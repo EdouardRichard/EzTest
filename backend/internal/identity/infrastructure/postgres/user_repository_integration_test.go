@@ -7,6 +7,7 @@ import (
 	"errors"
 	"testing"
 
+	audit "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/application"
 	identity "github.com/EdouardRichard/EzTest/backend/internal/identity/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/infrastructure/password"
@@ -146,7 +147,7 @@ func TestUserRepositoryCRUDAndPagination(t *testing.T) {
 func TestEnsureAdminSeedsOnceAgainstDatabase(t *testing.T) {
 	pool := testutil.OpenTestDB(t)
 	repo := postgres.NewUserRepository(pool)
-	svc := application.NewUserService(repo, password.NewHasher(12))
+	svc := application.NewUserService(repo, password.NewHasher(12), audit.NopRecorder{})
 
 	if err := svc.EnsureAdmin(ctx, "admin", "admin-pass-123"); err != nil {
 		t.Fatal(err)

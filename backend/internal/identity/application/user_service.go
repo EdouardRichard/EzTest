@@ -1,12 +1,16 @@
 // Package application implements the identity use cases on top of the domain
-// repository port and a password hashing port.
+// repository ports, a password hashing port and the audit recorder.
 package application
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strconv"
 
+	audit "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
+	auditdomain "github.com/EdouardRichard/EzTest/backend/internal/audit/domain"
 	identity "github.com/EdouardRichard/EzTest/backend/internal/identity/domain"
 )
 
@@ -27,13 +31,25 @@ type Hasher interface {
 // UserService manages user accounts for the admin settings screen and seeds the
 // single admin account at startup.
 type UserService struct {
-	repo   identity.Repository
-	hasher Hasher
+	repo     identity.Repository
+	hasher   Hasher
+	recorder audit.Recorder
 }
 
-// NewUserService wires the user service to its repository and password hasher.
-func NewUserService(repo identity.Repository, hasher Hasher) *UserService {
-	return &UserService{repo: repo, hasher: hasher}
+// NewUserService wires the user service to its repository, password hasher and
+// audit recorder.
+func NewUserService(repo identity.Repository, hasher Hasher, recorder audit.Recorder) *UserService {
+	return &UserService{repo: repo, hasher: hasher, recorder: recorder}
+}
+
+// recordAudit writes one audit entry. Auditing is best-effort: a failed audit
+// write must not turn a completed action into an error, but it is logged. The
+// log line never includes the entry metadata, so credentials cannot leak
+// through it.
+func recordAudit(ctx context.Context, recorder audit.Recorder, entry auditdomain.Entry) {
+	if err := recorder.Record(ctx, entry); err != nil {
+		slog.ErrorContext(ctx, "audit: record entry", "action", entry.Action, "error", err)
+	}
 }
 
 // Create creates a regular user. The admin is only ever created by EnsureAdmin:
@@ -57,6 +73,16 @@ func (s *UserService) Create(ctx context.Context, username, password string) (id
 	if err != nil {
 		return identity.User{}, err
 	}
+	recordAudit(ctx, s.recorder, auditdomain.Entry{
+		Action:     audit.ActionUserCreated,
+		TargetType: "user",
+		TargetID:   strconv.FormatInt(user.ID, 10),
+		Metadata: map[string]any{
+			"username": user.Username,
+			"role":     string(user.Role),
+			"status":   string(user.Status),
+		},
+	})
 	return user, nil
 }
 
@@ -64,6 +90,8 @@ func (s *UserService) Create(ctx context.Context, username, password string) (id
 // It is a no-op once an admin exists, so repeated startups are idempotent and a
 // deployment whose seed has already run can start without EZTEST_ADMIN_*
 // configured. Without an admin, missing or invalid credentials are an error.
+// The seed is a startup bootstrap rather than an authenticated action, so it is
+// deliberately not audited.
 func (s *UserService) EnsureAdmin(ctx context.Context, username, password string) error {
 	admins, err := s.repo.CountAdmins(ctx)
 	if err != nil {
@@ -132,7 +160,21 @@ func (s *UserService) SetStatus(ctx context.Context, actorID, userID int64, stat
 	if actorID == userID && status == identity.StatusDisabled {
 		return identity.User{}, identity.ErrLastAdmin
 	}
-	return s.repo.UpdateStatus(ctx, userID, status)
+	user, err := s.repo.UpdateStatus(ctx, userID, status)
+	if err != nil {
+		return identity.User{}, err
+	}
+	recordAudit(ctx, s.recorder, auditdomain.Entry{
+		Action:      audit.ActionUserUpdated,
+		ActorUserID: &actorID,
+		TargetType:  "user",
+		TargetID:    strconv.FormatInt(user.ID, 10),
+		Metadata: map[string]any{
+			"username": user.Username,
+			"status":   string(user.Status),
+		},
+	})
+	return user, nil
 }
 
 // ResetPassword replaces a user's password with a freshly hashed one. Token
@@ -146,5 +188,13 @@ func (s *UserService) ResetPassword(ctx context.Context, userID int64, password 
 	if err != nil {
 		return fmt.Errorf("identity: hash password: %w", err)
 	}
-	return s.repo.UpdatePasswordHash(ctx, userID, hash)
+	if err := s.repo.UpdatePasswordHash(ctx, userID, hash); err != nil {
+		return err
+	}
+	recordAudit(ctx, s.recorder, auditdomain.Entry{
+		Action:     audit.ActionUserPasswordReset,
+		TargetType: "user",
+		TargetID:   strconv.FormatInt(userID, 10),
+	})
+	return nil
 }

@@ -10,6 +10,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
+	audit "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	identity "github.com/EdouardRichard/EzTest/backend/internal/identity/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/infrastructure/password"
 )
@@ -62,7 +63,7 @@ func TestPasswordHashCostAndMaxLength(t *testing.T) {
 
 func TestCreateUserRejectsDuplicateAndWeak(t *testing.T) {
 	repo := newFakeUserRepo()
-	svc := NewUserService(repo, password.NewHasher(12))
+	svc := NewUserService(repo, password.NewHasher(12), audit.NopRecorder{})
 	if _, err := svc.Create(ctx, "qa01", "1234567890"); err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +86,7 @@ func TestCreateUserValidatesUsername(t *testing.T) {
 	}
 	for _, username := range invalid {
 		t.Run("invalid/"+username, func(t *testing.T) {
-			svc := NewUserService(newFakeUserRepo(), password.NewHasher(12))
+			svc := NewUserService(newFakeUserRepo(), password.NewHasher(12), audit.NopRecorder{})
 			if _, err := svc.Create(ctx, username, "1234567890"); !errors.Is(err, identity.ErrInvalidUsername) {
 				t.Fatalf("username %q: err=%v", username, err)
 			}
@@ -95,7 +96,7 @@ func TestCreateUserValidatesUsername(t *testing.T) {
 	valid := []string{"qa1", "qa_01", "qa-01", "qa.01", strings.Repeat("a", 64)}
 	for _, username := range valid {
 		t.Run("valid/"+username, func(t *testing.T) {
-			svc := NewUserService(newFakeUserRepo(), password.NewHasher(12))
+			svc := NewUserService(newFakeUserRepo(), password.NewHasher(12), audit.NopRecorder{})
 			if _, err := svc.Create(ctx, username, "1234567890"); err != nil {
 				t.Fatalf("username %q: %v", username, err)
 			}
@@ -112,14 +113,14 @@ func TestCreateUserValidatesPassword(t *testing.T) {
 	}
 	for _, pw := range invalid {
 		t.Run("weak", func(t *testing.T) {
-			svc := NewUserService(newFakeUserRepo(), password.NewHasher(12))
+			svc := NewUserService(newFakeUserRepo(), password.NewHasher(12), audit.NopRecorder{})
 			if _, err := svc.Create(ctx, "qa01", pw); !errors.Is(err, identity.ErrWeakPassword) {
 				t.Fatalf("password length %d: err=%v", len(pw), err)
 			}
 		})
 	}
 
-	svc := NewUserService(newFakeUserRepo(), password.NewHasher(12))
+	svc := NewUserService(newFakeUserRepo(), password.NewHasher(12), audit.NopRecorder{})
 	if _, err := svc.Create(ctx, "qa01", strings.Repeat("a", identity.MaxPasswordLength)); err != nil {
 		t.Fatalf("maximum-length password rejected: %v", err)
 	}
@@ -128,7 +129,7 @@ func TestCreateUserValidatesPassword(t *testing.T) {
 func TestCreateUserStoresHashedUser(t *testing.T) {
 	repo := newFakeUserRepo()
 	hasher := password.NewHasher(12)
-	svc := NewUserService(repo, hasher)
+	svc := NewUserService(repo, hasher, audit.NopRecorder{})
 
 	user, err := svc.Create(ctx, "qa01", "1234567890")
 	if err != nil {
@@ -162,7 +163,7 @@ func TestCreateUserStoresHashedUser(t *testing.T) {
 func TestEnsureAdminSeedsOnce(t *testing.T) {
 	repo := newFakeUserRepo()
 	hasher := password.NewHasher(12)
-	svc := NewUserService(repo, hasher)
+	svc := NewUserService(repo, hasher, audit.NopRecorder{})
 
 	if err := svc.EnsureAdmin(ctx, "admin", "admin-pass-123"); err != nil {
 		t.Fatal(err)
@@ -206,7 +207,7 @@ func TestEnsureAdminSeedsOnce(t *testing.T) {
 }
 
 func TestEnsureAdminToleratesConcurrentSeed(t *testing.T) {
-	svc := NewUserService(concurrentAdminRepo{newFakeUserRepo()}, password.NewHasher(12))
+	svc := NewUserService(concurrentAdminRepo{newFakeUserRepo()}, password.NewHasher(12), audit.NopRecorder{})
 	if err := svc.EnsureAdmin(ctx, "admin", "admin-pass-123"); err != nil {
 		t.Fatalf("concurrent admin seed should be a no-op: %v", err)
 	}
@@ -214,7 +215,7 @@ func TestEnsureAdminToleratesConcurrentSeed(t *testing.T) {
 	// Same race, but PostgreSQL reports the duplicate username constraint
 	// instead of the single-admin index; the service must re-check for an admin.
 	racing := &duplicateNameRepo{fakeUserRepo: newFakeUserRepo()}
-	svc = NewUserService(racing, password.NewHasher(12))
+	svc = NewUserService(racing, password.NewHasher(12), audit.NopRecorder{})
 	if err := svc.EnsureAdmin(ctx, "admin", "admin-pass-123"); err != nil {
 		t.Fatalf("concurrent duplicate-name seed should be a no-op: %v", err)
 	}
@@ -225,7 +226,7 @@ func TestEnsureAdminToleratesConcurrentSeed(t *testing.T) {
 
 func TestEnsureAdminRequiresCredentialsWhenNoAdmin(t *testing.T) {
 	repo := newFakeUserRepo()
-	svc := NewUserService(repo, password.NewHasher(12))
+	svc := NewUserService(repo, password.NewHasher(12), audit.NopRecorder{})
 
 	if err := svc.EnsureAdmin(ctx, "", "admin-pass-123"); !errors.Is(err, identity.ErrInvalidUsername) {
 		t.Fatalf("missing username: err=%v", err)
@@ -240,7 +241,7 @@ func TestEnsureAdminRequiresCredentialsWhenNoAdmin(t *testing.T) {
 
 func TestSetStatusRejectsSelfDisable(t *testing.T) {
 	repo := newFakeUserRepo()
-	svc := NewUserService(repo, password.NewHasher(12))
+	svc := NewUserService(repo, password.NewHasher(12), audit.NopRecorder{})
 	admin, err := repo.Create(ctx, identity.CreateParams{Username: "admin", PasswordHash: "hash", Role: identity.RoleAdmin})
 	if err != nil {
 		t.Fatal(err)
@@ -278,7 +279,7 @@ func TestSetStatusRejectsSelfDisable(t *testing.T) {
 func TestResetPasswordRehashes(t *testing.T) {
 	repo := newFakeUserRepo()
 	hasher := password.NewHasher(12)
-	svc := NewUserService(repo, hasher)
+	svc := NewUserService(repo, hasher, audit.NopRecorder{})
 	user, err := repo.Create(ctx, identity.CreateParams{
 		Username:     "qa01",
 		PasswordHash: mustHash(t, hasher, "1234567890"),
@@ -320,7 +321,7 @@ func TestResetPasswordRehashes(t *testing.T) {
 
 func TestGetAndListUsers(t *testing.T) {
 	repo := newFakeUserRepo()
-	svc := NewUserService(repo, password.NewHasher(12))
+	svc := NewUserService(repo, password.NewHasher(12), audit.NopRecorder{})
 	for _, username := range []string{"qa01", "qa02", "qa03"} {
 		if _, err := svc.Create(ctx, username, "1234567890"); err != nil {
 			t.Fatal(err)

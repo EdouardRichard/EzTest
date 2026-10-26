@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	audit "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	identity "github.com/EdouardRichard/EzTest/backend/internal/identity/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/infrastructure/password"
 )
@@ -18,7 +19,7 @@ var fixedNow = time.Date(2026, 10, 27, 3, 0, 0, 0, time.UTC)
 func TestLoginCreatesHashedTokenAndAuthenticates(t *testing.T) {
 	users := newFakeUserRepoWith(t, "admin", "admin-pass-123", identity.RoleAdmin)
 	tokens := newFakeTokenRepo()
-	svc := NewAuthService(users, tokens, password.NewHasher(12), func() time.Time { return fixedNow })
+	svc := NewAuthService(users, tokens, password.NewHasher(12), func() time.Time { return fixedNow }, audit.NopRecorder{})
 	res, err := svc.Login(ctx, "admin", "admin-pass-123")
 	if err != nil {
 		t.Fatal(err)
@@ -59,7 +60,7 @@ func TestLoginExpiryIsUTC(t *testing.T) {
 	tokens := newFakeTokenRepo()
 	local := time.FixedZone("UTC+8", 8*60*60)
 	localNow := fixedNow.In(local)
-	svc := NewAuthService(users, tokens, password.NewHasher(12), func() time.Time { return localNow })
+	svc := NewAuthService(users, tokens, password.NewHasher(12), func() time.Time { return localNow }, audit.NopRecorder{})
 
 	res, err := svc.Login(ctx, "admin", "admin-pass-123")
 	if err != nil {
@@ -76,7 +77,7 @@ func TestLoginExpiryIsUTC(t *testing.T) {
 func TestLoginIssuesUniqueTokensAndUpdatesLastLogin(t *testing.T) {
 	users := newFakeUserRepoWith(t, "admin", "admin-pass-123", identity.RoleAdmin)
 	tokens := newFakeTokenRepo()
-	svc := NewAuthService(users, tokens, password.NewHasher(12), func() time.Time { return fixedNow })
+	svc := NewAuthService(users, tokens, password.NewHasher(12), func() time.Time { return fixedNow }, audit.NopRecorder{})
 
 	first, err := svc.Login(ctx, "admin", "admin-pass-123")
 	if err != nil {
@@ -190,7 +191,7 @@ func TestExpiredRevokedDisabledRejected(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			users := newFakeUserRepoWith(t, "admin", "admin-pass-123", identity.RoleAdmin)
 			tokens := newFakeTokenRepo()
-			svc := NewAuthService(users, tokens, hasher, func() time.Time { return fixedNow })
+			svc := NewAuthService(users, tokens, hasher, func() time.Time { return fixedNow }, audit.NopRecorder{})
 			raw := tt.prepare(t, users, tokens)
 			if _, err := svc.Authenticate(ctx, raw); !errors.Is(err, identity.ErrUnauthenticated) {
 				t.Fatalf("Authenticate(%q) err=%v, want ErrUnauthenticated", raw, err)
@@ -225,7 +226,7 @@ func TestLoginRejectsInvalidCredentials(t *testing.T) {
 				}
 			}
 			tokens := newFakeTokenRepo()
-			svc := NewAuthService(users, tokens, hasher, func() time.Time { return fixedNow })
+			svc := NewAuthService(users, tokens, hasher, func() time.Time { return fixedNow }, audit.NopRecorder{})
 			if _, err := svc.Login(ctx, tt.username, tt.password); !errors.Is(err, identity.ErrUnauthenticated) {
 				t.Fatalf("Login(%q,%q) err=%v, want ErrUnauthenticated", tt.username, tt.password, err)
 			}
@@ -240,7 +241,7 @@ func TestTokenValidUntilExpiry(t *testing.T) {
 	users := newFakeUserRepoWith(t, "admin", "admin-pass-123", identity.RoleAdmin)
 	tokens := newFakeTokenRepo()
 	now := fixedNow
-	svc := NewAuthService(users, tokens, password.NewHasher(12), func() time.Time { return now })
+	svc := NewAuthService(users, tokens, password.NewHasher(12), func() time.Time { return now }, audit.NopRecorder{})
 
 	res, err := svc.Login(ctx, "admin", "admin-pass-123")
 	if err != nil {
@@ -265,7 +266,7 @@ func TestAuthenticateTouchesLastSeenAtMostEveryFiveMinutes(t *testing.T) {
 	users := newFakeUserRepoWith(t, "admin", "admin-pass-123", identity.RoleAdmin)
 	tokens := newFakeTokenRepo()
 	now := fixedNow
-	svc := NewAuthService(users, tokens, password.NewHasher(12), func() time.Time { return now })
+	svc := NewAuthService(users, tokens, password.NewHasher(12), func() time.Time { return now }, audit.NopRecorder{})
 
 	res, err := svc.Login(ctx, "admin", "admin-pass-123")
 	if err != nil {
@@ -314,7 +315,7 @@ func TestAuthenticateTouchesLastSeenAtMostEveryFiveMinutes(t *testing.T) {
 func TestAuthenticateSucceedsWhenLastSeenTouchFails(t *testing.T) {
 	users := newFakeUserRepoWith(t, "admin", "admin-pass-123", identity.RoleAdmin)
 	tokens := newFakeTokenRepo()
-	svc := NewAuthService(users, tokens, password.NewHasher(12), func() time.Time { return fixedNow })
+	svc := NewAuthService(users, tokens, password.NewHasher(12), func() time.Time { return fixedNow }, audit.NopRecorder{})
 
 	res, err := svc.Login(ctx, "admin", "admin-pass-123")
 	if err != nil {
@@ -337,7 +338,7 @@ func TestAuthenticateSucceedsWhenLastSeenTouchFails(t *testing.T) {
 func TestLogoutRevokesCurrentToken(t *testing.T) {
 	users := newFakeUserRepoWith(t, "admin", "admin-pass-123", identity.RoleAdmin)
 	tokens := newFakeTokenRepo()
-	svc := NewAuthService(users, tokens, password.NewHasher(12), func() time.Time { return fixedNow })
+	svc := NewAuthService(users, tokens, password.NewHasher(12), func() time.Time { return fixedNow }, audit.NopRecorder{})
 
 	res, err := svc.Login(ctx, "admin", "admin-pass-123")
 	if err != nil {
@@ -365,7 +366,7 @@ func TestLogoutRevokesCurrentToken(t *testing.T) {
 func TestLoginDoesNotStorePlaintextToken(t *testing.T) {
 	users := newFakeUserRepoWith(t, "admin", "admin-pass-123", identity.RoleAdmin)
 	tokens := newFakeTokenRepo()
-	svc := NewAuthService(users, tokens, password.NewHasher(12), func() time.Time { return fixedNow })
+	svc := NewAuthService(users, tokens, password.NewHasher(12), func() time.Time { return fixedNow }, audit.NopRecorder{})
 
 	res, err := svc.Login(ctx, "admin", "admin-pass-123")
 	if err != nil {

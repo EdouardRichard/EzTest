@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"time"
 
+	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
+	auditpostgres "github.com/EdouardRichard/EzTest/backend/internal/audit/infrastructure/postgres"
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
 	"github.com/EdouardRichard/EzTest/backend/internal/db"
 	identityapp "github.com/EdouardRichard/EzTest/backend/internal/identity/application"
@@ -61,7 +63,8 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 
 	userRepo := identitypostgres.NewUserRepository(database.Pool)
 	hasher := password.NewHasher(bcryptCost)
-	userService := identityapp.NewUserService(userRepo, hasher)
+	auditor := auditapp.NewService(auditpostgres.NewRepository(database.Pool))
+	userService := identityapp.NewUserService(userRepo, hasher, auditor)
 	if err := userService.EnsureAdmin(startupCtx, cfg.AdminUsername, cfg.AdminPassword); err != nil {
 		return fmt.Errorf("seed admin (set EZTEST_ADMIN_USERNAME and EZTEST_ADMIN_PASSWORD when no admin exists): %w", err)
 	}
@@ -70,6 +73,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		identitypostgres.NewTokenRepository(database.Pool),
 		hasher,
 		time.Now,
+		auditor,
 	)
 	cancelStartup()
 
