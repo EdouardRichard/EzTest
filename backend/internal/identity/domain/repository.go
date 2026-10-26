@@ -27,6 +27,9 @@ type Repository interface {
 	UpdateStatus(ctx context.Context, id int64, status Status) (User, error)
 	// UpdatePasswordHash replaces a user's password hash.
 	UpdatePasswordHash(ctx context.Context, id int64, passwordHash string) error
+	// UpdateLastLogin records a successful login by setting last_login_at to
+	// the database clock.
+	UpdateLastLogin(ctx context.Context, id int64) error
 	// CountAdmins returns the number of users with the admin role.
 	CountAdmins(ctx context.Context) (int, error)
 }
