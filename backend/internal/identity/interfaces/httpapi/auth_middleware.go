@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	identity "github.com/EdouardRichard/EzTest/backend/internal/identity/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
 // userContextKey is the private context key carrying the authenticated user.
@@ -25,12 +26,12 @@ func AuthMiddleware(authenticator Authenticator) func(http.Handler) http.Handler
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			rawToken, ok := bearerToken(r)
 			if !ok {
-				writeUnauthenticated(w)
+				writeUnauthenticated(w, r)
 				return
 			}
 			user, err := authenticator.Authenticate(r.Context(), rawToken)
 			if err != nil {
-				writeUnauthenticated(w)
+				writeUnauthenticated(w, r)
 				return
 			}
 			ctx := context.WithValue(r.Context(), userContextKey{}, user)
@@ -45,7 +46,7 @@ func RequireAdmin(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		user, ok := UserFromContext(r.Context())
 		if !ok || user.Role != identity.RoleAdmin {
-			writeError(w, http.StatusForbidden, "forbidden", "admin role required")
+			platform.WriteError(w, r, http.StatusForbidden, platform.CodeForbidden, "admin role required")
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -69,7 +70,7 @@ func bearerToken(r *http.Request) (string, bool) {
 
 // writeUnauthenticated writes the shared 401 response, including the Bearer
 // challenge required by the API contract.
-func writeUnauthenticated(w http.ResponseWriter) {
+func writeUnauthenticated(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("WWW-Authenticate", "Bearer")
-	writeError(w, http.StatusUnauthorized, "unauthenticated", "authentication required")
+	platform.WriteError(w, r, http.StatusUnauthorized, platform.CodeUnauthenticated, "authentication required")
 }

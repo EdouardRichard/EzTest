@@ -15,6 +15,7 @@ import (
 
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/application"
 	identity "github.com/EdouardRichard/EzTest/backend/internal/identity/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
 const (
@@ -78,7 +79,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	var req loginRequest
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxLoginBodyBytes))
 	if err := decoder.Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_argument", "invalid JSON body")
+		platform.WriteError(w, r, http.StatusBadRequest, platform.CodeInvalidArgument, "invalid JSON body")
 		return
 	}
 
@@ -86,14 +87,14 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	// keys or reach the (comparatively expensive) auth service. The 401 is
 	// deliberately indistinguishable from wrong credentials.
 	if err := identity.ValidateUsername(req.Username); err != nil {
-		writeError(w, http.StatusUnauthorized, "unauthenticated", "invalid username or password")
+		platform.WriteError(w, r, http.StatusUnauthorized, platform.CodeUnauthenticated, "invalid username or password")
 		return
 	}
 
 	key := loginKey(clientIP(r), req.Username)
 	if h.limiter.Locked(key) {
 		w.Header().Set("Retry-After", "60")
-		writeError(w, http.StatusTooManyRequests, "rate_limited", "too many failed login attempts, try again later")
+		platform.WriteError(w, r, http.StatusTooManyRequests, platform.CodeRateLimited, "too many failed login attempts, try again later")
 		return
 	}
 
@@ -101,10 +102,10 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, identity.ErrUnauthenticated) {
 			h.limiter.Fail(key)
-			writeError(w, http.StatusUnauthorized, "unauthenticated", "invalid username or password")
+			platform.WriteError(w, r, http.StatusUnauthorized, platform.CodeUnauthenticated, "invalid username or password")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "internal", "internal server error")
+		platform.WriteError(w, r, http.StatusInternalServerError, platform.CodeInternal, "internal server error")
 		return
 	}
 	h.limiter.Reset(key)
@@ -119,7 +120,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
 	user, ok := UserFromContext(r.Context())
 	if !ok {
-		writeUnauthenticated(w)
+		writeUnauthenticated(w, r)
 		return
 	}
 	writeJSON(w, http.StatusOK, userEnvelope{Data: newUserPayload(user)})
@@ -129,11 +130,11 @@ func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
 func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 	rawToken, ok := bearerToken(r)
 	if !ok {
-		writeUnauthenticated(w)
+		writeUnauthenticated(w, r)
 		return
 	}
 	if err := h.svc.Logout(r.Context(), rawToken); err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "internal server error")
+		platform.WriteError(w, r, http.StatusInternalServerError, platform.CodeInternal, "internal server error")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -276,25 +277,11 @@ type userEnvelope struct {
 	Data userPayload `json:"data"`
 }
 
-// errorEnvelope is the local error shape until Task 6 adds the shared API
-// error envelope.
-type errorEnvelope struct {
-	Error errorPayload `json:"error"`
-}
-
-type errorPayload struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-}
-
+// writeJSON writes a success response in the shared `{"data": ...}` shape.
 func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
-}
-
-func writeError(w http.ResponseWriter, status int, code, message string) {
-	writeJSON(w, status, errorEnvelope{Error: errorPayload{Code: code, Message: message}})
 }
 
 // clientIP extracts the peer address of the request. Forwarding headers are

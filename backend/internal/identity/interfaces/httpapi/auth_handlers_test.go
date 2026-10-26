@@ -14,6 +14,7 @@ import (
 
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/application"
 	identity "github.com/EdouardRichard/EzTest/backend/internal/identity/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
 var fixedNow = time.Date(2026, 10, 27, 3, 0, 0, 0, time.UTC)
@@ -23,6 +24,11 @@ const (
 	userToken  = "ezt_user-token"
 	adminPass  = "admin-pass-123"
 	userPass   = "qa-pass-1234"
+	// testRequestID is attached to every request by the test helpers. These
+	// tests call the auth handlers directly, without the server package's
+	// request ID middleware (importing it would create an import cycle), so the
+	// helpers seed the platform request ID the middleware would normally add.
+	testRequestID = "req_auth_test_1234"
 )
 
 func TestLoginAndMe(t *testing.T) {
@@ -46,8 +52,12 @@ func TestAdminEndpointForbiddenForUser(t *testing.T) {
 		t.Fatalf("user login=%d %s", rec.Code, rec.Body)
 	}
 	user := decodeToken(t, rec.Body)
-	if rec := getWithBearer(h, "/api/admin/ping", user); rec.Code != http.StatusForbidden {
+	rec = getWithBearer(h, "/api/admin/ping", user)
+	if rec.Code != http.StatusForbidden {
 		t.Fatalf("user token on admin endpoint=%d %s, want 403", rec.Code, rec.Body)
+	}
+	if apiErr := decodeAPIError(t, rec); apiErr.Code != "forbidden" {
+		t.Fatalf("user token on admin endpoint: error code=%q want forbidden", apiErr.Code)
 	}
 
 	rec = postJSON(h, "/api/auth/login", `{"username":"admin","password":"admin-pass-123"}`)
@@ -59,8 +69,15 @@ func TestAdminEndpointForbiddenForUser(t *testing.T) {
 		t.Fatalf("admin token on admin endpoint=%d %s, want 200", rec.Code, rec.Body)
 	}
 
-	if rec := getWithBearer(h, "/api/admin/ping", "ezt_bogus"); rec.Code != http.StatusUnauthorized {
+	rec = getWithBearer(h, "/api/admin/ping", "ezt_bogus")
+	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("bogus token on admin endpoint=%d, want 401", rec.Code)
+	}
+	if got := rec.Header().Get("WWW-Authenticate"); got != "Bearer" {
+		t.Fatalf("bogus token on admin endpoint: WWW-Authenticate=%q want Bearer", got)
+	}
+	if apiErr := decodeAPIError(t, rec); apiErr.Code != "unauthenticated" {
+		t.Fatalf("bogus token on admin endpoint: error code=%q want unauthenticated", apiErr.Code)
 	}
 }
 
@@ -95,7 +112,7 @@ func TestMeReturnsCurrentUser(t *testing.T) {
 func TestMeRequiresBearerToken(t *testing.T) {
 	h := newTestAPI(t)
 	for _, header := range []string{"", "Bearer", "Bearer ", "Token " + userToken, "Basic YWRtaW46YWRtaW4="} {
-		req := httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
+		req := newTestRequest(http.MethodGet, "/api/auth/me", nil)
 		if header != "" {
 			req.Header.Set("Authorization", header)
 		}
@@ -107,8 +124,8 @@ func TestMeRequiresBearerToken(t *testing.T) {
 		if got := rec.Header().Get("WWW-Authenticate"); got != "Bearer" {
 			t.Fatalf("authorization %q: WWW-Authenticate=%q want Bearer", header, got)
 		}
-		if code := decodeErrorCode(t, rec.Body.Bytes()); code != "unauthenticated" {
-			t.Fatalf("authorization %q: error code=%q want unauthenticated", header, code)
+		if apiErr := decodeAPIError(t, rec); apiErr.Code != "unauthenticated" {
+			t.Fatalf("authorization %q: error code=%q want unauthenticated", header, apiErr.Code)
 		}
 	}
 }
@@ -124,7 +141,7 @@ func TestLoginRejectsInvalidCredentials(t *testing.T) {
 		if rec.Code != http.StatusUnauthorized {
 			t.Fatalf("login %s: code=%d body=%s want 401", body, rec.Code, rec.Body)
 		}
-		if code := decodeErrorCode(t, rec.Body.Bytes()); code != "unauthenticated" {
+		if code := decodeAPIError(t, rec).Code; code != "unauthenticated" {
 			t.Fatalf("login %s: error code=%q", body, code)
 		}
 	}
@@ -136,7 +153,7 @@ func TestLoginRejectsMalformedJSON(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("malformed body: code=%d body=%s want 400", rec.Code, rec.Body)
 	}
-	if code := decodeErrorCode(t, rec.Body.Bytes()); code != "invalid_argument" {
+	if code := decodeAPIError(t, rec).Code; code != "invalid_argument" {
 		t.Fatalf("malformed body: error code=%q", code)
 	}
 }
@@ -148,7 +165,7 @@ func TestLoginInternalErrorIsNotUnauthenticated(t *testing.T) {
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("internal failure: code=%d body=%s want 500", rec.Code, rec.Body)
 	}
-	if code := decodeErrorCode(t, rec.Body.Bytes()); code != "internal" {
+	if code := decodeAPIError(t, rec).Code; code != "internal" {
 		t.Fatalf("internal failure: error code=%q", code)
 	}
 }
@@ -176,6 +193,12 @@ func TestLogoutRequiresAuthentication(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("logout without a valid token=%d want 401", rec.Code)
 	}
+	if got := rec.Header().Get("WWW-Authenticate"); got != "Bearer" {
+		t.Fatalf("logout without a valid token: WWW-Authenticate=%q want Bearer", got)
+	}
+	if apiErr := decodeAPIError(t, rec); apiErr.Code != "unauthenticated" {
+		t.Fatalf("logout without a valid token: error code=%q want unauthenticated", apiErr.Code)
+	}
 }
 
 func TestLoginRateLimitedAfterFiveFailures(t *testing.T) {
@@ -194,7 +217,7 @@ func TestLoginRateLimitedAfterFiveFailures(t *testing.T) {
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("locked login: code=%d body=%s want 429", rec.Code, rec.Body)
 	}
-	if code := decodeErrorCode(t, rec.Body.Bytes()); code != "rate_limited" {
+	if code := decodeAPIError(t, rec).Code; code != "rate_limited" {
 		t.Fatalf("locked login: error code=%q want rate_limited", code)
 	}
 	if got := rec.Header().Get("Retry-After"); got != "60" {
@@ -289,7 +312,7 @@ func TestLoginRejectsInvalidUsernameWithoutLimiterEntry(t *testing.T) {
 				if rec.Code != http.StatusUnauthorized {
 					t.Fatalf("attempt %d: code=%d body=%s want 401", i+1, rec.Code, rec.Body)
 				}
-				if code := decodeErrorCode(t, rec.Body.Bytes()); code != "unauthenticated" {
+				if code := decodeAPIError(t, rec).Code; code != "unauthenticated" {
 					t.Fatalf("attempt %d: error code=%q want unauthenticated", i+1, code)
 				}
 			}
@@ -314,7 +337,7 @@ func TestLoginBodyLimitEnforced(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("oversized body: code=%d body=%s want 400", rec.Code, rec.Body)
 	}
-	if code := decodeErrorCode(t, rec.Body.Bytes()); code != "invalid_argument" {
+	if code := decodeAPIError(t, rec).Code; code != "invalid_argument" {
 		t.Fatalf("oversized body: error code=%q want invalid_argument", code)
 	}
 	if h.auth.loginCalls != 0 {
@@ -504,7 +527,7 @@ func (api *testAPI) advance(d time.Duration) {
 }
 
 func postJSON(h http.Handler, path, body string) *httptest.ResponseRecorder {
-	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	req := newTestRequest(http.MethodPost, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -512,7 +535,7 @@ func postJSON(h http.Handler, path, body string) *httptest.ResponseRecorder {
 }
 
 func getWithBearer(h http.Handler, path, token string) *httptest.ResponseRecorder {
-	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req := newTestRequest(http.MethodGet, path, nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -520,11 +543,18 @@ func getWithBearer(h http.Handler, path, token string) *httptest.ResponseRecorde
 }
 
 func postWithBearer(h http.Handler, path, token string) *httptest.ResponseRecorder {
-	req := httptest.NewRequest(http.MethodPost, path, nil)
+	req := newTestRequest(http.MethodPost, path, nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec
+}
+
+// newTestRequest builds a request carrying the platform request ID that the
+// server's requestIDMiddleware would normally put in the context.
+func newTestRequest(method, target string, body io.Reader) *http.Request {
+	req := httptest.NewRequest(method, target, body)
+	return req.WithContext(platform.WithRequestID(req.Context(), testRequestID))
 }
 
 func decodeToken(t *testing.T, body io.Reader) string {
@@ -543,15 +573,43 @@ func decodeToken(t *testing.T, body io.Reader) string {
 	return payload.Data.Token
 }
 
-func decodeErrorCode(t *testing.T, body []byte) string {
+// decodeAPIError decodes the design's §9.1 error envelope and proves every
+// field is present. request_id must be non-empty, must come from the request
+// context and must equal the X-Request-ID response header so clients can
+// correlate the error with the request log.
+func decodeAPIError(t *testing.T, rec *httptest.ResponseRecorder) platform.APIError {
 	t.Helper()
 	var payload struct {
 		Error struct {
-			Code string `json:"code"`
+			Code      string          `json:"code"`
+			Message   string          `json:"message"`
+			RequestID *string         `json:"request_id"`
+			Retryable *bool           `json:"retryable"`
+			Details   json.RawMessage `json:"details"`
 		} `json:"error"`
 	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		t.Fatalf("decode error response %q: %v", body, err)
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode error response %q: %v", rec.Body.Bytes(), err)
 	}
-	return payload.Error.Code
+	if payload.Error.RequestID == nil || *payload.Error.RequestID == "" {
+		t.Fatalf("error envelope has no request_id: %s", rec.Body)
+	}
+	if *payload.Error.RequestID != testRequestID {
+		t.Fatalf("envelope request_id=%q want %q (request context ID)", *payload.Error.RequestID, testRequestID)
+	}
+	if got := rec.Header().Get(platform.RequestIDHeader); got != *payload.Error.RequestID {
+		t.Fatalf("envelope request_id=%q, X-Request-ID header=%q", *payload.Error.RequestID, got)
+	}
+	if payload.Error.Retryable == nil {
+		t.Fatalf("error envelope has no retryable field: %s", rec.Body)
+	}
+	if string(payload.Error.Details) != "{}" {
+		t.Fatalf("error envelope details=%s, want {}: %s", payload.Error.Details, rec.Body)
+	}
+	return platform.APIError{
+		Code:      payload.Error.Code,
+		Message:   payload.Error.Message,
+		RequestID: *payload.Error.RequestID,
+		Retryable: *payload.Error.Retryable,
+	}
 }
