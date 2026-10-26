@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - P0 范围严格按 `docs/design/implementation-phases.md` §2-P0；**不建**版本/需求/用例/执行/证据/问题/报告实体。
-- 端口：Web `6868`、API `2333`、PostgreSQL `5433`；CORS 仅允许 `EZTEST_WEB_ORIGIN=http://localhost:6868`。
+- 端口：Web `6868`、API `13333`、PostgreSQL `5433`；CORS 仅允许 `EZTEST_WEB_ORIGIN=http://localhost:6868`。
 - Go module：`github.com/EdouardRichard/EzTest/backend`；Go 1.24.6；只用标准库 `net/http`（Go 1.22+ 方法路由）。
 - 目录与导入方向：严格按 `Agent.md` §6（domain → application → infrastructure/interfaces；跨上下文只走 application 接口/事件）。
 - 迁移：`backend/internal/db/migrations/`，文件名 `<context>_<version>_<desc>.sql`；`order.txt` 定义全局顺序；只增不改；启动 advisory lock。
@@ -79,7 +79,7 @@ func TestLoadDefaultsAndValidation(t *testing.T) {
     }
     cfg, err := Load(func(k string) string { return env[k] })
     if err != nil { t.Fatal(err) }
-    if cfg.HTTPAddr != ":2333" { t.Fatalf("HTTPAddr=%q", cfg.HTTPAddr) }
+    if cfg.HTTPAddr != ":13333" { t.Fatalf("HTTPAddr=%q", cfg.HTTPAddr) }
     if cfg.WebOrigin != "http://localhost:6868" { t.Fatalf("WebOrigin=%q", cfg.WebOrigin) }
     if cfg.Env != "dev" { t.Fatalf("Env=%q", cfg.Env) }
     if len(cfg.SecretKeys[1]) == 0 { t.Fatal("missing secret key") }
@@ -102,7 +102,7 @@ Expected: FAIL（`config.Load` 不存在/编译失败）
 - [ ] **Step 3: 实现配置**
 
 实现 `Config`（字段：Env、HTTPAddr、WebOrigin、DatabaseURL、TestDatabaseURL、AdminUsername、AdminPassword、SecretKeys map[int][]byte、SecretKeyActive int、StorageDir、EnableTestEndpoints bool、LogLevel slog.Level、LLMSeed{BaseURL,Key,Model}）。
-解析规则：必填 `EZTEST_DATABASE_URL`、`EZTEST_SECRET_KEYS`、`EZTEST_SECRET_KEY_ACTIVE`；active 必须存在于 keys；`EZTEST_ENV` 默认 `dev`；`EZTEST_HTTP_ADDR` 默认 `:2333`；`EZTEST_WEB_ORIGIN` 默认 `http://localhost:6868`；`EZTEST_STORAGE_DIR` 默认 `.data/objects`；`EZTEST_ENABLE_TEST_ENDPOINTS` 默认 `EZTEST_ENV != "prod"`；`EZTEST_LOG_LEVEL` 默认 `info`。
+解析规则：必填 `EZTEST_DATABASE_URL`、`EZTEST_SECRET_KEYS`、`EZTEST_SECRET_KEY_ACTIVE`；active 必须存在于 keys；`EZTEST_ENV` 默认 `dev`；`EZTEST_HTTP_ADDR` 默认 `:13333`；`EZTEST_WEB_ORIGIN` 默认 `http://localhost:6868`；`EZTEST_STORAGE_DIR` 默认 `.data/objects`；`EZTEST_ENABLE_TEST_ENDPOINTS` 默认 `EZTEST_ENV != "prod"`；`EZTEST_LOG_LEVEL` 默认 `info`。
 `go.mod`：module `github.com/EdouardRichard/EzTest/backend`，go 1.24.6。
 
 - [ ] **Step 4: 写健康/请求 ID 测试**
@@ -1161,7 +1161,7 @@ git commit -m "feat: add SSE client and admin settings panels"
 - Create: `scripts/acceptance.ps1`
 
 **Interfaces:**
-- E2E 使用独立库 `eztest_e2e`；`scripts/e2e.ps1` 初始化/重置库、启动 API（2333）/Web（6868）、运行 Playwright、清理进程。
+- E2E 使用独立库 `eztest_e2e`；`scripts/e2e.ps1` 初始化/重置库、启动 API（13333）/Web（6868）、运行 Playwright、清理进程。
 - Playwright 使用本机 Chrome/Edge channel；`baseURL=http://localhost:6868`。
 - 真实 LLM 验收 gated：`EZTEST_RUN_REAL_LLM=1`；否则跳过并输出“SKIPPED”。
 
@@ -1252,7 +1252,7 @@ git commit -m "test: add Playwright E2E and P0 acceptance scripts"
 - Test: `frontend/scripts/validate-compose.mjs`（运行即校验）
 
 **Interfaces:**
-- Compose：`api`（2333）、`web`（6868）、`postgres:17`（5433）；健康检查；卷 `pgdata`/`objects`；`EZTEST_DATABASE_URL`/`EZTEST_WEB_ORIGIN`。
+- Compose：`api`（13333）、`web`（6868）、`postgres:17`（5433）；健康检查；卷 `pgdata`/`objects`；`EZTEST_DATABASE_URL`/`EZTEST_WEB_ORIGIN`。
 - Dockerfile.api：Go 多阶段构建，非 root；镜像内复制 `docs/openapi/p0.yaml` 到工作目录同名路径。
 - Dockerfile.web：Next standalone 构建。
 - OpenAPI 覆盖规格 §9.2 全部端点；`GET /api/openapi.yaml` 读取 `cfg.OpenAPIPath`（默认 `docs/openapi/p0.yaml`），返回 `application/yaml`；缺失 404。

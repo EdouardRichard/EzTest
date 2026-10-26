@@ -41,7 +41,7 @@ type Config struct {
 func Load(getenv func(string) string) (Config, error) {
 	cfg := Config{
 		Env:             valueOr(getenv, "EZTEST_ENV", "dev"),
-		HTTPAddr:        valueOr(getenv, "EZTEST_HTTP_ADDR", ":2333"),
+		HTTPAddr:        valueOr(getenv, "EZTEST_HTTP_ADDR", ":13333"),
 		WebOrigin:       valueOr(getenv, "EZTEST_WEB_ORIGIN", "http://localhost:6868"),
 		DatabaseURL:     strings.TrimSpace(getenv("EZTEST_DATABASE_URL")),
 		TestDatabaseURL: strings.TrimSpace(getenv("EZTEST_TEST_DATABASE_URL")),

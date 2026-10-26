@@ -24,7 +24,7 @@ func TestLoadDefaultsAndValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.HTTPAddr != ":2333" {
+	if cfg.HTTPAddr != ":13333" {
 		t.Fatalf("HTTPAddr=%q", cfg.HTTPAddr)
 	}
 	if cfg.WebOrigin != "http://localhost:6868" {

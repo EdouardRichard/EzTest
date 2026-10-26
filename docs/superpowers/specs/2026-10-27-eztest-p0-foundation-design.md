@@ -45,7 +45,7 @@
 | 后端 | Go（标准库 `net/http`，Go 1.22+ 方法路由），模块化单体 |
 | 前端 | Next.js App Router + React 19 + Tailwind + TypeScript；无业务页面 |
 | 数据库 | PostgreSQL 17.6 便携版，端口 `5433`；数据库 `eztest` / 测试库 `eztest_test` |
-| 端口 | Web `6868`、API `2333`、PostgreSQL `5433` |
+| 端口 | Web `6868`、API `13333`、PostgreSQL `5433` |
 | 前后端 | CORS 直连；`EZTEST_WEB_ORIGIN=http://localhost:6868` |
 | 认证 | 不透明 Bearer Token（32B 随机、SHA-256 哈希入库、12h、可撤销） |
 | SSE 鉴权 | fetch 流 + `Authorization` + `Last-Event-ID`；不使用 EventSource/Cookie |
@@ -114,7 +114,7 @@ HTTP -> server middleware（request_id -> recover -> logging -> CORS -> auth -> 
 | 变量 | 必填 | 默认 | 说明 |
 |---|---|---|---|
 | `EZTEST_ENV` | 否 | `dev` | `dev/test/prod`；控制测试端点与日志级别 |
-| `EZTEST_HTTP_ADDR` | 否 | `:2333` | API 监听地址 |
+| `EZTEST_HTTP_ADDR` | 否 | `:13333` | API 监听地址 |
 | `EZTEST_WEB_ORIGIN` | 否 | `http://localhost:6868` | CORS 允许的单一来源 |
 | `EZTEST_DATABASE_URL` | 是 | — | `postgres://eztest:***@localhost:5433/eztest?sslmode=disable` |
 | `EZTEST_TEST_DATABASE_URL` | 测试 | — | 集成测试库，禁止指向开发库 |
@@ -129,7 +129,7 @@ HTTP -> server middleware（request_id -> recover -> logging -> CORS -> auth -> 
 | `llm_base_url` | 种子 | — | 首次启动无默认 LLM 配置时使用 |
 | `llm_key` | 种子 | — | 首次启动时立即加密入库；不写日志 |
 | `llm_model_name` | 种子 | — | 首次启动使用 |
-| `NEXT_PUBLIC_API_BASE_URL` | 前端 | `http://localhost:2333` | 浏览器访问 API 的地址 |
+| `NEXT_PUBLIC_API_BASE_URL` | 前端 | `http://localhost:13333` | 浏览器访问 API 的地址 |
 
 - **失败快**：缺少 `EZTEST_DATABASE_URL` / `EZTEST_SECRET_KEYS` / 管理员种子（无管理员时）→ 启动失败并给出明确错误。
 - 不在日志、错误、审计中输出 token、密码、LLM Key、Authorization、custom headers 值。
