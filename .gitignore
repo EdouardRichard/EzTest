@@ -1,0 +1,33 @@
+# ---- secrets ----
+.env
+.env.*
+!.env.example
+.secrets/
+
+# ---- local toolchain (portable Go/PostgreSQL) ----
+.tools/
+
+# ---- node / next ----
+node_modules/
+.pnpm-store/
+.next/
+out/
+dist/
+coverage/
+*.tsbuildinfo
+
+# ---- go ----
+bin/
+*.exe
+*.test
+
+# ---- logs / temp ----
+*.log
+tmp/
+.tmp/
+
+# ---- os / editor ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
