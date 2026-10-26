@@ -147,7 +147,7 @@ func TestUserRepositoryCRUDAndPagination(t *testing.T) {
 func TestEnsureAdminSeedsOnceAgainstDatabase(t *testing.T) {
 	pool := testutil.OpenTestDB(t)
 	repo := postgres.NewUserRepository(pool)
-	svc := application.NewUserService(repo, password.NewHasher(12), audit.NopRecorder{})
+	svc := application.NewUserService(repo, password.NewHasher(12), audit.NopRecorder{}, postgres.NewTokenRepository(pool))
 
 	if err := svc.EnsureAdmin(ctx, "admin", "admin-pass-123"); err != nil {
 		t.Fatal(err)

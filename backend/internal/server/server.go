@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
+	audithttp "github.com/EdouardRichard/EzTest/backend/internal/audit/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
 	identityhttp "github.com/EdouardRichard/EzTest/backend/internal/identity/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/idempotency"
@@ -28,6 +30,14 @@ type Dependencies struct {
 	// has wired authentication, so the /api/auth routes are mounted and the
 	// protected /api routes require a bearer token.
 	Auth identityhttp.AuthService
+	// Users is the identity user-management use case. When set, the admin user
+	// routes are mounted. They rely on the global bearer-token middleware and
+	// apply the per-route admin guard.
+	Users identityhttp.UserService
+	// Audit is the audit recorder. When set, the admin audit query endpoint is
+	// mounted and the auth handlers record the login rejections that happen
+	// before the auth service (invalid username, limiter lockout).
+	Audit auditapp.Recorder
 	// Idempotency stores replayable write responses. A nil store disables
 	// idempotent replay (for example in unit tests that do not exercise it).
 	Idempotency idempotency.Store
@@ -43,7 +53,15 @@ func New(cfg config.Config, logger *slog.Logger, deps Dependencies) http.Handler
 	mux.HandleFunc("GET /healthz", handleHealthz)
 	mux.HandleFunc("GET /api/health", handleAPIHealth(deps.Pinger))
 	if deps.Auth != nil {
-		identityhttp.RegisterAuthRoutes(mux, deps.Auth, identityhttp.NewLoginLimiter(time.Now))
+		identityhttp.RegisterAuthRoutes(mux, deps.Auth, identityhttp.NewLoginLimiter(time.Now), deps.Audit)
+	}
+	if deps.Users != nil {
+		identityhttp.RegisterUserRoutes(mux, deps.Users)
+	}
+	if deps.Audit != nil {
+		// The route is mounted here because the admin guard lives in the
+		// identity interface package; the audit handler itself only lists.
+		mux.Handle("GET /api/admin/audit", identityhttp.RequireAdmin(audithttp.NewHandler(deps.Audit)))
 	}
 	return withMiddleware(mux, cfg, deps, logger)
 }

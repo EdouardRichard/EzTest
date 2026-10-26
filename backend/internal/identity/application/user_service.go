@@ -28,25 +28,59 @@ type Hasher interface {
 	Verify(hash, password string) bool
 }
 
+// TokenRevoker revokes every token of a user. It is implemented by the token
+// repository and used when a password is reset: the old sessions must stop
+// working immediately.
+type TokenRevoker interface {
+	RevokeAllForUser(ctx context.Context, userID int64) error
+}
+
 // UserService manages user accounts for the admin settings screen and seeds the
 // single admin account at startup.
 type UserService struct {
 	repo     identity.Repository
 	hasher   Hasher
 	recorder audit.Recorder
+	tokens   TokenRevoker
 }
 
-// NewUserService wires the user service to its repository, password hasher and
-// audit recorder.
-func NewUserService(repo identity.Repository, hasher Hasher, recorder audit.Recorder) *UserService {
-	return &UserService{repo: repo, hasher: hasher, recorder: recorder}
+// NewUserService wires the user service to its repository, password hasher,
+// audit recorder and token revoker.
+func NewUserService(repo identity.Repository, hasher Hasher, recorder audit.Recorder, tokens TokenRevoker) *UserService {
+	return &UserService{repo: repo, hasher: hasher, recorder: recorder, tokens: tokens}
+}
+
+// withRequestContext merges the HTTP request metadata and the authenticated
+// actor carried by ctx into entry. The entry keeps whatever the service set
+// explicitly; the context only fills the gaps. This is how handler-set metadata
+// reaches existing service-level audit records without changing every service
+// signature.
+func withRequestContext(ctx context.Context, entry auditdomain.Entry) auditdomain.Entry {
+	meta := audit.MetaFromContext(ctx)
+	if entry.RequestID == "" {
+		entry.RequestID = meta.RequestID
+	}
+	if entry.IP == "" {
+		entry.IP = meta.IP
+	}
+	if entry.UserAgent == "" {
+		entry.UserAgent = meta.UserAgent
+	}
+	if entry.ActorUserID == nil {
+		if actorID, ok := audit.ActorIDFromContext(ctx); ok {
+			entry.ActorUserID = &actorID
+		}
+	}
+	return entry
 }
 
 // recordAudit writes one audit entry. Auditing is best-effort: a failed audit
 // write must not turn a completed action into an error, but it is logged. The
 // log line never includes the entry metadata, so credentials cannot leak
-// through it.
+// through it. Request metadata and the authenticated actor are merged from the
+// context before the entry is persisted.
 func recordAudit(ctx context.Context, recorder audit.Recorder, entry auditdomain.Entry) {
+	entry = withRequestContext(ctx, entry)
 	if err := recorder.Record(ctx, entry); err != nil {
 		slog.ErrorContext(ctx, "audit: record entry", "action", entry.Action, "error", err)
 	}
@@ -177,9 +211,9 @@ func (s *UserService) SetStatus(ctx context.Context, actorID, userID int64, stat
 	return user, nil
 }
 
-// ResetPassword replaces a user's password with a freshly hashed one. Token
-// revocation is wired in the auth task; until then the auth layer validates the
-// user status on every request.
+// ResetPassword replaces a user's password with a freshly hashed one and
+// revokes every token of that user, so sessions opened with the old password
+// stop working immediately.
 func (s *UserService) ResetPassword(ctx context.Context, userID int64, password string) error {
 	if err := identity.ValidatePassword(password); err != nil {
 		return err
@@ -190,6 +224,9 @@ func (s *UserService) ResetPassword(ctx context.Context, userID int64, password 
 	}
 	if err := s.repo.UpdatePasswordHash(ctx, userID, hash); err != nil {
 		return err
+	}
+	if err := s.tokens.RevokeAllForUser(ctx, userID); err != nil {
+		return fmt.Errorf("identity: revoke user tokens: %w", err)
 	}
 	recordAudit(ctx, s.recorder, auditdomain.Entry{
 		Action:     audit.ActionUserPasswordReset,

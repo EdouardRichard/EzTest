@@ -63,7 +63,7 @@ func TestPasswordHashCostAndMaxLength(t *testing.T) {
 
 func TestCreateUserRejectsDuplicateAndWeak(t *testing.T) {
 	repo := newFakeUserRepo()
-	svc := NewUserService(repo, password.NewHasher(12), audit.NopRecorder{})
+	svc := NewUserService(repo, password.NewHasher(12), audit.NopRecorder{}, newFakeTokenRevoker())
 	if _, err := svc.Create(ctx, "qa01", "1234567890"); err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +86,7 @@ func TestCreateUserValidatesUsername(t *testing.T) {
 	}
 	for _, username := range invalid {
 		t.Run("invalid/"+username, func(t *testing.T) {
-			svc := NewUserService(newFakeUserRepo(), password.NewHasher(12), audit.NopRecorder{})
+			svc := NewUserService(newFakeUserRepo(), password.NewHasher(12), audit.NopRecorder{}, newFakeTokenRevoker())
 			if _, err := svc.Create(ctx, username, "1234567890"); !errors.Is(err, identity.ErrInvalidUsername) {
 				t.Fatalf("username %q: err=%v", username, err)
 			}
@@ -96,7 +96,7 @@ func TestCreateUserValidatesUsername(t *testing.T) {
 	valid := []string{"qa1", "qa_01", "qa-01", "qa.01", strings.Repeat("a", 64)}
 	for _, username := range valid {
 		t.Run("valid/"+username, func(t *testing.T) {
-			svc := NewUserService(newFakeUserRepo(), password.NewHasher(12), audit.NopRecorder{})
+			svc := NewUserService(newFakeUserRepo(), password.NewHasher(12), audit.NopRecorder{}, newFakeTokenRevoker())
 			if _, err := svc.Create(ctx, username, "1234567890"); err != nil {
 				t.Fatalf("username %q: %v", username, err)
 			}
@@ -113,14 +113,14 @@ func TestCreateUserValidatesPassword(t *testing.T) {
 	}
 	for _, pw := range invalid {
 		t.Run("weak", func(t *testing.T) {
-			svc := NewUserService(newFakeUserRepo(), password.NewHasher(12), audit.NopRecorder{})
+			svc := NewUserService(newFakeUserRepo(), password.NewHasher(12), audit.NopRecorder{}, newFakeTokenRevoker())
 			if _, err := svc.Create(ctx, "qa01", pw); !errors.Is(err, identity.ErrWeakPassword) {
 				t.Fatalf("password length %d: err=%v", len(pw), err)
 			}
 		})
 	}
 
-	svc := NewUserService(newFakeUserRepo(), password.NewHasher(12), audit.NopRecorder{})
+	svc := NewUserService(newFakeUserRepo(), password.NewHasher(12), audit.NopRecorder{}, newFakeTokenRevoker())
 	if _, err := svc.Create(ctx, "qa01", strings.Repeat("a", identity.MaxPasswordLength)); err != nil {
 		t.Fatalf("maximum-length password rejected: %v", err)
 	}
@@ -129,7 +129,7 @@ func TestCreateUserValidatesPassword(t *testing.T) {
 func TestCreateUserStoresHashedUser(t *testing.T) {
 	repo := newFakeUserRepo()
 	hasher := password.NewHasher(12)
-	svc := NewUserService(repo, hasher, audit.NopRecorder{})
+	svc := NewUserService(repo, hasher, audit.NopRecorder{}, newFakeTokenRevoker())
 
 	user, err := svc.Create(ctx, "qa01", "1234567890")
 	if err != nil {
@@ -163,7 +163,7 @@ func TestCreateUserStoresHashedUser(t *testing.T) {
 func TestEnsureAdminSeedsOnce(t *testing.T) {
 	repo := newFakeUserRepo()
 	hasher := password.NewHasher(12)
-	svc := NewUserService(repo, hasher, audit.NopRecorder{})
+	svc := NewUserService(repo, hasher, audit.NopRecorder{}, newFakeTokenRevoker())
 
 	if err := svc.EnsureAdmin(ctx, "admin", "admin-pass-123"); err != nil {
 		t.Fatal(err)
@@ -207,7 +207,7 @@ func TestEnsureAdminSeedsOnce(t *testing.T) {
 }
 
 func TestEnsureAdminToleratesConcurrentSeed(t *testing.T) {
-	svc := NewUserService(concurrentAdminRepo{newFakeUserRepo()}, password.NewHasher(12), audit.NopRecorder{})
+	svc := NewUserService(concurrentAdminRepo{newFakeUserRepo()}, password.NewHasher(12), audit.NopRecorder{}, newFakeTokenRevoker())
 	if err := svc.EnsureAdmin(ctx, "admin", "admin-pass-123"); err != nil {
 		t.Fatalf("concurrent admin seed should be a no-op: %v", err)
 	}
@@ -215,7 +215,7 @@ func TestEnsureAdminToleratesConcurrentSeed(t *testing.T) {
 	// Same race, but PostgreSQL reports the duplicate username constraint
 	// instead of the single-admin index; the service must re-check for an admin.
 	racing := &duplicateNameRepo{fakeUserRepo: newFakeUserRepo()}
-	svc = NewUserService(racing, password.NewHasher(12), audit.NopRecorder{})
+	svc = NewUserService(racing, password.NewHasher(12), audit.NopRecorder{}, newFakeTokenRevoker())
 	if err := svc.EnsureAdmin(ctx, "admin", "admin-pass-123"); err != nil {
 		t.Fatalf("concurrent duplicate-name seed should be a no-op: %v", err)
 	}
@@ -226,7 +226,7 @@ func TestEnsureAdminToleratesConcurrentSeed(t *testing.T) {
 
 func TestEnsureAdminRequiresCredentialsWhenNoAdmin(t *testing.T) {
 	repo := newFakeUserRepo()
-	svc := NewUserService(repo, password.NewHasher(12), audit.NopRecorder{})
+	svc := NewUserService(repo, password.NewHasher(12), audit.NopRecorder{}, newFakeTokenRevoker())
 
 	if err := svc.EnsureAdmin(ctx, "", "admin-pass-123"); !errors.Is(err, identity.ErrInvalidUsername) {
 		t.Fatalf("missing username: err=%v", err)
@@ -241,7 +241,7 @@ func TestEnsureAdminRequiresCredentialsWhenNoAdmin(t *testing.T) {
 
 func TestSetStatusRejectsSelfDisable(t *testing.T) {
 	repo := newFakeUserRepo()
-	svc := NewUserService(repo, password.NewHasher(12), audit.NopRecorder{})
+	svc := NewUserService(repo, password.NewHasher(12), audit.NopRecorder{}, newFakeTokenRevoker())
 	admin, err := repo.Create(ctx, identity.CreateParams{Username: "admin", PasswordHash: "hash", Role: identity.RoleAdmin})
 	if err != nil {
 		t.Fatal(err)
@@ -279,7 +279,8 @@ func TestSetStatusRejectsSelfDisable(t *testing.T) {
 func TestResetPasswordRehashes(t *testing.T) {
 	repo := newFakeUserRepo()
 	hasher := password.NewHasher(12)
-	svc := NewUserService(repo, hasher, audit.NopRecorder{})
+	revoker := newFakeTokenRevoker()
+	svc := NewUserService(repo, hasher, audit.NopRecorder{}, revoker)
 	user, err := repo.Create(ctx, identity.CreateParams{
 		Username:     "qa01",
 		PasswordHash: mustHash(t, hasher, "1234567890"),
@@ -319,9 +320,54 @@ func TestResetPasswordRehashes(t *testing.T) {
 	}
 }
 
+// TestResetPasswordRevokesAllTokens pins the security requirement that a
+// password reset invalidates every session of the target user: only a
+// successful reset revokes, and a revocation failure is surfaced so the caller
+// never believes the sessions are gone.
+func TestResetPasswordRevokesAllTokens(t *testing.T) {
+	repo := newFakeUserRepo()
+	hasher := password.NewHasher(12)
+	revoker := newFakeTokenRevoker()
+	svc := NewUserService(repo, hasher, audit.NopRecorder{}, revoker)
+	user, err := repo.Create(ctx, identity.CreateParams{
+		Username:     "qa01",
+		PasswordHash: mustHash(t, hasher, "1234567890"),
+		Role:         identity.RoleUser,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.ResetPassword(ctx, user.ID, "new-pass-1234"); err != nil {
+		t.Fatal(err)
+	}
+	if len(revoker.revoked) != 1 || revoker.revoked[0] != user.ID {
+		t.Fatalf("revoked=%v want exactly [%d]", revoker.revoked, user.ID)
+	}
+
+	// Invalid input must not revoke anything: the hash never changed.
+	revoker.revoked = nil
+	if err := svc.ResetPassword(ctx, user.ID, "short"); !errors.Is(err, identity.ErrWeakPassword) {
+		t.Fatalf("weak password: err=%v", err)
+	}
+	if err := svc.ResetPassword(ctx, 999, "new-pass-1234"); !errors.Is(err, identity.ErrUserNotFound) {
+		t.Fatalf("missing user: err=%v", err)
+	}
+	if len(revoker.revoked) != 0 {
+		t.Fatalf("failed resets revoked=%v want none", revoker.revoked)
+	}
+
+	// A revocation failure must reach the caller instead of silently leaving
+	// the old sessions usable.
+	revoker.err = errors.New("token store down")
+	if err := svc.ResetPassword(ctx, user.ID, "another-pass-1234"); err == nil {
+		t.Fatal("revocation failure was swallowed")
+	}
+}
+
 func TestGetAndListUsers(t *testing.T) {
 	repo := newFakeUserRepo()
-	svc := NewUserService(repo, password.NewHasher(12), audit.NopRecorder{})
+	svc := NewUserService(repo, password.NewHasher(12), audit.NopRecorder{}, newFakeTokenRevoker())
 	for _, username := range []string{"qa01", "qa02", "qa03"} {
 		if _, err := svc.Create(ctx, username, "1234567890"); err != nil {
 			t.Fatal(err)
@@ -416,6 +462,23 @@ func (r *duplicateNameRepo) CountAdmins(context.Context) (int, error) {
 
 func (r *duplicateNameRepo) Create(context.Context, identity.CreateParams) (identity.User, error) {
 	return identity.User{}, identity.ErrUsernameTaken
+}
+
+// fakeTokenRevoker records the user IDs whose tokens were revoked and can fail
+// on demand so ResetPassword's security behavior is observable.
+type fakeTokenRevoker struct {
+	revoked []int64
+	err     error
+}
+
+func newFakeTokenRevoker() *fakeTokenRevoker { return &fakeTokenRevoker{} }
+
+func (r *fakeTokenRevoker) RevokeAllForUser(_ context.Context, userID int64) error {
+	if r.err != nil {
+		return r.err
+	}
+	r.revoked = append(r.revoked, userID)
+	return nil
 }
 
 // fakeUserRepo is an in-memory identity.Repository for service unit tests. It
