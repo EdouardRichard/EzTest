@@ -57,6 +57,21 @@ const CONFIG = {
   api_key: "sk-should-never-render",
 }
 
+const encoder = new TextEncoder()
+
+/** Builds a one-shot SSE response carrying the given frames. */
+function streamResponse(chunks: string[]): Response {
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
+        controller.close()
+      },
+    }),
+    { status: 200, headers: { "content-type": "text/event-stream" } },
+  )
+}
+
 describe("LLMPanel", () => {
   beforeEach(() => {
     mocks.apiGet.mockReset()
@@ -95,5 +110,42 @@ describe("LLMPanel", () => {
       model: "deepseek-chat",
       is_default: true,
     })
+  })
+
+  it("fails a streaming test that ends without llm.done", async () => {
+    mocks.apiStreamFetch.mockResolvedValue(
+      streamResponse(['event: llm.delta\ndata: {"delta":"hello"}\n\n']),
+    )
+
+    render(<LLMPanel />)
+    await waitFor(() => expect(screen.getByText("deepseek")).toBeTruthy())
+    fireEvent.click(screen.getByRole("button", { name: "编辑" }))
+    fireEvent.click(screen.getByLabelText("流式输出"))
+    fireEvent.click(screen.getByRole("button", { name: "测试连通性" }))
+
+    // The body ended without llm.done (or llm.error): this is a truncated
+    // stream, not a successful test, even if deltas were received.
+    await waitFor(() => expect(screen.getByText(/意外结束/)).toBeTruthy())
+    expect(screen.queryByText("测试通过")).toBeNull()
+    expect(screen.getByText("hello")).toBeTruthy()
+  })
+
+  it("passes a streaming test only after llm.done", async () => {
+    mocks.apiStreamFetch.mockResolvedValue(
+      streamResponse([
+        'event: llm.delta\ndata: {"delta":"hello"}\n\n',
+        'event: llm.done\ndata: {"latency_ms":12,"usage":{"total_tokens":3}}\n\n',
+      ]),
+    )
+
+    render(<LLMPanel />)
+    await waitFor(() => expect(screen.getByText("deepseek")).toBeTruthy())
+    fireEvent.click(screen.getByRole("button", { name: "编辑" }))
+    fireEvent.click(screen.getByLabelText("流式输出"))
+    fireEvent.click(screen.getByRole("button", { name: "测试连通性" }))
+
+    await waitFor(() => expect(screen.getByText("测试通过")).toBeTruthy())
+    expect(screen.queryByText(/意外结束/)).toBeNull()
+    expect(screen.getByText(/延迟 12 ms/)).toBeTruthy()
   })
 })

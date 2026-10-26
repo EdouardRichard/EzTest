@@ -199,7 +199,6 @@ export function connectSSE(options: ConnectSSEOptions): () => void {
     try {
       const headers: Record<string, string> = {
         Accept: "text/event-stream",
-        "Cache-Control": "no-cache",
         Authorization: `Bearer ${options.token}`,
       }
       if (lastSeq !== undefined) headers["Last-Event-ID"] = String(lastSeq)

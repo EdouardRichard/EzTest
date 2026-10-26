@@ -368,6 +368,7 @@ export function LLMPanel() {
         let text = ""
         let doneUsage: Usage | undefined
         let doneLatencyMs: number | undefined
+        let doneSeen = false
         let streamError = ""
         await consumeSSEStream(response, {
           signal: abortController.signal,
@@ -378,6 +379,7 @@ export function LLMPanel() {
                 text += data.delta
                 setStreamText(text)
               } else if (event.event === "llm.done" && isRecord(data)) {
+                doneSeen = true
                 doneUsage = isRecord(data.usage) ? (data.usage as Usage) : undefined
                 doneLatencyMs = typeof data.latency_ms === "number" ? data.latency_ms : undefined
               } else if (event.event === "llm.error" && isRecord(data)) {
@@ -390,6 +392,12 @@ export function LLMPanel() {
         })
         if (streamError !== "") {
           setTestError(streamError)
+          return
+        }
+        if (!doneSeen) {
+          // A body that closes without llm.done means the stream was truncated
+          // (or the backend died mid-test); deltas alone do not prove success.
+          setTestError("流式响应意外结束：未收到 llm.done。")
           return
         }
         setTestResult({

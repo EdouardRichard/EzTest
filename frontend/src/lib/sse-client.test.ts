@@ -99,6 +99,34 @@ describe("connectSSE", () => {
     expect(statuses.at(-1)).toBe("closed")
   })
 
+  it("omits Cache-Control because the CORS allow-list is closed", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(openResponse())
+    vi.stubGlobal("fetch", fetchMock)
+
+    const stop = connectSSE({
+      url: "http://localhost:13333/api/stream?channel=system",
+      token: "ezt_test",
+      lastEventId: 7,
+      onEvent: vi.fn(),
+      onStatus: vi.fn(),
+    })
+
+    await flushMicrotasks()
+    const headers = requestHeaders(fetchMock, 0)
+    const headerNames = Object.keys(headers).map((name) => name.toLowerCase())
+    // The browser must not preflight on a header the API does not allow; the
+    // closed allow-list only covers Authorization, Content-Type, X-Request-ID,
+    // Idempotency-Key and Last-Event-ID.
+    expect(headerNames).not.toContain("cache-control")
+    expect(headers).toMatchObject({
+      Accept: "text/event-stream",
+      Authorization: "Bearer ezt_test",
+    })
+    expect(headers["Last-Event-ID"]).toBe("7")
+
+    stop()
+  })
+
   it("handles stream.reset without advancing lastSeq", async () => {
     vi.useFakeTimers()
     vi.spyOn(Math, "random").mockReturnValue(0)
