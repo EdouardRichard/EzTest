@@ -5,6 +5,7 @@ package server
 import (
 	"context"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -12,7 +13,9 @@ import (
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	audithttp "github.com/EdouardRichard/EzTest/backend/internal/audit/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
+	eventinghttp "github.com/EdouardRichard/EzTest/backend/internal/eventing/interfaces/httpapi"
 	identityhttp "github.com/EdouardRichard/EzTest/backend/internal/identity/interfaces/httpapi"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/idempotency"
 )
 
@@ -20,6 +23,13 @@ import (
 // reachable.
 type Pinger interface {
 	Ping(ctx context.Context) error
+}
+
+// EventService is the eventing use case the server mounts: the snapshot query
+// and the admin test publisher. The eventing application Service satisfies it.
+type EventService interface {
+	eventinghttp.Snapshotter
+	eventinghttp.Publisher
 }
 
 // Dependencies holds the collaborators wired into the HTTP layer. Later tasks
@@ -41,6 +51,14 @@ type Dependencies struct {
 	// Idempotency stores replayable write responses. A nil store disables
 	// idempotent replay (for example in unit tests that do not exercise it).
 	Idempotency idempotency.Store
+	// Events is the eventing use case. When set, GET /api/stream/events is
+	// mounted and, when test endpoints are enabled, the admin test publisher.
+	Events EventService
+	// EventReader replays persisted events for GET /api/stream. The stream route
+	// is mounted only when EventReader and EventHub are both set.
+	EventReader eventinghttp.EventReader
+	// EventHub delivers live events to GET /api/stream.
+	EventHub eventinghttp.EventSubscriber
 }
 
 // New assembles the HTTP handler. Middleware runs in the order
@@ -62,6 +80,22 @@ func New(cfg config.Config, logger *slog.Logger, deps Dependencies) http.Handler
 		// The route is mounted here because the admin guard lives in the
 		// identity interface package; the audit handler itself only lists.
 		mux.Handle("GET /api/admin/audit", identityhttp.RequireAdmin(audithttp.NewHandler(deps.Audit)))
+	}
+	if deps.Events != nil {
+		mux.Handle("GET /api/stream/events", eventinghttp.NewSnapshotHandler(deps.Events))
+	}
+	if deps.EventReader != nil && deps.EventHub != nil {
+		mux.Handle("GET /api/stream",
+			eventinghttp.NewSSEHandler(deps.EventReader, deps.EventHub, eventinghttp.DefaultHeartbeat))
+	}
+	if deps.Events != nil && cfg.EnableTestEndpoints {
+		auditor := deps.Audit
+		if auditor == nil {
+			auditor = auditapp.NopRecorder{}
+		}
+		publisher := eventinghttp.NewTestPublisher(deps.Events, auditor, cfg.EnableTestEndpoints)
+		mux.Handle("POST /api/admin/stream/test-events",
+			identityhttp.RequireAdmin(auditRequestContext(publisher)))
 	}
 	return withMiddleware(mux, cfg, deps, logger)
 }
@@ -124,4 +158,32 @@ func authenticatedUserID(ctx context.Context) (int64, bool) {
 		return 0, false
 	}
 	return user.ID, true
+}
+
+// auditRequestContext attaches the request metadata and the authenticated actor
+// to the context for handlers that record their own audit entries (the eventing
+// test publisher). It must run after authentication; the route applies the
+// admin guard outside it.
+func auditRequestContext(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := auditapp.WithMeta(r.Context(), auditapp.RequestMeta{
+			RequestID: platform.RequestID(r.Context()),
+			IP:        remoteIP(r),
+			UserAgent: r.UserAgent(),
+		})
+		if user, ok := identityhttp.UserFromContext(ctx); ok {
+			ctx = auditapp.WithActorID(ctx, user.ID)
+		}
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// remoteIP extracts the peer address of the request. Forwarding headers are
+// client-controlled and deliberately ignored, matching the login limiter.
+func remoteIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }

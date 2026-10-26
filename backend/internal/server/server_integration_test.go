@@ -3,8 +3,10 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +18,9 @@ import (
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	auditpostgres "github.com/EdouardRichard/EzTest/backend/internal/audit/infrastructure/postgres"
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
+	eventingapp "github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
+	eventinginfra "github.com/EdouardRichard/EzTest/backend/internal/eventing/infrastructure"
+	eventpostgres "github.com/EdouardRichard/EzTest/backend/internal/eventing/infrastructure/postgres"
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/application"
 	identity "github.com/EdouardRichard/EzTest/backend/internal/identity/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/infrastructure/password"
@@ -260,4 +265,302 @@ func doLogin(t *testing.T, h http.Handler, username, password string) string {
 		t.Fatalf("login %q returned no token: %s", username, rec.Body)
 	}
 	return payload.Data.Token
+}
+
+// TestEventStreamAPIsAgainstDatabase is the Task 8 end-to-end check on the real
+// PostgreSQL store and the in-process hub: unknown-channel 404, the admin test
+// publisher (seqs, audit, 403/401), the snapshot envelope and cursor, and an SSE
+// reconnect that replays without duplicates or gaps.
+func TestEventStreamAPIsAgainstDatabase(t *testing.T) {
+	pool := testutil.OpenTestDB(t)
+	ctx := context.Background()
+	userRepo := identitypostgres.NewUserRepository(pool)
+	tokenRepo := identitypostgres.NewTokenRepository(pool)
+	hasher := password.NewHasher(12)
+	auditor := auditapp.NewService(auditpostgres.NewRepository(pool))
+
+	userSvc := application.NewUserService(userRepo, hasher, auditor, tokenRepo)
+	if err := userSvc.EnsureAdmin(ctx, "admin", "admin-pass-123"); err != nil {
+		t.Fatal(err)
+	}
+	authSvc := application.NewAuthService(userRepo, tokenRepo, hasher, time.Now, auditor)
+
+	eventStore := eventpostgres.NewEventStore(pool)
+	eventHub := eventinginfra.NewHub()
+	eventSvc := eventingapp.NewService(eventStore, eventHub)
+
+	h := New(config.Config{Env: "test", EnableTestEndpoints: true}, testLogger(), Dependencies{
+		Pinger:      fakePinger{},
+		Auth:        authSvc,
+		Users:       userSvc,
+		Audit:       auditor,
+		Events:      eventSvc,
+		EventReader: eventStore,
+		EventHub:    eventHub,
+	})
+
+	adminToken := doLogin(t, h, "admin", "admin-pass-123")
+	rec := doJSON(t, h, http.MethodPost, "/api/users",
+		`{"username":"qa01","password":"qa-pass-1234"}`, adminToken, "req_int_stream_create_1")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create user=%d %s", rec.Code, rec.Body)
+	}
+	userToken := doLogin(t, h, "qa01", "qa-pass-1234")
+
+	// Unknown channels are reported as 404 by the snapshot endpoint.
+	rec = doJSON(t, h, http.MethodGet, "/api/stream/events?channel=system", "", adminToken,
+		"req_int_stream_snapshot_empty")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("empty channel snapshot=%d %s want 404", rec.Code, rec.Body)
+	}
+
+	// The admin test publisher writes three synthetic events and returns seqs.
+	rec = doJSON(t, h, http.MethodPost, "/api/admin/stream/test-events",
+		`{"count":3,"summary":"admin test event","detail":{"index":1}}`, adminToken,
+		"req_int_stream_publish_1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("test publish=%d %s", rec.Code, rec.Body)
+	}
+	var published struct {
+		Data struct {
+			Seqs []int64 `json:"seqs"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &published); err != nil {
+		t.Fatalf("decode publish %q: %v", rec.Body, err)
+	}
+	if len(published.Data.Seqs) != 3 || published.Data.Seqs[0] != 1 ||
+		published.Data.Seqs[1] != 2 || published.Data.Seqs[2] != 3 {
+		t.Fatalf("seqs=%v want [1 2 3]", published.Data.Seqs)
+	}
+
+	// The publish is audited with the admin actor and the request metadata.
+	rec = doJSON(t, h, http.MethodGet, "/api/admin/audit?limit=100", "", adminToken,
+		"req_int_stream_audit_1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("audit=%d %s", rec.Code, rec.Body)
+	}
+	var auditPage struct {
+		Data []struct {
+			ActorUserID *int64         `json:"actor_user_id"`
+			Action      string         `json:"action"`
+			RequestID   string         `json:"request_id"`
+			IP          string         `json:"ip"`
+			Metadata    map[string]any `json:"metadata"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &auditPage); err != nil {
+		t.Fatalf("decode audit %q: %v", rec.Body, err)
+	}
+	var publishEntry *struct {
+		ActorUserID *int64         `json:"actor_user_id"`
+		Action      string         `json:"action"`
+		RequestID   string         `json:"request_id"`
+		IP          string         `json:"ip"`
+		Metadata    map[string]any `json:"metadata"`
+	}
+	for i := range auditPage.Data {
+		if auditPage.Data[i].Action == "sse.test_published" {
+			publishEntry = &auditPage.Data[i]
+			break
+		}
+	}
+	if publishEntry == nil {
+		t.Fatalf("audit log has no sse.test_published entry: %+v", auditPage.Data)
+	}
+	if publishEntry.ActorUserID == nil || *publishEntry.ActorUserID != 1 {
+		t.Fatalf("publish audit actor=%v want admin 1", publishEntry.ActorUserID)
+	}
+	if publishEntry.RequestID != "req_int_stream_publish_1" {
+		t.Fatalf("publish audit request_id=%q", publishEntry.RequestID)
+	}
+	if publishEntry.IP != "192.0.2.1" {
+		t.Fatalf("publish audit ip=%q", publishEntry.IP)
+	}
+	if publishEntry.Metadata["count"] != float64(3) {
+		t.Fatalf("publish audit metadata=%v", publishEntry.Metadata)
+	}
+
+	// The snapshot returns the newest events below the cursor, ascending, with
+	// the channel's latest seq and a has_more flag.
+	rec = doJSON(t, h, http.MethodGet, "/api/stream/events?channel=system&limit=2", "", userToken,
+		"req_int_stream_snapshot_1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("snapshot=%d %s", rec.Code, rec.Body)
+	}
+	var snapshot struct {
+		Data struct {
+			Items []struct {
+				Seq     int64          `json:"seq"`
+				Channel string         `json:"channel"`
+				Type    string         `json:"type"`
+				Summary string         `json:"summary"`
+				Detail  map[string]any `json:"detail"`
+				Refs    map[string]any `json:"refs"`
+			} `json:"items"`
+			SnapshotCursor int64 `json:"snapshot_cursor"`
+			HasMore        bool  `json:"has_more"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &snapshot); err != nil {
+		t.Fatalf("decode snapshot %q: %v", rec.Body, err)
+	}
+	if snapshot.Data.SnapshotCursor != 3 || !snapshot.Data.HasMore || len(snapshot.Data.Items) != 2 {
+		t.Fatalf("snapshot=%s", rec.Body)
+	}
+	if snapshot.Data.Items[0].Seq != 2 || snapshot.Data.Items[1].Seq != 3 {
+		t.Fatalf("snapshot seqs=%+v want [2 3]", snapshot.Data.Items)
+	}
+	if snapshot.Data.Items[0].Summary != "admin test event" ||
+		snapshot.Data.Items[0].Detail["index"] != float64(1) ||
+		snapshot.Data.Items[0].Refs["evidence"] == nil {
+		t.Fatalf("snapshot item=%+v", snapshot.Data.Items[0])
+	}
+	rec = doJSON(t, h, http.MethodGet, "/api/stream/events?channel=system&limit=1&before_seq=3", "", adminToken,
+		"req_int_stream_snapshot_2")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("before_seq snapshot=%d %s", rec.Code, rec.Body)
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &snapshot); err != nil {
+		t.Fatalf("decode before_seq snapshot %q: %v", rec.Body, err)
+	}
+	if len(snapshot.Data.Items) != 1 || snapshot.Data.Items[0].Seq != 2 ||
+		snapshot.Data.SnapshotCursor != 3 || !snapshot.Data.HasMore {
+		t.Fatalf("before_seq snapshot=%s", rec.Body)
+	}
+
+	// The test publisher is admin-only and requires authentication.
+	rec = doJSON(t, h, http.MethodPost, "/api/admin/stream/test-events", `{"count":1}`, userToken,
+		"req_int_stream_forbidden_1")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("test publish as user=%d %s want 403", rec.Code, rec.Body)
+	}
+	rec = doJSON(t, h, http.MethodPost, "/api/admin/stream/test-events", `{"count":1}`, "",
+		"req_int_stream_unauth_1")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("test publish anonymous=%d %s want 401", rec.Code, rec.Body)
+	}
+
+	// Open the SSE stream from seq 1: the persisted events 2 and 3 replay, then
+	// an event published while connected arrives live, exactly once.
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	streamCtx, cancelStream := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelStream()
+	stream := openEventStream(t, streamCtx, srv.URL+"/api/stream?channel=system&since=1", adminToken, "")
+	defer stream.Body.Close()
+	if got := stream.Header.Get("X-Snapshot-Cursor"); got != "3" {
+		t.Fatalf("X-Snapshot-Cursor=%q want 3", got)
+	}
+	reader := bufio.NewReader(stream.Body)
+	assertStreamEvent(t, readStreamFrame(t, reader), "2")
+	assertStreamEvent(t, readStreamFrame(t, reader), "3")
+
+	rec = doJSON(t, h, http.MethodPost, "/api/admin/stream/test-events", `{"count":1,"summary":"live"}`, adminToken,
+		"req_int_stream_publish_2")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("live publish=%d %s", rec.Code, rec.Body)
+	}
+	assertStreamEvent(t, readStreamFrame(t, reader), "4")
+	stream.Body.Close()
+
+	// Reconnect with Last-Event-ID: only the missing event is replayed.
+	reconnectCtx, cancelReconnect := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelReconnect()
+	reconnected := openEventStream(t, reconnectCtx, srv.URL+"/api/stream?channel=system&since=1", adminToken, "3")
+	defer reconnected.Body.Close()
+	if got := reconnected.Header.Get("X-Snapshot-Cursor"); got != "4" {
+		t.Fatalf("reconnect X-Snapshot-Cursor=%q want 4", got)
+	}
+	assertStreamEvent(t, readStreamFrame(t, bufio.NewReader(reconnected.Body)), "4")
+}
+
+// openEventStream opens an SSE response and fails on a non-200 status.
+func openEventStream(t *testing.T, ctx context.Context, url, token, lastEventID string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", "eztest-integration/1.0")
+	if lastEventID != "" {
+		req.Header.Set("Last-Event-ID", lastEventID)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("stream status=%d body=%s", resp.StatusCode, body)
+	}
+	return resp
+}
+
+// streamFrame is one parsed SSE frame.
+type streamFrame struct {
+	ID    string
+	Event string
+	Data  string
+}
+
+// readStreamFrame reads one event frame, skipping comment-only heartbeats.
+func readStreamFrame(t *testing.T, reader *bufio.Reader) streamFrame {
+	t.Helper()
+	for {
+		frame := streamFrame{}
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				t.Fatalf("read SSE frame: %v", err)
+			}
+			line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+			if line == "" {
+				break
+			}
+			if strings.HasPrefix(line, ":") {
+				continue
+			}
+			field, value, _ := strings.Cut(line, ":")
+			value = strings.TrimPrefix(value, " ")
+			switch field {
+			case "id":
+				frame.ID = value
+			case "event":
+				frame.Event = value
+			case "data":
+				frame.Data = value
+			}
+		}
+		if frame.ID != "" || frame.Event != "" {
+			return frame
+		}
+	}
+}
+
+// assertStreamEvent checks one replayed event frame's id, type and payload.
+func assertStreamEvent(t *testing.T, frame streamFrame, wantSeq string) {
+	t.Helper()
+	if frame.ID != wantSeq {
+		t.Fatalf("stream id=%q want %q (event=%q data=%q)", frame.ID, wantSeq, frame.Event, frame.Data)
+	}
+	if frame.Event != "system.test" {
+		t.Fatalf("stream event=%q want system.test", frame.Event)
+	}
+	var payload struct {
+		Seq     int64  `json:"seq"`
+		Channel string `json:"channel"`
+		Type    string `json:"type"`
+	}
+	if err := json.Unmarshal([]byte(frame.Data), &payload); err != nil {
+		t.Fatalf("decode stream data %q: %v", frame.Data, err)
+	}
+	if fmt.Sprint(payload.Seq) != wantSeq {
+		t.Fatalf("stream payload seq=%d want %s", payload.Seq, wantSeq)
+	}
+	if payload.Channel != "system" || payload.Type != "system.test" {
+		t.Fatalf("stream payload=%+v", payload)
+	}
 }

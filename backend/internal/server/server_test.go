@@ -17,7 +17,10 @@ import (
 	"time"
 
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
+	auditdomain "github.com/EdouardRichard/EzTest/backend/internal/audit/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
+	eventing "github.com/EdouardRichard/EzTest/backend/internal/eventing/domain"
+	eventinginfra "github.com/EdouardRichard/EzTest/backend/internal/eventing/infrastructure"
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/application"
 	identity "github.com/EdouardRichard/EzTest/backend/internal/identity/domain"
 	identityhttp "github.com/EdouardRichard/EzTest/backend/internal/identity/interfaces/httpapi"
@@ -736,5 +739,174 @@ func TestAuthRoutesWired(t *testing.T) {
 	}
 	if got := rec.Header().Get("WWW-Authenticate"); got != "Bearer" {
 		t.Fatalf("WWW-Authenticate=%q want Bearer", got)
+	}
+}
+
+// stubEventService is a minimal server.EventService used to prove the stream
+// routes are mounted. The snapshot is empty and a publish returns seq 1.
+type stubEventService struct {
+	snapshot []eventing.Event
+}
+
+func (s stubEventService) Snapshot(context.Context, string, int64, int) ([]eventing.Event, int64, bool, error) {
+	return s.snapshot, int64(len(s.snapshot)), false, nil
+}
+
+func (s stubEventService) Publish(_ context.Context, event eventing.NewEvent) (eventing.Event, error) {
+	return eventing.Event{Seq: 1, Channel: event.Channel, Type: event.Type, TS: event.TS}, nil
+}
+
+// stubEventReader is an empty EventReader for route-wiring tests.
+type stubEventReader struct{}
+
+func (stubEventReader) ListAfter(context.Context, string, int64, int) ([]eventing.Event, error) {
+	return nil, nil
+}
+
+func (stubEventReader) LatestSeq(context.Context, string) (int64, error) { return 0, nil }
+
+// capturingAudit records entries so route tests can assert the test publisher's
+// audit entry carries the actor and request metadata.
+type capturingAudit struct {
+	entries []auditdomain.Entry
+}
+
+func (c *capturingAudit) Record(_ context.Context, entry auditdomain.Entry) error {
+	c.entries = append(c.entries, entry)
+	return nil
+}
+
+func (c *capturingAudit) List(context.Context, int, int64) ([]auditdomain.Entry, bool, error) {
+	return c.entries, false, nil
+}
+
+// TestEventStreamRoutesWired proves the composition root mounts the stream
+// endpoints, keeps the global auth, enforces admin-only on the test publisher,
+// registers the publisher only when test endpoints are enabled and attaches the
+// audit actor/request metadata.
+func TestEventStreamRoutesWired(t *testing.T) {
+	admin := identity.User{ID: 1, Username: "admin", Role: identity.RoleAdmin, Status: identity.StatusActive}
+	regular := identity.User{ID: 2, Username: "qa01", Role: identity.RoleUser, Status: identity.StatusActive}
+	auditor := &capturingAudit{}
+	deps := Dependencies{
+		Pinger:      fakePinger{},
+		Auth:        tokenMapAuth{"ezt_admin": admin, "ezt_user": regular},
+		Events:      stubEventService{},
+		EventReader: stubEventReader{},
+		EventHub:    eventinginfra.NewHub(),
+		Audit:       auditor,
+	}
+	cfg := config.Config{Env: "test", EnableTestEndpoints: true}
+	h := New(cfg, testLogger(), deps)
+
+	newReq := func(method, path, token, body string) *http.Request {
+		var reader io.Reader
+		if body != "" {
+			reader = strings.NewReader(body)
+		}
+		req := httptest.NewRequest(method, path, reader)
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		return req
+	}
+
+	// Snapshot is available to any authenticated user, never anonymous.
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, newReq(http.MethodGet, "/api/stream/events?channel=system", "ezt_user", ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("snapshot as user=%d body=%s want 200", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), `"snapshot_cursor":0`) ||
+		!strings.Contains(rec.Body.String(), `"items":[]`) {
+		t.Fatalf("snapshot body=%s", rec.Body)
+	}
+	for _, path := range []string{"/api/stream/events?channel=system", "/api/stream?channel=system"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, newReq(http.MethodGet, path, "", ""))
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("anonymous GET %s=%d want 401", path, rec.Code)
+		}
+	}
+
+	// The admin can publish test events through the mounted route; the audit
+	// entry carries the actor and the request metadata from the server context.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, newReq(http.MethodPost, "/api/admin/stream/test-events", "ezt_admin", `{"count":3}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("publish=%d body=%s want 200", rec.Code, rec.Body)
+	}
+	if len(auditor.entries) != 1 {
+		t.Fatalf("audit entries=%d want 1", len(auditor.entries))
+	}
+	entry := auditor.entries[0]
+	if entry.Action != "sse.test_published" {
+		t.Fatalf("audit action=%q", entry.Action)
+	}
+	if entry.ActorUserID == nil || *entry.ActorUserID != admin.ID {
+		t.Fatalf("audit actor=%v want %d", entry.ActorUserID, admin.ID)
+	}
+	if entry.RequestID == "" {
+		t.Fatal("audit entry has no request id")
+	}
+	if entry.IP != "192.0.2.1" {
+		t.Fatalf("audit ip=%q want the peer address 192.0.2.1", entry.IP)
+	}
+	if entry.Metadata["count"] != 3 {
+		t.Fatalf("audit metadata=%v", entry.Metadata)
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, newReq(http.MethodPost, "/api/admin/stream/test-events", "ezt_user", `{"count":1}`))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("publish as user=%d want 403", rec.Code)
+	}
+
+	// GET /api/stream is a real streaming endpoint: open it against a live
+	// server, check the headers, then close the body.
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/api/stream?channel=system", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer ezt_admin")
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stream=%d want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		t.Fatalf("stream Content-Type=%q", ct)
+	}
+	if got := resp.Header.Get("X-Snapshot-Cursor"); got != "0" {
+		t.Fatalf("X-Snapshot-Cursor=%q want 0", got)
+	}
+}
+
+// TestTestPublisherRouteDisabled proves the admin test publisher is only
+// registered when EZTEST_ENABLE_TEST_ENDPOINTS is enabled.
+func TestTestPublisherRouteDisabled(t *testing.T) {
+	admin := identity.User{ID: 1, Username: "admin", Role: identity.RoleAdmin, Status: identity.StatusActive}
+	deps := Dependencies{
+		Pinger:      fakePinger{},
+		Auth:        tokenMapAuth{"ezt_admin": admin},
+		Events:      stubEventService{},
+		EventReader: stubEventReader{},
+		EventHub:    eventinginfra.NewHub(),
+	}
+	h := New(config.Config{Env: "test", EnableTestEndpoints: false}, testLogger(), deps)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/stream/test-events", strings.NewReader(`{"count":1}`))
+	req.Header.Set("Authorization", "Bearer ezt_admin")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("disabled test publisher=%d body=%s want 404", rec.Code, rec.Body)
 	}
 }
