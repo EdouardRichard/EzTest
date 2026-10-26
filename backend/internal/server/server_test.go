@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
+	"github.com/EdouardRichard/EzTest/backend/internal/identity/application"
+	identity "github.com/EdouardRichard/EzTest/backend/internal/identity/domain"
 )
 
 func testLogger() *slog.Logger {
@@ -263,5 +265,38 @@ func TestLoggingRecordsRequestWithoutSensitiveHeaders(t *testing.T) {
 	}
 	if strings.Contains(out, "super-secret-token") || strings.Contains(out, "Authorization") {
 		t.Fatalf("log leaked sensitive request header: %s", out)
+	}
+}
+
+// stubAuth is an AuthService that rejects every login. It only proves that the
+// server exposes the auth routes when the dependency is wired.
+type stubAuth struct{}
+
+func (stubAuth) Login(context.Context, string, string) (application.LoginResult, error) {
+	return application.LoginResult{}, identity.ErrUnauthenticated
+}
+
+func (stubAuth) Authenticate(context.Context, string) (identity.User, error) {
+	return identity.User{}, identity.ErrUnauthenticated
+}
+
+func (stubAuth) Logout(context.Context, string) error { return nil }
+
+func TestAuthRoutesWired(t *testing.T) {
+	h := New(config.Config{Env: "test"}, testLogger(), Dependencies{Auth: stubAuth{}})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"username":"admin","password":"nope"}`)))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("login=%d body=%s want 401", rec.Code, rec.Body)
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/auth/me", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("me=%d want 401", rec.Code)
+	}
+	if got := rec.Header().Get("WWW-Authenticate"); got != "Bearer" {
+		t.Fatalf("WWW-Authenticate=%q want Bearer", got)
 	}
 }

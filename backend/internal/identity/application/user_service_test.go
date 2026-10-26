@@ -504,6 +504,17 @@ func (r *fakeUserRepo) UpdatePasswordHash(_ context.Context, id int64, passwordH
 	return nil
 }
 
+func (r *fakeUserRepo) UpdateLastLogin(_ context.Context, id int64) error {
+	user, ok := r.users[id]
+	if !ok {
+		return identity.ErrUserNotFound
+	}
+	now := time.Now().UTC()
+	user.LastLoginAt = &now
+	r.users[id] = user
+	return nil
+}
+
 func (r *fakeUserRepo) CountAdmins(_ context.Context) (int, error) {
 	count := 0
 	for _, u := range r.users {

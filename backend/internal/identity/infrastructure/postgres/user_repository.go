@@ -157,6 +157,18 @@ func (r *UserRepository) UpdatePasswordHash(ctx context.Context, id int64, passw
 	return nil
 }
 
+// UpdateLastLogin records the current database time as the user's last login.
+func (r *UserRepository) UpdateLastLogin(ctx context.Context, id int64) error {
+	tag, err := r.pool.Exec(ctx, `UPDATE users SET last_login_at = now() WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("postgres: update user last login: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return identity.ErrUserNotFound
+	}
+	return nil
+}
+
 // CountAdmins returns the number of admin accounts. The users_one_admin index
 // keeps this at most 1 in P0.
 func (r *UserRepository) CountAdmins(ctx context.Context) (int, error) {

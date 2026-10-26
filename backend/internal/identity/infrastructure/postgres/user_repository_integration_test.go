@@ -78,6 +78,20 @@ func TestUserRepositoryCRUDAndPagination(t *testing.T) {
 		t.Fatalf("missing id: err=%v", err)
 	}
 
+	if err := repo.UpdateLastLogin(ctx, user.ID); err != nil {
+		t.Fatal(err)
+	}
+	loggedIn, err := repo.GetByID(ctx, user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loggedIn.LastLoginAt == nil {
+		t.Fatal("UpdateLastLogin did not set last_login_at")
+	}
+	if err := repo.UpdateLastLogin(ctx, 99999); !errors.Is(err, identity.ErrUserNotFound) {
+		t.Fatalf("missing last-login target: err=%v", err)
+	}
+
 	if _, err := repo.Create(ctx, identity.CreateParams{Username: "qa01", PasswordHash: hash, Role: identity.RoleUser}); !errors.Is(err, identity.ErrUsernameTaken) {
 		t.Fatalf("duplicate username: err=%v", err)
 	}
