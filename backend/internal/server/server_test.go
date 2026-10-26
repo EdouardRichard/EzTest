@@ -5,17 +5,22 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/application"
 	identity "github.com/EdouardRichard/EzTest/backend/internal/identity/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/idempotency"
 )
 
 func testLogger() *slog.Logger {
@@ -195,6 +200,77 @@ func TestRecoverMiddlewareReturns500(t *testing.T) {
 	}
 }
 
+// TestPanicResponseUsesSharedErrorEnvelope proves the recover middleware writes
+// the same error envelope as handlers (code, request_id, retryable, details)
+// and that its request ID matches the X-Request-ID header and the panic log.
+func TestPanicResponseUsesSharedErrorEnvelope(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	h := recoverMiddleware(logger)(requestIDMiddleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		panic("boom")
+	})))
+
+	req := httptest.NewRequest(http.MethodGet, "/boom", nil)
+	req.Header.Set("X-Request-ID", "req_panic_1234")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("content-type=%q", ct)
+	}
+	var raw struct {
+		Error struct {
+			Code      string          `json:"code"`
+			Message   string          `json:"message"`
+			RequestID string          `json:"request_id"`
+			Retryable bool            `json:"retryable"`
+			Details   json.RawMessage `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("body=%q: %v", rec.Body.String(), err)
+	}
+	if raw.Error.Code != platform.CodeInternal {
+		t.Fatalf("code=%q want %s", raw.Error.Code, platform.CodeInternal)
+	}
+	if raw.Error.RequestID != "req_panic_1234" {
+		t.Fatalf("request_id=%q want req_panic_1234", raw.Error.RequestID)
+	}
+	if raw.Error.RequestID != rec.Header().Get(requestIDHeader) {
+		t.Fatalf("envelope request_id=%q, header=%q", raw.Error.RequestID, rec.Header().Get(requestIDHeader))
+	}
+	if raw.Error.Retryable {
+		t.Fatal("panic response must not be retryable")
+	}
+	if string(raw.Error.Details) != "{}" {
+		t.Fatalf("details=%s, want {}", raw.Error.Details)
+	}
+	if got := logField(logs.String(), "request_id"); got != raw.Error.RequestID {
+		t.Fatalf("panic log request_id=%q, envelope request_id=%q", got, raw.Error.RequestID)
+	}
+}
+
+// TestRequestIDMiddlewareStoresPlatformContext proves the server middleware and
+// platform.WriteError share one request ID source.
+func TestRequestIDMiddlewareStoresPlatformContext(t *testing.T) {
+	var seen string
+	h := requestIDMiddleware(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		seen = platform.RequestID(r.Context())
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if seen == "" {
+		t.Fatal("platform.RequestID is empty inside the handler")
+	}
+	if seen != rec.Header().Get(requestIDHeader) {
+		t.Fatalf("context request id=%q, response header=%q", seen, rec.Header().Get(requestIDHeader))
+	}
+}
+
 func TestLoggingMiddlewarePreservesFlusher(t *testing.T) {
 	h := loggingMiddleware(testLogger())(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		flusher, ok := w.(http.Flusher)
@@ -281,6 +357,191 @@ func (stubAuth) Authenticate(context.Context, string) (identity.User, error) {
 }
 
 func (stubAuth) Logout(context.Context, string) error { return nil }
+
+// acceptingAuth authenticates exactly one bearer token. It implements
+// identityhttp.AuthService so it can be wired into Dependencies.Auth.
+type acceptingAuth struct {
+	token string
+	user  identity.User
+}
+
+func (a acceptingAuth) Login(context.Context, string, string) (application.LoginResult, error) {
+	return application.LoginResult{}, identity.ErrUnauthenticated
+}
+
+func (a acceptingAuth) Authenticate(_ context.Context, rawToken string) (identity.User, error) {
+	if rawToken != a.token {
+		return identity.User{}, identity.ErrUnauthenticated
+	}
+	return a.user, nil
+}
+
+func (a acceptingAuth) Logout(context.Context, string) error { return nil }
+
+// memoryIdempotencyStore is an in-memory idempotency.Store for middleware-chain
+// tests.
+type memoryIdempotencyStore struct {
+	mu      sync.Mutex
+	entries map[string]idempotency.StoredResponse
+}
+
+func newMemoryIdempotencyStore() *memoryIdempotencyStore {
+	return &memoryIdempotencyStore{entries: make(map[string]idempotency.StoredResponse)}
+}
+
+func (s *memoryIdempotencyStore) Get(_ context.Context, userID int64, key, method, path string) (*idempotency.StoredResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, ok := s.entries[fmt.Sprintf("%d|%s|%s|%s", userID, key, method, path)]
+	if !ok {
+		return nil, nil
+	}
+	return &entry, nil
+}
+
+func (s *memoryIdempotencyStore) Save(_ context.Context, userID int64, key, method, path, requestHash string, status int, body []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.entries[fmt.Sprintf("%d|%s|%s|%s", userID, key, method, path)] = idempotency.StoredResponse{
+		Status:      status,
+		Body:        append([]byte(nil), body...),
+		RequestHash: requestHash,
+	}
+	return nil
+}
+
+// TestMiddlewareChainAuthenticatesBeforeIdempotency pins the production order:
+// auth runs first, so idempotency sees the authenticated user and a retried
+// write is replayed instead of re-executed.
+func TestMiddlewareChainAuthenticatesBeforeIdempotency(t *testing.T) {
+	mux := http.NewServeMux()
+	var calls int32
+	mux.HandleFunc("POST /api/things", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"data":{"id":1}}`))
+	})
+	deps := Dependencies{
+		Auth: acceptingAuth{
+			token: "ezt_valid",
+			user:  identity.User{ID: 7, Username: "qa01", Role: identity.RoleUser, Status: identity.StatusActive},
+		},
+		Idempotency: newMemoryIdempotencyStore(),
+	}
+	h := withMiddleware(mux, config.Config{Env: "test", WebOrigin: "http://localhost:6868"}, deps, testLogger())
+
+	newReq := func() *http.Request {
+		req := httptest.NewRequest(http.MethodPost, "/api/things", strings.NewReader(`{"name":"x"}`))
+		req.Header.Set("Authorization", "Bearer ezt_valid")
+		req.Header.Set("Idempotency-Key", "key_12345678")
+		return req
+	}
+	first := httptest.NewRecorder()
+	h.ServeHTTP(first, newReq())
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first code=%d body=%s", first.Code, first.Body)
+	}
+	second := httptest.NewRecorder()
+	h.ServeHTTP(second, newReq())
+	if second.Header().Get("Idempotent-Replayed") != "true" {
+		t.Fatal("retried write was not replayed; idempotency ran before authentication")
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("handler calls=%d, want 1", got)
+	}
+}
+
+func TestMiddlewareChainRequiresAuthForProtectedAPIRoutes(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/things", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	deps := Dependencies{Auth: acceptingAuth{token: "ezt_valid"}}
+	h := withMiddleware(mux, config.Config{Env: "test"}, deps, testLogger())
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/things", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("code=%d body=%s, want 401", rec.Code, rec.Body)
+	}
+	if got := rec.Header().Get("WWW-Authenticate"); got != "Bearer" {
+		t.Fatalf("WWW-Authenticate=%q", got)
+	}
+}
+
+func TestMiddlewareChainKeepsPublicRoutesPublic(t *testing.T) {
+	deps := Dependencies{Pinger: fakePinger{}, Auth: acceptingAuth{token: "ezt_valid"}}
+
+	// The health routes are registered by New; use a local mux that mirrors the
+	// public routes to exercise the auth carve-outs without the full server.
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", handleHealthz)
+	mux.HandleFunc("GET /api/health", handleAPIHealth(deps.Pinger))
+	mux.HandleFunc("GET /api/openapi.yaml", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	h := withMiddleware(mux, config.Config{Env: "test"}, deps, testLogger())
+
+	for _, path := range []string{"/healthz", "/api/health", "/api/openapi.yaml"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: code=%d body=%s, want 200 without a token", path, rec.Code, rec.Body)
+		}
+	}
+}
+
+func TestMiddlewareChainAppliesCORSPreflightBeforeAuth(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/things", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("preflight must not reach the route")
+	})
+	deps := Dependencies{Auth: acceptingAuth{token: "ezt_valid"}}
+	h := withMiddleware(mux, config.Config{Env: "test", WebOrigin: "http://localhost:6868"}, deps, testLogger())
+
+	req := httptest.NewRequest(http.MethodOptions, "/api/things", nil)
+	req.Header.Set("Origin", "http://localhost:6868")
+	req.Header.Set("Access-Control-Request-Method", "POST")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("code=%d, want 204", rec.Code)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "http://localhost:6868" {
+		t.Fatalf("Access-Control-Allow-Origin=%q", got)
+	}
+}
+
+func TestMiddlewareChainPanicEnvelopeHasRequestID(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/boom", func(w http.ResponseWriter, r *http.Request) {
+		panic("boom")
+	})
+	h := withMiddleware(mux, config.Config{Env: "test"}, Dependencies{Auth: acceptingAuth{token: "ezt_valid"}}, testLogger())
+
+	req := httptest.NewRequest(http.MethodGet, "/api/boom", nil)
+	req.Header.Set("Authorization", "Bearer ezt_valid")
+	req.Header.Set("X-Request-ID", "req_chain_1234")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	var body struct {
+		Error struct {
+			Code      string `json:"code"`
+			RequestID string `json:"request_id"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body=%q: %v", rec.Body.String(), err)
+	}
+	if body.Error.Code != platform.CodeInternal || body.Error.RequestID != "req_chain_1234" {
+		t.Fatalf("envelope=%+v", body.Error)
+	}
+}
 
 func TestAuthRoutesWired(t *testing.T) {
 	h := New(config.Config{Env: "test"}, testLogger(), Dependencies{Auth: stubAuth{}})

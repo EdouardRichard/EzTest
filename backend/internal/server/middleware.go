@@ -8,20 +8,20 @@ import (
 	"runtime/debug"
 	"time"
 
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 )
 
-const requestIDHeader = "X-Request-ID"
+const requestIDHeader = platform.RequestIDHeader
 
 // requestIDPattern is the shape accepted from clients. Anything else is
 // replaced with a generated UUID so untrusted input cannot break logs.
 var requestIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{8,128}$`)
 
-type requestIDContextKey struct{}
-
 // requestIDMiddleware resolves the request ID, stores it in the request
 // context for downstream handlers and middleware, and echoes it on the
-// response.
+// response. The context key is platform's, so platform.WriteError can build the
+// error envelope without knowing about the server package.
 func requestIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestID := r.Header.Get(requestIDHeader)
@@ -29,21 +29,22 @@ func requestIDMiddleware(next http.Handler) http.Handler {
 			requestID = id.RequestID()
 		}
 		w.Header().Set(requestIDHeader, requestID)
-		ctx := context.WithValue(r.Context(), requestIDContextKey{}, requestID)
+		ctx := platform.WithRequestID(r.Context(), requestID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
 // requestIDFromContext returns the request ID set by requestIDMiddleware.
 func requestIDFromContext(ctx context.Context) string {
-	requestID, _ := ctx.Value(requestIDContextKey{}).(string)
-	return requestID
+	return platform.RequestID(ctx)
 }
 
 // recoverMiddleware converts a panicking handler into a logged 500 response
 // instead of dropping the connection. It runs outside requestIDMiddleware, so
-// r.Context() does not carry the ID; read the response header instead, which
-// requestIDMiddleware set before dispatching downstream.
+// r.Context() does not carry the ID; it reads the response header (which
+// requestIDMiddleware set before dispatching downstream) and stores it in the
+// context it hands to platform.WriteError, keeping the envelope and the log
+// consistent.
 func recoverMiddleware(logger *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -52,14 +53,15 @@ func recoverMiddleware(logger *slog.Logger) func(http.Handler) http.Handler {
 				if recovered == nil {
 					return
 				}
+				requestID := w.Header().Get(requestIDHeader)
 				logger.Error("panic recovered",
 					"panic", recovered,
-					"request_id", w.Header().Get(requestIDHeader),
+					"request_id", requestID,
 					"stack", string(debug.Stack()),
 				)
-				w.Header().Set("Content-Type", "application/json; charset=utf-8")
-				w.WriteHeader(http.StatusInternalServerError)
-				_, _ = w.Write([]byte(`{"error":{"code":"internal","message":"internal server error"}}`))
+				ctx := platform.WithRequestID(r.Context(), requestID)
+				platform.WriteError(w, r.WithContext(ctx), http.StatusInternalServerError,
+					platform.CodeInternal, "internal server error")
 			}()
 			next.ServeHTTP(w, r)
 		})
