@@ -326,6 +326,40 @@ func TestUpdateUserStatus(t *testing.T) {
 	}
 }
 
+// TestDisableRevokesTokensPermanently pins the security requirement that
+// disabling an account revokes its sessions instead of only hiding them while
+// the account is disabled: a bearer token issued before the disable must stay
+// rejected after the account is re-enabled.
+func TestDisableRevokesTokensPermanently(t *testing.T) {
+	api := newUserTestAPI(t)
+	admin := loginAs(t, api, "admin", "admin-pass-123")
+	if rec := postJSONWithBearer(api, "/api/users", `{"username":"qa01","password":"qa-pass-123"}`, admin); rec.Code != http.StatusCreated {
+		t.Fatalf("create=%d %s", rec.Code, rec.Body)
+	}
+	oldToken := loginAs(t, api, "qa01", "qa-pass-123")
+	if rec := getWithBearer(api, "/api/auth/me", oldToken); rec.Code != http.StatusOK {
+		t.Fatalf("me before disable=%d %s", rec.Code, rec.Body)
+	}
+
+	if rec := patchJSONWithBearer(api, "/api/users/2", `{"status":"disabled"}`, admin); rec.Code != http.StatusOK {
+		t.Fatalf("disable=%d %s", rec.Code, rec.Body)
+	}
+	// The disabled account is rejected either way; the re-enable below is what
+	// distinguishes a revoked token from one merely hidden by the status check.
+	if rec := getWithBearer(api, "/api/auth/me", oldToken); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("me while disabled=%d %s", rec.Code, rec.Body)
+	}
+
+	if rec := patchJSONWithBearer(api, "/api/users/2", `{"status":"active"}`, admin); rec.Code != http.StatusOK {
+		t.Fatalf("reenable=%d %s", rec.Code, rec.Body)
+	}
+	if rec := getWithBearer(api, "/api/auth/me", oldToken); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("token issued before disable became valid again after re-enable: code=%d body=%s", rec.Code, rec.Body)
+	}
+	// The account itself is active again: a fresh login succeeds.
+	loginAs(t, api, "qa01", "qa-pass-123")
+}
+
 // TestResetPasswordRevokesTokens pins the security requirement: a successful
 // admin password reset revokes every session of the target user, so the old
 // bearer token and the old password stop working.
