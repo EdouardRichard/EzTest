@@ -56,6 +56,13 @@ type rowScanner interface {
 // transaction. Callers broadcast only after Publish returns, so subscribers
 // never observe an event that failed to commit.
 func (s *EventStore) Publish(ctx context.Context, newEvent eventing.NewEvent) (eventing.Event, error) {
+	// The application layer validates before calling, but the store is defence
+	// in depth: a future caller must not be able to persist an event that
+	// violates the frozen envelope contract.
+	if err := eventing.Validate(newEvent); err != nil {
+		return eventing.Event{}, err
+	}
+
 	ts := newEvent.TS.UTC()
 	if newEvent.TS.IsZero() {
 		ts = time.Now().UTC()

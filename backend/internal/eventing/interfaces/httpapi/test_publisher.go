@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -84,16 +85,30 @@ func (p *TestPublisher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		detail = json.RawMessage(`{}`)
 	}
 
+	// Validate before publishing so an invalid envelope is a client error even
+	// when the Publisher is not the application service (400, not a 500) and
+	// always before any event in a count>1 request is written.
+	newEvent := eventing.NewEvent{
+		Channel: testEventChannel,
+		Type:    testEventType,
+		Summary: request.Summary,
+		Detail:  detail,
+		TS:      p.now().UTC(),
+	}
+	if err := eventing.Validate(newEvent); err != nil {
+		writeInvalidEvent(w, r, err)
+		return
+	}
+
 	seqs := make([]int64, 0, count)
 	for i := 0; i < count; i++ {
-		event, err := p.publisher.Publish(r.Context(), eventing.NewEvent{
-			Channel: testEventChannel,
-			Type:    testEventType,
-			Summary: request.Summary,
-			Detail:  detail,
-			TS:      p.now().UTC(),
-		})
+		newEvent.TS = p.now().UTC()
+		event, err := p.publisher.Publish(r.Context(), newEvent)
 		if err != nil {
+			if errors.Is(err, eventing.ErrInvalidEvent) {
+				writeInvalidEvent(w, r, err)
+				return
+			}
 			platform.WriteError(w, r, http.StatusInternalServerError, platform.CodeInternal, "internal server error")
 			return
 		}
@@ -102,6 +117,12 @@ func (p *TestPublisher) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	p.recordAudit(r.Context(), count)
 	writeJSON(w, http.StatusOK, testPublisherEnvelope{Data: testPublisherData{Seqs: seqs}})
+}
+
+// writeInvalidEvent maps an envelope validation failure to the shared 400
+// invalid_argument error envelope.
+func writeInvalidEvent(w http.ResponseWriter, r *http.Request, err error) {
+	platform.WriteError(w, r, http.StatusBadRequest, platform.CodeInvalidArgument, err.Error())
 }
 
 // recordAudit writes the single sse.test_published entry for the request. The

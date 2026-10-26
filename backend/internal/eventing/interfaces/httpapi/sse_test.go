@@ -489,6 +489,98 @@ func TestTestPublisherCountBounds(t *testing.T) {
 	}
 }
 
+// TestTestPublisherEnforcesEnvelopeLimits proves the §7.2 envelope limits are
+// rejected as 400 invalid_argument by the test publisher instead of surfacing as
+// 500s or being persisted, and that boundary values are still accepted.
+func TestTestPublisherEnforcesEnvelopeLimits(t *testing.T) {
+	atLimitDetail := `{"pad":"` + strings.Repeat("a", (64<<10)-len(`{"pad":""}`)) + `"}`
+	overLimitDetail := `{"pad":"` + strings.Repeat("a", (64<<10)+1-len(`{"pad":""}`)) + `"}`
+	tests := []struct {
+		name          string
+		body          string
+		wantStatus    int
+		wantPublished int
+	}{
+		{name: "summary at 500 runes", body: `{"summary":"` + strings.Repeat("通", 500) + `"}`, wantStatus: http.StatusOK, wantPublished: 1},
+		{name: "summary over 500 runes", body: `{"summary":"` + strings.Repeat("通", 501) + `"}`, wantStatus: http.StatusBadRequest},
+		{name: "detail at 64KiB", body: `{"detail":` + atLimitDetail + `}`, wantStatus: http.StatusOK, wantPublished: 1},
+		{name: "detail over 64KiB", body: `{"detail":` + overLimitDetail + `}`, wantStatus: http.StatusBadRequest},
+		{name: "detail array", body: `{"detail":[1,2,3]}`, wantStatus: http.StatusBadRequest},
+		{name: "detail string", body: `{"detail":"not-an-object"}`, wantStatus: http.StatusBadRequest},
+		{name: "detail number", body: `{"detail":42}`, wantStatus: http.StatusBadRequest},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			publisher := &fakePublisher{}
+			auditor := &fakeAuditRecorder{}
+			rec := httptest.NewRecorder()
+			NewTestPublisher(publisher, auditor, true).ServeHTTP(rec,
+				httptest.NewRequest(http.MethodPost, "/api/admin/stream/test-events", strings.NewReader(tc.body)))
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("code=%d want %d body=%s", rec.Code, tc.wantStatus, rec.Body)
+			}
+			if len(publisher.published) != tc.wantPublished {
+				t.Fatalf("published=%d want %d", len(publisher.published), tc.wantPublished)
+			}
+			if tc.wantStatus == http.StatusBadRequest {
+				assertErrorEnvelopeCode(t, rec, http.StatusBadRequest, platform.CodeInvalidArgument)
+				if len(auditor.entries) != 0 {
+					t.Fatalf("invalid request was audited: %+v", auditor.entries)
+				}
+			}
+		})
+	}
+}
+
+// TestTestPublisherMapsPublisherValidationError proves a validation failure that
+// escapes to the Publisher port is still a 400 invalid_argument, not a 500.
+func TestTestPublisherMapsPublisherValidationError(t *testing.T) {
+	publisher := &fakePublisher{err: fmt.Errorf("%w: summary is too long", eventing.ErrInvalidEvent)}
+	auditor := &fakeAuditRecorder{}
+	rec := httptest.NewRecorder()
+	NewTestPublisher(publisher, auditor, true).ServeHTTP(rec,
+		httptest.NewRequest(http.MethodPost, "/api/admin/stream/test-events", strings.NewReader(`{"count":1}`)))
+	assertErrorEnvelopeCode(t, rec, http.StatusBadRequest, platform.CodeInvalidArgument)
+	if len(auditor.entries) != 0 {
+		t.Fatalf("invalid request was audited: %+v", auditor.entries)
+	}
+}
+
+// TestSSELiveGapReplaysMissingPredecessor proves a live broadcast can arrive
+// before its predecessor without hiding it: seq 5 delivered before seq 4 makes
+// the handler replay the persisted seq 4 from the store before writing 5, and
+// the late seq 4 broadcast is deduped.
+func TestSSELiveGapReplaysMissingPredecessor(t *testing.T) {
+	reader := newFakeEventReader(testEvent(1), testEvent(2), testEvent(3))
+	subscriber := newFakeSubscriber()
+	srv := httptest.NewServer(NewSSEHandler(reader, subscriber, time.Hour))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp := openStream(t, ctx, srv.URL+"/api/stream?channel=system")
+	defer resp.Body.Close()
+	stream := bufio.NewReader(resp.Body)
+	if got := resp.Header.Get("X-Snapshot-Cursor"); got != "3" {
+		t.Fatalf("X-Snapshot-Cursor=%q want 3", got)
+	}
+
+	// Both events commit after the connection snapshot. Their broadcasts race;
+	// simulate the hub delivering the higher seq first.
+	reader.appendEvent(testEvent(4), testEvent(5))
+	subscriber.send(testEvent(5))
+	subscriber.send(testEvent(4))
+
+	assertEventFrame(t, readEventFrame(t, stream), 4, "system.test")
+	assertEventFrame(t, readEventFrame(t, stream), 5, "system.test")
+
+	// The stream keeps moving forward: the next live event is delivered, and
+	// the late duplicate seq 4 was not re-emitted before it.
+	reader.appendEvent(testEvent(6))
+	subscriber.send(testEvent(6))
+	assertEventFrame(t, readEventFrame(t, stream), 6, "system.test")
+}
+
 // TestTestPublisherStoreFailure proves a publish failure is reported as a 500
 // and no success audit entry is written.
 func TestTestPublisherStoreFailure(t *testing.T) {
@@ -714,6 +806,17 @@ func newFakeEventReader(events ...eventing.Event) *fakeEventReader {
 	return reader
 }
 
+// appendEvent simulates events committing after a handler has started; it also
+// advances the channel's latest seq.
+func (f *fakeEventReader) appendEvent(events ...eventing.Event) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.events = append(f.events, events...)
+	if len(events) > 0 {
+		f.latest = events[len(events)-1].Seq
+	}
+}
+
 func (f *fakeEventReader) ListAfter(_ context.Context, _ string, afterSeq int64, limit int) ([]eventing.Event, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -739,6 +842,26 @@ func (f *fakeEventReader) LatestSeq(context.Context, string) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.latest, f.latestErr
+}
+
+// fakeSubscriber is a controllable EventSubscriber: the test decides the order
+// in which the broker delivers live events.
+type fakeSubscriber struct {
+	events chan eventing.Event
+}
+
+func newFakeSubscriber() *fakeSubscriber {
+	return &fakeSubscriber{events: make(chan eventing.Event, 16)}
+}
+
+func (s *fakeSubscriber) Subscribe(string) (<-chan eventing.Event, func()) {
+	return s.events, func() {}
+}
+
+func (s *fakeSubscriber) send(events ...eventing.Event) {
+	for _, event := range events {
+		s.events <- event
+	}
 }
 
 // fakeSnapshotter is an in-memory Snapshotter for handler tests.

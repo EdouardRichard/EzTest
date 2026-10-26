@@ -34,8 +34,12 @@ func NewService(store eventing.Store, hub Broker) *Service {
 	return &Service{store: store, hub: hub}
 }
 
-// Publish persists the event and then broadcasts the committed result.
+// Publish validates the envelope, persists the event and then broadcasts the
+// committed result.
 func (s *Service) Publish(ctx context.Context, event eventing.NewEvent) (eventing.Event, error) {
+	if err := eventing.Validate(event); err != nil {
+		return eventing.Event{}, err
+	}
 	published, err := s.store.Publish(ctx, event)
 	if err != nil {
 		return eventing.Event{}, err

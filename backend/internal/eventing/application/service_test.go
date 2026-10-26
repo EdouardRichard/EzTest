@@ -3,6 +3,7 @@ package application_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
@@ -49,6 +50,30 @@ func TestServicePublishWithoutBroker(t *testing.T) {
 	svc := application.NewService(store, nil)
 	if _, err := svc.Publish(ctx, eventing.NewEvent{Channel: "system", Type: "system.test"}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestServicePublishRejectsInvalidEnvelope proves the §7.2 limits are enforced
+// before the store is touched: an over-limit event is neither persisted nor
+// broadcast.
+func TestServicePublishRejectsInvalidEnvelope(t *testing.T) {
+	store := &fakeStore{nextSeq: 1}
+	broker := &fakeBroker{}
+	svc := application.NewService(store, broker)
+
+	_, err := svc.Publish(ctx, eventing.NewEvent{
+		Channel: "system",
+		Type:    "system.test",
+		Summary: strings.Repeat("通", 501),
+	})
+	if !errors.Is(err, eventing.ErrInvalidEvent) {
+		t.Fatalf("Publish error=%v, want ErrInvalidEvent", err)
+	}
+	if len(store.published) != 0 {
+		t.Fatalf("invalid event reached the store: %+v", store.published)
+	}
+	if len(broker.published) != 0 {
+		t.Fatalf("invalid event was broadcast: %+v", broker.published)
 	}
 }
 

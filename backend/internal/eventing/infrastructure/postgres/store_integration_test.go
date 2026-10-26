@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -138,6 +139,109 @@ func TestPublishPersistsEventEnvelope(t *testing.T) {
 		if len(values) != 0 {
 			t.Fatalf("refs.%s=%v want empty", name, values)
 		}
+	}
+}
+
+// TestPublishStoresLowercaseRefsJSON pins the JSONB key casing: SQL consumers
+// read refs->>'evidence', so the persisted object must use the envelope keys,
+// not the Go field names.
+func TestPublishStoresLowercaseRefsJSON(t *testing.T) {
+	pool := testutil.OpenTestDB(t)
+	store := eventpostgres.NewEventStore(pool)
+
+	published, err := store.Publish(ctx, eventing.NewEvent{
+		Channel: "system",
+		Type:    "system.test",
+		Refs: eventing.Refs{
+			Evidence:    []string{"evidence/one"},
+			Case:        []string{"case/one"},
+			Requirement: []string{"requirement/one"},
+			Code:        []string{"code/one"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var evidence, caseRef, requirement, code *string
+	if err := pool.QueryRow(ctx, `
+		SELECT refs->>'evidence', refs->>'case', refs->>'requirement', refs->>'code'
+		FROM events WHERE channel = $1 AND seq = $2`,
+		published.Channel, published.Seq,
+	).Scan(&evidence, &caseRef, &requirement, &code); err != nil {
+		t.Fatal(err)
+	}
+	for _, check := range []struct {
+		key  string
+		got  *string
+		want string
+	}{
+		{"evidence", evidence, `["evidence/one"]`},
+		{"case", caseRef, `["case/one"]`},
+		{"requirement", requirement, `["requirement/one"]`},
+		{"code", code, `["code/one"]`},
+	} {
+		if check.got == nil {
+			t.Fatalf("refs->>'%s' is NULL: JSONB keys must be lowercase", check.key)
+		}
+		if *check.got != check.want {
+			t.Fatalf("refs->>'%s'=%q want %q", check.key, *check.got, check.want)
+		}
+	}
+
+	var oldEvidence, oldCase, oldRequirement, oldCode *string
+	if err := pool.QueryRow(ctx, `
+		SELECT refs->>'Evidence', refs->>'Case', refs->>'Requirement', refs->>'Code'
+		FROM events WHERE channel = $1 AND seq = $2`,
+		published.Channel, published.Seq,
+	).Scan(&oldEvidence, &oldCase, &oldRequirement, &oldCode); err != nil {
+		t.Fatal(err)
+	}
+	if oldEvidence != nil || oldCase != nil || oldRequirement != nil || oldCode != nil {
+		t.Fatalf("refs JSONB still uses Go field names: %v/%v/%v/%v", oldEvidence, oldCase, oldRequirement, oldCode)
+	}
+}
+
+// TestPublishRejectsInvalidEvent proves the store enforces the §7.2 envelope
+// limits itself, as defence in depth: an invalid event allocates no seq and
+// inserts no row.
+func TestPublishRejectsInvalidEvent(t *testing.T) {
+	tests := []struct {
+		name  string
+		event eventing.NewEvent
+	}{
+		{
+			name: "summary over 500 runes",
+			event: eventing.NewEvent{
+				Channel: "system", Type: "system.test", Summary: strings.Repeat("通", 501),
+			},
+		},
+		{
+			name: "detail not a JSON object",
+			event: eventing.NewEvent{
+				Channel: "system", Type: "system.test", Detail: json.RawMessage(`[1,2,3]`),
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := testutil.OpenTestDB(t)
+			store := eventpostgres.NewEventStore(pool)
+
+			if _, err := store.Publish(ctx, tc.event); !errors.Is(err, eventing.ErrInvalidEvent) {
+				t.Fatalf("Publish error=%v, want ErrInvalidEvent", err)
+			}
+			var events int
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM events`).Scan(&events); err != nil {
+				t.Fatal(err)
+			}
+			if events != 0 {
+				t.Fatalf("invalid event was persisted: %d rows", events)
+			}
+			if _, err := store.LatestSeq(ctx, tc.event.Channel); !errors.Is(err, eventing.ErrChannelNotFound) {
+				t.Fatalf("LatestSeq err=%v, want ErrChannelNotFound", err)
+			}
+		})
 	}
 }
 
