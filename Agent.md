@@ -59,6 +59,7 @@
 | `docs/design/frontend-design.md` | 前端详细设计 | 详细设计（从属于主蓝图） | 前端/交互/UI |
 | `docs/design/auth-session-model.md` | 账号/会话详细设计 | 详细设计（从属于主蓝图） | 资源/执行前置/账号安全 |
 | `docs/design/system-overview.md` | 早期版本（已归档） | 非权威；不得用于设计决策 | 仅查历史 |
+| `docs/superpowers/specs/` | 阶段设计规格（P0 起） | 阶段实现依据（从属于主蓝图；冲突以主蓝图为准） | 实现某 Phase 前 |
 | `docs/Pre-Research/`（ARTEX 研究） | 研究/借鉴参考 | 参考（非设计权威）；不得复制源码 | 需要 ARTEX 设计/实现参考时 |
 | 计划/排期/进度类文档（若有） | 实施规划 | **非设计权威**；不得作为设计依据、验收约束或阶段限制 | 仅排期参考 |
 | `LICENSE` + 本地 ARTEX 参考仓库 | 许可与参考实现 | Apache-2.0 / AGPL-3.0 合规边界 | 引入依赖、参考 ARTEX 实现时 |
@@ -82,6 +83,7 @@
 | 前端 | 主蓝图 §12 + `frontend-design.md` |
 | 非功能/质量/风险 | 主蓝图 §13–§16 |
 | ARTEX 参考 | 主蓝图附录 + `docs/Pre-Research/` |
+| 阶段规格/实现依据 | 主蓝图 §15 + `implementation-phases.md` + `docs/superpowers/specs/` 对应规格 |
 | 排期/计划 | 计划类文档（非设计权威） |
 
 ---
@@ -124,7 +126,7 @@ EzTest/
 │     └─ audit/                       # 限界上下文：审计
 ├─ frontend/
 │  ├─ src/app/                        # Next.js App Router，只做页面组装
-│  ├─ src/features/{auth,users,llm-settings,shell}/
+│  ├─ src/features/{auth,users,llm-settings,sse-test,shell}/
 │  ├─ src/components/ui/              # 共享 UI 原语
 │  ├─ src/lib/                        # api-client / sse-client / auth-storage / utils
 │  ├─ src/hooks/  src/navigation/  src/styles/
@@ -132,6 +134,7 @@ EzTest/
 ├─ deploy/                            # Dockerfile.api / Dockerfile.web / docker-compose.yml
 ├─ scripts/                           # dev/db/test/e2e PowerShell 脚本
 ├─ docs/openapi/                      # OpenAPI 骨架
+├─ docs/superpowers/specs/            # 阶段设计规格（P0 起）
 ├─ .env.example  .gitignore
 └─ .tools/                            # 便携 Go/PostgreSQL（gitignored）
 ```
