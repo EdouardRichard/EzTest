@@ -4,3 +4,4 @@ audit_0001_logs.sql
 platform_0001_idempotency.sql
 eventing_0001_events.sql
 llm_0001_configs.sql
+storage_0001_objects.sql

@@ -36,6 +36,11 @@ const (
 	// headers, prompt and image bytes are never recorded.
 	ActionLLMTestSucceeded = "llm.test_succeeded"
 	ActionLLMTestFailed    = "llm.test_failed"
+
+	// ActionStorageObjectCreated is recorded for every accepted object upload.
+	// The entry carries the content-addressed id, size and content type, never
+	// the object bytes.
+	ActionStorageObjectCreated = "storage.object_created"
 )
 
 // Recorder is the audit port consumed by the other bounded contexts. Recording
