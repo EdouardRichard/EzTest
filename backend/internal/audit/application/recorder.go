@@ -25,6 +25,12 @@ const (
 	ActionUserCreated       = "user.created"
 	ActionUserUpdated       = "user.updated"
 	ActionUserPasswordReset = "user.password_reset"
+
+	// LLM configuration lifecycle. Secrets (API keys and header values) are
+	// never part of these entries.
+	ActionLLMConfigCreated = "llm.config_created"
+	ActionLLMConfigUpdated = "llm.config_updated"
+	ActionLLMConfigDeleted = "llm.config_deleted"
 )
 
 // Recorder is the audit port consumed by the other bounded contexts. Recording
