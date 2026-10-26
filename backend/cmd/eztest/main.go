@@ -14,11 +14,19 @@ import (
 
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
 	"github.com/EdouardRichard/EzTest/backend/internal/db"
+	identityapp "github.com/EdouardRichard/EzTest/backend/internal/identity/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/identity/infrastructure/password"
+	identitypostgres "github.com/EdouardRichard/EzTest/backend/internal/identity/infrastructure/postgres"
 	"github.com/EdouardRichard/EzTest/backend/internal/server"
 )
 
-// startupTimeout bounds database connection and migration work at boot.
-const startupTimeout = 30 * time.Second
+const (
+	// startupTimeout bounds database connection, migration and admin seeding
+	// work at boot.
+	startupTimeout = 30 * time.Second
+	// bcryptCost is the documented password hashing cost.
+	bcryptCost = 12
+)
 
 func main() {
 	cfg, err := config.Load(os.Getenv)
@@ -49,6 +57,14 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	defer database.Close()
 	if err := db.MigrateEmbedded(startupCtx, database.Pool); err != nil {
 		return fmt.Errorf("migrate database: %w", err)
+	}
+
+	userService := identityapp.NewUserService(
+		identitypostgres.NewUserRepository(database.Pool),
+		password.NewHasher(bcryptCost),
+	)
+	if err := userService.EnsureAdmin(startupCtx, cfg.AdminUsername, cfg.AdminPassword); err != nil {
+		return fmt.Errorf("seed admin (set EZTEST_ADMIN_USERNAME and EZTEST_ADMIN_PASSWORD when no admin exists): %w", err)
 	}
 	cancelStartup()
 
