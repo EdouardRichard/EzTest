@@ -276,6 +276,57 @@ func TestSetStatusRejectsSelfDisable(t *testing.T) {
 	}
 }
 
+// TestSetStatusDisableRevokesTokens pins the security requirement that
+// disabling an account revokes every session of that user: the status change
+// must not merely hide the account while disabled, because a token issued
+// before the disable would otherwise become valid again after a re-enable. A
+// revocation failure must leave the account active and reach the caller.
+func TestSetStatusDisableRevokesTokens(t *testing.T) {
+	repo := newFakeUserRepo()
+	revoker := newFakeTokenRevoker()
+	svc := NewUserService(repo, password.NewHasher(12), audit.NopRecorder{}, revoker)
+	admin, err := repo.Create(ctx, identity.CreateParams{Username: "admin", PasswordHash: "hash", Role: identity.RoleAdmin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := repo.Create(ctx, identity.CreateParams{Username: "qa01", PasswordHash: "hash", Role: identity.RoleUser})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	disabled, err := svc.SetStatus(ctx, admin.ID, user.ID, identity.StatusDisabled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disabled.Status != identity.StatusDisabled {
+		t.Fatalf("status=%q want disabled", disabled.Status)
+	}
+	if len(revoker.revoked) != 1 || revoker.revoked[0] != user.ID {
+		t.Fatalf("disable revoked=%v want exactly [%d]", revoker.revoked, user.ID)
+	}
+
+	// Re-enabling succeeds; the tokens revoked by the disable stay revoked
+	// (there is no un-revoke). The HTTP and integration tests prove the old
+	// bearer token is still rejected after the account is active again.
+	if _, err := svc.SetStatus(ctx, admin.ID, user.ID, identity.StatusActive); err != nil {
+		t.Fatal(err)
+	}
+
+	// A revocation failure must leave the account active instead of disabling
+	// it with sessions that would come back with a re-enable.
+	revoker.err = errors.New("token store down")
+	if _, err := svc.SetStatus(ctx, admin.ID, user.ID, identity.StatusDisabled); err == nil {
+		t.Fatal("disable swallowed the token revocation failure")
+	}
+	stored, err := repo.GetByID(ctx, user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != identity.StatusActive {
+		t.Fatalf("status=%q after failed disable want active", stored.Status)
+	}
+}
+
 func TestResetPasswordRehashes(t *testing.T) {
 	repo := newFakeUserRepo()
 	hasher := password.NewHasher(12)

@@ -186,13 +186,22 @@ func (s *UserService) Get(ctx context.Context, id int64) (identity.User, error) 
 
 // SetStatus changes a user's status. P0 has exactly one admin and no
 // un-seeded recovery path, so an admin disabling itself would lock everyone
-// out; that request is rejected with ErrLastAdmin.
+// out; that request is rejected with ErrLastAdmin. Disabling revokes every
+// token of the target user before the status is persisted: a token issued
+// before the disable must not become valid again after a re-enable, and a
+// revocation failure leaves the account active instead of disabled with live
+// sessions (fail safe).
 func (s *UserService) SetStatus(ctx context.Context, actorID, userID int64, status identity.Status) (identity.User, error) {
 	if !status.Valid() {
 		return identity.User{}, identity.ErrInvalidStatus
 	}
 	if actorID == userID && status == identity.StatusDisabled {
 		return identity.User{}, identity.ErrLastAdmin
+	}
+	if status == identity.StatusDisabled {
+		if err := s.tokens.RevokeAllForUser(ctx, userID); err != nil {
+			return identity.User{}, fmt.Errorf("identity: revoke user tokens: %w", err)
+		}
 	}
 	user, err := s.repo.UpdateStatus(ctx, userID, status)
 	if err != nil {

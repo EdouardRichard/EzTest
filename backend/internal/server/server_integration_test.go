@@ -134,6 +134,11 @@ func TestUserAndAuditAPIsAgainstDatabase(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("enable=%d %s", rec.Code, rec.Body)
 	}
+	// The disable revoked the token; the re-enable must not resurrect it.
+	rec = doJSON(t, h, http.MethodGet, "/api/auth/me", "", userToken, "req_int_me_reenabled")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("token issued before disable became valid again after re-enable: me=%d %s", rec.Code, rec.Body)
+	}
 	userToken = doLogin(t, h, "qa01", "qa-pass-1234")
 	rec = doJSON(t, h, http.MethodPost, "/api/users/2/reset-password",
 		`{"new_password":"new-pass-1234"}`, adminToken, "req_int_reset_1")
