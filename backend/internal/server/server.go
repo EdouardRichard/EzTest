@@ -71,7 +71,8 @@ type Dependencies struct {
 	LLMClientFactory llmapp.ClientFactory
 	// Storage is the object-storage use case. When set, the admin storage
 	// routes are mounted behind the global bearer auth and the per-route admin
-	// guard.
+	// guard. Reads expose the content type persisted by the metadata
+	// repository wired into the use case by the composition root.
 	Storage storagehttp.ObjectService
 }
 

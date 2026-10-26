@@ -37,9 +37,10 @@ const (
 	ActionLLMTestSucceeded = "llm.test_succeeded"
 	ActionLLMTestFailed    = "llm.test_failed"
 
-	// ActionStorageObjectCreated is recorded for every accepted object upload.
-	// The entry carries the content-addressed id, size and content type, never
-	// the object bytes.
+	// ActionStorageObjectCreated is recorded when a new object metadata row is
+	// created. The entry carries the content-addressed id, size and content
+	// type, never the object bytes. Re-uploading bytes that are already stored
+	// deduplicates and does not record this action.
 	ActionStorageObjectCreated = "storage.object_created"
 )
 
