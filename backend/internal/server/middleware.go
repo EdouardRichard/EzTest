@@ -41,7 +41,9 @@ func requestIDFromContext(ctx context.Context) string {
 }
 
 // recoverMiddleware converts a panicking handler into a logged 500 response
-// instead of dropping the connection.
+// instead of dropping the connection. It runs outside requestIDMiddleware, so
+// r.Context() does not carry the ID; read the response header instead, which
+// requestIDMiddleware set before dispatching downstream.
 func recoverMiddleware(logger *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -52,7 +54,7 @@ func recoverMiddleware(logger *slog.Logger) func(http.Handler) http.Handler {
 				}
 				logger.Error("panic recovered",
 					"panic", recovered,
-					"request_id", requestIDFromContext(r.Context()),
+					"request_id", w.Header().Get(requestIDHeader),
 					"stack", string(debug.Stack()),
 				)
 				w.Header().Set("Content-Type", "application/json; charset=utf-8")

@@ -116,6 +116,42 @@ func TestLoggingMiddlewarePreservesFlusher(t *testing.T) {
 	}
 }
 
+// TestPanicLogAndResponseShareRequestID is the regression test for the panic
+// log reporting an empty request ID even though the response carried one.
+// It composes the middleware in production order (recover -> requestID).
+func TestPanicLogAndResponseShareRequestID(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	h := recoverMiddleware(logger)(requestIDMiddleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		panic("boom")
+	})))
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/boom", nil))
+
+	responseID := rec.Header().Get(requestIDHeader)
+	if responseID == "" {
+		t.Fatal("panic response missing X-Request-ID")
+	}
+	loggedID := logField(logs.String(), "request_id")
+	if loggedID == "" {
+		t.Fatalf("panic log has no request_id (response header had %q): %s", responseID, logs.String())
+	}
+	if loggedID != responseID {
+		t.Fatalf("panic log request_id=%q, response header request_id=%q", loggedID, responseID)
+	}
+}
+
+// logField extracts the first text-handler field value for key from a log.
+func logField(output, key string) string {
+	for _, field := range strings.Fields(output) {
+		if value, ok := strings.CutPrefix(field, key+"="); ok {
+			return strings.Trim(value, `"`)
+		}
+	}
+	return ""
+}
+
 func TestLoggingRecordsRequestWithoutSensitiveHeaders(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
