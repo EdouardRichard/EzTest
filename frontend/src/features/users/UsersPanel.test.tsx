@@ -92,4 +92,23 @@ describe("UsersPanel", () => {
     )
     await waitFor(() => expect(screen.getByText("qa02")).toBeTruthy())
   })
+
+  it("requests the backend's largest page so more than 20 users are shown", async () => {
+    mocks.apiGet.mockResolvedValue([
+      { id: 1, username: "admin", role: "admin", status: "active" },
+      ...Array.from({ length: 25 }, (_, index) => ({
+        id: index + 2,
+        username: `qa${String(index + 1).padStart(2, "0")}`,
+        role: "user",
+        status: "active",
+      })),
+    ])
+
+    render(<UsersPanel />)
+
+    // The backend defaults to 20; without an explicit limit the 21st+ user is
+    // silently missing. The panel must request the maximum page size.
+    await waitFor(() => expect(mocks.apiGet).toHaveBeenCalledWith("/api/users?limit=100"))
+    expect(await screen.findByText("qa25")).toBeTruthy()
+  })
 })

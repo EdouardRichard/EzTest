@@ -59,7 +59,10 @@ export function UsersPanel() {
     setLoading(true)
     setError("")
     try {
-      const list = await apiGet<AuthUser[]>("/api/users")
+      // Ask for the backend's maximum page size. The default is 20 and this
+      // panel has no pagination, so an unqualified request silently hides
+      // every user after the first page.
+      const list = await apiGet<AuthUser[]>("/api/users?limit=100")
       setUsers(Array.isArray(list) ? list : [])
     } catch (caught) {
       setError(describeError(caught))
