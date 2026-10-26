@@ -261,6 +261,79 @@ func TestTokenValidUntilExpiry(t *testing.T) {
 	}
 }
 
+func TestAuthenticateTouchesLastSeenAtMostEveryFiveMinutes(t *testing.T) {
+	users := newFakeUserRepoWith(t, "admin", "admin-pass-123", identity.RoleAdmin)
+	tokens := newFakeTokenRepo()
+	now := fixedNow
+	svc := NewAuthService(users, tokens, password.NewHasher(12), func() time.Time { return now })
+
+	res, err := svc.Login(ctx, "admin", "admin-pass-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := identity.HashToken(res.Token)
+	authenticate := func() {
+		t.Helper()
+		if _, err := svc.Authenticate(ctx, res.Token); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	authenticate()
+	if got := tokens.touchCount[hash]; got != 1 {
+		t.Fatalf("touches after the first authentication=%d want 1", got)
+	}
+	// The service passes a five-minute cutoff so the repository only writes when
+	// the stored last_seen_at is older than the interval.
+	if got, want := tokens.lastCutoff[hash], fixedNow.Add(-5*time.Minute); !got.Equal(want) {
+		t.Fatalf("last-seen cutoff=%v want %v", got, want)
+	}
+
+	// Repeated authentication inside the five-minute interval must not write
+	// last_seen_at again.
+	for _, offset := range []time.Duration{time.Minute, 4 * time.Minute, 5 * time.Minute} {
+		now = fixedNow.Add(offset)
+		authenticate()
+	}
+	if got := tokens.touchCount[hash]; got != 1 {
+		t.Fatalf("touches within five minutes=%d want 1", got)
+	}
+
+	// Once the stored value is older than five minutes, the next authentication
+	// refreshes it.
+	now = fixedNow.Add(5*time.Minute + time.Second)
+	authenticate()
+	if got := tokens.touchCount[hash]; got != 2 {
+		t.Fatalf("touches after five minutes=%d want 2", got)
+	}
+	if got, want := tokens.lastCutoff[hash], now.Add(-5*time.Minute); !got.Equal(want) {
+		t.Fatalf("last-seen cutoff=%v want %v", got, want)
+	}
+}
+
+func TestAuthenticateSucceedsWhenLastSeenTouchFails(t *testing.T) {
+	users := newFakeUserRepoWith(t, "admin", "admin-pass-123", identity.RoleAdmin)
+	tokens := newFakeTokenRepo()
+	svc := NewAuthService(users, tokens, password.NewHasher(12), func() time.Time { return fixedNow })
+
+	res, err := svc.Login(ctx, "admin", "admin-pass-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokens.touchErr = errors.New("database down")
+
+	user, err := svc.Authenticate(ctx, res.Token)
+	if err != nil {
+		t.Fatalf("Authenticate failed because the last-seen touch failed: %v", err)
+	}
+	if user.Username != "admin" {
+		t.Fatalf("user=%+v", user)
+	}
+	if got := tokens.touchAttempts[identity.HashToken(res.Token)]; got != 1 {
+		t.Fatalf("last-seen touch attempts=%d want 1 (the touch is best-effort, not skipped)", got)
+	}
+}
+
 func TestLogoutRevokesCurrentToken(t *testing.T) {
 	users := newFakeUserRepoWith(t, "admin", "admin-pass-123", identity.RoleAdmin)
 	tokens := newFakeTokenRepo()
@@ -331,16 +404,25 @@ func newFakeUserRepoWith(t *testing.T, username, plaintext string, role identity
 // It mirrors the database invariants the service relies on: hashes are unique
 // and revocation is idempotent.
 type fakeTokenRepo struct {
-	byHash    map[string]identity.Token
-	lastHash  string
-	nextID    int64
-	revokedAt time.Time
+	byHash        map[string]identity.Token
+	lastHash      string
+	nextID        int64
+	revokedAt     time.Time
+	lastSeen      map[string]time.Time
+	touchAttempts map[string]int
+	touchCount    map[string]int
+	lastCutoff    map[string]time.Time
+	touchErr      error
 }
 
 func newFakeTokenRepo() *fakeTokenRepo {
 	return &fakeTokenRepo{
-		byHash:    make(map[string]identity.Token),
-		revokedAt: fixedNow,
+		byHash:        make(map[string]identity.Token),
+		revokedAt:     fixedNow,
+		lastSeen:      make(map[string]time.Time),
+		touchAttempts: make(map[string]int),
+		touchCount:    make(map[string]int),
+		lastCutoff:    make(map[string]time.Time),
 	}
 }
 
@@ -389,5 +471,26 @@ func (r *fakeTokenRepo) RevokeAllForUser(_ context.Context, userID int64) error 
 		token.RevokedAt = &revokedAt
 		r.byHash[tokenHash] = token
 	}
+	return nil
+}
+
+// TouchLastSeen mirrors the Postgres UPDATE: it only writes when the stored
+// value is missing or older than the cutoff. The simulated write time is the
+// service's cutoff plus five minutes, i.e. "now" when the service passes
+// now-5m. touchErr lets tests prove the touch is best-effort.
+func (r *fakeTokenRepo) TouchLastSeen(_ context.Context, tokenHash string, olderThan time.Time) error {
+	r.touchAttempts[tokenHash]++
+	if r.touchErr != nil {
+		return r.touchErr
+	}
+	if _, ok := r.byHash[tokenHash]; !ok {
+		return nil
+	}
+	r.lastCutoff[tokenHash] = olderThan
+	if seen, ok := r.lastSeen[tokenHash]; ok && !seen.Before(olderThan) {
+		return nil
+	}
+	r.lastSeen[tokenHash] = olderThan.Add(5 * time.Minute)
+	r.touchCount[tokenHash]++
 	return nil
 }

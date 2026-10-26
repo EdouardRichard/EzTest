@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	identity "github.com/EdouardRichard/EzTest/backend/internal/identity/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/infrastructure/password"
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/infrastructure/postgres"
@@ -146,4 +148,70 @@ func TestTokenRepositoryRejectsUnknownUser(t *testing.T) {
 	if err == nil {
 		t.Fatal("token for a missing user was accepted")
 	}
+}
+
+func TestTokenRepositoryTouchLastSeen(t *testing.T) {
+	pool := testutil.OpenTestDB(t)
+	users := postgres.NewUserRepository(pool)
+	tokens := postgres.NewTokenRepository(pool)
+
+	user, err := users.Create(ctx, identity.CreateParams{
+		Username:     "qa01",
+		PasswordHash: mustHash(t, password.NewHasher(12), "qa-pass-1234"),
+		Role:         identity.RoleUser,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := identity.HashToken(identity.TokenPrefix + "last-seen-token")
+	if err := tokens.Create(ctx, user.ID, hash, time.Now().UTC().Add(identity.TokenTTL)); err != nil {
+		t.Fatal(err)
+	}
+	if seen := lastSeenAt(t, pool, hash); seen != nil {
+		t.Fatalf("fresh token last_seen_at=%v want nil", seen)
+	}
+
+	// A cutoff after the touch stamps the column.
+	if err := tokens.TouchLastSeen(ctx, hash, time.Now().UTC().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	first := lastSeenAt(t, pool, hash)
+	if first == nil {
+		t.Fatal("TouchLastSeen did not set last_seen_at")
+	}
+
+	// A cutoff before the stored value is a no-op; this is the condition that
+	// gives the "at most every five minutes" contract.
+	if err := tokens.TouchLastSeen(ctx, hash, first.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if got := lastSeenAt(t, pool, hash); !got.Equal(*first) {
+		t.Fatalf("stale touch changed last_seen_at to %v, want %v", got, *first)
+	}
+
+	// Once the cutoff passes the stored value, the touch refreshes it.
+	time.Sleep(2 * time.Millisecond)
+	if err := tokens.TouchLastSeen(ctx, hash, first.Add(time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	second := lastSeenAt(t, pool, hash)
+	if !second.After(*first) {
+		t.Fatalf("last_seen_at=%v want after %v", second, *first)
+	}
+
+	// Unknown hashes are a no-op, like any UPDATE that affects no rows.
+	if err := tokens.TouchLastSeen(ctx, identity.HashToken(identity.TokenPrefix+"missing"), time.Now().UTC().Add(time.Hour)); err != nil {
+		t.Fatalf("TouchLastSeen for a missing token: %v", err)
+	}
+}
+
+// lastSeenAt reads auth_tokens.last_seen_at directly so tests observe the
+// column, not a repository mapping.
+func lastSeenAt(t *testing.T, pool *pgxpool.Pool, hash string) *time.Time {
+	t.Helper()
+	var seen *time.Time
+	if err := pool.QueryRow(ctx, `SELECT last_seen_at FROM auth_tokens WHERE token_hash = $1`, hash).Scan(&seen); err != nil {
+		t.Fatalf("read last_seen_at: %v", err)
+	}
+	return seen
 }

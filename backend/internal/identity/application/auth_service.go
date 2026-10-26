@@ -72,7 +72,9 @@ func (s *AuthService) Login(ctx context.Context, username, password string) (Log
 }
 
 // Authenticate resolves a raw bearer token to its user. Unknown, revoked or
-// expired tokens and disabled users all return ErrUnauthenticated.
+// expired tokens and disabled users all return ErrUnauthenticated. A successful
+// authentication best-effort refreshes the token's last-seen timestamp, at most
+// once per identity.TokenSeenInterval.
 func (s *AuthService) Authenticate(ctx context.Context, rawToken string) (identity.User, error) {
 	if rawToken == "" {
 		return identity.User{}, identity.ErrUnauthenticated
@@ -84,7 +86,8 @@ func (s *AuthService) Authenticate(ctx context.Context, rawToken string) (identi
 		}
 		return identity.User{}, fmt.Errorf("identity: authenticate: %w", err)
 	}
-	if token.RevokedAt != nil || !s.now().Before(token.ExpiresAt) {
+	now := s.now()
+	if token.RevokedAt != nil || !now.Before(token.ExpiresAt) {
 		return identity.User{}, identity.ErrUnauthenticated
 	}
 	user, err := s.users.GetByID(ctx, token.UserID)
@@ -97,6 +100,10 @@ func (s *AuthService) Authenticate(ctx context.Context, rawToken string) (identi
 	if user.Status != identity.StatusActive {
 		return identity.User{}, identity.ErrUnauthenticated
 	}
+	// Best-effort: record token usage at most every TokenSeenInterval. A failed
+	// touch must not fail an otherwise valid authentication; the next request
+	// retries it.
+	_ = s.tokens.TouchLastSeen(ctx, token.TokenHash, now.Add(-identity.TokenSeenInterval))
 	return user, nil
 }
 

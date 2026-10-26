@@ -19,8 +19,12 @@ import (
 
 const (
 	// maxLoginBodyBytes caps the login request body so a client cannot make the
-	// server buffer an unbounded amount of JSON.
-	maxLoginBodyBytes = 1 << 20
+	// server buffer an unbounded amount of JSON. A valid login body is tiny (a
+	// bounded username plus a <=128 character password), so 4 KiB is ample.
+	maxLoginBodyBytes = 4 << 10
+	// loginMaxEntries bounds the in-memory limiter map so unauthenticated
+	// requests cannot grow it without bound.
+	loginMaxEntries = 10_000
 	// loginMaxFailures is how many failed logins are tolerated per window.
 	loginMaxFailures = 5
 	// loginWindow is the rolling window the failures are counted in.
@@ -78,6 +82,14 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Reject usernames that cannot name an account before they become limiter
+	// keys or reach the (comparatively expensive) auth service. The 401 is
+	// deliberately indistinguishable from wrong credentials.
+	if err := identity.ValidateUsername(req.Username); err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthenticated", "invalid username or password")
+		return
+	}
+
 	key := loginKey(clientIP(r), req.Username)
 	if h.limiter.Locked(key) {
 		w.Header().Set("Retry-After", "60")
@@ -129,6 +141,8 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 
 // LoginLimiter throttles failed logins in memory, keyed by client IP and
 // username. P0 runs a single instance, so a process-local map is sufficient.
+// The map is bounded and expired entries are swept opportunistically, so an
+// unauthenticated client cannot grow it without bound.
 type LoginLimiter struct {
 	mu       sync.Mutex
 	now      func() time.Time
@@ -150,7 +164,9 @@ func NewLoginLimiter(now func() time.Time) *LoginLimiter {
 	return &LoginLimiter{now: now, attempts: make(map[string]loginAttempt)}
 }
 
-// Locked reports whether key is currently locked out.
+// Locked reports whether key is currently locked out. An entry whose counting
+// window has elapsed and whose lock has passed is forgotten here, so lookups
+// also reclaim abandoned identities.
 func (l *LoginLimiter) Locked(key string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -158,17 +174,30 @@ func (l *LoginLimiter) Locked(key string) bool {
 	if !ok {
 		return false
 	}
-	return l.now().Before(attempt.lockedUntil)
+	now := l.now()
+	if now.Before(attempt.lockedUntil) {
+		return true
+	}
+	if now.Sub(attempt.windowStart) >= loginWindow {
+		delete(l.attempts, key)
+	}
+	return false
 }
 
 // Fail records one failed login. The fifth failure inside a one-minute window
-// locks the key for one minute.
+// locks the key for one minute. Inserting a new identity first sweeps expired
+// entries (so abandoned keys cannot accumulate) and then, when the map is at
+// loginMaxEntries, evicts the oldest remaining entry so the map stays bounded.
 func (l *LoginLimiter) Fail(key string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.now()
 	attempt, ok := l.attempts[key]
 	if !ok || now.Sub(attempt.windowStart) >= loginWindow {
+		l.evictExpired(now)
+		if !ok && len(l.attempts) >= loginMaxEntries {
+			l.evictOldest()
+		}
 		attempt = loginAttempt{windowStart: now}
 	}
 	attempt.failures++
@@ -176,6 +205,30 @@ func (l *LoginLimiter) Fail(key string) {
 		attempt.lockedUntil = now.Add(loginLockDuration)
 	}
 	l.attempts[key] = attempt
+}
+
+// evictExpired removes entries whose counting window has elapsed and whose lock
+// has passed. Callers must hold l.mu.
+func (l *LoginLimiter) evictExpired(now time.Time) {
+	for key, attempt := range l.attempts {
+		if now.Sub(attempt.windowStart) >= loginWindow && !now.Before(attempt.lockedUntil) {
+			delete(l.attempts, key)
+		}
+	}
+}
+
+// evictOldest removes the entry whose counting window started earliest. Callers
+// must hold l.mu and the map must be non-empty.
+func (l *LoginLimiter) evictOldest() {
+	var oldestKey string
+	var oldestStart time.Time
+	for key, attempt := range l.attempts {
+		if oldestKey == "" || attempt.windowStart.Before(oldestStart) {
+			oldestKey = key
+			oldestStart = attempt.windowStart
+		}
+	}
+	delete(l.attempts, oldestKey)
 }
 
 // Reset forgets the failures of a key after a successful login.

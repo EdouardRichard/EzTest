@@ -74,3 +74,14 @@ func (r *TokenRepository) RevokeAllForUser(ctx context.Context, userID int64) er
 	}
 	return nil
 }
+
+// TouchLastSeen refreshes when the token was last used, but only when the
+// stored value is missing or older than olderThan. A missing token affects no
+// rows and is therefore a no-op.
+func (r *TokenRepository) TouchLastSeen(ctx context.Context, tokenHash string, olderThan time.Time) error {
+	const query = `UPDATE auth_tokens SET last_seen_at = now() WHERE token_hash = $1 AND (last_seen_at IS NULL OR last_seen_at < $2)`
+	if _, err := r.pool.Exec(ctx, query, tokenHash, olderThan); err != nil {
+		return fmt.Errorf("postgres: touch token last seen: %w", err)
+	}
+	return nil
+}
