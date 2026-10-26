@@ -19,6 +19,7 @@ import (
 	identityapp "github.com/EdouardRichard/EzTest/backend/internal/identity/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/infrastructure/password"
 	identitypostgres "github.com/EdouardRichard/EzTest/backend/internal/identity/infrastructure/postgres"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/idempotency"
 	"github.com/EdouardRichard/EzTest/backend/internal/server"
 )
 
@@ -75,11 +76,16 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		time.Now,
 		auditor,
 	)
+	idempotencyStore := idempotency.NewPostgresStore(database.Pool)
 	cancelStartup()
 
 	srv := &http.Server{
-		Addr:              cfg.HTTPAddr,
-		Handler:           server.New(cfg, logger, server.Dependencies{Pinger: database, Auth: authService}),
+		Addr: cfg.HTTPAddr,
+		Handler: server.New(cfg, logger, server.Dependencies{
+			Pinger:      database,
+			Auth:        authService,
+			Idempotency: idempotencyStore,
+		}),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

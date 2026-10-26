@@ -1,3 +1,4 @@
 identity_0001_users.sql
 identity_0002_auth_tokens.sql
 audit_0001_logs.sql
+platform_0001_idempotency.sql
