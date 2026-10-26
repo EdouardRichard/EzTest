@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"time"
+
+	llm "github.com/EdouardRichard/EzTest/backend/internal/llm/domain"
 )
 
 // healthPingTimeout bounds the database check performed by /api/health so a
@@ -30,6 +32,12 @@ type healthData struct {
 	LLMConfigured bool   `json:"llm_configured"`
 }
 
+// LLMConfigStore reports the decrypted default LLM configuration. The llm
+// application ConfigService satisfies it.
+type LLMConfigStore interface {
+	GetDefault(ctx context.Context) (llm.Config, error)
+}
+
 // handleHealthz is the liveness probe. It deliberately does not touch any
 // dependency: it answers 200 as long as the process can serve requests.
 func handleHealthz(w http.ResponseWriter, _ *http.Request) {
@@ -39,9 +47,9 @@ func handleHealthz(w http.ResponseWriter, _ *http.Request) {
 }
 
 // handleAPIHealth is the readiness probe. It pings the database with a short
-// timeout and reports 503 when the ping fails. LLM configuration is reported
-// as configured once the LLM context provides a decryptable default config.
-func handleAPIHealth(pinger Pinger) http.HandlerFunc {
+// timeout and reports 503 when the ping fails. LLM configuration is reported as
+// configured only when a default configuration exists and its key decrypts.
+func handleAPIHealth(pinger Pinger, llmConfigs LLMConfigStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), healthPingTimeout)
 		defer cancel()
@@ -57,6 +65,12 @@ func handleAPIHealth(pinger Pinger) http.HandlerFunc {
 			data.Status = "unavailable"
 			data.DB = "down"
 			status = http.StatusServiceUnavailable
+		} else if llmConfigs != nil {
+			// GetDefault decrypts the stored key; a decryption failure is
+			// reported as not configured instead of leaking the crypto error.
+			if cfg, err := llmConfigs.GetDefault(ctx); err == nil && cfg.APIKey != "" {
+				data.LLMConfigured = true
+			}
 		}
 
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")

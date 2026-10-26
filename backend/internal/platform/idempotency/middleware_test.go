@@ -312,6 +312,42 @@ func TestIdempotencyNonStreamingLLMTestIsCached(t *testing.T) {
 	}
 }
 
+// TestIdempotencyStreamingLLMTestBodySkips proves the LLM test endpoint is also
+// skipped when stream=true is in the JSON body, which is the documented request
+// shape: the middleware must not buffer the SSE response or replay it.
+func TestIdempotencyStreamingLLMTestBodySkips(t *testing.T) {
+	store := newFakeIdempotencyStore()
+	var calls int32
+	h := idempotency.Middleware(store, func(context.Context) (int64, bool) { return 1, true })(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&calls, 1)
+			flusher, ok := w.(http.Flusher)
+			if !ok {
+				t.Fatal("streaming handler lost http.Flusher behind the idempotency middleware")
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(w, "event: llm.done\ndata: {\"usage\":{}}\n\n")
+			flusher.Flush()
+		}))
+	for i := 0; i < 2; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, postRequest("/api/admin/llm/configs/7/test", `{"stream":true}`, testKey))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("call %d: code=%d body=%s", i, rec.Code, rec.Body)
+		}
+		if rec.Header().Get("Idempotent-Replayed") != "" {
+			t.Fatalf("call %d: streaming LLM test was replayed", i)
+		}
+		if !rec.Flushed {
+			t.Fatalf("call %d: SSE response was buffered by the idempotency middleware", i)
+		}
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("handler calls=%d want 2", got)
+	}
+}
+
 func TestIdempotencyInvalidKeyRejected(t *testing.T) {
 	store := newFakeIdempotencyStore()
 	var calls int32

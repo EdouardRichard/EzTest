@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -91,17 +92,17 @@ func (r *ConfigRepository) scanConfig(row rowScanner) (llm.Config, error) {
 	if len(apiKeyEnc) > 0 {
 		plaintext, err := r.keyring.DecryptWithAAD(apiKeyEnc, cfg.KeyVersion, aadAPIKey)
 		if err != nil {
-			return llm.Config{}, fmt.Errorf("postgres: decrypt api key: %w", err)
+			return llm.Config{}, fmt.Errorf("%w: %w", llm.ErrSecretsUnavailable, err)
 		}
 		cfg.APIKey = string(plaintext)
 	}
 	if len(headersEnc) > 0 {
 		plaintext, err := r.keyring.DecryptWithAAD(headersEnc, cfg.KeyVersion, aadHeaders)
 		if err != nil {
-			return llm.Config{}, fmt.Errorf("postgres: decrypt headers: %w", err)
+			return llm.Config{}, fmt.Errorf("%w: %w", llm.ErrSecretsUnavailable, err)
 		}
 		if err := json.Unmarshal(plaintext, &cfg.Headers); err != nil {
-			return llm.Config{}, fmt.Errorf("postgres: decode headers: %w", err)
+			return llm.Config{}, fmt.Errorf("%w: decode headers: %v", llm.ErrSecretsUnavailable, err)
 		}
 		if cfg.Headers == nil {
 			cfg.Headers = make(map[string]string)
@@ -158,7 +159,11 @@ func (r *ConfigRepository) Create(ctx context.Context, params llm.CreateParams) 
 	if timeoutMS == 0 {
 		timeoutMS = llm.DefaultTimeoutMS
 	}
-	apiKeyEnc, headersEnc, keyVersion, err := r.encryptSecrets(params.APIKey, params.Headers)
+	name := strings.TrimSpace(params.Name)
+	baseURL := strings.TrimSpace(params.BaseURL)
+	model := strings.TrimSpace(params.Model)
+	headers := normalizeHeaderNames(params.Headers)
+	apiKeyEnc, headersEnc, keyVersion, err := r.encryptSecrets(params.APIKey, headers)
 	if err != nil {
 		return llm.Config{}, err
 	}
@@ -181,10 +186,10 @@ func (r *ConfigRepository) Create(ctx context.Context, params llm.CreateParams) 
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		RETURNING ` + configColumns
 	cfg, err := r.scanConfig(tx.QueryRow(ctx, query,
-		params.Name,
+		name,
 		string(params.Protocol),
-		params.BaseURL,
-		params.Model,
+		baseURL,
+		model,
 		apiKeyEnc,
 		keyVersion,
 		headersEnc,
@@ -303,6 +308,10 @@ func (r *ConfigRepository) Update(ctx context.Context, id int64, params llm.Upda
 	if err != nil {
 		return llm.Config{}, fmt.Errorf("postgres: encode model catalog: %w", err)
 	}
+	name = strings.TrimSpace(name)
+	baseURL = strings.TrimSpace(baseURL)
+	model = strings.TrimSpace(model)
+	headers = normalizeHeaderNames(headers)
 	apiKeyEnc, headersEnc, keyVersion, err := r.encryptSecrets(apiKey, headers)
 	if err != nil {
 		return llm.Config{}, err
@@ -414,6 +423,19 @@ func (r *ConfigRepository) GetDefault(ctx context.Context) (llm.Config, error) {
 		return llm.Config{}, fmt.Errorf("postgres: get default llm config: %w", err)
 	}
 	return cfg, nil
+}
+
+// normalizeHeaderNames trims custom header names before they are persisted.
+// Values are preserved byte-for-byte. A nil map stays nil.
+func normalizeHeaderNames(headers map[string]string) map[string]string {
+	if headers == nil {
+		return nil
+	}
+	normalized := make(map[string]string, len(headers))
+	for name, value := range headers {
+		normalized[strings.TrimSpace(name)] = value
+	}
+	return normalized
 }
 
 // mapUniqueViolation translates the llm_configs table's unique violations into

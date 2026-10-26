@@ -31,6 +31,11 @@ const (
 	ActionLLMConfigCreated = "llm.config_created"
 	ActionLLMConfigUpdated = "llm.config_updated"
 	ActionLLMConfigDeleted = "llm.config_deleted"
+	// LLM connectivity tests. The entries carry the configuration id, model,
+	// protocol, duration and (on failure) the public error code only; the key,
+	// headers, prompt and image bytes are never recorded.
+	ActionLLMTestSucceeded = "llm.test_succeeded"
+	ActionLLMTestFailed    = "llm.test_failed"
 )
 
 // Recorder is the audit port consumed by the other bounded contexts. Recording

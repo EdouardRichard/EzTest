@@ -23,6 +23,8 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/infrastructure/password"
 	identitypostgres "github.com/EdouardRichard/EzTest/backend/internal/identity/infrastructure/postgres"
 	llmapp "github.com/EdouardRichard/EzTest/backend/internal/llm/application"
+	llm "github.com/EdouardRichard/EzTest/backend/internal/llm/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/llm/infrastructure/deepseek"
 	llmpostgres "github.com/EdouardRichard/EzTest/backend/internal/llm/infrastructure/postgres"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/crypto"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/idempotency"
@@ -87,13 +89,25 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("create secret keyring: %w", err)
 	}
-	llmConfigs := llmapp.NewConfigService(llmpostgres.NewConfigRepository(database.Pool, keyring), auditor)
+	llmRepo := llmpostgres.NewConfigRepository(database.Pool, keyring)
+	llmConfigs := llmapp.NewConfigService(llmRepo, auditor)
 	seededLLM, err := llmConfigs.SeedFromEnv(startupCtx, cfg.LLMSeed.BaseURL, cfg.LLMSeed.Key, cfg.LLMSeed.Model)
 	if err != nil {
 		return fmt.Errorf("seed default LLM configuration: %w", err)
 	}
 	if seededLLM {
 		logger.Info("seeded default LLM configuration from environment", "name", "default", "protocol", "chat_completions")
+	}
+	// The client factory applies each stored configuration's protocol, retry,
+	// interval and timeout policy to the upstream adapter.
+	llmClientFactory := func(llmCfg llm.Config) llmapp.Client {
+		timeout := time.Duration(llmCfg.TimeoutMS) * time.Millisecond
+		if timeout <= 0 {
+			timeout = time.Duration(llm.DefaultTimeoutMS) * time.Millisecond
+		}
+		interval := time.Duration(llmCfg.RetryIntervalMS) * time.Millisecond
+		base := deepseek.NewDeepSeekClient(llmCfg, &http.Client{Timeout: timeout})
+		return llmapp.NewRetryClient(base, llmCfg.RetryCount, interval, timeout)
 	}
 	idempotencyStore := idempotency.NewPostgresStore(database.Pool)
 	eventStore := eventpostgres.NewEventStore(database.Pool)
@@ -104,14 +118,16 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	srv := &http.Server{
 		Addr: cfg.HTTPAddr,
 		Handler: server.New(cfg, logger, server.Dependencies{
-			Pinger:      database,
-			Auth:        authService,
-			Users:       userService,
-			Audit:       auditor,
-			Idempotency: idempotencyStore,
-			Events:      eventService,
-			EventReader: eventStore,
-			EventHub:    eventHub,
+			Pinger:           database,
+			Auth:             authService,
+			Users:            userService,
+			Audit:            auditor,
+			Idempotency:      idempotencyStore,
+			Events:           eventService,
+			EventReader:      eventStore,
+			EventHub:         eventHub,
+			LLMConfigs:       llmConfigs,
+			LLMClientFactory: llmClientFactory,
 		}),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
