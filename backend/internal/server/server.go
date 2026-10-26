@@ -19,6 +19,7 @@ import (
 	llmhttp "github.com/EdouardRichard/EzTest/backend/internal/llm/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/idempotency"
+	storagehttp "github.com/EdouardRichard/EzTest/backend/internal/storage/interfaces/httpapi"
 )
 
 // Pinger reports whether a backing dependency (for example the database) is
@@ -68,6 +69,10 @@ type Dependencies struct {
 	// LLMClientFactory builds a protocol client from a stored configuration.
 	// It applies the configuration's retry, interval and timeout policy.
 	LLMClientFactory llmapp.ClientFactory
+	// Storage is the object-storage use case. When set, the admin storage
+	// routes are mounted behind the global bearer auth and the per-route admin
+	// guard.
+	Storage storagehttp.ObjectService
 }
 
 // New assembles the HTTP handler. Middleware runs in the order
@@ -105,6 +110,15 @@ func New(cfg config.Config, logger *slog.Logger, deps Dependencies) http.Handler
 			return identityhttp.RequireAdmin(auditRequestContext(next))
 		}
 		llmhttp.RegisterRoutes(mux, llmHandler, adminGuard)
+	}
+	if deps.Storage != nil {
+		// As with the LLM routes, authentication is the global middleware and
+		// each route only adds the admin guard plus the audit metadata.
+		storageHandler := storagehttp.NewHandler(deps.Storage)
+		adminGuard := func(next http.Handler) http.Handler {
+			return identityhttp.RequireAdmin(auditRequestContext(next))
+		}
+		storagehttp.RegisterRoutes(mux, storageHandler, adminGuard)
 	}
 	if deps.Events != nil && cfg.EnableTestEndpoints {
 		auditor := deps.Audit

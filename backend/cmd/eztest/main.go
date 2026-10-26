@@ -29,6 +29,8 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/crypto"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/idempotency"
 	"github.com/EdouardRichard/EzTest/backend/internal/server"
+	storageapp "github.com/EdouardRichard/EzTest/backend/internal/storage/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/storage/infrastructure/localfs"
 )
 
 const (
@@ -113,6 +115,9 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	eventStore := eventpostgres.NewEventStore(database.Pool)
 	eventHub := eventinginfra.NewHub()
 	eventService := eventingapp.NewService(eventStore, eventHub)
+	// Content-addressed objects live below EZTEST_STORAGE_DIR; the directory is
+	// created lazily on the first upload.
+	storageService := storageapp.NewService(localfs.New(cfg.StorageDir), auditor)
 	cancelStartup()
 
 	srv := &http.Server{
@@ -128,6 +133,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 			EventHub:         eventHub,
 			LLMConfigs:       llmConfigs,
 			LLMClientFactory: llmClientFactory,
+			Storage:          storageService,
 		}),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
