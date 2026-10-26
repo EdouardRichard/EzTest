@@ -120,6 +120,11 @@ func (h *SSEHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			cursor = latest
 		}
+	} else {
+		// A stream with no cursor is live-only: it starts at the snapshot edge
+		// announced in X-Snapshot-Cursor. Keeping cursor at 0 would make the
+		// gap recovery below replay the whole channel history.
+		cursor = latest
 	}
 
 	ticker := time.NewTicker(h.heartbeat)
@@ -133,6 +138,20 @@ func (h *SSEHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				// The hub disconnected this slow consumer. The client reconnects
 				// with Last-Event-ID and replays from the store.
 				return
+			}
+			if event.Seq <= cursor {
+				continue
+			}
+			// The hub broadcasts after commit, but concurrent publishers can
+			// still deliver a higher seq before its predecessor. Replaying the
+			// persisted gap before writing the buffered event keeps the lower
+			// seq from being permanently hidden; the cursor check afterwards
+			// dedupes whatever the replay already emitted.
+			if event.Seq > cursor+1 {
+				cursor, err = h.replayGap(ctx, w, flusher, channel, cursor, event.Seq)
+				if err != nil {
+					return
+				}
 			}
 			if event.Seq <= cursor {
 				continue
@@ -175,6 +194,44 @@ func (h *SSEHandler) replayHistory(ctx context.Context, w io.Writer, flusher htt
 			return cursor, nil
 		}
 	}
+}
+
+// replayGap fills a live-delivery gap before the buffered event at target is
+// written. Concurrent publishers commit seq N and N+1 in order, but the
+// post-commit hub broadcasts are not serialized, so N+1 can reach the handler
+// first. Reading ListAfter(cursor) and emitting every event below target
+// restores the missing predecessor; the caller rechecks the cursor so the
+// buffered event (and a late predecessor broadcast) is not emitted twice. The
+// replay stops at target because the buffered event itself supplies it.
+func (h *SSEHandler) replayGap(ctx context.Context, w io.Writer, flusher http.Flusher, channel string, cursor, target int64) (int64, error) {
+	for cursor+1 < target {
+		events, err := h.reader.ListAfter(ctx, channel, cursor, sseReplayBatch)
+		if err != nil {
+			return cursor, err
+		}
+		if len(events) == 0 {
+			// The predecessor is not readable. Give up on the connection rather
+			// than write target and hide the gap forever; the client reconnects
+			// with Last-Event-ID and receives stream.reset if it is too old.
+			return cursor, fmt.Errorf("eventing: live gap before seq %d cannot be replayed", target)
+		}
+		for _, event := range events {
+			if event.Seq <= cursor {
+				continue
+			}
+			if event.Seq >= target {
+				return cursor, nil
+			}
+			if err := writeSSEEvent(w, flusher, event); err != nil {
+				return cursor, err
+			}
+			cursor = event.Seq
+		}
+		if len(events) < sseReplayBatch && cursor+1 < target {
+			return cursor, fmt.Errorf("eventing: live gap before seq %d cannot be replayed", target)
+		}
+	}
+	return cursor, nil
 }
 
 // channelFromQuery validates the channel query parameter. On failure it writes

@@ -11,12 +11,13 @@ import (
 
 // Refs groups the references an event points at. The four arrays are always
 // present in the API envelope; a missing reference is an empty array, never
-// null.
+// null. The JSON keys are the frozen lowercase envelope names the refs JSONB
+// column stores.
 type Refs struct {
-	Evidence    []string
-	Case        []string
-	Requirement []string
-	Code        []string
+	Evidence    []string `json:"evidence"`
+	Case        []string `json:"case"`
+	Requirement []string `json:"requirement"`
+	Code        []string `json:"code"`
 }
 
 // Event is one persisted stream event. Seq is assigned by the store and is
