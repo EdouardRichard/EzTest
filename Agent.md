@@ -96,7 +96,93 @@
 
 ---
 
-## 6. 本文件边界
+## 6. 仓库结构与代码边界规则
+
+> 本节是**可执行的目录与导入约束**，用于防止后续阶段（含 AI）随意新增目录、跨层引用或复制参考实现。结构变更必须先改本节与主蓝图 `D26`。
+
+### 6.1 目录结构（唯一形态）
+
+```text
+EzTest/
+├─ backend/
+│  ├─ go.mod
+│  ├─ cmd/eztest/main.go              # 唯一组装根（composition root）
+│  └─ internal/
+│     ├─ config/                      # env 解析/校验，不放业务逻辑
+│     ├─ db/                          # pgx pool、事务 helper、迁移执行器
+│     │  └─ migrations/               # <context>_<version>_<desc>.sql
+│     ├─ server/                      # 路由装配、中间件链，不放业务逻辑
+│     ├─ platform/                    # 共享内核：clock/id/errors/pagination/validation/crypto
+│     ├─ identity/                    # 限界上下文：用户/认证
+│     │  ├─ domain/                   # 实体、值对象、仓储接口、领域错误
+│     │  ├─ application/              # 用例/命令/查询
+│     │  ├─ infrastructure/           # postgres repo、bcrypt、token 生成
+│     │  └─ interfaces/httpapi/       # handler、DTO、路由
+│     ├─ eventing/                    # 限界上下文：事件/SSE
+│     ├─ llm/                         # 限界上下文：LLM 配置/网关/模型目录
+│     ├─ storage/                     # 限界上下文：对象存储
+│     └─ audit/                       # 限界上下文：审计
+├─ frontend/
+│  ├─ src/app/                        # Next.js App Router，只做页面组装
+│  ├─ src/features/{auth,users,llm-settings,shell}/
+│  ├─ src/components/ui/              # 共享 UI 原语
+│  ├─ src/lib/                        # api-client / sse-client / auth-storage / utils
+│  ├─ src/hooks/  src/navigation/  src/styles/
+│  └─ package.json
+├─ deploy/                            # Dockerfile.api / Dockerfile.web / docker-compose.yml
+├─ scripts/                           # dev/db/test/e2e PowerShell 脚本
+├─ docs/openapi/                      # OpenAPI 骨架
+├─ .env.example  .gitignore
+└─ .tools/                            # 便携 Go/PostgreSQL（gitignored）
+```
+
+每个限界上下文**必须**四层齐全：`domain/`、`application/`、`infrastructure/`、`interfaces/httpapi/`。上下文名使用小写单数（`identity`、`eventing`、`llm`、`storage`、`audit`），不得新建 `utils/`、`common/`、`helpers/` 之类杂物目录；共享纯逻辑放 `internal/platform/`。
+
+### 6.2 导入方向（Go，强制）
+
+1. `domain` 只依赖标准库与 `platform` 的纯类型；**禁止**导入 `application` / `infrastructure` / `interfaces`，禁止导入 pgx、HTTP、LLM SDK。
+2. `application` 可导入同上下文 `domain` 与 `platform`；**禁止**导入 `infrastructure` / `interfaces`。
+3. `infrastructure` 实现 `domain` 定义的接口；可导入同上下文 `domain` / `application` 的端口定义；**禁止**被 `domain` / `application` 反向导入。
+4. `interfaces/httpapi` 只调用 `application`；DTO 与领域对象分离；**禁止**直接写 SQL 或调用 LLM SDK。
+5. 跨上下文只能通过对方 `application` 接口或事件协作；**禁止**导入对方 `infrastructure` / `interfaces`，禁止跨上下文共享可变状态。
+6. `cmd/eztest` 是唯一组装根；`server` 只做路由与中间件装配；`config` 只做配置解析；`db` 只做连接/事务/迁移。
+7. 测试与被测代码同包/同目录（`*_test.go`）；集成测试可放 `internal/<context>/integration/`，不得把测试辅助代码塞进生产包。
+
+### 6.3 迁移规则
+
+- 迁移文件集中在 `backend/internal/db/migrations/`，命名 `<context>_<version>_<desc>.sql`（如 `identity_0001_users.sql`）。
+- 迁移只做加法式 DDL；已应用迁移**禁止修改**，只能追加新版本。
+- 启动时获取 `pg_advisory_lock`，按版本顺序事务执行，写 `schema_migrations`；重复执行无副作用。
+- 一个迁移文件只属于一个上下文；跨上下文外键需显式评审。
+- 种子数据只允许幂等初始化（管理员、默认 LLM 配置），不得写入业务样例数据。
+
+### 6.4 前端规则
+
+- `src/app/` 只做路由、布局与页面组装；业务状态与交互逻辑放 `src/features/<feature>/`。
+- 所有 HTTP 请求必须走 `src/lib/api-client.ts`（统一错误信封、`X-Request-ID`、Bearer Token）；禁止在组件里直接 `fetch`。
+- SSE 只能走 `src/lib/sse-client.ts`（fetch 流、`Last-Event-ID`、重连状态）；禁止在 feature 内另写 EventSource/轮询。
+- 共享 UI 原语放 `src/components/ui/`；跨 feature 的导航放 `src/navigation/`；主题/全局样式放 `src/styles/`。
+- 不允许新建 `src/utils/` 大杂烩；纯函数放 `src/lib/` 并按领域命名。
+
+### 6.5 新上下文/新模块接入
+
+新增限界上下文时，必须同时：
+
+1. 建齐四层目录与最小空实现；
+2. 在 `cmd/eztest` 注册依赖；
+3. 在 `internal/db/migrations/` 增加该上下文迁移；
+4. 更新本节 6.1 目录树与 `docs/design/system-blueprint.md` 模块边界（如需）；
+5. 若新增前端页面，在 `frontend/src/features/` 建 feature 并在 `src/app/` 只做路由组装。
+
+### 6.6 ARTEX 参考边界
+
+- 只读参考 `D:\Project_new\ARTEX`，**禁止复制/大段搬运/派生源码**（AGPL-3.0；EzTest 为 Apache-2.0）。
+- 需要参考实现时，在实现说明中记录参考 `file:line`、对齐点与刻意差异；ARTEX 无对应时明确写“无对应”。
+- 目录形态参考 ARTEX 的按能力分包与 `cmd/config/db/server/web` 组织方式，但 DDD 分层与导入规则以本节为准。
+
+---
+
+## 7. 本文件边界
 
 - **不是设计文档**：设计事实、决策、原则、不变量、约束一律从主蓝图读取。
 - **不是进度文档**：阶段进度、任务状态、分支/环境状态不属于本文件。
