@@ -699,6 +699,7 @@ type Store interface {
 ### 12.4 验收前必须补齐
 
 - `.env` 增加 `EZTEST_SECRET_KEYS` / `EZTEST_SECRET_KEY_ACTIVE`、`EZTEST_ADMIN_USERNAME` / `EZTEST_ADMIN_PASSWORD`、`EZTEST_DATABASE_URL`；均不提交。
+- 开发环境管理员初始密码允许明文记录在本地开发文档（如 `docs/dev-setup.local.md`，gitignored）或 `.env`，便于登录；数据库仍只存 bcrypt 哈希，API/日志不回显密码。
 - 初始化便携 PostgreSQL，创建 `eztest` / `eztest_test`。
 - 确认 `.env` 的 `llm_base_url` / `llm_key` / `llm_model_name` 有效（真实调用验收前）。
 
