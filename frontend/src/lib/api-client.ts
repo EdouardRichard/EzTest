@@ -148,12 +148,19 @@ function unwrapData<T>(payload: unknown): T {
   return payload as T
 }
 
+type PreparedRequest = {
+  url: string
+  init: RequestInit
+  bearer: string | null
+  requestId: string
+}
+
 /**
- * The single HTTP entry point for the web app. It prefixes the configured API
- * origin, attaches the bearer token, unwraps `{"data": ...}`, turns error
- * envelopes into ApiError, and clears the local session on 401.
+ * Builds the URL, headers and auth for one request. Keeping this separate lets
+ * apiFetch (JSON) and apiStreamFetch (SSE) share the exact same auth/error
+ * behavior without duplicating header rules.
  */
-export async function apiFetch<T>(path: string, init: ApiFetchOptions = {}): Promise<T> {
+function prepareRequest(path: string, init: ApiFetchOptions): PreparedRequest {
   const { token, requestId, idempotencyKey, ...requestInit } = init
   const headers = toHeaderRecord(requestInit.headers)
 
@@ -175,20 +182,48 @@ export async function apiFetch<T>(path: string, init: ApiFetchOptions = {}): Pro
     setHeader(headers, "Idempotency-Key", idempotencyKey)
   }
 
-  let response: Response
+  return {
+    url: resolveApiUrl(path),
+    init: { ...requestInit, headers },
+    bearer: bearer ?? null,
+    requestId: requestId ?? "",
+  }
+}
+
+async function sendRequest(prepared: PreparedRequest): Promise<Response> {
   try {
-    response = await fetch(resolveApiUrl(path), { ...requestInit, headers })
+    return await fetch(prepared.url, prepared.init)
   } catch (cause) {
     throw new ApiError({
       status: 0,
       code: "network_error",
       message: cause instanceof Error ? cause.message : fallbackMessage(0),
-      requestId: requestId ?? "",
+      requestId: prepared.requestId,
       retryable: true,
     })
   }
+}
 
-  if (response.status === 401) clearSession()
+/**
+ * Sends a request and applies the shared 401 rule: clear the local session only
+ * when the request actually attached a bearer. Public calls (for example a
+ * failed login) must not wipe an unrelated existing session.
+ */
+async function performRequest(path: string, init: ApiFetchOptions): Promise<Response> {
+  const prepared = prepareRequest(path, init)
+  const response = await sendRequest(prepared)
+  if (response.status === 401 && prepared.bearer) clearSession()
+  return response
+}
+
+/**
+ * The single HTTP entry point for the web app. It prefixes the configured API
+ * origin, attaches the bearer token, unwraps `{"data": ...}`, turns error
+ * envelopes into ApiError, and clears the local session on an authenticated 401.
+ */
+export async function apiFetch<T>(path: string, init: ApiFetchOptions = {}): Promise<T> {
+  const response = await performRequest(path, init)
+
   if (!response.ok) throw await toApiError(response)
   if (response.status === 204) return undefined as T
 
@@ -209,6 +244,18 @@ export async function apiFetch<T>(path: string, init: ApiFetchOptions = {}): Pro
   }
 
   return unwrapData<T>(payload)
+}
+
+/**
+ * Opens a streaming response (Server-Sent Events) through the same auth and
+ * error layer as apiFetch. The caller reads and parses the body; a non-OK
+ * response still surfaces as ApiError and an authenticated 401 clears the
+ * session. Direct `fetch` stays confined to this module and sse-client.
+ */
+export async function apiStreamFetch(path: string, init: ApiFetchOptions = {}): Promise<Response> {
+  const response = await performRequest(path, init)
+  if (!response.ok) throw await toApiError(response)
+  return response
 }
 
 type RequestOptions = Omit<ApiFetchOptions, "method" | "body">

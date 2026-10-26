@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
-import { ApiError, apiFetch } from "./api-client"
+import { ApiError, apiFetch, apiStreamFetch } from "./api-client"
 import { getToken, setToken } from "./auth-storage"
 
 function jsonResponse(body: unknown, init: ResponseInit = {}) {
@@ -121,5 +121,80 @@ describe("apiFetch", () => {
     stubFetch(new Response(null, { status: 204 }))
 
     await expect(apiFetch<void>("/api/auth/logout", { method: "POST" })).resolves.toBeUndefined()
+  })
+
+  it("keeps the session when a 401 request carried no bearer", async () => {
+    setToken("ezt_current")
+    stubFetch(
+      jsonResponse(
+        {
+          error: {
+            code: "unauthenticated",
+            message: "invalid username or password",
+            request_id: "req_login",
+            retryable: false,
+          },
+        },
+        { status: 401 },
+      ),
+    )
+
+    await expect(
+      apiFetch("/api/auth/login", { method: "POST", token: null, body: "{}" }),
+    ).rejects.toMatchObject({ status: 401 })
+    expect(getToken()).toBe("ezt_current")
+  })
+})
+
+describe("apiStreamFetch", () => {
+  beforeEach(() => {
+    sessionStorage.clear()
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it("returns the raw streaming response with the bearer attached", async () => {
+    const fetchMock = stubFetch(
+      new Response('event: llm.delta\ndata: {"delta":"hi"}\n\n', {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    )
+
+    const response = await apiStreamFetch("/api/admin/llm/configs/1/test", {
+      method: "POST",
+      body: "{}",
+      token: "ezt_stream",
+    })
+
+    await expect(response.text()).resolves.toContain("llm.delta")
+    expect(fetchMock.mock.calls[0][1].headers.Authorization).toBe("Bearer ezt_stream")
+    expect(fetchMock.mock.calls[0][1].headers.Accept).toBe("application/json")
+  })
+
+  it("wraps stream error envelopes in ApiError", async () => {
+    stubFetch(
+      jsonResponse(
+        {
+          error: {
+            code: "invalid_argument",
+            message: "streaming is disabled for this LLM configuration",
+            request_id: "req_stream",
+            retryable: false,
+          },
+        },
+        { status: 400 },
+      ),
+    )
+
+    await expect(
+      apiStreamFetch("/api/admin/llm/configs/1/test", { method: "POST", body: "{}" }),
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_argument",
+      message: "streaming is disabled for this LLM configuration",
+    })
   })
 })
