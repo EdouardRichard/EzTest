@@ -15,6 +15,9 @@ const (
 	TokenPrefix = "ezt_"
 	// TokenTTL is how long a freshly issued token stays valid.
 	TokenTTL = 12 * time.Hour
+	// TokenSeenInterval is the maximum frequency at which an authenticated
+	// request refreshes auth_tokens.last_seen_at (spec §6.2).
+	TokenSeenInterval = 5 * time.Minute
 	// tokenRandomBytes is the entropy of a raw token.
 	tokenRandomBytes = 32
 )

@@ -18,4 +18,9 @@ type TokenRepository interface {
 	Revoke(ctx context.Context, tokenHash string) error
 	// RevokeAllForUser revokes every token of a user. It is idempotent.
 	RevokeAllForUser(ctx context.Context, userID int64) error
+	// TouchLastSeen refreshes auth_tokens.last_seen_at for a token when the
+	// stored value is missing or older than olderThan. A missing token is a
+	// no-op. Callers pass now minus the minimum refresh interval, which is how
+	// the "touch at most once per interval" contract is enforced.
+	TouchLastSeen(ctx context.Context, tokenHash string, olderThan time.Time) error
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -249,6 +250,187 @@ func TestLoginLimiterWindowAndLock(t *testing.T) {
 	}
 }
 
+// size reports how many identities the limiter currently tracks. It takes the
+// mutex so tests can inspect the map concurrently with handler calls.
+func (l *LoginLimiter) size() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.attempts)
+}
+
+// has reports whether the limiter tracks key.
+func (l *LoginLimiter) has(key string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	_, ok := l.attempts[key]
+	return ok
+}
+
+// TestLoginRejectsInvalidUsernameWithoutLimiterEntry proves attacker-sized or
+// malformed usernames are rejected before they can become limiter keys: a flood
+// of them must neither reach the auth service nor grow the limiter map.
+func TestLoginRejectsInvalidUsernameWithoutLimiterEntry(t *testing.T) {
+	h := newTestAPI(t)
+	invalid := map[string]string{
+		"oversized":   strings.Repeat("a", 65),
+		"with space":  "admin name",
+		"too short":   "ab",
+		"empty":       "",
+		"punctuation": "admin!",
+	}
+	for name, username := range invalid {
+		t.Run(name, func(t *testing.T) {
+			body, err := json.Marshal(map[string]string{"username": username, "password": adminPass})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; i < loginMaxFailures; i++ {
+				rec := postJSON(h, "/api/auth/login", string(body))
+				if rec.Code != http.StatusUnauthorized {
+					t.Fatalf("attempt %d: code=%d body=%s want 401", i+1, rec.Code, rec.Body)
+				}
+				if code := decodeErrorCode(t, rec.Body.Bytes()); code != "unauthenticated" {
+					t.Fatalf("attempt %d: error code=%q want unauthenticated", i+1, code)
+				}
+			}
+			if h.limiter.size() != 0 {
+				t.Fatalf("invalid username grew the limiter to %d entries", h.limiter.size())
+			}
+		})
+	}
+	if h.auth.loginCalls != 0 {
+		t.Fatalf("invalid usernames reached the auth service %d times", h.auth.loginCalls)
+	}
+}
+
+// TestLoginBodyLimitEnforced proves a request body over the small login cap is
+// rejected before JSON decoding can buffer it and before it can touch the
+// limiter or the auth service.
+func TestLoginBodyLimitEnforced(t *testing.T) {
+	h := newTestAPI(t)
+	body := `{"username":"admin","password":"` + strings.Repeat("x", 5000) + `"}`
+
+	rec := postJSON(h, "/api/auth/login", body)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("oversized body: code=%d body=%s want 400", rec.Code, rec.Body)
+	}
+	if code := decodeErrorCode(t, rec.Body.Bytes()); code != "invalid_argument" {
+		t.Fatalf("oversized body: error code=%q want invalid_argument", code)
+	}
+	if h.auth.loginCalls != 0 {
+		t.Fatalf("oversized body reached the auth service %d times", h.auth.loginCalls)
+	}
+	if h.limiter.size() != 0 {
+		t.Fatalf("oversized body grew the limiter to %d entries", h.limiter.size())
+	}
+}
+
+// TestLoginLimiterEvictsExpiredEntries proves abandoned identities do not stay
+// in the limiter forever: the next new key sweeps entries whose failure window
+// has elapsed and whose lock has passed.
+func TestLoginLimiterEvictsExpiredEntries(t *testing.T) {
+	now := fixedNow
+	limiter := NewLoginLimiter(func() time.Time { return now })
+	limiter.Fail("192.0.2.1|alice")
+	if got := limiter.size(); got != 1 {
+		t.Fatalf("limiter entries=%d want 1", got)
+	}
+
+	now = now.Add(loginWindow + time.Second)
+	limiter.Fail("192.0.2.1|bob")
+	if got := limiter.size(); got != 1 {
+		t.Fatalf("limiter entries=%d want 1 (expired entry was not evicted)", got)
+	}
+	if limiter.has("192.0.2.1|alice") {
+		t.Fatal("expired entry survived the sweep")
+	}
+	if !limiter.has("192.0.2.1|bob") {
+		t.Fatal("new entry was not recorded")
+	}
+}
+
+// TestLoginLimiterKeepsLockedEntriesDuringSweep proves the sweep only removes
+// entries whose lock has passed; locking out an identity for longer than the
+// counting window must not be cut short by eviction.
+func TestLoginLimiterKeepsLockedEntriesDuringSweep(t *testing.T) {
+	now := fixedNow
+	limiter := NewLoginLimiter(func() time.Time { return now })
+
+	limiter.Fail("192.0.2.1|alice")
+	// The remaining four failures land late in the window, so the lock lasts
+	// until t0+110s while the window expires at t0+60s.
+	now = fixedNow.Add(50 * time.Second)
+	for i := 0; i < loginMaxFailures-1; i++ {
+		limiter.Fail("192.0.2.1|alice")
+	}
+	if !limiter.Locked("192.0.2.1|alice") {
+		t.Fatal("identity was not locked after five failures")
+	}
+
+	// Window expired, lock still running: the entry must survive.
+	now = fixedNow.Add(70 * time.Second)
+	limiter.Fail("192.0.2.1|bob")
+	if !limiter.has("192.0.2.1|alice") {
+		t.Fatal("sweep evicted a still-locked entry")
+	}
+	if got := limiter.size(); got != 2 {
+		t.Fatalf("limiter entries=%d want 2", got)
+	}
+
+	// Lock passed as well: the entry is now evictable.
+	now = fixedNow.Add(111 * time.Second)
+	limiter.Fail("192.0.2.1|carol")
+	if limiter.has("192.0.2.1|alice") {
+		t.Fatal("expired entry survived the sweep after its lock elapsed")
+	}
+	if got := limiter.size(); got != 2 {
+		t.Fatalf("limiter entries=%d want 2 (bob, carol)", got)
+	}
+}
+
+// TestLoginLimiterCapsEntries proves the limiter map cannot grow without bound:
+// at the cap, expired entries are swept first and a remaining entry is evicted
+// to make room for the new key.
+func TestLoginLimiterCapsEntries(t *testing.T) {
+	now := fixedNow
+
+	newLimiter := func(entries int, windowStart time.Time) *LoginLimiter {
+		limiter := NewLoginLimiter(func() time.Time { return now })
+		limiter.mu.Lock()
+		for i := 0; i < entries; i++ {
+			key := fmt.Sprintf("198.51.100.%d|user%d", i%250, i)
+			limiter.attempts[key] = loginAttempt{windowStart: windowStart, failures: 1}
+		}
+		limiter.mu.Unlock()
+		return limiter
+	}
+
+	t.Run("at cap evicts an entry", func(t *testing.T) {
+		limiter := newLimiter(loginMaxEntries, now)
+		for i := 0; i < 5; i++ {
+			key := fmt.Sprintf("203.0.113.9|flood%d", i)
+			limiter.Fail(key)
+			if got := limiter.size(); got != loginMaxEntries {
+				t.Fatalf("insert %d: limiter entries=%d want %d", i, got, loginMaxEntries)
+			}
+			if !limiter.has(key) {
+				t.Fatalf("insert %d: new key was evicted instead of an old one", i)
+			}
+		}
+	})
+
+	t.Run("at cap sweeps expired entries first", func(t *testing.T) {
+		limiter := newLimiter(loginMaxEntries, now.Add(-loginWindow-time.Second))
+		limiter.Fail("203.0.113.9|attacker")
+		if got := limiter.size(); got != 1 {
+			t.Fatalf("limiter entries=%d want 1 after sweeping the expired seed", got)
+		}
+		if !limiter.has("203.0.113.9|attacker") {
+			t.Fatal("new entry was not recorded")
+		}
+	})
+}
+
 // fakeAuthService is an in-memory AuthService for HTTP tests. It issues fixed
 // tokens per account so tests can assert role behaviour without a database.
 type fakeAuthService struct {
@@ -299,20 +481,22 @@ func (f *fakeAuthService) Logout(_ context.Context, rawToken string) error {
 // real user endpoints.
 type testAPI struct {
 	http.Handler
-	auth *fakeAuthService
-	now  *time.Time
+	auth    *fakeAuthService
+	limiter *LoginLimiter
+	now     *time.Time
 }
 
 func newTestAPI(t *testing.T) *testAPI {
 	t.Helper()
 	now := fixedNow
 	auth := newFakeAuthService()
+	limiter := NewLoginLimiter(func() time.Time { return now })
 	mux := http.NewServeMux()
-	RegisterAuthRoutes(mux, auth, NewLoginLimiter(func() time.Time { return now }))
+	RegisterAuthRoutes(mux, auth, limiter)
 	mux.Handle("GET /api/admin/ping", AuthMiddleware(auth)(RequireAdmin(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))))
-	return &testAPI{Handler: mux, auth: auth, now: &now}
+	return &testAPI{Handler: mux, auth: auth, limiter: limiter, now: &now}
 }
 
 func (api *testAPI) advance(d time.Duration) {
