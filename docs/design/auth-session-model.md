@@ -36,7 +36,7 @@
 - ❌ 不做"跨系统权限统一"或权限同步（SSO 只作为登录方式接入）。
 - ❌ 不把密码/cookie 暴露给模型或前端明文接口。
 - ❌ 不做通用 IAM（只服务测试执行）。
-- ❌ 不在本版做 SSO 的父子会话级联（字段预留，P2 实现）。
+- ❌ 不在本版做 SSO 的父子会话级联（字段预留，AS-M2 实现）。
 
 ### 1.3 关键不变量（实现时必须守住）
 
@@ -248,7 +248,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     system_id         BIGINT NOT NULL REFERENCES systems(id) ON DELETE CASCADE,
     environment_id    BIGINT NOT NULL REFERENCES environments(id) ON DELETE CASCADE,
     access_id         BIGINT NOT NULL REFERENCES account_system_accesses(id) ON DELETE CASCADE,
-    parent_session_id BIGINT REFERENCES sessions(id) ON DELETE SET NULL,  -- SSO IdP 父会话（P2）
+    parent_session_id BIGINT REFERENCES sessions(id) ON DELETE SET NULL,  -- SSO IdP 父会话（AS-M2）
     state             TEXT NOT NULL CHECK (state IN (
                         'pending','acquiring','needs_manual','valid','refreshing',
                         'expired','invalid','revoked','failed')),
@@ -587,7 +587,7 @@ sequenceDiagram
 
 - **A（MVP）人工导入**：EzTest 生成一次性登录指引/脚本，用户在自己浏览器登录后导出 `storageState` 上传（或使用 `playwright-cli state-save`），服务端校验后存为 Session（`acquisition=manual`）。
 - **B（v1.1）OTP 原地接管**：自动化驱动登录到 OTP 步骤，UI 弹输入框收集 OTP，继续完成登录（短信/邮箱/TOTP 均可）。
-- **C（P2）内嵌远程浏览器**：托管 Playwright + noVNC/CDP 推流，人在 EzTest 里直接操作登录窗口；实现复杂、资源开销大。
+- **C（AS-M2）内嵌远程浏览器**：托管 Playwright + noVNC/CDP 推流，人在 EzTest 里直接操作登录窗口；实现复杂、资源开销大。
 
 ### 6.3 伪造/无效处理
 
@@ -717,13 +717,15 @@ POST            /api/manual-takeovers/{id}/complete|cancel
 
 ### 11.1 里程碑
 
-| 阶段 | 内容 |
+| 里程碑 | 内容 |
 |---|---|
-| **P0（MVP）** | 基础域 5 表 + secrets + `account_system_accesses` + sessions/session_blobs/events/leases；手工导入 storageState 获取 Session；HTTP 工具按 session 注入；简单 `login_check`（URL 正则/页面特征）；执行前 preflight（登录有效）；Session 列表/状态 UI；case_run 记录 session_id |
-| **P1** | AuthFlow 自动登录（form/api + TOTP）；ProbeRecipe + 快照 + 漂移检测；人工接管（形态 A + OTP 形态 B）；租约/并发上限/失败退避；prod 审批；定时刷新/通知；能力对照与 blocked 分类；报告指纹 |
-| **P2** | SSO 父子会话与级联失效；Session 出口代理（自定义脚本 + 证据全留）；会话池预热；多租户/权限；探测配方回归 |
+| **AS-M0（MVP；实施 P2+P6）** | 基础域 5 表 + secrets + `account_system_accesses` + sessions/session_blobs/events/leases；手工导入 storageState 获取 Session；HTTP 工具按 session 注入；简单 `login_check`（URL 正则/页面特征）；执行前 preflight（登录有效）；Session 列表/状态 UI；case_run 记录 session_id |
+| **AS-M1（实施 P6/P7/P8）** | AuthFlow 自动登录（form/api + TOTP）；ProbeRecipe + 快照 + 漂移检测；人工接管（形态 A + OTP 形态 B）；租约/并发上限/失败退避；prod 审批；定时刷新/通知；能力对照与 blocked 分类；报告指纹 |
+| **AS-M2（P8 之后）** | SSO 父子会话与级联失效；Session 出口代理（自定义脚本 + 证据全留）；会话池预热；多租户/权限；探测配方回归 |
 
-### 11.2 验收场景（P0-P1 必须能跑）
+> 实施阶段映射：AS-M0 覆盖实施 P2（人工导入/管理）与 P6（执行注入）；AS-M1 以 P6 为主，部分归入 P7/P8；AS-M2 为 P8 之后。
+
+### 11.2 验收场景（AS-M0/AS-M1 必须能跑）
 
 1. 配置公司/系统/环境/账号/Access，手工导入 Session 后状态 `valid`。
 2. 同一 Session 被两条用例复用（串行）；并发时第二条排队/另取。
@@ -743,7 +745,7 @@ POST            /api/manual-takeovers/{id}/complete|cancel
 1. **人工接管形态**：MVP 采用 A（导入 storageState）是否可接受？还是必须内嵌浏览器（C）？
 2. **探测生产可用性**：探测请求会打真实系统（虽只读）；生产环境是否允许探测，还是仅允许"登录有效性校验"？
 3. **Session 复用策略**：默认"运行级租用、可复用至过期"是否合适？高风险环境是否默认用后即焚？
-4. **SSO 优先级**：公司统一账号是否主要走 SSO？若是，P0 就要考虑 IdP 会话（否则每个系统都要独立登录）。
+4. **SSO 优先级**：公司统一账号是否主要走 SSO？若是，MVP（AS-M0）就要考虑 IdP 会话（否则每个系统都要独立登录）。
 5. **执行器形态**：浏览器执行器是独立 Playwright 服务（推荐，隔离/可扩）还是进程内嵌？
 6. **多租户/权限**：谁能看/改 secret、谁能审批 prod、谁能人工接管——需要公司的角色/审批配置。
 7. **能力 key 的治理**：ProbeRecipe 由谁维护、改版后历史快照如何解释（建议保留 recipe version + 变更日志）。
@@ -780,4 +782,4 @@ POST            /api/manual-takeovers/{id}/complete|cancel
 
 ---
 
-*文档版本：v0.1（2026-10-26）；待评审。评审重点：§12 未决问题 + §7 工具契约 + §11 P0 范围。*
+*文档版本：v0.1（2026-10-26）；待评审。评审重点：§12 未决问题 + §7 工具契约 + §11 里程碑。*
