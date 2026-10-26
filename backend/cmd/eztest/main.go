@@ -31,6 +31,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/server"
 	storageapp "github.com/EdouardRichard/EzTest/backend/internal/storage/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/storage/infrastructure/localfs"
+	storagepostgres "github.com/EdouardRichard/EzTest/backend/internal/storage/infrastructure/postgres"
 )
 
 const (
@@ -116,8 +117,14 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	eventHub := eventinginfra.NewHub()
 	eventService := eventingapp.NewService(eventStore, eventHub)
 	// Content-addressed objects live below EZTEST_STORAGE_DIR; the directory is
-	// created lazily on the first upload.
-	storageService := storageapp.NewService(localfs.New(cfg.StorageDir), auditor)
+	// created lazily on the first upload. The durable metadata (size, content
+	// type, relative path) lives in the storage_objects table and is read back
+	// on Open/Stat so downloads carry the stored media type.
+	storageService := storageapp.NewService(
+		localfs.New(cfg.StorageDir),
+		storagepostgres.NewMetadataRepository(database.Pool),
+		auditor,
+	)
 	cancelStartup()
 
 	srv := &http.Server{

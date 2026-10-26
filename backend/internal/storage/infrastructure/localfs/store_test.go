@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	storage "github.com/EdouardRichard/EzTest/backend/internal/storage/domain"
@@ -75,9 +76,9 @@ func TestPutOpenDedupeAndCorrupt(t *testing.T) {
 	}
 }
 
-// TestPutWritesTempThenRenamesIntoContentAddressedPath proves the on-disk
+// TestPutWritesTempThenCommitsIntoContentAddressedPath proves the on-disk
 // layout is ab/cd/<sha256> and that no temporary file is left behind.
-func TestPutWritesTempThenRenamesIntoContentAddressedPath(t *testing.T) {
+func TestPutWritesTempThenCommitsIntoContentAddressedPath(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	s := localfs.New(root)
@@ -115,10 +116,10 @@ func TestPutWritesTempThenRenamesIntoContentAddressedPath(t *testing.T) {
 	}
 }
 
-// TestPutDoesNotOverwriteExistingObject proves the append-only contract: when
-// the target path already exists, Put leaves it untouched even if its content
-// no longer matches the hash.
-func TestPutDoesNotOverwriteExistingObject(t *testing.T) {
+// TestPutRejectsCorruptExistingObject proves the append-only contract: when
+// the target path already exists but its bytes no longer hash to their id, Put
+// reports corruption and never overwrites the existing file.
+func TestPutRejectsCorruptExistingObject(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	s := localfs.New(root)
@@ -133,15 +134,127 @@ func TestPutDoesNotOverwriteExistingObject(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := s.Put(ctx, strings.NewReader(content), "text/plain"); err != nil {
-		t.Fatalf("put over an existing object must dedupe, got error: %v", err)
+	if _, err := s.Put(ctx, strings.NewReader(content), "text/plain"); !errors.Is(err, storage.ErrCorrupted) {
+		t.Fatalf("put over a corrupt object error=%v, want storage.ErrCorrupted", err)
 	}
 	onDisk, err := os.ReadFile(target)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(onDisk) != "tampered" {
-		t.Fatalf("existing object was overwritten: %q", onDisk)
+		t.Fatalf("corrupt existing object was overwritten: %q", onDisk)
+	}
+	// The rejected upload must not leave its staging file behind either.
+	var files []string
+	if err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			files = append(files, p)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || files[0] != target {
+		t.Fatalf("files after rejected put=%v, want only %s", files, target)
+	}
+}
+
+// TestPutDedupesValidExistingObject keeps the positive dedupe case: when the
+// target path already exists with the matching bytes, Put reuses it and reports
+// its verified size instead of writing or overwriting anything.
+func TestPutDedupesValidExistingObject(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	s := localfs.New(root)
+
+	content := "hello"
+	sum := sha256Hex(content)
+	target := filepath.Join(root, sum[:2], sum[2:4], sum)
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	obj, err := s.Put(ctx, strings.NewReader(content), "application/json")
+	if err != nil {
+		t.Fatalf("put over a matching object must dedupe: %v", err)
+	}
+	if obj.SHA256 != sum || obj.Size != int64(len(content)) || obj.RelativePath != filepath.ToSlash(filepath.Join(sum[:2], sum[2:4], sum)) {
+		t.Fatalf("deduped object=%+v", obj)
+	}
+	onDisk, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(onDisk) != content {
+		t.Fatalf("existing object changed: %q", onDisk)
+	}
+}
+
+// TestConcurrentPutDedupesWithoutOverwrite runs many simultaneous uploads of
+// the same bytes. The commit must be no-replace, so every caller sees the same
+// verified object and exactly one file is left behind.
+func TestConcurrentPutDedupesWithoutOverwrite(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	s := localfs.New(root)
+
+	content := strings.Repeat("concurrent content-addressed upload;", 64)
+	wantSHA := sha256Hex(content)
+	const writers = 16
+
+	objects := make([]storage.Object, writers)
+	errs := make([]error, writers)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(writers)
+	for i := 0; i < writers; i++ {
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			objects[i], errs[i] = s.Put(ctx, strings.NewReader(content), "text/plain")
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i := range objects {
+		if errs[i] != nil {
+			t.Fatalf("writer %d: %v", i, errs[i])
+		}
+		if objects[i].SHA256 != wantSHA || objects[i].Size != int64(len(content)) || objects[i].ContentType != "text/plain" {
+			t.Fatalf("writer %d object=%+v, want sha=%s size=%d content_type=text/plain",
+				i, objects[i], wantSHA, len(content))
+		}
+	}
+
+	target := filepath.Join(root, wantSHA[:2], wantSHA[2:4], wantSHA)
+	var files []string
+	if err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			files = append(files, p)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || files[0] != target {
+		t.Fatalf("files after concurrent puts=%v, want only %s", files, target)
+	}
+	onDisk, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(onDisk) != content {
+		t.Fatalf("stored object has %d bytes that do not match the uploaded content", len(onDisk))
 	}
 }
 

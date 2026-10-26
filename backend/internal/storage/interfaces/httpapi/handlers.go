@@ -21,9 +21,9 @@ import (
 const (
 	// maxObjectBytes is the upload cap documented by the design: 10 MiB.
 	maxObjectBytes int64 = 10 << 20
-	// downloadContentType is what a download is served as: the object bytes are
-	// opaque to the API and the store does not persist the upload media type.
-	downloadContentType = "application/octet-stream"
+	// fallbackDownloadContentType is served when an object has no durable
+	// metadata row; normally the stored content type is used instead.
+	fallbackDownloadContentType = "application/octet-stream"
 )
 
 // ObjectService is the storage use case consumed by the admin routes.
@@ -116,7 +116,15 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rc.Close()
 
-	w.Header().Set("Content-Type", downloadContentType)
+	contentType := obj.ContentType
+	if contentType == "" {
+		contentType = fallbackDownloadContentType
+	}
+	w.Header().Set("Content-Type", contentType)
+	// Object bytes are user-supplied: never let a browser sniff or render them
+	// inline, and always hand them over as a download.
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Disposition", "attachment")
 	w.Header().Set("Content-Length", strconv.FormatInt(obj.Size, 10))
 	w.WriteHeader(http.StatusOK)
 	if _, err := io.Copy(w, rc); err != nil {

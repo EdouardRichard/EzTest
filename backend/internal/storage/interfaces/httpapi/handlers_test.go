@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
@@ -37,6 +38,34 @@ func (r *capturingRecorder) Record(_ context.Context, entry auditdomain.Entry) e
 
 func (r *capturingRecorder) List(context.Context, int, int64) ([]auditdomain.Entry, bool, error) {
 	return r.entries, false, nil
+}
+
+// memoryMetadata is an in-memory storage_objects repository with insert-only
+// semantics, matching the production PostgreSQL repository.
+type memoryMetadata struct {
+	mu   sync.Mutex
+	rows map[string]storageapp.ObjectMetadata
+}
+
+func newMemoryMetadata() *memoryMetadata {
+	return &memoryMetadata{rows: make(map[string]storageapp.ObjectMetadata)}
+}
+
+func (m *memoryMetadata) Insert(_ context.Context, metadata storageapp.ObjectMetadata) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.rows[metadata.SHA256]; ok {
+		return false, nil
+	}
+	m.rows[metadata.SHA256] = metadata
+	return true, nil
+}
+
+func (m *memoryMetadata) Find(_ context.Context, sha256 string) (storageapp.ObjectMetadata, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	metadata, ok := m.rows[sha256]
+	return metadata, ok, nil
 }
 
 type testAuth struct {
@@ -79,7 +108,7 @@ func newStorageTestServer(t *testing.T) (http.Handler, string, *capturingRecorde
 	t.Helper()
 	root := t.TempDir()
 	recorder := &capturingRecorder{}
-	service := storageapp.NewService(localfs.New(root), recorder)
+	service := storageapp.NewService(localfs.New(root), newMemoryMetadata(), recorder)
 	mux := http.NewServeMux()
 	guard := func(next http.Handler) http.Handler {
 		return identityhttp.RequireAdmin(withAuditMeta(next))
@@ -221,8 +250,16 @@ func TestStorageUploadDownloadAdminOnly(t *testing.T) {
 	if got := rec.Header().Get("Content-Length"); got != fmt.Sprint(len(content)) {
 		t.Fatalf("Content-Length=%q want %d", got, len(content))
 	}
-	if got := rec.Header().Get("Content-Type"); !strings.HasPrefix(got, "application/octet-stream") {
-		t.Fatalf("Content-Type=%q", got)
+	// The download media type comes from the durable metadata row, and the
+	// response is marked as a non-sniffed attachment.
+	if got := rec.Header().Get("Content-Type"); got != "text/plain" {
+		t.Fatalf("Content-Type=%q want persisted text/plain", got)
+	}
+	if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("X-Content-Type-Options=%q want nosniff", got)
+	}
+	if got := rec.Header().Get("Content-Disposition"); got != "attachment" {
+		t.Fatalf("Content-Disposition=%q want attachment", got)
 	}
 
 	// Missing and malformed ids are distinguished.
@@ -258,19 +295,22 @@ func TestStorageUploadDownloadAdminOnly(t *testing.T) {
 }
 
 // TestStorageUploadDedupesByContent proves repeated uploads reuse the same
-// content-addressed file.
+// content-addressed file and metadata row, record the create audit only once,
+// and keep reporting the content type persisted by the first upload.
 func TestStorageUploadDedupesByContent(t *testing.T) {
-	h, root, _ := newStorageTestServer(t)
+	h, root, recorder := newStorageTestServer(t)
 	content := "dedupe me"
 
 	type uploadPayload struct {
 		Data struct {
-			SHA256 string `json:"sha256"`
+			SHA256      string `json:"sha256"`
+			ContentType string `json:"content_type"`
 		} `json:"data"`
 	}
 	var uploads [2]uploadPayload
+	contentTypes := [2]string{"text/plain", "application/octet-stream"}
 	for i := range uploads {
-		rec := doStorageRequest(t, h, http.MethodPost, "/api/admin/storage/objects", "ezt_admin", "text/plain",
+		rec := doStorageRequest(t, h, http.MethodPost, "/api/admin/storage/objects", "ezt_admin", contentTypes[i],
 			strings.NewReader(content))
 		if rec.Code != http.StatusCreated {
 			t.Fatalf("upload %d=%d body=%s", i, rec.Code, rec.Body)
@@ -281,6 +321,10 @@ func TestStorageUploadDedupesByContent(t *testing.T) {
 	}
 	if uploads[0].Data.SHA256 != uploads[1].Data.SHA256 {
 		t.Fatalf("dedupe sha mismatch: %q vs %q", uploads[0].Data.SHA256, uploads[1].Data.SHA256)
+	}
+	if uploads[0].Data.ContentType != "text/plain" || uploads[1].Data.ContentType != "text/plain" {
+		t.Fatalf("dedupe content types=%q,%q want persisted text/plain",
+			uploads[0].Data.ContentType, uploads[1].Data.ContentType)
 	}
 	path := storagePath(root, content)
 	var files int
@@ -300,6 +344,23 @@ func TestStorageUploadDedupesByContent(t *testing.T) {
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("object missing at %s: %v", path, err)
+	}
+	// The first upload created the durable object; the dedupe must not add a
+	// false storage.object_created entry.
+	if len(recorder.entries) != 1 {
+		t.Fatalf("audit entries after dedupe=%d want 1: %+v", len(recorder.entries), recorder.entries)
+	}
+	if recorder.entries[0].Action != auditapp.ActionStorageObjectCreated {
+		t.Fatalf("audit action=%q", recorder.entries[0].Action)
+	}
+
+	// Downloads keep serving the persisted type of the first upload.
+	rec := doStorageRequest(t, h, http.MethodGet, "/api/admin/storage/objects/"+uploads[0].Data.SHA256, "ezt_admin", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("download=%d body=%s", rec.Code, rec.Body)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "text/plain" {
+		t.Fatalf("deduped download Content-Type=%q want text/plain", got)
 	}
 }
 
