@@ -20,7 +20,7 @@
 4. 对象/证据存储抽象（本地文件 + sha256 内容寻址）。
 5. 统一 JSON API：错误信封、request_id、分页、幂等、健康检查、OpenAPI 骨架。
 6. SSE 通道 V1：事件持久化、通道内单调 seq、快照游标、Last-Event-ID 回放、心跳、重连语义、测试通道。
-7. 极简 LLM 网关：DB 配置（开发模式明文）、Chat Completions + Responses 双协议、多模态图片、流式/非流式、重试。
+7. 极简 LLM 网关：DB 配置、AES-256-GCM 密钥、Chat Completions + Responses 双协议、多模态图片、流式/非流式、重试。
 8. 前端壳：登录/登出、侧边栏、路由、主题、状态徽章、空页面、请求封装、fetch SSE hook、最小设置页（用户/LLM/SSE 测试）。
 9. 三个风险 spike：SSE 断线回放、LLM 多模态调用、浏览器执行环境可用性（只验证不集成）。
 
@@ -47,12 +47,11 @@
 | 数据库 | PostgreSQL 17.6 便携版，端口 `5433`；数据库 `eztest` / 测试库 `eztest_test` |
 | 端口 | Web `6868`、API `2333`、PostgreSQL `5433` |
 | 前后端 | CORS 直连；`EZTEST_WEB_ORIGIN=http://localhost:6868` |
-| 认证 | 不透明 Bearer Token（32B 随机、SHA-256 哈希入库、不过期、可撤销） |
-| 安全模式 | 开发模式：用户密码、LLM Key、custom headers 明文存储；管理员可查看；关闭登录限流；P8 回收 |
+| 认证 | 不透明 Bearer Token（32B 随机、SHA-256 哈希入库、12h、可撤销） |
 | SSE 鉴权 | fetch 流 + `Authorization` + `Last-Event-ID`；不使用 EventSource/Cookie |
 | LLM | `https://api.deepseek.com`，`deepseek-flash`；Chat Completions + Responses 双协议 |
 | 模型上下文 | 运行时从 `GET /v1/models` 的 `context_window` 读取，不手工配置 |
-| LLM 配置 | 全量存 DB；API Key/custom headers 明文（开发模式），仅管理员可查看 |
+| LLM 配置 | 全量存 DB；API Key/custom headers 用 AES-256-GCM 加密；主密钥在 `.env` |
 | 视觉断言 | P8（D7） |
 | 仓库结构 | ARTEX 式按能力分包 + 每上下文 DDD 四层（D26 / `Agent.md` §6） |
 | Git | `feat/p0-foundation` 分支，小步提交，不 push；验收后本地合并回 `dev` |
@@ -114,24 +113,26 @@ HTTP -> server middleware（request_id -> recover -> logging -> CORS -> auth -> 
 
 | 变量 | 必填 | 默认 | 说明 |
 |---|---|---|---|
-| `EZTEST_ENV` | 否 | `dev` | P0 仅支持 `dev/test`；`prod` 启动失败（尚未实现生产安全模式） |
+| `EZTEST_ENV` | 否 | `dev` | `dev/test/prod`；控制测试端点与日志级别 |
 | `EZTEST_HTTP_ADDR` | 否 | `:2333` | API 监听地址 |
 | `EZTEST_WEB_ORIGIN` | 否 | `http://localhost:6868` | CORS 允许的单一来源 |
 | `EZTEST_DATABASE_URL` | 是 | — | `postgres://eztest:***@localhost:5433/eztest?sslmode=disable` |
 | `EZTEST_TEST_DATABASE_URL` | 测试 | — | 集成测试库，禁止指向开发库 |
 | `EZTEST_ADMIN_USERNAME` | 首次启动 | — | 无管理员时创建 |
-| `EZTEST_ADMIN_PASSWORD` | 首次启动 | — | 明文种子；不写日志；创建后忽略 |
+| `EZTEST_ADMIN_PASSWORD` | 首次启动 | — | 不写日志；创建后忽略 |
+| `EZTEST_SECRET_KEYS` | 是 | — | JSON：`{"1":"<base64 32B>"}`；可含多版本用于轮换 |
+| `EZTEST_SECRET_KEY_ACTIVE` | 是 | `1` | 当前加密版本；解密按记录 `key_version` |
 | `EZTEST_STORAGE_DIR` | 否 | `.data/objects` | 对象存储根 |
 | `EZTEST_ENABLE_TEST_ENDPOINTS` | 否 | `dev` 下 `true` | 控制 SSE 测试发布端点 |
 | `EZTEST_LOG_LEVEL` | 否 | `info` | `debug/info/warn/error` |
 | `EZTEST_RUN_REAL_LLM` | 测试 | `false` | `1` 时运行真实 LLM 验收；常规测试默认跳过 |
 | `llm_base_url` | 种子 | — | 首次启动无默认 LLM 配置时使用 |
-| `llm_key` | 种子 | — | 首次启动时明文入库；不写日志 |
+| `llm_key` | 种子 | — | 首次启动时立即加密入库；不写日志 |
 | `llm_model_name` | 种子 | — | 首次启动使用 |
 | `NEXT_PUBLIC_API_BASE_URL` | 前端 | `http://localhost:2333` | 浏览器访问 API 的地址 |
 
-- **失败快**：缺少 `EZTEST_DATABASE_URL` / 管理员种子（无管理员时）→ 启动失败并给出明确错误；`EZTEST_ENV=prod` 直接拒绝启动。
-- 不在日志、错误、审计中输出 token、密码、LLM Key、Authorization、custom headers 值（排障卫生；明文存储见 6.3）。
+- **失败快**：缺少 `EZTEST_DATABASE_URL` / `EZTEST_SECRET_KEYS` / 管理员种子（无管理员时）→ 启动失败并给出明确错误。
+- 不在日志、错误、审计中输出 token、密码、LLM Key、Authorization、custom headers 值。
 
 ### 4.2 本地开发
 
@@ -179,7 +180,7 @@ schema_migrations (
 users (
   id BIGSERIAL PRIMARY KEY,
   username TEXT NOT NULL UNIQUE,
-  password TEXT NOT NULL,
+  password_hash TEXT NOT NULL,
   role TEXT NOT NULL CHECK (role IN ('admin','user')),
   status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','disabled')),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -192,7 +193,7 @@ auth_tokens (
   id BIGSERIAL PRIMARY KEY,
   user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   token_hash TEXT NOT NULL UNIQUE,
-  expires_at TIMESTAMPTZ, -- null = 不过期（开发模式）
+  expires_at TIMESTAMPTZ NOT NULL,
   revoked_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   last_seen_at TIMESTAMPTZ
@@ -217,8 +218,9 @@ llm_configs (
   protocol TEXT NOT NULL CHECK (protocol IN ('chat_completions','responses')),
   base_url TEXT NOT NULL,
   model TEXT NOT NULL,
-  api_key TEXT,
-  headers JSONB NOT NULL DEFAULT '{}',
+  api_key_encrypted BYTEA,
+  key_version INT NOT NULL DEFAULT 1,
+  headers_encrypted BYTEA,
   retry_count INT NOT NULL DEFAULT 2 CHECK (retry_count BETWEEN 0 AND 5),
   retry_interval_ms INT NOT NULL DEFAULT 500 CHECK (retry_interval_ms BETWEEN 100 AND 30000),
   timeout_ms INT NOT NULL DEFAULT 60000 CHECK (timeout_ms BETWEEN 1000 AND 300000),
@@ -288,7 +290,7 @@ storage_objects (
 - 重复启动/重复执行无副作用；失败回滚并终止启动。
 - 种子只在首次启动执行：
   - 无管理员 → 创建管理员（角色 admin，状态 active）。
-  - 无默认 LLM 配置且 `.env` 三值齐全 → 创建 `name=default` 配置，Key 明文写入（开发模式）。
+  - 无默认 LLM 配置且 `.env` 三值齐全 → 创建 `name=default` 配置，Key 立即 AES-GCM 加密。
   - 种子不写业务样例数据。
 
 ---
@@ -298,28 +300,28 @@ storage_objects (
 ### 6.1 用户与密码
 
 - 角色：`admin`、`user`。P0 只允许一个管理员：由种子创建；不提供创建/提升/降级管理员的 API；`users` 部分唯一索引保证 `role='admin'` 最多一行。
-- 用户名：`^[a-zA-Z0-9_.-]{3,64}$`；密码：1–128 字符（开发模式不设复杂度/长度安全限制）。
-- 密码明文存 `users.password`；管理员可在用户页查看/复制（开发模式）。
+- 用户名：`^[a-zA-Z0-9_.-]{3,64}$`；密码：≥10 字符，≤128。
+- 密码哈希：bcrypt cost 12；永不回显、永不记录。
 - 管理员不能禁用自己；P0 不提供删除用户的接口，`PATCH /api/users/{id}` 只允许改 `status`。
 - 普通用户：只能读自己的信息；不能访问 `/api/users` 与 `/api/admin/*`。
-- 关闭登录失败限流（开发模式）；失败仍返回 401。
+- 登录失败限流：内存 `IP+username`，5 次/分钟，锁 1 分钟；锁定期返回 429。
 
 ### 6.2 Token
 
 - 登录成功生成 32 随机字节，前缀 `ezt_`，base64url 编码；返回明文一次。
-- DB 只存 `SHA-256(token)`；token 不过期（`expires_at` 为空）；`last_seen_at` 最多每 5 分钟更新一次。
+- DB 只存 `SHA-256(token)`；有效期 12h；`last_seen_at` 最多每 5 分钟更新一次。
 - `POST /api/auth/logout` 撤销当前 token；禁用用户/重置密码撤销该用户全部 token。
 - 认证头：`Authorization: Bearer <token>`；失败 401，带 `WWW-Authenticate: Bearer`。
 - 前端把 token 放 `sessionStorage`（键 `eztest.token`）；关闭标签页失效；文档标注 XSS 边界。
-- 不做 refresh token；token 不过期，登出/撤销后重新登录。
+- 不做 refresh token；过期重新登录。
 
-### 6.3 开发模式机密处理（安全债务）
+### 6.3 主密钥与 LLM 机密
 
-- 开发模式（`EZTEST_ENV=dev/test`）：`users.password`、`llm_configs.api_key`、`llm_configs.headers` 明文存储；管理员可在设置页查看/复制。
-- 不引入 AES 主密钥、`key_version` 或轮换；P0 不做秘密加密。
-- Token 仍以 `SHA-256(token)` 哈希存储（不影响调试），但不过期。
-- 日志/审计/错误仍不输出密码、token、LLM Key、headers 值（排障卫生，不是安全边界）。
-- 仅限本地开发；不得用于共享/生产。P8 硬化必须恢复密码哈希、秘密加密、token 过期、登录限流，并轮换已暴露的凭据。
+- `EZTEST_SECRET_KEYS`：JSON 映射 `版本 -> base64(32B)`；`EZTEST_SECRET_KEY_ACTIVE` 指定加密版本。
+- AES-256-GCM：12B 随机 nonce，密文格式 `nonce || ciphertext`；AAD 使用固定上下文串（`eztest.llm.api_key` / `eztest.llm.headers`）。
+- 解密按记录的 `key_version` 选择密钥；不存在该版本 → 配置不可用并报明确错误。
+- 轮换：更换 active 版本后，旧记录仍可解密；保存配置时按 active 重新加密。P0 无 UI 轮换。
+- API 永不返回 Key/headers 明文或密文；只返回 `has_api_key`、`key_version`、header 名。
 
 ### 6.4 审计
 
@@ -392,7 +394,7 @@ POST /api/admin/stream/test-events
 - 游标早于当前通道最早事件、或通道被重建 → 发送合成控制帧 `event: stream.reset`，`data: {"channel":"system","snapshot_cursor":N,"reason":"cursor_too_old"}`；该帧**不带 `id`、不写入 `events`**，前端收到后重取首屏。
 - 心跳：每 20s 发送 SSE 注释 `: ping`；客户端 45s 无任何字节视为断线并重连。
 - 重连：指数退避 1s→30s + jitter；UI 显示“实时/重连中/已断开”，不得把断线显示为“无消息”。
-- 认证在连接建立时校验；token 被撤销后新连接 401，既有连接不强制中断（客户端重连时重新鉴权）。
+- 认证在连接建立时校验；token 过期后新连接 401，既有连接不强制中断（客户端重连时重新鉴权）。
 - 测试发布：`count` 取值 1–100，`channel` 固定 `system`，`type` 固定 `system.test`。
 
 ### 7.4 前端 SSE 客户端
@@ -414,14 +416,14 @@ POST /api/admin/stream/test-events
 - `base_url` 归一化：
   - 以 `/v1` 结尾：`{base}/chat/completions`、`{base}/responses`、`{base}/models`；
   - 否则：`{base}/v1/chat/completions`、`{base}/v1/responses`、`{base}/v1/models`。
-- 自定义 headers：JSON 对象（明文，开发模式）；应用到所有上游请求；禁止覆盖 `Authorization`、`Content-Type`（保存时校验拒绝）。
+- 自定义 headers：加密 JSON 对象；应用到所有上游请求；禁止覆盖 `Authorization`、`Content-Type`（保存时校验拒绝）。
 - 校验：base_url 必须 http/https；protocol 枚举；retry 0–5；interval 100–30000ms；timeout 1000–300000ms。
 
 ### 8.2 种子
 
 - 首次启动无默认配置且 `llm_base_url`、`llm_key`、`llm_model_name` 齐全：
   - `name=default`、`protocol=chat_completions`、`base_url=llm_base_url`、`model=llm_model_name`；
-  - Key 明文写入；retry=2、interval=500ms、timeout=60000ms、stream=true、multimodal=true；
+  - Key 用 active 主密钥加密；retry=2、interval=500ms、timeout=60000ms、stream=true、multimodal=true；
   - 写入后不再读取 `.env` 的 LLM 值。
 - 缺任一值 → 不种子；设置页提示“未配置 LLM”，应用仍可启动。
 
@@ -486,7 +488,7 @@ POST /api/admin/stream/test-events
 
 | 端点 | 行为 |
 |---|---|
-| `GET /api/admin/llm/configs` | 列表；返回 `api_key`/`headers` 明文（仅管理员，开发模式）；前端默认掩码可显示 |
+| `GET /api/admin/llm/configs` | 列表；`has_api_key`、`key_version`、header 名；不返回秘密 |
 | `POST /api/admin/llm/configs` | 创建；Key/headers 可选；写审计 |
 | `PATCH /api/admin/llm/configs/{id}` | 更新；`api_key`/`headers` 缺省=保留，传入=替换；写审计 |
 | `DELETE /api/admin/llm/configs/{id}` | 删除；删除默认后 `llm_configured=false`，仅重启时按 `.env` 重新种子 |
@@ -570,7 +572,7 @@ GET    /api/openapi.yaml
 ```json
 POST /api/auth/login
 {"username":"admin","password":"..."}
--> 200 {"data":{"token":"ezt_...","expires_at":null,"user":{"id":1,"username":"admin","role":"admin","status":"active"}}}
+-> 200 {"data":{"token":"ezt_...","expires_at":"2026-10-27T14:00:00Z","user":{"id":1,"username":"admin","role":"admin","status":"active"}}}
 ```
 
 **创建用户**：
@@ -581,7 +583,7 @@ POST /api/users
 -> 201 {"data":{"id":2,"username":"qa01","role":"user","status":"active"}}
 ```
 
-> P0 的 `POST /api/users` 只创建 `role=user`；管理员由种子创建，且全库仅一个。开发模式下，管理员 `GET /api/users` 与 `GET /api/users/{id}` 返回 `password` 明文；普通用户访问 403。
+> P0 的 `POST /api/users` 只创建 `role=user`；管理员由种子创建，且全库仅一个。
 
 **SSE 快照**：
 
@@ -605,7 +607,7 @@ GET /api/stream/events?channel=system&limit=50
 
 | 路由 | 内容 |
 |---|---|
-| `/login` | 登录表单；错误提示；已登录跳 `/` |
+| `/login` | 登录表单；错误/锁定提示；已登录跳 `/` |
 | `/` | 概览：API/DB/LLM/SSE 状态卡；版本功能 P3 空状态 |
 | `/settings` | 管理员：用户、LLM、SSE 测试三 Tab；普通用户：账户信息 + 主题 |
 | `/versions`、`/issues`、`/reports`、`/code-repos`、`/resources`、`/agents` | P0 占位页（空状态 + 阶段说明） |
@@ -620,16 +622,16 @@ GET /api/stream/events?channel=system&limit=50
 - `lib/sse-client.ts`：fetch 流解析、`Last-Event-ID`、20s 心跳超时、退避重连、`stream.reset`、状态回调。
 - `lib/auth-storage.ts`：`sessionStorage` 读写 token；不在 URL/日志中出现。
 - `features/auth`：登录/登出/当前用户。
-- `features/users`：用户列表/创建/禁用/重置密码（管理员）；查看/复制明文密码（开发模式）。
-- `features/llm-settings`：配置表单（Key 明文可查看/替换）、模型目录、上下文大小、测试（含图片/流式）。
+- `features/users`：用户列表/创建/禁用/重置密码（管理员）。
+- `features/llm-settings`：配置表单（Key 留空=保留）、模型目录、上下文大小、测试（含图片/流式）。
 - `features/sse-test`：连接状态、最后 seq、发送测试事件、事件列表。
 - `features/shell`：布局、侧边栏、顶栏、状态徽章、主题。
 - 空状态/错误重试/骨架屏统一组件；键盘可达、焦点管理、对比度、状态不只靠颜色。
 
 ### 10.4 设置页验收动线
 
-1. 管理员登录 → 创建普通用户（可查看/复制明文密码）→ 普通用户登录，确认 403/只读。
-2. 管理员配置 LLM（Key 明文可查看）→ 刷新模型目录 → 显示 `context_window`。
+1. 管理员登录 → 创建普通用户 → 普通用户登录，确认 403/只读。
+2. 管理员配置 LLM → 刷新模型目录 → 显示 `context_window`。
 3. 发送多模态测试（含图片）→ 非流式成功；切换流式 → 看到增量输出。
 4. SSE 测试卡连接 → 发送 3 条测试事件 → 普通用户侧实时可见；断网/恢复 → 状态“重连中”→“实时”，seq 连续。
 
@@ -670,7 +672,7 @@ type Store interface {
 
 | 层 | 命令/工具 | 覆盖 |
 |---|---|---|
-| Go 单元 | `go test ./...` | 领域校验、密码明文可见、token 不过期/撤销、错误映射、重试策略、SSE 编解码 |
+| Go 单元 | `go test ./...` | 领域校验、bcrypt、token 哈希/过期、错误映射、重试策略、SSE 编解码、AES-GCM 往返 |
 | Go 集成 | `go test -tags=integration ./...`（`EZTEST_TEST_DATABASE_URL`） | 迁移重复执行、仓储、登录/登出、权限、幂等重放、事件 seq/回放、LLM mock |
 | 前端单元 | `pnpm test`（Vitest） | api-client 错误/401；sse-client 解析/去重/重连/reset |
 | E2E | `pnpm e2e`（Playwright，Chrome/Edge） | 登录、创建用户、只读权限、LLM 配置/目录/测试、SSE 连接/断线恢复 |
@@ -680,8 +682,7 @@ type Store interface {
 
 | DoD | 验收 |
 |---|---|
-| 管理员登录并创建普通用户；权限差异 | E2E + 集成测试（403/只读）；管理员可查看明文密码 |
-| 开发模式明文与不过期 | 管理员 GET 用户/LLM 返回明文；普通用户 403；日志无秘密；token 不过期 |
+| 管理员登录并创建普通用户；权限差异 | E2E + 集成测试（403/只读） |
 | 健康/日志/审计可用；迁移重复执行无副作用 | `/api/health`、审计查询、migrate 跑两次断言 |
 | 前端收到测试 SSE；断线重连不丢事件 | 集成测试 Last-Event-ID 回放；E2E 断网/恢复后 seq 连续 |
 | LLM 多模态 + 重试 | 真实 Chat Completions 含图（gated）；Responses 文本真实 + 多模态 mock；mock 429/5xx 重试验证 |
@@ -697,7 +698,7 @@ type Store interface {
 
 ### 12.4 验收前必须补齐
 
-- `.env` 增加 `EZTEST_ADMIN_USERNAME` / `EZTEST_ADMIN_PASSWORD`、`EZTEST_DATABASE_URL`；均不提交；确认仅本地开发使用。
+- `.env` 增加 `EZTEST_SECRET_KEYS` / `EZTEST_SECRET_KEY_ACTIVE`、`EZTEST_ADMIN_USERNAME` / `EZTEST_ADMIN_PASSWORD`、`EZTEST_DATABASE_URL`；均不提交。
 - 初始化便携 PostgreSQL，创建 `eztest` / `eztest_test`。
 - 确认 `.env` 的 `llm_base_url` / `llm_key` / `llm_model_name` 有效（真实调用验收前）。
 
@@ -712,8 +713,8 @@ type Store interface {
 | SSE 重连窗口/慢消费者 | 先订阅后回放、seq 去重、缓冲溢出断开回放；集成 + E2E 覆盖 |
 | Next/React 版本兼容 | package.json 锁版本；先壳后组件；`pnpm build` 作为门禁 |
 | Windows 便携 PG 生命周期 | 脚本 initdb/start/stop/健康检查；失败明确提示 |
-| token 存 sessionStorage 的 XSS 边界 | 仅本地 dev；token 不过期意味着一旦被窃取长期有效；输入转义、CSP 预留；P8 硬化恢复过期 |
-| 明文密码/LLM Key 泄露 | 仅本地 `dev/test`；DB/备份不共享；P8 硬化前不接真实凭据；日志仍脱敏 |
+| token 存 sessionStorage 的 XSS 边界 | 单管理员内网工具；输入转义、CSP 预留、依赖审计；文档标注 |
+| 主密钥丢失 | 丢失则已加密 LLM Key 不可恢复；`.env` 备份提醒；文档标注 |
 | 范围膨胀 | 严格按本规格与 §2.9 前端映射；不建业务表/页面 |
 
 ---
@@ -736,8 +737,6 @@ type Store interface {
 3. DeepSeek 网关在 P0 期间保持 `chat_completions` / `responses` / `models` 端点可用；模型名 `deepseek-flash` 支持图片输入。
 4. 单实例部署；SSE 不做多实例广播。
 5. 管理员信任其配置的 `base_url`（P0 不针对 LLM 网关做 SSRF 白名单）。
-6. P0 仅用于本地开发/测试；明文密码与 LLM Key 是已知安全债务，P8 硬化回收。
-7. 真实 LLM Key 只存在于本地 `.env` 与开发 DB，不分享、不用于生产。
 
 ---
 
@@ -748,5 +747,4 @@ type Store interface {
 - 目标系统/环境/账号/Session、代码仓库、代码理解。
 - 多实例、消息队列、Redis/NATS、多租户、复杂 RBAC。
 - Docker 容器运行验证。
-- 生产安全模式（密码哈希、秘密加密、token 过期、登录限流；P8）。
 - 视觉断言（P8）。
