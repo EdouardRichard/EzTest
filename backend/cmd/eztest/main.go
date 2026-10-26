@@ -16,6 +16,9 @@ import (
 	auditpostgres "github.com/EdouardRichard/EzTest/backend/internal/audit/infrastructure/postgres"
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
 	"github.com/EdouardRichard/EzTest/backend/internal/db"
+	eventingapp "github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
+	eventinginfra "github.com/EdouardRichard/EzTest/backend/internal/eventing/infrastructure"
+	eventpostgres "github.com/EdouardRichard/EzTest/backend/internal/eventing/infrastructure/postgres"
 	identityapp "github.com/EdouardRichard/EzTest/backend/internal/identity/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/infrastructure/password"
 	identitypostgres "github.com/EdouardRichard/EzTest/backend/internal/identity/infrastructure/postgres"
@@ -78,6 +81,9 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		auditor,
 	)
 	idempotencyStore := idempotency.NewPostgresStore(database.Pool)
+	eventStore := eventpostgres.NewEventStore(database.Pool)
+	eventHub := eventinginfra.NewHub()
+	eventService := eventingapp.NewService(eventStore, eventHub)
 	cancelStartup()
 
 	srv := &http.Server{
@@ -88,6 +94,9 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 			Users:       userService,
 			Audit:       auditor,
 			Idempotency: idempotencyStore,
+			Events:      eventService,
+			EventReader: eventStore,
+			EventHub:    eventHub,
 		}),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
