@@ -51,8 +51,11 @@ func TestPasswordHashCostAndMaxLength(t *testing.T) {
 		t.Fatal("verify failed for maximum-length password")
 	}
 	// A password that differs only after bcrypt's 72-byte window must not
-	// verify: truncation would be a credential-collision bug.
-	if h.Verify(hash, long[:71]+"b") {
+	// verify: truncation would be a credential-collision bug. The candidate's
+	// first 72 bytes are identical to long's, so a truncating implementation
+	// accepts it and only a full-length hash rejects it.
+	candidate := long[:72] + "b"
+	if h.Verify(hash, candidate) {
 		t.Fatal("password truncated at 72 bytes")
 	}
 }
