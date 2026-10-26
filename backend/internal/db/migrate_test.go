@@ -13,7 +13,9 @@ import (
 )
 
 func TestMigrateIdempotentAndChecksum(t *testing.T) {
-	pool := testutil.OpenTestDB(t)
+	// OpenRawTestDB skips the embedded migrations: this test owns the whole
+	// schema and starts its custom MapFS at version 1.
+	pool := testutil.OpenRawTestDB(t)
 	ctx := context.Background()
 	fsys := fstest.MapFS{
 		"migrations/order.txt":       {Data: []byte("0001_test_a.sql\n0002_test_b.sql\n")},
@@ -51,5 +53,25 @@ func TestMigrateEmbeddedIsIdempotent(t *testing.T) {
 	}
 	if err := db.MigrateEmbedded(ctx, pool); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestOpenRawTestDBStartsWithoutLedger pins the isolation that
+// TestMigrateIdempotentAndChecksum relies on: OpenRawTestDB must hand out an
+// empty public schema (no schema_migrations, no embedded tables), so a custom
+// MapFS starting at version 1 never collides with the embedded migrations
+// added by later tasks.
+func TestOpenRawTestDBStartsWithoutLedger(t *testing.T) {
+	ctx := context.Background()
+	// Seed the shared schema with the embedded migration ledger first.
+	testutil.OpenTestDB(t)
+	pool := testutil.OpenRawTestDB(t)
+	var hasLedger bool
+	if err := pool.QueryRow(ctx,
+		`SELECT to_regclass('public.schema_migrations') IS NOT NULL`).Scan(&hasLedger); err != nil {
+		t.Fatal(err)
+	}
+	if hasLedger {
+		t.Fatal("schema_migrations exists after OpenRawTestDB; expected an empty public schema")
 	}
 }
