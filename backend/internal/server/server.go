@@ -30,6 +30,7 @@ func New(cfg config.Config, logger *slog.Logger, deps Dependencies) http.Handler
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
+	mux.HandleFunc("GET /api/health", handleAPIHealth(deps.Pinger))
 
 	var handler http.Handler = mux
 	handler = loggingMiddleware(logger)(handler)

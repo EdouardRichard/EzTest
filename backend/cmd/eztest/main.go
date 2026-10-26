@@ -13,8 +13,12 @@ import (
 	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
+	"github.com/EdouardRichard/EzTest/backend/internal/db"
 	"github.com/EdouardRichard/EzTest/backend/internal/server"
 )
+
+// startupTimeout bounds database connection and migration work at boot.
+const startupTimeout = 30 * time.Second
 
 func main() {
 	cfg, err := config.Load(os.Getenv)
@@ -32,12 +36,25 @@ func main() {
 	}
 }
 
-// serve starts the HTTP server and shuts it down gracefully on SIGINT or
-// SIGTERM.
+// serve opens the database, applies pending migrations, then starts the HTTP
+// server and shuts it down gracefully on SIGINT or SIGTERM.
 func serve(cfg config.Config, logger *slog.Logger) error {
+	startupCtx, cancelStartup := context.WithTimeout(context.Background(), startupTimeout)
+	defer cancelStartup()
+
+	database, err := db.Open(startupCtx, cfg.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+	defer database.Close()
+	if err := db.MigrateEmbedded(startupCtx, database.Pool); err != nil {
+		return fmt.Errorf("migrate database: %w", err)
+	}
+	cancelStartup()
+
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           server.New(cfg, logger, server.Dependencies{}),
+		Handler:           server.New(cfg, logger, server.Dependencies{Pinger: database}),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

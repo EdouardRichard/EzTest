@@ -2,19 +2,111 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
 )
 
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+type fakePinger struct{ err error }
+
+func (f fakePinger) Ping(context.Context) error { return f.err }
+
+type deadlinePinger struct {
+	called   bool
+	deadline time.Time
+}
+
+func (p *deadlinePinger) Ping(ctx context.Context) error {
+	p.called = true
+	p.deadline, _ = ctx.Deadline()
+	return nil
+}
+
+func TestAPIHealth(t *testing.T) {
+	h := New(config.Config{Env: "test"}, testLogger(), Dependencies{Pinger: fakePinger{}})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/health", nil))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("content-type=%q", ct)
+	}
+	var body struct {
+		Data struct {
+			Status        string `json:"status"`
+			Version       string `json:"version"`
+			Commit        string `json:"commit"`
+			DB            string `json:"db"`
+			LLMConfigured bool   `json:"llm_configured"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body=%q: %v", rec.Body.String(), err)
+	}
+	if body.Data.Status != "ok" || body.Data.DB != "ok" {
+		t.Fatalf("unexpected health payload: %s", rec.Body)
+	}
+	if body.Data.Version != "dev" || body.Data.Commit != "" {
+		t.Fatalf("version=%q commit=%q", body.Data.Version, body.Data.Commit)
+	}
+	if body.Data.LLMConfigured {
+		t.Fatal("llm_configured must be false before LLM configuration exists")
+	}
+}
+
+func TestAPIHealthDBDown(t *testing.T) {
+	h := New(config.Config{Env: "test"}, testLogger(), Dependencies{Pinger: fakePinger{err: errors.New("down")}})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/health", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	var body struct {
+		Data struct {
+			Status string `json:"status"`
+			DB     string `json:"db"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body=%q: %v", rec.Body.String(), err)
+	}
+	if body.Data.Status != "unavailable" {
+		t.Fatalf("status=%q body=%s", body.Data.Status, rec.Body)
+	}
+}
+
+func TestAPIHealthPingTimeout(t *testing.T) {
+	pinger := &deadlinePinger{}
+	h := New(config.Config{Env: "test"}, testLogger(), Dependencies{Pinger: pinger})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/health", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if !pinger.called {
+		t.Fatal("Ping was not called")
+	}
+	if pinger.deadline.IsZero() {
+		t.Fatal("Ping context has no deadline")
+	}
+	remaining := time.Until(pinger.deadline)
+	if remaining < time.Second || remaining > 3*time.Second {
+		t.Fatalf("Ping deadline %v is not the expected ~2s timeout", remaining)
+	}
 }
 
 func TestHealthzAndRequestID(t *testing.T) {
