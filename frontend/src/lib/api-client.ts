@@ -1,7 +1,7 @@
 import { clearSession, getToken } from "./auth-storage"
 
 /** Fallback API origin used when NEXT_PUBLIC_API_BASE_URL is not configured. */
-export const DEFAULT_API_BASE_URL = "http://localhost:2333"
+export const DEFAULT_API_BASE_URL = "http://localhost:13333"
 
 /** Structured, non-sensitive error returned by the shared API error envelope. */
 export type ApiErrorDetails = Record<string, unknown>
