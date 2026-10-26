@@ -289,6 +289,83 @@ func (l *LoginLimiter) has(key string) bool {
 	return ok
 }
 
+// TestInvalidUsernameLoginFailureIsAudited pins the Task 5 carry-over: a login
+// rejected before AuthService (invalid username -> 401) is still recorded, with
+// the request metadata attached by the handler and no actor. The raw invalid
+// username is attacker-controlled and must not be persisted.
+func TestInvalidUsernameLoginFailureIsAudited(t *testing.T) {
+	h := newTestAPI(t)
+	bad := strings.Repeat("a", 65)
+	rec := postJSON(h, "/api/auth/login", `{"username":"`+bad+`","password":"admin-pass-123"}`)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("invalid username=%d %s want 401", rec.Code, rec.Body)
+	}
+	if h.auth.loginCalls != 0 {
+		t.Fatalf("invalid username reached the auth service %d times", h.auth.loginCalls)
+	}
+
+	entry, ok := h.audit.lastEntry("auth.login_failed")
+	if !ok {
+		t.Fatalf("invalid username failure was not audited: %+v", h.audit.entries)
+	}
+	if entry.ActorUserID != nil {
+		t.Fatalf("invalid username failure actor=%d want nil", *entry.ActorUserID)
+	}
+	if entry.RequestID != testRequestID || entry.IP != "192.0.2.1" || entry.UserAgent != testUserAgent {
+		t.Fatalf("entry meta=(%q,%q,%q) want (%q,192.0.2.1,%q)",
+			entry.RequestID, entry.IP, entry.UserAgent, testRequestID, testUserAgent)
+	}
+	if _, ok := entry.Metadata["username"]; ok {
+		t.Fatalf("invalid username was persisted in audit metadata: %v", entry.Metadata)
+	}
+	raw, err := json.Marshal(entry.Metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), bad) {
+		t.Fatalf("audit metadata contains the raw invalid username: %s", raw)
+	}
+}
+
+// TestRateLimitedLoginFailureIsAudited pins the other pre-service rejection:
+// a locked identity never reaches AuthService, so the handler records the
+// auth.login_failed entry itself.
+func TestRateLimitedLoginFailureIsAudited(t *testing.T) {
+	h := newTestAPI(t)
+	for i := 0; i < loginMaxFailures; i++ {
+		rec := postJSON(h, "/api/auth/login", `{"username":"admin","password":"wrong-password"}`)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("failure %d: code=%d body=%s", i+1, rec.Code, rec.Body)
+		}
+	}
+	before := len(h.audit.entries)
+
+	rec := postJSON(h, "/api/auth/login", `{"username":"admin","password":"admin-pass-123"}`)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("locked login=%d %s want 429", rec.Code, rec.Body)
+	}
+	if got := len(h.audit.entries) - before; got != 1 {
+		t.Fatalf("locked login recorded %d audit entries, want 1", got)
+	}
+	entry := h.audit.entries[len(h.audit.entries)-1]
+	if entry.Action != "auth.login_failed" {
+		t.Fatalf("action=%q want auth.login_failed", entry.Action)
+	}
+	if entry.Metadata["reason"] != "rate_limited" || entry.Metadata["username"] != "admin" {
+		t.Fatalf("metadata=%v want reason=rate_limited username=admin", entry.Metadata)
+	}
+	if entry.ActorUserID != nil {
+		t.Fatalf("locked login actor=%d want nil", *entry.ActorUserID)
+	}
+	if entry.RequestID != testRequestID || entry.IP != "192.0.2.1" || entry.UserAgent != testUserAgent {
+		t.Fatalf("entry meta=(%q,%q,%q) want (%q,192.0.2.1,%q)",
+			entry.RequestID, entry.IP, entry.UserAgent, testRequestID, testUserAgent)
+	}
+	if strings.Contains(rec.Body.String(), "wrong-password") || strings.Contains(rec.Body.String(), "admin-pass-123") {
+		t.Fatalf("response leaks a password: %s", rec.Body)
+	}
+}
+
 // TestLoginRejectsInvalidUsernameWithoutLimiterEntry proves attacker-sized or
 // malformed usernames are rejected before they can become limiter keys: a flood
 // of them must neither reach the auth service nor grow the limiter map.
@@ -506,6 +583,7 @@ type testAPI struct {
 	http.Handler
 	auth    *fakeAuthService
 	limiter *LoginLimiter
+	audit   *capturingRecorder
 	now     *time.Time
 }
 
@@ -514,12 +592,13 @@ func newTestAPI(t *testing.T) *testAPI {
 	now := fixedNow
 	auth := newFakeAuthService()
 	limiter := NewLoginLimiter(func() time.Time { return now })
+	recorder := &capturingRecorder{}
 	mux := http.NewServeMux()
-	RegisterAuthRoutes(mux, auth, limiter)
+	RegisterAuthRoutes(mux, auth, limiter, recorder)
 	mux.Handle("GET /api/admin/ping", AuthMiddleware(auth)(RequireAdmin(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))))
-	return &testAPI{Handler: mux, auth: auth, limiter: limiter, now: &now}
+	return &testAPI{Handler: mux, auth: auth, limiter: limiter, audit: recorder, now: &now}
 }
 
 func (api *testAPI) advance(d time.Duration) {
@@ -529,6 +608,7 @@ func (api *testAPI) advance(d time.Duration) {
 func postJSON(h http.Handler, path, body string) *httptest.ResponseRecorder {
 	req := newTestRequest(http.MethodPost, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", testUserAgent)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec
@@ -537,6 +617,7 @@ func postJSON(h http.Handler, path, body string) *httptest.ResponseRecorder {
 func getWithBearer(h http.Handler, path, token string) *httptest.ResponseRecorder {
 	req := newTestRequest(http.MethodGet, path, nil)
 	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", testUserAgent)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec
@@ -545,6 +626,7 @@ func getWithBearer(h http.Handler, path, token string) *httptest.ResponseRecorde
 func postWithBearer(h http.Handler, path, token string) *httptest.ResponseRecorder {
 	req := newTestRequest(http.MethodPost, path, nil)
 	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", testUserAgent)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec

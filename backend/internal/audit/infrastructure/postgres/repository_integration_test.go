@@ -153,7 +153,7 @@ func TestIdentityActionsAreAudited(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	userSvc := identityapp.NewUserService(users, hasher, recorder)
+	userSvc := identityapp.NewUserService(users, hasher, recorder, tokens)
 	authSvc := identityapp.NewAuthService(users, tokens, hasher, time.Now, recorder)
 
 	// Failed and successful login.

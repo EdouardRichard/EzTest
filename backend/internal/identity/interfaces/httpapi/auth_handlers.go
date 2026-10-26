@@ -7,12 +7,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
+	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
+	auditdomain "github.com/EdouardRichard/EzTest/backend/internal/audit/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/application"
 	identity "github.com/EdouardRichard/EzTest/backend/internal/identity/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
@@ -50,23 +53,29 @@ type AuthService interface {
 
 // AuthHandler serves the login, logout and me endpoints.
 type AuthHandler struct {
-	svc     AuthService
-	limiter *LoginLimiter
+	svc      AuthService
+	limiter  *LoginLimiter
+	recorder auditapp.Recorder
 }
 
 // NewAuthHandler returns handlers for svc. A nil limiter means a limiter with
-// the real clock.
-func NewAuthHandler(svc AuthService, limiter *LoginLimiter) *AuthHandler {
+// the real clock; a nil recorder discards audit entries. The recorder is needed
+// for login rejections that never reach AuthService (invalid username, limiter
+// lockout), which would otherwise leave no audit trail.
+func NewAuthHandler(svc AuthService, limiter *LoginLimiter, recorder auditapp.Recorder) *AuthHandler {
 	if limiter == nil {
 		limiter = NewLoginLimiter(time.Now)
 	}
-	return &AuthHandler{svc: svc, limiter: limiter}
+	if recorder == nil {
+		recorder = auditapp.NopRecorder{}
+	}
+	return &AuthHandler{svc: svc, limiter: limiter, recorder: recorder}
 }
 
 // RegisterAuthRoutes mounts the auth endpoints on mux. Login is public;
 // logout and me require a valid bearer token.
-func RegisterAuthRoutes(mux *http.ServeMux, svc AuthService, limiter *LoginLimiter) {
-	handler := NewAuthHandler(svc, limiter)
+func RegisterAuthRoutes(mux *http.ServeMux, svc AuthService, limiter *LoginLimiter, recorder auditapp.Recorder) {
+	handler := NewAuthHandler(svc, limiter, recorder)
 	mux.HandleFunc("POST /api/auth/login", handler.Login)
 	authenticated := AuthMiddleware(svc)
 	mux.Handle("GET /api/auth/me", authenticated(http.HandlerFunc(handler.Me)))
@@ -85,20 +94,27 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 
 	// Reject usernames that cannot name an account before they become limiter
 	// keys or reach the (comparatively expensive) auth service. The 401 is
-	// deliberately indistinguishable from wrong credentials.
+	// deliberately indistinguishable from wrong credentials for the client, but
+	// the rejection is audited: it never reaches AuthService, so the handler
+	// records it. The raw invalid username is attacker-controlled and is not
+	// persisted.
 	if err := identity.ValidateUsername(req.Username); err != nil {
+		h.recordLoginFailed(r, "", "invalid_username")
 		platform.WriteError(w, r, http.StatusUnauthorized, platform.CodeUnauthenticated, "invalid username or password")
 		return
 	}
 
 	key := loginKey(clientIP(r), req.Username)
 	if h.limiter.Locked(key) {
+		h.recordLoginFailed(r, req.Username, "rate_limited")
 		w.Header().Set("Retry-After", "60")
 		platform.WriteError(w, r, http.StatusTooManyRequests, platform.CodeRateLimited, "too many failed login attempts, try again later")
 		return
 	}
 
-	result, err := h.svc.Login(r.Context(), req.Username, req.Password)
+	// The request context carries the audit metadata; AuthService records its
+	// own success/failure entries and stamps them with it.
+	result, err := h.svc.Login(requestContext(r), req.Username, req.Password)
 	if err != nil {
 		if errors.Is(err, identity.ErrUnauthenticated) {
 			h.limiter.Fail(key)
@@ -133,11 +149,33 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 		writeUnauthenticated(w, r)
 		return
 	}
-	if err := h.svc.Logout(r.Context(), rawToken); err != nil {
+	if err := h.svc.Logout(requestContext(r), rawToken); err != nil {
 		platform.WriteError(w, r, http.StatusInternalServerError, platform.CodeInternal, "internal server error")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// recordLoginFailed records a login rejection that never reached AuthService
+// (an invalid username or a limiter lockout). Wrong-password failures are
+// recorded by AuthService itself; recording them here as well would duplicate
+// the entry. The attempted password never reaches the entry.
+func (h *AuthHandler) recordLoginFailed(r *http.Request, username, reason string) {
+	metadata := map[string]any{"reason": reason}
+	if username != "" {
+		metadata["username"] = username
+	}
+	entry := auditdomain.Entry{
+		Action:     auditapp.ActionLoginFailed,
+		TargetType: "user",
+		RequestID:  platform.RequestID(r.Context()),
+		IP:         clientIP(r),
+		UserAgent:  r.UserAgent(),
+		Metadata:   metadata,
+	}
+	if err := h.recorder.Record(r.Context(), entry); err != nil {
+		slog.ErrorContext(r.Context(), "audit: record entry", "action", entry.Action, "error", err)
+	}
 }
 
 // LoginLimiter throttles failed logins in memory, keyed by client IP and

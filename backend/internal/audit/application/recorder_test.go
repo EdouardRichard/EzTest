@@ -30,7 +30,7 @@ func TestAuthAndUserActionsAreAudited(t *testing.T) {
 	users, admin := newFakeUserRepo(t)
 	tokens := newFakeTokenRepo()
 	hasher := fakeHasher{}
-	userSvc := identityapp.NewUserService(users, hasher, rec)
+	userSvc := identityapp.NewUserService(users, hasher, rec, tokens)
 	authSvc := identityapp.NewAuthService(users, tokens, hasher, func() time.Time { return fixedNow }, rec)
 
 	// A failed login is recorded and never includes the attempted password.
@@ -157,6 +157,116 @@ func TestAuthAndUserActionsAreAudited(t *testing.T) {
 	}
 }
 
+// TestAuditEntriesCarryRequestContext is the Task 7 carry-over acceptance test:
+// HTTP handlers attach the request metadata and the authenticated actor to the
+// context, and the identity services stamp both onto the entries they already
+// record, without a service-signature change. An entry that names its actor
+// explicitly keeps it; the context only fills the gaps.
+func TestAuditEntriesCarryRequestContext(t *testing.T) {
+	rec := &fakeRecorder{}
+	users, admin := newFakeUserRepo(t)
+	tokens := newFakeTokenRepo()
+	hasher := fakeHasher{}
+	userSvc := identityapp.NewUserService(users, hasher, rec, tokens)
+	authSvc := identityapp.NewAuthService(users, tokens, hasher, func() time.Time { return fixedNow }, rec)
+
+	meta := auditapp.RequestMeta{RequestID: "req_ctx_1234", IP: "203.0.113.9", UserAgent: "eztest-http-test"}
+	requestCtx := auditapp.WithMeta(ctx, meta)
+	adminCtx := auditapp.WithActorID(requestCtx, admin.ID)
+
+	// A successful login records the request metadata from the context and the
+	// account itself as the actor.
+	login, err := authSvc.Login(requestCtx, "admin", "admin-pass-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	loginEntry := rec.entries[len(rec.entries)-1]
+	assertRequestMeta(t, loginEntry, meta)
+	if loginEntry.ActorUserID == nil || *loginEntry.ActorUserID != admin.ID {
+		t.Fatalf("login actor=%v want %d", loginEntry.ActorUserID, admin.ID)
+	}
+
+	// A failed login records the request metadata but stays anonymous.
+	if _, err := authSvc.Login(requestCtx, "admin", "wrong-pass-123"); !errors.Is(err, identity.ErrUnauthenticated) {
+		t.Fatalf("wrong password: err=%v, want ErrUnauthenticated", err)
+	}
+	failedEntry := rec.entries[len(rec.entries)-1]
+	assertRequestMeta(t, failedEntry, meta)
+	if failedEntry.ActorUserID != nil {
+		t.Fatalf("failed login actor=%d want nil", *failedEntry.ActorUserID)
+	}
+	assertNoSecrets(t, failedEntry, "wrong-pass-123", "admin-pass-123", "hash:admin-pass-123")
+
+	// A user action whose service entry does not name an actor (create) picks
+	// the authenticated actor up from the context.
+	created, err := userSvc.Create(adminCtx, "qa01", "qa-pass-1234")
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdEntry := rec.entries[len(rec.entries)-1]
+	assertRequestMeta(t, createdEntry, meta)
+	if createdEntry.ActorUserID == nil || *createdEntry.ActorUserID != admin.ID {
+		t.Fatalf("created actor=%v want %d", createdEntry.ActorUserID, admin.ID)
+	}
+	assertNoSecrets(t, createdEntry, "qa-pass-1234", "hash:qa-pass-1234", created.PasswordHash)
+
+	// An entry that names its actor keeps it: the context only fills gaps, so a
+	// mismatched context actor cannot rewrite who performed the action.
+	otherCtx := auditapp.WithActorID(requestCtx, 99)
+	if _, err := userSvc.SetStatus(otherCtx, admin.ID, created.ID, identity.StatusDisabled); err != nil {
+		t.Fatal(err)
+	}
+	updatedEntry := rec.entries[len(rec.entries)-1]
+	assertRequestMeta(t, updatedEntry, meta)
+	if updatedEntry.ActorUserID == nil || *updatedEntry.ActorUserID != admin.ID {
+		t.Fatalf("updated actor=%v want the explicit actor %d", updatedEntry.ActorUserID, admin.ID)
+	}
+	assertNoSecrets(t, updatedEntry, "qa-pass-1234", "hash:qa-pass-1234", created.PasswordHash)
+
+	// Password reset also carries the context actor and request metadata.
+	if err := userSvc.ResetPassword(adminCtx, created.ID, "new-qa-pass-1234"); err != nil {
+		t.Fatal(err)
+	}
+	resetEntry := rec.entries[len(rec.entries)-1]
+	assertRequestMeta(t, resetEntry, meta)
+	if resetEntry.ActorUserID == nil || *resetEntry.ActorUserID != admin.ID {
+		t.Fatalf("reset actor=%v want %d", resetEntry.ActorUserID, admin.ID)
+	}
+	assertNoSecrets(t, resetEntry, "qa-pass-1234", "new-qa-pass-1234", "hash:qa-pass-1234", "hash:new-qa-pass-1234", created.PasswordHash)
+
+	// Logout records the token owner and the request metadata.
+	if err := authSvc.Logout(requestCtx, login.Token); err != nil {
+		t.Fatal(err)
+	}
+	logoutEntry := rec.entries[len(rec.entries)-1]
+	assertRequestMeta(t, logoutEntry, meta)
+	if logoutEntry.ActorUserID == nil || *logoutEntry.ActorUserID != admin.ID {
+		t.Fatalf("logout actor=%v want %d", logoutEntry.ActorUserID, admin.ID)
+	}
+
+	// A context without RequestMeta leaves the fields empty instead of
+	// inventing values (for example a background job recording an entry).
+	if _, err := userSvc.Create(ctx, "qa02", "qa-pass-1234"); err != nil {
+		t.Fatal(err)
+	}
+	backgroundEntry := rec.entries[len(rec.entries)-1]
+	if backgroundEntry.RequestID != "" || backgroundEntry.IP != "" || backgroundEntry.UserAgent != "" {
+		t.Fatalf("background entry meta=(%q,%q,%q) want empty", backgroundEntry.RequestID, backgroundEntry.IP, backgroundEntry.UserAgent)
+	}
+	if backgroundEntry.ActorUserID != nil {
+		t.Fatalf("background entry actor=%d want nil", *backgroundEntry.ActorUserID)
+	}
+}
+
+// assertRequestMeta fails when entry does not carry want.
+func assertRequestMeta(t *testing.T, entry auditdomain.Entry, want auditapp.RequestMeta) {
+	t.Helper()
+	if entry.RequestID != want.RequestID || entry.IP != want.IP || entry.UserAgent != want.UserAgent {
+		t.Fatalf("%s entry meta=(%q,%q,%q) want %+v",
+			entry.Action, entry.RequestID, entry.IP, entry.UserAgent, want)
+	}
+}
+
 // TestAuditFailureDoesNotFailIdentityActions pins the best-effort contract: an
 // audit write failure must not turn a completed login/user change into an
 // error.
@@ -171,7 +281,7 @@ func TestAuditFailureDoesNotFailIdentityActions(t *testing.T) {
 	users, admin := newFakeUserRepo(t)
 	tokens := newFakeTokenRepo()
 	hasher := fakeHasher{}
-	userSvc := identityapp.NewUserService(users, hasher, rec)
+	userSvc := identityapp.NewUserService(users, hasher, rec, tokens)
 	authSvc := identityapp.NewAuthService(users, tokens, hasher, func() time.Time { return fixedNow }, rec)
 
 	if _, err := authSvc.Login(ctx, "admin", "admin-pass-123"); err != nil {
@@ -456,6 +566,18 @@ func (r *fakeTokenRepo) Revoke(_ context.Context, tokenHash string) error {
 		token.RevokedAt = &revokedAt
 	}
 	r.byHash[tokenHash] = token
+	return nil
+}
+
+func (r *fakeTokenRepo) RevokeAllForUser(_ context.Context, userID int64) error {
+	for hash, token := range r.byHash {
+		if token.UserID != userID || token.RevokedAt != nil {
+			continue
+		}
+		revokedAt := fixedNow
+		token.RevokedAt = &revokedAt
+		r.byHash[hash] = token
+	}
 	return nil
 }
 

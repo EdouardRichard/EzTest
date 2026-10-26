@@ -63,15 +63,16 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	}
 
 	userRepo := identitypostgres.NewUserRepository(database.Pool)
+	tokenRepo := identitypostgres.NewTokenRepository(database.Pool)
 	hasher := password.NewHasher(bcryptCost)
 	auditor := auditapp.NewService(auditpostgres.NewRepository(database.Pool))
-	userService := identityapp.NewUserService(userRepo, hasher, auditor)
+	userService := identityapp.NewUserService(userRepo, hasher, auditor, tokenRepo)
 	if err := userService.EnsureAdmin(startupCtx, cfg.AdminUsername, cfg.AdminPassword); err != nil {
 		return fmt.Errorf("seed admin (set EZTEST_ADMIN_USERNAME and EZTEST_ADMIN_PASSWORD when no admin exists): %w", err)
 	}
 	authService := identityapp.NewAuthService(
 		userRepo,
-		identitypostgres.NewTokenRepository(database.Pool),
+		tokenRepo,
 		hasher,
 		time.Now,
 		auditor,
@@ -84,6 +85,8 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Handler: server.New(cfg, logger, server.Dependencies{
 			Pinger:      database,
 			Auth:        authService,
+			Users:       userService,
+			Audit:       auditor,
 			Idempotency: idempotencyStore,
 		}),
 		ReadHeaderTimeout: 10 * time.Second,

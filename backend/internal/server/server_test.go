@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/application"
 	identity "github.com/EdouardRichard/EzTest/backend/internal/identity/domain"
@@ -608,6 +609,114 @@ func TestMiddlewareChainPanicEnvelopeHasRequestID(t *testing.T) {
 	}
 	if body.Error.Code != platform.CodeInternal || body.Error.RequestID != "req_chain_1234" {
 		t.Fatalf("envelope=%+v", body.Error)
+	}
+}
+
+// stubUserService is a minimal identityhttp.UserService used to prove the
+// server exposes the admin user routes with the global auth and per-route
+// RequireAdmin guard.
+type stubUserService struct{ users []identity.User }
+
+func (s stubUserService) Create(context.Context, string, string) (identity.User, error) {
+	return identity.User{ID: 3, Username: "qa02", Role: identity.RoleUser, Status: identity.StatusActive}, nil
+}
+
+func (s stubUserService) List(context.Context, int, int64) ([]identity.User, bool, error) {
+	return s.users, false, nil
+}
+
+func (s stubUserService) Get(_ context.Context, id int64) (identity.User, error) {
+	for _, user := range s.users {
+		if user.ID == id {
+			return user, nil
+		}
+	}
+	return identity.User{}, identity.ErrUserNotFound
+}
+
+func (s stubUserService) SetStatus(_ context.Context, _, userID int64, status identity.Status) (identity.User, error) {
+	return identity.User{ID: userID, Status: status}, nil
+}
+
+func (s stubUserService) ResetPassword(context.Context, int64, string) error { return nil }
+
+// tokenMapAuth authenticates a fixed set of bearer tokens so the server wiring
+// test can exercise both the admin and the regular-user paths.
+type tokenMapAuth map[string]identity.User
+
+func (a tokenMapAuth) Login(context.Context, string, string) (application.LoginResult, error) {
+	return application.LoginResult{}, identity.ErrUnauthenticated
+}
+
+func (a tokenMapAuth) Authenticate(_ context.Context, rawToken string) (identity.User, error) {
+	user, ok := a[rawToken]
+	if !ok {
+		return identity.User{}, identity.ErrUnauthenticated
+	}
+	return user, nil
+}
+
+func (a tokenMapAuth) Logout(context.Context, string) error { return nil }
+
+// TestUserAndAuditRoutesWired proves the composition root mounts the user and
+// audit endpoints, keeps the global auth for them and enforces admin-only
+// access per route.
+func TestUserAndAuditRoutesWired(t *testing.T) {
+	admin := identity.User{ID: 1, Username: "admin", Role: identity.RoleAdmin, Status: identity.StatusActive}
+	regular := identity.User{ID: 2, Username: "qa01", Role: identity.RoleUser, Status: identity.StatusActive}
+	deps := Dependencies{
+		Pinger: fakePinger{},
+		Auth:   tokenMapAuth{"ezt_admin": admin, "ezt_user": regular},
+		Users:  stubUserService{users: []identity.User{admin, regular}},
+		Audit:  auditapp.NopRecorder{},
+	}
+	h := New(config.Config{Env: "test"}, testLogger(), deps)
+
+	newReq := func(method, path, token, body string) *http.Request {
+		var reader io.Reader
+		if body != "" {
+			reader = strings.NewReader(body)
+		}
+		req := httptest.NewRequest(method, path, reader)
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		return req
+	}
+
+	// The admin can list users and read the audit log.
+	for _, path := range []string{"/api/users", "/api/admin/audit"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, newReq(http.MethodGet, path, "ezt_admin", ""))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("admin GET %s=%d body=%s want 200", path, rec.Code, rec.Body)
+		}
+	}
+
+	// The admin can create a user through the mounted route.
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, newReq(http.MethodPost, "/api/users", "ezt_admin",
+		`{"username":"qa02","password":"qa-pass-123"}`))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("admin create=%d body=%s want 201", rec.Code, rec.Body)
+	}
+
+	// A regular user is forbidden from both admin surfaces.
+	for _, path := range []string{"/api/users", "/api/admin/audit"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, newReq(http.MethodGet, path, "ezt_user", ""))
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("user GET %s=%d body=%s want 403", path, rec.Code, rec.Body)
+		}
+	}
+
+	// Without a token the global auth middleware rejects both.
+	for _, path := range []string{"/api/users", "/api/admin/audit"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, newReq(http.MethodGet, path, "", ""))
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("anonymous GET %s=%d body=%s want 401", path, rec.Code, rec.Body)
+		}
 	}
 }
 
