@@ -13,11 +13,34 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// OpenTestDB opens the database named by EZTEST_TEST_DATABASE_URL, applies the
-// embedded migrations and truncates every public table except
-// schema_migrations. The pool is closed, and the tables are emptied again,
-// when the test finishes. The test is skipped when the variable is unset.
+// OpenTestDB opens the database named by EZTEST_TEST_DATABASE_URL on an empty
+// public schema, applies the embedded migrations and truncates every public
+// table except schema_migrations. The pool is closed, and the tables are
+// emptied again, when the test finishes. The test is skipped when the variable
+// is unset.
 func OpenTestDB(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	pool := OpenRawTestDB(t)
+
+	ctx := context.Background()
+	if err := db.MigrateEmbedded(ctx, pool); err != nil {
+		t.Fatalf("migrate test database: %v", err)
+	}
+	// Clean leftovers from a previous run before handing the pool to the test.
+	truncateAll(t, ctx, pool)
+	t.Cleanup(func() {
+		truncateAll(t, ctx, pool)
+	})
+	return pool
+}
+
+// OpenRawTestDB opens the database named by EZTEST_TEST_DATABASE_URL with an
+// empty public schema: it drops and recreates the schema (the URL points at
+// the test database) and does not apply any migrations. Tests that supply
+// their own migration set start from a clean ledger instead of inheriting the
+// embedded one. The pool is closed when the test finishes. The test is skipped
+// when the variable is unset.
+func OpenRawTestDB(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	url := strings.TrimSpace(os.Getenv("EZTEST_TEST_DATABASE_URL"))
 	if url == "" {
@@ -31,14 +54,9 @@ func OpenTestDB(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(database.Close)
 
-	if err := db.MigrateEmbedded(ctx, database.Pool); err != nil {
-		t.Fatalf("migrate test database: %v", err)
+	if _, err := database.Pool.Exec(ctx, `DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;`); err != nil {
+		t.Fatalf("reset test database schema: %v", err)
 	}
-	// Clean leftovers from a previous run before handing the pool to the test.
-	truncateAll(t, ctx, database.Pool)
-	t.Cleanup(func() {
-		truncateAll(t, ctx, database.Pool)
-	})
 	return database.Pool
 }
 
