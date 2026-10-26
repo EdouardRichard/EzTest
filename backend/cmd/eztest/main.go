@@ -22,6 +22,9 @@ import (
 	identityapp "github.com/EdouardRichard/EzTest/backend/internal/identity/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/infrastructure/password"
 	identitypostgres "github.com/EdouardRichard/EzTest/backend/internal/identity/infrastructure/postgres"
+	llmapp "github.com/EdouardRichard/EzTest/backend/internal/llm/application"
+	llmpostgres "github.com/EdouardRichard/EzTest/backend/internal/llm/infrastructure/postgres"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/crypto"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/idempotency"
 	"github.com/EdouardRichard/EzTest/backend/internal/server"
 )
@@ -80,6 +83,18 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		time.Now,
 		auditor,
 	)
+	keyring, err := crypto.NewKeyring(cfg.SecretKeys, cfg.SecretKeyActive)
+	if err != nil {
+		return fmt.Errorf("create secret keyring: %w", err)
+	}
+	llmConfigs := llmapp.NewConfigService(llmpostgres.NewConfigRepository(database.Pool, keyring), auditor)
+	seededLLM, err := llmConfigs.SeedFromEnv(startupCtx, cfg.LLMSeed.BaseURL, cfg.LLMSeed.Key, cfg.LLMSeed.Model)
+	if err != nil {
+		return fmt.Errorf("seed default LLM configuration: %w", err)
+	}
+	if seededLLM {
+		logger.Info("seeded default LLM configuration from environment", "name", "default", "protocol", "chat_completions")
+	}
 	idempotencyStore := idempotency.NewPostgresStore(database.Pool)
 	eventStore := eventpostgres.NewEventStore(database.Pool)
 	eventHub := eventinginfra.NewHub()
