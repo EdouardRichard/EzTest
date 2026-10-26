@@ -70,8 +70,11 @@ const (
 
 // Defaults used when a create request omits a timing field. Zero is outside
 // both valid ranges, so it unambiguously means "not provided"; these mirror the
-// database column defaults.
+// database column defaults. Retry count accepts an explicit zero, so callers
+// that omit it must resolve DefaultRetryCount themselves (the HTTP layer uses
+// application.DefaultCreateParams).
 const (
+	DefaultRetryCount      = 2
 	DefaultRetryIntervalMS = 500
 	DefaultTimeoutMS       = 60000
 )
@@ -150,6 +153,10 @@ var (
 	ErrReservedHeader = errors.New("llm: headers must not override Authorization or Content-Type")
 	// ErrInvalidHeaderName means a custom header has an empty name.
 	ErrInvalidHeaderName = errors.New("llm: header names must not be empty")
+	// ErrSecretsUnavailable means the stored API key or headers cannot be
+	// decrypted, for example because their key version is not configured.
+	// The HTTP layer maps it to storage_corrupted.
+	ErrSecretsUnavailable = errors.New("llm: stored credentials cannot be decrypted")
 )
 
 // ValidateName enforces a non-blank configuration name.

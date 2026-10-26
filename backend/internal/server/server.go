@@ -15,6 +15,8 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
 	eventinghttp "github.com/EdouardRichard/EzTest/backend/internal/eventing/interfaces/httpapi"
 	identityhttp "github.com/EdouardRichard/EzTest/backend/internal/identity/interfaces/httpapi"
+	llmapp "github.com/EdouardRichard/EzTest/backend/internal/llm/application"
+	llmhttp "github.com/EdouardRichard/EzTest/backend/internal/llm/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/idempotency"
 )
@@ -59,6 +61,13 @@ type Dependencies struct {
 	EventReader eventinghttp.EventReader
 	// EventHub delivers live events to GET /api/stream.
 	EventHub eventinghttp.EventSubscriber
+	// LLMConfigs is the LLM configuration use case. When both LLMConfigs and
+	// LLMClientFactory are set, the admin LLM routes are mounted behind the
+	// global bearer auth and the per-route admin guard.
+	LLMConfigs llmhttp.ConfigService
+	// LLMClientFactory builds a protocol client from a stored configuration.
+	// It applies the configuration's retry, interval and timeout policy.
+	LLMClientFactory llmapp.ClientFactory
 }
 
 // New assembles the HTTP handler. Middleware runs in the order
@@ -69,7 +78,7 @@ func New(cfg config.Config, logger *slog.Logger, deps Dependencies) http.Handler
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
-	mux.HandleFunc("GET /api/health", handleAPIHealth(deps.Pinger))
+	mux.HandleFunc("GET /api/health", handleAPIHealth(deps.Pinger, deps.LLMConfigs))
 	if deps.Auth != nil {
 		identityhttp.RegisterAuthRoutes(mux, deps.Auth, identityhttp.NewLoginLimiter(time.Now), deps.Audit)
 	}
@@ -87,6 +96,15 @@ func New(cfg config.Config, logger *slog.Logger, deps Dependencies) http.Handler
 	if deps.EventReader != nil && deps.EventHub != nil {
 		mux.Handle("GET /api/stream",
 			eventinghttp.NewSSEHandler(deps.EventReader, deps.EventHub, eventinghttp.DefaultHeartbeat))
+	}
+	if deps.LLMConfigs != nil && deps.LLMClientFactory != nil {
+		// Authentication is the global middleware; each route only adds the
+		// admin guard and attaches the audit actor/request metadata.
+		llmHandler := llmhttp.NewHandler(deps.LLMConfigs, deps.LLMClientFactory, deps.Audit)
+		adminGuard := func(next http.Handler) http.Handler {
+			return identityhttp.RequireAdmin(auditRequestContext(next))
+		}
+		llmhttp.RegisterRoutes(mux, llmHandler, adminGuard)
 	}
 	if deps.Events != nil && cfg.EnableTestEndpoints {
 		auditor := deps.Audit

@@ -24,6 +24,9 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/application"
 	identity "github.com/EdouardRichard/EzTest/backend/internal/identity/domain"
 	identityhttp "github.com/EdouardRichard/EzTest/backend/internal/identity/interfaces/httpapi"
+	llmapp "github.com/EdouardRichard/EzTest/backend/internal/llm/application"
+	llm "github.com/EdouardRichard/EzTest/backend/internal/llm/domain"
+	llmhttp "github.com/EdouardRichard/EzTest/backend/internal/llm/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/idempotency"
 )
@@ -549,7 +552,7 @@ func TestMiddlewareChainKeepsPublicRoutesPublic(t *testing.T) {
 	// public routes to exercise the auth carve-outs without the full server.
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
-	mux.HandleFunc("GET /api/health", handleAPIHealth(deps.Pinger))
+	mux.HandleFunc("GET /api/health", handleAPIHealth(deps.Pinger, nil))
 	mux.HandleFunc("GET /api/openapi.yaml", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
@@ -908,5 +911,225 @@ func TestTestPublisherRouteDisabled(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("disabled test publisher=%d body=%s want 404", rec.Code, rec.Body)
+	}
+}
+
+// fakeLLMConfigService is a minimal llmhttp.ConfigService for the server-level
+// health and route-wiring tests.
+type fakeLLMConfigService struct {
+	configs       []llm.Config
+	defaultConfig llm.Config
+	defaultErr    error
+}
+
+func (s *fakeLLMConfigService) Create(context.Context, llm.CreateParams) (llm.Config, error) {
+	return llm.Config{}, nil
+}
+
+func (s *fakeLLMConfigService) Update(context.Context, int64, llm.UpdateParams) (llm.Config, error) {
+	return llm.Config{}, nil
+}
+
+func (s *fakeLLMConfigService) Delete(context.Context, int64) error { return nil }
+
+func (s *fakeLLMConfigService) Get(_ context.Context, id int64) (llm.Config, error) {
+	for _, cfg := range s.configs {
+		if cfg.ID == id {
+			return cfg, nil
+		}
+	}
+	return llm.Config{}, llm.ErrConfigNotFound
+}
+
+func (s *fakeLLMConfigService) List(context.Context) ([]llm.Config, error) {
+	return s.configs, nil
+}
+
+func (s *fakeLLMConfigService) GetDefault(context.Context) (llm.Config, error) {
+	if s.defaultErr != nil {
+		return llm.Config{}, s.defaultErr
+	}
+	if s.defaultConfig.ID == 0 {
+		return llm.Config{}, llm.ErrConfigNotFound
+	}
+	return s.defaultConfig, nil
+}
+
+// stubLLMClient is a successful in-process llm.Client used for route mounting.
+type stubLLMClient struct{ text string }
+
+func (c stubLLMClient) Chat(context.Context, llmapp.ChatRequest) (llmapp.ChatResponse, error) {
+	return llmapp.ChatResponse{Text: c.text}, nil
+}
+
+func (c stubLLMClient) ChatStream(context.Context, llmapp.ChatRequest) (<-chan llmapp.StreamEvent, error) {
+	events := make(chan llmapp.StreamEvent, 1)
+	events <- llmapp.StreamEvent{Done: true}
+	close(events)
+	return events, nil
+}
+
+func (c stubLLMClient) ListModels(context.Context) ([]llm.ModelInfo, error) {
+	return []llm.ModelInfo{}, nil
+}
+
+// TestAPIHealthLLMConfigured proves llm_configured is true only when a default
+// configuration exists and its key decrypts (the fake service models a decrypt
+// failure as a GetDefault error).
+func TestAPIHealthLLMConfigured(t *testing.T) {
+	cases := []struct {
+		name     string
+		service  llmhttp.ConfigService
+		expected bool
+	}{
+		{
+			name: "configured with decryptable key",
+			service: &fakeLLMConfigService{defaultConfig: llm.Config{
+				ID: 1, Name: "default", APIKey: "sk-test", IsDefault: true,
+			}},
+			expected: true,
+		},
+		{
+			name:     "default without a key",
+			service:  &fakeLLMConfigService{defaultConfig: llm.Config{ID: 1, Name: "default", IsDefault: true}},
+			expected: false,
+		},
+		{
+			name:     "no default config",
+			service:  &fakeLLMConfigService{defaultErr: llm.ErrConfigNotFound},
+			expected: false,
+		},
+		{
+			name:     "key cannot be decrypted",
+			service:  &fakeLLMConfigService{defaultErr: errors.New("crypto: unknown key version")},
+			expected: false,
+		},
+		{
+			name:     "llm not wired",
+			service:  nil,
+			expected: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			deps := Dependencies{Pinger: fakePinger{}}
+			if tc.service != nil {
+				deps.LLMConfigs = tc.service
+			}
+			h := New(config.Config{Env: "test"}, testLogger(), deps)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/health", nil))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+			}
+			var body struct {
+				Data struct {
+					LLMConfigured bool `json:"llm_configured"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode health %q: %v", rec.Body, err)
+			}
+			if body.Data.LLMConfigured != tc.expected {
+				t.Fatalf("llm_configured=%v want %v body=%s", body.Data.LLMConfigured, tc.expected, rec.Body)
+			}
+		})
+	}
+}
+
+// TestLLMAdminRoutesWired proves the composition root mounts the LLM admin
+// routes with the global bearer auth plus the per-route RequireAdmin guard, and
+// that the test endpoint's audit entry carries the actor and request metadata.
+func TestLLMAdminRoutesWired(t *testing.T) {
+	admin := identity.User{ID: 1, Username: "admin", Role: identity.RoleAdmin, Status: identity.StatusActive}
+	regular := identity.User{ID: 2, Username: "qa01", Role: identity.RoleUser, Status: identity.StatusActive}
+	cfg := llm.Config{
+		ID: 7, Name: "default", Protocol: llm.ProtocolChat,
+		BaseURL: "https://api.deepseek.com", Model: "deepseek-flash",
+		APIKey: "sk-test", KeyVersion: 1, Headers: map[string]string{"X-Test": "header-value"},
+		RetryCount: 2, RetryIntervalMS: 500, TimeoutMS: 60000,
+		StreamEnabled: true, MultimodalEnabled: true, IsDefault: true,
+	}
+	auditor := &capturingAudit{}
+	deps := Dependencies{
+		Pinger: fakePinger{},
+		Auth:   tokenMapAuth{"ezt_admin": admin, "ezt_user": regular},
+		Audit:  auditor,
+		LLMConfigs: &fakeLLMConfigService{
+			configs:       []llm.Config{cfg},
+			defaultConfig: cfg,
+		},
+		LLMClientFactory: func(llm.Config) llmapp.Client { return stubLLMClient{text: "hello"} },
+	}
+	h := New(config.Config{Env: "test"}, testLogger(), deps)
+
+	newReq := func(method, path, token, body string) *http.Request {
+		var reader io.Reader
+		if body != "" {
+			reader = strings.NewReader(body)
+		}
+		req := httptest.NewRequest(method, path, reader)
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		req.Header.Set("X-Request-ID", "req_llm_wired_1234")
+		return req
+	}
+
+	// Admin list is 200 and masked; regular user 403; anonymous 401.
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, newReq(http.MethodGet, "/api/admin/llm/configs", "ezt_admin", ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin list=%d body=%s", rec.Code, rec.Body)
+	}
+	if strings.Contains(rec.Body.String(), "sk-test") || strings.Contains(rec.Body.String(), "header-value") {
+		t.Fatalf("admin list leaked secrets: %s", rec.Body)
+	}
+	for _, tc := range []struct {
+		token string
+		want  int
+	}{{token: "ezt_user", want: http.StatusForbidden}, {token: "", want: http.StatusUnauthorized}} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, newReq(http.MethodGet, "/api/admin/llm/configs", tc.token, ""))
+		if rec.Code != tc.want {
+			t.Fatalf("list token=%q=%d want %d", tc.token, rec.Code, tc.want)
+		}
+	}
+
+	// The admin test endpoint works through the mounted route and is audited.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, newReq(http.MethodPost, "/api/admin/llm/configs/7/test", "ezt_admin", `{"prompt":"hi"}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin test=%d body=%s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), `"text":"hello"`) {
+		t.Fatalf("test body=%s", rec.Body)
+	}
+	if len(auditor.entries) != 1 {
+		t.Fatalf("audit entries=%d want 1: %+v", len(auditor.entries), auditor.entries)
+	}
+	entry := auditor.entries[0]
+	if entry.Action != "llm.test_succeeded" {
+		t.Fatalf("audit action=%q", entry.Action)
+	}
+	if entry.ActorUserID == nil || *entry.ActorUserID != admin.ID {
+		t.Fatalf("audit actor=%v want %d", entry.ActorUserID, admin.ID)
+	}
+	if entry.RequestID != "req_llm_wired_1234" {
+		t.Fatalf("audit request_id=%q", entry.RequestID)
+	}
+
+	// The admin test endpoint is admin-only.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, newReq(http.MethodPost, "/api/admin/llm/configs/7/test", "ezt_user", `{}`))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("user test=%d want 403", rec.Code)
+	}
+
+	// Health now reports the configured default.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, newReq(http.MethodGet, "/api/health", "", ""))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"llm_configured":true`) {
+		t.Fatalf("health=%d body=%s", rec.Code, rec.Body)
 	}
 }

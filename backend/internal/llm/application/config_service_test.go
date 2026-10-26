@@ -512,3 +512,101 @@ func TestConfigServiceGetListAndDefault(t *testing.T) {
 		t.Fatalf("default=%+v err=%v", got, err)
 	}
 }
+
+// TestDefaultCreateParams pins the explicit create default policy used by the
+// admin API: omitted fields get the database column defaults instead of the Go
+// zero value, while an explicitly provided zero (retry_count=0) stays zero.
+func TestDefaultCreateParams(t *testing.T) {
+	defaults := DefaultCreateParams()
+	if defaults.RetryCount != 2 {
+		t.Fatalf("RetryCount=%d want 2", defaults.RetryCount)
+	}
+	if defaults.RetryIntervalMS != 500 {
+		t.Fatalf("RetryIntervalMS=%d want 500", defaults.RetryIntervalMS)
+	}
+	if defaults.TimeoutMS != 60000 {
+		t.Fatalf("TimeoutMS=%d want 60000", defaults.TimeoutMS)
+	}
+	if !defaults.StreamEnabled || !defaults.MultimodalEnabled {
+		t.Fatalf("feature defaults=%+v want both true", defaults)
+	}
+	if defaults.IsDefault {
+		t.Fatal("a created configuration must not become the default implicitly")
+	}
+}
+
+// TestConfigServiceTrimsPersistedValues covers the Task 9 review minor: the
+// persisted name, base_url, model and header names must be trimmed.
+func TestConfigServiceTrimsPersistedValues(t *testing.T) {
+	repo := newFakeConfigRepository()
+	svc := NewConfigService(repo, audit.NopRecorder{})
+	params := validCreateParams()
+	params.Name = "  default  "
+	params.BaseURL = "  https://api.deepseek.com  "
+	params.Model = "  deepseek-flash  "
+	params.Headers = map[string]string{"  X-Test  ": " value "}
+	cfg, err := svc.Create(ctx, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Name != "default" || cfg.BaseURL != "https://api.deepseek.com" || cfg.Model != "deepseek-flash" {
+		t.Fatalf("create did not trim persisted values: %+v", cfg)
+	}
+	if len(cfg.Headers) != 1 || cfg.Headers["X-Test"] != " value " {
+		t.Fatalf("create did not trim header names only: %+v", cfg.Headers)
+	}
+
+	name := "  renamed  "
+	baseURL := "  https://api.deepseek.com/v1  "
+	model := "  deepseek-chat  "
+	headers := map[string]string{"  X-New  ": "v"}
+	updated, err := svc.Update(ctx, cfg.ID, llm.UpdateParams{
+		Name:    &name,
+		BaseURL: &baseURL,
+		Model:   &model,
+		Headers: &headers,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Name != "renamed" || updated.BaseURL != "https://api.deepseek.com/v1" || updated.Model != "deepseek-chat" {
+		t.Fatalf("update did not trim persisted values: %+v", updated)
+	}
+	if len(updated.Headers) != 1 || updated.Headers["X-New"] != "v" {
+		t.Fatalf("update did not trim header names: %+v", updated.Headers)
+	}
+}
+
+// TestConfigServiceSeedExistingNameWithoutDefault covers the Task 9 review
+// minor: a pre-existing non-default configuration named "default" must not abort
+// startup seeding. The seed is a logged no-op and the existing row is untouched.
+func TestConfigServiceSeedExistingNameWithoutDefault(t *testing.T) {
+	repo := newFakeConfigRepository()
+	recorder := &capturingRecorder{}
+	svc := NewConfigService(repo, recorder)
+
+	params := validCreateParams()
+	params.Name = llm.SeedConfigName
+	params.IsDefault = false
+	if _, err := svc.Create(ctx, params); err != nil {
+		t.Fatal(err)
+	}
+
+	seeded, err := svc.SeedFromEnv(ctx, "https://api.deepseek.com", "sk-seed", "deepseek-flash")
+	if err != nil {
+		t.Fatalf("seed aborted startup: %v", err)
+	}
+	if seeded {
+		t.Fatal("seed reported a created configuration")
+	}
+	configs, err := svc.List(ctx)
+	if err != nil || len(configs) != 1 {
+		t.Fatalf("configs=%d err=%v", len(configs), err)
+	}
+	if configs[0].APIKey != "sk-test" || configs[0].Model != "deepseek-flash" || configs[0].IsDefault {
+		t.Fatalf("existing config was modified: %+v", configs[0])
+	}
+	if len(recorder.entries) != 1 {
+		t.Fatalf("seed recorded an unexpected audit entry: %+v", recorder.entries)
+	}
+}

@@ -76,9 +76,70 @@ func configMetadata(cfg llm.Config) map[string]any {
 	}
 }
 
+// DefaultCreateParams returns the explicit defaults for a create request. It is
+// the service-level default policy used by the admin API: retry_count 0 is a
+// valid explicit value, so the HTTP layer resolves this policy first and only
+// overrides fields the request actually provides. The values mirror the
+// llm_configs column defaults.
+func DefaultCreateParams() llm.CreateParams {
+	return llm.CreateParams{
+		RetryCount:        llm.DefaultRetryCount,
+		RetryIntervalMS:   llm.DefaultRetryIntervalMS,
+		TimeoutMS:         llm.DefaultTimeoutMS,
+		StreamEnabled:     true,
+		MultimodalEnabled: true,
+	}
+}
+
+// normalizeCreateParams trims the persisted strings. Header values are kept
+// byte-for-byte; only their names are trimmed.
+func normalizeCreateParams(params llm.CreateParams) llm.CreateParams {
+	params.Name = strings.TrimSpace(params.Name)
+	params.BaseURL = strings.TrimSpace(params.BaseURL)
+	params.Model = strings.TrimSpace(params.Model)
+	params.Headers = normalizeHeaderNames(params.Headers)
+	return params
+}
+
+// normalizeUpdateParams trims the explicitly provided strings and header names.
+func normalizeUpdateParams(params llm.UpdateParams) llm.UpdateParams {
+	if params.Name != nil {
+		value := strings.TrimSpace(*params.Name)
+		params.Name = &value
+	}
+	if params.BaseURL != nil {
+		value := strings.TrimSpace(*params.BaseURL)
+		params.BaseURL = &value
+	}
+	if params.Model != nil {
+		value := strings.TrimSpace(*params.Model)
+		params.Model = &value
+	}
+	if params.Headers != nil {
+		normalized := normalizeHeaderNames(*params.Headers)
+		params.Headers = &normalized
+	}
+	return params
+}
+
+// normalizeHeaderNames trims header names. A nil map stays nil so an omitted
+// map is not turned into an empty replacement.
+func normalizeHeaderNames(headers map[string]string) map[string]string {
+	if headers == nil {
+		return nil
+	}
+	normalized := make(map[string]string, len(headers))
+	for name, value := range headers {
+		normalized[strings.TrimSpace(name)] = value
+	}
+	return normalized
+}
+
 // Create validates and stores a new configuration and records llm.config_created.
-// Omitted timing fields (zero) fall back to the documented defaults.
+// Omitted timing fields (zero interval/timeout, whose valid ranges exclude zero)
+// fall back to the documented defaults.
 func (s *ConfigService) Create(ctx context.Context, params llm.CreateParams) (llm.Config, error) {
+	params = normalizeCreateParams(params)
 	if params.RetryIntervalMS == 0 {
 		params.RetryIntervalMS = llm.DefaultRetryIntervalMS
 	}
@@ -103,6 +164,7 @@ func (s *ConfigService) Create(ctx context.Context, params llm.CreateParams) (ll
 
 // Update applies a partial update and records llm.config_updated.
 func (s *ConfigService) Update(ctx context.Context, id int64, params llm.UpdateParams) (llm.Config, error) {
+	params = normalizeUpdateParams(params)
 	if err := params.Validate(); err != nil {
 		return llm.Config{}, err
 	}
@@ -186,7 +248,20 @@ func (s *ConfigService) SeedFromEnv(ctx context.Context, baseURL, apiKey, model 
 		// insert. The partial unique index allows one default, so once a
 		// default exists this seed is complete.
 		if errors.Is(err, llm.ErrNameTaken) || errors.Is(err, llm.ErrDefaultConflict) {
-			if _, getErr := s.repo.GetDefault(ctx); getErr == nil {
+			_, getErr := s.repo.GetDefault(ctx)
+			switch {
+			case getErr == nil:
+				return false, nil
+			case !errors.Is(getErr, llm.ErrConfigNotFound):
+				return false, fmt.Errorf("llm: check default configuration after seed conflict: %w", getErr)
+			case errors.Is(err, llm.ErrNameTaken):
+				// A non-default configuration already uses the seed name. That
+				// is not a fatal startup condition: keep the operator's row
+				// untouched and let an administrator promote a configuration
+				// explicitly.
+				slog.WarnContext(ctx,
+					"llm: default seed skipped because a non-default configuration already uses the name",
+					"name", llm.SeedConfigName)
 				return false, nil
 			}
 		}

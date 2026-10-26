@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"mime"
@@ -86,6 +87,12 @@ func Middleware(store Store, userID func(context.Context) (int64, bool)) func(ht
 				return
 			}
 			r.Body = io.NopCloser(bytes.NewReader(body))
+			// The LLM test endpoint carries stream in its JSON body, so the
+			// stream flag can only be inspected after the body is buffered.
+			if isStreamingLLMTestBody(r, body) {
+				next.ServeHTTP(w, r)
+				return
+			}
 			requestHash := hashRequest(r.Method, r.URL.Path, body)
 
 			// Serialise concurrent requests that share the same idempotency
@@ -151,12 +158,34 @@ func skipIdempotency(r *http.Request) bool {
 	return isStreamingLLMTest(r)
 }
 
-// isStreamingLLMTest matches POST /api/admin/llm/configs/{id}/test?stream=true.
+// isStreamingLLMTest matches POST /api/admin/llm/configs/{id}/test with
+// stream=true in the query string.
 func isStreamingLLMTest(r *http.Request) bool {
 	if r.URL.Query().Get("stream") != "true" {
 		return false
 	}
-	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	return isLLMTestPath(r.URL.Path)
+}
+
+// isStreamingLLMTestBody matches the same endpoint when the documented body
+// carries {"stream":true}. The body flag must also bypass the middleware:
+// buffering the SSE response would hide http.Flusher and break the stream.
+func isStreamingLLMTestBody(r *http.Request, body []byte) bool {
+	if !isLLMTestPath(r.URL.Path) {
+		return false
+	}
+	var payload struct {
+		Stream bool `json:"stream"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return false
+	}
+	return payload.Stream
+}
+
+// isLLMTestPath reports whether path is POST /api/admin/llm/configs/{id}/test.
+func isLLMTestPath(path string) bool {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
 	return len(parts) == 6 &&
 		parts[0] == "api" &&
 		parts[1] == "admin" &&
