@@ -7,17 +7,31 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/db"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+const (
+	// testDBLockID serialises the shared test database across test binaries.
+	// Go runs different packages' test binaries in parallel by default, so
+	// without a cross-process lock one package's schema reset or truncate could
+	// destroy another package's tables mid-test. It is deliberately distinct
+	// from db.Migrate's startup lock (4242).
+	testDBLockID = 4243
+
+	lockTestDBSQL   = "SELECT pg_advisory_lock($1)"
+	unlockTestDBSQL = "SELECT pg_advisory_unlock($1)"
+)
+
 // OpenTestDB opens the database named by EZTEST_TEST_DATABASE_URL on an empty
 // public schema, applies the embedded migrations and truncates every public
 // table except schema_migrations. The pool is closed, and the tables are
 // emptied again, when the test finishes. The test is skipped when the variable
-// is unset.
+// is unset. Like OpenRawTestDB it holds advisory lock 4243 for the whole test,
+// so tests using it must not call t.Parallel().
 func OpenTestDB(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	pool := OpenRawTestDB(t)
@@ -40,6 +54,14 @@ func OpenTestDB(t *testing.T) *pgxpool.Pool {
 // their own migration set start from a clean ledger instead of inheriting the
 // embedded one. The pool is closed when the test finishes. The test is skipped
 // when the variable is unset.
+//
+// The helper takes advisory lock 4243 for the lifetime of the test so that
+// parallel test binaries in other packages cannot reset or truncate the shared
+// database while this test runs. Because the lock is held for the whole test,
+// a test must not call this helper (or OpenTestDB) a second time while the
+// first pool is still in use, and tests must not call t.Parallel(). Cleanup
+// order is pool close registered first, then unlock/release, so the lock is
+// always released before the pool closes and even a failing test unlocks.
 func OpenRawTestDB(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	url := strings.TrimSpace(os.Getenv("EZTEST_TEST_DATABASE_URL"))
@@ -54,10 +76,44 @@ func OpenRawTestDB(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(database.Close)
 
+	// Take the cross-package lock before touching the schema.
+	lockTestDB(t, ctx, database.Pool)
+
 	if _, err := database.Pool.Exec(ctx, `DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;`); err != nil {
 		t.Fatalf("reset test database schema: %v", err)
 	}
 	return database.Pool
+}
+
+// lockTestDB acquires advisory lock testDBLockID on a dedicated pooled
+// connection and registers a cleanup that unlocks it and returns the
+// connection. Session-level advisory locks belong to a single session, so the
+// connection stays acquired for the whole test rather than only while the reset
+// runs. Cleanups run LIFO: callers register their pool close first, then this
+// lock cleanup, then any later work (truncateAll); therefore later work runs
+// while the lock is still held and the lock is released before the pool closes.
+func lockTestDB(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire test database lock connection: %v", err)
+	}
+	if _, err := conn.Exec(ctx, lockTestDBSQL, testDBLockID); err != nil {
+		conn.Release()
+		t.Fatalf("lock test database (advisory lock %d): %v", testDBLockID, err)
+	}
+	t.Cleanup(func() {
+		unlockCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if _, err := conn.Exec(unlockCtx, unlockTestDBSQL, testDBLockID); err != nil {
+			// Closing the connection releases the session lock server-side and
+			// keeps a still-locked session out of the pool.
+			_ = conn.Conn().Close(unlockCtx)
+			conn.Release()
+			return
+		}
+		conn.Release()
+	})
 }
 
 // truncateAll empties every table in the public schema except the migration

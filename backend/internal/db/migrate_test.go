@@ -63,8 +63,13 @@ func TestMigrateEmbeddedIsIdempotent(t *testing.T) {
 // added by later tasks.
 func TestOpenRawTestDBStartsWithoutLedger(t *testing.T) {
 	ctx := context.Background()
-	// Seed the shared schema with the embedded migration ledger first.
-	testutil.OpenTestDB(t)
+	// Seed the shared schema with the embedded migration ledger first. The
+	// helpers hold a cross-package advisory lock for the lifetime of a test, so
+	// the seed runs in a subtest: its cleanup (truncate, unlock, pool close)
+	// finishes before OpenRawTestDB takes the lock for the rest of this test.
+	t.Run("seed", func(t *testing.T) {
+		testutil.OpenTestDB(t)
+	})
 	pool := testutil.OpenRawTestDB(t)
 	var hasLedger bool
 	if err := pool.QueryRow(ctx,
