@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 .secrets/
+*.local.md
 
 # ---- local toolchain (portable Go/PostgreSQL) ----
 .tools/
