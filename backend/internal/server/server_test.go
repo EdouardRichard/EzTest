@@ -19,6 +19,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/application"
 	identity "github.com/EdouardRichard/EzTest/backend/internal/identity/domain"
+	identityhttp "github.com/EdouardRichard/EzTest/backend/internal/identity/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/idempotency"
 )
@@ -460,13 +461,80 @@ func TestMiddlewareChainRequiresAuthForProtectedAPIRoutes(t *testing.T) {
 	deps := Dependencies{Auth: acceptingAuth{token: "ezt_valid"}}
 	h := withMiddleware(mux, config.Config{Env: "test"}, deps, testLogger())
 
+	req := httptest.NewRequest(http.MethodGet, "/api/things", nil)
+	req.Header.Set("X-Request-ID", "req_auth_chain_1234")
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/things", nil))
+	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("code=%d body=%s, want 401", rec.Code, rec.Body)
 	}
 	if got := rec.Header().Get("WWW-Authenticate"); got != "Bearer" {
 		t.Fatalf("WWW-Authenticate=%q", got)
+	}
+	assertAuthErrorEnvelope(t, rec, platform.CodeUnauthenticated, "req_auth_chain_1234")
+}
+
+// TestMiddlewareChainForbiddenUsesSharedErrorEnvelope covers the RequireAdmin
+// 403 that the global auth chain now also produces for a non-admin caller.
+func TestMiddlewareChainForbiddenUsesSharedErrorEnvelope(t *testing.T) {
+	auth := acceptingAuth{
+		token: "ezt_valid",
+		user:  identity.User{ID: 7, Username: "qa01", Role: identity.RoleUser, Status: identity.StatusActive},
+	}
+	mux := http.NewServeMux()
+	mux.Handle("GET /api/admin/things", identityhttp.AuthMiddleware(auth)(identityhttp.RequireAdmin(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))))
+	h := withMiddleware(mux, config.Config{Env: "test"}, Dependencies{Auth: auth}, testLogger())
+
+	req := httptest.NewRequest(http.MethodGet, "/api/admin/things", nil)
+	req.Header.Set("Authorization", "Bearer ezt_valid")
+	req.Header.Set("X-Request-ID", "req_forbidden_1234")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("code=%d body=%s, want 403", rec.Code, rec.Body)
+	}
+	assertAuthErrorEnvelope(t, rec, platform.CodeForbidden, "req_forbidden_1234")
+}
+
+// assertAuthErrorEnvelope proves an auth failure uses the design's §9.1
+// envelope: every field present, request_id non-empty and equal to the
+// X-Request-ID response header (which the request ID middleware set).
+func assertAuthErrorEnvelope(t *testing.T, rec *httptest.ResponseRecorder, wantCode, wantRequestID string) {
+	t.Helper()
+	var payload struct {
+		Error struct {
+			Code      string          `json:"code"`
+			Message   string          `json:"message"`
+			RequestID *string         `json:"request_id"`
+			Retryable *bool           `json:"retryable"`
+			Details   json.RawMessage `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode error response %q: %v", rec.Body.Bytes(), err)
+	}
+	if payload.Error.Code != wantCode {
+		t.Fatalf("error code=%q want %q", payload.Error.Code, wantCode)
+	}
+	if payload.Error.Message == "" {
+		t.Fatal("error envelope has no message")
+	}
+	if payload.Error.RequestID == nil || *payload.Error.RequestID == "" {
+		t.Fatalf("error envelope has no request_id: %s", rec.Body)
+	}
+	if *payload.Error.RequestID != wantRequestID {
+		t.Fatalf("envelope request_id=%q want %q", *payload.Error.RequestID, wantRequestID)
+	}
+	if got := rec.Header().Get(platform.RequestIDHeader); got != *payload.Error.RequestID {
+		t.Fatalf("envelope request_id=%q, X-Request-ID header=%q", *payload.Error.RequestID, got)
+	}
+	if payload.Error.Retryable == nil {
+		t.Fatalf("error envelope has no retryable field: %s", rec.Body)
+	}
+	if string(payload.Error.Details) != "{}" {
+		t.Fatalf("error envelope details=%s, want {}: %s", payload.Error.Details, rec.Body)
 	}
 }
 
