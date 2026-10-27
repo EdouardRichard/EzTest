@@ -1212,8 +1212,9 @@ func (s *RunService) run(ctx context.Context, runID int64, session domain.Sessio
   7. `Messages.CompleteAssistant(assistantID, parts, reasoning, calls, usage)`；flush 两个 buffer（final=true）；更新 `history`。**无论 Done、Err 还是 ctx 取消，都必须用已累计内容调用 `CompleteAssistant`**，保留部分输出。
   8. 有 usage → 发 `usage` 活动；`Runs.UpdateProgress`。
   9. `turns++`。
-  10. 无 calls：`finishReason=="length"` → `failed/model_error`；否则 `done/completed`。
+  10. 无 calls：按 `finishReason` 收尾——`length` / `aborted` / `insufficient_system_resource` / `tool_calls`（但无 calls）→ `failed/model_error`（`error_code` 记 `finish_reason=<x>`）；`stop`/空 → `done/completed`；**所有终态必须写非空 `terminal_reason`**。
   11. 对每个 call：`stage="tools"`；发 `tool_use`；`Executor.Execute(ctx, ToolCallInput{RunID: runID, SessionID: session.ID, ActorUserID: actor, Call: call, Allowed: profile.AllowedTools})`；`Messages.Append(tool)`；发 `tool_result`；更新 `history`；若 ctx 取消 → 终态 aborted_tools。
+  12. 工具结果入上下文前截断到 **32KB**（保留头尾 + `...[truncated]`）；事件 preview ≤2KB。
   12. 继续下一回合。
 - `finish`：`Runs.Finish(runID, domain.RunResult{...})`，然后发 `run_finished`（detail 含 status/reason/turns/duration/usage/abort_code/last_tool）。
 - 任何 repo/event 错误：记录 log；终态写库失败则 log error。
@@ -1222,9 +1223,9 @@ func (s *RunService) run(ctx context.Context, runID int64, session domain.Sessio
 
 Run:
 ```powershell
-cd backend; & ..\.tools\go\bin\go.exe test ./internal/agent/application -race -v
+cd backend; & ..\.tools\go\bin\go.exe test ./internal/agent/application -count=1 -v
 ```
-Expected: PASS（无 data race）。
+Expected: PASS。若本机 Go 支持 cgo/`-race`，再跑一次 `-race` 并记录；无 cgo 时跳过并在报告注明（环境限制）。
 
 - [ ] **Step 8: 提交**
 
@@ -1654,6 +1655,7 @@ func TestAgentRoutesAbsentWithoutDeps(t *testing.T) {
     runService.Shutdown(agentShutdownCtx)
     cancelAgent()
     ```
+13. `agentaudit.Sink.Record` 使用 `context.WithoutCancel(ctx)` + 2s 超时调用 auditor，保证 abort/超时后仍能写入 `agent.tool.invoked` / `agent.run.aborted`；审计失败只 log（不阻塞 run）。
 
 - [ ] **Step 10: 全量构建/测试**
 
