@@ -45,7 +45,9 @@ type FactVersionRepository interface {
 	// deciding whether to reuse the version or bump it (design spec §6.4). A
 	// version that has no stored body is reported as a not-found error.
 	GetVersion(ctx context.Context, repoID int64, commit, factKey string, version int) ([]byte, error)
-	Create(ctx context.Context, repoID int64, commit, factKey, model, prompt string, version int, body []byte, analysisID int64) error
+	// Create appends one fact version. The caller supplies the Snowflake id
+	// minted in the application layer (D29); the repository never generates it.
+	Create(ctx context.Context, id int64, repoID int64, commit, factKey, model, prompt string, version int, body []byte, analysisID int64) error
 	Supersede(ctx context.Context, repoID int64, commit, factKey string, before int, at time.Time) error
 }
 
@@ -56,8 +58,10 @@ type CacheRepository interface {
 	Upsert(ctx context.Context, c CachedFile) error
 }
 
-// CachedFile is one successful cached file analysis.
+// CachedFile is one successful cached file analysis. The caller supplies ID,
+// the Snowflake id minted in the application layer (D29).
 type CachedFile struct {
+	ID            int64
 	RepoID        int64
 	Commit        string
 	Path          string

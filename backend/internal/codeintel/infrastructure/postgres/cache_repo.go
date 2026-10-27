@@ -12,9 +12,9 @@ import (
 )
 
 // cacheColumnList is the shared column order of every cache query and the order
-// scanCachedFile expects. The table id stays internal to the repository because
-// the cache is always addressed by its six-part key, never by id.
-const cacheColumnList = `repo_id, commit_sha, path, file_hash, model, prompt_version,
+// scanCachedFile expects. Reads return the caller-supplied Snowflake id even
+// though the cache is also addressable by its six-part key.
+const cacheColumnList = `id, repo_id, commit_sha, path, file_hash, model, prompt_version,
 	facts, stats, created_at, last_used_at`
 
 // scanCachedFile scans one row in cacheColumnList order. The JSONB facts/stats
@@ -26,6 +26,7 @@ func scanCachedFile(row rowScanner) (domain.CachedFile, error) {
 		stats  []byte
 	)
 	if err := row.Scan(
+		&cached.ID,
 		&cached.RepoID,
 		&cached.Commit,
 		&cached.Path,
@@ -75,11 +76,16 @@ func (r *CacheRepo) Get(ctx context.Context, repoID int64, commit, path, fileHas
 	return &cached, true, nil
 }
 
-// Upsert stores one successful file analysis and, on conflict, refreshes its
-// facts/stats/last_used_at while keeping the original id and created_at
-// (design spec §6.11). The cache key is the six-part
-// (repo, commit, path, file_hash, model, prompt_version) tuple.
+// Upsert stores one successful file analysis under the caller-supplied Snowflake
+// id and, on conflict, refreshes its facts/stats/last_used_at while keeping the
+// original id and created_at (design spec §6.11). A zero id is rejected with
+// ErrInvalid/missing_id because this package never mints ids (D29). The cache
+// key is the six-part (repo, commit, path, file_hash, model, prompt_version)
+// tuple.
 func (r *CacheRepo) Upsert(ctx context.Context, cached domain.CachedFile) error {
+	if cached.ID == 0 {
+		return missingIDError("cached file analysis")
+	}
 	const query = `INSERT INTO code_analysis_cache
 		(id, repo_id, commit_sha, path, file_hash, model, prompt_version, facts, stats)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb)
@@ -89,7 +95,7 @@ func (r *CacheRepo) Upsert(ctx context.Context, cached domain.CachedFile) error 
 			stats = EXCLUDED.stats,
 			last_used_at = now()`
 	if _, err := r.pool.Exec(ctx, query,
-		nextRepoID(), cached.RepoID, cached.Commit, cached.Path, cached.FileHash,
+		cached.ID, cached.RepoID, cached.Commit, cached.Path, cached.FileHash,
 		cached.Model, cached.PromptVersion,
 		jsonParam(cached.Facts, jsonFallbackEmptyArray),
 		jsonParam(cached.Stats, jsonFallbackEmptyObject),

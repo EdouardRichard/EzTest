@@ -26,8 +26,9 @@ const (
 )
 
 // seedIDGenerator is the process-wide Snowflake generator of the seeded
-// fixtures. It uses node 3 so its ids cannot collide with the node-0/1
-// generators the repositories and other contexts fall back to.
+// fixtures. It uses node 3 so its ids cannot collide with the application's
+// node-configured generator (node 1) or the literal ids the repository fixtures
+// supply.
 var seedIDGenerator = sync.OnceValue(func() *id.Snowflake {
 	generator, err := id.NewSnowflake(3)
 	if err != nil {

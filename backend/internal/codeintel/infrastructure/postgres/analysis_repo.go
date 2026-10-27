@@ -310,7 +310,7 @@ func (r *AnalysisRepo) GetLatest(ctx context.Context, versionID int64) (domain.C
 		 LIMIT 1`, versionID))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.CodeAnalysis{}, domain.NewNotFound("analysis",
+			return domain.CodeAnalysis{}, domain.NewNotFound("analysis_not_found",
 				fmt.Sprintf("codeintel: version %d has no analysis", versionID))
 		}
 		return domain.CodeAnalysis{}, fmt.Errorf("postgres: get latest analysis: %w", err)
