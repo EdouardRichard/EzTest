@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/textproto"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -711,21 +712,30 @@ func (f *fakeRelationService) List(_ context.Context, versionID int64) ([]versio
 
 // fakeAttachmentService is an in-memory AttachmentService.
 type fakeAttachmentService struct {
-	attachments  map[int64]*versionapp.Attachment
-	contents     map[int64][]byte
-	nextID       int64
-	order        *[]string
-	calls        []string
-	lastActor    int64
-	lastUpload   fakeAttachmentUpload
-	removedPaths []string
-	storagePaths []string
-	uploadErr    error
-	listErr      error
-	deleteErr    error
-	pathsErr     error
-	removeErr    error
-	openErr      error
+	attachments   map[int64]*versionapp.Attachment
+	contents      map[int64][]byte
+	nextID        int64
+	order         *[]string
+	calls         []string
+	lastActor     int64
+	lastUpload    fakeAttachmentUpload
+	readTextCalls []fakeAttachmentRead
+	removedPaths  []string
+	storagePaths  []string
+	uploadErr     error
+	listErr       error
+	deleteErr     error
+	pathsErr      error
+	removeErr     error
+	openErr       error
+	readTextErr   error
+}
+
+// fakeAttachmentRead records one ReadText request of the recon part builder.
+type fakeAttachmentRead struct {
+	versionID    int64
+	attachmentID int64
+	maxBytes     int
 }
 
 // fakeAttachmentUpload records one multipart upload.
@@ -821,13 +831,43 @@ func (f *fakeAttachmentService) List(_ context.Context, versionID, reqID int64) 
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
-	attachments := make([]versionapp.Attachment, 0, len(f.attachments))
-	for _, attachment := range f.attachments {
+	ids := make([]int64, 0, len(f.attachments))
+	for id, attachment := range f.attachments {
 		if attachment.VersionID == versionID && attachment.RequirementID == reqID {
-			attachments = append(attachments, *attachment)
+			ids = append(ids, id)
 		}
 	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	attachments := make([]versionapp.Attachment, 0, len(ids))
+	for _, id := range ids {
+		attachments = append(attachments, *f.attachments[id])
+	}
 	return attachments, nil
+}
+
+// ReadText implements AttachmentService. It clamps the returned content to the
+// requested byte budget like the real service clamps to 64 KiB per file.
+func (f *fakeAttachmentService) ReadText(_ context.Context, versionID, attachmentID int64, maxBytes int) (string, error) {
+	f.calls = append(f.calls, "ReadText")
+	f.readTextCalls = append(f.readTextCalls, fakeAttachmentRead{
+		versionID: versionID, attachmentID: attachmentID, maxBytes: maxBytes,
+	})
+	if f.readTextErr != nil {
+		return "", f.readTextErr
+	}
+	attachment, ok := f.attachments[attachmentID]
+	if !ok || attachment.VersionID != versionID {
+		return "", domain.NewNotFound("attachment", attachmentID)
+	}
+	if attachment.Kind != domain.AttachmentText {
+		return "", domain.NewInvalid("file", "unsupported_attachment_type",
+			"only text attachments can be read")
+	}
+	content := f.contents[attachmentID]
+	if maxBytes > 0 && len(content) > maxBytes {
+		content = content[:maxBytes]
+	}
+	return string(content), nil
 }
 
 // Get implements AttachmentService.
@@ -898,6 +938,11 @@ type testDeps struct {
 	requirementStats *fakeRequirementStats
 	relations        *fakeRelationService
 	attachments      *fakeAttachmentService
+	clarification    *fakeClarificationService
+	messages         *fakeClarificationMessages
+	events           *fakeEventSnapshotter
+	eventReader      *fakeEventReader
+	eventSubscriber  *fakeEventSubscriber
 	order            *[]string
 }
 
@@ -912,6 +957,11 @@ func newTestDeps() *testDeps {
 		requirementStats: &fakeRequirementStats{open: map[int64]int{}, attachments: map[int64]int{}},
 		relations:        &fakeRelationService{},
 		attachments:      newFakeAttachmentService(&order),
+		clarification:    newFakeClarificationService(),
+		messages:         &fakeClarificationMessages{},
+		events:           &fakeEventSnapshotter{},
+		eventReader:      &fakeEventReader{},
+		eventSubscriber:  &fakeEventSubscriber{},
 		order:            &order,
 	}
 }
@@ -922,13 +972,18 @@ func newTestServer(t *testing.T) (http.Handler, *testDeps) {
 	t.Helper()
 	deps := newTestDeps()
 	handlers := NewHandlers(HandlersDeps{
-		Versions:         deps.versions,
-		VersionCounts:    deps.versionCounts,
-		ResourceCatalog:  deps.catalog,
-		Requirements:     deps.requirements,
-		RequirementStats: deps.requirementStats,
-		Relations:        deps.relations,
-		Attachments:      deps.attachments,
+		Versions:              deps.versions,
+		VersionCounts:         deps.versionCounts,
+		ResourceCatalog:       deps.catalog,
+		Requirements:          deps.requirements,
+		RequirementStats:      deps.requirementStats,
+		Relations:             deps.relations,
+		Attachments:           deps.attachments,
+		Clarification:         deps.clarification,
+		ClarificationMessages: deps.messages,
+		Events:                deps.events,
+		EventReader:           deps.eventReader,
+		EventSubscriber:       deps.eventSubscriber,
 	})
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, *handlers)
@@ -965,6 +1020,21 @@ func doRequest(handler http.Handler, method, path, token, body string) *httptest
 	if token != "" {
 		request.Header.Set("Authorization", "Bearer "+token)
 	}
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	return recorder
+}
+
+// newAuthenticatedRequest builds a request carrying the test bearer token, for
+// tests that need to set additional headers before sending it.
+func newAuthenticatedRequest(method, path string, body io.Reader) *http.Request {
+	request := httptest.NewRequest(method, path, body)
+	request.Header.Set("Authorization", "Bearer "+testUserToken)
+	return request
+}
+
+// doRequestWith serves one already built request against the test server.
+func doRequestWith(handler http.Handler, request *http.Request) *httptest.ResponseRecorder {
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, request)
 	return recorder

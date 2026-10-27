@@ -1,10 +1,12 @@
 package httpapi
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
+	eventing "github.com/EdouardRichard/EzTest/backend/internal/eventing/domain"
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 )
 
@@ -312,4 +314,394 @@ func newAttachmentDTOs(attachments []versionapp.Attachment) []attachmentDTO {
 		items = append(items, newAttachmentDTO(&attachments[i]))
 	}
 	return items
+}
+
+// clarificationSessionDTO is the ClarificationSession shape of spec §7.5. The
+// P3 session id is a decimal string; the P1 agentSessionId stays a number.
+type clarificationSessionDTO struct {
+	ID               int64      `json:"id,string"`
+	Status           string     `json:"status"`
+	AgentSessionID   *int64     `json:"agentSessionId"`
+	StartedAt        time.Time  `json:"startedAt"`
+	EndedAt          *time.Time `json:"endedAt"`
+	ContextSummary   string     `json:"contextSummary"`
+	SummaryUpdatedAt *time.Time `json:"summaryUpdatedAt"`
+}
+
+// newClarificationSessionDTO maps one session aggregate to the API shape.
+func newClarificationSessionDTO(session *versionapp.ClarificationSession) clarificationSessionDTO {
+	return clarificationSessionDTO{
+		ID:               session.ID,
+		Status:           session.Status,
+		AgentSessionID:   session.AgentSessionID,
+		StartedAt:        session.StartedAt,
+		EndedAt:          session.EndedAt,
+		ContextSummary:   session.ContextSummary,
+		SummaryUpdatedAt: session.SummaryUpdatedAt,
+	}
+}
+
+// clarificationSessionStartedDTO is the narrow 201 body of the session start
+// (spec §7.5): only the fields known before completion and context summary.
+type clarificationSessionStartedDTO struct {
+	ID             int64     `json:"id,string"`
+	Status         string    `json:"status"`
+	AgentSessionID *int64    `json:"agentSessionId"`
+	StartedAt      time.Time `json:"startedAt"`
+}
+
+// newClarificationSessionStartedDTO maps a freshly started session.
+func newClarificationSessionStartedDTO(session *versionapp.ClarificationSession) clarificationSessionStartedDTO {
+	return clarificationSessionStartedDTO{
+		ID:             session.ID,
+		Status:         session.Status,
+		AgentSessionID: session.AgentSessionID,
+		StartedAt:      session.StartedAt,
+	}
+}
+
+// clarificationQuestionCountsDTO is the per-status question counter block.
+type clarificationQuestionCountsDTO struct {
+	Open      int `json:"open"`
+	Answered  int `json:"answered"`
+	Dismissed int `json:"dismissed"`
+}
+
+// clarificationDecisionCountsDTO is the per-status decision counter block.
+type clarificationDecisionCountsDTO struct {
+	Proposed int `json:"proposed"`
+	Accepted int `json:"accepted"`
+	Rejected int `json:"rejected"`
+}
+
+// clarificationOverviewDTO is the GET clarification body (spec §7.5). Session is
+// null before the first session is started.
+type clarificationOverviewDTO struct {
+	Session   *clarificationSessionDTO       `json:"session"`
+	Questions clarificationQuestionCountsDTO `json:"questions"`
+	Decisions clarificationDecisionCountsDTO `json:"decisions"`
+}
+
+// newClarificationOverviewDTO maps the active session (nil when none) and the
+// per-status counters to the overview shape.
+func newClarificationOverviewDTO(session *versionapp.ClarificationSession, counts versionapp.ClarificationCounts) clarificationOverviewDTO {
+	dto := clarificationOverviewDTO{
+		Questions: clarificationQuestionCountsDTO{
+			Open:      counts.OpenQuestions,
+			Answered:  counts.AnsweredQuestions,
+			Dismissed: counts.DismissedQuestions,
+		},
+		Decisions: clarificationDecisionCountsDTO{
+			Proposed: counts.ProposedDecisions,
+			Accepted: counts.AcceptedDecisions,
+			Rejected: counts.RejectedDecisions,
+		},
+	}
+	if session != nil {
+		item := newClarificationSessionDTO(session)
+		dto.Session = &item
+	}
+	return dto
+}
+
+// clarificationMessagePartDTO is one persisted P1 message part. Image parts keep
+// only their type: the stored image reference is not exposed by the chat read
+// model (the data URL never leaves the DB/LLM boundary).
+type clarificationMessagePartDTO struct {
+	Type string `json:"type"`
+	Text string `json:"text,omitempty"`
+}
+
+// clarificationMessageDTO is the P1 message projection of spec §7.5. The P1
+// message, run and agent session ids stay numbers; system messages are filtered
+// out before this mapping.
+type clarificationMessageDTO struct {
+	ID        int64                         `json:"id"`
+	Role      string                        `json:"role"`
+	Parts     []clarificationMessagePartDTO `json:"parts"`
+	Reasoning string                        `json:"reasoning,omitempty"`
+	ToolCalls json.RawMessage               `json:"toolCalls,omitempty"`
+	ToolName  string                        `json:"toolName,omitempty"`
+	RunID     int64                         `json:"runId"`
+	CreatedAt time.Time                     `json:"createdAt"`
+}
+
+// newClarificationMessageDTO maps one projected P1 message.
+func newClarificationMessageDTO(message *versionapp.AgentMessage) clarificationMessageDTO {
+	parts := make([]clarificationMessagePartDTO, 0, len(message.Parts))
+	for _, part := range message.Parts {
+		parts = append(parts, clarificationMessagePartDTO{Type: part.Type, Text: part.Text})
+	}
+	return clarificationMessageDTO{
+		ID:        message.ID,
+		Role:      message.Role,
+		Parts:     parts,
+		Reasoning: message.Reasoning,
+		ToolCalls: message.ToolCalls,
+		ToolName:  message.ToolName,
+		RunID:     message.RunID,
+		CreatedAt: message.CreatedAt,
+	}
+}
+
+// newClarificationMessageDTOs maps a message slice to a non-nil DTO slice.
+func newClarificationMessageDTOs(messages []versionapp.AgentMessage) []clarificationMessageDTO {
+	items := make([]clarificationMessageDTO, 0, len(messages))
+	for i := range messages {
+		items = append(items, newClarificationMessageDTO(&messages[i]))
+	}
+	return items
+}
+
+// sendClarificationMessageResultDTO is the 202 body of the send-message action
+// (spec §7.5): the P3 session id is a decimal string, the P1 ids are numbers.
+type sendClarificationMessageResultDTO struct {
+	SessionID      int64  `json:"sessionId,string"`
+	AgentSessionID int64  `json:"agentSessionId"`
+	RunID          int64  `json:"runId"`
+	Status         string `json:"status"`
+}
+
+// newSendClarificationMessageResultDTO maps the started run result. The status
+// is always "running" for a freshly started run (spec §7.5).
+func newSendClarificationMessageResultDTO(result versionapp.StartRunResult) sendClarificationMessageResultDTO {
+	status := result.Status
+	if status == "" {
+		status = "running"
+	}
+	return sendClarificationMessageResultDTO{
+		SessionID:      result.SessionID,
+		AgentSessionID: result.AgentSessionID,
+		RunID:          result.RunID,
+		Status:         status,
+	}
+}
+
+// clarificationRunResultDTO is the 202 body of the one-shot analyze/recon runs
+// (spec §7.5): only the P1 agent session and run ids, both numbers.
+type clarificationRunResultDTO struct {
+	AgentSessionID int64 `json:"agentSessionId"`
+	RunID          int64 `json:"runId"`
+}
+
+// newClarificationRunResultDTO maps the started one-shot run result.
+func newClarificationRunResultDTO(result versionapp.StartRunResult) clarificationRunResultDTO {
+	return clarificationRunResultDTO{AgentSessionID: result.AgentSessionID, RunID: result.RunID}
+}
+
+// questionDTO is the QuestionDTO of spec §7.6. Every P3-owned id is a decimal
+// string; user ids stay numbers.
+type questionDTO struct {
+	ID            int64      `json:"id,string"`
+	VersionID     int64      `json:"versionId,string"`
+	RequirementID *int64     `json:"requirementId,string"`
+	SessionID     *int64     `json:"sessionId,string"`
+	Question      string     `json:"question"`
+	Status        string     `json:"status"`
+	Answer        string     `json:"answer"`
+	Source        string     `json:"source"`
+	AnsweredVia   string     `json:"answeredVia"`
+	AnsweredBy    *int64     `json:"answeredBy"`
+	AnsweredAt    *time.Time `json:"answeredAt"`
+	CreatedBy     int64      `json:"createdBy"`
+	CreatedAt     time.Time  `json:"createdAt"`
+	UpdatedAt     time.Time  `json:"updatedAt"`
+}
+
+// newQuestionDTO maps one question aggregate to the API shape.
+func newQuestionDTO(question *versionapp.Question) questionDTO {
+	return questionDTO{
+		ID:            question.ID,
+		VersionID:     question.VersionID,
+		RequirementID: question.RequirementID,
+		SessionID:     question.SessionID,
+		Question:      question.Question,
+		Status:        question.Status,
+		Answer:        question.Answer,
+		Source:        question.Source,
+		AnsweredVia:   question.AnsweredVia,
+		AnsweredBy:    question.AnsweredBy,
+		AnsweredAt:    question.AnsweredAt,
+		CreatedBy:     question.CreatedBy,
+		CreatedAt:     question.CreatedAt,
+		UpdatedAt:     question.UpdatedAt,
+	}
+}
+
+// newQuestionDTOs maps a question slice to a non-nil DTO slice.
+func newQuestionDTOs(questions []versionapp.Question) []questionDTO {
+	items := make([]questionDTO, 0, len(questions))
+	for i := range questions {
+		items = append(items, newQuestionDTO(&questions[i]))
+	}
+	return items
+}
+
+// decisionDTO is the DecisionDTO of spec §7.6. Every P3-owned id is a decimal
+// string; user ids stay numbers.
+type decisionDTO struct {
+	ID            int64      `json:"id,string"`
+	VersionID     int64      `json:"versionId,string"`
+	RequirementID *int64     `json:"requirementId,string"`
+	QuestionID    *int64     `json:"questionId,string"`
+	Topic         string     `json:"topic"`
+	Decision      string     `json:"decision"`
+	Rationale     string     `json:"rationale"`
+	Status        string     `json:"status"`
+	Source        string     `json:"source"`
+	ProposedBy    int64      `json:"proposedBy"`
+	DecidedBy     *int64     `json:"decidedBy"`
+	DecidedAt     *time.Time `json:"decidedAt"`
+	CreatedAt     time.Time  `json:"createdAt"`
+	UpdatedAt     time.Time  `json:"updatedAt"`
+}
+
+// newDecisionDTO maps one decision aggregate to the API shape.
+func newDecisionDTO(decision *versionapp.Decision) decisionDTO {
+	return decisionDTO{
+		ID:            decision.ID,
+		VersionID:     decision.VersionID,
+		RequirementID: decision.RequirementID,
+		QuestionID:    decision.QuestionID,
+		Topic:         decision.Topic,
+		Decision:      decision.Decision,
+		Rationale:     decision.Rationale,
+		Status:        decision.Status,
+		Source:        decision.Source,
+		ProposedBy:    decision.ProposedBy,
+		DecidedBy:     decision.DecidedBy,
+		DecidedAt:     decision.DecidedAt,
+		CreatedAt:     decision.CreatedAt,
+		UpdatedAt:     decision.UpdatedAt,
+	}
+}
+
+// newDecisionDTOs maps a decision slice to a non-nil DTO slice.
+func newDecisionDTOs(decisions []versionapp.Decision) []decisionDTO {
+	items := make([]decisionDTO, 0, len(decisions))
+	for i := range decisions {
+		items = append(items, newDecisionDTO(&decisions[i]))
+	}
+	return items
+}
+
+// versionEventRefsDTO is the frozen V1 refs block; absent arrays are [].
+type versionEventRefsDTO struct {
+	Evidence    []string `json:"evidence"`
+	Case        []string `json:"case"`
+	Requirement []string `json:"requirement"`
+	Code        []string `json:"code"`
+}
+
+// versionEventDTO is the frozen V1 event envelope used by the version events
+// snapshot and the version SSE stream (spec §7.7). It mirrors
+// eventing/interfaces/httpapi's eventPayload field for field.
+type versionEventDTO struct {
+	Seq       int64               `json:"seq"`
+	Channel   string              `json:"channel"`
+	Type      string              `json:"type"`
+	VersionID *string             `json:"version_id"`
+	BatchID   *string             `json:"batch_id"`
+	CaseID    *string             `json:"case_id"`
+	StepID    *string             `json:"step_id"`
+	AgentRole *string             `json:"agent_role"`
+	SessionID *string             `json:"session_id"`
+	TS        time.Time           `json:"ts"`
+	Summary   string              `json:"summary"`
+	Detail    json.RawMessage     `json:"detail"`
+	Refs      versionEventRefsDTO `json:"refs"`
+}
+
+// newVersionEventDTO maps one persisted event to the V1 envelope. The detail
+// falls back to {} when a row carries invalid or empty JSON, and the four refs
+// arrays are always present.
+func newVersionEventDTO(event *eventing.Event) versionEventDTO {
+	detail := event.Detail
+	if len(strings.TrimSpace(string(detail))) == 0 || !json.Valid(detail) {
+		detail = json.RawMessage(`{}`)
+	}
+	return versionEventDTO{
+		Seq:       event.Seq,
+		Channel:   event.Channel,
+		Type:      event.Type,
+		VersionID: event.VersionID,
+		BatchID:   event.BatchID,
+		CaseID:    event.CaseID,
+		StepID:    event.StepID,
+		AgentRole: event.AgentRole,
+		SessionID: event.SessionID,
+		TS:        event.TS.UTC(),
+		Summary:   event.Summary,
+		Detail:    detail,
+		Refs: versionEventRefsDTO{
+			Evidence:    nonNilStrings(event.Refs.Evidence),
+			Case:        nonNilStrings(event.Refs.Case),
+			Requirement: nonNilStrings(event.Refs.Requirement),
+			Code:        nonNilStrings(event.Refs.Code),
+		},
+	}
+}
+
+// newVersionEventDTOs maps an event slice to a non-nil DTO slice.
+func newVersionEventDTOs(events []eventing.Event) []versionEventDTO {
+	items := make([]versionEventDTO, 0, len(events))
+	for i := range events {
+		items = append(items, newVersionEventDTO(&events[i]))
+	}
+	return items
+}
+
+// nonNilStrings keeps the frozen V1 refs envelope: a missing array is [].
+func nonNilStrings(values []string) []string {
+	if values == nil {
+		return []string{}
+	}
+	return values
+}
+
+// versionEventSnapshotEnvelope is the flat P3 events snapshot of spec §7.7,
+// unlike the nested P0 snapshot: {data:[...], snapshot_cursor, has_more}.
+type versionEventSnapshotEnvelope struct {
+	Data           []versionEventDTO `json:"data"`
+	SnapshotCursor int64             `json:"snapshot_cursor"`
+	HasMore        bool              `json:"has_more"`
+}
+
+// sendClarificationMessageRequest is the POST clarification/messages body: the
+// text is 1-5000 characters (the service enforces both bounds).
+type sendClarificationMessageRequest struct {
+	Message string `json:"message"`
+}
+
+// createQuestionRequest is the POST clarification/questions body. requirementId
+// is an optional P3 decimal string; omitting it creates a version-level
+// question.
+type createQuestionRequest struct {
+	Question      string `json:"question"`
+	RequirementID *int64 `json:"requirementId,string"`
+}
+
+// updateQuestionRequest is the PATCH clarification/questions/{qid} body. Every
+// field is optional; a status transition picks the service action.
+type updateQuestionRequest struct {
+	Status   *string `json:"status"`
+	Question *string `json:"question"`
+	Answer   *string `json:"answer"`
+}
+
+// createDecisionRequest is the POST decisions body. requirementId/questionId are
+// optional P3 decimal strings. A human decision is stored as accepted.
+type createDecisionRequest struct {
+	RequirementID *int64 `json:"requirementId,string"`
+	QuestionID    *int64 `json:"questionId,string"`
+	Topic         string `json:"topic"`
+	Decision      string `json:"decision"`
+	Rationale     string `json:"rationale"`
+}
+
+// updateDecisionRequest is the PATCH decisions/{did} body: status must be
+// accepted or rejected and the optional rationale reuses the proposal field.
+type updateDecisionRequest struct {
+	Status    string  `json:"status"`
+	Rationale *string `json:"rationale"`
 }
