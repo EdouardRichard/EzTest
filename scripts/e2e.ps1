@@ -6,9 +6,10 @@
 .DESCRIPTION
     Initialises/resets the eztest_e2e database from EZTEST_DATABASE_URL, builds and
     starts the API on :13333 with EZTEST_HTTP_ADDR=:13333, starts the Next.js web app
-    on :6868, runs the Playwright suite with the installed Chrome/Edge channel, and
-    stops both processes on exit. Secrets are read from the gitignored .env and are
-    never printed.
+    on :6868, starts the deterministic fixture target on :13335 (design spec §9.2),
+    runs the Playwright suite with the installed Chrome/Edge channel, and stops all
+    processes on exit. Secrets are read from the gitignored .env and are never
+    printed.
 
 .NOTES
     Compatible with Windows PowerShell 5.1 and PowerShell 7+.
@@ -26,9 +27,11 @@ $e2eDbName = "eztest_e2e"
 $apiPort = 13333
 $webPort = 6868
 $fakeLlmPort = 13334
+$fixturePort = 13335
 $apiBaseUrl = "http://localhost:$apiPort"
 $webBaseUrl = "http://localhost:$webPort"
 $fakeLlmBaseUrl = "http://127.0.0.1:$fakeLlmPort"
+$fixtureBaseUrl = "http://127.0.0.1:$fixturePort"
 
 New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
 
@@ -177,6 +180,7 @@ $exitCode = 0
 $apiProcess = $null
 $webProcess = $null
 $fakeProcess = $null
+$fixtureProcess = $null
 $apiOut = Join-Path $tmpDir "e2e-api.out.log"
 $apiErr = Join-Path $tmpDir "e2e-api.err.log"
 $webOut = Join-Path $tmpDir "e2e-web.out.log"
@@ -184,12 +188,15 @@ $webErr = Join-Path $tmpDir "e2e-web.err.log"
 $fakeOut = Join-Path $tmpDir "e2e-fake-llm.out.log"
 $fakeErr = Join-Path $tmpDir "e2e-fake-llm.err.log"
 $fakeRequestLog = Join-Path $tmpDir "fake-llm-requests.jsonl"
+$fixtureLog = Join-Path $tmpDir "fixture-target.log"
+$fixtureErr = Join-Path $tmpDir "fixture-target.err.log"
 $playwrightLog = Join-Path $tmpDir "e2e-playwright.log"
 
 try {
     Assert-PortFree -Port $apiPort
     Assert-PortFree -Port $webPort
     Assert-PortFree -Port $fakeLlmPort
+    Assert-PortFree -Port $fixturePort
 
     if (-not (Test-Path -LiteralPath (Join-Path $frontendDir "node_modules\next\dist\bin\next"))) {
         throw "frontend/node_modules is missing; run pnpm install in frontend first"
@@ -354,6 +361,19 @@ try {
     Wait-ForHttp -Url "$webBaseUrl/login" -TimeoutSeconds 180 -Process $webProcess -Label "Web"
     Write-Host "Web is ready at $webBaseUrl"
 
+    Write-Step "Starting fixture target on :$fixturePort"
+    $env:FIXTURE_PORT = "$fixturePort"
+    Remove-Item -LiteralPath $fixtureLog, $fixtureErr -ErrorAction SilentlyContinue
+    $fixtureProcess = Start-Process -FilePath $nodeExe `
+        -ArgumentList "`"scripts/fixture-target.cjs`"" `
+        -WorkingDirectory $repoRoot `
+        -RedirectStandardOutput $fixtureLog `
+        -RedirectStandardError $fixtureErr `
+        -WindowStyle Hidden `
+        -PassThru
+    Wait-ForHttp -Url "$fixtureBaseUrl/health" -TimeoutSeconds 10 -Process $fixtureProcess -Label "Fixture target"
+    Write-Host "Fixture target is ready at $fixtureBaseUrl"
+
     Write-Step "Running Playwright (channel: $channel, database: $e2eDbName)"
     $env:EZTEST_E2E_ADMIN_USERNAME = $adminUsername
     $env:EZTEST_E2E_ADMIN_PASSWORD = $adminPassword
@@ -397,14 +417,17 @@ try {
     Write-LogTail -Path $fakeErr -Label "Fake LLM stderr" -Lines 40
     Write-LogTail -Path $webOut -Label "Web stdout" -Lines 80
     Write-LogTail -Path $webErr -Label "Web stderr" -Lines 80
+    Write-LogTail -Path $fixtureLog -Label "Fixture target stdout" -Lines 40
+    Write-LogTail -Path $fixtureErr -Label "Fixture target stderr" -Lines 40
     Write-LogTail -Path $playwrightLog -Label "Playwright" -Lines 120
 } finally {
     Write-Step "Cleaning up"
     Stop-ProcessTree -Process $webProcess
     Stop-ProcessTree -Process $apiProcess
     Stop-ProcessTree -Process $fakeProcess
+    Stop-ProcessTree -Process $fixtureProcess
     Start-Sleep -Milliseconds 500
-    foreach ($port in @($webPort, $apiPort, $fakeLlmPort)) {
+    foreach ($port in @($webPort, $apiPort, $fakeLlmPort, $fixturePort)) {
         $listeners = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue
         if ($listeners) {
             Write-Host "WARNING: port $port still has a listener after cleanup" -ForegroundColor Yellow
