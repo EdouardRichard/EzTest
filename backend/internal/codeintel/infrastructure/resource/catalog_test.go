@@ -11,11 +11,15 @@ import (
 	resourcedomain "github.com/EdouardRichard/EzTest/backend/internal/resource/domain"
 )
 
-// fakeCodeRepoReader is an in-memory P2 code repository reader.
+// fakeCodeRepoReader is an in-memory P2 code repository reader implementing the
+// Get/List slice the adapter uses.
 type fakeCodeRepoReader struct {
-	repo  resourcedomain.CodeRepository
-	err   error
-	calls []int64
+	repo      resourcedomain.CodeRepository
+	err       error
+	calls     []int64
+	listRepos []resourcedomain.CodeRepository
+	listErr   error
+	filters   []resourcedomain.CodeRepoFilter
 }
 
 // Get returns the configured repository or failure.
@@ -26,6 +30,34 @@ func (f *fakeCodeRepoReader) Get(_ context.Context, id int64) (*resourcedomain.C
 	}
 	repo := f.repo
 	return &repo, nil
+}
+
+// List mimics the P2 repository: a cursor page ordered by ID ascending with an
+// exclusive AfterID and a has-more flag.
+func (f *fakeCodeRepoReader) List(_ context.Context, filter resourcedomain.CodeRepoFilter) ([]resourcedomain.CodeRepository, bool, error) {
+	f.filters = append(f.filters, filter)
+	if f.listErr != nil {
+		return nil, false, f.listErr
+	}
+	matches := make([]resourcedomain.CodeRepository, 0, len(f.listRepos))
+	for _, repo := range f.listRepos {
+		if repo.ID <= filter.Page.AfterID {
+			continue
+		}
+		if filter.Status != "" && repo.Status != filter.Status {
+			continue
+		}
+		matches = append(matches, repo)
+	}
+	limit := filter.Page.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	more := len(matches) > limit
+	if more {
+		matches = matches[:limit]
+	}
+	return matches, more, nil
 }
 
 // fakeAppModelReader is an in-memory P2 app model lister honouring the
@@ -127,6 +159,111 @@ func TestCatalogMapsRepoInfo(t *testing.T) {
 	}
 	if !info.LastIndexedAt.Equal(wantIndexedAt) {
 		t.Fatalf("lastIndexedAt=%v want the cloned %v", info.LastIndexedAt, wantIndexedAt)
+	}
+}
+
+// TestCatalogListsCodeRepos pins the RepoCatalog.List projection: every
+// repository is projected with the same fields and cloning rules as Get, the P2
+// cursor page is drained in ID order and operational failures propagate.
+func TestCatalogListsCodeRepos(t *testing.T) {
+	indexedAt := time.Date(2026, 10, 27, 10, 0, 0, 0, time.UTC)
+	first := resourcedomain.CodeRepository{
+		ID:            7,
+		Key:           "web",
+		Name:          "Web",
+		LocalPath:     "/srv/web",
+		FixedBranch:   "main",
+		IncludeGlobs:  []string{"src/**"},
+		ExcludeGlobs:  []string{"dist/**"},
+		Status:        resourcedomain.StatusActive,
+		LastIndexedAt: &indexedAt,
+	}
+	second := resourcedomain.CodeRepository{
+		ID:           8,
+		Key:          "api",
+		Name:         "API",
+		LocalPath:    "/srv/api",
+		FixedBranch:  "develop",
+		IncludeGlobs: []string{"internal/**"},
+		ExcludeGlobs: []string{"vendor/**"},
+		Status:       resourcedomain.StatusDisabled,
+	}
+	reader := &fakeCodeRepoReader{listRepos: []resourcedomain.CodeRepository{first, second}}
+	catalog := codeintelresource.NewCatalog(reader)
+
+	infos, err := catalog.List(context.Background())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(infos) != 2 {
+		t.Fatalf("infos=%+v want 2", infos)
+	}
+	if infos[0].ID != 7 || infos[0].Key != "web" || infos[0].Name != "Web" ||
+		infos[0].LocalPath != "/srv/web" || infos[0].FixedBranch != "main" ||
+		infos[0].Status != resourcedomain.StatusActive {
+		t.Fatalf("first info=%+v", infos[0])
+	}
+	if len(infos[0].IncludeGlobs) != 1 || infos[0].IncludeGlobs[0] != "src/**" ||
+		len(infos[0].ExcludeGlobs) != 1 || infos[0].ExcludeGlobs[0] != "dist/**" {
+		t.Fatalf("first globs=%v/%v", infos[0].IncludeGlobs, infos[0].ExcludeGlobs)
+	}
+	if infos[0].LastIndexedAt == nil || !infos[0].LastIndexedAt.Equal(indexedAt) {
+		t.Fatalf("first lastIndexedAt=%v want %v", infos[0].LastIndexedAt, indexedAt)
+	}
+	if infos[1].ID != 8 || infos[1].Status != resourcedomain.StatusDisabled {
+		t.Fatalf("second info=%+v", infos[1])
+	}
+	if infos[1].LastIndexedAt != nil {
+		t.Fatalf("second lastIndexedAt=%v want nil", infos[1].LastIndexedAt)
+	}
+	if len(reader.filters) != 1 || reader.filters[0].Page.AfterID != 0 || reader.filters[0].Page.Limit != 100 {
+		t.Fatalf("list filters=%+v want one first page of 100", reader.filters)
+	}
+
+	// The projection owns its slices and timestamps (same clone rule as Get).
+	wantIndexedAt := indexedAt
+	reader.listRepos[0].IncludeGlobs[0] = "mutated"
+	*reader.listRepos[0].LastIndexedAt = indexedAt.Add(24 * time.Hour)
+	if infos[0].IncludeGlobs[0] != "src/**" {
+		t.Fatalf("includeGlobs aliases stored state: %v", infos[0].IncludeGlobs)
+	}
+	if !infos[0].LastIndexedAt.Equal(wantIndexedAt) {
+		t.Fatalf("lastIndexedAt=%v want the cloned %v", infos[0].LastIndexedAt, wantIndexedAt)
+	}
+
+	reader.listErr = errors.New("resource database down")
+	if _, err := catalog.List(context.Background()); err == nil {
+		t.Fatal("List error=nil want the P2 list failure")
+	}
+
+	// A catalog wired without a code repository reader is a configuration error.
+	if _, err := codeintelresource.NewCatalog(nil).List(context.Background()); err == nil {
+		t.Fatal("List without a code repository reader=nil want a configuration error")
+	}
+}
+
+// TestCatalogListDrainsCodeRepoPages proves List follows the P2 cursor page
+// instead of silently truncating at the first 100 repositories.
+func TestCatalogListDrainsCodeRepoPages(t *testing.T) {
+	repos := make([]resourcedomain.CodeRepository, 0, 101)
+	for i := 1; i <= 101; i++ {
+		repos = append(repos, resourcedomain.CodeRepository{ID: int64(i), Key: "repo", Name: "Repo", Status: resourcedomain.StatusActive})
+	}
+	reader := &fakeCodeRepoReader{listRepos: repos}
+	catalog := codeintelresource.NewCatalog(reader)
+
+	infos, err := catalog.List(context.Background())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(infos) != 101 {
+		t.Fatalf("infos=%d want 101", len(infos))
+	}
+	if len(reader.filters) != 2 {
+		t.Fatalf("page requests=%d want 2", len(reader.filters))
+	}
+	if reader.filters[1].Page.AfterID != 100 {
+		t.Fatalf("second page afterID=%d want 100", reader.filters[1].Page.AfterID)
 	}
 }
 

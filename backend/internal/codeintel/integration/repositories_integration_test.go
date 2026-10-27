@@ -116,6 +116,68 @@ func TestChangeSetGetOrCreate(t *testing.T) {
 	}
 }
 
+// TestChangeSetFindByCommits pins the review-round R25 lookup: the change set of
+// a deterministic (repo, base, head) trio is readable for the read-only preview,
+// while an absent trio is a change_set_not_found the caller can leave as null.
+func TestChangeSetFindByCommits(t *testing.T) {
+	ctx := context.Background()
+	pool := testutil.OpenTestDB(t)
+	repoID, _, _ := seedRepoVersionRequirement(t, pool)
+	repo := postgres.NewChangeSetRepository(pool)
+
+	if _, err := repo.FindByCommits(ctx, repoID, seedBaseCommit, seedHeadCommit); !errors.Is(err, domain.ErrNotFound) || domain.Reason(err) != "change_set_not_found" {
+		t.Fatalf("FindByCommits empty error = %v (reason %q), want change_set_not_found", err, domain.Reason(err))
+	}
+
+	want := domain.CodeChangeSet{
+		ID:         7051,
+		RepoID:     repoID,
+		BaseCommit: seedBaseCommit,
+		HeadCommit: seedHeadCommit,
+		Stats:      []byte(`{"files":2,"additions":5,"deletions":1,"truncated":true}`),
+		Files: []domain.ChangedFile{
+			{Path: "src/api/refund.ts", Status: "M", Additions: 3, Deletions: 1, HeadBlobHash: ciBlobHashA},
+			{Path: "src/api/order.ts", Status: "R100", OldPath: ciPtr("src/api/old-order.ts"), Binary: true},
+		},
+		Truncated: true,
+	}
+	if _, _, err := repo.GetOrCreate(ctx, want); err != nil {
+		t.Fatalf("GetOrCreate: %v", err)
+	}
+
+	found, err := repo.FindByCommits(ctx, repoID, seedBaseCommit, seedHeadCommit)
+	if err != nil {
+		t.Fatalf("FindByCommits: %v", err)
+	}
+	if found.ID != want.ID || found.RepoID != repoID || found.BaseCommit != seedBaseCommit || found.HeadCommit != seedHeadCommit {
+		t.Fatalf("found identity = %+v, want %+v", found, want)
+	}
+	if found.CreatedAt.IsZero() {
+		t.Fatal("found created_at is zero")
+	}
+	if !reflect.DeepEqual(found.Files, want.Files) {
+		t.Fatalf("found files = %+v, want %+v", found.Files, want.Files)
+	}
+	ciAssertJSONEqual(t, found.Stats, string(want.Stats))
+	if found.Truncated != want.Truncated {
+		t.Fatalf("found truncated = %v, want %v", found.Truncated, want.Truncated)
+	}
+
+	// Any part of the trio changing is a miss.
+	otherHead := "dddddddddddddddddddddddddddddddddddddddd"
+	if _, err := repo.FindByCommits(ctx, repoID, seedBaseCommit, otherHead); !errors.Is(err, domain.ErrNotFound) || domain.Reason(err) != "change_set_not_found" {
+		t.Fatalf("FindByCommits other head error = %v (reason %q), want change_set_not_found", err, domain.Reason(err))
+	}
+	if _, err := repo.FindByCommits(ctx, repoID+1, seedBaseCommit, seedHeadCommit); !errors.Is(err, domain.ErrNotFound) || domain.Reason(err) != "change_set_not_found" {
+		t.Fatalf("FindByCommits other repo error = %v (reason %q), want change_set_not_found", err, domain.Reason(err))
+	}
+	if _, err := repo.FindByCommits(ctx, repoID, otherHead, seedHeadCommit); !errors.Is(err, domain.ErrNotFound) || domain.Reason(err) != "change_set_not_found" {
+		t.Fatalf("FindByCommits other base error = %v (reason %q), want change_set_not_found", err, domain.Reason(err))
+	}
+}
+
+// history split of code_entities/code_fact_versions and the fact-body read of
+// GetVersion.
 // TestEntityUpsertAndFactVersion covers the T0 file upsert, the current-versus-
 // history split of code_entities/code_fact_versions and the fact-body read of
 // GetVersion.

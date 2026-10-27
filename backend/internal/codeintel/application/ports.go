@@ -60,9 +60,11 @@ type RepoInfo struct {
 }
 
 // RepoCatalog reads P2 code repositories through the resource application
-// layer.
+// layer. Get returns one projection; List drains the P2 cursor pages so the
+// repository list endpoint can serve every configured repository.
 type RepoCatalog interface {
 	Get(ctx context.Context, repoID int64) (RepoInfo, error)
+	List(ctx context.Context) ([]RepoInfo, error)
 }
 
 // IndexStateWriter records the last successful index state without touching any

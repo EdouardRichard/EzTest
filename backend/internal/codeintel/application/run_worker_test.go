@@ -129,8 +129,9 @@ func TestWorkerQueueFull(t *testing.T) {
 	}
 }
 
-// TestWorkerRecovery pins the startup recovery hook: it is called exactly once
-// with a threshold ten minutes before Now.
+// TestWorkerRecovery pins the startup recovery hook (R26): it is called exactly
+// once with the current time, so every queued/running run left behind by the
+// previous (dead) process becomes failed(interrupted) regardless of age.
 func TestWorkerRecovery(t *testing.T) {
 	rec := &stubRecoverer{called: make(chan time.Time, 1)}
 	w := NewWorker(WorkerConfig{QueueSize: 2, Concurrency: 1, Timeout: time.Second, Logger: workerTestLogger()})
@@ -144,12 +145,13 @@ func TestWorkerRecovery(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for RecoverStale")
 	}
+	afterStart := time.Now()
 	w.Stop(context.Background())
 
-	wantLow := beforeStart.Add(-10*time.Minute - 2*time.Second)
-	wantHigh := time.Now().Add(-10*time.Minute + 2*time.Second)
-	if got.Before(wantLow) || got.After(wantHigh) {
-		t.Fatalf("RecoverStale before = %v, want about Now-10m", got)
+	// The cutoff is "now", not now-10m: a run queued 30s before the crash must
+	// not survive startup and keep the repository in index_in_progress forever.
+	if got.Before(beforeStart.Add(-time.Second)) || got.After(afterStart.Add(time.Second)) {
+		t.Fatalf("RecoverStale before = %v, want about Now (%v..%v)", got, beforeStart, afterStart)
 	}
 	if count := rec.callCount(); count != 1 {
 		t.Fatalf("RecoverStale calls = %d, want 1", count)

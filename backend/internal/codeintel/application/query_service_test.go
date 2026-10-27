@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
 )
@@ -16,10 +17,24 @@ type queryFixture struct {
 	git        *stubGit
 	repos      *stubRepos
 	entities   *stubEntities
-	changeSets *stubChangeSets
+	changeSets *queryChangeSets
 	versions   *stubVersions
 	audit      *stubAudit
 	svc        *QueryService
+}
+
+// queryRepoInfo is the active repository projection the query fixture serves.
+func queryRepoInfo() RepoInfo {
+	return RepoInfo{
+		ID:           3,
+		Key:          "web",
+		Name:         "Web",
+		LocalPath:    "/repo",
+		FixedBranch:  "main",
+		IncludeGlobs: []string{"src/**"},
+		ExcludeGlobs: []string{"vendor/**"},
+		Status:       "active",
+	}
 }
 
 func newQueryFixture() *queryFixture {
@@ -28,25 +43,16 @@ func newQueryFixture() *queryFixture {
 
 func newQueryFixtureWithConfig(cfg QueryConfig) *queryFixture {
 	f := &queryFixture{
-		git:        &stubGit{head: testCommitC},
+		// ancestor=true keeps the explicit-head /changes cases valid; the head
+		// validation tests below override it to prove the rejection paths.
+		git:        &stubGit{head: testCommitC, ancestor: true},
 		repos:      &stubRepos{},
 		entities:   &stubEntities{},
-		changeSets: &stubChangeSets{},
+		changeSets: &queryChangeSets{},
 		versions:   &stubVersions{},
 		audit:      &stubAudit{},
 	}
-	f.repos.infos = map[int64]RepoInfo{
-		3: {
-			ID:           3,
-			Key:          "web",
-			Name:         "Web",
-			LocalPath:    "/repo",
-			FixedBranch:  "main",
-			IncludeGlobs: []string{"src/**"},
-			ExcludeGlobs: []string{"vendor/**"},
-			Status:       "active",
-		},
-	}
+	f.repos.infos = map[int64]RepoInfo{3: queryRepoInfo()}
 	f.svc = NewQueryService(QueryServiceDeps{
 		Git:        f.git,
 		Repos:      f.repos,
@@ -57,6 +63,121 @@ func newQueryFixtureWithConfig(cfg QueryConfig) *queryFixture {
 		Config:     cfg,
 	})
 	return f
+}
+
+// queryChangeSets is the QueryService change-set double: the write side the
+// preview never uses plus the review-round FindByCommits lookup.
+type queryChangeSets struct {
+	getOrCreateCalls []domain.CodeChangeSet
+	findCalls        []queryFindCommitsCall
+	stored           *domain.CodeChangeSet
+	findErr          error
+}
+
+// queryFindCommitsCall records one FindByCommits lookup.
+type queryFindCommitsCall struct {
+	repoID int64
+	base   string
+	head   string
+}
+
+func (c *queryChangeSets) GetOrCreate(_ context.Context, cs domain.CodeChangeSet) (domain.CodeChangeSet, bool, error) {
+	c.getOrCreateCalls = append(c.getOrCreateCalls, cs)
+	return cs, true, nil
+}
+
+func (c *queryChangeSets) GetByID(context.Context, int64) (domain.CodeChangeSet, error) {
+	return domain.CodeChangeSet{}, domain.ErrNotFound
+}
+
+func (c *queryChangeSets) FindByCommits(_ context.Context, repoID int64, base, head string) (domain.CodeChangeSet, error) {
+	c.findCalls = append(c.findCalls, queryFindCommitsCall{repoID: repoID, base: base, head: head})
+	if c.findErr != nil {
+		return domain.CodeChangeSet{}, c.findErr
+	}
+	if c.stored == nil {
+		return domain.CodeChangeSet{}, domain.NewNotFound("change_set_not_found", "codeintel: change set not found")
+	}
+	return *c.stored, nil
+}
+
+// The review round widens RepoCatalog (List) and domain.ChangeSetRepository
+// (FindByCommits). Those shared doubles live in index_service_test.go; the two
+// methods below keep them satisfying the widened ports without touching that
+// file (the fix-round write scope). The repository list itself is served by
+// resource.Catalog and covered by its own tests, and the index service never
+// looks up a change set by commits, so not-found is the honest default.
+func (r *stubRepos) List(context.Context) ([]RepoInfo, error) {
+	if r.err != nil {
+		return nil, r.err
+	}
+	infos := make([]RepoInfo, 0, len(r.infos))
+	for _, info := range r.infos {
+		infos = append(infos, info)
+	}
+	return infos, nil
+}
+
+func (c *stubChangeSets) FindByCommits(context.Context, int64, string, string) (domain.CodeChangeSet, error) {
+	return domain.CodeChangeSet{}, domain.NewNotFound("change_set_not_found", "codeintel: change set not found")
+}
+
+// gitAncestorCall and gitCommitCall record the Git port calls the query tests
+// inspect.
+type gitAncestorCall struct {
+	localPath string
+	base      string
+	head      string
+}
+
+type gitCommitCall struct {
+	localPath string
+	sha       string
+}
+
+// queryAncestorGit records IsAncestor calls and reports the embedded stub's
+// configurable verdict.
+type queryAncestorGit struct {
+	*stubGit
+	ancestorCalls []gitAncestorCall
+}
+
+func (g *queryAncestorGit) IsAncestor(_ context.Context, localPath, base, head string) (bool, error) {
+	g.ancestorCalls = append(g.ancestorCalls, gitAncestorCall{localPath: localPath, base: base, head: head})
+	return g.stubGit.ancestor, g.stubGit.ancestorErr
+}
+
+// queryCommitGit records Commit calls and reports the embedded stub's result.
+type queryCommitGit struct {
+	*stubGit
+	commitCalls []gitCommitCall
+}
+
+func (g *queryCommitGit) Commit(_ context.Context, localPath, sha string) (domain.CommitInfo, error) {
+	g.commitCalls = append(g.commitCalls, gitCommitCall{localPath: localPath, sha: sha})
+	return g.stubGit.commitInfo, g.stubGit.commitErr
+}
+
+// newVersionChangesService wires a QueryService over the given Git double and
+// the standard version binding (repo 3, baseline testCommitA). The change-set
+// dependency is the port itself so a test can pass an untyped nil.
+func newVersionChangesService(git GitReader, changeSets domain.ChangeSetRepository) (*QueryService, *stubVersions) {
+	versions := &stubVersions{info: VersionInfo{
+		ID:             9,
+		RepoID:         3,
+		HasRepo:        true,
+		BaselineCommit: testCommitA,
+		Branch:         "release",
+	}}
+	svc := NewQueryService(QueryServiceDeps{
+		Git:        git,
+		Repos:      &stubRepos{infos: map[int64]RepoInfo{3: queryRepoInfo()}},
+		Entities:   &stubEntities{},
+		ChangeSets: changeSets,
+		Versions:   versions,
+		Config:     QueryConfig{MaxDiffBytes: 4096},
+	})
+	return svc, versions
 }
 
 // TestQueryServiceTreeResolvesFixedBranchHeadAndForwardsFilters pins the tree
@@ -447,23 +568,16 @@ func TestQueryServiceVersionChangesUsesBaseline(t *testing.T) {
 		t.Fatal("VersionChanges preview must not persist a change set")
 	}
 
-	// No explicit head: resolve the version branch (falling back to the repo's
-	// fixed branch when the version carries none).
+	// No explicit head: resolve the repository's live fixed branch tip. The
+	// version binding branch is not used for the §7.3 change preview.
 	if _, _, head, err = f.svc.VersionChanges(context.Background(), 9, ""); err != nil {
 		t.Fatalf("VersionChanges(default head) error = %v", err)
 	}
 	if head != testCommitC {
 		t.Fatalf("head = %s, want %s", head, testCommitC)
 	}
-	if len(f.git.headCalls) != 1 || f.git.headCalls[0].branch != "release" {
-		t.Fatalf("Head calls = %+v, want version branch release", f.git.headCalls)
-	}
-	f.versions.info.Branch = ""
-	if _, _, _, err = f.svc.VersionChanges(context.Background(), 9, ""); err != nil {
-		t.Fatalf("VersionChanges(fallback branch) error = %v", err)
-	}
-	if last := f.git.headCalls[len(f.git.headCalls)-1]; last.branch != "main" {
-		t.Fatalf("fallback branch = %q, want repo fixed branch main", last.branch)
+	if len(f.git.headCalls) != 1 || f.git.headCalls[0].localPath != "/repo" || f.git.headCalls[0].branch != "main" {
+		t.Fatalf("Head calls = %+v, want the repository fixed branch main", f.git.headCalls)
 	}
 
 	f.versions.info.HasRepo = false
@@ -501,5 +615,246 @@ func TestQueryServiceVersionChangesPropagatesRepoAndDiffErrors(t *testing.T) {
 	delete(f.repos.infos, 3)
 	if _, _, _, err := f.svc.VersionChanges(context.Background(), 9, testCommitB); !errors.Is(err, domain.ErrInvalid) {
 		t.Fatalf("missing repo error = %v, want ErrInvalid", err)
+	}
+}
+
+// TestQueryServiceVersionChangesValidatesExplicitHead pins R25/§6.1: an explicit
+// head must be a lowercase 40-hex commit and a descendant of the baseline; a
+// malformed or unreachable head is the documented 422 invalid_head and never
+// reaches the diff.
+func TestQueryServiceVersionChangesValidatesExplicitHead(t *testing.T) {
+	longSHA := testCommitA + "a"
+	uppercaseSHA := "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	validHeadCases := []struct {
+		name   string
+		head   string
+		expect string
+	}{
+		{name: "explicit head", head: testCommitB, expect: testCommitB},
+		{name: "base equals head is legal", head: testCommitA, expect: testCommitA},
+		{name: "surrounding whitespace is trimmed", head: "  " + testCommitB + " ", expect: testCommitB},
+	}
+	for _, tc := range validHeadCases {
+		t.Run(tc.name, func(t *testing.T) {
+			git := &queryAncestorGit{stubGit: &stubGit{head: testCommitC, ancestor: true}}
+			svc, _ := newVersionChangesService(git, &queryChangeSets{})
+
+			_, base, head, err := svc.VersionChanges(context.Background(), 9, tc.head)
+			if err != nil {
+				t.Fatalf("VersionChanges error = %v", err)
+			}
+			if base != testCommitA || head != tc.expect {
+				t.Fatalf("base/head = %s/%s, want %s/%s", base, head, testCommitA, tc.expect)
+			}
+			if len(git.headCalls) != 0 {
+				t.Fatalf("Head calls = %d, want 0 for an explicit head", len(git.headCalls))
+			}
+			if len(git.ancestorCalls) != 1 {
+				t.Fatalf("IsAncestor calls = %d, want 1", len(git.ancestorCalls))
+			}
+			if call := git.ancestorCalls[0]; call.localPath != "/repo" || call.base != testCommitA || call.head != tc.expect {
+				t.Fatalf("IsAncestor args = %+v, want /repo %s %s", call, testCommitA, tc.expect)
+			}
+			if len(git.diffCalls) != 1 || git.diffCalls[0].base != testCommitA || git.diffCalls[0].head != tc.expect {
+				t.Fatalf("Diff calls = %+v, want base %s head %s", git.diffCalls, testCommitA, tc.expect)
+			}
+		})
+	}
+
+	malformedHeads := []struct {
+		name string
+		head string
+	}{
+		{name: "short", head: "abc123"},
+		{name: "39 hex", head: testCommitA[:39]},
+		{name: "41 hex", head: longSHA},
+		{name: "uppercase hex", head: uppercaseSHA},
+		{name: "non-hex", head: "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"},
+		{name: "ref name", head: "refs/heads/main"},
+	}
+	for _, tc := range malformedHeads {
+		t.Run(tc.name, func(t *testing.T) {
+			git := &queryAncestorGit{stubGit: &stubGit{head: testCommitC, ancestor: true}}
+			svc, _ := newVersionChangesService(git, &queryChangeSets{})
+
+			_, _, _, err := svc.VersionChanges(context.Background(), 9, tc.head)
+			if !errors.Is(err, domain.ErrInvalid) {
+				t.Fatalf("error = %v, want ErrInvalid", err)
+			}
+			if reason := domain.Reason(err); reason != "invalid_head" {
+				t.Fatalf("reason = %q, want invalid_head", reason)
+			}
+			if len(git.ancestorCalls) != 0 || len(git.diffCalls) != 0 {
+				t.Fatalf("malformed head must not reach Git: ancestor=%d diff=%d", len(git.ancestorCalls), len(git.diffCalls))
+			}
+		})
+	}
+
+	// A well-formed head that is not a descendant of the baseline is rejected.
+	git := &queryAncestorGit{stubGit: &stubGit{head: testCommitC, ancestor: false}}
+	svc, _ := newVersionChangesService(git, &queryChangeSets{})
+	_, _, _, err := svc.VersionChanges(context.Background(), 9, testCommitB)
+	if !errors.Is(err, domain.ErrInvalid) {
+		t.Fatalf("non-descendant head error = %v, want ErrInvalid", err)
+	}
+	if reason := domain.Reason(err); reason != "invalid_head" {
+		t.Fatalf("reason = %q, want invalid_head", reason)
+	}
+	if len(git.diffCalls) != 0 {
+		t.Fatal("non-descendant head must not reach the diff")
+	}
+
+	// An operational IsAncestor failure propagates unchanged.
+	git = &queryAncestorGit{stubGit: &stubGit{head: testCommitC, ancestor: true, ancestorErr: errors.New("git unavailable")}}
+	svc, _ = newVersionChangesService(git, &queryChangeSets{})
+	if _, _, _, err := svc.VersionChanges(context.Background(), 9, testCommitB); err == nil {
+		t.Fatal("IsAncestor failure error = nil, want the Git error")
+	}
+}
+
+// TestQueryServiceVersionChangesReusesStoredChangeSet pins R25/§7.3: the
+// read-only preview computes the diff live but attaches the id of an already
+// persisted deterministic change set; an absent row leaves changeSetId null.
+func TestQueryServiceVersionChangesReusesStoredChangeSet(t *testing.T) {
+	git := &queryAncestorGit{stubGit: &stubGit{
+		head:     testCommitC,
+		ancestor: true,
+		diffData: domain.ChangeSetData{
+			Stats: []byte(`{"files":1}`),
+			Files: []domain.ChangedFile{{Path: "src/a.ts", Status: "M"}},
+		},
+	}}
+	changeSets := &queryChangeSets{stored: &domain.CodeChangeSet{
+		ID:         4242,
+		RepoID:     3,
+		BaseCommit: testCommitA,
+		HeadCommit: testCommitB,
+	}}
+	svc, _ := newVersionChangesService(git, changeSets)
+
+	data, _, _, err := svc.VersionChanges(context.Background(), 9, testCommitB)
+	if err != nil {
+		t.Fatalf("VersionChanges error = %v", err)
+	}
+	if data.ChangeSetID == nil || *data.ChangeSetID != 4242 {
+		t.Fatalf("changeSetId = %v, want the stored id 4242", data.ChangeSetID)
+	}
+	if len(data.Files) != 1 || data.Files[0].Path != "src/a.ts" {
+		t.Fatalf("files = %+v, want the live diff page", data.Files)
+	}
+	if len(changeSets.findCalls) != 1 {
+		t.Fatalf("FindByCommits calls = %d, want 1", len(changeSets.findCalls))
+	}
+	if call := changeSets.findCalls[0]; call.repoID != 3 || call.base != testCommitA || call.head != testCommitB {
+		t.Fatalf("FindByCommits args = %+v, want repo 3 %s..%s", call, testCommitA, testCommitB)
+	}
+	if len(changeSets.getOrCreateCalls) != 0 {
+		t.Fatal("the read-only preview must never persist a change set")
+	}
+
+	// No stored change set: changeSetId stays null and the preview still works.
+	changeSets.findErr = domain.NewNotFound("change_set_not_found", "codeintel: change set not found")
+	data, _, _, err = svc.VersionChanges(context.Background(), 9, testCommitB)
+	if err != nil {
+		t.Fatalf("VersionChanges(no stored set) error = %v", err)
+	}
+	if data.ChangeSetID != nil {
+		t.Fatalf("changeSetId = %v, want nil for an unstored change set", *data.ChangeSetID)
+	}
+
+	// An operational lookup failure surfaces instead of silently dropping the id.
+	changeSets.findErr = errors.New("database unavailable")
+	if _, _, _, err := svc.VersionChanges(context.Background(), 9, testCommitB); err == nil {
+		t.Fatal("VersionChanges(lookup failure) error = nil, want the storage error")
+	}
+
+	// A QueryService wired without the change-set repository still previews.
+	svcWithoutChangeSets, _ := newVersionChangesService(git, nil)
+	data, _, _, err = svcWithoutChangeSets.VersionChanges(context.Background(), 9, testCommitB)
+	if err != nil {
+		t.Fatalf("VersionChanges(nil change sets) error = %v", err)
+	}
+	if data.ChangeSetID != nil {
+		t.Fatalf("changeSetId = %v, want nil without a change-set repository", *data.ChangeSetID)
+	}
+}
+
+// TestQueryServiceCommitValidatesAndDelegates pins the commit metadata read:
+// the sha must be a full lowercase 40-hex id, the repository must be active and
+// the Git adapter receives the repo path and the normalized sha.
+func TestQueryServiceCommitValidatesAndDelegates(t *testing.T) {
+	committedAt := time.Date(2026, 10, 27, 10, 0, 0, 0, time.UTC)
+	f := newQueryFixture()
+	git := &queryCommitGit{stubGit: &stubGit{commitInfo: domain.CommitInfo{
+		SHA:         testCommitA,
+		Message:     "feat: refunds",
+		Author:      "Dev",
+		CommittedAt: committedAt,
+	}}}
+	svc := NewQueryService(QueryServiceDeps{
+		Git:        git,
+		Repos:      f.repos,
+		Entities:   f.entities,
+		ChangeSets: f.changeSets,
+		Versions:   f.versions,
+		Audit:      f.audit,
+		Config:     QueryConfig{MaxDiffBytes: 4096},
+	})
+
+	info, err := svc.Commit(context.Background(), 3, "  "+testCommitA+" ")
+	if err != nil {
+		t.Fatalf("Commit error = %v", err)
+	}
+	if info.SHA != testCommitA || info.Message != "feat: refunds" || info.Author != "Dev" || !info.CommittedAt.Equal(committedAt) {
+		t.Fatalf("Commit = %+v, want the fake commit metadata", info)
+	}
+	if len(git.commitCalls) != 1 {
+		t.Fatalf("Commit calls = %d, want 1", len(git.commitCalls))
+	}
+	if call := git.commitCalls[0]; call.localPath != "/repo" || call.sha != testCommitA {
+		t.Fatalf("Commit args = %+v, want /repo %s", call, testCommitA)
+	}
+
+	for _, sha := range []string{"", "abc123", testCommitA[:39], testCommitA + "a", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "refs/heads/main"} {
+		_, err := svc.Commit(context.Background(), 3, sha)
+		if !errors.Is(err, domain.ErrInvalid) {
+			t.Fatalf("Commit(%q) error = %v, want ErrInvalid", sha, err)
+		}
+		if reason := domain.Reason(err); reason != "invalid_head" {
+			t.Fatalf("Commit(%q) reason = %q, want invalid_head", sha, reason)
+		}
+	}
+	if len(git.commitCalls) != 1 {
+		t.Fatalf("Commit calls after malformed shas = %d, want still 1", len(git.commitCalls))
+	}
+
+	// A disabled repository is rejected before Git is touched.
+	disabled := f.repos.infos[3]
+	disabled.Status = "disabled"
+	f.repos.infos[3] = disabled
+	if _, err := svc.Commit(context.Background(), 3, testCommitB); !errors.Is(err, domain.ErrInvalid) {
+		t.Fatalf("Commit(disabled repo) error = %v, want ErrInvalid", err)
+	} else if reason := domain.Reason(err); reason != "code_repository_disabled" {
+		t.Fatalf("reason = %q, want code_repository_disabled", reason)
+	}
+	if len(git.commitCalls) != 1 {
+		t.Fatal("disabled repository must not reach Git")
+	}
+
+	// A missing repository maps to the §7.1 422 code_repository_not_found.
+	delete(f.repos.infos, 3)
+	if _, err := svc.Commit(context.Background(), 3, testCommitA); !errors.Is(err, domain.ErrInvalid) || domain.Reason(err) != "code_repository_not_found" {
+		t.Fatalf("Commit(missing repo) error = %v (reason %q), want code_repository_not_found", err, domain.Reason(err))
+	}
+
+	// Git errors (unknown commit, operational failure) propagate unchanged.
+	f.repos.infos[3] = queryRepoInfo()
+	git.commitErr = domain.NewNotFound("commit_not_found", "commit not found")
+	if _, err := svc.Commit(context.Background(), 3, testCommitA); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("Commit unknown sha error = %v, want ErrNotFound", err)
+	}
+	git.commitErr = errors.New("git unavailable")
+	if _, err := svc.Commit(context.Background(), 3, testCommitA); err == nil {
+		t.Fatal("Commit operational error = nil, want the Git error")
 	}
 }

@@ -2,7 +2,9 @@ package application
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
@@ -25,6 +27,12 @@ const (
 	auditActionCodeRead = "code.read"
 )
 
+// queryCommitHashPattern matches the lowercase 40-hex commit ids the DDL and the
+// explicit-head contract require (design spec §6.1). It is deliberately a
+// query-local copy of the analysis-service rule so the read path does not depend
+// on the analysis service's declarations.
+var queryCommitHashPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
 // QueryConfig bounds the read-only query use case. Zero (or out-of-range)
 // values fall back to the design-spec §4.2 defaults; configured values may only
 // lower the hard domain caps.
@@ -40,8 +48,9 @@ type QueryConfig struct {
 }
 
 // QueryServiceDeps are the ports of the read-only code intelligence queries.
-// ChangeSets is part of the fixed dependency list but the §7.3 change preview is
-// read-only (changeSetId stays nil); the analysis service owns persistence.
+// ChangeSets serves the §7.3 change-preview reuse lookup (an already persisted
+// deterministic change set contributes its id; the preview never writes) and
+// Audit stays injectable for the code.read entries (nil disables auditing).
 type QueryServiceDeps struct {
 	Git        GitReader
 	Repos      RepoCatalog
@@ -210,9 +219,30 @@ func (s *QueryService) Search(ctx context.Context, repoID int64, commit, q, kind
 	return entities, nextCursor, more, nil
 }
 
+// Commit returns the read-only metadata of one commit (design spec §7.2). The
+// sha must be a full lowercase 40-hex commit id; a malformed one is the
+// documented 422 invalid_head before Git is touched. Only active repositories
+// are served. Unknown commits surface as the adapter's commit_not_found.
+func (s *QueryService) Commit(ctx context.Context, repoID int64, sha string) (domain.CommitInfo, error) {
+	repo, err := s.readRepo(ctx, repoID)
+	if err != nil {
+		return domain.CommitInfo{}, err
+	}
+	sha = strings.TrimSpace(sha)
+	if !queryCommitHashPattern.MatchString(sha) {
+		return domain.CommitInfo{}, domain.NewInvalid("sha", "invalid_head",
+			"codeintel: commit sha must be a lowercase 40-hex commit id")
+	}
+	return s.deps.Git.Commit(ctx, repo.LocalPath, sha)
+}
+
 // VersionChanges computes the version-scoped change preview (design spec §7.3):
-// base is always the version's bound baseline commit, head is the explicit
-// commit or the fixed branch tip. Nothing is persisted, so ChangeSetID is nil.
+// base is always the version's bound baseline commit. An explicit head must be
+// a lowercase 40-hex commit reachable from the baseline (git is-ancestor) or it
+// is rejected with the documented 422 invalid_head; an empty head resolves the
+// repository's fixed branch tip live. Nothing is persisted: when a deterministic
+// change set for (repo, base, head) already exists its id is attached, otherwise
+// ChangeSetID stays nil as §7.3 allows.
 func (s *QueryService) VersionChanges(ctx context.Context, versionID int64, headCommit string) (domain.ChangeSetData, string, string, error) {
 	info, err := s.deps.Versions.Get(ctx, versionID)
 	if err != nil {
@@ -232,23 +262,63 @@ func (s *QueryService) VersionChanges(ctx context.Context, versionID int64, head
 	if err != nil {
 		return domain.ChangeSetData{}, "", "", err
 	}
-	head := strings.TrimSpace(headCommit)
-	if head == "" {
-		branch := strings.TrimSpace(info.Branch)
-		if branch == "" {
-			branch = repo.FixedBranch
-		}
-		head, err = s.deps.Git.Head(ctx, repo.LocalPath, branch)
-		if err != nil {
-			return domain.ChangeSetData{}, "", "", err
-		}
+	head, err := s.resolveVersionHead(ctx, repo, base, headCommit)
+	if err != nil {
+		return domain.ChangeSetData{}, "", "", err
 	}
 	data, err := s.deps.Git.Diff(ctx, repo.LocalPath, base, head)
 	if err != nil {
 		return domain.ChangeSetData{}, "", "", err
 	}
-	data.ChangeSetID = nil
+	changeSetID, err := s.storedChangeSetID(ctx, repo.ID, base, head)
+	if err != nil {
+		return domain.ChangeSetData{}, "", "", err
+	}
+	data.ChangeSetID = changeSetID
 	return data, base, head, nil
+}
+
+// resolveVersionHead validates an explicit change-preview head (40 hex and a
+// baseline descendant) or resolves the repository's fixed branch tip live. The
+// version binding branch is not used: §6.1/§7.3 always default to the P2 fixed
+// branch, never a stale cached commit.
+func (s *QueryService) resolveVersionHead(ctx context.Context, repo RepoInfo, base, headCommit string) (string, error) {
+	head := strings.TrimSpace(headCommit)
+	if head == "" {
+		return s.deps.Git.Head(ctx, repo.LocalPath, repo.FixedBranch)
+	}
+	if !queryCommitHashPattern.MatchString(head) {
+		return "", domain.NewInvalid("headCommit", "invalid_head",
+			"codeintel: headCommit must be a lowercase 40-hex commit id")
+	}
+	ancestor, err := s.deps.Git.IsAncestor(ctx, repo.LocalPath, base, head)
+	if err != nil {
+		return "", err
+	}
+	if !ancestor {
+		return "", domain.NewInvalid("headCommit", "invalid_head",
+			fmt.Sprintf("codeintel: commit %s is not a descendant of the baseline %s", head, base))
+	}
+	return head, nil
+}
+
+// storedChangeSetID returns the id of an already persisted deterministic change
+// set for (repo, base, head), or nil when the preview has not been stored yet
+// (design spec §7.3 allows changeSetId=null). A missing change-set repository or
+// a not-found row is not an error for this read; operational failures surface.
+func (s *QueryService) storedChangeSetID(ctx context.Context, repoID int64, base, head string) (*int64, error) {
+	if s.deps.ChangeSets == nil {
+		return nil, nil
+	}
+	stored, err := s.deps.ChangeSets.FindByCommits(ctx, repoID, base, head)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	id := stored.ID
+	return &id, nil
 }
 
 // readRepo loads the repository and rejects a disabled one. P4 reads are only
