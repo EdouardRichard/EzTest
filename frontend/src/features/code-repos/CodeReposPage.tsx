@@ -1,10 +1,10 @@
 "use client"
 
-import { GitBranch, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react"
-import { type FormEvent, useCallback, useEffect, useState } from "react"
+import { AlertCircle, GitBranch, Loader2, Pencil, Plus, RefreshCw, Trash2, X } from "lucide-react"
+import { type FormEvent, useCallback, useEffect, useRef, useState } from "react"
 
 import { EmptyState } from "@/components/ui/EmptyState"
-import { StatusBadge } from "@/components/ui/StatusBadge"
+import { StatusBadge, type StatusBadgeVariant } from "@/components/ui/StatusBadge"
 import { useAuth } from "@/features/auth/AuthProvider"
 import { ApiError } from "@/lib/api-client"
 
@@ -16,6 +16,7 @@ import {
   validateCodeRepo,
 } from "./api"
 import type { CodeRepoDTO } from "./types"
+import { type IndexView, indexView, type RepoIndexState, useIndexStatus } from "./useIndexStatus"
 
 type CodeRepoForm = {
   key: string
@@ -50,6 +51,20 @@ const ERROR_REASON_LABELS: Record<string, string> = {
   invalid_glob: "Glob 配置不合法",
   duplicate_key: "标识已存在",
   has_dependencies: "存在依赖，无法删除",
+  code_repository_not_found: "代码仓库不存在或已被删除",
+  code_repository_disabled: "代码仓库已停用",
+  git_unavailable: "Git 仓库暂时不可用，请稍后重试",
+  index_in_progress: "该仓库已有索引任务在运行",
+  index_run_not_found: "尚未找到索引记录",
+}
+
+/** Badge copy/colour for each derived index state (spec §9.2). */
+const INDEX_VIEW_META: Record<IndexView, { label: string; variant: StatusBadgeVariant }> = {
+  unindexed: { label: "未索引", variant: "neutral" },
+  queued: { label: "排队中", variant: "info" },
+  running: { label: "索引中", variant: "info" },
+  done: { label: "已索引", variant: "success" },
+  failed: { label: "索引失败", variant: "danger" },
 }
 
 function describeError(error: unknown): string {
@@ -95,15 +110,42 @@ function statusLabel(status: string): string {
   return status === "" ? "未知" : status
 }
 
+/** Short commit for the index cell; the full SHA stays in a title. */
+function formatCommit(commit: string): string {
+  return commit.length <= 8 ? commit : commit.slice(0, 8)
+}
+
+/** Merges the P4 index projection into the P2 repository row (spec §9.2). */
+function resolveIndexState(
+  repo: CodeRepoDTO,
+  indexById: Record<number, RepoIndexState>,
+): RepoIndexState {
+  const state = indexById[repo.id]
+  return {
+    lastIndexedAt: state?.lastIndexedAt ?? repo.lastIndexedAt,
+    run: state?.run ?? null,
+  }
+}
+
 /**
- * Admin management of local Git repositories: list, create, edit, delete and
- * re-validate. Editing never sends the immutable key. Readonly users see the
- * data without any write affordance. The index column stays a P4 placeholder
- * because P2 does not build an index.
+ * Admin management of local Git repositories: list, create, edit, delete,
+ * re-validate and trigger a T0 index. Editing never sends the immutable key.
+ * Readonly users see the repository and index status without any write
+ * affordance; the backend 403 remains the real guard for index triggers.
  */
 export function CodeReposPage() {
   const { user } = useAuth()
   const canWrite = user?.role === "admin"
+
+  const {
+    indexById,
+    refreshingId,
+    exhausted,
+    error: indexError,
+    clearError: clearIndexError,
+    loadIndexStatus,
+    refreshIndex,
+  } = useIndexStatus()
 
   const [repos, setRepos] = useState<CodeRepoDTO[]>([])
   const [loading, setLoading] = useState(true)
@@ -122,18 +164,29 @@ export function CodeReposPage() {
     setLoading(true)
     setError("")
     try {
-      const page = await listCodeRepos()
+      // P2 rows stay the source of truth for configuration; the P4 list only
+      // contributes each repository's latest index projection.
+      const [page] = await Promise.all([listCodeRepos(), loadIndexStatus()])
       setRepos(page.items)
     } catch (caught) {
       setError(describeError(caught))
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [loadIndexStatus])
 
   useEffect(() => {
     void load()
   }, [load])
+
+  // Guards the post-index list refresh when the page unmounts mid-run.
+  const mountedRef = useRef(true)
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
 
   function updateForm(patch: Partial<CodeRepoForm>) {
     setForm((previous) => ({ ...previous, ...patch }))
@@ -259,6 +312,18 @@ export function CodeReposPage() {
     }
   }
 
+  async function handleRefreshIndex(repo: CodeRepoDTO) {
+    setError("")
+    setNotice("")
+    await refreshIndex(repo.id)
+    if (!mountedRef.current) return
+    // Re-read both lists so `lastIndexedAt` and the latest run are consistent
+    // after the run settles (or after a trigger failure).
+    await load()
+  }
+
+  const indexErrorMessage = indexError === null ? "" : describeError(indexError)
+
   return (
     <div className="space-y-6">
       <header className="flex flex-wrap items-start justify-between gap-3">
@@ -268,8 +333,8 @@ export function CodeReposPage() {
             {canWrite ? null : <StatusBadge variant="neutral">只读</StatusBadge>}
           </div>
           <p className="mt-1 max-w-2xl text-sm leading-relaxed text-muted-foreground">
-            配置本地 Git 代码仓的路径、固定分支与扫描范围；保存与重新校验均为只读 Git
-            检查，代码索引在 P4 阶段开放。
+            配置本地 Git 代码仓的路径、固定分支与扫描范围；保存与重新校验均为只读 Git 检查，
+            管理员可在此触发 T0 索引并查看索引状态。
           </p>
         </div>
         <div className="flex flex-wrap gap-1.5">
@@ -285,7 +350,10 @@ export function CodeReposPage() {
           ) : null}
           <button
             type="button"
-            onClick={() => void load()}
+            onClick={() => {
+              clearIndexError()
+              void load()
+            }}
             disabled={loading}
             className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-2 text-sm font-medium transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
@@ -309,6 +377,14 @@ export function CodeReposPage() {
           className="rounded-xl border border-emerald-500/25 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-300"
         >
           {notice}
+        </p>
+      ) : null}
+      {exhausted ? (
+        <p
+          role="status"
+          className="rounded-xl border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-300"
+        >
+          索引仍在运行，已停止自动刷新；请稍后点击「刷新」查看最新状态。
         </p>
       ) : null}
 
@@ -476,6 +552,9 @@ export function CodeReposPage() {
                   最近校验
                 </th>
                 <th scope="col" className="px-3 py-2 font-medium">
+                  索引状态
+                </th>
+                <th scope="col" className="px-3 py-2 font-medium">
                   状态
                 </th>
                 {canWrite ? (
@@ -486,108 +565,176 @@ export function CodeReposPage() {
               </tr>
             </thead>
             <tbody className="divide-y divide-border">
-              {repos.map((repo) => (
-                <tr key={repo.id}>
-                  <td className="px-3 py-2 align-top">
-                    <div className="font-medium">{repo.name}</div>
-                    <div className="break-all font-mono text-[11px] text-muted-foreground">
-                      {repo.key}
-                    </div>
-                  </td>
-                  <td className="px-3 py-2 align-top">
-                    <span className="block max-w-[22rem] break-all font-mono text-xs">
-                      {repo.localPath}
-                    </span>
-                  </td>
-                  <td className="px-3 py-2 align-top">
-                    <span className="break-all font-mono text-xs">{repo.fixedBranch}</span>
-                  </td>
-                  <td className="px-3 py-2 align-top">
-                    <span className="block max-w-[16rem] break-all font-mono text-xs">
-                      {repo.lastCommit || "—"}
-                    </span>
-                    {repo.lastIndexedAt === null ? (
-                      <span className="mt-0.5 block text-[11px] text-muted-foreground">
-                        未索引（P4）
-                      </span>
-                    ) : (
-                      <span className="mt-0.5 block text-[11px] text-muted-foreground">
-                        已索引：{formatTime(repo.lastIndexedAt)}
-                      </span>
-                    )}
-                  </td>
-                  <td className="px-3 py-2 align-top text-xs text-muted-foreground">
-                    {repo.lastValidatedAt === null ? "未校验" : formatTime(repo.lastValidatedAt)}
-                    {repo.lastValidationError ? (
-                      <span className="mt-0.5 block break-all text-destructive">
-                        {repo.lastValidationError}
-                      </span>
-                    ) : null}
-                  </td>
-                  <td className="px-3 py-2 align-top">
-                    <StatusBadge variant={statusVariant(repo.status)}>
-                      {statusLabel(repo.status)}
-                    </StatusBadge>
-                  </td>
-                  {canWrite ? (
+              {repos.map((repo) => {
+                const indexState = resolveIndexState(repo, indexById)
+                const view = indexView(indexState)
+                const meta = INDEX_VIEW_META[view]
+                const indexedAt = indexState.lastIndexedAt ?? indexState.run?.finishedAt ?? null
+                const indexCommit = indexState.run?.commit || repo.lastCommit
+                const indexFailure = indexState.run?.errors?.[0]
+
+                return (
+                  <tr key={repo.id}>
                     <td className="px-3 py-2 align-top">
-                      <div className="flex flex-wrap items-center justify-end gap-1.5">
-                        <button
-                          type="button"
-                          onClick={() => startEdit(repo)}
-                          className="inline-flex items-center gap-1 rounded-lg border border-border px-2.5 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                        >
-                          <Pencil className="h-3.5 w-3.5" aria-hidden="true" />
-                          编辑
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => void handleValidate(repo)}
-                          disabled={busyId === repo.id}
-                          className="inline-flex items-center gap-1 rounded-lg border border-border px-2.5 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                        >
-                          <RefreshCw
-                            className={`h-3.5 w-3.5 ${busyId === repo.id ? "animate-spin" : ""}`}
-                            aria-hidden="true"
-                          />
-                          重新校验
-                        </button>
-                        {confirmingDeleteId === repo.id ? (
-                          <>
-                            <button
-                              type="button"
-                              onClick={() => void handleDelete(repo)}
-                              disabled={busyId === repo.id}
-                              className="rounded-lg border border-destructive/40 bg-destructive/10 px-2.5 py-1.5 text-xs font-medium text-destructive transition-colors hover:bg-destructive/20 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                            >
-                              确认删除
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => setConfirmingDeleteId(null)}
-                              className="rounded-lg border border-border px-2.5 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                            >
-                              取消
-                            </button>
-                          </>
-                        ) : (
+                      <div className="font-medium">{repo.name}</div>
+                      <div className="break-all font-mono text-[11px] text-muted-foreground">
+                        {repo.key}
+                      </div>
+                    </td>
+                    <td className="px-3 py-2 align-top">
+                      <span className="block max-w-[22rem] break-all font-mono text-xs">
+                        {repo.localPath}
+                      </span>
+                    </td>
+                    <td className="px-3 py-2 align-top">
+                      <span className="break-all font-mono text-xs">{repo.fixedBranch}</span>
+                    </td>
+                    <td className="px-3 py-2 align-top">
+                      <span className="block max-w-[16rem] break-all font-mono text-xs">
+                        {repo.lastCommit || "—"}
+                      </span>
+                    </td>
+                    <td className="px-3 py-2 align-top text-xs text-muted-foreground">
+                      {repo.lastValidatedAt === null ? "未校验" : formatTime(repo.lastValidatedAt)}
+                      {repo.lastValidationError ? (
+                        <span className="mt-0.5 block break-all text-destructive">
+                          {repo.lastValidationError}
+                        </span>
+                      ) : null}
+                    </td>
+                    <td className="px-3 py-2 align-top">
+                      <StatusBadge variant={meta.variant}>{meta.label}</StatusBadge>
+                      {view === "done" && indexedAt !== null ? (
+                        <span className="mt-0.5 block text-[11px] text-muted-foreground">
+                          {formatTime(indexedAt)}
+                          {indexCommit === "" ? null : (
+                            <>
+                              {" · "}
+                              <span className="font-mono" title={indexCommit}>
+                                {formatCommit(indexCommit)}
+                              </span>
+                            </>
+                          )}
+                        </span>
+                      ) : null}
+                      {view === "failed" ? (
+                        <span className="mt-0.5 block max-w-[14rem] break-all text-[11px] text-destructive">
+                          {indexFailure?.message || indexFailure?.code || "未知原因"}
+                        </span>
+                      ) : null}
+                      {view === "queued" ? (
+                        <span className="mt-0.5 block text-[11px] text-muted-foreground">
+                          等待 worker 领取任务。
+                        </span>
+                      ) : null}
+                      {view === "running" ? (
+                        <span className="mt-0.5 block text-[11px] text-muted-foreground">
+                          正在扫描仓库…
+                        </span>
+                      ) : null}
+                      {view === "unindexed" ? (
+                        <span className="mt-0.5 block text-[11px] text-muted-foreground">
+                          尚未建立 T0 索引。
+                        </span>
+                      ) : null}
+                    </td>
+                    <td className="px-3 py-2 align-top">
+                      <StatusBadge variant={statusVariant(repo.status)}>
+                        {statusLabel(repo.status)}
+                      </StatusBadge>
+                    </td>
+                    {canWrite ? (
+                      <td className="px-3 py-2 align-top">
+                        <div className="flex flex-wrap items-center justify-end gap-1.5">
                           <button
                             type="button"
-                            onClick={() => setConfirmingDeleteId(repo.id)}
+                            onClick={() => startEdit(repo)}
+                            className="inline-flex items-center gap-1 rounded-lg border border-border px-2.5 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                          >
+                            <Pencil className="h-3.5 w-3.5" aria-hidden="true" />
+                            编辑
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void handleValidate(repo)}
                             disabled={busyId === repo.id}
                             className="inline-flex items-center gap-1 rounded-lg border border-border px-2.5 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                           >
-                            <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
-                            删除
+                            <RefreshCw
+                              className={`h-3.5 w-3.5 ${busyId === repo.id ? "animate-spin" : ""}`}
+                              aria-hidden="true"
+                            />
+                            重新校验
                           </button>
-                        )}
-                      </div>
-                    </td>
-                  ) : null}
-                </tr>
-              ))}
+                          <button
+                            type="button"
+                            onClick={() => void handleRefreshIndex(repo)}
+                            disabled={refreshingId !== null || busyId === repo.id}
+                            title={view === "failed" ? "重新触发索引" : "触发 T0 索引"}
+                            className="inline-flex items-center gap-1 rounded-lg border border-border px-2.5 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                          >
+                            {refreshingId === repo.id ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                            ) : (
+                              <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
+                            )}
+                            刷新索引
+                          </button>
+                          {confirmingDeleteId === repo.id ? (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() => void handleDelete(repo)}
+                                disabled={busyId === repo.id}
+                                className="rounded-lg border border-destructive/40 bg-destructive/10 px-2.5 py-1.5 text-xs font-medium text-destructive transition-colors hover:bg-destructive/20 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                              >
+                                确认删除
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setConfirmingDeleteId(null)}
+                                className="rounded-lg border border-border px-2.5 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                              >
+                                取消
+                              </button>
+                            </>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => setConfirmingDeleteId(repo.id)}
+                              disabled={busyId === repo.id}
+                              className="inline-flex items-center gap-1 rounded-lg border border-border px-2.5 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                              删除
+                            </button>
+                          )}
+                        </div>
+                      </td>
+                    ) : null}
+                  </tr>
+                )
+              })}
             </tbody>
           </table>
+        </div>
+      )}
+
+      {indexErrorMessage === "" ? null : (
+        <div
+          role="alert"
+          className="fixed bottom-4 right-4 z-50 flex max-w-sm items-start gap-2 rounded-xl border border-destructive/30 bg-card px-3 py-2 text-sm text-destructive shadow-lg"
+        >
+          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+          <p className="flex-1 leading-relaxed">{indexErrorMessage}</p>
+          <button
+            type="button"
+            onClick={clearIndexError}
+            aria-label="关闭提示"
+            className="rounded-lg p-0.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <X className="h-4 w-4" aria-hidden="true" />
+          </button>
         </div>
       )}
     </div>
