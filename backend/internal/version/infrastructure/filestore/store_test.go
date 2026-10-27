@@ -302,6 +302,44 @@ func TestSaveAtomicAndPermissions(t *testing.T) {
 	})
 }
 
+// TestEnsureRootTightensExistingMode covers the root permission rule: an
+// already-existing root is chmod-ed to 0700 where Unix permission bits apply.
+// Windows only models the read-only bit, so the same code path is observed there
+// by making the root read-only and checking that Save has made it writable
+// again.
+func TestEnsureRootTightensExistingMode(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "version-attachments")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatalf("pre-create root: %v", err)
+	}
+	loose := os.FileMode(0o755)
+	if runtime.GOOS == "windows" {
+		loose = 0o500
+	}
+	if err := os.Chmod(root, loose); err != nil {
+		t.Fatalf("pre-create looser root mode: %v", err)
+	}
+
+	store := filestore.New(root)
+	if _, err := store.Save(testContext(), 100, 5001, "notes.txt", strings.NewReader("hello")); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	info, err := os.Stat(root)
+	if err != nil {
+		t.Fatalf("stat root: %v", err)
+	}
+	if runtime.GOOS == "windows" {
+		if info.Mode().Perm()&0o200 == 0 {
+			t.Fatalf("root mode = %o, want the write bit restored by the 0700 chmod", info.Mode().Perm())
+		}
+		return
+	}
+	if mode := info.Mode().Perm(); mode != 0o700 {
+		t.Fatalf("root mode = %o, want 700", mode)
+	}
+}
+
 // TestOpenAndRemove covers the read/remove half of the port: Open is seekable,
 // a missing file is fs.ErrNotExist, Remove deletes and is idempotent.
 func TestOpenAndRemove(t *testing.T) {

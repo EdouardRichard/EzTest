@@ -324,6 +324,64 @@ func TestAttachmentDeleteWithMissingFile(t *testing.T) {
 	}
 }
 
+// TestAttachmentRequirementCascadeCleanup covers the cross-task T14 hook: the
+// storage paths are captured before the requirement hard-delete cascades the
+// metadata rows away, then the files are removed after the delete committed.
+// The requirement delete itself must not be responsible for the files.
+func TestAttachmentRequirementCascadeCleanup(t *testing.T) {
+	ctx := context.Background()
+	f := newAttachmentIntegrationFixture(t)
+	version := f.seedVersion(t, 9001, domain.VersionDraft)
+	requirement := f.seedRequirement(t, version.ID, domain.RequirementDraft)
+	first := f.mustUpload(t, requirement, "notes.txt", "text/plain", []byte("notes"))
+	second := f.mustUpload(t, requirement, "pixel.png", "image/png", attachmentIntegrationPNG)
+
+	paths, err := f.service.StoragePathsForRequirement(ctx, version.ID, requirement.ID)
+	if err != nil {
+		t.Fatalf("StoragePathsForRequirement: %v", err)
+	}
+	if len(paths) != 2 || paths[0] != first.StoragePath || paths[1] != second.StoragePath {
+		t.Fatalf("captured paths = %v, want [%s %s]", paths, first.StoragePath, second.StoragePath)
+	}
+
+	requirementService := application.NewRequirementService(f.requirements, f.versions, f.events)
+	if err := requirementService.Delete(ctx, version.ID, requirement.ID, 42); err != nil {
+		t.Fatalf("Delete requirement: %v", err)
+	}
+
+	// The metadata cascade is complete, but the files must still be on disk for
+	// the post-delete cleanup step.
+	if _, err := f.requirements.Get(ctx, requirement.ID); err == nil {
+		t.Fatal("requirement metadata survived the delete")
+	}
+	for _, attachment := range []*application.Attachment{first, second} {
+		if _, err := f.requirements.GetAttachment(ctx, attachment.ID); err == nil {
+			t.Fatalf("attachment %d metadata survived the requirement cascade", attachment.ID)
+		}
+		if _, err := os.Stat(f.storedPath(attachment)); err != nil {
+			t.Fatalf("attachment %d file disappeared before RemoveStoredFiles: %v", attachment.ID, err)
+		}
+	}
+	var rows int
+	if err := f.pool.QueryRow(ctx,
+		`SELECT count(*)::int FROM requirement_attachments WHERE requirement_id = $1`,
+		requirement.ID).Scan(&rows); err != nil {
+		t.Fatalf("count attachment rows: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("attachment rows = %d, want 0", rows)
+	}
+
+	if err := f.service.RemoveStoredFiles(ctx, paths); err != nil {
+		t.Fatalf("RemoveStoredFiles: %v", err)
+	}
+	for _, attachment := range []*application.Attachment{first, second} {
+		if _, err := os.Stat(f.storedPath(attachment)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("attachment %d file survived RemoveStoredFiles: %v", attachment.ID, err)
+		}
+	}
+}
+
 // sha256Hex returns the hex sha256 of content.
 func sha256Hex(content []byte) string {
 	sum := sha256.Sum256(content)

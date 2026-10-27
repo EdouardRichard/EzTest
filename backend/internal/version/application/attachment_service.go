@@ -175,6 +175,10 @@ func (s *AttachmentService) Upload(ctx context.Context, versionID, reqID int64, 
 	if err != nil {
 		return nil, err
 	}
+	// The draft gate and the count caps below are check-then-write: P3 is
+	// single-user, so the narrow race with a concurrent confirm/upload is
+	// accepted. The duplicate-sha pre-check is likewise check-then-write; the
+	// requirement_attachments unique index is its database backstop.
 	if requirement.Status != domain.RequirementDraft {
 		return nil, requirementStateConflictError(reqID, requirement.Status)
 	}
@@ -304,6 +308,12 @@ func (s *AttachmentService) ReadText(ctx context.Context, versionID, attachmentI
 	if attachment.SizeBytes > 0 && attachment.SizeBytes < int64(limit) {
 		limit = int(attachment.SizeBytes)
 	}
+	// Only a window shorter than the declared file is a real truncation; it may
+	// legitimately split a rune. When the declared file fits inside the window
+	// (SizeBytes <= limit), the whole row was read and a trailing partial rune
+	// means corrupt content: it must fail the UTF-8 check below instead of
+	// silently returning a prefix.
+	truncated := attachment.SizeBytes > int64(limit)
 
 	file, err := s.store.Open(ctx, attachment.StoragePath)
 	if err != nil {
@@ -317,7 +327,7 @@ func (s *AttachmentService) ReadText(ctx context.Context, versionID, attachmentI
 		return "", fmt.Errorf("version: read attachment text: %w", readErr)
 	}
 	data = data[:n]
-	if limit > 0 && n == limit {
+	if truncated && n == limit {
 		data = trimIncompleteUTF8Suffix(data)
 	}
 	if !utf8.Valid(data) {
@@ -373,6 +383,8 @@ func (s *AttachmentService) Delete(ctx context.Context, versionID, reqID, attach
 	if err != nil {
 		return err
 	}
+	// The draft gate is check-then-write: P3 is single-user, so a concurrent
+	// confirm/delete race is accepted.
 	if requirement.Status != domain.RequirementDraft {
 		return requirementStateConflictError(reqID, requirement.Status)
 	}
@@ -400,6 +412,50 @@ func (s *AttachmentService) Delete(ctx context.Context, versionID, reqID, attach
 		},
 	})
 	return nil
+}
+
+// StoragePathsForRequirement returns the root-relative storage paths of every
+// attachment of one requirement, in repository order. T14 captures them before
+// RequirementService.Delete: the requirement hard delete cascades the attachment
+// metadata rows, so the paths must be read first. A requirement without
+// attachments returns an empty, non-nil slice.
+func (s *AttachmentService) StoragePathsForRequirement(ctx context.Context, versionID, requirementID int64) ([]string, error) {
+	if s.repo == nil {
+		return nil, errors.New("version: attachment service is not configured")
+	}
+	if _, err := s.loadRequirement(ctx, versionID, requirementID); err != nil {
+		return nil, err
+	}
+	attachments, err := s.repo.ListAttachments(ctx, requirementID)
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]string, 0, len(attachments))
+	for _, attachment := range attachments {
+		paths = append(paths, attachment.StoragePath)
+	}
+	return paths, nil
+}
+
+// RemoveStoredFiles removes the files behind already-captured storage paths
+// without touching the attachment metadata. T14 calls it after a successful
+// requirement delete, when the metadata cascade has already committed: each
+// removal is best effort, failures are joined and returned for logging, and the
+// remaining paths are still attempted. An empty list is a nil error.
+func (s *AttachmentService) RemoveStoredFiles(ctx context.Context, paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	if s.store == nil {
+		return errors.New("version: attachment service is not configured")
+	}
+	var failures []error
+	for _, storagePath := range paths {
+		if err := s.store.Remove(ctx, storagePath); err != nil {
+			failures = append(failures, fmt.Errorf("version: remove attachment %q: %w", storagePath, err))
+		}
+	}
+	return errors.Join(failures...)
 }
 
 // List returns the attachment metadata of one requirement scoped to versionID.
@@ -467,7 +523,9 @@ func (s *AttachmentService) loadScopedAttachment(ctx context.Context, versionID,
 
 // checkAttachmentCounts enforces the per-requirement and per-version caps
 // before any byte is written. The database has no count constraint; the small
-// race between two concurrent uploads is accepted by the spec.
+// race between two concurrent uploads is accepted for P3's single-user scope.
+// The duplicate-sha pre-check in Upload is likewise check-then-write, with the
+// requirement_attachments unique index as its database backstop.
 func (s *AttachmentService) checkAttachmentCounts(ctx context.Context, reqID, versionID int64) error {
 	perRequirement, perVersion, err := s.repo.CountAttachments(ctx, reqID, versionID)
 	if err != nil {
