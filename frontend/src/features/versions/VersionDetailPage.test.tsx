@@ -3,6 +3,22 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { ApiError } from "@/lib/api-client"
 
+const codeIntelMocks = vi.hoisted(() => ({
+  getVersionChanges: vi.fn(),
+  getLatestIndexRun: vi.fn(),
+  getLatestAnalysis: vi.fn(),
+  startAnalysis: vi.fn(),
+  getFileDiff: vi.fn(),
+}))
+
+vi.mock("@/features/code-intel/api", () => ({
+  getVersionChanges: codeIntelMocks.getVersionChanges,
+  getLatestIndexRun: codeIntelMocks.getLatestIndexRun,
+  getLatestAnalysis: codeIntelMocks.getLatestAnalysis,
+  startAnalysis: codeIntelMocks.startAnalysis,
+  getFileDiff: codeIntelMocks.getFileDiff,
+}))
+
 const mocks = vi.hoisted(() => ({
   getVersion: vi.fn(),
   startClarification: vi.fn(),
@@ -55,6 +71,8 @@ vi.mock("./VersionBindingsForm", () => ({
 
 import VersionDetailRoutePage from "@/app/(app)/versions/[id]/page"
 
+import type { Analysis, ChangeList, IndexRun } from "@/features/code-intel/types"
+
 import type { Version } from "./types"
 import { VersionDetailPage } from "./VersionDetailPage"
 
@@ -106,8 +124,63 @@ const PLACEHOLDER_TABS = [
   ["结果与证据", "P6"],
   ["问题", "P7"],
   ["报告", "P6"],
-  ["代码与变更", "P4"],
 ] as const
+
+const CODE_BASE = "0123456789abcdef0123456789abcdef01234567"
+const CODE_HEAD = "89abcdef0123456789abcdef0123456789abcdef"
+
+const CODE_CHANGES: ChangeList = {
+  changeSetId: "1844674407370955163",
+  baseCommit: CODE_BASE,
+  headCommit: CODE_HEAD,
+  stats: { files: 1, additions: 12, deletions: 1, truncated: false },
+  files: [
+    {
+      path: "src/api/refund.ts",
+      oldPath: null,
+      status: "M",
+      additions: 12,
+      deletions: 1,
+      binary: false,
+      headBlobHash: "git-sha1:1111111111111111111111111111111111111111",
+    },
+  ],
+  nextCursor: null,
+  hasMore: false,
+}
+
+const CODE_INDEX: IndexRun = {
+  runId: "1844674407370955164",
+  repoId: 3,
+  commit: CODE_HEAD,
+  status: "done",
+  stats: { files: 20, truncated: false },
+  startedAt: "2026-10-28T00:50:00Z",
+  finishedAt: "2026-10-28T00:52:03Z",
+}
+
+const CODE_ANALYSIS: Analysis = {
+  id: "1844674407370955162",
+  versionId: VERSION_ID,
+  repoId: 3,
+  baseCommit: CODE_BASE,
+  headCommit: CODE_HEAD,
+  status: "done",
+  degraded: false,
+  analysisVersion: 1,
+  model: "deepseek-chat",
+  promptVersion: "p4.1",
+  changeSetId: "1844674407370955163",
+  changeSummary: "退款接口新增 reason 参数",
+  stats: null,
+  factVersions: [],
+  candidates: [],
+  unmapped: [],
+  errors: [],
+  createdAt: "2026-10-28T01:00:00Z",
+  startedAt: "2026-10-28T01:00:00Z",
+  finishedAt: "2026-10-28T01:02:03Z",
+}
 
 describe("VersionDetailPage", () => {
   beforeEach(() => {
@@ -134,6 +207,10 @@ describe("VersionDetailPage", () => {
     })
     mocks.listDecisions.mockResolvedValue({ items: [], nextCursor: "", hasMore: false })
     mocks.useVersionStream.mockReturnValue({ events: [], status: "live", reconnect: vi.fn() })
+    for (const mock of Object.values(codeIntelMocks)) mock.mockReset()
+    codeIntelMocks.getVersionChanges.mockResolvedValue(CODE_CHANGES)
+    codeIntelMocks.getLatestIndexRun.mockResolvedValue(CODE_INDEX)
+    codeIntelMocks.getLatestAnalysis.mockResolvedValue(CODE_ANALYSIS)
   })
 
   afterEach(() => {
@@ -215,6 +292,23 @@ describe("VersionDetailPage", () => {
       expect(screen.queryAllByRole("table")).toHaveLength(0)
       expect(screen.queryAllByRole("row")).toHaveLength(0)
     }
+  })
+
+  it("mounts the real code changes tab instead of the P4 placeholder", async () => {
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "代码与变更" }))
+
+    expect(await screen.findByRole("heading", { name: "变更文件" })).toBeTruthy()
+    expect(screen.getByText("src/api/refund.ts")).toBeTruthy()
+    expect(screen.queryByText("阶段 P4")).toBeNull()
+    expect(screen.queryByText(/代码与变更在 P4 阶段接入/)).toBeNull()
+    expect(screen.queryByText("该 Tab 尚未接入数据，不展示占位假数据。")).toBeNull()
+
+    expect(codeIntelMocks.getVersionChanges).toHaveBeenCalledWith(VERSION_ID)
+    expect(codeIntelMocks.getLatestIndexRun).toHaveBeenCalledWith(3)
+    expect(codeIntelMocks.getLatestAnalysis).toHaveBeenCalledWith(VERSION_ID)
   })
 
   it("shows the header status, binding summary and action for the current state", async () => {

@@ -3,6 +3,7 @@
 import { Loader2 } from "lucide-react"
 import { useCallback, useEffect, useRef, useState } from "react"
 
+import { CodeChangesTab } from "@/features/code-intel/CodeChangesTab"
 import { ApiError } from "@/lib/api-client"
 
 import { getVersion } from "./api"
@@ -156,6 +157,7 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
         onTabChange={handleTabChange}
         requirements={<RequirementsWorkbenchSlot version={version} onChanged={refresh} />}
         overview={<OverviewTab version={version} />}
+        code={<CodeChangesTab versionId={versionId} repoId={version.codeRepositoryId} />}
       />
     </div>
   )
