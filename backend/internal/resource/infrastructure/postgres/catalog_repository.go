@@ -508,19 +508,21 @@ func (r *CatalogRepository) ListAppModels(ctx context.Context, f domain.AppModel
 	return nodes, more, nil
 }
 
-// UpdateAppModel writes the mutable node columns and refreshes the server
-// timestamps on n. The system, kind and key are immutable after creation.
+// UpdateAppModel writes the mutable node columns, including source, and
+// refreshes the server timestamps on n. The system, kind and key are immutable
+// after creation.
 func (r *CatalogRepository) UpdateAppModel(ctx context.Context, n *domain.AppModelNode) error {
 	meta, err := encodeAppModelMeta(n.Meta)
 	if err != nil {
 		return fmt.Errorf("postgres: encode app model meta: %w", err)
 	}
 	const query = `UPDATE app_model_nodes
-		SET parent_id = $2, name = $3, path = $4, method = $5, meta = $6, updated_at = now()
+		SET parent_id = $2, name = $3, path = $4, method = $5, source = $6, meta = $7,
+		    updated_at = now()
 		WHERE id = $1
 		RETURNING created_at, updated_at`
 	if err := r.pool.QueryRow(ctx, query,
-		n.ID, n.ParentID, n.Name, n.Path, n.Method, meta,
+		n.ID, n.ParentID, n.Name, n.Path, n.Method, n.Source, meta,
 	).Scan(&n.CreatedAt, &n.UpdatedAt); err != nil {
 		return catalogWriteBackError(err, "app model", n.ID,
 			"an app model node with this key already exists", "update app model")
