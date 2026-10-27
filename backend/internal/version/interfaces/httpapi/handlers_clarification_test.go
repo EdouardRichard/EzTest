@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -297,6 +298,35 @@ func TestClarificationMessageHistory(t *testing.T) {
 		}
 	})
 
+	t.Run("completed session keeps its persisted history", func(t *testing.T) {
+		handler, deps := newTestServer(t)
+		deps.clarification.seedSession(versionapp.ClarificationSession{
+			ID: 6001, VersionID: versionDetailID, Status: domain.SessionCompleted,
+			AgentSessionID: int64Ptr(clarificationMessageRunID),
+		})
+		deps.messages.messages = []versionapp.AgentMessage{
+			{ID: 10, RunID: 9001, Role: "assistant",
+				Parts: []versionapp.AgentPart{{Type: "text", Text: "hello"}}, CreatedAt: testNow},
+		}
+
+		recorder := doRequest(handler, http.MethodGet,
+			"/api/versions/100/clarification/messages", testUserToken, "")
+		requireStatus(t, recorder, http.StatusOK)
+		items, nextCursor, hasMore := decodePage(t, recorder)
+		if len(items) != 1 || nextCursor != "" || hasMore {
+			t.Fatalf("page=%v/%q/%v want the completed session's one message", items, nextCursor, hasMore)
+		}
+		requireJSONNumber(t, items[0], "id", 10)
+		if deps.messages.calls != 1 || deps.messages.lastAgentSessionID != clarificationMessageRunID {
+			t.Fatalf("message reader calls/agentSession=%d/%d want the completed session's agent session",
+				deps.messages.calls, deps.messages.lastAgentSessionID)
+		}
+		if !containsCall(deps.clarification.calls, "LatestSession") ||
+			containsCall(deps.clarification.calls, "CurrentSession") {
+			t.Fatalf("calls=%v want LatestSession only for the history read", deps.clarification.calls)
+		}
+	})
+
 	t.Run("query validation", func(t *testing.T) {
 		handler, _ := newTestServer(t)
 		recorder := doRequest(handler, http.MethodGet,
@@ -392,8 +422,8 @@ func TestClarificationAnalyzeAndRecon(t *testing.T) {
 		}
 
 		parts := deps.clarification.lastReconParts
-		if len(parts) != 4 {
-			t.Fatalf("recon parts=%+v want 2 text + 2 image parts", parts)
+		if len(parts) != 5 {
+			t.Fatalf("recon parts=%+v want 2 text + 2 image parts + the oversized-image note", parts)
 		}
 		// The instruction part is prepended by StartReconWithParts itself (T10);
 		// the HTTP layer only supplies the attachment parts.
@@ -404,12 +434,17 @@ func TestClarificationAnalyzeAndRecon(t *testing.T) {
 		if parts[1].Type != "image" || parts[1].ImageRef != "attachment:301" {
 			t.Fatalf("parts[1]=%+v want the attachment:301 image ref", parts[1])
 		}
-		if parts[2].Type != "text" || !strings.Contains(parts[2].Text, "beta") ||
-			!strings.Contains(parts[2].Text, "spec.md") {
-			t.Fatalf("parts[2]=%+v want the spec.md text summary", parts[2])
+		if parts[2].Type != "text" || !strings.Contains(parts[2].Text, "huge.png") ||
+			!strings.Contains(parts[2].Text, "too large") ||
+			strings.Contains(parts[2].Text, "attachment:302") {
+			t.Fatalf("parts[2]=%+v want the oversized-image annotation without an injected ref", parts[2])
 		}
-		if parts[3].Type != "image" || parts[3].ImageRef != "attachment:304" {
-			t.Fatalf("parts[3]=%+v want the attachment:304 image ref", parts[3])
+		if parts[3].Type != "text" || !strings.Contains(parts[3].Text, "beta") ||
+			!strings.Contains(parts[3].Text, "spec.md") {
+			t.Fatalf("parts[3]=%+v want the spec.md text summary", parts[3])
+		}
+		if parts[4].Type != "image" || parts[4].ImageRef != "attachment:304" {
+			t.Fatalf("parts[4]=%+v want the attachment:304 image ref", parts[4])
 		}
 		if len(deps.attachments.readTextCalls) != 2 {
 			t.Fatalf("ReadText calls=%+v want exactly the 2 text attachments",
@@ -420,6 +455,76 @@ func TestClarificationAnalyzeAndRecon(t *testing.T) {
 				call.maxBytes > domain.MaxInjectedTextBytesPerFile {
 				t.Fatalf("ReadText call=%+v want a version-scoped 64 KiB-bounded read", call)
 			}
+		}
+	})
+
+	t.Run("recon annotates an oversized image instead of injecting it", func(t *testing.T) {
+		handler, deps := newTestServer(t)
+		deps.requirements.listResult = []versionapp.Requirement{
+			{ID: 200, VersionID: versionDetailID, Title: "Login"},
+		}
+		seedTextAttachment(deps, versionapp.Attachment{
+			ID: 310, VersionID: versionDetailID, RequirementID: 200, Kind: domain.AttachmentImage,
+			Filename: "huge.png", MIMEType: "image/png", SizeBytes: domain.MaxAgentImageBytes + 1,
+		}, nil)
+
+		recorder := doRequest(handler, http.MethodPost, "/api/versions/100/clarification/recon", testUserToken, "")
+		requireStatus(t, recorder, http.StatusAccepted)
+		parts := deps.clarification.lastReconParts
+		if len(parts) != 1 || parts[0].Type != "text" {
+			t.Fatalf("parts=%+v want only the oversized-image annotation", parts)
+		}
+		note := parts[0].Text
+		if !strings.Contains(note, "huge.png") || !strings.Contains(note, "too large") ||
+			!strings.Contains(note, "not included") {
+			t.Fatalf("note=%q want the filename, the too-large reason and the not-included statement", note)
+		}
+		if strings.Contains(note, "attachment:") {
+			t.Fatalf("note=%q must not inject the oversized image ref", note)
+		}
+		if len(deps.attachments.readTextCalls) != 0 {
+			t.Fatalf("ReadText calls=%+v want none for an image", deps.attachments.readTextCalls)
+		}
+	})
+
+	t.Run("the oversized-image annotation counts toward the text budget", func(t *testing.T) {
+		handler, deps := newTestServer(t)
+		deps.requirements.listResult = []versionapp.Requirement{
+			{ID: 200, VersionID: versionDetailID, Title: "Login"},
+		}
+		// Four 60 KiB texts consume the whole 200 KiB run budget (the fourth
+		// read is clamped to the remaining 20 KiB), so the annotation no longer
+		// fits and must be omitted.
+		chunk := strings.Repeat("a", 60<<10)
+		for i := int64(0); i < 4; i++ {
+			seedTextAttachment(deps, versionapp.Attachment{
+				ID: 320 + i, VersionID: versionDetailID, RequirementID: 200,
+				Filename: "file.txt", MIMEType: "text/plain", SizeBytes: int64(len(chunk)),
+			}, []byte(chunk))
+		}
+		seedTextAttachment(deps, versionapp.Attachment{
+			ID: 330, VersionID: versionDetailID, RequirementID: 200, Kind: domain.AttachmentImage,
+			Filename: "huge.png", MIMEType: "image/png", SizeBytes: domain.MaxAgentImageBytes + 1,
+		}, nil)
+
+		recorder := doRequest(handler, http.MethodPost, "/api/versions/100/clarification/recon", testUserToken, "")
+		requireStatus(t, recorder, http.StatusAccepted)
+		parts := deps.clarification.lastReconParts
+		if len(parts) != 4 {
+			t.Fatalf("parts=%d want the 4 text parts and no annotation past the budget", len(parts))
+		}
+		injected := 0
+		for _, part := range parts {
+			if part.Type != "text" || strings.Contains(part.Text, "huge.png") {
+				t.Fatalf("part=%+v want only text content within the budget", part)
+			}
+			if index := strings.IndexByte(part.Text, '\n'); index >= 0 {
+				injected += len(part.Text) - index - 1
+			}
+		}
+		if injected != domain.MaxInjectedTextBytesPerRun {
+			t.Fatalf("injected text bytes=%d want the exhausted %d budget",
+				injected, domain.MaxInjectedTextBytesPerRun)
 		}
 	})
 
@@ -504,6 +609,82 @@ func TestClarificationAnalyzeAndRecon(t *testing.T) {
 					t.Fatalf("retryable=false want true for %v", errs[testCase.name])
 				}
 			})
+		}
+	})
+}
+
+// TestClarificationAIReadiness covers the AI runtime probe of the four
+// AI-starting endpoints: a probe failure is the retryable 503 ai_unavailable
+// before any service call, a passing probe changes nothing, and non-AI reads are
+// never gated (spec §8.6).
+func TestClarificationAIReadiness(t *testing.T) {
+	aiRoutes := []struct {
+		name   string
+		path   string
+		body   string
+		status int
+	}{
+		{"start session", "/api/versions/100/clarification/sessions", "", http.StatusCreated},
+		{"send message", "/api/versions/100/clarification/messages", `{"message":"hi"}`, http.StatusAccepted},
+		{"analyze", "/api/versions/100/clarification/analyze", "", http.StatusAccepted},
+		{"recon", "/api/versions/100/clarification/recon", "", http.StatusAccepted},
+	}
+
+	t.Run("a failing probe is a retryable ai_unavailable", func(t *testing.T) {
+		for _, route := range aiRoutes {
+			t.Run(route.name, func(t *testing.T) {
+				handler, deps := newTestServer(t)
+				deps.aiReady.err = errors.New("llm is not configured")
+				recorder := doRequest(handler, http.MethodPost, route.path, testUserToken, route.body)
+				apiError := requireError(t, recorder, http.StatusServiceUnavailable,
+					platform.CodeUnavailable, "ai_unavailable")
+				if !apiError.Retryable {
+					t.Fatal("retryable=false want true")
+				}
+				if deps.aiReady.calls != 1 {
+					t.Fatalf("readiness calls=%d want exactly 1", deps.aiReady.calls)
+				}
+				if len(deps.clarification.calls) != 0 {
+					t.Fatalf("AI endpoint reached the service while unavailable: %v", deps.clarification.calls)
+				}
+			})
+		}
+	})
+
+	t.Run("a passing probe keeps the endpoints working", func(t *testing.T) {
+		for _, route := range aiRoutes {
+			t.Run(route.name, func(t *testing.T) {
+				handler, deps := newTestServer(t)
+				recorder := doRequest(handler, http.MethodPost, route.path, testUserToken, route.body)
+				requireStatus(t, recorder, route.status)
+				if deps.aiReady.calls != 1 {
+					t.Fatalf("readiness calls=%d want exactly 1", deps.aiReady.calls)
+				}
+			})
+		}
+	})
+
+	t.Run("non-AI reads are not gated", func(t *testing.T) {
+		handler, deps := newTestServer(t)
+		deps.aiReady.err = errors.New("llm is not configured")
+		deps.clarification.seedSession(versionapp.ClarificationSession{
+			ID: 6001, VersionID: versionDetailID,
+		})
+		routes := []struct {
+			method string
+			path   string
+			body   string
+		}{
+			{http.MethodGet, "/api/versions/100/clarification", ""},
+			{http.MethodGet, "/api/versions/100/clarification/messages", ""},
+			{http.MethodPost, "/api/versions/100/clarification/sessions/6001/complete", ""},
+		}
+		for _, route := range routes {
+			recorder := doRequest(handler, route.method, route.path, testUserToken, route.body)
+			requireStatus(t, recorder, http.StatusOK)
+		}
+		if deps.aiReady.calls != 0 {
+			t.Fatalf("readiness probe calls=%d want 0 for non-AI reads", deps.aiReady.calls)
 		}
 	})
 }

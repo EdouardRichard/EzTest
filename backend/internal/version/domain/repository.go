@@ -62,6 +62,10 @@ type RequirementRepository interface {
 type ClarificationRepository interface {
 	CreateSession(ctx context.Context, s *ClarificationSession) error
 	GetActiveSession(ctx context.Context, versionID int64) (*ClarificationSession, error)
+	// LatestSession returns the newest session of the version regardless of
+	// status: the latest started_at wins, an active session wins a same-start
+	// tie, and the highest id breaks the remaining tie. Nil means no session.
+	LatestSession(ctx context.Context, versionID int64) (*ClarificationSession, error)
 	GetSession(ctx context.Context, id int64) (*ClarificationSession, error)
 	CompleteSession(ctx context.Context, id int64, actor int64) (*ClarificationSession, error)
 	UpdateContextSummary(ctx context.Context, versionID int64, summary string, actor int64) error

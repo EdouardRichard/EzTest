@@ -267,6 +267,26 @@ func (r *ClarificationRepository) GetActiveSession(ctx context.Context, versionI
 	return &session, nil
 }
 
+// LatestSession returns the version's newest session regardless of status so
+// the completed-session message history stays readable. The latest started_at
+// wins, an active session wins a same-start tie, and the highest id breaks the
+// remaining tie. A version without any session returns (nil, nil).
+func (r *ClarificationRepository) LatestSession(ctx context.Context, versionID int64) (*domain.ClarificationSession, error) {
+	session, err := scanClarificationSession(r.pool.QueryRow(ctx,
+		`SELECT `+clarificationSessionColumnList+`
+		 FROM clarification_sessions
+		 WHERE version_id = $1
+		 ORDER BY started_at DESC, (status = 'active') DESC, id DESC
+		 LIMIT 1`, versionID))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("postgres: get latest clarification session: %w", err)
+	}
+	return &session, nil
+}
+
 // GetSession returns one session by id.
 func (r *ClarificationRepository) GetSession(ctx context.Context, id int64) (*domain.ClarificationSession, error) {
 	session, err := scanClarificationSession(r.pool.QueryRow(ctx,

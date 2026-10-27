@@ -81,6 +81,36 @@ func (r *fakeClarificationRepo) GetActiveSession(_ context.Context, versionID in
 	return nil, nil
 }
 
+// LatestSession returns the newest session of the version regardless of status:
+// the latest started_at wins, an active session wins a same-start tie, and the
+// highest id breaks the remaining tie.
+func (r *fakeClarificationRepo) LatestSession(_ context.Context, versionID int64) (*domain.ClarificationSession, error) {
+	var latest *domain.ClarificationSession
+	for _, stored := range r.sessions {
+		if stored.VersionID != versionID {
+			continue
+		}
+		copied := stored
+		if latest == nil || newerClarificationSession(&copied, latest) {
+			latest = &copied
+		}
+	}
+	return latest, nil
+}
+
+// newerClarificationSession reports whether candidate is the newest session.
+func newerClarificationSession(candidate, current *domain.ClarificationSession) bool {
+	if !candidate.StartedAt.Equal(current.StartedAt) {
+		return candidate.StartedAt.After(current.StartedAt)
+	}
+	candidateActive := candidate.Status == domain.SessionActive
+	currentActive := current.Status == domain.SessionActive
+	if candidateActive != currentActive {
+		return candidateActive
+	}
+	return candidate.ID > current.ID
+}
+
 // GetSession returns one stored session.
 func (r *fakeClarificationRepo) GetSession(_ context.Context, id int64) (*domain.ClarificationSession, error) {
 	stored, ok := r.sessions[id]
@@ -1219,6 +1249,72 @@ func TestClarificationVersionNotFound(t *testing.T) {
 	}
 	if len(f.repo.sessions)+len(f.repo.questions)+len(f.repo.decisions) != 0 || len(f.events.events) != 0 {
 		t.Fatalf("missing-version calls wrote rows or events")
+	}
+}
+
+// TestClarificationLatestSessionSurvivesCompletion covers the read model the
+// completed-session message history needs: after completion CurrentSession is
+// nil while LatestSession still returns the completed conversation, and a new
+// active session becomes the latest.
+func TestClarificationLatestSessionSurvivesCompletion(t *testing.T) {
+	ctx := context.Background()
+	f := newClarificationFixture()
+	version := f.seedVersion(domain.VersionClarifying)
+
+	latest, err := f.service.LatestSession(ctx, version.ID)
+	if err != nil || latest != nil {
+		t.Fatalf("LatestSession before start = %+v/%v, want nil", latest, err)
+	}
+
+	session := f.startSession(t, version.ID)
+	latest, err = f.service.LatestSession(ctx, version.ID)
+	if err != nil || latest == nil || latest.ID != session.ID || latest.Status != domain.SessionActive {
+		t.Fatalf("LatestSession active = %+v/%v", latest, err)
+	}
+
+	if _, err := f.service.CompleteSession(ctx, version.ID, session.ID, 42); err != nil {
+		t.Fatalf("CompleteSession: %v", err)
+	}
+	if current, err := f.service.CurrentSession(ctx, version.ID); err != nil || current != nil {
+		t.Fatalf("CurrentSession after completion = %+v/%v, want nil", current, err)
+	}
+	completed, err := f.service.LatestSession(ctx, version.ID)
+	if err != nil || completed == nil {
+		t.Fatalf("LatestSession after completion = %+v/%v", completed, err)
+	}
+	if completed.ID != session.ID || completed.Status != domain.SessionCompleted ||
+		completed.AgentSessionID == nil || completed.AgentSessionID != session.AgentSessionID ||
+		completed.EndedAt == nil {
+		t.Fatalf("completed session = %+v", completed)
+	}
+
+	// A newer active session replaces the completed one as the latest.
+	second := f.startSession(t, version.ID)
+	latest, err = f.service.LatestSession(ctx, version.ID)
+	if err != nil || latest == nil || latest.ID != second.ID || latest.Status != domain.SessionActive {
+		t.Fatalf("LatestSession new active = %+v/%v", latest, err)
+	}
+
+	// A same-start tie prefers the active session over a completed one, even
+	// when the completed row has the higher id.
+	tieVersion := f.seedVersionWithID(101, domain.VersionClarifying)
+	startedAt := testNow
+	f.repo.sessions[6100] = domain.ClarificationSession{
+		ID: 6100, VersionID: tieVersion.ID, Status: domain.SessionCompleted, StartedAt: startedAt,
+	}
+	f.repo.sessions[6101] = domain.ClarificationSession{
+		ID: 6101, VersionID: tieVersion.ID, Status: domain.SessionActive, StartedAt: startedAt,
+	}
+	latest, err = f.service.LatestSession(ctx, tieVersion.ID)
+	if err != nil || latest == nil || latest.ID != 6101 {
+		t.Fatalf("LatestSession same-start tie = %+v/%v, want the active 6101", latest, err)
+	}
+
+	// LatestSession keeps the version existence gate.
+	_, err = f.service.LatestSession(ctx, 999999)
+	var notFound *domain.Error
+	if !errors.As(err, &notFound) || notFound.Kind != domain.KindNotFound {
+		t.Fatalf("LatestSession missing version error = %v, want not_found", err)
 	}
 }
 

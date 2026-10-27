@@ -702,6 +702,16 @@ func (s *ClarificationService) CurrentSession(ctx context.Context, versionID int
 	return s.repo.GetActiveSession(ctx, versionID)
 }
 
+// LatestSession returns the version's newest session regardless of status (the
+// completed-session message history reads it after completion) or nil when the
+// version has no session at all. A missing version is a 404.
+func (s *ClarificationService) LatestSession(ctx context.Context, versionID int64) (*ClarificationSession, error) {
+	if _, err := s.ensureVersion(ctx, versionID); err != nil {
+		return nil, err
+	}
+	return s.repo.LatestSession(ctx, versionID)
+}
+
 // UpdateContextSummary writes the active session's context summary. It is the
 // service entry point of the agent's context.summary_update tool (spec §8.3):
 // the summary is bounded to 20 KiB and the successful write publishes

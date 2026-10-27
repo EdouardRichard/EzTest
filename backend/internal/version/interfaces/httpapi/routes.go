@@ -96,6 +96,7 @@ type ClarificationService interface {
 	StartAnalysis(ctx context.Context, versionID int64, actor int64) (versionapp.StartRunResult, error)
 	StartReconWithParts(ctx context.Context, versionID int64, extraParts []versionapp.AgentPart, actor int64) (versionapp.StartRunResult, error)
 	CurrentSession(ctx context.Context, versionID int64) (*versionapp.ClarificationSession, error)
+	LatestSession(ctx context.Context, versionID int64) (*versionapp.ClarificationSession, error)
 	Counts(ctx context.Context, versionID int64) (versionapp.ClarificationCounts, error)
 	ListQuestions(ctx context.Context, versionID int64, status string, requirementID *int64, page domain.Page) ([]versionapp.Question, bool, error)
 	UpsertQuestion(ctx context.Context, versionID int64, input versionapp.QuestionInput, actor int64, source string) (*versionapp.Question, error)
@@ -165,9 +166,15 @@ type HandlersDeps struct {
 
 	Clarification         ClarificationService
 	ClarificationMessages ClarificationMessagesReader
-	Events                EventSnapshotter
-	EventReader           eventinghttp.EventReader
-	EventSubscriber       eventinghttp.EventSubscriber
+	// AIReady probes the AI runtime (LLM configured, tools supported, capacity)
+	// before the four endpoints that start an agent run. A returned error is
+	// mapped to 503 unavailable/ai_unavailable (retryable, spec §8.6). Nil means
+	// "assume available": that keeps unit tests and partially wired processes
+	// working, and T16 wires the concrete probe.
+	AIReady         func(context.Context) error
+	Events          EventSnapshotter
+	EventReader     eventinghttp.EventReader
+	EventSubscriber eventinghttp.EventSubscriber
 	// SSEHeartbeat overrides the inherited 20s SSE heartbeat (tests use a short
 	// interval); zero means the eventing default.
 	SSEHeartbeat time.Duration
@@ -206,6 +213,7 @@ func NewHandlers(deps HandlersDeps) *Handlers {
 			messages:      deps.ClarificationMessages,
 			requirements:  deps.Requirements,
 			attachments:   deps.Attachments,
+			aiReady:       deps.AIReady,
 		}
 		handlers.Questions = &QuestionHandler{clarification: deps.Clarification}
 		handlers.Decisions = &DecisionHandler{clarification: deps.Clarification}

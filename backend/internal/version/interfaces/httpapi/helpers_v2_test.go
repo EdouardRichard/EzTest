@@ -195,13 +195,26 @@ func (f *fakeClarificationService) CompleteSession(_ context.Context, versionID,
 	return session, nil
 }
 
-// CurrentSession implements ClarificationService.
+// CurrentSession implements ClarificationService. Like the real service it
+// returns only an active session; a completed fixture is nil here.
 func (f *fakeClarificationService) CurrentSession(_ context.Context, versionID int64) (*versionapp.ClarificationSession, error) {
 	f.record("CurrentSession")
 	f.lastVersion = versionID
 	if f.currentErr != nil {
 		return nil, f.currentErr
 	}
+	session := f.sessions[versionID]
+	if session == nil || session.Status != domain.SessionActive {
+		return nil, nil
+	}
+	return session, nil
+}
+
+// LatestSession implements ClarificationService: the newest session of the
+// version regardless of status, so a completed conversation keeps its history.
+func (f *fakeClarificationService) LatestSession(_ context.Context, versionID int64) (*versionapp.ClarificationSession, error) {
+	f.record("LatestSession")
+	f.lastVersion = versionID
 	return f.sessions[versionID], nil
 }
 
@@ -520,6 +533,19 @@ func (f *fakeClarificationService) Decide(_ context.Context, versionID, decision
 	}
 	decision.UpdatedAt = testNow
 	return decision, nil
+}
+
+// fakeAIReady is the injectable AI runtime readiness probe. A nil err means the
+// runtime is available; any err must surface as the retryable 503 ai_unavailable.
+type fakeAIReady struct {
+	err   error
+	calls int
+}
+
+// Ready implements the HandlersDeps.AIReady probe.
+func (f *fakeAIReady) Ready(context.Context) error {
+	f.calls++
+	return f.err
 }
 
 // fakeClarificationMessages is an in-memory clarification message reader.
