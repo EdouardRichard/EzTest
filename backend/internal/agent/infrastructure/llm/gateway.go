@@ -104,8 +104,40 @@ func (c *caller) ChatStream(ctx context.Context, req agentapp.LLMRequest) (<-cha
 		return nil, wrapLLMError(err)
 	}
 	events := make(chan agentapp.LLMStreamEvent)
-	go forwardStream(ctx, upstream, events)
+	go forwardStream(ctx, upstream, events, wireToInternalNames(req.Tools))
 	return events, nil
+}
+
+// wireToolName maps an internal tool name to the provider-safe wire name.
+// OpenAI-compatible upstreams only accept ^[a-zA-Z0-9_-]+$ in a function name,
+// so the dotted internal contract (file.read, http.get, ...) is sent with
+// underscores. The internal names stay unchanged for the agent runtime.
+func wireToolName(name string) string {
+	return strings.ReplaceAll(name, ".", "_")
+}
+
+// wireToInternalNames builds the inbound mapping from the request's tools, so a
+// wire tool-call name is reported back to the agent caller under its internal
+// name. Nil when the request carries no tools.
+func wireToInternalNames(tools []agentapp.LLMTool) map[string]string {
+	if len(tools) == 0 {
+		return nil
+	}
+	names := make(map[string]string, len(tools))
+	for _, tool := range tools {
+		names[wireToolName(tool.Name)] = tool.Name
+	}
+	return names
+}
+
+// internalToolName maps a wire tool-call name back to the internal name. An
+// unknown wire name is returned unchanged so the executor can deny or fail it
+// through its normal path.
+func internalToolName(wireToInternal map[string]string, name string) string {
+	if internal, ok := wireToInternal[name]; ok {
+		return internal
+	}
+	return name
 }
 
 // toChatRequest maps the agent request onto the llm gateway request. Stream is
@@ -133,7 +165,7 @@ func toChatRequest(req agentapp.LLMRequest) llmapp.ChatRequest {
 			for _, call := range message.ToolCalls {
 				toolCalls = append(toolCalls, llmapp.ToolCall{
 					ID:        call.ID,
-					Name:      call.Name,
+					Name:      wireToolName(call.Name),
 					Arguments: call.Arguments,
 				})
 			}
@@ -152,7 +184,7 @@ func toChatRequest(req agentapp.LLMRequest) llmapp.ChatRequest {
 		tools = make([]llmapp.ToolSpec, 0, len(req.Tools))
 		for _, tool := range req.Tools {
 			tools = append(tools, llmapp.ToolSpec{
-				Name:        tool.Name,
+				Name:        wireToolName(tool.Name),
 				Description: tool.Description,
 				Parameters:  tool.Parameters,
 			})
@@ -170,16 +202,17 @@ func toChatRequest(req agentapp.LLMRequest) llmapp.ChatRequest {
 	}
 }
 
-// fromStreamEvent maps one upstream stream event to the agent port. A stream
-// error is wrapped so its llm_* code survives.
-func fromStreamEvent(event llmapp.StreamEvent) agentapp.LLMStreamEvent {
+// fromStreamEvent maps one upstream stream event to the agent port. Wire tool
+// names are mapped back to their internal names; a stream error is wrapped so
+// its llm_* code survives.
+func fromStreamEvent(event llmapp.StreamEvent, wireToInternal map[string]string) agentapp.LLMStreamEvent {
 	var toolCalls []agentdomain.ToolCall
 	if len(event.ToolCalls) > 0 {
 		toolCalls = make([]agentdomain.ToolCall, 0, len(event.ToolCalls))
 		for _, call := range event.ToolCalls {
 			toolCalls = append(toolCalls, agentdomain.ToolCall{
 				ID:        call.ID,
-				Name:      call.Name,
+				Name:      internalToolName(wireToInternal, call.Name),
 				Arguments: call.Arguments,
 			})
 		}
@@ -202,8 +235,9 @@ func fromStreamEvent(event llmapp.StreamEvent) agentapp.LLMStreamEvent {
 
 // forwardStream forwards mapped events until the upstream channel closes or the
 // run context is cancelled, synthesizing the terminal error when the upstream
-// ended without one.
-func forwardStream(ctx context.Context, source <-chan llmapp.StreamEvent, out chan<- agentapp.LLMStreamEvent) {
+// ended without one. wireToInternal maps inbound wire tool names back to the
+// internal contract.
+func forwardStream(ctx context.Context, source <-chan llmapp.StreamEvent, out chan<- agentapp.LLMStreamEvent, wireToInternal map[string]string) {
 	defer close(out)
 	terminal := false
 	for {
@@ -225,7 +259,7 @@ func forwardStream(ctx context.Context, source <-chan llmapp.StreamEvent, out ch
 				terminal = true
 			}
 			select {
-			case out <- fromStreamEvent(event):
+			case out <- fromStreamEvent(event, wireToInternal):
 			case <-ctx.Done():
 				return
 			}

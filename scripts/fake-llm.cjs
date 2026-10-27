@@ -218,7 +218,7 @@ function diagnosticMessage() {
   return {
     content: null,
     reasoning_content: REASONING_TEXT,
-    tool_calls: toolCallPayload("file.read", README_ARGUMENTS),
+    tool_calls: toolCallPayload("file_read", README_ARGUMENTS),
   };
 }
 

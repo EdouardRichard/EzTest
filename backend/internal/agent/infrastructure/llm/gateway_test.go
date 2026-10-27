@@ -255,14 +255,14 @@ func TestChatStreamMapsRequest(t *testing.T) {
 	if assistant.ReasoningContent != "I should echo" || len(assistant.ToolCalls) != 1 {
 		t.Fatalf("assistant message=%+v", assistant)
 	}
-	if assistant.ToolCalls[0].ID != "call_1" || assistant.ToolCalls[0].Name != "test.echo" ||
+	if assistant.ToolCalls[0].ID != "call_1" || assistant.ToolCalls[0].Name != "test_echo" ||
 		assistant.ToolCalls[0].Arguments != `{"text":"hello"}` {
 		t.Fatalf("assistant tool call=%+v", assistant.ToolCalls[0])
 	}
 	if got.Messages[3].ToolCallID != "call_1" {
 		t.Fatalf("tool message=%+v", got.Messages[3])
 	}
-	if len(got.Tools) != 1 || got.Tools[0].Name != "test.echo" ||
+	if len(got.Tools) != 1 || got.Tools[0].Name != "test_echo" ||
 		got.Tools[0].Description != "Echo text" ||
 		string(got.Tools[0].Parameters) != `{"type":"object"}` {
 		t.Fatalf("tools=%+v", got.Tools)
@@ -310,6 +310,119 @@ func TestChatStreamMapsEvents(t *testing.T) {
 	wantUsage := agentdomain.Usage{PromptTokens: 10, CompletionTokens: 5, ReasoningTokens: 3, TotalTokens: 18}
 	if done.Usage != wantUsage {
 		t.Fatalf("done usage=%+v want %+v", done.Usage, wantUsage)
+	}
+}
+
+func TestChatStreamSendsWireToolNames(t *testing.T) {
+	client := &fakeLLMClient{events: []llmapp.StreamEvent{{Done: true}}}
+	caller, err := prepare(t, &fakeConfigSource{cfg: chatConfig()}, client, "")
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	stream, err := caller.ChatStream(context.Background(), agentapp.LLMRequest{
+		Model: "deepseek-flash",
+		Tools: []agentapp.LLMTool{
+			{Name: "file.read", Description: "Read a file"},
+			{Name: "http.get", Description: "Fetch a URL"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ChatStream: %v", err)
+	}
+	drain(t, stream)
+
+	if len(client.requests) != 1 {
+		t.Fatalf("upstream requests=%d want 1", len(client.requests))
+	}
+	tools := client.requests[0].Tools
+	if len(tools) != 2 || tools[0].Name != "file_read" || tools[1].Name != "http_get" {
+		t.Fatalf("wire tool names=%+v want file_read,http_get", tools)
+	}
+}
+
+func TestChatStreamSendsWireToolCallHistoryNames(t *testing.T) {
+	client := &fakeLLMClient{events: []llmapp.StreamEvent{{Done: true}}}
+	caller, err := prepare(t, &fakeConfigSource{cfg: chatConfig()}, client, "")
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	stream, err := caller.ChatStream(context.Background(), agentapp.LLMRequest{
+		Model: "deepseek-flash",
+		Messages: []agentapp.LLMMessage{
+			{
+				Role: "assistant",
+				ToolCalls: []agentdomain.ToolCall{{
+					ID: "call_1", Name: "file.read", Arguments: `{"path":"README.md"}`,
+				}},
+			},
+			{Role: "tool", Parts: []agentdomain.Part{{Type: "text", Text: "# EzTest"}}, ToolCallID: "call_1"},
+		},
+		Tools: []agentapp.LLMTool{{Name: "file.read"}},
+	})
+	if err != nil {
+		t.Fatalf("ChatStream: %v", err)
+	}
+	drain(t, stream)
+
+	if len(client.requests) != 1 {
+		t.Fatalf("upstream requests=%d want 1", len(client.requests))
+	}
+	assistant := client.requests[0].Messages[0]
+	if len(assistant.ToolCalls) != 1 || assistant.ToolCalls[0].Name != "file_read" {
+		t.Fatalf("wire assistant tool calls=%+v want file_read", assistant.ToolCalls)
+	}
+}
+
+func TestChatStreamMapsWireToolCallNamesBack(t *testing.T) {
+	client := &fakeLLMClient{events: []llmapp.StreamEvent{{
+		Done:         true,
+		FinishReason: "tool_calls",
+		ToolCalls:    []llmapp.ToolCall{{ID: "call_1", Name: "file_read", Arguments: `{"path":"README.md"}`}},
+	}}}
+	caller, err := prepare(t, &fakeConfigSource{cfg: chatConfig()}, client, "")
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	stream, err := caller.ChatStream(context.Background(), agentapp.LLMRequest{
+		Model: "deepseek-flash",
+		Tools: []agentapp.LLMTool{{Name: "file.read"}, {Name: "http.get"}},
+	})
+	if err != nil {
+		t.Fatalf("ChatStream: %v", err)
+	}
+	events := drain(t, stream)
+	if len(events) != 1 || !events[0].Done {
+		t.Fatalf("events=%+v want one done event", events)
+	}
+	if len(events[0].ToolCalls) != 1 || events[0].ToolCalls[0] != (agentdomain.ToolCall{
+		ID: "call_1", Name: "file.read", Arguments: `{"path":"README.md"}`,
+	}) {
+		t.Fatalf("internal tool calls=%+v want file.read", events[0].ToolCalls)
+	}
+}
+
+func TestChatStreamLeavesUnknownWireToolCallNamesUnchanged(t *testing.T) {
+	client := &fakeLLMClient{events: []llmapp.StreamEvent{{
+		Done:      true,
+		ToolCalls: []llmapp.ToolCall{{ID: "call_1", Name: "unknown_tool", Arguments: `{}`}},
+	}}}
+	caller, err := prepare(t, &fakeConfigSource{cfg: chatConfig()}, client, "")
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	stream, err := caller.ChatStream(context.Background(), agentapp.LLMRequest{
+		Model: "deepseek-flash",
+		Tools: []agentapp.LLMTool{{Name: "file.read"}},
+	})
+	if err != nil {
+		t.Fatalf("ChatStream: %v", err)
+	}
+	events := drain(t, stream)
+	if len(events) != 1 || len(events[0].ToolCalls) != 1 {
+		t.Fatalf("events=%+v want one tool call", events)
+	}
+	if events[0].ToolCalls[0].Name != "unknown_tool" {
+		t.Fatalf("unknown wire name=%q want unchanged", events[0].ToolCalls[0].Name)
 	}
 }
 
