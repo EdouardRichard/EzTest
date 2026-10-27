@@ -86,8 +86,18 @@ function describeActionError(error: unknown): string {
  * `useAgentSession`.
  */
 export function SessionPane({ sessionId, session }: SessionPaneProps) {
-  const { activities, status, loading, error, running, hasMore, loadEarlier, refresh, getDetail } =
-    useAgentSession(sessionId, session)
+  const {
+    activities,
+    status,
+    loading,
+    error,
+    running,
+    hasMore,
+    loadEarlier,
+    refresh,
+    reconnect,
+    getDetail,
+  } = useAgentSession(sessionId, session)
   const [sending, setSending] = useState(false)
   const [stopping, setStopping] = useState(false)
   const [actionError, setActionError] = useState("")
@@ -163,16 +173,32 @@ export function SessionPane({ sessionId, session }: SessionPaneProps) {
           <StatusBadge variant={connectionMeta.variant} dot={false}>
             {connectionMeta.label}
           </StatusBadge>
+          {status === "closed" && !loading ? (
+            <button
+              type="button"
+              onClick={reconnect}
+              className="rounded-lg border border-border bg-card px-2.5 py-1 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              重新连接
+            </button>
+          ) : null}
         </div>
       </header>
 
       {error ? (
-        <p
+        <div
           role="alert"
-          className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+          className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive"
         >
-          {error}
-        </p>
+          <p className="min-w-0 break-words">{error}</p>
+          <button
+            type="button"
+            onClick={reconnect}
+            className="rounded-lg border border-destructive/40 px-2.5 py-1 text-xs font-medium text-destructive transition-colors hover:bg-destructive/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            重试
+          </button>
+        </div>
       ) : null}
 
       <Transcript

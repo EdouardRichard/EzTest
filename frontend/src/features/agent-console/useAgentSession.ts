@@ -7,6 +7,7 @@ import { getToken } from "@/lib/auth-storage"
 import { connectSSE, type SSEEvent, type SSEStatus } from "@/lib/sse-client"
 
 import {
+  type ActivitiesPage,
   type AgentEvent,
   type AgentMessageDetail,
   type AgentSession,
@@ -17,6 +18,17 @@ import {
 /** Snapshot page size from the design (§11.3): the last 50 persisted activities. */
 const SNAPSHOT_LIMIT = 50
 
+type SnapshotResult = {
+  items: AgentEvent[]
+  cursor: number
+  hasMore: boolean
+}
+
+/** The snapshot of a channel that has no persisted events yet (the API 404s). */
+function emptySnapshot(): SnapshotResult {
+  return { items: [], cursor: 0, hasMore: false }
+}
+
 export type AgentSessionState = {
   activities: AgentEvent[]
   status: SSEStatus
@@ -26,13 +38,8 @@ export type AgentSessionState = {
   hasMore: boolean
   loadEarlier: () => Promise<void>
   refresh: () => Promise<void>
+  reconnect: () => void
   getDetail: (messageId: number) => Promise<AgentMessageDetail>
-}
-
-type SnapshotResult = {
-  items: AgentEvent[]
-  cursor: number
-  hasMore: boolean
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -129,7 +136,10 @@ function describeError(error: unknown): string {
  * SSE channel with `lastEventId=snapshot_cursor`. Activities are deduped and
  * sorted by seq; `run_started`/`run_finished` drive `running`, and a finished
  * run triggers a snapshot refresh so a missed event cannot leave the view
- * stale. The stream is stopped on session change and unmount.
+ * stale. A snapshot 404 means the channel has no persisted events yet, which is
+ * the normal state of a new session. The stream is stopped on session change
+ * and unmount; `reconnect` re-opens it after a `closed` status. `generationRef`
+ * fences every callback so a stopped session can never write into a new one.
  */
 export function useAgentSession(
   sessionId: number | null,
@@ -145,25 +155,41 @@ export function useAgentSession(
   const sessionIdRef = useRef<number | null>(sessionId)
   const activitiesRef = useRef<AgentEvent[]>(activities)
   const stopRef = useRef<(() => void) | null>(null)
+  const generationRef = useRef(0)
   const detailsRef = useRef(new Map<number, AgentMessageDetail>())
-  const sessionRunning = session?.running ?? false
+
+  // Mirror the parent's `running` flag on every render. The stream effect only
+  // reads it when the session identity changes: a later parent refresh that
+  // flips `session.running` must not tear down the live stream.
+  const latestSessionRunningRef = useRef(session?.running ?? false)
+  useEffect(() => {
+    latestSessionRunningRef.current = session?.running ?? false
+  })
 
   useEffect(() => {
     activitiesRef.current = activities
   }, [activities])
 
   const loadSnapshot = useCallback(
-    async (id: number, mode: "merge" | "replace"): Promise<SnapshotResult> => {
-      const page = await fetchActivities(id, { limit: SNAPSHOT_LIMIT })
+    async (id: number, generation: number, mode: "merge" | "replace"): Promise<SnapshotResult> => {
+      let page: ActivitiesPage
+      try {
+        page = await fetchActivities(id, { limit: SNAPSHOT_LIMIT })
+      } catch (caught) {
+        // The snapshot endpoint 404s while a channel still has no events. That
+        // is the empty state of a brand-new session, not a fatal error.
+        if (caught instanceof ApiError && caught.status === 404) return emptySnapshot()
+        throw caught
+      }
       const items = normalizeActivities(page.items)
       const result: SnapshotResult = {
         items,
         cursor: typeof page.snapshot_cursor === "number" ? page.snapshot_cursor : 0,
         hasMore: Boolean(page.has_more),
       }
-      // A session change while the request was in flight must not write into
-      // the new session's state.
-      if (sessionIdRef.current !== id) return result
+      // A session change / reconnect while the request was in flight must not
+      // write into the new connection's state.
+      if (sessionIdRef.current !== id || generationRef.current !== generation) return result
       setHasMore(result.hasMore)
       setActivities((previous) => (mode === "replace" ? items : mergeActivities(previous, items)))
       return result
@@ -171,39 +197,103 @@ export function useAgentSession(
     [],
   )
 
-  const reload = useCallback(
-    async (mode: "merge" | "replace"): Promise<void> => {
-      const id = sessionIdRef.current
-      if (id === null) return
+  /**
+   * Reconciles the snapshot: merges/replaces activities, derives `running`, and
+   * clears a previous error because this fetch succeeded.
+   */
+  const syncSnapshot = useCallback(
+    async (id: number, generation: number, mode: "merge" | "replace"): Promise<void> => {
       try {
-        const snapshot = await loadSnapshot(id, mode)
-        if (sessionIdRef.current !== id) return
+        const snapshot = await loadSnapshot(id, generation, mode)
+        if (sessionIdRef.current !== id || generationRef.current !== generation) return
+        setError("")
         const nextRunning = runningFromActivities(snapshot.items)
         if (nextRunning !== undefined) setRunning(nextRunning)
       } catch (caught) {
-        if (sessionIdRef.current === id) setError(describeError(caught))
+        if (sessionIdRef.current !== id || generationRef.current !== generation) return
+        setError(describeError(caught))
       }
     },
     [loadSnapshot],
   )
 
+  const connectSession = useCallback(
+    async (id: number, token: string, mode: "merge" | "replace"): Promise<void> => {
+      const generation = generationRef.current
+      let snapshot = emptySnapshot()
+      let snapshotFailed = false
+      try {
+        snapshot = await loadSnapshot(id, generation, mode)
+      } catch (caught) {
+        if (sessionIdRef.current !== id || generationRef.current !== generation) return
+        // A failed snapshot must not block live updates: surface the error but
+        // open the stream anyway, so the running run can still resolve. The
+        // retry action re-fetches the snapshot.
+        snapshotFailed = true
+        setError(describeError(caught))
+      }
+      if (sessionIdRef.current !== id || generationRef.current !== generation) return
+      setLoading(false)
+      if (!snapshotFailed) {
+        setError("")
+        const nextRunning = runningFromActivities(snapshot.items)
+        if (nextRunning !== undefined) setRunning(nextRunning)
+      }
+
+      stopRef.current = connectSSE({
+        url: resolveApiUrl(`/api/stream?channel=${encodeURIComponent(`agent:${id}`)}`),
+        token,
+        lastEventId: snapshot.cursor,
+        onEvent: (event) => {
+          if (generationRef.current !== generation) return
+          const activity = parseActivity(event)
+          if (!activity) return
+          setActivities((previous) => mergeActivities(previous, [activity]))
+          const kind = activityKind(activity)
+          if (kind === "run_started") {
+            setRunning(true)
+          } else if (kind === "run_finished") {
+            setRunning(false)
+            // Reconcile with the persisted snapshot in case an event was missed.
+            void syncSnapshot(id, generation, "merge")
+          }
+        },
+        onStatus: (next) => {
+          if (generationRef.current === generation) setStatus(next)
+        },
+        onReset: () => {
+          if (generationRef.current !== generation) return
+          setActivities([])
+          setHasMore(false)
+          void syncSnapshot(id, generation, "replace")
+        },
+      })
+      // The session may have changed while connectSSE was being set up.
+      if (sessionIdRef.current !== id || generationRef.current !== generation) {
+        stopRef.current()
+        stopRef.current = null
+      }
+    },
+    [loadSnapshot, syncSnapshot],
+  )
+
   useEffect(() => {
     sessionIdRef.current = sessionId
+    generationRef.current += 1
+    stopRef.current?.()
+    stopRef.current = null
     detailsRef.current.clear()
     setError("")
     setActivities([])
     setHasMore(false)
-    setRunning(sessionRunning)
+    setRunning(latestSessionRunningRef.current)
 
     if (sessionId === null) {
       setLoading(false)
       setStatus("closed")
-      stopRef.current?.()
-      stopRef.current = null
       return
     }
 
-    const id = sessionId
     const token = getToken()
     setLoading(true)
     setStatus("connecting")
@@ -214,93 +304,66 @@ export function useAgentSession(
       setError("当前会话没有访问令牌，请重新登录。")
       return
     }
-    const bearer = token
 
-    let disposed = false
-
-    async function reloadAfterEvent(mode: "merge" | "replace"): Promise<void> {
-      try {
-        const snapshot = await loadSnapshot(id, mode)
-        if (disposed) return
-        const nextRunning = runningFromActivities(snapshot.items)
-        if (nextRunning !== undefined) setRunning(nextRunning)
-      } catch (caught) {
-        if (!disposed) setError(describeError(caught))
-      }
-    }
-
-    function handleEvent(event: SSEEvent): void {
-      if (disposed) return
-      const activity = parseActivity(event)
-      if (!activity) return
-      setActivities((previous) => mergeActivities(previous, [activity]))
-      const kind = activityKind(activity)
-      if (kind === "run_started") {
-        setRunning(true)
-      } else if (kind === "run_finished") {
-        setRunning(false)
-        // Reconcile with the persisted snapshot in case an event was missed.
-        void reloadAfterEvent("merge")
-      }
-    }
-
-    async function connect(): Promise<void> {
-      try {
-        const snapshot = await loadSnapshot(id, "replace")
-        if (disposed) return
-        const nextRunning = runningFromActivities(snapshot.items)
-        setRunning(nextRunning === undefined ? sessionRunning : nextRunning)
-        setLoading(false)
-        stopRef.current = connectSSE({
-          url: resolveApiUrl(`/api/stream?channel=${encodeURIComponent(`agent:${id}`)}`),
-          token: bearer,
-          lastEventId: snapshot.cursor,
-          onEvent: handleEvent,
-          onStatus: (next) => {
-            if (!disposed) setStatus(next)
-          },
-          onReset: () => {
-            if (disposed) return
-            setActivities([])
-            setHasMore(false)
-            void reloadAfterEvent("replace")
-          },
-        })
-      } catch (caught) {
-        if (disposed) return
-        setLoading(false)
-        setStatus("closed")
-        setError(describeError(caught))
-      }
-    }
-
-    void connect()
+    void connectSession(sessionId, token, "replace")
 
     return () => {
-      disposed = true
+      generationRef.current += 1
       stopRef.current?.()
       stopRef.current = null
     }
-  }, [sessionId, sessionRunning, loadSnapshot])
+  }, [sessionId, connectSession])
+
+  /**
+   * Manual recovery action: tears down the current stream, refreshes the
+   * snapshot (keeping the rendered transcript), and reconnects. Used by the
+   * `已断开` reconnect button and the initial-load retry.
+   */
+  const reconnect = useCallback((): void => {
+    const id = sessionIdRef.current
+    if (id === null) return
+    const token = getToken()
+    if (!token) {
+      setLoading(false)
+      setStatus("closed")
+      setError("当前会话没有访问令牌，请重新登录。")
+      return
+    }
+    // Invalidate the old stream before stopping it so its late callbacks cannot
+    // overwrite the new connection's state.
+    generationRef.current += 1
+    stopRef.current?.()
+    stopRef.current = null
+    setError("")
+    setStatus("connecting")
+    setLoading(activitiesRef.current.length === 0)
+    void connectSession(id, token, "merge")
+  }, [connectSession])
 
   const loadEarlier = useCallback(async (): Promise<void> => {
     const id = sessionIdRef.current
     const first = activitiesRef.current[0]
     if (id === null || first === undefined) return
+    const generation = generationRef.current
     try {
       const page = await fetchActivities(id, { before_seq: first.seq, limit: SNAPSHOT_LIMIT })
-      if (sessionIdRef.current !== id) return
+      if (sessionIdRef.current !== id || generationRef.current !== generation) return
       const items = normalizeActivities(page.items)
       setActivities((previous) => mergeActivities(previous, items))
       setHasMore(Boolean(page.has_more))
+      setError("")
     } catch (caught) {
-      if (sessionIdRef.current === id) setError(describeError(caught))
+      if (sessionIdRef.current === id && generationRef.current === generation) {
+        setError(describeError(caught))
+      }
     }
   }, [])
 
   const refresh = useCallback(async (): Promise<void> => {
-    await reload("merge")
-  }, [reload])
+    const id = sessionIdRef.current
+    if (id === null) return
+    await syncSnapshot(id, generationRef.current, "merge")
+  }, [syncSnapshot])
 
   const getDetail = useCallback(async (messageId: number): Promise<AgentMessageDetail> => {
     const cached = detailsRef.current.get(messageId)
@@ -321,6 +384,7 @@ export function useAgentSession(
     hasMore,
     loadEarlier,
     refresh,
+    reconnect,
     getDetail,
   }
 }
