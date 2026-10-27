@@ -2,6 +2,7 @@ package config
 
 import (
 	"log/slog"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -53,7 +54,7 @@ func TestLoadRemainingDefaults(t *testing.T) {
 	if cfg.StorageDir != ".data/objects" {
 		t.Fatalf("StorageDir=%q", cfg.StorageDir)
 	}
-	if cfg.OpenAPIPath != "docs/openapi/p0.yaml" {
+	if cfg.OpenAPIPath != "docs/openapi/api.yaml" {
 		t.Fatalf("OpenAPIPath=%q", cfg.OpenAPIPath)
 	}
 	if cfg.LogLevel != slog.LevelInfo {
@@ -165,6 +166,89 @@ func TestLoadRejectsInvalidLogLevel(t *testing.T) {
 	_, err := Load(func(k string) string { return env[k] })
 	if err == nil || !strings.Contains(err.Error(), "EZTEST_LOG_LEVEL") {
 		t.Fatalf("expected EZTEST_LOG_LEVEL error, got %v", err)
+	}
+}
+
+// TestLoadAgentDefaults pins the Agent runtime defaults from design spec §4.1:
+// no file root, localhost-only HTTP allowlist, a 10 s tool budget, four
+// concurrent runs and the renamed OpenAPI document.
+func TestLoadAgentDefaults(t *testing.T) {
+	env := validEnv()
+	cfg, err := Load(func(k string) string { return env[k] })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AgentFileRoot != "" {
+		t.Fatalf("AgentFileRoot=%q want the empty default (file tools disabled)", cfg.AgentFileRoot)
+	}
+	if want := []string{"127.0.0.1", "localhost"}; !reflect.DeepEqual(cfg.AgentHTTPAllowlist, want) {
+		t.Fatalf("AgentHTTPAllowlist=%v want %v", cfg.AgentHTTPAllowlist, want)
+	}
+	if cfg.AgentToolTimeoutMS != 10000 {
+		t.Fatalf("AgentToolTimeoutMS=%d want 10000", cfg.AgentToolTimeoutMS)
+	}
+	if cfg.AgentMaxConcurrentRuns != 4 {
+		t.Fatalf("AgentMaxConcurrentRuns=%d want 4", cfg.AgentMaxConcurrentRuns)
+	}
+	if cfg.OpenAPIPath != "docs/openapi/api.yaml" {
+		t.Fatalf("OpenAPIPath=%q want docs/openapi/api.yaml", cfg.OpenAPIPath)
+	}
+}
+
+// TestLoadAgentOverrides proves the Agent environment variables are trimmed and
+// parsed, including a comma-separated HTTP allowlist with blank entries.
+func TestLoadAgentOverrides(t *testing.T) {
+	env := validEnv()
+	env["EZTEST_AGENT_FILE_ROOT"] = "  D:/Project_new/EzTest  "
+	env["EZTEST_AGENT_HTTP_ALLOWLIST"] = " 10.0.0.1 , api.internal:8443 ,, "
+	env["EZTEST_AGENT_TOOL_TIMEOUT_MS"] = "15000"
+	env["EZTEST_AGENT_MAX_CONCURRENT_RUNS"] = "8"
+	cfg, err := Load(func(k string) string { return env[k] })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AgentFileRoot != "D:/Project_new/EzTest" {
+		t.Fatalf("AgentFileRoot=%q", cfg.AgentFileRoot)
+	}
+	if want := []string{"10.0.0.1", "api.internal:8443"}; !reflect.DeepEqual(cfg.AgentHTTPAllowlist, want) {
+		t.Fatalf("AgentHTTPAllowlist=%v want %v", cfg.AgentHTTPAllowlist, want)
+	}
+	if cfg.AgentToolTimeoutMS != 15000 {
+		t.Fatalf("AgentToolTimeoutMS=%d", cfg.AgentToolTimeoutMS)
+	}
+	if cfg.AgentMaxConcurrentRuns != 8 {
+		t.Fatalf("AgentMaxConcurrentRuns=%d", cfg.AgentMaxConcurrentRuns)
+	}
+}
+
+// TestLoadRejectsInvalidAgentValues proves every Agent bound is validated at
+// startup with an error naming the offending environment variable.
+func TestLoadRejectsInvalidAgentValues(t *testing.T) {
+	cases := []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{"tool timeout too low", "EZTEST_AGENT_TOOL_TIMEOUT_MS", "10"},
+		{"tool timeout too high", "EZTEST_AGENT_TOOL_TIMEOUT_MS", "60001"},
+		{"tool timeout not a number", "EZTEST_AGENT_TOOL_TIMEOUT_MS", "soon"},
+		{"max concurrent runs zero", "EZTEST_AGENT_MAX_CONCURRENT_RUNS", "0"},
+		{"max concurrent runs too high", "EZTEST_AGENT_MAX_CONCURRENT_RUNS", "33"},
+		{"max concurrent runs not a number", "EZTEST_AGENT_MAX_CONCURRENT_RUNS", "many"},
+		{"allowlist without hosts", "EZTEST_AGENT_HTTP_ALLOWLIST", " , "},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := validEnv()
+			env[tc.key] = tc.value
+			_, err := Load(func(k string) string { return env[k] })
+			if err == nil {
+				t.Fatalf("Load accepted %s=%q", tc.key, tc.value)
+			}
+			if !strings.Contains(err.Error(), tc.key) {
+				t.Fatalf("error %q does not name %s", err, tc.key)
+			}
+		})
 	}
 }
 

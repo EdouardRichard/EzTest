@@ -13,6 +13,13 @@ import (
 	"syscall"
 	"time"
 
+	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
+	agentdomain "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
+	agentaudit "github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/audit"
+	agentevent "github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/eventing"
+	agentllm "github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/llm"
+	agentpostgres "github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/postgres"
+	agenttools "github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/tools"
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	auditpostgres "github.com/EdouardRichard/EzTest/backend/internal/audit/infrastructure/postgres"
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
@@ -43,6 +50,13 @@ const (
 	// shutdown signal. Open SSE connections are canceled through BaseContext
 	// before Shutdown is called, so only genuinely stuck handlers hit it.
 	shutdownTimeout = 10 * time.Second
+	// agentShutdownTimeout is how long the Agent run service gets to cancel and
+	// finish the in-flight runs before the HTTP server starts draining.
+	agentShutdownTimeout = 5 * time.Second
+	// agentHardTimeout is the fallback hard-stop budget the run service adds to
+	// a profile's run_seconds when the profile leaves hard_timeout_seconds
+	// unset (design spec §4.1).
+	agentHardTimeout = 60 * time.Second
 	// bcryptCost is the documented password hashing cost.
 	bcryptCost = 12
 )
@@ -130,6 +144,74 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		storagepostgres.NewMetadataRepository(database.Pool),
 		auditor,
 	)
+
+	// Agent runtime: the four postgres repositories, the cross-context adapters
+	// (LLM gateway, event sink, audit sink) and the tool registry. The same
+	// registry instance backs both the run service and the HTTP tool catalog, so
+	// the profile allowlist validation and the live tool list never disagree.
+	agentProfiles := agentpostgres.NewProfileRepository(database.Pool)
+	agentSessions := agentpostgres.NewSessionRepository(database.Pool)
+	agentRuns := agentpostgres.NewRunRepository(database.Pool)
+	agentMessages := agentpostgres.NewMessageRepository(database.Pool)
+
+	agentAuditSink := agentaudit.NewSink(auditor)
+	agentEventSink := agentevent.NewSink(eventService)
+	agentGateway := agentllm.NewGateway(llmConfigs, llmClientFactory)
+
+	// http.get keeps its documented 5 s request bound (a zero duration selects
+	// it); the tool executor applies the global EZTEST_AGENT_TOOL_TIMEOUT_MS
+	// budget on top. The file tools are only registered when a read-only root is
+	// configured: an invalid root is a startup failure, never a silent skip.
+	agentToolList := []agentdomain.Tool{
+		agenttools.NewTestEcho(),
+		agenttools.NewTestFail(),
+		agenttools.NewHTTPGet(cfg.AgentHTTPAllowlist, 0),
+	}
+	if cfg.AgentFileRoot != "" {
+		fileTools, err := agenttools.NewFileTools(cfg.AgentFileRoot)
+		if err != nil {
+			return fmt.Errorf("configure agent file tools (EZTEST_AGENT_FILE_ROOT=%q): %w", cfg.AgentFileRoot, err)
+		}
+		agentToolList = append(agentToolList, fileTools...)
+	}
+	agentRegistry := agentapp.NewToolRegistry(agentToolList...)
+	agentExecutor := agentapp.NewToolExecutor(
+		agentRegistry, agentAuditSink, time.Duration(cfg.AgentToolTimeoutMS)*time.Millisecond)
+	runService := agentapp.NewRunService(agentapp.RunServiceDeps{
+		Profiles: agentProfiles,
+		Sessions: agentSessions,
+		Runs:     agentRuns,
+		Messages: agentMessages,
+
+		LLM:      agentGateway,
+		Tools:    agentRegistry,
+		Executor: agentExecutor,
+
+		Events: agentEventSink,
+		Audit:  agentAuditSink,
+
+		MaxConcurrentRuns: cfg.AgentMaxConcurrentRuns,
+		HardTimeout:       agentHardTimeout,
+	})
+	agentProfileService := agentapp.NewProfileService(agentProfiles, agentAuditSink)
+	agentSessionService := agentapp.NewSessionService(
+		agentProfiles, agentSessions, agentRuns, agentMessages, runService, agentAuditSink)
+	agentToolCatalog := agentapp.NewToolCatalog(agentRegistry)
+
+	// Startup seeds and cleanup are idempotent: the builtin profile is created
+	// only when its key is absent (an existing, possibly edited row is never
+	// overwritten) and runs left running by a previous process are marked
+	// interrupted.
+	if created, err := agentProfiles.EnsureBuiltin(startupCtx, agentdomain.BuiltinProfile()); err != nil {
+		return fmt.Errorf("seed builtin agent profile: %w", err)
+	} else if created {
+		logger.Info("seeded builtin agent profile", "key", agentdomain.BuiltinProfileKey)
+	}
+	if recovered, err := runService.RecoverInterrupted(startupCtx); err != nil {
+		return fmt.Errorf("recover interrupted agent runs: %w", err)
+	} else if recovered > 0 {
+		logger.Info("marked interrupted agent runs", "count", recovered)
+	}
 	cancelStartup()
 
 	// Every request context descends from baseCtx. Canceling it on shutdown
@@ -151,6 +233,12 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 			LLMConfigs:       llmConfigs,
 			LLMClientFactory: llmClientFactory,
 			Storage:          storageService,
+			Agent: &server.AgentDependencies{
+				Profiles: agentProfileService,
+				Sessions: agentSessionService,
+				Runs:     runService,
+				Tools:    agentToolCatalog,
+			},
 		}),
 		BaseContext:       baseContext(baseCtx),
 		ReadHeaderTimeout: 10 * time.Second,
@@ -178,6 +266,12 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		// r.Context().Done() and would otherwise keep Shutdown waiting until
 		// the grace period expires.
 		cancelBase()
+		// Cancel and drain the Agent runs before the HTTP server: their runners
+		// write terminal rows and activity events with a detached context, so a
+		// short bounded wait lets them finish cleanly.
+		agentShutdownCtx, cancelAgent := context.WithTimeout(context.Background(), agentShutdownTimeout)
+		runService.Shutdown(agentShutdownCtx)
+		cancelAgent()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
