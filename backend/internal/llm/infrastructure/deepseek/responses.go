@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	llmapp "github.com/EdouardRichard/EzTest/backend/internal/llm/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
 // responses wire shapes (design §8.4).
@@ -88,7 +89,12 @@ func (c *client) responsesPayload(req llmapp.ChatRequest, stream bool) responses
 }
 
 // Chat sends a non-streaming responses request and parses its text and usage.
+// Tools are rejected: P1's agent runtime only supports tool calling on chat
+// completions (design §7.3).
 func (c *client) responsesChat(ctx context.Context, req llmapp.ChatRequest) (llmapp.ChatResponse, error) {
+	if len(req.Tools) > 0 {
+		return llmapp.ChatResponse{}, toolsUnsupportedError()
+	}
 	resp, err := c.do(ctx, http.MethodPost, "/responses", c.responsesPayload(req, false))
 	if err != nil {
 		return llmapp.ChatResponse{}, err
@@ -111,8 +117,12 @@ func (c *client) responsesChat(ctx context.Context, req llmapp.ChatRequest) (llm
 	return llmapp.ChatResponse{Text: text, Usage: usage}, nil
 }
 
-// responsesChatStream sends a streaming responses request.
+// responsesChatStream sends a streaming responses request. Tools are rejected
+// before the upstream is called (design §7.3).
 func (c *client) responsesChatStream(ctx context.Context, req llmapp.ChatRequest) (<-chan llmapp.StreamEvent, error) {
+	if len(req.Tools) > 0 {
+		return nil, toolsUnsupportedError()
+	}
 	resp, err := c.do(ctx, http.MethodPost, "/responses", c.responsesPayload(req, true))
 	if err != nil {
 		return nil, err
@@ -120,6 +130,13 @@ func (c *client) responsesChatStream(ctx context.Context, req llmapp.ChatRequest
 	events := make(chan llmapp.StreamEvent)
 	go streamResponses(ctx, resp.Body, events)
 	return events, nil
+}
+
+// toolsUnsupportedError is the typed rejection for a responses request carrying
+// tools. P1 deliberately supports tool calling on chat completions only, so the
+// adapter fails defensively before the upstream is called (design §7.3).
+func toolsUnsupportedError() *llmapp.LLMError {
+	return llmapp.NewLLMError(platform.CodeLLMBadRequest, "llm tools require the chat completions protocol", false, 0, nil)
 }
 
 // responseText extracts the assistant text from a non-streaming responses

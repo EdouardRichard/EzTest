@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 
 	llm "github.com/EdouardRichard/EzTest/backend/internal/llm/domain"
@@ -18,43 +19,78 @@ type Part struct {
 	ImageURL string
 }
 
+// ToolSpec is one function tool offered to the model. Parameters is the JSON
+// Schema object describing the tool arguments.
+type ToolSpec struct {
+	Name        string
+	Description string
+	Parameters  json.RawMessage
+}
+
+// ToolCall is one function call requested by the model. Arguments is the raw
+// JSON string produced by the model, never re-encoded.
+type ToolCall struct {
+	ID        string
+	Name      string
+	Arguments string
+}
+
 // Message is one conversation message. Content is always a list of parts so a
-// user turn can mix text and an image.
+// user turn can mix text and an image. ReasoningContent, ToolCalls, ToolCallID
+// and Name carry the tool-calling history; ReasoningContent of every assistant
+// turn must be echoed back when thinking mode is combined with tools.
 type Message struct {
-	Role    string
-	Content []Part
+	Role             string
+	Content          []Part
+	ReasoningContent string
+	ToolCalls        []ToolCall
+	ToolCallID       string
+	Name             string
 }
 
 // ChatRequest is one completion request. Model overrides the configuration's
-// model when set. MaxTokens is optional.
+// model when set. Tools are sent only when non-empty; Thinking and
+// ReasoningEffort are sent only when non-empty. MaxTokens is optional.
 type ChatRequest struct {
-	Model     string
-	Messages  []Message
-	Stream    bool
-	MaxTokens int
+	Model           string
+	Messages        []Message
+	Tools           []ToolSpec
+	Stream          bool
+	MaxTokens       int
+	Thinking        string
+	ReasoningEffort string
 }
 
 // Usage is the token accounting returned by the upstream.
 type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
+	ReasoningTokens  int `json:"reasoning_tokens"`
 	TotalTokens      int `json:"total_tokens"`
 }
 
-// ChatResponse is the parsed non-streaming response.
+// ChatResponse is the parsed non-streaming response. Text may be empty when the
+// model only requested tool calls.
 type ChatResponse struct {
-	Text  string
-	Usage Usage
+	Text             string
+	ReasoningContent string
+	ToolCalls        []ToolCall
+	FinishReason     string
+	Usage            Usage
 }
 
-// StreamEvent is one normalized streaming event: a delta, a terminal done (with
-// usage) or a terminal error. A channel may emit deltas followed by exactly one
-// Done or Err event.
+// StreamEvent is one normalized streaming event: a content delta, a reasoning
+// delta, a terminal done (with assembled tool calls, finish reason and usage) or
+// a terminal error. A channel may emit deltas followed by exactly one Done or
+// Err event.
 type StreamEvent struct {
-	Delta string
-	Done  bool
-	Err   error
-	Usage Usage
+	Delta          string
+	ReasoningDelta string
+	Done           bool
+	ToolCalls      []ToolCall
+	FinishReason   string
+	Usage          Usage
+	Err            error
 }
 
 // Client is the LLM gateway port. The DeepSeek adapter implements it for both
