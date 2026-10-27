@@ -226,7 +226,7 @@ function failToolMessage() {
   return {
     content: null,
     reasoning_content: FAILTOOL_REASONING,
-    tool_calls: toolCallPayload("test.fail", FAILTOOL_ARGUMENTS),
+    tool_calls: toolCallPayload("test_fail", FAILTOOL_ARGUMENTS),
   };
 }
 
