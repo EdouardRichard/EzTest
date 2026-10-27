@@ -68,6 +68,16 @@ type fakeSessionRepo struct {
 
 	forceSessionConflict  bool
 	forceTakeoverConflict bool
+
+	// getSessionErr/getTakeoverErr inject a read failure on the nth read so the
+	// lazy-expiry tests can prove a failed post-conflict re-read is returned
+	// instead of swallowed.
+	getSessionErr        error
+	getSessionErrOnCall  int
+	getSessionReadCalls  int
+	getTakeoverErr       error
+	getTakeoverErrOnCall int
+	getTakeoverReadCalls int
 }
 
 // newFakeSessionRepo returns an empty repository using now as its clock.
@@ -100,8 +110,12 @@ func (r *fakeSessionRepo) CreateSession(_ context.Context, s *domain.Session) er
 	return nil
 }
 
-// GetSession returns one session by id.
+// GetSession returns one session by id, injecting the configured read failure.
 func (r *fakeSessionRepo) GetSession(_ context.Context, id int64) (*domain.Session, error) {
+	r.getSessionReadCalls++
+	if r.getSessionErr != nil && r.getSessionReadCalls == r.getSessionErrOnCall {
+		return nil, r.getSessionErr
+	}
 	session, ok := r.sessions[id]
 	if !ok {
 		return nil, domain.NewNotFound("session", id)
@@ -313,8 +327,12 @@ func (r *fakeSessionRepo) CreateTakeover(_ context.Context, t *domain.Takeover) 
 	return nil
 }
 
-// GetTakeover returns one takeover by id.
+// GetTakeover returns one takeover by id, injecting the configured read failure.
 func (r *fakeSessionRepo) GetTakeover(_ context.Context, id int64) (*domain.Takeover, error) {
+	r.getTakeoverReadCalls++
+	if r.getTakeoverErr != nil && r.getTakeoverReadCalls == r.getTakeoverErrOnCall {
+		return nil, r.getTakeoverErr
+	}
 	takeover, ok := r.takeovers[id]
 	if !ok {
 		return nil, domain.NewNotFound("takeover", id)
@@ -1377,6 +1395,41 @@ func TestSessionServiceListTakeoversLazilyExpiresWaitingRows(t *testing.T) {
 	}
 }
 
+func TestSessionServiceListReturnsLazyExpireSessionRereadError(t *testing.T) {
+	svc, f := newSessionServiceWithFakes(t)
+	seeded := f.seedSession(domain.Session{State: domain.StateValid})
+	// Make the valid session already past its expires_at.
+	seeded.ExpiresAt = sessionTimePtr(sessionTestNow.Add(-time.Minute))
+	f.sessions.sessions[seeded.ID] = seeded
+	f.sessions.forceSessionConflict = true
+	readErr := errors.New("forced session reread failure")
+	f.sessions.getSessionErr = readErr
+	f.sessions.getSessionErrOnCall = 1
+
+	_, _, err := svc.List(context.Background(), domain.SessionFilter{})
+	if !errors.Is(err, readErr) {
+		t.Fatalf("List error=%v want the reread error %v", err, readErr)
+	}
+}
+
+func TestSessionServiceListTakeoversReturnsLazyExpireTakeoverRereadError(t *testing.T) {
+	svc, f := newSessionServiceWithFakes(t)
+	seeded := f.seedSession(domain.Session{State: domain.StateNeedsManual})
+	f.seedTakeover(domain.Takeover{
+		SessionID: &seeded.ID, Status: domain.TakeoverStatusWaiting,
+		ExpiresAt: sessionTimePtr(sessionTestNow.Add(-time.Minute)),
+	})
+	f.sessions.forceTakeoverConflict = true
+	readErr := errors.New("forced takeover reread failure")
+	f.sessions.getTakeoverErr = readErr
+	f.sessions.getTakeoverErrOnCall = 1
+
+	_, _, err := svc.ListTakeovers(context.Background(), domain.TakeoverFilter{})
+	if !errors.Is(err, readErr) {
+		t.Fatalf("ListTakeovers error=%v want the reread error %v", err, readErr)
+	}
+}
+
 func TestSessionServiceRequestTakeover(t *testing.T) {
 	svc, f := newSessionServiceWithFakes(t)
 	seeded := f.seedSession(domain.Session{State: domain.StateValid})
@@ -1484,7 +1537,7 @@ func TestSessionServiceRequestTakeoverRejectsRevokedAndBadReason(t *testing.T) {
 	}
 }
 
-func TestSessionServiceRequestTakeoverCASConflict(t *testing.T) {
+func TestSessionServiceRequestTakeoverCASConflictCancelsOrphan(t *testing.T) {
 	svc, f := newSessionServiceWithFakes(t)
 	seeded := f.seedSession(domain.Session{State: domain.StateValid})
 	f.sessions.forceSessionConflict = true
@@ -1495,6 +1548,48 @@ func TestSessionServiceRequestTakeoverCASConflict(t *testing.T) {
 	if f.sessions.createTakeoverCalls != 1 {
 		t.Fatalf("create takeover calls=%d want 1 (the request is recorded first)",
 			f.sessions.createTakeoverCalls)
+	}
+	// The takeover created for a request whose session CAS lost must not stay
+	// waiting: it would block every later takeover and advertise work that can
+	// never be completed for a needs_manual session that was never moved.
+	waiting, getErr := f.sessions.GetWaitingTakeover(context.Background(), seeded.ID)
+	if getErr != nil {
+		t.Fatalf("GetWaitingTakeover: %v", getErr)
+	}
+	if waiting != nil {
+		t.Fatalf("session CAS failure left an orphan waiting takeover: %+v", waiting)
+	}
+	if len(f.sessions.takeovers) != 1 {
+		t.Fatalf("takeovers=%d want the single attempted request", len(f.sessions.takeovers))
+	}
+	for _, takeover := range f.sessions.takeovers {
+		if takeover.Status != domain.TakeoverStatusCancelled {
+			t.Fatalf("orphan takeover status=%q want cancelled", takeover.Status)
+		}
+	}
+	if f.sessions.lastExpectedTakeoverStatus != domain.TakeoverStatusWaiting {
+		t.Fatalf("takeover CAS expected=%q want waiting", f.sessions.lastExpectedTakeoverStatus)
+	}
+	if f.sessions.sessions[seeded.ID].State != domain.StateValid {
+		t.Fatalf("failed session CAS changed the state to %q",
+			f.sessions.sessions[seeded.ID].State)
+	}
+}
+
+func TestSessionServiceRequestTakeoverCASConflictCancelFailureStillReturnsConflict(t *testing.T) {
+	svc, f := newSessionServiceWithFakes(t)
+	seeded := f.seedSession(domain.Session{State: domain.StateValid})
+	f.sessions.forceSessionConflict = true
+	f.sessions.forceTakeoverConflict = true
+
+	_, _, err := svc.RequestTakeover(context.Background(), seeded.ID,
+		domain.TakeoverReasonOther, nil, 0, nil)
+	// Cancelling the orphan is best effort: a lost cancel CAS must not mask the
+	// session conflict the caller needs.
+	assertCatalogServiceError(t, err, domain.KindStateConflict, "session_state_conflict")
+	if f.sessions.sessions[seeded.ID].State != domain.StateValid {
+		t.Fatalf("failed session CAS changed the state to %q",
+			f.sessions.sessions[seeded.ID].State)
 	}
 }
 
@@ -1677,6 +1772,38 @@ func TestSessionServiceCompleteTakeoverCASConflictLeavesTakeoverWaiting(t *testi
 	}
 	if f.sessions.updateTakeoverCalls != 0 {
 		t.Fatal("a failed session CAS updated the takeover")
+	}
+}
+
+func TestSessionServiceCompleteTakeoverTakeoverCASConflictLeavesSessionUpdated(t *testing.T) {
+	svc, f := newSessionServiceWithFakes(t)
+	seeded := f.seedSession(domain.Session{State: domain.StateNeedsManual})
+	takeover := f.seedTakeover(domain.Takeover{
+		SessionID: &seeded.ID, Status: domain.TakeoverStatusWaiting,
+		ExpiresAt: sessionTimePtr(sessionTestNow.Add(30 * time.Minute)),
+	})
+	f.checker.result = domain.LoginCheckResult{Observed: domain.ObservedAllowed, Status: 200}
+	f.sessions.forceTakeoverConflict = true
+
+	_, _, snapshot, err := svc.CompleteTakeover(context.Background(), takeover.ID,
+		ReplaceSessionStateInput{Kind: "storage_state", StorageState: sessionStorageStateJSON()}, nil)
+	assertCatalogServiceError(t, err, domain.KindStateConflict, "session_state_conflict")
+	if snapshot != nil {
+		t.Fatalf("a lost takeover CAS returned a snapshot: %+v", snapshot)
+	}
+	// Accepted ruling (T13 fix round 1): the session is updated before the
+	// takeover CAS. When the takeover CAS loses, the session may already carry
+	// the completed login state; the caller gets the conflict and the admin can
+	// re-import. A transaction is deliberately out of scope for single-admin P2.
+	if got := f.sessions.sessions[seeded.ID]; got.State != domain.StateValid {
+		t.Fatalf("session state=%q want valid (the session write precedes the takeover CAS)", got.State)
+	}
+	if f.sessions.updateSessionCalls != 1 {
+		t.Fatalf("session update calls=%d want 1", f.sessions.updateSessionCalls)
+	}
+	if f.sessions.takeovers[takeover.ID].Status != domain.TakeoverStatusWaiting {
+		t.Fatalf("takeover status=%q want waiting",
+			f.sessions.takeovers[takeover.ID].Status)
 	}
 }
 

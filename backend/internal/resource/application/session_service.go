@@ -347,7 +347,9 @@ func (s *SessionService) createSnapshot(ctx context.Context, snapshot *domain.Sn
 
 // lazyExpireSession moves a valid session whose expires_at has passed to
 // expired (spec §6.1). A lost CAS means another writer already changed the row,
-// so the latest row is read back instead of failing the read path.
+// so the latest row is read back instead of failing the read path. A failed
+// re-read is returned: serving the stale value would silently report a state the
+// row no longer has.
 func (s *SessionService) lazyExpireSession(ctx context.Context, session *domain.Session, now time.Time) error {
 	if session.State != domain.StateValid || !session.IsExpired(now) {
 		return nil
@@ -358,7 +360,11 @@ func (s *SessionService) lazyExpireSession(ctx context.Context, session *domain.
 		if !isStateConflict(err) {
 			return err
 		}
-		if latest, getErr := s.sessions.GetSession(ctx, session.ID); getErr == nil && latest != nil {
+		latest, getErr := s.sessions.GetSession(ctx, session.ID)
+		if getErr != nil {
+			return getErr
+		}
+		if latest != nil {
 			*session = *latest
 		}
 		return nil
@@ -368,7 +374,8 @@ func (s *SessionService) lazyExpireSession(ctx context.Context, session *domain.
 }
 
 // lazyExpireTakeover moves an expired waiting takeover to expired (spec §6.4).
-// As above a lost CAS is resolved by reading the latest row.
+// As above a lost CAS is resolved by reading the latest row, and a failed
+// re-read is returned instead of swallowed.
 func (s *SessionService) lazyExpireTakeover(ctx context.Context, takeover *domain.Takeover, now time.Time) error {
 	if takeover == nil || takeover.Status != domain.TakeoverStatusWaiting ||
 		takeover.ExpiresAt == nil || now.Before(*takeover.ExpiresAt) {
@@ -380,7 +387,11 @@ func (s *SessionService) lazyExpireTakeover(ctx context.Context, takeover *domai
 		if !isStateConflict(err) {
 			return err
 		}
-		if latest, getErr := s.sessions.GetTakeover(ctx, takeover.ID); getErr == nil && latest != nil {
+		latest, getErr := s.sessions.GetTakeover(ctx, takeover.ID)
+		if getErr != nil {
+			return getErr
+		}
+		if latest != nil {
 			*takeover = *latest
 		}
 		return nil
@@ -656,6 +667,13 @@ func (s *SessionService) RequestTakeover(ctx context.Context, sessionID int64, r
 		return nil, nil, invalidTakeoverReasonError()
 	}
 	now := s.now()
+	// One-waiting invariant: spec §6.4 allows at most one waiting takeover per
+	// session. There is no partial unique index and this check-then-insert is
+	// not atomic against a second concurrent admin request, so two truly
+	// simultaneous requests can both pass. Accepted for single-admin P2: the
+	// admin surface serialises these writes in practice. Revisit with a partial
+	// unique index on (session_id) WHERE status = 'waiting' if admin concurrency
+	// is introduced.
 	waiting, err := s.sessions.GetWaitingTakeover(ctx, sessionID)
 	if err != nil {
 		return nil, nil, err
@@ -690,6 +708,16 @@ func (s *SessionService) RequestTakeover(ctx context.Context, sessionID int64, r
 	expected := session.State
 	session.State = domain.StateNeedsManual
 	if err := s.sessions.UpdateSession(ctx, session, expected); err != nil {
+		// The request cannot be honoured unless the session moves to
+		// needs_manual, so the takeover just recorded must not stay waiting: it
+		// would block every later request and advertise work that can never be
+		// completed. Cancel it best effort; the row is ours (created above), so
+		// a lost cancel CAS means another writer already moved it, and the
+		// session conflict remains the error the caller needs. A transaction is
+		// deliberately out of scope for the single-admin P2 surface.
+		cancelled := *takeover
+		cancelled.Status = domain.TakeoverStatusCancelled
+		_ = s.sessions.UpdateTakeover(ctx, &cancelled, domain.TakeoverStatusWaiting)
 		return nil, nil, err
 	}
 	return takeover, session, nil
@@ -738,6 +766,13 @@ func (s *SessionService) CompleteTakeover(ctx context.Context, takeoverID int64,
 		return nil, nil, nil, err
 	}
 
+	// Ordering ruling (T13 fix round 1): the session update commits before the
+	// takeover CAS. If the takeover CAS then loses, the session may already
+	// carry the completed login state while the takeover still reads waiting;
+	// the caller gets the conflict and the admin can re-import. This is accepted
+	// for the single-admin P2 surface, and a cross-row transaction is
+	// deliberately out of scope. The reverse order is worse: a failed session
+	// CAS would leave a completed takeover attached to an unchanged session.
 	expected := session.State
 	session.StorageState = storedState
 	session.StorageStateHash = storageHash
