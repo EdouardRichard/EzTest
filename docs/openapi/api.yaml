@@ -2639,7 +2639,7 @@ paths:
                       runId: '1844674407370955161'
                       repoId: 3
                       commit: '0123456789abcdef0123456789abcdef01234567'
-                      source: manual
+                      source: t0
                       status: done
                       stats:
                         files: 1200
@@ -2760,8 +2760,9 @@ paths:
       description: |
         Every authenticated user. `commit` defaults to the repository's fixed
         branch tip; an empty `path` means the repository root. Entries are
-        `blob|tree` with a Git object id and an `unsupported` marker for
-        symlinks/submodules. The page is capped server-side.
+        `blob|tree|commit` with a Git object id; `commit` entries are submodules
+        and carry the `unsupported` marker together with symlinks. The page is
+        capped server-side.
       operationId: getCodeRepoTree
       security:
         - bearerAuth: []
@@ -3097,6 +3098,8 @@ paths:
           $ref: '#/components/responses/Unauthenticated'
         '422':
           $ref: '#/components/responses/CodeInvalid'
+        '503':
+          $ref: '#/components/responses/CodeGitUnavailable'
         '500':
           $ref: '#/components/responses/Internal'
   /api/code/repos/{repoId}/search:
@@ -3106,7 +3109,9 @@ paths:
       description: |
         Every authenticated user. Case-insensitive substring match on entity
         path/name only (D24); no full-text index and no code-body search. The
-        read is audited by the application service.
+        `q` query is required: an empty or missing value is 400
+        `invalid_argument` with `details.reason=invalid_request`. The read is
+        audited by the application service.
       operationId: searchCodeRepoFacts
       security:
         - bearerAuth: []
@@ -3121,10 +3126,10 @@ paths:
             type: string
         - name: q
           in: query
-          required: false
+          required: true
           description: |
-            Path/name substring query. Omitted/empty returns the commit's facts
-            without a text filter (the handler does not require `q`).
+            Required path/name substring query (D24). An empty or missing `q`
+            is 400 `invalid_argument` with `details.reason=invalid_request`.
           schema:
             type: string
             minLength: 1
@@ -3154,6 +3159,8 @@ paths:
           $ref: '#/components/responses/Unauthenticated'
         '422':
           $ref: '#/components/responses/CodeInvalid'
+        '503':
+          $ref: '#/components/responses/CodeGitUnavailable'
         '500':
           $ref: '#/components/responses/Internal'
   /api/code/repos/{repoId}/commits/{sha}:
@@ -4507,15 +4514,19 @@ paths:
       tags: [code]
       summary: Trigger or reuse a version impact analysis
       description: |
-        Every authenticated user. The request body is `{headCommit?, force?}`.
-        A new run returns 202 with `reused=false`; an identical completed run
-        (same version/base/head/model/prompt and fact-version snapshot, without
-        `force`) returns 200 `reused=true` and the existing id. `force=true`
-        creates `analysisVersion+1` and never overwrites the old analysis. A
-        queued/running analysis for the same version is 409
-        `analysis_in_progress`; a full worker queue is 429
-        `analysis_queue_full` (retryable). The analysis itself is asynchronous;
-        poll `/analyses/{analysisId}` or `/analyses/latest`.
+        Every authenticated user. The request body is required and must be a
+        JSON object; `{headCommit?, force?}` are both optional, so `{}` is a
+        valid trigger (fixed-branch tip, `force=false`) while a missing/empty
+        body is 400 `invalid_argument` (`invalid_json`). A new run returns 202
+        with `reused=false`; an identical completed run (same
+        version/base/head/model/prompt, without `force`) returns 200
+        `reused=true` and the existing id. `force=true` creates
+        `analysisVersion+1` and never overwrites the old analysis. A reusable
+        done analysis wins over the active-run rule; otherwise a queued/running
+        analysis for the same version is 409 `analysis_in_progress`, and a full
+        worker queue is 429 `analysis_queue_full` (retryable). The analysis
+        itself is asynchronous; poll `/analyses/{analysisId}` or
+        `/analyses/latest`.
       operationId: startVersionCodeAnalysis
       security:
         - bearerAuth: []
@@ -4524,7 +4535,7 @@ paths:
         - $ref: '#/components/parameters/CodeVersionId'
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
-        required: false
+        required: true
         content:
           application/json:
             schema:
@@ -4652,6 +4663,7 @@ paths:
                     duplicateFacts: 0
                     unmatchedContracts: 0
                     truncated: false
+                    skipped: 0
                   factVersions:
                     - factKey: 'api:POST /api/example'
                       version: 1
@@ -4735,7 +4747,8 @@ paths:
       description: |
         Every authenticated user. Optional `subjectKind`/`subjectId` exact
         filters. The response is the normal `{"data":[...]}` envelope (no
-        pagination); anchor ids and subject ids are decimal strings.
+        pagination); anchor ids and subject ids are decimal strings. An unknown
+        version returns 200 with an empty list, not 404.
       operationId: listVersionCodeAnchors
       security:
         - bearerAuth: []
@@ -4764,8 +4777,6 @@ paths:
                 $ref: '#/components/schemas/AnchorList'
         '401':
           $ref: '#/components/responses/Unauthenticated'
-        '404':
-          $ref: '#/components/responses/NotFound'
         '422':
           $ref: '#/components/responses/CodeInvalid'
         '500':
@@ -4816,6 +4827,8 @@ paths:
           $ref: '#/components/responses/CodeConflict'
         '422':
           $ref: '#/components/responses/CodeInvalid'
+        '503':
+          $ref: '#/components/responses/CodeGitUnavailable'
         '500':
           $ref: '#/components/responses/Internal'
   /api/versions/{versionId}/code/anchors/{anchorId}:
@@ -5478,7 +5491,8 @@ components:
         A P4 state conflict (`conflict`, HTTP 409). `details.reason` is one of
         `index_in_progress` (the repository already has a queued/running index),
         `analysis_in_progress` (the version already has a queued/running
-        analysis), `analysis_not_done` (adjusting a candidate before the
+        analysis and no identical completed run was reusable),
+        `analysis_not_done` (adjusting a candidate before the
         analysis completed) or `anchor_duplicate` (same subject/file/line range).
       content:
         application/json:
@@ -5488,8 +5502,11 @@ components:
       description: |
         A P4 object is absent (`not_found`, HTTP 404). `details.reason` is one of
         `index_run_not_found`, `analysis_not_found`, `candidate_not_found` or
-        `anchor_not_found`. A missing P3 version or P2 repository on a
-        version-scoped route stays a plain `not_found`.
+        `anchor_not_found`. Version-scoped analysis reads report
+        `analysis_not_found` even when the version is unknown or has no analysis;
+        the anchors list answers 200 with `[]` for an unknown version. A missing
+        P3 version or P2 repository on a trigger, change-preview or
+        anchor-create route is a plain `not_found` (no codeintel reason).
       content:
         application/json:
           schema:
@@ -7405,7 +7422,8 @@ components:
       type: string
       description: |
         Closed set of P4 `error.details.reason` values (spec §7.1 plus the
-        transport-level request errors). The HTTP status is determined by the
+        transport-level request errors and the plain `not_found` reason of a
+        missing P3 version on a code route). The HTTP status is determined by the
         error code: 400/422 `invalid_argument`, 404 `not_found`, 409 `conflict`,
         429 `rate_limited`, 503 `unavailable`.
       enum:
@@ -7434,6 +7452,7 @@ components:
         - unsupported_subject_kind
         - subject_not_in_version
         - app_model_not_found
+        - not_found
         - invalid_id
         - invalid_request
         - invalid_limit
@@ -7481,7 +7500,8 @@ components:
           pattern: '^[a-f0-9]{40}$'
         source:
           type: string
-          description: Who/why the run was started (for example `manual`, `startup`).
+          description: The index-run source; P4 always writes `t0` (T0 Git facts).
+          example: t0
         status:
           type: string
           enum: [queued, running, done, failed]
@@ -7614,8 +7634,10 @@ components:
           nullable: true
         status:
           type: string
-          description: File-level Git status (A/M/D/R/C/T).
-          enum: [A, M, D, R, C, T]
+          description: |
+            File-level Git status: `A`, `M`, `D`, `T`, or `R<score>`/`C<score>`
+            for a rename/copy (for example `R100` or `C075`).
+          pattern: '^(A|M|D|T|R[0-9]{1,3}|C[0-9]{1,3})$'
         additions:
           type: integer
           minimum: 0
@@ -7681,7 +7703,8 @@ components:
           maxLength: 4096
         type:
           type: string
-          enum: [blob, tree]
+          description: Git object type; `commit` entries are submodules.
+          enum: [blob, tree, commit]
         size:
           type: integer
           format: int64
@@ -7721,10 +7744,12 @@ components:
           maxLength: 4096
         startLine:
           type: integer
-          minimum: 1
+          minimum: 0
+          description: First line (1-based); 0 when the file is empty.
         endLine:
           type: integer
-          minimum: 1
+          minimum: 0
+          description: Last line (inclusive); 0 when the file is empty.
         totalLines:
           type: integer
           minimum: 0
@@ -7754,7 +7779,8 @@ components:
           maxLength: 4096
         status:
           type: string
-          enum: [A, M, D, R, C, T]
+          description: Git status of the changed file (A/M/D/T or R<score>/C<score>).
+          pattern: '^(A|M|D|T|R[0-9]{1,3}|C[0-9]{1,3})$'
         binary:
           type: boolean
         truncated:
@@ -7855,7 +7881,7 @@ components:
           enum: [git, ai]
         confidence:
           type: string
-          description: Confidence bucket (high/medium/low); T0 facts may use an empty value.
+          description: Confidence bucket (high/medium/low); T0 file facts are always `high`.
         evidence:
           type: array
           items:
@@ -7984,8 +8010,8 @@ components:
       type: object
       description: |
         One impact candidate. `id`/`subjectId` are decimal strings; `subjectKind`
-        is `requirement` or `app_model`. The `evidence` items are always an array
-        and are normalized/deduplicated by the server.
+        is `requirement` or `app_model`. The `evidence` items are always an array,
+        normalized/deduplicated by the server and capped at 5.
       required:
         - id
         - subjectKind
@@ -8016,7 +8042,7 @@ components:
           enum: [direct, contract, relation, ai]
         evidence:
           type: array
-          maxItems: 8
+          maxItems: 5
           items:
             $ref: '#/components/schemas/Evidence'
         selected:
@@ -8040,7 +8066,8 @@ components:
           maxLength: 4096
         status:
           type: string
-          enum: [A, M, D, R, C, T]
+          description: Status of the changed file (A/M/D/T or R<score>/C<score>).
+          pattern: '^(A|M|D|T|R[0-9]{1,3}|C[0-9]{1,3})$'
         reason:
           type: string
           enum:
@@ -8128,7 +8155,6 @@ components:
             $ref: '#/components/schemas/FactVersionRef'
         candidates:
           type: array
-          maxItems: 200
           items:
             $ref: '#/components/schemas/Candidate'
         unmapped:
