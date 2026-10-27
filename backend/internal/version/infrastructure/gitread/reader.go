@@ -51,8 +51,8 @@ var commitRE = regexp.MustCompile(`^[0-9a-f]{40}$`)
 var branchRE = regexp.MustCompile(`^[A-Za-z0-9._/-]{1,255}$`)
 
 // GitReader is the read-only local Git adapter. It implements
-// application.GitReader and additionally exposes ReadRange, which reports the
-// blob size so the code tools can flag truncation.
+// application.GitReader and additionally exposes TreePrefix (prefix filtering
+// before the entry cap) and ReadRange (the blob size for truncation detection).
 type GitReader struct {
 	timeout time.Duration
 }
@@ -105,6 +105,24 @@ func (r *GitReader) ResolveCommit(ctx context.Context, repoPath, branch string) 
 // Tree lists the entries of a commit-pinned tree, applying the repository's
 // include/exclude path globs and returning at most max entries (hard cap 200).
 func (r *GitReader) Tree(ctx context.Context, repoPath, commit string, include, exclude []string, max int) ([]application.CodeEntry, error) {
+	return r.tree(ctx, repoPath, commit, "", include, exclude, max)
+}
+
+// TreePrefix lists at most max entries of a commit-pinned tree that live below
+// prefix, applying the prefix and the repository's include/exclude globs before
+// the entry cap. It is an optional extension over application.GitReader: the
+// code tools use it so a subtree that sorts after the cap is not hidden.
+func (r *GitReader) TreePrefix(ctx context.Context, repoPath, commit, prefix string, include, exclude []string, max int) ([]application.CodeEntry, error) {
+	normalized, err := normalizeTreePrefix(prefix)
+	if err != nil {
+		return nil, err
+	}
+	return r.tree(ctx, repoPath, commit, normalized, include, exclude, max)
+}
+
+// tree is the shared implementation of Tree and TreePrefix. A non-empty prefix
+// filters entries before the cap is applied.
+func (r *GitReader) tree(ctx context.Context, repoPath, commit, prefix string, include, exclude []string, max int) ([]application.CodeEntry, error) {
 	ctx, cancel := r.withTimeout(ctx)
 	defer cancel()
 
@@ -119,6 +137,7 @@ func (r *GitReader) Tree(ctx context.Context, repoPath, commit string, include, 
 	if limit <= 0 || limit > maxTreeEntries {
 		limit = maxTreeEntries
 	}
+	filter := compilePathFilter(include, exclude)
 
 	output, _, err := r.run(ctx, dir, "ls-tree", "-r", "-t", "-l", "-z", commit)
 	if err != nil {
@@ -145,6 +164,9 @@ func (r *GitReader) Tree(ctx context.Context, repoPath, commit string, include, 
 			Path: record[tab+1:],
 			Type: fields[1],
 		}
+		if prefix != "" && !strings.HasPrefix(entry.Path, prefix+"/") {
+			continue
+		}
 		if fields[3] != "-" {
 			size, err := strconv.ParseInt(fields[3], 10, 64)
 			if err != nil {
@@ -152,7 +174,7 @@ func (r *GitReader) Tree(ctx context.Context, repoPath, commit string, include, 
 			}
 			entry.Size = size
 		}
-		if !treePathIncluded(entry.Path, include, exclude) {
+		if !filter.includes(entry.Path) {
 			continue
 		}
 		entries = append(entries, entry)
@@ -393,43 +415,88 @@ func validateCodePath(codePath string) error {
 	return nil
 }
 
-// treePathIncluded applies the simple include/exclude path filters of spec
-// §6.8: an entry must match at least one include glob (when any) and no exclude
-// glob.
-func treePathIncluded(entryPath string, include, exclude []string) bool {
-	if len(include) > 0 && !matchesAnyGlob(entryPath, include) {
-		return false
+// normalizeTreePrefix trims the conventional leading/trailing slashes of a
+// listing prefix and rejects any unsafe component. The empty prefix means the
+// repository root.
+func normalizeTreePrefix(prefix string) (string, error) {
+	trimmed := strings.Trim(strings.TrimSpace(prefix), "/")
+	if trimmed == "" {
+		return "", nil
 	}
-	return !matchesAnyGlob(entryPath, exclude)
+	if err := validateCodePath(trimmed); err != nil {
+		return "", err
+	}
+	return trimmed, nil
 }
 
-// matchesAnyGlob reports whether p matches at least one glob.
-func matchesAnyGlob(p string, globs []string) bool {
+// compiledGlob is one include/exclude pattern compiled once per tree listing.
+// A pattern without wildcards keeps its literal form because a plain name also
+// matches every descendant.
+type compiledGlob struct {
+	literal string
+	pattern *regexp.Regexp
+}
+
+// pathFilter is the compiled include/exclude pair of one tree listing.
+type pathFilter struct {
+	include []compiledGlob
+	exclude []compiledGlob
+}
+
+// compilePathFilter compiles the repository globs once so a tree listing with
+// many entries does not recompile every pattern per entry.
+func compilePathFilter(include, exclude []string) pathFilter {
+	return pathFilter{include: compileGlobs(include), exclude: compileGlobs(exclude)}
+}
+
+// compileGlobs compiles the non-blank globs; an invalid wildcard pattern is
+// dropped and therefore matches nothing, like the previous per-entry compile.
+func compileGlobs(globs []string) []compiledGlob {
+	compiled := make([]compiledGlob, 0, len(globs))
 	for _, glob := range globs {
-		if matchGlob(glob, p) {
+		glob = strings.TrimSpace(strings.ReplaceAll(glob, `\`, "/"))
+		if glob == "" {
+			continue
+		}
+		if !strings.ContainsAny(glob, "*?[") {
+			compiled = append(compiled, compiledGlob{literal: glob})
+			continue
+		}
+		pattern, err := globPattern(strings.TrimSuffix(glob, "/"))
+		if err != nil {
+			continue
+		}
+		compiled = append(compiled, compiledGlob{pattern: pattern})
+	}
+	return compiled
+}
+
+// includes applies the P3 filter: an entry must match at least one include glob
+// (when any) and no exclude glob.
+func (f pathFilter) includes(entryPath string) bool {
+	if len(f.include) > 0 && !matchesAnyCompiledGlob(f.include, entryPath) {
+		return false
+	}
+	return !matchesAnyCompiledGlob(f.exclude, entryPath)
+}
+
+// matchesAnyCompiledGlob reports whether p matches at least one compiled glob.
+func matchesAnyCompiledGlob(globs []compiledGlob, p string) bool {
+	for _, glob := range globs {
+		if glob.matches(p) {
 			return true
 		}
 	}
 	return false
 }
 
-// matchGlob implements the P3 subset of glob matching: exact names match the
-// entry or any descendant, and a compiled wildcard pattern matches the path.
-// "**" matches across separators, "*" and "?" stay inside one path segment.
-func matchGlob(glob, p string) bool {
-	glob = strings.TrimSpace(strings.ReplaceAll(glob, `\`, "/"))
-	if glob == "" {
-		return false
+// matches applies one compiled glob. A literal matches itself and descendants;
+// a wildcard pattern must match the whole path.
+func (g compiledGlob) matches(p string) bool {
+	if g.pattern != nil {
+		return g.pattern.MatchString(p)
 	}
-	if !strings.ContainsAny(glob, "*?[") {
-		return p == glob || strings.HasPrefix(p, glob+"/")
-	}
-	glob = strings.TrimSuffix(glob, "/")
-	pattern, err := globPattern(glob)
-	if err != nil {
-		return false
-	}
-	return pattern.MatchString(p)
+	return p == g.literal || strings.HasPrefix(p, g.literal+"/")
 }
 
 // globPattern compiles a simple glob into an anchored regular expression.

@@ -3,6 +3,7 @@ package gitread_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -240,6 +241,77 @@ func TestGitReadAtCommit(t *testing.T) {
 			t.Fatalf("Tree(unknown commit) reason=%q want resource_unavailable", reason)
 		}
 	})
+}
+
+// TestGitTreePrefixFiltersBeforeCap pins the prefix-aware listing: the prefix
+// (and the include/exclude globs) must be applied before the 200-entry cap, so a
+// subtree that sorts after more than 200 other entries is still listed.
+func TestGitTreePrefixFiltersBeforeCap(t *testing.T) {
+	ctx := context.Background()
+	repo := newTestRepo(t)
+
+	for i := 0; i < 220; i++ {
+		writeRepoFile(t, repo, fmt.Sprintf("aaa/file-%03d.txt", i), "x\n")
+	}
+	writeRepoFile(t, repo, "src/main.go", "package main\n")
+	writeRepoFile(t, repo, "src/nested/util.go", "package nested\n")
+	writeRepoFile(t, repo, "README.md", "readme\n")
+	commit := commitRepo(t, repo, "many files")
+	reader := gitread.NewGitReader(5 * time.Second)
+
+	// The plain listing fills its whole cap with entries that sort before src.
+	capped, err := reader.Tree(ctx, repo, commit, nil, nil, 200)
+	if err != nil {
+		t.Fatalf("Tree: %v", err)
+	}
+	if len(capped) != 200 {
+		t.Fatalf("Tree returned %d entries, want the 200-entry cap", len(capped))
+	}
+	for _, entry := range capped {
+		if entry.Path == "src/main.go" || entry.Path == "src/nested/util.go" {
+			t.Fatalf("Tree returned %q inside the cap; the fixture is wrong", entry.Path)
+		}
+	}
+
+	// TreePrefix filters the prefix before the cap.
+	entries, err := reader.TreePrefix(ctx, repo, commit, "src", nil, nil, 200)
+	if err != nil {
+		t.Fatalf("TreePrefix: %v", err)
+	}
+	paths := entryPaths(entries)
+	for _, want := range []string{"src/main.go", "src/nested", "src/nested/util.go"} {
+		if !contains(paths, want) {
+			t.Fatalf("TreePrefix(src) paths=%v missing %q", paths, want)
+		}
+	}
+	if contains(paths, "README.md") {
+		t.Fatalf("TreePrefix(src) paths=%v leaked an entry outside the prefix", paths)
+	}
+
+	// The include/exclude globs are applied before the cap too.
+	filtered, err := reader.TreePrefix(ctx, repo, commit, "src", []string{"src/**"}, []string{"src/nested"}, 200)
+	if err != nil {
+		t.Fatalf("TreePrefix(globs): %v", err)
+	}
+	if paths := entryPaths(filtered); len(paths) != 1 || paths[0] != "src/main.go" {
+		t.Fatalf("TreePrefix(src, include src/**, exclude src/nested) paths=%v want [src/main.go]", paths)
+	}
+
+	// The cap still bounds the already-filtered prefix.
+	limited, err := reader.TreePrefix(ctx, repo, commit, "src", nil, nil, 1)
+	if err != nil {
+		t.Fatalf("TreePrefix(max 1): %v", err)
+	}
+	if len(limited) != 1 || !strings.HasPrefix(limited[0].Path, "src/") {
+		t.Fatalf("TreePrefix(max 1)=%+v want one src entry", entryPaths(limited))
+	}
+
+	// A traversing prefix is rejected before it can reach git.
+	if _, err := reader.TreePrefix(ctx, repo, commit, "../src", nil, nil, 200); err == nil {
+		t.Fatal("TreePrefix(../src) returned nil error")
+	} else if reason := gitErrorReason(t, err); reason != "path_not_found" {
+		t.Fatalf("TreePrefix(../src) reason=%q want path_not_found", reason)
+	}
 }
 
 // contains reports whether values contains want.

@@ -214,7 +214,7 @@ func (s *AgentToolService) ContextGet(ctx context.Context, versionID int64) (str
 		})
 	}
 
-	attachments, attachmentsMore, err := s.contextAttachments(ctx, versionID)
+	attachments, attachmentsMore, err := s.contextAttachments(ctx, requirements, requirementsMore)
 	if err != nil {
 		return toolOutcome(err)
 	}
@@ -453,12 +453,21 @@ func (s *AgentToolService) CodeTree(ctx context.Context, versionID int64, codePa
 	if limit <= 0 || limit > maxToolCodeTreeEntries {
 		limit = maxToolCodeTreeEntries
 	}
-	entries, err := s.git.Tree(ctx, repository.LocalPath, commit,
-		repository.IncludeGlobs, repository.ExcludeGlobs, maxToolCodeTreeEntries)
+	prefix := strings.Trim(strings.TrimSpace(codePath), "/")
+	prefixReader, prefixAware := s.git.(codeTreePrefixReader)
+	var entries []CodeEntry
+	if prefix != "" && prefixAware {
+		// The optional prefix-aware extension filters the subtree before the
+		// reader's entry cap; a plain GitReader falls back to Tree below.
+		entries, err = prefixReader.TreePrefix(ctx, repository.LocalPath, commit, prefix,
+			repository.IncludeGlobs, repository.ExcludeGlobs, maxToolCodeTreeEntries)
+	} else {
+		entries, err = s.git.Tree(ctx, repository.LocalPath, commit,
+			repository.IncludeGlobs, repository.ExcludeGlobs, maxToolCodeTreeEntries)
+	}
 	if err != nil {
 		return toolOutcome(err)
 	}
-	prefix := strings.Trim(strings.TrimSpace(codePath), "/")
 	filtered := make([]toolCodeEntryView, 0, len(entries))
 	for _, entry := range entries {
 		if prefix != "" && !strings.HasPrefix(entry.Path, prefix+"/") {
@@ -497,8 +506,10 @@ func (s *AgentToolService) CodeRead(ctx context.Context, versionID int64, codePa
 
 	content := ""
 	var size int64
+	rangeRead := false
 	if rangeReader, ok := s.git.(codeRangeReader); ok {
 		content, size, err = rangeReader.ReadRange(ctx, repository.LocalPath, commit, codePath, offset, limit)
+		rangeRead = true
 	} else {
 		// Fallback for a GitReader without the optional range extension: read the
 		// prefix and drop the offset locally. Only offsets inside the first read
@@ -512,16 +523,50 @@ func (s *AgentToolService) CodeRead(ctx context.Context, versionID int64, codePa
 	if err != nil {
 		return toolOutcome(err)
 	}
+	if rangeRead && int64(offset) > size {
+		return toolOutcome(domain.NewInvalid("offset", "invalid_offset",
+			fmt.Sprintf("offset %d is past the end of %q (%d bytes)", offset, codePath, size)))
+	}
+	truncated := rangeRead && size > int64(offset)+int64(len(content))
+	// A byte window can split a multi-byte UTF-8 rune at both edges: an offset
+	// inside a rune leaves continuation bytes at the start, and a truncated
+	// window can end inside a rune. Trim those edges before the text check so
+	// valid CJK/emoji content is not misreported as binary.
+	if offset > 0 {
+		content = trimLeadingUTF8Continuation(content)
+	}
+	if truncated {
+		content = string(trimIncompleteUTF8Suffix([]byte(content)))
+	}
 	if !utf8.ValidString(content) || strings.ContainsRune(content, 0) {
 		return toolOutcome(domain.NewInvalid("path", "unsupported_content",
 			fmt.Sprintf("code path %q is not a text file", codePath)))
 	}
-	truncated := size > 0 && size > int64(offset)+int64(len(content))
 	return toolJSON(map[string]any{
 		"path":      codePath,
 		"content":   content,
 		"truncated": truncated,
 	})
+}
+
+// trimLeadingUTF8Continuation drops at most UTFMax-1 leading continuation bytes:
+// a window that starts at offset>0 may begin inside a rune whose first bytes
+// were skipped. More than UTFMax-1 continuation bytes is malformed content and
+// stays rejected by the caller's UTF-8 check.
+func trimLeadingUTF8Continuation(content string) string {
+	start := 0
+	for start < len(content) && start < utf8.UTFMax-1 && !utf8.RuneStart(content[start]) {
+		start++
+	}
+	return content[start:]
+}
+
+// codeTreePrefixReader is the optional GitReader extension that filters a tree
+// listing by a path prefix before applying the entry cap; the production
+// gitread adapter implements it. A GitReader without it still works, but its
+// prefix filter runs after the cap.
+type codeTreePrefixReader interface {
+	TreePrefix(ctx context.Context, repoPath, commit, prefix string, include, exclude []string, max int) ([]CodeEntry, error)
 }
 
 // codeRangeReader is the optional GitReader extension that reports the blob
@@ -548,13 +593,29 @@ func (s *AgentToolService) codeBinding(ctx context.Context, versionID int64) (Co
 	}
 	repository, err := s.resources.GetCodeRepository(ctx, *version.CodeRepositoryID)
 	if err != nil {
-		return CodeRepoRef{}, "", err
+		return CodeRepoRef{}, "", mapToolCodeRepositoryLookupError(err)
 	}
 	if !repository.Available || (repository.Status != "" && repository.Status != resourceStatusActive) {
 		return CodeRepoRef{}, "", domain.NewInvalid("codeRepositoryId", "resource_unavailable",
 			fmt.Sprintf("code repository %d is not available", repository.ID))
 	}
 	return repository, *version.CodeBaselineCommit, nil
+}
+
+// mapToolCodeRepositoryLookupError translates a code-repository lookup
+// not-found into the code tools' resource_unavailable verdict. The P2 catalog
+// hard-deletes repositories, so a version bound to a deleted repository gets
+// code_repository_not_found from the lookup; that reasoning is meaningful for
+// version binding validation (and the HTTP reason mapping) but not for a code
+// tool, which can only report that the bound resource is unavailable. Other
+// typed and operational errors pass through unchanged.
+func mapToolCodeRepositoryLookupError(err error) error {
+	var resourceErr *ResourceError
+	if errors.As(err, &resourceErr) && resourceErr.Reason == "code_repository_not_found" {
+		return domain.NewInvalid("codeRepositoryId", "resource_unavailable",
+			fmt.Sprintf("the version's code repository is not available: %s", resourceErr.Error()))
+	}
+	return err
 }
 
 // contextRequirements loads at most contextRequirementLimit requirements of the
@@ -690,15 +751,12 @@ func (s *AgentToolService) contextDecisionsPage(ctx context.Context, versionID i
 	return decisions, true, nil
 }
 
-// contextAttachments collects the attachment metadata of the listed
-// requirements, bounded by contextAttachmentLimit.
-func (s *AgentToolService) contextAttachments(ctx context.Context, versionID int64) ([]toolAttachmentView, bool, error) {
+// contextAttachments collects the attachment metadata of the already loaded
+// requirements, bounded by contextAttachmentLimit. The caller shares its single
+// requirement page load with this section.
+func (s *AgentToolService) contextAttachments(ctx context.Context, requirements []Requirement, requirementsMore bool) ([]toolAttachmentView, bool, error) {
 	if s.requirements == nil {
 		return []toolAttachmentView{}, false, nil
-	}
-	requirements, requirementsMore, err := s.contextRequirements(ctx, versionID)
-	if err != nil {
-		return nil, false, err
 	}
 	views := make([]toolAttachmentView, 0)
 	for i := range requirements {
