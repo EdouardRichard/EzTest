@@ -276,8 +276,10 @@ test("creates a bound version, relations, confirmation, design entry, reload and
   await expect(page.getByRole("region", { name: "需求与澄清工作台" })).toBeVisible()
 
   await page.getByRole("tab", { name: "代码与变更" }).click()
-  await expect(page.getByText("阶段 P4", { exact: true })).toBeVisible()
-  await expect(page.getByRole("heading", { name: "代码与变更", level: 2 })).toBeVisible()
+  await expect(page.getByText("阶段 P4", { exact: true })).toHaveCount(0)
+  // The real code-intelligence tab replaced the P4 placeholder: this throwaway
+  // repository was never indexed, so the documented unindexed empty state shows.
+  await expect(page.getByRole("heading", { name: "代码仓库尚未索引" })).toBeVisible()
 
   await page.goto(`/versions/${versionId}?tab=report`)
   await expect(page.getByRole("heading", { name: "报告", level: 2 })).toBeVisible()

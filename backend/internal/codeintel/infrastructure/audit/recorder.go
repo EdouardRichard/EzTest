@@ -14,8 +14,10 @@ import (
 	"strconv"
 	"strings"
 
+	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	auditdomain "github.com/EdouardRichard/EzTest/backend/internal/audit/domain"
 	codeintelapp "github.com/EdouardRichard/EzTest/backend/internal/codeintel/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
 const (
@@ -100,6 +102,19 @@ func (r *Recorder) Record(ctx context.Context, actorID int64, action, subject st
 	if actorID > 0 {
 		actor := actorID
 		entry.ActorUserID = &actor
+	}
+	// Request correlation (P0): a code read/trigger recorded inside an HTTP
+	// request carries that request's metadata. The async analysis worker carries
+	// no HTTP metadata, but the trigger copies its request id into the run
+	// context (AnalysisService.Run), so the completion entry stays correlated
+	// (mirrors the Agent audit sink, T19).
+	if meta := auditapp.MetaFromContext(ctx); meta != (auditapp.RequestMeta{}) {
+		entry.RequestID = meta.RequestID
+		entry.IP = meta.IP
+		entry.UserAgent = meta.UserAgent
+	}
+	if entry.RequestID == "" {
+		entry.RequestID = platform.RequestID(ctx)
 	}
 	return r.recorder.Record(ctx, entry)
 }

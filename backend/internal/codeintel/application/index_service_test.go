@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
 // Test fixture commits are valid lowercase 40-hex ids.
@@ -405,10 +406,11 @@ func (q *stubQueue) Enqueue(job Job) error {
 
 // stubAudit records AuditRecorder calls.
 type auditCall struct {
-	actorID int64
-	action  string
-	subject string
-	detail  map[string]any
+	actorID   int64
+	action    string
+	subject   string
+	detail    map[string]any
+	requestID string
 }
 
 type stubAudit struct {
@@ -416,8 +418,14 @@ type stubAudit struct {
 	err   error
 }
 
-func (a *stubAudit) Record(_ context.Context, actorID int64, action, subject string, detail map[string]any) error {
-	a.calls = append(a.calls, auditCall{actorID: actorID, action: action, subject: subject, detail: detail})
+func (a *stubAudit) Record(ctx context.Context, actorID int64, action, subject string, detail map[string]any) error {
+	a.calls = append(a.calls, auditCall{
+		actorID:   actorID,
+		action:    action,
+		subject:   subject,
+		detail:    detail,
+		requestID: platform.RequestID(ctx),
+	})
 	return a.err
 }
 

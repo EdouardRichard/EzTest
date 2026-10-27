@@ -480,6 +480,49 @@ test("partial mode returns invalid JSON for one file and valid JSON for the othe
   });
 });
 
+test("the runtime P4 mode control switches and resets the scenario", async () => {
+  assert.ok(sharedServer, "shared fake LLM server was not started");
+
+  const getMode = async () => {
+    const response = await fetch(sharedServer.base + "/__p4-mode");
+    assert.equal(response.status, 200, "GET /__p4-mode must answer 200");
+    return (await response.json()).mode;
+  };
+  const setMode = async (mode) => {
+    const response = await fetch(sharedServer.base + "/__p4-mode", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode }),
+    });
+    assert.equal(response.status, 200, "POST /__p4-mode must answer 200");
+    return (await response.json()).mode;
+  };
+
+  try {
+    assert.equal(await setMode("error"), "error");
+    assert.equal(await getMode(), "error");
+    const failed = await postChat(sharedServer.base, fileAnalysisBody("src/api/refund.ts"));
+    assert.equal(failed.status, 500, "the runtime switch must take effect without a restart");
+
+    assert.equal(await setMode("ok"), "ok");
+    assert.equal(await getMode(), "ok");
+    parseCompletion(
+      await postChat(sharedServer.base, fileAnalysisBody("src/api/refund.ts")),
+      "runtime reset",
+    );
+
+    const invalid = await fetch(sharedServer.base + "/__p4-mode", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "not-a-mode" }),
+    });
+    assert.equal(invalid.status, 400, "an unknown mode must be rejected");
+    assert.equal(await getMode(), "ok", "a rejected mode must not change the active mode");
+  } finally {
+    await setMode("ok");
+  }
+});
+
 test("P1 fallback still answers the diagnostic scenario", async () => {
   assert.ok(sharedServer, "shared fake LLM server was not started");
   const res = await postChat(sharedServer.base, {

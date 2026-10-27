@@ -105,11 +105,12 @@ test("admin creates a code repository, revalidates it, and sees a 422 for a miss
   ).toBeVisible()
 
   // The stored commit is the real 40-char HEAD of the throwaway repository and
-  // the index column stays a P4 placeholder.
+  // the P4 index projection renders the unindexed placeholder state.
   const row = page.getByRole("row").filter({ hasText: repoName })
   await expect(row).toBeVisible()
   await expect(row.getByText(repoCommit, { exact: true })).toBeVisible()
-  await expect(row).toContainText("未索引（P4）")
+  await expect(row).toContainText("未索引")
+  await expect(row).toContainText("尚未建立 T0 索引。")
   await expect(row).toContainText(repoPath)
   await expect(row).toContainText(repoBranch)
   await expect(row).toContainText("启用")
