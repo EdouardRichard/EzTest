@@ -33,9 +33,11 @@
 
 .NOTES
     This script makes paid upstream calls. It is deliberately not part of
-    scripts/acceptance.ps1, which reports it as gated. PostgreSQL must already be
-    running; the script resets the eztest_e2e database and leaves PostgreSQL
-    running. Compatible with Windows PowerShell 5.1 and PowerShell 7+.
+    scripts/acceptance.ps1, which reports it as gated. When the gate is open
+    (EZTEST_RUN_REAL_LLM=1), missing .env LLM keys are a failure, never a skip.
+    PostgreSQL must already be running; the script resets the eztest_e2e database
+    and leaves PostgreSQL running. Compatible with Windows PowerShell 5.1 and
+    PowerShell 7+.
 #>
 [CmdletBinding()]
 param(
@@ -464,8 +466,6 @@ try {
     New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
 
     $envValues = Read-DotEnv -Path $envPath
-    $adminUsername = Get-RequiredValue -Values $envValues -Key "EZTEST_ADMIN_USERNAME"
-    $adminPassword = Get-RequiredValue -Values $envValues -Key "EZTEST_ADMIN_PASSWORD"
 
     $llmKey = ""
     if ($envValues.ContainsKey("llm_key")) { $llmKey = [string]$envValues["llm_key"] }
@@ -473,10 +473,21 @@ try {
     if ($envValues.ContainsKey("llm_base_url")) { $llmBaseURL = [string]$envValues["llm_base_url"] }
     $llmModel = ""
     if ($envValues.ContainsKey("llm_model_name")) { $llmModel = [string]$envValues["llm_model_name"] }
-    if ([string]::IsNullOrWhiteSpace($llmKey) -or [string]::IsNullOrWhiteSpace($llmBaseURL) -or [string]::IsNullOrWhiteSpace($llmModel)) {
-        Write-Host "SKIPPED: .env does not provide llm_base_url/llm_key/llm_model_name, so no real LLM call can be made."
-        exit 0
+
+    # The gate was explicitly opened, so a missing LLM key is a failure rather
+    # than a skip. Only the key names are reported; values are never printed.
+    $missingLlmKeys = @()
+    if ([string]::IsNullOrWhiteSpace($llmKey)) { $missingLlmKeys += "llm_key" }
+    if ([string]::IsNullOrWhiteSpace($llmBaseURL)) { $missingLlmKeys += "llm_base_url" }
+    if ([string]::IsNullOrWhiteSpace($llmModel)) { $missingLlmKeys += "llm_model_name" }
+    if ($missingLlmKeys.Count -gt 0) {
+        Write-Host ("REAL AGENT LLM ACCEPTANCE FAILED: EZTEST_RUN_REAL_LLM=1 but .env is missing required key(s): " + ($missingLlmKeys -join ", ")) -ForegroundColor Red
+        Write-Host "Refusing to skip the gated run; add the missing key(s) to .env or unset EZTEST_RUN_REAL_LLM." -ForegroundColor Red
+        exit 1
     }
+
+    $adminUsername = Get-RequiredValue -Values $envValues -Key "EZTEST_ADMIN_USERNAME"
+    $adminPassword = Get-RequiredValue -Values $envValues -Key "EZTEST_ADMIN_PASSWORD"
 
     $script:secretValues = @($adminPassword, $llmKey)
     if ($envValues.ContainsKey("EZTEST_SECRET_KEYS")) {

@@ -123,23 +123,34 @@ EzTest/
 │     ├─ eventing/                    # 限界上下文：事件/SSE
 │     ├─ llm/                         # 限界上下文：LLM 配置/网关/模型目录
 │     ├─ storage/                     # 限界上下文：对象存储
-│     └─ audit/                       # 限界上下文：审计
+│     ├─ audit/                       # 限界上下文：审计
+│     └─ agent/                       # 限界上下文：Agent 运行时（P1）
+│        ├─ domain/                   # profile/session/run/message/activity/tool
+│        ├─ application/              # run 循环、上下文组装、工具管线、端口
+│        ├─ infrastructure/           # {postgres,llm,eventing,audit,tools}
+│        └─ interfaces/httpapi/       # /api/agents/* handler、DTO
 ├─ frontend/
 │  ├─ src/app/                        # Next.js App Router，只做页面组装
-│  ├─ src/features/{auth,users,llm-settings,sse-test,shell}/
+│  │  └─ (app)/agents/                # /agents 路由，挂载 agent-console
+│  ├─ src/features/{auth,users,llm-settings,sse-test,shell,agent-console}/
 │  ├─ src/components/ui/              # 共享 UI 原语
 │  ├─ src/lib/                        # api-client / sse-client / auth-storage / utils
 │  ├─ src/hooks/  src/navigation/  src/styles/
 │  └─ package.json
 ├─ deploy/                            # Dockerfile.api / Dockerfile.web / docker-compose.yml
-├─ scripts/                           # dev/db/test/e2e PowerShell 脚本
-├─ docs/openapi/                      # OpenAPI 骨架
+├─ scripts/                           # dev/db/test/e2e/验收脚本
+│  ├─ fake-llm.cjs                    # E2E 确定性 LLM 上游
+│  ├─ e2e.ps1                         # Playwright E2E（fake 上游）
+│  └─ acceptance-agent-llm.ps1        # gated 真实 LLM 验收
+├─ docs/openapi/api.yaml              # OpenAPI 契约
 ├─ docs/superpowers/specs/            # 阶段设计规格（P0 起）
 ├─ .env.example  .gitignore
 └─ .tools/                            # 便携 Go/PostgreSQL（gitignored）
 ```
 
-每个限界上下文**必须**四层齐全：`domain/`、`application/`、`infrastructure/`、`interfaces/httpapi/`。上下文名使用小写单数（`identity`、`eventing`、`llm`、`storage`、`audit`），不得新建 `utils/`、`common/`、`helpers/` 之类杂物目录；共享纯逻辑放 `internal/platform/`。
+每个限界上下文**必须**四层齐全：`domain/`、`application/`、`infrastructure/`、`interfaces/httpapi/`。上下文名使用小写单数（`identity`、`eventing`、`llm`、`storage`、`audit`、`agent`），不得新建 `utils/`、`common/`、`helpers/` 之类杂物目录；共享纯逻辑放 `internal/platform/`。
+
+P1 新增的 `agent` 上下文位于 `backend/internal/agent/`：`infrastructure/` 含 `postgres`、`llm`、`eventing`、`audit`、`tools` 适配，`interfaces/httpapi/` 暴露 `/api/agents/*`。
 
 ### 6.2 导入方向（Go，强制）
 
