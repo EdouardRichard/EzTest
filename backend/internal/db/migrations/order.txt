@@ -6,3 +6,6 @@ eventing_0001_events.sql
 llm_0001_configs.sql
 storage_0001_objects.sql
 agent_0001_profiles_sessions_runs_messages.sql
+resource_0001_catalog.sql
+resource_0002_accounts_sessions.sql
+resource_0003_code_repositories.sql
