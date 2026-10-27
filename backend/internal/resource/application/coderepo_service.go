@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/resource/domain"
 )
@@ -228,4 +229,25 @@ func (s *CodeRepoService) Validate(ctx context.Context, id int64) (*domain.CodeR
 		return nil, err
 	}
 	return codeRepo, nil
+}
+
+// MarkIndexed records a successful code index run (P4 index-state port). It
+// validates that the repository exists and is active, then updates only
+// last_indexed_at. The commit parameter names the indexed commit for the caller
+// but is deliberately not stored: last_commit stays the last validated commit,
+// so indexing never rewrites the P2 validation audit fields or the status. A
+// missing repository is a not-found error and a disabled one is a validation
+// error; neither writes.
+func (s *CodeRepoService) MarkIndexed(ctx context.Context, repoID int64, commit string, at time.Time) error {
+	codeRepo, err := s.repos.GetCodeRepo(ctx, repoID)
+	if err != nil {
+		return err
+	}
+	if codeRepo.Status != domain.StatusActive {
+		return domain.NewInvalid("repoId", "code_repository_disabled",
+			fmt.Sprintf("code repository %d is disabled", repoID))
+	}
+	indexedAt := at
+	codeRepo.LastIndexedAt = &indexedAt
+	return s.repos.UpdateCodeRepo(ctx, codeRepo)
 }

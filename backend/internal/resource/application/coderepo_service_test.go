@@ -586,6 +586,82 @@ func TestCodeRepoServiceGetAndDelete(t *testing.T) {
 	assertCodeRepoDomainError(t, err, domain.KindNotFound, "", "not_found")
 }
 
+// TestCodeRepoServiceMarkIndexed pins the P4 index-state write: the repository
+// must exist and be active, and a successful call rewrites only last_indexed_at
+// (never last_commit/status) without running a Git validation.
+func TestCodeRepoServiceMarkIndexed(t *testing.T) {
+	t.Run("records the index timestamp only", func(t *testing.T) {
+		service, repos, git := newCodeRepoServiceForTest()
+		old := codeRepoTestNow.Add(-48 * time.Hour)
+		seeded := repos.seed(domain.CodeRepository{
+			Key:             "web",
+			Name:            "Web",
+			LocalPath:       "/srv/repo",
+			FixedBranch:     "main",
+			Status:          domain.StatusActive,
+			LastCommit:      "old-commit",
+			LastValidatedAt: &old,
+			LastIndexedAt:   &old,
+		})
+
+		indexedAt := codeRepoTestNow.Add(time.Minute)
+		if err := service.MarkIndexed(context.Background(), seeded.ID, codeRepoTestCommit, indexedAt); err != nil {
+			t.Fatalf("MarkIndexed: %v", err)
+		}
+
+		stored := repos.codeRepos[seeded.ID]
+		if stored.LastIndexedAt == nil || !stored.LastIndexedAt.Equal(indexedAt) {
+			t.Fatalf("lastIndexedAt=%v want %v", stored.LastIndexedAt, indexedAt)
+		}
+		if stored.LastCommit != "old-commit" {
+			t.Fatalf("lastCommit=%q want the validation commit untouched", stored.LastCommit)
+		}
+		if stored.Status != domain.StatusActive {
+			t.Fatalf("status=%q want active", stored.Status)
+		}
+		if stored.LastValidatedAt == nil || !stored.LastValidatedAt.Equal(old) {
+			t.Fatalf("lastValidatedAt=%v want %v", stored.LastValidatedAt, old)
+		}
+		if repos.updateCalls != 1 {
+			t.Fatalf("updateCalls=%d want 1", repos.updateCalls)
+		}
+		if git.calls != 0 {
+			t.Fatalf("git calls=%d want 0: indexing must not re-validate the checkout", git.calls)
+		}
+	})
+
+	t.Run("missing repository is not found", func(t *testing.T) {
+		service, repos, _ := newCodeRepoServiceForTest()
+
+		err := service.MarkIndexed(context.Background(), 404, codeRepoTestCommit, codeRepoTestNow)
+		assertCodeRepoDomainError(t, err, domain.KindNotFound, "", "not_found")
+		if repos.updateCalls != 0 {
+			t.Fatalf("updateCalls=%d want 0", repos.updateCalls)
+		}
+	})
+
+	t.Run("disabled repository is rejected", func(t *testing.T) {
+		service, repos, _ := newCodeRepoServiceForTest()
+		seeded := repos.seed(domain.CodeRepository{
+			Key:         "web",
+			Name:        "Web",
+			LocalPath:   "/srv/repo",
+			FixedBranch: "main",
+			Status:      domain.StatusDisabled,
+			LastCommit:  "old-commit",
+		})
+
+		err := service.MarkIndexed(context.Background(), seeded.ID, codeRepoTestCommit, codeRepoTestNow)
+		assertCodeRepoDomainError(t, err, domain.KindInvalid, "repoId", "code_repository_disabled")
+		if repos.updateCalls != 0 {
+			t.Fatalf("updateCalls=%d want 0", repos.updateCalls)
+		}
+		if stored := repos.codeRepos[seeded.ID]; stored.LastIndexedAt != nil {
+			t.Fatalf("lastIndexedAt=%v want nil", stored.LastIndexedAt)
+		}
+	})
+}
+
 func TestCodeRepoServiceList(t *testing.T) {
 	service, repos, _ := newCodeRepoServiceForTest()
 	active := repos.seed(domain.CodeRepository{Key: "web", Status: domain.StatusActive})

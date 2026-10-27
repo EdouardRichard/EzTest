@@ -1,0 +1,170 @@
+package audit_test
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+
+	auditdomain "github.com/EdouardRichard/EzTest/backend/internal/audit/domain"
+	codeintelaudit "github.com/EdouardRichard/EzTest/backend/internal/codeintel/infrastructure/audit"
+)
+
+// fakeRecorder captures every audit entry the adapter records.
+type fakeRecorder struct {
+	entries []auditdomain.Entry
+	err     error
+}
+
+// Record stores the entry and returns the configured failure.
+func (f *fakeRecorder) Record(_ context.Context, entry auditdomain.Entry) error {
+	f.entries = append(f.entries, entry)
+	return f.err
+}
+
+// auditDetailKeys is the identifier/status allowlist the adapter may persist.
+var auditDetailKeys = map[string]struct{}{
+	"repoId":     {},
+	"versionId":  {},
+	"commit":     {},
+	"baseCommit": {},
+	"headCommit": {},
+	"path":       {},
+	"status":     {},
+	"analysisId": {},
+}
+
+// TestAuditRecorderOmitsCodeContent is the core audit contract: an entry names
+// the actor, action and subject, keeps only identifiers/status in its metadata
+// and never persists code content, diffs or prompts.
+func TestAuditRecorderOmitsCodeContent(t *testing.T) {
+	recorder := &fakeRecorder{}
+	adapter := codeintelaudit.NewRecorder(recorder)
+	detail := map[string]any{
+		"repoId":     int64(42),
+		"commit":     strings.Repeat("a", 40),
+		"path":       "src/api/refund.ts",
+		"status":     "done",
+		"analysisId": int64(9001),
+		"content":    "export const secret = \"TOP_SECRET_CODE\";",
+		"diff":       "+const secret = 'TOP_SECRET_CODE'",
+		"prompt":     "PROMPT_SECRET",
+		"title":      "TITLE_SECRET",
+	}
+
+	err := adapter.Record(context.Background(), 7, "code.read", "code_repository:42", detail)
+	if err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	if len(recorder.entries) != 1 {
+		t.Fatalf("entries=%d want 1", len(recorder.entries))
+	}
+	entry := recorder.entries[0]
+	if entry.Action != "code.read" {
+		t.Fatalf("action=%q want code.read", entry.Action)
+	}
+	if entry.ActorUserID == nil || *entry.ActorUserID != 7 {
+		t.Fatalf("actor=%v want 7", entry.ActorUserID)
+	}
+	if entry.TargetType != "code_repository" || entry.TargetID != "42" {
+		t.Fatalf("target=%q/%q want code_repository/42", entry.TargetType, entry.TargetID)
+	}
+	if len(entry.Metadata) != 5 {
+		t.Fatalf("metadata=%v want exactly the five allowlisted keys", entry.Metadata)
+	}
+	for key := range entry.Metadata {
+		if _, ok := auditDetailKeys[key]; !ok {
+			t.Fatalf("metadata contains non-allowlisted key %q: %v", key, entry.Metadata)
+		}
+	}
+	raw, err := json.Marshal(entry.Metadata)
+	if err != nil {
+		t.Fatalf("marshal metadata: %v", err)
+	}
+	for _, secret := range []string{"TOP_SECRET_CODE", "PROMPT_SECRET", "TITLE_SECRET"} {
+		if strings.Contains(string(raw), secret) {
+			t.Fatalf("metadata leaks %q: %s", secret, raw)
+		}
+	}
+	if entry.Metadata["path"] != "src/api/refund.ts" ||
+		entry.Metadata["commit"] != strings.Repeat("a", 40) ||
+		entry.Metadata["status"] != "done" ||
+		entry.Metadata["repoId"] != int64(42) ||
+		entry.Metadata["analysisId"] != int64(9001) {
+		t.Fatalf("metadata=%v", entry.Metadata)
+	}
+}
+
+// TestAuditRecorderMapsAnalyzeEntry pins the second action: an anonymous
+// analysis trigger keeps a nil actor, and version/base/head identifiers travel
+// in metadata.
+func TestAuditRecorderMapsAnalyzeEntry(t *testing.T) {
+	recorder := &fakeRecorder{}
+	adapter := codeintelaudit.NewRecorder(recorder)
+
+	err := adapter.Record(context.Background(), 0, "code.analyze", "code_analysis:9001", map[string]any{
+		"versionId":  int64(5),
+		"baseCommit": strings.Repeat("b", 40),
+		"headCommit": strings.Repeat("c", 40),
+		"status":     "queued",
+		"analysisId": int64(9001),
+	})
+	if err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	entry := recorder.entries[0]
+	if entry.Action != "code.analyze" {
+		t.Fatalf("action=%q want code.analyze", entry.Action)
+	}
+	if entry.ActorUserID != nil {
+		t.Fatalf("actor=%v want nil for actor id 0", entry.ActorUserID)
+	}
+	if entry.TargetType != "code_analysis" || entry.TargetID != "9001" {
+		t.Fatalf("target=%q/%q", entry.TargetType, entry.TargetID)
+	}
+	if entry.Metadata["versionId"] != int64(5) || entry.Metadata["status"] != "queued" {
+		t.Fatalf("metadata=%v", entry.Metadata)
+	}
+}
+
+// TestAuditRecorderErrors pins the failure contract: an unsupported action is
+// rejected without writing, an empty subject falls back to the code target type,
+// and a recorder failure is returned to the caller.
+func TestAuditRecorderErrors(t *testing.T) {
+	t.Run("unsupported action", func(t *testing.T) {
+		recorder := &fakeRecorder{}
+		adapter := codeintelaudit.NewRecorder(recorder)
+		if err := adapter.Record(context.Background(), 7, "code.delete", "code_repository:42", nil); err == nil {
+			t.Fatal("Record(unsupported action)=nil want an error")
+		}
+		if len(recorder.entries) != 0 {
+			t.Fatalf("entries=%d want 0", len(recorder.entries))
+		}
+	})
+
+	t.Run("subject without a type falls back to code", func(t *testing.T) {
+		recorder := &fakeRecorder{}
+		adapter := codeintelaudit.NewRecorder(recorder)
+		if err := adapter.Record(context.Background(), 7, "code.read", "src/main.go", nil); err != nil {
+			t.Fatalf("Record: %v", err)
+		}
+		entry := recorder.entries[0]
+		if entry.TargetType != "code" || entry.TargetID != "src/main.go" {
+			t.Fatalf("target=%q/%q want code/src/main.go", entry.TargetType, entry.TargetID)
+		}
+	})
+
+	t.Run("recorder failure is returned", func(t *testing.T) {
+		adapter := codeintelaudit.NewRecorder(&fakeRecorder{err: errors.New("audit database down")})
+		if err := adapter.Record(context.Background(), 7, "code.read", "code_repository:42", nil); err == nil {
+			t.Fatal("Record error=nil want the audit failure")
+		}
+	})
+
+	t.Run("a nil recorder is a disabled no-op", func(t *testing.T) {
+		if err := codeintelaudit.NewRecorder(nil).Record(context.Background(), 7, "code.read", "code_repository:42", nil); err != nil {
+			t.Fatalf("Record(nil recorder)=%v want nil", err)
+		}
+	})
+}
