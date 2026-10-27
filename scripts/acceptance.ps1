@@ -188,6 +188,24 @@ function Assert-SafeTestDatabaseUrl {
         if ([string]::IsNullOrWhiteSpace($item.Uri.Host)) {
             throw "$($item.Name) must include a host"
         }
+        # pgx applies query parameters over the URL path and host:port, so a
+        # URL whose path ends in _test can still connect to the development
+        # database via ?dbname= or ?database= (and ?host=/?port= can redirect
+        # the connection). Reject the target-changing keys case-insensitively
+        # instead of trusting the path. The Go validator checks the effective
+        # pgx target as a second layer. Never echo the URL or credentials.
+        $query = $item.Uri.Query
+        if (-not [string]::IsNullOrWhiteSpace($query)) {
+            foreach ($pair in ($query.TrimStart([char]"?")) -split "&") {
+                if ([string]::IsNullOrWhiteSpace($pair)) { continue }
+                $equals = $pair.IndexOf("=")
+                $key = if ($equals -ge 0) { $pair.Substring(0, $equals) } else { $pair }
+                $key = [System.Uri]::UnescapeDataString($key).Trim().ToLowerInvariant()
+                if ($key -eq "dbname" -or $key -eq "database" -or $key -eq "host" -or $key -eq "port") {
+                    throw "$($item.Name) must not override the connection target with the query parameter '$key'; put the host, port and database in the URL itself"
+                }
+            }
+        }
     }
 
     $testName = [System.Uri]::UnescapeDataString($testUri.AbsolutePath.TrimStart([char[]]"/"))
