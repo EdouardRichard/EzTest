@@ -940,6 +940,7 @@ type testDeps struct {
 	attachments      *fakeAttachmentService
 	clarification    *fakeClarificationService
 	messages         *fakeClarificationMessages
+	aiReady          *fakeAIReady
 	events           *fakeEventSnapshotter
 	eventReader      *fakeEventReader
 	eventSubscriber  *fakeEventSubscriber
@@ -959,6 +960,7 @@ func newTestDeps() *testDeps {
 		attachments:      newFakeAttachmentService(&order),
 		clarification:    newFakeClarificationService(),
 		messages:         &fakeClarificationMessages{},
+		aiReady:          &fakeAIReady{},
 		events:           &fakeEventSnapshotter{},
 		eventReader:      &fakeEventReader{},
 		eventSubscriber:  &fakeEventSubscriber{},
@@ -981,6 +983,7 @@ func newTestServer(t *testing.T) (http.Handler, *testDeps) {
 		Attachments:           deps.attachments,
 		Clarification:         deps.clarification,
 		ClarificationMessages: deps.messages,
+		AIReady:               deps.aiReady.Ready,
 		Events:                deps.events,
 		EventReader:           deps.eventReader,
 		EventSubscriber:       deps.eventSubscriber,

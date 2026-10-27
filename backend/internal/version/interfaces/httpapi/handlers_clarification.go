@@ -21,8 +21,6 @@ const (
 	// reconRequirementPageSize is the requirement page size walked when the
 	// context-recon parts are built from every requirement of the version.
 	reconRequirementPageSize = 100
-	// maxReconImages bounds the images injected into one recon run (spec §6.7).
-	maxReconImages = 2
 )
 
 // aiUnavailableErrors are the P1 agent/LLM startup failures of spec §8.6: the
@@ -42,6 +40,7 @@ type ClarificationHandler struct {
 	messages      ClarificationMessagesReader
 	requirements  RequirementService
 	attachments   AttachmentService
+	aiReady       func(context.Context) error
 }
 
 // RegisterRoutes mounts the clarification routes. Authentication is the
@@ -80,6 +79,9 @@ func (h *ClarificationHandler) Overview(w http.ResponseWriter, r *http.Request) 
 // StartSession starts one clarification session (201) with the narrow started
 // body of spec §7.5.
 func (h *ClarificationHandler) StartSession(w http.ResponseWriter, r *http.Request) {
+	if !h.ensureAIReady(w, r) {
+		return
+	}
 	versionID, err := PathID(r, "id")
 	if err != nil {
 		WriteServiceError(w, r, err)
@@ -113,9 +115,10 @@ func (h *ClarificationHandler) CompleteSession(w http.ResponseWriter, r *http.Re
 	WriteData(w, http.StatusOK, newClarificationSessionDTO(session))
 }
 
-// ListMessages returns the persisted P1 conversation projection of the active
-// session, oldest first and with role=system filtered out. before_id is the raw
-// numeric P1 message id (spec §7.5) and next_cursor is its decimal string form.
+// ListMessages returns the persisted P1 conversation projection of the version's
+// latest session (active or completed, so history survives completion), oldest
+// first and with role=system filtered out. before_id is the raw numeric P1
+// message id (spec §7.5) and next_cursor is its decimal string form.
 func (h *ClarificationHandler) ListMessages(w http.ResponseWriter, r *http.Request) {
 	versionID, err := PathID(r, "id")
 	if err != nil {
@@ -132,14 +135,15 @@ func (h *ClarificationHandler) ListMessages(w http.ResponseWriter, r *http.Reque
 		WriteServiceError(w, r, err)
 		return
 	}
-	session, err := h.clarification.CurrentSession(r.Context(), versionID)
+	session, err := h.clarification.LatestSession(r.Context(), versionID)
 	if err != nil {
 		WriteServiceError(w, r, err)
 		return
 	}
 	if session == nil || session.AgentSessionID == nil {
-		// Reading history is not a state transition: a version without an active
-		// conversation has an empty history, not a 409.
+		// Reading history is not a state transition: a version whose latest
+		// session is completed still exposes the persisted conversation, and a
+		// version without any session has an empty history, not a 409.
 		WritePage(w, []clarificationMessageDTO{}, "", false)
 		return
 	}
@@ -174,6 +178,9 @@ func (h *ClarificationHandler) ListMessages(w http.ResponseWriter, r *http.Reque
 // SendMessage starts one text run on the active session (202). An unavailable
 // AI runtime is a retryable 503 ai_unavailable so the UI keeps the draft.
 func (h *ClarificationHandler) SendMessage(w http.ResponseWriter, r *http.Request) {
+	if !h.ensureAIReady(w, r) {
+		return
+	}
 	versionID, err := PathID(r, "id")
 	if err != nil {
 		WriteServiceError(w, r, err)
@@ -195,6 +202,9 @@ func (h *ClarificationHandler) SendMessage(w http.ResponseWriter, r *http.Reques
 // Analyze starts the one-shot requirement-analysis run (202). The run is
 // text-only: the analysis instruction is owned by the service.
 func (h *ClarificationHandler) Analyze(w http.ResponseWriter, r *http.Request) {
+	if !h.ensureAIReady(w, r) {
+		return
+	}
 	versionID, err := PathID(r, "id")
 	if err != nil {
 		WriteServiceError(w, r, err)
@@ -212,6 +222,9 @@ func (h *ClarificationHandler) Analyze(w http.ResponseWriter, r *http.Request) {
 // parts: bounded text summaries and at most two image references. The
 // instruction text part is prepended by StartReconWithParts.
 func (h *ClarificationHandler) Recon(w http.ResponseWriter, r *http.Request) {
+	if !h.ensureAIReady(w, r) {
+		return
+	}
 	versionID, err := PathID(r, "id")
 	if err != nil {
 		WriteServiceError(w, r, err)
@@ -233,8 +246,10 @@ func (h *ClarificationHandler) Recon(w http.ResponseWriter, r *http.Request) {
 // reconParts builds the attachment parts of one recon run from every requirement
 // of the version: text reads are capped at 64 KiB per file and 200 KiB in total
 // for the run, and at most two images at most 2 MiB each are injected as
-// attachment:<id> refs (spec §6.7/§8.4). Oversized images are skipped. A version
-// without attachments yields nil parts.
+// attachment:<id> refs (spec §6.7/§8.4). An oversized image is not injected;
+// instead a small deterministic text note announces the skipped file and is
+// charged to the same 200 KiB text budget. A version without attachments yields
+// nil parts.
 func (h *ClarificationHandler) reconParts(ctx context.Context, versionID int64) ([]versionapp.AgentPart, error) {
 	if h.requirements == nil || h.attachments == nil {
 		return nil, nil
@@ -258,7 +273,19 @@ func (h *ClarificationHandler) reconParts(ctx context.Context, versionID int64) 
 				attachment := &attachments[j]
 				switch attachment.Kind {
 				case domain.AttachmentImage:
-					if images >= maxReconImages || attachment.SizeBytes > domain.MaxAgentImageBytes {
+					if attachment.SizeBytes > domain.MaxAgentImageBytes {
+						// The image cannot be injected, but a small deterministic
+						// note lets the agent tell the user the file was skipped.
+						// It is charged to the text budget like any injected text;
+						// past the budget the note is omitted (spec §6.7).
+						note := reconOversizedImageNote(attachment.Filename, attachment.SizeBytes)
+						if len(note) <= textBudget {
+							textBudget -= len(note)
+							parts = append(parts, versionapp.AgentPart{Type: "text", Text: note})
+						}
+						continue
+					}
+					if images >= domain.MaxAgentImagesPerRun {
 						continue
 					}
 					parts = append(parts, versionapp.AgentPart{
@@ -314,21 +341,49 @@ func reconAttachmentText(filename, content string) string {
 	return fmt.Sprintf("Attachment %s:\n%s", filename, content)
 }
 
+// reconOversizedImageNote renders the deterministic text part that stands in for
+// an image too large to inject (spec §6.7), so the agent can mention the skipped
+// file to the user instead of losing it silently.
+func reconOversizedImageNote(filename string, sizeBytes int64) string {
+	return fmt.Sprintf("Attachment %s was too large to inject (%d bytes, limit %d bytes) and was not included.",
+		filename, sizeBytes, domain.MaxAgentImageBytes)
+}
+
+// ensureAIReady runs the optional AI readiness probe before an endpoint starts
+// an agent run. A nil probe assumes availability (unit tests and partially wired
+// processes); a probe error is the retryable 503 ai_unavailable of spec §8.6.
+func (h *ClarificationHandler) ensureAIReady(w http.ResponseWriter, r *http.Request) bool {
+	if h.aiReady == nil {
+		return true
+	}
+	if err := h.aiReady(r.Context()); err != nil {
+		writeAIUnavailable(w, r)
+		return false
+	}
+	return true
+}
+
 // writeClarificationError maps the P1 agent/LLM startup failures to the P3 503
 // unavailable reason ai_unavailable (retryable) and every other failure to the
 // shared error mapping.
 func writeClarificationError(w http.ResponseWriter, r *http.Request, err error) {
 	if isAIUnavailable(err) {
-		message := "the AI runtime is unavailable"
-		platform.WriteError(w, r, http.StatusServiceUnavailable, platform.CodeUnavailable, message,
-			platform.WithRetryable(true),
-			platform.WithDetails(map[string]any{
-				"reason":  "ai_unavailable",
-				"message": message,
-			}))
+		writeAIUnavailable(w, r)
 		return
 	}
 	WriteServiceError(w, r, err)
+}
+
+// writeAIUnavailable renders the spec §8.6 503 unavailable/ai_unavailable body
+// shared by the readiness probe and the P1 startup failures.
+func writeAIUnavailable(w http.ResponseWriter, r *http.Request) {
+	message := "the AI runtime is unavailable"
+	platform.WriteError(w, r, http.StatusServiceUnavailable, platform.CodeUnavailable, message,
+		platform.WithRetryable(true),
+		platform.WithDetails(map[string]any{
+			"reason":  "ai_unavailable",
+			"message": message,
+		}))
 }
 
 // isAIUnavailable reports whether err is one of the P1 agent startup failures.

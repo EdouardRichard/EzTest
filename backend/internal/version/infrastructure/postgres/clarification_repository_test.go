@@ -126,6 +126,62 @@ func mustCompleteSession(repo *postgres.ClarificationRepository, ctx context.Con
 	return err
 }
 
+// TestClarificationLatestSessionRepository covers the completed-session read
+// behind the message history: the repository returns the newest session even
+// after completion, and nil when the version has none.
+func TestClarificationLatestSessionRepository(t *testing.T) {
+	ctx := context.Background()
+	clar, _, versions := openClarificationTestDB(t)
+	version := insertVersion(t, versions, domain.Version{ID: 1001, Name: "Order v2", Status: domain.VersionClarifying, CreatedBy: 7, UpdatedBy: 7})
+	otherVersion := insertVersion(t, versions, domain.Version{ID: 1002, Name: "Other", Status: domain.VersionClarifying, CreatedBy: 7, UpdatedBy: 7})
+
+	latest, err := clar.LatestSession(ctx, version.ID)
+	if err != nil || latest != nil {
+		t.Fatalf("LatestSession without sessions = %+v/%v, want nil", latest, err)
+	}
+
+	first := &domain.ClarificationSession{ID: 9101, VersionID: version.ID, Status: domain.SessionActive, StartedBy: 42}
+	if err := clar.CreateSession(ctx, first); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	latest, err = clar.LatestSession(ctx, version.ID)
+	if err != nil || latest == nil || latest.ID != first.ID || latest.Status != domain.SessionActive {
+		t.Fatalf("LatestSession active = %+v/%v", latest, err)
+	}
+
+	// Completion keeps the session readable as the latest one.
+	if _, err := clar.CompleteSession(ctx, first.ID, 43); err != nil {
+		t.Fatalf("CompleteSession: %v", err)
+	}
+	latest, err = clar.LatestSession(ctx, version.ID)
+	if err != nil || latest == nil || latest.ID != first.ID ||
+		latest.Status != domain.SessionCompleted || latest.EndedAt == nil {
+		t.Fatalf("LatestSession completed = %+v/%v", latest, err)
+	}
+
+	// A newer session, active or completed, becomes the latest.
+	second := &domain.ClarificationSession{ID: 9102, VersionID: version.ID, Status: domain.SessionActive, StartedBy: 44}
+	if err := clar.CreateSession(ctx, second); err != nil {
+		t.Fatalf("CreateSession second: %v", err)
+	}
+	latest, err = clar.LatestSession(ctx, version.ID)
+	if err != nil || latest == nil || latest.ID != second.ID || latest.Status != domain.SessionActive {
+		t.Fatalf("LatestSession second active = %+v/%v", latest, err)
+	}
+	if _, err := clar.CompleteSession(ctx, second.ID, 44); err != nil {
+		t.Fatalf("CompleteSession second: %v", err)
+	}
+	latest, err = clar.LatestSession(ctx, version.ID)
+	if err != nil || latest == nil || latest.ID != second.ID || latest.Status != domain.SessionCompleted {
+		t.Fatalf("LatestSession second completed = %+v/%v", latest, err)
+	}
+
+	// Sessions of another version are never returned.
+	if latest, err := clar.LatestSession(ctx, otherVersion.ID); err != nil || latest != nil {
+		t.Fatalf("LatestSession of another version = %+v/%v, want nil", latest, err)
+	}
+}
+
 // TestClarificationQuestionRepository covers question create/get/list/update and
 // the open-question transitions against the real schema.
 func TestClarificationQuestionRepository(t *testing.T) {
