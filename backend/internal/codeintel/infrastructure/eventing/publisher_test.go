@@ -118,12 +118,18 @@ func TestImpactEventPayloadCaps(t *testing.T) {
 		t.Fatal("summary was not truncated")
 	}
 
-	// detail: ids/counts only, never code content or diff text.
+	// detail: ids/counts only, never code content or diff text. analysisId is a
+	// codeintel snowflake id, so D29/INV-9 require a decimal string rather than
+	// a JSON number that a JavaScript consumer would round.
 	if len(event.Detail) > 64<<10 {
 		t.Fatalf("detail is %d bytes, want at most 64 KiB", len(event.Detail))
 	}
 	detail := detailMap(t, event.Detail)
-	if detail["analysisId"] != float64(1001) || detail["baseCommit"] != "base-commit" || detail["headCommit"] != "head-commit" {
+	analysisID, ok := detail["analysisId"].(string)
+	if !ok || analysisID != "1001" {
+		t.Fatalf("detail.analysisId=%v (%T) want the decimal string %q", detail["analysisId"], detail["analysisId"], "1001")
+	}
+	if detail["baseCommit"] != "base-commit" || detail["headCommit"] != "head-commit" {
 		t.Fatalf("detail=%v", detail)
 	}
 	statsDetail, ok := detail["stats"].(map[string]any)
@@ -217,7 +223,11 @@ func TestImpactComputedEventPayloadCaps(t *testing.T) {
 		t.Fatalf("detail is %d bytes, want at most 64 KiB", len(event.Detail))
 	}
 	detail := detailMap(t, event.Detail)
-	if detail["analysisId"] != float64(2002) || detail["analysisVersion"] != float64(3) ||
+	analysisID, ok := detail["analysisId"].(string)
+	if !ok || analysisID != "2002" {
+		t.Fatalf("detail.analysisId=%v (%T) want the decimal string %q", detail["analysisId"], detail["analysisId"], "2002")
+	}
+	if detail["analysisVersion"] != float64(3) ||
 		detail["status"] != "done" || detail["degraded"] != true {
 		t.Fatalf("detail=%v", detail)
 	}
@@ -265,6 +275,28 @@ func TestPublisherContract(t *testing.T) {
 		}
 		if len(recorder.events) != 0 {
 			t.Fatalf("published %d events on invalid stats", len(recorder.events))
+		}
+	})
+
+	t.Run("an over-64KiB detail is rejected before publishing", func(t *testing.T) {
+		recorder := &fakeEventPublisher{}
+		publisher := codeinteleventing.NewPublisher(recorder)
+		// The stats block is allowlisted to four counters, but the commit
+		// fields are caller strings: an oversized one must trip the envelope
+		// bound instead of reaching the event store.
+		err := publisher.Changed(ctx, 5, codeintelapp.ChangedEvent{
+			AnalysisID: 1,
+			BaseCommit: strings.Repeat("a", 64<<10),
+			Stats:      []byte(`{"changedFiles":1}`),
+		})
+		if err == nil {
+			t.Fatal("Changed(oversized detail)=nil want the 64 KiB bound error")
+		}
+		if !strings.Contains(err.Error(), "detail") {
+			t.Fatalf("error %v is not the detail size failure", err)
+		}
+		if len(recorder.events) != 0 {
+			t.Fatalf("published %d events with an over-limit detail", len(recorder.events))
 		}
 	})
 

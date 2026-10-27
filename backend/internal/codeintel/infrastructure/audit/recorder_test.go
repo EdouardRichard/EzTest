@@ -87,11 +87,27 @@ func TestAuditRecorderOmitsCodeContent(t *testing.T) {
 			t.Fatalf("metadata leaks %q: %s", secret, raw)
 		}
 	}
+
+	// Review R23 / D29 / INV-9: identifier values must be decimal strings in the
+	// persisted JSON, never numbers, so a snowflake id cannot lose precision.
+	var persisted map[string]any
+	if err := json.Unmarshal(raw, &persisted); err != nil {
+		t.Fatalf("unmarshal metadata: %v", err)
+	}
+	for _, key := range []string{"repoId", "analysisId"} {
+		if _, ok := persisted[key].(string); !ok {
+			t.Fatalf("metadata %s=%v (%T) want a decimal string", key, persisted[key], persisted[key])
+		}
+	}
+	if persisted["analysisId"] != "9001" || persisted["repoId"] != "42" {
+		t.Fatalf("metadata ids=%v want analysisId=\"9001\", repoId=\"42\"", persisted)
+	}
+
 	if entry.Metadata["path"] != "src/api/refund.ts" ||
 		entry.Metadata["commit"] != strings.Repeat("a", 40) ||
 		entry.Metadata["status"] != "done" ||
-		entry.Metadata["repoId"] != int64(42) ||
-		entry.Metadata["analysisId"] != int64(9001) {
+		entry.Metadata["repoId"] != "42" ||
+		entry.Metadata["analysisId"] != "9001" {
 		t.Fatalf("metadata=%v", entry.Metadata)
 	}
 }
@@ -123,9 +139,65 @@ func TestAuditRecorderMapsAnalyzeEntry(t *testing.T) {
 	if entry.TargetType != "code_analysis" || entry.TargetID != "9001" {
 		t.Fatalf("target=%q/%q", entry.TargetType, entry.TargetID)
 	}
-	if entry.Metadata["versionId"] != int64(5) || entry.Metadata["status"] != "queued" {
+	if entry.Metadata["versionId"] != "5" || entry.Metadata["status"] != "queued" {
 		t.Fatalf("metadata=%v", entry.Metadata)
 	}
+	if entry.Metadata["analysisId"] != "9001" {
+		t.Fatalf("metadata.analysisId=%v want the decimal string \"9001\"", entry.Metadata["analysisId"])
+	}
+}
+
+// TestAuditRecorderNormalizesIDKeys pins review R23: whatever numeric shape a
+// caller uses for an identifier, the recorded metadata carries the decimal
+// string. Values that are not decimal identifiers are dropped rather than
+// persisted under an id key.
+func TestAuditRecorderNormalizesIDKeys(t *testing.T) {
+	record := func(t *testing.T, detail map[string]any) auditdomain.Entry {
+		t.Helper()
+		recorder := &fakeRecorder{}
+		adapter := codeintelaudit.NewRecorder(recorder)
+		if err := adapter.Record(context.Background(), 7, "code.analyze", "code_analysis:9001", detail); err != nil {
+			t.Fatalf("Record: %v", err)
+		}
+		if len(recorder.entries) != 1 {
+			t.Fatalf("entries=%d want 1", len(recorder.entries))
+		}
+		return recorder.entries[0]
+	}
+
+	t.Run("numeric ids become decimal strings", func(t *testing.T) {
+		entry := record(t, map[string]any{
+			"analysisId": int64(9001),
+			"versionId":  7,
+			"repoId":     json.Number("42"),
+		})
+		if entry.Metadata["analysisId"] != "9001" || entry.Metadata["versionId"] != "7" || entry.Metadata["repoId"] != "42" {
+			t.Fatalf("metadata=%v want decimal string ids", entry.Metadata)
+		}
+	})
+
+	t.Run("decimal strings pass through unchanged", func(t *testing.T) {
+		entry := record(t, map[string]any{
+			"analysisId": "9001",
+			"versionId":  "7",
+			"repoId":     "42",
+		})
+		if entry.Metadata["analysisId"] != "9001" || entry.Metadata["versionId"] != "7" || entry.Metadata["repoId"] != "42" {
+			t.Fatalf("metadata=%v want the caller's decimal strings", entry.Metadata)
+		}
+	})
+
+	t.Run("non-decimal id values are dropped", func(t *testing.T) {
+		entry := record(t, map[string]any{
+			"analysisId": true,
+			"versionId":  "not-an-id",
+			"repoId":     -1,
+			"path":       "src/main.go",
+		})
+		if len(entry.Metadata) != 1 || entry.Metadata["path"] != "src/main.go" {
+			t.Fatalf("metadata=%v want only the path key", entry.Metadata)
+		}
+	})
 }
 
 // TestAuditRecorderErrors pins the failure contract: an unsupported action is

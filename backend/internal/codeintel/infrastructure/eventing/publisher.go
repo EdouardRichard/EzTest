@@ -58,8 +58,9 @@ func NewPublisher(events EventPublisher) *Publisher {
 var _ codeintelapp.ImpactNotifier = (*Publisher)(nil)
 
 // Changed publishes code.changed after a change set is ready. The payload
-// carries the analysis id, both commits and the deterministic stats summary; the
-// event summary and refs.code are bounded, deduplicated and sorted.
+// carries the analysis id (as a decimal string: D29/INV-9), both commits and the
+// deterministic stats summary; the event summary and refs.code are bounded,
+// deduplicated and sorted.
 func (p *Publisher) Changed(ctx context.Context, versionID int64, e codeintelapp.ChangedEvent) error {
 	if p == nil || p.events == nil {
 		return nil
@@ -69,7 +70,7 @@ func (p *Publisher) Changed(ctx context.Context, versionID int64, e codeintelapp
 		return err
 	}
 	detail, err := encodeDetail(map[string]any{
-		"analysisId": e.AnalysisID,
+		"analysisId": strconv.FormatInt(e.AnalysisID, 10),
 		"baseCommit": e.BaseCommit,
 		"headCommit": e.HeadCommit,
 		"stats":      stats,
@@ -82,15 +83,16 @@ func (p *Publisher) Changed(ctx context.Context, versionID int64, e codeintelapp
 }
 
 // ImpactComputed publishes code.impact_computed after an analysis reaches its
-// terminal state. The counts are allowlisted to the four documented counters and
-// the evidence paths are deduplicated, sorted and capped in refs.code.
+// terminal state. The analysis id is a decimal string (D29/INV-9), the counts
+// are allowlisted to the four documented counters and the evidence paths are
+// deduplicated, sorted and capped in refs.code.
 func (p *Publisher) ImpactComputed(ctx context.Context, versionID int64, e codeintelapp.ImpactEvent) error {
 	if p == nil || p.events == nil {
 		return nil
 	}
 	counts := impactCounts(e.Counts)
 	detail, err := encodeDetail(map[string]any{
-		"analysisId":      e.AnalysisID,
+		"analysisId":      strconv.FormatInt(e.AnalysisID, 10),
 		"analysisVersion": e.AnalysisVersion,
 		"status":          e.Status,
 		"degraded":        e.Degraded,

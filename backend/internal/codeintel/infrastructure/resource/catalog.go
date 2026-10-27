@@ -51,9 +51,10 @@ type Catalog struct {
 
 // NewCatalog wires the adapter to the P2 code repository reader and, optionally,
 // the P2 app model reader. P2 splits those two reads across CodeRepoService and
-// CatalogService, so a caller that needs both passes both; a caller that only
-// reads repositories may omit the app model reader and will get a configuration
-// error from ListBySystem.
+// CatalogService, so the composition root must call NewCatalog(repoSvc,
+// catalogSvc) to serve both ports; omitting the app model reader is only
+// supported for repo-catalog-only processes and makes ListBySystem return a
+// configuration error.
 func NewCatalog(codeRepos CodeRepositoryReader, appModels ...AppModelReader) *Catalog {
 	catalog := &Catalog{codeRepos: codeRepos}
 	if len(appModels) > 0 {

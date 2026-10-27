@@ -119,6 +119,15 @@ func TestCatalogMapsRepoInfo(t *testing.T) {
 	if info.IncludeGlobs[0] != "src/**" {
 		t.Fatalf("includeGlobs aliases stored state: %v", info.IncludeGlobs)
 	}
+
+	wantIndexedAt := indexedAt
+	*reader.repo.LastIndexedAt = indexedAt.Add(24 * time.Hour)
+	if info.LastIndexedAt == reader.repo.LastIndexedAt {
+		t.Fatal("lastIndexedAt aliases the stored row pointer")
+	}
+	if !info.LastIndexedAt.Equal(wantIndexedAt) {
+		t.Fatalf("lastIndexedAt=%v want the cloned %v", info.LastIndexedAt, wantIndexedAt)
+	}
 }
 
 // TestCatalogMapsMissingRepoToValidationError pins the spec §7.1 reason: a
@@ -214,6 +223,21 @@ func TestCatalogPagesThroughAppModelNodes(t *testing.T) {
 	}
 	if appModels.filters[1].Page.AfterID != 100 {
 		t.Fatalf("second page afterID=%d want 100", appModels.filters[1].Page.AfterID)
+	}
+}
+
+// TestCatalogRequiresItsDependencies pins that a partially wired catalog fails
+// loudly on the port it cannot serve instead of panicking. T18 must pass both
+// the code repository reader and the app model reader.
+func TestCatalogRequiresItsDependencies(t *testing.T) {
+	repoOnly := codeintelresource.NewCatalog(&fakeCodeRepoReader{})
+	if _, err := repoOnly.ListBySystem(context.Background(), 1, nil); err == nil {
+		t.Fatal("ListBySystem without the app model reader=nil want a configuration error")
+	}
+
+	appModelsOnly := codeintelresource.NewCatalog(nil, &fakeAppModelReader{})
+	if _, err := appModelsOnly.Get(context.Background(), 1); err == nil {
+		t.Fatal("Get without the code repository reader=nil want a configuration error")
 	}
 }
 
