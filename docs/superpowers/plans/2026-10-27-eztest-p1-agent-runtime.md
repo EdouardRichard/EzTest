@@ -135,7 +135,7 @@ git commit -m "docs: record D27 runtime-validation agent decision"
 1. 从 `.env` 读取三个值；
 2. 第一次 `POST {base}/chat/completions`：`model`、`messages=[{role:user,content:"读取 /api/health 并告诉我状态"}]`、`tools=[{type:function,function:{name:"http_get",description:"GET a URL",parameters:{type:object,properties:{url:{type:string}},required:["url"]}}}]`、`thinking={type:enabled}`、`reasoning_effort=max`、`max_tokens=2048`、`stream=false`；
 3. 断言响应 `choices[0].message.tool_calls` 非空、`reasoning_content` 非空；
-4. 第二次请求：把第一次的 assistant 消息（含 `content`/`reasoning_content`/`tool_calls`）原样加入，再追加 `{role:"tool",tool_call_id:<id>,content:"{\"status\":\"ok\"}"}`，同样带 `tools`/`thinking`/`reasoning_effort`；
+4. 第二次请求：把第一次的 assistant 消息（含 `content`/`reasoning_content`/`tool_calls`）原样加入，再**对每一个返回的 tool_call id 各追加一条** `{role:"tool",tool_call_id:<id>,content:"{\"status\":\"ok\"}"}`（缺任何一条上游会 400：`insufficient tool messages following tool_calls message`），同样带 `tools`/`thinking`/`reasoning_effort`；
 5. 断言第二次返回 200 且 `content` 非空；只打印 `SPIKE OK tool_calls=<n> reasoning_chars=<n> second_status=200`。
 
 - [ ] **Step 2: 运行**
@@ -144,7 +144,7 @@ Run:
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .tmp\spike-agent-llm.ps1
 ```
-Expected: `SPIKE OK ...`；若 400/无 tool_calls/无 reasoning_content，**停止**并在报告中给出原始错误码与消息（不含 Key）。
+Expected: `SPIKE OK ...`；若 400/无 tool_calls/无 reasoning_content，**停止**并在报告中给出原始错误码与消息（不含 Key）。若第一次返回 N 个 tool calls，第二次必须回答全部 N 个（协议要求，不是放宽探针）。
 
 - [ ] **Step 3: 记录结果**
 
