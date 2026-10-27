@@ -95,7 +95,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1
 ```
 
-P3 的 Playwright E2E（`frontend/e2e/versions*.spec.ts`，共 3 个 spec）已落地并纳入 `scripts/e2e.ps1`；T19 记录完整套件 17 passed、P3 3 passed，真实 LLM 人工验收仍为 gated。
+P3 的 Playwright E2E（`frontend/e2e/versions*.spec.ts`，共 3 个 spec）已落地并纳入 `scripts/e2e.ps1`；T20 记录完整套件 22 passed（含 P3 3 个与 P4 5 个 spec），真实 LLM 人工验收仍为 gated。
 
 真实 LLM 的 P3 人工验收为 gated：需 `.env` 配置有效 `llm_*`、显式设置 `EZTEST_ACCEPTANCE_REAL_LLM=1`，并人工执行创建版本/需求/附件 → ≥2 轮澄清 → 确认 → 进入设计；截图保存到 `.tmp/p3-acceptance/`（spec §10.7）。
 
@@ -129,14 +129,17 @@ cd ..
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/fixture-codeintel-repo.ps1
 node scripts/fake-llm.p4.test.cjs
 
-# 仅 P4 静态门禁（OpenAPI/README/env/迁移 + fake-LLM，不需要数据库与 Playwright）
+# 仅 P4 静态门禁（OpenAPI/README/env/迁移 + fake-LLM，不需要数据库与 Playwright；
+# 仍需 Node、frontend/node_modules/yaml 与 git）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1 -StaticOnly
 
-# 完整 P0–P4 验收（P4 OpenAPI needle、reason、事件与 fake-LLM 测试已纳入；真实 LLM 仍 gated）
+# 完整 P0–P4 验收（P4 OpenAPI needle、reason、事件、fake-LLM 测试与 5 个 P4 Playwright spec 已纳入；真实 LLM 仍 gated）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1
 ```
 
-P4 的真实 LLM 验收是 gated：未设置 `EZTEST_RUN_REAL_LLM=1` 时 `scripts/acceptance-codeintel-llm.ps1` 打印 `SKIPPED` 并退出 0。设置后脚本会克隆 EzTest 自身到 `.tmp/p4-real-repo`（或用 `EZTEST_ACCEPTANCE_P4_REPO` 指向的现有 Git 检查点；可写时创建 `p4-acceptance` 分支，只读时复用已有分支绑定版本）并选择一个真实 `base..head`（≤20 个变更文件），创建绑定版本、2 条需求（其中标题含 `P4-AI-IMPACT`），并在可用变更文件上尝试创建 1 个需求锚点（没有可锚定文件时记录 warning/skipped，不声称已建锚点），触发真实影响分析并校验：变更列表与 `git diff --name-status` 一致、AI 证据哈希按 commit 内容复算、候选带非空 reason/合法 confidence（high/medium 至少一条 path 证据）且命中需求、unmapped 至少 1 条（默认强制；确需接受全映射 commit 对时显式传 `-AllowNoUnmapped`，输出与结果 JSON 会记录该放宽）、二次 POST `reused=true` 且规范化候选 JSON 完全一致、同仓库/base 的第二个版本分析同一 head 时 `stats.cacheHits>0`、`force` 产生 `analysisVersion+1` 且旧分析不变；结果写入 `.tmp/p4-real-acceptance.json`。可用 `EZTEST_ACCEPTANCE_P4_BASE`/`EZTEST_ACCEPTANCE_P4_HEAD` 指定真实 commit 对，用 `EZTEST_ACCEPTANCE_API_URL` 复用已运行的 API，或用 `-DryRun` 只检查 `.env` 键名与工具链（不克隆、不启动 API、不调用 LLM）；脚本日志不含代码正文、提示词或密钥。P4 的 Playwright E2E 覆盖由 Task 20 补充落地；当前 `scripts/e2e.ps1` 门禁仍只覆盖 P0–P3，不声称 P4 E2E 已运行。
+P4 的真实 LLM 验收是 gated：未设置 `EZTEST_RUN_REAL_LLM=1` 时 `scripts/acceptance-codeintel-llm.ps1` 打印 `SKIPPED` 并退出 0。设置后脚本会先校验 `EZTEST_DATABASE_URL`（postgres 协议、显式 host 与有效 port（缺省按 5432），拒绝 `?dbname=`/`?database=`/`?host=`/`?port=` 等改目标参数，并确认 API 与 psql 指向同一个 `eztest_e2e`），再把来源仓库（默认当前 checkout；或 `EZTEST_ACCEPTANCE_P4_REPO` 指定的 Git 仓库）克隆到 `.tmp/p4-real-repo`（每次重建，来源仓库只被读取、绝不写入），在克隆内创建唯一验收分支并选择一个真实 `base..head`（≤20 个变更文件）；随后创建绑定版本、2 条需求（其中标题含 `P4-AI-IMPACT`），并在可用变更文件上尝试创建 1 个需求锚点（没有可锚定文件时记录 warning/skipped，不声称已建锚点），触发真实影响分析并校验：变更列表与带 50% rename 检测的 `git diff --name-status -z` 一致、AI 证据哈希按 commit 内容复算、候选带非空 reason/合法 confidence（high/medium 至少一条 path 证据）且命中需求、每个变更文件都被事实/锚点覆盖或进入 unmapped（§10.7 无静默遗漏）、unmapped 至少 1 条（默认强制；确需接受全映射 commit 对时显式传 `-AllowNoUnmapped`，输出与结果 JSON 会记录该放宽）、`stats.unmapped` 与列表一致（截断时除外）、二次 POST `reused=true` 且规范化候选 JSON 完全一致、同仓库/base 的第二个版本分析同一 head 时 `stats.cacheHits>0`、`force` 产生 `analysisVersion+1` 且旧分析不变；结果（含 `analysis.model`/`promptVersion` 与 degraded 标记）写入 `.tmp/p4-real-acceptance.json`。脚本默认 fail-closed：`llm_configured=false` 或任一分析（含复用 API 与 force 路径）返回 `degraded=true` 时直接失败；只有显式传 `-AllowDegraded` 才记录 `passed_degraded` 并跳过 AI-only 断言。可用 `EZTEST_ACCEPTANCE_P4_BASE`/`EZTEST_ACCEPTANCE_P4_HEAD` 指定真实 commit 对，用 `EZTEST_ACCEPTANCE_API_URL` 复用已运行的 API，或用 `-DryRun` 只检查 `.env` 键名、数据库目标 preflight 与工具链（不克隆、不启动 API、不调用 LLM）；脚本日志不含代码正文、提示词或密钥。
+
+P4 的 Playwright E2E 已落地 5 个 spec（`versions-code.spec.ts`、`versions-code-cache.spec.ts`、`versions-code-degraded.spec.ts`、`versions-code-anchors.spec.ts`、`code-repos-index.spec.ts`），由 `scripts/e2e.ps1` 跑完整套件时执行（T20 记录 22/22 通过）；`scripts/acceptance.ps1` 也将这 5 个 spec 的静态存在性纳入 P4 检查。
 
 ## 技术架构
 
@@ -370,16 +373,17 @@ pnpm dev
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test.ps1
 
 # 完整 P0–P4 验收（Go 单元/集成、Agent 单元/集成、Version 单元/集成、codeintel 单元/集成、
-# 前端 lint/typecheck/test/build、Playwright E2E、迁移重复执行、健康/审计/版本 API 冒烟、
+# 前端 lint/typecheck/test/build、Playwright E2E（含 5 个 P4 spec）、迁移重复执行、健康/审计/版本 API 冒烟、
 # 交付物与 OpenAPI P1/P2/P3/P4 契约、P3/P4 错误 reason 与事件目录检查、P4 fake-LLM 契约）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1
 
-# 仅静态检查（README/OpenAPI/env/Compose/迁移契约 + P4 fake-LLM，不启动数据库/API/Playwright）
+# 仅静态检查（README/OpenAPI/env/Compose/迁移契约 + P4 fake-LLM，不启动数据库/API/Playwright；
+# 仍需 Node、frontend/node_modules/yaml 与 git）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1 -StaticOnly
 
 # 仅 E2E（会自行启动/停止 API、Web、fake LLM 上游与 fixture target，使用 eztest_e2e 库；
-# 当前覆盖 P0 场景、P1 Agent 控制台与 P2 Session；P3 版本工作台/澄清/降级的
-# Playwright 用例（frontend/e2e/versions*.spec.ts 已纳入 P3 E2E）
+# 当前覆盖 P0 场景、P1 Agent 控制台、P2 Session、P3 版本工作台/澄清/降级，以及 P4
+# 代码理解/缓存/降级/锚点/仓库索引 5 个 spec；T20 记录 22/22 通过）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1
 
 # Compose 静态校验（不需要 Docker 守护进程）
@@ -408,8 +412,8 @@ node scripts/validate-compose.mjs
 
 - 本机没有 Docker，`scripts/acceptance.ps1` 会把“Compose 容器运行”标为 **SKIPPED**；Compose 仅通过 `validate-compose.mjs` 做静态字段校验，不代表已运行验证。P1 真实 Agent LLM、P3 真实 LLM 人工验收与 P4 真实 LLM 验收同样标为 **SKIPPED**（见下节）。
 - 常规测试不访问真实 LLM：Go 测试使用 `httptest` mock（`/v1/chat/completions`、`/v1/responses`、`/v1/models`，可注入 429/5xx/超时/分片）；`scripts/e2e.ps1` 使用 `scripts/fake-llm.cjs`（127.0.0.1:13334）并覆盖 `llm_*`，E2E 零 LLM 费用；P4 的 `scripts/fake-llm.p4.test.cjs` 同样只启动本地 fake 上游。
-- `acceptance.ps1 -StaticOnly` 可在没有 `.env`/数据库/Playwright 的主机上运行：它校验 README/OpenAPI/env/Compose 契约、从 `order.txt` 动态推导 P4 迁移与表清单、解析 OpenAPI YAML，并执行 P4 fake-LLM 测试。
-- `acceptance.ps1` 额外校验 `docs/openapi/api.yaml` 含 P1 的 `/api/agents/sessions`、`agent.activity`、`reasoning_tokens`，P2 的 `/api/resources/systems`、`/api/resources/sessions`、`/api/resources/code-repos`、`storageState`、`credentialSet`，P3 的 `/api/versions`、`clarification`、`enter-design`、`snowflake`、`version-attachments` 关键词、全部 P3 错误 reason（含字段级 `invalid_context_summary`）、全部版本事件类型（含 `clarification.context_updated`），以及 P4 的 `/api/code/repos/{repoId}/index`、`/api/versions/{versionId}/code/analyses`、全部 P4 path/schema、`CodeErrorReason`（含 `analysis_in_progress`、`anchor_duplicate`、`analysis_queue_full`、`git_unavailable`、`path_not_git_repo`）与 `code.changed`/`code.impact_computed` 事件；同时校验 `.env.example` 的 Agent/P3/P4 变量与 Compose 的附件目录；P1/P3/P4 DoD 与检查项/证据的映射会打印在汇总后。P4 Playwright E2E 由 Task 20 交付，当前门禁不包含 P4 E2E。
+- `acceptance.ps1 -StaticOnly` 可在没有 `.env`/数据库/Playwright 的主机上运行：它校验 README/OpenAPI/env/Compose 契约、从 `order.txt` 动态推导 P4 迁移与表清单、解析 OpenAPI YAML，并执行 P4 fake-LLM 测试。仍需要 Node、`frontend/node_modules/yaml` 与 git（P4 fixture）。
+- `acceptance.ps1` 额外校验 `docs/openapi/api.yaml` 含 P1 的 `/api/agents/sessions`、`agent.activity`、`reasoning_tokens`，P2 的 `/api/resources/systems`、`/api/resources/sessions`、`/api/resources/code-repos`、`storageState`、`credentialSet`，P3 的 `/api/versions`、`clarification`、`enter-design`、`snowflake`、`version-attachments` 关键词、全部 P3 错误 reason（含字段级 `invalid_context_summary`）、全部版本事件类型（含 `clarification.context_updated`），以及 P4 的 `/api/code/repos/{repoId}/index`、`/api/versions/{versionId}/code/analyses`、全部 P4 path/schema、`CodeErrorReason`（含 `analysis_in_progress`、`anchor_duplicate`、`analysis_queue_full`、`git_unavailable`、`path_not_git_repo`）与 `code.changed`/`code.impact_computed` 事件；同时校验 `.env.example` 的 Agent/P3/P4 变量、Compose 的附件目录与 5 个 P4 Playwright spec 是否存在；P1/P3/P4 DoD 与检查项/证据的映射会打印在汇总后。P4 E2E 由 `scripts/e2e.ps1` 的完整 Playwright 套件执行（T20 记录 22/22 通过）。
 - 通过条件：所有非 SKIPPED 检查 FAIL 数为 0，脚本退出码为 0。
 
 ## 真实 LLM（gated）
@@ -418,9 +422,9 @@ node scripts/validate-compose.mjs
 
 1. `.env` 中 `llm_base_url` / `llm_key` / `llm_model_name` 有效；
 2. 显式设置 `EZTEST_RUN_REAL_LLM=1`（P0/P1/P4 脚本）或 `EZTEST_ACCEPTANCE_REAL_LLM=1`（P3 人工验收）；
-3. 运行 P0 连通性验收 `scripts/acceptance-llm.ps1`，或 P1 Agent 真实验收 `scripts/acceptance-agent-llm.ps1`（后者验证 `deepseek-flash` 思考模式 + 工具调用 + 终态，并断言 `reasoning_tokens>0`），或 P4 代码智能真实验收 `scripts/acceptance-codeintel-llm.ps1`（真实 Git diff + 证据哈希 + 候选 + 缓存/force 版本；结果写 `.tmp/p4-real-acceptance.json`），或按 P3 章节人工执行澄清/分析/侦察验收。
+3. 运行 P0 连通性验收 `scripts/acceptance-llm.ps1`，或 P1 Agent 真实验收 `scripts/acceptance-agent-llm.ps1`（后者验证 `deepseek-flash` 思考模式 + 工具调用 + 终态，并断言 `reasoning_tokens>0`），或 P4 代码智能真实验收 `scripts/acceptance-codeintel-llm.ps1`（真实 Git diff + 证据哈希 + 候选 + unmapped 完整性 + 缓存/force 版本，结果含 `analysis.model`/`promptVersion` provenance 与 degraded 标记，写入 `.tmp/p4-real-acceptance.json`），或按 P3 章节人工执行澄清/分析/侦察验收。
 
-P4 脚本可选配置：`EZTEST_ACCEPTANCE_P4_REPO`（已存在的 Git 检查点路径；默认可写克隆 `./.tmp/p4-real-repo`，不存在时从当前仓库克隆；只读检查点会复用已有分支）、`EZTEST_ACCEPTANCE_P4_BASE`/`EZTEST_ACCEPTANCE_P4_HEAD`（显式 40-hex commit 对，base 必须是 head 的祖先且变更文件 ≤20）、`EZTEST_ACCEPTANCE_API_URL`（复用已在运行的 API；默认重置 `eztest_e2e` 并启动当前源码构建的 API）。默认要求分析结果至少包含 1 条真实 unmapped；若显式 commit 对全映射，可传 `-AllowNoUnmapped` 记录为 skipped/warning（不得静默通过）。脚本不会把仓库内容、提示词或密钥写入日志；降级（`degraded=true`）时会记录 `passed_degraded` 并跳过 AI-only 断言（含 cacheHits 断言）。
+P4 脚本可选配置：`EZTEST_ACCEPTANCE_P4_REPO`（来源 Git 仓库路径，默认当前仓库；脚本总是把它克隆到 `./.tmp/p4-real-repo` 并在克隆内创建唯一验收分支，来源仓库只读、绝不被写入）、`EZTEST_ACCEPTANCE_P4_BASE`/`EZTEST_ACCEPTANCE_P4_HEAD`（显式 40-hex commit 对，base 必须是 head 的祖先且变更文件 ≤20）、`EZTEST_ACCEPTANCE_API_URL`（复用已在运行的 API；默认重置 `eztest_e2e` 并启动当前源码构建的 API，启动前校验数据库 URL 不能通过 query 参数改目标）。默认要求分析结果至少包含 1 条真实 unmapped；若显式 commit 对全映射，可传 `-AllowNoUnmapped` 记录为 skipped/warning（不得静默通过）。脚本不会把仓库内容、提示词或密钥写入日志。默认 fail-closed：`llm_configured=false` 或任一分析（含复用 API 与 force 路径）`degraded=true` 时失败；显式传 `-AllowDegraded` 才记录 `passed_degraded` 并跳过 AI-only 断言（含 cacheHits 断言）。
 
 普通 `go test`、`pnpm test`、E2E 与 `scripts/acceptance.ps1` 都不会访问真实 LLM。P1/P4 的真实验收与 P3 的人工验收都不进入默认门禁，需人工显式执行。配置也可在管理员登录后于设置页创建/更新，Key 留空表示保留原值。
 
