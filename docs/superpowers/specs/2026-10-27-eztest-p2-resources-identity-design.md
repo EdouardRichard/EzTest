@@ -454,7 +454,7 @@ CREATE TABLE IF NOT EXISTS code_repositories (
 
 **通用**：
 
-- 结构不合法 → 422 `validation_failed`，`details.field` 指向具体字段；不创建 Session。
+- 结构不合法 → 422 `invalid_argument`，`details.field` 指向具体字段，`details.reason='invalid_storage_state'`；不创建 Session。
 - `storage_state_hash = sha256(规范化 JSON)`（Go `encoding/json` 对 map 排序键；对象按结构体字段顺序）；用于去重/展示，不用于加密。
 - 生效 TTL：`access.session_ttl_seconds ?? system.default_session_ttl_seconds ?? 3600`。
 - `expires_at = now + TTL`；若 storage_state 存在最早正数 cookie `expires`，取更早者；若结果 ≤ now → 422 `storage_state_expired`。
@@ -548,7 +548,7 @@ CREATE TABLE IF NOT EXISTS code_repositories (
 - 成功：`{"data": ...}`；列表：`{"data":[...],"next_cursor":"...","has_more":false}`；创建 201，删除 204，动作 200。
 - 分页：`limit` 1–100（默认 20）+ 不透明 cursor；筛选参数见各端点。
 - 幂等：写请求可带 `Idempotency-Key`（复用 P0 中间件）；非必填。
-- 错误：复用 `platform/errors` 信封与闭集 code；`details.reason` 细分：
+- 错误：复用 `platform/errors` 信封与闭集 code：400/422=`invalid_argument`，404=`not_found`，409=`conflict`，403=`forbidden`；`details.reason` 细分如下：
 
 | reason | HTTP | 场景 |
 |---|---|---|
@@ -649,6 +649,7 @@ Access 字段：`systemId,authType,credential,credentialSet,usernameOverride,log
 
 ```json
 {
+  "environmentId": 12,
   "kind": "storage_state",
   "storageState": {"cookies":[...],"origins":[...]},
   "expiresAt": "2026-10-28T12:00:00Z",
@@ -659,8 +660,11 @@ Access 字段：`systemId,authType,credential,credentialSet,usernameOverride,log
 或：
 
 ```json
-{"kind":"token","headers":{"Authorization":"Bearer fixture-token"}}
+{"environmentId":12,"kind":"token","headers":{"Authorization":"Bearer fixture-token"}}
 ```
+
+- `environmentId` 必填，且必须属于 Access 的 `system_id`；否则 422 `invalid_argument`。
+- `POST /code-repos`、`/systems`、`/accounts` 不接受 `companyId`；服务固定使用 `companies(key='default')`。
 
 响应 `201`：SessionDTO（`state` 为 `valid` 或 `needs_manual`；含 `latestSnapshot`）。`expiresAt` 可省略，按 §6.2 计算。
 
