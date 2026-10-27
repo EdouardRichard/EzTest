@@ -21,6 +21,12 @@ const (
 	// sessionDeleteAbortTimeout bounds how long DELETE waits for the aborted run
 	// to become idle before it gives up with domain.ErrRunActive.
 	sessionDeleteAbortTimeout = 5 * time.Second
+	// defaultListMessagesLimit is the page size used when a caller passes a
+	// non-positive limit to ListMessages.
+	defaultListMessagesLimit = 20
+	// maxListMessagesLimit bounds one ListMessages page, matching the API's
+	// pagination ceiling.
+	maxListMessagesLimit = 100
 )
 
 // RunControl is the subset of the run service the session lifecycle needs. The
@@ -212,6 +218,39 @@ func (s *SessionService) Message(ctx context.Context, sessionID, messageID int64
 		return domain.Message{}, domain.ErrNotFound
 	}
 	return message, nil
+}
+
+// ListMessages returns one page of a session's message history for the P3
+// clarification chat (design spec §8.2 item 5). beforeID selects messages older
+// than that id; a non-positive beforeID reads the newest page. The page is
+// returned oldest-to-newest and hasMore reports whether older messages remain
+// beyond it.
+//
+// The P1 repository only exposes a whole-session read, so the cursor and limit
+// are applied here. limit is defaulted and capped to the API's pagination
+// bounds; the HTTP layer does not have to pre-validate it.
+func (s *SessionService) ListMessages(ctx context.Context, sessionID, beforeID int64, limit int) ([]domain.Message, bool, error) {
+	if limit <= 0 {
+		limit = defaultListMessagesLimit
+	}
+	if limit > maxListMessagesLimit {
+		limit = maxListMessagesLimit
+	}
+	all, err := s.messages.ListBySession(ctx, sessionID)
+	if err != nil {
+		return nil, false, err
+	}
+	eligible := make([]domain.Message, 0, len(all))
+	for _, message := range all {
+		if beforeID > 0 && message.ID >= beforeID {
+			continue
+		}
+		eligible = append(eligible, message)
+	}
+	if len(eligible) <= limit {
+		return eligible, false, nil
+	}
+	return eligible[len(eligible)-limit:], true, nil
 }
 
 // recordSessionDeleted appends the agent.session.deleted entry. Auditing must
