@@ -74,6 +74,7 @@ function hookState(overrides: Partial<AgentSessionState> = {}): AgentSessionStat
     hasMore: false,
     loadEarlier: vi.fn(async () => {}),
     refresh: vi.fn(async () => {}),
+    reconnect: vi.fn(),
     getDetail: vi.fn(),
     ...overrides,
   }
@@ -163,6 +164,29 @@ describe("SessionPane", () => {
       expect(screen.getByText(label)).toBeTruthy()
       view.unmount()
     }
+  })
+
+  it("offers a manual reconnect once the stream is closed", () => {
+    const hook = hookState({ status: "closed" })
+    mocks.useAgentSession.mockReturnValue(hook)
+
+    render(<SessionPane sessionId={1} session={makeSession()} />)
+
+    expect(screen.getByText("已断开")).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "重新连接" }))
+    expect(hook.reconnect).toHaveBeenCalledTimes(1)
+  })
+
+  it("offers a retry when the initial snapshot failed", () => {
+    const hook = hookState({ status: "live", error: "转录加载失败" })
+    mocks.useAgentSession.mockReturnValue(hook)
+
+    render(<SessionPane sessionId={1} session={makeSession()} />)
+
+    const alert = screen.getByRole("alert")
+    expect(alert.textContent).toContain("转录加载失败")
+    fireEvent.click(screen.getByRole("button", { name: "重试" }))
+    expect(hook.reconnect).toHaveBeenCalledTimes(1)
   })
 
   it("loads earlier activities through the hook", () => {

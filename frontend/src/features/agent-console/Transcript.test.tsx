@@ -246,6 +246,32 @@ describe("Transcript", () => {
     expect(screen.getByText(/第 2 回合/)).toBeTruthy()
   })
 
+  it("shows the terminal reason and abort/error code for a finished run", () => {
+    const activities = [
+      makeActivity(1, { kind: "run_started", run_id: 9 }),
+      makeActivity(2, {
+        kind: "run_finished",
+        run_id: 9,
+        status: "aborted",
+        terminal_reason: "aborted_tools",
+        abort_code: "user_abort",
+      }),
+      makeActivity(3, { kind: "run_started", run_id: 10 }),
+      makeActivity(4, {
+        kind: "run_finished",
+        run_id: 10,
+        status: "failed",
+        terminal_reason: "model_error",
+        error_code: "finish_reason=length",
+      }),
+    ]
+
+    render(<Transcript activities={activities} status="live" />)
+
+    expect(screen.getByText("运行终止：aborted_tools（user_abort）")).toBeTruthy()
+    expect(screen.getByText("运行出错：model_error（finish_reason=length）")).toBeTruthy()
+  })
+
   it("shows the error code and duration for a failed tool call", () => {
     const activities = [
       RUN_STARTED,

@@ -157,6 +157,139 @@ describe("useAgentSession", () => {
     )
   })
 
+  it("treats a missing snapshot channel as empty and still opens the stream", async () => {
+    mocks.fetchActivities.mockRejectedValue(
+      new ApiError({ status: 404, code: "not_found", message: "channel not found" }),
+    )
+
+    const { result } = renderSessionHook()
+
+    await waitFor(() => expect(result.current.loading).toBe(false))
+    expect(result.current.error).toBe("")
+    expect(result.current.activities).toEqual([])
+    expect(["connecting", "live"]).toContain(result.current.status)
+    expect(mocks.connectSSE).toHaveBeenCalledTimes(1)
+    expect(latestOptions().lastEventId).toBe(0)
+  })
+
+  it("keeps the stream open after a snapshot failure and retries on demand", async () => {
+    mocks.fetchActivities.mockRejectedValue(
+      new ApiError({ status: 500, code: "internal", message: "snapshot failed" }),
+    )
+
+    const { result } = renderSessionHook()
+
+    await waitFor(() => expect(result.current.error).toBe("snapshot failed"))
+    expect(result.current.loading).toBe(false)
+    expect(result.current.status).not.toBe("closed")
+    expect(mocks.connectSSE).toHaveBeenCalledTimes(1)
+
+    mocks.fetchActivities.mockResolvedValue({
+      items: [makeActivity(1, { kind: "user_message", message_id: 1, text: "重试后" })],
+      snapshot_cursor: 1,
+      has_more: false,
+    })
+    act(() => result.current.reconnect())
+
+    await waitFor(() => expect(result.current.error).toBe(""))
+    await waitFor(() => expect(mocks.connectSSE).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(result.current.activities.map((event) => event.seq)).toEqual([1]))
+    expect(latestOptions().lastEventId).toBe(1)
+  })
+
+  it("reconnects a closed stream on demand without dropping activities", async () => {
+    mocks.fetchActivities.mockResolvedValue({
+      items: [makeActivity(1, { kind: "user_message", message_id: 1, text: "保留" })],
+      snapshot_cursor: 1,
+      has_more: false,
+    })
+
+    const { result } = renderSessionHook()
+    await waitFor(() => expect(result.current.loading).toBe(false))
+    const first = latestOptions()
+
+    act(() => first.onStatus("closed"))
+    expect(result.current.status).toBe("closed")
+
+    act(() => result.current.reconnect())
+
+    await waitFor(() => expect(result.current.status).toBe("connecting"))
+    expect(result.current.activities.map((event) => event.seq)).toEqual([1])
+    await waitFor(() => expect(mocks.connectSSE).toHaveBeenCalledTimes(2))
+    expect(latestOptions()).not.toBe(first)
+  })
+
+  it("does not reconnect or clear the transcript when the parent running flag flips", async () => {
+    mocks.fetchActivities.mockResolvedValue({
+      items: [makeActivity(1, { kind: "user_message", message_id: 1, text: "保留" })],
+      snapshot_cursor: 1,
+      has_more: false,
+    })
+
+    const { result, rerender } = renderHook(
+      ({ session }: { session: AgentSession }) => useAgentSession(1, session),
+      { initialProps: { session: makeSession({ running: false }) } },
+    )
+    await waitFor(() => expect(result.current.loading).toBe(false))
+    expect(result.current.activities.map((event) => event.seq)).toEqual([1])
+    expect(mocks.fetchActivities).toHaveBeenCalledTimes(1)
+    expect(mocks.connectSSE).toHaveBeenCalledTimes(1)
+
+    rerender({ session: makeSession({ running: true }) })
+
+    expect(result.current.activities.map((event) => event.seq)).toEqual([1])
+    expect(mocks.fetchActivities).toHaveBeenCalledTimes(1)
+    expect(mocks.connectSSE).toHaveBeenCalledTimes(1)
+  })
+
+  it("clears the error after a successful refresh or load-earlier", async () => {
+    mocks.fetchActivities
+      .mockResolvedValueOnce({
+        items: [
+          makeActivity(5, {
+            kind: "text",
+            run_id: 3,
+            message_id: 10,
+            part: 0,
+            final: true,
+            text: "五",
+          }),
+        ],
+        snapshot_cursor: 5,
+        has_more: true,
+      })
+      .mockRejectedValueOnce(new ApiError({ status: 500, code: "internal", message: "刷新失败" }))
+      .mockResolvedValueOnce({
+        items: [
+          makeActivity(4, {
+            kind: "text",
+            run_id: 3,
+            message_id: 10,
+            part: 0,
+            final: true,
+            text: "四",
+          }),
+        ],
+        snapshot_cursor: 5,
+        has_more: false,
+      })
+
+    const { result } = renderSessionHook()
+    await waitFor(() => expect(result.current.loading).toBe(false))
+    expect(result.current.hasMore).toBe(true)
+
+    await act(async () => {
+      await result.current.refresh()
+    })
+    expect(result.current.error).toBe("刷新失败")
+
+    await act(async () => {
+      await result.current.loadEarlier()
+    })
+    expect(result.current.error).toBe("")
+    expect(result.current.activities.map((event) => event.seq)).toEqual([4, 5])
+  })
+
   it("refetches on stream reset and exposes the reconnecting status", async () => {
     mocks.fetchActivities
       .mockResolvedValueOnce({
@@ -305,7 +438,7 @@ describe("useAgentSession", () => {
     expect(mocks.getMessage).toHaveBeenCalledWith(1, 42)
   })
 
-  it("shows the admin-only error on 403 and never opens the stream", async () => {
+  it("shows the admin-only error on 403 but still opens the stream for a retry", async () => {
     mocks.fetchActivities.mockRejectedValue(
       new ApiError({ status: 403, code: "forbidden", message: "forbidden" }),
     )
@@ -314,8 +447,8 @@ describe("useAgentSession", () => {
 
     await waitFor(() => expect(result.current.error).toBe("仅管理员可用"))
     expect(result.current.loading).toBe(false)
-    expect(result.current.status).toBe("closed")
-    expect(mocks.connectSSE).not.toHaveBeenCalled()
+    expect(result.current.status).toBe("connecting")
+    expect(mocks.connectSSE).toHaveBeenCalledTimes(1)
   })
 
   it("reports a missing token instead of opening the stream", async () => {

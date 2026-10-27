@@ -220,17 +220,23 @@ function formatTime(ts: string): string {
   return date.toLocaleTimeString("zh-CN", { hour12: false })
 }
 
+/**
+ * Describes a finished run with its persisted `terminal_reason` plus the
+ * `abort_code` (aborted runs) or `error_code` (failed runs), so the UI never
+ * relies on colour or a bare status word to explain an outcome (§11.4).
+ */
 function runOutcome(event: AgentEvent): string {
-  switch (readDetailText(event, "status")) {
-    case "aborted":
-      return "运行终止"
-    case "failed":
-      return "运行出错"
-    case "interrupted":
-      return "运行中断"
-    default:
-      return "运行结束"
-  }
+  const status = readDetailText(event, "status")
+  let label = "运行结束"
+  if (status === "aborted") label = "运行终止"
+  else if (status === "failed") label = "运行出错"
+  else if (status === "interrupted") label = "运行中断"
+
+  const reason = readDetailText(event, "terminal_reason")
+  const code = readDetailText(event, "abort_code") || readDetailText(event, "error_code")
+  if (reason && code) return `${label}：${reason}（${code}）`
+  if (reason || code) return `${label}：${reason || code}`
+  return label
 }
 
 function UserMessage({ event }: { event: AgentEvent }) {
