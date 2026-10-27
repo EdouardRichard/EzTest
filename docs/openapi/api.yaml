@@ -901,7 +901,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/AgentMessageDetail'
+                $ref: '#/components/schemas/AgentMessageEnvelope'
         '400':
           $ref: '#/components/responses/InvalidArgument'
         '401':
@@ -939,6 +939,8 @@ paths:
           $ref: '#/components/responses/InvalidArgument'
         '401':
           $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/AgentChannelForbidden'
         '404':
           $ref: '#/components/responses/NotFound'
         '500':
@@ -988,6 +990,8 @@ paths:
           $ref: '#/components/responses/InvalidArgument'
         '401':
           $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/AgentChannelForbidden'
         '500':
           $ref: '#/components/responses/Internal'
   /api/admin/stream/test-events:
@@ -1350,6 +1354,15 @@ components:
             $ref: '#/components/schemas/ErrorEnvelope'
     Forbidden:
       description: Authenticated but not an administrator (`forbidden`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    AgentChannelForbidden:
+      description: |
+        Authenticated but not an administrator (`forbidden`). Channels starting
+        with `agent:` are administrator-only; the P0 `system` channel remains
+        available to every authenticated user.
       content:
         application/json:
           schema:
@@ -2045,7 +2058,14 @@ components:
           uniqueItems: true
           items:
             type: string
-          description: Must be a subset of the registered tools from GET /api/agents/tools.
+          description: |
+            Tool names this profile may call. On PATCH the list must be a subset
+            of the tools currently registered by `GET /api/agents/tools`;
+            otherwise the request is 422. That subset check is not re-applied to
+            a stored profile, so the seeded `runtime-diagnostic` profile may list
+            tools that are currently unregistered (for example `file.list` and
+            `file.read` when `EZTEST_AGENT_FILE_ROOT` is empty) and those calls
+            are rejected at run time.
         max_turns:
           type: integer
           minimum: 0
@@ -2420,6 +2440,12 @@ components:
         created_at:
           type: string
           format: date-time
+    AgentMessageEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/AgentMessageDetail'
     AgentActivityUsage:
       type: object
       description: Accumulated run usage inside a `run_finished` activity.
