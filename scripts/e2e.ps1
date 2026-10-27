@@ -15,7 +15,12 @@
     Compatible with Windows PowerShell 5.1 and PowerShell 7+.
 #>
 [CmdletBinding()]
-param()
+param(
+    # Optional Playwright path/filter arguments, e.g. `scripts/e2e.ps1 versions`
+    # to iterate on the P3 specs. The default runs the whole suite.
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$PlaywrightArgs = @()
+)
 
 $ErrorActionPreference = "Stop"
 
@@ -32,6 +37,7 @@ $apiBaseUrl = "http://localhost:$apiPort"
 $webBaseUrl = "http://localhost:$webPort"
 $fakeLlmBaseUrl = "http://127.0.0.1:$fakeLlmPort"
 $fixtureBaseUrl = "http://127.0.0.1:$fixturePort"
+$p3AttachmentDir = Join-Path $tmpDir "p3-attachments"
 
 New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
 
@@ -303,6 +309,9 @@ try {
     if (-not $nodeExe) { $nodeExe = (Get-Command node).Source }
     if (-not $nodeExe) { throw "node was not found; it is required by the fake LLM upstream and the web app" }
     $env:EZTEST_FAKE_LLM_PORT = "$fakeLlmPort"
+    # Enables the deterministic P3 clarification/analysis/recon scenarios (they
+    # are inert for the P1/P2 scenarios when a request carries no P3 marker).
+    $env:EZTEST_FAKE_LLM_P3 = "1"
     Remove-Item -LiteralPath $fakeOut, $fakeErr, $fakeRequestLog -ErrorAction SilentlyContinue
     $fakeProcess = Start-Process -FilePath $nodeExe `
         -ArgumentList "`"scripts/fake-llm.cjs`"" `
@@ -321,6 +330,12 @@ try {
     $env:EZTEST_WEB_ORIGIN = $webBaseUrl
     $env:EZTEST_ENABLE_TEST_ENDPOINTS = "true"
     $env:EZTEST_STORAGE_DIR = (Join-Path $tmpDir "e2e-objects")
+    # P3 attachments are isolated in a throwaway directory that is cleaned up
+    # after the suite (design spec §10.2).
+    if (Test-Path -LiteralPath $p3AttachmentDir) {
+        Remove-Item -LiteralPath $p3AttachmentDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    $env:EZTEST_VERSION_ATTACHMENT_DIR = $p3AttachmentDir
     $env:EZTEST_ADMIN_USERNAME = $adminUsername
     $env:EZTEST_ADMIN_PASSWORD = $adminPassword
     foreach ($key in @("EZTEST_SECRET_KEYS", "EZTEST_SECRET_KEY_ACTIVE", "llm_base_url", "llm_key", "llm_model_name")) {
@@ -381,6 +396,12 @@ try {
     $env:EZTEST_E2E_API_URL = $apiBaseUrl
     $env:EZTEST_E2E_BASE_URL = $webBaseUrl
     $env:EZTEST_E2E_CHANNEL = $channel
+    # P3 specs read the fake upstream log directly and optionally use psql for
+    # the D30 assertion that no image data URL is persisted in agent_messages.
+    $env:EZTEST_E2E_FAKE_LLM_URL = $fakeLlmBaseUrl
+    $env:EZTEST_E2E_FAKE_LLM_LOG = $fakeRequestLog
+    $env:EZTEST_E2E_DATABASE_URL = $e2eDatabaseUrl
+    $env:EZTEST_E2E_PSQL = $psqlExe
     # The harness may set both NO_COLOR and FORCE_COLOR; Node then prints a
     # warning to stderr, which Windows PowerShell surfaces as a noisy error
     # record while the Playwright output is redirected to a file.
@@ -393,7 +414,7 @@ try {
     $previous = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        & $playwright test *> $playwrightLog
+        & $playwright test @PlaywrightArgs *> $playwrightLog
         $playwrightExit = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previous
@@ -435,6 +456,11 @@ try {
     }
     Remove-Item Env:EZTEST_E2E_ADMIN_PASSWORD -ErrorAction SilentlyContinue
     Remove-Item Env:PGPASSWORD -ErrorAction SilentlyContinue
+    # The attachment root and the P3 throwaway resources are test-only files.
+    if (Test-Path -LiteralPath $p3AttachmentDir) {
+        Remove-Item -LiteralPath $p3AttachmentDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item -LiteralPath (Join-Path $tmpDir "p3-e2e-repo") -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 exit $exitCode
