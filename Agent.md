@@ -115,6 +115,7 @@ EzTest/
 │     │  └─ migrations/               # <context>_<version>_<desc>.sql
 │     ├─ server/                      # 路由装配、中间件链，不放业务逻辑
 │     ├─ platform/                    # 共享内核：clock/id/errors/pagination/validation/crypto
+│     │                                # id/ 自 P3 起含雪花生成器（D29）
 │     ├─ identity/                    # 限界上下文：用户/认证
 │     │  ├─ domain/                   # 实体、值对象、仓储接口、领域错误
 │     │  ├─ application/              # 用例/命令/查询
@@ -200,6 +201,22 @@ P2 新增的 `resource` 上下文位于 `backend/internal/resource/`：承载公
 - 只读参考 `D:\Project_new\ARTEX`，**禁止复制/大段搬运/派生源码**（AGPL-3.0；EzTest 为 Apache-2.0）。
 - 需要参考实现时，在实现说明中记录参考 `file:line`、对齐点与刻意差异；ARTEX 无对应时明确写“无对应”。
 - 目录形态参考 ARTEX 的按能力分包与 `cmd/config/db/server/web` 组织方式，但 DDD 分层与导入规则以本节为准。
+
+### 6.7 主键与 ID 规范（全项目）
+
+1. 自 P3 起，所有**新增**实体/表的主键统一使用雪花 ID（64-bit：41bit 毫秒 + 10bit 节点 + 12bit 序列），由 `backend/internal/platform/id` 在应用层生成；**禁止新增 `BIGSERIAL`/`SERIAL`/数据库自增主键**。
+2. 同一实体在 DB、Go、JSON、事件与工具参数中使用同一 int64 语义；64-bit ID 在 JSON/工具参数中一律为十进制字符串（避免 JS 精度丢失），URL 路径参数为十进制字符串。
+3. 雪花节点 ID 由 `EZTEST_SNOWFLAKE_NODE_ID` 配置（0–1023，单实例默认 1）；多实例部署必须保证节点唯一。
+4. 既有 P0–P2 的 `BIGSERIAL` 表**不回溯改造**；如需统一，必须单独立项迁移并记录 D#；迁移完成前不得混用同一实体的 ID 类型。
+5. 跨上下文引用与主键同类型（BIGINT），仍按 §6.2 只做逻辑引用、不建 FK。
+
+### 6.8 文件存储规范（全项目）
+
+1. 业务附件与用户文件（需求附件、证据、截图、导出等）统一存**文件系统**，由所属上下文提供存储适配；**禁止把二进制写入 PostgreSQL**。
+2. 文件存储必须：根目录可配置、路径由应用生成并做根内校验、拒绝 `..`/绝对路径/symlink 逃逸、文件名清洗、临时文件 + 原子 rename、文件 0600/目录 0700、大小与数量上限。
+3. 新功能不得新增对 P0 `storage` 内容寻址对象存储的依赖；该上下文冻结为既有能力/历史兼容，确需复用须在阶段规格中显式记录理由与 D#。
+4. 删除采用“DB 元数据 + best-effort 文件删除”；孤儿文件由 GC/保留策略处理，不阻塞业务。
+5. 下载/读取必须鉴权，不对外暴露内部存储路径；文件内容视为不可信数据。
 
 ---
 

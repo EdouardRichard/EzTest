@@ -149,6 +149,8 @@
 | D26 | **仓库结构与 DDD 边界**：采用 ARTEX 式按能力分包 + 每个限界上下文 DDD 四层（domain/application/infrastructure/interfaces/httpapi）；`cmd/eztest` 为唯一组装根；导入方向、迁移命名、前端目录与 ARTEX 合规边界见 `Agent.md` §6。 |
 | D27 | P1 内置的「诊断 Agent」= **运行时验证夹具**（key=`runtime-diagnostic`），不进入 §6.1 十三角色；提示词/模型/思考强度/预算/工具白名单管理员可配；工具仅只读白名单（文件只读、HTTP 只读、测试工具）；活动事件统一为 `agent.activity`（`detail.kind` 区分 run_started/user_message/thinking/text/tool_use/tool_result/usage/decision/run_finished）；`agent_messages` 为 LLM 上下文权威来源，`events` 为其 UI 投影；P2 起由业务 Agent 替换，不改变运行时契约。 |
 | D28 | **P2 公共资源与身份：单 `resource` 上下文、明文存储、无审计/加密**。P2 新增 `resource` 限界上下文，承载 System/Environment/AppModel/Account/Access/Session/Snapshot/Lease/Takeover/LocalGitRepo；单公司种子，不做公司 CRUD。被测系统凭据（`account_system_accesses.credential`）与 Session 状态（`sessions.storage_state`）**明文存储**；P2 不实现加密、脱敏、审计（不写 `audit_logs`，不建 `session_events`/`secrets`/`session_blobs`）。Session 状态采用 auth-session-model 完整枚举 + 派生 `expiring`；快照表名 `session_snapshots`；API 统一 `/api/resources/*`；`System.kind` 仅 `web\|api`。P2 不做自动登录、ProbeRecipe、代码索引、Session 执行注入。理由：内部工具场景，被测系统凭据非生产秘密；先交付资源管理闭环，安全能力在需要时再引入。 |
+| D29 | **全项目主键统一雪花 ID**：自 P3 起所有新增实体/表的主键使用 64-bit 雪花 ID（41bit 毫秒 + 10bit 节点 + 12bit 序列），由 `platform/id` 在应用层生成；**禁止新增 `BIGSERIAL`/自增主键**。64-bit ID 在 JSON/工具参数/URL 中一律十进制字符串（避免 JS 精度丢失）；节点 ID 由 `EZTEST_SNOWFLAKE_NODE_ID` 配置（0–1023，单实例默认 1）。既有 P0–P2 的 `BIGSERIAL` 表不回溯改造；如需统一，单独立项迁移并记录 D#。 |
+| D30 | **全项目文件存储走文件系统**：业务附件与用户文件（需求附件、证据、截图、导出等）统一文件系统存储，**禁止二进制写入 PostgreSQL**；禁止新增对 P0 `storage` 内容寻址对象存储的依赖（该上下文冻结为既有能力/历史兼容，例外须记录 D#）。文件根目录可配置，路径由应用生成并做根内校验、拒绝 `..`/绝对路径/symlink 逃逸、文件名清洗、临时文件 + 原子 rename、文件 0600/目录 0700、大小/数量上限；删除采用 DB 元数据 + best-effort 文件删除，孤儿由 GC/保留策略处理。 |
 
 ---
 
@@ -198,7 +200,7 @@
 |---|---|
 | 后端 | Go（net/http，统一 JSON API） |
 | 前端 | Next.js + React + Tailwind + 组件库；React Flow 承载图 |
-| 存储 | PostgreSQL（业务/图/执行/会话/审计）+ 对象存储或本地文件（证据：截图/报文/日志） |
+| 存储 | PostgreSQL（业务/图/执行/会话/审计）+ 文件系统（业务附件/证据/截图/导出；按上下文配置根目录，D30） |
 | 执行 | Playwright（Chromium）+ HTTP 客户端 + DB 断言（可选只读连接） |
 | 实时 | SSE（快照游标 + seq 去重 + Last-Event-ID） |
 | 代码理解 | 只读 git CLI（T0）+ AI 代码理解（语言无关，T1）；**不设计 parser** |
@@ -458,8 +460,8 @@ Playwright 浏览器（导航、DOM/A11y、点击输入、快照、截图、stor
 ### 10.1 存储布局
 
 - PostgreSQL：业务/图/执行/会话/审计/代码索引/报告元数据。
-- 对象存储或本地文件：证据（截图/报文/日志）、脑图导出、报告附件；内容寻址（sha256）+ 不可变。
-- 本地 Git 仓库：只读挂载，不进对象存储（只存索引与锚点）。
+- 文件系统（D30）：证据（截图/报文/日志）、脑图导出、报告附件、需求附件；按上下文配置根目录，sha256 校验完整性 + 不可变/保留策略；禁止二进制入库，不新增对象存储依赖。
+- 本地 Git 仓库：只读挂载，不进业务文件存储根（只存索引与锚点）。
 
 ### 10.2 核心表分组（概念，DDL 在阶段规格中细化）
 

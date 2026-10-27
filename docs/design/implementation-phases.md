@@ -217,7 +217,7 @@ P0–P7 ────────────────────────
 - 暂停/恢复：`paused` 独立标记、优雅/立即、恢复从检查点；interrupted 用例 cleanup/seed。
 - 工具：Playwright（导航/DOM/A11y/点击输入/截图/storageState）、HTTP/API、DB 断言（可选只读）、日志/控制台、文件/下载。
 - Session：自动登录（补齐 P2）+ 注入 + 失效重取；人工接管 checkpoint。
-- 证据：截图/报文/日志，内容寻址不可变；四态结果（passed/failed/blocked/inconclusive）；失败分类 v1（应用/环境/会话/模型/用例/flaky）。
+- 证据：截图/报文/日志，文件系统存储（D30）+ sha256 完整性 + 不可变；四态结果（passed/failed/blocked/inconclusive）；失败分类 v1（应用/环境/会话/模型/用例/flaky）。
 - 前端：版本详情内执行类 Tab（执行会话/探索链路/实时播报/结果与证据）、执行实时视图（多 Agent 会话/工具/证据）、暂停/恢复按钮、人工接管卡。
 - 报告 Batch 1 简版（完整报告在 P7）。
 
