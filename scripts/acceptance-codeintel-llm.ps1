@@ -16,17 +16,22 @@
         commit and selects a real base..head pair with at most 20 changed files
         (EZTEST_ACCEPTANCE_P4_BASE/HEAD override the pair);
       * registers the clone as a P2 code repository, creates a version bound to
-        it, adds two requirements (one title contains P4-AI-IMPACT) and one
-        requirement anchor on a changed file;
+        it, adds two requirements (one title contains P4-AI-IMPACT) and attempts
+        one requirement anchor on a changed file (recorded as skipped with a
+        warning when no changed path can be anchored);
       * triggers POST /api/versions/{id}/code/analyses with an explicit
         headCommit and polls until done/failed;
       * verifies that the change list matches `git diff --name-status`, that
         stored AI evidence hashes recompute from commit content, that impact
-        candidates reference the created requirements and that unmapped changes
-        are reported;
-      * verifies cache reuse (second POST returns reused=true and the same id)
-        and force versioning (force=true creates analysisVersion+1 while the old
-        analysis stays readable and its candidates stay unchanged);
+        candidates carry a non-empty reason, a valid confidence and path
+        evidence for high/medium, and that unmapped changes are reported (at
+        least one unless -AllowNoUnmapped is passed explicitly);
+      * verifies cache reuse (second POST returns reused=true, the same id and
+        normalized candidates identical), file-level cache hits in a second
+        version bound to the same repo/base analyzing the same head
+        (stats.cacheHits > 0), and force versioning (force=true creates
+        analysisVersion+1 while the old analysis stays readable and its
+        candidates stay unchanged);
       * records a machine-readable, secret-free result at
         .tmp/p4-real-acceptance.json.
 
@@ -44,6 +49,12 @@
     or spending an LLM call. Exits 0 when the preflight passes. DryRun also works
     while the gate is closed.
 
+.PARAMETER AllowNoUnmapped
+    Accept a real commit pair where every changed file maps to a candidate
+    (unmapped = 0). Without this switch the run fails because spec §10.7 step 3
+    requires at least one real unmapped change; the relaxation is printed and
+    recorded in the result JSON so it cannot pass silently.
+
 .NOTES
     This script makes paid upstream calls. It is deliberately not part of
     scripts/acceptance.ps1, which reports it as gated. The selected repository is
@@ -52,7 +63,8 @@
 #>
 [CmdletBinding()]
 param(
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$AllowNoUnmapped
 )
 
 $ErrorActionPreference = "Stop"
@@ -109,6 +121,10 @@ $script:resultData = [ordered]@{
     candidateCount = $null
     requirementCandidateCount = $null
     unmappedCount = $null
+    allowNoUnmapped = $false
+    secondVersionId = $null
+    secondAnalysisId = $null
+    cacheHits    = $null
     checks       = @()
     warnings     = @()
     error        = $null
@@ -622,8 +638,47 @@ function Wait-Analysis {
 
 function Get-CandidateFingerprint {
     param($Candidates)
-    $sorted = @(@($Candidates) | Sort-Object -Property id)
-    return (ConvertTo-Json -InputObject $sorted -Depth 10 -Compress)
+    # Canonical form for the spec §10.7 step 4 comparison: candidates sorted by
+    # id, evidence sorted by file/range/hash, and only contract fields emitted
+    # (so projection/order noise cannot mask a real candidate change).
+    $normalized = @()
+    foreach ($candidate in @(@($Candidates) | Sort-Object -Property { [string]$_.id })) {
+        if ($null -eq $candidate) { continue }
+        $evidence = @()
+        $sortable = @()
+        foreach ($item in @($candidate.evidence)) {
+            if ($null -eq $item) { continue }
+            $startLine = $(if ($null -eq $item.startLine) { $null } else { [int]$item.startLine })
+            $endLine = $(if ($null -eq $item.endLine) { $null } else { [int]$item.endLine })
+            $excerptHash = $(if ($null -eq $item.excerptHash) { $null } else { [string]$item.excerptHash })
+            $sortable += [pscustomobject]@{
+                SortKey     = "{0}|{1}|{2}|{3}" -f [string]$item.file, $(if ($null -eq $startLine) { "-" } else { $startLine }), $(if ($null -eq $endLine) { "-" } else { $endLine }), [string]$excerptHash
+                File        = [string]$item.file
+                StartLine   = $startLine
+                EndLine     = $endLine
+                ExcerptHash = $excerptHash
+            }
+        }
+        foreach ($item in @($sortable | Sort-Object -Property SortKey)) {
+            $evidence += [ordered]@{
+                file        = $item.File
+                startLine   = $item.StartLine
+                endLine     = $item.EndLine
+                excerptHash = $item.ExcerptHash
+            }
+        }
+        $normalized += [ordered]@{
+            id          = [string]$candidate.id
+            subjectKind = [string]$candidate.subjectKind
+            subjectId   = [string]$candidate.subjectId
+            reason      = [string]$candidate.reason
+            confidence  = [string]$candidate.confidence
+            source      = [string]$candidate.source
+            evidence    = @($evidence)
+            selected    = [bool]$candidate.selected
+        }
+    }
+    return (ConvertTo-Json -InputObject @($normalized) -Depth 10 -Compress)
 }
 
 function Write-EvidenceHashHelper {
@@ -754,6 +809,11 @@ function Invoke-DryRun {
     } else {
         Write-Host "DryRun: gate is open; the real run will make paid LLM calls."
     }
+    if ($AllowNoUnmapped) {
+        Write-Host "DryRun: -AllowNoUnmapped is set; unmapped=0 will be recorded as skipped, not failed."
+    } else {
+        Write-Host "DryRun: at least one real unmapped change will be required (pass -AllowNoUnmapped to relax)."
+    }
     Write-Host "DRYRUN OK" -ForegroundColor Green
     return 0
 }
@@ -765,6 +825,15 @@ if ($DryRun) {
 if ($env:EZTEST_RUN_REAL_LLM -ne "1") {
     Write-Host "SKIPPED: real codeintel LLM acceptance is disabled (set EZTEST_RUN_REAL_LLM=1 to run it)."
     exit 0
+}
+
+# Spec §10.7 step 3 requires at least one real unmapped file. The relaxation is
+# explicit and printed so a fully mapped pair cannot pass silently.
+$script:resultData.allowNoUnmapped = [bool]$AllowNoUnmapped
+if ($AllowNoUnmapped) {
+    Write-Host "Unmapped policy: -AllowNoUnmapped is set; unmapped=0 will be recorded as skipped, not failed." -ForegroundColor Yellow
+} else {
+    Write-Host "Unmapped policy: at least one real unmapped change is required (pass -AllowNoUnmapped to relax)."
 }
 
 $exitCode = 0
@@ -1218,11 +1287,42 @@ try {
         throw "a low-confidence candidate is selected by default"
     }
 
+    # Spec §6.6/INV-2: every candidate carries a reason, a valid confidence and
+    # traceable path evidence; high/medium candidates must never be evidence-free.
+    if ($candidates.Count -eq 0) {
+        Add-CheckResult -Name "candidate reason/confidence/evidence" -Status "skipped" -Detail "analysis produced no candidates"
+    } else {
+        $validConfidences = @("high", "medium", "low")
+        foreach ($candidate in $candidates) {
+            if ($null -eq $candidate) { throw "analysis candidates contain a null entry" }
+            $candidateId = [string]$candidate.id
+            if ([string]::IsNullOrWhiteSpace([string]$candidate.reason)) {
+                throw "candidate $candidateId has an empty reason"
+            }
+            $candidateConfidence = [string]$candidate.confidence
+            if ($validConfidences -notcontains $candidateConfidence) {
+                throw "candidate $candidateId has invalid confidence '$candidateConfidence'"
+            }
+            if ($candidateConfidence -eq "high" -or $candidateConfidence -eq "medium") {
+                $pathEvidence = @($candidate.evidence | Where-Object {
+                        $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.file)
+                    })
+                if ($pathEvidence.Count -eq 0) {
+                    throw "candidate $candidateId has confidence '$candidateConfidence' without path evidence"
+                }
+            }
+        }
+        Add-CheckResult -Name "candidate reason/confidence/evidence" -Status "passed" -Detail ("{0} candidates validated" -f $candidates.Count)
+    }
+
     if ($null -eq $analysis.PSObject.Properties["unmapped"]) {
         throw "analysis does not expose an unmapped array"
     }
     $unmapped = @($analysis.unmapped)
     $script:resultData.unmappedCount = $unmapped.Count
+    $changedPaths = @{}
+    foreach ($gitEntry in @($gitEntries)) { $changedPaths[[string]$gitEntry.Path] = $true }
+    $validUnmappedReasons = @("deleted_file", "unsupported_content", "no_fact_or_anchor", "ai_unavailable", "unmatched_contract")
     foreach ($unmappedEntry in $unmapped) {
         if ($null -eq $unmappedEntry) { continue }
         if ([string]::IsNullOrWhiteSpace([string]$unmappedEntry.path) -or
@@ -1230,13 +1330,26 @@ try {
             [string]::IsNullOrWhiteSpace([string]$unmappedEntry.suggestion)) {
             throw "an unmapped change is missing path/reason/suggestion"
         }
+        if (-not $changedPaths.ContainsKey([string]$unmappedEntry.path)) {
+            throw "unmapped change path '$([string]$unmappedEntry.path)' is not part of the analyzed change set"
+        }
+        if ($validUnmappedReasons -notcontains [string]$unmappedEntry.reason) {
+            throw "unmapped change has invalid reason '$([string]$unmappedEntry.reason)'"
+        }
     }
     if ($unmapped.Count -eq 0) {
-        Add-CheckResult -Name "unmapped changes" -Status "skipped" -Detail "this real commit pair produced no unmapped file"
-        [void]$script:warnings.Add("unmapped=0 for the selected commit pair; retry with an explicit pair that includes an unmapped/deleted/binary file")
+        if ($AllowNoUnmapped) {
+            Add-CheckResult -Name "unmapped changes" -Status "skipped" -Detail "unmapped=0 explicitly allowed by -AllowNoUnmapped"
+            [void]$script:warnings.Add("unmapped=0 explicitly allowed by -AllowNoUnmapped for the selected commit pair")
+            Write-Host "unmapped policy: -AllowNoUnmapped is set; unmapped=0 is recorded as skipped." -ForegroundColor Yellow
+        } else {
+            throw "unmapped=0 for the selected commit pair; spec §10.7 requires >=1 real unmapped change (pass -AllowNoUnmapped to relax explicitly)"
+        }
     } else {
         Add-CheckResult -Name "unmapped changes" -Status "passed" -Detail ([string]$unmapped.Count)
     }
+
+    $initialFingerprint = Get-CandidateFingerprint -Candidates $analysis.candidates
 
     Write-Step "Verifying cache reuse (second POST must return reused=true)"
     $second = Invoke-Api -Method Post -Uri "$apiBaseUrl/api/versions/$versionId/code/analyses" -Headers $headers -TimeoutSec 60 -Body @{
@@ -1248,11 +1361,59 @@ try {
     }
     if (-not [bool]$second.Data.reused) { throw "second analysis POST did not report reused=true" }
     if ([string]$second.Data.id -ne $analysisId) { throw "second analysis POST returned a different analysis id" }
+    $reusedAnalysis = Invoke-Api -Method Get -Uri "$apiBaseUrl/api/versions/$versionId/code/analyses/$analysisId" -Headers $headers -TimeoutSec 30
+    $reusedFingerprint = Get-CandidateFingerprint -Candidates $reusedAnalysis.Data.candidates
+    if ($initialFingerprint -ne $reusedFingerprint) {
+        throw "the reused analysis returned different normalized candidates"
+    }
     $script:resultData.reused = $true
-    Add-CheckResult -Name "cache reuse" -Status "passed" -Detail "reused=true and the same analysis id"
+    Add-CheckResult -Name "cache reuse" -Status "passed" -Detail "reused=true, same analysis id, normalized candidates identical"
+
+    Write-Step "Verifying file-level cache hits in a second version bound to the same repo/base"
+    $secondVersion = Invoke-Api -Method Post -Uri "$apiBaseUrl/api/versions" -Headers $headers -TimeoutSec 30 -Body @{
+        name               = "P4 real LLM acceptance (cache check)"
+        description        = "Second acceptance version bound to the same repository and baseline."
+        codeRepositoryId   = $repoId
+        codeBranch         = $acceptanceBranch
+        codeBaselineCommit = $baseCommit
+    }
+    $secondVersionId = [string]$secondVersion.Data.id
+    if ([string]::IsNullOrWhiteSpace($secondVersionId)) { throw "second version creation did not return an id" }
+    $script:resultData.secondVersionId = $secondVersionId
+    $secondStart = Invoke-Api -Method Post -Uri "$apiBaseUrl/api/versions/$secondVersionId/code/analyses" -Headers $headers -TimeoutSec 60 -Body @{
+        headCommit = $headCommit
+        force      = $false
+    }
+    if ($secondStart.Status -ne 202) {
+        throw "second version analysis POST returned HTTP $($secondStart.Status), expected 202 for a new analysis"
+    }
+    $secondAnalysisId = [string]$secondStart.Data.id
+    if ([string]::IsNullOrWhiteSpace($secondAnalysisId)) { throw "second version analysis trigger did not return an id" }
+    $script:resultData.secondAnalysisId = $secondAnalysisId
+    $secondAnalysisResponse = Wait-Analysis -VersionId $secondVersionId -AnalysisId $secondAnalysisId -Headers $headers -TimeoutSeconds $pollTimeoutSeconds
+    $secondAnalysis = $secondAnalysisResponse.Data
+    if ([string]$secondAnalysis.status -eq "failed") { throw "second version analysis failed" }
+    if ([string]$secondAnalysis.status -ne "done") {
+        throw "second version analysis reached unexpected terminal status '$([string]$secondAnalysis.status)'"
+    }
+    if ([string]$secondAnalysis.baseCommit -ne $baseCommit -or [string]$secondAnalysis.headCommit -ne $headCommit) {
+        throw "second version analysis base/head commits do not match the selected real commit pair"
+    }
+    $secondStats = $secondAnalysis.stats
+    if ($null -eq $secondStats) { throw "second version analysis has no stats" }
+    $cacheHits = [int]$secondStats.cacheHits
+    $script:resultData.cacheHits = $cacheHits
+    $secondDegraded = [bool]$secondAnalysis.degraded
+    if ($degraded -or $secondDegraded) {
+        Add-CheckResult -Name "second version cache hits" -Status "skipped" -Detail ("degraded=true; stats.cacheHits={0} is not enforced" -f $cacheHits)
+        [void]$script:warnings.Add("second version cacheHits assertion skipped because the analysis degraded")
+    } elseif ($cacheHits -le 0) {
+        throw "second version analysis stats.cacheHits=$cacheHits, expected >0 for the same repo/base/head"
+    } else {
+        Add-CheckResult -Name "second version cache hits" -Status "passed" -Detail ("stats.cacheHits={0}" -f $cacheHits)
+    }
 
     Write-Step "Verifying force creates analysisVersion+1 and preserves the old analysis"
-    $oldFingerprint = Get-CandidateFingerprint -Candidates $analysis.candidates
     $forced = Invoke-Api -Method Post -Uri "$apiBaseUrl/api/versions/$versionId/code/analyses" -Headers $headers -TimeoutSec 60 -Body @{
         headCommit = $headCommit
         force      = $true
@@ -1274,7 +1435,7 @@ try {
     }
     $oldAgain = Invoke-Api -Method Get -Uri "$apiBaseUrl/api/versions/$versionId/code/analyses/$analysisId" -Headers $headers -TimeoutSec 30
     $oldAgainFingerprint = Get-CandidateFingerprint -Candidates $oldAgain.Data.candidates
-    if ($oldFingerprint -ne $oldAgainFingerprint) {
+    if ($initialFingerprint -ne $oldAgainFingerprint) {
         throw "the old analysis candidates changed after the force run"
     }
     Add-CheckResult -Name "force versioning" -Status "passed" -Detail ("analysisVersion {0} -> {1}; old analysis unchanged" -f $initialVersion, $forceVersion)
