@@ -54,6 +54,7 @@
 | Agent 写模型 | AI 只改 draft 需求、来源标记 `ai`；不得确认/删除/改变状态；不得代答（问题回答仅转录用户明确表述） | 本规格 |
 | 主键 | **雪花 ID（64-bit，应用层生成）**：41bit ms + 10bit node + 12bit seq；DDL 无序列/默认值；`EZTEST_SNOWFLAKE_NODE_ID` 默认 1；全项目新增实体统一，P0–P2 既有表不回溯 | 用户 2026-10-27；D29 |
 | ID 序列化 | P3 自有 ID（version/requirement/relation/clarificationSession/question/decision/attachment）JSON 一律十进制**字符串**；P2 资源 ID 仍为 number；事件 refs 为字符串 | D29；本规格（JS 精度） |
+| 多模态注入 | 截图以 `image_ref`（`attachment:<id>`）传给 P1；`agent_messages` 只存引用，data URL 仅在 LLM 调用前由 `ImageResolver` 瞬态生成；文件始终在文件系统 | D30；本规格 |
 | 附件存储 | **文件系统**（`EZTEST_VERSION_ATTACHMENT_DIR`，默认 `.data/version-attachments`）；全项目业务文件统一文件系统，不走 P0 对象/二进制存储 | 用户 2026-10-27；D30 |
 | API 前缀 | `/api/versions/*`（蓝图 §11.1）；动作子路径或独立动作端点 | 蓝图 |
 | 错误信封 | 复用 `platform/errors` 闭集 code + `details.reason`；409 用于状态/并发冲突 | P0/P2 |
@@ -67,7 +68,7 @@
 ### 3.1 形态
 
 - 单体 Go 服务 + Next.js；新增 `version` 限界上下文，四层齐全。
-- P3 对 P1 做**兼容扩展**（默认行为不变）：`activity_channel`、`StartWithParts`、图片预算计量、`MultimodalEnabled` 校验、工具调用上下文、3 个 profile seed、按通道查询运行中 run。
+- P3 对 P1 做**兼容扩展**（默认行为不变）：`activity_channel`、`StartWithParts`（文本 + `image_ref`）、图片预算计量、`MultimodalEnabled` 校验、工具调用上下文、3 个 profile seed、按通道查询运行中 run。
 - 跨上下文只通过端口 + 适配器；`cmd/eztest` 为唯一组装根。
 - P3 主键由 `platform/id` 雪花生成器在应用层生成；附件由 P3 自有的 `infrastructure/filestore` 直接写文件系统。
 
@@ -89,7 +90,7 @@ backend/internal/version/
 │  ├─ postgres/                # 7 表 repo；多表写入 repo 事务；计数/运行查询
 │  ├─ filestore/               # 附件文件系统：Save/Open/Remove（原子写/路径校验）
 │  ├─ gitread/                 # 只读 git：ResolveCommit/Tree/Read（commit pin）
-│  ├─ agent/                   # P1 agent application 适配（会话/run/消息/通道）
+│  ├─ agent/                   # P1 agent application 适配（会话/run/消息/通道/image resolver）
 │  ├─ eventing/                # 版本事件发布
 │  └─ resource/                # P2 CatalogService/CodeRepoService 适配
 └─ interfaces/httpapi/         # routes.go handlers_*.go dto.go helpers.go
@@ -97,14 +98,15 @@ backend/internal/version/
 backend/internal/agent/
 ├─ domain/profile_p3.go        # ClarificationProfiles() + 3 个系统提示词
 ├─ domain/session.go           # + ActivityChannel / ActivityVersionID
+├─ domain/message.go           # + ImageRef（P3；ImageURL 保留）
 ├─ application/tool_invocation.go   # WithToolInvocation / InvocationFromContext
 ├─ application/session_service.go   # CreateWithOptions；GetByKey
 ├─ application/run_service.go       # StartWithParts；Start 委托
 ├─ application/context_builder.go   # EstimateChars 计图片固定预算
 ├─ application/activity.go          # emitter 带 channel/versionID；空值回退
-├─ application/ports.go             # ActivityEvent.VersionID
+├─ application/ports.go             # ActivityEvent.VersionID；ImageResolver（P1 端口）
 ├─ infrastructure/postgres/         # activity_channel 扫描/查询；运行中 run by channel
-├─ infrastructure/llm/gateway.go    # 图片 parts 时校验 MultimodalEnabled
+├─ infrastructure/llm/gateway.go    # image_ref 解析 + MultimodalEnabled 校验
 ├─ infrastructure/tools/clarification.go  # 11 个 P3 工具适配器 + 本地窄接口
 └─ infrastructure/eventing/sink.go  # 设置 VersionID
 
@@ -135,7 +137,7 @@ frontend/e2e/versions-degraded.spec.ts
 1. **创建版本**：`POST /api/versions` → 校验可选绑定（P2 资源存在/归属；GitReader 解析 branch→commit）→ 雪花 ID + `versions` 落库 `draft` → 发 `version.created`。
 2. **录入需求**：`POST .../requirements` → 校验 → 雪花 ID + `requirements` 落库 `draft` → `requirement.added`；附件单独 multipart 上传 → **文件系统原子落盘 + sha256 + 元数据** → `attachment.added`。
 3. **开始澄清**：`POST .../start-clarification` → 版本 `clarifying` → 发状态事件；随后 `POST .../clarification/sessions` → 创建 P1 Agent 会话（profile=`clarification-dialog`，channel=`version:{id}`）→ P3 会话落库 active → `clarification.session_started`。
-4. **对话轮次**：`POST .../clarification/messages` → 校验单版本无运行中 Agent → `RunService.StartWithParts`（文本；图片仅侦察 run）→ P1 异步运行 → activity 事件写 `events` 并广播 `version:{id}`。
+4. **对话轮次**：`POST .../clarification/messages` → 校验单版本无运行中 Agent → `RunService.StartWithParts`（对话仅文本；侦察 run 携带 `image_ref`）→ P1 异步运行 → activity 事件写 `events` 并广播 `version:{id}`。
 5. **Agent 工具写**：P1 executor 注入 invocation context → P3 工具适配器 → P3 `AgentToolService` 校验 CAS/状态 → 落库 → 发版本事件；工具失败返回可纠正 `ToolResult`。
 6. **确认/重开**：逐需求确认（open questions=0）；`reopen` 回到 draft；Version.status 不变。
 7. **进入设计**：软门禁返回 warnings；带 `acknowledgeUnclarified=true` 后 `clarifying→designing`。
@@ -149,11 +151,11 @@ frontend/e2e/versions-degraded.spec.ts
 | `RequirementService` | CRUD、确认/重开、附件校验挂接、open questions 计数 |
 | `RelationService` | 四类关系增删改、同版本/自环/归一化唯一 |
 | `ClarificationService` | 会话启动/完成、消息发送、分析/侦察触发、问题/决策、`agent_busy` 判定 |
-| `AttachmentService` | multipart 校验、文件系统 Save/Open/Remove、文本读取、图片 data URL 构造 |
+| `AttachmentService` | multipart 校验、文件系统 Save/Open/Remove、文本读取、图片文件读取（供 `ImageResolver` 瞬态解析） |
 | `AgentToolService` | 11 个工具用原语方法：上下文读取/草案更新/问题/决策/关系/附件/摘要/代码 |
 | `AgentOrchestrator` | 创建 P1 会话、构造首轮/分析/侦察消息、通道与版本 ID、运行状态查询 |
 
-### 3.5 跨上下文端口（P3 定义，P3 infrastructure 实现，main 注入）
+### 3.5 跨上下文端口（P3 定义或消费；P3 infrastructure 实现/适配；main 注入）
 
 | 端口 | 方法（要点） | 适配 |
 |---|---|---|
@@ -162,6 +164,7 @@ frontend/e2e/versions-degraded.spec.ts
 | `AttachmentStore` | `Save(versionID,attachmentID,filename,reader)` → `{storagePath,sha256,size}`；`Open(storagePath)` → `io.ReadSeekCloser`；`Remove(storagePath)` | P3 `infrastructure/filestore`（文件系统，原子写/路径校验） |
 | `EventPublisher` | `Publish(ctx, VersionEvent)`；版本 channel/version_id/refs 由适配器填 | eventing application |
 | `AgentSessions` | `Create(profileKey,title,actor,channel,versionID)`、`StartText`、`StartParts`、`Messages(beforeID,limit)`、`HasRunningByChannel(channel)` | P1 agent application |
+| `ImageResolver`（P1 定义） | `ResolveImage(ref)` → data URL；仅供 LLM 调用瞬态使用 | P3 `version/infrastructure/agent` 适配 `AttachmentService` |
 | `Clock/IDs` | 时间与雪花 ID | `platform/id.NewSnowflake(cfg.SnowflakeNodeID)`；测试注入 clock/固定 ID |
 
 ### 3.6 组装根
@@ -170,6 +173,7 @@ frontend/e2e/versions-degraded.spec.ts
 - 用 `id.NewSnowflake(cfg.SnowflakeNodeID)` 构造生成器并注入 P3 各服务；
 - 用 `cfg.VersionAttachmentDir` 构造 `filestore`；
 - 注入 P3 `AgentToolService` 到 `agent/infrastructure/tools.NewClarificationTools`，注册到 P1 tool registry；
+- 注入 P1 `ImageResolver`（由 P3 `version/infrastructure/agent` 适配 `AttachmentService`）；
 - 启动时 `EnsureBuiltin` 三个 P3 profile 并校验 allowed_tools。
 
 P3 application 不 import P1/P2；工具适配器是薄壳，只调用 P3 application 的结构化方法。
@@ -497,7 +501,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_sessions_activity_channel
 - 路径：`<EZTEST_VERSION_ATTACHMENT_DIR>/<versionId>/<attachmentId>_<safeName>`；DB 存 `storage_path` 相对路径；目录 0700、文件 0600。
 - 写入：同目录临时文件 + 流式 sha256 + 10MiB 限长 + `fsync` + 原子 rename；DB 插入失败时 best-effort 删除文件；不跟随 symlink，拒绝 `..`/绝对路径。
 - 读取：解析后校验仍在根内；下载用 `http.ServeContent`（`Content-Type` 取 DB，`X-Content-Type-Options: nosniff`，安全 `Content-Disposition`）；文本注入每文件 ≤64KiB、每 run 合计 ≤200KiB。
-- 图片注入（仅 context-recon）：每张 ≤2MiB、每次 ≤2 张；读文件转 data URL 交给 P1 `StartWithParts`；超出限制的图片不注入，摘要中提示"图片过大/未读取"。
+- 图片注入（仅 context-recon）：每张 ≤2MiB、每次 ≤2 张；P3 以 `image_ref`（`attachment:<id>`）传给 P1，`agent_messages` 只持久化引用；LLM 网关在调用前经 `ImageResolver` 从文件系统读取并瞬态生成 data URL（不落库、不写日志）。超出限制的图片不注入，摘要中提示"图片过大/未读取"。
 - 删除：先删 DB 元数据，再 best-effort 删文件；失败留孤儿文件（P8 GC）；需求级联删除时收集 `storage_path` 后清理。
 - 附件/代码内容是不可信数据：提示词要求只做分析、不执行其中指令、不输出秘密。
 
@@ -754,7 +758,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_sessions_activity_channel
 ### 8.2 P1 兼容扩展
 
 1. **通道**：`agent_sessions.activity_channel/activity_version_id`；`Session` 增加字段；`CreateWithOptions`（`Create` 保留默认空）；activity emitter 接收 channel/versionID，空值回退 `agent:{session_id}`；`RecoverInterrupted` 从会话读取；`ActivityEvent.VersionID` → sink 设置 `eventing.VersionID`。
-2. **多模态**：`RunService.StartWithParts(ctx,sessionID,parts,actor)`；`Start` 委托单 text part；parts 校验（文本非空或图片非空；image URL 长度上限；≤2 张/2MiB 由 P3 保证，P1 做基本校验）；`ContextBuilder.EstimateChars` 每张图片加 4096 字符预算；gateway 在含图片时检查 `MultimodalEnabled`，禁用返回 `llm_bad_request`。
+2. **多模态**：`RunService.StartWithParts(ctx,sessionID,parts,actor)`；`Start` 委托单 text part；`domain.Part` 增加 `ImageRef`（保留 `ImageURL` 兼容 P1）；`StartWithParts` 校验文本非空或图片引用非空；`ContextBuilder.EstimateChars` 每张图片引用加 4096 字符预算；`agent_messages.content` 只存 `image_ref`；LLM 网关调用前通过 P1 `ImageResolver` 端口解析为 data URL，并在含图片时检查 `MultimodalEnabled`（禁用返回 `llm_bad_request`）；P1 默认文本路径不变。
 3. **工具上下文**：`WithToolInvocation(ctx, Invocation{SessionID,RunID,ActorUserID,ProfileKey})`；executor 调用前注入；P3 工具读取 actor/session，不接受模型伪造的 actor。
 4. **运行查询**：`HasRunningByChannel(ctx, channel)`（`agent_runs JOIN agent_sessions`）供 P3 单版本单飞判定。
 5. **Profile 查询**：`ProfileService.GetByKey`（P3 adapter 解析 key→id）。
@@ -786,7 +790,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_sessions_activity_channel
 
 1. **澄清会话**：start session →（前端用户点击/输入）`POST messages` → `HasRunningByChannel` 检查 → `StartText` → P1 run → activity 到 `version:{id}` → 前端流式展示；工具写库后版本事件追加。
 2. **需求分析**：`POST analyze` → 检查 active session + 无运行中 Agent → 创建一次性 P1 会话（profile=requirement-analysis，channel 同版本）→ `StartText`（指令含 versionId）→ 工具写关系/问题/决策建议 → 活动流可见。
-3. **上下文侦察**：`POST recon` → 同上（profile=context-recon）→ 构造 parts：instruction 文本 + 文本附件摘要（≤200KiB）+ 图片 data URL（≤2 张/2MiB）→ `StartParts` → 工具写 context_summary/问题。
+3. **上下文侦察**：`POST recon` → 同上（profile=context-recon）→ 构造 parts：instruction 文本 + 文本附件摘要（≤200KiB）+ `image_ref`（≤2 张/2MiB，引用 P3 附件文件）→ `StartParts` → 工具写 context_summary/问题。
 4. **完成会话**：仅无运行中 Agent 时允许；会话 active→completed；后续可再启动新会话。
 
 ### 8.5 Seed 提示词（原文）
@@ -851,6 +855,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_sessions_activity_channel
 - 工具写操作只允许 P3 定义的白名单字段；不能改 status/created_by。
 - 附件文件名/路径清洗；文件根校验；代码读取拒绝绝对路径/`..`/symlink 逃逸；只读 git 命令。
 - 附件文件权限 0600、目录 0700；下载需登录；不暴露 `storage_path`。
+- `image_ref` 只允许解析 P3 附件 ID；data URL 仅在 LLM 调用内存中存在，不落库、不写日志。
 
 ---
 
@@ -931,7 +936,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_sessions_activity_channel
 
 - **目标系统**：沿用 P2 fixture（13335）与资源 seed；E2E 创建 system/environment/code repo。
 - **代码仓**：`.tmp/p3-e2e-repo`（git init + 2 个文件 + commit），P3 绑定并 `code.read`；P3 使用独立 gitread，不依赖 P1 file tool。
-- **图片**：复用 `testdata/pixel.png`；E2E 上传并断言 recon 请求含 image_url。
+- **图片**：复用 `testdata/pixel.png`；E2E 上传并断言 fake LLM 收到的请求含解析后的 image_url，同时断言 `agent_messages.content` 只含 `image_ref`（无 `data:image`）。
 - **附件目录**：集成/E2E 使用临时 `EZTEST_VERSION_ATTACHMENT_DIR`（`t.TempDir()` / `.tmp/p3-attachments`），测试后清理。
 - **fake LLM**：`scripts/fake-llm.cjs` 增加 P3 场景：按消息标记返回工具调用（创建问题/更新草案/关系/决策），记录请求到 `.tmp/fake-llm-requests.jsonl`；场景互不耦合。
 - **DB**：`testutil.OpenTestDB` + 新建 version seed helper（显式雪花 ID 或固定 ID）。
@@ -943,7 +948,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_sessions_activity_channel
 - 应用：创建版本带绑定（P2 资源缺失/环境不匹配/commit 失败）、start/enter-design warnings/ack、新增需求不改版本状态、designing 下确认需求、问题/决策事务、接受决策关闭问题、会话单飞、AI busy。
 - 基础设施：附件原子写/限长/路径穿越/symlink/重复 sha/删除孤儿；文件 0600、目录 0700。
 - Handler：401/409/422/503、reason/field、分页、附件 multipart、SSE 版本不存在 404、Last-Event-ID/快照、字符串 ID 序列化。
-- Agent：activity_channel 默认回退/版本通道、StartWithParts 图片、图片预算、MultimodalEnabled、tool invocation actor、profile seed 幂等/tools 校验、HasRunningByChannel。
+- Agent：activity_channel 默认回退/版本通道、StartWithParts `image_ref`、ImageResolver 解析、图片预算、MultimodalEnabled、tool invocation actor、profile seed 幂等/tools 校验、HasRunningByChannel、`agent_messages` 不落 data URL。
 - 集成：7 表迁移、事务级联、部分唯一索引、事件 version_id/channel、agent channel 迁移。
 
 ### 10.4 前端测试清单
@@ -985,7 +990,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_sessions_activity_channel
 | 风险 | 处理 |
 |---|---|
 | AI/LLM 不可用 | 503 可重试；全部人工路径可用；UI 降级横幅 |
-| 多模态图片持久化导致 `agent_messages` 膨胀 | 注入限 2 张/2MiB；文本摘要优先；P8 blob 引用/GC；风险接受 |
+| 多模态引用解析/瞬态 base64 的内存与时延 | 注入限 2 张/2MiB；引用不落库；解析失败降级为文本摘要；P8 可加缓存/压缩 |
 | 雪花节点冲突/时钟回拨 | nodeId 配置 0–1023；回拨自旋/序列自增；单实例默认 1；测试覆盖 |
 | 雪花 ID 超 JS 精度 | API 字符串序列化；前端 ID 类型 string；禁止 Number() |
 | P1 通道扩展回归 | 默认空通道回退 `agent:{id}`；P1/P2 既有测试全绿；新增通道测试 |
@@ -1016,7 +1021,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_sessions_activity_channel
 
 ### 13.1 D31 原文（追加至蓝图 §3.2）
 
-> **D31**：P3 版本/多需求/澄清采用「Version 粗粒度容器 + Requirement 独立流水线」。新增/确认/重开需求**永不**改变或回退 `Version.status`；P3 只实现 `draft→clarifying→designing` 与 `Requirement draft→clarified`；`designing` 下仍可独立澄清/确认需求。版本「进入设计」允许带未澄清需求，但需 `acknowledgeUnclarified` 二次确认。新需求重新走「澄清→设计→评审→执行」；执行中的批次不因新增需求中断，受影响用例由 P7 的 AI 补全/修改（D3/D17）。P3 新增 `version` 上下文 7 表（versions/requirements/requirement_relations/requirement_attachments/clarification_sessions/clarification_questions/decisions）与 `agent_0002_activity_channel`；主键遵循 D29 雪花 ID（JSON 字符串序列化）；澄清 SSE 走 `version:{id}` 通道，Agent 会话可选 `activity_channel`（默认 `agent:{session_id}` 不变）。所有登录用户可写版本域；附件支持文本+截图并遵循 D30 文件系统存储，PDF/DOCX 不做。P3 不实现 P4/P5/P6/P7 能力。
+> **D31**：P3 版本/多需求/澄清采用「Version 粗粒度容器 + Requirement 独立流水线」。新增/确认/重开需求**永不**改变或回退 `Version.status`；P3 只实现 `draft→clarifying→designing` 与 `Requirement draft→clarified`；`designing` 下仍可独立澄清/确认需求。版本「进入设计」允许带未澄清需求，但需 `acknowledgeUnclarified` 二次确认。新需求重新走「澄清→设计→评审→执行」；执行中的批次不因新增需求中断，受影响用例由 P7 的 AI 补全/修改（D3/D17）。P3 新增 `version` 上下文 7 表（versions/requirements/requirement_relations/requirement_attachments/clarification_sessions/clarification_questions/decisions）与 `agent_0002_activity_channel`；主键遵循 D29 雪花 ID（JSON 字符串序列化）；澄清 SSE 走 `version:{id}` 通道，Agent 会话可选 `activity_channel`（默认 `agent:{session_id}` 不变）。所有登录用户可写版本域；附件支持文本+截图并遵循 D30 文件系统存储，截图以 `image_ref` 注入、data URL 仅 LLM 调用瞬态生成，PDF/DOCX 不做。P3 不实现 P4/P5/P6/P7 能力。
 
 > **D29/D30 状态**：本次修改已写入蓝图 §3.2 与 `Agent.md` §6.7/§6.8（全项目约束）；D31 待本规格评审通过后追加。
 
@@ -1063,7 +1068,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_sessions_activity_channel
 
 1. 单公司/单租户；P3 表不带 `company_id`。
 2. P2 资源删除不级联 P3，读取时降级为不可用；P8 再加引用保护。
-3. 图片以 data URL 注入并被 P1 持久化到 `agent_messages.content`；P3 用严格限制控制体积，P8 做 blob 引用/GC。
+3. 截图以 `image_ref` 注入 Agent；`agent_messages` 只存引用，data URL 仅在 LLM 调用前瞬态生成（D30：不落库）；P3 用严格限制控制解析体积。
 4. `code_branch`/`code_baseline_commit` 为绑定快照；P4 批次基线在此之上演进。
 5. 单版本单运行中 Agent 为应用层尽力保证；P1 单会话唯一 running 索引兜底。
 6. Agent profile 启动 seed 只插入不更新；提示词迭代通过 admin PATCH 或后续迁移。
