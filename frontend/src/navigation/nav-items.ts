@@ -42,7 +42,13 @@ export const NAV_ITEMS: NavItem[] = [
     hint: "本地 Git 代码仓（P2）",
   },
   { label: "公共资源", href: "/resources", icon: Boxes, phase: "P2", hint: "公共资源管理（P2）" },
-  { label: "Agent 中心", href: "/agents", icon: Bot, phase: "P8", hint: "Agent 配置与观测（P8）" },
+  {
+    label: "Agent 中心",
+    href: "/agents",
+    icon: Bot,
+    phase: "P1",
+    hint: "Agent 运行时控制台（P8 扩展为 Agent 中心）",
+  },
   { label: "设置", href: "/settings", icon: Settings, phase: "P0", hint: "账户与平台设置" },
 ]
 
