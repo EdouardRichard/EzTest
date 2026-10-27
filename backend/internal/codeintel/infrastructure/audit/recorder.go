@@ -1,12 +1,17 @@
 // Package audit adapts the codeintel AuditRecorder port to the audit
 // application recorder (design spec §3.5/§6.10). It records code reads and
 // analyses with identifiers and status only: code content, prompts, diffs and
-// model responses are never part of an entry.
+// model responses are never part of an entry. Identifier keys are recorded as
+// decimal strings (D29/INV-9, review R23) so a Snowflake id cannot lose
+// precision in the persisted JSON.
 package audit
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 
 	auditdomain "github.com/EdouardRichard/EzTest/backend/internal/audit/domain"
@@ -22,11 +27,16 @@ const (
 	// defaultTargetType is used when a caller supplies a subject without a
 	// "<type>:<id>" prefix.
 	defaultTargetType = "code"
+
+	// maxExactFloat64 is the largest integer range a float64 holds exactly; a
+	// decoded JSON number beyond it has already lost precision.
+	maxExactFloat64 = 1 << 53
 )
 
 // allowedDetailKeys is the identifier/status allowlist of the audit metadata.
 // Whatever else a caller puts in the detail map is dropped before the entry is
-// recorded, so code content, diffs and prompts cannot reach the audit log.
+// recorded, so code content, diffs and prompts cannot reach the audit log. The
+// commit/path/status keys are strings by contract and copied unchanged.
 var allowedDetailKeys = map[string]struct{}{
 	"repoId":     {},
 	"versionId":  {},
@@ -35,6 +45,16 @@ var allowedDetailKeys = map[string]struct{}{
 	"headCommit": {},
 	"path":       {},
 	"status":     {},
+	"analysisId": {},
+}
+
+// decimalIDKeys are the allowlisted keys that carry an identifier. D29/INV-9
+// require codeintel ids to be decimal strings in JSON; repoId is a JSON number
+// in the P2 DTOs but is normalized here too, inside the audit metadata only, so
+// the log never stores an id in a shape that a JSON consumer could round.
+var decimalIDKeys = map[string]struct{}{
+	"repoId":     {},
+	"versionId":  {},
 	"analysisId": {},
 }
 
@@ -60,7 +80,8 @@ var _ codeintelapp.AuditRecorder = (*Recorder)(nil)
 
 // Record appends one code audit entry. The subject is "<targetType>:<targetID>";
 // without a colon the whole subject is the target id of the generic "code" type.
-// Only the allowlisted identifier/status keys survive in the metadata.
+// Only the allowlisted identifier/status keys survive in the metadata, and
+// identifier values are recorded as decimal strings.
 func (r *Recorder) Record(ctx context.Context, actorID int64, action, subject string, detail map[string]any) error {
 	if action != ActionCodeRead && action != ActionCodeAnalyze {
 		return fmt.Errorf("codeintel: unsupported audit action %q", action)
@@ -98,13 +119,72 @@ func splitSubject(subject string) (string, string) {
 }
 
 // allowedMetadata copies the allowlisted detail keys into a fresh map so the
-// caller's map is neither aliased nor trusted.
+// caller's map is neither aliased nor trusted. Identifier keys are normalized
+// to decimal strings (D29/INV-9, review R23); commit/path/status values are
+// copied unchanged.
 func allowedMetadata(detail map[string]any) map[string]any {
 	metadata := make(map[string]any, len(detail))
 	for key, value := range detail {
-		if _, ok := allowedDetailKeys[key]; ok {
-			metadata[key] = value
+		if _, ok := allowedDetailKeys[key]; !ok {
+			continue
 		}
+		if _, ok := decimalIDKeys[key]; ok {
+			id, ok := decimalID(value)
+			if !ok {
+				// A value that cannot be a decimal id is a caller bug; dropping
+				// it keeps the log free of malformed identifier shapes.
+				continue
+			}
+			metadata[key] = id
+			continue
+		}
+		metadata[key] = value
 	}
 	return metadata
+}
+
+// decimalID renders an identifier as its decimal string. Callers pass either the
+// int64 domain id or an already-formatted decimal string; a float64 (a decoded
+// JSON number) is accepted only while it is an exact non-negative integer, which
+// is the only range where converting it back to a string is lossless.
+func decimalID(value any) (string, bool) {
+	switch typed := value.(type) {
+	case string:
+		return normalizeDecimalID(typed)
+	case int64:
+		if typed < 0 {
+			return "", false
+		}
+		return strconv.FormatInt(typed, 10), true
+	case int:
+		if typed < 0 {
+			return "", false
+		}
+		return strconv.Itoa(typed), true
+	case json.Number:
+		return normalizeDecimalID(typed.String())
+	case float64:
+		if typed < 0 || typed != math.Trunc(typed) || typed > maxExactFloat64 {
+			return "", false
+		}
+		return strconv.FormatFloat(typed, 'f', -1, 64), true
+	default:
+		return "", false
+	}
+}
+
+// normalizeDecimalID accepts a non-empty unsigned decimal integer. The trimmed
+// original is returned so a large Snowflake id is never reparsed through a
+// float.
+func normalizeDecimalID(value string) (string, bool) {
+	id := strings.TrimSpace(value)
+	if id == "" {
+		return "", false
+	}
+	for _, digit := range id {
+		if digit < '0' || digit > '9' {
+			return "", false
+		}
+	}
+	return id, true
 }
