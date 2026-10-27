@@ -468,14 +468,14 @@ func TestRequirementRelationsNormalizationAndEvents(t *testing.T) {
 	}
 
 	// Update keeps the type when only the description changes, and delete works.
-	updated, err := f.relations.Update(ctx, version.ID, overlaps.ID, "", "still the same scope")
+	updated, err := f.relations.Update(ctx, version.ID, overlaps.ID, nil, requirementPtr("still the same scope"), 42)
 	if err != nil {
 		t.Fatalf("Update relation: %v", err)
 	}
 	if updated.RelationType != domain.RelationOverlaps || updated.Description != "still the same scope" {
 		t.Fatalf("updated relation = %+v", updated)
 	}
-	if err := f.relations.Delete(ctx, version.ID, reverse.ID); err != nil {
+	if err := f.relations.Delete(ctx, version.ID, reverse.ID, 42); err != nil {
 		t.Fatalf("Delete relation: %v", err)
 	}
 

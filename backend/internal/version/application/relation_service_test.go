@@ -148,28 +148,38 @@ func TestRelationUpdateAndDelete(t *testing.T) {
 	f.events.events = nil
 
 	t.Run("changing into a duplicate type is a 409", func(t *testing.T) {
-		_, err := f.relations.Update(context.Background(), version.ID, overlapping.ID, domain.RelationSharesScope, "")
+		_, err := f.relations.Update(context.Background(), version.ID, overlapping.ID,
+			ptr(domain.RelationSharesScope), nil, 42)
 		assertDomainReason(t, err, domain.KindConflict, "duplicate_relation")
 		if got := f.repo.relations[overlapping.ID]; got.RelationType != domain.RelationOverlaps {
 			t.Fatalf("failed update wrote the relation: %+v", got)
 		}
 	})
 
-	t.Run("empty relation type keeps the current type and rewrites the description", func(t *testing.T) {
-		updated, err := f.relations.Update(context.Background(), version.ID, overlapping.ID, "", "same checkout scope")
+	t.Run("nil relation type keeps the current type and rewrites the description", func(t *testing.T) {
+		f.events.events = nil
+		updated, err := f.relations.Update(context.Background(), version.ID, overlapping.ID,
+			nil, ptr("same checkout scope"), 43)
 		if err != nil {
 			t.Fatalf("Update: %v", err)
 		}
 		if updated.RelationType != domain.RelationOverlaps || updated.Description != "same checkout scope" {
 			t.Fatalf("updated = %+v", updated)
 		}
-		if len(f.events.events) != 1 || f.events.events[0].Type != "requirement.relation_updated" {
+		if len(f.events.events) != 1 {
 			t.Fatalf("events = %+v", f.events.events)
+		}
+		event := f.events.events[0]
+		if event.Type != "requirement.relation_updated" ||
+			event.ActorID != 43 || event.Source != domain.SourceUser {
+			t.Fatalf("event = %+v", event)
 		}
 	})
 
 	t.Run("relation type can change", func(t *testing.T) {
-		updated, err := f.relations.Update(context.Background(), version.ID, overlapping.ID, domain.RelationConflictsWith, "conflict")
+		f.events.events = nil
+		updated, err := f.relations.Update(context.Background(), version.ID, overlapping.ID,
+			ptr(domain.RelationConflictsWith), ptr("conflict"), 42)
 		if err != nil {
 			t.Fatalf("Update: %v", err)
 		}
@@ -178,28 +188,49 @@ func TestRelationUpdateAndDelete(t *testing.T) {
 		}
 	})
 
+	t.Run("nil relation type and description preserve the stored fields", func(t *testing.T) {
+		f.events.events = nil
+		updated, err := f.relations.Update(context.Background(), version.ID, overlapping.ID, nil, nil, 7)
+		if err != nil {
+			t.Fatalf("Update: %v", err)
+		}
+		if updated.RelationType != domain.RelationConflictsWith || updated.Description != "conflict" {
+			t.Fatalf("nil update changed the relation: %+v", updated)
+		}
+		if len(f.events.events) != 1 ||
+			f.events.events[0].ActorID != 7 || f.events.events[0].Source != domain.SourceUser {
+			t.Fatalf("events = %+v", f.events.events)
+		}
+	})
+
 	t.Run("unknown relation type is a 422", func(t *testing.T) {
-		_, err := f.relations.Update(context.Background(), version.ID, overlapping.ID, "blocks", "")
+		_, err := f.relations.Update(context.Background(), version.ID, overlapping.ID, ptr("blocks"), nil, 42)
 		assertDomainReason(t, err, domain.KindInvalid, "invalid_relation_type")
 	})
 
 	t.Run("missing relation is 404", func(t *testing.T) {
-		_, err := f.relations.Update(context.Background(), version.ID, 999, domain.RelationOverlaps, "")
+		_, err := f.relations.Update(context.Background(), version.ID, 999,
+			ptr(domain.RelationOverlaps), nil, 42)
 		assertDomainReason(t, err, domain.KindNotFound, "not_found")
 	})
 
 	t.Run("delete removes the relation and publishes an event", func(t *testing.T) {
 		f.events.events = nil
-		if err := f.relations.Delete(context.Background(), version.ID, shares.ID); err != nil {
+		if err := f.relations.Delete(context.Background(), version.ID, shares.ID, 43); err != nil {
 			t.Fatalf("Delete: %v", err)
 		}
 		if _, ok := f.repo.relations[shares.ID]; ok {
 			t.Fatal("relation was not deleted")
 		}
-		if len(f.events.events) != 1 || f.events.events[0].Type != "requirement.relation_removed" {
+		if len(f.events.events) != 1 {
 			t.Fatalf("events = %+v", f.events.events)
 		}
-		if err := f.relations.Delete(context.Background(), version.ID, shares.ID); err == nil {
+		event := f.events.events[0]
+		if event.Type != "requirement.relation_removed" ||
+			event.ActorID != 43 || event.Source != domain.SourceUser {
+			t.Fatalf("event = %+v", event)
+		}
+		if err := f.relations.Delete(context.Background(), version.ID, shares.ID, 43); err == nil {
 			t.Fatal("deleting a missing relation succeeded")
 		}
 	})
@@ -210,9 +241,10 @@ func TestRelationUpdateAndDelete(t *testing.T) {
 		foreignSecond := f.seedRequirement(otherVersion.ID, domain.RequirementDraft)
 		foreign := createRelation(t, f, otherVersion.ID, foreignFirst.ID, foreignSecond.ID, domain.RelationOverlaps)
 
-		_, err := f.relations.Update(context.Background(), version.ID, foreign.ID, domain.RelationConflictsWith, "")
+		_, err := f.relations.Update(context.Background(), version.ID, foreign.ID,
+			ptr(domain.RelationConflictsWith), nil, 42)
 		assertDomainReason(t, err, domain.KindNotFound, "not_found")
-		assertDomainReason(t, f.relations.Delete(context.Background(), version.ID, foreign.ID),
+		assertDomainReason(t, f.relations.Delete(context.Background(), version.ID, foreign.ID, 42),
 			domain.KindNotFound, "not_found")
 	})
 }
@@ -238,5 +270,30 @@ func TestRelationList(t *testing.T) {
 	}
 	if len(empty) != 0 {
 		t.Fatalf("empty relations = %+v", empty)
+	}
+}
+
+// TestRelationListCapsAt500 covers spec §7.4: the relation list is unpaginated
+// but never returns more than 500 edges of one version.
+func TestRelationListCapsAt500(t *testing.T) {
+	f := newRequirementFixture()
+	version := f.seedVersion(domain.VersionDraft)
+	for i := int64(0); i < 501; i++ {
+		id := 9000 + i
+		f.repo.relations[id] = domain.Relation{
+			ID: id, VersionID: version.ID, FromRequirementID: 1, ToRequirementID: 2,
+			RelationType: domain.RelationOverlaps, Source: domain.SourceUser,
+		}
+	}
+
+	relations, err := f.relations.List(context.Background(), version.ID)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(relations) != 500 {
+		t.Fatalf("relations = %d, want the 500 cap", len(relations))
+	}
+	if relations[0].ID != 9000 || relations[499].ID != 9499 {
+		t.Fatalf("first/last relation = %d/%d, want 9000/9499", relations[0].ID, relations[499].ID)
 	}
 }

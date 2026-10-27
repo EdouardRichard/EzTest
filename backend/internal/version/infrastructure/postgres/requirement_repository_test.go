@@ -540,6 +540,43 @@ func mustUpdateRelation(repo *postgres.RequirementRepository, ctx context.Contex
 	return err
 }
 
+// TestRequirementRelationListCapsAt500 covers spec §7.4: the relation list is
+// unpaginated but bounded to 500 rows per version. Rows are seeded through SQL
+// so the test stays fast with more than 500 relations.
+func TestRequirementRelationListCapsAt500(t *testing.T) {
+	ctx := context.Background()
+	pool, repo, versions := openRequirementTestDB(t)
+	version := insertVersion(t, versions, domain.Version{ID: 1001, Name: "Capped v1", CreatedBy: 7, UpdatedBy: 7})
+
+	// Two disjoint requirement ranges give 50x11 distinct non-self pairs; 521
+	// relations are seeded so only the lowest 500 ids may be returned.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO requirements (id, version_id, title, created_by, updated_by)
+		SELECT n, $1::bigint, 'requirement ' || n, 7, 7 FROM generate_series(3001, 3050) AS n
+		UNION ALL
+		SELECT n, $1::bigint, 'requirement ' || n, 7, 7 FROM generate_series(4001, 4011) AS n`, version.ID); err != nil {
+		t.Fatalf("seed requirements: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO requirement_relations
+			(id, version_id, from_requirement_id, to_requirement_id, relation_type, created_by)
+		SELECT 800000 + n, $1, 3001 + (n / 11), 4001 + (n % 11), 'overlaps', 7
+		FROM generate_series(0, 520) AS n`, version.ID); err != nil {
+		t.Fatalf("seed relations: %v", err)
+	}
+
+	relations, err := repo.ListRelations(ctx, version.ID)
+	if err != nil {
+		t.Fatalf("ListRelations: %v", err)
+	}
+	if len(relations) != 500 {
+		t.Fatalf("relations = %d, want the 500 cap", len(relations))
+	}
+	if relations[0].ID != 800000 || relations[499].ID != 800499 {
+		t.Fatalf("first/last relation = %d/%d, want 800000/800499", relations[0].ID, relations[499].ID)
+	}
+}
+
 // TestRequirementAttachmentRepository covers the attachment metadata methods that
 // the attachment service (T11) consumes.
 func TestRequirementAttachmentRepository(t *testing.T) {
