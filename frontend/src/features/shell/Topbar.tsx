@@ -5,10 +5,8 @@ import { ChevronDown, FlaskConical, LogOut, Moon, ShieldCheck, Sun } from "lucid
 import Link from "next/link"
 import { useTheme } from "next-themes"
 import { useEffect, useState } from "react"
-
+import { StatusBadge, type StatusBadgeVariant } from "@/components/ui/StatusBadge"
 import { useAuth } from "@/features/auth/AuthProvider"
-
-import { StatusBadge, type StatusBadgeVariant } from "./StatusBadge"
 
 type EnvironmentMeta = {
   label: string

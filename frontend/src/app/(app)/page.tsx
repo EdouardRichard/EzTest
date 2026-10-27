@@ -2,6 +2,7 @@
 
 import type { LucideIcon } from "lucide-react"
 import {
+  ArrowRight,
   Bot,
   Database,
   Layers,
@@ -14,8 +15,8 @@ import {
 import Link from "next/link"
 import { useCallback, useEffect, useState } from "react"
 
-import { EmptyState } from "@/features/shell/EmptyState"
-import { StatusBadge, type StatusBadgeVariant } from "@/features/shell/StatusBadge"
+import { EmptyState } from "@/components/ui/EmptyState"
+import { StatusBadge, type StatusBadgeVariant } from "@/components/ui/StatusBadge"
 import { ApiError, apiGet, getApiBaseUrl } from "@/lib/api-client"
 
 type HealthData = {
@@ -32,6 +33,8 @@ type ServiceCard = {
   label: string
   detail: string
   variant: StatusBadgeVariant
+  /** Optional call to action; the SSE card points at its settings panel. */
+  href?: string
 }
 
 export default function OverviewPage() {
@@ -117,7 +120,7 @@ export default function OverviewPage() {
         label: health.llm_configured ? "已配置" : "未配置",
         detail: health.llm_configured
           ? "已存在可解密的默认 LLM 配置。"
-          : "设置页将在后续任务接入 LLM 配置。",
+          : "可在设置页配置 LLM 连接、模型与 API Key。",
         variant: health.llm_configured ? "success" : "warning",
       }
     : {
@@ -135,9 +138,10 @@ export default function OverviewPage() {
     {
       title: "SSE 事件流",
       icon: RadioTower,
-      label: "待接入",
-      detail: "服务端事件流已就绪；浏览器 SSE 客户端将在后续任务接入。",
-      variant: "info",
+      label: "已接入",
+      detail: "可在设置页的 SSE 测试面板连接 system 频道并发布测试事件。",
+      variant: "success",
+      href: "/settings",
     },
   ]
 
@@ -184,6 +188,15 @@ export default function OverviewPage() {
               </div>
               <h2 className="mt-3 text-sm font-medium">{card.title}</h2>
               <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{card.detail}</p>
+              {card.href ? (
+                <Link
+                  href={card.href}
+                  className="mt-3 inline-flex items-center gap-1 text-xs font-medium text-sky-600 transition-colors hover:text-sky-500 dark:text-sky-400"
+                >
+                  前往设置
+                  <ArrowRight className="h-3 w-3" aria-hidden="true" />
+                </Link>
+              ) : null}
             </article>
           )
         })}
@@ -192,14 +205,14 @@ export default function OverviewPage() {
       <EmptyState
         icon={Layers}
         title="版本功能将在 P3 阶段开放"
-        description="版本列表、多需求澄清、用例脑图、执行中心与报告会按 P3–P7 阶段逐步接入。P0 仅交付应用壳、登录、权限保护与请求基础设施。"
+        description="版本列表、多需求澄清、用例脑图、执行中心与报告会按 P3–P7 阶段逐步接入。P0 已交付应用壳、登录、用户与权限、LLM 配置、SSE 事件流、对象存储与审计等基础能力。"
         action={
           <Link
             href="/settings"
             className="inline-flex h-9 items-center gap-2 rounded-lg border border-border bg-card px-3 text-sm font-medium transition-colors hover:bg-muted"
           >
             <Settings2 className="h-4 w-4" aria-hidden="true" />
-            查看设置骨架
+            查看设置与诊断
           </Link>
         }
       />

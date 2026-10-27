@@ -10,9 +10,8 @@ import {
 } from "lucide-react"
 import { useRouter } from "next/navigation"
 import { type FormEvent, useEffect, useState } from "react"
-
+import { StatusBadge } from "@/components/ui/StatusBadge"
 import { useAuth } from "@/features/auth/AuthProvider"
-import { StatusBadge } from "@/features/shell/StatusBadge"
 import { ApiError, getApiBaseUrl } from "@/lib/api-client"
 
 function toLoginMessage(cause: unknown): string {

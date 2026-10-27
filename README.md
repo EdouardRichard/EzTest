@@ -37,7 +37,7 @@ P0 **不包含**版本/需求/用例/执行/证据/问题/报告等业务实体�
 ### 前端（`frontend/`）
 
 - Next.js 16 App Router、React 19、TypeScript、Tailwind CSS 4、Radix 原语、`next-themes`、lucide-react。
-- `src/app/` 只做路由/布局/页面组装；业务在 `src/features/{auth,users,llm-settings,sse-test,shell}`。
+- `src/app/` 只做路由/布局/页面组装；业务在 `src/features/{auth,users,llm-settings,sse-test,shell}`；共享 UI 原语在 `src/components/ui/`，跨 feature 导航在 `src/navigation/`。
 - 所有 HTTP 请求经 `src/lib/api-client.ts`（Bearer、错误信封、`X-Request-ID`、幂等键）；SSE 经 `src/lib/sse-client.ts`（fetch 流、`Last-Event-ID`、退避重连、心跳超时）。
 - 质量工具：Biome（lint/format）、Vitest + Testing Library、Playwright（使用本机 Chrome/Edge channel，不下载 Chromium）。
 
@@ -69,6 +69,8 @@ EzTest/
 ├─ frontend/
 │  ├─ src/app/                        # Next.js App Router 页面组装
 │  ├─ src/features/                   # auth/users/llm-settings/sse-test/shell
+│  ├─ src/components/ui/              # 共享 UI 原语（StatusBadge/EmptyState）
+│  ├─ src/navigation/                 # 跨 feature 导航数据（侧边栏）
 │  ├─ src/lib/                        # api-client / sse-client / auth-storage
 │  ├─ scripts/validate-compose.mjs    # Compose 静态校验
 │  └─ e2e/                            # Playwright
@@ -116,7 +118,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/db.ps1 start
 | `EZTEST_HTTP_ADDR` | 否 | API 监听地址，默认 `:13333`。 |
 | `EZTEST_WEB_ORIGIN` | 否 | CORS 允许的前端 origin，默认 `http://localhost:6868`。 |
 | `EZTEST_DATABASE_URL` | 是 | PostgreSQL URL；本地为 `postgres://eztest:<password>@localhost:5433/eztest?sslmode=disable`。 |
-| `EZTEST_TEST_DATABASE_URL` | 集成测试 | 独立测试库 URL（`eztest_test`），不会碰开发库。 |
+| `EZTEST_TEST_DATABASE_URL` | 集成测试 | 独立测试库 URL（`eztest_test`）；库名必须以 `_test`/`_e2e` 结尾且不得与开发库相同（测试辅助与脚本会前置校验，失败即拒绝重置 schema）。 |
 | `EZTEST_ADMIN_USERNAME` / `EZTEST_ADMIN_PASSWORD` | 首次启动 | 种子管理员；密码至少 10 字符，仅存 bcrypt 哈希。 |
 | `EZTEST_SECRET_KEYS` | 是 | JSON `{"版本":"base64 32 字节密钥"}`，用于加密 LLM Key/headers。 |
 | `EZTEST_SECRET_KEY_ACTIVE` | 是 | 当前加密密钥版本，必须在 `EZTEST_SECRET_KEYS` 中存在。 |
@@ -157,8 +159,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/dev-web.ps1
 等价的底层命令：
 
 ```powershell
-# API（必须从 backend/ 运行；OpenAPI 路径需按需设置）
+# API（必须从 backend/ 运行；OpenAPI 默认相对路径按进程工作目录解析，
+# 因此显式指向仓库根目录的文件）
 cd backend
+$env:EZTEST_OPENAPI_PATH = (Resolve-Path ..\docs\openapi\p0.yaml).Path
 ..\.tools\go\bin\go.exe run ./cmd/eztest
 
 # 前端

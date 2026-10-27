@@ -2,11 +2,11 @@ package httpapi
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -290,7 +290,6 @@ func defaultTestConfig() llm.Config {
 func newAdminTestHandler(t *testing.T, svc ConfigService, factory *fakeFactory, recorder auditapp.Recorder) http.Handler {
 	t.Helper()
 	handler := NewHandler(svc, factory.build, recorder)
-	handler.imagePath = filepath.Join("..", "..", "..", "..", "testdata", "pixel.png")
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, handler, identityhttp.RequireAdmin)
 	admin := identity.User{ID: 1, Username: "admin", Role: identity.RoleAdmin, Status: identity.StatusActive}
@@ -656,6 +655,41 @@ func TestLLMConfigValidationErrors(t *testing.T) {
 	}
 	if rec := doLLMRequest(t, h, http.MethodPatch, "/api/admin/llm/configs/abc", "ezt_admin", `{"model":"x"}`); rec.Code != http.StatusBadRequest {
 		t.Fatalf("bad id=%d want 400 body=%s", rec.Code, rec.Body)
+	}
+}
+
+// TestTestEndpointUsesEmbeddedPixelImageFromAnyWorkingDirectory proves the
+// multimodal fixture is compiled into the binary instead of being read relative
+// to the process working directory. The runtime image only ships the binary and
+// the OpenAPI document, so a cwd/file-path lookup would fail in production.
+func TestTestEndpointUsesEmbeddedPixelImageFromAnyWorkingDirectory(t *testing.T) {
+	svc := newFakeConfigService(defaultTestConfig())
+	client := &fakeLLMClient{}
+	h := newAdminTestHandler(t, svc, &fakeFactory{client: client}, &capturingRecorder{})
+
+	// An empty temporary directory stands in for the container working
+	// directory, which has no testdata/pixel.png next to it.
+	t.Chdir(t.TempDir())
+
+	rec := doLLMRequest(t, h, http.MethodPost, "/api/admin/llm/configs/1/test", "ezt_admin", `{"image":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("image test from empty cwd=%d body=%s", rec.Code, rec.Body)
+	}
+	content := client.lastChat.Messages
+	if len(content) != 1 || len(content[0].Content) != 2 {
+		t.Fatalf("image request parts=%+v", content)
+	}
+	image := content[0].Content[1]
+	const prefix = "data:image/png;base64,"
+	if image.Type != "image_url" || !strings.HasPrefix(image.ImageURL, prefix) {
+		t.Fatalf("image part=%+v", image)
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(image.ImageURL, prefix))
+	if err != nil {
+		t.Fatalf("decode embedded image: %v", err)
+	}
+	if len(raw) < 8 || string(raw[:8]) != "\x89PNG\r\n\x1a\n" {
+		t.Fatalf("embedded image is not a PNG: %x", raw)
 	}
 }
 

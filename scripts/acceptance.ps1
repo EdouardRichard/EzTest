@@ -6,9 +6,10 @@
 .DESCRIPTION
     Executes the Go unit and integration suites, the frontend lint/typecheck/test/build
     gate, the Playwright E2E suite, a repeated migration run and the health/audit
-    assertions. Container execution is reported as SKIPPED because this host has no
-    Docker; Task 15 deliverable checks are also reported as SKIPPED (out of scope for
-    Task 14). Prints a DoD mapping table and exits non-zero on any failure.
+    assertions. The Task 15 deliverables are checked (README, OpenAPI, deploy files)
+    and the Compose file is statically validated with node. Container execution is
+    reported as SKIPPED because this host has no Docker. Prints a DoD mapping table
+    and exits non-zero on any failure.
 
 .NOTES
     Compatible with Windows PowerShell 5.1 and PowerShell 7+.
@@ -150,6 +151,66 @@ function Get-RequiredValue {
         throw "Missing required value $Key in .env"
     }
     return [string]$Values[$Key]
+}
+
+function Assert-SafeTestDatabaseUrl {
+    param(
+        [string]$TestDatabaseUrl,
+        [string]$DatabaseUrl
+    )
+    # Defense in depth for the destructive Go integration helper: it drops and
+    # recreates the public schema, so the URL must name a dedicated PostgreSQL
+    # test/e2e database and must not be the development database. Error messages
+    # intentionally omit credentials and the full URLs.
+    if ([string]::IsNullOrWhiteSpace($TestDatabaseUrl)) {
+        throw "EZTEST_TEST_DATABASE_URL is not set; integration tests need the dedicated test database"
+    }
+    if ([string]::IsNullOrWhiteSpace($DatabaseUrl)) {
+        throw "EZTEST_DATABASE_URL is not set, so the test database cannot be checked against the development database"
+    }
+
+    $testUri = $null
+    if (-not [System.Uri]::TryCreate($TestDatabaseUrl, [System.UriKind]::Absolute, [ref]$testUri)) {
+        throw "EZTEST_TEST_DATABASE_URL is not a valid absolute URL"
+    }
+    $devUri = $null
+    if (-not [System.Uri]::TryCreate($DatabaseUrl, [System.UriKind]::Absolute, [ref]$devUri)) {
+        throw "EZTEST_DATABASE_URL is not a valid absolute URL"
+    }
+
+    foreach ($item in @(
+            @{ Name = "EZTEST_TEST_DATABASE_URL"; Uri = $testUri },
+            @{ Name = "EZTEST_DATABASE_URL"; Uri = $devUri }
+        )) {
+        if ($item.Uri.Scheme -ne "postgres" -and $item.Uri.Scheme -ne "postgresql") {
+            throw "$($item.Name) must use the postgres scheme"
+        }
+        if ([string]::IsNullOrWhiteSpace($item.Uri.Host)) {
+            throw "$($item.Name) must include a host"
+        }
+    }
+
+    $testName = [System.Uri]::UnescapeDataString($testUri.AbsolutePath.TrimStart([char[]]"/"))
+    if ([string]::IsNullOrWhiteSpace($testName)) {
+        throw "EZTEST_TEST_DATABASE_URL must include a database name"
+    }
+    if (-not ($testName.EndsWith("_test", [System.StringComparison]::Ordinal) -or
+            $testName.EndsWith("_e2e", [System.StringComparison]::Ordinal))) {
+        throw "EZTEST_TEST_DATABASE_URL database '$testName' must end with _test or _e2e"
+    }
+
+    $devName = [System.Uri]::UnescapeDataString($devUri.AbsolutePath.TrimStart([char[]]"/"))
+    if ([string]::IsNullOrWhiteSpace($devName)) {
+        throw "EZTEST_DATABASE_URL must include a database name"
+    }
+
+    $testPort = if ($testUri.Port -gt 0) { $testUri.Port } else { 5432 }
+    $devPort = if ($devUri.Port -gt 0) { $devUri.Port } else { 5432 }
+    $testCanonical = "{0}:{1}/{2}" -f $testUri.Host.ToLowerInvariant(), $testPort, $testName
+    $devCanonical = "{0}:{1}/{2}" -f $devUri.Host.ToLowerInvariant(), $devPort, $devName
+    if ($testCanonical -eq $devCanonical) {
+        throw "EZTEST_TEST_DATABASE_URL points at the same database as EZTEST_DATABASE_URL ($testCanonical); refusing to reset it"
+    }
 }
 
 function Stop-ProcessTree {
@@ -332,6 +393,10 @@ try {
     $pnpmExe = (Get-Command pnpm.cmd -ErrorAction SilentlyContinue).Source
     if (-not $pnpmExe) { $pnpmExe = (Get-Command pnpm -ErrorAction SilentlyContinue).Source }
     if (-not $pnpmExe) { throw "pnpm is not available on PATH" }
+    $nodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
+    if (-not $nodeCommand) { $nodeCommand = Get-Command node -ErrorAction SilentlyContinue }
+    if (-not $nodeCommand) { throw "node is not available on PATH" }
+    $nodeExe = $nodeCommand.Source
     $scriptHost = Join-Path $PSHOME "pwsh.exe"
     if (-not (Test-Path -LiteralPath $scriptHost)) { $scriptHost = Join-Path $PSHOME "powershell.exe" }
     if (-not (Test-Path -LiteralPath $scriptHost)) { throw "cannot locate a PowerShell host to run scripts/e2e.ps1" }
@@ -364,6 +429,10 @@ try {
     $slashIndex = $urlBase.LastIndexOf("/")
     if ($slashIndex -lt 0) { throw "EZTEST_DATABASE_URL does not contain a database name" }
     $e2eDatabaseUrl = $urlBase.Substring(0, $slashIndex + 1) + $e2eDbName + $urlQuery
+
+    # Refuse to run the destructive integration helper against anything that is
+    # not a dedicated test/e2e database before any suite is started.
+    Assert-SafeTestDatabaseUrl -TestDatabaseUrl $testDatabaseUrl -DatabaseUrl $databaseUrl
 
     $expectedMigrations = @(Get-Content -LiteralPath (Join-Path $backendDir "internal\db\migrations\order.txt") | Where-Object { $_.Trim() -ne "" }).Count
     if ($expectedMigrations -le 0) { throw "no migrations are listed in order.txt" }
@@ -481,12 +550,34 @@ try {
             }
         })
 
+    [void](Invoke-Check -Dod "5" -CheckName "P0 deliverables and Compose static validation" -Body {
+            foreach ($relative in @(
+                    "README.md",
+                    "docs/openapi/p0.yaml",
+                    "deploy/Dockerfile.api",
+                    "deploy/Dockerfile.web",
+                    "deploy/docker-compose.yml"
+                )) {
+                $deliverable = Join-Path $repoRoot $relative
+                if (-not (Test-Path -LiteralPath $deliverable)) {
+                    throw "missing P0 deliverable $relative"
+                }
+            }
+            $readme = Get-Content -LiteralPath (Join-Path $repoRoot "README.md") -Raw
+            if ($readme -notmatch "EZTEST_OPENAPI_PATH") {
+                throw "README raw go-run instructions do not document EZTEST_OPENAPI_PATH"
+            }
+            Invoke-LoggedCommand -Exe $nodeExe -Arguments @("scripts/validate-compose.mjs") `
+                -WorkingDirectory $frontendDir `
+                -LogPath (Join-Path $tmpDir "acceptance-compose-validate.log") `
+                -Label "scripts/validate-compose.mjs" `
+                -SuccessTailLines 8
+        })
+
     Add-CheckResult -Dod "risk" -CheckName "Compose container run" -Status "SKIPPED" `
         -Detail "No Docker on this host; Compose remains static-validation only (Task 15)."
     Add-CheckResult -Dod "4" -CheckName "Real LLM acceptance" -Status "SKIPPED" `
         -Detail "Gated: run scripts/acceptance-llm.ps1 with EZTEST_RUN_REAL_LLM=1."
-    Add-CheckResult -Dod "5" -CheckName "README/OpenAPI/deploy files" -Status "SKIPPED" `
-        -Detail "Task 15 scope; intentionally not implemented in Task 14."
 
     Write-Step "P0 DoD acceptance summary"
     $table = $checkResults | Format-Table -AutoSize -Wrap | Out-String -Width 200

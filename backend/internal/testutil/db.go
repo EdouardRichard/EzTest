@@ -4,6 +4,9 @@ package testutil
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -52,8 +55,10 @@ func OpenTestDB(t *testing.T) *pgxpool.Pool {
 // empty public schema: it drops and recreates the schema (the URL points at
 // the test database) and does not apply any migrations. Tests that supply
 // their own migration set start from a clean ledger instead of inheriting the
-// embedded one. The pool is closed when the test finishes. The test is skipped
-// when the variable is unset.
+// embedded one. Before connecting, the URL is checked by
+// validateTestDatabaseURL: it must name a dedicated `_test`/`_e2e` PostgreSQL
+// database and must not be the development database. The pool is closed when
+// the test finishes. The test is skipped when the variable is unset.
 //
 // The helper takes advisory lock 4243 for the lifetime of the test so that
 // parallel test binaries in other packages cannot reset or truncate the shared
@@ -67,6 +72,12 @@ func OpenRawTestDB(t *testing.T) *pgxpool.Pool {
 	url := strings.TrimSpace(os.Getenv("EZTEST_TEST_DATABASE_URL"))
 	if url == "" {
 		t.Skip("EZTEST_TEST_DATABASE_URL is not set")
+	}
+	// Refuse to touch anything that is not clearly a dedicated test database
+	// before opening a connection. The helper drops the public schema, so a
+	// mis-set variable must never be able to wipe the development database.
+	if err := validateTestDatabaseURL(url, strings.TrimSpace(os.Getenv("EZTEST_DATABASE_URL"))); err != nil {
+		t.Fatalf("refusing to reset test database: %v", err)
 	}
 
 	ctx := context.Background()
@@ -114,6 +125,78 @@ func lockTestDB(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
 		}
 		conn.Release()
 	})
+}
+
+// validateTestDatabaseURL guards the destructive test helpers. OpenRawTestDB
+// drops and recreates the public schema, so the URL must be a real PostgreSQL
+// URL, must name a dedicated test/e2e database and must not resolve to the
+// development database. The checks are pure so they can be unit-tested without
+// a database and run before any connection or DROP.
+//
+// The comparison against the development URL is skipped when devURL is empty
+// (for example a plain `go test` invocation that only exports the test URL);
+// the scheme, host, database-name and suffix checks still fail closed. When a
+// development URL is present it must itself be a valid PostgreSQL URL.
+func validateTestDatabaseURL(testURL, devURL string) error {
+	testURL = strings.TrimSpace(testURL)
+	if testURL == "" {
+		return errors.New("EZTEST_TEST_DATABASE_URL is not set")
+	}
+	test, err := url.Parse(testURL)
+	if err != nil {
+		// Do not wrap the parse error: it quotes the raw URL, including the
+		// password. The message is still actionable without it.
+		return errors.New("EZTEST_TEST_DATABASE_URL is not a valid URL")
+	}
+	if !isPostgresURL(test) {
+		return fmt.Errorf("EZTEST_TEST_DATABASE_URL must use the postgres scheme, got %q", test.Scheme)
+	}
+	if test.Hostname() == "" {
+		return errors.New("EZTEST_TEST_DATABASE_URL must include a host")
+	}
+	testName := databaseName(test)
+	if testName == "" {
+		return errors.New("EZTEST_TEST_DATABASE_URL must include a database name")
+	}
+	if !strings.HasSuffix(testName, "_test") && !strings.HasSuffix(testName, "_e2e") {
+		return fmt.Errorf("EZTEST_TEST_DATABASE_URL database %q must end with _test or _e2e", testName)
+	}
+
+	devURL = strings.TrimSpace(devURL)
+	if devURL == "" {
+		return nil
+	}
+	dev, err := url.Parse(devURL)
+	if err != nil || !isPostgresURL(dev) || dev.Hostname() == "" || databaseName(dev) == "" {
+		return errors.New("EZTEST_DATABASE_URL is not a valid PostgreSQL URL; cannot verify that the test database is separate")
+	}
+	if canonicalDatabase(test) == canonicalDatabase(dev) {
+		return fmt.Errorf("EZTEST_TEST_DATABASE_URL points at the same database as EZTEST_DATABASE_URL (%s); refusing to drop its schema", canonicalDatabase(test))
+	}
+	return nil
+}
+
+// isPostgresURL reports whether u uses a scheme the pgx driver accepts.
+func isPostgresURL(u *url.URL) bool {
+	scheme := strings.ToLower(u.Scheme)
+	return scheme == "postgres" || scheme == "postgresql"
+}
+
+// databaseName returns the URL's database path without the leading slash.
+func databaseName(u *url.URL) string {
+	return strings.TrimPrefix(u.Path, "/")
+}
+
+// canonicalDatabase renders host, effective port and database name for
+// comparison. Credentials and query parameters are deliberately excluded: two
+// URLs can reach the same database with different users, TLS modes or textual
+// port forms, and the schema reset must be refused in every such case.
+func canonicalDatabase(u *url.URL) string {
+	port := u.Port()
+	if port == "" {
+		port = "5432"
+	}
+	return strings.ToLower(u.Hostname()) + ":" + port + "/" + databaseName(u)
 }
 
 // truncateAll empties every table in the public schema except the migration

@@ -3,7 +3,7 @@
 import { RadioTower, Send, Unplug } from "lucide-react"
 import { useCallback, useEffect, useRef, useState } from "react"
 
-import { StatusBadge, type StatusBadgeVariant } from "@/features/shell/StatusBadge"
+import { StatusBadge, type StatusBadgeVariant } from "@/components/ui/StatusBadge"
 import { ApiError, apiGet, apiPost, resolveApiUrl } from "@/lib/api-client"
 import { getToken } from "@/lib/auth-storage"
 import { connectSSE, type SSEEvent, type SSEStatus } from "@/lib/sse-client"

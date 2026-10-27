@@ -3,8 +3,8 @@
 import { KeyRound, Plus, RefreshCw, Save, Sparkles } from "lucide-react"
 import { type FormEvent, useCallback, useEffect, useRef, useState } from "react"
 
-import { EmptyState } from "@/features/shell/EmptyState"
-import { StatusBadge } from "@/features/shell/StatusBadge"
+import { EmptyState } from "@/components/ui/EmptyState"
+import { StatusBadge } from "@/components/ui/StatusBadge"
 import { ApiError, apiGet, apiPatch, apiPost, apiStreamFetch } from "@/lib/api-client"
 import { consumeSSEStream } from "@/lib/sse-client"
 
