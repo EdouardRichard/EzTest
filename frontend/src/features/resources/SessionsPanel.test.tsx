@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const mocks = vi.hoisted(() => ({
@@ -34,7 +34,7 @@ vi.mock("./api", () => ({
 }))
 
 import { SessionsPanel } from "./SessionsPanel"
-import type { AccountDTO, EnvironmentDTO, SessionDTO, SnapshotDTO, SystemDTO } from "./types"
+import type { AccountDTO, EnvironmentDTO, Page, SessionDTO, SnapshotDTO, SystemDTO } from "./types"
 
 const SYSTEM: SystemDTO = {
   id: 1,
@@ -214,6 +214,43 @@ describe("SessionsPanel", () => {
         systemId: 1,
       }),
     )
+  })
+
+  it("ignores a late session list response after the filters change", async () => {
+    const stale = makeSession({ id: 3, state: "needs_manual" })
+    const fresh = makeSession({ id: 4, state: "invalid" })
+    mocks.listSessions.mockResolvedValueOnce(page([]))
+    mocks.getSession.mockImplementation((id: number) =>
+      Promise.resolve(id === 3 ? stale : id === 4 ? fresh : SESSION),
+    )
+    const pending: Array<(value: Page<SessionDTO>) => void> = []
+
+    render(<SessionsPanel canWrite={false} />)
+    await screen.findByText("暂无会话")
+
+    // Hold both filter loads open so the older response can land last.
+    mocks.listSessions.mockImplementation(
+      () => new Promise<Page<SessionDTO>>((resolve) => pending.push(resolve)),
+    )
+    fireEvent.change(screen.getByLabelText("按状态筛选"), {
+      target: { value: "needs_manual" },
+    })
+    await waitFor(() => expect(pending).toHaveLength(1))
+    fireEvent.change(screen.getByLabelText("按状态筛选"), { target: { value: "invalid" } })
+    await waitFor(() => expect(pending).toHaveLength(2))
+
+    await act(async () => {
+      pending[1](page([fresh]))
+    })
+    const table = await screen.findByRole("table")
+    expect(within(table).getByText("#4")).toBeTruthy()
+
+    await act(async () => {
+      pending[0](page([stale]))
+    })
+
+    expect(within(screen.getByRole("table")).getByText("#4")).toBeTruthy()
+    expect(within(screen.getByRole("table")).queryByText("#3")).toBeNull()
   })
 
   it("selects a row, records the deep link and renders the fetched detail", async () => {
