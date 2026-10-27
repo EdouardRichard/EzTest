@@ -226,6 +226,7 @@ export async function downloadAttachment(
 ): Promise<Blob> {
   const response = await apiStreamFetch(
     `${attachmentsPath(versionId, requirementId)}/${attachmentId}/content`,
+    { method: "GET" },
   )
   return response.blob()
 }

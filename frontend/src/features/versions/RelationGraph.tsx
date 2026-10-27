@@ -1,5 +1,6 @@
 "use client"
 
+import { Loader2 } from "lucide-react"
 import { type KeyboardEvent, useId } from "react"
 
 import { StatusBadge } from "@/components/ui/StatusBadge"
@@ -95,6 +96,10 @@ const EDGE_DASH: Record<RelationType, string | undefined> = {
 export type RelationGraphProps = {
   requirements: Requirement[]
   relations: RequirementRelation[]
+  /** True while relations are (re)loading; the stale count is hidden meanwhile. */
+  loading?: boolean
+  /** Relation load failure from the workbench; shown instead of a zero count. */
+  error?: string
   /** Selects the requirement a node represents; the workbench owns selection. */
   onSelect: (requirementId: string) => void
 }
@@ -105,7 +110,13 @@ export type RelationGraphProps = {
  * with an arrowhead and plain lines for the three undirected kinds, a text
  * legend, and node selection by click or keyboard.
  */
-export function RelationGraph({ requirements, relations, onSelect }: RelationGraphProps) {
+export function RelationGraph({
+  requirements,
+  relations,
+  loading = false,
+  error = "",
+  onSelect,
+}: RelationGraphProps) {
   // React ids contain ":" characters, which are awkward inside SVG url(#...)
   // references; strip everything outside the safe fragment alphabet.
   const arrowId = `relation-arrow-${useId().replace(/[^a-zA-Z0-9_-]/g, "")}`
@@ -132,10 +143,30 @@ export function RelationGraph({ requirements, relations, onSelect }: RelationGra
     >
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h2 className="text-base font-semibold">需求关系图</h2>
-        <StatusBadge variant="neutral">{`共 ${relations.length} 条关系`}</StatusBadge>
+        {loading ? (
+          <StatusBadge variant="neutral">关系加载中…</StatusBadge>
+        ) : error !== "" ? (
+          <StatusBadge variant="danger">关系加载失败</StatusBadge>
+        ) : (
+          <StatusBadge variant="neutral">{`共 ${relations.length} 条关系`}</StatusBadge>
+        )}
       </div>
 
-      {requirements.length === 0 ? (
+      {error === "" ? null : (
+        <p
+          role="alert"
+          className="mt-2 rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+        >
+          加载关系失败：{error}
+        </p>
+      )}
+
+      {loading ? (
+        <p className="mt-3 flex items-center justify-center gap-2 rounded-xl border border-dashed border-border px-3 py-6 text-sm text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+          正在加载关系…
+        </p>
+      ) : error !== "" ? null : requirements.length === 0 ? (
         <p className="mt-3 rounded-xl border border-dashed border-border px-3 py-6 text-center text-sm text-muted-foreground">
           暂无可绘制关系的需求。
         </p>
@@ -197,7 +228,7 @@ export function RelationGraph({ requirements, relations, onSelect }: RelationGra
                 transform={`translate(${x} ${y})`}
                 onClick={() => onSelect(requirement.id)}
                 onKeyDown={(event) => handleNodeKeyDown(event, requirement.id)}
-                className="cursor-pointer focus-visible:outline-none"
+                className="group cursor-pointer focus-visible:outline-none"
               >
                 <title>{`需求：${requirement.title}`}</title>
                 <circle
@@ -205,6 +236,7 @@ export function RelationGraph({ requirements, relations, onSelect }: RelationGra
                   fill="var(--muted, #f1f5f9)"
                   stroke="var(--border, #cbd5e1)"
                   strokeWidth={1.5}
+                  className="group-focus-visible:stroke-ring group-focus-visible:[stroke-width:3px]"
                 />
                 <text textAnchor="middle" y={4} fontSize={10} fill="var(--foreground, #0f172a)">
                   {shortTitle(requirement.title)}
