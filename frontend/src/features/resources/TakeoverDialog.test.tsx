@@ -22,37 +22,59 @@ describe("TakeoverDialog", () => {
 
   afterEach(cleanup)
 
-  it("requests a takeover with reason, instructions and expiry", async () => {
+  it("requests a takeover with an enum reason, instructions and expiry", async () => {
     const onDone = vi.fn().mockResolvedValue(undefined)
     render(<TakeoverDialog mode="request" sessionId={3} onClose={vi.fn()} onDone={onDone} />)
 
-    fireEvent.change(screen.getByLabelText("接管原因"), { target: { value: "需要验证码" } })
+    // Spec §7.6: the backend only accepts the closed reason enum, so the form
+    // must be a select and free text belongs in instructions.text.
+    const reason = screen.getByLabelText("接管原因")
+    expect(reason.tagName).toBe("SELECT")
+    const select = reason as HTMLSelectElement
+    expect(select.value).toBe("other")
+    expect(Array.from(select.options).map((option) => option.value)).toEqual([
+      "mfa",
+      "captcha",
+      "approval",
+      "login_unknown",
+      "other",
+    ])
+
+    fireEvent.change(reason, { target: { value: "mfa" } })
     fireEvent.change(screen.getByLabelText("操作指引"), {
-      target: { value: "5 分钟内完成" },
+      target: { value: "5 分钟内完成短信验证码" },
     })
     fireEvent.change(screen.getByLabelText("有效期（秒）"), { target: { value: "900" } })
     fireEvent.click(screen.getByRole("button", { name: "确认发起" }))
 
     await waitFor(() =>
       expect(mocks.requestTakeover).toHaveBeenCalledWith(3, {
-        reason: "需要验证码",
-        instructions: { text: "5 分钟内完成" },
+        reason: "mfa",
+        instructions: { text: "5 分钟内完成短信验证码" },
         expiresInSeconds: 900,
       }),
     )
     await waitFor(() => expect(onDone).toHaveBeenCalled())
   })
 
-  it("rejects a takeover request without a reason", async () => {
+  it("defaults to the other reason and keeps free text in instructions", async () => {
     const onDone = vi.fn().mockResolvedValue(undefined)
     render(<TakeoverDialog mode="request" sessionId={3} onClose={vi.fn()} onDone={onDone} />)
 
+    fireEvent.change(screen.getByLabelText("操作指引"), {
+      target: { value: "请人工完成短信验证码" },
+    })
     fireEvent.click(screen.getByRole("button", { name: "确认发起" }))
 
-    const alert = await screen.findByRole("alert")
-    expect(alert.textContent).toContain("接管原因")
-    expect(mocks.requestTakeover).not.toHaveBeenCalled()
-    expect(onDone).not.toHaveBeenCalled()
+    await waitFor(() =>
+      expect(mocks.requestTakeover).toHaveBeenCalledWith(3, {
+        reason: "other",
+        instructions: { text: "请人工完成短信验证码" },
+        // The form sends the documented default expiry explicitly.
+        expiresInSeconds: 1800,
+      }),
+    )
+    await waitFor(() => expect(onDone).toHaveBeenCalled())
   })
 
   it("completes a takeover with token headers", async () => {

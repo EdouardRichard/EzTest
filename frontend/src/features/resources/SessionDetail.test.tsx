@@ -195,7 +195,7 @@ describe("SessionDetail", () => {
     fireEvent.click(screen.getByRole("button", { name: "发起接管" }))
     const dialog = await screen.findByRole("dialog")
     fireEvent.change(within(dialog).getByLabelText("接管原因"), {
-      target: { value: "需要验证码" },
+      target: { value: "mfa" },
     })
     fireEvent.change(within(dialog).getByLabelText("操作指引"), {
       target: { value: "5 分钟内完成" },
@@ -205,7 +205,7 @@ describe("SessionDetail", () => {
 
     await waitFor(() =>
       expect(mocks.requestTakeover).toHaveBeenCalledWith(1, {
-        reason: "需要验证码",
+        reason: "mfa",
         instructions: { text: "5 分钟内完成" },
         expiresInSeconds: 900,
       }),
