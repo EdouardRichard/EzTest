@@ -144,7 +144,7 @@ func (r *IndexRunRepo) GetLatest(ctx context.Context, repoID int64) (domain.Inde
 		 LIMIT 1`, repoID))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.IndexRun{}, domain.NewNotFound("index_run",
+			return domain.IndexRun{}, domain.NewNotFound("index_run_not_found",
 				fmt.Sprintf("codeintel: repository %d has no index run", repoID))
 		}
 		return domain.IndexRun{}, fmt.Errorf("postgres: get latest index run: %w", err)

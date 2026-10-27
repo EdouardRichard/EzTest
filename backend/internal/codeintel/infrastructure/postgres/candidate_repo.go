@@ -87,21 +87,22 @@ type preparedCandidate struct {
 
 // Replace atomically replaces the whole candidate set of one analysis: the
 // previous rows are deleted inside the same transaction that inserts the new
-// ones (design spec §6.11). Duplicate candidates are left to the database's
+// ones (design spec §6.11). Every candidate must carry the caller-supplied
+// Snowflake id; a zero id is rejected with ErrInvalid/missing_id before the
+// previous set is touched (D29). Duplicate candidates are left to the database's
 // unique constraint and skipped.
 func (r *CandidateRepo) Replace(ctx context.Context, analysisID int64, items []domain.ImpactCandidate) error {
 	prepared := make([]preparedCandidate, 0, len(items))
 	for _, item := range items {
+		if item.ID == 0 {
+			return missingIDError("impact candidate")
+		}
 		encodedEvidence, err := marshalEvidence(item.Evidence)
 		if err != nil {
 			return fmt.Errorf("postgres: encode candidate evidence: %w", err)
 		}
-		id := item.ID
-		if id == 0 {
-			id = nextRepoID()
-		}
 		prepared = append(prepared, preparedCandidate{
-			id:          id,
+			id:          item.ID,
 			subjectKind: item.SubjectKind,
 			subjectID:   item.SubjectID,
 			reason:      item.Reason,

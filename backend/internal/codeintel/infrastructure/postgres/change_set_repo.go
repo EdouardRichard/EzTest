@@ -1,9 +1,10 @@
 // Package postgres implements the codeintel context's repository ports with
-// PostgreSQL. P4 ids are Snowflake values generated in the application layer;
-// every insert supplies the id explicitly. Rows whose domain payload carries no
-// id (fact versions and cache entries) receive a process-wide Snowflake id from
-// this package. JSONB documents are exchanged as raw JSON bytes and never use a
-// cross-context foreign key (design spec §5, §6.11).
+// PostgreSQL. P4 ids are Snowflake values generated in the application layer
+// (platform/id); repositories never mint ids. Every insert therefore supplies
+// the caller's id explicitly, and payloads that carry the id reject a zero id
+// with ErrInvalid and the details.reason code missing_id (D29). JSONB documents
+// are exchanged as raw JSON bytes and never use a cross-context foreign key
+// (design spec §5, §6.11).
 package postgres
 
 import (
@@ -53,9 +54,16 @@ func isUniqueViolation(err error) bool {
 }
 
 // notFoundError builds the sentinel-classified not-found error of one
-// repository resource.
+// repository resource. The reason is the §7.1 resource-specific code, for
+// example analysis_not_found.
 func notFoundError(resource string, id int64) error {
-	return domain.NewNotFound(resource, fmt.Sprintf("codeintel: %s %d not found", resource, id))
+	return domain.NewNotFound(resource+"_not_found", fmt.Sprintf("codeintel: %s %d not found", resource, id))
+}
+
+// missingIDError builds the ErrInvalid/missing_id rejection of a repository
+// write whose payload carries no application-generated Snowflake id (D29).
+func missingIDError(resource string) error {
+	return domain.NewInvalid("id", "missing_id", fmt.Sprintf("codeintel: %s id is required", resource))
 }
 
 // changeSetColumnList is the shared column order of every change-set query and

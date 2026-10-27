@@ -76,19 +76,19 @@ type preparedEdge struct {
 
 // ReplaceFactEdges atomically replaces all edges of one fact version: the
 // previous set is deleted inside the same transaction that inserts the new one
-// (design spec §6.11). The fact_key/fact_version of every inserted edge come
-// from the method arguments, so a caller cannot fan an edge into another fact
-// version.
+// (design spec §6.11). Every edge must carry the caller-supplied Snowflake id; a
+// zero id is rejected with ErrInvalid/missing_id before the previous set is
+// touched (D29). The fact_key/fact_version of every inserted edge come from the
+// method arguments, so a caller cannot fan an edge into another fact version.
 func (r *EdgeRepo) ReplaceFactEdges(ctx context.Context, repoID int64, commit, factKey string, version int, edges []domain.CodeEdge) error {
 	prepared := make([]preparedEdge, 0, len(edges))
 	for _, edge := range edges {
+		if edge.ID == 0 {
+			return missingIDError("edge")
+		}
 		encodedEvidence, err := marshalEvidence(edge.Evidence)
 		if err != nil {
 			return fmt.Errorf("postgres: encode edge evidence: %w", err)
-		}
-		id := edge.ID
-		if id == 0 {
-			id = nextRepoID()
 		}
 		source := edge.Source
 		if source == "" {
@@ -99,7 +99,7 @@ func (r *EdgeRepo) ReplaceFactEdges(ctx context.Context, repoID int64, commit, f
 			confidence = domain.ConfidenceMedium
 		}
 		prepared = append(prepared, preparedEdge{
-			id:         id,
+			id:         edge.ID,
 			src:        edge.SrcEntityID,
 			dst:        edge.DstEntityID,
 			rel:        edge.Rel,

@@ -161,7 +161,9 @@ func (r *EntityRepo) Upsert(ctx context.Context, e domain.CodeEntity) error {
 
 // UpsertFile stores the T0 file entities of one index run in a single
 // statement. The identity is (repo_id, commit_sha, path): an existing row keeps
-// its id and created_at while its blob hash is refreshed.
+// its id and created_at while its blob hash is refreshed. Every item must carry
+// the caller-supplied Snowflake id; a zero id is rejected with
+// ErrInvalid/missing_id before any row is written (D29).
 func (r *EntityRepo) UpsertFile(ctx context.Context, repoID int64, commit string, files []domain.CodeEntity) error {
 	if len(files) == 0 {
 		return nil
@@ -170,11 +172,10 @@ func (r *EntityRepo) UpsertFile(ctx context.Context, repoID int64, commit string
 	paths := make([]string, len(files))
 	blobHashes := make([]string, len(files))
 	for i, file := range files {
-		id := file.ID
-		if id == 0 {
-			id = nextRepoID()
+		if file.ID == 0 {
+			return missingIDError("file entity")
 		}
-		ids[i] = id
+		ids[i] = file.ID
 		paths[i] = file.Path
 		blobHashes[i] = file.BlobHash
 	}
@@ -199,7 +200,7 @@ func (r *EntityRepo) GetByFactKey(ctx context.Context, repoID int64, commit, fac
 		repoID, commit, factKey))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.CodeEntity{}, domain.NewNotFound("entity",
+			return domain.CodeEntity{}, domain.NewNotFound("entity_not_found",
 				fmt.Sprintf("codeintel: fact %q not found at commit %s", factKey, commit))
 		}
 		return domain.CodeEntity{}, fmt.Errorf("postgres: get entity by fact key: %w", err)

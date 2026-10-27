@@ -111,8 +111,8 @@ func TestChangeSetGetOrCreate(t *testing.T) {
 	if loaded.ID != want.ID || !reflect.DeepEqual(loaded.Files, want.Files) {
 		t.Fatalf("loaded = %+v, want %+v", loaded, want)
 	}
-	if _, err := repo.GetByID(ctx, 9999); !errors.Is(err, domain.ErrNotFound) {
-		t.Fatalf("GetByID missing error = %v, want ErrNotFound", err)
+	if _, err := repo.GetByID(ctx, 9999); !errors.Is(err, domain.ErrNotFound) || domain.Reason(err) != "change_set_not_found" {
+		t.Fatalf("GetByID missing error = %v (reason %q), want change_set_not_found", err, domain.Reason(err))
 	}
 }
 
@@ -199,13 +199,25 @@ func TestEntityUpsertAndFactVersion(t *testing.T) {
 
 	// The append-only body history: Current returns the entity plus the current
 	// version, GetVersion reads one exact body, Supersede closes older versions.
-	if err := facts.Create(ctx, repoID, commit, factKey, "deepseek-chat", "p4.1", 1,
+	factVersionIDs := []int64{7121, 7122}
+	if err := facts.Create(ctx, factVersionIDs[0], repoID, commit, factKey, "deepseek-chat", "p4.1", 1,
 		[]byte(`{"summary":"v1","kind":"api"}`), 7201); err != nil {
 		t.Fatalf("Create fact version 1: %v", err)
 	}
-	if err := facts.Create(ctx, repoID, commit, factKey, "deepseek-chat", "p4.1", 2,
+	if err := facts.Create(ctx, factVersionIDs[1], repoID, commit, factKey, "deepseek-chat", "p4.1", 2,
 		[]byte(`{"summary":"v2","kind":"api"}`), 7202); err != nil {
 		t.Fatalf("Create fact version 2: %v", err)
+	}
+	// Fact-version rows keep the caller-supplied Snowflake ids.
+	var storedFactVersionIDs []int64
+	if err := pool.QueryRow(ctx,
+		`SELECT array_agg(id ORDER BY version) FROM code_fact_versions
+		 WHERE repo_id = $1 AND commit_sha = $2 AND fact_key = $3`,
+		repoID, commit, factKey).Scan(&storedFactVersionIDs); err != nil {
+		t.Fatalf("read fact version ids: %v", err)
+	}
+	if !reflect.DeepEqual(storedFactVersionIDs, factVersionIDs) {
+		t.Fatalf("stored fact version ids = %v, want %v", storedFactVersionIDs, factVersionIDs)
 	}
 	current, version, err := facts.Current(ctx, repoID, commit, factKey)
 	if err != nil {
@@ -222,8 +234,8 @@ func TestEntityUpsertAndFactVersion(t *testing.T) {
 		t.Fatalf("GetVersion(1): %v", err)
 	}
 	ciAssertJSONEqual(t, body, `{"summary":"v1","kind":"api"}`)
-	if _, err := facts.GetVersion(ctx, repoID, commit, factKey, 99); !errors.Is(err, domain.ErrNotFound) {
-		t.Fatalf("GetVersion(99) error = %v, want ErrNotFound", err)
+	if _, err := facts.GetVersion(ctx, repoID, commit, factKey, 99); !errors.Is(err, domain.ErrNotFound) || domain.Reason(err) != "fact_not_found" {
+		t.Fatalf("GetVersion(99) error = %v (reason %q), want fact_not_found", err, domain.Reason(err))
 	}
 
 	supersededAt := ciNow()
@@ -251,8 +263,8 @@ func TestEntityUpsertAndFactVersion(t *testing.T) {
 	if !currentSuperseded {
 		t.Fatal("current fact version must not be superseded")
 	}
-	if _, _, err := facts.Current(ctx, repoID, commit, "api:POST /api/missing"); !errors.Is(err, domain.ErrNotFound) {
-		t.Fatalf("Current missing error = %v, want ErrNotFound", err)
+	if _, _, err := facts.Current(ctx, repoID, commit, "api:POST /api/missing"); !errors.Is(err, domain.ErrNotFound) || domain.Reason(err) != "fact_not_found" {
+		t.Fatalf("Current missing error = %v (reason %q), want fact_not_found", err, domain.Reason(err))
 	}
 
 	// T0 file upserts are keyed by (repo, commit, path): a re-index refreshes
@@ -339,8 +351,8 @@ func TestEntityUpsertAndFactVersion(t *testing.T) {
 	if err := entities.DeleteFact(ctx, repoID, commit, factKey); err != nil {
 		t.Fatalf("DeleteFact: %v", err)
 	}
-	if _, err := entities.GetByFactKey(ctx, repoID, commit, factKey); !errors.Is(err, domain.ErrNotFound) {
-		t.Fatalf("GetByFactKey after delete error = %v, want ErrNotFound", err)
+	if _, err := entities.GetByFactKey(ctx, repoID, commit, factKey); !errors.Is(err, domain.ErrNotFound) || domain.Reason(err) != "entity_not_found" {
+		t.Fatalf("GetByFactKey after delete error = %v (reason %q), want entity_not_found", err, domain.Reason(err))
 	}
 	// Deleting a missing fact is idempotent.
 	if err := entities.DeleteFact(ctx, repoID, commit, factKey); err != nil {
@@ -450,6 +462,7 @@ func TestCacheHitAndUpsert(t *testing.T) {
 	}
 
 	entry := domain.CachedFile{
+		ID:            7151,
 		RepoID:        repoID,
 		Commit:        commit,
 		Path:          "src/a.ts",
@@ -468,6 +481,9 @@ func TestCacheHitAndUpsert(t *testing.T) {
 	}
 	if !ok || hit == nil {
 		t.Fatal("Get after Upsert missed")
+	}
+	if hit.ID != entry.ID {
+		t.Fatalf("cache id = %d, want the caller-supplied %d", hit.ID, entry.ID)
 	}
 	ciAssertJSONEqual(t, hit.Facts, string(entry.Facts))
 	ciAssertJSONEqual(t, hit.Stats, string(entry.Stats))
@@ -501,10 +517,16 @@ func TestCacheHitAndUpsert(t *testing.T) {
 	// Re-analysing the same file with the same key updates the row instead of
 	// duplicating it and refreshes last_used_at again.
 	updated := entry
+	updated.ID = 7152 // ignored by the conflict update: the stored row keeps its id
 	updated.Facts = []byte(`[{"kind":"route","name":"/order"}]`)
 	updated.Stats = []byte(`{"facts":2}`)
 	if err := cache.Upsert(ctx, updated); err != nil {
 		t.Fatalf("Upsert updated: %v", err)
+	}
+	if hit, ok, err := cache.Get(ctx, repoID, commit, "src/a.ts", ciBlobHashA, "deepseek-chat", "p4.1"); err != nil || !ok {
+		t.Fatalf("Get after conflict = (ok %v, err %v)", ok, err)
+	} else if hit.ID != entry.ID {
+		t.Fatalf("cache id after conflict = %d, want the original %d", hit.ID, entry.ID)
 	}
 	var rows int
 	if err := pool.QueryRow(ctx,
@@ -541,6 +563,9 @@ func TestAnalysisReuseAndNextVersion(t *testing.T) {
 	analyses := postgres.NewAnalysisRepository(pool)
 	base, head := seedBaseCommit, seedHeadCommit
 
+	if _, err := analyses.GetLatest(ctx, versionID); !errors.Is(err, domain.ErrNotFound) || domain.Reason(err) != "analysis_not_found" {
+		t.Fatalf("GetLatest empty error = %v (reason %q), want analysis_not_found", err, domain.Reason(err))
+	}
 	next, err := analyses.NextAnalysisVersion(ctx, versionID, base, head)
 	if err != nil {
 		t.Fatalf("NextAnalysisVersion empty: %v", err)
@@ -662,13 +687,13 @@ func TestAnalysisReuseAndNextVersion(t *testing.T) {
 	if err := analyses.Create(ctx, duplicate); !errors.Is(err, domain.ErrConflict) {
 		t.Fatalf("duplicate analysis version error = %v, want ErrConflict", err)
 	}
-	if _, err := analyses.GetByID(ctx, versionID+1, a1.ID); !errors.Is(err, domain.ErrNotFound) {
-		t.Fatalf("GetByID wrong version error = %v, want ErrNotFound", err)
+	if _, err := analyses.GetByID(ctx, versionID+1, a1.ID); !errors.Is(err, domain.ErrNotFound) || domain.Reason(err) != "analysis_not_found" {
+		t.Fatalf("GetByID wrong version error = %v (reason %q), want analysis_not_found", err, domain.Reason(err))
 	}
 	missing := a1
 	missing.ID = 9999
-	if err := analyses.Update(ctx, missing); !errors.Is(err, domain.ErrNotFound) {
-		t.Fatalf("Update missing error = %v, want ErrNotFound", err)
+	if err := analyses.Update(ctx, missing); !errors.Is(err, domain.ErrNotFound) || domain.Reason(err) != "analysis_not_found" {
+		t.Fatalf("Update missing error = %v (reason %q), want analysis_not_found", err, domain.Reason(err))
 	}
 }
 
@@ -744,8 +769,8 @@ func TestCandidateSelection(t *testing.T) {
 	if got.SubjectID != requirementID || got.Source != domain.CandidateDirect || !got.Selected {
 		t.Fatalf("candidate = %+v, want the direct requirement candidate", got)
 	}
-	if _, err := candidates.Get(ctx, analysisID, 9999); !errors.Is(err, domain.ErrNotFound) {
-		t.Fatalf("Get missing error = %v, want ErrNotFound", err)
+	if _, err := candidates.Get(ctx, analysisID, 9999); !errors.Is(err, domain.ErrNotFound) || domain.Reason(err) != "candidate_not_found" {
+		t.Fatalf("Get missing error = %v (reason %q), want candidate_not_found", err, domain.Reason(err))
 	}
 
 	// Replacement is a full delete+insert of the analysis' candidates.
@@ -777,8 +802,8 @@ func TestCandidateSelection(t *testing.T) {
 	if got.SelectionUpdatedAt == nil || got.SelectionUpdatedAt.IsZero() {
 		t.Fatal("selection_updated_at not written")
 	}
-	if err := analyses.UpdateCandidateSelection(ctx, analysisID, 9999, 42, true); !errors.Is(err, domain.ErrNotFound) {
-		t.Fatalf("UpdateCandidateSelection missing error = %v, want ErrNotFound", err)
+	if err := analyses.UpdateCandidateSelection(ctx, analysisID, 9999, 42, true); !errors.Is(err, domain.ErrNotFound) || domain.Reason(err) != "candidate_not_found" {
+		t.Fatalf("UpdateCandidateSelection missing error = %v (reason %q), want candidate_not_found", err, domain.Reason(err))
 	}
 
 	// An empty replacement clears the candidate set.
@@ -896,14 +921,14 @@ func TestAnchorDuplicate(t *testing.T) {
 	if err := anchors.Delete(ctx, versionID, anchor.ID); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	if _, err := anchors.Get(ctx, versionID, anchor.ID); !errors.Is(err, domain.ErrNotFound) {
-		t.Fatalf("Get deleted error = %v, want ErrNotFound", err)
+	if _, err := anchors.Get(ctx, versionID, anchor.ID); !errors.Is(err, domain.ErrNotFound) || domain.Reason(err) != "anchor_not_found" {
+		t.Fatalf("Get deleted error = %v (reason %q), want anchor_not_found", err, domain.Reason(err))
 	}
-	if err := anchors.Delete(ctx, versionID, anchor.ID); !errors.Is(err, domain.ErrNotFound) {
-		t.Fatalf("second Delete error = %v, want ErrNotFound", err)
+	if err := anchors.Delete(ctx, versionID, anchor.ID); !errors.Is(err, domain.ErrNotFound) || domain.Reason(err) != "anchor_not_found" {
+		t.Fatalf("second Delete error = %v (reason %q), want anchor_not_found", err, domain.Reason(err))
 	}
-	if _, err := anchors.Get(ctx, versionID+1, otherRange.ID); !errors.Is(err, domain.ErrNotFound) {
-		t.Fatalf("Get wrong version error = %v, want ErrNotFound", err)
+	if _, err := anchors.Get(ctx, versionID+1, otherRange.ID); !errors.Is(err, domain.ErrNotFound) || domain.Reason(err) != "anchor_not_found" {
+		t.Fatalf("Get wrong version error = %v (reason %q), want anchor_not_found", err, domain.Reason(err))
 	}
 }
 
@@ -915,6 +940,9 @@ func TestIndexRunLifecycle(t *testing.T) {
 	repoID, _, _ := seedRepoVersionRequirement(t, pool)
 	runs := postgres.NewIndexRunRepository(pool)
 
+	if _, err := runs.GetLatest(ctx, repoID); !errors.Is(err, domain.ErrNotFound) || domain.Reason(err) != "index_run_not_found" {
+		t.Fatalf("GetLatest empty error = %v (reason %q), want index_run_not_found", err, domain.Reason(err))
+	}
 	run := domain.IndexRun{
 		ID:        7901,
 		RepoID:    repoID,
@@ -983,16 +1011,16 @@ func TestIndexRunLifecycle(t *testing.T) {
 	}
 	ciAssertJSONEqual(t, stored.Stats, string(run.Stats))
 
-	if _, err := runs.GetByID(ctx, repoID, 9999); !errors.Is(err, domain.ErrNotFound) {
-		t.Fatalf("GetByID missing error = %v, want ErrNotFound", err)
+	if _, err := runs.GetByID(ctx, repoID, 9999); !errors.Is(err, domain.ErrNotFound) || domain.Reason(err) != "index_run_not_found" {
+		t.Fatalf("GetByID missing error = %v (reason %q), want index_run_not_found", err, domain.Reason(err))
 	}
-	if _, err := runs.GetByID(ctx, repoID+1, run.ID); !errors.Is(err, domain.ErrNotFound) {
-		t.Fatalf("GetByID wrong repo error = %v, want ErrNotFound", err)
+	if _, err := runs.GetByID(ctx, repoID+1, run.ID); !errors.Is(err, domain.ErrNotFound) || domain.Reason(err) != "index_run_not_found" {
+		t.Fatalf("GetByID wrong repo error = %v (reason %q), want index_run_not_found", err, domain.Reason(err))
 	}
 	missing := run
 	missing.ID = 9999
-	if err := runs.Update(ctx, missing); !errors.Is(err, domain.ErrNotFound) {
-		t.Fatalf("Update missing error = %v, want ErrNotFound", err)
+	if err := runs.Update(ctx, missing); !errors.Is(err, domain.ErrNotFound) || domain.Reason(err) != "index_run_not_found" {
+		t.Fatalf("Update missing error = %v (reason %q), want index_run_not_found", err, domain.Reason(err))
 	}
 }
 
@@ -1120,5 +1148,105 @@ func TestAnalysisRecoverStale(t *testing.T) {
 	}
 	if fresh.Status != domain.RunRunning {
 		t.Fatalf("fresh analysis status = %s, want running", fresh.Status)
+	}
+}
+
+// TestRepositoriesRejectMissingIDs pins R21/D29: the repositories that used to
+// mint a fallback id reject a zero id with ErrInvalid/missing_id, and a batch
+// with one bad item is rejected before any of its rows are written.
+func TestRepositoriesRejectMissingIDs(t *testing.T) {
+	ctx := context.Background()
+	pool := testutil.OpenTestDB(t)
+	repoID, _, requirementID := seedRepoVersionRequirement(t, pool)
+	commit := seedHeadCommit
+	entities := postgres.NewEntityRepository(pool)
+	facts := postgres.NewFactVersionRepository(pool)
+	cache := postgres.NewCacheRepository(pool)
+	edges := postgres.NewEdgeRepository(pool)
+	candidates := postgres.NewCandidateRepository(pool)
+
+	cases := []struct {
+		name string
+		call func() error
+	}{
+		{
+			name: "fact version create",
+			call: func() error {
+				return facts.Create(ctx, 0, repoID, commit, "api:missing", "deepseek-chat", "p4.1", 1,
+					[]byte(`{"kind":"api"}`), 0)
+			},
+		},
+		{
+			name: "cache upsert",
+			call: func() error {
+				return cache.Upsert(ctx, domain.CachedFile{
+					RepoID:        repoID,
+					Commit:        commit,
+					Path:          "src/missing.ts",
+					FileHash:      ciBlobHashA,
+					Model:         "deepseek-chat",
+					PromptVersion: "p4.1",
+					Facts:         []byte(`[]`),
+					Stats:         []byte(`{}`),
+				})
+			},
+		},
+		{
+			name: "file entity upsert",
+			call: func() error {
+				return entities.UpsertFile(ctx, repoID, commit, []domain.CodeEntity{
+					{ID: 7961, Path: "src/valid.ts", BlobHash: ciBlobHashA},
+					{ID: 0, Path: "src/missing.ts", BlobHash: ciBlobHashB},
+				})
+			},
+		},
+		{
+			name: "fact edges replace",
+			call: func() error {
+				return edges.ReplaceFactEdges(ctx, repoID, commit, "client:missing", 1, []domain.CodeEdge{
+					{ID: 7962, SrcEntityID: 1, DstEntityID: 2, Rel: domain.RelCalls},
+					{SrcEntityID: 1, DstEntityID: 2, Rel: domain.RelCalls},
+				})
+			},
+		},
+		{
+			name: "candidates replace",
+			call: func() error {
+				return candidates.Replace(ctx, 1, []domain.ImpactCandidate{
+					{ID: 7963, SubjectKind: domain.CandidateRequirement, SubjectID: requirementID},
+					{SubjectKind: domain.CandidateRequirement, SubjectID: requirementID},
+				})
+			},
+		},
+	}
+	for _, tc := range cases {
+		err := tc.call()
+		if !errors.Is(err, domain.ErrInvalid) || domain.Reason(err) != "missing_id" {
+			t.Fatalf("%s error = %v (reason %q), want ErrInvalid/missing_id", tc.name, err, domain.Reason(err))
+		}
+	}
+
+	count := func(query string, args ...any) int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, query, args...).Scan(&n); err != nil {
+			t.Fatalf("count rejected rows: %v", err)
+		}
+		return n
+	}
+	if n := count(`SELECT count(*)::int FROM code_fact_versions WHERE fact_key = 'api:missing'`); n != 0 {
+		t.Fatalf("rejected fact version rows = %d, want 0", n)
+	}
+	if n := count(`SELECT count(*)::int FROM code_analysis_cache WHERE path = 'src/missing.ts'`); n != 0 {
+		t.Fatalf("rejected cache rows = %d, want 0", n)
+	}
+	if n := count(`SELECT count(*)::int FROM code_entities WHERE path IN ('src/valid.ts', 'src/missing.ts')`); n != 0 {
+		t.Fatalf("rejected file entity rows = %d, want 0", n)
+	}
+	if n := count(`SELECT count(*)::int FROM code_edges WHERE fact_key = 'client:missing'`); n != 0 {
+		t.Fatalf("rejected edge rows = %d, want 0", n)
+	}
+	if n := count(`SELECT count(*)::int FROM code_impact_candidates WHERE analysis_id = 1`); n != 0 {
+		t.Fatalf("rejected candidate rows = %d, want 0", n)
 	}
 }

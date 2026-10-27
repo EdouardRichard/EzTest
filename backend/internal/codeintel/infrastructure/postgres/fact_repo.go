@@ -4,31 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
-	"github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 )
-
-// repoIDGenerator mints the ids of rows whose domain payload carries no id
-// field (fact versions and cache entries). The repository constructors are
-// fixed by the domain ports, so the generator is process-wide; node 0 keeps it
-// apart from the node-1 fallback the application services use. P4 runs a single
-// instance (design spec §15); these ids never leave the context.
-var repoIDGenerator = sync.OnceValue(func() *id.Snowflake {
-	generator, err := id.NewSnowflake(0)
-	if err != nil {
-		panic(fmt.Sprintf("codeintel postgres: default snowflake generator: %v", err))
-	}
-	return generator
-})
-
-// nextRepoID returns the next package-generated Snowflake id.
-func nextRepoID() int64 { return repoIDGenerator().Next() }
 
 // FactVersionRepo implements domain.FactVersionRepository on a pgx pool.
 type FactVersionRepo struct {
@@ -52,13 +34,13 @@ func (r *FactVersionRepo) Current(ctx context.Context, repoID int64, commit, fac
 		repoID, commit, factKey))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, 0, domain.NewNotFound("fact_version",
+			return nil, 0, domain.NewNotFound("fact_not_found",
 				fmt.Sprintf("codeintel: current fact %q not found at commit %s", factKey, commit))
 		}
 		return nil, 0, fmt.Errorf("postgres: get current fact: %w", err)
 	}
 	if entity.FactVersion == nil {
-		return nil, 0, domain.NewNotFound("fact_version",
+		return nil, 0, domain.NewNotFound("fact_not_found",
 			fmt.Sprintf("codeintel: current fact %q has no version at commit %s", factKey, commit))
 	}
 	return &entity, *entity.FactVersion, nil
@@ -76,7 +58,7 @@ func (r *FactVersionRepo) GetVersion(ctx context.Context, repoID int64, commit, 
 		repoID, commit, factKey, version).Scan(&body)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, domain.NewNotFound("fact_version",
+			return nil, domain.NewNotFound("fact_not_found",
 				fmt.Sprintf("codeintel: fact %q version %d not found at commit %s", factKey, version, commit))
 		}
 		return nil, fmt.Errorf("postgres: get fact version body: %w", err)
@@ -84,14 +66,19 @@ func (r *FactVersionRepo) GetVersion(ctx context.Context, repoID int64, commit, 
 	return body, nil
 }
 
-// Create appends one fact body version. Versions are append-only: callers bump
-// the version instead of updating an existing row (design spec §6.4).
-func (r *FactVersionRepo) Create(ctx context.Context, repoID int64, commit, factKey, model, prompt string, version int, body []byte, analysisID int64) error {
+// Create appends one fact body version under the caller-supplied Snowflake id.
+// Versions are append-only: callers bump the version instead of updating an
+// existing row (design spec §6.4). A zero id is rejected with
+// ErrInvalid/missing_id because this package never mints ids (D29).
+func (r *FactVersionRepo) Create(ctx context.Context, id int64, repoID int64, commit, factKey, model, prompt string, version int, body []byte, analysisID int64) error {
+	if id == 0 {
+		return missingIDError("fact version")
+	}
 	const query = `INSERT INTO code_fact_versions
 		(id, repo_id, commit_sha, fact_key, version, model, prompt_version, body, analysis_id)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)`
 	if _, err := r.pool.Exec(ctx, query,
-		nextRepoID(), repoID, commit, factKey, version, model, prompt,
+		id, repoID, commit, factKey, version, model, prompt,
 		jsonParam(body, jsonFallbackEmptyObject), nullableID(analysisID),
 	); err != nil {
 		if isUniqueViolation(err) {
