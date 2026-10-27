@@ -159,6 +159,8 @@ export type AnalysisStats = {
   duplicateFacts: number
   unmatchedContracts: number
   truncated: boolean
+  /** True when the server truncated the unmapped list at 200 entries. */
+  unmappedTruncated?: boolean
   skipped?: number
 }
 

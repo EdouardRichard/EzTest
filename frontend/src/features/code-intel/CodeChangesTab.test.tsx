@@ -14,6 +14,7 @@ import type {
   CodeEntity,
   FileDiff,
   IndexRun,
+  UnmappedChange,
 } from "./types"
 
 const mocks = vi.hoisted(() => ({
@@ -55,6 +56,7 @@ vi.mock("@/features/versions/useVersionStream", () => ({
 }))
 
 import { CodeChangesTab } from "./CodeChangesTab"
+import { MAX_UNMAPPED_ENTRIES } from "./UnmappedChanges"
 
 /** A snowflake-shaped ID that must stay a string end to end (spec §7.1). */
 const VERSION_ID = "1844674407370955161"
@@ -97,6 +99,15 @@ const ANALYSIS_STATS: AnalysisStats = {
   duplicateFacts: 0,
   unmatchedContracts: 0,
   truncated: false,
+}
+
+function capUnmappedEntries(): UnmappedChange[] {
+  return Array.from({ length: MAX_UNMAPPED_ENTRIES }, (_value, index) => ({
+    path: `src/generated/file-${index}.ts`,
+    status: "M",
+    reason: "no_fact_or_anchor",
+    suggestion: "",
+  }))
 }
 
 function notFound(message = "not found"): ApiError {
@@ -706,6 +717,26 @@ describe("CodeChangesTab", () => {
       ),
     )
     await waitFor(() => expect((checkbox as HTMLInputElement).checked).toBe(false))
+  })
+
+  it("warns when the analysis stats mark the unmapped list truncated", async () => {
+    mockReady({
+      analysis: analysisFixture({
+        stats: {
+          ...ANALYSIS_STATS,
+          unmapped: MAX_UNMAPPED_ENTRIES,
+          unmappedTruncated: true,
+        },
+        unmapped: capUnmappedEntries(),
+      }),
+    })
+
+    renderTab()
+
+    expect(await screen.findByRole("heading", { name: "未映射变更" })).toBeTruthy()
+    expect(
+      screen.getByText(`未映射变更超过上限，仅展示前 ${MAX_UNMAPPED_ENTRIES} 条。`),
+    ).toBeTruthy()
   })
 
   it("opens the anchor dialog from a changed file row and refreshes after creation", async () => {

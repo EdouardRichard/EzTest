@@ -2,6 +2,7 @@ import { act, cleanup, renderHook } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import type { VersionEvent } from "@/features/versions/types"
+import { ApiError } from "@/lib/api-client"
 
 import type { Analysis } from "./types"
 
@@ -127,6 +128,26 @@ describe("useAnalysisPolling exhausted hint", () => {
         await rendered.result.current.refresh()
       })
       expect(rendered.result.current.analysis?.status).toBe("done")
+      expect(rendered.result.current.exhausted).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("clears exhausted when the latest read is a 404", async () => {
+    vi.useFakeTimers()
+    try {
+      const rendered = await exhaustPolling()
+      expect(rendered.result.current.exhausted).toBe(true)
+
+      mocks.getLatestAnalysis.mockRejectedValue(
+        new ApiError({ status: 404, code: "not_found", message: "analysis not found" }),
+      )
+      await act(async () => {
+        await rendered.result.current.refresh()
+      })
+
+      expect(rendered.result.current.analysis).toBeNull()
       expect(rendered.result.current.exhausted).toBe(false)
     } finally {
       vi.useRealTimers()

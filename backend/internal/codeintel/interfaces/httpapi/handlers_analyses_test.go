@@ -109,6 +109,7 @@ type analysisStatsWire struct {
 	DuplicateFacts     int  `json:"duplicateFacts"`
 	UnmatchedContracts int  `json:"unmatchedContracts"`
 	Truncated          bool `json:"truncated"`
+	UnmappedTruncated  bool `json:"unmappedTruncated"`
 	Skipped            int  `json:"skipped"`
 }
 
