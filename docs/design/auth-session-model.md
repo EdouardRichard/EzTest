@@ -8,6 +8,12 @@
 
 ---
 
+## P2 实施口径（D28）
+
+> P2 不实现本文完整形态，按 `system-blueprint.md` D28 裁剪：被测系统凭据并入 `account_system_accesses.credential`，Session 状态（storageState/token）并入 `sessions.storage_state`；不建 `secrets` / `session_blobs` / `session_events`；凭据与 storageState **明文存储**，不加密、不脱敏、不写 `audit_logs`。P2 只做人工导入 + 只读 HTTP login_check + 人工确认，不做自动登录、ProbeRecipe、漂移检测、Session 事件流。本文其余章节为 P6+ 目标形态，与 P2 冲突处以本节与 D28 为准。
+
+---
+
 ## 0. 结论摘要（TL;DR）
 
 1. **账号与会话分离**：`Account` 是公司级身份；`AccountSystemAccess` 只回答"这个账号怎么登进这个系统"；`Session` 是"账号 × 系统 × 环境"的运行时登录态资产。
@@ -100,6 +106,8 @@ flowchart TD
 ## 3. 数据模型（PostgreSQL DDL 草案）
 
 > 约定：所有时间用 `TIMESTAMPTZ`；状态用 `TEXT + CHECK`（便于加值，不用 PG ENUM）；DDL 全部 `IF NOT EXISTS` 可重入；表名前缀不强制，部署时可按 schema 隔离。
+
+> **P2 按 D28 裁剪**：P2 `resource` 上下文只建 11 表，`secrets`（§3.2）、`session_blobs`（§3.5）、`session_events`（§3.6）不在 P2 实施；凭据在 `account_system_accesses.credential`，storageState 在 `sessions.storage_state`。
 
 ### 3.1 基础域
 
@@ -703,6 +711,8 @@ POST            /api/manual-takeovers/{id}/complete|cancel
 
 ## 10. 安全、审计与合规
 
+> **P2 按 D28 裁剪**：P2 凭据/Session 明文存储，不做加密、脱敏、审计（不写 `audit_logs`）；本节为 P6/P8 目标形态。
+
 1. **加密**：secret 与 session blob 均 AES-256-GCM 加密，密钥不入库；支持 key_version 轮换。
 2. **最小暴露**：API 不回明文；agent 只拿 handle；日志/activity/提示词/报告脱敏（复用 ARTEX 的 mask/redaction 思路）。
 3. **审批**：`environments.require_approval`（建议 prod=true）→ 获取/使用前走审批（可复用 ARTEX intercept 式的两阶段审计：申请 → 决策 → 执行 → 结果）。
@@ -714,6 +724,8 @@ POST            /api/manual-takeovers/{id}/complete|cancel
 ---
 
 ## 11. MVP 拆解与验收
+
+> **P2 按 D28 裁剪**：AS-M0 的 P2 部分不含 `secrets`/`session_blobs`/`session_events` 与加密/审计；本文里程碑保留完整目标形态。
 
 ### 11.1 里程碑
 

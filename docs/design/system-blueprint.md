@@ -148,6 +148,7 @@
 | D25 | **阶段编号唯一化与前端交付归属**：`implementation-phases.md` 独占 P0–P8；其他详细设计的局部里程碑改用 `CI-Mx`（代码智能）、`AS-Mx`（账号会话）等独立前缀，不得复用 P0–P8。D18 的 8 个版本详情 Tab 是前端首版目标形态，按实施阶段 P3（容器/总览/需求与澄清）、P4（代码与变更）、P6（执行类 Tab）、P7（问题/报告）交付；实施 P0 只做平台地基与最小设置页（用户/LLM），不含版本/需求/用例等领域实体。 |
 | D26 | **仓库结构与 DDD 边界**：采用 ARTEX 式按能力分包 + 每个限界上下文 DDD 四层（domain/application/infrastructure/interfaces/httpapi）；`cmd/eztest` 为唯一组装根；导入方向、迁移命名、前端目录与 ARTEX 合规边界见 `Agent.md` §6。 |
 | D27 | P1 内置的「诊断 Agent」= **运行时验证夹具**（key=`runtime-diagnostic`），不进入 §6.1 十三角色；提示词/模型/思考强度/预算/工具白名单管理员可配；工具仅只读白名单（文件只读、HTTP 只读、测试工具）；活动事件统一为 `agent.activity`（`detail.kind` 区分 run_started/user_message/thinking/text/tool_use/tool_result/usage/decision/run_finished）；`agent_messages` 为 LLM 上下文权威来源，`events` 为其 UI 投影；P2 起由业务 Agent 替换，不改变运行时契约。 |
+| D28 | **P2 公共资源与身份：单 `resource` 上下文、明文存储、无审计/加密**。P2 新增 `resource` 限界上下文，承载 System/Environment/AppModel/Account/Access/Session/Snapshot/Lease/Takeover/LocalGitRepo；单公司种子，不做公司 CRUD。被测系统凭据（`account_system_accesses.credential`）与 Session 状态（`sessions.storage_state`）**明文存储**；P2 不实现加密、脱敏、审计（不写 `audit_logs`，不建 `session_events`/`secrets`/`session_blobs`）。Session 状态采用 auth-session-model 完整枚举 + 派生 `expiring`；快照表名 `session_snapshots`；API 统一 `/api/resources/*`；`System.kind` 仅 `web\|api`。P2 不做自动登录、ProbeRecipe、代码索引、Session 执行注入。理由：内部工具场景，被测系统凭据非生产秘密；先交付资源管理闭环，安全能力在需要时再引入。 |
 
 ---
 
@@ -228,6 +229,8 @@ CodeRepository（本地 Git 路径/分支/排除规则）─< CodeEntity / CodeC
 Account ─< AccountSystemAccess ─< Session ─< PermissionSnapshot
 ```
 
+> P2（D28）资源域固定 11 表：`companies / systems / environments / app_model_nodes / accounts / account_system_accesses / sessions / session_snapshots / session_leases / manual_takeovers / code_repositories`；不建 `secrets` / `session_blobs` / `session_events`，凭据与 storageState 明文存储。
+
 ### 5.2 验证域（版本工作区）
 
 ```text
@@ -265,7 +268,7 @@ Version ─< VersionChange（新增需求/影响面/批次差异）
 | CaseNode | draft → reviewed（基线）→ executed；AI 补充：supplemented → merged/rejected；受影响：needs_revalidation |
 | RunBatch | planned → running → paused(标记) → done / failed / cancelled |
 | CaseRun | pending → running → passed / failed / blocked / inconclusive / skipped / interrupted |
-| Session | valid / expiring / needs_manual / expired / invalid / revoked（详见 auth-session-model） |
+| Session | pending / acquiring / needs_manual / valid / refreshing / expired / invalid / revoked / failed；`expiring` 为派生值，不落库（详见 auth-session-model） |
 | Issue | open → confirmed / dismissed |
 | Report | draft → published → stale（证据/结论变更） |
 
@@ -444,9 +447,9 @@ Playwright 浏览器（导航、DOM/A11y、点击输入、快照、截图、stor
 ## 9. 账号与会话（摘要）
 
 - 统一账号（公司级）+ 每系统登录方式（password/sso/token/apikey/basic/manual）+ Session（账号×系统×环境）。
-- 不建模角色；权限是各系统事实，登录后做**权限快照观测**（可选 ProbeRecipe），用于上下文/漂移/报告指纹。
-- Session 生命周期、租约、人工接管（2FA/验证码）、环境白名单、秘密加密与脱敏。
-- 详见 `auth-session-model.md`。
+- 不建模角色；权限是各系统事实，登录后做**权限快照观测**（P2 仅 login_check 最小快照 `session_snapshots`；ProbeRecipe/漂移在 P6+），用于上下文/报告指纹。
+- Session 生命周期、租约、人工接管（2FA/验证码）、环境白名单；**P2 按 D28 明文存储凭据（`account_system_accesses.credential`）与 Session（`sessions.storage_state`），不加密、不脱敏、不写审计（`audit_logs`），且不做自动登录**。
+- 详见 `auth-session-model.md`（P2 按 D28 裁剪）。
 
 ---
 
@@ -462,7 +465,7 @@ Playwright 浏览器（导航、DOM/A11y、点击输入、快照、截图、stor
 
 | 组 | 表（示例） |
 |---|---|
-| 资源 | companies / systems / environments / app_model_nodes / accounts / account_system_accesses / sessions / session_blobs / session_leases / permission_snapshots |
+| 资源 | companies / systems / environments / app_model_nodes / accounts / account_system_accesses / sessions / session_snapshots / session_leases / manual_takeovers / code_repositories（P2 共 11 表；`secrets` / `session_blobs` / `session_events` / `auth_flows` / `probe_recipes` 等 P6 需要时追加） |
 | 版本需求 | versions / requirements / requirement_relations / clarification_sessions / decisions / version_changes |
 | 用例脑图 | case_graph_nodes / case_steps / assertions / case_sources / case_reviews |
 | 执行 | run_batches / case_runs / step_results / run_events(activity) / evidence / evidence_refs |
@@ -498,6 +501,8 @@ Playwright 浏览器（导航、DOM/A11y、点击输入、快照、截图、stor
 /api/auth / users / admin
 /api/versions/{id}/stream   ← SSE
 ```
+
+> P2（D28）：公共资源与身份统一使用 `/api/resources/*`（含 `accesses`、`takeovers`）；GET 任意登录用户，写/动作 admin。
 
 ### 11.2 实时事件（SSE）
 
