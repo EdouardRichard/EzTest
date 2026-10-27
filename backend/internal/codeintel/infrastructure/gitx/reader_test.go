@@ -52,6 +52,9 @@ func newTestRepo(t *testing.T) repoFixture {
 	writeRepoFile(t, dir, "src/styles/site.css", "first\r\nsecond\r\nthird\r\n")
 	writeRepoFile(t, dir, "src/utf8/你好.txt", "第一行\n第二行\n第三行\n")
 	writeRepoFile(t, dir, "src/data/lines.txt", "l1\nl2\nl3\nl4\n")
+	writeRepoFile(t, dir, "src/data/leading-blank.txt", "\nhello\n")
+	writeRepoFile(t, dir, "src/data/internal-blank.txt", "a\n\nb\n")
+	writeRepoFile(t, dir, "src/data/blank-wide.txt", "\n"+strings.Repeat("a", domain.MaxFileReadBytes+1024)+"\n")
 	writeRepoFile(t, dir, "src/data/wide.txt", strings.Repeat("a", 70000)+"\n")
 	writeRepoFile(t, dir, "src/data/wide-utf8.txt", strings.Repeat("你", 30000)+"\n")
 	writeRepoFile(t, dir, "src/data/empty.txt", "")
@@ -575,6 +578,93 @@ func TestFileWindowCRLFAndUTF8(t *testing.T) {
 	requireDomainInvalid(t, err, "invalid_line_range")
 	_, err = r.File(ctx, fx.dir, fx.commit2, "src/missing.ts", 0, 0)
 	requireDomainInvalid(t, err, "path_not_found")
+}
+
+// TestFileWindowPreservesBlankWindowLines is the regression test for the line
+// joiner: a window that starts on an empty line must still emit the separator
+// before every following line, so Content always describes exactly
+// StartLine..EndLine.
+func TestFileWindowPreservesBlankWindowLines(t *testing.T) {
+	fx := newTestRepo(t)
+	r := gitx.NewGitReader(gitx.GitConfig{CommandTimeout: 5 * time.Second})
+	ctx := context.Background()
+
+	cases := []struct {
+		name     string
+		path     string
+		start    int
+		end      int
+		total    int
+		wantLast int
+		want     string
+	}{
+		{
+			name:     "leading blank line",
+			path:     "src/data/leading-blank.txt",
+			start:    1,
+			end:      2,
+			total:    2,
+			wantLast: 2,
+			want:     "\nhello",
+		},
+		{
+			name:     "internal blank line",
+			path:     "src/data/internal-blank.txt",
+			start:    2,
+			end:      3,
+			total:    3,
+			wantLast: 3,
+			want:     "\nb",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			window, err := r.File(ctx, fx.dir, fx.commit2, tc.path, tc.start, tc.end)
+			if err != nil {
+				t.Fatalf("File(%s %d-%d): %v", tc.path, tc.start, tc.end, err)
+			}
+			if window.StartLine != tc.start || window.EndLine != tc.wantLast || window.TotalLines != tc.total {
+				t.Fatalf("File(%s) lines start=%d end=%d total=%d want %d/%d/%d",
+					tc.path, window.StartLine, window.EndLine, window.TotalLines, tc.start, tc.wantLast, tc.total)
+			}
+			if window.Content != tc.want {
+				t.Fatalf("File(%s %d-%d).Content=%q want %q", tc.path, tc.start, tc.end, window.Content, tc.want)
+			}
+			if window.Truncated {
+				t.Fatalf("File(%s %d-%d).Truncated=true want false", tc.path, tc.start, tc.end)
+			}
+		})
+	}
+}
+
+// TestFileWindowByteCapKeepsLeadingBlankLine pins the 64 KiB byte-cap path of
+// the line joiner: the separator that represents a leading empty line counts
+// toward the byte budget, so the content stays line-accurate at the cut.
+func TestFileWindowByteCapKeepsLeadingBlankLine(t *testing.T) {
+	fx := newTestRepo(t)
+	r := gitx.NewGitReader(gitx.GitConfig{CommandTimeout: 5 * time.Second})
+
+	window, err := r.File(context.Background(), fx.dir, fx.commit2, "src/data/blank-wide.txt", 1, 2)
+	if err != nil {
+		t.Fatalf("File(blank-wide 1-2): %v", err)
+	}
+	want := "\n" + strings.Repeat("a", domain.MaxFileReadBytes-1)
+	if window.Content != want {
+		prefix := window.Content
+		if len(prefix) > 8 {
+			prefix = prefix[:8]
+		}
+		t.Fatalf("File(blank-wide).Content len=%d prefix=%q want len=%d starting with a newline",
+			len(window.Content), prefix, len(want))
+	}
+	if len(window.Content) != domain.MaxFileReadBytes || !window.Truncated {
+		t.Fatalf("File(blank-wide) len=%d truncated=%v want len=%d truncated=true",
+			len(window.Content), window.Truncated, domain.MaxFileReadBytes)
+	}
+	if window.StartLine != 1 || window.EndLine != 2 || window.TotalLines != 2 {
+		t.Fatalf("File(blank-wide) lines start=%d end=%d total=%d want 1/2/2",
+			window.StartLine, window.EndLine, window.TotalLines)
+	}
 }
 
 // TestReadAllCapsBytes pins commit-pinned byte reads, the maxBytes cap and its

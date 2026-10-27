@@ -480,8 +480,11 @@ func joinLineWindow(lines []string, start, end int) (string, int, bool) {
 	lastLine := start
 	for index := start; index <= end; index++ {
 		line := lines[index-1]
+		// The separator belongs to the window position, not to the buffer: an
+		// empty line still occupies a line, so every line after the first one
+		// needs its "\n" even when nothing has been written yet.
 		separator := 0
-		if builder.Len() > 0 {
+		if index > start {
 			separator = 1
 		}
 		available := domain.MaxFileReadBytes - builder.Len()

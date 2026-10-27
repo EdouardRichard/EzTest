@@ -176,8 +176,9 @@ func literalPathspec(repoPath string) string {
 }
 
 // compiledGlob is one include/exclude pattern compiled once per tree listing.
-// A pattern without wildcards keeps its literal form because a plain name also
-// matches every descendant.
+// A pattern without wildcards keeps its literal form, trailing slash included,
+// because that is the P3 gitread semantics design spec §6.1 requires: a plain
+// name also matches every descendant, while a trailing slash matches no file.
 type compiledGlob struct {
 	literal string
 	pattern *regexp.Regexp
@@ -205,7 +206,7 @@ func compileGlobs(globs []string) []compiledGlob {
 			continue
 		}
 		if !strings.ContainsAny(glob, "*?[") {
-			compiled = append(compiled, compiledGlob{literal: strings.TrimSuffix(glob, "/")})
+			compiled = append(compiled, compiledGlob{literal: glob})
 			continue
 		}
 		pattern, err := globPattern(strings.TrimSuffix(glob, "/"))

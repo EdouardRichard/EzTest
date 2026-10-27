@@ -78,6 +78,41 @@ func TestPathNormalization(t *testing.T) {
 	}
 }
 
+// TestTreeLiteralGlobKeepsTrailingSlash pins design spec §6.1 glob parity with
+// P3 gitread: a literal pattern (no wildcards) keeps its trailing slash, so
+// "src/api/" matches no file path, while "src/api" still matches its subtree.
+func TestTreeLiteralGlobKeepsTrailingSlash(t *testing.T) {
+	fx := newTestRepo(t)
+	r := gitx.NewGitReader(gitx.GitConfig{CommandTimeout: 5 * time.Second})
+	ctx := context.Background()
+
+	trailing, err := r.Tree(ctx, fx.dir, fx.commit2, "", []string{"src/api/"}, nil, "", 200)
+	if err != nil {
+		t.Fatalf("Tree(include src/api/): %v", err)
+	}
+	if len(trailing.Entries) != 0 {
+		t.Fatalf("Tree(include src/api/) returned %d entries, want none (P3 keeps a literal glob's trailing slash)", len(trailing.Entries))
+	}
+
+	plain, err := r.Tree(ctx, fx.dir, fx.commit2, "", []string{"src/api"}, nil, "", 200)
+	if err != nil {
+		t.Fatalf("Tree(include src/api): %v", err)
+	}
+	plainIndex := entryIndex(plain.Entries)
+	if _, ok := plainIndex["src/api/refund.ts"]; !ok {
+		t.Fatalf("Tree(include src/api) missing src/api/refund.ts (got %v)", keys(plainIndex))
+	}
+
+	notExcluded, err := r.Tree(ctx, fx.dir, fx.commit2, "", nil, []string{"src/api/"}, "", 200)
+	if err != nil {
+		t.Fatalf("Tree(exclude src/api/): %v", err)
+	}
+	notExcludedIndex := entryIndex(notExcluded.Entries)
+	if _, ok := notExcludedIndex["src/api/refund.ts"]; !ok {
+		t.Fatalf("Tree(exclude src/api/) dropped src/api/refund.ts, want none excluded (got %v)", keys(notExcludedIndex))
+	}
+}
+
 // TestRepositoryValidation pins localPath checks: a missing directory is an
 // operational failure (503 git_unavailable, not a domain verdict), a directory
 // that is not a Git work tree is the domain reason path_not_git_repo and a
