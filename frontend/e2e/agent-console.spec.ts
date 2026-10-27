@@ -134,7 +134,9 @@ test.describe("agent console", () => {
     // full arguments (README.md) and the README content itself.
     await tool.click()
     await expect(firstRun.getByText(/"path":"README\.md"/)).toBeVisible()
-    await expect(firstRun.getByText(/EzTest 的 P0 基础阶段/)).toBeVisible()
+    // The expanded result carries the README's stable title heading rather than
+    // mutable introductory prose.
+    await expect(firstRun.getByText(/# EzTest/)).toBeVisible()
 
     // The usage row aggregates both model turns of the run (152 + 272 tokens).
     await firstRun.getByRole("button", { name: "用量" }).click()
@@ -180,8 +182,25 @@ test.describe("agent console", () => {
     await expect(abortedRun.getByText(/aborted_streaming/)).toBeVisible()
     await expect(abortedRun.getByText(/user_abort/)).toBeVisible()
 
-    // A reload replays the persisted activities: both diagnostic runs plus the
-    // aborted run must come back from the event snapshot.
+    // The service must still accept new messages after an abort (design spec
+    // §12.3 item 5): a normal message starts a fresh run that completes with
+    // its own text and tool evidence instead of staying wedged.
+    await sendMessage(pane, "继续检查")
+    await expect(runs).toHaveCount(4, { timeout: 30_000 })
+    const postAbortRun = runs.nth(3)
+    const postAbortTool = postAbortRun.getByRole("button", { name: "工具 file.read" })
+    await expect(postAbortRun.getByText("继续检查")).toBeVisible()
+    await expect(postAbortRun.getByRole("button", { name: "思考" })).toBeVisible()
+    await expect(postAbortTool).toBeVisible()
+    await expect(postAbortRun.getByRole("button", { name: "用量" })).toBeVisible()
+    await expect(postAbortRun.getByText(/诊断完成/)).toBeVisible({ timeout: 30_000 })
+    await expect(postAbortTool).toContainText("成功")
+    await expect(pane.getByText("已完成", { exact: true })).toBeVisible()
+
+    // A reload replays the complete transcript, not only its text (design spec
+    // §12.3 item 6): all four run groups (three diagnostics plus the aborted
+    // run) and their thinking, file.read and usage activities must come back
+    // from the event snapshot.
     await page.reload()
     await expect(page.getByRole("heading", { name: "Agent 运行时控制台" })).toBeVisible({
       timeout: 30_000,
@@ -189,10 +208,19 @@ test.describe("agent console", () => {
     await expect(page).toHaveURL(/[?&]session=\d+/)
     const replayPane = sessionPane(page)
     const replayRuns = runGroups(replayPane)
-    await expect.poll(() => replayRuns.count(), { timeout: 30_000 }).toBeGreaterThanOrEqual(2)
-    await expect(replayPane.getByText(/诊断完成/)).toHaveCount(2)
-    await expect(replayPane.getByText(/aborted_streaming/)).toBeVisible()
-    await expect(replayPane.getByText(/user_abort/)).toBeVisible()
+    await expect(replayRuns).toHaveCount(4, { timeout: 30_000 })
+    await expect(replayPane.getByText(/诊断完成/)).toHaveCount(3)
+
+    const replayTools = replayRuns.getByRole("button", { name: "工具 file.read" })
+    await expect(replayRuns.getByRole("button", { name: "思考" })).toHaveCount(3)
+    await expect(replayTools).toHaveCount(3)
+    await expect(replayTools.filter({ hasText: "成功" })).toHaveCount(3)
+    await expect(replayRuns.getByRole("button", { name: "用量" })).toHaveCount(3)
+
+    const replayedAbortedRun = replayRuns.nth(2)
+    await expect(replayedAbortedRun.getByText(/aborted_streaming/)).toBeVisible()
+    await expect(replayedAbortedRun.getByText(/user_abort/)).toBeVisible()
+    await expect(replayRuns.nth(3).getByText(/诊断完成/)).toBeVisible()
   })
 
   test("prompt edit applies to the next run", async ({ page }) => {
