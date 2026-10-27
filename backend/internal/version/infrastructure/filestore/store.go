@@ -231,7 +231,17 @@ func (s *Store) ensureRoot() (string, error) {
 	if err := os.MkdirAll(abs, dirPerm); err != nil {
 		return "", fmt.Errorf("filestore: create attachment root: %w", err)
 	}
-	return s.existingRoot()
+	root, err := s.existingRoot()
+	if err != nil {
+		return "", err
+	}
+	// Tighten a root created by an older/looser process; the mode is a no-op on
+	// Windows (except for the read-only bit) but still enforces the spec's 0700
+	// where it applies.
+	if err := os.Chmod(root, dirPerm); err != nil {
+		return "", fmt.Errorf("filestore: set attachment root mode: %w", err)
+	}
+	return root, nil
 }
 
 // existingRoot returns the symlink-resolved absolute root without creating it.

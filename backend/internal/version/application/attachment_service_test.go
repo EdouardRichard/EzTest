@@ -735,6 +735,24 @@ func TestReadTextRejectsNonUTF8(t *testing.T) {
 	assertDomainReason(t, err, domain.KindInvalid, "invalid_attachment_content")
 }
 
+// TestReadTextRejectsExactSizeCorruptSuffix covers the exact-window edge of
+// ReadText: when the metadata size equals the read window, the whole declared
+// file is inside the window, so a trailing partial rune is corrupt content, not
+// a legitimate size-limit cut, and must be a 422 rather than a silently
+// trimmed prefix.
+func TestReadTextRejectsExactSizeCorruptSuffix(t *testing.T) {
+	f := newAttachmentFixture(t)
+	req := f.seedRequirement(9001, 100, domain.RequirementDraft)
+	// "abc" followed by the first two bytes of the three-byte '€' rune: the row
+	// declares 5 bytes and the read window is 5 bytes, so nothing is truncated.
+	attachment := f.seedAttachment(req, 9102, "corrupt.txt", "text/plain", domain.AttachmentText,
+		"100/9102_corrupt.txt", []byte{'a', 'b', 'c', 0xe2, 0x82})
+
+	_, err := f.service.ReadText(context.Background(), 100, attachment.ID, 5)
+
+	assertDomainReason(t, err, domain.KindInvalid, "invalid_attachment_content")
+}
+
 // TestImageDataURLOnlyImages covers the multimodal resolver contract: only
 // image attachments, capped at 2 MiB, returned transiently as a data URL.
 func TestImageDataURLOnlyImages(t *testing.T) {
@@ -999,6 +1017,135 @@ func TestListGetAndOpenContent(t *testing.T) {
 	}
 }
 
+// TestStoragePathsForRequirement covers the requirement-delete cascade hook:
+// T14 captures the attachment storage paths before the hard delete cascades the
+// metadata rows away.
+func TestStoragePathsForRequirement(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("returns every attachment path in metadata order", func(t *testing.T) {
+		f := newAttachmentFixture(t)
+		req := f.seedRequirement(9001, 100, domain.RequirementDraft)
+		first := f.mustUpload(req, "first.txt", "text/plain", []byte("first"))
+		second := f.mustUpload(req, "second.txt", "text/plain", []byte("second"))
+
+		paths, err := f.service.StoragePathsForRequirement(ctx, 100, req.ID)
+		if err != nil {
+			t.Fatalf("StoragePathsForRequirement: %v", err)
+		}
+		if len(paths) != 2 || paths[0] != first.StoragePath || paths[1] != second.StoragePath {
+			t.Fatalf("paths = %v, want [%s %s]", paths, first.StoragePath, second.StoragePath)
+		}
+	})
+
+	t.Run("a requirement without attachments returns an empty slice", func(t *testing.T) {
+		f := newAttachmentFixture(t)
+		req := f.seedRequirement(9001, 100, domain.RequirementDraft)
+
+		paths, err := f.service.StoragePathsForRequirement(ctx, 100, req.ID)
+		if err != nil {
+			t.Fatalf("StoragePathsForRequirement: %v", err)
+		}
+		if paths == nil || len(paths) != 0 {
+			t.Fatalf("paths = %#v, want a non-nil empty slice", paths)
+		}
+	})
+
+	t.Run("missing requirement and foreign version are 404s", func(t *testing.T) {
+		f := newAttachmentFixture(t)
+		req := f.seedRequirement(9001, 100, domain.RequirementDraft)
+		f.mustUpload(req, "first.txt", "text/plain", []byte("first"))
+
+		_, err := f.service.StoragePathsForRequirement(ctx, 200, req.ID)
+		assertDomainReason(t, err, domain.KindNotFound, "not_found")
+		_, err = f.service.StoragePathsForRequirement(ctx, 100, 9099)
+		assertDomainReason(t, err, domain.KindNotFound, "not_found")
+	})
+
+	t.Run("repository list failures propagate", func(t *testing.T) {
+		f := newAttachmentFixture(t)
+		req := f.seedRequirement(9001, 100, domain.RequirementDraft)
+		f.repo.listAttachmentsErr = errors.New("database unavailable")
+
+		_, err := f.service.StoragePathsForRequirement(ctx, 100, req.ID)
+
+		if err == nil || !strings.Contains(err.Error(), "database unavailable") {
+			t.Fatalf("StoragePathsForRequirement error = %v, want the repository failure", err)
+		}
+	})
+}
+
+// TestRemoveStoredFiles covers the post-delete cleanup hook of the requirement
+// cascade: remove the captured files best effort, never touch metadata, and
+// keep going after an individual failure.
+func TestRemoveStoredFiles(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("removes every stored file without touching metadata", func(t *testing.T) {
+		f := newAttachmentFixture(t)
+		req := f.seedRequirement(9001, 100, domain.RequirementDraft)
+		first := f.mustUpload(req, "first.txt", "text/plain", []byte("first"))
+		second := f.mustUpload(req, "second.txt", "text/plain", []byte("second"))
+
+		err := f.service.RemoveStoredFiles(ctx, []string{first.StoragePath, second.StoragePath})
+
+		if err != nil {
+			t.Fatalf("RemoveStoredFiles: %v", err)
+		}
+		for _, attachment := range []*application.Attachment{first, second} {
+			if _, statErr := os.Stat(f.storedPath(attachment)); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("file for attachment %d survived: %v", attachment.ID, statErr)
+			}
+			if _, getErr := f.repo.GetAttachment(ctx, attachment.ID); getErr != nil {
+				t.Fatalf("RemoveStoredFiles touched attachment %d metadata: %v", attachment.ID, getErr)
+			}
+		}
+	})
+
+	t.Run("an empty list is a no-op", func(t *testing.T) {
+		f := newAttachmentFixture(t)
+		for _, paths := range [][]string{nil, {}} {
+			if err := f.service.RemoveStoredFiles(ctx, paths); err != nil {
+				t.Fatalf("RemoveStoredFiles(%#v) = %v, want nil", paths, err)
+			}
+		}
+		if count := f.fileCount(); count != 0 {
+			t.Fatalf("attachment files = %d, want 0", count)
+		}
+	})
+
+	t.Run("a failing path is joined and the others are still removed", func(t *testing.T) {
+		f := newAttachmentFixture(t)
+		req := f.seedRequirement(9001, 100, domain.RequirementDraft)
+		locked := f.mustUpload(req, "locked.txt", "text/plain", []byte("locked"))
+		removable := f.mustUpload(req, "removable.txt", "text/plain", []byte("removable"))
+		sentinel := errors.New("file is locked")
+		store := &failPathStore{AttachmentStore: f.store, failPath: locked.StoragePath, err: sentinel}
+		f.service = application.NewAttachmentService(f.repo, store, f.limits, f.events,
+			application.WithAttachmentIDGenerator(f.ids))
+
+		err := f.service.RemoveStoredFiles(ctx, []string{locked.StoragePath, removable.StoragePath})
+
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("RemoveStoredFiles error = %v, want a join containing %v", err, sentinel)
+		}
+		wantAttempts := []string{locked.StoragePath, removable.StoragePath}
+		if len(store.attempts) != 2 || store.attempts[0] != wantAttempts[0] ||
+			store.attempts[1] != wantAttempts[1] {
+			t.Fatalf("remove attempts = %v, want %v", store.attempts, wantAttempts)
+		}
+		if _, statErr := os.Stat(f.storedPath(removable)); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("succeeded path was not removed after a failure: %v", statErr)
+		}
+		if _, statErr := os.Stat(f.storedPath(locked)); statErr != nil {
+			t.Fatalf("failing path should stay on disk for the GC: %v", statErr)
+		}
+		if _, getErr := f.repo.GetAttachment(ctx, locked.ID); getErr != nil {
+			t.Fatalf("RemoveStoredFiles touched metadata: %v", getErr)
+		}
+	})
+}
+
 // removeFailureStore wraps a store and fails file removals.
 type removeFailureStore struct {
 	application.AttachmentStore
@@ -1010,4 +1157,22 @@ type removeFailureStore struct {
 func (s *removeFailureStore) Remove(ctx context.Context, storagePath string) error {
 	s.removeCalls++
 	return s.err
+}
+
+// failPathStore wraps a store and fails Remove only for one storage path, so a
+// test can prove the remaining paths are still cleaned up.
+type failPathStore struct {
+	application.AttachmentStore
+	failPath string
+	err      error
+	attempts []string
+}
+
+// Remove records the attempt, fails the scripted path and delegates the rest.
+func (s *failPathStore) Remove(ctx context.Context, storagePath string) error {
+	s.attempts = append(s.attempts, storagePath)
+	if storagePath == s.failPath {
+		return s.err
+	}
+	return s.AttachmentStore.Remove(ctx, storagePath)
 }
