@@ -796,9 +796,10 @@ POST /api/agents/sessions/1/stop
   1. 启动 API/Web（复用 `scripts/dev-api.ps1` / `dev-web.ps1`，由脚本前置检查）；
   2. 打开 `http://localhost:6868/login`，用管理员账号登录；
   3. `context.storageState({path: ".tmp/spike-storage-state.json"})` 保存会话；
-  4. 新建 context 并注入该 storageState，访问受保护页面 `/` 与 `/agents`；
+  4. 新建 context 并注入该 storageState；**由于 P0 的 token 存在 `sessionStorage`（Playwright `storageState` 不含 `sessionStorage`），还需用 `addInitScript` 恢复登录态**；访问受保护页面 `/` 与 `/agents`；
   5. 断言页面显示已登录（用户菜单/控制台），截图 `.tmp/spike-shell.png`；
   6. 输出结构化结果（步骤、耗时、截图路径、成功/失败）。
+- **Spike 结论（2026-10-27）**：`storageState` 只保存 cookies/localStorage，不含 `sessionStorage`；纯 storageState 注入无法恢复 EzTest 登录（状态文件 36B，`/` 被重定向 `/login`）。可行路径 = storageState + `addInitScript` 恢复 `eztest.token`/`eztest.user`。**P6 的 Session 复用必须持久化并注入 sessionStorage，或把 token 迁移到 localStorage/cookie；这是 P6 的输入约束。**
 - 明确不做：不写入 Agent 工具、不进入 API、不用于 P1 验收的 Agent 链路；脚本失败只报告，不阻塞 P1 主验收（P6 前置风险提前暴露）。
 - 成本：每轮几秒；不产生 LLM 费用。
 
