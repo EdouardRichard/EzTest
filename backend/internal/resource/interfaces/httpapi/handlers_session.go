@@ -19,6 +19,12 @@ const maxSessionImportBodyBytes int64 = 6 << 20
 // maxSessionBodyBytes caps ordinary session and takeover request bodies.
 const maxSessionBodyBytes int64 = 64 << 10
 
+// maxTakeoverCompleteBodyBytes caps the complete-takeover body. A completion
+// replaces the session's storage state or token headers, so it needs the same
+// 6 MiB room as an import (spec §7.6); the 64 KiB ordinary action cap would
+// reject a valid storageState. confirm/invalidate/revoke keep the small cap.
+const maxTakeoverCompleteBodyBytes int64 = 6 << 20
+
 // maxTakeoverExpiresInSeconds bounds expiresInSeconds so the duration conversion
 // cannot overflow. The API has no documented upper bound; a year is far beyond
 // any human takeover.
@@ -538,7 +544,7 @@ func (h *SessionHandler) CompleteTakeover(w http.ResponseWriter, r *http.Request
 		return
 	}
 	var req completeTakeoverRequest
-	if err := DecodeJSON(w, r, &req, maxSessionBodyBytes); err != nil {
+	if err := DecodeJSON(w, r, &req, maxTakeoverCompleteBodyBytes); err != nil {
 		WriteServiceError(w, r, err)
 		return
 	}

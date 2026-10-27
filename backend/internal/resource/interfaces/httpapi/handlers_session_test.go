@@ -773,6 +773,50 @@ func TestSessionHandlerActionBodyCap(t *testing.T) {
 
 	rr = sessionRequest(mux, http.MethodPost, "/api/resources/sessions/1/invalidate", catalogAdminToken, oversized)
 	assertAccessErrorEnvelope(t, rr, http.StatusUnprocessableEntity, "invalid_argument", "body_too_large")
+
+	rr = sessionRequest(mux, http.MethodPost, "/api/resources/sessions/1/revoke", catalogAdminToken, oversized)
+	assertAccessErrorEnvelope(t, rr, http.StatusUnprocessableEntity, "invalid_argument", "body_too_large")
+}
+
+func TestSessionHandlerCompleteTakeoverBodyCap(t *testing.T) {
+	mux, env := newSessionHandlerTestServer(t)
+	env.checker.result = domain.LoginCheckResult{Observed: domain.ObservedAllowed, Status: 200}
+	session := env.seedSession(domain.StateNeedsManual)
+	takeover := env.seedTakeover(session.ID, domain.TakeoverStatusWaiting)
+
+	// A completion carries a storage_state, so it needs the import-size cap. A
+	// body above the 64 KiB action cap but below 6 MiB must reach the service.
+	origins := make([]string, 0, 200)
+	for i := 0; i < 200; i++ {
+		origins = append(origins, fmt.Sprintf(
+			`{"origin":"http://localhost:%d","localStorage":[{"name":"k","value":"%s"}]}`,
+			13400+i, strings.Repeat("a", 300)))
+	}
+	storage := `{"cookies":[],"origins":[` + strings.Join(origins, ",") + `]}`
+	body := `{"kind":"storage_state","storageState":` + storage + `}`
+	if len(body) <= 64<<10 || len(body) >= 6<<20 {
+		t.Fatalf("fixture body size %d outside the expected 64KiB..6MiB window", len(body))
+	}
+	rr := sessionRequest(mux, http.MethodPost,
+		fmt.Sprintf("/api/resources/takeovers/%d/complete", takeover.ID), catalogAdminToken, body)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200 for a body above 64 KiB (body=%s)", rr.Code, rr.Body.String())
+	}
+	completed := decodeAccessData[map[string]any](t, rr)
+	if sessionJSONMap(t, completed, "takeover")["status"] != domain.TakeoverStatusCompleted {
+		t.Fatalf("completed takeover=%v", completed["takeover"])
+	}
+	if sessionJSONMap(t, completed, "session")["state"] != domain.StateValid {
+		t.Fatalf("completed session=%v", completed["session"])
+	}
+	assertNoSessionSecretLeak(t, rr)
+
+	// The larger cap stays bounded: above 6 MiB is still a 422.
+	oversized := `{"kind":"storage_state","storageState":{"cookies":[],"origins":[]},` +
+		`"headers":{"Authorization":"` + strings.Repeat("a", 6<<20) + `"}}`
+	rr = sessionRequest(mux, http.MethodPost,
+		fmt.Sprintf("/api/resources/takeovers/%d/complete", takeover.ID), catalogAdminToken, oversized)
+	assertAccessErrorEnvelope(t, rr, http.StatusUnprocessableEntity, "invalid_argument", "body_too_large")
 }
 
 func TestSessionHandlerDetailAndList(t *testing.T) {
