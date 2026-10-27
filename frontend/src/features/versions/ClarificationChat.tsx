@@ -81,6 +81,11 @@ function readDetailNumber(event: VersionEvent, key: string): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null
 }
 
+/** Reads a boolean activity flag such as `args_truncated`. */
+function readDetailFlag(event: VersionEvent, key: string): boolean {
+  return event.detail[key] === true
+}
+
 /** Reads an ID that may arrive as a JSON number or a decimal string. */
 function readDetailId(event: VersionEvent, key: string): string | null {
   const value = event.detail[key]
@@ -165,6 +170,9 @@ type TranscriptEntry =
       name: string
       args: string
       result: string
+      /** The visible args/result is the runner's bounded preview, not the full value. */
+      argsTruncated: boolean
+      resultTruncated: boolean
       status: string
       durationMs: number | null
       at: string
@@ -203,18 +211,35 @@ function runOutcomeNotice(event: VersionEvent): string {
   return label
 }
 
-/** Applies one live tool activity to an existing tool row. */
+/**
+ * Applies one live tool activity to an existing tool row. The persisted snapshot
+ * is authoritative: the runner bounds event previews to 2048 bytes, so a preview
+ * only fills a value the snapshot does not have. A preview that does fill a gap
+ * keeps its `args_truncated`/`result_truncated` flag so the row is never shown
+ * as if the shortened preview were the complete value.
+ */
 function applyToolActivity(entry: ToolEntry, event: VersionEvent, kind: string): void {
   const name = readDetailText(event, "tool")
   if (name !== "") entry.name = name
   if (kind === "tool_use") {
+    if (entry.args !== "") return
     const args = readDetailText(event, "args")
-    if (args !== "") entry.args = args
+    if (args === "") return
+    entry.args = args
+    entry.argsTruncated = readDetailFlag(event, "args_truncated")
     return
   }
-  entry.result = readDetailText(event, "result")
-  entry.status = readDetailText(event, "status")
-  entry.durationMs = readDetailNumber(event, "duration_ms")
+  if (entry.result === "") {
+    const result = readDetailText(event, "result")
+    if (result !== "") {
+      entry.result = result
+      entry.resultTruncated = readDetailFlag(event, "result_truncated")
+    }
+  }
+  const status = readDetailText(event, "status")
+  if (status !== "") entry.status = status
+  const durationMs = readDetailNumber(event, "duration_ms")
+  if (durationMs !== null) entry.durationMs = durationMs
 }
 
 /**
@@ -236,6 +261,15 @@ function findPendingLiveTool(
 }
 
 type OrderedEntry = { entry: TranscriptEntry; order: number }
+
+/**
+ * Key for a persisted tool call. Call ids are only unique per run, so the run id
+ * scopes the lookup when the snapshot has one; a bare call id is used only when
+ * the snapshot has no run id at all.
+ */
+function persistedToolKey(runId: string | number | null, callId: string): string {
+  return runId === null ? callId : `${runId}|${callId}`
+}
 
 function parseTime(value: string): number {
   const time = Date.parse(value)
@@ -262,6 +296,8 @@ function sortEntries(ordered: OrderedEntry[]): TranscriptEntry[] {
  * - persisted text/thinking/tool content is rendered once (the API is the
  *   authority after a reload);
  * - live text/thinking chunks of the same `(message_id, part)` are folded;
+ * - persisted tool args/results are authoritative; live activity only fills a
+ *   missing value and keeps the runner's truncation flags;
  * - tool_use/tool_result pairs fold by `run_id` + `call_id`, falling back to the
  *   persisted call with the same call id so a restored call is never duplicated;
  * - usage activities fold into one summary and a non-successful `run_finished`
@@ -284,7 +320,7 @@ function buildTranscript(
 
   const knownMessageIds = new Set<number>()
   const persistedToolCalls: OrderedEntry[] = []
-  const persistedToolByCallId = new Map<string, OrderedEntry>()
+  const persistedToolByKey = new Map<string, OrderedEntry>()
   const persistedUserTexts = new Map<string, number>()
 
   for (const message of messages) {
@@ -320,12 +356,15 @@ function buildTranscript(
           name: call.name,
           args: call.arguments,
           result: "",
+          argsTruncated: false,
+          resultTruncated: false,
           status: "",
           durationMs: null,
           at: message.createdAt,
         })
         persistedToolCalls.push(entry)
-        if (!persistedToolByCallId.has(call.id)) persistedToolByCallId.set(call.id, entry)
+        const key = persistedToolKey(message.runId, call.id)
+        if (!persistedToolByKey.has(key)) persistedToolByKey.set(key, entry)
       }
       continue
     }
@@ -347,6 +386,8 @@ function buildTranscript(
         name: message.toolName ?? "工具",
         args: "",
         result: text,
+        argsTruncated: false,
+        resultTruncated: false,
         status: "ok",
         durationMs: null,
         at: message.createdAt,
@@ -409,7 +450,12 @@ function buildTranscript(
       const toolKey = `${runId ?? "?"}|${callId}`
       let existing = liveTools.get(toolKey)
       if (existing === undefined) {
-        const persisted = persistedToolByCallId.get(callId)
+        let persisted = persistedToolByKey.get(persistedToolKey(runId, callId))
+        if (persisted === undefined) {
+          // A bare key only ever holds a call whose snapshot message had no run
+          // id, so this fallback cannot attach to a call scoped to another run.
+          persisted = persistedToolByKey.get(callId)
+        }
         if (persisted !== undefined && persisted.entry.kind === "tool") {
           applyToolActivity(persisted.entry, event, kind)
           liveTools.set(toolKey, persisted)
@@ -436,6 +482,8 @@ function buildTranscript(
           name: readDetailText(event, "tool") || callId,
           args: kind === "tool_use" ? readDetailText(event, "args") : "",
           result: kind === "tool_result" ? readDetailText(event, "result") : "",
+          argsTruncated: kind === "tool_use" && readDetailFlag(event, "args_truncated"),
+          resultTruncated: kind === "tool_result" && readDetailFlag(event, "result_truncated"),
           status: kind === "tool_result" ? readDetailText(event, "status") : "",
           durationMs: kind === "tool_result" ? readDetailNumber(event, "duration_ms") : null,
           at: event.ts,
@@ -552,6 +600,11 @@ function ToolRow({ entry }: { entry: Extract<TranscriptEntry, { kind: "tool" }> 
             <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-all rounded-lg bg-muted/50 p-2 font-mono text-xs">
               {entry.args || "（无）"}
             </pre>
+            {entry.argsTruncated ? (
+              <p className="mt-1 text-[11px] text-amber-700 dark:text-amber-300">
+                参数已截断，仅显示预览。
+              </p>
+            ) : null}
           </div>
           <div>
             <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
@@ -560,6 +613,11 @@ function ToolRow({ entry }: { entry: Extract<TranscriptEntry, { kind: "tool" }> 
             <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-all rounded-lg bg-muted/50 p-2 font-mono text-xs">
               {entry.result || "（无结果）"}
             </pre>
+            {entry.resultTruncated ? (
+              <p className="mt-1 text-[11px] text-amber-700 dark:text-amber-300">
+                结果已截断，仅显示预览。
+              </p>
+            ) : null}
           </div>
         </div>
       ) : null}

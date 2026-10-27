@@ -37,11 +37,15 @@ const RELATION_TYPES = Object.keys(RELATION_TYPE_META) as RelationType[]
 /**
  * Clarification event types that change the question/decision panels, the
  * clarification overview counters or the version header counters. A live event
- * of one of these types refreshes every clarification surface.
+ * of one of these types refreshes every clarification surface. The session
+ * lifecycle events are included so a session started or completed elsewhere
+ * (another window/user) refreshes the chat's session state as well.
  */
 const CLARIFICATION_PANEL_EVENTS: ReadonlySet<string> = new Set([
   "clarification.question_updated",
   "clarification.context_updated",
+  "clarification.session_started",
+  "clarification.session_completed",
   "decision.proposed",
   "decision.decided",
 ])
