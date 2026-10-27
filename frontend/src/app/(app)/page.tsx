@@ -120,7 +120,7 @@ export default function OverviewPage() {
         label: health.llm_configured ? "已配置" : "未配置",
         detail: health.llm_configured
           ? "已存在可解密的默认 LLM 配置。"
-          : "可在设置页配置 LLM 连接、模型与 API Key。",
+          : "管理员可在设置页配置 LLM 连接、模型与 API Key。",
         variant: health.llm_configured ? "success" : "warning",
       }
     : {
@@ -139,7 +139,7 @@ export default function OverviewPage() {
       title: "SSE 事件流",
       icon: RadioTower,
       label: "已接入",
-      detail: "可在设置页的 SSE 测试面板连接 system 频道并发布测试事件。",
+      detail: "管理员可在设置页的 SSE 测试面板连接 system 频道并发布测试事件。",
       variant: "success",
       href: "/settings",
     },

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -133,6 +134,14 @@ func lockTestDB(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
 // development database. The checks are pure so they can be unit-tested without
 // a database and run before any connection or DROP.
 //
+// Validation uses the effective pgx connection target, not just the URL text:
+// pgx applies query parameters on top of the path and host, so
+// ...?dbname=eztest, ...?database=eztest, ...?host=..., ...?port=... can point
+// the connection at a different database than the path suggests. The same
+// pgxpool.ParseConfig parse that pgxpool.New performs is used here, so the
+// checked target is the one that would be dialled. Query parameters that do not
+// change the target (for example sslmode) remain allowed.
+//
 // The comparison against the development URL is skipped when devURL is empty
 // (for example a plain `go test` invocation that only exports the test URL);
 // the scheme, host, database-name and suffix checks still fail closed. When a
@@ -158,8 +167,21 @@ func validateTestDatabaseURL(testURL, devURL string) error {
 	if testName == "" {
 		return errors.New("EZTEST_TEST_DATABASE_URL must include a database name")
 	}
-	if !strings.HasSuffix(testName, "_test") && !strings.HasSuffix(testName, "_e2e") {
-		return fmt.Errorf("EZTEST_TEST_DATABASE_URL database %q must end with _test or _e2e", testName)
+	testConfig, err := pgxpool.ParseConfig(testURL)
+	if err != nil {
+		// pgx errors quote the connection string, password included; never
+		// wrap them. The effective target cannot be verified, so fail closed.
+		return errors.New("EZTEST_TEST_DATABASE_URL is not a valid URL for a PostgreSQL connection")
+	}
+	testTarget := effectiveTarget(testConfig.ConnConfig)
+	if testConfig.ConnConfig.Host == "" {
+		return errors.New("EZTEST_TEST_DATABASE_URL must include a host")
+	}
+	if testConfig.ConnConfig.Database == "" {
+		return errors.New("EZTEST_TEST_DATABASE_URL must include a database name")
+	}
+	if !isTestDatabaseName(testConfig.ConnConfig.Database) {
+		return fmt.Errorf("EZTEST_TEST_DATABASE_URL database %q must end with _test or _e2e", testConfig.ConnConfig.Database)
 	}
 
 	devURL = strings.TrimSpace(devURL)
@@ -170,10 +192,21 @@ func validateTestDatabaseURL(testURL, devURL string) error {
 	if err != nil || !isPostgresURL(dev) || dev.Hostname() == "" || databaseName(dev) == "" {
 		return errors.New("EZTEST_DATABASE_URL is not a valid PostgreSQL URL; cannot verify that the test database is separate")
 	}
-	if canonicalDatabase(test) == canonicalDatabase(dev) {
-		return fmt.Errorf("EZTEST_TEST_DATABASE_URL points at the same database as EZTEST_DATABASE_URL (%s); refusing to drop its schema", canonicalDatabase(test))
+	devConfig, err := pgxpool.ParseConfig(devURL)
+	if err != nil || devConfig.ConnConfig.Host == "" || devConfig.ConnConfig.Database == "" {
+		return errors.New("EZTEST_DATABASE_URL is not a valid PostgreSQL URL; cannot verify that the test database is separate")
+	}
+	if testTarget == effectiveTarget(devConfig.ConnConfig) {
+		return fmt.Errorf("EZTEST_TEST_DATABASE_URL points at the same database as EZTEST_DATABASE_URL (%s); refusing to drop its schema", testTarget)
 	}
 	return nil
+}
+
+// isTestDatabaseName reports whether the effective database name is dedicated
+// to tests. A suffix check on the URL path alone is not enough because pgx
+// query parameters can replace the database name.
+func isTestDatabaseName(name string) bool {
+	return strings.HasSuffix(name, "_test") || strings.HasSuffix(name, "_e2e")
 }
 
 // isPostgresURL reports whether u uses a scheme the pgx driver accepts.
@@ -187,16 +220,12 @@ func databaseName(u *url.URL) string {
 	return strings.TrimPrefix(u.Path, "/")
 }
 
-// canonicalDatabase renders host, effective port and database name for
-// comparison. Credentials and query parameters are deliberately excluded: two
-// URLs can reach the same database with different users, TLS modes or textual
-// port forms, and the schema reset must be refused in every such case.
-func canonicalDatabase(u *url.URL) string {
-	port := u.Port()
-	if port == "" {
-		port = "5432"
-	}
-	return strings.ToLower(u.Hostname()) + ":" + port + "/" + databaseName(u)
+// effectiveTarget renders the host, port and database pgx would actually
+// connect to. Credentials are deliberately excluded: two URLs can reach the
+// same database with different users or TLS modes, and the schema reset must be
+// refused in every such case.
+func effectiveTarget(cfg *pgx.ConnConfig) string {
+	return strings.ToLower(cfg.Host) + ":" + strconv.Itoa(int(cfg.Port)) + "/" + cfg.Database
 }
 
 // truncateAll empties every table in the public schema except the migration

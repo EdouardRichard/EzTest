@@ -12,6 +12,13 @@ import (
 func TestValidateTestDatabaseURL(t *testing.T) {
 	const devURL = "postgres://dev:secret@localhost:5433/eztest?sslmode=disable"
 
+	// pgx applies PG* environment variables when the URL leaves a setting out
+	// (notably PGPORT), so the effective target would depend on the host
+	// environment. The validator deliberately parses the same effective
+	// configuration; keep the port deterministic here. An empty value is
+	// ignored by pgx, restoring the 5432 default.
+	t.Setenv("PGPORT", "")
+
 	tests := []struct {
 		name        string
 		testURL     string
@@ -81,6 +88,45 @@ func TestValidateTestDatabaseURL(t *testing.T) {
 			devURL:      "postgres://dev:secret@localhost:5432/eztest_test",
 			wantErr:     true,
 			errContains: "same database",
+		},
+		{
+			// pgx lets the dbname query parameter override the URL path. The
+			// path looks safe but the connection would open the dev database.
+			name:        "dbname query override reaches development database",
+			testURL:     "postgres://user:pass@localhost:5433/eztest_test?dbname=eztest",
+			devURL:      devURL,
+			wantErr:     true,
+			errContains: "_test or _e2e",
+		},
+		{
+			// database is the canonical pgx name for the same setting.
+			name:        "database query override reaches development database",
+			testURL:     "postgres://user:pass@localhost:5433/eztest_test?database=eztest",
+			devURL:      devURL,
+			wantErr:     true,
+			errContains: "_test or _e2e",
+		},
+		{
+			// The URL text points at a remote host, but pgx connects to the
+			// dev host:port because query parameters win over host:port.
+			name:        "host query override reaches development database",
+			testURL:     "postgres://user:pass@remote.example.com:6000/eztest_test?host=localhost&port=5433",
+			devURL:      "postgres://dev:secret@localhost:5433/eztest_test",
+			wantErr:     true,
+			errContains: "same database",
+		},
+		{
+			name:        "port query override reaches development database",
+			testURL:     "postgres://user:pass@localhost:6000/eztest_test?port=5433",
+			devURL:      "postgres://dev:secret@localhost:5433/eztest_test",
+			wantErr:     true,
+			errContains: "same database",
+		},
+		{
+			name:    "safe test database with sslmode query",
+			testURL: "postgres://user:pass@localhost:5433/eztest_test?sslmode=disable",
+			devURL:  devURL,
+			wantErr: false,
 		},
 		{
 			name:    "safe test database",
