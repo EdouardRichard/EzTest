@@ -13,6 +13,10 @@ import (
 // Relation is one typed edge between two requirements.
 type Relation = domain.Relation
 
+// maxRelationsPerVersion bounds one relation listing (spec §7.4: the relation
+// list is not paginated but never returns more than 500 edges).
+const maxRelationsPerVersion = 500
+
 // CreateRelationCommand is the create-relation request (spec §7.4). Source
 // records the caller: user for the HTTP API, ai for the agent relation tool.
 type CreateRelationCommand struct {
@@ -130,21 +134,24 @@ func (s *RelationService) Create(ctx context.Context, versionID int64, cmd Creat
 	return relation, nil
 }
 
-// Update rewrites a relation's type and/or description. An empty relType keeps
-// the current type (PATCH semantics). Edits are not limited by the status of the
-// linked requirements. A change that collides with another edge is a
-// duplicate_relation.
-func (s *RelationService) Update(ctx context.Context, versionID, relID int64, relType, desc string) (*Relation, error) {
+// Update rewrites a relation's type and/or description. Nil fields keep their
+// current value (PATCH semantics: an omitted description does not clear it). An
+// explicitly supplied empty or unknown type is rejected by validation. Edits are
+// not limited by the status of the linked requirements. A change that collides
+// with another edge is a duplicate_relation.
+func (s *RelationService) Update(ctx context.Context, versionID, relID int64, relType, description *string, actor int64) (*Relation, error) {
 	current, err := s.loadRelation(ctx, versionID, relID)
 	if err != nil {
 		return nil, err
 	}
 
 	candidate := *current
-	if relType != "" {
-		candidate.RelationType = relType
+	if relType != nil {
+		candidate.RelationType = *relType
 	}
-	candidate.Description = desc
+	if description != nil {
+		candidate.Description = *description
+	}
 	if err := candidate.Validate(); err != nil {
 		return nil, err
 	}
@@ -161,6 +168,7 @@ func (s *RelationService) Update(ctx context.Context, versionID, relID int64, re
 		Type:             "requirement.relation_updated",
 		Summary:          "requirement relation updated",
 		RefRequirementID: requirementIDPtr(updated.FromRequirementID),
+		ActorID:          actor,
 		Source:           domain.SourceUser,
 		Detail: map[string]any{
 			"relationId":        strconv.FormatInt(updated.ID, 10),
@@ -173,7 +181,7 @@ func (s *RelationService) Update(ctx context.Context, versionID, relID int64, re
 }
 
 // Delete removes one relation of the version.
-func (s *RelationService) Delete(ctx context.Context, versionID, relID int64) error {
+func (s *RelationService) Delete(ctx context.Context, versionID, relID, actor int64) error {
 	current, err := s.loadRelation(ctx, versionID, relID)
 	if err != nil {
 		return err
@@ -186,15 +194,24 @@ func (s *RelationService) Delete(ctx context.Context, versionID, relID int64) er
 		Type:             "requirement.relation_removed",
 		Summary:          "requirement relation removed",
 		RefRequirementID: requirementIDPtr(current.FromRequirementID),
+		ActorID:          actor,
 		Source:           domain.SourceUser,
 		Detail:           map[string]any{"relationId": strconv.FormatInt(relID, 10)},
 	})
 	return nil
 }
 
-// List returns all relations of one version ordered by id (spec §7.4).
+// List returns the relations of one version ordered by id, capped at the
+// spec §7.4 upper bound of 500.
 func (s *RelationService) List(ctx context.Context, versionID int64) ([]Relation, error) {
-	return s.repo.ListRelations(ctx, versionID)
+	relations, err := s.repo.ListRelations(ctx, versionID)
+	if err != nil {
+		return nil, err
+	}
+	if len(relations) > maxRelationsPerVersion {
+		relations = relations[:maxRelationsPerVersion]
+	}
+	return relations, nil
 }
 
 // loadRelation finds one relation inside its version. A relation of another

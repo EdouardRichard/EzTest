@@ -42,6 +42,10 @@ const (
 	// requirementAttachmentsPrimaryKey is the name of the attachments primary-key
 	// constraint; every other unique violation is a duplicate content upload.
 	requirementAttachmentsPrimaryKey = "requirement_attachments_pkey"
+
+	// requirementRelationsListLimit bounds one version relation listing
+	// (spec §7.4: not paginated, upper bound 500).
+	requirementRelationsListLimit = 500
 )
 
 // requirementRowScanner is the subset of pgx.Row and pgx.Rows used to scan one
@@ -370,8 +374,11 @@ func (r *RequirementRepository) Delete(ctx context.Context, id int64) error {
 }
 
 // UpdateStatus performs a status compare-and-swap. Confirmation additionally
-// requires zero open questions of the requirement, enforced in the same
-// statement so a concurrently opened question cannot slip through (INV-3).
+// requires zero open questions of the requirement, checked inside the same
+// status-CAS UPDATE statement (INV-3). Under READ COMMITTED a question that a
+// concurrent transaction commits after this statement's snapshot may not be
+// visible, so the gate is CAS-consistent rather than serializable; the spec
+// accepts this concurrency model (question creation is owned by T10).
 // Confirmed_at/by are stamped on confirmation and cleared on reopen; both
 // transitions are human-only, so last_update_source becomes user.
 func (r *RequirementRepository) UpdateStatus(ctx context.Context, id int64, from, to string, actor int64) (*domain.Requirement, error) {
@@ -434,11 +441,14 @@ func (r *RequirementRepository) CountOpenQuestions(ctx context.Context, requirem
 	return count, nil
 }
 
-// ListRelations returns all relations of one version ordered by id.
+// ListRelations returns up to 500 relations of one version ordered by id. The
+// spec §7.4 relation list is not paginated but has an upper bound of 500; the
+// service applies the same cap as defence in depth.
 func (r *RequirementRepository) ListRelations(ctx context.Context, versionID int64) ([]domain.Relation, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT `+relationColumnList+` FROM requirement_relations WHERE version_id = $1 ORDER BY id ASC`,
-		versionID)
+		`SELECT `+relationColumnList+` FROM requirement_relations
+		 WHERE version_id = $1 ORDER BY id ASC LIMIT $2`,
+		versionID, requirementRelationsListLimit)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list requirement relations: %w", err)
 	}
