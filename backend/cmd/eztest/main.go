@@ -95,11 +95,17 @@ const (
 	// text per planning call.
 	codeIntelImpactMaxFacts       = 200
 	codeIntelImpactMaxPromptBytes = 64 << 10
-	// codeIntelShutdownTimeout bounds the graceful codeintel worker stop that
-	// runs after the HTTP server drained and before the database closes. A run
-	// still executing when the budget expires stays failed(interrupted) on the
-	// next start (design spec §6.8).
-	codeIntelShutdownTimeout = 10 * time.Second
+	// codeIntelShutdownBuffer is the extra grace added to the configured
+	// analysis timeout for the worker's graceful stop (design spec §6.8): a run
+	// already executing when shutdown starts may still need its whole
+	// analysis_timeout_ms to persist its terminal state.
+	codeIntelShutdownBuffer = 10 * time.Second
+	// codeIntelDefaultAnalysisTimeoutMS and codeIntelMaxAnalysisTimeoutMS mirror
+	// the EZTEST_CODEINTEL_ANALYSIS_TIMEOUT_MS bounds owned by internal/config.
+	// They keep the shutdown budget positive and bounded even for a defensively
+	// built Config that never went through config.Load.
+	codeIntelDefaultAnalysisTimeoutMS = 180000
+	codeIntelMaxAnalysisTimeoutMS     = 600000
 )
 
 func main() {
@@ -264,15 +270,12 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		ConfigService: llmConfigs,
 		ClientFactory: llmClientFactory,
 	})
-	var codeIntelLLM codeintelapp.LLMCompleter
-	if codeIntelLLMErr != nil {
-		// Log once and continue. The gateway error carries only the stable
-		// "not configured" reason: never a prompt, response or secret.
-		logger.Warn("code intelligence LLM is unavailable; analyses will degrade to T0 results",
-			"reason", codeIntelLLMErr)
-	} else {
-		codeIntelLLM = codeIntelLLMGateway
-	}
+	// A missing or unusable default LLM configuration is an intentional
+	// degraded mode, never a startup failure: the helper logs once (the error
+	// carries only the stable "not configured" reason, never a prompt, response
+	// or secret) and returns a nil completer, so the process keeps serving and
+	// analyses fall back to deterministic T0 results (design spec §6.2).
+	codeIntelLLM := codeIntelLLMCompleter(codeIntelLLMGateway, codeIntelLLMErr, logger)
 
 	// The nine codeintel PostgreSQL repositories (design spec §5).
 	codeIntelIndexRuns := codeintelpg.NewIndexRunRepository(database.Pool)
@@ -398,7 +401,15 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	})
 	codeIntelWorker.Start()
 	defer func() {
-		stopCtx, cancelStop := context.WithTimeout(context.Background(), codeIntelShutdownTimeout)
+		// The stop budget tracks the configured analysis timeout, not a fixed
+		// 10 s: design spec §6.8 requires the graceful shutdown to wait for the
+		// current run up to its own timeout. database.Close was deferred before
+		// this block, so it always runs after the worker stopped, even when the
+		// configured timeout is zero or invalid (the helper keeps the budget
+		// positive and capped at the documented maximum).
+		budget := codeintelShutdownTimeout(cfg)
+		logger.Info("stopping codeintel worker", "timeout", budget)
+		stopCtx, cancelStop := context.WithTimeout(context.Background(), budget)
 		defer cancelStop()
 		codeIntelWorker.Stop(stopCtx)
 	}()
@@ -475,7 +486,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	// tools available; P5 configures which profiles may call them. The
 	// repository catalog is adapted because the tools package depends only on
 	// its own local projection, never on the codeintel application layer.
-	agentToolList = append(agentToolList, agenttools.NewCodeIntelTools(agenttools.CodeIntelToolDeps{
+	agentToolList = append(agentToolList, codeIntelTools(agenttools.CodeIntelToolDeps{
 		Repos:    codeIntelRepoCatalog{repos: codeIntelRepos},
 		Indexes:  codeIntelIndex,
 		Queries:  codeIntelQuery,
@@ -788,4 +799,47 @@ func (wallClock) Now() time.Time { return time.Now() }
 // drain instead of waiting for client disconnects.
 func baseContext(ctx context.Context) func(net.Listener) context.Context {
 	return func(net.Listener) context.Context { return ctx }
+}
+
+// codeIntelTools builds the nine P4 codeintel agent tools (design spec §8.1).
+// The composition root appends them to the single tool registry before
+// NewToolRegistry is called; keeping that append behind this helper makes the
+// registration path directly testable from package main.
+func codeIntelTools(deps agenttools.CodeIntelToolDeps) []agentdomain.Tool {
+	return agenttools.NewCodeIntelTools(deps)
+}
+
+// codeintelShutdownTimeout returns the graceful codeintel worker-stop budget:
+// the configured analysis timeout plus codeIntelShutdownBuffer (design spec
+// §6.8). The worker applies analysis_timeout_ms per job, so the budget covers a
+// run that was already executing when the shutdown started. A zero or negative
+// timeout falls back to the documented default (NewWorker applies the same
+// default) and an above-max value is capped, keeping the budget positive and
+// bounded even for a Config that bypassed config.Load. A positive budget also
+// guarantees the deferred worker stop completes before database.Close, which
+// was deferred earlier and therefore runs last.
+func codeintelShutdownTimeout(cfg config.Config) time.Duration {
+	timeoutMS := cfg.CodeIntelAnalysisTimeoutMS
+	switch {
+	case timeoutMS <= 0:
+		timeoutMS = codeIntelDefaultAnalysisTimeoutMS
+	case timeoutMS > codeIntelMaxAnalysisTimeoutMS:
+		timeoutMS = codeIntelMaxAnalysisTimeoutMS
+	}
+	return time.Duration(timeoutMS)*time.Millisecond + codeIntelShutdownBuffer
+}
+
+// codeIntelLLMCompleter selects the codeintel completer. A gateway construction
+// failure is the intentional degraded mode of design spec §6.2, not a startup
+// failure: it is logged once and reported as a nil completer, so the process
+// keeps serving and analyses fall back to deterministic T0 results. The error
+// carries only the stable "not configured" reason: never a prompt, response or
+// secret.
+func codeIntelLLMCompleter(gateway codeintelapp.LLMCompleter, err error, logger *slog.Logger) codeintelapp.LLMCompleter {
+	if err != nil {
+		logger.Warn("code intelligence LLM is unavailable; analyses will degrade to T0 results",
+			"reason", err)
+		return nil
+	}
+	return gateway
 }

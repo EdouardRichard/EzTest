@@ -312,7 +312,10 @@ func TestCodeIntelRoutesNilSafe(t *testing.T) {
 // composition root exposes the nine P4 tools (design spec §8.1) alongside the
 // unchanged P1 tools. The API lists the dotted registry names; the model-facing
 // underscore wire names are produced by the existing LLM gateway mapping
-// (code.analyze -> code_analyze) and therefore never appear here.
+// (code.analyze -> code_analyze) and therefore never appear here. The registry
+// fixture is built locally because package main cannot be imported; the
+// composition root's own append helper (codeIntelTools) is covered by
+// TestCodeIntelToolsRegistersNine in cmd/eztest.
 func TestAgentToolCatalogIncludesCodeIntel(t *testing.T) {
 	registry := agentapp.NewToolRegistry(append(
 		[]agentdomain.Tool{agenttools.NewTestEcho()},
