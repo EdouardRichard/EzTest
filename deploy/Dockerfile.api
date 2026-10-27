@@ -35,9 +35,12 @@ WORKDIR /app
 COPY --from=build --chown=eztest:eztest /out/eztest ./eztest
 COPY --chown=eztest:eztest docs/openapi/api.yaml ./docs/openapi/api.yaml
 
-# Content-addressed objects live on the `objects` volume in docker-compose.
-RUN mkdir -p /data/objects \
-    && chown -R eztest:eztest /app /data/objects
+# Content-addressed objects and P3 version attachments live on named volumes in
+# docker-compose. Both directories must exist and be owned by the runtime user
+# before the volume is mounted: a fresh named volume inherits root ownership, and
+# the API creates the attachment root with mode 0700 at startup.
+RUN mkdir -p /data/objects /data/version-attachments \
+    && chown -R eztest:eztest /app /data/objects /data/version-attachments
 
 USER eztest
 

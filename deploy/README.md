@@ -83,13 +83,13 @@ Stop the stack without deleting data:
 docker compose --env-file .env -f deploy/docker-compose.yml down
 ```
 
-`down -v` deletes the `pgdata` and `objects` volumes.
+`down -v` deletes the `pgdata`, `objects` and `attachments` volumes.
 
 ## Ports, volumes and health
 
 | Service | Published port | Health check | Persistent data |
 |---|---|---|---|
-| `api` | 13333 | `GET /healthz` via wget | `objects` → `/data/objects` |
+| `api` | 13333 | `GET /healthz` via wget | `objects` → `/data/objects`; `attachments` → `/data/version-attachments` |
 | `web` | 6868 | `GET /login` via wget | — |
 | `postgres` | 5433 → 5432 | `pg_isready` | `pgdata` → `/var/lib/postgresql/data` |
 
@@ -124,6 +124,6 @@ node scripts/validate-compose.mjs
 ```
 
 The script uses the `yaml` dev dependency to assert services `api`/`web`/
-`postgres`, published ports, health checks, the `pgdata`/`objects` volumes and
-the `depends_on` / `service_healthy` ordering. It fails with exit code 1 and a
-list of problems. It does not need or contact a Docker daemon.
+`postgres`, published ports, health checks, the `pgdata`/`objects`/`attachments`
+volumes and the `depends_on` / `service_healthy` ordering. It fails with exit
+code 1 and a list of problems. It does not need or contact a Docker daemon.
