@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"time"
+	"sync"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	"github.com/EdouardRichard/EzTest/backend/internal/version/domain"
@@ -41,25 +41,18 @@ type VersionService struct {
 	resources ResourceCatalog
 	git       GitReader
 	events    EventPublisher
-	clock     Clock
 	ids       IDGenerator
 }
 
 // VersionServiceOption customises the service dependencies. Production wires
-// the process-wide Snowflake generator and wall clock; tests inject fixed ones.
+// the process-wide Snowflake generator; tests inject a fixed one.
 type VersionServiceOption func(*VersionService)
-
-// WithClock injects the clock.
-func WithClock(clock Clock) VersionServiceOption {
-	return func(s *VersionService) {
-		if clock != nil {
-			s.clock = clock
-		}
-	}
-}
 
 // WithIDGenerator injects the Snowflake ID generator. P3 ids are generated in
 // the application layer and passed explicitly to the repository (spec §5.4).
+// The composition root should inject one shared id.NewSnowflake(cfg.SnowflakeNodeID)
+// for the whole process (T16); without it, the package-wide DefaultIDGenerator
+// is used so services in one process cannot mint colliding ids.
 func WithIDGenerator(ids IDGenerator) VersionServiceOption {
 	return func(s *VersionService) {
 		if ids != nil {
@@ -68,34 +61,43 @@ func WithIDGenerator(ids IDGenerator) VersionServiceOption {
 	}
 }
 
-// systemClock is the production Clock.
-type systemClock struct{}
-
-// Now returns the current wall time.
-func (systemClock) Now() time.Time { return time.Now() }
-
-// defaultIDGenerator builds the fallback Snowflake generator used when the
-// composition root does not inject one. Node 1 is always valid; multi-instance
-// deployments must inject a per-instance generator with a unique node id.
-func defaultIDGenerator() IDGenerator {
+// defaultIDGenerator is the process-wide fallback Snowflake generator. It is a
+// sync.OnceValue so every VersionService constructed without WithIDGenerator
+// shares one generator, and therefore one node/sequence state. A per-service
+// fallback would let two services started in the same millisecond mint
+// identical ids (both begin at node 1, sequence 0).
+var defaultIDGenerator = sync.OnceValue(func() IDGenerator {
 	generator, err := id.NewSnowflake(1)
 	if err != nil {
 		panic(fmt.Sprintf("version: default snowflake generator: %v", err))
 	}
 	return generator
+})
+
+// DefaultIDGenerator returns the process-wide fallback Snowflake generator
+// (node 1). It is shared by every VersionService created without
+// WithIDGenerator. T9/T10 services may use it the same way.
+//
+// Production composition (T16) must replace it with one shared
+// id.NewSnowflake(cfg.SnowflakeNodeID) injected through WithIDGenerator: node 1
+// is only a safe fallback for a single process, while multi-instance
+// deployments need a node id unique per running instance.
+func DefaultIDGenerator() IDGenerator {
+	return defaultIDGenerator()
 }
 
 // NewVersionService wires the version use cases to their repository, the P2
-// resource catalog, the Git reader and the event publisher. Optional
-// dependencies (clock, id generator) are injected with VersionServiceOption.
+// resource catalog, the Git reader and the event publisher. The optional
+// WithIDGenerator injects the process-wide Snowflake generator; T16 must inject
+// one shared id.NewSnowflake(cfg.SnowflakeNodeID) so every service and every
+// instance uses a distinct node id.
 func NewVersionService(repo VersionRepository, resources ResourceCatalog, git GitReader, events EventPublisher, opts ...VersionServiceOption) *VersionService {
 	service := &VersionService{
 		repo:      repo,
 		resources: resources,
 		git:       git,
 		events:    events,
-		clock:     systemClock{},
-		ids:       defaultIDGenerator(),
+		ids:       DefaultIDGenerator(),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -235,12 +237,17 @@ func (s *VersionService) checkEnvironment(ctx context.Context, environmentID int
 		return domain.NewInvalid("environmentId", "environment_not_found",
 			fmt.Sprintf("environment %d is not active", environmentID))
 	}
-	// The catalog adapter sets the owning system. When it is present it must
-	// match the bound system; an adapter that cannot report it leaves the
-	// environment's system unverified (documented port limitation).
-	if ref.SystemID != nil && systemID != nil && *ref.SystemID != *systemID {
+	// Fail closed: the catalog adapter must report the environment's owning
+	// system. An environment whose ownership cannot be verified is rejected
+	// instead of being bound to an arbitrary system, and a reported owner must
+	// match the bound system (spec §6.8).
+	if ref.SystemID == nil {
 		return domain.NewInvalid("environmentId", "environment_system_mismatch",
-			fmt.Sprintf("environment %d does not belong to system %d", environmentID, *systemID))
+			fmt.Sprintf("environment %d does not report its owning system", environmentID))
+	}
+	if systemID == nil || *ref.SystemID != *systemID {
+		return domain.NewInvalid("environmentId", "environment_system_mismatch",
+			fmt.Sprintf("environment %d does not belong to the bound system", environmentID))
 	}
 	return nil
 }
@@ -279,7 +286,7 @@ func (s *VersionService) resolveRepositoryBinding(ctx context.Context, repositor
 	}
 	head, err := s.git.ResolveCommit(ctx, ref.LocalPath, resolvedBranch)
 	if err != nil {
-		return VersionBindings{}, mapGitError(err, resolvedBranch)
+		return VersionBindings{}, mapGitError(err)
 	}
 	if resolvedCommit == nil {
 		resolvedCommit = &head
@@ -304,7 +311,7 @@ func mapResourceLookupError(field string, err error) error {
 
 // mapGitError translates a GitReader adapter error into the version domain's
 // 422 validation error, preserving the stable branch/path reason.
-func mapGitError(err error, branch string) error {
+func mapGitError(err error) error {
 	var gitErr *GitError
 	if errors.As(err, &gitErr) && gitErr.Reason != "" {
 		field := "codeRepositoryId"
