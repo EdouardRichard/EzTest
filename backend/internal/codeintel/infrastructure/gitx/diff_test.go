@@ -12,6 +12,121 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/codeintel/infrastructure/gitx"
 )
 
+// TestFileDiffOversizedPatchReturnsEmptyTruncated pins design spec §6.1 and
+// ruling R18: a patch over maxBytes returns no error, an empty patch and
+// truncated=true; an exact fit is still returned whole.
+func TestFileDiffOversizedPatchReturnsEmptyTruncated(t *testing.T) {
+	fx := newTestRepo(t)
+	r := gitx.NewGitReader(gitx.GitConfig{CommandTimeout: 5 * time.Second})
+	ctx := context.Background()
+
+	full, err := r.FileDiff(ctx, fx.dir, fx.commit1, fx.commit2, "src/api/refund.ts", 1<<20)
+	if err != nil {
+		t.Fatalf("FileDiff(full): %v", err)
+	}
+	if full.Truncated || full.Patch == "" {
+		t.Fatalf("FileDiff(full) patch=%q truncated=%v want the whole patch", full.Patch, full.Truncated)
+	}
+
+	exact, err := r.FileDiff(ctx, fx.dir, fx.commit1, fx.commit2, "src/api/refund.ts", len(full.Patch))
+	if err != nil {
+		t.Fatalf("FileDiff(exact): %v", err)
+	}
+	if exact.Truncated || exact.Patch != full.Patch {
+		t.Fatalf("FileDiff(exact) len=%d truncated=%v want the exact-fit patch", len(exact.Patch), exact.Truncated)
+	}
+
+	oversized, err := r.FileDiff(ctx, fx.dir, fx.commit1, fx.commit2, "src/api/refund.ts", len(full.Patch)-1)
+	if err != nil {
+		t.Fatalf("FileDiff(oversized) returned %v, want the empty-patch contract", err)
+	}
+	if !oversized.Truncated || oversized.Patch != "" {
+		t.Fatalf("FileDiff(oversized) patch=%q truncated=%v want an empty patch marked truncated", oversized.Patch, oversized.Truncated)
+	}
+	if oversized.Status != "M" || oversized.Path != "src/api/refund.ts" || oversized.Binary {
+		t.Fatalf("FileDiff(oversized)=%+v want the change-set metadata preserved", oversized)
+	}
+}
+
+// TestFileDiffOutputOverflowReturnsTruncated pins R18 for the command bound: a
+// single-file patch above the 4 MiB stdout limit returns an empty truncated
+// patch, never an error.
+func TestFileDiffOutputOverflowReturnsTruncated(t *testing.T) {
+	dir := t.TempDir()
+	runGit(t, dir, "init", "-q", "-b", "main")
+	runGit(t, dir, "config", "user.email", testEmail)
+	runGit(t, dir, "config", "user.name", testAuthor)
+	runGit(t, dir, "config", "core.autocrlf", "false")
+	writeRepoFile(t, dir, "base.txt", "base\n")
+	base := commitRepo(t, dir, "base", commit1Date)
+	writeRepoFile(t, dir, "large.txt", strings.Repeat("x", 4<<20+1024)+"\n")
+	head := commitRepo(t, dir, "large", commit2Date)
+
+	r := gitx.NewGitReader(gitx.GitConfig{CommandTimeout: 10 * time.Second})
+	diff, err := r.FileDiff(context.Background(), dir, base, head, "large.txt", 1<<20)
+	if err != nil {
+		t.Fatalf("FileDiff(overflow) returned %v, want an empty truncated patch", err)
+	}
+	if !diff.Truncated || diff.Patch != "" {
+		t.Fatalf("FileDiff(overflow) patch=%q truncated=%v want an empty patch marked truncated", diff.Patch, diff.Truncated)
+	}
+}
+
+// TestFileDiffKeepsTextPatchContainingBinaryMarker is the regression test for
+// the removed text sniff: a text patch whose content contains the literal
+// "Binary files " must not be emptied or marked binary. Binary detection comes
+// only from the numstat "-" / change-set Binary flag.
+func TestFileDiffKeepsTextPatchContainingBinaryMarker(t *testing.T) {
+	fx := newTestRepo(t)
+	r := gitx.NewGitReader(gitx.GitConfig{CommandTimeout: 5 * time.Second})
+
+	diff, err := r.FileDiff(context.Background(), fx.dir, fx.commit1, fx.commit2, "src/notes/binary-note.txt", 1<<20)
+	if err != nil {
+		t.Fatalf("FileDiff(binary-marker): %v", err)
+	}
+	if diff.Binary {
+		t.Fatalf("FileDiff(binary-marker).Binary=true want false for a text file")
+	}
+	if diff.Truncated {
+		t.Fatalf("FileDiff(binary-marker).Truncated=true want false")
+	}
+	if !strings.Contains(diff.Patch, "@@") {
+		t.Fatalf("FileDiff(binary-marker) patch=%q want a unified diff", diff.Patch)
+	}
+	if !strings.Contains(diff.Patch, "Binary files a/logo.png and b/logo.png differ") {
+		t.Fatalf("FileDiff(binary-marker) patch=%q want the text line preserved", diff.Patch)
+	}
+}
+
+// TestFileDiffDisablesTextconv pins --no-textconv: a repository-configured
+// textconv driver must not execute or rewrite the returned patch.
+func TestFileDiffDisablesTextconv(t *testing.T) {
+	dir := t.TempDir()
+	runGit(t, dir, "init", "-q", "-b", "main")
+	runGit(t, dir, "config", "user.email", testEmail)
+	runGit(t, dir, "config", "user.name", testAuthor)
+	runGit(t, dir, "config", "core.autocrlf", "false")
+	runGit(t, dir, "config", "core.safecrlf", "false")
+	writeRepoFile(t, dir, "notes.txt", "alpha\nbeta\n")
+	base := commitRepo(t, dir, "base", commit1Date)
+	writeRepoFile(t, dir, "notes.txt", "alpha\ngamma\n")
+	writeRepoFile(t, dir, ".gitattributes", "notes.txt diff=upper\n")
+	head := commitRepo(t, dir, "head", commit2Date)
+	runGit(t, dir, "config", "diff.upper.textconv", "echo TEXTCONV")
+
+	r := gitx.NewGitReader(gitx.GitConfig{CommandTimeout: 5 * time.Second})
+	diff, err := r.FileDiff(context.Background(), dir, base, head, "notes.txt", 1<<20)
+	if err != nil {
+		t.Fatalf("FileDiff(textconv): %v", err)
+	}
+	if strings.Contains(diff.Patch, "TEXTCONV") {
+		t.Fatalf("FileDiff(textconv) patch=%q ran the repository textconv driver", diff.Patch)
+	}
+	if !strings.Contains(diff.Patch, "gamma") {
+		t.Fatalf("FileDiff(textconv) patch=%q want the real text content", diff.Patch)
+	}
+}
+
 // TestDiffStatuses pins the two-command file-level diff: statuses, rename old
 // paths, binary detection, head blob hashes, -z special file names and ordering.
 func TestDiffStatuses(t *testing.T) {
@@ -159,8 +274,8 @@ func TestDiffTruncatesAt2000(t *testing.T) {
 }
 
 // TestFileDiffStatusBinaryAndTruncation pins the on-demand unified diff:
-// change-set status, binary/deleted empty patches, byte truncation and the
-// not_changed rejection.
+// change-set status, the binary/deleted empty-patch rule, the oversize
+// empty-patch contract and the not_changed rejection.
 func TestFileDiffStatusBinaryAndTruncation(t *testing.T) {
 	fx := newTestRepo(t)
 	r := gitx.NewGitReader(gitx.GitConfig{CommandTimeout: 5 * time.Second})
@@ -200,8 +315,8 @@ func TestFileDiffStatusBinaryAndTruncation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FileDiff(truncated): %v", err)
 	}
-	if !truncated.Truncated || len(truncated.Patch) != 20 {
-		t.Fatalf("FileDiff(truncated) len=%d truncated=%v want exactly 20 bytes truncated", len(truncated.Patch), truncated.Truncated)
+	if !truncated.Truncated || truncated.Patch != "" {
+		t.Fatalf("FileDiff(truncated) patch=%q truncated=%v want an empty patch marked truncated", truncated.Patch, truncated.Truncated)
 	}
 
 	renamed, err := r.FileDiff(ctx, fx.dir, fx.commit1, fx.commit2, "src/api/refund-v2.ts", 1<<20)
