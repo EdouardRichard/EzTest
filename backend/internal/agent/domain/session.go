@@ -14,6 +14,12 @@ type Session struct {
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 	LastActivityAt time.Time
+	// ActivityChannel is the P0 event channel the session's activities are
+	// published on. Empty means the P1 default, agent:<session id>.
+	ActivityChannel string
+	// ActivityVersionID is the version the session is scoped to. It is
+	// forwarded on every activity event; nil for P1 sessions.
+	ActivityVersionID *string
 }
 
 // SessionSummary is one row of the session list: the session plus its active

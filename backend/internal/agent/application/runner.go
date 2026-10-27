@@ -116,7 +116,7 @@ func (s *RunService) run(ctx context.Context, runID int64, session domain.Sessio
 		profile: profile,
 		actor:   actor,
 		caller:  caller,
-		emitter: newActivityEmitter(s.deps.Events, session.ID, profile.Key),
+		emitter: newActivityEmitter(s.deps.Events, session.ID, profile.Key, session.ActivityChannel, session.ActivityVersionID),
 	}
 	execution.execute(ctx)
 }

@@ -72,10 +72,32 @@ func (s *SessionService) List(ctx context.Context, cursor int64, limit int, prof
 	return s.sessions.List(ctx, cursor, limit, profileID)
 }
 
-// Create creates a session on profileID, or on the builtin profile when
-// profileID is 0. A missing profile is domain.ErrNotFound; a disabled profile is
-// domain.ErrProfileDisabled. The title must be at most 120 characters.
+// SessionOptions carries the optional P3 activity-routing stamp of a new
+// session. The zero value keeps the P1 behavior: the session publishes on
+// agent:<session id> and carries no version reference.
+type SessionOptions struct {
+	ActivityChannel   string
+	ActivityVersionID *string
+}
+
+// sessionOptionsCreator is the optional repository extension that persists the
+// activity channel and version id. It stays a local interface so the domain
+// SessionRepository port (and every other fake of it) does not have to change.
+type sessionOptionsCreator interface {
+	CreateWithOptions(ctx context.Context, profileID int64, title string, createdBy *int64, channel string, versionID *string) (domain.Session, error)
+}
+
+// Create creates a session with the P1 defaults. It delegates to
+// CreateWithOptions with empty options.
 func (s *SessionService) Create(ctx context.Context, profileID int64, title string, actor *int64) (domain.Session, error) {
+	return s.CreateWithOptions(ctx, profileID, title, actor, SessionOptions{})
+}
+
+// CreateWithOptions creates a session on profileID, or on the builtin profile
+// when profileID is 0, stamping the optional activity channel and version id.
+// A missing profile is domain.ErrNotFound; a disabled profile is
+// domain.ErrProfileDisabled. The title must be at most 120 characters.
+func (s *SessionService) CreateWithOptions(ctx context.Context, profileID int64, title string, actor *int64, opts SessionOptions) (domain.Session, error) {
 	if err := validateSessionTitle(title); err != nil {
 		return domain.Session{}, err
 	}
@@ -86,7 +108,17 @@ func (s *SessionService) Create(ctx context.Context, profileID int64, title stri
 	if !profile.Enabled {
 		return domain.Session{}, domain.ErrProfileDisabled
 	}
-	return s.sessions.Create(ctx, profile.ID, title, actor)
+	creator, ok := s.sessions.(sessionOptionsCreator)
+	if !ok {
+		// A repository without the optional extension still serves P1 creates;
+		// a P3 create must fail loudly rather than silently drop the routing
+		// stamp and publish activities on the wrong channel.
+		if opts.ActivityChannel != "" || opts.ActivityVersionID != nil {
+			return domain.Session{}, fmt.Errorf("agent: session repository does not support activity channels")
+		}
+		return s.sessions.Create(ctx, profile.ID, title, actor)
+	}
+	return creator.CreateWithOptions(ctx, profile.ID, title, actor, opts.ActivityChannel, opts.ActivityVersionID)
 }
 
 // profileForSession resolves the profile a new session is created on. A zero id

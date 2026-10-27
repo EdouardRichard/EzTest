@@ -61,6 +61,10 @@ type svcFakeSessionRepository struct {
 	createdTitle     string
 	createdBy        *int64
 
+	createWithOptionsCalls int
+	createdChannel         string
+	createdVersionID       *string
+
 	updateTitleSession domain.Session
 	updateTitleErr     error
 	updateTitleID      int64
@@ -93,6 +97,15 @@ func (r *svcFakeSessionRepository) Create(_ context.Context, profileID int64, ti
 		return domain.Session{}, r.createErr
 	}
 	return r.created, nil
+}
+
+// CreateWithOptions records the P3 channel stamp. The service reaches it
+// through its optional repository extension.
+func (r *svcFakeSessionRepository) CreateWithOptions(ctx context.Context, profileID int64, title string, createdBy *int64, channel string, versionID *string) (domain.Session, error) {
+	r.createWithOptionsCalls++
+	r.createdChannel = channel
+	r.createdVersionID = versionID
+	return r.Create(ctx, profileID, title, createdBy)
 }
 
 // Get returns the configured session or ErrNotFound.
@@ -480,6 +493,64 @@ func TestSessionCreateDefaultsProfile(t *testing.T) {
 		}
 		if sessions.createCalls != 0 {
 			t.Fatalf("repository Create called %d times, want 0", sessions.createCalls)
+		}
+	})
+}
+
+// TestCreateWithOptionsPersistsChannel pins the P3 session stamp: Create keeps
+// the P1 empty channel, while CreateWithOptions forwards the version channel
+// and version id to the repository.
+func TestCreateWithOptionsPersistsChannel(t *testing.T) {
+	builtin := svcTestProfile(2)
+	profiles := &svcFakeProfileRepository{profiles: []domain.AgentProfile{builtin}}
+
+	t.Run("P1 Create keeps the default empty channel", func(t *testing.T) {
+		sessions := &svcFakeSessionRepository{created: domain.Session{ID: 11, ProfileID: 2}}
+		svc := svcTestSessionService(profiles, sessions, &svcFakeRunRepository{},
+			&svcFakeMessageRepository{}, &svcFakeRunController{}, &svcFakeAuditSink{})
+
+		if _, err := svc.Create(context.Background(), 0, "检查运行时健康", nil); err != nil {
+			t.Fatalf("Create returned error: %v", err)
+		}
+		if sessions.createWithOptionsCalls != 1 {
+			t.Fatalf("repository CreateWithOptions calls=%d want 1 (Create must delegate)", sessions.createWithOptionsCalls)
+		}
+		if sessions.createdChannel != "" {
+			t.Fatalf("repository activity_channel=%q want the empty P1 default", sessions.createdChannel)
+		}
+		if sessions.createdVersionID != nil {
+			t.Fatalf("repository activity_version_id=%v want nil", sessions.createdVersionID)
+		}
+	})
+
+	t.Run("P3 CreateWithOptions persists the version channel and version id", func(t *testing.T) {
+		versionID := "42"
+		sessions := &svcFakeSessionRepository{created: domain.Session{ID: 12, ProfileID: 2}}
+		svc := svcTestSessionService(profiles, sessions, &svcFakeRunRepository{},
+			&svcFakeMessageRepository{}, &svcFakeRunController{}, &svcFakeAuditSink{})
+		actor := int64(3)
+
+		session, err := svc.CreateWithOptions(context.Background(), 0, "需求评审", &actor, application.SessionOptions{
+			ActivityChannel:   "version:42",
+			ActivityVersionID: &versionID,
+		})
+		if err != nil {
+			t.Fatalf("CreateWithOptions returned error: %v", err)
+		}
+		if session.ID != 12 {
+			t.Fatalf("CreateWithOptions returned session %+v want the repository result", session)
+		}
+		if sessions.createdChannel != "version:42" {
+			t.Fatalf("repository activity_channel=%q want version:42", sessions.createdChannel)
+		}
+		if sessions.createdVersionID == nil || *sessions.createdVersionID != versionID {
+			t.Fatalf("repository activity_version_id=%v want %q", sessions.createdVersionID, versionID)
+		}
+		if sessions.createdProfileID != 2 || sessions.createdTitle != "需求评审" {
+			t.Fatalf("repository profile/title=%d/%q want 2/需求评审", sessions.createdProfileID, sessions.createdTitle)
+		}
+		if sessions.createdBy == nil || *sessions.createdBy != actor {
+			t.Fatalf("repository created_by=%v want %d", sessions.createdBy, actor)
 		}
 	})
 }

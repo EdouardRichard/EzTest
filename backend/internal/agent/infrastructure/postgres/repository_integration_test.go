@@ -841,6 +841,110 @@ func TestSessionUpdateTitleAndDeleteCascade(t *testing.T) {
 	}
 }
 
+// TestCreateWithOptionsAndRunningByChannel pins the P3 session stamp and the
+// deletion guard: the channel and version id round-trip through Create, Get and
+// List, and HasRunningByChannel follows the run status of the stamped session.
+func TestCreateWithOptionsAndRunningByChannel(t *testing.T) {
+	pool := testutil.OpenTestDB(t)
+	profile := seedProfile(t, pool)
+	sessions := postgres.NewSessionRepository(pool)
+	runs := postgres.NewRunRepository(pool)
+
+	versionID := "42"
+	session, err := sessions.CreateWithOptions(ctx, profile.ID, "需求评审", nil, "version:42", &versionID)
+	if err != nil {
+		t.Fatalf("create session with options: %v", err)
+	}
+	if session.ActivityChannel != "version:42" {
+		t.Fatalf("created session activity_channel=%q want version:42", session.ActivityChannel)
+	}
+	if session.ActivityVersionID == nil || *session.ActivityVersionID != versionID {
+		t.Fatalf("created session activity_version_id=%v want %q", session.ActivityVersionID, versionID)
+	}
+
+	stored, err := sessions.Get(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("get created session: %v", err)
+	}
+	if stored.ActivityChannel != "version:42" || stored.ActivityVersionID == nil || *stored.ActivityVersionID != versionID {
+		t.Fatalf("stored session channel=%q version_id=%v want version:42/%q",
+			stored.ActivityChannel, stored.ActivityVersionID, versionID)
+	}
+
+	// The P1 default stays empty: Create writes neither a channel nor a version.
+	defaultSession, err := sessions.Create(ctx, profile.ID, "", nil)
+	if err != nil {
+		t.Fatalf("create default session: %v", err)
+	}
+	if defaultSession.ActivityChannel != "" || defaultSession.ActivityVersionID != nil {
+		t.Fatalf("default session channel=%q version_id=%v want empty/nil",
+			defaultSession.ActivityChannel, defaultSession.ActivityVersionID)
+	}
+
+	// List carries the stamp of every session, not just Get.
+	summaries, _, err := sessions.List(ctx, 0, 10, nil)
+	if err != nil {
+		t.Fatalf("list sessions: %v", err)
+	}
+	var listed *agent.SessionSummary
+	for i := range summaries {
+		if summaries[i].Session.ID == session.ID {
+			listed = &summaries[i]
+			break
+		}
+	}
+	if listed == nil {
+		t.Fatalf("created session %d is missing from the list", session.ID)
+	}
+	if listed.Session.ActivityChannel != "version:42" || listed.Session.ActivityVersionID == nil || *listed.Session.ActivityVersionID != versionID {
+		t.Fatalf("listed session channel=%q version_id=%v want version:42/%q",
+			listed.Session.ActivityChannel, listed.Session.ActivityVersionID, versionID)
+	}
+
+	// No running run yet: the channel is idle.
+	running, err := sessions.HasRunningByChannel(ctx, "version:42")
+	if err != nil {
+		t.Fatalf("has running by channel before the run: %v", err)
+	}
+	if running {
+		t.Fatal("HasRunningByChannel(version:42)=true before any run was created")
+	}
+
+	turn, err := runs.CreateTurn(ctx, session.ID, []agent.Part{{Type: "text", Text: "hello"}}, "hello")
+	if err != nil {
+		t.Fatalf("create running turn: %v", err)
+	}
+	running, err = sessions.HasRunningByChannel(ctx, "version:42")
+	if err != nil {
+		t.Fatalf("has running by channel with a running run: %v", err)
+	}
+	if !running {
+		t.Fatal("HasRunningByChannel(version:42)=false while the stamped session has a running run")
+	}
+	running, err = sessions.HasRunningByChannel(ctx, "version:99")
+	if err != nil {
+		t.Fatalf("has running by channel of an unrelated channel: %v", err)
+	}
+	if running {
+		t.Fatal("HasRunningByChannel(version:99)=true, want false for an unrelated channel")
+	}
+
+	if err := runs.Finish(ctx, turn.RunID, agent.RunResult{
+		Status:         agent.RunDone,
+		TerminalReason: agent.ReasonCompleted,
+		Turns:          1,
+	}); err != nil {
+		t.Fatalf("finish running turn: %v", err)
+	}
+	running, err = sessions.HasRunningByChannel(ctx, "version:42")
+	if err != nil {
+		t.Fatalf("has running by channel after the run finished: %v", err)
+	}
+	if running {
+		t.Fatal("HasRunningByChannel(version:42)=true after the run finished")
+	}
+}
+
 // TestRepositoryMapsMissingParentsToNotFound pins the foreign-key mapping of
 // the create paths: a session, run or profile that does not exist surfaces as
 // domain.ErrNotFound, never as a raw constraint error.
