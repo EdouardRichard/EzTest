@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
 // ActionRunAborted is the audit action recorded when a run is stopped by a
@@ -184,6 +185,12 @@ func (s *RunService) Start(ctx context.Context, sessionID int64, message string,
 	// Registration publishes nothing, so the activity order (user_message
 	// before run_started) is unchanged.
 	runCtx, cancel := context.WithCancelCause(s.rootCtx)
+	// The run outlives the HTTP request that started it, but its audit entries
+	// must stay correlated with that request. Copy the request ID onto the run
+	// context so the runner and tool executor inherit it (T19).
+	if requestID := platform.RequestID(ctx); requestID != "" {
+		runCtx = WithRequestID(runCtx, requestID)
+	}
 	s.mu.Lock()
 	s.active[sessionID] = activeRun{runID: ids.RunID, cancel: cancel}
 	s.mu.Unlock()

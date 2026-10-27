@@ -13,6 +13,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	agenttools "github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/tools"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
 // runTestState is the shared in-memory store behind the fake repositories.
@@ -482,16 +483,20 @@ func (f *runFakeEvents) snapshot() []application.ActivityEvent {
 	return append([]application.ActivityEvent(nil), f.events...)
 }
 
-// runFakeAudit implements AuditSink.
+// runFakeAudit implements AuditSink. Next to every event it captures the
+// request ID carried by the Record context, so tests can pin that the run
+// goroutine's audit entries stay correlated with the originating request.
 type runFakeAudit struct {
-	mu     sync.Mutex
-	events []application.AuditEvent
+	mu         sync.Mutex
+	events     []application.AuditEvent
+	requestIDs []string
 }
 
-func (f *runFakeAudit) Record(_ context.Context, event application.AuditEvent) error {
+func (f *runFakeAudit) Record(ctx context.Context, event application.AuditEvent) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.events = append(f.events, event)
+	f.requestIDs = append(f.requestIDs, application.RequestIDFromContext(ctx))
 	return nil
 }
 
@@ -499,6 +504,20 @@ func (f *runFakeAudit) snapshot() []application.AuditEvent {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]application.AuditEvent(nil), f.events...)
+}
+
+// requestIDsByAction returns the request ID captured alongside every event
+// with the given action, in record order.
+func (f *runFakeAudit) requestIDsByAction(action string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ids := make([]string, 0, len(f.events))
+	for index, event := range f.events {
+		if event.Action == action {
+			ids = append(ids, f.requestIDs[index])
+		}
+	}
+	return ids
 }
 
 // runFakeBlockingTool blocks in Execute until the run context ends.
@@ -1814,5 +1833,45 @@ func TestToolDeniedEmitsDecision(t *testing.T) {
 	}
 	if messages[3].Role != "assistant" || messages[3].Parts[0].Text != answer {
 		t.Fatalf("final assistant=%+v want %q", messages[3], answer)
+	}
+}
+
+// TestToolAuditCarriesOriginatingRequestID pins the T19 contract: the runner
+// goroutine does not inherit the HTTP request context, so Start must copy the
+// request ID onto the run context; otherwise agent.tool.invoked audit rows lose
+// the correlation their sibling request-scoped audit rows already carry.
+func TestToolAuditCarriesOriginatingRequestID(t *testing.T) {
+	const requestID = "req_tool_audit_1"
+
+	profile := runTestProfile(t)
+	state := runTestNewState(t, profile, 7)
+	caller := &runFakeCaller{
+		model:         "deepseek-flash",
+		contextWindow: 100000,
+		scripts: []runFakeScript{
+			{events: []application.LLMStreamEvent{{
+				Done:         true,
+				FinishReason: "tool_calls",
+				ToolCalls: []domain.ToolCall{
+					{ID: "call_1", Name: "test.echo", Arguments: `{"text":"README"}`},
+				},
+			}}},
+			{events: []application.LLMStreamEvent{{Done: true, FinishReason: "stop"}}},
+		},
+	}
+	service, _, audit := runTestNewService(t, state, caller)
+
+	ctx := platform.WithRequestID(context.Background(), requestID)
+	if _, err := service.Start(ctx, 7, "审计请求关联", nil); err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+	runTestWaitIdle(t, service, 7)
+
+	ids := audit.requestIDsByAction(application.ActionToolInvoked)
+	if len(ids) != 1 {
+		t.Fatalf("agent.tool.invoked audit entries=%d want 1", len(ids))
+	}
+	if ids[0] != requestID {
+		t.Fatalf("agent.tool.invoked request_id=%q want %q", ids[0], requestID)
 	}
 }
