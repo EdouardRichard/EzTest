@@ -292,10 +292,86 @@ func (s *RunService) Shutdown(ctx context.Context) {
 	}
 }
 
+// interruptedRunLister is the optional startup-recovery query implemented by
+// the postgres run repository. It stays a local interface so the domain
+// RunRepository port (and every other fake of it) does not have to change.
+type interruptedRunLister interface {
+	ListRunningInterrupted(ctx context.Context) ([]domain.Run, error)
+}
+
 // RecoverInterrupted marks runs left running by a previous process as
-// interrupted and reports how many were changed.
+// interrupted and publishes a synthetic run_finished activity for each one, so
+// an open console leaves its running state after a crash instead of waiting for
+// an event that will never arrive.
+//
+// The rows are listed first (the database sets ended_at during the update and
+// the in-memory copy is used for the event detail), then marked, and only then
+// are the events published: the DB update must be visible before the event.
+// Event publication is advisory; only the repository errors are returned.
 func (s *RunService) RecoverInterrupted(ctx context.Context) (int64, error) {
-	return s.deps.Runs.MarkRunningInterrupted(ctx)
+	var interrupted []domain.Run
+	if lister, ok := s.deps.Runs.(interruptedRunLister); ok {
+		runs, err := lister.ListRunningInterrupted(ctx)
+		if err != nil {
+			return 0, err
+		}
+		interrupted = runs
+	}
+
+	count, err := s.deps.Runs.MarkRunningInterrupted(ctx)
+	if err != nil {
+		return count, err
+	}
+	for _, run := range interrupted {
+		s.emitRecoveredRunFinished(ctx, run)
+	}
+	return count, nil
+}
+
+// emitRecoveredRunFinished publishes the terminal activity the crashed process
+// never got to publish. The event carries the run's usage and duration; the
+// envelope uses the session's channel and its profile key as agent_role. A nil
+// sink, an unresolvable session/profile or a failing sink only logs: recovery
+// must not fail because of an advisory event.
+func (s *RunService) emitRecoveredRunFinished(ctx context.Context, run domain.Run) {
+	if s.deps.Events == nil {
+		return
+	}
+	session, err := s.deps.Sessions.Get(ctx, run.SessionID)
+	if err != nil {
+		slog.ErrorContext(ctx, "agent: load recovered run session", "run_id", run.ID, "session_id", run.SessionID, "error", err)
+		return
+	}
+	profile, err := s.deps.Profiles.Get(ctx, session.ProfileID)
+	if err != nil {
+		slog.ErrorContext(ctx, "agent: load recovered run profile", "run_id", run.ID, "profile_id", session.ProfileID, "error", err)
+		return
+	}
+
+	end := s.now()
+	if run.EndedAt != nil && !run.EndedAt.IsZero() {
+		end = *run.EndedAt
+	}
+	durationMS := end.Sub(run.StartedAt).Milliseconds()
+	if durationMS < 0 {
+		durationMS = 0
+	}
+
+	detail := map[string]any{
+		"status":          string(domain.RunInterrupted),
+		"terminal_reason": string(domain.ReasonInterrupted),
+		"turns":           run.Turns,
+		"duration_ms":     durationMS,
+		"usage": map[string]any{
+			"prompt":     run.InputTokens,
+			"completion": run.OutputTokens,
+			"reasoning":  run.ReasoningTokens,
+			"total":      run.InputTokens + run.OutputTokens,
+		},
+	}
+	emitter := newActivityEmitter(s.deps.Events, run.SessionID, profile.Key)
+	_ = emitter.emit(ctx, run.ID, domain.KindRunFinished,
+		"运行结束："+string(domain.ReasonInterrupted), detail)
 }
 
 // isActive reports whether the session currently has a registered run.

@@ -217,6 +217,32 @@ func (r *RunRepository) Finish(ctx context.Context, runID int64, result agent.Ru
 	return nil
 }
 
+// ListRunningInterrupted returns the runs still marked running, in id order.
+// Startup recovery uses it to know which runs it is about to mark interrupted,
+// so it can publish their terminal activity. It is intentionally not part of
+// the domain RunRepository port: only the recovery path needs it.
+func (r *RunRepository) ListRunningInterrupted(ctx context.Context) ([]agent.Run, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT `+runColumnList+` FROM agent_runs WHERE status = 'running' ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list running agent runs: %w", err)
+	}
+	defer rows.Close()
+
+	runs := make([]agent.Run, 0)
+	for rows.Next() {
+		run, err := scanRun(rows)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: scan running agent run: %w", err)
+		}
+		runs = append(runs, run)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: list running agent runs: %w", err)
+	}
+	return runs, nil
+}
+
 // MarkRunningInterrupted is the process-restart recovery hook: every run still
 // marked running belongs to a process that is gone, because a run is only
 // created and finished by the live in-process runner.
