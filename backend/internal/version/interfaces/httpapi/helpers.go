@@ -149,18 +149,80 @@ func WriteServiceError(w http.ResponseWriter, r *http.Request, err error) {
 // malformed value is a 400 instead of a repository failure. The cursor string
 // itself is passed through untouched to the repository.
 func ParsePage(r *http.Request) (domain.Page, error) {
-	query := r.URL.Query()
-	limit, err := platform.ParseLimit(query.Get("limit"))
+	limit, err := ParseQueryLimit(r)
 	if err != nil {
-		return domain.Page{}, newBadRequest("limit", "invalid_limit",
-			"limit must be an integer between 1 and 100")
+		return domain.Page{}, err
 	}
-	cursor := query.Get("cursor")
+	cursor := r.URL.Query().Get("cursor")
 	if _, err := platform.DecodeCursor(cursor); err != nil {
 		return domain.Page{}, newBadRequest("cursor", "invalid_cursor",
 			"cursor is not a valid pagination cursor")
 	}
 	return domain.Page{Limit: limit, Cursor: cursor}, nil
+}
+
+// ParseQueryLimit parses the limit query parameter alone, for the endpoints that
+// page with a raw numeric cursor (P1 message ids, event sequence numbers) instead
+// of the opaque cursor of ParsePage.
+func ParseQueryLimit(r *http.Request) (int, error) {
+	limit, err := platform.ParseLimit(r.URL.Query().Get("limit"))
+	if err != nil {
+		return 0, newBadRequest("limit", "invalid_limit",
+			"limit must be an integer between 1 and 100")
+	}
+	return limit, nil
+}
+
+// ParseBeforeID parses the optional raw P1 message id of ?before_id=. The value
+// is deliberately not a P3 snowflake string: clarification messages are P1
+// agent_messages and page backwards by their numeric ids (spec §7.5). An empty
+// value means "the newest page".
+func ParseBeforeID(r *http.Request) (int64, error) {
+	raw := strings.TrimSpace(r.URL.Query().Get("before_id"))
+	if raw == "" {
+		return 0, nil
+	}
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || id < 0 {
+		return 0, newBadRequest("before_id", "invalid_before_id",
+			"before_id must be a non-negative decimal message id")
+	}
+	return id, nil
+}
+
+// ParseBeforeSeq parses the optional ?before_seq= upper bound of the version
+// event snapshot. An empty value means the newest events.
+func ParseBeforeSeq(r *http.Request) (int64, error) {
+	raw := strings.TrimSpace(r.URL.Query().Get("before_seq"))
+	if raw == "" {
+		return 0, nil
+	}
+	seq, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || seq < 0 {
+		return 0, newBadRequest("before_seq", "invalid_before_seq",
+			"before_seq must be a non-negative decimal sequence number")
+	}
+	return seq, nil
+}
+
+// ParseOptionalQueryID parses one optional decimal-id filter query parameter.
+// An empty value means "no filter"; a malformed or non-positive value is a 400.
+func ParseOptionalQueryID(r *http.Request, name string) (*int64, error) {
+	raw := strings.TrimSpace(r.URL.Query().Get(name))
+	if raw == "" {
+		return nil, nil
+	}
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || id <= 0 {
+		return nil, newBadRequest(name, "invalid_id", name+" must be a positive decimal id")
+	}
+	return &id, nil
+}
+
+// versionChannel returns the event channel of one version (spec §6.11): every
+// P3 event is published on channel=version:{id}.
+func versionChannel(versionID int64) string {
+	return "version:" + strconv.FormatInt(versionID, 10)
 }
 
 // PathID parses a positive decimal {name} path value. P3 ids are 64-bit
