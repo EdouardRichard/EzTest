@@ -1,10 +1,10 @@
 openapi: 3.0.3
 info:
   title: EzTest API
-  version: 0.2.0
+  version: 0.3.0
   description: |
-    Hand-maintained OpenAPI document for the EzTest API: the P0 foundation and
-    the P1 Agent runtime.
+    Hand-maintained OpenAPI document for the EzTest API: the P0 foundation, the
+    P1 Agent runtime and the P2 resource context.
 
     Conventions:
     - Successful responses use the `{"data": ...}` envelope. List endpoints add
@@ -32,6 +32,13 @@ info:
       `agent:{session_id}` channel; reading or streaming an `agent:` channel
       also requires an administrator (403 `forbidden` otherwise). See
       AgentActivityDetail for the frozen V1 nine-kind detail contract.
+    - P2 resource endpoints under `/api/resources` use camelCase payload fields
+      (the P2 DTOs), unlike the snake_case P0/P1 payloads. Every authenticated
+      user may read; every write and action is administrator-only. Stored
+      credentials and session `storageState` documents are write-only: an
+      Access exposes only `credentialSet`, and a Session exposes only the
+      storage-state hash and shape counts. The company is always the seeded
+      default one, so requests never carry a `companyId`.
 
     This document is served publicly at `GET /api/openapi.yaml`; it is the same
     file under `docs/openapi/api.yaml` in the repository.
@@ -48,6 +55,8 @@ tags:
   - name: stream
   - name: storage
   - name: audit
+  - name: resources
+  - name: code-repos
   - name: health
 security: []
 paths:
@@ -1136,6 +1145,1437 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '500':
           $ref: '#/components/responses/Internal'
+  # --- P2 resource context (/api/resources) -------------------------------
+  # Reads require a bearer token only; every write and action route is
+  # administrator-only (403 for a regular user). P2 payload fields are
+  # camelCase, unlike the P0/P1 snake_case API. Responses never carry a stored
+  # credential or a session storage_state: Access exposes credentialSet and
+  # Session exposes only its hash and shape counts.
+  /api/resources/systems:
+    get:
+      tags: [resources]
+      summary: List systems
+      description: One cursor-paged list ordered by ID ascending.
+      operationId: listSystems
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: status
+          in: query
+          required: false
+          description: Exact status filter.
+          schema:
+            type: string
+            enum: [active, disabled]
+        - name: kind
+          in: query
+          required: false
+          description: Exact system kind filter.
+          schema:
+            type: string
+            enum: [web, api]
+      responses:
+        '200':
+          description: One page of systems.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemList'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [resources]
+      summary: Create a system (admin only)
+      description: The company is fixed to the seeded default one; requests never carry a companyId.
+      operationId: createSystem
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSystemRequest'
+      responses:
+        '201':
+          description: The created system.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/ResourceConflict'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/systems/{id}:
+    get:
+      tags: [resources]
+      summary: Get one system
+      operationId: getSystem
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceSystemId'
+      responses:
+        '200':
+          description: The system.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+    patch:
+      tags: [resources]
+      summary: Update a system (admin only)
+      description: Every field is optional; omitted fields keep their stored value. The key is immutable.
+      operationId: updateSystem
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceSystemId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateSystemRequest'
+      responses:
+        '200':
+          description: The updated system.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+    delete:
+      tags: [resources]
+      summary: Delete a system (admin only)
+      description: A system that still has environments or accesses is 409 with details.reason=has_dependencies.
+      operationId: deleteSystem
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceSystemId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: The system was deleted.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ResourceConflict'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/systems/{id}/environments:
+    get:
+      tags: [resources]
+      summary: List a system's environments
+      description: Unpaginated; every environment of the system ordered by ID ascending.
+      operationId: listEnvironments
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceSystemId'
+      responses:
+        '200':
+          description: Every environment of the system.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnvironmentList'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [resources]
+      summary: Create an environment (admin only)
+      operationId: createEnvironment
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceSystemId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateEnvironmentRequest'
+      responses:
+        '201':
+          description: The created environment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnvironmentEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ResourceConflict'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/environments/{id}:
+    get:
+      tags: [resources]
+      summary: Get one environment
+      operationId: getEnvironment
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceEnvironmentId'
+      responses:
+        '200':
+          description: The environment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnvironmentEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+    patch:
+      tags: [resources]
+      summary: Update an environment (admin only)
+      description: |
+        Every field is optional; omitted fields keep their stored value. An
+        explicit "loginCheck": null clears the stored login check.
+      operationId: updateEnvironment
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceEnvironmentId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateEnvironmentRequest'
+      responses:
+        '200':
+          description: The updated environment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnvironmentEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+    delete:
+      tags: [resources]
+      summary: Delete an environment (admin only)
+      description: An environment that still has sessions is 409 with details.reason=has_dependencies.
+      operationId: deleteEnvironment
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceEnvironmentId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: The environment was deleted.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ResourceConflict'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/systems/{id}/app-models:
+    get:
+      tags: [resources]
+      summary: List a system's app model nodes
+      description: One cursor-paged list ordered by ID ascending, optionally filtered by kind and parentKey.
+      operationId: listAppModels
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceSystemId'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: kind
+          in: query
+          required: false
+          description: Exact node kind filter.
+          schema:
+            type: string
+            enum: [page, route, api, component]
+        - name: parentKey
+          in: query
+          required: false
+          description: Return only the direct children of this node key.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: One page of app model nodes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppModelList'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [resources]
+      summary: Create an app model node (admin only)
+      description: The node key and kind are immutable after creation.
+      operationId: createAppModel
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceSystemId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAppModelRequest'
+      responses:
+        '201':
+          description: The created node.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppModelEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ResourceConflict'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/systems/{id}/app-models/import:
+    post:
+      tags: [resources]
+      summary: Import app model nodes (admin only)
+      description: |
+        Upserts up to 5000 nodes by (systemId, key). parentKey resolves against
+        nodes created earlier in the same batch or already stored.
+      operationId: importAppModels
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceSystemId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImportAppModelsRequest'
+      responses:
+        '200':
+          description: The number of created and updated nodes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppModelImportResultEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ResourceConflict'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/app-models/{id}:
+    get:
+      tags: [resources]
+      summary: Get one app model node
+      operationId: getAppModel
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceAppModelId'
+      responses:
+        '200':
+          description: The app model node.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppModelEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+    patch:
+      tags: [resources]
+      summary: Update an app model node (admin only)
+      description: Every field is optional; key and kind are immutable.
+      operationId: updateAppModel
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceAppModelId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAppModelRequest'
+      responses:
+        '200':
+          description: The updated node.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppModelEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+    delete:
+      tags: [resources]
+      summary: Delete an app model node and its subtree (admin only)
+      operationId: deleteAppModel
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceAppModelId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: The node and its subtree were deleted.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/accounts:
+    get:
+      tags: [resources]
+      summary: List accounts
+      description: One cursor-paged list ordered by ID ascending.
+      operationId: listAccounts
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: status
+          in: query
+          required: false
+          description: Exact status filter.
+          schema:
+            type: string
+            enum: [active, disabled]
+        - name: kind
+          in: query
+          required: false
+          description: Exact account kind filter.
+          schema:
+            type: string
+            enum: [human, service]
+      responses:
+        '200':
+          description: One page of accounts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountList'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [resources]
+      summary: Create an account (admin only)
+      description: The account belongs to the seeded default company; the key is immutable.
+      operationId: createAccount
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAccountRequest'
+      responses:
+        '201':
+          description: The created account.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/ResourceConflict'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/accounts/{id}:
+    get:
+      tags: [resources]
+      summary: Get one account
+      operationId: getAccount
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceAccountId'
+      responses:
+        '200':
+          description: The account.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+    patch:
+      tags: [resources]
+      summary: Update an account (admin only)
+      description: Every field is optional; the key is immutable.
+      operationId: updateAccount
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceAccountId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAccountRequest'
+      responses:
+        '200':
+          description: The updated account.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+    delete:
+      tags: [resources]
+      summary: Delete an account (admin only)
+      description: An account that still has accesses or sessions is 409 with details.reason=has_dependencies.
+      operationId: deleteAccount
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceAccountId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: The account was deleted.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ResourceConflict'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/accounts/{id}/accesses:
+    get:
+      tags: [resources]
+      summary: List an account's accesses
+      description: Unpaginated; every access of the account ordered by ID ascending.
+      operationId: listAccountAccesses
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceAccountId'
+      responses:
+        '200':
+          description: Every access of the account, without credentials.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccessList'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [resources]
+      summary: Create an access (admin only)
+      description: The credential is write-only; the response exposes only credentialSet.
+      operationId: createAccess
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceAccountId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAccessRequest'
+      responses:
+        '201':
+          description: The created access with credentialSet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccessEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ResourceConflict'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/accesses/{id}:
+    get:
+      tags: [resources]
+      summary: Get one access
+      description: The response never carries the stored credential.
+      operationId: getAccess
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceAccessId'
+      responses:
+        '200':
+          description: The access with credentialSet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccessEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+    patch:
+      tags: [resources]
+      summary: Update an access (admin only)
+      description: |
+        Every field is optional. credential follows the write-only rule:
+        omitted keeps the stored value, "" clears it and a non-empty value
+        replaces it. An explicit "sessionTtlSeconds": null clears the TTL
+        override. systemId is accepted for form compatibility and ignored.
+      operationId: updateAccess
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceAccessId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAccessRequest'
+      responses:
+        '200':
+          description: The updated access with credentialSet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccessEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+    delete:
+      tags: [resources]
+      summary: Delete an access (admin only)
+      description: An access that still has sessions is 409 with details.reason=has_dependencies.
+      operationId: deleteAccess
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceAccessId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: The access was deleted.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ResourceConflict'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/accesses/{id}/sessions:
+    post:
+      tags: [resources]
+      summary: Import a session from a stored login state (admin only)
+      description: |
+        Creates a session from a Playwright storage-state document or a token
+        header map and runs the environment login_check. The response session is
+        valid or needs_manual and includes latestSnapshot. storageState and the
+        token headers are write-only; they never appear in a response.
+      operationId: importSession
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceAccessId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImportSessionRequest'
+            example:
+              environmentId: 12
+              kind: storage_state
+              storageState:
+                cookies: []
+                origins: []
+              note: manual import
+      responses:
+        '201':
+          description: The created session with its latest snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/sessions:
+    get:
+      tags: [resources]
+      summary: List sessions
+      description: One cursor-paged list ordered by ID ascending.
+      operationId: listSessions
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: accountId
+          in: query
+          required: false
+          description: Exact account filter (positive integer).
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+        - name: systemId
+          in: query
+          required: false
+          description: Exact system filter (positive integer).
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+        - name: environmentId
+          in: query
+          required: false
+          description: Exact environment filter (positive integer).
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+        - name: state
+          in: query
+          required: false
+          description: Exact session state filter.
+          schema:
+            type: string
+            enum: [pending, acquiring, needs_manual, valid, refreshing, expired, invalid, revoked, failed]
+      responses:
+        '200':
+          description: One page of sessions (list shape, no detail relations).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionList'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/sessions/{id}:
+    get:
+      tags: [resources]
+      summary: Get one session
+      description: Returns the session plus its latest snapshot, active lease and latest takeover.
+      operationId: getSession
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceSessionId'
+      responses:
+        '200':
+          description: The session detail. Never includes storage_state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/sessions/{id}/snapshots:
+    get:
+      tags: [resources]
+      summary: List a session's snapshots
+      description: One cursor-paged list ordered by ID ascending.
+      operationId: listSessionSnapshots
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceSessionId'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of snapshots.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SnapshotList'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/sessions/{id}/validate:
+    post:
+      tags: [resources]
+      summary: Re-run the environment login_check (admin only)
+      description: Allowed from pending, needs_manual, valid, expired or invalid; a disallowed state is 409 session_state_conflict.
+      operationId: validateSession
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceSessionId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The updated session with its latest snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ResourceConflict'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/sessions/{id}/confirm:
+    post:
+      tags: [resources]
+      summary: Manually confirm a session as valid (admin only)
+      description: Allowed only from pending or needs_manual; a disallowed state is 409 session_state_conflict.
+      operationId: confirmSession
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceSessionId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfirmSessionRequest'
+      responses:
+        '200':
+          description: The confirmed session.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ResourceConflict'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/sessions/{id}/invalidate:
+    post:
+      tags: [resources]
+      summary: Invalidate a session (admin only)
+      description: Allowed from valid, needs_manual or expired; a disallowed state is 409 session_state_conflict.
+      operationId: invalidateSession
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceSessionId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonRequest'
+      responses:
+        '200':
+          description: The invalidated session.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ResourceConflict'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/sessions/{id}/revoke:
+    post:
+      tags: [resources]
+      summary: Revoke a session (admin only)
+      description: Allowed from any state except revoked; a revoked session is 409 session_state_conflict.
+      operationId: revokeSession
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceSessionId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonRequest'
+      responses:
+        '200':
+          description: The revoked session.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ResourceConflict'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/sessions/{id}/takeovers:
+    post:
+      tags: [resources]
+      summary: Request a manual takeover (admin only)
+      description: |
+        Creates a waiting takeover and moves the session to needs_manual. A
+        session may have at most one waiting takeover; a second request is 409
+        takeover_not_waiting. expiresInSeconds defaults when omitted or 0 and is
+        capped at one year.
+      operationId: requestTakeover
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceSessionId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RequestTakeoverRequest'
+      responses:
+        '201':
+          description: The waiting takeover and the updated session.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TakeoverActionEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ResourceConflict'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/takeovers:
+    get:
+      tags: [resources]
+      summary: List manual takeovers
+      description: One cursor-paged list ordered by ID ascending.
+      operationId: listTakeovers
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: status
+          in: query
+          required: false
+          description: Exact takeover status filter.
+          schema:
+            type: string
+            enum: [waiting, completed, cancelled, expired]
+      responses:
+        '200':
+          description: One page of takeovers.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TakeoverList'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/takeovers/{id}/complete:
+    post:
+      tags: [resources]
+      summary: Complete a manual takeover (admin only)
+      description: |
+        Replaces the session's stored login state with the uploaded
+        storage_state or token headers, re-runs the login_check and marks the
+        takeover completed. A takeover that is not waiting is 409
+        takeover_not_waiting.
+      operationId: completeTakeover
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceTakeoverId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompleteTakeoverRequest'
+      responses:
+        '200':
+          description: The completed takeover and the updated session.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TakeoverActionEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ResourceConflict'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/takeovers/{id}/cancel:
+    post:
+      tags: [resources]
+      summary: Cancel a manual takeover (admin only)
+      description: The session stays needs_manual. A takeover that is not waiting is 409 takeover_not_waiting.
+      operationId: cancelTakeover
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceTakeoverId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The cancelled takeover.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TakeoverEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ResourceConflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/code-repos:
+    get:
+      tags: [code-repos]
+      summary: List code repositories
+      description: One cursor-paged list ordered by ID ascending.
+      operationId: listCodeRepos
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: status
+          in: query
+          required: false
+          description: Exact status filter.
+          schema:
+            type: string
+            enum: [active, disabled]
+      responses:
+        '200':
+          description: One page of code repositories.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CodeRepoList'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [code-repos]
+      summary: Create a code repository (admin only)
+      description: |
+        The local checkout is validated read-only before saving: a missing path,
+        a non-Git directory or an unknown branch is 422 with details.reason
+        path_not_found, path_not_git_repo or branch_not_found.
+      operationId: createCodeRepo
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCodeRepoRequest'
+      responses:
+        '201':
+          description: The created code repository.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CodeRepoEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/ResourceConflict'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/code-repos/{id}:
+    get:
+      tags: [code-repos]
+      summary: Get one code repository
+      operationId: getCodeRepo
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceCodeRepoId'
+      responses:
+        '200':
+          description: The code repository.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CodeRepoEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+    patch:
+      tags: [code-repos]
+      summary: Update a code repository (admin only)
+      description: Every field is optional; the key is immutable and a changed checkout is revalidated before writing.
+      operationId: updateCodeRepo
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceCodeRepoId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateCodeRepoRequest'
+      responses:
+        '200':
+          description: The updated code repository.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CodeRepoEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+    delete:
+      tags: [code-repos]
+      summary: Delete a code repository (admin only)
+      description: P2 registers no dependents, so the delete is unconditional.
+      operationId: deleteCodeRepo
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceCodeRepoId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: The code repository was deleted.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/code-repos/{id}/validate:
+    post:
+      tags: [code-repos]
+      summary: Revalidate a code repository (admin only)
+      description: Re-runs the read-only Git check and refreshes lastCommit, lastValidatedAt and lastValidationError.
+      operationId: validateCodeRepo
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceCodeRepoId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The revalidated code repository.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CodeRepoEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
   /healthz:
     get:
       tags: [health]
@@ -1339,6 +2779,78 @@ components:
         type: integer
         format: int64
         minimum: 1
+    ResourceSystemId:
+      name: id
+      in: path
+      required: true
+      description: System ID.
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    ResourceEnvironmentId:
+      name: id
+      in: path
+      required: true
+      description: Environment ID.
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    ResourceAppModelId:
+      name: id
+      in: path
+      required: true
+      description: App model node ID.
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    ResourceAccountId:
+      name: id
+      in: path
+      required: true
+      description: Account ID.
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    ResourceAccessId:
+      name: id
+      in: path
+      required: true
+      description: Access ID.
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    ResourceSessionId:
+      name: id
+      in: path
+      required: true
+      description: Session ID.
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    ResourceTakeoverId:
+      name: id
+      in: path
+      required: true
+      description: Manual takeover ID.
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    ResourceCodeRepoId:
+      name: id
+      in: path
+      required: true
+      description: Code repository ID.
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
   responses:
     InvalidArgument:
       description: Invalid input (`invalid_argument` or `idempotency_conflict` for a reused key with a different body).
@@ -1429,6 +2941,31 @@ components:
             $ref: '#/components/schemas/ErrorEnvelope'
     GatewayTimeout:
       description: The upstream LLM call exceeded the configured timeout (`llm_timeout`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    ResourceInvalid:
+      description: |
+        A semantically invalid resource request (`invalid_argument`).
+        `details.field` names the rejected field and `details.reason` is one of
+        `invalid_key`, `invalid_kind`, `invalid_status`, `invalid_base_url`,
+        `invalid_login_check`, `invalid_allowed_hosts`, `invalid_json`,
+        `body_too_large`, `invalid_limit`, `invalid_cursor`, `invalid_id`,
+        `invalid_storage_state`, `storage_state_expired`, `invalid_branch`,
+        `invalid_glob`, `path_not_found`, `path_not_git_repo` or
+        `branch_not_found`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    ResourceConflict:
+      description: |
+        A resource conflict (`conflict`) with `details.reason` one of
+        `duplicate_key` (a unique key is already in use), `has_dependencies`
+        (the object still has dependents), `session_state_conflict` (the
+        session state does not allow the action) or `takeover_not_waiting`
+        (the takeover is not waiting).
       content:
         application/json:
           schema:
@@ -2629,3 +4166,1100 @@ components:
               enum: [ok, down]
             llm_configured:
               type: boolean
+    # --- P2 resource context ---------------------------------------------
+    System:
+      type: object
+      description: |
+        A target application under test. Every P2 resource belongs to the
+        seeded default company. `key` is immutable after creation and matches
+        `^[a-z0-9][a-z0-9_-]{1,63}$`.
+      required:
+        - id
+        - key
+        - name
+        - kind
+        - baseUrl
+        - defaultSessionTtlSeconds
+        - notes
+        - status
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: integer
+          format: int64
+        key:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9_-]{1,63}$'
+        name:
+          type: string
+        kind:
+          type: string
+          enum: [web, api]
+        baseUrl:
+          type: string
+          format: uri
+        defaultSessionTtlSeconds:
+          type: integer
+          minimum: 60
+          maximum: 604800
+          description: Default session lifetime; an Access TTL overrides it.
+        notes:
+          type: string
+        status:
+          type: string
+          enum: [active, disabled]
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    SystemEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/System'
+    SystemList:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/System'
+        next_cursor:
+          type: string
+          description: Opaque cursor for the next page; empty when `has_more` is false.
+        has_more:
+          type: boolean
+    LoginCheck:
+      type: object
+      description: The optional read-only login verification of an environment (spec 6.3).
+      required: [url, expectStatus, bodyContains]
+      properties:
+        url:
+          type: string
+          maxLength: 2048
+          description: Absolute or environment-relative URL; empty disables the check.
+        expectStatus:
+          type: array
+          maxItems: 10
+          items:
+            type: integer
+            minimum: 100
+            maximum: 599
+        bodyContains:
+          type: string
+          maxLength: 512
+    Environment:
+      type: object
+      required:
+        - id
+        - systemId
+        - key
+        - name
+        - baseUrl
+        - kind
+        - isProd
+        - allowedHosts
+        - loginCheck
+        - allowAutoLogin
+        - requireApproval
+      properties:
+        id:
+          type: integer
+          format: int64
+        systemId:
+          type: integer
+          format: int64
+        key:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9_-]{1,63}$'
+        name:
+          type: string
+        baseUrl:
+          type: string
+          format: uri
+        kind:
+          type: string
+          enum: [dev, staging, prod, other]
+        isProd:
+          type: boolean
+        allowedHosts:
+          type: array
+          maxItems: 50
+          items:
+            type: string
+            maxLength: 253
+        loginCheck:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/LoginCheck'
+        allowAutoLogin:
+          type: boolean
+        requireApproval:
+          type: boolean
+    EnvironmentEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/Environment'
+    EnvironmentList:
+      type: object
+      description: Unpaginated environment list; the array is always present.
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Environment'
+    AppModelNode:
+      type: object
+      description: One element of a system's application model. `key` and `kind` are immutable.
+      required:
+        - id
+        - systemId
+        - parentId
+        - kind
+        - key
+        - name
+        - path
+        - method
+        - source
+        - meta
+      properties:
+        id:
+          type: integer
+          format: int64
+        systemId:
+          type: integer
+          format: int64
+        parentId:
+          type: integer
+          format: int64
+          nullable: true
+        kind:
+          type: string
+          enum: [page, route, api, component]
+        key:
+          type: string
+        name:
+          type: string
+        path:
+          type: string
+        method:
+          type: string
+          description: Required for api nodes; empty otherwise.
+        source:
+          type: string
+          enum: [manual, import]
+        meta:
+          type: object
+          additionalProperties: true
+    AppModelEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/AppModelNode'
+    AppModelList:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/AppModelNode'
+        next_cursor:
+          type: string
+          description: Opaque cursor for the next page; empty when `has_more` is false.
+        has_more:
+          type: boolean
+    AppModelImportResult:
+      type: object
+      required: [created, updated]
+      properties:
+        created:
+          type: integer
+        updated:
+          type: integer
+    AppModelImportResultEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/AppModelImportResult'
+    Account:
+      type: object
+      description: A login account under the seeded default company; `key` is immutable.
+      required: [id, key, label, username, kind, status, notes]
+      properties:
+        id:
+          type: integer
+          format: int64
+        key:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9_-]{1,63}$'
+        label:
+          type: string
+        username:
+          type: string
+        kind:
+          type: string
+          enum: [human, service]
+        status:
+          type: string
+          enum: [active, disabled]
+        notes:
+          type: string
+    AccountEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/Account'
+    AccountList:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Account'
+        next_cursor:
+          type: string
+          description: Opaque cursor for the next page; empty when `has_more` is false.
+        has_more:
+          type: boolean
+    Access:
+      type: object
+      description: |
+        An account's login configuration for one system. The stored credential
+        is write-only: it is never returned, only `credentialSet` reports
+        whether one is stored.
+      required:
+        - id
+        - accountId
+        - systemId
+        - authType
+        - credentialSet
+        - usernameOverride
+        - loginUrl
+        - enabled
+        - concurrencyLimit
+        - sessionTtlSeconds
+        - permissionNote
+      properties:
+        id:
+          type: integer
+          format: int64
+        accountId:
+          type: integer
+          format: int64
+        systemId:
+          type: integer
+          format: int64
+        authType:
+          type: string
+          enum: [password, sso, token, apikey, basic, manual]
+        credentialSet:
+          type: boolean
+          description: True when a credential is stored. The value itself is never returned.
+        usernameOverride:
+          type: string
+        loginUrl:
+          type: string
+        enabled:
+          type: boolean
+        concurrencyLimit:
+          type: integer
+          minimum: 1
+          maximum: 100
+        sessionTtlSeconds:
+          type: integer
+          minimum: 60
+          maximum: 604800
+          nullable: true
+          description: Overrides the system default when present.
+        permissionNote:
+          type: string
+    AccessEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/Access'
+    AccessList:
+      type: object
+      description: Unpaginated access list; the array is always present.
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Access'
+    Snapshot:
+      type: object
+      description: An immutable record of one login_check or manual confirmation.
+      required:
+        - id
+        - sessionId
+        - kind
+        - items
+        - summary
+        - permissionHash
+        - degraded
+        - capturedAt
+      properties:
+        id:
+          type: integer
+          format: int64
+        sessionId:
+          type: integer
+          format: int64
+        kind:
+          type: string
+          enum: [login]
+        items:
+          type: object
+          additionalProperties: true
+        summary:
+          type: object
+          additionalProperties: true
+        permissionHash:
+          type: string
+        degraded:
+          type: boolean
+        capturedAt:
+          type: string
+          format: date-time
+    Lease:
+      type: object
+      description: |
+        The active application-level lease of a session. Leases have no route
+        of their own; the active one is embedded in a session detail.
+      required: [id, holder, acquiredAt, expiresAt]
+      properties:
+        id:
+          type: integer
+          format: int64
+        holder:
+          type: string
+        acquiredAt:
+          type: string
+          format: date-time
+        expiresAt:
+          type: string
+          format: date-time
+    Takeover:
+      type: object
+      required:
+        - id
+        - sessionId
+        - accountId
+        - systemId
+        - environmentId
+        - reason
+        - status
+        - instructions
+        - requestedBy
+        - requestedAt
+        - expiresAt
+        - completedAt
+      properties:
+        id:
+          type: integer
+          format: int64
+        sessionId:
+          type: integer
+          format: int64
+          nullable: true
+        accountId:
+          type: integer
+          format: int64
+        systemId:
+          type: integer
+          format: int64
+        environmentId:
+          type: integer
+          format: int64
+        reason:
+          type: string
+          enum: [mfa, captcha, approval, login_unknown, other]
+        status:
+          type: string
+          enum: [waiting, completed, cancelled, expired]
+        instructions:
+          type: object
+          additionalProperties: true
+        requestedBy:
+          type: integer
+          format: int64
+          nullable: true
+        requestedAt:
+          type: string
+          format: date-time
+        expiresAt:
+          type: string
+          format: date-time
+          nullable: true
+        completedAt:
+          type: string
+          format: date-time
+          nullable: true
+    TakeoverEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/Takeover'
+    TakeoverList:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Takeover'
+        next_cursor:
+          type: string
+          description: Opaque cursor for the next page; empty when `has_more` is false.
+        has_more:
+          type: boolean
+    TakeoverAction:
+      type: object
+      description: The takeover plus the session it belongs to after the action.
+      required: [takeover, session]
+      properties:
+        takeover:
+          $ref: '#/components/schemas/Takeover'
+        session:
+          $ref: '#/components/schemas/Session'
+    TakeoverActionEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/TakeoverAction'
+    Session:
+      type: object
+      description: |
+        One imported login state. The stored storage_state document is never
+        returned: the schema exposes only `storageStateHash` and the shape
+        counts (`cookieCount`, `originCount`). `latestSnapshot`, `activeLease`
+        and `latestTakeover` are detail-only relations omitted from list
+        responses. `expiring` is derived and never stored.
+      required:
+        - id
+        - accountId
+        - systemId
+        - environmentId
+        - accessId
+        - state
+        - acquisition
+        - storageStateKind
+        - cookieCount
+        - originCount
+        - storageStateHash
+        - expiresAt
+        - lastValidatedAt
+        - lastUsedAt
+        - failureReason
+        - invalidatedReason
+        - expiring
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: integer
+          format: int64
+        accountId:
+          type: integer
+          format: int64
+        systemId:
+          type: integer
+          format: int64
+        environmentId:
+          type: integer
+          format: int64
+        accessId:
+          type: integer
+          format: int64
+        state:
+          type: string
+          enum: [pending, acquiring, needs_manual, valid, refreshing, expired, invalid, revoked, failed]
+        acquisition:
+          type: string
+          enum: [auto, manual, imported]
+        storageStateKind:
+          type: string
+          enum: ["", storage_state, token]
+        cookieCount:
+          type: integer
+        originCount:
+          type: integer
+        storageStateHash:
+          type: string
+          description: SHA-256 of the canonical stored document; the document itself is never returned.
+        expiresAt:
+          type: string
+          format: date-time
+          nullable: true
+        lastValidatedAt:
+          type: string
+          format: date-time
+          nullable: true
+        lastUsedAt:
+          type: string
+          format: date-time
+          nullable: true
+        failureReason:
+          type: string
+        invalidatedReason:
+          type: string
+        expiring:
+          type: boolean
+          description: True when a valid session is close to expiry.
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        latestSnapshot:
+          $ref: '#/components/schemas/Snapshot'
+        activeLease:
+          $ref: '#/components/schemas/Lease'
+        latestTakeover:
+          $ref: '#/components/schemas/Takeover'
+    SessionEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/Session'
+    SessionList:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Session'
+        next_cursor:
+          type: string
+          description: Opaque cursor for the next page; empty when `has_more` is false.
+        has_more:
+          type: boolean
+    SnapshotList:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Snapshot'
+        next_cursor:
+          type: string
+          description: Opaque cursor for the next page; empty when `has_more` is false.
+        has_more:
+          type: boolean
+    CodeRepo:
+      type: object
+      description: |
+        A local Git checkout used by later phases for indexing. P2 only
+        validates and stores it; `lastIndexedAt` stays null until a later phase
+        indexes the checkout. `key` is immutable.
+      required:
+        - id
+        - key
+        - name
+        - localPath
+        - fixedBranch
+        - includeGlobs
+        - excludeGlobs
+        - status
+        - lastCommit
+        - lastValidatedAt
+        - lastValidationError
+        - lastIndexedAt
+      properties:
+        id:
+          type: integer
+          format: int64
+        key:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9_-]{1,63}$'
+        name:
+          type: string
+        localPath:
+          type: string
+        fixedBranch:
+          type: string
+          maxLength: 255
+        includeGlobs:
+          type: array
+          maxItems: 200
+          items:
+            type: string
+            maxLength: 256
+        excludeGlobs:
+          type: array
+          maxItems: 200
+          items:
+            type: string
+            maxLength: 256
+        status:
+          type: string
+          enum: [active, disabled]
+        lastCommit:
+          type: string
+        lastValidatedAt:
+          type: string
+          format: date-time
+          nullable: true
+        lastValidationError:
+          type: string
+        lastIndexedAt:
+          type: string
+          format: date-time
+          nullable: true
+    CodeRepoEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/CodeRepo'
+    CodeRepoList:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/CodeRepo'
+        next_cursor:
+          type: string
+          description: Opaque cursor for the next page; empty when `has_more` is false.
+        has_more:
+          type: boolean
+    CreateSystemRequest:
+      type: object
+      required: [key, name, kind, baseUrl]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9_-]{1,63}$'
+        name:
+          type: string
+        kind:
+          type: string
+          enum: [web, api]
+        baseUrl:
+          type: string
+          format: uri
+        defaultSessionTtlSeconds:
+          type: integer
+          minimum: 0
+          maximum: 604800
+          default: 3600
+          description: 0 or omitted selects the 3600 second default.
+        notes:
+          type: string
+    UpdateSystemRequest:
+      type: object
+      additionalProperties: false
+      description: Partial update; omitted fields keep their stored value. The key is immutable.
+      properties:
+        name:
+          type: string
+        kind:
+          type: string
+          enum: [web, api]
+        baseUrl:
+          type: string
+          format: uri
+        notes:
+          type: string
+        defaultSessionTtlSeconds:
+          type: integer
+          minimum: 60
+          maximum: 604800
+        status:
+          type: string
+          enum: [active, disabled]
+    CreateEnvironmentRequest:
+      type: object
+      required: [key, name, baseUrl, kind]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9_-]{1,63}$'
+        name:
+          type: string
+        baseUrl:
+          type: string
+          format: uri
+        kind:
+          type: string
+          enum: [dev, staging, prod, other]
+        isProd:
+          type: boolean
+          default: false
+        allowedHosts:
+          type: array
+          maxItems: 50
+          items:
+            type: string
+            maxLength: 253
+        loginCheck:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/LoginCheck'
+        allowAutoLogin:
+          type: boolean
+          default: false
+        requireApproval:
+          type: boolean
+          default: false
+    UpdateEnvironmentRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        Partial update; omitted fields keep their stored value. An explicit
+        "loginCheck": null clears the stored document.
+      properties:
+        name:
+          type: string
+        baseUrl:
+          type: string
+          format: uri
+        kind:
+          type: string
+          enum: [dev, staging, prod, other]
+        isProd:
+          type: boolean
+        allowedHosts:
+          type: array
+          maxItems: 50
+          items:
+            type: string
+            maxLength: 253
+        loginCheck:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/LoginCheck'
+        allowAutoLogin:
+          type: boolean
+        requireApproval:
+          type: boolean
+    CreateAppModelRequest:
+      type: object
+      required: [key, kind, name]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+        kind:
+          type: string
+          enum: [page, route, api, component]
+        name:
+          type: string
+        path:
+          type: string
+        method:
+          type: string
+        parentKey:
+          type: string
+          description: Empty or omitted makes the node a root.
+        meta:
+          type: object
+          additionalProperties: true
+    UpdateAppModelRequest:
+      type: object
+      additionalProperties: false
+      description: Partial update; omitted fields keep their stored value. Key and kind are immutable.
+      properties:
+        name:
+          type: string
+        path:
+          type: string
+        method:
+          type: string
+        parentKey:
+          type: string
+        meta:
+          type: object
+          additionalProperties: true
+    AppModelImportNode:
+      type: object
+      required: [key, kind, name]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+        kind:
+          type: string
+          enum: [page, route, api, component]
+        name:
+          type: string
+        path:
+          type: string
+        method:
+          type: string
+        parentKey:
+          type: string
+        meta:
+          type: object
+          additionalProperties: true
+    ImportAppModelsRequest:
+      type: object
+      required: [nodes]
+      additionalProperties: false
+      properties:
+        nodes:
+          type: array
+          maxItems: 5000
+          items:
+            $ref: '#/components/schemas/AppModelImportNode'
+    CreateAccountRequest:
+      type: object
+      required: [key, label, kind]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9_-]{1,63}$'
+        label:
+          type: string
+        username:
+          type: string
+        kind:
+          type: string
+          enum: [human, service]
+        notes:
+          type: string
+    UpdateAccountRequest:
+      type: object
+      additionalProperties: false
+      description: Partial update; omitted fields keep their stored value. The key is immutable.
+      properties:
+        label:
+          type: string
+        username:
+          type: string
+        kind:
+          type: string
+          enum: [human, service]
+        notes:
+          type: string
+        status:
+          type: string
+          enum: [active, disabled]
+    CreateAccessRequest:
+      type: object
+      required: [systemId, authType, concurrencyLimit]
+      additionalProperties: false
+      properties:
+        systemId:
+          type: integer
+          format: int64
+          minimum: 1
+        authType:
+          type: string
+          enum: [password, sso, token, apikey, basic, manual]
+        credential:
+          type: string
+          writeOnly: true
+          description: Write-only; never returned.
+        usernameOverride:
+          type: string
+        loginUrl:
+          type: string
+        enabled:
+          type: boolean
+          default: true
+        concurrencyLimit:
+          type: integer
+          minimum: 1
+          maximum: 100
+        sessionTtlSeconds:
+          type: integer
+          minimum: 60
+          maximum: 604800
+          nullable: true
+        permissionNote:
+          type: string
+    UpdateAccessRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        Partial update. credential follows the write-only rule: omitted keeps
+        the stored value, "" clears it and a non-empty value replaces it. An
+        explicit "sessionTtlSeconds": null clears the TTL override. systemId is
+        accepted for form compatibility and ignored.
+      properties:
+        authType:
+          type: string
+          enum: [password, sso, token, apikey, basic, manual]
+        credential:
+          type: string
+          writeOnly: true
+        usernameOverride:
+          type: string
+        loginUrl:
+          type: string
+        permissionNote:
+          type: string
+        enabled:
+          type: boolean
+        concurrencyLimit:
+          type: integer
+          minimum: 1
+          maximum: 100
+        systemId:
+          type: integer
+          format: int64
+        sessionTtlSeconds:
+          type: integer
+          minimum: 60
+          maximum: 604800
+          nullable: true
+    ImportSessionRequest:
+      type: object
+      required: [environmentId]
+      additionalProperties: false
+      properties:
+        environmentId:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Must belong to the access's system.
+        kind:
+          type: string
+          enum: [storage_state, token]
+          description: Omitted infers token when headers are present, storage_state otherwise.
+        storageState:
+          type: object
+          additionalProperties: true
+          writeOnly: true
+          description: Playwright storageState document (cookies and origins). Write-only; never returned.
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+          writeOnly: true
+          description: Token headers such as Authorization. Write-only; never returned.
+        expiresAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Explicit expiry; omitted computes min(now+TTL, earliest cookie expiry).
+        note:
+          type: string
+    ConfirmSessionRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        note:
+          type: string
+    ReasonRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        reason:
+          type: string
+    RequestTakeoverRequest:
+      type: object
+      required: [reason]
+      additionalProperties: false
+      properties:
+        reason:
+          type: string
+          enum: [mfa, captcha, approval, login_unknown, other]
+        instructions:
+          type: object
+          additionalProperties: true
+        expiresInSeconds:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 31536000
+          default: 1800
+    CompleteTakeoverRequest:
+      type: object
+      additionalProperties: false
+      description: The same login-state shape as the import request.
+      properties:
+        kind:
+          type: string
+          enum: [storage_state, token]
+        storageState:
+          type: object
+          additionalProperties: true
+          writeOnly: true
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+          writeOnly: true
+    CreateCodeRepoRequest:
+      type: object
+      required: [key, name, localPath]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9_-]{1,63}$'
+        name:
+          type: string
+        localPath:
+          type: string
+        fixedBranch:
+          type: string
+          maxLength: 255
+          default: main
+        includeGlobs:
+          type: array
+          maxItems: 200
+          items:
+            type: string
+            maxLength: 256
+        excludeGlobs:
+          type: array
+          maxItems: 200
+          items:
+            type: string
+            maxLength: 256
+    UpdateCodeRepoRequest:
+      type: object
+      additionalProperties: false
+      description: Partial update; omitted fields keep their stored value. The key is immutable.
+      properties:
+        name:
+          type: string
+        localPath:
+          type: string
+        fixedBranch:
+          type: string
+          maxLength: 255
+        includeGlobs:
+          type: array
+          maxItems: 200
+          items:
+            type: string
+            maxLength: 256
+        excludeGlobs:
+          type: array
+          maxItems: 200
+          items:
+            type: string
+            maxLength: 256
+        status:
+          type: string
+          enum: [active, disabled]

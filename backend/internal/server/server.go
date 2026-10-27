@@ -22,6 +22,7 @@ import (
 	llmhttp "github.com/EdouardRichard/EzTest/backend/internal/llm/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/idempotency"
+	resourcehttp "github.com/EdouardRichard/EzTest/backend/internal/resource/interfaces/httpapi"
 	storagehttp "github.com/EdouardRichard/EzTest/backend/internal/storage/interfaces/httpapi"
 )
 
@@ -90,6 +91,10 @@ type Dependencies struct {
 	// Agent holds the Agent use cases. When set, the admin /api/agents routes
 	// are mounted behind the global bearer auth and the per-route admin guard.
 	Agent *AgentDependencies
+	// Resources holds the resource context's HTTP handlers (P2). When set, the
+	// /api/resources routes are mounted; reads require only the global bearer
+	// auth, while writes and actions apply the per-route admin guard.
+	Resources *resourcehttp.Handlers
 }
 
 // New assembles the HTTP handler. Middleware runs in the order
@@ -149,6 +154,13 @@ func New(cfg config.Config, logger *slog.Logger, deps Dependencies) http.Handler
 			return identityhttp.RequireAdmin(auditRequestContext(next))
 		}
 		agenthttp.RegisterRoutes(mux, agentHandler, adminGuard)
+	}
+	if deps.Resources != nil {
+		// The resource reads need only the global bearer auth; every write and
+		// action route carries the per-route admin guard. The handlers derive
+		// the audit actor from the identity context, so no extra metadata
+		// middleware is needed here.
+		resourcehttp.RegisterRoutes(mux, *deps.Resources, identityhttp.RequireAdmin)
 	}
 	if deps.Events != nil && cfg.EnableTestEndpoints {
 		auditor := deps.Audit
