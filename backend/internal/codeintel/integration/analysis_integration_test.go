@@ -255,6 +255,13 @@ func (l *analysisFakeLLM) Complete(_ context.Context, system, user string) (stri
 
 func (l *analysisFakeLLM) Model() string { return l.model }
 
+// setResponse replaces one path's deterministic T1 response.
+func (l *analysisFakeLLM) setResponse(path, response string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.byPath[path] = response
+}
+
 func (l *analysisFakeLLM) callCount() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -461,6 +468,8 @@ type analysisStatsIntegration struct {
 	EvidenceChecks     int    `json:"evidenceChecks"`
 	EvidenceFailures   int    `json:"evidenceFailures"`
 	UnmatchedContracts int    `json:"unmatchedContracts"`
+	UnresolvedEdges    int    `json:"unresolvedEdges"`
+	Conflicts          int    `json:"conflicts"`
 	Unmapped           int    `json:"unmapped"`
 	ChangeSummary      string `json:"changeSummary"`
 }
@@ -835,6 +844,166 @@ func TestAnalysisIntegrationDegraded(t *testing.T) {
 	}
 	if candidateCount != 1 {
 		t.Fatalf("degraded candidates = %d, want 1", candidateCount)
+	}
+}
+
+// analysisEntityID reads the persisted entity id of one fact key.
+func analysisEntityID(t *testing.T, pool *pgxpool.Pool, repoID int64, commit, factKey string) int64 {
+	t.Helper()
+	var id int64
+	if err := pool.QueryRow(context.Background(),
+		`SELECT id FROM code_entities
+		 WHERE repo_id = $1 AND commit_sha = $2 AND fact_key = $3`,
+		repoID, commit, factKey).Scan(&id); err != nil {
+		t.Fatalf("read entity %q: %v", factKey, err)
+	}
+	return id
+}
+
+// TestAnalysisIntegrationAIEdgesAndFactBump proves the §6.2 edge
+// materialisation against the real repositories: a fact version bump keeps the
+// entity row id, every code_edges endpoint references a persisted entity, an
+// unresolved endpoint is counted, and the contract edge keeps both real
+// endpoints.
+func TestAnalysisIntegrationAIEdgesAndFactBump(t *testing.T) {
+	pool := testutil.OpenTestDB(t)
+	ctx := context.Background()
+	dir, base, head := newAnalysisGitRepo(t)
+	repoID, versionID, requirementID := seedAnalysisRepoVersion(t, pool, dir, base)
+
+	llm := newAnalysisFakeLLM()
+	fixture := newAnalysisServiceForIntegration(t, pool, llm, "p4.1")
+	fixture.planner.requirementID = requirementID
+	analyses := codeintelpg.NewAnalysisRepository(pool)
+
+	runAnalysisJob(t, fixture, analyses, versionID, head, false)
+	firstClientID := analysisEntityID(t, pool, repoID, head, "client:POST /api/refund")
+	firstAPIID := analysisEntityID(t, pool, repoID, head, "api:POST /api/refund")
+	if firstClientID == 0 || firstAPIID == 0 || firstClientID == firstAPIID {
+		t.Fatalf("first-run entity ids = %d/%d, want two distinct persisted rows", firstClientID, firstAPIID)
+	}
+
+	// Bump the client fact body and add one resolvable AI edge (client → the
+	// existing api fact) plus one edge with an unresolved endpoint.
+	llm.setResponse(analysisClientPath, `{
+		"changeSummary": "refund client call adds a reason parameter",
+		"facts": [{
+			"kind": "client_call",
+			"name": "POST /api/refund",
+			"path": "web/src/api/refund.ts",
+			"startLine": 1,
+			"endLine": 3,
+			"signature": "post('/api/refund')",
+			"confidence": "high",
+			"summary": "client calls the refund API with a reason",
+			"evidence": [{"file": "web/src/api/refund.ts", "startLine": 2, "endLine": 3}]
+		}],
+		"edges": [
+			{
+				"from": {"kind": "client_call", "name": "POST /api/refund"},
+				"to": {"kind": "api", "name": "POST /api/refund"},
+				"rel": "calls",
+				"confidence": "high",
+				"evidence": [{"file": "web/src/api/refund.ts", "startLine": 2, "endLine": 3}]
+			},
+			{
+				"from": {"kind": "client_call", "name": "POST /api/refund"},
+				"to": {"kind": "component", "name": "MissingWidget"},
+				"rel": "imports",
+				"confidence": "high",
+				"evidence": [{"file": "web/src/api/refund.ts", "startLine": 2, "endLine": 3}]
+			}
+		]
+	}`)
+	second := runAnalysisJob(t, fixture, analyses, versionID, head, true)
+	stats := analysisStoredStats(t, second.Stats)
+	if stats.Facts != 2 || stats.Contracts != 1 || stats.UnresolvedEdges != 1 {
+		t.Fatalf("stats = %+v, want 2 facts, 1 contract, 1 unresolved edge", stats)
+	}
+	if stats.Edges != 2 {
+		t.Fatalf("stats.edges = %d, want calls + route_to_api", stats.Edges)
+	}
+
+	// The bumped fact kept its entity row id.
+	if got := analysisEntityID(t, pool, repoID, head, "client:POST /api/refund"); got != firstClientID {
+		t.Fatalf("client entity id after the bump = %d, want the preserved %d", got, firstClientID)
+	}
+	if got := analysisEntityID(t, pool, repoID, head, "api:POST /api/refund"); got != firstAPIID {
+		t.Fatalf("api entity id = %d, want the preserved %d", got, firstAPIID)
+	}
+	var clientVersions int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*)::int FROM code_fact_versions
+		 WHERE repo_id = $1 AND commit_sha = $2 AND fact_key = 'client:POST /api/refund'`,
+		repoID, head).Scan(&clientVersions); err != nil {
+		t.Fatalf("count client fact versions: %v", err)
+	}
+	if clientVersions != 2 {
+		t.Fatalf("client fact versions = %d, want version 1 and the bumped version 2", clientVersions)
+	}
+
+	// No edge may reference an entity row that does not exist.
+	var dangling int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*)::int FROM code_edges e
+		 WHERE e.repo_id = $1 AND e.commit_sha = $2
+		   AND (NOT EXISTS (
+		           SELECT 1 FROM code_entities s
+		            WHERE s.id = e.src_entity_id AND s.repo_id = e.repo_id AND s.commit_sha = e.commit_sha)
+		        OR NOT EXISTS (
+		           SELECT 1 FROM code_entities d
+		            WHERE d.id = e.dst_entity_id AND d.repo_id = e.repo_id AND d.commit_sha = e.commit_sha))`,
+		repoID, head).Scan(&dangling); err != nil {
+		t.Fatalf("count dangling edges: %v", err)
+	}
+	if dangling != 0 {
+		t.Fatalf("dangling edges = %d, want every endpoint to reference a persisted entity", dangling)
+	}
+
+	var callsSrc, callsDst, routeSrc, routeDst int64
+	if err := pool.QueryRow(ctx,
+		`SELECT src_entity_id, dst_entity_id FROM code_edges
+		 WHERE repo_id = $1 AND commit_sha = $2 AND rel = 'calls'`,
+		repoID, head).Scan(&callsSrc, &callsDst); err != nil {
+		t.Fatalf("read calls edge: %v", err)
+	}
+	if callsSrc != firstClientID || callsDst != firstAPIID {
+		t.Fatalf("calls edge = %d->%d, want persisted %d->%d",
+			callsSrc, callsDst, firstClientID, firstAPIID)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT src_entity_id, dst_entity_id FROM code_edges
+		 WHERE repo_id = $1 AND commit_sha = $2 AND rel = 'route_to_api'`,
+		repoID, head).Scan(&routeSrc, &routeDst); err != nil {
+		t.Fatalf("read route_to_api edge: %v", err)
+	}
+	if routeSrc != firstClientID || routeDst != firstAPIID {
+		t.Fatalf("route_to_api edge = %d->%d, want persisted %d->%d",
+			routeSrc, routeDst, firstClientID, firstAPIID)
+	}
+
+	// The planner received the aggregated stats and both persisted contract
+	// endpoints as facts at head.
+	input, ok := fixture.planner.lastInput()
+	if !ok {
+		t.Fatal("planner was not called")
+	}
+	var plannerStats map[string]any
+	if err := json.Unmarshal(input.Analysis.Stats, &plannerStats); err != nil {
+		t.Fatalf("decode planner analysis stats: %v", err)
+	}
+	if summary, _ := plannerStats["changeSummary"].(string); !strings.Contains(summary, "refund") {
+		t.Fatalf("planner stats.changeSummary = %q, want the aggregated summary", summary)
+	}
+	plannerIDs := make(map[string]int64)
+	for _, fact := range input.FactsAtHead {
+		if fact.FactKey != nil {
+			plannerIDs[*fact.FactKey] = fact.ID
+		}
+	}
+	if plannerIDs["client:POST /api/refund"] != firstClientID || plannerIDs["api:POST /api/refund"] != firstAPIID {
+		t.Fatalf("planner fact ids = %+v, want the persisted contract pair %d/%d",
+			plannerIDs, firstClientID, firstAPIID)
 	}
 }
 
