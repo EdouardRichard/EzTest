@@ -254,7 +254,6 @@ func newImpactIntegrationFixture(t *testing.T, pool *pgxpool.Pool) *impactIntegr
 		Git:             gitx.NewGitReader(gitx.GitConfig{CommandTimeout: 10 * time.Second}),
 		Repos:           repoCatalog,
 		IDs:             generator,
-		Clock:           indexIntegrationClock{},
 		MaxRequirements: 100,
 		MaxFacts:        200,
 		MaxPromptBytes:  64 << 10,
@@ -384,8 +383,8 @@ func TestImpactIntegrationPlanCandidates(t *testing.T) {
 		Contract           int `json:"contract"`
 		Relation           int `json:"relation"`
 		AI                 int `json:"ai"`
-		EvidenceChecks     int `json:"evidenceChecks"`
-		EvidenceFailures   int `json:"evidenceFailures"`
+		AIEvidenceChecks   int `json:"aiEvidenceChecks"`
+		AIEvidenceFailures int `json:"aiEvidenceFailures"`
 		UnmatchedContracts int `json:"unmatchedContracts"`
 		Unmapped           int `json:"unmapped"`
 	}
@@ -394,9 +393,111 @@ func TestImpactIntegrationPlanCandidates(t *testing.T) {
 	}
 	if stats.Candidates != 4 || stats.Requirements != 3 || stats.AppModels != 1 ||
 		stats.Direct != 1 || stats.Contract != 1 || stats.Relation != 1 || stats.AI != 1 ||
-		stats.EvidenceChecks != 1 || stats.EvidenceFailures != 0 ||
+		stats.AIEvidenceChecks != 1 || stats.AIEvidenceFailures != 0 ||
 		stats.UnmatchedContracts != 0 || stats.Unmapped != 3 {
 		t.Fatalf("impact stats = %+v", stats)
+	}
+}
+
+// TestImpactIntegrationChangedAPIContractPropagation proves the R38 direction of
+// §6.5 end to end: a changed api fact reaches its unchanged route_to_api
+// counterpart client_call, and the component/page facts on that counterpart path
+// match the real P2 app model nodes as contract-sourced candidates.
+func TestImpactIntegrationChangedAPIContractPropagation(t *testing.T) {
+	pool := testutil.OpenTestDB(t)
+	ctx := context.Background()
+	dir, base, head := newAnalysisGitRepo(t)
+	repoID, versionID, _ := seedAnalysisRepoVersion(t, pool, dir, base)
+
+	systemID := impactIntegrationSeedSystem(t, pool)
+	if _, err := pool.Exec(ctx, `UPDATE versions SET system_id = $1 WHERE id = $2`, systemID, versionID); err != nil {
+		t.Fatalf("bind version system: %v", err)
+	}
+	componentID := impactIntegrationSeedAppModel(t, pool, systemID,
+		"component", "component:RefundButton", "RefundButton", analysisClientPath, "")
+	pageID := impactIntegrationSeedAppModel(t, pool, systemID,
+		"page", "page:/orders", "Orders", "/orders", "")
+
+	// The changed api fact, its unchanged counterpart client_call and the
+	// companion component/page facts on the counterpart path.
+	apiEntityID := nextSeedID()
+	impactIntegrationSeedFact(t, pool, apiEntityID, repoID, head,
+		"api", "POST /api/refund", analysisServerPath, "api:POST /api/refund",
+		[]domain.Evidence{{File: analysisServerPath, StartLine: 1, EndLine: 2}})
+	clientEntityID := nextSeedID()
+	impactIntegrationSeedFact(t, pool, clientEntityID, repoID, head,
+		"client_call", "POST /api/refund", analysisClientPath, "client:POST /api/refund",
+		[]domain.Evidence{{File: analysisClientPath, StartLine: 2, EndLine: 3}})
+	impactIntegrationSeedFact(t, pool, nextSeedID(), repoID, head,
+		"component", "RefundButton", analysisClientPath, "component:web/src/api/client.ts#RefundButton",
+		[]domain.Evidence{{File: analysisClientPath, StartLine: 2, EndLine: 3}})
+	impactIntegrationSeedFact(t, pool, nextSeedID(), repoID, head,
+		"page", "/orders", analysisClientPath, "page:/orders",
+		[]domain.Evidence{{File: analysisClientPath, StartLine: 2, EndLine: 3}})
+	impactIntegrationSeedContractEdge(t, pool, repoID, head, clientEntityID, apiEntityID, "POST", "/api/refund")
+
+	catalogRepo := resourcepg.NewCatalogRepository(pool)
+	appCatalog := resourceapp.NewCatalogService(catalogRepo, catalogRepo, catalogRepo, catalogRepo, indexIntegrationClock{})
+	repoCatalog := codeintelresource.NewCatalog(
+		resourceapp.NewCodeRepoService(resourcepg.NewCodeRepository(pool), nil, indexIntegrationClock{}),
+		appCatalog)
+	versionRepo := versionpg.NewVersionRepository(pool)
+	requirementRepo := versionpg.NewRequirementRepository(pool)
+	versionCatalog := codeintelversion.NewCatalog(
+		versionapp.NewVersionService(versionRepo, nil, nil, nil),
+		versionapp.NewRequirementService(requirementRepo, versionRepo, nil),
+		versionapp.NewRelationService(requirementRepo))
+	generator, err := id.NewSnowflake(14)
+	if err != nil {
+		t.Fatalf("new impact snowflake generator: %v", err)
+	}
+	service := codeintelapp.NewImpactService(codeintelapp.ImpactServiceDeps{
+		Versions:  versionCatalog,
+		AppModels: repoCatalog,
+		Anchors:   codeintelpg.NewAnchorRepository(pool),
+		Edges:     codeintelpg.NewEdgeRepository(pool),
+		Git:       gitx.NewGitReader(gitx.GitConfig{CommandTimeout: 10 * time.Second}),
+		Repos:     repoCatalog,
+		IDs:       generator,
+	})
+
+	version, err := versionCatalog.Get(ctx, versionID)
+	if err != nil {
+		t.Fatalf("version catalog Get: %v", err)
+	}
+	facts, err := codeintelpg.NewEntityRepository(pool).ListByPaths(
+		ctx, repoID, head, []string{analysisServerPath, analysisClientPath})
+	if err != nil {
+		t.Fatalf("ListByPaths: %v", err)
+	}
+	if len(facts) != 4 {
+		t.Fatalf("facts at head = %+v, want the api, client_call and two companion facts", facts)
+	}
+	result, err := service.Plan(ctx, codeintelapp.ImpactInput{
+		Version:      version,
+		Analysis:     domain.CodeAnalysis{VersionID: versionID, RepoID: repoID, HeadCommit: head},
+		ChangedFiles: []domain.ChangedFile{{Path: analysisServerPath, Status: "M", HeadBlobHash: "git-sha1:4444444444444444444444444444444444444444"}},
+		FactsAtHead:  facts,
+		Degraded:     true,
+	})
+	if err != nil {
+		t.Fatalf("Plan error = %v", err)
+	}
+	if len(result.Candidates) != 2 {
+		t.Fatalf("candidates = %+v, want the component and page contract candidates", result.Candidates)
+	}
+	for _, candidate := range result.Candidates {
+		if candidate.Source != domain.CandidateContract || candidate.Reason != "contract POST /api/refund changed" {
+			t.Fatalf("candidate = %+v, want contract POST /api/refund changed", candidate)
+		}
+	}
+	component := impactIntegrationFindCandidate(t, result.Candidates, domain.CandidateAppModel, componentID)
+	page := impactIntegrationFindCandidate(t, result.Candidates, domain.CandidateAppModel, pageID)
+	if component.Confidence != domain.ConfidenceHigh || !component.Selected || len(component.Evidence) != 2 {
+		t.Fatalf("component candidate = %+v, want contract/high/selected with merged evidence", component)
+	}
+	if page.Confidence != domain.ConfidenceHigh || !page.Selected {
+		t.Fatalf("page candidate = %+v, want contract/high/selected", page)
 	}
 }
 

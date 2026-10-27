@@ -392,3 +392,44 @@ func TestAnchorDeleteScopedToVersion(t *testing.T) {
 		t.Fatalf("second delete error = %v, want anchor_not_found", err)
 	}
 }
+
+// TestAnchorCreateRequiresRepositoryPorts pins the fail-loud wiring contract: a
+// missing anchor repository is a configuration error before any lookup, never a
+// nil-interface panic on the uniqueness check.
+func TestAnchorCreateRequiresRepositoryPorts(t *testing.T) {
+	f := newAnchorFixture(t)
+	svc := NewAnchorService(AnchorServiceDeps{
+		Repos:     f.repos,
+		Versions:  f.versions,
+		AppModels: f.appModels,
+		Git:       f.git,
+		IDs:       f.ids,
+		Clock:     f.clock,
+	})
+	if _, err := svc.Create(context.Background(), impactVersionID, 7, domain.CreateAnchorParams{
+		SubjectKind: domain.SubjectRequirement, SubjectID: impactRequirementID,
+		FilePath: impactClientPath,
+	}); err == nil {
+		t.Fatal("Create error = nil, want the missing anchor repository to fail loudly")
+	}
+}
+
+// TestAnchorCreateRequiresFixedBranch pins the fixed-branch contract: a
+// repository without a fixed branch must fail instead of guessing "main".
+func TestAnchorCreateRequiresFixedBranch(t *testing.T) {
+	f := newAnchorFixture(t)
+	repo := f.repos.infos[impactRepoID]
+	repo.FixedBranch = ""
+	f.repos.infos[impactRepoID] = repo
+
+	if _, err := f.svc.Create(context.Background(), impactVersionID, 7, domain.CreateAnchorParams{
+		SubjectKind: domain.SubjectRequirement, SubjectID: impactRequirementID,
+		FilePath: impactClientPath,
+	}); domain.Reason(err) != "code_repository_not_bound" {
+		t.Fatalf("Create error = %v (reason %q), want code_repository_not_bound",
+			err, domain.Reason(err))
+	}
+	if len(f.git.headCalls) != 0 {
+		t.Fatalf("git head calls = %+v, want none (the empty fixed branch must not guess main)", f.git.headCalls)
+	}
+}
