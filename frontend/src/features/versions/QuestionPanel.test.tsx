@@ -16,7 +16,12 @@ vi.mock("./api", () => ({
 }))
 
 import { QuestionPanel } from "./QuestionPanel"
-import type { ClarificationQuestion, ClarificationQuestionsPage, Requirement } from "./types"
+import type {
+  ClarificationQuestion,
+  ClarificationQuestionCounts,
+  ClarificationQuestionsPage,
+  Requirement,
+} from "./types"
 
 const VERSION_ID = "1844674407370955161"
 const REQ_A = "1844674407370956001"
@@ -91,12 +96,17 @@ function questionsPage(items: ClarificationQuestion[]): ClarificationQuestionsPa
   return { items, nextCursor: "", hasMore: false }
 }
 
-function renderPanel(onChanged: () => void = vi.fn(), refreshToken = 0) {
+function renderPanel(
+  onChanged: () => void = vi.fn(),
+  refreshToken = 0,
+  counts?: ClarificationQuestionCounts,
+) {
   return render(
     <QuestionPanel
       versionId={VERSION_ID}
       requirements={REQUIREMENTS}
       refreshToken={refreshToken}
+      counts={counts}
       onChanged={onChanged}
     />,
   )
@@ -186,6 +196,52 @@ describe("QuestionPanel", () => {
     const filters = screen.getByRole("group", { name: "问题状态筛选" })
     expect(within(filters).getByRole("button", { name: "待回答 0" })).toBeTruthy()
     expect(within(filters).getByRole("button", { name: "已回答 1" })).toBeTruthy()
+  })
+
+  it("shows the clarification overview counters when they are provided", async () => {
+    renderPanel(vi.fn(), 0, { open: 5, answered: 2, dismissed: 1 })
+
+    expect(await screen.findByText("下单后如何扣减库存？")).toBeTruthy()
+
+    const filters = screen.getByRole("group", { name: "问题状态筛选" })
+    expect(within(filters).getByRole("button", { name: "全部 8" })).toBeTruthy()
+    expect(within(filters).getByRole("button", { name: "待回答 5" })).toBeTruthy()
+    expect(within(filters).getByRole("button", { name: "已回答 2" })).toBeTruthy()
+    expect(within(filters).getByRole("button", { name: "已驳回 1" })).toBeTruthy()
+  })
+
+  it("clears the inline answer after answering and reopening the question", async () => {
+    const answered = {
+      ...OPEN_QUESTION,
+      status: "answered" as const,
+      answer: "按下单数量扣减。",
+      answeredBy: 1,
+      answeredAt: "2026-10-27T12:00:00Z",
+    }
+    mocks.listClarificationQuestions
+      .mockResolvedValueOnce(questionsPage([OPEN_QUESTION]))
+      .mockResolvedValueOnce(questionsPage([answered]))
+      .mockResolvedValueOnce(questionsPage([OPEN_QUESTION]))
+
+    renderPanel()
+    const row = await screen.findByTestId(`question-row-${Q_OPEN}`)
+    fireEvent.change(within(row).getByLabelText("回答内容"), {
+      target: { value: "按下单数量扣减。" },
+    })
+    fireEvent.click(within(row).getByRole("button", { name: "保存回答" }))
+    expect(await screen.findByText("回答：按下单数量扣减。")).toBeTruthy()
+
+    const answeredRow = screen.getByTestId(`question-row-${Q_OPEN}`)
+    fireEvent.click(within(answeredRow).getByRole("button", { name: "重开" }))
+
+    await waitFor(() =>
+      expect(mocks.updateClarificationQuestion).toHaveBeenLastCalledWith(VERSION_ID, Q_OPEN, {
+        status: "open",
+      }),
+    )
+    const reopenedRow = await screen.findByTestId(`question-row-${Q_OPEN}`)
+    const textarea = within(reopenedRow).getByLabelText("回答内容") as HTMLTextAreaElement
+    expect(textarea.value).toBe("")
   })
 
   it("requires an answer before saving it", async () => {

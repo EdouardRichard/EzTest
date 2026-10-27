@@ -9,6 +9,19 @@ const mocks = vi.hoisted(() => ({
   enterDesign: vi.fn(),
   listRequirements: vi.fn(),
   listRelations: vi.fn(),
+  getClarification: vi.fn(),
+  listClarificationMessages: vi.fn(),
+  sendClarificationMessage: vi.fn(),
+  startClarificationSession: vi.fn(),
+  analyzeClarification: vi.fn(),
+  reconClarification: vi.fn(),
+  listClarificationQuestions: vi.fn(),
+  createClarificationQuestion: vi.fn(),
+  updateClarificationQuestion: vi.fn(),
+  listDecisions: vi.fn(),
+  createDecision: vi.fn(),
+  updateDecision: vi.fn(),
+  useVersionStream: vi.fn(),
 }))
 
 vi.mock("./api", () => ({
@@ -17,7 +30,22 @@ vi.mock("./api", () => ({
   enterDesign: mocks.enterDesign,
   listRequirements: mocks.listRequirements,
   listRelations: mocks.listRelations,
+  getClarification: mocks.getClarification,
+  listClarificationMessages: mocks.listClarificationMessages,
+  sendClarificationMessage: mocks.sendClarificationMessage,
+  startClarificationSession: mocks.startClarificationSession,
+  analyzeClarification: mocks.analyzeClarification,
+  reconClarification: mocks.reconClarification,
+  listClarificationQuestions: mocks.listClarificationQuestions,
+  createClarificationQuestion: mocks.createClarificationQuestion,
+  updateClarificationQuestion: mocks.updateClarificationQuestion,
+  listDecisions: mocks.listDecisions,
+  createDecision: mocks.createDecision,
+  updateDecision: mocks.updateDecision,
 }))
+
+// The workbench owns the version stream; this suite only covers the tab shell.
+vi.mock("./useVersionStream", () => ({ useVersionStream: mocks.useVersionStream }))
 
 // The bindings form reads the P2 resource APIs; the container test stays focused
 // on the tab shell and header actions, while T17's own suite covers bindings.
@@ -89,6 +117,23 @@ describe("VersionDetailPage", () => {
     // assertions deterministic.
     mocks.listRequirements.mockResolvedValue({ items: [], nextCursor: "", hasMore: false })
     mocks.listRelations.mockResolvedValue([])
+    mocks.getClarification.mockResolvedValue({
+      session: null,
+      questions: { open: 0, answered: 0, dismissed: 0 },
+      decisions: { proposed: 0, accepted: 0, rejected: 0 },
+    })
+    mocks.listClarificationMessages.mockResolvedValue({
+      items: [],
+      nextCursor: "",
+      hasMore: false,
+    })
+    mocks.listClarificationQuestions.mockResolvedValue({
+      items: [],
+      nextCursor: "",
+      hasMore: false,
+    })
+    mocks.listDecisions.mockResolvedValue({ items: [], nextCursor: "", hasMore: false })
+    mocks.useVersionStream.mockReturnValue({ events: [], status: "live", reconnect: vi.fn() })
   })
 
   afterEach(() => {

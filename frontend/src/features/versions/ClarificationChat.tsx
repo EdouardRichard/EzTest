@@ -97,6 +97,19 @@ function messageText(parts: ClarificationMessage["parts"]): string {
     .join("")
 }
 
+/**
+ * Whether a persisted message has content the snapshot can render on its own.
+ * P1 inserts an empty assistant placeholder before a run streams its answer, so
+ * an empty placeholder must not be treated as authoritative: the live chunks
+ * below are what make the answer visible.
+ */
+function hasRenderableContent(message: ClarificationMessage): boolean {
+  if (messageText(message.parts) !== "") return true
+  if (message.role !== "assistant") return false
+  if (message.reasoning !== "") return true
+  return Array.isArray(message.toolCalls) && message.toolCalls.length > 0
+}
+
 /** Whether an agent run is currently active according to the activity stream. */
 function streamBusy(events: VersionEvent[]): boolean {
   let running = false
@@ -120,6 +133,14 @@ function isAiUnavailable(error: unknown): boolean {
   return error.details.reason === "ai_unavailable"
 }
 
+/** Human labels for the closed clarification error reasons (spec §7.1). */
+const CHAT_REASON_LABELS: Record<string, string> = {
+  clarification_session_not_active: "澄清会话未处于进行中状态，请刷新后重试。",
+  clarification_session_active: "已有进行中的澄清会话，请刷新后重新查看。",
+  requirements_required: "开始澄清前请至少录入一条需求。",
+  agent_busy: "已有澄清任务在运行，请等待其结束。",
+}
+
 function describeChatError(error: unknown): string {
   if (!(error instanceof ApiError)) {
     return error instanceof Error ? error.message : "未知错误"
@@ -127,10 +148,8 @@ function describeChatError(error: unknown): string {
   if (error.status === 0) return "无法连接 API 服务，请确认后端已启动。"
   if (error.status === 401) return "登录状态已失效，请重新登录。"
   const reason = typeof error.details.reason === "string" ? error.details.reason : ""
-  if (reason === "clarification_session_not_active") {
-    return "澄清会话未处于进行中状态，请刷新后重试。"
-  }
-  if (reason === "agent_busy") return "已有澄清任务在运行，请等待其结束。"
+  const label = CHAT_REASON_LABELS[reason]
+  if (label !== undefined) return label
   if (reason !== "") return `${error.message}（${reason}）`
   return error.message
 }
@@ -150,7 +169,71 @@ type TranscriptEntry =
       durationMs: number | null
       at: string
     }
+  | {
+      kind: "usage"
+      key: string
+      prompt: number
+      completion: number
+      reasoning: number
+      total: number
+      turns: number
+      at: string
+    }
   | { kind: "notice"; key: string; text: string; tone: "info" | "error"; at: string }
+
+type ToolEntry = Extract<TranscriptEntry, { kind: "tool" }>
+type UsageEntry = Extract<TranscriptEntry, { kind: "usage" }>
+
+/** Terminal run states that must be surfaced instead of finishing silently. */
+const RUN_STATUS_LABELS: Record<string, string> = {
+  failed: "运行出错",
+  aborted: "运行已中止",
+  interrupted: "运行被中断",
+}
+
+/** Describes a non-successful `run_finished`; "" means the run completed. */
+function runOutcomeNotice(event: VersionEvent): string {
+  const status = readDetailText(event, "status")
+  const label = RUN_STATUS_LABELS[status]
+  if (label === undefined) return ""
+  const reason = readDetailText(event, "terminal_reason")
+  const code = readDetailText(event, "abort_code") || readDetailText(event, "error_code")
+  if (reason !== "" && code !== "") return `${label}：${reason}（${code}）`
+  if (reason !== "" || code !== "") return `${label}：${reason !== "" ? reason : code}`
+  return label
+}
+
+/** Applies one live tool activity to an existing tool row. */
+function applyToolActivity(entry: ToolEntry, event: VersionEvent, kind: string): void {
+  const name = readDetailText(event, "tool")
+  if (name !== "") entry.name = name
+  if (kind === "tool_use") {
+    const args = readDetailText(event, "args")
+    if (args !== "") entry.args = args
+    return
+  }
+  entry.result = readDetailText(event, "result")
+  entry.status = readDetailText(event, "status")
+  entry.durationMs = readDetailNumber(event, "duration_ms")
+}
+
+/**
+ * Finds the live tool row still waiting for a result. Real activity detail
+ * always carries `run_id`; this fallback keeps a result folded with its tool use
+ * even when a frame omits the run id.
+ */
+function findPendingLiveTool(
+  entries: Map<string, OrderedEntry>,
+  callId: string,
+  kind: string,
+): OrderedEntry | undefined {
+  for (const item of entries.values()) {
+    if (item.entry.kind !== "tool" || item.entry.callId !== callId) continue
+    if (kind === "tool_result" && item.entry.status !== "") continue
+    return item
+  }
+  return undefined
+}
 
 type OrderedEntry = { entry: TranscriptEntry; order: number }
 
@@ -174,12 +257,16 @@ function sortEntries(ordered: OrderedEntry[]): TranscriptEntry[] {
 /**
  * Merges the persisted message snapshot with local optimistic user messages and
  * the live `agent.activity` stream:
+ * - a persisted message is authoritative only when it has renderable content, so
+ *   an empty P1 assistant placeholder does not hide its live streamed answer;
  * - persisted text/thinking/tool content is rendered once (the API is the
  *   authority after a reload);
  * - live text/thinking chunks of the same `(message_id, part)` are folded;
- * - tool_use/tool_result pairs fold by `call_id`;
- * - a live activity whose message is already in the snapshot is skipped, so a
- *   refresh never duplicates a restored message.
+ * - tool_use/tool_result pairs fold by `run_id` + `call_id`, falling back to the
+ *   persisted call with the same call id so a restored call is never duplicated;
+ * - usage activities fold into one summary and a non-successful `run_finished`
+ *   is surfaced as a notice;
+ * - optimistic user messages are dropped once the snapshot contains them.
  */
 function buildTranscript(
   messages: ClarificationMessage[],
@@ -197,13 +284,17 @@ function buildTranscript(
 
   const knownMessageIds = new Set<number>()
   const persistedToolCalls: OrderedEntry[] = []
+  const persistedToolByCallId = new Map<string, OrderedEntry>()
+  const persistedUserTexts = new Map<string, number>()
 
   for (const message of messages) {
-    knownMessageIds.add(message.id)
+    if (hasRenderableContent(message)) knownMessageIds.add(message.id)
     const text = messageText(message.parts)
     if (message.role === "user") {
-      if (text !== "")
+      if (text !== "") {
+        persistedUserTexts.set(text, (persistedUserTexts.get(text) ?? 0) + 1)
         add({ kind: "user", key: `message-${message.id}`, text, at: message.createdAt })
+      }
       continue
     }
     if (message.role === "assistant") {
@@ -222,27 +313,29 @@ function buildTranscript(
         ? message.toolCalls
         : []
       for (const call of calls) {
-        persistedToolCalls.push(
-          add({
-            kind: "tool",
-            key: `message-${message.id}-tool-${call.id}`,
-            callId: call.id,
-            name: call.name,
-            args: call.arguments,
-            result: "",
-            status: "",
-            durationMs: null,
-            at: message.createdAt,
-          }),
-        )
+        const entry = add({
+          kind: "tool",
+          key: `message-${message.id}-tool-${call.id}`,
+          callId: call.id,
+          name: call.name,
+          args: call.arguments,
+          result: "",
+          status: "",
+          durationMs: null,
+          at: message.createdAt,
+        })
+        persistedToolCalls.push(entry)
+        if (!persistedToolByCallId.has(call.id)) persistedToolByCallId.set(call.id, entry)
       }
       continue
     }
-    // Tool-role messages only carry the result; attach them to the most recent
-    // persisted call still waiting for one, otherwise render a standalone row.
-    const pending = [...persistedToolCalls]
-      .reverse()
-      .find((item) => item.entry.kind === "tool" && item.entry.result === "")
+    // Tool-role messages only carry the result; pair them with the first
+    // persisted call still waiting for one (call order), otherwise render a
+    // standalone row. Tool calls and their results are persisted in order. An
+    // empty persisted result still consumes its call so the queue stays aligned.
+    const pending = persistedToolCalls.find(
+      (item) => item.entry.kind === "tool" && item.entry.status === "",
+    )
     if (pending !== undefined && pending.entry.kind === "tool") {
       pending.entry.result = text
       pending.entry.status = "ok"
@@ -262,20 +355,28 @@ function buildTranscript(
   }
 
   for (const local of optimistic) {
+    const persisted = persistedUserTexts.get(local.text) ?? 0
+    if (persisted > 0) {
+      persistedUserTexts.set(local.text, persisted - 1)
+      continue
+    }
     add({ kind: "user", key: local.key, text: local.text, at: local.at })
   }
 
   const liveText = new Map<string, OrderedEntry>()
   const liveTools = new Map<string, OrderedEntry>()
+  let usage: UsageEntry | null = null
 
   for (const event of events) {
     if (event.type !== "agent.activity") continue
     const kind = activityKind(event)
     if (kind === "" || kind === "user_message") continue
     const messageId = readDetailNumber(event, "message_id")
-    if (messageId !== null && knownMessageIds.has(messageId)) continue
 
     if (kind === "text" || kind === "thinking") {
+      // A message with renderable content is restored by the snapshot; only an
+      // empty placeholder leaves its live chunks to render here.
+      if (messageId !== null && knownMessageIds.has(messageId)) continue
       const part = readDetailNumber(event, "part") ?? 0
       // Chunks of one persisted message part fold together (spec §9.2); the
       // message ID plus part index is stable across a run's activity frames.
@@ -303,27 +404,36 @@ function buildTranscript(
     if (kind === "tool_use" || kind === "tool_result") {
       const callId = readDetailId(event, "call_id")
       if (callId === null) continue
-      const name = readDetailText(event, "tool") || callId
-      const existing = liveTools.get(callId)
-      if (existing !== undefined && existing.entry.kind === "tool") {
-        if (kind === "tool_use") {
-          existing.entry.name = name
-          const args = readDetailText(event, "args")
-          if (args !== "") existing.entry.args = args
-        } else {
-          existing.entry.result = readDetailText(event, "result")
-          existing.entry.status = readDetailText(event, "status")
-          existing.entry.durationMs = readDetailNumber(event, "duration_ms")
+      // Call ids are only unique per run; the run id keeps two runs apart.
+      const runId = readDetailId(event, "run_id")
+      const toolKey = `${runId ?? "?"}|${callId}`
+      let existing = liveTools.get(toolKey)
+      if (existing === undefined) {
+        const persisted = persistedToolByCallId.get(callId)
+        if (persisted !== undefined && persisted.entry.kind === "tool") {
+          applyToolActivity(persisted.entry, event, kind)
+          liveTools.set(toolKey, persisted)
+          continue
         }
+        // Only an event without a run id may reuse a row from another run; a
+        // missing exact key otherwise means this is a different run.
+        existing =
+          runId === null
+            ? findPendingLiveTool(liveTools, callId, kind)
+            : liveTools.get(`?|${callId}`)
+      }
+      if (existing !== undefined && existing.entry.kind === "tool") {
+        applyToolActivity(existing.entry, event, kind)
+        liveTools.set(toolKey, existing)
         continue
       }
       liveTools.set(
-        callId,
+        toolKey,
         add({
           kind: "tool",
-          key: `live-tool-${callId}`,
+          key: `live-tool-${toolKey}`,
           callId,
-          name,
+          name: readDetailText(event, "tool") || callId,
           args: kind === "tool_use" ? readDetailText(event, "args") : "",
           result: kind === "tool_result" ? readDetailText(event, "result") : "",
           status: kind === "tool_result" ? readDetailText(event, "status") : "",
@@ -331,8 +441,39 @@ function buildTranscript(
           at: event.ts,
         }),
       )
+      continue
+    }
+
+    if (kind === "usage") {
+      if (usage === null) {
+        usage = {
+          kind: "usage",
+          key: "usage",
+          prompt: 0,
+          completion: 0,
+          reasoning: 0,
+          total: 0,
+          turns: 0,
+          at: event.ts,
+        }
+      }
+      usage.turns += 1
+      usage.prompt += readDetailNumber(event, "prompt_tokens") ?? 0
+      usage.completion += readDetailNumber(event, "completion_tokens") ?? 0
+      usage.reasoning += readDetailNumber(event, "reasoning_tokens") ?? 0
+      usage.total += readDetailNumber(event, "total_tokens") ?? 0
+      continue
+    }
+
+    if (kind === "run_finished") {
+      const notice = runOutcomeNotice(event)
+      if (notice !== "") {
+        add({ kind: "notice", key: `run-${event.seq}`, text: notice, tone: "error", at: event.ts })
+      }
     }
   }
+
+  if (usage !== null) add(usage)
 
   return sortEntries(ordered)
 }
@@ -426,6 +567,38 @@ function ToolRow({ entry }: { entry: Extract<TranscriptEntry, { kind: "tool" }> 
   )
 }
 
+function UsageRow({ entry }: { entry: UsageEntry }) {
+  const [expanded, setExpanded] = useState(false)
+  return (
+    <div className="rounded-xl border border-border bg-card/60">
+      <button
+        type="button"
+        aria-label="用量"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((previous) => !previous)}
+        className="flex w-full items-center gap-2 px-3 py-2 text-left text-[11px] text-muted-foreground transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <span>{`用量 · ${entry.turns} 回合`}</span>
+        <span className="ml-auto font-mono">token</span>
+        <ChevronRight
+          className={
+            expanded
+              ? "h-3.5 w-3.5 shrink-0 rotate-90 transition-transform"
+              : "h-3.5 w-3.5 shrink-0 transition-transform"
+          }
+          aria-hidden="true"
+        />
+      </button>
+      {expanded ? (
+        <div className="space-y-1 border-t border-border px-3 py-2 text-[11px] text-muted-foreground">
+          <p className="font-medium text-foreground">{`共 ${entry.total} tokens`}</p>
+          <p>{`输入 ${entry.prompt} · 输出 ${entry.completion} · 推理 ${entry.reasoning}`}</p>
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
 export type ClarificationChatProps = {
   /** P3-owned version ID; never re-parsed. */
   versionId: string
@@ -436,6 +609,11 @@ export type ClarificationChatProps = {
   status: SSEStatus
   /** True while the owning workbench is still loading the overview. */
   sessionLoading?: boolean
+  /**
+   * The overview load error from the owning workbench. A failed session lookup
+   * must not present a start-session CTA next to the retry banner.
+   */
+  sessionError?: string
   /** Refreshes the workbench overview after starting a session. */
   onChanged?: () => void
   /** Reopens the version stream after a disconnect. */
@@ -455,6 +633,7 @@ export function ClarificationChat({
   events,
   status,
   sessionLoading = false,
+  sessionError = "",
   onChanged,
   onReconnect,
 }: ClarificationChatProps) {
@@ -474,6 +653,10 @@ export function ClarificationChat({
 
   const messagesRequestRef = useRef(0)
   const optimisticCounterRef = useRef(0)
+  /** Highest stream seq already inspected for a finished-run refetch. */
+  const lastEventSeqRef = useRef<number | null>(null)
+  const reconnectPendingRef = useRef(status === "reconnecting")
+  const wasLiveRef = useRef(status === "live")
 
   const loadMessages = useCallback(async (): Promise<void> => {
     const requestId = ++messagesRequestRef.current
@@ -500,11 +683,61 @@ export function ClarificationChat({
     setAiUnavailable(false)
     setFailedAction(null)
     setStartedSession(null)
+    lastEventSeqRef.current = null
     void loadMessages()
     return () => {
       messagesRequestRef.current += 1
     }
   }, [loadMessages])
+
+  // A finished run finalizes the persisted assistant answer: the snapshot must
+  // replace the streamed chunks, which otherwise stay the only visible answer
+  // for the empty P1 placeholder. The persisted event snapshot is loaded while
+  // the stream is still connecting and cannot be newer than the messages
+  // already fetched, so only live-run finishes trigger the refetch.
+  useEffect(() => {
+    const versionEvents = events.filter(
+      (event) => event.version_id === null || event.version_id === versionId,
+    )
+    if (versionEvents.length === 0) return
+    let maxSeq = -1
+    for (const event of versionEvents) {
+      if (event.seq > maxSeq) maxSeq = event.seq
+    }
+    const previousSeq = lastEventSeqRef.current
+    lastEventSeqRef.current = maxSeq
+    if (previousSeq === null && status !== "live") return
+    const since = previousSeq ?? -1
+    const finished = versionEvents.some(
+      (event) =>
+        event.seq > since &&
+        event.type === "agent.activity" &&
+        activityKind(event) === "run_finished",
+    )
+    if (finished) void loadMessages()
+  }, [events, loadMessages, versionId, status])
+
+  // Messages completed while the stream was disconnected fall outside the
+  // 50-event snapshot window, so a reconnect after a live/closed episode
+  // refetches the persisted transcript. A mount that starts already
+  // reconnecting refetches on its first `live` transition as well.
+  useEffect(() => {
+    if (status === "live") {
+      wasLiveRef.current = true
+      if (reconnectPendingRef.current) {
+        reconnectPendingRef.current = false
+        void loadMessages()
+      }
+      return
+    }
+    if (status === "reconnecting") {
+      reconnectPendingRef.current = true
+      return
+    }
+    if ((status === "closed" || status === "connecting") && wasLiveRef.current) {
+      reconnectPendingRef.current = true
+    }
+  }, [status, loadMessages])
 
   const resolvedSession =
     session !== null && session.status === "active" ? session : (startedSession ?? session)
@@ -703,21 +936,32 @@ export function ClarificationChat({
           正在加载澄清会话…
         </p>
       ) : sessionActive ? null : resolvedSession === null ? (
-        <div className="mt-2 rounded-xl border border-dashed border-border px-3 py-3">
-          <p className="text-sm font-medium">尚未开始澄清会话。</p>
-          <p className="mt-0.5 text-xs text-muted-foreground">
-            开始会话后，Agent 会结合需求进行追问；AI 不可用时人工问题与决策仍可录入。
-          </p>
-          <button
-            type="button"
-            onClick={() => void runStart()}
-            disabled={starting}
-            className="mt-2 inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            {starting ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : null}
-            开始澄清会话
-          </button>
-        </div>
+        sessionError !== "" ? (
+          <div className="mt-2 rounded-xl border border-dashed border-border px-3 py-3">
+            <p className="text-sm font-medium">无法加载澄清会话状态。</p>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              请先重试上方概览加载，避免重复启动会话。
+            </p>
+          </div>
+        ) : (
+          <div className="mt-2 rounded-xl border border-dashed border-border px-3 py-3">
+            <p className="text-sm font-medium">尚未开始澄清会话。</p>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              开始会话后，Agent 会结合需求进行追问；AI 不可用时人工问题与决策仍可录入。
+            </p>
+            <button
+              type="button"
+              onClick={() => void runStart()}
+              disabled={starting}
+              className="mt-2 inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              {starting ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+              ) : null}
+              开始澄清会话
+            </button>
+          </div>
+        )
       ) : (
         <div className="mt-2 rounded-xl border border-dashed border-border px-3 py-3">
           <p className="text-sm font-medium">澄清会话已结束。</p>
@@ -789,6 +1033,7 @@ export function ClarificationChat({
           }
           if (entry.kind === "thinking") return <ThinkingRow key={entry.key} entry={entry} />
           if (entry.kind === "tool") return <ToolRow key={entry.key} entry={entry} />
+          if (entry.kind === "usage") return <UsageRow key={entry.key} entry={entry} />
           return (
             <p
               key={entry.key}

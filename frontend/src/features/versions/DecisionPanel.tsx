@@ -9,6 +9,7 @@ import { ApiError } from "@/lib/api-client"
 import { createDecision, listDecisions, updateDecision } from "./api"
 import type {
   ClarificationDecision,
+  ClarificationDecisionCounts,
   ClarificationDecisionStatus,
   CreateDecisionBody,
   Requirement,
@@ -85,6 +86,11 @@ export type DecisionPanelProps = {
   requirements: Requirement[]
   /** Bumped by the workbench when another clarification panel writes. */
   refreshToken?: number
+  /**
+   * Complete per-status counters from `GET clarification`; when absent the
+   * panel labels the loaded page's counts.
+   */
+  counts?: ClarificationDecisionCounts | null
   /** Notifies the workbench after a successful write. */
   onChanged?: () => void
 }
@@ -100,6 +106,7 @@ export function DecisionPanel({
   versionId,
   requirements,
   refreshToken = 0,
+  counts: overviewCounts = null,
   onChanged,
 }: DecisionPanelProps) {
   const uid = useId()
@@ -139,7 +146,11 @@ export function DecisionPanel({
     }
   }, [load, refreshToken])
 
-  const counts = countDecisions(decisions)
+  const counts = overviewCounts ?? countDecisions(decisions)
+  const total =
+    overviewCounts === null
+      ? decisions.length
+      : overviewCounts.proposed + overviewCounts.accepted + overviewCounts.rejected
   const visible = filter === "all" ? decisions : decisions.filter((item) => item.status === filter)
 
   function requirementTitle(requirementId: string): string {
@@ -227,7 +238,7 @@ export function DecisionPanel({
       <fieldset className="mt-2 flex flex-wrap gap-1 border-0 p-0">
         <legend className="sr-only">决策状态筛选</legend>
         {FILTERS.map((option) => {
-          const count = option.value === "all" ? decisions.length : counts[option.value]
+          const count = option.value === "all" ? total : counts[option.value]
           return (
             <button
               key={option.value}

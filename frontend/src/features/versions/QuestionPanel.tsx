@@ -13,6 +13,7 @@ import {
 } from "./api"
 import type {
   ClarificationQuestion,
+  ClarificationQuestionCounts,
   ClarificationQuestionStatus,
   Requirement,
   UpdateClarificationQuestionBody,
@@ -81,6 +82,11 @@ export type QuestionPanelProps = {
   requirements: Requirement[]
   /** Bumped by the workbench when another clarification panel writes. */
   refreshToken?: number
+  /**
+   * Complete per-status counters from `GET clarification`; when absent the
+   * panel labels the loaded page's counts.
+   */
+  counts?: ClarificationQuestionCounts | null
   /** Notifies the workbench after a successful write. */
   onChanged?: () => void
 }
@@ -95,6 +101,7 @@ export function QuestionPanel({
   versionId,
   requirements,
   refreshToken = 0,
+  counts: overviewCounts = null,
   onChanged,
 }: QuestionPanelProps) {
   const uid = useId()
@@ -135,7 +142,11 @@ export function QuestionPanel({
     }
   }, [load, refreshToken])
 
-  const counts = countQuestions(questions)
+  const counts = overviewCounts ?? countQuestions(questions)
+  const total =
+    overviewCounts === null
+      ? questions.length
+      : overviewCounts.open + overviewCounts.answered + overviewCounts.dismissed
   const visible = filter === "all" ? questions : questions.filter((item) => item.status === filter)
 
   const groups: QuestionGroup[] = []
@@ -162,6 +173,14 @@ export function QuestionPanel({
     setActionError("")
     try {
       await updateClarificationQuestion(versionId, questionId, body)
+      // The inline answer belongs to the previous question state; a reopened
+      // question must not silently carry the old text into a new answer.
+      setAnswers((previous) => {
+        if (!(questionId in previous)) return previous
+        const next = { ...previous }
+        delete next[questionId]
+        return next
+      })
       await load()
       onChanged?.()
     } catch (caught) {
@@ -244,7 +263,7 @@ export function QuestionPanel({
       <fieldset className="mt-2 flex flex-wrap gap-1 border-0 p-0">
         <legend className="sr-only">问题状态筛选</legend>
         {FILTERS.map((option) => {
-          const count = option.value === "all" ? questions.length : counts[option.value]
+          const count = option.value === "all" ? total : counts[option.value]
           return (
             <button
               key={option.value}

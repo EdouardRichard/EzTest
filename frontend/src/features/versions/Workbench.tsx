@@ -34,6 +34,18 @@ const PAGE_SIZE = 100
 
 const RELATION_TYPES = Object.keys(RELATION_TYPE_META) as RelationType[]
 
+/**
+ * Clarification event types that change the question/decision panels, the
+ * clarification overview counters or the version header counters. A live event
+ * of one of these types refreshes every clarification surface.
+ */
+const CLARIFICATION_PANEL_EVENTS: ReadonlySet<string> = new Set([
+  "clarification.question_updated",
+  "clarification.context_updated",
+  "decision.proposed",
+  "decision.decided",
+])
+
 function describeLoadError(error: unknown): string {
   if (!(error instanceof ApiError)) {
     return error instanceof Error ? error.message : "未知错误"
@@ -126,6 +138,8 @@ export function Workbench({ version, onChanged }: WorkbenchProps) {
   const requirementsRequestRef = useRef(0)
   const relationsRequestRef = useRef(0)
   const clarificationRequestRef = useRef(0)
+  /** Highest stream seq already inspected for a clarification panel refresh. */
+  const streamEventSeqRef = useRef<number | null>(null)
 
   const stream = useVersionStream(version.id)
 
@@ -210,6 +224,7 @@ export function Workbench({ version, onChanged }: WorkbenchProps) {
     setRelations([])
     setClarification(null)
     setClarificationError("")
+    streamEventSeqRef.current = null
     void loadRequirements()
     void loadRelations()
     void loadClarification()
@@ -221,7 +236,37 @@ export function Workbench({ version, onChanged }: WorkbenchProps) {
     }
   }, [loadRequirements, loadRelations, loadClarification])
 
+  // AI (and human) writes arrive as version events. The workbench owns the
+  // stream, so it must refresh the question/decision panels and the overview
+  // counters itself; otherwise the chat updates while the panels stay stale
+  // until a page refresh. The first batch is the persisted snapshot (loaded
+  // while the stream is still connecting) and is already reflected in the
+  // initial loads; a batch that arrives after `live` is new and refreshes.
+  useEffect(() => {
+    const versionEvents = stream.events.filter(
+      (event) => event.version_id === null || event.version_id === version.id,
+    )
+    if (versionEvents.length === 0) {
+      streamEventSeqRef.current = null
+      return
+    }
+    const maxSeq = versionEvents.reduce((latest, event) => Math.max(latest, event.seq), 0)
+    const previousSeq = streamEventSeqRef.current
+    streamEventSeqRef.current = maxSeq
+    const changed = versionEvents.some(
+      (event) => event.seq > (previousSeq ?? -1) && CLARIFICATION_PANEL_EVENTS.has(event.type),
+    )
+    if (!changed) return
+    if (previousSeq === null && stream.status !== "live") return
+    setClarificationRevision((previous) => previous + 1)
+    void loadClarification()
+    onChanged()
+  }, [stream.events, stream.status, version.id, loadClarification, onChanged])
+
   function reloadAll(): void {
+    // A manual refresh must refresh the AI-driven panels as well; their only
+    // other reload trigger is the stream event watcher above.
+    setClarificationRevision((previous) => previous + 1)
     void loadRequirements()
     void loadRelations()
     void loadClarification()
@@ -779,6 +824,7 @@ export function Workbench({ version, onChanged }: WorkbenchProps) {
             events={stream.events}
             status={stream.status}
             sessionLoading={clarificationLoading}
+            sessionError={clarificationError}
             onChanged={handleClarificationChanged}
             onReconnect={stream.reconnect}
           />
@@ -788,12 +834,14 @@ export function Workbench({ version, onChanged }: WorkbenchProps) {
             versionId={version.id}
             requirements={requirements}
             refreshToken={clarificationRevision}
+            counts={clarification?.questions ?? null}
             onChanged={handleClarificationChanged}
           />
           <DecisionPanel
             versionId={version.id}
             requirements={requirements}
             refreshToken={clarificationRevision}
+            counts={clarification?.decisions ?? null}
             onChanged={handleClarificationChanged}
           />
         </div>
