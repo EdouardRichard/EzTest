@@ -24,7 +24,12 @@ type fakeClarificationRepo struct {
 	createSessionErr  error
 	createQuestionErr error
 	createDecisionErr error
-	writes            int
+	// linkedAnswerNoop simulates a linked question that a concurrent actor
+	// changed before the decision transaction's open-only answer update ran. The
+	// fake marks the question dismissed (the update affects zero rows) without
+	// answering it.
+	linkedAnswerNoop bool
+	writes           int
 }
 
 // newFakeClarificationRepo returns an empty repository.
@@ -231,6 +236,17 @@ func (r *fakeClarificationRepo) answerLinkedQuestion(decision *domain.Decision) 
 	}
 	stored, ok := r.questions[*decision.QuestionID]
 	if !ok || stored.Status != domain.QuestionOpen {
+		return
+	}
+	if r.linkedAnswerNoop {
+		// A concurrent dismissal won the race: the repository's
+		// WHERE status='open' update touches no row.
+		stored.Status = domain.QuestionDismissed
+		stored.Answer = ""
+		stored.AnsweredBy = nil
+		stored.AnsweredAt = nil
+		stored.UpdatedAt = testNow.Add(time.Second)
+		r.questions[stored.ID] = stored
 		return
 	}
 	stored.Status = domain.QuestionAnswered
@@ -509,9 +525,10 @@ func TestClarificationStartSessionSingleActive(t *testing.T) {
 	assertDomainReason(t, err, domain.KindNotFound, "not_found")
 }
 
-// TestClarificationStartSessionRollsBackOnRepositoryFailure proves a failed P3
-// insert publishes no event and surfaces the repository error.
-func TestClarificationStartSessionRollsBackOnRepositoryFailure(t *testing.T) {
+// TestClarificationStartSessionRepositoryFailureLeavesNoActiveSessionOrEvent
+// proves a failed P3 insert publishes no event, stores no active row and
+// surfaces the repository error.
+func TestClarificationStartSessionRepositoryFailureLeavesNoActiveSessionOrEvent(t *testing.T) {
 	f := newClarificationFixture()
 	version := f.seedVersion(domain.VersionClarifying)
 	f.repo.createSessionErr = errors.New("insert failed")
@@ -522,6 +539,10 @@ func TestClarificationStartSessionRollsBackOnRepositoryFailure(t *testing.T) {
 	}
 	if len(f.events.events) != 0 {
 		t.Fatalf("failed start published events: %v", eventTypesOf(f.events.events))
+	}
+	active, err := f.repo.GetActiveSession(context.Background(), version.ID)
+	if err != nil || active != nil {
+		t.Fatalf("failed start left an active session: %+v/%v", active, err)
 	}
 }
 
@@ -725,6 +746,61 @@ func TestClarificationAnalyzeReconRequireActiveSession(t *testing.T) {
 	assertDomainReason(t, err, domain.KindNotFound, "not_found")
 	_, err = f.service.StartRecon(ctx, 999999, 42)
 	assertDomainReason(t, err, domain.KindNotFound, "not_found")
+}
+
+// TestClarificationStartReconWithParts covers the multimodal recon entry point:
+// the caller's attachment parts follow the instruction text part, and StartRecon
+// keeps delegating with no extra parts.
+func TestClarificationStartReconWithParts(t *testing.T) {
+	ctx := context.Background()
+	f := newClarificationFixture()
+	version := f.seedVersion(domain.VersionClarifying)
+	session := f.startSession(t, version.ID)
+	f.agents.created = nil
+	f.events.events = nil
+
+	extra := []application.AgentPart{
+		{Type: "text", Text: "Attachment manifest: spec.md"},
+		{Type: "image", ImageRef: "attachment:501"},
+	}
+	result, err := f.service.StartReconWithParts(ctx, version.ID, extra, 42)
+	if err != nil {
+		t.Fatalf("StartReconWithParts: %v", err)
+	}
+	if result.SessionID != session.ID || result.AgentSessionID != 7001 ||
+		result.RunID != 8000 || result.Status != "running" {
+		t.Fatalf("recon result = %+v", result)
+	}
+	if len(f.agents.created) != 1 || f.agents.created[0].ProfileKey != "context-recon" {
+		t.Fatalf("recon agent session = %+v", f.agents.created)
+	}
+	if len(f.agents.partRuns) != 1 || f.agents.partRuns[0].AgentSessionID != result.AgentSessionID {
+		t.Fatalf("recon parts run = %+v", f.agents.partRuns)
+	}
+	parts := f.agents.partRuns[0].Parts
+	if len(parts) != 1+len(extra) {
+		t.Fatalf("recon parts = %+v, want the instruction plus %d extra parts", parts, len(extra))
+	}
+	if parts[0].Type != "text" || !strings.Contains(parts[0].Text, "100") {
+		t.Fatalf("instruction must stay the first text part: %+v", parts)
+	}
+	for i, want := range extra {
+		if parts[i+1] != want {
+			t.Fatalf("extra part %d = %+v, want %+v", i, parts[i+1], want)
+		}
+	}
+	if len(f.events.events) != 0 {
+		t.Fatalf("recon published version events: %v", eventTypesOf(f.events.events))
+	}
+
+	// StartRecon delegates with no extra parts: the instruction is the only part.
+	if _, err := f.service.StartRecon(ctx, version.ID, 42); err != nil {
+		t.Fatalf("StartRecon: %v", err)
+	}
+	if len(f.agents.partRuns) != 2 || len(f.agents.partRuns[1].Parts) != 1 ||
+		f.agents.partRuns[1].Parts[0].Type != "text" {
+		t.Fatalf("plain recon parts = %+v", f.agents.partRuns)
+	}
 }
 
 // TestClarificationQuestionTransitions covers create/update, the idempotent
@@ -1042,6 +1118,68 @@ func TestClarificationDecisionAcceptClosesLinkedQuestion(t *testing.T) {
 	assertDomainReason(t, err, domain.KindInvalid, "invalid_decision")
 }
 
+// TestClarificationDecisionPhantomQuestionEvent pins the race where the linked
+// question changes between the service's pre-read and the decision transaction:
+// the repository's open-only answer step is then a no-op, so no phantom
+// clarification.question_updated may be published, while the decision event is.
+func TestClarificationDecisionPhantomQuestionEvent(t *testing.T) {
+	ctx := context.Background()
+	f := newClarificationFixture()
+	version := f.seedVersion(domain.VersionClarifying)
+	requirement := f.seedRequirement(version.ID, 300)
+	f.startSession(t, version.ID)
+	question, err := f.service.UpsertQuestion(ctx, version.ID, application.QuestionInput{
+		RequirementID: &requirement.ID, Question: "Which coupons apply?",
+	}, 42, domain.SourceAI)
+	if err != nil {
+		t.Fatalf("UpsertQuestion: %v", err)
+	}
+	proposal, err := f.service.CreateDecision(ctx, version.ID, application.DecisionInput{
+		RequirementID: &requirement.ID, QuestionID: &question.ID,
+		Topic: "Coupons", Decision: "Apply all coupons",
+	}, 42, domain.SourceAI)
+	if err != nil {
+		t.Fatalf("CreateDecision: %v", err)
+	}
+
+	// Decide: the linked question is dismissed by a concurrent actor before the
+	// repository transaction answers it, so only decision.decided is published.
+	f.events.events = nil
+	f.repo.linkedAnswerNoop = true
+	accepted, err := f.service.Decide(ctx, version.ID, proposal.ID, true, 43)
+	if err != nil {
+		t.Fatalf("Decide accept: %v", err)
+	}
+	if accepted.Status != domain.DecisionAccepted {
+		t.Fatalf("accepted decision = %+v", accepted)
+	}
+	if got := eventTypesOf(f.events.events); len(got) != 1 || got[0] != "decision.decided" {
+		t.Fatalf("events = %v, want only decision.decided", got)
+	}
+
+	// CreateDecision (human source, accepted immediately) follows the same rule.
+	question2, err := f.service.UpsertQuestion(ctx, version.ID, application.QuestionInput{
+		RequirementID: &requirement.ID, Question: "Which currency?",
+	}, 42, domain.SourceAI)
+	if err != nil {
+		t.Fatalf("UpsertQuestion second: %v", err)
+	}
+	f.events.events = nil
+	human, err := f.service.CreateDecision(ctx, version.ID, application.DecisionInput{
+		RequirementID: &requirement.ID, QuestionID: &question2.ID,
+		Topic: "Currency", Decision: "EUR",
+	}, 44, domain.SourceUser)
+	if err != nil {
+		t.Fatalf("CreateDecision human: %v", err)
+	}
+	if human.Status != domain.DecisionAccepted {
+		t.Fatalf("human decision = %+v", human)
+	}
+	if got := eventTypesOf(f.events.events); len(got) != 1 || got[0] != "decision.decided" {
+		t.Fatalf("events = %v, want only decision.decided", got)
+	}
+}
+
 // TestClarificationVersionNotFound proves every version-scoped write and read
 // rejects a missing version before writing anything.
 func TestClarificationVersionNotFound(t *testing.T) {
@@ -1177,6 +1315,68 @@ func TestClarificationReadsAndCounts(t *testing.T) {
 	}
 	if third.Status != domain.QuestionOpen {
 		t.Fatalf("version-level question = %+v", third)
+	}
+}
+
+// TestClarificationUpdateContextSummaryLimit enforces the 20 KiB bound of the
+// context.summary_update tool (spec §8.3): the exact limit is accepted, one byte
+// more is a domain invalid error and writes nothing.
+func TestClarificationUpdateContextSummaryLimit(t *testing.T) {
+	ctx := context.Background()
+	f := newClarificationFixture()
+	version := f.seedVersion(domain.VersionClarifying)
+	session := f.startSession(t, version.ID)
+	f.events.events = nil
+	writes := f.repo.writes
+
+	over := strings.Repeat("s", application.MaxClarificationContextSummaryBytes+1)
+	assertDomainReason(t, f.service.UpdateContextSummary(ctx, version.ID, over, 42),
+		domain.KindInvalid, "invalid_context_summary")
+	if f.repo.writes != writes {
+		t.Fatalf("over-limit summary was written: writes=%d want %d", f.repo.writes, writes)
+	}
+	if len(f.events.events) != 0 {
+		t.Fatalf("over-limit summary published events: %v", eventTypesOf(f.events.events))
+	}
+	stored, err := f.repo.GetSession(ctx, session.ID)
+	if err != nil || stored.ContextSummary != "" {
+		t.Fatalf("over-limit summary changed the session: %+v/%v", stored, err)
+	}
+
+	atLimit := strings.Repeat("s", application.MaxClarificationContextSummaryBytes)
+	if err := f.service.UpdateContextSummary(ctx, version.ID, atLimit, 42); err != nil {
+		t.Fatalf("UpdateContextSummary at the limit: %v", err)
+	}
+	stored, err = f.repo.GetSession(ctx, session.ID)
+	if err != nil || stored.ContextSummary != atLimit {
+		t.Fatalf("summary at the limit was not stored: %+v/%v", stored, err)
+	}
+}
+
+// TestClarificationUpdateContextSummaryEvent pins the post-commit
+// clarification.context_updated event and its version/tool/actor references.
+func TestClarificationUpdateContextSummaryEvent(t *testing.T) {
+	ctx := context.Background()
+	f := newClarificationFixture()
+	version := f.seedVersion(domain.VersionClarifying)
+	f.startSession(t, version.ID)
+	f.events.events = nil
+
+	if err := f.service.UpdateContextSummary(ctx, version.ID, "the user wants coupons", 42); err != nil {
+		t.Fatalf("UpdateContextSummary: %v", err)
+	}
+	if len(f.events.events) != 1 {
+		t.Fatalf("events = %v, want [clarification.context_updated]", eventTypesOf(f.events.events))
+	}
+	event := f.events.events[0]
+	if event.Type != "clarification.context_updated" || event.VersionID != version.ID ||
+		event.ActorID != 42 || event.Source != domain.SourceAI ||
+		event.Summary != "clarification context updated" {
+		t.Fatalf("context event = %+v", event)
+	}
+	if event.Detail["versionId"] != "100" || event.Detail["tool"] != "context.summary_update" ||
+		event.Detail["actorId"] != int64(42) {
+		t.Fatalf("context event detail = %+v", event.Detail)
 	}
 }
 
