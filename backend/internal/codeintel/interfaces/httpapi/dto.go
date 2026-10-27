@@ -172,6 +172,136 @@ type CommitDTO struct {
 	CommittedAt time.Time `json:"committedAt"`
 }
 
+// StartAnalysisDTO is the body of POST /api/versions/{id}/code/analyses (design
+// spec §7.3): 202 with reused=false for a new run, 200 with reused=true for a
+// reused one.
+type StartAnalysisDTO struct {
+	ID              string `json:"id"`
+	Status          string `json:"status"`
+	AnalysisVersion int    `json:"analysisVersion"`
+	Reused          bool   `json:"reused"`
+}
+
+// AnalysisStatsDTO is the projected JSONB stats document of one analysis
+// (frontend types.ts AnalysisStats). It is always an object, even when the run
+// has not produced stats yet (R8).
+type AnalysisStatsDTO struct {
+	ChangedFiles       int  `json:"changedFiles"`
+	AnalyzedFiles      int  `json:"analyzedFiles"`
+	CacheHits          int  `json:"cacheHits"`
+	Facts              int  `json:"facts"`
+	Edges              int  `json:"edges"`
+	Contracts          int  `json:"contracts"`
+	EvidenceChecks     int  `json:"evidenceChecks"`
+	EvidenceFailures   int  `json:"evidenceFailures"`
+	Unmapped           int  `json:"unmapped"`
+	InvalidFacts       int  `json:"invalidFacts"`
+	DuplicateFacts     int  `json:"duplicateFacts"`
+	UnmatchedContracts int  `json:"unmatchedContracts"`
+	Truncated          bool `json:"truncated"`
+	Skipped            int  `json:"skipped"`
+}
+
+// FactVersionDTO is one entry of an analysis' fact-version snapshot.
+type FactVersionDTO struct {
+	FactKey string `json:"factKey"`
+	Version int    `json:"version"`
+}
+
+// UnmappedChangeDTO is one changed file no candidate covers (design spec §7.3).
+type UnmappedChangeDTO struct {
+	Path       string `json:"path"`
+	Status     string `json:"status"`
+	Reason     string `json:"reason"`
+	Suggestion string `json:"suggestion"`
+}
+
+// CandidateDTO is one impact candidate (design spec §7.3). id and subjectId are
+// decimal strings; selectionUpdatedBy stays a number and selectionUpdatedAt an
+// ISO timestamp. Evidence is always an array: T1/AI evidence carries a verified
+// line range plus excerpt hash, anchor evidence only file.
+type CandidateDTO struct {
+	ID                 string            `json:"id"`
+	SubjectKind        string            `json:"subjectKind"`
+	SubjectID          string            `json:"subjectId"`
+	Reason             string            `json:"reason"`
+	Confidence         string            `json:"confidence"`
+	Source             string            `json:"source"`
+	Evidence           []domain.Evidence `json:"evidence"`
+	Selected           bool              `json:"selected"`
+	SelectionUpdatedBy *int64            `json:"selectionUpdatedBy,omitempty"`
+	SelectionUpdatedAt *time.Time        `json:"selectionUpdatedAt,omitempty"`
+}
+
+// AnalysisDTO is the aggregated analysis detail of GET latest/{analysisId}
+// (design spec §7.3, frontend types.ts Analysis). The four aggregate arrays are
+// always [] rather than null (R8); changeSummary is projected out of the stats
+// document (R28); stats is always an object.
+type AnalysisDTO struct {
+	ID              string              `json:"id"`
+	VersionID       string              `json:"versionId"`
+	RepoID          int64               `json:"repoId"`
+	BaseCommit      string              `json:"baseCommit"`
+	HeadCommit      string              `json:"headCommit"`
+	Status          string              `json:"status"`
+	Degraded        bool                `json:"degraded"`
+	AnalysisVersion int                 `json:"analysisVersion"`
+	Model           string              `json:"model"`
+	PromptVersion   string              `json:"promptVersion"`
+	ChangeSetID     *string             `json:"changeSetId"`
+	ChangeSummary   string              `json:"changeSummary"`
+	Stats           AnalysisStatsDTO    `json:"stats"`
+	FactVersions    []FactVersionDTO    `json:"factVersions"`
+	Candidates      []CandidateDTO      `json:"candidates"`
+	Unmapped        []UnmappedChangeDTO `json:"unmapped"`
+	Errors          []AnalysisErrorDTO  `json:"errors"`
+	CreatedBy       int64               `json:"createdBy"`
+	CreatedAt       time.Time           `json:"createdAt"`
+	StartedAt       *time.Time          `json:"startedAt"`
+	FinishedAt      *time.Time          `json:"finishedAt"`
+}
+
+// AnchorDTO is one code anchor (design spec §7.3, frontend types.ts Anchor):
+// anchor/version/subject ids are decimal strings, createdBy stays a number and
+// the location fields are nullable.
+type AnchorDTO struct {
+	ID            string    `json:"id"`
+	VersionID     string    `json:"versionId"`
+	SubjectKind   string    `json:"subjectKind"`
+	SubjectID     string    `json:"subjectId"`
+	FilePath      string    `json:"filePath"`
+	StartLine     *int      `json:"startLine"`
+	EndLine       *int      `json:"endLine"`
+	CommitSHA     *string   `json:"commitSha"`
+	Confidence    string    `json:"confidence"`
+	CreatedByKind string    `json:"createdByKind"`
+	CreatedBy     int64     `json:"createdBy"`
+	CreatedAt     time.Time `json:"createdAt"`
+}
+
+// startAnalysisRequest is the POST /analyses body (design spec §7.3). Both
+// fields are optional, so an empty object is a valid trigger.
+type startAnalysisRequest struct {
+	HeadCommit string `json:"headCommit"`
+	Force      bool   `json:"force"`
+}
+
+// patchCandidateRequest is the PATCH candidate body (design spec §7.3): selected
+// is required, so it is a pointer here and a missing value is a 400.
+type patchCandidateRequest struct {
+	Selected *bool `json:"selected"`
+}
+
+// createAnchorRequest is the POST /anchors body (design spec §7.3). subjectId is
+// a decimal string on the wire; the handler parses it to the domain's int64.
+type createAnchorRequest struct {
+	SubjectKind string `json:"subjectKind"`
+	SubjectID   string `json:"subjectId"`
+	FilePath    string `json:"filePath"`
+	StartLine   *int   `json:"startLine"`
+	EndLine     *int   `json:"endLine"`
+}
+
 // indexRunStatsDocument is the stored JSONB stats document of an index run. Only
 // the projected keys are read; unknown keys are ignored.
 type indexRunStatsDocument struct {
@@ -398,4 +528,129 @@ func newCommitDTO(info domain.CommitInfo) CommitDTO {
 		Author:      info.Author,
 		CommittedAt: info.CommittedAt,
 	}
+}
+
+// analysisStatsDocument is the stored JSONB stats document of one analysis. The
+// wire-projected counters are decoded through the embedded DTO; changeSummary
+// lives in the same document (R28) and is projected separately.
+type analysisStatsDocument struct {
+	AnalysisStatsDTO
+	ChangeSummary string `json:"changeSummary"`
+}
+
+// newAnalysisDTO maps one analysis plus its persisted candidates to the wire
+// shape. A malformed or absent stored stats document is rendered as an empty
+// object instead of failing the read (it can only be produced by a bug, and R8
+// requires stats to stay an object); the four aggregate arrays are always
+// non-nil so the JSON is [] rather than null.
+func newAnalysisDTO(analysis domain.CodeAnalysis, candidates []domain.ImpactCandidate) AnalysisDTO {
+	var document analysisStatsDocument
+	if len(analysis.Stats) > 0 {
+		_ = json.Unmarshal(analysis.Stats, &document)
+	}
+	return AnalysisDTO{
+		ID:              formatID(analysis.ID),
+		VersionID:       formatID(analysis.VersionID),
+		RepoID:          analysis.RepoID,
+		BaseCommit:      analysis.BaseCommit,
+		HeadCommit:      analysis.HeadCommit,
+		Status:          analysis.Status,
+		Degraded:        analysis.Degraded,
+		AnalysisVersion: analysis.AnalysisVersion,
+		Model:           analysis.Model,
+		PromptVersion:   analysis.PromptVersion,
+		ChangeSetID:     formatOptionalID(analysis.ChangeSetID),
+		ChangeSummary:   document.ChangeSummary,
+		Stats:           document.AnalysisStatsDTO,
+		FactVersions:    newFactVersionDTOs(analysis.FactVersions),
+		Candidates:      newCandidateDTOs(candidates),
+		Unmapped:        newUnmappedChangeDTOs(analysis.Unmapped),
+		Errors:          newAnalysisErrorDTOs(analysis.Errors),
+		CreatedBy:       analysis.CreatedBy,
+		CreatedAt:       analysis.CreatedAt,
+		StartedAt:       analysis.StartedAt,
+		FinishedAt:      analysis.FinishedAt,
+	}
+}
+
+// newFactVersionDTOs maps the fact-version snapshot, always returning a non-nil
+// slice.
+func newFactVersionDTOs(items []domain.FactVersionRef) []FactVersionDTO {
+	dtos := make([]FactVersionDTO, 0, len(items))
+	for _, item := range items {
+		dtos = append(dtos, FactVersionDTO{FactKey: item.FactKey, Version: item.Version})
+	}
+	return dtos
+}
+
+// newUnmappedChangeDTOs maps the unmapped changes, always returning a non-nil
+// slice.
+func newUnmappedChangeDTOs(items []domain.UnmappedChange) []UnmappedChangeDTO {
+	dtos := make([]UnmappedChangeDTO, 0, len(items))
+	for _, item := range items {
+		dtos = append(dtos, UnmappedChangeDTO{
+			Path:       item.Path,
+			Status:     item.Status,
+			Reason:     item.Reason,
+			Suggestion: item.Suggestion,
+		})
+	}
+	return dtos
+}
+
+// newCandidateDTOs maps the candidates, always returning a non-nil slice.
+func newCandidateDTOs(items []domain.ImpactCandidate) []CandidateDTO {
+	dtos := make([]CandidateDTO, 0, len(items))
+	for _, item := range items {
+		dtos = append(dtos, newCandidateDTO(item))
+	}
+	return dtos
+}
+
+// newCandidateDTO maps one candidate. Evidence keeps the domain JSON shape
+// (file plus the optional verified range/hash) and is never null.
+func newCandidateDTO(candidate domain.ImpactCandidate) CandidateDTO {
+	evidence := candidate.Evidence
+	if evidence == nil {
+		evidence = []domain.Evidence{}
+	}
+	return CandidateDTO{
+		ID:                 formatID(candidate.ID),
+		SubjectKind:        candidate.SubjectKind,
+		SubjectID:          formatID(candidate.SubjectID),
+		Reason:             candidate.Reason,
+		Confidence:         candidate.Confidence,
+		Source:             candidate.Source,
+		Evidence:           evidence,
+		Selected:           candidate.Selected,
+		SelectionUpdatedBy: candidate.SelectionUpdatedBy,
+		SelectionUpdatedAt: candidate.SelectionUpdatedAt,
+	}
+}
+
+// newAnchorDTO maps one anchor to its wire shape (decimal-string ids).
+func newAnchorDTO(anchor domain.CodeAnchor) AnchorDTO {
+	return AnchorDTO{
+		ID:            formatID(anchor.ID),
+		VersionID:     formatID(anchor.VersionID),
+		SubjectKind:   anchor.SubjectKind,
+		SubjectID:     formatID(anchor.SubjectID),
+		FilePath:      anchor.FilePath,
+		StartLine:     anchor.StartLine,
+		EndLine:       anchor.EndLine,
+		CommitSHA:     anchor.CommitSHA,
+		Confidence:    anchor.Confidence,
+		CreatedByKind: anchor.CreatedByKind,
+		CreatedBy:     anchor.CreatedBy,
+		CreatedAt:     anchor.CreatedAt,
+	}
+}
+
+// newAnchorDTOs maps the anchor list, always returning a non-nil slice.
+func newAnchorDTOs(items []domain.CodeAnchor) []AnchorDTO {
+	dtos := make([]AnchorDTO, 0, len(items))
+	for _, item := range items {
+		dtos = append(dtos, newAnchorDTO(item))
+	}
+	return dtos
 }

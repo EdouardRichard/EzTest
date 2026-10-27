@@ -160,6 +160,12 @@ type commitCall struct {
 	SHA    string
 }
 
+// versionChangesCall records one QueryService.VersionChanges invocation.
+type versionChangesCall struct {
+	VersionID int64
+	Head      string
+}
+
 // fakeQueryService is the hand-written application.QueryService consumer
 // double. Each method records its arguments and delegates to the configured
 // function.
@@ -171,14 +177,18 @@ type fakeQueryService struct {
 	factsFn    func(context.Context, int64, domain.EntityFilter) ([]domain.CodeEntity, string, bool, error)
 	searchFn   func(context.Context, int64, string, string, string, int, string) ([]domain.CodeEntity, string, bool, error)
 	commitFn   func(context.Context, int64, string) (domain.CommitInfo, error)
+	// versionChangesFn backs the version-scoped change preview added to the
+	// QueryService consumer port by T15.
+	versionChangesFn func(context.Context, int64, string) (domain.ChangeSetData, string, string, error)
 
-	treeCalls     []treeCall
-	fileCalls     []fileCall
-	diffCalls     []diffCall
-	fileDiffCalls []fileDiffCall
-	factsCalls    []factsCall
-	searchCalls   []searchCall
-	commitCalls   []commitCall
+	treeCalls           []treeCall
+	fileCalls           []fileCall
+	diffCalls           []diffCall
+	fileDiffCalls       []fileDiffCall
+	factsCalls          []factsCall
+	searchCalls         []searchCall
+	commitCalls         []commitCall
+	versionChangesCalls []versionChangesCall
 }
 
 func (f *fakeQueryService) Tree(ctx context.Context, repoID int64, prefix, commit, cursor string, limit int) (domain.TreePage, error) {
@@ -235,6 +245,14 @@ func (f *fakeQueryService) Commit(ctx context.Context, repoID int64, sha string)
 		return domain.CommitInfo{}, nil
 	}
 	return f.commitFn(ctx, repoID, sha)
+}
+
+func (f *fakeQueryService) VersionChanges(ctx context.Context, versionID int64, headCommit string) (domain.ChangeSetData, string, string, error) {
+	f.versionChangesCalls = append(f.versionChangesCalls, versionChangesCall{VersionID: versionID, Head: headCommit})
+	if f.versionChangesFn == nil {
+		return domain.ChangeSetData{}, "", "", nil
+	}
+	return f.versionChangesFn(ctx, versionID, headCommit)
 }
 
 // fakeRepoCatalog is the hand-written application.RepoCatalog double.
