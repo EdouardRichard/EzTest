@@ -1,6 +1,7 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
+import type { IndexRun, RepoSummary } from "@/features/code-intel/types"
 import { ApiError } from "@/lib/api-client"
 
 const mocks = vi.hoisted(() => ({
@@ -11,6 +12,12 @@ const mocks = vi.hoisted(() => ({
   validateCodeRepo: vi.fn(),
 }))
 
+const indexMocks = vi.hoisted(() => ({
+  getCodeRepos: vi.fn(),
+  getLatestIndexRun: vi.fn(),
+  startIndex: vi.fn(),
+}))
+
 const authState = vi.hoisted(() => ({ role: "admin" as "admin" | "user" }))
 
 vi.mock("./api", () => ({
@@ -19,6 +26,12 @@ vi.mock("./api", () => ({
   updateCodeRepo: mocks.updateCodeRepo,
   deleteCodeRepo: mocks.deleteCodeRepo,
   validateCodeRepo: mocks.validateCodeRepo,
+}))
+
+vi.mock("@/features/code-intel/api", () => ({
+  getCodeRepos: indexMocks.getCodeRepos,
+  getLatestIndexRun: indexMocks.getLatestIndexRun,
+  startIndex: indexMocks.startIndex,
 }))
 
 vi.mock("@/features/auth/AuthProvider", () => ({
@@ -47,12 +60,59 @@ const REPO = {
   lastIndexedAt: null,
 }
 
+/** A snowflake-shaped run id that must stay a string end to end (spec §7.1). */
+const RUN_ID = "1844674407370955164"
+const INDEX_COMMIT = "def456789abcdef0123456789abcdef012345678"
+const INDEX_FINISHED_AT = "2026-10-27T09:32:03Z"
+
+const DONE_INDEX_RUN: IndexRun = {
+  runId: RUN_ID,
+  repoId: REPO.id,
+  commit: INDEX_COMMIT,
+  status: "done",
+  stats: { files: 1200, truncated: false },
+  startedAt: "2026-10-27T09:30:00Z",
+  finishedAt: INDEX_FINISHED_AT,
+}
+
+function repoSummary(overrides: Partial<RepoSummary> = {}): RepoSummary {
+  return {
+    id: REPO.id,
+    key: REPO.key,
+    name: REPO.name,
+    status: REPO.status,
+    fixedBranch: REPO.fixedBranch,
+    lastCommit: REPO.lastCommit,
+    lastIndexedAt: INDEX_FINISHED_AT,
+    index: DONE_INDEX_RUN,
+    ...overrides,
+  }
+}
+
+const UNINDEXED_SUMMARY = repoSummary({ lastIndexedAt: null, index: null })
+
+/** Resolves the initial effect promises while fake timers are installed. */
+async function flushPromises(): Promise<void> {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
+  })
+}
+
 function apiError(status: number, reason: string): ApiError {
   return new ApiError({
     status,
     code: status === 422 ? "invalid_argument" : "conflict",
     message: "validation failed",
     details: { reason, field: "fixedBranch" },
+  })
+}
+
+function indexError(status: number, reason: string): ApiError {
+  return new ApiError({
+    status,
+    code: status === 409 ? "conflict" : "invalid_argument",
+    message: "index trigger failed",
+    details: { reason },
   })
 }
 
@@ -64,21 +124,221 @@ describe("CodeReposPage", () => {
     mocks.updateCodeRepo.mockReset()
     mocks.deleteCodeRepo.mockReset()
     mocks.validateCodeRepo.mockReset()
+    indexMocks.getCodeRepos.mockReset()
+    indexMocks.getLatestIndexRun.mockReset()
+    indexMocks.startIndex.mockReset()
     mocks.listCodeRepos.mockResolvedValue({ items: [REPO], nextCursor: null, hasMore: false })
+    indexMocks.getCodeRepos.mockResolvedValue([UNINDEXED_SUMMARY])
   })
 
   afterEach(() => {
     cleanup()
   })
 
-  it("renders a repo row with its last commit and the index placeholder", async () => {
+  it("shows the last indexed time and commit and drops the P4 placeholder", async () => {
+    mocks.listCodeRepos.mockResolvedValue({
+      items: [{ ...REPO, lastValidatedAt: null }],
+      nextCursor: null,
+      hasMore: false,
+    })
+    indexMocks.getCodeRepos.mockResolvedValue([repoSummary()])
+
     render(<CodeReposPage />)
 
     expect(await screen.findByText("EzTest")).toBeTruthy()
-    expect(screen.getByText("D:/repo")).toBeTruthy()
-    expect(screen.getByText("dev")).toBeTruthy()
-    expect(screen.getByText("abc")).toBeTruthy()
-    expect(screen.getByText(/未索引（P4）/)).toBeTruthy()
+    const row = screen.getByText("EzTest").closest("tr") as HTMLTableRowElement
+    const scope = within(row)
+    expect(scope.getByText("已索引")).toBeTruthy()
+    expect(scope.getByText(/2026/)).toBeTruthy()
+    expect(scope.getByText("def45678")).toBeTruthy()
+    expect(scope.queryByText(/未索引（P4）/)).toBeNull()
+    expect(scope.queryByText(/未索引/)).toBeNull()
+  })
+
+  it("shows the failure reason for a failed index run", async () => {
+    indexMocks.getCodeRepos.mockResolvedValue([
+      repoSummary({
+        lastIndexedAt: null,
+        index: {
+          ...DONE_INDEX_RUN,
+          status: "failed",
+          stats: undefined,
+          errors: [{ code: "git_unavailable", message: "Git 仓库不可访问" }],
+        },
+      }),
+    ])
+
+    render(<CodeReposPage />)
+
+    expect(await screen.findByText("EzTest")).toBeTruthy()
+    const row = screen.getByText("EzTest").closest("tr") as HTMLTableRowElement
+    expect(within(row).getByText("索引失败")).toBeTruthy()
+    expect(within(row).getByText(/Git 仓库不可访问/)).toBeTruthy()
+    expect(within(row).getByRole("button", { name: "刷新索引" })).toBeTruthy()
+  })
+
+  it("lets admins refresh the index and polls until it is done", async () => {
+    vi.useFakeTimers()
+    try {
+      mocks.listCodeRepos
+        .mockResolvedValueOnce({ items: [REPO], nextCursor: null, hasMore: false })
+        .mockResolvedValue({
+          items: [{ ...REPO, lastIndexedAt: INDEX_FINISHED_AT }],
+          nextCursor: null,
+          hasMore: false,
+        })
+      indexMocks.getCodeRepos
+        .mockResolvedValueOnce([UNINDEXED_SUMMARY])
+        .mockResolvedValue([repoSummary()])
+      indexMocks.startIndex.mockResolvedValue({
+        runId: RUN_ID,
+        status: "queued",
+        commit: INDEX_COMMIT,
+      })
+      indexMocks.getLatestIndexRun
+        .mockResolvedValueOnce({
+          ...DONE_INDEX_RUN,
+          status: "running",
+          stats: undefined,
+          finishedAt: null,
+        })
+        .mockResolvedValueOnce(DONE_INDEX_RUN)
+
+      render(<CodeReposPage />)
+      await flushPromises()
+      expect(screen.getByText("未索引")).toBeTruthy()
+
+      fireEvent.click(screen.getByRole("button", { name: "刷新索引" }))
+      await flushPromises()
+
+      expect(indexMocks.startIndex).toHaveBeenCalledWith(REPO.id)
+      expect(typeof indexMocks.startIndex.mock.calls[0]?.[0]).toBe("number")
+      expect(screen.getByText("排队中")).toBeTruthy()
+      expect((screen.getByRole("button", { name: "刷新索引" }) as HTMLButtonElement).disabled).toBe(
+        true,
+      )
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1500)
+      })
+      await flushPromises()
+      expect(indexMocks.getLatestIndexRun).toHaveBeenCalledWith(REPO.id)
+      expect(indexMocks.getLatestIndexRun).toHaveBeenCalledTimes(1)
+      expect(screen.getByText("索引中")).toBeTruthy()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1500)
+      })
+      await flushPromises()
+      expect(indexMocks.getLatestIndexRun).toHaveBeenCalledTimes(2)
+      expect(screen.getByText("已索引")).toBeTruthy()
+      expect(screen.getByText("def45678")).toBeTruthy()
+      expect((screen.getByRole("button", { name: "刷新索引" }) as HTMLButtonElement).disabled).toBe(
+        false,
+      )
+
+      // Terminal status stops the 1.5s poll and refreshes both lists.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(6000)
+      })
+      expect(indexMocks.getLatestIndexRun).toHaveBeenCalledTimes(2)
+      expect(mocks.listCodeRepos).toHaveBeenCalledTimes(2)
+      expect(indexMocks.getCodeRepos).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("stops polling after 60 attempts and asks for a manual refresh", async () => {
+    vi.useFakeTimers()
+    try {
+      indexMocks.startIndex.mockResolvedValue({
+        runId: RUN_ID,
+        status: "queued",
+        commit: INDEX_COMMIT,
+      })
+      indexMocks.getLatestIndexRun.mockResolvedValue({
+        ...DONE_INDEX_RUN,
+        status: "running",
+        stats: undefined,
+        finishedAt: null,
+      })
+
+      render(<CodeReposPage />)
+      await flushPromises()
+
+      fireEvent.click(screen.getByRole("button", { name: "刷新索引" }))
+      await flushPromises()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1500 * 60)
+      })
+      await flushPromises()
+
+      expect(indexMocks.getLatestIndexRun).toHaveBeenCalledTimes(60)
+      expect(screen.getByText(/已停止自动刷新/)).toBeTruthy()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(6000)
+      })
+      expect(indexMocks.getLatestIndexRun).toHaveBeenCalledTimes(60)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("stops polling on unmount", async () => {
+    vi.useFakeTimers()
+    try {
+      indexMocks.startIndex.mockResolvedValue({
+        runId: RUN_ID,
+        status: "queued",
+        commit: INDEX_COMMIT,
+      })
+      indexMocks.getLatestIndexRun.mockResolvedValue({
+        ...DONE_INDEX_RUN,
+        status: "running",
+        stats: undefined,
+        finishedAt: null,
+      })
+
+      const view = render(<CodeReposPage />)
+      await flushPromises()
+
+      fireEvent.click(screen.getByRole("button", { name: "刷新索引" }))
+      await flushPromises()
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1500)
+      })
+      await flushPromises()
+      expect(indexMocks.getLatestIndexRun).toHaveBeenCalledTimes(1)
+
+      view.unmount()
+      const listCalls = mocks.listCodeRepos.mock.calls.length
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(6000)
+      })
+      expect(indexMocks.getLatestIndexRun).toHaveBeenCalledTimes(1)
+      expect(mocks.listCodeRepos).toHaveBeenCalledTimes(listCalls)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("shows an index error toast and does not poll when the trigger fails", async () => {
+    indexMocks.startIndex.mockRejectedValueOnce(indexError(409, "index_in_progress"))
+
+    render(<CodeReposPage />)
+    await screen.findByText("EzTest")
+
+    fireEvent.click(screen.getByRole("button", { name: "刷新索引" }))
+
+    const toast = await screen.findByRole("alert")
+    expect(toast.textContent).toContain("已有索引任务在运行")
+    expect(indexMocks.getLatestIndexRun).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole("button", { name: "关闭提示" }))
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull())
   })
 
   it("hides every write action for a readonly user and shows the readonly badge", async () => {
@@ -92,6 +352,7 @@ describe("CodeReposPage", () => {
     expect(screen.queryByRole("button", { name: "编辑" })).toBeNull()
     expect(screen.queryByRole("button", { name: "删除" })).toBeNull()
     expect(screen.queryByRole("button", { name: "重新校验" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "刷新索引" })).toBeNull()
     expect(screen.queryByLabelText("本地路径")).toBeNull()
   })
 
