@@ -277,6 +277,96 @@ func TestLoadOptionalFields(t *testing.T) {
 	}
 }
 
+// TestLoadCodeIntelDefaults pins the P4 codeintel defaults from design spec
+// §4.1.
+func TestLoadCodeIntelDefaults(t *testing.T) {
+	env := validEnv()
+	cfg, err := Load(func(k string) string { return env[k] })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.CodeIntelMaxChangedFiles != 20 ||
+		cfg.CodeIntelMaxFileBytes != 65536 ||
+		cfg.CodeIntelMaxIndexFiles != 5000 ||
+		cfg.CodeIntelAnalysisTimeoutMS != 180000 ||
+		cfg.CodeIntelMaxConcurrentAnalyses != 1 ||
+		cfg.CodeIntelPromptVersion != "p4.1" ||
+		cfg.CodeIntelMaxExcerptLines != 40 ||
+		cfg.CodeIntelMaxDiffBytes != 262144 {
+		t.Fatalf("unexpected codeintel defaults: %+v", cfg)
+	}
+}
+
+// TestLoadCodeIntelOverrides proves the eight P4 variables are trimmed and
+// parsed, including the prompt version character set.
+func TestLoadCodeIntelOverrides(t *testing.T) {
+	env := validEnv()
+	env["EZTEST_CODEINTEL_MAX_CHANGED_FILES"] = " 200 "
+	env["EZTEST_CODEINTEL_MAX_FILE_BYTES"] = "1048576"
+	env["EZTEST_CODEINTEL_MAX_INDEX_FILES"] = "1"
+	env["EZTEST_CODEINTEL_ANALYSIS_TIMEOUT_MS"] = "600000"
+	env["EZTEST_CODEINTEL_MAX_CONCURRENT_ANALYSES"] = "4"
+	env["EZTEST_CODEINTEL_PROMPT_VERSION"] = " p4.2-rc.1 "
+	env["EZTEST_CODEINTEL_MAX_EXCERPT_LINES"] = "200"
+	env["EZTEST_CODEINTEL_MAX_DIFF_BYTES"] = "4096"
+	cfg, err := Load(func(k string) string { return env[k] })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.CodeIntelMaxChangedFiles != 200 ||
+		cfg.CodeIntelMaxFileBytes != 1048576 ||
+		cfg.CodeIntelMaxIndexFiles != 1 ||
+		cfg.CodeIntelAnalysisTimeoutMS != 600000 ||
+		cfg.CodeIntelMaxConcurrentAnalyses != 4 ||
+		cfg.CodeIntelPromptVersion != "p4.2-rc.1" ||
+		cfg.CodeIntelMaxExcerptLines != 200 ||
+		cfg.CodeIntelMaxDiffBytes != 4096 {
+		t.Fatalf("unexpected codeintel overrides: %+v", cfg)
+	}
+}
+
+// TestLoadCodeIntelRejectsOutOfRange proves every P4 bound is validated at
+// startup with an error naming the offending environment variable.
+func TestLoadCodeIntelRejectsOutOfRange(t *testing.T) {
+	cases := []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{"changed files zero", "EZTEST_CODEINTEL_MAX_CHANGED_FILES", "0"},
+		{"changed files too high", "EZTEST_CODEINTEL_MAX_CHANGED_FILES", "201"},
+		{"changed files not a number", "EZTEST_CODEINTEL_MAX_CHANGED_FILES", "many"},
+		{"file bytes too low", "EZTEST_CODEINTEL_MAX_FILE_BYTES", "1023"},
+		{"file bytes too high", "EZTEST_CODEINTEL_MAX_FILE_BYTES", "1048577"},
+		{"index files zero", "EZTEST_CODEINTEL_MAX_INDEX_FILES", "0"},
+		{"index files too high", "EZTEST_CODEINTEL_MAX_INDEX_FILES", "50001"},
+		{"analysis timeout too low", "EZTEST_CODEINTEL_ANALYSIS_TIMEOUT_MS", "29999"},
+		{"analysis timeout too high", "EZTEST_CODEINTEL_ANALYSIS_TIMEOUT_MS", "600001"},
+		{"concurrent analyses zero", "EZTEST_CODEINTEL_MAX_CONCURRENT_ANALYSES", "0"},
+		{"concurrent analyses too high", "EZTEST_CODEINTEL_MAX_CONCURRENT_ANALYSES", "5"},
+		{"prompt version illegal chars", "EZTEST_CODEINTEL_PROMPT_VERSION", "bad version!"},
+		{"prompt version uppercase", "EZTEST_CODEINTEL_PROMPT_VERSION", "P4.1"},
+		{"prompt version too long", "EZTEST_CODEINTEL_PROMPT_VERSION", strings.Repeat("a", 33)},
+		{"excerpt lines zero", "EZTEST_CODEINTEL_MAX_EXCERPT_LINES", "0"},
+		{"excerpt lines too high", "EZTEST_CODEINTEL_MAX_EXCERPT_LINES", "201"},
+		{"diff bytes too low", "EZTEST_CODEINTEL_MAX_DIFF_BYTES", "4095"},
+		{"diff bytes too high", "EZTEST_CODEINTEL_MAX_DIFF_BYTES", "1048577"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := validEnv()
+			env[tc.key] = tc.value
+			_, err := Load(func(k string) string { return env[k] })
+			if err == nil {
+				t.Fatalf("Load accepted %s=%q", tc.key, tc.value)
+			}
+			if !strings.Contains(err.Error(), tc.key) {
+				t.Fatalf("error %q does not name %s", err, tc.key)
+			}
+		})
+	}
+}
+
 // TestLoadP3Defaults pins the P3 version-context defaults from design spec
 // §4.1: the attachment filesystem root and the Snowflake node ID.
 func TestLoadP3Defaults(t *testing.T) {

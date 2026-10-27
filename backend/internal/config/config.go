@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -52,6 +53,16 @@ type Config struct {
 	// AgentMaxConcurrentRuns bounds the process-wide number of running Agent
 	// runs.
 	AgentMaxConcurrentRuns int
+	// P4 codeintel settings (design spec §4.1). The prompt version participates
+	// in the analysis cache key and in fact versioning.
+	CodeIntelMaxChangedFiles       int
+	CodeIntelMaxFileBytes          int
+	CodeIntelMaxIndexFiles         int
+	CodeIntelAnalysisTimeoutMS     int
+	CodeIntelMaxConcurrentAnalyses int
+	CodeIntelPromptVersion         string
+	CodeIntelMaxExcerptLines       int
+	CodeIntelMaxDiffBytes          int
 
 	EnableTestEndpoints bool
 	LogLevel            slog.Level
@@ -74,6 +85,36 @@ const (
 	minSnowflakeNodeID     = 0
 	maxSnowflakeNodeID     = 1023
 )
+
+// P4 codeintel defaults and bounds from design spec §4.1.
+const (
+	defaultCodeIntelMaxChangedFiles       = 20
+	minCodeIntelMaxChangedFiles           = 1
+	maxCodeIntelMaxChangedFiles           = 200
+	defaultCodeIntelMaxFileBytes          = 65536
+	minCodeIntelMaxFileBytes              = 1024
+	maxCodeIntelMaxFileBytes              = 1048576
+	defaultCodeIntelMaxIndexFiles         = 5000
+	minCodeIntelMaxIndexFiles             = 1
+	maxCodeIntelMaxIndexFiles             = 50000
+	defaultCodeIntelAnalysisTimeoutMS     = 180000
+	minCodeIntelAnalysisTimeoutMS         = 30000
+	maxCodeIntelAnalysisTimeoutMS         = 600000
+	defaultCodeIntelMaxConcurrentAnalyses = 1
+	minCodeIntelMaxConcurrentAnalyses     = 1
+	maxCodeIntelMaxConcurrentAnalyses     = 4
+	defaultCodeIntelPromptVersion         = "p4.1"
+	defaultCodeIntelMaxExcerptLines       = 40
+	minCodeIntelMaxExcerptLines           = 1
+	maxCodeIntelMaxExcerptLines           = 200
+	defaultCodeIntelMaxDiffBytes          = 262144
+	minCodeIntelMaxDiffBytes              = 4096
+	maxCodeIntelMaxDiffBytes              = 1048576
+)
+
+// codeIntelPromptVersionPattern is the prompt version alphabet from design
+// spec §4.1: 1–32 lowercase letters, digits, dots and hyphens.
+var codeIntelPromptVersionPattern = regexp.MustCompile(`^[a-z0-9.-]{1,32}$`)
 
 // defaultAgentHTTPAllowlist is the localhost-only HTTP allowlist applied when
 // EZTEST_AGENT_HTTP_ALLOWLIST is unset.
@@ -131,6 +172,63 @@ func Load(getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 	cfg.SnowflakeNodeID = int64(nodeID)
+
+	maxChangedFiles, err := parseBoundedInt(getenv, "EZTEST_CODEINTEL_MAX_CHANGED_FILES",
+		defaultCodeIntelMaxChangedFiles, minCodeIntelMaxChangedFiles, maxCodeIntelMaxChangedFiles)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.CodeIntelMaxChangedFiles = maxChangedFiles
+
+	maxFileBytes, err := parseBoundedInt(getenv, "EZTEST_CODEINTEL_MAX_FILE_BYTES",
+		defaultCodeIntelMaxFileBytes, minCodeIntelMaxFileBytes, maxCodeIntelMaxFileBytes)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.CodeIntelMaxFileBytes = maxFileBytes
+
+	maxIndexFiles, err := parseBoundedInt(getenv, "EZTEST_CODEINTEL_MAX_INDEX_FILES",
+		defaultCodeIntelMaxIndexFiles, minCodeIntelMaxIndexFiles, maxCodeIntelMaxIndexFiles)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.CodeIntelMaxIndexFiles = maxIndexFiles
+
+	analysisTimeout, err := parseBoundedInt(getenv, "EZTEST_CODEINTEL_ANALYSIS_TIMEOUT_MS",
+		defaultCodeIntelAnalysisTimeoutMS, minCodeIntelAnalysisTimeoutMS, maxCodeIntelAnalysisTimeoutMS)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.CodeIntelAnalysisTimeoutMS = analysisTimeout
+
+	maxConcurrentAnalyses, err := parseBoundedInt(getenv, "EZTEST_CODEINTEL_MAX_CONCURRENT_ANALYSES",
+		defaultCodeIntelMaxConcurrentAnalyses, minCodeIntelMaxConcurrentAnalyses, maxCodeIntelMaxConcurrentAnalyses)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.CodeIntelMaxConcurrentAnalyses = maxConcurrentAnalyses
+
+	cfg.CodeIntelPromptVersion = valueOr(getenv, "EZTEST_CODEINTEL_PROMPT_VERSION",
+		defaultCodeIntelPromptVersion)
+	if !codeIntelPromptVersionPattern.MatchString(cfg.CodeIntelPromptVersion) {
+		return Config{}, fmt.Errorf(
+			"config: EZTEST_CODEINTEL_PROMPT_VERSION must match %s, got %q",
+			codeIntelPromptVersionPattern, cfg.CodeIntelPromptVersion)
+	}
+
+	maxExcerptLines, err := parseBoundedInt(getenv, "EZTEST_CODEINTEL_MAX_EXCERPT_LINES",
+		defaultCodeIntelMaxExcerptLines, minCodeIntelMaxExcerptLines, maxCodeIntelMaxExcerptLines)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.CodeIntelMaxExcerptLines = maxExcerptLines
+
+	maxDiffBytes, err := parseBoundedInt(getenv, "EZTEST_CODEINTEL_MAX_DIFF_BYTES",
+		defaultCodeIntelMaxDiffBytes, minCodeIntelMaxDiffBytes, maxCodeIntelMaxDiffBytes)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.CodeIntelMaxDiffBytes = maxDiffBytes
 
 	keys, err := parseSecretKeys(getenv("EZTEST_SECRET_KEYS"))
 	if err != nil {

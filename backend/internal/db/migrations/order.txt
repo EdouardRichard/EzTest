@@ -12,3 +12,5 @@ resource_0003_code_repositories.sql
 version_0001_versions_requirements.sql
 version_0002_clarification.sql
 agent_0002_activity_channel.sql
+codeintel_0001_code_facts.sql
+codeintel_0002_code_impact.sql
