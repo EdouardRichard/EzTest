@@ -501,6 +501,7 @@ CREATE TABLE IF NOT EXISTS code_repositories (
 ### 6.5 租约（应用层，无 HTTP）
 
 - `Acquire(ctx, sessionID, holder, ttl)`：要求 Session `valid` 且未过期；无活跃 lease；`expires_at = min(now+ttl(默认30min), session.expires_at)`；唯一索引冲突 → `lease_conflict`。
+- Acquire 在同一事务内先惰性回收该 Session 已过期但未释放的 lease（`released_at=now(), released_reason='expired'`），再插入新 lease；`GetActiveLease` 只认 `released_at IS NULL AND expires_at > now()`。否则部分唯一索引会使过期 lease 永久阻塞复用。
 - `Release(ctx, sessionID, holder, reason)`：CAS 更新 `released_at`。
 - 撤销/失效时批量释放。
 - P6 执行器直接调用应用服务；P2 仅集成测试覆盖。
