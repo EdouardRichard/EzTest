@@ -180,3 +180,52 @@ func TestProfileUpdateValidatesAndAudits(t *testing.T) {
 		}
 	})
 }
+
+// TestProfileGetByKey pins the P3 key→profile lookup used by adapters to
+// resolve a configured profile key to its stored row (spec §8.2 item 5).
+func TestProfileGetByKey(t *testing.T) {
+	dialog := domain.ClarificationProfiles()[0]
+	dialog.ID = 11
+	analysis := domain.ClarificationProfiles()[1]
+	analysis.ID = 12
+
+	t.Run("returns the matching profile", func(t *testing.T) {
+		repo := &svcFakeProfileRepository{profiles: []domain.AgentProfile{dialog, analysis}}
+		svc := application.NewProfileService(repo, nil)
+
+		got, err := svc.GetByKey(context.Background(), "requirement-analysis")
+		if err != nil {
+			t.Fatalf("GetByKey(requirement-analysis) error: %v", err)
+		}
+		if got.ID != 12 || got.Key != "requirement-analysis" {
+			t.Fatalf("GetByKey returned id=%d key=%q want 12/requirement-analysis", got.ID, got.Key)
+		}
+	})
+
+	t.Run("missing key is reported as not found", func(t *testing.T) {
+		repo := &svcFakeProfileRepository{profiles: []domain.AgentProfile{dialog, analysis}}
+		svc := application.NewProfileService(repo, nil)
+
+		if _, err := svc.GetByKey(context.Background(), "no-such-profile"); !errors.Is(err, domain.ErrNotFound) {
+			t.Fatalf("GetByKey(missing) error=%v want domain.ErrNotFound", err)
+		}
+	})
+
+	t.Run("empty repository is reported as not found", func(t *testing.T) {
+		svc := application.NewProfileService(&svcFakeProfileRepository{}, nil)
+
+		if _, err := svc.GetByKey(context.Background(), ""); !errors.Is(err, domain.ErrNotFound) {
+			t.Fatalf("GetByKey(\"\") error=%v want domain.ErrNotFound", err)
+		}
+	})
+
+	t.Run("repository failure is propagated", func(t *testing.T) {
+		repoErr := errors.New("profile store is down")
+		repo := &svcFakeProfileRepository{listErr: repoErr}
+		svc := application.NewProfileService(repo, nil)
+
+		if _, err := svc.GetByKey(context.Background(), "clarification-dialog"); !errors.Is(err, repoErr) {
+			t.Fatalf("GetByKey error=%v want the repository error", err)
+		}
+	})
+}

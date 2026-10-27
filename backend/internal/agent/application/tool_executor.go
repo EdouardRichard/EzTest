@@ -134,7 +134,11 @@ func (r *ToolRegistry) ToolInfos() []domain.ToolInfo {
 type ToolCallInput struct {
 	RunID, SessionID int64
 	ActorUserID      *int64
-	Call             domain.ToolCall
+	// ProfileKey is the key of the profile that owns the run. The executor
+	// forwards it in the Invocation context together with the run, session and
+	// actor identity.
+	ProfileKey string
+	Call       domain.ToolCall
 	// Allowed is the profile's tool allowlist; a call outside it is denied
 	// without executing the tool.
 	Allowed []string
@@ -200,15 +204,22 @@ func (e *ToolExecutor) run(ctx context.Context, in ToolCallInput) (execution Too
 	if err != nil {
 		return toolExecutionFailure(ToolStatusError, toolErrorCodeInvalidArguments, err.Error())
 	}
-	return e.invoke(ctx, tool, args)
+	return e.invoke(ctx, tool, args, in)
 }
 
-// invoke calls the tool under the executor timeout and maps its outcome.
-func (e *ToolExecutor) invoke(ctx context.Context, tool domain.Tool, args json.RawMessage) ToolExecution {
-	toolCtx := ctx
+// invoke calls the tool under the executor timeout and maps its outcome. The
+// invocation context is attached first so the tool always sees the run-scoped
+// identity the executor was given; a value a caller left in ctx is replaced.
+func (e *ToolExecutor) invoke(ctx context.Context, tool domain.Tool, args json.RawMessage, in ToolCallInput) ToolExecution {
+	toolCtx := WithToolInvocation(ctx, Invocation{
+		SessionID:   in.SessionID,
+		RunID:       in.RunID,
+		ActorUserID: in.ActorUserID,
+		ProfileKey:  in.ProfileKey,
+	})
 	if e.timeout > 0 {
 		var cancel context.CancelFunc
-		toolCtx, cancel = context.WithTimeout(ctx, e.timeout)
+		toolCtx, cancel = context.WithTimeout(toolCtx, e.timeout)
 		defer cancel()
 	}
 

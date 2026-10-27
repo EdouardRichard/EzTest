@@ -38,6 +38,23 @@ func (s *ProfileService) Get(ctx context.Context, id int64) (domain.AgentProfile
 	return s.profiles.Get(ctx, id)
 }
 
+// GetByKey returns the profile with the given stable key or domain.ErrNotFound.
+// P3 adapters resolve a configured profile key to its stored row (and id) with
+// it (design spec §8.2 item 5). The profile table is small and the repository
+// has no key lookup, so the list is scanned.
+func (s *ProfileService) GetByKey(ctx context.Context, key string) (domain.AgentProfile, error) {
+	profiles, err := s.profiles.List(ctx)
+	if err != nil {
+		return domain.AgentProfile{}, err
+	}
+	for _, profile := range profiles {
+		if profile.Key == key {
+			return profile, nil
+		}
+	}
+	return domain.AgentProfile{}, domain.ErrNotFound
+}
+
 // Update applies a partial update to the stored profile. The merged profile is
 // validated before the repository writes it; a failed validation leaves the
 // stored row untouched. A successful update records agent.profile.updated with
