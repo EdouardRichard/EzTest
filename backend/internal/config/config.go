@@ -31,6 +31,12 @@ type Config struct {
 	SecretKeys      map[int][]byte
 	SecretKeyActive int
 	StorageDir      string
+	// VersionAttachmentDir is the root of the P3 version attachment file store
+	// (design spec §4.1, D30). Docker maps it to /data/version-attachments.
+	VersionAttachmentDir string
+	// SnowflakeNodeID is this process's 10-bit node ID for application-side
+	// primary key generation (D29). It must be unique per running instance.
+	SnowflakeNodeID int64
 	// OpenAPIPath locates the hand-maintained OpenAPI document served by
 	// GET /api/openapi.yaml. It is relative to the process working directory by
 	// default so the deployed image only needs to ship the file at that path.
@@ -62,6 +68,13 @@ const (
 	maxAgentMaxConcurrentRuns     = 32
 )
 
+// Snowflake node defaults and bounds from design spec §4.1 (D29).
+const (
+	defaultSnowflakeNodeID = 1
+	minSnowflakeNodeID     = 0
+	maxSnowflakeNodeID     = 1023
+)
+
 // defaultAgentHTTPAllowlist is the localhost-only HTTP allowlist applied when
 // EZTEST_AGENT_HTTP_ALLOWLIST is unset.
 var defaultAgentHTTPAllowlist = []string{"127.0.0.1", "localhost"}
@@ -78,8 +91,10 @@ func Load(getenv func(string) string) (Config, error) {
 		AdminUsername:   strings.TrimSpace(getenv("EZTEST_ADMIN_USERNAME")),
 		AdminPassword:   getenv("EZTEST_ADMIN_PASSWORD"),
 		StorageDir:      valueOr(getenv, "EZTEST_STORAGE_DIR", ".data/objects"),
-		OpenAPIPath:     valueOr(getenv, "EZTEST_OPENAPI_PATH", "docs/openapi/api.yaml"),
-		AgentFileRoot:   strings.TrimSpace(getenv("EZTEST_AGENT_FILE_ROOT")),
+		VersionAttachmentDir: valueOr(getenv, "EZTEST_VERSION_ATTACHMENT_DIR",
+			".data/version-attachments"),
+		OpenAPIPath:   valueOr(getenv, "EZTEST_OPENAPI_PATH", "docs/openapi/api.yaml"),
+		AgentFileRoot: strings.TrimSpace(getenv("EZTEST_AGENT_FILE_ROOT")),
 		LLMSeed: LLMSeed{
 			BaseURL: strings.TrimSpace(getenv("llm_base_url")),
 			Key:     strings.TrimSpace(getenv("llm_key")),
@@ -96,19 +111,26 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 	cfg.AgentHTTPAllowlist = allowlist
 
-	toolTimeout, err := parseAgentInt(getenv, "EZTEST_AGENT_TOOL_TIMEOUT_MS",
+	toolTimeout, err := parseBoundedInt(getenv, "EZTEST_AGENT_TOOL_TIMEOUT_MS",
 		defaultAgentToolTimeoutMS, minAgentToolTimeoutMS, maxAgentToolTimeoutMS)
 	if err != nil {
 		return Config{}, err
 	}
 	cfg.AgentToolTimeoutMS = toolTimeout
 
-	maxConcurrentRuns, err := parseAgentInt(getenv, "EZTEST_AGENT_MAX_CONCURRENT_RUNS",
+	maxConcurrentRuns, err := parseBoundedInt(getenv, "EZTEST_AGENT_MAX_CONCURRENT_RUNS",
 		defaultAgentMaxConcurrentRuns, minAgentMaxConcurrentRuns, maxAgentMaxConcurrentRuns)
 	if err != nil {
 		return Config{}, err
 	}
 	cfg.AgentMaxConcurrentRuns = maxConcurrentRuns
+
+	nodeID, err := parseBoundedInt(getenv, "EZTEST_SNOWFLAKE_NODE_ID",
+		defaultSnowflakeNodeID, minSnowflakeNodeID, maxSnowflakeNodeID)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.SnowflakeNodeID = int64(nodeID)
 
 	keys, err := parseSecretKeys(getenv("EZTEST_SECRET_KEYS"))
 	if err != nil {
@@ -178,9 +200,10 @@ func parseAgentHTTPAllowlist(raw string) ([]string, error) {
 	return hosts, nil
 }
 
-// parseAgentInt parses one bounded Agent integer setting. An empty value
-// selects def; anything else must be a number inside [min, max].
-func parseAgentInt(getenv func(string) string, key string, def, min, max int) (int, error) {
+// parseBoundedInt parses one bounded integer setting. An empty value selects
+// def; anything else must be a number inside [min, max]. The returned error
+// names the offending environment variable.
+func parseBoundedInt(getenv func(string) string, key string, def, min, max int) (int, error) {
 	raw := strings.TrimSpace(getenv(key))
 	if raw == "" {
 		return def, nil

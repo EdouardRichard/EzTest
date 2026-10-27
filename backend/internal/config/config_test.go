@@ -276,3 +276,74 @@ func TestLoadOptionalFields(t *testing.T) {
 		t.Fatalf("LLMSeed=%+v", cfg.LLMSeed)
 	}
 }
+
+// TestLoadP3Defaults pins the P3 version-context defaults from design spec
+// §4.1: the attachment filesystem root and the Snowflake node ID.
+func TestLoadP3Defaults(t *testing.T) {
+	env := validEnv()
+	cfg, err := Load(func(k string) string { return env[k] })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.VersionAttachmentDir != ".data/version-attachments" {
+		t.Fatalf("VersionAttachmentDir=%q want .data/version-attachments", cfg.VersionAttachmentDir)
+	}
+	if cfg.SnowflakeNodeID != 1 {
+		t.Fatalf("SnowflakeNodeID=%d want 1", cfg.SnowflakeNodeID)
+	}
+}
+
+// TestLoadP3Overrides proves the P3 environment variables are parsed and
+// trimmed, including a Docker-style absolute attachment directory.
+func TestLoadP3Overrides(t *testing.T) {
+	env := validEnv()
+	env["EZTEST_VERSION_ATTACHMENT_DIR"] = "  /data/version-attachments  "
+	env["EZTEST_SNOWFLAKE_NODE_ID"] = "17"
+	cfg, err := Load(func(k string) string { return env[k] })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.VersionAttachmentDir != "/data/version-attachments" {
+		t.Fatalf("VersionAttachmentDir=%q", cfg.VersionAttachmentDir)
+	}
+	if cfg.SnowflakeNodeID != 17 {
+		t.Fatalf("SnowflakeNodeID=%d", cfg.SnowflakeNodeID)
+	}
+}
+
+// TestLoadSnowflakeNodeBounds proves the Snowflake node ID is validated to
+// 0..1023 at startup, with an error naming the offending variable.
+func TestLoadSnowflakeNodeBounds(t *testing.T) {
+	for _, value := range []string{"-1", "1024"} {
+		t.Run("rejects "+value, func(t *testing.T) {
+			env := validEnv()
+			env["EZTEST_SNOWFLAKE_NODE_ID"] = value
+			_, err := Load(func(k string) string { return env[k] })
+			if err == nil {
+				t.Fatalf("Load accepted EZTEST_SNOWFLAKE_NODE_ID=%q", value)
+			}
+			if !strings.Contains(err.Error(), "EZTEST_SNOWFLAKE_NODE_ID") {
+				t.Fatalf("error %q does not name EZTEST_SNOWFLAKE_NODE_ID", err)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		value string
+		want  int64
+	}{
+		{"0", 0},
+		{"1023", 1023},
+	} {
+		t.Run("accepts "+tc.value, func(t *testing.T) {
+			env := validEnv()
+			env["EZTEST_SNOWFLAKE_NODE_ID"] = tc.value
+			cfg, err := Load(func(k string) string { return env[k] })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.SnowflakeNodeID != tc.want {
+				t.Fatalf("SnowflakeNodeID=%d want %d", cfg.SnowflakeNodeID, tc.want)
+			}
+		})
+	}
+}
