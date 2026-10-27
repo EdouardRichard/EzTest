@@ -1701,7 +1701,7 @@ test("admin runs the validation agent end to end", async ({ page, request }) => 
   // 6. page.reload() → expect 历史文本 "诊断完成" 与至少两个 run 分隔
 });
 test("prompt edit applies to the next run", async ({ page }) => {
-  // 配置 Tab → 系统提示词追加 "E2E-MARKER-<ts>" → 保存 → "下次运行生效"
+  // 配置 Tab → 在系统提示词**开头**插入 "E2E-MARKER-<ts>"（fake 的 ECHO_SYSTEM 只回显前 80 字符）→ 保存 → "下次运行生效"
   // 会话 Tab → 发 "ECHO_SYSTEM" → expect 文本含 marker
 });
 test("regular user sees the admin-only state and gets 403", async ({ page, request }) => {
