@@ -8,6 +8,8 @@
 // Endpoints:
 //   GET  /v1/models
 //   POST /v1/chat/completions   (streaming and non-streaming)
+//   GET  /__p4-mode             (test-only: the active P4 scenario mode)
+//   POST /__p4-mode             (test-only: switch the P4 scenario at runtime)
 //
 // Every chat-completions request body is appended as one JSON line to
 // .tmp/fake-llm-requests.jsonl so Playwright can assert the outbound wire
@@ -620,6 +622,36 @@ async function handleP3Scenario(messages, res, stream) {
 
 // --- P4 scripted behaviors -------------------------------------------------
 
+/**
+ * Test-only runtime control of EZTEST_FAKE_LLM_P4_MODE (design spec §10.5 item
+ * 3). The degraded E2E switches the fake to `error` while the servers are
+ * already running and restores `ok` afterwards, so a whole restart is not
+ * needed. The handle is only exposed by this local fake upstream.
+ */
+async function handleP4ModeControl(req, res) {
+  const raw = await readBody(req);
+  let body;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    sendError(res, 400, "invalid json body");
+    return;
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    sendError(res, 400, "invalid json body");
+    return;
+  }
+  const mode = String(body.mode || "")
+    .trim()
+    .toLowerCase();
+  if (!P4_MODES.has(mode)) {
+    sendError(res, 400, "mode must be one of ok, error, partial, impact-ai");
+    return;
+  }
+  process.env.EZTEST_FAKE_LLM_P4_MODE = mode;
+  sendJson(res, 200, { mode: p4Mode() });
+}
+
 function p4Mode() {
   const value = String(process.env.EZTEST_FAKE_LLM_P4_MODE || "ok")
     .trim()
@@ -997,6 +1029,16 @@ async function handleRequest(req, res) {
   }
   if (req.method === "POST" && pathname === "/v1/chat/completions") {
     await handleChatCompletions(req, res);
+    return;
+  }
+  // Test-only P4 scenario control (design spec §10.5 item 3): never part of the
+  // provider wire contract, so it sits outside /v1.
+  if (req.method === "POST" && pathname === "/__p4-mode") {
+    await handleP4ModeControl(req, res);
+    return;
+  }
+  if (req.method === "GET" && pathname === "/__p4-mode") {
+    sendJson(res, 200, { mode: p4Mode() });
     return;
   }
   sendError(res, 404, "not found");

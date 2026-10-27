@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
 // Analysis-service constants. The configuration bounds mirror design spec §4.1;
@@ -172,6 +173,9 @@ type AnalysisServiceDeps struct {
 type analysisRunRef struct {
 	versionID int64
 	force     bool
+	// requestID is the HTTP request id of the trigger. The worker re-attaches it
+	// to the run context so the completion audit stays request-correlated (P0).
+	requestID string
 }
 
 // AnalysisService implements the version-scoped impact analysis run (design
@@ -322,7 +326,7 @@ func (s *AnalysisService) Start(ctx context.Context, versionID, actorID int64, h
 	if err := s.deps.Analyses.Create(ctx, analysis); err != nil {
 		return domain.CodeAnalysis{}, false, err
 	}
-	s.rememberAnalysis(analysis.ID, versionID, force)
+	s.rememberAnalysis(analysis.ID, versionID, force, platform.RequestID(ctx))
 	if err := s.enqueueAnalysis(analysis); err != nil {
 		return s.failEnqueuedAnalysis(ctx, analysis, err)
 	}
@@ -462,6 +466,11 @@ func (s *AnalysisService) Run(ctx context.Context, analysisID int64) (err error)
 	if !ok {
 		return domain.NewNotFound("analysis_not_found",
 			fmt.Sprintf("codeintel: analysis %d is not owned by this service", analysisID))
+	}
+	// The worker goroutine is detached from the trigger request; re-attach the
+	// request id so the completion audit stays correlated (P0).
+	if ref.requestID != "" {
+		ctx = platform.WithRequestID(ctx, ref.requestID)
 	}
 	analysis, err := s.deps.Analyses.GetByID(ctx, ref.versionID, analysisID)
 	if err != nil {
@@ -1959,11 +1968,11 @@ func (s *AnalysisService) now() time.Time {
 	return time.Now().UTC()
 }
 
-// rememberAnalysis records the version/force of a queued analysis.
-func (s *AnalysisService) rememberAnalysis(analysisID, versionID int64, force bool) {
+// rememberAnalysis records the version/force/request id of a queued analysis.
+func (s *AnalysisService) rememberAnalysis(analysisID, versionID int64, force bool, requestID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.runs[analysisID] = analysisRunRef{versionID: versionID, force: force}
+	s.runs[analysisID] = analysisRunRef{versionID: versionID, force: force, requestID: requestID}
 }
 
 // analysisRef returns the registry entry of one analysis.

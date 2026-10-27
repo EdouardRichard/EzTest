@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
 // Unit-test fixture content of the analysed files. The line numbers of the
@@ -2327,6 +2328,39 @@ func TestRunPersistsCandidatesAndSelection(t *testing.T) {
 		t.Fatalf("completion audit = %+v, want code.analyze done", completion)
 	}
 	assertNoCodeContentInAudit(t, f.audit.calls)
+}
+
+// TestRunPropagatesTriggerRequestIDToCompletionAudit pins the correlation of
+// async analysis audits: Start copies the HTTP request id into the in-process
+// run registry and Run re-attaches it to the worker context, so the trigger and
+// the completion code.analyze entries both belong to the request that started
+// the analysis (the completion runs on the worker goroutine).
+func TestRunPropagatesTriggerRequestIDToCompletionAudit(t *testing.T) {
+	f := newAnalysisFixture(t)
+	f.changeSet(analysisChangedFile(1, "web/src/api/refund.ts", "M"))
+	f.llm.responses["web/src/api/refund.ts"] = clientFactResponse()
+
+	const requestID = "req_e2e_analyze_1234"
+	analysis, reused, err := f.svc.Start(
+		platform.WithRequestID(context.Background(), requestID), 11, 42, "", false)
+	if err != nil {
+		t.Fatalf("Start error = %v", err)
+	}
+	if reused {
+		t.Fatal("Start reused = true, want a new queued analysis")
+	}
+	if err := f.svc.Run(context.Background(), analysis.ID); err != nil {
+		t.Fatalf("Run error = %v", err)
+	}
+
+	if len(f.audit.calls) != 2 {
+		t.Fatalf("audit calls = %+v, want one trigger and one completion", f.audit.calls)
+	}
+	for index, call := range f.audit.calls {
+		if call.requestID != requestID {
+			t.Fatalf("audit[%d] %s request id = %q, want %q", index, call.detail["status"], call.requestID, requestID)
+		}
+	}
 }
 
 // TestRunPlannerReceivesCrossFileFacts pins that a fact whose own path is not a

@@ -7,8 +7,10 @@ import (
 	"strings"
 	"testing"
 
+	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	auditdomain "github.com/EdouardRichard/EzTest/backend/internal/audit/domain"
 	codeintelaudit "github.com/EdouardRichard/EzTest/backend/internal/codeintel/infrastructure/audit"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
 // fakeRecorder captures every audit entry the adapter records.
@@ -239,4 +241,53 @@ func TestAuditRecorderErrors(t *testing.T) {
 			t.Fatalf("Record(nil recorder)=%v want nil", err)
 		}
 	})
+}
+
+// TestAuditRecorderStampsRequestCorrelation pins the P0 correlation contract for
+// code audits: an entry recorded on an HTTP request path carries that request's
+// metadata, and an entry recorded by the async analysis worker keeps the request
+// id the trigger copied into the run context (no IP/User-Agent there).
+func TestAuditRecorderStampsRequestCorrelation(t *testing.T) {
+	recorder := &fakeRecorder{}
+	adapter := codeintelaudit.NewRecorder(recorder)
+
+	httpCtx := auditapp.WithMeta(context.Background(), auditapp.RequestMeta{
+		RequestID: "req_http_1234",
+		IP:        "203.0.113.7",
+		UserAgent: "eztest-e2e",
+	})
+	if err := adapter.Record(httpCtx, 7, "code.analyze", "analysis:1", map[string]any{"status": "queued"}); err != nil {
+		t.Fatalf("Record(http): %v", err)
+	}
+
+	workerCtx := platform.WithRequestID(context.Background(), "req_worker_5678")
+	if err := adapter.Record(workerCtx, 7, "code.analyze", "analysis:2", map[string]any{"status": "done"}); err != nil {
+		t.Fatalf("Record(worker): %v", err)
+	}
+
+	if err := adapter.Record(context.Background(), 7, "code.read", "code_repository:42", nil); err != nil {
+		t.Fatalf("Record(background): %v", err)
+	}
+
+	if len(recorder.entries) != 3 {
+		t.Fatalf("entries=%d want 3", len(recorder.entries))
+	}
+	httpEntry := recorder.entries[0]
+	if httpEntry.RequestID != "req_http_1234" || httpEntry.IP != "203.0.113.7" ||
+		httpEntry.UserAgent != "eztest-e2e" {
+		t.Fatalf("http entry correlation=(%q,%q,%q) want the request metadata",
+			httpEntry.RequestID, httpEntry.IP, httpEntry.UserAgent)
+	}
+	workerEntry := recorder.entries[1]
+	if workerEntry.RequestID != "req_worker_5678" {
+		t.Fatalf("worker entry request id=%q want req_worker_5678", workerEntry.RequestID)
+	}
+	if workerEntry.IP != "" || workerEntry.UserAgent != "" {
+		t.Fatalf("worker entry ip/ua=(%q,%q) want empty", workerEntry.IP, workerEntry.UserAgent)
+	}
+	backgroundEntry := recorder.entries[2]
+	if backgroundEntry.RequestID != "" || backgroundEntry.IP != "" || backgroundEntry.UserAgent != "" {
+		t.Fatalf("background entry correlation=(%q,%q,%q) want empty",
+			backgroundEntry.RequestID, backgroundEntry.IP, backgroundEntry.UserAgent)
+	}
 }
