@@ -85,6 +85,35 @@ func TestRecordMapsEntry(t *testing.T) {
 	}
 }
 
+// TestRecordFallsBackToRunRequestID pins the T19 contract: a tool audit is
+// recorded from the run goroutine, which carries the request ID copied by
+// RunService.Start but none of the HTTP request metadata. The sink must stamp
+// that request ID while leaving the IP and User-Agent untouched, because the
+// run never observed them.
+func TestRecordFallsBackToRunRequestID(t *testing.T) {
+	recorder := &capturingRecorder{}
+	sink := NewSink(recorder)
+	ctx := agentapp.WithRequestID(context.Background(), "req_tool_audit_1")
+
+	err := sink.Record(ctx, agentapp.AuditEvent{
+		Action:   agentapp.ActionToolInvoked,
+		Metadata: map[string]any{"tool": "file.list", "status": "ok"},
+	})
+	if err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	if len(recorder.entries) != 1 {
+		t.Fatalf("recorded entries=%d want 1", len(recorder.entries))
+	}
+	entry := recorder.entries[0]
+	if entry.RequestID != "req_tool_audit_1" {
+		t.Fatalf("RequestID=%q want req_tool_audit_1", entry.RequestID)
+	}
+	if entry.IP != "" || entry.UserAgent != "" {
+		t.Fatalf("run-scoped audit leaked request metadata: IP=%q UserAgent=%q want empty", entry.IP, entry.UserAgent)
+	}
+}
+
 func TestRecordDetachesCancellation(t *testing.T) {
 	recorder := &capturingRecorder{}
 	sink := NewSink(recorder)

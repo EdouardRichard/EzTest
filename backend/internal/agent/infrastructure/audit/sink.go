@@ -60,6 +60,13 @@ func (s *Sink) Record(ctx context.Context, event agentapp.AuditEvent) error {
 		entry.IP = meta.IP
 		entry.UserAgent = meta.UserAgent
 	}
+	// Tool audits are recorded from the run goroutine, which carries the
+	// request ID copied by RunService.Start but no HTTP request metadata.
+	// Prefer the request-level values above when present; fall back to the run
+	// context otherwise so every run-scoped entry stays correlated (T19).
+	if entry.RequestID == "" {
+		entry.RequestID = agentapp.RequestIDFromContext(ctx)
+	}
 	if err := s.recorder.Record(recordCtx, entry); err != nil {
 		slog.ErrorContext(ctx, "agent: record audit entry",
 			"action", event.Action, "target_type", event.TargetType, "target_id", event.TargetID, "error", err)
