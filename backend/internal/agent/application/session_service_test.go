@@ -195,15 +195,32 @@ func (r *svcFakeRunRepository) MarkRunningInterrupted(context.Context) (int64, e
 	return 0, nil
 }
 
-// svcFakeMessageRepository returns one configured message.
+// svcFakeMessageRepository returns one configured message and, when the list
+// fields are set, the configured session history.
 type svcFakeMessageRepository struct {
 	message domain.Message
 	getErr  error
+
+	messages  []domain.Message
+	listErr   error
+	listCalls int
+	listID    int64
 }
 
-// ListBySession is unused by SessionService.
-func (r *svcFakeMessageRepository) ListBySession(context.Context, int64) ([]domain.Message, error) {
-	return nil, nil
+// ListBySession returns the configured messages of sessionID ordered by id.
+func (r *svcFakeMessageRepository) ListBySession(_ context.Context, sessionID int64) ([]domain.Message, error) {
+	r.listCalls++
+	r.listID = sessionID
+	if r.listErr != nil {
+		return nil, r.listErr
+	}
+	matches := make([]domain.Message, 0, len(r.messages))
+	for _, message := range r.messages {
+		if message.SessionID == sessionID {
+			matches = append(matches, message)
+		}
+	}
+	return matches, nil
 }
 
 // Get returns the configured message.
@@ -626,6 +643,97 @@ func TestSessionMessageRejectsMessageFromAnotherSession(t *testing.T) {
 			t.Fatalf("Message returned %+v want message 42", got)
 		}
 	})
+}
+
+// TestSessionListMessagesPagination pins the P3 message-history primitive: a
+// before_id cursor selects older messages, the newest page is returned
+// oldest-to-newest, and hasMore reports whether older messages remain.
+func TestSessionListMessagesPagination(t *testing.T) {
+	history := func() *svcFakeMessageRepository {
+		return &svcFakeMessageRepository{messages: []domain.Message{
+			{ID: 1, SessionID: 7, Role: "user"},
+			{ID: 2, SessionID: 7, Role: "assistant"},
+			{ID: 3, SessionID: 7, Role: "user"},
+			{ID: 4, SessionID: 7, Role: "assistant"},
+			{ID: 5, SessionID: 7, Role: "user"},
+			{ID: 6, SessionID: 8, Role: "user"},
+		}}
+	}
+	service := func(repo *svcFakeMessageRepository) *application.SessionService {
+		return svcTestSessionService(&svcFakeProfileRepository{}, &svcFakeSessionRepository{},
+			&svcFakeRunRepository{}, repo, &svcFakeRunController{}, &svcFakeAuditSink{})
+	}
+
+	t.Run("beforeID<=0 returns the newest page oldest-to-newest", func(t *testing.T) {
+		repo := history()
+		got, hasMore, err := service(repo).ListMessages(context.Background(), 7, 0, 2)
+		if err != nil {
+			t.Fatalf("ListMessages returned error: %v", err)
+		}
+		if len(got) != 2 || got[0].ID != 4 || got[1].ID != 5 {
+			t.Fatalf("ListMessages ids=%v want [4 5]", messageIDs(got))
+		}
+		if !hasMore {
+			t.Fatal("ListMessages hasMore=false want true (messages 1-3 are older)")
+		}
+		if repo.listCalls != 1 || repo.listID != 7 {
+			t.Fatalf("repository ListBySession calls=%d session=%d want 1/7", repo.listCalls, repo.listID)
+		}
+	})
+
+	t.Run("beforeID selects the page older than the cursor", func(t *testing.T) {
+		got, hasMore, err := service(history()).ListMessages(context.Background(), 7, 4, 10)
+		if err != nil {
+			t.Fatalf("ListMessages returned error: %v", err)
+		}
+		if len(got) != 3 || got[0].ID != 1 || got[2].ID != 3 {
+			t.Fatalf("ListMessages ids=%v want [1 2 3]", messageIDs(got))
+		}
+		if hasMore {
+			t.Fatal("ListMessages hasMore=true want false")
+		}
+	})
+
+	t.Run("a non-positive limit falls back to a bounded default", func(t *testing.T) {
+		got, hasMore, err := service(history()).ListMessages(context.Background(), 7, 0, 0)
+		if err != nil {
+			t.Fatalf("ListMessages returned error: %v", err)
+		}
+		if len(got) != 5 || hasMore {
+			t.Fatalf("ListMessages len=%d hasMore=%v want 5,false", len(got), hasMore)
+		}
+	})
+
+	t.Run("an over-large limit is capped", func(t *testing.T) {
+		got, _, err := service(history()).ListMessages(context.Background(), 7, 0, 100000)
+		if err != nil {
+			t.Fatalf("ListMessages returned error: %v", err)
+		}
+		if len(got) != 5 {
+			t.Fatalf("ListMessages len=%d want 5", len(got))
+		}
+	})
+
+	t.Run("empty history and repository errors are reported", func(t *testing.T) {
+		empty, hasMore, err := service(history()).ListMessages(context.Background(), 9, 0, 20)
+		if err != nil || len(empty) != 0 || hasMore {
+			t.Fatalf("ListMessages(empty session)=%v,%v,%v want [],false,nil", messageIDs(empty), hasMore, err)
+		}
+
+		failing := &svcFakeMessageRepository{listErr: errors.New("history unavailable")}
+		if _, _, err := service(failing).ListMessages(context.Background(), 7, 0, 20); err == nil {
+			t.Fatal("ListMessages repository error=nil want the repository failure")
+		}
+	})
+}
+
+// messageIDs returns the ids of a message slice for failure messages.
+func messageIDs(messages []domain.Message) []int64 {
+	ids := make([]int64, len(messages))
+	for i, message := range messages {
+		ids[i] = message.ID
+	}
+	return ids
 }
 
 func TestSessionUpdateTitleRejectsTooLongTitle(t *testing.T) {
