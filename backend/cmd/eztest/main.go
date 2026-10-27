@@ -22,6 +22,16 @@ import (
 	agenttools "github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/tools"
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	auditpostgres "github.com/EdouardRichard/EzTest/backend/internal/audit/infrastructure/postgres"
+	codeintelapp "github.com/EdouardRichard/EzTest/backend/internal/codeintel/application"
+	codeinteldomain "github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
+	codeintelaudit "github.com/EdouardRichard/EzTest/backend/internal/codeintel/infrastructure/audit"
+	codeinteleventing "github.com/EdouardRichard/EzTest/backend/internal/codeintel/infrastructure/eventing"
+	codeintelgitx "github.com/EdouardRichard/EzTest/backend/internal/codeintel/infrastructure/gitx"
+	codeintelllm "github.com/EdouardRichard/EzTest/backend/internal/codeintel/infrastructure/llm"
+	codeintelpg "github.com/EdouardRichard/EzTest/backend/internal/codeintel/infrastructure/postgres"
+	codeintelresource "github.com/EdouardRichard/EzTest/backend/internal/codeintel/infrastructure/resource"
+	codeintelversion "github.com/EdouardRichard/EzTest/backend/internal/codeintel/infrastructure/version"
+	codeintelhttp "github.com/EdouardRichard/EzTest/backend/internal/codeintel/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
 	"github.com/EdouardRichard/EzTest/backend/internal/db"
 	eventingapp "github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
@@ -77,6 +87,19 @@ const (
 	// root (design spec §6.7). It is enforced at startup and by the filestore;
 	// Windows cannot represent the Unix permission bits and ignores them.
 	versionAttachmentDirPerm os.FileMode = 0o700
+	// codeIntelWorkerQueueSize is the bounded async-run queue of design spec
+	// §6.8 (16 jobs; a full queue answers 429 analysis_queue_full).
+	codeIntelWorkerQueueSize = 16
+	// codeIntelImpactMaxFacts and codeIntelImpactMaxPromptBytes are the §6.6
+	// AI impact prompt budgets (R15): at most 200 facts and 64 KiB of prompt
+	// text per planning call.
+	codeIntelImpactMaxFacts       = 200
+	codeIntelImpactMaxPromptBytes = 64 << 10
+	// codeIntelShutdownTimeout bounds the graceful codeintel worker stop that
+	// runs after the HTTP server drained and before the database closes. A run
+	// still executing when the budget expires stays failed(interrupted) on the
+	// next start (design spec §6.8).
+	codeIntelShutdownTimeout = 10 * time.Second
 )
 
 func main() {
@@ -231,6 +254,165 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		versionapp.WithAttachmentIDGenerator(snowflake))
 	imageResolver := versionagent.NewImageResolver(attachmentService)
 
+	// Code intelligence context (P4, D32/D33): the nine PostgreSQL repositories,
+	// the read-only adapters over the P2/P3/P0 contexts, the codeintel LLM
+	// gateway and the bounded async worker. A missing or unusable default LLM
+	// configuration is not a startup failure: the completer stays nil and
+	// analyses degrade to deterministic T0 results (design spec §6.2).
+	codeIntelGit := codeintelgitx.NewGitReader(codeintelgitx.GitConfig{})
+	codeIntelLLMGateway, codeIntelLLMErr := codeintelllm.NewLLMGateway(codeintelllm.LLMGatewayConfig{
+		ConfigService: llmConfigs,
+		ClientFactory: llmClientFactory,
+	})
+	var codeIntelLLM codeintelapp.LLMCompleter
+	if codeIntelLLMErr != nil {
+		// Log once and continue. The gateway error carries only the stable
+		// "not configured" reason: never a prompt, response or secret.
+		logger.Warn("code intelligence LLM is unavailable; analyses will degrade to T0 results",
+			"reason", codeIntelLLMErr)
+	} else {
+		codeIntelLLM = codeIntelLLMGateway
+	}
+
+	// The nine codeintel PostgreSQL repositories (design spec §5).
+	codeIntelIndexRuns := codeintelpg.NewIndexRunRepository(database.Pool)
+	codeIntelEntities := codeintelpg.NewEntityRepository(database.Pool)
+	codeIntelChangeSets := codeintelpg.NewChangeSetRepository(database.Pool)
+	codeIntelAnalyses := codeintelpg.NewAnalysisRepository(database.Pool)
+	codeIntelCandidates := codeintelpg.NewCandidateRepository(database.Pool)
+	codeIntelFacts := codeintelpg.NewFactVersionRepository(database.Pool)
+	codeIntelCache := codeintelpg.NewCacheRepository(database.Pool)
+	codeIntelEdges := codeintelpg.NewEdgeRepository(database.Pool)
+	codeIntelAnchors := codeintelpg.NewAnchorRepository(database.Pool)
+
+	// Cross-context adapters (design spec §3.5): the P2 repository catalog (repo
+	// and app-model reads), the P2 index-state writer, the P3 read-only version
+	// catalog, the P0 version-scoped event publisher and the audit recorder.
+	codeIntelRepos := codeintelresource.NewCatalog(codeRepoService, catalogService)
+	codeIntelIndexState := codeintelresource.NewIndexStateWriter(codeRepoService)
+	codeIntelVersions := codeintelversion.NewCatalog(versionService, requirementService, relationService)
+	codeIntelEvents := codeinteleventing.NewPublisher(eventService)
+	codeIntelAudit := codeintelaudit.NewRecorder(auditor)
+
+	// The worker is built first and receives no runner until both async
+	// services exist: the services depend on its Enqueuer port, so the graph is
+	// cyclic at construction time (design spec §3.6).
+	codeIntelWorker := codeintelapp.NewWorker(codeintelapp.WorkerConfig{
+		QueueSize:   codeIntelWorkerQueueSize,
+		Concurrency: cfg.CodeIntelMaxConcurrentAnalyses,
+		Timeout:     time.Duration(cfg.CodeIntelAnalysisTimeoutMS) * time.Millisecond,
+		Logger:      logger,
+	})
+
+	codeIntelImpact := codeintelapp.NewImpactService(codeintelapp.ImpactServiceDeps{
+		LLM:       codeIntelLLM,
+		Versions:  codeIntelVersions,
+		AppModels: codeIntelRepos,
+		Anchors:   codeIntelAnchors,
+		Edges:     codeIntelEdges,
+		Git:       codeIntelGit,
+		// Repos resolves the checkout the AI candidate evidence is verified
+		// against (design spec §6.3/§6.6): without it the impact service cannot
+		// read the commit content and every AI candidate would fail its check.
+		Repos:           codeIntelRepos,
+		IDs:             snowflake,
+		MaxRequirements: codeinteldomain.MaxRequirementsInPrompt,
+		MaxFacts:        codeIntelImpactMaxFacts,
+		MaxPromptBytes:  codeIntelImpactMaxPromptBytes,
+	})
+	codeIntelIndex := codeintelapp.NewIndexService(codeintelapp.IndexServiceDeps{
+		Git:           codeIntelGit,
+		Repos:         codeIntelRepos,
+		IndexRuns:     codeIntelIndexRuns,
+		Entities:      codeIntelEntities,
+		ChangeSets:    codeIntelChangeSets,
+		State:         codeIntelIndexState,
+		Queue:         codeIntelWorker,
+		Audit:         codeIntelAudit,
+		IDs:           snowflake,
+		Clock:         wallClock{},
+		MaxIndexFiles: cfg.CodeIntelMaxIndexFiles,
+	})
+	codeIntelAnalysis := codeintelapp.NewAnalysisService(codeintelapp.AnalysisServiceDeps{
+		Git:        codeIntelGit,
+		Repos:      codeIntelRepos,
+		Versions:   codeIntelVersions,
+		ChangeSets: codeIntelChangeSets,
+		Entities:   codeIntelEntities,
+		Edges:      codeIntelEdges,
+		Facts:      codeIntelFacts,
+		Cache:      codeIntelCache,
+		Analyses:   codeIntelAnalyses,
+		Candidates: codeIntelCandidates,
+		Anchors:    codeIntelAnchors,
+		Queue:      codeIntelWorker,
+		LLM:        codeIntelLLM,
+		Planner:    codeIntelImpact,
+		Notifier:   codeIntelEvents,
+		Audit:      codeIntelAudit,
+		IDs:        snowflake,
+		Clock:      wallClock{},
+		Config: codeintelapp.AnalysisConfig{
+			MaxChangedFiles: cfg.CodeIntelMaxChangedFiles,
+			MaxFileBytes:    cfg.CodeIntelMaxFileBytes,
+			MaxExcerptLines: cfg.CodeIntelMaxExcerptLines,
+			MaxIndexFiles:   cfg.CodeIntelMaxIndexFiles,
+			PromptVersion:   cfg.CodeIntelPromptVersion,
+			// Timeout is left zero: the worker applies the configured
+			// analysis_timeout_ms to every run (design spec §3.6).
+		},
+	})
+	codeIntelQuery := codeintelapp.NewQueryService(codeintelapp.QueryServiceDeps{
+		Git:        codeIntelGit,
+		Repos:      codeIntelRepos,
+		Entities:   codeIntelEntities,
+		ChangeSets: codeIntelChangeSets,
+		Versions:   codeIntelVersions,
+		Audit:      codeIntelAudit,
+		Config: codeintelapp.QueryConfig{
+			MaxTreeEntries:  codeinteldomain.MaxTreeEntriesPerPage,
+			MaxReadLines:    codeinteldomain.MaxReadLines,
+			MaxDiffBytes:    cfg.CodeIntelMaxDiffBytes,
+			MaxChangedFiles: codeinteldomain.MaxChangedFilesStored,
+		},
+	})
+	codeIntelAnchor := codeintelapp.NewAnchorService(codeintelapp.AnchorServiceDeps{
+		Repos:     codeIntelRepos,
+		Versions:  codeIntelVersions,
+		AppModels: codeIntelRepos,
+		Git:       codeIntelGit,
+		Anchors:   codeIntelAnchors,
+		IDs:       snowflake,
+		Clock:     wallClock{},
+	})
+
+	// Both async services exist now, so the worker can execute them and recover
+	// the previous process's leftover queued/running runs before serving its
+	// first job (design spec §6.8). The deferred stop runs after the HTTP
+	// server drained and before database.Close (that defer was registered
+	// first, so it runs last).
+	codeIntelWorker.SetRunner(codeIntelRunner{index: codeIntelIndex, analyses: codeIntelAnalysis})
+	codeIntelWorker.SetRecoverer(codeintelapp.StaleRunRecoverer{
+		IndexRuns: codeIntelIndexRuns,
+		Analyses:  codeIntelAnalyses,
+	})
+	codeIntelWorker.Start()
+	defer func() {
+		stopCtx, cancelStop := context.WithTimeout(context.Background(), codeIntelShutdownTimeout)
+		defer cancelStop()
+		codeIntelWorker.Stop(stopCtx)
+	}()
+
+	// The handler group is assembled here, in the composition root; no service
+	// is constructed inside the HTTP layer (design spec §3.6, Agent.md §6.2).
+	codeIntelHandler := codeintelhttp.NewHandler(codeintelhttp.HandlerDeps{
+		Index:    codeIntelIndex,
+		Query:    codeIntelQuery,
+		Analyses: codeIntelAnalysis,
+		Anchors:  codeIntelAnchor,
+		Repos:    codeIntelRepos,
+	})
+
 	// Agent runtime: the four postgres repositories, the cross-context adapters
 	// (LLM gateway, event sink, audit sink) and the tool registry. The same
 	// registry instance backs both the run service and the HTTP tool catalog, so
@@ -288,6 +470,18 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	// The 11 P3 tools are appended BEFORE the registry is built so the
 	// startup profile validation below checks the real registry the runs use.
 	agentToolList = append(agentToolList, agenttools.NewClarificationTools(agentToolService)...)
+	// The nine P4 codeintel tools are appended the same way (design spec §8.1).
+	// The P3 profile allowlists stay unchanged: registration only makes the
+	// tools available; P5 configures which profiles may call them. The
+	// repository catalog is adapted because the tools package depends only on
+	// its own local projection, never on the codeintel application layer.
+	agentToolList = append(agentToolList, agenttools.NewCodeIntelTools(agenttools.CodeIntelToolDeps{
+		Repos:    codeIntelRepoCatalog{repos: codeIntelRepos},
+		Indexes:  codeIntelIndex,
+		Queries:  codeIntelQuery,
+		Analyses: codeIntelAnalysis,
+		Anchors:  codeIntelAnchor,
+	})...)
 	agentRegistry := agentapp.NewToolRegistry(agentToolList...)
 	agentExecutor := agentapp.NewToolExecutor(
 		agentRegistry, agentAuditSink, time.Duration(cfg.AgentToolTimeoutMS)*time.Millisecond)
@@ -387,6 +581,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 			},
 			Resources: resourceHandlers,
 			Version:   versionHandlers,
+			CodeIntel: codeIntelHandler,
 		}),
 		BaseContext:       baseContext(baseCtx),
 		ReadHeaderTimeout: 10 * time.Second,
@@ -527,6 +722,57 @@ func ensureP3Profiles(ctx context.Context, profiles *agentpostgres.ProfileReposi
 		}
 	}
 	return nil
+}
+
+// codeIntelRunner adapts the two codeintel async run services to the worker's
+// Runner port. The worker only knows run ids; the services own the state
+// machine and persist every terminal transition.
+type codeIntelRunner struct {
+	index    *codeintelapp.IndexService
+	analyses *codeintelapp.AnalysisService
+}
+
+// RunIndex executes one queued T0 repository index run.
+func (r codeIntelRunner) RunIndex(ctx context.Context, runID int64) error {
+	return r.index.Run(ctx, runID)
+}
+
+// RunAnalysis executes one queued version impact analysis run.
+func (r codeIntelRunner) RunAnalysis(ctx context.Context, analysisID int64) error {
+	return r.analyses.Run(ctx, analysisID)
+}
+
+var _ codeintelapp.Runner = codeIntelRunner{}
+
+// codeIntelRepoCatalog adapts the codeintel application RepoCatalog to the
+// agent tools' local ListRepos projection. The tools package deliberately
+// depends only on its own CodeIntelRepo type, so the composition root performs
+// the projection (design spec §8.1).
+type codeIntelRepoCatalog struct {
+	repos codeintelapp.RepoCatalog
+}
+
+var _ agenttools.CodeIntelRepoCatalog = codeIntelRepoCatalog{}
+
+// ListRepos implements agent tools.CodeIntelRepoCatalog over the P2 repository
+// catalog.
+func (c codeIntelRepoCatalog) ListRepos(ctx context.Context) ([]agenttools.CodeIntelRepo, error) {
+	infos, err := c.repos.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	repos := make([]agenttools.CodeIntelRepo, 0, len(infos))
+	for _, info := range infos {
+		repos = append(repos, agenttools.CodeIntelRepo{
+			ID:            info.ID,
+			Key:           info.Key,
+			Name:          info.Name,
+			Status:        info.Status,
+			FixedBranch:   info.FixedBranch,
+			LastIndexedAt: info.LastIndexedAt,
+		})
+	}
+	return repos, nil
 }
 
 // wallClock is the production resource application.Clock. The services convert

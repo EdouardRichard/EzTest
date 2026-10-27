@@ -14,6 +14,7 @@ import (
 	agenthttp "github.com/EdouardRichard/EzTest/backend/internal/agent/interfaces/httpapi"
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	audithttp "github.com/EdouardRichard/EzTest/backend/internal/audit/interfaces/httpapi"
+	codeintelhttp "github.com/EdouardRichard/EzTest/backend/internal/codeintel/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
 	eventinghttp "github.com/EdouardRichard/EzTest/backend/internal/eventing/interfaces/httpapi"
 	identity "github.com/EdouardRichard/EzTest/backend/internal/identity/domain"
@@ -101,6 +102,11 @@ type Dependencies struct {
 	// middleware and add no per-route guard: the P3 contract makes every route
 	// available to any authenticated user.
 	Version *versionhttp.Handlers
+	// CodeIntel holds the code-intelligence context's HTTP handlers (P4). When
+	// set, the /api/code and /api/versions/{id}/code routes are mounted. They
+	// rely on the global bearer auth; only the T0 index trigger adds the
+	// per-route admin guard (design spec §6.10).
+	CodeIntel *codeintelhttp.Handler
 }
 
 // New assembles the HTTP handler. Middleware runs in the order
@@ -173,6 +179,14 @@ func New(cfg config.Config, logger *slog.Logger, deps Dependencies) http.Handler
 		// per-route guard. RegisterRoutes skips a nil handler group, so a
 		// partially wired process mounts only the groups it has.
 		versionhttp.RegisterRoutes(mux, *deps.Version)
+	}
+	if deps.CodeIntel != nil {
+		// The codeintel routes (P4) rely on the global bearer auth too; the
+		// handler group wraps only the T0 index trigger in the identity
+		// context's RequireAdmin guard (design spec §6.10). Register mounts each
+		// group only when its application service is wired, so a partially
+		// assembled process never exposes a route backed by nil dependencies.
+		deps.CodeIntel.Register(mux)
 	}
 	if deps.Events != nil && cfg.EnableTestEndpoints {
 		auditor := deps.Audit
