@@ -227,6 +227,71 @@ func TestEnsureBuiltinAndMarkInterrupted(t *testing.T) {
 	}
 }
 
+// TestListRunningInterrupted pins the startup-recovery query: only runs still
+// marked running are returned, and marking them interrupted drains the list.
+func TestListRunningInterrupted(t *testing.T) {
+	pool := testutil.OpenTestDB(t)
+	runs := postgres.NewRunRepository(pool)
+
+	_, firstSession := seedSession(t, pool)
+	_, secondSession := seedSession(t, pool)
+	_, doneSession := seedSession(t, pool)
+
+	first, err := runs.CreateTurn(ctx, firstSession.ID, []agent.Part{{Type: "text", Text: "first"}}, "first")
+	if err != nil {
+		t.Fatalf("create first running turn: %v", err)
+	}
+	second, err := runs.CreateTurn(ctx, secondSession.ID, []agent.Part{{Type: "text", Text: "second"}}, "second")
+	if err != nil {
+		t.Fatalf("create second running turn: %v", err)
+	}
+	done, err := runs.CreateTurn(ctx, doneSession.ID, []agent.Part{{Type: "text", Text: "done"}}, "done")
+	if err != nil {
+		t.Fatalf("create done turn: %v", err)
+	}
+	if err := runs.Finish(ctx, done.RunID, agent.RunResult{
+		Status:         agent.RunDone,
+		TerminalReason: agent.ReasonCompleted,
+		Turns:          1,
+	}); err != nil {
+		t.Fatalf("finish done turn: %v", err)
+	}
+
+	listed, err := runs.ListRunningInterrupted(ctx)
+	if err != nil {
+		t.Fatalf("list running interrupted: %v", err)
+	}
+	if len(listed) != 2 {
+		t.Fatalf("listed runs=%d want the two running runs: %+v", len(listed), listed)
+	}
+	if listed[0].ID != first.RunID || listed[1].ID != second.RunID {
+		t.Fatalf("listed run ids=%d,%d want %d,%d in id order", listed[0].ID, listed[1].ID, first.RunID, second.RunID)
+	}
+	if listed[0].SessionID != firstSession.ID || listed[1].SessionID != secondSession.ID {
+		t.Fatalf("listed session ids=%d,%d want %d,%d", listed[0].SessionID, listed[1].SessionID, firstSession.ID, secondSession.ID)
+	}
+	for _, run := range listed {
+		if run.Status != agent.RunRunning || run.EndedAt != nil {
+			t.Fatalf("listed run=%+v want running with no ended_at", run)
+		}
+	}
+
+	marked, err := runs.MarkRunningInterrupted(ctx)
+	if err != nil {
+		t.Fatalf("mark running interrupted: %v", err)
+	}
+	if marked != 2 {
+		t.Fatalf("marked=%d want 2", marked)
+	}
+	listed, err = runs.ListRunningInterrupted(ctx)
+	if err != nil {
+		t.Fatalf("list after marking: %v", err)
+	}
+	if len(listed) != 0 {
+		t.Fatalf("listed runs after recovery=%d want 0: %+v", len(listed), listed)
+	}
+}
+
 func TestMessagePlaceholderLifecycle(t *testing.T) {
 	pool := testutil.OpenTestDB(t)
 	_, session := seedSession(t, pool)

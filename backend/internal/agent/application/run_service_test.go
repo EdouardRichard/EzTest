@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -46,6 +47,13 @@ type runTestState struct {
 	completed      []int64
 	interrupted    int64
 	interruptedErr error
+
+	// runningInterrupted seeds the optional ListRunningInterrupted query and
+	// markInterruptedHook runs after MarkRunningInterrupted, so recovery tests
+	// can prove the terminal events are published after the DB update.
+	runningInterrupted  []domain.Run
+	listInterruptedErr  error
+	markInterruptedHook func()
 }
 
 type runTestFinishedRun struct {
@@ -278,8 +286,23 @@ func (f *runFakeRuns) Finish(ctx context.Context, runID int64, result domain.Run
 func (f *runFakeRuns) MarkRunningInterrupted(_ context.Context) (int64, error) {
 	state := f.state
 	state.mu.Lock()
+	hook := state.markInterruptedHook
+	interrupted, err := state.interrupted, state.interruptedErr
+	state.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return interrupted, err
+}
+
+// ListRunningInterrupted is the optional startup-recovery query. The domain
+// RunRepository port does not require it; the recovery test pins that the
+// service uses it when the repository provides it.
+func (f *runFakeRuns) ListRunningInterrupted(_ context.Context) ([]domain.Run, error) {
+	state := f.state
+	state.mu.Lock()
 	defer state.mu.Unlock()
-	return state.interrupted, state.interruptedErr
+	return append([]domain.Run(nil), state.runningInterrupted...), state.listInterruptedErr
 }
 
 // runFakeMessages implements domain.MessageRepository.
@@ -389,6 +412,12 @@ type runFakeCaller struct {
 	scripts       []runFakeScript
 	requests      []application.LLMRequest
 	calls         int
+	// strict makes ChatStream reject requests the real upstream rejects: an
+	// assistant message with neither content nor tool_calls, and invalid
+	// tool_calls <-> tool pairing. The continuation tests use it to prove one
+	// failed run cannot brick the session for the next one.
+	strict     bool
+	rejections []string
 }
 
 func (c *runFakeCaller) Model() string { return c.model }
@@ -406,8 +435,18 @@ func (c *runFakeCaller) ChatStream(ctx context.Context, req application.LLMReque
 	} else {
 		script.err = errors.New("run service test: unexpected ChatStream call")
 	}
+	strict := c.strict
 	c.mu.Unlock()
 
+	if strict {
+		if err := runTestStrictRequest(req); err != nil {
+			c.mu.Lock()
+			c.rejections = append(c.rejections, err.Error())
+			c.mu.Unlock()
+			// The real upstream rejects the request before streaming starts.
+			return nil, &runFakeCodedError{code: "llm_bad_request", message: err.Error()}
+		}
+	}
 	if script.wait != nil {
 		if err := script.wait(ctx); err != nil {
 			return nil, err
@@ -437,6 +476,73 @@ func (c *runFakeCaller) ChatStream(ctx context.Context, req application.LLMReque
 		}
 	}()
 	return out, nil
+}
+
+// runTestStrictRequest mirrors the two chat-completions request rules the real
+// upstream enforces with HTTP 400: every assistant message needs content or
+// tool_calls, and every tool call must be answered by its tool messages (which
+// in turn must answer the assistant directly above them).
+func runTestStrictRequest(req application.LLMRequest) error {
+	messages := req.Messages
+	for index, message := range messages {
+		switch message.Role {
+		case "assistant":
+			if !runTestHasTextPart(message.Parts) && len(message.ToolCalls) == 0 {
+				return fmt.Errorf("Invalid assistant message at index %d: no content and no tool_calls", index)
+			}
+			if len(message.ToolCalls) == 0 {
+				continue
+			}
+			answered := make(map[string]bool, len(message.ToolCalls))
+			for next := index + 1; next < len(messages) && messages[next].Role == "tool"; next++ {
+				answered[messages[next].ToolCallID] = true
+			}
+			for _, call := range message.ToolCalls {
+				if call.ID == "" || !answered[call.ID] {
+					return fmt.Errorf("insufficient tool messages following tool_calls message: call %q has no result", call.ID)
+				}
+			}
+		case "tool":
+			start := index
+			for start > 0 && messages[start-1].Role == "tool" {
+				start--
+			}
+			if start == 0 || messages[start-1].Role != "assistant" {
+				return fmt.Errorf("tool message %q has no tool_calls assistant", message.ToolCallID)
+			}
+			if !runTestHasCall(messages[start-1].ToolCalls, message.ToolCallID) {
+				return fmt.Errorf("tool message %q does not answer the preceding assistant", message.ToolCallID)
+			}
+		}
+	}
+	return nil
+}
+
+// runTestHasTextPart reports whether the message carries a non-empty text part.
+func runTestHasTextPart(parts []domain.Part) bool {
+	for _, part := range parts {
+		if part.Type == "text" && part.Text != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// runTestHasCall reports whether calls contains the given call ID.
+func runTestHasCall(calls []domain.ToolCall, callID string) bool {
+	for _, call := range calls {
+		if call.ID == callID {
+			return true
+		}
+	}
+	return false
+}
+
+// violations returns a copy of the strict-mode rejections.
+func (c *runFakeCaller) violations() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.rejections...)
 }
 
 // requests returns a copy of the recorded requests.
@@ -481,6 +587,29 @@ func (f *runFakeEvents) snapshot() []application.ActivityEvent {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]application.ActivityEvent(nil), f.events...)
+}
+
+// runTestRecoveryEvents records startup-recovery activities and whether the
+// interrupted rows were already marked when each one was published.
+type runTestRecoveryEvents struct {
+	marked              *bool
+	publishedBeforeMark bool
+	events              []application.ActivityEvent
+}
+
+func (f *runTestRecoveryEvents) PublishActivity(_ context.Context, event application.ActivityEvent) error {
+	if !*f.marked {
+		f.publishedBeforeMark = true
+	}
+	f.events = append(f.events, event)
+	return nil
+}
+
+// runTestFailingEvents fails every publish, like an unavailable event bus.
+type runTestFailingEvents struct{}
+
+func (f *runTestFailingEvents) PublishActivity(context.Context, application.ActivityEvent) error {
+	return errors.New("run service test: event sink unavailable")
 }
 
 // runFakeAudit implements AuditSink. Next to every event it captures the
@@ -588,6 +717,13 @@ func runTestRuntimeError(err error) runTestServiceOption {
 func runTestRegisterTool(tool domain.Tool) runTestServiceOption {
 	return func(_ *application.RunServiceDeps, tools *[]domain.Tool) {
 		*tools = append(*tools, tool)
+	}
+}
+
+// runTestEvents overrides the event sink, including with nil.
+func runTestEvents(sink application.EventSink) runTestServiceOption {
+	return func(deps *application.RunServiceDeps, _ *[]domain.Tool) {
+		deps.Events = sink
 	}
 }
 
@@ -898,6 +1034,11 @@ func TestStartRunsToolLoopAndEmitsOrderedActivities(t *testing.T) {
 	if toolUses[0].Detail["call_id"] != "call_1" || toolUses[0].Detail["tool"] != "test.echo" {
 		t.Fatalf("tool_use detail=%+v", toolUses[0].Detail)
 	}
+	// The lazy full-args load needs the assistant message that owns the
+	// tool_calls: the frontend fetches it and reads tool_calls by call_id.
+	if got := runTestDetailInt64(t, toolUses[0].Detail, "message_id"); got != assistantWithTool.ID {
+		t.Fatalf("tool_use message_id=%d want the assistant message id %d", got, assistantWithTool.ID)
+	}
 	if args, _ := toolUses[0].Detail["args"].(string); args != `{"text":"README"}` {
 		t.Fatalf("tool_use args=%q", args)
 	}
@@ -1205,6 +1346,176 @@ func TestAbortDuringStreamSetupCompletesAssistantMessage(t *testing.T) {
 	}
 	if events := runTestEventsOfKind(sink.snapshot(), domain.KindRunFinished); len(events) != 1 {
 		t.Fatalf("run_finished events=%d want 1", len(events))
+	}
+}
+
+// TestSessionRecoversAfterEmptyAssistantTurn pins the C1 repair: a first run
+// that leaves an assistant row with neither content nor tool_calls must not
+// poison the session. Each case reproduces one way the runner persists such a
+// row, then starts a second run against a strict fake upstream that rejects
+// exactly what DeepSeek rejects with HTTP 400.
+func TestSessionRecoversAfterEmptyAssistantTurn(t *testing.T) {
+	cases := []struct {
+		name string
+		run  func(started chan struct{}) runFakeScript
+		stop bool
+	}{
+		{
+			name: "immediate abort before first text",
+			stop: true,
+			run: func(started chan struct{}) runFakeScript {
+				var once sync.Once
+				return runFakeScript{wait: func(ctx context.Context) error {
+					once.Do(func() { close(started) })
+					<-ctx.Done()
+					return ctx.Err()
+				}}
+			},
+		},
+		{
+			name: "thought-only abort",
+			stop: true,
+			run: func(started chan struct{}) runFakeScript {
+				return runFakeScript{
+					events:  []application.LLMStreamEvent{{ReasoningDelta: "只想了半句"}},
+					hold:    true,
+					started: started,
+				}
+			},
+		},
+		{
+			name: "synchronous stream error",
+			run: func(chan struct{}) runFakeScript {
+				return runFakeScript{err: &runFakeCodedError{code: "llm_timeout", message: "upstream timed out"}}
+			},
+		},
+		{
+			name: "empty successful answer",
+			run: func(chan struct{}) runFakeScript {
+				return runFakeScript{events: []application.LLMStreamEvent{{Done: true, FinishReason: "stop"}}}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			profile := runTestProfile(t)
+			state := runTestNewState(t, profile, 7)
+			started := make(chan struct{})
+			caller := &runFakeCaller{
+				model:         "deepseek-flash",
+				contextWindow: 100000,
+				strict:        true,
+				scripts: []runFakeScript{
+					tc.run(started),
+					{events: []application.LLMStreamEvent{{Delta: "恢复回答", Done: true, FinishReason: "stop"}}},
+				},
+			}
+			service, _, _ := runTestNewService(t, state, caller)
+			if _, err := service.Start(context.Background(), 7, "第一轮", nil); err != nil {
+				t.Fatalf("first Start returned error: %v", err)
+			}
+			if tc.stop {
+				runTestAwaitSignal(t, started, "the first model stream")
+				if _, err := service.Abort(context.Background(), 7, nil); err != nil {
+					t.Fatalf("Abort returned error: %v", err)
+				}
+			}
+			runTestWaitIdle(t, service, 7)
+
+			// The first run must really leave the poison row behind, otherwise
+			// the second run proves nothing.
+			poison := false
+			for _, message := range state.messagesFor(7) {
+				if message.Role == "assistant" && len(message.ToolCalls) == 0 && !runTestHasTextPart(message.Parts) {
+					poison = true
+				}
+			}
+			if !poison {
+				t.Fatalf("first run left no empty assistant row to replay: %+v", state.messagesFor(7))
+			}
+
+			if _, err := service.Start(context.Background(), 7, "第二轮", nil); err != nil {
+				t.Fatalf("second Start returned error: %v", err)
+			}
+			runTestWaitIdle(t, service, 7)
+
+			finished := state.finishedResults()
+			if len(finished) != 2 {
+				t.Fatalf("finished runs=%d want 2", len(finished))
+			}
+			second := finished[1].result
+			if second.Status != domain.RunDone || second.TerminalReason != domain.ReasonCompleted {
+				t.Fatalf("second run finished %s/%s want done/completed (strict rejections: %v)",
+					second.Status, second.TerminalReason, caller.violations())
+			}
+			if second.Turns != 1 {
+				t.Fatalf("second run turns=%d want 1", second.Turns)
+			}
+			if rejections := caller.violations(); len(rejections) != 0 {
+				t.Fatalf("strict fake rejected %d request(s): %v", len(rejections), rejections)
+			}
+		})
+	}
+}
+
+// TestThinkingAutoOmitsWireThinking pins spec §13: "auto" means "let the
+// provider decide", so the request must omit the thinking parameter instead of
+// sending {"type":"auto"} (which the strict upstream rejects). The run_started
+// activity keeps reporting the configured profile value, and reasoning_effort
+// is still sent because §13 only names the thinking parameter.
+func TestThinkingAutoOmitsWireThinking(t *testing.T) {
+	cases := []struct {
+		thinking     string
+		effort       string
+		wantThinking string
+		wantEffort   string
+	}{
+		{thinking: "auto", effort: "max", wantThinking: "", wantEffort: "max"},
+		{thinking: "enabled", effort: "max", wantThinking: "enabled", wantEffort: "max"},
+		{thinking: "disabled", effort: "none", wantThinking: "disabled", wantEffort: "none"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.thinking, func(t *testing.T) {
+			profile := runTestProfile(t)
+			profile.Thinking = tc.thinking
+			profile.ReasoningEffort = tc.effort
+			if err := profile.Validate(); err != nil {
+				t.Fatalf("profile %q/%q is invalid: %v", tc.thinking, tc.effort, err)
+			}
+			state := runTestNewState(t, profile, 7)
+			caller := &runFakeCaller{
+				model:         "deepseek-flash",
+				contextWindow: 100000,
+				scripts: []runFakeScript{{
+					events: []application.LLMStreamEvent{{Delta: "ok", Done: true, FinishReason: "stop"}},
+				}},
+			}
+			service, sink, _ := runTestNewService(t, state, caller)
+			if _, err := service.Start(context.Background(), 7, "思考模式映射", nil); err != nil {
+				t.Fatalf("Start returned error: %v", err)
+			}
+			runTestWaitIdle(t, service, 7)
+
+			requests := caller.recordedRequests()
+			if len(requests) != 1 {
+				t.Fatalf("LLM requests=%d want 1", len(requests))
+			}
+			if requests[0].Thinking != tc.wantThinking {
+				t.Fatalf("request thinking=%q want %q (profile thinking=%q)", requests[0].Thinking, tc.wantThinking, tc.thinking)
+			}
+			if requests[0].ReasoningEffort != tc.wantEffort {
+				t.Fatalf("request reasoning_effort=%q want %q", requests[0].ReasoningEffort, tc.wantEffort)
+			}
+
+			started := runTestEventsOfKind(sink.snapshot(), domain.KindRunStarted)
+			if len(started) != 1 {
+				t.Fatalf("run_started events=%d want 1", len(started))
+			}
+			if started[0].Detail["thinking"] != tc.thinking {
+				t.Fatalf("run_started thinking=%v want the configured %q", started[0].Detail["thinking"], tc.thinking)
+			}
+		})
 	}
 }
 
@@ -1539,6 +1850,128 @@ func TestRecoverInterrupted(t *testing.T) {
 	state.interruptedErr = broken
 	if _, err := service.RecoverInterrupted(context.Background()); !errors.Is(err, broken) {
 		t.Fatalf("RecoverInterrupted error=%v want %v", err, broken)
+	}
+}
+
+// TestRecoverInterruptedPublishesTerminalActivity pins the I1 contract: a
+// startup recovery marks the crashed rows interrupted AND publishes the
+// synthetic run_finished activity the dead process never got to publish,
+// otherwise an open console stays "running" forever. The events must come after
+// the DB update.
+func TestRecoverInterruptedPublishesTerminalActivity(t *testing.T) {
+	profile := runTestProfile(t)
+	state := runTestNewState(t, profile, 7, 8)
+	base := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
+	firstEnded := base.Add(1500 * time.Millisecond)
+	state.runningInterrupted = []domain.Run{
+		{
+			ID: 11, SessionID: 7, Status: domain.RunRunning, Turns: 3,
+			InputTokens: 100, OutputTokens: 20, ReasoningTokens: 5,
+			StartedAt: base, EndedAt: &firstEnded,
+		},
+		{
+			ID: 12, SessionID: 8, Status: domain.RunRunning,
+			InputTokens: 7, OutputTokens: 2, ReasoningTokens: 1,
+			StartedAt: base.Add(time.Hour),
+		},
+	}
+	state.interrupted = 2
+
+	marked := false
+	state.markInterruptedHook = func() { marked = true }
+	sink := &runTestRecoveryEvents{marked: &marked}
+	clock := func() time.Time { return base.Add(time.Hour + 2500*time.Millisecond) }
+	service, _, _ := runTestNewService(t, state, &runFakeCaller{},
+		runTestEvents(sink), runTestClock(clock))
+
+	count, err := service.RecoverInterrupted(context.Background())
+	if err != nil {
+		t.Fatalf("RecoverInterrupted returned error: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("RecoverInterrupted count=%d want 2", count)
+	}
+	if !marked {
+		t.Fatal("MarkRunningInterrupted was not called")
+	}
+	if sink.publishedBeforeMark {
+		t.Fatal("a run_finished event was published before the interrupted rows were marked")
+	}
+	if len(sink.events) != 2 {
+		t.Fatalf("recovery events=%d want one per interrupted run: %+v", len(sink.events), sink.events)
+	}
+
+	// Below the terminal detail every recovered run must carry (spec §9.2).
+	first := sink.events[0]
+	runTestAssertEnvelope(t, first, 7, profile.Key)
+	if first.Detail["status"] != "interrupted" || first.Detail["terminal_reason"] != "interrupted" {
+		t.Fatalf("first recovery detail=%+v want interrupted/interrupted", first.Detail)
+	}
+	if got := runTestDetailInt64(t, first.Detail, "run_id"); got != 11 {
+		t.Fatalf("first recovery run_id=%d want 11", got)
+	}
+	if got := runTestDetailInt64(t, first.Detail, "turns"); got != 3 {
+		t.Fatalf("first recovery turns=%d want 3", got)
+	}
+	// ended_at is set: the duration must come from it, not from the clock.
+	if got := runTestDetailInt64(t, first.Detail, "duration_ms"); got != 1500 {
+		t.Fatalf("first recovery duration_ms=%d want 1500 (ended_at - started_at)", got)
+	}
+	firstUsage, ok := first.Detail["usage"].(map[string]any)
+	if !ok {
+		t.Fatalf("first recovery usage=%v (%T) want an object", first.Detail["usage"], first.Detail["usage"])
+	}
+	if got := runTestDetailInt64(t, firstUsage, "prompt"); got != 100 {
+		t.Fatalf("first recovery usage prompt=%d want 100", got)
+	}
+	if got := runTestDetailInt64(t, firstUsage, "completion"); got != 20 {
+		t.Fatalf("first recovery usage completion=%d want 20", got)
+	}
+	if got := runTestDetailInt64(t, firstUsage, "reasoning"); got != 5 {
+		t.Fatalf("first recovery usage reasoning=%d want 5", got)
+	}
+	if got := runTestDetailInt64(t, firstUsage, "total"); got != 120 {
+		t.Fatalf("first recovery usage total=%d want 120", got)
+	}
+	if !strings.Contains(first.Summary, "interrupted") {
+		t.Fatalf("first recovery summary=%q want the interrupted terminal reason", first.Summary)
+	}
+
+	// ended_at is missing: the duration falls back to the injected clock.
+	second := sink.events[1]
+	runTestAssertEnvelope(t, second, 8, profile.Key)
+	if got := runTestDetailInt64(t, second.Detail, "run_id"); got != 12 {
+		t.Fatalf("second recovery run_id=%d want 12", got)
+	}
+	if got := runTestDetailInt64(t, second.Detail, "duration_ms"); got != 2500 {
+		t.Fatalf("second recovery duration_ms=%d want 2500 (clock - started_at)", got)
+	}
+}
+
+// TestRecoverInterruptedEventSinkIsAdvisory pins that recovery never fails on
+// event publication: a broken sink and a nil sink both leave the DB recovery
+// (the count/error contract) untouched.
+func TestRecoverInterruptedEventSinkIsAdvisory(t *testing.T) {
+	profile := runTestProfile(t)
+	newState := func() *runTestState {
+		state := runTestNewState(t, profile, 7)
+		state.runningInterrupted = []domain.Run{{
+			ID: 1, SessionID: 7, Status: domain.RunRunning, StartedAt: time.Now(),
+		}}
+		state.interrupted = 1
+		return state
+	}
+
+	state := newState()
+	service, _, _ := runTestNewService(t, state, &runFakeCaller{}, runTestEvents(&runTestFailingEvents{}))
+	if count, err := service.RecoverInterrupted(context.Background()); err != nil || count != 1 {
+		t.Fatalf("RecoverInterrupted with a failing sink=(%d,%v) want (1,nil)", count, err)
+	}
+
+	state = newState()
+	service, _, _ = runTestNewService(t, state, &runFakeCaller{}, runTestEvents(nil))
+	if count, err := service.RecoverInterrupted(context.Background()); err != nil || count != 1 {
+		t.Fatalf("RecoverInterrupted with a nil sink=(%d,%v) want (1,nil)", count, err)
 	}
 }
 

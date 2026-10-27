@@ -30,6 +30,10 @@ type BuildResult struct {
 // Build converts the session history into LLM messages and truncates it to
 // budgetChars.
 //
+// The history is first sanitized so it is wire-valid for the chat completions
+// protocol: empty assistant turns are dropped and tool calls are kept only with
+// their complete tool-message answers (see sanitizeHistory).
+//
 // Messages are grouped by user turn: a user message starts a new group and the
 // assistant/tool messages that follow it belong to that group. Any history
 // before the first user message (abnormal data) forms its own leading group.
@@ -45,7 +49,7 @@ func (b *ContextBuilder) Build(systemPrompt string, history []domain.Message, bu
 	}
 
 	groups := make([][]LLMMessage, 0, len(history))
-	for _, group := range groupHistoryByUserTurn(history) {
+	for _, group := range groupHistoryByUserTurn(sanitizeHistory(history)) {
 		messages := make([]LLMMessage, 0, len(group))
 		for _, message := range group {
 			messages = append(messages, convertHistoryMessage(message))
@@ -93,6 +97,112 @@ func (b *ContextBuilder) Build(systemPrompt string, history []domain.Message, bu
 		dropped += len(groups[i])
 	}
 	return BuildResult{Messages: messages, DroppedMessages: dropped}, nil
+}
+
+// sanitizeHistory drops history rows that would make the upstream reject the
+// whole request, while keeping the user turns and the valid tool pairs:
+//
+//   - an assistant message with no non-empty text part and no tool calls is
+//     never replayed. The upstream answers such a message with HTTP 400
+//     "Invalid assistant message"; it is left behind by an immediate abort
+//     before the first token, a thought-only abort, a synchronous stream error
+//     or an empty successful answer. Reasoning alone does not make it valid.
+//   - empty text parts are filtered from every kept message.
+//   - an assistant message with tool calls is kept only when a tool message
+//     directly following it answers every call ID. Otherwise the assistant and
+//     its partial tool messages are dropped together: the upstream answers an
+//     unanswered tool_calls message with HTTP 400 "insufficient tool messages".
+//   - tool messages with no matching assistant call (crash history, a dropped
+//     assistant) are dropped.
+//
+// The removed rows are not reported in DroppedMessages: that counter measures
+// budget truncation only.
+func sanitizeHistory(history []domain.Message) []domain.Message {
+	sanitized := make([]domain.Message, 0, len(history))
+	for index := 0; index < len(history); index++ {
+		message := history[index]
+		switch message.Role {
+		case "user", "system":
+			sanitized = append(sanitized, filterEmptyTextParts(message))
+		case "assistant":
+			message = filterEmptyTextParts(message)
+			if len(message.ToolCalls) == 0 {
+				if !hasTextPart(message.Parts) {
+					continue
+				}
+				sanitized = append(sanitized, message)
+				continue
+			}
+			// The tool answers must directly follow their assistant message.
+			end := index + 1
+			for end < len(history) && history[end].Role == "tool" {
+				end++
+			}
+			callIDs := make(map[string]struct{}, len(message.ToolCalls))
+			for _, call := range message.ToolCalls {
+				callIDs[call.ID] = struct{}{}
+			}
+			toolIDs := make(map[string]struct{}, end-index-1)
+			for _, tool := range history[index+1 : end] {
+				toolIDs[tool.ToolCallID] = struct{}{}
+			}
+			complete := true
+			for callID := range callIDs {
+				if _, ok := toolIDs[callID]; !ok || callID == "" {
+					complete = false
+					break
+				}
+			}
+			if !complete {
+				// Drop the assistant and every partial tool message that
+				// belongs to its turn; the next non-tool message resumes.
+				index = end - 1
+				continue
+			}
+			sanitized = append(sanitized, message)
+			for _, tool := range history[index+1 : end] {
+				if _, ok := callIDs[tool.ToolCallID]; ok {
+					sanitized = append(sanitized, filterEmptyTextParts(tool))
+				}
+			}
+			index = end - 1
+		default:
+			// A tool message here has no assistant tool_calls message in front
+			// of it; any other role is not a chat completions role.
+			continue
+		}
+	}
+	return sanitized
+}
+
+// hasTextPart reports whether parts contains a non-empty text part.
+func hasTextPart(parts []domain.Part) bool {
+	for _, part := range parts {
+		if part.Type == "text" && part.Text != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// filterEmptyTextParts removes text parts with no content. Other part types
+// (images) are kept as-is.
+func filterEmptyTextParts(message domain.Message) domain.Message {
+	if len(message.Parts) == 0 {
+		return message
+	}
+	filtered := make([]domain.Part, 0, len(message.Parts))
+	for _, part := range message.Parts {
+		if part.Type == "text" && part.Text == "" {
+			continue
+		}
+		filtered = append(filtered, part)
+	}
+	if len(filtered) == len(message.Parts) {
+		return message
+	}
+	message.Parts = filtered
+	return message
 }
 
 // EstimateChars estimates the character cost of messages as the sum of text

@@ -75,6 +75,11 @@ type runExecution struct {
 	lastToolPending bool
 	stage           runStage
 
+	// assistantMessageID is the placeholder row of the model turn whose tool
+	// calls are executing. tool_use events reference it so the console can
+	// lazy-load the full arguments from the assistant message detail.
+	assistantMessageID int64
+
 	thinkingBuf *segmentBuffer
 	textBuf     *segmentBuffer
 }
@@ -218,13 +223,14 @@ func (ex *runExecution) execute(ctx context.Context) {
 		now := service.now()
 		ex.thinkingBuf = newSegmentBuffer(domain.KindThinking, ex.runID, assistantID, now)
 		ex.textBuf = newSegmentBuffer(domain.KindText, ex.runID, assistantID, now)
+		ex.assistantMessageID = assistantID
 
 		request := LLMRequest{
 			Model:           ex.caller.Model(),
 			Messages:        built.Messages,
 			Tools:           service.deps.Tools.Specs(ex.profile.AllowedTools),
 			MaxTokens:       ex.profile.MaxOutputTokens,
-			Thinking:        ex.profile.Thinking,
+			Thinking:        wireThinking(ex.profile.Thinking),
 			ReasoningEffort: ex.profile.ReasoningEffort,
 		}
 		ex.stage = runStageStreaming
@@ -386,6 +392,7 @@ func (ex *runExecution) executeTools(ctx context.Context, calls []domain.ToolCal
 			"tool":           call.Name,
 			"args":           argsPreview,
 			"args_truncated": argsTruncated,
+			"message_id":     ex.assistantMessageID,
 		})
 
 		ex.lastToolName = call.Name
@@ -637,6 +644,18 @@ func (ex *runExecution) addUsage(usage domain.Usage) {
 	ex.usage.CompletionTokens += usage.CompletionTokens
 	ex.usage.ReasoningTokens += usage.ReasoningTokens
 	ex.usage.TotalTokens += usage.TotalTokens
+}
+
+// wireThinking maps the profile's thinking mode to the upstream request value.
+// "auto" is the provider-decides mode: the design spec §13 requires omitting
+// the thinking parameter entirely (sending {"type":"auto"} is rejected by the
+// strict upstream), so it maps to the empty, omitted value. reasoning_effort is
+// an independent parameter and is still sent when configured.
+func wireThinking(mode string) string {
+	if mode == "auto" {
+		return ""
+	}
+	return mode
 }
 
 // abortCodeFromCause extracts the named abort code. A bare deadline maps to the

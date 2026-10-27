@@ -545,7 +545,7 @@ type ToolError struct {
 | `user_message` | 用户消息落库后 | `message_id, text`（≤4096，超出截断并标记）、`truncated` |
 | `thinking` | 思考连续片段 | `run_id, message_id, part, final, text`（≤4096/片）、`truncated` |
 | `text` | 回答连续片段 | 同上 |
-| `tool_use` | 工具调用前 | `run_id, call_id, tool, args`（≤2048）、`args_truncated` |
+| `tool_use` | 工具调用前 | `run_id, call_id, tool, args`（≤2048）、`args_truncated, message_id`（assistant，即拥有该 `tool_calls` 的消息 id；前端按 `call_id` 从消息详情懒加载完整参数） |
 | `tool_result` | 工具返回后 | `run_id, call_id, tool, status`(ok/error/timeout/cancelled/denied)、`duration_ms, result`（≤2048）、`result_truncated, error_code, message_id` |
 | `usage` | 每个模型回合 | `run_id, turn, prompt_tokens, completion_tokens, reasoning_tokens, total_tokens` |
 | `decision` | 预算/截断/拒绝 | `run_id, decision`(context_truncated/budget_stop/tool_denied)、`reason`、可选计数 |

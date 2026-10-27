@@ -274,6 +274,211 @@ func TestBuildFailsWhenLatestUserAloneExceedsBudget(t *testing.T) {
 	}
 }
 
+// assistantHasVisibleContent reports whether one LLM message is a wire-valid
+// assistant turn: it must carry a non-empty text part or at least one tool call.
+func assistantHasVisibleContent(message application.LLMMessage) bool {
+	if len(message.ToolCalls) > 0 {
+		return true
+	}
+	for _, part := range message.Parts {
+		if part.Type == "text" && part.Text != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// TestBuildDropsEmptyAssistantTurns pins the C1 contract: an assistant message
+// with neither content nor tool_calls is rejected by the upstream with HTTP 400
+// "Invalid assistant message", so the builder must never replay one — including
+// reasoning-only turns left by a thought-only abort and placeholders completed
+// with empty content.
+func TestBuildDropsEmptyAssistantTurns(t *testing.T) {
+	history := []domain.Message{
+		{ID: 1, Role: "user", Parts: textPart("q1")},
+		{ID: 2, Role: "assistant", Parts: []domain.Part{}},                                   // immediate abort: completed empty
+		{ID: 3, Role: "assistant", Reasoning: "只有思考"},                                        // thought-only abort
+		{ID: 4, Role: "assistant", Parts: textPart("")},                                      // empty successful answer
+		{ID: 5, Role: "assistant", Parts: []domain.Part{{Type: "image_url", ImageURL: "x"}}}, // no text, no calls
+		{ID: 6, Role: "user", Parts: textPart("q2")},
+		{ID: 7, Role: "assistant", Parts: textPart("a2")},
+	}
+
+	result, err := application.NewContextBuilder().Build("sys", history, 100000)
+	if err != nil {
+		t.Fatalf("Build returned error: %v", err)
+	}
+	if result.DroppedMessages != 0 {
+		t.Fatalf("DroppedMessages=%d want 0 (dropping invalid turns is sanitation, not truncation)", result.DroppedMessages)
+	}
+	if len(result.Messages) != 4 {
+		t.Fatalf("Messages=%+v want system + user q1 + user q2 + assistant a2", result.Messages)
+	}
+	if result.Messages[0].Role != "system" {
+		t.Fatalf("first message role=%q want system", result.Messages[0].Role)
+	}
+	if !messagesContain(result.Messages, "q1") || !messagesContain(result.Messages, "q2") || !messagesContain(result.Messages, "a2") {
+		t.Fatalf("valid messages were dropped: %+v", result.Messages)
+	}
+	for _, message := range result.Messages {
+		if message.Role != "assistant" {
+			continue
+		}
+		if !assistantHasVisibleContent(message) {
+			t.Fatalf("an empty assistant message survived: %+v", message)
+		}
+	}
+}
+
+// TestBuildDropsUnpairedToolCalls pins the I2 contract: crash history may hold
+// an assistant tool_calls message whose tool results were never persisted; the
+// upstream answers such a replay with HTTP 400 "insufficient tool messages".
+func TestBuildDropsUnpairedToolCalls(t *testing.T) {
+	history := []domain.Message{
+		{ID: 1, Role: "user", Parts: textPart("q1")},
+		{
+			ID:   2,
+			Role: "assistant",
+			ToolCalls: []domain.ToolCall{
+				{ID: "call_a", Name: "file.read", Arguments: `{"path":"a"}`},
+				{ID: "call_b", Name: "file.read", Arguments: `{"path":"b"}`},
+			},
+		},
+		{ID: 3, Role: "tool", Parts: textPart("partial"), ToolCallID: "call_a"},
+		{ID: 4, Role: "user", Parts: textPart("q2")},
+		{ID: 5, Role: "assistant", Parts: textPart("a2")},
+	}
+
+	result, err := application.NewContextBuilder().Build("sys", history, 100000)
+	if err != nil {
+		t.Fatalf("Build returned error: %v", err)
+	}
+	if len(result.Messages) != 4 {
+		t.Fatalf("Messages=%+v want system + user q1 + user q2 + assistant a2", result.Messages)
+	}
+	for _, message := range result.Messages {
+		if len(message.ToolCalls) > 0 {
+			t.Fatalf("an assistant with unpaired tool_calls survived: %+v", message)
+		}
+		if message.Role == "tool" {
+			t.Fatalf("a partial tool result survived its dropped assistant: %+v", message)
+		}
+	}
+	if !messagesContain(result.Messages, "q1") || !messagesContain(result.Messages, "q2") || !messagesContain(result.Messages, "a2") {
+		t.Fatalf("the user turn or a valid answer was dropped: %+v", result.Messages)
+	}
+}
+
+func TestBuildKeepsCompleteToolCallPairing(t *testing.T) {
+	history := []domain.Message{
+		{ID: 1, Role: "user", Parts: textPart("q1")},
+		{
+			ID:   2,
+			Role: "assistant",
+			ToolCalls: []domain.ToolCall{
+				{ID: "call_a", Name: "file.read", Arguments: `{"path":"a"}`},
+				{ID: "call_b", Name: "file.read", Arguments: `{"path":"b"}`},
+			},
+		},
+		{ID: 3, Role: "tool", Parts: textPart("result a"), ToolCallID: "call_a"},
+		{ID: 4, Role: "tool", Parts: textPart("result b"), ToolCallID: "call_b"},
+		{ID: 5, Role: "assistant", Parts: textPart("done")},
+	}
+
+	result, err := application.NewContextBuilder().Build("sys", history, 100000)
+	if err != nil {
+		t.Fatalf("Build returned error: %v", err)
+	}
+	if len(result.Messages) != 6 {
+		t.Fatalf("Messages=%+v want system + the complete user turn", result.Messages)
+	}
+	assistant := result.Messages[2]
+	if assistant.Role != "assistant" || len(assistant.ToolCalls) != 2 {
+		t.Fatalf("assistant tool calls=%+v want both calls", assistant)
+	}
+	if len(assistant.Parts) != 0 {
+		t.Fatalf("assistant parts=%+v want none (only tool calls)", assistant.Parts)
+	}
+	// A reasoning-only assistant turn is wire-valid when it carries tool calls.
+	if got := result.Messages[3]; got.Role != "tool" || got.ToolCallID != "call_a" {
+		t.Fatalf("first tool message=%+v", got)
+	}
+	if got := result.Messages[4]; got.Role != "tool" || got.ToolCallID != "call_b" {
+		t.Fatalf("second tool message=%+v", got)
+	}
+}
+
+func TestBuildDropsOrphanToolMessages(t *testing.T) {
+	history := []domain.Message{
+		{ID: 1, Role: "user", Parts: textPart("q1")},
+		// Orphan tool result without any assistant tool_calls message.
+		{ID: 2, Role: "tool", Parts: textPart("orphan"), ToolCallID: "call_missing"},
+		{ID: 3, Role: "user", Parts: textPart("q2")},
+		// A complete pair followed by an extra tool message that answers nothing.
+		{
+			ID:   4,
+			Role: "assistant",
+			ToolCalls: []domain.ToolCall{
+				{ID: "call_a", Name: "file.read", Arguments: `{}`},
+			},
+		},
+		{ID: 5, Role: "tool", Parts: textPart("result a"), ToolCallID: "call_a"},
+		{ID: 6, Role: "tool", Parts: textPart("stray"), ToolCallID: "call_stray"},
+		{ID: 7, Role: "assistant", Parts: textPart("a2")},
+	}
+
+	result, err := application.NewContextBuilder().Build("sys", history, 100000)
+	if err != nil {
+		t.Fatalf("Build returned error: %v", err)
+	}
+	if len(result.Messages) != 6 {
+		t.Fatalf("Messages=%+v want system + user q1 + user q2 + assistant/tool pair + a2", result.Messages)
+	}
+	for _, message := range result.Messages {
+		if message.ToolCallID == "call_missing" || message.ToolCallID == "call_stray" {
+			t.Fatalf("an orphan tool message survived: %+v", message)
+		}
+	}
+	if got := result.Messages[4]; got.Role != "tool" || got.ToolCallID != "call_a" {
+		t.Fatalf("the paired tool message was dropped: %+v", got)
+	}
+}
+
+func TestBuildFiltersEmptyTextParts(t *testing.T) {
+	history := []domain.Message{
+		{ID: 1, Role: "user", Parts: textPart("q1")},
+		{
+			ID:   2,
+			Role: "assistant",
+			Parts: []domain.Part{
+				{Type: "text", Text: ""},
+				{Type: "text", Text: "可见回答"},
+			},
+		},
+		{ID: 3, Role: "user", Parts: []domain.Part{{Type: "text", Text: ""}}},
+	}
+
+	result, err := application.NewContextBuilder().Build("sys", history, 100000)
+	if err != nil {
+		t.Fatalf("Build returned error: %v", err)
+	}
+	if len(result.Messages) != 4 {
+		t.Fatalf("Messages=%+v want system + q1 + assistant + empty user turn kept", result.Messages)
+	}
+	assistant := result.Messages[2]
+	if len(assistant.Parts) != 1 || assistant.Parts[0].Text != "可见回答" {
+		t.Fatalf("assistant parts=%+v want only the non-empty part", assistant.Parts)
+	}
+	// The latest user turn is never dropped, even when its content is empty.
+	latestUser := result.Messages[3]
+	if latestUser.Role != "user" {
+		t.Fatalf("latest message role=%q want user", latestUser.Role)
+	}
+	if len(latestUser.Parts) != 0 {
+		t.Fatalf("empty user text parts were not filtered: %+v", latestUser.Parts)
+	}
+}
+
 func TestEstimateCharsCountsTextReasoningAndArguments(t *testing.T) {
 	messages := []application.LLMMessage{
 		{Role: "system", Parts: []domain.Part{{Type: "text", Text: "sys"}}}, // 3 + 16
