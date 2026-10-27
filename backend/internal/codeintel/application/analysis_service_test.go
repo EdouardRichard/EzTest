@@ -168,7 +168,14 @@ func (e *analysisEntities) Upsert(_ context.Context, entity domain.CodeEntity) e
 		e.files[entity.Path] = entity
 		return nil
 	}
-	e.facts[analysisEntityKey(entity.RepoID, entity.Commit, *entity.FactKey)] = entity
+	key := analysisEntityKey(entity.RepoID, entity.Commit, *entity.FactKey)
+	if existing, ok := e.facts[key]; ok {
+		// The real ON CONFLICT (repo_id, commit_sha, fact_key) DO UPDATE keeps
+		// the existing row id and created_at; only the payload is refreshed.
+		entity.ID = existing.ID
+		entity.CreatedAt = existing.CreatedAt
+	}
+	e.facts[key] = entity
 	e.upserts = append(e.upserts, entity)
 	return nil
 }
@@ -453,12 +460,20 @@ func (f *analysisFacts) Create(_ context.Context, id int64, repoID int64, commit
 	if f.createErr != nil {
 		return f.createErr
 	}
+	key := analysisEntityKey(repoID, commit, factKey)
+	if stored, ok := f.versions[key][version]; ok {
+		// The real code_fact_versions unique constraint rejects a duplicate
+		// (repo, commit, fact_key, version) row; model it so retry paths are
+		// exercised faithfully.
+		_ = stored
+		return domain.NewConflict("duplicate_key",
+			fmt.Sprintf("fact %q version %d already exists", factKey, version))
+	}
 	f.creates = append(f.creates, analysisFactCreate{
 		id: id, repoID: repoID, commit: commit, factKey: factKey,
 		model: model, prompt: prompt, version: version, body: append([]byte(nil), body...),
 		analysisID: analysisID,
 	})
-	key := analysisEntityKey(repoID, commit, factKey)
 	if f.versions[key] == nil {
 		f.versions[key] = make(map[int]analysisFactVersion)
 	}
@@ -2719,6 +2734,580 @@ func TestAnalysisReads(t *testing.T) {
 	candidates, err := f.svc.ListCandidates(context.Background(), 100)
 	if err != nil || len(candidates) != 1 || candidates[0].ID != 500 {
 		t.Fatalf("ListCandidates = %+v, %v; want candidate 500", candidates, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Review fix round 1 regression tests.
+// ---------------------------------------------------------------------------
+
+// analysisClientAndRouteResponse renders one client_call + route fact pair plus
+// the supplied AI edges. The summaries are parameters so a test can bump a fact
+// body without changing the fact identity.
+func analysisClientAndRouteResponse(changeSummary, clientSummary, routeSummary string, edges []any) string {
+	payload := map[string]any{
+		"changeSummary": changeSummary,
+		"facts": []any{
+			map[string]any{
+				"kind": domain.KindClientCall, "name": "POST /api/refund",
+				"path": "web/src/api/refund.ts", "startLine": 1, "endLine": 3,
+				"signature": "post('/api/refund')", "confidence": domain.ConfidenceHigh,
+				"summary": clientSummary,
+				"evidence": []any{map[string]any{
+					"file": "web/src/api/refund.ts", "startLine": 2, "endLine": 3,
+				}},
+			},
+			map[string]any{
+				"kind": domain.KindRoute, "name": "/orders",
+				"path": "web/src/api/refund.ts", "startLine": 1, "endLine": 1,
+				"signature": "routes", "confidence": domain.ConfidenceHigh,
+				"summary": routeSummary,
+				"evidence": []any{map[string]any{
+					"file": "web/src/api/refund.ts", "startLine": 1, "endLine": 1,
+				}},
+			},
+		},
+		"edges": edges,
+	}
+	raw, _ := json.Marshal(payload)
+	return string(raw)
+}
+
+// analysisClientFactWithEdges renders one client_call fact plus the supplied AI
+// edges (used for endpoint-resolution coverage).
+func analysisClientFactWithEdges(factSummary string, edges []any) string {
+	payload := map[string]any{
+		"changeSummary": "refund client analysis",
+		"facts": []any{map[string]any{
+			"kind": domain.KindClientCall, "name": "POST /api/refund",
+			"path": "web/src/api/refund.ts", "startLine": 1, "endLine": 3,
+			"signature": "post('/api/refund')", "confidence": domain.ConfidenceHigh,
+			"summary": factSummary,
+			"evidence": []any{map[string]any{
+				"file": "web/src/api/refund.ts", "startLine": 2, "endLine": 3,
+			}},
+		}},
+		"edges": edges,
+	}
+	raw, _ := json.Marshal(payload)
+	return string(raw)
+}
+
+// analysisTestEdge builds one AI edge payload.
+func analysisTestEdge(fromKind, fromName, toKind, toName, rel string, evidence ...map[string]any) map[string]any {
+	return map[string]any{
+		"from":       map[string]any{"kind": fromKind, "name": fromName},
+		"to":         map[string]any{"kind": toKind, "name": toName},
+		"rel":        rel,
+		"confidence": domain.ConfidenceHigh,
+		"evidence":   evidence,
+	}
+}
+
+// TestRunAIEdgeUsesPersistedEntityAfterFactVersionBump pins Critical 1: the
+// Upsert of a changed fact preserves the existing row id, so the materialised
+// edge must reference the persisted entity ids (the previously minted id would
+// dangle).
+func TestRunAIEdgeUsesPersistedEntityAfterFactVersionBump(t *testing.T) {
+	f := newAnalysisFixture(t)
+	f.changeSet(analysisChangedFile(1, "web/src/api/refund.ts", "M"))
+	edge := analysisTestEdge(domain.KindClientCall, "POST /api/refund", domain.KindRoute, "/orders",
+		domain.RelCalls, map[string]any{"file": "web/src/api/refund.ts", "startLine": 2, "endLine": 3})
+	f.llm.responses["web/src/api/refund.ts"] = analysisClientAndRouteResponse(
+		"first", "client calls refund", "orders route", []any{edge})
+
+	f.runNewAnalysis(t)
+	client, ok := f.entities.fact(3, testCommitB, "client:POST /api/refund")
+	if !ok {
+		t.Fatal("client fact missing after first run")
+	}
+	route, ok := f.entities.fact(3, testCommitB, "route:/orders")
+	if !ok {
+		t.Fatal("route fact missing after first run")
+	}
+	firstEdges := f.edges.allEdges()
+	if len(firstEdges) != 1 {
+		t.Fatalf("first-run edges = %+v, want the AI calls edge", firstEdges)
+	}
+	if firstEdges[0].SrcEntityID != client.ID || firstEdges[0].DstEntityID != route.ID {
+		t.Fatalf("first-run edge = %d->%d, want %d->%d", firstEdges[0].SrcEntityID,
+			firstEdges[0].DstEntityID, client.ID, route.ID)
+	}
+	if firstEdges[0].FactVersion == nil || *firstEdges[0].FactVersion != 1 {
+		t.Fatalf("first-run edge factVersion = %v, want 1", firstEdges[0].FactVersion)
+	}
+
+	// Forced re-run with a changed client body and the same AI edge: the entity
+	// row keeps its id, so the version-2 edge must use it.
+	f.llm.responses["web/src/api/refund.ts"] = analysisClientAndRouteResponse(
+		"second", "client calls refund with a reason", "orders route", []any{edge})
+	forced := f.startAnalysis(t, true)
+	f.runAnalysis(t, forced.ID)
+
+	persistedClient, ok := f.entities.fact(3, testCommitB, "client:POST /api/refund")
+	if !ok {
+		t.Fatal("client fact missing after the body bump")
+	}
+	persistedRoute, ok := f.entities.fact(3, testCommitB, "route:/orders")
+	if !ok {
+		t.Fatal("route fact missing after the body bump")
+	}
+	if persistedClient.ID != client.ID || persistedRoute.ID != route.ID {
+		t.Fatalf("persisted ids = %d/%d, want the stable row ids %d/%d",
+			persistedClient.ID, persistedRoute.ID, client.ID, route.ID)
+	}
+	if persistedClient.FactVersion == nil || *persistedClient.FactVersion != 2 {
+		t.Fatalf("persisted client factVersion = %v, want 2", persistedClient.FactVersion)
+	}
+
+	replaces := f.edges.replacesFor("client:POST /api/refund")
+	if len(replaces) != 2 {
+		t.Fatalf("client edge replacements = %+v, want one per run", replaces)
+	}
+	latest := replaces[len(replaces)-1]
+	if latest.version != 2 || len(latest.edges) != 1 {
+		t.Fatalf("version-2 replacement = %+v, want the single AI edge", latest)
+	}
+	bumped := latest.edges[0]
+	if bumped.SrcEntityID != persistedClient.ID || bumped.DstEntityID != persistedRoute.ID {
+		t.Fatalf("bumped edge endpoints = %d/%d, want persisted ids %d/%d",
+			bumped.SrcEntityID, bumped.DstEntityID, persistedClient.ID, persistedRoute.ID)
+	}
+
+	// The planner handoff must carry the same persisted ids.
+	if len(f.planner.calls) != 2 {
+		t.Fatalf("Planner calls = %d, want 2", len(f.planner.calls))
+	}
+	plannerIDs := make(map[string]int64)
+	for _, fact := range f.planner.calls[1].FactsAtHead {
+		if fact.FactKey != nil {
+			plannerIDs[*fact.FactKey] = fact.ID
+		}
+	}
+	if plannerIDs["client:POST /api/refund"] != persistedClient.ID ||
+		plannerIDs["route:/orders"] != persistedRoute.ID {
+		t.Fatalf("planner fact ids = %+v, want persisted %d/%d",
+			plannerIDs, persistedClient.ID, persistedRoute.ID)
+	}
+}
+
+// TestRunCountsUnresolvedAIEdges pins design spec §6.2: an AI edge with an
+// endpoint that does not resolve to a current fact is dropped and counted.
+func TestRunCountsUnresolvedAIEdges(t *testing.T) {
+	f := newAnalysisFixture(t)
+	f.changeSet(analysisChangedFile(1, "web/src/api/refund.ts", "M"))
+	edge := analysisTestEdge(domain.KindClientCall, "POST /api/refund", domain.KindComponent, "MissingWidget",
+		domain.RelImports, map[string]any{"file": "web/src/api/refund.ts", "startLine": 2, "endLine": 3})
+	f.llm.responses["web/src/api/refund.ts"] = analysisClientFactWithEdges("client calls refund", []any{edge})
+
+	analysis := f.runNewAnalysis(t)
+	stats := analysisStatsJSON(t, analysis)
+	if got := analysisStatInt(t, stats, "unresolvedEdges"); got != 1 {
+		t.Fatalf("stats.unresolvedEdges = %d, want 1", got)
+	}
+	if got := analysisStatInt(t, stats, "edges"); got != 0 {
+		t.Fatalf("stats.edges = %d, want 0", got)
+	}
+	if edges := f.edges.allEdges(); len(edges) != 0 {
+		t.Fatalf("materialised edges = %+v, want none for an unresolved endpoint", edges)
+	}
+}
+
+// TestRunContractEdgeOwnerIsStableAcrossReruns pins R31's deterministic
+// per-(fact_key, fact_version) replacement: both contract sides materialised in
+// one run have exactly one owner (the client side) on every rerun, never a
+// duplicate or ownership-flipped write.
+func TestRunContractEdgeOwnerIsStableAcrossReruns(t *testing.T) {
+	f := newAnalysisFixture(t)
+	f.changeSet(
+		analysisChangedFile(1, "web/src/api/refund.ts", "M"),
+		analysisChangedFile(2, "server/refund.go", "M"),
+	)
+	f.configureFileAnalyses()
+	f.runNewAnalysis(t)
+	forced := f.startAnalysis(t, true)
+	f.runAnalysis(t, forced.ID)
+
+	contractEdges := make([]domain.CodeEdge, 0)
+	for _, edge := range f.edges.allEdges() {
+		if edge.Rel == domain.RelRouteToAPI {
+			contractEdges = append(contractEdges, edge)
+		}
+	}
+	if len(contractEdges) != 1 {
+		t.Fatalf("route_to_api edges = %+v, want exactly one owned edge", contractEdges)
+	}
+	if contractEdges[0].FactKey == nil || *contractEdges[0].FactKey != "client:POST /api/refund" {
+		t.Fatalf("route_to_api owner = %v, want the deterministic client owner", contractEdges[0].FactKey)
+	}
+	apiReplaces := f.edges.replacesFor("api:POST /api/refund")
+	if len(apiReplaces) == 0 {
+		t.Fatal("api fact edges were not replaced")
+	}
+	if last := apiReplaces[len(apiReplaces)-1]; len(last.edges) != 0 {
+		t.Fatalf("api owner edges = %+v, want none (client owns the pair)", last.edges)
+	}
+}
+
+// TestStartUsesRepositoryFixedBranchForLiveHead pins design spec §6.1/INV-3: a
+// live head resolution always uses the repository fixed branch, never the
+// version's code branch.
+func TestStartUsesRepositoryFixedBranchForLiveHead(t *testing.T) {
+	f := newAnalysisFixture(t)
+	f.versions.info.Branch = "feature/version-branch"
+	repo := f.repos.infos[3]
+	repo.FixedBranch = "release"
+	f.repos.infos[3] = repo
+
+	if _, _, err := f.svc.Start(context.Background(), 11, 42, "", false); err != nil {
+		t.Fatalf("Start error = %v", err)
+	}
+	if len(f.git.headCalls) != 1 || f.git.headCalls[0] != "release" {
+		t.Fatalf("Head calls = %v, want the repository fixed branch release", f.git.headCalls)
+	}
+}
+
+// TestRunPlannerInputCarriesAggregatedStats pins the finding-3 fix: the
+// aggregated stats document (including changeSummary) is merged into
+// Analysis.Stats before Planner.Plan runs.
+func TestRunPlannerInputCarriesAggregatedStats(t *testing.T) {
+	f := newAnalysisFixture(t)
+	f.changeSet(analysisChangedFile(1, "web/src/api/refund.ts", "M"))
+	f.llm.responses["web/src/api/refund.ts"] = clientFactResponse()
+
+	f.runNewAnalysis(t)
+	if len(f.planner.calls) != 1 {
+		t.Fatalf("Planner calls = %d, want 1", len(f.planner.calls))
+	}
+	var stats map[string]any
+	if err := json.Unmarshal(f.planner.calls[0].Analysis.Stats, &stats); err != nil {
+		t.Fatalf("decode planner analysis stats %q: %v", string(f.planner.calls[0].Analysis.Stats), err)
+	}
+	if got, ok := stats["facts"].(float64); !ok || int(got) != 1 {
+		t.Fatalf("planner stats.facts = %v, want 1", stats["facts"])
+	}
+	if got, ok := stats["changedFiles"].(float64); !ok || int(got) != 1 {
+		t.Fatalf("planner stats.changedFiles = %v, want 1", stats["changedFiles"])
+	}
+	summary, _ := stats["changeSummary"].(string)
+	if !strings.Contains(summary, "refund client call") {
+		t.Fatalf("planner stats.changeSummary = %q, want the aggregated summary", summary)
+	}
+}
+
+// TestRunPlannerInputIncludesContractCounterparts pins the finding-3 fix: the
+// head counterpart of a contract pair (an api fact whose file is not a changed
+// file) is part of FactsAtHead so T13 can propagate the contract.
+func TestRunPlannerInputIncludesContractCounterparts(t *testing.T) {
+	f := newAnalysisFixture(t)
+	f.changeSet(analysisChangedFile(1, "web/src/api/refund.ts", "M"))
+	f.llm.responses["web/src/api/refund.ts"] = clientFactResponse()
+	apiKey := "api:POST /api/refund"
+	apiVersion := 1
+	f.entities.facts[analysisEntityKey(3, testCommitB, apiKey)] = domain.CodeEntity{
+		ID: 9100, RepoID: 3, Commit: testCommitB, Kind: domain.KindAPI,
+		Name: "POST /api/refund", Path: "server/refund.go", Source: domain.SourceAI,
+		Confidence: domain.ConfidenceHigh,
+		Evidence:   []domain.Evidence{analysisEvidenceFor(t, 0, "server/refund.go", 1, 3)},
+		FactKey:    &apiKey, FactVersion: &apiVersion,
+	}
+
+	analysis := f.runNewAnalysis(t)
+	stats := analysisStatsJSON(t, analysis)
+	if got := analysisStatInt(t, stats, "contracts"); got != 1 {
+		t.Fatalf("stats.contracts = %d, want 1", got)
+	}
+	if len(f.planner.calls) != 1 {
+		t.Fatalf("Planner calls = %d, want 1", len(f.planner.calls))
+	}
+	in := f.planner.calls[0]
+	ids := make(map[string]int64)
+	for _, fact := range in.FactsAtHead {
+		if fact.FactKey != nil {
+			ids[*fact.FactKey] = fact.ID
+		}
+	}
+	client, _ := f.entities.fact(3, testCommitB, "client:POST /api/refund")
+	if ids["client:POST /api/refund"] != client.ID {
+		t.Fatalf("planner client fact = %d, want persisted %d", ids["client:POST /api/refund"], client.ID)
+	}
+	if ids[apiKey] != 9100 {
+		t.Fatalf("planner facts = %+v, want the contract counterpart api fact 9100", ids)
+	}
+	var contract *domain.CodeEdge
+	for index := range in.Edges {
+		if in.Edges[index].Rel == domain.RelRouteToAPI {
+			contract = &in.Edges[index]
+		}
+	}
+	if contract == nil || contract.SrcEntityID != client.ID || contract.DstEntityID != 9100 {
+		t.Fatalf("planner contract edge = %+v, want %d->9100", contract, client.ID)
+	}
+}
+
+// TestRunMixedEvidenceForcesLowClue pins §6.2/§6.3: any evidence-validation
+// failure (not only a fully invalid set) forces the fact to a low clue and the
+// edge to low confidence.
+func TestRunMixedEvidenceForcesLowClue(t *testing.T) {
+	f := newAnalysisFixture(t)
+	f.changeSet(analysisChangedFile(1, "web/src/api/refund.ts", "M"))
+	payload := map[string]any{
+		"changeSummary": "mixed evidence",
+		"facts": []any{
+			map[string]any{
+				"kind": domain.KindClientCall, "name": "POST /api/refund",
+				"path": "web/src/api/refund.ts", "startLine": 1, "endLine": 3,
+				"confidence": domain.ConfidenceHigh, "summary": "mixed client evidence",
+				"evidence": []any{
+					map[string]any{"file": "web/src/api/refund.ts", "startLine": 2, "endLine": 3},
+					map[string]any{"file": "web/src/api/refund.ts", "startLine": 99, "endLine": 100},
+				},
+			},
+			map[string]any{
+				"kind": domain.KindRoute, "name": "/orders",
+				"path": "web/src/api/refund.ts", "startLine": 1, "endLine": 1,
+				"confidence": domain.ConfidenceHigh, "summary": "orders route",
+				"evidence": []any{
+					map[string]any{"file": "web/src/api/refund.ts", "startLine": 1, "endLine": 1},
+				},
+			},
+		},
+		"edges": []any{map[string]any{
+			"from": map[string]any{"kind": domain.KindClientCall, "name": "POST /api/refund"},
+			"to":   map[string]any{"kind": domain.KindRoute, "name": "/orders"},
+			"rel":  domain.RelCalls, "confidence": domain.ConfidenceHigh,
+			"evidence": []any{
+				map[string]any{"file": "web/src/api/refund.ts", "startLine": 1, "endLine": 2},
+				map[string]any{"file": "web/src/api/refund.ts", "startLine": 99, "endLine": 100},
+			},
+		}},
+	}
+	raw, _ := json.Marshal(payload)
+	f.llm.responses["web/src/api/refund.ts"] = string(raw)
+
+	analysis := f.runNewAnalysis(t)
+	stats := analysisStatsJSON(t, analysis)
+	if got := analysisStatInt(t, stats, "evidenceChecks"); got != 5 {
+		t.Fatalf("stats.evidenceChecks = %d, want 5", got)
+	}
+	if got := analysisStatInt(t, stats, "evidenceFailures"); got != 2 {
+		t.Fatalf("stats.evidenceFailures = %d, want 2", got)
+	}
+	client, ok := f.entities.fact(3, testCommitB, "client:POST /api/refund")
+	if !ok {
+		t.Fatal("client fact missing")
+	}
+	if client.Confidence != domain.ConfidenceLow {
+		t.Fatalf("client confidence = %q, want low for mixed evidence", client.Confidence)
+	}
+	if !strings.Contains(string(client.Meta), `"clue":true`) {
+		t.Fatalf("client meta = %s, want clue=true", client.Meta)
+	}
+	if len(client.Evidence) != 1 {
+		t.Fatalf("client evidence = %+v, want only the valid entry", client.Evidence)
+	}
+	var edge *domain.CodeEdge
+	for _, candidate := range f.edges.allEdges() {
+		if candidate.Rel == domain.RelCalls {
+			edge = &candidate
+		}
+	}
+	if edge == nil {
+		t.Fatal("calls edge missing")
+	}
+	if edge.Confidence != domain.ConfidenceLow {
+		t.Fatalf("edge confidence = %q, want low for mixed evidence", edge.Confidence)
+	}
+	if len(edge.Evidence) != 1 {
+		t.Fatalf("edge evidence = %+v, want only the valid entry", edge.Evidence)
+	}
+}
+
+// TestMergeMaterializedFactsForcesClueOnInvalidEvidence pins the duplicate-merge
+// half of the same §6.3 rule: a duplicate contribution with an invalid evidence
+// entry keeps the merged fact a low clue even when valid evidence survives.
+func TestMergeMaterializedFactsForcesClueOnInvalidEvidence(t *testing.T) {
+	valid := &materializedFact{
+		Key: "route:/orders", Kind: domain.KindRoute, Name: "/orders", Path: "web/a.ts",
+		Confidence: domain.ConfidenceHigh, LinesValid: true,
+		Evidence: []domain.Evidence{{File: "web/a.ts", StartLine: 1, EndLine: 1}},
+	}
+	mixed := &materializedFact{
+		Key: "route:/orders", Kind: domain.KindRoute, Name: "/orders", Path: "web/a.ts",
+		Confidence: domain.ConfidenceLow, LinesValid: true, Clue: true, InvalidEvidence: 1,
+		Evidence: []domain.Evidence{{File: "web/b.ts", StartLine: 2, EndLine: 2}},
+	}
+	merged, _ := mergeMaterializedFacts([]analysisFileResult{
+		{facts: []*materializedFact{valid}},
+		{facts: []*materializedFact{mixed}},
+	})
+	if len(merged) != 1 {
+		t.Fatalf("merged facts = %d, want 1", len(merged))
+	}
+	if !merged[0].Clue || merged[0].Confidence != domain.ConfidenceLow {
+		t.Fatalf("merged fact = %+v, want a low clue after an invalid evidence entry", merged[0])
+	}
+}
+
+// TestRunSkipsSymlinkLikeFiles pins §6.2: a changed file that GitReader reports
+// as path_not_file (symlink/submodule) is skipped, not degraded.
+func TestRunSkipsSymlinkLikeFiles(t *testing.T) {
+	f := newAnalysisFixture(t)
+	f.changeSet(analysisChangedFile(1, "web/src/link.ts", "M"))
+	f.git.readErr["web/src/link.ts"] = domain.NewInvalid("path", "path_not_file",
+		"codeintel: path is not a regular file at the requested commit")
+
+	analysis := f.runNewAnalysis(t)
+	if analysis.Degraded {
+		t.Fatal("path_not_file must not degrade the run")
+	}
+	if len(analysis.Errors) != 0 {
+		t.Fatalf("analysis errors = %+v, want none for an unsupported file kind", analysis.Errors)
+	}
+	stats := analysisStatsJSON(t, analysis)
+	if got := analysisStatInt(t, stats, "skipped"); got != 1 {
+		t.Fatalf("stats.skipped = %d, want 1", got)
+	}
+	if got := analysisStatInt(t, stats, "failedFiles"); got != 0 {
+		t.Fatalf("stats.failedFiles = %d, want 0", got)
+	}
+	if f.llm.callCount() != 0 {
+		t.Fatalf("LLM calls = %d, want 0 for a skipped file", f.llm.callCount())
+	}
+}
+
+// TestRunDuplicateFactVersionRetryRecovers pins the R30 idempotency rule: a
+// partial materialisation that left the fact-version row but no entity is
+// recovered on retry when the retried body is identical, and the failure was
+// persisted as failed.
+func TestRunDuplicateFactVersionRetryRecovers(t *testing.T) {
+	f := newAnalysisFixture(t)
+	f.changeSet(analysisChangedFile(1, "web/src/api/refund.ts", "M"))
+	f.llm.responses["web/src/api/refund.ts"] = clientFactResponse()
+
+	f.entities.err = errors.New("entity write failed")
+	failed := f.startAnalysis(t, false)
+	if err := f.svc.Run(context.Background(), failed.ID); err == nil {
+		t.Fatal("Run error = nil, want the partial entity failure")
+	}
+	storedFailed := f.storedAnalysis(t, failed.ID)
+	if storedFailed.Status != domain.RunFailed {
+		t.Fatalf("partial failure status = %q, want failed", storedFailed.Status)
+	}
+	if len(f.facts.creates) != 1 {
+		t.Fatalf("fact creates after the partial failure = %+v, want one", f.facts.creates)
+	}
+	if _, ok := f.entities.fact(3, testCommitB, "client:POST /api/refund"); ok {
+		t.Fatal("entity exists after the forced partial failure")
+	}
+
+	// Retry with the same body: the duplicate version row is accepted and the
+	// missing entity write is completed.
+	f.entities.err = nil
+	retry := f.startAnalysis(t, true)
+	f.runAnalysis(t, retry.ID)
+	recovered := f.storedAnalysis(t, retry.ID)
+	if recovered.Status != domain.RunDone {
+		t.Fatalf("retry status = %q, want done", recovered.Status)
+	}
+	entity, ok := f.entities.fact(3, testCommitB, "client:POST /api/refund")
+	if !ok {
+		t.Fatal("entity missing after the retry")
+	}
+	if entity.FactVersion == nil || *entity.FactVersion != 1 {
+		t.Fatalf("retry entity factVersion = %v, want 1", entity.FactVersion)
+	}
+	if len(f.facts.creates) != 1 {
+		t.Fatalf("fact creates after the retry = %+v, want the recovered version only", f.facts.creates)
+	}
+	if stats := analysisStatsJSON(t, recovered); analysisStatInt(t, stats, "conflicts") != 0 {
+		t.Fatalf("retry stats = %+v, want no conflict", stats)
+	}
+}
+
+// TestRunChangedBodyAfterPartialFailureIsDeterministic pins the R30 rule for a
+// retried version whose body changed: the persisted (DB) version record wins,
+// the run completes, and repeated retries stay deterministic instead of
+// wedging on duplicate_key.
+func TestRunChangedBodyAfterPartialFailureIsDeterministic(t *testing.T) {
+	f := newAnalysisFixture(t)
+	f.changeSet(analysisChangedFile(1, "web/src/api/refund.ts", "M"))
+	f.llm.responses["web/src/api/refund.ts"] = clientFactResponseWithFactSummary("body A")
+	f.runNewAnalysis(t)
+	initial, ok := f.entities.fact(3, testCommitB, "client:POST /api/refund")
+	if !ok {
+		t.Fatal("initial fact missing")
+	}
+
+	// Partial failure: version 2 exists but the entity upsert fails.
+	f.llm.responses["web/src/api/refund.ts"] = clientFactResponseWithFactSummary("body B")
+	f.entities.err = errors.New("entity write failed")
+	failed := f.startAnalysis(t, true)
+	if err := f.svc.Run(context.Background(), failed.ID); err == nil {
+		t.Fatal("Run error = nil, want the partial entity failure")
+	}
+	if stored := f.storedAnalysis(t, failed.ID); stored.Status != domain.RunFailed {
+		t.Fatalf("partial failure status = %q, want failed", stored.Status)
+	}
+	f.entities.err = nil
+
+	// Retry with a third body: the stored version-2 body is the DB authority.
+	f.llm.responses["web/src/api/refund.ts"] = clientFactResponseWithFactSummary("body C")
+	retry := f.startAnalysis(t, true)
+	f.runAnalysis(t, retry.ID)
+	recovered := f.storedAnalysis(t, retry.ID)
+	if recovered.Status != domain.RunDone {
+		t.Fatalf("retry status = %q, want done", recovered.Status)
+	}
+	persisted, ok := f.entities.fact(3, testCommitB, "client:POST /api/refund")
+	if !ok {
+		t.Fatal("fact missing after the retry")
+	}
+	if persisted.ID != initial.ID {
+		t.Fatalf("retried entity id = %d, want the preserved %d", persisted.ID, initial.ID)
+	}
+	if persisted.FactVersion == nil || *persisted.FactVersion != 2 {
+		t.Fatalf("retried factVersion = %v, want the persisted version 2", persisted.FactVersion)
+	}
+	if len(f.facts.creates) != 2 {
+		t.Fatalf("fact creates = %+v, want the existing version 1 and 2 only", f.facts.creates)
+	}
+	stats := analysisStatsJSON(t, recovered)
+	if got := analysisStatInt(t, stats, "conflicts"); got != 1 {
+		t.Fatalf("stats.conflicts = %d, want 1 for the DB-persisted version", got)
+	}
+	storedBody, err := f.facts.GetVersion(context.Background(), 3, testCommitB, "client:POST /api/refund", 2)
+	if err != nil {
+		t.Fatalf("read persisted version body: %v", err)
+	}
+	if !strings.Contains(string(storedBody), `"summary":"body B"`) {
+		t.Fatalf("persisted version-2 body = %s, want the DB authority body B", storedBody)
+	}
+
+	// The next retry computes body C again. The DB now holds body B as the
+	// current version, so C is a real body change and legitimately becomes
+	// version 3; a repeated retry then reuses version 3 (idempotent).
+	again := f.startAnalysis(t, true)
+	f.runAnalysis(t, again.ID)
+	if got := len(f.facts.creates); got != 3 {
+		t.Fatalf("fact creates after the second retry = %d, want the version-3 row", got)
+	}
+	converged := f.storedAnalysis(t, again.ID)
+	if persisted, _ := f.entities.fact(3, testCommitB, "client:POST /api/refund"); persisted.FactVersion == nil || *persisted.FactVersion != 3 {
+		t.Fatalf("converged factVersion = %v, want 3", persisted.FactVersion)
+	}
+	if stats := analysisStatsJSON(t, converged); analysisStatInt(t, stats, "conflicts") != 0 {
+		t.Fatalf("second retry stats = %+v, want no conflict", stats)
+	}
+
+	repeat := f.startAnalysis(t, true)
+	f.runAnalysis(t, repeat.ID)
+	if got := len(f.facts.creates); got != 3 {
+		t.Fatalf("fact creates after the repeated retry = %d, want 3", got)
+	}
+	repeatStats := analysisStatsJSON(t, f.storedAnalysis(t, repeat.ID))
+	if got := analysisStatInt(t, repeatStats, "conflicts"); got != 0 {
+		t.Fatalf("repeated retry stats.conflicts = %d, want 0", got)
 	}
 }
 

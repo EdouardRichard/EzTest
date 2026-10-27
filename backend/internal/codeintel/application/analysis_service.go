@@ -55,6 +55,12 @@ const (
 	reasonParseError     = "parse_error"
 	reasonReadFailed     = "read_failed"
 
+	// reasonUnsupportedContent and reasonPathNotFile are the Git verdicts of a
+	// non-text read and of a symlink/submodule/directory. Design spec §6.2
+	// excludes those files from AI analysis: they are skipped, not degraded.
+	reasonUnsupportedContent = "unsupported_content"
+	reasonPathNotFile        = "path_not_file"
+
 	// statusChangedFileDeleted is the git diff status of a deleted file.
 	statusChangedFileDeleted = "D"
 
@@ -260,7 +266,7 @@ func (s *AnalysisService) Start(ctx context.Context, versionID, actorID int64, h
 	if err != nil {
 		return domain.CodeAnalysis{}, false, err
 	}
-	head, err := s.resolveHead(ctx, repo, info, base, headCommit)
+	head, err := s.resolveHead(ctx, repo, base, headCommit)
 	if err != nil {
 		return domain.CodeAnalysis{}, false, err
 	}
@@ -366,9 +372,11 @@ func (s *AnalysisService) failEnqueuedAnalysis(ctx context.Context, analysis dom
 }
 
 // resolveHead validates an explicit head commit (40 hex and a descendant of the
-// baseline) or resolves the version/repository fixed branch tip live (design
-// spec §6.1/§6.6). base == head is legal.
-func (s *AnalysisService) resolveHead(ctx context.Context, repo RepoInfo, info VersionInfo, base, headCommit string) (string, error) {
+// baseline) or resolves the live tip of the repository fixed branch (design
+// spec §6.1/INV-3: the version's code_branch is display metadata, never a Git
+// source; QueryService/IndexService resolve the same fixed branch). base == head
+// is legal.
+func (s *AnalysisService) resolveHead(ctx context.Context, repo RepoInfo, base, headCommit string) (string, error) {
 	head := strings.TrimSpace(headCommit)
 	if head != "" {
 		if !commitHashPattern.MatchString(head) {
@@ -385,11 +393,7 @@ func (s *AnalysisService) resolveHead(ctx context.Context, repo RepoInfo, info V
 		}
 		return head, nil
 	}
-	branch := strings.TrimSpace(info.Branch)
-	if branch == "" {
-		branch = repo.FixedBranch
-	}
-	return s.deps.Git.Head(ctx, repo.LocalPath, branch)
+	return s.deps.Git.Head(ctx, repo.LocalPath, repo.FixedBranch)
 }
 
 // activeRepo loads the repository and rejects a disabled one (design spec §7.1
@@ -566,6 +570,7 @@ type analysisStats struct {
 	UnresolvedEdges    int    `json:"unresolvedEdges"`
 	TruncatedEntries   int    `json:"truncatedEntries"`
 	Truncated          bool   `json:"truncated"`
+	Conflicts          int    `json:"conflicts"`
 	Unmapped           int    `json:"unmapped"`
 	Candidates         int    `json:"candidates"`
 	ChangeSummary      string `json:"changeSummary"`
@@ -653,7 +658,8 @@ func (s *AnalysisService) executeRun(ctx context.Context, state *analysisRunStat
 	if err != nil {
 		return err
 	}
-	if err := s.materializeEdges(ctx, state, factEntities, allEdges); err != nil {
+	headFacts, err := s.materializeEdges(ctx, state, factEntities, allEdges)
+	if err != nil {
 		return err
 	}
 
@@ -665,7 +671,7 @@ func (s *AnalysisService) executeRun(ctx context.Context, state *analysisRunStat
 	if err != nil {
 		return err
 	}
-	factsAtHead, err := s.factsAtHead(ctx, state, changedPaths, factEntities)
+	factsAtHead, err := s.factsAtHead(ctx, state, changedPaths, factEntities, headFacts)
 	if err != nil {
 		return err
 	}
@@ -673,9 +679,18 @@ func (s *AnalysisService) executeRun(ctx context.Context, state *analysisRunStat
 	if err != nil {
 		return err
 	}
+	// The planner sees the aggregated T1 stats (including the joined
+	// changeSummary) at Plan time; the final persisted document merges the
+	// planner's own counters afterwards (design spec §6.6 input 3 / R28).
+	planStats, err := mergeAnalysisStats(state.stats, nil)
+	if err != nil {
+		return err
+	}
+	analysisInput := *analysis
+	analysisInput.Stats = planStats
 	input := ImpactInput{
 		Version:      info,
-		Analysis:     *analysis,
+		Analysis:     analysisInput,
 		Requirements: requirements,
 		Relations:    relations,
 		Anchors:      anchors,
@@ -828,7 +843,10 @@ func (s *AnalysisService) analyzeFile(ctx context.Context, state *analysisRunSta
 		if isRunContextError(ctx, content.err) {
 			return result, content.err
 		}
-		if domain.Reason(content.err) == "unsupported_content" {
+		// Deleted, binary, non-UTF-8 and symlink/submodule files are outside
+		// the §6.2 analysable set: counted as skipped, never degraded.
+		switch domain.Reason(content.err) {
+		case reasonUnsupportedContent, reasonPathNotFile:
 			state.stats.Skipped++
 			return result, nil
 		}
@@ -1006,7 +1024,9 @@ func (s *AnalysisService) validateFileAnalysis(ctx context.Context, state *analy
 		mergedEvidence := mergeContractEvidence(evidence)
 
 		confidence := fact.Confidence
-		clue := !linesValid || len(mergedEvidence) == 0
+		// §6.2/§6.3: any failed evidence validation (even when another entry
+		// survives) forces the fact to a low clue.
+		clue := !linesValid || len(mergedEvidence) == 0 || invalidEvidence > 0
 		if clue {
 			confidence = domain.ConfidenceLow
 		}
@@ -1035,16 +1055,19 @@ func (s *AnalysisService) validateFileAnalysis(ctx context.Context, state *analy
 			continue
 		}
 		evidence := make([]domain.Evidence, 0, len(edge.Evidence))
+		invalidEvidence := 0
 		for _, raw := range edge.Evidence {
 			state.stats.EvidenceChecks++
 			evidencePath, pathErr := normalizeRepoRelativePath(raw.File)
 			if pathErr != nil {
 				state.stats.EvidenceFailures++
+				invalidEvidence++
 				continue
 			}
 			content := s.contentFor(ctx, state, evidencePath)
 			if content.err != nil || content.truncated || !content.ok {
 				state.stats.EvidenceFailures++
+				invalidEvidence++
 				continue
 			}
 			normalized := raw
@@ -1052,13 +1075,16 @@ func (s *AnalysisService) validateFileAnalysis(ctx context.Context, state *analy
 			validated, err := ValidateEvidence(content.content, normalized, s.config.MaxExcerptLines)
 			if err != nil {
 				state.stats.EvidenceFailures++
+				invalidEvidence++
 				continue
 			}
 			evidence = append(evidence, validated)
 		}
 		mergedEvidence := mergeContractEvidence(evidence)
 		confidence := edge.Confidence
-		if len(mergedEvidence) == 0 {
+		// Any invalid edge evidence entry downgrades the edge (§6.2/§6.3),
+		// not only a fully empty valid set.
+		if len(mergedEvidence) == 0 || invalidEvidence > 0 {
 			confidence = domain.ConfidenceLow
 		}
 		edges = append(edges, validatedAIEdge{
@@ -1075,65 +1101,20 @@ func (s *AnalysisService) validateFileAnalysis(ctx context.Context, state *analy
 
 // materializeFacts versions and upserts every merged fact and returns the
 // fact-version snapshot plus the current fact entities keyed by fact_key.
+//
+// The persisted entity row is always resolved back from the repository: a fact
+// version bump updates the existing row in place (ON CONFLICT keeps its id), so
+// the newly minted candidate id must never leak into code_edges /
+// ImpactInput.FactsAtHead.
 func (s *AnalysisService) materializeFacts(ctx context.Context, state *analysisRunState, facts []*materializedFact) ([]domain.FactVersionRef, map[string]domain.CodeEntity, error) {
-	analysis := state.analysis
 	factEntities := make(map[string]domain.CodeEntity, len(facts))
 	refs := make([]domain.FactVersionRef, 0, len(facts))
 
 	for _, fact := range facts {
-		body := marshalFactBody(fact)
-		version := 1
-		var entity domain.CodeEntity
-		needsWrite := true
-
-		current, currentVersion, err := s.deps.Facts.Current(ctx, analysis.RepoID, analysis.HeadCommit, fact.Key)
-		switch {
-		case err == nil:
-			existingBody, bodyErr := s.deps.Facts.GetVersion(ctx, analysis.RepoID, analysis.HeadCommit, fact.Key, currentVersion)
-			if bodyErr != nil {
-				return nil, nil, bodyErr
-			}
-			if jsonSemanticEqual(existingBody, body) {
-				version = currentVersion
-				entity = *current
-				needsWrite = false
-			} else {
-				version = currentVersion + 1
-			}
-		case errors.Is(err, domain.ErrNotFound):
-			// New fact: version 1.
-		default:
+		entity, version, err := s.materializeFact(ctx, state, fact)
+		if err != nil {
 			return nil, nil, err
 		}
-
-		if needsWrite {
-			if version > 1 {
-				if err := s.deps.Facts.Supersede(ctx, analysis.RepoID, analysis.HeadCommit, fact.Key, version, s.now()); err != nil {
-					return nil, nil, err
-				}
-			}
-			id := s.deps.IDs.Next()
-			if id == 0 {
-				return nil, nil, errors.New("codeintel: id generator returned a zero fact version id")
-			}
-			if err := s.deps.Facts.Create(ctx, id, analysis.RepoID, analysis.HeadCommit, fact.Key,
-				analysis.Model, analysis.PromptVersion, version, body, analysis.ID); err != nil {
-				if domain.Reason(err) != "duplicate_key" {
-					return nil, nil, err
-				}
-				// A previous interrupted attempt already appended this version; reuse
-				// it only when the body matches, otherwise surface the conflict.
-				stored, getErr := s.deps.Facts.GetVersion(ctx, analysis.RepoID, analysis.HeadCommit, fact.Key, version)
-				if getErr != nil || !jsonSemanticEqual(stored, body) {
-					return nil, nil, err
-				}
-			}
-			entity = s.factEntity(state, fact, version)
-			if err := s.deps.Entities.Upsert(ctx, entity); err != nil {
-				return nil, nil, err
-			}
-		}
-
 		factEntities[fact.Key] = entity
 		refs = append(refs, domain.FactVersionRef{FactKey: fact.Key, Version: version})
 	}
@@ -1143,6 +1124,132 @@ func (s *AnalysisService) materializeFacts(ctx context.Context, state *analysisR
 		refs = refs[:domain.MaxFactVersionsSnapshot]
 	}
 	return refs, factEntities, nil
+}
+
+// materializeFact persists one fact and returns the current persisted entity
+// snapshot plus its version. An unchanged body reuses the current version; a
+// changed body bumps it.
+func (s *AnalysisService) materializeFact(ctx context.Context, state *analysisRunState, fact *materializedFact) (domain.CodeEntity, int, error) {
+	analysis := state.analysis
+	body := marshalFactBody(fact)
+	current, currentVersion, err := s.deps.Facts.Current(ctx, analysis.RepoID, analysis.HeadCommit, fact.Key)
+	switch {
+	case err == nil:
+		existingBody, bodyErr := s.deps.Facts.GetVersion(ctx, analysis.RepoID, analysis.HeadCommit, fact.Key, currentVersion)
+		if bodyErr != nil {
+			return domain.CodeEntity{}, 0, bodyErr
+		}
+		if jsonSemanticEqual(existingBody, body) {
+			return *current, currentVersion, nil
+		}
+		return s.writeFactVersion(ctx, state, fact, body, currentVersion+1, current)
+	case errors.Is(err, domain.ErrNotFound):
+		// New fact (or a previous attempt left only the version row): version 1.
+		return s.writeFactVersion(ctx, state, fact, body, 1, nil)
+	default:
+		return domain.CodeEntity{}, 0, err
+	}
+}
+
+// factIDCollisionAttempts bounds the fresh-id retries of an INSERT whose
+// duplicate-key error came from the caller-minted id rather than the fact
+// version identity.
+const factIDCollisionAttempts = 3
+
+// writeFactVersion appends one fact version, tolerating the partial states left
+// by an interrupted earlier attempt (R30). Equal persisted bodies are accepted
+// as the same version; a different persisted body is the DB authority (design
+// spec §6.11 "以 DB 现有记录为准") and is recorded as stats.conflicts instead of
+// wedging every retry on duplicate_key. Finally the upserted entity is read back
+// so callers always receive the persisted row id.
+func (s *AnalysisService) writeFactVersion(ctx context.Context, state *analysisRunState, fact *materializedFact, body []byte, version int, current *domain.CodeEntity) (domain.CodeEntity, int, error) {
+	analysis := state.analysis
+	if version > 1 {
+		if err := s.deps.Facts.Supersede(ctx, analysis.RepoID, analysis.HeadCommit, fact.Key, version, s.now()); err != nil {
+			return domain.CodeEntity{}, 0, err
+		}
+	}
+
+	persistedFact := fact
+	for attempt := 0; ; attempt++ {
+		id := s.deps.IDs.Next()
+		if id == 0 {
+			return domain.CodeEntity{}, 0, errors.New("codeintel: id generator returned a zero fact version id")
+		}
+		err := s.deps.Facts.Create(ctx, id, analysis.RepoID, analysis.HeadCommit, fact.Key,
+			analysis.Model, analysis.PromptVersion, version, body, analysis.ID)
+		if err == nil {
+			break
+		}
+		if domain.Reason(err) != "duplicate_key" {
+			return domain.CodeEntity{}, 0, err
+		}
+		stored, getErr := s.deps.Facts.GetVersion(ctx, analysis.RepoID, analysis.HeadCommit, fact.Key, version)
+		switch {
+		case getErr == nil && jsonSemanticEqual(stored, body):
+			// The interrupted attempt left the exact same version body.
+		case getErr == nil:
+			adopted, decodeErr := materializedFactFromBody(fact.Key, stored)
+			if decodeErr != nil {
+				return domain.CodeEntity{}, 0,
+					fmt.Errorf("codeintel: decode persisted fact %q version %d: %w", fact.Key, version, decodeErr)
+			}
+			persistedFact = adopted
+			state.stats.Conflicts++
+		case errors.Is(getErr, domain.ErrNotFound):
+			// The duplicate came from another unique constraint (the caller
+			// id): mint a fresh snowflake and retry the same version.
+			if attempt+1 < factIDCollisionAttempts {
+				continue
+			}
+			return domain.CodeEntity{}, 0, err
+		default:
+			return domain.CodeEntity{}, 0, getErr
+		}
+		break
+	}
+
+	entity := s.factEntity(state, persistedFact, version)
+	if current != nil {
+		// ON CONFLICT updates the existing row in place: reuse its id so the
+		// edges materialised below never reference the discarded minted id.
+		entity.ID = current.ID
+		entity.CreatedAt = current.CreatedAt
+	}
+	if err := s.deps.Entities.Upsert(ctx, entity); err != nil {
+		return domain.CodeEntity{}, 0, err
+	}
+	persisted, err := s.deps.Entities.GetByFactKey(ctx, analysis.RepoID, analysis.HeadCommit, fact.Key)
+	if err != nil {
+		return domain.CodeEntity{}, 0,
+			fmt.Errorf("codeintel: resolve persisted fact %q: %w", fact.Key, err)
+	}
+	return persisted, version, nil
+}
+
+// materializedFactFromBody reconstructs the fact fields of one persisted
+// canonical fact body so the DB-authoritative version can refresh the current
+// entity after a retry conflict.
+func materializedFactFromBody(key string, body []byte) (*materializedFact, error) {
+	var document factBodyJSON
+	if err := json.Unmarshal(body, &document); err != nil {
+		return nil, err
+	}
+	return &materializedFact{
+		Key:             key,
+		Kind:            document.Kind,
+		Name:            document.Name,
+		Path:            document.Path,
+		StartLine:       document.StartLine,
+		EndLine:         document.EndLine,
+		Signature:       document.Signature,
+		Confidence:      document.Confidence,
+		Summary:         document.Summary,
+		Evidence:        document.Evidence,
+		Clue:            document.Clue,
+		LinesValid:      true,
+		InvalidEvidence: document.InvalidEvidence,
+	}, nil
 }
 
 // factEntity builds the current code_entities snapshot of one fact version. The
@@ -1181,8 +1288,10 @@ func (s *AnalysisService) factEntity(state *analysisRunState, fact *materialized
 // materializeEdges resolves AI edges against the current fact entities,
 // generates the cross-stack contract edges, and replaces the edge set of every
 // materialised fact exactly once (design spec §6.2/§6.5). Endpoints that cannot
-// be resolved are counted in stats.unresolvedEdges.
-func (s *AnalysisService) materializeEdges(ctx context.Context, state *analysisRunState, factEntities map[string]domain.CodeEntity, edges []validatedAIEdge) error {
+// be resolved are counted in stats.unresolvedEdges. The returned map is the
+// full fact view at head (materialised facts + the head contract facts) handed
+// to the planner.
+func (s *AnalysisService) materializeEdges(ctx context.Context, state *analysisRunState, factEntities map[string]domain.CodeEntity, edges []validatedAIEdge) (map[string]domain.CodeEntity, error) {
 	analysis := state.analysis
 	ownerEdges := make(map[string][]domain.CodeEdge, len(factEntities))
 	for key := range factEntities {
@@ -1216,7 +1325,7 @@ func (s *AnalysisService) materializeEdges(ctx context.Context, state *analysisR
 
 	factsAtHead, err := s.loadContractFacts(ctx, analysis.RepoID, analysis.HeadCommit)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	allFacts := make(map[string]domain.CodeEntity, len(factsAtHead)+len(factEntities))
 	for _, entity := range factsAtHead {
@@ -1238,24 +1347,26 @@ func (s *AnalysisService) materializeEdges(ctx context.Context, state *analysisR
 	state.stats.Contracts = len(matched.pairs)
 	state.stats.UnmatchedContracts = matched.unmatched
 	state.stats.ContractTruncated = matched.truncated
+	// Exactly one owner per matched pair (R31): the client side when this run
+	// materialised it, else the api side. A pair materialised by neither side
+	// belongs to an earlier analysis and is not rewritten here, so ownership can
+	// never be double-written inside one run.
+	ownedPairs := make(map[string]struct{}, len(matched.pairs))
 	for _, pair := range matched.pairs {
 		clientEntity, clientOK := allFacts[pair.ClientFactKey]
 		apiEntity, apiOK := allFacts[pair.APIFactKey]
 		if !clientOK || !apiOK {
 			continue
 		}
-		ownerKey := ""
-		if _, ok := factEntities[pair.ClientFactKey]; ok {
-			ownerKey = pair.ClientFactKey
-		} else if _, ok := factEntities[pair.APIFactKey]; ok {
-			ownerKey = pair.APIFactKey
-		}
-		if ownerKey == "" {
-			// Neither side was materialised by this run: the contract edge belongs
-			// to an earlier analysis and must not be rewritten from here.
+		ownerKey, owner, ok := contractPairOwner(pair, factEntities)
+		if !ok {
 			continue
 		}
-		owner := factEntities[ownerKey]
+		edgeIdentity := pair.ClientFactKey + "\x00" + pair.APIFactKey
+		if _, duplicate := ownedPairs[edgeIdentity]; duplicate {
+			continue
+		}
+		ownedPairs[edgeIdentity] = struct{}{}
 		meta := contractEdgeMeta(pair.Method, pair.NormalizedPath)
 		ownerEdges[ownerKey] = append(ownerEdges[ownerKey], s.codeEdge(analysis, clientEntity, apiEntity,
 			domain.RelRouteToAPI, pair.Confidence, pair.Evidence, ownerKey, owner, meta))
@@ -1272,12 +1383,25 @@ func (s *AnalysisService) materializeEdges(ctx context.Context, state *analysisR
 		version := factVersionOf(entity)
 		owns := ownerEdges[key]
 		if err := s.deps.Edges.ReplaceFactEdges(ctx, analysis.RepoID, analysis.HeadCommit, key, version, owns); err != nil {
-			return err
+			return nil, err
 		}
 		edgeCount += len(owns)
 	}
 	state.stats.Edges = edgeCount
-	return nil
+	return allFacts, nil
+}
+
+// contractPairOwner applies the deterministic R31 owner preference: a client
+// fact materialised by this run wins, otherwise the materialised api fact. A
+// pair with no materialised side is left untouched.
+func contractPairOwner(pair ContractPair, materialized map[string]domain.CodeEntity) (string, domain.CodeEntity, bool) {
+	if entity, ok := materialized[pair.ClientFactKey]; ok {
+		return pair.ClientFactKey, entity, true
+	}
+	if entity, ok := materialized[pair.APIFactKey]; ok {
+		return pair.APIFactKey, entity, true
+	}
+	return "", domain.CodeEntity{}, false
 }
 
 // codeEdge builds one materialised AI edge owned by factKey.
@@ -1345,20 +1469,25 @@ func (s *AnalysisService) loadContractFacts(ctx context.Context, repoID int64, c
 
 // factsAtHead loads the current fact entities for the planner handoff (本次分析
 // 产出 + 既有缓存/实体, design spec §6.6 input 3). The changed files supply the
-// existing facts (from earlier analyses or the file cache); the materialised
-// map supplies every fact produced by this run, including facts the model
+// existing facts (from earlier analyses or the file cache); materialized
+// supplies every fact produced by this run, including facts the model
 // attributed to a file outside the change set (for example a route declared in
-// a router file while another file was analysed).
-func (s *AnalysisService) factsAtHead(ctx context.Context, state *analysisRunState, changedPaths []string, materialized map[string]domain.CodeEntity) ([]domain.CodeEntity, error) {
+// a router file while another file was analysed); headFacts (the bounded
+// contract scan) supplies the unchanged counterpart of a contract pair so T13
+// can propagate api→client. Precedence: materialized > headFacts > path scan.
+func (s *AnalysisService) factsAtHead(ctx context.Context, state *analysisRunState, changedPaths []string, materialized, headFacts map[string]domain.CodeEntity) ([]domain.CodeEntity, error) {
 	entities, err := s.deps.Entities.ListByPaths(ctx, state.analysis.RepoID, state.analysis.HeadCommit, changedPaths)
 	if err != nil {
 		return nil, err
 	}
-	byKey := make(map[string]domain.CodeEntity, len(entities)+len(materialized))
+	byKey := make(map[string]domain.CodeEntity, len(entities)+len(headFacts)+len(materialized))
 	for _, entity := range entities {
 		if entity.FactKey != nil {
 			byKey[*entity.FactKey] = entity
 		}
+	}
+	for key, entity := range headFacts {
+		byKey[key] = entity
 	}
 	for key, entity := range materialized {
 		byKey[key] = entity
@@ -1621,7 +1750,7 @@ func mergeMaterializedFacts(results []analysisFileResult) ([]*materializedFact, 
 			}
 			existing.LinesValid = existing.LinesValid || fact.LinesValid
 			existing.InvalidEvidence += fact.InvalidEvidence
-			existing.Clue = !existing.LinesValid || len(existing.Evidence) == 0
+			existing.Clue = !existing.LinesValid || len(existing.Evidence) == 0 || existing.InvalidEvidence > 0
 			if existing.Clue {
 				existing.Confidence = domain.ConfidenceLow
 			}
@@ -1903,7 +2032,7 @@ func materializeCachedFileAnalysis(analysedPath string, document cachedFileAnaly
 			continue
 		}
 		evidence := mergeContractEvidence(fact.Evidence)
-		clue := fact.Clue || len(evidence) == 0
+		clue := fact.Clue || len(evidence) == 0 || fact.InvalidEvidence > 0
 		confidence := fact.Confidence
 		if clue {
 			confidence = domain.ConfidenceLow
