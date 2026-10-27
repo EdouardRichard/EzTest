@@ -4663,6 +4663,7 @@ paths:
                     duplicateFacts: 0
                     unmatchedContracts: 0
                     truncated: false
+                    unmappedTruncated: false
                     skipped: 0
                   factVersions:
                     - factKey: 'api:POST /api/example'
@@ -7952,6 +7953,7 @@ components:
         - duplicateFacts
         - unmatchedContracts
         - truncated
+        - unmappedTruncated
         - skipped
       properties:
         changedFiles:
@@ -7992,6 +7994,11 @@ components:
           minimum: 0
         truncated:
           type: boolean
+        unmappedTruncated:
+          type: boolean
+          description: >-
+            True when the server truncated the unmapped list at 200 entries.
+            Always emitted.
         skipped:
           type: integer
           minimum: 0

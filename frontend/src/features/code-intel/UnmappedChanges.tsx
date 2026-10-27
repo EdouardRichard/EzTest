@@ -22,8 +22,9 @@ const reasonBadgeClass =
 export type UnmappedChangesProps = {
   entries: UnmappedChange[]
   /**
-   * Set when the backend truncated the unmapped list. Defaults to the known
-   * maximum-entry cap so a capped list still warns without extra DTO fields.
+   * True when the backend truncated the unmapped list (stats.unmappedTruncated).
+   * The flag is authoritative because a truncated list is still capped at
+   * `MAX_UNMAPPED_ENTRIES`; a longer list also warns defensively.
    */
   truncated?: boolean
 }
@@ -34,9 +35,10 @@ export type UnmappedChangesProps = {
  * when the list was truncated.
  */
 export function UnmappedChanges({ entries, truncated }: UnmappedChangesProps) {
-  // Exactly `MAX_UNMAPPED_ENTRIES` is a complete list; only a longer one (or an
-  // explicit backend flag) means the response was truncated.
-  const capped = truncated ?? entries.length > MAX_UNMAPPED_ENTRIES
+  // Exactly `MAX_UNMAPPED_ENTRIES` is a complete list unless the backend says it
+  // truncated; only a longer list (or the explicit backend flag) means the
+  // response was truncated.
+  const capped = truncated || entries.length > MAX_UNMAPPED_ENTRIES
 
   return (
     <section

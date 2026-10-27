@@ -459,7 +459,10 @@ export function CodeChangesTab({ versionId, repoId }: CodeChangesTabProps) {
                   hint="尚未开始分析，分析完成后展示未映射变更。"
                 />
               ) : (
-                <UnmappedChanges entries={analysis.unmapped} />
+                <UnmappedChanges
+                  entries={analysis.unmapped}
+                  truncated={analysis.stats?.unmappedTruncated === true}
+                />
               )}
             </div>
           </div>

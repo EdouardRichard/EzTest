@@ -38,6 +38,15 @@ const ENTRIES: UnmappedChange[] = [
   },
 ]
 
+function capEntries(count: number): UnmappedChange[] {
+  return Array.from({ length: count }, (_value, index) => ({
+    path: `src/generated/file-${index}.ts`,
+    status: "M",
+    reason: "no_fact_or_anchor",
+    suggestion: "",
+  }))
+}
+
 describe("UnmappedChanges", () => {
   afterEach(() => {
     cleanup()
@@ -69,18 +78,24 @@ describe("UnmappedChanges", () => {
     expect(screen.getByText("没有未映射变更")).toBeTruthy()
   })
 
-  it("does not claim truncation when the list is exactly at the cap", () => {
-    const entries: UnmappedChange[] = Array.from(
-      { length: MAX_UNMAPPED_ENTRIES },
-      (_value, index) => ({
-        path: `src/generated/file-${index}.ts`,
-        status: "M",
-        reason: "no_fact_or_anchor",
-        suggestion: "",
-      }),
-    )
+  it("warns when the backend marks the exact-cap list truncated", () => {
+    render(<UnmappedChanges entries={capEntries(MAX_UNMAPPED_ENTRIES)} truncated />)
 
-    render(<UnmappedChanges entries={entries} />)
+    expect(
+      screen.getByText(`未映射变更超过上限，仅展示前 ${MAX_UNMAPPED_ENTRIES} 条。`),
+    ).toBeTruthy()
+  })
+
+  it("warns for a list longer than the cap even when the flag is false", () => {
+    render(<UnmappedChanges entries={capEntries(MAX_UNMAPPED_ENTRIES + 1)} truncated={false} />)
+
+    expect(
+      screen.getByText(`未映射变更超过上限，仅展示前 ${MAX_UNMAPPED_ENTRIES + 1} 条。`),
+    ).toBeTruthy()
+  })
+
+  it("does not claim truncation when the list is exactly at the cap", () => {
+    render(<UnmappedChanges entries={capEntries(MAX_UNMAPPED_ENTRIES)} />)
 
     expect(screen.getByText(`共 ${MAX_UNMAPPED_ENTRIES} 个文件`)).toBeTruthy()
     expect(screen.queryByText(/超过上限/)).toBeNull()

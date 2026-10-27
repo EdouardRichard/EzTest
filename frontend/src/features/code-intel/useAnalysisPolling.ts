@@ -83,10 +83,13 @@ export function useAnalysisPolling(
       return latest ?? null
     } catch (caught) {
       if (requestRef.current !== requestId) return null
-      // A version without any analysis is a normal state, not an error.
+      // A version without any analysis is a normal state, not an error. It also
+      // means the cap hint is stale, so a missing analysis clears it too.
       if (caught instanceof ApiError && caught.status === 404) {
         setAnalysis(null)
         setError(null)
+        exhaustedRef.current = false
+        setExhausted(false)
         return null
       }
       setError(caught)
