@@ -217,22 +217,21 @@ async function performRequest(path: string, init: ApiFetchOptions): Promise<Resp
 }
 
 /**
- * The single HTTP entry point for the web app. It prefixes the configured API
- * origin, attaches the bearer token, unwraps `{"data": ...}`, turns error
- * envelopes into ApiError, and clears the local session on an authenticated 401.
+ * Sends one request and returns the parsed JSON payload without applying the
+ * `{"data": ...}` unwrap. Shared by apiFetch (which unwraps) and apiGetPage
+ * (which needs the sibling pagination fields the unwrap would drop).
  */
-export async function apiFetch<T>(path: string, init: ApiFetchOptions = {}): Promise<T> {
+async function requestPayload(path: string, init: ApiFetchOptions): Promise<unknown> {
   const response = await performRequest(path, init)
 
   if (!response.ok) throw await toApiError(response)
-  if (response.status === 204) return undefined as T
+  if (response.status === 204) return undefined
 
   const text = await response.text()
-  if (text.length === 0) return undefined as T
+  if (text.length === 0) return undefined
 
-  let payload: unknown
   try {
-    payload = JSON.parse(text)
+    return JSON.parse(text)
   } catch {
     throw new ApiError({
       status: response.status,
@@ -242,8 +241,15 @@ export async function apiFetch<T>(path: string, init: ApiFetchOptions = {}): Pro
       retryable: false,
     })
   }
+}
 
-  return unwrapData<T>(payload)
+/**
+ * The single HTTP entry point for the web app. It prefixes the configured API
+ * origin, attaches the bearer token, unwraps `{"data": ...}`, turns error
+ * envelopes into ApiError, and clears the local session on an authenticated 401.
+ */
+export async function apiFetch<T>(path: string, init: ApiFetchOptions = {}): Promise<T> {
+  return unwrapData<T>(await requestPayload(path, init))
 }
 
 /**
@@ -262,6 +268,39 @@ type RequestOptions = Omit<ApiFetchOptions, "method" | "body">
 
 export function apiGet<T>(path: string, init: RequestOptions = {}): Promise<T> {
   return apiFetch<T>(path, { ...init, method: "GET" })
+}
+
+/** One cursor page from a list endpoint (spec §7.1: `{data, next_cursor, has_more}`). */
+export type ApiPage<T> = {
+  items: T[]
+  nextCursor: string
+  hasMore: boolean
+}
+
+/**
+ * Reads a page envelope's opaque cursor. List endpoints name it `next_cursor`;
+ * the events snapshot names the same concept `snapshot_cursor`.
+ */
+function readPageCursor(payload: Record<string, unknown>): string {
+  const raw = payload.next_cursor ?? payload.snapshot_cursor
+  if (typeof raw === "string") return raw
+  if (typeof raw === "number" && Number.isFinite(raw)) return String(raw)
+  return ""
+}
+
+/**
+ * Fetches one page of a list endpoint while preserving the pagination envelope
+ * that apiFetch deliberately unwraps. `nextCursor` is "" when the response has
+ * no cursor, so callers can keep paging until `hasMore` is false.
+ */
+export async function apiGetPage<T>(path: string, init: ApiFetchOptions = {}): Promise<ApiPage<T>> {
+  const payload = await requestPayload(path, { ...init, method: "GET" })
+  if (!isRecord(payload)) return { items: [], nextCursor: "", hasMore: false }
+  return {
+    items: Array.isArray(payload.data) ? (payload.data as T[]) : [],
+    nextCursor: readPageCursor(payload),
+    hasMore: payload.has_more === true,
+  }
 }
 
 export function apiPost<T>(path: string, body?: unknown, init: RequestOptions = {}): Promise<T> {

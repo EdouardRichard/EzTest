@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
-import { ApiError, apiFetch, apiStreamFetch } from "./api-client"
+import { ApiError, apiFetch, apiGet, apiGetPage, apiStreamFetch } from "./api-client"
 import { getToken, setToken } from "./auth-storage"
 
 function jsonResponse(body: unknown, init: ResponseInit = {}) {
@@ -143,6 +143,68 @@ describe("apiFetch", () => {
       apiFetch("/api/auth/login", { method: "POST", token: null, body: "{}" }),
     ).rejects.toMatchObject({ status: 401 })
     expect(getToken()).toBe("ezt_current")
+  })
+})
+
+describe("apiGetPage", () => {
+  beforeEach(() => {
+    sessionStorage.clear()
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it("preserves the list envelope cursor and has_more fields", async () => {
+    const fetchMock = stubFetch(
+      jsonResponse({ data: [{ id: "1844674407370955161" }], next_cursor: "c2", has_more: true }),
+    )
+
+    await expect(apiGetPage("/api/versions?limit=20")).resolves.toEqual({
+      items: [{ id: "1844674407370955161" }],
+      nextCursor: "c2",
+      hasMore: true,
+    })
+    expect(fetchMock.mock.calls[0][1].method).toBe("GET")
+  })
+
+  it("reads the numeric snapshot_cursor used by the events snapshot", async () => {
+    stubFetch(jsonResponse({ data: [{ seq: 7 }], snapshot_cursor: 7, has_more: false }))
+
+    await expect(apiGetPage("/api/versions/1/events?limit=50")).resolves.toEqual({
+      items: [{ seq: 7 }],
+      nextCursor: "7",
+      hasMore: false,
+    })
+  })
+
+  it("keeps apiGet unwrapping only data for the same envelope", async () => {
+    stubFetch(
+      jsonResponse({ data: [{ id: "1844674407370955161" }], next_cursor: "c2", has_more: true }),
+    )
+
+    await expect(apiGet("/api/versions")).resolves.toEqual([{ id: "1844674407370955161" }])
+  })
+
+  it("surfaces list error envelopes as ApiError", async () => {
+    stubFetch(
+      jsonResponse(
+        {
+          error: {
+            code: "invalid_argument",
+            message: "invalid cursor",
+            request_id: "req_page",
+            retryable: false,
+          },
+        },
+        { status: 400 },
+      ),
+    )
+
+    await expect(apiGetPage("/api/versions?cursor=bad")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_argument",
+    })
   })
 })
 
