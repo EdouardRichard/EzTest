@@ -143,6 +143,7 @@ P0–P7 ────────────────────────
 **范围**
 - 领域：`version` 上下文 7 表——Version、Requirement（多需求）、RequirementRelation（依赖/冲突/重叠/共享范围）、RequirementAttachment、ClarificationSession、ClarificationQuestion、Decision；主键雪花 ID（D29），附件文件系统存储（D30）。
 - 状态语义（D31）：Version 为**粗粒度容器**，需求流水线独立；P3 只实现 `draft→clarifying→designing` 与 `Requirement draft→clarified`；新增/确认/重开需求永不改变或回退 Version.status；`designing` 下仍可独立澄清/确认；新增需求不中断执行（P7）。
+- 进入设计软门禁：允许带未澄清需求进入 `designing`，但需 `acknowledgeUnclarified=true`；未确认时 409 `unclarified_requirements`（details 含未澄清需求 id 与 open 问题数），确认后返回 `warnings` 并进入 `designing`。
 - 资源绑定：创建版本时可选绑定 P2 系统/环境/代码仓（branch→commit 快照）；`draft|clarifying` 允许整体替换，`designing` 只读。
 - Agent：澄清对话 Agent + 需求分析 Agent + 上下文侦察 Agent 最小版（读文档/截图/本地代码只读）；3 个 profile seed；11 个澄清/需求工具；附件截图以 `image_ref` 注入（data URL 仅 LLM 调用瞬态生成，不落库）。
 - 前端：版本列表/创建版本（含可选资源绑定）；版本详情容器（VersionHeader + 状态徽章 + 9 Tab）与总览 Tab 骨架；版本工作台（需求列表 + 需求编辑器/附件 + 关系图 + 澄清对话 + 问题清单 + 决策 + 确认/重开 + 新增需求）；其余 8 个 Tab 以骨架/占位入口存在并标注归属阶段；脑图/资源为独立入口（P5/P2）。
