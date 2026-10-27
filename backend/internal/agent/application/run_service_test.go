@@ -31,9 +31,18 @@ type runTestState struct {
 
 	createTurnErr error
 
+	// listMessagesHook, when set, replaces the default history read. Tests use
+	// it to hold the initial history load until the run context is cancelled.
+	listMessagesHook func(ctx context.Context, sessionID int64) ([]domain.Message, error)
+	// finishHook, when set, runs after a terminal result is recorded and the
+	// session's active flag cleared, before Finish returns. Tests use it to
+	// start a successor run while a predecessor's runner is still cleaning up.
+	finishHook func(ctx context.Context, runID int64) error
+
 	finished       []runTestFinishedRun
 	progress       []runTestProgress
 	created        []runTestCreatedTurn
+	completed      []int64
 	interrupted    int64
 	interruptedErr error
 }
@@ -114,6 +123,27 @@ func (s *runTestState) progressUpdates() []runTestProgress {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]runTestProgress(nil), s.progress...)
+}
+
+// setListMessagesHook installs the history-read hook.
+func (s *runTestState) setListMessagesHook(hook func(ctx context.Context, sessionID int64) ([]domain.Message, error)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.listMessagesHook = hook
+}
+
+// setFinishHook installs the terminal-write hook.
+func (s *runTestState) setFinishHook(hook func(ctx context.Context, runID int64) error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.finishHook = hook
+}
+
+// completedMessages returns the message ids CompleteAssistant was called with.
+func (s *runTestState) completedMessages() []int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]int64(nil), s.completed...)
 }
 
 // runFakeProfiles implements domain.ProfileRepository.
@@ -229,13 +259,17 @@ func (f *runFakeRuns) UpdateProgress(_ context.Context, runID int64, turns int, 
 	return nil
 }
 
-func (f *runFakeRuns) Finish(_ context.Context, runID int64, result domain.RunResult) error {
+func (f *runFakeRuns) Finish(ctx context.Context, runID int64, result domain.RunResult) error {
 	state := f.state
 	state.mu.Lock()
-	defer state.mu.Unlock()
 	state.finished = append(state.finished, runTestFinishedRun{runID: runID, result: result})
 	if sessionID, ok := state.runSession[runID]; ok {
 		delete(state.active, sessionID)
+	}
+	hook := state.finishHook
+	state.mu.Unlock()
+	if hook != nil {
+		return hook(ctx, runID)
 	}
 	return nil
 }
@@ -252,8 +286,15 @@ type runFakeMessages struct {
 	state *runTestState
 }
 
-func (f *runFakeMessages) ListBySession(_ context.Context, sessionID int64) ([]domain.Message, error) {
-	return f.state.messagesFor(sessionID), nil
+func (f *runFakeMessages) ListBySession(ctx context.Context, sessionID int64) ([]domain.Message, error) {
+	state := f.state
+	state.mu.Lock()
+	hook := state.listMessagesHook
+	state.mu.Unlock()
+	if hook != nil {
+		return hook(ctx, sessionID)
+	}
+	return state.messagesFor(sessionID), nil
 }
 
 func (f *runFakeMessages) Get(_ context.Context, _ int64) (domain.Message, error) {
@@ -301,6 +342,7 @@ func (f *runFakeMessages) CompleteAssistant(_ context.Context, messageID int64, 
 		state.messages[i].Reasoning = reasoning
 		state.messages[i].ToolCalls = calls
 		state.messages[i].Usage = usage
+		state.completed = append(state.completed, messageID)
 		return nil
 	}
 	return domain.ErrNotFound
@@ -332,6 +374,10 @@ type runFakeScript struct {
 	err     error
 	hold    bool
 	started chan struct{}
+	// wait, when set, runs inside ChatStream after the call is recorded and
+	// before it returns; tests use it to hold the synchronous handshake until
+	// the run context is cancelled.
+	wait func(ctx context.Context) error
 }
 
 // runFakeCaller implements LLMCaller with a per-call script.
@@ -361,6 +407,11 @@ func (c *runFakeCaller) ChatStream(ctx context.Context, req application.LLMReque
 	}
 	c.mu.Unlock()
 
+	if script.wait != nil {
+		if err := script.wait(ctx); err != nil {
+			return nil, err
+		}
+	}
 	if script.err != nil {
 		return nil, script.err
 	}
@@ -1013,6 +1064,248 @@ func TestAbortDuringToolUsesAbortedTools(t *testing.T) {
 	toolResults := runTestEventsOfKind(sink.snapshot(), domain.KindToolResult)
 	if len(toolResults) != 1 || toolResults[0].Detail["status"] != "cancelled" {
 		t.Fatalf("tool_result events=%+v want one cancelled result", toolResults)
+	}
+}
+
+func TestAbortDuringInitialHistoryLoadFinishesAborted(t *testing.T) {
+	profile := runTestProfile(t)
+	state := runTestNewState(t, profile, 7)
+
+	historyStarted := make(chan struct{})
+	var startedOnce sync.Once
+	state.setListMessagesHook(func(ctx context.Context, _ int64) ([]domain.Message, error) {
+		startedOnce.Do(func() { close(historyStarted) })
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+
+	caller := &runFakeCaller{model: "deepseek-flash", contextWindow: 100000}
+	service, sink, audit := runTestNewService(t, state, caller)
+	if _, err := service.Start(context.Background(), 7, "历史读取期间中止", nil); err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+	runTestAwaitSignal(t, historyStarted, "the initial history load")
+
+	abort, err := service.Abort(context.Background(), 7, nil)
+	if err != nil {
+		t.Fatalf("Abort returned error: %v", err)
+	}
+	if abort.Status != "stopping" {
+		t.Fatalf("Abort status=%q want stopping", abort.Status)
+	}
+	runTestWaitIdle(t, service, 7)
+
+	// A stop that lands while the runner is loading the history must terminate
+	// the run as aborted, never as a model/internal failure.
+	finished := runTestFinished(t, state)
+	if finished.Status != domain.RunAborted || finished.TerminalReason != domain.ReasonAborted {
+		t.Fatalf("run finished %s/%s want aborted/aborted", finished.Status, finished.TerminalReason)
+	}
+	if finished.AbortCode != "user_abort" {
+		t.Fatalf("abort_code=%q want user_abort", finished.AbortCode)
+	}
+	if finished.ErrorCode != "" || finished.ErrorMessage != "" {
+		t.Fatalf("aborted run error_code=%q error_message=%q want empty", finished.ErrorCode, finished.ErrorMessage)
+	}
+	if finished.Turns != 0 {
+		t.Fatalf("run turns=%d want 0 (the abort landed before the first model turn)", finished.Turns)
+	}
+	if calls := caller.callCount(); calls != 0 {
+		t.Fatalf("LLM calls=%d want 0 (the abort landed before the model call)", calls)
+	}
+
+	messages := state.messagesFor(7)
+	if len(messages) != 1 || messages[0].Role != "user" {
+		t.Fatalf("messages=%+v want only the user message", messages)
+	}
+	if ids := state.completedMessages(); len(ids) != 0 {
+		t.Fatalf("CompleteAssistant calls=%v want none before streaming started", ids)
+	}
+
+	runFinished := runTestEventsOfKind(sink.snapshot(), domain.KindRunFinished)
+	if len(runFinished) != 1 {
+		t.Fatalf("run_finished events=%d want 1", len(runFinished))
+	}
+	if runFinished[0].Detail["status"] != "aborted" || runFinished[0].Detail["abort_code"] != "user_abort" {
+		t.Fatalf("run_finished detail=%+v", runFinished[0].Detail)
+	}
+	if audits := audit.snapshot(); len(audits) != 1 || audits[0].Action != "agent.run.aborted" {
+		t.Fatalf("audit entries=%+v want one agent.run.aborted", audits)
+	}
+}
+
+func TestAbortDuringStreamSetupCompletesAssistantMessage(t *testing.T) {
+	profile := runTestProfile(t)
+	state := runTestNewState(t, profile, 7)
+
+	setupStarted := make(chan struct{})
+	var startedOnce sync.Once
+	caller := &runFakeCaller{
+		model:         "deepseek-flash",
+		contextWindow: 100000,
+		scripts: []runFakeScript{{
+			wait: func(ctx context.Context) error {
+				startedOnce.Do(func() { close(setupStarted) })
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		}},
+	}
+	service, sink, _ := runTestNewService(t, state, caller)
+	if _, err := service.Start(context.Background(), 7, "流建立期间中止", nil); err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+	runTestAwaitSignal(t, setupStarted, "the model stream setup")
+
+	abort, err := service.Abort(context.Background(), 7, nil)
+	if err != nil || abort.Status != "stopping" {
+		t.Fatalf("Abort=(%+v,%v) want stopping", abort, err)
+	}
+	runTestWaitIdle(t, service, 7)
+
+	finished := runTestFinished(t, state)
+	if finished.Status != domain.RunAborted || finished.TerminalReason != domain.ReasonAbortedStreaming {
+		t.Fatalf("run finished %s/%s want aborted/aborted_streaming", finished.Status, finished.TerminalReason)
+	}
+	if finished.AbortCode != "user_abort" {
+		t.Fatalf("abort_code=%q want user_abort", finished.AbortCode)
+	}
+
+	// The placeholder created before ChatStream must be completed (with empty
+	// content) so the aborted run does not leave a dangling row behind.
+	messages := state.messagesFor(7)
+	if len(messages) != 2 || messages[1].Role != "assistant" {
+		t.Fatalf("messages=%+v want user + assistant placeholder", messages)
+	}
+	completed := state.completedMessages()
+	if len(completed) != 1 || completed[0] != messages[1].ID {
+		t.Fatalf("CompleteAssistant calls=%v want the placeholder %d completed", completed, messages[1].ID)
+	}
+	if len(messages[1].Parts) != 0 || messages[1].Reasoning != "" {
+		t.Fatalf("aborted assistant message=%+v want empty content", messages[1])
+	}
+	if events := runTestEventsOfKind(sink.snapshot(), domain.KindRunFinished); len(events) != 1 {
+		t.Fatalf("run_finished events=%d want 1", len(events))
+	}
+}
+
+func TestAbortMissingSessionReturnsNotFound(t *testing.T) {
+	profile := runTestProfile(t)
+	state := runTestNewState(t, profile, 7)
+	service, _, audit := runTestNewService(t, state, &runFakeCaller{})
+
+	_, err := service.Abort(context.Background(), 99, nil)
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("Abort(missing session) error=%v want domain.ErrNotFound", err)
+	}
+	if audits := audit.snapshot(); len(audits) != 0 {
+		t.Fatalf("Abort(missing session) wrote audit entries=%+v want none", audits)
+	}
+}
+
+func TestStartSuccessorRegistrationSurvivesPredecessorCleanup(t *testing.T) {
+	profile := runTestProfile(t)
+	state := runTestNewState(t, profile, 7, 8)
+
+	firstFinishEntered := make(chan struct{})
+	releaseFirstFinish := make(chan struct{})
+	var finishOnce sync.Once
+	state.setFinishHook(func(ctx context.Context, runID int64) error {
+		if runID != 1 {
+			return nil
+		}
+		finishOnce.Do(func() { close(firstFinishEntered) })
+		select {
+		case <-releaseFirstFinish:
+		case <-ctx.Done():
+		}
+		return nil
+	})
+
+	successorStreamStarted := make(chan struct{})
+	caller := &runFakeCaller{
+		model:         "deepseek-flash",
+		contextWindow: 100000,
+		scripts: []runFakeScript{
+			{events: []application.LLMStreamEvent{{Done: true, FinishReason: "stop"}}},
+			{hold: true, started: successorStreamStarted},
+			{hold: true},
+		},
+	}
+	service, _, _ := runTestNewService(t, state, caller, runTestMaxConcurrentRuns(2))
+
+	first, err := service.Start(context.Background(), 7, "第一轮", nil)
+	if err != nil {
+		t.Fatalf("first Start returned error: %v", err)
+	}
+	runTestAwaitSignal(t, firstFinishEntered, "the first run's terminal write")
+
+	// The first run's terminal row is already written, so the session's
+	// single-flight slot is free while its runner goroutine still holds its
+	// in-process registry entry.
+	successor, err := service.Start(context.Background(), 7, "第二轮", nil)
+	if err != nil {
+		t.Fatalf("successor Start returned error: %v", err)
+	}
+	if successor.RunID == first.RunID {
+		t.Fatalf("successor run id=%d collides with the predecessor", successor.RunID)
+	}
+	runTestAwaitSignal(t, successorStreamStarted, "the successor run's stream")
+
+	// Let the first runner finish. Its deferred cleanup now runs while the
+	// successor is registered.
+	close(releaseFirstFinish)
+
+	// A third run is only admitted once the first runner released its
+	// semaphore slot, which happens after its registry cleanup. Capacity is
+	// therefore a deterministic signal that the cleanup already ran.
+	deadline := time.Now().Add(5 * time.Second)
+	var probe domain.StartResult
+	for {
+		probe, err = service.Start(context.Background(), 8, "探针", nil)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, domain.ErrCapacity) {
+			t.Fatalf("capacity probe Start error=%v want ErrCapacity or success", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the predecessor to release its capacity slot")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// The predecessor's cleanup must not have removed the successor's entry.
+	abort, err := service.Abort(context.Background(), 7, nil)
+	if err != nil {
+		t.Fatalf("successor Abort returned error: %v", err)
+	}
+	if abort.Status != "stopping" {
+		t.Fatalf("successor Abort status=%q want stopping (its registry entry was deleted by the predecessor)", abort.Status)
+	}
+	if _, err := service.Abort(context.Background(), 8, nil); err != nil {
+		t.Fatalf("probe Abort returned error: %v", err)
+	}
+	runTestWaitIdle(t, service, 7)
+	runTestWaitIdle(t, service, 8)
+
+	finished := make(map[int64]domain.RunResult)
+	for _, entry := range state.finishedResults() {
+		finished[entry.runID] = entry.result
+	}
+	firstResult, ok := finished[first.RunID]
+	if !ok || firstResult.Status != domain.RunDone || firstResult.TerminalReason != domain.ReasonCompleted {
+		t.Fatalf("predecessor result=%+v ok=%v want done/completed", firstResult, ok)
+	}
+	successorResult, ok := finished[successor.RunID]
+	if !ok || successorResult.Status != domain.RunAborted || successorResult.TerminalReason != domain.ReasonAbortedStreaming {
+		t.Fatalf("successor result=%+v ok=%v want aborted/aborted_streaming", successorResult, ok)
+	}
+	if successorResult.AbortCode != "user_abort" {
+		t.Fatalf("successor abort_code=%q want user_abort", successorResult.AbortCode)
+	}
+	if _, ok := finished[probe.RunID]; !ok {
+		t.Fatalf("probe run %d has no terminal result", probe.RunID)
 	}
 }
 
