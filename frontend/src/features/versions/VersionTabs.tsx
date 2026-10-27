@@ -35,7 +35,7 @@ export function isVersionTab(value: string | null): value is VersionTabValue {
   return value !== null && VERSION_TAB_VALUES.has(value)
 }
 
-/** Tabs not delivered by T8; the owning phase comes from implementation-phases.md. */
+/** Tabs delivered by later phases; the owning phase comes from implementation-phases.md. */
 const PLACEHOLDER_TABS: readonly {
   value: VersionTabValue
   label: string
@@ -78,12 +78,6 @@ const PLACEHOLDER_TABS: readonly {
     phase: "P6",
     description: "版本报告在 P6 Batch 1、P7 完整版接入，将展示批次报告与差异。",
   },
-  {
-    value: "code",
-    label: "代码与变更",
-    phase: "P4",
-    description: "代码与变更在 P4 阶段接入，将展示 diff、影响用例与未映射变更。",
-  },
 ]
 
 const tabTriggerClass =
@@ -94,15 +88,23 @@ export type VersionTabsProps = {
   onTabChange: (value: VersionTabValue) => void
   requirements: ReactNode
   overview: ReactNode
+  /** Real 「代码与变更」 container (P4); required once the tab is opened. */
+  code?: ReactNode
 }
 
 /**
  * The nine-tab version detail shell (spec §9.1): the functional requirements
- * slot, the overview skeleton, and seven clearly-labelled placeholders. Radix
- * Tabs provides keyboard navigation; the active tab itself is owned by the
- * container so it can stay in sync with `?tab=`.
+ * slot, the overview skeleton, the P4 code-changes slot and six clearly-labelled
+ * placeholders. Radix Tabs provides keyboard navigation; the active tab itself
+ * is owned by the container so it can stay in sync with `?tab=`.
  */
-export function VersionTabs({ active, onTabChange, requirements, overview }: VersionTabsProps) {
+export function VersionTabs({
+  active,
+  onTabChange,
+  requirements,
+  overview,
+  code,
+}: VersionTabsProps) {
   return (
     <Tabs.Root
       value={active}
@@ -124,6 +126,10 @@ export function VersionTabs({ active, onTabChange, requirements, overview }: Ver
 
       <Tabs.Content value="overview" className="pt-4">
         {overview}
+      </Tabs.Content>
+
+      <Tabs.Content value="code" className="pt-4">
+        {code}
       </Tabs.Content>
 
       {PLACEHOLDER_TABS.map((tab) => (
