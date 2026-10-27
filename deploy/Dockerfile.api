@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 #
 # Multi-stage build for the EzTest Go API. The runtime image is Alpine, runs as
-# a non-root user and ships docs/openapi/p0.yaml at the working-directory path
+# a non-root user and ships docs/openapi/api.yaml at the working-directory path
 # the default EZTEST_OPENAPI_PATH expects. Docker is not available on the
 # development host; this file is delivered but not built there.
 
@@ -33,7 +33,7 @@ RUN apk add --no-cache ca-certificates tzdata wget \
 WORKDIR /app
 
 COPY --from=build --chown=eztest:eztest /out/eztest ./eztest
-COPY --chown=eztest:eztest docs/openapi/p0.yaml ./docs/openapi/p0.yaml
+COPY --chown=eztest:eztest docs/openapi/api.yaml ./docs/openapi/api.yaml
 
 # Content-addressed objects live on the `objects` volume in docker-compose.
 RUN mkdir -p /data/objects \
@@ -43,7 +43,7 @@ USER eztest
 
 ENV EZTEST_HTTP_ADDR=:13333 \
     EZTEST_STORAGE_DIR=/data/objects \
-    EZTEST_OPENAPI_PATH=docs/openapi/p0.yaml
+    EZTEST_OPENAPI_PATH=docs/openapi/api.yaml
 
 EXPOSE 13333
 

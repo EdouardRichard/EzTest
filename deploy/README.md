@@ -1,8 +1,8 @@
 # EzTest deployment
 
-This directory contains the P0 container deployment: a multi-stage Go API image,
-a Next.js standalone web image and a single-instance Docker Compose file with
-PostgreSQL 17.
+This directory contains the container deployment for the P0 foundation and the
+P1 Agent runtime: a multi-stage Go API image, a Next.js standalone web image and
+a single-instance Docker Compose file with PostgreSQL 17.
 
 > **Validation status:** Docker is not installed on the development host, so the
 > images have never been built and the Compose stack has never been started
@@ -14,10 +14,10 @@ PostgreSQL 17.
 
 | File | Purpose |
 |---|---|
-| `Dockerfile.api` | Multi-stage Go build; Alpine runtime; non-root `eztest` user; ships `docs/openapi/p0.yaml` at `./docs/openapi/p0.yaml` in the working directory. |
+| `Dockerfile.api` | Multi-stage Go build; Alpine runtime; non-root `eztest` user; ships `docs/openapi/api.yaml` at `./docs/openapi/api.yaml` in the working directory. |
 | `Dockerfile.web` | Multi-stage Next.js `standalone` build; non-root `nextjs` user; listens on 6868. |
 | `docker-compose.yml` | `api`, `web`, `postgres:17`; health checks; named volumes; startup ordering. |
-| `../docs/openapi/p0.yaml` | Hand-maintained OpenAPI document served at `GET /api/openapi.yaml`. |
+| `../docs/openapi/api.yaml` | Hand-maintained OpenAPI document served at `GET /api/openapi.yaml`. |
 
 ## Prerequisites
 
@@ -43,6 +43,8 @@ passes the repository `.env` to the API container with `env_file`.
 | `EZTEST_ADMIN_USERNAME` / `EZTEST_ADMIN_PASSWORD` | api | Seeds the single P0 administrator on first boot. |
 | `EZTEST_WEB_ORIGIN` | api | Browser origin for CORS, default `http://localhost:6868`. |
 | `EZTEST_ENABLE_TEST_ENDPOINTS` | api | Default `false` in Compose. Set `true` only for the SSE test endpoint. |
+| `EZTEST_AGENT_FILE_ROOT` | api | Optional read-only root for `file.list`/`file.read`. Empty (the default) disables the file tools. Mount the tree read-only and point this at the mount when they are needed. |
+| `EZTEST_AGENT_HTTP_ALLOWLIST` / `EZTEST_AGENT_TOOL_TIMEOUT_MS` / `EZTEST_AGENT_MAX_CONCURRENT_RUNS` | api | Optional Agent limits; defaults `127.0.0.1,localhost`, `10000` and `4`. |
 | `llm_base_url` / `llm_key` / `llm_model_name` | api | Optional first-boot LLM seed; lowercase names are intentional. Leave the key empty to disable real calls. |
 | `NEXT_PUBLIC_API_BASE_URL` | web build | Build-time browser API origin, default `http://localhost:13333`. |
 
@@ -103,10 +105,14 @@ are idempotent.
   UID 1001).
 - The API stores LLM credentials encrypted with `EZTEST_SECRET_KEYS`. Losing
   that keyring makes stored credentials unrecoverable; back it up.
-- P0 is a single-instance, intranet-oriented deployment. It does not provide
+- P0/P1 is a single-instance, intranet-oriented deployment. It does not provide
   TLS, multi-tenant isolation, a reverse proxy or public object URLs. Put a
   TLS-terminating proxy in front of ports 13333/6868 if exposed beyond
   localhost, and restrict the PostgreSQL port.
+- P1 Agent endpoints are administrator-only. The Agent file tools are disabled
+  unless `EZTEST_AGENT_FILE_ROOT` is set; keep that root read-only and
+  minimal. `http.get` only reaches `EZTEST_AGENT_HTTP_ALLOWLIST` hosts
+  (localhost by default).
 - The administrator password lives only in `.env` and, for the local
   development host, in the gitignored `docs/dev-setup.local.md`.
 
