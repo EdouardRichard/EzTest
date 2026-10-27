@@ -17,6 +17,17 @@ const KIND_OPTIONS = [
 
 type ImportKind = (typeof KIND_OPTIONS)[number]["value"]
 
+/** Takeover reasons accepted by the backend's manual_takeovers.reason CHECK. */
+const REASON_OPTIONS = [
+  { value: "mfa", label: "mfa（多因素认证）" },
+  { value: "captcha", label: "captcha（验证码）" },
+  { value: "approval", label: "approval（人工审批）" },
+  { value: "login_unknown", label: "login_unknown（未知登录问题）" },
+  { value: "other", label: "other（其他）" },
+] as const
+
+type TakeoverReason = (typeof REASON_OPTIONS)[number]["value"]
+
 /** Payload accepted by both `importSession` and `completeTakeover`. */
 type SessionStatePayload =
   | { kind: "storage_state"; storageState: { cookies: unknown[]; origins: unknown[] } }
@@ -119,7 +130,7 @@ export type TakeoverDialogProps =
  */
 export function TakeoverDialog(props: TakeoverDialogProps) {
   const { mode, onClose, onDone } = props
-  const [reason, setReason] = useState("")
+  const [reason, setReason] = useState<TakeoverReason>("other")
   const [instructions, setInstructions] = useState("")
   const [expiresSeconds, setExpiresSeconds] = useState(String(DEFAULT_EXPIRES_SECONDS))
   const [kind, setKind] = useState<ImportKind>(
@@ -128,7 +139,7 @@ export function TakeoverDialog(props: TakeoverDialogProps) {
   const [json, setJson] = useState("")
   const [error, setError] = useState("")
   const [saving, setSaving] = useState(false)
-  const reasonRef = useRef<HTMLTextAreaElement>(null)
+  const reasonRef = useRef<HTMLSelectElement>(null)
   const jsonRef = useRef<HTMLTextAreaElement>(null)
 
   useEffect(() => {
@@ -152,11 +163,6 @@ export function TakeoverDialog(props: TakeoverDialogProps) {
   }
 
   async function submitRequest(sessionId: number) {
-    const trimmedReason = reason.trim()
-    if (trimmedReason === "") {
-      setError("请输入接管原因。")
-      return
-    }
     let expiresInSeconds: number | undefined
     const rawExpires = expiresSeconds.trim()
     if (rawExpires !== "") {
@@ -168,11 +174,13 @@ export function TakeoverDialog(props: TakeoverDialogProps) {
       expiresInSeconds = parsed
     }
 
+    // `reason` is one of the enum values by construction (the select has no
+    // free-text option); free text belongs to `instructions.text`.
     const payload: {
-      reason: string
+      reason: TakeoverReason
       instructions?: { text: string }
       expiresInSeconds?: number
-    } = { reason: trimmedReason }
+    } = { reason }
     const trimmedInstructions = instructions.trim()
     if (trimmedInstructions !== "") payload.instructions = { text: trimmedInstructions }
     if (expiresInSeconds !== undefined) payload.expiresInSeconds = expiresInSeconds
@@ -266,15 +274,19 @@ export function TakeoverDialog(props: TakeoverDialogProps) {
                 <label htmlFor="takeover-reason" className={labelClass}>
                   接管原因
                 </label>
-                <textarea
+                <select
                   id="takeover-reason"
                   ref={reasonRef}
                   value={reason}
-                  onChange={(event) => setReason(event.target.value)}
-                  rows={2}
-                  placeholder="例如 需要完成短信验证码"
+                  onChange={(event) => setReason(event.target.value as TakeoverReason)}
                   className={inputClass}
-                />
+                >
+                  {REASON_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
               </div>
               <div>
                 <label htmlFor="takeover-instructions" className={labelClass}>

@@ -109,6 +109,8 @@ type FixtureResources = {
   environmentId: number
 }
 
+type LoginCheckConfig = { url: string; expectStatus: number[]; bodyContains: string }
+
 /**
  * Creates the account/access/system/environment chain for one test through the
  * real admin API, so each scenario owns fresh resources. Only the session flows
@@ -116,7 +118,15 @@ type FixtureResources = {
  */
 async function createResources(
   request: APIRequestContext,
-  options: { tag: string; withLoginCheck: boolean },
+  options: {
+    tag: string
+    withLoginCheck: boolean
+    /** Defaults to a web system; the token scenario uses an API system (spec §9.2 item 6). */
+    systemKind?: "web" | "api"
+    /** Overrides the login_check; `undefined` derives it from `withLoginCheck`. */
+    loginCheck?: LoginCheckConfig | null
+    authType?: "manual" | "token"
+  },
 ): Promise<FixtureResources> {
   const token = await adminApiToken(request)
   const headers = { Authorization: `Bearer ${token}` }
@@ -124,13 +134,23 @@ async function createResources(
   const systemName = `P2 ${options.tag} ${suffix}`
   const environmentName = options.withLoginCheck ? `检查环境 ${suffix}` : `无检查环境 ${suffix}`
   const accountLabel = `Fixture 账号 ${suffix}`
+  const loginCheck: LoginCheckConfig | null =
+    options.loginCheck !== undefined
+      ? options.loginCheck
+      : options.withLoginCheck
+        ? {
+            url: `${FIXTURE_URL}/account`,
+            expectStatus: [200],
+            bodyContains: "Fixture Account",
+          }
+        : null
 
   const systemResponse = await request.post(`${API_URL}/api/resources/systems`, {
     headers,
     data: {
       key: `pw-${options.tag}-${suffix}`,
       name: systemName,
-      kind: "web",
+      kind: options.systemKind ?? "web",
       baseUrl: FIXTURE_URL,
       defaultSessionTtlSeconds: 3600,
       notes: "E2E session actions",
@@ -151,13 +171,7 @@ async function createResources(
         baseUrl: FIXTURE_URL,
         isProd: false,
         allowedHosts: [],
-        loginCheck: options.withLoginCheck
-          ? {
-              url: `${FIXTURE_URL}/account`,
-              expectStatus: [200],
-              bodyContains: "Fixture Account",
-            }
-          : null,
+        loginCheck,
         allowAutoLogin: false,
         requireApproval: false,
       },
@@ -185,7 +199,7 @@ async function createResources(
       headers,
       data: {
         systemId,
-        authType: "manual",
+        authType: options.authType ?? "manual",
         usernameOverride: "",
         loginUrl: "",
         enabled: true,
@@ -210,12 +224,15 @@ async function createResources(
 
 type ImportedSession = { sessionId: number; resultText: string }
 
-/** Imports the exported storageState for resources and returns the new session. */
+/** Imports one session document for resources and returns the new session. */
 async function importSession(
   page: Page,
   resources: FixtureResources,
-  storageState: unknown,
+  document: unknown,
+  options: { kind?: "storage_state" | "token"; accessAuthType?: string } = {},
 ): Promise<ImportedSession> {
+  const kind = options.kind ?? "storage_state"
+  const accessAuthType = options.accessAuthType ?? "manual"
   await page.getByRole("button", { name: "导入会话" }).click()
   const dialog = page.getByRole("dialog", { name: "导入会话" })
   await expect(dialog).toBeVisible()
@@ -226,7 +243,7 @@ async function importSession(
   await dialog.locator("#session-import-account").selectOption(String(resources.accountId))
 
   await expect(
-    dialog.locator("#session-import-access option").filter({ hasText: "manual" }),
+    dialog.locator("#session-import-access option").filter({ hasText: accessAuthType }),
   ).toHaveCount(1)
   await dialog.locator("#session-import-access").selectOption(String(resources.accessId))
 
@@ -237,12 +254,18 @@ async function importSession(
   ).toHaveCount(1)
   await dialog.locator("#session-import-environment").selectOption(String(resources.environmentId))
 
-  await dialog.locator("#session-import-file").setInputFiles({
-    name: "fixture-storage-state.json",
-    mimeType: "application/json",
-    buffer: Buffer.from(JSON.stringify(storageState)),
-  })
-  await expect(dialog.locator("#session-import-json")).not.toHaveValue("")
+  if (kind === "token") {
+    // Token JSON mode: select the kind and paste the document (spec §6.2).
+    await dialog.locator("#session-import-kind").selectOption("token")
+    await dialog.locator("#session-import-json").fill(JSON.stringify(document))
+  } else {
+    await dialog.locator("#session-import-file").setInputFiles({
+      name: "fixture-storage-state.json",
+      mimeType: "application/json",
+      buffer: Buffer.from(JSON.stringify(document)),
+    })
+    await expect(dialog.locator("#session-import-json")).not.toHaveValue("")
+  }
   await dialog.getByRole("button", { name: "导入", exact: true }).click()
 
   const result = dialog.getByRole("status")
@@ -381,7 +404,7 @@ test.describe("session actions", () => {
     await detail.getByRole("button", { name: "发起接管" }).click()
     const requestDialog = page.getByRole("dialog", { name: "发起人工接管" })
     await expect(requestDialog).toBeVisible()
-    await requestDialog.getByLabel("接管原因").fill("other")
+    await requestDialog.getByLabel("接管原因").selectOption("other")
     await requestDialog.getByLabel("操作指引").fill("E2E 人工接管：上传新的 fixture 状态")
     await requestDialog.getByRole("button", { name: "确认发起" }).click()
     await expect(detail.getByRole("status")).toContainText("已发起接管，等待人工完成。")
@@ -412,6 +435,45 @@ test.describe("session actions", () => {
     await expect(detail.getByRole("button", { name: "发起接管" })).toBeEnabled()
     await page.screenshot({
       path: screenshotPath("session-actions-takeover.png"),
+      fullPage: true,
+    })
+  })
+
+  test("imports a token session against an API system login check", async ({ page, request }) => {
+    // Spec §9.2 item 6: a token session on an API system is validated by the
+    // fixture target's bearer-protected /api/profile login_check.
+    const resources = await createResources(request, {
+      tag: "token",
+      withLoginCheck: true,
+      systemKind: "api",
+      authType: "token",
+      loginCheck: { url: "/api/profile", expectStatus: [200], bodyContains: "fixture" },
+    })
+
+    await login(page, ADMIN_USERNAME, requireAdminPassword())
+    await page.goto("/resources?tab=sessions")
+    await expect(page.getByRole("heading", { name: "会话", exact: true })).toBeVisible()
+
+    const imported = await importSession(
+      page,
+      resources,
+      { kind: "token", headers: { Authorization: "Bearer fixture-token" } },
+      { kind: "token", accessAuthType: "token" },
+    )
+    expect(imported.resultText).toContain("状态 valid。")
+    expect(imported.resultText).toContain("能力校验通过。")
+    expect(imported.resultText).toContain("快照：允许 1 / 拒绝 0 / 错误 0。")
+
+    const detail = page.getByRole("region", { name: "会话详情" })
+    await expect(detail.getByRole("heading", { name: `会话 #${imported.sessionId}` })).toBeVisible()
+    await expect(detail.getByText("valid", { exact: true })).toBeVisible()
+    await expect(detail.getByText("token", { exact: true })).toBeVisible()
+    await expect(detail.getByText("允许 1 / 拒绝 0 / 错误 0", { exact: true })).toBeVisible()
+    await expect(detail.getByText("allowed", { exact: true })).toBeVisible()
+    await expect(detail.getByText("200", { exact: true })).toBeVisible()
+    await expect(detail.getByText("能力未验证", { exact: true })).toHaveCount(0)
+    await page.screenshot({
+      path: screenshotPath("session-actions-token-import.png"),
       fullPage: true,
     })
   })
