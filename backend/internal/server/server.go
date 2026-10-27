@@ -24,6 +24,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/idempotency"
 	resourcehttp "github.com/EdouardRichard/EzTest/backend/internal/resource/interfaces/httpapi"
 	storagehttp "github.com/EdouardRichard/EzTest/backend/internal/storage/interfaces/httpapi"
+	versionhttp "github.com/EdouardRichard/EzTest/backend/internal/version/interfaces/httpapi"
 )
 
 // Pinger reports whether a backing dependency (for example the database) is
@@ -95,6 +96,11 @@ type Dependencies struct {
 	// /api/resources routes are mounted; reads require only the global bearer
 	// auth, while writes and actions apply the per-route admin guard.
 	Resources *resourcehttp.Handlers
+	// Version holds the version context's HTTP handlers (P3). When set, the
+	// /api/versions routes are mounted. They rely on the global bearer
+	// middleware and add no per-route guard: the P3 contract makes every route
+	// available to any authenticated user.
+	Version *versionhttp.Handlers
 }
 
 // New assembles the HTTP handler. Middleware runs in the order
@@ -161,6 +167,12 @@ func New(cfg config.Config, logger *slog.Logger, deps Dependencies) http.Handler
 		// the audit actor from the identity context, so no extra metadata
 		// middleware is needed here.
 		resourcehttp.RegisterRoutes(mux, *deps.Resources, identityhttp.RequireAdmin)
+	}
+	if deps.Version != nil {
+		// The version routes (P3) rely on the global bearer auth and add no
+		// per-route guard. RegisterRoutes skips a nil handler group, so a
+		// partially wired process mounts only the groups it has.
+		versionhttp.RegisterRoutes(mux, *deps.Version)
 	}
 	if deps.Events != nil && cfg.EnableTestEndpoints {
 		auditor := deps.Audit
