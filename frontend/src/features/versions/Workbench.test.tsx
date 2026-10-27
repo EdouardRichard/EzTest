@@ -673,6 +673,29 @@ describe("Workbench", () => {
     expect(mocks.getClarification).toHaveBeenCalledTimes(2)
   })
 
+  it("reloads requirements and relations when requirement or attachment events arrive", async () => {
+    let streamEvents: VersionEvent[] = []
+    mocks.useVersionStream.mockImplementation(() => ({
+      events: streamEvents,
+      status: "live",
+      reconnect: vi.fn(),
+    }))
+    const view = renderWorkbench()
+
+    await waitFor(() => expect(mocks.listRequirements).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(mocks.listRelations).toHaveBeenCalledTimes(1))
+
+    streamEvents = [versionEvent(1, "requirement.updated")]
+    view.rerender(<Workbench version={VERSION} onChanged={vi.fn()} />)
+    await waitFor(() => expect(mocks.listRequirements).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(mocks.listRelations).toHaveBeenCalledTimes(2))
+
+    streamEvents = [...streamEvents, versionEvent(2, "attachment.added")]
+    view.rerender(<Workbench version={VERSION} onChanged={vi.fn()} />)
+    await waitFor(() => expect(mocks.listRequirements).toHaveBeenCalledTimes(3))
+    await waitFor(() => expect(mocks.listRelations).toHaveBeenCalledTimes(3))
+  })
+
   it("does not offer to start a session when the clarification overview fails to load", async () => {
     mocks.getClarification.mockRejectedValue(
       new ApiError({ status: 500, code: "internal", message: "boom" }),
