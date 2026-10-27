@@ -495,7 +495,7 @@ func NewSessionRepository(pool *pgxpool.Pool) *SessionRepository
 
 - [ ] **Step 1: 写失败的集成测试**
 
-覆盖：session 创建/读取；`UpdateSession` 正确 CAS、旧 state 失败返回 `KindStateConflict`；snapshot 追加与 `GetLatestSnapshot`；lease 唯一冲突与释放；takeover 状态 CAS；`ListSessions` 过滤与分页。
+覆盖：session 创建/读取；`UpdateSession` 正确 CAS、旧 state 失败返回 `KindStateConflict`；snapshot 追加与 `GetLatestSnapshot`；lease 唯一冲突与释放；takeover 状态 CAS；`ListSessions` 过滤与分页。测试用**原生 SQL** seed account/system/env/access，避免依赖 T3/T4 的并行实现。
 
 ```go
 //go:build integration
@@ -668,6 +668,12 @@ git commit -m "feat: add read-only login check client"
 **Interfaces:**
 - Consumes: `apiGet/apiPost/apiPatch/apiDelete`（`@/lib/api-client`）、`useAuth`、`StatusBadge`、`EmptyState`。
 - Produces（T14/T16 使用）:
+```ts
+// 组件 props
+SystemsPanel({ canWrite, selectedId, onSelect }: { canWrite:boolean; selectedId:number|null; onSelect:(id:number)=>void })
+EnvironmentsPanel({ systemId, canWrite }: { systemId:number; canWrite:boolean })
+ResourcesPage(): JSX.Element // 读取 useAuth().user.role
+```
 
 ```ts
 // types.ts
@@ -1177,7 +1183,12 @@ git commit -m "feat: add code repository service and handlers"
 
 **Interfaces:**
 - Consumes: T8 的 `types.ts/api.ts` 中 app model/account/access 函数。
-- Produces: 两个面板组件 `AppModelsPanel({systemId,canWrite})`、`AccountsPanel({canWrite})`，供 `ResourcesPage` 使用。
+- Produces:
+```ts
+AppModelsPanel({ systemId, canWrite }: { systemId:number; canWrite:boolean })
+AccountsPanel({ canWrite }: { canWrite:boolean })
+AccessForm({ accountId, systems, access, canWrite, onSubmit }: { accountId:number; systems:SystemDTO[]; access?:AccessDTO; canWrite:boolean; onSubmit:(input:unknown)=>Promise<void> })
+```
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -1238,7 +1249,10 @@ git commit -m "feat: add app model import and account access panels"
 
 **Interfaces:**
 - Consumes: T8 的 `SessionDTO/SnapshotDTO` 与 `listSessions/getSession/importSession/validateSession/confirmSession/invalidateSession/revokeSession/listSnapshots/requestTakeover/completeTakeover/cancelTakeover/listAccounts/listAccesses/listEnvironments`。
-- Produces: `SessionsPanel({canWrite, initialSessionId?})`，`ResourcesPage` 深链 `?tab=sessions&session=` 使用。
+- Produces:
+```ts
+SessionsPanel({ canWrite, initialSessionId }: { canWrite:boolean; initialSessionId?:number })
+```
 
 - [ ] **Step 1: 写失败的测试**
 
