@@ -52,12 +52,22 @@ describe("Transcript", () => {
       if (messageId === 42) {
         return makeDetail({ id: 42, reasoning: "完整推理内容" })
       }
+      if (messageId === 43) {
+        // The real DTO shape: the assistant message owns `tool_calls`; the tool
+        // message only carries its result content.
+        return makeDetail({
+          id: 43,
+          role: "assistant",
+          content: [{ type: "text", text: "正在调用工具。" }],
+          tool_calls: [{ id: "call_1", name: "test.echo", arguments: '{"text":"完整参数"}' }],
+        })
+      }
       if (messageId === 77) {
         return makeDetail({
           id: 77,
           role: "tool",
           content: [{ type: "text", text: "完整工具结果" }],
-          tool_calls: [{ id: "call_1", name: "test.echo", arguments: '{"text":"完整参数"}' }],
+          tool_calls: null,
           tool_call_id: "call_1",
           tool_name: "test.echo",
         })
@@ -82,6 +92,7 @@ describe("Transcript", () => {
         tool: "test.echo",
         args: '{"text":"ping"}',
         args_truncated: false,
+        message_id: 43,
       }),
       makeActivity(4, {
         kind: "tool_result",
@@ -105,6 +116,8 @@ describe("Transcript", () => {
 
     const toolButton = screen.getByRole("button", { name: "工具 test.echo" })
     expect(toolButton.getAttribute("aria-expanded")).toBe("false")
+    // Collapsed row summarises the streamed args preview next to the tool name.
+    expect(toolButton.textContent).toContain('· {"text":"ping"}')
     expect(screen.queryByText("pong")).toBeNull()
     expect(screen.getByText("成功")).toBeTruthy()
     expect(screen.getByText("12ms")).toBeTruthy()
@@ -115,9 +128,86 @@ describe("Transcript", () => {
     expect(await screen.findByText("完整推理内容")).toBeTruthy()
 
     fireEvent.click(toolButton)
+    // Full arguments come from the assistant message, not the tool message.
+    await waitFor(() => expect(getDetail).toHaveBeenCalledWith(43))
     await waitFor(() => expect(getDetail).toHaveBeenCalledWith(77))
+    expect(await screen.findByText(/"text": "完整参数"/)).toBeTruthy()
+    expect(await screen.findByText("test.echo")).toBeTruthy()
     expect(await screen.findByText("完整工具结果")).toBeTruthy()
-    expect(screen.getByText('{"text":"完整参数"}')).toBeTruthy()
+  })
+
+  it("falls back to the streamed args preview when tool_use has no message_id", async () => {
+    const getDetail = vi.fn(async (messageId: number) => {
+      if (messageId === 77) {
+        return makeDetail({
+          id: 77,
+          role: "tool",
+          content: [{ type: "text", text: "完整工具结果" }],
+          tool_calls: null,
+          tool_call_id: "call_1",
+          tool_name: "test.echo",
+        })
+      }
+      throw new Error(`unexpected message id ${messageId}`)
+    })
+
+    const activities = [
+      RUN_STARTED,
+      makeActivity(2, {
+        kind: "tool_use",
+        run_id: 9,
+        call_id: "call_1",
+        tool: "test.echo",
+        args: '{"text":"ping"}',
+        args_truncated: false,
+      }),
+      makeActivity(3, {
+        kind: "tool_result",
+        run_id: 9,
+        call_id: "call_1",
+        tool: "test.echo",
+        status: "ok",
+        duration_ms: 5,
+        result: "pong",
+        result_truncated: false,
+        message_id: 77,
+      }),
+    ]
+
+    render(<Transcript activities={activities} status="live" getDetail={getDetail} />)
+
+    fireEvent.click(screen.getByRole("button", { name: "工具 test.echo" }))
+    await waitFor(() => expect(getDetail).toHaveBeenCalledWith(77))
+    expect(getDetail).toHaveBeenCalledTimes(1)
+    expect(await screen.findByText(/"text": "ping"/)).toBeTruthy()
+    expect(await screen.findByText("完整工具结果")).toBeTruthy()
+  })
+
+  it("falls back to the streamed args preview when the assistant detail has no tool_calls", async () => {
+    const getDetail = vi.fn(async (messageId: number) => {
+      if (messageId === 50) return makeDetail({ id: 50, role: "assistant", tool_calls: null })
+      throw new Error(`unexpected message id ${messageId}`)
+    })
+
+    const activities = [
+      RUN_STARTED,
+      makeActivity(2, {
+        kind: "tool_use",
+        run_id: 9,
+        call_id: "call_1",
+        tool: "test.echo",
+        args: '{"text":"ping"}',
+        args_truncated: false,
+        message_id: 50,
+      }),
+    ]
+
+    render(<Transcript activities={activities} status="live" getDetail={getDetail} />)
+
+    fireEvent.click(screen.getByRole("button", { name: "工具 test.echo" }))
+    await waitFor(() => expect(getDetail).toHaveBeenCalledWith(50))
+    expect(await screen.findByText(/"text": "ping"/)).toBeTruthy()
+    expect(screen.getByText("执行中")).toBeTruthy()
   })
 
   it("concatenates text chunks by message_id and part", () => {
