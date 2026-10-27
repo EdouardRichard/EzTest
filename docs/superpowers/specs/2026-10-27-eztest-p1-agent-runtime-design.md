@@ -126,7 +126,8 @@ POST /api/agents/sessions/{id}/messages
   -> 注册 cancel func，后台 goroutine：
        for 回合:
          预算检查 -> 构建上下文（截断）-> LLMPort.ChatStream
-         -> 落库 assistant message -> 发 thinking/text/usage 活动
+         -> 插入 assistant 占位消息（取得 message_id）-> 流式发 thinking/text 分片
+         -> Done/中止时 UPDATE 完整内容/reasoning/tool_calls/usage
          -> 有 tool_calls: 逐个执行（白名单/超时/panic/取消）-> 落库 tool message -> 发活动
          无 tool_calls -> 终态
   -> 终态：更新 run 行 -> 发 run_finished 活动 -> 释放额度/注销
@@ -554,6 +555,7 @@ type ToolError struct {
 
 - thinking/text 按连续片段合并；片段结束时 flush。
 - 长片段增量 flush：**每 1500ms 或累计 1024 字符**先发一条，`final=false`；片段结束时补 `final=true`。
+- 每个 LLM 回合在流开始前插入 assistant **占位消息**（空内容）取得 `message_id`；分片引用它；Done/中止时 UPDATE 完整内容与 usage。中止保留已生成的部分输出。
 - 前端按 `(message_id, part)` 拼接；完整文本仍以 `agent_messages` 为准。
 - 不逐 token 落事件。
 
