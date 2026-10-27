@@ -229,6 +229,7 @@ func (s *IndexService) Run(ctx context.Context, runID int64) (err error) {
 		s.forgetRun(runID)
 		return nil
 	case domain.RunRunning:
+		s.forgetRun(runID)
 		return domain.NewConflict("index_in_progress",
 			fmt.Sprintf("codeintel: index run %d is already running", runID))
 	}
@@ -245,6 +246,7 @@ func (s *IndexService) Run(ctx context.Context, runID int64) (err error) {
 	run.Status = domain.RunRunning
 	run.StartedAt = &startedAt
 	if err := s.deps.IndexRuns.Update(ctx, run); err != nil {
+		s.forgetRun(runID)
 		return err
 	}
 

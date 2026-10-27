@@ -138,13 +138,14 @@ type impactPlanState struct {
 	changed      map[string]domain.ChangedFile
 	changedPaths []string
 
-	anchors      []domain.CodeAnchor
-	appModels    []AppModelNode
-	edges        []domain.CodeEdge
-	facts        []domain.CodeEntity
-	changedFacts []domain.CodeEntity
-	requirements []RequirementInfo
-	relations    []RelationInfo
+	anchors       []domain.CodeAnchor
+	appModels     []AppModelNode
+	edges         []domain.CodeEdge
+	facts         []domain.CodeEntity
+	coverageFacts []domain.CodeEntity
+	changedFacts  []domain.CodeEntity
+	requirements  []RequirementInfo
+	relations     []RelationInfo
 
 	stats impactStats
 
@@ -195,16 +196,22 @@ func (s *ImpactService) Plan(ctx context.Context, in ImpactInput) (ImpactResult,
 
 	candidates := make([]domain.ImpactCandidate, 0)
 	directRequirements := make(map[int64]string)
+	directEvidence := make(map[int64][]domain.Evidence)
 	for _, candidate := range s.anchorCandidates(state) {
 		candidates = append(candidates, candidate)
 		if candidate.SubjectKind == domain.CandidateRequirement {
 			directRequirements[candidate.SubjectID] = strongerImpactConfidence(
 				directRequirements[candidate.SubjectID], candidate.Confidence)
+			// A relation candidate inherits the triggering direct requirement's
+			// changed-file evidence so every automatic candidate stays traceable
+			// to a changed file (INV-2).
+			directEvidence[candidate.SubjectID] = mergeImpactEvidence(
+				directEvidence[candidate.SubjectID], candidate.Evidence)
 		}
 	}
 	candidates = append(candidates, s.appModelCandidates(state)...)
 	candidates = append(candidates, s.contractCandidates(state)...)
-	candidates = append(candidates, s.relationCandidates(state, directRequirements)...)
+	candidates = append(candidates, s.relationCandidates(state, directRequirements, directEvidence)...)
 
 	aiCandidates, err := s.aiCandidates(ctx, state)
 	if err != nil {
@@ -302,6 +309,7 @@ func (s *ImpactService) prepare(ctx context.Context, in ImpactInput) (*impactPla
 	sort.SliceStable(state.edges, func(i, j int) bool { return state.edges[i].ID < state.edges[j].ID })
 
 	state.facts = highMediumImpactFacts(in.FactsAtHead)
+	state.coverageFacts = impactCoverageFacts(in.FactsAtHead)
 	for _, fact := range state.facts {
 		if impactFactTouchesPaths(fact, state.changed) {
 			state.changedFacts = append(state.changedFacts, fact)
@@ -349,6 +357,38 @@ func isImpactFactKind(kind string) bool {
 	default:
 		return false
 	}
+}
+
+// impactCoverageFacts keeps the facts that can cover a changed file in the
+// unmapped_changes view (design spec §6.6 step 7 / INV-8): AI fact kinds with
+// verified evidence regardless of confidence, never the T0 file entities. A low
+// clue still proves the file was analysed; only automatic candidate generation
+// is restricted to high/medium facts (INV-1).
+func impactCoverageFacts(facts []domain.CodeEntity) []domain.CodeEntity {
+	kept := make([]domain.CodeEntity, 0, len(facts))
+	for _, fact := range facts {
+		if !isImpactFactKind(fact.Kind) {
+			continue
+		}
+		if !impactFactHasVerifiedEvidence(fact) {
+			continue
+		}
+		kept = append(kept, fact)
+	}
+	return kept
+}
+
+// impactFactHasVerifiedEvidence reports whether the fact carries at least one
+// verified evidence location. Analysis drops invalid evidence before
+// materialisation, so a non-empty file entry is the persistence marker of a
+// verified excerpt.
+func impactFactHasVerifiedEvidence(fact domain.CodeEntity) bool {
+	for _, evidence := range fact.Evidence {
+		if evidence.File != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // impactFactKey returns the fact identity or "" when the entity has none.
@@ -673,8 +713,10 @@ func impactEdgeConfidence(confidence string) string {
 
 // relationCandidates expands the directly hit requirements one hop through the
 // requirement relations in any direction (design spec §6.6 step 3). It never
-// recurses and never adds an already directly hit requirement.
-func (s *ImpactService) relationCandidates(state *impactPlanState, direct map[int64]string) []domain.ImpactCandidate {
+// recurses and never adds an already directly hit requirement. The relation
+// candidate carries the triggering direct candidate's evidence so it stays
+// traceable to the changed file (INV-2).
+func (s *ImpactService) relationCandidates(state *impactPlanState, direct map[int64]string, directEvidence map[int64][]domain.Evidence) []domain.ImpactCandidate {
 	type relationHit struct {
 		relatedID int64
 		triggerID int64
@@ -717,6 +759,7 @@ func (s *ImpactService) relationCandidates(state *impactPlanState, direct map[in
 			Reason:      hit.relation,
 			Confidence:  weakerConfidence(domain.ConfidenceMedium, direct[hit.triggerID]),
 			Source:      domain.CandidateRelation,
+			Evidence:    mergeImpactEvidence(directEvidence[hit.triggerID]),
 		})
 	}
 	return candidates
@@ -1240,8 +1283,10 @@ func (s *ImpactService) unmappedChanges(state *impactPlanState) ([]domain.Unmapp
 	for _, anchor := range state.anchors {
 		covered[anchor.FilePath] = struct{}{}
 	}
-	for _, fact := range state.facts {
-		covered[fact.Path] = struct{}{}
+	for _, fact := range state.coverageFacts {
+		if fact.Path != "" {
+			covered[fact.Path] = struct{}{}
+		}
 		for _, evidence := range fact.Evidence {
 			if evidence.File != "" {
 				covered[evidence.File] = struct{}{}
