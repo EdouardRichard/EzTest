@@ -4,17 +4,21 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/version/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/filestore"
 )
 
-// toolGit is a GitReader double that records the code-tool calls.
+// toolGit is a GitReader double that records the code-tool calls and mimics the
+// gitread adapter's bounds: the include/exclude globs are applied and the max cap
+// is enforced after filtering.
 type toolGit struct {
 	commit  string
 	entries []application.CodeEntry
@@ -25,6 +29,7 @@ type toolGit struct {
 
 	treeMax    int
 	treeCalled int
+	treePrefix string
 	readOffset int
 	readMax    int
 	readPath   string
@@ -39,14 +44,73 @@ func (g *toolGit) ResolveCommit(context.Context, string, string) (string, error)
 	return g.commit, nil
 }
 
-// Tree returns the configured entries.
-func (g *toolGit) Tree(_ context.Context, _, _ string, _, _ []string, max int) ([]application.CodeEntry, error) {
+// Tree returns the glob-filtered entries up to max.
+func (g *toolGit) Tree(_ context.Context, _, _ string, include, exclude []string, max int) ([]application.CodeEntry, error) {
 	g.treeCalled++
 	g.treeMax = max
 	if g.treeErr != nil {
 		return nil, g.treeErr
 	}
-	return g.entries, nil
+	return g.treeWindow("", include, exclude, max), nil
+}
+
+// TreePrefix filters by prefix and globs before max, like the real adapter.
+func (g *toolGit) TreePrefix(_ context.Context, _, _, prefix string, include, exclude []string, max int) ([]application.CodeEntry, error) {
+	g.treeCalled++
+	g.treeMax = max
+	g.treePrefix = prefix
+	if g.treeErr != nil {
+		return nil, g.treeErr
+	}
+	return g.treeWindow(prefix, include, exclude, max), nil
+}
+
+// treeWindow applies the prefix and globs first, then the max cap.
+func (g *toolGit) treeWindow(prefix string, include, exclude []string, max int) []application.CodeEntry {
+	entries := make([]application.CodeEntry, 0, len(g.entries))
+	for _, entry := range g.entries {
+		if prefix != "" && !strings.HasPrefix(entry.Path, prefix+"/") {
+			continue
+		}
+		if !fakePathIncluded(entry.Path, include, exclude) {
+			continue
+		}
+		entries = append(entries, entry)
+		if max > 0 && len(entries) >= max {
+			break
+		}
+	}
+	return entries
+}
+
+// fakePathIncluded applies the test glob subset the same way the real reader
+// does: an exact name matches the entry or a descendant and prefix/** matches
+// descendants.
+func fakePathIncluded(entryPath string, include, exclude []string) bool {
+	if len(include) > 0 && !fakeMatchesAny(entryPath, include) {
+		return false
+	}
+	return !fakeMatchesAny(entryPath, exclude)
+}
+
+// fakeMatchesAny reports whether p matches at least one test glob.
+func fakeMatchesAny(p string, globs []string) bool {
+	for _, glob := range globs {
+		glob = strings.TrimSpace(glob)
+		if glob == "" {
+			continue
+		}
+		if strings.HasSuffix(glob, "/**") {
+			if strings.HasPrefix(p, strings.TrimSuffix(glob, "/**")+"/") {
+				return true
+			}
+			continue
+		}
+		if p == glob || strings.HasPrefix(p, glob+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // Read returns the configured content.
@@ -84,20 +148,34 @@ func (g *toolGit) window(offset, maxBytes int) string {
 	return g.content[offset:end]
 }
 
+// countingRequirementLister counts List calls so the context test can assert
+// version.context_get loads the requirement slice once.
+type countingRequirementLister struct {
+	*fakeRequirementRepo
+	listCalls int
+}
+
+// List counts the call and delegates to the in-memory repository.
+func (r *countingRequirementLister) List(ctx context.Context, versionID int64, status string, page domain.Page) ([]domain.Requirement, bool, error) {
+	r.listCalls++
+	return r.fakeRequirementRepo.List(ctx, versionID, status, page)
+}
+
 // toolFixture wires the real AgentToolService to the shared in-memory fakes and
 // a real filesystem attachment store.
 type toolFixture struct {
-	t              *testing.T
-	service        *application.AgentToolService
-	versions       *fakeVersionRepo
-	requirements   *fakeRequirementRepo
-	clarifications *fakeClarificationRepo
-	attachments    *application.AttachmentService
-	events         *fakeEvents
-	git            *toolGit
-	resources      *fakeCatalog
-	ids            *fixedIDs
-	root           string
+	t                 *testing.T
+	service           *application.AgentToolService
+	versions          *fakeVersionRepo
+	requirements      *fakeRequirementRepo
+	requirementLister *countingRequirementLister
+	clarifications    *fakeClarificationRepo
+	attachments       *application.AttachmentService
+	events            *fakeEvents
+	git               *toolGit
+	resources         *fakeCatalog
+	ids               *fixedIDs
+	root              string
 }
 
 // newToolFixture returns a fixture with the first generated id 5000.
@@ -114,6 +192,14 @@ func newToolFixture(t *testing.T) *toolFixture {
 		ids:            &fixedIDs{next: 5000},
 		root:           filepath.Join(t.TempDir(), "version-attachments"),
 	}
+	f.requirementLister = &countingRequirementLister{fakeRequirementRepo: f.requirements}
+	// The shared catalog's repository defaults to src/** include globs; the code
+	// tool fixtures below are explicit about their globs so every tree entry
+	// stays visible unless a test narrows it again.
+	repository := f.resources.repos[9]
+	repository.IncludeGlobs = nil
+	repository.ExcludeGlobs = nil
+	f.resources.repos[9] = repository
 	requirementService := application.NewRequirementService(
 		f.requirements, f.versions, f.events,
 		application.WithRequirementIDGenerator(f.ids),
@@ -133,7 +219,7 @@ func newToolFixture(t *testing.T) *toolFixture {
 	)
 	f.service = application.NewAgentToolService(application.AgentToolServiceDeps{
 		Versions:             f.versions,
-		Requirements:         f.requirements,
+		Requirements:         f.requirementLister,
 		Clarifications:       f.clarifications,
 		RequirementService:   requirementService,
 		RelationService:      relationService,
@@ -741,9 +827,10 @@ func TestToolServiceCodePrimitives(t *testing.T) {
 	content, business, err = f.service.CodeTree(ctx, unbound.ID, "", 0)
 	toolBusiness(t, content, business, err, "resource_unavailable")
 
-	// A deleted P2 repository is resource_unavailable.
-	deleted := application.CodeRepoRef{ID: 9, Name: "order-web", Available: false}
-	f.resources.repos[9] = deleted
+	// A hard-deleted P2 repository is resource_unavailable for the code tools.
+	// The real catalog hard-deletes rows and reports code_repository_not_found;
+	// that reason stays reserved for version binding validation.
+	delete(f.resources.repos, 9)
 	content, business, err = f.service.CodeRead(ctx, version.ID, "README.md", 0, 0)
 	toolBusiness(t, content, business, err, "resource_unavailable")
 }
@@ -774,4 +861,152 @@ func TestToolServiceInfrastructureErrorsStayErrors(t *testing.T) {
 	// Version lookups stay business errors.
 	content, isError, err = f.service.CodeTree(ctx, 999999, "", 0)
 	toolBusiness(t, content, isError, err, "not found")
+}
+
+// TestToolServiceCodeTreeFiltersPrefixBeforeCap pins the optional prefix-aware
+// reader contract: a subtree that sorts after more than 200 other entries must
+// still be listed for code.tree{path:"src"}.
+func TestToolServiceCodeTreeFiltersPrefixBeforeCap(t *testing.T) {
+	ctx := context.Background()
+	f := newToolFixture(t)
+	version := f.seedVersion(100, domain.VersionClarifying)
+	f.bindCode(version.ID)
+	repository := f.resources.repos[9]
+	repository.IncludeGlobs = []string{"aaa/**", "src/**"}
+	repository.ExcludeGlobs = []string{"src/skip.go"}
+	f.resources.repos[9] = repository
+	for i := 0; i < 250; i++ {
+		f.git.entries = append(f.git.entries, application.CodeEntry{
+			Path: fmt.Sprintf("aaa/file-%03d.txt", i), Type: "blob", Size: 1,
+		})
+	}
+	f.git.entries = append(f.git.entries,
+		application.CodeEntry{Path: "README.md", Type: "blob", Size: 5},
+		application.CodeEntry{Path: "src/main.go", Type: "blob", Size: 20},
+		application.CodeEntry{Path: "src/skip.go", Type: "blob", Size: 30},
+	)
+
+	content, isError, err := f.service.CodeTree(ctx, version.ID, "src", 200)
+	var tree struct {
+		Entries []struct {
+			Path string `json:"path"`
+			Type string `json:"type"`
+			Size int64  `json:"size"`
+		} `json:"entries"`
+		Truncated bool `json:"truncated"`
+	}
+	toolOutcome(t, content, isError, err, &tree)
+	if len(tree.Entries) != 1 || tree.Entries[0].Path != "src/main.go" ||
+		tree.Entries[0].Type != "blob" || tree.Entries[0].Size != 20 {
+		t.Fatalf("code tree under src entries=%+v want only src/main.go", tree.Entries)
+	}
+	if tree.Truncated {
+		t.Fatal("code tree under src reported truncation for one entry")
+	}
+	if f.git.treePrefix != "src" {
+		t.Fatalf("reader prefix=%q want the prefix-aware TreePrefix call", f.git.treePrefix)
+	}
+}
+
+// TestToolServiceCodeReadTrimsSplitRuneWindow pins the UTF-8 window fix: a
+// 64 KiB window at a non-zero offset can start and end inside a rune, and the
+// split edges must not turn valid CJK/emoji text into unsupported_content.
+func TestToolServiceCodeReadTrimsSplitRuneWindow(t *testing.T) {
+	ctx := context.Background()
+	f := newToolFixture(t)
+	version := f.seedVersion(100, domain.VersionClarifying)
+	f.bindCode(version.ID)
+	content := "a" + strings.Repeat("你", 22000) + strings.Repeat("🙂", 2000)
+	f.git.content = content
+	f.git.size = int64(len(content))
+
+	var read struct {
+		Content   string `json:"content"`
+		Truncated bool   `json:"truncated"`
+	}
+	// Offset 2 starts inside the first three-byte rune; the 64 KiB cap ends
+	// inside a later three-byte rune.
+	raw, isError, err := f.service.CodeRead(ctx, version.ID, "src/main.go", 2, 0)
+	toolOutcome(t, raw, isError, err, &read)
+	want := content[4:65536]
+	if read.Content != want {
+		t.Fatalf("split-rune read content=%d bytes, want %d bytes", len(read.Content), len(want))
+	}
+	if !utf8.ValidString(read.Content) {
+		t.Fatal("split-rune read content is not valid UTF-8")
+	}
+	if !read.Truncated {
+		t.Fatal("split-rune read did not report truncation")
+	}
+
+	// A small window inside the four-byte emoji run runs both trims at once.
+	raw, isError, err = f.service.CodeRead(ctx, version.ID, "src/main.go", 66002, 8)
+	toolOutcome(t, raw, isError, err, &read)
+	if read.Content != "🙂" || !read.Truncated {
+		t.Fatalf("emoji split read=%q truncated=%v want one emoji and truncation", read.Content, read.Truncated)
+	}
+}
+
+// TestToolServiceCodeReadRejectsOffsetPastEOF pins the offset bound: a window
+// that starts past the blob is a correctable invalid_offset, while an offset at
+// EOF is an ordinary empty read.
+func TestToolServiceCodeReadRejectsOffsetPastEOF(t *testing.T) {
+	ctx := context.Background()
+	f := newToolFixture(t)
+	version := f.seedVersion(100, domain.VersionClarifying)
+	f.bindCode(version.ID)
+	f.git.content = "hello"
+	f.git.size = int64(len(f.git.content))
+
+	content, business, err := f.service.CodeRead(ctx, version.ID, "src/main.go", 6, 0)
+	toolBusiness(t, content, business, err, "invalid_offset")
+
+	content, isError, err := f.service.CodeRead(ctx, version.ID, "src/main.go", 5, 0)
+	var read struct {
+		Content   string `json:"content"`
+		Truncated bool   `json:"truncated"`
+	}
+	toolOutcome(t, content, isError, err, &read)
+	if read.Content != "" || read.Truncated {
+		t.Fatalf("offset-at-EOF read=%+v want an empty non-truncated read", read)
+	}
+}
+
+// TestToolServiceContextGetLoadsRequirementsOnce pins that version.context_get
+// shares one requirement page load between its requirement and attachment
+// sections instead of querying twice.
+func TestToolServiceContextGetLoadsRequirementsOnce(t *testing.T) {
+	ctx := context.Background()
+	f := newToolFixture(t)
+	version := f.seedVersion(100, domain.VersionClarifying)
+	f.seedRequirement(version.ID, 501, "Checkout", domain.RequirementDraft)
+	f.seedAttachment(version.ID, 501, 901, "spec.txt", "text/plain", domain.AttachmentText, "spec body")
+
+	if _, isError, err := f.service.ContextGet(ctx, version.ID); err != nil || isError {
+		t.Fatalf("ContextGet=%v/%v want success", isError, err)
+	}
+	if f.requirementLister.listCalls != 1 {
+		t.Fatalf("requirement List calls=%d want 1 (context and attachments share one load)", f.requirementLister.listCalls)
+	}
+}
+
+// TestToolServiceWritePublishesVersionEvent pins that a successful tool write
+// still publishes the version event through the wrapped service.
+func TestToolServiceWritePublishesVersionEvent(t *testing.T) {
+	ctx := context.Background()
+	f := newToolFixture(t)
+	version := f.seedVersion(100, domain.VersionClarifying)
+	draft := f.seedRequirement(version.ID, 501, "Checkout", domain.RequirementDraft)
+
+	if _, isError, err := f.service.UpdateDraft(ctx, version.ID, draft.ID, 1, json.RawMessage(`{"title":"Checkout v2"}`), 7); err != nil || isError {
+		t.Fatalf("UpdateDraft=%v/%v want success", isError, err)
+	}
+	if len(f.events.events) != 1 {
+		t.Fatalf("published %d events, want 1", len(f.events.events))
+	}
+	event := f.events.events[0]
+	if event.Type != "requirement.updated" || event.VersionID != version.ID || event.ActorID != 7 ||
+		event.Source != domain.SourceAI || event.RefRequirementID == nil || *event.RefRequirementID != draft.ID {
+		t.Fatalf("published event=%+v", event)
+	}
 }
