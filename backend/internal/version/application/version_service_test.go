@@ -13,8 +13,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
-// testNow is the fixed instant the fake clock returns and the base of every
-// fake version timestamp.
+// testNow is the base of every fake version timestamp.
 var testNow = time.Date(2026, 10, 27, 10, 0, 0, 0, time.UTC)
 
 // testCommit is a valid (40 lowercase hex) Git commit id.
@@ -22,12 +21,6 @@ const testCommit = "0123456789abcdef0123456789abcdef01234567"
 
 // ptr returns a pointer to v.
 func ptr[T any](v T) *T { return &v }
-
-// fakeClock is a fixed application.Clock.
-type fakeClock struct{ now time.Time }
-
-// Now returns the fixed instant.
-func (c fakeClock) Now() time.Time { return c.now }
 
 // fixedIDs is an application.IDGenerator that yields a scripted sequence.
 type fixedIDs struct {
@@ -331,7 +324,6 @@ type versionFixture struct {
 	git     *fakeGit
 	events  *fakeEvents
 	ids     *fixedIDs
-	clock   fakeClock
 }
 
 // newVersionFixture returns a fixture with id 1000 as the first generated id.
@@ -342,7 +334,6 @@ func newVersionFixture() *versionFixture {
 		git:     &fakeGit{commit: testCommit},
 		events:  &fakeEvents{},
 		ids:     &fixedIDs{next: 1000},
-		clock:   fakeClock{now: testNow},
 	}
 	f.service = application.NewVersionService(
 		f.repo,
@@ -350,7 +341,6 @@ func newVersionFixture() *versionFixture {
 		f.git,
 		f.events,
 		application.WithIDGenerator(f.ids),
-		application.WithClock(f.clock),
 	)
 	return f
 }
@@ -413,6 +403,25 @@ func TestCreateVersionValidatesBindings(t *testing.T) {
 		assertDomainReason(t, err, domain.KindInvalid, "environment_system_mismatch")
 	})
 
+	t.Run("environment without reported ownership is a 422 reason", func(t *testing.T) {
+		f := newVersionFixture()
+		unowned := f.catalog.environments[8]
+		unowned.SystemID = nil
+		f.catalog.environments[8] = unowned
+
+		_, err := f.service.Create(context.Background(), application.CreateVersionCommand{
+			Name: "Order v2", SystemID: ptr(int64(7)), EnvironmentID: ptr(int64(8)),
+		}, 42)
+
+		assertDomainReason(t, err, domain.KindInvalid, "environment_system_mismatch")
+		if len(f.repo.versions) != 0 {
+			t.Fatalf("fail-open ownership check created a version: %+v", f.repo.versions)
+		}
+		if len(f.events.events) != 0 {
+			t.Fatalf("failed create published events: %+v", f.events.events)
+		}
+	})
+
 	t.Run("environment requires a system", func(t *testing.T) {
 		f := newVersionFixture()
 
@@ -448,6 +457,9 @@ func TestCreateVersionValidatesBindings(t *testing.T) {
 		}, 42)
 
 		assertDomainReason(t, err, domain.KindInvalid, "branch_not_found")
+		if len(f.git.calls) != 1 {
+			t.Fatalf("git calls = %v, want exactly one fixed-branch resolution", f.git.calls)
+		}
 		if f.git.calls[0] != "/srv/order-web@main" {
 			t.Fatalf("git call = %q, want fixed branch resolution", f.git.calls[0])
 		}

@@ -167,10 +167,10 @@ func TestVersionRepositoryRoundTripAndList(t *testing.T) {
 		t.Fatal("List accepted a zero limit")
 	}
 
-	// Missing rows are not-found reads.
-	if _, err := repo.Get(ctx, 999999); err != nil {
-		assertVersionKind(t, err, domain.KindNotFound, "not_found")
-	}
+	// Missing rows are not-found reads. Assert unconditionally: a broken path
+	// that returns nil must fail the test, not silently skip the assertion.
+	_, err = repo.Get(ctx, 999999)
+	assertVersionKind(t, err, domain.KindNotFound, "not_found")
 }
 
 func TestVersionRepositoryCursorAcrossTimestamps(t *testing.T) {
@@ -252,9 +252,8 @@ func TestVersionRepositoryMetadataAndBindingsCAS(t *testing.T) {
 	}
 
 	// A stale revision never writes.
-	if _, err := repo.UpdateMetadata(ctx, stored.ID, 1, "Stale", "", "", 42); err != nil {
-		assertVersionKind(t, err, domain.KindStateConflict, "revision_conflict")
-	}
+	_, err = repo.UpdateMetadata(ctx, stored.ID, 1, "Stale", "", "", 42)
+	assertVersionKind(t, err, domain.KindStateConflict, "revision_conflict")
 	afterStale, err := repo.Get(ctx, stored.ID)
 	if err != nil {
 		t.Fatalf("Get after stale: %v", err)
@@ -279,8 +278,17 @@ func TestVersionRepositoryMetadataAndBindingsCAS(t *testing.T) {
 		bound.UpdatedBy != 43 {
 		t.Fatalf("bound = %+v", bound)
 	}
-	if _, err := repo.UpdateBindings(ctx, stored.ID, 2, bindings, 43); err != nil {
-		assertVersionKind(t, err, domain.KindStateConflict, "revision_conflict")
+	// A stale binding revision is a revision_conflict and never writes.
+	_, err = repo.UpdateBindings(ctx, stored.ID, 2, bindings, 43)
+	assertVersionKind(t, err, domain.KindStateConflict, "revision_conflict")
+	staleBinding, err := repo.Get(ctx, stored.ID)
+	if err != nil {
+		t.Fatalf("Get after stale binding update: %v", err)
+	}
+	if staleBinding.Revision != 3 || staleBinding.SystemID == nil || *staleBinding.SystemID != 7 ||
+		staleBinding.CodeRepositoryID == nil || *staleBinding.CodeRepositoryID != 9 ||
+		staleBinding.CodeBranch == nil || *staleBinding.CodeBranch != "main" {
+		t.Fatalf("stale binding update wrote the row: %+v", staleBinding)
 	}
 
 	// Designing blocks binding replacement even with the right revision.
@@ -305,16 +313,14 @@ func TestVersionRepositoryMetadataAndBindingsCAS(t *testing.T) {
 	}
 
 	// Missing rows on CAS writes are reported as conflicts, matching the
-	// repository port contract.
-	if _, err := repo.UpdateMetadata(ctx, 999999, 1, "Missing", "", "", 43); err != nil {
-		assertVersionKind(t, err, domain.KindStateConflict, "revision_conflict")
-	}
-	if _, err := repo.UpdateBindings(ctx, 999999, 1, domain.VersionBindings{}, 43); err != nil {
-		assertVersionKind(t, err, domain.KindStateConflict, "revision_conflict")
-	}
-	if _, err := repo.UpdateStatus(ctx, 999999, domain.VersionDraft, domain.VersionClarifying, 43); err != nil {
-		assertVersionKind(t, err, domain.KindStateConflict, "version_state_conflict")
-	}
+	// repository port contract. Assert unconditionally so a regression that
+	// returns nil for a missing row fails here.
+	_, err = repo.UpdateMetadata(ctx, 999999, 1, "Missing", "", "", 43)
+	assertVersionKind(t, err, domain.KindStateConflict, "revision_conflict")
+	_, err = repo.UpdateBindings(ctx, 999999, 1, domain.VersionBindings{}, 43)
+	assertVersionKind(t, err, domain.KindStateConflict, "revision_conflict")
+	_, err = repo.UpdateStatus(ctx, 999999, domain.VersionDraft, domain.VersionClarifying, 43)
+	assertVersionKind(t, err, domain.KindStateConflict, "version_state_conflict")
 
 	// Duplicate explicit Snowflake ids are a uniqueness conflict.
 	duplicate := &domain.Version{ID: 2001, Name: "Duplicate", Status: domain.VersionDraft, Revision: 1, CreatedBy: 7, UpdatedBy: 7}
@@ -384,9 +390,9 @@ func TestVersionRepositoryStatusCountsAndUnclarified(t *testing.T) {
 	if updated.Status != domain.VersionClarifying || updated.Revision != 2 || updated.UpdatedBy != 42 {
 		t.Fatalf("status update = %+v", updated)
 	}
-	if _, err := repo.UpdateStatus(ctx, stored.ID, domain.VersionDraft, domain.VersionClarifying, 42); err != nil {
-		assertVersionKind(t, err, domain.KindStateConflict, "version_state_conflict")
-	}
+	// A second draft->clarifying transition loses the status CAS.
+	_, err = repo.UpdateStatus(ctx, stored.ID, domain.VersionDraft, domain.VersionClarifying, 42)
+	assertVersionKind(t, err, domain.KindStateConflict, "version_state_conflict")
 
 	// Requirement operations never change Version.status (INV-4): confirm,
 	// reopen and delete requirements directly and re-read the version.

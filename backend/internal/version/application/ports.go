@@ -38,9 +38,11 @@ type (
 // when validating a binding. Status is the P2 lifecycle status ("active" or
 // "disabled"); Available is false when the resource has been deleted.
 //
-// SystemID is only set for environments: the catalog adapter fills it with the
-// owning system so version bindings can reject an environment that belongs to
-// another system (spec §6.8). It is nil for systems and repositories.
+// SystemID is only set for environments: the catalog adapter must fill it with
+// the owning system so version bindings can reject an environment that belongs
+// to another system (spec §6.8). The ownership check is fail-closed: a nil
+// SystemID on a bound environment is rejected as environment_system_mismatch
+// rather than accepted unverified.
 type ResourceRef struct {
 	ID        int64
 	Name      string
