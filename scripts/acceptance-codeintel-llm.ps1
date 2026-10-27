@@ -8,12 +8,21 @@
     Without the gate this script prints SKIPPED and exits 0. With the gate open
     it drives one real-LLM P4 acceptance run against a real Git repository:
 
+      * validates EZTEST_DATABASE_URL before anything destructive: the URL must
+        use postgres/postgresql, carry an explicit host and a valid port (5432
+        when omitted), and must not override the connection target with
+        ?dbname=/?database=/?host=/?port=. The API URL for eztest_e2e is rebuilt
+        from the validated URL and checked against the psql target, so both
+        tools provably use the same database;
       * resets the dedicated eztest_e2e database, builds and starts the current
         API (or reuses an already running API when EZTEST_ACCEPTANCE_API_URL is
         set), then logs in as the administrator;
-      * clones the EzTest repository itself to .tmp/p4-real-repo (or uses
-        EZTEST_ACCEPTANCE_P4_REPO), creates the acceptance branch at a real base
-        commit and selects a real base..head pair with at most 20 changed files
+      * always clones the source repository (default: this checkout, or the Git
+        path in EZTEST_ACCEPTANCE_P4_REPO) into .tmp/p4-real-repo and creates a
+        uniquely named acceptance branch at a real base commit in that
+        disposable clone. The source repository is never written to; it is only
+        read by git clone;
+      * selects a real base..head pair with at most 20 changed files
         (EZTEST_ACCEPTANCE_P4_BASE/HEAD override the pair);
       * registers the clone as a P2 code repository, creates a version bound to
         it, adds two requirements (one title contains P4-AI-IMPACT) and attempts
@@ -21,32 +30,41 @@
         warning when no changed path can be anchored);
       * triggers POST /api/versions/{id}/code/analyses with an explicit
         headCommit and polls until done/failed;
-      * verifies that the change list matches `git diff --name-status`, that
-        stored AI evidence hashes recompute from commit content, that impact
-        candidates carry a non-empty reason, a valid confidence and path
-        evidence for high/medium, and that unmapped changes are reported (at
-        least one unless -AllowNoUnmapped is passed explicitly);
+      * verifies that the change list matches `git diff --name-status` (with
+        rename detection at 50%, parsed NUL-separated exactly like the backend),
+        that stored AI evidence hashes recompute from commit content, that
+        impact candidates carry a non-empty reason, a valid confidence and path
+        evidence for high/medium, and that no changed path is silently dropped:
+        every changed path must be covered by a persisted fact (path or evidence
+        file), a version anchor, or an unmapped entry (spec §10.7 and INV-8).
+        stats.unmapped is compared with the returned list unless truncation is
+        reported;
       * verifies cache reuse (second POST returns reused=true, the same id and
         normalized candidates identical), file-level cache hits in a second
         version bound to the same repo/base analyzing the same head
         (stats.cacheHits > 0), and force versioning (force=true creates
         analysisVersion+1 while the old analysis stays readable and its
         candidates stay unchanged);
-      * records a machine-readable, secret-free result at
-        .tmp/p4-real-acceptance.json.
+      * records the analysis.model/promptVersion provenance and a
+        machine-readable, secret-free result at .tmp/p4-real-acceptance.json.
 
-    A degraded (done + degraded=true) run is recorded as passed_degraded and the
-    AI-only assertions are skipped with an explicit note. If the default LLM
-    configuration is unavailable before the run starts, the gate is open but the
-    required llm_* keys are present, so this is a failure rather than a skip.
+    Fail-closed by default: if health reports llm_configured=false, or any
+    analysis in the run returns done+degraded=true (including the reused-API and
+    force paths), the run FAILS instead of claiming a real-LLM success. Pass
+    -AllowDegraded to opt into the previous behavior: the result is recorded as
+    passed_degraded and the AI-only assertions are skipped with an explicit
+    warning. If the default LLM configuration is unavailable before the run
+    starts, the gate is open but the required llm_* keys are present, so this is
+    a failure unless -AllowDegraded is passed explicitly.
 
     Logs contain only statuses, ids, counts and error codes; they never contain
     code bodies, prompts, credentials or repository file contents.
 
 .PARAMETER DryRun
-    Validate paths, the .env key presence (names only) and the Git/Node/Go/psql
-    tool availability without cloning, resetting the database, starting the API
-    or spending an LLM call. Exits 0 when the preflight passes. DryRun also works
+    Validate paths, the .env key presence (names only), the EZTEST_DATABASE_URL
+    target-changing-query/psql-vs-API preflight and the Git/Node/Go/psql tool
+    availability without cloning, resetting the database, starting the API or
+    spending an LLM call. Exits 0 when the preflight passes. DryRun also works
     while the gate is closed.
 
 .PARAMETER AllowNoUnmapped
@@ -55,16 +73,27 @@
     requires at least one real unmapped change; the relaxation is printed and
     recorded in the result JSON so it cannot pass silently.
 
+.PARAMETER AllowDegraded
+    Accept a degraded analysis (done + degraded=true) and record it as
+    passed_degraded with the AI-only assertions skipped. Without this switch a
+    run whose LLM configuration is unavailable or whose first, second-version or
+    force analysis is degraded fails, so a degraded run can never masquerade as
+    real LLM acceptance.
+
 .NOTES
     This script makes paid upstream calls. It is deliberately not part of
-    scripts/acceptance.ps1, which reports it as gated. The selected repository is
-    mounted/read only by design: P4 never writes to the checkout. Compatible with
-    Windows PowerShell 5.1 and PowerShell 7+; PostgreSQL must already be running.
+    scripts/acceptance.ps1, which reports it as gated. P4 itself only reads the
+    configured repository, but this script needs a branch for the version
+    binding, so it clones the source (read-only source access) into the
+    gitignored .tmp/p4-real-repo and never creates/updates refs in the source
+    checkout. Compatible with Windows PowerShell 5.1 and PowerShell 7+;
+    PostgreSQL must already be running.
 #>
 [CmdletBinding()]
 param(
     [switch]$DryRun,
-    [switch]$AllowNoUnmapped
+    [switch]$AllowNoUnmapped,
+    [switch]$AllowDegraded
 )
 
 $ErrorActionPreference = "Stop"
@@ -79,12 +108,17 @@ $e2eDbName = "eztest_e2e"
 $apiPort = 13333
 $apiBaseUrl = "http://localhost:$apiPort"
 $repoKey = "p4-acceptance-repo"
-$acceptanceBranch = "p4-acceptance"
+$acceptanceBranchPrefix = "p4-acceptance"
 $requirementMarker = "P4-AI-IMPACT"
 $maxChangedFiles = 20
 $pollIntervalSeconds = 2
 $pollTimeoutSeconds = 420
 $evidenceVerifyLimit = 20
+$factsPageSize = 100
+# The index caps a repository at 50000 files (EZTEST_CODEINTEL_MAX_INDEX_FILES),
+# so 500 pages of 100 always lets the coverage check read every persisted fact;
+# an unfinished pagination is a hard failure instead of a silent partial check.
+$maxFactPages = 500
 $requiredEnvKeys = @(
     "EZTEST_DATABASE_URL",
     "EZTEST_ADMIN_USERNAME",
@@ -106,21 +140,28 @@ $script:resultData = [ordered]@{
     generatedAt  = [DateTime]::UtcNow.ToString("o")
     baseCommit   = $null
     headCommit   = $null
-    branch       = $acceptanceBranch
+    branch       = $null
     versionId    = $null
     analysisId   = $null
     analysisVersion = $null
+    model        = $null
+    promptVersion = $null
     forceAnalysisId = $null
     forceAnalysisVersion = $null
     reused       = $null
     degraded     = $null
+    allowDegraded = $false
+    llmConfigured = $null
     changedFiles = $null
     factCount    = $null
+    anchorCount  = $null
     evidenceCount = $null
     verifiedEvidence = $null
     candidateCount = $null
     requirementCandidateCount = $null
     unmappedCount = $null
+    statsUnmapped = $null
+    unmappedTruncated = $null
     allowNoUnmapped = $false
     secondVersionId = $null
     secondAnalysisId = $null
@@ -164,6 +205,63 @@ function Get-RequiredValue {
         throw "Missing required value $Key in .env"
     }
     return [string]$Values[$Key]
+}
+
+function Assert-SafeDatabaseUrl {
+    param([string]$DatabaseUrl)
+    # pgx applies query parameters over the URL path and host:port, so a URL
+    # whose path names a dedicated e2e database can still connect to another
+    # database via ?dbname=/?database= (or redirect the host/port). The script
+    # resets eztest_e2e through psql authority while the API receives the URL,
+    # so reject target-changing keys before any destructive statement instead
+    # of trusting the path. Error messages never echo the URL or credentials.
+    $uri = $null
+    if (-not [System.Uri]::TryCreate($DatabaseUrl, [System.UriKind]::Absolute, [ref]$uri)) {
+        throw "EZTEST_DATABASE_URL is not a valid absolute URL"
+    }
+    if ($uri.Scheme -ne "postgres" -and $uri.Scheme -ne "postgresql") {
+        throw "EZTEST_DATABASE_URL must use the postgres scheme"
+    }
+    if ([string]::IsNullOrWhiteSpace($uri.Host)) {
+        throw "EZTEST_DATABASE_URL must include a host"
+    }
+    # .NET reports -1 when the URL omits the port; psql/pgx then default to 5432.
+    if ($uri.Port -ne -1 -and ($uri.Port -lt 1 -or $uri.Port -gt 65535)) {
+        throw "EZTEST_DATABASE_URL port must be between 1 and 65535 when present"
+    }
+    $query = $uri.Query
+    if (-not [string]::IsNullOrWhiteSpace($query)) {
+        foreach ($pair in ($query.TrimStart([char]"?")) -split "&") {
+            if ([string]::IsNullOrWhiteSpace($pair)) { continue }
+            $equals = $pair.IndexOf("=")
+            $key = if ($equals -ge 0) { $pair.Substring(0, $equals) } else { $pair }
+            $key = [System.Uri]::UnescapeDataString($key).Trim().ToLowerInvariant()
+            if ($key -eq "dbname" -or $key -eq "database" -or $key -eq "host" -or $key -eq "port") {
+                throw "EZTEST_DATABASE_URL must not override the connection target with the query parameter '$key'; put the host, port and database in the URL itself"
+            }
+        }
+    }
+    $databaseName = [System.Uri]::UnescapeDataString($uri.AbsolutePath.TrimStart([char[]]"/"))
+    if ([string]::IsNullOrWhiteSpace($databaseName) -or $databaseName.Contains("/")) {
+        throw "EZTEST_DATABASE_URL must include a single database name in its path"
+    }
+    return $uri
+}
+
+function New-E2eDatabaseUrl {
+    param([System.Uri]$DatabaseUri, [string]$DatabaseName)
+    # Rebuild rather than path-splice so the validated query string (for example
+    # sslmode) survives while the database path is replaced deterministically.
+    $builder = New-Object System.UriBuilder -ArgumentList @($DatabaseUri)
+    $builder.Path = "/" + $DatabaseName
+    return $builder.Uri.AbsoluteUri
+}
+
+function Get-DatabaseTargetName {
+    param([System.Uri]$Uri)
+    $name = [System.Uri]::UnescapeDataString($Uri.AbsolutePath.TrimStart([char[]]"/"))
+    $port = if ($Uri.Port -gt 0) { $Uri.Port } else { 5432 }
+    return ("{0}:{1}/{2}" -f $Uri.Host.ToLowerInvariant(), $port, $name)
 }
 
 function Resolve-ToolPath {
@@ -397,23 +495,63 @@ function Test-GitAncestor {
 
 function ConvertTo-DiffEntries {
     param([string]$Base, [string]$Head)
-    $raw = Invoke-GitText -Arguments @("diff", "--name-status", "--no-color", $Base, $Head)
+    $previous = $ErrorActionPreference
+    $previousEncoding = $null
+    try { $previousEncoding = [Console]::OutputEncoding } catch { }
+    $ErrorActionPreference = "SilentlyContinue"
+    try {
+        # Decode git's raw path bytes as UTF-8, matching the backend's -z parser;
+        # Windows PowerShell 5.1 otherwise uses the console code page.
+        try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { }
+        # -z disables path quoting. The backend parses the same NUL-separated
+        # records with --find-renames=50%, so mirror the rename threshold and
+        # the full status strings (for example R100) instead of guessing.
+        $output = & $gitExe -C $repoPath diff --name-status -z --no-ext-diff --no-textconv --find-renames=50% $Base $Head
+        $code = $LASTEXITCODE
+    } finally {
+        if ($null -ne $previousEncoding) {
+            try { [Console]::OutputEncoding = $previousEncoding } catch { }
+        }
+        $ErrorActionPreference = $previous
+    }
+    if ($code -ne 0) { throw "git diff --name-status failed with exit code $code" }
+
+    $text = (-join @($output))
+    $records = $text -split "`0"
     $entries = @()
-    foreach ($line in ($raw -split "\r?\n")) {
-        if ([string]::IsNullOrWhiteSpace($line)) { continue }
-        $parts = $line -split "`t"
-        if ($parts.Count -lt 2) { continue }
-        $status = $parts[0].Substring(0, 1)
-        if ($status -eq "R" -or $status -eq "C") {
-            if ($parts.Count -lt 3) { continue }
+    for ($index = 0; $index -lt $records.Count;) {
+        $status = [string]$records[$index]
+        $index++
+        if ([string]::IsNullOrEmpty($status)) { continue }
+        if ($status -notmatch '^[A-Z][0-9]*$') {
+            throw "git diff --name-status returned an unexpected status token"
+        }
+        if ($status.StartsWith("R") -or $status.StartsWith("C")) {
+            if ($index + 1 -ge $records.Count) {
+                throw "git diff --name-status returned a rename/copy record without two paths"
+            }
+            $oldPath = [string]$records[$index]
+            $newPath = [string]$records[$index + 1]
+            $index += 2
+            if ([string]::IsNullOrEmpty($oldPath) -or [string]::IsNullOrEmpty($newPath)) {
+                throw "git diff --name-status returned a rename/copy record with an empty path"
+            }
             $entries += [pscustomobject]@{
-                Path    = $parts[2]
-                OldPath = $parts[1]
+                Path    = $newPath
+                OldPath = $oldPath
                 Status  = $status
             }
         } else {
+            if ($index -ge $records.Count) {
+                throw "git diff --name-status returned a record without a path"
+            }
+            $path = [string]$records[$index]
+            $index++
+            if ([string]::IsNullOrEmpty($path)) {
+                throw "git diff --name-status returned a record with an empty path"
+            }
             $entries += [pscustomobject]@{
-                Path    = $parts[1]
+                Path    = $path
                 OldPath = $null
                 Status  = $status
             }
@@ -438,8 +576,9 @@ function Select-CommitPair {
     if (-not [string]::IsNullOrWhiteSpace($explicitHead)) {
         $headSpec = $explicitHead
     } elseif ([string]::IsNullOrWhiteSpace($env:EZTEST_ACCEPTANCE_P4_REPO)) {
-        # The local default clone is refreshed from the source repository; prefer
-        # origin/HEAD so an existing clone does not pin an old acceptance commit.
+        # The default acceptance clone is created fresh from this checkout, so
+        # origin/HEAD names the current default branch tip instead of a stale
+        # local branch.
         $originHead = Resolve-GitCommit -Spec "origin/HEAD"
         if (-not [string]::IsNullOrWhiteSpace($originHead)) { $headSpec = $originHead }
     }
@@ -494,50 +633,62 @@ function Select-CommitPair {
 }
 
 function Initialize-RepoWorkspace {
+    # Never create refs or fetch in the caller's repository: resolve the source,
+    # then read it only through `git clone` into the gitignored .tmp workspace.
+    # The clone is recreated on every run so a stale branch/commit from an earlier
+    # acceptance run can never be reused.
+    $sourceRepo = $repoRoot
     $explicitRepo = $env:EZTEST_ACCEPTANCE_P4_REPO
     if (-not [string]::IsNullOrWhiteSpace($explicitRepo)) {
         $candidate = [string]$explicitRepo
         if (-not (Test-Path -LiteralPath $candidate -PathType Container)) {
             throw "EZTEST_ACCEPTANCE_P4_REPO does not exist: $candidate"
         }
-        $gitDirCheck = & $gitExe -C $candidate rev-parse --git-dir 2>$null
-        if ($LASTEXITCODE -ne 0) {
-            throw "EZTEST_ACCEPTANCE_P4_REPO is not a Git repository: $candidate"
+        $sourceRepo = (Resolve-Path -LiteralPath $candidate -ErrorAction Stop).ProviderPath
+        $previous = $ErrorActionPreference
+        $ErrorActionPreference = "SilentlyContinue"
+        try {
+            & $gitExe -C $sourceRepo rev-parse --git-dir *> $null
+            $gitDirExit = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previous
         }
-        return $candidate
+        if ($gitDirExit -ne 0) {
+            throw "EZTEST_ACCEPTANCE_P4_REPO is not a Git repository: $sourceRepo"
+        }
     }
 
-    $candidate = Join-Path $tmpDir "p4-real-repo"
-    if (-not (Test-Path -LiteralPath (Join-Path $candidate ".git"))) {
-        if (Test-Path -LiteralPath $candidate) {
-            throw "the default P4 acceptance path exists but is not a Git clone: $candidate"
-        }
-        New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
-        Write-Step "Cloning the EzTest repository to .tmp/p4-real-repo (read-only knowledge for P4)"
-        $previous = $ErrorActionPreference
-        $ErrorActionPreference = "SilentlyContinue"
-        try {
-            & $gitExe clone --quiet --no-hardlinks $repoRoot $candidate 2>$null
-            $cloneExit = $LASTEXITCODE
-        } finally {
-            $ErrorActionPreference = $previous
-        }
-        if ($cloneExit -ne 0) { throw "git clone of the repository for P4 acceptance failed (exit $cloneExit)" }
-    } else {
-        # Refresh a local clone without touching the source checkout; a fetch
-        # failure is non-fatal because the existing history is still usable.
-        $previous = $ErrorActionPreference
-        $ErrorActionPreference = "SilentlyContinue"
-        try {
-            & $gitExe -C $candidate fetch --quiet origin 2>$null
-            if ($LASTEXITCODE -eq 0) {
-                & $gitExe -C $candidate remote set-head origin -a 2>$null | Out-Null
-            }
-        } finally {
-            $ErrorActionPreference = $previous
-        }
+    $clonePath = Join-Path $tmpDir "p4-real-repo"
+    $sourceFull = [System.IO.Path]::GetFullPath($sourceRepo)
+    $cloneFull = [System.IO.Path]::GetFullPath($clonePath)
+    if ($sourceFull.Equals($cloneFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "EZTEST_ACCEPTANCE_P4_REPO must be a source repository, not the .tmp/p4-real-repo clone target"
     }
-    return $candidate
+    $tmpFull = [System.IO.Path]::GetFullPath($tmpDir).TrimEnd([char[]]"\/")
+    if (-not $cloneFull.StartsWith($tmpFull + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "refusing to use an acceptance clone outside .tmp: $cloneFull"
+    }
+
+    New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
+    if (Test-Path -LiteralPath $clonePath) {
+        Write-Step "Replacing the previous disposable P4 acceptance clone at .tmp/p4-real-repo"
+        Remove-Item -LiteralPath $clonePath -Recurse -Force
+    }
+
+    Write-Step "Cloning the source repository into .tmp/p4-real-repo (source is never written)"
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "SilentlyContinue"
+    try {
+        & $gitExe clone --quiet --no-hardlinks $sourceFull $clonePath 2>$null
+        $cloneExit = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    if ($cloneExit -ne 0) { throw "git clone of the P4 acceptance source failed (exit $cloneExit)" }
+    if (-not (Test-Path -LiteralPath (Join-Path $clonePath ".git"))) {
+        throw "the P4 acceptance clone does not contain a Git worktree: $clonePath"
+    }
+    return $clonePath
 }
 
 function Ensure-CodeRepo {
@@ -604,16 +755,66 @@ function Assert-ChangeListMatchesGit {
     $apiByPath = @{}
     foreach ($file in @($ApiFiles)) {
         if ($null -eq $file) { continue }
-        $apiByPath[[string]$file.path] = [string]$file.status
+        $path = [string]$file.path
+        if ($apiByPath.ContainsKey($path)) {
+            throw "version change list contains the same path twice: $path"
+        }
+        $apiByPath[$path] = $file
     }
     foreach ($entry in @($GitEntries)) {
-        if (-not $apiByPath.ContainsKey([string]$entry.Path)) {
-            throw "version change list is missing a file reported by git diff: $($entry.Path)"
+        $path = [string]$entry.Path
+        if (-not $apiByPath.ContainsKey($path)) {
+            throw "version change list is missing a file reported by git diff: $path"
         }
-        if ($apiByPath[[string]$entry.Path] -ne [string]$entry.Status) {
-            throw "version change list status mismatch for $($entry.Path)"
+        $apiFile = $apiByPath[$path]
+        # Both sides use --find-renames=50%, so the full status string (M, A,
+        # D, T, R100, C075) must match; comparing only the first character
+        # would hide a rename/copy mismatch.
+        if ([string]$apiFile.status -ne [string]$entry.Status) {
+            throw "version change list status mismatch for $($path): api=$([string]$apiFile.status) git=$([string]$entry.Status)"
+        }
+        if ($null -ne $entry.OldPath) {
+            if ([string]::IsNullOrWhiteSpace([string]$apiFile.oldPath) -or
+                [string]$apiFile.oldPath -ne [string]$entry.OldPath) {
+                throw "version change list rename oldPath mismatch for $($path)"
+            }
         }
     }
+}
+
+function Get-CodeFacts {
+    param([int64]$RepoId, [string]$Commit, [hashtable]$Headers)
+    # Facts are paged; the unmapped-coverage assertion is only sound when every
+    # page was read, so an unfinished pagination is a hard failure rather than a
+    # silent partial set.
+    $facts = @()
+    $cursor = ""
+    for ($page = 0; $page -lt $maxFactPages; $page++) {
+        $url = "$apiBaseUrl/api/code/repos/$RepoId/facts?commit=" + [System.Uri]::EscapeDataString($Commit) + "&limit=$factsPageSize"
+        if (-not [string]::IsNullOrWhiteSpace($cursor)) {
+            $url = $url + "&cursor=" + [System.Uri]::EscapeDataString($cursor)
+        }
+        $response = Invoke-Api -Method Get -Uri $url -Headers $Headers -TimeoutSec 60
+        if ($null -ne $response.Raw.data) { $facts += @($response.Raw.data) }
+        if (-not [bool]$response.Raw.has_more) {
+            return [pscustomobject]@{ Facts = $facts; Pages = $page + 1 }
+        }
+        $cursor = [string]$response.Raw.next_cursor
+        if ([string]::IsNullOrWhiteSpace($cursor)) {
+            throw "facts pagination reported has_more=true without a next_cursor"
+        }
+    }
+    throw "facts pagination still reported has_more=true after $maxFactPages pages; refusing a partial unmapped-coverage check"
+}
+
+function Get-VersionAnchors {
+    param([string]$VersionId, [hashtable]$Headers)
+    $response = Invoke-Api -Method Get -Uri "$apiBaseUrl/api/versions/$VersionId/code/anchors" -Headers $Headers -TimeoutSec 30
+    $anchors = @()
+    if ($null -ne $response.Data) { $anchors = @($response.Data) }
+    # Emit the elements (not the array as one object) so the caller's @() wrap
+    # yields one item per anchor for any anchor count.
+    return $anchors
 }
 
 function Wait-Analysis {
@@ -705,28 +906,27 @@ try {
 } catch {
   process.exit(2);
 }
-const lines = [];
-let current = [];
-for (const byte of bytes) {
-  if (byte === 10) {
-    if (current.length > 0 && current[current.length - 1] === 13) current.pop();
-    lines.push(Buffer.from(current));
-    current = [];
-  } else {
-    current.push(byte);
+const lines = (() => {
+  // Mirror application/evidence.go commitContentLines (spec section 6.3):
+  // split on "\n", drop the implicit trailing empty element only when the
+  // content ends with "\n", and strip one trailing "\r" per line. A zero-byte
+  // blob has zero lines (the backend rejects evidence for it), while a file
+  // containing only "\n" has one empty line.
+  if (bytes.length === 0) return [];
+  if (bytes.includes(0)) process.exit(3);
+  let text;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    process.exit(3);
   }
-}
-if (current.length > 0 || (bytes.length > 0 && bytes[bytes.length - 1] !== 10)) {
-  if (current.length > 0 && current[current.length - 1] === 13) current.pop();
-  lines.push(Buffer.from(current));
-}
+  const parts = text.split("\n");
+  if (parts.length > 0 && parts[parts.length - 1] === "" && text.endsWith("\n")) parts.pop();
+  return parts.map((line) => (line.endsWith("\r") ? line.slice(0, -1) : line));
+})();
 if (start > lines.length || end > lines.length) process.exit(3);
-const parts = [];
-for (let index = start - 1; index < end; index += 1) {
-  if (index > start - 1) parts.push(Buffer.from("\n"));
-  parts.push(lines[index]);
-}
-process.stdout.write("sha256:" + createHash("sha256").update(Buffer.concat(parts)).digest("hex") + "\n");
+const excerpt = lines.slice(start - 1, end).join("\n");
+process.stdout.write("sha256:" + createHash("sha256").update(excerpt, "utf8").digest("hex") + "\n");
 '@
     [System.IO.File]::WriteAllText($helperPath, $code, (New-Object System.Text.UTF8Encoding($false)))
     return $helperPath
@@ -765,6 +965,7 @@ function Invoke-DryRun {
     if ([string]::IsNullOrWhiteSpace($nodeExe)) { $problems += "node executable not found on PATH" }
 
     $presentKeys = @()
+    $dryRunTarget = $null
     if (-not (Test-Path -LiteralPath $envPath -PathType Leaf)) {
         $problems += ".env not found at $envPath"
     } else {
@@ -774,6 +975,25 @@ function Invoke-DryRun {
                 $problems += "missing .env key: $key"
             } else {
                 $presentKeys += $key
+            }
+        }
+        # Preflight the destructive part of the real run: the same guard runs
+        # before any database reset, so DryRun proves the URL cannot redirect
+        # the API away from the eztest_e2e database that psql resets.
+        if ($envValues.ContainsKey("EZTEST_DATABASE_URL") -and
+            -not [string]::IsNullOrWhiteSpace([string]$envValues["EZTEST_DATABASE_URL"])) {
+            try {
+                $dryRunDatabaseUri = Assert-SafeDatabaseUrl -DatabaseUrl ([string]$envValues["EZTEST_DATABASE_URL"])
+                $dryRunE2eUrl = New-E2eDatabaseUrl -DatabaseUri $dryRunDatabaseUri -DatabaseName $e2eDbName
+                $dryRunE2eUri = [System.Uri]$dryRunE2eUrl
+                $dryRunTarget = Get-DatabaseTargetName -Uri $dryRunE2eUri
+                $dryRunPort = if ($dryRunDatabaseUri.Port -gt 0) { $dryRunDatabaseUri.Port } else { 5432 }
+                $psqlTarget = "{0}:{1}/{2}" -f $dryRunDatabaseUri.Host.ToLowerInvariant(), $dryRunPort, $e2eDbName
+                if ($psqlTarget -ne $dryRunTarget) {
+                    $problems += "EZTEST_DATABASE_URL preflight: the rebuilt API target differs from the psql target"
+                }
+            } catch {
+                $problems += ("EZTEST_DATABASE_URL preflight: " + $_.Exception.Message)
             }
         }
     }
@@ -792,12 +1012,15 @@ function Invoke-DryRun {
     }
     Write-Host "DryRun: repository root: $repoRoot"
     Write-Host ("DryRun: .env found; required keys present ({0}/{1})" -f $presentKeys.Count, $requiredEnvKeys.Count)
+    if ($null -ne $dryRunTarget) {
+        Write-Host ("DryRun: database preflight OK; API and psql both target {0} (no target-changing query keys)" -f $dryRunTarget)
+    }
     Write-Host "DryRun: git executable found: $gitExe"
     Write-Host "DryRun: node executable found: $nodeExe"
     if ([string]::IsNullOrWhiteSpace($env:EZTEST_ACCEPTANCE_P4_REPO)) {
-        Write-Host "DryRun: the real run will clone/refresh .tmp/p4-real-repo"
+        Write-Host "DryRun: the real run will delete/reclone .tmp/p4-real-repo from this checkout (source is never written)"
     } else {
-        Write-Host "DryRun: the real run will use EZTEST_ACCEPTANCE_P4_REPO"
+        Write-Host "DryRun: the real run will delete/reclone .tmp/p4-real-repo from EZTEST_ACCEPTANCE_P4_REPO (source is never written)"
     }
     if ([string]::IsNullOrWhiteSpace($env:EZTEST_ACCEPTANCE_API_URL)) {
         Write-Host "DryRun: the real run will reset $e2eDbName, build and start the API on :$apiPort"
@@ -808,6 +1031,11 @@ function Invoke-DryRun {
         Write-Host "DryRun: gate is closed (EZTEST_RUN_REAL_LLM != 1); the real run would print SKIPPED and exit 0."
     } else {
         Write-Host "DryRun: gate is open; the real run will make paid LLM calls."
+    }
+    if ($AllowDegraded) {
+        Write-Host "DryRun: -AllowDegraded is set; a degraded analysis would be recorded as passed_degraded, not failed."
+    } else {
+        Write-Host "DryRun: llm_configured=false or a degraded analysis will fail the run by default (pass -AllowDegraded to record it instead)."
     }
     if ($AllowNoUnmapped) {
         Write-Host "DryRun: -AllowNoUnmapped is set; unmapped=0 will be recorded as skipped, not failed."
@@ -834,6 +1062,15 @@ if ($AllowNoUnmapped) {
     Write-Host "Unmapped policy: -AllowNoUnmapped is set; unmapped=0 will be recorded as skipped, not failed." -ForegroundColor Yellow
 } else {
     Write-Host "Unmapped policy: at least one real unmapped change is required (pass -AllowNoUnmapped to relax)."
+}
+
+# R43: a degraded run is not real-LLM acceptance, so it fails closed unless the
+# caller explicitly opts in. The relaxation is recorded in the result JSON.
+$script:resultData.allowDegraded = [bool]$AllowDegraded
+if ($AllowDegraded) {
+    Write-Host "Degraded policy: -AllowDegraded is set; a degraded analysis will be recorded as passed_degraded, not failed." -ForegroundColor Yellow
+} else {
+    Write-Host "Degraded policy: llm_configured=false or a degraded analysis will fail the run (pass -AllowDegraded to record it instead)."
 }
 
 $exitCode = 0
@@ -891,27 +1128,28 @@ try {
         }
     }
 
-    $databaseUri = [System.Uri]$databaseUrl
-    if (-not $databaseUri.IsAbsoluteUri) { throw "EZTEST_DATABASE_URL is not an absolute URL" }
+    # Validate the URL and rebuild the eztest_e2e API URL from its validated
+    # components before any destructive psql statement. The query may keep
+    # non-target keys such as sslmode, but dbname/database/host/port are
+    # rejected by Assert-SafeDatabaseUrl because pgx would let them override
+    # the path/host/port the psql reset uses.
+    $databaseUri = Assert-SafeDatabaseUrl -DatabaseUrl $databaseUrl
     $userInfo = $databaseUri.UserInfo
     $separator = $userInfo.IndexOf(":")
     if ($separator -lt 0) { throw "EZTEST_DATABASE_URL must contain a user and password" }
     $dbUser = [System.Uri]::UnescapeDataString($userInfo.Substring(0, $separator))
     $dbPassword = [System.Uri]::UnescapeDataString($userInfo.Substring($separator + 1))
     $dbHost = $databaseUri.Host
-    $dbPort = $databaseUri.Port
+    $dbPort = if ($databaseUri.Port -gt 0) { $databaseUri.Port } else { 5432 }
     $script:secretValues += $dbPassword
-    $queryIndex = $databaseUrl.IndexOf("?")
-    if ($queryIndex -ge 0) {
-        $urlBase = $databaseUrl.Substring(0, $queryIndex)
-        $urlQuery = $databaseUrl.Substring($queryIndex)
-    } else {
-        $urlBase = $databaseUrl
-        $urlQuery = ""
+    $e2eDatabaseUrl = New-E2eDatabaseUrl -DatabaseUri $databaseUri -DatabaseName $e2eDbName
+    $e2eDatabaseUri = [System.Uri]$e2eDatabaseUrl
+    $psqlTarget = "{0}:{1}/{2}" -f $dbHost.ToLowerInvariant(), $dbPort, $e2eDbName
+    $apiTarget = Get-DatabaseTargetName -Uri $e2eDatabaseUri
+    if ($psqlTarget -ne $apiTarget) {
+        throw "EZTEST_DATABASE_URL preflight failed: the API target and the psql reset target differ; refusing to reset a database the API might not use"
     }
-    $slashIndex = $urlBase.LastIndexOf("/")
-    if ($slashIndex -lt 0) { throw "EZTEST_DATABASE_URL does not contain a database name" }
-    $e2eDatabaseUrl = $urlBase.Substring(0, $slashIndex + 1) + $e2eDbName + $urlQuery
+    Write-Host ("Database target validated: API and psql both use {0}" -f $psqlTarget)
 
     $gitExe = Resolve-ToolPath -LocalPath "" -CommandName "git"
     if ([string]::IsNullOrWhiteSpace($gitExe)) { throw "git executable not found on PATH" }
@@ -1005,13 +1243,17 @@ try {
     if ($null -eq $health.Raw -or [string]$health.Raw.data.status -ne "ok") {
         throw "API health is not ok"
     }
-    if (-not [bool]$health.Raw.data.llm_configured) {
-        # The gate is open and the llm_* keys are present, but the seeded
-        # default configuration is not usable. Spec §6.6 requires the analysis to
-        # degrade to done+degraded in that case, so the run proceeds and the
-        # AI-only assertions are skipped; the result records passed_degraded.
-        Write-Host "WARNING: health reports llm_configured=false; the analysis is expected to degrade (AI-only checks will be skipped)." -ForegroundColor Yellow
-        [void]$script:warnings.Add("health reports llm_configured=false; analysis degraded mode expected")
+    $llmConfigured = [bool]$health.Raw.data.llm_configured
+    $script:resultData.llmConfigured = $llmConfigured
+    if (-not $llmConfigured) {
+        # R43 fail-closed: the gate is open, so a run without a usable LLM
+        # configuration cannot be real-LLM acceptance. Only an explicit
+        # -AllowDegraded opt-in may record the expected done+degraded result.
+        if (-not $AllowDegraded) {
+            throw "health reports llm_configured=false; refusing to claim real-LLM acceptance by default (pass -AllowDegraded to record an explicitly degraded run)"
+        }
+        Write-Host "WARNING: health reports llm_configured=false (allowed by -AllowDegraded); the analysis is expected to degrade." -ForegroundColor Yellow
+        [void]$script:warnings.Add("health reports llm_configured=false; degraded mode explicitly allowed by -AllowDegraded")
     }
 
     Write-Step "Logging in as admin"
@@ -1037,39 +1279,29 @@ try {
     Write-Host ("Selected real commit pair: base={0} head={1} changedFiles={2}" -f $baseCommit.Substring(0, 12), $headCommit.Substring(0, 12), @($gitEntries).Count)
     Add-CheckResult -Name "real commit pair" -Status "passed" -Detail ("base..head with {0} changed files" -f @($gitEntries).Count)
 
-    # Point the version's branch at the base commit; the analysis explicitly
-    # asks for the later head commit, exactly as the §10.7 manual path does. A
-    # read-only EZTEST_ACCEPTANCE_P4_REPO cannot accept a new branch, so fall
-    # back to an existing branch: the version binding only needs a branch that
-    # exists, and the baseline commit stays the explicit base.
+    # Create a uniquely named branch at the base commit inside the disposable
+    # clone. The analysis explicitly asks for the later head commit, exactly as
+    # the §10.7 manual path does. The clone is ours, so no fallback to an
+    # existing branch and no ref writes in the caller's repository are needed.
+    $acceptanceBranch = "{0}-{1}-{2}" -f $acceptanceBranchPrefix, $baseCommit.Substring(0, 12), ([guid]::NewGuid().ToString("N").Substring(0, 8))
     $previous = $ErrorActionPreference
     $ErrorActionPreference = "SilentlyContinue"
-    $branchReady = $false
     try {
         & $gitExe -C $repoPath update-ref "refs/heads/$acceptanceBranch" $baseCommit 2>$null
         $branchExit = $LASTEXITCODE
         if ($branchExit -eq 0) {
-            $branchReady = $true
+            $branchTip = ((& $gitExe -C $repoPath rev-parse --verify "refs/heads/$acceptanceBranch^{commit}" 2>$null | Out-String).Trim())
         } else {
-            $existingBranch = ((& $gitExe -C $repoPath rev-parse --abbrev-ref HEAD 2>$null | Out-String).Trim())
-            if ([string]::IsNullOrWhiteSpace($existingBranch) -or $existingBranch -eq "HEAD") {
-                $existingBranch = ((& $gitExe -C $repoPath for-each-ref --count=1 --format="%(refname:short)" refs/heads 2>$null | Out-String).Trim())
-            }
-            if (-not [string]::IsNullOrWhiteSpace($existingBranch)) {
-                $acceptanceBranch = $existingBranch
-                $branchReady = $true
-            }
+            $branchTip = ""
         }
     } finally {
         $ErrorActionPreference = $previous
     }
-    if (-not $branchReady) {
-        throw "could not create the acceptance branch at the selected base commit (and no existing branch was found)"
-    }
-    if ($branchExit -ne 0) {
-        [void]$script:warnings.Add("repository branch ref was not writable; bound the version to existing branch '$acceptanceBranch'")
+    if ($branchExit -ne 0 -or $branchTip -ne $baseCommit) {
+        throw "could not create the unique acceptance branch '$acceptanceBranch' at the selected base commit in .tmp/p4-real-repo"
     }
     $script:resultData.branch = $acceptanceBranch
+    Write-Host ("Acceptance branch created in the disposable clone: {0}" -f $acceptanceBranch)
 
     Write-Step "Registering the code repository and creating a bound version"
     $repo = Ensure-CodeRepo -RepositoryPath $repoPath -Branch $acceptanceBranch -Headers $headers
@@ -1111,7 +1343,7 @@ try {
     Write-Step "Creating one requirement anchor on a changed file (direct-candidate source)"
     $anchorCreated = $false
     $anchorFailures = @()
-    $anchorCandidates = @($gitEntries | Where-Object { $_.Status -in @("M", "T", "D", "R") })
+    $anchorCandidates = @($gitEntries | Where-Object { $_.Status -match '^[MTDRC]' })
     foreach ($entry in $anchorCandidates) {
         if ($anchorCreated) { break }
         try {
@@ -1183,6 +1415,28 @@ try {
     $script:resultData.degraded = $degraded
     Add-CheckResult -Name "analysis completed" -Status "passed" -Detail ("status=done degraded={0}" -f $degraded)
 
+    # Provenance: record exactly which model/prompt produced the analysis. The
+    # prompt version is always set (config default); a non-degraded real-LLM run
+    # must also record the resolved model.
+    $analysisModel = [string]$analysis.model
+    $analysisPromptVersion = [string]$analysis.promptVersion
+    $script:resultData.model = $analysisModel
+    $script:resultData.promptVersion = $analysisPromptVersion
+    if ([string]::IsNullOrWhiteSpace($analysisPromptVersion)) {
+        throw "analysis did not record promptVersion provenance"
+    }
+    if (-not $degraded -and [string]::IsNullOrWhiteSpace($analysisModel)) {
+        throw "analysis did not record the model used by a non-degraded run"
+    }
+    Add-CheckResult -Name "analysis provenance" -Status "passed" -Detail ("model={0} promptVersion={1}" -f $analysisModel, $analysisPromptVersion)
+
+    # R43 fail-closed: a degraded analysis must never be reported as real-LLM
+    # acceptance unless the caller explicitly opted in with -AllowDegraded (the
+    # old skip-AI-checks behavior).
+    if ($degraded -and -not $AllowDegraded) {
+        throw "analysis degraded=true; refusing to claim real-LLM acceptance by default (pass -AllowDegraded to record an explicitly degraded run)"
+    }
+
     $stats = $analysis.stats
     if ($null -eq $stats) { throw "completed analysis has no stats" }
     if ([int]$stats.changedFiles -ne @($gitEntries).Count) {
@@ -1200,20 +1454,15 @@ try {
     }
 
     Write-Step "Verifying AI facts and evidence hashes against commit content"
-    $facts = @()
-    $cursor = ""
-    for ($page = 0; $page -lt 10; $page++) {
-        $factsUrl = "$apiBaseUrl/api/code/repos/$repoId/facts?commit=$headCommit&limit=100"
-        if (-not [string]::IsNullOrWhiteSpace($cursor)) {
-            $factsUrl = $factsUrl + "&cursor=" + [System.Uri]::EscapeDataString($cursor)
-        }
-        $factsResponse = Invoke-Api -Method Get -Uri $factsUrl -Headers $headers -TimeoutSec 60
-        if ($null -ne $factsResponse.Raw.data) { $facts += @($factsResponse.Raw.data) }
-        if (-not [bool]$factsResponse.Raw.has_more) { break }
-        $cursor = [string]$factsResponse.Raw.next_cursor
-        if ([string]::IsNullOrWhiteSpace($cursor)) { break }
-    }
-    $script:resultData.factCount = @($facts).Count
+    $factsResult = Get-CodeFacts -RepoId $repoId -Commit $headCommit -Headers $headers
+    $facts = @($factsResult.Facts)
+    $script:resultData.factCount = $facts.Count
+    Write-Host ("Facts read: {0} entries across {1} page(s)" -f $facts.Count, $factsResult.Pages)
+
+    # Version anchors also cover changed paths for the unmapped-completeness
+    # assertion (spec §6.6 step 7 / INV-8). The endpoint returns one plain array.
+    $anchors = @(Get-VersionAnchors -VersionId $versionId -Headers $headers)
+    $script:resultData.anchorCount = $anchors.Count
 
     $evidenceTotal = 0
     $evidenceVerified = 0
@@ -1349,6 +1598,69 @@ try {
         Add-CheckResult -Name "unmapped changes" -Status "passed" -Detail ([string]$unmapped.Count)
     }
 
+    # INV-8 / spec §10.7 "no silent omission": every changed path must either be
+    # covered by a persisted AI fact (fact path or verified evidence file), a
+    # version anchor, or be listed explicitly in unmapped. This mirrors the
+    # backend's impactCoverageFacts: AI fact kinds with at least one verified
+    # evidence location, regardless of confidence, and never the T0 file-entity
+    # rows (those would cover every indexed path and hide a real omission).
+    $coverageFactKinds = @("page", "route", "api", "client_call", "component", "module", "symbol")
+    $coverage = @{}
+    foreach ($fact in $facts) {
+        if ($null -eq $fact) { continue }
+        if ($coverageFactKinds -notcontains [string]$fact.kind) { continue }
+        $verifiedEvidence = @($fact.evidence | Where-Object {
+                $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_.file)
+            })
+        if ($verifiedEvidence.Count -eq 0) { continue }
+        $factPath = [string]$fact.path
+        if (-not [string]::IsNullOrWhiteSpace($factPath)) { $coverage[$factPath] = $true }
+        foreach ($evidence in $verifiedEvidence) {
+            $coverage[[string]$evidence.file] = $true
+        }
+    }
+    foreach ($anchor in $anchors) {
+        if ($null -eq $anchor) { continue }
+        $anchorPath = [string]$anchor.filePath
+        if (-not [string]::IsNullOrWhiteSpace($anchorPath)) { $coverage[$anchorPath] = $true }
+    }
+    $unmappedPaths = @{}
+    foreach ($unmappedEntry in $unmapped) {
+        if ($null -eq $unmappedEntry) { continue }
+        $unmappedPaths[[string]$unmappedEntry.path] = $true
+    }
+    $uncovered = @($changedPaths.Keys | Where-Object {
+            -not $coverage.ContainsKey([string]$_) -and -not $unmappedPaths.ContainsKey([string]$_)
+        } | Sort-Object)
+    if ($uncovered.Count -gt 0) {
+        throw ("unmapped completeness failed: {0} changed path(s) are neither covered by a fact/anchor nor listed in unmapped: {1}" -f $uncovered.Count, ($uncovered -join ", "))
+    }
+    Add-CheckResult -Name "unmapped completeness" -Status "passed" -Detail ("{0} changed paths covered by facts/anchors or unmapped" -f $changedPaths.Count)
+
+    # stats.unmapped must agree with the returned list. Truncation is the only
+    # allowed difference; the counter is compared to the list unless the backend
+    # reports stats.unmappedTruncated=true (older DTO projections omit it).
+    if ($null -eq $stats.PSObject.Properties["unmapped"]) {
+        throw "analysis stats do not expose the unmapped counter"
+    }
+    $statsUnmapped = [int]$stats.unmapped
+    $script:resultData.statsUnmapped = $statsUnmapped
+    $unmappedTruncated = $false
+    if ($null -ne $stats.PSObject.Properties["unmappedTruncated"]) {
+        $unmappedTruncated = [bool]$stats.unmappedTruncated
+    }
+    $script:resultData.unmappedTruncated = $unmappedTruncated
+    if ($unmappedTruncated) {
+        if ($statsUnmapped -lt $unmapped.Count) {
+            throw "stats.unmapped=$statsUnmapped is smaller than the returned unmapped list ($($unmapped.Count) entries)"
+        }
+        Add-CheckResult -Name "stats.unmapped" -Status "passed" -Detail ("{0} total, {1} returned after truncation" -f $statsUnmapped, $unmapped.Count)
+    } elseif ($statsUnmapped -ne $unmapped.Count) {
+        throw "analysis stats.unmapped=$statsUnmapped but the returned unmapped list has $($unmapped.Count) entries"
+    } else {
+        Add-CheckResult -Name "stats.unmapped" -Status "passed" -Detail ([string]$statsUnmapped)
+    }
+
     $initialFingerprint = Get-CandidateFingerprint -Candidates $analysis.candidates
 
     Write-Step "Verifying cache reuse (second POST must return reused=true)"
@@ -1404,6 +1716,9 @@ try {
     $cacheHits = [int]$secondStats.cacheHits
     $script:resultData.cacheHits = $cacheHits
     $secondDegraded = [bool]$secondAnalysis.degraded
+    if ($secondDegraded -and -not $AllowDegraded) {
+        throw "second version analysis degraded=true; refusing to claim real-LLM acceptance by default (pass -AllowDegraded to record an explicitly degraded run)"
+    }
     if ($degraded -or $secondDegraded) {
         Add-CheckResult -Name "second version cache hits" -Status "skipped" -Detail ("degraded=true; stats.cacheHits={0} is not enforced" -f $cacheHits)
         [void]$script:warnings.Add("second version cacheHits assertion skipped because the analysis degraded")
@@ -1430,8 +1745,16 @@ try {
     $script:resultData.forceAnalysisId = $forceAnalysisId
     $script:resultData.forceAnalysisVersion = $forceVersion
     $forceAnalysisResponse = Wait-Analysis -VersionId $versionId -AnalysisId $forceAnalysisId -Headers $headers -TimeoutSeconds $pollTimeoutSeconds
-    if ([string]$forceAnalysisResponse.Data.status -eq "failed") {
+    $forceAnalysis = $forceAnalysisResponse.Data
+    if ([string]$forceAnalysis.status -eq "failed") {
         throw "force analysis failed"
+    }
+    if ([string]$forceAnalysis.status -ne "done") {
+        throw "force analysis reached unexpected terminal status '$([string]$forceAnalysis.status)'"
+    }
+    $forceDegraded = [bool]$forceAnalysis.degraded
+    if ($forceDegraded -and -not $AllowDegraded) {
+        throw "force analysis degraded=true; refusing to claim real-LLM acceptance by default (pass -AllowDegraded to record an explicitly degraded run)"
     }
     $oldAgain = Invoke-Api -Method Get -Uri "$apiBaseUrl/api/versions/$versionId/code/analyses/$analysisId" -Headers $headers -TimeoutSec 30
     $oldAgainFingerprint = Get-CandidateFingerprint -Candidates $oldAgain.Data.candidates
@@ -1440,7 +1763,9 @@ try {
     }
     Add-CheckResult -Name "force versioning" -Status "passed" -Detail ("analysisVersion {0} -> {1}; old analysis unchanged" -f $initialVersion, $forceVersion)
 
-    if ($degraded) {
+    $anyDegraded = $degraded -or $secondDegraded -or $forceDegraded
+    $script:resultData.degraded = $anyDegraded
+    if ($anyDegraded) {
         $script:resultData.status = "passed_degraded"
     } else {
         $script:resultData.status = "passed"
@@ -1461,7 +1786,7 @@ try {
 
 if ($exitCode -eq 0) {
     if ($script:resultData.status -eq "passed_degraded") {
-        Write-Host "PASS (degraded): the real-LLM analysis degraded, AI-only assertions were skipped; T0/caching/versioning checks passed." -ForegroundColor Yellow
+        Write-Host "PASS (degraded, explicitly allowed by -AllowDegraded): AI-only assertions were skipped; T0/caching/versioning checks passed." -ForegroundColor Yellow
     } else {
         Write-Host "PASS: real codeintel LLM acceptance completed." -ForegroundColor Green
     }

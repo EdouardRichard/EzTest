@@ -7,23 +7,25 @@
     Executes the Go unit and integration suites, the P1 Agent unit/integration
     suites, the P3 version/requirements/clarification suites, the P4 codeintel
     suites, the frontend lint/typecheck/test/build gate, the Playwright E2E
-    suite (P0/P1/P2 and the three P3 version specs in
-    frontend/e2e/versions*.spec.ts; P4 E2E coverage is added by Task 20 and is
-    not part of this gate yet), a repeated
-    migration run and the health/audit/version-API assertions. The P0-P4
-    deliverables are checked (README, OpenAPI, deploy files, Agent/P3/P4 env
-    templates, the P3/P4 OpenAPI contract keywords, reason enums and event
-    catalog), the P4 fake-LLM test is executed, the P4 migration/table contract
-    is derived from order.txt and the Compose file is statically validated with
-    node. Container execution and the gated real Agent/P3/P4 LLM acceptance are
-    reported as SKIPPED because this host has no Docker and no opt-in for paid
-    calls. Prints P1/P3/P4 DoD mapping tables and exits non-zero on any failure.
+    suite (P0/P1/P2, the three P3 version specs in
+    frontend/e2e/versions*.spec.ts, and the five P4 code-intelligence specs
+    versions-code, versions-code-cache, versions-code-degraded,
+    versions-code-anchors and code-repos-index), a repeated migration run and
+    the health/audit/version-API assertions. The P0-P4 deliverables are checked
+    (README, OpenAPI, deploy files, Agent/P3/P4 env templates, the P3/P4 OpenAPI
+    contract keywords, reason enums and event catalog), the P4 fake-LLM test is
+    executed, the P4 migration/table contract is derived from order.txt and the
+    Compose file is statically validated with node. Container execution and the
+    gated real Agent/P3/P4 LLM acceptance are reported as SKIPPED because this
+    host has no Docker and no opt-in for paid calls. Prints P1/P3/P4 DoD mapping
+    tables and exits non-zero on any failure.
 
 .PARAMETER StaticOnly
     Runs only the repository-local static checks (README/OpenAPI/env/Compose
     contracts plus the P4 fake-LLM test) without requiring .env, the database,
-    the built API or Playwright. Useful on a host without PostgreSQL; the full
-    gate remains the default.
+    the built API or Playwright. It still needs Node, frontend/node_modules/yaml
+    (OpenAPI YAML parse) and git (the P4 fixture and fake-LLM test). Useful on a
+    host without PostgreSQL; the full gate remains the default.
 
 .NOTES
     Compatible with Windows PowerShell 5.1 and PowerShell 7+.
@@ -930,6 +932,22 @@ try {
                 }
             }
 
+            # The five P4 Playwright specs run as part of the whole Playwright
+            # suite in scripts/e2e.ps1; pin their presence in the static gate so
+            # a rename cannot silently drop P4 E2E coverage.
+            foreach ($p4Spec in @(
+                    "versions-code.spec.ts",
+                    "versions-code-cache.spec.ts",
+                    "versions-code-degraded.spec.ts",
+                    "versions-code-anchors.spec.ts",
+                    "code-repos-index.spec.ts"
+                )) {
+                $specPath = Join-Path $frontendDir ("e2e\" + $p4Spec)
+                if (-not (Test-Path -LiteralPath $specPath)) {
+                    throw "missing P4 E2E spec frontend/e2e/$p4Spec (the Playwright gate must include P4 coverage)"
+                }
+            }
+
             $openapi = Get-Content -LiteralPath (Join-Path $repoRoot "docs/openapi/api.yaml") -Raw
             foreach ($needle in @(
                     # Both P4 API prefixes and every documented path family.
@@ -1097,7 +1115,7 @@ try {
     Add-CheckResult -Dod "P3" -CheckName "P3 real LLM acceptance" -Status "SKIPPED" `
         -Detail "Gated: manual P3 acceptance (spec §10.7) with EZTEST_ACCEPTANCE_REAL_LLM=1; screenshots under .tmp/p3-acceptance/."
     Add-CheckResult -Dod "P4" -CheckName "P4 real LLM acceptance" -Status "SKIPPED" `
-        -Detail "Gated: run scripts/acceptance-codeintel-llm.ps1 with EZTEST_RUN_REAL_LLM=1; results under .tmp/p4-real-acceptance.json."
+        -Detail "Gated: run scripts/acceptance-codeintel-llm.ps1 with EZTEST_RUN_REAL_LLM=1; it fails closed on llm_configured=false/degraded unless -AllowDegraded is passed; results under .tmp/p4-real-acceptance.json."
 
     Write-Step "P0-P4 DoD acceptance summary"
     $table = $checkResults | Format-Table -AutoSize -Wrap | Out-String -Width 200
@@ -1139,7 +1157,7 @@ try {
     # P3 exit criteria (spec §10.6) mapped to the evidence collected above; the
     # real-LLM manual acceptance remains the only gated piece. The three P3
     # Playwright specs (frontend/e2e/versions*.spec.ts) are part of scripts/e2e.ps1
-    # and passed in T19 (17 total / 3 P3).
+    # (T20 recorded 22/22 total, including the 3 P3 and 5 P4 specs).
     Write-Step "P3 DoD mapping (spec §10.6)"
     $p3DodMapping = @(
         [pscustomobject][ordered]@{
@@ -1192,28 +1210,30 @@ try {
     Write-Host $p3Table
 
     # P4 exit criteria (spec §10.6) mapped to the evidence collected above;
-    # the gated real-LLM run remains the only opt-in piece.
+    # the gated real-LLM run remains the only opt-in piece. The five P4
+    # Playwright specs run inside scripts/e2e.ps1 with the rest of the suite
+    # (T20 recorded 22/22 E2E passing, including these five specs).
     Write-Step "P4 DoD mapping (spec §10.6)"
     $p4DodMapping = @(
         [pscustomobject][ordered]@{
             DoD         = "P4-1"
             Requirement = "Any-language repository: file-level diff, AI interface/route/page facts with evidence"
-            Evidence    = "codeintel domain/gitx suites; P4 OpenAPI tree/file/diff/facts paths; P4 fake-LLM test; gated acceptance-codeintel-llm.ps1"
+            Evidence    = "codeintel domain/gitx suites; P4 OpenAPI tree/file/diff/facts paths; P4 fake-LLM test; Playwright versions-code.spec.ts + code-repos-index.spec.ts; gated acceptance-codeintel-llm.ps1"
         },
         [pscustomobject][ordered]@{
             DoD         = "P4-2"
             Requirement = "Same-commit analyses reuse the cache; re-analysis creates a new version without overwriting"
-            Evidence    = "codeintel application cache/version suites; gated script asserts reused=true with identical normalized candidates, a second same-base version with stats.cacheHits>0, and force analysisVersion+1"
+            Evidence    = "codeintel application cache/version suites; Playwright versions-code-cache.spec.ts; gated script asserts reused=true with identical normalized candidates, a second same-base version with stats.cacheHits>0, and force analysisVersion+1"
         },
         [pscustomobject][ordered]@{
             DoD         = "P4-3"
             Requirement = "Impact candidates carry reason/confidence/evidence, can be toggled, and unmapped changes are visible"
-            Evidence    = "codeintel impact/candidate suites; P4 Analysis/Candidate/Unmapped OpenAPI schemas; gated script checks candidate reason/confidence/evidence and requires >=1 unmapped (or explicit -AllowNoUnmapped)"
+            Evidence    = "codeintel impact/candidate suites; P4 Analysis/Candidate/Unmapped OpenAPI schemas; Playwright versions-code.spec.ts + versions-code-anchors.spec.ts; gated script checks candidate reason/confidence/evidence, >=1 unmapped (or explicit -AllowNoUnmapped), and no silent unmapped omission"
         },
         [pscustomobject][ordered]@{
             DoD         = "P4-4"
             Requirement = "AI failure degrades without blocking the main flow"
-            Evidence    = "codeintel degraded suites; P4 Analysis.degraded contract; gated script skips AI-only assertions when degraded"
+            Evidence    = "codeintel degraded suites; P4 Analysis.degraded contract; Playwright versions-code-degraded.spec.ts; gated script fails closed on degraded unless -AllowDegraded is passed explicitly"
         }
     )
     $p4Table = $p4DodMapping | Format-Table -AutoSize -Wrap | Out-String -Width 200

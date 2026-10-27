@@ -17,8 +17,12 @@
         deleted and the binary logo is updated (unsupported content).
 
     The author, committer, timestamps, branch and messages are fixed, so the
-    two commit SHAs are reproducible. The script always deletes and rebuilds the
-    repository (idempotent); E2E callers may therefore run it before every run.
+    two commit SHAs are reproducible. The environment variables
+    GIT_AUTHOR_NAME/EMAIL and GIT_COMMITTER_NAME/EMAIL are pinned to the fixture
+    identity and restored in `finally`; ambient or CI identities can therefore
+    never leak into the fixture history. The script always deletes and rebuilds
+    the repository (idempotent); E2E callers may therefore run it before every
+    run.
 
     It prints three machine-readable lines consumed by `scripts/e2e.ps1`:
       P4_FIXTURE_REPO=<absolute path with forward slashes>
@@ -117,209 +121,239 @@ function New-FixtureCommit {
     Invoke-Git @("commit", "--quiet", "--no-gpg-sign", "-m", $Message)
 }
 
-if (Test-Path -LiteralPath $fixtureDir) {
-    Remove-Item -LiteralPath $fixtureDir -Recurse -Force
+# Pin every Git identity variable, not just the repository-local user.name and
+# user.email: GIT_AUTHOR_NAME/EMAIL and GIT_COMMITTER_NAME/EMAIL override the
+# local config, so an ambient/CI identity would otherwise change the commit
+# SHAs. Capture and restore the previous values (including the date variables
+# New-FixtureCommit sets) so the caller's environment is left untouched.
+$identityEnv = [ordered]@{
+    GIT_AUTHOR_NAME     = $authorName
+    GIT_AUTHOR_EMAIL    = $authorEmail
+    GIT_COMMITTER_NAME  = $authorName
+    GIT_COMMITTER_EMAIL = $authorEmail
 }
-Ensure-FixtureDirectory -Path $fixtureDir
-
-Invoke-Git @("init", "--quiet")
-Invoke-Git @("symbolic-ref", "HEAD", "refs/heads/$branch")
-Invoke-Git @("config", "user.name", $authorName)
-Invoke-Git @("config", "user.email", $authorEmail)
-Invoke-Git @("config", "core.autocrlf", "false")
-Invoke-Git @("config", "commit.gpgsign", "false")
-
-# --- commit 1: initial application -----------------------------------------
-
-Write-FixtureText "src/api/refund.ts" @(
-    '// Refund API client used by the orders flow.'
-    'export async function requestRefund(orderId: string): Promise<void> {'
-    '  const response = await fetch("/api/refund", {'
-    '    method: "POST",'
-    '    headers: { "Content-Type": "application/json" },'
-    '    body: JSON.stringify({ orderId }),'
-    '  })'
-    '  if (!response.ok) {'
-    '    throw new Error("refund request failed: " + response.status)'
-    '  }'
-    '}'
-)
-
-Write-FixtureText "src/router.ts" @(
-    'import { createRouter } from "./framework"'
-    ''
-    'export const router = createRouter()'
-    ''
-    'router.get("/orders", async (context) => {'
-    '  return context.render("OrdersPage")'
-    '})'
-)
-
-Write-FixtureText "src/pages/OrdersPage.tsx" @(
-    'import { requestRefund } from "../api/refund"'
-    ''
-    'export function OrdersPage({ orders }: { orders: Order[] }) {'
-    '  const refund = async (orderId: string) => {'
-    '    await requestRefund(orderId)'
-    '  }'
-    ''
-    '  return <OrderList orders={orders} onRefund={refund} />'
-    '}'
-)
-
-Write-FixtureText "server/refund.go" @(
-    'package server'
-    ''
-    'import ('
-    '	"encoding/json"'
-    '	"net/http"'
-    ')'
-    ''
-    'type refundRequest struct {'
-    '	OrderID string `json:"orderId"`'
-    '}'
-    ''
-    'func registerRefundRoutes(mux *http.ServeMux) {'
-    '	mux.HandleFunc("POST /api/refund", handleRefund)'
-    '}'
-    ''
-    'func handleRefund(w http.ResponseWriter, r *http.Request) {'
-    '	var request refundRequest'
-    '	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {'
-    '		http.Error(w, "invalid request", http.StatusBadRequest)'
-    '		return'
-    '	}'
-    '	w.WriteHeader(http.StatusNoContent)'
-    '}'
-)
-
-Write-FixtureText "src/utils/format.ts" @(
-    'export function formatAmount(value: number): string {'
-    '  return value.toFixed(2)'
-    '}'
-)
-
-Write-FixtureText "src/legacy/old.ts" @(
-    'export const legacyRefundNote = "superseded by src/api/refund.ts"'
-)
-
-# 1x1 transparent PNG; a real binary blob so git reports it as binary.
-$logoBytes = [System.Convert]::FromBase64String(
-    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
-)
-Write-FixtureBytes "assets/logo.png" $logoBytes
-
-New-FixtureCommit -Message $commit1Message -Timestamp $commit1Date
-$baseCommit = Get-GitText @("rev-parse", "HEAD")
-
-# --- commit 2: cross-stack `reason` parameter -------------------------------
-
-Write-FixtureText "src/api/refund.ts" @(
-    '// Refund API client used by the orders flow.'
-    'export type RefundRequest = { orderId: string; reason: string }'
-    ''
-    'export async function requestRefund(input: RefundRequest): Promise<void> {'
-    '  const response = await fetch("/api/refund", {'
-    '    method: "POST",'
-    '    headers: { "Content-Type": "application/json" },'
-    '    body: JSON.stringify(input),'
-    '  })'
-    '  if (!response.ok) {'
-    '    throw new Error("refund request failed: " + response.status)'
-    '  }'
-    '}'
-)
-
-Write-FixtureText "src/router.ts" @(
-    'import { createRouter } from "./framework"'
-    ''
-    'export const router = createRouter()'
-    ''
-    'router.get("/orders", async (context) => {'
-    '  return context.render("OrdersPage")'
-    '})'
-    ''
-    'router.get("/orders/refund", async (context) => {'
-    '  return context.render("OrdersPage", { focus: "refund" })'
-    '})'
-)
-
-Write-FixtureText "src/pages/OrdersPage.tsx" @(
-    'import { requestRefund } from "../api/refund"'
-    ''
-    'export function OrdersPage({ orders }: { orders: Order[] }) {'
-    '  const refund = async (orderId: string) => {'
-    '    await requestRefund({ orderId, reason: "customer request" })'
-    '  }'
-    ''
-    '  return <OrderList orders={orders} onRefund={refund} />'
-    '}'
-)
-
-Write-FixtureText "server/refund.go" @(
-    'package server'
-    ''
-    'import ('
-    '	"encoding/json"'
-    '	"net/http"'
-    ')'
-    ''
-    'type refundRequest struct {'
-    '	OrderID string `json:"orderId"`'
-    '	Reason  string `json:"reason"`'
-    '}'
-    ''
-    'func registerRefundRoutes(mux *http.ServeMux) {'
-    '	mux.HandleFunc("POST /api/refund", handleRefund)'
-    '}'
-    ''
-    'func handleRefund(w http.ResponseWriter, r *http.Request) {'
-    '	var request refundRequest'
-    '	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {'
-    '		http.Error(w, "invalid request", http.StatusBadRequest)'
-    '		return'
-    '	}'
-    '	w.WriteHeader(http.StatusNoContent)'
-    '}'
-)
-
-Write-FixtureText "src/utils/format.ts" @(
-    'export function formatAmount(value: number, currency: string): string {'
-    '  const scale = currency === "JPY" ? 0 : 2'
-    '  return `${currency} ${value.toFixed(scale)}`'
-    '}'
-)
-
-# The binary update is deterministic: the v1 bytes plus a fixed ASCII trailer.
-$logoBytesV2 = [byte[]]($logoBytes + [System.Text.Encoding]::ASCII.GetBytes("P4 fixture logo v2"))
-Write-FixtureBytes "assets/logo.png" $logoBytesV2
-
-Invoke-Git @("rm", "--quiet", "src/legacy/old.ts")
-
-New-FixtureCommit -Message $commit2Message -Timestamp $commit2Date
-$headCommit = Get-GitText @("rev-parse", "HEAD")
-
-Remove-Item Env:GIT_AUTHOR_DATE -ErrorAction SilentlyContinue
-Remove-Item Env:GIT_COMMITTER_DATE -ErrorAction SilentlyContinue
-
-# --- verification: deterministic shape -------------------------------------
-
-$commitCount = Get-GitText @("rev-list", "--count", "HEAD")
-if ($commitCount -ne "2") {
-    throw "the fixture must contain exactly two commits, found $commitCount"
+$identityEnvKeys = @($identityEnv.Keys) + @("GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE")
+$previousEnvironment = @{}
+foreach ($key in $identityEnvKeys) {
+    $previousEnvironment[$key] = [System.Environment]::GetEnvironmentVariable($key, [System.EnvironmentVariableTarget]::Process)
 }
-if ($baseCommit -notmatch '^[0-9a-f]{40}$' -or $headCommit -notmatch '^[0-9a-f]{40}$') {
-    throw "unexpected commit SHAs: base=$baseCommit head=$headCommit"
-}
-$status = Get-GitText @("status", "--porcelain")
-if ($status -ne "") {
-    throw "the fixture worktree is not clean: $status"
-}
-$currentBranch = Get-GitText @("rev-parse", "--abbrev-ref", "HEAD")
-if ($currentBranch -ne $branch) {
-    throw "the fixture must be on branch $branch, found $currentBranch"
+foreach ($key in @($identityEnv.Keys)) {
+    Set-Item -Path ("Env:" + $key) -Value $identityEnv[$key]
 }
 
-Write-Output ("P4_FIXTURE_REPO=" + ($fixtureDir -replace '\\', '/'))
-Write-Output ("P4_FIXTURE_BASE_COMMIT=" + $baseCommit)
-Write-Output ("P4_FIXTURE_HEAD_COMMIT=" + $headCommit)
+try {
+    if (Test-Path -LiteralPath $fixtureDir) {
+        Remove-Item -LiteralPath $fixtureDir -Recurse -Force
+    }
+    Ensure-FixtureDirectory -Path $fixtureDir
+
+    Invoke-Git @("init", "--quiet")
+    Invoke-Git @("symbolic-ref", "HEAD", "refs/heads/$branch")
+    Invoke-Git @("config", "user.name", $authorName)
+    Invoke-Git @("config", "user.email", $authorEmail)
+    Invoke-Git @("config", "core.autocrlf", "false")
+    Invoke-Git @("config", "commit.gpgsign", "false")
+
+    # --- commit 1: initial application -----------------------------------------
+
+    Write-FixtureText "src/api/refund.ts" @(
+        '// Refund API client used by the orders flow.'
+        'export async function requestRefund(orderId: string): Promise<void> {'
+        '  const response = await fetch("/api/refund", {'
+        '    method: "POST",'
+        '    headers: { "Content-Type": "application/json" },'
+        '    body: JSON.stringify({ orderId }),'
+        '  })'
+        '  if (!response.ok) {'
+        '    throw new Error("refund request failed: " + response.status)'
+        '  }'
+        '}'
+    )
+
+    Write-FixtureText "src/router.ts" @(
+        'import { createRouter } from "./framework"'
+        ''
+        'export const router = createRouter()'
+        ''
+        'router.get("/orders", async (context) => {'
+        '  return context.render("OrdersPage")'
+        '})'
+    )
+
+    Write-FixtureText "src/pages/OrdersPage.tsx" @(
+        'import { requestRefund } from "../api/refund"'
+        ''
+        'export function OrdersPage({ orders }: { orders: Order[] }) {'
+        '  const refund = async (orderId: string) => {'
+        '    await requestRefund(orderId)'
+        '  }'
+        ''
+        '  return <OrderList orders={orders} onRefund={refund} />'
+        '}'
+    )
+
+    Write-FixtureText "server/refund.go" @(
+        'package server'
+        ''
+        'import ('
+        '	"encoding/json"'
+        '	"net/http"'
+        ')'
+        ''
+        'type refundRequest struct {'
+        '	OrderID string `json:"orderId"`'
+        '}'
+        ''
+        'func registerRefundRoutes(mux *http.ServeMux) {'
+        '	mux.HandleFunc("POST /api/refund", handleRefund)'
+        '}'
+        ''
+        'func handleRefund(w http.ResponseWriter, r *http.Request) {'
+        '	var request refundRequest'
+        '	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {'
+        '		http.Error(w, "invalid request", http.StatusBadRequest)'
+        '		return'
+        '	}'
+        '	w.WriteHeader(http.StatusNoContent)'
+        '}'
+    )
+
+    Write-FixtureText "src/utils/format.ts" @(
+        'export function formatAmount(value: number): string {'
+        '  return value.toFixed(2)'
+        '}'
+    )
+
+    Write-FixtureText "src/legacy/old.ts" @(
+        'export const legacyRefundNote = "superseded by src/api/refund.ts"'
+    )
+
+    # 1x1 transparent PNG; a real binary blob so git reports it as binary.
+    $logoBytes = [System.Convert]::FromBase64String(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+    )
+    Write-FixtureBytes "assets/logo.png" $logoBytes
+
+    New-FixtureCommit -Message $commit1Message -Timestamp $commit1Date
+    $baseCommit = Get-GitText @("rev-parse", "HEAD")
+
+    # --- commit 2: cross-stack `reason` parameter -------------------------------
+
+    Write-FixtureText "src/api/refund.ts" @(
+        '// Refund API client used by the orders flow.'
+        'export type RefundRequest = { orderId: string; reason: string }'
+        ''
+        'export async function requestRefund(input: RefundRequest): Promise<void> {'
+        '  const response = await fetch("/api/refund", {'
+        '    method: "POST",'
+        '    headers: { "Content-Type": "application/json" },'
+        '    body: JSON.stringify(input),'
+        '  })'
+        '  if (!response.ok) {'
+        '    throw new Error("refund request failed: " + response.status)'
+        '  }'
+        '}'
+    )
+
+    Write-FixtureText "src/router.ts" @(
+        'import { createRouter } from "./framework"'
+        ''
+        'export const router = createRouter()'
+        ''
+        'router.get("/orders", async (context) => {'
+        '  return context.render("OrdersPage")'
+        '})'
+        ''
+        'router.get("/orders/refund", async (context) => {'
+        '  return context.render("OrdersPage", { focus: "refund" })'
+        '})'
+    )
+
+    Write-FixtureText "src/pages/OrdersPage.tsx" @(
+        'import { requestRefund } from "../api/refund"'
+        ''
+        'export function OrdersPage({ orders }: { orders: Order[] }) {'
+        '  const refund = async (orderId: string) => {'
+        '    await requestRefund({ orderId, reason: "customer request" })'
+        '  }'
+        ''
+        '  return <OrderList orders={orders} onRefund={refund} />'
+        '}'
+    )
+
+    Write-FixtureText "server/refund.go" @(
+        'package server'
+        ''
+        'import ('
+        '	"encoding/json"'
+        '	"net/http"'
+        ')'
+        ''
+        'type refundRequest struct {'
+        '	OrderID string `json:"orderId"`'
+        '	Reason  string `json:"reason"`'
+        '}'
+        ''
+        'func registerRefundRoutes(mux *http.ServeMux) {'
+        '	mux.HandleFunc("POST /api/refund", handleRefund)'
+        '}'
+        ''
+        'func handleRefund(w http.ResponseWriter, r *http.Request) {'
+        '	var request refundRequest'
+        '	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {'
+        '		http.Error(w, "invalid request", http.StatusBadRequest)'
+        '		return'
+        '	}'
+        '	w.WriteHeader(http.StatusNoContent)'
+        '}'
+    )
+
+    Write-FixtureText "src/utils/format.ts" @(
+        'export function formatAmount(value: number, currency: string): string {'
+        '  const scale = currency === "JPY" ? 0 : 2'
+        '  return `${currency} ${value.toFixed(scale)}`'
+        '}'
+    )
+
+    # The binary update is deterministic: the v1 bytes plus a fixed ASCII trailer.
+    $logoBytesV2 = [byte[]]($logoBytes + [System.Text.Encoding]::ASCII.GetBytes("P4 fixture logo v2"))
+    Write-FixtureBytes "assets/logo.png" $logoBytesV2
+
+    Invoke-Git @("rm", "--quiet", "src/legacy/old.ts")
+
+    New-FixtureCommit -Message $commit2Message -Timestamp $commit2Date
+    $headCommit = Get-GitText @("rev-parse", "HEAD")
+
+    # --- verification: deterministic shape -------------------------------------
+
+    $commitCount = Get-GitText @("rev-list", "--count", "HEAD")
+    if ($commitCount -ne "2") {
+        throw "the fixture must contain exactly two commits, found $commitCount"
+    }
+    if ($baseCommit -notmatch '^[0-9a-f]{40}$' -or $headCommit -notmatch '^[0-9a-f]{40}$') {
+        throw "unexpected commit SHAs: base=$baseCommit head=$headCommit"
+    }
+    $status = Get-GitText @("status", "--porcelain")
+    if ($status -ne "") {
+        throw "the fixture worktree is not clean: $status"
+    }
+    $currentBranch = Get-GitText @("rev-parse", "--abbrev-ref", "HEAD")
+    if ($currentBranch -ne $branch) {
+        throw "the fixture must be on branch $branch, found $currentBranch"
+    }
+
+    Write-Output ("P4_FIXTURE_REPO=" + ($fixtureDir -replace '\\', '/'))
+    Write-Output ("P4_FIXTURE_BASE_COMMIT=" + $baseCommit)
+    Write-Output ("P4_FIXTURE_HEAD_COMMIT=" + $headCommit)
+} finally {
+    # Restore every identity/date variable even when a git command fails, so the
+    # caller's environment (and later fixture runs) stay deterministic.
+    foreach ($key in $identityEnvKeys) {
+        $previous = $previousEnvironment[$key]
+        if ($null -eq $previous) {
+            Remove-Item -Path ("Env:" + $key) -ErrorAction SilentlyContinue
+        } else {
+            Set-Item -Path ("Env:" + $key) -Value $previous
+        }
+    }
+}
