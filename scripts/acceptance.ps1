@@ -609,7 +609,15 @@ try {
             foreach ($needle in @(
                     "/api/agents/sessions",
                     "agent.activity",
-                    "reasoning_tokens"
+                    "reasoning_tokens",
+                    # P2 resources contract: the resource paths plus the two
+                    # write-only markers proving credentials and storage state
+                    # are represented without ever echoing their values.
+                    "/api/resources/systems",
+                    "/api/resources/sessions",
+                    "/api/resources/code-repos",
+                    "storageState",
+                    "credentialSet"
                 )) {
                 if ($openapi -notmatch [regex]::Escape($needle)) {
                     throw "docs/openapi/api.yaml is missing $needle"

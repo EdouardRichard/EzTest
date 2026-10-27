@@ -1,8 +1,9 @@
 # EzTest
 
-EzTest 的 P0 基础阶段（foundation）与 P1 Agent 运行时地基实现：Go 后端 API、Next.js 管理前端、PostgreSQL 持久化，以及 SSE 事件流、对象存储、审计、LLM 配置管理，和可对话、可调工具、可实时展示/中止/回放的 Agent 控制台。
+EzTest 的 P0 基础阶段（foundation）、P1 Agent 运行时与 P2 公共资源/身份实现：Go 后端 API、Next.js 管理前端、PostgreSQL 持久化，以及 SSE 事件流、对象存储、审计、LLM 配置管理、可对话/可调工具/可实时展示、中止与回放的 Agent 控制台，和系统/环境/账号/Session/本地代码仓等公共资源管理。
 
-- 分支：`feat/p1-agent-runtime`
+- 分支：`feat/p2-resources-identity`
+- P2 阶段规格：[`docs/superpowers/specs/2026-10-27-eztest-p2-resources-identity-design.md`](docs/superpowers/specs/2026-10-27-eztest-p2-resources-identity-design.md)
 - P1 阶段规格：[`docs/superpowers/specs/2026-10-27-eztest-p1-agent-runtime-design.md`](docs/superpowers/specs/2026-10-27-eztest-p1-agent-runtime-design.md)
 - P0 阶段规格：[`docs/superpowers/specs/2026-10-27-eztest-p0-foundation-design.md`](docs/superpowers/specs/2026-10-27-eztest-p0-foundation-design.md)
 - OpenAPI：[`docs/openapi/api.yaml`](docs/openapi/api.yaml)（公开端点 `GET /api/openapi.yaml`）
@@ -19,7 +20,7 @@ EzTest 的 P0 基础阶段（foundation）与 P1 Agent 运行时地基实现：G
 - 对象存储：内容寻址（SHA-256）、本地文件系统、10 MiB 上限、下载时完整性校验。
 - 审计：管理员查询、登录/用户/LLM/存储/测试事件动作记录。
 - 统一约定：`{"data": ...}` 成功信封、统一错误信封与错误码、`X-Request-ID`、幂等键、CORS、健康检查、OpenAPI。
-- 本地开发脚本、E2E、P0/P1 验收入口；Docker/Compose 交付文件与静态校验。
+- 本地开发脚本、E2E、P0/P1/P2 验收入口；Docker/Compose 交付文件与静态校验。
 
 P0 **不包含**版本/需求/用例/执行/证据/问题/报告等业务实体与页面，也不包含代码仓库管理、多实例/多租户等能力（详见 P0 阶段规格 §16）。Agent 运行时不在 P0 内，由 P1 在 P0 之上补齐。
 
@@ -36,12 +37,34 @@ P1 在 P0 的事件流、LLM 网关与权限模型之上增加一个可用的 Ag
 - 本地启动：先按「本地启动」运行 API/Web，管理员登录后进入 `/agents`。要让文件工具可用，设置 `EZTEST_AGENT_FILE_ROOT=<仓库根绝对路径>` 并重启 API（`scripts/dev-api.ps1` 在未设置时默认使用仓库根，`.env` 显式设置优先）；内置 profile 的 `allowed_tools` 已列出文件工具，未设置时运行时会拒绝调用。通常无需重新保存 profile，只有曾在禁用状态下把文件工具从白名单移除过，才需要在启用后重新保存。
 - 测试：Agent 单元/集成套件 `go test ./internal/agent/...` 与 `go test -tags=integration ./internal/agent/...`；`scripts/e2e.ps1` 会启动 fake 上游 `scripts/fake-llm.cjs`（默认 13334）并覆盖 `llm_*`，P0+P1 E2E 不产生真实费用。真实 `deepseek-flash` 的思考 + 工具验收是 gated（见下文「真实 LLM（gated）」）。
 
+## P2 公共资源与身份
+
+P2 增加 `resource` 限界上下文与公共资源页面；`/api/resources/*` 的所有 GET 对任意已登录用户开放，所有写操作与动作仅管理员可用（普通用户只读，写 API 返回 403）。
+
+- 页面：`/resources` 四个 Tab —— 系统与环境、应用模型、账号与访问、会话；支持 `?tab=systems&system=<id>`、`?tab=sessions&session=<id>` 深链。`/code-repos` 管理本地代码仓（创建/编辑/删除/重新校验），显示 `localPath`、`fixedBranch` 与 `lastCommit`；代码索引是 P4 占位。
+- Session：从 Access 导入 Playwright `storageState` 或 token `headers`；状态为 `pending`/`acquiring`/`needs_manual`/`valid`/`refreshing`/`expired`/`invalid`/`revoked`/`failed`（`expiring` 为派生标记）。动作为导入 → validate/confirm（login_check 不可用时人工确认，快照标记 degraded）→ invalidate/revoke，以及人工接管（发起/完成/取消）。API 只暴露摘要（`storageStateHash`、cookie/origin 计数），不返回凭据或 `storageState` 原文。
+- 凭据与状态（D28）：Access 的 `credential` 与 Session 的 `storageState` **明文存储**，P2 不实现加密、脱敏与审计日志；API 永不回显原文，只返回 `credentialSet` 与 storageState 的 hash/形状统计。P2 不新增 EzTest 环境变量（fixture 的 `FIXTURE_PORT` 仅测试脚本使用）。
+- fixture：`node scripts/fixture-target.cjs`（默认 `127.0.0.1:13335`，可用 `FIXTURE_PORT` 覆盖）提供 `/login`（`fixture` / `fixture-pass`）、`/account`、`/api/profile`（`Authorization: Bearer fixture-token`）与 `/health`，用于导入真实 storageState / token 的验收；`scripts/e2e.ps1` 会自动启动并停止它。
+- 验收命令：
+
+```powershell
+# 快速门禁（Go 单元 + 集成 + 前端 lint/typecheck/test）
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test.ps1
+# 资源域细粒度
+cd backend; ..\.tools\go\bin\go.exe test -count=1 ./internal/resource/...
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-integration.ps1 ./internal/resource/...
+# E2E（含 fixture target）
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1
+# 完整 P0/P1/P2 验收（含 OpenAPI 契约关键词检查）
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1
+```
+
 ## 技术架构
 
 ### 后端（`backend/`）
 
 - Go 1.24，标准库 `net/http`（Go 1.22+ 方法路由），`pgx/v5` 连接 PostgreSQL 17。
-- DDD 限界上下文：`identity`、`eventing`、`llm`、`storage`、`audit`，以及 P1 的 `agent`；每个上下文四层（`domain` / `application` / `infrastructure` / `interfaces/httpapi`），导入方向约束见 `Agent.md` §6.2。
+- DDD 限界上下文：`identity`、`eventing`、`llm`、`storage`、`audit`、P1 的 `agent` 与 P2 的 `resource`；每个上下文四层（`domain` / `application` / `infrastructure` / `interfaces/httpapi`），导入方向约束见 `Agent.md` §6.2。
 - `cmd/eztest` 是唯一组装根：读取配置、连接数据库、执行迁移、种子管理员/默认 LLM 配置/内置 Agent profile、清理 `interrupted` run、装配 HTTP 服务、在 SIGINT/SIGTERM 时先停止 Agent run 再优雅退出。
 - `internal/server` 只装配路由与中间件：recover → request ID → 日志 → CORS → 认证 → 幂等 → 路由。
 - `internal/platform` 放共享的纯基础设施：错误信封、分页游标、JSON 解码、请求 ID、AES keyring、幂等存储。
@@ -51,7 +74,7 @@ P1 在 P0 的事件流、LLM 网关与权限模型之上增加一个可用的 Ag
 ### 前端（`frontend/`）
 
 - Next.js 16 App Router、React 19、TypeScript、Tailwind CSS 4、Radix 原语、`next-themes`、lucide-react。
-- `src/app/` 只做路由/布局/页面组装；业务在 `src/features/{auth,users,llm-settings,sse-test,agent-console,shell}`；共享 UI 原语在 `src/components/ui/`，跨 feature 导航在 `src/navigation/`。P1 的 `/agents` 页面由 `agent-console` 提供。
+- `src/app/` 只做路由/布局/页面组装；业务在 `src/features/{auth,users,llm-settings,sse-test,agent-console,resources,code-repos,shell}`；共享 UI 原语在 `src/components/ui/`，跨 feature 导航在 `src/navigation/`。P1 的 `/agents` 页面由 `agent-console` 提供，P2 的 `/resources`（四 Tab）与 `/code-repos` 分别由 `resources`、`code-repos` 提供。
 - 所有 HTTP 请求经 `src/lib/api-client.ts`（Bearer、错误信封、`X-Request-ID`、幂等键）；SSE 经 `src/lib/sse-client.ts`（fetch 流、`Last-Event-ID`、退避重连、心跳超时）。
 - 质量工具：Biome（lint/format）、Vitest + Testing Library、Playwright（使用本机 Chrome/Edge channel，不下载 Chromium）。
 
@@ -79,19 +102,20 @@ EzTest/
 │     ├─ eventing/                    # 事件/SSE（四层）
 │     ├─ llm/                         # LLM 配置/网关（四层）
 │     ├─ agent/                       # P1 Agent 运行时（四层）
+│     ├─ resource/                    # P2 公共资源/身份（四层）
 │     ├─ storage/                     # 对象存储（四层）
 │     └─ audit/                       # 审计（四层）
 ├─ frontend/
-│  ├─ src/app/                        # Next.js App Router 页面组装（含 /agents）
-│  ├─ src/features/                   # auth/users/llm-settings/sse-test/agent-console/shell
+│  ├─ src/app/                        # Next.js App Router 页面组装（含 /agents、/resources、/code-repos）
+│  ├─ src/features/                   # auth/users/llm-settings/sse-test/agent-console/resources/code-repos/shell
 │  ├─ src/components/ui/              # 共享 UI 原语（StatusBadge/EmptyState）
 │  ├─ src/navigation/                 # 跨 feature 导航数据（侧边栏）
 │  ├─ src/lib/                        # api-client / sse-client / auth-storage
 │  ├─ scripts/validate-compose.mjs    # Compose 静态校验
-│  └─ e2e/                            # Playwright（P0 + Agent 控制台）
+│  └─ e2e/                            # Playwright E2E（由 scripts/e2e.ps1 编排）
 ├─ deploy/                            # Dockerfile.api / Dockerfile.web / docker-compose.yml
-├─ scripts/                           # db/dev-api/dev-web/test/e2e/acceptance/fake-llm/acceptance-agent-llm
-├─ docs/openapi/api.yaml              # 手工维护的 OpenAPI 3.0（P0 + P1）
+├─ scripts/                           # db/dev-api/dev-web/test/e2e/acceptance/fake-llm/fixture-target/acceptance-agent-llm
+├─ docs/openapi/api.yaml              # 手工维护的 OpenAPI 3.0（P0 + P1 + P2）
 ├─ .env.example                       # 环境变量模板（无真实秘密）
 ├─ .tools/                            # 便携 Go/PostgreSQL（gitignored）
 └─ README.md
@@ -173,6 +197,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/dev-web.ps1
 
 - Web：<http://localhost:6868>
 - Agent 控制台：<http://localhost:6868/agents>（管理员登录后；普通用户显示仅管理员可用）
+- 公共资源：<http://localhost:6868/resources>（四 Tab；普通用户只读）
+- 代码仓：<http://localhost:6868/code-repos>（普通用户只读）
 - API 健康：<http://localhost:13333/api/health>
 - OpenAPI：<http://localhost:13333/api/openapi.yaml>
 
@@ -205,11 +231,12 @@ pnpm dev
 
 ## API 概览
 
-基础约定（详见 OpenAPI 与 P0 规格 §9、P1 规格 §9–§10）：
+基础约定（详见 OpenAPI 与 P0 规格 §9、P1 规格 §9–§10、P2 规格 §7）：
 
 - 成功：`{"data": ...}`；列表：`{"data":[...],"next_cursor":"...","has_more":true}`。Agent session 列表是例外：`{"data":{"items":[...],"has_more":true,"next_cursor":null}}`。
-- 错误：`{"error":{"code","message","request_id","retryable","details"}}`；错误码为闭集（`invalid_argument`、`unauthenticated`、`forbidden`、`not_found`、`conflict`、`idempotency_conflict`、`rate_limited`、`internal`、`unavailable`、`storage_corrupted`、`llm_*`）。Agent 冲突/503 在 `details.reason` 中给出具体原因（`run_active`、`profile_disabled`、`llm_not_configured`、`tools_require_chat_completions`、`capacity`）。
+- 错误：`{"error":{"code","message","request_id","retryable","details"}}`；错误码为闭集（`invalid_argument`、`unauthenticated`、`forbidden`、`not_found`、`conflict`、`idempotency_conflict`、`rate_limited`、`internal`、`unavailable`、`storage_corrupted`、`llm_*`）。Agent 冲突/503 在 `details.reason` 中给出具体原因（`run_active`、`profile_disabled`、`llm_not_configured`、`tools_require_chat_completions`、`capacity`）；P2 资源冲突/422 同样用 `details.reason`（如 `duplicate_key`、`session_state_conflict`、`invalid_storage_state`、`path_not_git_repo`）。
 - 认证：`Authorization: Bearer <token>`；登录返回的 token 只出现一次。`/api/agents/*` 与 `agent:` 通道要求管理员。
+- P2 公共资源：`/api/resources/*` 使用 camelCase 字段（P0/P1 为 snake_case）；GET 对任意登录用户开放，写/动作仅管理员；`credential` 与 `storageState` 只写不读，响应只含 `credentialSet` 与 storageState hash/形状统计。
 - `X-Request-ID` 可传入 `^[A-Za-z0-9_-]{8,128}$`，否则生成 UUID；响应回显。
 - 认证写接口支持 `Idempotency-Key`（24h 重放，同 key 不同 body 为 409）。
 - CORS 只允许 `EZTEST_WEB_ORIGIN`；SSE 支持 `Last-Event-ID`。Agent 活动事件为 `type=agent.activity`、`channel=agent:{session_id}`，复用 P0 快照与 SSE；9 类 `detail.kind` 见 P1 章节与 OpenAPI `AgentActivityDetail`。
@@ -222,6 +249,9 @@ pnpm dev
 | 用户（管理员） | `GET/POST /api/users`、`GET/PATCH /api/users/{id}`、`POST /api/users/{id}/reset-password` |
 | LLM（管理员） | `GET/POST /api/admin/llm/configs`、`PATCH/DELETE /api/admin/llm/configs/{id}`、`POST /api/admin/llm/configs/{id}/catalog/refresh`、`POST /api/admin/llm/configs/{id}/test` |
 | Agent（管理员） | `GET /api/agents/profiles`、`GET/PATCH /api/agents/profiles/{id}`、`GET /api/agents/tools`、`GET/POST /api/agents/sessions`、`GET/PATCH/DELETE /api/agents/sessions/{id}`、`POST /api/agents/sessions/{id}/messages`、`POST /api/agents/sessions/{id}/stop`、`GET /api/agents/sessions/{id}/messages/{message_id}` |
+| 公共资源（读=登录用户，写=管理员） | 系统/环境：`GET/POST /api/resources/systems`、`GET/PATCH/DELETE /api/resources/systems/{id}`、`GET/POST /api/resources/systems/{id}/environments`、`GET/PATCH/DELETE /api/resources/environments/{id}`；应用模型：`GET/POST /api/resources/systems/{id}/app-models`、`POST /api/resources/systems/{id}/app-models/import`、`GET/PATCH/DELETE /api/resources/app-models/{id}`；账号/Access：`GET/POST /api/resources/accounts`、`GET/PATCH/DELETE /api/resources/accounts/{id}`、`GET/POST /api/resources/accounts/{id}/accesses`、`GET/PATCH/DELETE /api/resources/accesses/{id}` |
+| Session/接管（读=登录用户，写=管理员） | `GET /api/resources/sessions`、`GET /api/resources/sessions/{id}`、`POST /api/resources/accesses/{id}/sessions`、`POST /api/resources/sessions/{id}/validate`/`confirm`/`invalidate`/`revoke`、`GET /api/resources/sessions/{id}/snapshots`、`POST /api/resources/sessions/{id}/takeovers`、`GET /api/resources/takeovers`、`POST /api/resources/takeovers/{id}/complete`/`cancel` |
+| 本地代码仓（读=登录用户，写=管理员） | `GET/POST /api/resources/code-repos`、`GET/PATCH/DELETE /api/resources/code-repos/{id}`、`POST /api/resources/code-repos/{id}/validate` |
 | 事件流 | `GET /api/stream/events`、`GET /api/stream`（SSE）、`POST /api/admin/stream/test-events`（需开启测试端点）；`agent:` 通道仅管理员 |
 | 存储（管理员） | `POST /api/admin/storage/objects`、`GET /api/admin/storage/objects/{sha256}` |
 | 审计（管理员） | `GET /api/admin/audit` |
@@ -243,12 +273,12 @@ pnpm dev
 # 一键本地检查（Go 单元 + Go 集成 + 前端 lint/typecheck/test）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test.ps1
 
-# 完整 P0/P1 验收（Go 单元/集成、Agent 单元/集成、前端 lint/typecheck/test/build、
-# Playwright E2E、迁移重复执行、健康/审计断言、交付物与 OpenAPI/env 检查）
+# 完整 P0/P1/P2 验收（Go 单元/集成、Agent 单元/集成、前端 lint/typecheck/test/build、
+# Playwright E2E、迁移重复执行、健康/审计断言、交付物与 OpenAPI/env/P2 契约检查）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1
 
-# 仅 E2E（会自行启动/停止 API、Web 与 fake LLM 上游，使用 eztest_e2e 库；
-# 覆盖 P0 场景和 P1 Agent 控制台）
+# 仅 E2E（会自行启动/停止 API、Web、fake LLM 上游与 fixture target，使用 eztest_e2e 库；
+# 覆盖 P0 场景和 P1 Agent 控制台，fixture target 供 P2 Session 验收）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1
 
 # Compose 静态校验（不需要 Docker 守护进程）
@@ -271,8 +301,8 @@ node scripts/validate-compose.mjs
 验收说明：
 
 - 本机没有 Docker，`scripts/acceptance.ps1` 会把“Compose 容器运行”标为 **SKIPPED**；Compose 仅通过 `validate-compose.mjs` 做静态字段校验，不代表已运行验证。P1 真实 Agent LLM 验收同样标为 **SKIPPED**（见下节）。
-- 常规测试不访问真实 LLM：Go 测试使用 `httptest` mock（`/v1/chat/completions`、`/v1/responses`、`/v1/models`，可注入 429/5xx/超时/分片）；`scripts/e2e.ps1` 使用 `scripts/fake-llm.cjs`（127.0.0.1:13334）并覆盖 `llm_*`，P0+P1 E2E 零费用。
-- `acceptance.ps1` 额外校验 `docs/openapi/api.yaml` 含 `/api/agents/sessions`、`agent.activity`、`reasoning_tokens`，以及 `.env.example` 的 4 个 Agent 变量；P1 DoD（`implementation-phases.md` L105–108）与检查项/证据的映射会打印在汇总后。
+- 常规测试不访问真实 LLM：Go 测试使用 `httptest` mock（`/v1/chat/completions`、`/v1/responses`、`/v1/models`，可注入 429/5xx/超时/分片）；`scripts/e2e.ps1` 使用 `scripts/fake-llm.cjs`（127.0.0.1:13334）并覆盖 `llm_*`，E2E 零 LLM 费用。
+- `acceptance.ps1` 额外校验 `docs/openapi/api.yaml` 含 P1 的 `/api/agents/sessions`、`agent.activity`、`reasoning_tokens` 与 P2 的 `/api/resources/systems`、`/api/resources/sessions`、`/api/resources/code-repos`、`storageState`、`credentialSet`，以及 `.env.example` 的 4 个 Agent 变量；P1 DoD（`implementation-phases.md` L105–108）与检查项/证据的映射会打印在汇总后。
 - 通过条件：所有非 SKIPPED 检查 FAIL 数为 0，脚本退出码为 0。
 
 ## 真实 LLM（gated）
@@ -296,18 +326,19 @@ node scripts/validate-compose.mjs
 - **本机未安装 Docker**：镜像未构建、Compose 未启动；唯一验证是
   `cd frontend && node scripts/validate-compose.mjs`（解析 YAML，断言服务、端口、健康检查、卷、依赖顺序）。
 
-## 已知限制（P0/P1）
+## 已知限制（P0/P1/P2）
 
 - 单实例部署：SSE 的订阅与广播在进程内完成，不做多实例广播；重启/多副本会丢失实时连接（客户端可重连回放）。Agent run 也由进程内 runner 调度，重启时 `running` 会标记为 `interrupted`，P1 不做跨实例运行。
-- 权限：P1 的 `/api/agents/*`、`/agents` 页面与 `agent:` 事件通道均仅管理员可用；普通用户无 Agent 访问路径，P1 不做 per-user Agent 或 RBAC。
+- 权限：P1 的 `/api/agents/*`、`/agents` 页面与 `agent:` 事件通道均仅管理员可用；P2 的 `/api/resources/*` GET 对任意登录用户开放，写/动作仅管理员（普通用户只读）。P1/P2 均不做 per-user 授权或 RBAC。
 - Agent 工具：文件工具默认关闭（空 `EZTEST_AGENT_FILE_ROOT`）；`http.get` 只读、host allowlist、最多 3 次重定向、响应截断 1 MB；P1 不提供浏览器/数据库/写操作等业务工具。
+- P2 资源：Access 凭据与 Session 状态明文存储，且不写审计/事件流（D28）；Session 过期惰性判定、无后台 GC；代码仓仅本地路径校验，代码索引是 P4 占位；不提供自动登录、ProbeRecipe 或 Session 执行注入。
 - 登录 token 存 `sessionStorage`：属于单管理员内网工具的 XSS 边界，未做 CSP/HttpOnly cookie 会话。
 - 无 TLS、反向代理、限流网关或多租户/RBAC；管理员角色是唯一权限分层。
 - 对象存储只有本地内容寻址实现：无公开 URL、GC、保留期、去重清理。
 - LLM `base_url` 由管理员配置且被信任（P0 管理端测试不做 SSRF 白名单）；P1 Agent 工具调用另有 host allowlist。真实调用受上游可用性/限流/费用影响。
 - Compose/镜像仅静态交付，未在本机运行验证；Dockerfile 使用 `golang:1.24.6-alpine`、`node:22-alpine`、`alpine:3.21`，首次构建需要拉取镜像与依赖。
 - 迁移与数据备份需自行负责；丢失 `EZTEST_SECRET_KEYS` 会导致已加密的 LLM Key/headers 不可恢复。
-- 页面覆盖：P0 登录、概览、设置（用户/LLM/SSE 测试），P1 增加 `/agents` 控制台；其余侧边栏入口仍为占位页。
+- 页面覆盖：P0 登录、概览、设置（用户/LLM/SSE 测试），P1 增加 `/agents` 控制台，P2 增加 `/resources`（四 Tab）与 `/code-repos`；其余侧边栏入口仍为占位页。
 
 ## 许可证
 
