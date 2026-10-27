@@ -38,6 +38,7 @@ $webBaseUrl = "http://localhost:$webPort"
 $fakeLlmBaseUrl = "http://127.0.0.1:$fakeLlmPort"
 $fixtureBaseUrl = "http://127.0.0.1:$fixturePort"
 $p3AttachmentDir = Join-Path $tmpDir "p3-attachments"
+$p4FixtureScript = Join-Path $PSScriptRoot "fixture-codeintel-repo.ps1"
 
 New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
 
@@ -295,6 +296,36 @@ try {
         Remove-Item Env:PGPASSWORD -ErrorAction SilentlyContinue
     }
 
+    # P4 code-intelligence E2E fixture (design spec §10.2): a gitignored,
+    # deterministic two-commit repository under .tmp. The script always rebuilds
+    # it, so running the suite repeatedly is safe. Its commit SHAs are exposed to
+    # Playwright through EZTEST_E2E_P4_* variables below.
+    Write-Step "Preparing P4 code-intelligence fixture repository"
+    if (-not (Test-Path -LiteralPath $p4FixtureScript)) {
+        throw "Missing $p4FixtureScript; the P4 E2E fixture cannot be created"
+    }
+    $p4FixtureOutput = & powershell -NoProfile -ExecutionPolicy Bypass -File $p4FixtureScript
+    if ($LASTEXITCODE -ne 0) {
+        throw "fixture-codeintel-repo.ps1 failed with exit code $LASTEXITCODE"
+    }
+    $p4FixtureValues = @{}
+    foreach ($line in @($p4FixtureOutput)) {
+        if (("$line") -match '^(P4_FIXTURE_[A-Z_]+)=(.*)$') {
+            $p4FixtureValues[$matches[1]] = $matches[2].Trim()
+        }
+    }
+    foreach ($key in @("P4_FIXTURE_REPO", "P4_FIXTURE_BASE_COMMIT", "P4_FIXTURE_HEAD_COMMIT")) {
+        if (-not $p4FixtureValues.ContainsKey($key) -or [string]::IsNullOrWhiteSpace([string]$p4FixtureValues[$key])) {
+            throw "fixture-codeintel-repo.ps1 did not print $key"
+        }
+    }
+    $env:EZTEST_E2E_P4_REPO = [string]$p4FixtureValues["P4_FIXTURE_REPO"]
+    $env:EZTEST_E2E_P4_BASE_COMMIT = [string]$p4FixtureValues["P4_FIXTURE_BASE_COMMIT"]
+    $env:EZTEST_E2E_P4_HEAD_COMMIT = [string]$p4FixtureValues["P4_FIXTURE_HEAD_COMMIT"]
+    $env:EZTEST_E2E_P4_BRANCH = "main"
+    Write-Host "P4 fixture repository is ready at $($env:EZTEST_E2E_P4_REPO)"
+    Write-Host "P4 fixture base=$($env:EZTEST_E2E_P4_BASE_COMMIT) head=$($env:EZTEST_E2E_P4_HEAD_COMMIT)"
+
     Write-Step "Building API"
     Push-Location $backendDir
     try {
@@ -312,6 +343,12 @@ try {
     # Enables the deterministic P3 clarification/analysis/recon scenarios (they
     # are inert for the P1/P2 scenarios when a request carries no P3 marker).
     $env:EZTEST_FAKE_LLM_P3 = "1"
+    # P4 fake scenario switch (design spec §10.2): ok|error|partial|impact-ai.
+    # A caller-provided value (e.g. a degraded-mode run) is preserved.
+    if ([string]::IsNullOrWhiteSpace($env:EZTEST_FAKE_LLM_P4_MODE)) {
+        $env:EZTEST_FAKE_LLM_P4_MODE = "ok"
+    }
+    Write-Host "P4 fake LLM mode: $env:EZTEST_FAKE_LLM_P4_MODE"
     Remove-Item -LiteralPath $fakeOut, $fakeErr, $fakeRequestLog -ErrorAction SilentlyContinue
     $fakeProcess = Start-Process -FilePath $nodeExe `
         -ArgumentList "`"scripts/fake-llm.cjs`"" `
@@ -324,6 +361,8 @@ try {
     Write-Host "Fake LLM is ready at $fakeLlmBaseUrl"
 
     Write-Step "Starting API on :$apiPort (database $e2eDbName)"
+    # cmd/eztest applies all pending migrations (including P4 codeintel) on
+    # startup, before /api/health reports healthy.
     $env:EZTEST_ENV = "dev"
     $env:EZTEST_DATABASE_URL = $e2eDatabaseUrl
     $env:EZTEST_HTTP_ADDR = ":$apiPort"

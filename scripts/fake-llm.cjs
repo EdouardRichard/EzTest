@@ -62,6 +62,124 @@ const P3 = {
   RECON_REPLY: "P3 侦察完成：已记录上下文摘要。",
 };
 
+// --- P4 deterministic code-intelligence scenarios (design spec §10.2) -------
+//
+// P4 requests are identified by the stable system-prompt markers of design
+// spec §8.3/§8.4. File analysis answers per repository-relative path with facts
+// whose evidence line ranges match the fixture repository created by
+// scripts/fixture-codeintel-repo.ps1 (`.tmp/p4-e2e-repo`, HEAD commit). Impact
+// reasoning returns no candidate by default; EZTEST_FAKE_LLM_P4_MODE=impact-ai
+// returns the requirement whose title carries P4-AI-IMPACT (or, when no title
+// carries it, the first requirement of the given list).
+//
+// Modes (§10.2): ok (default) | error (HTTP 500 for P4 analysis requests) |
+// partial (one file answers with invalid JSON) | impact-ai (ok facts + AI
+// impact candidate). The requests are appended compactly — kind/path/commit/
+// mode only — to .tmp/fake-llm-requests.jsonl: never the prompt or code body.
+const P4_FILE_ANALYZER_MARKER = "EzTest 的只读代码分析器";
+const P4_IMPACT_ANALYZER_MARKER = "EzTest 的只读变更影响分析器";
+const P4_IMPACT_TITLE_MARKER = "P4-AI-IMPACT";
+const P4_PARTIAL_INVALID_PATH = "src/router.ts";
+const P4_MODES = new Set(["ok", "error", "partial", "impact-ai"]);
+const P4_USAGE = makeUsage(1024, 192, 0);
+
+// Line ranges below are pinned to the fixture HEAD commit content. They are
+// verified against the real fixture files by scripts/fake-llm.p4.test.cjs.
+const P4_FILE_TEMPLATES = {
+  "src/api/refund.ts": {
+    changeSummary: "退款 API 客户端：使用 POST /api/refund 提交退款请求，本次新增 reason 参数。",
+    facts: [
+      {
+        kind: "client_call",
+        name: "POST /api/refund",
+        startLine: 4,
+        endLine: 6,
+        signature: "requestRefund(input: RefundRequest)",
+        confidence: "high",
+        summary: "调用后端退款接口 POST /api/refund。",
+        evidence: [{ startLine: 5, endLine: 6 }],
+      },
+    ],
+    edges: [],
+  },
+  "src/router.ts": {
+    changeSummary: "页面路由表：注册订单列表页与新增的退款页路由。",
+    facts: [
+      {
+        kind: "route",
+        name: "/orders",
+        startLine: 5,
+        endLine: 7,
+        signature: "GET /orders",
+        confidence: "high",
+        summary: "订单列表页路由。",
+        evidence: [{ startLine: 5, endLine: 7 }],
+      },
+      {
+        kind: "route",
+        name: "/orders/refund",
+        startLine: 9,
+        endLine: 11,
+        signature: "GET /orders/refund",
+        confidence: "high",
+        summary: "退款页路由。",
+        evidence: [{ startLine: 9, endLine: 11 }],
+      },
+    ],
+    edges: [],
+  },
+  "src/pages/OrdersPage.tsx": {
+    changeSummary: "订单页面组件：展示订单列表并触发退款，本次在调用点补充 reason 参数。",
+    facts: [
+      {
+        kind: "component",
+        name: "OrdersPage",
+        startLine: 3,
+        endLine: 9,
+        signature: "OrdersPage({ orders })",
+        confidence: "high",
+        summary: "订单列表页面组件。",
+        evidence: [{ startLine: 3, endLine: 3 }],
+      },
+    ],
+    edges: [
+      {
+        from: { kind: "component", name: "OrdersPage" },
+        to: { kind: "route", name: "/orders" },
+        rel: "contains",
+        confidence: "high",
+        evidence: [{ startLine: 3, endLine: 3 }],
+      },
+    ],
+  },
+  "server/refund.go": {
+    changeSummary: "退款的 Go HTTP 接口：注册 POST /api/refund 并解析新增的 reason 参数。",
+    facts: [
+      {
+        kind: "api",
+        name: "POST /api/refund",
+        startLine: 13,
+        endLine: 15,
+        signature: "func registerRefundRoutes(mux *http.ServeMux)",
+        confidence: "high",
+        summary: "注册退款接口 POST /api/refund。",
+        evidence: [{ startLine: 14, endLine: 14 }],
+      },
+    ],
+    edges: [],
+  },
+  "src/utils/format.ts": {
+    changeSummary: "金额格式化工具函数：只调整格式化参数，未识别页面/路由/接口事实。",
+    facts: [],
+    edges: [],
+  },
+};
+
+const P4_DEFAULT_FILE_ANALYSIS = {
+  changeSummary: "未识别到页面、路由、接口或组件事实。",
+  facts: [],
+  edges: [],
+};
 
 const MODELS_BODY = {
   data: [
@@ -500,6 +618,193 @@ async function handleP3Scenario(messages, res, stream) {
   return true;
 }
 
+// --- P4 scripted behaviors -------------------------------------------------
+
+function p4Mode() {
+  const value = String(process.env.EZTEST_FAKE_LLM_P4_MODE || "ok")
+    .trim()
+    .toLowerCase();
+  return P4_MODES.has(value) ? value : "ok";
+}
+
+/** Matches one P4 scenario from the system prompt; null for P1/P2/P3. */
+function detectP4Scenario(systemText) {
+  if (systemText.includes(P4_FILE_ANALYZER_MARKER)) return "file_analysis";
+  if (systemText.includes(P4_IMPACT_ANALYZER_MARKER)) return "impact_analysis";
+  return null;
+}
+
+function matchPromptField(text, label) {
+  const match = new RegExp("(?:^|\\n)" + label + "：([^\\n]+)").exec(text);
+  return match ? match[1].trim() : "";
+}
+
+/** Appends the compact P4 request line (never the prompt or file content). */
+function recordP4Request(kind, pathValue, commit, mode) {
+  const entry = {
+    p4: true,
+    kind,
+    path: pathValue || null,
+    commit: commit || null,
+    mode,
+  };
+  try {
+    fs.appendFileSync(REQUEST_LOG_PATH, JSON.stringify(entry) + "\n", "utf8");
+  } catch (error) {
+    console.error("fake-llm: failed to append the request log: " + error.message);
+  }
+}
+
+/** Builds one valid §8.3 JSON object with the prompt path filled in. */
+function p4FileAnalysisResponse(pathValue) {
+  const template = Object.prototype.hasOwnProperty.call(P4_FILE_TEMPLATES, pathValue)
+    ? P4_FILE_TEMPLATES[pathValue]
+    : P4_DEFAULT_FILE_ANALYSIS;
+  return {
+    changeSummary: template.changeSummary,
+    facts: template.facts.map((fact) => ({
+      kind: fact.kind,
+      name: fact.name,
+      path: pathValue,
+      startLine: fact.startLine,
+      endLine: fact.endLine,
+      signature: fact.signature,
+      confidence: fact.confidence,
+      summary: fact.summary,
+      // Evidence is only file + line range: the server always recomputes the
+      // excerpt hash from the commit blob (design spec §6.3).
+      evidence: fact.evidence.map((item) => ({
+        file: pathValue,
+        startLine: item.startLine,
+        endLine: item.endLine,
+      })),
+    })),
+    edges: template.edges.map((edge) => ({
+      from: { kind: edge.from.kind, name: edge.from.name },
+      to: { kind: edge.to.kind, name: edge.to.name },
+      rel: edge.rel,
+      confidence: edge.confidence,
+      evidence: edge.evidence.map((item) => ({
+        file: pathValue,
+        startLine: item.startLine,
+        endLine: item.endLine,
+      })),
+    })),
+  };
+}
+
+/** Extracts the version requirement list of the §8.4 impact prompt. */
+function parseP4Requirements(userText) {
+  const block = /版本需求清单（id \| 标题 \| 描述摘要）：\n([\s\S]*?)\n\n变更文件/.exec(userText);
+  const section = block ? block[1] : userText;
+  const requirements = [];
+  const pattern = /^(\d+)\s*\|\s*(.*?)\s*\|/gm;
+  let match = pattern.exec(section);
+  while (match !== null) {
+    requirements.push({ id: match[1], title: match[2] });
+    match = pattern.exec(section);
+  }
+  return requirements;
+}
+
+/** Extracts the changed-file paths of the §8.4 impact prompt. */
+function parseP4ChangedFiles(userText) {
+  const block = /变更文件（path \| status）：\n([\s\S]*?)\n\n变更事实/.exec(userText);
+  if (!block) return [];
+  return block[1]
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "" && line !== "(无)")
+    .map((line) => line.split("|")[0].trim())
+    .filter((line) => line !== "");
+}
+
+/** Picks the first evidence interval of the prompt that names a changed file. */
+function p4ImpactEvidence(userText, changedFiles) {
+  for (const file of changedFiles) {
+    const escaped = file.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const match = new RegExp(escaped + ":(\\d+)-(\\d+)").exec(userText);
+    if (match) {
+      return { file, startLine: Number(match[1]), endLine: Number(match[2]) };
+    }
+  }
+  if (changedFiles.length > 0) {
+    return { file: changedFiles[0], startLine: 1, endLine: 1 };
+  }
+  return null;
+}
+
+/**
+ * Builds the §8.4 JSON object. It stays deterministic: the default mode returns
+ * an empty affected list, impact-ai returns the P4-AI-IMPACT requirement (or the
+ * first listed requirement) with a reason and validated-looking evidence.
+ */
+function p4ImpactResponse(userText, mode) {
+  if (mode !== "impact-ai") return { affected: [] };
+  const requirements = parseP4Requirements(userText);
+  if (requirements.length === 0) return { affected: [] };
+
+  const marked = requirements.filter((requirement) =>
+    requirement.title.toUpperCase().includes(P4_IMPACT_TITLE_MARKER),
+  );
+  const chosen = marked.length > 0 ? marked : [requirements[0]];
+  const changedFiles = parseP4ChangedFiles(userText);
+  const evidence = p4ImpactEvidence(userText, changedFiles);
+
+  return {
+    affected: chosen.map((requirement) => {
+      const affected = {
+        requirementId: requirement.id,
+        reason:
+          "AI 推测：退款调用与接口均新增 reason 参数，需求「" +
+          requirement.title +
+          "」的展示与校验可能需要同步。",
+        confidence: "high",
+        evidence: evidence ? [evidence] : [],
+      };
+      return affected;
+    }),
+  };
+}
+
+/**
+ * Handles one P4 analysis request. Returns true when the system prompt carried
+ * a P4 marker, false so the P1/P3 behaviors below stay untouched.
+ */
+async function handleP4Scenario(messages, res, stream) {
+  const kind = detectP4Scenario(systemPromptText(messages));
+  if (kind === null) return false;
+
+  const lastUser = findLastUserMessage(messages);
+  const userText = lastUser ? lastUser.text : "";
+  const pathValue = kind === "file_analysis" ? matchPromptField(userText, "文件") : "";
+  const commit = matchPromptField(userText, "提交");
+  const mode = p4Mode();
+  recordP4Request(kind, pathValue, commit, mode);
+
+  if (mode === "error") {
+    sendError(res, 500, "fake P4 analysis upstream error");
+    return true;
+  }
+
+  let text;
+  if (mode === "partial" && kind === "file_analysis" && pathValue === P4_PARTIAL_INVALID_PATH) {
+    // Deliberately not JSON so the parser records a parse_error for this file.
+    text = "fake P4 partial mode: " + P4_PARTIAL_INVALID_PATH + " response is not valid JSON";
+  } else if (kind === "file_analysis") {
+    text = JSON.stringify(p4FileAnalysisResponse(pathValue));
+  } else {
+    text = JSON.stringify(p4ImpactResponse(userText, mode));
+  }
+
+  if (stream) {
+    await streamTextTurn(res, text, P4_USAGE);
+    return true;
+  }
+  sendJson(res, 200, completionBody({ content: text }, "stop", P4_USAGE));
+  return true;
+}
+
 // --- scripted behaviors ----------------------------------------------------
 
 function diagnosticMessage() {
@@ -587,6 +892,15 @@ async function handleChatCompletions(req, res) {
     sendError(res, 400, "invalid json body");
     return;
   }
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const stream = body.stream === true;
+
+  // P4 file/impact analysis requests carry a system prompt marker and no
+  // agent tools (the codeintel gateway sends a plain system + user pair), so
+  // they are detected before the agent tool-call validation below. P1/P2/P3
+  // requests never match these markers and keep the original behavior.
+  if (await handleP4Scenario(messages, res, stream)) return;
+
   recordRequest(body);
 
   if (!Array.isArray(body.tools) || body.tools.length === 0) {
@@ -594,10 +908,8 @@ async function handleChatCompletions(req, res) {
     return;
   }
 
-  const messages = Array.isArray(body.messages) ? body.messages : [];
   const lastMessage = messages.length > 0 ? messages[messages.length - 1] : {};
   const lastRole = lastMessage && lastMessage.role;
-  const stream = body.stream === true;
 
   // The P3 clarification/analysis/recon scenarios own every request whose last
   // user message carries their marker (or the one-shot instruction). P1/P2
