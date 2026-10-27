@@ -144,9 +144,13 @@ export async function deleteEnvironment(id: number): Promise<void> {
 
 export async function listAppModels(
   systemId: number,
-  params: { kind?: string } = {},
+  params: { kind?: string; limit?: number; cursor?: string } = {},
 ): Promise<Page<AppModelNodeDTO>> {
-  const path = withQuery(`${systemPath(systemId)}/app-models`, { kind: params.kind })
+  const path = withQuery(`${systemPath(systemId)}/app-models`, {
+    kind: params.kind,
+    limit: params.limit,
+    cursor: params.cursor,
+  })
   return toPage<AppModelNodeDTO>(await apiGet<unknown>(path))
 }
 
@@ -203,8 +207,15 @@ export async function deleteAccount(id: number): Promise<void> {
   await apiDelete<void>(accountPath(id))
 }
 
-export function listAccesses(accountId: number): Promise<AccessDTO[]> {
-  return apiGet<AccessDTO[]>(`${accountPath(accountId)}/accesses`)
+export async function listAccesses(
+  accountId: number,
+  params: { limit?: number; cursor?: string } = {},
+): Promise<AccessDTO[]> {
+  const path = withQuery(`${accountPath(accountId)}/accesses`, {
+    limit: params.limit,
+    cursor: params.cursor,
+  })
+  return apiGet<AccessDTO[]>(path)
 }
 
 export function createAccess(
