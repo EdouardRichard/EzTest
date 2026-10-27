@@ -253,3 +253,209 @@ export type RequirementAttachment = {
   sha256: string
   createdAt: string
 }
+
+// --- Clarification sessions, messages, questions and decisions (spec §7.5/§7.6) ---
+
+/** Clarification session lifecycle (spec §5.2). */
+export type ClarificationSessionStatus = "active" | "completed" | "cancelled"
+
+/**
+ * One version-level clarification session. `id` is a P3 snowflake string;
+ * `agentSessionId` is the P1 agent session and stays a number.
+ */
+export type ClarificationSession = {
+  id: string
+  status: ClarificationSessionStatus
+  agentSessionId: number | null
+  startedAt: string
+  endedAt: string | null
+  contextSummary: string
+  summaryUpdatedAt: string | null
+}
+
+/** A clarification question can be open, answered or dismissed (spec §6.6). */
+export type ClarificationQuestionStatus = "open" | "answered" | "dismissed"
+
+/** Whether a question/decision was authored by a user or the agent. */
+export type ClarificationSource = "user" | "ai"
+
+/** How a question was answered: inline in the UI or transcribed by the agent. */
+export type ClarificationAnsweredVia = "ui" | "agent"
+
+/** `QuestionDTO` (spec §7.6). Every P3-owned ID is a decimal string. */
+export type ClarificationQuestion = {
+  id: string
+  versionId: string
+  requirementId: string | null
+  sessionId: string | null
+  question: string
+  status: ClarificationQuestionStatus
+  answer: string
+  source: ClarificationSource
+  answeredVia: ClarificationAnsweredVia
+  answeredBy: number | null
+  answeredAt: string | null
+  createdBy: number
+  createdAt: string
+  updatedAt: string
+}
+
+/** Decision lifecycle: proposed by AI, then accepted or rejected by a human. */
+export type ClarificationDecisionStatus = "proposed" | "accepted" | "rejected"
+
+/** `DecisionDTO` (spec §7.6). Every P3-owned ID is a decimal string. */
+export type ClarificationDecision = {
+  id: string
+  versionId: string
+  requirementId: string | null
+  questionId: string | null
+  topic: string
+  decision: string
+  rationale: string
+  status: ClarificationDecisionStatus
+  source: ClarificationSource
+  proposedBy: number
+  decidedBy: number | null
+  decidedAt: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+/** Per-status question counters returned by `GET clarification` (spec §7.5). */
+export type ClarificationQuestionCounts = {
+  open: number
+  answered: number
+  dismissed: number
+}
+
+/** Per-status decision counters returned by `GET clarification` (spec §7.5). */
+export type ClarificationDecisionCounts = {
+  proposed: number
+  accepted: number
+  rejected: number
+}
+
+/** `GET /api/versions/{id}/clarification` (spec §7.5): session + counters. */
+export type ClarificationOverview = {
+  session: ClarificationSession | null
+  questions: ClarificationQuestionCounts
+  decisions: ClarificationDecisionCounts
+}
+
+/** P1 message roles exposed by the clarification history projection. */
+export type ClarificationMessageRole = "user" | "assistant" | "tool"
+
+/** One content part of a persisted agent message. */
+export type ClarificationMessagePart = {
+  type: string
+  text?: string
+}
+
+/** A tool call persisted on an assistant message. */
+export type ClarificationToolCall = {
+  id: string
+  name: string
+  arguments: string
+}
+
+/**
+ * One clarification message projected from P1 `agent_messages` (spec §7.5).
+ * `id`/`runId` are P1 numbers; the session ID is not part of this projection.
+ */
+export type ClarificationMessage = {
+  id: number
+  role: ClarificationMessageRole
+  parts: ClarificationMessagePart[]
+  reasoning: string
+  toolCalls: ClarificationToolCall[] | null
+  toolName: string | null
+  runId: number | null
+  createdAt: string
+}
+
+/** One `GET clarification/messages` page; the cursor is a P1 message ID. */
+export type ClarificationMessagesPage = {
+  items: ClarificationMessage[]
+  nextCursor: string
+  hasMore: boolean
+}
+
+/** One `GET clarification/questions` page. */
+export type ClarificationQuestionsPage = {
+  items: ClarificationQuestion[]
+  nextCursor: string
+  hasMore: boolean
+}
+
+/** One `GET decisions` page. */
+export type ClarificationDecisionsPage = {
+  items: ClarificationDecision[]
+  nextCursor: string
+  hasMore: boolean
+}
+
+/** Filters accepted by `GET clarification/messages` (spec §7.5). */
+export type ClarificationMessageQuery = {
+  beforeId?: number
+  limit?: number
+}
+
+/** Filters accepted by `GET clarification/questions` (spec §7.6). */
+export type ClarificationQuestionQuery = {
+  status?: ClarificationQuestionStatus
+  requirementId?: string
+  limit?: number
+  cursor?: string
+}
+
+/** Filters accepted by `GET decisions` (spec §7.6). */
+export type ClarificationDecisionQuery = {
+  status?: ClarificationDecisionStatus
+  limit?: number
+  cursor?: string
+}
+
+/** `POST clarification/messages` body (spec §7.5, 1–5000 characters). */
+export type SendClarificationMessageBody = {
+  message: string
+}
+
+/** 202 result of starting one clarification run. */
+export type ClarificationRunResult = {
+  agentSessionId: number
+  runId: number
+}
+
+/** 202 result of posting a clarification message (spec §7.5). */
+export type SendClarificationMessageResult = ClarificationRunResult & {
+  sessionId: string
+  status: string
+}
+
+/** `POST clarification/questions` body (spec §7.6); version-level omits it. */
+export type CreateClarificationQuestionBody = {
+  question: string
+  requirementId?: string | null
+}
+
+/** `PATCH clarification/questions/{qid}` body (spec §7.6). */
+export type UpdateClarificationQuestionBody = {
+  status?: ClarificationQuestionStatus
+  question?: string
+  answer?: string
+}
+
+/** `POST decisions` body; the backend records it as accepted/user. */
+export type CreateDecisionBody = {
+  topic: string
+  decision: string
+  rationale?: string
+  requirementId?: string | null
+  questionId?: string | null
+}
+
+/** `PATCH decisions/{did}` body: only proposed decisions can transition. */
+export type UpdateDecisionBody = {
+  status: "accepted" | "rejected"
+  rationale?: string
+}
