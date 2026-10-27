@@ -49,12 +49,15 @@ services:
       EZTEST_WEB_ORIGIN: ${EZTEST_WEB_ORIGIN:-http://localhost:6868}
       EZTEST_DATABASE_URL: postgres://${POSTGRES_USER:-eztest}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in the environment or ../.env}@postgres:5432/${POSTGRES_DB:-eztest}?sslmode=disable
       EZTEST_STORAGE_DIR: /data/objects
+      EZTEST_VERSION_ATTACHMENT_DIR: /data/version-attachments
+      EZTEST_SNOWFLAKE_NODE_ID: ${EZTEST_SNOWFLAKE_NODE_ID:-1}
       EZTEST_OPENAPI_PATH: docs/openapi/api.yaml
       EZTEST_ENABLE_TEST_ENDPOINTS: ${EZTEST_ENABLE_TEST_ENDPOINTS:-false}
     ports:
       - "13333:13333"
     volumes:
       - objects:/data/objects
+      - attachments:/data/version-attachments
     depends_on:
       postgres:
         condition: service_healthy
@@ -91,3 +94,4 @@ services:
 volumes:
   pgdata:
   objects:
+  attachments:
