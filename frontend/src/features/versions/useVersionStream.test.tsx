@@ -67,6 +67,15 @@ function stubSnapshots(...payloads: unknown[]) {
   return fetchMock
 }
 
+/** A Response promise the test resolves manually, to hold one snapshot in flight. */
+function deferredResponse(): { promise: Promise<Response>; resolve: (response: Response) => void } {
+  let resolve: (response: Response) => void = () => {}
+  const promise = new Promise<Response>((next) => {
+    resolve = next
+  })
+  return { promise, resolve }
+}
+
 /** Stubs a failing snapshot response (404 no channel / 5xx read failure). */
 function stubSnapshotError(status: number, code: string) {
   const fetchMock = vi.fn().mockImplementation(async () => {
@@ -158,7 +167,7 @@ describe("useVersionStream", () => {
     await waitFor(() => expect(result.current.events.map((event) => event.seq)).toEqual([1, 2, 3]))
   })
 
-  it("refetches the snapshot when the server resets the stream", async () => {
+  it("refetches the snapshot and resumes from the new cursor when the server resets", async () => {
     const fetchMock = stubSnapshots(
       eventsPage([makeEvent(1)], 1),
       eventsPage([makeEvent(1), makeEvent(2)], 2),
@@ -166,12 +175,62 @@ describe("useVersionStream", () => {
 
     const { result } = renderHook(() => useVersionStream(VERSION_ID))
     await waitFor(() => expect(mocks.connectSSE).toHaveBeenCalledTimes(1))
-    const options = latestOptions()
+    const first = latestOptions()
+    expect(first.lastEventId).toBe(1)
 
-    act(() => options.onReset?.({ channel: `version:${VERSION_ID}`, reason: "cursor_too_old" }))
+    act(() => first.onReset?.({ channel: `version:${VERSION_ID}`, reason: "cursor_too_old" }))
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
     await waitFor(() => expect(result.current.events.map((event) => event.seq)).toEqual([1, 2]))
+    // The reset transport cannot advance its own lastSeq, so it is replaced by
+    // one that resumes from the refetched cursor.
+    await waitFor(() => expect(mocks.connectSSE).toHaveBeenCalledTimes(2))
+    expect(mocks.stop).toHaveBeenCalledTimes(1)
+    const second = latestOptions()
+    expect(second).not.toBe(first)
+    expect(second.lastEventId).toBe(2)
+  })
+
+  it("keeps live events that arrive while the reset snapshot is in flight", async () => {
+    const resetSnapshot = deferredResponse()
+    let snapshotCalls = 0
+    const fetchMock = vi.fn().mockImplementation(() => {
+      callOrder.push("fetch")
+      snapshotCalls += 1
+      if (snapshotCalls === 1) return Promise.resolve(jsonResponse(eventsPage([makeEvent(1)], 1)))
+      return resetSnapshot.promise
+    })
+    vi.stubGlobal("fetch", fetchMock)
+
+    const { result } = renderHook(() => useVersionStream(VERSION_ID))
+    await waitFor(() => expect(mocks.connectSSE).toHaveBeenCalledTimes(1))
+    const options = latestOptions()
+    expect(options.lastEventId).toBe(1)
+    act(() => options.onStatus("live"))
+
+    act(() => options.onReset?.({ channel: `version:${VERSION_ID}`, reason: "cursor_too_old" }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+
+    // A live frame lands while the reset snapshot is still in flight. The
+    // snapshot below (cursor 2) has not seen it yet, so a replace would drop it.
+    act(() => options.onEvent(toSseEvent(makeEvent(3))))
+    expect(result.current.events.map((event) => event.seq)).toEqual([1, 3])
+
+    await act(async () => {
+      resetSnapshot.resolve(jsonResponse(eventsPage([makeEvent(1), makeEvent(2)], 2)))
+    })
+
+    await waitFor(() => expect(result.current.events.map((event) => event.seq)).toEqual([1, 2, 3]))
+    // The replacement stream starts after the merged high-water seq (3), not
+    // the snapshot cursor (2), so a later reconnect cannot reset again.
+    await waitFor(() => expect(mocks.connectSSE).toHaveBeenCalledTimes(2))
+    expect(mocks.stop).toHaveBeenCalledTimes(1)
+    const replacement = latestOptions()
+    expect(replacement.lastEventId).toBe(3)
+    // The real transport reports "connecting" as soon as it opens; resnapshotting
+    // must not regress a stream the UI already saw as live.
+    act(() => replacement.onStatus("connecting"))
+    expect(result.current.status).toBe("live")
   })
 
   it("exposes live/reconnecting status and keeps events while reconnecting", async () => {
