@@ -50,6 +50,9 @@ func (s *AnchorService) Create(ctx context.Context, versionID, actorID int64, p 
 	if err := domain.ValidateSubjectKind(p.SubjectKind); err != nil {
 		return domain.CodeAnchor{}, err
 	}
+	if s.deps.Anchors == nil {
+		return domain.CodeAnchor{}, errors.New("codeintel: anchor repository is not configured")
+	}
 	if s.deps.Versions == nil {
 		return domain.CodeAnchor{}, errors.New("codeintel: version catalog is not configured")
 	}
@@ -126,9 +129,6 @@ func (s *AnchorService) Create(ctx context.Context, versionID, actorID int64, p 
 		CreatedByKind: anchorCreatedByKindUser,
 		CreatedBy:     actorID,
 		CreatedAt:     s.now(),
-	}
-	if s.deps.Anchors == nil {
-		return domain.CodeAnchor{}, errors.New("codeintel: anchor repository is not configured")
 	}
 	if err := s.deps.Anchors.Create(ctx, anchor); err != nil {
 		return domain.CodeAnchor{}, err
@@ -254,7 +254,10 @@ func (s *AnchorService) validateAnchorFile(ctx context.Context, repo RepoInfo, f
 	}
 	branch := strings.TrimSpace(repo.FixedBranch)
 	if branch == "" {
-		branch = "main"
+		// The fixed branch is part of the P2 repository contract; guessing
+		// "main" would validate the anchor against the wrong tip.
+		return domain.NewInvalid("repoId", "code_repository_not_bound",
+			fmt.Sprintf("codeintel: code repository %d has no fixed branch", repo.ID))
 	}
 	commit, err := s.deps.Git.Head(ctx, repo.LocalPath, branch)
 	if err != nil {

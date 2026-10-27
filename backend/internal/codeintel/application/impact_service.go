@@ -25,8 +25,9 @@ const (
 	defaultImpactMaxPromptBytes = 64 << 10
 	// minImpactMaxPromptBytes keeps a configured prompt budget usable.
 	minImpactMaxPromptBytes = 4 << 10
-	// maxImpactMaxPromptBytes is the documented hard upper bound.
-	maxImpactMaxPromptBytes = 1 << 20
+	// maxImpactMaxPromptBytes is R15's documented hard upper bound (64 KiB);
+	// configuration may only lower it.
+	maxImpactMaxPromptBytes = defaultImpactMaxPromptBytes
 
 	// maxImpactCandidateEvidence is §6.6 step 4's merged evidence cap.
 	maxImpactCandidateEvidence = 5
@@ -35,6 +36,9 @@ const (
 	// impactPromptSchemaMarker is the trailing section BuildImpactPrompt emits;
 	// truncation markers are inserted in front of it.
 	impactPromptSchemaMarker = "\n\n输出 JSON schema：\n"
+	// impactSummaryTruncatedMarker marks the truncated changeSummary section of
+	// the impact prompt (R15).
+	impactSummaryTruncatedMarker = "\n……（变更摘要已截断）"
 )
 
 // Impact-result unmapped suggestions (the deleted-file suggestion is verbatim
@@ -69,7 +73,6 @@ type ImpactServiceDeps struct {
 	Git       GitReader
 	Repos     RepoCatalog
 	IDs       IDGenerator
-	Clock     Clock
 
 	MaxRequirements int
 	MaxFacts        int
@@ -170,8 +173,8 @@ type impactStats struct {
 	Contract           int  `json:"contract"`
 	Relation           int  `json:"relation"`
 	AI                 int  `json:"ai"`
-	EvidenceChecks     int  `json:"evidenceChecks"`
-	EvidenceFailures   int  `json:"evidenceFailures"`
+	AIEvidenceChecks   int  `json:"aiEvidenceChecks"`
+	AIEvidenceFailures int  `json:"aiEvidenceFailures"`
 	UnmatchedContracts int  `json:"unmatchedContracts"`
 	Unmapped           int  `json:"unmapped"`
 	UnmappedTruncated  bool `json:"unmappedTruncated,omitempty"`
@@ -370,6 +373,25 @@ func impactFactTouchesPaths(fact domain.CodeEntity, changed map[string]domain.Ch
 	return false
 }
 
+// impactAppModelFacts returns the facts allowed to produce app model candidates:
+// facts that touch a changed file (their path or verified evidence) plus facts
+// this analysis run produced even when the model attributed them to an
+// out-of-path file (design spec §6.6 input 3). The head-wide FactsAtHead
+// snapshot also carries facts from other analyses/versions; none of those may
+// become a direct candidate (review finding 1). state.facts is deterministic, so
+// the filtered view is too.
+func impactAppModelFacts(state *impactPlanState) []domain.CodeEntity {
+	analysisID := state.in.Analysis.ID
+	kept := make([]domain.CodeEntity, 0, len(state.changedFacts))
+	for _, fact := range state.facts {
+		if impactFactTouchesPaths(fact, state.changed) ||
+			(analysisID != 0 && fact.AnalysisID != nil && *fact.AnalysisID == analysisID) {
+			kept = append(kept, fact)
+		}
+	}
+	return kept
+}
+
 // anchorCandidates projects every anchor of a changed file onto a candidate.
 // Version anchors are display-only (design spec §6.6 step 3).
 func (s *ImpactService) anchorCandidates(state *impactPlanState) []domain.ImpactCandidate {
@@ -404,23 +426,14 @@ func impactAnchorConfidence(confidence string) string {
 	return confidence
 }
 
-// appModelCandidates matches the high/medium facts against the version-bound
-// system's app model nodes by exact key (design spec §6.6 step 3).
+// appModelCandidates matches the facts of this change against the version-bound
+// system's app model nodes by exact key (design spec §6.6 step 3). Only facts
+// that touch the change set (or were produced by this run) are considered, so
+// the head-wide fact snapshot cannot turn an unrelated fact into a candidate.
 func (s *ImpactService) appModelCandidates(state *impactPlanState) []domain.ImpactCandidate {
-	byKey := make(map[string]AppModelNode, len(state.appModels))
-	for _, node := range state.appModels {
-		switch node.Kind {
-		case domain.KindPage, domain.KindRoute, domain.KindAPI, domain.KindComponent:
-		default:
-			continue
-		}
-		key := node.Kind + "\x00" + node.Key
-		if _, exists := byKey[key]; !exists {
-			byKey[key] = node
-		}
-	}
+	byKey := impactAppModelNodeIndex(state.appModels)
 	candidates := make([]domain.ImpactCandidate, 0)
-	for _, fact := range state.facts {
+	for _, fact := range impactAppModelFacts(state) {
 		key, ok := impactAppModelKeyForFact(fact)
 		if !ok {
 			continue
@@ -439,6 +452,25 @@ func (s *ImpactService) appModelCandidates(state *impactPlanState) []domain.Impa
 		})
 	}
 	return candidates
+}
+
+// impactAppModelNodeIndex indexes the app model nodes by kind and key. The first
+// node wins so a duplicate key stays deterministic (state.appModels is sorted by
+// kind, key and id).
+func impactAppModelNodeIndex(appModels []AppModelNode) map[string]AppModelNode {
+	index := make(map[string]AppModelNode, len(appModels))
+	for _, node := range appModels {
+		switch node.Kind {
+		case domain.KindPage, domain.KindRoute, domain.KindAPI, domain.KindComponent:
+		default:
+			continue
+		}
+		key := node.Kind + "\x00" + node.Key
+		if _, exists := index[key]; !exists {
+			index[key] = node
+		}
+	}
+	return index
 }
 
 // impactAppModelKeyForFact returns the P2 app model key of one fact
@@ -476,16 +508,18 @@ func impactLeadingSlash(value string) string {
 }
 
 // contractCandidates propagates changed client_call/api facts one hop over the
-// route_to_api edges to the counterpart api method/path and matches the api app
-// model node (design spec §6.5/§6.6, CI-M0).
+// route_to_api edges (design spec §6.5/§6.6, CI-M0):
+//
+//   - a changed client_call reaches the counterpart api node (api:<METHOD> <path>);
+//   - a changed api reaches the component/page facts recorded at the counterpart
+//     client_call's path and matches their app model nodes (R38: the analysis
+//     service supplies those companion facts in FactsAtHead).
 func (s *ImpactService) contractCandidates(state *impactPlanState) []domain.ImpactCandidate {
-	apiNodes := make(map[string]AppModelNode, len(state.appModels))
-	for _, node := range state.appModels {
-		if node.Kind != domain.KindAPI {
-			continue
-		}
-		if _, exists := apiNodes[node.Key]; !exists {
-			apiNodes[node.Key] = node
+	nodes := impactAppModelNodeIndex(state.appModels)
+	factsByID := make(map[int64]domain.CodeEntity, len(state.facts))
+	for _, fact := range state.facts {
+		if _, exists := factsByID[fact.ID]; !exists {
+			factsByID[fact.ID] = fact
 		}
 	}
 
@@ -504,11 +538,44 @@ func (s *ImpactService) contractCandidates(state *impactPlanState) []domain.Impa
 				continue
 			}
 			touched = true
-			method, path, ok := impactContractEndpoint(edge, state.facts)
+			method, path, ok := impactContractEndpoint(edge, fact, state.facts)
 			if !ok {
 				continue
 			}
-			node, ok := apiNodes["api:"+method+" "+path]
+			if fact.Kind == domain.KindAPI {
+				// Changed api → counterpart client_call → its component/page
+				// facts → their app model nodes (design spec §6.5 传播).
+				counterpartID := edge.SrcEntityID
+				if counterpartID == fact.ID {
+					counterpartID = edge.DstEntityID
+				}
+				counterpart, ok := factsByID[counterpartID]
+				if !ok || counterpart.Kind != domain.KindClientCall {
+					continue
+				}
+				for _, companion := range impactCompanionFacts(state.facts, counterpart.Path) {
+					key, ok := impactAppModelKeyForFact(companion)
+					if !ok {
+						continue
+					}
+					node, ok := nodes[companion.Kind+"\x00"+key]
+					if !ok {
+						continue
+					}
+					candidates = append(candidates, domain.ImpactCandidate{
+						SubjectKind: domain.CandidateAppModel,
+						SubjectID:   node.ID,
+						Reason:      fmt.Sprintf("contract %s %s changed", method, path),
+						Confidence: weakerConfidence(
+							weakerConfidence(fact.Confidence, impactEdgeConfidence(edge.Confidence)),
+							companion.Confidence),
+						Source:   domain.CandidateContract,
+						Evidence: mergeImpactEvidence(fact.Evidence, edge.Evidence, companion.Evidence),
+					})
+				}
+				continue
+			}
+			node, ok := nodes[domain.KindAPI+"\x00"+"api:"+method+" "+path]
 			if !ok {
 				continue
 			}
@@ -535,10 +602,29 @@ func (s *ImpactService) contractCandidates(state *impactPlanState) []domain.Impa
 	return candidates
 }
 
+// impactCompanionFacts returns the high/medium component/page facts recorded at
+// one contract-counterpart path (R38) in deterministic fact order.
+func impactCompanionFacts(facts []domain.CodeEntity, path string) []domain.CodeEntity {
+	if path == "" {
+		return nil
+	}
+	companions := make([]domain.CodeEntity, 0)
+	for _, fact := range facts {
+		if fact.Path != path {
+			continue
+		}
+		if fact.Kind != domain.KindComponent && fact.Kind != domain.KindPage {
+			continue
+		}
+		companions = append(companions, fact)
+	}
+	return companions
+}
+
 // impactContractEndpoint resolves the api side of one route_to_api edge from its
-// meta document, falling back to the counterpart fact name when the meta is
-// absent/corrupt.
-func impactContractEndpoint(edge domain.CodeEdge, facts []domain.CodeEntity) (string, string, bool) {
+// meta document, falling back to the triggering fact name and then to the
+// endpoint fact name when the meta is absent/corrupt.
+func impactContractEndpoint(edge domain.CodeEdge, trigger domain.CodeEntity, facts []domain.CodeEntity) (string, string, bool) {
 	if len(edge.Meta) > 0 {
 		var meta struct {
 			Method         string `json:"method"`
@@ -548,6 +634,9 @@ func impactContractEndpoint(edge domain.CodeEdge, facts []domain.CodeEntity) (st
 			strings.TrimSpace(meta.Method) != "" && strings.TrimSpace(meta.NormalizedPath) != "" {
 			return strings.ToUpper(strings.TrimSpace(meta.Method)), strings.TrimSpace(meta.NormalizedPath), true
 		}
+	}
+	if method, path := domain.NormalizeMethodPath("", trigger.Name); method != "" && path != "" {
+		return method, path, true
 	}
 	for _, fact := range facts {
 		if fact.ID != edge.SrcEntityID && fact.ID != edge.DstEntityID {
@@ -707,14 +796,14 @@ func (s *ImpactService) aiCandidates(ctx context.Context, state *impactPlanState
 				// model output regardless of which prompt produced it.
 				break
 			}
-			state.stats.EvidenceChecks++
+			state.stats.AIEvidenceChecks++
 			if rawEvidence.File == nil || rawEvidence.StartLine == nil || rawEvidence.EndLine == nil {
-				state.stats.EvidenceFailures++
+				state.stats.AIEvidenceFailures++
 				continue
 			}
 			validated, ok := s.validateAIEvidence(ctx, state, *rawEvidence.File, *rawEvidence.StartLine, *rawEvidence.EndLine)
 			if !ok {
-				state.stats.EvidenceFailures++
+				state.stats.AIEvidenceFailures++
 				continue
 			}
 			evidence = append(evidence, validated)
@@ -842,15 +931,15 @@ func (s *ImpactService) repositoryLocalPath(ctx context.Context, state *impactPl
 
 // impactPromptPlan is the selected, bounded prompt content of one AI call.
 type impactPromptPlan struct {
-	facts        []AIFact
-	files        []domain.ChangedFile
-	requirements []RequirementInfo
-	truncated    bool
+	facts     []AIFact
+	truncated bool
 }
 
 // buildImpactPrompt renders the §8.4 prompt with the R15 caps: the fact count is
 // capped by MaxFacts and the whole prompt by MaxPromptBytes (first reached
-// wins), and every cut is marked inside the user message.
+// wins), and every cut is marked inside the user message. The changeSummary is
+// the last section to shrink so the final system+user prompt never exceeds the
+// configured byte budget.
 func (s *ImpactService) buildImpactPrompt(state *impactPlanState) (string, string, impactPromptPlan) {
 	allFacts := impactPromptFacts(state.changedFacts)
 	files := append([]domain.ChangedFile(nil), state.in.ChangedFiles...)
@@ -869,7 +958,7 @@ func (s *ImpactService) buildImpactPrompt(state *impactPlanState) (string, strin
 	}
 
 	summary := impactChangeSummary(state.in.Analysis.Stats)
-	build := func(factCount, fileCount, requirementCount int) (string, string, bool) {
+	build := func(summary string, factCount, fileCount, requirementCount int) (string, string, bool) {
 		system, user := BuildImpactPrompt(ImpactPromptInput{
 			Requirements:  requirements[:requirementCount],
 			ChangedFiles:  files[:fileCount],
@@ -886,31 +975,58 @@ func (s *ImpactService) buildImpactPrompt(state *impactPlanState) (string, strin
 		return len(system)+len(user) <= s.config.maxPromptBytes
 	}
 
-	system, user, truncated := build(factLimit, len(files), requirementLimit)
+	system, user, truncated := build(summary, factLimit, len(files), requirementLimit)
 	if !fits(system, user) {
 		// Facts first: they are the largest and least stable section of the
 		// prompt; changed files and the requirement list stay complete as long
 		// as the byte budget allows.
 		factLimit = largestImpactFit(factLimit, func(count int) bool {
-			candidateSystem, candidateUser, _ := build(count, len(files), requirementLimit)
+			candidateSystem, candidateUser, _ := build(summary, count, len(files), requirementLimit)
 			return fits(candidateSystem, candidateUser)
 		})
 		fileLimit = largestImpactFit(len(files), func(count int) bool {
-			candidateSystem, candidateUser, _ := build(factLimit, count, requirementLimit)
+			candidateSystem, candidateUser, _ := build(summary, factLimit, count, requirementLimit)
 			return fits(candidateSystem, candidateUser)
 		})
 		requirementLimit = largestImpactFit(requirementLimit, func(count int) bool {
-			candidateSystem, candidateUser, _ := build(factLimit, fileLimit, count)
+			candidateSystem, candidateUser, _ := build(summary, factLimit, fileLimit, count)
 			return fits(candidateSystem, candidateUser)
 		})
-		system, user, truncated = build(factLimit, fileLimit, requirementLimit)
+		system, user, truncated = build(summary, factLimit, fileLimit, requirementLimit)
+	}
+	if !fits(system, user) && summary != "" {
+		// The summary is the only unbounded free-text section left. Cut it down
+		// (with an explicit marker) until the whole prompt fits the budget.
+		summaryRunes := []rune(summary)
+		summaryLimit := 0
+		if len(summaryRunes) > 1 {
+			summaryLimit = largestImpactFit(len(summaryRunes)-1, func(count int) bool {
+				candidateSystem, candidateUser, _ := build(
+					impactTruncatedChangeSummary(summaryRunes, count), factLimit, fileLimit, requirementLimit)
+				return fits(candidateSystem, candidateUser)
+			})
+		}
+		system, user, truncated = build(
+			impactTruncatedChangeSummary(summaryRunes, summaryLimit), factLimit, fileLimit, requirementLimit)
+		truncated = true
+		if !fits(system, user) {
+			// The marker itself no longer fits: drop the summary entirely.
+			system, user, _ = build("", factLimit, fileLimit, requirementLimit)
+		}
 	}
 	return system, user, impactPromptPlan{
-		facts:        allFacts[:factLimit],
-		files:        files[:fileLimit],
-		requirements: requirements[:requirementLimit],
-		truncated:    truncated,
+		facts:     allFacts[:factLimit],
+		truncated: truncated,
 	}
+}
+
+// impactTruncatedChangeSummary returns the first count runes of the summary with
+// the R15 truncation marker appended.
+func impactTruncatedChangeSummary(summary []rune, count int) string {
+	if count <= 0 {
+		return impactSummaryTruncatedMarker
+	}
+	return string(summary[:count]) + impactSummaryTruncatedMarker
 }
 
 // largestImpactFit returns the largest n in [0, limit] for which fits(n) holds.
@@ -1115,8 +1231,10 @@ func strongerImpactConfidence(left, right string) string {
 }
 
 // unmappedChanges builds the §6.6 step 7 list: one entry per uncovered changed
-// file in path order plus the extra unmatched-contract entries, capped at the
-// documented maximum with the truncation flag.
+// file plus the extra unmatched-contract entries, sorted together by path and
+// capped at the documented maximum with the truncation flag. Sorting the combined
+// list keeps the output deterministic and path-ordered even though the
+// unmatched-contract extras are not part of the per-file dedupe.
 func (s *ImpactService) unmappedChanges(state *impactPlanState) ([]domain.UnmappedChange, bool) {
 	covered := make(map[string]struct{})
 	for _, anchor := range state.anchors {
@@ -1167,6 +1285,11 @@ func (s *ImpactService) unmappedChanges(state *impactPlanState) ([]domain.Unmapp
 			Suggestion: impactSuggestionContract,
 		})
 	}
+
+	// Deterministic, path-ascending combined order. The sort is stable so a
+	// regular file entry stays before the unmatched-contract extra of the same
+	// path.
+	sort.SliceStable(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
 
 	truncated := false
 	if len(entries) > domain.MaxUnmappedEntries {

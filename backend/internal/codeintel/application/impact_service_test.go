@@ -144,7 +144,6 @@ func (f *impactFixture) newService(mutate func(*ImpactServiceDeps)) *ImpactServi
 		Git:             f.git,
 		Repos:           f.repos,
 		IDs:             f.ids,
-		Clock:           f.clock,
 		MaxRequirements: 0,
 		MaxFacts:        0,
 		MaxPromptBytes:  0,
@@ -225,8 +224,8 @@ type impactStatsDocument struct {
 	Contract           int  `json:"contract"`
 	Relation           int  `json:"relation"`
 	AI                 int  `json:"ai"`
-	EvidenceChecks     int  `json:"evidenceChecks"`
-	EvidenceFailures   int  `json:"evidenceFailures"`
+	AIEvidenceChecks   int  `json:"aiEvidenceChecks"`
+	AIEvidenceFailures int  `json:"aiEvidenceFailures"`
 	UnmatchedContracts int  `json:"unmatchedContracts"`
 	Unmapped           int  `json:"unmapped"`
 	UnmappedTruncated  bool `json:"unmappedTruncated"`
@@ -234,6 +233,7 @@ type impactStatsDocument struct {
 	PromptFacts        int  `json:"promptFacts"`
 	PromptTruncated    bool `json:"promptTruncated"`
 	AIUnavailable      bool `json:"aiUnavailable"`
+	AIErrors           int  `json:"aiErrors"`
 }
 
 func impactDecodeStats(t *testing.T, raw []byte) impactStatsDocument {
@@ -680,7 +680,7 @@ func TestImpactAICandidateValidation(t *testing.T) {
 	}
 
 	stats := impactDecodeStats(t, result.Stats)
-	if stats.InvalidCandidates != 1 || stats.EvidenceChecks != 2 || stats.EvidenceFailures != 1 {
+	if stats.InvalidCandidates != 1 || stats.AIEvidenceChecks != 2 || stats.AIEvidenceFailures != 1 {
 		t.Fatalf("stats = %+v, want one invalid candidate and one failed evidence check", stats)
 	}
 }
@@ -763,12 +763,12 @@ func TestImpactStatsCountsAndNoContent(t *testing.T) {
 	want := impactStatsDocument{
 		Candidates: 4, Requirements: 3, AppModels: 1,
 		Direct: 1, Contract: 1, Relation: 1, AI: 1,
-		EvidenceChecks: 1, Unmapped: 1,
+		AIEvidenceChecks: 1, Unmapped: 1,
 	}
 	if stats.Candidates != want.Candidates || stats.Requirements != want.Requirements ||
 		stats.AppModels != want.AppModels || stats.Direct != want.Direct ||
 		stats.Contract != want.Contract || stats.Relation != want.Relation || stats.AI != want.AI ||
-		stats.EvidenceChecks != want.EvidenceChecks || stats.Unmapped != want.Unmapped {
+		stats.AIEvidenceChecks != want.AIEvidenceChecks || stats.Unmapped != want.Unmapped {
 		t.Fatalf("stats = %+v, want %+v", stats, want)
 	}
 	for _, forbidden := range []string{impactClientContent, "changed file", "related to", "退款", "line one"} {
@@ -970,5 +970,408 @@ func TestImpactPromptCaps(t *testing.T) {
 	stats := impactDecodeStats(t, result.Stats)
 	if !stats.PromptTruncated || stats.PromptFacts <= 0 || stats.PromptFacts >= 10 {
 		t.Fatalf("stats = %+v, want a truncated prompt with fewer than 10 facts", stats)
+	}
+}
+
+// TestImpactAppModelCandidatesOnlyUseChangedFacts pins review finding 1: the
+// head-wide FactsAtHead snapshot must never turn an unrelated high/medium api
+// fact from another analysis/version into a direct app model candidate. A fact
+// produced by this run keeps counting even when the model attributed it to a
+// path outside the change set (AnalysisID provenance).
+func TestImpactAppModelCandidatesOnlyUseChangedFacts(t *testing.T) {
+	const adminAppModelID int64 = 9301
+
+	newAdminFixture := func(t *testing.T) *impactFixture {
+		t.Helper()
+		f := newImpactFixture(t)
+		f.appModels.nodes = []AppModelNode{{
+			ID:       adminAppModelID,
+			SystemID: impactSystemID,
+			Kind:     domain.KindAPI,
+			Key:      "api:POST /api/admin",
+			Name:     "Admin",
+			Path:     "/api/admin",
+			Method:   "POST",
+		}}
+		return f
+	}
+	unrelated := func(confidence string) domain.CodeEntity {
+		return impactEntity(31, domain.KindAPI, "POST /api/admin", "server/admin.go",
+			confidence, "api:POST /api/admin",
+			domain.Evidence{File: "server/admin.go", StartLine: 1, EndLine: 2})
+	}
+
+	t.Run("unrelated head fact is ignored", func(t *testing.T) {
+		for _, confidence := range []string{domain.ConfidenceHigh, domain.ConfidenceMedium} {
+			t.Run(confidence, func(t *testing.T) {
+				f := newAdminFixture(t)
+				in := f.input([]domain.ChangedFile{impactChangedFile(impactClientPath)},
+					[]domain.CodeEntity{unrelated(confidence)})
+				in.Degraded = true
+
+				result, err := f.newService(nil).Plan(context.Background(), in)
+				if err != nil {
+					t.Fatalf("Plan error = %v", err)
+				}
+				if !impactAbsentCandidate(result.Candidates, domain.CandidateAppModel, adminAppModelID) {
+					t.Fatalf("unchanged head fact produced an app model candidate: %+v", result.Candidates)
+				}
+				if len(result.Candidates) != 0 {
+					t.Fatalf("candidates = %+v, want none", result.Candidates)
+				}
+			})
+		}
+	})
+
+	t.Run("this run out-of-path fact still counts", func(t *testing.T) {
+		f := newAdminFixture(t)
+		analysisID := int64(77)
+		own := unrelated(domain.ConfidenceHigh)
+		own.ID = 32
+		own.AnalysisID = &analysisID
+		in := f.input([]domain.ChangedFile{impactChangedFile(impactClientPath)},
+			[]domain.CodeEntity{own})
+		in.Analysis.ID = analysisID
+		in.Degraded = true
+
+		result, err := f.newService(nil).Plan(context.Background(), in)
+		if err != nil {
+			t.Fatalf("Plan error = %v", err)
+		}
+		candidate := impactFindCandidate(t, result.Candidates, domain.CandidateAppModel, adminAppModelID)
+		if candidate.Source != domain.CandidateDirect || candidate.Confidence != domain.ConfidenceHigh {
+			t.Fatalf("run-provenance candidate = %+v, want direct/high", candidate)
+		}
+	})
+
+	t.Run("low fact never becomes a candidate", func(t *testing.T) {
+		f := newAdminFixture(t)
+		low := unrelated(domain.ConfidenceLow)
+		in := f.input([]domain.ChangedFile{impactChangedFile("server/admin.go")},
+			[]domain.CodeEntity{low})
+		in.Degraded = true
+
+		result, err := f.newService(nil).Plan(context.Background(), in)
+		if err != nil {
+			t.Fatalf("Plan error = %v", err)
+		}
+		if len(result.Candidates) != 0 {
+			t.Fatalf("low fact produced automatic candidates (INV-1): %+v", result.Candidates)
+		}
+	})
+}
+
+// TestImpactLowFactsProduceNoAutomaticCandidates pins INV-1 for the direct and
+// contract sources: low client_call/api facts never yield an app model
+// candidate, even when their key matches a node and a route_to_api edge exists.
+func TestImpactLowFactsProduceNoAutomaticCandidates(t *testing.T) {
+	f := newImpactFixture(t)
+	f.appModels.nodes = []AppModelNode{{
+		ID:       impactAPIAppModelID,
+		SystemID: impactSystemID,
+		Kind:     domain.KindAPI,
+		Key:      "api:POST /api/refund",
+		Name:     "Refund",
+		Path:     "/api/refund",
+		Method:   "POST",
+	}}
+	lowAPI := impactEntity(41, domain.KindAPI, "POST /api/refund", impactServerPath,
+		domain.ConfidenceLow, "api:POST /api/refund",
+		domain.Evidence{File: impactServerPath, StartLine: 1, EndLine: 1})
+	lowClient := impactEntity(42, domain.KindClientCall, "POST /api/refund", impactClientPath,
+		domain.ConfidenceLow, "client:POST /api/refund",
+		domain.Evidence{File: impactClientPath, StartLine: 1, EndLine: 1})
+	f.edges.edges = []domain.CodeEdge{{
+		ID: 33, RepoID: impactRepoID, Commit: testCommitA,
+		SrcEntityID: 42, DstEntityID: 41,
+		Rel: domain.RelRouteToAPI, Source: domain.SourceAI, Confidence: domain.ConfidenceLow,
+		Meta: []byte(`{"method":"POST","normalizedPath":"/api/refund","match":"exact"}`),
+	}}
+
+	in := f.input([]domain.ChangedFile{
+		impactChangedFile(impactClientPath), impactChangedFile(impactServerPath),
+	}, []domain.CodeEntity{lowAPI, lowClient})
+	in.Degraded = true
+
+	result, err := f.newService(nil).Plan(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Plan error = %v", err)
+	}
+	if len(result.Candidates) != 0 {
+		t.Fatalf("low facts produced automatic candidates (INV-1): %+v", result.Candidates)
+	}
+	stats := impactDecodeStats(t, result.Stats)
+	if stats.UnmatchedContracts != 0 {
+		t.Fatalf("stats.unmatchedContracts = %d, want 0 (low facts are not contract sources)", stats.UnmatchedContracts)
+	}
+}
+
+// TestImpactAIFailuresDegradeWithoutFailing pins §6.6's degradation contract for
+// both AI failure modes: a completion error and a malformed JSON response set
+// aiUnavailable/aiErrors, leave the analysis successful and mark the uncovered
+// changed files ai_unavailable.
+func TestImpactAIFailuresDegradeWithoutFailing(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*impactFixture)
+	}{
+		{
+			name: "completion error",
+			mutate: func(f *impactFixture) {
+				f.llm.defaultErr = errors.New("llm unavailable")
+			},
+		},
+		{
+			name: "malformed json",
+			mutate: func(f *impactFixture) {
+				f.llm.defaultResponse = "this is not the impact schema"
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newImpactFixture(t)
+			tc.mutate(f)
+			in := f.input([]domain.ChangedFile{impactChangedFile(impactPlainPath)}, nil)
+			in.Requirements = []RequirementInfo{{ID: impactRequirementID, Title: "退款"}}
+
+			result, err := f.newService(nil).Plan(context.Background(), in)
+			if err != nil {
+				t.Fatalf("Plan error = %v, want a degraded success", err)
+			}
+			if got := f.llm.callCount(); got != 1 {
+				t.Fatalf("LLM calls = %d, want 1", got)
+			}
+			if len(result.Candidates) != 0 {
+				t.Fatalf("candidates = %+v, want none", result.Candidates)
+			}
+			if entry := impactUnmappedFor(t, result.Unmapped, impactPlainPath, domain.UnmappedAIUnavailable); entry.Suggestion != "AI 不可用，请人工确认" {
+				t.Fatalf("unmapped = %+v, want the AI-unavailable suggestion", entry)
+			}
+			stats := impactDecodeStats(t, result.Stats)
+			if !stats.AIUnavailable || stats.AIErrors != 1 || stats.AIEvidenceChecks != 0 {
+				t.Fatalf("stats = %+v, want aiUnavailable with one AI error", stats)
+			}
+		})
+	}
+}
+
+// TestImpactChangedAPIContractPropagation pins §6.5/§6.6's second propagation
+// direction: a changed api fact reaches its route_to_api counterpart client_call
+// and the component/page facts on that counterpart path become contract-sourced
+// app model candidates (R38 supplies the companion facts in FactsAtHead).
+func TestImpactChangedAPIContractPropagation(t *testing.T) {
+	const (
+		componentAppModelID int64 = 9401
+		pageAppModelID      int64 = 9402
+	)
+	clientPath := impactClientPath
+	serverPath := impactServerPath
+
+	f := newImpactFixture(t)
+	f.appModels.nodes = []AppModelNode{
+		{ID: componentAppModelID, SystemID: impactSystemID, Kind: domain.KindComponent,
+			Key: "component:RefundButton", Name: "RefundButton", Path: clientPath},
+		{ID: pageAppModelID, SystemID: impactSystemID, Kind: domain.KindPage,
+			Key: "page:/orders", Name: "Orders", Path: "/orders"},
+	}
+	apiFact := impactEntity(51, domain.KindAPI, "POST /api/refund", serverPath,
+		domain.ConfidenceHigh, "api:POST /api/refund",
+		domain.Evidence{File: serverPath, StartLine: 1, EndLine: 2})
+	clientFact := impactEntity(52, domain.KindClientCall, "POST /api/refund", clientPath,
+		domain.ConfidenceHigh, "client:POST /api/refund",
+		domain.Evidence{File: clientPath, StartLine: 1, EndLine: 1, ExcerptHash: "sha256:bb"})
+	componentFact := impactEntity(53, domain.KindComponent, "RefundButton", clientPath,
+		domain.ConfidenceMedium, "component:web/src/api/refund.ts#RefundButton",
+		domain.Evidence{File: clientPath, StartLine: 2, EndLine: 2, ExcerptHash: "sha256:cc"})
+	pageFact := impactEntity(54, domain.KindPage, "/orders", clientPath,
+		domain.ConfidenceHigh, "page:/orders",
+		domain.Evidence{File: clientPath, StartLine: 3, EndLine: 3, ExcerptHash: "sha256:dd"})
+	f.edges.edges = []domain.CodeEdge{{
+		ID: 34, RepoID: impactRepoID, Commit: testCommitA,
+		SrcEntityID: 52, DstEntityID: 51,
+		Rel: domain.RelRouteToAPI, Source: domain.SourceAI, Confidence: domain.ConfidenceHigh,
+		Evidence: []domain.Evidence{{File: clientPath, StartLine: 1, EndLine: 1, ExcerptHash: "sha256:aa"}},
+		Meta:     []byte(`{"method":"POST","normalizedPath":"/api/refund","match":"exact"}`),
+	}}
+
+	in := f.input([]domain.ChangedFile{impactChangedFile(serverPath)},
+		[]domain.CodeEntity{apiFact, clientFact, componentFact, pageFact})
+	in.Degraded = true
+
+	result, err := f.newService(nil).Plan(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Plan error = %v", err)
+	}
+	if len(result.Candidates) != 2 {
+		t.Fatalf("candidates = %+v, want the component and page contract candidates", result.Candidates)
+	}
+	for _, candidate := range result.Candidates {
+		if candidate.Source != domain.CandidateContract {
+			t.Fatalf("candidate = %+v, want source=contract (companions are on the unchanged counterpart path)", candidate)
+		}
+		if candidate.Reason != "contract POST /api/refund changed" {
+			t.Fatalf("candidate reason = %q", candidate.Reason)
+		}
+	}
+	component := impactFindCandidate(t, result.Candidates, domain.CandidateAppModel, componentAppModelID)
+	if component.Confidence != domain.ConfidenceMedium || !component.Selected {
+		t.Fatalf("component candidate = %+v, want contract/medium/selected (min of api, edge and companion)", component)
+	}
+	if !impactCandidateHasEvidence(component, serverPath) || !impactCandidateHasEvidence(component, clientPath) {
+		t.Fatalf("component evidence = %+v, want the api, edge and companion evidence", component.Evidence)
+	}
+	page := impactFindCandidate(t, result.Candidates, domain.CandidateAppModel, pageAppModelID)
+	if page.Confidence != domain.ConfidenceHigh || !page.Selected {
+		t.Fatalf("page candidate = %+v, want contract/high/selected", page)
+	}
+	stats := impactDecodeStats(t, result.Stats)
+	if stats.UnmatchedContracts != 0 || stats.Contract != 2 {
+		t.Fatalf("stats = %+v, want two contract candidates and no unmatched contract", stats)
+	}
+}
+
+// impactCandidateHasEvidence reports whether one candidate carries evidence for
+// a file.
+func impactCandidateHasEvidence(candidate domain.ImpactCandidate, file string) bool {
+	for _, evidence := range candidate.Evidence {
+		if evidence.File == file {
+			return true
+		}
+	}
+	return false
+}
+
+// TestImpactPlannerStatsPreserveAnalysisEvidenceCounters pins ruling R37: the
+// planner emits aiEvidenceChecks/aiEvidenceFailures and never overwrites the T10
+// evidenceChecks/evidenceFailures keys when the analysis stats are merged.
+func TestImpactPlannerStatsPreserveAnalysisEvidenceCounters(t *testing.T) {
+	f := newImpactFixture(t)
+	f.llm.defaultResponse = fmt.Sprintf(
+		`{"affected":[{"requirementId":"%d","reason":"证据有效","confidence":"high","evidence":[{"file":%q,"startLine":1,"endLine":1}]}]}`,
+		impactRequirementID, impactClientPath)
+	in := f.input([]domain.ChangedFile{impactChangedFile(impactClientPath)}, nil)
+	in.Requirements = []RequirementInfo{{ID: impactRequirementID, Title: "退款"}}
+
+	result, err := f.newService(nil).Plan(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Plan error = %v", err)
+	}
+
+	var plannerKeys map[string]json.RawMessage
+	if err := json.Unmarshal(result.Stats, &plannerKeys); err != nil {
+		t.Fatalf("decode planner stats %q: %v", string(result.Stats), err)
+	}
+	for _, legacy := range []string{"evidenceChecks", "evidenceFailures"} {
+		if _, ok := plannerKeys[legacy]; ok {
+			t.Fatalf("planner stats still emit %q: %s", legacy, string(result.Stats))
+		}
+	}
+
+	merged, err := mergeAnalysisStats(analysisStats{EvidenceChecks: 6, EvidenceFailures: 2}, result.Stats)
+	if err != nil {
+		t.Fatalf("merge stats: %v", err)
+	}
+	var values struct {
+		EvidenceChecks     int `json:"evidenceChecks"`
+		EvidenceFailures   int `json:"evidenceFailures"`
+		AIEvidenceChecks   int `json:"aiEvidenceChecks"`
+		AIEvidenceFailures int `json:"aiEvidenceFailures"`
+	}
+	if err := json.Unmarshal(merged, &values); err != nil {
+		t.Fatalf("decode merged stats %q: %v", string(merged), err)
+	}
+	if values.EvidenceChecks != 6 || values.EvidenceFailures != 2 {
+		t.Fatalf("merged T10 evidence counters = %d/%d, want 6/2",
+			values.EvidenceChecks, values.EvidenceFailures)
+	}
+	if values.AIEvidenceChecks != 1 || values.AIEvidenceFailures != 0 {
+		t.Fatalf("merged planner counters = %d/%d, want 1/0",
+			values.AIEvidenceChecks, values.AIEvidenceFailures)
+	}
+}
+
+// TestImpactPromptByteBudgetAndSummaryTruncation pins R15: the configured byte
+// budget can only lower the 64 KiB hard cap and a large changeSummary is
+// truncated so the final system+user prompt never exceeds the budget.
+func TestImpactPromptByteBudgetAndSummaryTruncation(t *testing.T) {
+	t.Run("configuration clamps to the R15 hard bound", func(t *testing.T) {
+		f := newImpactFixture(t)
+		svc := f.newService(func(deps *ImpactServiceDeps) {
+			deps.MaxPromptBytes = 8 << 20
+			deps.MaxFacts = 5000
+		})
+		if svc.config.maxPromptBytes != 64<<10 {
+			t.Fatalf("maxPromptBytes = %d, want the 64 KiB hard cap", svc.config.maxPromptBytes)
+		}
+		if svc.config.maxFacts != defaultImpactMaxFacts {
+			t.Fatalf("maxFacts = %d, want the %d hard cap", svc.config.maxFacts, defaultImpactMaxFacts)
+		}
+	})
+
+	t.Run("large change summary is truncated", func(t *testing.T) {
+		f := newImpactFixture(t)
+		summary := strings.Repeat("摘", 2000)
+		stats, err := json.Marshal(map[string]string{"changeSummary": summary})
+		if err != nil {
+			t.Fatalf("encode stats: %v", err)
+		}
+		in := f.input([]domain.ChangedFile{impactChangedFile(impactClientPath)}, nil)
+		in.Analysis.Stats = stats
+		in.Requirements = []RequirementInfo{{ID: impactRequirementID, Title: "退款"}}
+
+		svc := f.newService(func(deps *ImpactServiceDeps) {
+			deps.MaxPromptBytes = 4 << 10
+		})
+		result, err := svc.Plan(context.Background(), in)
+		if err != nil {
+			t.Fatalf("Plan error = %v", err)
+		}
+		if len(f.llm.users) != 1 {
+			t.Fatalf("captured prompts = %d, want 1", len(f.llm.users))
+		}
+		user := f.llm.users[0]
+		if total := len(impactAnalysisSystem) + len(user); total > 4<<10 {
+			t.Fatalf("prompt bytes = %d, want <= 4096", total)
+		}
+		if !strings.Contains(user, "变更摘要已截断") {
+			t.Fatalf("prompt is missing the summary truncation marker")
+		}
+		if strings.Count(user, "摘") >= 2000 {
+			t.Fatalf("prompt kept the full change summary")
+		}
+		statsDoc := impactDecodeStats(t, result.Stats)
+		if !statsDoc.PromptTruncated {
+			t.Fatalf("stats = %+v, want promptTruncated", statsDoc)
+		}
+	})
+}
+
+// TestImpactUnmappedCombinedPathOrder pins the deterministic order of the
+// combined unmapped list: file entries and unmatched-contract extras are sorted
+// together by path before the cap is applied.
+func TestImpactUnmappedCombinedPathOrder(t *testing.T) {
+	f := newImpactFixture(t)
+	client := impactEntity(61, domain.KindClientCall, "GET /api/missing", "src/a.ts",
+		domain.ConfidenceHigh, "client:GET /api/missing",
+		domain.Evidence{File: "src/a.ts", StartLine: 1, EndLine: 1})
+	in := f.input([]domain.ChangedFile{
+		impactChangedFile("src/z.ts"),
+		impactChangedFile("src/a.ts"),
+	}, []domain.CodeEntity{client})
+	in.Degraded = true
+
+	result, err := f.newService(nil).Plan(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Plan error = %v", err)
+	}
+	if len(result.Unmapped) != 2 {
+		t.Fatalf("unmapped = %+v, want two entries", result.Unmapped)
+	}
+	if result.Unmapped[0].Path != "src/a.ts" || result.Unmapped[0].Reason != domain.UnmappedContract {
+		t.Fatalf("unmapped[0] = %+v, want the unmatched-contract entry of src/a.ts", result.Unmapped[0])
+	}
+	if result.Unmapped[1].Path != "src/z.ts" {
+		t.Fatalf("unmapped[1] = %+v, want src/z.ts", result.Unmapped[1])
 	}
 }
