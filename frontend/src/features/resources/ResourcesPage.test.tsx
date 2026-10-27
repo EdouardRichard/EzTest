@@ -8,6 +8,16 @@ const mocks = vi.hoisted(() => ({
   listEnvironments: vi.fn(),
   createEnvironment: vi.fn(),
   updateEnvironment: vi.fn(),
+  listAppModels: vi.fn(),
+  importAppModels: vi.fn(),
+  createAppModel: vi.fn(),
+  updateAppModel: vi.fn(),
+  listAccounts: vi.fn(),
+  createAccount: vi.fn(),
+  updateAccount: vi.fn(),
+  listAccesses: vi.fn(),
+  createAccess: vi.fn(),
+  updateAccess: vi.fn(),
 }))
 
 const auth = vi.hoisted(() => ({ role: "user" as "user" | "admin" }))
@@ -28,6 +38,16 @@ vi.mock("./api", () => ({
   listEnvironments: mocks.listEnvironments,
   createEnvironment: mocks.createEnvironment,
   updateEnvironment: mocks.updateEnvironment,
+  listAppModels: mocks.listAppModels,
+  importAppModels: mocks.importAppModels,
+  createAppModel: mocks.createAppModel,
+  updateAppModel: mocks.updateAppModel,
+  listAccounts: mocks.listAccounts,
+  createAccount: mocks.createAccount,
+  updateAccount: mocks.updateAccount,
+  listAccesses: mocks.listAccesses,
+  createAccess: mocks.createAccess,
+  updateAccess: mocks.updateAccess,
 }))
 
 import { ResourcesPage } from "./ResourcesPage"
@@ -73,6 +93,9 @@ describe("ResourcesPage", () => {
     auth.role = "user"
     mocks.listSystems.mockResolvedValue({ items: [], nextCursor: null, hasMore: false })
     mocks.listEnvironments.mockResolvedValue([])
+    mocks.listAppModels.mockResolvedValue({ items: [], nextCursor: null, hasMore: false })
+    mocks.listAccounts.mockResolvedValue({ items: [], nextCursor: null, hasMore: false })
+    mocks.listAccesses.mockResolvedValue([])
   })
 
   afterEach(() => {
@@ -110,7 +133,7 @@ describe("ResourcesPage", () => {
 
     fireEvent.mouseDown(screen.getByRole("tab", { name: "应用模型" }))
 
-    expect(await screen.findByRole("heading", { name: "应用模型面板即将上线" })).toBeTruthy()
+    expect(await screen.findByRole("heading", { name: "请选择系统" })).toBeTruthy()
     await waitFor(() => expect(window.location.search).toContain("tab=app-models"))
   })
 

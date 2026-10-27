@@ -227,12 +227,14 @@ describe("resources api", () => {
 
   it("calls the app model endpoints from spec §7.3", async () => {
     fetchMock.mockResolvedValue(jsonResponse({ data: [NODE] }))
-    await expect(listAppModels(1, { kind: "route" })).resolves.toEqual({
+    await expect(listAppModels(1, { kind: "route", limit: 100 })).resolves.toEqual({
       items: [NODE],
       nextCursor: null,
       hasMore: false,
     })
-    expect(lastRequest().url.endsWith("/api/resources/systems/1/app-models?kind=route")).toBe(true)
+    expect(
+      lastRequest().url.endsWith("/api/resources/systems/1/app-models?kind=route&limit=100"),
+    ).toBe(true)
 
     fetchMock.mockResolvedValue(jsonResponse({ data: NODE }, 201))
     await expect(createAppModel(1, { key: "route:/orders", kind: "route" })).resolves.toEqual(NODE)
@@ -279,8 +281,8 @@ describe("resources api", () => {
     expect(lastRequest().url.endsWith("/api/resources/accounts/3")).toBe(true)
 
     fetchMock.mockResolvedValue(jsonResponse({ data: [ACCESS] }))
-    await expect(listAccesses(3)).resolves.toEqual([ACCESS])
-    expect(lastRequest().url.endsWith("/api/resources/accounts/3/accesses")).toBe(true)
+    await expect(listAccesses(3, { limit: 100 })).resolves.toEqual([ACCESS])
+    expect(lastRequest().url.endsWith("/api/resources/accounts/3/accesses?limit=100")).toBe(true)
 
     fetchMock.mockResolvedValue(jsonResponse({ data: ACCESS }, 201))
     await expect(createAccess(3, { systemId: 1, authType: "manual" })).resolves.toEqual(ACCESS)

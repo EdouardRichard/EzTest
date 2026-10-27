@@ -8,6 +8,8 @@ import { EmptyState } from "@/components/ui/EmptyState"
 import { StatusBadge } from "@/components/ui/StatusBadge"
 import { useAuth } from "@/features/auth/AuthProvider"
 
+import { AccountsPanel } from "./AccountsPanel"
+import { AppModelsPanel } from "./AppModelsPanel"
 import { EnvironmentsPanel } from "./EnvironmentsPanel"
 import { SystemsPanel } from "./SystemsPanel"
 
@@ -60,9 +62,11 @@ const tabTriggerClass =
  * Normal users get a read-only badge and never see write controls.
  */
 export function ResourcesPage() {
-  const { user } = useAuth()
+  const { user, loading } = useAuth()
   const canWrite = user?.role === "admin"
-  const readonly = user !== null && !canWrite
+  // While the session is being restored, `user` is still null; showing the
+  // readonly badge then would flash for admins, so wait for the restore.
+  const readonly = !loading && user !== null && !canWrite
 
   const [tab, setTab] = useState<ResourceTab>("systems")
   const [selectedSystemId, setSelectedSystemId] = useState<number | null>(null)
@@ -128,25 +132,38 @@ export function ResourcesPage() {
                 description="从左侧选择一个系统后查看和维护它的环境。"
               />
             ) : (
-              <EnvironmentsPanel systemId={selectedSystemId} canWrite={canWrite} />
+              <EnvironmentsPanel
+                key={selectedSystemId}
+                systemId={selectedSystemId}
+                canWrite={canWrite}
+              />
             )}
           </div>
         </Tabs.Content>
 
         <Tabs.Content value="app-models" className="pt-4">
-          <EmptyState
-            icon={Boxes}
-            title="应用模型面板即将上线"
-            description="应用模型树、kind 筛选与 JSON 导入将在后续任务中提供。"
-          />
+          {selectedSystemId === null ? (
+            <EmptyState
+              icon={Boxes}
+              title="请选择系统"
+              description="应用模型按系统归属；请先在「系统与环境」中选择一个系统。"
+              action={
+                <button
+                  type="button"
+                  onClick={() => handleTabChange("systems")}
+                  className={tabTriggerClass}
+                >
+                  前往系统与环境
+                </button>
+              }
+            />
+          ) : (
+            <AppModelsPanel systemId={selectedSystemId} canWrite={canWrite} />
+          )}
         </Tabs.Content>
 
         <Tabs.Content value="accounts" className="pt-4">
-          <EmptyState
-            icon={KeyRound}
-            title="账号与访问面板即将上线"
-            description="账号列表与 Access 凭据配置将在后续任务中提供。"
-          />
+          <AccountsPanel canWrite={canWrite} />
         </Tabs.Content>
 
         <Tabs.Content value="sessions" className="pt-4">
