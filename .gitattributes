@@ -1,3 +1,6 @@
 # Migration files are hashed byte-for-byte into schema_migrations; keep them LF
 # on every platform so core.autocrlf cannot change the checksum.
 *.sql text eol=lf
+
+# Biome formats with LF; keep frontend checkouts LF on Windows too.
+frontend/** text eol=lf
