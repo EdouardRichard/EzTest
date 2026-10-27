@@ -29,6 +29,32 @@ vi.mock("@/lib/api-client", () => {
   return { ApiError }
 })
 
+vi.mock("./SessionPane", () => ({
+  SessionPane: ({
+    sessionId,
+    session,
+  }: {
+    sessionId: number | null
+    session: { id: number; title: string } | null
+  }) => (
+    <div
+      data-testid="session-pane-mock"
+      data-session-id={sessionId === null ? undefined : sessionId}
+      data-session-title={session?.title}
+    >
+      session-pane-mock
+    </div>
+  ),
+}))
+
+vi.mock("./ConfigPane", () => ({
+  ConfigPane: ({ profiles }: { profiles: unknown[]; onSaved: (profile: unknown) => void }) => (
+    <div data-testid="config-pane-mock" data-profile-count={profiles.length}>
+      config-pane-mock
+    </div>
+  ),
+}))
+
 import { ApiError } from "@/lib/api-client"
 
 import { AgentConsole } from "./AgentConsole"
@@ -116,13 +142,16 @@ describe("AgentConsole", () => {
     expect(screen.getByRole("heading", { name: "Agent 运行时控制台" })).toBeTruthy()
     expect(screen.getByRole("tab", { name: "会话" })).toBeTruthy()
     expect(screen.getByRole("tab", { name: "配置" })).toBeTruthy()
-    expect(screen.getByText("选择或新建会话")).toBeTruthy()
+    const emptyPane = screen.getByTestId("session-pane-mock")
+    expect(emptyPane.getAttribute("data-session-id")).toBeNull()
+    expect(emptyPane.getAttribute("data-session-title")).toBeNull()
     await waitFor(() => expect(mocks.listProfiles).toHaveBeenCalledTimes(1))
     expect(mocks.listSessions).toHaveBeenCalledWith({ limit: 20 })
 
     // Radix Tabs activates on mousedown (focus follows in a real browser).
     fireEvent.mouseDown(screen.getByRole("tab", { name: "配置" }))
-    expect(await screen.findByText("配置在后续任务接入")).toBeTruthy()
+    const configPane = await screen.findByTestId("config-pane-mock")
+    expect(configPane.getAttribute("data-profile-count")).toBe("1")
   })
 
   it("creates and selects a session and syncs ?session= into the URL", async () => {
@@ -142,12 +171,16 @@ describe("AgentConsole", () => {
     const created = await screen.findByRole("button", { name: "新会话" })
     expect(created.getAttribute("aria-current")).toBe("true")
     await waitFor(() => expect(window.location.search).toBe("?session=2"))
-    expect(screen.getByText("当前会话：新会话")).toBeTruthy()
+    let pane = screen.getByTestId("session-pane-mock")
+    expect(pane.getAttribute("data-session-id")).toBe("2")
+    expect(pane.getAttribute("data-session-title")).toBe("新会话")
 
     fireEvent.click(screen.getByRole("button", { name: "会话一" }))
     await waitFor(() => expect(window.location.search).toBe("?session=1"))
     expect(screen.getByRole("button", { name: "会话一" }).getAttribute("aria-current")).toBe("true")
-    expect(screen.getByText("当前会话：会话一")).toBeTruthy()
+    pane = screen.getByTestId("session-pane-mock")
+    expect(pane.getAttribute("data-session-id")).toBe("1")
+    expect(pane.getAttribute("data-session-title")).toBe("会话一")
   })
 
   it("selects the session named by the ?session= deep link", async () => {
@@ -162,7 +195,9 @@ describe("AgentConsole", () => {
 
     const linked = await screen.findByRole("button", { name: "会话二" })
     await waitFor(() => expect(linked.getAttribute("aria-current")).toBe("true"))
-    expect(screen.getByText("当前会话：会话二")).toBeTruthy()
+    const pane = screen.getByTestId("session-pane-mock")
+    expect(pane.getAttribute("data-session-id")).toBe("2")
+    expect(pane.getAttribute("data-session-title")).toBe("会话二")
   })
 
   it("loads a deep-linked session that is not on the first page", async () => {
@@ -177,7 +212,11 @@ describe("AgentConsole", () => {
     render(<AgentConsole />)
 
     await waitFor(() => expect(mocks.getSession).toHaveBeenCalledWith(7))
-    expect(await screen.findByText("当前会话：深层会话")).toBeTruthy()
+    await waitFor(() => {
+      const pane = screen.getByTestId("session-pane-mock")
+      expect(pane.getAttribute("data-session-id")).toBe("7")
+      expect(pane.getAttribute("data-session-title")).toBe("深层会话")
+    })
   })
 
   it("removes a deleted session and clears its deep link", async () => {
