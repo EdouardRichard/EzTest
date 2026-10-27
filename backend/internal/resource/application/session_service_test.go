@@ -1113,6 +1113,116 @@ func TestSessionServiceValidateMissingSession(t *testing.T) {
 	assertCatalogServiceError(t, err, domain.KindNotFound, "not_found")
 }
 
+// TestSessionServiceValidateRefreshesExpiry proves that a successful validate
+// recomputes expires_at from the access/system TTL and the stored state's cookie
+// expiry instead of keeping the previous, possibly already past, value.
+func TestSessionServiceValidateRefreshesExpiry(t *testing.T) {
+	cases := []struct {
+		name         string
+		state        string
+		kind         string
+		storageState json.RawMessage
+		accessTTL    *int
+		wantExpiry   time.Time
+	}{
+		{
+			name: "expired session refreshes to the ttl", state: domain.StateExpired,
+			wantExpiry: sessionTestNow.Add(time.Hour),
+		},
+		{
+			name: "valid session refreshes to the ttl", state: domain.StateValid,
+			wantExpiry: sessionTestNow.Add(time.Hour),
+		},
+		{
+			name: "needs_manual session refreshes to the ttl", state: domain.StateNeedsManual,
+			wantExpiry: sessionTestNow.Add(time.Hour),
+		},
+		{
+			name: "access ttl drives the refresh", state: domain.StateExpired,
+			accessTTL: sessionIntPtr(120), wantExpiry: sessionTestNow.Add(2 * time.Minute),
+		},
+		{
+			name: "cookie expiry caps the refresh", state: domain.StateExpired,
+			storageState: sessionStateWithCookieExpiry(sessionTestNow.Add(15 * time.Minute).Unix()),
+			wantExpiry:   sessionTestNow.Add(15 * time.Minute),
+		},
+		{
+			name: "token state has no cookie cap", state: domain.StateExpired,
+			kind:         domain.StorageStateKindToken,
+			storageState: json.RawMessage(`{"headers":{"Authorization":"Bearer live-token"}}`),
+			wantExpiry:   sessionTestNow.Add(time.Hour),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, f := newSessionServiceWithFakes(t)
+			if tc.accessTTL != nil {
+				access := f.accesses.accesses[f.accessID]
+				access.SessionTTLSeconds = tc.accessTTL
+				f.accesses.accesses[f.accessID] = access
+			}
+			f.checker.result = domain.LoginCheckResult{Observed: domain.ObservedAllowed, Status: 200}
+			seeded := f.seedSession(domain.Session{
+				State:            tc.state,
+				ExpiresAt:        sessionTimePtr(sessionTestNow.Add(-time.Minute)),
+				StorageState:     tc.storageState,
+				StorageStateKind: tc.kind,
+			})
+
+			session, _, err := svc.Validate(context.Background(), seeded.ID)
+			if err != nil {
+				t.Fatalf("Validate: %v", err)
+			}
+			if session.State != domain.StateValid {
+				t.Fatalf("state=%q want valid", session.State)
+			}
+			if session.ExpiresAt == nil || !session.ExpiresAt.Equal(tc.wantExpiry) {
+				t.Fatalf("expires_at=%v want %v", session.ExpiresAt, tc.wantExpiry)
+			}
+			if session.LastValidatedAt == nil || !session.LastValidatedAt.Equal(sessionTestNow) {
+				t.Fatalf("last_validated_at=%v want now", session.LastValidatedAt)
+			}
+			if stored := f.sessions.sessions[seeded.ID]; stored.ExpiresAt == nil ||
+				!stored.ExpiresAt.Equal(tc.wantExpiry) {
+				t.Fatalf("stored expires_at=%v want %v", stored.ExpiresAt, tc.wantExpiry)
+			}
+			// The finding's symptom: a refresh after the action must not
+			// lazy-expire the row back to expired.
+			refreshed, _, _, _, err := svc.Get(context.Background(), seeded.ID)
+			if err != nil {
+				t.Fatalf("Get after Validate: %v", err)
+			}
+			if refreshed.State != domain.StateValid {
+				t.Fatalf("Get after Validate state=%q want valid", refreshed.State)
+			}
+		})
+	}
+}
+
+// TestSessionServiceValidateRejectsExpiredStorageState proves the helper rejects
+// a state whose computed expiry is not after now: the row must not be persisted
+// as valid with an expiry that Get/List would immediately lazy-expire. The
+// contract maps storage_state_expired to 422 invalid_argument.
+func TestSessionServiceValidateRejectsExpiredStorageState(t *testing.T) {
+	svc, f := newSessionServiceWithFakes(t)
+	f.checker.result = domain.LoginCheckResult{Observed: domain.ObservedAllowed, Status: 200}
+	seeded := f.seedSession(domain.Session{
+		State:        domain.StateExpired,
+		ExpiresAt:    sessionTimePtr(sessionTestNow.Add(-time.Minute)),
+		StorageState: sessionStateWithCookieExpiry(sessionTestNow.Add(-time.Minute).Unix()),
+	})
+
+	_, _, err := svc.Validate(context.Background(), seeded.ID)
+	assertCatalogServiceError(t, err, domain.KindInvalid, "storage_state_expired")
+	if f.sessions.updateSessionCalls != 0 || f.sessions.createSnapshotCalls != 0 {
+		t.Fatalf("a validate of an expired storage state wrote state: updates=%d snapshots=%d",
+			f.sessions.updateSessionCalls, f.sessions.createSnapshotCalls)
+	}
+	if stored := f.sessions.sessions[seeded.ID]; stored.State != domain.StateExpired {
+		t.Fatalf("stored state=%q want expired", stored.State)
+	}
+}
+
 func TestSessionServiceConfirmMarksManualValid(t *testing.T) {
 	for _, state := range []string{domain.StatePending, domain.StateNeedsManual} {
 		t.Run(state, func(t *testing.T) {
@@ -1176,6 +1286,113 @@ func TestSessionServiceConfirmCASConflict(t *testing.T) {
 	if f.sessions.sessions[seeded.ID].State != domain.StateNeedsManual {
 		t.Fatal("a conflicting confirm changed the stored state")
 	}
+}
+
+// TestSessionServiceConfirmRefreshesExpiry proves a manual confirmation of a
+// still-live session recomputes expires_at from the current state (access/system
+// TTL capped by the earliest cookie expiry) instead of keeping the old value.
+func TestSessionServiceConfirmRefreshesExpiry(t *testing.T) {
+	cases := []struct {
+		name         string
+		kind         string
+		storageState json.RawMessage
+		wantExpiry   time.Time
+	}{
+		{
+			name:       "live session refreshes to the ttl",
+			wantExpiry: sessionTestNow.Add(time.Hour),
+		},
+		{
+			name:         "cookie expiry caps the refresh",
+			storageState: sessionStateWithCookieExpiry(sessionTestNow.Add(20 * time.Minute).Unix()),
+			wantExpiry:   sessionTestNow.Add(20 * time.Minute),
+		},
+		{
+			name:         "token state has no cookie cap",
+			kind:         domain.StorageStateKindToken,
+			storageState: json.RawMessage(`{"headers":{"Authorization":"Bearer live-token"}}`),
+			wantExpiry:   sessionTestNow.Add(time.Hour),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, f := newSessionServiceWithFakes(t)
+			// The old expiry is live but shorter than the refreshed candidate.
+			seeded := f.seedSession(domain.Session{
+				State:            domain.StateNeedsManual,
+				ExpiresAt:        sessionTimePtr(sessionTestNow.Add(5 * time.Minute)),
+				StorageState:     tc.storageState,
+				StorageStateKind: tc.kind,
+			})
+
+			session, _, err := svc.Confirm(context.Background(), seeded.ID, "", nil)
+			if err != nil {
+				t.Fatalf("Confirm: %v", err)
+			}
+			if session.State != domain.StateValid {
+				t.Fatalf("state=%q want valid", session.State)
+			}
+			if session.ExpiresAt == nil || !session.ExpiresAt.Equal(tc.wantExpiry) {
+				t.Fatalf("expires_at=%v want %v", session.ExpiresAt, tc.wantExpiry)
+			}
+			if stored := f.sessions.sessions[seeded.ID]; stored.ExpiresAt == nil ||
+				!stored.ExpiresAt.Equal(tc.wantExpiry) {
+				t.Fatalf("stored expires_at=%v want %v", stored.ExpiresAt, tc.wantExpiry)
+			}
+			refreshed, _, _, _, err := svc.Get(context.Background(), seeded.ID)
+			if err != nil {
+				t.Fatalf("Get after Confirm: %v", err)
+			}
+			if refreshed.State != domain.StateValid {
+				t.Fatalf("Get after Confirm state=%q want valid", refreshed.State)
+			}
+		})
+	}
+}
+
+// TestSessionServiceConfirmRejectsExpiredState documents the two rejection
+// paths. A session whose own expiry has passed is no longer confirmable: it is
+// rejected as a state conflict (409 session_state_conflict, the contract's code
+// for a state that does not allow the action), matching a lazily expired row. A
+// stored state that computes to at or before now is rejected with the import
+// reason (422 invalid_argument / storage_state_expired).
+func TestSessionServiceConfirmRejectsExpiredState(t *testing.T) {
+	t.Run("session expiry has passed", func(t *testing.T) {
+		svc, f := newSessionServiceWithFakes(t)
+		seeded := f.seedSession(domain.Session{
+			State:     domain.StateNeedsManual,
+			ExpiresAt: sessionTimePtr(sessionTestNow.Add(-time.Minute)),
+		})
+
+		_, _, err := svc.Confirm(context.Background(), seeded.ID, "", nil)
+		assertCatalogServiceError(t, err, domain.KindStateConflict, "session_state_conflict")
+		if f.sessions.updateSessionCalls != 0 || f.sessions.createSnapshotCalls != 0 {
+			t.Fatalf("an expired confirm wrote state: updates=%d snapshots=%d",
+				f.sessions.updateSessionCalls, f.sessions.createSnapshotCalls)
+		}
+		if stored := f.sessions.sessions[seeded.ID]; stored.State != domain.StateNeedsManual {
+			t.Fatalf("stored state=%q want needs_manual", stored.State)
+		}
+	})
+
+	t.Run("stored state has expired", func(t *testing.T) {
+		svc, f := newSessionServiceWithFakes(t)
+		// No session expiry yet, so only the state's cookie expiry can reject.
+		seeded := f.seedSession(domain.Session{
+			State:        domain.StateNeedsManual,
+			StorageState: sessionStateWithCookieExpiry(sessionTestNow.Add(-time.Minute).Unix()),
+		})
+
+		_, _, err := svc.Confirm(context.Background(), seeded.ID, "", nil)
+		assertCatalogServiceError(t, err, domain.KindInvalid, "storage_state_expired")
+		if f.sessions.updateSessionCalls != 0 || f.sessions.createSnapshotCalls != 0 {
+			t.Fatalf("an expired confirm wrote state: updates=%d snapshots=%d",
+				f.sessions.updateSessionCalls, f.sessions.createSnapshotCalls)
+		}
+		if stored := f.sessions.sessions[seeded.ID]; stored.State != domain.StateNeedsManual {
+			t.Fatalf("stored state=%q want needs_manual", stored.State)
+		}
+	})
 }
 
 func TestSessionServiceInvalidateTransitionsAndReleasesLeases(t *testing.T) {
@@ -1597,7 +1814,7 @@ func TestSessionServiceCompleteTakeoverReplacesStateAndRechecks(t *testing.T) {
 	svc, f := newSessionServiceWithFakes(t)
 	seeded := f.seedSession(domain.Session{
 		State: domain.StateNeedsManual, FailureReason: "login_failed",
-		ExpiresAt: sessionTimePtr(sessionTestNow.Add(time.Hour)),
+		ExpiresAt: sessionTimePtr(sessionTestNow.Add(10 * time.Minute)),
 	})
 	oldHash := seeded.StorageStateHash
 	takeover := f.seedTakeover(domain.Takeover{
@@ -1635,8 +1852,10 @@ func TestSessionServiceCompleteTakeoverReplacesStateAndRechecks(t *testing.T) {
 		t.Fatal("storage_state_hash was not replaced")
 	}
 	assertSessionStorageHashMatches(t, session)
+	// The replaced token state has no cookie expiry, so the new expiry is
+	// now+TTL, not the old session's now+10m expiry.
 	if session.ExpiresAt == nil || !session.ExpiresAt.Equal(sessionTestNow.Add(time.Hour)) {
-		t.Fatalf("expires_at=%v want it unchanged", session.ExpiresAt)
+		t.Fatalf("expires_at=%v want the new token state's ttl", session.ExpiresAt)
 	}
 	if snapshot.Degraded || snapshot.SessionID != seeded.ID {
 		t.Fatalf("snapshot=%+v", snapshot)
@@ -1650,6 +1869,110 @@ func TestSessionServiceCompleteTakeoverReplacesStateAndRechecks(t *testing.T) {
 	}
 	if f.sessions.takeovers[takeover.ID].Status != domain.TakeoverStatusCompleted {
 		t.Fatal("completed takeover was not persisted")
+	}
+}
+
+// TestSessionServiceCompleteTakeoverUsesNewStateExpiry proves a completion
+// (re)computes expires_at from the uploaded state even when the session's old
+// expiry is already in the past: the new state's TTL/cookie expiry wins.
+func TestSessionServiceCompleteTakeoverUsesNewStateExpiry(t *testing.T) {
+	cases := []struct {
+		name         string
+		kind         string
+		storageState json.RawMessage
+		wantExpiry   time.Time
+	}{
+		{
+			name:         "cookie expiry of the new state",
+			kind:         domain.StorageStateKindStorageState,
+			storageState: sessionStateWithCookieExpiry(sessionTestNow.Add(45 * time.Minute).Unix()),
+			wantExpiry:   sessionTestNow.Add(45 * time.Minute),
+		},
+		{
+			name:         "token state uses the ttl",
+			kind:         domain.StorageStateKindToken,
+			storageState: json.RawMessage(`{"headers":{"Authorization":"Bearer rotated-token"}}`),
+			wantExpiry:   sessionTestNow.Add(time.Hour),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, f := newSessionServiceWithFakes(t)
+			seeded := f.seedSession(domain.Session{
+				State:     domain.StateNeedsManual,
+				ExpiresAt: sessionTimePtr(sessionTestNow.Add(-time.Minute)),
+			})
+			takeover := f.seedTakeover(domain.Takeover{
+				SessionID: &seeded.ID, Status: domain.TakeoverStatusWaiting,
+				ExpiresAt: sessionTimePtr(sessionTestNow.Add(30 * time.Minute)),
+			})
+			f.checker.result = domain.LoginCheckResult{Observed: domain.ObservedAllowed, Status: 200}
+
+			completed, session, _, err := svc.CompleteTakeover(context.Background(), takeover.ID,
+				ReplaceSessionStateInput{Kind: tc.kind, StorageState: tc.storageState}, nil)
+			if err != nil {
+				t.Fatalf("CompleteTakeover: %v", err)
+			}
+			if completed.Status != domain.TakeoverStatusCompleted {
+				t.Fatalf("takeover=%+v", completed)
+			}
+			if session.State != domain.StateValid {
+				t.Fatalf("state=%q want valid", session.State)
+			}
+			if session.ExpiresAt == nil || !session.ExpiresAt.Equal(tc.wantExpiry) {
+				t.Fatalf("expires_at=%v want %v", session.ExpiresAt, tc.wantExpiry)
+			}
+			if stored := f.sessions.sessions[seeded.ID]; stored.ExpiresAt == nil ||
+				!stored.ExpiresAt.Equal(tc.wantExpiry) {
+				t.Fatalf("stored expires_at=%v want %v", stored.ExpiresAt, tc.wantExpiry)
+			}
+			refreshed, _, _, _, err := svc.Get(context.Background(), seeded.ID)
+			if err != nil {
+				t.Fatalf("Get after CompleteTakeover: %v", err)
+			}
+			if refreshed.State != domain.StateValid {
+				t.Fatalf("Get after CompleteTakeover state=%q want valid", refreshed.State)
+			}
+		})
+	}
+}
+
+// TestSessionServiceCompleteTakeoverRejectsExpiredNewState proves an uploaded
+// state whose computed expiry is not after now is rejected before the session or
+// takeover is written, using the contract's 422 storage_state_expired reason.
+func TestSessionServiceCompleteTakeoverRejectsExpiredNewState(t *testing.T) {
+	svc, f := newSessionServiceWithFakes(t)
+	seeded := f.seedSession(domain.Session{
+		State:     domain.StateNeedsManual,
+		ExpiresAt: sessionTimePtr(sessionTestNow.Add(30 * time.Minute)),
+	})
+	takeover := f.seedTakeover(domain.Takeover{
+		SessionID: &seeded.ID, Status: domain.TakeoverStatusWaiting,
+		ExpiresAt: sessionTimePtr(sessionTestNow.Add(30 * time.Minute)),
+	})
+	oldHash := seeded.StorageStateHash
+	f.checker.result = domain.LoginCheckResult{Observed: domain.ObservedAllowed, Status: 200}
+
+	_, _, _, err := svc.CompleteTakeover(context.Background(), takeover.ID,
+		ReplaceSessionStateInput{
+			Kind:         domain.StorageStateKindStorageState,
+			StorageState: sessionStateWithCookieExpiry(sessionTestNow.Add(-time.Minute).Unix()),
+		}, nil)
+	assertCatalogServiceError(t, err, domain.KindInvalid, "storage_state_expired")
+	if f.sessions.updateSessionCalls != 0 || f.sessions.updateTakeoverCalls != 0 {
+		t.Fatalf("an expired completion wrote state: session updates=%d takeover updates=%d",
+			f.sessions.updateSessionCalls, f.sessions.updateTakeoverCalls)
+	}
+	if f.checker.calls != 0 {
+		t.Fatalf("an expired completion ran the login check %d time(s)", f.checker.calls)
+	}
+	stored := f.sessions.sessions[seeded.ID]
+	if stored.State != domain.StateNeedsManual || stored.StorageStateHash != oldHash {
+		t.Fatalf("stored session=%+v want the unchanged state", stored)
+	}
+	if f.sessions.takeovers[takeover.ID].Status != domain.TakeoverStatusWaiting {
+		t.Fatalf("takeover status=%q want waiting",
+			f.sessions.takeovers[takeover.ID].Status)
 	}
 }
 

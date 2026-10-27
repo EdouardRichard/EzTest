@@ -106,8 +106,9 @@ func invalidEnvironmentError() *domain.Error {
 		"environmentId must reference an environment of the access's system")
 }
 
-// storageStateExpiredError is the documented 422 for an import whose computed
-// expiration is already in the past.
+// storageStateExpiredError is the documented 422 for a computed expiration at
+// or before now. Import uses it and so does every transition that would persist
+// valid; the contract maps storage_state_expired to 422 invalid_argument.
 func storageStateExpiredError() *domain.Error {
 	return domain.NewInvalid("storageState", "storage_state_expired",
 		"storage state expires at or before the current time")
@@ -206,10 +207,15 @@ func effectiveSessionTTL(access *domain.Access, system *domain.System) int {
 	return ttl
 }
 
-// sessionExpiry returns now+ttl, an optional explicit value winning, capped by
-// the earliest positive cookie expiry. A result at or before now is rejected.
-func sessionExpiry(now time.Time, ttlSeconds int, state *domain.StorageState, explicit *time.Time) (time.Time, error) {
-	expiresAt := now.Add(time.Duration(ttlSeconds) * time.Second)
+// sessionExpiry is the single expiry computation shared by import, validate,
+// confirm and complete-takeover: now plus the effective access/system TTL, an
+// explicit import override winning, capped by the state's earliest positive
+// cookie expiry (a token has none). A result at or before now is rejected with
+// the documented 422 invalid_argument / storage_state_expired; callers that
+// would persist valid must propagate the error instead of writing a row that
+// Get/List would immediately lazy-expire.
+func sessionExpiry(now time.Time, access *domain.Access, system *domain.System, state *domain.StorageState, explicit *time.Time) (time.Time, error) {
+	expiresAt := now.Add(time.Duration(effectiveSessionTTL(access, system)) * time.Second)
 	if explicit != nil {
 		expiresAt = explicit.UTC()
 	}
@@ -220,6 +226,28 @@ func sessionExpiry(now time.Time, ttlSeconds int, state *domain.StorageState, ex
 		return time.Time{}, storageStateExpiredError()
 	}
 	return expiresAt, nil
+}
+
+// refreshSessionExpiry resolves the TTL sources and stores the expiry implied by
+// state on session. It is the transition-side entry point to sessionExpiry, used
+// by validate, confirm and complete-takeover. A rejected expiry leaves the
+// session's old expires_at untouched, so the caller cannot persist an
+// already-expired valid row.
+func (s *SessionService) refreshSessionExpiry(ctx context.Context, session *domain.Session, state *domain.StorageState, now time.Time) error {
+	access, err := s.accesses.GetAccess(ctx, session.AccessID)
+	if err != nil {
+		return err
+	}
+	system, err := s.systems.GetSystem(ctx, session.SystemID)
+	if err != nil {
+		return err
+	}
+	expiresAt, err := sessionExpiry(now, access, system, state, nil)
+	if err != nil {
+		return err
+	}
+	session.ExpiresAt = &expiresAt
+	return nil
 }
 
 // permissionHash hashes the sorted items[key,observed] pairs. Manual
@@ -483,7 +511,7 @@ func (s *SessionService) Import(ctx context.Context, accessID int64, in ImportSe
 		return nil, nil, err
 	}
 	now := s.now()
-	expiresAt, err := sessionExpiry(now, effectiveSessionTTL(access, system), state, in.ExpiresAt)
+	expiresAt, err := sessionExpiry(now, access, system, state, in.ExpiresAt)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -547,6 +575,14 @@ func (s *SessionService) Validate(ctx context.Context, id int64) (*domain.Sessio
 	result := s.runLoginCheck(ctx, environment, state)
 	expected := session.State
 	applySessionCheckResult(session, result, now)
+	if session.State == domain.StateValid {
+		// A successful check refreshes the expiry from the state that produced
+		// it. The old expires_at may already be in the past (validate is legal
+		// from expired) and must not survive into the valid row.
+		if err := s.refreshSessionExpiry(ctx, session, state, now); err != nil {
+			return nil, nil, err
+		}
+	}
 	if err := s.sessions.UpdateSession(ctx, session, expected); err != nil {
 		return nil, nil, err
 	}
@@ -558,7 +594,10 @@ func (s *SessionService) Validate(ctx context.Context, id int64) (*domain.Sessio
 }
 
 // Confirm marks a pending or needs_manual session valid from a human
-// confirmation and records the degraded manual snapshot (spec §6.3).
+// confirmation and records the degraded manual snapshot (spec §6.3). The
+// confirmation refreshes expires_at from the still-live stored state; an already
+// expired session is rejected as a state conflict (409 session_state_conflict,
+// matching a lazily expired row) instead of being resurrected as valid.
 func (s *SessionService) Confirm(ctx context.Context, id int64, note string, actorID *int64) (*domain.Session, *domain.Snapshot, error) {
 	_ = note
 	_ = actorID
@@ -571,6 +610,21 @@ func (s *SessionService) Confirm(ctx context.Context, id int64, note string, act
 	default:
 		return nil, nil, stateConflictError("session state " + session.State + " does not allow confirm")
 	}
+	now := s.now()
+	if session.IsExpired(now) {
+		return nil, nil, stateConflictError("session is expired and cannot be confirmed")
+	}
+	state, err := parseStoredStorageState(session)
+	if err != nil {
+		return nil, nil, err
+	}
+	// The stored state is still live (its computed expiry is after now), so the
+	// refreshed candidate may extend or shorten the old expiry but stays within
+	// the cookie lifetime. A stale state is rejected with 422
+	// storage_state_expired before any write.
+	if err := s.refreshSessionExpiry(ctx, session, state, now); err != nil {
+		return nil, nil, err
+	}
 	expected := session.State
 	session.State = domain.StateValid
 	session.FailureReason = ""
@@ -578,7 +632,7 @@ func (s *SessionService) Confirm(ctx context.Context, id int64, note string, act
 	if err := s.sessions.UpdateSession(ctx, session, expected); err != nil {
 		return nil, nil, err
 	}
-	snapshot, err := s.createSnapshot(ctx, buildManualSnapshot(session.ID, s.now()))
+	snapshot, err := s.createSnapshot(ctx, buildManualSnapshot(session.ID, now))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -725,7 +779,8 @@ func (s *SessionService) RequestTakeover(ctx context.Context, sessionID int64, r
 
 // CompleteTakeover replaces the session's stored login state from a human
 // completion, re-runs the login_check and marks the takeover completed
-// (spec §6.4).
+// (spec §6.4). expires_at is recomputed from the uploaded state's TTL/cookie
+// expiry; the session's previous expiry is never reused.
 func (s *SessionService) CompleteTakeover(ctx context.Context, takeoverID int64, in ReplaceSessionStateInput, actorID *int64) (*domain.Takeover, *domain.Session, *domain.Snapshot, error) {
 	_ = actorID
 	takeover, err := s.sessions.GetTakeover(ctx, takeoverID)
@@ -763,6 +818,14 @@ func (s *SessionService) CompleteTakeover(ctx context.Context, takeoverID int64,
 	}
 	storageHash, err := domain.HashJSON(state)
 	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	// The uploaded state defines the new lifetime. Validate it before writing
+	// anything: an already-expired upload is rejected with 422
+	// storage_state_expired and leaves the session and takeover untouched, even
+	// if the login_check would have put the session back in needs_manual.
+	if err := s.refreshSessionExpiry(ctx, session, state, now); err != nil {
 		return nil, nil, nil, err
 	}
 
