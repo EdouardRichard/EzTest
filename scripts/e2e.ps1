@@ -25,8 +25,10 @@ $tmpDir = Join-Path $repoRoot ".tmp"
 $e2eDbName = "eztest_e2e"
 $apiPort = 13333
 $webPort = 6868
+$fakeLlmPort = 13334
 $apiBaseUrl = "http://localhost:$apiPort"
 $webBaseUrl = "http://localhost:$webPort"
+$fakeLlmBaseUrl = "http://127.0.0.1:$fakeLlmPort"
 
 New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
 
@@ -174,15 +176,20 @@ function Assert-PortFree {
 $exitCode = 0
 $apiProcess = $null
 $webProcess = $null
+$fakeProcess = $null
 $apiOut = Join-Path $tmpDir "e2e-api.out.log"
 $apiErr = Join-Path $tmpDir "e2e-api.err.log"
 $webOut = Join-Path $tmpDir "e2e-web.out.log"
 $webErr = Join-Path $tmpDir "e2e-web.err.log"
+$fakeOut = Join-Path $tmpDir "e2e-fake-llm.out.log"
+$fakeErr = Join-Path $tmpDir "e2e-fake-llm.err.log"
+$fakeRequestLog = Join-Path $tmpDir "fake-llm-requests.jsonl"
 $playwrightLog = Join-Path $tmpDir "e2e-playwright.log"
 
 try {
     Assert-PortFree -Port $apiPort
     Assert-PortFree -Port $webPort
+    Assert-PortFree -Port $fakeLlmPort
 
     if (-not (Test-Path -LiteralPath (Join-Path $frontendDir "node_modules\next\dist\bin\next"))) {
         throw "frontend/node_modules is missing; run pnpm install in frontend first"
@@ -284,6 +291,22 @@ try {
         Pop-Location
     }
 
+    Write-Step "Starting fake LLM upstream on :$fakeLlmPort"
+    $nodeExe = (Get-Command node.exe -ErrorAction SilentlyContinue).Source
+    if (-not $nodeExe) { $nodeExe = (Get-Command node).Source }
+    if (-not $nodeExe) { throw "node was not found; it is required by the fake LLM upstream and the web app" }
+    $env:EZTEST_FAKE_LLM_PORT = "$fakeLlmPort"
+    Remove-Item -LiteralPath $fakeOut, $fakeErr, $fakeRequestLog -ErrorAction SilentlyContinue
+    $fakeProcess = Start-Process -FilePath $nodeExe `
+        -ArgumentList "`"scripts/fake-llm.cjs`"" `
+        -WorkingDirectory $repoRoot `
+        -RedirectStandardOutput $fakeOut `
+        -RedirectStandardError $fakeErr `
+        -WindowStyle Hidden `
+        -PassThru
+    Wait-ForHttp -Url "$fakeLlmBaseUrl/v1/models" -TimeoutSeconds 30 -Process $fakeProcess -Label "Fake LLM"
+    Write-Host "Fake LLM is ready at $fakeLlmBaseUrl"
+
     Write-Step "Starting API on :$apiPort (database $e2eDbName)"
     $env:EZTEST_ENV = "dev"
     $env:EZTEST_DATABASE_URL = $e2eDatabaseUrl
@@ -298,6 +321,12 @@ try {
             Set-Item -Path ("Env:" + $key) -Value $envValues[$key]
         }
     }
+    # Agent E2E talks to the deterministic local fake (never the real provider)
+    # and starts its read-only file tools at the repository root (spec §4.2).
+    $env:llm_base_url = $fakeLlmBaseUrl
+    $env:llm_key = "e2e-test"
+    $env:llm_model_name = "deepseek-flash"
+    $env:EZTEST_AGENT_FILE_ROOT = $repoRoot
     Remove-Item Env:EZTEST_TEST_DATABASE_URL -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $apiOut, $apiErr -ErrorAction SilentlyContinue
     $apiProcess = Start-Process -FilePath (Join-Path $tmpDir "e2e-api.exe") `
@@ -313,8 +342,6 @@ try {
     $env:NEXT_PUBLIC_API_BASE_URL = $apiBaseUrl
     $env:NEXT_PUBLIC_APP_ENV = "test"
     $env:NEXT_TELEMETRY_DISABLED = "1"
-    $nodeExe = (Get-Command node.exe -ErrorAction SilentlyContinue).Source
-    if (-not $nodeExe) { $nodeExe = (Get-Command node).Source }
     $nextBin = Join-Path $frontendDir "node_modules\next\dist\bin\next"
     Remove-Item -LiteralPath $webOut, $webErr -ErrorAction SilentlyContinue
     $webProcess = Start-Process -FilePath $nodeExe `
@@ -366,6 +393,8 @@ try {
     $exitCode = 1
     Write-LogTail -Path $apiOut -Label "API stdout" -Lines 80
     Write-LogTail -Path $apiErr -Label "API stderr" -Lines 80
+    Write-LogTail -Path $fakeOut -Label "Fake LLM stdout" -Lines 40
+    Write-LogTail -Path $fakeErr -Label "Fake LLM stderr" -Lines 40
     Write-LogTail -Path $webOut -Label "Web stdout" -Lines 80
     Write-LogTail -Path $webErr -Label "Web stderr" -Lines 80
     Write-LogTail -Path $playwrightLog -Label "Playwright" -Lines 120
@@ -373,8 +402,9 @@ try {
     Write-Step "Cleaning up"
     Stop-ProcessTree -Process $webProcess
     Stop-ProcessTree -Process $apiProcess
+    Stop-ProcessTree -Process $fakeProcess
     Start-Sleep -Milliseconds 500
-    foreach ($port in @($webPort, $apiPort)) {
+    foreach ($port in @($webPort, $apiPort, $fakeLlmPort)) {
         $listeners = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue
         if ($listeners) {
             Write-Host "WARNING: port $port still has a listener after cleanup" -ForegroundColor Yellow
