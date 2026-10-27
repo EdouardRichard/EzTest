@@ -1,26 +1,36 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-    Runs the P0-P3 acceptance gate for EzTest.
+    Runs the P0-P4 acceptance gate for EzTest.
 
 .DESCRIPTION
     Executes the Go unit and integration suites, the P1 Agent unit/integration
-    suites, the P3 version/requirements/clarification suites, the frontend
-    lint/typecheck/test/build gate, the Playwright E2E suite (P0/P1/P2 and the
-    three P3 version specs in frontend/e2e/versions*.spec.ts), a repeated
-    migration run and the health/audit/version-API
-    assertions. The P0-P3 deliverables are checked (README, OpenAPI, deploy
-    files, Agent/P3 env templates, the P3 OpenAPI contract keywords and the P3
-    event catalog) and the Compose file is statically validated with node.
-    Container execution and the gated real Agent/P3 LLM acceptance are reported
-    as SKIPPED because this host has no Docker and no opt-in for paid calls.
-    Prints P1 and P3 DoD mapping tables and exits non-zero on any failure.
+    suites, the P3 version/requirements/clarification suites, the P4 codeintel
+    suites, the frontend lint/typecheck/test/build gate, the Playwright E2E
+    suite (P0/P1/P2, the three P3 version specs and the P4 code specs in
+    frontend/e2e/versions*.spec.ts, code-repos-index.spec.ts), a repeated
+    migration run and the health/audit/version-API assertions. The P0-P4
+    deliverables are checked (README, OpenAPI, deploy files, Agent/P3/P4 env
+    templates, the P3/P4 OpenAPI contract keywords, reason enums and event
+    catalog), the P4 fake-LLM test is executed, the P4 migration/table contract
+    is derived from order.txt and the Compose file is statically validated with
+    node. Container execution and the gated real Agent/P3/P4 LLM acceptance are
+    reported as SKIPPED because this host has no Docker and no opt-in for paid
+    calls. Prints P1/P3/P4 DoD mapping tables and exits non-zero on any failure.
+
+.PARAMETER StaticOnly
+    Runs only the repository-local static checks (README/OpenAPI/env/Compose
+    contracts plus the P4 fake-LLM test) without requiring .env, the database,
+    the built API or Playwright. Useful on a host without PostgreSQL; the full
+    gate remains the default.
 
 .NOTES
     Compatible with Windows PowerShell 5.1 and PowerShell 7+.
 #>
 [CmdletBinding()]
-param()
+param(
+    [switch]$StaticOnly
+)
 
 $ErrorActionPreference = "Stop"
 
@@ -456,68 +466,98 @@ $hasLLMSeed = $false
 
 try {
     Write-Step "Loading local configuration"
-    if (-not (Test-Path -LiteralPath (Join-Path $repoRoot ".env"))) {
-        throw "Missing .env at the repository root"
-    }
-    if (-not (Test-Path -LiteralPath (Join-Path $frontendDir "node_modules"))) {
-        throw "frontend/node_modules is missing; run pnpm install in frontend first"
+    $envValues = @{}
+    if (-not $StaticOnly) {
+        if (-not (Test-Path -LiteralPath (Join-Path $repoRoot ".env"))) {
+            throw "Missing .env at the repository root"
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path $frontendDir "node_modules"))) {
+            throw "frontend/node_modules is missing; run pnpm install in frontend first"
+        }
     }
 
     $goExe = Join-Path $repoRoot ".tools\go\bin\go.exe"
     if (-not (Test-Path -LiteralPath $goExe)) { $goExe = "go" }
     $psqlExe = Join-Path $repoRoot ".tools\pgsql\bin\psql.exe"
     if (-not (Test-Path -LiteralPath $psqlExe)) { $psqlExe = "psql" }
-    $pnpmExe = (Get-Command pnpm.cmd -ErrorAction SilentlyContinue).Source
-    if (-not $pnpmExe) { $pnpmExe = (Get-Command pnpm -ErrorAction SilentlyContinue).Source }
-    if (-not $pnpmExe) { throw "pnpm is not available on PATH" }
+    $pnpmExe = ""
+    if (-not $StaticOnly) {
+        $pnpmExe = (Get-Command pnpm.cmd -ErrorAction SilentlyContinue).Source
+        if (-not $pnpmExe) { $pnpmExe = (Get-Command pnpm -ErrorAction SilentlyContinue).Source }
+        if (-not $pnpmExe) { throw "pnpm is not available on PATH" }
+    }
     $nodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
     if (-not $nodeCommand) { $nodeCommand = Get-Command node -ErrorAction SilentlyContinue }
     if (-not $nodeCommand) { throw "node is not available on PATH" }
     $nodeExe = $nodeCommand.Source
     $scriptHost = Join-Path $PSHOME "pwsh.exe"
     if (-not (Test-Path -LiteralPath $scriptHost)) { $scriptHost = Join-Path $PSHOME "powershell.exe" }
-    if (-not (Test-Path -LiteralPath $scriptHost)) { throw "cannot locate a PowerShell host to run scripts/e2e.ps1" }
+    if (-not (Test-Path -LiteralPath $scriptHost)) { throw "cannot locate a PowerShell host to run helper scripts" }
 
-    $envValues = Read-DotEnv -Path (Join-Path $repoRoot ".env")
-    $databaseUrl = Get-RequiredValue -Values $envValues -Key "EZTEST_DATABASE_URL"
-    $testDatabaseUrl = Get-RequiredValue -Values $envValues -Key "EZTEST_TEST_DATABASE_URL"
-    $adminUsername = Get-RequiredValue -Values $envValues -Key "EZTEST_ADMIN_USERNAME"
-    $adminPassword = Get-RequiredValue -Values $envValues -Key "EZTEST_ADMIN_PASSWORD"
-    $hasLLMSeed = $envValues.ContainsKey("llm_key") -and -not [string]::IsNullOrWhiteSpace([string]$envValues["llm_key"])
+    if (-not $StaticOnly) {
+        $envValues = Read-DotEnv -Path (Join-Path $repoRoot ".env")
+        $databaseUrl = Get-RequiredValue -Values $envValues -Key "EZTEST_DATABASE_URL"
+        $testDatabaseUrl = Get-RequiredValue -Values $envValues -Key "EZTEST_TEST_DATABASE_URL"
+        $adminUsername = Get-RequiredValue -Values $envValues -Key "EZTEST_ADMIN_USERNAME"
+        $adminPassword = Get-RequiredValue -Values $envValues -Key "EZTEST_ADMIN_PASSWORD"
+        $hasLLMSeed = $envValues.ContainsKey("llm_key") -and -not [string]::IsNullOrWhiteSpace([string]$envValues["llm_key"])
 
-    $databaseUri = [System.Uri]$databaseUrl
-    if (-not $databaseUri.IsAbsoluteUri) { throw "EZTEST_DATABASE_URL is not an absolute URL" }
-    $userInfo = $databaseUri.UserInfo
-    $separator = $userInfo.IndexOf(":")
-    if ($separator -lt 0) { throw "EZTEST_DATABASE_URL must contain a user and password" }
-    $dbUser = [System.Uri]::UnescapeDataString($userInfo.Substring(0, $separator))
-    $dbPassword = [System.Uri]::UnescapeDataString($userInfo.Substring($separator + 1))
-    $dbHost = $databaseUri.Host
-    $dbPort = $databaseUri.Port
+        $databaseUri = [System.Uri]$databaseUrl
+        if (-not $databaseUri.IsAbsoluteUri) { throw "EZTEST_DATABASE_URL is not an absolute URL" }
+        $userInfo = $databaseUri.UserInfo
+        $separator = $userInfo.IndexOf(":")
+        if ($separator -lt 0) { throw "EZTEST_DATABASE_URL must contain a user and password" }
+        $dbUser = [System.Uri]::UnescapeDataString($userInfo.Substring(0, $separator))
+        $dbPassword = [System.Uri]::UnescapeDataString($userInfo.Substring($separator + 1))
+        $dbHost = $databaseUri.Host
+        $dbPort = $databaseUri.Port
 
-    $queryIndex = $databaseUrl.IndexOf("?")
-    if ($queryIndex -ge 0) {
-        $urlBase = $databaseUrl.Substring(0, $queryIndex)
-        $urlQuery = $databaseUrl.Substring($queryIndex)
-    } else {
-        $urlBase = $databaseUrl
-        $urlQuery = ""
+        $queryIndex = $databaseUrl.IndexOf("?")
+        if ($queryIndex -ge 0) {
+            $urlBase = $databaseUrl.Substring(0, $queryIndex)
+            $urlQuery = $databaseUrl.Substring($queryIndex)
+        } else {
+            $urlBase = $databaseUrl
+            $urlQuery = ""
+        }
+        $slashIndex = $urlBase.LastIndexOf("/")
+        if ($slashIndex -lt 0) { throw "EZTEST_DATABASE_URL does not contain a database name" }
+        $e2eDatabaseUrl = $urlBase.Substring(0, $slashIndex + 1) + $e2eDbName + $urlQuery
+
+        # Refuse to run the destructive integration helper against anything that
+        # is not a dedicated test/e2e database before any suite is started.
+        Assert-SafeTestDatabaseUrl -TestDatabaseUrl $testDatabaseUrl -DatabaseUrl $databaseUrl
     }
-    $slashIndex = $urlBase.LastIndexOf("/")
-    if ($slashIndex -lt 0) { throw "EZTEST_DATABASE_URL does not contain a database name" }
-    $e2eDatabaseUrl = $urlBase.Substring(0, $slashIndex + 1) + $e2eDbName + $urlQuery
 
-    # Refuse to run the destructive integration helper against anything that is
-    # not a dedicated test/e2e database before any suite is started.
-    Assert-SafeTestDatabaseUrl -TestDatabaseUrl $testDatabaseUrl -DatabaseUrl $databaseUrl
-
-    $expectedMigrations = @(Get-Content -LiteralPath (Join-Path $backendDir "internal\db\migrations\order.txt") | Where-Object { $_.Trim() -ne "" }).Count
+    # The migration expectation is always derived from order.txt, never
+    # hard-coded. The P4 table list is parsed from the codeintel migrations that
+    # order.txt actually lists, so adding a migration updates the expectation.
+    $migrationOrder = @(Get-Content -LiteralPath (Join-Path $backendDir "internal\db\migrations\order.txt") | Where-Object { $_.Trim() -ne "" } | ForEach-Object { $_.Trim() })
+    $expectedMigrations = $migrationOrder.Count
     if ($expectedMigrations -le 0) { throw "no migrations are listed in order.txt" }
+    $p4MigrationNames = @($migrationOrder | Where-Object { $_ -match '^codeintel_.*\.sql$' })
+    if ($p4MigrationNames.Count -eq 0) { throw "order.txt lists no P4 codeintel migrations" }
+    $p4MigrationTables = @()
+    foreach ($migrationName in $p4MigrationNames) {
+        $migrationPath = Join-Path $backendDir ("internal\db\migrations\" + $migrationName)
+        if (-not (Test-Path -LiteralPath $migrationPath)) {
+            throw "order.txt lists a missing migration: $migrationName"
+        }
+        $migrationSql = Get-Content -LiteralPath $migrationPath -Raw
+        foreach ($tableMatch in [regex]::Matches($migrationSql, 'CREATE TABLE IF NOT EXISTS\s+([a-zA-Z0-9_]+)')) {
+            $p4MigrationTables += $tableMatch.Groups[1].Value
+        }
+    }
+    $p4MigrationTables = @($p4MigrationTables | Select-Object -Unique)
+    if ($p4MigrationTables.Count -eq 0) {
+        throw "the codeintel migrations listed in order.txt define no tables"
+    }
 
-    # Integration tests open EZTEST_TEST_DATABASE_URL, the dedicated test database.
-    $env:EZTEST_TEST_DATABASE_URL = $testDatabaseUrl
+    if (-not $StaticOnly) {
+        # Integration tests open EZTEST_TEST_DATABASE_URL, the dedicated test database.
+        $env:EZTEST_TEST_DATABASE_URL = $testDatabaseUrl
 
-    [void](Invoke-Check -Dod "4,5" -CheckName "Go unit tests" -Body {
+        [void](Invoke-Check -Dod "4,5" -CheckName "Go unit tests" -Body {
             Invoke-LoggedCommand -Exe $goExe -Arguments @("test", "-count=1", "./...") `
                 -WorkingDirectory $backendDir `
                 -LogPath (Join-Path $tmpDir "acceptance-go-unit.log") `
@@ -654,13 +694,24 @@ try {
                 if ($migrationCount -ne $expectedMigrations) {
                     throw "applied migrations=$migrationCount, expected $expectedMigrations"
                 }
-                Write-Host "Migration rerun OK: $migrationCount migrations, checksums unchanged across two API starts."
+
+                # P4 table expectations come from the CREATE TABLE statements of
+                # the codeintel migrations order.txt lists (no hard-coded table
+                # count), so a new migration cannot silently skip its tables.
+                $tableInList = ($p4MigrationTables | ForEach-Object { "'" + $_ + "'" }) -join ","
+                $tableSql = "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ($tableInList);"
+                $presentTables = [int](Get-PsqlScalar -Database $e2eDbName -Sql $tableSql)
+                if ($presentTables -ne $p4MigrationTables.Count) {
+                    throw "P4 tables present=$presentTables, expected $($p4MigrationTables.Count) (from order.txt codeintel migrations)"
+                }
+                Write-Host "Migration rerun OK: $migrationCount migrations, checksums unchanged across two API starts; P4 tables present: $presentTables."
             } finally {
                 Stop-ProcessTree -Process $first
                 Stop-ProcessTree -Process $second
                 Remove-Item Env:PGPASSWORD -ErrorAction SilentlyContinue
             }
         })
+    }
 
     [void](Invoke-Check -Dod "5,P1-4" -CheckName "P0/P1 deliverables and Compose static validation" -Body {
             foreach ($relative in @(
@@ -858,6 +909,176 @@ try {
             }
         })
 
+    [void](Invoke-Check -Dod "P4" -CheckName "P4 deliverables, OpenAPI, fake LLM and migration contract" -Body {
+            $readme = Get-Content -LiteralPath (Join-Path $repoRoot "README.md") -Raw
+            foreach ($needle in @(
+                    "EZTEST_CODEINTEL_MAX_CHANGED_FILES",
+                    "EZTEST_CODEINTEL_PROMPT_VERSION",
+                    "EZTEST_CODEINTEL_MAX_DIFF_BYTES",
+                    "EZTEST_ACCEPTANCE_P4_REPO",
+                    "/api/code/repos",
+                    "/api/versions/{id}/code",
+                    "scripts/fake-llm.p4.test.cjs",
+                    "scripts/acceptance-codeintel-llm.ps1",
+                    "code.impact_computed",
+                    "read-only"
+                )) {
+                if ($readme -notmatch [regex]::Escape($needle)) {
+                    throw "README.md is missing P4 keyword $needle"
+                }
+            }
+
+            $openapi = Get-Content -LiteralPath (Join-Path $repoRoot "docs/openapi/api.yaml") -Raw
+            foreach ($needle in @(
+                    # Both P4 API prefixes and every documented path family.
+                    "/api/code/repos",
+                    "/api/code/repos/{repoId}/index",
+                    "/api/code/repos/{repoId}/index-runs/latest",
+                    "/api/code/repos/{repoId}/index-runs/{runId}",
+                    "/api/code/repos/{repoId}/tree",
+                    "/api/code/repos/{repoId}/file",
+                    "/api/code/repos/{repoId}/diff",
+                    "/api/code/repos/{repoId}/diff/file",
+                    "/api/code/repos/{repoId}/facts",
+                    "/api/code/repos/{repoId}/search",
+                    "/api/code/repos/{repoId}/commits/{sha}",
+                    "/api/versions/{versionId}/code/changes",
+                    "/api/versions/{versionId}/code/analyses",
+                    "/api/versions/{versionId}/code/analyses/latest",
+                    "/api/versions/{versionId}/code/analyses/{analysisId}",
+                    "/api/versions/{versionId}/code/analyses/{analysisId}/candidates/{candidateId}",
+                    "/api/versions/{versionId}/code/anchors",
+                    "/api/versions/{versionId}/code/anchors/{anchorId}",
+                    # Wire-contract fields the frontend depends on.
+                    "changeSetId",
+                    "changeSummary",
+                    "factVersions",
+                    "nextCursor",
+                    "headBlobHash"
+                )) {
+                if ($openapi -notmatch [regex]::Escape($needle)) {
+                    throw "docs/openapi/api.yaml is missing P4 contract keyword $needle"
+                }
+            }
+
+            # P4 schema names must exist as their own component entries; a bare
+            # mention inside another description cannot satisfy this check.
+            foreach ($schemaName in @(
+                    "RepoSummary",
+                    "IndexRun",
+                    "ChangeList",
+                    "FileDiff",
+                    "FactsPage",
+                    "Analysis",
+                    "Candidate",
+                    "Anchor",
+                    "CodeEntity",
+                    "CodeErrorReason"
+                )) {
+                if ($openapi -notmatch ("(?m)^    " + $schemaName + ":")) {
+                    throw "docs/openapi/api.yaml is missing the P4 schema $schemaName"
+                }
+            }
+
+            # The reason needles must live in the P4 reason enum itself, not in
+            # an unrelated P3 table that happens to mention the same word.
+            $p4ReasonCatalog = [regex]::Match($openapi, '(?ms)^    CodeErrorReason:\r?\n.*?(?=^    [A-Za-z])')
+            if (-not $p4ReasonCatalog.Success) {
+                throw "docs/openapi/api.yaml is missing the CodeErrorReason reason catalog"
+            }
+            foreach ($reason in @(
+                    "code_repository_not_bound",
+                    "baseline_commit_missing",
+                    "invalid_head",
+                    "not_changed",
+                    "unsupported_content",
+                    "index_in_progress",
+                    "analysis_in_progress",
+                    "analysis_queue_full",
+                    "analysis_not_done",
+                    "anchor_duplicate",
+                    "anchor_not_found",
+                    "unsupported_subject_kind",
+                    "git_unavailable"
+                )) {
+                if ($p4ReasonCatalog.Value -notmatch [regex]::Escape($reason)) {
+                    throw "docs/openapi/api.yaml CodeErrorReason is missing P4 reason $reason"
+                }
+            }
+
+            # P4 event types must be in the version event catalog; the P3 check
+            # above already pins the earlier catalog entries.
+            $p4EventCatalog = [regex]::Match($openapi, '(?ms)^    VersionEventType:\r?\n.*?(?=^    [A-Za-z])')
+            if (-not $p4EventCatalog.Success) {
+                throw "docs/openapi/api.yaml is missing the VersionEventType event catalog"
+            }
+            foreach ($eventType in @("code.changed", "code.impact_computed")) {
+                if ($p4EventCatalog.Value -notmatch [regex]::Escape($eventType)) {
+                    throw "docs/openapi/api.yaml VersionEventType is missing P4 event type $eventType"
+                }
+            }
+
+            # The P4 env template keys are part of the deliverable; no values
+            # are read or reported here.
+            $envTemplate = Get-Content -LiteralPath (Join-Path $repoRoot ".env.example") -Raw
+            foreach ($codeintelVar in @(
+                    "EZTEST_CODEINTEL_MAX_CHANGED_FILES",
+                    "EZTEST_CODEINTEL_MAX_FILE_BYTES",
+                    "EZTEST_CODEINTEL_MAX_INDEX_FILES",
+                    "EZTEST_CODEINTEL_ANALYSIS_TIMEOUT_MS",
+                    "EZTEST_CODEINTEL_MAX_CONCURRENT_ANALYSES",
+                    "EZTEST_CODEINTEL_PROMPT_VERSION",
+                    "EZTEST_CODEINTEL_MAX_EXCERPT_LINES",
+                    "EZTEST_CODEINTEL_MAX_DIFF_BYTES"
+                )) {
+                if ($envTemplate -notmatch [regex]::Escape($codeintelVar)) {
+                    throw ".env.example is missing P4 variable $codeintelVar"
+                }
+            }
+
+            # P4 migrations must be the tail of order.txt and their tables are
+            # parsed dynamically (no hard-coded 16 or table count).
+            if ($migrationOrder.Count -lt 2 -or
+                $migrationOrder[$migrationOrder.Count - 2] -notmatch '^codeintel_' -or
+                $migrationOrder[$migrationOrder.Count - 1] -notmatch '^codeintel_') {
+                throw "order.txt must append the P4 codeintel migrations at its tail"
+            }
+            if ($p4MigrationTables.Count -lt 1) {
+                throw "the P4 codeintel migrations listed in order.txt define no tables"
+            }
+
+            # Parse the OpenAPI document with the repository's existing YAML
+            # dependency (frontend/node_modules/yaml); this catches a broken
+            # YAML document that the regex needles above would miss.
+            # Windows PowerShell 5.1 strips embedded double quotes from native
+            # arguments, so the JavaScript program uses single-quoted strings.
+            $openapiParseCode = "import { readFileSync } from 'node:fs'; import { parse } from 'yaml'; const doc = parse(readFileSync(process.argv[1], 'utf8')); if (!doc || typeof doc !== 'object' || !doc.paths || !doc.components || !doc.components.schemas) { throw new Error('invalid OpenAPI document'); } const p4 = Object.keys(doc.paths).filter((p) => p.startsWith('/api/code/repos') || p.includes('/code/changes') || p.includes('/code/analyses') || p.includes('/code/anchors')); if (p4.length < 18) { throw new Error('expected at least 18 P4 paths, found ' + p4.length); } console.log('OpenAPI parsed: ' + Object.keys(doc.paths).length + ' paths, ' + Object.keys(doc.components.schemas).length + ' schemas, ' + p4.length + ' P4 paths');"
+            Invoke-LoggedCommand -Exe $nodeExe `
+                -Arguments @("--input-type=module", "-e", $openapiParseCode, (Join-Path $repoRoot "docs/openapi/api.yaml")) `
+                -WorkingDirectory $frontendDir `
+                -LogPath (Join-Path $tmpDir "acceptance-openapi-parse.log") `
+                -Label "OpenAPI YAML parse" `
+                -SuccessTailLines 2
+
+            # The P4 fake-LLM contract test is a gate, not an optional script.
+            # Its fixture is deterministic and rebuilt only when absent.
+            $fixtureDir = Join-Path $tmpDir "p4-e2e-repo"
+            if (-not (Test-Path -LiteralPath (Join-Path $fixtureDir ".git"))) {
+                Invoke-LoggedCommand -Exe $scriptHost `
+                    -Arguments @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $scriptsDir "fixture-codeintel-repo.ps1")) `
+                    -WorkingDirectory $repoRoot `
+                    -LogPath (Join-Path $tmpDir "acceptance-p4-fixture.log") `
+                    -Label "scripts/fixture-codeintel-repo.ps1" `
+                    -SuccessTailLines 4
+            }
+            Invoke-LoggedCommand -Exe $nodeExe `
+                -Arguments @("scripts/fake-llm.p4.test.cjs") `
+                -WorkingDirectory $repoRoot `
+                -LogPath (Join-Path $tmpDir "acceptance-fake-llm-p4.log") `
+                -Label "node scripts/fake-llm.p4.test.cjs" `
+                -SuccessTailLines 8
+        })
+
     Add-CheckResult -Dod "risk" -CheckName "Compose container run" -Status "SKIPPED" `
         -Detail "No Docker on this host; Compose remains static-validation only (Task 15)."
     Add-CheckResult -Dod "4" -CheckName "Real LLM acceptance" -Status "SKIPPED" `
@@ -866,8 +1087,10 @@ try {
         -Detail "Gated: run scripts/acceptance-agent-llm.ps1 with EZTEST_RUN_REAL_LLM=1."
     Add-CheckResult -Dod "P3" -CheckName "P3 real LLM acceptance" -Status "SKIPPED" `
         -Detail "Gated: manual P3 acceptance (spec §10.7) with EZTEST_ACCEPTANCE_REAL_LLM=1; screenshots under .tmp/p3-acceptance/."
+    Add-CheckResult -Dod "P4" -CheckName "P4 real LLM acceptance" -Status "SKIPPED" `
+        -Detail "Gated: run scripts/acceptance-codeintel-llm.ps1 with EZTEST_RUN_REAL_LLM=1; results under .tmp/p4-real-acceptance.json."
 
-    Write-Step "P0-P3 DoD acceptance summary"
+    Write-Step "P0-P4 DoD acceptance summary"
     $table = $checkResults | Format-Table -AutoSize -Wrap | Out-String -Width 200
     Write-Host $table
 
@@ -958,6 +1181,34 @@ try {
     )
     $p3Table = $p3DodMapping | Format-Table -AutoSize -Wrap | Out-String -Width 200
     Write-Host $p3Table
+
+    # P4 exit criteria (spec §10.6) mapped to the evidence collected above;
+    # the gated real-LLM run remains the only opt-in piece.
+    Write-Step "P4 DoD mapping (spec §10.6)"
+    $p4DodMapping = @(
+        [pscustomobject][ordered]@{
+            DoD         = "P4-1"
+            Requirement = "Any-language repository: file-level diff, AI interface/route/page facts with evidence"
+            Evidence    = "codeintel domain/gitx suites; P4 OpenAPI tree/file/diff/facts paths; P4 fake-LLM test; gated acceptance-codeintel-llm.ps1"
+        },
+        [pscustomobject][ordered]@{
+            DoD         = "P4-2"
+            Requirement = "Same-commit analyses reuse the cache; re-analysis creates a new version without overwriting"
+            Evidence    = "codeintel application cache/version suites; gated script asserts reused=true and force analysisVersion+1"
+        },
+        [pscustomobject][ordered]@{
+            DoD         = "P4-3"
+            Requirement = "Impact candidates carry reason/confidence/evidence, can be toggled, and unmapped changes are visible"
+            Evidence    = "codeintel impact/candidate suites; P4 Analysis/Candidate/Unmapped OpenAPI schemas; gated script checks candidates/unmapped"
+        },
+        [pscustomobject][ordered]@{
+            DoD         = "P4-4"
+            Requirement = "AI failure degrades without blocking the main flow"
+            Evidence    = "codeintel degraded suites; P4 Analysis.degraded contract; gated script skips AI-only assertions when degraded"
+        }
+    )
+    $p4Table = $p4DodMapping | Format-Table -AutoSize -Wrap | Out-String -Width 200
+    Write-Host $p4Table
 
     $failed = @($checkResults | Where-Object { $_.Result -eq "FAIL" })
     $passed = @($checkResults | Where-Object { $_.Result -eq "PASS" })

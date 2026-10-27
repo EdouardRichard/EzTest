@@ -1,11 +1,11 @@
 openapi: 3.0.3
 info:
   title: EzTest API
-  version: 0.4.0
+  version: 0.5.0
   description: |
     Hand-maintained OpenAPI document for the EzTest API: the P0 foundation, the
-    P1 Agent runtime, the P2 resource context and the P3 version / requirements
-    / clarification context.
+    P1 Agent runtime, the P2 resource context, the P3 version / requirements /
+    clarification context and the P4 code-intelligence context.
 
     Conventions:
     - Successful responses use the `{"data": ...}` envelope. List endpoints add
@@ -50,6 +50,16 @@ info:
       `answeredBy`, `decidedBy`, `proposedBy`) stay numbers. Version events are
       published on `channel=version:{id}`; `GET /api/versions/{id}/stream` fixes
       that channel server-side and ignores a client-supplied `channel`.
+    - P4 code endpoints use `/api/code/repos` (repository-scoped reads plus the
+      administrator-only index trigger) and `/api/versions/{versionId}/code`
+      (version changes, analyses, candidates and anchors). Codeintel-owned IDs
+      (`analysisId`, `indexRunId`, `changeSetId`, `entityId`, `anchorId`,
+      `candidateId`, `factVersion`) and subject IDs are decimal strings while
+      `repoId`/`createdBy` stay numbers. Code endpoints never return code bodies
+      except the bounded `/file` line window and `/diff/file` patch the caller
+      explicitly requested, and errors never echo repository paths or code
+      content. P4 adds the `code.changed` and `code.impact_computed` event types
+      on the existing `version:{id}` channel; it adds no SSE endpoint.
 
     This document is served publicly at `GET /api/openapi.yaml`; it is the same
     file under `docs/openapi/api.yaml` in the repository.
@@ -69,6 +79,11 @@ tags:
   - name: resources
   - name: code-repos
   - name: versions
+  - name: code
+    description: |
+      P4 code intelligence: read-only Git tree/file/diff/commit reads and T0
+      facts, administrator-triggered repository indexing, and version-scoped
+      change previews, impact analyses, candidate selection and anchors.
   - name: health
 security: []
 paths:
@@ -2588,6 +2603,584 @@ paths:
           $ref: '#/components/responses/ResourceInvalid'
         '500':
           $ref: '#/components/responses/Internal'
+  /api/code/repos:
+    get:
+      tags: [code]
+      summary: List code repositories with their latest index-run projection
+      description: |
+        Every authenticated user. One row per P2 code repository (id ascending)
+        with the latest T0 index run inline (null before the first index). No
+        pagination: the P2 repository catalogue is unbounded in name only and
+        this projection is one application call per repository.
+      operationId: listCodeIntelRepos
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+      responses:
+        '200':
+          description: The repository summaries.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RepoSummaryList'
+              example:
+                data:
+                  - id: 3
+                    key: example-repo
+                    name: Example repository
+                    status: active
+                    fixedBranch: main
+                    lastCommit: '0123456789abcdef0123456789abcdef01234567'
+                    lastIndexedAt: '2026-10-28T01:02:03Z'
+                    index:
+                      runId: '1844674407370955161'
+                      repoId: 3
+                      commit: '0123456789abcdef0123456789abcdef01234567'
+                      source: manual
+                      status: done
+                      stats:
+                        files: 1200
+                        truncated: false
+                      errors: []
+                      startedAt: '2026-10-28T01:00:00Z'
+                      finishedAt: '2026-10-28T01:02:03Z'
+                      createdBy: 1
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/code/repos/{repoId}/index:
+    post:
+      tags: [code]
+      summary: Trigger a T0 index run of a repository (admin only)
+      description: |
+        Administrator only. Resolves the repository's fixed-branch tip and
+        enqueues one T0 index run (202). A repository that already has a
+        queued/running index returns 409 `index_in_progress`. Git/read failures
+        are 503 `git_unavailable` (retryable).
+      operationId: startCodeRepoIndex
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CodeRepoId'
+      responses:
+        '202':
+          description: The accepted index run.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IndexRunAcceptedEnvelope'
+              example:
+                data:
+                  runId: '1844674407370955161'
+                  status: queued
+                  commit: '0123456789abcdef0123456789abcdef01234567'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/CodeConflict'
+        '422':
+          $ref: '#/components/responses/CodeInvalid'
+        '503':
+          $ref: '#/components/responses/CodeGitUnavailable'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/code/repos/{repoId}/index-runs/latest:
+    get:
+      tags: [code]
+      summary: Read the latest index run of a repository
+      description: |
+        Every authenticated user. Returns 404 `index_run_not_found` when the
+        repository has never been indexed; repository index status is not
+        broadcast over SSE, so clients poll this endpoint.
+      operationId: getLatestCodeRepoIndexRun
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/CodeRepoId'
+      responses:
+        '200':
+          description: The latest index run.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IndexRunEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/CodeNotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/code/repos/{repoId}/index-runs/{runId}:
+    get:
+      tags: [code]
+      summary: Read one index run of a repository
+      description: A run of another repository is a plain 404 `index_run_not_found`.
+      operationId: getCodeRepoIndexRun
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/CodeRepoId'
+        - $ref: '#/components/parameters/CodeIndexRunId'
+      responses:
+        '200':
+          description: The index run.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IndexRunEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/CodeNotFound'
+        '422':
+          $ref: '#/components/responses/CodeInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/code/repos/{repoId}/tree:
+    get:
+      tags: [code]
+      summary: List one cursor page of a commit-pinned file tree (live Git)
+      description: |
+        Every authenticated user. `commit` defaults to the repository's fixed
+        branch tip; an empty `path` means the repository root. Entries are
+        `blob|tree` with a Git object id and an `unsupported` marker for
+        symlinks/submodules. The page is capped server-side.
+      operationId: getCodeRepoTree
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/CodeRepoId'
+        - name: commit
+          in: query
+          required: false
+          description: 40-hex commit; omitted/empty resolves the fixed branch tip.
+          schema:
+            type: string
+        - name: path
+          in: query
+          required: false
+          description: Repository-relative directory path; empty means the root.
+          schema:
+            type: string
+            maxLength: 4096
+        - name: cursor
+          in: query
+          required: false
+          description: Opaque cursor returned as `next_cursor` by the previous page.
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of tree entries.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TreePage'
+              example:
+                data:
+                  - path: src/example.ts
+                    type: blob
+                    size: 128
+                    gitObjectId: '0123456789abcdef0123456789abcdef01234567'
+                    mode: '100644'
+                    unsupported: false
+                next_cursor: ''
+                has_more: false
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          $ref: '#/components/responses/CodeInvalid'
+        '503':
+          $ref: '#/components/responses/CodeGitUnavailable'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/code/repos/{repoId}/file:
+    get:
+      tags: [code]
+      summary: Read one 1-based line window of a commit-pinned file (audited)
+      description: |
+        Every authenticated user; each read writes a `code.read` audit entry.
+        `startLine`/`endLine` are optional and clamped to the file; a bounded
+        window is still 200 with `truncated=true`. Never returns a whole file
+        beyond the bounded window.
+      operationId: getCodeRepoFile
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/CodeRepoId'
+        - name: commit
+          in: query
+          required: false
+          description: 40-hex commit; omitted/empty resolves the fixed branch tip.
+          schema:
+            type: string
+        - name: path
+          in: query
+          required: true
+          description: Repository-relative file path.
+          schema:
+            type: string
+            maxLength: 4096
+        - name: startLine
+          in: query
+          required: false
+          description: First line (1-based); omitted means the first line.
+          schema:
+            type: integer
+            minimum: 1
+        - name: endLine
+          in: query
+          required: false
+          description: Last line (inclusive); omitted means the end of the file.
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        '200':
+          description: The requested line window.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FileWindowEnvelope'
+              example:
+                data:
+                  commit: '0123456789abcdef0123456789abcdef01234567'
+                  path: src/example.ts
+                  startLine: 1
+                  endLine: 3
+                  totalLines: 120
+                  truncated: true
+                  content: '// placeholder line'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          $ref: '#/components/responses/CodeInvalid'
+        '503':
+          $ref: '#/components/responses/CodeGitUnavailable'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/code/repos/{repoId}/diff:
+    get:
+      tags: [code]
+      summary: List one page of a file-level change list (live Git preview)
+      description: |
+        Every authenticated user. `base` and `head` are required 40-hex commits
+        and must describe a valid base/head pair. The read-only preview never
+        persists a change set, so `changeSetId` is null. The `ChangeList` is
+        returned inside the normal `{"data":...}` envelope, not a generic page
+        envelope; its own `nextCursor`/`hasMore` paginate the file list.
+      operationId: getCodeRepoDiff
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/CodeRepoId'
+        - name: base
+          in: query
+          required: true
+          description: Base 40-hex commit.
+          schema:
+            type: string
+            pattern: '^[a-f0-9]{40}$'
+        - name: head
+          in: query
+          required: true
+          description: Head 40-hex commit (a descendant of base).
+          schema:
+            type: string
+            pattern: '^[a-f0-9]{40}$'
+        - name: cursor
+          in: query
+          required: false
+          description: Opaque path cursor from `nextCursor`.
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: The file-level change list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChangeListEnvelope'
+              example:
+                data:
+                  changeSetId: null
+                  baseCommit: '0123456789abcdef0123456789abcdef01234567'
+                  headCommit: '89abcdef0123456789abcdef0123456789abcdef'
+                  stats:
+                    files: 12
+                    additions: 340
+                    deletions: 80
+                    truncated: false
+                  files:
+                    - path: src/example.ts
+                      oldPath: null
+                      status: M
+                      additions: 40
+                      deletions: 2
+                      binary: false
+                      headBlobHash: 'git-sha1:0123456789abcdef0123456789abcdef01234567'
+                  nextCursor: null
+                  hasMore: false
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          $ref: '#/components/responses/CodeInvalid'
+        '503':
+          $ref: '#/components/responses/CodeGitUnavailable'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/code/repos/{repoId}/diff/file:
+    get:
+      tags: [code]
+      summary: Read the on-demand unified diff of one changed file
+      description: |
+        Every authenticated user. `base` is required; `head` defaults to the
+        fixed branch tip and the resolved pair is echoed. Binary, deleted and
+        oversized files are still 200 with an empty patch and the matching
+        `binary`/`truncated` flag. A path outside the change set is 422
+        `not_changed`.
+      operationId: getCodeRepoFileDiff
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/CodeRepoId'
+        - name: base
+          in: query
+          required: true
+          description: Base 40-hex commit.
+          schema:
+            type: string
+            pattern: '^[a-f0-9]{40}$'
+        - name: head
+          in: query
+          required: false
+          description: Head 40-hex commit; omitted/empty resolves the fixed branch tip.
+          schema:
+            type: string
+        - name: path
+          in: query
+          required: true
+          description: Repository-relative changed file path.
+          schema:
+            type: string
+            maxLength: 4096
+      responses:
+        '200':
+          description: The unified file diff.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FileDiffEnvelope'
+              example:
+                data:
+                  baseCommit: '0123456789abcdef0123456789abcdef01234567'
+                  headCommit: '89abcdef0123456789abcdef0123456789abcdef'
+                  path: src/example.ts
+                  status: M
+                  binary: false
+                  truncated: false
+                  patch: '@@ -1 +1 @@ -// old +// new'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          $ref: '#/components/responses/CodeInvalid'
+        '503':
+          $ref: '#/components/responses/CodeGitUnavailable'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/code/repos/{repoId}/facts:
+    get:
+      tags: [code]
+      summary: List one page of persisted code facts at a commit
+      description: |
+        Every authenticated user. Returns T0 file facts plus materialized AI
+        facts for the commit. `kind` and `path` are exact filters; pagination is
+        the shared opaque cursor envelope. Facts carry evidence ranges whose
+        excerpt hash is validated server-side against the commit content.
+      operationId: listCodeRepoFacts
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/CodeRepoId'
+        - name: commit
+          in: query
+          required: false
+          description: 40-hex commit; omitted/empty resolves the fixed branch tip.
+          schema:
+            type: string
+        - name: kind
+          in: query
+          required: false
+          description: Exact entity kind filter (for example `api` or `component`).
+          schema:
+            type: string
+        - name: path
+          in: query
+          required: false
+          description: Exact repository-relative path filter.
+          schema:
+            type: string
+            maxLength: 4096
+        - name: cursor
+          in: query
+          required: false
+          description: Opaque cursor returned as `next_cursor`.
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of facts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FactsPage'
+              example:
+                data:
+                  - id: '1844674407370955161'
+                    repoId: 3
+                    commit: '0123456789abcdef0123456789abcdef01234567'
+                    kind: api
+                    path: src/example.ts
+                    name: POST /api/example
+                    startLine: 10
+                    endLine: 12
+                    signature: ''
+                    blobHash: 'git-sha1:0123456789abcdef0123456789abcdef01234567'
+                    source: ai
+                    confidence: high
+                    evidence:
+                      - file: src/example.ts
+                        startLine: 10
+                        endLine: 12
+                        excerptHash: 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+                    factKey: 'api:POST /api/example'
+                    factVersion: 1
+                    analysisId: '1844674407370955162'
+                next_cursor: ''
+                has_more: false
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          $ref: '#/components/responses/CodeInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/code/repos/{repoId}/search:
+    get:
+      tags: [code]
+      summary: Search fact paths/names by substring (not full text)
+      description: |
+        Every authenticated user. Case-insensitive substring match on entity
+        path/name only (D24); no full-text index and no code-body search. The
+        read is audited by the application service.
+      operationId: searchCodeRepoFacts
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/CodeRepoId'
+        - name: commit
+          in: query
+          required: false
+          description: 40-hex commit; omitted/empty resolves the fixed branch tip.
+          schema:
+            type: string
+        - name: q
+          in: query
+          required: true
+          description: Path/name substring query.
+          schema:
+            type: string
+            minLength: 1
+        - name: kind
+          in: query
+          required: false
+          description: Exact entity kind filter.
+          schema:
+            type: string
+        - name: cursor
+          in: query
+          required: false
+          description: Opaque cursor returned as `next_cursor`.
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of matching facts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FactsPage'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          $ref: '#/components/responses/CodeInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/code/repos/{repoId}/commits/{sha}:
+    get:
+      tags: [code]
+      summary: Read one commit's metadata
+      description: |
+        Every authenticated user. `sha` must be 40 lowercase hex; a malformed
+        value is 422 `invalid_head` and an unknown commit is 422
+        `commit_not_found` (not 404).
+      operationId: getCodeRepoCommit
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/CodeRepoId'
+        - $ref: '#/components/parameters/CodeCommitSha'
+      responses:
+        '200':
+          description: The commit metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommitEnvelope'
+              example:
+                data:
+                  sha: '0123456789abcdef0123456789abcdef01234567'
+                  message: Example commit
+                  author: Example Author
+                  committedAt: '2026-10-28T01:00:00Z'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          $ref: '#/components/responses/CodeInvalid'
+        '503':
+          $ref: '#/components/responses/CodeGitUnavailable'
+        '500':
+          $ref: '#/components/responses/Internal'
   /api/versions:
     get:
       tags: [versions]
@@ -3859,6 +4452,379 @@ paths:
           $ref: '#/components/responses/NotFound'
         '500':
           $ref: '#/components/responses/Internal'
+  /api/versions/{versionId}/code/changes:
+    get:
+      tags: [code]
+      summary: Read a version-scoped change preview
+      description: |
+        Every authenticated user. Resolves the version's repository and baseline
+        commit, computes the live diff to `head` (default: the repository fixed
+        branch tip) and returns the shared `ChangeList` inside the normal
+        `{"data":...}` envelope. The read never writes a change set: when no
+        persisted change set exists for the pair, `changeSetId` is null.
+      operationId: getVersionCodeChanges
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/CodeVersionId'
+        - name: head
+          in: query
+          required: false
+          description: Head 40-hex commit; omitted/empty resolves the fixed branch tip.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The version change preview.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChangeListEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/CodeInvalid'
+        '503':
+          $ref: '#/components/responses/CodeGitUnavailable'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{versionId}/code/analyses:
+    post:
+      tags: [code]
+      summary: Trigger or reuse a version impact analysis
+      description: |
+        Every authenticated user. The request body is `{headCommit?, force?}`.
+        A new run returns 202 with `reused=false`; an identical completed run
+        (same version/base/head/model/prompt and fact-version snapshot, without
+        `force`) returns 200 `reused=true` and the existing id. `force=true`
+        creates `analysisVersion+1` and never overwrites the old analysis. A
+        queued/running analysis for the same version is 409
+        `analysis_in_progress`; a full worker queue is 429
+        `analysis_queue_full` (retryable). The analysis itself is asynchronous;
+        poll `/analyses/{analysisId}` or `/analyses/latest`.
+      operationId: startVersionCodeAnalysis
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/CodeVersionId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartAnalysisRequest'
+            example:
+              headCommit: '89abcdef0123456789abcdef0123456789abcdef'
+              force: false
+      responses:
+        '202':
+          description: A new analysis run was queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StartAnalysisResultEnvelope'
+              example:
+                data:
+                  id: '1844674407370955162'
+                  status: queued
+                  analysisVersion: 1
+                  reused: false
+        '200':
+          description: An identical analysis was reused.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StartAnalysisResultEnvelope'
+              example:
+                data:
+                  id: '1844674407370955162'
+                  status: done
+                  analysisVersion: 1
+                  reused: true
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/CodeConflict'
+        '422':
+          $ref: '#/components/responses/CodeInvalid'
+        '429':
+          $ref: '#/components/responses/CodeQueueFull'
+        '503':
+          $ref: '#/components/responses/CodeGitUnavailable'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{versionId}/code/analyses/latest:
+    get:
+      tags: [code]
+      summary: Read the latest impact analysis of a version
+      description: |
+        Every authenticated user. Returns the newest analysis with its
+        candidates, unmapped changes, fact-version snapshot and stats. 404
+        `analysis_not_found` before the first analysis.
+      operationId: getLatestVersionCodeAnalysis
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/CodeVersionId'
+      responses:
+        '200':
+          description: The latest analysis.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalysisEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/CodeNotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{versionId}/code/analyses/{analysisId}:
+    get:
+      tags: [code]
+      summary: Read one impact analysis of a version
+      description: |
+        Every authenticated user. An analysis of another version is 404
+        `analysis_not_found`. The response includes `changeSummary`, stats,
+        `factVersions`, candidates, unmapped changes and non-fatal errors.
+      operationId: getVersionCodeAnalysis
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/CodeVersionId'
+        - $ref: '#/components/parameters/CodeAnalysisId'
+      responses:
+        '200':
+          description: The analysis.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalysisEnvelope'
+              example:
+                data:
+                  id: '1844674407370955162'
+                  versionId: '1844674407370955161'
+                  repoId: 3
+                  baseCommit: '0123456789abcdef0123456789abcdef01234567'
+                  headCommit: '89abcdef0123456789abcdef0123456789abcdef'
+                  status: done
+                  degraded: false
+                  analysisVersion: 1
+                  model: example-model
+                  promptVersion: p4.1
+                  changeSetId: '1844674407370955163'
+                  changeSummary: Example change summary.
+                  stats:
+                    changedFiles: 2
+                    analyzedFiles: 2
+                    cacheHits: 0
+                    facts: 4
+                    edges: 1
+                    contracts: 1
+                    evidenceChecks: 6
+                    evidenceFailures: 0
+                    unmapped: 1
+                    invalidFacts: 0
+                    duplicateFacts: 0
+                    unmatchedContracts: 0
+                    truncated: false
+                  factVersions:
+                    - factKey: 'api:POST /api/example'
+                      version: 1
+                  candidates:
+                    - id: '1844674407370955164'
+                      subjectKind: requirement
+                      subjectId: '1844674407370955165'
+                      reason: changed file src/example.ts
+                      confidence: high
+                      source: direct
+                      evidence:
+                        - file: src/example.ts
+                      selected: true
+                  unmapped:
+                    - path: docs/example.md
+                      status: M
+                      reason: no_fact_or_anchor
+                      suggestion: Confirm the impact manually.
+                  errors: []
+                  createdBy: 1
+                  createdAt: '2026-10-28T01:00:00Z'
+                  startedAt: '2026-10-28T01:00:01Z'
+                  finishedAt: '2026-10-28T01:00:20Z'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/CodeNotFound'
+        '422':
+          $ref: '#/components/responses/CodeInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{versionId}/code/analyses/{analysisId}/candidates/{candidateId}:
+    patch:
+      tags: [code]
+      summary: Adjust one impact candidate's manual selection
+      description: |
+        Every authenticated user. Body `{selected: bool}`. Only a completed
+        analysis can be adjusted; a queued/running analysis is 409
+        `analysis_not_done`. The response is the updated candidate. The change
+        is persisted but does not alter the analysis status.
+      operationId: patchVersionCodeAnalysisCandidate
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/CodeVersionId'
+        - $ref: '#/components/parameters/CodeAnalysisId'
+        - $ref: '#/components/parameters/CodeCandidateId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateCandidateRequest'
+            example:
+              selected: true
+      responses:
+        '200':
+          description: The updated candidate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CandidateEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/CodeNotFound'
+        '409':
+          $ref: '#/components/responses/CodeConflict'
+        '422':
+          $ref: '#/components/responses/CodeInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{versionId}/code/anchors:
+    get:
+      tags: [code]
+      summary: List the code anchors of a version
+      description: |
+        Every authenticated user. Optional `subjectKind`/`subjectId` exact
+        filters. The response is the normal `{"data":[...]}` envelope (no
+        pagination); anchor ids and subject ids are decimal strings.
+      operationId: listVersionCodeAnchors
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/CodeVersionId'
+        - name: subjectKind
+          in: query
+          required: false
+          description: Exact subject kind filter.
+          schema:
+            $ref: '#/components/schemas/AnchorSubjectKind'
+        - name: subjectId
+          in: query
+          required: false
+          description: Exact decimal-string subject id filter.
+          schema:
+            type: string
+            pattern: '^[0-9]{1,19}$'
+      responses:
+        '200':
+          description: The anchors of the version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnchorList'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/CodeInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [code]
+      summary: Create a code anchor
+      description: |
+        Every authenticated user. P4 accepts `requirement`, `app_model` and
+        `version` subjects; `case`/`issue` are 422 `unsupported_subject_kind`.
+        The requirement must belong to the version and an app-model subject
+        requires the version's system binding. The file must exist at the fixed
+        branch tip. A duplicate subject/file/line-range anchor is 409
+        `anchor_duplicate`. Returns 201 with the created anchor.
+      operationId: createVersionCodeAnchor
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/CodeVersionId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAnchorRequest'
+            example:
+              subjectKind: requirement
+              subjectId: '1844674407370955165'
+              filePath: src/example.ts
+              startLine: 10
+              endLine: 12
+      responses:
+        '201':
+          description: The created anchor.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnchorEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/CodeConflict'
+        '422':
+          $ref: '#/components/responses/CodeInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{versionId}/code/anchors/{anchorId}:
+    delete:
+      tags: [code]
+      summary: Delete a code anchor
+      description: |
+        Every authenticated user. The anchor must belong to the version; an
+        unknown/other-version anchor is 404 `anchor_not_found`. Returns 204.
+      operationId: deleteVersionCodeAnchor
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/CodeVersionId'
+        - $ref: '#/components/parameters/CodeAnchorId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: The anchor was deleted.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/CodeNotFound'
+        '422':
+          $ref: '#/components/responses/CodeInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
   /healthz:
     get:
       tags: [health]
@@ -4240,6 +5206,63 @@ components:
         type: integer
         format: int64
         minimum: 1
+    CodeRepoId:
+      name: repoId
+      in: path
+      required: true
+      description: P2 code repository id (a number, unlike codeintel-owned ids).
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    CodeVersionId:
+      name: versionId
+      in: path
+      required: true
+      description: P3 version id serialized as a decimal string.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    CodeIndexRunId:
+      name: runId
+      in: path
+      required: true
+      description: Codeintel index-run id serialized as a decimal string.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    CodeAnalysisId:
+      name: analysisId
+      in: path
+      required: true
+      description: Codeintel analysis id serialized as a decimal string.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    CodeCandidateId:
+      name: candidateId
+      in: path
+      required: true
+      description: Codeintel impact-candidate id serialized as a decimal string.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    CodeAnchorId:
+      name: anchorId
+      in: path
+      required: true
+      description: Codeintel anchor id serialized as a decimal string.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    CodeCommitSha:
+      name: sha
+      in: path
+      required: true
+      description: Lowercase 40-hex commit SHA-1.
+      schema:
+        type: string
+        pattern: '^[a-f0-9]{40}$'
   responses:
     InvalidArgument:
       description: Invalid input (`invalid_argument` or `idempotency_conflict` for a reused key with a different body).
@@ -4412,6 +5435,63 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorEnvelope'
+    CodeInvalid:
+      description: |
+        A semantically invalid P4 code request (`invalid_argument`, HTTP 422).
+        `details.reason` is one of `code_repository_not_bound`,
+        `code_repository_not_found`, `code_repository_disabled`,
+        `baseline_commit_missing`, `invalid_head`, `commit_not_found`,
+        `path_not_found`, `path_not_file`, `path_escape`, `not_changed`,
+        `unsupported_content`, `unsupported_subject_kind`,
+        `subject_not_in_version`, `app_model_not_found`, `invalid_id`, plus the
+        transport-level `invalid_request`, `invalid_limit`, `invalid_cursor`,
+        `invalid_line`, `invalid_line_range`, `invalid_json` and
+        `body_too_large` (HTTP 400/422).
+        `details.field` names the rejected field. Messages never echo code
+        content or repository-internal paths.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    CodeConflict:
+      description: |
+        A P4 state conflict (`conflict`, HTTP 409). `details.reason` is one of
+        `index_in_progress` (the repository already has a queued/running index),
+        `analysis_in_progress` (the version already has a queued/running
+        analysis), `analysis_not_done` (adjusting a candidate before the
+        analysis completed) or `anchor_duplicate` (same subject/file/line range).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    CodeNotFound:
+      description: |
+        A P4 object is absent (`not_found`, HTTP 404). `details.reason` is one of
+        `index_run_not_found`, `analysis_not_found`, `candidate_not_found` or
+        `anchor_not_found`. A missing P3 version or P2 repository on a
+        version-scoped route stays a plain `not_found`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    CodeQueueFull:
+      description: |
+        The bounded analysis worker queue is full (`rate_limited`, HTTP 429).
+        `details.reason=analysis_queue_full` and `retryable` is true.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    CodeGitUnavailable:
+      description: |
+        The Git repository is temporarily unreadable or a Git command timed out
+        (`unavailable`, HTTP 503). `details.reason=git_unavailable` and
+        `retryable` is true; no Git output, internal path or code content is
+        echoed.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
   schemas:
     ErrorEnvelope:
       type: object
@@ -4459,7 +5539,8 @@ components:
                 `capacity`) or `field` (the rejected request field). P3 version
                 errors carry `reason` from the tables documented by
                 VersionConflict, VersionInvalid and VersionUnavailable, plus
-                `field`/`message` when applicable.
+                `field`/`message` when applicable. P4 code errors carry `reason`
+                from CodeErrorReason, plus `field`/`message` when applicable.
     User:
       type: object
       required: [id, username, role, status]
@@ -6299,6 +7380,904 @@ components:
           description: Opaque cursor for the next page; empty when `has_more` is false.
         has_more:
           type: boolean
+    CodeErrorReason:
+      type: string
+      description: |
+        Closed set of P4 `error.details.reason` values (spec §7.1 plus the
+        transport-level request errors). The HTTP status is determined by the
+        error code: 400/422 `invalid_argument`, 404 `not_found`, 409 `conflict`,
+        429 `rate_limited`, 503 `unavailable`.
+      enum:
+        - code_repository_not_bound
+        - code_repository_not_found
+        - code_repository_disabled
+        - baseline_commit_missing
+        - invalid_head
+        - commit_not_found
+        - git_unavailable
+        - path_not_found
+        - path_not_file
+        - path_escape
+        - not_changed
+        - unsupported_content
+        - index_in_progress
+        - index_run_not_found
+        - analysis_in_progress
+        - analysis_queue_full
+        - analysis_not_found
+        - analysis_not_done
+        - candidate_not_found
+        - anchor_not_found
+        - anchor_duplicate
+        - unsupported_subject_kind
+        - subject_not_in_version
+        - app_model_not_found
+        - invalid_id
+        - invalid_request
+        - invalid_limit
+        - invalid_cursor
+        - invalid_line
+        - invalid_line_range
+        - invalid_json
+        - body_too_large
+    IndexRunStats:
+      type: object
+      required: [files, truncated]
+      properties:
+        files:
+          type: integer
+          minimum: 0
+        truncated:
+          type: boolean
+    IndexRun:
+      type: object
+      description: |
+        One T0 repository index run. `runId` is a decimal string; `repoId` and
+        `createdBy` are numbers. `stats` is null until the run produced a stats
+        document; `errors` is always an array.
+      required:
+        - runId
+        - repoId
+        - commit
+        - source
+        - status
+        - stats
+        - errors
+        - startedAt
+        - finishedAt
+        - createdBy
+      properties:
+        runId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        repoId:
+          type: integer
+          format: int64
+          minimum: 1
+        commit:
+          type: string
+          pattern: '^[a-f0-9]{40}$'
+        source:
+          type: string
+          description: Who/why the run was started (for example `manual`, `startup`).
+        status:
+          type: string
+          enum: [queued, running, done, failed]
+        stats:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/IndexRunStats'
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/AnalysisError'
+        startedAt:
+          type: string
+          format: date-time
+          nullable: true
+        finishedAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdBy:
+          type: integer
+          format: int64
+          minimum: 1
+        createdAt:
+          type: string
+          format: date-time
+    IndexRunEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/IndexRun'
+    IndexRunAccepted:
+      type: object
+      required: [runId, status, commit]
+      properties:
+        runId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        status:
+          type: string
+          enum: [queued, running, done, failed]
+        commit:
+          type: string
+          pattern: '^[a-f0-9]{40}$'
+    IndexRunAcceptedEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/IndexRunAccepted'
+    RepoSummary:
+      type: object
+      description: |
+        A P2 code repository plus its latest index-run projection. `index` is
+        null before the first run; `lastCommit` projects the newest indexed
+        commit. `repoId` stays a number.
+      required:
+        - id
+        - key
+        - name
+        - status
+        - fixedBranch
+        - lastCommit
+        - lastIndexedAt
+        - index
+      properties:
+        id:
+          type: integer
+          format: int64
+          minimum: 1
+        key:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9_-]{1,63}$'
+        name:
+          type: string
+        status:
+          type: string
+          enum: [active, disabled]
+        fixedBranch:
+          type: string
+        lastCommit:
+          type: string
+          description: Newest indexed commit, or empty before the first index.
+        lastIndexedAt:
+          type: string
+          format: date-time
+          nullable: true
+        index:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/IndexRun'
+    RepoSummaryList:
+      type: object
+      description: The unbounded repository summary list (no generic page envelope).
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/RepoSummary'
+    ChangeSetStats:
+      type: object
+      required: [files, additions, deletions, truncated]
+      properties:
+        files:
+          type: integer
+          minimum: 0
+        additions:
+          type: integer
+          minimum: 0
+        deletions:
+          type: integer
+          minimum: 0
+        truncated:
+          type: boolean
+    ChangedFile:
+      type: object
+      required: [path, oldPath, status, additions, deletions, binary, headBlobHash]
+      properties:
+        path:
+          type: string
+          maxLength: 4096
+        oldPath:
+          type: string
+          maxLength: 4096
+          nullable: true
+        status:
+          type: string
+          description: File-level Git status (A/M/D/R/C/T).
+          enum: [A, M, D, R, C, T]
+        additions:
+          type: integer
+          minimum: 0
+        deletions:
+          type: integer
+          minimum: 0
+        binary:
+          type: boolean
+        headBlobHash:
+          type: string
+          description: Head-side blob identity (`git-sha1:<40hex>` or `sha256:<64hex>`).
+    ChangeList:
+      type: object
+      description: |
+        The shared change-list projection of `/api/code/repos/{repoId}/diff` and
+        `/api/versions/{versionId}/code/changes`. It is carried inside the normal
+        `{"data":...}` envelope; its own `nextCursor`/`hasMore` paginate the file
+        array. `changeSetId` is null for a read-only preview.
+      required:
+        - changeSetId
+        - baseCommit
+        - headCommit
+        - stats
+        - files
+        - nextCursor
+        - hasMore
+      properties:
+        changeSetId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+        baseCommit:
+          type: string
+          pattern: '^[a-f0-9]{40}$'
+        headCommit:
+          type: string
+          pattern: '^[a-f0-9]{40}$'
+        stats:
+          $ref: '#/components/schemas/ChangeSetStats'
+        files:
+          type: array
+          maxItems: 2000
+          description: One page for `/diff` (limit 1-100); the whole stored change set (up to 2000) for the version preview.
+          items:
+            $ref: '#/components/schemas/ChangedFile'
+        nextCursor:
+          type: string
+          nullable: true
+        hasMore:
+          type: boolean
+    ChangeListEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/ChangeList'
+    TreeEntry:
+      type: object
+      required: [path, type, size, gitObjectId, mode, unsupported]
+      properties:
+        path:
+          type: string
+          maxLength: 4096
+        type:
+          type: string
+          enum: [blob, tree]
+        size:
+          type: integer
+          format: int64
+          minimum: 0
+        gitObjectId:
+          type: string
+          pattern: '^[a-f0-9]{40}$'
+        mode:
+          type: string
+          description: Git tree mode (for example `100644` or `040000`).
+        unsupported:
+          type: boolean
+          description: True for symlink/submodule entries that P4 does not follow.
+    TreePage:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          maxItems: 200
+          items:
+            $ref: '#/components/schemas/TreeEntry'
+        next_cursor:
+          type: string
+          description: Opaque path cursor; empty when `has_more` is false.
+        has_more:
+          type: boolean
+    FileWindow:
+      type: object
+      required: [commit, path, startLine, endLine, totalLines, truncated, content]
+      properties:
+        commit:
+          type: string
+          pattern: '^[a-f0-9]{40}$'
+        path:
+          type: string
+          maxLength: 4096
+        startLine:
+          type: integer
+          minimum: 1
+        endLine:
+          type: integer
+          minimum: 1
+        totalLines:
+          type: integer
+          minimum: 0
+        truncated:
+          type: boolean
+        content:
+          type: string
+          description: The bounded line window only; never an unbounded file dump.
+    FileWindowEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/FileWindow'
+    FileDiff:
+      type: object
+      required: [baseCommit, headCommit, path, status, binary, truncated, patch]
+      properties:
+        baseCommit:
+          type: string
+          pattern: '^[a-f0-9]{40}$'
+        headCommit:
+          type: string
+          pattern: '^[a-f0-9]{40}$'
+        path:
+          type: string
+          maxLength: 4096
+        status:
+          type: string
+          enum: [A, M, D, R, C, T]
+        binary:
+          type: boolean
+        truncated:
+          type: boolean
+        patch:
+          type: string
+          description: Unified diff, empty for binary/deleted/oversized files.
+    FileDiffEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/FileDiff'
+    AnalysisError:
+      type: object
+      description: One non-fatal run error; never code content or internal paths.
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        path:
+          type: string
+          maxLength: 4096
+        message:
+          type: string
+    Evidence:
+      type: object
+      description: |
+        One code evidence range. AI/T1 evidence carries `startLine`/`endLine`
+        and the server-computed `excerptHash`; anchor-sourced evidence carries
+        only `file`.
+      required: [file]
+      properties:
+        file:
+          type: string
+          maxLength: 4096
+        startLine:
+          type: integer
+          minimum: 1
+        endLine:
+          type: integer
+          minimum: 1
+        excerptHash:
+          type: string
+          pattern: '^sha256:[a-f0-9]{64}$'
+    CodeEntity:
+      type: object
+      description: |
+        One persisted code fact/entity at a commit. `id`/`analysisId` are decimal
+        strings; `repoId` is a number. `evidence` is always an array.
+      required:
+        - id
+        - repoId
+        - commit
+        - kind
+        - path
+        - name
+        - startLine
+        - endLine
+        - signature
+        - blobHash
+        - source
+        - confidence
+        - evidence
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        repoId:
+          type: integer
+          format: int64
+          minimum: 1
+        commit:
+          type: string
+          pattern: '^[a-f0-9]{40}$'
+        kind:
+          type: string
+          description: Entity kind (for example `api`, `route`, `page`, `component`).
+        path:
+          type: string
+          maxLength: 4096
+        name:
+          type: string
+        startLine:
+          type: integer
+          minimum: 1
+          nullable: true
+        endLine:
+          type: integer
+          minimum: 1
+          nullable: true
+        signature:
+          type: string
+        blobHash:
+          type: string
+        source:
+          type: string
+          enum: [git, ai]
+        confidence:
+          type: string
+          description: Confidence bucket (high/medium/low); T0 facts may use an empty value.
+        evidence:
+          type: array
+          items:
+            $ref: '#/components/schemas/Evidence'
+        factKey:
+          type: string
+          nullable: true
+        factVersion:
+          type: integer
+          minimum: 1
+          nullable: true
+        analysisId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    FactsPage:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/CodeEntity'
+        next_cursor:
+          type: string
+          description: Opaque cursor; empty when `has_more` is false.
+        has_more:
+          type: boolean
+    Commit:
+      type: object
+      required: [sha, message, author, committedAt]
+      properties:
+        sha:
+          type: string
+          pattern: '^[a-f0-9]{40}$'
+        message:
+          type: string
+        author:
+          type: string
+        committedAt:
+          type: string
+          format: date-time
+    CommitEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/Commit'
+    AnalysisStats:
+      type: object
+      required:
+        - changedFiles
+        - analyzedFiles
+        - cacheHits
+        - facts
+        - edges
+        - contracts
+        - evidenceChecks
+        - evidenceFailures
+        - unmapped
+        - invalidFacts
+        - duplicateFacts
+        - unmatchedContracts
+        - truncated
+        - skipped
+      properties:
+        changedFiles:
+          type: integer
+          minimum: 0
+        analyzedFiles:
+          type: integer
+          minimum: 0
+        cacheHits:
+          type: integer
+          minimum: 0
+        facts:
+          type: integer
+          minimum: 0
+        edges:
+          type: integer
+          minimum: 0
+        contracts:
+          type: integer
+          minimum: 0
+        evidenceChecks:
+          type: integer
+          minimum: 0
+        evidenceFailures:
+          type: integer
+          minimum: 0
+        unmapped:
+          type: integer
+          minimum: 0
+        invalidFacts:
+          type: integer
+          minimum: 0
+        duplicateFacts:
+          type: integer
+          minimum: 0
+        unmatchedContracts:
+          type: integer
+          minimum: 0
+        truncated:
+          type: boolean
+        skipped:
+          type: integer
+          minimum: 0
+          description: Changed files skipped by a limit (always emitted).
+    FactVersionRef:
+      type: object
+      required: [factKey, version]
+      properties:
+        factKey:
+          type: string
+          maxLength: 512
+        version:
+          type: integer
+          minimum: 1
+    Candidate:
+      type: object
+      description: |
+        One impact candidate. `id`/`subjectId` are decimal strings; `subjectKind`
+        is `requirement` or `app_model`. The `evidence` items are always an array
+        and are normalized/deduplicated by the server.
+      required:
+        - id
+        - subjectKind
+        - subjectId
+        - reason
+        - confidence
+        - source
+        - evidence
+        - selected
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        subjectKind:
+          type: string
+          enum: [requirement, app_model]
+        subjectId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        reason:
+          type: string
+          maxLength: 2000
+        confidence:
+          type: string
+          enum: [high, medium, low]
+        source:
+          type: string
+          enum: [direct, contract, relation, ai]
+        evidence:
+          type: array
+          maxItems: 8
+          items:
+            $ref: '#/components/schemas/Evidence'
+        selected:
+          type: boolean
+        selectionUpdatedBy:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+        selectionUpdatedAt:
+          type: string
+          format: date-time
+          nullable: true
+    UnmappedChange:
+      type: object
+      description: A changed file that produced no requirement/app-model candidate.
+      required: [path, status, reason, suggestion]
+      properties:
+        path:
+          type: string
+          maxLength: 4096
+        status:
+          type: string
+          enum: [A, M, D, R, C, T]
+        reason:
+          type: string
+          enum:
+            - deleted_file
+            - unsupported_content
+            - no_fact_or_anchor
+            - ai_unavailable
+            - unmatched_contract
+        suggestion:
+          type: string
+    Analysis:
+      type: object
+      description: |
+        `AnalysisDTO` of spec §7.3. `id`/`versionId`/`changeSetId`/candidate ids
+        and subject ids are decimal strings; `repoId`/`createdBy` are numbers.
+        `unmapped` is present on latest/detail reads. R8: `stats` is always an
+        object (zero counters before completion) and the four aggregate arrays
+        are always `[]` rather than null.
+      required:
+        - id
+        - versionId
+        - repoId
+        - baseCommit
+        - headCommit
+        - status
+        - degraded
+        - analysisVersion
+        - model
+        - promptVersion
+        - changeSetId
+        - changeSummary
+        - stats
+        - factVersions
+        - candidates
+        - unmapped
+        - errors
+        - createdBy
+        - createdAt
+        - startedAt
+        - finishedAt
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        versionId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        repoId:
+          type: integer
+          format: int64
+          minimum: 1
+        baseCommit:
+          type: string
+          pattern: '^[a-f0-9]{40}$'
+        headCommit:
+          type: string
+          pattern: '^[a-f0-9]{40}$'
+        status:
+          type: string
+          enum: [queued, running, done, failed]
+        degraded:
+          type: boolean
+        analysisVersion:
+          type: integer
+          minimum: 1
+        model:
+          type: string
+        promptVersion:
+          type: string
+          maxLength: 32
+        changeSetId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+        changeSummary:
+          type: string
+          maxLength: 2000
+          description: The change-set summary projected from the run stats/document.
+        stats:
+          $ref: '#/components/schemas/AnalysisStats'
+        factVersions:
+          type: array
+          maxItems: 500
+          items:
+            $ref: '#/components/schemas/FactVersionRef'
+        candidates:
+          type: array
+          maxItems: 200
+          items:
+            $ref: '#/components/schemas/Candidate'
+        unmapped:
+          type: array
+          maxItems: 200
+          items:
+            $ref: '#/components/schemas/UnmappedChange'
+        errors:
+          type: array
+          maxItems: 20
+          items:
+            $ref: '#/components/schemas/AnalysisError'
+        createdBy:
+          type: integer
+          format: int64
+          minimum: 1
+        createdAt:
+          type: string
+          format: date-time
+        startedAt:
+          type: string
+          format: date-time
+          nullable: true
+        finishedAt:
+          type: string
+          format: date-time
+          nullable: true
+    AnalysisEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/Analysis'
+    StartAnalysisRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        headCommit:
+          type: string
+          description: Omit/empty to resolve the repository fixed branch tip; otherwise a 40-hex descendant of the baseline.
+        force:
+          type: boolean
+          default: false
+          description: Skip reuse and create `analysisVersion+1`.
+    StartAnalysisResult:
+      type: object
+      required: [id, status, analysisVersion, reused]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        status:
+          type: string
+          enum: [queued, running, done, failed]
+        analysisVersion:
+          type: integer
+          minimum: 1
+        reused:
+          type: boolean
+    StartAnalysisResultEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/StartAnalysisResult'
+    UpdateCandidateRequest:
+      type: object
+      additionalProperties: false
+      required: [selected]
+      properties:
+        selected:
+          type: boolean
+    CandidateEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/Candidate'
+    AnchorSubjectKind:
+      type: string
+      description: P4 anchor subject kinds; `case`/`issue` are reserved for later phases.
+      enum: [version, requirement, app_model]
+    Anchor:
+      type: object
+      description: |
+        A code anchor. `id`/`versionId`/`subjectId` are decimal strings;
+        `createdBy` is a number. `startLine`/`endLine`/`commitSha` are always
+        present and null when the anchor has no line range or commit pin.
+      required:
+        - id
+        - versionId
+        - subjectKind
+        - subjectId
+        - filePath
+        - startLine
+        - endLine
+        - commitSha
+        - confidence
+        - createdByKind
+        - createdBy
+        - createdAt
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        versionId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        subjectKind:
+          $ref: '#/components/schemas/AnchorSubjectKind'
+        subjectId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        filePath:
+          type: string
+          maxLength: 4096
+        startLine:
+          type: integer
+          minimum: 1
+          nullable: true
+        endLine:
+          type: integer
+          minimum: 1
+          nullable: true
+        commitSha:
+          type: string
+          pattern: '^[a-f0-9]{40}$'
+          nullable: true
+        confidence:
+          type: string
+          description: Anchor confidence bucket (high/medium/low).
+        createdByKind:
+          type: string
+          description: P4 anchors are user-created (`user`); AI anchors are reserved.
+        createdBy:
+          type: integer
+          format: int64
+          minimum: 1
+        createdAt:
+          type: string
+          format: date-time
+    AnchorList:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Anchor'
+    AnchorEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/Anchor'
+    CreateAnchorRequest:
+      type: object
+      additionalProperties: false
+      required: [subjectKind, subjectId, filePath]
+      properties:
+        subjectKind:
+          $ref: '#/components/schemas/AnchorSubjectKind'
+        subjectId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        filePath:
+          type: string
+          maxLength: 4096
+        startLine:
+          type: integer
+          minimum: 1
+        endLine:
+          type: integer
+          minimum: 1
     CreateSystemRequest:
       type: object
       required: [key, name, kind, baseUrl]
@@ -7811,6 +9790,13 @@ components:
         nine-kind detail contract. `clarification.context_updated` is emitted by
         the `context.summary_update` tool and carries
         `detail.versionId` (decimal string), `detail.tool` and `detail.actorId`.
+        P4 adds `code.changed` (published when a change set is ready;
+        `detail.analysisId`, `detail.baseCommit`, `detail.headCommit` and
+        `detail.stats`) and `code.impact_computed` (published when an analysis
+        finishes or degrades; `detail.analysisId`, `detail.analysisVersion`,
+        `detail.status`, `detail.degraded` and `detail.counts`). Both put changed
+        or evidence paths (up to 20, deduplicated) in `refs.code` and never carry
+        facts, diffs or code content.
       enum:
         - version.created
         - version.updated
@@ -7832,6 +9818,8 @@ components:
         - attachment.added
         - attachment.removed
         - agent.activity
+        - code.changed
+        - code.impact_computed
     VersionEvent:
       type: object
       description: |
