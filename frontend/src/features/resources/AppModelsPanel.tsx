@@ -1,13 +1,13 @@
 "use client"
 
-import { Boxes, Pencil, Plus, RefreshCw, Upload } from "lucide-react"
+import { Boxes, Pencil, Plus, RefreshCw, Trash2, Upload } from "lucide-react"
 import { type FormEvent, useCallback, useEffect, useRef, useState } from "react"
 
 import { EmptyState } from "@/components/ui/EmptyState"
 import { ApiError } from "@/lib/api-client"
 
 import { AppModelImportDialog } from "./AppModelImportDialog"
-import { createAppModel, listAppModels, updateAppModel } from "./api"
+import { createAppModel, deleteAppModel, listAppModels, updateAppModel } from "./api"
 import type { AppModelNodeDTO } from "./types"
 
 const APP_MODEL_PAGE_LIMIT = 100
@@ -87,6 +87,22 @@ function validateForm(form: NodeFormState, editing: boolean): string {
   return ""
 }
 
+/** Removes a node and every local descendant; the backend cascades the subtree. */
+function withoutSubtree(nodes: AppModelNodeDTO[], rootId: number): AppModelNodeDTO[] {
+  const removed = new Set<number>([rootId])
+  let changed = true
+  while (changed) {
+    changed = false
+    for (const node of nodes) {
+      if (node.parentId !== null && removed.has(node.parentId) && !removed.has(node.id)) {
+        removed.add(node.id)
+        changed = true
+      }
+    }
+  }
+  return nodes.filter((node) => !removed.has(node.id))
+}
+
 const inputClass =
   "mt-1 w-full rounded-lg border border-border bg-input px-3 py-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-60"
 const labelClass = "text-xs font-medium text-muted-foreground"
@@ -94,6 +110,10 @@ const primaryButtonClass =
   "inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
 const secondaryButtonClass =
   "inline-flex items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-2 text-sm font-medium transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+const rowActionClass =
+  "inline-flex items-center gap-1 rounded-lg border border-border px-2 py-1 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+const rowDangerActionClass =
+  "inline-flex items-center gap-1 rounded-lg border border-destructive/40 bg-destructive/10 px-2 py-1 text-xs font-medium text-destructive transition-colors hover:bg-destructive/20 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
 
 export type AppModelsPanelProps = {
   systemId: number
@@ -116,6 +136,8 @@ export function AppModelsPanel({ systemId, canWrite }: AppModelsPanelProps) {
   const [editingId, setEditingId] = useState<number | null>(null)
   const [form, setForm] = useState<NodeFormState>(EMPTY_FORM)
   const [saving, setSaving] = useState(false)
+  const [deletingId, setDeletingId] = useState<number | null>(null)
+  const [confirmingDeleteId, setConfirmingDeleteId] = useState<number | null>(null)
   const [importOpen, setImportOpen] = useState(false)
   const importButtonRef = useRef<HTMLButtonElement>(null)
 
@@ -202,6 +224,26 @@ export function AppModelsPanel({ systemId, canWrite }: AppModelsPanelProps) {
       setError(describeError(caught))
     } finally {
       setSaving(false)
+    }
+  }
+
+  async function handleDelete(node: AppModelNodeDTO) {
+    setConfirmingDeleteId(null)
+    setDeletingId(node.id)
+    setError("")
+    setNotice("")
+    try {
+      await deleteAppModel(node.id)
+      setNodes((previous) => withoutSubtree(previous, node.id))
+      if (editingId === node.id) {
+        setFormOpen(false)
+        setEditingId(null)
+      }
+      setNotice(`已删除节点 ${node.name}。`)
+    } catch (caught) {
+      setError(describeError(caught))
+    } finally {
+      setDeletingId(null)
     }
   }
 
@@ -450,15 +492,55 @@ export function AppModelsPanel({ systemId, canWrite }: AppModelsPanelProps) {
                   <td className="px-2.5 py-2 text-xs text-muted-foreground">{node.source}</td>
                   {canWrite ? (
                     <td className="px-2.5 py-2 text-right">
-                      <button
-                        type="button"
-                        onClick={() => startEdit(node)}
-                        aria-label={`编辑 ${node.name}`}
-                        className="inline-flex items-center gap-1 rounded-lg border border-border px-2 py-1 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                      >
-                        <Pencil className="h-3 w-3" aria-hidden="true" />
-                        编辑
-                      </button>
+                      <div className="flex flex-wrap items-center justify-end gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => startEdit(node)}
+                          aria-label={`编辑 ${node.name}`}
+                          className={rowActionClass}
+                        >
+                          <Pencil className="h-3 w-3" aria-hidden="true" />
+                          编辑
+                        </button>
+                        {confirmingDeleteId === node.id ? (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => void handleDelete(node)}
+                              disabled={deletingId === node.id}
+                              aria-label={`确认删除节点 ${node.name}`}
+                              className={rowDangerActionClass}
+                            >
+                              <Trash2 className="h-3 w-3" aria-hidden="true" />
+                              确认删除
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setConfirmingDeleteId(null)}
+                              disabled={deletingId === node.id}
+                              aria-label={`取消删除节点 ${node.name}`}
+                              className={rowActionClass}
+                            >
+                              取消
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setConfirmingDeleteId(node.id)
+                              setError("")
+                              setNotice("")
+                            }}
+                            disabled={deletingId === node.id}
+                            aria-label={`删除节点 ${node.name}`}
+                            className={rowActionClass}
+                          >
+                            <Trash2 className="h-3 w-3" aria-hidden="true" />
+                            删除
+                          </button>
+                        )}
+                      </div>
                     </td>
                   ) : null}
                 </tr>

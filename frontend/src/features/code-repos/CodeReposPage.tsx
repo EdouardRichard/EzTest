@@ -26,13 +26,19 @@ type CodeRepoForm = {
   excludeGlobs: string
 }
 
+/**
+ * Defaults from the code_repositories DDL. The backend applies them only when
+ * `excludeGlobs` is omitted, so the create form must send them explicitly.
+ */
+const DEFAULT_EXCLUDE_GLOBS = ".git/**, node_modules/**, dist/**, build/**, vendor/**"
+
 const EMPTY_FORM: CodeRepoForm = {
   key: "",
   name: "",
   localPath: "",
   fixedBranch: "main",
   includeGlobs: "",
-  excludeGlobs: "",
+  excludeGlobs: DEFAULT_EXCLUDE_GLOBS,
 }
 
 /** Human labels for the closed `details.reason` set of spec §7.1/§6.7. */
@@ -416,6 +422,9 @@ export function CodeReposPage() {
                 placeholder="例如 .git/**, node_modules/**"
                 className="mt-1 w-full rounded-lg border border-border bg-input px-3 py-2 font-mono text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring"
               />
+              <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
+                新建时默认排除常见构建目录；清空后保存将显式提交空列表。
+              </p>
             </div>
           </div>
 

@@ -172,6 +172,76 @@ describe("CodeReposPage", () => {
     expect(screen.getByRole("status").textContent).toContain("已创建")
   })
 
+  it("prefills the documented default exclude globs for a new repository", async () => {
+    const created = {
+      ...REPO,
+      id: 3,
+      key: "eztest-defaults",
+      name: "EzTest Defaults",
+      localPath: "D:/repo3",
+      fixedBranch: "main",
+    }
+    mocks.listCodeRepos.mockResolvedValue({
+      items: [REPO, created],
+      nextCursor: null,
+      hasMore: false,
+    })
+    mocks.createCodeRepo.mockResolvedValueOnce(created)
+
+    render(<CodeReposPage />)
+    await screen.findByText("EzTest")
+
+    fireEvent.click(screen.getByRole("button", { name: "新建代码仓" }))
+    const excludeInput = screen.getByLabelText(/排除 Globs/) as HTMLInputElement
+    expect(excludeInput.value).toBe(".git/**, node_modules/**, dist/**, build/**, vendor/**")
+
+    fireEvent.change(screen.getByLabelText("标识"), { target: { value: "eztest-defaults" } })
+    fireEvent.change(screen.getByLabelText("名称"), { target: { value: "EzTest Defaults" } })
+    fireEvent.change(screen.getByLabelText("本地路径"), { target: { value: "D:/repo3" } })
+    fireEvent.click(screen.getByRole("button", { name: "保存" }))
+
+    await waitFor(() =>
+      expect(mocks.createCodeRepo).toHaveBeenCalledWith(
+        expect.objectContaining({
+          excludeGlobs: [".git/**", "node_modules/**", "dist/**", "build/**", "vendor/**"],
+        }),
+      ),
+    )
+  })
+
+  it("sends an empty exclude list when the prefilled defaults are cleared", async () => {
+    const created = {
+      ...REPO,
+      id: 4,
+      key: "eztest-no-excludes",
+      name: "EzTest No Excludes",
+      localPath: "D:/repo4",
+      fixedBranch: "main",
+    }
+    mocks.listCodeRepos.mockResolvedValue({
+      items: [REPO, created],
+      nextCursor: null,
+      hasMore: false,
+    })
+    mocks.createCodeRepo.mockResolvedValueOnce(created)
+
+    render(<CodeReposPage />)
+    await screen.findByText("EzTest")
+
+    fireEvent.click(screen.getByRole("button", { name: "新建代码仓" }))
+    fireEvent.change(screen.getByLabelText("标识"), { target: { value: "eztest-no-excludes" } })
+    fireEvent.change(screen.getByLabelText("名称"), { target: { value: "EzTest No Excludes" } })
+    fireEvent.change(screen.getByLabelText("本地路径"), { target: { value: "D:/repo4" } })
+    fireEvent.change(screen.getByLabelText(/排除 Globs/), { target: { value: "" } })
+    fireEvent.click(screen.getByRole("button", { name: "保存" }))
+
+    await waitFor(() =>
+      expect(mocks.createCodeRepo).toHaveBeenCalledWith(
+        expect.objectContaining({ excludeGlobs: [] }),
+      ),
+    )
+  })
+
   it("edits a repo without sending the immutable key", async () => {
     mocks.updateCodeRepo.mockResolvedValueOnce({ ...REPO, localPath: "D:/moved-repo" })
 
