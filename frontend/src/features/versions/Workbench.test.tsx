@@ -76,7 +76,15 @@ vi.mock("@/features/code-repos/api", () => ({
   listCodeRepos: mocks.listCodeRepos,
 }))
 
-import type { ClarificationSession, Requirement, RequirementRelation, Version } from "./types"
+import type {
+  ClarificationDecision,
+  ClarificationQuestion,
+  ClarificationSession,
+  Requirement,
+  RequirementRelation,
+  Version,
+  VersionEvent,
+} from "./types"
 import { Workbench } from "./Workbench"
 
 const VERSION_ID = "1844674407370955161"
@@ -170,6 +178,75 @@ const RELATION: RequirementRelation = {
   createdBy: 1,
   createdAt: "2026-10-27T10:00:00Z",
   updatedAt: "2026-10-27T10:00:00Z",
+}
+
+const CLARIFICATION_QUESTION: ClarificationQuestion = {
+  id: "1844674407370957101",
+  versionId: VERSION_ID,
+  requirementId: REQ_A,
+  sessionId: CLARIFICATION_SESSION.id,
+  question: "下单后如何扣减库存？",
+  status: "open",
+  answer: "",
+  source: "ai",
+  answeredVia: "ui",
+  answeredBy: null,
+  answeredAt: null,
+  createdBy: 1,
+  createdAt: "2026-10-27T10:00:00Z",
+  updatedAt: "2026-10-27T10:00:00Z",
+}
+
+function clarificationDecision(
+  overrides: Partial<ClarificationDecision> &
+    Pick<ClarificationDecision, "id" | "topic" | "status">,
+): ClarificationDecision {
+  return {
+    versionId: VERSION_ID,
+    requirementId: REQ_A,
+    questionId: null,
+    decision: "支持 7 天无理由退款",
+    rationale: "",
+    source: "ai",
+    proposedBy: 1,
+    decidedBy: null,
+    decidedAt: null,
+    createdAt: "2026-10-27T10:00:00Z",
+    updatedAt: "2026-10-27T10:00:00Z",
+    ...overrides,
+  }
+}
+
+const PROPOSED_DECISION = clarificationDecision({
+  id: "1844674407370957201",
+  topic: "退款政策",
+  status: "proposed",
+})
+
+const ACCEPTED_DECISION = clarificationDecision({
+  id: "1844674407370957201",
+  topic: "退款政策",
+  status: "accepted",
+  decidedBy: 1,
+  decidedAt: "2026-10-27T12:00:00Z",
+})
+
+function versionEvent(seq: number, type: string): VersionEvent {
+  return {
+    seq,
+    channel: `version:${VERSION_ID}`,
+    type,
+    version_id: VERSION_ID,
+    batch_id: null,
+    case_id: null,
+    step_id: null,
+    agent_role: null,
+    session_id: null,
+    ts: new Date(Date.UTC(2026, 9, 27, 10, 0, seq)).toISOString(),
+    summary: "",
+    detail: {},
+    refs: { evidence: [], case: [], requirement: [], code: [] },
+  }
 }
 
 function page(items: Requirement[], nextCursor = "", hasMore = false) {
@@ -460,5 +537,117 @@ describe("Workbench", () => {
     expect(mocks.listClarificationMessages).toHaveBeenCalledWith(VERSION_ID, { limit: 50 })
     expect(mocks.listClarificationQuestions).toHaveBeenCalledWith(VERSION_ID, { limit: 100 })
     expect(mocks.listDecisions).toHaveBeenCalledWith(VERSION_ID, { limit: 100 })
+  })
+
+  it("reloads the clarification overview, panels and header when AI events arrive", async () => {
+    let streamEvents: VersionEvent[] = [versionEvent(1, "requirement.added")]
+    mocks.useVersionStream.mockImplementation(() => ({
+      events: streamEvents,
+      status: "live",
+      reconnect: vi.fn(),
+    }))
+    mocks.getClarification.mockResolvedValue({
+      session: CLARIFICATION_SESSION,
+      questions: { open: 2, answered: 1, dismissed: 0 },
+      decisions: { proposed: 1, accepted: 0, rejected: 0 },
+    })
+    const onChanged = vi.fn()
+    const view = renderWorkbench(onChanged)
+
+    await waitFor(() => expect(mocks.getClarification).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(mocks.listClarificationQuestions).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(mocks.listDecisions).toHaveBeenCalledTimes(1))
+    // The mounted panels display the overview's server counters.
+    expect(screen.getByRole("button", { name: "待回答 2" })).toBeTruthy()
+    expect(screen.getByRole("button", { name: "待确认 1" })).toBeTruthy()
+
+    // clarification.question_updated: question panel + overview + header reload.
+    streamEvents = [...streamEvents, versionEvent(2, "clarification.question_updated")]
+    mocks.listClarificationQuestions.mockResolvedValue({
+      items: [CLARIFICATION_QUESTION],
+      nextCursor: "",
+      hasMore: false,
+    })
+    mocks.getClarification.mockResolvedValue({
+      session: CLARIFICATION_SESSION,
+      questions: { open: 1, answered: 1, dismissed: 0 },
+      decisions: { proposed: 1, accepted: 0, rejected: 0 },
+    })
+    view.rerender(<Workbench version={VERSION} onChanged={onChanged} />)
+    expect(await screen.findByText("下单后如何扣减库存？")).toBeTruthy()
+    await waitFor(() => expect(mocks.getClarification).toHaveBeenCalledTimes(2))
+    expect(screen.getByRole("button", { name: "待回答 1" })).toBeTruthy()
+
+    // decision.proposed: decision panel + overview + header reload.
+    streamEvents = [...streamEvents, versionEvent(3, "decision.proposed")]
+    mocks.listDecisions.mockResolvedValue({
+      items: [PROPOSED_DECISION],
+      nextCursor: "",
+      hasMore: false,
+    })
+    mocks.getClarification.mockResolvedValue({
+      session: CLARIFICATION_SESSION,
+      questions: { open: 1, answered: 1, dismissed: 0 },
+      decisions: { proposed: 2, accepted: 0, rejected: 0 },
+    })
+    view.rerender(<Workbench version={VERSION} onChanged={onChanged} />)
+    expect(await screen.findByText("支持 7 天无理由退款")).toBeTruthy()
+    await waitFor(() => expect(mocks.getClarification).toHaveBeenCalledTimes(3))
+    expect(screen.getByRole("button", { name: "待确认 2" })).toBeTruthy()
+
+    // clarification.context_updated: the overview reloads as well.
+    streamEvents = [...streamEvents, versionEvent(4, "clarification.context_updated")]
+    view.rerender(<Workbench version={VERSION} onChanged={onChanged} />)
+    await waitFor(() => expect(mocks.getClarification).toHaveBeenCalledTimes(4))
+
+    // decision.decided: decision panel + overview reload.
+    streamEvents = [...streamEvents, versionEvent(5, "decision.decided")]
+    mocks.listDecisions.mockResolvedValue({
+      items: [ACCEPTED_DECISION],
+      nextCursor: "",
+      hasMore: false,
+    })
+    mocks.getClarification.mockResolvedValue({
+      session: CLARIFICATION_SESSION,
+      questions: { open: 1, answered: 1, dismissed: 0 },
+      decisions: { proposed: 1, accepted: 1, rejected: 0 },
+    })
+    view.rerender(<Workbench version={VERSION} onChanged={onChanged} />)
+    expect(await screen.findByText("已接受 1")).toBeTruthy()
+    await waitFor(() => expect(mocks.getClarification).toHaveBeenCalledTimes(5))
+
+    await waitFor(() => expect(mocks.listClarificationQuestions).toHaveBeenCalledTimes(5))
+    expect(mocks.listDecisions).toHaveBeenCalledTimes(5)
+    expect(onChanged).toHaveBeenCalledTimes(4)
+  })
+
+  it("refreshes the clarification panels when the workbench is reloaded manually", async () => {
+    renderWorkbench()
+
+    await waitFor(() => expect(mocks.listClarificationQuestions).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(mocks.listDecisions).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(mocks.getClarification).toHaveBeenCalledTimes(1))
+
+    const refresh = screen.getByRole("button", { name: "刷新工作台" })
+    await waitFor(() => expect((refresh as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(refresh)
+
+    await waitFor(() => expect(mocks.listClarificationQuestions).toHaveBeenCalledTimes(2))
+    expect(mocks.listDecisions).toHaveBeenCalledTimes(2)
+    expect(mocks.getClarification).toHaveBeenCalledTimes(2)
+  })
+
+  it("does not offer to start a session when the clarification overview fails to load", async () => {
+    mocks.getClarification.mockRejectedValue(
+      new ApiError({ status: 500, code: "internal", message: "boom" }),
+    )
+
+    renderWorkbench()
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toContain("加载澄清会话失败")
+    await waitFor(() => expect(screen.queryByText("正在加载澄清会话…")).toBeNull())
+    expect(screen.getByText("无法加载澄清会话状态。")).toBeTruthy()
+    expect(screen.queryByRole("button", { name: "开始澄清会话" })).toBeNull()
   })
 })

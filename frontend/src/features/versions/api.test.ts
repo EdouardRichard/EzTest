@@ -3,7 +3,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { setToken } from "@/lib/auth-storage"
 
 import {
+  analyzeClarification,
+  completeClarificationSession,
   confirmRequirement,
+  createClarificationQuestion,
+  createDecision,
   createRelation,
   createRequirement,
   createVersion,
@@ -13,20 +17,33 @@ import {
   downloadAttachment,
   enterDesign,
   fetchVersionEvents,
+  getClarification,
   getVersion,
   listAttachments,
+  listClarificationMessages,
+  listClarificationQuestions,
+  listDecisions,
   listRelations,
   listRequirements,
   listVersions,
   putBindings,
+  reconClarification,
   reopenRequirement,
+  sendClarificationMessage,
   startClarification,
+  startClarificationSession,
+  updateClarificationQuestion,
+  updateDecision,
   updateRelation,
   updateRequirement,
   updateVersion,
   uploadAttachment,
 } from "./api"
 import type {
+  ClarificationDecision,
+  ClarificationMessage,
+  ClarificationQuestion,
+  ClarificationSession,
   Requirement,
   RequirementAttachment,
   RequirementRelation,
@@ -133,6 +150,65 @@ const ATTACHMENT: RequirementAttachment = {
 }
 
 const UPLOAD_FILE = new File(["# notes\n"], "notes.md", { type: "text/markdown" })
+
+const CLARIFICATION_SESSION_ID = "1844674407370957001"
+const QUESTION_ID = "1844674407370957101"
+const DECISION_ID = "1844674407370957201"
+
+const CLARIFICATION_SESSION: ClarificationSession = {
+  id: CLARIFICATION_SESSION_ID,
+  status: "active",
+  agentSessionId: 77,
+  startedAt: "2026-10-27T10:00:00Z",
+  endedAt: null,
+  contextSummary: "",
+  summaryUpdatedAt: null,
+}
+
+const CLARIFICATION_MESSAGE: ClarificationMessage = {
+  id: 11,
+  role: "assistant",
+  parts: [{ type: "text", text: "请确认是否必填。" }],
+  reasoning: "先核对需求上下文",
+  toolCalls: [{ id: "call_1", name: "version.context_get", arguments: "{}" }],
+  toolName: null,
+  runId: 501,
+  createdAt: "2026-10-27T10:00:05Z",
+}
+
+const CLARIFICATION_QUESTION: ClarificationQuestion = {
+  id: QUESTION_ID,
+  versionId: VERSION_ID,
+  requirementId: REQUIREMENT_ID,
+  sessionId: CLARIFICATION_SESSION_ID,
+  question: "下单后如何扣减库存？",
+  status: "open",
+  answer: "",
+  source: "ai",
+  answeredVia: "ui",
+  answeredBy: null,
+  answeredAt: null,
+  createdBy: 1,
+  createdAt: "2026-10-27T10:00:00Z",
+  updatedAt: "2026-10-27T10:00:00Z",
+}
+
+const CLARIFICATION_DECISION: ClarificationDecision = {
+  id: DECISION_ID,
+  versionId: VERSION_ID,
+  requirementId: REQUIREMENT_ID,
+  questionId: null,
+  topic: "退款政策",
+  decision: "支持 7 天无理由退款",
+  rationale: "",
+  status: "proposed",
+  source: "ai",
+  proposedBy: 1,
+  decidedBy: null,
+  decidedAt: null,
+  createdAt: "2026-10-27T10:00:00Z",
+  updatedAt: "2026-10-27T10:00:00Z",
+}
 
 function jsonResponse(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
@@ -595,5 +671,289 @@ describe("requirement workbench api", () => {
     request = lastRequest()
     expect(request.url.endsWith(`/api/versions/${VERSION_ID}/relations/${RELATION_ID}`)).toBe(true)
     expect(request.method).toBe("DELETE")
+  })
+})
+
+describe("clarification api", () => {
+  beforeEach(() => {
+    fetchMock.mockReset()
+    vi.stubGlobal("fetch", fetchMock)
+    setToken("test-token")
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it("reads the clarification overview and normalizes missing session and counters", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        data: {
+          session: CLARIFICATION_SESSION,
+          questions: { open: 2, answered: 1, dismissed: 0 },
+          decisions: { proposed: 1, accepted: 0, rejected: 0 },
+        },
+      }),
+    )
+
+    await expect(getClarification(VERSION_ID)).resolves.toEqual({
+      session: CLARIFICATION_SESSION,
+      questions: { open: 2, answered: 1, dismissed: 0 },
+      decisions: { proposed: 1, accepted: 0, rejected: 0 },
+    })
+    const request = lastRequest()
+    expect(request.url.endsWith(`/api/versions/${VERSION_ID}/clarification`)).toBe(true)
+    expect(request.method).toBe("GET")
+
+    fetchMock.mockResolvedValue(jsonResponse({ data: { session: null } }))
+    await expect(getClarification(VERSION_ID)).resolves.toEqual({
+      session: null,
+      questions: { open: 0, answered: 0, dismissed: 0 },
+      decisions: { proposed: 0, accepted: 0, rejected: 0 },
+    })
+  })
+
+  it("starts and completes a clarification session without a request body", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ data: CLARIFICATION_SESSION }, 201))
+    await expect(startClarificationSession(VERSION_ID)).resolves.toEqual(CLARIFICATION_SESSION)
+    let request = lastRequest()
+    expect(request.url.endsWith(`/api/versions/${VERSION_ID}/clarification/sessions`)).toBe(true)
+    expect(request.method).toBe("POST")
+    expect(request.body).toBeUndefined()
+
+    fetchMock.mockResolvedValue(new Response(null, { status: 204 }))
+    await expect(
+      completeClarificationSession(VERSION_ID, CLARIFICATION_SESSION_ID),
+    ).resolves.toBeUndefined()
+    request = lastRequest()
+    expect(
+      request.url.endsWith(
+        `/api/versions/${VERSION_ID}/clarification/sessions/${CLARIFICATION_SESSION_ID}/complete`,
+      ),
+    ).toBe(true)
+    expect(request.method).toBe("POST")
+    expect(request.body).toBeUndefined()
+  })
+
+  it("lists messages with before_id and normalizes optional fields", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        data: [
+          {
+            id: 11,
+            role: "assistant",
+            parts: [{ type: "text", text: "请确认是否必填。" }],
+            runId: 501,
+            createdAt: "2026-10-27T10:00:05Z",
+          },
+          CLARIFICATION_MESSAGE,
+        ],
+        next_cursor: "10",
+        has_more: true,
+      }),
+    )
+
+    const page = await listClarificationMessages(VERSION_ID, { beforeId: 11, limit: 50 })
+
+    expect(page.items[0]).toMatchObject({
+      id: 11,
+      reasoning: "",
+      toolCalls: null,
+      toolName: null,
+    })
+    expect(page.items[1]).toEqual(CLARIFICATION_MESSAGE)
+    expect(page.nextCursor).toBe("10")
+    expect(page.hasMore).toBe(true)
+    const request = lastRequest()
+    expect(
+      request.url.endsWith(
+        `/api/versions/${VERSION_ID}/clarification/messages?before_id=11&limit=50`,
+      ),
+    ).toBe(true)
+    expect(request.method).toBe("GET")
+  })
+
+  it("sends a message and starts the analyze/recon runs without bodies", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse(
+        {
+          data: {
+            sessionId: CLARIFICATION_SESSION_ID,
+            agentSessionId: 77,
+            runId: 501,
+            status: "running",
+          },
+        },
+        202,
+      ),
+    )
+
+    const sent = await sendClarificationMessage(VERSION_ID, "库存如何扣减？")
+
+    expect(sent).toEqual({
+      sessionId: CLARIFICATION_SESSION_ID,
+      agentSessionId: 77,
+      runId: 501,
+      status: "running",
+    })
+    let request = lastRequest()
+    expect(request.url.endsWith(`/api/versions/${VERSION_ID}/clarification/messages`)).toBe(true)
+    expect(request.method).toBe("POST")
+    expect(jsonBody(request)).toEqual({ message: "库存如何扣减？" })
+
+    const runResult = { agentSessionId: 77, runId: 501 }
+    fetchMock.mockResolvedValue(jsonResponse({ data: runResult }, 202))
+    await expect(analyzeClarification(VERSION_ID)).resolves.toEqual(runResult)
+    request = lastRequest()
+    expect(request.url.endsWith(`/api/versions/${VERSION_ID}/clarification/analyze`)).toBe(true)
+    expect(request.method).toBe("POST")
+    expect(request.body).toBeUndefined()
+
+    fetchMock.mockResolvedValue(jsonResponse({ data: { agentSessionId: 77, runId: 502 } }, 202))
+    await expect(reconClarification(VERSION_ID)).resolves.toEqual({
+      agentSessionId: 77,
+      runId: 502,
+    })
+    request = lastRequest()
+    expect(request.url.endsWith(`/api/versions/${VERSION_ID}/clarification/recon`)).toBe(true)
+    expect(request.method).toBe("POST")
+    expect(request.body).toBeUndefined()
+  })
+
+  it("lists, creates and updates clarification questions", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        data: [
+          {
+            id: QUESTION_ID,
+            versionId: VERSION_ID,
+            question: "下单后如何扣减库存？",
+            status: "open",
+            answer: "",
+            source: "ai",
+            answeredVia: "ui",
+            answeredBy: null,
+            answeredAt: null,
+            createdBy: 1,
+            createdAt: "2026-10-27T10:00:00Z",
+            updatedAt: "2026-10-27T10:00:00Z",
+          },
+        ],
+        next_cursor: "q2",
+        has_more: true,
+      }),
+    )
+
+    const page = await listClarificationQuestions(VERSION_ID, {
+      status: "open",
+      requirementId: REQUIREMENT_ID,
+      limit: 50,
+      cursor: "q1",
+    })
+
+    expect(page.items[0].requirementId).toBeNull()
+    expect(page.items[0].sessionId).toBeNull()
+    expect(page.nextCursor).toBe("q2")
+    expect(page.hasMore).toBe(true)
+    let request = lastRequest()
+    expect(
+      request.url.endsWith(
+        `/api/versions/${VERSION_ID}/clarification/questions?status=open&requirementId=${REQUIREMENT_ID}&limit=50&cursor=q1`,
+      ),
+    ).toBe(true)
+    expect(request.method).toBe("GET")
+
+    fetchMock.mockResolvedValue(jsonResponse({ data: CLARIFICATION_QUESTION }, 201))
+    await expect(
+      createClarificationQuestion(VERSION_ID, {
+        question: "下单后如何扣减库存？",
+        requirementId: REQUIREMENT_ID,
+      }),
+    ).resolves.toEqual(CLARIFICATION_QUESTION)
+    request = lastRequest()
+    expect(request.url.endsWith(`/api/versions/${VERSION_ID}/clarification/questions`)).toBe(true)
+    expect(request.method).toBe("POST")
+    expect(jsonBody(request)).toEqual({
+      question: "下单后如何扣减库存？",
+      requirementId: REQUIREMENT_ID,
+    })
+
+    fetchMock.mockResolvedValue(
+      jsonResponse({ data: { ...CLARIFICATION_QUESTION, status: "answered", answer: "下单扣减" } }),
+    )
+    await updateClarificationQuestion(VERSION_ID, QUESTION_ID, {
+      status: "answered",
+      answer: "下单扣减",
+    })
+    request = lastRequest()
+    expect(
+      request.url.endsWith(`/api/versions/${VERSION_ID}/clarification/questions/${QUESTION_ID}`),
+    ).toBe(true)
+    expect(request.method).toBe("PATCH")
+    expect(jsonBody(request)).toEqual({ status: "answered", answer: "下单扣减" })
+  })
+
+  it("lists, creates and updates decisions", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        data: [
+          {
+            id: DECISION_ID,
+            versionId: VERSION_ID,
+            topic: "退款政策",
+            decision: "支持 7 天无理由退款",
+            rationale: "",
+            status: "proposed",
+            source: "ai",
+            proposedBy: 1,
+            decidedBy: null,
+            decidedAt: null,
+            createdAt: "2026-10-27T10:00:00Z",
+            updatedAt: "2026-10-27T10:00:00Z",
+          },
+        ],
+        next_cursor: "d2",
+        has_more: true,
+      }),
+    )
+
+    const page = await listDecisions(VERSION_ID, { status: "proposed", limit: 50, cursor: "d1" })
+
+    expect(page.items[0].requirementId).toBeNull()
+    expect(page.items[0].questionId).toBeNull()
+    expect(page.nextCursor).toBe("d2")
+    let request = lastRequest()
+    expect(
+      request.url.endsWith(
+        `/api/versions/${VERSION_ID}/decisions?status=proposed&limit=50&cursor=d1`,
+      ),
+    ).toBe(true)
+    expect(request.method).toBe("GET")
+
+    fetchMock.mockResolvedValue(jsonResponse({ data: CLARIFICATION_DECISION }, 201))
+    await expect(
+      createDecision(VERSION_ID, {
+        topic: "退款政策",
+        decision: "支持 7 天无理由退款",
+        requirementId: REQUIREMENT_ID,
+      }),
+    ).resolves.toEqual(CLARIFICATION_DECISION)
+    request = lastRequest()
+    expect(request.url.endsWith(`/api/versions/${VERSION_ID}/decisions`)).toBe(true)
+    expect(request.method).toBe("POST")
+    expect(jsonBody(request)).toEqual({
+      topic: "退款政策",
+      decision: "支持 7 天无理由退款",
+      requirementId: REQUIREMENT_ID,
+    })
+
+    fetchMock.mockResolvedValue(
+      jsonResponse({ data: { ...CLARIFICATION_DECISION, status: "accepted" } }),
+    )
+    await updateDecision(VERSION_ID, DECISION_ID, { status: "accepted" })
+    request = lastRequest()
+    expect(request.url.endsWith(`/api/versions/${VERSION_ID}/decisions/${DECISION_ID}`)).toBe(true)
+    expect(request.method).toBe("PATCH")
+    expect(jsonBody(request)).toEqual({ status: "accepted" })
   })
 })

@@ -68,6 +68,49 @@ const ASSISTANT_MESSAGE = message({
   createdAt: "2026-10-27T10:00:05Z",
 })
 
+/** P1 persists an empty assistant placeholder before the run streams content. */
+const PLACEHOLDER_MESSAGE = message({
+  id: 101,
+  role: "assistant",
+  parts: [],
+  createdAt: "2026-10-27T10:00:05Z",
+})
+
+/** The same placeholder after the run finished and P1 persisted the answer. */
+const STREAMED_ANSWER = message({
+  id: 101,
+  role: "assistant",
+  parts: [{ type: "text", text: "请确认收货地址是否必填，并补充联系人。" }],
+  createdAt: "2026-10-27T10:00:05Z",
+})
+
+const ASSISTANT_WITH_TOOL_CALLS = message({
+  id: 20,
+  role: "assistant",
+  parts: [],
+  toolCalls: [
+    { id: "call_a", name: "tool_a", arguments: '{"a":1}' },
+    { id: "call_b", name: "tool_b", arguments: '{"b":2}' },
+  ],
+  createdAt: "2026-10-27T10:00:01Z",
+})
+
+const TOOL_RESULT_A = message({
+  id: 21,
+  role: "tool",
+  parts: [{ type: "text", text: "结果一" }],
+  toolName: "tool_a",
+  createdAt: "2026-10-27T10:00:02Z",
+})
+
+const TOOL_RESULT_B = message({
+  id: 22,
+  role: "tool",
+  parts: [{ type: "text", text: "结果二" }],
+  toolName: "tool_b",
+  createdAt: "2026-10-27T10:00:03Z",
+})
+
 function messagesPage(items: ClarificationMessage[]): ClarificationMessagesPage {
   return { items, nextCursor: "", hasMore: false }
 }
@@ -227,6 +270,7 @@ describe("ClarificationChat", () => {
             result: '{"ok":true}',
             status: "ok",
             duration_ms: 12,
+            run_id: "501",
           }),
         ],
       }),
@@ -374,5 +418,260 @@ describe("ClarificationChat", () => {
       expect((screen.getByLabelText("消息内容") as HTMLTextAreaElement).disabled).toBe(false),
     )
     expect(onChanged).toHaveBeenCalledTimes(1)
+  })
+
+  it("renders live answer chunks into an empty persisted assistant placeholder", async () => {
+    mocks.listClarificationMessages.mockResolvedValue(
+      messagesPage([USER_MESSAGE, PLACEHOLDER_MESSAGE]),
+    )
+
+    renderChat({
+      events: [
+        activity(10, { kind: "text", message_id: 101, part: 0, text: "请确认收货地址" }),
+        activity(11, { kind: "text", message_id: 101, part: 0, text: "是否必填。" }),
+      ],
+    })
+
+    // Wait for the snapshot (the persisted user message) before asserting the
+    // placeholder's live answer: the live chunks must survive that snapshot.
+    expect(await screen.findByText("订单创建需要哪些字段？")).toBeTruthy()
+    expect(await screen.findByText("请确认收货地址是否必填。")).toBeTruthy()
+  })
+
+  it("refetches the snapshot when a run finishes so the persisted answer replaces live chunks", async () => {
+    mocks.listClarificationMessages
+      .mockResolvedValueOnce(messagesPage([USER_MESSAGE, PLACEHOLDER_MESSAGE]))
+      .mockResolvedValueOnce(messagesPage([USER_MESSAGE, STREAMED_ANSWER]))
+
+    const liveChunks = [
+      activity(10, { kind: "text", message_id: 101, part: 0, text: "请确认收货地址" }),
+      activity(11, { kind: "text", message_id: 101, part: 0, text: "是否必填。" }),
+    ]
+    const { rerender } = renderChat({ events: liveChunks })
+
+    expect(await screen.findByText("请确认收货地址是否必填。")).toBeTruthy()
+    expect(mocks.listClarificationMessages).toHaveBeenCalledTimes(1)
+
+    rerender(
+      chatElement({
+        events: [
+          ...liveChunks,
+          activity(12, { kind: "run_finished", run_id: "501", status: "done" }),
+        ],
+      }),
+    )
+
+    await waitFor(() => expect(mocks.listClarificationMessages).toHaveBeenCalledTimes(2))
+    expect(await screen.findByText("请确认收货地址是否必填，并补充联系人。")).toBeTruthy()
+    // The persisted message is authoritative now; the live chunk rows are gone.
+    expect(screen.queryByText("请确认收货地址是否必填。")).toBeNull()
+  })
+
+  it("does not duplicate the optimistic echo when a finished run refetches the snapshot", async () => {
+    const persistedUser = message({
+      id: 11,
+      role: "user",
+      parts: [{ type: "text", text: "收货地址是否必填？" }],
+      runId: 500,
+      createdAt: "2026-10-27T10:00:00Z",
+    })
+    mocks.listClarificationMessages
+      .mockResolvedValueOnce(messagesPage([]))
+      .mockResolvedValueOnce(messagesPage([persistedUser, STREAMED_ANSWER]))
+
+    const { rerender } = renderChat()
+    expect(await screen.findByText("暂无消息")).toBeTruthy()
+
+    fireEvent.change(screen.getByLabelText("消息内容"), {
+      target: { value: "收货地址是否必填？" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "发送" }))
+    await waitFor(() =>
+      expect(mocks.sendClarificationMessage).toHaveBeenCalledWith(VERSION_ID, "收货地址是否必填？"),
+    )
+    expect(await screen.findByText("收货地址是否必填？")).toBeTruthy()
+
+    rerender(
+      chatElement({
+        events: [activity(12, { kind: "run_finished", run_id: "501", status: "done" })],
+      }),
+    )
+
+    await waitFor(() => expect(mocks.listClarificationMessages).toHaveBeenCalledTimes(2))
+    expect(await screen.findByText("请确认收货地址是否必填，并补充联系人。")).toBeTruthy()
+    // The snapshot now carries the persisted user message: the optimistic echo
+    // must be dropped instead of rendering the same text twice.
+    expect(screen.getAllByText("收货地址是否必填？").length).toBe(1)
+  })
+
+  it("pairs persisted tool results with tool calls in call order", async () => {
+    mocks.listClarificationMessages.mockResolvedValue(
+      messagesPage([ASSISTANT_WITH_TOOL_CALLS, TOOL_RESULT_A, TOOL_RESULT_B]),
+    )
+
+    renderChat()
+
+    const rowA = (await screen.findByRole("button", { name: "工具 tool_a" })).parentElement
+    const rowB = screen.getByRole("button", { name: "工具 tool_b" }).parentElement
+    expect(rowA).not.toBeNull()
+    expect(rowB).not.toBeNull()
+    if (rowA === null || rowB === null) return
+
+    fireEvent.click(within(rowA).getByRole("button", { name: "工具 tool_a" }))
+    fireEvent.click(within(rowB).getByRole("button", { name: "工具 tool_b" }))
+
+    expect(within(rowA).getByText("结果一")).toBeTruthy()
+    expect(within(rowB).getByText("结果二")).toBeTruthy()
+    expect(within(rowA).queryByText("结果二")).toBeNull()
+    expect(within(rowB).queryByText("结果一")).toBeNull()
+  })
+
+  it("refetches the message snapshot when the stream reconnects", async () => {
+    mocks.listClarificationMessages
+      .mockResolvedValueOnce(messagesPage([USER_MESSAGE]))
+      .mockResolvedValueOnce(messagesPage([USER_MESSAGE, ASSISTANT_MESSAGE]))
+
+    const { rerender } = renderChat({ status: "reconnecting" })
+    expect(await screen.findByText("订单创建需要哪些字段？")).toBeTruthy()
+    expect(mocks.listClarificationMessages).toHaveBeenCalledTimes(1)
+
+    rerender(chatElement({ status: "live" }))
+
+    expect(await screen.findByText("请确认是否需要收货地址。")).toBeTruthy()
+    expect(mocks.listClarificationMessages).toHaveBeenCalledTimes(2)
+  })
+
+  it("surfaces a failed run status instead of finishing silently", async () => {
+    renderChat({
+      events: [
+        activity(6, {
+          kind: "run_finished",
+          run_id: "501",
+          status: "failed",
+          terminal_reason: "model_error",
+          error_code: "llm_error",
+        }),
+      ],
+    })
+
+    expect(await screen.findByText(/运行出错/)).toBeTruthy()
+    expect(screen.getByText(/model_error/)).toBeTruthy()
+    expect(screen.getByText(/llm_error/)).toBeTruthy()
+  })
+
+  it("folds usage activity into one expandable summary", async () => {
+    renderChat({
+      events: [
+        activity(5, {
+          kind: "usage",
+          run_id: "501",
+          turn: 1,
+          prompt_tokens: 10,
+          completion_tokens: 4,
+          reasoning_tokens: 0,
+          total_tokens: 14,
+        }),
+        activity(6, {
+          kind: "usage",
+          run_id: "501",
+          turn: 2,
+          prompt_tokens: 20,
+          completion_tokens: 8,
+          reasoning_tokens: 2,
+          total_tokens: 30,
+        }),
+      ],
+    })
+
+    const toggle = await screen.findByRole("button", { name: "用量" })
+    expect(screen.queryByText("共 44 tokens")).toBeNull()
+
+    fireEvent.click(toggle)
+
+    expect(screen.getByText("共 44 tokens")).toBeTruthy()
+    expect(screen.getByText("输入 30 · 输出 12 · 推理 2")).toBeTruthy()
+  })
+
+  it("keys live tool activity per run so equal call ids do not collide", async () => {
+    renderChat({
+      events: [
+        activity(20, {
+          kind: "tool_use",
+          run_id: "501",
+          call_id: "call_1",
+          tool: "version.context_get",
+          args: '{"run":1}',
+        }),
+        activity(21, {
+          kind: "tool_result",
+          run_id: "501",
+          call_id: "call_1",
+          tool: "version.context_get",
+          result: "结果一",
+          status: "ok",
+        }),
+        activity(30, {
+          kind: "tool_use",
+          run_id: "502",
+          call_id: "call_1",
+          tool: "version.context_get",
+          args: '{"run":2}',
+        }),
+        activity(31, {
+          kind: "tool_result",
+          run_id: "502",
+          call_id: "call_1",
+          tool: "version.context_get",
+          result: "结果二",
+          status: "ok",
+        }),
+      ],
+    })
+
+    const buttons = await screen.findAllByRole("button", { name: "工具 version.context_get" })
+    expect(buttons.length).toBe(2)
+
+    fireEvent.click(buttons[0])
+    expect(screen.getByText("结果一")).toBeTruthy()
+    expect(screen.queryByText("结果二")).toBeNull()
+
+    fireEvent.click(buttons[1])
+    expect(screen.getByText("结果二")).toBeTruthy()
+  })
+
+  it("maps an active-session conflict to a friendly message", async () => {
+    mocks.listClarificationMessages.mockResolvedValue(messagesPage([]))
+    mocks.startClarificationSession.mockRejectedValueOnce(
+      new ApiError({
+        status: 409,
+        code: "conflict",
+        message: "version already has an active session",
+        details: { reason: "clarification_session_active" },
+      }),
+    )
+
+    renderChat({ session: null })
+    fireEvent.click(await screen.findByRole("button", { name: "开始澄清会话" }))
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toContain("已有进行中的澄清会话")
+  })
+
+  it("maps requirements_required to a friendly message", async () => {
+    mocks.listClarificationMessages.mockResolvedValue(messagesPage([]))
+    mocks.startClarificationSession.mockRejectedValueOnce(
+      new ApiError({
+        status: 422,
+        code: "invalid_argument",
+        message: "at least one requirement is required",
+        details: { reason: "requirements_required" },
+      }),
+    )
+
+    renderChat({ session: null })
+    fireEvent.click(await screen.findByRole("button", { name: "开始澄清会话" }))
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toContain("开始澄清前请至少录入一条需求")
   })
 })

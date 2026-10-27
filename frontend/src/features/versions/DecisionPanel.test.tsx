@@ -16,7 +16,12 @@ vi.mock("./api", () => ({
 }))
 
 import { DecisionPanel } from "./DecisionPanel"
-import type { ClarificationDecision, ClarificationDecisionsPage, Requirement } from "./types"
+import type {
+  ClarificationDecision,
+  ClarificationDecisionCounts,
+  ClarificationDecisionsPage,
+  Requirement,
+} from "./types"
 
 const VERSION_ID = "1844674407370955161"
 const REQ_A = "1844674407370956001"
@@ -112,12 +117,17 @@ function decisionsPage(items: ClarificationDecision[]): ClarificationDecisionsPa
   return { items, nextCursor: "", hasMore: false }
 }
 
-function renderPanel(onChanged: () => void = vi.fn(), refreshToken = 0) {
+function renderPanel(
+  onChanged: () => void = vi.fn(),
+  refreshToken = 0,
+  counts?: ClarificationDecisionCounts,
+) {
   return render(
     <DecisionPanel
       versionId={VERSION_ID}
       requirements={REQUIREMENTS}
       refreshToken={refreshToken}
+      counts={counts}
       onChanged={onChanged}
     />,
   )
@@ -176,6 +186,18 @@ describe("DecisionPanel", () => {
 
     expect(screen.getByText("支持中英双语")).toBeTruthy()
     expect(screen.queryByText("支持 7 天无理由退款")).toBeNull()
+  })
+
+  it("shows the clarification overview counters when they are provided", async () => {
+    renderPanel(vi.fn(), 0, { proposed: 4, accepted: 2, rejected: 1 })
+
+    expect(await screen.findByText("支持 7 天无理由退款")).toBeTruthy()
+
+    const filters = screen.getByRole("group", { name: "决策状态筛选" })
+    expect(within(filters).getByRole("button", { name: "全部 7" })).toBeTruthy()
+    expect(within(filters).getByRole("button", { name: "待确认 4" })).toBeTruthy()
+    expect(within(filters).getByRole("button", { name: "已接受 2" })).toBeTruthy()
+    expect(within(filters).getByRole("button", { name: "已驳回 1" })).toBeTruthy()
   })
 
   it("accepts one proposed decision and rejects another", async () => {
