@@ -136,3 +136,120 @@ export type VersionEventPage = {
   cursor: number
   hasMore: boolean
 }
+
+/**
+ * Requirement lifecycle status (spec §6.2). P3 only reaches draft → clarified;
+ * later-phase values are declared so badges can render whatever the backend
+ * may return.
+ */
+export type RequirementStatus = "draft" | "clarified" | "designed" | "verified" | "obsolete"
+
+/** Requirement priority (spec §6.2). */
+export type RequirementPriority = "must" | "should" | "could"
+
+/** Whether a requirement or relation was authored by a user or the agent. */
+export type RequirementSource = "user" | "ai"
+
+/**
+ * `RequirementDTO` (spec §7.3). Every P3-owned ID is a decimal string and must
+ * never be converted with `Number()`; user IDs stay numbers.
+ */
+export type Requirement = {
+  id: string
+  versionId: string
+  title: string
+  description: string
+  acceptanceCriteria: string
+  priority: RequirementPriority
+  status: RequirementStatus
+  source: RequirementSource
+  lastUpdateSource: RequirementSource
+  revision: number
+  confirmedAt: string | null
+  confirmedBy: number | null
+  openQuestionCount: number
+  relationCount: number
+  attachmentCount: number
+  createdBy: number
+  updatedBy: number
+  createdAt: string
+  updatedAt: string
+}
+
+/** Filters accepted by `GET /api/versions/{id}/requirements` (spec §7.3). */
+export type RequirementQuery = {
+  status?: RequirementStatus
+  limit?: number
+  cursor?: string
+}
+
+/** `POST /api/versions/{id}/requirements` body (spec §7.3). */
+export type CreateRequirementBody = {
+  title: string
+  description?: string
+  acceptanceCriteria?: string
+  priority?: RequirementPriority
+}
+
+/**
+ * `PATCH /api/versions/{id}/requirements/{rid}` body. `revision` is the
+ * optimistic-lock token and is required on every edit (spec §6.10).
+ */
+export type UpdateRequirementBody = {
+  revision: number
+  title?: string
+  description?: string
+  acceptanceCriteria?: string
+  priority?: RequirementPriority
+}
+
+/**
+ * The four relation kinds (spec §6.4). Only `depends_on` is directed; the
+ * other three are undirected even though storage keeps a from/to pair.
+ */
+export type RelationType = "depends_on" | "conflicts_with" | "overlaps" | "shares_scope"
+
+/** `RelationDTO` (spec §7.4); both endpoint IDs are decimal strings. */
+export type RequirementRelation = {
+  id: string
+  versionId: string
+  fromRequirementId: string
+  toRequirementId: string
+  relationType: RelationType
+  description: string
+  source: RequirementSource
+  createdBy: number
+  createdAt: string
+  updatedAt: string
+}
+
+/** `POST /api/versions/{id}/relations` body (spec §7.4). */
+export type CreateRelationBody = {
+  fromRequirementId: string
+  toRequirementId: string
+  relationType: RelationType
+  description?: string
+}
+
+/** `PATCH /api/versions/{id}/relations/{relId}` body; relations have no revision. */
+export type UpdateRelationBody = {
+  relationType?: RelationType
+  description?: string
+}
+
+/** Attachment kind derived from the MIME whitelist (spec §6.7). */
+export type AttachmentKind = "text" | "image"
+
+/**
+ * Attachment metadata returned by the requirement attachment endpoints
+ * (spec §7.3). `storagePath` is deliberately never exposed to the client.
+ */
+export type RequirementAttachment = {
+  id: string
+  kind: AttachmentKind
+  filename: string
+  mimeType: string
+  sizeBytes: number
+  sha256: string
+  createdAt: string
+}
