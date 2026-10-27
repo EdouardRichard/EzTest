@@ -147,6 +147,7 @@
 | D24 | 代码全文检索为后续增强；实施 P4 只做路径/符号/路由/接口查询 + 按需读片段 |
 | D25 | **阶段编号唯一化与前端交付归属**：`implementation-phases.md` 独占 P0–P8；其他详细设计的局部里程碑改用 `CI-Mx`（代码智能）、`AS-Mx`（账号会话）等独立前缀，不得复用 P0–P8。D18 的 8 个版本详情 Tab 是前端首版目标形态，按实施阶段 P3（容器/总览/需求与澄清）、P4（代码与变更）、P6（执行类 Tab）、P7（问题/报告）交付；实施 P0 只做平台地基与最小设置页（用户/LLM），不含版本/需求/用例等领域实体。 |
 | D26 | **仓库结构与 DDD 边界**：采用 ARTEX 式按能力分包 + 每个限界上下文 DDD 四层（domain/application/infrastructure/interfaces/httpapi）；`cmd/eztest` 为唯一组装根；导入方向、迁移命名、前端目录与 ARTEX 合规边界见 `Agent.md` §6。 |
+| D27 | P1 内置的「诊断 Agent」= **运行时验证夹具**（key=`runtime-diagnostic`），不进入 §6.1 十三角色；提示词/模型/思考强度/预算/工具白名单管理员可配；工具仅只读白名单（文件只读、HTTP 只读、测试工具）；活动事件统一为 `agent.activity`（`detail.kind` 区分 run_started/user_message/thinking/text/tool_use/tool_result/usage/decision/run_finished）；`agent_messages` 为 LLM 上下文权威来源，`events` 为其 UI 投影；P2 起由业务 Agent 替换，不改变运行时契约。 |
 
 ---
 
@@ -332,6 +333,8 @@ stateDiagram-v2
 - 活动流与回放（每步 thinking/tool/result/evidence）。
 - Agent 配置（提示词/工具/模型/技能，管理员可配）。
 - Agent 质量评测（实施 P8）。
+
+P1 提供一个**不进入 §6.1 十三角色**的运行时验证 Agent（key=`runtime-diagnostic`），仅用于验收运行时（会话/工具/活动流/预算/中止），P2 起由业务 Agent 替换（D27）。
 
 ### 6.4 共享黑板
 
@@ -581,7 +584,7 @@ SSE + 快照游标 + seq 去重 + Last-Event-ID；图结构签名防抖；历史
 | Phase | 主题 | 产出摘要 |
 |---|---|---|
 | P0 | 工程与运行基础 | 脚手架/迁移/存储/认证/API 骨架/SSE/极简 LLM/前端壳+最小设置页 |
-| P1 | Agent 运行时地基 | 会话/工具/活动流/上下文/预算；诊断 Agent 实时跑通 |
+| P1 | Agent 运行时地基 | 会话/工具/活动流/上下文/预算；诊断 Agent 实时跑通（诊断 Agent = 运行时验证夹具，见 D27） |
 | P2 | 公共资源与身份 | 系统/环境/应用模型/账号/Session/本地 Git 仓库 + 管理 UI |
 | P3 | 版本 / 多需求 / 澄清 | 版本、多需求、关系、澄清对话、决策、确认 |
 | P4 | 代码理解与影响分析 v1 | 本地 Git T0 + AI 代码理解 + 证据校验 + 影响候选 |
