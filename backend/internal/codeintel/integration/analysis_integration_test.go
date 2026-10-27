@@ -1044,3 +1044,91 @@ func TestAnalysisIntegrationForceAndReuseOnSameInput(t *testing.T) {
 		t.Fatalf("analyses = %d, want the reused one only", analysisCount)
 	}
 }
+
+// TestAnalysisIntegrationPlannerFactsIncludeContractCompanions proves R38
+// end to end: the unchanged contract counterpart and the page/component facts
+// declared at its path are part of the planner's FactsAtHead, deduplicated by
+// entity id, so T13 can propagate a changed api to the page rendering the
+// counterpart client call.
+func TestAnalysisIntegrationPlannerFactsIncludeContractCompanions(t *testing.T) {
+	pool := testutil.OpenTestDB(t)
+	ctx := context.Background()
+	dir, base, head := newAnalysisGitRepo(t)
+	repoID, versionID, requirementID := seedAnalysisRepoVersion(t, pool, dir, base)
+
+	const counterpartPath = "web/src/pages/Refund.tsx"
+	generator, err := id.NewSnowflake(13)
+	if err != nil {
+		t.Fatalf("new companion snowflake generator: %v", err)
+	}
+	entities := codeintelpg.NewEntityRepository(pool)
+	clientKey := "client:POST /api/refund"
+	clientVersion := 1
+	clientID := generator.Next()
+	if err := entities.Upsert(ctx, domain.CodeEntity{
+		ID: clientID, RepoID: repoID, Commit: head, Kind: domain.KindClientCall,
+		Path: counterpartPath, Name: "POST /api/refund", Source: domain.SourceAI,
+		Confidence: domain.ConfidenceHigh, FactKey: &clientKey, FactVersion: &clientVersion,
+	}); err != nil {
+		t.Fatalf("seed counterpart client fact: %v", err)
+	}
+	companions := make(map[string]int64, 2)
+	for _, seed := range []struct {
+		kind    string
+		name    string
+		factKey string
+	}{
+		{domain.KindComponent, "RefundPage", "component:web/src/pages/Refund.tsx#RefundPage"},
+		{domain.KindPage, "RefundPage", "page:RefundPage"},
+	} {
+		factVersion := 1
+		companionID := generator.Next()
+		if err := entities.Upsert(ctx, domain.CodeEntity{
+			ID: companionID, RepoID: repoID, Commit: head, Kind: seed.kind,
+			Path: counterpartPath, Name: seed.name, Source: domain.SourceAI,
+			Confidence: domain.ConfidenceHigh, FactKey: &seed.factKey, FactVersion: &factVersion,
+		}); err != nil {
+			t.Fatalf("seed %s companion: %v", seed.kind, err)
+		}
+		companions[seed.factKey] = companionID
+	}
+
+	fixture := newAnalysisServiceForIntegration(t, pool, newAnalysisFakeLLM(), "p4.1")
+	// The changed client file contributes no client_call fact in this fixture:
+	// the changed side is the api fact, and the client fact at the counterpart
+	// path is the pre-existing entity seeded above (same normalized contract
+	// key, so a second materialised client fact would collide).
+	fixture.llm.setResponse(analysisClientPath, `{"changeSummary": "client stays the same", "facts": [], "edges": []}`)
+	fixture.planner.requirementID = requirementID
+	analyses := codeintelpg.NewAnalysisRepository(pool)
+	runAnalysisJob(t, fixture, analyses, versionID, head, false)
+
+	input, ok := fixture.planner.lastInput()
+	if !ok {
+		t.Fatal("planner was not called")
+	}
+	byKey := make(map[string]domain.CodeEntity, len(input.FactsAtHead))
+	byID := make(map[int64]string, len(input.FactsAtHead))
+	for _, fact := range input.FactsAtHead {
+		if fact.FactKey == nil {
+			continue
+		}
+		if previous, ok := byID[fact.ID]; ok {
+			t.Fatalf("planner fact ids = %d repeated by %q and %q, want entity-id dedupe",
+				fact.ID, previous, *fact.FactKey)
+		}
+		byID[fact.ID] = *fact.FactKey
+		byKey[*fact.FactKey] = fact
+	}
+	if got := byKey[clientKey]; got.ID != clientID || got.Path != counterpartPath {
+		t.Fatalf("planner counterpart = %+v, want the seeded client call %d at %s",
+			got, clientID, counterpartPath)
+	}
+	for factKey, wantID := range companions {
+		got, ok := byKey[factKey]
+		if !ok || got.ID != wantID || got.Path != counterpartPath {
+			t.Fatalf("planner facts = %+v, want the companion %s (%d) at %s",
+				byKey, factKey, wantID, counterpartPath)
+		}
+	}
+}

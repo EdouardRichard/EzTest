@@ -3045,6 +3045,73 @@ func TestRunPlannerInputIncludesContractCounterparts(t *testing.T) {
 	}
 }
 
+// TestRunPlannerFactsIncludeContractCounterpartCompanions pins R38: when a
+// changed fact matches an unchanged contract counterpart, the companion facts
+// declared at the counterpart's path (a component and a page here) are part of
+// FactsAtHead so T13 can propagate a changed api through the counterpart
+// client_call to the page/component at the same path.
+func TestRunPlannerFactsIncludeContractCounterpartCompanions(t *testing.T) {
+	f := newAnalysisFixture(t)
+	f.changeSet(analysisChangedFile(1, "server/refund.go", "M"))
+	f.llm.responses["server/refund.go"] = apiFactResponse()
+
+	const counterpartPath = "web/src/pages/Refund.tsx"
+	clientKey := "client:POST /api/refund"
+	clientVersion := 1
+	f.entities.facts[analysisEntityKey(3, testCommitB, clientKey)] = domain.CodeEntity{
+		ID: 9100, RepoID: 3, Commit: testCommitB, Kind: domain.KindClientCall,
+		Name: "POST /api/refund", Path: counterpartPath, Source: domain.SourceAI,
+		Confidence: domain.ConfidenceHigh, FactKey: &clientKey, FactVersion: &clientVersion,
+	}
+	componentKey := "component:web/src/pages/Refund.tsx#RefundPage"
+	componentVersion := 1
+	f.entities.facts[analysisEntityKey(3, testCommitB, componentKey)] = domain.CodeEntity{
+		ID: 9200, RepoID: 3, Commit: testCommitB, Kind: domain.KindComponent,
+		Name: "RefundPage", Path: counterpartPath, Source: domain.SourceAI,
+		Confidence: domain.ConfidenceHigh, FactKey: &componentKey, FactVersion: &componentVersion,
+	}
+	pageKey := "page:RefundPage"
+	pageVersion := 1
+	f.entities.facts[analysisEntityKey(3, testCommitB, pageKey)] = domain.CodeEntity{
+		ID: 9201, RepoID: 3, Commit: testCommitB, Kind: domain.KindPage,
+		Name: "RefundPage", Path: counterpartPath, Source: domain.SourceAI,
+		Confidence: domain.ConfidenceHigh, FactKey: &pageKey, FactVersion: &pageVersion,
+	}
+
+	analysis := f.runNewAnalysis(t)
+	stats := analysisStatsJSON(t, analysis)
+	if got := analysisStatInt(t, stats, "contracts"); got != 1 {
+		t.Fatalf("stats.contracts = %d, want the unchanged counterpart to match the changed api fact", got)
+	}
+	if len(f.planner.calls) != 1 {
+		t.Fatalf("Planner calls = %d, want 1", len(f.planner.calls))
+	}
+	byKey := make(map[string]domain.CodeEntity)
+	byID := make(map[int64]string)
+	for _, fact := range f.planner.calls[0].FactsAtHead {
+		if fact.FactKey == nil {
+			continue
+		}
+		if previous, ok := byID[fact.ID]; ok {
+			t.Fatalf("planner fact ids = %d repeated by %q and %q, want entity-id dedupe", fact.ID, previous, *fact.FactKey)
+		}
+		byID[fact.ID] = *fact.FactKey
+		byKey[*fact.FactKey] = fact
+	}
+	if got := byKey[clientKey]; got.ID != 9100 || got.Path != counterpartPath {
+		t.Fatalf("planner counterpart = %+v, want the seeded client call %d at %s", got, 9100, counterpartPath)
+	}
+	for key, id := range map[string]int64{componentKey: 9200, pageKey: 9201} {
+		got, ok := byKey[key]
+		if !ok || got.ID != id {
+			t.Fatalf("planner facts = %+v, want companion fact %s (%d) at the counterpart path", byKey, key, id)
+		}
+		if got.Path != counterpartPath {
+			t.Fatalf("planner fact %s path = %q, want the counterpart path %q", key, got.Path, counterpartPath)
+		}
+	}
+}
+
 // TestRunMixedEvidenceForcesLowClue pins §6.2/§6.3: any evidence-validation
 // failure (not only a fully invalid set) forces the fact to a low clue and the
 // edge to low confidence.
