@@ -103,17 +103,21 @@ func (b *segmentBuffer) Flush(now time.Time, final bool) (text string, part int,
 }
 
 // activityEmitter publishes one session's activity events with the frozen
-// envelope: channel agent:{session_id}, agent_role = profile key, summary
-// bounded to 500 runes and every detail string bounded as a safety net.
+// envelope: channel agent:{session_id} unless the session carries an explicit
+// channel, agent_role = profile key, summary bounded to 500 runes and every
+// detail string bounded as a safety net.
 type activityEmitter struct {
 	sink      EventSink
 	sessionID int64
 	role      string
+	channel   string
+	versionID *string
 }
 
-// newActivityEmitter binds an emitter to one session and agent role.
-func newActivityEmitter(sink EventSink, sessionID int64, role string) *activityEmitter {
-	return &activityEmitter{sink: sink, sessionID: sessionID, role: role}
+// newActivityEmitter binds an emitter to one session and agent role. An empty
+// channel falls back to the P1 agent:<session_id> channel when emitting.
+func newActivityEmitter(sink EventSink, sessionID int64, role, channel string, versionID *string) *activityEmitter {
+	return &activityEmitter{sink: sink, sessionID: sessionID, role: role, channel: channel, versionID: versionID}
 }
 
 // emit publishes one activity. run_id and kind are part of every detail object
@@ -127,11 +131,16 @@ func (e *activityEmitter) emit(ctx context.Context, runID int64, kind, summary s
 	envelope["kind"] = kind
 	envelope["run_id"] = runID
 
+	channel := e.channel
+	if channel == "" {
+		channel = domain.ChannelForSession(e.sessionID)
+	}
 	event := ActivityEvent{
-		Channel:   domain.ChannelForSession(e.sessionID),
+		Channel:   channel,
 		AgentRole: e.role,
 		Summary:   activityTruncateString(summary, activitySummaryLimit),
 		SessionID: e.sessionID,
+		VersionID: e.versionID,
 		Detail:    envelope,
 	}
 	if err := e.sink.PublishActivity(ctx, event); err != nil {

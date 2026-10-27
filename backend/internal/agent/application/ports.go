@@ -74,6 +74,9 @@ type ActivityEvent struct {
 	AgentRole string
 	Summary   string
 	SessionID int64
+	// VersionID is the P3 version the session is scoped to; nil keeps the P1
+	// envelope (no version reference).
+	VersionID *string
 	Detail    map[string]any
 }
 

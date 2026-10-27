@@ -98,6 +98,49 @@ func TestPublishActivityDerivesChannelAndEmptyDetail(t *testing.T) {
 	}
 }
 
+// TestPublishActivityCarriesVersionID pins the P3 envelope mapping: a non-empty
+// version id is forwarded to the event, while an absent or empty one stays nil.
+func TestPublishActivityCarriesVersionID(t *testing.T) {
+	versionID := "42"
+	emptyVersionID := ""
+	cases := []struct {
+		name      string
+		versionID *string
+		want      *string
+	}{
+		{name: "non-empty version id is forwarded", versionID: &versionID, want: &versionID},
+		{name: "nil version id stays nil", versionID: nil, want: nil},
+		{name: "empty version id stays nil", versionID: &emptyVersionID, want: nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			publisher := &capturingPublisher{}
+			sink := NewSink(publisher)
+			err := sink.PublishActivity(context.Background(), agentapp.ActivityEvent{
+				Channel:   "version:42",
+				SessionID: 7,
+				VersionID: tc.versionID,
+			})
+			if err != nil {
+				t.Fatalf("PublishActivity: %v", err)
+			}
+			if len(publisher.events) != 1 {
+				t.Fatalf("published events=%d want 1", len(publisher.events))
+			}
+			got := publisher.events[0].VersionID
+			if tc.want == nil {
+				if got != nil {
+					t.Fatalf("VersionID=%v want nil", got)
+				}
+				return
+			}
+			if got == nil || *got != *tc.want {
+				t.Fatalf("VersionID=%v want %q", got, *tc.want)
+			}
+		})
+	}
+}
+
 func TestPublishActivityReturnsPublisherError(t *testing.T) {
 	publishErr := errors.New("event store is down")
 	publisher := &capturingPublisher{err: publishErr}

@@ -197,7 +197,7 @@ func (s *RunService) Start(ctx context.Context, sessionID int64, message string,
 
 	// The user_message activity is published before the runner starts so it
 	// always precedes run_started (spec §9.1).
-	emitter := newActivityEmitter(s.deps.Events, sessionID, profile.Key)
+	emitter := newActivityEmitter(s.deps.Events, sessionID, profile.Key, session.ActivityChannel, session.ActivityVersionID)
 	text, truncated := activityTruncateRunes(message, maxUserMessageActivityRunes)
 	_ = emitter.emit(ctx, ids.RunID, domain.KindUserMessage, activitySummarize(message, userMessageSummaryRunes), map[string]any{
 		"message_id": ids.UserMessageID,
@@ -369,9 +369,31 @@ func (s *RunService) emitRecoveredRunFinished(ctx context.Context, run domain.Ru
 			"total":      run.InputTokens + run.OutputTokens,
 		},
 	}
-	emitter := newActivityEmitter(s.deps.Events, run.SessionID, profile.Key)
+	emitter := newActivityEmitter(s.deps.Events, run.SessionID, profile.Key, session.ActivityChannel, session.ActivityVersionID)
 	_ = emitter.emit(ctx, run.ID, domain.KindRunFinished,
 		"运行结束："+string(domain.ReasonInterrupted), detail)
+}
+
+// channelRunningChecker is the optional running-by-channel query implemented by
+// the postgres session repository. It stays a local interface so the domain
+// SessionRepository port (and every other fake of it) does not have to change.
+type channelRunningChecker interface {
+	HasRunningByChannel(ctx context.Context, channel string) (bool, error)
+}
+
+// HasRunningByChannel reports whether any session stamped with channel still
+// has a run in status running. P3 deletion uses it to refuse deleting a version
+// whose sessions are executing. An empty channel is never a routing target (P1
+// sessions publish on agent:<id>), so it reports false without a query.
+func (s *RunService) HasRunningByChannel(ctx context.Context, channel string) (bool, error) {
+	if channel == "" {
+		return false, nil
+	}
+	checker, ok := s.deps.Sessions.(channelRunningChecker)
+	if !ok {
+		return false, nil
+	}
+	return checker.HasRunningByChannel(ctx, channel)
 }
 
 // isActive reports whether the session currently has a registered run.

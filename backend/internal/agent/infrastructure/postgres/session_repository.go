@@ -14,7 +14,7 @@ import (
 
 // sessionListColumns is the session projection of the list query. It is
 // scanned before the two joined run projections.
-const sessionListColumns = `s.id, s.profile_id, p.key, s.title, s.created_by, s.created_at, s.updated_at, s.last_activity_at`
+const sessionListColumns = `s.id, s.profile_id, p.key, s.title, s.created_by, s.created_at, s.updated_at, s.last_activity_at, s.activity_channel, s.activity_version_id`
 
 // SessionRepository implements domain.SessionRepository on a pgx pool.
 type SessionRepository struct {
@@ -27,7 +27,7 @@ func NewSessionRepository(pool *pgxpool.Pool) *SessionRepository {
 }
 
 // sessionSelect joins the profile so every returned session carries ProfileKey.
-const sessionSelect = `SELECT s.id, s.profile_id, p.key, s.title, s.created_by, s.created_at, s.updated_at, s.last_activity_at
+const sessionSelect = `SELECT s.id, s.profile_id, p.key, s.title, s.created_by, s.created_at, s.updated_at, s.last_activity_at, s.activity_channel, s.activity_version_id
 	FROM agent_sessions s
 	JOIN agent_profiles p ON p.id = s.profile_id`
 
@@ -43,6 +43,8 @@ func scanSession(row rowScanner) (agent.Session, error) {
 		&session.CreatedAt,
 		&session.UpdatedAt,
 		&session.LastActivityAt,
+		&session.ActivityChannel,
+		&session.ActivityVersionID,
 	); err != nil {
 		return agent.Session{}, err
 	}
@@ -194,6 +196,8 @@ func (r *SessionRepository) List(ctx context.Context, cursor int64, limit int, p
 			&summary.Session.CreatedAt,
 			&summary.Session.UpdatedAt,
 			&summary.Session.LastActivityAt,
+			&summary.Session.ActivityChannel,
+			&summary.Session.ActivityVersionID,
 		}
 		destinations = append(destinations, active.destinations()...)
 		destinations = append(destinations, last.destinations()...)
@@ -214,18 +218,25 @@ func (r *SessionRepository) List(ctx context.Context, cursor int64, limit int, p
 	return summaries, hasMore, nil
 }
 
-// Create inserts a session and returns it with ProfileKey. An unknown profile
-// is reported as ErrNotFound (the profile_id foreign key rejects it).
+// Create inserts a session with the P1 defaults (no activity channel). It
+// delegates to CreateWithOptions.
 func (r *SessionRepository) Create(ctx context.Context, profileID int64, title string, createdBy *int64) (agent.Session, error) {
+	return r.CreateWithOptions(ctx, profileID, title, createdBy, "", nil)
+}
+
+// CreateWithOptions inserts a session and returns it with ProfileKey, stamping
+// the optional P3 activity channel and version id. An unknown profile is
+// reported as ErrNotFound (the profile_id foreign key rejects it).
+func (r *SessionRepository) CreateWithOptions(ctx context.Context, profileID int64, title string, createdBy *int64, channel string, versionID *string) (agent.Session, error) {
 	const query = `WITH ins AS (
-		INSERT INTO agent_sessions (profile_id, title, created_by)
-		VALUES ($1, $2, $3)
-		RETURNING id, profile_id, title, created_by, created_at, updated_at, last_activity_at
+		INSERT INTO agent_sessions (profile_id, title, created_by, activity_channel, activity_version_id)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING id, profile_id, title, created_by, created_at, updated_at, last_activity_at, activity_channel, activity_version_id
 	)
-	SELECT ins.id, ins.profile_id, p.key, ins.title, ins.created_by, ins.created_at, ins.updated_at, ins.last_activity_at
+	SELECT ins.id, ins.profile_id, p.key, ins.title, ins.created_by, ins.created_at, ins.updated_at, ins.last_activity_at, ins.activity_channel, ins.activity_version_id
 	FROM ins
 	JOIN agent_profiles p ON p.id = ins.profile_id`
-	session, err := scanSession(r.pool.QueryRow(ctx, query, profileID, title, createdBy))
+	session, err := scanSession(r.pool.QueryRow(ctx, query, profileID, title, createdBy, channel, versionID))
 	if err != nil {
 		if mapped := mapForeignKeyViolation(err); mapped != nil {
 			return agent.Session{}, mapped
@@ -253,9 +264,9 @@ func (r *SessionRepository) UpdateTitle(ctx context.Context, id int64, title str
 		UPDATE agent_sessions
 		   SET title = $2, updated_at = now()
 		 WHERE id = $1
-		RETURNING id, profile_id, title, created_by, created_at, updated_at, last_activity_at
+		RETURNING id, profile_id, title, created_by, created_at, updated_at, last_activity_at, activity_channel, activity_version_id
 	)
-	SELECT upd.id, upd.profile_id, p.key, upd.title, upd.created_by, upd.created_at, upd.updated_at, upd.last_activity_at
+	SELECT upd.id, upd.profile_id, p.key, upd.title, upd.created_by, upd.created_at, upd.updated_at, upd.last_activity_at, upd.activity_channel, upd.activity_version_id
 	FROM upd
 	JOIN agent_profiles p ON p.id = upd.profile_id`
 	session, err := scanSession(r.pool.QueryRow(ctx, query, id, title))
@@ -266,6 +277,23 @@ func (r *SessionRepository) UpdateTitle(ctx context.Context, id int64, title str
 		return agent.Session{}, fmt.Errorf("postgres: update agent session title: %w", err)
 	}
 	return session, nil
+}
+
+// HasRunningByChannel reports whether any session stamped with channel still
+// has a run in status running. It is intentionally not part of the domain
+// SessionRepository port: only the P3 deletion path needs it.
+func (r *SessionRepository) HasRunningByChannel(ctx context.Context, channel string) (bool, error) {
+	const query = `SELECT EXISTS (
+		SELECT 1
+		FROM agent_runs r
+		JOIN agent_sessions s ON s.id = r.session_id
+		WHERE s.activity_channel = $1 AND r.status = 'running'
+	)`
+	var exists bool
+	if err := r.pool.QueryRow(ctx, query, channel).Scan(&exists); err != nil {
+		return false, fmt.Errorf("postgres: check running agent runs by channel: %w", err)
+	}
+	return exists, nil
 }
 
 // Delete removes a session. Messages and runs cascade in the schema.

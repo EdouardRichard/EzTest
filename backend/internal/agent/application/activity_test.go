@@ -120,9 +120,53 @@ func TestSegmentBufferFinalFlushAfterIncrementalFlush(t *testing.T) {
 	}
 }
 
+// TestActivityEmitterFallsBackToAgentChannel pins the P1 default: a session
+// without a stored channel publishes on agent:<session_id> and carries no
+// version id.
+func TestActivityEmitterFallsBackToAgentChannel(t *testing.T) {
+	sink := &runFakeActivitySink{}
+	emitter := newActivityEmitter(sink, 5, "runtime-diagnostic", "", nil)
+
+	if err := emitter.emit(context.Background(), 9, domain.KindRunStarted, "开始运行", nil); err != nil {
+		t.Fatalf("emit returned error: %v", err)
+	}
+	events := sink.published()
+	if len(events) != 1 {
+		t.Fatalf("published events=%d want 1", len(events))
+	}
+	if want := domain.ChannelForSession(5); events[0].Channel != want {
+		t.Fatalf("Channel=%q want the derived %q", events[0].Channel, want)
+	}
+	if events[0].VersionID != nil {
+		t.Fatalf("VersionID=%v want nil for a session without a version stamp", events[0].VersionID)
+	}
+}
+
+// TestActivityEmitterUsesVersionChannel pins the P3 routing: a session stamped
+// with a version channel publishes on it and forwards the version id.
+func TestActivityEmitterUsesVersionChannel(t *testing.T) {
+	versionID := "42"
+	sink := &runFakeActivitySink{}
+	emitter := newActivityEmitter(sink, 5, "runtime-diagnostic", "version:42", &versionID)
+
+	if err := emitter.emit(context.Background(), 9, domain.KindRunStarted, "开始运行", nil); err != nil {
+		t.Fatalf("emit returned error: %v", err)
+	}
+	events := sink.published()
+	if len(events) != 1 {
+		t.Fatalf("published events=%d want 1", len(events))
+	}
+	if events[0].Channel != "version:42" {
+		t.Fatalf("Channel=%q want the persisted version:42", events[0].Channel)
+	}
+	if events[0].VersionID == nil || *events[0].VersionID != versionID {
+		t.Fatalf("VersionID=%v want %q", events[0].VersionID, versionID)
+	}
+}
+
 func TestActivityEmitterSetsSegmentDetailAndTruncates(t *testing.T) {
 	sink := &runFakeActivitySink{}
-	emitter := newActivityEmitter(sink, 5, "runtime-diagnostic")
+	emitter := newActivityEmitter(sink, 5, "runtime-diagnostic", "", nil)
 	base := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
 
 	buf := newSegmentBuffer(domain.KindText, 9, 42, base)

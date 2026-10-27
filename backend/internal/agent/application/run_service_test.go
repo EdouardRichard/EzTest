@@ -200,6 +200,23 @@ func (f *runFakeSessions) Get(_ context.Context, id int64) (domain.Session, erro
 	return session, nil
 }
 
+// HasRunningByChannel is the optional P3 routing guard. It mirrors the real
+// JOIN: a channel has a running run while one of its sessions is active.
+func (f *runFakeSessions) HasRunningByChannel(_ context.Context, channel string) (bool, error) {
+	state := f.state
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	for sessionID, running := range state.active {
+		if !running {
+			continue
+		}
+		if state.sessions[sessionID].ActivityChannel == channel {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (f *runFakeSessions) UpdateTitle(_ context.Context, _ int64, _ string) (domain.Session, error) {
 	return domain.Session{}, errors.New("run service test: UpdateTitle is not used")
 }
@@ -1945,6 +1962,95 @@ func TestRecoverInterruptedPublishesTerminalActivity(t *testing.T) {
 	}
 	if got := runTestDetailInt64(t, second.Detail, "duration_ms"); got != 2500 {
 		t.Fatalf("second recovery duration_ms=%d want 2500 (clock - started_at)", got)
+	}
+}
+
+// TestRecoverInterruptedUsesSessionChannel pins that recovery publishes the
+// synthetic terminal activity on the session's persisted P3 channel and carries
+// its version id, instead of falling back to agent:<session_id>.
+func TestRecoverInterruptedUsesSessionChannel(t *testing.T) {
+	profile := runTestProfile(t)
+	state := runTestNewState(t, profile, 7)
+	versionID := "42"
+	session := state.sessions[7]
+	session.ActivityChannel = "version:42"
+	session.ActivityVersionID = &versionID
+	state.sessions[7] = session
+	base := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
+	state.runningInterrupted = []domain.Run{{
+		ID: 11, SessionID: 7, Status: domain.RunRunning, StartedAt: base,
+	}}
+	state.interrupted = 1
+
+	sink := &runFakeEvents{}
+	service, _, _ := runTestNewService(t, state, &runFakeCaller{}, runTestEvents(sink))
+	if count, err := service.RecoverInterrupted(context.Background()); err != nil || count != 1 {
+		t.Fatalf("RecoverInterrupted=(%d,%v) want (1,nil)", count, err)
+	}
+	events := sink.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("recovery events=%d want 1", len(events))
+	}
+	if events[0].Channel != "version:42" {
+		t.Fatalf("recovery channel=%q want the persisted version:42", events[0].Channel)
+	}
+	if events[0].VersionID == nil || *events[0].VersionID != versionID {
+		t.Fatalf("recovery version_id=%v want %q", events[0].VersionID, versionID)
+	}
+}
+
+// TestHasRunningByChannel pins the P3 deletion guard: a channel is busy only
+// while one of its sessions still has a run in status running.
+func TestHasRunningByChannel(t *testing.T) {
+	profile := runTestProfile(t)
+	state := runTestNewState(t, profile, 7)
+	versionID := "42"
+	session := state.sessions[7]
+	session.ActivityChannel = "version:42"
+	session.ActivityVersionID = &versionID
+	state.sessions[7] = session
+	service, _, _ := runTestNewService(t, state, &runFakeCaller{})
+	ctx := context.Background()
+
+	state.mu.Lock()
+	state.active[7] = true
+	state.mu.Unlock()
+
+	running, err := service.HasRunningByChannel(ctx, "version:42")
+	if err != nil {
+		t.Fatalf("HasRunningByChannel returned error: %v", err)
+	}
+	if !running {
+		t.Fatal("HasRunningByChannel(version:42)=false while its session has a running run")
+	}
+
+	running, err = service.HasRunningByChannel(ctx, "version:99")
+	if err != nil {
+		t.Fatalf("HasRunningByChannel(other) returned error: %v", err)
+	}
+	if running {
+		t.Fatal("HasRunningByChannel(version:99)=true, want false for an unrelated channel")
+	}
+
+	// The empty channel is not a routing target: sessions without a channel
+	// publish on agent:<id>, so the guard must not treat them as a match.
+	running, err = service.HasRunningByChannel(ctx, "")
+	if err != nil {
+		t.Fatalf("HasRunningByChannel(empty) returned error: %v", err)
+	}
+	if running {
+		t.Fatal("HasRunningByChannel(empty)=true, want false")
+	}
+
+	state.mu.Lock()
+	state.active[7] = false
+	state.mu.Unlock()
+	running, err = service.HasRunningByChannel(ctx, "version:42")
+	if err != nil {
+		t.Fatalf("HasRunningByChannel after finish returned error: %v", err)
+	}
+	if running {
+		t.Fatal("HasRunningByChannel(version:42)=true after the run finished")
 	}
 }
 

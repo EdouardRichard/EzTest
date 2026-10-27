@@ -50,6 +50,12 @@ func (s *Sink) PublishActivity(ctx context.Context, event agentapp.ActivityEvent
 	}
 	sessionID := strconv.FormatInt(event.SessionID, 10)
 	agentRole := event.AgentRole
+	// The P3 envelope only references a version when one is stamped; a nil or
+	// empty version id keeps the P1 event shape.
+	var versionID *string
+	if event.VersionID != nil && *event.VersionID != "" {
+		versionID = event.VersionID
+	}
 	detail, err := encodeDetail(event.Detail)
 	if err != nil {
 		return err
@@ -57,6 +63,7 @@ func (s *Sink) PublishActivity(ctx context.Context, event agentapp.ActivityEvent
 	_, err = s.publisher.Publish(ctx, eventing.NewEvent{
 		Channel:   channel,
 		Type:      ActivityType,
+		VersionID: versionID,
 		AgentRole: &agentRole,
 		SessionID: &sessionID,
 		Summary:   event.Summary,
