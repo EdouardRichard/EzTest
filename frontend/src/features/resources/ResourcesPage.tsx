@@ -11,6 +11,7 @@ import { useAuth } from "@/features/auth/AuthProvider"
 import { AccountsPanel } from "./AccountsPanel"
 import { AppModelsPanel } from "./AppModelsPanel"
 import { EnvironmentsPanel } from "./EnvironmentsPanel"
+import { SessionsPanel } from "./SessionsPanel"
 import { SystemsPanel } from "./SystemsPanel"
 
 const TABS = [
@@ -56,10 +57,10 @@ const tabTriggerClass =
   "flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring data-[state=active]:bg-card data-[state=active]:text-foreground data-[state=active]:shadow-sm"
 
 /**
- * `/resources` shell: four tabs for the public-resource areas. The tab and the
- * selected system live in the URL (`?tab=`, `?system=`) so later panels
- * (app models, accounts, sessions) can extend the same deep-link scheme.
- * Normal users get a read-only badge and never see write controls.
+ * `/resources` shell: four tabs for the public-resource areas. The active tab,
+ * the selected system and the selected session live in the URL (`?tab=`,
+ * `?system=`, `?session=`) so the panels can be deep-linked. Normal users get a
+ * read-only badge and never see write controls.
  */
 export function ResourcesPage() {
   const { user, loading } = useAuth()
@@ -70,10 +71,12 @@ export function ResourcesPage() {
 
   const [tab, setTab] = useState<ResourceTab>("systems")
   const [selectedSystemId, setSelectedSystemId] = useState<number | null>(null)
+  const [selectedSessionId, setSelectedSessionId] = useState<number | null>(null)
 
   useEffect(() => {
     setTab(readTabParam())
     setSelectedSystemId(readPositiveIntParam("system"))
+    setSelectedSessionId(readPositiveIntParam("session"))
   }, [])
 
   function handleTabChange(value: string) {
@@ -85,6 +88,11 @@ export function ResourcesPage() {
   function handleSelectSystem(id: number) {
     setSelectedSystemId(id)
     writeQueryParam("system", String(id))
+  }
+
+  function handleSelectSession(id: number) {
+    setSelectedSessionId(id)
+    writeQueryParam("session", String(id))
   }
 
   return (
@@ -167,10 +175,10 @@ export function ResourcesPage() {
         </Tabs.Content>
 
         <Tabs.Content value="sessions" className="pt-4">
-          <EmptyState
-            icon={Layers}
-            title="会话面板即将上线"
-            description="Session 状态、快照与人工接管将在后续任务中提供。"
+          <SessionsPanel
+            canWrite={canWrite}
+            initialSessionId={selectedSessionId ?? undefined}
+            onSelectSession={handleSelectSession}
           />
         </Tabs.Content>
       </Tabs.Root>
