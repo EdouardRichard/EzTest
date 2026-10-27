@@ -216,6 +216,10 @@ export function Workbench({ version, onChanged }: WorkbenchProps) {
     setSelectedId((previous) =>
       previous === requirementId ? (remaining[0]?.id ?? null) : previous,
     )
+    // Deleting a requirement cascades its relations and changes the relation
+    // badges of the remaining requirements, so both lists need a fresh read.
+    void loadRequirements()
+    void loadRelations()
     onChanged()
   }
 
@@ -229,7 +233,7 @@ export function Workbench({ version, onChanged }: WorkbenchProps) {
     const from = relationDraft.fromRequirementId
     const to = relationDraft.toRequirementId
     if (from === "" || to === "") {
-      setRelationError("请选择关系两端的需要。")
+      setRelationError("请选择关系两端的需求。")
       return
     }
     if (from === to) {
@@ -374,6 +378,8 @@ export function Workbench({ version, onChanged }: WorkbenchProps) {
         <RelationGraph
           requirements={requirements}
           relations={relations}
+          loading={relationsLoading}
+          error={relationsError}
           onSelect={(requirementId) => {
             setSelectedId(requirementId)
             setCreating(false)

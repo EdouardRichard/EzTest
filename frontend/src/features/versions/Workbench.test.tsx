@@ -355,4 +355,42 @@ describe("Workbench", () => {
     expect(alert.textContent).toContain("加载需求失败")
     expect(screen.getAllByText("订单创建").length).toBeGreaterThan(0)
   })
+
+  it("reloads requirements and relations after deleting a requirement so the graph stays in sync", async () => {
+    mocks.listRequirements
+      .mockResolvedValueOnce(page([DRAFT, CLARIFIED]))
+      .mockResolvedValue(page([CLARIFIED]))
+    mocks.listRelations.mockResolvedValueOnce([RELATION]).mockResolvedValue([])
+    mocks.deleteRequirement.mockResolvedValue(undefined)
+    const onChanged = vi.fn()
+
+    renderWorkbench(onChanged)
+    expect(await screen.findByTestId(`relation-edge-${REL_ID}`)).toBeTruthy()
+    expect(screen.getByText("共 1 条关系")).toBeTruthy()
+
+    fireEvent.click(screen.getByRole("button", { name: "删除需求" }))
+    fireEvent.click(screen.getByRole("button", { name: "确认删除" }))
+
+    await waitFor(() => expect(mocks.deleteRequirement).toHaveBeenCalledWith(VERSION_ID, REQ_A))
+    await waitFor(() => expect(mocks.listRelations).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(mocks.listRequirements).toHaveBeenCalledTimes(2))
+
+    await waitFor(() => {
+      expect(screen.queryByTestId(`relation-item-${REL_ID}`)).toBeNull()
+      expect(screen.queryByTestId(`relation-edge-${REL_ID}`)).toBeNull()
+      expect(screen.getByText("共 0 条关系")).toBeTruthy()
+    })
+    expect(
+      within(screen.getByRole("region", { name: "需求列表" })).queryByText("订单创建"),
+    ).toBeNull()
+    expect(onChanged).toHaveBeenCalledTimes(1)
+  })
+
+  it("asks for both relation endpoints with the requirement wording", async () => {
+    renderWorkbench()
+    fireEvent.click(await screen.findByRole("button", { name: "新增关系" }))
+
+    expect(screen.getByRole("alert").textContent).toContain("请选择关系两端的需求。")
+    expect(mocks.createRelation).not.toHaveBeenCalled()
+  })
 })

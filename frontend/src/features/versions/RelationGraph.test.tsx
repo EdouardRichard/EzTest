@@ -159,4 +159,40 @@ describe("RelationGraph", () => {
     expect(screen.getByText("暂无关系，添加关系后将在此展示关系图。")).toBeTruthy()
     expect(screen.getByTestId(`requirement-node-${REQ_A}`)).toBeTruthy()
   })
+
+  it("shows loading and error states instead of a zero relation count", () => {
+    const { rerender } = render(
+      <RelationGraph requirements={REQUIREMENTS} relations={[]} onSelect={vi.fn()} loading />,
+    )
+
+    expect(screen.getByText("关系加载中…")).toBeTruthy()
+    expect(screen.queryByText("共 0 条关系")).toBeNull()
+    expect(screen.queryByText("暂无关系，添加关系后将在此展示关系图。")).toBeNull()
+
+    rerender(
+      <RelationGraph
+        requirements={REQUIREMENTS}
+        relations={[]}
+        onSelect={vi.fn()}
+        error="offline"
+      />,
+    )
+
+    expect(screen.getByRole("alert").textContent).toContain("加载关系失败：offline")
+    expect(screen.queryByText("共 0 条关系")).toBeNull()
+    expect(screen.queryByText("暂无关系，添加关系后将在此展示关系图。")).toBeNull()
+  })
+
+  it("keeps node role semantics and a visible focus ring for keyboard users", () => {
+    render(<RelationGraph requirements={REQUIREMENTS} relations={RELATIONS} onSelect={vi.fn()} />)
+
+    const node = screen.getByTestId(`requirement-node-${REQ_A}`)
+    expect(node.getAttribute("role")).toBe("button")
+    expect(node.getAttribute("tabindex")).toBe("0")
+    expect(node.getAttribute("class")).toContain("group")
+
+    const circle = node.querySelector("circle")
+    expect(circle?.getAttribute("class")).toContain("group-focus-visible:stroke-ring")
+    expect(circle?.getAttribute("class")).toContain("group-focus-visible:[stroke-width:3px]")
+  })
 })

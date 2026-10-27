@@ -1,7 +1,7 @@
 "use client"
 
 import { Check, ClipboardList, Loader2, RefreshCw, RotateCcw, Save, Trash2, X } from "lucide-react"
-import { type FormEvent, useId, useState } from "react"
+import { type FormEvent, useEffect, useId, useState } from "react"
 
 import { EmptyState } from "@/components/ui/EmptyState"
 import { StatusBadge } from "@/components/ui/StatusBadge"
@@ -50,6 +50,14 @@ function describeRequirementError(error: unknown): string {
 /** A 409 means the client state is stale; offer the reload explicitly. */
 function isStaleConflict(error: unknown): boolean {
   return error instanceof ApiError && error.status === 409
+}
+
+/** `stale` marks a conflict the user can resolve by reloading the requirement. */
+type EditorErrorState = {
+  message: string
+  stale: boolean
+  /** The requirement revision the error belongs to; a reload changes it. */
+  revision: number
 }
 
 type RequirementFormState = {
@@ -295,13 +303,21 @@ function EditRequirementForm({
   const uid = useId()
   const [form, setForm] = useState<RequirementFormState>(() => toFormState(requirement))
   const [busy, setBusy] = useState<"save" | "confirm" | "reopen" | "delete" | null>(null)
-  const [error, setError] = useState("")
-  const [refreshHint, setRefreshHint] = useState(false)
+  const [error, setError] = useState<EditorErrorState | null>(null)
   const [confirmDelete, setConfirmDelete] = useState(false)
 
   const readOnly = requirement.status !== "draft"
   const status = REQUIREMENT_STATUS_META[requirement.status]
   const blockedByQuestions = requirement.openQuestionCount > 0
+
+  useEffect(() => {
+    // A requirement that stopped being a draft can no longer be deleted.
+    if (requirement.status !== "draft") setConfirmDelete(false)
+  }, [requirement.status])
+
+  // A stale 409 banner belongs to one revision; a reloaded requirement hides it.
+  const visibleError =
+    error !== null && (!error.stale || error.revision === requirement.revision) ? error : null
 
   function updateForm(patch: Partial<RequirementFormState>): void {
     setForm((previous) => ({ ...previous, ...patch }))
@@ -312,8 +328,7 @@ function EditRequirementForm({
     request: () => Promise<Requirement | undefined>,
   ): Promise<void> {
     setBusy(action)
-    setError("")
-    setRefreshHint(false)
+    setError(null)
     try {
       const result = await request()
       if (action === "delete") {
@@ -322,8 +337,11 @@ function EditRequirementForm({
       }
       if (result !== undefined) onUpdated(result)
     } catch (caught) {
-      setError(describeRequirementError(caught))
-      setRefreshHint(isStaleConflict(caught))
+      setError({
+        message: describeRequirementError(caught),
+        stale: isStaleConflict(caught),
+        revision: requirement.revision,
+      })
     } finally {
       setBusy(null)
     }
@@ -333,7 +351,7 @@ function EditRequirementForm({
     event.preventDefault()
     const validation = validate(form)
     if (validation !== "") {
-      setError(validation)
+      setError({ message: validation, stale: false, revision: requirement.revision })
       return
     }
     void run("save", () =>
@@ -393,14 +411,14 @@ function EditRequirementForm({
 
       <RequirementFields form={form} readOnly={readOnly} onChange={updateForm} />
 
-      {error === "" ? null : refreshHint ? (
-        <EditorError message={error} onRefresh={onReload} />
+      {visibleError === null ? null : visibleError.stale ? (
+        <EditorError message={visibleError.message} onRefresh={onReload} />
       ) : (
         <p
           role="alert"
           className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive"
         >
-          {error}
+          {visibleError.message}
         </p>
       )}
 

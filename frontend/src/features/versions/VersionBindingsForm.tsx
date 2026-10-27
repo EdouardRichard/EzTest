@@ -1,7 +1,7 @@
 "use client"
 
-import { Loader2, Save } from "lucide-react"
-import { type FormEvent, useEffect, useId, useState } from "react"
+import { Loader2, RefreshCw, Save } from "lucide-react"
+import { type FormEvent, useCallback, useEffect, useId, useRef, useState } from "react"
 
 import { listCodeRepos } from "@/features/code-repos/api"
 import type { CodeRepoDTO } from "@/features/code-repos/types"
@@ -62,6 +62,26 @@ function formFromVersion(version: Version): BindingsFormState {
   }
 }
 
+function sameForm(left: BindingsFormState, right: BindingsFormState): boolean {
+  return (
+    left.systemId === right.systemId &&
+    left.environmentId === right.environmentId &&
+    left.codeRepositoryId === right.codeRepositoryId &&
+    left.branch === right.branch
+  )
+}
+
+/** A 409 means the version moved; offer an explicit reload of the version. */
+function isStaleConflict(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 409
+}
+
+/** `stale` marks a conflict the user can resolve by reloading the version. */
+type BindingsErrorState = {
+  message: string
+  stale: boolean
+}
+
 export type VersionBindingsFormProps = {
   version: Version
   /** Called after a successful PUT so the container can refetch the version. */
@@ -82,57 +102,108 @@ export function VersionBindingsForm({ version, onChanged }: VersionBindingsFormP
   const [systems, setSystems] = useState<SystemDTO[]>([])
   const [environments, setEnvironments] = useState<EnvironmentDTO[]>([])
   const [repos, setRepos] = useState<CodeRepoDTO[]>([])
-  const [resourcesFailed, setResourcesFailed] = useState(false)
+  const [systemsReposFailed, setSystemsReposFailed] = useState(false)
+  const [environmentsFailed, setEnvironmentsFailed] = useState(false)
+  const resourcesFailed = systemsReposFailed || environmentsFailed
+  const systemsReposRequestRef = useRef(0)
+  const environmentsRequestRef = useRef(0)
+
+  // The last server-confirmed version: the optimistic-lock revision and the
+  // baseline snapshot come from here, not from the prop's object identity, so
+  // an immediate second save reuses the revision the server just returned.
+  const [baseVersion, setBaseVersion] = useState<Version>(version)
   const [form, setForm] = useState<BindingsFormState>(() => formFromVersion(version))
   const [saving, setSaving] = useState(false)
-  const [error, setError] = useState("")
+  const [error, setError] = useState<BindingsErrorState | null>(null)
   const [notice, setNotice] = useState("")
 
+  const appliedVersionKeyRef = useRef(`${version.id}:${version.revision}`)
+  const baseVersionIdRef = useRef(baseVersion.id)
+  baseVersionIdRef.current = baseVersion.id
+  const dirtyRef = useRef(false)
+  const dirty = !sameForm(form, formFromVersion(baseVersion))
+  dirtyRef.current = dirty
+
   useEffect(() => {
-    setForm(formFromVersion(version))
+    // Prop object identity changes for unrelated reasons must not reset a dirty
+    // form; only a new stable version id + revision (a real reload) applies.
+    const nextKey = `${version.id}:${version.revision}`
+    if (nextKey === appliedVersionKeyRef.current) return
+    appliedVersionKeyRef.current = nextKey
+    const differentVersion = baseVersionIdRef.current !== version.id
+    setBaseVersion(version)
+    if (differentVersion || !dirtyRef.current) {
+      setForm(formFromVersion(version))
+    }
+    setError((current) => (current?.stale === true ? null : current))
   }, [version])
+
+  const loadResourceOptions = useCallback(async (): Promise<void> => {
+    const requestId = ++systemsReposRequestRef.current
+    setSystemsReposFailed(false)
+    const [systemsResult, reposResult] = await Promise.allSettled([
+      listSystems({ limit: MAX_PAGE_SIZE }),
+      listCodeRepos(),
+    ])
+    if (systemsReposRequestRef.current !== requestId) return
+    if (systemsResult.status === "fulfilled") setSystems(systemsResult.value.items)
+    if (reposResult.status === "fulfilled") setRepos(reposResult.value.items)
+    setSystemsReposFailed(systemsResult.status === "rejected" || reposResult.status === "rejected")
+  }, [])
+
+  const loadEnvironmentOptions = useCallback(async (systemId: number | null): Promise<void> => {
+    const requestId = ++environmentsRequestRef.current
+    if (systemId === null) {
+      setEnvironments([])
+      setEnvironmentsFailed(false)
+      return
+    }
+    setEnvironmentsFailed(false)
+    try {
+      const items = await listEnvironments(systemId)
+      if (environmentsRequestRef.current === requestId) setEnvironments(items)
+    } catch {
+      if (environmentsRequestRef.current === requestId) {
+        setEnvironments([])
+        setEnvironmentsFailed(true)
+      }
+    }
+  }, [])
 
   useEffect(() => {
     if (!editable) return
-    let cancelled = false
-    void Promise.allSettled([listSystems({ limit: MAX_PAGE_SIZE }), listCodeRepos()]).then(
-      ([systemsResult, reposResult]) => {
-        if (cancelled) return
-        if (systemsResult.status === "fulfilled") setSystems(systemsResult.value.items)
-        if (reposResult.status === "fulfilled") setRepos(reposResult.value.items)
-        if (systemsResult.status === "rejected" || reposResult.status === "rejected") {
-          setResourcesFailed(true)
-        }
-      },
-    )
+    void loadResourceOptions()
     return () => {
-      cancelled = true
+      // Invalidate an in-flight resource request for this mount.
+      systemsReposRequestRef.current += 1
     }
-  }, [editable])
+  }, [editable, loadResourceOptions])
 
   useEffect(() => {
-    if (!editable || form.systemId === null) {
+    if (!editable) {
       setEnvironments([])
+      setEnvironmentsFailed(false)
       return
     }
-    let cancelled = false
-    void listEnvironments(form.systemId)
-      .then((items) => {
-        if (!cancelled) setEnvironments(items)
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setEnvironments([])
-          setResourcesFailed(true)
-        }
-      })
+    void loadEnvironmentOptions(form.systemId)
     return () => {
-      cancelled = true
+      // Invalidate an in-flight environment request for this system.
+      environmentsRequestRef.current += 1
     }
-  }, [editable, form.systemId])
+  }, [editable, form.systemId, loadEnvironmentOptions])
 
   function updateForm(patch: Partial<BindingsFormState>): void {
     setForm((previous) => ({ ...previous, ...patch }))
+  }
+
+  function retryResources(): void {
+    void loadResourceOptions()
+    void loadEnvironmentOptions(form.systemId)
+  }
+
+  /** Reloads the version through the container after a stale 409. */
+  function reloadVersion(): void {
+    onChanged()
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
@@ -140,26 +211,35 @@ export function VersionBindingsForm({ version, onChanged }: VersionBindingsFormP
     const branch =
       form.codeRepositoryId === null || form.branch.trim() === "" ? null : form.branch.trim()
     const unchangedSnapshot =
-      form.codeRepositoryId === version.codeRepositoryId && branch === version.codeBranch
+      form.codeRepositoryId === baseVersion.codeRepositoryId && branch === baseVersion.codeBranch
     const codeBaselineCommit =
-      form.codeRepositoryId === null ? null : unchangedSnapshot ? version.codeBaselineCommit : null
+      form.codeRepositoryId === null
+        ? null
+        : unchangedSnapshot
+          ? baseVersion.codeBaselineCommit
+          : null
+    const submitted = form
 
     setSaving(true)
-    setError("")
+    setError(null)
     setNotice("")
     try {
-      await putBindings(version.id, {
-        revision: version.revision,
+      const updated = await putBindings(version.id, {
+        revision: baseVersion.revision,
         systemId: form.systemId,
         environmentId: form.environmentId,
         codeRepositoryId: form.codeRepositoryId,
         codeBranch: branch,
         codeBaselineCommit,
       })
+      // Keep the returned version locally so the next immediate save reuses the
+      // new revision and the resolved baseline instead of conflicting.
+      setBaseVersion(updated)
+      setForm((current) => (sameForm(current, submitted) ? formFromVersion(updated) : current))
       setNotice("绑定已保存。")
       onChanged()
     } catch (caught) {
-      setError(describeBindingError(caught))
+      setError({ message: describeBindingError(caught), stale: isStaleConflict(caught) })
     } finally {
       setSaving(false)
     }
@@ -218,12 +298,19 @@ export function VersionBindingsForm({ version, onChanged }: VersionBindingsFormP
       </div>
 
       {resourcesFailed ? (
-        <p
+        <div
           role="status"
           className="rounded-xl border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
         >
-          系统、环境或代码仓列表加载失败，暂不能修改绑定。
-        </p>
+          <p>系统、环境或代码仓列表加载失败，暂不能修改绑定。</p>
+          <button
+            type="button"
+            onClick={retryResources}
+            className="mt-1.5 rounded-lg border border-border bg-card px-2.5 py-1 text-xs font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            重试加载资源
+          </button>
+        </div>
       ) : null}
 
       <div className="grid gap-3 sm:grid-cols-2">
@@ -320,17 +407,29 @@ export function VersionBindingsForm({ version, onChanged }: VersionBindingsFormP
 
       <p className="text-xs text-muted-foreground">
         当前基线 commit：
-        <span className="ml-1 break-all font-mono">{version.codeBaselineCommit ?? "未绑定"}</span>
+        <span className="ml-1 break-all font-mono">
+          {baseVersion.codeBaselineCommit ?? "未绑定"}
+        </span>
         。重新绑定仓库或修改分支后由后端解析新的基线。
       </p>
 
-      {error === "" ? null : (
-        <p
+      {error === null ? null : (
+        <div
           role="alert"
-          className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+          className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive"
         >
-          {error}
-        </p>
+          <span>{error.message}</span>
+          {error.stale ? (
+            <button
+              type="button"
+              onClick={reloadVersion}
+              className="inline-flex items-center gap-1 rounded-lg border border-border bg-card px-2.5 py-1 text-xs font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <RefreshCw className="h-3 w-3" aria-hidden="true" />
+              刷新
+            </button>
+          ) : null}
+        </div>
       )}
 
       {notice === "" ? null : (

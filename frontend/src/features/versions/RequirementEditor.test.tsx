@@ -265,4 +265,67 @@ describe("RequirementEditor", () => {
       screen.getByText("从左侧需求列表选择一条需求进行编辑，或点击「新增需求」。"),
     ).toBeTruthy()
   })
+
+  it("clears the stale revision-conflict message after the requirement reloads", async () => {
+    mocks.updateRequirement.mockRejectedValue(
+      new ApiError({
+        status: 409,
+        code: "conflict",
+        message: "revision conflict",
+        details: { reason: "revision_conflict" },
+      }),
+    )
+    const { rerender } = renderEditor({ requirement: requirement() })
+    await screen.findByText("暂无附件")
+
+    fireEvent.click(screen.getByRole("button", { name: "保存需求" }))
+    expect((await screen.findByRole("alert")).textContent).toContain(
+      "该需求已被更新，请刷新后重试。",
+    )
+
+    rerender(
+      <RequirementEditor
+        versionId={VERSION_ID}
+        requirement={requirement({ revision: 4 })}
+        creating={false}
+        onCreated={vi.fn()}
+        onUpdated={vi.fn()}
+        onDeleted={vi.fn()}
+        onCancelCreate={vi.fn()}
+        onReload={vi.fn()}
+        onAttachmentsChanged={vi.fn()}
+      />,
+    )
+
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull())
+  })
+
+  it("closes the delete confirmation when the requirement is no longer a draft", async () => {
+    const { rerender } = renderEditor({ requirement: requirement() })
+    await screen.findByText("暂无附件")
+
+    fireEvent.click(screen.getByRole("button", { name: "删除需求" }))
+    expect(screen.getByRole("alertdialog")).toBeTruthy()
+
+    rerender(
+      <RequirementEditor
+        versionId={VERSION_ID}
+        requirement={requirement({
+          status: "clarified",
+          revision: 4,
+          confirmedAt: "2026-10-27T12:00:00Z",
+          confirmedBy: 1,
+        })}
+        creating={false}
+        onCreated={vi.fn()}
+        onUpdated={vi.fn()}
+        onDeleted={vi.fn()}
+        onCancelCreate={vi.fn()}
+        onReload={vi.fn()}
+        onAttachmentsChanged={vi.fn()}
+      />,
+    )
+
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull())
+  })
 })

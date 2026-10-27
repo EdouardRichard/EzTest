@@ -260,4 +260,116 @@ describe("VersionBindingsForm", () => {
     const alert = await screen.findByRole("alert")
     expect(alert.textContent).toContain("当前版本状态不允许修改绑定，请刷新后重试。")
   })
+
+  it("uses the revision and baseline returned by the server for the next save", async () => {
+    const NEW_COMMIT = "fedcba9876543210fedcba9876543210fedcba98"
+    mocks.putBindings
+      .mockResolvedValueOnce({ ...VERSION, revision: 3, codeBaselineCommit: NEW_COMMIT })
+      .mockResolvedValue({ ...VERSION, revision: 4, codeBaselineCommit: NEW_COMMIT })
+
+    render(<VersionBindingsForm version={VERSION} onChanged={vi.fn()} />)
+    await screen.findByRole("option", { name: "订单系统" })
+
+    fireEvent.click(screen.getByRole("button", { name: "保存绑定" }))
+    await waitFor(() => expect(mocks.putBindings).toHaveBeenCalledTimes(1))
+    expect(await screen.findByText(NEW_COMMIT)).toBeTruthy()
+
+    fireEvent.click(screen.getByRole("button", { name: "保存绑定" }))
+    await waitFor(() =>
+      expect(mocks.putBindings).toHaveBeenLastCalledWith(VERSION_ID, {
+        revision: 3,
+        systemId: 1,
+        environmentId: 2,
+        codeRepositoryId: 3,
+        codeBranch: "main",
+        codeBaselineCommit: NEW_COMMIT,
+      }),
+    )
+  })
+
+  it("offers an inline refresh on a revision conflict and saves with the refreshed revision", async () => {
+    mocks.putBindings
+      .mockRejectedValueOnce(
+        new ApiError({
+          status: 409,
+          code: "conflict",
+          message: "revision conflict",
+          details: { reason: "revision_conflict" },
+        }),
+      )
+      .mockResolvedValueOnce({ ...VERSION, revision: 6 })
+    const onChanged = vi.fn()
+
+    const { rerender } = render(<VersionBindingsForm version={VERSION} onChanged={onChanged} />)
+    await screen.findByRole("option", { name: "订单系统" })
+
+    fireEvent.click(screen.getByRole("button", { name: "保存绑定" }))
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toContain("版本已被更新，请刷新后重试。")
+    fireEvent.click(screen.getByRole("button", { name: "刷新" }))
+    expect(onChanged).toHaveBeenCalledTimes(1)
+
+    rerender(<VersionBindingsForm version={{ ...VERSION, revision: 6 }} onChanged={onChanged} />)
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull())
+
+    fireEvent.click(screen.getByRole("button", { name: "保存绑定" }))
+    await waitFor(() =>
+      expect(mocks.putBindings).toHaveBeenLastCalledWith(
+        VERSION_ID,
+        expect.objectContaining({ revision: 6 }),
+      ),
+    )
+  })
+
+  it("keeps unsaved edits when the version object identity changes without a revision change", async () => {
+    const { rerender } = render(<VersionBindingsForm version={VERSION} onChanged={vi.fn()} />)
+    await screen.findByRole("option", { name: "订单系统" })
+
+    fireEvent.change(screen.getByLabelText("分支"), { target: { value: "feature/payments" } })
+
+    rerender(<VersionBindingsForm version={{ ...VERSION }} onChanged={vi.fn()} />)
+
+    expect((screen.getByLabelText("分支") as HTMLInputElement).value).toBe("feature/payments")
+  })
+
+  it("keeps unsaved edits but adopts the revision of a refreshed version", async () => {
+    mocks.putBindings.mockResolvedValue({ ...VERSION, revision: 6, codeBranch: "feature/payments" })
+    const { rerender } = render(<VersionBindingsForm version={VERSION} onChanged={vi.fn()} />)
+    await screen.findByRole("option", { name: "订单系统" })
+
+    fireEvent.change(screen.getByLabelText("分支"), { target: { value: "feature/payments" } })
+    rerender(<VersionBindingsForm version={{ ...VERSION, revision: 5 }} onChanged={vi.fn()} />)
+
+    expect((screen.getByLabelText("分支") as HTMLInputElement).value).toBe("feature/payments")
+
+    fireEvent.click(screen.getByRole("button", { name: "保存绑定" }))
+    await waitFor(() =>
+      expect(mocks.putBindings).toHaveBeenCalledWith(VERSION_ID, {
+        revision: 5,
+        systemId: 1,
+        environmentId: 2,
+        codeRepositoryId: 3,
+        codeBranch: "feature/payments",
+        codeBaselineCommit: null,
+      }),
+    )
+  })
+
+  it("retries loading the resource options after a failure", async () => {
+    mocks.listSystems.mockRejectedValueOnce(
+      new ApiError({ status: 500, code: "internal", message: "boom" }),
+    )
+
+    render(<VersionBindingsForm version={VERSION} onChanged={vi.fn()} />)
+
+    expect(await screen.findByText("系统、环境或代码仓列表加载失败，暂不能修改绑定。")).toBeTruthy()
+
+    fireEvent.click(screen.getByRole("button", { name: "重试加载资源" }))
+
+    expect(await screen.findByRole("option", { name: "订单系统" })).toBeTruthy()
+    await waitFor(() =>
+      expect(screen.queryByText("系统、环境或代码仓列表加载失败，暂不能修改绑定。")).toBeNull(),
+    )
+  })
 })
