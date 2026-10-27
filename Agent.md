@@ -124,11 +124,16 @@ EzTest/
 │     ├─ llm/                         # 限界上下文：LLM 配置/网关/模型目录
 │     ├─ storage/                     # 限界上下文：对象存储
 │     ├─ audit/                       # 限界上下文：审计
-│     └─ agent/                       # 限界上下文：Agent 运行时（P1）
+│     ├─ agent/                       # 限界上下文：Agent 运行时（P1）
 │        ├─ domain/                   # profile/session/run/message/activity/tool
 │        ├─ application/              # run 循环、上下文组装、工具管线、端口
 │        ├─ infrastructure/           # {postgres,llm,eventing,audit,tools}
 │        └─ interfaces/httpapi/       # /api/agents/* handler、DTO
+│     └─ resource/                    # 限界上下文：公共资源与身份（P2）
+│        ├─ domain/                   # company/system/environment/appmodel/account/access/session/snapshot/lease/takeover/coderepo
+│        ├─ application/              # catalog/access/session/coderepo 服务、ports
+│        ├─ infrastructure/           # {postgres,httpcheck,gitexec}
+│        └─ interfaces/httpapi/       # /api/resources/* handler、DTO
 ├─ frontend/
 │  ├─ src/app/                        # Next.js App Router，只做页面组装
 │  │  └─ (app)/agents/                # /agents 路由，挂载 agent-console
@@ -148,9 +153,11 @@ EzTest/
 └─ .tools/                            # 便携 Go/PostgreSQL（gitignored）
 ```
 
-每个限界上下文**必须**四层齐全：`domain/`、`application/`、`infrastructure/`、`interfaces/httpapi/`。上下文名使用小写单数（`identity`、`eventing`、`llm`、`storage`、`audit`、`agent`），不得新建 `utils/`、`common/`、`helpers/` 之类杂物目录；共享纯逻辑放 `internal/platform/`。
+每个限界上下文**必须**四层齐全：`domain/`、`application/`、`infrastructure/`、`interfaces/httpapi/`。上下文名使用小写单数（`identity`、`eventing`、`llm`、`storage`、`audit`、`agent`、`resource`），不得新建 `utils/`、`common/`、`helpers/` 之类杂物目录；共享纯逻辑放 `internal/platform/`。
 
 P1 新增的 `agent` 上下文位于 `backend/internal/agent/`：`infrastructure/` 含 `postgres`、`llm`、`eventing`、`audit`、`tools` 适配，`interfaces/httpapi/` 暴露 `/api/agents/*`。
+
+P2 新增的 `resource` 上下文位于 `backend/internal/resource/`：承载公共资源与身份（D28），`infrastructure/` 含 `postgres`、`httpcheck`、`gitexec` 适配，`interfaces/httpapi/` 暴露 `/api/resources/*`。
 
 ### 6.2 导入方向（Go，强制）
 
