@@ -512,7 +512,7 @@ Expected: FAIL。
 
 - 所有查询使用 `ctx`、参数化 SQL；`ErrNotFound` 映射 `pgx.ErrNoRows`。
 - `CreateTurn` 使用规格 §5.5 的单条 CTE；`titlePreview` 由调用方截断；**唯一索引冲突（SQLSTATE 23505）映射为 `domain.ErrRunActive`**。
-- `Active` 查 `status='running'`；`Latest` 按 id 倒序取 1。
+- `Active` 查 `status='running'`；`Latest` 取最近的**终态** run（`status <> 'running'`，按 id 倒序取 1）；`List` 的 last_run LATERAL 同条件。
 - `List` 用 `LEFT JOIN LATERAL` 取每个 session 的最新 run 与 running run，并 **JOIN `agent_profiles` 填充 `ProfileKey`**；按 `id DESC`，`cursor>0` 时 `id < cursor`，多取 1 条判断 `hasMore`。`Get` 同样返回 `ProfileKey`。
 - `Finish` 更新所有终态字段与 `ended_at=now()`；`UpdateProgress` 更新 turns/tokens。
 - `AppendAssistantPlaceholder` 插入空 assistant 消息并返回 id；`CompleteAssistant` 更新 content/reasoning/tool_calls/usage。
@@ -1488,7 +1488,7 @@ Expected: FAIL。
 - [ ] **Step 4: 实现**
 
 - `ProfileService.Update`：`Get` → `Apply(params)` → `Validate` → `repo.Update` → 审计（metadata 只含 `profile_key` 与变更字段名）。
-- `SessionService`：创建时 `profileID==0` → 从 `Profiles.List` 找 `Builtin==true` 的一条；profile 不存在/禁用 → `domain.ErrNotFound`/`domain.ErrProfileDisabled`；`title` ≤120；列表 `limit` 由 handler 传入；删除先 `runs.Abort`，`WaitIdle` 最多 5s，未停 → `domain.ErrRunActive`，已停 → `repo.Delete` + 审计；`Get` 组装 `SessionDetail`（active/latest run）。
+- `SessionService`：创建时 `profileID==0` → 从 `Profiles.List` 找 `Builtin==true` 的一条；profile 不存在/禁用 → `domain.ErrNotFound`/`domain.ErrProfileDisabled`；`title` ≤120；列表 `limit` 由 handler 传入；删除先 `runs.Abort`，`WaitIdle` 最多 5s，未停 → `domain.ErrRunActive`，已停 → `repo.Delete` + 审计；`Get` 组装 `SessionDetail`（`Active` run + 最近终态 run）。
 - HTTP DTO 映射严格按规格 §10.2；`writeJSON` 本地实现；错误映射表见规格 §10.3；`PATCH profile` 用 `domain.UpdateParams` 的指针字段，拒绝 `key`/`builtin`（这些不在 DTO 中，`DecodeJSON` 的 `DisallowUnknownFields` 已拒绝）。
 - `RegisterRoutes` 把全部路由包在 `guard` 中；路由按规格 §10.1。
 - `ToolCatalog.Infos` 返回 `registry.ToolInfos()`（按名字排序）。
