@@ -1789,6 +1789,111 @@ func TestStartRejectsDisabledProfileAndEmptyMessage(t *testing.T) {
 	})
 }
 
+// TestStartWithPartsPersistsTextAndImageRef pins the P3 multimodal turn: the
+// text parts and the attachment reference are persisted together, the data URL
+// is never written to the message store (D30), and the context passed to the
+// LLM port still carries the reference (the gateway resolves it at call time).
+func TestStartWithPartsPersistsTextAndImageRef(t *testing.T) {
+	profile := runTestProfile(t)
+	state := runTestNewState(t, profile, 7)
+	caller := &runFakeCaller{
+		model:         "deepseek-flash",
+		contextWindow: 100000,
+		scripts: []runFakeScript{{
+			events: []application.LLMStreamEvent{{Delta: "收到", Done: true, FinishReason: "stop"}},
+		}},
+	}
+	service, _, _ := runTestNewService(t, state, caller)
+
+	parts := []domain.Part{
+		{Type: "text", Text: "请看这张截图"},
+		{Type: "image_url", ImageRef: "attachment:42"},
+	}
+	result, err := service.StartWithParts(context.Background(), 7, parts, nil)
+	if err != nil {
+		t.Fatalf("StartWithParts: %v", err)
+	}
+	if result.RunID == 0 || result.UserMessageID == 0 {
+		t.Fatalf("StartWithParts result=%+v want both ids", result)
+	}
+	runTestWaitIdle(t, service, 7)
+
+	messages := state.messagesFor(7)
+	if len(messages) == 0 {
+		t.Fatal("the user turn was not persisted")
+	}
+	user := messages[0]
+	if user.Role != "user" {
+		t.Fatalf("first message role=%q want user", user.Role)
+	}
+	if len(user.Parts) != 2 || user.Parts[0].Text != "请看这张截图" || user.Parts[1].ImageRef != "attachment:42" {
+		t.Fatalf("persisted user parts=%+v", user.Parts)
+	}
+	encoded, err := json.Marshal(user.Parts)
+	if err != nil {
+		t.Fatalf("marshal persisted parts: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"image_ref":"attachment:42"`) {
+		t.Fatalf("persisted content lacks image_ref: %s", encoded)
+	}
+	if strings.Contains(string(encoded), "data:image") {
+		t.Fatalf("persisted content contains a transient data URL: %s", encoded)
+	}
+
+	requests := caller.recordedRequests()
+	if len(requests) == 0 {
+		t.Fatal("the run made no LLM request")
+	}
+	var modelUser *application.LLMMessage
+	for index := range requests[0].Messages {
+		if requests[0].Messages[index].Role == "user" {
+			modelUser = &requests[0].Messages[index]
+		}
+	}
+	if modelUser == nil {
+		t.Fatalf("LLM request has no user message: %+v", requests[0].Messages)
+	}
+	if len(modelUser.Parts) != 2 || modelUser.Parts[1].ImageRef != "attachment:42" {
+		t.Fatalf("LLM request user parts=%+v want the image reference", modelUser.Parts)
+	}
+}
+
+func TestStartWithPartsRejectsEmpty(t *testing.T) {
+	cases := []struct {
+		name  string
+		parts []domain.Part
+	}{
+		{name: "nil", parts: nil},
+		{name: "no parts", parts: []domain.Part{}},
+		{name: "blank text", parts: []domain.Part{{Type: "text", Text: "  \n\t "}}},
+		{name: "missing image ref", parts: []domain.Part{{Type: "image_url"}}},
+		{name: "blank image ref", parts: []domain.Part{{Type: "image_url", ImageRef: "   "}}},
+		{name: "blank text with blank image ref", parts: []domain.Part{
+			{Type: "text", Text: " "},
+			{Type: "image_url", ImageRef: "\t"},
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			profile := runTestProfile(t)
+			state := runTestNewState(t, profile, 7)
+			caller := &runFakeCaller{model: "deepseek-flash", contextWindow: 100000}
+			service, _, _ := runTestNewService(t, state, caller)
+
+			_, err := service.StartWithParts(context.Background(), 7, tc.parts, nil)
+			if !errors.Is(err, domain.ErrEmptyMessage) {
+				t.Fatalf("StartWithParts error=%v want ErrEmptyMessage", err)
+			}
+			if len(state.created) != 0 {
+				t.Fatalf("a turn was created for empty parts: %+v", state.created)
+			}
+			if caller.callCount() != 0 {
+				t.Fatalf("the LLM was called %d times for empty parts", caller.callCount())
+			}
+		})
+	}
+}
+
 func TestStartMapsNotConfiguredAndProtocol(t *testing.T) {
 	for _, wantErr := range []error{domain.ErrLLMNotConfigured, domain.ErrToolsUnsupported} {
 		t.Run(wantErr.Error(), func(t *testing.T) {

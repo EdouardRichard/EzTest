@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -85,6 +87,159 @@ func drain(t *testing.T, stream <-chan agentapp.LLMStreamEvent) []agentapp.LLMSt
 		events = append(events, event)
 	}
 	return events
+}
+
+// fakeImageResolver records every reference it is asked to resolve and returns
+// the configured transient data URL.
+type fakeImageResolver struct {
+	mu      sync.Mutex
+	refs    []string
+	dataURL string
+	err     error
+}
+
+func (r *fakeImageResolver) ResolveImage(_ context.Context, ref string) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.refs = append(r.refs, ref)
+	if r.err != nil {
+		return "", r.err
+	}
+	return r.dataURL, nil
+}
+
+func (r *fakeImageResolver) resolvedRefs() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.refs...)
+}
+
+// imageRefRequest is the multimodal request the gateway tests start from.
+func imageRefRequest() agentapp.LLMRequest {
+	return agentapp.LLMRequest{
+		Model: "deepseek-flash",
+		Messages: []agentapp.LLMMessage{{
+			Role: "user",
+			Parts: []agentdomain.Part{
+				{Type: "text", Text: "look"},
+				{Type: "image_url", ImageRef: "attachment:42"},
+			},
+		}},
+	}
+}
+
+func TestGatewayResolvesImageRefs(t *testing.T) {
+	const dataURL = "data:image/png;base64,iVBORw0KGgo="
+	resolver := &fakeImageResolver{dataURL: dataURL}
+	client := &fakeLLMClient{events: []llmapp.StreamEvent{{Done: true}}}
+	cfg := chatConfig()
+	cfg.MultimodalEnabled = true
+	caller, err := NewGateway(&fakeConfigSource{cfg: cfg}, func(llm.Config) llmapp.Client {
+		return client
+	}, resolver).Prepare(context.Background(), "")
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+
+	request := imageRefRequest()
+	stream, err := caller.ChatStream(context.Background(), request)
+	if err != nil {
+		t.Fatalf("ChatStream: %v", err)
+	}
+	drain(t, stream)
+
+	if refs := resolver.resolvedRefs(); len(refs) != 1 || refs[0] != "attachment:42" {
+		t.Fatalf("resolved refs=%+v want [attachment:42]", refs)
+	}
+	if len(client.requests) != 1 {
+		t.Fatalf("upstream requests=%d want 1", len(client.requests))
+	}
+	parts := client.requests[0].Messages[0].Content
+	if len(parts) != 2 {
+		t.Fatalf("upstream parts=%+v want text + image", parts)
+	}
+	if parts[0].Type != "text" || parts[0].Text != "look" {
+		t.Fatalf("text part=%+v", parts[0])
+	}
+	if parts[1].Type != "image_url" || parts[1].ImageURL != dataURL {
+		t.Fatalf("image part=%+v want resolved data URL", parts[1])
+	}
+	// The caller's request is not mutated: persisted content keeps only the
+	// reference (D30), the data URL lives only inside this call.
+	if request.Messages[0].Parts[1].ImageRef != "attachment:42" ||
+		request.Messages[0].Parts[1].ImageURL != "" {
+		t.Fatalf("ChatStream mutated the caller's request: %+v", request.Messages[0].Parts[1])
+	}
+}
+
+func TestGatewayRejectsImagesWhenMultimodalDisabled(t *testing.T) {
+	resolver := &fakeImageResolver{dataURL: "data:image/png;base64,AAAA"}
+	client := &fakeLLMClient{events: []llmapp.StreamEvent{{Done: true}}}
+	cfg := chatConfig() // MultimodalEnabled defaults to false.
+	caller, err := NewGateway(&fakeConfigSource{cfg: cfg}, func(llm.Config) llmapp.Client {
+		return client
+	}, resolver).Prepare(context.Background(), "")
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+
+	_, err = caller.ChatStream(context.Background(), imageRefRequest())
+	if err == nil {
+		t.Fatal("ChatStream accepted an image reference while multimodal is disabled")
+	}
+	var coded agentapp.CodedError
+	if !errors.As(err, &coded) {
+		t.Fatalf("err=%v does not implement agentapp.CodedError", err)
+	}
+	if coded.ErrorCode() != platform.CodeLLMBadRequest {
+		t.Fatalf("ErrorCode()=%q want %q", coded.ErrorCode(), platform.CodeLLMBadRequest)
+	}
+	if refs := resolver.resolvedRefs(); len(refs) != 0 {
+		t.Fatalf("the resolver was called with multimodal disabled: %+v", refs)
+	}
+	if len(client.requests) != 0 {
+		t.Fatalf("an image request reached the upstream with multimodal disabled: %+v", client.requests)
+	}
+}
+
+func TestGatewayWithoutResolverFailsImageRef(t *testing.T) {
+	client := &fakeLLMClient{events: []llmapp.StreamEvent{{Done: true}}}
+	cfg := chatConfig()
+	cfg.MultimodalEnabled = true
+	caller, err := NewGateway(&fakeConfigSource{cfg: cfg}, func(llm.Config) llmapp.Client {
+		return client
+	}).Prepare(context.Background(), "")
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+
+	_, err = caller.ChatStream(context.Background(), imageRefRequest())
+	if err == nil {
+		t.Fatal("ChatStream accepted an image reference without a resolver")
+	}
+	if !strings.Contains(err.Error(), "resolver") {
+		t.Fatalf("err=%q is not a readable resolver error", err)
+	}
+	if len(client.requests) != 0 {
+		t.Fatalf("an unresolved image request reached the upstream: %+v", client.requests)
+	}
+
+	// The P1 text-only path is unchanged: no resolver is fine without images.
+	textOnly := agentapp.LLMRequest{
+		Model: "deepseek-flash",
+		Messages: []agentapp.LLMMessage{{
+			Role:  "user",
+			Parts: []agentdomain.Part{{Type: "text", Text: "hello"}},
+		}},
+	}
+	stream, err := caller.ChatStream(context.Background(), textOnly)
+	if err != nil {
+		t.Fatalf("text-only ChatStream without a resolver: %v", err)
+	}
+	drain(t, stream)
+	if len(client.requests) != 1 {
+		t.Fatalf("upstream requests=%d want 1 after the text-only call", len(client.requests))
+	}
 }
 
 func TestPrepareRejectsUnavailableDefault(t *testing.T) {
