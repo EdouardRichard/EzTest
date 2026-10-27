@@ -160,7 +160,7 @@ EzTest/
 └─ .tools/                            # 便携 Go/PostgreSQL（gitignored）
 ```
 
-每个限界上下文**必须**四层齐全：`domain/`、`application/`、`infrastructure/`、`interfaces/httpapi/`。上下文名使用小写单数（`identity`、`eventing`、`llm`、`storage`、`audit`、`agent`、`resource`），不得新建 `utils/`、`common/`、`helpers/` 之类杂物目录；共享纯逻辑放 `internal/platform/`。
+每个限界上下文**必须**四层齐全：`domain/`、`application/`、`infrastructure/`、`interfaces/httpapi/`。上下文名使用小写单数（`identity`、`eventing`、`llm`、`storage`、`audit`、`agent`、`resource`、`version`），不得新建 `utils/`、`common/`、`helpers/` 之类杂物目录；共享纯逻辑放 `internal/platform/`。
 
 P1 新增的 `agent` 上下文位于 `backend/internal/agent/`：`infrastructure/` 含 `postgres`、`llm`、`eventing`、`audit`、`tools` 适配，`interfaces/httpapi/` 暴露 `/api/agents/*`。P3 兼容扩展：Agent 会话新增可选 `activity_channel`（澄清会话为 `version:{id}`；默认回退 `agent:{session_id}` 不变），run 支持文本 + `image_ref` 多模态输入。
 
