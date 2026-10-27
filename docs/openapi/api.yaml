@@ -1,10 +1,11 @@
 openapi: 3.0.3
 info:
   title: EzTest API
-  version: 0.3.0
+  version: 0.4.0
   description: |
     Hand-maintained OpenAPI document for the EzTest API: the P0 foundation, the
-    P1 Agent runtime and the P2 resource context.
+    P1 Agent runtime, the P2 resource context and the P3 version / requirements
+    / clarification context.
 
     Conventions:
     - Successful responses use the `{"data": ...}` envelope. List endpoints add
@@ -39,6 +40,16 @@ info:
       Access exposes only `credentialSet`, and a Session exposes only the
       storage-state hash and shape counts. The company is always the seeded
       default one, so requests never carry a `companyId`.
+    - P3 version endpoints under `/api/versions` use camelCase payload fields and
+      are available to every authenticated user (P3 adds no 403). P3-owned IDs
+      (`versionId`, `requirementId`, `relationId`, `sessionId`, `questionId`,
+      `decisionId`, `attachmentId`) are 64-bit snowflake values serialized as
+      decimal strings in JSON and URL paths and must never be parsed as
+      JavaScript numbers; P2 resource IDs (`systemId`, `environmentId`,
+      `codeRepositoryId`) and user IDs (`createdBy`, `updatedBy`, `confirmedBy`,
+      `answeredBy`, `decidedBy`, `proposedBy`) stay numbers. Version events are
+      published on `channel=version:{id}`; `GET /api/versions/{id}/stream` fixes
+      that channel server-side and ignores a client-supplied `channel`.
 
     This document is served publicly at `GET /api/openapi.yaml`; it is the same
     file under `docs/openapi/api.yaml` in the repository.
@@ -57,6 +68,7 @@ tags:
   - name: audit
   - name: resources
   - name: code-repos
+  - name: versions
   - name: health
 security: []
 paths:
@@ -2576,6 +2588,1276 @@ paths:
           $ref: '#/components/responses/ResourceInvalid'
         '500':
           $ref: '#/components/responses/Internal'
+  /api/versions:
+    get:
+      tags: [versions]
+      summary: List versions
+      description: |
+        One cursor page ordered by `updatedAt DESC, id DESC`. Every authenticated
+        user may read the version domain; P3 defines no 403. Each row carries the
+        aggregate `requirementCount`, `clarifiedCount` and `openQuestionCount`.
+      operationId: listVersions
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionStatusFilter'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of versions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VersionList'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [versions]
+      summary: Create a version
+      description: |
+        Creates a `draft` version, optionally bound to P2 resources in the same
+        request. Resource existence, environment/system consistency and the Git
+        baseline are validated here; the response is 201. No clarification
+        session is created.
+      operationId: createVersion
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateVersionRequest'
+      responses:
+        '201':
+          description: The created draft version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VersionEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          $ref: '#/components/responses/VersionInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}:
+    get:
+      tags: [versions]
+      summary: Read one version
+      description: |
+        The version with resolved P2 bindings. `bindings.*.available` is false
+        when the referenced P2 resource was deleted after binding; this never
+        blocks requirement or clarification work.
+      operationId: getVersion
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+      responses:
+        '200':
+          description: The version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VersionEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    patch:
+      tags: [versions]
+      summary: Update version metadata
+      description: |
+        Updates `name`, `label` and/or `description` in any status. `status` is
+        not writable. `revision` is required and must match the stored revision
+        (409 `revision_conflict` otherwise).
+      operationId: updateVersion
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateVersionRequest'
+      responses:
+        '200':
+          description: The updated version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VersionEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/VersionConflict'
+        '422':
+          $ref: '#/components/responses/VersionInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}/bindings:
+    put:
+      tags: [versions]
+      summary: Replace the resource bindings of a version
+      description: |
+        Replaces the whole binding set (an omitted or `null` field clears that
+        binding). Allowed only while the version is `draft` or `clarifying`;
+        `designing` returns 409 `version_state_conflict`. Requires `revision`.
+        `environmentId` must belong to `systemId`; `codeBaselineCommit` is a
+        40-hex snapshot that only changes by rebinding.
+      operationId: putVersionBindings
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PutVersionBindingsRequest'
+      responses:
+        '200':
+          description: The version with the replaced bindings.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VersionEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/VersionConflict'
+        '422':
+          $ref: '#/components/responses/VersionInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}/start-clarification:
+    post:
+      tags: [versions]
+      summary: Move a draft version into clarification
+      description: |
+        `draft → clarifying`. The version must have at least one requirement;
+        otherwise the response is 422 `requirements_required`. No clarification
+        session is started automatically.
+      operationId: startVersionClarification
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The version in status `clarifying`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VersionEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/VersionConflict'
+        '422':
+          $ref: '#/components/responses/VersionInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}/enter-design:
+    post:
+      tags: [versions]
+      summary: Move a clarifying version into design
+      description: |
+        `clarifying → designing`. When unclarified requirements or version-level
+        open questions exist, the first call without
+        `acknowledgeUnclarified=true` returns 409 `unclarified_requirements`
+        with `details.unclarifiedRequirementIds` and `details.openQuestionCount`;
+        an acknowledged retry succeeds and returns the warnings, which may be
+        empty. The transition never blocks on unclarified work.
+      operationId: enterVersionDesign
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EnterDesignRequest'
+      responses:
+        '200':
+          description: The version in status `designing` plus the warnings.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnterDesignEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/VersionConflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}/requirements:
+    get:
+      tags: [versions]
+      summary: List requirements of a version
+      description: |
+        One cursor page ordered by `created_at, id` ascending. Each row carries
+        `openQuestionCount`, `relationCount` and `attachmentCount`.
+      operationId: listRequirements
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/RequirementStatusFilter'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of requirements.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RequirementList'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [versions]
+      summary: Add a requirement to a version
+      description: |
+        Always creates a `draft` requirement with `source=user`; the version
+        status does not change (INV-4). Returns 201.
+      operationId: createRequirement
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRequirementRequest'
+      responses:
+        '201':
+          description: The created draft requirement.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RequirementEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/VersionInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}/requirements/{rid}:
+    get:
+      tags: [versions]
+      summary: Read one requirement
+      description: Requirement detail including attachment metadata. `storagePath` is never returned.
+      operationId: getRequirement
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/RequirementPathId'
+      responses:
+        '200':
+          description: The requirement.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RequirementEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    patch:
+      tags: [versions]
+      summary: Edit a draft requirement
+      description: |
+        Only `draft` requirements may be edited; a `clarified` requirement
+        returns 409 `requirement_state_conflict`. `revision` is required
+        (409 `revision_conflict` on mismatch).
+      operationId: updateRequirement
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/RequirementPathId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateRequirementRequest'
+      responses:
+        '200':
+          description: The updated requirement.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RequirementEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/VersionConflict'
+        '422':
+          $ref: '#/components/responses/VersionInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+    delete:
+      tags: [versions]
+      summary: Delete a draft requirement
+      description: |
+        Only `draft` requirements may be deleted (hard delete, cascading to its
+        relations, questions, attachments and decisions). The attachment files
+        are cleaned up best-effort. A `clarified` requirement returns 409
+        `requirement_state_conflict`.
+      operationId: deleteRequirement
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/RequirementPathId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: The requirement was deleted.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/VersionConflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}/requirements/{rid}/confirm:
+    post:
+      tags: [versions]
+      summary: Confirm a draft requirement
+      description: |
+        `draft → clarified`. The requirement itself must have zero open
+        questions; otherwise 409 `open_questions_remaining`. Version-level open
+        questions do not block. Version status is never changed.
+      operationId: confirmRequirement
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/RequirementPathId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The clarified requirement.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RequirementEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/VersionConflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}/requirements/{rid}/reopen:
+    post:
+      tags: [versions]
+      summary: Reopen a clarified requirement
+      description: |
+        `clarified → draft` in any version status. Clears `confirmedAt` and
+        `confirmedBy`; questions and decisions are preserved. Version status is
+        never changed.
+      operationId: reopenRequirement
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/RequirementPathId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The reopened draft requirement.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RequirementEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/VersionConflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}/requirements/{rid}/attachments:
+    get:
+      tags: [versions]
+      summary: List the attachments of a requirement
+      description: Metadata only; `storagePath` is never returned and the files stay behind the authenticated download endpoint.
+      operationId: listRequirementAttachments
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/RequirementPathId'
+      responses:
+        '200':
+          description: All attachment metadata of the requirement.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RequirementAttachmentList'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [versions]
+      summary: Upload an attachment to a draft requirement
+      description: |
+        Multipart upload with the single field `file`. Allowed MIME types are
+        `text/plain`, `text/markdown`, `application/json`, `application/yaml`,
+        `text/yaml`, `image/png` and `image/jpeg` (the extension must match);
+        each file is at most 10 MiB, at most 10 files are allowed per
+        requirement and 50 per version. Upload and delete require a `draft`
+        requirement. The same `sha256` may appear only once per requirement
+        (409 `duplicate_attachment`). Returns 201 with metadata only.
+      operationId: uploadRequirementAttachment
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/RequirementPathId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        '201':
+          description: The stored attachment metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RequirementAttachmentEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/VersionConflict'
+        '422':
+          $ref: '#/components/responses/VersionInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}/requirements/{rid}/attachments/{aid}/content:
+    get:
+      tags: [versions]
+      summary: Download an attachment
+      description: |
+        Streams the stored bytes with the MIME type persisted at upload time,
+        an inline RFC 5987 `Content-Disposition` filename and
+        `X-Content-Type-Options: nosniff`. Available to any authenticated user.
+      operationId: downloadRequirementAttachment
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/RequirementPathId'
+        - $ref: '#/components/parameters/AttachmentPathId'
+      responses:
+        '200':
+          description: The raw attachment content.
+          headers:
+            Content-Disposition:
+              description: Inline with a UTF-8 `filename*` parameter.
+              schema:
+                type: string
+            X-Content-Type-Options:
+              description: Always `nosniff`.
+              schema:
+                type: string
+          content:
+            '*/*':
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}/requirements/{rid}/attachments/{aid}:
+    delete:
+      tags: [versions]
+      summary: Delete an attachment
+      description: Deletes the metadata first and then removes the file best-effort; only `draft` requirements allow it.
+      operationId: deleteRequirementAttachment
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/RequirementPathId'
+        - $ref: '#/components/parameters/AttachmentPathId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: The attachment was deleted.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/VersionConflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}/relations:
+    get:
+      tags: [versions]
+      summary: List all requirement relations of a version
+      description: |
+        Every relation of the version, ordered by `id`. The endpoint has no
+        pagination and returns at most 500 relations.
+      operationId: listRequirementRelations
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+      responses:
+        '200':
+          description: All relations of the version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RequirementRelationList'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [versions]
+      summary: Create a requirement relation
+      description: |
+        Both endpoints must be requirements of this version and must differ.
+        `depends_on` is directed; the other three types are normalized as
+        undirected for duplicate detection. A duplicate returns 409
+        `duplicate_relation`; a cross-version endpoint returns 422
+        `relation_requirement_mismatch`. Returns 201.
+      operationId: createRequirementRelation
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRelationRequest'
+      responses:
+        '201':
+          description: The created relation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RequirementRelationEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/VersionConflict'
+        '422':
+          $ref: '#/components/responses/VersionInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}/relations/{relId}:
+    patch:
+      tags: [versions]
+      summary: Edit a requirement relation
+      description: Changes `relationType` and/or `description`; relations have no revision field.
+      operationId: updateRequirementRelation
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/RelationPathId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateRelationRequest'
+      responses:
+        '200':
+          description: The updated relation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RequirementRelationEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/VersionConflict'
+        '422':
+          $ref: '#/components/responses/VersionInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+    delete:
+      tags: [versions]
+      summary: Delete a requirement relation
+      operationId: deleteRequirementRelation
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/RelationPathId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: The relation was deleted.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}/clarification:
+    get:
+      tags: [versions]
+      summary: Read the clarification overview of a version
+      description: |
+        The active clarification session, if any, plus per-status question and
+        decision counters and the agent-maintained `contextSummary`.
+      operationId: getVersionClarification
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+      responses:
+        '200':
+          description: The clarification overview.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClarificationOverviewEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}/clarification/sessions:
+    post:
+      tags: [versions]
+      summary: Start a clarification session
+      description: |
+        Creates a P1 Agent session with profile `clarification-dialog` on
+        `channel=version:{id}` and an `active` P3 session row. Requires the
+        version to be `clarifying` or `designing` and a version without an
+        active session (409 `clarification_session_active`). Returns 201. An
+        unavailable AI runtime is 503 `ai_unavailable`.
+      operationId: startClarificationSession
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '201':
+          description: The started session.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClarificationSessionEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/VersionConflict'
+        '503':
+          $ref: '#/components/responses/VersionUnavailable'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}/clarification/sessions/{sid}/complete:
+    post:
+      tags: [versions]
+      summary: Complete the active clarification session
+      description: |
+        `active → completed`. The version channel must have no running Agent
+        run; otherwise 409 `agent_busy`. A non-active session returns 409
+        `clarification_session_not_active`.
+      operationId: completeClarificationSession
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/ClarificationSessionPathId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The completed session.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClarificationSessionEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/VersionConflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}/clarification/messages:
+    get:
+      tags: [versions]
+      summary: Read the clarification conversation
+      description: |
+        The persisted P1 `agent_messages` projection, oldest first, with
+        `role=system` messages filtered out. `before_id` is a P1 message ID
+        (number), not a P3 snowflake string. `next_cursor` is the oldest message
+        ID of the page.
+      operationId: listClarificationMessages
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/BeforeId'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of clarification messages.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClarificationMessagePage'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [versions]
+      summary: Send a clarification message
+      description: |
+        Sends a 1-5000 character text message through the active session's P1
+        Agent run and returns 202 with the started run. Requires an active
+        session (`clarification_session_not_active`) and an idle version channel
+        (`agent_busy`). An unavailable AI runtime returns 503 `ai_unavailable`
+        with `retryable: true`; the user keeps the draft in the UI.
+      operationId: sendClarificationMessage
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SendClarificationMessageRequest'
+      responses:
+        '202':
+          description: The started Agent run.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SendClarificationMessageResultEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/VersionConflict'
+        '422':
+          $ref: '#/components/responses/VersionInvalid'
+        '503':
+          $ref: '#/components/responses/VersionUnavailable'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}/clarification/analyze:
+    post:
+      tags: [versions]
+      summary: Run a one-shot requirement analysis
+      description: |
+        Starts a `requirement-analysis` Agent run on the version channel and
+        returns 202. The version must have an active clarification session
+        (409 `clarification_session_required`) and no running Agent
+        (409 `agent_busy`). The run itself publishes events through the normal
+        channel; there is no P3 session row for the one-shot run.
+      operationId: analyzeVersionRequirements
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202':
+          description: The started Agent run.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClarificationRunResultEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/VersionConflict'
+        '503':
+          $ref: '#/components/responses/VersionUnavailable'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}/clarification/recon:
+    post:
+      tags: [versions]
+      summary: Run a one-shot context reconnaissance
+      description: |
+        Starts a `context-recon` Agent run that injects the bound text
+        attachments (at most 64 KiB per file and 200 KiB per run) and at most
+        two images (2 MiB each) as `image_ref` parts. Requires an active session
+        and an idle version channel; returns 202. Data URLs are generated only
+        in memory for the LLM call and never persisted or logged.
+      operationId: reconVersionContext
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202':
+          description: The started Agent run.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClarificationRunResultEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/VersionConflict'
+        '503':
+          $ref: '#/components/responses/VersionUnavailable'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}/clarification/questions:
+    get:
+      tags: [versions]
+      summary: List clarification questions
+      description: |
+        One cursor page ordered by `id` ascending. Filters: `status` and
+        `requirementId` (a P3 decimal string; omit for version-level and
+        requirement-level questions together).
+      operationId: listClarificationQuestions
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/QuestionStatusFilter'
+        - $ref: '#/components/parameters/QuestionRequirementFilter'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of questions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClarificationQuestionPage'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [versions]
+      summary: Add a clarification question
+      description: |
+        Creates an `open` question with `source=user`. `requirementId` is a P3
+        string and must belong to this version; omit it for a version-level
+        question. The question text is at most 2000 characters. Returns 201.
+      operationId: createClarificationQuestion
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateClarificationQuestionRequest'
+      responses:
+        '201':
+          description: The created question.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClarificationQuestionEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/VersionInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}/clarification/questions/{qid}:
+    patch:
+      tags: [versions]
+      summary: Answer, dismiss, reopen or edit a question
+      description: |
+        State transitions: `open → answered` (a non-empty `answer` is required),
+        `open → dismissed`, and `answered|dismissed → open` (which clears the
+        answer fields). Reopening or answering the wrong state returns 409
+        `clarification_question_state_conflict`. The text may also be corrected
+        without a state change; AI callers may only touch open questions.
+      operationId: updateClarificationQuestion
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/QuestionPathId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateClarificationQuestionRequest'
+      responses:
+        '200':
+          description: The updated question.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClarificationQuestionEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/VersionConflict'
+        '422':
+          $ref: '#/components/responses/VersionInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}/decisions:
+    get:
+      tags: [versions]
+      summary: List clarification decisions
+      description: One cursor page ordered by `id` ascending, optionally filtered by `status`.
+      operationId: listDecisions
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/DecisionStatusFilter'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of decisions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClarificationDecisionPage'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [versions]
+      summary: Record a manual decision
+      description: |
+        A human-authored decision is stored as `accepted` with `source=user`
+        (201). `requirementId`/`questionId` are P3 strings and must belong to
+        this version. Accepting a decision linked to an open question answers
+        that question in the same transaction.
+      operationId: createDecision
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateDecisionRequest'
+      responses:
+        '201':
+          description: The recorded decision.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClarificationDecisionEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/VersionInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}/decisions/{did}:
+    patch:
+      tags: [versions]
+      summary: Accept or reject a proposed decision
+      description: |
+        Only a `proposed` decision can transition (to `accepted` or `rejected`
+        with an optional rejection `rationale`); accepted/rejected are terminal
+        and a second change returns 409 `decision_state_conflict`. Accepting a
+        decision linked to an open question answers that question in the same
+        transaction.
+      operationId: updateDecision
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/DecisionPathId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateDecisionRequest'
+      responses:
+        '200':
+          description: The decided record.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClarificationDecisionEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/VersionConflict'
+        '422':
+          $ref: '#/components/responses/VersionInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}/events:
+    get:
+      tags: [versions]
+      summary: Snapshot the newest events of a version channel
+      description: |
+        Returns the newest persisted events before `before_seq` plus the
+        channel's current `snapshot_cursor`. Unlike the P0 snapshot, the P3
+        response is flat: `{"data":[...], "snapshot_cursor", "has_more"}`.
+        Events are the same V1 envelope used by `/api/stream[/events]`, with
+        `channel=version:{id}` and a decimal-string `version_id`.
+      operationId: getVersionEventSnapshot
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/BeforeSeq'
+      responses:
+        '200':
+          description: The version event snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VersionEventSnapshot'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}/stream:
+    get:
+      tags: [versions, stream]
+      summary: Stream version events as Server-Sent Events
+      description: |
+        Opens the SSE stream for the fixed `channel=version:{id}`. The version
+        must exist (404 `not_found`); a client-supplied `?channel=` is ignored so
+        the channel cannot be overridden. `Last-Event-ID` (reset automatically
+        by browsers on reconnect) takes precedence over `?since`; omit both for
+        live-only. Frames use `id: <seq>`, `event: <type>` and
+        `data: <event envelope>`; the server sends a `: ping` comment every 20
+        seconds. When the cursor is too old the server emits a synthetic
+        `stream.reset` frame (no id) and the client must fetch a fresh
+        `/events` snapshot. Duplicate seqs are never delivered.
+      operationId: streamVersionEvents
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/Since'
+        - $ref: '#/components/parameters/LastEventID'
+      responses:
+        '200':
+          description: |
+            An endless `text/event-stream`. The `X-Snapshot-Cursor` response
+            header announces the version channel's current seq at connect time.
+          headers:
+            X-Snapshot-Cursor:
+              description: The version channel's latest seq when the stream opened.
+              schema:
+                type: integer
+                format: int64
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              example: |
+                id: 42
+                event: clarification.question_updated
+                data: {"seq":42,"channel":"version:1844674407370955161","type":"clarification.question_updated","version_id":"1844674407370955161","batch_id":null,"case_id":null,"step_id":null,"agent_role":null,"session_id":"1844674407370955162","ts":"2026-10-27T08:00:00Z","summary":"clarification question updated","detail":{"questionId":"1844674407370955163","status":"open"},"refs":{"evidence":[],"case":[],"requirement":[],"code":[]}}
+
+                : ping
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
   /healthz:
     get:
       tags: [health]
@@ -2851,6 +4133,109 @@ components:
         type: integer
         format: int64
         minimum: 1
+    VersionPathId:
+      name: id
+      in: path
+      required: true
+      description: |
+        Version ID: a 64-bit snowflake serialized as a decimal string. Never
+        parse it into a JavaScript number.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    RequirementPathId:
+      name: rid
+      in: path
+      required: true
+      description: Requirement ID (snowflake decimal string) belonging to the version.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    RelationPathId:
+      name: relId
+      in: path
+      required: true
+      description: Requirement relation ID (snowflake decimal string) belonging to the version.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    AttachmentPathId:
+      name: aid
+      in: path
+      required: true
+      description: Attachment ID (snowflake decimal string) belonging to the requirement.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    ClarificationSessionPathId:
+      name: sid
+      in: path
+      required: true
+      description: Clarification session ID (snowflake decimal string) belonging to the version.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    QuestionPathId:
+      name: qid
+      in: path
+      required: true
+      description: Clarification question ID (snowflake decimal string) belonging to the version.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    DecisionPathId:
+      name: did
+      in: path
+      required: true
+      description: Decision ID (snowflake decimal string) belonging to the version.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    VersionStatusFilter:
+      name: status
+      in: query
+      required: false
+      description: Optional exact version status filter.
+      schema:
+        $ref: '#/components/schemas/VersionStatus'
+    RequirementStatusFilter:
+      name: status
+      in: query
+      required: false
+      description: Optional exact requirement status filter.
+      schema:
+        $ref: '#/components/schemas/RequirementStatus'
+    QuestionStatusFilter:
+      name: status
+      in: query
+      required: false
+      description: Optional exact question status filter.
+      schema:
+        $ref: '#/components/schemas/ClarificationQuestionStatus'
+    DecisionStatusFilter:
+      name: status
+      in: query
+      required: false
+      description: Optional exact decision status filter.
+      schema:
+        $ref: '#/components/schemas/ClarificationDecisionStatus'
+    QuestionRequirementFilter:
+      name: requirementId
+      in: query
+      required: false
+      description: Optional requirement ID filter (P3 snowflake decimal string).
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    BeforeId:
+      name: before_id
+      in: query
+      required: false
+      description: Return clarification messages with an ID lower than this P1 message ID (a number).
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
   responses:
     InvalidArgument:
       description: Invalid input (`invalid_argument` or `idempotency_conflict` for a reused key with a different body).
@@ -2970,6 +4355,57 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorEnvelope'
+    VersionConflict:
+      description: |
+        A P3 state or optimistic-lock conflict (`conflict`). `details.reason` is
+        one of `version_state_conflict` (the version status does not allow the
+        action), `requirement_state_conflict` (the requirement is not editable),
+        `open_questions_remaining` (confirming a requirement with open
+        questions), `unclarified_requirements` (entering design without
+        `acknowledgeUnclarified`; details add `unclarifiedRequirementIds` and
+        `openQuestionCount`), `duplicate_relation`, `duplicate_attachment`
+        (same requirement and sha256), `revision_conflict`,
+        `clarification_session_active`, `clarification_session_not_active`,
+        `clarification_session_required` (analyze/recon without an active
+        session), `clarification_question_state_conflict`,
+        `decision_state_conflict` or `agent_busy` (a run is already active on
+        the version channel). `details.field` is set when a request field is at
+        fault and `details.message` is always human-readable.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    VersionInvalid:
+      description: |
+        A semantically invalid P3 request (`invalid_argument`, HTTP 422).
+        `details.reason` is one of `requirements_required` (start clarification
+        without requirements), `relation_requirement_mismatch` (relation
+        endpoints from different versions), `attachment_too_large`,
+        `attachment_limit_exceeded`, `unsupported_attachment_type`,
+        `invalid_attachment_content`, `system_not_found`, `system_disabled`,
+        `environment_not_found`, `environment_system_mismatch`,
+        `code_repository_not_found`, `code_repository_disabled`,
+        `branch_not_found`, `path_not_found`, `path_not_git_repo` or
+        `resource_unavailable` (a bound P2 resource was deleted). Field-level
+        validation may instead use reasons such as `invalid_name`, `invalid_title`,
+        `invalid_priority`, `invalid_status`, `invalid_message`, `invalid_answer`,
+        `invalid_relation_type` or `invalid_commit`, always with `details.field`
+        and `details.message`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    VersionUnavailable:
+      description: |
+        An AI-dependent endpoint could not start (`unavailable`, HTTP 503)
+        because the Agent/LLM runtime is not configured or unavailable.
+        `details.reason` is `ai_unavailable` and `retryable` is true; manual
+        version, requirement, question, decision, relation and confirmation
+        endpoints keep working.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
   schemas:
     ErrorEnvelope:
       type: object
@@ -3014,7 +4450,10 @@ components:
                 may include `upstream_status`. Agent errors may include
                 `reason` (`run_active`, `profile_disabled`,
                 `llm_not_configured`, `tools_require_chat_completions`,
-                `capacity`) or `field` (the rejected request field).
+                `capacity`) or `field` (the rejected request field). P3 version
+                errors carry `reason` from the tables documented by
+                VersionConflict, VersionInvalid and VersionUnavailable, plus
+                `field`/`message` when applicable.
     User:
       type: object
       required: [id, username, role, status]
@@ -3386,15 +4825,22 @@ components:
           description: |
             `system` for the P0 platform stream. Each P1 Agent session publishes
             on `agent:{session_id}`; those channels require an administrator.
+            P3 version events publish on `version:{id}` and are readable by any
+            authenticated user through the version endpoints.
         type:
           type: string
           maxLength: 100
           description: |
             `system.test` for the P0 test publisher; `agent.activity` for every
-            P1 Agent activity (frozen V1 contract, see AgentActivityDetail).
+            P1 Agent activity (frozen V1 contract, see AgentActivityDetail); on
+            `version:{id}` channels the P3 catalog documented by VersionEventType
+            (including `clarification.context_updated`) and `agent.activity`.
         version_id:
           type: string
           nullable: true
+          description: |
+            Decimal-string version ID for P3 events and `agent.activity` on a
+            version channel; null otherwise.
         batch_id:
           type: string
           nullable: true
@@ -3411,6 +4857,7 @@ components:
         session_id:
           type: string
           nullable: true
+          description: Decimal-string session ID for events that reference a P1 Agent session.
         ts:
           type: string
           format: date-time
@@ -5263,3 +6710,1160 @@ components:
         status:
           type: string
           enum: [active, disabled]
+    VersionStatus:
+      type: string
+      description: |
+        Version lifecycle status (spec §6.1). P3 only reaches
+        `draft → clarifying → designing` through its actions; later values are
+        reserved for later phases and are accepted as filters for forward
+        compatibility.
+      enum:
+        - draft
+        - clarifying
+        - designing
+        - reviewing
+        - executing
+        - continuing
+        - completed
+        - archived
+    VersionResourceRef:
+      type: object
+      description: One resolved P2 resource binding; `available` is false after the resource was deleted.
+      required: [id, name, available]
+      properties:
+        id:
+          type: integer
+          format: int64
+          description: P2 resource ID; stays a number unlike P3-owned IDs.
+        name:
+          type: string
+        available:
+          type: boolean
+    VersionBindings:
+      type: object
+      description: The resolved bindings of a version; unbound entries are null.
+      required: [system, environment, codeRepository]
+      properties:
+        system:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/VersionResourceRef'
+        environment:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/VersionResourceRef'
+        codeRepository:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/VersionResourceRef'
+    Version:
+      type: object
+      description: |
+        `VersionDTO` (spec §7.2). `id` is a 64-bit snowflake serialized as a
+        decimal string; P2 resource IDs and user IDs stay numbers.
+      required:
+        - id
+        - name
+        - label
+        - description
+        - status
+        - systemId
+        - environmentId
+        - codeRepositoryId
+        - codeBranch
+        - codeBaselineCommit
+        - bindings
+        - requirementCount
+        - clarifiedCount
+        - openQuestionCount
+        - revision
+        - createdBy
+        - updatedBy
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          example: '1844674407370955161'
+          description: Snowflake ID as a decimal string; never convert it to a number.
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        label:
+          type: string
+          maxLength: 50
+        description:
+          type: string
+          maxLength: 20000
+        status:
+          $ref: '#/components/schemas/VersionStatus'
+        systemId:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+        environmentId:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+        codeRepositoryId:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+        codeBranch:
+          type: string
+          maxLength: 200
+          nullable: true
+        codeBaselineCommit:
+          type: string
+          pattern: '^[a-f0-9]{40}$'
+          nullable: true
+          description: Snapshot of the bound commit; only a rebind changes it.
+        bindings:
+          $ref: '#/components/schemas/VersionBindings'
+        requirementCount:
+          type: integer
+          minimum: 0
+        clarifiedCount:
+          type: integer
+          minimum: 0
+        openQuestionCount:
+          type: integer
+          minimum: 0
+        revision:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Optimistic-lock token; every PATCH/binding write must send it.
+        createdBy:
+          type: integer
+          format: int64
+          description: User ID; stays a number.
+        updatedBy:
+          type: integer
+          format: int64
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    VersionEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/Version'
+    VersionList:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Version'
+        next_cursor:
+          type: string
+          description: Opaque cursor for the next page; empty when `has_more` is false.
+        has_more:
+          type: boolean
+    CreateVersionRequest:
+      type: object
+      required: [name]
+      additionalProperties: false
+      description: Creates a `draft` version; bindings are optional. P2 resource IDs are numbers.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        label:
+          type: string
+          maxLength: 50
+        description:
+          type: string
+          maxLength: 20000
+        systemId:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+        environmentId:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+          description: Must belong to `systemId`.
+        codeRepositoryId:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+        codeBranch:
+          type: string
+          maxLength: 200
+          nullable: true
+        codeBaselineCommit:
+          type: string
+          pattern: '^[a-f0-9]{40}$'
+          nullable: true
+    UpdateVersionRequest:
+      type: object
+      required: [revision]
+      additionalProperties: false
+      description: |
+        Partial metadata update; omitted fields keep their value. `status` is not
+        writable and `revision` must match the stored revision.
+      properties:
+        revision:
+          type: integer
+          format: int64
+          minimum: 1
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        label:
+          type: string
+          maxLength: 50
+        description:
+          type: string
+          maxLength: 20000
+    PutVersionBindingsRequest:
+      type: object
+      required: [revision]
+      additionalProperties: false
+      description: |
+        Replaces the whole binding set. An omitted or `null` field clears that
+        binding; `environmentId` must belong to `systemId`. Only `draft` and
+        `clarifying` versions allow the write.
+      properties:
+        revision:
+          type: integer
+          format: int64
+          minimum: 1
+        systemId:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+        environmentId:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+        codeRepositoryId:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+        codeBranch:
+          type: string
+          maxLength: 200
+          nullable: true
+        codeBaselineCommit:
+          type: string
+          pattern: '^[a-f0-9]{40}$'
+          nullable: true
+    EnterDesignRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        acknowledgeUnclarified:
+          type: boolean
+          default: false
+          description: Required to proceed when unclarified requirements or open questions exist.
+    EnterDesignResult:
+      type: object
+      required: [version, warnings]
+      properties:
+        version:
+          $ref: '#/components/schemas/Version'
+        warnings:
+          type: array
+          items:
+            type: string
+          description: Human-readable warnings about unclarified work; empty when none remain.
+    EnterDesignEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/EnterDesignResult'
+    RequirementStatus:
+      type: string
+      description: |
+        Requirement lifecycle status (spec §6.2). P3 only reaches
+        `draft → clarified`; later values are reserved and accepted as filters.
+      enum: [draft, clarified, designed, verified, obsolete]
+    RequirementPriority:
+      type: string
+      enum: [must, should, could]
+    VersionSource:
+      type: string
+      description: Whether the record was authored by a human through the API or by the Agent.
+      enum: [user, ai]
+    Requirement:
+      type: object
+      description: |
+        `RequirementDTO` (spec §7.3). Every P3-owned ID is a decimal string;
+        user IDs stay numbers.
+      required:
+        - id
+        - versionId
+        - title
+        - description
+        - acceptanceCriteria
+        - priority
+        - status
+        - source
+        - lastUpdateSource
+        - revision
+        - confirmedAt
+        - confirmedBy
+        - openQuestionCount
+        - relationCount
+        - attachmentCount
+        - createdBy
+        - updatedBy
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        versionId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        title:
+          type: string
+          minLength: 1
+          maxLength: 300
+        description:
+          type: string
+          maxLength: 20000
+        acceptanceCriteria:
+          type: string
+          maxLength: 10000
+        priority:
+          $ref: '#/components/schemas/RequirementPriority'
+        status:
+          $ref: '#/components/schemas/RequirementStatus'
+        source:
+          $ref: '#/components/schemas/VersionSource'
+        lastUpdateSource:
+          $ref: '#/components/schemas/VersionSource'
+        revision:
+          type: integer
+          format: int64
+          minimum: 1
+        confirmedAt:
+          type: string
+          format: date-time
+          nullable: true
+        confirmedBy:
+          type: integer
+          format: int64
+          nullable: true
+          description: User ID; stays a number.
+        openQuestionCount:
+          type: integer
+          minimum: 0
+        relationCount:
+          type: integer
+          minimum: 0
+        attachmentCount:
+          type: integer
+          minimum: 0
+        createdBy:
+          type: integer
+          format: int64
+        updatedBy:
+          type: integer
+          format: int64
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    RequirementEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/Requirement'
+    RequirementList:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Requirement'
+        next_cursor:
+          type: string
+          description: Opaque cursor for the next page; empty when `has_more` is false.
+        has_more:
+          type: boolean
+    CreateRequirementRequest:
+      type: object
+      required: [title]
+      additionalProperties: false
+      description: Adds a `draft` requirement with `source=user`; the version status never changes.
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 300
+        description:
+          type: string
+          maxLength: 20000
+        acceptanceCriteria:
+          type: string
+          maxLength: 10000
+        priority:
+          allOf:
+            - $ref: '#/components/schemas/RequirementPriority'
+          description: Defaults to `should` when omitted.
+    UpdateRequirementRequest:
+      type: object
+      required: [revision]
+      additionalProperties: false
+      description: |
+        Edits a `draft` requirement. `revision` must match the stored revision;
+        a `clarified` requirement returns 409 `requirement_state_conflict`.
+      properties:
+        revision:
+          type: integer
+          format: int64
+          minimum: 1
+        title:
+          type: string
+          minLength: 1
+          maxLength: 300
+        description:
+          type: string
+          maxLength: 20000
+        acceptanceCriteria:
+          type: string
+          maxLength: 10000
+        priority:
+          $ref: '#/components/schemas/RequirementPriority'
+    RelationType:
+      type: string
+      description: |
+        Four relation kinds. `depends_on` is directed; the other three are
+        undirected for duplicate detection even though storage keeps a from/to
+        pair.
+      enum: [depends_on, conflicts_with, overlaps, shares_scope]
+    RequirementRelation:
+      type: object
+      description: Relation DTO (spec §7.4); both endpoint IDs are P3 decimal strings.
+      required:
+        - id
+        - versionId
+        - fromRequirementId
+        - toRequirementId
+        - relationType
+        - description
+        - source
+        - createdBy
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        versionId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        fromRequirementId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        toRequirementId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        relationType:
+          $ref: '#/components/schemas/RelationType'
+        description:
+          type: string
+        source:
+          $ref: '#/components/schemas/VersionSource'
+        createdBy:
+          type: integer
+          format: int64
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    RequirementRelationEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/RequirementRelation'
+    RequirementRelationList:
+      type: object
+      description: All relations of a version (no pagination; at most 500).
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/RequirementRelation'
+    CreateRelationRequest:
+      type: object
+      required: [fromRequirementId, toRequirementId, relationType]
+      additionalProperties: false
+      properties:
+        fromRequirementId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        toRequirementId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        relationType:
+          $ref: '#/components/schemas/RelationType'
+        description:
+          type: string
+    UpdateRelationRequest:
+      type: object
+      additionalProperties: false
+      description: Partial update; relations have no revision field. At least one field is expected.
+      properties:
+        relationType:
+          $ref: '#/components/schemas/RelationType'
+        description:
+          type: string
+    AttachmentKind:
+      type: string
+      enum: [text, image]
+    RequirementAttachment:
+      type: object
+      description: Attachment metadata (spec §6.7/§7.3); `storagePath` is never exposed.
+      required: [id, kind, filename, mimeType, sizeBytes, sha256, createdAt]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        kind:
+          $ref: '#/components/schemas/AttachmentKind'
+        filename:
+          type: string
+          description: Basename with Unicode preserved, control characters and path separators removed, at most 120 runes.
+        mimeType:
+          type: string
+          enum:
+            - text/plain
+            - text/markdown
+            - application/json
+            - application/yaml
+            - text/yaml
+            - image/png
+            - image/jpeg
+        sizeBytes:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 10485760
+        sha256:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        createdAt:
+          type: string
+          format: date-time
+    RequirementAttachmentEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/RequirementAttachment'
+    RequirementAttachmentList:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/RequirementAttachment'
+    ClarificationSessionStatus:
+      type: string
+      enum: [active, completed, cancelled]
+    ClarificationSession:
+      type: object
+      description: |
+        One version-level clarification session. `id` is a P3 snowflake string;
+        `agentSessionId` is the P1 Agent session and stays a number.
+      required:
+        - id
+        - status
+        - agentSessionId
+        - startedAt
+        - endedAt
+        - contextSummary
+        - summaryUpdatedAt
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        status:
+          $ref: '#/components/schemas/ClarificationSessionStatus'
+        agentSessionId:
+          type: integer
+          format: int64
+          nullable: true
+        startedAt:
+          type: string
+          format: date-time
+        endedAt:
+          type: string
+          format: date-time
+          nullable: true
+        contextSummary:
+          type: string
+          maxLength: 20480
+          description: Agent-maintained context summary (at most 20 KiB).
+        summaryUpdatedAt:
+          type: string
+          format: date-time
+          nullable: true
+    ClarificationSessionEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/ClarificationSession'
+    ClarificationQuestionCounts:
+      type: object
+      required: [open, answered, dismissed]
+      properties:
+        open:
+          type: integer
+          minimum: 0
+        answered:
+          type: integer
+          minimum: 0
+        dismissed:
+          type: integer
+          minimum: 0
+    ClarificationDecisionCounts:
+      type: object
+      required: [proposed, accepted, rejected]
+      properties:
+        proposed:
+          type: integer
+          minimum: 0
+        accepted:
+          type: integer
+          minimum: 0
+        rejected:
+          type: integer
+          minimum: 0
+    ClarificationOverview:
+      type: object
+      description: The active session is omitted (or null) before the first session is started.
+      required: [questions, decisions]
+      properties:
+        session:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/ClarificationSession'
+        questions:
+          $ref: '#/components/schemas/ClarificationQuestionCounts'
+        decisions:
+          $ref: '#/components/schemas/ClarificationDecisionCounts'
+    ClarificationOverviewEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/ClarificationOverview'
+    ClarificationMessageRole:
+      type: string
+      description: P1 message role exposed by the projection; system messages are filtered out.
+      enum: [user, assistant, tool]
+    ClarificationMessagePart:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+        text:
+          type: string
+    ClarificationToolCall:
+      type: object
+      required: [id, name, arguments]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        arguments:
+          type: string
+    ClarificationMessage:
+      type: object
+      description: One persisted P1 `agent_messages` row projected into the clarification history.
+      required: [id, role, parts, createdAt]
+      properties:
+        id:
+          type: integer
+          format: int64
+          description: P1 message ID; stays a number and is also the `before_id` cursor.
+        role:
+          $ref: '#/components/schemas/ClarificationMessageRole'
+        parts:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClarificationMessagePart'
+        reasoning:
+          type: string
+          nullable: true
+        toolCalls:
+          type: array
+          nullable: true
+          items:
+            $ref: '#/components/schemas/ClarificationToolCall'
+        toolName:
+          type: string
+          nullable: true
+        runId:
+          type: integer
+          format: int64
+          nullable: true
+          description: P1 run ID; stays a number.
+        createdAt:
+          type: string
+          format: date-time
+    ClarificationMessagePage:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClarificationMessage'
+        next_cursor:
+          type: string
+          description: Opaque cursor for the previous page; pass it as `before_id` to fetch older messages. Empty when there is no earlier page.
+        has_more:
+          type: boolean
+    SendClarificationMessageRequest:
+      type: object
+      required: [message]
+      additionalProperties: false
+      properties:
+        message:
+          type: string
+          minLength: 1
+          maxLength: 5000
+    SendClarificationMessageResult:
+      type: object
+      required: [sessionId, agentSessionId, runId, status]
+      properties:
+        sessionId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          description: P3 clarification session ID.
+        agentSessionId:
+          type: integer
+          format: int64
+        runId:
+          type: integer
+          format: int64
+        status:
+          type: string
+          enum: [running]
+    SendClarificationMessageResultEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/SendClarificationMessageResult'
+    ClarificationRunResult:
+      type: object
+      description: A one-shot analyze/recon run (202).
+      required: [agentSessionId, runId]
+      properties:
+        agentSessionId:
+          type: integer
+          format: int64
+        runId:
+          type: integer
+          format: int64
+    ClarificationRunResultEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/ClarificationRunResult'
+    ClarificationQuestionStatus:
+      type: string
+      enum: [open, answered, dismissed]
+    ClarificationSource:
+      type: string
+      enum: [user, ai]
+    ClarificationAnsweredVia:
+      type: string
+      enum: [ui, agent]
+    ClarificationQuestion:
+      type: object
+      description: Question DTO (spec §7.6); every P3-owned ID is a decimal string.
+      required:
+        - id
+        - versionId
+        - requirementId
+        - sessionId
+        - question
+        - status
+        - answer
+        - source
+        - answeredVia
+        - answeredBy
+        - answeredAt
+        - createdBy
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        versionId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        requirementId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+          description: Null for a version-level question.
+        sessionId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+        question:
+          type: string
+          minLength: 1
+          maxLength: 2000
+        status:
+          $ref: '#/components/schemas/ClarificationQuestionStatus'
+        answer:
+          type: string
+          maxLength: 5000
+        source:
+          $ref: '#/components/schemas/ClarificationSource'
+        answeredVia:
+          $ref: '#/components/schemas/ClarificationAnsweredVia'
+        answeredBy:
+          type: integer
+          format: int64
+          nullable: true
+        answeredAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdBy:
+          type: integer
+          format: int64
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    ClarificationQuestionEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/ClarificationQuestion'
+    ClarificationQuestionPage:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClarificationQuestion'
+        next_cursor:
+          type: string
+          description: Opaque cursor for the next page; empty when `has_more` is false.
+        has_more:
+          type: boolean
+    CreateClarificationQuestionRequest:
+      type: object
+      required: [question]
+      additionalProperties: false
+      properties:
+        question:
+          type: string
+          minLength: 1
+          maxLength: 2000
+        requirementId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+          description: Omit for a version-level question.
+    UpdateClarificationQuestionRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        Answer/dismiss/reopen or correct the text. Only allowed transitions are
+        `open → answered`, `open → dismissed` and `answered|dismissed → open`;
+        any other state change is 409 `clarification_question_state_conflict`.
+      properties:
+        status:
+          $ref: '#/components/schemas/ClarificationQuestionStatus'
+        question:
+          type: string
+          minLength: 1
+          maxLength: 2000
+        answer:
+          type: string
+          maxLength: 5000
+          description: Required when `status` is `answered`; cleared when reopening.
+    ClarificationDecisionStatus:
+      type: string
+      enum: [proposed, accepted, rejected]
+    ClarificationDecision:
+      type: object
+      description: Decision DTO (spec §7.6); every P3-owned ID is a decimal string.
+      required:
+        - id
+        - versionId
+        - requirementId
+        - questionId
+        - topic
+        - decision
+        - rationale
+        - status
+        - source
+        - proposedBy
+        - decidedBy
+        - decidedAt
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        versionId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        requirementId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+        questionId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+        topic:
+          type: string
+          minLength: 1
+          maxLength: 300
+        decision:
+          type: string
+          minLength: 1
+          maxLength: 5000
+        rationale:
+          type: string
+          maxLength: 5000
+        status:
+          $ref: '#/components/schemas/ClarificationDecisionStatus'
+        source:
+          $ref: '#/components/schemas/ClarificationSource'
+        proposedBy:
+          type: integer
+          format: int64
+        decidedBy:
+          type: integer
+          format: int64
+          nullable: true
+        decidedAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    ClarificationDecisionEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/ClarificationDecision'
+    ClarificationDecisionPage:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClarificationDecision'
+        next_cursor:
+          type: string
+          description: Opaque cursor for the next page; empty when `has_more` is false.
+        has_more:
+          type: boolean
+    CreateDecisionRequest:
+      type: object
+      required: [topic, decision]
+      additionalProperties: false
+      description: A human decision is stored as `accepted` with `source=user`.
+      properties:
+        topic:
+          type: string
+          minLength: 1
+          maxLength: 300
+        decision:
+          type: string
+          minLength: 1
+          maxLength: 5000
+        rationale:
+          type: string
+          maxLength: 5000
+        requirementId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+        questionId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+          description: When this decision is accepted, the linked open question is answered in the same transaction.
+    UpdateDecisionRequest:
+      type: object
+      required: [status]
+      additionalProperties: false
+      description: Only `proposed` decisions can transition; accepted/rejected are terminal.
+      properties:
+        status:
+          type: string
+          enum: [accepted, rejected]
+        rationale:
+          type: string
+          maxLength: 5000
+          description: Optional rejection rationale (reuses the rationale field).
+    VersionEventType:
+      type: string
+      description: |
+        The complete `channel=version:{id}` event catalog (spec §6.11 plus the
+        P3 `clarification.context_updated` addition). Types from the earlier
+        phases keep their V1 semantics; `agent.activity` keeps its frozen V1
+        nine-kind detail contract. `clarification.context_updated` is emitted by
+        the `context.summary_update` tool and carries
+        `detail.versionId` (decimal string), `detail.tool` and `detail.actorId`.
+      enum:
+        - version.created
+        - version.updated
+        - version.status_changed
+        - requirement.added
+        - requirement.updated
+        - requirement.clarified
+        - requirement.reopened
+        - requirement.deleted
+        - requirement.relation_added
+        - requirement.relation_updated
+        - requirement.relation_removed
+        - clarification.session_started
+        - clarification.session_completed
+        - clarification.question_updated
+        - clarification.context_updated
+        - decision.proposed
+        - decision.decided
+        - attachment.added
+        - attachment.removed
+        - agent.activity
+    VersionEvent:
+      type: object
+      description: |
+        One persisted event on `channel=version:{id}`. It uses the same V1
+        envelope as Event; `version_id` is always the decimal string version ID
+        and `refs` reference P3-owned IDs as strings.
+      required:
+        - seq
+        - channel
+        - type
+        - version_id
+        - batch_id
+        - case_id
+        - step_id
+        - agent_role
+        - session_id
+        - ts
+        - summary
+        - detail
+        - refs
+      properties:
+        seq:
+          type: integer
+          format: int64
+          description: Channel-local monotonic sequence.
+        channel:
+          type: string
+          maxLength: 64
+          description: Always `version:{id}` for this channel.
+        type:
+          $ref: '#/components/schemas/VersionEventType'
+        version_id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        batch_id:
+          type: string
+          nullable: true
+        case_id:
+          type: string
+          nullable: true
+        step_id:
+          type: string
+          nullable: true
+        agent_role:
+          type: string
+          nullable: true
+          description: Agent profile key for `agent.activity`; null for domain events.
+        session_id:
+          type: string
+          nullable: true
+          description: Decimal-string P1 Agent session ID when the event references one.
+        ts:
+          type: string
+          format: date-time
+        summary:
+          type: string
+          maxLength: 500
+        detail:
+          type: object
+          additionalProperties: true
+          description: |
+            Up to 64 KiB of valid JSON. P3 domain events include `actorId` and
+            `source`, and the referenced P3 ID (`requirementId`, `questionId`,
+            `decisionId`, `attachmentId`, ...) as decimal strings.
+        refs:
+          $ref: '#/components/schemas/EventRefs'
+    VersionEventSnapshot:
+      type: object
+      description: |
+        The flat P3 events snapshot (`{"data":[...], "snapshot_cursor",
+        "has_more"}`), unlike the nested P0 EventSnapshot.
+      required: [data, snapshot_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/VersionEvent'
+        snapshot_cursor:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The version channel's current seq; use it as the SSE `since`/`Last-Event-ID` base.
+        has_more:
+          type: boolean
