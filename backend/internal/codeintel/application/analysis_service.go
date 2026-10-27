@@ -1474,7 +1474,9 @@ func (s *AnalysisService) loadContractFacts(ctx context.Context, repoID int64, c
 // attributed to a file outside the change set (for example a route declared in
 // a router file while another file was analysed); headFacts (the bounded
 // contract scan) supplies the unchanged counterpart of a contract pair so T13
-// can propagate api→client. Precedence: materialized > headFacts > path scan.
+// can propagate api→client. The facts declared at those counterpart paths are
+// loaded too (R38), so T13 can continue client→page/component at the same path.
+// Precedence: materialized > headFacts > path scan > companion load.
 func (s *AnalysisService) factsAtHead(ctx context.Context, state *analysisRunState, changedPaths []string, materialized, headFacts map[string]domain.CodeEntity) ([]domain.CodeEntity, error) {
 	entities, err := s.deps.Entities.ListByPaths(ctx, state.analysis.RepoID, state.analysis.HeadCommit, changedPaths)
 	if err != nil {
@@ -1492,6 +1494,47 @@ func (s *AnalysisService) factsAtHead(ctx context.Context, state *analysisRunSta
 	for key, entity := range materialized {
 		byKey[key] = entity
 	}
+	// R38: the contract scan only loads the counterpart client_call/api fact
+	// itself. Companion facts at the counterpart's path (page/component/…) are
+	// what T13 indexes a propagation hit to, so load every fact at the
+	// counterpart paths that the changed-file scan did not already supply. The
+	// path list and the number of merged companion facts reuse MaxIndexFiles,
+	// the existing bound of one analysis' head fact scan.
+	companionPaths := contractCounterpartPaths(headFacts, changedPaths, s.config.MaxIndexFiles)
+	if len(companionPaths) > 0 {
+		companions, err := s.deps.Entities.ListByPaths(ctx, state.analysis.RepoID, state.analysis.HeadCommit, companionPaths)
+		if err != nil {
+			return nil, err
+		}
+		seenIDs := make(map[int64]struct{}, len(byKey))
+		for _, entity := range byKey {
+			if entity.ID != 0 {
+				seenIDs[entity.ID] = struct{}{}
+			}
+		}
+		added := 0
+		for _, entity := range companions {
+			if entity.FactKey == nil {
+				continue
+			}
+			if _, ok := byKey[*entity.FactKey]; ok {
+				continue
+			}
+			if entity.ID != 0 {
+				if _, ok := seenIDs[entity.ID]; ok {
+					continue
+				}
+			}
+			if added >= s.config.MaxIndexFiles {
+				break
+			}
+			byKey[*entity.FactKey] = entity
+			if entity.ID != 0 {
+				seenIDs[entity.ID] = struct{}{}
+			}
+			added++
+		}
+	}
 	facts := make([]domain.CodeEntity, 0, len(byKey))
 	for _, entity := range byKey {
 		facts = append(facts, entity)
@@ -1503,6 +1546,41 @@ func (s *AnalysisService) factsAtHead(ctx context.Context, state *analysisRunSta
 		return facts[i].ID < facts[j].ID
 	})
 	return facts, nil
+}
+
+// contractCounterpartPaths returns the deterministic, capped set of paths that
+// carry an eligible contract fact at head and are not part of the changed-file
+// scan. The head contract facts are the client_call/api facts of the bounded
+// contract scan; the changed paths are already loaded as a whole by
+// factsAtHead, so only the counterpart paths need a second read (R38).
+func contractCounterpartPaths(headFacts map[string]domain.CodeEntity, changedPaths []string, limit int) []string {
+	changed := make(map[string]struct{}, len(changedPaths))
+	for _, path := range changedPaths {
+		changed[path] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(headFacts))
+	paths := make([]string, 0, len(headFacts))
+	for _, entity := range headFacts {
+		if entity.Kind != domain.KindClientCall && entity.Kind != domain.KindAPI {
+			continue
+		}
+		if entity.Path == "" {
+			continue
+		}
+		if _, ok := changed[entity.Path]; ok {
+			continue
+		}
+		if _, ok := seen[entity.Path]; ok {
+			continue
+		}
+		seen[entity.Path] = struct{}{}
+		paths = append(paths, entity.Path)
+	}
+	sort.Strings(paths)
+	if limit > 0 && len(paths) > limit {
+		paths = paths[:limit]
+	}
+	return paths
 }
 
 // prepareCandidates assigns the application snowflake ids, the analysis id and
