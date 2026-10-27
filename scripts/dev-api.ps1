@@ -53,6 +53,12 @@ Import-DotEnv -Path $envPath
 # document reachable at the configured default path.
 $env:EZTEST_OPENAPI_PATH = Join-Path $repoRoot "docs\openapi\api.yaml"
 
+# Local development roots the read-only Agent file tools at the repository;
+# a non-empty value loaded from .env above takes precedence.
+if ([string]::IsNullOrWhiteSpace($env:EZTEST_AGENT_FILE_ROOT)) {
+    $env:EZTEST_AGENT_FILE_ROOT = $repoRoot
+}
+
 $dbScript = Join-Path $PSScriptRoot "db.ps1"
 # db.ps1 throws on failure, so a normal return means PostgreSQL is ready.
 & $dbScript start

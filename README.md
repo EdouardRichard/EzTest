@@ -33,7 +33,7 @@ P1 在 P0 的事件流、LLM 网关与权限模型之上增加一个可用的 Ag
 - 工具：`test.echo`、`test.fail` 始终注册；`file.list`/`file.read` 仅在 `EZTEST_AGENT_FILE_ROOT` 非空时注册（空值 = 不启用，默认）；`http.get` 只允许 `EZTEST_AGENT_HTTP_ALLOWLIST` 中的 host（默认 `127.0.0.1,localhost`）。工具调用、结果、错误与中止均写审计。
 - 事件契约 V1（冻结）：`type=agent.activity`、`channel=agent:{session_id}`、`agent_role=profile.key`、`session_id` 为字符串化会话 ID；`detail.kind` 共 9 类：`run_started`、`user_message`、`thinking`、`text`、`tool_use`、`tool_result`、`usage`、`decision`、`run_finished`。thinking/text 以 1500ms 或 1024 字符分片（`final` 标记），按 `(message_id, part)` 拼接；事件只带预览，完整内容用 message detail 端点懒加载。
 - 新增 4 个环境变量：`EZTEST_AGENT_FILE_ROOT`（空 = 禁用文件工具）、`EZTEST_AGENT_HTTP_ALLOWLIST`、`EZTEST_AGENT_TOOL_TIMEOUT_MS`（默认 10000）、`EZTEST_AGENT_MAX_CONCURRENT_RUNS`（默认 4），详见下方环境变量表。
-- 本地启动：先按「本地启动」运行 API/Web，管理员登录后进入 `/agents`。要让文件工具可用，在 `.env` 设置 `EZTEST_AGENT_FILE_ROOT=<仓库根绝对路径>`；内置 profile 的 `allowed_tools` 已列出文件工具，未设置时运行时会拒绝调用（启用后重新保存 profile）。
+- 本地启动：先按「本地启动」运行 API/Web，管理员登录后进入 `/agents`。要让文件工具可用，设置 `EZTEST_AGENT_FILE_ROOT=<仓库根绝对路径>` 并重启 API（`scripts/dev-api.ps1` 在未设置时默认使用仓库根，`.env` 显式设置优先）；内置 profile 的 `allowed_tools` 已列出文件工具，未设置时运行时会拒绝调用。通常无需重新保存 profile，只有曾在禁用状态下把文件工具从白名单移除过，才需要在启用后重新保存。
 - 测试：Agent 单元/集成套件 `go test ./internal/agent/...` 与 `go test -tags=integration ./internal/agent/...`；`scripts/e2e.ps1` 会启动 fake 上游 `scripts/fake-llm.cjs`（默认 13334）并覆盖 `llm_*`，P0+P1 E2E 不产生真实费用。真实 `deepseek-flash` 的思考 + 工具验收是 gated（见下文「真实 LLM（gated）」）。
 
 ## 技术架构
@@ -141,7 +141,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/db.ps1 start
 | `EZTEST_ENABLE_TEST_ENDPOINTS` | 否 | 是否注册 `POST /api/admin/stream/test-events`，dev 默认 true。 |
 | `EZTEST_LOG_LEVEL` | 否 | `debug` / `info` / `warn` / `error`。 |
 | `EZTEST_OPENAPI_PATH` | 否 | OpenAPI 文件路径，默认 `docs/openapi/api.yaml`；相对路径以进程工作目录为准，`dev-api.ps1` 会设为绝对路径。 |
-| `EZTEST_AGENT_FILE_ROOT` | 否 | `file.list`/`file.read` 的只读根；**空 = 不注册文件工具**（安全默认）。本地开发设为仓库根。 |
+| `EZTEST_AGENT_FILE_ROOT` | 否 | `file.list`/`file.read` 的只读根；**空 = 不注册文件工具**（安全默认）。本地用 `scripts/dev-api.ps1` 时未设置则默认仓库根。 |
 | `EZTEST_AGENT_HTTP_ALLOWLIST` | 否 | `http.get` 允许的 host 列表（逗号分隔，可含端口），默认 `127.0.0.1,localhost`；空列表启动失败。 |
 | `EZTEST_AGENT_TOOL_TIMEOUT_MS` | 否 | 单工具超时，1000–60000 ms，默认 `10000`。 |
 | `EZTEST_AGENT_MAX_CONCURRENT_RUNS` | 否 | 全局并发 run 上限，1–32，默认 `4`。 |
@@ -192,7 +192,7 @@ cd frontend
 pnpm dev
 ```
 
-首次登录使用 `EZTEST_ADMIN_USERNAME` / `EZTEST_ADMIN_PASSWORD`（默认用户 `admin`）。本地要让 Agent 文件工具可用，请在 `.env` 设置 `EZTEST_AGENT_FILE_ROOT=<仓库根绝对路径>`；否则内置 profile 虽然列出文件工具，运行时也会拒绝调用。
+首次登录使用 `EZTEST_ADMIN_USERNAME` / `EZTEST_ADMIN_PASSWORD`（默认用户 `admin`）。本地启用 Agent 文件工具的方式见上节「P1 Agent 运行时」。
 
 ### 开发管理员密码
 
