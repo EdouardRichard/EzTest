@@ -43,13 +43,14 @@
 | Wave | Tasks | 并行规则 |
 |---|---|---|
 | W0（串行门禁） | T1 → T2 | T2 未完成不进入 W1 |
-| W1 | T3 ∥ T4 ∥ T5 ∥ T6 ∥ T7 ∥ T8 ∥ T9 ∥ T10 | 8 个任务写作用域互斥，可并行 |
-| W2 | T11 ∥ T12 ∥ T13 ∥ T14 ∥ T15 | 5 个任务写作用域互斥，可并行 |
+| W1 | T3 → T4 → T5 → T6；T7 ∥ T8 ∥ T9 ∥ T10 | 同包后端串行链；T7/T8/T9/T10 并行 |
+| W2 | T11 → T12 → T13 → T14；T15 | 同包后端串行链；T15 并行 |
 | W3 | T16 ∥ T17 | 前端会话页与后端装配互斥，可并行 |
 | W4 | T18 ∥ T19 | E2E 与验收脚本/文档互斥，可并行 |
 | W5 | T20 | 串行（全量回归 + 人工验收 + 最终评审） |
 
 - 同一 Wave 的任务派发给独立 subagent；每个 task 的 `**写作用域**` 是该 subagent 唯一允许修改的路径前缀。
+- **同包串行**：T3–T6 同属 `infrastructure/postgres` 包、T11–T14 同属 `application` 与 `interfaces/httpapi` 包；并行写会让彼此编译到半成品文件，因此后端同包任务按表中的串行链执行。前端/脚本/独立包任务仍并行。
 - 并行实现者**不 commit**；改动留工作区并报告文件清单；Lead 只 stage 该任务写作用域并提交，保证 per-task review range。
 - 跨 Wave 依赖未完成前不得启动后续任务；接口以各任务 `Interfaces → Produces` 为准。
 - T14/T15 依次修改 `ResourcesPage.tsx`，因此分属 W2/W3 串行；其余同 Wave 任务不共享文件。
@@ -383,7 +384,7 @@ git commit -m "feat: add P2 resource schema, domain model, ports and HTTP helper
 
 ### Task 3: Catalog PostgreSQL 仓储（System/Environment/AppModel/Company）
 
-**Wave:** W1 · **并发:** 可并发（与 T4/T5/T6/T7/T8/T9/T10） · **依赖:** T2
+**Wave:** W1 · **并发:** 串行（同 postgres 包；与 T7/T8/T9/T10 并行） · **依赖:** T2
 **写作用域:** `backend/internal/resource/infrastructure/postgres/catalog_repository.go`, `backend/internal/resource/infrastructure/postgres/catalog_repository_integration_test.go`
 
 **Files:**
@@ -439,7 +440,7 @@ git commit -m "feat: add catalog postgres repository"
 
 ### Task 4: Access PostgreSQL 仓储（Account/Access）
 
-**Wave:** W1 · **并发:** 可并发（与 T3/T5/T6/T7/T8/T9/T10） · **依赖:** T2
+**Wave:** W1 · **并发:** 串行（依赖 T3；与 T7/T8/T9/T10 并行） · **依赖:** T3
 **写作用域:** `backend/internal/resource/infrastructure/postgres/access_repository.go`, `backend/internal/resource/infrastructure/postgres/access_repository_integration_test.go`
 
 **Files:**
@@ -476,7 +477,7 @@ git commit -m "feat: add access postgres repository"
 
 ### Task 5: Session PostgreSQL 仓储（Session/Snapshot/Lease/Takeover）
 
-**Wave:** W1 · **并发:** 可并发（与 T3/T4/T6/T7/T8/T9/T10） · **依赖:** T2
+**Wave:** W1 · **并发:** 串行（依赖 T4；与 T7/T8/T9/T10 并行） · **依赖:** T4
 **写作用域:** `backend/internal/resource/infrastructure/postgres/session_repository.go`, `backend/internal/resource/infrastructure/postgres/session_repository_integration_test.go`
 
 **Files:**
@@ -527,7 +528,7 @@ git commit -m "feat: add session postgres repository"
 
 ### Task 6: CodeRepository 仓储与只读 Git 校验器
 
-**Wave:** W1 · **并发:** 可并发（与 T3/T4/T5/T7/T8/T9/T10） · **依赖:** T2
+**Wave:** W1 · **并发:** 串行（依赖 T5；与 T7/T8/T9/T10 并行） · **依赖:** T5
 **写作用域:** `backend/internal/resource/infrastructure/postgres/code_repo_repository.go`, `backend/internal/resource/infrastructure/postgres/code_repo_repository_integration_test.go`, `backend/internal/resource/infrastructure/gitexec/`
 
 **Files:**
@@ -596,7 +597,7 @@ git commit -m "feat: add code repository storage and read-only git validator"
 
 ### Task 7: HTTP login_check 客户端
 
-**Wave:** W1 · **并发:** 可并发（与 T3/T4/T5/T6/T8/T9/T10） · **依赖:** T2
+**Wave:** W1 · **并发:** 可并发（与 T3–T6 串行链、T8/T9/T10 并行） · **依赖:** T2
 **写作用域:** `backend/internal/resource/infrastructure/httpcheck/`
 
 **Files:**
@@ -651,7 +652,7 @@ git commit -m "feat: add read-only login check client"
 
 ### Task 8: 前端资源页骨架、系统与环境、共享 API 类型
 
-**Wave:** W1 · **并发:** 可并发（与 T3/T4/T5/T6/T7/T9/T10） · **依赖:** T2
+**Wave:** W1 · **并发:** 可并发（与 T3–T7、T9/T10 并行） · **依赖:** T2
 **写作用域:** `frontend/src/features/resources/`, `frontend/src/app/(app)/resources/page.tsx`
 
 **Files:**
@@ -765,7 +766,7 @@ git commit -m "feat: add resource shell, systems and environments panels"
 
 ### Task 9: 前端代码仓页
 
-**Wave:** W1 · **并发:** 可并发（与 T3/T4/T5/T6/T7/T8/T10） · **依赖:** T2
+**Wave:** W1 · **并发:** 可并发（与 T3–T8、T10 并行） · **依赖:** T2
 **写作用域:** `frontend/src/features/code-repos/`, `frontend/src/app/(app)/code-repos/page.tsx`
 
 **Files:**
@@ -817,7 +818,7 @@ git commit -m "feat: add code repositories page"
 
 ### Task 10: fixture target 与 e2e 启动接线
 
-**Wave:** W1 · **并发:** 可并发（与 T3/T4/T5/T6/T7/T8/T9） · **依赖:** T2
+**Wave:** W1 · **并发:** 可并发（与 T3–T9 并行） · **依赖:** T2
 **写作用域:** `scripts/fixture-target.cjs`, `scripts/e2e.ps1`
 
 **Files:**
@@ -867,7 +868,7 @@ git commit -m "test: add deterministic fixture target for P2 session flows"
 
 ### Task 11: Catalog 应用服务与 HTTP Handler
 
-**Wave:** W2 · **并发:** 可并发（与 T12/T13/T14/T15） · **依赖:** T3
+**Wave:** W2 · **并发:** 串行（同 application/httpapi 包；与 T15 并行） · **依赖:** T3
 **写作用域:** `backend/internal/resource/application/catalog_service.go`, `backend/internal/resource/application/catalog_service_test.go`, `backend/internal/resource/interfaces/httpapi/handlers_catalog.go`, `backend/internal/resource/interfaces/httpapi/handlers_catalog_test.go`
 
 **Files:**
@@ -955,7 +956,7 @@ git commit -m "feat: add catalog application service and resource handlers"
 
 ### Task 12: Access 应用服务与 HTTP Handler
 
-**Wave:** W2 · **并发:** 可并发（与 T11/T13/T14/T15） · **依赖:** T3、T4
+**Wave:** W2 · **并发:** 串行（依赖 T11；与 T15 并行） · **依赖:** T4
 **写作用域:** `backend/internal/resource/application/access_service.go`, `backend/internal/resource/application/access_service_test.go`, `backend/internal/resource/interfaces/httpapi/handlers_access.go`, `backend/internal/resource/interfaces/httpapi/handlers_access_test.go`
 
 **Files:**
@@ -1026,7 +1027,7 @@ git commit -m "feat: add account and access application service and handlers"
 
 ### Task 13: Session 应用服务与 HTTP Handler（含接管/租约）
 
-**Wave:** W2 · **并发:** 可并发（与 T11/T12/T14/T15） · **依赖:** T3、T4、T5、T7
+**Wave:** W2 · **并发:** 串行（依赖 T12；与 T15 并行） · **依赖:** T5、T7
 **写作用域:** `backend/internal/resource/application/session_service.go`, `backend/internal/resource/application/session_service_test.go`, `backend/internal/resource/interfaces/httpapi/handlers_session.go`, `backend/internal/resource/interfaces/httpapi/handlers_session_test.go`
 
 **Files:**
@@ -1107,7 +1108,7 @@ git commit -m "feat: add session import validation takeover and lease services"
 
 ### Task 14: CodeRepo 应用服务与 HTTP Handler
 
-**Wave:** W2 · **并发:** 可并发（与 T11/T12/T13/T15） · **依赖:** T6
+**Wave:** W2 · **并发:** 串行（依赖 T13；与 T15 并行） · **依赖:** T6
 **写作用域:** `backend/internal/resource/application/coderepo_service.go`, `backend/internal/resource/application/coderepo_service_test.go`, `backend/internal/resource/interfaces/httpapi/handlers_coderepo.go`, `backend/internal/resource/interfaces/httpapi/handlers_coderepo_test.go`
 
 **Files:**
@@ -1168,7 +1169,7 @@ git commit -m "feat: add code repository service and handlers"
 
 ### Task 15: 前端应用模型、账号与 Access 面板
 
-**Wave:** W2 · **并发:** 可并发（与 T11/T12/T13/T14） · **依赖:** T8
+**Wave:** W2 · **并发:** 可并发（与 T11–T14 后端串行链） · **依赖:** T8
 **写作用域:** `frontend/src/features/resources/AppModelsPanel.tsx`, `AppModelImportDialog.tsx`, `AccountsPanel.tsx`, `AccessForm.tsx`, `ResourcesPage.tsx`, `*.test.tsx`（仅新增上述组件的测试）
 
 **Files:**
