@@ -140,8 +140,16 @@ func (ex *runExecution) execute(ctx context.Context) {
 		"run_seconds":       ex.profile.RunSeconds,
 	})
 
+	// The initial history read happens before the tool loop. A stop that lands
+	// during that read must terminate the run as aborted, not as a model or
+	// internal failure (the read itself fails with the context error).
+	ex.stage = runStageBetween
 	history, err := service.deps.Messages.ListBySession(hardCtx, ex.session.ID)
 	if err != nil {
+		if cause := context.Cause(hardCtx); cause != nil {
+			ex.finishAborted(ctx, cause)
+			return
+		}
 		slog.ErrorContext(ctx, "agent: load run history", "run_id", ex.runID, "error", err)
 		ex.finish(ctx, domain.RunFailed, domain.ReasonModelError, runFinishOptions{
 			errorCode:    errorCodeInternal,
@@ -150,7 +158,6 @@ func (ex *runExecution) execute(ctx context.Context) {
 		return
 	}
 	ex.history = history
-	ex.stage = runStageBetween
 
 	for {
 		ex.stage = runStageBetween
@@ -179,6 +186,12 @@ func (ex *runExecution) execute(ctx context.Context) {
 		budgetChars := window - max(2048, window/4) - 2000
 		built, err := service.deps.Context.Build(ex.profile.SystemPrompt, ex.history, budgetChars)
 		if err != nil {
+			// The stage is "between" here; a stop that landed while the context
+			// was assembled wins over the build error.
+			if cause := context.Cause(hardCtx); cause != nil {
+				ex.finishAborted(ctx, cause)
+				return
+			}
 			if errors.Is(err, domain.ErrContextOverflow) {
 				ex.finish(ctx, domain.RunFailed, domain.ReasonContextOverflow, runFinishOptions{
 					errorCode:    "context_overflow",
@@ -218,6 +231,7 @@ func (ex *runExecution) execute(ctx context.Context) {
 		stream, streamErr := ex.caller.ChatStream(hardCtx, request)
 		if streamErr != nil {
 			if cause := context.Cause(hardCtx); cause != nil {
+				ex.completeEmptyAssistant(ctx, assistantID)
 				ex.finishAborted(ctx, cause)
 				return
 			}
@@ -509,6 +523,22 @@ func (ex *runExecution) finishAborted(ctx context.Context, cause error) {
 		lastToolName:    ex.lastToolName,
 		lastToolPending: ex.lastToolPending || ex.stage == runStageTools,
 	})
+}
+
+// completeEmptyAssistant persists the assistant placeholder as completed with
+// empty content when the run aborts after the placeholder exists but before any
+// stream output arrived. The stream abort path completes its message the same
+// way, so history never keeps an unanswered placeholder.
+func (ex *runExecution) completeEmptyAssistant(ctx context.Context, assistantID int64) {
+	if assistantID == 0 {
+		return
+	}
+	err := ex.service.deps.Messages.CompleteAssistant(
+		runNoCancelContext(ctx), assistantID, []domain.Part{}, "", nil, nil,
+	)
+	if err != nil {
+		slog.ErrorContext(ctx, "agent: complete assistant message", "run_id", ex.runID, "message_id", assistantID, "error", err)
+	}
 }
 
 // finish writes the terminal run row and only then publishes run_finished. A

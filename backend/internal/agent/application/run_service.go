@@ -179,6 +179,15 @@ func (s *RunService) Start(ctx context.Context, sessionID int64, message string,
 		return domain.StartResult{}, err
 	}
 
+	// Register the run before publishing user_message so a stop that lands
+	// between the turn insert and the goroutine launch can still cancel it.
+	// Registration publishes nothing, so the activity order (user_message
+	// before run_started) is unchanged.
+	runCtx, cancel := context.WithCancelCause(s.rootCtx)
+	s.mu.Lock()
+	s.active[sessionID] = activeRun{runID: ids.RunID, cancel: cancel}
+	s.mu.Unlock()
+
 	// The user_message activity is published before the runner starts so it
 	// always precedes run_started (spec §9.1).
 	emitter := newActivityEmitter(s.deps.Events, sessionID, profile.Key)
@@ -189,17 +198,17 @@ func (s *RunService) Start(ctx context.Context, sessionID int64, message string,
 		"truncated":  truncated,
 	})
 
-	runCtx, cancel := context.WithCancelCause(s.rootCtx)
-	s.mu.Lock()
-	s.active[sessionID] = activeRun{runID: ids.RunID, cancel: cancel}
-	s.mu.Unlock()
-
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
 		defer func() {
 			s.mu.Lock()
-			delete(s.active, sessionID)
+			// Only remove this run's entry: the run writes its terminal row
+			// before this cleanup runs, so a successor run may already have
+			// registered for the same session.
+			if current, ok := s.active[sessionID]; ok && current.runID == ids.RunID {
+				delete(s.active, sessionID)
+			}
 			s.mu.Unlock()
 			cancel(nil)
 			<-s.sem
@@ -210,9 +219,14 @@ func (s *RunService) Start(ctx context.Context, sessionID int64, message string,
 	return domain.StartResult{RunID: ids.RunID, UserMessageID: ids.UserMessageID}, nil
 }
 
-// Abort cancels the session's active run with the user_abort cause. When the
-// session is idle it reports "idle" instead of an error.
+// Abort cancels the session's active run with the user_abort cause. A missing
+// session is domain.ErrNotFound (the HTTP layer maps it to 404); an existing
+// idle session reports "idle" instead of an error.
 func (s *RunService) Abort(ctx context.Context, sessionID int64, actor *int64) (domain.AbortResult, error) {
+	if _, err := s.deps.Sessions.Get(ctx, sessionID); err != nil {
+		return domain.AbortResult{}, err
+	}
+
 	s.mu.Lock()
 	run, active := s.active[sessionID]
 	s.mu.Unlock()
