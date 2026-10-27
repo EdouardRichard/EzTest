@@ -32,6 +32,37 @@ const FAILTOOL_ARGUMENTS = JSON.stringify({ mode: "error", message: "fake-llm FA
 const SLOW_CHUNK_COUNT = 20;
 const SLOW_CHUNK_INTERVAL_MS = 300;
 
+// --- P3 deterministic clarification scenarios (design spec §10.2) ----------
+//
+// P3 requests are identified by stable markers in the latest user message
+// (P3-CLARIFY-1/P3-CLARIFY-2) or by the one-shot analyze/recon instructions.
+// Every turn first reads the real version context through version.context_get,
+// then emits one tool call per turn so the persisted P1 history (and the
+// transcript folding) exercise the real tool path. Only tool effects are
+// asserted by Playwright; the reply markers exist to know when a run ended.
+const P3_ENABLED = process.env.EZTEST_FAKE_LLM_P3 !== "0";
+const P3_TOOL_USAGE = makeUsage(180, 12, 8);
+const P3_TEXT_USAGE = makeUsage(220, 10, 0);
+
+const P3 = {
+  QUESTION_ONE: "P3 问题一：订单金额达到多少需要人工审核？",
+  QUESTION_TWO: "P3 问题二：退款是否需要原路退回？",
+  DRAFT_DESCRIPTION: "P3 草案更新：已补充人工审核阈值说明。",
+  DECISION_TOPIC: "P3 退款政策",
+  DECISION_TEXT: "P3 决策：支持 7 天无理由退款",
+  DECISION_RATIONALE: "P3 决策理由：客户退款体验优先。",
+  RELATION_DESCRIPTION: "P3 关系建议：取消依赖创建后的库存状态。",
+  CLARIFY_ONE_REPLY: "P3 第一轮完成：已记录问题并更新需求草案。",
+  CLARIFY_TWO_REPLY: "P3 第二轮完成：已提交关系与决策建议，请人工确认。",
+  ANALYSIS_RELATION_DESCRIPTION: "P3 分析关系建议：退款与结算共享金额口径。",
+  ANALYSIS_TOPIC: "P3 分析结论",
+  ANALYSIS_DECISION: "P3 分析决策：退款与结算金额口径需一致。",
+  ANALYSIS_REPLY: "P3 分析完成：已提交关系与决策建议。",
+  RECON_SUMMARY: "P3 上下文摘要：已读取文本附件、截图与绑定代码；业务规则与未决问题已记录。",
+  RECON_REPLY: "P3 侦察完成：已记录上下文摘要。",
+};
+
+
 const MODELS_BODY = {
   data: [
     {
@@ -96,8 +127,8 @@ function completionBody(message, finishReason, usage) {
   };
 }
 
-function toolCallPayload(name, args) {
-  return [{ id: TOOL_CALL_ID, type: "function", function: { name, arguments: args } }];
+function toolCallPayload(name, args, id) {
+  return [{ id: id || TOOL_CALL_ID, type: "function", function: { name, arguments: args } }];
 }
 
 function streamChunk(delta, finishReason, usage) {
@@ -212,6 +243,263 @@ function splitText(text, parts) {
   return chunks;
 }
 
+// --- P3 scripted behaviors -------------------------------------------------
+
+function findLastUserMessage(messages) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message && message.role === "user") {
+      return { index, text: extractText(message.content) };
+    }
+  }
+  return null;
+}
+
+function parseJsonObject(text) {
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Describes the P3 run that owns the trailing tool turns: how many tool-call
+ * turns already happened after the marker user message, the latest parsed
+ * version.context_get payload and the latest question-upsert result.
+ */
+function describeP3Run(messages, lastUserIndex) {
+  const callNames = new Map();
+  const toolResults = [];
+  let step = 0;
+  for (let index = lastUserIndex + 1; index < messages.length; index += 1) {
+    const message = messages[index];
+    if (!message) continue;
+    if (message.role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+      step += 1;
+      for (const call of message.tool_calls) {
+        if (call && call.id) callNames.set(call.id, call.function ? call.function.name : "");
+      }
+      continue;
+    }
+    if (message.role === "tool") {
+      toolResults.push({
+        name: callNames.get(message.tool_call_id) || "",
+        text: extractText(message.content),
+      });
+    }
+  }
+  let context = null;
+  let questionId = null;
+  for (const result of toolResults) {
+    if (result.name === "version_context_get") {
+      const parsed = parseJsonObject(result.text);
+      if (parsed) context = parsed;
+    }
+    if (result.name === "clarification_question_upsert") {
+      const parsed = parseJsonObject(result.text);
+      if (parsed && typeof parsed.questionId === "string") questionId = parsed.questionId;
+    }
+  }
+  return { step, context, questionId };
+}
+
+/** Matches one P3 scenario from the latest user message; null for P1/P2. */
+function detectP3Scenario(text) {
+  const clarify = /P3-CLARIFY-(1|2)/.exec(text);
+  if (clarify) {
+    const versionMatch = /version(?:Id)?\s*[=:]\s*"?(\d+)"?/i.exec(text);
+    return {
+      kind: "clarification",
+      round: Number(clarify[1]),
+      versionId: versionMatch ? versionMatch[1] : "",
+    };
+  }
+  const analyze = /Analyze the requirements of version\s+(\d+)/i.exec(text);
+  if (analyze) return { kind: "analysis", versionId: analyze[1] };
+  const recon = /Recon the context of version\s+(\d+)/i.exec(text);
+  if (recon) return { kind: "recon", versionId: recon[1] };
+  return null;
+}
+
+function p3Tool(name, args, reasoning) {
+  return { kind: "tool", name, arguments: JSON.stringify(args), reasoning };
+}
+
+function p3Text(text) {
+  return { kind: "text", text };
+}
+
+function p3Requirements(context) {
+  return context && Array.isArray(context.requirements) ? context.requirements : [];
+}
+
+/** Plans exactly one P3 turn from the scenario, the run state and the context. */
+function planP3Turn(scenario, run) {
+  const context = run.context;
+  const versionId =
+    scenario.versionId ||
+    (context && context.version && typeof context.version.id === "string" ? context.version.id : "");
+  if (versionId === "") {
+    return p3Text("P3 无法确定版本上下文，本轮结束。");
+  }
+  const requirements = p3Requirements(context);
+  const first = requirements[0];
+  const second = requirements[1];
+
+  if (scenario.kind === "clarification") {
+    if (scenario.round === 1) {
+      if (run.step === 0) {
+        return p3Tool("version_context_get", { versionId }, "P3 场景：读取版本上下文");
+      }
+      if (run.step === 1 && first) {
+        return p3Tool(
+          "clarification_question_upsert",
+          { versionId, requirementId: first.id, question: P3.QUESTION_ONE },
+          "P3 场景：记录第一个澄清问题",
+        );
+      }
+      if (run.step === 2 && first) {
+        return p3Tool(
+          "requirement_update_draft",
+          {
+            versionId,
+            requirementId: first.id,
+            revision: first.revision,
+            patch: { description: P3.DRAFT_DESCRIPTION },
+          },
+          "P3 场景：把确认信息写回需求草案",
+        );
+      }
+      return p3Text(P3.CLARIFY_ONE_REPLY);
+    }
+    if (run.step === 0) {
+      return p3Tool("version_context_get", { versionId }, "P3 场景：读取第二轮上下文");
+    }
+    if (run.step === 1 && second) {
+      return p3Tool(
+        "clarification_question_upsert",
+        { versionId, requirementId: second.id, question: P3.QUESTION_TWO },
+        "P3 场景：记录第二个澄清问题",
+      );
+    }
+    if (run.step === 2 && run.questionId && second) {
+      return p3Tool(
+        "decision.propose",
+        {
+          versionId,
+          requirementId: second.id,
+          questionId: run.questionId,
+          topic: P3.DECISION_TOPIC,
+          decision: P3.DECISION_TEXT,
+          rationale: P3.DECISION_RATIONALE,
+        },
+        "P3 场景：提出等待人接受的决策建议",
+      );
+    }
+    if (run.step === 3 && first && second) {
+      return p3Tool(
+        "relation.propose",
+        {
+          versionId,
+          fromRequirementId: first.id,
+          toRequirementId: second.id,
+          relationType: "depends_on",
+          description: P3.RELATION_DESCRIPTION,
+        },
+        "P3 场景：提交需求关系建议",
+      );
+    }
+    return p3Text(P3.CLARIFY_TWO_REPLY);
+  }
+
+  if (scenario.kind === "analysis") {
+    if (run.step === 0) {
+      return p3Tool("version_context_get", { versionId }, "P3 场景：读取需求分析上下文");
+    }
+    if (run.step === 1 && first && second) {
+      return p3Tool(
+        "relation.propose",
+        {
+          versionId,
+          fromRequirementId: first.id,
+          toRequirementId: second.id,
+          relationType: "shares_scope",
+          description: P3.ANALYSIS_RELATION_DESCRIPTION,
+        },
+        "P3 场景：分析关系建议",
+      );
+    }
+    if (run.step === 2 && first) {
+      return p3Tool(
+        "decision.propose",
+        {
+          versionId,
+          requirementId: first.id,
+          topic: P3.ANALYSIS_TOPIC,
+          decision: P3.ANALYSIS_DECISION,
+        },
+        "P3 场景：提交分析结论",
+      );
+    }
+    return p3Text(P3.ANALYSIS_REPLY);
+  }
+
+  if (scenario.kind === "recon") {
+    if (run.step === 0) {
+      return p3Tool("version_context_get", { versionId }, "P3 场景：读取侦察上下文");
+    }
+    if (run.step === 1) {
+      return p3Tool(
+        "context.summary_update",
+        { versionId, summary: P3.RECON_SUMMARY },
+        "P3 场景：写入上下文摘要",
+      );
+    }
+    return p3Text(P3.RECON_REPLY);
+  }
+
+  return null;
+}
+
+/**
+ * Handles one P3 scenario request. Returns true when the request belonged to a
+ * P3 scenario, false so the P1/P2 behaviors below stay untouched.
+ */
+async function handleP3Scenario(messages, res, stream) {
+  if (!P3_ENABLED) return false;
+  const lastUser = findLastUserMessage(messages);
+  if (lastUser === null) return false;
+  const scenario = detectP3Scenario(lastUser.text);
+  if (scenario === null) return false;
+
+  const run = describeP3Run(messages, lastUser.index);
+  const plan = planP3Turn(scenario, run);
+  if (plan === null) return false;
+
+  if (plan.kind === "tool") {
+    const message = {
+      content: null,
+      reasoning_content: plan.reasoning,
+      tool_calls: toolCallPayload(plan.name, plan.arguments, `p3_call_${run.step + 1}`),
+    };
+    if (stream) {
+      await streamToolTurn(res, message, P3_TOOL_USAGE);
+      return true;
+    }
+    sendJson(res, 200, completionBody(message, "tool_calls", P3_TOOL_USAGE));
+    return true;
+  }
+
+  if (stream) {
+    await streamTextTurn(res, plan.text, P3_TEXT_USAGE);
+    return true;
+  }
+  sendJson(res, 200, completionBody({ content: plan.text }, "stop", P3_TEXT_USAGE));
+  return true;
+}
+
 // --- scripted behaviors ----------------------------------------------------
 
 function diagnosticMessage() {
@@ -310,6 +598,11 @@ async function handleChatCompletions(req, res) {
   const lastMessage = messages.length > 0 ? messages[messages.length - 1] : {};
   const lastRole = lastMessage && lastMessage.role;
   const stream = body.stream === true;
+
+  // The P3 clarification/analysis/recon scenarios own every request whose last
+  // user message carries their marker (or the one-shot instruction). P1/P2
+  // requests never match this detector and keep the original behavior.
+  if (await handleP3Scenario(messages, res, stream)) return;
 
   if (lastRole === "user") {
     const text = extractText(lastMessage.content);
