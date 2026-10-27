@@ -40,6 +40,11 @@ type EdgeRepository interface {
 // FactVersionRepository owns the append-only history of AI fact bodies.
 type FactVersionRepository interface {
 	Current(ctx context.Context, repoID int64, commit, factKey string) (*CodeEntity, int, error)
+	// GetVersion returns the canonical body stored for one fact version so the
+	// service can compare a newly computed body with the persisted one before
+	// deciding whether to reuse the version or bump it (design spec §6.4). A
+	// version that has no stored body is reported as a not-found error.
+	GetVersion(ctx context.Context, repoID int64, commit, factKey string, version int) ([]byte, error)
 	Create(ctx context.Context, repoID int64, commit, factKey, model, prompt string, version int, body []byte, analysisID int64) error
 	Supersede(ctx context.Context, repoID int64, commit, factKey string, before int, at time.Time) error
 }

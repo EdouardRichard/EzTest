@@ -325,6 +325,28 @@ func TestLoadCodeIntelOverrides(t *testing.T) {
 	}
 }
 
+// TestLoadCodeIntelPromptVersionLengthBoundary pins the prompt-version regex as
+// an inclusive length bound: 32 characters are accepted, 33 are rejected.
+func TestLoadCodeIntelPromptVersionLengthBoundary(t *testing.T) {
+	env := validEnv()
+	accepted := strings.Repeat("a", 32)
+	env["EZTEST_CODEINTEL_PROMPT_VERSION"] = accepted
+	cfg, err := Load(func(k string) string { return env[k] })
+	if err != nil {
+		t.Fatalf("Load rejected a 32-character prompt version: %v", err)
+	}
+	if cfg.CodeIntelPromptVersion != accepted {
+		t.Fatalf("CodeIntelPromptVersion=%q want %q", cfg.CodeIntelPromptVersion, accepted)
+	}
+
+	env["EZTEST_CODEINTEL_PROMPT_VERSION"] = accepted + "a"
+	if _, err := Load(func(k string) string { return env[k] }); err == nil {
+		t.Fatal("Load accepted a 33-character prompt version")
+	} else if !strings.Contains(err.Error(), "EZTEST_CODEINTEL_PROMPT_VERSION") {
+		t.Fatalf("error %q does not name EZTEST_CODEINTEL_PROMPT_VERSION", err)
+	}
+}
+
 // TestLoadCodeIntelRejectsOutOfRange proves every P4 bound is validated at
 // startup with an error naming the offending environment variable.
 func TestLoadCodeIntelRejectsOutOfRange(t *testing.T) {

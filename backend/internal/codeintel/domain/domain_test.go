@@ -20,6 +20,7 @@ func TestFactKey(t *testing.T) {
 		{KindAPI, "post /api/refund", "", "api:POST /api/refund"},
 		{KindAPI, "GET /api/orders/{id}", "", "api:GET /api/orders/{}"},
 		{KindClientCall, "post https://x.test/api/refund/42?x=1", "", "client:POST /api/refund/{}"},
+		{KindClientCall, "post https://x.test?q=1", "", "client:POST /"},
 		{KindComponent, "OrdersPage", "src/pages/OrdersPage.tsx", "component:src/pages/OrdersPage.tsx#OrdersPage"},
 		{KindModule, "refund", "server/refund.go", "symbol:server/refund.go#refund"},
 		{KindSymbol, "Refund", "src/refund.ts", "symbol:src/refund.ts#Refund"},
@@ -66,6 +67,24 @@ func TestFactKeyRejectsUnkeyableFacts(t *testing.T) {
 	}
 }
 
+// TestFactKeyLengthBoundary pins MaxFactKeyChars as an inclusive upper bound: a
+// key of exactly 512 characters is accepted, one character more is rejected.
+func TestFactKeyLengthBoundary(t *testing.T) {
+	// route: + "/" + name -> 6 + 1 + len(name); 505 keeps the key at 512.
+	name := strings.Repeat("a", MaxFactKeyChars-len("route:")-1)
+	key, err := FactKey(KindRoute, name, "")
+	if err != nil {
+		t.Fatalf("FactKey rejected a %d-character key at the limit: %v", MaxFactKeyChars, err)
+	}
+	if len(key) != MaxFactKeyChars {
+		t.Fatalf("key length=%d want %d", len(key), MaxFactKeyChars)
+	}
+
+	if _, err := FactKey(KindRoute, name+"a", ""); err == nil {
+		t.Fatalf("FactKey accepted a %d-character key beyond the limit", MaxFactKeyChars+1)
+	}
+}
+
 func TestFactKeyIsDeterministic(t *testing.T) {
 	first, err := FactKey(KindAPI, "POST https://x.test/api//orders/42/?q=1", "")
 	if err != nil {
@@ -99,6 +118,9 @@ func TestNormalizeMethodPath(t *testing.T) {
 		{"", "GET /api//refund/", "GET", "/api/refund"},
 		{"", "get /api/users/<id>", "GET", "/api/users/{}"},
 		{"GET", "https://x.test:8443/a/b#frag", "GET", "/a/b"},
+		{"GET", "https://x.test", "GET", "/"},
+		{"GET", "https://x.test?q=1", "GET", "/"},
+		{"", "post https://x.test#frag", "POST", "/"},
 		{"GET", "/", "GET", "/"},
 		{"GET", "/Orders/42", "GET", "/Orders/{}"},
 		{"GET", "orders", "GET", "/orders"},
@@ -156,6 +178,25 @@ func candidateIDs(candidates []ImpactCandidate) []int64 {
 		ids[i] = c.ID
 	}
 	return ids
+}
+
+// TestCandidateOrderTieBreak pins the deterministic tie-breaks below the four
+// spec keys: candidates sharing source, confidence and subject kind order by
+// subject ID, and full ties order by candidate ID (INV-4).
+func TestCandidateOrderTieBreak(t *testing.T) {
+	candidates := []ImpactCandidate{
+		{ID: 30, Source: CandidateDirect, Confidence: ConfidenceHigh, SubjectKind: CandidateRequirement, SubjectID: 7},
+		{ID: 10, Source: CandidateDirect, Confidence: ConfidenceHigh, SubjectKind: CandidateRequirement, SubjectID: 2},
+		{ID: 20, Source: CandidateDirect, Confidence: ConfidenceHigh, SubjectKind: CandidateRequirement, SubjectID: 7},
+	}
+	SortCandidates(candidates)
+
+	wantIDs := []int64{10, 20, 30}
+	for i, want := range wantIDs {
+		if candidates[i].ID != want {
+			t.Fatalf("candidates[%d].ID=%d want %d (order=%v)", i, candidates[i].ID, want, candidateIDs(candidates))
+		}
+	}
 }
 
 func TestValidateSubjectKind(t *testing.T) {

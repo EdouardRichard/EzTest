@@ -11,7 +11,8 @@ import (
 // matching (design spec §6.5):
 //
 //  1. the method is upper-cased;
-//  2. an absolute URL contributes only its path, query and fragment are
+//  2. an absolute URL contributes only its path (a host-root URL such as
+//     "https://x.test" therefore normalizes to "/"); query and fragment are
 //     dropped, duplicate slashes are merged and a trailing slash is removed
 //     (except for the root);
 //  3. dynamic segments ({id}, :id, <id>, pure digits and UUIDs) become "{}";
@@ -66,7 +67,12 @@ func normalizeContractPath(raw string) string {
 		return ""
 	}
 	if strings.Contains(raw, "://") {
-		if parsed, err := url.Parse(raw); err == nil && parsed.Path != "" {
+		// An absolute URL contributes only its path. A host-root URL such as
+		// "https://x.test" parses with an empty Path, which still means the
+		// root; a hostless absolute URL such as "file:///x" keeps its path.
+		// Either way the scheme and host must not leak into the normalized
+		// path (design spec §6.5 rule 2).
+		if parsed, err := url.Parse(raw); err == nil && (parsed.Host != "" || parsed.Path != "") {
 			raw = parsed.Path
 		}
 	}
