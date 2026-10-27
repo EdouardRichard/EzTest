@@ -36,6 +36,11 @@ import (
 	llmpostgres "github.com/EdouardRichard/EzTest/backend/internal/llm/infrastructure/postgres"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/crypto"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/idempotency"
+	resourceapp "github.com/EdouardRichard/EzTest/backend/internal/resource/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/resource/infrastructure/gitexec"
+	"github.com/EdouardRichard/EzTest/backend/internal/resource/infrastructure/httpcheck"
+	resourcepostgres "github.com/EdouardRichard/EzTest/backend/internal/resource/infrastructure/postgres"
+	resourcehttp "github.com/EdouardRichard/EzTest/backend/internal/resource/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/server"
 	storageapp "github.com/EdouardRichard/EzTest/backend/internal/storage/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/storage/infrastructure/localfs"
@@ -145,6 +150,32 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		auditor,
 	)
 
+	// Resource context (P2): the catalog repository backs the company, system,
+	// environment and app-model ports; the access, session and code-repository
+	// repositories back their own aggregates. Requests never carry a company id:
+	// the services resolve the seeded default company through the catalog
+	// repository. The clock and the read-only login_check/Git adapters are the
+	// production implementations of the application ports.
+	resourceCatalogRepo := resourcepostgres.NewCatalogRepository(database.Pool)
+	resourceAccessRepo := resourcepostgres.NewAccessRepository(database.Pool)
+	resourceSessionRepo := resourcepostgres.NewSessionRepository(database.Pool)
+	resourceCodeRepo := resourcepostgres.NewCodeRepository(database.Pool)
+	catalogService := resourceapp.NewCatalogService(
+		resourceCatalogRepo, resourceCatalogRepo, resourceCatalogRepo, resourceCatalogRepo, wallClock{})
+	accessService := resourceapp.NewAccessService(
+		resourceCatalogRepo, resourceAccessRepo, resourceAccessRepo, resourceCatalogRepo)
+	sessionService := resourceapp.NewSessionService(
+		resourceSessionRepo, resourceAccessRepo, resourceCatalogRepo, resourceCatalogRepo,
+		httpcheck.NewChecker(), wallClock{})
+	codeRepoService := resourceapp.NewCodeRepoService(
+		resourceCodeRepo, gitexec.NewValidator(), wallClock{})
+	resourceHandlers := &resourcehttp.Handlers{
+		Catalog:  resourcehttp.NewCatalogHandler(catalogService),
+		Access:   resourcehttp.NewAccessHandler(accessService),
+		Session:  resourcehttp.NewSessionHandler(sessionService),
+		CodeRepo: resourcehttp.NewCodeRepoHandler(codeRepoService),
+	}
+
 	// Agent runtime: the four postgres repositories, the cross-context adapters
 	// (LLM gateway, event sink, audit sink) and the tool registry. The same
 	// registry instance backs both the run service and the HTTP tool catalog, so
@@ -239,6 +270,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 				Runs:     runService,
 				Tools:    agentToolCatalog,
 			},
+			Resources: resourceHandlers,
 		}),
 		BaseContext:       baseContext(baseCtx),
 		ReadHeaderTimeout: 10 * time.Second,
@@ -286,6 +318,13 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		return nil
 	}
 }
+
+// wallClock is the production resource application.Clock. The services convert
+// the returned instant to UTC where the database stores timestamptz.
+type wallClock struct{}
+
+// Now returns the current time.
+func (wallClock) Now() time.Time { return time.Now() }
 
 // baseContext returns the http.Server.BaseContext callback that derives every
 // request context from ctx. Canceling ctx on SIGINT/SIGTERM makes handlers that
