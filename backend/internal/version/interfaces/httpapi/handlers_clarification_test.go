@@ -576,6 +576,58 @@ func TestClarificationAnalyzeAndRecon(t *testing.T) {
 		}
 	})
 
+	t.Run("expected p1 session states map to the p3 conflicts", func(t *testing.T) {
+		cases := []struct {
+			name      string
+			set       func(*fakeClarificationService)
+			path      string
+			body      string
+			status    int
+			reason    string
+			retryable bool
+		}{
+			{
+				name:   "concurrent run is agent_busy",
+				set:    func(f *fakeClarificationService) { f.messageErr = agentdomain.ErrRunActive },
+				path:   "/api/versions/100/clarification/messages",
+				body:   `{"message":"hi"}`,
+				status: http.StatusConflict,
+				reason: "agent_busy",
+			},
+			{
+				name:      "disabled profile is ai_unavailable",
+				set:       func(f *fakeClarificationService) { f.sessionErr = agentdomain.ErrProfileDisabled },
+				path:      "/api/versions/100/clarification/sessions",
+				status:    http.StatusServiceUnavailable,
+				reason:    "ai_unavailable",
+				retryable: true,
+			},
+			{
+				name:   "deleted p1 session is not active",
+				set:    func(f *fakeClarificationService) { f.messageErr = agentdomain.ErrNotFound },
+				path:   "/api/versions/100/clarification/messages",
+				body:   `{"message":"hi"}`,
+				status: http.StatusConflict,
+				reason: "clarification_session_not_active",
+			},
+		}
+		for _, testCase := range cases {
+			t.Run(testCase.name, func(t *testing.T) {
+				handler, deps := newTestServer(t)
+				testCase.set(deps.clarification)
+				recorder := doRequest(handler, http.MethodPost, testCase.path, testUserToken, testCase.body)
+				apiError := requireError(t, recorder, testCase.status,
+					map[int]string{
+						http.StatusConflict:           platform.CodeConflict,
+						http.StatusServiceUnavailable: platform.CodeUnavailable,
+					}[testCase.status], testCase.reason)
+				if apiError.Retryable != testCase.retryable {
+					t.Fatalf("retryable=%v want %v", apiError.Retryable, testCase.retryable)
+				}
+			})
+		}
+	})
+
 	t.Run("agent and llm startup failures are retryable ai_unavailable", func(t *testing.T) {
 		cases := []struct {
 			name string
