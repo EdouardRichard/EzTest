@@ -584,7 +584,7 @@ export function RequirementEditor({
       className="min-w-0 rounded-2xl border border-border bg-card p-4"
     >
       <EditRequirementForm
-        key={requirement.id}
+        key={`${requirement.id}:${requirement.revision}`}
         versionId={versionId}
         requirement={requirement}
         onUpdated={onUpdated}

@@ -50,6 +50,11 @@ const CLARIFICATION_PANEL_EVENTS: ReadonlySet<string> = new Set([
   "decision.decided",
 ])
 
+/** Requirement/relation/attachment writes change the workbench data surfaces. */
+function isWorkbenchContentEvent(type: string): boolean {
+  return type.startsWith("requirement.") || type.startsWith("attachment.")
+}
+
 function describeLoadError(error: unknown): string {
   if (!(error instanceof ApiError)) {
     return error instanceof Error ? error.message : "未知错误"
@@ -257,15 +262,32 @@ export function Workbench({ version, onChanged }: WorkbenchProps) {
     const maxSeq = versionEvents.reduce((latest, event) => Math.max(latest, event.seq), 0)
     const previousSeq = streamEventSeqRef.current
     streamEventSeqRef.current = maxSeq
-    const changed = versionEvents.some(
+    const changedClarification = versionEvents.some(
       (event) => event.seq > (previousSeq ?? -1) && CLARIFICATION_PANEL_EVENTS.has(event.type),
     )
-    if (!changed) return
+    const changedContent = versionEvents.some(
+      (event) => event.seq > (previousSeq ?? -1) && isWorkbenchContentEvent(event.type),
+    )
+    if (!changedClarification && !changedContent) return
     if (previousSeq === null && stream.status !== "live") return
-    setClarificationRevision((previous) => previous + 1)
-    void loadClarification()
-    onChanged()
-  }, [stream.events, stream.status, version.id, loadClarification, onChanged])
+    if (changedClarification) {
+      setClarificationRevision((previous) => previous + 1)
+      void loadClarification()
+      onChanged()
+    }
+    if (changedContent) {
+      void loadRequirements()
+      void loadRelations()
+    }
+  }, [
+    stream.events,
+    stream.status,
+    version.id,
+    loadRequirements,
+    loadRelations,
+    loadClarification,
+    onChanged,
+  ])
 
   function reloadAll(): void {
     // A manual refresh must refresh the AI-driven panels as well; their only
