@@ -440,22 +440,22 @@ func TestSessionRepositoryListCursorAndRunSummaries(t *testing.T) {
 		t.Fatalf("profile keys first=%q third=%q", first.ProfileKey, third.ProfileKey)
 	}
 
-	// first: one running run.
-	firstTurn, err := runs.CreateTurn(ctx, first.ID, []agent.Part{{Type: "text", Text: "running"}}, "running")
+	// first: one running run and no terminal run yet.
+	firstRun, err := runs.CreateTurn(ctx, first.ID, []agent.Part{{Type: "text", Text: "running"}}, "running")
 	if err != nil {
 		t.Fatalf("create running turn: %v", err)
 	}
 	// second: one completed run.
-	secondTurn, err := runs.CreateTurn(ctx, second.ID, []agent.Part{{Type: "text", Text: "done"}}, "done")
+	doneRun, err := runs.CreateTurn(ctx, second.ID, []agent.Part{{Type: "text", Text: "done"}}, "done")
 	if err != nil {
 		t.Fatalf("create done turn: %v", err)
 	}
-	if err := runs.Finish(ctx, secondTurn.RunID, agent.RunResult{
+	if err := runs.Finish(ctx, doneRun.RunID, agent.RunResult{
 		Status:         agent.RunDone,
 		TerminalReason: agent.ReasonCompleted,
 		Turns:          1,
 	}); err != nil {
-		t.Fatalf("finish second run: %v", err)
+		t.Fatalf("finish done run: %v", err)
 	}
 	// third: no runs at all.
 
@@ -481,17 +481,72 @@ func TestSessionRepositoryListCursorAndRunSummaries(t *testing.T) {
 	if summaries[1].ActiveRun != nil {
 		t.Fatalf("second session should have no active run: %+v", summaries[1].ActiveRun)
 	}
-	if summaries[1].LastRun == nil || summaries[1].LastRun.ID != secondTurn.RunID || summaries[1].LastRun.Status != agent.RunDone {
-		t.Fatalf("second session last run=%+v want %d done", summaries[1].LastRun, secondTurn.RunID)
+	if summaries[1].LastRun == nil || summaries[1].LastRun.ID != doneRun.RunID || summaries[1].LastRun.Status != agent.RunDone {
+		t.Fatalf("second session last run=%+v want %d done", summaries[1].LastRun, doneRun.RunID)
 	}
-	if summaries[2].ActiveRun == nil || summaries[2].ActiveRun.ID != firstTurn.RunID || summaries[2].ActiveRun.Status != agent.RunRunning {
-		t.Fatalf("first session active run=%+v want %d running", summaries[2].ActiveRun, firstTurn.RunID)
+	if summaries[2].ActiveRun == nil || summaries[2].ActiveRun.ID != firstRun.RunID || summaries[2].ActiveRun.Status != agent.RunRunning {
+		t.Fatalf("first session active run=%+v want %d running", summaries[2].ActiveRun, firstRun.RunID)
 	}
-	if summaries[2].LastRun == nil || summaries[2].LastRun.ID != firstTurn.RunID {
-		t.Fatalf("first session last run=%+v want %d", summaries[2].LastRun, firstTurn.RunID)
+	// last_run is the newest terminal run, so a session whose only run is still
+	// running has no last_run.
+	if summaries[2].LastRun != nil {
+		t.Fatalf("first session last run=%+v while only a running run exists, want nil", summaries[2].LastRun)
 	}
 	if summaries[2].Session.ProfileKey != firstProfile.Key || summaries[0].Session.ProfileKey != secondProfile.Key {
 		t.Fatalf("profile keys in list=%q,%q", summaries[2].Session.ProfileKey, summaries[0].Session.ProfileKey)
+	}
+
+	// Once the running run finishes, it becomes the last_run.
+	if err := runs.Finish(ctx, firstRun.RunID, agent.RunResult{
+		Status:         agent.RunDone,
+		TerminalReason: agent.ReasonCompleted,
+		Turns:          1,
+	}); err != nil {
+		t.Fatalf("finish first run: %v", err)
+	}
+	if _, err := runs.Active(ctx, first.ID); !errors.Is(err, agent.ErrNotFound) {
+		t.Fatalf("active after finish err=%v, want ErrNotFound", err)
+	}
+
+	// A new running run keeps the previous terminal run as last_run.
+	nextRun, err := runs.CreateTurn(ctx, first.ID, []agent.Part{{Type: "text", Text: "again"}}, "again")
+	if err != nil {
+		t.Fatalf("create next turn: %v", err)
+	}
+	summaries, hasMore, err = sessions.List(ctx, 0, 10, nil)
+	if err != nil {
+		t.Fatalf("list sessions with a new running run: %v", err)
+	}
+	if hasMore || len(summaries) != 3 {
+		t.Fatalf("sessions after next turn hasMore=%v len=%d", hasMore, len(summaries))
+	}
+	if summaries[2].ActiveRun == nil || summaries[2].ActiveRun.ID != nextRun.RunID || summaries[2].ActiveRun.Status != agent.RunRunning {
+		t.Fatalf("first session active run=%+v want %d running", summaries[2].ActiveRun, nextRun.RunID)
+	}
+	if summaries[2].LastRun == nil || summaries[2].LastRun.ID != firstRun.RunID || summaries[2].LastRun.Status != agent.RunDone {
+		t.Fatalf("first session last run=%+v want terminal run %d", summaries[2].LastRun, firstRun.RunID)
+	}
+
+	// When the new run finishes, last_run follows it and active_run is cleared.
+	if err := runs.Finish(ctx, nextRun.RunID, agent.RunResult{
+		Status:         agent.RunDone,
+		TerminalReason: agent.ReasonCompleted,
+		Turns:          1,
+	}); err != nil {
+		t.Fatalf("finish next run: %v", err)
+	}
+	summaries, hasMore, err = sessions.List(ctx, 0, 10, nil)
+	if err != nil {
+		t.Fatalf("list sessions after the next run finished: %v", err)
+	}
+	if hasMore || len(summaries) != 3 {
+		t.Fatalf("sessions after finish hasMore=%v len=%d", hasMore, len(summaries))
+	}
+	if summaries[2].ActiveRun != nil {
+		t.Fatalf("first session active run=%+v after finish, want nil", summaries[2].ActiveRun)
+	}
+	if summaries[2].LastRun == nil || summaries[2].LastRun.ID != nextRun.RunID || summaries[2].LastRun.Status != agent.RunDone {
+		t.Fatalf("first session last run=%+v want %d done", summaries[2].LastRun, nextRun.RunID)
 	}
 
 	page, hasMore, err := sessions.List(ctx, 0, 2, nil)
@@ -556,9 +611,9 @@ func TestRunRepositoryProgressActiveLatestFinish(t *testing.T) {
 	if err != nil || active.ID != first.RunID {
 		t.Fatalf("active=%+v err=%v want %d", active, err, first.RunID)
 	}
-	latest, err := runs.Latest(ctx, session.ID)
-	if err != nil || latest.ID != first.RunID {
-		t.Fatalf("latest=%+v err=%v want %d", latest, err, first.RunID)
+	// A running run is not the latest terminal run.
+	if _, err := runs.Latest(ctx, session.ID); !errors.Is(err, agent.ErrNotFound) {
+		t.Fatalf("latest while the only run is running err=%v, want ErrNotFound", err)
 	}
 
 	if err := runs.UpdateProgress(ctx, first.RunID, 2, agent.Usage{
@@ -605,14 +660,21 @@ func TestRunRepositoryProgressActiveLatestFinish(t *testing.T) {
 	if _, err := runs.Active(ctx, session.ID); !errors.Is(err, agent.ErrNotFound) {
 		t.Fatalf("active after finish err=%v, want ErrNotFound", err)
 	}
-	latest, err = runs.Latest(ctx, session.ID)
-	if err != nil || latest.ID != first.RunID {
-		t.Fatalf("latest after finish=%+v err=%v", latest, err)
+	latest, err := runs.Latest(ctx, session.ID)
+	if err != nil || latest.ID != first.RunID || latest.Status != agent.RunDone {
+		t.Fatalf("latest after finish=%+v err=%v want %d done", latest, err, first.RunID)
 	}
 
 	second, err := runs.CreateTurn(ctx, session.ID, []agent.Part{{Type: "text", Text: "two"}}, "two")
 	if err != nil {
 		t.Fatalf("create second turn: %v", err)
+	}
+	// While the second run is running, latest stays on the previous terminal run.
+	if active, err = runs.Active(ctx, session.ID); err != nil || active.ID != second.RunID {
+		t.Fatalf("active second=%+v err=%v want %d", active, err, second.RunID)
+	}
+	if latest, err = runs.Latest(ctx, session.ID); err != nil || latest.ID != first.RunID || latest.Status != agent.RunDone {
+		t.Fatalf("latest while second runs=%+v err=%v want terminal run %d", latest, err, first.RunID)
 	}
 	aborted := agent.RunResult{
 		Status:          agent.RunAborted,
@@ -642,6 +704,14 @@ func TestRunRepositoryProgressActiveLatestFinish(t *testing.T) {
 	}
 	if stored.LastToolName != "file.read" || !stored.LastToolPending {
 		t.Fatalf("aborted run tool state=%+v", stored)
+	}
+	// The finished second run is now the latest terminal run and no run is
+	// active any more.
+	if _, err := runs.Active(ctx, session.ID); !errors.Is(err, agent.ErrNotFound) {
+		t.Fatalf("active after second finish err=%v, want ErrNotFound", err)
+	}
+	if latest, err = runs.Latest(ctx, session.ID); err != nil || latest.ID != second.RunID || latest.Status != agent.RunAborted {
+		t.Fatalf("latest after second finish=%+v err=%v want %d aborted", latest, err, second.RunID)
 	}
 
 	if err := runs.Finish(ctx, 999999, result); !errors.Is(err, agent.ErrNotFound) {

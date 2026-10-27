@@ -22,7 +22,7 @@ type SessionRepository interface {
 	// starts after that ID. When profileID is non-nil only sessions of that
 	// profile are returned. hasMore reports whether another row exists after
 	// the returned page. Every session carries its ProfileKey and, when
-	// present, its active and latest run.
+	// present, its active (running) run and its newest terminal run.
 	List(ctx context.Context, cursor int64, limit int, profileID *int64) ([]SessionSummary, bool, error)
 	// Create inserts a session and returns the stored row with ProfileKey.
 	Create(ctx context.Context, profileID int64, title string, createdBy *int64) (Session, error)
@@ -47,7 +47,8 @@ type RunRepository interface {
 	Get(ctx context.Context, id int64) (Run, error)
 	// Active returns the session's running run or ErrNotFound.
 	Active(ctx context.Context, sessionID int64) (Run, error)
-	// Latest returns the session's most recent run or ErrNotFound.
+	// Latest returns the session's newest terminal run (a run whose status is
+	// not running) or ErrNotFound. A running run is returned by Active.
 	Latest(ctx context.Context, sessionID int64) (Run, error)
 	// UpdateProgress records the turns and accumulated token usage completed
 	// so far. It returns ErrNotFound for an unknown run.

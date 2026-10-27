@@ -147,8 +147,8 @@ func (j *joinedRun) run() *agent.Run {
 }
 
 // List returns a page of session summaries ordered by ID descending. The two
-// lateral joins fetch the running run and the latest run for each session
-// without a second round trip; the profile join supplies ProfileKey.
+// lateral joins fetch the running run and the newest terminal run for each
+// session without a second round trip; the profile join supplies ProfileKey.
 func (r *SessionRepository) List(ctx context.Context, cursor int64, limit int, profileID *int64) ([]agent.SessionSummary, bool, error) {
 	if limit <= 0 {
 		return nil, false, fmt.Errorf("postgres: list agent sessions: limit must be positive")
@@ -163,7 +163,7 @@ func (r *SessionRepository) List(ctx context.Context, cursor int64, limit int, p
 	) ar ON true
 	LEFT JOIN LATERAL (
 		SELECT * FROM agent_runs
-		WHERE session_id = s.id
+		WHERE session_id = s.id AND status <> 'running'
 		ORDER BY id DESC LIMIT 1
 	) lr ON true
 	WHERE ($1 = 0 OR s.id < $1)
