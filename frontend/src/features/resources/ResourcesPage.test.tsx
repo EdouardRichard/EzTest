@@ -18,6 +18,17 @@ const mocks = vi.hoisted(() => ({
   listAccesses: vi.fn(),
   createAccess: vi.fn(),
   updateAccess: vi.fn(),
+  listSessions: vi.fn(),
+  getSession: vi.fn(),
+  importSession: vi.fn(),
+  validateSession: vi.fn(),
+  confirmSession: vi.fn(),
+  invalidateSession: vi.fn(),
+  revokeSession: vi.fn(),
+  listSnapshots: vi.fn(),
+  requestTakeover: vi.fn(),
+  completeTakeover: vi.fn(),
+  cancelTakeover: vi.fn(),
 }))
 
 const auth = vi.hoisted(() => ({ role: "user" as "user" | "admin" }))
@@ -48,10 +59,21 @@ vi.mock("./api", () => ({
   listAccesses: mocks.listAccesses,
   createAccess: mocks.createAccess,
   updateAccess: mocks.updateAccess,
+  listSessions: mocks.listSessions,
+  getSession: mocks.getSession,
+  importSession: mocks.importSession,
+  validateSession: mocks.validateSession,
+  confirmSession: mocks.confirmSession,
+  invalidateSession: mocks.invalidateSession,
+  revokeSession: mocks.revokeSession,
+  listSnapshots: mocks.listSnapshots,
+  requestTakeover: mocks.requestTakeover,
+  completeTakeover: mocks.completeTakeover,
+  cancelTakeover: mocks.cancelTakeover,
 }))
 
 import { ResourcesPage } from "./ResourcesPage"
-import type { EnvironmentDTO, SystemDTO } from "./types"
+import type { EnvironmentDTO, SessionDTO, SystemDTO } from "./types"
 
 function makeSystem(id: number, key: string, name: string): SystemDTO {
   return {
@@ -87,6 +109,31 @@ function makeEnvironment(id: number, systemId: number, name: string): Environmen
   }
 }
 
+function makeSession(id: number, state: string): SessionDTO {
+  return {
+    id,
+    accountId: 3,
+    systemId: 1,
+    environmentId: 5,
+    accessId: 11,
+    state,
+    acquisition: "import",
+    storageStateKind: "storage_state",
+    cookieCount: 0,
+    originCount: 0,
+    storageStateHash: "state-hash",
+    expiresAt: "2026-10-28T12:00:00Z",
+    lastValidatedAt: null,
+    lastUsedAt: null,
+    failureReason: "",
+    invalidatedReason: "",
+    expiring: false,
+    latestSnapshot: null,
+    activeLease: null,
+    latestTakeover: null,
+  }
+}
+
 describe("ResourcesPage", () => {
   beforeEach(() => {
     for (const mock of Object.values(mocks)) mock.mockReset()
@@ -96,6 +143,8 @@ describe("ResourcesPage", () => {
     mocks.listAppModels.mockResolvedValue({ items: [], nextCursor: null, hasMore: false })
     mocks.listAccounts.mockResolvedValue({ items: [], nextCursor: null, hasMore: false })
     mocks.listAccesses.mockResolvedValue([])
+    mocks.listSessions.mockResolvedValue({ items: [], nextCursor: null, hasMore: false })
+    mocks.getSession.mockResolvedValue(makeSession(1, "valid"))
   })
 
   afterEach(() => {
@@ -124,7 +173,8 @@ describe("ResourcesPage", () => {
     await waitFor(() =>
       expect(screen.getByRole("tab", { name: "会话" }).getAttribute("aria-selected")).toBe("true"),
     )
-    expect(await screen.findByRole("heading", { name: "会话面板即将上线" })).toBeTruthy()
+    expect(await screen.findByRole("heading", { name: "会话" })).toBeTruthy()
+    expect(await screen.findByText("暂无会话")).toBeTruthy()
   })
 
   it("switches tabs and records the active tab in the URL", async () => {
@@ -165,5 +215,27 @@ describe("ResourcesPage", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Shop" }))
     await waitFor(() => expect(window.location.search).toContain("system=1"))
+  })
+
+  it("opens the session named by the ?session= deep link and keeps it in the URL", async () => {
+    window.history.replaceState(null, "", "/resources?tab=sessions&session=2")
+    const session = makeSession(2, "needs_manual")
+    const other = makeSession(1, "valid")
+    mocks.listSessions.mockResolvedValue({
+      items: [other, session],
+      nextCursor: null,
+      hasMore: false,
+    })
+    mocks.getSession.mockImplementation((id: number) => Promise.resolve(id === 1 ? other : session))
+
+    render(<ResourcesPage />)
+
+    expect(await screen.findByText("会话 #2")).toBeTruthy()
+    await waitFor(() => expect(mocks.getSession).toHaveBeenCalledWith(2))
+
+    fireEvent.click(await screen.findByRole("button", { name: "查看会话 #1" }))
+
+    await waitFor(() => expect(mocks.getSession).toHaveBeenCalledWith(1))
+    await waitFor(() => expect(window.location.search).toContain("session=1"))
   })
 })
