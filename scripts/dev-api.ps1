@@ -9,7 +9,7 @@
     the API with `go run ./cmd/eztest` from backend/. The API applies all pending
     embedded migrations and seeds the administrator on startup.
 
-    EZTEST_OPENAPI_PATH is pinned to the repository's docs/openapi/p0.yaml as an
+    EZTEST_OPENAPI_PATH is pinned to the repository's docs/openapi/api.yaml as an
     absolute path so GET /api/openapi.yaml works even though the process
     working directory is backend/.
 
@@ -51,7 +51,7 @@ Import-DotEnv -Path $envPath
 
 # Run from backend/ because the Go module root is there, but keep the OpenAPI
 # document reachable at the configured default path.
-$env:EZTEST_OPENAPI_PATH = Join-Path $repoRoot "docs\openapi\p0.yaml"
+$env:EZTEST_OPENAPI_PATH = Join-Path $repoRoot "docs\openapi\api.yaml"
 
 $dbScript = Join-Path $PSScriptRoot "db.ps1"
 # db.ps1 throws on failure, so a normal return means PostgreSQL is ready.

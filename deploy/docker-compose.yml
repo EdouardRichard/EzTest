@@ -1,6 +1,6 @@
 name: eztest
 
-# EzTest P0 single-instance deployment.
+# EzTest P0/P1 single-instance deployment.
 #
 # Static validation only on this host: Docker is not installed, so this file is
 # checked by `cd frontend && node scripts/validate-compose.mjs` and has never
@@ -49,7 +49,7 @@ services:
       EZTEST_WEB_ORIGIN: ${EZTEST_WEB_ORIGIN:-http://localhost:6868}
       EZTEST_DATABASE_URL: postgres://${POSTGRES_USER:-eztest}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in the environment or ../.env}@postgres:5432/${POSTGRES_DB:-eztest}?sslmode=disable
       EZTEST_STORAGE_DIR: /data/objects
-      EZTEST_OPENAPI_PATH: docs/openapi/p0.yaml
+      EZTEST_OPENAPI_PATH: docs/openapi/api.yaml
       EZTEST_ENABLE_TEST_ENDPOINTS: ${EZTEST_ENABLE_TEST_ENDPOINTS:-false}
     ports:
       - "13333:13333"

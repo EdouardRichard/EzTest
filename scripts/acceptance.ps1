@@ -1,15 +1,18 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-    Runs the P0 acceptance gate for EzTest.
+    Runs the P0/P1 acceptance gate for EzTest.
 
 .DESCRIPTION
-    Executes the Go unit and integration suites, the frontend lint/typecheck/test/build
-    gate, the Playwright E2E suite, a repeated migration run and the health/audit
-    assertions. The Task 15 deliverables are checked (README, OpenAPI, deploy files)
-    and the Compose file is statically validated with node. Container execution is
-    reported as SKIPPED because this host has no Docker. Prints a DoD mapping table
-    and exits non-zero on any failure.
+    Executes the Go unit and integration suites, the P1 Agent unit/integration
+    suites, the frontend lint/typecheck/test/build gate, the Playwright E2E
+    suite (including the Agent console), a repeated migration run and the
+    health/audit assertions. The P0/P1 deliverables are checked (README,
+    OpenAPI, deploy files, Agent env template) and the Compose file is
+    statically validated with node. Container execution and the gated real
+    Agent LLM script are reported as SKIPPED because this host has no Docker
+    and no opt-in for paid calls. Prints a DoD mapping table and exits non-zero
+    on any failure.
 
 .NOTES
     Compatible with Windows PowerShell 5.1 and PowerShell 7+.
@@ -473,6 +476,23 @@ try {
                 -Label "go test -tags=integration ./..."
         })
 
+    # P1 DoD 105: the Agent runtime has its own focused suites in addition to
+    # the whole-module runs above, so a regression names the Agent package.
+    [void](Invoke-Check -Dod "P1-1" -CheckName "Agent unit tests" -Body {
+            Invoke-LoggedCommand -Exe $goExe -Arguments @("test", "-count=1", "./internal/agent/...") `
+                -WorkingDirectory $backendDir `
+                -LogPath (Join-Path $tmpDir "acceptance-agent-unit.log") `
+                -Label "go test ./internal/agent/..."
+        })
+
+    [void](Invoke-Check -Dod "P1-1" -CheckName "Agent integration tests" -Body {
+            $env:EZTEST_TEST_DATABASE_URL = $testDatabaseUrl
+            Invoke-LoggedCommand -Exe $goExe -Arguments @("test", "-tags=integration", "-count=1", "./internal/agent/...") `
+                -WorkingDirectory $backendDir `
+                -LogPath (Join-Path $tmpDir "acceptance-agent-integration.log") `
+                -Label "go test -tags=integration ./internal/agent/..."
+        })
+
     [void](Invoke-Check -Dod "5" -CheckName "Frontend lint" -Body {
             Invoke-LoggedCommand -Exe $pnpmExe -Arguments @("lint") `
                 -WorkingDirectory $frontendDir `
@@ -501,7 +521,7 @@ try {
                 -Label "pnpm build"
         })
 
-    [void](Invoke-Check -Dod "1,3" -CheckName "Playwright E2E (real Chrome)" -Body {
+    [void](Invoke-Check -Dod "1,3,P1-1,P1-2,P1-3" -CheckName "Playwright E2E (real Chrome, P0 + Agent console)" -Body {
             Invoke-LoggedCommand -Exe $scriptHost `
                 -Arguments @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $scriptsDir "e2e.ps1")) `
                 -WorkingDirectory $repoRoot `
@@ -568,22 +588,43 @@ try {
             }
         })
 
-    [void](Invoke-Check -Dod "5" -CheckName "P0 deliverables and Compose static validation" -Body {
+    [void](Invoke-Check -Dod "5,P1-4" -CheckName "P0/P1 deliverables and Compose static validation" -Body {
             foreach ($relative in @(
                     "README.md",
-                    "docs/openapi/p0.yaml",
+                    "docs/openapi/api.yaml",
                     "deploy/Dockerfile.api",
                     "deploy/Dockerfile.web",
                     "deploy/docker-compose.yml"
                 )) {
                 $deliverable = Join-Path $repoRoot $relative
                 if (-not (Test-Path -LiteralPath $deliverable)) {
-                    throw "missing P0 deliverable $relative"
+                    throw "missing P0/P1 deliverable $relative"
                 }
             }
             $readme = Get-Content -LiteralPath (Join-Path $repoRoot "README.md") -Raw
             if ($readme -notmatch "EZTEST_OPENAPI_PATH") {
                 throw "README raw go-run instructions do not document EZTEST_OPENAPI_PATH"
+            }
+            $openapi = Get-Content -LiteralPath (Join-Path $repoRoot "docs/openapi/api.yaml") -Raw
+            foreach ($needle in @(
+                    "/api/agents/sessions",
+                    "agent.activity",
+                    "reasoning_tokens"
+                )) {
+                if ($openapi -notmatch [regex]::Escape($needle)) {
+                    throw "docs/openapi/api.yaml is missing $needle"
+                }
+            }
+            $envTemplate = Get-Content -LiteralPath (Join-Path $repoRoot ".env.example") -Raw
+            foreach ($agentVar in @(
+                    "EZTEST_AGENT_FILE_ROOT",
+                    "EZTEST_AGENT_HTTP_ALLOWLIST",
+                    "EZTEST_AGENT_TOOL_TIMEOUT_MS",
+                    "EZTEST_AGENT_MAX_CONCURRENT_RUNS"
+                )) {
+                if ($envTemplate -notmatch [regex]::Escape($agentVar)) {
+                    throw ".env.example is missing $agentVar"
+                }
             }
             Invoke-LoggedCommand -Exe $nodeExe -Arguments @("scripts/validate-compose.mjs") `
                 -WorkingDirectory $frontendDir `
@@ -596,10 +637,45 @@ try {
         -Detail "No Docker on this host; Compose remains static-validation only (Task 15)."
     Add-CheckResult -Dod "4" -CheckName "Real LLM acceptance" -Status "SKIPPED" `
         -Detail "Gated: run scripts/acceptance-llm.ps1 with EZTEST_RUN_REAL_LLM=1."
+    Add-CheckResult -Dod "P1-1" -CheckName "Real Agent LLM acceptance" -Status "SKIPPED" `
+        -Detail "Gated: run scripts/acceptance-agent-llm.ps1 with EZTEST_RUN_REAL_LLM=1."
 
-    Write-Step "P0 DoD acceptance summary"
+    Write-Step "P0/P1 DoD acceptance summary"
     $table = $checkResults | Format-Table -AutoSize -Wrap | Out-String -Width 200
     Write-Host $table
+
+    # The P1 exit criteria are proven by suites spread across the gate (the
+    # gated real-LLM script is the only opt-in piece), so map each criterion to
+    # its evidence explicitly instead of hiding the link in a check name.
+    Write-Step "P1 DoD mapping (implementation-phases.md L105-L108)"
+    $p1DodMapping = @(
+        [pscustomobject][ordered]@{
+            DoD         = "P1-1"
+            Source      = "L105"
+            Requirement = "Diagnostic Agent completes multi-turn conversation + tool calls, live in the UI and replayable"
+            Evidence    = "Agent unit/integration suites; Playwright agent-console E2E (Task 16); OpenAPI /api/agents + agent.activity"
+        },
+        [pscustomobject][ordered]@{
+            DoD         = "P1-2"
+            Source      = "L106"
+            Requirement = "A run can be aborted with correct events/state; tool errors and timeouts do not take the service down"
+            Evidence    = "Run abort and tool executor suites; agent-console E2E stop flow"
+        },
+        [pscustomobject][ordered]@{
+            DoD         = "P1-3"
+            Source      = "L107"
+            Requirement = "Agent configuration (system prompt/model) changes take effect on the next run"
+            Evidence    = "Profile domain/application suites; agent-console E2E prompt edit flow"
+        },
+        [pscustomobject][ordered]@{
+            DoD         = "P1-4"
+            Source      = "L108"
+            Requirement = "Event/tool contract frozen at V1 for compatible extension"
+            Evidence    = "Agent activity domain/application suites; docs/openapi/api.yaml agent schemas"
+        }
+    )
+    $p1Table = $p1DodMapping | Format-Table -AutoSize -Wrap | Out-String -Width 200
+    Write-Host $p1Table
 
     $failed = @($checkResults | Where-Object { $_.Result -eq "FAIL" })
     $passed = @($checkResults | Where-Object { $_.Result -eq "PASS" })
