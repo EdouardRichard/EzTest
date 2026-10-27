@@ -95,7 +95,7 @@ export function ChangedFiles({ changes, onOpenFile, onAnchorFile }: ChangedFiles
                 <span className="text-red-700 dark:text-red-300">-{file.deletions}</span>
               </span>
             </button>
-            {onAnchorFile === undefined ? null : (
+            {onAnchorFile === undefined || fileStatusKey(file.status) === "D" ? null : (
               <button
                 type="button"
                 aria-label={`为 ${file.path} 关联需求`}

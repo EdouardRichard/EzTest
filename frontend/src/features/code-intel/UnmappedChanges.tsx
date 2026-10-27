@@ -34,7 +34,9 @@ export type UnmappedChangesProps = {
  * when the list was truncated.
  */
 export function UnmappedChanges({ entries, truncated }: UnmappedChangesProps) {
-  const capped = truncated ?? entries.length >= MAX_UNMAPPED_ENTRIES
+  // Exactly `MAX_UNMAPPED_ENTRIES` is a complete list; only a longer one (or an
+  // explicit backend flag) means the response was truncated.
+  const capped = truncated ?? entries.length > MAX_UNMAPPED_ENTRIES
 
   return (
     <section

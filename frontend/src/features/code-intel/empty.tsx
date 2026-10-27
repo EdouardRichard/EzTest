@@ -110,23 +110,36 @@ export type UnindexedCodeStateProps = {
   /** Latest index run, or null when the repository has never been indexed. */
   run: IndexRun | null
   refreshing: boolean
+  /** True when the tab stopped its 60-poll budget before a terminal status. */
+  pollingExhausted?: boolean
   onRefresh: () => void
 }
 
 /**
  * Empty state for a repository that has no successful T0 index yet (spec §9.2).
  * Indexing itself is an admin action on the code repository page; this tab only
- * reports the state and offers a status refresh.
+ * reports the state and offers a status refresh. When the tab's 60-poll budget
+ * runs out mid-run, the copy asks for the manual refresh instead of silently
+ * freezing on「正在索引」.
  */
-export function UnindexedCodeState({ run, refreshing, onRefresh }: UnindexedCodeStateProps) {
+export function UnindexedCodeState({
+  run,
+  refreshing,
+  pollingExhausted = false,
+  onRefresh,
+}: UnindexedCodeStateProps) {
   const indexing = run?.status === "queued" || run?.status === "running"
   const failed = run?.status === "failed"
   const title = indexing ? "代码仓库正在索引" : failed ? "代码索引失败" : "代码仓库尚未索引"
-  const description = indexing
+  const baseDescription = indexing
     ? "索引任务正在运行，完成后会自动刷新变更与文件级分析。"
     : failed
       ? "上一次索引任务失败。请联系管理员在「代码仓库」页面重新触发索引，然后刷新状态。"
       : "代码仓尚未完成 T0 索引。索引由管理员在「代码仓库」页面触发，完成后即可查看变更与 diff。"
+  const description =
+    indexing && pollingExhausted
+      ? `${baseDescription} 索引仍在运行，已停止自动刷新；请点击「刷新索引状态」查看最新进度。`
+      : baseDescription
 
   return (
     <EmptyState

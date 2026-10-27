@@ -160,6 +160,13 @@ const INDEX_DONE: IndexRun = {
   finishedAt: "2026-10-28T00:52:03Z",
 }
 
+const INDEX_RUNNING: IndexRun = {
+  ...INDEX_DONE,
+  status: "running",
+  stats: undefined,
+  finishedAt: null,
+}
+
 const CANDIDATE: Candidate = {
   id: "7001",
   subjectKind: "requirement",
@@ -735,5 +742,39 @@ describe("CodeChangesTab", () => {
 
     fireEvent.keyDown(screen.getByRole("dialog", { name: "关联需求锚点" }), { key: "Escape" })
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull())
+  })
+
+  it("stops index polling after 60 attempts and offers a manual refresh", async () => {
+    vi.useFakeTimers()
+    try {
+      mockReady({ index: INDEX_RUNNING, analysis: notFound() })
+
+      renderTab()
+      await flushPromises()
+      expect(screen.getByRole("heading", { name: "代码仓库正在索引" })).toBeTruthy()
+      expect(mocks.getLatestIndexRun).toHaveBeenCalledTimes(1)
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1500 * 61)
+      })
+      await flushPromises()
+
+      expect(mocks.getLatestIndexRun).toHaveBeenCalledTimes(1 + 60)
+      expect(screen.getByText(/已停止自动刷新/)).toBeTruthy()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(6000)
+      })
+      expect(mocks.getLatestIndexRun).toHaveBeenCalledTimes(1 + 60)
+
+      // The manual status refresh reads the terminal run and leaves the state.
+      mocks.getLatestIndexRun.mockResolvedValue(INDEX_DONE)
+      fireEvent.click(screen.getByRole("button", { name: "刷新索引状态" }))
+      await flushPromises()
+      expect(screen.getByRole("heading", { name: "变更文件" })).toBeTruthy()
+      expect(screen.queryByText(/已停止自动刷新/)).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

@@ -191,6 +191,8 @@ export function CodeChangesTab({ versionId, repoId }: CodeChangesTabProps) {
   const [anchorFile, setAnchorFile] = useState<ChangedFile | null>(null)
   const [starting, setStarting] = useState(false)
   const [actionError, setActionError] = useState("")
+  /** True when the tab's index poll budget ran out before a terminal status. */
+  const [indexPollExhausted, setIndexPollExhausted] = useState(false)
   const requestRef = useRef(0)
 
   const loadChanges = useCallback(
@@ -281,12 +283,14 @@ export function CodeChangesTab({ versionId, repoId }: CodeChangesTabProps) {
   const indexActive = indexRun?.status === "queued" || indexRun?.status === "running"
   useEffect(() => {
     if (!indexActive || typeof repoId !== "number") return
+    setIndexPollExhausted(false)
     let stopped = false
     let attempts = 0
     const timer = setInterval(() => {
       if (stopped) return
       if (typeof document !== "undefined" && document.hidden) return
       if (attempts >= INDEX_POLL_MAX_ATTEMPTS) {
+        setIndexPollExhausted(true)
         clearInterval(timer)
         return
       }
@@ -298,6 +302,12 @@ export function CodeChangesTab({ versionId, repoId }: CodeChangesTabProps) {
             setLoad((current) =>
               current.kind === "unindexed" ? { kind: "unindexed", run: latest } : current,
             )
+            // The 60th poll returned a still-active run: stop and offer the
+            // manual status refresh instead of polling forever.
+            if (attempts >= INDEX_POLL_MAX_ATTEMPTS) {
+              setIndexPollExhausted(true)
+              clearInterval(timer)
+            }
           } else {
             void loadChanges({ silent: true })
           }
@@ -367,6 +377,7 @@ export function CodeChangesTab({ versionId, repoId }: CodeChangesTabProps) {
       <UnindexedCodeState
         run={load.run}
         refreshing={refreshing}
+        pollingExhausted={indexPollExhausted}
         onRefresh={() => void loadChanges({ silent: true })}
       />
     )
