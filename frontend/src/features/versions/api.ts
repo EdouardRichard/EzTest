@@ -12,6 +12,22 @@ import {
 
 import type {
   BindingsBody,
+  ClarificationDecision,
+  ClarificationDecisionCounts,
+  ClarificationDecisionQuery,
+  ClarificationDecisionsPage,
+  ClarificationMessage,
+  ClarificationMessageQuery,
+  ClarificationMessagesPage,
+  ClarificationOverview,
+  ClarificationQuestion,
+  ClarificationQuestionCounts,
+  ClarificationQuestionQuery,
+  ClarificationQuestionsPage,
+  ClarificationRunResult,
+  ClarificationSession,
+  CreateClarificationQuestionBody,
+  CreateDecisionBody,
   CreateRelationBody,
   CreateRequirementBody,
   CreateVersionBody,
@@ -20,6 +36,10 @@ import type {
   RequirementAttachment,
   RequirementQuery,
   RequirementRelation,
+  SendClarificationMessageBody,
+  SendClarificationMessageResult,
+  UpdateClarificationQuestionBody,
+  UpdateDecisionBody,
   UpdateRelationBody,
   UpdateRequirementBody,
   UpdateVersionBody,
@@ -268,4 +288,184 @@ export function updateRelation(
 /** DELETE /api/versions/{id}/relations/{relId}. */
 export function deleteRelation(versionId: string, relationId: string): Promise<void> {
   return apiDelete<void>(`${relationsPath(versionId)}/${relationId}`)
+}
+
+// --- Clarification (spec §7.5/§7.6) ----------------------------------------
+
+/** Clarification overview path for one version. */
+function clarificationPath(versionId: string): string {
+  return `${versionPath(versionId)}/clarification`
+}
+
+/** Clarification message collection path. */
+function clarificationMessagesPath(versionId: string): string {
+  return `${clarificationPath(versionId)}/messages`
+}
+
+/** Clarification question collection path. */
+function clarificationQuestionsPath(versionId: string): string {
+  return `${clarificationPath(versionId)}/questions`
+}
+
+/** Decision collection path; decisions live beside clarification, not under it. */
+function decisionsPath(versionId: string): string {
+  return `${versionPath(versionId)}/decisions`
+}
+
+/**
+ * `GET clarification` — the optional session (absent before the first start)
+ * plus the per-status counters. Missing counters are normalized to zero so the
+ * UI never renders `undefined` as a count.
+ */
+export async function getClarification(versionId: string): Promise<ClarificationOverview> {
+  type Payload = {
+    session?: ClarificationSession | null
+    questions?: Partial<ClarificationQuestionCounts>
+    decisions?: Partial<ClarificationDecisionCounts>
+  }
+  const payload = await apiGet<Payload>(clarificationPath(versionId))
+  return {
+    session: payload.session ?? null,
+    questions: {
+      open: payload.questions?.open ?? 0,
+      answered: payload.questions?.answered ?? 0,
+      dismissed: payload.questions?.dismissed ?? 0,
+    },
+    decisions: {
+      proposed: payload.decisions?.proposed ?? 0,
+      accepted: payload.decisions?.accepted ?? 0,
+      rejected: payload.decisions?.rejected ?? 0,
+    },
+  }
+}
+
+/** POST clarification/sessions — 201 with the started session (409 when active). */
+export function startClarificationSession(versionId: string): Promise<ClarificationSession> {
+  return apiPost<ClarificationSession>(`${clarificationPath(versionId)}/sessions`)
+}
+
+/** POST clarification/sessions/{sid}/complete — active → completed. */
+export function completeClarificationSession(versionId: string, sessionId: string): Promise<void> {
+  return apiPost<void>(`${clarificationPath(versionId)}/sessions/${sessionId}/complete`)
+}
+
+/**
+ * GET clarification/messages — the persisted conversation projection, oldest
+ * first, with `before_id` (a P1 message ID) for earlier pages.
+ */
+export async function listClarificationMessages(
+  versionId: string,
+  query: ClarificationMessageQuery = {},
+): Promise<ClarificationMessagesPage> {
+  const params = new URLSearchParams()
+  if (query.beforeId !== undefined) params.set("before_id", String(query.beforeId))
+  if (query.limit !== undefined) params.set("limit", String(query.limit))
+  const page = await apiGetPage<ClarificationMessage>(
+    withQuery(clarificationMessagesPath(versionId), params),
+  )
+  // The projection marks reasoning/toolCalls/toolName optional; normalize them
+  // so the chat renderer never has to distinguish absent from empty.
+  const items = page.items.map((item) => ({
+    ...item,
+    reasoning: item.reasoning ?? "",
+    toolCalls: item.toolCalls ?? null,
+    toolName: item.toolName ?? null,
+  }))
+  return { items, nextCursor: page.nextCursor, hasMore: page.hasMore }
+}
+
+/** POST clarification/messages — 202 with the started run (409 busy, 503 AI). */
+export function sendClarificationMessage(
+  versionId: string,
+  message: string,
+): Promise<SendClarificationMessageResult> {
+  const body: SendClarificationMessageBody = { message }
+  return apiPost<SendClarificationMessageResult>(clarificationMessagesPath(versionId), body)
+}
+
+/** POST clarification/analyze — one requirement-analysis run (202). */
+export function analyzeClarification(versionId: string): Promise<ClarificationRunResult> {
+  return apiPost<ClarificationRunResult>(`${clarificationPath(versionId)}/analyze`)
+}
+
+/** POST clarification/recon — one context-recon run (202). */
+export function reconClarification(versionId: string): Promise<ClarificationRunResult> {
+  return apiPost<ClarificationRunResult>(`${clarificationPath(versionId)}/recon`)
+}
+
+/** GET clarification/questions — one cursor page of structured questions. */
+export async function listClarificationQuestions(
+  versionId: string,
+  query: ClarificationQuestionQuery = {},
+): Promise<ClarificationQuestionsPage> {
+  const params = new URLSearchParams()
+  if (query.status !== undefined) params.set("status", query.status)
+  // Spec §7.6 names this query field `requirementId` (unlike `before_id`).
+  if (query.requirementId !== undefined) params.set("requirementId", query.requirementId)
+  if (query.limit !== undefined) params.set("limit", String(query.limit))
+  if (query.cursor !== undefined && query.cursor !== "") params.set("cursor", query.cursor)
+  const page = await apiGetPage<ClarificationQuestion>(
+    withQuery(clarificationQuestionsPath(versionId), params),
+  )
+  const items = page.items.map((item) => ({
+    ...item,
+    requirementId: item.requirementId ?? null,
+    sessionId: item.sessionId ?? null,
+  }))
+  return { items, nextCursor: page.nextCursor, hasMore: page.hasMore }
+}
+
+/** POST clarification/questions — 201 with the created question. */
+export function createClarificationQuestion(
+  versionId: string,
+  body: CreateClarificationQuestionBody,
+): Promise<ClarificationQuestion> {
+  return apiPost<ClarificationQuestion>(clarificationQuestionsPath(versionId), body)
+}
+
+/** PATCH clarification/questions/{qid} — answer/dismiss/reopen/edit. */
+export function updateClarificationQuestion(
+  versionId: string,
+  questionId: string,
+  body: UpdateClarificationQuestionBody,
+): Promise<ClarificationQuestion> {
+  return apiPatch<ClarificationQuestion>(
+    `${clarificationQuestionsPath(versionId)}/${questionId}`,
+    body,
+  )
+}
+
+/** GET decisions — one cursor page of proposed/accepted/rejected decisions. */
+export async function listDecisions(
+  versionId: string,
+  query: ClarificationDecisionQuery = {},
+): Promise<ClarificationDecisionsPage> {
+  const params = new URLSearchParams()
+  if (query.status !== undefined) params.set("status", query.status)
+  if (query.limit !== undefined) params.set("limit", String(query.limit))
+  if (query.cursor !== undefined && query.cursor !== "") params.set("cursor", query.cursor)
+  const page = await apiGetPage<ClarificationDecision>(withQuery(decisionsPath(versionId), params))
+  const items = page.items.map((item) => ({
+    ...item,
+    requirementId: item.requirementId ?? null,
+    questionId: item.questionId ?? null,
+  }))
+  return { items, nextCursor: page.nextCursor, hasMore: page.hasMore }
+}
+
+/** POST decisions — a manual decision, recorded as accepted/user. */
+export function createDecision(
+  versionId: string,
+  body: CreateDecisionBody,
+): Promise<ClarificationDecision> {
+  return apiPost<ClarificationDecision>(decisionsPath(versionId), body)
+}
+
+/** PATCH decisions/{did} — accept or reject a proposed decision. */
+export function updateDecision(
+  versionId: string,
+  decisionId: string,
+  body: UpdateDecisionBody,
+): Promise<ClarificationDecision> {
+  return apiPatch<ClarificationDecision>(`${decisionsPath(versionId)}/${decisionId}`, body)
 }

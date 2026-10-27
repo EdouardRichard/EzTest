@@ -18,6 +18,19 @@ const mocks = vi.hoisted(() => ({
   uploadAttachment: vi.fn(),
   downloadAttachment: vi.fn(),
   deleteAttachment: vi.fn(),
+  getClarification: vi.fn(),
+  listClarificationMessages: vi.fn(),
+  sendClarificationMessage: vi.fn(),
+  startClarificationSession: vi.fn(),
+  analyzeClarification: vi.fn(),
+  reconClarification: vi.fn(),
+  listClarificationQuestions: vi.fn(),
+  createClarificationQuestion: vi.fn(),
+  updateClarificationQuestion: vi.fn(),
+  listDecisions: vi.fn(),
+  createDecision: vi.fn(),
+  updateDecision: vi.fn(),
+  useVersionStream: vi.fn(),
   listSystems: vi.fn(),
   listEnvironments: vi.fn(),
   listCodeRepos: vi.fn(),
@@ -38,7 +51,21 @@ vi.mock("./api", () => ({
   uploadAttachment: mocks.uploadAttachment,
   downloadAttachment: mocks.downloadAttachment,
   deleteAttachment: mocks.deleteAttachment,
+  getClarification: mocks.getClarification,
+  listClarificationMessages: mocks.listClarificationMessages,
+  sendClarificationMessage: mocks.sendClarificationMessage,
+  startClarificationSession: mocks.startClarificationSession,
+  analyzeClarification: mocks.analyzeClarification,
+  reconClarification: mocks.reconClarification,
+  listClarificationQuestions: mocks.listClarificationQuestions,
+  createClarificationQuestion: mocks.createClarificationQuestion,
+  updateClarificationQuestion: mocks.updateClarificationQuestion,
+  listDecisions: mocks.listDecisions,
+  createDecision: mocks.createDecision,
+  updateDecision: mocks.updateDecision,
 }))
+
+vi.mock("./useVersionStream", () => ({ useVersionStream: mocks.useVersionStream }))
 
 vi.mock("@/features/resources/api", () => ({
   listSystems: mocks.listSystems,
@@ -49,7 +76,7 @@ vi.mock("@/features/code-repos/api", () => ({
   listCodeRepos: mocks.listCodeRepos,
 }))
 
-import type { Requirement, RequirementRelation, Version } from "./types"
+import type { ClarificationSession, Requirement, RequirementRelation, Version } from "./types"
 import { Workbench } from "./Workbench"
 
 const VERSION_ID = "1844674407370955161"
@@ -78,6 +105,16 @@ const VERSION: Version = {
   updatedBy: 1,
   createdAt: "2026-10-27T10:00:00Z",
   updatedAt: "2026-10-27T10:00:00Z",
+}
+
+const CLARIFICATION_SESSION: ClarificationSession = {
+  id: "1844674407370957001",
+  status: "active",
+  agentSessionId: 77,
+  startedAt: "2026-10-27T10:00:00Z",
+  endedAt: null,
+  contextSummary: "",
+  summaryUpdatedAt: null,
 }
 
 function requirement(
@@ -152,6 +189,23 @@ describe("Workbench", () => {
     mocks.listSystems.mockResolvedValue({ items: [], nextCursor: null, hasMore: false })
     mocks.listEnvironments.mockResolvedValue([])
     mocks.listCodeRepos.mockResolvedValue({ items: [], nextCursor: null, hasMore: false })
+    mocks.useVersionStream.mockReturnValue({ events: [], status: "live", reconnect: vi.fn() })
+    mocks.getClarification.mockResolvedValue({
+      session: CLARIFICATION_SESSION,
+      questions: { open: 0, answered: 0, dismissed: 0 },
+      decisions: { proposed: 0, accepted: 0, rejected: 0 },
+    })
+    mocks.listClarificationMessages.mockResolvedValue({
+      items: [],
+      nextCursor: "",
+      hasMore: false,
+    })
+    mocks.listClarificationQuestions.mockResolvedValue({
+      items: [],
+      nextCursor: "",
+      hasMore: false,
+    })
+    mocks.listDecisions.mockResolvedValue({ items: [], nextCursor: "", hasMore: false })
   })
 
   afterEach(cleanup)
@@ -392,5 +446,19 @@ describe("Workbench", () => {
 
     expect(screen.getByRole("alert").textContent).toContain("请选择关系两端的需求。")
     expect(mocks.createRelation).not.toHaveBeenCalled()
+  })
+
+  it("mounts the clarification chat, question panel and decision panel", async () => {
+    renderWorkbench()
+
+    const chat = await screen.findByRole("region", { name: "澄清对话" })
+    expect(screen.getByRole("region", { name: "澄清问题" })).toBeTruthy()
+    expect(screen.getByRole("region", { name: "澄清决策" })).toBeTruthy()
+    expect(within(chat).getByLabelText("消息内容")).toBeTruthy()
+    expect(mocks.useVersionStream).toHaveBeenCalledWith(VERSION_ID)
+    expect(mocks.getClarification).toHaveBeenCalledWith(VERSION_ID)
+    expect(mocks.listClarificationMessages).toHaveBeenCalledWith(VERSION_ID, { limit: 50 })
+    expect(mocks.listClarificationQuestions).toHaveBeenCalledWith(VERSION_ID, { limit: 100 })
+    expect(mocks.listDecisions).toHaveBeenCalledWith(VERSION_ID, { limit: 100 })
   })
 })

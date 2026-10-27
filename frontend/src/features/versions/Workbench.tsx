@@ -8,14 +8,25 @@ import { ApiError } from "@/lib/api-client"
 import {
   createRelation,
   deleteRelation,
+  getClarification,
   listRelations,
   listRequirements,
   updateRelation,
 } from "./api"
+import { ClarificationChat } from "./ClarificationChat"
+import { DecisionPanel } from "./DecisionPanel"
+import { QuestionPanel } from "./QuestionPanel"
 import { RELATION_TYPE_META, RelationGraph } from "./RelationGraph"
 import { RequirementEditor } from "./RequirementEditor"
 import { RequirementList } from "./RequirementList"
-import type { RelationType, Requirement, RequirementRelation, Version } from "./types"
+import type {
+  ClarificationOverview,
+  RelationType,
+  Requirement,
+  RequirementRelation,
+  Version,
+} from "./types"
+import { useVersionStream } from "./useVersionStream"
 import { VersionBindingsForm } from "./VersionBindingsForm"
 
 /** The backend's maximum page size; the list exposes a load-more control. */
@@ -97,6 +108,11 @@ export function Workbench({ version, onChanged }: WorkbenchProps) {
   const [relationsLoading, setRelationsLoading] = useState(true)
   const [relationsError, setRelationsError] = useState("")
 
+  const [clarification, setClarification] = useState<ClarificationOverview | null>(null)
+  const [clarificationLoading, setClarificationLoading] = useState(true)
+  const [clarificationError, setClarificationError] = useState("")
+  const [clarificationRevision, setClarificationRevision] = useState(0)
+
   const [relationDraft, setRelationDraft] = useState<RelationDraft>(EMPTY_RELATION_DRAFT)
   const [editingRelationId, setEditingRelationId] = useState<string | null>(null)
   const [relationEdit, setRelationEdit] = useState<RelationEditState>({
@@ -109,6 +125,9 @@ export function Workbench({ version, onChanged }: WorkbenchProps) {
 
   const requirementsRequestRef = useRef(0)
   const relationsRequestRef = useRef(0)
+  const clarificationRequestRef = useRef(0)
+
+  const stream = useVersionStream(version.id)
 
   const loadRequirements = useCallback(
     async (cursor?: string): Promise<void> => {
@@ -168,28 +187,60 @@ export function Workbench({ version, onChanged }: WorkbenchProps) {
     }
   }, [version.id])
 
+  const loadClarification = useCallback(async (): Promise<void> => {
+    const requestId = ++clarificationRequestRef.current
+    setClarificationLoading(true)
+    setClarificationError("")
+    try {
+      const overview = await getClarification(version.id)
+      if (clarificationRequestRef.current === requestId) setClarification(overview)
+    } catch (caught) {
+      if (clarificationRequestRef.current === requestId) {
+        setClarificationError(describeLoadError(caught))
+      }
+    } finally {
+      if (clarificationRequestRef.current === requestId) setClarificationLoading(false)
+    }
+  }, [version.id])
+
   useEffect(() => {
     setRequirements([])
     setSelectedId(null)
     setCreating(false)
     setRelations([])
+    setClarification(null)
+    setClarificationError("")
     void loadRequirements()
     void loadRelations()
+    void loadClarification()
     return () => {
       // Invalidate every request started for this version.
       requirementsRequestRef.current += 1
       relationsRequestRef.current += 1
+      clarificationRequestRef.current += 1
     }
-  }, [loadRequirements, loadRelations])
+  }, [loadRequirements, loadRelations, loadClarification])
 
   function reloadAll(): void {
     void loadRequirements()
     void loadRelations()
+    void loadClarification()
   }
 
   /** Reload everything and refresh the container's version counters. */
   function reloadWithContainer(): void {
     reloadAll()
+    onChanged()
+  }
+
+  /**
+   * A clarification write changes the version counters and may update the
+   * status of questions linked from decisions, so every clarification surface
+   * (and the container header) is refreshed.
+   */
+  function handleClarificationChanged(): void {
+    setClarificationRevision((previous) => previous + 1)
+    void loadClarification()
     onChanged()
   }
 
@@ -322,7 +373,7 @@ export function Workbench({ version, onChanged }: WorkbenchProps) {
         <div>
           <h2 className="text-lg font-semibold">需求与澄清工作台</h2>
           <p className="mt-0.5 text-xs text-muted-foreground">
-            维护需求、关系、附件与资源绑定；澄清对话在右侧区域接入。
+            维护需求、关系、附件与资源绑定；右侧为澄清对话、问题与决策。
           </p>
         </div>
         <button
@@ -701,6 +752,52 @@ export function Workbench({ version, onChanged }: WorkbenchProps) {
           )}
         </section>
       </div>
+
+      <section
+        aria-label="澄清与决策"
+        className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(0,28rem)]"
+      >
+        <div className="min-w-0 space-y-2">
+          {clarificationError === "" ? null : (
+            <div
+              role="alert"
+              className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+            >
+              <p>加载澄清会话失败：{clarificationError}</p>
+              <button
+                type="button"
+                onClick={() => void loadClarification()}
+                className="mt-1.5 rounded-lg border border-border bg-card px-2.5 py-1 text-[11px] font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                重试
+              </button>
+            </div>
+          )}
+          <ClarificationChat
+            versionId={version.id}
+            session={clarification?.session ?? null}
+            events={stream.events}
+            status={stream.status}
+            sessionLoading={clarificationLoading}
+            onChanged={handleClarificationChanged}
+            onReconnect={stream.reconnect}
+          />
+        </div>
+        <div className="min-w-0 space-y-4">
+          <QuestionPanel
+            versionId={version.id}
+            requirements={requirements}
+            refreshToken={clarificationRevision}
+            onChanged={handleClarificationChanged}
+          />
+          <DecisionPanel
+            versionId={version.id}
+            requirements={requirements}
+            refreshToken={clarificationRevision}
+            onChanged={handleClarificationChanged}
+          />
+        </div>
+      </section>
 
       <VersionBindingsForm version={version} onChanged={onChanged} />
     </section>
