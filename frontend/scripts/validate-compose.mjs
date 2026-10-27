@@ -113,6 +113,7 @@ for (const [name, svc] of Object.entries({ api, web, postgres })) {
 const volumeNames = new Set(Object.keys(document?.volumes ?? {}))
 check(volumeNames.has("pgdata"), "top-level volume pgdata is missing")
 check(volumeNames.has("objects"), "top-level volume objects is missing")
+check(volumeNames.has("attachments"), "top-level volume attachments is missing")
 
 const postgresMounts = mountTargets(postgres)
 check(
@@ -124,6 +125,12 @@ check(
   apiMounts.some((mount) => mount.source === "objects" && mount.target === "/data/objects"),
   "api must mount the objects volume at /data/objects",
 )
+check(
+  apiMounts.some(
+    (mount) => mount.source === "attachments" && mount.target === "/data/version-attachments",
+  ),
+  "api must mount the attachments volume at /data/version-attachments",
+)
 
 check(hasHealthyDependency(api, "postgres"), "api must depend_on postgres (service_healthy)")
 check(hasHealthyDependency(web, "api"), "web must depend_on api (service_healthy)")
@@ -134,6 +141,10 @@ check(
   "api environment must define EZTEST_DATABASE_URL",
 )
 check(apiEnvironment.includes("EZTEST_WEB_ORIGIN"), "api environment must define EZTEST_WEB_ORIGIN")
+check(
+  apiEnvironment.includes("EZTEST_VERSION_ATTACHMENT_DIR"),
+  "api environment must define EZTEST_VERSION_ATTACHMENT_DIR",
+)
 
 check(
   String(api.build?.dockerfile ?? "").includes("Dockerfile.api"),
