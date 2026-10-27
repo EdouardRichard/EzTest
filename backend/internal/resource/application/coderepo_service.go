@@ -232,22 +232,14 @@ func (s *CodeRepoService) Validate(ctx context.Context, id int64) (*domain.CodeR
 }
 
 // MarkIndexed records a successful code index run (P4 index-state port). It
-// validates that the repository exists and is active, then updates only
-// last_indexed_at. The commit parameter names the indexed commit for the caller
-// but is deliberately not stored: last_commit stays the last validated commit,
-// so indexing never rewrites the P2 validation audit fields or the status. A
-// missing repository is a not-found error and a disabled one is a validation
-// error; neither writes.
+// writes only last_indexed_at through the narrow, status-guarded repository
+// method (ruling R44/INV-14), so a concurrent admin edit of the P2 configuration
+// or status is never overwritten. The commit parameter names the indexed commit
+// for the caller but is deliberately not stored: last_commit stays the last
+// validated commit. A missing repository stays a not-found error and a disabled
+// one stays the code_repository_disabled validation error; the repository port
+// reports both from the guarded UPDATE, so this service never reads the whole
+// row first and therefore has no read-modify-write window.
 func (s *CodeRepoService) MarkIndexed(ctx context.Context, repoID int64, commit string, at time.Time) error {
-	codeRepo, err := s.repos.GetCodeRepo(ctx, repoID)
-	if err != nil {
-		return err
-	}
-	if codeRepo.Status != domain.StatusActive {
-		return domain.NewInvalid("repoId", "code_repository_disabled",
-			fmt.Sprintf("code repository %d is disabled", repoID))
-	}
-	indexedAt := at
-	codeRepo.LastIndexedAt = &indexedAt
-	return s.repos.UpdateCodeRepo(ctx, codeRepo)
+	return s.repos.UpdateLastIndexedAt(ctx, repoID, at)
 }

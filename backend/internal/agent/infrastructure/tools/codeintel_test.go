@@ -101,6 +101,7 @@ type fakeCodeIntelQueries struct {
 	searchMore     bool
 	searchErr      error
 	searchCalls    int
+	searchActorID  int64
 	searchRepoID   int64
 	searchCommit   string
 	searchQuery    string
@@ -125,9 +126,11 @@ type fakeCodeIntelQueries struct {
 	factsFilter codeinteldomain.EntityFilter
 }
 
-// Search records the query and returns the canned entity page.
-func (f *fakeCodeIntelQueries) Search(_ context.Context, repoID int64, commit, q, kind string, limit int, cursor string) ([]codeinteldomain.CodeEntity, string, bool, error) {
+// Search records the query and returns the canned entity page. Agent-tool
+// searches have no platform user, so the audit actor is expected to be 0.
+func (f *fakeCodeIntelQueries) Search(_ context.Context, actorID, repoID int64, commit, q, kind string, limit int, cursor string) ([]codeinteldomain.CodeEntity, string, bool, error) {
 	f.searchCalls++
+	f.searchActorID = actorID
 	f.searchRepoID, f.searchCommit, f.searchQuery, f.searchKind = repoID, commit, q, kind
 	f.searchLimit, f.searchCursor = limit, cursor
 	if f.searchErr != nil {

@@ -83,7 +83,7 @@ func (stubToolIndex) GetLatest(context.Context, int64) (codeinteldomain.IndexRun
 
 type stubToolQuery struct{}
 
-func (stubToolQuery) Search(context.Context, int64, string, string, string, int, string) ([]codeinteldomain.CodeEntity, string, bool, error) {
+func (stubToolQuery) Search(context.Context, int64, int64, string, string, string, int, string) ([]codeinteldomain.CodeEntity, string, bool, error) {
 	return nil, "", false, nil
 }
 

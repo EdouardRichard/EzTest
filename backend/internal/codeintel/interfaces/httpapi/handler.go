@@ -31,8 +31,8 @@ type IndexService interface {
 }
 
 // QueryService is the read-only T0 query use case consumed by the HTTP layer.
-// *application.QueryService implements it. File records the code.read audit
-// entry itself, so the handler only forwards the authenticated actor.
+// *application.QueryService implements it. File and Search record the code.read
+// audit entry themselves, so the handler only forwards the authenticated actor.
 // VersionChanges is the version-scoped change preview (design spec §7.3, R25):
 // base is the version's bound baseline, head defaults to the repository fixed
 // branch tip and changeSetId stays nil until an analysis persists the set.
@@ -42,7 +42,7 @@ type QueryService interface {
 	Diff(ctx context.Context, repoID int64, base, head string, limit int, cursor string) (domain.ChangeSetData, error)
 	FileDiff(ctx context.Context, repoID int64, base, head, path string) (domain.FileDiff, error)
 	Facts(ctx context.Context, repoID int64, filter domain.EntityFilter) ([]domain.CodeEntity, string, bool, error)
-	Search(ctx context.Context, repoID int64, commit, q, kind string, limit int, cursor string) ([]domain.CodeEntity, string, bool, error)
+	Search(ctx context.Context, actorID, repoID int64, commit, q, kind string, limit int, cursor string) ([]domain.CodeEntity, string, bool, error)
 	Commit(ctx context.Context, repoID int64, sha string) (domain.CommitInfo, error)
 	VersionChanges(ctx context.Context, versionID int64, headCommit string) (domain.ChangeSetData, string, string, error)
 }

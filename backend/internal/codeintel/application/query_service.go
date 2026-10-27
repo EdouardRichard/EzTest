@@ -179,13 +179,14 @@ func (s *QueryService) FileDiff(ctx context.Context, repoID int64, base, head, p
 }
 
 // Facts returns one page of code entities (T0 file facts and AI facts) at a
-// commit. An empty filter commit means the fixed branch tip.
+// commit. An empty filter commit means the fixed branch tip; an explicit one
+// must be a lowercase 40-hex commit that exists in the repository.
 func (s *QueryService) Facts(ctx context.Context, repoID int64, f domain.EntityFilter) ([]domain.CodeEntity, string, bool, error) {
 	repo, err := s.readRepo(ctx, repoID)
 	if err != nil {
 		return nil, "", false, err
 	}
-	f.Commit, err = s.resolveCommit(ctx, repo, f.Commit)
+	f.Commit, err = s.resolveEntityCommit(ctx, repo, f.Commit)
 	if err != nil {
 		return nil, "", false, err
 	}
@@ -194,13 +195,15 @@ func (s *QueryService) Facts(ctx context.Context, repoID int64, f domain.EntityF
 }
 
 // Search returns one page of entities whose path or name contains q (a
-// substring search, not full text). The read is audited as code.read.
-func (s *QueryService) Search(ctx context.Context, repoID int64, commit, q, kind string, limit int, cursor string) ([]domain.CodeEntity, string, bool, error) {
+// substring search, not full text). The explicit commit is validated exactly
+// like the other persisted reads and the read is audited as code.read for the
+// authenticated actor (design spec §6.10, R32).
+func (s *QueryService) Search(ctx context.Context, actorID, repoID int64, commit, q, kind string, limit int, cursor string) ([]domain.CodeEntity, string, bool, error) {
 	repo, err := s.readRepo(ctx, repoID)
 	if err != nil {
 		return nil, "", false, err
 	}
-	commit, err = s.resolveCommit(ctx, repo, commit)
+	commit, err = s.resolveEntityCommit(ctx, repo, commit)
 	if err != nil {
 		return nil, "", false, err
 	}
@@ -215,7 +218,7 @@ func (s *QueryService) Search(ctx context.Context, repoID int64, commit, q, kind
 	if err != nil {
 		return nil, "", false, err
 	}
-	s.recordReadAudit(ctx, 0, repoID, commit, "")
+	s.recordReadAudit(ctx, actorID, repoID, commit, "")
 	return entities, nextCursor, more, nil
 }
 
@@ -237,8 +240,9 @@ func (s *QueryService) Commit(ctx context.Context, repoID int64, sha string) (do
 }
 
 // VersionChanges computes the version-scoped change preview (design spec §7.3):
-// base is always the version's bound baseline commit. An explicit head must be
-// a lowercase 40-hex commit reachable from the baseline (git is-ancestor) or it
+// base is always the version's bound baseline commit; a missing or malformed
+// baseline is the documented 422 baseline_commit_missing. An explicit head must
+// be a lowercase 40-hex commit reachable from the baseline (git is-ancestor) or it
 // is rejected with the documented 422 invalid_head; an empty head resolves the
 // repository's fixed branch tip live. Nothing is persisted: when a deterministic
 // change set for (repo, base, head) already exists its id is attached, otherwise
@@ -253,9 +257,12 @@ func (s *QueryService) VersionChanges(ctx context.Context, versionID int64, head
 			fmt.Sprintf("codeintel: version %d has no code repository binding", versionID))
 	}
 	base := strings.TrimSpace(info.BaselineCommit)
-	if base == "" {
+	if base == "" || !queryCommitHashPattern.MatchString(base) {
+		// A malformed baseline is the same missing-baseline verdict as the
+		// analysis trigger (AnalysisService.Start), never a commit_not_found
+		// leaking out of the diff.
 		return domain.ChangeSetData{}, "", "", domain.NewInvalid("versionId", "baseline_commit_missing",
-			fmt.Sprintf("codeintel: version %d has no code baseline commit", versionID))
+			fmt.Sprintf("codeintel: version %d has no valid code baseline commit", versionID))
 	}
 
 	repo, err := s.readRepo(ctx, info.RepoID)
@@ -344,6 +351,27 @@ func (s *QueryService) resolveCommit(ctx context.Context, repo RepoInfo, commit 
 		return commit, nil
 	}
 	return s.deps.Git.Head(ctx, repo.LocalPath, repo.FixedBranch)
+}
+
+// resolveEntityCommit resolves the commit of a persisted facts/search read. An
+// omitted commit keeps the fixed-branch-tip default; an explicit one must be a
+// lowercase 40-hex commit that exists in the repository (read through the same
+// Git port as the commit metadata endpoint). Without this check a malformed or
+// unknown commit reached the SQL layer and silently returned an empty page
+// instead of the documented 422 (design spec §7.1 invalid_head/commit_not_found).
+func (s *QueryService) resolveEntityCommit(ctx context.Context, repo RepoInfo, commit string) (string, error) {
+	commit = strings.TrimSpace(commit)
+	if commit == "" {
+		return s.resolveCommit(ctx, repo, "")
+	}
+	if !queryCommitHashPattern.MatchString(commit) {
+		return "", domain.NewInvalid("commit", "invalid_head",
+			"codeintel: commit must be a lowercase 40-hex commit id")
+	}
+	if _, err := s.deps.Git.Commit(ctx, repo.LocalPath, commit); err != nil {
+		return "", err
+	}
+	return commit, nil
 }
 
 // recordReadAudit records one code.read entry. Audit failures never block the

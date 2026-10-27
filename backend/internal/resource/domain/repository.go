@@ -1,6 +1,9 @@
 package domain
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // Page is a cursor page request. AfterID is exclusive; Limit is the requested
 // page size (the HTTP layer bounds it to 1-100).
@@ -101,5 +104,11 @@ type CodeRepoRepository interface {
 	GetCodeRepo(ctx context.Context, id int64) (*CodeRepository, error)
 	ListCodeRepos(ctx context.Context, f CodeRepoFilter) ([]CodeRepository, bool, error)
 	UpdateCodeRepo(ctx context.Context, r *CodeRepository) error
+	// UpdateLastIndexedAt records the last successful P4 index time of one
+	// active repository. It is a single-column, status-guarded write so it never
+	// restores a stale copy of the other P2 columns (INV-14). A disabled
+	// repository is invalid (code_repository_disabled) and a missing one is not
+	// found.
+	UpdateLastIndexedAt(ctx context.Context, id int64, at time.Time) error
 	DeleteCodeRepo(ctx context.Context, id int64) error
 }

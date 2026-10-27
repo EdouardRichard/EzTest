@@ -78,9 +78,11 @@ type CodeIntelIndexPort interface {
 
 // CodeIntelQueryPort is the read-only T0 query subset behind
 // code.search/diff/facts/routes/apis. It is implemented by
-// *application.QueryService.
+// *application.QueryService. The Search actorID is the code.read audit actor;
+// agent-tool searches have no platform user in this port, so runCodeSearch
+// forwards 0 (the same actor the pre-R32 tool path recorded).
 type CodeIntelQueryPort interface {
-	Search(ctx context.Context, repoID int64, commit, q, kind string, limit int, cursor string) ([]codeinteldomain.CodeEntity, string, bool, error)
+	Search(ctx context.Context, actorID, repoID int64, commit, q, kind string, limit int, cursor string) ([]codeinteldomain.CodeEntity, string, bool, error)
 	Diff(ctx context.Context, repoID int64, base, head string, limit int, cursor string) (codeinteldomain.ChangeSetData, error)
 	Facts(ctx context.Context, repoID int64, filter codeinteldomain.EntityFilter) ([]codeinteldomain.CodeEntity, string, bool, error)
 }
@@ -318,7 +320,7 @@ func runCodeSearch(ctx context.Context, deps CodeIntelToolDeps, args json.RawMes
 	if query == "" {
 		return invalidToolArguments("q is required"), nil
 	}
-	entities, _, more, err := deps.Queries.Search(ctx, input.RepoID, commit, query,
+	entities, _, more, err := deps.Queries.Search(ctx, 0, input.RepoID, commit, query,
 		strings.TrimSpace(input.Kind), codeIntelBoundedLimit(input.Limit, codeIntelMaxSearchResults), "")
 	if err != nil {
 		return codeIntelToolOutcome(err)
