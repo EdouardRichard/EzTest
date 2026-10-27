@@ -1,19 +1,20 @@
 "use client"
 
-import { Globe, Pencil, Plus, RefreshCw } from "lucide-react"
+import { Globe, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react"
 import { type FormEvent, useCallback, useEffect, useState } from "react"
 
 import { EmptyState } from "@/components/ui/EmptyState"
 import { StatusBadge } from "@/components/ui/StatusBadge"
 import { ApiError } from "@/lib/api-client"
 
-import { createEnvironment, listEnvironments, updateEnvironment } from "./api"
+import { createEnvironment, deleteEnvironment, listEnvironments, updateEnvironment } from "./api"
 import type { EnvironmentDTO } from "./types"
 
 const KEY_PATTERN = /^[a-z0-9][a-z0-9_-]{1,63}$/
 const DEFAULT_KIND = "staging"
 const MAX_ALLOWED_HOSTS = 50
 const MAX_EXPECT_STATUS = 10
+const MAX_LOGIN_CHECK_URL_LENGTH = 2048
 
 const KIND_OPTIONS = [
   { value: "dev", label: "开发" },
@@ -31,6 +32,9 @@ function describeError(error: unknown): string {
     if (error.status === 0) return "无法连接 API 服务，请确认后端已启动。"
     if (error.status === 403) return "当前账户没有管理员权限。"
     if (error.details.reason === "duplicate_key") return "环境标识已存在，请更换 key。"
+    if (error.details.reason === "has_dependencies") {
+      return "存在依赖，无法删除（has_dependencies）。"
+    }
     return error.message
   }
   return error instanceof Error ? error.message : "未知错误"
@@ -111,8 +115,14 @@ function validateForm(form: EnvironmentFormState, editing: boolean): string {
     return `允许主机最多 ${MAX_ALLOWED_HOSTS} 个。`
   }
   if (form.loginCheckUrl.trim() !== "") {
-    if (!/^https?:\/\//i.test(form.loginCheckUrl.trim())) {
-      return "登录检查 URL 必须以 http:// 或 https:// 开头。"
+    const loginCheckUrl = form.loginCheckUrl.trim()
+    if (loginCheckUrl.length > MAX_LOGIN_CHECK_URL_LENGTH) {
+      return `登录检查 URL 不能超过 ${MAX_LOGIN_CHECK_URL_LENGTH} 个字符。`
+    }
+    // Spec §6.3: an absolute http(s) URL is used as-is; anything else is joined
+    // to the environment base URL, so it must be a rooted path such as /account.
+    if (!/^https?:\/\//i.test(loginCheckUrl) && !loginCheckUrl.startsWith("/")) {
+      return "登录检查 URL 需为 http(s):// 绝对地址，或以 / 开头的相对路径。"
     }
     if (parseStatuses(form.expectStatus) === null) {
       return "期望状态码需为 100–599 的整数，最多 10 个。"
@@ -129,6 +139,10 @@ const primaryButtonClass =
   "inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
 const secondaryButtonClass =
   "inline-flex items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-2 text-sm font-medium transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+const rowActionClass =
+  "inline-flex items-center gap-1 rounded-lg border border-border px-2 py-1 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+const rowDangerActionClass =
+  "inline-flex items-center gap-1 rounded-lg border border-destructive/40 bg-destructive/10 px-2 py-1 text-xs font-medium text-destructive transition-colors hover:bg-destructive/20 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
 
 export type EnvironmentsPanelProps = {
   systemId: number
@@ -148,6 +162,8 @@ export function EnvironmentsPanel({ systemId, canWrite }: EnvironmentsPanelProps
   const [editingId, setEditingId] = useState<number | null>(null)
   const [form, setForm] = useState<EnvironmentFormState>(EMPTY_FORM)
   const [saving, setSaving] = useState(false)
+  const [deletingId, setDeletingId] = useState<number | null>(null)
+  const [confirmingDeleteId, setConfirmingDeleteId] = useState<number | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -242,6 +258,26 @@ export function EnvironmentsPanel({ systemId, canWrite }: EnvironmentsPanelProps
       setError(describeError(caught))
     } finally {
       setSaving(false)
+    }
+  }
+
+  async function handleDelete(environment: EnvironmentDTO) {
+    setConfirmingDeleteId(null)
+    setDeletingId(environment.id)
+    setError("")
+    setNotice("")
+    try {
+      await deleteEnvironment(environment.id)
+      setEnvironments((previous) => previous.filter((item) => item.id !== environment.id))
+      if (editingId === environment.id) {
+        setFormOpen(false)
+        setEditingId(null)
+      }
+      setNotice(`已删除环境 ${environment.name}。`)
+    } catch (caught) {
+      setError(describeError(caught))
+    } finally {
+      setDeletingId(null)
     }
   }
 
@@ -426,9 +462,12 @@ export function EnvironmentsPanel({ systemId, canWrite }: EnvironmentsPanelProps
                 value={form.loginCheckUrl}
                 onChange={(event) => updateForm("loginCheckUrl", event.target.value)}
                 autoComplete="off"
-                placeholder="http://localhost:13335/account"
+                placeholder="/account"
                 className={inputClass}
               />
+              <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
+                可填写 http(s):// 绝对地址，或以 / 开头的相对路径（与 Base URL 拼接）。
+              </p>
             </div>
             <div className="grid gap-2 sm:grid-cols-2">
               <div>
@@ -557,15 +596,55 @@ export function EnvironmentsPanel({ systemId, canWrite }: EnvironmentsPanelProps
                   </td>
                   {canWrite ? (
                     <td className="px-2.5 py-2 text-right">
-                      <button
-                        type="button"
-                        onClick={() => startEdit(environment)}
-                        aria-label={`编辑 ${environment.name}`}
-                        className="inline-flex items-center gap-1 rounded-lg border border-border px-2 py-1 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                      >
-                        <Pencil className="h-3 w-3" aria-hidden="true" />
-                        编辑
-                      </button>
+                      <div className="flex flex-wrap items-center justify-end gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => startEdit(environment)}
+                          aria-label={`编辑 ${environment.name}`}
+                          className={rowActionClass}
+                        >
+                          <Pencil className="h-3 w-3" aria-hidden="true" />
+                          编辑
+                        </button>
+                        {confirmingDeleteId === environment.id ? (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => void handleDelete(environment)}
+                              disabled={deletingId === environment.id}
+                              aria-label={`确认删除环境 ${environment.name}`}
+                              className={rowDangerActionClass}
+                            >
+                              <Trash2 className="h-3 w-3" aria-hidden="true" />
+                              确认删除
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setConfirmingDeleteId(null)}
+                              disabled={deletingId === environment.id}
+                              aria-label={`取消删除环境 ${environment.name}`}
+                              className={rowActionClass}
+                            >
+                              取消
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setConfirmingDeleteId(environment.id)
+                              setError("")
+                              setNotice("")
+                            }}
+                            disabled={deletingId === environment.id}
+                            aria-label={`删除环境 ${environment.name}`}
+                            className={rowActionClass}
+                          >
+                            <Trash2 className="h-3 w-3" aria-hidden="true" />
+                            删除
+                          </button>
+                        )}
+                      </div>
                     </td>
                   ) : null}
                 </tr>

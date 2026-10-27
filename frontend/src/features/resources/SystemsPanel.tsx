@@ -1,13 +1,13 @@
 "use client"
 
-import { Pencil, Plus, RefreshCw, Server } from "lucide-react"
+import { Pencil, Plus, RefreshCw, Server, Trash2 } from "lucide-react"
 import { type FormEvent, useCallback, useEffect, useState } from "react"
 
 import { EmptyState } from "@/components/ui/EmptyState"
 import { StatusBadge } from "@/components/ui/StatusBadge"
 import { ApiError } from "@/lib/api-client"
 
-import { createSystem, listSystems, updateSystem } from "./api"
+import { createSystem, deleteSystem, listSystems, updateSystem } from "./api"
 import type { SystemDTO } from "./types"
 
 const SYSTEM_PAGE_LIMIT = 100
@@ -28,6 +28,9 @@ function describeError(error: unknown): string {
     if (error.status === 0) return "无法连接 API 服务，请确认后端已启动。"
     if (error.status === 403) return "当前账户没有管理员权限。"
     if (error.details.reason === "duplicate_key") return "系统标识已存在，请更换 key。"
+    if (error.details.reason === "has_dependencies") {
+      return "存在依赖，无法删除（has_dependencies）。"
+    }
     return error.message
   }
   return error instanceof Error ? error.message : "未知错误"
@@ -84,6 +87,8 @@ const primaryButtonClass =
   "inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
 const secondaryButtonClass =
   "inline-flex items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-2 text-sm font-medium transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+const dangerButtonClass =
+  "inline-flex items-center gap-1.5 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm font-medium text-destructive transition-colors hover:bg-destructive/20 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
 
 export type SystemsPanelProps = {
   canWrite: boolean
@@ -105,6 +110,11 @@ export function SystemsPanel({ canWrite, selectedId = null, onSelect }: SystemsP
   const [editingId, setEditingId] = useState<number | null>(null)
   const [form, setForm] = useState<SystemFormState>(EMPTY_FORM)
   const [saving, setSaving] = useState(false)
+  const [deletingId, setDeletingId] = useState<number | null>(null)
+  const [confirmingDeleteId, setConfirmingDeleteId] = useState<number | null>(null)
+
+  const selectedSystem =
+    selectedId === null ? null : (systems.find((system) => system.id === selectedId) ?? null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -187,6 +197,30 @@ export function SystemsPanel({ canWrite, selectedId = null, onSelect }: SystemsP
     }
   }
 
+  async function handleDelete(system: SystemDTO) {
+    setConfirmingDeleteId(null)
+    setDeletingId(system.id)
+    setError("")
+    setNotice("")
+    try {
+      await deleteSystem(system.id)
+      const remaining = systems.filter((item) => item.id !== system.id)
+      setSystems(remaining)
+      if (editingId === system.id) {
+        setFormOpen(false)
+        setEditingId(null)
+      }
+      setNotice(`已删除系统 ${system.name}。`)
+      // The selection is owned by the page; move it to a surviving system so the
+      // environment panel never points at the deleted row.
+      if (selectedId === system.id && remaining.length > 0) onSelect(remaining[0].id)
+    } catch (caught) {
+      setError(describeError(caught))
+    } finally {
+      setDeletingId(null)
+    }
+  }
+
   return (
     <section
       aria-labelledby="systems-panel-title"
@@ -202,7 +236,7 @@ export function SystemsPanel({ canWrite, selectedId = null, onSelect }: SystemsP
             选择左侧系统查看其环境；管理员可新建与编辑。
           </p>
         </div>
-        <div className="flex items-center gap-1.5">
+        <div className="flex flex-wrap items-center gap-1.5">
           <button
             type="button"
             onClick={() => void load()}
@@ -217,6 +251,43 @@ export function SystemsPanel({ canWrite, selectedId = null, onSelect }: SystemsP
               <Plus className="h-4 w-4" aria-hidden="true" />
               新建系统
             </button>
+          ) : null}
+          {canWrite && selectedSystem !== null ? (
+            confirmingDeleteId === selectedSystem.id ? (
+              <>
+                <button
+                  type="button"
+                  onClick={() => void handleDelete(selectedSystem)}
+                  disabled={deletingId === selectedSystem.id}
+                  className={dangerButtonClass}
+                >
+                  <Trash2 className="h-4 w-4" aria-hidden="true" />
+                  确认删除
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setConfirmingDeleteId(null)}
+                  disabled={deletingId === selectedSystem.id}
+                  className={secondaryButtonClass}
+                >
+                  取消
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                onClick={() => {
+                  setConfirmingDeleteId(selectedSystem.id)
+                  setError("")
+                  setNotice("")
+                }}
+                disabled={deletingId === selectedSystem.id}
+                className={secondaryButtonClass}
+              >
+                <Trash2 className="h-4 w-4" aria-hidden="true" />
+                删除系统
+              </button>
+            )
           ) : null}
         </div>
       </div>

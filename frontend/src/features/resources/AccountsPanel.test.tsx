@@ -5,21 +5,27 @@ const mocks = vi.hoisted(() => ({
   listAccounts: vi.fn(),
   createAccount: vi.fn(),
   updateAccount: vi.fn(),
+  deleteAccount: vi.fn(),
   listSystems: vi.fn(),
   listAccesses: vi.fn(),
   createAccess: vi.fn(),
   updateAccess: vi.fn(),
+  deleteAccess: vi.fn(),
 }))
 
 vi.mock("./api", () => ({
   listAccounts: mocks.listAccounts,
   createAccount: mocks.createAccount,
   updateAccount: mocks.updateAccount,
+  deleteAccount: mocks.deleteAccount,
   listSystems: mocks.listSystems,
   listAccesses: mocks.listAccesses,
   createAccess: mocks.createAccess,
   updateAccess: mocks.updateAccess,
+  deleteAccess: mocks.deleteAccess,
 }))
+
+import { ApiError } from "@/lib/api-client"
 
 import { AccountsPanel } from "./AccountsPanel"
 import type { AccessDTO, AccountDTO, SystemDTO } from "./types"
@@ -134,6 +140,7 @@ describe("AccountsPanel", () => {
 
     expect(screen.queryByRole("button", { name: "新建账号" })).toBeNull()
     expect(screen.queryByRole("button", { name: "编辑账号 QA 01" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "删除账号 QA 01" })).toBeNull()
 
     fireEvent.click(screen.getByRole("button", { name: "QA 01" }))
 
@@ -146,6 +153,7 @@ describe("AccountsPanel", () => {
     expect(screen.getByText("继承系统")).toBeTruthy()
     expect(screen.queryByRole("button", { name: "新建 Access" })).toBeNull()
     expect(screen.queryByRole("button", { name: "编辑 Access 8" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "删除 Access 8" })).toBeNull()
   })
 
   it("creates an account and selects it", async () => {
@@ -316,5 +324,86 @@ describe("AccountsPanel", () => {
 
     expect(screen.queryByRole("button", { name: "编辑 Access 8" })).toBeNull()
     expect(screen.getByRole("button", { name: "编辑 Access 11" })).toBeTruthy()
+  })
+
+  it("deletes an account only after the inline confirmation", async () => {
+    mocks.deleteAccount.mockResolvedValue(undefined)
+
+    render(<AccountsPanel canWrite />)
+    await screen.findByText("QA 01")
+
+    fireEvent.click(screen.getByRole("button", { name: "删除账号 QA 01" }))
+    expect(mocks.deleteAccount).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole("button", { name: "确认删除账号 QA 01" }))
+
+    await waitFor(() => expect(mocks.deleteAccount).toHaveBeenCalledWith(3))
+    const status = await screen.findByRole("status")
+    expect(status.textContent).toContain("已删除账号 QA 01。")
+    await waitFor(() => expect(screen.queryByText("QA 01")).toBeNull())
+  })
+
+  it("shows the has_dependencies reason when an account delete is refused", async () => {
+    mocks.deleteAccount.mockRejectedValue(
+      new ApiError({
+        status: 409,
+        code: "conflict",
+        message: "account still has accesses",
+        details: { reason: "has_dependencies" },
+      }),
+    )
+
+    render(<AccountsPanel canWrite />)
+    await screen.findByText("QA 01")
+
+    fireEvent.click(screen.getByRole("button", { name: "删除账号 QA 01" }))
+    fireEvent.click(screen.getByRole("button", { name: "确认删除账号 QA 01" }))
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toContain("has_dependencies")
+    expect(screen.getByText("QA 01")).toBeTruthy()
+  })
+
+  it("deletes an access only after the inline confirmation", async () => {
+    mocks.deleteAccess.mockResolvedValue(undefined)
+
+    render(<AccountsPanel canWrite />)
+    await screen.findByText("QA 01")
+    fireEvent.click(screen.getByRole("button", { name: "QA 01" }))
+    await waitFor(() => expect(mocks.listAccesses).toHaveBeenCalledWith(3, { limit: 100 }))
+
+    fireEvent.click(screen.getByRole("button", { name: "删除 Access 8" }))
+    expect(mocks.deleteAccess).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole("button", { name: "确认删除 Access 8" }))
+
+    await waitFor(() => expect(mocks.deleteAccess).toHaveBeenCalledWith(8))
+    const status = await screen.findByRole("status")
+    expect(status.textContent).toContain("已删除 Access #8。")
+    await waitFor(() => expect(screen.queryByRole("button", { name: "编辑 Access 8" })).toBeNull())
+    expect(screen.getByRole("button", { name: "编辑 Access 9" })).toBeTruthy()
+  })
+
+  it("shows the has_dependencies reason when an access delete is refused", async () => {
+    mocks.deleteAccess.mockRejectedValue(
+      new ApiError({
+        status: 409,
+        code: "conflict",
+        message: "access still has sessions",
+        details: { reason: "has_dependencies" },
+      }),
+    )
+
+    render(<AccountsPanel canWrite />)
+    await screen.findByText("QA 01")
+    fireEvent.click(screen.getByRole("button", { name: "QA 01" }))
+    await waitFor(() => expect(mocks.listAccesses).toHaveBeenCalledWith(3, { limit: 100 }))
+
+    fireEvent.click(screen.getByRole("button", { name: "删除 Access 8" }))
+    fireEvent.click(screen.getByRole("button", { name: "确认删除 Access 8" }))
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toContain("has_dependencies")
+    expect(screen.getByRole("button", { name: "编辑 Access 8" })).toBeTruthy()
   })
 })

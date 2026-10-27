@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   importAppModels: vi.fn(),
   createAppModel: vi.fn(),
   updateAppModel: vi.fn(),
+  deleteAppModel: vi.fn(),
 }))
 
 vi.mock("./api", () => ({
@@ -13,6 +14,7 @@ vi.mock("./api", () => ({
   importAppModels: mocks.importAppModels,
   createAppModel: mocks.createAppModel,
   updateAppModel: mocks.updateAppModel,
+  deleteAppModel: mocks.deleteAppModel,
 }))
 
 import { ApiError } from "@/lib/api-client"
@@ -82,6 +84,7 @@ describe("AppModelsPanel", () => {
     expect(screen.queryByRole("button", { name: "新建节点" })).toBeNull()
     expect(screen.queryByRole("button", { name: "JSON 导入" })).toBeNull()
     expect(screen.queryByRole("button", { name: "编辑 Orders" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "删除节点 Orders" })).toBeNull()
   })
 
   it("requests the maximum page size and reloads when the kind filter changes", async () => {
@@ -238,5 +241,51 @@ describe("AppModelsPanel", () => {
         method: "",
       }),
     )
+  })
+
+  it("deletes a node subtree only after the inline confirmation", async () => {
+    const child = {
+      ...makeNode(7, "api", "api:GET /orders/1", "Order detail", "/orders/1", "GET"),
+      parentId: 5,
+    }
+    mocks.listAppModels.mockResolvedValue(page([ROUTE, child, API_NODE]))
+    mocks.deleteAppModel.mockResolvedValue(undefined)
+
+    render(<AppModelsPanel systemId={1} canWrite />)
+    await screen.findByText("route:/orders")
+    expect(screen.getByText("Order detail")).toBeTruthy()
+
+    fireEvent.click(screen.getByRole("button", { name: "删除节点 Orders" }))
+    expect(mocks.deleteAppModel).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole("button", { name: "确认删除节点 Orders" }))
+
+    await waitFor(() => expect(mocks.deleteAppModel).toHaveBeenCalledWith(5))
+    const status = await screen.findByRole("status")
+    expect(status.textContent).toContain("已删除节点 Orders。")
+    await waitFor(() => expect(screen.queryByText("Orders")).toBeNull())
+    expect(screen.queryByText("Order detail")).toBeNull()
+    expect(screen.getByText("订单查询")).toBeTruthy()
+  })
+
+  it("shows the dependency reason when a node delete is refused", async () => {
+    mocks.deleteAppModel.mockRejectedValue(
+      new ApiError({
+        status: 409,
+        code: "conflict",
+        message: "node still has dependents",
+        details: { reason: "has_dependencies" },
+      }),
+    )
+
+    render(<AppModelsPanel systemId={1} canWrite />)
+    await screen.findByText("route:/orders")
+
+    fireEvent.click(screen.getByRole("button", { name: "删除节点 Orders" }))
+    fireEvent.click(screen.getByRole("button", { name: "确认删除节点 Orders" }))
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toContain("has_dependencies")
+    expect(screen.getByText("Orders")).toBeTruthy()
   })
 })

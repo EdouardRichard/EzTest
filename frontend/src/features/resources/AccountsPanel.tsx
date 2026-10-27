@@ -1,6 +1,6 @@
 "use client"
 
-import { KeyRound, Pencil, Plus, RefreshCw, Users } from "lucide-react"
+import { KeyRound, Pencil, Plus, RefreshCw, Trash2, Users } from "lucide-react"
 import { type FormEvent, useCallback, useEffect, useRef, useState } from "react"
 
 import { EmptyState } from "@/components/ui/EmptyState"
@@ -11,6 +11,8 @@ import { AccessForm, type AccessWriteInput } from "./AccessForm"
 import {
   createAccess,
   createAccount,
+  deleteAccess,
+  deleteAccount,
   listAccesses,
   listAccounts,
   listSystems,
@@ -107,6 +109,10 @@ const primaryButtonClass =
   "inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
 const secondaryButtonClass =
   "inline-flex items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-2 text-sm font-medium transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+const rowActionClass =
+  "inline-flex items-center gap-1 rounded-lg border border-border px-2 py-1 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+const rowDangerActionClass =
+  "inline-flex items-center gap-1 rounded-lg border border-destructive/40 bg-destructive/10 px-2 py-1 text-xs font-medium text-destructive transition-colors hover:bg-destructive/20 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
 
 export type AccountsPanelProps = {
   canWrite: boolean
@@ -130,6 +136,8 @@ export function AccountsPanel({ canWrite }: AccountsPanelProps) {
   const [editingId, setEditingId] = useState<number | null>(null)
   const [form, setForm] = useState<AccountFormState>(EMPTY_ACCOUNT_FORM)
   const [saving, setSaving] = useState(false)
+  const [deletingAccountId, setDeletingAccountId] = useState<number | null>(null)
+  const [confirmingAccountDeleteId, setConfirmingAccountDeleteId] = useState<number | null>(null)
 
   const [accesses, setAccesses] = useState<AccessDTO[]>([])
   const [accessesAccountId, setAccessesAccountId] = useState<number | null>(null)
@@ -139,6 +147,8 @@ export function AccountsPanel({ canWrite }: AccountsPanelProps) {
   const [accessNotice, setAccessNotice] = useState("")
   const [accessFormOpen, setAccessFormOpen] = useState(false)
   const [editingAccess, setEditingAccess] = useState<AccessDTO | null>(null)
+  const [deletingAccessId, setDeletingAccessId] = useState<number | null>(null)
+  const [confirmingAccessDeleteId, setConfirmingAccessDeleteId] = useState<number | null>(null)
 
   const loadAccounts = useCallback(async () => {
     setLoading(true)
@@ -293,6 +303,31 @@ export function AccountsPanel({ canWrite }: AccountsPanelProps) {
     }
   }
 
+  async function handleDeleteAccount(account: AccountDTO) {
+    setConfirmingAccountDeleteId(null)
+    setDeletingAccountId(account.id)
+    setError("")
+    setNotice("")
+    try {
+      await deleteAccount(account.id)
+      setAccounts((previous) => previous.filter((item) => item.id !== account.id))
+      if (editingId === account.id) {
+        setFormOpen(false)
+        setEditingId(null)
+      }
+      if (selectedAccountId === account.id) {
+        setSelectedAccountId(null)
+        setAccessFormOpen(false)
+        setEditingAccess(null)
+      }
+      setNotice(`已删除账号 ${account.label}。`)
+    } catch (caught) {
+      setError(describeError(caught))
+    } finally {
+      setDeletingAccountId(null)
+    }
+  }
+
   function startCreateAccess() {
     setEditingAccess(null)
     setAccessFormOpen(true)
@@ -327,6 +362,27 @@ export function AccountsPanel({ canWrite }: AccountsPanelProps) {
     setAccessFormOpen(false)
     setEditingAccess(null)
     await loadAccesses(selectedAccount.id)
+  }
+
+  async function handleDeleteAccess(access: AccessDTO) {
+    if (selectedAccount === null) return
+    setConfirmingAccessDeleteId(null)
+    setDeletingAccessId(access.id)
+    setAccessError("")
+    setAccessNotice("")
+    try {
+      await deleteAccess(access.id)
+      setAccesses((previous) => previous.filter((item) => item.id !== access.id))
+      if (editingAccess?.id === access.id) {
+        setAccessFormOpen(false)
+        setEditingAccess(null)
+      }
+      setAccessNotice(`已删除 Access #${access.id}。`)
+    } catch (caught) {
+      setAccessError(describeError(caught))
+    } finally {
+      setDeletingAccessId(null)
+    }
   }
 
   return (
@@ -537,15 +593,55 @@ export function AccountsPanel({ canWrite }: AccountsPanelProps) {
                     </td>
                     {canWrite ? (
                       <td className="px-2.5 py-2 text-right">
-                        <button
-                          type="button"
-                          onClick={() => startEdit(account)}
-                          aria-label={`编辑账号 ${account.label}`}
-                          className="inline-flex items-center gap-1 rounded-lg border border-border px-2 py-1 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                        >
-                          <Pencil className="h-3 w-3" aria-hidden="true" />
-                          编辑
-                        </button>
+                        <div className="flex flex-wrap items-center justify-end gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => startEdit(account)}
+                            aria-label={`编辑账号 ${account.label}`}
+                            className={rowActionClass}
+                          >
+                            <Pencil className="h-3 w-3" aria-hidden="true" />
+                            编辑
+                          </button>
+                          {confirmingAccountDeleteId === account.id ? (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() => void handleDeleteAccount(account)}
+                                disabled={deletingAccountId === account.id}
+                                aria-label={`确认删除账号 ${account.label}`}
+                                className={rowDangerActionClass}
+                              >
+                                <Trash2 className="h-3 w-3" aria-hidden="true" />
+                                确认删除
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setConfirmingAccountDeleteId(null)}
+                                disabled={deletingAccountId === account.id}
+                                aria-label={`取消删除账号 ${account.label}`}
+                                className={rowActionClass}
+                              >
+                                取消
+                              </button>
+                            </>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setConfirmingAccountDeleteId(account.id)
+                                setError("")
+                                setNotice("")
+                              }}
+                              disabled={deletingAccountId === account.id}
+                              aria-label={`删除账号 ${account.label}`}
+                              className={rowActionClass}
+                            >
+                              <Trash2 className="h-3 w-3" aria-hidden="true" />
+                              删除
+                            </button>
+                          )}
+                        </div>
                       </td>
                     ) : null}
                   </tr>
@@ -695,15 +791,55 @@ export function AccountsPanel({ canWrite }: AccountsPanelProps) {
                       </td>
                       {canWrite ? (
                         <td className="px-2.5 py-2 text-right">
-                          <button
-                            type="button"
-                            onClick={() => startEditAccess(access)}
-                            aria-label={`编辑 Access ${access.id}`}
-                            className="inline-flex items-center gap-1 rounded-lg border border-border px-2 py-1 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                          >
-                            <Pencil className="h-3 w-3" aria-hidden="true" />
-                            编辑
-                          </button>
+                          <div className="flex flex-wrap items-center justify-end gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => startEditAccess(access)}
+                              aria-label={`编辑 Access ${access.id}`}
+                              className={rowActionClass}
+                            >
+                              <Pencil className="h-3 w-3" aria-hidden="true" />
+                              编辑
+                            </button>
+                            {confirmingAccessDeleteId === access.id ? (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={() => void handleDeleteAccess(access)}
+                                  disabled={deletingAccessId === access.id}
+                                  aria-label={`确认删除 Access ${access.id}`}
+                                  className={rowDangerActionClass}
+                                >
+                                  <Trash2 className="h-3 w-3" aria-hidden="true" />
+                                  确认删除
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setConfirmingAccessDeleteId(null)}
+                                  disabled={deletingAccessId === access.id}
+                                  aria-label={`取消删除 Access ${access.id}`}
+                                  className={rowActionClass}
+                                >
+                                  取消
+                                </button>
+                              </>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setConfirmingAccessDeleteId(access.id)
+                                  setAccessError("")
+                                  setAccessNotice("")
+                                }}
+                                disabled={deletingAccessId === access.id}
+                                aria-label={`删除 Access ${access.id}`}
+                                className={rowActionClass}
+                              >
+                                <Trash2 className="h-3 w-3" aria-hidden="true" />
+                                删除
+                              </button>
+                            )}
+                          </div>
                         </td>
                       ) : null}
                     </tr>

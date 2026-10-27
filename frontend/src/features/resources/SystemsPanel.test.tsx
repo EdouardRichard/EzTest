@@ -5,12 +5,14 @@ const mocks = vi.hoisted(() => ({
   listSystems: vi.fn(),
   createSystem: vi.fn(),
   updateSystem: vi.fn(),
+  deleteSystem: vi.fn(),
 }))
 
 vi.mock("./api", () => ({
   listSystems: mocks.listSystems,
   createSystem: mocks.createSystem,
   updateSystem: mocks.updateSystem,
+  deleteSystem: mocks.deleteSystem,
 }))
 
 import { ApiError } from "@/lib/api-client"
@@ -47,6 +49,7 @@ describe("SystemsPanel", () => {
     mocks.listSystems.mockReset()
     mocks.createSystem.mockReset()
     mocks.updateSystem.mockReset()
+    mocks.deleteSystem.mockReset()
     mocks.listSystems.mockResolvedValue({ items: [SHOP, BLOG], nextCursor: null, hasMore: false })
   })
 
@@ -55,12 +58,13 @@ describe("SystemsPanel", () => {
   })
 
   it("lists systems and hides every write control from readonly users", async () => {
-    render(<SystemsPanel canWrite={false} selectedId={null} onSelect={vi.fn()} />)
+    render(<SystemsPanel canWrite={false} selectedId={1} onSelect={vi.fn()} />)
 
     expect(await screen.findByText("Shop")).toBeTruthy()
     expect(screen.getByText("Blog")).toBeTruthy()
     expect(screen.queryByRole("button", { name: "新建系统" })).toBeNull()
     expect(screen.queryByRole("button", { name: "编辑 Shop" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "删除系统" })).toBeNull()
     await waitFor(() => expect(mocks.listSystems).toHaveBeenCalledWith({ limit: 100 }))
   })
 
@@ -153,5 +157,44 @@ describe("SystemsPanel", () => {
 
     const alert = await screen.findByRole("alert")
     expect(alert.textContent).toContain("管理员")
+  })
+
+  it("deletes the selected system only after the inline confirmation and selects the next", async () => {
+    mocks.deleteSystem.mockResolvedValue(undefined)
+    const onSelect = vi.fn()
+
+    render(<SystemsPanel canWrite selectedId={1} onSelect={onSelect} />)
+    await screen.findByText("Shop")
+
+    fireEvent.click(screen.getByRole("button", { name: "删除系统" }))
+    expect(mocks.deleteSystem).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole("button", { name: "确认删除" }))
+
+    await waitFor(() => expect(mocks.deleteSystem).toHaveBeenCalledWith(1))
+    const status = await screen.findByRole("status")
+    expect(status.textContent).toContain("已删除系统 Shop。")
+    await waitFor(() => expect(onSelect).toHaveBeenCalledWith(2))
+  })
+
+  it("shows the has_dependencies reason when a system delete is refused", async () => {
+    mocks.deleteSystem.mockRejectedValue(
+      new ApiError({
+        status: 409,
+        code: "conflict",
+        message: "system still has environments",
+        details: { reason: "has_dependencies" },
+      }),
+    )
+
+    render(<SystemsPanel canWrite selectedId={1} onSelect={vi.fn()} />)
+    await screen.findByText("Shop")
+
+    fireEvent.click(screen.getByRole("button", { name: "删除系统" }))
+    fireEvent.click(screen.getByRole("button", { name: "确认删除" }))
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toContain("has_dependencies")
+    expect(screen.getByText("Shop")).toBeTruthy()
   })
 })

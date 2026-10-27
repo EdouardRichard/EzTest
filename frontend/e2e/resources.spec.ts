@@ -113,12 +113,13 @@ test("admin configures resources, imports a fixture session, and the normal user
   ).toBeVisible()
   await expect(page.getByRole("button", { name: systemName, exact: true })).toBeVisible()
 
-  // 2. Environment: the fixture login_check of spec §9.2.
+  // 2. Environment: the fixture login_check of spec §9.2. The URL stays relative
+  // and the backend joins it with the environment Base URL (spec §6.3).
   await page.getByRole("button", { name: "新建环境" }).click()
   await page.getByLabel("环境标识 key").fill("local")
   await page.getByLabel("名称", { exact: true }).fill(environmentName)
   await page.getByLabel("Base URL").fill(FIXTURE_URL)
-  await page.getByLabel("登录检查 URL").fill(`${FIXTURE_URL}/account`)
+  await page.getByLabel("登录检查 URL").fill("/account")
   await page.getByLabel("期望状态码（逗号分隔）").fill("200")
   await page.getByLabel("响应体包含").fill("Fixture Account")
   await page.getByRole("button", { name: "保存环境" }).click()
