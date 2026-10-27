@@ -11,10 +11,12 @@ import (
 	"strings"
 	"time"
 
+	agenthttp "github.com/EdouardRichard/EzTest/backend/internal/agent/interfaces/httpapi"
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	audithttp "github.com/EdouardRichard/EzTest/backend/internal/audit/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
 	eventinghttp "github.com/EdouardRichard/EzTest/backend/internal/eventing/interfaces/httpapi"
+	identity "github.com/EdouardRichard/EzTest/backend/internal/identity/domain"
 	identityhttp "github.com/EdouardRichard/EzTest/backend/internal/identity/interfaces/httpapi"
 	llmapp "github.com/EdouardRichard/EzTest/backend/internal/llm/application"
 	llmhttp "github.com/EdouardRichard/EzTest/backend/internal/llm/interfaces/httpapi"
@@ -34,6 +36,16 @@ type Pinger interface {
 type EventService interface {
 	eventinghttp.Snapshotter
 	eventinghttp.Publisher
+}
+
+// AgentDependencies holds the Agent use cases the server mounts. They are
+// grouped so a process without an Agent runtime (and most unit tests) can leave
+// the whole /api/agents surface unmounted by leaving Dependencies.Agent nil.
+type AgentDependencies struct {
+	Profiles agenthttp.ProfileService
+	Sessions agenthttp.SessionService
+	Runs     agenthttp.RunControl
+	Tools    agenthttp.ToolCatalog
 }
 
 // Dependencies holds the collaborators wired into the HTTP layer. Later tasks
@@ -75,6 +87,9 @@ type Dependencies struct {
 	// guard. Reads expose the content type persisted by the metadata
 	// repository wired into the use case by the composition root.
 	Storage storagehttp.ObjectService
+	// Agent holds the Agent use cases. When set, the admin /api/agents routes
+	// are mounted behind the global bearer auth and the per-route admin guard.
+	Agent *AgentDependencies
 }
 
 // New assembles the HTTP handler. Middleware runs in the order
@@ -101,11 +116,11 @@ func New(cfg config.Config, logger *slog.Logger, deps Dependencies) http.Handler
 		mux.Handle("GET /api/admin/audit", identityhttp.RequireAdmin(audithttp.NewHandler(deps.Audit)))
 	}
 	if deps.Events != nil {
-		mux.Handle("GET /api/stream/events", eventinghttp.NewSnapshotHandler(deps.Events))
+		mux.Handle("GET /api/stream/events", agentChannelAdminOnly(eventinghttp.NewSnapshotHandler(deps.Events)))
 	}
 	if deps.EventReader != nil && deps.EventHub != nil {
 		mux.Handle("GET /api/stream",
-			eventinghttp.NewSSEHandler(deps.EventReader, deps.EventHub, eventinghttp.DefaultHeartbeat))
+			agentChannelAdminOnly(eventinghttp.NewSSEHandler(deps.EventReader, deps.EventHub, eventinghttp.DefaultHeartbeat)))
 	}
 	if deps.LLMConfigs != nil && deps.LLMClientFactory != nil {
 		// Authentication is the global middleware; each route only adds the
@@ -124,6 +139,16 @@ func New(cfg config.Config, logger *slog.Logger, deps Dependencies) http.Handler
 			return identityhttp.RequireAdmin(auditRequestContext(next))
 		}
 		storagehttp.RegisterRoutes(mux, storageHandler, adminGuard)
+	}
+	if deps.Agent != nil {
+		// The Agent API is admin-only: the global middleware authenticates, the
+		// per-route guard enforces the role and attaches the audit actor the
+		// Agent handlers record on every write.
+		agentHandler := agenthttp.NewHandler(deps.Agent.Profiles, deps.Agent.Sessions, deps.Agent.Runs, deps.Agent.Tools)
+		adminGuard := func(next http.Handler) http.Handler {
+			return identityhttp.RequireAdmin(auditRequestContext(next))
+		}
+		agenthttp.RegisterRoutes(mux, agentHandler, adminGuard)
 	}
 	if deps.Events != nil && cfg.EnableTestEndpoints {
 		auditor := deps.Audit
@@ -231,6 +256,24 @@ func auditRequestContext(next http.Handler) http.Handler {
 			ctx = auditapp.WithActorID(ctx, user.ID)
 		}
 		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// agentChannelAdminOnly restricts the Agent activity channels to administrators.
+// P1 activity lives on the `agent:{session_id}` channels (design spec §9.5), so
+// any channel with that prefix requires the admin role; the P0 `system` channel
+// and every other channel keep their previous authenticated-only behaviour. It
+// is mounted on the stream routes and therefore runs after the global auth
+// middleware.
+func agentChannelAdminOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Query().Get("channel"), "agent:") {
+			if user, ok := identityhttp.UserFromContext(r.Context()); !ok || user.Role != identity.RoleAdmin {
+				platform.WriteError(w, r, http.StatusForbidden, platform.CodeForbidden, "admin role required")
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 

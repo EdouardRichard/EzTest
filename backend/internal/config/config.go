@@ -34,11 +34,37 @@ type Config struct {
 	// OpenAPIPath locates the hand-maintained OpenAPI document served by
 	// GET /api/openapi.yaml. It is relative to the process working directory by
 	// default so the deployed image only needs to ship the file at that path.
-	OpenAPIPath         string
+	OpenAPIPath string
+	// AgentFileRoot is the read-only root of the file.list/file.read tools. It
+	// is empty by default, which disables the file tools (design spec §4.1).
+	AgentFileRoot string
+	// AgentHTTPAllowlist lists the hosts http.get may reach. An entry may carry
+	// an explicit :port.
+	AgentHTTPAllowlist []string
+	// AgentToolTimeoutMS bounds every single tool invocation.
+	AgentToolTimeoutMS int
+	// AgentMaxConcurrentRuns bounds the process-wide number of running Agent
+	// runs.
+	AgentMaxConcurrentRuns int
+
 	EnableTestEndpoints bool
 	LogLevel            slog.Level
 	LLMSeed             LLMSeed
 }
+
+// Agent runtime defaults and bounds from design spec §4.1.
+const (
+	defaultAgentToolTimeoutMS     = 10000
+	minAgentToolTimeoutMS         = 1000
+	maxAgentToolTimeoutMS         = 60000
+	defaultAgentMaxConcurrentRuns = 4
+	minAgentMaxConcurrentRuns     = 1
+	maxAgentMaxConcurrentRuns     = 32
+)
+
+// defaultAgentHTTPAllowlist is the localhost-only HTTP allowlist applied when
+// EZTEST_AGENT_HTTP_ALLOWLIST is unset.
+var defaultAgentHTTPAllowlist = []string{"127.0.0.1", "localhost"}
 
 // Load reads the configuration through getenv and validates it. It returns an
 // error that names the offending environment variable instead of panicking.
@@ -52,7 +78,8 @@ func Load(getenv func(string) string) (Config, error) {
 		AdminUsername:   strings.TrimSpace(getenv("EZTEST_ADMIN_USERNAME")),
 		AdminPassword:   getenv("EZTEST_ADMIN_PASSWORD"),
 		StorageDir:      valueOr(getenv, "EZTEST_STORAGE_DIR", ".data/objects"),
-		OpenAPIPath:     valueOr(getenv, "EZTEST_OPENAPI_PATH", "docs/openapi/p0.yaml"),
+		OpenAPIPath:     valueOr(getenv, "EZTEST_OPENAPI_PATH", "docs/openapi/api.yaml"),
+		AgentFileRoot:   strings.TrimSpace(getenv("EZTEST_AGENT_FILE_ROOT")),
 		LLMSeed: LLMSeed{
 			BaseURL: strings.TrimSpace(getenv("llm_base_url")),
 			Key:     strings.TrimSpace(getenv("llm_key")),
@@ -62,6 +89,26 @@ func Load(getenv func(string) string) (Config, error) {
 	if cfg.DatabaseURL == "" {
 		return Config{}, fmt.Errorf("config: EZTEST_DATABASE_URL is required")
 	}
+
+	allowlist, err := parseAgentHTTPAllowlist(getenv("EZTEST_AGENT_HTTP_ALLOWLIST"))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.AgentHTTPAllowlist = allowlist
+
+	toolTimeout, err := parseAgentInt(getenv, "EZTEST_AGENT_TOOL_TIMEOUT_MS",
+		defaultAgentToolTimeoutMS, minAgentToolTimeoutMS, maxAgentToolTimeoutMS)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.AgentToolTimeoutMS = toolTimeout
+
+	maxConcurrentRuns, err := parseAgentInt(getenv, "EZTEST_AGENT_MAX_CONCURRENT_RUNS",
+		defaultAgentMaxConcurrentRuns, minAgentMaxConcurrentRuns, maxAgentMaxConcurrentRuns)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.AgentMaxConcurrentRuns = maxConcurrentRuns
 
 	keys, err := parseSecretKeys(getenv("EZTEST_SECRET_KEYS"))
 	if err != nil {
@@ -108,6 +155,41 @@ func valueOr(getenv func(string) string, key, def string) string {
 		return v
 	}
 	return def
+}
+
+// parseAgentHTTPAllowlist parses the comma-separated http.get host allowlist.
+// An unset variable selects the localhost-only default; a value that contains
+// no host at all is rejected so a typo cannot silently disable every host (the
+// tool itself fails closed on an empty list).
+func parseAgentHTTPAllowlist(raw string) ([]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return append([]string(nil), defaultAgentHTTPAllowlist...), nil
+	}
+	hosts := make([]string, 0, strings.Count(raw, ",")+1)
+	for _, entry := range strings.Split(raw, ",") {
+		if entry = strings.TrimSpace(entry); entry != "" {
+			hosts = append(hosts, entry)
+		}
+	}
+	if len(hosts) == 0 {
+		return nil, fmt.Errorf("config: EZTEST_AGENT_HTTP_ALLOWLIST must contain at least one host, got %q", raw)
+	}
+	return hosts, nil
+}
+
+// parseAgentInt parses one bounded Agent integer setting. An empty value
+// selects def; anything else must be a number inside [min, max].
+func parseAgentInt(getenv func(string) string, key string, def, min, max int) (int, error) {
+	raw := strings.TrimSpace(getenv(key))
+	if raw == "" {
+		return def, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < min || value > max {
+		return 0, fmt.Errorf("config: %s must be an integer between %d and %d, got %q", key, min, max, raw)
+	}
+	return value, nil
 }
 
 // parseSecretKeys decodes EZTEST_SECRET_KEYS: a JSON object mapping key
