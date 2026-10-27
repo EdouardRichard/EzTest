@@ -1,0 +1,95 @@
+package domain
+
+import (
+	"context"
+	"time"
+)
+
+// ChangeSetRepository persists the deterministic file-level change sets.
+type ChangeSetRepository interface {
+	GetOrCreate(ctx context.Context, cs CodeChangeSet) (CodeChangeSet, bool, error)
+	GetByID(ctx context.Context, id int64) (CodeChangeSet, error)
+}
+
+// IndexRunRepository persists T0 repository index runs.
+type IndexRunRepository interface {
+	Create(ctx context.Context, r IndexRun) error
+	Update(ctx context.Context, r IndexRun) error
+	GetByID(ctx context.Context, repoID, id int64) (IndexRun, error)
+	GetLatest(ctx context.Context, repoID int64) (IndexRun, error)
+	RecoverStale(ctx context.Context, before time.Time) (int64, error)
+}
+
+// EntityRepository persists code entities and their current fact versions.
+type EntityRepository interface {
+	Upsert(ctx context.Context, e CodeEntity) error
+	UpsertFile(ctx context.Context, repoID int64, commit string, files []CodeEntity) error
+	GetByFactKey(ctx context.Context, repoID int64, commit, factKey string) (CodeEntity, error)
+	List(ctx context.Context, repoID int64, f EntityFilter) ([]CodeEntity, string, bool, error)
+	ListByPaths(ctx context.Context, repoID int64, commit string, paths []string) ([]CodeEntity, error)
+	DeleteFact(ctx context.Context, repoID int64, commit, factKey string) error
+}
+
+// EdgeRepository persists the edges of one fact version.
+type EdgeRepository interface {
+	ReplaceFactEdges(ctx context.Context, repoID int64, commit, factKey string, version int, edges []CodeEdge) error
+	ListByEntity(ctx context.Context, repoID int64, commit string, entityID int64) ([]CodeEdge, error)
+	ListByRel(ctx context.Context, repoID int64, commit, rel string) ([]CodeEdge, error)
+}
+
+// FactVersionRepository owns the append-only history of AI fact bodies.
+type FactVersionRepository interface {
+	Current(ctx context.Context, repoID int64, commit, factKey string) (*CodeEntity, int, error)
+	Create(ctx context.Context, repoID int64, commit, factKey, model, prompt string, version int, body []byte, analysisID int64) error
+	Supersede(ctx context.Context, repoID int64, commit, factKey string, before int, at time.Time) error
+}
+
+// CacheRepository persists the file-level AI analysis cache keyed by
+// (repo, commit, path, file hash, model, prompt version).
+type CacheRepository interface {
+	Get(ctx context.Context, repoID int64, commit, path, fileHash, model, prompt string) (*CachedFile, bool, error)
+	Upsert(ctx context.Context, c CachedFile) error
+}
+
+// CachedFile is one successful cached file analysis.
+type CachedFile struct {
+	RepoID        int64
+	Commit        string
+	Path          string
+	FileHash      string
+	Model         string
+	PromptVersion string
+	Facts         []byte // JSONB
+	Stats         []byte // JSONB
+	CreatedAt     time.Time
+	LastUsedAt    time.Time
+}
+
+// AnalysisRepository persists version-scoped impact analyses.
+type AnalysisRepository interface {
+	Create(ctx context.Context, a CodeAnalysis) error
+	Update(ctx context.Context, a CodeAnalysis) error
+	GetByID(ctx context.Context, versionID, id int64) (CodeAnalysis, error)
+	GetLatest(ctx context.Context, versionID int64) (CodeAnalysis, error)
+	FindReusable(ctx context.Context, versionID, repoID int64, base, head, model, prompt string) (*CodeAnalysis, error)
+	HasActive(ctx context.Context, versionID int64) (bool, error)
+	NextAnalysisVersion(ctx context.Context, versionID int64, base, head string) (int, error)
+	RecoverStale(ctx context.Context, before time.Time) (int64, error)
+	UpdateCandidateSelection(ctx context.Context, analysisID, candidateID, actorID int64, selected bool) error
+}
+
+// CandidateRepository persists impact candidates of one analysis.
+type CandidateRepository interface {
+	Replace(ctx context.Context, analysisID int64, items []ImpactCandidate) error
+	List(ctx context.Context, analysisID int64) ([]ImpactCandidate, error)
+	Get(ctx context.Context, analysisID, candidateID int64) (ImpactCandidate, error)
+}
+
+// AnchorRepository persists version-scoped code anchors.
+type AnchorRepository interface {
+	Create(ctx context.Context, a CodeAnchor) error
+	Delete(ctx context.Context, versionID, id int64) error
+	Get(ctx context.Context, versionID, id int64) (CodeAnchor, error)
+	List(ctx context.Context, versionID int64, f AnchorFilter) ([]CodeAnchor, error)
+	ListByPaths(ctx context.Context, versionID int64, paths []string) ([]CodeAnchor, error)
+}
