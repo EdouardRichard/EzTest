@@ -6,9 +6,9 @@
 .DESCRIPTION
     Executes the Go unit and integration suites, the P1 Agent unit/integration
     suites, the P3 version/requirements/clarification suites, the frontend
-    lint/typecheck/test/build gate, the Playwright E2E suite (P0/P1/P2; the P3
-    version workbench specs are planned and gated until Task 19 and are not
-    present yet), a repeated migration run and the health/audit/version-API
+    lint/typecheck/test/build gate, the Playwright E2E suite (P0/P1/P2 and the
+    three P3 version specs in frontend/e2e/versions*.spec.ts), a repeated
+    migration run and the health/audit/version-API
     assertions. The P0-P3 deliverables are checked (README, OpenAPI, deploy
     files, Agent/P3 env templates, the P3 OpenAPI contract keywords and the P3
     event catalog) and the Compose file is statically validated with node.
@@ -905,46 +905,45 @@ try {
     Write-Host $p1Table
 
     # P3 exit criteria (spec §10.6) mapped to the evidence collected above; the
-    # real-LLM manual acceptance remains the only gated piece. The P3 Playwright
-    # specs (frontend/e2e/versions*.spec.ts) are planned for Task 19 and are not
-    # present yet, so each row labels that evidence as planned rather than
-    # implying current P3 E2E coverage.
+    # real-LLM manual acceptance remains the only gated piece. The three P3
+    # Playwright specs (frontend/e2e/versions*.spec.ts) are part of scripts/e2e.ps1
+    # and passed in T19 (17 total / 3 P3).
     Write-Step "P3 DoD mapping (spec §10.6)"
     $p3DodMapping = @(
         [pscustomobject][ordered]@{
             DoD         = "P3-1"
             Requirement = "A version records 3+ requirements; AI multi-turn questioning; human answers/edits; requirements/relations/decisions persisted"
-            Evidence    = "Version unit/integration suites; workbench/clarification component tests; P3 real-LLM acceptance (gated); P3 Playwright E2E planned (T19)"
+            Evidence    = "Version unit/integration suites; workbench/clarification component tests; P3 real-LLM acceptance (gated); P3 Playwright E2E in frontend/e2e/versions*.spec.ts (T19: 3 P3 specs passed)"
         },
         [pscustomobject][ordered]@{
             DoD         = "P3-2"
             Requirement = "Requirement confirmation and Version design entry follow the state rules (draft -> clarifying -> designing; draft -> clarified)"
-            Evidence    = "Domain state-machine tests; HTTP 200/409/422 OpenAPI contract; enter-design acknowledge component test; P3 Playwright E2E planned (T19)"
+            Evidence    = "Domain state-machine tests; HTTP 200/409/422 OpenAPI contract; enter-design acknowledge component test; P3 Playwright E2E in frontend/e2e/versions*.spec.ts (T19: 3 P3 specs passed)"
         },
         [pscustomobject][ordered]@{
             DoD         = "P3-3"
             Requirement = "Refresh/reconnect loses neither the conversation nor the draft requirements"
-            Evidence    = "Workbench reload + SSE reconnect component tests; flat /events snapshot + version stream in OpenAPI; P3 Playwright E2E planned (T19)"
+            Evidence    = "Workbench reload + SSE reconnect component tests; flat /events snapshot + version stream in OpenAPI; P3 Playwright E2E in frontend/e2e/versions*.spec.ts (T19: 3 P3 specs passed)"
         },
         [pscustomobject][ordered]@{
             DoD         = "P3-4"
             Requirement = "The requirement relation graph renders correctly"
-            Evidence    = "RelationGraph component tests; P3 Playwright E2E planned (T19)"
+            Evidence    = "RelationGraph component tests; P3 Playwright E2E in frontend/e2e/versions*.spec.ts (T19: 3 P3 specs passed)"
         },
         [pscustomobject][ordered]@{
             DoD         = "P3-5"
             Requirement = "Manual entry/confirmation still works when AI is unavailable"
-            Evidence    = "AI-unavailable component test; 503 ai_unavailable contract; Version API smoke; P3 Playwright E2E planned (T19)"
+            Evidence    = "AI-unavailable component test; 503 ai_unavailable contract; Version API smoke; P3 Playwright E2E in frontend/e2e/versions*.spec.ts (T19: 3 P3 specs passed)"
         },
         [pscustomobject][ordered]@{
             DoD         = "P3-6"
             Requirement = "Version detail container, 9-tab workbench and overview skeleton"
-            Evidence    = "VersionTabs/VersionDetailPage tab + ?tab deep-link component tests; P3 Playwright E2E planned (T19)"
+            Evidence    = "VersionTabs/VersionDetailPage tab + ?tab deep-link component tests; P3 Playwright E2E in frontend/e2e/versions*.spec.ts (T19: 3 P3 specs passed)"
         },
         [pscustomobject][ordered]@{
             DoD         = "P3-7"
             Requirement = "Attachments and multimodal context-recon within limits"
-            Evidence    = "Attachment multipart upload/download integration tests; recon multimodal parts application test; OpenAPI attachment paths; P3 Playwright E2E planned (T19)"
+            Evidence    = "Attachment multipart upload/download integration tests; recon multimodal parts application test; OpenAPI attachment paths; P3 Playwright E2E in frontend/e2e/versions*.spec.ts (T19: 3 P3 specs passed)"
         },
         [pscustomobject][ordered]@{
             DoD         = "P3-8"

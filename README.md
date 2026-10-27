@@ -94,7 +94,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1
 ```
 
-P3 的 Playwright E2E（`frontend/e2e/versions*.spec.ts`）尚未落地，计划随 T19 接入；当前 E2E 只覆盖 P0/P1/P2，README 与验收入口不声称 P3 E2E 已通过。
+P3 的 Playwright E2E（`frontend/e2e/versions*.spec.ts`，共 3 个 spec）已落地并纳入 `scripts/e2e.ps1`；T19 记录完整套件 17 passed、P3 3 passed，真实 LLM 人工验收仍为 gated。
 
 真实 LLM 的 P3 人工验收为 gated：需 `.env` 配置有效 `llm_*`、显式设置 `EZTEST_ACCEPTANCE_REAL_LLM=1`，并人工执行创建版本/需求/附件 → ≥2 轮澄清 → 确认 → 进入设计；截图保存到 `.tmp/p3-acceptance/`（spec §10.7）。
 
@@ -325,7 +325,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1
 
 # 仅 E2E（会自行启动/停止 API、Web、fake LLM 上游与 fixture target，使用 eztest_e2e 库；
 # 当前覆盖 P0 场景、P1 Agent 控制台与 P2 Session；P3 版本工作台/澄清/降级的
-# Playwright 用例（frontend/e2e/versions*.spec.ts）计划随 T19 接入）
+# Playwright 用例（frontend/e2e/versions*.spec.ts 已纳入 P3 E2E）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1
 
 # Compose 静态校验（不需要 Docker 守护进程）
@@ -351,7 +351,7 @@ node scripts/validate-compose.mjs
 
 - 本机没有 Docker，`scripts/acceptance.ps1` 会把“Compose 容器运行”标为 **SKIPPED**；Compose 仅通过 `validate-compose.mjs` 做静态字段校验，不代表已运行验证。P1 真实 Agent LLM 与 P3 真实 LLM 人工验收同样标为 **SKIPPED**（见下节）。
 - 常规测试不访问真实 LLM：Go 测试使用 `httptest` mock（`/v1/chat/completions`、`/v1/responses`、`/v1/models`，可注入 429/5xx/超时/分片）；`scripts/e2e.ps1` 使用 `scripts/fake-llm.cjs`（127.0.0.1:13334）并覆盖 `llm_*`，E2E 零 LLM 费用。
-- `acceptance.ps1` 额外校验 `docs/openapi/api.yaml` 含 P1 的 `/api/agents/sessions`、`agent.activity`、`reasoning_tokens`，P2 的 `/api/resources/systems`、`/api/resources/sessions`、`/api/resources/code-repos`、`storageState`、`credentialSet`，以及 P3 的 `/api/versions`、`clarification`、`enter-design`、`snowflake`、`version-attachments` 关键词、全部 P3 错误 reason（含字段级 `invalid_context_summary`）、全部版本事件类型（含 `clarification.context_updated`）；同时校验 `.env.example` 的 Agent/P3 变量与 Compose 的附件目录；P1/P3 DoD 与检查项/证据的映射会打印在汇总后（P3 Playwright E2E 标记为计划随 T19 接入）。
+- `acceptance.ps1` 额外校验 `docs/openapi/api.yaml` 含 P1 的 `/api/agents/sessions`、`agent.activity`、`reasoning_tokens`，P2 的 `/api/resources/systems`、`/api/resources/sessions`、`/api/resources/code-repos`、`storageState`、`credentialSet`，以及 P3 的 `/api/versions`、`clarification`、`enter-design`、`snowflake`、`version-attachments` 关键词、全部 P3 错误 reason（含字段级 `invalid_context_summary`）、全部版本事件类型（含 `clarification.context_updated`）；同时校验 `.env.example` 的 Agent/P3 变量与 Compose 的附件目录；P1/P3 DoD 与检查项/证据的映射会打印在汇总后（P3 Playwright E2E 已纳入 `scripts/e2e.ps1`）。
 - 通过条件：所有非 SKIPPED 检查 FAIL 数为 0，脚本退出码为 0。
 
 ## 真实 LLM（gated）

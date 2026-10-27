@@ -10,7 +10,6 @@ import {
   RadioTower,
   RefreshCw,
   Server,
-  Settings2,
 } from "lucide-react"
 import Link from "next/link"
 import { useCallback, useEffect, useState } from "react"
@@ -204,15 +203,15 @@ export default function OverviewPage() {
 
       <EmptyState
         icon={Layers}
-        title="版本功能将在 P3 阶段开放"
-        description="版本列表、多需求澄清、用例脑图、执行中心与报告会按 P3–P7 阶段逐步接入。P0 已交付应用壳、登录、用户与权限、LLM 配置、SSE 事件流、对象存储与审计等基础能力。"
+        title="版本与澄清工作台已开放"
+        description="创建版本、绑定应用与代码仓库、编写需求与附件、发起 AI 澄清并确认需求。用例脑图、执行中心与报告会按后续阶段逐步接入。"
         action={
           <Link
-            href="/settings"
-            className="inline-flex h-9 items-center gap-2 rounded-lg border border-border bg-card px-3 text-sm font-medium transition-colors hover:bg-muted"
+            href="/versions"
+            className="inline-flex h-9 items-center gap-2 rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90"
           >
-            <Settings2 className="h-4 w-4" aria-hidden="true" />
-            查看设置与诊断
+            前往版本工作台
+            <ArrowRight className="h-3 w-3" aria-hidden="true" />
           </Link>
         }
       />

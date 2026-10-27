@@ -365,13 +365,25 @@ func (h *ClarificationHandler) ensureAIReady(w http.ResponseWriter, r *http.Requ
 
 // writeClarificationError maps the P1 agent/LLM startup failures to the P3 503
 // unavailable reason ai_unavailable (retryable) and every other failure to the
-// shared error mapping.
+// shared error mapping. The expected P1 session states are translated to the P3
+// contracts: a concurrently started run is 409 agent_busy, a disabled profile is
+// the retryable AI-unavailable degradation, and a vanished session is the
+// not-active conflict instead of a generic 500.
 func writeClarificationError(w http.ResponseWriter, r *http.Request, err error) {
-	if isAIUnavailable(err) {
+	switch {
+	case isAIUnavailable(err):
 		writeAIUnavailable(w, r)
-		return
+	case errors.Is(err, agentdomain.ErrRunActive):
+		WriteServiceError(w, r, domain.NewStateConflict("agent_busy",
+			"an agent run is already active for this version"))
+	case errors.Is(err, agentdomain.ErrProfileDisabled):
+		writeAIUnavailable(w, r)
+	case errors.Is(err, agentdomain.ErrNotFound):
+		WriteServiceError(w, r, domain.NewStateConflict("clarification_session_not_active",
+			"the clarification session is no longer active"))
+	default:
+		WriteServiceError(w, r, err)
 	}
-	WriteServiceError(w, r, err)
 }
 
 // writeAIUnavailable renders the spec §8.6 503 unavailable/ai_unavailable body
