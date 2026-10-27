@@ -190,15 +190,31 @@ func (r *ChangeSetRepo) GetOrCreate(ctx context.Context, cs domain.CodeChangeSet
 		return domain.CodeChangeSet{}, false, fmt.Errorf("postgres: create change set: %w", err)
 	}
 	created := tag.RowsAffected() == 1
-	stored, err := scanChangeSet(r.pool.QueryRow(ctx,
-		`SELECT `+changeSetColumnList+`
-		 FROM code_change_sets
-		 WHERE repo_id = $1 AND base_commit = $2 AND head_commit = $3`,
-		cs.RepoID, cs.BaseCommit, cs.HeadCommit))
+	stored, err := r.FindByCommits(ctx, cs.RepoID, cs.BaseCommit, cs.HeadCommit)
 	if err != nil {
 		return domain.CodeChangeSet{}, false, fmt.Errorf("postgres: read change set after upsert: %w", err)
 	}
 	return stored, created, nil
+}
+
+// FindByCommits returns the deterministic change set of one (repo, base, head)
+// trio. The read-only §7.3 preview uses it to reuse an already persisted row;
+// a trio without a row is reported as change_set_not_found so the caller can
+// leave changeSetId null.
+func (r *ChangeSetRepo) FindByCommits(ctx context.Context, repoID int64, base, head string) (domain.CodeChangeSet, error) {
+	stored, err := scanChangeSet(r.pool.QueryRow(ctx,
+		`SELECT `+changeSetColumnList+`
+		 FROM code_change_sets
+		 WHERE repo_id = $1 AND base_commit = $2 AND head_commit = $3`,
+		repoID, base, head))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.CodeChangeSet{}, domain.NewNotFound("change_set_not_found",
+				fmt.Sprintf("codeintel: change set %s..%s of repository %d not found", base, head, repoID))
+		}
+		return domain.CodeChangeSet{}, fmt.Errorf("postgres: find change set: %w", err)
+	}
+	return stored, nil
 }
 
 // GetByID returns one change set by id.

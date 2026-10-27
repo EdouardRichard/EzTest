@@ -23,9 +23,6 @@ const (
 	defaultWorkerConcurrency = 1
 	defaultWorkerTimeout     = 180 * time.Second
 
-	// recoveryWindow is the startup recovery threshold: queued/running runs
-	// older than ten minutes are failed(interrupted) (design spec §6.8).
-	recoveryWindow = 10 * time.Minute
 	// recoveryTimeout bounds the startup recovery queries.
 	recoveryTimeout = 10 * time.Second
 )
@@ -113,9 +110,9 @@ type WorkerConfig struct {
 // Worker is the single-instance bounded async worker of design spec §6.8. It
 // owns a bounded job channel plus a slot semaphore sized QueueSize, so a slot
 // stays reserved for the whole run and a full queue rejects new work instead of
-// blocking. Start recovers stale runs before serving jobs; Stop stops accepting
-// work, drains the accepted jobs and waits for them bounded by the caller's
-// context.
+// blocking. Start recovers the queued/running runs of the previous process
+// before serving jobs; Stop stops accepting work, drains the accepted jobs and
+// waits for them bounded by the caller's context.
 type Worker struct {
 	cfg    WorkerConfig
 	jobs   chan Job
@@ -164,8 +161,17 @@ func (w *Worker) SetRunner(r Runner) {
 	w.runner = r
 }
 
-// SetRecoverer registers the startup recovery hook. It must be called before
-// Start. When no recoverer is set, startup recovery is skipped.
+// SetRecoverer registers the startup recovery hook T18 wires after SetRunner:
+//
+//	worker.SetRecoverer(application.StaleRunRecoverer{
+//		IndexRuns: indexRunRepo,
+//		Analyses:  analysisRepo,
+//	})
+//
+// It must be called before Start. Recoverer is kept a port so the worker never
+// depends on concrete repositories (the fixed NewWorker(WorkerConfig) signature
+// cannot receive them). When no recoverer is set, startup recovery is skipped;
+// a Runner that itself implements Recoverer is also accepted.
 func (w *Worker) SetRecoverer(r Recoverer) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -192,7 +198,10 @@ func (w *Worker) Enqueue(job Job) error {
 }
 
 // Start performs the one-time startup recovery and launches Concurrency worker
-// goroutines. It never accepts a second start.
+// goroutines. Being the single instance, this process is the only live owner of
+// runs at startup, so recovery fails every leftover queued/running run
+// (failed(interrupted)) before the first job is served. It never accepts a
+// second start.
 func (w *Worker) Start() {
 	w.startOnce.Do(func() {
 		w.mu.Lock()
@@ -232,9 +241,13 @@ func (w *Worker) Stop(ctx context.Context) {
 	}
 }
 
-// recoverStale fails the leftover queued/running runs of a previous process
-// (design spec §6.8). Recovery problems are logged, never fatal: the worker
-// still serves new jobs.
+// recoverStale fails every queued/running run left behind by a previous process
+// (design spec §6.8). P4 runs a single process, so at startup the previous
+// process is dead and no run can legitimately still be in flight: the recovery
+// cutoff is now, not now-10m. Recovering with a ten-minute window would let a
+// run queued seconds before a crash survive startup and keep its repository
+// permanently in index_in_progress (409). Recovery problems are logged, never
+// fatal: the worker still serves new jobs.
 func (w *Worker) recoverStale() {
 	w.mu.Lock()
 	recoverer := w.recoverer
@@ -252,7 +265,7 @@ func (w *Worker) recoverStale() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), recoveryTimeout)
 	defer cancel()
-	before := time.Now().Add(-recoveryWindow)
+	before := time.Now()
 	if err := recoverer.RecoverStale(ctx, before); err != nil {
 		w.logger.Error("codeintel worker startup recovery failed", "error", err)
 		return

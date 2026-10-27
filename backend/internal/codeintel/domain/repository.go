@@ -9,6 +9,10 @@ import (
 type ChangeSetRepository interface {
 	GetOrCreate(ctx context.Context, cs CodeChangeSet) (CodeChangeSet, bool, error)
 	GetByID(ctx context.Context, id int64) (CodeChangeSet, error)
+	// FindByCommits returns the stored change set of one deterministic
+	// (repo, base, head) trio so the read-only §7.3 preview can return its id. A
+	// trio without a stored row is reported as a not-found error.
+	FindByCommits(ctx context.Context, repoID int64, base, head string) (CodeChangeSet, error)
 }
 
 // IndexRunRepository persists T0 repository index runs.

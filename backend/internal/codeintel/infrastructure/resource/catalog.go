@@ -21,6 +21,10 @@ import (
 // repository accepts the same page size here.
 const appModelPageSize = 100
 
+// codeRepoPageSize is the cursor page size used while draining the P2 code
+// repository list (the P2 HTTP layer serves at most 100 rows per page).
+const codeRepoPageSize = 100
+
 // allAppModelKinds is the documented app model node kinds, in the order the
 // codeintel prompt and impact pages consume them.
 var allAppModelKinds = []string{
@@ -31,9 +35,11 @@ var allAppModelKinds = []string{
 }
 
 // CodeRepositoryReader is the narrow slice of the P2 code repository service the
-// adapter needs. *resource/application.CodeRepoService satisfies it.
+// adapter needs. *resource/application.CodeRepoService satisfies it: Get serves
+// one repository and List serves one cursor page of them.
 type CodeRepositoryReader interface {
 	Get(ctx context.Context, id int64) (*resourcedomain.CodeRepository, error)
+	List(ctx context.Context, f resourcedomain.CodeRepoFilter) ([]resourcedomain.CodeRepository, bool, error)
 }
 
 // AppModelReader is the narrow slice of the P2 catalog service the adapter
@@ -83,7 +89,47 @@ func (c *Catalog) Get(ctx context.Context, repoID int64) (codeintelapp.RepoInfo,
 		return codeintelapp.RepoInfo{}, codedomain.NewInvalid("repoId", "code_repository_not_found",
 			fmt.Sprintf("code repository %d not found", repoID))
 	}
+	return projectCodeRepo(*repo), nil
+}
 
+// List returns every P2 code repository as the same read-only codeintel
+// projection Get serves. The P2 read is a cursor page, so the adapter drains
+// every page in ID order instead of returning only the first one.
+func (c *Catalog) List(ctx context.Context) ([]codeintelapp.RepoInfo, error) {
+	if c == nil || c.codeRepos == nil {
+		return nil, errors.New("codeintel: resource code repository catalog is not configured")
+	}
+	infos := make([]codeintelapp.RepoInfo, 0)
+	afterID := int64(0)
+	for {
+		page, more, err := c.codeRepos.List(ctx, resourcedomain.CodeRepoFilter{
+			Page: resourcedomain.Page{Limit: codeRepoPageSize, AfterID: afterID},
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, repo := range page {
+			infos = append(infos, projectCodeRepo(repo))
+		}
+		if !more {
+			break
+		}
+		if len(page) == 0 {
+			return nil, fmt.Errorf("codeintel: list code repositories: empty page with more set")
+		}
+		next := page[len(page)-1].ID
+		if next <= afterID {
+			return nil, fmt.Errorf("codeintel: list code repositories: cursor did not advance past %d", afterID)
+		}
+		afterID = next
+	}
+	return infos, nil
+}
+
+// projectCodeRepo is the shared codeintel projection of one P2 code repository.
+// It clones the glob slices and the indexed timestamp so a returned RepoInfo
+// never aliases the stored P2 row.
+func projectCodeRepo(repo resourcedomain.CodeRepository) codeintelapp.RepoInfo {
 	var lastIndexedAt *time.Time
 	if repo.LastIndexedAt != nil {
 		indexedAt := *repo.LastIndexedAt
@@ -99,7 +145,7 @@ func (c *Catalog) Get(ctx context.Context, repoID int64) (codeintelapp.RepoInfo,
 		ExcludeGlobs:  cloneStrings(repo.ExcludeGlobs),
 		Status:        repo.Status,
 		LastIndexedAt: lastIndexedAt,
-	}, nil
+	}
 }
 
 // ListBySystem returns every app model node of systemID for the requested kinds.
