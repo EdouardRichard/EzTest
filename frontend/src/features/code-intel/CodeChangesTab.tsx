@@ -5,7 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
 import { StatusBadge } from "@/components/ui/StatusBadge"
 import { ApiError } from "@/lib/api-client"
-
+import { AnchorDialog } from "./AnchorDialog"
 import { getLatestIndexRun, getVersionChanges, startAnalysis } from "./api"
 import { ChangedFiles } from "./ChangedFiles"
 import { type CodeAnalysisView, CommitHeader } from "./CommitHeader"
@@ -19,7 +19,10 @@ import {
   UnboundCodeState,
   UnindexedCodeState,
 } from "./empty"
+import { FactsPanel } from "./FactsPanel"
+import { ImpactPanel } from "./ImpactPanel"
 import type { Analysis, ChangedFile, ChangeList, IndexRun } from "./types"
+import { UnmappedChanges } from "./UnmappedChanges"
 import { useAnalysisPolling } from "./useAnalysisPolling"
 
 /** Version-level reasons that mean "no usable code repository binding". */
@@ -161,12 +164,23 @@ function AnalysisSummary({ analysis, view }: AnalysisSummaryProps) {
   )
 }
 
+/** No-analysis placeholder for one panel slot; it never renders fake results. */
+function AwaitingAnalysisPanel({ title, hint }: { title: string; hint: string }) {
+  return (
+    <section className="space-y-2 rounded-2xl border border-border bg-card p-4">
+      <h2 className="text-base font-semibold">{title}</h2>
+      <p className="text-sm text-muted-foreground">{hint}</p>
+    </section>
+  )
+}
+
 /**
  * 「代码与变更」container (spec §9.1/§9.2): loads the version change preview,
  * gates on the repository index, derives the six UI states (unbound / unindexed
  * / no changes / running / done / degraded, plus a failed error state), polls a
  * running analysis, and opens the unified diff drawer on demand. It never
- * fabricates batches, cases or facts; T11 fills the reserved panel slots.
+ * fabricates batches, cases or facts; T11 mounts the facts, impact, unmapped and
+ * requirement-anchor panels.
  */
 export function CodeChangesTab({ versionId, repoId }: CodeChangesTabProps) {
   const [load, setLoad] = useState<ChangesLoad>(
@@ -174,6 +188,7 @@ export function CodeChangesTab({ versionId, repoId }: CodeChangesTabProps) {
   )
   const [refreshing, setRefreshing] = useState(false)
   const [openFile, setOpenFile] = useState<ChangedFile | null>(null)
+  const [anchorFile, setAnchorFile] = useState<ChangedFile | null>(null)
   const [starting, setStarting] = useState(false)
   const [actionError, setActionError] = useState("")
   const requestRef = useRef(0)
@@ -398,16 +413,44 @@ export function CodeChangesTab({ versionId, repoId }: CodeChangesTabProps) {
       ) : (
         <div className="grid items-start gap-4 xl:grid-cols-2">
           <div className="space-y-4">
-            <ChangedFiles changes={changes} onOpenFile={handleOpenFile} />
-            {/* T11 mounts FactsPanel in this slot. */}
-            <div data-testid="code-facts-slot" />
+            <ChangedFiles
+              changes={changes}
+              onOpenFile={handleOpenFile}
+              onAnchorFile={setAnchorFile}
+            />
+            <div data-testid="code-facts-slot">
+              {analysis === null ? (
+                <AwaitingAnalysisPanel
+                  title="代码事实"
+                  hint="尚未开始分析，分析完成后展示代码事实。"
+                />
+              ) : (
+                <FactsPanel analysis={analysis} />
+              )}
+            </div>
           </div>
           <div className="space-y-4">
             <AnalysisSummary analysis={analysis} view={view} />
-            {/* T11 mounts ImpactPanel in this slot. */}
-            <div data-testid="code-impact-slot" />
-            {/* T11 mounts UnmappedChanges (and AnchorDialog) in this slot. */}
-            <div data-testid="code-unmapped-slot" />
+            <div data-testid="code-impact-slot">
+              {analysis === null ? (
+                <AwaitingAnalysisPanel
+                  title="影响候选"
+                  hint="尚未开始分析，分析完成后展示影响候选。"
+                />
+              ) : (
+                <ImpactPanel key={analysis.id} analysis={analysis} />
+              )}
+            </div>
+            <div data-testid="code-unmapped-slot">
+              {analysis === null ? (
+                <AwaitingAnalysisPanel
+                  title="未映射变更"
+                  hint="尚未开始分析，分析完成后展示未映射变更。"
+                />
+              ) : (
+                <UnmappedChanges entries={analysis.unmapped} />
+              )}
+            </div>
           </div>
         </div>
       )}
@@ -419,6 +462,18 @@ export function CodeChangesTab({ versionId, repoId }: CodeChangesTabProps) {
           headCommit={changes.headCommit}
           file={openFile}
           onClose={() => setOpenFile(null)}
+        />
+      ) : null}
+
+      {anchorFile !== null ? (
+        <AnchorDialog
+          versionId={versionId}
+          filePath={anchorFile.path}
+          onClose={() => setAnchorFile(null)}
+          onCreated={() => {
+            void analysisPolling.refresh()
+            void loadChanges({ silent: true })
+          }}
         />
       ) : null}
     </div>

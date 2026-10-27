@@ -1,10 +1,20 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
-import type { VersionEvent } from "@/features/versions/types"
+import type { Requirement, VersionEvent } from "@/features/versions/types"
 import { ApiError } from "@/lib/api-client"
 
-import type { Analysis, AnalysisStats, ChangedFile, ChangeList, FileDiff, IndexRun } from "./types"
+import type {
+  Analysis,
+  AnalysisStats,
+  Anchor,
+  Candidate,
+  ChangedFile,
+  ChangeList,
+  CodeEntity,
+  FileDiff,
+  IndexRun,
+} from "./types"
 
 const mocks = vi.hoisted(() => ({
   getVersionChanges: vi.fn(),
@@ -12,6 +22,13 @@ const mocks = vi.hoisted(() => ({
   getLatestAnalysis: vi.fn(),
   startAnalysis: vi.fn(),
   getFileDiff: vi.fn(),
+  getFacts: vi.fn(),
+  getFile: vi.fn(),
+  patchCandidate: vi.fn(),
+  listAnchors: vi.fn(),
+  createAnchor: vi.fn(),
+  deleteAnchor: vi.fn(),
+  listRequirements: vi.fn(),
   useVersionStream: vi.fn(),
 }))
 
@@ -21,6 +38,16 @@ vi.mock("./api", () => ({
   getLatestAnalysis: mocks.getLatestAnalysis,
   startAnalysis: mocks.startAnalysis,
   getFileDiff: mocks.getFileDiff,
+  getFacts: mocks.getFacts,
+  getFile: mocks.getFile,
+  patchCandidate: mocks.patchCandidate,
+  listAnchors: mocks.listAnchors,
+  createAnchor: mocks.createAnchor,
+  deleteAnchor: mocks.deleteAnchor,
+}))
+
+vi.mock("@/features/versions/api", () => ({
+  listRequirements: mocks.listRequirements,
 }))
 
 vi.mock("@/features/versions/useVersionStream", () => ({
@@ -133,6 +160,70 @@ const INDEX_DONE: IndexRun = {
   finishedAt: "2026-10-28T00:52:03Z",
 }
 
+const CANDIDATE: Candidate = {
+  id: "7001",
+  subjectKind: "requirement",
+  subjectId: "9001",
+  reason: "changed api POST /api/refund",
+  confidence: "high",
+  source: "direct",
+  evidence: [{ file: "src/api/refund.ts", startLine: 80, endLine: 96 }],
+  selected: true,
+}
+
+const FACT_ENTITY: CodeEntity = {
+  id: "1844674407370955201",
+  repoId: REPO_ID,
+  commit: HEAD,
+  kind: "route",
+  path: "src/routes/orders.ts",
+  name: "GET /orders",
+  startLine: 1,
+  endLine: 10,
+  signature: "",
+  blobHash: "git-sha1:1111111111111111111111111111111111111111",
+  source: "ai",
+  confidence: "high",
+  evidence: [{ file: "src/routes/orders.ts", startLine: 2, endLine: 3 }],
+}
+
+const REQUIREMENT: Requirement = {
+  id: "1844674407370956001",
+  versionId: VERSION_ID,
+  title: "退款需求",
+  description: "",
+  acceptanceCriteria: "",
+  priority: "must",
+  status: "draft",
+  source: "user",
+  lastUpdateSource: "user",
+  revision: 1,
+  confirmedAt: null,
+  confirmedBy: null,
+  openQuestionCount: 0,
+  relationCount: 0,
+  attachmentCount: 0,
+  createdBy: 1,
+  updatedBy: 1,
+  createdAt: "2026-10-27T10:00:00Z",
+  updatedAt: "2026-10-27T10:00:00Z",
+}
+
+const CREATED_ANCHOR: Anchor = {
+  id: "1844674407370955301",
+  versionId: VERSION_ID,
+  subjectKind: "requirement",
+  subjectId: REQUIREMENT.id,
+  filePath: TEXT_FILE.path,
+  startLine: null,
+  endLine: null,
+  commitSha: HEAD,
+  confidence: "high",
+  createdByKind: "user",
+  createdBy: 1,
+  createdAt: "2026-10-28T01:00:00Z",
+}
+
 function codeEvent(seq: number, type = "code.changed"): VersionEvent {
   return {
     seq,
@@ -154,6 +245,10 @@ function codeEvent(seq: number, type = "code.changed"): VersionEvent {
 function resetMocks(): void {
   for (const mock of Object.values(mocks)) mock.mockReset()
   mocks.useVersionStream.mockReturnValue({ events: [], status: "live", reconnect: vi.fn() })
+  // The panels mounted in the T11 slots fetch facts and requirements on mount.
+  mocks.getFacts.mockResolvedValue({ items: [], nextCursor: "", hasMore: false })
+  mocks.listRequirements.mockResolvedValue({ items: [REQUIREMENT], nextCursor: "", hasMore: false })
+  mocks.listAnchors.mockResolvedValue([])
 }
 
 /** Resolves the initial effect promises of the container. */
@@ -253,7 +348,8 @@ describe("CodeChangesTab", () => {
     resetMocks()
     mockReady({ analysis: analysisFixture({ degraded: true }) })
     const degraded = renderTab()
-    expect(await screen.findByText("AI 不可用，仅文件级结果")).toBeTruthy()
+    // The summary and the impact panel both state the degraded mode.
+    expect((await screen.findAllByText("AI 不可用，仅文件级结果")).length).toBeGreaterThan(0)
     expect(screen.getByText("分析降级")).toBeTruthy()
     expect(screen.getByRole("button", { name: "重新分析" })).toBeTruthy()
     degraded.unmount()
@@ -298,7 +394,7 @@ describe("CodeChangesTab", () => {
     const changesHeading = await screen.findByRole("heading", { name: "变更文件" })
     expect(changesHeading).toBeTruthy()
     expect(screen.getByText("src/api/refund.ts")).toBeTruthy()
-    expect(screen.getByText("修改")).toBeTruthy()
+    expect(screen.getAllByText("修改").length).toBeGreaterThan(0)
     expect(screen.getByText("+40")).toBeTruthy()
     expect(screen.getByText("-2")).toBeTruthy()
 
@@ -560,5 +656,84 @@ describe("CodeChangesTab", () => {
     expect(typeof mocks.getLatestIndexRun.mock.calls[0]?.[0]).toBe("number")
     expect(mocks.getLatestAnalysis).toHaveBeenCalledWith(VERSION_ID)
     expect(typeof mocks.getLatestAnalysis.mock.calls[0]?.[0]).toBe("string")
+  })
+
+  it("mounts the facts, impact and unmapped panels in the T11 slots", async () => {
+    mockReady({
+      analysis: analysisFixture({ candidates: [CANDIDATE] }),
+    })
+    mocks.getFacts.mockImplementation((_repoId: number, params: { kind?: string }) =>
+      Promise.resolve({
+        items: params.kind === FACT_ENTITY.kind ? [FACT_ENTITY] : [],
+        nextCursor: "",
+        hasMore: false,
+      }),
+    )
+    mocks.patchCandidate.mockResolvedValue({ ...CANDIDATE, selected: false })
+
+    renderTab()
+
+    expect(await screen.findByRole("heading", { name: "代码事实" })).toBeTruthy()
+    expect(await screen.findByText("GET /orders")).toBeTruthy()
+    expect(mocks.getFacts).toHaveBeenCalledWith(REPO_ID, {
+      commit: HEAD,
+      kind: "route",
+      limit: 50,
+    })
+    expect(screen.getByRole("heading", { name: "影响候选" })).toBeTruthy()
+    expect(screen.getByText("changed api POST /api/refund")).toBeTruthy()
+    expect(screen.getByRole("heading", { name: "未映射变更" })).toBeTruthy()
+    expect(screen.getByText("无事实或锚点覆盖")).toBeTruthy()
+    expect(screen.queryByTestId("code-facts-slot")?.textContent).toContain("GET /orders")
+
+    const checkbox = screen.getByRole("checkbox", { name: "选择需求 9001" })
+    expect((checkbox as HTMLInputElement).checked).toBe(true)
+    fireEvent.click(checkbox)
+
+    await waitFor(() =>
+      expect(mocks.patchCandidate).toHaveBeenCalledWith(
+        VERSION_ID,
+        ANALYSIS_ID,
+        CANDIDATE.id,
+        false,
+      ),
+    )
+    await waitFor(() => expect((checkbox as HTMLInputElement).checked).toBe(false))
+  })
+
+  it("opens the anchor dialog from a changed file row and refreshes after creation", async () => {
+    mockReady()
+    mocks.createAnchor.mockResolvedValue(CREATED_ANCHOR)
+
+    renderTab()
+
+    const anchorAction = await screen.findByRole("button", {
+      name: "为 src/api/refund.ts 关联需求",
+    })
+    fireEvent.click(anchorAction)
+
+    expect(await screen.findByRole("dialog", { name: "关联需求锚点" })).toBeTruthy()
+    expect(mocks.listRequirements).toHaveBeenCalledWith(VERSION_ID, { limit: 100 })
+    await screen.findByRole("option", { name: /退款需求/ })
+
+    fireEvent.change(screen.getByLabelText("需求"), {
+      target: { value: REQUIREMENT.id },
+    })
+    const beforeRefresh = mocks.getLatestAnalysis.mock.calls.length
+    fireEvent.click(screen.getByRole("button", { name: "创建锚点" }))
+
+    await waitFor(() =>
+      expect(mocks.createAnchor).toHaveBeenCalledWith(VERSION_ID, {
+        subjectKind: "requirement",
+        subjectId: REQUIREMENT.id,
+        filePath: TEXT_FILE.path,
+      }),
+    )
+    await waitFor(() =>
+      expect(mocks.getLatestAnalysis.mock.calls.length).toBeGreaterThan(beforeRefresh),
+    )
+
+    fireEvent.keyDown(screen.getByRole("dialog", { name: "关联需求锚点" }), { key: "Escape" })
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull())
   })
 })

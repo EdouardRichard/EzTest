@@ -32,14 +32,17 @@ const binaryBadgeClass =
 export type ChangedFilesProps = {
   changes: ChangeList
   onOpenFile: (file: ChangedFile) => void
+  /** Opens the requirement-anchor dialog for one changed file (spec §9.2). */
+  onAnchorFile?: (file: ChangedFile) => void
 }
 
 /**
  * Change-set file list (spec §9.2): status/additions/deletions and the binary
- * marker, one button per file opening the unified diff drawer. It never
- * fabricates rows; an empty list is rendered by the container's empty state.
+ * marker, one button per file opening the unified diff drawer plus a row-level
+ * 「关联需求」 action that opens the anchor dialog. It never fabricates rows; an
+ * empty list is rendered by the container's empty state.
  */
-export function ChangedFiles({ changes, onOpenFile }: ChangedFilesProps) {
+export function ChangedFiles({ changes, onOpenFile, onAnchorFile }: ChangedFilesProps) {
   const headingId = useId()
   const { files, stats } = changes
 
@@ -68,12 +71,15 @@ export function ChangedFiles({ changes, onOpenFile }: ChangedFilesProps) {
 
       <ul className="divide-y divide-border">
         {files.map((file) => (
-          <li key={`${file.status}:${file.path}`}>
+          <li
+            key={`${file.status}:${file.path}`}
+            className="flex items-center gap-1.5 rounded-lg transition-colors hover:bg-muted/60"
+          >
             <button
               type="button"
               aria-label={`查看 ${file.path} 的 diff`}
               onClick={() => onOpenFile(file)}
-              className="grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-3 rounded-lg px-1 py-2.5 text-left transition-colors hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className="grid w-full min-w-0 flex-1 grid-cols-[minmax(0,1fr)_auto] items-center gap-3 rounded-lg px-1 py-2.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
               <span className="min-w-0">
                 <span className="block truncate font-mono text-xs text-foreground">
@@ -89,6 +95,16 @@ export function ChangedFiles({ changes, onOpenFile }: ChangedFilesProps) {
                 <span className="text-red-700 dark:text-red-300">-{file.deletions}</span>
               </span>
             </button>
+            {onAnchorFile === undefined ? null : (
+              <button
+                type="button"
+                aria-label={`为 ${file.path} 关联需求`}
+                onClick={() => onAnchorFile(file)}
+                className="shrink-0 rounded-lg border border-border px-2.5 py-1 text-xs font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                关联需求
+              </button>
+            )}
           </li>
         ))}
       </ul>
