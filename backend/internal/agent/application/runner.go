@@ -401,6 +401,7 @@ func (ex *runExecution) executeTools(ctx context.Context, calls []domain.ToolCal
 			RunID:       ex.runID,
 			SessionID:   ex.session.ID,
 			ActorUserID: ex.actor,
+			ProfileKey:  ex.profile.Key,
 			Call:        call,
 			Allowed:     ex.profile.AllowedTools,
 		})
