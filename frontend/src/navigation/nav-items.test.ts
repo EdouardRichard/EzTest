@@ -9,6 +9,12 @@ describe("navigation items", () => {
     expect(NAV_ITEMS.some((item) => item.phase === "P3")).toBe(true)
   })
 
+  it("marks the agent console route as the P1 agent runtime console", () => {
+    const agents = NAV_ITEMS.find((item) => item.href === "/agents")
+    expect(agents?.phase).toBe("P1")
+    expect(agents?.hint).toBe("Agent 运行时控制台（P8 扩展为 Agent 中心）")
+  })
+
   it("matches exact and nested routes but never hash anchors", () => {
     expect(isActive("/", "/")).toBe(true)
     expect(isActive("/settings", "/settings")).toBe(true)
