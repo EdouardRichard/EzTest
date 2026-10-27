@@ -1,6 +1,6 @@
 # EzTest 代码智能设计 v0.4（语言无关：AI 理解为主，不设计 parser）
 
-> **状态**：draft（与 system-blueprint v2.2 配套）
+> **状态**：draft（与 system-blueprint v2.2 配套）；实施细化见 P4 规格 `docs/superpowers/specs/2026-10-28-eztest-p4-code-intelligence-design.md`（D32/D33）与本文 §14；§13 DDL 为历史草案，实施按 D29/D32 定稿（雪花 BIGINT、9 表、无跨上下文 FK）。
 > **核心原则**：**不限定被测项目的语言/技术栈；不设计 parser/静态语言解析器**。代码理解完全由 AI 承担（读文件/diff/上下文，产出结构化事实 + 证据 + 置信度）；系统只保留语言无关的 **T0 通用 Git 层** 作为确定性兜底。
 > **真源**：管理员配置的**本地 Git 仓库**（只读挂载、固定分支、不联网）。不接线上代码仓。
 > **目标**：让 AI 理解"代码现状"并据此设计用例、做变更影响分析、定位问题代码位置；同时保证低 token、可复现、可追溯。
@@ -293,7 +293,7 @@ AI 产出（结构化，必须带证据）：
 | CI-M1（P4/P5/P8 增强） | AI 辅助的依赖/调用关系与影响精度提升；增量索引；设计评审用"代码有、脑图没覆盖"；未提交改动提示；AI 事实质量评估（命中率/人工修正率）；影响分析误报/漏报度量 |
 | CI-M2（P8 之后远期候选） | 字段级/跨栈深度分析；覆盖率联动；事实质量自动校准 |
 
-> 实施阶段映射：CI-M0 = 实施 P4；CI-M1 的增强项按能力分别归入 P4/P5/P8；CI-M2 为远期候选，需另立决策（实施 P4 明确不做字段级分析）。
+> 实施阶段映射：CI-M0 = 实施 P4；CI-M1 的增强项按能力分别归入 P4/P5/P8；CI-M2 为远期候选，需另立决策（实施 P4 明确不做字段级分析）。P4 范围与 CI-M0 场景的逐条映射见 P4 规格 §10.6：场景 6（用例/问题 code_ref）在 P4 以锚点 + 证据跳转替代，case/issue 实体归 P5/P6；其余场景按 T0/T1/影响分析/缓存/降级交付。
 
 ### 11.2 验收场景（语言无关）
 
@@ -320,6 +320,8 @@ AI 产出（结构化，必须带证据）：
 ---
 
 ## 13. DDL 草案（PostgreSQL，语言无关）
+
+> **实施说明（D29/D32，P4）**：以下 `BIGSERIAL`、`REFERENCES code_repositories(id)` 与旧枚举均为 **历史示例**；P4 实施按 D29/D32 使用应用层雪花 `BIGINT` 主键（`id BIGINT PRIMARY KEY`，无序列、无默认值），共 **9 表**：`code_change_sets`/`code_index_runs`/`code_entities`/`code_edges`/`code_fact_versions`/`code_analysis_cache`/`code_analyses`/`code_impact_candidates`/`code_anchors`；`repo_id`/`version_id`/`requirement_id`/`app_model_id` 为逻辑引用，**不建跨上下文 FK**。完整定稿 DDL 见 P4 规格 §5。
 
 ```sql
 CREATE TABLE IF NOT EXISTS code_repositories (
@@ -418,6 +420,22 @@ CREATE TABLE IF NOT EXISTS code_fact_versions (
     UNIQUE (repo_id, commit_sha, fact_key, version)
 );
 ```
+
+---
+
+## 14. P4 实施细化（D32/D33）
+
+> P4 交付 CI-M0 垂直切片；完整依据见 `docs/superpowers/specs/2026-10-28-eztest-p4-code-intelligence-design.md`。本节只列落点，与蓝图 D32/D33 保持一致；与旧文本冲突时以 P4 规格为准。
+
+1. **T0（确定性，语言无关）**：只读解析本地固定分支的 commit / 文件树 / blob 哈希 / 文件级 diff / 按需 unified diff / 行读取；不做 parser、不切分支、不改工作树、不信任 `last_commit` 缓存。仓库级 T0 索引为异步 run，文件实体落 `code_entities(kind=file)`，`last_indexed_at` 只经 resource application 端口回写。
+2. **T1（AI 代码理解）**：仅分析 change set 中可读取的变更文本文件（默认 ≤20），每文件一次 chat 调用，产出严格 JSON 事实/边（route/page/api/client_call/component/module/symbol + confidence）；跨栈契约以 `method + 归一化 path` 精确匹配后落 `code_edges.rel='route_to_api'`，不另建契约表。
+3. **证据按 commit 固定**：每条事实证据为 `path + start/end line + 摘录 sha256`，服务端按 **commit 内容**（非工作树）复算校验；失败降为 low 线索（灰显、不参与自动影响），无效证据不入库。
+4. **缓存与版本**：文件级缓存键 `(repo, commit, path, file_hash, model, prompt_version)`，命中不调 LLM；事实按 `fact_key` 版本化（body 语义相同复用，不同 `version+1` 并写旧版 `superseded_at`，`code_entities` 只存当前版本）；影响分析同 `(version, base, head, model, prompt_version, fact 版本集)` 默认复用（`reused=true`），`force` 新建 `analysis_version`、不覆盖旧记录。
+5. **影响对象**：v1 输出受影响**需求**、**应用模型节点**（P2 key 约定归一匹配 + 人工锚点）与 `unmapped_changes`（reason/suggestion）；`affected.cases` 仅保留响应结构，P5 接入。候选 source 优先级 direct > contract > relation > ai，low 默认不选中、可人工勾选。
+6. **API 作用域**：仓库级 `/api/code/*`（repos/index/tree/file/diff/facts/search/commits），版本级 `/api/versions/{id}/code/*`（changes/analyses/candidates/anchors）；触发返回 202、同输入复用返回 200；单实例进程内 worker（默认并发 1），启动把遗留 queued/running 置 failed(interrupted)。
+7. **事件**：复用 `version:{id}` SSE 通道，只发 `code.changed`/`code.impact_computed`（id/计数/path 摘要，不含代码正文）；仓库级索引不广播，前端轮询索引状态。
+8. **降级**：LLM 未配置/不可用/超预算/解析全部失败 → `status=done`、`degraded=true`，仅 T0 候选 + unmapped，HTTP 2xx，不阻塞版本流程；Git/仓库/head 失败才 `failed`。
+9. **P4 明确不做**：parser/符号级/字段级分析；全仓 AI 分析、全文检索（D24）、全仓索引大屏；用例/问题实体与 `code_ref` 页面（P5/P6）、批次执行（P6）、monorepo 子项目配置（D20）、线上仓、多实例 worker；不新增 Agent profile，仅注册 `code_*` 只读工具薄壳（P3 `code.tree`/`code.read` 契约不变）。
 
 ---
 

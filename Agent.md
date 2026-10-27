@@ -135,16 +135,21 @@ EzTest/
 │     │  ├─ application/              # catalog/access/session/coderepo 服务、ports
 │     │  ├─ infrastructure/           # {postgres,httpcheck,gitexec}
 │     │  └─ interfaces/httpapi/       # /api/resources/* handler、DTO
-│     └─ version/                     # 限界上下文：版本/多需求/澄清（P3，D31）
+│     ├─ version/                     # 限界上下文：版本/多需求/澄清（P3，D31）
 │        ├─ domain/                   # version/requirement/relation/attachment/clarification/decision
 │        ├─ application/              # version/requirement/relation/clarification/attachment 服务、agent_tool、ports
 │        ├─ infrastructure/           # {postgres,filestore,gitread,agent,eventing,resource}
 │        └─ interfaces/httpapi/       # /api/versions/* handler、DTO
+│     └─ codeintel/                   # 限界上下文：代码智能（P4，D32/D33）
+│        ├─ domain/                   # entity/edge/change_set/analysis/fact_version/anchor/evidence/contract/limits
+│        ├─ application/              # index/analysis/impact/anchor 服务、run_worker、prompt/parser、agent_tool、ports
+│        ├─ infrastructure/           # {gitx,postgres,llm,eventing,resource,version,audit}
+│        └─ interfaces/httpapi/       # /api/code/*、/api/versions/{id}/code/* handler、DTO
 ├─ frontend/
 │  ├─ src/app/                        # Next.js App Router，只做页面组装
 │  │  ├─ (app)/agents/                # /agents 路由，挂载 agent-console
 │  │  └─ (app)/versions/              # /versions 与 /versions/[id] 路由，挂载 versions
-│  ├─ src/features/{auth,users,llm-settings,sse-test,shell,agent-console,versions}/
+│  ├─ src/features/{auth,users,llm-settings,sse-test,shell,agent-console,versions,code-intel}/
 │  ├─ src/components/ui/              # 共享 UI 原语
 │  ├─ src/lib/                        # api-client / sse-client / auth-storage / utils
 │  ├─ src/hooks/  src/navigation/  src/styles/
@@ -160,13 +165,15 @@ EzTest/
 └─ .tools/                            # 便携 Go/PostgreSQL（gitignored）
 ```
 
-每个限界上下文**必须**四层齐全：`domain/`、`application/`、`infrastructure/`、`interfaces/httpapi/`。上下文名使用小写单数（`identity`、`eventing`、`llm`、`storage`、`audit`、`agent`、`resource`、`version`），不得新建 `utils/`、`common/`、`helpers/` 之类杂物目录；共享纯逻辑放 `internal/platform/`。
+每个限界上下文**必须**四层齐全：`domain/`、`application/`、`infrastructure/`、`interfaces/httpapi/`。上下文名使用小写单数（`identity`、`eventing`、`llm`、`storage`、`audit`、`agent`、`resource`、`version`、`codeintel`），不得新建 `utils/`、`common/`、`helpers/` 之类杂物目录；共享纯逻辑放 `internal/platform/`。
 
 P1 新增的 `agent` 上下文位于 `backend/internal/agent/`：`infrastructure/` 含 `postgres`、`llm`、`eventing`、`audit`、`tools` 适配，`interfaces/httpapi/` 暴露 `/api/agents/*`。P3 兼容扩展：Agent 会话新增可选 `activity_channel`（澄清会话为 `version:{id}`；默认回退 `agent:{session_id}` 不变），run 支持文本 + `image_ref` 多模态输入。
 
 P2 新增的 `resource` 上下文位于 `backend/internal/resource/`：承载公共资源与身份（D28），`infrastructure/` 含 `postgres`、`httpcheck`、`gitexec` 适配，`interfaces/httpapi/` 暴露 `/api/resources/*`。
 
 P3 新增的 `version` 上下文位于 `backend/internal/version/`：承载版本/多需求/澄清（D31），四层齐全；`infrastructure/` 含 `postgres`、`filestore`、`gitread`、`agent`、`eventing`、`resource` 适配，`interfaces/httpapi/` 暴露 `/api/versions/*`。主键由 `backend/internal/platform/id/snowflake.go` 生成（D29），需求附件走文件系统（D30）；前端 feature 位于 `frontend/src/features/versions/`。
+
+P4 新增的 `codeintel` 上下文位于 `backend/internal/codeintel/`：承载代码理解与影响分析（D32/D33），四层齐全；`infrastructure/` 含 `gitx`、`postgres`、`llm`、`eventing`、`resource`、`version`、`audit` 适配，`interfaces/httpapi/` 暴露仓库级 `/api/code/*` 与版本级 `/api/versions/{id}/code/*`。新增 9 表（雪花 `BIGINT` 主键；`repo_id`/`version_id`/`requirement_id`/`app_model_id` 均为逻辑引用、不建跨上下文 FK）；分析/索引为异步 run（202 + 轮询 + `version:{id}` SSE），复用 P0 LLM 网关，不新增 Agent profile（仅注册 `code_*` 只读工具薄壳，P3 `code.tree`/`code.read` 契约不变）；前端 feature 位于 `frontend/src/features/code-intel/`。
 
 ### 6.2 导入方向（Go，强制）
 
