@@ -7,6 +7,12 @@ import "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 // ids, JSON framing).
 const contextMessageOverheadChars = 16
 
+// contextImageBudgetChars is the fixed character budget charged for each image
+// reference. The real data URL is only generated at LLM call time (D30), so the
+// estimate cannot measure its size; 4096 keeps the budget conservative without
+// charging the attachment's raw bytes.
+const contextImageBudgetChars = 4096
+
 // ContextBuilder assembles the LLM context for one model turn: the profile's
 // system prompt followed by the session history, truncated turn by turn to fit
 // the character budget. It is stateless and safe to reuse across runs.
@@ -207,14 +213,18 @@ func filterEmptyTextParts(message domain.Message) domain.Message {
 
 // EstimateChars estimates the character cost of messages as the sum of text
 // part lengths, reasoning lengths and tool-call argument lengths, plus a fixed
-// overhead per message. Byte length is used deliberately: it charges a CJK
-// character three units instead of one, which keeps the budget conservative.
+// overhead per message and a fixed allowance per image reference. Byte length
+// is used deliberately: it charges a CJK character three units instead of one,
+// which keeps the budget conservative.
 func EstimateChars(messages []LLMMessage) int {
 	total := 0
 	for _, message := range messages {
 		total += contextMessageOverheadChars
 		for _, part := range message.Parts {
 			total += len(part.Text)
+			if part.ImageRef != "" {
+				total += contextImageBudgetChars
+			}
 		}
 		total += len(message.ReasoningContent)
 		for _, call := range message.ToolCalls {

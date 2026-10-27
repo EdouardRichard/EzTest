@@ -4,10 +4,16 @@ import "time"
 
 // Part is one piece of a message's content. Type is "text" or "image_url"; the
 // JSON tags make the persisted JSONB and the API shape identical.
+//
+// ImageRef is the P3 multimodal form of an image part: it references a stored
+// attachment ("attachment:<id>") and is what the message store keeps. ImageURL
+// is kept for P1 compatibility and is only ever populated transiently by the
+// LLM gateway right before a call (D30: no data URLs in the database).
 type Part struct {
 	Type     string `json:"type"`
 	Text     string `json:"text,omitempty"`
 	ImageURL string `json:"image_url,omitempty"`
+	ImageRef string `json:"image_ref,omitempty"`
 }
 
 // ToolCall is one tool invocation requested by the model. Arguments is the raw

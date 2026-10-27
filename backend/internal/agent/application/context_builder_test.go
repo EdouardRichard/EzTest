@@ -479,6 +479,26 @@ func TestBuildFiltersEmptyTextParts(t *testing.T) {
 	}
 }
 
+// TestEstimateCharsCountsImages pins the multimodal budget: every image
+// reference is charged a fixed 4096 characters. The data URL is generated only
+// at LLM call time (D30), so its real size is never available to the estimate.
+func TestEstimateCharsCountsImages(t *testing.T) {
+	messages := []application.LLMMessage{
+		{Role: "user", Parts: []domain.Part{
+			{Type: "text", Text: "look"},                   // 4
+			{Type: "image_url", ImageRef: "attachment:41"}, // 4096
+		}}, // + 16
+		{Role: "user", Parts: []domain.Part{
+			{Type: "image_url", ImageRef: "attachment:42"}, // 4096
+			{Type: "image_url", ImageRef: "attachment:43"}, // 4096
+		}}, // + 16
+	}
+	// 4+4096+16 + 4096+4096+16 = 12324.
+	if got, want := application.EstimateChars(messages), 12324; got != want {
+		t.Fatalf("EstimateChars=%d want %d (4096 per image ref)", got, want)
+	}
+}
+
 func TestEstimateCharsCountsTextReasoningAndArguments(t *testing.T) {
 	messages := []application.LLMMessage{
 		{Role: "system", Parts: []domain.Part{{Type: "text", Text: "sys"}}}, // 3 + 16

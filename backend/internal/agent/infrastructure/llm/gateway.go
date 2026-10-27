@@ -8,6 +8,7 @@ package agentllm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 
 	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
@@ -31,14 +32,22 @@ type ConfigSource interface {
 // caller keeps the configuration's client for the whole run, so a mid-run
 // administrator change only affects the next run.
 type Gateway struct {
-	source  ConfigSource
-	factory llmapp.ClientFactory
+	source   ConfigSource
+	factory  llmapp.ClientFactory
+	resolver agentapp.ImageResolver
 }
 
 // NewGateway returns a gateway reading the default configuration from source and
-// building clients with factory.
-func NewGateway(source ConfigSource, factory llmapp.ClientFactory) *Gateway {
-	return &Gateway{source: source, factory: factory}
+// building clients with factory. resolver is optional for P1 compatibility:
+// text-only runs never need it, while a request carrying an image reference is
+// rejected with a readable error when it is missing. P3 wires the attachment
+// resolver here; the data URL it returns is transient (D30).
+func NewGateway(source ConfigSource, factory llmapp.ClientFactory, resolver ...agentapp.ImageResolver) *Gateway {
+	var imageResolver agentapp.ImageResolver
+	if len(resolver) > 0 {
+		imageResolver = resolver[0]
+	}
+	return &Gateway{source: source, factory: factory, resolver: imageResolver}
 }
 
 // Prepare resolves the default configuration and returns the caller for one run.
@@ -63,6 +72,8 @@ func (g *Gateway) Prepare(ctx context.Context, modelOverride string) (agentapp.L
 		model:         model,
 		contextWindow: contextWindowFor(cfg.ModelCatalog, model),
 		client:        g.factory(cfg),
+		resolver:      g.resolver,
+		multimodal:    cfg.MultimodalEnabled,
 	}, nil
 }
 
@@ -86,6 +97,10 @@ type caller struct {
 	model         string
 	contextWindow int
 	client        llmapp.Client
+	// resolver turns persisted image references into transient data URLs at
+	// call time; multimodal reflects the configuration's image capability.
+	resolver   agentapp.ImageResolver
+	multimodal bool
 }
 
 // Model implements agentapp.LLMCaller.
@@ -94,11 +109,17 @@ func (c *caller) Model() string { return c.model }
 // ContextWindowTokens implements agentapp.LLMCaller.
 func (c *caller) ContextWindowTokens() int { return c.contextWindow }
 
-// ChatStream implements agentapp.LLMCaller: it forwards the mapped request and
-// streams mapped events. Upstream and in-stream errors are wrapped so the runner
-// can read their llm_* code; a stream that closes without a terminal Done or Err
-// event is reported as llm_invalid_response.
+// ChatStream implements agentapp.LLMCaller: it resolves any image reference into
+// a transient data URL, forwards the mapped request and streams mapped events.
+// Upstream and in-stream errors are wrapped so the runner can read their llm_*
+// code; a stream that closes without a terminal Done or Err event is reported as
+// llm_invalid_response.
 func (c *caller) ChatStream(ctx context.Context, req agentapp.LLMRequest) (<-chan agentapp.LLMStreamEvent, error) {
+	messages, err := c.resolveImageRefs(ctx, req.Messages)
+	if err != nil {
+		return nil, err
+	}
+	req.Messages = messages
 	upstream, err := c.client.ChatStream(ctx, toChatRequest(req))
 	if err != nil {
 		return nil, wrapLLMError(err)
@@ -106,6 +127,64 @@ func (c *caller) ChatStream(ctx context.Context, req agentapp.LLMRequest) (<-cha
 	events := make(chan agentapp.LLMStreamEvent)
 	go forwardStream(ctx, upstream, events, wireToInternalNames(req.Tools))
 	return events, nil
+}
+
+// resolveImageRefs replaces every persisted image reference with the data URL
+// the resolver produces for this call. Text-only requests are returned
+// untouched, so the P1 path keeps its exact behavior.
+//
+// The caller's messages and parts are copied before the substitution: a request
+// value is reused by the runner for its history, which must never hold a data
+// URL (D30). The configuration's multimodal capability is checked only when a
+// reference is actually present.
+func (c *caller) resolveImageRefs(ctx context.Context, messages []agentapp.LLMMessage) ([]agentapp.LLMMessage, error) {
+	hasRefs := false
+	for _, message := range messages {
+		for _, part := range message.Parts {
+			if part.ImageRef != "" {
+				hasRefs = true
+				break
+			}
+		}
+		if hasRefs {
+			break
+		}
+	}
+	if !hasRefs {
+		return messages, nil
+	}
+	if !c.multimodal {
+		return nil, badRequestError("llm: the default configuration has multimodal disabled; an image reference cannot be sent")
+	}
+	if c.resolver == nil {
+		return nil, badRequestError("llm: image resolver is not configured")
+	}
+
+	resolved := make([]agentapp.LLMMessage, len(messages))
+	copy(resolved, messages)
+	for index, message := range messages {
+		parts := make([]agentdomain.Part, len(message.Parts))
+		copy(parts, message.Parts)
+		for partIndex, part := range parts {
+			if part.ImageRef == "" {
+				continue
+			}
+			dataURL, err := c.resolver.ResolveImage(ctx, part.ImageRef)
+			if err != nil {
+				return nil, fmt.Errorf("llm: resolve image reference %q: %w", part.ImageRef, err)
+			}
+			parts[partIndex] = agentdomain.Part{Type: "image_url", ImageURL: dataURL}
+		}
+		resolved[index].Parts = parts
+	}
+	return resolved, nil
+}
+
+// badRequestError is a request the gateway refuses before reaching the upstream.
+// It carries the public llm_bad_request code so the runner persists the precise
+// cause in agent_runs.
+func badRequestError(message string) error {
+	return &codedError{code: platform.CodeLLMBadRequest, err: errors.New(message)}
 }
 
 // wireToolName maps an internal tool name to the provider-safe wire name.

@@ -101,6 +101,14 @@ type AuditSink interface {
 	Record(ctx context.Context, event AuditEvent) error
 }
 
+// ImageResolver turns a stored image reference ("attachment:<id>") into a data
+// URL at LLM call time. The data URL is transient: it must never be persisted
+// in agent_messages or logged (D30). Implementations reject references that do
+// not name a readable image attachment.
+type ImageResolver interface {
+	ResolveImage(ctx context.Context, ref string) (dataURL string, err error)
+}
+
 // Clock returns the current time. It is injectable so the run loop can be
 // tested without sleeping.
 type Clock func() time.Time
