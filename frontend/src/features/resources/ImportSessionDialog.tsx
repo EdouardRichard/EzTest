@@ -1,11 +1,25 @@
 "use client"
 
-import { type ChangeEvent, type FormEvent, useEffect, useRef, useState } from "react"
+import {
+  type ChangeEvent,
+  type FormEvent,
+  type KeyboardEvent,
+  useEffect,
+  useRef,
+  useState,
+} from "react"
 
 import { ApiError } from "@/lib/api-client"
 
 import { importSession, listAccesses, listAccounts, listEnvironments, listSystems } from "./api"
-import type { AccessDTO, AccountDTO, EnvironmentDTO, SessionDTO, SystemDTO } from "./types"
+import type {
+  AccessDTO,
+  AccountDTO,
+  EnvironmentDTO,
+  SessionDTO,
+  SnapshotDTO,
+  SystemDTO,
+} from "./types"
 
 /** Import payload cap: 5 MiB of JSON (spec §6.2). */
 const MAX_IMPORT_BYTES = 5 * 1024 * 1024
@@ -129,18 +143,48 @@ function summaryText(summary: unknown): string {
   return `允许 ${parsed.allowed ?? 0} / 拒绝 ${parsed.denied ?? 0} / 错误 ${parsed.error ?? 0}`
 }
 
+/** Reads `items.login.observed` from a login-check snapshot, when present. */
+function observedLogin(items: unknown): string {
+  if (typeof items !== "object" || items === null) return ""
+  const login = (items as Record<string, unknown>).login
+  if (typeof login !== "object" || login === null) return ""
+  const observed = (login as Record<string, unknown>).observed
+  return typeof observed === "string" ? observed : ""
+}
+
+/**
+ * Import outcome line (spec §6.3). A non-degraded snapshot is only a pass when
+ * the session is valid and nothing was denied or errored: a denied/errored
+ * login_check lands in needs_manual, so it must not be reported as a pass.
+ */
+function describeCheckOutcome(session: SessionDTO, snapshot: SnapshotDTO): string {
+  const summary = readSummary(snapshot.summary)
+  if (snapshot.degraded || summary.degraded) {
+    return "能力未验证（degraded），请人工确认或重新校验。"
+  }
+  const observed = observedLogin(snapshot.items)
+  if ((summary.denied ?? 0) > 0 || observed === "denied") {
+    return "能力校验未通过：登录检查被拒绝，请人工确认或重新校验。"
+  }
+  if ((summary.error ?? 0) > 0 || observed === "error") {
+    return "能力校验未通过：登录检查执行出错，请人工确认或重新校验。"
+  }
+  if (session.state === "valid" && ((summary.allowed ?? 0) > 0 || observed === "allowed")) {
+    return "能力校验通过。"
+  }
+  return "能力校验未通过，需人工确认。"
+}
+
 /** Import result line: state, snapshot counters and the degraded flag (spec §6.3). */
 function describeResult(session: SessionDTO): string {
   const parts = [`已导入会话 #${session.id}：状态 ${session.state}。`]
   const snapshot = session.latestSnapshot ?? null
   if (snapshot === null) {
     parts.push("暂无快照。")
-  } else if (snapshot.degraded || readSummary(snapshot.summary).degraded) {
-    parts.push("能力未验证（degraded），请人工确认或重新校验。")
-  } else {
-    parts.push("能力校验通过。")
+    return parts.join("")
   }
-  if (snapshot !== null) parts.push(`快照：${summaryText(snapshot.summary)}。`)
+  parts.push(describeCheckOutcome(session, snapshot))
+  parts.push(`快照：${summaryText(snapshot.summary)}。`)
   return parts.join("")
 }
 
@@ -151,6 +195,16 @@ const primaryButtonClass =
   "inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
 const secondaryButtonClass =
   "inline-flex items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-2 text-sm font-medium transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+
+/** Tab order inside the modal dialog; disabled controls are skipped. */
+const FOCUSABLE_SELECTOR = [
+  "a[href]",
+  "button:not([disabled])",
+  "input:not([disabled])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  "[tabindex]:not([tabindex='-1'])",
+].join(", ")
 
 export type ImportSessionDialogProps = {
   onClose: () => void
@@ -181,6 +235,49 @@ export function ImportSessionDialog({ onClose, onImported }: ImportSessionDialog
   const [environmentLoading, setEnvironmentLoading] = useState(false)
   const accessRequestRef = useRef(0)
   const environmentRequestRef = useRef(0)
+  const dialogRef = useRef<HTMLDivElement>(null)
+  const firstFieldRef = useRef<HTMLSelectElement>(null)
+  const triggerRef = useRef<HTMLElement | null>(null)
+
+  // Move focus into the modal on open (so `aria-modal` and Escape work) and
+  // hand it back to the trigger when the dialog unmounts.
+  useEffect(() => {
+    const trigger = document.activeElement
+    triggerRef.current = trigger instanceof HTMLElement ? trigger : null
+    firstFieldRef.current?.focus()
+    return () => {
+      const previous = triggerRef.current
+      if (previous?.isConnected) previous.focus()
+    }
+  }, [])
+
+  function handleDialogKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    if (event.key === "Escape") {
+      onClose()
+      return
+    }
+    if (event.key !== "Tab") return
+    const dialog = dialogRef.current
+    if (dialog === null) return
+    const focusable = Array.from(dialog.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR))
+    if (focusable.length === 0) {
+      event.preventDefault()
+      return
+    }
+    const first = focusable[0]
+    const last = focusable[focusable.length - 1]
+    const active = document.activeElement
+    const inside = active instanceof HTMLElement && dialog.contains(active)
+    if (event.shiftKey) {
+      if (!inside || active === first) {
+        event.preventDefault()
+        last.focus()
+      }
+    } else if (!inside || active === last) {
+      event.preventDefault()
+      first.focus()
+    }
+  }
 
   useEffect(() => {
     let active = true
@@ -336,12 +433,11 @@ export function ImportSessionDialog({ onClose, onImported }: ImportSessionDialog
   return (
     <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 p-4 sm:items-center">
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby="session-import-title"
-        onKeyDown={(event) => {
-          if (event.key === "Escape") onClose()
-        }}
+        onKeyDown={handleDialogKeyDown}
         className="w-full max-w-2xl space-y-3 rounded-2xl border border-border bg-card p-4 shadow-xl"
       >
         <div className="flex flex-wrap items-start justify-between gap-2">
@@ -384,6 +480,7 @@ export function ImportSessionDialog({ onClose, onImported }: ImportSessionDialog
               </label>
               <select
                 id="session-import-account"
+                ref={firstFieldRef}
                 value={accountId}
                 onChange={(event) => handleAccountChange(event.target.value)}
                 className={inputClass}

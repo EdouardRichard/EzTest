@@ -103,6 +103,7 @@ export function SessionsPanel({ canWrite, initialSessionId, onSelectSession }: S
   const [detailError, setDetailError] = useState("")
   const [importOpen, setImportOpen] = useState(false)
   const detailRequestRef = useRef(0)
+  const listRequestRef = useRef(0)
 
   const loadOptions = useCallback(async () => {
     try {
@@ -118,6 +119,10 @@ export function SessionsPanel({ canWrite, initialSessionId, onSelectSession }: S
   }, [])
 
   const load = useCallback(async () => {
+    // Rapid filter changes (or the refresh button) can resolve out of order;
+    // only the newest request may write rows, environments, errors and loading.
+    const requestId = listRequestRef.current + 1
+    listRequestRef.current = requestId
     setLoading(true)
     setError("")
     try {
@@ -127,6 +132,7 @@ export function SessionsPanel({ canWrite, initialSessionId, onSelectSession }: S
         ...(filters.systemId === "" ? {} : { systemId: Number(filters.systemId) }),
         ...(filters.state === "" ? {} : { state: filters.state }),
       })
+      if (listRequestRef.current !== requestId) return
       setSessions(page.items)
       // With no deep link the first row becomes the selection, so the detail
       // (and the admin actions) are reachable without an extra click.
@@ -139,14 +145,16 @@ export function SessionsPanel({ canWrite, initialSessionId, onSelectSession }: S
       }
       try {
         const lists = await Promise.all(systemIds.map((id) => listEnvironments(id)))
+        if (listRequestRef.current !== requestId) return
         setEnvironments(lists.flat())
       } catch {
         // Environment names are decorative; keep the session list usable.
       }
     } catch (caught) {
+      if (listRequestRef.current !== requestId) return
       setError(describeError(caught))
     } finally {
-      setLoading(false)
+      if (listRequestRef.current === requestId) setLoading(false)
     }
   }, [filters])
 
