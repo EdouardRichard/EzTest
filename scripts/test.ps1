@@ -73,6 +73,66 @@ function Invoke-Checked {
     }
 }
 
+function Assert-SafeTestDatabaseUrl {
+    param(
+        [string]$TestDatabaseUrl,
+        [string]$DatabaseUrl
+    )
+    # Defense in depth for the destructive Go integration helper: it drops and
+    # recreates the public schema, so the URL must name a dedicated PostgreSQL
+    # test/e2e database and must not be the development database. Error messages
+    # intentionally omit credentials and the full URLs.
+    if ([string]::IsNullOrWhiteSpace($TestDatabaseUrl)) {
+        throw "EZTEST_TEST_DATABASE_URL is not set; integration tests need the dedicated test database"
+    }
+    if ([string]::IsNullOrWhiteSpace($DatabaseUrl)) {
+        throw "EZTEST_DATABASE_URL is not set, so the test database cannot be checked against the development database"
+    }
+
+    $testUri = $null
+    if (-not [System.Uri]::TryCreate($TestDatabaseUrl, [System.UriKind]::Absolute, [ref]$testUri)) {
+        throw "EZTEST_TEST_DATABASE_URL is not a valid absolute URL"
+    }
+    $devUri = $null
+    if (-not [System.Uri]::TryCreate($DatabaseUrl, [System.UriKind]::Absolute, [ref]$devUri)) {
+        throw "EZTEST_DATABASE_URL is not a valid absolute URL"
+    }
+
+    foreach ($item in @(
+            @{ Name = "EZTEST_TEST_DATABASE_URL"; Uri = $testUri },
+            @{ Name = "EZTEST_DATABASE_URL"; Uri = $devUri }
+        )) {
+        if ($item.Uri.Scheme -ne "postgres" -and $item.Uri.Scheme -ne "postgresql") {
+            throw "$($item.Name) must use the postgres scheme"
+        }
+        if ([string]::IsNullOrWhiteSpace($item.Uri.Host)) {
+            throw "$($item.Name) must include a host"
+        }
+    }
+
+    $testName = [System.Uri]::UnescapeDataString($testUri.AbsolutePath.TrimStart([char[]]"/"))
+    if ([string]::IsNullOrWhiteSpace($testName)) {
+        throw "EZTEST_TEST_DATABASE_URL must include a database name"
+    }
+    if (-not ($testName.EndsWith("_test", [System.StringComparison]::Ordinal) -or
+            $testName.EndsWith("_e2e", [System.StringComparison]::Ordinal))) {
+        throw "EZTEST_TEST_DATABASE_URL database '$testName' must end with _test or _e2e"
+    }
+
+    $devName = [System.Uri]::UnescapeDataString($devUri.AbsolutePath.TrimStart([char[]]"/"))
+    if ([string]::IsNullOrWhiteSpace($devName)) {
+        throw "EZTEST_DATABASE_URL must include a database name"
+    }
+
+    $testPort = if ($testUri.Port -gt 0) { $testUri.Port } else { 5432 }
+    $devPort = if ($devUri.Port -gt 0) { $devUri.Port } else { 5432 }
+    $testCanonical = "{0}:{1}/{2}" -f $testUri.Host.ToLowerInvariant(), $testPort, $testName
+    $devCanonical = "{0}:{1}/{2}" -f $devUri.Host.ToLowerInvariant(), $devPort, $devName
+    if ($testCanonical -eq $devCanonical) {
+        throw "EZTEST_TEST_DATABASE_URL points at the same database as EZTEST_DATABASE_URL ($testCanonical); refusing to reset it"
+    }
+}
+
 Import-DotEnv -Path $envPath
 
 $goExe = Join-Path $repoRoot ".tools\go\bin\go.exe"
@@ -88,9 +148,8 @@ Invoke-Checked -Label "Go unit tests" -Exe $goExe `
     -Arguments @("test", "-count=1", "./...") -WorkingDirectory $backendDir
 
 if (-not $SkipIntegration) {
-    if ([string]::IsNullOrWhiteSpace([string]$env:EZTEST_TEST_DATABASE_URL)) {
-        throw "EZTEST_TEST_DATABASE_URL is not set in .env; integration tests need the eztest_test database"
-    }
+    Assert-SafeTestDatabaseUrl -TestDatabaseUrl ([string]$env:EZTEST_TEST_DATABASE_URL) `
+        -DatabaseUrl ([string]$env:EZTEST_DATABASE_URL)
     Invoke-Checked -Label "Go integration tests" -Exe $goExe `
         -Arguments @("test", "-tags=integration", "-count=1", "./...") -WorkingDirectory $backendDir
 } else {

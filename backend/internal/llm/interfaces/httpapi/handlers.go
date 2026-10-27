@@ -13,9 +13,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
-	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -33,8 +30,6 @@ const (
 	maxLLMBodyBytes int64 = 16 << 10
 	// defaultTestPrompt is the design's default prompt for the test endpoint.
 	defaultTestPrompt = "请用一句话描述这张图片"
-	// pixelFixturePath is the built-in 1x1 PNG used by image tests.
-	pixelFixturePath = "testdata/pixel.png"
 )
 
 // ConfigService is the LLM configuration use case consumed by the admin routes.
@@ -55,8 +50,6 @@ type Handler struct {
 	svc      ConfigService
 	factory  llmapp.ClientFactory
 	recorder auditapp.Recorder
-	// imagePath optionally overrides the built-in test image location.
-	imagePath string
 }
 
 // NewHandler returns the admin LLM handlers. A nil recorder degrades to a no-op
@@ -361,14 +354,11 @@ func (h *Handler) Test(w http.ResponseWriter, r *http.Request) {
 		parts[0].Text = defaultTestPrompt
 	}
 	if req.Image {
-		png, err := h.pixelImage()
-		if err != nil {
-			platform.WriteError(w, r, http.StatusInternalServerError, platform.CodeInternal, "test image is not available")
-			return
-		}
+		// pixelPNG is compiled into the binary: no working-directory or source
+		// tree lookup exists, so the API image can serve this endpoint too.
 		parts = append(parts, llmapp.Part{
 			Type:     "image_url",
-			ImageURL: "data:image/png;base64," + base64.StdEncoding.EncodeToString(png),
+			ImageURL: "data:image/png;base64," + base64.StdEncoding.EncodeToString(pixelPNG),
 		})
 	}
 
@@ -546,27 +536,6 @@ func (h *Handler) clientFor(cfg llm.Config) (llmapp.Client, error) {
 		return nil, errors.New("llm: client factory returned nil")
 	}
 	return client, nil
-}
-
-// pixelImage reads the built-in 1x1 PNG fixture. The explicit path wins; the
-// remaining candidates keep the fixture discoverable both from the backend
-// working directory and from a test package's directory.
-func (h *Handler) pixelImage() ([]byte, error) {
-	candidates := make([]string, 0, 3)
-	if h.imagePath != "" {
-		candidates = append(candidates, h.imagePath)
-	}
-	candidates = append(candidates, pixelFixturePath)
-	if _, file, _, ok := runtime.Caller(0); ok {
-		candidates = append(candidates, filepath.Join(filepath.Dir(file), "..", "..", "..", "..", "testdata", "pixel.png"))
-	}
-	for _, candidate := range candidates {
-		data, err := os.ReadFile(candidate)
-		if err == nil {
-			return data, nil
-		}
-	}
-	return nil, fmt.Errorf("llm: pixel fixture %q is not readable", pixelFixturePath)
 }
 
 // configIDFromPath parses the positive integer {id} path value.

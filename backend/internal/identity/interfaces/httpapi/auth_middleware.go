@@ -2,6 +2,8 @@ package httpapi
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -20,7 +22,10 @@ func UserFromContext(ctx context.Context) (identity.User, bool) {
 
 // AuthMiddleware resolves the Authorization bearer token and stores the user in
 // the request context. A missing, malformed, unknown, revoked or expired token
-// gets 401 with a Bearer challenge.
+// gets 401 with a Bearer challenge. Any other Authenticate error (typically a
+// database outage) is a server failure: it gets the shared 503 unavailable
+// envelope without the challenge, so clients keep their credentials and retry
+// instead of treating a valid session as invalid.
 func AuthMiddleware(authenticator Authenticator) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -31,7 +36,16 @@ func AuthMiddleware(authenticator Authenticator) func(http.Handler) http.Handler
 			}
 			user, err := authenticator.Authenticate(r.Context(), rawToken)
 			if err != nil {
-				writeUnauthenticated(w, r)
+				if errors.Is(err, identity.ErrUnauthenticated) {
+					writeUnauthenticated(w, r)
+					return
+				}
+				// Never log the bearer token: only the request id and the
+				// underlying server-side failure are recorded.
+				slog.ErrorContext(r.Context(), "auth: authenticate request",
+					"request_id", platform.RequestID(r.Context()), "error", err)
+				platform.WriteError(w, r, http.StatusServiceUnavailable, platform.CodeUnavailable,
+					"authentication is temporarily unavailable")
 				return
 			}
 			ctx := context.WithValue(r.Context(), userContextKey{}, user)

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -38,6 +39,10 @@ const (
 	// startupTimeout bounds database connection, migration and admin seeding
 	// work at boot.
 	startupTimeout = 30 * time.Second
+	// shutdownTimeout is the grace period for in-flight requests after the
+	// shutdown signal. Open SSE connections are canceled through BaseContext
+	// before Shutdown is called, so only genuinely stuck handlers hit it.
+	shutdownTimeout = 10 * time.Second
 	// bcryptCost is the documented password hashing cost.
 	bcryptCost = 12
 )
@@ -127,6 +132,11 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	)
 	cancelStartup()
 
+	// Every request context descends from baseCtx. Canceling it on shutdown
+	// wakes long-lived SSE handlers, which only exit on r.Context().Done().
+	baseCtx, cancelBase := context.WithCancel(context.Background())
+	defer cancelBase()
+
 	srv := &http.Server{
 		Addr: cfg.HTTPAddr,
 		Handler: server.New(cfg, logger, server.Dependencies{
@@ -142,6 +152,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 			LLMClientFactory: llmClientFactory,
 			Storage:          storageService,
 		}),
+		BaseContext:       baseContext(baseCtx),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -163,11 +174,29 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	case <-ctx.Done():
 		stop()
 		logger.Info("shutting down http server")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		// Cancel request contexts before Shutdown: SSE handlers block on
+		// r.Context().Done() and would otherwise keep Shutdown waiting until
+		// the grace period expires.
+		cancelBase()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
-			return fmt.Errorf("graceful shutdown: %w", err)
+			// The shutdown was requested intentionally, so a grace-period
+			// timeout is not a process failure: force-close the remaining
+			// connections and exit cleanly.
+			logger.Warn("graceful shutdown did not finish; forcing connection close", "error", err)
+			if closeErr := srv.Close(); closeErr != nil {
+				logger.Warn("force close after shutdown timeout failed", "error", closeErr)
+			}
 		}
 		return nil
 	}
+}
+
+// baseContext returns the http.Server.BaseContext callback that derives every
+// request context from ctx. Canceling ctx on SIGINT/SIGTERM makes handlers that
+// only observe their request context (the SSE streams) return, so Shutdown can
+// drain instead of waiting for client disconnects.
+func baseContext(ctx context.Context) func(net.Listener) context.Context {
+	return func(net.Listener) context.Context { return ctx }
 }

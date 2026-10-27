@@ -1,7 +1,7 @@
 import { Bot } from "lucide-react"
 
-import { EmptyState } from "@/features/shell/EmptyState"
-import { StatusBadge } from "@/features/shell/StatusBadge"
+import { EmptyState } from "@/components/ui/EmptyState"
+import { StatusBadge } from "@/components/ui/StatusBadge"
 
 export default function AgentsPage() {
   return (

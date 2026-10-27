@@ -3,10 +3,9 @@
 import { Monitor, Moon, Settings2, Sun } from "lucide-react"
 import { useTheme } from "next-themes"
 import { useEffect, useState } from "react"
-
+import { StatusBadge } from "@/components/ui/StatusBadge"
 import { useAuth } from "@/features/auth/AuthProvider"
 import { SettingsTabs } from "@/features/settings/SettingsTabs"
-import { StatusBadge } from "@/features/shell/StatusBadge"
 
 const THEME_OPTIONS = [
   { value: "light", label: "浅色", icon: Sun },

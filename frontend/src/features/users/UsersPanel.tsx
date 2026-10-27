@@ -2,10 +2,9 @@
 
 import { Ban, KeyRound, RefreshCw, UserPlus, Users } from "lucide-react"
 import { type FormEvent, useCallback, useEffect, useState } from "react"
-
+import { EmptyState } from "@/components/ui/EmptyState"
+import { StatusBadge } from "@/components/ui/StatusBadge"
 import { useAuth } from "@/features/auth/AuthProvider"
-import { EmptyState } from "@/features/shell/EmptyState"
-import { StatusBadge } from "@/features/shell/StatusBadge"
 import { ApiError, apiGet, apiPatch, apiPost } from "@/lib/api-client"
 import type { AuthUser } from "@/lib/auth-storage"
 
