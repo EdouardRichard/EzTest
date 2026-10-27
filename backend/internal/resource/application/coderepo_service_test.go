@@ -23,14 +23,22 @@ type codeRepoTestClock struct{ now time.Time }
 // Now returns the fixed instant.
 func (c codeRepoTestClock) Now() time.Time { return c.now }
 
+// indexedAtCall records one UpdateLastIndexedAt invocation.
+type indexedAtCall struct {
+	id int64
+	at time.Time
+}
+
 // fakeCodeRepoRepo is an in-memory domain.CodeRepoRepository.
 type fakeCodeRepoRepo struct {
-	codeRepos   map[int64]domain.CodeRepository
-	nextID      int64
-	createCalls int
-	updateCalls int
-	deleteCalls int
-	lastFilter  domain.CodeRepoFilter
+	codeRepos      map[int64]domain.CodeRepository
+	nextID         int64
+	createCalls    int
+	getCalls       int
+	updateCalls    int
+	deleteCalls    int
+	indexedAtCalls []indexedAtCall
+	lastFilter     domain.CodeRepoFilter
 }
 
 func newFakeCodeRepoRepo() *fakeCodeRepoRepo {
@@ -57,6 +65,7 @@ func (r *fakeCodeRepoRepo) CreateCodeRepo(_ context.Context, codeRepo *domain.Co
 }
 
 func (r *fakeCodeRepoRepo) GetCodeRepo(_ context.Context, id int64) (*domain.CodeRepository, error) {
+	r.getCalls++
 	codeRepo, ok := r.codeRepos[id]
 	if !ok {
 		return nil, domain.NewNotFound("code repository", id)
@@ -99,6 +108,25 @@ func (r *fakeCodeRepoRepo) UpdateCodeRepo(_ context.Context, codeRepo *domain.Co
 	}
 	r.updateCalls++
 	r.codeRepos[codeRepo.ID] = *codeRepo
+	return nil
+}
+
+// UpdateLastIndexedAt mimics the narrow repository write: only an active row is
+// updated, a disabled row keeps the 422 reason and a missing row is not found.
+// The call is recorded first so the tests can prove the service delegates.
+func (r *fakeCodeRepoRepo) UpdateLastIndexedAt(_ context.Context, id int64, at time.Time) error {
+	r.indexedAtCalls = append(r.indexedAtCalls, indexedAtCall{id: id, at: at})
+	codeRepo, ok := r.codeRepos[id]
+	if !ok {
+		return domain.NewNotFound("code repository", id)
+	}
+	if codeRepo.Status != domain.StatusActive {
+		return domain.NewInvalid("repoId", "code_repository_disabled",
+			fmt.Sprintf("code repository %d is disabled", id))
+	}
+	indexedAt := at
+	codeRepo.LastIndexedAt = &indexedAt
+	r.codeRepos[id] = codeRepo
 	return nil
 }
 
@@ -587,8 +615,9 @@ func TestCodeRepoServiceGetAndDelete(t *testing.T) {
 }
 
 // TestCodeRepoServiceMarkIndexed pins the P4 index-state write: the repository
-// must exist and be active, and a successful call rewrites only last_indexed_at
-// (never last_commit/status) without running a Git validation.
+// must exist and be active, and a successful call writes last_indexed_at through
+// the narrow port only. The service must not read or rewrite the whole P2 row
+// (ruling R44), so a concurrent admin edit can never be lost.
 func TestCodeRepoServiceMarkIndexed(t *testing.T) {
 	t.Run("records the index timestamp only", func(t *testing.T) {
 		service, repos, git := newCodeRepoServiceForTest()
@@ -609,6 +638,16 @@ func TestCodeRepoServiceMarkIndexed(t *testing.T) {
 			t.Fatalf("MarkIndexed: %v", err)
 		}
 
+		if len(repos.indexedAtCalls) != 1 || repos.indexedAtCalls[0].id != seeded.ID || !repos.indexedAtCalls[0].at.Equal(indexedAt) {
+			t.Fatalf("UpdateLastIndexedAt calls=%+v want one %d/%v", repos.indexedAtCalls, seeded.ID, indexedAt)
+		}
+		if repos.updateCalls != 0 {
+			t.Fatalf("updateCalls=%d want 0: MarkIndexed must not rewrite the whole row", repos.updateCalls)
+		}
+		if repos.getCalls != 0 {
+			t.Fatalf("getCalls=%d want 0: the narrow write needs no full-row read", repos.getCalls)
+		}
+
 		stored := repos.codeRepos[seeded.ID]
 		if stored.LastIndexedAt == nil || !stored.LastIndexedAt.Equal(indexedAt) {
 			t.Fatalf("lastIndexedAt=%v want %v", stored.LastIndexedAt, indexedAt)
@@ -622,9 +661,6 @@ func TestCodeRepoServiceMarkIndexed(t *testing.T) {
 		if stored.LastValidatedAt == nil || !stored.LastValidatedAt.Equal(old) {
 			t.Fatalf("lastValidatedAt=%v want %v", stored.LastValidatedAt, old)
 		}
-		if repos.updateCalls != 1 {
-			t.Fatalf("updateCalls=%d want 1", repos.updateCalls)
-		}
 		if git.calls != 0 {
 			t.Fatalf("git calls=%d want 0: indexing must not re-validate the checkout", git.calls)
 		}
@@ -635,8 +671,11 @@ func TestCodeRepoServiceMarkIndexed(t *testing.T) {
 
 		err := service.MarkIndexed(context.Background(), 404, codeRepoTestCommit, codeRepoTestNow)
 		assertCodeRepoDomainError(t, err, domain.KindNotFound, "", "not_found")
-		if repos.updateCalls != 0 {
-			t.Fatalf("updateCalls=%d want 0", repos.updateCalls)
+		if len(repos.indexedAtCalls) != 1 {
+			t.Fatalf("UpdateLastIndexedAt calls=%d want 1 (the port reports not found)", len(repos.indexedAtCalls))
+		}
+		if repos.updateCalls != 0 || repos.getCalls != 0 {
+			t.Fatalf("updateCalls=%d getCalls=%d want 0/0", repos.updateCalls, repos.getCalls)
 		}
 	})
 
@@ -653,8 +692,11 @@ func TestCodeRepoServiceMarkIndexed(t *testing.T) {
 
 		err := service.MarkIndexed(context.Background(), seeded.ID, codeRepoTestCommit, codeRepoTestNow)
 		assertCodeRepoDomainError(t, err, domain.KindInvalid, "repoId", "code_repository_disabled")
-		if repos.updateCalls != 0 {
-			t.Fatalf("updateCalls=%d want 0", repos.updateCalls)
+		if len(repos.indexedAtCalls) != 1 {
+			t.Fatalf("UpdateLastIndexedAt calls=%d want 1 (the port reports disabled)", len(repos.indexedAtCalls))
+		}
+		if repos.updateCalls != 0 || repos.getCalls != 0 {
+			t.Fatalf("updateCalls=%d getCalls=%d want 0/0", repos.updateCalls, repos.getCalls)
 		}
 		if stored := repos.codeRepos[seeded.ID]; stored.LastIndexedAt != nil {
 			t.Fatalf("lastIndexedAt=%v want nil", stored.LastIndexedAt)

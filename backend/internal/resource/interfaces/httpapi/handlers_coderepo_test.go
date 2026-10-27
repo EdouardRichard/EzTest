@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -106,6 +107,24 @@ func (r *codeRepoHTTPTestRepo) UpdateCodeRepo(_ context.Context, codeRepo *domai
 	r.updateCalls++
 	codeRepo.UpdatedAt = codeRepoHTTPTestNow
 	r.codeRepos[codeRepo.ID] = *codeRepo
+	return nil
+}
+
+// UpdateLastIndexedAt is the narrow P4 index-state port; the HTTP tests never
+// exercise it directly but the fake must satisfy domain.CodeRepoRepository.
+func (r *codeRepoHTTPTestRepo) UpdateLastIndexedAt(_ context.Context, id int64, at time.Time) error {
+	codeRepo, ok := r.codeRepos[id]
+	if !ok {
+		return domain.NewNotFound("code repository", id)
+	}
+	if codeRepo.Status != domain.StatusActive {
+		return domain.NewInvalid("repoId", "code_repository_disabled",
+			fmt.Sprintf("code repository %d is disabled", id))
+	}
+	indexedAt := at
+	codeRepo.LastIndexedAt = &indexedAt
+	codeRepo.UpdatedAt = codeRepoHTTPTestNow
+	r.codeRepos[id] = codeRepo
 	return nil
 }
 

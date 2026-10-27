@@ -294,3 +294,79 @@ func TestCodeRepositoryConflictsAndNotFound(t *testing.T) {
 
 	assertCatalogKind(t, repo.DeleteCodeRepo(ctx, 999999), domain.KindNotFound, "not_found")
 }
+
+// TestCodeRepositoryUpdateLastIndexedAt pins the narrow P4 index-state write
+// (ruling R44): only last_indexed_at changes, a concurrent admin edit is never
+// reverted, a disabled repository keeps the 422 code_repository_disabled reason
+// and an unknown id stays not found.
+func TestCodeRepositoryUpdateLastIndexedAt(t *testing.T) {
+	ctx := context.Background()
+	pool := testutil.OpenTestDB(t)
+	repo := postgres.NewCodeRepository(pool)
+
+	indexedAt := codeRepoTime(time.Now().Add(-time.Hour))
+	active := &domain.CodeRepository{
+		Key:             "indexed",
+		Name:            "Indexed",
+		LocalPath:       `C:\work\indexed`,
+		LastCommit:      "0123456789abcdef0123456789abcdef01234567",
+		LastValidatedAt: codeRepoTime(time.Now().Add(-2 * time.Hour)),
+	}
+	if err := repo.CreateCodeRepo(ctx, active); err != nil {
+		t.Fatal(err)
+	}
+
+	// A concurrent admin edit lands after the caller would have read the row;
+	// the narrow UPDATE must preserve it instead of restoring stale columns.
+	if _, err := pool.Exec(ctx,
+		`UPDATE code_repositories SET name = 'Renamed', local_path = 'D:\work\moved' WHERE id = $1`,
+		active.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.UpdateLastIndexedAt(ctx, active.ID, *indexedAt); err != nil {
+		t.Fatalf("UpdateLastIndexedAt: %v", err)
+	}
+	loaded, err := repo.GetCodeRepo(ctx, active.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.LastIndexedAt == nil || !loaded.LastIndexedAt.Equal(*indexedAt) {
+		t.Fatalf("last_indexed_at=%v want %v", loaded.LastIndexedAt, indexedAt)
+	}
+	if loaded.Name != "Renamed" || loaded.LocalPath != `D:\work\moved` {
+		t.Fatalf("concurrent edit lost: name=%q local_path=%q", loaded.Name, loaded.LocalPath)
+	}
+	if loaded.LastCommit != active.LastCommit {
+		t.Fatalf("last_commit=%q want %q", loaded.LastCommit, active.LastCommit)
+	}
+	if loaded.LastValidatedAt == nil || !loaded.LastValidatedAt.Equal(*active.LastValidatedAt) {
+		t.Fatalf("last_validated_at=%v want %v", loaded.LastValidatedAt, active.LastValidatedAt)
+	}
+	if loaded.Status != domain.StatusActive {
+		t.Fatalf("status=%q want active", loaded.Status)
+	}
+	if !loaded.UpdatedAt.Equal(active.UpdatedAt) {
+		t.Fatalf("updated_at=%v want %v: only last_indexed_at may change", loaded.UpdatedAt, active.UpdatedAt)
+	}
+
+	// A disabled repository keeps the documented reason and is never written.
+	disabled := &domain.CodeRepository{
+		Key: "indexed-disabled", Name: "Disabled", LocalPath: `C:\work\disabled`,
+		Status: domain.StatusDisabled,
+	}
+	if err := repo.CreateCodeRepo(ctx, disabled); err != nil {
+		t.Fatal(err)
+	}
+	assertCatalogKind(t, repo.UpdateLastIndexedAt(ctx, disabled.ID, time.Now()),
+		domain.KindInvalid, "code_repository_disabled")
+	loadedDisabled, err := repo.GetCodeRepo(ctx, disabled.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loadedDisabled.LastIndexedAt != nil {
+		t.Fatalf("disabled last_indexed_at=%v want nil", loadedDisabled.LastIndexedAt)
+	}
+
+	// An unknown id is the existing not-found reason.
+	assertCatalogKind(t, repo.UpdateLastIndexedAt(ctx, 999999, time.Now()), domain.KindNotFound, "not_found")
+}

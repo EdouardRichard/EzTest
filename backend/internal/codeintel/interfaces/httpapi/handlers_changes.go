@@ -181,10 +181,18 @@ func (h *Handler) Facts(w http.ResponseWriter, r *http.Request) {
 }
 
 // Search returns one page of entities whose path or name contains q: a
-// path/name substring search, never full text (design spec §7.2, D24). The
-// application service records the read audit.
+// path/name substring search, never full text (design spec §7.2, D24). q is
+// required: a missing, empty or whitespace-only q is a 400 invalid_request
+// instead of a query that matches every entity (ruling R42), and the trimmed q
+// is what reaches the application service. The application service records the
+// read audit for the authenticated actor (R32).
 func (h *Handler) Search(w http.ResponseWriter, r *http.Request) {
 	repoID, err := PathID(r, "repoId")
+	if err != nil {
+		WriteServiceError(w, r, err)
+		return
+	}
+	q, err := requiredQuery(r, "q")
 	if err != nil {
 		WriteServiceError(w, r, err)
 		return
@@ -200,8 +208,8 @@ func (h *Handler) Search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	query := r.URL.Query()
-	entities, nextCursor, hasMore, err := h.query.Search(r.Context(), repoID,
-		strings.TrimSpace(query.Get("commit")), query.Get("q"),
+	entities, nextCursor, hasMore, err := h.query.Search(r.Context(), ActorID(r.Context()), repoID,
+		strings.TrimSpace(query.Get("commit")), q,
 		strings.TrimSpace(query.Get("kind")), limit, cursor)
 	if err != nil {
 		WriteServiceError(w, r, err)

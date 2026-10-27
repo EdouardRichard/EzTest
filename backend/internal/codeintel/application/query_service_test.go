@@ -508,7 +508,7 @@ func TestQueryServiceFactsAndSearch(t *testing.T) {
 		t.Fatalf("Head calls = %d, want 1 (default commit only)", len(f.git.headCalls))
 	}
 
-	if _, _, _, err := f.svc.Search(context.Background(), 3, "", "refund", domain.KindAPI, 5, "page-2"); err != nil {
+	if _, _, _, err := f.svc.Search(context.Background(), 7, 3, "", "refund", domain.KindAPI, 5, "page-2"); err != nil {
 		t.Fatalf("Search error = %v", err)
 	}
 	search := f.entities.listFilters[len(f.entities.listFilters)-1]
@@ -519,15 +519,176 @@ func TestQueryServiceFactsAndSearch(t *testing.T) {
 	if len(f.audit.calls) != 1 {
 		t.Fatalf("audit calls = %d, want 1 code.read for search", len(f.audit.calls))
 	}
-	if entry := f.audit.calls[0]; entry.action != "code.read" || entry.subject != "code_repository:3" ||
+	if entry := f.audit.calls[0]; entry.actorID != 7 || entry.action != "code.read" || entry.subject != "code_repository:3" ||
 		entry.detail["repoId"] != int64(3) || entry.detail["commit"] != testCommitC {
-		t.Fatalf("search audit = %+v, want code.read with repoId/commit", entry)
+		t.Fatalf("search audit = %+v, want actor 7 code.read with repoId/commit", entry)
 	}
 
 	f.entities.listErr = errors.New("db down")
 	if _, _, _, err := f.svc.Facts(context.Background(), 3, domain.EntityFilter{Commit: testCommitB}); err == nil {
 		t.Fatal("Facts error = nil, want the repository error")
 	}
+}
+
+// TestQueryServiceFactsAndSearchValidateExplicitCommit pins the commit
+// validation of the persisted entity reads: an explicit commit must be a
+// lowercase 40-hex id (422 invalid_head) that resolves in the repository
+// (commit_not_found) before it can reach the SQL layer, while an omitted commit
+// still resolves the fixed branch tip live. The search read keeps recording the
+// authenticated actor (R32).
+func TestQueryServiceFactsAndSearchValidateExplicitCommit(t *testing.T) {
+	newEntityService := func(git GitReader, entities *stubEntities, audit *stubAudit) *QueryService {
+		return NewQueryService(QueryServiceDeps{
+			Git:        git,
+			Repos:      &stubRepos{infos: map[int64]RepoInfo{3: queryRepoInfo()}},
+			Entities:   entities,
+			ChangeSets: &queryChangeSets{},
+			Versions:   &stubVersions{},
+			Audit:      audit,
+			Config:     QueryConfig{MaxDiffBytes: 4096},
+		})
+	}
+	assertInvalid := func(t *testing.T, err error, reason string) {
+		t.Helper()
+		if !errors.Is(err, domain.ErrInvalid) {
+			t.Fatalf("error = %v, want ErrInvalid", err)
+		}
+		if got := domain.Reason(err); got != reason {
+			t.Fatalf("reason = %q, want %q", got, reason)
+		}
+	}
+
+	t.Run("facts rejects a non-40-hex commit before SQL and Git", func(t *testing.T) {
+		git := &queryCommitGit{stubGit: &stubGit{head: testCommitC}}
+		entities := &stubEntities{}
+		svc := newEntityService(git, entities, &stubAudit{})
+
+		_, _, _, err := svc.Facts(context.Background(), 3, domain.EntityFilter{Commit: "zzz"})
+		assertInvalid(t, err, "invalid_head")
+		if len(entities.listFilters) != 0 {
+			t.Fatalf("entity list calls = %+v, want none", entities.listFilters)
+		}
+		if len(git.commitCalls) != 0 || len(git.headCalls) != 0 {
+			t.Fatalf("Git calls commit=%d head=%d, want none before validation", len(git.commitCalls), len(git.headCalls))
+		}
+	})
+
+	t.Run("search rejects a non-40-hex commit before SQL and Git", func(t *testing.T) {
+		git := &queryCommitGit{stubGit: &stubGit{head: testCommitC}}
+		entities := &stubEntities{}
+		svc := newEntityService(git, entities, &stubAudit{})
+
+		_, _, _, err := svc.Search(context.Background(), 9, 3, "zzz", "refund", "", 10, "")
+		assertInvalid(t, err, "invalid_head")
+		if len(entities.listFilters) != 0 {
+			t.Fatalf("entity list calls = %+v, want none", entities.listFilters)
+		}
+		if len(git.commitCalls) != 0 || len(git.headCalls) != 0 {
+			t.Fatalf("Git calls commit=%d head=%d, want none before validation", len(git.commitCalls), len(git.headCalls))
+		}
+	})
+
+	t.Run("facts surfaces commit_not_found for an unknown commit", func(t *testing.T) {
+		git := &queryCommitGit{stubGit: &stubGit{
+			head:      testCommitC,
+			commitErr: domain.NewInvalid("commit", "commit_not_found", "codeintel: commit does not resolve in this repository"),
+		}}
+		entities := &stubEntities{}
+		svc := newEntityService(git, entities, &stubAudit{})
+
+		_, _, _, err := svc.Facts(context.Background(), 3, domain.EntityFilter{Commit: testCommitB})
+		assertInvalid(t, err, "commit_not_found")
+		if len(entities.listFilters) != 0 {
+			t.Fatalf("entity list calls = %+v, want none for an unknown commit", entities.listFilters)
+		}
+		if len(git.commitCalls) != 1 || git.commitCalls[0].sha != testCommitB {
+			t.Fatalf("Git commit calls = %+v, want one existence check for %s", git.commitCalls, testCommitB)
+		}
+	})
+
+	t.Run("search surfaces commit_not_found for an unknown commit", func(t *testing.T) {
+		git := &queryCommitGit{stubGit: &stubGit{
+			head:      testCommitC,
+			commitErr: domain.NewInvalid("commit", "commit_not_found", "codeintel: commit does not resolve in this repository"),
+		}}
+		entities := &stubEntities{}
+		svc := newEntityService(git, entities, &stubAudit{})
+
+		_, _, _, err := svc.Search(context.Background(), 9, 3, testCommitB, "refund", "", 10, "")
+		assertInvalid(t, err, "commit_not_found")
+		if len(entities.listFilters) != 0 {
+			t.Fatalf("entity list calls = %+v, want none for an unknown commit", entities.listFilters)
+		}
+		if len(git.commitCalls) != 1 || git.commitCalls[0].sha != testCommitB {
+			t.Fatalf("Git commit calls = %+v, want one existence check for %s", git.commitCalls, testCommitB)
+		}
+	})
+
+	t.Run("facts forwards a resolved explicit commit without re-reading HEAD", func(t *testing.T) {
+		git := &queryCommitGit{stubGit: &stubGit{head: testCommitC}}
+		entities := &stubEntities{listResult: []domain.CodeEntity{{ID: 11}}}
+		svc := newEntityService(git, entities, &stubAudit{})
+
+		got, _, _, err := svc.Facts(context.Background(), 3, domain.EntityFilter{Commit: testCommitB})
+		if err != nil {
+			t.Fatalf("Facts error = %v", err)
+		}
+		if len(got) != 1 || got[0].ID != 11 {
+			t.Fatalf("Facts entities = %+v, want the fake page", got)
+		}
+		if len(git.headCalls) != 0 {
+			t.Fatalf("Head calls = %+v, want none for an explicit commit", git.headCalls)
+		}
+		if len(git.commitCalls) != 1 || git.commitCalls[0].localPath != "/repo" || git.commitCalls[0].sha != testCommitB {
+			t.Fatalf("Git commit calls = %+v, want /repo %s", git.commitCalls, testCommitB)
+		}
+		if filter := entities.listFilters[0]; filter.Commit != testCommitB {
+			t.Fatalf("entity filter = %+v, want commit %s", filter, testCommitB)
+		}
+	})
+
+	t.Run("search audits the actor with the validated commit", func(t *testing.T) {
+		git := &queryCommitGit{stubGit: &stubGit{head: testCommitC}}
+		audit := &stubAudit{}
+		entities := &stubEntities{}
+		svc := newEntityService(git, entities, audit)
+
+		if _, _, _, err := svc.Search(context.Background(), 9, 3, testCommitB, "refund", "", 10, ""); err != nil {
+			t.Fatalf("Search error = %v", err)
+		}
+		if filter := entities.listFilters[0]; filter.Commit != testCommitB || filter.Query != "refund" {
+			t.Fatalf("entity filter = %+v, want commit %s query refund", filter, testCommitB)
+		}
+		if len(audit.calls) != 1 {
+			t.Fatalf("audit calls = %d, want 1", len(audit.calls))
+		}
+		entry := audit.calls[0]
+		if entry.actorID != 9 || entry.action != "code.read" || entry.detail["commit"] != testCommitB {
+			t.Fatalf("search audit = %+v, want actor 9 code.read for %s", entry, testCommitB)
+		}
+	})
+
+	t.Run("an omitted commit still resolves the fixed branch tip", func(t *testing.T) {
+		git := &queryCommitGit{stubGit: &stubGit{
+			head:      testCommitC,
+			commitErr: errors.New("commit must not be called for the default head"),
+		}}
+		entities := &stubEntities{}
+		svc := newEntityService(git, entities, &stubAudit{})
+
+		if _, _, _, err := svc.Facts(context.Background(), 3, domain.EntityFilter{}); err != nil {
+			t.Fatalf("Facts error = %v", err)
+		}
+		if len(git.headCalls) != 1 || git.headCalls[0].branch != "main" {
+			t.Fatalf("Head calls = %+v, want the fixed branch main", git.headCalls)
+		}
+		if len(git.commitCalls) != 0 {
+			t.Fatalf("Git commit calls = %+v, want none when the commit is omitted", git.commitCalls)
+		}
+		if filter := entities.listFilters[0]; filter.Commit != testCommitC {
+			t.Fatalf("entity filter = %+v, want the resolved head %s", filter, testCommitC)
+		}
+	})
 }
 
 // TestQueryServiceVersionChangesUsesBaseline pins the version-scoped change
@@ -593,6 +754,21 @@ func TestQueryServiceVersionChangesUsesBaseline(t *testing.T) {
 		t.Fatalf("missing baseline error = %v, want ErrInvalid", err)
 	} else if domain.Reason(err) != "baseline_commit_missing" {
 		t.Fatalf("reason = %q, want baseline_commit_missing", domain.Reason(err))
+	}
+
+	// A non-40-hex baseline is rejected with the same baseline_commit_missing
+	// reason as AnalysisService.Start instead of surfacing commit_not_found from
+	// the diff (or an empty preview). It must not reach Git.
+	headCallsBefore, diffCallsBefore := len(f.git.headCalls), len(f.git.diffCalls)
+	f.versions.info.BaselineCommit = "zzz"
+	if _, _, _, err := f.svc.VersionChanges(context.Background(), 9, ""); !errors.Is(err, domain.ErrInvalid) {
+		t.Fatalf("malformed baseline error = %v, want ErrInvalid", err)
+	} else if domain.Reason(err) != "baseline_commit_missing" {
+		t.Fatalf("reason = %q, want baseline_commit_missing", domain.Reason(err))
+	}
+	if len(f.git.headCalls) != headCallsBefore || len(f.git.diffCalls) != diffCallsBefore {
+		t.Fatalf("malformed baseline reached Git: head=%d->%d diff=%d->%d",
+			headCallsBefore, len(f.git.headCalls), diffCallsBefore, len(f.git.diffCalls))
 	}
 
 	f.versions.err = domain.NewNotFound("not_found", "version not found")

@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -185,6 +186,37 @@ func (r *CodeRepository) UpdateCodeRepo(ctx context.Context, c *domain.CodeRepos
 			"a code repository with this key already exists", "update code repository")
 	}
 	return nil
+}
+
+// UpdateLastIndexedAt records the last successful P4 index time of one active
+// repository. The single-column, status-guarded UPDATE cannot restore a stale
+// copy of the other P2 columns (INV-14/R44): the rows-affected count decides
+// whether the row was written, and a zero count is resolved to the documented
+// disabled/not-found reasons with one read of the status column.
+func (r *CodeRepository) UpdateLastIndexedAt(ctx context.Context, id int64, at time.Time) error {
+	const query = `UPDATE code_repositories
+		SET last_indexed_at = $2
+		WHERE id = $1 AND status = 'active'`
+	tag, err := r.pool.Exec(ctx, query, id, at)
+	if err != nil {
+		return catalogWriteError(err, "duplicate key", "update code repository index timestamp")
+	}
+	if tag.RowsAffected() > 0 {
+		return nil
+	}
+
+	// The guarded UPDATE matched nothing: a missing row and a disabled row must
+	// keep their existing P2/P4 reasons, so read only the status column.
+	var status string
+	if err := r.pool.QueryRow(ctx,
+		`SELECT status FROM code_repositories WHERE id = $1`, id).Scan(&status); err != nil {
+		return catalogReadError(err, "code repository", id, "update code repository index timestamp")
+	}
+	if status != domain.StatusActive {
+		return domain.NewInvalid("repoId", "code_repository_disabled",
+			fmt.Sprintf("code repository %d is disabled", id))
+	}
+	return domain.NewNotFound("code repository", id)
 }
 
 // DeleteCodeRepo removes a code repository. P2 registers no dependents, so the

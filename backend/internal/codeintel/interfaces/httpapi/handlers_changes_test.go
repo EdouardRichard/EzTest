@@ -601,17 +601,19 @@ func TestFactsDefaultsLimitAndRejectsMalformedCursor(t *testing.T) {
 	})
 }
 
-// TestSearchForwardsSubstringQuery proves the search endpoint forwards q/kind/
-// cursor as a path-or-name substring query and renders the ApiPage.
+// TestSearchForwardsSubstringQuery proves the search endpoint requires a
+// non-blank q, forwards the trimmed q/kind/cursor as a path-or-name substring
+// query, forwards the authenticated actor for the code.read audit (R32) and
+// renders the ApiPage.
 func TestSearchForwardsSubstringQuery(t *testing.T) {
 	cursor := platform.EncodeCursor(77)
-	query := &fakeQueryService{searchFn: func(context.Context, int64, string, string, string, int, string) ([]domain.CodeEntity, string, bool, error) {
+	query := &fakeQueryService{searchFn: func(context.Context, int64, int64, string, string, string, int, string) ([]domain.CodeEntity, string, bool, error) {
 		return []domain.CodeEntity{{ID: 5001, RepoID: 3, Commit: commitA, Kind: domain.KindRoute, Path: "src/router.ts", Name: "/orders"}}, "", false, nil
 	}}
 	handler := newTestHandler(t, HandlerDeps{Query: query})
 
 	recorder := serve(t, handler, http.MethodGet,
-		"/api/code/repos/3/search?commit="+commitA+"&q=refund%20api&kind=api&limit=10&cursor="+url.QueryEscape(cursor), userToken)
+		"/api/code/repos/3/search?commit="+commitA+"&q=%20refund%20api%20&kind=api&limit=10&cursor="+url.QueryEscape(cursor), userToken)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (body %s)", recorder.Code, recorder.Body.String())
 	}
@@ -623,9 +625,96 @@ func TestSearchForwardsSubstringQuery(t *testing.T) {
 	if body.HasMore || body.NextCursor != "" {
 		t.Fatalf("page = cursor %q hasMore %v, want empty/false", body.NextCursor, body.HasMore)
 	}
-	want := searchCall{RepoID: 3, Commit: commitA, Query: "refund api", Kind: "api", Limit: 10, Cursor: cursor}
+	want := searchCall{ActorID: testUserID, RepoID: 3, Commit: commitA, Query: "refund api", Kind: "api", Limit: 10, Cursor: cursor}
 	if got := query.searchCalls; len(got) != 1 || got[0] != want {
 		t.Fatalf("Search call = %+v, want %+v", got, want)
+	}
+}
+
+// TestSearchRequiresQ pins ruling R42: a missing, empty or whitespace-only q is
+// a 400 invalid_request naming the q field instead of the all-entities query the
+// former raw pass-through produced.
+func TestSearchRequiresQ(t *testing.T) {
+	targets := []string{
+		"/api/code/repos/3/search",
+		"/api/code/repos/3/search?q=",
+		"/api/code/repos/3/search?q=%20%20%20",
+	}
+	for _, target := range targets {
+		t.Run(target, func(t *testing.T) {
+			query := &fakeQueryService{}
+			handler := newTestHandler(t, HandlerDeps{Query: query})
+			recorder := serve(t, handler, http.MethodGet, target, userToken)
+			body := assertErrorResponse(t, recorder, http.StatusBadRequest,
+				platform.CodeInvalidArgument, "invalid_request")
+			if field, _ := body.Error.Details["field"].(string); field != "q" {
+				t.Fatalf("details.field = %v, want q (body %s)", body.Error.Details["field"], recorder.Body.String())
+			}
+			if body.Error.Message != "q is required" {
+				t.Fatalf("message = %q, want \"q is required\"", body.Error.Message)
+			}
+			if len(query.searchCalls) != 0 {
+				t.Fatalf("Search calls = %+v, want none for a blank q", query.searchCalls)
+			}
+		})
+	}
+}
+
+// TestFactsAndSearchCommitReasonMapping pins the facts/search commit validation
+// transport mapping: a malformed explicit commit is invalid_head and an unknown
+// one is commit_not_found, both 422 as design spec §7.1 requires.
+func TestFactsAndSearchCommitReasonMapping(t *testing.T) {
+	testCases := []struct {
+		name   string
+		target string
+		search bool
+		err    error
+		reason string
+	}{
+		{
+			name:   "facts malformed commit",
+			target: "/api/code/repos/3/facts?commit=zzz",
+			err:    domain.NewInvalid("commit", "invalid_head", "codeintel: commit must be a lowercase 40-hex commit id"),
+			reason: "invalid_head",
+		},
+		{
+			name:   "facts unknown commit",
+			target: "/api/code/repos/3/facts?commit=" + commitB,
+			err:    domain.NewInvalid("commit", "commit_not_found", "codeintel: commit does not resolve in this repository"),
+			reason: "commit_not_found",
+		},
+		{
+			name:   "search malformed commit",
+			target: "/api/code/repos/3/search?q=refund&commit=zzz",
+			search: true,
+			err:    domain.NewInvalid("commit", "invalid_head", "codeintel: commit must be a lowercase 40-hex commit id"),
+			reason: "invalid_head",
+		},
+		{
+			name:   "search unknown commit",
+			target: "/api/code/repos/3/search?q=refund&commit=" + commitB,
+			search: true,
+			err:    domain.NewInvalid("commit", "commit_not_found", "codeintel: commit does not resolve in this repository"),
+			reason: "commit_not_found",
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			query := &fakeQueryService{}
+			if testCase.search {
+				query.searchFn = func(context.Context, int64, int64, string, string, string, int, string) ([]domain.CodeEntity, string, bool, error) {
+					return nil, "", false, testCase.err
+				}
+			} else {
+				query.factsFn = func(context.Context, int64, domain.EntityFilter) ([]domain.CodeEntity, string, bool, error) {
+					return nil, "", false, testCase.err
+				}
+			}
+			handler := newTestHandler(t, HandlerDeps{Query: query})
+			recorder := serve(t, handler, http.MethodGet, testCase.target, userToken)
+			assertErrorResponse(t, recorder, http.StatusUnprocessableEntity,
+				platform.CodeInvalidArgument, testCase.reason)
+		})
 	}
 }
 

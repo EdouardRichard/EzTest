@@ -146,12 +146,13 @@ type factsCall struct {
 
 // searchCall records one QueryService.Search invocation.
 type searchCall struct {
-	RepoID int64
-	Commit string
-	Query  string
-	Kind   string
-	Limit  int
-	Cursor string
+	ActorID int64
+	RepoID  int64
+	Commit  string
+	Query   string
+	Kind    string
+	Limit   int
+	Cursor  string
 }
 
 // commitCall records one QueryService.Commit invocation.
@@ -175,7 +176,7 @@ type fakeQueryService struct {
 	diffFn     func(context.Context, int64, string, string, int, string) (domain.ChangeSetData, error)
 	fileDiffFn func(context.Context, int64, string, string, string) (domain.FileDiff, error)
 	factsFn    func(context.Context, int64, domain.EntityFilter) ([]domain.CodeEntity, string, bool, error)
-	searchFn   func(context.Context, int64, string, string, string, int, string) ([]domain.CodeEntity, string, bool, error)
+	searchFn   func(context.Context, int64, int64, string, string, string, int, string) ([]domain.CodeEntity, string, bool, error)
 	commitFn   func(context.Context, int64, string) (domain.CommitInfo, error)
 	// versionChangesFn backs the version-scoped change preview added to the
 	// QueryService consumer port by T15.
@@ -231,12 +232,12 @@ func (f *fakeQueryService) Facts(ctx context.Context, repoID int64, filter domai
 	return f.factsFn(ctx, repoID, filter)
 }
 
-func (f *fakeQueryService) Search(ctx context.Context, repoID int64, commit, q, kind string, limit int, cursor string) ([]domain.CodeEntity, string, bool, error) {
-	f.searchCalls = append(f.searchCalls, searchCall{RepoID: repoID, Commit: commit, Query: q, Kind: kind, Limit: limit, Cursor: cursor})
+func (f *fakeQueryService) Search(ctx context.Context, actorID, repoID int64, commit, q, kind string, limit int, cursor string) ([]domain.CodeEntity, string, bool, error) {
+	f.searchCalls = append(f.searchCalls, searchCall{ActorID: actorID, RepoID: repoID, Commit: commit, Query: q, Kind: kind, Limit: limit, Cursor: cursor})
 	if f.searchFn == nil {
 		return nil, "", false, nil
 	}
-	return f.searchFn(ctx, repoID, commit, q, kind, limit, cursor)
+	return f.searchFn(ctx, actorID, repoID, commit, q, kind, limit, cursor)
 }
 
 func (f *fakeQueryService) Commit(ctx context.Context, repoID int64, sha string) (domain.CommitInfo, error) {
