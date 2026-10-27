@@ -135,7 +135,7 @@ func newWiringFixture(t *testing.T, pool *pgxpool.Pool) *wiringFixture {
 	eventService := eventingapp.NewService(eventpostgres.NewEventStore(pool), eventinginfra.NewHub())
 	auditService := auditapp.NewService(auditpostgres.NewRepository(pool))
 
-	// One Snowflake node for the fixture (the integration seeds use node 3);
+	// One Snowflake node for the fixture (the integration seeds use node 13);
 	// the worker jobs and every analysis share this generator, as in main.go.
 	generator, err := id.NewSnowflake(13)
 	if err != nil {
@@ -171,8 +171,10 @@ func newWiringFixture(t *testing.T, pool *pgxpool.Pool) *wiringFixture {
 		Logger:      logger,
 	})
 
-	// No LLM configuration exists in the fixture: the nil completer is the
-	// documented degraded mode (analyses still produce deterministic results).
+	// No LLM configuration exists in the fixture, on purpose: the nil completer
+	// is the documented degraded mode (design spec §6.2) and must not abort
+	// startup. Reaching the assertions below proves the assembled context starts,
+	// mounts its routes and serves requests with that nil completer.
 	impact := codeintelapp.NewImpactService(codeintelapp.ImpactServiceDeps{
 		LLM:             nil,
 		Versions:        versionCatalog,
