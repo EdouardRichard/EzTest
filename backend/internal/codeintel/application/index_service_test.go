@@ -985,6 +985,44 @@ func TestIndexServiceRunSkipsTerminalRun(t *testing.T) {
 	}
 }
 
+// TestIndexServiceRunForgetsRegistryOnRunningConflict pins review finding 5:
+// the in-process run registry must not leak when a duplicate job observes a run
+// that is already running.
+func TestIndexServiceRunForgetsRegistryOnRunningConflict(t *testing.T) {
+	f := newIndexFixture(10)
+	run := f.queuedRun(t)
+	// Simulate the worker that owns the run having already moved it to running.
+	f.runs.mu.Lock()
+	running := f.runs.runs[run.ID]
+	running.Status = domain.RunRunning
+	f.runs.runs[run.ID] = running
+	f.runs.mu.Unlock()
+
+	err := f.svc.Run(context.Background(), run.ID)
+	if !errors.Is(err, domain.ErrConflict) || domain.Reason(err) != "index_in_progress" {
+		t.Fatalf("Run(running) error = %v, want the index_in_progress conflict", err)
+	}
+	if _, ok := f.svc.repoForRun(run.ID); ok {
+		t.Fatal("running conflict left the run registry entry behind")
+	}
+}
+
+// TestIndexServiceRunForgetsRegistryOnStartUpdateError pins review finding 5 for
+// the other non-terminal exit: a failed running-status update must not leak the
+// registry entry either.
+func TestIndexServiceRunForgetsRegistryOnStartUpdateError(t *testing.T) {
+	f := newIndexFixture(10)
+	run := f.queuedRun(t)
+	f.runs.updateErr = errors.New("db write failed")
+
+	if err := f.svc.Run(context.Background(), run.ID); err == nil {
+		t.Fatal("Run error = nil, want the running-status update failure")
+	}
+	if _, ok := f.svc.repoForRun(run.ID); ok {
+		t.Fatal("running-status update failure left the run registry entry behind")
+	}
+}
+
 // TestIndexServiceGetAndGetLatest pins the read pass-through used by the HTTP
 // handlers.
 func TestIndexServiceGetAndGetLatest(t *testing.T) {

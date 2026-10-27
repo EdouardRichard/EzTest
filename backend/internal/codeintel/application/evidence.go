@@ -28,6 +28,9 @@ func HashExcerpt(content []byte, startLine, endLine int) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if len(lines) == 0 {
+		return "", emptyContentEvidenceError()
+	}
 	if err := domain.ValidateEvidenceRange(startLine, endLine, len(lines), 0); err != nil {
 		return "", err
 	}
@@ -56,6 +59,9 @@ func ValidateEvidence(content []byte, ev domain.Evidence, maxLines int) (domain.
 	if err != nil {
 		return domain.Evidence{}, err
 	}
+	if len(lines) == 0 {
+		return domain.Evidence{}, emptyContentEvidenceError()
+	}
 	if err := domain.ValidateEvidenceRange(ev.StartLine, ev.EndLine, len(lines), maxLines); err != nil {
 		return domain.Evidence{}, err
 	}
@@ -66,14 +72,19 @@ func ValidateEvidence(content []byte, ev domain.Evidence, maxLines int) (domain.
 
 // commitContentLines splits raw commit content into lines following design spec
 // §6.3: split on "\n", strip each line's trailing "\r" and do not count the
-// implicit empty line produced by a trailing newline. Non-UTF-8 and binary
-// content is rejected because no reliable excerpt can be derived from it.
+// implicit empty line produced by a trailing newline. A zero-byte blob yields
+// zero lines (never one empty line), so no evidence range can validate against
+// it. Non-UTF-8 and binary content is rejected because no reliable excerpt can
+// be derived from it.
 func commitContentLines(content []byte) ([]string, error) {
 	if !utf8.Valid(content) {
 		return nil, unsupportedContentError("file content is not valid UTF-8")
 	}
 	if bytes.IndexByte(content, 0) >= 0 {
 		return nil, unsupportedContentError("file content is binary")
+	}
+	if len(content) == 0 {
+		return nil, nil
 	}
 
 	text := string(content)
@@ -99,4 +110,11 @@ func hashExcerptLines(lines []string, startLine, endLine int) string {
 // unsupported_content reason of design spec §7.1. It never embeds the bytes.
 func unsupportedContentError(detail string) error {
 	return domain.NewInvalid("file", "unsupported_content", "codeintel: "+detail)
+}
+
+// emptyContentEvidenceError reports evidence referencing a zero-byte file:
+// there is no line that could carry a verifiable excerpt (review finding 3).
+func emptyContentEvidenceError() error {
+	return domain.NewInvalid("evidence", "invalid_evidence",
+		"codeintel: empty file content has no evidence lines")
 }

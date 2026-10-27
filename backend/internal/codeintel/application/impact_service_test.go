@@ -456,6 +456,9 @@ func TestImpactRelationOneHop(t *testing.T) {
 	if related.Reason != wantReason {
 		t.Fatalf("relation reason = %q, want %q", related.Reason, wantReason)
 	}
+	if len(related.Evidence) != 1 || related.Evidence[0].File != impactClientPath {
+		t.Fatalf("relation evidence = %+v, want the triggering anchor's changed-file evidence", related.Evidence)
+	}
 	if !impactAbsentCandidate(result.Candidates, domain.CandidateRequirement, impactAIRequirementID) {
 		t.Fatalf("relation expanded twice: %+v", result.Candidates)
 	}
@@ -573,8 +576,10 @@ func TestImpactUnmappedReasons(t *testing.T) {
 	coveredFile := impactChangedFile("src/covered.ts")
 
 	availableFacts := []domain.CodeEntity{
-		impactEntity(21, domain.KindPage, "/orders", "src/covered.ts", domain.ConfidenceHigh, "page:/orders"),
-		impactEntity(22, domain.KindClientCall, "POST /api/refund", "src/client.ts", domain.ConfidenceHigh, "client:POST /api/refund"),
+		impactEntity(21, domain.KindPage, "/orders", "src/covered.ts", domain.ConfidenceHigh, "page:/orders",
+			domain.Evidence{File: "src/covered.ts", StartLine: 1, EndLine: 1}),
+		impactEntity(22, domain.KindClientCall, "POST /api/refund", "src/client.ts", domain.ConfidenceHigh, "client:POST /api/refund",
+			domain.Evidence{File: "src/client.ts", StartLine: 1, EndLine: 1}),
 	}
 
 	t.Run("available", func(t *testing.T) {
@@ -633,6 +638,56 @@ func TestImpactUnmappedReasons(t *testing.T) {
 		if !stats.AIUnavailable || stats.UnmatchedContracts != 0 {
 			t.Fatalf("stats = %+v, want aiUnavailable and no unmatched contract", stats)
 		}
+	})
+}
+
+// TestImpactLowConfidenceFactCoversChangedFile pins review finding 2 and INV-8:
+// the unmapped coverage view is built from the head-wide fact snapshot, so an
+// evidence-verified low-confidence fact still covers its changed file even
+// though INV-1 keeps it out of automatic candidate generation. A low clue with
+// no verified evidence covers nothing.
+func TestImpactLowConfidenceFactCoversChangedFile(t *testing.T) {
+	lowFact := func(evidence ...domain.Evidence) domain.CodeEntity {
+		return impactEntity(71, domain.KindModule, "refund", impactPlainPath,
+			domain.ConfidenceLow, "symbol:"+impactPlainPath+"#refund", evidence...)
+	}
+
+	t.Run("verified low fact covers", func(t *testing.T) {
+		f := newImpactFixture(t)
+		in := f.input([]domain.ChangedFile{impactChangedFile(impactPlainPath)},
+			[]domain.CodeEntity{lowFact(domain.Evidence{
+				File: impactPlainPath, StartLine: 1, EndLine: 1, ExcerptHash: "sha256:ee",
+			})})
+		in.Requirements = []RequirementInfo{{ID: impactRequirementID, Title: "退款"}}
+		in.Degraded = true
+
+		result, err := f.newService(nil).Plan(context.Background(), in)
+		if err != nil {
+			t.Fatalf("Plan error = %v", err)
+		}
+		for _, entry := range result.Unmapped {
+			if entry.Path == impactPlainPath {
+				t.Fatalf("low-confidence fact did not cover the changed file: %+v", entry)
+			}
+		}
+		if stats := impactDecodeStats(t, result.Stats); stats.Unmapped != 0 {
+			t.Fatalf("stats.unmapped = %d, want 0", stats.Unmapped)
+		}
+		if len(result.Candidates) != 0 {
+			t.Fatalf("low fact produced automatic candidates (INV-1): %+v", result.Candidates)
+		}
+	})
+
+	t.Run("low fact without evidence does not cover", func(t *testing.T) {
+		f := newImpactFixture(t)
+		in := f.input([]domain.ChangedFile{impactChangedFile(impactPlainPath)},
+			[]domain.CodeEntity{lowFact()})
+
+		result, err := f.newService(nil).Plan(context.Background(), in)
+		if err != nil {
+			t.Fatalf("Plan error = %v", err)
+		}
+		impactUnmappedFor(t, result.Unmapped, impactPlainPath, domain.UnmappedNoFact)
 	})
 }
 

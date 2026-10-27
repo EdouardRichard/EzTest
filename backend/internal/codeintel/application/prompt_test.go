@@ -1,7 +1,9 @@
 package application
 
 import (
+	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -94,6 +96,66 @@ func TestBuildFilePromptCapsAt2000Lines(t *testing.T) {
 	}
 	if !strings.Contains(user, "截断") {
 		t.Fatalf("user prompt is missing the truncation marker")
+	}
+}
+
+// TestBuildFilePromptEmptyFileHasZeroLines pins the empty-file prompt contract
+// (review finding 3): zero-byte content has zero lines, not one empty line, so
+// the model is told 文件总行数：0 and no numbered line is rendered.
+func TestBuildFilePromptEmptyFileHasZeroLines(t *testing.T) {
+	_, user := BuildFilePrompt("web", "abc", "src/empty.ts", []byte{})
+
+	if !strings.Contains(user, "文件总行数：0") {
+		t.Fatalf("user prompt does not report zero total lines:\n%s", user)
+	}
+	if strings.Contains(user, "文件总行数：1") {
+		t.Fatalf("user prompt counted the empty blob as one line:\n%s", user)
+	}
+	if strings.Contains(user, "1 |") {
+		t.Fatalf("user prompt rendered a numbered line for empty content:\n%s", user)
+	}
+}
+
+// TestBuildFilePromptQuotesSchemaPaths pins review finding 4: the
+// repository-relative path is interpolated into JSON string literals, so quotes
+// and backslashes must be escaped and the schema must stay valid JSON.
+func TestBuildFilePromptQuotesSchemaPaths(t *testing.T) {
+	path := `src/odd"name\sub.ts`
+	_, user := BuildFilePrompt("web", "abc", path, []byte("export const x = 1"))
+
+	quoted := strconv.Quote(path)
+	if count := strings.Count(user, quoted); count != 3 {
+		t.Fatalf("escaped path appears %d times, want 3 (fact path and two evidence files):\n%s", count, user)
+	}
+
+	const schemaMarker = "输出 JSON schema：\n"
+	index := strings.Index(user, schemaMarker)
+	if index < 0 {
+		t.Fatalf("user prompt is missing the schema marker:\n%s", user)
+	}
+	var schema struct {
+		Facts []struct {
+			Path     string `json:"path"`
+			Evidence []struct {
+				File string `json:"file"`
+			} `json:"evidence"`
+		} `json:"facts"`
+		Edges []struct {
+			Evidence []struct {
+				File string `json:"file"`
+			} `json:"evidence"`
+		} `json:"edges"`
+	}
+	if err := json.Unmarshal([]byte(user[index+len(schemaMarker):]), &schema); err != nil {
+		t.Fatalf("file schema is not valid JSON: %v\n%s", err, user[index:])
+	}
+	if len(schema.Facts) != 1 || schema.Facts[0].Path != path ||
+		len(schema.Facts[0].Evidence) != 1 || schema.Facts[0].Evidence[0].File != path {
+		t.Fatalf("fact schema path = %+v, want %q", schema.Facts, path)
+	}
+	if len(schema.Edges) != 1 || len(schema.Edges[0].Evidence) != 1 ||
+		schema.Edges[0].Evidence[0].File != path {
+		t.Fatalf("edge schema evidence = %+v, want file %q", schema.Edges, path)
 	}
 }
 

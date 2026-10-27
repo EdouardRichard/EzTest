@@ -158,3 +158,22 @@ func TestValidateEvidenceDefaultsSpanLimit(t *testing.T) {
 		t.Fatal("ValidateEvidence(span over hard limit) error = nil, want error")
 	}
 }
+
+// TestValidateEvidenceRejectsEmptyFile pins the zero-byte rule (review finding
+// 3): empty content has zero lines, so no evidence range can be verified
+// against it and a fabricated 1..1 fact must not validate.
+func TestValidateEvidenceRejectsEmptyFile(t *testing.T) {
+	ev := domain.Evidence{File: "src/empty.ts", StartLine: 1, EndLine: 1}
+	for _, content := range [][]byte{nil, {}} {
+		if _, err := HashExcerpt(content, 1, 1); err == nil {
+			t.Fatalf("HashExcerpt(empty content) error = nil, want rejection")
+		} else if !errors.Is(err, domain.ErrInvalid) {
+			t.Fatalf("HashExcerpt(empty content) error = %v, want ErrInvalid", err)
+		}
+		if _, err := ValidateEvidence(content, ev, 10); err == nil {
+			t.Fatalf("ValidateEvidence(empty content) error = nil, want rejection")
+		} else if !errors.Is(err, domain.ErrInvalid) {
+			t.Fatalf("ValidateEvidence(empty content) error = %v, want ErrInvalid", err)
+		}
+	}
+}

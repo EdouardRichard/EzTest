@@ -2,6 +2,7 @@ package application
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
@@ -51,25 +52,26 @@ const impactAnalysisSystem = `你是 EzTest 的只读变更影响分析器。输
 5. 只输出一个 JSON 对象，符合 schema；不要 Markdown 或解释。`
 
 // fileAnalysisSchema is the verbatim user-message schema of design spec §8.3.
-// The three %s verbs receive the repository-relative file path.
+// The three %s verbs receive the JSON-quoted repository-relative file path, so
+// a path containing a quote or backslash cannot corrupt the schema.
 const fileAnalysisSchema = `{
   "changeSummary": "string",
   "facts": [{
     "kind": "route|page|api|client_call|component|module|symbol",
     "name": "string",
-    "path": "%s",
+    "path": %s,
     "startLine": 1, "endLine": 1,
     "signature": "string",
     "confidence": "high|medium|low",
     "summary": "string",
-    "evidence": [{"file": "%s", "startLine": 1, "endLine": 1}]
+    "evidence": [{"file": %s, "startLine": 1, "endLine": 1}]
   }],
   "edges": [{
     "from": {"kind": "component", "name": "string"},
     "to": {"kind": "route", "name": "string"},
     "rel": "contains|imports|defines|calls|renders|route_to_api",
     "confidence": "high|medium|low",
-    "evidence": [{"file": "%s", "startLine": 1, "endLine": 1}]
+    "evidence": [{"file": %s, "startLine": 1, "endLine": 1}]
   }]
 }`
 
@@ -125,7 +127,8 @@ func BuildFilePrompt(repoKey, commit, path string, content []byte) (system, user
 	}
 	b.WriteString("</file-content>\n\n")
 	b.WriteString("输出 JSON schema：\n")
-	b.WriteString(fmt.Sprintf(fileAnalysisSchema, path, path, path))
+	quotedPath := strconv.Quote(path)
+	b.WriteString(fmt.Sprintf(fileAnalysisSchema, quotedPath, quotedPath, quotedPath))
 
 	return fileAnalysisSystem, b.String()
 }
@@ -189,8 +192,12 @@ func BuildImpactPrompt(in ImpactPromptInput) (system, user string) {
 
 // splitPromptLines normalises file content for prompt rendering: split on "\n",
 // strip a trailing "\r" from every line (CRLF -> LF) and drop the implicit
-// empty line produced by a trailing newline.
+// empty line produced by a trailing newline. Zero-byte content has zero lines
+// (not one empty line), so the prompt reports 文件总行数：0.
 func splitPromptLines(content []byte) []string {
+	if len(content) == 0 {
+		return nil
+	}
 	text := string(content)
 	lines := strings.Split(text, "\n")
 	if len(lines) > 0 && lines[len(lines)-1] == "" && strings.HasSuffix(text, "\n") {
