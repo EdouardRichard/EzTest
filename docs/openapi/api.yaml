@@ -54,8 +54,10 @@ info:
       administrator-only index trigger) and `/api/versions/{versionId}/code`
       (version changes, analyses, candidates and anchors). Codeintel-owned IDs
       (`analysisId`, `indexRunId`, `changeSetId`, `entityId`, `anchorId`,
-      `candidateId`, `factVersion`) and subject IDs are decimal strings while
-      `repoId`/`createdBy` stay numbers. Code endpoints never return code bodies
+      `candidateId`) and subject IDs are decimal strings while
+      `repoId`/`createdBy` stay numbers. Fact version snapshots are
+      `{factKey, version}` pairs whose `version` is an integer counter, not an
+      ID. Code endpoints never return code bodies
       except the bounded `/file` line window and `/diff/file` patch the caller
       explicitly requested, and errors never echo repository paths or code
       content. P4 adds the `code.changed` and `code.impact_computed` event types
@@ -2657,8 +2659,11 @@ paths:
       description: |
         Administrator only. Resolves the repository's fixed-branch tip and
         enqueues one T0 index run (202). A repository that already has a
-        queued/running index returns 409 `index_in_progress`. Git/read failures
-        are 503 `git_unavailable` (retryable).
+        queued/running index returns 409 `index_in_progress`. A path that
+        exists but is not a Git work tree is 422 `path_not_git_repo`; a
+        missing/unreadable path or a Git command that times out is 503
+        `git_unavailable` (retryable). A full worker queue is 429
+        `analysis_queue_full` (retryable).
       operationId: startCodeRepoIndex
       security:
         - bearerAuth: []
@@ -2686,6 +2691,8 @@ paths:
           $ref: '#/components/responses/CodeConflict'
         '422':
           $ref: '#/components/responses/CodeInvalid'
+        '429':
+          $ref: '#/components/responses/CodeQueueFull'
         '503':
           $ref: '#/components/responses/CodeGitUnavailable'
         '500':
@@ -2715,6 +2722,8 @@ paths:
           $ref: '#/components/responses/Unauthenticated'
         '404':
           $ref: '#/components/responses/CodeNotFound'
+        '422':
+          $ref: '#/components/responses/CodeInvalid'
         '500':
           $ref: '#/components/responses/Internal'
   /api/code/repos/{repoId}/index-runs/{runId}:
@@ -3112,8 +3121,10 @@ paths:
             type: string
         - name: q
           in: query
-          required: true
-          description: Path/name substring query.
+          required: false
+          description: |
+            Path/name substring query. Omitted/empty returns the commit's facts
+            without a text filter (the handler does not require `q`).
           schema:
             type: string
             minLength: 1
@@ -4546,6 +4557,8 @@ paths:
                   status: done
                   analysisVersion: 1
                   reused: true
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
         '401':
           $ref: '#/components/responses/Unauthenticated'
         '404':
@@ -4585,6 +4598,8 @@ paths:
           $ref: '#/components/responses/Unauthenticated'
         '404':
           $ref: '#/components/responses/CodeNotFound'
+        '422':
+          $ref: '#/components/responses/CodeInvalid'
         '500':
           $ref: '#/components/responses/Internal'
   /api/versions/{versionId}/code/analyses/{analysisId}:
@@ -4701,6 +4716,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CandidateEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
         '401':
           $ref: '#/components/responses/Unauthenticated'
         '404':
@@ -4789,6 +4806,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AnchorEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
         '401':
           $ref: '#/components/responses/Unauthenticated'
         '404':
@@ -5441,7 +5460,8 @@ components:
         `details.reason` is one of `code_repository_not_bound`,
         `code_repository_not_found`, `code_repository_disabled`,
         `baseline_commit_missing`, `invalid_head`, `commit_not_found`,
-        `path_not_found`, `path_not_file`, `path_escape`, `not_changed`,
+        `path_not_found`, `path_not_file`, `path_escape`,
+        `path_not_git_repo`, `not_changed`,
         `unsupported_content`, `unsupported_subject_kind`,
         `subject_not_in_version`, `app_model_not_found`, `invalid_id`, plus the
         transport-level `invalid_request`, `invalid_limit`, `invalid_cursor`,
@@ -5476,7 +5496,8 @@ components:
             $ref: '#/components/schemas/ErrorEnvelope'
     CodeQueueFull:
       description: |
-        The bounded analysis worker queue is full (`rate_limited`, HTTP 429).
+        The bounded codeintel worker queue (T0 index or impact analysis) is
+        full (`rate_limited`, HTTP 429).
         `details.reason=analysis_queue_full` and `retryable` is true.
       content:
         application/json:
@@ -7398,6 +7419,7 @@ components:
         - path_not_found
         - path_not_file
         - path_escape
+        - path_not_git_repo
         - not_changed
         - unsupported_content
         - index_in_progress
@@ -7464,7 +7486,9 @@ components:
           type: string
           enum: [queued, running, done, failed]
         stats:
+          type: object
           nullable: true
+          description: Null until the run produced a stats document.
           allOf:
             - $ref: '#/components/schemas/IndexRunStats'
         errors:
@@ -7549,6 +7573,7 @@ components:
           format: date-time
           nullable: true
         index:
+          type: object
           nullable: true
           allOf:
             - $ref: '#/components/schemas/IndexRun'

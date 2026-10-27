@@ -43,7 +43,7 @@ P1 在 P0 的事件流、LLM 网关与权限模型之上增加一个可用的 Ag
 
 P2 增加 `resource` 限界上下文与公共资源页面；`/api/resources/*` 的所有 GET 对任意已登录用户开放，所有写操作与动作仅管理员可用（普通用户只读，写 API 返回 403）。
 
-- 页面：`/resources` 四个 Tab —— 系统与环境、应用模型、账号与访问、会话；支持 `?tab=systems&system=<id>`、`?tab=sessions&session=<id>` 深链。`/code-repos` 管理本地代码仓（创建/编辑/删除/重新校验），显示 `localPath`、`fixedBranch` 与 `lastCommit`；代码索引是 P4 占位。
+- 页面：`/resources` 四个 Tab —— 系统与环境、应用模型、账号与访问、会话；支持 `?tab=systems&system=<id>`、`?tab=sessions&session=<id>` 深链。`/code-repos` 管理本地代码仓（创建/编辑/删除/重新校验），显示 `localPath`、`fixedBranch` 与 `lastCommit`；代码索引与影响分析由 P4 `codeintel` 提供（见下文）。
 - Session：从 Access 导入 Playwright `storageState` 或 token `headers`；状态为 `pending`/`acquiring`/`needs_manual`/`valid`/`refreshing`/`expired`/`invalid`/`revoked`/`failed`（`expiring` 为派生标记）。动作为导入 → validate/confirm（login_check 不可用时人工确认，快照标记 degraded）→ invalidate/revoke，以及人工接管（发起/完成/取消）。API 只暴露摘要（`storageStateHash`、cookie/origin 计数），不返回凭据或 `storageState` 原文。
 - 凭据与状态（D28）：Access 的 `credential` 与 Session 的 `storageState` **明文存储**，P2 不实现加密、脱敏与审计日志；API 永不回显原文，只返回 `credentialSet` 与 storageState 的 hash/形状统计。P2 不新增 EzTest 环境变量（fixture 的 `FIXTURE_PORT` 仅测试脚本使用）。
 - fixture：`node scripts/fixture-target.cjs`（默认 `127.0.0.1:13335`，可用 `FIXTURE_PORT` 覆盖）提供 `/login`（`fixture` / `fixture-pass`）、`/account`、`/api/profile`（`Authorization: Bearer fixture-token`）与 `/health`，用于导入真实 storageState / token 的验收；`scripts/e2e.ps1` 会自动启动并停止它。
@@ -105,11 +105,11 @@ P4 增加 `codeintel` 限界上下文（9 张表、雪花 ID、`repo_id`/`versio
 
 - 仓库级 API（前缀 `/api/code/repos`）：`GET /api/code/repos`（仓库 + 最新索引状态）、`POST /api/code/repos/{repoId}/index`（管理员）、`GET .../index-runs/latest`、`GET .../index-runs/{runId}`、`GET .../tree`、`GET .../file`（审计读取）、`GET .../diff`、`GET .../diff/file`、`GET .../facts`、`GET .../search`、`GET .../commits/{sha}`。P4 的读接口对全部登录用户开放，仅索引触发要求管理员。
 - 版本级 API（前缀 `/api/versions/{id}/code`）：`GET /changes`（只读预览，`changeSetId` 可为 null）、`POST /analyses`（202 新建 / 200 复用；未带 `force` 复用，`force=true` 产生 `analysisVersion+1`）、`GET /analyses/latest`、`GET /analyses/{analysisId}`、`PATCH .../candidates/{candidateId}`（`{selected}`）、`GET/POST /anchors`、`DELETE /anchors/{anchorId}`。P4 不新增 SSE 端点，`code.changed` 与 `code.impact_computed` 事件复用 `channel=version:{id}`。
-- ID 规则：codeintel 自有 ID（analysis/indexRun/changeSet/entity/anchor/candidate/fact 版本）与 `subjectId` 为十进制字符串，`repoId`/`createdBy`/`selectionUpdatedBy` 保持 number；前端不得对前者调用 `Number()`。
+- ID 规则：codeintel 自有 ID（analysisId/indexRunId/changeSetId/entityId/anchorId/candidateId）与 `subjectId` 为十进制字符串，`repoId`/`createdBy`/`selectionUpdatedBy` 保持 number；`factVersions[]` 是 `{factKey, version}` 快照，其中 `version` 是整数版本计数器，不是 ID；前端不得对字符串 ID 调用 `Number()`。
 - 影响分析：T0 change set + 文件级 AI 缓存（命中不调 LLM）+ 事实版本化；候选来源 direct/contract/relation/ai，带 reason/confidence/evidence，low 默认不勾选，可人工 PATCH；未被事实/锚点覆盖的变更进入 `unmapped`。AI 不可用或部分失败时 `status=done, degraded=true`，保留 T0/直接锚点候选，不阻塞主流程。
-- 代码仓只读挂载：P4 只读取 Git 对象与工作树，不写 checkout、不执行仓库代码。本地 `scripts/dev-api.ps1` 直接使用主机路径；部署时把代码仓目录以 **read-only** 方式挂载进 API 容器（例如 `-v D:\repos\app:/repos/app:ro`），P2 的 `localPath` 填容器内可见路径（`/repos/app`），并确保运行 API 的用户可读。仓库路径必须是 Git 工作树；不存在/不可读/非 Git 会在索引或读取时返回 `git_unavailable`（503, retryable）。
+- 代码仓只读挂载：P4 只读取 Git 对象与工作树，不写 checkout、不执行仓库代码。本地 `scripts/dev-api.ps1` 直接使用主机路径；部署时把代码仓目录以 **read-only** 方式挂载进 API 容器（例如 `-v D:\repos\app:/repos/app:ro`），P2 的 `localPath` 填容器内可见路径（`/repos/app`），并确保运行 API 的用户可读。仓库路径必须是 Git 工作树：非 Git 工作树返回 422 `path_not_git_repo`；路径不存在/不可读、Git 命令超时等运行期故障返回 503 `git_unavailable`（retryable）。
 - 新增 8 个环境变量：`EZTEST_CODEINTEL_MAX_CHANGED_FILES`（默认 20）、`EZTEST_CODEINTEL_MAX_FILE_BYTES`（65536）、`EZTEST_CODEINTEL_MAX_INDEX_FILES`（5000）、`EZTEST_CODEINTEL_ANALYSIS_TIMEOUT_MS`（180000）、`EZTEST_CODEINTEL_MAX_CONCURRENT_ANALYSES`（1）、`EZTEST_CODEINTEL_PROMPT_VERSION`（`p4.1`）、`EZTEST_CODEINTEL_MAX_EXCERPT_LINES`（40）、`EZTEST_CODEINTEL_MAX_DIFF_BYTES`（262144），详见下表。
-- 数据库：`order.txt` 末尾追加 `codeintel_0001_code_facts.sql` 与 `codeintel_0002_code_impact.sql`（共 16 条迁移），启动时自动迁移；验收脚本从 `order.txt` 动态推导迁移条数与 P4 表清单，不硬编码 16。
+- 数据库：`order.txt` 末尾追加 `codeintel_0001_code_facts.sql` 与 `codeintel_0002_code_impact.sql`，启动时自动迁移；迁移条数与 P4 表清单由验收脚本从 `order.txt` 及迁移 SQL 动态推导，不硬编码。
 
 P4 验收命令：
 
@@ -136,7 +136,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1 -
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1
 ```
 
-P4 的真实 LLM 验收是 gated：未设置 `EZTEST_RUN_REAL_LLM=1` 时 `scripts/acceptance-codeintel-llm.ps1` 打印 `SKIPPED` 并退出 0。设置后脚本会克隆 EzTest 自身到 `.tmp/p4-real-repo`（或用 `EZTEST_ACCEPTANCE_P4_REPO` 指向的现有 Git 检查点；可写时创建 `p4-acceptance` 分支，只读时复用已有分支绑定版本）并选择一个真实 `base..head`（≤20 个变更文件），创建绑定版本、2 条需求（其中标题含 `P4-AI-IMPACT`）和 1 个需求锚点，触发真实影响分析并校验：变更列表与 `git diff --name-status` 一致、AI 证据哈希按 commit 内容复算、候选命中需求、unmapped 结构、二次 POST `reused=true`、`force` 产生 `analysisVersion+1` 且旧分析不变；结果写入 `.tmp/p4-real-acceptance.json`。可用 `EZTEST_ACCEPTANCE_P4_BASE`/`EZTEST_ACCEPTANCE_P4_HEAD` 指定真实 commit 对，用 `EZTEST_ACCEPTANCE_API_URL` 复用已运行的 API，或用 `-DryRun` 只检查 `.env` 键名与工具链（不克隆、不启动 API、不调用 LLM）；脚本日志不含代码正文、提示词或密钥。
+P4 的真实 LLM 验收是 gated：未设置 `EZTEST_RUN_REAL_LLM=1` 时 `scripts/acceptance-codeintel-llm.ps1` 打印 `SKIPPED` 并退出 0。设置后脚本会克隆 EzTest 自身到 `.tmp/p4-real-repo`（或用 `EZTEST_ACCEPTANCE_P4_REPO` 指向的现有 Git 检查点；可写时创建 `p4-acceptance` 分支，只读时复用已有分支绑定版本）并选择一个真实 `base..head`（≤20 个变更文件），创建绑定版本、2 条需求（其中标题含 `P4-AI-IMPACT`），并在可用变更文件上尝试创建 1 个需求锚点（没有可锚定文件时记录 warning/skipped，不声称已建锚点），触发真实影响分析并校验：变更列表与 `git diff --name-status` 一致、AI 证据哈希按 commit 内容复算、候选带非空 reason/合法 confidence（high/medium 至少一条 path 证据）且命中需求、unmapped 至少 1 条（默认强制；确需接受全映射 commit 对时显式传 `-AllowNoUnmapped`，输出与结果 JSON 会记录该放宽）、二次 POST `reused=true` 且规范化候选 JSON 完全一致、同仓库/base 的第二个版本分析同一 head 时 `stats.cacheHits>0`、`force` 产生 `analysisVersion+1` 且旧分析不变；结果写入 `.tmp/p4-real-acceptance.json`。可用 `EZTEST_ACCEPTANCE_P4_BASE`/`EZTEST_ACCEPTANCE_P4_HEAD` 指定真实 commit 对，用 `EZTEST_ACCEPTANCE_API_URL` 复用已运行的 API，或用 `-DryRun` 只检查 `.env` 键名与工具链（不克隆、不启动 API、不调用 LLM）；脚本日志不含代码正文、提示词或密钥。P4 的 Playwright E2E 覆盖由 Task 20 补充落地；当前 `scripts/e2e.ps1` 门禁仍只覆盖 P0–P3，不声称 P4 E2E 已运行。
 
 ## 技术架构
 
@@ -409,7 +409,7 @@ node scripts/validate-compose.mjs
 - 本机没有 Docker，`scripts/acceptance.ps1` 会把“Compose 容器运行”标为 **SKIPPED**；Compose 仅通过 `validate-compose.mjs` 做静态字段校验，不代表已运行验证。P1 真实 Agent LLM、P3 真实 LLM 人工验收与 P4 真实 LLM 验收同样标为 **SKIPPED**（见下节）。
 - 常规测试不访问真实 LLM：Go 测试使用 `httptest` mock（`/v1/chat/completions`、`/v1/responses`、`/v1/models`，可注入 429/5xx/超时/分片）；`scripts/e2e.ps1` 使用 `scripts/fake-llm.cjs`（127.0.0.1:13334）并覆盖 `llm_*`，E2E 零 LLM 费用；P4 的 `scripts/fake-llm.p4.test.cjs` 同样只启动本地 fake 上游。
 - `acceptance.ps1 -StaticOnly` 可在没有 `.env`/数据库/Playwright 的主机上运行：它校验 README/OpenAPI/env/Compose 契约、从 `order.txt` 动态推导 P4 迁移与表清单、解析 OpenAPI YAML，并执行 P4 fake-LLM 测试。
-- `acceptance.ps1` 额外校验 `docs/openapi/api.yaml` 含 P1 的 `/api/agents/sessions`、`agent.activity`、`reasoning_tokens`，P2 的 `/api/resources/systems`、`/api/resources/sessions`、`/api/resources/code-repos`、`storageState`、`credentialSet`，P3 的 `/api/versions`、`clarification`、`enter-design`、`snowflake`、`version-attachments` 关键词、全部 P3 错误 reason（含字段级 `invalid_context_summary`）、全部版本事件类型（含 `clarification.context_updated`），以及 P4 的 `/api/code/repos/{repoId}/index`、`/api/versions/{versionId}/code/analyses`、全部 P4 path/schema、`CodeErrorReason`（含 `analysis_in_progress`、`anchor_duplicate`、`analysis_queue_full`、`git_unavailable`）与 `code.changed`/`code.impact_computed` 事件；同时校验 `.env.example` 的 Agent/P3/P4 变量与 Compose 的附件目录；P1/P3/P4 DoD 与检查项/证据的映射会打印在汇总后（P3/P4 Playwright E2E 已纳入 `scripts/e2e.ps1`）。
+- `acceptance.ps1` 额外校验 `docs/openapi/api.yaml` 含 P1 的 `/api/agents/sessions`、`agent.activity`、`reasoning_tokens`，P2 的 `/api/resources/systems`、`/api/resources/sessions`、`/api/resources/code-repos`、`storageState`、`credentialSet`，P3 的 `/api/versions`、`clarification`、`enter-design`、`snowflake`、`version-attachments` 关键词、全部 P3 错误 reason（含字段级 `invalid_context_summary`）、全部版本事件类型（含 `clarification.context_updated`），以及 P4 的 `/api/code/repos/{repoId}/index`、`/api/versions/{versionId}/code/analyses`、全部 P4 path/schema、`CodeErrorReason`（含 `analysis_in_progress`、`anchor_duplicate`、`analysis_queue_full`、`git_unavailable`、`path_not_git_repo`）与 `code.changed`/`code.impact_computed` 事件；同时校验 `.env.example` 的 Agent/P3/P4 变量与 Compose 的附件目录；P1/P3/P4 DoD 与检查项/证据的映射会打印在汇总后。P4 Playwright E2E 由 Task 20 交付，当前门禁不包含 P4 E2E。
 - 通过条件：所有非 SKIPPED 检查 FAIL 数为 0，脚本退出码为 0。
 
 ## 真实 LLM（gated）
@@ -420,7 +420,7 @@ node scripts/validate-compose.mjs
 2. 显式设置 `EZTEST_RUN_REAL_LLM=1`（P0/P1/P4 脚本）或 `EZTEST_ACCEPTANCE_REAL_LLM=1`（P3 人工验收）；
 3. 运行 P0 连通性验收 `scripts/acceptance-llm.ps1`，或 P1 Agent 真实验收 `scripts/acceptance-agent-llm.ps1`（后者验证 `deepseek-flash` 思考模式 + 工具调用 + 终态，并断言 `reasoning_tokens>0`），或 P4 代码智能真实验收 `scripts/acceptance-codeintel-llm.ps1`（真实 Git diff + 证据哈希 + 候选 + 缓存/force 版本；结果写 `.tmp/p4-real-acceptance.json`），或按 P3 章节人工执行澄清/分析/侦察验收。
 
-P4 脚本可选配置：`EZTEST_ACCEPTANCE_P4_REPO`（已存在的 Git 检查点路径；默认可写克隆 `./.tmp/p4-real-repo`，不存在时从当前仓库克隆；只读检查点会复用已有分支）、`EZTEST_ACCEPTANCE_P4_BASE`/`EZTEST_ACCEPTANCE_P4_HEAD`（显式 40-hex commit 对，base 必须是 head 的祖先且变更文件 ≤20）、`EZTEST_ACCEPTANCE_API_URL`（复用已在运行的 API；默认重置 `eztest_e2e` 并启动当前源码构建的 API）。脚本不会把仓库内容、提示词或密钥写入日志；降级（`degraded=true`）时会记录 `passed_degraded` 并跳过 AI-only 断言。
+P4 脚本可选配置：`EZTEST_ACCEPTANCE_P4_REPO`（已存在的 Git 检查点路径；默认可写克隆 `./.tmp/p4-real-repo`，不存在时从当前仓库克隆；只读检查点会复用已有分支）、`EZTEST_ACCEPTANCE_P4_BASE`/`EZTEST_ACCEPTANCE_P4_HEAD`（显式 40-hex commit 对，base 必须是 head 的祖先且变更文件 ≤20）、`EZTEST_ACCEPTANCE_API_URL`（复用已在运行的 API；默认重置 `eztest_e2e` 并启动当前源码构建的 API）。默认要求分析结果至少包含 1 条真实 unmapped；若显式 commit 对全映射，可传 `-AllowNoUnmapped` 记录为 skipped/warning（不得静默通过）。脚本不会把仓库内容、提示词或密钥写入日志；降级（`degraded=true`）时会记录 `passed_degraded` 并跳过 AI-only 断言（含 cacheHits 断言）。
 
 普通 `go test`、`pnpm test`、E2E 与 `scripts/acceptance.ps1` 都不会访问真实 LLM。P1/P4 的真实验收与 P3 的人工验收都不进入默认门禁，需人工显式执行。配置也可在管理员登录后于设置页创建/更新，Key 留空表示保留原值。
 
@@ -443,7 +443,7 @@ P4 脚本可选配置：`EZTEST_ACCEPTANCE_P4_REPO`（已存在的 Git 检查点
 - Agent 工具：文件工具默认关闭（空 `EZTEST_AGENT_FILE_ROOT`）；`http.get` 只读、host allowlist、最多 3 次重定向、响应截断 1 MB；P1 不提供浏览器/数据库/写操作等业务工具。
 - P2 资源：Access 凭据与 Session 状态明文存储，且不写审计/事件流（D28）；Session 过期惰性判定、无后台 GC；代码仓只做本地只读路径/分支校验，P4 提供索引与读取；不提供自动登录、ProbeRecipe 或 Session 执行注入。
 - P3 版本域：只实现 `draft → clarifying → designing` 与需求 `draft → clarified`，不提供版本删除/归档、脑图/评审/执行/报告；附件仅落本地文件系统（无 GC/备份，删除 best-effort 可留孤儿文件）；AI 澄清/分析/侦察依赖 P1 Agent 与 LLM，不可用时返回 503 但人工路径可用；单版本最多一个 active 会话与一个运行中 Agent；P3 不写 `audit_logs`。
-- P4 代码智能：只做文件级 Git 与 AI 事实，无 parser/符号级调用链/字段级分析、无全仓 AI 分析、无全文检索；只分析变更文件且受 20 文件/64KiB/摘录行数/超时/队列(16)等上限约束；单实例进程内 worker，无取消、无跨进程恢复；仓库必须本地只读可见，不支持线上仓、分支切换或工作树修改；候选只有需求/应用模型（case/issue 归 P5/P6），版本锚点仅 API 可建；事实无人工修正/版本对比 UI；AI 失败降级为 T0 候选但可能产生 `analysis_queue_full`/`analysis_in_progress` 等 429/409；P4 不写 `audit_logs`（`code.read` 审计除外）。
+- P4 代码智能：只做文件级 Git 与 AI 事实，无 parser/符号级调用链/字段级分析、无全仓 AI 分析、无全文检索；只分析变更文件且受 20 文件/64KiB/摘录行数/超时/队列(16)等上限约束；单实例进程内 worker，无取消、无跨进程恢复；仓库必须本地只读可见，不支持线上仓、分支切换或工作树修改；候选只有需求/应用模型（case/issue 归 P5/P6），版本锚点仅 API 可建；事实无人工修正/版本对比 UI；AI 失败降级为 T0 候选但可能产生 `analysis_queue_full`/`analysis_in_progress` 等 429/409；P4 不写 `audit_logs`（`code.read`/`code.analyze` 审计除外）。
 - 登录 token 存 `sessionStorage`：属于单管理员内网工具的 XSS 边界，未做 CSP/HttpOnly cookie 会话。
 - 无 TLS、反向代理、限流网关或多租户/RBAC；管理员角色是唯一权限分层。
 - 对象存储只有本地内容寻址实现：无公开 URL、GC、保留期、去重清理。

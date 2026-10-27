@@ -7,8 +7,9 @@
     Executes the Go unit and integration suites, the P1 Agent unit/integration
     suites, the P3 version/requirements/clarification suites, the P4 codeintel
     suites, the frontend lint/typecheck/test/build gate, the Playwright E2E
-    suite (P0/P1/P2, the three P3 version specs and the P4 code specs in
-    frontend/e2e/versions*.spec.ts, code-repos-index.spec.ts), a repeated
+    suite (P0/P1/P2 and the three P3 version specs in
+    frontend/e2e/versions*.spec.ts; P4 E2E coverage is added by Task 20 and is
+    not part of this gate yet), a repeated
     migration run and the health/audit/version-API assertions. The P0-P4
     deliverables are checked (README, OpenAPI, deploy files, Agent/P3/P4 env
     templates, the P3/P4 OpenAPI contract keywords, reason enums and event
@@ -921,6 +922,7 @@ try {
                     "scripts/fake-llm.p4.test.cjs",
                     "scripts/acceptance-codeintel-llm.ps1",
                     "code.impact_computed",
+                    "code.analyze",
                     "read-only"
                 )) {
                 if ($readme -notmatch [regex]::Escape($needle)) {
@@ -999,6 +1001,7 @@ try {
                     "anchor_duplicate",
                     "anchor_not_found",
                     "unsupported_subject_kind",
+                    "path_not_git_repo",
                     "git_unavailable"
                 )) {
                 if ($p4ReasonCatalog.Value -notmatch [regex]::Escape($reason)) {
@@ -1049,7 +1052,13 @@ try {
 
             # Parse the OpenAPI document with the repository's existing YAML
             # dependency (frontend/node_modules/yaml); this catches a broken
-            # YAML document that the regex needles above would miss.
+            # YAML document that the regex needles above would miss. StaticOnly
+            # does not require frontend/node_modules, so fail with an actionable
+            # message instead of a bare node module-resolution error.
+            $yamlModule = Join-Path $frontendDir "node_modules\yaml"
+            if (-not (Test-Path -LiteralPath $yamlModule)) {
+                throw "frontend/node_modules/yaml is missing; run 'pnpm install' in frontend (the OpenAPI YAML parse uses that dependency)"
+            }
             # Windows PowerShell 5.1 strips embedded double quotes from native
             # arguments, so the JavaScript program uses single-quoted strings.
             $openapiParseCode = "import { readFileSync } from 'node:fs'; import { parse } from 'yaml'; const doc = parse(readFileSync(process.argv[1], 'utf8')); if (!doc || typeof doc !== 'object' || !doc.paths || !doc.components || !doc.components.schemas) { throw new Error('invalid OpenAPI document'); } const p4 = Object.keys(doc.paths).filter((p) => p.startsWith('/api/code/repos') || p.includes('/code/changes') || p.includes('/code/analyses') || p.includes('/code/anchors')); if (p4.length < 18) { throw new Error('expected at least 18 P4 paths, found ' + p4.length); } console.log('OpenAPI parsed: ' + Object.keys(doc.paths).length + ' paths, ' + Object.keys(doc.components.schemas).length + ' schemas, ' + p4.length + ' P4 paths');"
@@ -1194,12 +1203,12 @@ try {
         [pscustomobject][ordered]@{
             DoD         = "P4-2"
             Requirement = "Same-commit analyses reuse the cache; re-analysis creates a new version without overwriting"
-            Evidence    = "codeintel application cache/version suites; gated script asserts reused=true and force analysisVersion+1"
+            Evidence    = "codeintel application cache/version suites; gated script asserts reused=true with identical normalized candidates, a second same-base version with stats.cacheHits>0, and force analysisVersion+1"
         },
         [pscustomobject][ordered]@{
             DoD         = "P4-3"
             Requirement = "Impact candidates carry reason/confidence/evidence, can be toggled, and unmapped changes are visible"
-            Evidence    = "codeintel impact/candidate suites; P4 Analysis/Candidate/Unmapped OpenAPI schemas; gated script checks candidates/unmapped"
+            Evidence    = "codeintel impact/candidate suites; P4 Analysis/Candidate/Unmapped OpenAPI schemas; gated script checks candidate reason/confidence/evidence and requires >=1 unmapped (or explicit -AllowNoUnmapped)"
         },
         [pscustomobject][ordered]@{
             DoD         = "P4-4"
