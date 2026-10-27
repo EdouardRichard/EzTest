@@ -383,6 +383,24 @@ func TestCatalogRepositoryRoundTrip(t *testing.T) {
 	}
 	assertCatalogAppModel(t, *reloadedAPI, *api)
 
+	// T11's JSON import upserts existing nodes by key, so an existing manual
+	// node must be able to become an imported one through UpdateAppModel.
+	page.Source = "import"
+	if err := repo.UpdateAppModel(ctx, page); err != nil {
+		t.Fatal(err)
+	}
+	reloadedPage, err := repo.GetAppModel(ctx, page.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloadedPage.Source != "import" {
+		t.Fatalf("updated page source=%q want import", reloadedPage.Source)
+	}
+	if !reloadedPage.UpdatedAt.After(page.CreatedAt) {
+		t.Fatalf("updated page updated_at=%v created_at=%v", reloadedPage.UpdatedAt, page.CreatedAt)
+	}
+	assertCatalogAppModel(t, *reloadedPage, *page)
+
 	if err := repo.DeleteEnvironment(ctx, dev.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -680,7 +698,7 @@ func TestCatalogRepositoryConflictsAndDependencies(t *testing.T) {
 	reparented := &domain.AppModelNode{
 		ID: node.ID, SystemID: sys.ID, ParentID: catalogInt64(999999),
 		Kind: domain.AppModelKindPage, Key: "page:/orders", Name: "Orders", Path: "/orders",
-		Meta: json.RawMessage(`{}`),
+		Source: node.Source, Meta: json.RawMessage(`{}`),
 	}
 	assertCatalogKind(t, repo.UpdateAppModel(ctx, reparented), domain.KindDependency, "has_dependencies")
 }
@@ -712,7 +730,7 @@ func TestCatalogRepositoryNotFound(t *testing.T) {
 	assertCatalogKind(t, repo.UpdateEnvironment(ctx, missingEnv), domain.KindNotFound, "not_found")
 	missingNode := &domain.AppModelNode{
 		ID: 999999, SystemID: 1, Kind: domain.AppModelKindPage, Key: "page:/missing", Name: "Missing",
-		Path: "/missing", Meta: json.RawMessage(`{}`),
+		Path: "/missing", Source: "manual", Meta: json.RawMessage(`{}`),
 	}
 	assertCatalogKind(t, repo.UpdateAppModel(ctx, missingNode), domain.KindNotFound, "not_found")
 
