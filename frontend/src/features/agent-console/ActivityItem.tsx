@@ -73,6 +73,7 @@ export function ActivityItem({ entry, getDetail }: ActivityItemProps) {
           status={result ? readDetailText(result, "status") : use ? "running" : ""}
           durationMs={result ? readDetailNumber(result, "duration_ms") : null}
           errorCode={result ? readDetailText(result, "error_code") : ""}
+          assistantMessageId={use ? readDetailNumber(use, "message_id") : null}
           resultMessageId={result ? readDetailNumber(result, "message_id") : null}
           getDetail={getDetail}
         />
