@@ -11,6 +11,23 @@ import (
 // moves the epoch.
 const snowflakeTestEpochMs int64 = 1_704_067_200_000
 
+// Test-local copies of the D29 field layout, so a shift or mask change in the
+// implementation breaks these assertions instead of silently moving them.
+const (
+	snowflakeTestTimeShift = 22
+	snowflakeTestNodeShift = 12
+	snowflakeTestNodeMask  = 0x3FF
+	snowflakeTestSeqMask   = 0xFFF
+)
+
+func snowflakeTimeField(id int64) int64 { return id >> snowflakeTestTimeShift }
+
+func snowflakeNodeField(id int64) int64 {
+	return id >> snowflakeTestNodeShift & snowflakeTestNodeMask
+}
+
+func snowflakeSeqField(id int64) int64 { return id & snowflakeTestSeqMask }
+
 // fixedClock returns a clock function frozen at now, plus a setter the
 // rollback test uses to move it backwards.
 func fixedClock(now time.Time) (func() time.Time, func(time.Time)) {
@@ -165,5 +182,141 @@ func TestSnowflakeConcurrentUnique(t *testing.T) {
 
 	if want := goroutines * perGoroutine; len(seen) != want {
 		t.Fatalf("collected %d unique ids, want %d", len(seen), want)
+	}
+}
+
+// TestSnowflakeSequenceOverflowAdvancesLogicalMillisecond pins the accepted
+// policy for exhausting the 12-bit sequence: Next never blocks, it advances
+// the logical millisecond instead. With a frozen clock the 4097th ID must
+// carry time field +1 and sequence 0; once the wall clock catches up to or
+// passes that logical millisecond, later IDs must stay strictly increasing and
+// never repeat.
+func TestSnowflakeSequenceOverflowAdvancesLogicalMillisecond(t *testing.T) {
+	base := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
+	clock, setClock := fixedClock(base)
+	const nodeID int64 = 3
+	sf, err := newSnowflake(nodeID, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	baseMs := base.UnixMilli() - snowflakeTestEpochMs
+
+	seen := make(map[int64]struct{}, 4097+8)
+	var prev int64
+	record := func(phase string, idx int, id int64) {
+		t.Helper()
+		if _, ok := seen[id]; ok {
+			t.Fatalf("%s id #%d: duplicate id %d", phase, idx, id)
+		}
+		seen[id] = struct{}{}
+		if prev != 0 && id <= prev {
+			t.Fatalf("%s id #%d: id %d is not greater than previous %d", phase, idx, id, prev)
+		}
+		prev = id
+	}
+
+	// The first 4096 IDs fit in the frozen millisecond: one per sequence slot.
+	var lastFrozen int64
+	for i := 0; i < 4096; i++ {
+		lastFrozen = sf.Next()
+		record("frozen", i, lastFrozen)
+		if got := snowflakeTimeField(lastFrozen); got != baseMs {
+			t.Fatalf("frozen id #%d time field = %d, want %d", i, got, baseMs)
+		}
+		if got := snowflakeSeqField(lastFrozen); got != int64(i) {
+			t.Fatalf("frozen id #%d seq = %d, want %d", i, got, i)
+		}
+	}
+	if got := snowflakeSeqField(lastFrozen); got != 4095 {
+		t.Fatalf("last frozen id seq = %d, want 4095", got)
+	}
+
+	// The 4097th ID exhausts the sequence, so the generator advances the
+	// logical millisecond rather than waiting on the frozen wall clock.
+	overflow := sf.Next()
+	record("overflow", 4096, overflow)
+	if got := snowflakeTimeField(overflow); got != baseMs+1 {
+		t.Fatalf("overflow id time field = %d, want %d (base+1)", got, baseMs+1)
+	}
+	if got := snowflakeSeqField(overflow); got != 0 {
+		t.Fatalf("overflow id seq = %d, want 0", got)
+	}
+	if got := snowflakeNodeField(overflow); got != nodeID {
+		t.Fatalf("overflow id node field = %d, want %d", got, nodeID)
+	}
+
+	// Catch the wall clock up to the logical millisecond: IDs may share that
+	// millisecond, but must keep increasing without repeating.
+	setClock(base.Add(time.Millisecond))
+	for i := 0; i < 4; i++ {
+		id := sf.Next()
+		record("catch-up", i, id)
+		if got := snowflakeTimeField(id); got != baseMs+1 {
+			t.Fatalf("catch-up id #%d time field = %d, want %d", i, got, baseMs+1)
+		}
+	}
+
+	// Once wall time passes the logical millisecond, it is authoritative again.
+	setClock(base.Add(5 * time.Millisecond))
+	for i := 0; i < 4; i++ {
+		id := sf.Next()
+		record("post-catch-up", i, id)
+		if got := snowflakeTimeField(id); got != baseMs+5 {
+			t.Fatalf("post-catch-up id #%d time field = %d, want %d", i, got, baseMs+5)
+		}
+	}
+
+	if want := 4097 + 8; len(seen) != want {
+		t.Fatalf("collected %d unique ids, want %d", len(seen), want)
+	}
+}
+
+// TestSnowflakeClockAdvances proves that when wall time moves past the last
+// millisecond, the time field advances by that many milliseconds, the sequence
+// restarts at 0, and the ID is still strictly greater. Several IDs are taken
+// before the advance so a missing sequence reset is observable: deleting the
+// "s.seq = 0" line in Next's clock-advance branch leaves seq > 0 here.
+func TestSnowflakeClockAdvances(t *testing.T) {
+	base := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
+	clock, setClock := fixedClock(base)
+	const nodeID int64 = 2
+	sf, err := newSnowflake(nodeID, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	baseMs := base.UnixMilli() - snowflakeTestEpochMs
+	first := sf.Next()
+	if got := snowflakeTimeField(first); got != baseMs {
+		t.Fatalf("first id time field = %d, want %d", got, baseMs)
+	}
+	if got := snowflakeSeqField(first); got != 0 {
+		t.Fatalf("first id seq = %d, want 0", got)
+	}
+
+	prev := first
+	for i := 0; i < 3; i++ {
+		prev = sf.Next()
+	}
+	if got := snowflakeSeqField(prev); got != 3 {
+		t.Fatalf("seq before clock advance = %d, want 3", got)
+	}
+
+	const advanceMs = 7
+	setClock(base.Add(advanceMs * time.Millisecond))
+	got := sf.Next()
+
+	if want := baseMs + advanceMs; snowflakeTimeField(got) != want {
+		t.Fatalf("time field after advancing %dms = %d, want %d", advanceMs, snowflakeTimeField(got), want)
+	}
+	if seq := snowflakeSeqField(got); seq != 0 {
+		t.Fatalf("sequence after clock advance = %d, want 0 (reset)", seq)
+	}
+	if node := snowflakeNodeField(got); node != nodeID {
+		t.Fatalf("node field after clock advance = %d, want %d", node, nodeID)
+	}
+	if got <= prev {
+		t.Fatalf("id %d after clock advance is not greater than previous %d", got, prev)
 	}
 }
