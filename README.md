@@ -64,7 +64,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1
 
 P3 增加 `version` 限界上下文（7 张表 + 附件文件系统 + 雪花 ID），交付「版本容器 + 多需求 + AI 引导澄清 + 人工确认」垂直切片。`/api/versions/*` 全部登录用户可读写，P3 不新增 403 权限点；写操作由 identity context 注入 actor 并记录 `createdBy`/`updatedBy`。
 
-- 页面：`/versions` 列表/创建/资源绑定；`/versions/[id]` 工作台，默认「需求与澄清」Tab，另有总览、执行会话、探索链路、实时播报、结果与证据、问题、报告、代码与变更 8 个占位 Tab（P4–P7 归属）。支持 `?tab=overview|sessions|exploration|broadcast|results|issues|report|code` 深链。
+- 页面：`/versions` 列表/创建/资源绑定；`/versions/[id]` 工作台，默认「需求与澄清」Tab（功能工作台），另有「总览」骨架 Tab 与执行会话、探索链路、实时播报、结果与证据、问题、报告、代码与变更 7 个占位 Tab（P4–P7 归属）。支持 `?tab=overview|sessions|exploration|broadcast|results|issues|report|code` 深链。
 - 状态：需求独立流水线 `draft → clarified`，版本 `draft → clarifying → designing`。新增/确认/重开需求**不会**改变 Version.status；`designing` 下仍可独立澄清与确认；进入设计允许带未澄清需求，但需 `acknowledgeUnclarified=true` 二次确认并返回 warnings。
 - 澄清：会话/消息（P1 `clarification-dialog`）、问题（open/answered/dismissed）、决策（proposed/accepted/rejected）与需求关系（`depends_on`/`conflicts_with`/`overlaps`/`shares_scope`）；SSE 固定 `channel=version:{id}`，复用 `Last-Event-ID` 回放、20s 心跳与 `stream.reset`；事件快照为扁平 `{"data":[...],"snapshot_cursor","has_more"}`，注册全部 P3 事件类型（含 `clarification.context_updated`）。
 - ID：P3 自有 ID（version/requirement/relation/session/question/decision/attachment）在 JSON/URL 中一律为十进制字符串；P2 资源 ID（`systemId` 等）与用户 ID 仍为 number；前端禁止对 P3 ID 使用 `Number()`。
@@ -76,21 +76,25 @@ P3 增加 `version` 限界上下文（7 张表 + 附件文件系统 + 雪花 ID�
 P3 验收命令：
 
 ```powershell
-# P3 单元 + 集成
+# P3 单元 + 集成（仓库根 → backend）
 cd backend
 ..\.tools\go\bin\go.exe test -count=1 ./internal/version/...
 $env:EZTEST_TEST_DATABASE_URL = "<eztest_test URL>"
 ..\.tools\go\bin\go.exe test -tags=integration -count=1 ./internal/version/...
 
-# P3 前端组件
-cd frontend; pnpm vitest run src/features/versions
+# P3 前端组件（backend → frontend）
+cd ..\frontend
+pnpm vitest run src/features/versions
 
-# 全链路（fake LLM，含 P3 工作台/澄清/SSE/降级；零真实费用）
+# 仅 E2E（frontend → 仓库根；fake LLM，零真实费用）
+cd ..
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1
 
-# 完整 P0–P3 验收（P3 关键词、错误 reason 与事件目录检查；真实 LLM 仍 gated）
+# 完整 P0–P3 验收（仓库根；P3 关键词、错误 reason 与事件目录检查；真实 LLM 仍 gated）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1
 ```
+
+P3 的 Playwright E2E（`frontend/e2e/versions*.spec.ts`）尚未落地，计划随 T19 接入；当前 E2E 只覆盖 P0/P1/P2，README 与验收入口不声称 P3 E2E 已通过。
 
 真实 LLM 的 P3 人工验收为 gated：需 `.env` 配置有效 `llm_*`、显式设置 `EZTEST_ACCEPTANCE_REAL_LLM=1`，并人工执行创建版本/需求/附件 → ≥2 轮澄清 → 确认 → 进入设计；截图保存到 `.tmp/p3-acceptance/`（spec §10.7）。
 
@@ -320,7 +324,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1
 
 # 仅 E2E（会自行启动/停止 API、Web、fake LLM 上游与 fixture target，使用 eztest_e2e 库；
-# 覆盖 P0 场景、P1 Agent 控制台、P2 Session 与 P3 版本工作台/澄清/降级）
+# 当前覆盖 P0 场景、P1 Agent 控制台与 P2 Session；P3 版本工作台/澄清/降级的
+# Playwright 用例（frontend/e2e/versions*.spec.ts）计划随 T19 接入）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1
 
 # Compose 静态校验（不需要 Docker 守护进程）
@@ -346,7 +351,7 @@ node scripts/validate-compose.mjs
 
 - 本机没有 Docker，`scripts/acceptance.ps1` 会把“Compose 容器运行”标为 **SKIPPED**；Compose 仅通过 `validate-compose.mjs` 做静态字段校验，不代表已运行验证。P1 真实 Agent LLM 与 P3 真实 LLM 人工验收同样标为 **SKIPPED**（见下节）。
 - 常规测试不访问真实 LLM：Go 测试使用 `httptest` mock（`/v1/chat/completions`、`/v1/responses`、`/v1/models`，可注入 429/5xx/超时/分片）；`scripts/e2e.ps1` 使用 `scripts/fake-llm.cjs`（127.0.0.1:13334）并覆盖 `llm_*`，E2E 零 LLM 费用。
-- `acceptance.ps1` 额外校验 `docs/openapi/api.yaml` 含 P1 的 `/api/agents/sessions`、`agent.activity`、`reasoning_tokens`，P2 的 `/api/resources/systems`、`/api/resources/sessions`、`/api/resources/code-repos`、`storageState`、`credentialSet`，以及 P3 的 `/api/versions`、`clarification`、`enter-design`、`snowflake`、`version-attachments` 关键词、全部 §7.1 错误 reason、全部版本事件类型（含 `clarification.context_updated`）；同时校验 `.env.example` 的 Agent/P3 变量与 Compose 的附件目录；P1/P3 DoD 与检查项/证据的映射会打印在汇总后。
+- `acceptance.ps1` 额外校验 `docs/openapi/api.yaml` 含 P1 的 `/api/agents/sessions`、`agent.activity`、`reasoning_tokens`，P2 的 `/api/resources/systems`、`/api/resources/sessions`、`/api/resources/code-repos`、`storageState`、`credentialSet`，以及 P3 的 `/api/versions`、`clarification`、`enter-design`、`snowflake`、`version-attachments` 关键词、全部 P3 错误 reason（含字段级 `invalid_context_summary`）、全部版本事件类型（含 `clarification.context_updated`）；同时校验 `.env.example` 的 Agent/P3 变量与 Compose 的附件目录；P1/P3 DoD 与检查项/证据的映射会打印在汇总后（P3 Playwright E2E 标记为计划随 T19 接入）。
 - 通过条件：所有非 SKIPPED 检查 FAIL 数为 0，脚本退出码为 0。
 
 ## 真实 LLM（gated）
@@ -383,7 +388,7 @@ node scripts/validate-compose.mjs
 - LLM `base_url` 由管理员配置且被信任（P0 管理端测试不做 SSRF 白名单）；P1 Agent 工具调用另有 host allowlist。真实调用受上游可用性/限流/费用影响。
 - Compose/镜像仅静态交付，未在本机运行验证；Dockerfile 使用 `golang:1.24.6-alpine`、`node:22-alpine`、`alpine:3.21`，首次构建需要拉取镜像与依赖。
 - 迁移与数据备份需自行负责；丢失 `EZTEST_SECRET_KEYS` 会导致已加密的 LLM Key/headers 不可恢复。
-- 页面覆盖：P0 登录、概览、设置（用户/LLM/SSE 测试），P1 增加 `/agents` 控制台，P2 增加 `/resources`（四 Tab）与 `/code-repos`，P3 增加 `/versions` 列表与详情工作台（其余 Tab 为 P4–P7 占位）；其余侧边栏入口仍为占位页。
+- 页面覆盖：P0 登录、概览、设置（用户/LLM/SSE 测试），P1 增加 `/agents` 控制台，P2 增加 `/resources`（四 Tab）与 `/code-repos`，P3 增加 `/versions` 列表与详情工作台（总览为骨架，其余 7 个 Tab 为 P4–P7 占位）；其余侧边栏入口仍为占位页。
 
 ## 许可证
 

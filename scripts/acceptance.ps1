@@ -6,15 +6,15 @@
 .DESCRIPTION
     Executes the Go unit and integration suites, the P1 Agent unit/integration
     suites, the P3 version/requirements/clarification suites, the frontend
-    lint/typecheck/test/build gate, the Playwright E2E suite (including the
-    Agent console and the P3 version workbench), a repeated migration run and
-    the health/audit/version-API assertions. The P0-P3 deliverables are checked
-    (README, OpenAPI, deploy files, Agent/P3 env templates, the P3 OpenAPI
-    contract keywords and the P3 event catalog) and the Compose file is
-    statically validated with node. Container execution and the gated real
-    Agent/P3 LLM acceptance are reported as SKIPPED because this host has no
-    Docker and no opt-in for paid calls. Prints P1 and P3 DoD mapping tables and
-    exits non-zero on any failure.
+    lint/typecheck/test/build gate, the Playwright E2E suite (P0/P1/P2; the P3
+    version workbench specs are planned and gated until Task 19 and are not
+    present yet), a repeated migration run and the health/audit/version-API
+    assertions. The P0-P3 deliverables are checked (README, OpenAPI, deploy
+    files, Agent/P3 env templates, the P3 OpenAPI contract keywords and the P3
+    event catalog) and the Compose file is statically validated with node.
+    Container execution and the gated real Agent/P3 LLM acceptance are reported
+    as SKIPPED because this host has no Docker and no opt-in for paid calls.
+    Prints P1 and P3 DoD mapping tables and exits non-zero on any failure.
 
 .NOTES
     Compatible with Windows PowerShell 5.1 and PowerShell 7+.
@@ -731,7 +731,9 @@ try {
 
             $openapi = Get-Content -LiteralPath (Join-Path $repoRoot "docs/openapi/api.yaml") -Raw
             foreach ($needle in @(
-                    # P3 path families.
+                    # P3 method/path families. The full P3 paths are used for
+                    # /events and /stream because the bare fragments also match
+                    # the earlier P0/P1 endpoints.
                     "/api/versions",
                     "/start-clarification",
                     "/enter-design",
@@ -740,16 +742,13 @@ try {
                     "/attachments",
                     "/clarification",
                     "/decisions",
-                    "/events",
-                    "/stream",
-                    # P3 contract markers: revision CAS, acknowledge gate, flat
-                    # snapshot, string IDs, SSE and the new context event.
+                    "/api/versions/{id}/events",
+                    "/api/versions/{id}/stream",
+                    # P3 contract markers: acknowledge gate, context event,
+                    # string IDs and multipart upload.
                     "acknowledgeUnclarified",
-                    "snapshot_cursor",
                     "clarification.context_updated",
-                    "agent.activity",
                     "snowflake",
-                    "Last-Event-ID",
                     "multipart/form-data"
                 )) {
                 if ($openapi -notmatch [regex]::Escape($needle)) {
@@ -757,7 +756,19 @@ try {
                 }
             }
 
-            # Full spec §7.1 details.reason table.
+            # These markers predate P3 and would pass on the P0/P1 sections
+            # alone, so scope them to the P3 objects that own them.
+            $p3EventSnapshot = [regex]::Match($openapi, '(?ms)^    VersionEventSnapshot:\r?\n.*?(?=^    [A-Za-z]|\z)')
+            if (-not $p3EventSnapshot.Success -or $p3EventSnapshot.Value -notmatch 'snapshot_cursor') {
+                throw "docs/openapi/api.yaml is missing VersionEventSnapshot.snapshot_cursor"
+            }
+            $p3Stream = [regex]::Match($openapi, '(?ms)^  /api/versions/\{id\}/stream:\r?\n.*?(?=^  /|^components:)')
+            if (-not $p3Stream.Success -or $p3Stream.Value -notmatch 'Last-Event-ID') {
+                throw "docs/openapi/api.yaml is missing the P3 stream Last-Event-ID contract"
+            }
+
+            # Full spec §7.1 details.reason table plus the field-level
+            # invalid_context_summary reason emitted by context.summary_update.
             foreach ($reason in @(
                     "version_state_conflict",
                     "requirement_state_conflict",
@@ -778,6 +789,7 @@ try {
                     "attachment_limit_exceeded",
                     "unsupported_attachment_type",
                     "invalid_attachment_content",
+                    "invalid_context_summary",
                     "system_not_found",
                     "system_disabled",
                     "environment_not_found",
@@ -795,7 +807,13 @@ try {
                 }
             }
 
-            # Full spec §6.11 event catalog plus the P3 clarification.context_updated.
+            # Full spec §6.11 event catalog plus the P3 clarification.context_updated,
+            # scoped to the P3 VersionEventType enum so earlier-phase event types
+            # cannot satisfy the check.
+            $p3EventCatalog = [regex]::Match($openapi, '(?ms)^    VersionEventType:\r?\n.*?(?=^    [A-Za-z])')
+            if (-not $p3EventCatalog.Success) {
+                throw "docs/openapi/api.yaml is missing the VersionEventType event catalog"
+            }
             foreach ($eventType in @(
                     "version.created",
                     "version.updated",
@@ -818,8 +836,8 @@ try {
                     "attachment.removed",
                     "agent.activity"
                 )) {
-                if ($openapi -notmatch [regex]::Escape($eventType)) {
-                    throw "docs/openapi/api.yaml is missing version event type $eventType"
+                if ($p3EventCatalog.Value -notmatch [regex]::Escape($eventType)) {
+                    throw "docs/openapi/api.yaml VersionEventType is missing version event type $eventType"
                 }
             }
 
@@ -887,43 +905,46 @@ try {
     Write-Host $p1Table
 
     # P3 exit criteria (spec §10.6) mapped to the evidence collected above; the
-    # real-LLM manual acceptance remains the only gated piece.
+    # real-LLM manual acceptance remains the only gated piece. The P3 Playwright
+    # specs (frontend/e2e/versions*.spec.ts) are planned for Task 19 and are not
+    # present yet, so each row labels that evidence as planned rather than
+    # implying current P3 E2E coverage.
     Write-Step "P3 DoD mapping (spec §10.6)"
     $p3DodMapping = @(
         [pscustomobject][ordered]@{
             DoD         = "P3-1"
             Requirement = "A version records 3+ requirements; AI multi-turn questioning; human answers/edits; requirements/relations/decisions persisted"
-            Evidence    = "Version unit/integration suites; versions-clarification E2E; P3 real-LLM acceptance (gated)"
+            Evidence    = "Version unit/integration suites; workbench/clarification component tests; P3 real-LLM acceptance (gated); P3 Playwright E2E planned (T19)"
         },
         [pscustomobject][ordered]@{
             DoD         = "P3-2"
             Requirement = "Requirement confirmation and Version design entry follow the state rules (draft -> clarifying -> designing; draft -> clarified)"
-            Evidence    = "Domain state-machine tests; HTTP 200/409/422 contract; Playwright versions.spec warnings + acknowledge flow"
+            Evidence    = "Domain state-machine tests; HTTP 200/409/422 OpenAPI contract; enter-design acknowledge component test; P3 Playwright E2E planned (T19)"
         },
         [pscustomobject][ordered]@{
             DoD         = "P3-3"
             Requirement = "Refresh/reconnect loses neither the conversation nor the draft requirements"
-            Evidence    = "Playwright reload + SSE reconnect; flat /events snapshot + version stream in OpenAPI"
+            Evidence    = "Workbench reload + SSE reconnect component tests; flat /events snapshot + version stream in OpenAPI; P3 Playwright E2E planned (T19)"
         },
         [pscustomobject][ordered]@{
             DoD         = "P3-4"
             Requirement = "The requirement relation graph renders correctly"
-            Evidence    = "Workbench component tests; versions.spec relation graph"
+            Evidence    = "RelationGraph component tests; P3 Playwright E2E planned (T19)"
         },
         [pscustomobject][ordered]@{
             DoD         = "P3-5"
             Requirement = "Manual entry/confirmation still works when AI is unavailable"
-            Evidence    = "versions-degraded E2E; 503 ai_unavailable contract; Version API smoke"
+            Evidence    = "AI-unavailable component test; 503 ai_unavailable contract; Version API smoke; P3 Playwright E2E planned (T19)"
         },
         [pscustomobject][ordered]@{
             DoD         = "P3-6"
             Requirement = "Version detail container, 9-tab workbench and overview skeleton"
-            Evidence    = "versions.spec Tab contract and deep links"
+            Evidence    = "VersionTabs/VersionDetailPage tab + ?tab deep-link component tests; P3 Playwright E2E planned (T19)"
         },
         [pscustomobject][ordered]@{
             DoD         = "P3-7"
             Requirement = "Attachments and multimodal context-recon within limits"
-            Evidence    = "Attachment multipart upload/download integration tests; recon image_ref E2E; OpenAPI attachment paths"
+            Evidence    = "Attachment multipart upload/download integration tests; recon multimodal parts application test; OpenAPI attachment paths; P3 Playwright E2E planned (T19)"
         },
         [pscustomobject][ordered]@{
             DoD         = "P3-8"

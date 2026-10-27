@@ -2914,7 +2914,7 @@ paths:
         - $ref: '#/components/parameters/RequirementPathId'
       responses:
         '200':
-          description: The requirement.
+          description: The requirement with its attachment metadata.
           content:
             application/json:
               schema:
@@ -3362,11 +3362,11 @@ paths:
         - $ref: '#/components/parameters/IdempotencyKey'
       responses:
         '201':
-          description: The started session.
+          description: The started session (`{id, status, agentSessionId, startedAt}`).
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ClarificationSessionEnvelope'
+                $ref: '#/components/schemas/ClarificationSessionStartedEnvelope'
         '401':
           $ref: '#/components/responses/Unauthenticated'
         '404':
@@ -3415,8 +3415,9 @@ paths:
       description: |
         The persisted P1 `agent_messages` projection, oldest first, with
         `role=system` messages filtered out. `before_id` is a P1 message ID
-        (number), not a P3 snowflake string. `next_cursor` is the oldest message
-        ID of the page.
+        (integer), not a P3 snowflake string. `next_cursor` is a decimal string
+        encoding the oldest P1 message ID of the page; to fetch older messages,
+        parse it as an integer and pass that value as `before_id`.
       operationId: listClarificationMessages
       security:
         - bearerAuth: []
@@ -4231,7 +4232,10 @@ components:
       name: before_id
       in: query
       required: false
-      description: Return clarification messages with an ID lower than this P1 message ID (a number).
+      description: |
+        Return clarification messages with an ID lower than this P1 message ID
+        (an integer). Pass the integer value encoded by the previous page's
+        `ClarificationMessagePage.next_cursor` decimal string.
       schema:
         type: integer
         format: int64
@@ -4389,8 +4393,10 @@ components:
         `resource_unavailable` (a bound P2 resource was deleted). Field-level
         validation may instead use reasons such as `invalid_name`, `invalid_title`,
         `invalid_priority`, `invalid_status`, `invalid_message`, `invalid_answer`,
-        `invalid_relation_type` or `invalid_commit`, always with `details.field`
-        and `details.message`.
+        `invalid_relation_type`, `invalid_commit` or `invalid_context_summary`
+        (the latter carries `field=summary` and is emitted by the
+        `context.summary_update` tool for a summary over 20 KiB), always with
+        `details.field` and `details.message`.
       content:
         application/json:
           schema:
@@ -6987,7 +6993,9 @@ components:
           type: array
           items:
             type: string
-          description: Human-readable warnings about unclarified work; empty when none remain.
+          description: |
+            Human-readable warnings about unclarified work; always a JSON array
+            of strings (never a nested object) and empty when none remain.
     EnterDesignEnvelope:
       type: object
       required: [data]
@@ -7011,7 +7019,9 @@ components:
       type: object
       description: |
         `RequirementDTO` (spec §7.3). Every P3-owned ID is a decimal string;
-        user IDs stay numbers.
+        user IDs stay numbers. `GET /api/versions/{id}/requirements/{rid}`
+        additionally includes the requirement's `attachments` metadata; list
+        items expose only `attachmentCount`.
       required:
         - id
         - versionId
@@ -7079,6 +7089,14 @@ components:
         attachmentCount:
           type: integer
           minimum: 0
+        attachments:
+          type: array
+          description: |
+            Attachment metadata for the requirement-detail response (spec §7.3).
+            Omitted or empty on list items, which expose `attachmentCount` only.
+            `storagePath` is never returned.
+          items:
+            $ref: '#/components/schemas/RequirementAttachment'
         createdBy:
           type: integer
           format: int64
@@ -7334,6 +7352,33 @@ components:
           type: string
           format: date-time
           nullable: true
+    ClarificationSessionStarted:
+      type: object
+      description: |
+        The 201 response of `POST /api/versions/{id}/clarification/sessions`
+        (spec §7.5): only the fields known when the session starts, before any
+        completion or context summary exists.
+      required: [id, status, agentSessionId, startedAt]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          description: P3 clarification session ID.
+        status:
+          $ref: '#/components/schemas/ClarificationSessionStatus'
+        agentSessionId:
+          type: integer
+          format: int64
+          description: The P1 Agent session created for this clarification session.
+        startedAt:
+          type: string
+          format: date-time
+    ClarificationSessionStartedEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/ClarificationSessionStarted'
     ClarificationSessionEnvelope:
       type: object
       required: [data]
@@ -7451,7 +7496,11 @@ components:
             $ref: '#/components/schemas/ClarificationMessage'
         next_cursor:
           type: string
-          description: Opaque cursor for the previous page; pass it as `before_id` to fetch older messages. Empty when there is no earlier page.
+          description: |
+            Decimal-string encoding of the oldest P1 message ID on this page
+            (the same value space as `ClarificationMessage.id`). Convert it to
+            an integer and pass that integer as the `before_id` query parameter
+            to fetch older messages. Empty when there is no earlier page.
         has_more:
           type: boolean
     SendClarificationMessageRequest:
