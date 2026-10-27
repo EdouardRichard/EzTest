@@ -3,7 +3,6 @@
 import { Loader2 } from "lucide-react"
 import { useCallback, useEffect, useRef, useState } from "react"
 
-import { StatusBadge } from "@/components/ui/StatusBadge"
 import { ApiError } from "@/lib/api-client"
 
 import { getVersion } from "./api"
@@ -11,6 +10,7 @@ import { OverviewTab } from "./OverviewTab"
 import type { Version } from "./types"
 import { VersionHeader } from "./VersionHeader"
 import { isVersionTab, VersionTabs, type VersionTabValue } from "./VersionTabs"
+import { Workbench } from "./Workbench"
 
 const DEFAULT_TAB: VersionTabValue = "requirements"
 
@@ -41,32 +41,16 @@ function describeLoadError(error: unknown): string {
 
 type RequirementsWorkbenchSlotProps = {
   version: Version
+  onChanged: () => void
 }
 
 /**
- * T17/T18 mount point. T8 deliberately renders a labelled slot instead of a
- * workbench so the container, tabs and routing can ship first (spec §9.1).
+ * Requirements tab content. T17 owns the workbench; T18 extends it with the
+ * clarification column. `onChanged` refetches the version so the header
+ * counters stay in sync after requirement writes.
  */
-function RequirementsWorkbenchSlot({ version }: RequirementsWorkbenchSlotProps) {
-  return (
-    <section
-      aria-label="需求与澄清工作台"
-      data-testid="requirements-workbench-slot"
-      className="rounded-2xl border border-dashed border-border bg-card/60 p-6"
-    >
-      <div className="flex flex-wrap items-center gap-2">
-        <h2 className="text-base font-semibold">需求与澄清工作台</h2>
-        <StatusBadge variant="info">T17 挂载点</StatusBadge>
-      </div>
-      <p className="mt-2 max-w-2xl text-sm leading-relaxed text-muted-foreground">
-        工作台尚未接入：T17 将在此挂载需求列表、需求编辑器、附件与关系图，T18
-        将挂载澄清对话、问题与决策。
-      </p>
-      <p className="mt-1 text-xs text-muted-foreground">
-        当前版本需求计数：{version.requirementCount} 条，已确认 {version.clarifiedCount} 条。
-      </p>
-    </section>
-  )
+function RequirementsWorkbenchSlot({ version, onChanged }: RequirementsWorkbenchSlotProps) {
+  return <Workbench version={version} onChanged={onChanged} />
 }
 
 export type VersionDetailPageProps = {
@@ -170,7 +154,7 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
       <VersionTabs
         active={tab}
         onTabChange={handleTabChange}
-        requirements={<RequirementsWorkbenchSlot version={version} />}
+        requirements={<RequirementsWorkbenchSlot version={version} onChanged={refresh} />}
         overview={<OverviewTab version={version} />}
       />
     </div>

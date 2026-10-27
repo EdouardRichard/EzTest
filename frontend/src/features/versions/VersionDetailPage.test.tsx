@@ -7,12 +7,22 @@ const mocks = vi.hoisted(() => ({
   getVersion: vi.fn(),
   startClarification: vi.fn(),
   enterDesign: vi.fn(),
+  listRequirements: vi.fn(),
+  listRelations: vi.fn(),
 }))
 
 vi.mock("./api", () => ({
   getVersion: mocks.getVersion,
   startClarification: mocks.startClarification,
   enterDesign: mocks.enterDesign,
+  listRequirements: mocks.listRequirements,
+  listRelations: mocks.listRelations,
+}))
+
+// The bindings form reads the P2 resource APIs; the container test stays focused
+// on the tab shell and header actions, while T17's own suite covers bindings.
+vi.mock("./VersionBindingsForm", () => ({
+  VersionBindingsForm: () => null,
 }))
 
 import VersionDetailRoutePage from "@/app/(app)/versions/[id]/page"
@@ -75,6 +85,10 @@ describe("VersionDetailPage", () => {
   beforeEach(() => {
     for (const mock of Object.values(mocks)) mock.mockReset()
     mocks.getVersion.mockResolvedValue(VERSION)
+    // The mounted workbench loads these on mount; empty data keeps the shell
+    // assertions deterministic.
+    mocks.listRequirements.mockResolvedValue({ items: [], nextCursor: "", hasMore: false })
+    mocks.listRelations.mockResolvedValue([])
   })
 
   afterEach(() => {
@@ -193,7 +207,8 @@ describe("VersionDetailPage", () => {
 
     render(<VersionDetailPage versionId={VERSION_ID} />)
     await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
-    expect(screen.getByText("草稿")).toBeTruthy()
+    const versionHeader = screen.getAllByRole("banner")[0]
+    expect(within(versionHeader).getByText("草稿")).toBeTruthy()
 
     fireEvent.click(screen.getByRole("button", { name: "开始澄清" }))
 
