@@ -1,18 +1,20 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-    Runs the P0/P1 acceptance gate for EzTest.
+    Runs the P0-P3 acceptance gate for EzTest.
 
 .DESCRIPTION
     Executes the Go unit and integration suites, the P1 Agent unit/integration
-    suites, the frontend lint/typecheck/test/build gate, the Playwright E2E
-    suite (including the Agent console), a repeated migration run and the
-    health/audit assertions. The P0/P1 deliverables are checked (README,
-    OpenAPI, deploy files, Agent env template) and the Compose file is
+    suites, the P3 version/requirements/clarification suites, the frontend
+    lint/typecheck/test/build gate, the Playwright E2E suite (including the
+    Agent console and the P3 version workbench), a repeated migration run and
+    the health/audit/version-API assertions. The P0-P3 deliverables are checked
+    (README, OpenAPI, deploy files, Agent/P3 env templates, the P3 OpenAPI
+    contract keywords and the P3 event catalog) and the Compose file is
     statically validated with node. Container execution and the gated real
-    Agent LLM script are reported as SKIPPED because this host has no Docker
-    and no opt-in for paid calls. Prints a DoD mapping table and exits non-zero
-    on any failure.
+    Agent/P3 LLM acceptance are reported as SKIPPED because this host has no
+    Docker and no opt-in for paid calls. Prints P1 and P3 DoD mapping tables and
+    exits non-zero on any failure.
 
 .NOTES
     Compatible with Windows PowerShell 5.1 and PowerShell 7+.
@@ -394,6 +396,60 @@ function Test-AdminAudit {
     }
 }
 
+function Test-VersionApiSmoke {
+    # P3 global gate: unauthenticated requests are 401, an authenticated list
+    # returns the P3 cursor envelope, P3-owned IDs are JSON strings while P2
+    # resource/user IDs stay numbers, and an unknown version is 404.
+    try {
+        Invoke-RestMethod -Uri "$apiBaseUrl/api/versions" -TimeoutSec 20 | Out-Null
+        throw "GET /api/versions without a bearer token unexpectedly succeeded"
+    } catch {
+        $response = $_.Exception.Response
+        if ($null -eq $response -or [int]$response.StatusCode -ne 401) {
+            throw "GET /api/versions without a bearer token did not return 401: $($_.Exception.Message)"
+        }
+    }
+
+    $loginPayload = @{ username = $adminUsername; password = $adminPassword } | ConvertTo-Json -Compress
+    $login = Invoke-RestMethod -Method Post -Uri "$apiBaseUrl/api/auth/login" `
+        -ContentType "application/json" -Body $loginPayload -TimeoutSec 20
+    $token = [string]$login.data.token
+    if ([string]::IsNullOrWhiteSpace($token)) { throw "admin login did not return a token for the version smoke check" }
+    $headers = @{ Authorization = "Bearer $token" }
+
+    $page = Invoke-RestMethod -Uri "$apiBaseUrl/api/versions?limit=1" -Headers $headers -TimeoutSec 20
+    foreach ($field in @("data", "next_cursor", "has_more")) {
+        if (-not ($page.PSObject.Properties.Name -contains $field)) {
+            throw "GET /api/versions response is missing '$field'"
+        }
+    }
+    if ($page.data -isnot [array]) { throw "GET /api/versions 'data' is not an array" }
+    foreach ($version in @($page.data)) {
+        if ($version.id -isnot [string] -or [string]$version.id -notmatch '^[0-9]+$') {
+            throw "version id is not a decimal string: '$($version.id)'"
+        }
+        if ($version.revision -is [string]) { throw "version revision must be a JSON number" }
+        if ($null -ne $version.systemId -and $version.systemId -is [string]) {
+            throw "version systemId must stay a JSON number (P2 resource ID)"
+        }
+        if ($null -ne $version.createdBy -and $version.createdBy -is [string]) {
+            throw "version createdBy must stay a JSON number (user ID)"
+        }
+    }
+
+    try {
+        Invoke-RestMethod -Uri "$apiBaseUrl/api/versions/123456789012345678" -Headers $headers -TimeoutSec 20 | Out-Null
+        throw "GET /api/versions/{unknown} unexpectedly succeeded"
+    } catch {
+        $response = $_.Exception.Response
+        if ($null -eq $response -or [int]$response.StatusCode -ne 404) {
+            throw "GET /api/versions/{unknown} did not return 404: $($_.Exception.Message)"
+        }
+    }
+
+    Write-Host "Version API smoke OK: 401 unauthenticated, cursor envelope, string P3 IDs/numbers for P2 IDs, 404 unknown version."
+}
+
 $exitCode = 0
 $apiExe = Join-Path $tmpDir "e2e-api.exe"
 $hasLLMSeed = $false
@@ -493,6 +549,23 @@ try {
                 -Label "go test -tags=integration ./internal/agent/..."
         })
 
+    # P3 version / requirements / clarification domain, application, repository,
+    # handlers and Snowflake-ID suites.
+    [void](Invoke-Check -Dod "P3" -CheckName "Version context unit tests" -Body {
+            Invoke-LoggedCommand -Exe $goExe -Arguments @("test", "-count=1", "./internal/version/...") `
+                -WorkingDirectory $backendDir `
+                -LogPath (Join-Path $tmpDir "acceptance-version-unit.log") `
+                -Label "go test ./internal/version/..."
+        })
+
+    [void](Invoke-Check -Dod "P3" -CheckName "Version context integration tests" -Body {
+            $env:EZTEST_TEST_DATABASE_URL = $testDatabaseUrl
+            Invoke-LoggedCommand -Exe $goExe -Arguments @("test", "-tags=integration", "-count=1", "./internal/version/...") `
+                -WorkingDirectory $backendDir `
+                -LogPath (Join-Path $tmpDir "acceptance-version-integration.log") `
+                -Label "go test -tags=integration ./internal/version/..."
+        })
+
     [void](Invoke-Check -Dod "5" -CheckName "Frontend lint" -Body {
             Invoke-LoggedCommand -Exe $pnpmExe -Arguments @("lint") `
                 -WorkingDirectory $frontendDir `
@@ -530,7 +603,7 @@ try {
                 -SuccessTailLines 12
         })
 
-    [void](Invoke-Check -Dod "2" -CheckName "Migration rerun + health/audit" -Body {
+    [void](Invoke-Check -Dod "2,P3" -CheckName "Migration rerun + health/audit/version API" -Body {
             $env:PGPASSWORD = $dbPassword
             $first = $null
             $second = $null
@@ -571,6 +644,7 @@ try {
                 $healthSecond = Invoke-RestMethod -Uri "$apiBaseUrl/api/health" -TimeoutSec 20
                 Assert-Health -Health $healthSecond
                 Test-AdminAudit
+                Test-VersionApiSmoke
                 $afterSecond = Get-MigrationFingerprint
 
                 if ($before -ne $afterFirst -or $afterFirst -ne $afterSecond) {
@@ -641,14 +715,141 @@ try {
                 -SuccessTailLines 8
         })
 
+    [void](Invoke-Check -Dod "P3" -CheckName "P3 deliverables and OpenAPI/SSE contract" -Body {
+            $readme = Get-Content -LiteralPath (Join-Path $repoRoot "README.md") -Raw
+            foreach ($needle in @(
+                    "/versions",
+                    "EZTEST_VERSION_ATTACHMENT_DIR",
+                    "EZTEST_SNOWFLAKE_NODE_ID",
+                    "version-attachments",
+                    "scripts/acceptance.ps1"
+                )) {
+                if ($readme -notmatch [regex]::Escape($needle)) {
+                    throw "README.md is missing P3 keyword $needle"
+                }
+            }
+
+            $openapi = Get-Content -LiteralPath (Join-Path $repoRoot "docs/openapi/api.yaml") -Raw
+            foreach ($needle in @(
+                    # P3 path families.
+                    "/api/versions",
+                    "/start-clarification",
+                    "/enter-design",
+                    "/requirements",
+                    "/relations",
+                    "/attachments",
+                    "/clarification",
+                    "/decisions",
+                    "/events",
+                    "/stream",
+                    # P3 contract markers: revision CAS, acknowledge gate, flat
+                    # snapshot, string IDs, SSE and the new context event.
+                    "acknowledgeUnclarified",
+                    "snapshot_cursor",
+                    "clarification.context_updated",
+                    "agent.activity",
+                    "snowflake",
+                    "Last-Event-ID",
+                    "multipart/form-data"
+                )) {
+                if ($openapi -notmatch [regex]::Escape($needle)) {
+                    throw "docs/openapi/api.yaml is missing P3 contract keyword $needle"
+                }
+            }
+
+            # Full spec §7.1 details.reason table.
+            foreach ($reason in @(
+                    "version_state_conflict",
+                    "requirement_state_conflict",
+                    "open_questions_remaining",
+                    "unclarified_requirements",
+                    "requirements_required",
+                    "duplicate_relation",
+                    "relation_requirement_mismatch",
+                    "duplicate_attachment",
+                    "revision_conflict",
+                    "clarification_session_active",
+                    "clarification_session_not_active",
+                    "clarification_session_required",
+                    "clarification_question_state_conflict",
+                    "decision_state_conflict",
+                    "agent_busy",
+                    "attachment_too_large",
+                    "attachment_limit_exceeded",
+                    "unsupported_attachment_type",
+                    "invalid_attachment_content",
+                    "system_not_found",
+                    "system_disabled",
+                    "environment_not_found",
+                    "environment_system_mismatch",
+                    "code_repository_not_found",
+                    "code_repository_disabled",
+                    "branch_not_found",
+                    "path_not_found",
+                    "path_not_git_repo",
+                    "resource_unavailable",
+                    "ai_unavailable"
+                )) {
+                if ($openapi -notmatch [regex]::Escape($reason)) {
+                    throw "docs/openapi/api.yaml is missing P3 error reason $reason"
+                }
+            }
+
+            # Full spec §6.11 event catalog plus the P3 clarification.context_updated.
+            foreach ($eventType in @(
+                    "version.created",
+                    "version.updated",
+                    "version.status_changed",
+                    "requirement.added",
+                    "requirement.updated",
+                    "requirement.clarified",
+                    "requirement.reopened",
+                    "requirement.deleted",
+                    "requirement.relation_added",
+                    "requirement.relation_updated",
+                    "requirement.relation_removed",
+                    "clarification.session_started",
+                    "clarification.session_completed",
+                    "clarification.question_updated",
+                    "clarification.context_updated",
+                    "decision.proposed",
+                    "decision.decided",
+                    "attachment.added",
+                    "attachment.removed",
+                    "agent.activity"
+                )) {
+                if ($openapi -notmatch [regex]::Escape($eventType)) {
+                    throw "docs/openapi/api.yaml is missing version event type $eventType"
+                }
+            }
+
+            $envTemplate = Get-Content -LiteralPath (Join-Path $repoRoot ".env.example") -Raw
+            foreach ($versionVar in @("EZTEST_VERSION_ATTACHMENT_DIR", "EZTEST_SNOWFLAKE_NODE_ID")) {
+                if ($envTemplate -notmatch [regex]::Escape($versionVar)) {
+                    throw ".env.example is missing $versionVar"
+                }
+            }
+            $compose = Get-Content -LiteralPath (Join-Path $repoRoot "deploy/docker-compose.yml") -Raw
+            foreach ($composeNeedle in @("EZTEST_VERSION_ATTACHMENT_DIR", "attachments:/data/version-attachments")) {
+                if ($compose -notmatch [regex]::Escape($composeNeedle)) {
+                    throw "deploy/docker-compose.yml is missing P3 attachment setting $composeNeedle"
+                }
+            }
+            if ($envTemplate -notmatch [regex]::Escape("version-attachments")) {
+                throw ".env.example is missing the version-attachments default path"
+            }
+        })
+
     Add-CheckResult -Dod "risk" -CheckName "Compose container run" -Status "SKIPPED" `
         -Detail "No Docker on this host; Compose remains static-validation only (Task 15)."
     Add-CheckResult -Dod "4" -CheckName "Real LLM acceptance" -Status "SKIPPED" `
         -Detail "Gated: run scripts/acceptance-llm.ps1 with EZTEST_RUN_REAL_LLM=1."
     Add-CheckResult -Dod "P1-1" -CheckName "Real Agent LLM acceptance" -Status "SKIPPED" `
         -Detail "Gated: run scripts/acceptance-agent-llm.ps1 with EZTEST_RUN_REAL_LLM=1."
+    Add-CheckResult -Dod "P3" -CheckName "P3 real LLM acceptance" -Status "SKIPPED" `
+        -Detail "Gated: manual P3 acceptance (spec §10.7) with EZTEST_ACCEPTANCE_REAL_LLM=1; screenshots under .tmp/p3-acceptance/."
 
-    Write-Step "P0/P1 DoD acceptance summary"
+    Write-Step "P0-P3 DoD acceptance summary"
     $table = $checkResults | Format-Table -AutoSize -Wrap | Out-String -Width 200
     Write-Host $table
 
@@ -684,6 +885,59 @@ try {
     )
     $p1Table = $p1DodMapping | Format-Table -AutoSize -Wrap | Out-String -Width 200
     Write-Host $p1Table
+
+    # P3 exit criteria (spec §10.6) mapped to the evidence collected above; the
+    # real-LLM manual acceptance remains the only gated piece.
+    Write-Step "P3 DoD mapping (spec §10.6)"
+    $p3DodMapping = @(
+        [pscustomobject][ordered]@{
+            DoD         = "P3-1"
+            Requirement = "A version records 3+ requirements; AI multi-turn questioning; human answers/edits; requirements/relations/decisions persisted"
+            Evidence    = "Version unit/integration suites; versions-clarification E2E; P3 real-LLM acceptance (gated)"
+        },
+        [pscustomobject][ordered]@{
+            DoD         = "P3-2"
+            Requirement = "Requirement confirmation and Version design entry follow the state rules (draft -> clarifying -> designing; draft -> clarified)"
+            Evidence    = "Domain state-machine tests; HTTP 200/409/422 contract; Playwright versions.spec warnings + acknowledge flow"
+        },
+        [pscustomobject][ordered]@{
+            DoD         = "P3-3"
+            Requirement = "Refresh/reconnect loses neither the conversation nor the draft requirements"
+            Evidence    = "Playwright reload + SSE reconnect; flat /events snapshot + version stream in OpenAPI"
+        },
+        [pscustomobject][ordered]@{
+            DoD         = "P3-4"
+            Requirement = "The requirement relation graph renders correctly"
+            Evidence    = "Workbench component tests; versions.spec relation graph"
+        },
+        [pscustomobject][ordered]@{
+            DoD         = "P3-5"
+            Requirement = "Manual entry/confirmation still works when AI is unavailable"
+            Evidence    = "versions-degraded E2E; 503 ai_unavailable contract; Version API smoke"
+        },
+        [pscustomobject][ordered]@{
+            DoD         = "P3-6"
+            Requirement = "Version detail container, 9-tab workbench and overview skeleton"
+            Evidence    = "versions.spec Tab contract and deep links"
+        },
+        [pscustomobject][ordered]@{
+            DoD         = "P3-7"
+            Requirement = "Attachments and multimodal context-recon within limits"
+            Evidence    = "Attachment multipart upload/download integration tests; recon image_ref E2E; OpenAPI attachment paths"
+        },
+        [pscustomobject][ordered]@{
+            DoD         = "P3-8"
+            Requirement = "Optional P2 resource bindings with validation and degraded display"
+            Evidence    = "Create/bind validation tests; bindings.available=false contract; OpenAPI VersionBindings"
+        },
+        [pscustomobject][ordered]@{
+            DoD         = "P3-9"
+            Requirement = "Snowflake IDs and decimal-string JSON serialization"
+            Evidence    = "Snowflake unit tests; string-ID serialization tests; acceptance Version API smoke; OpenAPI string schemas"
+        }
+    )
+    $p3Table = $p3DodMapping | Format-Table -AutoSize -Wrap | Out-String -Width 200
+    Write-Host $p3Table
 
     $failed = @($checkResults | Where-Object { $_.Result -eq "FAIL" })
     $passed = @($checkResults | Where-Object { $_.Result -eq "PASS" })
