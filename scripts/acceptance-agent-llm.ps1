@@ -8,10 +8,15 @@
     Boots the API against a freshly reset eztest_e2e database (which seeds the
     builtin runtime-diagnostic profile and the default LLM configuration from
     .env), logs in as the admin, and drives one real diagnostic run:
+      * GET /api/admin/llm/configs and PATCH the default configuration's
+        timeout_ms to 180000 (the 60 s seed default is too short for the
+        thinking=max profile);
       * GET /api/agents/profiles and pick key=runtime-diagnostic;
       * POST /api/agents/sessions;
       * POST .../messages with the diagnostic prompt (http.get + README);
-      * poll the session until the run reaches a terminal state (300 s cap);
+      * poll the session until the run reaches a terminal state (300 s cap),
+        then retry the event snapshot briefly until run_finished is visible
+        (the API writes the terminal row before publishing the event);
       * read the agent channel's event snapshot and assert the activity
         contract: run_started/thinking/text/tool_use/tool_result/usage/
         run_finished, at least one successful tool result, and non-zero
@@ -21,9 +26,10 @@
     reported.
 
 .PARAMETER DryRun
-    Validate the script's paths and the .env key presence without resetting the
-    database, building or starting the API, or calling the LLM. Exits 0 when the
-    preflight passes.
+    Validate the script's paths and the .env key presence (including the
+    EZTEST_SECRET_KEYS/EZTEST_SECRET_KEY_ACTIVE variables) without resetting
+    the database, building or starting the API, or calling the LLM. Exits 0
+    when the preflight passes.
 
 .NOTES
     This script makes paid upstream calls. It is deliberately not part of
@@ -52,6 +58,14 @@ $eventsLimit = 100
 $maxEventPages = 2
 $pollIntervalSeconds = 2
 $pollTimeoutSeconds = 300
+# The default LLM configuration is seeded with timeout_ms=60000, which is too
+# short for a thinking=max diagnostic run; the script raises it before the run.
+$llmConfigsPath = "/api/admin/llm/configs"
+$llmTimeoutMs = 180000
+# The API writes the terminal run row before publishing run_finished, so a
+# running=false poll can race the event; retry the snapshot briefly first.
+$runFinishedWaitAttempts = 5
+$runFinishedWaitIntervalSeconds = 1
 $diagnosticPrompt = "请检查 EzTest 运行时健康（调用 http.get 访问 http://localhost:13333/api/health），并读取 README 的构建说明。"
 $requiredKinds = @("run_started", "thinking", "text", "tool_use", "tool_result", "usage", "run_finished")
 
@@ -244,10 +258,61 @@ function Get-AgentEventItems {
     return $items
 }
 
+function Wait-AgentEventKind {
+    param(
+        [hashtable]$Headers,
+        [int64]$SessionId,
+        [string]$Kind,
+        [int]$Attempts = 5,
+        [int]$IntervalSeconds = 1
+    )
+    # The API writes the terminal run row before publishing run_finished, so
+    # running=false does not guarantee the event is in the snapshot yet.
+    $items = @()
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        $items = @(Get-AgentEventItems -Headers $Headers -SessionId $SessionId)
+        foreach ($item in $items) {
+            if ($null -eq $item -or $null -eq $item.detail) { continue }
+            if ([string]$item.detail.kind -eq $Kind) { return $items }
+        }
+        if ($attempt -lt $Attempts) { Start-Sleep -Seconds $IntervalSeconds }
+    }
+    return $items
+}
+
+function Get-DefaultLLMConfig {
+    param([hashtable]$Headers)
+    $response = Invoke-Api -Method Get -Uri "${apiBaseUrl}${llmConfigsPath}" -Headers $Headers -TimeoutSec 20
+    $defaults = @()
+    if ($null -ne $response.data) {
+        $defaults = @($response.data | Where-Object { $null -ne $_ -and [bool]$_.is_default })
+    }
+    if ($defaults.Count -eq 0) {
+        throw "no default LLM configuration was returned by GET ${llmConfigsPath}"
+    }
+    return $defaults[0]
+}
+
+function Set-DefaultLLMTimeout {
+    param([hashtable]$Headers, [int64]$ConfigId, [int]$TimeoutMs)
+    # PATCH is a partial update: only timeout_ms is sent, so the server keeps
+    # every other stored field (name, protocol, model, api_key, headers, ...).
+    $response = Invoke-Api -Method Patch -Uri "${apiBaseUrl}${llmConfigsPath}/${ConfigId}" -Headers $Headers -Body @{ timeout_ms = $TimeoutMs } -TimeoutSec 20
+    $applied = [int64]-1
+    if ($null -ne $response.data -and $null -ne $response.data.timeout_ms) {
+        $applied = ConvertTo-Int64OrZero -Value $response.data.timeout_ms
+    }
+    if ($applied -ne [int64]$TimeoutMs) {
+        throw "the LLM configuration update did not apply timeout_ms=$TimeoutMs"
+    }
+    return $response
+}
+
 function Get-ApiErrorSummary {
     param($ErrorRecord)
     $status = 0
     $code = ""
+    $reason = ""
     $rawBody = $null
     try {
         $response = $ErrorRecord.Exception.Response
@@ -276,18 +341,25 @@ function Get-ApiErrorSummary {
         }
     }
     if (-not [string]::IsNullOrWhiteSpace($rawBody)) {
-        # Only the shared error envelope's code is reported; the body, headers
-        # and any echoed request data are deliberately discarded.
+        # Only the shared error envelope's code and details.reason are reported;
+        # the body, headers and any echoed request data are deliberately
+        # discarded.
         try {
             $parsed = $rawBody | ConvertFrom-Json
             $code = [string]$parsed.error.code
+            if ($null -ne $parsed.error.details -and $null -ne $parsed.error.details.reason) {
+                $reason = [string]$parsed.error.details.reason
+            }
         } catch {
             $code = ""
+            $reason = ""
         }
     }
     if ($status -gt 0) {
-        if ([string]::IsNullOrWhiteSpace($code)) { return "HTTP $status" }
-        return "HTTP $status error_code=$code"
+        $parts = @("HTTP $status")
+        if (-not [string]::IsNullOrWhiteSpace($code)) { $parts += "error_code=$code" }
+        if (-not [string]::IsNullOrWhiteSpace($reason)) { $parts += "reason=$reason" }
+        return ($parts -join " ")
     }
     return (Get-RedactedText -Text ([string]$ErrorRecord.Exception.Message))
 }
@@ -334,7 +406,7 @@ function Invoke-DryRun {
     if (-not (Test-Path -LiteralPath $backendDir -PathType Container)) { $problems += "backend directory not found" }
 
     $envValues = $null
-    $requiredKeys = @("EZTEST_DATABASE_URL", "EZTEST_ADMIN_USERNAME", "EZTEST_ADMIN_PASSWORD", "llm_base_url", "llm_key", "llm_model_name")
+    $requiredKeys = @("EZTEST_DATABASE_URL", "EZTEST_ADMIN_USERNAME", "EZTEST_ADMIN_PASSWORD", "EZTEST_SECRET_KEYS", "EZTEST_SECRET_KEY_ACTIVE", "llm_base_url", "llm_key", "llm_model_name")
     $presentKeys = @()
     if (-not (Test-Path -LiteralPath $envPath -PathType Leaf)) {
         $problems += ".env not found at $envPath"
@@ -370,6 +442,7 @@ function Invoke-DryRun {
     } else {
         Write-Host "DryRun: gate is open; the real run would reset $e2eDbName, build/start the API on :$apiPort, and spend one paid LLM run."
     }
+    Write-Host "DryRun: the real run will PATCH the default LLM configuration timeout_ms to $llmTimeoutMs via the admin API."
     Write-Host "DryRun: port :$apiPort is not probed (another process may own it); the real run asserts it is free."
     Write-Host "DRYRUN OK" -ForegroundColor Green
     return 0
@@ -531,6 +604,27 @@ try {
     if ([string]::IsNullOrWhiteSpace([string]$script:token)) { throw "admin login did not return a token" }
     $headers = @{ Authorization = "Bearer $($script:token)" }
 
+    Write-Step "Raising the default LLM timeout to ${llmTimeoutMs}ms for the diagnostic run"
+    try {
+        $llmConfig = Get-DefaultLLMConfig -Headers $headers
+        $llmConfigId = ConvertTo-Int64OrZero -Value $llmConfig.id
+        if ($llmConfigId -le 0) { throw "the default LLM configuration has no id" }
+    } catch {
+        $summary = Get-ApiErrorSummary -ErrorRecord $_
+        Write-Host "LLM configuration lookup failed: $summary" -ForegroundColor Red
+        throw "could not load the default LLM configuration"
+    }
+    try {
+        # PATCH is partial: only timeout_ms changes, so the server preserves the
+        # seeded base_url/model/api_key and every other stored field.
+        Set-DefaultLLMTimeout -Headers $headers -ConfigId $llmConfigId -TimeoutMs $llmTimeoutMs | Out-Null
+    } catch {
+        $summary = Get-ApiErrorSummary -ErrorRecord $_
+        Write-Host "LLM timeout update failed: $summary" -ForegroundColor Red
+        throw "could not set the default LLM timeout_ms=$llmTimeoutMs"
+    }
+    Write-Host ("llm_timeout_ms={0}" -f $llmTimeoutMs)
+
     Write-Step "Loading the runtime-diagnostic agent profile"
     $profilesResponse = Invoke-Api -Method Get -Uri "$apiBaseUrl/api/agents/profiles" -Headers $headers -TimeoutSec 20
     $profile = $null
@@ -602,8 +696,8 @@ try {
     }
     Write-Host "Run finished: status=$runStatus terminal_reason=$terminalReason"
 
-    Write-Step "Reading the agent channel event snapshot"
-    $eventItems = @(Get-AgentEventItems -Headers $headers -SessionId $script:sessionId)
+    Write-Step "Reading the agent channel event snapshot (retrying for run_finished)"
+    $eventItems = @(Wait-AgentEventKind -Headers $headers -SessionId $script:sessionId -Kind "run_finished" -Attempts $runFinishedWaitAttempts -IntervalSeconds $runFinishedWaitIntervalSeconds)
     $script:eventItems = $eventItems
 
     $kinds = @()
