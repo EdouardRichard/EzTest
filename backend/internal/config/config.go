@@ -21,16 +21,20 @@ type LLMSeed struct {
 
 // Config is the process configuration. It is resolved once at startup.
 type Config struct {
-	Env                 string
-	HTTPAddr            string
-	WebOrigin           string
-	DatabaseURL         string
-	TestDatabaseURL     string
-	AdminUsername       string
-	AdminPassword       string
-	SecretKeys          map[int][]byte
-	SecretKeyActive     int
-	StorageDir          string
+	Env             string
+	HTTPAddr        string
+	WebOrigin       string
+	DatabaseURL     string
+	TestDatabaseURL string
+	AdminUsername   string
+	AdminPassword   string
+	SecretKeys      map[int][]byte
+	SecretKeyActive int
+	StorageDir      string
+	// OpenAPIPath locates the hand-maintained OpenAPI document served by
+	// GET /api/openapi.yaml. It is relative to the process working directory by
+	// default so the deployed image only needs to ship the file at that path.
+	OpenAPIPath         string
 	EnableTestEndpoints bool
 	LogLevel            slog.Level
 	LLMSeed             LLMSeed
@@ -48,6 +52,7 @@ func Load(getenv func(string) string) (Config, error) {
 		AdminUsername:   strings.TrimSpace(getenv("EZTEST_ADMIN_USERNAME")),
 		AdminPassword:   getenv("EZTEST_ADMIN_PASSWORD"),
 		StorageDir:      valueOr(getenv, "EZTEST_STORAGE_DIR", ".data/objects"),
+		OpenAPIPath:     valueOr(getenv, "EZTEST_OPENAPI_PATH", "docs/openapi/p0.yaml"),
 		LLMSeed: LLMSeed{
 			BaseURL: strings.TrimSpace(getenv("llm_base_url")),
 			Key:     strings.TrimSpace(getenv("llm_key")),

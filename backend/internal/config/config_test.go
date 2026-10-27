@@ -53,6 +53,9 @@ func TestLoadRemainingDefaults(t *testing.T) {
 	if cfg.StorageDir != ".data/objects" {
 		t.Fatalf("StorageDir=%q", cfg.StorageDir)
 	}
+	if cfg.OpenAPIPath != "docs/openapi/p0.yaml" {
+		t.Fatalf("OpenAPIPath=%q", cfg.OpenAPIPath)
+	}
 	if cfg.LogLevel != slog.LevelInfo {
 		t.Fatalf("LogLevel=%v", cfg.LogLevel)
 	}

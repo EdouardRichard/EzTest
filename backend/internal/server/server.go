@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -85,6 +86,9 @@ func New(cfg config.Config, logger *slog.Logger, deps Dependencies) http.Handler
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
 	mux.HandleFunc("GET /api/health", handleAPIHealth(deps.Pinger, deps.LLMConfigs))
+	// The OpenAPI document is public (see requiresAuthentication) so tooling can
+	// discover the API without a bearer token.
+	mux.HandleFunc("GET /api/openapi.yaml", handleOpenAPIDocument(cfg.OpenAPIPath))
 	if deps.Auth != nil {
 		identityhttp.RegisterAuthRoutes(mux, deps.Auth, identityhttp.NewLoginLimiter(time.Now), deps.Audit)
 	}
@@ -167,6 +171,25 @@ func authenticatedAPI(authenticator identityhttp.Authenticator) func(http.Handle
 			}
 			authenticate.ServeHTTP(w, r)
 		})
+	}
+}
+
+// openAPIContentType is the media type of the hand-maintained OpenAPI document.
+const openAPIContentType = "application/yaml"
+
+// handleOpenAPIDocument serves the hand-maintained OpenAPI document from path.
+// A missing or unreadable file is a 404 in the shared error envelope rather
+// than a 500: the deployment simply did not ship the document.
+func handleOpenAPIDocument(path string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		document, err := os.ReadFile(path)
+		if err != nil {
+			platform.WriteError(w, r, http.StatusNotFound, platform.CodeNotFound, "openapi document not found")
+			return
+		}
+		w.Header().Set("Content-Type", openAPIContentType)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(document)
 	}
 }
 
