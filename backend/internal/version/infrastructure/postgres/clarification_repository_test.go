@@ -63,8 +63,7 @@ func TestClarificationSessionRepository(t *testing.T) {
 		t.Fatalf("GetActiveSession: %v", err)
 	}
 	if active == nil || active.ID != session.ID || active.Status != domain.SessionActive ||
-		active.StartedBy != 42 || !active.StartedAt.Equal(session.StartedAt) ||
-		!active.StartedAt.Equal(session.StartedAt) {
+		active.StartedBy != 42 || !active.StartedAt.Equal(session.StartedAt) {
 		t.Fatalf("active session = %+v", active)
 	}
 	if missing, err := clar.GetActiveSession(ctx, otherVersion.ID); err != nil || missing != nil {

@@ -46,6 +46,10 @@ const (
 // MaxClarificationMessageChars bounds one clarification message (spec §7.5).
 const MaxClarificationMessageChars = 5000
 
+// MaxClarificationContextSummaryBytes bounds the context summary written by the
+// context.summary_update tool (spec §8.3: at most 20 KiB).
+const MaxClarificationContextSummaryBytes = 20 << 10
+
 // clarificationCountPageSize is the page size used by the overview counters. The
 // repository exposes no aggregate-count method, so the service walks the
 // keyset pages; the bound keeps every request to a handful of queries.
@@ -166,6 +170,11 @@ func (s *ClarificationService) StartSession(ctx context.Context, versionID int64
 			fmt.Sprintf("version %d already has an active clarification session", versionID))
 	}
 
+	// AgentSessions has no delete primitive: if the P3 insert below fails (unique
+	// active-index race or database error) this P1 session is left without runs.
+	// The orphan is bounded (a single session row, no active P3 row) and the P8
+	// cleanup sweeps it; do not add a delete primitive for this (Lead ruling,
+	// Task 10 fix round 1).
 	agentSessionID, err := s.agents.Create(ctx, clarificationDialogProfile,
 		fmt.Sprintf("Clarification for version %d", versionID), actor,
 		clarificationChannel(versionID), strconv.FormatInt(versionID, 10))
@@ -284,25 +293,32 @@ func (s *ClarificationService) StartAnalysis(ctx context.Context, versionID int6
 		"Analyze the requirements of version %d. Call version.context_get with versionId=%q first, then record relations, questions and decisions for the version.",
 		versionID, strconv.FormatInt(versionID, 10))
 	return s.startOneShot(ctx, versionID, actor, requirementAnalysisProfile,
-		fmt.Sprintf("Requirement analysis for version %d", versionID), instruction, false)
+		fmt.Sprintf("Requirement analysis for version %d", versionID), instruction, false, nil)
 }
 
-// StartRecon starts a one-shot context-recon run. It requires an active
-// clarification session and no running agent; the instruction is delivered as a
-// text part so multimodal parts can be appended by the caller/adapters (spec
-// §7.5/§8.4).
+// StartRecon starts a one-shot context-recon run with the instruction text part
+// only. It delegates to StartReconWithParts with no extra parts.
 func (s *ClarificationService) StartRecon(ctx context.Context, versionID int64, actor int64) (StartRunResult, error) {
+	return s.StartReconWithParts(ctx, versionID, nil, actor)
+}
+
+// StartReconWithParts starts a one-shot context-recon run whose message carries
+// the instruction text part first, followed by extraParts (attachment text
+// summaries and image_ref parts, spec §8.4). T13 builds the parts from the
+// version's attachments and calls this method. It requires an active
+// clarification session and no running agent (spec §7.5/§8.4).
+func (s *ClarificationService) StartReconWithParts(ctx context.Context, versionID int64, extraParts []AgentPart, actor int64) (StartRunResult, error) {
 	instruction := fmt.Sprintf(
 		"Recon the context of version %d. Call version.context_get with versionId=%q first, then inspect attachments and the bound code repository, update the context summary and record questions.",
 		versionID, strconv.FormatInt(versionID, 10))
 	return s.startOneShot(ctx, versionID, actor, contextReconProfile,
-		fmt.Sprintf("Context recon for version %d", versionID), instruction, true)
+		fmt.Sprintf("Context recon for version %d", versionID), instruction, true, extraParts)
 }
 
 // startOneShot creates a one-shot P1 agent session on the version channel and
-// starts its run. Analyze sends text; recon sends a single text part through
-// StartParts.
-func (s *ClarificationService) startOneShot(ctx context.Context, versionID, actor int64, profileKey, title, instruction string, multimodal bool) (StartRunResult, error) {
+// starts its run. Analyze sends text; recon sends the instruction as the first
+// part followed by extraParts through StartParts.
+func (s *ClarificationService) startOneShot(ctx context.Context, versionID, actor int64, profileKey, title, instruction string, multimodal bool, extraParts []AgentPart) (StartRunResult, error) {
 	if _, err := s.ensureVersion(ctx, versionID); err != nil {
 		return StartRunResult{}, err
 	}
@@ -321,6 +337,10 @@ func (s *ClarificationService) startOneShot(ctx context.Context, versionID, acto
 		return StartRunResult{}, errors.New("version: agent sessions are not configured")
 	}
 
+	// AgentSessions has no delete primitive: a failure after this Create leaves an
+	// orphan one-shot P1 session with no runs. It is bounded (single row) and the
+	// P8 cleanup sweeps it; do not add a delete primitive for this (Lead ruling,
+	// Task 10 fix round 1).
 	agentSessionID, err := s.agents.Create(ctx, profileKey, title, actor,
 		clarificationChannel(versionID), strconv.FormatInt(versionID, 10))
 	if err != nil {
@@ -328,8 +348,10 @@ func (s *ClarificationService) startOneShot(ctx context.Context, versionID, acto
 	}
 	var runID int64
 	if multimodal {
-		runID, err = s.agents.StartParts(ctx, agentSessionID,
-			[]AgentPart{{Type: "text", Text: instruction}}, actor)
+		parts := make([]AgentPart, 0, 1+len(extraParts))
+		parts = append(parts, AgentPart{Type: "text", Text: instruction})
+		parts = append(parts, extraParts...)
+		runID, err = s.agents.StartParts(ctx, agentSessionID, parts, actor)
 	} else {
 		runID, err = s.agents.StartText(ctx, agentSessionID, instruction, actor)
 	}
@@ -592,15 +614,7 @@ func (s *ClarificationService) CreateDecision(ctx context.Context, versionID int
 		s.publishDecision(ctx, versionID, decision, "decision.proposed", actor, source)
 	} else {
 		s.publishDecision(ctx, versionID, decision, "decision.decided", actor, source)
-		if linkedQuestion != nil && linkedQuestion.Status == domain.QuestionOpen {
-			answered := *linkedQuestion
-			answered.Status = domain.QuestionAnswered
-			answered.Answer = decision.Decision
-			answered.AnsweredVia = domain.AnsweredViaUI
-			answered.AnsweredBy = decision.DecidedBy
-			answered.AnsweredAt = decision.DecidedAt
-			s.publishQuestion(ctx, versionID, &answered, actor, source)
-		}
+		s.publishAnsweredLinkedQuestion(ctx, versionID, linkedQuestion, decision, actor, source)
 	}
 	return decision, nil
 }
@@ -647,17 +661,36 @@ func (s *ClarificationService) Decide(ctx context.Context, versionID, decisionID
 		return nil, err
 	}
 	s.publishDecision(ctx, versionID, &candidate, "decision.decided", actor, domain.SourceUser)
-	if candidate.Status == domain.DecisionAccepted &&
-		linkedQuestion != nil && linkedQuestion.Status == domain.QuestionOpen {
-		answered := *linkedQuestion
-		answered.Status = domain.QuestionAnswered
-		answered.Answer = candidate.Decision
-		answered.AnsweredVia = domain.AnsweredViaUI
-		answered.AnsweredBy = candidate.DecidedBy
-		answered.AnsweredAt = candidate.DecidedAt
-		s.publishQuestion(ctx, versionID, &answered, actor, domain.SourceUser)
+	if candidate.Status == domain.DecisionAccepted {
+		s.publishAnsweredLinkedQuestion(ctx, versionID, linkedQuestion, &candidate, actor, domain.SourceUser)
 	}
 	return &candidate, nil
+}
+
+// publishAnsweredLinkedQuestion publishes clarification.question_updated for the
+// question linked to an accepted decision only when the repository transaction
+// actually moved it from open to answered. The repository answers a linked
+// question only while it is still open, so a concurrent dismissal (or answer)
+// makes its update a no-op; publishing the stale pre-read snapshot would then be
+// a phantom event. The post-commit re-read is best-effort like the event itself:
+// a failure is logged and swallowed because the decision write already committed.
+func (s *ClarificationService) publishAnsweredLinkedQuestion(ctx context.Context, versionID int64, linked *Question, decision *Decision, actor int64, source string) {
+	if linked == nil || linked.Status != domain.QuestionOpen {
+		return
+	}
+	answered, err := s.loadQuestion(ctx, versionID, linked.ID)
+	if err != nil {
+		slog.WarnContext(ctx, "clarification decision linked question re-read failed",
+			"question_id", linked.ID,
+			"version_id", versionID,
+			"error", err,
+		)
+		return
+	}
+	if answered.Status != domain.QuestionAnswered {
+		return
+	}
+	s.publishQuestion(ctx, versionID, answered, actor, source)
 }
 
 // CurrentSession returns the active session of the version, or nil when none is
@@ -670,13 +703,33 @@ func (s *ClarificationService) CurrentSession(ctx context.Context, versionID int
 }
 
 // UpdateContextSummary writes the active session's context summary. It is the
-// service entry point of the agent's context.summary_update tool (spec §8.3);
-// the caller bounds the summary length.
+// service entry point of the agent's context.summary_update tool (spec §8.3):
+// the summary is bounded to 20 KiB and the successful write publishes
+// clarification.context_updated after the repository call returns.
 func (s *ClarificationService) UpdateContextSummary(ctx context.Context, versionID int64, summary string, actor int64) error {
 	if _, err := s.ensureVersion(ctx, versionID); err != nil {
 		return err
 	}
-	return s.repo.UpdateContextSummary(ctx, versionID, summary, actor)
+	if len(summary) > MaxClarificationContextSummaryBytes {
+		return domain.NewInvalid("summary", "invalid_context_summary",
+			fmt.Sprintf("context summary must be at most %d bytes", MaxClarificationContextSummaryBytes))
+	}
+	if err := s.repo.UpdateContextSummary(ctx, versionID, summary, actor); err != nil {
+		return err
+	}
+	s.publish(ctx, VersionEvent{
+		VersionID: versionID,
+		Type:      "clarification.context_updated",
+		Summary:   "clarification context updated",
+		ActorID:   actor,
+		Source:    domain.SourceAI,
+		Detail: map[string]any{
+			"versionId": eventID(versionID),
+			"tool":      "context.summary_update",
+			"actorId":   actor,
+		},
+	})
+	return nil
 }
 
 // ListQuestions returns one page of a version's questions ordered by id

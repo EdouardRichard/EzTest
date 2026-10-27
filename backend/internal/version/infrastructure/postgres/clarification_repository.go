@@ -37,7 +37,6 @@ const (
 
 	clarificationActiveSessionIndex = "uq_clarification_active"
 
-	clarificationSessionsPrimaryKey  = "clarification_sessions_pkey"
 	clarificationQuestionsPrimaryKey = "clarification_questions_pkey"
 	decisionsPrimaryKey              = "decisions_pkey"
 )
