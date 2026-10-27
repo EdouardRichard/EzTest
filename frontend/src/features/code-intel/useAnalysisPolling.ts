@@ -74,6 +74,12 @@ export function useAnalysisPolling(
       if (requestRef.current !== requestId) return null
       setAnalysis(latest ?? null)
       setError(null)
+      // A completed/failed (or missing) analysis means the cap hint is stale,
+      // even when the reads that discover it come from refresh()/SSE.
+      if (latest === null || !isActiveAnalysis(latest.status)) {
+        exhaustedRef.current = false
+        setExhausted(false)
+      }
       return latest ?? null
     } catch (caught) {
       if (requestRef.current !== requestId) return null

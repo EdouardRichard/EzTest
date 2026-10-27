@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it } from "vitest"
 
 import type { UnmappedChange } from "./types"
 
-import { UnmappedChanges } from "./UnmappedChanges"
+import { MAX_UNMAPPED_ENTRIES, UnmappedChanges } from "./UnmappedChanges"
 
 const ENTRIES: UnmappedChange[] = [
   {
@@ -67,5 +67,22 @@ describe("UnmappedChanges", () => {
 
     render(<UnmappedChanges entries={[]} />)
     expect(screen.getByText("没有未映射变更")).toBeTruthy()
+  })
+
+  it("does not claim truncation when the list is exactly at the cap", () => {
+    const entries: UnmappedChange[] = Array.from(
+      { length: MAX_UNMAPPED_ENTRIES },
+      (_value, index) => ({
+        path: `src/generated/file-${index}.ts`,
+        status: "M",
+        reason: "no_fact_or_anchor",
+        suggestion: "",
+      }),
+    )
+
+    render(<UnmappedChanges entries={entries} />)
+
+    expect(screen.getByText(`共 ${MAX_UNMAPPED_ENTRIES} 个文件`)).toBeTruthy()
+    expect(screen.queryByText(/超过上限/)).toBeNull()
   })
 })

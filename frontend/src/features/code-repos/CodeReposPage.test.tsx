@@ -91,10 +91,27 @@ function repoSummary(overrides: Partial<RepoSummary> = {}): RepoSummary {
 
 const UNINDEXED_SUMMARY = repoSummary({ lastIndexedAt: null, index: null })
 
+const RUNNING_INDEX_RUN: IndexRun = {
+  ...DONE_INDEX_RUN,
+  status: "running",
+  stats: undefined,
+  finishedAt: null,
+}
+
+function runningSummary(): RepoSummary {
+  return repoSummary({ index: RUNNING_INDEX_RUN })
+}
+
 /** Resolves the initial effect promises while fake timers are installed. */
 async function flushPromises(): Promise<void> {
   await act(async () => {
     await vi.advanceTimersByTimeAsync(0)
+  })
+}
+
+async function advanceTimers(ms: number): Promise<void> {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(ms)
   })
 }
 
@@ -551,5 +568,123 @@ describe("CodeReposPage", () => {
 
     const alert = await screen.findByRole("alert")
     expect(alert.textContent).toContain("duplicate_key")
+  })
+
+  it("polls an active index run discovered on the initial list load", async () => {
+    vi.useFakeTimers()
+    try {
+      indexMocks.getCodeRepos.mockResolvedValue([runningSummary()])
+      indexMocks.getLatestIndexRun.mockResolvedValueOnce(DONE_INDEX_RUN)
+
+      render(<CodeReposPage />)
+      await flushPromises()
+
+      expect(indexMocks.startIndex).not.toHaveBeenCalled()
+      expect(screen.getByText("索引中")).toBeTruthy()
+      expect(indexMocks.getLatestIndexRun).not.toHaveBeenCalled()
+
+      await advanceTimers(1500)
+      expect(indexMocks.getLatestIndexRun).toHaveBeenCalledWith(REPO.id)
+      expect(screen.getByText("已索引")).toBeTruthy()
+
+      // The terminal status ends the 1.5s poll for the discovered run.
+      await advanceTimers(6000)
+      expect(indexMocks.getLatestIndexRun).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("polls the active run after a 409 index trigger and keeps the reason toast", async () => {
+    vi.useFakeTimers()
+    try {
+      indexMocks.startIndex.mockRejectedValueOnce(indexError(409, "index_in_progress"))
+      indexMocks.getCodeRepos
+        .mockResolvedValueOnce([UNINDEXED_SUMMARY])
+        .mockResolvedValue([runningSummary()])
+      indexMocks.getLatestIndexRun
+        .mockResolvedValueOnce(RUNNING_INDEX_RUN)
+        .mockResolvedValue(DONE_INDEX_RUN)
+
+      render(<CodeReposPage />)
+      await flushPromises()
+      fireEvent.click(screen.getByRole("button", { name: "刷新索引" }))
+      await flushPromises()
+
+      const toast = screen.getByRole("alert")
+      expect(toast.textContent).toContain("已有索引任务在运行")
+      // The 409 recovery reload discovered the run another tab/admin started.
+      expect(indexMocks.getCodeRepos.mock.calls.length).toBeGreaterThanOrEqual(2)
+      expect(screen.getByText("索引中")).toBeTruthy()
+
+      await advanceTimers(1500)
+      expect(indexMocks.getLatestIndexRun).toHaveBeenCalledTimes(1)
+      expect(screen.getByText("索引中")).toBeTruthy()
+
+      await advanceTimers(1500)
+      expect(indexMocks.getLatestIndexRun).toHaveBeenCalledTimes(2)
+      expect(screen.getByText("已索引")).toBeTruthy()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("clears the exhausted hint when a refresh settles with a terminal run", async () => {
+    vi.useFakeTimers()
+    try {
+      indexMocks.startIndex.mockResolvedValue({
+        runId: RUN_ID,
+        status: "queued",
+        commit: INDEX_COMMIT,
+      })
+      indexMocks.getLatestIndexRun.mockResolvedValue(RUNNING_INDEX_RUN)
+
+      render(<CodeReposPage />)
+      await flushPromises()
+      fireEvent.click(screen.getByRole("button", { name: "刷新索引" }))
+      await flushPromises()
+
+      await advanceTimers(1500 * 60)
+      expect(indexMocks.getLatestIndexRun).toHaveBeenCalledTimes(60)
+      expect(screen.getByText(/已停止自动刷新/)).toBeTruthy()
+
+      // A manual refresh that observes the terminal run clears the stale hint.
+      indexMocks.getLatestIndexRun.mockResolvedValue(DONE_INDEX_RUN)
+      indexMocks.getCodeRepos.mockResolvedValue([repoSummary()])
+      fireEvent.click(screen.getByRole("button", { name: "刷新" }))
+      await flushPromises()
+
+      expect(screen.queryByText(/已停止自动刷新/)).toBeNull()
+      expect(screen.getByText("已索引")).toBeTruthy()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("clears a previous index read error after a successful load", async () => {
+    indexMocks.getCodeRepos.mockRejectedValueOnce(new Error("索引状态读取失败"))
+    mocks.createCodeRepo.mockResolvedValue({
+      ...REPO,
+      id: 2,
+      key: "eztest-web",
+      name: "EzTest Web",
+      localPath: "D:/repo2",
+      fixedBranch: "main",
+    })
+
+    render(<CodeReposPage />)
+
+    const toast = await screen.findByRole("alert")
+    expect(toast.textContent).toContain("索引状态读取失败")
+
+    // Creating a repository ends in a successful list/index read, which
+    // supersedes the stale read error without a manual dismiss.
+    fireEvent.click(screen.getByRole("button", { name: "新建代码仓" }))
+    fireEvent.change(screen.getByLabelText("标识"), { target: { value: "eztest-web" } })
+    fireEvent.change(screen.getByLabelText("名称"), { target: { value: "EzTest Web" } })
+    fireEvent.change(screen.getByLabelText("本地路径"), { target: { value: "D:/repo2" } })
+    fireEvent.click(screen.getByRole("button", { name: "保存" }))
+
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull())
   })
 })
