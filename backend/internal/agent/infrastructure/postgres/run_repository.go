@@ -145,10 +145,11 @@ func (r *RunRepository) Active(ctx context.Context, sessionID int64) (agent.Run,
 	return run, nil
 }
 
-// Latest returns the session's most recent run.
+// Latest returns the session's newest terminal run. A running run is reported
+// by Active instead, so it is never returned here.
 func (r *RunRepository) Latest(ctx context.Context, sessionID int64) (agent.Run, error) {
 	run, err := scanRun(r.pool.QueryRow(ctx,
-		`SELECT `+runColumnList+` FROM agent_runs WHERE session_id = $1 ORDER BY id DESC LIMIT 1`,
+		`SELECT `+runColumnList+` FROM agent_runs WHERE session_id = $1 AND status <> 'running' ORDER BY id DESC LIMIT 1`,
 		sessionID))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
