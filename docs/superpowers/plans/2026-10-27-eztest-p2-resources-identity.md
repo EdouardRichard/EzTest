@@ -236,7 +236,7 @@ type AccountRepository interface {
     UpdateAccount(ctx context.Context, a *Account) error
     DeleteAccount(ctx context.Context, id int64) error
     CountAccesses(ctx context.Context, accountID int64) (int, error)
-    CountSessions(ctx context.Context, accountID int64) (int, error)
+    CountSessionsByAccount(ctx context.Context, accountID int64) (int, error)
 }
 type AccessRepository interface {
     CreateAccess(ctx context.Context, a *Access) error
@@ -244,7 +244,7 @@ type AccessRepository interface {
     ListAccesses(ctx context.Context, accountID int64) ([]Access, error)
     UpdateAccess(ctx context.Context, a *Access) error
     DeleteAccess(ctx context.Context, id int64) error
-    CountSessions(ctx context.Context, accessID int64) (int, error)
+    CountSessionsByAccess(ctx context.Context, accessID int64) (int, error)
 }
 type SessionRepository interface {
     CreateSession(ctx context.Context, s *Session) error
