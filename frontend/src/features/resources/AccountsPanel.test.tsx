@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const mocks = vi.hoisted(() => ({
@@ -95,6 +95,16 @@ const ACCESSES = [
     sessionTtlSeconds: 3600,
   }),
 ]
+
+function deferred<T>() {
+  let resolve: (value: T) => void = () => {}
+  let reject: (reason?: unknown) => void = () => {}
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
 
 describe("AccountsPanel", () => {
   beforeEach(() => {
@@ -249,5 +259,62 @@ describe("AccountsPanel", () => {
     )
     expect(await screen.findByRole("status")).toBeTruthy()
     await waitFor(() => expect(mocks.listAccesses).toHaveBeenCalledTimes(2))
+  })
+
+  it("clears the previous account's access rows immediately and keeps them cleared after a failed load", async () => {
+    const serviceLoad = deferred<AccessDTO[]>()
+    mocks.listAccesses.mockResolvedValueOnce(ACCESSES).mockReturnValueOnce(serviceLoad.promise)
+
+    render(<AccountsPanel canWrite />)
+    await screen.findByText("QA 01")
+
+    fireEvent.click(screen.getByRole("button", { name: "QA 01" }))
+    await waitFor(() => expect(mocks.listAccesses).toHaveBeenCalledWith(3, { limit: 100 }))
+    expect(await screen.findByRole("button", { name: "编辑 Access 8" })).toBeTruthy()
+    expect(screen.getByText("Shop")).toBeTruthy()
+
+    fireEvent.click(screen.getByRole("button", { name: "SVC" }))
+    await waitFor(() => expect(mocks.listAccesses).toHaveBeenCalledWith(4, { limit: 100 }))
+
+    // Account B is still loading: account A's rows and their edit targets must
+    // already be gone so no click can address A's access id under B.
+    expect(screen.queryByRole("button", { name: "编辑 Access 8" })).toBeNull()
+    expect(screen.queryByText("Shop")).toBeNull()
+    expect(screen.getByText("正在加载 Access…")).toBeTruthy()
+
+    await act(async () => {
+      serviceLoad.reject(new Error("access load failed"))
+      await serviceLoad.promise.catch(() => undefined)
+    })
+
+    expect((await screen.findByRole("alert")).textContent).toContain("access load failed")
+    expect(screen.queryByRole("button", { name: "编辑 Access 8" })).toBeNull()
+    expect(screen.queryByText("Shop")).toBeNull()
+    expect(screen.getByText("暂无 Access")).toBeTruthy()
+  })
+
+  it("ignores a late response from the previously selected account", async () => {
+    const qaLoad = deferred<AccessDTO[]>()
+    mocks.listAccesses
+      .mockReturnValueOnce(qaLoad.promise)
+      .mockResolvedValueOnce([makeAccess(11, 4, 2)])
+
+    render(<AccountsPanel canWrite />)
+    await screen.findByText("QA 01")
+
+    fireEvent.click(screen.getByRole("button", { name: "QA 01" }))
+    await waitFor(() => expect(mocks.listAccesses).toHaveBeenCalledWith(3, { limit: 100 }))
+
+    fireEvent.click(screen.getByRole("button", { name: "SVC" }))
+    await waitFor(() => expect(mocks.listAccesses).toHaveBeenCalledWith(4, { limit: 100 }))
+    expect(await screen.findByRole("button", { name: "编辑 Access 11" })).toBeTruthy()
+
+    await act(async () => {
+      qaLoad.resolve(ACCESSES)
+      await qaLoad.promise
+    })
+
+    expect(screen.queryByRole("button", { name: "编辑 Access 8" })).toBeNull()
+    expect(screen.getByRole("button", { name: "编辑 Access 11" })).toBeTruthy()
   })
 })

@@ -1,7 +1,7 @@
 "use client"
 
 import { KeyRound, Pencil, Plus, RefreshCw, Users } from "lucide-react"
-import { type FormEvent, useCallback, useEffect, useState } from "react"
+import { type FormEvent, useCallback, useEffect, useRef, useState } from "react"
 
 import { EmptyState } from "@/components/ui/EmptyState"
 import { StatusBadge } from "@/components/ui/StatusBadge"
@@ -132,6 +132,8 @@ export function AccountsPanel({ canWrite }: AccountsPanelProps) {
   const [saving, setSaving] = useState(false)
 
   const [accesses, setAccesses] = useState<AccessDTO[]>([])
+  const [accessesAccountId, setAccessesAccountId] = useState<number | null>(null)
+  const accessRequestIdRef = useRef(0)
   const [accessLoading, setAccessLoading] = useState(false)
   const [accessError, setAccessError] = useState("")
   const [accessNotice, setAccessNotice] = useState("")
@@ -161,14 +163,23 @@ export function AccountsPanel({ canWrite }: AccountsPanelProps) {
   }, [])
 
   const loadAccesses = useCallback(async (accountId: number) => {
+    const requestId = accessRequestIdRef.current + 1
+    accessRequestIdRef.current = requestId
     setAccessLoading(true)
     setAccessError("")
     try {
-      setAccesses(await listAccesses(accountId, { limit: ACCESS_PAGE_LIMIT }))
+      const loaded = await listAccesses(accountId, { limit: ACCESS_PAGE_LIMIT })
+      if (accessRequestIdRef.current !== requestId) return
+      setAccesses(loaded)
+      setAccessesAccountId(accountId)
     } catch (caught) {
+      if (accessRequestIdRef.current !== requestId) return
+      // A failed load must not leave rows from a previously selected account.
+      setAccesses([])
+      setAccessesAccountId(null)
       setAccessError(describeError(caught))
     } finally {
-      setAccessLoading(false)
+      if (accessRequestIdRef.current === requestId) setAccessLoading(false)
     }
   }, [])
 
@@ -178,10 +189,14 @@ export function AccountsPanel({ canWrite }: AccountsPanelProps) {
   }, [loadAccounts, loadSystems])
 
   useEffect(() => {
-    if (selectedAccountId === null) {
-      setAccesses([])
-      return
-    }
+    // A selection change invalidates both the rows loaded for the previous
+    // account and any in-flight request that could still fill them.
+    accessRequestIdRef.current += 1
+    setAccesses([])
+    setAccessesAccountId(null)
+    setAccessError("")
+    setAccessLoading(false)
+    if (selectedAccountId === null) return
     void loadAccesses(selectedAccountId)
   }, [selectedAccountId, loadAccesses])
 
@@ -190,11 +205,23 @@ export function AccountsPanel({ canWrite }: AccountsPanelProps) {
       ? null
       : (accounts.find((account) => account.id === selectedAccountId) ?? null)
 
+  // Only rows proven to belong to the current account are rendered, so a late
+  // response for a previous selection can never surface under the new one.
+  const visibleAccesses =
+    selectedAccount !== null && accessesAccountId === selectedAccount.id ? accesses : []
+
   function systemName(systemId: number): string {
     return systems.find((system) => system.id === systemId)?.name ?? `#${systemId}`
   }
 
   function selectAccount(account: AccountDTO) {
+    if (account.id !== selectedAccountId) {
+      // Clear in the same update as the selection: while the new account loads,
+      // no row or edit target from the previous account may remain clickable.
+      setAccesses([])
+      setAccessesAccountId(null)
+      setAccessLoading(true)
+    }
     setSelectedAccountId(account.id)
     setAccessFormOpen(false)
     setEditingAccess(null)
@@ -596,11 +623,11 @@ export function AccountsPanel({ canWrite }: AccountsPanelProps) {
             />
           ) : null}
 
-          {accessLoading && accesses.length === 0 ? (
+          {accessLoading && visibleAccesses.length === 0 ? (
             <p className="rounded-xl border border-dashed border-border px-4 py-6 text-center text-sm text-muted-foreground">
               正在加载 Access…
             </p>
-          ) : accesses.length === 0 ? (
+          ) : visibleAccesses.length === 0 ? (
             <EmptyState
               icon={KeyRound}
               title="暂无 Access"
@@ -640,7 +667,7 @@ export function AccountsPanel({ canWrite }: AccountsPanelProps) {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-border">
-                  {accesses.map((access) => (
+                  {visibleAccesses.map((access) => (
                     <tr key={access.id}>
                       <td className="px-2.5 py-2">{systemName(access.systemId)}</td>
                       <td className="px-2.5 py-2 text-muted-foreground">
