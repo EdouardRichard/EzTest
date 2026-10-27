@@ -1,0 +1,1515 @@
+openapi: 3.0.3
+info:
+  title: EzTest P0 API
+  version: 0.1.0
+  description: |
+    Hand-maintained OpenAPI document for the EzTest P0 foundation phase.
+
+    Conventions:
+    - Successful responses use the `{"data": ...}` envelope. List endpoints add
+      `next_cursor` (opaque, omitted when there is no next page or empty string)
+      and `has_more`. The SSE snapshot uses its own nested shape.
+    - Errors use `{"error": {"code", "message", "request_id", "retryable", "details"}}`
+      with the closed set of codes listed in the ErrorEnvelope schema.
+    - Every response echoes the request ID in the `X-Request-ID` header (a
+      client-supplied `^[A-Za-z0-9_-]{8,128}$` value is reused, otherwise a UUID
+      is generated). Clients may send `X-Request-ID` on any request.
+    - Authenticated write endpoints accept an optional `Idempotency-Key`
+      (`^[A-Za-z0-9_-]{8,128}$`). Replaying the same key and body returns the
+      stored response with `Idempotent-Replayed: true`; a different body is 409
+      `idempotency_conflict`. JSON responses larger than 1 MiB and SSE responses
+      are not cached.
+    - Bearer tokens are opaque strings returned once by `POST /api/auth/login`;
+      the server stores only their hash. No endpoint ever returns a password,
+      API key, ciphertext or custom header value.
+    - Times are RFC 3339 UTC. Pagination is `limit` 1-100 (default 20) plus an
+      opaque `cursor`.
+
+    This document is served publicly at `GET /api/openapi.yaml`; it is the same
+    file under `docs/openapi/p0.yaml` in the repository.
+  license:
+    name: Apache-2.0
+servers:
+  - url: http://localhost:13333
+    description: Local development API
+tags:
+  - name: auth
+  - name: users
+  - name: llm
+  - name: stream
+  - name: storage
+  - name: audit
+  - name: health
+security: []
+paths:
+  /api/auth/login:
+    post:
+      tags: [auth]
+      summary: Authenticate a user and return a bearer token
+      description: |
+        Public. Five failed attempts for the same client IP and username within a
+        minute lock the pair for a minute and return 429 with `Retry-After: 60`.
+      operationId: login
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            example:
+              username: admin
+              password: correct-horse-battery
+      responses:
+        '200':
+          description: The raw bearer token (returned exactly once), its expiry and the user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/auth/logout:
+    post:
+      tags: [auth]
+      summary: Revoke the current bearer token
+      operationId: logout
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+      responses:
+        '204':
+          description: The token was revoked.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/auth/me:
+    get:
+      tags: [auth]
+      summary: Return the authenticated user
+      operationId: getCurrentUser
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+      responses:
+        '200':
+          description: The current user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+  /api/users:
+    get:
+      tags: [users]
+      summary: List users (admin only)
+      description: Ordered by ID ascending.
+      operationId: listUsers
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of users.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserList'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [users]
+      summary: Create a regular user (admin only)
+      description: P0 only creates `role=user`; the administrator is seeded at startup.
+      operationId: createUser
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateUserRequest'
+      responses:
+        '201':
+          description: The created user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/users/{id}:
+    get:
+      tags: [users]
+      summary: Get one user (admin only)
+      operationId: getUser
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/UserId'
+      responses:
+        '200':
+          description: The requested user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    patch:
+      tags: [users]
+      summary: Enable or disable a user (admin only)
+      description: |
+        A PATCH only changes `status`. Disabling the acting administrator is a
+        409 `conflict` because P0 has no recovery path.
+      operationId: updateUserStatus
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/UserId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserRequest'
+      responses:
+        '200':
+          description: The updated user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/users/{id}/reset-password:
+    post:
+      tags: [users]
+      summary: Reset a user's password and revoke all of their tokens (admin only)
+      operationId: resetUserPassword
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/UserId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResetPasswordRequest'
+      responses:
+        '204':
+          description: The password was replaced and every token of the user was revoked.
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/admin/llm/configs:
+    get:
+      tags: [llm]
+      summary: List LLM configurations (admin only)
+      description: 'Secrets are masked: only `has_api_key`, `key_version` and header names are returned.'
+      operationId: listLLMConfigs
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+      responses:
+        '200':
+          description: Every configuration (no pagination).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LLMConfigList'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [llm]
+      summary: Create an LLM configuration (admin only)
+      operationId: createLLMConfig
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateLLMConfigRequest'
+      responses:
+        '201':
+          description: The created configuration with secrets masked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LLMConfigEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/admin/llm/configs/{id}:
+    patch:
+      tags: [llm]
+      summary: Update an LLM configuration (admin only)
+      description: |
+        Every field is optional. Omitted `api_key` and `headers` keep their
+        stored values; provided values replace them. The full object is
+        re-encrypted with the active key version.
+      operationId: updateLLMConfig
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/LLMConfigId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateLLMConfigRequest'
+      responses:
+        '200':
+          description: The updated configuration with secrets masked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LLMConfigEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+    delete:
+      tags: [llm]
+      summary: Delete an LLM configuration (admin only)
+      description: Deleting the default configuration leaves `llm_configured=false` until the environment seed runs again on restart.
+      operationId: deleteLLMConfig
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/LLMConfigId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: The configuration was deleted.
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/admin/llm/configs/{id}/catalog/refresh:
+    post:
+      tags: [llm]
+      summary: Refresh the upstream model catalog (admin only)
+      description: |
+        Calls the configuration's `GET {base_url}/v1/models`. On failure the
+        previous cache is kept and the mapped `llm_*` error is returned.
+      operationId: refreshLLMCatalog
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/LLMConfigId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The configuration with the refreshed `model_catalog` and `catalog_fetched_at`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LLMConfigEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+  /api/admin/llm/configs/{id}/test:
+    post:
+      tags: [llm]
+      summary: Run a connectivity test against an LLM configuration (admin only)
+      description: |
+        Non-streaming calls return text, usage and latency. `stream=true`
+        returns normalized `llm.delta` / `llm.done` / `llm.error` SSE frames.
+        Success and failure are audited without the key, prompt or image bytes.
+        `stream=true` requires `stream_enabled=true`; `image=true` requires
+        `multimodal_enabled=true` and attaches the built-in 1x1 PNG.
+      operationId: testLLMConfig
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/LLMConfigId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LLMTestRequest'
+      responses:
+        '200':
+          description: |
+            Non-streaming test result as JSON, or an SSE stream when
+            `stream=true`. SSE frames are `llm.delta`, `llm.done` and
+            `llm.error`; they are not idempotency-cached.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LLMTestResult'
+            text/event-stream:
+              schema:
+                type: string
+              example: |
+                event: llm.delta
+                data: {"delta":"A"}
+
+                event: llm.done
+                data: {"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},"latency_ms":42}
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+  /api/stream/events:
+    get:
+      tags: [stream]
+      summary: Snapshot the newest events of a channel
+      description: |
+        Returns the newest events before `before_seq` plus the channel's current
+        sequence cursor, so a client can render history and then connect
+        `GET /api/stream` without a gap.
+      operationId: getEventSnapshot
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/Channel'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/BeforeSeq'
+      responses:
+        '200':
+          description: The snapshot in the event-stream-specific shape.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventSnapshot'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/stream:
+    get:
+      tags: [stream]
+      summary: Stream channel events as Server-Sent Events
+      description: |
+        Opens a live SSE stream and optionally replays persisted events after a
+        cursor. `Last-Event-ID` (set automatically by browsers on reconnect)
+        takes precedence over `?since`; omit both for live-only. Frames use
+        `id: <seq>`, `event: <type>`, `data: <event envelope>`; the server sends
+        a `: ping` comment every 20 seconds. When the cursor is too old the
+        server emits a synthetic `stream.reset` frame (no id) after which the
+        client must fetch a fresh snapshot. Duplicate seqs are never delivered.
+      operationId: streamEvents
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/Channel'
+        - $ref: '#/components/parameters/Since'
+        - $ref: '#/components/parameters/LastEventID'
+      responses:
+        '200':
+          description: |
+            An endless `text/event-stream`. The `X-Snapshot-Cursor` response
+            header announces the channel's current seq at connect time.
+          headers:
+            X-Snapshot-Cursor:
+              description: The channel's latest seq when the stream opened.
+              schema:
+                type: integer
+                format: int64
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              example: |
+                id: 42
+                event: system.test
+                data: {"seq":42,"channel":"system","type":"system.test","version_id":null,"batch_id":null,"case_id":null,"step_id":null,"agent_role":null,"session_id":null,"ts":"2026-10-27T08:00:00Z","summary":"test","detail":{},"refs":{"evidence":[],"case":[],"requirement":[],"code":[]}}
+
+                : ping
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/admin/stream/test-events:
+    post:
+      tags: [stream]
+      summary: Publish synthetic `system.test` events (admin only, dev/test)
+      description: |
+        Only mounted when `EZTEST_ENABLE_TEST_ENDPOINTS=true`. Publishes `count`
+        events of type `system.test` on channel `system` and returns their seqs.
+      operationId: publishTestEvents
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PublishTestEventsRequest'
+      responses:
+        '200':
+          description: The seqs assigned to the published events.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublishTestEventsResponse'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/admin/storage/objects:
+    post:
+      tags: [storage]
+      summary: Upload a content-addressed object (admin only)
+      description: |
+        The raw request body (at most 10 MiB) is the object; the `Content-Type`
+        header is required and recorded as metadata. The response carries the
+        SHA-256 id used by the download endpoint. P0 has no public URL, GC or
+        retention policy.
+      operationId: uploadObject
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          '*/*':
+            schema:
+              type: string
+              format: binary
+      responses:
+        '201':
+          description: The stored object's content-addressed metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObjectEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/admin/storage/objects/{sha256}:
+    get:
+      tags: [storage]
+      summary: Download an object by SHA-256 (admin only)
+      description: |
+        Streams the stored bytes after re-verifying the content hash. A hash
+        mismatch is `storage_corrupted`; bytes are always served as an
+        attachment with `X-Content-Type-Options: nosniff`.
+      operationId: downloadObject
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/SHA256'
+      responses:
+        '200':
+          description: The raw object bytes with the stored content type.
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+                example: attachment
+            X-Content-Type-Options:
+              schema:
+                type: string
+                example: nosniff
+          content:
+            '*/*':
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/admin/audit:
+    get:
+      tags: [audit]
+      summary: List audit entries, newest first (admin only)
+      operationId: listAuditEntries
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of audit entries.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditList'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /healthz:
+    get:
+      tags: [health]
+      summary: Liveness probe
+      description: Always 200 while the process can serve requests; never touches the database.
+      operationId: liveness
+      security: []
+      responses:
+        '200':
+          description: The process is alive.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Liveness'
+  /api/health:
+    get:
+      tags: [health]
+      summary: Readiness probe
+      description: |
+        Pings the database with a 2 second timeout. `llm_configured` is true
+        only when a default LLM configuration exists and its key can be
+        decrypted. Database failure returns 503 with `status: unavailable` and
+        `db: down`.
+      operationId: readiness
+      security: []
+      responses:
+        '200':
+          description: The service is ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthEnvelope'
+        '503':
+          description: The database is unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthEnvelope'
+  /api/openapi.yaml:
+    get:
+      tags: [health]
+      summary: The public OpenAPI document
+      description: Serves the hand-maintained YAML document; a missing file is 404.
+      operationId: getOpenAPIDocument
+      security: []
+      responses:
+        '200':
+          description: The OpenAPI 3.0 document.
+          content:
+            application/yaml:
+              schema:
+                type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+      description: |
+        Opaque session token returned once by `POST /api/auth/login`. Send it as
+        `Authorization: Bearer <token>`. The server stores only its SHA-256 hash;
+        logout and password resets revoke it.
+  parameters:
+    RequestID:
+      name: X-Request-ID
+      in: header
+      required: false
+      description: |
+        Optional client request ID matching `^[A-Za-z0-9_-]{8,128}$`. Invalid
+        values are replaced with a UUID; the response always echoes the chosen
+        value in `X-Request-ID` and in every error envelope.
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9_-]{8,128}$'
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Opts an authenticated write into 24 hour idempotent replay. Same key
+        and body replay the stored response with `Idempotent-Replayed: true`;
+        same key and a different body is 409 `idempotency_conflict`.
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9_-]{8,128}$'
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Page size, 1-100. Defaults to 20.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque id cursor from the previous page; do not parse it.
+      schema:
+        type: string
+    BeforeSeq:
+      name: before_seq
+      in: query
+      required: false
+      description: Return events with a sequence lower than this cursor. Omit (or 0) for the latest events.
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+    Channel:
+      name: channel
+      in: query
+      required: true
+      description: Channel name, 1-64 characters. P0 uses `system`.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 64
+    Since:
+      name: since
+      in: query
+      required: false
+      description: Replay events after this seq when `Last-Event-ID` is absent. Omit for live-only.
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+    LastEventID:
+      name: Last-Event-ID
+      in: header
+      required: false
+      description: Reconnect cursor. Takes precedence over `?since`.
+      schema:
+        type: string
+    UserId:
+      name: id
+      in: path
+      required: true
+      description: User ID.
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    LLMConfigId:
+      name: id
+      in: path
+      required: true
+      description: LLM configuration ID.
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    SHA256:
+      name: sha256
+      in: path
+      required: true
+      description: Lowercase hex SHA-256 object id.
+      schema:
+        type: string
+        pattern: '^[a-f0-9]{64}$'
+  responses:
+    InvalidArgument:
+      description: Invalid input (`invalid_argument` or `idempotency_conflict` for a reused key with a different body).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Unauthenticated:
+      description: Missing, malformed, expired or revoked bearer token (`unauthenticated`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Forbidden:
+      description: Authenticated but not an administrator (`forbidden`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    NotFound:
+      description: The requested resource is absent (`not_found`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Conflict:
+      description: State conflict such as a duplicate username or a protected administrator (`conflict`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    PayloadTooLarge:
+      description: The upload exceeds 10 MiB (`invalid_argument`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    TooManyRequests:
+      description: Login lockout or upstream LLM rate limiting (`rate_limited` / `llm_rate_limited`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Internal:
+      description: Unexpected server failure (`internal` or `storage_corrupted`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    BadGateway:
+      description: Upstream LLM authentication, 5xx or invalid response (`llm_auth_failed`, `llm_upstream_error`, `llm_invalid_response`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Unavailable:
+      description: No usable LLM configuration (`llm_not_configured`) or the database is down.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    GatewayTimeout:
+      description: The upstream LLM call exceeded the configured timeout (`llm_timeout`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+  schemas:
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, request_id, retryable, details]
+          properties:
+            code:
+              type: string
+              enum:
+                - invalid_argument
+                - unauthenticated
+                - forbidden
+                - not_found
+                - conflict
+                - idempotency_conflict
+                - rate_limited
+                - internal
+                - unavailable
+                - storage_corrupted
+                - llm_not_configured
+                - llm_auth_failed
+                - llm_rate_limited
+                - llm_bad_request
+                - llm_upstream_error
+                - llm_timeout
+                - llm_invalid_response
+            message:
+              type: string
+            request_id:
+              type: string
+              description: Echoes `X-Request-ID`; always present when the request reached the middleware chain.
+            retryable:
+              type: boolean
+            details:
+              type: object
+              additionalProperties: true
+              description: Non-sensitive structured details; `{}` when absent. LLM errors may include `upstream_status`.
+    User:
+      type: object
+      required: [id, username, role, status]
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 1
+        username:
+          type: string
+          pattern: '^[a-zA-Z0-9_.-]{3,64}$'
+        role:
+          type: string
+          enum: [admin, user]
+        status:
+          type: string
+          enum: [active, disabled]
+    UserEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/User'
+    UserList:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/User'
+        next_cursor:
+          type: string
+          description: Opaque cursor for the next page; empty when `has_more` is false.
+        has_more:
+          type: boolean
+    CreateUserRequest:
+      type: object
+      required: [username, password]
+      additionalProperties: false
+      properties:
+        username:
+          type: string
+          pattern: '^[a-zA-Z0-9_.-]{3,64}$'
+        password:
+          type: string
+          minLength: 10
+          maxLength: 128
+    UpdateUserRequest:
+      type: object
+      required: [status]
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+          enum: [active, disabled]
+    ResetPasswordRequest:
+      type: object
+      required: [new_password]
+      additionalProperties: false
+      properties:
+        new_password:
+          type: string
+          minLength: 10
+          maxLength: 128
+    LoginRequest:
+      type: object
+      required: [username, password]
+      additionalProperties: false
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+    LoginResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [token, expires_at, user]
+          properties:
+            token:
+              type: string
+              description: Raw opaque bearer token; returned exactly once.
+            expires_at:
+              type: string
+              format: date-time
+            user:
+              $ref: '#/components/schemas/User'
+    ModelInfo:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+        context_window:
+          type: integer
+          format: int64
+          nullable: true
+        max_output_tokens:
+          type: integer
+          format: int64
+          nullable: true
+        input_modalities:
+          type: array
+          items:
+            type: string
+          description: Missing upstream fields are omitted rather than guessed.
+    LLMConfig:
+      type: object
+      required:
+        - id
+        - name
+        - protocol
+        - base_url
+        - model
+        - has_api_key
+        - key_version
+        - header_names
+        - retry_count
+        - retry_interval_ms
+        - timeout_ms
+        - stream_enabled
+        - multimodal_enabled
+        - is_default
+        - model_catalog
+        - catalog_fetched_at
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        protocol:
+          type: string
+          enum: [chat_completions, responses]
+        base_url:
+          type: string
+          format: uri
+        model:
+          type: string
+        has_api_key:
+          type: boolean
+        key_version:
+          type: integer
+        header_names:
+          type: array
+          items:
+            type: string
+          description: Sorted custom header names. Header values are never returned.
+        retry_count:
+          type: integer
+          minimum: 0
+          maximum: 5
+        retry_interval_ms:
+          type: integer
+          minimum: 100
+          maximum: 30000
+        timeout_ms:
+          type: integer
+          minimum: 1000
+          maximum: 300000
+        stream_enabled:
+          type: boolean
+        multimodal_enabled:
+          type: boolean
+        is_default:
+          type: boolean
+        model_catalog:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModelInfo'
+        catalog_fetched_at:
+          type: string
+          format: date-time
+          nullable: true
+    LLMConfigEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/LLMConfig'
+    LLMConfigList:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/LLMConfig'
+    CreateLLMConfigRequest:
+      type: object
+      required: [name, protocol, base_url, model]
+      properties:
+        name:
+          type: string
+          minLength: 1
+        protocol:
+          type: string
+          enum: [chat_completions, responses]
+        base_url:
+          type: string
+          format: uri
+        model:
+          type: string
+          minLength: 1
+        api_key:
+          type: string
+          description: Optional upstream credential; encrypted at rest and never returned.
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+          description: Optional custom headers; names must not be empty and must not override Authorization or Content-Type.
+        retry_count:
+          type: integer
+          minimum: 0
+          maximum: 5
+          default: 2
+        retry_interval_ms:
+          type: integer
+          minimum: 100
+          maximum: 30000
+          default: 500
+        timeout_ms:
+          type: integer
+          minimum: 1000
+          maximum: 300000
+          default: 60000
+        stream_enabled:
+          type: boolean
+          default: true
+        multimodal_enabled:
+          type: boolean
+          default: true
+        is_default:
+          type: boolean
+          default: false
+    UpdateLLMConfigRequest:
+      type: object
+      description: Every field is optional; omitted `api_key` and `headers` keep their stored value.
+      properties:
+        name:
+          type: string
+          minLength: 1
+        protocol:
+          type: string
+          enum: [chat_completions, responses]
+        base_url:
+          type: string
+          format: uri
+        model:
+          type: string
+          minLength: 1
+        api_key:
+          type: string
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+        retry_count:
+          type: integer
+          minimum: 0
+          maximum: 5
+        retry_interval_ms:
+          type: integer
+          minimum: 100
+          maximum: 30000
+        timeout_ms:
+          type: integer
+          minimum: 1000
+          maximum: 300000
+        stream_enabled:
+          type: boolean
+        multimodal_enabled:
+          type: boolean
+        is_default:
+          type: boolean
+    LLMTestRequest:
+      type: object
+      properties:
+        stream:
+          type: boolean
+          default: false
+          description: Requires `stream_enabled=true`; returns normalized SSE frames.
+        prompt:
+          type: string
+          description: Defaults to a short description prompt when empty.
+        image:
+          type: boolean
+          default: false
+          description: Requires `multimodal_enabled=true`; attaches the built-in 1x1 PNG.
+    Usage:
+      type: object
+      required: [prompt_tokens, completion_tokens, total_tokens]
+      properties:
+        prompt_tokens:
+          type: integer
+        completion_tokens:
+          type: integer
+        total_tokens:
+          type: integer
+    LLMTestResult:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [text, usage, latency_ms]
+          properties:
+            text:
+              type: string
+            usage:
+              $ref: '#/components/schemas/Usage'
+            latency_ms:
+              type: integer
+              format: int64
+    EventRefs:
+      type: object
+      required: [evidence, case, requirement, code]
+      properties:
+        evidence:
+          type: array
+          items:
+            type: string
+        case:
+          type: array
+          items:
+            type: string
+        requirement:
+          type: array
+          items:
+            type: string
+        code:
+          type: array
+          items:
+            type: string
+    Event:
+      type: object
+      required:
+        - seq
+        - channel
+        - type
+        - version_id
+        - batch_id
+        - case_id
+        - step_id
+        - agent_role
+        - session_id
+        - ts
+        - summary
+        - detail
+        - refs
+      properties:
+        seq:
+          type: integer
+          format: int64
+          description: Channel-local monotonic sequence assigned by the store.
+        channel:
+          type: string
+          maxLength: 64
+        type:
+          type: string
+          maxLength: 100
+        version_id:
+          type: string
+          nullable: true
+        batch_id:
+          type: string
+          nullable: true
+        case_id:
+          type: string
+          nullable: true
+        step_id:
+          type: string
+          nullable: true
+        agent_role:
+          type: string
+          nullable: true
+        session_id:
+          type: string
+          nullable: true
+        ts:
+          type: string
+          format: date-time
+        summary:
+          type: string
+          maxLength: 500
+        detail:
+          type: object
+          additionalProperties: true
+          description: Up to 64 KiB of valid JSON; `{}` when absent.
+        refs:
+          $ref: '#/components/schemas/EventRefs'
+    EventSnapshot:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [items, snapshot_cursor, has_more]
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/Event'
+            snapshot_cursor:
+              type: integer
+              format: int64
+              description: The channel's current seq; use it as the SSE `since`/`Last-Event-ID` base.
+            has_more:
+              type: boolean
+    PublishTestEventsRequest:
+      type: object
+      properties:
+        count:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 1
+        summary:
+          type: string
+          maxLength: 500
+        detail:
+          type: object
+          additionalProperties: true
+          description: Optional JSON object up to 64 KiB; defaults to `{}`.
+    PublishTestEventsResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [seqs]
+          properties:
+            seqs:
+              type: array
+              items:
+                type: integer
+                format: int64
+    Object:
+      type: object
+      required: [sha256, size, content_type]
+      properties:
+        sha256:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        size:
+          type: integer
+          format: int64
+        content_type:
+          type: string
+    ObjectEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/Object'
+    AuditEntry:
+      type: object
+      required:
+        - id
+        - actor_user_id
+        - action
+        - target_type
+        - target_id
+        - request_id
+        - ip
+        - user_agent
+        - metadata
+        - created_at
+      properties:
+        id:
+          type: integer
+          format: int64
+        actor_user_id:
+          type: integer
+          format: int64
+          nullable: true
+        action:
+          type: string
+          example: auth.login_succeeded
+        target_type:
+          type: string
+        target_id:
+          type: string
+        request_id:
+          type: string
+        ip:
+          type: string
+        user_agent:
+          type: string
+        metadata:
+          type: object
+          additionalProperties: true
+        created_at:
+          type: string
+          format: date-time
+    AuditList:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditEntry'
+        next_cursor:
+          type: string
+        has_more:
+          type: boolean
+    Liveness:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+    HealthEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [status, version, commit, db, llm_configured]
+          properties:
+            status:
+              type: string
+              enum: [ok, unavailable]
+            version:
+              type: string
+            commit:
+              type: string
+            db:
+              type: string
+              enum: [ok, down]
+            llm_configured:
+              type: boolean

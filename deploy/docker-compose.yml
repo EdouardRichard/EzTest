@@ -1,0 +1,93 @@
+name: eztest
+
+# EzTest P0 single-instance deployment.
+#
+# Static validation only on this host: Docker is not installed, so this file is
+# checked by `cd frontend && node scripts/validate-compose.mjs` and has never
+# been started here. Run it on a host with Docker Engine + Compose v2.
+#
+# Usage (from the deploy/ directory, repo-root .env provides the secrets):
+#   docker compose --env-file ../.env up -d --build
+#
+# Required in the repo-root .env for interpolation (see ../.env.example):
+#   POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB
+# The api service also reads ../.env through env_file for the EZTEST_* and
+# lowercase llm_* variables. `.env` is gitignored and must never be committed.
+
+services:
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-eztest}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in the environment or ../.env}
+      POSTGRES_DB: ${POSTGRES_DB:-eztest}
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+      args:
+        VERSION: ${EZTEST_VERSION:-dev}
+        COMMIT: ${EZTEST_COMMIT:-}
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      EZTEST_ENV: ${EZTEST_ENV:-dev}
+      EZTEST_HTTP_ADDR: ":13333"
+      EZTEST_WEB_ORIGIN: ${EZTEST_WEB_ORIGIN:-http://localhost:6868}
+      EZTEST_DATABASE_URL: postgres://${POSTGRES_USER:-eztest}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in the environment or ../.env}@postgres:5432/${POSTGRES_DB:-eztest}?sslmode=disable
+      EZTEST_STORAGE_DIR: /data/objects
+      EZTEST_OPENAPI_PATH: docs/openapi/p0.yaml
+      EZTEST_ENABLE_TEST_ENDPOINTS: ${EZTEST_ENABLE_TEST_ENDPOINTS:-false}
+    ports:
+      - "13333:13333"
+    volumes:
+      - objects:/data/objects
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:13333/healthz >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.web
+      args:
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:13333}
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: "6868"
+      HOSTNAME: 0.0.0.0
+    ports:
+      - "6868:6868"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:6868/login >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+volumes:
+  pgdata:
+  objects:
