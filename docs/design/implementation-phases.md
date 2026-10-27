@@ -141,18 +141,20 @@ P0–P7 ────────────────────────
 **目标**：跑通"版本级多需求 + AI 引导澄清 + 人确认"的垂直切片。
 
 **范围**
-- 领域：Version、Requirement（多需求）、RequirementRelation（依赖/冲突/重叠/共享范围）、ClarificationSession、Decision。
-- Agent：澄清对话 Agent + 需求分析 Agent；上下文侦察 Agent 最小版（读文档/截图/本地代码只读）。
-- 前端：版本列表/创建版本；版本详情容器（VersionHeader + 状态徽章 + Tab 导航）与总览 Tab 骨架；版本工作台（需求列表 + 关系图 + 澄清对话 + 需求草案/待澄清/决策 + 确认）；其余 Tab 以占位/只读入口存在。
-- 实时：澄清过程通过 SSE 可见（复用 P0/P1）。
+- 领域：`version` 上下文 7 表——Version、Requirement（多需求）、RequirementRelation（依赖/冲突/重叠/共享范围）、RequirementAttachment、ClarificationSession、ClarificationQuestion、Decision；主键雪花 ID（D29），附件文件系统存储（D30）。
+- 状态语义（D31）：Version 为**粗粒度容器**，需求流水线独立；P3 只实现 `draft→clarifying→designing` 与 `Requirement draft→clarified`；新增/确认/重开需求永不改变或回退 Version.status；`designing` 下仍可独立澄清/确认；新增需求不中断执行（P7）。
+- 资源绑定：创建版本时可选绑定 P2 系统/环境/代码仓（branch→commit 快照）；`draft|clarifying` 允许整体替换，`designing` 只读。
+- Agent：澄清对话 Agent + 需求分析 Agent + 上下文侦察 Agent 最小版（读文档/截图/本地代码只读）；3 个 profile seed；11 个澄清/需求工具；附件截图以 `image_ref` 注入（data URL 仅 LLM 调用瞬态生成，不落库）。
+- 前端：版本列表/创建版本（含可选资源绑定）；版本详情容器（VersionHeader + 状态徽章 + 9 Tab）与总览 Tab 骨架；版本工作台（需求列表 + 需求编辑器/附件 + 关系图 + 澄清对话 + 问题清单 + 决策 + 确认/重开 + 新增需求）；其余 8 个 Tab 以骨架/占位入口存在并标注归属阶段；脑图/资源为独立入口（P5/P2）。
+- 实时：澄清过程经 `version:{id}` 通道 SSE 可见（快照游标 + Last-Event-ID + 20s 心跳；复用 P0/P1）。
 - 暂停/继续：本阶段只需"用户可随时离开/返回，状态不丢"（运行暂停在 P6）。
 
-**明确不做**：脑图、执行、代码影响分析（P4/P5）。
+**明确不做**：脑图、执行、代码影响分析（P4/P5）；PDF/DOCX 附件、图片编辑/压缩、视觉断言。
 
 **退出标准**
-- 一个版本可录 3+ 需求，AI 多轮追问，人能回答/编辑，需求/关系/决策落库。
-- 需求确认后状态按蓝图 §5.5 流转（draft → clarified → designed；Version 状态按蓝图 §5.6）。
-- 刷新/重连不丢对话与草案；关系图正确渲染。
+- 一个版本可录 3+ 需求，AI 多轮追问，人能回答/编辑，需求/关系/附件/问题/决策落库。
+- 需求确认后 `draft → clarified`；Version 状态按 D31 只由创建/开始澄清/进入设计改变（`draft → clarifying → designing`），任何需求操作不改变或回退 Version.status。
+- 刷新/重连不丢对话与草案；关系图正确渲染；附件上传/下载/删除走 D30 文件系统。
 - AI 不可用时，人工仍能录入/确认需求（降级可用）。
 
 **风险**：多需求关系（冲突/重叠）容易做成"看起来有"；本 Phase 只需基础关系 + 人工可编辑，复杂推理后移。

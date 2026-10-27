@@ -151,6 +151,7 @@
 | D28 | **P2 公共资源与身份：单 `resource` 上下文、明文存储、无审计/加密**。P2 新增 `resource` 限界上下文，承载 System/Environment/AppModel/Account/Access/Session/Snapshot/Lease/Takeover/LocalGitRepo；单公司种子，不做公司 CRUD。被测系统凭据（`account_system_accesses.credential`）与 Session 状态（`sessions.storage_state`）**明文存储**；P2 不实现加密、脱敏、审计（不写 `audit_logs`，不建 `session_events`/`secrets`/`session_blobs`）。Session 状态采用 auth-session-model 完整枚举 + 派生 `expiring`；快照表名 `session_snapshots`；API 统一 `/api/resources/*`；`System.kind` 仅 `web\|api`。P2 不做自动登录、ProbeRecipe、代码索引、Session 执行注入。理由：内部工具场景，被测系统凭据非生产秘密；先交付资源管理闭环，安全能力在需要时再引入。 |
 | D29 | **全项目主键统一雪花 ID**：自 P3 起所有新增实体/表的主键使用 64-bit 雪花 ID（41bit 毫秒 + 10bit 节点 + 12bit 序列），由 `platform/id` 在应用层生成；**禁止新增 `BIGSERIAL`/自增主键**。64-bit ID 在 JSON/工具参数/URL 中一律十进制字符串（避免 JS 精度丢失）；节点 ID 由 `EZTEST_SNOWFLAKE_NODE_ID` 配置（0–1023，单实例默认 1）。既有 P0–P2 的 `BIGSERIAL` 表不回溯改造；如需统一，单独立项迁移并记录 D#。 |
 | D30 | **全项目文件存储走文件系统**：业务附件与用户文件（需求附件、证据、截图、导出等）统一文件系统存储，**禁止二进制（含 base64/data URL）写入 PostgreSQL**；禁止新增对 P0 `storage` 内容寻址对象存储的依赖（该上下文冻结为既有能力/历史兼容，例外须记录 D#）。文件根目录可配置，路径由应用生成并做根内校验、拒绝 `..`/绝对路径/symlink 逃逸、文件名清洗、临时文件 + 原子 rename、文件 0600/目录 0700、大小/数量上限；删除采用 DB 元数据 + best-effort 文件删除，孤儿由 GC/保留策略处理。 |
+| D31 | P3 版本/多需求/澄清采用「Version 粗粒度容器 + Requirement 独立流水线」。新增/确认/重开需求**永不**改变或回退 `Version.status`；P3 只实现 `draft→clarifying→designing` 与 `Requirement draft→clarified`；`designing` 下仍可独立澄清/确认需求。版本「进入设计」允许带未澄清需求，但需 `acknowledgeUnclarified` 二次确认。新需求重新走「澄清→设计→评审→执行」；执行中的批次不因新增需求中断，受影响用例由 P7 的 AI 补全/修改（D3/D17）。P3 新增 `version` 上下文 7 表（versions/requirements/requirement_relations/requirement_attachments/clarification_sessions/clarification_questions/decisions）与 `agent_0002_activity_channel`；主键遵循 D29 雪花 ID（JSON 字符串序列化）；澄清 SSE 走 `version:{id}` 通道，Agent 会话可选 `activity_channel`（默认 `agent:{session_id}` 不变）。所有登录用户可写版本域；附件支持文本+截图并遵循 D30 文件系统存储，截图以 `image_ref` 注入、data URL 仅 LLM 调用瞬态生成，PDF/DOCX 不做。P3 不实现 P4/P5/P6/P7 能力。 |
 
 ---
 
@@ -295,6 +296,8 @@ stateDiagram-v2
 ```
 
 暂停语义：优雅暂停（当前步骤后停）或立即暂停（中断当前步骤，用例 `interrupted`）；恢复从步骤检查点续跑，interrupted 用例先 cleanup/seed。每批次记录 `base_commit → head_commit`，报告按批次生成 Revision。
+
+> **D31 备注（P3 起）**：Version 状态是**粗粒度容器**，与需求流水线解耦——新增/确认/重开需求**永不**改变或回退 `Version.status`；`designing` 下仍可独立澄清/确认需求；新增需求不中断执行中的批次，受影响用例由 P7 的 AI 补全/修改（D3/D17）。P3 只实现 `draft→clarifying→designing` 与 `Requirement draft→clarified`。
 
 ---
 
@@ -468,7 +471,7 @@ Playwright 浏览器（导航、DOM/A11y、点击输入、快照、截图、stor
 | 组 | 表（示例） |
 |---|---|
 | 资源 | companies / systems / environments / app_model_nodes / accounts / account_system_accesses / sessions / session_snapshots / session_leases / manual_takeovers / code_repositories（P2 共 11 表；`secrets` / `session_blobs` / `session_events` / `auth_flows` / `probe_recipes` 等 P6 需要时追加） |
-| 版本需求 | versions / requirements / requirement_relations / clarification_sessions / decisions / version_changes |
+| 版本需求 | versions / requirements / requirement_relations / requirement_attachments / clarification_sessions / clarification_questions / decisions / version_changes（P3 交付 `version` 上下文 7 表；主键按 D29，附件文件按 D30，`version_changes` 等后续阶段） |
 | 用例脑图 | case_graph_nodes / case_steps / assertions / case_sources / case_reviews |
 | 执行 | run_batches / case_runs / step_results / run_events(activity) / evidence / evidence_refs |
 | 问题报告 | issues / issue_refs / reports / report_refs |
@@ -494,17 +497,24 @@ Playwright 浏览器（导航、DOM/A11y、点击输入、快照、截图、stor
 
 ```text
 /api/resources/{systems,environments,app-models,accounts,sessions,code-repos}
+/api/versions                      ← 集合：列表/创建
+/api/versions/{id}                 ← 详情/元数据（PATCH）
+/api/versions/{id}/{bindings,start-clarification,enter-design}
 /api/versions/{id}/{requirements,relations,clarification,decisions}
+/api/versions/{id}/requirements/{rid}/attachments
 /api/versions/{id}/mindmap/{nodes,steps,assertions,review,export}
 /api/versions/{id}/batches / runs / case-runs / step-results
 /api/versions/{id}/issues / reports / changes
 /api/code/{repos,index,search,read,routes,apis,diff,impact}
 /api/agents / agent-profiles / llm-configs
 /api/auth / users / admin
-/api/versions/{id}/stream   ← SSE
+/api/versions/{id}/events          ← 事件快照分页
+/api/versions/{id}/stream          ← SSE
 ```
 
 > P2（D28）：公共资源与身份统一使用 `/api/resources/*`（含 `accesses`、`takeovers`）；GET 任意登录用户，写/动作 admin。
+
+> P3（D31）：`/api/versions/*` 集合/详情/动作/绑定/附件/事件/流；全部登录用户可写；P3 自有 ID 在 JSON/URL 中为十进制字符串（D29）。
 
 ### 11.2 实时事件（SSE）
 
@@ -512,6 +522,8 @@ Playwright 浏览器（导航、DOM/A11y、点击输入、快照、截图、stor
 - 快照游标：首屏 REST 拿最新事件页 + snapshot_cursor；SSE 从游标起，历史≤cursor、实时>cursor，无洞。
 - 事件字段：seq、type、version_id、batch_id、case_id、step_id、agent_role、session_id、ts、summary、detail、refs(evidence/case/requirement/code)。
 - 事件类型：version.status_changed、batch.started/finished、requirement.added/clarified/updated、case.created/updated/status_changed/reviewed/supplemented/revalidation_marked、run.started/paused/resumed/finished、step.started/finished、agent.activity、evidence.created、issue.created/updated、gate.pending/resolved、human.requested、report.published/stale、code.indexed/code.changed/code.impact_computed。
+- P3 事件（channel=`version:{id}`，version_id 必填）：新增 version.created/version.updated、requirement.reopened/deleted、requirement.relation_added/relation_updated/relation_removed、clarification.session_started/session_completed、clarification.question_updated、decision.proposed/decided、attachment.added/removed；原有 version.status_changed、requirement.added/clarified/updated、agent.activity 语义不变。需求事件永不改变或回退 Version.status（D31）。
+- P3 通道：澄清 SSE 固定广播到 `version:{id}`（客户端不可覆盖）；P1 Agent 会话可选 `activity_channel=version:{id}`，默认 `agent:{session_id}` 不变。
 - 断线重连：Last-Event-ID；去重按 seq；20s 心跳；前端显示"重连中"。
 - 鉴权：单管理员 + 普通用户；会话 token；资源级只读控制。
 
@@ -530,6 +542,8 @@ Playwright 浏览器（导航、DOM/A11y、点击输入、快照、截图、stor
 ### 12.2 版本详情 Tab（11）
 
 总览 · 需求与澄清 · 探索链路 · 执行会话 · 实时播报 · 用例脑图 · 结果与证据 · 问题 · 报告 · 代码与变更 · 资源与会话。前 8 个按 D18 顺序，分阶段交付（P3 容器/总览、P4 代码与变更、P6 执行类、P7 问题/报告）；实施 P0 只交付应用壳与最小设置页。
+
+> P3 Tab 为 **9 项**：**需求与澄清**（默认工作台，功能）+ D18 的 8 Tab（总览为骨架，执行会话/探索链路/实时播报/结果与证据/问题/报告/代码与变更均为占位并标注归属阶段）；「用例脑图」「资源与会话」仍为独立入口（P5/P2），P3 不放进 Tab 集合（D31）。
 
 ### 12.3 核心交互
 
