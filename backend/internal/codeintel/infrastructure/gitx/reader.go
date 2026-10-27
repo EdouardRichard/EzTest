@@ -302,19 +302,22 @@ func (r *GitReader) Commit(ctx context.Context, localPath, sha string) (domain.C
 }
 
 // openRepo validates localPath, proves it is a Git work tree and returns the
-// repository root, which is the working directory of every git command.
+// repository root, which is the working directory of every git command. A
+// local path that is missing or unreadable is an operational failure (503
+// git_unavailable) rather than a domain verdict; a directory that exists but
+// is not a work tree is the domain reason path_not_git_repo (422, R19).
 func (r *GitReader) openRepo(ctx context.Context, localPath string) (string, error) {
 	if strings.TrimSpace(localPath) == "" {
-		return "", pathNotFoundAtRepo()
+		return "", repoUnavailable()
 	}
 	absolute, err := filepath.Abs(localPath)
 	if err != nil {
-		return "", fmt.Errorf("gitx: resolve local path: %w", err)
+		return "", fmt.Errorf("%w: resolve local path: %w", errRepoUnavailable, err)
 	}
 	absolute = filepath.Clean(absolute)
 	info, err := os.Stat(absolute)
 	if err != nil || !info.IsDir() {
-		return "", pathNotFoundAtRepo()
+		return "", repoUnavailable()
 	}
 	inside, err := r.run(ctx, absolute, "rev-parse", "--is-inside-work-tree")
 	if err != nil {
@@ -469,6 +472,7 @@ func normalizeTextLines(content []byte) ([]string, error) {
 
 // joinLineWindow joins lines[start-1:end] with "\n" while staying within the
 // 64 KiB content bound. When a single line crosses the bound the line is cut
+// at a UTF-8 rune boundary (the file itself was already validated as UTF-8)
 // and the reported last line is the cut line. The returned bool reports that
 // the window content was truncated by the byte bound.
 func joinLineWindow(lines []string, start, end int) (string, int, bool) {
@@ -485,10 +489,17 @@ func joinLineWindow(lines []string, start, end int) (string, int, bool) {
 			return builder.String(), lastLine, true
 		}
 		if separator+len(line) > available {
+			cut := line[:available-separator]
+			for len(cut) > 0 && !utf8.ValidString(cut) {
+				cut = cut[:len(cut)-1]
+			}
+			if cut == "" {
+				return builder.String(), lastLine, true
+			}
 			if separator == 1 {
 				builder.WriteByte('\n')
 			}
-			builder.WriteString(line[:available-separator])
+			builder.WriteString(cut)
 			return builder.String(), index, true
 		}
 		if separator == 1 {

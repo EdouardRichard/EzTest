@@ -3,11 +3,11 @@ package gitx
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
 )
@@ -37,7 +37,9 @@ func (r *GitReader) Diff(ctx context.Context, localPath, base, head string) (dom
 // FileDiff returns the on-demand unified diff of one changed file. The change
 // set lookup supplies the authoritative status (so a rename keeps R<score>)
 // and rejects paths outside the change set. Binary and deleted files return an
-// empty patch, and the patch is cut at maxBytes.
+// empty patch; a patch over maxBytes or over the 4 MiB command-output bound
+// also returns an empty patch with Truncated=true and no error (design spec
+// §6.1, ruling R18), so an oversized file can never block the UI.
 func (r *GitReader) FileDiff(ctx context.Context, localPath, base, head, path string, maxBytes int) (domain.FileDiff, error) {
 	if !validCommit(base) || !validCommit(head) {
 		return domain.FileDiff{}, commitNotFound()
@@ -82,9 +84,18 @@ func (r *GitReader) FileDiff(ctx context.Context, localPath, base, head, path st
 		return result, nil
 	}
 
-	output, err := r.run(ctx, dir, "diff", "--no-ext-diff", "--find-renames", "--unified=3",
+	// --no-textconv keeps a repository-configured textconv driver from
+	// executing or rewriting the returned patch; binary files are already
+	// identified by the numstat "-" of the change set above.
+	output, err := r.run(ctx, dir, "diff", "--no-ext-diff", "--no-textconv", "--find-renames", "--unified=3",
 		base+".."+head, "--", literalPathspec(normalized))
 	if err != nil {
+		// R18: an oversized single-file patch is reported as truncated with an
+		// empty patch, never as an operational error that would map to 503.
+		if errors.Is(err, errCommandOutputTooLarge) {
+			result.Truncated = true
+			return result, nil
+		}
 		if operationalError(err) {
 			return domain.FileDiff{}, err
 		}
@@ -94,17 +105,12 @@ func (r *GitReader) FileDiff(ctx context.Context, localPath, base, head, path st
 		return domain.FileDiff{}, fmt.Errorf("gitx: file diff: %w", err)
 	}
 	patch := string(output)
-	if strings.Contains(patch, "Binary files ") || strings.Contains(patch, "GIT binary patch") {
-		result.Binary = true
-		result.Patch = ""
-		return result, nil
-	}
+	// Binary detection comes only from the change set (numstat "-"); sniffing
+	// the patch text would empty a valid text patch whose content happens to
+	// contain a marker such as "Binary files ".
 	if len(patch) > limit {
-		patch = patch[:limit]
-		for len(patch) > 0 && !utf8.ValidString(patch) {
-			patch = patch[:len(patch)-1]
-		}
 		result.Truncated = true
+		return result, nil
 	}
 	result.Patch = patch
 	return result, nil
@@ -115,11 +121,11 @@ func (r *GitReader) diffAt(ctx context.Context, dir, base, head string) (domain.
 	commitRange := base + ".." + head
 	// --no-abbrev is required: raw diff abbreviates object ids by default, but
 	// design spec §6.1 defines headBlobHash as "git-sha1:<40hex>".
-	rawOutput, err := r.run(ctx, dir, "diff", "--raw", "-z", "--no-ext-diff", "--find-renames=50%", "--no-abbrev", commitRange)
+	rawOutput, err := r.run(ctx, dir, "diff", "--raw", "-z", "--no-ext-diff", "--no-textconv", "--find-renames=50%", "--no-abbrev", commitRange)
 	if err != nil {
 		return domain.ChangeSetData{}, diffCommandError(err)
 	}
-	numstatOutput, err := r.run(ctx, dir, "diff", "--numstat", "-z", "--no-ext-diff", "--find-renames=50%", commitRange)
+	numstatOutput, err := r.run(ctx, dir, "diff", "--numstat", "-z", "--no-ext-diff", "--no-textconv", "--find-renames=50%", commitRange)
 	if err != nil {
 		return domain.ChangeSetData{}, diffCommandError(err)
 	}

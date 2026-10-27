@@ -1,6 +1,7 @@
 package gitx
 
 import (
+	"fmt"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -12,13 +13,14 @@ import (
 // commitRE is the full SHA-1 commit id form pinned by design spec §6.1/§15.
 var commitRE = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
-// branchRE is the fixed branch format. It rejects option-like branches so a
-// branch can never reach git as a command line flag and rejects the revision
-// operators git itself forbids in branch names.
-var branchRE = regexp.MustCompile(`^[A-Za-z0-9._/-]{1,255}$`)
-
-// error constructors keep every failure a typed domain error (design spec
-// §7.1) instead of raw git text.
+// The error constructors below keep every git verdict a typed domain error
+// with a stable details.reason. Most reasons are the §7.1 table values;
+// path_not_git_repo and invalid_line_range are the two documented extensions
+// (P2 repo validation and the file-window bounds) and are also returned as
+// domain.ErrInvalid so handlers answer 422. Environment failures (timeout,
+// output overflow, exec failure, unreadable localPath) deliberately do NOT use
+// these constructors: they stay non-domain so handlers map them to 503
+// git_unavailable (ruling R19).
 
 // invalidPath denies a path that could escape the commit tree.
 func invalidPath() error {
@@ -68,10 +70,11 @@ func notChanged() error {
 		"codeintel: path is not part of the requested change set")
 }
 
-// pathNotFoundAtRepo reports a missing local repository path.
-func pathNotFoundAtRepo() error {
-	return domain.NewInvalid("localPath", "path_not_found",
-		"codeintel: local path does not exist or is not a directory")
+// repoUnavailable reports a local repository path that is missing or not a
+// readable directory. It is an operational failure rather than a domain
+// verdict so handlers map it to 503 git_unavailable (ruling R19).
+func repoUnavailable() error {
+	return fmt.Errorf("%w: local path does not exist or is not a directory", errRepoUnavailable)
 }
 
 // notGitWorkTree reports a local path that is not a Git work tree.
@@ -85,14 +88,40 @@ func validCommit(commit string) bool {
 	return commitRE.MatchString(commit)
 }
 
-// validBranch reports whether branch is a safe fixed branch name.
+// validBranch reports whether branch is a safe fixed branch name. It accepts
+// the names git accepts for refs/heads, including "+", "=" and UTF-8, so a
+// valid configured branch is never rejected. It still rejects option-like
+// names and the revision operators ~ ^ : ? * [ \ and "@{" so a branch can
+// never reach git as a command line flag or a revision expression.
 func validBranch(branch string) bool {
-	return branch != "" &&
-		!strings.HasPrefix(branch, "-") &&
-		branchRE.MatchString(branch) &&
-		!strings.Contains(branch, "..") &&
-		!strings.HasPrefix(branch, "/") &&
-		!strings.HasSuffix(branch, "/")
+	if branch == "" || branch == "@" || len(branch) > 255 {
+		return false
+	}
+	if strings.HasPrefix(branch, "-") || strings.HasPrefix(branch, "/") || strings.HasSuffix(branch, "/") {
+		return false
+	}
+	if strings.Contains(branch, "..") || strings.Contains(branch, "@{") {
+		return false
+	}
+	for _, component := range strings.Split(branch, "/") {
+		if component == "" ||
+			strings.HasPrefix(component, ".") ||
+			strings.HasSuffix(component, ".") ||
+			strings.HasSuffix(component, ".lock") {
+			return false
+		}
+	}
+	for index := 0; index < len(branch); index++ {
+		char := branch[index]
+		if char <= ' ' || char == 0x7f {
+			return false
+		}
+		switch char {
+		case '~', '^', ':', '?', '*', '[', '\\':
+			return false
+		}
+	}
+	return true
 }
 
 // normalizeRepoPath slash-normalizes a repository-relative path and rejects

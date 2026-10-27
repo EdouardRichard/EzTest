@@ -78,9 +78,10 @@ func TestPathNormalization(t *testing.T) {
 	}
 }
 
-// TestRepositoryValidation pins localPath checks: a missing directory is
-// path_not_found, a directory that is not a Git work tree is path_not_git_repo
-// and a subdirectory of a work tree resolves against the repository root.
+// TestRepositoryValidation pins localPath checks: a missing directory is an
+// operational failure (503 git_unavailable, not a domain verdict), a directory
+// that is not a Git work tree is the domain reason path_not_git_repo and a
+// subdirectory of a work tree resolves against the repository root.
 func TestRepositoryValidation(t *testing.T) {
 	fx := newTestRepo(t)
 	r := gitx.NewGitReader(gitx.GitConfig{CommandTimeout: 5 * time.Second})
@@ -88,7 +89,7 @@ func TestRepositoryValidation(t *testing.T) {
 
 	missing := filepath.Join(t.TempDir(), "absent")
 	_, err := r.Head(ctx, missing, "main")
-	requireDomainInvalid(t, err, "path_not_found")
+	requireOperationalError(t, err)
 
 	notRepo := t.TempDir()
 	_, err = r.Head(ctx, notRepo, "main")
@@ -101,4 +102,21 @@ func TestRepositoryValidation(t *testing.T) {
 	if fromSubdirectory != fx.commit2 {
 		t.Fatalf("Head(from subdirectory)=%q want %q", fromSubdirectory, fx.commit2)
 	}
+}
+
+// TestGitOperationalErrorsAreNotDomainInvalid pins the R19 handler mapping:
+// timeout and cancellation failures stay non-domain so the HTTP layer can map
+// them to 503 git_unavailable instead of 422.
+func TestGitOperationalErrorsAreNotDomainInvalid(t *testing.T) {
+	fx := newTestRepo(t)
+	r := gitx.NewGitReader(gitx.GitConfig{CommandTimeout: 5 * time.Second})
+
+	expired := gitx.NewGitReader(gitx.GitConfig{CommandTimeout: time.Nanosecond})
+	_, err := expired.Head(context.Background(), fx.dir, "main")
+	requireOperationalError(t, err)
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = r.Head(canceled, fx.dir, "main")
+	requireOperationalError(t, err)
 }

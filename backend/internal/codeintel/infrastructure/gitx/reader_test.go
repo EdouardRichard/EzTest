@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/codeintel/infrastructure/gitx"
@@ -52,7 +53,9 @@ func newTestRepo(t *testing.T) repoFixture {
 	writeRepoFile(t, dir, "src/utf8/你好.txt", "第一行\n第二行\n第三行\n")
 	writeRepoFile(t, dir, "src/data/lines.txt", "l1\nl2\nl3\nl4\n")
 	writeRepoFile(t, dir, "src/data/wide.txt", strings.Repeat("a", 70000)+"\n")
+	writeRepoFile(t, dir, "src/data/wide-utf8.txt", strings.Repeat("你", 30000)+"\n")
 	writeRepoFile(t, dir, "src/data/empty.txt", "")
+	writeRepoFile(t, dir, "src/notes/binary-note.txt", "note\n")
 	writeRepoBytes(t, dir, "assets/logo.png", []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01, 0x02, 0x03})
 	writeRepoBytes(t, dir, "src/data/binary.bin", []byte{0x00, 0xff, 0xfe, 0x80, 0x81})
 	writeRepoBytes(t, dir, "src/data/invalid-utf8.txt", []byte("ok\n\xff\n"))
@@ -62,6 +65,7 @@ func newTestRepo(t *testing.T) repoFixture {
 	writeRepoFile(t, dir, "src/api/refund.test.ts", "import { refund } from './refund';\n")
 	writeRepoFile(t, dir, "src/utils/format.ts", "export function format(value: string) {\n  return value.trim().toUpperCase();\n}\n")
 	writeRepoFile(t, dir, "src/notes/说明 文档.md", "# 说明\n\n第二版\n")
+	writeRepoFile(t, dir, "src/notes/binary-note.txt", "note\nBinary files a/logo.png and b/logo.png differ\n")
 	writeRepoBytes(t, dir, "assets/logo.png", []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x09, 0x08, 0x07})
 	if err := os.Remove(filepath.Join(dir, "docs", "guide.md")); err != nil {
 		t.Fatalf("remove docs/guide.md: %v", err)
@@ -160,6 +164,22 @@ func requireDomainInvalid(t *testing.T, err error, wantReason string) {
 	}
 }
 
+// requireOperationalError asserts that err is a non-domain operational git
+// failure. Handlers map such errors to 503 git_unavailable (R19), so the error
+// must not wrap domain.ErrInvalid or carry a domain reason.
+func requireOperationalError(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("want an operational git error, got nil")
+	}
+	if errors.Is(err, domain.ErrInvalid) {
+		t.Fatalf("error %v wraps domain.ErrInvalid; handlers would map it to 422 instead of 503 git_unavailable", err)
+	}
+	if reason := domain.Reason(err); reason != "" {
+		t.Fatalf("operational error carries domain reason %q (error: %v)", reason, err)
+	}
+}
+
 // entryIndex maps tree paths to entries.
 func entryIndex(entries []domain.TreeEntry) map[string]domain.TreeEntry {
 	index := make(map[string]domain.TreeEntry, len(entries))
@@ -223,6 +243,89 @@ func TestHeadAncestorAndCommit(t *testing.T) {
 	requireDomainInvalid(t, err, "invalid_head")
 	_, err = r.Commit(ctx, fx.dir, strings.Repeat("a", 40))
 	requireDomainInvalid(t, err, "commit_not_found")
+}
+
+// TestHeadAcceptsGitValidBranchNames pins branch validation: names git accepts
+// (for example the "+" separator) must resolve, while option-like names and
+// revision operators must never reach git as flags or revision expressions.
+func TestHeadAcceptsGitValidBranchNames(t *testing.T) {
+	fx := newTestRepo(t)
+	r := gitx.NewGitReader(gitx.GitConfig{CommandTimeout: 5 * time.Second})
+	ctx := context.Background()
+
+	const extended = "release+2026"
+	runGit(t, fx.dir, "branch", extended, fx.commit1)
+	head, err := r.Head(ctx, fx.dir, extended)
+	if err != nil {
+		t.Fatalf("Head(%q): %v", extended, err)
+	}
+	if head != fx.commit1 {
+		t.Fatalf("Head(%q)=%q want %q", extended, head, fx.commit1)
+	}
+
+	rejected := []string{
+		"main~1",
+		"main^",
+		"main:refs/heads/main",
+		"main?",
+		"main*",
+		"main[",
+		`main\`,
+		"main..x",
+		"release@{1}",
+		"/main",
+		"main/",
+		"@",
+		"main branch",
+	}
+	for _, branch := range rejected {
+		_, err := r.Head(ctx, fx.dir, branch)
+		requireDomainInvalid(t, err, "invalid_head")
+	}
+}
+
+// TestReaderIgnoresInheritedGitRedirects pins the child environment: an
+// inherited GIT_DIR/GIT_WORK_TREE must not redirect the adapter away from the
+// validated localPath.
+func TestReaderIgnoresInheritedGitRedirects(t *testing.T) {
+	fx := newTestRepo(t)
+	other := t.TempDir()
+	runGit(t, other, "init", "-q", "-b", "main")
+	runGit(t, other, "config", "user.email", testEmail)
+	runGit(t, other, "config", "user.name", testAuthor)
+	writeRepoFile(t, other, "other.txt", "other\n")
+	otherHead := commitRepo(t, other, "other", commit1Date)
+	if otherHead == fx.commit2 {
+		t.Fatal("fixture repositories unexpectedly share a head commit")
+	}
+	t.Setenv("GIT_DIR", filepath.Join(other, ".git"))
+	t.Setenv("GIT_WORK_TREE", other)
+
+	r := gitx.NewGitReader(gitx.GitConfig{CommandTimeout: 5 * time.Second})
+	head, err := r.Head(context.Background(), fx.dir, "main")
+	if err != nil {
+		t.Fatalf("Head: %v", err)
+	}
+	if head != fx.commit2 {
+		t.Fatalf("Head=%q want %q (inherited GIT_DIR/GIT_WORK_TREE pointed at %q)", head, fx.commit2, otherHead)
+	}
+}
+
+// TestCommitOutputOverflowIsOperational pins the 4 MiB output bound: overflow
+// is a non-domain operational failure (503 git_unavailable), never a 422.
+func TestCommitOutputOverflowIsOperational(t *testing.T) {
+	dir := t.TempDir()
+	runGit(t, dir, "init", "-q", "-b", "main")
+	runGit(t, dir, "config", "user.email", testEmail)
+	runGit(t, dir, "config", "user.name", testAuthor)
+	writeRepoFile(t, dir, "base.txt", "base\n")
+	runGit(t, dir, "add", "-A")
+	runGitInput(t, dir, strings.Repeat("m", 4<<20+1024), "commit", "-q", "-F", "-")
+	sha := runGit(t, dir, "rev-parse", "HEAD")
+
+	r := gitx.NewGitReader(gitx.GitConfig{CommandTimeout: 10 * time.Second})
+	_, err := r.Commit(context.Background(), dir, sha)
+	requireOperationalError(t, err)
 }
 
 // TestTreeFiltersAndHashes pins the commit-pinned recursive listing: path
@@ -436,6 +539,26 @@ func TestFileWindowCRLFAndUTF8(t *testing.T) {
 	}
 	if len(wide.Content) != domain.MaxFileReadBytes || !wide.Truncated || wide.EndLine != 1 || wide.TotalLines != 1 {
 		t.Fatalf("File(wide) len=%d truncated=%v end=%d total=%d want %d bytes truncated", len(wide.Content), wide.Truncated, wide.EndLine, wide.TotalLines, domain.MaxFileReadBytes)
+	}
+
+	wideUTF8, err := r.File(ctx, fx.dir, fx.commit2, "src/data/wide-utf8.txt", 1, 1)
+	if err != nil {
+		t.Fatalf("File(wide-utf8): %v", err)
+	}
+	if !wideUTF8.Truncated || wideUTF8.EndLine != 1 || wideUTF8.TotalLines != 1 {
+		t.Fatalf("File(wide-utf8) truncated=%v end=%d total=%d want a truncated single-line window", wideUTF8.Truncated, wideUTF8.EndLine, wideUTF8.TotalLines)
+	}
+	if len(wideUTF8.Content) > domain.MaxFileReadBytes {
+		t.Fatalf("File(wide-utf8) len=%d want <= %d", len(wideUTF8.Content), domain.MaxFileReadBytes)
+	}
+	if len(wideUTF8.Content) < domain.MaxFileReadBytes-utf8.UTFMax {
+		t.Fatalf("File(wide-utf8) len=%d want within one rune of %d", len(wideUTF8.Content), domain.MaxFileReadBytes)
+	}
+	if !utf8.ValidString(wideUTF8.Content) {
+		t.Fatalf("File(wide-utf8) content is not valid UTF-8 at the 64 KiB cut")
+	}
+	if wideUTF8.Content != strings.Repeat("你", len(wideUTF8.Content)/len("你")) {
+		t.Fatalf("File(wide-utf8) content is not a whole-rune prefix of the file")
 	}
 
 	empty, err := r.File(ctx, fx.dir, fx.commit2, "src/data/empty.txt", 1, 0)
