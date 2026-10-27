@@ -621,6 +621,42 @@ describe("Workbench", () => {
     expect(onChanged).toHaveBeenCalledTimes(4)
   })
 
+  it("reloads the clarification overview when the session changes externally", async () => {
+    let streamEvents: VersionEvent[] = [versionEvent(1, "requirement.added")]
+    mocks.useVersionStream.mockImplementation(() => ({
+      events: streamEvents,
+      status: "live",
+      reconnect: vi.fn(),
+    }))
+    const onChanged = vi.fn()
+    const view = renderWorkbench(onChanged)
+
+    await waitFor(() => expect(mocks.getClarification).toHaveBeenCalledTimes(1))
+    expect(screen.queryByText("澄清会话已结束。")).toBeNull()
+
+    // Another window/user started the session: the overview must refresh.
+    streamEvents = [...streamEvents, versionEvent(2, "clarification.session_started")]
+    view.rerender(<Workbench version={VERSION} onChanged={onChanged} />)
+    await waitFor(() => expect(mocks.getClarification).toHaveBeenCalledTimes(2))
+
+    // The session completed elsewhere: the chat reflects the new status.
+    mocks.getClarification.mockResolvedValue({
+      session: {
+        ...CLARIFICATION_SESSION,
+        status: "completed",
+        endedAt: "2026-10-27T12:00:00Z",
+      },
+      questions: { open: 0, answered: 0, dismissed: 0 },
+      decisions: { proposed: 0, accepted: 0, rejected: 0 },
+    })
+    streamEvents = [...streamEvents, versionEvent(3, "clarification.session_completed")]
+    view.rerender(<Workbench version={VERSION} onChanged={onChanged} />)
+
+    expect(await screen.findByText("澄清会话已结束。")).toBeTruthy()
+    await waitFor(() => expect(mocks.getClarification).toHaveBeenCalledTimes(3))
+    expect(onChanged).toHaveBeenCalledTimes(2)
+  })
+
   it("refreshes the clarification panels when the workbench is reloaded manually", async () => {
     renderWorkbench()
 

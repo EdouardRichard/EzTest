@@ -111,6 +111,54 @@ const TOOL_RESULT_B = message({
   createdAt: "2026-10-27T10:00:03Z",
 })
 
+/**
+ * The runner bounds `agent.activity` previews to 2048 bytes (`args_truncated`/
+ * `result_truncated`), while the persisted message keeps the full content.
+ */
+const FULL_TOOL_ARGS = JSON.stringify({ query: "a".repeat(3000) })
+const FULL_TOOL_RESULT = `完整结果：${"r".repeat(3000)}`
+const TRUNCATED_TOOL_ARGS = FULL_TOOL_ARGS.slice(0, 2048)
+const TRUNCATED_TOOL_RESULT = FULL_TOOL_RESULT.slice(0, 2048)
+
+const ASSISTANT_WITH_LONG_TOOL_CALL = message({
+  id: 30,
+  role: "assistant",
+  parts: [],
+  toolCalls: [{ id: "call_long", name: "tool_long", arguments: FULL_TOOL_ARGS }],
+  createdAt: "2026-10-27T10:00:10Z",
+})
+
+const LONG_TOOL_RESULT = message({
+  id: 31,
+  role: "tool",
+  parts: [{ type: "text", text: FULL_TOOL_RESULT }],
+  toolName: "tool_long",
+  createdAt: "2026-10-27T10:00:11Z",
+})
+
+function longToolEvents(): VersionEvent[] {
+  return [
+    activity(40, {
+      kind: "tool_use",
+      run_id: "501",
+      call_id: "call_long",
+      tool: "tool_long",
+      args: TRUNCATED_TOOL_ARGS,
+      args_truncated: true,
+    }),
+    activity(41, {
+      kind: "tool_result",
+      run_id: "501",
+      call_id: "call_long",
+      tool: "tool_long",
+      result: TRUNCATED_TOOL_RESULT,
+      result_truncated: true,
+      status: "ok",
+      duration_ms: 8,
+    }),
+  ]
+}
+
 function messagesPage(items: ClarificationMessage[]): ClarificationMessagesPage {
   return { items, nextCursor: "", hasMore: false }
 }
@@ -524,6 +572,145 @@ describe("ClarificationChat", () => {
     expect(within(rowB).getByText("结果二")).toBeTruthy()
     expect(within(rowA).queryByText("结果二")).toBeNull()
     expect(within(rowB).queryByText("结果一")).toBeNull()
+  })
+
+  it("keys persisted tool calls per run so equal call ids do not cross-attach", async () => {
+    const ASSISTANT_RUN_501 = message({
+      id: 40,
+      role: "assistant",
+      parts: [],
+      toolCalls: [{ id: "call_shared", name: "tool_shared", arguments: '{"run":501}' }],
+      runId: 501,
+      createdAt: "2026-10-27T10:00:10Z",
+    })
+    const ASSISTANT_RUN_502 = message({
+      id: 41,
+      role: "assistant",
+      parts: [],
+      toolCalls: [{ id: "call_shared", name: "tool_shared", arguments: '{"run":502}' }],
+      runId: 502,
+      createdAt: "2026-10-27T10:00:20Z",
+    })
+    mocks.listClarificationMessages.mockResolvedValue(
+      messagesPage([ASSISTANT_RUN_501, ASSISTANT_RUN_502]),
+    )
+
+    const { rerender } = renderChat()
+    // Wait for the persisted snapshot before attaching events so the rows below
+    // are the restored calls, not live-only placeholders.
+    expect(await screen.findAllByRole("button", { name: "工具 tool_shared" })).toHaveLength(2)
+
+    rerender(
+      chatElement({
+        events: [
+          activity(50, {
+            kind: "tool_result",
+            run_id: "501",
+            call_id: "call_shared",
+            tool: "tool_shared",
+            result: "结果一",
+            status: "ok",
+          }),
+          activity(51, {
+            kind: "tool_result",
+            run_id: "502",
+            call_id: "call_shared",
+            tool: "tool_shared",
+            result: "结果二",
+            status: "ok",
+          }),
+        ],
+      }),
+    )
+
+    const buttons = screen.getAllByRole("button", { name: "工具 tool_shared" })
+    expect(buttons.length).toBe(2)
+    const row501 = buttons[0].parentElement
+    const row502 = buttons[1].parentElement
+    expect(row501).not.toBeNull()
+    expect(row502).not.toBeNull()
+    if (row501 === null || row502 === null) return
+
+    fireEvent.click(buttons[0])
+    fireEvent.click(buttons[1])
+
+    expect(within(row501).getByText("结果一")).toBeTruthy()
+    expect(within(row501).queryByText("结果二")).toBeNull()
+    expect(within(row502).getByText("结果二")).toBeTruthy()
+    expect(within(row502).queryByText("结果一")).toBeNull()
+  })
+
+  it("falls back to the call id when the persisted message has no run id", async () => {
+    const ASSISTANT_NO_RUN = message({
+      id: 42,
+      role: "assistant",
+      parts: [],
+      toolCalls: [{ id: "call_no_run", name: "tool_no_run", arguments: '{"x":1}' }],
+      runId: null,
+      createdAt: "2026-10-27T10:00:10Z",
+    })
+    mocks.listClarificationMessages.mockResolvedValue(messagesPage([ASSISTANT_NO_RUN]))
+
+    const { rerender } = renderChat()
+    expect(await screen.findAllByRole("button", { name: "工具 tool_no_run" })).toHaveLength(1)
+
+    rerender(
+      chatElement({
+        events: [
+          activity(60, {
+            kind: "tool_result",
+            run_id: "501",
+            call_id: "call_no_run",
+            tool: "tool_no_run",
+            result: "结果无运行 ID",
+            status: "ok",
+          }),
+        ],
+      }),
+    )
+
+    // The persisted call carries no run id, so the bare call id is the only
+    // possible key; the result must attach instead of creating a duplicate row.
+    const buttons = screen.getAllByRole("button", { name: "工具 tool_no_run" })
+    expect(buttons.length).toBe(1)
+    fireEvent.click(buttons[0])
+    expect(screen.getByText("结果无运行 ID")).toBeTruthy()
+  })
+
+  it("keeps the full persisted args and result when a truncated event preview arrives", async () => {
+    mocks.listClarificationMessages.mockResolvedValue(
+      messagesPage([ASSISTANT_WITH_LONG_TOOL_CALL, LONG_TOOL_RESULT]),
+    )
+
+    const { rerender } = renderChat()
+    expect(await screen.findByRole("button", { name: "工具 tool_long" })).toBeTruthy()
+
+    rerender(chatElement({ events: longToolEvents() }))
+
+    fireEvent.click(screen.getByRole("button", { name: "工具 tool_long" }))
+
+    expect(screen.getByText(FULL_TOOL_ARGS)).toBeTruthy()
+    expect(screen.getByText(FULL_TOOL_RESULT)).toBeTruthy()
+    // A persisted full value is authoritative: no truncation indicator claims
+    // the visible content was silently shortened.
+    expect(screen.queryByText("参数已截断，仅显示预览。")).toBeNull()
+    expect(screen.queryByText("结果已截断，仅显示预览。")).toBeNull()
+  })
+
+  it("marks truncated previews for a live-only tool call", async () => {
+    mocks.listClarificationMessages.mockResolvedValue(messagesPage([]))
+
+    const { rerender } = renderChat()
+    expect(await screen.findByText("暂无消息")).toBeTruthy()
+
+    rerender(chatElement({ events: longToolEvents() }))
+
+    fireEvent.click(screen.getByRole("button", { name: "工具 tool_long" }))
+
+    expect(screen.getByText(TRUNCATED_TOOL_ARGS)).toBeTruthy()
+    expect(screen.getByText(TRUNCATED_TOOL_RESULT)).toBeTruthy()
+    expect(screen.getByText("参数已截断，仅显示预览。")).toBeTruthy()
+    expect(screen.getByText("结果已截断，仅显示预览。")).toBeTruthy()
   })
 
   it("refetches the message snapshot when the stream reconnects", async () => {
