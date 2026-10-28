@@ -489,7 +489,8 @@ func analysisStoredStats(t *testing.T, raw []byte) analysisStatsIntegration {
 func runAnalysisJob(t *testing.T, fixture *analysisIntegration, analyses *codeintelpg.AnalysisRepo, versionID int64, headCommit string, force bool) domain.CodeAnalysis {
 	t.Helper()
 	ctx := context.Background()
-	analysis, reused, err := fixture.service.Start(ctx, versionID, 1, headCommit, force)
+	analysis, reused, err := fixture.service.Start(ctx, versionID, 1,
+		codeintelapp.StartAnalysisInput{HeadCommit: headCommit, Force: force})
 	if err != nil {
 		t.Fatalf("Start error = %v", err)
 	}
@@ -519,7 +520,8 @@ func TestAnalysisIntegrationMaterialisesFactsCacheAndVersions(t *testing.T) {
 	fixture.planner.requirementID = requirementID
 	analyses := codeintelpg.NewAnalysisRepository(pool)
 
-	analysis, reused, err := fixture.service.Start(ctx, versionID, 1, head, false)
+	analysis, reused, err := fixture.service.Start(ctx, versionID, 1,
+		codeintelapp.StartAnalysisInput{HeadCommit: head})
 	if err != nil {
 		t.Fatalf("Start error = %v", err)
 	}
@@ -529,7 +531,8 @@ func TestAnalysisIntegrationMaterialisesFactsCacheAndVersions(t *testing.T) {
 	if fixture.queue.len() != 1 {
 		t.Fatalf("enqueued jobs = %d, want 1", fixture.queue.len())
 	}
-	if _, _, err := fixture.service.Start(ctx, versionID, 1, head, false); err == nil || domain.Reason(err) != "analysis_in_progress" {
+	if _, _, err := fixture.service.Start(ctx, versionID, 1,
+		codeintelapp.StartAnalysisInput{HeadCommit: head}); err == nil || domain.Reason(err) != "analysis_in_progress" {
 		t.Fatalf("duplicate Start error = %v, want analysis_in_progress", err)
 	}
 
@@ -1022,7 +1025,8 @@ func TestAnalysisIntegrationForceAndReuseOnSameInput(t *testing.T) {
 	first := runAnalysisJob(t, fixture, analyses, versionID, head, false)
 	callsAfterFirst := fixture.llm.callCount()
 
-	reused, reusedFlag, err := fixture.service.Start(ctx, versionID, 1, head, false)
+	reused, reusedFlag, err := fixture.service.Start(ctx, versionID, 1,
+		codeintelapp.StartAnalysisInput{HeadCommit: head})
 	if err != nil {
 		t.Fatalf("Start reuse error = %v", err)
 	}

@@ -87,7 +87,7 @@ type stubCodeIntelAnalysis struct {
 	analysis codeinteldomain.CodeAnalysis
 }
 
-func (s stubCodeIntelAnalysis) Start(context.Context, int64, int64, string, bool) (codeinteldomain.CodeAnalysis, bool, error) {
+func (s stubCodeIntelAnalysis) Start(context.Context, int64, int64, codeintelapp.StartAnalysisInput) (codeinteldomain.CodeAnalysis, bool, error) {
 	return s.analysis, false, nil
 }
 

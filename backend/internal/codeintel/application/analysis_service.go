@@ -50,6 +50,11 @@ const (
 	reasonAnalysisInProgress = "analysis_in_progress"
 	reasonAnalysisNotDone    = "analysis_not_done"
 
+	// reasonCommitNotFound is the T0 Git verdict for a commit id the repository
+	// cannot resolve (P4 design spec §7.1). An explicit analysis base that Git
+	// cannot resolve is reported as invalid_base_commit (P7 design spec §7.11).
+	reasonCommitNotFound = "commit_not_found"
+
 	// Per-file analysis error codes persisted in code_analysis.errors.
 	reasonLLMUnavailable = "llm_unavailable"
 	reasonLLMError       = "llm_error"
@@ -241,15 +246,32 @@ func normalizeAnalysisConfig(cfg AnalysisConfig) AnalysisConfig {
 	return cfg
 }
 
-// Start validates the version binding, resolves the head commit, reuses a done
-// analysis for the same input unless force is set, and creates+enqueues a queued
-// analysis with the next analysis version (design spec §6.4/§6.8).
+// StartAnalysisInput is the optional trigger input of design spec §7.9: an
+// explicit head commit (default: the repository fixed branch tip), an explicit
+// base commit (default: the version's code baseline commit) and the force flag
+// that bypasses reuse. Both commits, when present, must be lowercase 40-hex
+// ids; the base must additionally be an ancestor of the resolved head.
+type StartAnalysisInput struct {
+	HeadCommit string
+	BaseCommit string
+	Force      bool
+}
+
+// Start validates the version binding, resolves the base/head commits, reuses a
+// done analysis for the same input unless force is set, and creates+enqueues a
+// queued analysis with the next analysis version (design spec §6.4/§6.8/§7.9).
+//
+// The base defaults to the version's code baseline commit and the head to the
+// live fixed-branch tip; an explicit base must be a 40-hex ancestor of the head
+// (422 invalid_base_commit otherwise). The resolved base participates in the
+// reuse lookup and the analysis-version allocation, so one version can hold
+// analyses of several commit ranges.
 //
 // The returned bool reports reuse: a reused analysis is returned unchanged with
 // reused=true and nothing is created or enqueued. A full worker queue persists
 // the new analysis as failed(analysis_queue_full) and returns the retryable
 // error chain.
-func (s *AnalysisService) Start(ctx context.Context, versionID, actorID int64, headCommit string, force bool) (domain.CodeAnalysis, bool, error) {
+func (s *AnalysisService) Start(ctx context.Context, versionID, actorID int64, in StartAnalysisInput) (domain.CodeAnalysis, bool, error) {
 	s.startMu.Lock()
 	defer s.startMu.Unlock()
 
@@ -261,19 +283,19 @@ func (s *AnalysisService) Start(ctx context.Context, versionID, actorID int64, h
 		return domain.CodeAnalysis{}, false, domain.NewInvalid("versionId", "code_repository_not_bound",
 			fmt.Sprintf("codeintel: version %d has no code repository binding", versionID))
 	}
-	base := strings.TrimSpace(info.BaselineCommit)
-	if base == "" || !commitHashPattern.MatchString(base) {
-		return domain.CodeAnalysis{}, false, domain.NewInvalid("versionId", "baseline_commit_missing",
-			fmt.Sprintf("codeintel: version %d has no valid code baseline commit", versionID))
+	base, baseExplicit, err := s.resolveBase(info, in.BaseCommit)
+	if err != nil {
+		return domain.CodeAnalysis{}, false, err
 	}
 	repo, err := s.activeRepo(ctx, info.RepoID)
 	if err != nil {
 		return domain.CodeAnalysis{}, false, err
 	}
-	head, err := s.resolveHead(ctx, repo, base, headCommit)
+	head, err := s.resolveHead(ctx, repo, base, baseExplicit, in.HeadCommit)
 	if err != nil {
 		return domain.CodeAnalysis{}, false, err
 	}
+	force := in.Force
 
 	model := ""
 	if s.deps.LLM != nil {
@@ -375,12 +397,38 @@ func (s *AnalysisService) failEnqueuedAnalysis(ctx context.Context, analysis dom
 	return failed, false, callerErr
 }
 
+// resolveBase resolves the analysed base commit (design spec §6.8/§7.9). An
+// explicit base must be a lowercase 40-hex commit id (422 invalid_base_commit);
+// otherwise the version's code baseline commit is used and its absence remains
+// the P4 baseline_commit_missing verdict. The explicit flag lets the head
+// resolution attribute a non-ancestor range to the explicit base and allows an
+// explicit base to be analysed even when the version baseline is unset.
+func (s *AnalysisService) resolveBase(info VersionInfo, baseCommit string) (string, bool, error) {
+	explicit := strings.TrimSpace(baseCommit)
+	if explicit == "" {
+		base := strings.TrimSpace(info.BaselineCommit)
+		if base == "" || !commitHashPattern.MatchString(base) {
+			return "", false, domain.NewInvalid("versionId", "baseline_commit_missing",
+				fmt.Sprintf("codeintel: version %d has no valid code baseline commit", info.ID))
+		}
+		return base, false, nil
+	}
+	if !commitHashPattern.MatchString(explicit) {
+		return "", true, domain.NewInvalid("baseCommit", "invalid_base_commit",
+			"codeintel: baseCommit must be a lowercase 40-hex commit id")
+	}
+	return explicit, true, nil
+}
+
 // resolveHead validates an explicit head commit (40 hex and a descendant of the
-// baseline) or resolves the live tip of the repository fixed branch (design
-// spec §6.1/INV-3: the version's code_branch is display metadata, never a Git
-// source; QueryService/IndexService resolve the same fixed branch). base == head
-// is legal.
-func (s *AnalysisService) resolveHead(ctx context.Context, repo RepoInfo, base, headCommit string) (string, error) {
+// resolved base) or resolves the live tip of the repository fixed branch
+// (design spec §6.1/INV-3: the version's code_branch is display metadata, never
+// a Git source; QueryService/IndexService resolve the same fixed branch). An
+// explicit base must itself be an ancestor of the resolved head (design spec
+// §7.9): a rejected range is reported as invalid_base_commit when the base was
+// supplied by the caller, so the caller can correct that field, and as
+// invalid_head for the P4 default-base contract. base == head is legal.
+func (s *AnalysisService) resolveHead(ctx context.Context, repo RepoInfo, base string, baseExplicit bool, headCommit string) (string, error) {
 	head := strings.TrimSpace(headCommit)
 	if head != "" {
 		if !commitHashPattern.MatchString(head) {
@@ -389,15 +437,46 @@ func (s *AnalysisService) resolveHead(ctx context.Context, repo RepoInfo, base, 
 		}
 		ancestor, err := s.deps.Git.IsAncestor(ctx, repo.LocalPath, base, head)
 		if err != nil {
+			if baseExplicit && domain.Reason(err) == reasonCommitNotFound {
+				return "", invalidBaseCommit(base)
+			}
 			return "", err
 		}
 		if !ancestor {
+			if baseExplicit {
+				return "", invalidBaseCommit(base)
+			}
 			return "", domain.NewInvalid("headCommit", "invalid_head",
 				fmt.Sprintf("codeintel: commit %s is not a descendant of the baseline %s", head, base))
 		}
 		return head, nil
 	}
-	return s.deps.Git.Head(ctx, repo.LocalPath, repo.FixedBranch)
+	tip, err := s.deps.Git.Head(ctx, repo.LocalPath, repo.FixedBranch)
+	if err != nil {
+		return "", err
+	}
+	if !baseExplicit {
+		return tip, nil
+	}
+	ancestor, err := s.deps.Git.IsAncestor(ctx, repo.LocalPath, base, tip)
+	if err != nil {
+		if domain.Reason(err) == reasonCommitNotFound {
+			return "", invalidBaseCommit(base)
+		}
+		return "", err
+	}
+	if !ancestor {
+		return "", invalidBaseCommit(base)
+	}
+	return tip, nil
+}
+
+// invalidBaseCommit is the §7.11 verdict of an explicit analysis base that is
+// malformed, does not resolve in the repository, or is not an ancestor of the
+// resolved head.
+func invalidBaseCommit(base string) error {
+	return domain.NewInvalid("baseCommit", "invalid_base_commit",
+		fmt.Sprintf("codeintel: base commit %s must be a 40-hex ancestor of the analysed HEAD", base))
 }
 
 // activeRepo loads the repository and rejects a disabled one (design spec §7.1

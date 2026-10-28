@@ -187,6 +187,36 @@ func TestAnchorsCRUDAndReason(t *testing.T) {
 		}
 	})
 
+	t.Run("an issue anchor is created with subjectKind issue", func(t *testing.T) {
+		anchor := testAnchor(6003, 9301)
+		anchor.SubjectKind = domain.SubjectIssue
+		anchors := &fakeAnchorService{createFn: func(_ context.Context, versionID, actorID int64, params domain.CreateAnchorParams) (domain.CodeAnchor, error) {
+			if versionID != 42 || actorID != testUserID {
+				t.Fatalf("Create(%d, %d), want (42, %d)", versionID, actorID, testUserID)
+			}
+			if params.SubjectKind != domain.SubjectIssue || params.SubjectID != 9301 {
+				t.Fatalf("Create params = %+v, want issue/9301", params)
+			}
+			return anchor, nil
+		}}
+		handler := newTestHandler(t, HandlerDeps{Anchors: anchors})
+		recorder := serveJSON(t, handler, http.MethodPost, "/api/versions/42/code/anchors", userToken, map[string]any{
+			"subjectKind": "issue",
+			"subjectId":   "9301",
+			"filePath":    "src/api/refund.ts",
+		})
+		if recorder.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201 (body %s)", recorder.Code, recorder.Body.String())
+		}
+		var body struct {
+			Data anchorWire `json:"data"`
+		}
+		decodeBody(t, recorder, &body)
+		if body.Data.SubjectKind != domain.SubjectIssue || body.Data.SubjectID != "9301" {
+			t.Fatalf("issue anchor = %+v, want subjectKind issue and the decimal subject id", body.Data)
+		}
+	})
+
 	reasonCases := []struct {
 		name   string
 		err    error
@@ -203,7 +233,7 @@ func TestAnchorsCRUDAndReason(t *testing.T) {
 		},
 		{
 			name:   "an unknown subject kind maps to 422 unsupported_subject_kind",
-			err:    domain.NewInvalid("subjectKind", "unsupported_subject_kind", "codeintel: subjectKind must be one of version, requirement, app_model or case"),
+			err:    domain.NewInvalid("subjectKind", "unsupported_subject_kind", "codeintel: subjectKind must be one of version, requirement, app_model, case or issue"),
 			status: http.StatusUnprocessableEntity,
 			code:   platform.CodeInvalidArgument,
 			reason: "unsupported_subject_kind",

@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/EdouardRichard/EzTest/backend/internal/codeintel/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
 )
 
@@ -35,11 +36,11 @@ func (h *Handler) VersionChanges(w http.ResponseWriter, r *http.Request) {
 }
 
 // StartAnalysis triggers a version-scoped impact analysis or reuses the done one
-// for the same input (design spec §6.4/§6.8). The body carries the optional
-// headCommit and force flag; the application service validates the version
-// binding, the head commit and the active-run rule. A newly queued analysis is a
-// 202; a reused one is a 200 (both report reused so the caller can tell them
-// apart).
+// for the same input (design spec §6.4/§6.8/§7.9). The body carries the optional
+// headCommit, baseCommit and force flag; the application service validates the
+// version binding, the base/head commits (422 invalid_base_commit/invalid_head)
+// and the active-run rule. A newly queued analysis is a 202; a reused one is a
+// 200 (both report reused so the caller can tell them apart).
 func (h *Handler) StartAnalysis(w http.ResponseWriter, r *http.Request) {
 	versionID, err := PathID(r, "id")
 	if err != nil {
@@ -51,7 +52,11 @@ func (h *Handler) StartAnalysis(w http.ResponseWriter, r *http.Request) {
 		WriteServiceError(w, r, err)
 		return
 	}
-	analysis, reused, err := h.analyses.Start(r.Context(), versionID, ActorID(r.Context()), body.HeadCommit, body.Force)
+	analysis, reused, err := h.analyses.Start(r.Context(), versionID, ActorID(r.Context()), application.StartAnalysisInput{
+		HeadCommit: body.HeadCommit,
+		BaseCommit: body.BaseCommit,
+		Force:      body.Force,
+	})
 	if err != nil {
 		WriteServiceError(w, r, err)
 		return

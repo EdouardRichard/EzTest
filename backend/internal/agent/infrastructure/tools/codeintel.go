@@ -9,11 +9,12 @@ package tools
 // appends them to the P1 registry.
 //
 // The ports are declared locally, following the P3 clarification tools: this
-// infrastructure package depends only on the codeintel domain language, never
-// on another context's infrastructure or interfaces. The composition root
-// injects the committed application services, which satisfy the ports
-// structurally (the P3 AgentToolService pattern); the repository catalog is
-// adapted because the tool only needs its summary projection.
+// infrastructure package depends only on the codeintel domain language and the
+// application trigger DTO (StartAnalysisInput), never on another context's
+// infrastructure or interfaces. The composition root injects the committed
+// application services, which satisfy the ports structurally (the P3
+// AgentToolService pattern); the repository catalog is adapted because the tool
+// only needs its summary projection.
 
 import (
 	"context"
@@ -26,6 +27,7 @@ import (
 	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
+	codeintelapp "github.com/EdouardRichard/EzTest/backend/internal/codeintel/application"
 	codeinteldomain "github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
 )
 
@@ -90,7 +92,7 @@ type CodeIntelQueryPort interface {
 // CodeIntelAnalysisPort is the version-scoped analysis subset behind
 // code.analyze/code.impact. It is implemented by *application.AnalysisService.
 type CodeIntelAnalysisPort interface {
-	Start(ctx context.Context, versionID, actorID int64, headCommit string, force bool) (codeinteldomain.CodeAnalysis, bool, error)
+	Start(ctx context.Context, versionID, actorID int64, in codeintelapp.StartAnalysisInput) (codeinteldomain.CodeAnalysis, bool, error)
 	GetLatest(ctx context.Context, versionID int64) (codeinteldomain.CodeAnalysis, error)
 	Get(ctx context.Context, versionID, analysisID int64) (codeinteldomain.CodeAnalysis, error)
 	ListCandidates(ctx context.Context, analysisID int64) ([]codeinteldomain.ImpactCandidate, error)
@@ -521,7 +523,10 @@ func runCodeAnalyze(ctx context.Context, deps CodeIntelToolDeps, args json.RawMe
 	if !ok {
 		return invalidToolArguments("headCommit must be a lowercase 40-hex commit id"), nil
 	}
-	analysis, reused, err := deps.Analyses.Start(ctx, versionID, actor.id, headCommit, input.Force)
+	analysis, reused, err := deps.Analyses.Start(ctx, versionID, actor.id, codeintelapp.StartAnalysisInput{
+		HeadCommit: headCommit,
+		Force:      input.Force,
+	})
 	if err != nil {
 		return codeIntelToolOutcome(err)
 	}

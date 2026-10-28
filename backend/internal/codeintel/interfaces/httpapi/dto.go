@@ -280,10 +280,13 @@ type AnchorDTO struct {
 	CreatedAt     time.Time `json:"createdAt"`
 }
 
-// startAnalysisRequest is the POST /analyses body (design spec §7.3). Both
-// fields are optional, so an empty object is a valid trigger.
+// startAnalysisRequest is the POST /analyses body (design spec §7.3/§7.9). All
+// three fields are optional, so an empty object is a valid trigger: baseCommit
+// defaults to the version code baseline commit and headCommit to the repository
+// fixed branch tip.
 type startAnalysisRequest struct {
 	HeadCommit string `json:"headCommit"`
+	BaseCommit string `json:"baseCommit"`
 	Force      bool   `json:"force"`
 }
 

@@ -8,9 +8,10 @@ import (
 )
 
 // ListAnchors returns the anchor list of the version filtered by subject (design
-// spec §7.3). Both filters are optional; subjectKind is forwarded to the
+// spec §7.3/§7.9). Both filters are optional; subjectKind is forwarded to the
 // application service (which owns the enum and the ordering) and subjectId is a
-// decimal string parsed to the domain's int64.
+// decimal string parsed to the domain's int64. An issue subject filter returns
+// the issue anchors of this version (the version scope is the ownership check).
 func (h *Handler) ListAnchors(w http.ResponseWriter, r *http.Request) {
 	versionID, err := PathID(r, "id")
 	if err != nil {
@@ -35,11 +36,13 @@ func (h *Handler) ListAnchors(w http.ResponseWriter, r *http.Request) {
 	WriteData(w, http.StatusOK, newAnchorDTOs(anchors))
 }
 
-// CreateAnchor creates one user anchor of the version (design spec §6.7/§7.3).
-// The handler only enforces the transport shape (required fields, decimal-string
-// subjectId); the application service owns the subject kind enum, the subject
-// ownership, the file existence, the line-range rule and the point-uniqueness
-// conflict, so every verdict is the documented 422/409 reason.
+// CreateAnchor creates one user anchor of the version (design spec
+// §6.7/§7.3/§7.9). The handler only enforces the transport shape (required
+// fields, decimal-string subjectId); the application service owns the subject
+// kind enum (version, requirement, app_model, case, issue), the subject
+// ownership (an issue must belong to the path version), the file existence, the
+// line-range rule and the point-uniqueness conflict, so every verdict is the
+// documented 422/409 reason.
 func (h *Handler) CreateAnchor(w http.ResponseWriter, r *http.Request) {
 	versionID, err := PathID(r, "id")
 	if err != nil {

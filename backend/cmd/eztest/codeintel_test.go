@@ -97,7 +97,7 @@ func (stubToolQuery) Facts(context.Context, int64, codeinteldomain.EntityFilter)
 
 type stubToolAnalysis struct{}
 
-func (stubToolAnalysis) Start(context.Context, int64, int64, string, bool) (codeinteldomain.CodeAnalysis, bool, error) {
+func (stubToolAnalysis) Start(context.Context, int64, int64, codeintelapp.StartAnalysisInput) (codeinteldomain.CodeAnalysis, bool, error) {
 	return codeinteldomain.CodeAnalysis{}, false, nil
 }
 
