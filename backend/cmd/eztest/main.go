@@ -262,6 +262,8 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Access:   resourcehttp.NewAccessHandler(accessService),
 		Session:  resourcehttp.NewSessionHandler(sessionService),
 		CodeRepo: resourcehttp.NewCodeRepoHandler(codeRepoService),
+		AuthFlow: resourcehttp.NewAuthFlowHandler(
+			resourceapp.NewAuthFlowService(resourceAuthFlows, resourceCatalogRepo)),
 	}
 
 	// P3 version context: the PostgreSQL repositories, the cross-context
@@ -572,6 +574,15 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		executionapp.WithEvidenceMaxPerCaseRun(cfg.ExecEvidencePerCase),
 	)
 	executorClient := executionbrowser.New(cfg.ExecutorURL, cfg.ExecutorToken, 0)
+	// Auto-login acquisition drives the stored form recipe through the same
+	// executor client used for case execution and captures the storage_state the
+	// resource service leases to execution (spec §5.9). Without this wiring the
+	// acquisition path fails closed with no_valid_session.
+	sessionService.ConfigureAcquisition(resourceapp.AcquisitionDeps{
+		Flows:    resourceAuthFlows,
+		Login:    executionbrowser.NewLoginBrowser(executorClient),
+		Accounts: resourceAccessRepo,
+	})
 	if cfg.ExecutorToken == "" {
 		logger.Warn("EZTEST_EXECUTOR_TOKEN is empty; executor calls will be rejected until the API and executor share a token")
 	}
