@@ -389,9 +389,9 @@ type CodeAnchorGateway interface {
 	Delete(ctx context.Context, versionID, anchorID int64) error
 }
 
-// Prober performs one read-only HTTP probe for app exploration. The
-// infrastructure/httpclient adapter implements it; application services must
-// depend on this port, never on the adapter package (Agent.md §6.2).
+// ProbeResult is the parsed projection of one read-only HTTP probe. Body is the
+// capped page body; Truncated reports that the response was longer and the body
+// was cut.
 type ProbeResult struct {
 	URL         string
 	Status      int
@@ -404,8 +404,17 @@ type ProbeResult struct {
 	Truncated   bool
 }
 
+// Prober performs one read-only HTTP probe for app exploration. The
+// infrastructure/httpclient adapter implements it; application services must
+// depend on this port, never on the adapter package (Agent.md §6.2).
+//
+// allowedHosts is the per-environment SSRF allowlist: the environment base host
+// plus its configured allowed_hosts. A non-empty list overrides the adapter's
+// configured allowlist for this probe; nil or empty falls back to the adapter
+// configuration. Passing it on every call lets one shared Prober serve many
+// environments without weakening the adapter's host check.
 type Prober interface {
-	Probe(ctx context.Context, rawURL, cookieHeader string) (ProbeResult, error)
+	Probe(ctx context.Context, rawURL, cookieHeader string, allowedHosts []string) (ProbeResult, error)
 }
 
 // AgentRuntime is the P1 agent runtime port: profile seeding, sessions, text

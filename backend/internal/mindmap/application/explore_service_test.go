@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -22,22 +23,35 @@ const (
 	exploreBaseURL = "http://app.test"
 )
 
-// exploreHits counts fake probe calls per path and keeps the last cookie.
+// exploreHits counts fake probe calls per path and keeps the last cookie and
+// host allowlist each call was made with.
 type exploreHits struct {
-	mu      sync.Mutex
-	counts  map[string]int
-	cookies map[string]string
+	mu         sync.Mutex
+	counts     map[string]int
+	cookies    map[string]string
+	allowlists map[string][]string
 }
 
 func newExploreHits() *exploreHits {
-	return &exploreHits{counts: make(map[string]int), cookies: make(map[string]string)}
+	return &exploreHits{
+		counts:     make(map[string]int),
+		cookies:    make(map[string]string),
+		allowlists: make(map[string][]string),
+	}
 }
 
-func (h *exploreHits) add(path, cookie string) {
+func (h *exploreHits) add(path, cookie string, allowedHosts []string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.counts[path]++
 	h.cookies[path] = cookie
+	h.allowlists[path] = append([]string(nil), allowedHosts...)
+}
+
+func (h *exploreHits) allowlist(path string) []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.allowlists[path]...)
 }
 
 func (h *exploreHits) get(path string) int {
@@ -69,13 +83,13 @@ type fakeProber struct {
 	handler func(path, rawURL, cookieHeader string) (application.ProbeResult, error)
 }
 
-func (p *fakeProber) Probe(_ context.Context, rawURL, cookieHeader string) (application.ProbeResult, error) {
+func (p *fakeProber) Probe(_ context.Context, rawURL, cookieHeader string, allowedHosts []string) (application.ProbeResult, error) {
 	path := "/"
 	if parsed, err := url.Parse(rawURL); err == nil && parsed.Path != "" {
 		path = parsed.Path
 	}
 	if p.hits != nil {
-		p.hits.add(path, cookieHeader)
+		p.hits.add(path, cookieHeader, allowedHosts)
 	}
 	result, err := p.handler(path, rawURL, cookieHeader)
 	if err != nil {
@@ -93,7 +107,7 @@ func (p *fakeProber) Probe(_ context.Context, rawURL, cookieHeader string) (appl
 // failingProber is the default fixture prober: it fails the run if reached.
 type failingProber struct{}
 
-func (failingProber) Probe(context.Context, string, string) (application.ProbeResult, error) {
+func (failingProber) Probe(context.Context, string, string, []string) (application.ProbeResult, error) {
 	return application.ProbeResult{}, errors.New("unexpected probe")
 }
 
@@ -597,6 +611,31 @@ func TestExploreRunImportsExploredAppModels(t *testing.T) {
 	}
 	if hits.get("/logout") != 0 || hits.get("/p5/delete/1") != 0 {
 		t.Fatal("logout/delete links were fetched")
+	}
+}
+
+// TestExplorePassesEnvironmentAllowlistToProbes pins that every probe (the
+// start page and the links discovered from it) carries the per-environment
+// allowlist: the base URL host plus the configured allowed_hosts, normalized to
+// bare lowercase hosts and deduplicated.
+func TestExplorePassesEnvironmentAllowlistToProbes(t *testing.T) {
+	prober, hits := newExploreSite()
+	fixture := newExploreFixture(exploreBaseURL)
+	fixture.prober = prober
+	fixture.environment.AllowedHosts = []string{"API.Test:8443", "127.0.0.1", "App.TEST"}
+
+	run, err := fixture.service().Start(context.Background(), exploreVersionID, 7, application.ExploreCommand{})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if _, err := fixture.service().Run(context.Background(), run); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	want := []string{"app.test", "api.test", "127.0.0.1"}
+	for _, path := range []string{"/", "/p5/orders"} {
+		if got := hits.allowlist(path); !slices.Equal(got, want) {
+			t.Fatalf("probe %s allowlist = %v, want %v", path, got, want)
+		}
 	}
 }
 

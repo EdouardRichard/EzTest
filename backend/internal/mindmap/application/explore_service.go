@@ -600,7 +600,7 @@ func (c *exploreCrawl) run(ctx context.Context) error {
 		c.queue = c.queue[1:]
 		c.requests++
 
-		probe, err := c.probe.Probe(ctx, target.url.String(), c.cookie)
+		probe, err := c.probe.Probe(ctx, target.url.String(), c.cookie, c.allowed)
 		if err != nil {
 			if target.depth != 0 {
 				continue
