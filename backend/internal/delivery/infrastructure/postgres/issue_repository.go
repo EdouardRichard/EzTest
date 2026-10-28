@@ -135,8 +135,9 @@ func (r *IssueRepository) Update(ctx context.Context, issue domain.Issue, expect
 		failure_class = $12, dedupe_key = $13, title = $14, description = $15,
 		repro_steps = $16, expected = $17, actual = $18, rerun_suggestion = $19,
 		external_ref = $20, recurrence_count = $21, revision = $22, dismissed_reason = $23,
+		created_by = $24,
 		updated_by = $25, confirmed_by = $26, confirmed_at = $27, dismissed_by = $28,
-		dismissed_at = $29, updated_at = $31
+		dismissed_at = $29, created_at = $30, updated_at = $31
 		WHERE id = $1 AND version_id = $2 AND revision = $32
 		RETURNING `+issueColumnList, args...))
 	if err != nil {
