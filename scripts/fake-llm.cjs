@@ -14,6 +14,8 @@
 //   POST /__p5-mode             (test-only: switch the P5 scenario at runtime)
 //   GET  /__p6-mode             (test-only: the active P6 execution scenario mode)
 //   POST /__p6-mode             (test-only: switch the P6 scenario at runtime)
+//   GET  /__p7-mode             (test-only: the active P7 autonomous-loop mode)
+//   POST /__p7-mode             (test-only: switch the P7 scenario at runtime)
 //
 // Every chat-completions request body is appended as one JSON line to
 // .tmp/fake-llm-requests.jsonl so Playwright can assert the outbound wire
@@ -1459,6 +1461,9 @@ async function handleP5Scenario(messages, res, stream) {
 //
 //   normal   case_context -> goto (/p6/orders/new) -> snapshot -> fill -> click
 //            -> screenshot -> step_record xN -> assertion_record xM -> case_finish(passed)
+//            (P7: a kind=db assertion uses execution_db_assert instead of
+//            assertion_record; the server reads SQL/expected/target and records
+//            the db_result evidence, spec §9.5)
 //   fail     case_context -> goto (/p6/assert-fail) -> snapshot -> screenshot
 //            -> step_record xN -> assertion_record xM(failed) -> case_finish(failed, application)
 //   blocked  case_context -> goto (/p6/requires-auth) -> snapshot -> screenshot
@@ -1675,6 +1680,17 @@ function planP6Turn(mode, run) {
 
   if (index < assertions.length) {
     const assertion = assertions[index];
+    // P7 addition (spec §9.5): a kind=db snapshot assertion is executed by the
+    // server-side execution.db_assert tool, not by execution.assertion_record.
+    // The agent sends only the assertion id; SQL, expected value and the target
+    // stay on the server. The tool itself records the db_result evidence.
+    if (assertion.kind === "db") {
+      return p6Tool(
+        "execution_db_assert",
+        { assertionId: assertion.assertion_id },
+        "P7 执行：执行服务器端 db 断言 " + assertion.assertion_id,
+      );
+    }
     if (evidenceId === "") return p6Text(P6_EMPTY_CONTEXT_TEXT);
     const failed = mode === "fail";
     return p6Tool(
@@ -1760,6 +1776,554 @@ async function handleP6Scenario(messages, res, stream) {
     return true;
   }
   sendJson(res, 200, completionBody({ content: plan.text }, "stop", P6_TEXT_USAGE));
+  return true;
+}
+
+// --- P7 autonomous-loop scenarios (design spec §9.1-§9.5, §12.5) -----------
+//
+// P7 requests are identified by the stable Chinese system-prompt markers of the
+// three seeded P7 profiles (`backend/internal/mindmap/domain/profile_supplement.go`
+// and `backend/internal/delivery/domain/profile.go`). Every run is scripted from
+// the number of assistant tool turns already present after the run instruction
+// (the same counting trick as P3/P5/P6) and from the ids the backend returned by
+// the read tools, so proposals always cite real ids and never invent any:
+//
+//   supplement  context_read -> case_propose -> [affected_cases_propose] -> finish
+//   failure     case_list -> case_detail xN -> evidence_meta -> candidate_propose -> finish
+//   triage      candidate_list -> issue_list -> context_read -> issue_draft -> finish
+//
+// affected_cases_propose only runs for incremental_design runs: the backend
+// rejects it for post_batch supplement runs (spec §9.2).
+//
+// Modes (default normal), switched at runtime by POST /__p7-mode:
+//   noop      read once then finish without proposals (no supplement batch,
+//             no failure candidate, no issue draft)
+//   degraded  one text-only turn; a successful completion, not an upstream
+//             failure (the backend records a degraded run, not a failed one)
+//   invalid   the proposal call carries malformed JSON arguments so the tool
+//             layer answers invalid_arguments and the run degrades
+//
+// Every P7 id emitted here is a decimal string (D29) and every tool call name is
+// the P1 gateway's dot->underscore wire form (`supplement.case_propose` ->
+// `supplement_case_propose`), exactly like P5/P6.
+const P7_SUPPLEMENT_MARKER = "EzTest 的补全 Agent";
+const P7_FAILURE_MARKER = "EzTest 的失败分析 Agent";
+const P7_TRIAGE_MARKER = "EzTest 的问题整理 Agent";
+const P7_MODES = new Set(["normal", "noop", "degraded", "invalid"]);
+const P7_TOOL_USAGE = makeUsage(900, 180, 64);
+const P7_TEXT_USAGE = makeUsage(200, 24, 0);
+const P7_DEGRADED_TEXT = "P7 降级：LLM 不可用，未提交任何结构化结果，已按降级路径结束。";
+const P7_INVALID_TEXT = "P7 提案参数无效：工具返回 invalid_arguments，本轮按降级结束。";
+const P7_EMPTY_TEXT = "P7 无法读取运行指令，本轮未提交任何提案。";
+const P7_FINISH_TEXTS = {
+  supplement: "P7 补全完成：已提交新增用例与受影响用例建议。",
+  supplementNoop: "P7 补全结束：本轮没有发现需要补全的用例。",
+  failure: "P7 失败分析完成：已提交失败候选。",
+  failureNoop: "P7 失败分析结束：本批次没有可提交的失败候选。",
+  triage: "P7 问题整理完成：已提交问题单草稿。",
+  triageNoop: "P7 问题整理结束：本批次没有可提交的问题单草稿。",
+};
+// Deliberately malformed JSON arguments for the invalid mode: the backend tool
+// decoder must answer invalid_arguments instead of proposing anything.
+const P7_INVALID_SUPPLEMENT_ARGS = '{"cases":[{"title":"P7 无效提案"';
+const P7_INVALID_FAILURE_ARGS = '{"candidates":[{"caseRunId":"7301"';
+const P7_INVALID_TRIAGE_ARGS = '{"issues":[{"title":"P7 无效草稿"';
+const P7_CODE_REFS = [
+  {
+    path: "backend/internal/order/service.go",
+    line: 42,
+    reason: "P7 契约测试：失败分支位于下单服务的此处",
+  },
+];
+
+/** Test-only runtime control of EZTEST_FAKE_LLM_P7_MODE (spec §12.5). */
+async function handleP7ModeControl(req, res) {
+  const raw = await readBody(req);
+  let body;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    sendError(res, 400, "invalid json body");
+    return;
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    sendError(res, 400, "invalid json body");
+    return;
+  }
+  const mode = String(body.mode || "")
+    .trim()
+    .toLowerCase();
+  if (!P7_MODES.has(mode)) {
+    sendError(res, 400, "mode must be one of normal, noop, degraded, invalid");
+    return;
+  }
+  process.env.EZTEST_FAKE_LLM_P7_MODE = mode;
+  sendJson(res, 200, { mode: p7Mode() });
+}
+
+function p7Mode() {
+  const value = String(process.env.EZTEST_FAKE_LLM_P7_MODE || "normal")
+    .trim()
+    .toLowerCase();
+  return P7_MODES.has(value) ? value : "normal";
+}
+
+/** Matches one P7 profile from the system prompt; null for P1-P6. */
+function detectP7Scenario(systemText) {
+  if (systemText.includes(P7_SUPPLEMENT_MARKER)) return "supplement";
+  if (systemText.includes(P7_FAILURE_MARKER)) return "failure";
+  if (systemText.includes(P7_TRIAGE_MARKER)) return "triage";
+  return null;
+}
+
+/** Appends the compact P7 request line (never the prompt or run data). */
+function recordP7Request(profile, mode, step) {
+  const entry = { p7: true, profile, mode, step };
+  try {
+    fs.appendFileSync(REQUEST_LOG_PATH, JSON.stringify(entry) + "\n", "utf8");
+  } catch (error) {
+    console.error("fake-llm: failed to append the request log: " + error.message);
+  }
+}
+
+function p7Tool(name, args, reasoning) {
+  return { kind: "tool", name, arguments: JSON.stringify(args), reasoning };
+}
+
+/** Builds a tool turn with raw (possibly malformed) argument text. */
+function p7RawTool(name, argumentsText, reasoning) {
+  return { kind: "tool", name, arguments: argumentsText, reasoning };
+}
+
+function p7Text(text) {
+  return { kind: "text", text };
+}
+
+/** Returns the latest parsed tool result with the given wire name, or null. */
+function p7LatestResult(toolResults, name) {
+  for (let index = toolResults.length - 1; index >= 0; index -= 1) {
+    if (toolResults[index].name !== name) continue;
+    const parsed = parseJsonObject(toolResults[index].text);
+    if (parsed !== null) return parsed;
+  }
+  return null;
+}
+
+function p7HasResult(toolResults, name) {
+  return toolResults.some((result) => result.name === name);
+}
+
+/** Reads one `key=value` line of the run instruction. */
+function p7InstructionValue(userText, key) {
+  const match = new RegExp("(?:^|\\n)" + key + "=([^\\n]+)").exec(userText);
+  return match ? match[1].trim() : "";
+}
+
+/** Keeps only positive decimal string ids from an arbitrary array. */
+function p7StringIds(value) {
+  if (!Array.isArray(value)) return [];
+  const ids = [];
+  for (const item of value) {
+    if (typeof item === "string" && /^[1-9][0-9]*$/.test(item) && !ids.includes(item)) {
+      ids.push(item);
+    }
+  }
+  return ids;
+}
+
+/** The run mode carried by the supplement instruction (spec §6.4.1). */
+function p7SupplementMode(userText) {
+  return p7InstructionValue(userText, "mode") === "incremental_design"
+    ? "incremental_design"
+    : "post_batch";
+}
+
+/** Confirmed requirement ids returned by supplement.context_read. */
+function p7ContextRequirementIds(toolResults) {
+  const context = p7LatestResult(toolResults, "supplement_context_read");
+  if (context === null || !Array.isArray(context.requirements)) return [];
+  return p7StringIds(context.requirements.map((requirement) => (requirement ? requirement.id : "")));
+}
+
+/** Existing, non-draft case node ids returned by supplement.context_read. */
+function p7ContextCaseNodeIds(toolResults) {
+  const context = p7LatestResult(toolResults, "supplement_context_read");
+  if (context === null || !Array.isArray(context.cases)) return [];
+  const usable = context.cases.filter(
+    (node) => node && typeof node.nodeId === "string" && node.status !== "draft",
+  );
+  return p7StringIds(usable.map((node) => node.nodeId));
+}
+
+/** One supplement.case_propose payload: 2 cases tied to confirmed requirements. */
+function p7SupplementCases(requirementIds) {
+  const requirementId = requirementIds[0];
+  return [
+    {
+      title: "P7 补全：下单金额校验",
+      description: "补全基线未覆盖的下单金额校验场景。",
+      priority: "P1",
+      preconditions: "用户已登录且购物车非空",
+      requirementIds: [requirementId],
+      confidence: "high",
+      rationale: "基于已确认需求与覆盖缺口生成。",
+      steps: [
+        { action: "打开下单页并输入合法金额", expected: "金额校验通过", data: "amount=100" },
+        { action: "提交订单", expected: "订单创建成功" },
+      ],
+      assertions: [
+        {
+          kind: "ui",
+          target: "#order-result",
+          expression: "text contains 订单创建成功",
+          expected: "订单创建成功",
+        },
+      ],
+    },
+    {
+      title: "P7 补全：退款幂等校验",
+      description: "补全重复退款请求的幂等场景。",
+      priority: "P2",
+      preconditions: "存在可退款订单",
+      requirementIds: [requirementId],
+      confidence: "medium",
+      rationale: "基于已确认需求生成。",
+      steps: [{ action: "连续提交两次退款", expected: "只生成一笔退款", data: "order=P7-1" }],
+      assertions: [
+        { kind: "api", target: "/api/refunds", expression: "refundCount == 1", expected: "1" },
+      ],
+    },
+  ];
+}
+
+/** One supplement.affected_cases_propose payload with code locations. */
+function p7AffectedCase(nodeId, requirementIds) {
+  const affected = {
+    caseNodeId: nodeId,
+    confidence: "high",
+    reason: "需求变化影响该旧用例的断言与页面路径。",
+    source: "code",
+    codeRefs: P7_CODE_REFS,
+  };
+  if (requirementIds.length > 0) affected.requirementIds = [requirementIds[0]];
+  return affected;
+}
+
+/** Plans one supplement-agent turn. */
+function planP7SupplementTurn(run, userText, mode) {
+  if (mode === "degraded") return p7Text(P7_DEGRADED_TEXT);
+
+  const runMode = p7SupplementMode(userText);
+  if (!p7HasResult(run.toolResults, "supplement_context_read")) {
+    return p7Tool("supplement_context_read", { mode: runMode }, "P7 补全：读取需求/用例/覆盖/影响摘要");
+  }
+  const requirementIds = p7ContextRequirementIds(run.toolResults);
+
+  if (mode === "invalid") {
+    if (p7HasResult(run.toolResults, "supplement_case_propose")) return p7Text(P7_INVALID_TEXT);
+    return p7RawTool("supplement_case_propose", P7_INVALID_SUPPLEMENT_ARGS, "P7 补全：提交无效提案");
+  }
+  if (mode === "noop") {
+    if (p7HasResult(run.toolResults, "supplement_finish")) return p7Text(P7_FINISH_TEXTS.supplementNoop);
+    return p7Tool(
+      "supplement_finish",
+      { summary: "P7 补全：本轮没有发现需要补全的用例" },
+      "P7 补全：结束补全运行",
+    );
+  }
+  if (p7HasResult(run.toolResults, "supplement_finish")) return p7Text(P7_FINISH_TEXTS.supplement);
+
+  if (!p7HasResult(run.toolResults, "supplement_case_propose")) {
+    if (requirementIds.length === 0) {
+      return p7Tool(
+        "supplement_finish",
+        { summary: "P7 补全：缺少已确认需求，未提交提案" },
+        "P7 补全：信息不足，结束运行",
+      );
+    }
+    return p7Tool(
+      "supplement_case_propose",
+      { cases: p7SupplementCases(requirementIds) },
+      "P7 补全：提交 1-2 条新增用例",
+    );
+  }
+
+  if (runMode === "incremental_design" && !p7HasResult(run.toolResults, "supplement_affected_cases_propose")) {
+    const nodeIds = p7ContextCaseNodeIds(run.toolResults);
+    if (nodeIds.length > 0) {
+      return p7Tool(
+        "supplement_affected_cases_propose",
+        { cases: [p7AffectedCase(nodeIds[0], requirementIds)] },
+        "P7 增量设计：提交受影响的旧用例",
+      );
+    }
+  }
+
+  return p7Tool(
+    "supplement_finish",
+    { summary: "P7 补全完成：已提交新增用例与受影响用例建议" },
+    "P7 补全：结束补全运行",
+  );
+}
+
+/** Returns the latest analysis.case_detail result of one case run, or null. */
+function p7CaseDetail(toolResults, caseRunId) {
+  for (let index = toolResults.length - 1; index >= 0; index -= 1) {
+    if (toolResults[index].name !== "analysis_case_detail") continue;
+    const parsed = parseJsonObject(toolResults[index].text);
+    if (parsed !== null && parsed.caseRunId === caseRunId) return parsed;
+  }
+  return null;
+}
+
+/** Builds the failure candidates from the case details read so far. */
+function p7FailureCandidates(details) {
+  const candidates = [];
+  for (const detail of details) {
+    const evidenceIds = p7StringIds(detail.evidenceIds);
+    if (evidenceIds.length === 0) continue;
+    const title = typeof detail.title === "string" && detail.title !== "" ? detail.title : "用例";
+    candidates.push({
+      caseRunId: detail.caseRunId,
+      caseNodeId: detail.caseNodeId,
+      title: "P7 失败分析：" + title,
+      description: "失败断言与证据已复核，根因可由证据与代码位置解释。",
+      severity: "major",
+      confidence: "high",
+      failureClass: "application",
+      rerunSuggestion: "修复后重跑该用例并复核断言。",
+      evidenceIds,
+    });
+  }
+  return candidates;
+}
+
+/** Plans one failure-analysis-agent turn. */
+function planP7FailureTurn(run, userText, mode) {
+  if (mode === "degraded") return p7Text(P7_DEGRADED_TEXT);
+
+  const batchId = p7InstructionValue(userText, "batchId");
+  if (!p7HasResult(run.toolResults, "analysis_case_list")) {
+    return p7Tool("analysis_case_list", { batchId }, "P7 失败分析：读取失败用例摘要");
+  }
+  if (mode === "invalid") {
+    if (p7HasResult(run.toolResults, "analysis_candidate_propose")) return p7Text(P7_INVALID_TEXT);
+    return p7RawTool("analysis_candidate_propose", P7_INVALID_FAILURE_ARGS, "P7 失败分析：提交无效候选");
+  }
+  if (mode === "noop") {
+    if (p7HasResult(run.toolResults, "analysis_finish")) return p7Text(P7_FINISH_TEXTS.failureNoop);
+    return p7Tool(
+      "analysis_finish",
+      { summary: "P7 失败分析结束：本轮没有可提交的候选" },
+      "P7 失败分析：结束分析运行",
+    );
+  }
+
+  const caseList = p7LatestResult(run.toolResults, "analysis_case_list");
+  const failed = caseList && Array.isArray(caseList.cases) ? caseList.cases : [];
+  const wanted = failed
+    .filter((failedCase) => failedCase && typeof failedCase.caseRunId === "string")
+    .slice(0, 2);
+  // One detail turn per failed case, counted on the tool results so a malformed
+  // or failed detail can never make the plan request it forever.
+  const detailTurns = run.toolResults.filter((result) => result.name === "analysis_case_detail").length;
+  if (detailTurns < wanted.length) {
+    const failedCase = wanted[detailTurns];
+    return p7Tool(
+      "analysis_case_detail",
+      { caseRunId: failedCase.caseRunId },
+      "P7 失败分析：读取用例明细 " + failedCase.caseRunId,
+    );
+  }
+
+  const details = wanted
+    .map((failedCase) => p7CaseDetail(run.toolResults, failedCase.caseRunId))
+    .filter((detail) => detail !== null);
+  const evidenceIds = p7StringIds(details.flatMap((detail) => p7StringIds(detail.evidenceIds)));
+  if (evidenceIds.length > 0 && !p7HasResult(run.toolResults, "analysis_evidence_meta")) {
+    return p7Tool("analysis_evidence_meta", { evidenceIds }, "P7 失败分析：读取证据元数据");
+  }
+
+  if (!p7HasResult(run.toolResults, "analysis_candidate_propose")) {
+    const candidates = p7FailureCandidates(details);
+    if (candidates.length > 0) {
+      return p7Tool(
+        "analysis_candidate_propose",
+        { candidates },
+        "P7 失败分析：提交 1-2 条失败候选",
+      );
+    }
+  }
+  if (!p7HasResult(run.toolResults, "analysis_finish")) {
+    return p7Tool(
+      "analysis_finish",
+      { summary: "P7 失败分析完成：已提交失败候选" },
+      "P7 失败分析：结束分析运行",
+    );
+  }
+  return p7Text(P7_FINISH_TEXTS.failure);
+}
+
+/** Sanitizes failure-candidate code refs for triage.issue_draft. */
+function p7DraftCodeRefs(codeRefs) {
+  if (!Array.isArray(codeRefs)) return [];
+  const refs = [];
+  for (const ref of codeRefs) {
+    if (!ref || typeof ref.path !== "string" || ref.path === "") continue;
+    if (!Number.isInteger(ref.line) || ref.line <= 0) continue;
+    if (typeof ref.reason !== "string" || ref.reason === "") continue;
+    refs.push({ path: ref.path, line: ref.line, reason: ref.reason });
+  }
+  return refs;
+}
+
+/** Builds one issue draft, merging into an open issue with the same title. */
+function p7IssueDraft(candidate, issueList) {
+  const title =
+    typeof candidate.title === "string" && candidate.title !== "" ? candidate.title : "P7 失败候选：待整理";
+  const draft = {
+    title,
+    description:
+      typeof candidate.description === "string" && candidate.description !== ""
+        ? candidate.description
+        : "失败分析候选整理为可复现问题单。",
+    reproSteps: "1. 运行失败用例 " + candidate.caseNodeId + "\n2. 按证据复现失败",
+    expected: "用例断言通过",
+    actual:
+      typeof candidate.description === "string" && candidate.description !== ""
+        ? candidate.description
+        : "断言失败",
+    severity: typeof candidate.severity === "string" ? candidate.severity : "major",
+    confidence: typeof candidate.confidence === "string" ? candidate.confidence : "high",
+    caseRunId: candidate.caseRunId,
+    caseNodeId: candidate.caseNodeId,
+    evidenceIds: p7StringIds(candidate.evidenceIds),
+    codeRefs: p7DraftCodeRefs(candidate.codeRefs),
+  };
+  const openIssues = issueList && Array.isArray(issueList.issues) ? issueList.issues : [];
+  const match = openIssues.find(
+    (issue) =>
+      issue &&
+      issue.title === draft.title &&
+      typeof issue.issueId === "string" &&
+      /^[1-9][0-9]*$/.test(issue.issueId),
+  );
+  if (match) draft.mergeIntoIssueId = match.issueId;
+  return draft;
+}
+
+/** Plans one issue-triage-agent turn. */
+function planP7TriageTurn(run, mode) {
+  if (mode === "degraded") return p7Text(P7_DEGRADED_TEXT);
+
+  if (!p7HasResult(run.toolResults, "triage_candidate_list")) {
+    return p7Tool("triage_candidate_list", {}, "P7 问题整理：读取失败候选");
+  }
+  if (mode === "invalid") {
+    if (p7HasResult(run.toolResults, "triage_issue_draft")) return p7Text(P7_INVALID_TEXT);
+    return p7RawTool("triage_issue_draft", P7_INVALID_TRIAGE_ARGS, "P7 问题整理：提交无效草稿");
+  }
+  if (mode === "noop") {
+    if (p7HasResult(run.toolResults, "triage_finish")) return p7Text(P7_FINISH_TEXTS.triageNoop);
+    return p7Tool(
+      "triage_finish",
+      { summary: "P7 问题整理结束：本轮没有可提交的草稿" },
+      "P7 问题整理：结束整理运行",
+    );
+  }
+
+  const candidateList = p7LatestResult(run.toolResults, "triage_candidate_list");
+  const candidates =
+    candidateList && Array.isArray(candidateList.candidates)
+      ? candidateList.candidates.filter((candidate) => candidate && typeof candidate.caseRunId === "string")
+      : [];
+
+  if (!p7HasResult(run.toolResults, "triage_issue_list")) {
+    return p7Tool("triage_issue_list", {}, "P7 问题整理：读取 open 问题摘要");
+  }
+  if (candidates.length === 0) {
+    if (p7HasResult(run.toolResults, "triage_finish")) return p7Text(P7_FINISH_TEXTS.triageNoop);
+    return p7Tool(
+      "triage_finish",
+      { summary: "P7 问题整理结束：没有可整理的候选" },
+      "P7 问题整理：结束整理运行",
+    );
+  }
+
+  const first = candidates[0];
+  if (!p7HasResult(run.toolResults, "triage_context_read")) {
+    return p7Tool(
+      "triage_context_read",
+      {
+        caseRunIds: [first.caseRunId],
+        evidenceIds: p7StringIds(first.evidenceIds),
+      },
+      "P7 问题整理：读取用例/证据/代码位置摘要",
+    );
+  }
+  if (!p7HasResult(run.toolResults, "triage_issue_draft")) {
+    const issueList = p7LatestResult(run.toolResults, "triage_issue_list") || { issues: [] };
+    return p7Tool(
+      "triage_issue_draft",
+      { issues: [p7IssueDraft(first, issueList)] },
+      "P7 问题整理：提交 1 张问题单草稿",
+    );
+  }
+  if (!p7HasResult(run.toolResults, "triage_finish")) {
+    return p7Tool(
+      "triage_finish",
+      { summary: "P7 问题整理完成：已提交问题单草稿" },
+      "P7 问题整理：结束整理运行",
+    );
+  }
+  return p7Text(P7_FINISH_TEXTS.triage);
+}
+
+/** Plans exactly one P7 turn from the profile, the run state and the mode. */
+function planP7Turn(profile, run, userText, mode) {
+  switch (profile) {
+    case "supplement":
+      return planP7SupplementTurn(run, userText, mode);
+    case "failure":
+      return planP7FailureTurn(run, userText, mode);
+    default:
+      return planP7TriageTurn(run, mode);
+  }
+}
+
+/**
+ * Handles one P7 agent request. Returns true when the system prompt carried a P7
+ * role marker, false so P1-P6 stay untouched.
+ */
+async function handleP7Scenario(messages, res, stream) {
+  const profile = detectP7Scenario(systemPromptText(messages));
+  if (profile === null) return false;
+
+  const lastUser = findLastUserMessage(messages);
+  const run = lastUser ? describeP5Run(messages, lastUser.index) : { step: 0, toolResults: [] };
+  const mode = p7Mode();
+  recordP7Request(profile, mode, run.step);
+
+  const plan = lastUser ? planP7Turn(profile, run, lastUser.text, mode) : p7Text(P7_EMPTY_TEXT);
+  if (plan.kind === "tool") {
+    const message = {
+      content: null,
+      reasoning_content: plan.reasoning,
+      tool_calls: toolCallPayload(plan.name, plan.arguments, `p7_${profile}_call_${run.step + 1}`),
+    };
+    if (stream) {
+      await streamToolTurn(res, message, P7_TOOL_USAGE);
+      return true;
+    }
+    sendJson(res, 200, completionBody(message, "tool_calls", P7_TOOL_USAGE));
+    return true;
+  }
+
+  if (stream) {
+    await streamTextTurn(res, plan.text, P7_TEXT_USAGE);
+    return true;
+  }
+  sendJson(res, 200, completionBody({ content: plan.text }, "stop", P7_TEXT_USAGE));
   return true;
 }
 
@@ -1869,6 +2433,12 @@ async function handleChatCompletions(req, res) {
   // answered after P5 and before recordRequest so the execution plan owns every
   // turn and P1-P5 request logging stays untouched.
   if (await handleP6Scenario(messages, res, stream)) return;
+
+  // P7 supplement/failure/triage requests carry one of the three P7 role
+  // markers (design spec §9.1-§9.4). They are answered after P6 and before
+  // recordRequest so the P7 plan owns every turn, including the degraded mode
+  // that answers without any tool call.
+  if (await handleP7Scenario(messages, res, stream)) return;
 
   recordRequest(body);
 
@@ -1994,6 +2564,15 @@ async function handleRequest(req, res) {
   }
   if (req.method === "GET" && pathname === "/__p6-mode") {
     sendJson(res, 200, { mode: p6Mode() });
+    return;
+  }
+  // Test-only P7 autonomous-loop scenario control (design spec §12.5).
+  if (req.method === "POST" && pathname === "/__p7-mode") {
+    await handleP7ModeControl(req, res);
+    return;
+  }
+  if (req.method === "GET" && pathname === "/__p7-mode") {
+    sendJson(res, 200, { mode: p7Mode() });
     return;
   }
   sendError(res, 404, "not found");
