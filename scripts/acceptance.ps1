@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     Runs the P0-P5 acceptance gate for EzTest.
@@ -1036,9 +1036,9 @@ function Initialize-P5ApiContext {
     $script:p5.EnvironmentId = $environment.Data.id
 
     foreach ($appModel in @(
-            @{ key = "page:/p5/home"; kind = "page"; name = "P5 home"; path = "/p5/home"; method = "" },
-            @{ key = "route:/p5/orders"; kind = "route"; name = "P5 orders"; path = "/p5/orders"; method = "" },
-            @{ key = "api:GET /api/orders"; kind = "api"; name = "P5 orders API"; path = "/api/orders"; method = "GET" }
+            @{ key = "page:/manual/home"; kind = "page"; name = "P5 manual home"; path = "/manual/home"; method = "" },
+            @{ key = "route:/manual/orders"; kind = "route"; name = "P5 manual orders"; path = "/manual/orders"; method = "" },
+            @{ key = "api:GET /manual/orders"; kind = "api"; name = "P5 manual orders API"; path = "/manual/orders"; method = "GET" }
         )) {
         $created = Invoke-P5Api -Method Post -Path "/api/resources/systems/$($script:p5.SystemId)/app-models" -Headers $script:p5.AdminHeaders -Body $appModel
         Assert-P5Http -Response $created -Status 201 -Label "POST app model" | Out-Null
@@ -2266,7 +2266,7 @@ writeFileSync(process.argv[3], JSON.stringify({
                             if ($recordedHash -ne $download.Sha256) {
                                 throw "sha256 mismatch for export $format (recorded $recordedHash, downloaded $($download.Sha256))"
                             }
-                            $content = [System.Text.Encoding]::UTF8.GetString($download.Bytes)
+                            $content = [System.IO.File]::ReadAllText($downloadPath, [System.Text.Encoding]::UTF8)
                             foreach ($needle in $expectedContent[$format]) {
                                 if ($content -notmatch [regex]::Escape($needle)) {
                                     throw "export $format is missing $needle"
