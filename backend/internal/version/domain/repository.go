@@ -27,9 +27,11 @@ type VersionRepository interface {
 	// pause_mode, batch_no) without changing status. It only writes an
 	// executing or continuing version; any other status is a state conflict.
 	UpdateExecutionState(ctx context.Context, id int64, paused bool, pauseMode string, batchNo int, actor int64) (*Version, error)
-	// AllocateBatchNo atomically increments the executing version's batch_no
-	// and returns the stored value. A missing version is not_found and any
-	// other status is a version_state_conflict.
+	// AllocateBatchNo atomically increments the batch_no of an executing or
+	// continuing version and returns the stored value. Both statuses accept the
+	// write (baseline/supplement batches belong to executing, P7 incremental
+	// batches to continuing). A missing version is not_found and any other status
+	// is a version_state_conflict.
 	AllocateBatchNo(ctx context.Context, id int64, actor int64) (int, error)
 	// ReleaseBatchNo compensates a failed batch create by decrementing
 	// batch_no only while it still equals allocated. Zero rows is a no-op:

@@ -29,13 +29,36 @@ const (
 	PauseModeImmediate = "immediate"
 )
 
+// Continue phases, mirrored from the version.continue_phase CHECK constraint
+// (spec §4.2.5/§5.1). A phase only exists while the version is continuing; the
+// zero value means "no phase" (NULL in the row).
+const (
+	ContinuePhaseClarifying = "clarifying"
+	ContinuePhaseDesigning  = "designing"
+	ContinuePhaseExecuting  = "executing"
+)
+
+// Version change kinds derived at read time for GET /versions/{id}/changes
+// (spec §7.2/D50). P7 does not persist a version_change table. code_changed is
+// reserved for the P8 version_change projection: P7's feed derives only
+// requirement/batch/report/issue rows, and P4's code tab/events are the visible
+// source of code changes until then.
+const (
+	VersionChangeRequirementAdded = "requirement_added"
+	VersionChangeBatchFinished    = "batch_finished"
+	VersionChangeReportPublished  = "report_published"
+	VersionChangeIssueCreated     = "issue_created"
+	VersionChangeCodeChanged      = "code_changed"
+)
+
 // commitRE mirrors the code_baseline_commit CHECK constraint: exactly 40
 // lowercase hexadecimal characters.
 var commitRE = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 // Version is the coarse-grained container for a requirement pipeline. P3 only
 // drives it through draft -> clarifying -> designing; requirements never change
-// its status.
+// its status. P7 adds the continuing lifecycle (D43): a completed version that
+// receives a new requirement becomes continuing with a continue phase.
 type Version struct {
 	ID                 int64
 	Name               string
@@ -45,6 +68,8 @@ type Version struct {
 	Paused             bool
 	PauseMode          string
 	BatchNo            int
+	ContinuePhase      string
+	ContinuedAt        *time.Time
 	SystemID           *int64
 	EnvironmentID      *int64
 	CodeRepositoryID   *int64
@@ -55,6 +80,16 @@ type Version struct {
 	UpdatedBy          int64
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
+}
+
+// VersionChange is one item of the read-time derived change feed of
+// GET /versions/{id}/changes (spec §7.2/D50). RefID is the decimal id of the
+// referenced requirement/batch/report/issue (or a commit for code_changed).
+type VersionChange struct {
+	Kind    string
+	At      time.Time
+	RefID   string
+	Summary string
 }
 
 // VersionFilter selects a page of versions ordered by updated_at DESC, id DESC.
@@ -132,10 +167,29 @@ func (v *Version) Validate() error {
 			return err
 		}
 	}
+	if v.ContinuePhase != "" {
+		if err := ValidateContinuePhase(v.ContinuePhase); err != nil {
+			return err
+		}
+	}
 	if v.BatchNo < 0 {
 		return NewInvalid("batchNo", "invalid_batch_no", "batchNo must not be negative")
 	}
 	return ValidateBindings(v.SystemID, v.EnvironmentID, v.CodeRepositoryID, v.CodeBranch, v.CodeBaselineCommit)
+}
+
+// ValidateContinuePhase enforces the version.continue_phase CHECK constraint
+// value set (spec §4.2.5/§5.1). The empty string means "no phase" and is valid:
+// a version that is not continuing stores NULL.
+func ValidateContinuePhase(phase string) error {
+	switch phase {
+	case "", ContinuePhaseClarifying, ContinuePhaseDesigning, ContinuePhaseExecuting:
+		return nil
+	default:
+		return NewInvalid("continuePhase", "invalid_continue_phase",
+			fmt.Sprintf("continuePhase must be empty, %q, %q or %q",
+				ContinuePhaseClarifying, ContinuePhaseDesigning, ContinuePhaseExecuting))
+	}
 }
 
 // ValidatePauseMode enforces the version.pause_mode CHECK constraint value set

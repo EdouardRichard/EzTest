@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	"github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
@@ -44,8 +46,9 @@ type executionStateRepository interface {
 	// SetBatchNo writes only batch_no under a monotonic SQL guard: a lower
 	// number is rejected as a version_state_conflict.
 	SetBatchNo(ctx context.Context, id int64, batchNo int, actor int64) (*Version, error)
-	// AllocateBatchNo atomically increments batch_no with a single UPDATE ...
-	// RETURNING and returns the new number.
+	// AllocateBatchNo atomically increments the batch_no of an executing or
+	// continuing version with a single UPDATE ... RETURNING and returns the new
+	// number.
 	AllocateBatchNo(ctx context.Context, id int64, actor int64) (int, error)
 	// ReleaseBatchNo compensates a failed create: it decrements batch_no only
 	// while it still equals allocated, and is a no-op otherwise.
@@ -55,17 +58,87 @@ type executionStateRepository interface {
 	CompleteExecution(ctx context.Context, id int64, actor int64) (*Version, error)
 }
 
+// continuingStateRepository is the column-scoped P7 continuing port. It is
+// detected from the wired VersionRepository at construction exactly like
+// executionStateRepository, so adapters/fakes that predate P7 keep compiling.
+// Each write is its own CAS and reports whether it actually transitioned:
+//   - MarkContinuing: completed -> continuing/clarifying
+//   - SetContinuePhase: continuing-only explicit phase write
+//   - RefreshContinuePhase: atomic phase derivation from the requirement
+//     statuses (all non-draft -> designing, otherwise clarifying), never
+//     interrupting phase=executing
+//   - CompleteContinuing: continuing -> completed
+//   - Finalize: executing or continuing -> completed (spec §5.1 rule 5)
+type continuingStateRepository interface {
+	MarkContinuing(ctx context.Context, id int64, actor int64) (*Version, bool, error)
+	SetContinuePhase(ctx context.Context, id int64, phase string, actor int64) (*Version, error)
+	RefreshContinuePhase(ctx context.Context, id int64, actor int64) (*Version, bool, error)
+	CompleteContinuing(ctx context.Context, id int64, actor int64) (*Version, bool, error)
+	Finalize(ctx context.Context, id int64, actor int64) (*Version, bool, error)
+}
+
+// changeFeedRepository is the optional read-time derivation port of
+// GET /versions/{id}/changes (spec §7.2/D50). It returns every derived item of
+// the version; the service sorts and pages them.
+type changeFeedRepository interface {
+	Changes(ctx context.Context, versionID int64) ([]domain.VersionChange, error)
+}
+
+// FinalizeBatchState is the execution-side projection the finalize decision
+// evaluates (spec §5.1/§6.2): total/active/unsettled/incremental batch counts.
+// The version service consumes it through FinalizeBatchReader; the PostgreSQL
+// version repository implements that port as a read-only run_batch projection,
+// and the composition root may override it with an execution-context adapter.
+type FinalizeBatchState struct {
+	// TotalBatches counts every batch of the version.
+	TotalBatches int
+	// ActiveBatches counts planned/running batches.
+	ActiveBatches int
+	// UnsettledBatches counts terminal batches with autonomy_done=false.
+	UnsettledBatches int
+	// IncrementalBatches counts continuing-time incremental batches.
+	IncrementalBatches int
+}
+
+// FinalizeBatchReader is the execution-side port of the finalize conditions.
+type FinalizeBatchReader interface {
+	FinalizeBatchState(ctx context.Context, versionID int64) (FinalizeBatchState, error)
+}
+
+// VersionAuditEvent is one version lifecycle audit entry (spec §11.2 D52). Only
+// ids/status/phase are recorded; no request payload is ever included.
+type VersionAuditEvent struct {
+	// Action is version.continued or version.completed.
+	Action    string
+	VersionID int64
+	From      string
+	To        string
+	Phase     string
+	ActorID   int64
+}
+
+// VersionAuditSink records version lifecycle audit entries. Like event
+// publication, a failure is logged but never fails the committed business
+// write. The concrete adapter is wired by the composition root.
+type VersionAuditSink interface {
+	Record(ctx context.Context, event VersionAuditEvent) error
+}
+
 // VersionService implements the version use cases: create/list/get, metadata
-// and binding updates, and the two P3 state actions (start-clarification and
-// enter-design). Requirement operations never call into this service to change
-// a status (spec §6.1/INV-2/INV-4).
+// and binding updates, the two P3 state actions (start-clarification and
+// enter-design) and the P7 continuing lifecycle (D43). Requirement operations
+// never call into this service to change a status (spec §6.1/INV-2/INV-4).
 type VersionService struct {
-	repo      VersionRepository
-	execution executionStateRepository
-	resources ResourceCatalog
-	git       GitReader
-	events    EventPublisher
-	ids       IDGenerator
+	repo       VersionRepository
+	execution  executionStateRepository
+	continuing continuingStateRepository
+	changes    changeFeedRepository
+	finalizer  FinalizeBatchReader
+	audit      VersionAuditSink
+	resources  ResourceCatalog
+	git        GitReader
+	events     EventPublisher
+	ids        IDGenerator
 }
 
 // VersionServiceOption customises the service dependencies. Production wires
@@ -81,6 +154,28 @@ func WithIDGenerator(ids IDGenerator) VersionServiceOption {
 	return func(s *VersionService) {
 		if ids != nil {
 			s.ids = ids
+		}
+	}
+}
+
+// WithFinalizeBatchReader overrides the execution-side finalize projection. The
+// PostgreSQL repository implements FinalizeBatchReader itself, so production
+// needs no extra wiring; adapters and tests use this option. TryFinalize fails
+// closed when neither is available.
+func WithFinalizeBatchReader(reader FinalizeBatchReader) VersionServiceOption {
+	return func(s *VersionService) {
+		if reader != nil {
+			s.finalizer = reader
+		}
+	}
+}
+
+// WithVersionAuditSink injects the version lifecycle audit sink (spec §11.2).
+// Audit failures are logged and swallowed (P6 semantics).
+func WithVersionAuditSink(sink VersionAuditSink) VersionServiceOption {
+	return func(s *VersionService) {
+		if sink != nil {
+			s.audit = sink
 		}
 	}
 }
@@ -126,6 +221,18 @@ func NewVersionService(repo VersionRepository, resources ResourceCatalog, git Gi
 	if execution, ok := repo.(executionStateRepository); ok {
 		service.execution = execution
 	}
+	if continuing, ok := repo.(continuingStateRepository); ok {
+		service.continuing = continuing
+	}
+	if changes, ok := repo.(changeFeedRepository); ok {
+		service.changes = changes
+	}
+	// The PostgreSQL repository implements the execution-side finalize projection
+	// itself (read-only run_batch counts); the option below overrides it for
+	// adapters and tests.
+	if finalizer, ok := repo.(FinalizeBatchReader); ok {
+		service.finalizer = finalizer
+	}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(service)
@@ -141,6 +248,15 @@ func (s *VersionService) executionRepo() (executionStateRepository, error) {
 		return nil, errors.New("version: repository does not support column-scoped execution-state writes")
 	}
 	return s.execution, nil
+}
+
+// continuingRepo returns the column-scoped continuing port, or an error when the
+// wired repository predates P7.
+func (s *VersionService) continuingRepo() (continuingStateRepository, error) {
+	if s.continuing == nil {
+		return nil, errors.New("version: repository does not support the continuing lifecycle writes")
+	}
+	return s.continuing, nil
 }
 
 // Create validates the optional bindings, snapshots the code baseline and
@@ -802,14 +918,16 @@ func (s *VersionService) SetBatchNo(ctx context.Context, id int64, batchNo int, 
 	return repo.SetBatchNo(ctx, id, batchNo, actor)
 }
 
-// AllocateBatchNo atomically increments an executing version's batch_no and
-// returns the new number (spec §5.3). Unlike SetBatchNo it takes no actor: the
+// AllocateBatchNo atomically increments an executing or continuing version's
+// batch_no and returns the new number (spec §5.3). Both statuses allocate: a
+// baseline/supplement batch belongs to an executing version and a P7 incremental
+// batch is created on a continuing one. Unlike SetBatchNo it takes no actor: the
 // execution context's native-allocator port has none, so the write is attributed
 // to the system actor 0. The repository performs the whole increment in one
 // UPDATE ... RETURNING under a status guard, so two concurrent batch creators
-// always receive distinct numbers; a missing version is not_found and a
-// non-executing version is a version_state_conflict. The action publishes no
-// event (batch events carry the batch lifecycle).
+// always receive distinct numbers; a missing version is not_found and any other
+// status (draft through completed) is a version_state_conflict. The action
+// publishes no event (batch events carry the batch lifecycle).
 func (s *VersionService) AllocateBatchNo(ctx context.Context, id int64) (int, error) {
 	repo, err := s.executionRepo()
 	if err != nil {
@@ -874,6 +992,309 @@ func (s *VersionService) CompleteExecution(ctx context.Context, id int64, actor 
 		},
 	})
 	return updated, nil
+}
+
+// MarkContinuing moves a completed version to continuing/clarifying (D43/spec
+// §5.1). The repository performs the completed -> continuing CAS; losing it to a
+// concurrent requirement create that already moved the version to continuing is
+// an idempotent success with no event. Any other status is the 409
+// version_not_continuable of spec §7.11. A real transition publishes
+// version.status_changed and audits version.continued.
+func (s *VersionService) MarkContinuing(ctx context.Context, versionID, actor int64) (Version, error) {
+	repo, err := s.continuingRepo()
+	if err != nil {
+		return Version{}, err
+	}
+	updated, transitioned, err := repo.MarkContinuing(ctx, versionID, actor)
+	if err != nil {
+		return Version{}, err
+	}
+	if updated == nil {
+		return Version{}, errors.New("version: mark-continuing returned no row")
+	}
+	if !transitioned {
+		return *updated, nil
+	}
+	s.publish(ctx, VersionEvent{
+		VersionID: versionID,
+		Type:      "version.status_changed",
+		Summary:   "version status changed from completed to continuing",
+		ActorID:   actor,
+		Source:    domain.SourceUser,
+		Detail: map[string]any{
+			"from":   domain.VersionCompleted,
+			"to":     domain.VersionContinuing,
+			"phase":  domain.ContinuePhaseClarifying,
+			"reason": continueReasonNewRequirement,
+		},
+	})
+	s.recordAudit(ctx, VersionAuditEvent{
+		Action:    "version.continued",
+		VersionID: versionID,
+		From:      domain.VersionCompleted,
+		To:        domain.VersionContinuing,
+		Phase:     domain.ContinuePhaseClarifying,
+		ActorID:   actor,
+	})
+	return *updated, nil
+}
+
+// continueReasonNewRequirement is the spec §8.1 version.status_changed reason of
+// the D43 requirement trigger.
+const continueReasonNewRequirement = "new_requirement"
+
+// sourceSystem marks events/audits produced by the system actor (the autonomy
+// worker's finalize). User-triggered transitions carry the user source.
+const sourceSystem = "system"
+
+// SetContinuePhase writes the phase of a continuing version (spec §5.1/§7.2).
+// Only the enum (or the empty string, which clears it) is accepted; any other
+// phase is a 422 invalid_continue_phase. A non-continuing version is a
+// version_state_conflict, and an unchanged phase is a silent no-op. The write
+// has no actor in the shared contract, so it is attributed to the system actor
+// 0. A phase change publishes version.status_changed.
+func (s *VersionService) SetContinuePhase(ctx context.Context, versionID int64, phase string) error {
+	if err := domain.ValidateContinuePhase(phase); err != nil {
+		return err
+	}
+	current, err := s.repo.Get(ctx, versionID)
+	if err != nil {
+		return err
+	}
+	if current.Status != domain.VersionContinuing {
+		return domain.NewStateConflict("version_state_conflict",
+			fmt.Sprintf("version %d is %s, continue phase requires continuing", versionID, current.Status))
+	}
+	if current.ContinuePhase == phase {
+		return nil
+	}
+	repo, err := s.continuingRepo()
+	if err != nil {
+		return err
+	}
+	if _, err := repo.SetContinuePhase(ctx, versionID, phase, 0); err != nil {
+		return err
+	}
+	detail := map[string]any{
+		"from": domain.VersionContinuing,
+		"to":   domain.VersionContinuing,
+	}
+	summary := "version continue phase cleared"
+	if phase != "" {
+		detail["phase"] = phase
+		summary = "version continue phase changed to " + phase
+	}
+	s.publish(ctx, VersionEvent{
+		VersionID: versionID,
+		Type:      "version.status_changed",
+		Summary:   summary,
+		ActorID:   0,
+		Source:    sourceSystem,
+		Detail:    detail,
+	})
+	return nil
+}
+
+// TryFinalize applies the finalize conditions of spec §5.1 and, when they hold,
+// performs the executing/continuing -> completed CAS. A paused or already
+// completed version is never finalized; the batch conditions come from the
+// injected execution-side reader and fail closed when it is not configured.
+// Losing the CAS to a concurrent finalizer is reported as not finalized, so the
+// call is idempotent. A real completion publishes version.status_changed and
+// audits version.completed.
+func (s *VersionService) TryFinalize(ctx context.Context, versionID int64) (bool, error) {
+	current, err := s.repo.Get(ctx, versionID)
+	if err != nil {
+		return false, err
+	}
+	if current.Status != domain.VersionExecuting && current.Status != domain.VersionContinuing {
+		return false, nil
+	}
+	if current.Paused {
+		return false, nil
+	}
+	if s.finalizer == nil {
+		return false, errors.New("version: finalize batch reader is not configured")
+	}
+	conditions, err := s.finalizer.FinalizeBatchState(ctx, versionID)
+	if err != nil {
+		return false, err
+	}
+	if conditions.ActiveBatches > 0 || conditions.UnsettledBatches > 0 || conditions.TotalBatches < 1 {
+		return false, nil
+	}
+	if current.Status == domain.VersionContinuing {
+		if conditions.IncrementalBatches < 1 {
+			return false, nil
+		}
+		drafts, _, err := s.repo.ListUnclarified(ctx, versionID)
+		if err != nil {
+			return false, err
+		}
+		if len(drafts) > 0 {
+			return false, nil
+		}
+	}
+
+	repo, err := s.continuingRepo()
+	if err != nil {
+		return false, err
+	}
+	_, transitioned, err := repo.Finalize(ctx, versionID, 0)
+	if err != nil {
+		return false, err
+	}
+	if !transitioned {
+		return false, nil
+	}
+	s.publish(ctx, VersionEvent{
+		VersionID: versionID,
+		Type:      "version.status_changed",
+		Summary:   "version status changed from " + current.Status + " to completed",
+		ActorID:   0,
+		Source:    sourceSystem,
+		Detail: map[string]any{
+			"from": current.Status,
+			"to":   domain.VersionCompleted,
+		},
+	})
+	s.recordAudit(ctx, VersionAuditEvent{
+		Action:    "version.completed",
+		VersionID: versionID,
+		From:      current.Status,
+		To:        domain.VersionCompleted,
+		ActorID:   0,
+	})
+	return true, nil
+}
+
+// CompleteContinuing performs the continuing -> completed transition (spec §5.1).
+// It is idempotent on an already completed version and refuses any other source
+// status. A real completion clears the phase, publishes version.status_changed
+// and audits version.completed.
+func (s *VersionService) CompleteContinuing(ctx context.Context, versionID, actor int64) (Version, error) {
+	current, err := s.repo.Get(ctx, versionID)
+	if err != nil {
+		return Version{}, err
+	}
+	if current.Status == domain.VersionCompleted {
+		return *current, nil
+	}
+	if current.Status != domain.VersionContinuing {
+		return Version{}, domain.NewStateConflict("version_state_conflict",
+			fmt.Sprintf("version %d is %s, complete-continuing requires continuing", versionID, current.Status))
+	}
+	repo, err := s.continuingRepo()
+	if err != nil {
+		return Version{}, err
+	}
+	updated, transitioned, err := repo.CompleteContinuing(ctx, versionID, actor)
+	if err != nil {
+		return Version{}, err
+	}
+	if updated == nil {
+		return Version{}, errors.New("version: complete-continuing returned no row")
+	}
+	if !transitioned {
+		return *updated, nil
+	}
+	s.publish(ctx, VersionEvent{
+		VersionID: versionID,
+		Type:      "version.status_changed",
+		Summary:   "version status changed from continuing to completed",
+		ActorID:   actor,
+		Source:    domain.SourceUser,
+		Detail: map[string]any{
+			"from": domain.VersionContinuing,
+			"to":   domain.VersionCompleted,
+		},
+	})
+	s.recordAudit(ctx, VersionAuditEvent{
+		Action:    "version.completed",
+		VersionID: versionID,
+		From:      domain.VersionContinuing,
+		To:        domain.VersionCompleted,
+		ActorID:   actor,
+	})
+	return *updated, nil
+}
+
+// VersionChangePage is one page of the derived version change feed (spec §7.2).
+type VersionChangePage struct {
+	Items      []domain.VersionChange
+	NextCursor string
+	HasMore    bool
+}
+
+// Changes returns the read-time derived change feed of a version: requirement
+// creations, finished batches, published reports and created issues, newest
+// first (spec §7.2/D50). Items sharing an instant are ordered by kind then by
+// refId, so the feed is deterministic. code_changed is intentionally absent: it
+// is deferred to the P8 version_change projection, with P4's code tab/events as
+// the visible source in P7. The cursor is an opaque offset: P7 keeps no snapshot
+// of the feed (D50), so concurrent writes may shift a page.
+func (s *VersionService) Changes(ctx context.Context, versionID int64, page domain.Page) (VersionChangePage, error) {
+	if _, err := s.repo.Get(ctx, versionID); err != nil {
+		return VersionChangePage{}, err
+	}
+	if s.changes == nil {
+		return VersionChangePage{}, errors.New("version: change feed is not configured")
+	}
+	all, err := s.changes.Changes(ctx, versionID)
+	if err != nil {
+		return VersionChangePage{}, err
+	}
+
+	items := append([]domain.VersionChange(nil), all...)
+	sort.SliceStable(items, func(i, j int) bool {
+		if !items[i].At.Equal(items[j].At) {
+			return items[i].At.After(items[j].At)
+		}
+		if items[i].Kind != items[j].Kind {
+			return items[i].Kind < items[j].Kind
+		}
+		return items[i].RefID > items[j].RefID
+	})
+
+	offset, err := platform.DecodeCursor(page.Cursor)
+	if err != nil {
+		return VersionChangePage{}, fmt.Errorf("version: decode changes cursor: %w", err)
+	}
+	limit := int64(page.Limit)
+	if limit <= 0 {
+		limit = int64(platform.DefaultLimit)
+	}
+	if offset > int64(len(items)) {
+		offset = int64(len(items))
+	}
+	end := offset + limit
+	if end > int64(len(items)) {
+		end = int64(len(items))
+	}
+	result := VersionChangePage{
+		Items:   make([]domain.VersionChange, 0, end-offset),
+		HasMore: end < int64(len(items)),
+	}
+	result.Items = append(result.Items, items[offset:end]...)
+	if result.HasMore {
+		result.NextCursor = platform.EncodeCursor(end)
+	}
+	return result, nil
+}
+
+// recordAudit records one version lifecycle audit entry. Failures are logged and
+// swallowed: the business write is already committed (spec §11.2/P6 semantics).
+func (s *VersionService) recordAudit(ctx context.Context, event VersionAuditEvent) {
+	if s.audit == nil {
+		return
+	}
+	if err := s.audit.Record(ctx, event); err != nil {
+		slog.WarnContext(ctx, "version audit record failed",
+			"action", event.Action,
+			"version_id", event.VersionID,
+			"error", err,
+		)
+	}
 }
 
 // publish emits one event after a committed write. Publication failures are

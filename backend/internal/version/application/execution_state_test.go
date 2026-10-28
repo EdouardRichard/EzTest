@@ -80,9 +80,10 @@ func (r *fakeVersionRepo) SetBatchNo(_ context.Context, id int64, batchNo int, a
 	return &stored, nil
 }
 
-// AllocateBatchNo mirrors the PostgreSQL single-statement allocation: the
-// executing version's batch_no is incremented in one step and the new value is
-// returned. A missing row is not_found, a non-executing row is a state conflict.
+// AllocateBatchNo mirrors the PostgreSQL single-statement allocation: an
+// executing or continuing version's batch_no is incremented in one step and the
+// new value is returned. A missing row is not_found, any other status is a
+// state conflict.
 func (r *fakeVersionRepo) AllocateBatchNo(_ context.Context, id int64, actor int64) (int, error) {
 	r.runExecutionHook(id)
 	fakeAllocatorMu.Lock()
@@ -91,7 +92,7 @@ func (r *fakeVersionRepo) AllocateBatchNo(_ context.Context, id int64, actor int
 	if !ok {
 		return 0, domain.NewNotFound("version", id)
 	}
-	if stored.Status != domain.VersionExecuting {
+	if stored.Status != domain.VersionExecuting && stored.Status != domain.VersionContinuing {
 		return 0, domain.NewStateConflict("version_state_conflict", "version status does not allow this action")
 	}
 	stored.BatchNo++
@@ -620,16 +621,17 @@ func TestReleaseBatchNoRestoresOnlyMatchingValue(t *testing.T) {
 	}
 }
 
-// TestAllocateBatchNoRequiresExecuting covers the status guard and the missing
-// version mapping of the native allocation.
-func TestAllocateBatchNoRequiresExecuting(t *testing.T) {
+// TestAllocateBatchNoStatusGuard covers the status guard and the missing
+// version mapping of the native allocation: executing and continuing versions
+// allocate (P7 incremental batches are created on a continuing version), while
+// every other status is a version_state_conflict.
+func TestAllocateBatchNoStatusGuard(t *testing.T) {
 	ctx := context.Background()
 	for _, status := range []string{
 		domain.VersionDraft, domain.VersionClarifying, domain.VersionDesigning,
-		domain.VersionReviewing, domain.VersionContinuing, domain.VersionCompleted,
-		domain.VersionArchived,
+		domain.VersionReviewing, domain.VersionCompleted, domain.VersionArchived,
 	} {
-		t.Run(status, func(t *testing.T) {
+		t.Run(status+" is rejected", func(t *testing.T) {
 			f := newVersionFixture()
 			stored := f.repo.seed(domain.Version{
 				ID: 100, Name: "Order v2", Status: status,
@@ -641,6 +643,27 @@ func TestAllocateBatchNoRequiresExecuting(t *testing.T) {
 			assertDomainReason(t, err, domain.KindStateConflict, "version_state_conflict")
 			if got := f.repo.versions[stored.ID]; got.BatchNo != 0 || got.Revision != 1 {
 				t.Fatalf("blocked allocation wrote the row: %+v", got)
+			}
+		})
+	}
+	for _, status := range []string{domain.VersionExecuting, domain.VersionContinuing} {
+		t.Run(status+" allocates", func(t *testing.T) {
+			f := newVersionFixture()
+			stored := f.repo.seed(domain.Version{
+				ID: 100, Name: "Order v2", Status: status,
+				PauseMode: domain.PauseModeGraceful, CreatedBy: 1, UpdatedBy: 1,
+			})
+
+			allocated, err := f.service.AllocateBatchNo(ctx, stored.ID)
+			if err != nil {
+				t.Fatalf("AllocateBatchNo: %v", err)
+			}
+			if allocated != 1 {
+				t.Fatalf("allocated = %d, want 1", allocated)
+			}
+			got := f.repo.versions[stored.ID]
+			if got.BatchNo != 1 || got.Status != status || got.Revision != 2 || got.UpdatedBy != 0 {
+				t.Fatalf("allocated row = %+v, want batchNo 1 and the system actor 0", got)
 			}
 		})
 	}
