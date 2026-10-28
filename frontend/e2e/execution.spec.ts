@@ -733,7 +733,15 @@ test("P6 执行端到端：seed → 批次 → 暂停/恢复 → 结果/证据 �
       `${API_URL}/api/versions/${failedSeed.version.id}/batches`,
       { headers: { Authorization: `Bearer ${token}` } },
     )
-    const untouchedBody = (await untouched.json()) as { data?: unknown[] }
-    expect(untouchedBody.data ?? []).toHaveLength(1)
+    const untouchedBody = (await untouched.json()) as {
+      data?: Array<{ kind?: string }>
+    }
+    // P7 autonomy may append a supplement batch after the failed baseline; the
+    // P6 intent here is only that the 409/503 gate did not create a second
+    // baseline for this untouched version.
+    const baselines = (untouchedBody.data ?? []).filter(
+      (batch) => batch.kind === "baseline",
+    )
+    expect(baselines).toHaveLength(1)
   })
 })
