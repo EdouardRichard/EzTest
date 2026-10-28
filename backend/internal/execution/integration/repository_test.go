@@ -50,6 +50,7 @@ func executionBatch(id int64, batchNo int, status domain.BatchStatus) domain.Run
 	return domain.RunBatch{
 		ID: id, VersionID: executionTestVersion, BatchNo: batchNo, Status: status,
 		PauseMode:    domain.PauseModeGraceful,
+		Kind:         domain.BatchKindBaseline,
 		BaselineHash: strings.Repeat("b", 64),
 		GraphHash:    strings.Repeat("c", 64),
 		CreatedBy:    executionTestActor,
