@@ -133,6 +133,8 @@
 - 操作：暂停/恢复（优雅/立即，版本级）、向执行 Agent 发纠偏消息（steer）、跳转证据/用例/代码。
 - 状态位："实时"/"重连中"，禁止把断线渲染成"没消息"。
 
+> **P6 实施注记**：`SessionsTab` 已落地：左栏按 Agent/用例分组（状态、当前用例、未读脉冲），右栏复用 agent-console 的 `Transcript`（`session-adapter.ts` 把 P1 `agent.activity` 映射为 `AgentEvent`，不改 agent-console）；工具调用一行折叠、断言期望 vs 实际、证据按钮打开 `EvidenceViewer`；顶部过滤/搜索与 `stream-status`；`HumanGateCard` 在 transcript 内呈现待接管。数据来自 `useExecution` 的会话列表 + `version:{id}` 事件流。
+
 #### 4.3.3 探索链路（Execution Chain Graph）
 - 节点：需求（粗描边方块）、用例（状态色圆角卡）、执行结果（小圆点：通过绿/失败红/阻塞灰/未执行白）、问题（红色菱形）、AI 补充用例（虚线 + "AI" 角标）、受影响用例（黄色描边 + `needs_revalidation`）。
 - 边：`需求→用例`（派生）、`用例→结果`（产出）、`结果→问题`（引发）、`缺口→补充用例`（补全）、`新需求/代码变更→受影响用例`（影响）。
@@ -140,10 +142,14 @@
 - 交互：缩放/平移/MiniMap；节点抽屉（摘要 + 证据 + 代码 + 深链）；筛选（需求/状态/仅异常/AI 补充）；"跟随当前执行"自动聚焦。
 - 大图：按需求折叠、按需展开；后端增量推送。
 
+> **P6 实施注记**：`ExplorationTab` + `ChainGraph`（手写 SVG，`chain-layout.ts` 确定性布局）渲染「需求→用例→结果」三层；状态色 + 图标/文本双编码；需求/状态/仅异常筛选、节点抽屉（摘要/证据/深链）、节点过多时按需求折叠。P6 不抓取问题数据，问题节点显示 P7 空态（`chain-issue-placeholder`），不引入图库。
+
 #### 4.3.4 实时播报（Broadcast）
 - 全量事件倒序：时间、Agent、动作、摘要、链接；异常置顶。
 - 过滤：事件类型、Agent、严重级。
 - 与链路/会话互补：链路看结构，播报看流水。
+
+> **P6 实施注记**：`BroadcastTab` 消费 `version:{id}` 事件流（含 `agent.activity`），倒序、异常置顶、按事件类型/Agent 过滤、快照游标分页，点击深链到用例/证据；P6 不含问题事件（P7）。
 
 #### 4.3.5 结果与证据
 - 用例结果表：用例、状态、耗时、步骤、问题、证据数、批次、代码锚点；失败/阻塞置顶。
@@ -151,6 +157,8 @@
 - 证据查看器：截图 lightbox（支持前后对比）、HTTP 请求/响应双栏（复制 curl、diff）、日志/控制台搜索。
 - 失败分类标签（应用缺陷/环境/会话/模型/用例问题）来自失败分析 Agent。
 - 操作：重跑用例、批量重跑受影响用例、跳转问题。
+
+> **P6 实施注记**：`ResultsTab` + `EvidenceViewer` + `StepDetail`/`AssertionRows`/`FailureClassBadge` 已落地。结果表支持失败/阻塞置顶、步骤/断言展开、终态重跑；证据查看器经 `/api/versions/{id}/evidence/{id}` 带 Bearer 读取（`apiStreamFetch` + object URL），按 `kind` 渲染：截图 lightbox、HTTP 请求/响应双栏 + 复制 curl、console 搜索、download 链接；展示 sha256/大小/MIME，不显示文件系统路径；Esc/遮罩关闭、焦点还原、Tab 焦点环。失败分类标签来自 `failure_class`（application/environment/session/model/case），flaky 为派生展示。
 
 #### 4.3.6 问题
 - 列表：严重级、标题、状态（open/confirmed/dismissed）、关联需求/用例、证据数、批次、代码位置。
@@ -162,6 +170,8 @@
 - 批次切换 + 差异对比（新增问题/已修复/回归通过）。
 - 导出：Markdown、脑图（Mermaid/PNG）；PDF 后续。
 - 条目深链到证据/用例。
+
+> **P6 实施注记**：`ReportTab` + `ReportSummary` 落地 Batch 1 派生报告：批次切换、摘要卡（用例数/四态分布/分类/证据数/耗时）、用例明细、Markdown 导出（服务端流式 + `X-Content-SHA256`）；不含问题列表/批次差异/Report Revision（P7），导出中/失败有明确状态。
 
 #### 4.3.8 代码与变更（关键资产）
 ```text
@@ -207,6 +217,8 @@
 - 暂停期间仍可查看实时视图、证据、代码变更；可新增需求（见 5.2）。
 - "继续中 + 已暂停"同时显示：`继续中（第 2 批）· 已暂停`。
 
+> **P6 实施注记**：`PauseDialog` 默认优雅；选「立即暂停」后原地展示中断警告（同一「确认立即暂停」按钮即二次确认），不另开弹窗；请求 in-flight/错误状态由 header 持有，提交后通过事件/轮询确认。`PausedBanner` 显示模式、已完成步骤数与恢复入口。优雅暂停把运行用例回 `pending`（不产生 `interrupted`），立即暂停置 `interrupted` 并记 `interrupted_step_seq`；暂停期间仍可浏览其余 Tab。
+
 ### 5.2 完成后新增需求 → 继续中（硬状态）
 
 ```text
@@ -235,6 +247,8 @@ reviewing → 横幅"待评审" → 全屏脑图 → 编辑/评论 → [通过�
 - 播报/会话中生成"待人工处理"卡，同时进入顶栏待办。
 - 接管卡：原因（2FA/验证码/审批）、账号/系统、操作指引、完成按钮；完成后自动继续。
 - 升级卡：上下文摘要（发生什么/已尝试/需要决策）+ 选项；人选择后继续。
+
+> **P6 实施注记**：`HumanGateCard` 由 `caseRun.pending_takeover` 渲染原因（MFA/验证码/审批）、账号/系统、操作指引、到期时间；仅 admin 显示「完成接管」并打开既有 `TakeoverDialog`（复用 P2 `POST /api/resources/takeovers/{id}/complete`），普通用户只显示只读提示；完成后卡片消失、事件刷新并自动重排新 attempt。若根本没有 Session 行（manual/未配置配方），只提示 `blocked(session, no_session)`，不生成接管卡。
 
 ---
 
@@ -266,8 +280,8 @@ reviewing → 横幅"待评审" → 全屏脑图 → 编辑/评论 → [通过�
 |---|---|---|
 | ActivityFeed / Transcript | 执行过程与会话 | 思考/工具/结果分组、折叠、懒加载 |
 | ToolCallBlock | 工具调用一行 + 展开 | 参数/结果/耗时/证据 |
-| EvidenceViewer | 截图/HTTP/日志 | 抽屉 + lightbox + 对比 |
-| GraphCanvas | 探索链路/脑图 | React Flow、MiniMap、按需展开、防抖 |
+| EvidenceViewer | 截图/HTTP/日志 | P6 模态查看器（object URL + 按 kind 渲染）；目标态支持前后对比 |
+| GraphCanvas | 探索链路/脑图 | 目标态 React Flow；P6 链路图用手写 SVG（`ChainGraph`），不引图库 |
 | **MindmapCanvas** | 用例脑图全屏画布 | 手写 SVG 确定性 tidy-tree；折叠/选中/键盘/缩放/fit/平移，无图库 |
 | **CaseEditor** | 场景/用例属性与步骤/断言编辑 | revision OCC、上下移、删除保护 |
 | **ReviewPanel** | 发起评审、findings 处置、批准/驳回 | 按严重级分组、blocker 确认、驳回评论 |

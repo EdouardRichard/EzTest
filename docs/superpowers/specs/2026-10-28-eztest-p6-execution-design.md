@@ -78,7 +78,7 @@ AI 补全、失败分析 Agent、问题（issue）、完整报告（revision/sta
 |---|---|---|
 | `execution_0001_batches.sql` | execution | 6 张表 + 索引 |
 | `version_0004_execution_state.sql` | version | `paused / pause_mode / batch_no` |
-| `resource_0006_auth_flows.sql` | resource | `auth_flow` 表 + `account_system_accesses.login_flow_id` |
+| `resource_0006_auth_flows.sql` | resource | `auth_flow` 表 + `account_system_access.login_flow_id` |
 
 - 三个文件追加到 `backend/internal/db/migrations/order.txt` 末尾；顺序 execution → version → resource 无依赖，但固定按上表顺序。
 - 已应用迁移不改；新表沿用 `created_at/updated_at`（D34）；证据 `updated_at` 仅建表默认，业务不更新。
@@ -239,20 +239,22 @@ CREATE INDEX IF NOT EXISTS idx_evidence_ref_target ON evidence_ref(ref_kind, ref
 ### 3.3 `version_0004_execution_state.sql`
 
 ```sql
-ALTER TABLE versions ADD COLUMN IF NOT EXISTS paused BOOLEAN NOT NULL DEFAULT false;
-ALTER TABLE versions ADD COLUMN IF NOT EXISTS pause_mode TEXT NOT NULL DEFAULT 'graceful'
+ALTER TABLE version ADD COLUMN IF NOT EXISTS paused BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE version ADD COLUMN IF NOT EXISTS pause_mode TEXT NOT NULL DEFAULT 'graceful'
   CHECK (pause_mode IN ('graceful','immediate'));
-ALTER TABLE versions ADD COLUMN IF NOT EXISTS batch_no INT NOT NULL DEFAULT 0
+ALTER TABLE version ADD COLUMN IF NOT EXISTS batch_no INT NOT NULL DEFAULT 0
   CHECK (batch_no >= 0);
-CREATE INDEX IF NOT EXISTS idx_versions_paused ON versions(paused) WHERE paused = true;
+CREATE INDEX IF NOT EXISTS idx_versions_paused ON version(paused) WHERE paused = true;
 ```
+
+> `version_0003` 已按 D34 把表改名为单数 `version`；`idx_versions_paused` 是已应用迁移的冻结索引名，不改名（与 `backend/internal/db/migrations/version_0004_execution_state.sql` 一致）。
 
 ### 3.4 `resource_0006_auth_flows.sql`
 
 ```sql
 CREATE TABLE IF NOT EXISTS auth_flow (
   id          BIGINT NOT NULL,
-  system_id   BIGINT NOT NULL REFERENCES systems(id) ON DELETE CASCADE,
+  system_id   BIGINT NOT NULL REFERENCES system(id) ON DELETE CASCADE,
   name        TEXT NOT NULL CHECK (name <> ''),
   kind        TEXT NOT NULL DEFAULT 'form' CHECK (kind IN ('form')),
   definition  JSONB NOT NULL,
@@ -264,11 +266,13 @@ CREATE TABLE IF NOT EXISTS auth_flow (
 );
 CREATE INDEX IF NOT EXISTS idx_auth_flow_system ON auth_flow(system_id, created_at, id);
 
-ALTER TABLE account_system_accesses ADD COLUMN IF NOT EXISTS login_flow_id BIGINT
+ALTER TABLE account_system_access ADD COLUMN IF NOT EXISTS login_flow_id BIGINT
   REFERENCES auth_flow(id) ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS idx_account_system_accesses_login_flow
-  ON account_system_accesses(login_flow_id);
+  ON account_system_access(login_flow_id);
 ```
+
+> `systems`/`account_system_accesses` 已按 D34 改名为单数 `system`/`account_system_access`；`idx_account_system_accesses_login_flow` 是已应用迁移的冻结索引名，不改名（与 `resource_0006_auth_flows.sql` 一致）。
 
 - `definition` 最小 schema（`kind=form`）：
 
@@ -305,26 +309,27 @@ CREATE INDEX IF NOT EXISTS idx_account_system_accesses_login_flow
 
 ```text
 backend/internal/execution/
-  domain/            batch.go case_run.go step_result.go assertion_result.go evidence.go
-                     verdict.go classification.go pause.go checkpoint.go scheduler.go
-                     report.go errors.go profile.go
-  application/       batch_service.go scheduler.go case_runner.go pause_service.go
-                     evidence_service.go report_service.go recovery.go agent_runtime.go
-                     browser.go session.go ports.go agent_tool/ (工具实现)
-  infrastructure/    postgres/ filestore/ browser/ (executor client) http/ agent/ version/
-                     mindmap/ resource/ eventing/ audit/
+  domain/            types.go entities.go snapshot.go verdict.go classification.go pause.go
+                     checkpoint.go report.go profile.go errors.go
+  application/       batch_service.go evidence_service.go report_service.go scheduler.go
+                     case_runner.go case_browser.go recorder.go recovery.go repository.go
+                     ports.go ids.go browser_port.go agent_tool/ (工具实现)
+  infrastructure/    postgres/ filestore/ browser/ (executor client) agent/ mindmap/
+                     resource/ version/ eventing/ audit/
   interfaces/httpapi/ handlers_batch.go handlers_case_run.go handlers_evidence.go
                      handlers_report.go dto.go routes.go
 
-executor/            server.mjs contexts.mjs actions.mjs snapshot.mjs security.mjs
+executor/            src/{server,contexts,actions,snapshot,security}.mjs
                      package.json pnpm-lock.yaml Dockerfile test/
 
 frontend/src/features/execution/
-  api.ts types.ts hooks/useExecution.ts
+  api.ts types.ts execution-errors.ts chain-layout.ts
+  hooks/useExecution.ts
   components/{SessionsTab,ExplorationTab,BroadcastTab,ResultsTab,ReportTab,
               BatchSelector,PauseDialog,PausedBanner,HumanGateCard,
-              EvidenceViewer,StepDetail,ChainGraph,ReportSummary}.tsx
-  execution-errors.ts
+              EvidenceViewer,StepDetail,AssertionRows,ChainGraph,ReportSummary,
+              FailureClassBadge,StartBatchButton}.tsx
+  components/session-adapter.ts
 ```
 
 - `execution` 四层齐全；`domain` 只依赖标准库 + `platform`；`application` 不导入 infrastructure/interfaces；`infrastructure` 适配 `agent`、`version`、`mindmap`、`resource`、`eventing`、`audit` 的 application 接口；`interfaces/httpapi` 只调 application。
@@ -336,33 +341,36 @@ frontend/src/features/execution/
 ```go
 type VersionPort interface {
     GetVersion(ctx context.Context, versionID int64) (VersionRef, error)
-    MarkPaused(ctx context.Context, versionID int64, paused bool, mode, reason string) error
-    MarkBatchNo(ctx context.Context, versionID int64, batchNo int) error
+    MarkPaused(ctx context.Context, versionID int64, paused bool, mode, reason string, actor int64) error
+    AllocateBatchNo(ctx context.Context, versionID int64) (int, error)
+    ReleaseBatchNo(ctx context.Context, versionID int64, allocated int) error
+    SetBatchNo(ctx context.Context, versionID int64, batchNo int, actor int64) error
     CompleteExecution(ctx context.Context, versionID int64, actorID int64) error
 }
 
 type MindmapPort interface {
-    GetBaseline(ctx context.Context, versionID int64) (BaselineRef, error) // hash, commit, case ids
-    SnapshotCases(ctx context.Context, versionID int64, caseIDs []int64) ([]CaseSnapshot, error)
-    MarkCasesExecuted(ctx context.Context, versionID int64, caseIDs []int64) error
+    Baseline(ctx context.Context, versionID int64) (BaselineRef, error) // hash, commit, case ids
+    SnapshotCases(ctx context.Context, versionID int64, caseIDs []int64) ([]CaseSnapshotSourceView, error)
+    MarkExecuted(ctx context.Context, versionID int64, caseNodeIDs []int64) error
 }
 
-type ResourcePort interface {
-    AcquireSession(ctx context.Context, envID, systemID int64, holder string) (SessionRef, error)
-    ReleaseSession(ctx context.Context, sessionID int64, holder, reason string) error
-    MarkSessionInvalid(ctx context.Context, sessionID int64, reason string) error
+type SessionPort interface {
+    Acquire(ctx context.Context, envID, systemID int64, holder string, ttl time.Duration) (SessionRef, error)
+    Release(ctx context.Context, sessionID int64, holder, reason string) error
+    MarkInvalid(ctx context.Context, sessionID int64, reason string) error
     PendingTakeover(ctx context.Context, sessionID int64) (*TakeoverRef, error)
     Environment(ctx context.Context, envID int64) (EnvironmentRef, error)
 }
 
-type AgentPort interface {
+type AgentRuntimePort interface {
     EnsureProfile(ctx context.Context) error
     StartCaseRun(ctx context.Context, req CaseRunRequest) (AgentRunRef, error)
     CancelRun(ctx context.Context, sessionID int64) error
     GetRun(ctx context.Context, sessionID int64) (AgentRunState, error)
+    ListSessions(ctx context.Context, versionID int64) ([]AgentSessionRef, error)
 }
 
-type Publisher interface { Publish(ctx context.Context, ev Event) error }
+type EventPublisher interface { Publish(ctx context.Context, ev Event) error }
 type EvidenceStore interface {
     Write(ctx context.Context, rel string, data []byte) (path, sha256 string, size int64, err error)
     Open(ctx context.Context, rel string) (io.ReadCloser, error)
@@ -376,7 +384,7 @@ type BrowserExecutor interface {
 }
 ```
 
-- `ResourcePort.AcquireSession` 内部完成「选会话 → 租约 → 必要时自动登录 → needs_manual/takeover」；execution 不直接操作 Session 状态机。
+- `SessionPort.Acquire` 内部完成「选会话 → 租约 → 必要时自动登录 → needs_manual/takeover」；execution 不直接操作 Session 状态机。
 - `resource/application` 新增 `SessionService.AcquireForExecution(ctx, envID, systemID, holder, ttl)` 与 `MarkInvalid`；新增 `LoginBrowser` 端口（由 `execution/infrastructure/browser` 实现）供自动登录使用。
 - `mindmap/application` 新增 `ExecutionSnapshot` 查询与 `MarkExecuted`（只允许 `reviewed→executed`，不触碰基线只读规则）。
 
@@ -386,7 +394,7 @@ type BrowserExecutor interface {
 POST batches
   → 校验 version executing / 无活跃批次 / 基线存在
   → 读 mindmap baseline + case snapshots（事务外只读）
-  → 事务：run_batch + case_run* + version.batch_no
+  → 事务：run_batch + case_run*；version.batch_no 在插入前经 `AllocateBatchNo` 原子分配，插入失败用 `ReleaseBatchNo` 补偿（号段单调不保证连续）
   → 事件 batch.created/started
   → 调度器（2s tick + 触发）派发 pending
       → 取 Session（租约）→ 创建执行器 context（注入 storageState）
@@ -432,7 +440,7 @@ POST batches
 
 - `case_hash` = 对规范化快照 JSON 的 sha256（与 P5 `CanonicalGraphHash` 同风格，但只覆盖该用例）；批次创建后快照不可变。
 - 批次创建时复核 `case_baseline.graph_hash`；不一致 → 409，不创建半批数据。
-- 执行不会修改脑图内容；通过 `MindmapPort.MarkCasesExecuted` 将 `case_node.status` 从 `reviewed` 标为 `executed`（失败/阻塞同样标 executed，结果在 CaseRun 上）。
+- 执行不会修改脑图内容；通过 `MindmapPort.MarkExecuted` 将 `case_node.status` 从 `reviewed` 标为 `executed`（失败/阻塞同样标 executed，结果在 CaseRun 上）。
 
 ### 5.3 调度、并发与资源冲突
 
@@ -454,12 +462,13 @@ POST batches
 | 重复暂停/恢复 | 409 `already_paused` / `not_paused`；批次终态 409 `batch_finished` |
 | 取消 | `pending → skipped`；`running → interrupted`（立即中断 + `cleanup_required=true`）；批次 `cancelled`；释放租约/context；发 `batch.finished`；版本保持 `executing`（可重新建批） |
 | 暂停期间 | 可查看事件/证据/报告；禁止建新批次（batch_active 仍占位）；新增需求（P3）不受影响 |
-| 崩溃/重启 | Boot 单事务：`running case_run → interrupted(reason=restart)`、`cleanup_required=true`、批次 `paused=true, immediate, reason=restart`、版本 `paused=true`、释放残留租约；P1 已把 running agent run 标 interrupted；事件 `run.paused`+`batch.paused`。**不自动拉起浏览器**，由用户恢复 |
+| 崩溃/重启 | Boot 恢复（有序幂等 CAS，非单事务）：`running case_run → interrupted(reason=restart)`、`cleanup_required=true`、批次 `paused=true, immediate, reason=restart`、版本 `paused=true`、释放残留租约；P1 已把 running agent run 标 interrupted；事件 `run.paused`+`batch.paused`。**不自动拉起浏览器**，由用户恢复 |
 | 检查点 | 即已完成 `step_result`；恢复提示包含「已完成步骤摘要 + 剩余步骤 + cleanup 要求」；未完成步骤不伪造结果 |
 | 恢复失败 | 若 cleanup/seed 失败 → `blocked(environment)` 或 `inconclusive(case)`（按错误码），批次继续 |
 
 - 优雅暂停等待当前步骤的边界：引擎在工具调用之间检查 `paused`；不打断已落库的 `step_record`。
 - 立即暂停的 `interrupted_step_seq` 记录被中断的步骤号，供 UI 展示与恢复定位。
+- Boot 恢复以**有序幂等 CAS** 实现（`running→interrupted` → 释放租约 → 刷新计数 → 批次 paused → 版本镜像 → 发事件）；storage ports 不暴露跨仓储事务，因此不做单事务，任一步中途崩溃由下一次 pass 补齐（Lead 已接受该偏离，恢复实现见 `backend/internal/execution/application/recovery.go`）。
 
 ### 5.5 执行 Agent 协议
 
@@ -544,7 +553,7 @@ POST batches
 
 ### 5.9 Session 选择 / 自动登录 / 注入 / 失效重取 / 接管
 
-- **选择**：见 §5.3；`SessionRef` 含 id、account、access、storageState、snapshotId、expiresAt。
+- **选择**：见 §5.3；`SessionRef` 含 `sessionId`、`snapshotId`、`storageStateKind`（`storage_state`/`token`）、`storageState`、`sessionStorage`、`headers`、`expiresAt`。`storageStateKind=storage_state` 时把 `storageState`/`sessionStorage` 注入浏览器 context；`token`（含 apikey/basic）只把 `headers` 注入 `http.request`，不建浏览器 context。
 - **自动登录资格**：`access.enabled`、`auth_type='password'`、credential 非空、`env.allow_auto_login=true`、`login_flow_id` 指向启用的 form 配方、环境可达；`env.is_prod && require_approval` → 直接 `needs_manual(approval)`。
 - **流程**（resource.application，单飞键 `(account,system,environment)`）：
   1. 创建/复用 session 行 `pending→acquiring`；
@@ -577,7 +586,7 @@ POST batches
 - 证据读取：所有登录用户（版本数据只读权限）。
 - 登录配方 CRUD、Session 导入/校验/接管完成：管理员（沿用 P2）。
 - 执行器 token 仅 API 进程持有。
-- 审计：`execution.batch.created/paused/resumed/cancelled`、`execution.case.finished`（只记 id/状态/分类/耗时，不含凭据与 prompt）。工具调用审计沿用 P1（不含参数/结果）。
+- 审计：`execution.batch.created/paused/resumed/cancelled`、`execution.case.finished`（只记 id/状态/分类/耗时，不含凭据与 prompt）。取消批次写 `execution.batch.cancelled`；暂停/恢复分别写 `execution.batch.paused`/`execution.batch.resumed`（同一 `BatchPaused` 适配按 `paused` 布尔分流）。工具调用审计沿用 P1（不含参数/结果）。
 
 ### 5.12 核心不变量（测试锚点，逐条必须有测试）
 
@@ -664,7 +673,9 @@ POST batches
 
 ### 6.4 错误 `details.reason`
 
-`version_not_executable`、`baseline_required`、`baseline_changed`、`batch_active`、`no_cases`、`too_many_cases`、`invalid_case_ids`、`environment_required`、`batch_finished`、`already_paused`、`not_paused`、`case_run_terminal`、`evidence_missing`、`executor_unavailable`、`session_unavailable`、`unsupported_assertion_kind`、`export_failed`、`auth_flow_invalid`、`takeover_required`。
+`version_not_executable`、`baseline_required`、`baseline_changed`、`batch_active`、`no_cases`、`too_many_cases`、`invalid_case_ids`、`environment_required`、`batch_finished`、`already_paused`、`not_paused`、`invalid_pause_mode`、`case_run_terminal`、`evidence_missing`、`executor_unavailable`、`session_unavailable`、`unsupported_assertion_kind`、`export_failed`、`auth_flow_invalid`、`takeover_required`。
+
+> `invalid_pause_mode` 与 `too_many_cases` 为请求校验类 422：前者在服务层校验 `mode ∈ {graceful,immediate}`（缺省按 graceful），后者超过 `EZTEST_EXEC_MAX_CASES_PER_BATCH`；`no_cases` 为 409。
 
 ### 6.5 SSE
 
@@ -782,13 +793,14 @@ executor/
 
 ```text
 features/execution/
-  api.ts types.ts execution-errors.ts
+  api.ts types.ts execution-errors.ts chain-layout.ts
   hooks/useExecution.ts        # batches/caseRuns/detail/report/actions + SSE 合并
   components/
     BatchSelector.tsx PauseDialog.tsx PausedBanner.tsx HumanGateCard.tsx
     SessionsTab.tsx ExplorationTab.tsx BroadcastTab.tsx ResultsTab.tsx ReportTab.tsx
     ChainGraph.tsx EvidenceViewer.tsx StepDetail.tsx AssertionRows.tsx
-    FailureClassBadge.tsx ReportSummary.tsx
+    FailureClassBadge.tsx ReportSummary.tsx StartBatchButton.tsx
+    session-adapter.ts          # P1 agent.activity → agent-console AgentEvent
   *.test.tsx
 ```
 
@@ -876,7 +888,7 @@ features/execution/
 
 1. `P6 deliverables`：3 迁移、`order.txt`、目录、脚本、env、OpenAPI 存在。
 2. `P6 migration`：启动两次；6 表 + version 列 + auth_flow 存在；重复执行无副作用。
-3. `P6 OpenAPI`：新增 path、16 个事件类型、19 个 error reason。
+3. `P6 OpenAPI`：新增 path、16 个事件类型、20 个 error reason（含请求级 `invalid_pause_mode`）。
 4. `P6 API smoke`：未登录 401；不存在版本 404；非 executing 409；字符串 ID。
 5. `P6 batch`：fake LLM 下建批→running→done；计数正确。
 6. `P6 evidence`：截图/HTTP 文件存在、sha256 匹配、跨版本读取 404、路径不泄露。
@@ -974,7 +986,7 @@ features/execution/
 |---|---|
 | D39 | **D39（P6 执行引擎与证据）**：新增 `execution` 限界上下文与 6 表（`run_batch`/`case_run`/`step_result`/`assertion_result`/`evidence`/`evidence_ref`，雪花 ID D29）；执行 = 确定性引擎 + 执行 Agent 单一结构化提交 + 服务端校验；批次绑定冻结基线哈希与 commit，单版本单活跃批次；`paused` 独立布尔，优雅/立即暂停、步骤检查点、interrupted cleanup/seed、重启不自动拉起；四态 passed/failed/blocked/inconclusive（+skipped/interrupted 过程态）与失败分类 v1；证据文件系统（D30）+ sha256 + 不可变；Batch 1 报告派生不建表。P6 不做 AI 补全/失败分析/问题/完整报告/继续中/视觉断言；DB 断言（只读）归 P7。 |
 | D40 | **D40（浏览器执行器）**：Playwright 浏览器由独立 Node 长驻执行器（A′）承担，Go 通过 `BrowserExecutor` 接口以类型化 HTTP/JSON 调用；执行器不访问业务 DB，只做 context/动作/产物；API 镜像不装 Node/Chromium；执行器钉 Playwright 1.64.x、独立容器与官方镜像；每用例一个 context、Session storageState 服务端注入、`allowed_hosts` 在路由层强制、动作级取消/超时。 |
-| D41 | **D41（Session 补齐）**：P6 新增 `auth_flow`（kind=form，最小配方：登录 URL/账号密码提交选择器/成功与失败判定）与 `account_system_accesses.login_flow_id`；自动登录仅 password，单飞、成功后写 storageState（含 sessionStorage）并 login_check；失效同用例重取一次；MFA/验证码/审批转人工接管（表单 A：导入 storageState，复用 P2 接口，完成后自动继续）；凭据/存储态仍明文（D28），但事件/日志/证据/前端不展示。 |
+| D41 | **D41（Session 补齐）**：P6 新增 `auth_flow`（kind=form，最小配方：登录 URL/账号密码提交选择器/成功与失败判定）与 `account_system_access.login_flow_id`；自动登录仅 password，单飞、成功后写 storageState（含 sessionStorage）并 login_check；失效同用例重取一次；MFA/验证码/审批转人工接管（表单 A：导入 storageState，复用 P2 接口，完成后自动继续）；凭据/存储态仍明文（D28），但事件/日志/证据/前端不展示。 |
 | D42 | **D42（事件与表复用）**：`RunEvent` 复用 P0 `event` 表（已含 batch_id/case_id/step_id/refs.evidence），不新增 `run_event`；`StepRun` 折叠为 `step_result`（pending/running/passed/failed/interrupted）；Batch 1 报告由批次/用例/证据派生并流式导出，`report/report_ref/revision/stale` 归 P7；前端新增「登录配方配置」并登记到 `implementation-phases` §2.9 P6 行。 |
 
 ### 13.2 同步修改清单

@@ -215,24 +215,27 @@ P0–P7 ────────────────────────
 **目标**：AI 真实执行基线用例：浏览器/API、取证、暂停/恢复、失败分类、实时可见。
 
 **范围**
-- 领域：RunBatch、CaseRun、StepRun、StepResult、Evidence、RunEvent。
+- 领域：RunBatch、CaseRun、step_result（`StepRun` 折叠）、assertion_result、Evidence、RunEvent（复用 `event` 表）。
 - 执行引擎：批次计划、用例调度/并发、依赖与资源冲突、步骤检查点。
 - 暂停/恢复：`paused` 独立标记、优雅/立即、恢复从检查点；interrupted 用例 cleanup/seed。
-- 工具：Playwright（导航/DOM/A11y/点击输入/截图/storageState）、HTTP/API、DB 断言（可选只读）、日志/控制台、文件/下载。
+- 执行器（A′，D40）：独立 Node/Playwright 长驻服务（`executor/`，钉 1.64.x），Go 经 `BrowserExecutor` 类型化 HTTP/JSON 调用；每用例 1 context、Session storageState 服务端注入、`allowed_hosts` 在路由层强制、动作级取消/超时；API 镜像不装 Node/Chromium。
+- 工具：Playwright（导航/DOM/A11y/点击输入/截图/storageState）、HTTP/API、日志/控制台、文件/下载。
 - Session：自动登录（补齐 P2）+ 注入 + 失效重取；人工接管 checkpoint。
-- 证据：截图/报文/日志，文件系统存储（D30）+ sha256 完整性 + 不可变；四态结果（passed/failed/blocked/inconclusive）；失败分类 v1（应用/环境/会话/模型/用例/flaky）。
+- 证据：截图/报文/日志，文件系统存储（D30）+ sha256 完整性 + 不可变；四态结果（passed/failed/blocked/inconclusive）；失败分类 v1（application/environment/session/model/case，flaky 派生不落库）。
+- 分类边界：`db` 断言 P6 不执行，含 db 断言的用例一律 `inconclusive(case, unsupported_assertion_kind)`；预算耗尽 → `inconclusive(model)`，绝不判 `failed`；环境/会话/模型错误不记应用缺陷。
 - 前端：版本详情内执行类 Tab（执行会话/探索链路/实时播报/结果与证据）、执行实时视图（多 Agent 会话/工具/证据）、暂停/恢复按钮、人工接管卡。
 - 报告 Batch 1 简版（完整报告在 P7）。
 
-**明确不做**：AI 自主补用例、失败分析 Agent、问题/报告完整、完成后增量（P7）、视觉断言（P8）。
+**明确不做**：AI 自主补用例、失败分析 Agent、问题/报告完整、完成后增量（P7）、DB 断言（只读，P7）、视觉断言（P8）。
 
 **退出标准**
 - 基线用例在真实测试环境执行；AI 能取证；失败分类正确区分"应用失败/环境/会话/模型"。
 - 暂停（优雅/立即）与恢复可用；重启后未完成用例状态正确（interrupted/blocked）。
 - 实时视图能看到执行过程与证据；报告 Batch 1 可导出。
 - 环境/账号受限时能 blocked 并说明原因。
+- 执行器不可用时建批 503，运行中失败不误判为应用缺陷；含 db 断言的用例为 inconclusive(case) 且不假通过。
 
-**风险**：执行不稳定、环境/Session 问题、浏览器工具差异 → 先用 1–2 个稳定测试环境跑通，再扩；失败分类宁严勿松。
+**风险**：执行不稳定、环境/Session 问题、浏览器工具差异、执行器与 API 分离部署 → 先用 1–2 个稳定测试环境跑通，再扩；失败分类宁严勿松；执行器不可用时只读查看历史结果/证据/报告，禁止建批。
 
 ---
 
@@ -244,6 +247,7 @@ P0–P7 ────────────────────────
 - 探索/补全 Agent：执行中分析覆盖缺口/遗漏 → 新增用例（`ai_supplement`）→ 回填脑图 → 继续执行（受需求/环境约束，不改基线）。
 - 失败分析 Agent：根因分类、去重、置信度、重跑建议、问题候选。
 - 问题整理 + 报告：问题（含证据/代码位置）、版本报告（批次/差异/stale）、脑图导出、报告导出。
+- **DB 断言（只读）**：目标库连接配置（只读凭据/白名单）、`db` 断言的执行与结果落库；P6 遗留的含 db 断言用例在 P7 可执行，P6 阶段遇 db 断言一律 `inconclusive(case, unsupported_assertion_kind)`。
 - **继续中（continuing 硬状态）**：完成后新增需求 → 增量澄清 → 增量设计/影响分析（P4）→ 增量批次 → 报告批次差异；暂停/恢复支持 continuing。
 - AI 补充用例自动并入并标记；报告区分基线/补充。
 - 前端：继续中状态徽章/横幅与新增需求入口、变更与批次、问题页、报告页（批次切换/差异）。
@@ -254,6 +258,7 @@ P0–P7 ────────────────────────
 - 执行中 AI 能发现覆盖缺口并补用例，回填脑图且不阻断执行。
 - 完成后新增需求触发 continuing → 增量批次 → 新报告版本；支持暂停/恢复。
 - 问题带步骤/证据/代码位置；报告分批次、evidence stale 标记。
+- DB 断言（只读）可配置并执行；连接/权限失败 → `blocked(environment)` 或 `inconclusive(case)`，不误判应用缺陷；P6 遗留的 db 断言用例可重跑。
 - AI 补全/失败分析不可用时，降级为纯基线执行 + 人工查看（不崩）。
 
 **风险**：自主循环容易"自嗨扩用例" → 补全边界（需求/环境）与预算/终止条件必须在 P7 定义并验收。
@@ -293,7 +298,7 @@ P0–P7 ────────────────────────
 | 6 | 版本详情容器：VersionHeader、状态徽章、Tab 导航、批次骨架 | P3 | 任意版本可进入详情并切换 Tab |
 | 7 | 总览 Tab | P3 骨架 / P7 完善 | 指标卡与批次时间线可读 |
 | 8 | 执行会话 Tab | P1 会话视图 / P6 并入版本详情 | Agent transcript 实时可见 |
-| 9 | 探索链路 Tab | P6 | 需求→用例→结果→问题图渲染 |
+| 9 | 探索链路 Tab | P6 | 需求→用例→结果图渲染；问题节点为 P7 空态 |
 | 10 | 实时播报 Tab | P6 | 全量事件时间线可过滤 |
 | 11 | 结果与证据 Tab | P6 | 步骤/断言/证据可展开 |
 | 12 | 问题 Tab | P7 | 问题列表/详情/确认/驳回 |
@@ -307,6 +312,7 @@ P0–P7 ────────────────────────
 | 20 | Agent 中心、设置完善、空/错/重连/可访问性 | P8 | 管理面完整 |
 | 21 | 报告/脑图导出（P5 已交付） | P5/P7 | Markdown/Mermaid 导出 |
 | 22 | 全局问题中心/报告中心（如需独立路由） | P7 | 列表可深链回版本 Tab |
+| 23 | 登录配方配置（`auth_flow` 列表/新建/编辑/删除；账号-系统访问绑定 `login_flow_id`） | P6 | 管理员配置配方并绑定后，触发自动登录可得 valid Session（验收锚点同 spec §13.2） |
 
 ---
 

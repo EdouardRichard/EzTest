@@ -1,12 +1,13 @@
 openapi: 3.0.3
 info:
   title: EzTest API
-  version: 0.6.0
+  version: 0.7.0
   description: |
     Hand-maintained OpenAPI document for the EzTest API: the P0 foundation, the
     P1 Agent runtime, the P2 resource context, the P3 version / requirements /
-    clarification context, the P4 code-intelligence context and the P5
-    case-mindmap / design-review context.
+    clarification context, the P4 code-intelligence context, the P5
+    case-mindmap / design-review context and the P6 execution / evidence /
+    reporting context.
 
     Conventions:
     - Successful responses use the `{"data": ...}` envelope. List endpoints add
@@ -79,6 +80,17 @@ info:
       existing `version:{id}` channel and never returns mindmap, LLM or export
       bodies from the JSON endpoints; only the authenticated export download
       streams bytes.
+    - P6 execution endpoints live under `/api/versions/{id}` (`batches`,
+      `evidence`, `execution/sessions`) plus the administrator-only login
+      recipes under `/api/resources/auth-flows`. They use snake_case payloads
+      (the P6 DTOs) and serialize every execution ID (batch, case run, step,
+      assertion, evidence, agent session/run, login recipe) as a decimal
+      string. Batch creation and control (pause/resume/cancel/rerun) accept an
+      optional `Idempotency-Key`; list endpoints use the cursor page envelope.
+      The 16 P6 event types are appended to `VersionEventType` on the existing
+      `version:{id}` channel. Evidence bytes and the Markdown report export are
+      the only P6 responses that stream content, and no P6 response ever
+      exposes filesystem paths, credentials or evidence bodies in JSON.
 
     This document is served publicly at `GET /api/openapi.yaml`; it is the same
     file under `docs/openapi/api.yaml` in the repository.
@@ -109,6 +121,14 @@ tags:
       assertions, requirement sources and case code anchors), design/review/
       data-plan/explore Agent runs, review findings, baseline freeze and
       Markdown/Mermaid/OPML export.
+  - name: execution
+    description: |
+      P6 execution: version-scoped batch creation and control (pause, resume,
+      cancel), case-run inspection and retry, evidence bytes and metadata, the
+      Batch 1 report with its Markdown export, and the version's execution
+      Agent sessions. The login recipes (`/api/resources/auth-flows`) used for
+      automatic session acquisition are administrator-only and carry the
+      `resources` tag.
   - name: health
 security: []
 paths:
@@ -2626,6 +2646,175 @@ paths:
           $ref: '#/components/responses/NotFound'
         '422':
           $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/auth-flows:
+    get:
+      tags: [resources]
+      summary: List login recipes (admin only)
+      description: |
+        Administrator-only, like every auth-flow route (spec §5.11). One cursor
+        page of login recipes ordered by ID ascending, optionally narrowed to
+        one `system_id`. A definition is returned exactly as stored (URL and
+        selectors only); a recipe never contains a credential or a
+        storage-state document.
+      operationId: listAuthFlows
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/AuthFlowSystemFilter'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of login recipes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthFlowList'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/AuthFlowInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [resources]
+      summary: Create a login recipe (admin only)
+      description: |
+        Administrator-only. Stores one `kind=form` login recipe for an existing
+        system and answers 201. The name must be unique within the system (409
+        `duplicate_key`). The definition is validated before writing (422
+        `auth_flow_invalid`): an absolute http(s) `login_url`, non-empty
+        username/password/submit selectors, exactly one of
+        `success.url_contains` / `success.selector`, and a `timeout_ms` between
+        5000 and 60000. A recipe never stores the credential (`accountId` +
+        access credential stay on the P2 access).
+      operationId: createAuthFlow
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAuthFlowRequest'
+      responses:
+        '201':
+          description: The created login recipe.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthFlowEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ResourceConflict'
+        '422':
+          $ref: '#/components/responses/AuthFlowInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/auth-flows/{id}:
+    get:
+      tags: [resources]
+      summary: Read one login recipe (admin only)
+      operationId: getAuthFlow
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/AuthFlowId'
+      responses:
+        '200':
+          description: The login recipe.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthFlowEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/AuthFlowInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+    patch:
+      tags: [resources]
+      summary: Update a login recipe (admin only)
+      description: |
+        Every field is optional; omitted fields are unchanged. The ID and the
+        owning system are immutable. A renamed recipe keeps the per-system name
+        unique (409 `duplicate_key`) and a changed definition is revalidated
+        (422 `auth_flow_invalid`), exactly like create.
+      operationId: updateAuthFlow
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/AuthFlowId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAuthFlowRequest'
+      responses:
+        '200':
+          description: The updated login recipe.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthFlowEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ResourceConflict'
+        '422':
+          $ref: '#/components/responses/AuthFlowInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+    delete:
+      tags: [resources]
+      summary: Delete a login recipe (admin only)
+      description: |
+        Removes the recipe; accesses bound to it fall back to `login_flow_id:
+        null` through the database foreign key and stop auto-logging in.
+      operationId: deleteAuthFlow
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/AuthFlowId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: The login recipe was deleted.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/AuthFlowInvalid'
         '500':
           $ref: '#/components/responses/Internal'
   /api/code/repos:
@@ -5989,6 +6178,562 @@ paths:
           $ref: '#/components/responses/MindmapNotFound'
         '500':
           $ref: '#/components/responses/MindmapServerError'
+  /api/versions/{id}/batches:
+    get:
+      tags: [execution]
+      summary: List the execution batches of a version
+      description: |
+        Every authenticated user. One cursor page of batches newest first,
+        optionally narrowed by exact `status`. A paused batch keeps
+        `status=running`, so `GET /batches?status=running&limit=1` is how a
+        client finds the version's single active batch (it is deliberately not
+        embedded in the version DTO). Rows never include case runs.
+      operationId: listExecutionBatches
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/BatchStatusFilter'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of batches.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchList'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ExecutionUnprocessable'
+        '500':
+          $ref: '#/components/responses/ExecutionServerError'
+    post:
+      tags: [execution]
+      summary: Create an execution batch
+      description: |
+        Every authenticated user. Freezes the current case baseline into one
+        immutable snapshot per case and queues the batch; the response is 201
+        with the created batch (the scheduler then starts it and publishes
+        `batch.created`/`batch.started`/`run.started`). An omitted `caseIds`
+        selects every case of the baseline.
+
+        The pre-flight gate is evaluated in order: version visible (404),
+        `status=executing` (409 `version_not_executable`), system and
+        environment bound (409 `environment_required`), a case baseline exists
+        (409 `baseline_required`), no active `planned`/`running` batch (409
+        `batch_active`), the selection is non-empty (409 `no_cases`) and within
+        `EZTEST_EXEC_MAX_CASES_PER_BATCH` (422 `too_many_cases`), the frozen
+        baseline hash still matches (409 `baseline_changed`), `caseIds` all
+        belong to the baseline (422 `invalid_case_ids`), and the executor is
+        healthy (503 `executor_unavailable`).
+      operationId: createExecutionBatch
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBatchRequest'
+            example:
+              caseIds: ['1844674407370955401', '1844674407370955402']
+      responses:
+        '201':
+          description: The created batch.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ExecutionConflict'
+        '422':
+          $ref: '#/components/responses/ExecutionUnprocessable'
+        '503':
+          $ref: '#/components/responses/ExecutionUnavailable'
+        '500':
+          $ref: '#/components/responses/ExecutionServerError'
+  /api/versions/{id}/batches/{batchId}:
+    get:
+      tags: [execution]
+      summary: Read one execution batch
+      description: |
+        Every authenticated user. A batch of another version is 404
+        `not_found`. The row carries the pause state, the case counts and the
+        stable failure reason; case runs are read from
+        `GET /batches/{batchId}/case-runs`.
+      operationId: getExecutionBatch
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/ExecutionBatchId'
+      responses:
+        '200':
+          description: The batch.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ExecutionUnprocessable'
+        '500':
+          $ref: '#/components/responses/ExecutionServerError'
+  /api/versions/{id}/batches/{batchId}/pause:
+    post:
+      tags: [execution]
+      summary: Pause an execution batch
+      description: |
+        Every authenticated user. Pauses the batch and mirrors
+        `paused`/`pause_mode` onto the version; the batch keeps `status=running`
+        so it still owns the version's active slot. An omitted body or mode
+        defaults to `graceful`.
+
+        `graceful` stops dispatching and parks each running case after its
+        current step: the case run returns to `pending`, the completed
+        `step_result` rows are kept, and leases/contexts are released.
+        `immediate` cancels the Agent run and the executor action, records
+        `interrupted_step_seq`, sets the case run to `interrupted` with
+        `cleanup_required=true`, and releases leases. Both publish
+        `run.paused`/`batch.paused`; a finished batch is 409 `batch_finished`
+        and a second pause is 409 `already_paused`.
+      operationId: pauseExecutionBatch
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/ExecutionBatchId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PauseBatchRequest'
+      responses:
+        '200':
+          description: The paused batch.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ExecutionConflict'
+        '422':
+          $ref: '#/components/responses/ExecutionUnprocessable'
+        '500':
+          $ref: '#/components/responses/ExecutionServerError'
+  /api/versions/{id}/batches/{batchId}/resume:
+    post:
+      tags: [execution]
+      summary: Resume a paused execution batch
+      description: |
+        Every authenticated user. Only a paused batch can resume (409
+        `not_paused`); a finished batch is 409 `batch_finished`. Resume clears
+        `paused` on the batch and the version, continues `pending` runs from
+        their last completed step, requeues `interrupted` runs as the same
+        attempt after cleanup/seed, and publishes `batch.resumed`/`run.resumed`.
+        The request body is ignored; send no body.
+      operationId: resumeExecutionBatch
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/ExecutionBatchId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The resumed batch.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ExecutionConflict'
+        '422':
+          $ref: '#/components/responses/ExecutionUnprocessable'
+        '500':
+          $ref: '#/components/responses/ExecutionServerError'
+  /api/versions/{id}/batches/{batchId}/cancel:
+    post:
+      tags: [execution]
+      summary: Cancel an execution batch
+      description: |
+        Every authenticated user. `pending` case runs become `skipped`,
+        running ones become `interrupted` (immediate interruption plus
+        `cleanup_required`), leases and contexts are released and the batch
+        ends as `cancelled` with a `batch.finished` event. The version stays
+        `executing` and a new batch may be created. A finished batch is 409
+        `batch_finished`. The request body is ignored; send no body.
+      operationId: cancelExecutionBatch
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/ExecutionBatchId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The cancelled batch.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ExecutionConflict'
+        '422':
+          $ref: '#/components/responses/ExecutionUnprocessable'
+        '500':
+          $ref: '#/components/responses/ExecutionServerError'
+  /api/versions/{id}/batches/{batchId}/case-runs:
+    get:
+      tags: [execution]
+      summary: List the case runs of a batch
+      description: |
+        Every authenticated user. One cursor page of case runs newest first,
+        optionally narrowed by exact `status`. List rows use the `CaseRun`
+        shape without the detail-only arrays (`steps`, `assertions`,
+        `evidence`, `pending_takeover`); read one row with the detail endpoint.
+      operationId: listExecutionCaseRuns
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/ExecutionBatchId'
+        - $ref: '#/components/parameters/CaseRunStatusFilter'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of case runs.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseRunList'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ExecutionUnprocessable'
+        '500':
+          $ref: '#/components/responses/ExecutionServerError'
+  /api/versions/{id}/batches/{batchId}/case-runs/{caseRunId}:
+    get:
+      tags: [execution]
+      summary: Read one case run with its detail
+      description: |
+        Every authenticated user. Returns the recorded steps, assertion
+        verdicts, evidence metadata, the resume checkpoint
+        (`completed_seqs`, `cleanup_required`, `interrupted_step_seq`) and, only
+        while a human takeover is waiting, `pending_takeover`. Evidence bodies
+        are never embedded; fetch them from
+        `GET /api/versions/{id}/evidence/{evidenceId}`.
+      operationId: getExecutionCaseRun
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/ExecutionBatchId'
+        - $ref: '#/components/parameters/ExecutionCaseRunId'
+      responses:
+        '200':
+          description: The case-run detail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseRunDetailEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ExecutionUnprocessable'
+        '500':
+          $ref: '#/components/responses/ExecutionServerError'
+  /api/versions/{id}/batches/{batchId}/case-runs/{caseRunId}/rerun:
+    post:
+      tags: [execution]
+      summary: Start the next attempt of a terminal case run
+      description: |
+        Every authenticated user. Creates the next `attempt` of a terminal case
+        run with the same immutable snapshot, revision and hash, links it via
+        `retry_of_case_run_id`, and answers 201 with the new (pending) case run.
+        A non-terminal case run is 409 `case_run_terminal`. P6 never retries
+        application failures automatically; a rerun is always manual and counts
+        as a new attempt for the flaky derivation. The request body is ignored;
+        send no body.
+      operationId: rerunExecutionCaseRun
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/ExecutionBatchId'
+        - $ref: '#/components/parameters/ExecutionCaseRunId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '201':
+          description: The new pending attempt.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseRunDetailEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/ExecutionConflict'
+        '422':
+          $ref: '#/components/responses/ExecutionUnprocessable'
+        '500':
+          $ref: '#/components/responses/ExecutionServerError'
+  /api/versions/{id}/batches/{batchId}/report:
+    get:
+      tags: [execution]
+      summary: Read the Batch 1 report of a batch
+      description: |
+        Every authenticated user; also readable while the batch is paused or
+        running (the report is derived at read time). The JSON carries the batch
+        identity, the status/failure-class counters, the derived `flaky_case_ids`
+        (a case that failed earlier and passed in a later attempt, never stored
+        on a case run), the per-case rows and the environment header. Rows are
+        ordered by case node then attempt so the JSON and the Markdown export
+        are reproducible.
+      operationId: getExecutionBatchReport
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/ExecutionBatchId'
+      responses:
+        '200':
+          description: The batch report.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchReportEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ExecutionUnprocessable'
+        '500':
+          $ref: '#/components/responses/ExecutionServerError'
+  /api/versions/{id}/batches/{batchId}/report/export:
+    get:
+      tags: [execution]
+      summary: Export the Batch 1 report as Markdown
+      description: |
+        Every authenticated user. Streams the deterministic Markdown rendering
+        of the same report the JSON endpoint returns, with the SHA-256 of the
+        streamed bytes in `X-Content-SHA256`. The response is an attachment
+        whose RFC 5987 filename identifies the batch; `format=markdown` is the
+        only P6 export format (an unsupported value is 422 `export_failed`).
+        Rendering never contains issue or revision fields and never contains
+        credentials, prompts or evidence bytes.
+      operationId: exportExecutionBatchReport
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/ExecutionBatchId'
+        - $ref: '#/components/parameters/BatchReportFormat'
+      responses:
+        '200':
+          description: The Markdown report bytes.
+          headers:
+            Content-Disposition:
+              description: |
+                Attachment with the batch's filename
+                (`execution-report-{batchId}.md`) and a UTF-8 `filename*`
+                parameter.
+              schema:
+                type: string
+            X-Content-SHA256:
+              description: Lowercase hex SHA-256 of the returned Markdown bytes.
+              schema:
+                type: string
+                pattern: '^[a-f0-9]{64}$'
+            Cache-Control:
+              description: Always `no-store`.
+              schema:
+                type: string
+          content:
+            text/markdown:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ExecutionUnprocessable'
+        '500':
+          $ref: '#/components/responses/ExecutionServerError'
+  /api/versions/{id}/evidence/{evidenceId}:
+    get:
+      tags: [execution]
+      summary: Read one evidence artifact
+      description: |
+        Every authenticated user. Streams the stored bytes with the MIME type
+        recorded at capture time and the SHA-256 of those bytes in
+        `X-Content-SHA256`; the stored document is re-verified (ownership through
+        the batch, size and sha256) before the first byte is written. A missing
+        or foreign evidence ID is the same 404 `not_found`, and a tampered or
+        unreadable artifact is 500 `evidence_corrupt`. The filesystem path is
+        never exposed, in a header or in an error.
+      operationId: getExecutionEvidence
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/ExecutionEvidenceId'
+      responses:
+        '200':
+          description: The raw evidence bytes.
+          headers:
+            Content-Type:
+              description: |
+                The MIME type recorded at capture time;
+                `application/octet-stream` when the row records none.
+              schema:
+                type: string
+            X-Content-SHA256:
+              description: Lowercase hex SHA-256 of the returned bytes.
+              schema:
+                type: string
+                pattern: '^[a-f0-9]{64}$'
+            Content-Length:
+              description: Exact byte length of the artifact.
+              schema:
+                type: integer
+                format: int64
+            Cache-Control:
+              description: |
+                `private, max-age=31536000, immutable` (evidence bytes never
+                change).
+              schema:
+                type: string
+          content:
+            '*/*':
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ExecutionUnprocessable'
+        '500':
+          $ref: '#/components/responses/ExecutionServerError'
+  /api/versions/{id}/evidence/{evidenceId}/meta:
+    get:
+      tags: [execution]
+      summary: Read the metadata of one evidence artifact
+      description: |
+        Every authenticated user. Returns the identity, kind, MIME type, size,
+        SHA-256, capture metadata and creation time of the artifact without the
+        bytes and without the filesystem path. Evidence is immutable: there is
+        no update or delete endpoint in P6.
+      operationId: getExecutionEvidenceMeta
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/ExecutionEvidenceId'
+      responses:
+        '200':
+          description: The evidence metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvidenceMetaEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ExecutionUnprocessable'
+        '500':
+          $ref: '#/components/responses/ExecutionServerError'
+  /api/versions/{id}/execution/sessions:
+    get:
+      tags: [execution]
+      summary: List the execution Agent sessions of a version
+      description: |
+        Every authenticated user. One cursor page of the P1 Agent sessions
+        whose activity channel is this version's `version:{id}` channel: the
+        execution Agent sessions behind the batches and case runs. The channel
+        is fixed server-side; a supplied `channel` that differs from
+        `version:{id}` yields an empty page. Rows never carry prompts, model
+        output or credentials.
+      operationId: listExecutionSessions
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/ExecutionChannelFilter'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of execution sessions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecutionSessionList'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ExecutionUnprocessable'
+        '500':
+          $ref: '#/components/responses/ExecutionServerError'
   /healthz:
     get:
       tags: [health]
@@ -6574,6 +7319,94 @@ components:
       description: Optional exact export format filter.
       schema:
         $ref: '#/components/schemas/ExportFormat'
+    ExecutionBatchId:
+      name: batchId
+      in: path
+      required: true
+      description: |
+        P6 batch ID: a 64-bit snowflake serialized as a decimal string. Never
+        parse it into a JavaScript number.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    ExecutionCaseRunId:
+      name: caseRunId
+      in: path
+      required: true
+      description: |
+        Case-run ID: a 64-bit snowflake serialized as a decimal string. It must
+        belong to the batch in the path.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    ExecutionEvidenceId:
+      name: evidenceId
+      in: path
+      required: true
+      description: |
+        Evidence ID: a 64-bit snowflake serialized as a decimal string. It must
+        belong to the version in the path.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    BatchStatusFilter:
+      name: status
+      in: query
+      required: false
+      description: |
+        Optional exact batch status filter. A paused batch still reports
+        `running`.
+      schema:
+        $ref: '#/components/schemas/BatchStatus'
+    CaseRunStatusFilter:
+      name: status
+      in: query
+      required: false
+      description: Optional exact case-run status filter.
+      schema:
+        $ref: '#/components/schemas/CaseRunStatus'
+    BatchReportFormat:
+      name: format
+      in: query
+      required: false
+      description: |
+        Export format. `markdown` is the only P6 format; an unsupported value
+        is 422 `export_failed`.
+      schema:
+        type: string
+        enum: [markdown]
+        default: markdown
+    ExecutionChannelFilter:
+      name: channel
+      in: query
+      required: false
+      description: |
+        Optional channel assertion. The endpoint always reads this version's
+        `version:{id}` channel; a different value yields an empty page.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 64
+    AuthFlowId:
+      name: id
+      in: path
+      required: true
+      description: |
+        Login recipe (`auth_flow`) ID as a decimal string, never a JavaScript
+        number.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    AuthFlowSystemFilter:
+      name: system_id
+      in: query
+      required: false
+      description: |
+        Optional P2 system ID (decimal string) narrowing the page to one
+        system's recipes.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
   responses:
     InvalidArgument:
       description: Invalid input (`invalid_argument` or `idempotency_conflict` for a reused key with a different body).
@@ -6676,8 +7509,9 @@ components:
         `invalid_login_check`, `invalid_allowed_hosts`, `invalid_json`,
         `body_too_large`, `invalid_limit`, `invalid_cursor`, `invalid_id`,
         `invalid_storage_state`, `storage_state_expired`, `invalid_branch`,
-        `invalid_glob`, `path_not_found`, `path_not_git_repo` or
-        `branch_not_found`.
+        `invalid_glob`, `path_not_found`, `path_not_git_repo`,
+        `branch_not_found` or `auth_flow_invalid` (a P6 login-recipe ID that is
+        missing, disabled, not `form`, or of another system).
       content:
         application/json:
           schema:
@@ -6886,6 +7720,80 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorEnvelope'
+    ExecutionConflict:
+      description: |
+        A P6 state conflict (`error.code=conflict`, HTTP 409) whose
+        `details.reason` is the stable identifier: `version_not_executable` (the
+        version status is not `executing`), `environment_required` (no
+        system/environment binding), `baseline_required` (the version has no
+        frozen case baseline), `baseline_changed` (the baseline hash or a frozen
+        case hash changed), `batch_active` (the version already has a
+        planned/running batch), `no_cases` (the baseline/selection contains no
+        case), `batch_finished` (a control action on a terminal batch),
+        `already_paused` (pause on a paused batch), `not_paused` (resume on a
+        batch that is not paused) or `case_run_terminal` (rerun of a
+        non-terminal case run). `details.field` is set when a request field is
+        at fault and `details.message` is always human-readable.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    ExecutionUnprocessable:
+      description: |
+        A syntactically or semantically invalid P6 request
+        (`error.code=invalid_argument`, HTTP 422). `details.reason` is one of
+        `too_many_cases` (over `EZTEST_EXEC_MAX_CASES_PER_BATCH`),
+        `invalid_case_ids` (an ID is not in the batch's case baseline),
+        `invalid_pause_mode` (mode is neither `graceful` nor `immediate`),
+        `export_failed` (the report cannot be rendered in the requested
+        format), the decoding reasons `invalid_json`, `body_too_large`,
+        `invalid_limit`, `invalid_cursor`, `invalid_id` and `invalid_status`, or
+        `auth_flow_invalid` on the login-recipe and access endpoints, always
+        with `details.field` and `details.message` when a field is at fault.
+        Case-outcome reasons (`evidence_missing`, `session_unavailable`,
+        `unsupported_assertion_kind`, `takeover_required`) are carried by a
+        case run's `failure_reason`, not by this response.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    ExecutionUnavailable:
+      description: |
+        The execution dependency is temporarily unavailable
+        (`error.code=unavailable`, HTTP 503). `details.reason` is
+        `executor_unavailable` (the Node/Playwright executor health probe fails
+        or it rejects the context) or `session_unavailable` (no usable login
+        session for the requested execution), and `retryable` is true.
+        Create-batch is rejected before any row is written; a case run that
+        loses its executor or session mid-flight is instead classified
+        `inconclusive`/`blocked` on the case run.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    ExecutionServerError:
+      description: |
+        Unexpected server failure (`internal`, HTTP 500). A stored evidence
+        artifact whose bytes no longer match its recorded sha256/size is
+        reported as `internal` with `details.reason=evidence_corrupt`, and a
+        Markdown export that cannot be rendered as `internal` with
+        `details.reason=export_failed`. Filesystem paths are never echoed.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    AuthFlowInvalid:
+      description: |
+        An invalid login recipe request (`invalid_argument`, HTTP 422).
+        `details.reason=auth_flow_invalid` covers an empty name, an unknown
+        `kind`, an absolute-URL/selector/success-rule/timeout violation in the
+        definition, or an invalid `login_flow_id` binding; `invalid_limit`,
+        `invalid_cursor` and `invalid_id` cover page/path decoding. `details.field`
+        names the rejected field and `details.message` is human-readable.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
   schemas:
     ErrorEnvelope:
       type: object
@@ -6935,6 +7843,9 @@ components:
                 VersionConflict, VersionInvalid and VersionUnavailable, plus
                 `field`/`message` when applicable. P4 code errors carry `reason`
                 from CodeErrorReason, plus `field`/`message` when applicable.
+                P5 mindmap errors carry `reason` from MindmapErrorReason. P6
+                execution errors carry `reason` from ExecutionErrorReason, plus
+                `field`/`message` when applicable.
     User:
       type: object
       required: [id, username, role, status]
@@ -8415,6 +9326,16 @@ components:
           description: Overrides the system default when present.
         permissionNote:
           type: string
+        login_flow_id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+          description: |
+            P6 login recipe (`auth_flow`) ID as a decimal string, or null when
+            automatic login is not configured for this access. Recipe
+            management is administrator-only; this reference is readable with
+            the rest of the access. Assigning an unknown, disabled or
+            non-`form` recipe is 422 `auth_flow_invalid`.
     AccessEnvelope:
       type: object
       required: [data]
@@ -10184,6 +11105,9 @@ components:
         - updatedBy
         - createdAt
         - updatedAt
+        - paused
+        - pause_mode
+        - batch_no
       properties:
         id:
           type: string
@@ -10255,6 +11179,24 @@ components:
         updatedAt:
           type: string
           format: date-time
+        paused:
+          type: boolean
+          description: |
+            P6 execution pause flag. It is independent of `status`: a paused
+            version keeps `executing` and stays the single active batch owner.
+            Written by the batch pause/resume endpoints and by restart
+            recovery (paused with mode `immediate`, reason `restart`).
+        pause_mode:
+          $ref: '#/components/schemas/PauseMode'
+        batch_no:
+          type: integer
+          minimum: 0
+          description: |
+            Highest P6 batch number allocated for the version; `0` before the
+            first batch. The active batch itself is deliberately NOT embedded
+            in the version DTO (the version context must not depend on the
+            execution context); read it through
+            `GET /api/versions/{id}/batches?status=running&limit=1`.
     VersionEnvelope:
       type: object
       required: [data]
@@ -11222,7 +12164,19 @@ components:
         `case.run_finished` (run id, kind, status, reason) and
         `case.export_ready` (export id, format, size). They put node ids (up to
         20) in `refs.case` and never carry mindmap bodies, LLM input/output or
-        export content.
+        export content. P6 adds the 16 execution event types, published on the
+        same channel: `batch.created`/`batch.started` (batch_no, case count,
+        baseline hash, status), `batch.paused`/`batch.resumed` (pause mode and
+        reason), `batch.finished` (status and the final counts),
+        `run.started`/`run.paused`/`run.resumed`/`run.finished` (case run id,
+        attempt, status, failure class/reason),
+        `step.started`/`step.finished` (seq, status, evidence count),
+        `evidence.created` (evidence id, kind, size, sha256),
+        `case.status_changed` (case node id, status) and `human.requested`/
+        `gate.pending`/`gate.resolved` (takeover id, session id, reason,
+        expiry). Execution events put evidence ids in `refs.evidence` and case
+        node ids in `refs.case`, and never carry evidence bytes, prompts,
+        credentials, case bodies or filesystem paths.
       enum:
         - version.created
         - version.updated
@@ -11254,6 +12208,22 @@ components:
         - case.run_started
         - case.run_finished
         - case.export_ready
+        - batch.created
+        - batch.started
+        - batch.paused
+        - batch.resumed
+        - batch.finished
+        - run.started
+        - run.paused
+        - run.resumed
+        - run.finished
+        - step.started
+        - step.finished
+        - evidence.created
+        - case.status_changed
+        - human.requested
+        - gate.pending
+        - gate.resolved
     VersionEvent:
       type: object
       description: |
@@ -12470,3 +13440,984 @@ components:
         - duplicate_key
         - graph_too_large
         - forbidden
+    BatchStatus:
+      type: string
+      description: |
+        P6 batch status (`run_batch.status`). `planned` exists only between the
+        create transaction and the scheduler's first dispatch. A paused batch
+        keeps `running`, so it still owns the version's single active-batch
+        slot (spec §5.1, §5.4).
+      enum: [planned, running, done, failed, cancelled]
+    PauseMode:
+      type: string
+      description: |
+        Pause mode of a batch and of its version mirror. `graceful` stops
+        dispatching and parks a running case after its current step (the case
+        run goes back to `pending` and keeps its completed step results);
+        `immediate` cancels the in-flight Agent run and executor action and
+        marks the case run `interrupted` with `cleanup_required=true`.
+        `graceful` is the default on the DDL and on an omitted pause body.
+      enum: [graceful, immediate]
+    CaseRunStatus:
+      type: string
+      description: |
+        Case-run status. `passed`/`failed`/`blocked`/`inconclusive` are the
+        four verdicts of spec §5.8; `skipped` covers cancelled or never
+        dispatched cases and `interrupted` an immediate pause / crash.
+      enum: [pending, running, passed, failed, blocked, inconclusive, skipped, interrupted]
+    FailureClass:
+      type: string
+      description: |
+        Failure class of a non-passed case run (spec §5.8). It is only written
+        for `failed`, `blocked` and `inconclusive` runs; `application` comes
+        from evidenced assertion failures, `environment`/`session` from
+        reachability/login problems and `model`/`case` from Agent, budget or
+        case-structure problems. Flaky detection is derived, never stored.
+      enum: [application, environment, session, model, case]
+    StepStatus:
+      type: string
+      description: |
+        Step-result status. `interrupted` marks the in-flight step of an
+        immediate pause or a crash; it is never reported as `failed`.
+      enum: [pending, running, passed, failed, interrupted]
+    AssertionVerdict:
+      type: string
+      description: |
+        Assertion-level verdict (distinct from the case-level four-state
+        verdict). `not_run` covers unattempted assertions, `db` assertions
+        (unsupported in P6) and passed/failed claims without evidence.
+      enum: [passed, failed, not_run]
+    EvidenceKind:
+      type: string
+      description: |
+        Evidence artifact kind (the `evidence.kind` allow-list). Screenshots,
+        downloads and HTTP exchanges are captured automatically; console and
+        network logs are captured when the Agent requests evidence.
+      enum: [screenshot, http_exchange, console_log, network_log, download]
+    AuthFlowKind:
+      type: string
+      description: Login recipe kind. P6 supports only the minimal `form` recipe.
+      enum: [form]
+    BatchCounts:
+      type: object
+      description: |
+        Per-status counters of one batch (spec §6.3). `total` is the batch case
+        count and the other six sum to at most `total`; the counts are derived
+        from the batch's case runs.
+      required: [total, passed, failed, blocked, inconclusive, skipped, interrupted]
+      properties:
+        total:
+          type: integer
+          minimum: 0
+        passed:
+          type: integer
+          minimum: 0
+        failed:
+          type: integer
+          minimum: 0
+        blocked:
+          type: integer
+          minimum: 0
+        inconclusive:
+          type: integer
+          minimum: 0
+        skipped:
+          type: integer
+          minimum: 0
+        interrupted:
+          type: integer
+          minimum: 0
+    Batch:
+      type: object
+      description: |
+        `BatchDTO` (spec §6.3): one execution batch of a version. Every ID is a
+        decimal string, including `created_by` and the baseline identity. The
+        DTO never embeds its case runs; read them from the case-run endpoints.
+        `paused` is independent of `status` (a paused batch keeps `running`),
+        and `pause_mode` is always `graceful` or `immediate`.
+      required:
+        - id
+        - version_id
+        - batch_no
+        - status
+        - paused
+        - pause_mode
+        - pause_reason
+        - baseline_hash
+        - code_baseline_commit
+        - head_commit
+        - counts
+        - created_by
+        - started_at
+        - finished_at
+        - failure_reason
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          example: '1844674407370955161'
+          description: Batch ID as a decimal string; never convert it to a number.
+        version_id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        batch_no:
+          type: integer
+          minimum: 1
+          description: Per-version sequential batch number starting at 1.
+        status:
+          $ref: '#/components/schemas/BatchStatus'
+        paused:
+          type: boolean
+          description: True while pause is in effect; the batch keeps `running`.
+        pause_mode:
+          $ref: '#/components/schemas/PauseMode'
+        pause_reason:
+          type: string
+          description: |
+            Free-form pause reason. Restart recovery writes `restart`; user
+            pauses leave it empty or write the actor's reason.
+        baseline_hash:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: sha256 of the frozen case baseline the batch pins.
+        code_baseline_commit:
+          type: string
+          pattern: '^[a-f0-9]{40}$'
+          nullable: true
+          description: P5 code baseline commit at batch creation, when bound.
+        head_commit:
+          type: string
+          pattern: '^[a-f0-9]{40}$'
+          nullable: true
+          description: Code head commit observed while executing, when bound.
+        counts:
+          $ref: '#/components/schemas/BatchCounts'
+        created_by:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          description: Creating user ID serialized as a decimal string.
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        finished_at:
+          type: string
+          format: date-time
+          nullable: true
+        failure_reason:
+          type: string
+          description: |
+            Batch-level failure reason (empty unless the batch itself failed,
+            for example because recovery could not resume it).
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    BatchEnvelope:
+      type: object
+      description: One batch under the normal data envelope.
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/Batch'
+    BatchList:
+      type: object
+      description: One cursor page of batches, newest first.
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Batch'
+        next_cursor:
+          type: string
+          description: Opaque cursor for the next page; empty when `has_more` is false.
+        has_more:
+          type: boolean
+    CreateBatchRequest:
+      type: object
+      description: |
+        Body of `POST /api/versions/{id}/batches`. An omitted or empty
+        `caseIds` selects every case of the frozen baseline; when present,
+        every ID must belong to that baseline (`invalid_case_ids` otherwise).
+      properties:
+        caseIds:
+          type: array
+          description: Case node IDs (decimal strings) to execute, order-insensitive.
+          items:
+            type: string
+            pattern: '^[0-9]{1,19}$'
+          maxItems: 500
+    PauseBatchRequest:
+      type: object
+      description: |
+        Body of `POST .../pause`. An omitted mode defaults to `graceful`; any
+        other value is 422 `invalid_pause_mode`.
+      properties:
+        mode:
+          $ref: '#/components/schemas/PauseMode'
+    StepResult:
+      type: object
+      description: |
+        One recorded case step (spec §6.3). `seq` is the step sequence of the
+        frozen case snapshot; `status` never becomes `passed` without recorded
+        evidence, and an immediate pause records the interrupted sequence in
+        the case-run checkpoint instead of faking a result.
+      required: [id, seq, action, expected, actual, status, evidence_ids]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          description: Step-result ID as a decimal string.
+        seq:
+          type: integer
+          minimum: 1
+        action:
+          type: string
+        expected:
+          type: string
+        actual:
+          type: string
+        status:
+          $ref: '#/components/schemas/StepStatus'
+        evidence_ids:
+          type: array
+          description: |
+            Evidence IDs (decimal strings) captured for this step; always an
+            array, empty when the step has no evidence.
+          items:
+            type: string
+            pattern: '^[0-9]{1,19}$'
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        finished_at:
+          type: string
+          format: date-time
+          nullable: true
+    AssertionResult:
+      type: object
+      description: |
+        One recorded assertion outcome (spec §6.3). `id` is the decimal-string
+        identifier of the recorded assertion result. `verdict` is the
+        assertion-level `passed`/`failed`/`not_run`, and a `passed`/`failed`
+        verdict always carries at least one evidence ID. A `db` assertion is
+        always `not_run` and makes the case
+        `inconclusive(case, unsupported_assertion_kind)`.
+      required: [id, kind, target, expected, actual, verdict, evidence_ids]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          description: Recorded assertion-result ID as a decimal string.
+        kind:
+          $ref: '#/components/schemas/AssertionKind'
+        target:
+          type: string
+        expected:
+          type: string
+        actual:
+          type: string
+        verdict:
+          $ref: '#/components/schemas/AssertionVerdict'
+        evidence_ids:
+          type: array
+          description: |
+            Evidence IDs (decimal strings) supporting the verdict; always an
+            array, empty when the assertion was not run.
+          items:
+            type: string
+            pattern: '^[0-9]{1,19}$'
+        step_seq:
+          type: integer
+          minimum: 1
+          description: |
+            Step sequence the assertion belongs to; omitted when the frozen
+            snapshot does not place it on a step.
+        failure_reason:
+          type: string
+          description: Stable failure reason of a `failed` verdict; omitted when empty.
+    EvidenceMeta:
+      type: object
+      description: |
+        Metadata of one immutable evidence artifact (spec §6.3, §5.7). The
+        filesystem path is never part of the DTO. `metadata` is capture-specific
+        JSON (viewport, request/response envelope, console range, download
+        filename, ...) with sensitive headers and fields already masked; the
+        bytes themselves are streamed by `GET .../evidence/{evidenceId}`.
+      required: [id, batch_id, kind, mime, size_bytes, sha256, metadata, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          description: Evidence ID as a decimal string.
+        batch_id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        case_run_id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+        step_result_id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+        kind:
+          $ref: '#/components/schemas/EvidenceKind'
+        mime:
+          type: string
+          description: Normalized media type recorded at capture time.
+        size_bytes:
+          type: integer
+          format: int64
+          minimum: 1
+        sha256:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+          description: sha256 of the stored bytes, re-verified on every read.
+        metadata:
+          type: object
+          additionalProperties: true
+          description: Redacted capture metadata; never contains credentials or paths.
+        created_at:
+          type: string
+          format: date-time
+    EvidenceMetaEnvelope:
+      type: object
+      description: One evidence artifact's metadata under the normal data envelope.
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/EvidenceMeta'
+    EvidenceView:
+      type: object
+      description: |
+        Evidence summary embedded in a case run and in the report's per-case
+        counts. It is the metadata projection without the batch membership,
+        capture metadata or creation time; use
+        `GET .../evidence/{evidenceId}/meta` for the full `EvidenceMeta`.
+      required: [id, kind, mime, size_bytes, sha256]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          description: Evidence ID as a decimal string.
+        kind:
+          $ref: '#/components/schemas/EvidenceKind'
+        mime:
+          type: string
+          description: Normalized media type recorded at capture time.
+        size_bytes:
+          type: integer
+          format: int64
+          minimum: 1
+        sha256:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+    PendingTakeover:
+      type: object
+      description: |
+        The waiting human takeover of a `blocked(session)` case run (spec §5.9),
+        present only while a takeover is waiting. Complete it through the
+        existing P2 endpoint `POST /api/resources/takeovers/{id}/complete`
+        (administrator); the worker then requeues the case run as a new attempt
+        automatically.
+      required: [id, reason, instructions, expires_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          description: |
+            P2 takeover ID as a decimal string; pass it to
+            `POST /api/resources/takeovers/{id}/complete`.
+        reason:
+          type: string
+          description: |
+            Why a human is needed: `mfa`, `captcha` or `approval` are produced
+            by automatic login (the P2 enum also allows `login_unknown` and
+            `other`).
+          enum: [mfa, captcha, approval, login_unknown, other]
+        instructions:
+          type: object
+          additionalProperties: true
+          description: Redacted operator instructions; never contains a credential.
+        expires_at:
+          type: string
+          description: |
+            Takeover expiry as an RFC 3339 timestamp; the empty string when the
+            waiting takeover has no expiry.
+    CaseRun:
+      type: object
+      description: |
+        `CaseRunDTO` (spec §6.3): one attempt at executing a case inside a
+        batch. The detail projection fills `steps`, `assertions`, `evidence`,
+        `session`, `pending_takeover` and the resume `checkpoint`; list rows
+        carry empty `steps`/`assertions`/`evidence` arrays, an empty
+        `completed_seqs` and `pending_takeover: null`. `case_node_id` is the P5
+        mindmap case node and `agent_session_id`/`agent_run_id` are P1 IDs, all
+        as decimal strings.
+      required:
+        - id
+        - batch_id
+        - case_node_id
+        - case_revision
+        - attempt
+        - status
+        - failure_class
+        - failure_reason
+        - summary
+        - duration_ms
+        - title
+        - session
+        - checkpoint
+        - steps
+        - assertions
+        - evidence
+        - pending_takeover
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          example: '1844674407370955301'
+        batch_id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        case_node_id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          description: P5 mindmap case node ID (decimal string).
+        case_revision:
+          type: integer
+          minimum: 1
+          description: Mindmap revision the frozen snapshot was taken from.
+        attempt:
+          type: integer
+          minimum: 1
+        status:
+          $ref: '#/components/schemas/CaseRunStatus'
+        failure_class:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/FailureClass'
+        failure_reason:
+          type: string
+          description: |
+            Stable reason of the failure or block (for example `no_session`,
+            `takeover_required`, `evidence_missing` or a tool error code).
+        summary:
+          type: string
+          maxLength: 500
+          description: Short human-readable outcome summary.
+        duration_ms:
+          type: integer
+          format: int64
+          minimum: 0
+        title:
+          type: string
+          description: Case title from the frozen snapshot.
+        session:
+          type: object
+          nullable: true
+          description: Credential-free session the attempt executed under.
+          required: [id, account, state]
+          properties:
+            id:
+              type: string
+              pattern: '^[0-9]{1,19}$'
+            account:
+              type: string
+            state:
+              type: string
+              description: P2 session state, for example `valid` or `invalid`.
+        checkpoint:
+          type: object
+          description: |
+            Resume checkpoint of the attempt (spec §5.4). List rows carry an
+            empty `completed_seqs` because they omit the recorded steps.
+          required: [completed_seqs, cleanup_required, interrupted_step_seq]
+          properties:
+            completed_seqs:
+              type: array
+              description: Step sequences already recorded; resume starts after these.
+              items:
+                type: integer
+                minimum: 1
+            cleanup_required:
+              type: boolean
+              description: True when resume must cleanup/seed before continuing.
+            interrupted_step_seq:
+              type: integer
+              minimum: 1
+              nullable: true
+              description: Sequence interrupted by an immediate pause, when any.
+        steps:
+          type: array
+          description: |
+            Recorded steps in sequence order; always an array, empty on list
+            rows and before the first step is recorded.
+          items:
+            $ref: '#/components/schemas/StepResult'
+        assertions:
+          type: array
+          description: |
+            Recorded assertion outcomes in recording order; always an array,
+            empty on list rows.
+          items:
+            $ref: '#/components/schemas/AssertionResult'
+        evidence:
+          type: array
+          description: |
+            Evidence summaries in capture order; always an array, empty on list
+            rows.
+          items:
+            $ref: '#/components/schemas/EvidenceView'
+        pending_takeover:
+          nullable: true
+          description: |
+            The waiting takeover, or null when none. Populated by the detail
+            endpoint only.
+          allOf:
+            - $ref: '#/components/schemas/PendingTakeover'
+        agent_session_id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+          description: P1 Agent session ID (decimal string) of the attempt.
+        agent_run_id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+          description: P1 Agent run ID (decimal string) of the attempt.
+        retry_of_case_run_id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+          description: Previous attempt this row retries, when it is a rerun/requeue.
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        finished_at:
+          type: string
+          format: date-time
+          nullable: true
+    CaseRunList:
+      type: object
+      description: |
+        One cursor page of case runs, newest first. Rows carry empty
+        `steps`/`assertions`/`evidence` arrays, an empty checkpoint
+        `completed_seqs` and `pending_takeover: null`.
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/CaseRun'
+        next_cursor:
+          type: string
+          description: Opaque cursor for the next page; empty when `has_more` is false.
+        has_more:
+          type: boolean
+    CaseRunDetailEnvelope:
+      type: object
+      description: One case run with its full detail.
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/CaseRun'
+    BatchReport:
+      type: object
+      description: |
+        `ReportDTO` (spec §6.3), the Batch 1 report derived at read time. It
+        contains no issue, revision or stale fields. `flaky_case_ids` is a
+        derived view (a case that failed in an earlier attempt and passed in a
+        later one) and is never stored on a case run. Case rows are ordered by
+        case node then attempt, so the JSON and the Markdown export are
+        reproducible.
+      required: [batch, summary, cases, environment, generated_at]
+      properties:
+        batch:
+          type: object
+          required: [id, batch_no, status, baseline_hash, code_baseline_commit]
+          properties:
+            id:
+              type: string
+              pattern: '^[0-9]{1,19}$'
+            batch_no:
+              type: integer
+              minimum: 1
+            status:
+              $ref: '#/components/schemas/BatchStatus'
+            baseline_hash:
+              type: string
+              pattern: '^[0-9a-f]{64}$'
+            code_baseline_commit:
+              type: string
+              pattern: '^[a-f0-9]{40}$'
+              nullable: true
+              description: |
+                P5 code baseline commit; null when the report's version has no
+                bound code baseline.
+        summary:
+          type: object
+          required:
+            - case_count
+            - by_status
+            - by_failure_class
+            - flaky_case_ids
+            - duration_ms
+            - evidence_count
+          properties:
+            case_count:
+              type: integer
+              minimum: 0
+            by_status:
+              type: object
+              description: Case counts keyed by case-run status; absent keys mean zero.
+              additionalProperties:
+                type: integer
+                minimum: 0
+            by_failure_class:
+              type: object
+              description: Case counts keyed by failure class; absent keys mean zero.
+              additionalProperties:
+                type: integer
+                minimum: 0
+            flaky_case_ids:
+              type: array
+              description: Case node IDs (decimal strings) of derived flaky cases.
+              items:
+                type: string
+                pattern: '^[0-9]{1,19}$'
+            duration_ms:
+              type: integer
+              format: int64
+              minimum: 0
+            evidence_count:
+              type: integer
+              minimum: 0
+        cases:
+          type: array
+          items:
+            type: object
+            required:
+              - case_run_id
+              - case_node_id
+              - title
+              - status
+              - failure_class
+              - steps
+              - assertions
+              - evidence
+              - duration_ms
+            properties:
+              case_run_id:
+                type: string
+                pattern: '^[0-9]{1,19}$'
+              case_node_id:
+                type: string
+                pattern: '^[0-9]{1,19}$'
+              title:
+                type: string
+              status:
+                $ref: '#/components/schemas/CaseRunStatus'
+              failure_class:
+                type: string
+                nullable: true
+                description: Null when the case has no failure class.
+              steps:
+                type: integer
+                minimum: 0
+              assertions:
+                type: integer
+                minimum: 0
+              evidence:
+                type: integer
+                minimum: 0
+              duration_ms:
+                type: integer
+                format: int64
+                minimum: 0
+        environment:
+          type: object
+          description: Environment header; the three keys are always present.
+          required: [system, environment, base_url]
+          properties:
+            system:
+              type: string
+            environment:
+              type: string
+            base_url:
+              type: string
+        generated_at:
+          type: string
+          format: date-time
+    BatchReportEnvelope:
+      type: object
+      description: The Batch 1 report under the normal data envelope.
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/BatchReport'
+    ExecutionSession:
+      type: object
+      description: |
+        One execution Agent session of the version channel: the P1 session
+        projection filtered by `channel=version:{id}`. `status` is `running`
+        while the session has an active run, otherwise the last run's status, or
+        `idle` when it has no run yet. The execution Agent profile key is fixed
+        (`execution-agent`). Prompts, model output and credentials are never part
+        of this DTO.
+      required: [id, channel, title, status, running, profile_key, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          description: P1 Agent session ID as a decimal string.
+        channel:
+          type: string
+          maxLength: 64
+          description: Always `version:{id}` (the channel is fixed server-side).
+        title:
+          type: string
+          maxLength: 120
+        status:
+          type: string
+          description: |
+            `running` while a run is active, otherwise the last run's status or
+            `idle` before the first run.
+        running:
+          type: boolean
+        profile_key:
+          type: string
+          description: Agent profile key; always `execution-agent` in P6.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    ExecutionSessionList:
+      type: object
+      description: One cursor page of the version's execution Agent sessions.
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExecutionSession'
+        next_cursor:
+          type: string
+          description: Opaque cursor for the next page; empty when `has_more` is false.
+        has_more:
+          type: boolean
+    FormSuccessRule:
+      type: object
+      description: |
+        Success predicate of a form login recipe. Exactly one of
+        `url_contains` / `selector` must be set (422 `auth_flow_invalid`
+        otherwise).
+      properties:
+        url_contains:
+          type: string
+          description: URL fragment the browser must land on after submit.
+        selector:
+          type: string
+          description: Element that must appear after submit.
+    FormFailureSelectors:
+      type: object
+      description: |
+        Optional selectors that turn a failed automatic login into a human
+        takeover instead of a credential failure. Each selector is independent.
+      properties:
+        mfa_selector:
+          type: string
+          description: Present when the login asks for a second factor.
+        captcha_selector:
+          type: string
+          description: Present when the login shows a captcha.
+        invalid_selector:
+          type: string
+          description: Present when the login rejects the credential.
+    FormDefinition:
+      type: object
+      description: |
+        Minimal `kind=form` login recipe (spec §3.4). It stores URLs and
+        selectors only: the username/password values come from the P2 access
+        credential and are filled with `secret=true`, so they never enter the
+        recipe, an event, a log or an evidence artifact. `timeout_ms` is
+        5000-60000.
+      required:
+        - login_url
+        - username_selector
+        - password_selector
+        - submit_selector
+        - success
+        - failure
+        - timeout_ms
+      properties:
+        login_url:
+          type: string
+          description: Absolute http(s) URL of the login page.
+        username_selector:
+          type: string
+          minLength: 1
+        password_selector:
+          type: string
+          minLength: 1
+        submit_selector:
+          type: string
+          minLength: 1
+        success:
+          $ref: '#/components/schemas/FormSuccessRule'
+        failure:
+          $ref: '#/components/schemas/FormFailureSelectors'
+        timeout_ms:
+          type: integer
+          minimum: 5000
+          maximum: 60000
+    AuthFlow:
+      type: object
+      description: |
+        One login recipe (`auth_flow`) of a system. IDs are decimal strings.
+        Recipes are administrator-only on every route; the definition is
+        returned as stored and never contains a credential or storage state.
+      required:
+        - id
+        - system_id
+        - name
+        - kind
+        - definition
+        - enabled
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        system_id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: Unique within the system.
+        kind:
+          $ref: '#/components/schemas/AuthFlowKind'
+        definition:
+          $ref: '#/components/schemas/FormDefinition'
+        enabled:
+          type: boolean
+          description: Only enabled recipes are eligible for automatic login.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    AuthFlowEnvelope:
+      type: object
+      description: One login recipe under the normal data envelope.
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/AuthFlow'
+    AuthFlowList:
+      type: object
+      description: One cursor page of login recipes, ordered by ID ascending.
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuthFlow'
+        next_cursor:
+          type: string
+          description: Opaque cursor for the next page; empty when `has_more` is false.
+        has_more:
+          type: boolean
+    CreateAuthFlowRequest:
+      type: object
+      description: Body of `POST /api/resources/auth-flows`.
+      required: [system_id, name, definition]
+      properties:
+        system_id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          description: P2 system ID (decimal string) that owns the recipe.
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        kind:
+          $ref: '#/components/schemas/AuthFlowKind'
+        definition:
+          $ref: '#/components/schemas/FormDefinition'
+        enabled:
+          type: boolean
+          default: true
+    UpdateAuthFlowRequest:
+      type: object
+      description: |
+        Body of `PATCH /api/resources/auth-flows/{id}`. Every field is
+        optional; omitted fields are unchanged, and the ID and owning system
+        are immutable.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        kind:
+          $ref: '#/components/schemas/AuthFlowKind'
+        definition:
+          $ref: '#/components/schemas/FormDefinition'
+        enabled:
+          type: boolean
+    ExecutionErrorReason:
+      type: string
+      description: |
+        Closed set of the P6 `error.details.reason` / case-run failure reason
+        identifiers (spec §6.4 plus the request-level `invalid_pause_mode`).
+        HTTP mapping: `version_not_executable`, `environment_required`,
+        `baseline_required`, `baseline_changed`, `batch_active`, `no_cases`,
+        `batch_finished`, `already_paused`, `not_paused` and
+        `case_run_terminal` are 409 conflicts (`error.code=conflict`);
+        `too_many_cases`, `invalid_case_ids`, `invalid_pause_mode` and
+        `export_failed` are 422 validation errors
+        (`error.code=invalid_argument`); `executor_unavailable` and
+        `session_unavailable` are retryable 503s
+        (`error.code=unavailable`); `auth_flow_invalid` is a 422 on the
+        login-recipe/access endpoints. The remaining values are case-outcome
+        reasons carried by a case run's `failure_reason` (and in the event
+        detail), not by an HTTP error: `evidence_missing`,
+        `unsupported_assertion_kind` and `takeover_required`.
+        `executor_unavailable` and `session_unavailable` are also used as case
+        failure reasons when the executor or the login session becomes
+        unavailable mid-run.
+      enum:
+        - version_not_executable
+        - baseline_required
+        - baseline_changed
+        - batch_active
+        - no_cases
+        - too_many_cases
+        - invalid_case_ids
+        - environment_required
+        - batch_finished
+        - already_paused
+        - not_paused
+        - case_run_terminal
+        - evidence_missing
+        - executor_unavailable
+        - session_unavailable
+        - unsupported_assertion_kind
+        - export_failed
+        - auth_flow_invalid
+        - takeover_required
+        - invalid_pause_mode

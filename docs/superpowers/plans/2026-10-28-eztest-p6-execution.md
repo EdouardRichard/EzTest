@@ -139,6 +139,8 @@ func (s *BatchService) Rerun(ctx context.Context, versionID, batchID, caseRunID,
 type VersionPort interface {
     GetVersion(ctx context.Context, versionID int64) (VersionRef, error)
     MarkPaused(ctx context.Context, versionID int64, paused bool, mode, reason string, actor int64) error
+    AllocateBatchNo(ctx context.Context, versionID int64) (int, error)
+    ReleaseBatchNo(ctx context.Context, versionID int64, allocated int) error
     SetBatchNo(ctx context.Context, versionID int64, batchNo int, actor int64) error
     CompleteExecution(ctx context.Context, versionID, actor int64) error
 }
@@ -216,6 +218,9 @@ func TestCanonicalCaseHashDeterministicAndOrderSensitive(t *testing.T) {
         Steps: []domain.CaseSnapshotStep{{Seq: 1, Action: "打开列表"}},
         Assertions: []domain.CaseSnapshotAssertion{{ID: 9, Kind: "ui", Expected: "存在"}}}
     b := a
+    // b := a 只复制 slice header；必须先复制 Steps，否则 b.Steps[0] 会改写 a
+    // 的底层数组，两个哈希会一起变化，测试失去意义。
+    b.Steps = append([]domain.CaseSnapshotStep(nil), a.Steps...)
     if got, want := domain.CanonicalCaseHash(b), domain.CanonicalCaseHash(a); got != want {
         t.Fatalf("hash not deterministic: %s != %s", got, want)
     }
@@ -830,7 +835,7 @@ Expected: FAIL。
 
 - [ ] **Step 3: 实现**
 
-`ports.go` 锁死共享端口；`Create` 顺序：version → baseline → snapshot（hash 校验）→ 事务创建 batch+runs → `SetBatchNo` → 发 `batch.created/started`；`Pause/Resume/Cancel/Rerun` 校验状态机并发布事件；`Rerun` 复制 snapshot 建 attempt+1（`retry_of_case_run_id`）。错误全部用 `domain.ReasonError`。
+`ports.go` 锁死共享端口；`Create` 顺序：version → baseline → snapshot（hash 校验）→ `AllocateBatchNo`（插入前原子分配，失败 `ReleaseBatchNo` 补偿）→ 事务创建 batch+runs → 发 `batch.created/started`；`Pause/Resume/Cancel/Rerun` 校验状态机并发布事件；`Rerun` 复制 snapshot 建 attempt+1（`retry_of_case_run_id`）。错误全部用 `domain.ReasonError`。
 补测试：非 executing、无基线、空用例、超上限、并发活跃批次、暂停不改 status、取消 pending→skipped、rerun 终态校验。
 
 - [ ] **Step 4: 跑通过**
@@ -1063,7 +1068,7 @@ git commit -m "feat: add execution agent tools and profile"
 - Test: 同名 `*_test.go`（fake 依赖）
 
 **Interfaces:**
-- Produces: `VersionPort/MindmapPort/SessionPort/EventPublisher` 的实现（`AgentRuntimePort` 由 T16 提供）；`audit.Sink` 方法 `BatchCreated/BatchPaused/CaseFinished`（如无既有接口则用 P0 Recorder）。
+- Produces: `VersionPort/MindmapPort/SessionPort/EventPublisher` 的实现（`AgentRuntimePort` 由 T16 提供）；`audit.Sink` 方法 `BatchCreated/BatchPaused/BatchCancelled/CaseFinished`（如无既有接口则用 P0 Recorder；`BatchPaused` 按 `paused` 布尔分流为 paused/resumed，取消批次写 `execution.batch.cancelled`）。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -1099,7 +1104,7 @@ git commit -m "feat: wire execution cross-context adapters"
 
 ---
 
-## Wave 5 — 恢复 / API / 前端壳（T18–T22）
+## Wave 5 — 恢复 / API / 前端壳（按 Concurrency Map 分属 W4–W6：T18→W4、T19→W5、T20–T22→W6）
 
 ### Task 18: 恢复 worker
 
@@ -1212,6 +1217,8 @@ git commit -m "feat: expose execution API and wire composition root"
 **Interfaces:**
 - Consumes: T11 hooks；版本 DTO 新字段。
 - Produces: `VersionTabs` 接受 `sessions/exploration/broadcast/results/report` 真实 slot；`VersionDetailPage` 传递它们。
+
+> **Wave 归属注记**：T20 的 `VersionHeader/VersionTabs/VersionDetailPage` 接线按 Concurrency Map 归 **W6**（与 T21–T27 并行），T19 只交付 HTTP API/组装根；本任务列在 Wave 5 标题下仅为文档阅读顺序，实现/派发以 W6 为准。
 
 - [ ] **Step 1: 写失败测试**
 
