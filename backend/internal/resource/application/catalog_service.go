@@ -27,10 +27,6 @@ const (
 	maxAppModelImportNodes = 5000
 	// maxAppModelDepth bounds a node's ancestor chain, the node itself included.
 	maxAppModelDepth = 32
-
-	// App model sources mirror the app_model_node.source CHECK constraint.
-	appModelSourceManual = "manual"
-	appModelSourceImport = "import"
 )
 
 // CatalogService implements the system, environment and app model use cases. It
@@ -95,7 +91,8 @@ type UpdateEnvironmentInput struct {
 // AppModelInput is one app model node. Key and Kind are only honored on create;
 // they are immutable afterwards. On create and import an empty ParentKey means a
 // root node; UpdateAppModel also treats an empty ParentKey as "make it a root"
-// because the HTTP layer merges omitted fields before calling it.
+// because the HTTP layer merges omitted fields before calling it. Source is only
+// honored by ImportAppModels; an empty value defaults to import.
 type AppModelInput struct {
 	Key       string
 	Kind      string
@@ -103,6 +100,7 @@ type AppModelInput struct {
 	Path      string
 	Method    string
 	ParentKey string
+	Source    string
 	Meta      json.RawMessage
 }
 
@@ -231,6 +229,20 @@ func effectiveAppModelMethod(kind, key, method string) string {
 		return suffix[:index]
 	}
 	return ""
+}
+
+// normalizeAppModelSource enforces the app_model_node.source CHECK constraint.
+// An empty source defaults to import so existing callers keep their behavior.
+func normalizeAppModelSource(source string) (string, error) {
+	switch source {
+	case "":
+		return domain.AppModelSourceImport, nil
+	case domain.AppModelSourceManual, domain.AppModelSourceImport, domain.AppModelSourceExplored:
+		return source, nil
+	default:
+		return "", domain.NewInvalid("source", "invalid_app_model_source",
+			"source must be manual, import or explored")
+	}
 }
 
 // GetSystem returns one system by id.
@@ -570,7 +582,7 @@ func (s *CatalogService) CreateAppModel(ctx context.Context, systemID int64, in 
 		Name:     in.Name,
 		Path:     in.Path,
 		Method:   effectiveAppModelMethod(in.Kind, in.Key, in.Method),
-		Source:   appModelSourceManual,
+		Source:   domain.AppModelSourceManual,
 		Meta:     in.Meta,
 	}
 	if parent != nil {
@@ -649,7 +661,8 @@ func (s *CatalogService) importDepth(ctx context.Context, systemID int64, key st
 
 // ImportAppModels upserts the payload nodes by (system_id, key). Duplicate keys
 // in the payload are collapsed (last value wins), missing nodes are never
-// deleted, and both created and updated nodes get source='import'.
+// deleted, and both created and updated nodes get the payload source (default
+// import, explored for P5 application exploration).
 func (s *CatalogService) ImportAppModels(ctx context.Context, systemID int64, inputs []AppModelInput) (int, int, error) {
 	if len(inputs) > maxAppModelImportNodes {
 		return 0, 0, domain.NewInvalid("nodes", "too_many_nodes",
@@ -666,6 +679,11 @@ func (s *CatalogService) ImportAppModels(ctx context.Context, systemID int64, in
 		if err := domain.ValidateAppModelKey(in.Kind, in.Key); err != nil {
 			return 0, 0, err
 		}
+		source, err := normalizeAppModelSource(in.Source)
+		if err != nil {
+			return 0, 0, err
+		}
+		in.Source = source
 		if _, seen := byKey[in.Key]; !seen {
 			orderIndex[in.Key] = index
 			keys = append(keys, in.Key)
@@ -717,7 +735,7 @@ func (s *CatalogService) ImportAppModels(ctx context.Context, systemID int64, in
 			node.Name = in.Name
 			node.Path = in.Path
 			node.Method = effectiveAppModelMethod(node.Kind, node.Key, in.Method)
-			node.Source = appModelSourceImport
+			node.Source = in.Source
 			if len(in.Meta) > 0 {
 				node.Meta = in.Meta
 			}
@@ -736,7 +754,7 @@ func (s *CatalogService) ImportAppModels(ctx context.Context, systemID int64, in
 			Name:     in.Name,
 			Path:     in.Path,
 			Method:   effectiveAppModelMethod(in.Kind, in.Key, in.Method),
-			Source:   appModelSourceImport,
+			Source:   in.Source,
 			Meta:     in.Meta,
 		}
 		if err := s.appModels.CreateAppModel(ctx, node); err != nil {

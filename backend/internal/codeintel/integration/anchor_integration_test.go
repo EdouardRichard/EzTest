@@ -5,7 +5,7 @@ package integration
 // This file wires the real AnchorService over the real gitx/PostgreSQL/P2/P3
 // adapters to prove design spec §6.7 against real storage and a real repository
 // checkout: subject ownership, fixed-branch file validation, point uniqueness,
-// version-scoped deletion and the case/issue rejection.
+// version-scoped deletion, case acceptance and the issue rejection.
 
 import (
 	"context"
@@ -185,13 +185,20 @@ func TestAnchorIntegrationCRUDUniquenessAndOwnership(t *testing.T) {
 		t.Fatalf("foreign requirement error = %v, want subject_not_in_version", err)
 	}
 
-	// case/issue are reserved and rejected (INV-15).
-	for _, kind := range []string{"case", "issue"} {
-		if _, err := fixture.service.Create(ctx, fixture.versionID, 1, domain.CreateAnchorParams{
-			SubjectKind: kind, SubjectID: fixture.requirementID, FilePath: analysisClientPath,
-		}); domain.Reason(err) != "unsupported_subject_kind" {
-			t.Fatalf("%s anchor error = %v, want unsupported_subject_kind", kind, err)
-		}
+	// Case anchors are accepted (D37); issue is still reserved (INV-15).
+	caseAnchor, err := fixture.service.Create(ctx, fixture.versionID, 1, domain.CreateAnchorParams{
+		SubjectKind: domain.SubjectCase, SubjectID: fixture.requirementID, FilePath: analysisServerPath,
+	})
+	if err != nil {
+		t.Fatalf("Create case anchor: %v", err)
+	}
+	if caseAnchor.SubjectKind != domain.SubjectCase {
+		t.Fatalf("case anchor subject = %q, want case", caseAnchor.SubjectKind)
+	}
+	if _, err := fixture.service.Create(ctx, fixture.versionID, 1, domain.CreateAnchorParams{
+		SubjectKind: "issue", SubjectID: fixture.requirementID, FilePath: analysisClientPath,
+	}); domain.Reason(err) != "unsupported_subject_kind" {
+		t.Fatalf("issue anchor error = %v, want unsupported_subject_kind", err)
 	}
 
 	// The deleted fixture file does not exist at the fixed branch tip.
