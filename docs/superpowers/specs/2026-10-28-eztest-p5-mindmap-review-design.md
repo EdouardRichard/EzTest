@@ -429,7 +429,7 @@ reviewing ──POST review{approve}──▶ executing（写 case_baseline，�
 
 1. 批准时计算 `graph_hash`：对规范化 JSON（节点按 `sort_order,id` 排序；字段固定顺序；步骤/断言按 `seq`/`id`）做 sha256。
 2. **跨上下文写入顺序（补偿式）**：先在 mindmap 单事务写 `case_baseline` + 全图节点 `draft→reviewed` → 再调 `VersionLifecycle.ApproveBaseline`（CAS `reviewing→executing`）→ 若返回冲突/失败，在补偿事务中删除该 baseline 并把节点状态的 `revision`/`status` 回滚到批准前 → 抛 409 `version_state_conflict`。补偿只处理"状态被并发抢占"这一种失败；补偿本身失败记 error 日志并返回 500，需人工核对（测试覆盖）。
-3. 基线冻结后：`case_node/step/assertion/source` 全部写操作 409 `baseline_frozen`；评审 run 仍可启动（只读评审）但不可再次批准；导出可继续。
+3. 基线冻结后：`case_node/step/assertion/source` 全部写操作 409 `baseline_frozen`；**只读评审 run 仍可启动**（实现：`review` 类 run 允许 `executing`，design/data_plan 不允许）但不可再次批准；导出可继续。
 4. `case_baseline` 记录 `node_count`、`case_count`、`code_baseline_commit`（取版本当前值）、`frozen_by/at`。
 5. 冻结不可回退（P5 无"解冻"）；需求重开或代码变更后的增量处理归 P7。
 6. 冻结后 `case_export` 强制绑定 `baseline_id`；未冻结时导出的 `baseline_id=NULL` 且不参与复用。
@@ -495,9 +495,9 @@ failed/degraded → run 终态 + 错误摘要事件（不物化、不改版本�
 
 | kind | 输入 | 物化 | 失败/降级 |
 |---|---|---|---|
-| `review` | 当前图（只读）+ 需求/代码事实 | 新建 `case_review(status=draft)` + findings；把本版本此前 `source='ai' AND status='open'` 的 findings 置 `dismissed`（superseded） | 降级 → run=degraded，不写 review |
-| `data_plan` | 既有节点 id 列表（≤60）+ 资源引用 | 只更新这些节点的 `preconditions/test_data`；带 `nodeRevision`，人工已改则跳过并记 `stats.skipped`；不新建节点 | 降级 → run=degraded，部分更新走单事务（全成功或全跳过） |
-| `explore` | system/environment id、可选 session id | 经 `CatalogGateway.ImportAppModels(source='explored')` 写应用模型；`stats.discovered/imported/skipped` | LLM 不可用 → 确定性 BFS 直接入库，run=degraded（reason=ai_unavailable） |
+| `review` | 当前图（只读）+ 需求/代码事实 | 新建 `case_review(status=draft)` + findings；把本版本此前 `source='ai' AND status='open'` 的 findings 置 `dismissed`（superseded） | 失败 → run=failed，不写 review（无确定性降级产物） |
+| `data_plan` | 既有节点 id 列表（≤60）+ 资源引用 | 只更新这些节点的 `preconditions/test_data`；带 `nodeRevision`，人工已改则跳过并记 `stats.skipped`；不新建节点 | 失败 → run=failed，部分更新走单事务（全成功或全跳过） |
+| `explore` | system/environment id、可选 session id | 经 `CatalogGateway.ImportAppModels(source='explored')` 写应用模型；`stats.discovered/imported/skipped` | P5 探索无 AI 步骤：确定性 BFS 成功 → run=done；目标不可达 → run=failed；`degraded` 仅在"AI 归类可用但失败、BFS 结果仍入库"时使用（P5 不启用 AI 归类） |
 
 ### 6.9 应用探索规则（D36）
 
@@ -656,7 +656,7 @@ failed/degraded → run 终态 + 错误摘要事件（不物化、不改版本�
 
 ### 7.4 错误原因（`details.reason`，OpenAPI 同步枚举）
 
-`version_state_conflict`、`baseline_frozen`、`case_revision_conflict`、`invalid_case_tree`、`no_cases`、`unconfirmed_requirements`、`requirement_not_found`、`requirement_not_clarified`、`node_not_found`、`step_not_found`、`assertion_not_found`、`source_not_found`、`anchor_not_found`、`review_not_found`、`baseline_not_found`、`finding_not_found`、`run_in_progress`、`run_not_found`、`run_state_conflict`、`invalid_run_kind`、`invalid_case_proposal`、`blocker_findings_open`、`exploration_requires_environment`、`environment_not_allowed`、`environment_unreachable`、`code_repo_unavailable`、`ai_unavailable`、`export_format_unsupported`、`export_not_found`、`export_conflict`、`export_corrupted`、`duplicate_case_source`、`duplicate_key`、`graph_too_large`、`forbidden`。
+`version_state_conflict`、`baseline_frozen`、`case_revision_conflict`、`invalid_case_tree`、`no_cases`、`unconfirmed_requirements`、`requirement_not_found`、`requirement_not_clarified`、`node_not_found`、`step_not_found`、`assertion_not_found`、`source_not_found`、`anchor_not_found`、`review_not_found`、`baseline_not_found`、`finding_not_found`、`run_in_progress`、`run_not_found`、`run_state_conflict`、`invalid_run_kind`、`invalid_case_proposal`、`blocker_findings_open`、`exploration_requires_environment`、`environment_not_allowed`、`environment_unreachable`、`code_repo_unavailable`、`ai_unavailable`、`export_format_unsupported`、`export_not_found`、`export_conflict`、`export_corrupted`、`duplicate_case_source`、`duplicate_key`、`graph_too_large`、`forbidden`、`invalid_finding_status`、`invalid_decision`、`invalid_start_paths`、`invalid_explore_input`、`session_not_valid`、`invalid_id`、`invalid_storage_path`、`anchor_duplicate`、`code_repository_not_bound`、`code_repository_disabled`、`path_not_found`、`path_escape`、`invalid_line_range`。
 
 > 补充约定（实现期固化）：`*_not_found` 统一为 404；`invalid_case_tree`/`no_cases`/`graph_too_large`/`unconfirmed_requirements`/`requirement_not_clarified` 在 HTTP 层映射 409（领域层仍可用 `KindInvalid`）；`duplicate_key` 沿用平台既有 reason；`export_conflict` 表示冻结态导出的并发唯一冲突。
 
@@ -664,7 +664,7 @@ failed/degraded → run 终态 + 错误摘要事件（不物化、不改版本�
 
 - 复用 `GET /api/versions/{versionId}/stream?since=` 与 `GET /api/versions/{versionId}/events`，通道固定 `version:{id}`，不新增通道。
 - 新增事件类型（追加 OpenAPI `VersionEventType`）：`case.created`、`case.updated`、`case.deleted`、`case.reviewed`、`case.baseline_frozen`、`case.run_started`、`case.run_finished`、`case.export_ready`，并复用 `gate.pending`/`gate.resolved`。
-- `refs.case` 携带节点 ID（≤20）；事件 `detail` 只放 id/计数/状态摘要（≤64 KiB），不放脑图正文、LLM 输入输出、导出内容。
+- `refs.case` 携带节点 ID（≤20，十进制字符串）；事件 `detail` 内的 `nodeId/runId/reviewId/baselineId` 沿用 P3/P4 既有约定以 JSON number 传递（D29 的"JSON/URL/工具参数"约束针对实体 DTO；SSE detail 为内部事件摘要），前端不得 `Number()` 实体 DTO；`detail` 只放 id/计数/状态摘要（≤64 KiB），不放脑图正文、LLM 输入输出、导出内容。
 
 ---
 
@@ -722,7 +722,7 @@ failed/degraded → run 终态 + 错误摘要事件（不物化、不改版本�
 | 场景 | 行为 |
 |---|---|
 | LLM 未配置（`llm_configured=false`） | `POST runs` 仍创建 run → `run=failed`（reason=`ai_unavailable`）+ `case.run_finished`；HTTP 仍 202（异步语义），run 详情给可读原因；**人工路径不受影响** |
-| LLM 超时/失败 | 重试 1 次（同 run 内）；仍失败 → `degraded`（若已拿到部分 proposal 则丢弃，零物化） |
+| LLM 超时/失败 | 重试 1 次（同 run 内）；仍失败 → `failed`（P5 的 design/review/data_plan 没有确定性降级产物；`degraded` 仅保留给"降级兜底仍产出了可用结果"的场景，P5 不产生） |
 | 设计 payload 校验失败 | `run=failed`（reason=`invalid_case_proposal`，`stats.validationErrors` 最多 20 条）；不物化、不改版本状态 |
 | 评审 run 失败 | `run=failed`；不生成 review，不阻塞人工评审/批准（无 blocker 时） |
 | 数据规划失败 | `run=failed`；已有前置/数据不变 |
