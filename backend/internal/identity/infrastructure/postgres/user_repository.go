@@ -61,7 +61,7 @@ func scanUser(row rowScanner) (identity.User, error) {
 
 // Create inserts a user and returns the stored row.
 func (r *UserRepository) Create(ctx context.Context, params identity.CreateParams) (identity.User, error) {
-	const query = `INSERT INTO users (username, password_hash, role) VALUES ($1, $2, $3) RETURNING ` + userColumns
+	const query = `INSERT INTO user_account (username, password_hash, role) VALUES ($1, $2, $3) RETURNING ` + userColumns
 	user, err := scanUser(r.pool.QueryRow(ctx, query, params.Username, params.PasswordHash, string(params.Role)))
 	if err != nil {
 		if mapped := mapUniqueViolation(err); mapped != nil {
@@ -74,7 +74,7 @@ func (r *UserRepository) Create(ctx context.Context, params identity.CreateParam
 
 // GetByUsername returns the account with the given username.
 func (r *UserRepository) GetByUsername(ctx context.Context, username string) (identity.User, error) {
-	const query = `SELECT ` + userColumns + ` FROM users WHERE username = $1`
+	const query = `SELECT ` + userColumns + ` FROM user_account WHERE username = $1`
 	user, err := scanUser(r.pool.QueryRow(ctx, query, username))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -87,7 +87,7 @@ func (r *UserRepository) GetByUsername(ctx context.Context, username string) (id
 
 // GetByID returns the account with the given id.
 func (r *UserRepository) GetByID(ctx context.Context, id int64) (identity.User, error) {
-	const query = `SELECT ` + userColumns + ` FROM users WHERE id = $1`
+	const query = `SELECT ` + userColumns + ` FROM user_account WHERE id = $1`
 	user, err := scanUser(r.pool.QueryRow(ctx, query, id))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -104,7 +104,7 @@ func (r *UserRepository) List(ctx context.Context, limit int, afterID int64) ([]
 	if limit <= 0 {
 		return nil, false, fmt.Errorf("postgres: list users: limit must be positive")
 	}
-	const query = `SELECT ` + userColumns + ` FROM users WHERE id > $1 ORDER BY id ASC LIMIT $2`
+	const query = `SELECT ` + userColumns + ` FROM user_account WHERE id > $1 ORDER BY id ASC LIMIT $2`
 	rows, err := r.pool.Query(ctx, query, afterID, limit+1)
 	if err != nil {
 		return nil, false, fmt.Errorf("postgres: list users: %w", err)
@@ -132,7 +132,7 @@ func (r *UserRepository) List(ctx context.Context, limit int, afterID int64) ([]
 
 // UpdateStatus changes a user's status and returns the stored row.
 func (r *UserRepository) UpdateStatus(ctx context.Context, id int64, status identity.Status) (identity.User, error) {
-	const query = `UPDATE users SET status = $2, updated_at = now() WHERE id = $1 RETURNING ` + userColumns
+	const query = `UPDATE user_account SET status = $2, updated_at = now() WHERE id = $1 RETURNING ` + userColumns
 	user, err := scanUser(r.pool.QueryRow(ctx, query, id, string(status)))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -146,7 +146,7 @@ func (r *UserRepository) UpdateStatus(ctx context.Context, id int64, status iden
 // UpdatePasswordHash replaces a user's password hash.
 func (r *UserRepository) UpdatePasswordHash(ctx context.Context, id int64, passwordHash string) error {
 	tag, err := r.pool.Exec(ctx,
-		`UPDATE users SET password_hash = $2, updated_at = now() WHERE id = $1`,
+		`UPDATE user_account SET password_hash = $2, updated_at = now() WHERE id = $1`,
 		id, passwordHash)
 	if err != nil {
 		return fmt.Errorf("postgres: update user password: %w", err)
@@ -159,7 +159,7 @@ func (r *UserRepository) UpdatePasswordHash(ctx context.Context, id int64, passw
 
 // UpdateLastLogin records the current database time as the user's last login.
 func (r *UserRepository) UpdateLastLogin(ctx context.Context, id int64) error {
-	tag, err := r.pool.Exec(ctx, `UPDATE users SET last_login_at = now() WHERE id = $1`, id)
+	tag, err := r.pool.Exec(ctx, `UPDATE user_account SET last_login_at = now() WHERE id = $1`, id)
 	if err != nil {
 		return fmt.Errorf("postgres: update user last login: %w", err)
 	}
@@ -173,13 +173,13 @@ func (r *UserRepository) UpdateLastLogin(ctx context.Context, id int64) error {
 // keeps this at most 1 in P0.
 func (r *UserRepository) CountAdmins(ctx context.Context) (int, error) {
 	var count int
-	if err := r.pool.QueryRow(ctx, `SELECT count(*) FROM users WHERE role = 'admin'`).Scan(&count); err != nil {
+	if err := r.pool.QueryRow(ctx, `SELECT count(*) FROM user_account WHERE role = 'admin'`).Scan(&count); err != nil {
 		return 0, fmt.Errorf("postgres: count admins: %w", err)
 	}
 	return count, nil
 }
 
-// mapUniqueViolation translates the users table's unique violations into domain
+// mapUniqueViolation translates the user_account table's unique violations into domain
 // errors. It returns nil when err is not a unique violation.
 func mapUniqueViolation(err error) error {
 	var pgErr *pgconn.PgError

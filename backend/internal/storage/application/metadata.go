@@ -6,7 +6,7 @@ import (
 )
 
 // ObjectMetadata is the durable metadata of one stored object. It is the
-// storage_objects row: the content-addressed id, the verified byte size, the
+// storage_object row: the content-addressed id, the verified byte size, the
 // media type declared on first upload, the relative storage path and when the
 // row was created. The table is append-only.
 type ObjectMetadata struct {
@@ -17,7 +17,7 @@ type ObjectMetadata struct {
 	CreatedAt    time.Time
 }
 
-// MetadataRepository is the insert-only port over the storage_objects table.
+// MetadataRepository is the insert-only port over the storage_object table.
 // Implementations never update or delete a row:
 //
 //   - Insert persists metadata and reports whether a new row was created.

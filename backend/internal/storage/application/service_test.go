@@ -108,7 +108,7 @@ func newTestService(store *fakeStore) (*Service, *fakeMetadata, *capturingRecord
 	return NewService(store, metadata, recorder), metadata, recorder
 }
 
-// TestPutAuditsOnlyNewObjects proves storage_objects is the source of truth for
+// TestPutAuditsOnlyNewObjects proves storage_object is the source of truth for
 // the create audit: the first upload inserts the metadata row and records
 // storage.object_created, while a later re-upload of the same bytes dedupes,
 // records nothing, and reports the persisted content type.

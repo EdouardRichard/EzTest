@@ -219,7 +219,7 @@ func TestLLMAdminAPIsAgainstDatabase(t *testing.T) {
 
 	// Secrets are encrypted at rest.
 	var apiKeyEnc, headersEnc []byte
-	if err := pool.QueryRow(ctx, `SELECT api_key_encrypted, headers_encrypted FROM llm_configs WHERE id=$1`, created.Data.ID).
+	if err := pool.QueryRow(ctx, `SELECT api_key_encrypted, headers_encrypted FROM llm_config WHERE id=$1`, created.Data.ID).
 		Scan(&apiKeyEnc, &headersEnc); err != nil {
 		t.Fatal(err)
 	}
@@ -247,7 +247,7 @@ func TestLLMAdminAPIsAgainstDatabase(t *testing.T) {
 	}
 	var catalogJSON []byte
 	var fetchedAt *time.Time
-	if err := pool.QueryRow(ctx, `SELECT model_catalog, catalog_fetched_at FROM llm_configs WHERE id=$1`, created.Data.ID).
+	if err := pool.QueryRow(ctx, `SELECT model_catalog, catalog_fetched_at FROM llm_config WHERE id=$1`, created.Data.ID).
 		Scan(&catalogJSON, &fetchedAt); err != nil {
 		t.Fatal(err)
 	}

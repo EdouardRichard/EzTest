@@ -42,7 +42,7 @@ func TestConfigRepositoryEncryptsAndSeeds(t *testing.T) {
 		t.Fatal(err)
 	}
 	var raw []byte
-	pool.QueryRow(ctx, `SELECT api_key_encrypted FROM llm_configs WHERE id=$1`, cfg.ID).Scan(&raw)
+	pool.QueryRow(ctx, `SELECT api_key_encrypted FROM llm_config WHERE id=$1`, cfg.ID).Scan(&raw)
 	if bytes.Contains(raw, []byte("sk-test")) {
 		t.Fatal("key stored in plaintext")
 	}
@@ -96,7 +96,7 @@ func TestConfigRepositoryDefaultSwitch(t *testing.T) {
 		t.Fatalf("default=%+v err=%v", def, err)
 	}
 	var count int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM llm_configs WHERE is_default`).Scan(&count); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM llm_config WHERE is_default`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	if count != 1 {
@@ -289,7 +289,7 @@ func TestConfigRepositoryBindsSecretsToTheirColumn(t *testing.T) {
 	}
 	var apiKeyRaw, headersRaw []byte
 	if err := pool.QueryRow(ctx,
-		`SELECT api_key_encrypted, headers_encrypted FROM llm_configs WHERE id=$1`, cfg.ID,
+		`SELECT api_key_encrypted, headers_encrypted FROM llm_config WHERE id=$1`, cfg.ID,
 	).Scan(&apiKeyRaw, &headersRaw); err != nil {
 		t.Fatal(err)
 	}
@@ -305,7 +305,7 @@ func TestConfigRepositoryBindsSecretsToTheirColumn(t *testing.T) {
 
 	// Copying one encrypted column into the other must fail authentication
 	// because each column is bound to its own AAD.
-	if _, err := pool.Exec(ctx, `UPDATE llm_configs SET api_key_encrypted = headers_encrypted WHERE id=$1`, cfg.ID); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE llm_config SET api_key_encrypted = headers_encrypted WHERE id=$1`, cfg.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := repo.Get(ctx, cfg.ID); !errors.Is(err, crypto.ErrInvalidCiphertext) {
@@ -390,7 +390,7 @@ func TestConfigServiceSeedFromEnvAgainstDatabase(t *testing.T) {
 	}
 
 	var rawKey []byte
-	if err := pool.QueryRow(ctx, `SELECT api_key_encrypted FROM llm_configs WHERE id=$1`, cfg.ID).Scan(&rawKey); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT api_key_encrypted FROM llm_config WHERE id=$1`, cfg.ID).Scan(&rawKey); err != nil {
 		t.Fatal(err)
 	}
 	if bytes.Contains(rawKey, []byte("sk-seed")) {

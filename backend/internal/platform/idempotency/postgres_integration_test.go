@@ -17,7 +17,7 @@ func createTestUser(t *testing.T, ctx context.Context, pool *pgxpool.Pool, usern
 	t.Helper()
 	var userID int64
 	if err := pool.QueryRow(ctx,
-		`INSERT INTO users (username, password_hash, role, status) VALUES ($1, $2, 'user', 'active') RETURNING id`,
+		`INSERT INTO user_account (username, password_hash, role, status) VALUES ($1, $2, 'user', 'active') RETURNING id`,
 		username, "not-a-real-hash").Scan(&userID); err != nil {
 		t.Fatalf("insert user: %v", err)
 	}
@@ -27,7 +27,7 @@ func createTestUser(t *testing.T, ctx context.Context, pool *pgxpool.Pool, usern
 func countIdempotencyRows(t *testing.T, ctx context.Context, pool *pgxpool.Pool) int {
 	t.Helper()
 	var count int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM idempotency_keys`).Scan(&count); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM idempotency_key`).Scan(&count); err != nil {
 		t.Fatalf("count idempotency rows: %v", err)
 	}
 	return count
@@ -112,7 +112,7 @@ func TestPostgresStoreTTLIs24Hours(t *testing.T) {
 	}
 	var ttl time.Duration
 	if err := pool.QueryRow(ctx,
-		`SELECT expires_at - created_at FROM idempotency_keys`).Scan(&ttl); err != nil {
+		`SELECT expires_at - created_at FROM idempotency_key`).Scan(&ttl); err != nil {
 		t.Fatalf("read ttl: %v", err)
 	}
 	if ttl < 24*time.Hour-time.Minute || ttl > 24*time.Hour+time.Minute {
@@ -129,7 +129,7 @@ func TestPostgresStorePurgesExpiredRecords(t *testing.T) {
 	if err := store.Save(ctx, userID, "key_12345678", "POST", "/api/users", "old-hash", 201, []byte(`{"data":{"id":1}}`)); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE idempotency_keys SET expires_at = now() - interval '1 second'`); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE idempotency_key SET expires_at = now() - interval '1 second'`); err != nil {
 		t.Fatalf("expire row: %v", err)
 	}
 

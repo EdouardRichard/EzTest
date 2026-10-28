@@ -10,7 +10,7 @@ import (
 )
 
 // PostgresStore is the durable idempotency store backed by the
-// idempotency_keys table.
+// idempotency_key table.
 type PostgresStore struct {
 	pool *pgxpool.Pool
 }
@@ -22,18 +22,18 @@ func NewPostgresStore(pool *pgxpool.Pool) *PostgresStore {
 	return &PostgresStore{pool: pool}
 }
 
-const cleanupExpiredSQL = `DELETE FROM idempotency_keys WHERE expires_at <= now()`
+const cleanupExpiredSQL = `DELETE FROM idempotency_key WHERE expires_at <= now()`
 
 // getSQL also purges expired records. The SELECT filters expired rows because
 // data-modifying CTEs share the statement snapshot.
 const getSQL = `WITH expired AS (
-	DELETE FROM idempotency_keys WHERE expires_at <= now()
+	DELETE FROM idempotency_key WHERE expires_at <= now()
 )
 SELECT response_status, response_body, request_hash
-FROM idempotency_keys
+FROM idempotency_key
 WHERE user_id = $1 AND key = $2 AND method = $3 AND path = $4 AND expires_at > now()`
 
-const saveSQL = `INSERT INTO idempotency_keys
+const saveSQL = `INSERT INTO idempotency_key
 	(key, user_id, method, path, request_hash, response_status, response_body, expires_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, now() + interval '24 hours')
 ON CONFLICT (user_id, key, method, path) DO NOTHING`

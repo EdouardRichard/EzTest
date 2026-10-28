@@ -12,7 +12,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
 )
 
-// TestMetadataRepositoryInsertIsInsertOnly proves the storage_objects
+// TestMetadataRepositoryInsertIsInsertOnly proves the storage_object
 // repository inserts once per sha256, reports whether a row was newly created,
 // and never updates an existing row.
 func TestMetadataRepositoryInsertIsInsertOnly(t *testing.T) {

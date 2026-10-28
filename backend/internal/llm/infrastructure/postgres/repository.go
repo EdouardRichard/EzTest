@@ -175,12 +175,12 @@ func (r *ConfigRepository) Create(ctx context.Context, params llm.CreateParams) 
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	if params.IsDefault {
-		if _, err := tx.Exec(ctx, `UPDATE llm_configs SET is_default = false, updated_at = now() WHERE is_default`); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE llm_config SET is_default = false, updated_at = now() WHERE is_default`); err != nil {
 			return llm.Config{}, fmt.Errorf("postgres: clear default llm config: %w", err)
 		}
 	}
 
-	const query = `INSERT INTO llm_configs
+	const query = `INSERT INTO llm_config
 		(name, protocol, base_url, model, api_key_encrypted, key_version, headers_encrypted,
 		 retry_count, retry_interval_ms, timeout_ms, stream_enabled, multimodal_enabled, is_default)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
@@ -224,7 +224,7 @@ func (r *ConfigRepository) Update(ctx context.Context, id int64, params llm.Upda
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	existing, err := r.scanConfig(tx.QueryRow(ctx,
-		`SELECT `+configColumns+` FROM llm_configs WHERE id = $1 FOR UPDATE`, id))
+		`SELECT `+configColumns+` FROM llm_config WHERE id = $1 FOR UPDATE`, id))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return llm.Config{}, llm.ErrConfigNotFound
@@ -319,12 +319,12 @@ func (r *ConfigRepository) Update(ctx context.Context, id int64, params llm.Upda
 
 	if isDefault {
 		if _, err := tx.Exec(ctx,
-			`UPDATE llm_configs SET is_default = false, updated_at = now() WHERE is_default AND id <> $1`, id); err != nil {
+			`UPDATE llm_config SET is_default = false, updated_at = now() WHERE is_default AND id <> $1`, id); err != nil {
 			return llm.Config{}, fmt.Errorf("postgres: clear other default llm config: %w", err)
 		}
 	}
 
-	const query = `UPDATE llm_configs SET
+	const query = `UPDATE llm_config SET
 		name = $2, protocol = $3, base_url = $4, model = $5,
 		api_key_encrypted = $6, key_version = $7, headers_encrypted = $8,
 		retry_count = $9, retry_interval_ms = $10, timeout_ms = $11,
@@ -367,7 +367,7 @@ func (r *ConfigRepository) Update(ctx context.Context, id int64, params llm.Upda
 
 // Delete removes a configuration.
 func (r *ConfigRepository) Delete(ctx context.Context, id int64) error {
-	tag, err := r.pool.Exec(ctx, `DELETE FROM llm_configs WHERE id = $1`, id)
+	tag, err := r.pool.Exec(ctx, `DELETE FROM llm_config WHERE id = $1`, id)
 	if err != nil {
 		return fmt.Errorf("postgres: delete llm config: %w", err)
 	}
@@ -380,7 +380,7 @@ func (r *ConfigRepository) Delete(ctx context.Context, id int64) error {
 // Get returns one decrypted configuration by ID.
 func (r *ConfigRepository) Get(ctx context.Context, id int64) (llm.Config, error) {
 	cfg, err := r.scanConfig(r.pool.QueryRow(ctx,
-		`SELECT `+configColumns+` FROM llm_configs WHERE id = $1`, id))
+		`SELECT `+configColumns+` FROM llm_config WHERE id = $1`, id))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return llm.Config{}, llm.ErrConfigNotFound
@@ -392,7 +392,7 @@ func (r *ConfigRepository) Get(ctx context.Context, id int64) (llm.Config, error
 
 // List returns every decrypted configuration ordered by ID.
 func (r *ConfigRepository) List(ctx context.Context) ([]llm.Config, error) {
-	rows, err := r.pool.Query(ctx, `SELECT `+configColumns+` FROM llm_configs ORDER BY id ASC`)
+	rows, err := r.pool.Query(ctx, `SELECT `+configColumns+` FROM llm_config ORDER BY id ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list llm configs: %w", err)
 	}
@@ -415,7 +415,7 @@ func (r *ConfigRepository) List(ctx context.Context) ([]llm.Config, error) {
 // GetDefault returns the default configuration or ErrConfigNotFound.
 func (r *ConfigRepository) GetDefault(ctx context.Context) (llm.Config, error) {
 	cfg, err := r.scanConfig(r.pool.QueryRow(ctx,
-		`SELECT `+configColumns+` FROM llm_configs WHERE is_default ORDER BY id LIMIT 1`))
+		`SELECT `+configColumns+` FROM llm_config WHERE is_default ORDER BY id LIMIT 1`))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return llm.Config{}, llm.ErrConfigNotFound
@@ -438,7 +438,7 @@ func normalizeHeaderNames(headers map[string]string) map[string]string {
 	return normalized
 }
 
-// mapUniqueViolation translates the llm_configs table's unique violations into
+// mapUniqueViolation translates the llm_config table's unique violations into
 // domain errors. It returns nil when err is not a unique violation.
 func mapUniqueViolation(err error) error {
 	var pgErr *pgconn.PgError

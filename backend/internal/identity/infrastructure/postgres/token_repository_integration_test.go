@@ -205,12 +205,12 @@ func TestTokenRepositoryTouchLastSeen(t *testing.T) {
 	}
 }
 
-// lastSeenAt reads auth_tokens.last_seen_at directly so tests observe the
+// lastSeenAt reads auth_token.last_seen_at directly so tests observe the
 // column, not a repository mapping.
 func lastSeenAt(t *testing.T, pool *pgxpool.Pool, hash string) *time.Time {
 	t.Helper()
 	var seen *time.Time
-	if err := pool.QueryRow(ctx, `SELECT last_seen_at FROM auth_tokens WHERE token_hash = $1`, hash).Scan(&seen); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT last_seen_at FROM auth_token WHERE token_hash = $1`, hash).Scan(&seen); err != nil {
 		t.Fatalf("read last_seen_at: %v", err)
 	}
 	return seen

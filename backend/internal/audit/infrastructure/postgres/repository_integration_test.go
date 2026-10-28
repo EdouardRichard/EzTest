@@ -118,7 +118,7 @@ func TestAuditRepositoryRecordAndList(t *testing.T) {
 	}
 
 	// Deleting the acting user must keep the entries and null their actor.
-	if _, err := pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, admin.ID); err != nil {
+	if _, err := pool.Exec(ctx, `DELETE FROM user_account WHERE id = $1`, admin.ID); err != nil {
 		t.Fatal(err)
 	}
 	all, _, err := repo.List(ctx, 10, 0)
@@ -136,7 +136,7 @@ func TestAuditRepositoryRecordAndList(t *testing.T) {
 }
 
 // TestIdentityActionsAreAudited wires the identity services to the real
-// PostgreSQL recorder and proves the six documented actions land in audit_logs
+// PostgreSQL recorder and proves the six documented actions land in audit_log
 // with no credentials in metadata. Authenticate must stay un-audited.
 func TestIdentityActionsAreAudited(t *testing.T) {
 	pool := testutil.OpenTestDB(t)

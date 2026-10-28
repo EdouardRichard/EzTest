@@ -29,7 +29,7 @@ func NewTokenRepository(pool *pgxpool.Pool) *TokenRepository {
 // Create stores a token hash for a user. The raw token never reaches the
 // database.
 func (r *TokenRepository) Create(ctx context.Context, userID int64, tokenHash string, expiresAt time.Time) error {
-	const query = `INSERT INTO auth_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)`
+	const query = `INSERT INTO auth_token (user_id, token_hash, expires_at) VALUES ($1, $2, $3)`
 	if _, err := r.pool.Exec(ctx, query, userID, tokenHash, expiresAt); err != nil {
 		return fmt.Errorf("postgres: create token: %w", err)
 	}
@@ -38,7 +38,7 @@ func (r *TokenRepository) Create(ctx context.Context, userID int64, tokenHash st
 
 // GetByHash returns the token with the given hash.
 func (r *TokenRepository) GetByHash(ctx context.Context, tokenHash string) (identity.Token, error) {
-	const query = `SELECT ` + tokenColumns + ` FROM auth_tokens WHERE token_hash = $1`
+	const query = `SELECT ` + tokenColumns + ` FROM auth_token WHERE token_hash = $1`
 	var token identity.Token
 	err := r.pool.QueryRow(ctx, query, tokenHash).Scan(
 		&token.ID,
@@ -59,7 +59,7 @@ func (r *TokenRepository) GetByHash(ctx context.Context, tokenHash string) (iden
 // Revoke marks a token revoked. Revoking an unknown or already revoked token is
 // a successful no-op so logout stays idempotent.
 func (r *TokenRepository) Revoke(ctx context.Context, tokenHash string) error {
-	const query = `UPDATE auth_tokens SET revoked_at = now() WHERE token_hash = $1 AND revoked_at IS NULL`
+	const query = `UPDATE auth_token SET revoked_at = now() WHERE token_hash = $1 AND revoked_at IS NULL`
 	if _, err := r.pool.Exec(ctx, query, tokenHash); err != nil {
 		return fmt.Errorf("postgres: revoke token: %w", err)
 	}
@@ -68,7 +68,7 @@ func (r *TokenRepository) Revoke(ctx context.Context, tokenHash string) error {
 
 // RevokeAllForUser revokes every unrevoked token of a user.
 func (r *TokenRepository) RevokeAllForUser(ctx context.Context, userID int64) error {
-	const query = `UPDATE auth_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL`
+	const query = `UPDATE auth_token SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL`
 	if _, err := r.pool.Exec(ctx, query, userID); err != nil {
 		return fmt.Errorf("postgres: revoke user tokens: %w", err)
 	}
@@ -79,7 +79,7 @@ func (r *TokenRepository) RevokeAllForUser(ctx context.Context, userID int64) er
 // stored value is missing or older than olderThan. A missing token affects no
 // rows and is therefore a no-op.
 func (r *TokenRepository) TouchLastSeen(ctx context.Context, tokenHash string, olderThan time.Time) error {
-	const query = `UPDATE auth_tokens SET last_seen_at = now() WHERE token_hash = $1 AND (last_seen_at IS NULL OR last_seen_at < $2)`
+	const query = `UPDATE auth_token SET last_seen_at = now() WHERE token_hash = $1 AND (last_seen_at IS NULL OR last_seen_at < $2)`
 	if _, err := r.pool.Exec(ctx, query, tokenHash, olderThan); err != nil {
 		return fmt.Errorf("postgres: touch token last seen: %w", err)
 	}
