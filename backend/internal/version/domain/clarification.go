@@ -7,7 +7,7 @@ import (
 	"unicode/utf8"
 )
 
-// Clarification session statuses, mirrored from the clarification_sessions
+// Clarification session statuses, mirrored from the clarification_session
 // status CHECK constraint.
 const (
 	SessionActive    = "active"
@@ -15,7 +15,7 @@ const (
 	SessionCancelled = "cancelled"
 )
 
-// Question statuses, mirrored from the clarification_questions status CHECK
+// Question statuses, mirrored from the clarification_question status CHECK
 // constraint.
 const (
 	QuestionOpen      = "open"
@@ -23,7 +23,7 @@ const (
 	QuestionDismissed = "dismissed"
 )
 
-// Answered-via values, mirrored from the clarification_questions
+// Answered-via values, mirrored from the clarification_question
 // answered_via CHECK constraint.
 const (
 	AnsweredViaUI    = "ui"
@@ -99,7 +99,7 @@ func (s *ClarificationSession) Validate() error {
 }
 
 // Validate enforces the question bounds of spec §6.6 and the frozen enums of
-// the clarification_questions CHECK constraints.
+// the clarification_question CHECK constraints.
 func (q *Question) Validate() error {
 	if q == nil {
 		return NewInvalid("", "invalid_question", "question is required")

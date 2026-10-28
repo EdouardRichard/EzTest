@@ -165,7 +165,7 @@ func TestVersionActionsLifecycle(t *testing.T) {
 
 	// One draft requirement unlocks clarifying.
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO requirements (id, version_id, title, status, created_by, updated_by)
+		INSERT INTO requirement (id, version_id, title, status, created_by, updated_by)
 		VALUES (7101, $1, 'Checkout flow', 'draft', 7, 7)`, created.ID); err != nil {
 		t.Fatalf("insert requirement: %v", err)
 	}
@@ -180,7 +180,7 @@ func TestVersionActionsLifecycle(t *testing.T) {
 	// One version-level open question plus the draft requirement: the soft gate
 	// rejects unacknowledged enter-design and reports both warnings.
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO clarification_questions (id, version_id, requirement_id, question, status, created_by)
+		INSERT INTO clarification_question (id, version_id, requirement_id, question, status, created_by)
 		VALUES (7201, $1, NULL, 'Which locales?', 'open', 7)`, created.ID); err != nil {
 		t.Fatalf("insert question: %v", err)
 	}
@@ -291,13 +291,13 @@ func TestVersionStatusIsNotChangedByRequirementOps(t *testing.T) {
 			t.Fatalf("Create %s: %v", status, err)
 		}
 		if status != domain.VersionDraft {
-			if _, err := pool.Exec(ctx, `UPDATE versions SET status = $2 WHERE id = $1`, version.ID, status); err != nil {
+			if _, err := pool.Exec(ctx, `UPDATE version SET status = $2 WHERE id = $1`, version.ID, status); err != nil {
 				t.Fatalf("seed status %s: %v", status, err)
 			}
 		}
 		requirementID := version.ID + 100
 		if _, err := pool.Exec(ctx, `
-			INSERT INTO requirements (id, version_id, title, status, created_by, updated_by)
+			INSERT INTO requirement (id, version_id, title, status, created_by, updated_by)
 			VALUES ($1, $2, 'Requirement', 'draft', 7, 7)`, requirementID, version.ID); err != nil {
 			t.Fatalf("insert requirement: %v", err)
 		}
@@ -307,10 +307,10 @@ func TestVersionStatusIsNotChangedByRequirementOps(t *testing.T) {
 			sql  string
 			args []any
 		}{
-			{"confirm", `UPDATE requirements SET status = 'clarified', confirmed_at = now(), confirmed_by = 7 WHERE id = $1`, []any{requirementID}},
-			{"reopen", `UPDATE requirements SET status = 'draft', confirmed_at = NULL, confirmed_by = NULL WHERE id = $1`, []any{requirementID}},
-			{"update", `UPDATE requirements SET title = 'Updated', updated_by = 7 WHERE id = $1`, []any{requirementID}},
-			{"delete", `DELETE FROM requirements WHERE id = $1`, []any{requirementID}},
+			{"confirm", `UPDATE requirement SET status = 'clarified', confirmed_at = now(), confirmed_by = 7 WHERE id = $1`, []any{requirementID}},
+			{"reopen", `UPDATE requirement SET status = 'draft', confirmed_at = NULL, confirmed_by = NULL WHERE id = $1`, []any{requirementID}},
+			{"update", `UPDATE requirement SET title = 'Updated', updated_by = 7 WHERE id = $1`, []any{requirementID}},
+			{"delete", `DELETE FROM requirement WHERE id = $1`, []any{requirementID}},
 		}
 		for _, operation := range operations {
 			if _, err := pool.Exec(ctx, operation.sql, operation.args...); err != nil {

@@ -8,7 +8,7 @@ import (
 	"unicode/utf8"
 )
 
-// Version statuses, mirrored from the versions.status CHECK constraint.
+// Version statuses, mirrored from the version.status CHECK constraint.
 const (
 	VersionDraft      = "draft"
 	VersionClarifying = "clarifying"

@@ -195,7 +195,7 @@ func TestRequirementRepositoryLifecycle(t *testing.T) {
 		2002: base.Add(time.Minute),
 		2003: base.Add(2 * time.Minute),
 	} {
-		if _, err := pool.Exec(ctx, `UPDATE requirements SET created_at = $2 WHERE id = $1`, id, at); err != nil {
+		if _, err := pool.Exec(ctx, `UPDATE requirement SET created_at = $2 WHERE id = $1`, id, at); err != nil {
 			t.Fatalf("set created_at for %d: %v", id, err)
 		}
 	}
@@ -233,7 +233,7 @@ func TestRequirementRepositoryLifecycle(t *testing.T) {
 
 	// Confirmation requires this requirement's open questions to be zero.
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO clarification_questions (id, version_id, requirement_id, question, status, created_by)
+		INSERT INTO clarification_question (id, version_id, requirement_id, question, status, created_by)
 		VALUES (3001, $1, 2001, 'Which coupons?', 'open', 7)`, version.ID); err != nil {
 		t.Fatalf("insert question: %v", err)
 	}
@@ -249,7 +249,7 @@ func TestRequirementRepositoryLifecycle(t *testing.T) {
 
 	// Answering the question unblocks the confirmation and stamps the audit
 	// fields.
-	if _, err := pool.Exec(ctx, `UPDATE clarification_questions SET status = 'answered', answer = 'all' WHERE id = 3001`); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE clarification_question SET status = 'answered', answer = 'all' WHERE id = 3001`); err != nil {
 		t.Fatalf("answer question: %v", err)
 	}
 	confirmed, err := repo.UpdateStatus(ctx, 2001, domain.RequirementDraft, domain.RequirementClarified, 42)
@@ -323,21 +323,21 @@ func TestRequirementRepositoryDeleteCascades(t *testing.T) {
 		Revision: 1, CreatedBy: 7, UpdatedBy: 7,
 	})
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO requirement_relations
+		INSERT INTO requirement_relation
 			(id, version_id, from_requirement_id, to_requirement_id, relation_type, created_by)
 		VALUES (4001, $1, 2101, 2102, 'depends_on', 7),
 		       (4002, $1, 2102, 2101, 'overlaps', 7)`, version.ID); err != nil {
 		t.Fatalf("insert relations: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO clarification_questions
+		INSERT INTO clarification_question
 			(id, version_id, requirement_id, question, status, created_by)
 		VALUES (4101, $1, 2101, 'Requirement question?', 'open', 7),
 		       (4102, $1, NULL, 'Version question?', 'open', 7)`, version.ID); err != nil {
 		t.Fatalf("insert questions: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO decisions
+		INSERT INTO decision
 			(id, version_id, requirement_id, topic, decision, status, source, proposed_by)
 		VALUES (4201, $1, 2101, 'Topic', 'Decision', 'proposed', 'ai', 7)`, version.ID); err != nil {
 		t.Fatalf("insert decision: %v", err)
@@ -355,10 +355,10 @@ func TestRequirementRepositoryDeleteCascades(t *testing.T) {
 		t.Fatalf("Delete: %v", err)
 	}
 	for _, table := range []string{
-		"requirement_relations WHERE from_requirement_id = 2101 OR to_requirement_id = 2101",
-		"clarification_questions WHERE requirement_id = 2101",
-		"decisions WHERE requirement_id = 2101",
-		"requirement_attachments WHERE requirement_id = 2101",
+		"requirement_relation WHERE from_requirement_id = 2101 OR to_requirement_id = 2101",
+		"clarification_question WHERE requirement_id = 2101",
+		"decision WHERE requirement_id = 2101",
+		"requirement_attachment WHERE requirement_id = 2101",
 	} {
 		var count int
 		if err := pool.QueryRow(ctx, `SELECT count(*)::int FROM `+table).Scan(&count); err != nil {
@@ -370,7 +370,7 @@ func TestRequirementRepositoryDeleteCascades(t *testing.T) {
 	}
 	// The version-level question and the other requirement survive.
 	var survivors int
-	if err := pool.QueryRow(ctx, `SELECT count(*)::int FROM clarification_questions WHERE id = 4102`).Scan(&survivors); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT count(*)::int FROM clarification_question WHERE id = 4102`).Scan(&survivors); err != nil {
 		t.Fatalf("count surviving question: %v", err)
 	}
 	if survivors != 1 {
@@ -551,14 +551,14 @@ func TestRequirementRelationListCapsAt500(t *testing.T) {
 	// Two disjoint requirement ranges give 50x11 distinct non-self pairs; 521
 	// relations are seeded so only the lowest 500 ids may be returned.
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO requirements (id, version_id, title, created_by, updated_by)
+		INSERT INTO requirement (id, version_id, title, created_by, updated_by)
 		SELECT n, $1::bigint, 'requirement ' || n, 7, 7 FROM generate_series(3001, 3050) AS n
 		UNION ALL
 		SELECT n, $1::bigint, 'requirement ' || n, 7, 7 FROM generate_series(4001, 4011) AS n`, version.ID); err != nil {
 		t.Fatalf("seed requirements: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO requirement_relations
+		INSERT INTO requirement_relation
 			(id, version_id, from_requirement_id, to_requirement_id, relation_type, created_by)
 		SELECT 800000 + n, $1, 3001 + (n / 11), 4001 + (n % 11), 'overlaps', 7
 		FROM generate_series(0, 520) AS n`, version.ID); err != nil {

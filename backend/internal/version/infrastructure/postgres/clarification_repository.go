@@ -235,7 +235,7 @@ func decisionWriteError(err error, operation string, decision *domain.Decision) 
 // CreateSession inserts session with its explicit Snowflake id and writes the
 // stored row (server timestamps included) back to it.
 func (r *ClarificationRepository) CreateSession(ctx context.Context, session *domain.ClarificationSession) error {
-	const query = `INSERT INTO clarification_sessions
+	const query = `INSERT INTO clarification_session
 		(id, version_id, status, agent_session_id, context_summary, started_by)
 		VALUES ($1, $2, $3, $4, $5, $6)
 		RETURNING ` + clarificationSessionColumnList
@@ -255,7 +255,7 @@ func (r *ClarificationRepository) CreateSession(ctx context.Context, session *do
 func (r *ClarificationRepository) GetActiveSession(ctx context.Context, versionID int64) (*domain.ClarificationSession, error) {
 	session, err := scanClarificationSession(r.pool.QueryRow(ctx,
 		`SELECT `+clarificationSessionColumnList+`
-		 FROM clarification_sessions
+		 FROM clarification_session
 		 WHERE version_id = $1 AND status = 'active'
 		 ORDER BY id DESC LIMIT 1`, versionID))
 	if err != nil {
@@ -274,7 +274,7 @@ func (r *ClarificationRepository) GetActiveSession(ctx context.Context, versionI
 func (r *ClarificationRepository) LatestSession(ctx context.Context, versionID int64) (*domain.ClarificationSession, error) {
 	session, err := scanClarificationSession(r.pool.QueryRow(ctx,
 		`SELECT `+clarificationSessionColumnList+`
-		 FROM clarification_sessions
+		 FROM clarification_session
 		 WHERE version_id = $1
 		 ORDER BY started_at DESC, (status = 'active') DESC, id DESC
 		 LIMIT 1`, versionID))
@@ -290,7 +290,7 @@ func (r *ClarificationRepository) LatestSession(ctx context.Context, versionID i
 // GetSession returns one session by id.
 func (r *ClarificationRepository) GetSession(ctx context.Context, id int64) (*domain.ClarificationSession, error) {
 	session, err := scanClarificationSession(r.pool.QueryRow(ctx,
-		`SELECT `+clarificationSessionColumnList+` FROM clarification_sessions WHERE id = $1`, id))
+		`SELECT `+clarificationSessionColumnList+` FROM clarification_session WHERE id = $1`, id))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, domain.NewNotFound("clarification session", id)
@@ -303,7 +303,7 @@ func (r *ClarificationRepository) GetSession(ctx context.Context, id int64) (*do
 // CompleteSession completes one active session with a status compare-and-swap.
 func (r *ClarificationRepository) CompleteSession(ctx context.Context, id int64, actor int64) (*domain.ClarificationSession, error) {
 	completed, err := scanClarificationSession(r.pool.QueryRow(ctx,
-		`UPDATE clarification_sessions
+		`UPDATE clarification_session
 		 SET status = 'completed', ended_at = now()
 		 WHERE id = $1 AND status = 'active'
 		 RETURNING `+clarificationSessionColumnList, id))
@@ -322,7 +322,7 @@ func (r *ClarificationRepository) CompleteSession(ctx context.Context, id int64,
 func (r *ClarificationRepository) clarificationSessionCompletionConflict(ctx context.Context, id int64) error {
 	var status string
 	if err := r.pool.QueryRow(ctx,
-		`SELECT status FROM clarification_sessions WHERE id = $1`, id).Scan(&status); err != nil {
+		`SELECT status FROM clarification_session WHERE id = $1`, id).Scan(&status); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewNotFound("clarification session", id)
 		}
@@ -335,7 +335,7 @@ func (r *ClarificationRepository) clarificationSessionCompletionConflict(ctx con
 // UpdateContextSummary writes the active session's context summary.
 func (r *ClarificationRepository) UpdateContextSummary(ctx context.Context, versionID int64, summary string, actor int64) error {
 	tag, err := r.pool.Exec(ctx,
-		`UPDATE clarification_sessions
+		`UPDATE clarification_session
 		 SET context_summary = $2, summary_updated_at = now()
 		 WHERE version_id = $1 AND status = 'active'`, versionID, summary)
 	if err != nil {
@@ -351,7 +351,7 @@ func (r *ClarificationRepository) UpdateContextSummary(ctx context.Context, vers
 // CreateQuestion inserts question with its explicit Snowflake id and writes the
 // stored row back to it.
 func (r *ClarificationRepository) CreateQuestion(ctx context.Context, question *domain.Question) error {
-	const query = `INSERT INTO clarification_questions
+	const query = `INSERT INTO clarification_question
 		(id, version_id, requirement_id, session_id, question, status, answer,
 		 source, answered_via, answered_by, answered_at, created_by)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
@@ -371,7 +371,7 @@ func (r *ClarificationRepository) CreateQuestion(ctx context.Context, question *
 // GetQuestion returns one question by id.
 func (r *ClarificationRepository) GetQuestion(ctx context.Context, id int64) (*domain.Question, error) {
 	question, err := scanQuestion(r.pool.QueryRow(ctx,
-		`SELECT `+clarificationQuestionColumnList+` FROM clarification_questions WHERE id = $1`, id))
+		`SELECT `+clarificationQuestionColumnList+` FROM clarification_question WHERE id = $1`, id))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, domain.NewNotFound("question", id)
@@ -394,7 +394,7 @@ func (r *ClarificationRepository) ListQuestions(ctx context.Context, filter doma
 		return nil, false, fmt.Errorf("postgres: list clarification questions: %w", err)
 	}
 	const query = `SELECT ` + clarificationQuestionColumnList + `
-		FROM clarification_questions
+		FROM clarification_question
 		WHERE version_id = $1
 		  AND ($2 = '' OR status = $2)
 		  AND ($3::bigint IS NULL OR requirement_id = $3)
@@ -429,7 +429,7 @@ func (r *ClarificationRepository) ListQuestions(ctx context.Context, filter doma
 // UpdateQuestion rewrites the mutable question fields under the fromStatus
 // compare-and-swap and writes the stored row back to question.
 func (r *ClarificationRepository) UpdateQuestion(ctx context.Context, question *domain.Question, fromStatus string) error {
-	const query = `UPDATE clarification_questions
+	const query = `UPDATE clarification_question
 		SET requirement_id = $3, session_id = $4, question = $5, status = $6,
 		    answer = $7, answered_via = $8, answered_by = $9, answered_at = $10,
 		    updated_at = now()
@@ -454,7 +454,7 @@ func (r *ClarificationRepository) UpdateQuestion(ctx context.Context, question *
 func (r *ClarificationRepository) clarificationQuestionUpdateConflict(ctx context.Context, id int64, fromStatus string) error {
 	var status string
 	if err := r.pool.QueryRow(ctx,
-		`SELECT status FROM clarification_questions WHERE id = $1`, id).Scan(&status); err != nil {
+		`SELECT status FROM clarification_question WHERE id = $1`, id).Scan(&status); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewNotFound("question", id)
 		}
@@ -474,7 +474,7 @@ func (r *ClarificationRepository) CreateDecision(ctx context.Context, decision *
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
 
-	const query = `INSERT INTO decisions
+	const query = `INSERT INTO decision
 		(id, version_id, requirement_id, question_id, topic, decision, rationale,
 		 status, source, proposed_by, decided_by, decided_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
@@ -500,7 +500,7 @@ func (r *ClarificationRepository) CreateDecision(ctx context.Context, decision *
 // GetDecision returns one decision by id.
 func (r *ClarificationRepository) GetDecision(ctx context.Context, id int64) (*domain.Decision, error) {
 	decision, err := scanDecision(r.pool.QueryRow(ctx,
-		`SELECT `+decisionColumnList+` FROM decisions WHERE id = $1`, id))
+		`SELECT `+decisionColumnList+` FROM decision WHERE id = $1`, id))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, domain.NewNotFound("decision", id)
@@ -521,7 +521,7 @@ func (r *ClarificationRepository) ListDecisions(ctx context.Context, filter doma
 		return nil, false, fmt.Errorf("postgres: list decisions: %w", err)
 	}
 	const query = `SELECT ` + decisionColumnList + `
-		FROM decisions
+		FROM decision
 		WHERE version_id = $1
 		  AND ($2 = '' OR status = $2)
 		  AND ($3::boolean = false OR id > $4::bigint)
@@ -561,7 +561,7 @@ func (r *ClarificationRepository) UpdateDecision(ctx context.Context, decision *
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
 
-	const query = `UPDATE decisions
+	const query = `UPDATE decision
 		SET status = $3, rationale = $4, decided_by = $5, decided_at = $6,
 		    updated_at = now()
 		WHERE id = $1 AND status = $2
@@ -590,7 +590,7 @@ func (r *ClarificationRepository) UpdateDecision(ctx context.Context, decision *
 func (r *ClarificationRepository) decisionUpdateConflict(ctx context.Context, tx pgx.Tx, id int64, fromStatus string) error {
 	var status string
 	if err := tx.QueryRow(ctx,
-		`SELECT status FROM decisions WHERE id = $1`, id).Scan(&status); err != nil {
+		`SELECT status FROM decision WHERE id = $1`, id).Scan(&status); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewNotFound("decision", id)
 		}
@@ -608,7 +608,7 @@ func answerLinkedQuestion(ctx context.Context, tx pgx.Tx, decision *domain.Decis
 		return nil
 	}
 	if _, err := tx.Exec(ctx, `
-		UPDATE clarification_questions
+		UPDATE clarification_question
 		SET status = 'answered', answer = $2, answered_via = 'ui',
 		    answered_by = $3, answered_at = COALESCE($4::timestamptz, now()),
 		    updated_at = now()

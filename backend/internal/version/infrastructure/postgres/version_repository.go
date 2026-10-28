@@ -124,7 +124,7 @@ func versionCreateError(err error) error {
 // Create inserts v with its explicit Snowflake id and writes the full stored
 // row (server timestamps included) back to v.
 func (r *VersionRepository) Create(ctx context.Context, v *domain.Version) error {
-	const query = `INSERT INTO versions
+	const query = `INSERT INTO version
 		(id, name, label, description, status,
 		 system_id, environment_id, code_repository_id, code_branch, code_baseline_commit,
 		 revision, created_by, updated_by)
@@ -147,7 +147,7 @@ func (r *VersionRepository) Create(ctx context.Context, v *domain.Version) error
 // Get returns one version by id.
 func (r *VersionRepository) Get(ctx context.Context, id int64) (*domain.Version, error) {
 	version, err := scanVersion(r.pool.QueryRow(ctx,
-		`SELECT `+versionColumnList+` FROM versions WHERE id = $1`, id))
+		`SELECT `+versionColumnList+` FROM version WHERE id = $1`, id))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, domain.NewNotFound("version", id)
@@ -176,7 +176,7 @@ func (r *VersionRepository) List(ctx context.Context, f domain.VersionFilter) ([
 	)
 	if cursorID != 0 {
 		if err := r.pool.QueryRow(ctx,
-			`SELECT updated_at FROM versions WHERE id = $1`, cursorID).Scan(&cursorUpdated); err != nil {
+			`SELECT updated_at FROM version WHERE id = $1`, cursorID).Scan(&cursorUpdated); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return []domain.Version{}, false, nil
 			}
@@ -186,7 +186,7 @@ func (r *VersionRepository) List(ctx context.Context, f domain.VersionFilter) ([
 	}
 
 	const query = `SELECT ` + versionColumnList + `
-		FROM versions
+		FROM version
 		WHERE ($1 = '' OR status = $1)
 		  AND ($2::boolean = false OR (updated_at, id) < ($3::timestamptz, $4::bigint))
 		ORDER BY updated_at DESC, id DESC
@@ -222,9 +222,9 @@ func (r *VersionRepository) Counts(ctx context.Context, versionID int64) (domain
 	const query = `SELECT
 			count(*)::int,
 			count(*) FILTER (WHERE status = 'clarified')::int,
-			(SELECT count(*)::int FROM clarification_questions
+			(SELECT count(*)::int FROM clarification_question
 			  WHERE version_id = $1 AND status = 'open')
-		FROM requirements
+		FROM requirement
 		WHERE version_id = $1`
 	var counts domain.VersionCounts
 	if err := r.pool.QueryRow(ctx, query, versionID).Scan(
@@ -239,7 +239,7 @@ func (r *VersionRepository) Counts(ctx context.Context, versionID int64) (domain
 // lock. Zero affected rows is a revision_conflict (the repository port
 // contract), whether the row is gone or another writer already bumped it.
 func (r *VersionRepository) UpdateMetadata(ctx context.Context, id int64, expected int, name, label, desc string, actor int64) (*domain.Version, error) {
-	const query = `UPDATE versions
+	const query = `UPDATE version
 		SET name = $3, label = $4, description = $5,
 		    revision = revision + 1, updated_by = $6, updated_at = now()
 		WHERE id = $1 AND revision = $2
@@ -259,7 +259,7 @@ func (r *VersionRepository) UpdateMetadata(ctx context.Context, id int64, expect
 // designing row (or any later status) is a version_state_conflict even when the
 // supplied revision matches (spec §6.1/INV-13).
 func (r *VersionRepository) UpdateBindings(ctx context.Context, id int64, expected int, b domain.VersionBindings, actor int64) (*domain.Version, error) {
-	const query = `UPDATE versions
+	const query = `UPDATE version
 		SET system_id = $3, environment_id = $4, code_repository_id = $5,
 		    code_branch = $6, code_baseline_commit = $7,
 		    revision = revision + 1, updated_by = $8, updated_at = now()
@@ -285,7 +285,7 @@ func (r *VersionRepository) UpdateBindings(ctx context.Context, id int64, expect
 // a deleted row) is a revision conflict.
 func (r *VersionRepository) bindingConflict(ctx context.Context, id int64) error {
 	var status string
-	if err := r.pool.QueryRow(ctx, `SELECT status FROM versions WHERE id = $1`, id).Scan(&status); err != nil {
+	if err := r.pool.QueryRow(ctx, `SELECT status FROM version WHERE id = $1`, id).Scan(&status); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return versionRevisionConflict(id)
 		}
@@ -300,7 +300,7 @@ func (r *VersionRepository) bindingConflict(ctx context.Context, id int64) error
 // UpdateStatus performs a status compare-and-swap. Zero affected rows is a
 // version_state_conflict, whether the row is gone or its status changed.
 func (r *VersionRepository) UpdateStatus(ctx context.Context, id int64, from, to string, actor int64) (*domain.Version, error) {
-	const query = `UPDATE versions
+	const query = `UPDATE version
 		SET status = $3, revision = revision + 1, updated_by = $4, updated_at = now()
 		WHERE id = $1 AND status = $2
 		RETURNING ` + versionColumnList
@@ -320,7 +320,7 @@ func (r *VersionRepository) UpdateStatus(ctx context.Context, id int64, from, to
 // are not repeated here.
 func (r *VersionRepository) ListUnclarified(ctx context.Context, versionID int64) ([]int64, int, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT id FROM requirements
+		SELECT id FROM requirement
 		WHERE version_id = $1 AND status = 'draft'
 		ORDER BY id ASC`, versionID)
 	if err != nil {
@@ -342,7 +342,7 @@ func (r *VersionRepository) ListUnclarified(ctx context.Context, versionID int64
 
 	var openQuestions int
 	if err := r.pool.QueryRow(ctx, `
-		SELECT count(*)::int FROM clarification_questions
+		SELECT count(*)::int FROM clarification_question
 		WHERE version_id = $1 AND status = 'open' AND requirement_id IS NULL`,
 		versionID).Scan(&openQuestions); err != nil {
 		return nil, 0, fmt.Errorf("postgres: count version-level open questions: %w", err)

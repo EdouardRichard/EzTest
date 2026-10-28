@@ -187,7 +187,7 @@ func TestVersionRepositoryCursorAcrossTimestamps(t *testing.T) {
 		4002: base.Add(2 * time.Minute),
 		4003: base.Add(time.Minute),
 	} {
-		if _, err := pool.Exec(ctx, `UPDATE versions SET updated_at = $2 WHERE id = $1`, id, at); err != nil {
+		if _, err := pool.Exec(ctx, `UPDATE version SET updated_at = $2 WHERE id = $1`, id, at); err != nil {
 			t.Fatalf("set updated_at for %d: %v", id, err)
 		}
 	}
@@ -211,7 +211,7 @@ func TestVersionRepositoryCursorAcrossTimestamps(t *testing.T) {
 
 	// Equal updated_at values fall back to id DESC and the composite keyset.
 	if _, err := pool.Exec(ctx,
-		`UPDATE versions SET updated_at = $2 WHERE id = ANY($1)`,
+		`UPDATE version SET updated_at = $2 WHERE id = ANY($1)`,
 		[]int64{4002, 4003}, base.Add(2*time.Minute)); err != nil {
 		t.Fatalf("tie updated_at: %v", err)
 	}
@@ -353,13 +353,13 @@ func TestVersionRepositoryStatusCountsAndUnclarified(t *testing.T) {
 	// version-level open question counts toward both Counts and the enter-design
 	// warnings; requirement-level open questions only count toward Counts.
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO requirements (id, version_id, title, status, created_by, updated_by)
+		INSERT INTO requirement (id, version_id, title, status, created_by, updated_by)
 		VALUES (3101, $1, 'Draft requirement', 'draft', 7, 7),
 		       (3102, $1, 'Clarified requirement', 'clarified', 7, 7)`, stored.ID); err != nil {
 		t.Fatalf("insert requirements: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO clarification_questions
+		INSERT INTO clarification_question
 			(id, version_id, requirement_id, question, status, answer, created_by)
 		VALUES (3201, $1, NULL, 'Version-level open?', 'open', '', 7),
 		       (3202, $1, 3101, 'Requirement-level open?', 'open', '', 7),
@@ -396,13 +396,13 @@ func TestVersionRepositoryStatusCountsAndUnclarified(t *testing.T) {
 
 	// Requirement operations never change Version.status (INV-4): confirm,
 	// reopen and delete requirements directly and re-read the version.
-	if _, err := pool.Exec(ctx, `UPDATE requirements SET status = 'clarified', confirmed_at = now(), confirmed_by = 7 WHERE id = 3101`); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE requirement SET status = 'clarified', confirmed_at = now(), confirmed_by = 7 WHERE id = 3101`); err != nil {
 		t.Fatalf("confirm requirement: %v", err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE requirements SET status = 'draft', confirmed_at = NULL, confirmed_by = NULL WHERE id = 3101`); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE requirement SET status = 'draft', confirmed_at = NULL, confirmed_by = NULL WHERE id = 3101`); err != nil {
 		t.Fatalf("reopen requirement: %v", err)
 	}
-	if _, err := pool.Exec(ctx, `DELETE FROM requirements WHERE id = 3102`); err != nil {
+	if _, err := pool.Exec(ctx, `DELETE FROM requirement WHERE id = 3102`); err != nil {
 		t.Fatalf("delete requirement: %v", err)
 	}
 	afterOps, err := repo.Get(ctx, stored.ID)

@@ -344,7 +344,7 @@ func TestClarificationQuestionDecisionStateLifecycle(t *testing.T) {
 	}
 	var questionRows int
 	if err := f.pool.QueryRow(ctx,
-		`SELECT count(*)::int FROM clarification_questions WHERE version_id = $1`, version.ID).Scan(&questionRows); err != nil {
+		`SELECT count(*)::int FROM clarification_question WHERE version_id = $1`, version.ID).Scan(&questionRows); err != nil {
 		t.Fatalf("count questions: %v", err)
 	}
 	if questionRows != 1 {
@@ -413,7 +413,7 @@ func TestClarificationQuestionDecisionStateLifecycle(t *testing.T) {
 	}
 	var storedQuestionStatus string
 	if err := f.pool.QueryRow(ctx,
-		`SELECT status FROM clarification_questions WHERE id = $1`, created.ID).Scan(&storedQuestionStatus); err != nil {
+		`SELECT status FROM clarification_question WHERE id = $1`, created.ID).Scan(&storedQuestionStatus); err != nil {
 		t.Fatalf("read question status: %v", err)
 	}
 	if storedQuestionStatus != domain.QuestionOpen {
@@ -435,7 +435,7 @@ func TestClarificationQuestionDecisionStateLifecycle(t *testing.T) {
 	)
 	if err := f.pool.QueryRow(ctx, `
 		SELECT status, answer, answered_via, answered_by, answered_at::text
-		FROM clarification_questions WHERE id = $1`, created.ID).
+		FROM clarification_question WHERE id = $1`, created.ID).
 		Scan(&storedQuestionStatus, &storedAnswer, &storedVia, &storedBy, &storedAnsweredAt); err != nil {
 		t.Fatalf("read answered question: %v", err)
 	}
@@ -466,7 +466,7 @@ func TestClarificationQuestionDecisionStateLifecycle(t *testing.T) {
 		t.Fatalf("human decision = %+v", human)
 	}
 	if err := f.pool.QueryRow(ctx,
-		`SELECT status, answer FROM clarification_questions WHERE id = $1`, second.ID).
+		`SELECT status, answer FROM clarification_question WHERE id = $1`, second.ID).
 		Scan(&storedQuestionStatus, &storedAnswer); err != nil {
 		t.Fatalf("read human-linked question: %v", err)
 	}

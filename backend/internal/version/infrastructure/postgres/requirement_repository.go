@@ -220,7 +220,7 @@ func attachmentCreateError(err error, requirementID int64) error {
 // Create inserts requirement with its explicit Snowflake id and writes the full
 // stored row (server timestamps included) back to it.
 func (r *RequirementRepository) Create(ctx context.Context, requirement *domain.Requirement) error {
-	const query = `INSERT INTO requirements
+	const query = `INSERT INTO requirement
 		(id, version_id, title, description, acceptance_criteria, priority, status,
 		 source, last_update_source, revision, confirmed_at, confirmed_by, created_by, updated_by)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
@@ -241,7 +241,7 @@ func (r *RequirementRepository) Create(ctx context.Context, requirement *domain.
 // Get returns one requirement by id.
 func (r *RequirementRepository) Get(ctx context.Context, id int64) (*domain.Requirement, error) {
 	requirement, err := scanRequirement(r.pool.QueryRow(ctx,
-		`SELECT `+requirementColumnList+` FROM requirements WHERE id = $1`, id))
+		`SELECT `+requirementColumnList+` FROM requirement WHERE id = $1`, id))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, domain.NewNotFound("requirement", id)
@@ -270,7 +270,7 @@ func (r *RequirementRepository) List(ctx context.Context, versionID int64, statu
 	)
 	if cursorID != 0 {
 		if err := r.pool.QueryRow(ctx,
-			`SELECT created_at FROM requirements WHERE id = $1`, cursorID).Scan(&cursorCreated); err != nil {
+			`SELECT created_at FROM requirement WHERE id = $1`, cursorID).Scan(&cursorCreated); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return []domain.Requirement{}, false, nil
 			}
@@ -280,7 +280,7 @@ func (r *RequirementRepository) List(ctx context.Context, versionID int64, statu
 	}
 
 	const query = `SELECT ` + requirementColumnList + `
-		FROM requirements
+		FROM requirement
 		WHERE version_id = $1
 		  AND ($2 = '' OR status = $2)
 		  AND ($3::boolean = false OR (created_at, id) > ($4::timestamptz, $5::bigint))
@@ -315,7 +315,7 @@ func (r *RequirementRepository) List(ctx context.Context, versionID int64, statu
 // stored row back to requirement. Non-draft rows (a concurrent confirmation) and
 // stale revisions are state conflicts and never write.
 func (r *RequirementRepository) Update(ctx context.Context, requirement *domain.Requirement, expected int) error {
-	const query = `UPDATE requirements
+	const query = `UPDATE requirement
 		SET title = $3, description = $4, acceptance_criteria = $5, priority = $6,
 		    last_update_source = $7, revision = revision + 1, updated_by = $8, updated_at = now()
 		WHERE id = $1 AND revision = $2 AND status = 'draft'
@@ -340,7 +340,7 @@ func (r *RequirementRepository) Update(ctx context.Context, requirement *domain.
 // requirement_state_conflict (INV-9).
 func (r *RequirementRepository) requirementWriteConflict(ctx context.Context, id int64) error {
 	var status string
-	if err := r.pool.QueryRow(ctx, `SELECT status FROM requirements WHERE id = $1`, id).Scan(&status); err != nil {
+	if err := r.pool.QueryRow(ctx, `SELECT status FROM requirement WHERE id = $1`, id).Scan(&status); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return requirementRevisionConflict(id)
 		}
@@ -356,13 +356,13 @@ func (r *RequirementRepository) requirementWriteConflict(ctx context.Context, id
 // attachment metadata are removed by the schema's ON DELETE CASCADE constraints
 // in the same statement (INV-10). Clarified requirements are a state conflict.
 func (r *RequirementRepository) Delete(ctx context.Context, id int64) error {
-	tag, err := r.pool.Exec(ctx, `DELETE FROM requirements WHERE id = $1 AND status = 'draft'`, id)
+	tag, err := r.pool.Exec(ctx, `DELETE FROM requirement WHERE id = $1 AND status = 'draft'`, id)
 	if err != nil {
 		return fmt.Errorf("postgres: delete requirement: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		var status string
-		if err := r.pool.QueryRow(ctx, `SELECT status FROM requirements WHERE id = $1`, id).Scan(&status); err != nil {
+		if err := r.pool.QueryRow(ctx, `SELECT status FROM requirement WHERE id = $1`, id).Scan(&status); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return domain.NewNotFound("requirement", id)
 			}
@@ -382,7 +382,7 @@ func (r *RequirementRepository) Delete(ctx context.Context, id int64) error {
 // Confirmed_at/by are stamped on confirmation and cleared on reopen; both
 // transitions are human-only, so last_update_source becomes user.
 func (r *RequirementRepository) UpdateStatus(ctx context.Context, id int64, from, to string, actor int64) (*domain.Requirement, error) {
-	const query = `UPDATE requirements
+	const query = `UPDATE requirement
 		SET status = $3,
 		    confirmed_at = CASE WHEN $3 = 'clarified' THEN now() ELSE NULL END,
 		    confirmed_by = CASE WHEN $3 = 'clarified' THEN $4::bigint ELSE NULL END,
@@ -390,7 +390,7 @@ func (r *RequirementRepository) UpdateStatus(ctx context.Context, id int64, from
 		    revision = revision + 1, updated_by = $4, updated_at = now()
 		WHERE id = $1 AND status = $2
 		  AND ($3 <> 'clarified' OR NOT EXISTS (
-		      SELECT 1 FROM clarification_questions q
+		      SELECT 1 FROM clarification_question q
 		      WHERE q.requirement_id = $1 AND q.status = 'open'))
 		RETURNING ` + requirementColumnList
 	updated, err := scanRequirement(r.pool.QueryRow(ctx, query, id, from, to, actor))
@@ -408,7 +408,7 @@ func (r *RequirementRepository) UpdateStatus(ctx context.Context, id int64, from
 // draft with open questions is the confirmation gate's open_questions_remaining.
 func (r *RequirementRepository) requirementStatusConflict(ctx context.Context, id int64, from, to string) error {
 	var status string
-	if err := r.pool.QueryRow(ctx, `SELECT status FROM requirements WHERE id = $1`, id).Scan(&status); err != nil {
+	if err := r.pool.QueryRow(ctx, `SELECT status FROM requirement WHERE id = $1`, id).Scan(&status); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return requirementStateConflict(id)
 		}
@@ -434,7 +434,7 @@ func (r *RequirementRepository) requirementStatusConflict(ctx context.Context, i
 func (r *RequirementRepository) CountOpenQuestions(ctx context.Context, requirementID int64) (int, error) {
 	var count int
 	if err := r.pool.QueryRow(ctx, `
-		SELECT count(*)::int FROM clarification_questions
+		SELECT count(*)::int FROM clarification_question
 		WHERE requirement_id = $1 AND status = 'open'`, requirementID).Scan(&count); err != nil {
 		return 0, fmt.Errorf("postgres: count requirement open questions: %w", err)
 	}
@@ -446,7 +446,7 @@ func (r *RequirementRepository) CountOpenQuestions(ctx context.Context, requirem
 // service applies the same cap as defence in depth.
 func (r *RequirementRepository) ListRelations(ctx context.Context, versionID int64) ([]domain.Relation, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT `+relationColumnList+` FROM requirement_relations
+		`SELECT `+relationColumnList+` FROM requirement_relation
 		 WHERE version_id = $1 ORDER BY id ASC LIMIT $2`,
 		versionID, requirementRelationsListLimit)
 	if err != nil {
@@ -472,11 +472,11 @@ func (r *RequirementRepository) ListRelations(ctx context.Context, versionID int
 // endpoints belong to the relation's version (INV-7); the partial unique indexes
 // reject normalized duplicates.
 func (r *RequirementRepository) CreateRelation(ctx context.Context, relation *domain.Relation) error {
-	const query = `INSERT INTO requirement_relations
+	const query = `INSERT INTO requirement_relation
 		(id, version_id, from_requirement_id, to_requirement_id, relation_type, description, source, created_by)
 		SELECT $1, $2, $3, $4, $5, $6, $7, $8
-		WHERE EXISTS (SELECT 1 FROM requirements WHERE id = $3 AND version_id = $2)
-		  AND EXISTS (SELECT 1 FROM requirements WHERE id = $4 AND version_id = $2)
+		WHERE EXISTS (SELECT 1 FROM requirement WHERE id = $3 AND version_id = $2)
+		  AND EXISTS (SELECT 1 FROM requirement WHERE id = $4 AND version_id = $2)
 		RETURNING ` + relationColumnList
 	created, err := scanRelation(r.pool.QueryRow(ctx, query,
 		relation.ID, relation.VersionID, relation.FromRequirementID, relation.ToRequirementID,
@@ -495,7 +495,7 @@ func (r *RequirementRepository) CreateRelation(ctx context.Context, relation *do
 
 // UpdateRelation rewrites one relation's type and description.
 func (r *RequirementRepository) UpdateRelation(ctx context.Context, id int64, relType, desc string) (*domain.Relation, error) {
-	const query = `UPDATE requirement_relations
+	const query = `UPDATE requirement_relation
 		SET relation_type = $2, description = $3, updated_at = now()
 		WHERE id = $1
 		RETURNING ` + relationColumnList
@@ -511,7 +511,7 @@ func (r *RequirementRepository) UpdateRelation(ctx context.Context, id int64, re
 
 // DeleteRelation removes one relation.
 func (r *RequirementRepository) DeleteRelation(ctx context.Context, id int64) error {
-	tag, err := r.pool.Exec(ctx, `DELETE FROM requirement_relations WHERE id = $1`, id)
+	tag, err := r.pool.Exec(ctx, `DELETE FROM requirement_relation WHERE id = $1`, id)
 	if err != nil {
 		return fmt.Errorf("postgres: delete requirement relation: %w", err)
 	}
@@ -523,7 +523,7 @@ func (r *RequirementRepository) DeleteRelation(ctx context.Context, id int64) er
 
 // CreateAttachment inserts one attachment metadata row.
 func (r *RequirementRepository) CreateAttachment(ctx context.Context, attachment *domain.Attachment) error {
-	const query = `INSERT INTO requirement_attachments
+	const query = `INSERT INTO requirement_attachment
 		(id, version_id, requirement_id, kind, filename, mime_type, size_bytes, sha256, storage_path, created_by)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		RETURNING ` + attachmentColumnList
@@ -542,7 +542,7 @@ func (r *RequirementRepository) CreateAttachment(ctx context.Context, attachment
 // ListAttachments returns the requirement's attachments ordered by id.
 func (r *RequirementRepository) ListAttachments(ctx context.Context, requirementID int64) ([]domain.Attachment, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT `+attachmentColumnList+` FROM requirement_attachments WHERE requirement_id = $1 ORDER BY id ASC`,
+		`SELECT `+attachmentColumnList+` FROM requirement_attachment WHERE requirement_id = $1 ORDER BY id ASC`,
 		requirementID)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list requirement attachments: %w", err)
@@ -566,7 +566,7 @@ func (r *RequirementRepository) ListAttachments(ctx context.Context, requirement
 // GetAttachment returns one attachment metadata row by id.
 func (r *RequirementRepository) GetAttachment(ctx context.Context, id int64) (*domain.Attachment, error) {
 	attachment, err := scanAttachment(r.pool.QueryRow(ctx,
-		`SELECT `+attachmentColumnList+` FROM requirement_attachments WHERE id = $1`, id))
+		`SELECT `+attachmentColumnList+` FROM requirement_attachment WHERE id = $1`, id))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, domain.NewNotFound("attachment", id)
@@ -578,7 +578,7 @@ func (r *RequirementRepository) GetAttachment(ctx context.Context, id int64) (*d
 
 // DeleteAttachment removes one attachment metadata row.
 func (r *RequirementRepository) DeleteAttachment(ctx context.Context, id int64) error {
-	tag, err := r.pool.Exec(ctx, `DELETE FROM requirement_attachments WHERE id = $1`, id)
+	tag, err := r.pool.Exec(ctx, `DELETE FROM requirement_attachment WHERE id = $1`, id)
 	if err != nil {
 		return fmt.Errorf("postgres: delete requirement attachment: %w", err)
 	}
@@ -594,8 +594,8 @@ func (r *RequirementRepository) CountAttachments(ctx context.Context, requiremen
 	var requirementCount, versionCount int
 	if err := r.pool.QueryRow(ctx, `
 		SELECT
-			(SELECT count(*)::int FROM requirement_attachments WHERE requirement_id = $1),
-			(SELECT count(*)::int FROM requirement_attachments WHERE version_id = $2)`,
+			(SELECT count(*)::int FROM requirement_attachment WHERE requirement_id = $1),
+			(SELECT count(*)::int FROM requirement_attachment WHERE version_id = $2)`,
 		requirementID, versionID).Scan(&requirementCount, &versionCount); err != nil {
 		return 0, 0, fmt.Errorf("postgres: count requirement attachments: %w", err)
 	}
