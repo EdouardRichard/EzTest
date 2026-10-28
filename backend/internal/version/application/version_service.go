@@ -32,12 +32,30 @@ type CreateVersionCommand struct {
 	CodeBaselineCommit *string
 }
 
+// executionStateRepository is the column-scoped P6 execution-state port used by
+// MarkPaused, SetBatchNo and CompleteExecution. Pausing, batch-number and
+// completion writes are deliberately separate operations: each UPDATE is scoped
+// to its own columns, so a stale read of one field can never roll back a
+// concurrent write of another. The PostgreSQL repository implements this
+// alongside the broader VersionRepository port.
+type executionStateRepository interface {
+	// SetPaused writes only paused and pause_mode.
+	SetPaused(ctx context.Context, id int64, paused bool, pauseMode string, actor int64) (*Version, error)
+	// SetBatchNo writes only batch_no under a monotonic SQL guard: a lower
+	// number is rejected as a version_state_conflict.
+	SetBatchNo(ctx context.Context, id int64, batchNo int, actor int64) (*Version, error)
+	// CompleteExecution performs the executing -> completed compare-and-swap
+	// and refuses a paused version.
+	CompleteExecution(ctx context.Context, id int64, actor int64) (*Version, error)
+}
+
 // VersionService implements the version use cases: create/list/get, metadata
 // and binding updates, and the two P3 state actions (start-clarification and
 // enter-design). Requirement operations never call into this service to change
 // a status (spec §6.1/INV-2/INV-4).
 type VersionService struct {
 	repo      VersionRepository
+	execution executionStateRepository
 	resources ResourceCatalog
 	git       GitReader
 	events    EventPublisher
@@ -99,12 +117,24 @@ func NewVersionService(repo VersionRepository, resources ResourceCatalog, git Gi
 		events:    events,
 		ids:       DefaultIDGenerator(),
 	}
+	if execution, ok := repo.(executionStateRepository); ok {
+		service.execution = execution
+	}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(service)
 		}
 	}
 	return service
+}
+
+// executionRepo returns the column-scoped execution-state port, or an error
+// when the wired repository predates the split.
+func (s *VersionService) executionRepo() (executionStateRepository, error) {
+	if s.execution == nil {
+		return nil, errors.New("version: repository does not support column-scoped execution-state writes")
+	}
+	return s.execution, nil
 }
 
 // Create validates the optional bindings, snapshots the code baseline and
@@ -674,10 +704,12 @@ func (s *VersionService) ApproveBaseline(ctx context.Context, id int64, actor in
 // MarkPaused sets or clears the execution pause flag of an executing or
 // continuing version (spec §5.3/§5.4). Pausing never changes the version
 // status: only the batch drives case scheduling, the version flag mirrors it
-// for the detail view. The action publishes the existing version.status_changed
-// event with from/to pinned to the unchanged status and the new paused flag in
-// detail; reason is carried for audit only and is not persisted on the version
-// row. Resuming keeps the stored pause mode.
+// for the detail view. The write is scoped to paused/pause_mode and never
+// touches batch_no, so a concurrent SetBatchNo cannot be rolled back by this
+// action's earlier read. The action publishes the existing
+// version.status_changed event with from/to pinned to the unchanged status and
+// the new paused flag in detail; reason is carried for audit only and is not
+// persisted on the version row. Resuming keeps the stored pause mode.
 func (s *VersionService) MarkPaused(ctx context.Context, id int64, paused bool, mode, reason string, actor int64) (*Version, error) {
 	current, err := s.repo.Get(ctx, id)
 	if err != nil {
@@ -699,7 +731,11 @@ func (s *VersionService) MarkPaused(ctx context.Context, id int64, paused bool, 
 		pauseMode = mode
 	}
 
-	updated, err := s.repo.UpdateExecutionState(ctx, id, paused, pauseMode, current.BatchNo, actor)
+	repo, err := s.executionRepo()
+	if err != nil {
+		return nil, err
+	}
+	updated, err := repo.SetPaused(ctx, id, paused, pauseMode, actor)
 	if err != nil {
 		return nil, err
 	}
@@ -729,10 +765,14 @@ func (s *VersionService) MarkPaused(ctx context.Context, id int64, paused bool, 
 	return updated, nil
 }
 
-// SetBatchNo records the latest batch number of an executing version. Batch
-// numbers are monotonic: a lower number is a version_state_conflict, the same
-// number is an idempotent no-op (so a retried create is safe), and the action
-// does not publish an event (batch events carry the batch lifecycle).
+// SetBatchNo records the latest batch number of an executing or continuing
+// version. The write is scoped to batch_no and never touches paused/pause_mode,
+// and the repository enforces the monotonic guard at write time (batch_no <=
+// $new): a lower number is a version_state_conflict even when the service's
+// earlier read saw a smaller value, so two racing batch writes can never move
+// the column backwards. The same number is an idempotent no-op in the service
+// (so a retried create is safe), and the action does not publish an event (batch
+// events carry the batch lifecycle).
 func (s *VersionService) SetBatchNo(ctx context.Context, id int64, batchNo int, actor int64) (*Version, error) {
 	if batchNo < 0 {
 		return nil, domain.NewInvalid("batchNo", "invalid_batch_no", "batchNo must not be negative")
@@ -749,17 +789,21 @@ func (s *VersionService) SetBatchNo(ctx context.Context, id int64, batchNo int, 
 		return current, nil
 	}
 
-	pauseMode := current.PauseMode
-	if pauseMode == "" {
-		pauseMode = domain.PauseModeGraceful
+	repo, err := s.executionRepo()
+	if err != nil {
+		return nil, err
 	}
-	return s.repo.UpdateExecutionState(ctx, id, current.Paused, pauseMode, batchNo, actor)
+	return repo.SetBatchNo(ctx, id, batchNo, actor)
 }
 
-// CompleteExecution moves a version from executing to completed (spec §6.2).
-// The continuing -> completed transition belongs to P7, so a continuing version
-// is a version_state_conflict here; every other source state is rejected the
-// same way. The action publishes version.status_changed.
+// CompleteExecution moves an unpaused executing version to completed (spec
+// §6.2). The continuing -> completed transition belongs to P7, so a continuing
+// version is a version_state_conflict here; every other source state, including
+// a paused executing version, is rejected the same way. The repository repeats
+// the guard in SQL (status = executing AND paused = false), so a pause that
+// commits between this read and the write also loses as a version_state_conflict
+// rather than completing a paused version. The action publishes
+// version.status_changed.
 func (s *VersionService) CompleteExecution(ctx context.Context, id int64, actor int64) (*Version, error) {
 	current, err := s.repo.Get(ctx, id)
 	if err != nil {
@@ -769,8 +813,16 @@ func (s *VersionService) CompleteExecution(ctx context.Context, id int64, actor 
 		return nil, domain.NewStateConflict("version_state_conflict",
 			fmt.Sprintf("version %d is %s, complete-execution requires executing", id, current.Status))
 	}
+	if current.Paused {
+		return nil, domain.NewStateConflict("version_state_conflict",
+			fmt.Sprintf("version %d is paused, complete-execution requires an unpaused executing version", id))
+	}
 
-	updated, err := s.repo.UpdateStatus(ctx, id, domain.VersionExecuting, domain.VersionCompleted, actor)
+	repo, err := s.executionRepo()
+	if err != nil {
+		return nil, err
+	}
+	updated, err := repo.CompleteExecution(ctx, id, actor)
 	if err != nil {
 		return nil, err
 	}

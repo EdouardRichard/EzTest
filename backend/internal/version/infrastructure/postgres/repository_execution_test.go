@@ -4,6 +4,7 @@ package postgres_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
@@ -11,10 +12,9 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/postgres"
 )
 
-// TestVersionRepositoryExecutionState covers the P6 execution columns:
-// scanner/round-trip, the defaults of a freshly created version, the
-// paused/pause_mode/batch_no write, the executing|continuing status guard and
-// the paused partial index (spec §3.3/§5.4).
+// TestVersionRepositoryExecutionState covers the P6 execution columns end to
+// end: scanner/defaults, the column-scoped pause and batch writes, the monotonic
+// batch guard and the guarded completion (spec §3.3/§5.4).
 func TestVersionRepositoryExecutionState(t *testing.T) {
 	ctx := context.Background()
 	pool := testutil.OpenTestDB(t)
@@ -35,37 +35,101 @@ func TestVersionRepositoryExecutionState(t *testing.T) {
 		t.Fatalf("loaded execution defaults = %+v", loaded)
 	}
 
-	// Execution-state writes are only legal while executing (or continuing).
-	// Move the seeded draft row straight to executing through SQL: UpdateStatus
-	// only models the P3/P5 transitions.
 	if _, err := pool.Exec(ctx, `UPDATE version SET status = 'executing' WHERE id = $1`, stored.ID); err != nil {
 		t.Fatalf("set executing: %v", err)
 	}
 
-	paused, err := repo.UpdateExecutionState(ctx, stored.ID, true, domain.PauseModeImmediate, 0, 42)
+	// SetPaused writes paused/pause_mode only; batch_no keeps its stored value.
+	paused, err := repo.SetPaused(ctx, stored.ID, true, domain.PauseModeImmediate, 42)
 	if err != nil {
-		t.Fatalf("UpdateExecutionState pause: %v", err)
+		t.Fatalf("SetPaused: %v", err)
 	}
 	if !paused.Paused || paused.PauseMode != domain.PauseModeImmediate || paused.BatchNo != 0 ||
 		paused.Status != domain.VersionExecuting || paused.Revision != 2 || paused.UpdatedBy != 42 {
 		t.Fatalf("paused row = %+v", paused)
 	}
 
-	withBatch, err := repo.UpdateExecutionState(ctx, stored.ID, true, domain.PauseModeImmediate, 4, 43)
+	// SetBatchNo writes batch_no only; the concurrent pause flag survives.
+	withBatch, err := repo.SetBatchNo(ctx, stored.ID, 4, 43)
 	if err != nil {
-		t.Fatalf("UpdateExecutionState batch: %v", err)
+		t.Fatalf("SetBatchNo: %v", err)
 	}
-	if withBatch.BatchNo != 4 || withBatch.Revision != 3 || withBatch.UpdatedBy != 43 {
+	if withBatch.BatchNo != 4 || !withBatch.Paused || withBatch.PauseMode != domain.PauseModeImmediate ||
+		withBatch.Revision != 3 || withBatch.UpdatedBy != 43 {
 		t.Fatalf("batch row = %+v", withBatch)
 	}
 
-	resumed, err := repo.UpdateExecutionState(ctx, stored.ID, false, domain.PauseModeImmediate, 4, 43)
+	// The SQL guard is monotonic (batch_no <= $new), so an equal write is
+	// accepted while a lower one is a conflict that leaves the row untouched.
+	equal, err := repo.SetBatchNo(ctx, stored.ID, 4, 44)
 	if err != nil {
-		t.Fatalf("UpdateExecutionState resume: %v", err)
+		t.Fatalf("SetBatchNo equal: %v", err)
 	}
-	if resumed.Paused || resumed.PauseMode != domain.PauseModeImmediate || resumed.BatchNo != 4 {
+	if equal.BatchNo != 4 || equal.Revision != 4 || !equal.Paused {
+		t.Fatalf("equal batch row = %+v", equal)
+	}
+	_, err = repo.SetBatchNo(ctx, stored.ID, 3, 45)
+	assertVersionKind(t, err, domain.KindStateConflict, "version_state_conflict")
+	afterDecrease, err := repo.Get(ctx, stored.ID)
+	if err != nil {
+		t.Fatalf("Get after decrease: %v", err)
+	}
+	if afterDecrease.BatchNo != 4 || afterDecrease.Revision != 4 || !afterDecrease.Paused {
+		t.Fatalf("rejected decrease changed the row: %+v", afterDecrease)
+	}
+
+	// Resume rewrites paused only and keeps the batch number.
+	resumed, err := repo.SetPaused(ctx, stored.ID, false, domain.PauseModeImmediate, 46)
+	if err != nil {
+		t.Fatalf("SetPaused resume: %v", err)
+	}
+	if resumed.Paused || resumed.BatchNo != 4 || resumed.PauseMode != domain.PauseModeImmediate ||
+		resumed.Revision != 5 {
 		t.Fatalf("resumed row = %+v", resumed)
 	}
+
+	// Completion is refused while paused.
+	if _, err := repo.SetPaused(ctx, stored.ID, true, domain.PauseModeImmediate, 47); err != nil {
+		t.Fatalf("SetPaused before complete: %v", err)
+	}
+	_, err = repo.CompleteExecution(ctx, stored.ID, 48)
+	assertVersionKind(t, err, domain.KindStateConflict, "version_state_conflict")
+	afterPausedComplete, err := repo.Get(ctx, stored.ID)
+	if err != nil {
+		t.Fatalf("Get after paused complete: %v", err)
+	}
+	if afterPausedComplete.Status != domain.VersionExecuting || !afterPausedComplete.Paused ||
+		afterPausedComplete.Revision != 6 {
+		t.Fatalf("paused complete changed the row: %+v", afterPausedComplete)
+	}
+
+	// An unpaused executing version completes.
+	if _, err := repo.SetPaused(ctx, stored.ID, false, domain.PauseModeImmediate, 49); err != nil {
+		t.Fatalf("SetPaused before complete: %v", err)
+	}
+	completed, err := repo.CompleteExecution(ctx, stored.ID, 50)
+	if err != nil {
+		t.Fatalf("CompleteExecution: %v", err)
+	}
+	if completed.Status != domain.VersionCompleted || completed.Revision != 8 || completed.Paused {
+		t.Fatalf("completed row = %+v", completed)
+	}
+
+	// Completing closes both execution-state write paths.
+	_, err = repo.SetPaused(ctx, stored.ID, true, domain.PauseModeGraceful, 51)
+	assertVersionKind(t, err, domain.KindStateConflict, "version_state_conflict")
+	_, err = repo.SetBatchNo(ctx, stored.ID, 5, 51)
+	assertVersionKind(t, err, domain.KindStateConflict, "version_state_conflict")
+	_, err = repo.CompleteExecution(ctx, stored.ID, 51)
+	assertVersionKind(t, err, domain.KindStateConflict, "version_state_conflict")
+
+	// Missing rows are the same state conflict, matching the port contract.
+	_, err = repo.SetPaused(ctx, 999999, true, domain.PauseModeGraceful, 44)
+	assertVersionKind(t, err, domain.KindStateConflict, "version_state_conflict")
+	_, err = repo.SetBatchNo(ctx, 999999, 1, 44)
+	assertVersionKind(t, err, domain.KindStateConflict, "version_state_conflict")
+	_, err = repo.CompleteExecution(ctx, 999999, 44)
+	assertVersionKind(t, err, domain.KindStateConflict, "version_state_conflict")
 
 	// The paused partial index exists on the renamed singular table.
 	var indexName *string
@@ -75,28 +139,159 @@ func TestVersionRepositoryExecutionState(t *testing.T) {
 	if indexName == nil || *indexName != "idx_versions_paused" {
 		t.Fatalf("paused index = %v, want idx_versions_paused", indexName)
 	}
+}
 
-	// completing the version closes the execution-state write path.
-	completed, err := repo.UpdateStatus(ctx, stored.ID, domain.VersionExecuting, domain.VersionCompleted, 44)
-	if err != nil {
-		t.Fatalf("UpdateStatus completed: %v", err)
-	}
-	if completed.Status != domain.VersionCompleted {
-		t.Fatalf("completed status = %s", completed.Status)
-	}
-	_, err = repo.UpdateExecutionState(ctx, stored.ID, true, domain.PauseModeGraceful, 5, 44)
-	assertVersionKind(t, err, domain.KindStateConflict, "version_state_conflict")
-	afterBlocked, err := repo.Get(ctx, stored.ID)
-	if err != nil {
-		t.Fatalf("Get after blocked execution state: %v", err)
-	}
-	if afterBlocked.Status != domain.VersionCompleted || afterBlocked.Paused ||
-		afterBlocked.PauseMode != domain.PauseModeImmediate || afterBlocked.BatchNo != 4 ||
-		afterBlocked.Revision != completed.Revision {
-		t.Fatalf("blocked execution-state write changed the row: %+v", afterBlocked)
+// TestVersionRepositoryExecutionStateIndependentColumns races pause and batch
+// writes on the same executing version: both must commit because neither write
+// touches the other's column.
+func TestVersionRepositoryExecutionStateIndependentColumns(t *testing.T) {
+	ctx := context.Background()
+	pool := testutil.OpenTestDB(t)
+	repo := postgres.NewVersionRepository(pool)
+
+	stored := insertVersion(t, repo, domain.Version{ID: 6002, Name: "Execution columns", CreatedBy: 7, UpdatedBy: 7})
+	if _, err := pool.Exec(ctx, `UPDATE version SET status = 'executing' WHERE id = $1`, stored.ID); err != nil {
+		t.Fatalf("set executing: %v", err)
 	}
 
-	// Missing rows are the same state conflict, matching the port contract.
-	_, err = repo.UpdateExecutionState(ctx, 999999, false, domain.PauseModeGraceful, 0, 44)
-	assertVersionKind(t, err, domain.KindStateConflict, "version_state_conflict")
+	start := make(chan struct{})
+	var (
+		wg                 sync.WaitGroup
+		pauseErr, batchErr error
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		_, pauseErr = repo.SetPaused(ctx, stored.ID, true, domain.PauseModeImmediate, 42)
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		_, batchErr = repo.SetBatchNo(ctx, stored.ID, 7, 43)
+	}()
+	close(start)
+	wg.Wait()
+
+	if pauseErr != nil {
+		t.Fatalf("concurrent SetPaused: %v", pauseErr)
+	}
+	if batchErr != nil {
+		t.Fatalf("concurrent SetBatchNo: %v", batchErr)
+	}
+	got, err := repo.Get(ctx, stored.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !got.Paused || got.PauseMode != domain.PauseModeImmediate || got.BatchNo != 7 {
+		t.Fatalf("concurrent pause/batch lost a column: %+v", got)
+	}
+	if got.Status != domain.VersionExecuting || got.Revision != 3 {
+		t.Fatalf("status/revision = %s/%d, want executing/3", got.Status, got.Revision)
+	}
+}
+
+// TestVersionRepositoryExecutionStateBatchMonotonicConcurrent races a lower and
+// a higher batch number: the SQL guard must keep the higher value, and any
+// rejected write must be a version_state_conflict.
+func TestVersionRepositoryExecutionStateBatchMonotonicConcurrent(t *testing.T) {
+	ctx := context.Background()
+	pool := testutil.OpenTestDB(t)
+	repo := postgres.NewVersionRepository(pool)
+
+	stored := insertVersion(t, repo, domain.Version{ID: 6003, Name: "Batch guard", CreatedBy: 7, UpdatedBy: 7})
+	if _, err := pool.Exec(ctx, `UPDATE version SET status = 'executing' WHERE id = $1`, stored.ID); err != nil {
+		t.Fatalf("set executing: %v", err)
+	}
+
+	batches := []int{5, 3}
+	errs := make([]error, len(batches))
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i, batchNo := range batches {
+		wg.Add(1)
+		go func(i, batchNo int) {
+			defer wg.Done()
+			<-start
+			_, errs[i] = repo.SetBatchNo(ctx, stored.ID, batchNo, 42)
+		}(i, batchNo)
+	}
+	close(start)
+	wg.Wait()
+
+	successes := 0
+	for _, err := range errs {
+		if err == nil {
+			successes++
+			continue
+		}
+		assertVersionKind(t, err, domain.KindStateConflict, "version_state_conflict")
+	}
+	if successes == 0 || successes > len(batches) {
+		t.Fatalf("successful writes = %d, want 1..%d", successes, len(batches))
+	}
+	got, err := repo.Get(ctx, stored.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.BatchNo != 5 {
+		t.Fatalf("batchNo = %d, want the monotonic maximum 5", got.BatchNo)
+	}
+	if got.Revision != 1+successes {
+		t.Fatalf("revision = %d, want 1+%d", got.Revision, successes)
+	}
+}
+
+// TestVersionRepositoryExecutionStatePauseCompleteRace races a pause against a
+// completion: the guarded completion and the status-guarded pause must not both
+// win, and the stored row must match the winner.
+func TestVersionRepositoryExecutionStatePauseCompleteRace(t *testing.T) {
+	ctx := context.Background()
+	pool := testutil.OpenTestDB(t)
+	repo := postgres.NewVersionRepository(pool)
+
+	stored := insertVersion(t, repo, domain.Version{ID: 6004, Name: "Pause complete race", CreatedBy: 7, UpdatedBy: 7})
+	if _, err := pool.Exec(ctx, `UPDATE version SET status = 'executing' WHERE id = $1`, stored.ID); err != nil {
+		t.Fatalf("set executing: %v", err)
+	}
+
+	var (
+		wg                    sync.WaitGroup
+		pauseErr, completeErr error
+	)
+	start := make(chan struct{})
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		_, pauseErr = repo.SetPaused(ctx, stored.ID, true, domain.PauseModeGraceful, 42)
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		_, completeErr = repo.CompleteExecution(ctx, stored.ID, 43)
+	}()
+	close(start)
+	wg.Wait()
+
+	got, err := repo.Get(ctx, stored.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	switch {
+	case pauseErr == nil && completeErr == nil:
+		t.Fatalf("pause and completion both won: row=%+v", got)
+	case completeErr == nil:
+		assertVersionKind(t, pauseErr, domain.KindStateConflict, "version_state_conflict")
+		if got.Status != domain.VersionCompleted || got.Paused {
+			t.Fatalf("completion won but row = %+v", got)
+		}
+	case pauseErr == nil:
+		assertVersionKind(t, completeErr, domain.KindStateConflict, "version_state_conflict")
+		if got.Status != domain.VersionExecuting || !got.Paused {
+			t.Fatalf("pause won but row = %+v", got)
+		}
+	default:
+		t.Fatalf("neither pause (%v) nor completion (%v) won", pauseErr, completeErr)
+	}
 }
