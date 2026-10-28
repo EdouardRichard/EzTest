@@ -24,3 +24,6 @@ agent_0003_rename_tables.sql
 resource_0004_rename_tables.sql
 version_0003_rename_tables.sql
 codeintel_0003_rename_tables.sql
+resource_0005_app_model_explored_source.sql
+codeintel_0004_case_anchor_subject.sql
+mindmap_0001_cases.sql
