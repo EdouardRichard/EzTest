@@ -975,4 +975,3 @@ type RunScope struct { VersionID, BatchID, SupplementRunID, AnalysisRunID int64 
 ---
 
 *Plan v1.0（2026-10-28）。执行方式：Subagent-Driven Development + 并发波次（用户要求"标记可并发的任务并发执行"）；Lead 统一提交与验收。*
-

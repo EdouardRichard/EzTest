@@ -1653,4 +1653,3 @@ GRANT SELECT ON db_order_fixture TO eztest_p7_ro;
 ---
 
 *本规格 v1.0（2026-10-28）。实现中如需偏离，必须先在主蓝图新增 D# 并更新本 spec，经用户确认后执行；禁止代码先行、文档后补（`Agent.md` §5.3）。*
-
