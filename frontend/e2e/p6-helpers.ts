@@ -449,6 +449,7 @@ export async function seedExecutionVersion(
       data: {
         systemId: base.systemId,
         authType: "password",
+        concurrencyLimit: 1,
         credential: "fixture-pass",
         usernameOverride: "fixture",
         loginUrl,
@@ -738,25 +739,55 @@ export async function getReport(
   return readData<ReportView>(response, 200, "get batch report")
 }
 
+export type ReadVersionEventsOptions = {
+  limit?: number
+  types?: string[]
+  /** Exclusive upper bound of the first page (older history paging). */
+  beforeSeq?: number
+  /**
+   * Pages to read backwards. The P6 run emits well over 100 events (one batch
+   * with 26 steps), so batch/run start events are no longer on the newest page;
+   * callers that need them page backwards instead of assuming one page.
+   */
+  maxPages?: number
+}
+
 /**
- * GET /api/versions/{id}/events — the persisted event snapshot, newest page.
- * The platform caps `limit` at 100, so larger values are narrowed here.
+ * GET /api/versions/{id}/events — the persisted event snapshot, newest page
+ * first and paged backwards through `before_seq`. The platform caps `limit` at
+ * 100, so larger values are narrowed here. Events stay in ascending seq order.
  */
 export async function readVersionEvents(
   request: APIRequestContext,
   token: string,
   versionId: string,
-  options: { limit?: number; types?: string[] } = {},
+  options: ReadVersionEventsOptions = {},
 ): Promise<VersionEvent[]> {
   const limit = Math.min(options.limit ?? 100, 100)
-  const response = await request.get(`${API_URL}/api/versions/${versionId}/events?limit=${limit}`, {
-    headers: authHeaders(token),
-  })
-  expect(response.status(), "read version events").toBe(200)
-  const body = (await response.json()) as { data?: VersionEvent[] }
-  const events = Array.isArray(body.data) ? body.data : []
-  if (options.types === undefined) return events
-  return events.filter((event) => options.types?.includes(event.type) === true)
+  const maxPages = Math.max(1, Math.trunc(options.maxPages ?? 1))
+  const collected: VersionEvent[] = []
+  let beforeSeq = options.beforeSeq
+  for (let pageIndex = 0; pageIndex < maxPages; pageIndex += 1) {
+    const params = new URLSearchParams({ limit: String(limit) })
+    if (beforeSeq !== undefined) params.set("before_seq", String(beforeSeq))
+    const response = await request.get(
+      `${API_URL}/api/versions/${versionId}/events?${params.toString()}`,
+      { headers: authHeaders(token) },
+    )
+    expect(response.status(), "read version events").toBe(200)
+    const body = (await response.json()) as {
+      data?: VersionEvent[]
+      has_more?: boolean
+    }
+    const events = Array.isArray(body.data) ? body.data : []
+    collected.push(...events)
+    const oldest = events[0]?.seq
+    if (body.has_more !== true || oldest === undefined) break
+    if (beforeSeq !== undefined && oldest >= beforeSeq) break
+    beforeSeq = oldest
+  }
+  if (options.types === undefined) return collected
+  return collected.filter((event) => options.types?.includes(event.type) === true)
 }
 
 // --- fake LLM P6 mode ------------------------------------------------------

@@ -160,10 +160,34 @@ async function expectVersionEvent(
 ): Promise<void> {
   await expect
     .poll(
-      async () => (await readVersionEvents(request, token, versionId)).some((e) => e.type === type),
+      async () =>
+        (await readVersionEvents(request, token, versionId, { maxPages: 3 })).some(
+          (e) => e.type === type,
+        ),
       { message: `version ${versionId} must persist a ${type} event`, timeout },
     )
     .toBe(true)
+}
+
+/**
+ * Expands the broadcast history until the row of one persisted event exists.
+ * The tab starts from the newest 50 events (its history cursor), so the
+ * batch/run start rows need two 「加载更早事件」 pages on a 26-step run.
+ */
+async function expectBroadcastRow(page: Page, seq: number): Promise<void> {
+  const row = page.getByTestId(`broadcast-row-${seq}`)
+  const loadOlder = page.getByTestId("broadcast-load-older")
+  const rows = page.locator('[data-testid^="broadcast-row-"]')
+  for (let pageIndex = 0; pageIndex < 6; pageIndex += 1) {
+    if (await row.isVisible()) return
+    if ((await loadOlder.count()) === 0) break
+    const before = await rows.count()
+    await loadOlder.click()
+    await expect
+      .poll(async () => rows.count(), { message: "broadcast history page", timeout: 15_000 })
+      .toBeGreaterThan(before)
+  }
+  await expect(row).toBeVisible({ timeout: 30_000 })
 }
 
 /** Sorted, de-duplicated step sequence list used by the checkpoint assertions. */
@@ -232,24 +256,27 @@ test("P6 执行端到端：seed → 批次 → 暂停/恢复 → 结果/证据 �
       await expectCaseRunStatus(request, token, normalSeed, batchId, caseRunId, "running", 60_000)
 
       // A graceful pause must park the run at a step boundary with the finished
-      // steps preserved. Wait until at least one step is recorded, then switch
-      // the fake to its never-finishing `budget` planner so the run cannot
-      // complete during the UI dialog round-trips.
-      await expect
-        .poll(
-          async () =>
-            (await getCaseRun(request, token, versionId, batchId, caseRunId)).steps.length,
-          { message: "the normal fake run must record a step", timeout: 120_000 },
-        )
-        .toBeGreaterThan(0)
-      await setP6Mode(request, "budget")
-
+      // steps preserved. Open the dialog up front (it only sends the pause on
+      // confirm) so the confirmation is the only action left in the critical
+      // window; the normal fake records its 26 steps in ~150ms, so the step
+      // poll must not use the default 100/250/500/1000ms backoff or it misses
+      // the first step entirely and the run hits max_turns unanswered.
       await page.getByTestId("exec-pause-btn").click()
       await expect(page.getByTestId("exec-pause-dialog")).toBeVisible()
       await expect(page.getByTestId("exec-pause-mode-graceful")).toHaveAttribute(
         "aria-pressed",
         "true",
       )
+      await expect
+        .poll(
+          async () =>
+            (await getCaseRun(request, token, versionId, batchId, caseRunId)).steps.length,
+          { message: "the normal fake run must record a step", timeout: 120_000, intervals: [25] },
+        )
+        .toBeGreaterThan(0)
+      // Switch to the slow `budget` planner only after the first step exists:
+      // its 8s navigations would otherwise pre-empt the normal step recording.
+      await setP6Mode(request, "budget")
       await page.getByTestId("exec-pause-confirm").click()
 
       const banner = page.getByTestId("paused-banner")
@@ -316,14 +343,14 @@ test("P6 执行端到端：seed → 批次 → 暂停/恢复 → 结果/证据 �
         timeout: 30_000,
       })
 
-      const events = await readVersionEvents(request, token, versionId)
+      // The run emits more than one 100-event page, so read the history back to
+      // the batch start instead of assuming it is still on the newest page.
+      const events = await readVersionEvents(request, token, versionId, { maxPages: 3 })
       for (const type of ["batch.started", "run.started", "step.finished"]) {
         const persisted = events.find((event) => event.type === type)
         expect(persisted, `the version stream must persist a ${type} event`).toBeTruthy()
         if (persisted === undefined) throw new Error(`missing ${type} event`)
-        await expect(page.getByTestId(`broadcast-row-${persisted.seq}`)).toBeVisible({
-          timeout: 30_000,
-        })
+        await expectBroadcastRow(page, persisted.seq)
       }
       await expectNoPasswordLeak(page, "实时播报")
 
@@ -496,11 +523,14 @@ test("P6 执行端到端：seed → 批次 → 暂停/恢复 → 结果/证据 �
     await expectNoPasswordLeak(page, "立即暂停")
 
     // Resume with the normal planner: the same attempt must run cleanup, record
-    // the two remaining steps once and finish passed.
+    // the two remaining steps once and finish passed. The resume is dispatched
+    // asynchronously, so the run stays `interrupted` until the scheduler picks
+    // it up again: `interrupted` must not end this wait as a terminal status.
     await setP6Mode(request, "normal")
     await page.getByTestId("exec-resume-btn").click()
     await expect(banner).toBeHidden({ timeout: 30_000 })
     const finished = await waitCaseRun(request, token, versionId, batchId, caseRunId, {
+      until: ["passed", "failed", "blocked", "inconclusive", "skipped"],
       timeoutMs: 240_000,
     })
     expect(finished.status).toBe("passed")

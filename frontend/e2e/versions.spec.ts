@@ -267,11 +267,16 @@ test("creates a bound version, relations, confirmation, design entry, reload and
 
   await page.getByRole("tab", { name: "执行会话" }).click()
   await expect(page).toHaveURL(/[?&]tab=sessions/)
-  await expect(page.getByRole("heading", { name: "执行会话", level: 2 })).toBeVisible()
-  await expect(page.getByText("阶段 P6", { exact: true })).toBeVisible()
-  await expect(page.getByText("占位 Tab", { exact: true })).toBeVisible()
-  await expect(page.getByText("该 Tab 尚未接入数据，不展示占位假数据。")).toBeVisible()
-  await page.getByRole("button", { name: "返回需求与澄清工作台" }).click()
+  // T20 wired the real sessions tab: this throwaway version has no batch, so
+  // the documented empty state shows instead of the old P6 placeholder.
+  const sessionsTab = page.getByTestId("sessions-tab")
+  await expect(sessionsTab).toBeVisible()
+  await expect(sessionsTab.getByRole("heading", { name: "暂无执行会话" })).toBeVisible({
+    timeout: 30_000,
+  })
+  await expect(sessionsTab).toContainText("批次开始后，执行 Agent 的会话会出现在这里。")
+  // The real tab has no placeholder back button: navigate through the tablist.
+  await page.getByRole("tab", { name: "需求与澄清" }).click()
   await expect(page).toHaveURL(/[?&]tab=requirements/)
   await expect(page.getByRole("region", { name: "需求与澄清工作台" })).toBeVisible()
 
@@ -283,11 +288,15 @@ test("creates a bound version, relations, confirmation, design entry, reload and
 
   await page.goto(`/versions/${versionId}?tab=report`)
   await expect(page.getByRole("heading", { name: "报告", level: 2 })).toBeVisible()
-  await expect(page.getByText("阶段 P6", { exact: true })).toBeVisible()
+  // The real report tab renders its no-batch empty state for this version.
+  await expect(page.getByTestId("report-tab")).toBeVisible()
+  await expect(page.getByTestId("report-empty")).toBeVisible({ timeout: 30_000 })
+  await expect(page.getByRole("heading", { name: "还没有执行批次" })).toBeVisible()
   await expect(page.getByRole("tab", { name: "报告" })).toHaveAttribute("aria-selected", "true")
 
   // 9. The attachment file is really gone after a UI delete (API 404).
-  await page.getByRole("button", { name: "返回需求与澄清工作台" }).click()
+  await page.getByRole("tab", { name: "需求与澄清" }).click()
+  await expect(page).toHaveURL(/[?&]tab=requirements/)
   await requirementButton(page, REQ_A).click()
   await expect(attachmentSection.getByText(ATTACHMENT_FILE)).toBeVisible()
   await page.getByRole("button", { name: `删除附件 ${ATTACHMENT_FILE}` }).click()
