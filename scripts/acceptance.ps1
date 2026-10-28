@@ -3187,10 +3187,19 @@ writeFileSync(process.argv[3], JSON.stringify({
                 $migrationPath = Join-Path $backendDir ("internal\db\migrations\" + $migrationName)
                 if (-not (Test-Path -LiteralPath $migrationPath)) { throw "P6 migration is missing: $migrationName" }
             }
-            if ($migrationOrder.Count -lt $p6MigrationNames.Count) { throw "order.txt is shorter than the 3 P6 migrations" }
-            $p6Tail = @($migrationOrder[($migrationOrder.Count - $p6MigrationNames.Count)..($migrationOrder.Count - 1)])
-            if (($p6Tail -join "|") -ne ($p6MigrationNames -join "|")) {
-                throw "order.txt must append exactly the 3 P6 migrations at its tail (found: $($p6Tail -join ', '))"
+            # Later phases (P7+) append their own migrations after the P6 block,
+            # so the 3 P6 migrations must be present and in relative order
+            # instead of being the tail of the whole file.
+            $p6Indexes = @()
+            foreach ($migrationName in $p6MigrationNames) {
+                $migrationIndex = [Array]::IndexOf([object[]]$migrationOrder, $migrationName)
+                if ($migrationIndex -lt 0) { throw "order.txt is missing the P6 migration: $migrationName" }
+                $p6Indexes += $migrationIndex
+            }
+            for ($i = 1; $i -lt $p6Indexes.Count; $i++) {
+                if ($p6Indexes[$i] -le $p6Indexes[$i - 1]) {
+                    throw "order.txt must list the 3 P6 migrations in order (found indexes: $($p6Indexes -join ', '))"
+                }
             }
             foreach ($relative in @(
                     "backend\internal\execution\domain",
