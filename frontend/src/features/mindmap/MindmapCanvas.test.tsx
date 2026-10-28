@@ -98,13 +98,15 @@ function fixtureGraph(nodes: CaseNodeView[] = fixtureNodes()): MindmapGraph {
   }
 }
 
-function renderCanvas(overrides: {
-  graph?: MindmapGraph
-  selectedId?: string | null
-  collapsed?: Set<string>
-  onSelect?: (id: string) => void
-  onToggle?: (id: string) => void
-} = {}) {
+function renderCanvas(
+  overrides: {
+    graph?: MindmapGraph
+    selectedId?: string | null
+    collapsed?: Set<string>
+    onSelect?: (id: string) => void
+    onToggle?: (id: string) => void
+  } = {},
+) {
   const onSelect = overrides.onSelect ?? vi.fn()
   const onToggle = overrides.onToggle ?? vi.fn()
   const result = render(
