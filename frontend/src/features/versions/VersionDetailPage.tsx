@@ -4,6 +4,7 @@ import { Loader2 } from "lucide-react"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
 import { CodeChangesTab } from "@/features/code-intel/CodeChangesTab"
+import { useReport } from "@/features/delivery/hooks/useReports"
 import { BroadcastTab } from "@/features/execution/components/BroadcastTab"
 import { EvidenceViewer } from "@/features/execution/components/EvidenceViewer"
 import {
@@ -134,6 +135,9 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
   const stream = useVersionStream(versionId)
   const batchPage = useBatches(versionId, {}, stream)
   const actions = useExecutionActions(versionId, { onChanged: batchPage.refresh })
+  // Resolve a `?report=` deep link so the shared batch selection can follow the
+  // report's own batch even when the newest batch is a different one.
+  const deepLinkedReport = useReport(versionId, reportId, stream)
 
   const activeBatch = useMemo(
     () => batchPage.batches.find((batch) => ACTIVE_BATCH_STATUSES.has(batch.status)) ?? null,
@@ -168,6 +172,18 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
     setReportId(readDeepLinkParam("report"))
     setRole(getStoredUser()?.role)
   }, [])
+
+  // The report detail carries its batch id. Once it matches the selected deep
+  // link, adopt that batch so the header selector, the execution tabs and the
+  // report tab agree on the report's batch instead of the newest one.
+  const deepLinkedReportBatchId =
+    reportId !== "" && deepLinkedReport.report?.id === reportId
+      ? deepLinkedReport.report.batchId
+      : ""
+
+  useEffect(() => {
+    if (deepLinkedReportBatchId !== "") setSelectedBatchId(deepLinkedReportBatchId)
+  }, [deepLinkedReportBatchId])
 
   useEffect(() => {
     void load()
@@ -343,7 +359,9 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
             onOpenIssues={() => handleTabChange("issues")}
             onOpenCode={() => handleTabChange("code")}
             onOpenReports={(batchIdValue) => {
-              setSelectedBatchId(batchIdValue)
+              // A batch entry supersedes any deep-linked report revision;
+              // handleBatchChange also clears the stale `?report=`.
+              handleBatchChange(batchIdValue)
               handleTabChange("report")
             }}
           />

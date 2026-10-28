@@ -346,6 +346,18 @@ function deliveryPage<T>(items: T[] = []) {
   }
 }
 
+/** A resolved (or empty) report resource for the page-level `?report=` sync. */
+function reportResult(report: object | null) {
+  return {
+    data: report,
+    report,
+    loading: false,
+    error: "",
+    streamStatus: "live" as const,
+    refresh: vi.fn(),
+  }
+}
+
 function actionsResult() {
   return {
     createBatch: mocks.createBatch,
@@ -913,6 +925,91 @@ describe("VersionDetailPage", () => {
     })
     await waitFor(() => expect(window.location.search).toContain(`report=${SECOND_REPORT_ID}`))
     expect(window.location.search).toContain("tab=report")
+
+    act(() => {
+      mocks.reportsProps.mock.calls.at(-1)?.[0].onReportChange?.("")
+    })
+    await waitFor(() => expect(window.location.search).not.toContain("report="))
+    expect(window.location.search).toContain("tab=report")
+    await waitFor(() =>
+      expect(mocks.reportsProps).toHaveBeenLastCalledWith(
+        expect.objectContaining({ reportId: "" }),
+      ),
+    )
+  })
+
+  it("adopts the deep-linked report's batch for the header selector", async () => {
+    mocks.getVersion.mockResolvedValue({ ...VERSION, status: "completed" })
+    const earlier = batchFixture({
+      id: HEADER_BATCH_1,
+      batch_no: 1,
+      status: "done",
+      finished_at: "2026-10-28T01:00:00Z",
+    })
+    const later = batchFixture({
+      id: HEADER_BATCH_2,
+      batch_no: 2,
+      status: "done",
+      finished_at: "2026-10-28T02:00:00Z",
+    })
+    mocks.useBatches.mockReturnValue(batchesResult([later, earlier]))
+    // The deep-linked report belongs to the older batch; the newest batch is
+    // what the container would otherwise select.
+    const deepLinkedReport = { ...REPORT_SUMMARY, batchId: HEADER_BATCH_1 }
+    mocks.useReport.mockImplementation((_versionId: string, nextReportId: string) =>
+      reportResult(nextReportId === REPORT_ID ? deepLinkedReport : null),
+    )
+    window.history.replaceState(null, "", `/versions/${VERSION_ID}?tab=report&report=${REPORT_ID}`)
+
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+
+    await waitFor(() =>
+      expect(mocks.reportsProps).toHaveBeenLastCalledWith(
+        expect.objectContaining({ reportId: REPORT_ID, batchId: HEADER_BATCH_1 }),
+      ),
+    )
+    expect((screen.getByTestId("exec-batch-selector") as HTMLSelectElement).value).toBe(
+      HEADER_BATCH_1,
+    )
+  })
+
+  it("removes the ?report= deep link when the header batch changes", async () => {
+    mocks.getVersion.mockResolvedValue({ ...VERSION, status: "completed" })
+    const earlier = batchFixture({
+      id: HEADER_BATCH_1,
+      batch_no: 1,
+      status: "done",
+      finished_at: "2026-10-28T01:00:00Z",
+    })
+    const later = batchFixture({
+      id: HEADER_BATCH_2,
+      batch_no: 2,
+      status: "done",
+      finished_at: "2026-10-28T02:00:00Z",
+    })
+    mocks.useBatches.mockReturnValue(batchesResult([later, earlier]))
+    window.history.replaceState(null, "", `/versions/${VERSION_ID}?tab=report&report=${REPORT_ID}`)
+
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+    await waitFor(() =>
+      expect(mocks.reportsProps).toHaveBeenLastCalledWith(
+        expect.objectContaining({ reportId: REPORT_ID }),
+      ),
+    )
+
+    fireEvent.change(screen.getByTestId("exec-batch-selector"), {
+      target: { value: HEADER_BATCH_1 },
+    })
+
+    await waitFor(() => expect(window.location.search).not.toContain("report="))
+    await waitFor(() =>
+      expect(mocks.reportsProps).toHaveBeenLastCalledWith(
+        expect.objectContaining({ reportId: "" }),
+      ),
+    )
+    expect(window.location.search).toContain("tab=report")
   })
 
   it("selects the overview report batch and the header batch selector for the report tab", async () => {
@@ -956,6 +1053,50 @@ describe("VersionDetailPage", () => {
       ),
     )
     expect(window.location.search).toContain("tab=report")
+  })
+
+  it("replaces a stale ?report= deep link when opening a batch report from the overview", async () => {
+    mocks.getVersion.mockResolvedValue({ ...VERSION, status: "completed" })
+    const earlier = batchFixture({
+      id: HEADER_BATCH_1,
+      batch_no: 1,
+      status: "done",
+      finished_at: "2026-10-28T01:00:00Z",
+    })
+    const later = batchFixture({
+      id: HEADER_BATCH_2,
+      batch_no: 2,
+      status: "done",
+      finished_at: "2026-10-28T02:00:00Z",
+    })
+    mocks.useBatches.mockReturnValue(batchesResult([later, earlier]))
+    // The old deep link points at the newest batch, so only the overview entry
+    // can move the shared selection to the clicked (older) batch.
+    const deepLinkedReport = { ...REPORT_SUMMARY, batchId: HEADER_BATCH_2 }
+    mocks.useReport.mockImplementation((_versionId: string, nextReportId: string) =>
+      reportResult(nextReportId === REPORT_ID ? deepLinkedReport : null),
+    )
+    window.history.replaceState(
+      null,
+      "",
+      `/versions/${VERSION_ID}?tab=overview&report=${REPORT_ID}`,
+    )
+
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+    await waitFor(() =>
+      expect(screen.getByRole("tab", { name: "总览" }).getAttribute("aria-selected")).toBe("true"),
+    )
+
+    fireEvent.click(await screen.findByRole("button", { name: "查看 Batch 1 报告" }))
+
+    await waitFor(() => expect(window.location.search).toContain("tab=report"))
+    await waitFor(() =>
+      expect(mocks.reportsProps).toHaveBeenLastCalledWith(
+        expect.objectContaining({ batchId: HEADER_BATCH_1, reportId: "" }),
+      ),
+    )
+    expect(window.location.search).not.toContain(`report=${REPORT_ID}`)
   })
 
   it("opens the requirement create editor from 新增需求 with a non-empty requirement list", async () => {
