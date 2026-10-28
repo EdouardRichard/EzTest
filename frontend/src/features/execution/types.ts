@@ -9,6 +9,12 @@
 /** Run batch statuses (spec §5.1, DDL `run_batch.status`). */
 export type BatchStatus = "planned" | "running" | "done" | "failed" | "cancelled"
 
+/**
+ * Batch provenance (spec §5.3/§7.7). A P6 historical batch without a stored
+ * kind reads as `baseline` (the backend applies the same default).
+ */
+export type BatchKind = "baseline" | "incremental" | "supplement"
+
 /** Pause modes accepted by `POST .../pause` (spec §5.4). */
 export type PauseMode = "graceful" | "immediate"
 
@@ -68,12 +74,16 @@ export type BatchCounts = {
   interrupted: number
 }
 
-/** `BatchDTO` of spec §6.3. */
+/** `BatchDTO` of spec §6.3 plus the P7 chain fields of spec §7.7. */
 export type Batch = {
   id: string
   version_id: string
   batch_no: number
   status: BatchStatus
+  /** P7 provenance; absent on a P6 historical row (reads as `baseline`). */
+  kind?: BatchKind
+  /** Parent batch of a supplement/incremental batch, as a decimal string. */
+  parentBatchId?: string | null
   paused: boolean
   pause_mode: PauseMode | ""
   pause_reason: string
@@ -285,3 +295,22 @@ export type ExecutionSessionQuery = {
   limit?: number
   cursor?: string
 }
+
+/**
+ * The eight P7 event types of spec §8.1 that can change the execution
+ * projection. The backend serializes every ID in their refs/detail as a
+ * decimal string (D29); the UI only uses them as refetch triggers.
+ */
+export const P7_EVENT_TYPES = [
+  "case.supplemented",
+  "case.revalidation_marked",
+  "issue.created",
+  "issue.updated",
+  "report.published",
+  "report.stale",
+  "analysis.started",
+  "analysis.finished",
+] as const
+
+/** Union of the P7 event type strings (spec §8.1/§8.3). */
+export type P7EventType = (typeof P7_EVENT_TYPES)[number]

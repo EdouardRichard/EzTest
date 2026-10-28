@@ -247,6 +247,22 @@ describe("ReportTab", () => {
     expect(failedRow.textContent).toContain("4.6s")
   })
 
+  it("shows the kind of the selected batch", () => {
+    mocks.useBatches.mockReturnValue(
+      batchesResult([
+        batch({ kind: "incremental", parentBatchId: BATCH_1 }),
+        batch({ id: BATCH_1, batch_no: 1 }),
+      ]),
+    )
+
+    render(<ReportTab versionId={VERSION_ID} />)
+
+    const kind = screen.getByTestId("report-batch-kind")
+    expect(kind.getAttribute("data-kind")).toBe("incremental")
+    expect(kind.textContent).toContain("增量")
+    expect(screen.getByTestId("report-summary-case-count")).toBeTruthy()
+  })
+
   it("switches the report when another batch is selected", () => {
     render(<ReportTab versionId={VERSION_ID} />)
 

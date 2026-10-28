@@ -1,16 +1,19 @@
 /**
- * Deterministic three-layer layout for the P6 execution chain graph (spec §9.3).
+ * Deterministic four-layer layout for the execution chain graph (spec §9.3,
+ * P7 §10.5).
  *
  * The chain is a layered graph: requirements (layer 0) → cases (layer 1) →
- * execution results (layer 2). Layout is a pure function of the inputs plus the
- * collapsed requirement set: requirement groups follow `sortOrder`, cases of one
- * requirement follow their own `sortOrder`, and every sibling tie is broken by
- * the decimal id. The same input therefore always produces the same coordinates
- * regardless of array order, which the canvas relies on to keep nodes stable
- * while SSE events refresh the data.
+ * execution results (layer 2) → issues (layer 3). Layout is a pure function of
+ * the inputs plus the collapsed requirement set: requirement groups follow
+ * `sortOrder`, cases of one requirement follow their own `sortOrder`, and every
+ * sibling tie is broken by the decimal id. The same input therefore always
+ * produces the same coordinates regardless of array order, which the canvas
+ * relies on to keep nodes stable while SSE events refresh the data.
  *
- * P6 does not fetch issue data (P7 owns issues); the issue layer is represented
- * by the tab's placeholder, not by this module.
+ * An issue attaches to its `caseNodeId`, or to the case of its `caseRunId` when
+ * the run is present. Issues that cannot be attached (for example
+ * requirement-gap issues without a case) are returned in `unlinkedIssues`
+ * instead of being silently dropped; the tab renders them in a side list.
  */
 
 import type { CaseRunStatus, FailureClass } from "./types"
@@ -24,6 +27,9 @@ export const CHAIN_CASE_HEIGHT = 72
 /** Result card size. */
 export const CHAIN_RESULT_WIDTH = 184
 export const CHAIN_RESULT_HEIGHT = 56
+/** Issue card size (red diamond plus severity/status text). */
+export const CHAIN_ISSUE_WIDTH = 136
+export const CHAIN_ISSUE_HEIGHT = 52
 /** Horizontal gap between two layers. */
 export const CHAIN_LAYER_GAP = 80
 /** Vertical gap between stacked results of the same case. */
@@ -69,10 +75,28 @@ export type ChainResultInput = {
   sortOrder?: number
 }
 
+/** One delivery issue rendered in layer 3 (spec §10.5). */
+export type ChainIssueInput = {
+  id: string
+  title: string
+  status?: string
+  severity?: string
+  confidence?: string
+  category?: string
+  /** Case node the issue belongs to; null for a requirement-gap/human issue. */
+  caseNodeId?: string | null
+  /** Case run the issue belongs to; used to resolve the case when it is null. */
+  caseRunId?: string | null
+  /** Evidence refs of the issue, opened in the results tab's viewer. */
+  evidenceIds?: readonly string[]
+  sortOrder?: number
+}
+
 export type ChainLayoutInput = {
   requirements: readonly ChainRequirementInput[]
   cases: readonly ChainCaseInput[]
   results?: readonly ChainResultInput[]
+  issues?: readonly ChainIssueInput[]
 }
 
 export type ChainLayoutOptions = {
@@ -80,12 +104,12 @@ export type ChainLayoutOptions = {
   collapsed?: readonly string[] | ReadonlySet<string>
 }
 
-export type ChainNodeKind = "requirement" | "case" | "result"
-export type ChainLayer = 0 | 1 | 2
+export type ChainNodeKind = "requirement" | "case" | "result" | "issue"
+export type ChainLayer = 0 | 1 | 2 | 3
 
 /** One visible node with top-left coordinates in layout units. */
 export type ChainNode = {
-  /** Domain id: requirement id, case node id or case-run id. */
+  /** Domain id: requirement id, case node id, case-run id or issue id. */
   id: string
   kind: ChainNodeKind
   layer: ChainLayer
@@ -98,12 +122,13 @@ export type ChainNode = {
   h: number
   /** Requirement ids linked to this node (empty for a requirement node). */
   requirementIds: string[]
-  /** Case node id of a case/result node; null for a requirement node. */
+  /** Case node id of a case/result/issue node; null for a requirement node. */
   caseNodeId: string | null
   /** The input row this node renders; never mutated by the layout. */
   requirement?: ChainRequirementInput
   case?: ChainCaseInput
   result?: ChainResultInput
+  issue?: ChainIssueInput
   /** True when the underlying data has children, collapsed or not. */
   hasChildren: boolean
   /** Descendants in the full input; used by the collapsed-count badge. */
@@ -112,7 +137,7 @@ export type ChainNode = {
   collapsed: boolean
 }
 
-export type ChainEdgeKind = "requirement-case" | "case-result"
+export type ChainEdgeKind = "requirement-case" | "case-result" | "issue-link"
 
 /** One visible parent → child link. */
 export type ChainEdge = {
@@ -130,7 +155,7 @@ export type ChainBounds = {
 }
 
 export type ChainLayoutResult = {
-  /** Visible nodes in pre-order (requirement group, case, results). */
+  /** Visible nodes in pre-order (requirement group, case, results, issues). */
   nodes: ChainNode[]
   /** Links between visible nodes only. */
   edges: ChainEdge[]
@@ -139,6 +164,8 @@ export type ChainLayoutResult = {
   visibleIds: string[]
   /** Nodes hidden by a collapsed requirement, sorted by id. */
   hiddenIds: string[]
+  /** Issues that cannot be attached to a case of this graph, sorted. */
+  unlinkedIssues: ChainIssueInput[]
   /** Total unique node count before collapsing (auto-collapse input). */
   totalCount: number
 }
@@ -204,13 +231,19 @@ function uniqueById<T extends { id: string }>(rows: readonly T[]): T[] {
   return unique
 }
 
-/** Number of unique requirements, cases and results in one chain input. */
+/** Number of unique requirements, cases, results and issues in one input. */
 function countInputNodes(input: ChainLayoutInput): number {
   const requirementIds = new Set(input.requirements.map((row) => row.id))
   const caseIds = new Set(input.cases.map((row) => row.id))
   const resultIds = new Set((input.results ?? []).map((row) => row.id))
+  const issueIds = new Set((input.issues ?? []).map((row) => row.id))
   for (const result of input.results ?? []) caseIds.add(result.caseNodeId)
-  return requirementIds.size + caseIds.size + resultIds.size
+  for (const issue of input.issues ?? []) {
+    if (issue.caseNodeId !== null && issue.caseNodeId !== undefined) {
+      caseIds.add(issue.caseNodeId)
+    }
+  }
+  return requirementIds.size + caseIds.size + resultIds.size + issueIds.size
 }
 
 /**
@@ -242,6 +275,7 @@ export function layoutChain(
   const requirements = uniqueById([...input.requirements].sort(compareOrder))
   const results = uniqueById([...(input.results ?? [])].sort(compareOrder))
   const cases = uniqueById([...input.cases].sort(compareOrder))
+  const issues = uniqueById([...(input.issues ?? [])].sort(compareOrder))
 
   const caseById = new Map<string, ChainCaseInput>()
   for (const row of cases) caseById.set(row.id, row)
@@ -250,6 +284,36 @@ export function layoutChain(
     caseById.set(result.caseNodeId, {
       id: result.caseNodeId,
       title: result.title === undefined || result.title === "" ? "未知用例" : result.title,
+      requirementIds: [],
+      sortOrder: Number.MAX_SAFE_INTEGER,
+    })
+  }
+
+  const resultCaseById = new Map<string, string>()
+  for (const result of results) resultCaseById.set(result.id, result.caseNodeId)
+
+  /** Case an issue hangs off, resolved through its case run when necessary. */
+  const issueCaseId = (issue: ChainIssueInput): string | null => {
+    const explicit = issue.caseNodeId ?? ""
+    if (explicit !== "") return explicit
+    const caseRunId = issue.caseRunId ?? ""
+    if (caseRunId === "") return null
+    return resultCaseById.get(caseRunId) ?? null
+  }
+
+  const linkedIssues: ChainIssueInput[] = []
+  const unlinkedIssues: ChainIssueInput[] = []
+  for (const issue of issues) {
+    const caseId = issueCaseId(issue)
+    if (caseId === null) {
+      unlinkedIssues.push(issue)
+      continue
+    }
+    linkedIssues.push(issue)
+    if (caseById.has(caseId)) continue
+    caseById.set(caseId, {
+      id: caseId,
+      title: "未知用例",
       requirementIds: [],
       sortOrder: Number.MAX_SAFE_INTEGER,
     })
@@ -277,6 +341,16 @@ export function layoutChain(
   }
   for (const siblings of resultsByCase.values()) siblings.sort(compareOrder)
 
+  const issuesByCase = new Map<string, ChainIssueInput[]>()
+  for (const issue of linkedIssues) {
+    const caseId = issueCaseId(issue)
+    if (caseId === null) continue
+    const siblings = issuesByCase.get(caseId)
+    if (siblings === undefined) issuesByCase.set(caseId, [issue])
+    else siblings.push(issue)
+  }
+  for (const siblings of issuesByCase.values()) siblings.sort(compareOrder)
+
   /** The earliest linked requirement decides which group a case sits in. */
   const primaryRequirement = (row: ChainCaseInput): string | null => {
     const ids = linkedRequirementIds(row)
@@ -303,6 +377,7 @@ export function layoutChain(
 
   const caseX = CHAIN_REQUIREMENT_WIDTH + CHAIN_LAYER_GAP
   const resultX = caseX + CHAIN_CASE_WIDTH + CHAIN_LAYER_GAP
+  const issueX = resultX + CHAIN_RESULT_WIDTH + CHAIN_LAYER_GAP
 
   function addEdge(kind: ChainEdgeKind, sourceId: string, targetId: string): void {
     const id = `${sourceId}->${targetId}`
@@ -313,6 +388,9 @@ export function layoutChain(
 
   function pushCase(row: ChainCaseInput, y: number): number {
     const requirementIds = linkedRequirementIds(row)
+    const siblings = resultsByCase.get(row.id) ?? []
+    const issueSiblings = issuesByCase.get(row.id) ?? []
+    const childCount = siblings.length + issueSiblings.length
     nodes.push({
       id: row.id,
       kind: "case",
@@ -326,13 +404,13 @@ export function layoutChain(
       requirementIds,
       caseNodeId: row.id,
       case: row,
-      hasChildren: (resultsByCase.get(row.id)?.length ?? 0) > 0,
-      descendantCount: resultsByCase.get(row.id)?.length ?? 0,
+      hasChildren: childCount > 0,
+      descendantCount: childCount,
       collapsed: false,
     })
     visibleIds.add(row.id)
 
-    const siblings = resultsByCase.get(row.id) ?? []
+    const resultIdsOfCase = new Set(siblings.map((result) => result.id))
     let cursor = y
     for (const result of siblings) {
       nodes.push({
@@ -356,6 +434,32 @@ export function layoutChain(
       cursor += CHAIN_RESULT_HEIGHT + CHAIN_ROW_GAP
     }
 
+    let issueCursor = y
+    for (const issue of issueSiblings) {
+      nodes.push({
+        id: issue.id,
+        kind: "issue",
+        layer: 3,
+        title: issue.title,
+        status: issue.status ?? "",
+        x: issueX,
+        y: issueCursor,
+        w: CHAIN_ISSUE_WIDTH,
+        h: CHAIN_ISSUE_HEIGHT,
+        requirementIds,
+        caseNodeId: row.id,
+        issue,
+        hasChildren: false,
+        descendantCount: 0,
+        collapsed: false,
+      })
+      visibleIds.add(issue.id)
+      const caseRunId = issue.caseRunId ?? ""
+      const sourceId = caseRunId !== "" && resultIdsOfCase.has(caseRunId) ? caseRunId : row.id
+      addEdge("issue-link", sourceId, issue.id)
+      issueCursor += CHAIN_ISSUE_HEIGHT + CHAIN_ROW_GAP
+    }
+
     for (const requirementId of requirementIds) addEdge("requirement-case", requirementId, row.id)
     for (const result of siblings) addEdge("case-result", row.id, result.id)
 
@@ -363,15 +467,25 @@ export function layoutChain(
       siblings.length === 0
         ? 0
         : siblings.length * CHAIN_RESULT_HEIGHT + (siblings.length - 1) * CHAIN_ROW_GAP
-    return Math.max(CHAIN_CASE_HEIGHT, resultsHeight)
+    const issuesHeight =
+      issueSiblings.length === 0
+        ? 0
+        : issueSiblings.length * CHAIN_ISSUE_HEIGHT + (issueSiblings.length - 1) * CHAIN_ROW_GAP
+    return Math.max(CHAIN_CASE_HEIGHT, resultsHeight, issuesHeight)
   }
 
   let cursorY = 0
   for (const requirement of requirements) {
     const group = casesByRequirement.get(requirement.id) ?? []
     const isCollapsed = collapsed.has(requirement.id)
-    const descendantCount =
-      group.length + group.reduce((sum, row) => sum + (resultsByCase.get(row.id)?.length ?? 0), 0)
+    const descendantCount = group.reduce(
+      (sum, row) =>
+        sum +
+        1 +
+        (resultsByCase.get(row.id)?.length ?? 0) +
+        (issuesByCase.get(row.id)?.length ?? 0),
+      0,
+    )
 
     nodes.push({
       id: requirement.id,
@@ -396,6 +510,7 @@ export function layoutChain(
       for (const row of group) {
         hidden.add(row.id)
         for (const result of resultsByCase.get(row.id) ?? []) hidden.add(result.id)
+        for (const issue of issuesByCase.get(row.id) ?? []) hidden.add(issue.id)
       }
       cursorY += CHAIN_REQUIREMENT_HEIGHT + CHAIN_GROUP_GAP
       continue
@@ -423,7 +538,6 @@ export function layoutChain(
   for (const id of caseById.keys()) {
     if (!visibleIds.has(id)) hidden.add(id)
   }
-
   // Edges are collected while laying out groups (a shared case can be linked
   // from a requirement that is not visible yet); keep only fully visible links.
   const visibleEdges = edges.filter(
@@ -451,6 +565,7 @@ export function layoutChain(
     bounds,
     visibleIds: nodes.map((node) => node.id),
     hiddenIds: [...hidden].sort(),
-    totalCount: requirements.length + allCases.length + results.length,
+    unlinkedIssues,
+    totalCount: requirements.length + allCases.length + results.length + issues.length,
   }
 }

@@ -259,4 +259,66 @@ describe("EvidenceViewer", () => {
     fireEvent.click(screen.getByRole("button", { name: "关闭证据查看器" }))
     expect(onClose).toHaveBeenCalledTimes(2)
   })
+
+  it("renders db_result evidence as a JSON table preview with a download", async () => {
+    mocks.getEvidenceMeta.mockResolvedValue(
+      evidenceMeta({ kind: "db_result", mime: "application/json" }),
+    )
+    mocks.apiStreamFetch.mockResolvedValue(
+      jsonResponse({
+        assertion_id: EVIDENCE_ID,
+        sql: "SELECT id, name FROM orders ORDER BY id",
+        columns: ["id", "name"],
+        rows: [
+          ["1", "张三"],
+          ["2", "李四"],
+        ],
+        row_count: 5,
+        truncated: true,
+        elapsed_ms: 12,
+      }),
+    )
+
+    renderViewer(vi.fn(), evidence({ kind: "db_result", mime: "application/json" }))
+
+    const dialog = screen.getByTestId("evidence-viewer")
+    expect(dialog.getAttribute("data-evidence-kind")).toBe("db_result")
+    expect(dialog.textContent).toContain("数据库结果")
+
+    const table = await screen.findByTestId("evidence-db-table")
+    expect(table.textContent).toContain("id")
+    expect(table.textContent).toContain("name")
+    expect(table.textContent).toContain("张三")
+    expect(table.textContent).toContain("李四")
+    expect(table.textContent).toContain("1")
+
+    const meta = screen.getByTestId("evidence-db-meta")
+    expect(meta.textContent).toContain("5 行")
+    expect(meta.textContent).toContain("12 ms")
+    expect(screen.getByTestId("evidence-db-truncated").textContent).toContain("结果已截断")
+    expect(screen.getByTestId("evidence-db-sql").textContent).toContain(
+      "SELECT id, name FROM orders",
+    )
+
+    const link = screen.getByTestId("evidence-db-download")
+    expect(link.getAttribute("href")).toBe("blob:evidence")
+    expect(link.getAttribute("download")).toBe(`evidence-${EVIDENCE_ID}.json`)
+    expect(createObjectURL).toHaveBeenCalledTimes(1)
+    const captured = createObjectURL.mock.calls[0]?.[0] as Blob | undefined
+    expect(await captured?.text()).toContain("SELECT id, name FROM orders")
+  })
+
+  it("reports an unreadable db_result artifact instead of rendering a broken table", async () => {
+    mocks.getEvidenceMeta.mockResolvedValue(
+      evidenceMeta({ kind: "db_result", mime: "application/json" }),
+    )
+    mocks.apiStreamFetch.mockResolvedValue(binaryResponse("not-json", "application/json"))
+
+    renderViewer(vi.fn(), evidence({ kind: "db_result", mime: "application/json" }))
+
+    const invalid = await screen.findByTestId("evidence-db-invalid")
+    expect(invalid.textContent).toContain("数据库结果")
+    expect(invalid.textContent).toContain("无法解析")
+    expect(screen.queryByTestId("evidence-db-table")).toBeNull()
+  })
 })

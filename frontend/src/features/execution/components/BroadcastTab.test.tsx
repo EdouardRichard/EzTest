@@ -135,6 +135,26 @@ describe("BroadcastTab", () => {
     expect(rowSeqs()).toEqual(["2"])
   })
 
+  it("labels and filters the P7 autonomy events", async () => {
+    mocks.fetchVersionEvents.mockResolvedValue(
+      page([
+        makeEvent(1, { type: "issue.created", summary: "新问题已落库" }),
+        makeEvent(2, { type: "analysis.finished", summary: "失败分析完成" }),
+        makeEvent(3, { type: "step.finished", summary: "步骤完成" }),
+      ]),
+    )
+
+    renderTab()
+    await screen.findByTestId("broadcast-row-3")
+
+    expect(screen.getByTestId("broadcast-row-1").textContent).toContain("问题创建")
+    expect(screen.getByTestId("broadcast-row-2").textContent).toContain("AI 分析完成")
+    expect(screen.getByRole("option", { name: "问题创建" })).toBeTruthy()
+
+    setFilter("类型", "issue.created")
+    expect(rowSeqs()).toEqual(["1"])
+  })
+
   it("filters by agent role", async () => {
     mocks.fetchVersionEvents.mockResolvedValue(
       page([

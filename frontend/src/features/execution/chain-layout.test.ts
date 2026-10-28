@@ -4,12 +4,16 @@ import {
   autoCollapsedRequirements,
   CHAIN_AUTO_COLLAPSE_THRESHOLD,
   CHAIN_CASE_WIDTH,
+  CHAIN_ISSUE_HEIGHT,
+  CHAIN_ISSUE_WIDTH,
   CHAIN_LAYER_GAP,
   CHAIN_REQUIREMENT_HEIGHT,
   CHAIN_REQUIREMENT_WIDTH,
   CHAIN_RESULT_HEIGHT,
+  CHAIN_RESULT_WIDTH,
   CHAIN_ROW_GAP,
   type ChainCaseInput,
+  type ChainIssueInput,
   type ChainRequirementInput,
   type ChainResultInput,
   isAbnormalResultStatus,
@@ -25,6 +29,8 @@ const C3 = "1844674407370955203"
 const CR1 = "1844674407370955301"
 const CR2 = "1844674407370955302"
 const CR3 = "1844674407370955303"
+const I1 = "1844674407370955401"
+const I2 = "1844674407370955402"
 
 function requirement(
   id: string,
@@ -53,6 +59,24 @@ function resultInput(
   overrides: Partial<ChainResultInput> = {},
 ): ChainResultInput {
   return { id, caseNodeId, status, sortOrder, ...overrides }
+}
+
+function issueInput(
+  id: string,
+  title: string,
+  caseNodeId: string | null,
+  sortOrder: number,
+  overrides: Partial<ChainIssueInput> = {},
+): ChainIssueInput {
+  return {
+    id,
+    title,
+    caseNodeId,
+    status: "open",
+    severity: "major",
+    sortOrder,
+    ...overrides,
+  }
 }
 
 function baseInput() {
@@ -85,6 +109,7 @@ describe("layoutChain", () => {
     expect(result.edges).toEqual([])
     expect(result.visibleIds).toEqual([])
     expect(result.hiddenIds).toEqual([])
+    expect(result.unlinkedIssues).toEqual([])
     expect(result.totalCount).toBe(0)
     expect(result.bounds).toEqual({ x: 0, y: 0, width: 0, height: 0 })
   })
@@ -234,6 +259,84 @@ describe("layoutChain", () => {
     expect(nodeById(result, orphanCase).title).toBe("已删除用例")
     expect(nodeById(result, CR1).kind).toBe("result")
     expect(result.edges.map((edge) => edge.id)).toEqual([`${orphanCase}->${CR1}`])
+  })
+
+  it("lays issues out as a fourth layer linked to their case or case run", () => {
+    const result = layoutChain({
+      ...baseInput(),
+      issues: [
+        issueInput(I1, "登录报错", C1, 0, { caseRunId: CR1, severity: "blocker" }),
+        issueInput(I2, "订单失败", C2, 1),
+      ],
+    })
+
+    const caseX = CHAIN_REQUIREMENT_WIDTH + CHAIN_LAYER_GAP
+    const resultX = caseX + CHAIN_CASE_WIDTH + CHAIN_LAYER_GAP
+    const issue = nodeById(result, I1)
+
+    expect(issue.kind).toBe("issue")
+    expect(issue.layer).toBe(3)
+    expect(issue.caseNodeId).toBe(C1)
+    expect(issue.w).toBe(CHAIN_ISSUE_WIDTH)
+    expect(issue.h).toBe(CHAIN_ISSUE_HEIGHT)
+    expect(issue.x).toBe(resultX + CHAIN_RESULT_WIDTH + CHAIN_LAYER_GAP)
+    expect(issue.issue?.title).toBe("登录报错")
+    expect(result.edges.find((edge) => edge.targetId === I1)).toMatchObject({
+      kind: "issue-link",
+      sourceId: CR1,
+    })
+    // Without a case run the issue hangs off the case node.
+    expect(result.edges.find((edge) => edge.targetId === I2)).toMatchObject({
+      kind: "issue-link",
+      sourceId: C2,
+    })
+  })
+
+  it("resolves an issue's case from its case run and keeps it visible", () => {
+    const result = layoutChain({
+      requirements: [],
+      cases: [],
+      results: [resultInput(CR1, C1, "failed", 0)],
+      issues: [issueInput(I1, "提交订单失败", null, 0, { caseRunId: CR1 })],
+    })
+
+    expect(nodeById(result, I1).caseNodeId).toBe(C1)
+    expect(result.visibleIds).toContain(I1)
+  })
+
+  it("lists issues without a case instead of dropping them from the layout", () => {
+    const result = layoutChain({
+      ...baseInput(),
+      issues: [issueInput(I1, "需求缺口", null, 0)],
+    })
+
+    expect(result.unlinkedIssues.map((issue) => issue.id)).toEqual([I1])
+    expect(result.nodes.some((node) => node.id === I1)).toBe(false)
+    expect(result.totalCount).toBe(9)
+  })
+
+  it("hides the issue nodes of a collapsed requirement group", () => {
+    const result = layoutChain(
+      { ...baseInput(), issues: [issueInput(I1, "登录报错", C1, 0)] },
+      { collapsed: [R1] },
+    )
+
+    expect(result.hiddenIds).toEqual([C1, CR1, I1])
+  })
+
+  it("keeps the layout deterministic with issue nodes in shuffled order", () => {
+    const input = {
+      ...baseInput(),
+      issues: [issueInput(I2, "订单失败", C2, 1), issueInput(I1, "登录报错", C1, 0)],
+    }
+    const shuffled = { ...input, issues: [input.issues[1], input.issues[0]] }
+
+    const forward = layoutChain(input)
+    const backward = layoutChain(shuffled)
+
+    expect(backward.nodes).toEqual(forward.nodes)
+    expect(backward.edges).toEqual(forward.edges)
+    expect(backward.visibleIds).toEqual(forward.visibleIds)
   })
 })
 

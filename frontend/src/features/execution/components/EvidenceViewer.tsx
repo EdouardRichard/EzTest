@@ -1,3 +1,4 @@
+// biome-ignore-all lint/suspicious/noArrayIndexKey: db result rows/columns/cells are positional tuples without a domain id, so React keys can only derive from the position.
 "use client"
 
 import { Download, Loader2, X } from "lucide-react"
@@ -6,16 +7,18 @@ import { type KeyboardEvent as ReactKeyboardEvent, useEffect, useId, useRef, use
 import { apiStreamFetch } from "@/lib/api-client"
 
 import { getEvidenceMeta, getEvidenceUrl } from "../api"
+import { parseDbResultEvidence } from "../db-result"
 import { describeExecutionError } from "../execution-errors"
 import type { EvidenceMeta, EvidenceView } from "../types"
 
-/** Human labels of the frozen evidence kinds (spec §5.7). */
+/** Human labels of the frozen evidence kinds (spec §5.7, P7 §10.6). */
 export const EVIDENCE_KIND_LABELS: Record<string, string> = {
   screenshot: "截图",
   http_exchange: "HTTP 交换",
   console_log: "Console 日志",
   network_log: "网络日志",
   download: "下载文件",
+  db_result: "数据库结果",
 }
 
 /** Label for any evidence kind; unknown values stay visible instead of blank. */
@@ -213,6 +216,20 @@ export function EvidenceViewer({
 
       const text = await response.text()
       if (controller.signal.aborted) return
+      if (meta.kind === "db_result") {
+        // The JSON table's download link points at the fetched artifact; the
+        // bytes endpoint still needs the bearer, so a blob URL is used.
+        const url = URL.createObjectURL(
+          new Blob([text], { type: meta.mime === "" ? "application/json" : meta.mime }),
+        )
+        objectUrl = url
+        if (controller.signal.aborted) {
+          URL.revokeObjectURL(url)
+          return
+        }
+        setState({ status: "ready", meta, text, objectUrl: url })
+        return
+      }
       setState({ status: "ready", meta, text, objectUrl: "" })
     }
 
@@ -313,6 +330,103 @@ export function EvidenceViewer({
             <Download className="h-4 w-4" aria-hidden="true" />
             下载 {evidenceFilename(content.meta)}
           </a>
+        </div>
+      )
+    }
+
+    if (content.meta.kind === "db_result") {
+      const dbResult = parseDbResultEvidence(content.text)
+      if (dbResult === null) {
+        return (
+          <div data-testid="evidence-db-invalid" role="alert" className="space-y-2">
+            <p className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+              数据库结果证据无法解析（不是有效的 JSON 文档）。
+            </p>
+            <pre className="overflow-x-auto rounded-xl border border-border bg-muted/30 p-3 font-mono text-xs leading-relaxed">
+              <code>{content.text}</code>
+            </pre>
+          </div>
+        )
+      }
+
+      const totalRows = dbResult.rowCount ?? dbResult.rows.length
+      const hasTable = dbResult.columns.length > 0 || dbResult.rows.length > 0
+      return (
+        <div className="space-y-3">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+            <p
+              data-testid="evidence-db-meta"
+              className="flex flex-wrap gap-x-3 text-xs text-muted-foreground"
+            >
+              <span>{`${totalRows} 行`}</span>
+              {dbResult.elapsedMs === null ? null : <span>{`耗时 ${dbResult.elapsedMs} ms`}</span>}
+              <span>{`预览上限：只读结果集`}</span>
+            </p>
+            <a
+              href={content.objectUrl}
+              download={evidenceFilename(content.meta)}
+              data-testid="evidence-db-download"
+              className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-card px-2.5 py-1 text-xs font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <Download className="h-3.5 w-3.5" aria-hidden="true" />
+              下载 JSON
+            </a>
+          </div>
+
+          {dbResult.truncated ? (
+            <p
+              data-testid="evidence-db-truncated"
+              className="rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
+            >
+              {`结果已截断：共 ${totalRows} 行，当前仅展示 ${dbResult.rows.length} 行。`}
+            </p>
+          ) : null}
+
+          <pre
+            data-testid="evidence-db-sql"
+            className="overflow-x-auto rounded-xl border border-border bg-muted/30 p-3 font-mono text-xs leading-relaxed"
+          >
+            <code>{dbResult.sql === "" ? "（SQL 未记录）" : dbResult.sql}</code>
+          </pre>
+
+          {hasTable ? (
+            <div className="overflow-x-auto rounded-xl border border-border">
+              <table data-testid="evidence-db-table" className="w-full text-left text-xs">
+                <caption className="sr-only">数据库查询结果</caption>
+                <thead className="bg-muted/50 text-muted-foreground">
+                  <tr>
+                    {dbResult.columns.map((column, index) => (
+                      <th
+                        key={`${column}:${index}`}
+                        scope="col"
+                        className="px-3 py-1.5 font-medium"
+                      >
+                        {column === "" ? "—" : column}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {dbResult.rows.map((row, rowIndex) => (
+                    <tr key={`row:${rowIndex}`} className="border-t border-border">
+                      {row.map((cell, cellIndex) => (
+                        <td
+                          key={`cell:${rowIndex}:${cellIndex}`}
+                          className="max-w-64 whitespace-pre-wrap break-words px-3 py-1.5 font-mono"
+                        >
+                          {cell === "" ? "—" : cell}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <p data-testid="evidence-db-empty" className="text-sm text-muted-foreground">
+              该数据库结果为空（没有列或行）。
+            </p>
+          )}
         </div>
       )
     }

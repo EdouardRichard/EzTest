@@ -10,6 +10,7 @@ import { exportReport } from "../api"
 import { describeExecutionError } from "../execution-errors"
 import { useBatches, useReport } from "../hooks/useExecution"
 import type { Batch, BatchStatus, ReportCase, ReportView } from "../types"
+import { batchKindLabel, batchOptionLabel, effectiveBatchKind } from "./batch-kind"
 import {
   CaseStatusBadge,
   FAILURE_CLASS_LABELS,
@@ -308,10 +309,20 @@ export function ReportTab({ versionId, batchId, onBatchChange }: ReportTabProps)
           >
             {batches.batches.map((candidate) => (
               <option key={candidate.id} value={candidate.id}>
-                {`批次 #${candidate.batch_no}（${BATCH_STATUS_LABELS[candidate.status]}）`}
+                {batchOptionLabel(candidate, BATCH_STATUS_LABELS[candidate.status])}
               </option>
             ))}
           </select>
+
+          {activeBatch === null ? null : (
+            <span
+              data-testid="report-batch-kind"
+              data-kind={effectiveBatchKind(activeBatch)}
+              className="rounded-full border border-border bg-muted px-2 py-0.5 text-[11px] font-medium text-foreground"
+            >
+              {batchKindLabel(activeBatch)}
+            </span>
+          )}
 
           {activeBatch === null ? null : (
             <button
