@@ -439,6 +439,7 @@ reviewing ──POST review{approve}──▶ executing（写 case_baseline，�
 - `case_node` 有 `revision`；`PATCH` 必须带 `revision`，服务端 `UPDATE ... WHERE id=? AND revision=?`，不匹配 409 `case_revision_conflict`（details 含当前 revision）。
 - 步骤/断言写入请求带 `nodeRevision`，服务端在同一事务校验节点 revision 后再增删改并 `revision+1`，避免"节点内容与子集合"交叉更新丢失。
 - 排序/删除同样走 revision；批量重排只校验一次版本级 `revision`（版本级 `graph_revision` 不新增，直接用节点 revision 集合并校验，冲突整单 409）。
+- **节点级重排例外**：`PUT /mindmap/order`（spec §7.2 端点 5）没有 revision 参数，按"最后一次写入胜出 + 必须提交完整子集合"处理（不传或漏传子节点 → 409 `invalid_case_tree`）；步骤重排（端点 9）仍要求 `nodeRevision`。
 
 ### 6.6 Agent run 生命周期（4 类）
 
@@ -649,12 +650,15 @@ failed/degraded → run 终态 + 错误摘要事件（不物化、不改版本�
 ```
 
 - `editable = versionStatus ∈ {designing, reviewing} 且无 baseline`。
+- **`latestRuns` 字段约定**：每个 run 摘要至少含 `id/status/kind`；`finishedAt`、`findingCount`、`blockerCount` 可缺省（无则 null/省略）；`GET /findings` 返回 `{"data": [FindingView...]}` 扁平数组（不分页，前端按 severity/status 过滤）。`include` 省略 `anchors`/`impact` 时，对应字段返回空数组（`anchors: []`、`impactCases: []`），不省略键。
 - `impactCases` 由 P4 最新 `code_analysis` 的候选（subject=requirement/app_model）经 `case_source` 映射得到，只读提示；`affected.cases` 的正式接入与 `needs_revalidation` 标记归 P6/P7。
 - 大图性能：`include` 可省略 `anchors/findings/impact`；节点 >200 时返回 `X-Graph-Truncated: false` 仅当全量；P5 上限 300 节点（超出 409 `graph_too_large`）。
 
 ### 7.4 错误原因（`details.reason`，OpenAPI 同步枚举）
 
-`version_state_conflict`、`baseline_frozen`、`case_revision_conflict`、`invalid_case_tree`、`no_cases`、`unconfirmed_requirements`、`requirement_not_found`、`requirement_not_clarified`、`node_not_found`、`step_not_found`、`assertion_not_found`、`source_not_found`、`anchor_not_found`、`run_in_progress`、`run_not_found`、`invalid_run_kind`、`invalid_case_proposal`、`blocker_findings_open`、`exploration_requires_environment`、`environment_not_allowed`、`code_repo_unavailable`、`ai_unavailable`、`export_format_unsupported`、`export_not_found`、`export_corrupted`、`graph_too_large`、`forbidden`。
+`version_state_conflict`、`baseline_frozen`、`case_revision_conflict`、`invalid_case_tree`、`no_cases`、`unconfirmed_requirements`、`requirement_not_found`、`requirement_not_clarified`、`node_not_found`、`step_not_found`、`assertion_not_found`、`source_not_found`、`anchor_not_found`、`review_not_found`、`baseline_not_found`、`finding_not_found`、`run_in_progress`、`run_not_found`、`run_state_conflict`、`invalid_run_kind`、`invalid_case_proposal`、`blocker_findings_open`、`exploration_requires_environment`、`environment_not_allowed`、`environment_unreachable`、`code_repo_unavailable`、`ai_unavailable`、`export_format_unsupported`、`export_not_found`、`export_conflict`、`export_corrupted`、`duplicate_case_source`、`duplicate_key`、`graph_too_large`、`forbidden`。
+
+> 补充约定（实现期固化）：`*_not_found` 统一为 404；`invalid_case_tree`/`no_cases`/`graph_too_large`/`unconfirmed_requirements`/`requirement_not_clarified` 在 HTTP 层映射 409（领域层仍可用 `KindInvalid`）；`duplicate_key` 沿用平台既有 reason；`export_conflict` 表示冻结态导出的并发唯一冲突。
 
 ### 7.5 SSE 与事件
 
