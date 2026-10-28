@@ -788,7 +788,7 @@ try {
             }
             Invoke-PsqlQuiet -Database "postgres" -Sql "CREATE DATABASE $e2eDbName;" -Operation "creating database $e2eDbName"
         } finally {
-            Remove-Item Env:PGPASSWORD -ErrorAction SilentlyContinue
+            $env:PGPASSWORD = $dbPassword
         }
 
         $apiExe = Join-Path $tmpDir "acceptance-mindmap-llm-api.exe"
@@ -1143,6 +1143,7 @@ try {
                 kind          = "explore"
                 systemId      = [int64]$script:state.SystemId
                 environmentId = [int64]$script:state.EnvironmentId
+                startPaths    = @("http://127.0.0.1:13335/p5/slow")
             }
             if ($first.Status -ne 202) { throw "POST explore run returned HTTP $($first.Status)" }
             $runId = [string]$first.Data.runId
@@ -1251,7 +1252,7 @@ try {
     }
 
     Invoke-Check -Name "events carry the mindmap lifecycle" -Body {
-        $events = Invoke-Api -Method Get -Uri "$apiBaseUrl/api/versions/$($script:state.VersionId)/events?limit=200" -Headers $adminHeaders
+        $events = Invoke-Api -Method Get -Uri "$apiBaseUrl/api/versions/$($script:state.VersionId)/events?limit=100" -Headers $adminHeaders
         if ($events.Status -ne 200) { throw "GET version events returned HTTP $($events.Status)" }
         $items = @($events.Data)
         $types = @($items | ForEach-Object { [string]$_.type })

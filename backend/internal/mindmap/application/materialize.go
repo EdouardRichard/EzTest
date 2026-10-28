@@ -569,6 +569,10 @@ func runValidateDesignProposal(proposal agentDesignProposal, confirmed map[int64
 		if len(proposalCase.Assertions) == 0 {
 			add("%s.assertions must not be empty", prefix)
 		}
+		// Real models occasionally emit 1-based stepIndex values. Accept them
+		// only when the mapping is unambiguous: every index is in [1,len] and at
+		// least one points at len (impossible in a valid 0-based proposal).
+		normalizeOneBasedStepIndexes(proposalCase.Steps, proposalCase.Assertions)
 		for assertionIndex, assertion := range proposalCase.Assertions {
 			assertionPrefix := fmt.Sprintf("%s.assertions[%d]", prefix, assertionIndex)
 			if assertion.StepIndex != nil {
@@ -1255,4 +1259,38 @@ func (s *RunService) publishGatePending(ctx context.Context, run domain.CaseDesi
 		Source:    domain.NodeSourceAIGenerated,
 		Detail:    map[string]any{"gate": "mindmap_review", "runId": run.ID},
 	})
+}
+
+
+// normalizeOneBasedStepIndexes rewrites a proposal that used 1-based step
+// indexes into the 0-based form the domain expects. It only fires when the
+// mapping is unambiguous (all indexes within [1,len] and at least one equals
+// len), so a valid 0-based proposal is never shifted.
+func normalizeOneBasedStepIndexes(steps []agentDesignStep, assertions []agentDesignAssertion) {
+	if len(steps) == 0 || len(assertions) == 0 {
+		return
+	}
+	atEnd := false
+	for _, assertion := range assertions {
+		if assertion.StepIndex == nil {
+			continue
+		}
+		idx := *assertion.StepIndex
+		if idx < 1 || idx > len(steps) {
+			return
+		}
+		if idx == len(steps) {
+			atEnd = true
+		}
+	}
+	if !atEnd {
+		return
+	}
+	for i := range assertions {
+		if assertions[i].StepIndex == nil {
+			continue
+		}
+		adjusted := *assertions[i].StepIndex - 1
+		assertions[i].StepIndex = &adjusted
+	}
 }
