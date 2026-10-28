@@ -740,18 +740,19 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 
 	// P6 execution engine. The agent runtime adapter needs the bound P1
 	// session/run services; its profile seed is validated against the live
-	// registry before it is written, exactly like the P3/P5 seeds. The scheduler
-	// is the sole dispatcher and is started once below; boot recovery settles
-	// anything a previous process left running before the loop begins.
+	// registry before it is written, exactly like the P3/P5 seeds. The seed runs
+	// with the other startup seeds below, AFTER the builtin runtime-diagnostic
+	// profile: profile ids are BIGSERIAL and the console lists profiles by id,
+	// defaulting to the first row, so seeding execution-agent first would make
+	// it the editable default while sessions run on the builtin profile. The
+	// scheduler is the sole dispatcher and is started once below, after those
+	// seeds; boot recovery settles what a previous process left running first.
 	executionAgentRuntime = executionagent.NewAgentRuntime(
 		agentProfileService, agentProfiles, agentSessionService, runService)
 	// The recorder is the live case read model, so the resumed case run's prompt
 	// starts with the completed steps' actuals/evidence counts and the remaining
 	// steps (spec §5.5, T16); both dependencies exist only here.
 	executionAgentRuntime.SetCaseContextSource(executionRecorder)
-	if err := ensureExecutionProfile(startupCtx, executionAgentRuntime, agentRegistry, logger); err != nil {
-		return err
-	}
 	executionRunner := executionapp.NewCaseRunner(executionapp.CaseRunnerDeps{
 		CaseRuns: executionCaseRuns,
 		Steps:    executionSteps,
@@ -822,25 +823,6 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		executionresource.NewReportEnvironmentSource(executionVersionPort, catalogService),
 		time.Now,
 	)
-	// One in-process scheduler loop (spec §5.3). The deferred stop runs before
-	// database.Close (registered earlier) and waits briefly for the in-flight
-	// case runners, which leave the run for boot recovery on shutdown.
-	executionWorkerCtx, cancelExecutionWorker := context.WithCancel(context.Background())
-	go executionScheduler.Start(executionWorkerCtx)
-	defer func() {
-		cancelExecutionWorker()
-		done := make(chan struct{})
-		go func() {
-			executionScheduler.Wait()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(shutdownTimeout):
-			logger.Warn("execution scheduler did not drain before shutdown")
-		}
-	}()
-
 	// The remaining P5 services. The run coordinator polls the P1 agent runtime
 	// through the mindmap adapter, so it is built once both P1 services exist;
 	// the review, baseline and export services then consume the run coordinator
@@ -932,11 +914,39 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	if err := ensureP5Profiles(startupCtx, mindmapAgentRuntime, agentRegistry, logger); err != nil {
 		return err
 	}
+	// The execution profile is seeded last, after the builtin and P3/P5 seeds, so
+	// it never takes the lowest profile id: the console lists profiles by id and
+	// ConfigPane edits the first row, which must stay the builtin profile that
+	// agent sessions actually run on.
+	if err := ensureExecutionProfile(startupCtx, executionAgentRuntime, agentRegistry, logger); err != nil {
+		return err
+	}
 	if recovered, err := runService.RecoverInterrupted(startupCtx); err != nil {
 		return fmt.Errorf("recover interrupted agent runs: %w", err)
 	} else if recovered > 0 {
 		logger.Info("marked interrupted agent runs", "count", recovered)
 	}
+
+	// One in-process execution scheduler loop (spec §5.3). It starts only after
+	// the profile seeds: its first tick dispatches immediately, and a case run
+	// must never start before the execution profile exists. The deferred stop
+	// runs before database.Close (registered earlier) and waits briefly for the
+	// in-flight case runners, which leave the run for boot recovery on shutdown.
+	executionWorkerCtx, cancelExecutionWorker := context.WithCancel(context.Background())
+	go executionScheduler.Start(executionWorkerCtx)
+	defer func() {
+		cancelExecutionWorker()
+		done := make(chan struct{})
+		go func() {
+			executionScheduler.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(shutdownTimeout):
+			logger.Warn("execution scheduler did not drain before shutdown")
+		}
+	}()
 
 	// The P5 run coordinator is a single in-process worker: it polls the agent
 	// sessions every 2 s (spec §8.4) and first fails the runs a previous process
