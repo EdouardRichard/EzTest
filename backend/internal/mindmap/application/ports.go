@@ -303,6 +303,9 @@ type RunRepository interface {
 	UpdateStatus(ctx context.Context, runID int64, from, to string, patch RunPatch) (domain.CaseDesignRun, error)
 	LatestByKind(ctx context.Context, versionID int64, kind string) (domain.CaseDesignRun, error)
 	ActiveByKind(ctx context.Context, versionID int64, kind string) (domain.CaseDesignRun, error)
+	// ListActive returns queued/running runs across versions (oldest first),
+	// bounded by limit. The run worker uses it to poll agent sessions.
+	ListActive(ctx context.Context, limit int) ([]domain.CaseDesignRun, error)
 	// RecoverStale marks queued/running runs updated before the cutoff as failed
 	// and returns the number recovered.
 	RecoverStale(ctx context.Context, before time.Time) (int64, error)
