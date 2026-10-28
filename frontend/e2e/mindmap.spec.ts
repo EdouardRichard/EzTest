@@ -318,12 +318,8 @@ test("generates, edits, reviews, freezes and exports a P5 case mindmap", async (
     // The UI refreshes after the API delete and now correctly disables the
     // last remaining requirement source, so assert the guard instead of
     // clicking it; the server-side 409 is asserted directly below.
-    await expect(
-      page.getByRole("button", { name: `删除来源 ${originalSource.id}` }),
-    ).toBeDisabled()
-    await expect(page.getByTestId("source-panel")).toContainText(
-      "最后一条不可删除",
-    )
+    await expect(page.getByRole("button", { name: `删除来源 ${originalSource.id}` })).toBeDisabled()
+    await expect(page.getByTestId("source-panel")).toContainText("最后一条不可删除")
 
     const rejected = await request.delete(
       `${API_URL}/api/versions/${versionId}/mindmap/sources/${originalSource.id}`,
