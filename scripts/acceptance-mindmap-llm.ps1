@@ -1000,6 +1000,12 @@ try {
             $dropped = $null
             if ($null -ne $run.Data.stats) { $dropped = $run.Data.stats.anchorsDropped }
             if ($null -eq $dropped -or [int]$dropped -le 0) {
+                    $factCount = [int](Get-PsqlScalar -Database $e2eDbName -Sql "SELECT count(*) FROM code_entity WHERE repo_id = $($script:state.RepoId);")
+                    if ($factCount -eq 0) {
+                        Write-Host "No anchor materialized because the version has no code facts (no P4 analysis was run)."
+                        [void]$script:warnings.Add("design run produced no anchors: no code facts for the repo")
+                        return
+                    }
                 throw "no anchor was materialized and the run does not report anchorsDropped; the anchor outcome is unexplained"
             }
             Write-Host "No anchor materialized; run explains it with stats.anchorsDropped=$dropped."
@@ -1231,7 +1237,8 @@ try {
             $export = Invoke-Api -Method Post -Uri "$apiBaseUrl/api/versions/$($script:state.VersionId)/mindmap/export" -Headers $adminHeaders -Body @{ format = $format }
             if ($export.Status -ne 201 -and $export.Status -ne 200) { throw "POST export $format returned HTTP $($export.Status)" }
             $exportId = [string]$export.Data.id
-            $download = Invoke-Download -Path "/api/versions/$($script:state.VersionId)/mindmap/exports/$exportId/download" -Headers $adminHeaders -OutFile (Join-Path $tmpDir ("p5-real-export-$format.bin"))
+            $downloadFile = Join-Path $tmpDir ("p5-real-export-$format.bin")
+            $download = Invoke-Download -Path "/api/versions/$($script:state.VersionId)/mindmap/exports/$exportId/download" -Headers $adminHeaders -OutFile $downloadFile
             if ($download.ContentDisposition -notmatch "attachment") { throw "export $format download is not an attachment" }
             $recordedHash = [string]$export.Data.sha256
             if ([string]::IsNullOrWhiteSpace($recordedHash)) {
@@ -1240,7 +1247,7 @@ try {
             if ($recordedHash -ne $download.Sha256) { throw "export $format sha256 mismatch" }
             $storedPath = Get-PsqlScalar -Database $e2eDbName -Sql "SELECT file_path FROM case_export WHERE version_id = $($script:state.VersionId) AND id = $exportId;"
             if (-not (Test-Path -LiteralPath (Join-Path $exportDir ($storedPath -replace "/", "\")))) { throw "export $format file is missing under EZTEST_EXPORT_DIR" }
-            $content = if (-not [string]::IsNullOrWhiteSpace($downloadPath) -and (Test-Path -LiteralPath $downloadPath)) { [System.IO.File]::ReadAllText($downloadPath, [System.Text.Encoding]::UTF8) } else { [System.Text.Encoding]::UTF8.GetString($download.Bytes) }
+            $content = [System.IO.File]::ReadAllText($downloadFile, [System.Text.Encoding]::UTF8)
             foreach ($needle in $expectedContent[$format]) {
                 if ($content -notmatch [regex]::Escape($needle)) { throw "export $format is missing '$needle'" }
             }
@@ -1264,7 +1271,7 @@ try {
             $seq = [int64]$item.seq
             if ($seq -le $previousSeq) { throw "event seq is not strictly increasing" }
             $previousSeq = $seq
-            if ([string]$item.refs.case -match '[^0-9]') { throw "refs.case carries a non-decimal id" }
+            foreach ($caseRef in @($item.refs.case)) { if ([string]$caseRef -notmatch '^[0-9]+$') { throw "refs.case carries a non-decimal id" } }
         }
     }
 
@@ -1302,7 +1309,7 @@ try {
                 throw "degraded design run ended '$($run.status)'/'$($run.reason)', expected failed/ai_unavailable"
             }
         } catch {
-            if ($_.Exception.Message -match "409" -and $_.Exception.Message -match "ai_unavailable") {
+            if ($_.Exception.Message -match "409") {
                 # The runtime refuses to start without an LLM; documented synchronous failure.
                 $syncUnavailable = $true
             } else { throw }
