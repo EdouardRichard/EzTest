@@ -86,9 +86,23 @@ export function mindmapPngFilename(versionName: string): string {
 }
 
 /**
+ * Drops the canvas pan/zoom transform from the cloned content group. The
+ * viewBox already frames the complete laid-out graph, so an identity transform
+ * makes the PNG a fit-to-graph snapshot instead of the current viewport.
+ */
+function resetContentTransform(clone: SVGSVGElement): void {
+  for (const child of Array.from(clone.children)) {
+    if (child.tagName.toLowerCase() === "g" && child.hasAttribute("transform")) {
+      child.setAttribute("transform", "translate(0 0)")
+      return
+    }
+  }
+}
+
+/**
  * Clones the SVG so the live canvas is untouched, pins the namespace, size and
- * (when absent) a viewBox. The rendered image therefore keeps the current
- * full-graph framing.
+ * (when absent) a viewBox, and resets the content pan/zoom so the rendered image
+ * is the full graph rather than the current viewport.
  */
 function serializeSvg(svg: SVGSVGElement, size: PngSize): string {
   const clone = svg.cloneNode(true) as SVGSVGElement
@@ -98,6 +112,7 @@ function serializeSvg(svg: SVGSVGElement, size: PngSize): string {
   if (clone.getAttribute("viewBox") === null) {
     clone.setAttribute("viewBox", `0 0 ${size.width} ${size.height}`)
   }
+  resetContentTransform(clone)
   return new XMLSerializer().serializeToString(clone)
 }
 

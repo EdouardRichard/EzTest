@@ -15,6 +15,7 @@ import {
 
 import { StatusBadge, type StatusBadgeVariant } from "@/components/ui/StatusBadge"
 import { getVersion } from "@/features/versions/api"
+import type { Version, VersionStatus } from "@/features/versions/types"
 import { versionStatusLabel, versionStatusVariant } from "@/features/versions/VersionHeader"
 import type { SSEStatus } from "@/lib/sse-client"
 
@@ -36,6 +37,34 @@ const STREAM_STATUS_META: Record<SSEStatus, { label: string; variant: StatusBadg
   live: { label: "实时", variant: "success" },
   reconnecting: { label: "重连中", variant: "warning" },
   closed: { label: "断开", variant: "danger" },
+}
+
+/** Spec §6.3: review runs and exports are only open in these version states. */
+const REVIEW_EXPORT_STATUSES: ReadonlySet<VersionStatus> = new Set([
+  "designing",
+  "reviewing",
+  "executing",
+])
+
+/**
+ * Copy for a read-only graph without a frozen baseline. The "baseline frozen"
+ * banner is reserved for a real `graph.baseline`; version status alone decides
+ * whether editing is simply not open yet (draft/clarifying) or already over.
+ */
+function statusBannerCopy(status: VersionStatus): string {
+  switch (status) {
+    case "draft":
+    case "clarifying":
+      return "需求确认并进入设计后可编辑脑图。"
+    case "completed":
+    case "archived":
+      return "当前版本已结束，脑图为只读。"
+    case "executing":
+    case "continuing":
+      return "当前版本处于执行阶段，脑图不可编辑。"
+    default:
+      return "当前版本暂不可编辑脑图。"
+  }
 }
 
 const FIELD_CLASS =
@@ -132,7 +161,7 @@ export type MindmapPageProps = {
 export function MindmapPage({ versionId }: MindmapPageProps) {
   const { graph, loading, error, streamStatus, refresh } = useMindmap(versionId)
 
-  const [versionName, setVersionName] = useState<string | null>(null)
+  const [version, setVersion] = useState<Version | null>(null)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set<string>())
   const [notice, setNotice] = useState("")
@@ -147,13 +176,14 @@ export function MindmapPage({ versionId }: MindmapPageProps) {
   const manualKindId = useId()
   const manualTitleId = useId()
 
-  // The version name feeds the toolbar title and the `{versionName}-mindmap.png`
-  // filename. It is supplementary: a failed lookup falls back to the version id.
+  // The version detail feeds the toolbar title, the PNG filename and the
+  // system/environment bindings of the explore run. It is supplementary: a
+  // failed lookup falls back to the version id and disables explore.
   useEffect(() => {
     let cancelled = false
     getVersion(versionId)
-      .then((version) => {
-        if (!cancelled) setVersionName(version.name)
+      .then((loaded) => {
+        if (!cancelled) setVersion(loaded)
       })
       .catch(() => {
         // Non-fatal: the graph read below is the authoritative load state.
@@ -231,7 +261,7 @@ export function MindmapPage({ versionId }: MindmapPageProps) {
   }
 
   const stream = STREAM_STATUS_META[streamStatus]
-  const versionLabel = versionName ?? versionId
+  const versionLabel = version?.name ?? versionId
 
   if (graph === null) {
     return (
@@ -284,6 +314,7 @@ export function MindmapPage({ versionId }: MindmapPageProps) {
   const uncoveredCount = graph.coverage.uncoveredRequirementIds.length
   const noNodes = graph.nodes.length === 0
   const noRequirements = requirementCount === 0
+  const reviewExportAllowed = REVIEW_EXPORT_STATUSES.has(graph.versionStatus)
 
   return (
     <div data-testid="mindmap-page" className="space-y-3">
@@ -356,13 +387,21 @@ export function MindmapPage({ versionId }: MindmapPageProps) {
         </div>
       </header>
 
-      {graph.editable ? null : (
+      {graph.baseline !== null ? (
         <p
           data-testid="readonly-banner"
           role="status"
           className="rounded-xl border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
         >
           基线已冻结：脑图与用例编辑为只读，仍可发起评审运行与导出。
+        </p>
+      ) : graph.editable ? null : (
+        <p
+          data-testid="status-banner"
+          role="status"
+          className="rounded-xl border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
+        >
+          {statusBannerCopy(graph.versionStatus)}
         </p>
       )}
 
@@ -579,6 +618,7 @@ export function MindmapPage({ versionId }: MindmapPageProps) {
               versionId={versionId}
               node={selectedNode}
               editable={graph.editable}
+              systemId={version?.systemId ?? null}
               onChanged={reload}
             />
           )}
@@ -590,7 +630,12 @@ export function MindmapPage({ versionId }: MindmapPageProps) {
         title="设计评审"
         description="评审发现项、批准与驳回"
       >
-        <ReviewPanel versionId={versionId} graph={graph} onChanged={reload} />
+        <ReviewPanel
+          versionId={versionId}
+          graph={graph}
+          disabled={!reviewExportAllowed}
+          onChanged={reload}
+        />
       </CollapsibleSection>
 
       <CollapsibleSection
@@ -599,7 +644,13 @@ export function MindmapPage({ versionId }: MindmapPageProps) {
         description="生成、评审与数据规划"
       >
         <fieldset disabled={!graph.editable} className="m-0 min-w-0 border-0 p-0">
-          <RunPanel versionId={versionId} graph={graph} onChanged={reload} />
+          <RunPanel
+            versionId={versionId}
+            graph={graph}
+            systemId={version?.systemId ?? null}
+            environmentId={version?.environmentId ?? null}
+            onChanged={reload}
+          />
         </fieldset>
       </CollapsibleSection>
 
@@ -613,7 +664,12 @@ export function MindmapPage({ versionId }: MindmapPageProps) {
           svgRef={svgRef}
           versionName={versionLabel}
           baseline={graph.baseline}
-          disabled={noNodes}
+          disabled={noNodes || !reviewExportAllowed}
+          disabledReason={
+            reviewExportAllowed
+              ? undefined
+              : "当前版本状态不开放导出（仅设计、评审、执行阶段开放）。"
+          }
         />
       </CollapsibleSection>
     </div>

@@ -4,6 +4,8 @@ import { Loader2, Plus, Trash2 } from "lucide-react"
 import { useCallback, useEffect, useId, useState } from "react"
 
 import { StatusBadge, type StatusBadgeVariant } from "@/components/ui/StatusBadge"
+import { listAppModels } from "@/features/resources/api"
+import type { AppModelNodeDTO } from "@/features/resources/types"
 import { listRequirements } from "@/features/versions/api"
 
 import { mindmapApi } from "./api"
@@ -26,6 +28,7 @@ export type SourceRequirementOption = {
 }
 
 const MAX_REQUIREMENTS = 100
+const MAX_APP_MODELS = 100
 
 const REF_KIND_LABEL: Record<CaseRefKind, string> = {
   requirement: "需求",
@@ -80,6 +83,8 @@ export type SourcePanelProps = {
   editable: boolean
   /** Optional preloaded confirmed requirements; fetched from the version API otherwise. */
   requirements?: readonly SourceRequirementOption[]
+  /** P2-owned system id of the version; enables the app-model picker when bound. */
+  systemId?: number | null
   /** Called after a successful source/anchor write so the graph can refetch. */
   onChanged: () => void
 }
@@ -114,6 +119,7 @@ function SourcePanelContent({
   node,
   editable,
   requirements,
+  systemId,
   onChanged,
 }: SourcePanelProps) {
   const uid = useId()
@@ -123,9 +129,14 @@ function SourcePanelContent({
   const [requirementsLoading, setRequirementsLoading] = useState(requirements === undefined)
   const [requirementsError, setRequirementsError] = useState("")
 
+  const [appModels, setAppModels] = useState<AppModelNodeDTO[]>([])
+  const [appModelsLoading, setAppModelsLoading] = useState(editable && typeof systemId === "number")
+  const [appModelsError, setAppModelsError] = useState("")
+
   const [selectedRequirementId, setSelectedRequirementId] = useState("")
   const [refKind, setRefKind] = useState<"app_model" | "manual">("manual")
   const [refKey, setRefKey] = useState("")
+  const [selectedAppModelId, setSelectedAppModelId] = useState("")
 
   const [filePath, setFilePath] = useState("")
   const [startLine, setStartLine] = useState("")
@@ -165,6 +176,36 @@ function SourcePanelContent({
   useEffect(() => {
     void loadRequirements()
   }, [loadRequirements])
+
+  const loadAppModels = useCallback(async (): Promise<void> => {
+    if (typeof systemId !== "number") {
+      setAppModels([])
+      setAppModelsLoading(false)
+      return
+    }
+    setAppModelsLoading(true)
+    setAppModelsError("")
+    try {
+      const page = await listAppModels(systemId, { limit: MAX_APP_MODELS })
+      setAppModels(page.items)
+    } catch (caught) {
+      setAppModelsError(describeMindmapError(caught))
+    } finally {
+      setAppModelsLoading(false)
+    }
+  }, [systemId])
+
+  useEffect(() => {
+    if (!editable) {
+      setAppModelsLoading(false)
+      return
+    }
+    void loadAppModels()
+  }, [editable, loadAppModels])
+
+  const appModelsUnavailable = typeof systemId !== "number"
+  const selectedAppModel =
+    appModels.find((model) => String(model.id) === selectedAppModelId) ?? null
 
   const requirementOptions = (requirements ?? fetchedRequirements).filter(
     (requirement) => requirement.status === undefined || requirement.status === "clarified",
@@ -207,17 +248,36 @@ function SourcePanelContent({
   }
 
   async function addRefSource(): Promise<void> {
-    const key = refKey.trim()
-    if (key === "") {
-      setActionError("请填写来源引用。")
-      return
-    }
     setBusy("ref")
     setActionError("")
     try {
-      const created = await mindmapApi.createSource(versionId, node.id, { refKind, refKey: key })
+      let created: CaseSourceView
+      if (refKind === "manual") {
+        const key = refKey.trim()
+        if (key === "") {
+          setActionError("请填写来源引用。")
+          return
+        }
+        created = await mindmapApi.createSource(versionId, node.id, {
+          refKind: "manual",
+          refKey: key,
+        })
+      } else {
+        // app_model sources must carry the numeric app model id as a decimal
+        // string (backend CHECK: only manual sources may be refKey-only).
+        if (selectedAppModel === null) {
+          setActionError("请选择应用模型。")
+          return
+        }
+        created = await mindmapApi.createSource(versionId, node.id, {
+          refKind: "app_model",
+          refId: String(selectedAppModel.id),
+          refKey: selectedAppModel.key,
+        })
+      }
       setSources((current) => [...current, created])
       setRefKey("")
+      setSelectedAppModelId("")
       onChanged()
     } catch (caught) {
       setActionError(describeMindmapError(caught))
@@ -451,24 +511,56 @@ function SourcePanelContent({
                   onChange={(event) => setRefKind(event.target.value as "app_model" | "manual")}
                   className={FIELD_CLASS}
                 >
-                  <option value="app_model">应用模型</option>
                   <option value="manual">手工</option>
+                  <option value="app_model">应用模型</option>
                 </select>
               </label>
-              <label className="min-w-0 flex-1 text-[11px] text-muted-foreground">
-                来源引用
-                <input
-                  aria-label="来源引用"
-                  value={refKey}
-                  disabled={controlsDisabled}
-                  placeholder="例如 app_model:page:/orders"
-                  onChange={(event) => setRefKey(event.target.value)}
-                  className={FIELD_CLASS}
-                />
-              </label>
+              {refKind === "manual" ? (
+                <label className="min-w-0 flex-1 text-[11px] text-muted-foreground">
+                  来源引用
+                  <input
+                    aria-label="来源引用"
+                    value={refKey}
+                    disabled={controlsDisabled}
+                    placeholder="例如 会议纪要 / 外部链接"
+                    onChange={(event) => setRefKey(event.target.value)}
+                    className={FIELD_CLASS}
+                  />
+                </label>
+              ) : (
+                <label className="min-w-0 flex-1 text-[11px] text-muted-foreground">
+                  应用模型
+                  <select
+                    aria-label="选择应用模型"
+                    value={selectedAppModelId}
+                    disabled={
+                      controlsDisabled ||
+                      appModelsUnavailable ||
+                      appModelsLoading ||
+                      appModels.length === 0
+                    }
+                    onChange={(event) => setSelectedAppModelId(event.target.value)}
+                    className={FIELD_CLASS}
+                  >
+                    <option value="">
+                      {appModelsLoading ? "正在加载应用模型…" : "请选择应用模型"}
+                    </option>
+                    {appModels.map((model) => (
+                      <option key={model.id} value={String(model.id)}>
+                        {`${model.name === "" ? model.key : model.name}（${model.key}）`}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
               <button
                 type="button"
-                disabled={controlsDisabled || refKey.trim() === ""}
+                disabled={
+                  controlsDisabled ||
+                  (refKind === "manual"
+                    ? refKey.trim() === ""
+                    : selectedAppModelId === "" || appModelsUnavailable)
+                }
                 onClick={() => void addRefSource()}
                 className={PRIMARY_BUTTON_CLASS}
               >
@@ -476,6 +568,29 @@ function SourcePanelContent({
                 添加来源
               </button>
             </div>
+            {refKind !== "app_model" ? null : appModelsUnavailable ? (
+              <p className="text-[11px] text-muted-foreground">
+                版本未绑定系统，无法关联应用模型；请先绑定系统或在“资源”中维护应用模型。
+              </p>
+            ) : appModelsError !== "" ? (
+              <div
+                role="alert"
+                className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+              >
+                <span>{appModelsError}</span>
+                <button
+                  type="button"
+                  onClick={() => void loadAppModels()}
+                  className={SMALL_BUTTON_CLASS}
+                >
+                  重试
+                </button>
+              </div>
+            ) : !appModelsLoading && appModels.length === 0 ? (
+              <p className="text-[11px] text-muted-foreground">
+                该系统还没有应用模型，请先在“资源”中导入应用模型。
+              </p>
+            ) : null}
           </div>
         ) : null}
       </section>

@@ -39,6 +39,16 @@ vi.mock("./png-export", async (importOriginal) => {
   return { ...actual, svgToPngBlob: vi.fn(), downloadBlob: vi.fn() }
 })
 
+// The run panel reads the signed-in role; this suite exercises the non-admin
+// path, so the admin-only explore entry stays hidden.
+vi.mock("@/features/auth/AuthProvider", () => ({
+  useAuth: () => ({
+    user: { id: 2, username: "designer", role: "designer", status: "active" },
+    loading: false,
+    logout: vi.fn(),
+  }),
+}))
+
 const api = {
   listFindings: vi.mocked(mindmapApi.listFindings),
   updateFinding: vi.mocked(mindmapApi.updateFinding),

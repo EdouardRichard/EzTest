@@ -232,6 +232,7 @@ function ScenarioEditorForm({
 
         {error?.stale ? (
           <div
+            data-testid="scenario-revision-conflict"
             role="alert"
             className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive"
           >

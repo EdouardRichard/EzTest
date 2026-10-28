@@ -32,6 +32,8 @@ export type ExportMenuProps = {
   svgRef: RefObject<SVGSVGElement | null>
   /** Prevents every export action (e.g. while the graph is still loading). */
   disabled?: boolean
+  /** Explains a status gate so the user knows why export is unavailable. */
+  disabledReason?: string
   /** Version name used for the PNG filename (`{versionName}-mindmap.png`). */
   versionName?: string
   /** Frozen baseline; when present the export is bound to it (spec §6.10). */
@@ -49,6 +51,7 @@ export function ExportMenu({
   versionId,
   svgRef,
   disabled = false,
+  disabledReason,
   versionName = "version",
   baseline = null,
 }: ExportMenuProps) {
@@ -146,6 +149,12 @@ export function ExportMenu({
           {exporting === "png" ? "导出中…" : "导出 PNG"}
         </button>
       </div>
+
+      {disabledReason === undefined || disabledReason === "" ? null : (
+        <p data-testid="export-status-gate" className="mt-2 text-[11px] text-muted-foreground">
+          {disabledReason}
+        </p>
+      )}
 
       {baseline === null ? (
         <p className="mt-2 text-[11px] text-muted-foreground">版本尚未冻结：导出为当前草稿快照。</p>
