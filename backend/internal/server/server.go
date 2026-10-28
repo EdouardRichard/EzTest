@@ -21,6 +21,7 @@ import (
 	identityhttp "github.com/EdouardRichard/EzTest/backend/internal/identity/interfaces/httpapi"
 	llmapp "github.com/EdouardRichard/EzTest/backend/internal/llm/application"
 	llmhttp "github.com/EdouardRichard/EzTest/backend/internal/llm/interfaces/httpapi"
+	mindmaphttp "github.com/EdouardRichard/EzTest/backend/internal/mindmap/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/idempotency"
 	resourcehttp "github.com/EdouardRichard/EzTest/backend/internal/resource/interfaces/httpapi"
@@ -107,6 +108,12 @@ type Dependencies struct {
 	// rely on the global bearer auth; only the T0 index trigger adds the
 	// per-route admin guard (design spec §6.10).
 	CodeIntel *codeintelhttp.Handler
+	// Mindmap holds the case-mindmap HTTP handler group (P5). When set, the
+	// /api/versions/{versionId}/mindmap routes are mounted. They rely on the
+	// global bearer auth; the exploration run kind and the anchor-delete
+	// ownership rule enforce their own authorization in the handler (design
+	// spec §7.1/§7.2), so no per-route guard is added here.
+	Mindmap *mindmaphttp.Handler
 }
 
 // New assembles the HTTP handler. Middleware runs in the order
@@ -187,6 +194,13 @@ func New(cfg config.Config, logger *slog.Logger, deps Dependencies) http.Handler
 		// group only when its application service is wired, so a partially
 		// assembled process never exposes a route backed by nil dependencies.
 		deps.CodeIntel.Register(mux)
+	}
+	if deps.Mindmap != nil {
+		// The mindmap routes (P5) sit under /api/versions/{versionId}/mindmap
+		// and rely on the global bearer auth. Register mounts each group only
+		// when its services are wired, so a partially assembled process never
+		// exposes a route backed by nil dependencies.
+		deps.Mindmap.Register(mux)
 	}
 	if deps.Events != nil && cfg.EnableTestEndpoints {
 		auditor := deps.Audit

@@ -35,6 +35,11 @@ type Config struct {
 	// VersionAttachmentDir is the root of the P3 version attachment file store
 	// (design spec §4.1, D30). Docker maps it to /data/version-attachments.
 	VersionAttachmentDir string
+	// ExportDir is the root of the P5 mindmap export file store (design spec
+	// §6.10/D30). Only the file metadata lives in the database; the generated
+	// Markdown/Mermaid/OPML documents are written below this directory. Docker
+	// maps it to /data/exports.
+	ExportDir string
 	// SnowflakeNodeID is this process's 10-bit node ID for application-side
 	// primary key generation (D29). It must be unique per running instance.
 	SnowflakeNodeID int64
@@ -134,6 +139,7 @@ func Load(getenv func(string) string) (Config, error) {
 		StorageDir:      valueOr(getenv, "EZTEST_STORAGE_DIR", ".data/objects"),
 		VersionAttachmentDir: valueOr(getenv, "EZTEST_VERSION_ATTACHMENT_DIR",
 			".data/version-attachments"),
+		ExportDir:     valueOr(getenv, "EZTEST_EXPORT_DIR", ".data/exports"),
 		OpenAPIPath:   valueOr(getenv, "EZTEST_OPENAPI_PATH", "docs/openapi/api.yaml"),
 		AgentFileRoot: strings.TrimSpace(getenv("EZTEST_AGENT_FILE_ROOT")),
 		LLMSeed: LLMSeed{
