@@ -66,10 +66,14 @@ func NewBatchService(deps BatchServiceDeps) *BatchService {
 
 // Create starts a batch for an executing, environment-bound version
 // (spec §5.1, §4.3). It validates every gate, pins the baseline hash and the
-// immutable per-case snapshots, then writes the batch and its pending runs in
-// one repository call, advances version.batch_no and publishes batch.created
-// and batch.started. The executor health probe deliberately does not live here:
-// it is an HTTP-layer gate (T19).
+// immutable per-case snapshots, allocates the version's next batch number and
+// then writes the batch and its pending runs in one repository call before
+// publishing batch.created and batch.started. Allocating before the insert
+// means a committed batch always carries a batch_no the version already
+// recorded; if the insert fails the number is handed back (when it is still the
+// newest) and the original error is returned, so a failure can never leave a
+// batch with an unrecorded number or wedge future batches. The executor health
+// probe deliberately does not live here: it is an HTTP-layer gate (T19).
 //
 // A nil or empty caseIDs selects every baseline case. Explicit ids must all be
 // baseline cases; duplicates are collapsed.
@@ -137,7 +141,6 @@ func (s *BatchService) Create(ctx context.Context, versionID, actor int64, caseI
 	batch := domain.RunBatch{
 		ID:                 batchID,
 		VersionID:          versionID,
-		BatchNo:            version.BatchNo + 1,
 		Status:             domain.BatchStatusRunning,
 		Paused:             false,
 		PauseMode:          domain.PauseModeGraceful,
@@ -151,21 +154,25 @@ func (s *BatchService) Create(ctx context.Context, versionID, actor int64, caseI
 	startedAt := now
 	batch.StartedAt = &startedAt
 
-	created, err := s.deps.Batches.CreateBatchWithRuns(ctx, batch, runs)
+	// Record the number before the insert. AllocateBatchNo is the atomic
+	// version-side increment, so the unique (version_id, batch_no) index can
+	// only reject a genuinely concurrent creator, never our own write.
+	allocated, err := s.deps.Versions.AllocateBatchNo(ctx, versionID)
 	if err != nil {
-		switch {
-		case errors.Is(err, domain.ErrBatchActive):
-			return nil, newReasonError("batch_active",
-				fmt.Sprintf("version %d already has an active batch", versionID))
-		case errors.Is(err, ErrConflict):
-			// The unique (version_id, batch_no) index lost a creation race.
-			return nil, newReasonError("batch_active",
-				fmt.Sprintf("a concurrent batch creation for version %d won", versionID))
-		}
 		return nil, err
 	}
+	batch.BatchNo = allocated
 
-	if err := s.deps.Versions.SetBatchNo(ctx, versionID, batch.BatchNo, actor); err != nil {
+	created, err := s.deps.Batches.CreateBatchWithRuns(ctx, batch, runs)
+	if err != nil {
+		// Hand the number back so a failed create cannot wedge later batches.
+		s.releaseBatchNo(ctx, versionID, allocated)
+		if errors.Is(err, domain.ErrBatchActive) {
+			return nil, newReasonError("batch_active",
+				fmt.Sprintf("version %d already has an active batch", versionID))
+		}
+		// Anything else (including a repository conflict) is not an active
+		// batch: return it unchanged rather than mislabelling it batch_active.
 		return nil, err
 	}
 
@@ -237,13 +244,15 @@ func (s *BatchService) Pause(ctx context.Context, versionID, batchID int64, mode
 	if err != nil {
 		return nil, err
 	}
-	if batch.Paused {
-		return nil, newReasonError("already_paused",
-			fmt.Sprintf("batch %d is already paused", batchID))
-	}
 	if !domain.CanPause(batch.Status) {
 		return nil, newReasonError("batch_finished",
 			fmt.Sprintf("batch %d is %s and cannot be paused", batchID, batch.Status))
+	}
+	// Check the terminal state first: a finished batch that still carries a
+	// stale paused flag is batch_finished, not already_paused (spec §5.4).
+	if batch.Paused {
+		return nil, newReasonError("already_paused",
+			fmt.Sprintf("batch %d is already paused", batchID))
 	}
 
 	updated, err := s.deps.Batches.SetPaused(ctx, batchID, true, mode, pauseReasonUser)
@@ -316,11 +325,14 @@ func (s *BatchService) Resume(ctx context.Context, versionID, batchID, actor int
 }
 
 // Cancel terminates an active batch (spec §5.4): pending runs become skipped,
-// running runs become interrupted, the tally is refreshed and the batch becomes
-// cancelled. The version status deliberately stays executing so a new batch can
-// be created. Lease/context release belongs to the scheduler.
+// running runs become interrupted with cleanup_required, the tally is refreshed
+// and the batch becomes cancelled. A paused batch has its pause flag and the
+// version mirror cleared before the batch turns terminal, so neither the batch
+// nor the version stays paused forever. The version status deliberately stays
+// executing so a new batch can be created. Lease/context release belongs to the
+// scheduler.
 func (s *BatchService) Cancel(ctx context.Context, versionID, batchID, actor int64) (*domain.RunBatch, error) {
-	if s.deps.Batches == nil || s.deps.CaseRuns == nil {
+	if s.deps.Batches == nil || s.deps.CaseRuns == nil || s.deps.Versions == nil {
 		return nil, errors.New("execution: cancel dependencies are not configured")
 	}
 	batch, err := s.deps.Batches.GetBatch(ctx, versionID, batchID)
@@ -338,25 +350,45 @@ func (s *BatchService) Cancel(ctx context.Context, versionID, batchID, actor int
 		return nil, err
 	}
 	for i := range runs {
-		var to domain.CaseRunStatus
 		switch runs[i].Status {
-		case domain.CaseRunStatusPending:
-			to = domain.CaseRunStatusSkipped
-		case domain.CaseRunStatusRunning:
-			to = domain.CaseRunStatusInterrupted
+		case domain.CaseRunStatusPending, domain.CaseRunStatusRunning:
+			to := domain.CaseRunStatusSkipped
+			if runs[i].Status == domain.CaseRunStatusRunning {
+				to = domain.CaseRunStatusInterrupted
+			}
+			updated, err := s.deps.CaseRuns.SetStatus(ctx, runs[i].ID, runs[i].Status, to, now)
+			if err != nil {
+				if errors.Is(err, domain.ErrCaseRunTerminal) || errors.Is(err, ErrConflict) {
+					current, readErr := s.deps.CaseRuns.GetCaseRun(ctx, batchID, runs[i].ID)
+					if readErr != nil {
+						return nil, readErr
+					}
+					runs[i] = current
+					continue
+				}
+				return nil, err
+			}
+			runs[i] = updated
+		case domain.CaseRunStatusInterrupted:
+			// A run left interrupted without its cleanup flag (a partially
+			// failed earlier cancel or a crash between the status and cleanup
+			// writes) is repaired here so the invariant cannot rot.
+			if runs[i].CleanupRequired {
+				continue
+			}
 		default:
 			continue
 		}
-		updated, err := s.deps.CaseRuns.SetStatus(ctx, runs[i].ID, runs[i].Status, to, now)
+		if runs[i].Status != domain.CaseRunStatusInterrupted {
+			continue
+		}
+		// A cancelled running case stops mid-flight: its browser/HTTP state is
+		// unknown, so a same-attempt resume must cleanup first (spec §5.4,
+		// §5.12 invariant 5).
+		runs[i].CleanupRequired = true
+		runs[i].UpdatedAt = now
+		updated, err := s.deps.CaseRuns.UpdateCaseRun(ctx, runs[i])
 		if err != nil {
-			if errors.Is(err, domain.ErrCaseRunTerminal) || errors.Is(err, ErrConflict) {
-				current, readErr := s.deps.CaseRuns.GetCaseRun(ctx, batchID, runs[i].ID)
-				if readErr != nil {
-					return nil, readErr
-				}
-				runs[i] = current
-				continue
-			}
 			return nil, err
 		}
 		runs[i] = updated
@@ -365,6 +397,11 @@ func (s *BatchService) Cancel(ctx context.Context, versionID, batchID, actor int
 	counts, err := s.deps.Batches.UpdateCounts(ctx, batchID)
 	if err != nil {
 		return nil, err
+	}
+	if batch.Paused {
+		if err := s.clearPause(ctx, batch, actor); err != nil {
+			return nil, err
+		}
 	}
 	finishedAt := now
 	cancelled, err := s.deps.Batches.UpdateBatchStatus(ctx, batchID, batch.Status, domain.BatchStatusCancelled, &finishedAt)
@@ -385,10 +422,35 @@ func (s *BatchService) Cancel(ctx context.Context, versionID, batchID, actor int
 	return &cancelled, nil
 }
 
+// clearPause unpauses the batch and clears the version mirror while the batch is
+// still active. Cancel calls it before the terminal status write because
+// SetPaused only accepts a planned/running batch.
+func (s *BatchService) clearPause(ctx context.Context, batch domain.RunBatch, actor int64) error {
+	mode := batch.PauseMode
+	if mode == "" {
+		mode = domain.PauseModeGraceful
+	}
+	if _, err := s.deps.Batches.SetPaused(ctx, batch.ID, false, mode, ""); err != nil {
+		return mapBatchStateError(err)
+	}
+	if err := s.deps.Versions.MarkPaused(ctx, batch.VersionID, false, string(mode), "", actor); err != nil {
+		// Best-effort rollback so a failed mirror write leaves the pair paused
+		// together and the operator can retry the cancel.
+		_, _ = s.deps.Batches.SetPaused(ctx, batch.ID, true, mode, batch.PauseReason)
+		return err
+	}
+	return nil
+}
+
 // Rerun creates the next attempt of a terminal case run (spec §5.8): the
-// snapshot, revision and hash are copied unchanged, attempt is incremented and
+// snapshot, revision and hash are copied unchanged into an independent deep copy
+// (the scenario maps included), attempt is incremented and
 // retry_of_case_run_id points at the run being retried. A non-terminal run is
 // case_run_terminal.
+//
+// It deliberately publishes no event: the new attempt is pending and the
+// scheduler owns run.started, which it emits when it dispatches the attempt
+// (spec §5.10). Emitting here would duplicate the event for one dispatch.
 func (s *BatchService) Rerun(ctx context.Context, versionID, batchID, caseRunID, actor int64) (*domain.CaseRun, error) {
 	if s.deps.Batches == nil || s.deps.CaseRuns == nil {
 		return nil, errors.New("execution: rerun dependencies are not configured")
@@ -514,6 +576,21 @@ func (s *BatchService) requireCreateDeps() error {
 	return nil
 }
 
+// releaseBatchNo compensates an allocated batch number after the batch insert
+// failed. The version adapter only rolls the number back while it is still the
+// newest one, so a concurrent creator's allocation is never lost. Compensation
+// is best effort: numbers are monotonic rather than gapless, so a failed release
+// costs at most a skipped number and must not mask the original create error.
+func (s *BatchService) releaseBatchNo(ctx context.Context, versionID int64, allocated int) {
+	if err := s.deps.Versions.ReleaseBatchNo(ctx, versionID, allocated); err != nil {
+		slog.WarnContext(ctx, "execution: release batch_no after a failed create",
+			"version_id", versionID,
+			"batch_no", allocated,
+			"error", err,
+		)
+	}
+}
+
 // publish emits one event after the committed write. Publication failures are
 // logged and swallowed: the API is authoritative and the stream self-heals.
 func (s *BatchService) publish(ctx context.Context, event Event) {
@@ -596,14 +673,52 @@ func snapshotFromView(view CaseSnapshotSourceView, capturedAt time.Time) domain.
 	}
 }
 
-// cloneSnapshot copies a snapshot including its slices so a rerun cannot share
-// mutable state with the original attempt.
+// cloneSnapshot copies a snapshot including its slices and the scenario maps
+// (node test_data and each step's data) so a rerun cannot share mutable state
+// with the original attempt.
 func cloneSnapshot(snapshot domain.CaseSnapshot) domain.CaseSnapshot {
 	cloned := snapshot
-	cloned.Steps = append([]domain.CaseSnapshotStep(nil), snapshot.Steps...)
+	cloned.Node.TestData = cloneAnyMap(snapshot.Node.TestData)
+	if snapshot.Steps != nil {
+		cloned.Steps = make([]domain.CaseSnapshotStep, len(snapshot.Steps))
+		for i, step := range snapshot.Steps {
+			cloned.Steps[i] = step
+			cloned.Steps[i].Data = cloneAnyMap(step.Data)
+		}
+	}
 	cloned.Assertions = append([]domain.CaseSnapshotAssertion(nil), snapshot.Assertions...)
 	cloned.Sources = append([]domain.CaseSnapshotSource(nil), snapshot.Sources...)
 	return cloned
+}
+
+// cloneAnyMap deep-copies a JSON-shaped map: nested maps and slices are rebuilt
+// so no mutation can cross between the original and the copy.
+func cloneAnyMap(source map[string]any) map[string]any {
+	if source == nil {
+		return nil
+	}
+	cloned := make(map[string]any, len(source))
+	for key, value := range source {
+		cloned[key] = cloneAnyValue(value)
+	}
+	return cloned
+}
+
+// cloneAnyValue deep-copies the container values a JSON-decoded scenario can
+// hold; scalars are immutable and are returned as is.
+func cloneAnyValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		return cloneAnyMap(typed)
+	case []any:
+		cloned := make([]any, len(typed))
+		for i, item := range typed {
+			cloned[i] = cloneAnyValue(item)
+		}
+		return cloned
+	default:
+		return value
+	}
 }
 
 // copyStringPointer copies an optional string so callers cannot mutate the
