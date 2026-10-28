@@ -15,10 +15,11 @@ import (
 )
 
 // runColumnList is the shared column order of every case_design_run query and
-// the order scanRun expects.
+// the order scanRun expects. batch_id is the P7 parent-batch link of
+// supplement/incremental_design runs (NULL for the legacy kinds).
 const runColumnList = `id, version_id, kind, status, agent_session_id, agent_run_id,
 	model, prompt_version, input, result, stats, errors, created_by,
-	created_at, updated_at, started_at, finished_at`
+	created_at, updated_at, started_at, finished_at, batch_id`
 
 // activeRunStatuses is the single-flight status set of
 // uk_case_design_run_active (spec §6.6).
@@ -83,6 +84,7 @@ func scanRun(row rowScanner) (domain.CaseDesignRun, error) {
 		&run.UpdatedAt,
 		&run.StartedAt,
 		&run.FinishedAt,
+		&run.BatchID,
 	); err != nil {
 		return domain.CaseDesignRun{}, err
 	}
@@ -100,9 +102,9 @@ func (r *RunRepository) Create(ctx context.Context, run domain.CaseDesignRun) (d
 	const query = `INSERT INTO case_design_run
 		(id, version_id, kind, status, agent_session_id, agent_run_id, model,
 		 prompt_version, input, result, stats, errors, created_by, created_at,
-		 updated_at, started_at, finished_at)
+		 updated_at, started_at, finished_at, batch_id)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb,
-		        $11::jsonb, $12::jsonb, $13, $14, $15, $16, $17)
+		        $11::jsonb, $12::jsonb, $13, $14, $15, $16, $17, $18)
 		RETURNING ` + runColumnList
 	created, err := scanRun(r.q.QueryRow(ctx, query,
 		run.ID, run.VersionID, run.Kind, run.Status,
@@ -110,7 +112,7 @@ func (r *RunRepository) Create(ctx context.Context, run domain.CaseDesignRun) (d
 		run.PromptVersion, jsonParam(run.Input), jsonParam(run.Result),
 		jsonParam(run.Stats), jsonParam(run.Errors), run.CreatedBy,
 		run.CreatedAt, run.UpdatedAt, nullableTime(run.StartedAt),
-		nullableTime(run.FinishedAt),
+		nullableTime(run.FinishedAt), nullableInt(run.BatchID),
 	))
 	if err != nil {
 		switch uniqueConstraint(err) {

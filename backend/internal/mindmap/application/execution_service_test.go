@@ -301,6 +301,38 @@ func TestExecutionSnapshotCasePayload(t *testing.T) {
 	}
 }
 
+// TestExecutionSnapshotCaseOriginAndStatus covers the P7 provenance fields the
+// execution context's snapshot gates read (spec §5.2/§5.3): Origin is the
+// normalized baseline|ai_supplement provenance of the case_node source and
+// Status is the live node status.
+func TestExecutionSnapshotCaseOriginAndStatus(t *testing.T) {
+	ctx := context.Background()
+	fixture, baselines := newExecutionFixture()
+	seedExecutionCase(fixture, 2000, domain.NodeStatusReviewed)
+	seedSupplementExecutionCase(fixture, 3000, domain.NodeStatusSupplemented)
+	service := executionServiceFor(fixture, baselines)
+
+	cases, err := service.SnapshotCases(ctx, runTestVersionID, nil)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if len(cases) != 2 {
+		t.Fatalf("snapshots = %d, want 2", len(cases))
+	}
+	if cases[0].Origin != domain.ExecutionOriginBaseline {
+		t.Fatalf("baseline case origin = %q, want %q", cases[0].Origin, domain.ExecutionOriginBaseline)
+	}
+	if cases[0].Status != domain.NodeStatusReviewed {
+		t.Fatalf("baseline case status = %q, want %q", cases[0].Status, domain.NodeStatusReviewed)
+	}
+	if cases[1].Origin != domain.ExecutionOriginAISupplement {
+		t.Fatalf("supplement case origin = %q, want %q", cases[1].Origin, domain.ExecutionOriginAISupplement)
+	}
+	if cases[1].Status != domain.NodeStatusSupplemented {
+		t.Fatalf("supplement case status = %q, want %q", cases[1].Status, domain.NodeStatusSupplemented)
+	}
+}
+
 // TestExecutionSnapshotCasesRejectsForeignAndNonCaseIDs covers the snapshot
 // selection validation: an id outside the version baseline or a scenario id is
 // invalid_case_ids, and an unfrozen version is baseline_required.
@@ -422,16 +454,16 @@ func TestMarkExecutedIsIdempotent(t *testing.T) {
 	}
 }
 
-// TestMarkExecutedRejectsOtherStatuses covers the reviewed-only guard: every
-// other node status is a 409 and writes nothing.
+// TestMarkExecutedRejectsOtherStatuses covers the P7 matrix guard: statuses the
+// spec matrix does not allow to become executed are a 409 and write nothing.
+// merged and needs_revalidation are the P7 additions and are covered by
+// TestMarkExecutedAcceptsMergedAndNeedsRevalidation.
 func TestMarkExecutedRejectsOtherStatuses(t *testing.T) {
 	ctx := context.Background()
 	for _, status := range []string{
 		domain.NodeStatusDraft,
 		domain.NodeStatusSupplemented,
-		domain.NodeStatusMerged,
 		domain.NodeStatusRejected,
-		domain.NodeStatusNeedsRevalidation,
 	} {
 		t.Run(status, func(t *testing.T) {
 			fixture, baselines := newExecutionFixture()

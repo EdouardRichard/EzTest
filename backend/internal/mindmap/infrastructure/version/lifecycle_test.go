@@ -62,6 +62,47 @@ func (f *fakeVersionService) ApproveBaseline(_ context.Context, id, actor int64)
 	return f.result("ApproveBaseline", id, actor)
 }
 
+// TestLifecycleAdapterReadsContinuePhase covers the optional P7
+// ContinuePhaseReader the incremental_design gate and the incremental plan
+// assert: the adapter returns version.continue_phase (empty when the version
+// has none) and maps version errors.
+func TestLifecycleAdapterReadsContinuePhase(t *testing.T) {
+	ctx := context.Background()
+	service := &fakeVersionService{version: &versionapp.Version{
+		ID:            7,
+		Status:        versiondomain.VersionContinuing,
+		ContinuePhase: versiondomain.ContinuePhaseDesigning,
+	}}
+	adapter := mindmapversion.NewLifecycleAdapter(service)
+	var _ mindmapapp.ContinuePhaseReader = adapter
+
+	phase, err := adapter.ContinuePhase(ctx, 7)
+	if err != nil {
+		t.Fatalf("ContinuePhase: %v", err)
+	}
+	if phase != versiondomain.ContinuePhaseDesigning {
+		t.Fatalf("phase = %q, want %q", phase, versiondomain.ContinuePhaseDesigning)
+	}
+	if service.versionID != 7 {
+		t.Fatalf("version service received id %d want 7", service.versionID)
+	}
+
+	// A version without a continue phase (executing/completed) has an empty
+	// phase rather than an error.
+	service.version = &versionapp.Version{ID: 7, Status: versiondomain.VersionExecuting}
+	phase, err = adapter.ContinuePhase(ctx, 7)
+	if err != nil || phase != "" {
+		t.Fatalf("phase/error = %q/%v, want empty/nil", phase, err)
+	}
+
+	service.err = versiondomain.NewNotFound("version", 7)
+	_, err = adapter.ContinuePhase(ctx, 7)
+	var mapped *mindmapdomain.Error
+	if !errors.As(err, &mapped) || mapped.Kind != mindmapdomain.KindNotFound {
+		t.Fatalf("ContinuePhase error=%v want a not_found mindmap error", err)
+	}
+}
+
 // TestLifecycleAdapterMapsVersionSnapshot pins every field of the mindmap
 // VersionSnapshot projection, including the optional resource bindings and the
 // code baseline commit.

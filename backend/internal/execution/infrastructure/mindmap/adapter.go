@@ -29,6 +29,8 @@ type Service interface {
 	Baseline(ctx context.Context, versionID int64) (mindmapdomain.ExecutionBaseline, error)
 	SnapshotCases(ctx context.Context, versionID int64, caseIDs []int64) ([]mindmapdomain.ExecutionCase, error)
 	MarkExecuted(ctx context.Context, versionID int64, caseIDs []int64) error
+	// MarkMerged adopts the supplement nodes selected by a P7 batch (spec §5.3).
+	MarkMerged(ctx context.Context, versionID int64, caseIDs []int64) error
 }
 
 // Adapter implements application.MindmapPort over the mindmap execution
@@ -43,6 +45,10 @@ func New(service Service) *Adapter {
 }
 
 var _ executionapp.MindmapPort = (*Adapter)(nil)
+
+// The P7 batch service asserts the optional supplement write surface so it can
+// fail closed before persisting a batch that selects supplement nodes.
+var _ executionapp.SupplementGraphPort = (*Adapter)(nil)
 
 // The production mindmap execution service must keep satisfying the adapter
 // contract; a signature drift fails the build here.
@@ -100,6 +106,19 @@ func (a *Adapter) MarkExecuted(ctx context.Context, versionID int64, caseNodeIDs
 	return mapMindmapError(a.service.MarkExecuted(ctx, versionID, caseNodeIDs))
 }
 
+// MarkMerged adopts the supplement case nodes selected by an incremental or
+// supplement batch (spec §5.3): the mindmap service moves supplemented → merged
+// and is idempotent for already merged nodes. An empty list is a no-op.
+func (a *Adapter) MarkMerged(ctx context.Context, versionID int64, caseNodeIDs []int64) error {
+	if a == nil || a.service == nil {
+		return errNotConfigured
+	}
+	if len(caseNodeIDs) == 0 {
+		return nil
+	}
+	return mapMindmapError(a.service.MarkMerged(ctx, versionID, caseNodeIDs))
+}
+
 // mapExecutionCase projects one mindmap ExecutionCase onto the source view.
 func mapExecutionCase(executionCase mindmapdomain.ExecutionCase) (executionapp.CaseSnapshotSourceView, error) {
 	testData, err := decodeRawObject(executionCase.TestData)
@@ -142,6 +161,10 @@ func mapExecutionCase(executionCase mindmapdomain.ExecutionCase) (executionapp.C
 		CaseNodeID: executionCase.NodeID,
 		Revision:   executionCase.Revision,
 		GraphHash:  executionCase.GraphHash,
+		// Origin is the P7 provenance gate input; an empty or non-supplement
+		// origin reads as baseline (P6 snapshots have no origin).
+		Origin: executiondomain.ParseCaseSource(executionCase.Origin),
+		Status: executionCase.Status,
 		Node: executiondomain.CaseSnapshotNode{
 			ID:            executionCase.NodeID,
 			Title:         executionCase.Title,

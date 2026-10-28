@@ -16,12 +16,14 @@ func ptr[T any](value T) *T { return &value }
 
 // fakeExecutionService is the mindmap execution projection the adapter consumes.
 type fakeExecutionService struct {
-	baseline    mindmapdomain.ExecutionBaseline
-	baselineErr error
-	cases       []mindmapdomain.ExecutionCase
-	snapshotErr error
-	markErr     error
-	markCalls   [][]int64
+	baseline        mindmapdomain.ExecutionBaseline
+	baselineErr     error
+	cases           []mindmapdomain.ExecutionCase
+	snapshotErr     error
+	markErr         error
+	markCalls       [][]int64
+	markMergedErr   error
+	markMergedCalls [][]int64
 }
 
 func (f *fakeExecutionService) Baseline(context.Context, int64) (mindmapdomain.ExecutionBaseline, error) {
@@ -35,6 +37,11 @@ func (f *fakeExecutionService) SnapshotCases(context.Context, int64, []int64) ([
 func (f *fakeExecutionService) MarkExecuted(_ context.Context, _ int64, caseIDs []int64) error {
 	f.markCalls = append(f.markCalls, append([]int64(nil), caseIDs...))
 	return f.markErr
+}
+
+func (f *fakeExecutionService) MarkMerged(_ context.Context, _ int64, caseIDs []int64) error {
+	f.markMergedCalls = append(f.markMergedCalls, append([]int64(nil), caseIDs...))
+	return f.markMergedErr
 }
 
 func seededExecutionCase() mindmapdomain.ExecutionCase {
@@ -56,6 +63,8 @@ func seededExecutionCase() mindmapdomain.ExecutionCase {
 		},
 		RequirementIDs: []int64{9, 3, 9},
 		GraphHash:      "graph-hash",
+		Origin:         mindmapdomain.ExecutionOriginAISupplement,
+		Status:         mindmapdomain.NodeStatusSupplemented,
 	}
 }
 
@@ -106,6 +115,13 @@ func TestSnapshotCasesMapsExecutionCase(t *testing.T) {
 	view := views[0]
 	if view.CaseNodeID != 101 || view.Revision != 4 || view.GraphHash != "graph-hash" {
 		t.Fatalf("view identity = %+v", view)
+	}
+	// The P7 gates read the provenance and the live node status from the view.
+	if view.Origin != executiondomain.CaseSourceAISupplement {
+		t.Fatalf("view origin = %q, want %q", view.Origin, executiondomain.CaseSourceAISupplement)
+	}
+	if view.Status != mindmapdomain.NodeStatusSupplemented {
+		t.Fatalf("view status = %q, want %q", view.Status, mindmapdomain.NodeStatusSupplemented)
 	}
 	if view.Node.ID != 101 || view.Node.Title != "Checkout" || view.Node.Priority != "P1" ||
 		view.Node.Preconditions != "signed in" {
@@ -189,6 +205,47 @@ func TestMarkExecutedMapsStatusConflict(t *testing.T) {
 	}
 }
 
+// TestMarkMergedForwardsAndSkipsEmpty covers the optional P7 SupplementGraphPort
+// (spec §5.3): an adopted supplement batch marks its cases merged, and an empty
+// selection never calls the mindmap service.
+func TestMarkMergedForwardsAndSkipsEmpty(t *testing.T) {
+	service := &fakeExecutionService{}
+	adapter := New(service)
+	ctx := context.Background()
+
+	if err := adapter.MarkMerged(ctx, 7, []int64{101, 102}); err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.MarkMerged(ctx, 7, []int64{101, 102}); err != nil {
+		t.Fatal(err)
+	}
+	if len(service.markMergedCalls) != 2 ||
+		!reflect.DeepEqual(service.markMergedCalls[0], []int64{101, 102}) ||
+		!reflect.DeepEqual(service.markMergedCalls[1], []int64{101, 102}) {
+		t.Fatalf("mark merged calls = %v", service.markMergedCalls)
+	}
+
+	service.markMergedCalls = nil
+	if err := adapter.MarkMerged(ctx, 7, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(service.markMergedCalls) != 0 {
+		t.Fatalf("empty mark merged must not call the service: %v", service.markMergedCalls)
+	}
+}
+
+func TestMarkMergedMapsStatusConflict(t *testing.T) {
+	service := &fakeExecutionService{
+		markMergedErr: mindmapdomain.NewStateConflict("case_status_conflict", "case is reviewed"),
+	}
+	err := New(service).MarkMerged(context.Background(), 7, []int64{101})
+
+	var reasonErr *executiondomain.ReasonError
+	if !errors.As(err, &reasonErr) || reasonErr.Code != "case_status_conflict" {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestAdapterRejectsNilService(t *testing.T) {
 	adapter := New(nil)
 	if _, err := adapter.Baseline(context.Background(), 7); err == nil {
@@ -200,6 +257,10 @@ func TestAdapterRejectsNilService(t *testing.T) {
 	if err := adapter.MarkExecuted(context.Background(), 7, []int64{1}); err == nil {
 		t.Fatal("MarkExecuted with a nil service = nil error")
 	}
+	if err := adapter.MarkMerged(context.Background(), 7, []int64{1}); err == nil {
+		t.Fatal("MarkMerged with a nil service = nil error")
+	}
 }
 
 var _ executionapp.MindmapPort = (*Adapter)(nil)
+var _ executionapp.SupplementGraphPort = (*Adapter)(nil)

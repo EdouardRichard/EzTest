@@ -56,11 +56,15 @@ type GraphDeps struct {
 	Baselines    BaselineRepository
 	Versions     VersionLifecycle
 	Requirements RequirementReader
-	Anchors      CodeAnchorGateway
-	Events       EventPublisher
-	IDs          IDGenerator
-	Clock        Clock
-	Logger       *slog.Logger
+	// Batches is the optional P7 execution-batch reader used by the incremental
+	// plan to validate the parent batch (spec §7.6). A nil reader degrades the
+	// check with the batch_precondition_unavailable warning.
+	Batches SupplementBatchReader
+	Anchors CodeAnchorGateway
+	Events  EventPublisher
+	IDs     IDGenerator
+	Clock   Clock
+	Logger  *slog.Logger
 }
 
 // GraphNode is one node of the mindmap with its child collections attached.

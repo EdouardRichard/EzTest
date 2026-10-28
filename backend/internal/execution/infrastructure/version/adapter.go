@@ -28,6 +28,8 @@ type Service interface {
 	MarkPaused(ctx context.Context, id int64, paused bool, mode, reason string, actor int64) (*versionapp.Version, error)
 	SetBatchNo(ctx context.Context, id int64, batchNo int, actor int64) (*versionapp.Version, error)
 	CompleteExecution(ctx context.Context, id int64, actor int64) (*versionapp.Version, error)
+	// SetContinuePhase records the P7 continuing phase (spec §5.1).
+	SetContinuePhase(ctx context.Context, id int64, phase string) error
 }
 
 // batchNoAllocator is the optional native allocate/release surface. The current
@@ -57,6 +59,10 @@ func New(versions Service) *Adapter {
 
 var _ executionapp.VersionPort = (*Adapter)(nil)
 
+// The P7 batch service asserts the optional continue-phase write surface after
+// an incremental batch commits; without it the phase would stay designing.
+var _ executionapp.ContinuePhasePort = (*Adapter)(nil)
+
 // The production version service must keep satisfying the adapter contract; a
 // signature drift fails the build here rather than at the composition root.
 var _ Service = (*versionapp.VersionService)(nil)
@@ -76,6 +82,7 @@ func (a *Adapter) GetVersion(ctx context.Context, versionID int64) (executionapp
 		Status:             version.Status,
 		Paused:             version.Paused,
 		PauseMode:          version.PauseMode,
+		ContinuePhase:      version.ContinuePhase,
 		BatchNo:            version.BatchNo,
 		SystemID:           copyInt64(version.SystemID),
 		EnvironmentID:      copyInt64(version.EnvironmentID),
@@ -100,6 +107,16 @@ func (a *Adapter) SetBatchNo(ctx context.Context, versionID int64, batchNo int, 
 	}
 	_, err := a.versions.SetBatchNo(ctx, versionID, batchNo, actor)
 	return mapVersionError(err)
+}
+
+// SetContinuePhase records the phase of a continuing version. The version
+// service enforces the continuing-only write; execution updates it only after
+// an incremental batch committed (spec §5.1/§5.3).
+func (a *Adapter) SetContinuePhase(ctx context.Context, versionID int64, phase string) error {
+	if a == nil || a.versions == nil {
+		return errNotConfigured
+	}
+	return mapVersionError(a.versions.SetContinuePhase(ctx, versionID, phase))
 }
 
 // AllocateBatchNo returns the version's next batch number and records it before

@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/mindmap/domain"
 )
@@ -65,6 +67,12 @@ func (f *flexID) UnmarshalJSON(data []byte) error {
 
 // Int64 returns the decoded id.
 func (f flexID) Int64() int64 { return int64(f) }
+
+// MarshalJSON encodes the id as a decimal JSON string, so run result documents
+// keep the D29 boundary convention even though the domain uses int64.
+func (f flexID) MarshalJSON() ([]byte, error) {
+	return json.Marshal(strconv.FormatInt(int64(f), 10))
+}
 
 // agentDesignProposal is the case.graph_propose payload of spec §6.7.
 type agentDesignProposal struct {
@@ -145,12 +153,14 @@ type agentDataPlanItem struct {
 }
 
 // runStoredInput is the persisted start command read back during materialization; it
-// carries the explicit replace confirmation of spec §6.7 rule 6.
+// carries the explicit replace confirmation of spec §6.7 rule 6 and the P7
+// parent batch id of the supplement/incremental_design runs (spec §7.6).
 type runStoredInput struct {
 	Kind           string  `json:"kind"`
 	Mode           string  `json:"mode"`
 	ConfirmReplace bool    `json:"confirmReplace"`
 	NodeIDs        []int64 `json:"nodeIds"`
+	BatchID        flexID  `json:"batchId"`
 }
 
 // runParseInput decodes a stored run input, tolerating an empty document.
@@ -195,6 +205,8 @@ func (s *RunService) materializeRun(ctx context.Context, run domain.CaseDesignRu
 	case domain.RunKindExplore:
 		// Explore runs are materialized by the exploration service (T13).
 		return nil
+	case RunKindSupplement, RunKindIncrementalDesign:
+		return s.materializeSupplement(ctx, run)
 	default:
 		return s.rejectRun(ctx, run, "invalid_run_kind", []string{fmt.Sprintf("run %d has unknown kind %q", run.ID, run.Kind)})
 	}
@@ -214,7 +226,7 @@ func (s *RunService) rejectRun(ctx context.Context, run domain.CaseDesignRun, re
 	}
 	message := strings.Join(messages, "; ")
 	switch reason {
-	case "baseline_frozen":
+	case "baseline_frozen", "baseline_required", "version_state_conflict":
 		return domain.NewStateConflict(reason, message)
 	case "graph_too_large":
 		return domain.NewConflict(reason, message)
@@ -1196,7 +1208,7 @@ func (s *RunService) publishCaseCreated(ctx context.Context, run domain.CaseDesi
 		Summary:    fmt.Sprintf("case %q created", title),
 		RefCaseIDs: []int64{node.ID},
 		ActorID:    run.CreatedBy,
-		Source:     domain.NodeSourceAIGenerated,
+		Source:     node.Source,
 		Detail: map[string]any{
 			"nodeId": node.ID,
 			"kind":   node.Kind,
@@ -1261,7 +1273,6 @@ func (s *RunService) publishGatePending(ctx context.Context, run domain.CaseDesi
 	})
 }
 
-
 // normalizeOneBasedStepIndexes rewrites a proposal that used 1-based step
 // indexes into the 0-based form the domain expects. It only fires when the
 // mapping is unambiguous (all indexes within [1,len] and at least one equals
@@ -1293,4 +1304,563 @@ func normalizeOneBasedStepIndexes(steps []agentDesignStep, assertions []agentDes
 		adjusted := *assertions[i].StepIndex - 1
 		assertions[i].StepIndex = &adjusted
 	}
+}
+
+// supplementRunResultDocument is the materialized run.result shape of the P7
+// supplement/incremental_design runs: validated counts, the affected list (spec
+// §6.4.4 stores it in run.result), the escalations kept for T16 and the
+// warnings. It replaces the raw agent proposal after a successful run.
+type supplementRunResultDocument struct {
+	Materialized     bool                       `json:"materialized"`
+	NewCaseIDs       []flexID                   `json:"newCaseIds"`
+	DuplicateSkipped int                        `json:"duplicateSkipped"`
+	AffectedCases    []supplementAffectedRecord `json:"affectedCases"`
+	Escalations      []supplementEscalation     `json:"escalations"`
+	ImpactAvailable  bool                       `json:"impactAvailable"`
+	// UnmappedChanges is nil (and thus omitted) when the agent run carried no P4
+	// result; an explicit empty array means P4 ran and found no unmapped changes.
+	// The plan relies on this distinction for its impact_unavailable warning.
+	UnmappedChanges *[]supplementUnmappedChange `json:"unmappedChanges,omitempty"`
+	Warnings        []IncrementalPlanWarning    `json:"warnings,omitempty"`
+	Summary         string                      `json:"summary,omitempty"`
+	Degraded        bool                        `json:"degraded"`
+}
+
+// supplementAffectedRecord is one validated affected-case entry stored in the
+// run result and read back by the incremental plan.
+type supplementAffectedRecord struct {
+	NodeID         flexID   `json:"nodeId"`
+	Confidence     string   `json:"confidence"`
+	Reason         string   `json:"reason"`
+	Source         string   `json:"source"`
+	RequirementIDs []flexID `json:"requirementIds,omitempty"`
+}
+
+// affectedTransition is one committed needs_revalidation transition awaiting its
+// post-commit events. The proposal confidence/source/refs are carried along for
+// the spec §8.1 case.revalidation_marked payload.
+type affectedTransition struct {
+	node           domain.CaseNode
+	from           string
+	confidence     string
+	source         string
+	requirementIDs []int64
+	codeRefs       []string
+}
+
+// materializeSupplement materializes a supplement/incremental_design run (spec
+// §6.4): append-only new ai_supplement cases, high/medium affected cases marked
+// needs_revalidation, requirement-gap escalations stored for T16, and warnings
+// for every skipped item. Duplicates and invalid proposals never fail the run.
+func (s *RunService) materializeSupplement(ctx context.Context, run domain.CaseDesignRun) error {
+	if err := s.requireSupplementMaterializableVersion(ctx, run); err != nil {
+		return err
+	}
+	if len(bytes.TrimSpace(run.Result)) > materializeMaxPayloadBytes {
+		return s.rejectRun(ctx, run, "invalid_case_proposal",
+			[]string{fmt.Sprintf("supplement payload is %d bytes; the limit is %d", len(run.Result), materializeMaxPayloadBytes)})
+	}
+	if s.deps.Graph == nil || s.deps.Nodes == nil || s.deps.Steps == nil ||
+		s.deps.Assertions == nil || s.deps.Sources == nil {
+		return errors.New("mindmap: graph ports are not configured for supplement materialization")
+	}
+	requirements, err := s.confirmedRequirements(ctx, run.VersionID)
+	if err != nil {
+		return err
+	}
+	confirmed := make(map[int64]struct{}, len(requirements))
+	for _, requirement := range requirements {
+		confirmed[requirement.ID] = struct{}{}
+	}
+
+	submission, parseErr := parseSupplementSubmission(run.Result)
+	warnings := make([]IncrementalPlanWarning, 0, 4)
+	if parseErr != nil {
+		warnings = append(warnings, IncrementalPlanWarning{
+			Code:    planWarningInvalidResult,
+			Message: "the supplement payload is not valid JSON and was ignored",
+		})
+	}
+	escalations := validateSupplementEscalations(submission.Escalations, confirmed, &warnings)
+	impactAvailable := supplementImpactAvailable(run.Result)
+
+	now := s.now()
+	var (
+		materialized             []domain.CaseNode
+		materializedRequirements = make(map[int64]int)
+		duplicateSkipped         int
+		affectedRecords          []supplementAffectedRecord
+		affectedMarked           []affectedTransition
+		affectedLimitReached     bool
+	)
+	err = s.deps.Graph.InTx(ctx, func(tx GraphTx) error {
+		if tx.Nodes() == nil || tx.Steps() == nil || tx.Assertions() == nil ||
+			tx.Sources() == nil || tx.Runs() == nil || tx.Baselines() == nil {
+			return errors.New("mindmap: graph transaction repositories are not configured")
+		}
+		// Re-check inside the transaction: a finalize that committed after the
+		// pre-check must not receive materialized rows.
+		baseline, err := loadBaseline(ctx, tx.Baselines(), run.VersionID)
+		if err != nil {
+			return err
+		}
+		if baseline == nil {
+			return supplementBaselineRequiredError(run.VersionID)
+		}
+		version, err := s.deps.Versions.GetVersion(ctx, run.VersionID)
+		if err != nil {
+			return err
+		}
+		if err := supplementVersionWritable(version); err != nil {
+			return err
+		}
+		state, err := loadGraphStateTx(ctx, tx, run.VersionID)
+		if err != nil {
+			return err
+		}
+		writer := newSupplementGraphWriter(run.VersionID, run.CreatedBy, now, s.deps.IDs, &state)
+		for index, proposal := range submission.Cases {
+			if len(materialized) >= supplementMaxCases {
+				warnings = append(warnings, IncrementalPlanWarning{
+					Code:    "case_limit_reached",
+					Message: fmt.Sprintf("the run may add at most %d cases; the rest was skipped", supplementMaxCases),
+				})
+				break
+			}
+			command := supplementCommandFromProposal(run.ID, proposal)
+			prepared, err := prepareSupplementNode(run.VersionID, command, confirmed)
+			if err != nil {
+				warnings = append(warnings, IncrementalPlanWarning{
+					Code:    "invalid_case",
+					Message: fmt.Sprintf("cases[%d] was skipped: %v", index, err),
+				})
+				continue
+			}
+			node, err := writer.append(prepared, run.ID)
+			if err != nil {
+				var domainErr *domain.Error
+				if errors.As(err, &domainErr) && domainErr.Reason == "duplicate_supplement" {
+					duplicateSkipped++
+					warnings = append(warnings, IncrementalPlanWarning{
+						Code:    "duplicate_case",
+						Message: fmt.Sprintf("cases[%d] duplicates an existing case and was skipped", index),
+					})
+					continue
+				}
+				return err
+			}
+			materialized = append(materialized, node)
+			materializedRequirements[node.ID] = len(prepared.requirementIDs)
+		}
+		for _, node := range writer.nodes {
+			if _, err := tx.Nodes().Create(ctx, node); err != nil {
+				return err
+			}
+		}
+		for _, step := range writer.steps {
+			if _, err := tx.Steps().Create(ctx, step); err != nil {
+				return err
+			}
+		}
+		for _, assertion := range writer.assertions {
+			if _, err := tx.Assertions().Create(ctx, assertion); err != nil {
+				return err
+			}
+		}
+		for _, source := range writer.sources {
+			if _, err := tx.Sources().Create(ctx, source); err != nil {
+				return err
+			}
+		}
+		if run.Kind == RunKindIncrementalDesign {
+			records, transitions, affectedWarnings, limitReached, err := applySupplementAffectedCases(
+				ctx, tx, &state, submission.AffectedCases, confirmed, now, run.CreatedBy)
+			if err != nil {
+				return err
+			}
+			affectedRecords = records
+			affectedMarked = transitions
+			affectedLimitReached = limitReached
+			warnings = append(warnings, affectedWarnings...)
+		}
+		sort.Slice(materialized, func(i, j int) bool { return materialized[i].ID < materialized[j].ID })
+		sort.Slice(affectedMarked, func(i, j int) bool { return affectedMarked[i].node.ID < affectedMarked[j].node.ID })
+		document := supplementRunResultDocument{
+			Materialized:     true,
+			NewCaseIDs:       make([]flexID, 0, len(materialized)),
+			DuplicateSkipped: duplicateSkipped,
+			AffectedCases:    affectedRecords,
+			Escalations:      escalations,
+			ImpactAvailable:  impactAvailable,
+			Warnings:         warnings,
+			Summary:          truncateRunes(strings.TrimSpace(submission.Summary), runMaxSummaryRunes),
+			Degraded:         submission.Degraded,
+		}
+		if impactAvailable {
+			// An explicit empty array means "P4 ran and found no unmapped
+			// changes"; the plan must not report impact_unavailable then. When the
+			// run carried no P4 result the field stays absent.
+			changes := submission.UnmappedChanges
+			if changes == nil {
+				changes = []supplementUnmappedChange{}
+			}
+			document.UnmappedChanges = &changes
+		}
+		for _, node := range materialized {
+			document.NewCaseIDs = append(document.NewCaseIDs, flexID(node.ID))
+		}
+		encoded, err := json.Marshal(document)
+		if err != nil {
+			return fmt.Errorf("mindmap: encode supplement run result: %w", err)
+		}
+		stats := map[string]any{
+			"materialized":         true,
+			"cases":                len(materialized),
+			"duplicateSkipped":     duplicateSkipped,
+			"affected":             len(affectedRecords),
+			"affectedMarked":       len(affectedMarked),
+			"affectedLimitReached": affectedLimitReached,
+			"escalations":          len(escalations),
+			"warnings":             len(warnings),
+		}
+		finished := s.now()
+		_, err = tx.Runs().UpdateStatus(ctx, run.ID, run.Status, domain.RunDone, RunPatch{
+			Result:     encoded,
+			Stats:      runMergeStats(run.Stats, stats),
+			FinishedAt: &finished,
+		})
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("mindmap: materialize supplement run %d: %w", run.ID, err)
+	}
+
+	for _, node := range materialized {
+		s.publishSupplementCaseCreated(ctx, run, node, materializedRequirements[node.ID])
+	}
+	for _, transition := range affectedMarked {
+		s.publishSupplementMarked(ctx, run, transition)
+	}
+	doneRun := run
+	doneRun.Status = domain.RunDone
+	s.publishRunEvent(ctx, doneRun, domain.EventCaseRunFinished, "", map[string]any{
+		"cases":          len(materialized),
+		"affectedMarked": len(affectedMarked),
+	})
+	return nil
+}
+
+// requireSupplementMaterializableVersion gates a supplement materialization: the
+// baseline must exist (the freeze exception precondition) and the version must
+// still be executing or continuing. A run that outlived the finalize is rejected
+// instead of writing into a completed version.
+func (s *RunService) requireSupplementMaterializableVersion(ctx context.Context, run domain.CaseDesignRun) error {
+	if s.deps.Versions == nil || s.deps.Baselines == nil {
+		return errors.New("mindmap: version ports are not configured for supplement materialization")
+	}
+	version, err := s.deps.Versions.GetVersion(ctx, run.VersionID)
+	if err != nil {
+		return fmt.Errorf("mindmap: read version %d for supplement materialization: %w", run.VersionID, err)
+	}
+	baseline, err := loadBaseline(ctx, s.deps.Baselines, run.VersionID)
+	if err != nil {
+		return fmt.Errorf("mindmap: read baseline of version %d for supplement materialization: %w", run.VersionID, err)
+	}
+	if baseline == nil {
+		return s.rejectRun(ctx, run, "baseline_required", []string{
+			fmt.Sprintf("version %d has no frozen baseline; supplement materialization requires one", run.VersionID),
+		})
+	}
+	switch version.Status {
+	case versionStatusExecuting, versionStatusContinuing:
+		return nil
+	default:
+		return s.rejectRun(ctx, run, "version_state_conflict", []string{
+			fmt.Sprintf("version %d is %s; supplement materialization needs executing or continuing", run.VersionID, version.Status),
+		})
+	}
+}
+
+// supplementCommandFromProposal converts one agent proposal into the append-only
+// write command. ID and structure validation happens in prepareSupplementNode.
+func supplementCommandFromProposal(runID int64, proposal supplementCaseProposal) SupplementNodeCommand {
+	requirementIDs := make([]int64, 0, len(proposal.RequirementIDs))
+	for _, requirementID := range proposal.RequirementIDs {
+		requirementIDs = append(requirementIDs, requirementID.Int64())
+	}
+	steps := make([]SupplementStep, 0, len(proposal.Steps))
+	for _, step := range proposal.Steps {
+		steps = append(steps, SupplementStep{Action: step.Action, Expected: step.Expected, Data: step.Data})
+	}
+	assertions := make([]SupplementAssertion, 0, len(proposal.Assertions))
+	for _, assertion := range proposal.Assertions {
+		assertions = append(assertions, SupplementAssertion{
+			StepIndex:  assertion.StepIndex,
+			Kind:       assertion.Kind,
+			Target:     assertion.Target,
+			Expression: assertion.Expression,
+			Expected:   assertion.Expected,
+		})
+	}
+	return SupplementNodeCommand{
+		Title:          proposal.Title,
+		Description:    proposal.Description,
+		Priority:       proposal.Priority,
+		Preconditions:  proposal.Preconditions,
+		TestData:       append([]byte(nil), proposal.TestData...),
+		RequirementIDs: requirementIDs,
+		Steps:          steps,
+		Assertions:     assertions,
+		Confidence:     proposal.Confidence,
+		RunID:          runID,
+	}
+}
+
+// validateSupplementEscalations bounds and validates the requirement-gap
+// escalations of spec §9.2. They are stored in run.result for T16; no delivery
+// write happens here.
+func validateSupplementEscalations(escalations []supplementEscalation, confirmed map[int64]struct{}, warnings *[]IncrementalPlanWarning) []supplementEscalation {
+	validated := make([]supplementEscalation, 0, len(escalations))
+	for _, escalation := range escalations {
+		if len(validated) >= supplementMaxEscalations {
+			*warnings = append(*warnings, IncrementalPlanWarning{
+				Code:    "escalation_limit_reached",
+				Message: fmt.Sprintf("at most %d requirement gaps are recorded per run", supplementMaxEscalations),
+			})
+			break
+		}
+		title := strings.TrimSpace(escalation.Title)
+		if title == "" {
+			*warnings = append(*warnings, IncrementalPlanWarning{
+				Code:    "invalid_escalation",
+				Message: "an escalation without a title was skipped",
+			})
+			continue
+		}
+		if len(escalation.RequirementIDs) == 0 {
+			// A requirement_gap issue needs at least one requirement ref (spec
+			// §5.4: refs of a requirement-gap issue must be requirements).
+			*warnings = append(*warnings, IncrementalPlanWarning{
+				Code:    "invalid_escalation",
+				Message: fmt.Sprintf("escalation %q references no requirement and was skipped", title),
+			})
+			continue
+		}
+		requirementIDs := make([]flexID, 0, len(escalation.RequirementIDs))
+		valid := true
+		for _, requirementID := range escalation.RequirementIDs {
+			if _, ok := confirmed[requirementID.Int64()]; !ok {
+				*warnings = append(*warnings, IncrementalPlanWarning{
+					Code:    "invalid_escalation",
+					Message: fmt.Sprintf("escalation %q references an unconfirmed requirement", title),
+				})
+				valid = false
+				break
+			}
+			requirementIDs = append(requirementIDs, requirementID)
+		}
+		if !valid {
+			continue
+		}
+		validated = append(validated, supplementEscalation{
+			Title:          title,
+			Detail:         escalation.Detail,
+			RequirementIDs: requirementIDs,
+		})
+	}
+	return validated
+}
+
+// applySupplementAffectedCases marks the high/medium confidence affected cases as
+// needs_revalidation (spec §5.8/§6.4.4) and caps the stored/processed proposals
+// at supplementMaxAffected. Low confidence only lands in the stored list; a node
+// that cannot transition, an unknown source or an unclarified requirement is
+// skipped with a warning.
+func applySupplementAffectedCases(
+	ctx context.Context,
+	tx GraphTx,
+	state *graphState,
+	proposals []supplementAffectedProposal,
+	confirmed map[int64]struct{},
+	now time.Time,
+	actor int64,
+) ([]supplementAffectedRecord, []affectedTransition, []IncrementalPlanWarning, bool, error) {
+	byID := make(map[int64]domain.CaseNode, len(state.nodes))
+	for _, node := range state.nodes {
+		byID[node.ID] = node
+	}
+	records := make([]supplementAffectedRecord, 0, len(proposals))
+	transitions := make([]affectedTransition, 0, len(proposals))
+	warnings := make([]IncrementalPlanWarning, 0)
+	seen := make(map[int64]struct{}, len(proposals))
+	limitReached := false
+	for index, proposal := range proposals {
+		if len(records) >= supplementMaxAffected {
+			// The cap is enforced server-side too: the agent tool cap is 20 but a
+			// non-conforming payload must not store/mark more (spec §6.4.5/§9.2).
+			warnings = append(warnings, IncrementalPlanWarning{
+				Code:    "affected_limit_reached",
+				Message: fmt.Sprintf("the run may propose at most %d affected cases; the rest was skipped", supplementMaxAffected),
+			})
+			limitReached = true
+			break
+		}
+		nodeID := proposal.nodeID()
+		if nodeID <= 0 {
+			warnings = append(warnings, IncrementalPlanWarning{
+				Code: "affected_case_invalid", Message: fmt.Sprintf("affectedCases[%d] has no case id", index),
+			})
+			continue
+		}
+		if _, duplicate := seen[nodeID]; duplicate {
+			continue
+		}
+		seen[nodeID] = struct{}{}
+		node, ok := byID[nodeID]
+		if !ok || node.Kind != domain.NodeKindCase {
+			warnings = append(warnings, IncrementalPlanWarning{
+				Code: "affected_case_invalid", Message: fmt.Sprintf("affected case %d is not a case of the version", nodeID),
+			})
+			continue
+		}
+		if !validConfidence(proposal.Confidence) {
+			warnings = append(warnings, IncrementalPlanWarning{
+				Code: "affected_case_invalid", Message: fmt.Sprintf("affected case %d has an invalid confidence", nodeID),
+			})
+			continue
+		}
+		if proposal.Source != "code" && proposal.Source != "requirement" {
+			warnings = append(warnings, IncrementalPlanWarning{
+				Code:    "affected_case_invalid",
+				Message: fmt.Sprintf("affected case %d has source %q; only code or requirement is accepted", nodeID, proposal.Source),
+			})
+			continue
+		}
+		record := supplementAffectedRecord{
+			NodeID:     flexID(nodeID),
+			Confidence: proposal.Confidence,
+			Reason:     proposal.Reason,
+			Source:     proposal.Source,
+		}
+		for _, requirementID := range proposal.RequirementIDs {
+			if _, ok := confirmed[requirementID.Int64()]; !ok {
+				warnings = append(warnings, IncrementalPlanWarning{
+					Code:    "affected_case_invalid",
+					Message: fmt.Sprintf("affected case %d references the unclarified requirement %d", nodeID, requirementID.Int64()),
+				})
+				continue
+			}
+			record.RequirementIDs = append(record.RequirementIDs, requirementID)
+		}
+		records = append(records, record)
+		if proposal.Confidence == domain.ConfidenceLow {
+			continue
+		}
+		if node.Status == domain.NodeStatusNeedsRevalidation {
+			// Already marked: idempotent, no second event.
+			continue
+		}
+		if !domain.CanTransitionNodeStatus(node.Status, domain.NodeStatusNeedsRevalidation) {
+			warnings = append(warnings, IncrementalPlanWarning{
+				Code:    "affected_case_skipped",
+				Message: fmt.Sprintf("affected case %d is %s and cannot be marked for revalidation", nodeID, node.Status),
+			})
+			continue
+		}
+		candidate := node
+		candidate.Status = domain.NodeStatusNeedsRevalidation
+		candidate.UpdatedBy = actor
+		candidate.UpdatedAt = now
+		updated, err := tx.Nodes().Update(ctx, candidate, node.Revision)
+		if err != nil {
+			var domainErr *domain.Error
+			if errors.As(err, &domainErr) && domainErr.Reason == "case_revision_conflict" {
+				warnings = append(warnings, IncrementalPlanWarning{
+					Code: "affected_case_skipped", Message: fmt.Sprintf("affected case %d changed concurrently", nodeID),
+				})
+				continue
+			}
+			return nil, nil, nil, false, err
+		}
+		byID[nodeID] = updated
+		transitions = append(transitions, affectedTransition{
+			node:           updated,
+			from:           node.Status,
+			confidence:     proposal.Confidence,
+			source:         proposal.Source,
+			requirementIDs: affectedRequirementIDs(record),
+			codeRefs:       proposal.codePaths(),
+		})
+	}
+	sort.Slice(records, func(i, j int) bool { return records[i].NodeID.Int64() < records[j].NodeID.Int64() })
+	return records, transitions, warnings, limitReached, nil
+}
+
+// affectedRequirementIDs converts the stored requirement refs into the int64
+// refs.requirement list of the revalidation event.
+func affectedRequirementIDs(record supplementAffectedRecord) []int64 {
+	ids := make([]int64, 0, len(record.RequirementIDs))
+	for _, requirementID := range record.RequirementIDs {
+		ids = append(ids, requirementID.Int64())
+	}
+	return ids
+}
+
+// publishSupplementCaseCreated emits case.created + case.supplemented for one
+// materialized supplement node (spec §6.4.4). The details follow §8.1/§8.2:
+// decimal-string ids, the source and the requirement count only.
+func (s *RunService) publishSupplementCaseCreated(ctx context.Context, run domain.CaseDesignRun, node domain.CaseNode, requirementCount int) {
+	s.publishCaseCreated(ctx, run, node)
+	s.publishEvent(ctx, Event{
+		VersionID:  run.VersionID,
+		Type:       domain.EventCaseSupplemented,
+		Summary:    fmt.Sprintf("case %q supplemented", truncateRunes(node.Title, maxEventTitleRunes)),
+		RefCaseIDs: []int64{node.ID},
+		ActorID:    run.CreatedBy,
+		Source:     node.Source,
+		Detail: map[string]any{
+			"nodeId":           strconv.FormatInt(node.ID, 10),
+			"source":           node.Source,
+			"runId":            strconv.FormatInt(run.ID, 10),
+			"requirementCount": requirementCount,
+		},
+	})
+}
+
+// publishSupplementMarked emits case.status_changed + case.revalidation_marked
+// for one affected case marked by the incremental design run. The revalidation
+// detail carries the spec §8.1 fields and its refs include the affected case's
+// requirements and code paths.
+func (s *RunService) publishSupplementMarked(ctx context.Context, run domain.CaseDesignRun, transition affectedTransition) {
+	node := transition.node
+	s.publishEvent(ctx, Event{
+		VersionID:  run.VersionID,
+		Type:       domain.EventCaseStatusChanged,
+		Summary:    fmt.Sprintf("case status changed %s -> %s", transition.from, domain.NodeStatusNeedsRevalidation),
+		RefCaseIDs: []int64{node.ID},
+		ActorID:    run.CreatedBy,
+		Source:     node.Source,
+		Detail: map[string]any{
+			"nodeId":   strconv.FormatInt(node.ID, 10),
+			"from":     transition.from,
+			"to":       domain.NodeStatusNeedsRevalidation,
+			"revision": node.Revision,
+		},
+	})
+	s.publishEvent(ctx, Event{
+		VersionID:         run.VersionID,
+		Type:              domain.EventCaseRevalidationMarked,
+		Summary:           "case marked for revalidation",
+		RefCaseIDs:        []int64{node.ID},
+		RefRequirementIDs: transition.requirementIDs,
+		RefCodeRefs:       transition.codeRefs,
+		ActorID:           run.CreatedBy,
+		Source:            node.Source,
+		Detail: map[string]any{
+			"nodeId":     strconv.FormatInt(node.ID, 10),
+			"confidence": transition.confidence,
+			"source":     transition.source,
+			"runId":      strconv.FormatInt(run.ID, 10),
+		},
+	})
 }

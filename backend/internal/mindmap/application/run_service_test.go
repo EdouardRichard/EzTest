@@ -37,8 +37,11 @@ type runFixture struct {
 	relations []application.RelationSnapshot
 	appModels []application.AppModelSnapshot
 	facts     []application.FactSummary
+	// batches is the optional P7 execution-batch reader of the run gates and the
+	// incremental plan; nil degrades the precondition checks with a warning.
+	batches       application.SupplementBatchReader
 	baselineFiles []string
-	files     map[string]bool
+	files         map[string]bool
 
 	anchors    []application.Anchor
 	anchorArgs []application.AnchorParams
@@ -104,6 +107,7 @@ func (f *runFixture) service() *application.RunService {
 		Assertions:   runAssertionRepo{f},
 		Sources:      runSourceRepo{f},
 		Versions:     runVersionLifecycle{f},
+		Batches:      f.batches,
 		Requirements: runRequirementReader{f},
 		Catalog:      runCatalogGateway{f},
 		CodeFacts:    runCodeFactsGateway{f},
