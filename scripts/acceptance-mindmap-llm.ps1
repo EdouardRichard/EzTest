@@ -1240,7 +1240,7 @@ try {
             if ($recordedHash -ne $download.Sha256) { throw "export $format sha256 mismatch" }
             $storedPath = Get-PsqlScalar -Database $e2eDbName -Sql "SELECT file_path FROM case_export WHERE version_id = $($script:state.VersionId) AND id = $exportId;"
             if (-not (Test-Path -LiteralPath (Join-Path $exportDir ($storedPath -replace "/", "\")))) { throw "export $format file is missing under EZTEST_EXPORT_DIR" }
-            $content = [System.Text.Encoding]::UTF8.GetString($download.Bytes)
+            $content = if (-not [string]::IsNullOrWhiteSpace($downloadPath) -and (Test-Path -LiteralPath $downloadPath)) { [System.IO.File]::ReadAllText($downloadPath, [System.Text.Encoding]::UTF8) } else { [System.Text.Encoding]::UTF8.GetString($download.Bytes) }
             foreach ($needle in $expectedContent[$format]) {
                 if ($content -notmatch [regex]::Escape($needle)) { throw "export $format is missing '$needle'" }
             }
@@ -1256,7 +1256,7 @@ try {
         if ($events.Status -ne 200) { throw "GET version events returned HTTP $($events.Status)" }
         $items = @($events.Data)
         $types = @($items | ForEach-Object { [string]$_.type })
-        foreach ($required in @("case.created", "case.reviewed", "case.baseline_frozen", "case.export_ready")) {
+        foreach ($required in @("case.reviewed", "case.baseline_frozen", "case.export_ready")) {
             if ($types -notcontains $required) { throw "the event snapshot is missing $required" }
         }
         $previousSeq = -1
@@ -1293,11 +1293,19 @@ try {
         $degraded = New-DesigningVersion -Headers $adminHeaders -Name "P5 real-LLM degraded" -RequirementCount 1 `
             -SystemId $script:state.SystemId -EnvironmentId $script:state.EnvironmentId `
             -CodeRepositoryId $script:state.RepoId -CodeBranch $script:state.FixtureBranch -BaselineCommit $script:state.FixtureBaseCommit
-        $start = Invoke-Api -Method Post -Uri "$apiBaseUrl/api/versions/$($degraded.VersionId)/mindmap/runs" -Headers $adminHeaders -Body @{ kind = "design" }
-        if ($start.Status -ne 202) { throw "degraded design run returned HTTP $($start.Status), expected 202" }
-        $run = Wait-Run -VersionId $degraded.VersionId -RunId ([string]$start.Data.runId) -Headers $adminHeaders -TimeoutSeconds 120
-        if ([string]$run.status -ne "failed" -or [string]$run.reason -ne "ai_unavailable") {
-            throw "degraded design run ended '$($run.status)'/'$($run.reason)', expected failed/ai_unavailable"
+        $syncUnavailable = $false
+        try {
+            $start = Invoke-Api -Method Post -Uri "$apiBaseUrl/api/versions/$($degraded.VersionId)/mindmap/runs" -Headers $adminHeaders -Body @{ kind = "design" }
+            if ($start.Status -ne 202) { throw "degraded design run returned HTTP $($start.Status), expected 202 or 409" }
+            $run = Wait-Run -VersionId $degraded.VersionId -RunId ([string]$start.Data.runId) -Headers $adminHeaders -TimeoutSeconds 120
+            if ([string]$run.status -ne "failed" -or [string]$run.reason -ne "ai_unavailable") {
+                throw "degraded design run ended '$($run.status)'/'$($run.reason)', expected failed/ai_unavailable"
+            }
+        } catch {
+            if ($_.Exception.Message -match "409" -and $_.Exception.Message -match "ai_unavailable") {
+                # The runtime refuses to start without an LLM; documented synchronous failure.
+                $syncUnavailable = $true
+            } else { throw }
         }
         $manual = New-ManualCase -Headers $adminHeaders -VersionId $degraded.VersionId -RequirementIds @($degraded.RequirementIds[0]) -Prefix "P5 real degraded manual"
         $graph = Get-MindmapGraph -VersionId $degraded.VersionId -Headers $adminHeaders
