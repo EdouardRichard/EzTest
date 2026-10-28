@@ -16,6 +16,7 @@ import (
 	audithttp "github.com/EdouardRichard/EzTest/backend/internal/audit/interfaces/httpapi"
 	codeintelhttp "github.com/EdouardRichard/EzTest/backend/internal/codeintel/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
+	deliveryhttp "github.com/EdouardRichard/EzTest/backend/internal/delivery/interfaces/httpapi"
 	eventinghttp "github.com/EdouardRichard/EzTest/backend/internal/eventing/interfaces/httpapi"
 	executionhttp "github.com/EdouardRichard/EzTest/backend/internal/execution/interfaces/httpapi"
 	identity "github.com/EdouardRichard/EzTest/backend/internal/identity/domain"
@@ -121,6 +122,11 @@ type Dependencies struct {
 	// control batches and read execution data (design spec §5.11), so no
 	// per-route guard is added here.
 	Execution *executionhttp.Handlers
+	// Delivery holds the delivery context's HTTP handlers (P7): issues, reports,
+	// analysis runs and the global issue/report centres. When set, the P7
+	// delivery routes are mounted under /api/versions/{id} and /api. They rely
+	// on the global bearer auth and add no per-route guard (spec §11.1).
+	Delivery *deliveryhttp.Handlers
 }
 
 // New assembles the HTTP handler. Middleware runs in the order
@@ -221,6 +227,14 @@ func New(cfg config.Config, logger *slog.Logger, deps Dependencies) http.Handler
 		// and add no per-route guard (spec §5.11). RegisterRoutes skips nil
 		// groups so a partially wired process mounts only what it has.
 		deps.Execution.RegisterRoutes(mux)
+	}
+	if deps.Delivery != nil {
+		// The delivery routes (P7) sit under /api/versions/{id}/issues,
+		// .../reports, .../batches/{batchId}/analysis and the global
+		// /api/issues|reports centres. They rely on the global bearer auth and
+		// add no per-route guard (spec §11.1); RegisterRoutes skips nil groups
+		// so a partially wired process mounts only what it has.
+		deps.Delivery.RegisterRoutes(mux)
 	}
 	if deps.Events != nil && cfg.EnableTestEndpoints {
 		auditor := deps.Audit
