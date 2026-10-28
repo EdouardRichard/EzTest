@@ -20,7 +20,7 @@ import (
 )
 
 // Analysis-service constants. The configuration bounds mirror design spec §4.1;
-// the reasons are the stable §7.1 reason codes persisted in code_analyses.
+// the reasons are the stable §7.1 reason codes persisted in code_analysis.
 const (
 	// auditActionCodeAnalyze is the design spec §6.10 analysis audit action. The
 	// detail carries identifiers and status only.
@@ -50,7 +50,7 @@ const (
 	reasonAnalysisInProgress = "analysis_in_progress"
 	reasonAnalysisNotDone    = "analysis_not_done"
 
-	// Per-file analysis error codes persisted in code_analyses.errors.
+	// Per-file analysis error codes persisted in code_analysis.errors.
 	reasonLLMUnavailable = "llm_unavailable"
 	reasonLLMError       = "llm_error"
 	reasonParseError     = "parse_error"
@@ -1113,7 +1113,7 @@ func (s *AnalysisService) validateFileAnalysis(ctx context.Context, state *analy
 //
 // The persisted entity row is always resolved back from the repository: a fact
 // version bump updates the existing row in place (ON CONFLICT keeps its id), so
-// the newly minted candidate id must never leak into code_edges /
+// the newly minted candidate id must never leak into code_edge /
 // ImpactInput.FactsAtHead.
 func (s *AnalysisService) materializeFacts(ctx context.Context, state *analysisRunState, facts []*materializedFact) ([]domain.FactVersionRef, map[string]domain.CodeEntity, error) {
 	factEntities := make(map[string]domain.CodeEntity, len(facts))
@@ -1261,7 +1261,7 @@ func materializedFactFromBody(key string, body []byte) (*materializedFact, error
 	}, nil
 }
 
-// factEntity builds the current code_entities snapshot of one fact version. The
+// factEntity builds the current code_entity snapshot of one fact version. The
 // snowflake id is minted by the application layer (D29); the repository keeps
 // the existing row id when it updates a fact in place.
 func (s *AnalysisService) factEntity(state *analysisRunState, fact *materializedFact, version int) domain.CodeEntity {

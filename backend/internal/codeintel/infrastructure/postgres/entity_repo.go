@@ -101,7 +101,7 @@ var _ domain.EntityRepository = (*EntityRepo)(nil)
 
 // upsertEntityColumns is the shared INSERT column list of the single-row entity
 // upserts.
-const upsertEntityColumns = `INSERT INTO code_entities
+const upsertEntityColumns = `INSERT INTO code_entity
 	(id, repo_id, commit_sha, kind, path, name, start_line, end_line, signature,
 	 blob_hash, source, confidence, evidence, meta, fact_key, fact_version, analysis_id)
 	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14::jsonb, $15, $16, $17)`
@@ -110,7 +110,7 @@ const upsertEntityColumns = `INSERT INTO code_entities
 // fact_key, (repo_id, commit_sha, fact_key) is the identity: the current row is
 // updated in place (its id and created_at are preserved). Without a fact_key the
 // row is treated as a T0 file entity and (repo_id, commit_sha, path) is the
-// identity. The full fact body history lives in code_fact_versions.
+// identity. The full fact body history lives in code_fact_version.
 func (r *EntityRepo) Upsert(ctx context.Context, e domain.CodeEntity) error {
 	encodedEvidence, err := marshalEvidence(e.Evidence)
 	if err != nil {
@@ -179,7 +179,7 @@ func (r *EntityRepo) UpsertFile(ctx context.Context, repoID int64, commit string
 		paths[i] = file.Path
 		blobHashes[i] = file.BlobHash
 	}
-	const query = `INSERT INTO code_entities
+	const query = `INSERT INTO code_entity
 			(id, repo_id, commit_sha, kind, path, blob_hash, source, confidence)
 		SELECT f.id, $2::bigint, $3::text, 'file', f.path, f.blob_hash, 'git', 'high'
 		FROM unnest($1::bigint[], $4::text[], $5::text[]) AS f(id, path, blob_hash)
@@ -195,7 +195,7 @@ func (r *EntityRepo) UpsertFile(ctx context.Context, repoID int64, commit string
 func (r *EntityRepo) GetByFactKey(ctx context.Context, repoID int64, commit, factKey string) (domain.CodeEntity, error) {
 	entity, err := scanEntity(r.pool.QueryRow(ctx,
 		`SELECT `+entityColumnList+`
-		 FROM code_entities
+		 FROM code_entity
 		 WHERE repo_id = $1 AND commit_sha = $2 AND fact_key = $3`,
 		repoID, commit, factKey))
 	if err != nil {
@@ -225,7 +225,7 @@ func (r *EntityRepo) List(ctx context.Context, repoID int64, filter domain.Entit
 	)
 	if cursorID != 0 {
 		if err := r.pool.QueryRow(ctx,
-			`SELECT path FROM code_entities WHERE id = $1 AND repo_id = $2 AND commit_sha = $3`,
+			`SELECT path FROM code_entity WHERE id = $1 AND repo_id = $2 AND commit_sha = $3`,
 			cursorID, repoID, filter.Commit).Scan(&cursorPath); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return []domain.CodeEntity{}, "", false, nil
@@ -236,7 +236,7 @@ func (r *EntityRepo) List(ctx context.Context, repoID int64, filter domain.Entit
 	}
 
 	const query = `SELECT ` + entityColumnList + `
-		FROM code_entities
+		FROM code_entity
 		WHERE repo_id = $1 AND commit_sha = $2
 		  AND ($3 = '' OR kind = $3)
 		  AND ($4 = '' OR path = $4)
@@ -282,7 +282,7 @@ func (r *EntityRepo) ListByPaths(ctx context.Context, repoID int64, commit strin
 	}
 	rows, err := r.pool.Query(ctx,
 		`SELECT `+entityColumnList+`
-		 FROM code_entities
+		 FROM code_entity
 		 WHERE repo_id = $1 AND commit_sha = $2 AND path = ANY($3::text[])
 		 ORDER BY path ASC, id ASC`,
 		repoID, commit, paths)
@@ -307,10 +307,10 @@ func (r *EntityRepo) ListByPaths(ctx context.Context, repoID int64, commit strin
 
 // DeleteFact removes the current entity snapshot of one fact. Deleting a fact
 // that is already gone is a no-op, so a re-run can clean up idempotently; the
-// append-only body history in code_fact_versions is kept.
+// append-only body history in code_fact_version is kept.
 func (r *EntityRepo) DeleteFact(ctx context.Context, repoID int64, commit, factKey string) error {
 	if _, err := r.pool.Exec(ctx,
-		`DELETE FROM code_entities WHERE repo_id = $1 AND commit_sha = $2 AND fact_key = $3`,
+		`DELETE FROM code_entity WHERE repo_id = $1 AND commit_sha = $2 AND fact_key = $3`,
 		repoID, commit, factKey); err != nil {
 		return fmt.Errorf("postgres: delete code entity fact: %w", err)
 	}

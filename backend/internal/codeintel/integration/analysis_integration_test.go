@@ -562,7 +562,7 @@ func TestAnalysisIntegrationMaterialisesFactsCacheAndVersions(t *testing.T) {
 	var changedFilesJSON []byte
 	var statsJSON []byte
 	if err := pool.QueryRow(ctx,
-		`SELECT changed_files, stats FROM code_change_sets
+		`SELECT changed_files, stats FROM code_change_set
 		 WHERE repo_id = $1 AND base_commit = $2 AND head_commit = $3`,
 		repoID, base, head).Scan(&changedFilesJSON, &statsJSON); err != nil {
 		t.Fatalf("read change set: %v", err)
@@ -579,7 +579,7 @@ func TestAnalysisIntegrationMaterialisesFactsCacheAndVersions(t *testing.T) {
 	rows, err := pool.Query(ctx,
 		`SELECT id, kind, name, source, confidence, fact_key, fact_version,
 		        jsonb_array_length(evidence)
-		 FROM code_entities
+		 FROM code_entity
 		 WHERE repo_id = $1 AND commit_sha = $2 AND fact_key IS NOT NULL
 		 ORDER BY fact_key`, repoID, head)
 	if err != nil {
@@ -631,7 +631,7 @@ func TestAnalysisIntegrationMaterialisesFactsCacheAndVersions(t *testing.T) {
 	var factVersions int
 	var superseded int
 	if err := pool.QueryRow(ctx,
-		`SELECT count(*)::int, count(superseded_at)::int FROM code_fact_versions
+		`SELECT count(*)::int, count(superseded_at)::int FROM code_fact_version
 		 WHERE repo_id = $1 AND commit_sha = $2`, repoID, head).Scan(&factVersions, &superseded); err != nil {
 		t.Fatalf("count fact versions: %v", err)
 	}
@@ -640,7 +640,7 @@ func TestAnalysisIntegrationMaterialisesFactsCacheAndVersions(t *testing.T) {
 	}
 	var factBody []byte
 	if err := pool.QueryRow(ctx,
-		`SELECT body FROM code_fact_versions
+		`SELECT body FROM code_fact_version
 		 WHERE repo_id = $1 AND commit_sha = $2 AND fact_key = 'client:POST /api/refund' AND version = 1`,
 		repoID, head).Scan(&factBody); err != nil {
 		t.Fatalf("read fact body: %v", err)
@@ -656,7 +656,7 @@ func TestAnalysisIntegrationMaterialisesFactsCacheAndVersions(t *testing.T) {
 	// Contract edge route_to_api with the documented meta.
 	var edgeCount int
 	if err := pool.QueryRow(ctx,
-		`SELECT count(*)::int FROM code_edges
+		`SELECT count(*)::int FROM code_edge
 		 WHERE repo_id = $1 AND commit_sha = $2 AND rel = 'route_to_api'`,
 		repoID, head).Scan(&edgeCount); err != nil {
 		t.Fatalf("count contract edges: %v", err)
@@ -668,7 +668,7 @@ func TestAnalysisIntegrationMaterialisesFactsCacheAndVersions(t *testing.T) {
 	var method, normalizedPath string
 	if err := pool.QueryRow(ctx,
 		`SELECT src_entity_id, dst_entity_id, meta ->> 'method', meta ->> 'normalizedPath'
-		 FROM code_edges
+		 FROM code_edge
 		 WHERE repo_id = $1 AND commit_sha = $2 AND rel = 'route_to_api'`,
 		repoID, head).Scan(&edgeSrc, &edgeDst, &method, &normalizedPath); err != nil {
 		t.Fatalf("read contract edge: %v", err)
@@ -707,7 +707,7 @@ func TestAnalysisIntegrationMaterialisesFactsCacheAndVersions(t *testing.T) {
 	var candidateSelected bool
 	if err := pool.QueryRow(ctx,
 		`SELECT count(*)::int, COALESCE(bool_and(selected), false)
-		 FROM code_impact_candidates WHERE analysis_id = $1`, analysis.ID,
+		 FROM code_impact_candidate WHERE analysis_id = $1`, analysis.ID,
 	).Scan(&candidateRows, &candidateSelected); err != nil {
 		t.Fatalf("read candidates: %v", err)
 	}
@@ -728,7 +728,7 @@ func TestAnalysisIntegrationMaterialisesFactsCacheAndVersions(t *testing.T) {
 		t.Fatalf("LLM calls after the cached version = %d, want %d", got, callsBefore)
 	}
 	if err := pool.QueryRow(ctx,
-		`SELECT count(*)::int FROM code_edges
+		`SELECT count(*)::int FROM code_edge
 		 WHERE repo_id = $1 AND commit_sha = $2 AND rel = 'route_to_api'`,
 		repoID, head).Scan(&edgeCount); err != nil {
 		t.Fatalf("count contract edges after the cached run: %v", err)
@@ -751,7 +751,7 @@ func TestAnalysisIntegrationMaterialisesFactsCacheAndVersions(t *testing.T) {
 		t.Fatalf("LLM calls after the forced run = %d, want %d", got, callsBefore+3)
 	}
 	if err := pool.QueryRow(ctx,
-		`SELECT count(*)::int FROM code_fact_versions
+		`SELECT count(*)::int FROM code_fact_version
 		 WHERE repo_id = $1 AND commit_sha = $2`, repoID, head).Scan(&factVersions); err != nil {
 		t.Fatalf("count fact versions after force: %v", err)
 	}
@@ -809,7 +809,7 @@ func TestAnalysisIntegrationDegraded(t *testing.T) {
 
 	var factEntities int
 	if err := pool.QueryRow(ctx,
-		`SELECT count(*)::int FROM code_entities
+		`SELECT count(*)::int FROM code_entity
 		 WHERE repo_id = $1 AND commit_sha = $2 AND fact_key IS NOT NULL`,
 		repoID, head).Scan(&factEntities); err != nil {
 		t.Fatalf("count degraded fact entities: %v", err)
@@ -838,7 +838,7 @@ func TestAnalysisIntegrationDegraded(t *testing.T) {
 	}
 	var candidateCount int
 	if err := pool.QueryRow(ctx,
-		`SELECT count(*)::int FROM code_impact_candidates WHERE analysis_id = $1`,
+		`SELECT count(*)::int FROM code_impact_candidate WHERE analysis_id = $1`,
 		stored.ID).Scan(&candidateCount); err != nil {
 		t.Fatalf("count degraded candidates: %v", err)
 	}
@@ -852,7 +852,7 @@ func analysisEntityID(t *testing.T, pool *pgxpool.Pool, repoID int64, commit, fa
 	t.Helper()
 	var id int64
 	if err := pool.QueryRow(context.Background(),
-		`SELECT id FROM code_entities
+		`SELECT id FROM code_entity
 		 WHERE repo_id = $1 AND commit_sha = $2 AND fact_key = $3`,
 		repoID, commit, factKey).Scan(&id); err != nil {
 		t.Fatalf("read entity %q: %v", factKey, err)
@@ -862,7 +862,7 @@ func analysisEntityID(t *testing.T, pool *pgxpool.Pool, repoID int64, commit, fa
 
 // TestAnalysisIntegrationAIEdgesAndFactBump proves the §6.2 edge
 // materialisation against the real repositories: a fact version bump keeps the
-// entity row id, every code_edges endpoint references a persisted entity, an
+// entity row id, every code_edge endpoint references a persisted entity, an
 // unresolved endpoint is counted, and the contract edge keeps both real
 // endpoints.
 func TestAnalysisIntegrationAIEdgesAndFactBump(t *testing.T) {
@@ -933,7 +933,7 @@ func TestAnalysisIntegrationAIEdgesAndFactBump(t *testing.T) {
 	}
 	var clientVersions int
 	if err := pool.QueryRow(ctx,
-		`SELECT count(*)::int FROM code_fact_versions
+		`SELECT count(*)::int FROM code_fact_version
 		 WHERE repo_id = $1 AND commit_sha = $2 AND fact_key = 'client:POST /api/refund'`,
 		repoID, head).Scan(&clientVersions); err != nil {
 		t.Fatalf("count client fact versions: %v", err)
@@ -945,13 +945,13 @@ func TestAnalysisIntegrationAIEdgesAndFactBump(t *testing.T) {
 	// No edge may reference an entity row that does not exist.
 	var dangling int
 	if err := pool.QueryRow(ctx,
-		`SELECT count(*)::int FROM code_edges e
+		`SELECT count(*)::int FROM code_edge e
 		 WHERE e.repo_id = $1 AND e.commit_sha = $2
 		   AND (NOT EXISTS (
-		           SELECT 1 FROM code_entities s
+		           SELECT 1 FROM code_entity s
 		            WHERE s.id = e.src_entity_id AND s.repo_id = e.repo_id AND s.commit_sha = e.commit_sha)
 		        OR NOT EXISTS (
-		           SELECT 1 FROM code_entities d
+		           SELECT 1 FROM code_entity d
 		            WHERE d.id = e.dst_entity_id AND d.repo_id = e.repo_id AND d.commit_sha = e.commit_sha))`,
 		repoID, head).Scan(&dangling); err != nil {
 		t.Fatalf("count dangling edges: %v", err)
@@ -962,7 +962,7 @@ func TestAnalysisIntegrationAIEdgesAndFactBump(t *testing.T) {
 
 	var callsSrc, callsDst, routeSrc, routeDst int64
 	if err := pool.QueryRow(ctx,
-		`SELECT src_entity_id, dst_entity_id FROM code_edges
+		`SELECT src_entity_id, dst_entity_id FROM code_edge
 		 WHERE repo_id = $1 AND commit_sha = $2 AND rel = 'calls'`,
 		repoID, head).Scan(&callsSrc, &callsDst); err != nil {
 		t.Fatalf("read calls edge: %v", err)
@@ -972,7 +972,7 @@ func TestAnalysisIntegrationAIEdgesAndFactBump(t *testing.T) {
 			callsSrc, callsDst, firstClientID, firstAPIID)
 	}
 	if err := pool.QueryRow(ctx,
-		`SELECT src_entity_id, dst_entity_id FROM code_edges
+		`SELECT src_entity_id, dst_entity_id FROM code_edge
 		 WHERE repo_id = $1 AND commit_sha = $2 AND rel = 'route_to_api'`,
 		repoID, head).Scan(&routeSrc, &routeDst); err != nil {
 		t.Fatalf("read route_to_api edge: %v", err)
@@ -1037,7 +1037,7 @@ func TestAnalysisIntegrationForceAndReuseOnSameInput(t *testing.T) {
 	}
 	var analysisCount int
 	if err := pool.QueryRow(ctx,
-		`SELECT count(*)::int FROM code_analyses WHERE version_id = $1`, versionID).Scan(&analysisCount); err != nil {
+		`SELECT count(*)::int FROM code_analysis WHERE version_id = $1`, versionID).Scan(&analysisCount); err != nil {
 		t.Fatalf("count analyses: %v", err)
 	}
 	if analysisCount != 1 {

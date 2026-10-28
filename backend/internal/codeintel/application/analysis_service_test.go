@@ -463,7 +463,7 @@ func (f *analysisFacts) Create(_ context.Context, id int64, repoID int64, commit
 	}
 	key := analysisEntityKey(repoID, commit, factKey)
 	if stored, ok := f.versions[key][version]; ok {
-		// The real code_fact_versions unique constraint rejects a duplicate
+		// The real code_fact_version unique constraint rejects a duplicate
 		// (repo, commit, fact_key, version) row; model it so retry paths are
 		// exercised faithfully.
 		_ = stored

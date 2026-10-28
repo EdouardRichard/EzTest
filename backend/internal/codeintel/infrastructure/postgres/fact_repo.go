@@ -29,7 +29,7 @@ var _ domain.FactVersionRepository = (*FactVersionRepo)(nil)
 func (r *FactVersionRepo) Current(ctx context.Context, repoID int64, commit, factKey string) (*domain.CodeEntity, int, error) {
 	entity, err := scanEntity(r.pool.QueryRow(ctx,
 		`SELECT `+entityColumnList+`
-		 FROM code_entities
+		 FROM code_entity
 		 WHERE repo_id = $1 AND commit_sha = $2 AND fact_key = $3`,
 		repoID, commit, factKey))
 	if err != nil {
@@ -53,7 +53,7 @@ func (r *FactVersionRepo) Current(ctx context.Context, repoID int64, commit, fac
 func (r *FactVersionRepo) GetVersion(ctx context.Context, repoID int64, commit, factKey string, version int) ([]byte, error) {
 	var body []byte
 	err := r.pool.QueryRow(ctx,
-		`SELECT body FROM code_fact_versions
+		`SELECT body FROM code_fact_version
 		 WHERE repo_id = $1 AND commit_sha = $2 AND fact_key = $3 AND version = $4`,
 		repoID, commit, factKey, version).Scan(&body)
 	if err != nil {
@@ -74,7 +74,7 @@ func (r *FactVersionRepo) Create(ctx context.Context, id int64, repoID int64, co
 	if id == 0 {
 		return missingIDError("fact version")
 	}
-	const query = `INSERT INTO code_fact_versions
+	const query = `INSERT INTO code_fact_version
 		(id, repo_id, commit_sha, fact_key, version, model, prompt_version, body, analysis_id)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)`
 	if _, err := r.pool.Exec(ctx, query,
@@ -95,7 +95,7 @@ func (r *FactVersionRepo) Create(ctx context.Context, id int64, repoID int64, co
 // version keeps its original timestamp.
 func (r *FactVersionRepo) Supersede(ctx context.Context, repoID int64, commit, factKey string, before int, at time.Time) error {
 	if _, err := r.pool.Exec(ctx,
-		`UPDATE code_fact_versions
+		`UPDATE code_fact_version
 		 SET superseded_at = $5
 		 WHERE repo_id = $1 AND commit_sha = $2 AND fact_key = $3
 		   AND version < $4 AND superseded_at IS NULL`,

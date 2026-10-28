@@ -225,7 +225,7 @@ func (r *AnalysisRepo) Create(ctx context.Context, analysis domain.CodeAnalysis)
 	if err != nil {
 		return fmt.Errorf("postgres: encode analysis unmapped changes: %w", err)
 	}
-	const query = `INSERT INTO code_analyses
+	const query = `INSERT INTO code_analysis
 		(id, version_id, repo_id, base_commit, head_commit, change_set_id,
 		 status, degraded, model, prompt_version, analysis_version,
 		 fact_versions, stats, errors, unmapped, created_by, started_at, finished_at)
@@ -264,7 +264,7 @@ func (r *AnalysisRepo) Update(ctx context.Context, analysis domain.CodeAnalysis)
 	if err != nil {
 		return fmt.Errorf("postgres: encode analysis unmapped changes: %w", err)
 	}
-	const query = `UPDATE code_analyses
+	const query = `UPDATE code_analysis
 		SET change_set_id = $3, status = $4, degraded = $5,
 		    fact_versions = $6::jsonb, stats = $7::jsonb,
 		    errors = $8::jsonb, unmapped = $9::jsonb,
@@ -290,7 +290,7 @@ func (r *AnalysisRepo) Update(ctx context.Context, analysis domain.CodeAnalysis)
 func (r *AnalysisRepo) GetByID(ctx context.Context, versionID, id int64) (domain.CodeAnalysis, error) {
 	analysis, err := scanAnalysis(r.pool.QueryRow(ctx,
 		`SELECT `+analysisColumnList+`
-		 FROM code_analyses WHERE id = $1 AND version_id = $2`, id, versionID))
+		 FROM code_analysis WHERE id = $1 AND version_id = $2`, id, versionID))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.CodeAnalysis{}, notFoundError("analysis", id)
@@ -304,7 +304,7 @@ func (r *AnalysisRepo) GetByID(ctx context.Context, versionID, id int64) (domain
 func (r *AnalysisRepo) GetLatest(ctx context.Context, versionID int64) (domain.CodeAnalysis, error) {
 	analysis, err := scanAnalysis(r.pool.QueryRow(ctx,
 		`SELECT `+analysisColumnList+`
-		 FROM code_analyses
+		 FROM code_analysis
 		 WHERE version_id = $1
 		 ORDER BY created_at DESC, id DESC
 		 LIMIT 1`, versionID))
@@ -325,7 +325,7 @@ func (r *AnalysisRepo) GetLatest(ctx context.Context, versionID int64) (domain.C
 func (r *AnalysisRepo) FindReusable(ctx context.Context, versionID, repoID int64, base, head, model, prompt string) (*domain.CodeAnalysis, error) {
 	analysis, err := scanAnalysis(r.pool.QueryRow(ctx,
 		`SELECT `+analysisColumnList+`
-		 FROM code_analyses
+		 FROM code_analysis
 		 WHERE version_id = $1 AND repo_id = $2
 		   AND base_commit = $3 AND head_commit = $4
 		   AND model = $5 AND prompt_version = $6
@@ -348,7 +348,7 @@ func (r *AnalysisRepo) HasActive(ctx context.Context, versionID int64) (bool, er
 	var active bool
 	if err := r.pool.QueryRow(ctx,
 		`SELECT EXISTS (
-			SELECT 1 FROM code_analyses
+			SELECT 1 FROM code_analysis
 			WHERE version_id = $1 AND status IN ('queued', 'running')
 		)`, versionID).Scan(&active); err != nil {
 		return false, fmt.Errorf("postgres: check active analysis: %w", err)
@@ -362,7 +362,7 @@ func (r *AnalysisRepo) NextAnalysisVersion(ctx context.Context, versionID int64,
 	var version int
 	if err := r.pool.QueryRow(ctx, `
 		SELECT COALESCE(MAX(analysis_version), 0) + 1
-		FROM code_analyses
+		FROM code_analysis
 		WHERE version_id = $1 AND base_commit = $2 AND head_commit = $3`,
 		versionID, base, head).Scan(&version); err != nil {
 		return 0, fmt.Errorf("postgres: next analysis version: %w", err)
@@ -375,7 +375,7 @@ func (r *AnalysisRepo) NextAnalysisVersion(ctx context.Context, versionID int64,
 // A queued analysis is aged by created_at, a running one by started_at (with
 // created_at as fallback). It returns the number of recovered analyses.
 func (r *AnalysisRepo) RecoverStale(ctx context.Context, before time.Time) (int64, error) {
-	const query = `UPDATE code_analyses
+	const query = `UPDATE code_analysis
 		SET status = 'failed',
 		    finished_at = now(),
 		    errors = errors || '[{"code":"interrupted"}]'::jsonb
@@ -394,7 +394,7 @@ func (r *AnalysisRepo) RecoverStale(ctx context.Context, before time.Time) (int6
 // recorded, no revision is introduced.
 func (r *AnalysisRepo) UpdateCandidateSelection(ctx context.Context, analysisID, candidateID, actorID int64, selected bool) error {
 	tag, err := r.pool.Exec(ctx, `
-		UPDATE code_impact_candidates
+		UPDATE code_impact_candidate
 		SET selected = $4, selection_updated_by = $3, selection_updated_at = now()
 		WHERE id = $2 AND analysis_id = $1`,
 		analysisID, candidateID, actorID, selected)

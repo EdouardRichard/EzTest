@@ -13,18 +13,19 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// codeIntelTables are the nine tables introduced by the two codeintel
-// migrations (design spec §5).
+// codeIntelTables are the nine codeintel tables after the D34 rename
+// migrations (design spec §3.2/§5). code_analysis_cache is the one table that
+// keeps its name.
 var codeIntelTables = []string{
-	"code_change_sets",
-	"code_index_runs",
-	"code_entities",
-	"code_edges",
-	"code_fact_versions",
+	"code_change_set",
+	"code_index_run",
+	"code_entity",
+	"code_edge",
+	"code_fact_version",
 	"code_analysis_cache",
-	"code_analyses",
-	"code_impact_candidates",
-	"code_anchors",
+	"code_analysis",
+	"code_impact_candidate",
+	"code_anchor",
 }
 
 // codeIntelIndexes are every index declared by the codeintel migrations.
@@ -62,10 +63,10 @@ var codeIntelExpressionIndexes = []string{
 	"uq_code_anchors_point",
 }
 
-// TestCodeIntelMigrations applies the embedded migrations, replays them and
-// asserts the P4 schema: the nine codeintel tables, their indexes, the
-// application-generated BIGINT ids, no cross-context foreign keys, an
-// order.txt with 16 entries and a repeatable migration run.
+// TestCodeIntelMigrations applies the embedded migrations, replays the rename
+// migration and asserts the P4 schema: the nine codeintel tables, their
+// indexes, the application-generated BIGINT ids, no cross-context foreign
+// keys, a fully recorded order.txt and a repeatable migration run.
 func TestCodeIntelMigrations(t *testing.T) {
 	pool := testutil.OpenTestDB(t)
 	ctx := context.Background()
@@ -76,19 +77,16 @@ func TestCodeIntelMigrations(t *testing.T) {
 		t.Fatalf("apply embedded migrations a second time: %v", err)
 	}
 
-	// Replay both codeintel SQL files directly as well: the DDL must be
-	// idempotent (IF NOT EXISTS) on its own.
-	for _, name := range []string{
-		"codeintel_0001_code_facts.sql",
-		"codeintel_0002_code_impact.sql",
-	} {
-		sql, err := os.ReadFile("../../db/migrations/" + name)
-		if err != nil {
-			t.Fatalf("read migration %s: %v", name, err)
-		}
-		if _, err := pool.Exec(ctx, string(sql)); err != nil {
-			t.Fatalf("replay migration %s: %v", name, err)
-		}
+	// Replay the D34 rename migration directly as well: it must be idempotent
+	// (ALTER TABLE/SEQUENCE IF EXISTS) on its own. The two historical DDL files
+	// are intentionally not replayed: they would recreate the old plural tables
+	// that the rename migration has already replaced.
+	renameSQL, err := os.ReadFile("../../db/migrations/codeintel_0003_rename_tables.sql")
+	if err != nil {
+		t.Fatalf("read rename migration: %v", err)
+	}
+	if _, err := pool.Exec(ctx, string(renameSQL)); err != nil {
+		t.Fatalf("replay rename migration: %v", err)
 	}
 
 	for _, table := range codeIntelTables {
@@ -139,8 +137,10 @@ func TestCodeIntelMigrations(t *testing.T) {
 		t.Errorf("codeintel tables have %d foreign keys, want none", foreignKeys)
 	}
 
-	// order.txt lists 16 migrations (the two P4 files are appended at 15/16)
-	// and the ledger has exactly one row per entry after the repeated run.
+	// order.txt lists at least the 16 P0–P4 migrations plus the 10 D34 rename
+	// migrations, and the ledger has exactly one row per entry after the
+	// repeated run. The exact total is not pinned because later P5 migrations
+	// are appended to the same list.
 	order, err := os.ReadFile("../../db/migrations/order.txt")
 	if err != nil {
 		t.Fatalf("read order.txt: %v", err)
@@ -151,8 +151,8 @@ func TestCodeIntelMigrations(t *testing.T) {
 			entries++
 		}
 	}
-	if entries != 16 {
-		t.Errorf("order.txt lists %d migrations, want 16", entries)
+	if entries < 26 {
+		t.Errorf("order.txt lists %d migrations, want at least 26", entries)
 	}
 	var applied int
 	if err := pool.QueryRow(ctx, `SELECT count(*)::int FROM schema_migrations`).Scan(&applied); err != nil {
