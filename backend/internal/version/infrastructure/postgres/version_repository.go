@@ -318,24 +318,76 @@ func (r *VersionRepository) UpdateStatus(ctx context.Context, id int64, from, to
 	return &updated, nil
 }
 
-// UpdateExecutionState replaces the P6 execution columns without changing
-// status. Only an executing or continuing version accepts the write, so a pause
-// or batch update racing a completion loses as a version_state_conflict instead
-// of mutating a finished version.
-func (r *VersionRepository) UpdateExecutionState(ctx context.Context, id int64, paused bool, pauseMode string, batchNo int, actor int64) (*domain.Version, error) {
+// SetPaused writes only the paused/pause_mode columns without changing status,
+// so a concurrent batch-number write can never be rolled back by a stale read in
+// the pause path. Only an executing or continuing version accepts the write;
+// zero affected rows (wrong status, deleted row) is a version_state_conflict.
+func (r *VersionRepository) SetPaused(ctx context.Context, id int64, paused bool, pauseMode string, actor int64) (*domain.Version, error) {
 	const query = `UPDATE version
-		SET paused = $2, pause_mode = $3, batch_no = $4,
-		    revision = revision + 1, updated_by = $5, updated_at = now()
+		SET paused = $2, pause_mode = $3,
+		    revision = revision + 1, updated_by = $4, updated_at = now()
 		WHERE id = $1 AND status IN ('executing', 'continuing')
 		RETURNING ` + versionColumnList
-	updated, err := scanVersion(r.pool.QueryRow(ctx, query, id, paused, pauseMode, batchNo, actor))
+	updated, err := scanVersion(r.pool.QueryRow(ctx, query, id, paused, pauseMode, actor))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, versionStateConflict(id)
 		}
-		return nil, fmt.Errorf("postgres: update version execution state: %w", err)
+		return nil, fmt.Errorf("postgres: set version paused: %w", err)
 	}
 	return &updated, nil
+}
+
+// SetBatchNo writes only the batch_no column under a monotonic SQL guard
+// (batch_no <= $2): an equal number is accepted, a lower number affects zero
+// rows and is a version_state_conflict, so a write racing a higher number can
+// never move the column backwards. paused/pause_mode are never touched. Only an
+// executing or continuing version accepts the write.
+func (r *VersionRepository) SetBatchNo(ctx context.Context, id int64, batchNo int, actor int64) (*domain.Version, error) {
+	const query = `UPDATE version
+		SET batch_no = $2, revision = revision + 1, updated_by = $3, updated_at = now()
+		WHERE id = $1 AND status IN ('executing', 'continuing') AND batch_no <= $2
+		RETURNING ` + versionColumnList
+	updated, err := scanVersion(r.pool.QueryRow(ctx, query, id, batchNo, actor))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, versionStateConflict(id)
+		}
+		return nil, fmt.Errorf("postgres: set version batch_no: %w", err)
+	}
+	return &updated, nil
+}
+
+// CompleteExecution performs the guarded executing -> completed transition.
+// The paused = false predicate is re-checked in SQL, so a pause that commits
+// between the service's read and this write loses as a version_state_conflict
+// instead of completing a paused version.
+func (r *VersionRepository) CompleteExecution(ctx context.Context, id int64, actor int64) (*domain.Version, error) {
+	const query = `UPDATE version
+		SET status = 'completed', revision = revision + 1, updated_by = $2, updated_at = now()
+		WHERE id = $1 AND status = 'executing' AND paused = false
+		RETURNING ` + versionColumnList
+	updated, err := scanVersion(r.pool.QueryRow(ctx, query, id, actor))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, versionStateConflict(id)
+		}
+		return nil, fmt.Errorf("postgres: complete version execution: %w", err)
+	}
+	return &updated, nil
+}
+
+// UpdateExecutionState is retained only because domain.VersionRepository still
+// declares it. Deprecated: the service no longer calls it; pause, batch and
+// completion writes use SetPaused, SetBatchNo and CompleteExecution. This shim
+// applies the column-scoped writes (instead of replacing all three columns from
+// the caller's possibly stale read), so a lower batch number cannot roll back a
+// newer one.
+func (r *VersionRepository) UpdateExecutionState(ctx context.Context, id int64, paused bool, pauseMode string, batchNo int, actor int64) (*domain.Version, error) {
+	if _, err := r.SetPaused(ctx, id, paused, pauseMode, actor); err != nil {
+		return nil, err
+	}
+	return r.SetBatchNo(ctx, id, batchNo, actor)
 }
 
 // ListUnclarified returns the ids of the version's draft requirements plus the
