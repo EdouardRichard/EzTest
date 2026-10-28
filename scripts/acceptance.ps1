@@ -4009,7 +4009,11 @@ writeFileSync(process.argv[3], JSON.stringify({
                 [void](Invoke-Check -Dod "P6-7,P6-2" -CheckName "P6 permissions/degraded" -Body {
                         $permissionsWorld = New-P6ExecutingVersion -Headers $adminHeaders -Name "P6 permissions" `
                             -SystemId $main.SystemId -EnvironmentId $main.EnvironmentId -CaseCount 1
-                        Set-P6FakeLlmMode -Mode "normal"
+                        # Use the slow budget plan so the single case is still
+                        # running when the pause/resume/cancel round-trips land;
+                        # the normal plan finishes in ~1s and cancel then races
+                        # into 409 batch_finished.
+                        Set-P6FakeLlmMode -Mode "budget"
                         $created = Invoke-P5Api -Method Post -Path "/api/versions/$($permissionsWorld.VersionId)/batches" -Headers $userHeaders -Body @{}
                         Assert-P5Http -Response $created -Status 201 -Label "normal user POST batch" | Out-Null
                         $batchId = [string]$created.Data.id
@@ -4018,8 +4022,16 @@ writeFileSync(process.argv[3], JSON.stringify({
                         if (-not [bool]$pause.Data.paused) { throw "the normal user graceful pause did not pause the batch" }
                         $resume = Invoke-P5Api -Method Post -Path "/api/versions/$($permissionsWorld.VersionId)/batches/$batchId/resume" -Headers $userHeaders -Body @{}
                         Assert-P5Http -Response $resume -Status 200 -Label "normal user resume" | Out-Null
-                        $cancel = Invoke-P5Api -Method Post -Path "/api/versions/$($permissionsWorld.VersionId)/batches/$batchId/cancel" -Headers $userHeaders -Body @{}
-                        Assert-P5Http -Response $cancel -Status 200 -Label "normal user cancel" | Out-Null
+                        $cancel = Invoke-P5Api -Method Post -Path "/api/versions/$($permissionsWorld.VersionId)/batches/$batchId/cancel" -Headers $userHeaders -Body @{} -NoThrow
+                        if ($cancel.Status -eq 409) {
+                            # The fast fake-LLM batch may have finished before cancel; a
+                            # finished batch is a legitimate 409, not a permission failure.
+                            if ([string]$cancel.Error.Reason -ne "batch_finished") {
+                                throw "normal user cancel returned HTTP 409/'$($cancel.Error.Reason)', expected 200 or 409 batch_finished"
+                            }
+                        } elseif ($cancel.Status -ne 200) {
+                            throw "normal user cancel returned HTTP $($cancel.Status), expected 200 or 409 batch_finished"
+                        }
 
                         if ($script:p6.AuthFlowAvailable) {
                             $forbiddenList = Invoke-P5Api -Method Get -Path "/api/resources/auth-flows" -Headers $userHeaders -NoThrow
