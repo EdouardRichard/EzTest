@@ -6,64 +6,38 @@ import (
 	"net/http"
 	"unicode/utf8"
 
+	deliveryapp "github.com/EdouardRichard/EzTest/backend/internal/delivery/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
 )
 
 // GlobalIssueFilter is the cross-version issue filter of GET /api/issues
 // (spec §7.10): the version-scoped filter of §7.3 plus versionId. The cursor is
-// the opaque keyset cursor owned by the reader.
-type GlobalIssueFilter struct {
-	VersionID  *int64
-	Status     string
-	Severity   string
-	Category   string
-	BatchID    *int64
-	CaseRunID  *int64
-	CaseNodeID *int64
-	Query      string
-	Cursor     string
-	Limit      int
-}
+// the opaque keyset cursor owned by the reader. The shape is owned by
+// delivery/application (T17b) so the infrastructure readers can implement the
+// port without importing this package; the HTTP contract is unchanged.
+type GlobalIssueFilter = deliveryapp.GlobalIssueFilter
 
 // GlobalIssueRow is one row of the global issue centre: the issue aggregate, its
 // refs and the owning version's display name.
-type GlobalIssueRow struct {
-	Issue       domain.Issue
-	Refs        []domain.IssueRef
-	VersionName string
-}
+type GlobalIssueRow = deliveryapp.GlobalIssueRow
 
 // GlobalIssueReader is the cross-version issue page query of GET /api/issues.
-//
-// The delivery application package currently has only version-scoped queries
-// (IssueService.List), so the T12 handlers consume this consumer-defined port.
-// T17 must add the additive cross-version application/repository query and adapt
-// it here (issue joined with version.name, filters + created_at DESC,id DESC
-// keyset pagination); T12 is not allowed to edit the T2-owned service files.
+// *deliveryapp.GlobalReaderService implements it (T17b), over the delivery-owned
+// issue store and the version-name adapter; the composition root wires it.
 type GlobalIssueReader interface {
 	ListGlobalIssues(ctx context.Context, filter GlobalIssueFilter) ([]GlobalIssueRow, string, bool, error)
 }
 
 // GlobalReportFilter is the cross-version report filter of GET /api/reports
 // (spec §7.10). The cursor is the opaque keyset cursor owned by the reader.
-type GlobalReportFilter struct {
-	VersionID *int64
-	Status    string
-	Cursor    string
-	Limit     int
-}
+type GlobalReportFilter = deliveryapp.GlobalReportFilter
 
 // GlobalReportRow is one row of the global report centre: the report summary, its
 // owning version's display name and the batch number.
-type GlobalReportRow struct {
-	Report      domain.Report
-	VersionName string
-	BatchNo     int
-}
+type GlobalReportRow = deliveryapp.GlobalReportRow
 
 // GlobalReportReader is the cross-version report page query of GET /api/reports.
-// It has the same T17 gap as GlobalIssueReader: the delivery application package
-// only exposes version-scoped report queries.
+// *deliveryapp.GlobalReaderService implements it (T17b).
 type GlobalReportReader interface {
 	ListGlobalReports(ctx context.Context, filter GlobalReportFilter) ([]GlobalReportRow, string, bool, error)
 }
