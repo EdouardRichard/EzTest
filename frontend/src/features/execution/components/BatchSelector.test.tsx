@@ -11,6 +11,7 @@ function batchFixture(overrides: Partial<Batch> = {}): Batch {
     version_id: "1844674407370955161",
     batch_no: 1,
     status: "done",
+    kind: "baseline",
     paused: false,
     pause_mode: "",
     pause_reason: "",
@@ -52,10 +53,45 @@ describe("BatchSelector", () => {
 
     const select = screen.getByTestId("exec-batch-selector") as HTMLSelectElement
     expect(select.value).toBe(first.id)
-    expect(screen.getByText("批次 #2（执行中）")).toBeTruthy()
+    expect(screen.getByText("批次 #2 · 基线（执行中）")).toBeTruthy()
 
     fireEvent.change(select, { target: { value: second.id } })
     expect(onChange).toHaveBeenCalledWith(second.id)
+  })
+
+  it("shows the kind badge, parent and the supplement origin of the selected batch", () => {
+    const parent = batchFixture({ id: "1844674407370955161", batch_no: 1 })
+    const supplement = batchFixture({
+      id: "1844674407370955163",
+      batch_no: 2,
+      status: "done",
+      kind: "supplement",
+      parentBatchId: parent.id,
+    })
+
+    render(
+      <BatchSelector batches={[supplement, parent]} value={supplement.id} onChange={vi.fn()} />,
+    )
+
+    const badge = screen.getByTestId("batch-kind-badge")
+    expect(badge.getAttribute("data-kind")).toBe("supplement")
+    expect(badge.textContent).toContain("补全")
+    expect(screen.getByTestId("batch-parent").textContent).toContain("父批次 #1")
+    expect(screen.getByTestId("batch-origin").textContent).toContain("由补全 Agent 创建")
+
+    // The option label also carries the kind so the list is scannable.
+    const select = screen.getByTestId("exec-batch-selector") as HTMLSelectElement
+    expect(select.options[0]?.textContent).toContain("补全")
+    expect(select.options[0]?.textContent).toContain("父批次 #1")
+  })
+
+  it("reads a historical batch without a kind as the baseline", () => {
+    render(<BatchSelector batches={[batchFixture({ kind: undefined })]} value="" />)
+
+    expect(screen.getByTestId("batch-kind-badge").getAttribute("data-kind")).toBe("baseline")
+    expect(screen.getByTestId("batch-kind-badge").textContent).toContain("基线")
+    expect(screen.queryByTestId("batch-parent")).toBeNull()
+    expect(screen.queryByTestId("batch-origin")).toBeNull()
   })
 
   it("renders nothing when there is no batch to select", () => {

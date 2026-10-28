@@ -20,17 +20,18 @@ import {
   resumeBatch,
 } from "../api"
 import { describeExecutionError } from "../execution-errors"
-import type {
-  Batch,
-  BatchQuery,
-  BatchStatus,
-  CaseRun,
-  CaseRunQuery,
-  CaseRunStatus,
-  CreateBatchBody,
-  PauseMode,
-  ReportDownload,
-  ReportView,
+import {
+  type Batch,
+  type BatchQuery,
+  type BatchStatus,
+  type CaseRun,
+  type CaseRunQuery,
+  type CaseRunStatus,
+  type CreateBatchBody,
+  P7_EVENT_TYPES,
+  type PauseMode,
+  type ReportDownload,
+  type ReportView,
 } from "../types"
 
 /** At most one live-data refresh per window, whichever event triggers it. */
@@ -39,8 +40,20 @@ export const EXECUTION_REFRESH_THROTTLE_MS = 500
 /** Batch statuses that count as "active" for the header/start-batch UI. */
 const ACTIVE_BATCH_STATUSES: readonly BatchStatus[] = ["planned", "running"]
 
-/** SSE event types that can change batches, case runs or the report (spec §5.10). */
-function isExecutionRefreshEvent(type: string): boolean {
+/** P7 event families that always invalidate the execution projection (spec §8.3). */
+const P7_EVENT_FAMILIES: readonly string[] = ["issue.", "report.", "analysis."]
+
+/** P7 non-family event types (the two case lifecycle events of spec §8.1). */
+const P7_CASE_EVENT_TYPES = new Set<string>(
+  P7_EVENT_TYPES.filter((type) => type.startsWith("case.")),
+)
+
+/**
+ * SSE event types that can change batches, case runs, issues, analyses or the
+ * report (spec §5.10, §8.3). Exported so the UI refresh contract is pinned by
+ * a unit test instead of only through a hook render.
+ */
+export function isExecutionRefreshEvent(type: string): boolean {
   return (
     type.startsWith("batch.") ||
     type.startsWith("run.") ||
@@ -48,7 +61,9 @@ function isExecutionRefreshEvent(type: string): boolean {
     type === "evidence.created" ||
     type === "case.status_changed" ||
     type === "human.requested" ||
-    type.startsWith("gate.")
+    type.startsWith("gate.") ||
+    P7_EVENT_FAMILIES.some((family) => type.startsWith(family)) ||
+    P7_CASE_EVENT_TYPES.has(type)
   )
 }
 

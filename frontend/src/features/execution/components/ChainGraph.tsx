@@ -57,6 +57,32 @@ const REQUIREMENT_STATUS_LABELS: Record<string, string> = {
   obsolete: "已废弃",
 }
 
+const ISSUE_STATUS_LABELS: Record<string, string> = {
+  open: "待确认",
+  confirmed: "已确认",
+  dismissed: "已驳回",
+}
+
+const ISSUE_SEVERITY_LABELS: Record<string, string> = {
+  blocker: "阻断",
+  major: "严重",
+  minor: "一般",
+  info: "提示",
+}
+
+/** Red used by the issue diamond (meaning is also carried by the "!" glyph). */
+const ISSUE_COLOR = "#ef4444"
+/** Amber used by the needs_revalidation border and badge (spec §10.5). */
+const REVALIDATION_COLOR = "#f59e0b"
+
+function issueStatusLabel(status: string): string {
+  return ISSUE_STATUS_LABELS[status] ?? (status === "" ? "—" : status)
+}
+
+function issueSeverityLabel(severity: string): string {
+  return ISSUE_SEVERITY_LABELS[severity] ?? (severity === "" ? "—" : severity)
+}
+
 function resultMeta(status: string): ResultMeta {
   return (
     RESULT_STATUS_META[status as CaseRunStatus] ?? {
@@ -95,6 +121,7 @@ function formatDuration(durationMs: number | undefined): string {
 function statusLabelOf(node: ChainNode): string {
   if (node.kind === "result") return resultMeta(node.status).label
   if (node.kind === "case") return caseStatusLabel(node.status)
+  if (node.kind === "issue") return issueStatusLabel(node.status)
   return requirementStatusLabel(node.status)
 }
 
@@ -109,7 +136,15 @@ function nodeAriaLabel(node: ChainNode): string {
   if (node.kind === "case") {
     const parts = [`用例：${node.title}`, status]
     if (node.case?.aiSupplemented === true) parts.push("AI 补充")
+    if (node.status === "needs_revalidation") parts.push("需重验")
     return parts.join("，")
+  }
+  if (node.kind === "issue") {
+    return [
+      `问题：${node.title}`,
+      `严重级 ${issueSeverityLabel(node.issue?.severity ?? "")}`,
+      status,
+    ].join("，")
   }
   const parts = [`结果：${node.title}`, status]
   const duration = formatDuration(node.result?.durationMs)
@@ -395,9 +430,12 @@ export function ChainGraph({ layout, selectedId, onSelect, onToggleRequirement }
               const endY = target.y + target.h / 2
               const midX = (startX + endX) / 2
               const stroke =
-                edge.kind === "case-result" && target.kind === "result"
-                  ? resultMeta(target.status).color
-                  : "var(--border, #cbd5e1)"
+                edge.kind === "issue-link"
+                  ? ISSUE_COLOR
+                  : edge.kind === "case-result" && target.kind === "result"
+                    ? resultMeta(target.status).color
+                    : "var(--border, #cbd5e1)"
+              const dashed = edge.kind === "requirement-case" || edge.kind === "issue-link"
               return (
                 <path
                   key={edge.id}
@@ -407,7 +445,7 @@ export function ChainGraph({ layout, selectedId, onSelect, onToggleRequirement }
                   fill="none"
                   stroke={stroke}
                   strokeWidth={1.5}
-                  strokeDasharray={edge.kind === "requirement-case" ? "6 4" : undefined}
+                  strokeDasharray={dashed ? "6 4" : undefined}
                   opacity={0.9}
                 />
               )
@@ -426,9 +464,13 @@ export function ChainGraph({ layout, selectedId, onSelect, onToggleRequirement }
                     if (element === null) itemRefs.current.delete(node.id)
                     else itemRefs.current.set(node.id, element)
                   }}
-                  data-testid={`chain-node-${node.id}`}
+                  data-testid={
+                    node.kind === "issue" ? `chain-issue-node-${node.id}` : `chain-node-${node.id}`
+                  }
                   data-kind={node.kind}
                   data-status={node.status}
+                  data-severity={node.kind === "issue" ? node.issue?.severity : undefined}
+                  data-revalidation={node.status === "needs_revalidation" ? "true" : undefined}
                   data-active={isActive ? "true" : undefined}
                   role="treeitem"
                   aria-level={node.layer + 1}
@@ -494,8 +536,12 @@ export function ChainGraph({ layout, selectedId, onSelect, onToggleRequirement }
                         height={node.h}
                         rx={10}
                         fill="var(--card, #ffffff)"
-                        stroke="var(--border, #cbd5e1)"
-                        strokeWidth={1.5}
+                        stroke={
+                          node.status === "needs_revalidation"
+                            ? REVALIDATION_COLOR
+                            : "var(--border, #cbd5e1)"
+                        }
+                        strokeWidth={node.status === "needs_revalidation" ? 2 : 1.5}
                         strokeDasharray={node.case?.aiSupplemented === true ? "6 4" : undefined}
                         className="group-focus-visible:[stroke-width:2.5px]"
                       />
@@ -517,7 +563,7 @@ export function ChainGraph({ layout, selectedId, onSelect, onToggleRequirement }
                         {`用例 · ${caseStatusLabel(node.status)}`}
                       </text>
                       {node.case?.aiSupplemented === true ? (
-                        <>
+                        <g data-testid="chain-supplement-badge">
                           <rect
                             x={node.x + node.w - 34}
                             y={node.y + 10}
@@ -535,8 +581,69 @@ export function ChainGraph({ layout, selectedId, onSelect, onToggleRequirement }
                           >
                             AI
                           </text>
-                        </>
+                        </g>
                       ) : null}
+                      {node.status === "needs_revalidation" ? (
+                        <g data-testid="chain-revalidation-badge">
+                          <rect
+                            x={node.x + node.w - 62}
+                            y={node.y + 40}
+                            width={52}
+                            height={16}
+                            rx={8}
+                            fill="#fef3c7"
+                            stroke={REVALIDATION_COLOR}
+                          />
+                          <text
+                            x={node.x + node.w - 36}
+                            y={node.y + 51.5}
+                            fontSize={9}
+                            textAnchor="middle"
+                            fill="#92400e"
+                          >
+                            需重验
+                          </text>
+                        </g>
+                      ) : null}
+                    </>
+                  ) : null}
+
+                  {node.kind === "issue" ? (
+                    <>
+                      {/* Red diamond of spec §10.5; the "!" glyph avoids a colour-only encoding. */}
+                      <polygon
+                        points={`${node.x + 18},${node.y + 8} ${node.x + 34},${node.y + 26} ${node.x + 18},${node.y + 44} ${node.x + 2},${node.y + 26}`}
+                        fill={ISSUE_COLOR}
+                        stroke="#b91c1c"
+                        strokeWidth={1}
+                      />
+                      <text
+                        x={node.x + 18}
+                        y={node.y + 31}
+                        fontSize={13}
+                        fontWeight={700}
+                        textAnchor="middle"
+                        fill="#ffffff"
+                      >
+                        !
+                      </text>
+                      <text
+                        x={node.x + 42}
+                        y={node.y + 22}
+                        fontSize={12}
+                        fontWeight={600}
+                        fill="var(--card-foreground, #0f172a)"
+                      >
+                        {clipTitle(node.title, 8)}
+                      </text>
+                      <text
+                        x={node.x + 42}
+                        y={node.y + 41}
+                        fontSize={10.5}
+                        fill="var(--muted-foreground, #5b6779)"
+                      >
+                        {`问题 · ${issueSeverityLabel(node.issue?.severity ?? "")} · ${issueStatusLabel(node.status)}`}
+                      </text>
                     </>
                   ) : null}
 

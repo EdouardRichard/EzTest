@@ -5,6 +5,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
 import { EmptyState } from "@/components/ui/EmptyState"
 import { StatusBadge, type StatusBadgeVariant } from "@/components/ui/StatusBadge"
+import { useIssues } from "@/features/delivery/hooks/useIssues"
+import type { IssueSummary } from "@/features/delivery/types"
 import { getGraph } from "@/features/mindmap/api"
 import type { CaseNodeView, MindmapGraph } from "@/features/mindmap/types"
 import { listRequirements } from "@/features/versions/api"
@@ -14,6 +16,7 @@ import type { VersionStreamState } from "@/features/versions/useVersionStream"
 import {
   autoCollapsedRequirements,
   type ChainCaseInput,
+  type ChainIssueInput,
   type ChainLayoutInput,
   type ChainNode,
   type ChainRequirementInput,
@@ -28,8 +31,9 @@ import type { CaseRun, CaseRunStatus } from "../types"
 import { ChainGraph } from "./ChainGraph"
 import { FailureClassBadge } from "./FailureClassBadge"
 
-/** Requirements fetched for the chain; comfortably below the auto-collapse scale. */
+/** Requirements/issues fetched for the chain; keeps the graph at a sane scale. */
 const REQUIREMENT_LIMIT = 200
+const ISSUE_LIMIT = 200
 
 const BUTTON_CLASS =
   "inline-flex items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -77,6 +81,38 @@ const REQUIREMENT_STATUS_LABELS: Record<string, string> = {
   obsolete: "已废弃",
 }
 
+const ISSUE_STATUS_LABELS: Record<string, string> = {
+  open: "待确认",
+  confirmed: "已确认",
+  dismissed: "已驳回",
+}
+
+const ISSUE_SEVERITY_LABELS: Record<string, string> = {
+  blocker: "阻断",
+  major: "严重",
+  minor: "一般",
+  info: "提示",
+}
+
+const ISSUE_CONFIDENCE_LABELS: Record<string, string> = {
+  high: "高",
+  medium: "中",
+  low: "低",
+}
+
+const ISSUE_CATEGORY_LABELS: Record<string, string> = {
+  defect: "应用缺陷",
+  requirement_gap: "需求缺口",
+  other: "其他",
+}
+
+const ISSUE_SEVERITY_BADGE_VARIANTS: Record<string, StatusBadgeVariant> = {
+  blocker: "danger",
+  major: "warning",
+  minor: "info",
+  info: "neutral",
+}
+
 const STATUS_FILTER_OPTIONS: readonly { value: ChainResultFilter; label: string }[] = [
   { value: "", label: "全部状态" },
   { value: "passed", label: "通过" },
@@ -88,11 +124,12 @@ const STATUS_FILTER_OPTIONS: readonly { value: ChainResultFilter; label: string 
   { value: "pending", label: "待执行/执行中" },
 ]
 
-/** Deep-link target of the node drawer (spec §9.3: 节点抽屉 + 深链). */
+/** Deep-link target of the node drawer (spec §10.5: 节点抽屉 + 深链). */
 export type ExplorationDeepLink =
   | { kind: "requirement"; id: string }
   | { kind: "case"; id: string }
   | { kind: "result"; id: string }
+  | { kind: "issue"; id: string }
 
 export type ExplorationTabProps = {
   /** P3 version id; never re-parsed (spec §7.1). */
@@ -127,6 +164,45 @@ function caseStatusLabel(status: string): string {
 
 function requirementStatusLabel(status: string): string {
   return REQUIREMENT_STATUS_LABELS[status] ?? (status === "" ? "—" : status)
+}
+
+function issueStatusLabel(status: string): string {
+  return ISSUE_STATUS_LABELS[status] ?? (status === "" ? "—" : status)
+}
+
+function issueSeverityLabel(severity: string): string {
+  return ISSUE_SEVERITY_LABELS[severity] ?? (severity === "" ? "—" : severity)
+}
+
+function issueConfidenceLabel(confidence: string): string {
+  return ISSUE_CONFIDENCE_LABELS[confidence] ?? (confidence === "" ? "—" : confidence)
+}
+
+function issueCategoryLabel(category: string): string {
+  return ISSUE_CATEGORY_LABELS[category] ?? (category === "" ? "—" : category)
+}
+
+/** Evidence refs of an issue summary; other ref kinds are not evidence. */
+function issueEvidenceIds(issue: IssueSummary): string[] {
+  return (issue.refs ?? [])
+    .filter((ref) => ref.kind === "evidence" && ref.id !== "")
+    .map((ref) => ref.id)
+}
+
+/** Maps one delivery issue to the chain issue layer (layout plus drawer data). */
+function toChainIssue(issue: IssueSummary, index: number): ChainIssueInput {
+  return {
+    id: issue.id,
+    title: issue.title,
+    status: issue.status,
+    severity: issue.severity,
+    confidence: issue.confidence,
+    category: issue.category,
+    caseNodeId: issue.caseNodeId,
+    caseRunId: issue.caseRunId,
+    evidenceIds: issueEvidenceIds(issue),
+    sortOrder: index,
+  }
 }
 
 /** True when `candidate` is a newer attempt than `current` (tie-break by id). */
@@ -180,21 +256,36 @@ type ChainDrawerProps = {
   onNavigate?: (target: ExplorationDeepLink) => void
 }
 
-/** Node drawer: summary, evidence and deep links (spec §9.3). */
+/** Node drawer: summary, evidence and deep links (spec §10.5). */
 function ChainDrawer({ node, onClose, onOpenEvidence, onNavigate }: ChainDrawerProps) {
   const kindLabel =
-    node.kind === "requirement" ? "需求节点" : node.kind === "case" ? "用例节点" : "执行结果"
+    node.kind === "requirement"
+      ? "需求节点"
+      : node.kind === "case"
+        ? "用例节点"
+        : node.kind === "issue"
+          ? "问题节点"
+          : "执行结果"
   const statusLabel =
     node.kind === "result"
       ? (RESULT_STATUS_LABELS[node.status as CaseRunStatus] ?? node.status)
       : node.kind === "case"
         ? caseStatusLabel(node.status)
-        : requirementStatusLabel(node.status)
+        : node.kind === "issue"
+          ? issueStatusLabel(node.status)
+          : requirementStatusLabel(node.status)
   const badgeVariant =
     node.kind === "result"
       ? (RESULT_BADGE_VARIANTS[node.status as CaseRunStatus] ?? "neutral")
-      : "neutral"
-  const evidenceIds = node.kind === "result" ? (node.result?.evidenceIds ?? []) : []
+      : node.kind === "issue"
+        ? (ISSUE_SEVERITY_BADGE_VARIANTS[node.issue?.severity ?? ""] ?? "neutral")
+        : "neutral"
+  const evidenceIds =
+    node.kind === "result"
+      ? (node.result?.evidenceIds ?? [])
+      : node.kind === "issue"
+        ? (node.issue?.evidenceIds ?? [])
+        : []
   const resultCaseId = node.kind === "result" ? node.caseNodeId : null
   const summary =
     node.kind === "result" && (node.result?.summary ?? "") !== ""
@@ -203,7 +294,9 @@ function ChainDrawer({ node, onClose, onOpenEvidence, onNavigate }: ChainDrawerP
         ? "该需求派生出的用例与执行结果如下。"
         : node.kind === "case"
           ? "该用例的执行结果与证据如下。"
-          : "该执行结果暂无摘要。"
+          : node.kind === "issue"
+            ? "该问题关联的用例执行结果可追溯证据；打开问题页查看复现步骤与处理记录。"
+            : "该执行结果暂无摘要。"
 
   return (
     <aside
@@ -241,6 +334,19 @@ function ChainDrawer({ node, onClose, onOpenEvidence, onNavigate }: ChainDrawerP
             {`耗时 ${formatDuration(node.result?.durationMs)}`}
           </span>
         ) : null}
+        {node.kind === "issue" ? (
+          <>
+            <span className="text-xs text-muted-foreground">
+              {`严重级：${issueSeverityLabel(node.issue?.severity ?? "")}`}
+            </span>
+            <span className="text-xs text-muted-foreground">
+              {`置信度：${issueConfidenceLabel(node.issue?.confidence ?? "")}`}
+            </span>
+            <span className="text-xs text-muted-foreground">
+              {`分类：${issueCategoryLabel(node.issue?.category ?? "")}`}
+            </span>
+          </>
+        ) : null}
       </div>
 
       <p className="mt-3 text-sm leading-relaxed text-muted-foreground">{summary}</p>
@@ -276,6 +382,28 @@ function ChainDrawer({ node, onClose, onOpenEvidence, onNavigate }: ChainDrawerP
           >
             查看用例
           </button>
+        ) : null}
+        {node.kind === "issue" ? (
+          <>
+            <button
+              type="button"
+              data-testid="chain-drawer-open-issue"
+              onClick={() => onNavigate?.({ kind: "issue", id: node.id })}
+              className={BUTTON_CLASS}
+            >
+              查看问题
+            </button>
+            {node.caseNodeId === null ? null : (
+              <button
+                type="button"
+                data-testid="chain-drawer-open-case"
+                onClick={() => onNavigate?.({ kind: "case", id: node.caseNodeId ?? "" })}
+                className={BUTTON_CLASS}
+              >
+                查看用例
+              </button>
+            )}
+          </>
         ) : null}
         {node.kind === "result" && resultCaseId !== null ? (
           <>
@@ -327,7 +455,9 @@ function ChainDrawer({ node, onClose, onOpenEvidence, onNavigate }: ChainDrawerP
       >
         <h4 className="text-xs font-semibold">问题</h4>
         <p className="mt-1 text-xs text-muted-foreground">
-          问题节点由 P7 提供，P6 不抓取问题数据（空态）。
+          {node.kind === "issue"
+            ? "问题状态与处理结果以问题页为准。"
+            : "该节点关联的问题节点会以红色菱形显示在链路图中。"}
         </p>
       </section>
     </aside>
@@ -335,11 +465,12 @@ function ChainDrawer({ node, onClose, onOpenEvidence, onNavigate }: ChainDrawerP
 }
 
 /**
- * Exploration chain tab (spec §9.3): requirement → case → result layers drawn
- * as hand-written SVG, status colour plus glyph/text, requirement/status/
- * abnormal filters, a node drawer with evidence and deep-link callbacks, and
- * per-requirement collapse (auto-collapsed above 200 nodes). Issue data is
- * never fetched — the P7 empty state is rendered instead.
+ * Exploration chain tab (spec §10.5): requirement → case → result → issue
+ * layers drawn as hand-written SVG, status colour plus glyph/text, AI-supplement
+ * and needs_revalidation styles, requirement/status/abnormal/batch filters, a
+ * node drawer with evidence and deep-link callbacks, and per-requirement
+ * collapse (auto-collapsed above 200 nodes). Issue data comes from the delivery
+ * `/issues` API (version-scoped, T18) and is merged into the same layout.
  */
 export function ExplorationTab({
   versionId,
@@ -355,6 +486,7 @@ export function ExplorationTab({
   const [requirementFilter, setRequirementFilter] = useState("")
   const [statusFilter, setStatusFilter] = useState<ChainResultFilter>("")
   const [abnormalOnly, setAbnormalOnly] = useState(false)
+  const [issueBatchFilter, setIssueBatchFilter] = useState<"current" | "all">("current")
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [collapsed, setCollapsed] = useState<ReadonlySet<string> | null>(null)
   const requestRef = useRef(0)
@@ -394,12 +526,24 @@ export function ExplorationTab({
     refresh,
   } = useCaseRuns(versionId, batchId ?? "", {}, stream)
 
+  // Without a batch scope there is nothing to narrow to, so the filter is "all".
+  const effectiveIssueBatchFilter: "current" | "all" =
+    batchId === undefined || batchId === "" ? "all" : issueBatchFilter
+  const issueQuery = useIssues(
+    versionId,
+    effectiveIssueBatchFilter === "current" && batchId !== undefined
+      ? { batchId, limit: ISSUE_LIMIT }
+      : { limit: ISSUE_LIMIT },
+    stream,
+  )
+
   // A version or batch switch starts a fresh view.
   // biome-ignore lint/correctness/useExhaustiveDependencies: switching scope must reset the view state even though no value is read.
   useEffect(() => {
     setRequirementFilter("")
     setStatusFilter("")
     setAbnormalOnly(false)
+    setIssueBatchFilter("current")
     setSelectedId(null)
     setCollapsed(null)
   }, [versionId, batchId])
@@ -445,19 +589,26 @@ export function ExplorationTab({
     [caseRuns],
   )
 
+  const issueInputs = useMemo<ChainIssueInput[]>(
+    () => issueQuery.items.map((issue, index) => toChainIssue(issue, index)),
+    [issueQuery.items],
+  )
+
   const baseInput = useMemo<ChainLayoutInput>(
     () => ({
       requirements: requirementInputs,
       cases: caseInputs,
       results: resultInputs,
+      issues: issueInputs,
     }),
-    [requirementInputs, caseInputs, resultInputs],
+    [requirementInputs, caseInputs, resultInputs, issueInputs],
   )
 
   const filteredInput = useMemo<ChainLayoutInput>(() => {
     let nextRequirements = baseInput.requirements
     let nextCases = baseInput.cases
     let nextResults = baseInput.results ?? []
+    let nextIssues = baseInput.issues ?? []
 
     if (requirementFilter !== "") {
       nextRequirements = nextRequirements.filter((row) => row.id === requirementFilter)
@@ -482,7 +633,25 @@ export function ExplorationTab({
       }
     }
 
-    return { requirements: nextRequirements, cases: nextCases, results: nextResults }
+    if (requirementFilter !== "" || statusFilter !== "" || abnormalOnly) {
+      // Graph issues follow their case; unlinked issues stay in the side list.
+      const nextCaseIds = new Set(nextCases.map((row) => row.id))
+      const resultsByRun = new Map((baseInput.results ?? []).map((row) => [row.id, row.caseNodeId]))
+      nextIssues = nextIssues.filter((issue) => {
+        const caseNodeId =
+          issue.caseNodeId !== null && issue.caseNodeId !== undefined && issue.caseNodeId !== ""
+            ? issue.caseNodeId
+            : (resultsByRun.get(issue.caseRunId ?? "") ?? null)
+        return caseNodeId === null ? true : nextCaseIds.has(caseNodeId)
+      })
+    }
+
+    return {
+      requirements: nextRequirements,
+      cases: nextCases,
+      results: nextResults,
+      issues: nextIssues,
+    }
   }, [baseInput, requirementFilter, statusFilter, abnormalOnly])
 
   const autoCollapsed = useMemo(() => autoCollapsedRequirements(filteredInput), [filteredInput])
@@ -524,6 +693,7 @@ export function ExplorationTab({
   function retry(): void {
     void loadMeta()
     void refresh()
+    void issueQuery.refresh()
   }
 
   return (
@@ -532,7 +702,8 @@ export function ExplorationTab({
         <div>
           <h2 className="text-base font-semibold tracking-tight">探索链路</h2>
           <p className="mt-0.5 text-xs text-muted-foreground">
-            需求 → 用例 → 结果的血缘图；问题节点由 P7 提供。拖拽平移、滚轮缩放、按需求折叠。
+            需求 → 用例 → 结果 → 问题的血缘图；红色菱形为问题，虚线 AI
+            角标为补全用例，黄色描边为需重验用例。拖拽平移、滚轮缩放、按需求折叠。
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -554,7 +725,7 @@ export function ExplorationTab({
         </div>
       </header>
 
-      <div className="grid gap-2 rounded-2xl border border-border bg-card p-3 sm:grid-cols-2 lg:grid-cols-4">
+      <div className="grid gap-2 rounded-2xl border border-border bg-card p-3 sm:grid-cols-2 lg:grid-cols-5">
         <label className="text-xs font-medium text-muted-foreground">
           需求
           <select
@@ -585,6 +756,23 @@ export function ExplorationTab({
                 {option.label}
               </option>
             ))}
+          </select>
+        </label>
+
+        <label className="text-xs font-medium text-muted-foreground">
+          批次
+          <select
+            data-testid="chain-batch-filter"
+            value={effectiveIssueBatchFilter}
+            onChange={(event) =>
+              setIssueBatchFilter(event.target.value === "current" ? "current" : "all")
+            }
+            className={FIELD_CLASS}
+          >
+            <option value="current" disabled={batchId === undefined || batchId === ""}>
+              当前批次
+            </option>
+            <option value="all">全部批次</option>
           </select>
         </label>
 
@@ -668,19 +856,70 @@ export function ExplorationTab({
                 onNavigate={onNavigate}
               />
             )}
-
-            <aside
-              data-testid="chain-issue-placeholder"
-              className="rounded-2xl border border-dashed border-border bg-card/60 px-4 py-3"
-            >
-              <h3 className="text-sm font-semibold">问题节点（P7）</h3>
-              <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-                P7 提供问题数据；P6 不抓取问题节点，当前显示为空态。
-              </p>
-            </aside>
           </div>
         </div>
       ) : null}
+
+      <aside
+        data-testid="chain-issue-panel"
+        className="rounded-2xl border border-border bg-card px-4 py-3"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h3 className="text-sm font-semibold">问题节点</h3>
+          <p data-testid="chain-issue-count" className="text-xs text-muted-foreground">
+            {`${issueInputs.length} 个问题`}
+          </p>
+        </div>
+
+        {issueQuery.error !== "" ? (
+          <p
+            data-testid="chain-issues-degraded"
+            role="alert"
+            className="mt-2 rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
+          >
+            {`问题数据加载失败：${issueQuery.error} 问题节点可能不完整（AI 分析降级时同样可能不完整）。`}
+          </p>
+        ) : issueQuery.loading && issueQuery.items.length === 0 ? (
+          <p
+            data-testid="chain-issues-loading"
+            role="status"
+            className="mt-2 flex items-center gap-2 text-xs text-muted-foreground"
+          >
+            <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+            问题加载中…
+          </p>
+        ) : issueQuery.items.length === 0 ? (
+          <p data-testid="chain-issues-empty" className="mt-2 text-xs text-muted-foreground">
+            本批次未发现问题。
+          </p>
+        ) : (
+          <p className="mt-2 text-xs text-muted-foreground">
+            {`红色菱形为问题节点（${
+              effectiveIssueBatchFilter === "current" ? "当前批次" : "全部批次"
+            }）；点击节点查看摘要、证据与深链。`}
+          </p>
+        )}
+
+        {layout.unlinkedIssues.length === 0 ? null : (
+          <div data-testid="chain-unlinked-issues" className="mt-3">
+            <h4 className="text-xs font-semibold">未关联用例的问题</h4>
+            <ul className="mt-1.5 flex flex-wrap gap-1.5">
+              {layout.unlinkedIssues.map((issue) => (
+                <li key={issue.id}>
+                  <button
+                    type="button"
+                    data-testid={`chain-unlinked-issue-${issue.id}`}
+                    onClick={() => onNavigate?.({ kind: "issue", id: issue.id })}
+                    className={BUTTON_CLASS}
+                  >
+                    {`${issueSeverityLabel(issue.severity ?? "")} · ${issue.title}`}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </aside>
     </section>
   )
 }

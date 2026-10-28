@@ -43,6 +43,7 @@ vi.mock("@/features/versions/useVersionStream", () => ({
 }))
 
 import {
+  isExecutionRefreshEvent,
   useBatch,
   useBatches,
   useCaseRun,
@@ -51,6 +52,7 @@ import {
   useExecutionActions,
   useReport,
 } from "./hooks/useExecution"
+import { P7_EVENT_TYPES } from "./types"
 
 const VERSION_ID = "1844674407370955161"
 const BATCH_ID = "1844674407370955162"
@@ -273,6 +275,61 @@ describe("execution hooks", () => {
 
     expect(mocks.listBatches).toHaveBeenCalledTimes(2)
     expect(rendered.result.current.batches[0]?.paused).toBe(true)
+  })
+
+  it("refreshes on the eight P7 autonomy event types", () => {
+    for (const type of P7_EVENT_TYPES) {
+      expect(isExecutionRefreshEvent(type)).toBe(true)
+    }
+    expect(isExecutionRefreshEvent("batch.started")).toBe(true)
+    expect(isExecutionRefreshEvent("case.status_changed")).toBe(true)
+    expect(isExecutionRefreshEvent("agent.activity")).toBe(false)
+    expect(isExecutionRefreshEvent("issue")).toBe(false)
+    expect(isExecutionRefreshEvent("")).toBe(false)
+  })
+
+  it.each(P7_EVENT_TYPES)(
+    "useBatches refetches after the %s event with no extra stream",
+    async (type) => {
+      mocks.listBatches
+        .mockResolvedValueOnce({ items: [batchFixture()], nextCursor: "", hasMore: false })
+        .mockResolvedValueOnce({
+          items: [batchFixture({ status: "done" })],
+          nextCursor: "",
+          hasMore: false,
+        })
+
+      const rendered = renderHook(() => useBatches(VERSION_ID))
+      await flushPromises()
+      expect(mocks.listBatches).toHaveBeenCalledTimes(1)
+
+      pushEvents(rendered, [event(1, type)])
+      await flushPromises()
+      await advance(500)
+      await flushPromises()
+
+      expect(mocks.listBatches).toHaveBeenCalledTimes(2)
+      // The refetch reuses the version stream, it never opens a second one.
+      expect(mocks.useVersionStream).not.toHaveBeenCalledWith("")
+    },
+  )
+
+  it("ignores events that cannot change the execution projection", async () => {
+    mocks.listBatches.mockResolvedValueOnce({
+      items: [batchFixture()],
+      nextCursor: "",
+      hasMore: false,
+    })
+
+    const rendered = renderHook(() => useBatches(VERSION_ID))
+    await flushPromises()
+
+    pushEvents(rendered, [event(1, "agent.activity")])
+    await flushPromises()
+    await advance(500)
+    await flushPromises()
+
+    expect(mocks.listBatches).toHaveBeenCalledTimes(1)
   })
 
   it("useBatch loads the detail and ignores a late response from the previous batch", async () => {

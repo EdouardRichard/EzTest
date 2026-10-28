@@ -32,6 +32,7 @@ const RUNNING_RUN = "1844674407370955174"
 const INCONCLUSIVE_RUN = "1844674407370955175"
 
 const ASSERTION_ID = "1844674407370955180"
+const DB_ASSERTION_ID = "1844674407370955181"
 const EVIDENCE_SCREENSHOT = "1844674407370955190"
 const EVIDENCE_HTTP = "1844674407370955191"
 const EVIDENCE_CONSOLE = "1844674407370955192"
@@ -398,5 +399,49 @@ describe("ResultsTab", () => {
 
     const alert = await screen.findByRole("alert")
     expect(alert.textContent).toContain("加载用例详情失败：详情加载失败")
+  })
+
+  it("renders db assertion rows with rows/elapsed/truncated/readonly metadata", async () => {
+    const dbAssertion = assertion({
+      id: DB_ASSERTION_ID,
+      kind: "db",
+      target: "public.orders",
+      expected: '{"rows":[["1"]]}',
+      actual: JSON.stringify({
+        columns: ["id", "status"],
+        rows: [["1", "paid"]],
+        rowCount: 3,
+        truncated: true,
+        elapsedMs: 12,
+      }),
+      verdict: "failed",
+      failure_reason: "db_readonly_violation",
+      evidence_ids: [EVIDENCE_CONSOLE],
+    })
+    mocks.useCaseRuns.mockReturnValue(listResult([FAILED_LIST_RUN]))
+    mocks.useCaseRun.mockReturnValue({
+      caseRun: { ...DETAIL, assertions: [dbAssertion] },
+      loading: false,
+      error: "",
+      streamStatus: "live",
+      refresh: mocks.detailRefresh,
+    })
+
+    renderTab()
+    fireEvent.click(screen.getByRole("button", { name: "展开 下单流程" }))
+
+    const row = await screen.findByTestId(`assertion-row-${DB_ASSERTION_ID}`)
+    const scoped = within(row)
+    expect(scoped.getByTestId("assertion-db-badge").textContent).toBe("db")
+    expect(scoped.getByTestId("assertion-db-badge").getAttribute("data-kind")).toBe("db")
+    expect(scoped.getByTestId("assertion-db-rows").textContent).toContain("3 行")
+    expect(scoped.getByTestId("assertion-db-elapsed").textContent).toContain("12 ms")
+    expect(scoped.getByTestId("assertion-db-truncated").textContent).toContain("结果已截断")
+
+    // A read-only violation is a stable reason: show readable copy, not the code.
+    const error = scoped.getByTestId("assertion-db-error")
+    expect(error.getAttribute("data-reason")).toBe("db_readonly_violation")
+    expect(error.textContent).toContain("只读违规")
+    expect(error.textContent).not.toContain("db_readonly_violation")
   })
 })

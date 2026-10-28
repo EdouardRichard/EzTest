@@ -42,6 +42,15 @@ const TYPE_LABELS: Record<string, string> = {
   "run.finished": "用例结束",
   "case.status_changed": "用例状态变更",
   "step.finished": "步骤完成",
+  // P7 autonomy events (spec §8.1/§10.6).
+  "case.supplemented": "用例补全",
+  "case.revalidation_marked": "标记需重验",
+  "issue.created": "问题创建",
+  "issue.updated": "问题更新",
+  "report.published": "报告发布",
+  "report.stale": "报告过期",
+  "analysis.started": "AI 分析开始",
+  "analysis.finished": "AI 分析完成",
 }
 
 const STATUS_SEVERITY: Record<string, Severity> = {
