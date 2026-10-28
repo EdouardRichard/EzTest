@@ -45,7 +45,8 @@ const (
 // the transaction is expected to expose through GraphTx). Baselines is read to
 // derive editability and to re-check the freeze in the write transaction.
 // Anchors is optional: when set, DeleteNode removes the code anchors of the
-// deleted subtree best-effort (spec §6.1 rule 6).
+// deleted subtree best-effort (spec §6.1 rule 6). Logger is optional: when set
+// it receives best-effort failure warnings; a nil logger keeps them silent.
 type GraphDeps struct {
 	Graph        GraphRepository
 	Nodes        NodeRepository
@@ -59,6 +60,7 @@ type GraphDeps struct {
 	Events       EventPublisher
 	IDs          IDGenerator
 	Clock        Clock
+	Logger       *slog.Logger
 }
 
 // GraphNode is one node of the mindmap with its child collections attached.
@@ -1125,16 +1127,19 @@ func (s *GraphService) AddSource(ctx context.Context, versionID, nodeID, actor i
 	if err := validateRefKind(cmd.RefKind); err != nil {
 		return domain.CaseSource{}, err
 	}
-	if cmd.RefKind == domain.RefRequirement {
+	// The case_source CHECK is ref_kind='manual' OR ref_id IS NOT NULL: every
+	// other kind must carry a refId, and only a manual source may be refKey-only.
+	if cmd.RefKind != domain.RefManual {
 		if cmd.RefID == nil {
-			return domain.CaseSource{}, invalidCaseTree("requirement source must carry a requirement id")
+			return domain.CaseSource{}, invalidCaseTree("%s source must carry a refId", cmd.RefKind)
 		}
+	} else if cmd.RefID == nil && strings.TrimSpace(cmd.RefKey) == "" {
+		return domain.CaseSource{}, invalidCaseTree("manual source needs refId or refKey")
+	}
+	if cmd.RefKind == domain.RefRequirement {
 		if _, err := s.requireConfirmedRequirements(ctx, versionID, []int64{*cmd.RefID}, true); err != nil {
 			return domain.CaseSource{}, err
 		}
-	} else if cmd.RefID == nil && strings.TrimSpace(cmd.RefKey) == "" {
-		return domain.CaseSource{}, domain.NewInvalid("refId", "invalid_source",
-			fmt.Sprintf("%s source needs refId or refKey", cmd.RefKind))
 	}
 	sourceKind := cmd.Source
 	if sourceKind == "" {
@@ -1170,6 +1175,19 @@ func (s *GraphService) AddSource(ctx context.Context, versionID, nodeID, actor i
 		if node.Kind != domain.NodeKindCase {
 			return invalidCaseTree("scenario %d must not own sources", nodeID)
 		}
+		for _, existing := range state.sources {
+			if existing.NodeID != nodeID || existing.RefKind != cmd.RefKind {
+				continue
+			}
+			if refIDValue(existing.RefID) != refIDValue(cmd.RefID) || existing.RefKey != cmd.RefKey {
+				continue
+			}
+			// The uk_case_source_ref key rejects a duplicate (node, refKind,
+			// refId, refKey) row; check it before the insert so a duplicate is
+			// a domain conflict and never a raw adapter error.
+			return domain.NewConflict("duplicate_case_source",
+				fmt.Sprintf("node %d already has this %s source", nodeID, cmd.RefKind))
+		}
 		eventNode = node
 		id, err := s.nextID()
 		if err != nil {
@@ -1195,6 +1213,12 @@ func (s *GraphService) AddSource(ctx context.Context, versionID, nodeID, actor i
 		if err != nil {
 			return err
 		}
+		// Bump the node revision in the same transaction so a concurrent source
+		// write that read the old revision loses its CAS instead of silently
+		// committing against a changed source set.
+		if _, err := tx.Nodes().Update(ctx, touchNode(node, actor, now), node.Revision); err != nil {
+			return err
+		}
 		created = stored
 		return nil
 	})
@@ -1211,6 +1235,7 @@ func (s *GraphService) DeleteSource(ctx context.Context, versionID, sourceID, ac
 	if err := s.beginWrite(ctx, versionID); err != nil {
 		return err
 	}
+	now := s.now()
 	var eventNode domain.CaseNode
 	err := s.deps.Graph.InTx(ctx, func(tx GraphTx) error {
 		if err := s.guardFrozenTx(ctx, tx, versionID); err != nil {
@@ -1254,6 +1279,12 @@ func (s *GraphService) DeleteSource(ctx context.Context, versionID, sourceID, ac
 			return err
 		}
 		if err := tx.Sources().Delete(ctx, node.ID, source.ID); err != nil {
+			return err
+		}
+		// Bump the node revision in the same transaction: two overlapping source
+		// deletes read the same revision, so the second loses the CAS instead of
+		// also deleting a row and zeroing the requirement coverage.
+		if _, err := tx.Nodes().Update(ctx, touchNode(node, actor, now), node.Revision); err != nil {
 			return err
 		}
 		eventNode = node
@@ -1350,18 +1381,21 @@ func (s *GraphService) beginWrite(ctx context.Context, versionID int64) error {
 	if err != nil {
 		return err
 	}
-	switch version.Status {
-	case versionStatusDesigning, versionStatusReviewing:
-	default:
-		return domain.NewStateConflict("version_state_conflict",
-			fmt.Sprintf("version %d is %s; the mindmap is editable only in designing or reviewing", versionID, version.Status))
-	}
+	// The baseline is checked before the status: approving a version moves it to
+	// executing and writes the baseline in the same flow, so a write after the
+	// freeze must report baseline_frozen, not version_state_conflict.
 	baseline, err := loadBaseline(ctx, s.deps.Baselines, versionID)
 	if err != nil {
 		return err
 	}
 	if baseline != nil {
 		return baselineFrozenError(versionID)
+	}
+	switch version.Status {
+	case versionStatusDesigning, versionStatusReviewing:
+	default:
+		return domain.NewStateConflict("version_state_conflict",
+			fmt.Sprintf("version %d is %s; the mindmap is editable only in designing or reviewing", versionID, version.Status))
 	}
 	return nil
 }
@@ -1491,12 +1525,26 @@ func (s *GraphService) deleteAnchors(ctx context.Context, versionID int64, nodeI
 	for _, nodeID := range nodeIDs {
 		anchors, err := s.deps.Anchors.List(ctx, versionID, nodeID)
 		if err != nil {
+			s.warn(ctx, "mindmap anchor cleanup list failed",
+				"version_id", versionID, "node_id", nodeID, "error", err)
 			continue
 		}
 		for _, anchor := range anchors {
-			_ = s.deps.Anchors.Delete(ctx, versionID, anchor.ID)
+			if err := s.deps.Anchors.Delete(ctx, versionID, anchor.ID); err != nil {
+				s.warn(ctx, "mindmap anchor cleanup delete failed",
+					"version_id", versionID, "node_id", nodeID, "anchor_id", anchor.ID, "error", err)
+			}
 		}
 	}
+}
+
+// warn logs a best-effort failure through the optional logger; a nil logger
+// keeps the failure silent.
+func (s *GraphService) warn(ctx context.Context, msg string, args ...any) {
+	if s.deps.Logger == nil {
+		return
+	}
+	s.deps.Logger.WarnContext(ctx, msg, args...)
 }
 
 // publish sends one event after the commit. A publish failure is logged and
@@ -1646,8 +1694,9 @@ func validateTreeState(state graphState) error {
 }
 
 // validateSourceState enforces spec §6.2: sources only exist on case nodes,
-// every requirement source carries a requirement id, and every case keeps at
-// least one requirement source.
+// every source except a manual one carries a refId (the DB CHECK is
+// ref_kind='manual' OR ref_id IS NOT NULL), and every case keeps at least one
+// requirement source.
 func validateSourceState(state graphState) error {
 	nodesByID := make(map[int64]domain.CaseNode, len(state.nodes))
 	for _, node := range state.nodes {
@@ -1662,10 +1711,10 @@ func validateSourceState(state graphState) error {
 		if node.Kind != domain.NodeKindCase {
 			return invalidCaseTree("scenario %d must not own sources", node.ID)
 		}
+		if source.RefID == nil && source.RefKind != domain.RefManual {
+			return invalidCaseTree("%s source %d has no refId", source.RefKind, source.ID)
+		}
 		if source.RefKind == domain.RefRequirement {
-			if source.RefID == nil {
-				return invalidCaseTree("requirement source %d has no requirement id", source.ID)
-			}
 			requirementSources[node.ID]++
 		}
 	}

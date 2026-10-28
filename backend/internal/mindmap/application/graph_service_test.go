@@ -1,9 +1,12 @@
 package application_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,6 +29,7 @@ type graphFixture struct {
 	relations  []application.RelationSnapshot
 	events     []application.Event
 	anchors    application.CodeAnchorGateway
+	logger     *slog.Logger
 	now        time.Time
 	nextID     int64
 }
@@ -47,8 +51,14 @@ func newGraphFixture() *graphFixture {
 }
 
 func (f *graphFixture) service() *application.GraphService {
+	return f.serviceWithGraph(f)
+}
+
+// serviceWithGraph wires the fixture with an alternative transaction runner so
+// a test can replay a transaction that overlapped another committed write.
+func (f *graphFixture) serviceWithGraph(graph application.GraphRepository) *application.GraphService {
 	return application.NewGraphService(application.GraphDeps{
-		Graph:        f,
+		Graph:        graph,
 		Nodes:        graphNodeRepo{f},
 		Steps:        graphStepRepo{f},
 		Assertions:   graphAssertionRepo{f},
@@ -60,6 +70,7 @@ func (f *graphFixture) service() *application.GraphService {
 		Events:       graphEventSink{f},
 		IDs:          graphIDGenerator{f},
 		Clock:        graphClock{f},
+		Logger:       f.logger,
 	})
 }
 
@@ -193,6 +204,8 @@ func (f *graphFixture) requirementSourcesOfNode(nodeID int64) []domain.CaseSourc
 			sources = append(sources, source)
 		}
 	}
+	// The fixture stores sources in a map; order by id so tests are stable.
+	sort.Slice(sources, func(i, j int) bool { return sources[i].ID < sources[j].ID })
 	return sources
 }
 
@@ -670,6 +683,135 @@ func (tx graphTx) Findings() application.FindingRepository     { return nil }
 func (tx graphTx) Baselines() application.BaselineRepository   { return graphBaselineRepo{tx.f} }
 func (tx graphTx) Runs() application.RunRepository             { return nil }
 
+// graphSnapshot is a copy of the fixture tables. It lets a test replay a
+// transaction that began before another write committed.
+type graphSnapshot struct {
+	nodes      map[int64]domain.CaseNode
+	steps      map[int64]domain.CaseStep
+	assertions map[int64]domain.CaseAssertion
+	sources    map[int64]domain.CaseSource
+}
+
+func (f *graphFixture) snapshot() graphSnapshot {
+	snapshot := graphSnapshot{
+		nodes:      make(map[int64]domain.CaseNode, len(f.nodes)),
+		steps:      make(map[int64]domain.CaseStep, len(f.steps)),
+		assertions: make(map[int64]domain.CaseAssertion, len(f.assertions)),
+		sources:    make(map[int64]domain.CaseSource, len(f.sources)),
+	}
+	for id, node := range f.nodes {
+		snapshot.nodes[id] = node
+	}
+	for id, step := range f.steps {
+		snapshot.steps[id] = step
+	}
+	for id, assertion := range f.assertions {
+		snapshot.assertions[id] = assertion
+	}
+	for id, source := range f.sources {
+		snapshot.sources[id] = source
+	}
+	return snapshot
+}
+
+// restore rolls the fixture tables back to a snapshot, mimicking the rollback
+// of a failed transaction.
+func (f *graphFixture) restore(snapshot graphSnapshot) {
+	f.nodes = snapshot.nodes
+	f.steps = snapshot.steps
+	f.assertions = snapshot.assertions
+	f.sources = snapshot.sources
+}
+
+// staleNodeRepo lists the nodes a transaction saw when it started while its
+// writes hit the live fixture (like a READ COMMITTED transaction that began
+// before a concurrent commit).
+type staleNodeRepo struct {
+	graphNodeRepo
+	nodes map[int64]domain.CaseNode
+}
+
+func (r staleNodeRepo) Get(_ context.Context, versionID, nodeID int64) (domain.CaseNode, error) {
+	node, ok := r.nodes[nodeID]
+	if !ok || node.VersionID != versionID {
+		return domain.CaseNode{}, domain.NewNotFound("node", nodeID)
+	}
+	return node, nil
+}
+
+func (r staleNodeRepo) ListByVersion(_ context.Context, versionID int64) ([]domain.CaseNode, error) {
+	nodes := make([]domain.CaseNode, 0, len(r.nodes))
+	for _, node := range r.nodes {
+		if node.VersionID == versionID {
+			nodes = append(nodes, node)
+		}
+	}
+	sort.Slice(nodes, func(i, j int) bool {
+		if nodes[i].SortOrder != nodes[j].SortOrder {
+			return nodes[i].SortOrder < nodes[j].SortOrder
+		}
+		return nodes[i].ID < nodes[j].ID
+	})
+	return nodes, nil
+}
+
+// staleSourceRepo lists the source rows a transaction saw when it started while
+// its writes hit the live fixture.
+type staleSourceRepo struct {
+	graphSourceRepo
+	sources map[int64]domain.CaseSource
+}
+
+func (r staleSourceRepo) ListByVersion(_ context.Context, versionID int64) ([]domain.CaseSource, error) {
+	sources := make([]domain.CaseSource, 0, len(r.sources))
+	for _, source := range r.sources {
+		if source.VersionID == versionID {
+			sources = append(sources, source)
+		}
+	}
+	sort.Slice(sources, func(i, j int) bool { return sources[i].ID < sources[j].ID })
+	return sources, nil
+}
+
+// staleGraphTx reads the graph from a snapshot while writes hit the live
+// fixture.
+type staleGraphTx struct {
+	graphTx
+	snapshot graphSnapshot
+}
+
+func (tx staleGraphTx) Nodes() application.NodeRepository {
+	return staleNodeRepo{graphNodeRepo: graphNodeRepo{tx.f}, nodes: tx.snapshot.nodes}
+}
+
+func (tx staleGraphTx) Sources() application.SourceRepository {
+	return staleSourceRepo{graphSourceRepo: graphSourceRepo{tx.f}, sources: tx.snapshot.sources}
+}
+
+// concurrentSourceDeleteGraph deterministically simulates two overlapping
+// source deletes: the first transaction runs against the live fixture while its
+// pre-write snapshot is kept, and the second transaction replays that snapshot
+// (old node revision, old source rows) and rolls the fixture back when it fails.
+type concurrentSourceDeleteGraph struct {
+	f        *graphFixture
+	snapshot graphSnapshot
+	calls    int
+}
+
+func (g *concurrentSourceDeleteGraph) InTx(_ context.Context, fn func(application.GraphTx) error) error {
+	g.calls++
+	if g.calls == 1 {
+		g.snapshot = g.f.snapshot()
+		return fn(graphTx{g.f})
+	}
+	backup := g.f.snapshot()
+	err := fn(staleGraphTx{graphTx: graphTx{g.f}, snapshot: g.snapshot})
+	if err != nil {
+		g.f.restore(backup)
+	}
+	return err
+}
+
 func graphInt64Ptr(value int64) *int64    { return &value }
 func graphStringPtr(value string) *string { return &value }
 
@@ -917,13 +1059,19 @@ func TestDeleteSourceKeepsCaseWhenOtherRequirementRemains(t *testing.T) {
 	}
 	fixture.sources[extra.ID] = extra
 	service := fixture.service()
-	sourceID := fixture.requirementSourcesOfNode(11)[0].ID
+	sources := fixture.requirementSourcesOfNode(11)
+	if len(sources) != 2 || sources[0].ID != 113 || sources[1].ID != 900 {
+		t.Fatalf("requirement sources = %+v, want source 113 (requirement 7) then 900 (requirement 8)", sources)
+	}
 
-	if err := service.DeleteSource(ctx, 1, sourceID, 42); err != nil {
+	if err := service.DeleteSource(ctx, 1, sources[0].ID, 42); err != nil {
 		t.Fatalf("delete source: %v", err)
 	}
 	if len(fixture.sources) != 1 || fixture.sources[900].ID != 900 {
 		t.Fatalf("sources after delete = %+v, want only source 900", fixture.sources)
+	}
+	if fixture.nodes[11].Revision != 2 {
+		t.Fatalf("node revision after source delete = %d, want 2", fixture.nodes[11].Revision)
 	}
 	requireEvent(t, fixture, 0, domain.EventCaseUpdated)
 }
@@ -948,6 +1096,69 @@ func TestDeleteLastAssertionRejected(t *testing.T) {
 	if len(fixture.events) != 0 {
 		t.Fatalf("rejected delete published %d event(s)", len(fixture.events))
 	}
+}
+
+// TestAddAssertionAppendsAndBumpsRevision covers the assertion create happy
+// path: the child row is stored and the owning node revision is bumped in the
+// same transaction.
+func TestAddAssertionAppendsAndBumpsRevision(t *testing.T) {
+	ctx := context.Background()
+	fixture := newGraphFixture()
+	fixture.seedCase(11, nil, 7)
+	service := fixture.service()
+
+	created, err := service.AddAssertion(ctx, 1, 11, 42, application.AddAssertionCommand{
+		NodeRevision: 1,
+		StepID:       graphInt64Ptr(111),
+		Kind:         domain.AssertionKindAPI,
+		Target:       "/api/orders",
+		Expression:   "status == 200",
+		Expected:     "200",
+	})
+	if err != nil {
+		t.Fatalf("add assertion: %v", err)
+	}
+	if created.NodeID != 11 || created.Kind != domain.AssertionKindAPI || created.StepID == nil || *created.StepID != 111 {
+		t.Fatalf("created assertion = %+v, want node 11 api assertion on step 111", created)
+	}
+	if len(fixture.assertionsOfNode(11)) != 2 {
+		t.Fatalf("assertions = %d, want 2", len(fixture.assertionsOfNode(11)))
+	}
+	if fixture.nodes[11].Revision != 2 {
+		t.Fatalf("node revision = %d, want 2", fixture.nodes[11].Revision)
+	}
+	requireEvent(t, fixture, 0, domain.EventCaseUpdated)
+}
+
+// TestDeleteAssertionKeepsRemainingAssertion covers the assertion delete happy
+// path: with two assertions one is removed and the other remains.
+func TestDeleteAssertionKeepsRemainingAssertion(t *testing.T) {
+	ctx := context.Background()
+	fixture := newGraphFixture()
+	fixture.seedCase(11, nil, 7)
+	second := domain.CaseAssertion{
+		ID:         200,
+		NodeID:     11,
+		Kind:       domain.AssertionKindText,
+		Expression: "second assertion",
+		Source:     domain.NodeSourceUserInput,
+		CreatedAt:  fixture.now,
+		UpdatedAt:  fixture.now,
+	}
+	fixture.assertions[second.ID] = second
+	service := fixture.service()
+
+	if err := service.DeleteAssertion(ctx, 1, second.ID, 42, 1); err != nil {
+		t.Fatalf("delete assertion: %v", err)
+	}
+	remaining := fixture.assertionsOfNode(11)
+	if len(remaining) != 1 || remaining[0].ID != 112 {
+		t.Fatalf("assertions after delete = %+v, want only assertion 112", remaining)
+	}
+	if fixture.nodes[11].Revision != 2 {
+		t.Fatalf("node revision = %d, want 2", fixture.nodes[11].Revision)
+	}
+	requireEvent(t, fixture, 0, domain.EventCaseUpdated)
 }
 
 // TestScenarioCannotHaveSteps covers spec §6.1 rule 2: a scenario must never own
@@ -1007,78 +1218,84 @@ func TestSourcesOnlyOnCaseNodes(t *testing.T) {
 }
 
 // TestFrozenVersionRejectsWrites covers spec §6.4 rule 3: once a baseline
-// exists every graph write is a baseline_frozen 409.
+// exists every graph write is a baseline_frozen 409, including when the version
+// has already moved to executing (the post-approve state).
 func TestFrozenVersionRejectsWrites(t *testing.T) {
 	ctx := context.Background()
-	fixture := newGraphFixture()
-	fixture.seedCase(11, nil, 7)
-	fixture.baseline = &domain.CaseBaseline{ID: 99, VersionID: 1, GraphHash: "abc"}
-	service := fixture.service()
-	scenarioID := int64(0)
-	nodeID := int64(11)
-	steps := fixture.stepsOfNode(nodeID)
-	assertions := fixture.assertionsOfNode(nodeID)
-	sources := fixture.requirementSourcesOfNode(nodeID)
-	emptyIDs := []int64{}
+	for _, status := range []string{"designing", "executing"} {
+		t.Run(status, func(t *testing.T) {
+			fixture := newGraphFixture()
+			fixture.version.Status = status
+			fixture.seedCase(11, nil, 7)
+			fixture.baseline = &domain.CaseBaseline{ID: 99, VersionID: 1, GraphHash: "abc"}
+			service := fixture.service()
+			scenarioID := int64(0)
+			nodeID := int64(11)
+			steps := fixture.stepsOfNode(nodeID)
+			assertions := fixture.assertionsOfNode(nodeID)
+			sources := fixture.requirementSourcesOfNode(nodeID)
+			emptyIDs := []int64{}
 
-	writes := map[string]func() error{
-		"create node": func() error {
-			_, err := service.CreateNode(ctx, 1, 42, application.CreateNodeCommand{Kind: domain.NodeKindScenario, Title: "x"})
-			return err
-		},
-		"update node": func() error {
-			_, err := service.UpdateNode(ctx, 1, nodeID, 42, application.UpdateNodeCommand{Revision: 1, Title: graphStringPtr("x")})
-			return err
-		},
-		"delete node": func() error {
-			return service.DeleteNode(ctx, 1, nodeID, 42, 1)
-		},
-		"add step": func() error {
-			_, err := service.AddStep(ctx, 1, nodeID, 42, application.AddStepCommand{NodeRevision: 1, Action: "x"})
-			return err
-		},
-		"update step": func() error {
-			_, err := service.UpdateStep(ctx, 1, steps[0].ID, 42, application.UpdateStepCommand{NodeRevision: 1, Action: graphStringPtr("x")})
-			return err
-		},
-		"delete step": func() error {
-			return service.DeleteStep(ctx, 1, steps[0].ID, 42, 1)
-		},
-		"reorder steps": func() error {
-			return service.ReorderSteps(ctx, 1, nodeID, 42, application.ReorderStepsCommand{NodeRevision: 1, StepIDs: emptyIDs})
-		},
-		"add assertion": func() error {
-			_, err := service.AddAssertion(ctx, 1, nodeID, 42, application.AddAssertionCommand{NodeRevision: 1, Kind: domain.AssertionKindUI, Expression: "x"})
-			return err
-		},
-		"update assertion": func() error {
-			_, err := service.UpdateAssertion(ctx, 1, assertions[0].ID, 42, application.UpdateAssertionCommand{NodeRevision: 1, Expression: graphStringPtr("x")})
-			return err
-		},
-		"delete assertion": func() error {
-			return service.DeleteAssertion(ctx, 1, assertions[0].ID, 42, 1)
-		},
-		"add source": func() error {
-			_, err := service.AddSource(ctx, 1, nodeID, 42, application.AddSourceCommand{RefKind: domain.RefRequirement, RefID: graphInt64Ptr(7)})
-			return err
-		},
-		"delete source": func() error {
-			return service.DeleteSource(ctx, 1, sources[0].ID, 42)
-		},
-		"reorder": func() error {
-			return service.Reorder(ctx, 1, 42, application.ReorderCommand{ParentID: &scenarioID, NodeIDs: nil})
-		},
-	}
-	for name, write := range writes {
-		t.Run(name, func(t *testing.T) {
-			requireDomainError(t, write(), domain.KindStateConflict, "baseline_frozen")
+			writes := map[string]func() error{
+				"create node": func() error {
+					_, err := service.CreateNode(ctx, 1, 42, application.CreateNodeCommand{Kind: domain.NodeKindScenario, Title: "x"})
+					return err
+				},
+				"update node": func() error {
+					_, err := service.UpdateNode(ctx, 1, nodeID, 42, application.UpdateNodeCommand{Revision: 1, Title: graphStringPtr("x")})
+					return err
+				},
+				"delete node": func() error {
+					return service.DeleteNode(ctx, 1, nodeID, 42, 1)
+				},
+				"add step": func() error {
+					_, err := service.AddStep(ctx, 1, nodeID, 42, application.AddStepCommand{NodeRevision: 1, Action: "x"})
+					return err
+				},
+				"update step": func() error {
+					_, err := service.UpdateStep(ctx, 1, steps[0].ID, 42, application.UpdateStepCommand{NodeRevision: 1, Action: graphStringPtr("x")})
+					return err
+				},
+				"delete step": func() error {
+					return service.DeleteStep(ctx, 1, steps[0].ID, 42, 1)
+				},
+				"reorder steps": func() error {
+					return service.ReorderSteps(ctx, 1, nodeID, 42, application.ReorderStepsCommand{NodeRevision: 1, StepIDs: emptyIDs})
+				},
+				"add assertion": func() error {
+					_, err := service.AddAssertion(ctx, 1, nodeID, 42, application.AddAssertionCommand{NodeRevision: 1, Kind: domain.AssertionKindUI, Expression: "x"})
+					return err
+				},
+				"update assertion": func() error {
+					_, err := service.UpdateAssertion(ctx, 1, assertions[0].ID, 42, application.UpdateAssertionCommand{NodeRevision: 1, Expression: graphStringPtr("x")})
+					return err
+				},
+				"delete assertion": func() error {
+					return service.DeleteAssertion(ctx, 1, assertions[0].ID, 42, 1)
+				},
+				"add source": func() error {
+					_, err := service.AddSource(ctx, 1, nodeID, 42, application.AddSourceCommand{RefKind: domain.RefRequirement, RefID: graphInt64Ptr(7)})
+					return err
+				},
+				"delete source": func() error {
+					return service.DeleteSource(ctx, 1, sources[0].ID, 42)
+				},
+				"reorder": func() error {
+					return service.Reorder(ctx, 1, 42, application.ReorderCommand{ParentID: &scenarioID, NodeIDs: nil})
+				},
+			}
+			for name, write := range writes {
+				t.Run(name, func(t *testing.T) {
+					requireDomainError(t, write(), domain.KindStateConflict, "baseline_frozen")
+				})
+			}
+			if len(fixture.events) != 0 {
+				t.Fatalf("frozen writes published %d event(s)", len(fixture.events))
+			}
+			if fixture.nodes[11].Revision != 1 {
+				t.Fatalf("frozen write bumped the node revision to %d", fixture.nodes[11].Revision)
+			}
 		})
-	}
-	if len(fixture.events) != 0 {
-		t.Fatalf("frozen writes published %d event(s)", len(fixture.events))
-	}
-	if fixture.nodes[11].Revision != 1 {
-		t.Fatalf("frozen write bumped the node revision to %d", fixture.nodes[11].Revision)
 	}
 }
 
@@ -1236,6 +1453,80 @@ func TestAddStepAppendsAndInsertsAfterSeq(t *testing.T) {
 	}
 }
 
+// TestAddStepStaleNodeRevisionConflict covers the step create OCC token: a
+// stale nodeRevision is a case_revision_conflict and writes nothing.
+func TestAddStepStaleNodeRevisionConflict(t *testing.T) {
+	ctx := context.Background()
+	fixture := newGraphFixture()
+	fixture.seedCase(11, nil, 7)
+	service := fixture.service()
+
+	_, err := service.AddStep(ctx, 1, 11, 42, application.AddStepCommand{
+		NodeRevision: 2,
+		Action:       "stale append",
+	})
+	requireDomainError(t, err, domain.KindStateConflict, "case_revision_conflict")
+	if len(fixture.stepsOfNode(11)) != 1 {
+		t.Fatal("stale step add wrote a step")
+	}
+	if fixture.nodes[11].Revision != 1 {
+		t.Fatalf("stale step add bumped the node revision to %d", fixture.nodes[11].Revision)
+	}
+	if len(fixture.events) != 0 {
+		t.Fatalf("stale step add published %d event(s)", len(fixture.events))
+	}
+}
+
+// TestAddStepEnforcesThirtyStepCap covers the 1..30 case_step cap: the 30th
+// step is accepted and the 31st is invalid_case_tree with no write.
+func TestAddStepEnforcesThirtyStepCap(t *testing.T) {
+	ctx := context.Background()
+	fixture := newGraphFixture()
+	fixture.seedCase(11, nil, 7)
+	for index := 0; index < 28; index++ {
+		step := domain.CaseStep{
+			ID:        int64(200 + index),
+			NodeID:    11,
+			Seq:       index + 2,
+			Action:    "seeded step",
+			Source:    domain.StepSourceUserInput,
+			CreatedAt: fixture.now,
+			UpdatedAt: fixture.now,
+		}
+		fixture.steps[step.ID] = step
+	}
+	if len(fixture.stepsOfNode(11)) != domain.MaxStepsPerCase-1 {
+		t.Fatalf("seeded steps = %d, want %d", len(fixture.stepsOfNode(11)), domain.MaxStepsPerCase-1)
+	}
+	service := fixture.service()
+
+	created, err := service.AddStep(ctx, 1, 11, 42, application.AddStepCommand{
+		NodeRevision: 1,
+		Action:       "the 30th step",
+	})
+	if err != nil {
+		t.Fatalf("add the 30th step: %v", err)
+	}
+	if created.Seq != domain.MaxStepsPerCase {
+		t.Fatalf("30th step seq = %d, want %d", created.Seq, domain.MaxStepsPerCase)
+	}
+	if len(fixture.stepsOfNode(11)) != domain.MaxStepsPerCase {
+		t.Fatalf("steps = %d, want %d", len(fixture.stepsOfNode(11)), domain.MaxStepsPerCase)
+	}
+
+	_, err = service.AddStep(ctx, 1, 11, 42, application.AddStepCommand{
+		NodeRevision: 2,
+		Action:       "the 31st step",
+	})
+	requireDomainError(t, err, domain.KindInvalid, "invalid_case_tree")
+	if len(fixture.stepsOfNode(11)) != domain.MaxStepsPerCase {
+		t.Fatalf("rejected 31st step wrote a step")
+	}
+	if len(fixture.events) != 1 {
+		t.Fatalf("step writes published %d event(s), want only the committed one", len(fixture.events))
+	}
+}
+
 // TestUpdateStepUnderNodeRevision checks the step edit OCC: a stale
 // nodeRevision conflicts, a matching one applies and bumps the node revision.
 func TestUpdateStepUnderNodeRevision(t *testing.T) {
@@ -1383,7 +1674,10 @@ func TestAddSourceRequiresConfirmedRequirement(t *testing.T) {
 	ctx := context.Background()
 	fixture := newGraphFixture()
 	fixture.seedCase(11, nil, 7)
-	fixture.confirmed = []application.RequirementSnapshot{{ID: 7, VersionID: 1, Status: "clarified"}}
+	fixture.confirmed = []application.RequirementSnapshot{
+		{ID: 7, VersionID: 1, Status: "clarified"},
+		{ID: 8, VersionID: 1, Status: "clarified"},
+	}
 	service := fixture.service()
 
 	_, err := service.AddSource(ctx, 1, 11, 42, application.AddSourceCommand{
@@ -1397,15 +1691,190 @@ func TestAddSourceRequiresConfirmedRequirement(t *testing.T) {
 
 	created, err := service.AddSource(ctx, 1, 11, 42, application.AddSourceCommand{
 		RefKind: domain.RefRequirement,
-		RefID:   graphInt64Ptr(7),
+		RefID:   graphInt64Ptr(8),
 	})
 	if err != nil {
 		t.Fatalf("add confirmed requirement source: %v", err)
 	}
-	if created.RefID == nil || *created.RefID != 7 {
-		t.Fatalf("created source = %+v, want requirement 7", created)
+	if created.RefID == nil || *created.RefID != 8 {
+		t.Fatalf("created source = %+v, want requirement 8", created)
+	}
+	if fixture.nodes[11].Revision != 2 {
+		t.Fatalf("node revision after source add = %d, want 2", fixture.nodes[11].Revision)
 	}
 	requireEvent(t, fixture, 0, domain.EventCaseUpdated)
+}
+
+// TestAddSourceRequiresRefIDForNonManualKinds covers the case_source CHECK
+// (ref_kind='manual' OR ref_id IS NOT NULL): requirement, app_model and ai_run
+// sources must carry a refId, only a manual source may be refKey-only, and a
+// missing refId is a domain invalid error before any write.
+func TestAddSourceRequiresRefIDForNonManualKinds(t *testing.T) {
+	ctx := context.Background()
+	fixture := newGraphFixture()
+	fixture.seedCase(11, nil, 7)
+	fixture.confirmed = []application.RequirementSnapshot{{ID: 7, VersionID: 1, Status: "clarified"}}
+	service := fixture.service()
+
+	for _, refKind := range []string{domain.RefRequirement, domain.RefAppModel, domain.RefAIRun} {
+		t.Run(refKind, func(t *testing.T) {
+			_, err := service.AddSource(ctx, 1, 11, 42, application.AddSourceCommand{
+				RefKind: refKind,
+				RefKey:  "some-ref-key",
+			})
+			requireDomainError(t, err, domain.KindInvalid, "invalid_case_tree")
+		})
+	}
+	if len(fixture.sources) != 1 {
+		t.Fatalf("rejected add source wrote sources: %+v", fixture.sources)
+	}
+	if len(fixture.events) != 0 {
+		t.Fatalf("rejected add source published %d event(s)", len(fixture.events))
+	}
+
+	created, err := service.AddSource(ctx, 1, 11, 42, application.AddSourceCommand{
+		RefKind: domain.RefManual,
+		RefKey:  "manual evidence",
+	})
+	if err != nil {
+		t.Fatalf("add refKey-only manual source: %v", err)
+	}
+	if created.RefID != nil || created.RefKey != "manual evidence" {
+		t.Fatalf("manual source = %+v, want a nil refId and refKey 'manual evidence'", created)
+	}
+	requireEvent(t, fixture, 0, domain.EventCaseUpdated)
+}
+
+// TestValidateSourceStateRequiresRefID covers the same refId rule on the write
+// path: a stored app_model source without a refId is rejected by the source
+// validation before any graph write.
+func TestValidateSourceStateRequiresRefID(t *testing.T) {
+	ctx := context.Background()
+	fixture := newGraphFixture()
+	fixture.seedCase(11, nil, 7)
+	fixture.sources[900] = domain.CaseSource{
+		ID:         900,
+		VersionID:  1,
+		NodeID:     11,
+		RefKind:    domain.RefAppModel,
+		RefKey:     "app-model",
+		Source:     domain.NodeSourceUserInput,
+		Confidence: domain.ConfidenceHigh,
+		CreatedAt:  fixture.now,
+		UpdatedAt:  fixture.now,
+	}
+	service := fixture.service()
+
+	_, err := service.AddAssertion(ctx, 1, 11, 42, application.AddAssertionCommand{
+		NodeRevision: 1,
+		Kind:         domain.AssertionKindUI,
+		Expression:   "must not attach",
+	})
+	requireDomainError(t, err, domain.KindInvalid, "invalid_case_tree")
+	if len(fixture.assertions) != 1 {
+		t.Fatalf("rejected write stored %d assertion(s), want 1", len(fixture.assertions))
+	}
+
+	fixture.sources[900] = domain.CaseSource{
+		ID:         900,
+		VersionID:  1,
+		NodeID:     11,
+		RefKind:    domain.RefManual,
+		RefKey:     "app-model",
+		Source:     domain.NodeSourceUserInput,
+		Confidence: domain.ConfidenceHigh,
+		CreatedAt:  fixture.now,
+		UpdatedAt:  fixture.now,
+	}
+	if _, err := service.AddAssertion(ctx, 1, 11, 42, application.AddAssertionCommand{
+		NodeRevision: 1,
+		Kind:         domain.AssertionKindUI,
+		Expression:   "refKey-only manual source is allowed",
+	}); err != nil {
+		t.Fatalf("add assertion with a refKey-only manual source: %v", err)
+	}
+}
+
+// TestAddSourceRejectsDuplicateSource covers the uk_case_source_ref key: a
+// duplicate (refKind, refId, refKey) on the same node is duplicate_case_source
+// (409) rejected before the insert.
+func TestAddSourceRejectsDuplicateSource(t *testing.T) {
+	ctx := context.Background()
+	fixture := newGraphFixture()
+	fixture.seedCase(11, nil, 7)
+	fixture.confirmed = []application.RequirementSnapshot{
+		{ID: 7, VersionID: 1, Status: "clarified"},
+		{ID: 8, VersionID: 1, Status: "clarified"},
+	}
+	service := fixture.service()
+
+	_, err := service.AddSource(ctx, 1, 11, 42, application.AddSourceCommand{
+		RefKind: domain.RefRequirement,
+		RefID:   graphInt64Ptr(7),
+	})
+	requireDomainError(t, err, domain.KindConflict, "duplicate_case_source")
+	if len(fixture.sources) != 1 {
+		t.Fatalf("rejected duplicate wrote %d source(s), want 1", len(fixture.sources))
+	}
+
+	if _, err := service.AddSource(ctx, 1, 11, 42, application.AddSourceCommand{
+		RefKind: domain.RefRequirement,
+		RefID:   graphInt64Ptr(8),
+	}); err != nil {
+		t.Fatalf("add a different requirement source: %v", err)
+	}
+	manual := application.AddSourceCommand{RefKind: domain.RefManual, RefKey: "doc:1"}
+	if _, err := service.AddSource(ctx, 1, 11, 42, manual); err != nil {
+		t.Fatalf("add manual source: %v", err)
+	}
+	_, err = service.AddSource(ctx, 1, 11, 42, manual)
+	requireDomainError(t, err, domain.KindConflict, "duplicate_case_source")
+	if len(fixture.sources) != 3 {
+		t.Fatalf("sources after the duplicate manual add = %d, want 3", len(fixture.sources))
+	}
+	if fixture.nodes[11].Revision != 3 {
+		t.Fatalf("node revision after two source adds = %d, want 3", fixture.nodes[11].Revision)
+	}
+}
+
+// TestConcurrentSourceDeletesCannotZeroRequirementCoverage covers the source
+// write serialization: two overlapping deletes both read the same node revision,
+// so the second loses the node revision CAS with case_revision_conflict and the
+// requirement coverage never drops to zero.
+func TestConcurrentSourceDeletesCannotZeroRequirementCoverage(t *testing.T) {
+	ctx := context.Background()
+	fixture := newGraphFixture()
+	fixture.seedCase(11, nil, 7)
+	fixture.sources[900] = domain.CaseSource{
+		ID:         900,
+		VersionID:  1,
+		NodeID:     11,
+		RefKind:    domain.RefRequirement,
+		RefID:      graphInt64Ptr(8),
+		Source:     domain.NodeSourceUserInput,
+		Confidence: domain.ConfidenceHigh,
+		CreatedAt:  fixture.now,
+		UpdatedAt:  fixture.now,
+	}
+	graph := &concurrentSourceDeleteGraph{f: fixture}
+	service := fixture.serviceWithGraph(graph)
+
+	if err := service.DeleteSource(ctx, 1, 113, 42); err != nil {
+		t.Fatalf("first source delete: %v", err)
+	}
+	if fixture.nodes[11].Revision != 2 {
+		t.Fatalf("node revision after first source delete = %d, want 2", fixture.nodes[11].Revision)
+	}
+
+	err := service.DeleteSource(ctx, 1, 900, 42)
+	requireDomainError(t, err, domain.KindStateConflict, "case_revision_conflict")
+	sources := fixture.requirementSourcesOfNode(11)
+	if len(sources) != 1 || sources[0].ID != 900 {
+		t.Fatalf("requirement sources after the conflicting delete = %+v, want only source 900", sources)
+	}
+	if len(fixture.events) != 1 {
+		t.Fatalf("source deletes published %d event(s), want only the committed one", len(fixture.events))
+	}
 }
 
 // TestDeleteNodeCascadesSubtree covers spec §6.1 rule 6: deleting a scenario
@@ -1581,6 +2050,46 @@ func TestDeleteNodeAnchorCleanupIsBestEffort(t *testing.T) {
 			}
 			if _, ok := fixture.nodes[11]; ok {
 				t.Fatal("node survived the delete")
+			}
+			requireEvent(t, fixture, 0, domain.EventCaseDeleted)
+		})
+	}
+}
+
+// TestAnchorCleanupFailureLogsWarning covers the optional logger: a failed
+// anchor list/delete is logged as a warning and never fails the delete.
+func TestAnchorCleanupFailureLogsWarning(t *testing.T) {
+	cases := []struct {
+		name      string
+		configure func(*graphAnchorGateway)
+	}{
+		{
+			name:      "list failure",
+			configure: func(g *graphAnchorGateway) { g.listErr = errors.New("anchor service unavailable") },
+		},
+		{
+			name:      "delete failure",
+			configure: func(g *graphAnchorGateway) { g.deleteErr = errors.New("anchor delete denied") },
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			ctx := context.Background()
+			var output bytes.Buffer
+			fixture := newGraphFixture()
+			fixture.logger = slog.New(slog.NewTextHandler(&output, &slog.HandlerOptions{Level: slog.LevelWarn}))
+			anchors := newGraphAnchorGateway()
+			anchors.add(11, 901)
+			testCase.configure(anchors)
+			fixture.anchors = anchors
+			fixture.seedCase(11, nil, 7)
+			service := fixture.service()
+
+			if err := service.DeleteNode(ctx, 1, 11, 42, 1); err != nil {
+				t.Fatalf("delete must not fail when anchor cleanup fails: %v", err)
+			}
+			if !strings.Contains(output.String(), "anchor cleanup") {
+				t.Fatalf("anchor cleanup failure was not logged: %q", output.String())
 			}
 			requireEvent(t, fixture, 0, domain.EventCaseDeleted)
 		})
