@@ -110,6 +110,7 @@ func runServiceWithVersions(fixture *runFixture, versions application.VersionLif
 		Requirements: runRequirementReader{fixture},
 		Catalog:      runCatalogGateway{fixture},
 		CodeFacts:    runCodeFactsGateway{fixture},
+		Impact:       fixture.impact,
 		Anchors:      runAnchorGateway{fixture},
 		Agents:       runAgentRuntime{fixture},
 		Events:       runEventSink{fixture},
@@ -729,6 +730,110 @@ func TestMaterializeIncrementalDesignPreservesImpactAvailability(t *testing.T) {
 	})
 }
 
+// TestMaterializeIncrementalDesignPreservesSeededWarnings covers the warning
+// owner chain: the starter seeds P4 diagnostics (truncated unmapped list,
+// degraded/unavailable) before the agent run, and the materializer must merge
+// them into the materialized result instead of rebuilding warnings only from its
+// own skips. Duplicates keep the first (seeded) warning of a code.
+func TestMaterializeIncrementalDesignPreservesSeededWarnings(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("seeded warnings merge with generated warnings and win the dedupe", func(t *testing.T) {
+		fixture := newSupplementMaterializeFixture()
+		fixture.version.Status = "continuing"
+		run := seedSupplementRun(fixture, application.RunKindIncrementalDesign, `{
+			"impactAvailable": true,
+			"unmappedChanges": [{"path":"src/x.ts","summary":"changed"}],
+			"warnings": [
+				{"code":"unmapped_truncated","message":"starter truncation diagnostic"},
+				{"code":"invalid_case","message":"starter invalid case diagnostic"}
+			],
+			"cases": [{"title":""}]
+		}`)
+		if err := fixture.service().Materialize(ctx, run.ID); err != nil {
+			t.Fatalf("materialize: %v", err)
+		}
+		done := fixture.runs[run.ID]
+		result := runResultDocument(t, done)
+		if result["impactAvailable"] != true {
+			t.Fatalf("impactAvailable = %#v, want true", result["impactAvailable"])
+		}
+		if countResultWarnings(t, done, "unmapped_truncated") != 1 {
+			t.Fatalf("run result = %s, want the seeded truncation warning preserved", done.Result)
+		}
+		if countResultWarnings(t, done, "invalid_case") != 1 {
+			t.Fatalf("run result = %s, want the generated invalid_case warning deduped by code", done.Result)
+		}
+		if message := resultWarningMessage(t, done, "invalid_case"); message != "starter invalid case diagnostic" {
+			t.Fatalf("invalid_case message = %q, want the seeded diagnostic to win the dedupe", message)
+		}
+
+		view, err := planService(fixture).IncrementalPlan(ctx, runTestVersionID)
+		if err != nil {
+			t.Fatalf("incremental plan: %v", err)
+		}
+		if !containsPlanWarning(view.Warnings, "unmapped_truncated") {
+			t.Fatalf("plan warnings = %+v, want the seeded truncation warning", view.Warnings)
+		}
+		if containsPlanWarning(view.Warnings, "impact_unavailable") {
+			t.Fatalf("plan warnings = %+v, impact was available", view.Warnings)
+		}
+		if len(view.UnmappedChanges) != 1 || view.UnmappedChanges[0].Path != "src/x.ts" {
+			t.Fatalf("plan unmappedChanges = %+v, want the seeded change", view.UnmappedChanges)
+		}
+	})
+
+	t.Run("unavailable degraded seed keeps its diagnostics", func(t *testing.T) {
+		fixture := newSupplementMaterializeFixture()
+		fixture.version.Status = "continuing"
+		run := seedSupplementRun(fixture, application.RunKindIncrementalDesign, `{
+			"impactAvailable": false,
+			"degraded": true,
+			"warnings": [
+				{"code":"impact_degraded","message":"starter degraded diagnostic"},
+				{"code":"impact_unavailable","message":"starter unavailable warning"}
+			]
+		}`)
+		if err := fixture.service().Materialize(ctx, run.ID); err != nil {
+			t.Fatalf("materialize: %v", err)
+		}
+		done := fixture.runs[run.ID]
+		result := runResultDocument(t, done)
+		if result["impactAvailable"] != false || result["degraded"] != true {
+			t.Fatalf("impactAvailable/degraded = %#v/%#v, want false/true",
+				result["impactAvailable"], result["degraded"])
+		}
+		if countResultWarnings(t, done, "impact_degraded") != 1 ||
+			countResultWarnings(t, done, "impact_unavailable") != 1 {
+			t.Fatalf("run result = %s, want both seeded diagnostics preserved once", done.Result)
+		}
+
+		view, err := planService(fixture).IncrementalPlan(ctx, runTestVersionID)
+		if err != nil {
+			t.Fatalf("incremental plan: %v", err)
+		}
+		if !view.Degraded {
+			t.Fatal("plan degraded = false, want the seeded degraded state")
+		}
+		count := 0
+		degradedDiagnostics := 0
+		for _, warning := range view.Warnings {
+			switch warning.Code {
+			case "impact_unavailable":
+				count++
+			case "impact_degraded":
+				degradedDiagnostics++
+			}
+		}
+		if count != 1 {
+			t.Fatalf("plan warnings = %+v, want exactly one impact_unavailable", view.Warnings)
+		}
+		if degradedDiagnostics != 1 {
+			t.Fatalf("plan warnings = %+v, want the degraded diagnostic preserved", view.Warnings)
+		}
+	})
+}
+
 // runResultDocument decodes one run's result document.
 func runResultDocument(t *testing.T, run domain.CaseDesignRun) map[string]any {
 	t.Helper()
@@ -757,4 +862,24 @@ func hasResultWarning(t *testing.T, run domain.CaseDesignRun, code string) bool 
 		}
 	}
 	return false
+}
+
+// resultWarningMessage returns the message of the first run-result warning with
+// a code, or an empty string.
+func resultWarningMessage(t *testing.T, run domain.CaseDesignRun, code string) string {
+	t.Helper()
+	document := runResultDocument(t, run)
+	warnings, ok := document["warnings"].([]any)
+	if !ok {
+		return ""
+	}
+	for _, warning := range warnings {
+		entry, ok := warning.(map[string]any)
+		if !ok || entry["code"] != code {
+			continue
+		}
+		message, _ := entry["message"].(string)
+		return message
+	}
+	return ""
 }

@@ -153,7 +153,10 @@ func (s *GraphService) IncrementalPlan(ctx context.Context, versionID int64) (In
 		for _, change := range submission.UnmappedChanges {
 			view.UnmappedChanges = append(view.UnmappedChanges, IncrementalPlanChange{Path: change.Path, Summary: change.Summary})
 		}
-	} else {
+	} else if !planWarningsContainCode(view.Warnings, planWarningImpactUnavailable) {
+		// The starter already records the same warning when it had no P4 result
+		// (T16b); only synthesize it for runs that carry neither the warning nor
+		// an impact signal, so the plan never lists it twice.
 		view.Warnings = append(view.Warnings, IncrementalPlanWarning{
 			Code:    planWarningImpactUnavailable,
 			Message: "no P4 impact result is available for this version",
@@ -274,6 +277,47 @@ func rawFieldPresent(raw []byte, key string) bool {
 	}
 	_, ok := document[key]
 	return ok
+}
+
+// planWarningsContainCode reports whether warnings already carry one code, so a
+// warning synthesized by the plan never duplicates a warning already stored in
+// the run result (for example the starter-seeded impact_unavailable).
+func planWarningsContainCode(warnings []IncrementalPlanWarning, code string) bool {
+	for _, warning := range warnings {
+		if warning.Code == code {
+			return true
+		}
+	}
+	return false
+}
+
+// mergeIncrementalPlanWarnings returns the seeded warnings followed by the
+// generated ones. Seeded warnings are deduped by code (first wins) and a
+// generated warning never repeats a seeded code: materialization must not drop
+// the input diagnostics (impact_unavailable, unmapped_truncated, a degraded
+// diagnostic) nor duplicate them. Generated warnings keep their own codes as-is,
+// because one run may legitimately report several skipped items with the same
+// code (for example two invalid affected proposals).
+func mergeIncrementalPlanWarnings(seeded, generated []IncrementalPlanWarning) []IncrementalPlanWarning {
+	if len(seeded) == 0 && len(generated) == 0 {
+		return nil
+	}
+	merged := make([]IncrementalPlanWarning, 0, len(seeded)+len(generated))
+	seededCodes := make(map[string]struct{}, len(seeded))
+	for _, warning := range seeded {
+		if _, duplicate := seededCodes[warning.Code]; duplicate {
+			continue
+		}
+		seededCodes[warning.Code] = struct{}{}
+		merged = append(merged, warning)
+	}
+	for _, warning := range generated {
+		if _, duplicate := seededCodes[warning.Code]; duplicate {
+			continue
+		}
+		merged = append(merged, warning)
+	}
+	return merged
 }
 
 // planNewCases lists the materialized ai_supplement cases attributed to the run:

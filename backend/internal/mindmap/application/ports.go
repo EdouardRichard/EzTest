@@ -135,6 +135,36 @@ type FactSummary struct {
 	Detail string
 }
 
+// P4ImpactSummary is the latest P4 code-impact projection consumed by the
+// incremental_design run starter (spec §6.1 step 3b/§7.6). Available is true only
+// for a completed, non-degraded analysis: the starter records
+// impactAvailable=false with the impact_unavailable warning instead of
+// fabricating an empty change list for anything else. UnmappedChanges is the
+// plan-facing {path, summary} list of the changed files no fact or anchor covers;
+// Warnings carries the P4 diagnostics (truncation, degraded state, unavailable
+// status) and is seeded for both available and unavailable results, alongside
+// the plan's own impact_unavailable warning.
+type P4ImpactSummary struct {
+	Available       bool
+	Degraded        bool
+	UnmappedChanges []P4UnmappedChange
+	Warnings        []IncrementalPlanWarning
+}
+
+// P4UnmappedChange is one changed file no P4 fact or anchor covers.
+type P4UnmappedChange struct {
+	Path    string
+	Summary string
+}
+
+// P4ImpactReader is the optional latest-P4-impact read of the incremental-design
+// run starter. Implementations return a zero summary with a nil error when the
+// version has no analysis yet; the mindmap context never reads codeintel tables
+// directly.
+type P4ImpactReader interface {
+	LatestImpactSummary(ctx context.Context, versionID int64) (P4ImpactSummary, error)
+}
+
 // AnchorParams is the input of a case code-anchor creation. SubjectID is the
 // case node id; the adapter always writes subject_kind='case'.
 type AnchorParams struct {
