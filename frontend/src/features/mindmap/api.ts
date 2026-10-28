@@ -107,10 +107,7 @@ function parseAttachmentFilename(header: string | null): string {
 }
 
 /** GET /mindmap — the whole graph snapshot (spec §7.2 endpoint 1). */
-export function getGraph(
-  versionId: string,
-  query: MindmapQuery = {},
-): Promise<MindmapGraph> {
+export function getGraph(versionId: string, query: MindmapQuery = {}): Promise<MindmapGraph> {
   return apiGet<MindmapGraph>(
     withQuery(mindmapPath(versionId), { include: includeParam(query.include) }),
   )
@@ -134,11 +131,7 @@ export function updateNode(
 }
 
 /** DELETE /nodes/{nodeId}?revision= — cascade delete of the subtree (endpoint 4). */
-export function deleteNode(
-  versionId: string,
-  nodeId: string,
-  revision: number,
-): Promise<void> {
+export function deleteNode(versionId: string, nodeId: string, revision: number): Promise<void> {
   return apiDelete<void>(
     withQuery(`${mindmapPath(versionId)}/nodes/${encodeURIComponent(nodeId)}`, { revision }),
   )
@@ -174,11 +167,7 @@ export function updateStep(
 }
 
 /** DELETE /steps/{stepId}?nodeRevision= — renumbers the remaining steps (endpoint 8). */
-export function deleteStep(
-  versionId: string,
-  stepId: string,
-  nodeRevision: number,
-): Promise<void> {
+export function deleteStep(versionId: string, stepId: string, nodeRevision: number): Promise<void> {
   return apiDelete<void>(
     withQuery(`${mindmapPath(versionId)}/steps/${encodeURIComponent(stepId)}`, { nodeRevision }),
   )
@@ -247,9 +236,7 @@ export function createSource(
 
 /** DELETE /sources/{sourceId} (endpoint 14). */
 export function deleteSource(versionId: string, sourceId: string): Promise<void> {
-  return apiDelete<void>(
-    `${mindmapPath(versionId)}/sources/${encodeURIComponent(sourceId)}`,
-  )
+  return apiDelete<void>(`${mindmapPath(versionId)}/sources/${encodeURIComponent(sourceId)}`)
 }
 
 /** POST /nodes/{nodeId}/anchors — 201 with the code anchor (endpoint 15). */
@@ -266,9 +253,7 @@ export function createAnchor(
 
 /** DELETE /anchors/{anchorId} — admin or creator only (endpoint 16). */
 export function deleteAnchor(versionId: string, anchorId: string): Promise<void> {
-  return apiDelete<void>(
-    `${mindmapPath(versionId)}/anchors/${encodeURIComponent(anchorId)}`,
-  )
+  return apiDelete<void>(`${mindmapPath(versionId)}/anchors/${encodeURIComponent(anchorId)}`)
 }
 
 /** POST /runs — 202 with the accepted run id (endpoint 17). */
@@ -277,10 +262,7 @@ export function startRun(versionId: string, body: StartRunBody): Promise<StartRu
 }
 
 /** GET /runs — one cursor page of runs (endpoint 18). */
-export function listRuns(
-  versionId: string,
-  query: RunsQuery = {},
-): Promise<ApiPage<CaseRunView>> {
+export function listRuns(versionId: string, query: RunsQuery = {}): Promise<ApiPage<CaseRunView>> {
   return apiGetPage<CaseRunView>(
     withQuery(`${mindmapPath(versionId)}/runs`, {
       kind: query.kind,
@@ -293,9 +275,7 @@ export function listRuns(
 
 /** GET /runs/{runId} — one run detail without LLM bodies (endpoint 19). */
 export function getRun(versionId: string, runId: string): Promise<CaseRunView> {
-  return apiGet<CaseRunView>(
-    `${mindmapPath(versionId)}/runs/${encodeURIComponent(runId)}`,
-  )
+  return apiGet<CaseRunView>(`${mindmapPath(versionId)}/runs/${encodeURIComponent(runId)}`)
 }
 
 /** POST /submit-review — designing → reviewing, returns the version (endpoint 20). */
@@ -321,19 +301,32 @@ export function listReviews(
   )
 }
 
-/** GET /findings — findings filtered by status/severity/node (endpoint 23). */
+/**
+ * GET /findings — findings filtered by status/severity/node (endpoint 23).
+ *
+ * The endpoint returns `{data: FindingView[]}`: one flat, unpaginated array,
+ * which `apiGet` unwraps to the array itself. A null `data` means "no rows",
+ * but any other non-array payload is a contract violation and throws instead
+ * of being silently reported as an empty list (which would hide findings).
+ */
 export async function listFindings(
   versionId: string,
   query: FindingsQuery = {},
 ): Promise<CaseFindingView[]> {
-  const items = await apiGet<CaseFindingView[]>(
+  const items = await apiGet<CaseFindingView[] | null>(
     withQuery(`${mindmapPath(versionId)}/findings`, {
       status: query.status,
       severity: query.severity,
       nodeId: query.nodeId,
     }),
   )
-  return Array.isArray(items) ? items : []
+  if (items === null || items === undefined) return []
+  if (!Array.isArray(items)) {
+    throw new Error(
+      "mindmap: GET /findings returned an unexpected payload (expected {data: FindingView[]})",
+    )
+  }
+  return items
 }
 
 /** PATCH /findings/{findingId} — mark a finding fixed or dismissed (endpoint 24). */
@@ -349,10 +342,7 @@ export function updateFinding(
 }
 
 /** POST /export — 201 (or 200 on reuse) with the export metadata (endpoint 25). */
-export function createExport(
-  versionId: string,
-  body: CreateExportBody,
-): Promise<CaseExportView> {
+export function createExport(versionId: string, body: CreateExportBody): Promise<CaseExportView> {
   return apiPost<CaseExportView>(`${mindmapPath(versionId)}/export`, body)
 }
 
