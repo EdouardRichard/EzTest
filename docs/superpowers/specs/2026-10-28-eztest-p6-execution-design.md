@@ -659,7 +659,7 @@ POST batches
  "generated_at":"..."}
 ```
 
-- `GET /api/versions/{id}` 增补：`paused`、`pause_mode`、`batch_no`、`active_batch`（无则 null：`{id,batch_no,status,paused,counts}`）。
+- `GET /api/versions/{id}` 增补：`paused`、`pause_mode`、`batch_no`。**活跃批次不塞进 version DTO**（避免 version 上下文反向依赖 execution）；前端用 `GET /api/versions/{id}/batches?status=running&limit=1` 获取并合并。
 - `pending_takeover` 仅当存在 waiting 接管时返回。
 
 ### 6.4 错误 `details.reason`
