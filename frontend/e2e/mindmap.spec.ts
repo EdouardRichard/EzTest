@@ -315,9 +315,14 @@ test("generates, edits, reviews, freezes and exports a P5 case mindmap", async (
     )
     expect(removed.status(), "delete the extra requirement source").toBe(204)
 
-    await page.getByRole("button", { name: `删除来源 ${originalSource.id}` }).click()
-    await expect(page.getByTestId("source-panel").getByRole("alert")).toContainText(
-      "用例结构不合法",
+    // The UI refreshes after the API delete and now correctly disables the
+    // last remaining requirement source, so assert the guard instead of
+    // clicking it; the server-side 409 is asserted directly below.
+    await expect(
+      page.getByRole("button", { name: `删除来源 ${originalSource.id}` }),
+    ).toBeDisabled()
+    await expect(page.getByTestId("source-panel")).toContainText(
+      "最后一条不可删除",
     )
 
     const rejected = await request.delete(
