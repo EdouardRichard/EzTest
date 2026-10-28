@@ -37,7 +37,19 @@ const mocks = vi.hoisted(() => ({
   listDecisions: vi.fn(),
   createDecision: vi.fn(),
   updateDecision: vi.fn(),
+  fetchVersionEvents: vi.fn(),
   useVersionStream: vi.fn(),
+  useBatches: vi.fn(),
+  useBatch: vi.fn(),
+  useCaseRuns: vi.fn(),
+  useCaseRun: vi.fn(),
+  useReport: vi.fn(),
+  useExecution: vi.fn(),
+  useExecutionActions: vi.fn(),
+  listExecutionSessions: vi.fn(),
+  createBatch: vi.fn(),
+  pauseBatch: vi.fn(),
+  resumeBatch: vi.fn(),
 }))
 
 vi.mock("./api", () => ({
@@ -58,6 +70,40 @@ vi.mock("./api", () => ({
   listDecisions: mocks.listDecisions,
   createDecision: mocks.createDecision,
   updateDecision: mocks.updateDecision,
+  fetchVersionEvents: mocks.fetchVersionEvents,
+}))
+
+// The execution tabs are covered by their own suites; this container test only
+// needs their empty projections to prove the slots and header controls are wired.
+vi.mock("@/features/execution/hooks/useExecution", () => ({
+  useBatches: mocks.useBatches,
+  useBatch: mocks.useBatch,
+  useCaseRuns: mocks.useCaseRuns,
+  useCaseRun: mocks.useCaseRun,
+  useReport: mocks.useReport,
+  useExecution: mocks.useExecution,
+  useExecutionActions: mocks.useExecutionActions,
+}))
+
+vi.mock("@/features/execution/api", () => ({
+  listExecutionSessions: mocks.listExecutionSessions,
+}))
+
+vi.mock("@/features/mindmap/api", () => ({
+  getGraph: vi.fn(async () => ({
+    versionId: "1844674407370955161",
+    versionStatus: "clarifying",
+    editable: false,
+    nodes: [],
+    coverage: {
+      requirementIds: [],
+      uncoveredRequirementIds: [],
+      staleRequirementIds: [],
+      matrix: [],
+    },
+    baseline: null,
+    latestRuns: {},
+  })),
 }))
 
 // The workbench owns the version stream; this suite only covers the tab shell.
@@ -72,6 +118,7 @@ vi.mock("./VersionBindingsForm", () => ({
 import VersionDetailRoutePage from "@/app/(app)/versions/[id]/page"
 
 import type { Analysis, ChangeList, IndexRun } from "@/features/code-intel/types"
+import type { Batch } from "@/features/execution/types"
 
 import type { Version } from "./types"
 import { VersionDetailPage } from "./VersionDetailPage"
@@ -117,14 +164,73 @@ const TAB_LABELS = [
   "代码与变更",
 ]
 
-const PLACEHOLDER_TABS = [
-  ["执行会话", "P6"],
-  ["探索链路", "P6"],
-  ["实时播报", "P6"],
-  ["结果与证据", "P6"],
-  ["问题", "P7"],
-  ["报告", "P6"],
+const PLACEHOLDER_TABS = [["问题", "P7"]] as const
+
+/** The five P6 tab slots and the root test id each real tab renders. */
+const EXECUTION_TAB_SLOTS = [
+  ["执行会话", "sessions-tab"],
+  ["探索链路", "exploration-tab"],
+  ["实时播报", "broadcast-tab"],
+  ["结果与证据", "results-tab"],
+  ["报告", "report-tab"],
 ] as const
+
+const ACTIVE_BATCH_ID = "1844674407370955165"
+
+function batchFixture(overrides: Partial<Batch> = {}): Batch {
+  return {
+    id: ACTIVE_BATCH_ID,
+    version_id: VERSION_ID,
+    batch_no: 1,
+    status: "running",
+    paused: false,
+    pause_mode: "",
+    pause_reason: "",
+    baseline_hash: "a".repeat(64),
+    code_baseline_commit: null,
+    head_commit: null,
+    counts: {
+      total: 2,
+      passed: 1,
+      failed: 0,
+      blocked: 0,
+      inconclusive: 0,
+      skipped: 0,
+      interrupted: 0,
+    },
+    created_by: "1",
+    started_at: "2026-10-28T00:00:00Z",
+    finished_at: null,
+    failure_reason: "",
+    ...overrides,
+  }
+}
+
+function batchesResult(batches: Batch[] = []) {
+  return {
+    batches,
+    nextCursor: "",
+    hasMore: false,
+    loading: false,
+    error: "",
+    streamStatus: "live" as const,
+    refresh: vi.fn().mockResolvedValue(undefined),
+  }
+}
+
+function actionsResult() {
+  return {
+    createBatch: mocks.createBatch,
+    pause: mocks.pauseBatch,
+    resume: mocks.resumeBatch,
+    cancel: vi.fn(),
+    rerun: vi.fn(),
+    exportReport: vi.fn(),
+    pending: "" as const,
+    error: "",
+    clearError: vi.fn(),
+  }
+}
 
 const CODE_BASE = "0123456789abcdef0123456789abcdef01234567"
 const CODE_HEAD = "89abcdef0123456789abcdef0123456789abcdef"
@@ -207,6 +313,52 @@ describe("VersionDetailPage", () => {
     })
     mocks.listDecisions.mockResolvedValue({ items: [], nextCursor: "", hasMore: false })
     mocks.useVersionStream.mockReturnValue({ events: [], status: "live", reconnect: vi.fn() })
+    mocks.fetchVersionEvents.mockResolvedValue({ events: [], cursor: 0, hasMore: false })
+    mocks.useBatches.mockReturnValue(batchesResult())
+    mocks.useBatch.mockReturnValue({
+      batch: null,
+      loading: false,
+      error: "",
+      streamStatus: "live",
+      refresh: vi.fn(),
+    })
+    mocks.useCaseRuns.mockReturnValue({
+      caseRuns: [],
+      nextCursor: "",
+      hasMore: false,
+      loading: false,
+      error: "",
+      streamStatus: "live",
+      refresh: vi.fn(),
+    })
+    mocks.useCaseRun.mockReturnValue({
+      caseRun: null,
+      loading: false,
+      error: "",
+      streamStatus: "live",
+      refresh: vi.fn(),
+    })
+    mocks.useReport.mockReturnValue({
+      report: null,
+      loading: false,
+      error: "",
+      streamStatus: "live",
+      refresh: vi.fn(),
+    })
+    mocks.useExecution.mockReturnValue({
+      batches: [],
+      activeBatch: null,
+      loading: false,
+      error: "",
+      streamStatus: "live",
+      refresh: vi.fn(),
+      actions: actionsResult(),
+    })
+    mocks.useExecutionActions.mockReturnValue(actionsResult())
+    mocks.listExecutionSessions.mockResolvedValue({ items: [], nextCursor: "", hasMore: false })
+    mocks.createBatch.mockResolvedValue(batchFixture())
+    mocks.pauseBatch.mockResolvedValue(true)
+    mocks.resumeBatch.mockResolvedValue(true)
     for (const mock of Object.values(codeIntelMocks)) mock.mockReset()
     codeIntelMocks.getVersionChanges.mockResolvedValue(CODE_CHANGES)
     codeIntelMocks.getLatestIndexRun.mockResolvedValue(CODE_INDEX)
@@ -258,15 +410,15 @@ describe("VersionDetailPage", () => {
     expect(screen.getByText("暂无问题，问题中心在 P7 阶段接入。")).toBeTruthy()
   })
 
-  it("switches tabs, syncs ?tab= and returns from a placeholder tab", async () => {
+  it("switches tabs, syncs ?tab= and returns from the issues placeholder", async () => {
     render(<VersionDetailPage versionId={VERSION_ID} />)
     await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
 
-    fireEvent.mouseDown(screen.getByRole("tab", { name: "执行会话" }))
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "问题" }))
 
-    await waitFor(() => expect(window.location.search).toContain("tab=sessions"))
-    expect(await screen.findByRole("heading", { name: "执行会话" })).toBeTruthy()
-    expect(screen.getByText("阶段 P6")).toBeTruthy()
+    await waitFor(() => expect(window.location.search).toContain("tab=issues"))
+    expect(await screen.findByRole("heading", { name: "问题" })).toBeTruthy()
+    expect(screen.getByText("阶段 P7")).toBeTruthy()
     expect(screen.getByText("该 Tab 尚未接入数据，不展示占位假数据。")).toBeTruthy()
     expect(screen.queryAllByRole("table")).toHaveLength(0)
 
@@ -281,7 +433,20 @@ describe("VersionDetailPage", () => {
     await waitFor(() => expect(window.location.search).toContain("tab=requirements"))
   })
 
-  it("labels every future tab with its owning phase and renders no fake data", async () => {
+  it("renders the five P6 execution tab slots instead of placeholders", async () => {
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+
+    for (const [label, testId] of EXECUTION_TAB_SLOTS) {
+      fireEvent.mouseDown(screen.getByRole("tab", { name: label }))
+
+      expect(await screen.findByTestId(testId)).toBeTruthy()
+      expect(screen.queryByText("阶段 P6")).toBeNull()
+      expect(screen.queryByText("该 Tab 尚未接入数据，不展示占位假数据。")).toBeNull()
+    }
+  })
+
+  it("still labels the issues tab as the remaining P7 placeholder", async () => {
     render(<VersionDetailPage versionId={VERSION_ID} />)
     await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
 
@@ -293,6 +458,42 @@ describe("VersionDetailPage", () => {
       expect(screen.queryAllByRole("table")).toHaveLength(0)
       expect(screen.queryAllByRole("row")).toHaveLength(0)
     }
+  })
+
+  it("shows 开始执行 only when an executing version has no active batch", async () => {
+    mocks.getVersion.mockResolvedValue({ ...VERSION, status: "executing" })
+
+    const { unmount } = render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+
+    fireEvent.click(await screen.findByTestId("exec-start-btn"))
+    await waitFor(() => expect(mocks.createBatch).toHaveBeenCalled())
+
+    unmount()
+    mocks.useBatches.mockReturnValue(batchesResult([batchFixture()]))
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+
+    expect(screen.queryByTestId("exec-start-btn")).toBeNull()
+    expect(screen.getByTestId("exec-batch-selector")).toBeTruthy()
+    expect(screen.getByTestId("exec-pause-btn")).toBeTruthy()
+  })
+
+  it("shows the paused banner and resume action for a paused batch", async () => {
+    mocks.getVersion.mockResolvedValue({ ...VERSION, status: "executing" })
+    mocks.useBatches.mockReturnValue(
+      batchesResult([batchFixture({ paused: true, pause_mode: "graceful" })]),
+    )
+
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+
+    expect(await screen.findByTestId("paused-banner")).toBeTruthy()
+    expect(screen.getAllByText(/优雅暂停/).length).toBeGreaterThan(0)
+    expect(screen.getByText(/已完成 1\/2 个用例/)).toBeTruthy()
+
+    fireEvent.click(screen.getByTestId("exec-resume-btn"))
+    await waitFor(() => expect(mocks.resumeBatch).toHaveBeenCalledWith(ACTIVE_BATCH_ID))
   })
 
   it("mounts the real code changes tab instead of the P4 placeholder", async () => {

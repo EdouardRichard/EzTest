@@ -1,6 +1,6 @@
 "use client"
 
-import { KeyRound, Pencil, Plus, RefreshCw, Trash2, Users } from "lucide-react"
+import { KeyRound, Pencil, Plus, RefreshCw, Settings2, Trash2, Users } from "lucide-react"
 import { type FormEvent, useCallback, useEffect, useRef, useState } from "react"
 
 import { EmptyState } from "@/components/ui/EmptyState"
@@ -8,22 +8,26 @@ import { StatusBadge } from "@/components/ui/StatusBadge"
 import { ApiError } from "@/lib/api-client"
 
 import { AccessForm, type AccessWriteInput } from "./AccessForm"
+import { AuthFlowDialog } from "./AuthFlowDialog"
 import {
   createAccess,
   createAccount,
   deleteAccess,
   deleteAccount,
+  deleteAuthFlow,
   listAccesses,
   listAccounts,
+  listAuthFlows,
   listSystems,
   updateAccess,
   updateAccount,
 } from "./api"
-import type { AccessDTO, AccountDTO, SystemDTO } from "./types"
+import type { AccessDTO, AccountDTO, AuthFlowDTO, SystemDTO } from "./types"
 
 const ACCOUNT_PAGE_LIMIT = 100
 const ACCESS_PAGE_LIMIT = 100
 const SYSTEM_PAGE_LIMIT = 100
+const AUTH_FLOW_PAGE_LIMIT = 100
 const KEY_PATTERN = /^[a-z0-9][a-z0-9_-]{1,63}$/
 
 const ACCOUNT_KIND_OPTIONS = [
@@ -150,6 +154,15 @@ export function AccountsPanel({ canWrite }: AccountsPanelProps) {
   const [deletingAccessId, setDeletingAccessId] = useState<number | null>(null)
   const [confirmingAccessDeleteId, setConfirmingAccessDeleteId] = useState<number | null>(null)
 
+  const [flows, setFlows] = useState<AuthFlowDTO[]>([])
+  const [flowsLoading, setFlowsLoading] = useState(true)
+  const [flowsError, setFlowsError] = useState("")
+  const [flowsNotice, setFlowsNotice] = useState("")
+  const [flowDialogOpen, setFlowDialogOpen] = useState(false)
+  const [editingFlow, setEditingFlow] = useState<AuthFlowDTO | null>(null)
+  const [deletingFlowId, setDeletingFlowId] = useState<string | null>(null)
+  const [confirmingFlowDeleteId, setConfirmingFlowDeleteId] = useState<string | null>(null)
+
   const loadAccounts = useCallback(async () => {
     setLoading(true)
     setError("")
@@ -171,6 +184,26 @@ export function AccountsPanel({ canWrite }: AccountsPanelProps) {
       setError(describeError(caught))
     }
   }, [])
+
+  // Login recipes are admin-only on the API (spec §5.11), so normal users never
+  // trigger the list call.
+  const loadFlows = useCallback(async () => {
+    if (!canWrite) {
+      setFlows([])
+      setFlowsLoading(false)
+      return
+    }
+    setFlowsLoading(true)
+    setFlowsError("")
+    try {
+      const page = await listAuthFlows({ limit: AUTH_FLOW_PAGE_LIMIT })
+      setFlows(page.items)
+    } catch (caught) {
+      setFlowsError(describeError(caught))
+    } finally {
+      setFlowsLoading(false)
+    }
+  }, [canWrite])
 
   const loadAccesses = useCallback(async (accountId: number) => {
     const requestId = accessRequestIdRef.current + 1
@@ -197,6 +230,10 @@ export function AccountsPanel({ canWrite }: AccountsPanelProps) {
     void loadAccounts()
     void loadSystems()
   }, [loadAccounts, loadSystems])
+
+  useEffect(() => {
+    void loadFlows()
+  }, [loadFlows])
 
   useEffect(() => {
     // A selection change invalidates both the rows loaded for the previous
@@ -382,6 +419,49 @@ export function AccountsPanel({ canWrite }: AccountsPanelProps) {
       setAccessError(describeError(caught))
     } finally {
       setDeletingAccessId(null)
+    }
+  }
+
+  function startCreateFlow() {
+    setEditingFlow(null)
+    setFlowDialogOpen(true)
+    setFlowsError("")
+    setFlowsNotice("")
+  }
+
+  function startEditFlow(flow: AuthFlowDTO) {
+    setEditingFlow(flow)
+    setFlowDialogOpen(true)
+    setFlowsError("")
+    setFlowsNotice("")
+  }
+
+  function cancelFlowDialog() {
+    setFlowDialogOpen(false)
+    setEditingFlow(null)
+  }
+
+  async function handleFlowSaved(flow: AuthFlowDTO) {
+    const created = editingFlow === null
+    setFlowDialogOpen(false)
+    setEditingFlow(null)
+    setFlowsNotice(created ? `已创建登录配方 ${flow.name}。` : `已更新登录配方 ${flow.name}。`)
+    await loadFlows()
+  }
+
+  async function handleDeleteFlow(flow: AuthFlowDTO) {
+    setConfirmingFlowDeleteId(null)
+    setDeletingFlowId(flow.id)
+    setFlowsError("")
+    setFlowsNotice("")
+    try {
+      await deleteAuthFlow(flow.id)
+      setFlows((previous) => previous.filter((item) => item.id !== flow.id))
+      setFlowsNotice(`已删除登录配方 ${flow.name}。`)
+    } catch (caught) {
+      setFlowsError(describeError(caught))
+    } finally {
+      setDeletingFlowId(null)
     }
   }
 
@@ -652,6 +732,169 @@ export function AccountsPanel({ canWrite }: AccountsPanelProps) {
         </div>
       )}
 
+      {canWrite ? (
+        <section
+          aria-labelledby="auth-flows-panel-title"
+          className="space-y-3 rounded-2xl border border-border bg-muted/20 p-3"
+        >
+          <div className="flex flex-wrap items-start justify-between gap-2">
+            <div>
+              <h3
+                id="auth-flows-panel-title"
+                className="flex items-center gap-2 text-sm font-semibold"
+              >
+                <Settings2 className="h-4 w-4 text-primary" aria-hidden="true" />
+                登录配方
+              </h3>
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                按系统配置表单登录步骤；Access 绑定启用中的配方后，执行时可在会话失效后自动登录。
+              </p>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => void loadFlows()}
+                disabled={flowsLoading}
+                aria-label="刷新登录配方"
+                className={secondaryButtonClass}
+              >
+                <RefreshCw
+                  className={`h-4 w-4 ${flowsLoading ? "animate-spin" : ""}`}
+                  aria-hidden="true"
+                />
+              </button>
+              <button type="button" onClick={startCreateFlow} className={primaryButtonClass}>
+                <Plus className="h-4 w-4" aria-hidden="true" />
+                新建配方
+              </button>
+            </div>
+          </div>
+
+          {flowsError ? (
+            <p
+              role="alert"
+              className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+            >
+              {flowsError}
+            </p>
+          ) : null}
+          {flowsNotice ? (
+            <p
+              role="status"
+              className="rounded-xl border border-emerald-500/25 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-300"
+            >
+              {flowsNotice}
+            </p>
+          ) : null}
+
+          {flowsLoading && flows.length === 0 ? (
+            <p className="rounded-xl border border-dashed border-border px-4 py-6 text-center text-sm text-muted-foreground">
+              正在加载登录配方…
+            </p>
+          ) : flows.length === 0 ? (
+            <EmptyState
+              icon={Settings2}
+              title="暂无登录配方"
+              description="使用“新建配方”配置第一个表单登录配方。"
+            />
+          ) : (
+            <div className="overflow-x-auto rounded-xl border border-border">
+              <table className="min-w-full divide-y divide-border text-sm">
+                <caption className="sr-only">登录配方列表</caption>
+                <thead className="bg-muted/50 text-left text-[11px] uppercase tracking-wide text-muted-foreground">
+                  <tr>
+                    <th scope="col" className="px-2.5 py-2 font-medium">
+                      名称
+                    </th>
+                    <th scope="col" className="px-2.5 py-2 font-medium">
+                      系统
+                    </th>
+                    <th scope="col" className="px-2.5 py-2 font-medium">
+                      登录 URL
+                    </th>
+                    <th scope="col" className="px-2.5 py-2 font-medium">
+                      状态
+                    </th>
+                    <th scope="col" className="px-2.5 py-2 text-right font-medium">
+                      操作
+                    </th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border">
+                  {flows.map((flow) => (
+                    <tr key={flow.id}>
+                      <td className="px-2.5 py-2">{flow.name}</td>
+                      <td className="px-2.5 py-2 text-muted-foreground">
+                        {systemName(Number(flow.system_id))}
+                      </td>
+                      <td className="max-w-[22rem] truncate px-2.5 py-2 font-mono text-[11px] text-muted-foreground">
+                        {flow.definition.login_url}
+                      </td>
+                      <td className="px-2.5 py-2">
+                        <StatusBadge variant={flow.enabled ? "success" : "neutral"}>
+                          {flow.enabled ? "启用" : "停用"}
+                        </StatusBadge>
+                      </td>
+                      <td className="px-2.5 py-2 text-right">
+                        <div className="flex flex-wrap items-center justify-end gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => startEditFlow(flow)}
+                            aria-label={`编辑配方 ${flow.name}`}
+                            className={rowActionClass}
+                          >
+                            <Pencil className="h-3 w-3" aria-hidden="true" />
+                            编辑
+                          </button>
+                          {confirmingFlowDeleteId === flow.id ? (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() => void handleDeleteFlow(flow)}
+                                disabled={deletingFlowId === flow.id}
+                                aria-label={`确认删除配方 ${flow.name}`}
+                                className={rowDangerActionClass}
+                              >
+                                <Trash2 className="h-3 w-3" aria-hidden="true" />
+                                确认删除
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setConfirmingFlowDeleteId(null)}
+                                disabled={deletingFlowId === flow.id}
+                                aria-label={`取消删除配方 ${flow.name}`}
+                                className={rowActionClass}
+                              >
+                                取消
+                              </button>
+                            </>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setConfirmingFlowDeleteId(flow.id)
+                                setFlowsError("")
+                                setFlowsNotice("")
+                              }}
+                              disabled={deletingFlowId === flow.id}
+                              aria-label={`删除配方 ${flow.name}`}
+                              className={rowActionClass}
+                            >
+                              <Trash2 className="h-3 w-3" aria-hidden="true" />
+                              删除
+                            </button>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+      ) : null}
+
       {selectedAccount === null ? (
         accounts.length === 0 ? null : (
           <p className="rounded-xl border border-dashed border-border px-4 py-4 text-center text-sm text-muted-foreground">
@@ -712,6 +955,7 @@ export function AccountsPanel({ canWrite }: AccountsPanelProps) {
               key={editingAccess === null ? "new" : editingAccess.id}
               accountId={selectedAccount.id}
               systems={systems}
+              flows={flows}
               access={editingAccess ?? undefined}
               canWrite={canWrite}
               onSubmit={handleAccessSubmit}
@@ -850,6 +1094,16 @@ export function AccountsPanel({ canWrite }: AccountsPanelProps) {
           )}
         </section>
       )}
+
+      {flowDialogOpen && canWrite ? (
+        <AuthFlowDialog
+          key={editingFlow === null ? "new" : editingFlow.id}
+          systems={systems}
+          flow={editingFlow ?? undefined}
+          onClose={cancelFlowDialog}
+          onSaved={handleFlowSaved}
+        />
+      ) : null}
     </section>
   )
 }

@@ -4,6 +4,8 @@ import type {
   AccessDTO,
   AccountDTO,
   AppModelNodeDTO,
+  AuthFlowDefinitionDTO,
+  AuthFlowDTO,
   EnvironmentDTO,
   Page,
   SessionDTO,
@@ -83,6 +85,10 @@ function accountPath(id: number): string {
 
 function accessPath(id: number): string {
   return `${RESOURCES_ROOT}/accesses/${id}`
+}
+
+function authFlowPath(id: string): string {
+  return `${RESOURCES_ROOT}/auth-flows/${id}`
 }
 
 function sessionPath(id: number): string {
@@ -234,6 +240,42 @@ export function updateAccess(
 
 export async function deleteAccess(id: number): Promise<void> {
   await apiDelete<void>(accessPath(id))
+}
+
+// --- Login recipes (spec §3.4/§6.2, admin-only) -----------------------------
+
+/** Writable login recipe fields; `system_id` is only accepted on create. */
+export type AuthFlowWriteInput = {
+  system_id?: string
+  name: string
+  kind: string
+  definition: AuthFlowDefinitionDTO
+  enabled: boolean
+}
+
+export async function listAuthFlows(
+  params: { systemId?: number; limit?: number; cursor?: string } = {},
+): Promise<Page<AuthFlowDTO>> {
+  const path = withQuery(`${RESOURCES_ROOT}/auth-flows`, {
+    system_id: params.systemId,
+    limit: params.limit,
+    cursor: params.cursor,
+  })
+  return toPage<AuthFlowDTO>(await apiGet<unknown>(path))
+}
+
+export function createAuthFlow(
+  input: AuthFlowWriteInput & { system_id: string },
+): Promise<AuthFlowDTO> {
+  return apiPost<AuthFlowDTO>(`${RESOURCES_ROOT}/auth-flows`, input)
+}
+
+export function updateAuthFlow(id: string, input: AuthFlowWriteInput): Promise<AuthFlowDTO> {
+  return apiPatch<AuthFlowDTO>(authFlowPath(id), input)
+}
+
+export async function deleteAuthFlow(id: string): Promise<void> {
+  await apiDelete<void>(authFlowPath(id))
 }
 
 // --- Sessions (spec §7.5) ---------------------------------------------------

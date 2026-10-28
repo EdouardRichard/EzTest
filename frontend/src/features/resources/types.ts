@@ -62,6 +62,31 @@ export type AccessDTO = {
   concurrencyLimit: number
   sessionTtlSeconds: number | null
   permissionNote: string
+  /** Bound auto-login recipe id (decimal string) or null (spec §3.4). */
+  login_flow_id?: string | null
+}
+
+/** Minimal form login recipe definition (spec §3.4). */
+export type AuthFlowDefinitionDTO = {
+  login_url: string
+  username_selector: string
+  password_selector: string
+  submit_selector: string
+  success: { url_contains?: string; selector?: string }
+  failure: { mfa_selector?: string; captcha_selector?: string; invalid_selector?: string }
+  timeout_ms: number
+}
+
+/** Login recipe (auth_flow) of one system; ids are decimal strings (spec §6.1). */
+export type AuthFlowDTO = {
+  id: string
+  system_id: string
+  name: string
+  kind: string
+  definition: AuthFlowDefinitionDTO
+  enabled: boolean
+  created_at: string
+  updated_at: string
 }
 
 export type SnapshotDTO = {

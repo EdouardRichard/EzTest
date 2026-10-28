@@ -1,14 +1,32 @@
 "use client"
 
-import { ArrowLeft, Loader2, Network, RefreshCw } from "lucide-react"
+import {
+  ArrowLeft,
+  FileText,
+  Loader2,
+  Network,
+  Pause,
+  RefreshCw,
+  UserRoundCheck,
+} from "lucide-react"
 import Link from "next/link"
 import { useState } from "react"
 
 import { StatusBadge, type StatusBadgeVariant } from "@/components/ui/StatusBadge"
+import { BatchSelector } from "@/features/execution/components/BatchSelector"
+import { PauseDialog } from "@/features/execution/components/PauseDialog"
+import { PausedBanner } from "@/features/execution/components/PausedBanner"
+import { StartBatchButton } from "@/features/execution/components/StartBatchButton"
+import {
+  type UseExecutionActionsResult,
+  useCaseRuns,
+} from "@/features/execution/hooks/useExecution"
+import type { Batch, PauseMode } from "@/features/execution/types"
 import { ApiError } from "@/lib/api-client"
 
 import { enterDesign, startClarification } from "./api"
 import type { Version, VersionResource, VersionStatus } from "./types"
+import type { VersionStreamState } from "./useVersionStream"
 
 /** Display metadata for every version status the API may return (spec §6.1). */
 export const VERSION_STATUS_META: Record<
@@ -75,6 +93,23 @@ type PendingWarnings = {
   openQuestionCount: number
 }
 
+/**
+ * Header-level execution projection owned by `VersionDetailPage`: the batch
+ * page, the selected batch, the control actions and the shared version stream.
+ * Pause/resume never update optimistically — the action refreshes the page and
+ * the paused banner follows the server projection.
+ */
+export type VersionHeaderExecution = {
+  batches: Batch[]
+  activeBatch: Batch | null
+  selectedBatchId: string
+  stream: VersionStreamState
+  actions: UseExecutionActionsResult
+  onBatchChange: (batchId: string) => void
+  onOpenReport: () => void
+  onOpenSessions: () => void
+}
+
 export type VersionHeaderProps = {
   version: Version
   /** True while the parent refetches the version. */
@@ -83,6 +118,43 @@ export type VersionHeaderProps = {
   onRefresh: () => void
   /** Receives every version returned by a state-changing action. */
   onUpdated: (version: Version) => void
+  /** P6 execution controls; absent while the header is used without them. */
+  execution?: VersionHeaderExecution
+}
+
+/** Banner for blocked case runs that are waiting for a human takeover. */
+function HumanPendingBanner({
+  versionId,
+  batchId,
+  stream,
+  onOpenSessions,
+}: {
+  versionId: string
+  batchId: string
+  stream: VersionStreamState
+  onOpenSessions: () => void
+}) {
+  const { caseRuns } = useCaseRuns(versionId, batchId, { status: "blocked" }, stream)
+  const pending = caseRuns.filter((caseRun) => caseRun.pending_takeover !== null).length
+  if (pending === 0) return null
+
+  return (
+    <div
+      data-testid="human-pending-banner"
+      role="status"
+      className="flex flex-wrap items-center gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-800 dark:text-amber-200"
+    >
+      <UserRoundCheck className="h-4 w-4 shrink-0" aria-hidden="true" />
+      <span>{`有 ${pending} 个用例等待人工接管`}</span>
+      <button
+        type="button"
+        onClick={onOpenSessions}
+        className="ml-auto rounded-lg border border-amber-500/40 bg-card px-2.5 py-1 text-xs font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        前往执行会话
+      </button>
+    </div>
+  )
 }
 
 /**
@@ -93,13 +165,25 @@ export type VersionHeaderProps = {
  * `unclarified_requirements` opens an inline confirmation, then the request is
  * retried with `acknowledgeUnclarified=true`.
  */
-export function VersionHeader({ version, refreshing, onRefresh, onUpdated }: VersionHeaderProps) {
+export function VersionHeader({
+  version,
+  refreshing,
+  onRefresh,
+  onUpdated,
+  execution,
+}: VersionHeaderProps) {
   const [busy, setBusy] = useState<"start" | "design" | null>(null)
   const [actionError, setActionError] = useState("")
   const [warnings, setWarnings] = useState<string[]>([])
   const [pendingWarnings, setPendingWarnings] = useState<PendingWarnings | null>(null)
+  const [pauseDialogOpen, setPauseDialogOpen] = useState(false)
+  const [pauseDialogError, setPauseDialogError] = useState("")
 
   const unclarifiedCount = Math.max(version.requirementCount - version.clarifiedCount, 0)
+  const executable = version.status === "executing" || version.status === "continuing"
+  const activeBatch = execution?.activeBatch ?? null
+  const executionPending = execution?.actions.pending ?? ""
+  const selectedBatch = execution?.selectedBatchId ?? ""
 
   async function handleStartClarification(): Promise<void> {
     setBusy("start")
@@ -143,6 +227,29 @@ export function VersionHeader({ version, refreshing, onRefresh, onUpdated }: Ver
     } finally {
       setBusy(null)
     }
+  }
+
+  async function handleStartBatch(): Promise<void> {
+    if (execution === undefined) return
+    setActionError("")
+    await execution.actions.createBatch()
+  }
+
+  async function handlePause(mode: PauseMode): Promise<void> {
+    if (execution === undefined || execution.activeBatch === null) return
+    setPauseDialogError("")
+    const ok = await execution.actions.pause(execution.activeBatch.id, mode)
+    if (ok) {
+      setPauseDialogOpen(false)
+    } else {
+      setPauseDialogError(execution.actions.error || "暂停失败，请稍后重试。")
+    }
+  }
+
+  async function handleResume(): Promise<void> {
+    if (execution === undefined || execution.activeBatch === null) return
+    setActionError("")
+    await execution.actions.resume(execution.activeBatch.id)
   }
 
   return (
@@ -215,6 +322,50 @@ export function VersionHeader({ version, refreshing, onRefresh, onUpdated }: Ver
             </button>
           ) : null}
 
+          {execution !== undefined && (executable || version.status === "completed") ? (
+            <BatchSelector
+              batches={execution.batches}
+              value={selectedBatch}
+              onChange={execution.onBatchChange}
+            />
+          ) : null}
+
+          <StartBatchButton
+            versionStatus={version.status}
+            hasActiveBatch={activeBatch !== null}
+            busy={executionPending === "createBatch"}
+            disabled={execution === undefined || execution.actions.pending !== ""}
+            onStart={() => void handleStartBatch()}
+          />
+
+          {executable && activeBatch !== null && !activeBatch.paused ? (
+            <button
+              type="button"
+              data-testid="exec-pause-btn"
+              onClick={() => {
+                setPauseDialogError("")
+                setPauseDialogOpen(true)
+              }}
+              disabled={executionPending !== "" || execution === undefined}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-2 text-sm font-medium transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <Pause className="h-4 w-4" aria-hidden="true" />
+              暂停
+            </button>
+          ) : null}
+
+          {version.status === "completed" && execution !== undefined ? (
+            <button
+              type="button"
+              data-testid="exec-report-entry"
+              onClick={execution.onOpenReport}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <FileText className="h-4 w-4" aria-hidden="true" />
+              查看报告
+            </button>
+          ) : null}
+
           <Link
             href={`/versions/${version.id}/mindmap`}
             data-testid="open-mindmap"
@@ -239,6 +390,33 @@ export function VersionHeader({ version, refreshing, onRefresh, onUpdated }: Ver
           </button>
         </div>
       </div>
+
+      {execution !== undefined && activeBatch?.paused ? (
+        <PausedBanner
+          batch={activeBatch}
+          busy={executionPending === "resume"}
+          error={execution.actions.error}
+          onResume={() => void handleResume()}
+        />
+      ) : null}
+
+      {execution !== undefined && activeBatch !== null ? (
+        <HumanPendingBanner
+          versionId={version.id}
+          batchId={activeBatch.id}
+          stream={execution.stream}
+          onOpenSessions={execution.onOpenSessions}
+        />
+      ) : null}
+
+      {execution !== undefined && execution.actions.error !== "" && activeBatch?.paused !== true ? (
+        <p
+          role="alert"
+          className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+        >
+          {execution.actions.error}
+        </p>
+      ) : null}
 
       {version.status === "designing" ? (
         <p
@@ -312,6 +490,14 @@ export function VersionHeader({ version, refreshing, onRefresh, onUpdated }: Ver
           </div>
         </div>
       )}
+
+      <PauseDialog
+        open={pauseDialogOpen}
+        busy={executionPending === "pause"}
+        error={pauseDialogError}
+        onConfirm={(mode) => void handlePause(mode)}
+        onClose={() => setPauseDialogOpen(false)}
+      />
     </header>
   )
 }
