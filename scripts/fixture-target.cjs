@@ -373,7 +373,7 @@ async function handleRequest(req, res) {
 
   // --- P5 additive exploration fixtures (design spec §10.2) ----------------
   // The routes below are new and leave every existing route untouched.
-  if (pathname === "/p5/home" || pathname === "/p5/orders" || pathname === "/p5/admin") {
+  if (pathname === "/p5/home" || pathname === "/p5/orders" || pathname === "/p5/admin" || pathname === "/p5/slow") {
     if (req.method !== "GET" && req.method !== "HEAD") {
       sendMethodNotAllowed(res, ["GET", "HEAD"]);
       return;

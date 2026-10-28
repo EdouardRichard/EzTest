@@ -86,7 +86,7 @@ const graphProposeSchema = `{
             "items": {
               "type": "object",
               "properties": {
-                "stepIndex": {"type": ["integer", "null"]},
+                "stepIndex": {"type": ["integer", "null"], "description": "0-based index into the case steps array (0 = first step)"},
                 "kind": {"type": "string", "enum": ["ui", "api", "db", "text"]},
                 "target": {"type": "string"},
                 "expression": {"type": "string"},
@@ -176,7 +176,7 @@ const graphProposeSchema = `{
                 "items": {
                   "type": "object",
                   "properties": {
-                    "stepIndex": {"type": ["integer", "null"]},
+                    "stepIndex": {"type": ["integer", "null"], "description": "0-based index into the case steps array (0 = first step)"},
                     "kind": {"type": "string", "enum": ["ui", "api", "db", "text"]},
                     "target": {"type": "string"},
                     "expression": {"type": "string"},
