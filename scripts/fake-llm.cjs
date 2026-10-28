@@ -1272,7 +1272,7 @@ function p5AppModelProposal(systemId) {
       },
     ],
   };
-  if (systemId !== "") proposal.systemId = Number(systemId);
+  if (systemId !== "") proposal.systemId = String(systemId);
   return proposal;
 }
 

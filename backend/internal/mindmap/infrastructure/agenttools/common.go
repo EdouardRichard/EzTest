@@ -186,7 +186,7 @@ func NewTools(deps ToolDeps) []agentdomain.Tool {
 		},
 		{
 			name:        toolNameGraphPropose,
-			description: "Submit the structured case proposal (spec §6.7 payload) of a design run. Stores it in the active run result; the server materializes it after the run finishes.",
+			description: "Submit the structured case proposal of a design run: flat spec §6.7 scenarios/cases at the top level (or a nested payload object). Stores it in the active run result; the server materializes it after the run finishes.",
 			schema:      graphProposeSchema,
 			run:         runGraphPropose,
 		},
@@ -255,6 +255,21 @@ func requireJSONObject(raw json.RawMessage, field string) *agentdomain.ToolError
 		return invalidToolArguments("%s must be a JSON object", field)
 	}
 	return nil
+}
+
+// requireJSONArray decodes raw as a JSON array and reports an invalid_arguments
+// failure otherwise. A missing field or an explicit null is rejected here; call
+// sites that treat the field as optional check presence first.
+func requireJSONArray(raw json.RawMessage, field string) ([]json.RawMessage, *agentdomain.ToolError) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '[' {
+		return nil, invalidToolArguments("%s must be a JSON array", field)
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal(trimmed, &items); err != nil || items == nil {
+		return nil, invalidToolArguments("%s must be a JSON array", field)
+	}
+	return items, nil
 }
 
 // invalidToolArguments builds a correctable invalid_arguments tool error.
