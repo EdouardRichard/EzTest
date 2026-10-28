@@ -21,6 +21,10 @@ const (
 	versionStatusDesigning = "designing"
 	versionStatusReviewing = "reviewing"
 
+	// maxGraphNodes is the P5 mindmap size cap of spec §7.3: above 300 nodes a
+	// read or an add is rejected with graph_too_large (HTTP 409).
+	maxGraphNodes = 300
+
 	maxNodeTitleRunes       = 200
 	maxNodeDescriptionRunes = 4000
 	maxStepActionRunes      = 2000
@@ -40,6 +44,8 @@ const (
 // transaction runner; the repository ports are the read path (and the adapters
 // the transaction is expected to expose through GraphTx). Baselines is read to
 // derive editability and to re-check the freeze in the write transaction.
+// Anchors is optional: when set, DeleteNode removes the code anchors of the
+// deleted subtree best-effort (spec §6.1 rule 6).
 type GraphDeps struct {
 	Graph        GraphRepository
 	Nodes        NodeRepository
@@ -49,6 +55,7 @@ type GraphDeps struct {
 	Baselines    BaselineRepository
 	Versions     VersionLifecycle
 	Requirements RequirementReader
+	Anchors      CodeAnchorGateway
 	Events       EventPublisher
 	IDs          IDGenerator
 	Clock        Clock
@@ -184,7 +191,8 @@ func NewGraphService(deps GraphDeps) *GraphService {
 
 // Get returns the mindmap projection of one version: nodes with their steps,
 // assertions and sources, the requirement coverage matrix, the baseline (when
-// frozen) and the server-derived editable flag (spec §7.3).
+// frozen) and the server-derived editable flag (spec §7.3). A version above the
+// 300-node cap is a graph_too_large conflict.
 func (s *GraphService) Get(ctx context.Context, versionID int64) (GraphView, error) {
 	if s.deps.Versions == nil {
 		return GraphView{}, errors.New("mindmap: version lifecycle is not configured")
@@ -203,6 +211,9 @@ func (s *GraphService) Get(ctx context.Context, versionID int64) (GraphView, err
 	state, err := loadGraphState(ctx, s.deps.Nodes, s.deps.Steps, s.deps.Assertions, s.deps.Sources, versionID)
 	if err != nil {
 		return GraphView{}, err
+	}
+	if len(state.nodes) > maxGraphNodes {
+		return GraphView{}, graphTooLargeError(versionID, len(state.nodes))
 	}
 	confirmed := make(map[int64]bool)
 	if s.deps.Requirements != nil {
@@ -226,7 +237,8 @@ func (s *GraphService) Get(ctx context.Context, versionID int64) (GraphView, err
 
 // CreateNode creates a scenario or a case. A case must reference at least one
 // clarified requirement of the version and gets its requirement source rows in
-// the same transaction; a scenario never owns sources (spec §6.1/§6.2).
+// the same transaction; a scenario never owns sources (spec §6.1/§6.2). Adding
+// the node that would exceed the 300-node cap is a graph_too_large conflict.
 func (s *GraphService) CreateNode(ctx context.Context, versionID, actor int64, cmd CreateNodeCommand) (domain.CaseNode, error) {
 	if err := s.beginWrite(ctx, versionID); err != nil {
 		return domain.CaseNode{}, err
@@ -283,6 +295,9 @@ func (s *GraphService) CreateNode(ctx context.Context, versionID, actor int64, c
 		state, err := loadGraphStateTx(ctx, tx, versionID)
 		if err != nil {
 			return err
+		}
+		if len(state.nodes) >= maxGraphNodes {
+			return graphTooLargeError(versionID, len(state.nodes))
 		}
 		if cmd.ParentID != nil {
 			parent, ok := findNode(state.nodes, *cmd.ParentID)
@@ -518,13 +533,15 @@ func (s *GraphService) UpdateNode(ctx context.Context, versionID, nodeID, actor 
 }
 
 // DeleteNode deletes one node under the revision CAS. Deleting a scenario
-// cascades its subtree; the child rows are removed by the database FKs
-// (spec §6.1 rule 6).
+// cascades its subtree; the child rows are removed by the database FKs and the
+// code anchors of the removed subtree are deleted best-effort through the
+// optional CodeAnchorGateway after the commit (spec §6.1 rule 6).
 func (s *GraphService) DeleteNode(ctx context.Context, versionID, nodeID, actor int64, revision int) error {
 	if err := s.beginWrite(ctx, versionID); err != nil {
 		return err
 	}
 	var deleted domain.CaseNode
+	var doomedIDs []int64
 	err := s.deps.Graph.InTx(ctx, func(tx GraphTx) error {
 		if err := s.guardFrozenTx(ctx, tx, versionID); err != nil {
 			return err
@@ -541,6 +558,7 @@ func (s *GraphService) DeleteNode(ctx context.Context, versionID, nodeID, actor 
 			return revisionConflict(nodeID, revision, current.Revision)
 		}
 		doomed := descendantIDs(state.nodes, nodeID)
+		doomedIDs = orderedIDs(doomed)
 		state = state.withoutNodes(doomed)
 		if err := validateGraphState(state); err != nil {
 			return err
@@ -554,6 +572,7 @@ func (s *GraphService) DeleteNode(ctx context.Context, versionID, nodeID, actor 
 	if err != nil {
 		return err
 	}
+	s.deleteAnchors(ctx, versionID, doomedIDs)
 	s.publishNode(ctx, domain.EventCaseDeleted, versionID, actor, deleted, "")
 	return nil
 }
@@ -1462,6 +1481,24 @@ func (s *GraphService) publishNode(ctx context.Context, eventType string, versio
 	})
 }
 
+// deleteAnchors removes every code anchor of the given nodes through the
+// optional CodeAnchorGateway. Anchor cleanup is best-effort (spec §6.1 rule 6):
+// a nil gateway or a failed list/delete call never fails the node delete.
+func (s *GraphService) deleteAnchors(ctx context.Context, versionID int64, nodeIDs []int64) {
+	if s.deps.Anchors == nil {
+		return
+	}
+	for _, nodeID := range nodeIDs {
+		anchors, err := s.deps.Anchors.List(ctx, versionID, nodeID)
+		if err != nil {
+			continue
+		}
+		for _, anchor := range anchors {
+			_ = s.deps.Anchors.Delete(ctx, versionID, anchor.ID)
+		}
+	}
+}
+
 // publish sends one event after the commit. A publish failure is logged and
 // never returned to the caller (spec §6.11).
 func (s *GraphService) publish(ctx context.Context, event Event) {
@@ -1718,6 +1755,13 @@ func revisionConflict(nodeID int64, expected, actual int) error {
 		fmt.Sprintf("case node %d revision is %d, expected %d", nodeID, actual, expected))
 }
 
+// graphTooLargeError builds the stable 409 of spec §7.3 for a graph above the
+// 300-node P5 cap.
+func graphTooLargeError(versionID int64, nodes int) error {
+	return domain.NewConflict("graph_too_large",
+		fmt.Sprintf("version %d has %d nodes; the mindmap is limited to %d nodes", versionID, nodes, maxGraphNodes))
+}
+
 // invalidCaseTree builds the domain-ruled invalid_case_tree error.
 func invalidCaseTree(format string, args ...any) error {
 	return domain.NewInvalid("graph", "invalid_case_tree", fmt.Sprintf(format, args...))
@@ -1764,6 +1808,16 @@ func descendantIDs(nodes []domain.CaseNode, id int64) map[int64]struct{} {
 		}
 	}
 	return doomed
+}
+
+// orderedIDs returns the ids of a set in ascending order.
+func orderedIDs(ids map[int64]struct{}) []int64 {
+	ordered := make([]int64, 0, len(ids))
+	for id := range ids {
+		ordered = append(ordered, id)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	return ordered
 }
 
 // findStep scans the snapshot for one step.
