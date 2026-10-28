@@ -1,6 +1,6 @@
-# EzTest 代码智能设计 v0.4（语言无关：AI 理解为主，不设计 parser）
+# EzTest 代码智能设计 v0.5（语言无关：AI 理解为主，不设计 parser）
 
-> **状态**：draft（与 system-blueprint v2.2 配套）；实施细化见 P4 规格 `docs/superpowers/specs/2026-10-28-eztest-p4-code-intelligence-design.md`（D32/D33）与本文 §14；§13 DDL 为历史草案，实施按 D29/D32 定稿（雪花 BIGINT、9 表、无跨上下文 FK）。
+> **状态**：draft（与 system-blueprint v2.3 配套）；实施细化见 P4 规格 `docs/superpowers/specs/2026-10-28-eztest-p4-code-intelligence-design.md`（D32/D33）与本文 §14；§13 DDL 为历史草案，实施按 D29/D32 定稿（雪花 BIGINT、9 表、无跨上下文 FK）。
 > **核心原则**：**不限定被测项目的语言/技术栈；不设计 parser/静态语言解析器**。代码理解完全由 AI 承担（读文件/diff/上下文，产出结构化事实 + 证据 + 置信度）；系统只保留语言无关的 **T0 通用 Git 层** 作为确定性兜底。
 > **真源**：管理员配置的**本地 Git 仓库**（只读挂载、固定分支、不联网）。不接线上代码仓。
 > **目标**：让 AI 理解"代码现状"并据此设计用例、做变更影响分析、定位问题代码位置；同时保证低 token、可复现、可追溯。
@@ -95,6 +95,7 @@ CodeFact / CodeEvidence：
 
 CodeAnchor：
   Requirement / Case / Issue / AppModel ↔ CodeEntity / 文件位置
+  （P7 起 subject_kind=issue 正式启用：服务端校验 file:line、问题版本归属后落 code_anchor）
 
 API 契约（跨栈）：
   前端调用点（method + path，AI 识别）↔ 后端接口端点（AI 识别）
@@ -186,9 +187,11 @@ AI 产出（结构化，必须带证据）：
 ### 7.1 输入
 
 1. **T0 确定性**：`git diff` 文件列表、commit、已有文件级锚点。
+   - P7（D49）增量批：`base` = 上一终态批 `head_commit`（无历史批用版本 `code_baseline_commit`），`head` = 建批时固定分支 HEAD；上一批 head 不是当前 head 的祖先（rebase/强推）时回退版本基线并标 `history_rewritten`。
+   - 影响分析 API 新增可选 `baseCommit`（40-hex，必须是当前 HEAD 祖先）；缺省仍为版本 `code_baseline_commit`，P4 行为不变；base 参与缓存键与唯一键。
 2. **T1 AI 理解**：变更文件的路由/接口/页面/组件/依赖事实 + 变更语义。
 3. **需求关系**：需求依赖/冲突/重叠/共享范围。
-4. **锚点**：Case/Requirement/Issue ↔ AppModel/CodeEntity。
+4. **锚点**：Case/Requirement/Issue ↔ AppModel/CodeEntity；P7 问题锚点由服务端校验后创建，读取失败降级为空列表。
 5. **历史**（可选）：近期失败/问题加权。
 
 ### 7.2 算法（语言无关）
@@ -232,6 +235,16 @@ AI 产出（结构化，必须带证据）：
 - AI 事实按 `(commit, file_hash, model, prompt_version)` 缓存；同一 commit 重跑复用，结果稳定。
 - AI 重分析/模型升级 → 新 fact 版本（不覆盖旧版本）；影响分析记录使用的 fact 版本。
 - 报告记录 commit、fact 版本、影响面；同 commit 可解释"当时为什么选这些用例"。
+- P7（D49）：影响分析缓存/唯一键包含 `baseCommit`；增量批 base 为上一终态批 head，head 为建批时固定 HEAD；base 非 head 祖先时回退版本基线并标 `history_rewritten`。该标记经批次 DTO `baseFallbackReason` 与增量计划 `warnings` 暴露；报告快照 `content.batch` 当前未包含该字段（D49 已知差异，报告侧补齐归 T23/P8）。显式 base 非法/非祖先 → 422 `invalid_base_commit`。
+
+### 7.5 P7 增量扩展（D49）
+
+P7 不改变 P4 影响分析算法，只增加下列增量能力：
+
+1. **可选 `baseCommit`**：`POST /api/versions/{versionId}/code/analyses` body 增可选 `baseCommit`（40-hex 小写）；显式 base 必须是当前仓库 HEAD 的祖先，否则 422 `invalid_base_commit`；缺省 = 版本 `code_baseline_commit`（P4 既有行为不变）。base 进入分析记录、缓存键与唯一键，`GET analyses` 返回 `baseCommit`。
+2. **问题锚点**：`code_anchor.subject_kind` 增 `issue`；`POST /api/versions/{versionId}/code/anchors` 与 `GET .../anchors?subjectKind=issue&subjectId=...` 复用 P4 `AnchorService`，服务端校验问题属于该版本、路径/行号合法；问题 DTO 的 `codeRefs` 读取失败降级为空数组，代码位置不阻断问题查询/报告生成。
+3. **增量 base 回退**：增量批 base 取上一终态批 `head_commit`；若上一批 head 不是当前 head 的祖先（rebase/强推），回退版本 `code_baseline_commit` 并在 `run_batch.base_fallback_reason='history_rewritten'`、批次 DTO `baseFallbackReason` 与增量计划 `warnings` 中记录；报告 `content.batch` 当前未暴露该标记（D49 已知实现差异，报告快照补齐归 T23/P8）。此时影响分析按版本基线重算，不静默使用失效 base。
+4. **确定性**：同一 `(version, base, head, model, prompt_version, fact 版本集)` 仍默认复用（`reused=true`）；`force` 或模型/提示词变化新建 analysis_version，不覆盖旧记录。P7 前端「代码与变更」与增量计划仅消费既有/新增只读接口。
 
 ---
 
@@ -436,7 +449,8 @@ CREATE TABLE IF NOT EXISTS code_fact_versions (
 7. **事件**：复用 `version:{id}` SSE 通道，只发 `code.changed`/`code.impact_computed`（id/计数/path 摘要，不含代码正文）；仓库级索引不广播，前端轮询索引状态。
 8. **降级**：LLM 未配置/不可用/超预算/解析全部失败 → `status=done`、`degraded=true`，仅 T0 候选 + unmapped，HTTP 2xx，不阻塞版本流程；Git/仓库/head 失败才 `failed`。
 9. **P4 明确不做**：parser/符号级/字段级分析；全仓 AI 分析、全文检索（D24）、全仓索引大屏；用例/问题实体与 `code_ref` 页面（P5/P6）、批次执行（P6）、monorepo 子项目配置（D20）、线上仓、多实例 worker；不新增 Agent profile，仅注册 `code_*` 只读工具薄壳（P3 `code.tree`/`code.read` 契约不变）。
+10. **P7 增量**（D49，详见 §7.5）：`POST /api/versions/{versionId}/code/analyses` 增可选 `baseCommit`（默认版本基线，参与缓存/唯一键）；`code_anchor.subject_kind` 增 `issue` 并校验问题归属；增量批 base 取上一终态批 head，base 非祖先时回退版本基线并标 `history_rewritten`（批次 DTO `baseFallbackReason`/增量计划 `warnings` 可见；报告 `content.batch` 未暴露，D49 已知差异归 T23/P8）。
 
 ---
 
-*文档版本：v0.4（2026-10-26）：**不设计 parser**；语言无关；T0 通用 Git 层 + T1 AI 代码理解；事实必须带证据并通过存在性校验；影响分析带置信度、可人工调整、可复现。*
+*文档版本：v0.5（2026-10-28，P7 增量同步 D49）：`baseCommit` 可选、issue 锚点、增量 base 回退 `history_rewritten`。**不设计 parser**；语言无关；T0 通用 Git 层 + T1 AI 代码理解；事实必须带证据并通过存在性校验；影响分析带置信度、可人工调整、可复现。*

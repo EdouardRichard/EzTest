@@ -1,4 +1,4 @@
-# EzTest 账号 / 会话 / 权限观测 设计（v0.1）
+# EzTest 账号 / 会话 / 权限观测 设计（v0.2）
 
 > **状态**：draft（待评审）
 > **决策记录**：账号模型采用「统一账号 + 按系统配置登录方式」；不建模角色/RBAC 切换（权限是各被测系统自己的事实）；启用**权限探测快照**（方案 B）。
@@ -367,6 +367,8 @@ CREATE INDEX IF NOT EXISTS idx_takeovers_status
 - `case_run` 必须落 `session_id`、`session_snapshot_id`（可空，未探测时）、`environment_fingerprint`。
 - 缺陷（finding）与回归复测引用 `case_run`，从而间接可回溯到 Session/快照；复测额外冻结一份快照（借鉴 ARTEX 的 `finding_retests.snapshot`）。
 
+> **P7 交付口径（报告/问题引用）**：P7 报告 `appendix` 只读记录 `environment/system/commit/generatedAt`（环境显示名与 commit，不含凭据），报告 `input_fingerprint` 只覆盖批次计数、用例最新 attempt 与问题状态；问题通过 `issue_ref(case_run/case_node/step_result/evidence)` 间接回溯执行时的环境/Session，详情/报告不内联 storageState、headers、Cookie、密码或 Session blob。P7 未把 `session_fingerprint` 直接写进 `IssueView`；需要 Session 指纹时从关联 `case_run.session_id/session_snapshot_id` 读取（P8 可补显式指纹字段）。
+
 ---
 
 ## 4. Session 生命周期
@@ -703,16 +705,20 @@ POST            /api/manual-takeovers/{id}/complete|cancel
 | 用例设计 | 用例声明 actor(account) + system/env + expected_capabilities | case.preconditions |
 | 执行前置 | acquire → validate → probe → 对照 expected | `case_run.session_id/snapshot_id`；失败→blocked |
 | 执行中 | HTTP/浏览器工具按 session 注入；401 归因 | activity 记录 session_id；失效→重取/blocked |
-| 缺陷/报告 | 缺陷带 Session 指纹与能力快照 | finding.session_fingerprint |
+| 缺陷/报告 | 缺陷带 Session 指纹与能力快照 | finding.session_fingerprint；P7 报告 appendix 记录 environment/system/commit，问题经 issue_ref 回溯 case_run/证据 |
 | 回归复测 | 冻结 session 快照（账号/系统/环境/能力/指纹） | retest.snapshot（借鉴 ARTEX） |
 | 覆盖统计 | 账号×系统维度：哪些组合被哪些用例覆盖 | coverage(account,system) |
 | 自动化 | Session 过期刷新、权限漂移检测、人工接管超时提醒 | 定时任务/通知 |
+
+> **P7 安全边界**：报告/问题只引用环境名、commit、case_run/证据 ID；任何响应、事件、审计、报告或 LLM prompt 都不出现凭据、storageState、Authorization/Cookie 原文。DB 目标密码（D48）同属不落 DTO/日志/事件的秘密；Session 相关字段读取仍需登录权限，管理面（DB 目标/资源写）仅 admin。
 
 ---
 
 ## 10. 安全、审计与合规
 
 > **P2 按 D28 裁剪**：P2 凭据/Session 明文存储，不做加密、脱敏、审计（不写 `audit_logs`）；本节为 P6/P8 目标形态。
+
+> **P7 交付注记**：问题/报告的环境与 Session 引用为**只读追溯**：报告 appendix 仅环境名/system/commit；问题通过 `issue_ref` 指向 `case_run/step_result/evidence`，前端只展示引用与证据入口，无 storageState/headers。DB 目标配置（D48）为 admin-only，密码明文存储但 API/DTO/事件/审计/日志/证据/报告/prompt 永不回显；`POST /db-target/test` 返回 `ok/latencyMs/serverVersion/currentUser/transactionReadOnly/warnings`，连接失败仍为 200 `ok=false` 并附分类 `error.reason/message`，失败原因分类不含 SQL 结果或凭据。全局问题/报告中心只读，不额外暴露 Session 信息。
 
 1. **加密**：secret 与 session blob 均 AES-256-GCM 加密，密钥不入库；支持 key_version 轮换。
 2. **最小暴露**：API 不回明文；agent 只拿 handle；日志/activity/提示词/报告脱敏（复用 ARTEX 的 mask/redaction 思路）。
@@ -795,4 +801,4 @@ POST            /api/manual-takeovers/{id}/complete|cancel
 
 ---
 
-*文档版本：v0.1（2026-10-26）；待评审。评审重点：§12 未决问题 + §7 工具契约 + §11 里程碑。*
+*文档版本：v0.2（2026-10-28，P7 同步）：报告/问题环境与 Session 引用为只读、不泄凭据。评审重点：§12 未决问题 + §7 工具契约 + §11 里程碑。*

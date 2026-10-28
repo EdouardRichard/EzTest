@@ -1,7 +1,7 @@
 # EzTest 实施 Phase 规划 v1.0（从基础层开始）
 
 > **性质**：实施节奏规划，不含接口/DDL/任务拆解（规格在各 Phase 启动时产出）。
-> **依据**：`system-blueprint.md` v2.2（设计冻结候选）。
+> **依据**：`system-blueprint.md` v2.3（P7 同步）。
 > **原则**：基础层先行 → Agent 运行时先行 → 领域/业务垂直切片 → 全自主闭环 → 体验与硬化。每个 Phase 都产出可演示、可验收的切片（含前端），不做"只后端"的阶段。
 > **编号约定**：`P0–P8` 仅指本文的实施阶段；其他详细设计的局部里程碑使用独立前缀（`CI-Mx`/`AS-Mx`），不得复用。前端交付归属见 §2.9。
 
@@ -250,18 +250,36 @@ P0–P7 ────────────────────────
 - **DB 断言（只读）**：目标库连接配置（只读凭据/白名单）、`db` 断言的执行与结果落库；P6 遗留的含 db 断言用例在 P7 可执行，P6 阶段遇 db 断言一律 `inconclusive(case, unsupported_assertion_kind)`。
 - **继续中（continuing 硬状态）**：完成后新增需求 → 增量澄清 → 增量设计/影响分析（P4）→ 增量批次 → 报告批次差异；暂停/恢复支持 continuing。
 - AI 补充用例自动并入并标记；报告区分基线/补充。
-- 前端：继续中状态徽章/横幅与新增需求入口、变更与批次、问题页、报告页（批次切换/差异）。
+- 前端：继续中状态徽章/横幅与新增需求入口、变更与批次、问题页、报告页（批次切换/差异）；问题/报告 Tab 与轻量全局只读中心（`/issues`、`/reports`，深链回版本 Tab）；admin-only 环境 DB 目标配置。
 
 **明确不做**：知识沉淀/评测（P8）、多用户协作、外部工单。
 
 **退出标准**
 - 执行中 AI 能发现覆盖缺口并补用例，回填脑图且不阻断执行。
 - 完成后新增需求触发 continuing → 增量批次 → 新报告版本；支持暂停/恢复。
-- 问题带步骤/证据/代码位置；报告分批次、evidence stale 标记。
+- 问题带步骤/证据/代码位置；报告分批次、报告 stale 标记（证据变更→报告 stale 联动归 P8）。
 - DB 断言（只读）可配置并执行；连接/权限失败 → `blocked(environment)` 或 `inconclusive(case)`，不误判应用缺陷；P6 遗留的 db 断言用例可重跑。
 - AI 补全/失败分析不可用时，降级为纯基线执行 + 人工查看（不崩）。
 
 **风险**：自主循环容易"自嗨扩用例" → 补全边界（需求/环境）与预算/终止条件必须在 P7 定义并验收。
+
+> **P7 已实现口径（D43–D52 摘要）**：P7 按 P7 设计规格交付，未改变 P0–P8 编号。
+> - **继续中（D43）**：`completed` 版本上成功创建需求 → 同事务 `continuing + continue_phase=clarifying + continued_at`（D31 唯一例外）；确认/重开不改状态；`batch_no` 只在建批时分配。`executing/continuing → completed` 由自主协调器在链收尾后 `TryFinalize`（取代 P6 无条件完成）。
+> - **受控补全（D44）**：基线/冻结节点仍只读；仅追加 `ai_supplement` 节点与 `supplemented→merged/rejected`、`reviewed→needs_revalidation`、`merged/needs_revalidation→executed` 状态迁移；冻结内容编辑仍 409 `baseline_frozen`。
+> - **链式批次（D45）**：`baseline/incremental/supplement` + `parent_batch_id`；单版本单活跃批；每批 1 个补全周期、每周期 ≤5 条新用例；补全批由 worker 自动创建。
+> - **问题/报告（D46/D47）**：`issue/issue_ref` 去重与确认/驳回 CAS；`report` 版本级 `(batch_id,revision)`、确定性 content/`input_fingerprint`、stale 检查、diff 与 Markdown 导出；`version_change` 不建表，`/changes` 读时派生，`code_changed` 留 P8。
+> - **DB 断言（D48）**：环境级 `db_target`（admin-only、PostgreSQL、只读事务/语句上限/脱敏），结果 `db_result` 证据；连接/权限失败 `blocked(environment)`，SQL/只读/截断错误 `inconclusive(case)`。
+> - **增量 base（D49）**：上一终态批 `head_commit` 起算，非祖先回退版本基线并标 `history_rewritten`；P4 分析请求 `baseCommit` 可选且进入缓存键。
+> - **交付面（D51/D52）**：3 个 P7 profile（supplement/failure/triage）+ 确定性报告；P7 API/事件/审计/权限按 D52；前端问题/报告/继续中/增量计划/DB 目标均已交付；全局中心页面与只读处理器已交付，跨版本查询适配由 T17b 接线后挂载。
+>
+> **退出标准状态（实现口径）**：
+> 1. 执行中补全回填脑图且不阻断执行 —— 已实现（受控写路径 + supplement 批 + `case.supplemented`）。
+> 2. 完成后新增需求 → continuing → 增量批次 → 新报告版本，支持暂停/恢复 —— 已实现（D43/D45/D49 + 批次 pause/resume）。
+> 3. 问题带步骤/证据/代码位置；报告分批次、报告 stale —— 已实现（issue_ref/code_anchor、report revision/stale）；证据变更→报告 stale 联动归 P8。
+> 4. DB 断言可配置执行且失败不误判应用缺陷；P6 遗留 db 断言用例可重跑 —— 已实现（D48 + `db_result` 证据 + `db_assert` 工具）。
+> 5. AI 不可用时降级为纯基线 + 人工查看且不崩 —— 已实现（degraded 分析/补全、deterministic 报告、前端降级态）。
+>
+> 真实 LLM/真实 DB/Playwright P7 验收由 P7 门禁脚本与 E2E 收口；未通过不得进入 P8。
 
 ---
 
@@ -311,8 +329,10 @@ P0–P7 ────────────────────────
 | 19 | 版本切换器、全局搜索、待办中心 | P8 | 全局导航可用 |
 | 20 | Agent 中心、设置完善、空/错/重连/可访问性 | P8 | 管理面完整 |
 | 21 | 报告/脑图导出（P5 已交付） | P5/P7 | Markdown/Mermaid 导出 |
-| 22 | 全局问题中心/报告中心（如需独立路由） | P7 | 列表可深链回版本 Tab |
+| 22 | 全局问题中心/报告中心（P7 已交付轻量版：`/issues`、`/reports` 只读列表 + 深链回版本 Tab） | P7 | 列表可深链回版本 Tab |
 | 23 | 登录配方配置（`auth_flow` 列表/新建/编辑/删除；账号-系统访问绑定 `login_flow_id`） | P6 | 管理员配置配方并绑定后，触发自动登录可得 valid Session（验收锚点同 spec §13.2） |
+
+> P7 交付归属不变：行 7（总览完善）、12（问题 Tab）、13（报告完整）、18（继续中）、21（Markdown/Mermaid 导出）与 22（轻量全局中心）均为 P7 已交付口径。全局中心为只读列表，不做批量确认/导出；其跨版本查询适配由 T17b 接线并在装配根挂载（未挂载时该组不注册）。
 
 ---
 
@@ -369,4 +389,4 @@ P0–P7 ────────────────────────
 
 ---
 
-*文档版本：v1.0（2026-10-26）；与 system-blueprint v2.2 配套。执行中如调整顺序，必须先更新本文与蓝图，并记录原因。*
+*文档版本：v1.0（2026-10-28）；与 system-blueprint v2.3 配套。执行中如调整顺序，必须先更新本文与蓝图，并记录原因。*

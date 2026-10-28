@@ -1,6 +1,6 @@
-# EzTest 前端设计 v0.2（ARTEX 级可观察/可干预/可回放）
+# EzTest 前端设计 v0.3（ARTEX 级可观察/可干预/可回放）
 
-> **状态**：v0.2（已确认：`continuing` 硬状态、允许立即暂停、本地 Git 代码仓为关键资产、首版 Tab 顺序 + 代码与变更）
+> **状态**：v0.3（P7 同步；已确认：`continuing` 硬状态、允许立即暂停、本地 Git 代码仓为关键资产、首版 Tab 顺序 + 代码与变更）
 > **目标**：让开发/测试**看得见 AI 怎么测的**（执行过程、探索链路、会话、证据、代码变更影响），并能**暂停/恢复、完成后新增需求继续**；不简化 UI，组件与交互参考 ARTEX 的成熟模式（不复制源码）。
 > **技术假设**：Next.js + React + Tailwind + 组件库（shadcn 风格）；SSE 实时流；图可视化 React Flow（DAG）。
 > **关联**：`system-overview.md`（架构/生命周期）、`code-intelligence.md`（本地 Git 代码仓/影响分析）、`auth-session-model.md`（账号/会话）。
@@ -70,7 +70,7 @@
 | PG3 | 版本详情 · 执行实时视图 | `/versions/{id}?tab=sessions` | 开发/测试 |
 | PG4 | 用例脑图（全屏编辑/评审；P5 已交付） | `/versions/{id}/mindmap` | 开发/测试 |
 | PG5 | 问题中心 | `/versions/{id}?tab=issues` / `/issues` | 开发/测试 |
-| PG6 | 报告中心 | `/versions/{id}?tab=report` | 开发/测试 |
+| PG6 | 报告中心 | `/versions/{id}?tab=report` / `/reports` | 开发/测试 |
 | PG7 | 本地代码仓（管理员） | `/code-repos` | 管理员 |
 | PG8 | 公共资源（管理员） | `/resources` | 管理员 |
 | PG9 | Agent 中心 | `/agents` | 管理员（普通用户只读） |
@@ -81,6 +81,8 @@
 版本详情是核心页：P3 默认进入「需求与澄清」工作台（`?tab=` 深链），关键过程在同一页多 Tab 内完成（ARTEX 任务详情模式）；其余 Tab 按实施阶段交付。
 
 > P5（D35）：PG4 全屏脑图已交付（`/versions/{id}/mindmap`），为独立路由（不计入版本详情 9 Tab）；入口为 `VersionHeader` 的「用例脑图」按钮与版本列表选择后进入。前端 feature 位于 `frontend/src/features/mindmap/`，核心组件 `MindmapCanvas`（手写 SVG 确定性 tidy-tree）、`CaseEditor`（节点属性 + 步骤/断言，revision OCC）、`ReviewPanel`（findings 处置、批准/驳回、blocker 确认）、`ExportMenu`（Markdown/Mermaid/OPML 下载 + PNG 光栅化）。
+
+> P7（D43–D52）：PG5/PG6 的版本内「问题」「报告」Tab 与全局只读中心 `/issues`、`/reports` 均已交付（`frontend/src/features/delivery/`）；全局列表行深链 `?tab=issues&issue=` / `?tab=report&report=`，只读、不做批量确认/导出。全局中心的生产 API 查询适配在装配根挂载后可用（未挂载时显示错误态）。
 
 ---
 
@@ -126,6 +128,8 @@
 - 批次时间线：Batch 1（commit）→ Batch 2（commit + 新增需求）…。
 - 待办入口：待评审脑图、待接管、待升级决策。
 
+> **P7 实施注记**：`OverviewTab` 补齐 4 张指标卡（需求覆盖/用例结果/问题/当前批次）、报告派生的需求×用例覆盖矩阵、批次时间线（`baseline/incremental/supplement` 徽章）、未关闭问题 Top 5 与代码变更摘要；每个区块有独立 loading/空态/错误/重连提示，不编造指标。数据来自 `useIssues`/`useReports`/批次列表，问题/报告入口跳到对应 Tab；报告缺失时显示引导而非假数据。
+
 #### 4.3.2 执行会话（AI 执行过程）
 - 左栏会话列表：按团队/Agent 分组（编排/澄清/设计/执行#1..N/补全/失败分析/报告），行内显示状态、当前用例、未读、脉冲。
 - 右栏 transcript：Agent 思考（折叠标"含推理"）、工具调用一行折叠（展开参数/结果/耗时/证据）、断言期望 vs 实际、证据内嵌、人工关卡卡。
@@ -143,6 +147,8 @@
 - 大图：按需求折叠、按需展开；后端增量推送。
 
 > **P6 实施注记**：`ExplorationTab` + `ChainGraph`（手写 SVG，`chain-layout.ts` 确定性布局）渲染「需求→用例→结果」三层；状态色 + 图标/文本双编码；需求/状态/仅异常筛选、节点抽屉（摘要/证据/深链）、节点过多时按需求折叠。P6 不抓取问题数据，问题节点显示 P7 空态（`chain-issue-placeholder`），不引入图库。
+
+> **P7 实施注记**：问题节点（红色菱形 + 严重级/状态文本，置信度在节点抽屉中展示）接入链路图，AI 补充节点用虚线 + “AI”角标，`needs_revalidation` 用琥珀描边/徽章；节点抽屉可打开问题详情并深链到「问题」Tab（`?tab=issues&issue=`）、证据查看器与代码位置。问题/补充数据来自 delivery 与 mindmap 受控接口，只读展示，不修改基线。
 
 #### 4.3.4 实时播报（Broadcast）
 - 全量事件倒序：时间、Agent、动作、摘要、链接；异常置顶。
@@ -165,6 +171,8 @@
 - 详情：复现步骤、期望/实际、证据、环境/Session 指纹、相关需求、**代码锚点**、建议。
 - 操作：确认/驳回（原因）、复制 Markdown/工单格式、跳转证据/用例/代码。
 
+> **P7 实施注记**：`IssuesTab` 由占位替换为真实列表 + 详情抽屉：状态/严重级/分类/批次筛选、标题搜索、游标分页；详情展示 AI/人工来源、`issue_ref`（用例/需求/证据/批次）、代码锚点、确认/驳回（revision CAS，驳回原因必填）与操作人/时间；支持 `?tab=issues&issue=<id>` 深链，版本页写回地址栏，刷新后仍打开同一问题。环境/Session 信息通过关联用例/证据只读回溯，不展示 storageState/headers/凭据。`IssuesTab` 单文件约 300 行（T18 评审记录 305 行，当前文件 300 行），拆分留待后续性能/可维护性优化，不影响功能。
+
 #### 4.3.7 报告
 - 批次报告：范围、执行摘要、需求覆盖矩阵、用例结果、问题列表、风险与结论、附录（环境/账号/Session/commit/时间）。
 - 批次切换 + 差异对比（新增问题/已修复/回归通过）。
@@ -172,6 +180,8 @@
 - 条目深链到证据/用例。
 
 > **P6 实施注记**：`ReportTab` + `ReportSummary` 落地 Batch 1 派生报告：批次切换、摘要卡（用例数/四态分布/分类/证据数/耗时）、用例明细、Markdown 导出（服务端流式 + `X-Content-SHA256`）；不含问题列表/批次差异/Report Revision（P7），导出中/失败有明确状态。
+
+> **P7 实施注记**：`ReportsTab` 替换 P6 Batch 1 视图：按批次（`baseline/incremental/supplement`）选择报告并展示该批最新 revision（`?report=<id>` 深链可定位指定 revision；当前无独立 revision 选择控件）、stale 横幅与“重新生成”（新 revision 201 / 已有更新 revision 200）、与上一版/指定 base 的差异（新增/修复/回归/恢复/变更用例与新问题）、问题与用例深链、Markdown 导出（含 Mermaid 覆盖图）；支持 `?tab=report&report=<id>` 深链，切换批次清空不匹配的 report 深链。报告内容为确定性快照，空/错/降级均有显式状态；P6 `GET /batches/{id}/report` 端点保留。
 
 #### 4.3.8 代码与变更（关键资产）
 ```text
@@ -197,7 +207,7 @@
 - **版本工作台（PG2）**：多需求列表 + 需求编辑器（draft 可编辑，clarified 只读 + 重开）+ 附件上传/下载/删除 + 需求关系图 + 澄清对话 + 问题清单 + 决策记录 + 新增需求（任何状态可用）；P3 经 `version:{id}` 通道 SSE 实时刷新，刷新/重连先 REST 快照恢复。
 - **用例脑图全屏（PG4，P5 已交付）**：树/图视图、评审、AI 补充区、受影响标记、导出；独立路由 `/versions/{id}/mindmap`（不计入 9 Tab），入口来自 `VersionHeader` 与版本列表；组件 `MindmapCanvas`/`CaseEditor`/`ReviewPanel`/`ExportMenu`。
 - **本地代码仓（PG7，管理员）**：`/code-repos`；仓库列表与创建/编辑（本地路径、固定分支、include/exclude）、保存时只读 git 校验（失败显示 422 reason）、当前 commit、「未索引（P4）」索引占位。
-- **公共资源（PG8）**：`/resources` 四 Tab——系统与环境 / 应用模型 / 账号与访问 / 会话；管理员可写，普通用户只读（Session 支持导入、校验、人工确认、失效/撤销、接管）。
+- **公共资源（PG8）**：`/resources` 四 Tab——系统与环境 / 应用模型 / 账号与访问 / 会话；管理员可写，普通用户只读（Session 支持导入、校验、人工确认、失效/撤销、接管）。P7 在环境详情新增「目标数据库」区块（admin-only）：`db_target` 表单（host/port/database/username/password/sslmode/超时/行数）、测试连接（只读事务与角色告警）、删除；密码只写不回显，仅显示是否已设置。
 - **Agent 中心（PG9）**：13 角色、提示词/工具/模型/技能配置、运行观察、质量指标（实施 P8）。
 - **设置（PG10）**：用户、LLM（多模态/重试/头）、基础配置（实施 P0 起提供最小版）。
 
@@ -219,11 +229,14 @@
 
 > **P6 实施注记**：`PauseDialog` 默认优雅；选「立即暂停」后原地展示中断警告（同一「确认立即暂停」按钮即二次确认），不另开弹窗；请求 in-flight/错误状态由 header 持有，提交后通过事件/轮询确认。`PausedBanner` 显示模式、已完成步骤数与恢复入口。优雅暂停把运行用例回 `pending`（不产生 `interrupted`），立即暂停置 `interrupted` 并记 `interrupted_step_seq`；暂停期间仍可浏览其余 Tab。
 
+> **P7 实施注记**：暂停/恢复对 `continuing` 下的增量批同样生效；`ContinuingBanner` 与 `PausedBanner` 可同时显示“继续中（第 N 批）· 已暂停”。Header 在继续中显示当前活跃增量批/阶段，暂停期间仍可新增需求、查看增量计划与报告；恢复后自主链从存储状态继续，不重复建批。
+
 ### 5.2 完成后新增需求 → 继续中（硬状态）
 
 ```text
 completed 版本 → 点[新增需求] → 录入（文本/文档/截图，可多条）
-→ status = continuing（硬状态）；continue_phase=clarifying；batch_no+1；记录 base/head commit
+→ 提交成功即 status = continuing（硬状态，同事务）；continue_phase=clarifying
+→ batch_no 不变（只在建批时分配）；新批次记录 base/head commit
 → 自动进入"需求与澄清"：AI 增量澄清（新增需求 + 与既有需求关系）→ 人确认
 → continue_phase=designing：增量脑图 + 影响分析（代码 diff + 需求关系 + 锚点）
    → 默认自动进入执行（可选"执行前查看增量脑图"）
@@ -234,6 +247,8 @@ UI 要点：
 - 已完成页常驻"新增需求"入口；状态徽章立即变为"继续中（第 N 批）"。
 - "代码与变更"自动展示本批 commit diff 与影响用例；用户可调整受影响用例。
 - 暂停期间新增需求：澄清完成后提示"将恢复执行增量批次"。
+
+> **P7 实施注记**：创建需求成功后前端以响应/事件刷新版本（`status=continuing`、`continuePhase=clarifying`、`continuedAt`），徽章与 `ContinuingBanner` 立即更新；`batchNo` 取自版本 `batch_no`/活跃批，不在进入继续中时自增。`designing` 阶段展示 `IncrementalPlanPanel`（数据源 `GET /api/versions/{id}/mindmap/incremental-plan`）：新用例、受影响用例（置信度/原因）、`unmappedChanges`、`warnings`（如 `history_rewritten`/`impact_unavailable`）与 `degraded`；默认勾选 `defaultCaseIds`（高/中置信），用户可改选并创建增量批（`parentBatchId`=上一终态批）。执行阶段展示增量批进度/暂停与批次差异入口；自主链收尾后版本回到 completed，报告出现新 revision。API 的版本 DTO 沿用 P6 `batch_no`/`pause_mode` snake_case 字段，前端类型层做映射。
 
 ### 5.3 脑图评审
 
@@ -324,4 +339,4 @@ reviewing → 横幅"待评审" → 全屏脑图 → 编辑/评论 → [通过�
 
 ---
 
-*文档版本：v0.2（2026-10-26）；与 system-overview v1.1、code-intelligence.md 配套。评审重点：代码与变更 Tab 的信息密度、立即暂停的二次确认、继续中状态一致性、探索链路图语义。*
+*文档版本：v0.3（2026-10-28，P7 同步）；与 system-overview、code-intelligence.md 配套。评审重点：代码与变更 Tab 的信息密度、立即暂停的二次确认、继续中状态一致性、探索链路图语义。*

@@ -1,4 +1,4 @@
-# EzTest 系统整体设计蓝图（v2.2 · 设计冻结候选）
+# EzTest 系统整体设计蓝图（v2.3 · P7 同步）
 
 > **文档性质**：本轮设计会话的**主交付物**。用于多阶段迭代开发的唯一"总设计稿"；详细实现规格按阶段拆出，但本蓝图定义系统边界、架构、领域模型、Agent 体系、生命周期、数据/API 轮廓、前端形态、非功能要求与迭代路线。
 > **配套详细设计**：`frontend-design.md`（前端细节）、`code-intelligence.md`（本地 Git 代码仓/影响分析）、`auth-session-model.md`（账号/会话/权限观测）；`system-overview.md` v1.1 为早期版本，内容已并入本文。
@@ -164,6 +164,21 @@
 | D41 | **D41（Session 补齐）**：P6 新增 `auth_flow`（kind=form，最小配方：登录 URL/账号密码提交选择器/成功与失败判定）与 `account_system_access.login_flow_id`；自动登录仅 password，单飞、成功后写 storageState（含 sessionStorage）并 login_check；失效同用例重取一次；MFA/验证码/审批转人工接管（表单 A：导入 storageState，复用 P2 接口，完成后自动继续）；凭据/存储态仍明文（D28），但事件/日志/证据/前端不展示。 |
 | D42 | **D42（事件与表复用）**：`RunEvent` 复用 P0 `event` 表（已含 batch_id/case_id/step_id/refs.evidence），不新增 `run_event`；`StepRun` 折叠为 `step_result`（pending/running/passed/failed/interrupted）；Batch 1 报告由批次/用例/证据派生并流式导出，`report/report_ref/revision/stale` 归 P7；前端新增「登录配方配置」并登记到 `implementation-phases` §2.9 P6 行。 |
 
+> **P7 决策记录（D43–D52，原文照抄 P7 设计规格 §2）**
+
+| D# | 决策 | 理由 | 代价/约束 |
+|---|---|---|---|
+| **D43** | `completed` 版本上 **创建需求成功即自动进入 `continuing`**：同事务置 `status=continuing`、`continue_phase=clarifying`、`continued_at=now()`，发布 `version.status_changed`。这是 D31"需求操作不改 Version.status"的**唯一例外**；确认/重开需求仍不改状态。`batch_no` 只在建批时分配，不在进入继续中时自增。`continuing→completed` 由自主协调器在增量批次链结束后触发。 | 同时满足前端旅程 C 与 D31 的主语义；状态变更可追溯、可幂等。 | D31 需新增例外说明；需求创建路径必须与版本状态同事务；并发创建需求只允许一次状态迁移。 |
+| **D44** | **基线永久只读 + 受控叠加层**：`case_baseline` 行、`graph_hash`、冻结节点内容不可改；P7 只开两条写路径：① 追加 `source=ai_supplement` 的新节点（含步骤/断言/来源）；② 仅状态迁移 `supplemented→merged/rejected`、`reviewed→needs_revalidation`、`merged/needs_revalidation→executed`。冻结节点的内容编辑仍 409 `baseline_frozen`。`case_run.source`、快照 `origin`、`run_batch.graph_hash` 记录来源与当前工作图哈希。 | 保留 P5 冻结语义与基线可审计；补全可回填且不破坏历史。 | 需要新的受控 GraphService 方法；所有旧测试中"冻结即全部 409"的断言需按两条例外更新。 |
+| **D45** | **链式批次**：`run_batch.kind ∈ {baseline, incremental, supplement}`，`parent_batch_id`；不修改在飞批次；基线批终态后自动跑补全分析，产出新用例后自动创建紧随的 supplement 批；`continuing` 下的批为 incremental。单版本单活跃批次不变；版本完成由自主协调器在"分析→问题→报告→补全→补充批"链结束后判定，取代 P6 的无条件 `CompleteExecution`。每批最多 1 个补全周期、每周期最多 5 条新用例。 | 避免在飞批次追加导致的计数/快照/报告不变量破坏；"继续执行"用紧随批次实现，基线执行不被阻塞。 | P6 scheduler 完成路径、批次门禁、Version 完成时机均需改造；P6 的"批次完成即版本完成"测试需更新。 |
+| **D46** | **每批一报告 + Revision**：`report` 按 `(batch_id, revision)` 唯一；分析终态后自动生成并发布 revision 1；读取时用 `input_fingerprint` 判断 stale；重新生成 → revision+1；支持批次差异与 Markdown 导出。P6 的 `GET /batches/{id}/report` 派生端点保持原样，P7 新增版本级报告 API。`version_change` 不建表，`/changes` 由需求/批次/报告/问题读时派生（P8 再建表）。 | 报告可复现、可追溯、不破坏 P6 契约；差异按报告快照计算。 | 需新增报告文件存储根与 stale 计算；P6 报告与 P7 报告并存，前端 P7 使用新端点。 |
+| **D47** | **Issue 模型**：`issue` + `issue_ref`；状态 `open→confirmed/dismissed`（终态，不重开）；AI 只为 `failed(application)` 与需求缺口建单，环境/会话/模型/用例失败不生成缺陷；AI 单按 `sha256(version\|caseNode\|failureClass\|normalizedReason)` 去重；任意登录用户可确认/驳回，驳回必填原因；`code_anchor(subject_kind='issue')` 由服务端验证 `file:line` 后创建。 | 问题必须可追溯、可去重、不误报环境问题；权限与 P3 版本域一致。 | 重复失败只追加引用/复发计数，不重开已驳回单；跨批次语义合并依赖问题整理 Agent，服务端仍做硬去重。 |
+| **D48** | **DB 断言目标库**：环境级 `db_target`（一环境一目标），admin-only；**密码明文存储**（D28 同类例外，admin-only、API 永不回显、不进入 prompt/事件/日志/证据）；仅 PostgreSQL；Go API 侧执行，只读事务 + 仅 SELECT/WITH/SHOW/EXPLAIN + 单语句 + 超时/行数/字节上限；结果落 `db_result` 证据；连接/权限失败 → `blocked(environment)`，SQL/只读/截断错误 → `inconclusive(case)`，绝不判应用缺陷。 | 复用本机 PG 与 D28 的明文存储惯例；只读由事务+角色+语句三层强制；执行器不接触业务 DB（D40）。 | 明文凭据是安全风险点，必须在 admin 权限、日志/事件/证据脱敏、UI 不回显上严格约束；只支持 PostgreSQL。 |
+| **D49** | **增量影响 base**：增量批 base = 上一终态批的 `head_commit`（无历史批用版本 `code_baseline_commit`）；head = 建批时固定分支 HEAD；若上一批 head 不是当前 head 的祖先（rebase/强推），回退版本基线并在批次/报告标 `history_rewritten`。P4 影响分析请求新增可选 `baseCommit`（默认版本基线），缓存/唯一键包含 base。 | 只分析上次已测以来的新变更，避免增量批越跑越宽；非祖先时安全回退。 | 需改 P4 分析服务/HTTP 请求；批次需记录 `base/head` 与回退标记。 |
+| **D50** | `version_change` 表 P7 不建；`GET /api/versions/{id}/changes` 由需求创建时间、批次、报告、问题读时派生；建表与事件回放留 P8。 | 避免无明确字段的表；P7 前端只需要变更列表/时间线。 | `/changes` 无持久快照，历史时点不可复现（P8 补）。 |
+| **D51** | **3 个 LLM Profile + 确定性交付**：`supplement-agent`（覆盖缺口 + 增量设计/AI 受影响用例）、`failure-analysis-agent`、`issue-triage-agent`；报告由确定性服务生成。AI 不可用时：分析/补全 marked degraded，受影响用例降级为 `case_source` 确定性映射，批次仍按基线执行。所有 Agent run 预算 MaxTurns 20 / 600s；每批最多 3 个分析类 run。 | 用户确认 3 Agent 方案；报告可复现；AI 失败不拖垮主流程。 | 新增 3 个 profile/工具/run 表；issue 文本来自 LLM，落库/去重/锚点仍服务端校验。 |
+| **D52** | **权限/审计/事件**：版本域写操作（问题确认/驳回、报告生成/导出、增量设计触发、补全批）任意登录用户；DB 目标配置 admin；审计动作 `delivery.issue.created/confirmed/dismissed`、`delivery.report.published/exported`、`delivery.analysis.started/finished`、`resource.db_target.upserted/tested`、`version.continued/completed`；新增事件 ID 一律十进制字符串；新增原因码以 §7.11 为准。 | 与 P3/P5/P6 的版本域权限一致；审计可追溯；避免 JS 精度问题。 | 不审计凭据/SQL 结果/证据正文/prompt；全局问题/报告中心只读。 |
+
 ---
 
 ## 4. 总体架构
@@ -260,38 +275,45 @@ Version（status/paused/batch_no/continue_phase）
 ### 5.3 执行与交付域
 
 ```text
-RunBatch（batch_no, base_commit, head_commit）─< CaseRun ─< StepResult ─< Evidence
-                                                    └─< Issue（含 code_refs）
-Version ─< Report（按批次 Revision，可 stale）
-Version ─< VersionChange（新增需求/影响面/批次差异）
+RunBatch（batch_no, kind, parent_batch_id, base_commit, head_commit）─< CaseRun ─< StepResult ─< Evidence
+                                                    └─< Issue ─< IssueRef
+Version ─< Report（按批次 Revision，可 stale）─< ReportRef
+Version ─< AnalysisRun（failure / issue_triage）
+Version ─< VersionChange（读时派生；P7 不建表，D50）
 ```
 
 > P6（D39/D42）细化：执行与交付域已落地 `execution` 上下文 6 表 `run_batch / case_run / step_result / assertion_result / evidence / evidence_ref`；`RunBatch.status ∈ {planned,running,done,failed,cancelled}` 且 `paused/pause_mode` 独立于 status；`CaseRun.status` 8 值（四态 passed/failed/blocked/inconclusive + pending/running/skipped/interrupted），`failure_class ∈ {application,environment,session,model,case}`（flaky 为派生展示，不落库）；`step_result.status` 5 值（pending/running/passed/failed/interrupted）；`case_snapshot` 建批后不可变。`RunEvent` 复用 P0 `event` 表（`batch_id/case_id/step_id/refs.evidence`），不新增 `run_event`；`StepRun` 折叠为 `step_result`。`Issue`/`Report` 实体与表不在 P6 落地，Batch 1 报告由批次/用例/证据派生并流式导出。
+
+> P7（D43–D52）实现注记：新增 `delivery` 上下文 5 表 `issue / issue_ref / report / report_ref / analysis_run`；`resource` 追加 `db_target`；`version` 追加 `continue_phase / continued_at`；`execution.run_batch` 追加 `kind / parent_batch_id / base_fallback_reason / graph_hash / supplement_attempted / autonomy_done`，`case_run` 追加 `source`，`evidence.kind` 追加 `db_result`；`mindmap.case_design_run` 追加 `supplement / incremental_design` 两类 kind 与 `batch_id`；`codeintel.code_anchor.subject_kind` 放开 `issue`。`Issue.status ∈ {open,confirmed,dismissed}`（终态，不重开），`source ∈ {ai,human}`，`category ∈ {defect,requirement_gap,other}`，`severity ∈ {blocker,major,minor,info}`，`confidence ∈ {high,medium,low}`；AI 只为 `failed(application)` 与需求缺口建单。`Report.status ∈ {draft,published,stale}`，`(batch_id,revision)` 唯一，旧 revision 保留；`Report.content` 为确定性快照，`input_fingerprint` 覆盖批次终态计数、每用例最新 attempt 与关联/开放问题；报告 Markdown 落 `EZTEST_REPORT_DIR`（默认 `.data/reports`），DB 只存相对路径 + sha256 + size。`AnalysisRun.kind ∈ {failure,issue_triage}`、`status ∈ {queued,running,done,failed,degraded}`，同批同 kind 单活跃 run。`VersionChange` 仍不建表（D50），`/changes` 由需求/批次/报告/问题读时派生；`code_changed` 留 P8。
 
 ### 5.4 锚点（可追溯的最小关系）
 
 - `需求/用例/问题 ↔ 应用模型（页面/路由/接口/组件）`
 - `用例/问题 ↔ 代码实体（file:line / symbol / route / api）`
 - `用例 ↔ 需求 / 代码 / 应用模型（P5/D37）`：用例经 `case_source` 关联已确认需求与应用模型节点，经 codeintel `code_anchor(subject_kind='case')` 关联 `file:line` / route / api；删除用例时同步清理其锚点。
+- `问题 ↔ 用例 / 证据 / 代码（P7/D47）`：`issue_ref` 指向 `case_run / case_node / step_result / evidence / requirement / batch / commit`；`code_anchor(subject_kind='issue')` 由服务端校验 `file:line` 与问题归属后创建，列表失败降级为空数组，不阻断问题查询。
 - `API 契约：前端调用点 ↔ 后端接口端点（method + 归一化 path）`
 - `证据 ↔ 用例步骤/问题/代码位置`
-- `报告 ↔ 批次/用例/问题/证据/commit`
+- `报告 ↔ 批次/用例/问题/证据/commit + report_ref（P7/D46）`
 
 ### 5.5 核心状态机
 
 | 对象 | 状态 |
 |---|---|
 | Version.status | draft / clarifying / designing / reviewing / executing / **continuing** / completed / archived |
-| Version 标志 | `paused`（bool）、`pause_mode`（graceful/immediate）、`batch_no`、`continue_phase`、`code_baseline_commit` |
+| Version 标志 | `paused`（bool）、`pause_mode`（graceful/immediate）、`batch_no`、`continue_phase`、`continued_at`、`code_baseline_commit` |
 | Requirement | draft（候选）→ clarified（已确认）→ designed → verified / obsolete |
-| CaseNode | draft → reviewed（基线）→ executed；AI 补充：supplemented → merged/rejected；受影响：needs_revalidation。P5（D35）只实现 `draft→reviewed`（批准冻结）；`executed`/`supplemented`/`merged`/`rejected`/`needs_revalidation` 为 P6/P7 预留 |
-| RunBatch | planned → running → paused(标记) → done / failed / cancelled |
-| CaseRun | pending → running → passed / failed / blocked / inconclusive / skipped / interrupted |
+| CaseNode | draft → reviewed（基线）→ executed；AI 补充：supplemented → merged/rejected；受影响：needs_revalidation。P5 只实现 `draft→reviewed`（批准冻结）；P7 落地受控写路径 `supplemented→merged/rejected`、`reviewed→needs_revalidation`、`merged/needs_revalidation→executed`，冻结节点内容仍不可改 |
+| RunBatch | planned → running → paused(标记) → done / failed / cancelled；`kind ∈ {baseline,incremental,supplement}`，supplement 必须有 parent |
+| CaseRun | pending → running → passed / failed / blocked / inconclusive / skipped / interrupted；`source ∈ {baseline,ai_supplement}` |
+| AnalysisRun | queued → running → done / failed / degraded（kind=failure / issue_triage，同批同 kind 单活跃） |
 | Session | pending / acquiring / needs_manual / valid / refreshing / expired / invalid / revoked / failed；`expiring` 为派生值，不落库（详见 auth-session-model） |
-| Issue | open → confirmed / dismissed |
+| Issue | open → confirmed / dismissed（终态，不重开） |
 | Report | draft → published → stale（证据/结论变更） |
 
 > P6（D39）实现注记：`run_batch` 增加 `paused/pause_mode/pause_reason/baseline_hash/code_baseline_commit/head_commit` 与 `case_count/passed_count/failed_count/blocked_count/inconclusive_count/skipped_count/interrupted_count`；`case_run` 增加 `attempt/case_revision/case_hash/case_snapshot/session_id/session_snapshot_id/agent_session_id/agent_run_id/retry_of_case_run_id/cleanup_required/interrupted_step_seq`；`assertion_result.verdict ∈ {passed,failed,not_run}`；`evidence.kind ∈ {screenshot,http_exchange,console_log,network_log,download}`，`evidence_ref.ref_kind ∈ {step_result,assertion_result,case_run,batch,report,issue}`。版本侧只增 `paused/pause_mode/batch_no`（活跃批次不并入 Version DTO，由前端从批次列表合并）。
+
+> P7（D43–D52）实现注记：`version` 追加 `continue_phase`（仅 `continuing` 时有值）与 `continued_at`；`run_batch` 追加 `kind/parent_batch_id/base_fallback_reason/graph_hash/supplement_attempted/autonomy_done`，`case_run` 追加 `source`，`evidence.kind` 追加 `db_result`，`case_node` 的 P7 状态迁移仅经受控 GraphService；`issue` 的状态/去重/引用与 `report` 的 revision/stale 见 §5.3。版本 DTO 兼容 P6 的 snake_case 字段 `paused/pause_mode/batch_no`，P7 新增 `continuePhase/continuedAt` 为 camelCase（前端统一经类型转换使用）。
 
 ### 5.6 版本生命周期（含暂停与继续中）
 
@@ -303,9 +325,9 @@ stateDiagram-v2
     designing --> reviewing: 脑图生成
     reviewing --> designing: 驳回修改
     reviewing --> executing: 人工批准基线
-    executing --> completed: 批次执行完成
-    completed --> continuing: 新增需求（硬状态）
-    continuing --> completed: 增量批次完成
+    executing --> completed: 自主链收尾（finalize）
+    completed --> continuing: 创建需求成功（D43）
+    continuing --> completed: 增量批次链收尾（自主协调器）
     completed --> archived: 归档
     note right of continuing
         增量澄清 → 增量设计/影响分析 → 增量执行
@@ -318,6 +340,8 @@ stateDiagram-v2
 > **P6 状态流注记**：`executing → completed` 只由批次完成触发，不由人工按钮驱动——批次内全部 `case_run` 进入终态、无等待中的人工接管、且批次未暂停时，调度器刷新计数并把 `run_batch` 置 `done`，随后经 `VersionPort.CompleteExecution` 将版本从 `executing` 置 `completed`；若版本已因并发操作离开 `executing`，批次仍完成但不强改版本状态。`paused` 是独立布尔标记，暂停不改变 `Version.status`。
 
 > **D31 备注（P3 起）**：Version 状态是**粗粒度容器**，与需求流水线解耦——新增/确认/重开需求**永不**改变或回退 `Version.status`；`designing` 下仍可独立澄清/确认需求；新增需求不中断执行中的批次，受影响用例由 P7 的 AI 补全/修改（D3/D17）。P3 只实现 `draft→clarifying→designing` 与 `Requirement draft→clarified`。
+
+> **P7 状态流注记（D43/D45/D49）**：`executing → completed` 不再由单批完成直接触发——批次终态后由自主协调器依次推进失败分析、问题整理、报告、补全/补充批，增量批次链收尾后经 `TryFinalize` 将 `executing/continuing` 置 `completed`；P6 的无条件 `CompleteExecution` 由该 finalize 取代。`completed → continuing` 是 **D31 的唯一例外**：仅在 `completed` 版本上“成功创建需求”时于同事务置 `continuing + continue_phase=clarifying + continued_at`，确认/重开需求仍不改状态；`batch_no` 只在建批时分配，进入继续中不自增。并发创建需求只允许一次状态迁移（幂等）。
 
 ---
 
@@ -476,6 +500,14 @@ Playwright 浏览器（导航、DOM/A11y、点击输入、快照、截图、stor
 > - **暂停/恢复**：`paused` 独立标记；优雅暂停把运行用例回 `pending`（保留已完成步骤），立即暂停置 `interrupted(cleanup_required=true, interrupted_step_seq)`；恢复时 interrupted 同 attempt 续跑并先 cleanup/seed。启动恢复：running→interrupted(restart)、批次 `paused(immediate,restart)`、版本镜像同步、释放残留租约，不自动拉起浏览器；周期 `Sweep` 只回收残留租约。
 > - **证据**：文件系统根 `EZTEST_EVIDENCE_DIR`（默认 `.data/evidence`），路径 `{batch_id}/{case_run_id}/{evidence_id}.{ext}`；`evidence` 只存相对路径 + sha256 + 大小 + MIME，字节不入库；单证据默认 ≤10MB、单用例默认 ≤100 条；读取校验 sha256 与版本归属，不暴露路径。
 
+> **P7（D43–D52）实现注记**
+> - **批次链**：`run_batch.kind ∈ {baseline,incremental,supplement}`，`parent_batch_id` 仅 supplement 必填；incremental 的 base=上一终态批 `head_commit`（无历史批用版本 `code_baseline_commit`），head=建批时固定分支 HEAD；上一批 head 非当前 head 祖先（rebase/强推）时回退版本基线并标 `base_fallback_reason=history_rewritten`。不修改在飞批次；单版本单活跃批次；每批最多 1 个补全周期、每周期最多 5 条新用例。
+> - **自主协调器**：单进程 worker 每 2s tick，单 tick 最多处理 `EZTEST_AUTONOMY_BATCHES_PER_TICK`（默认 4）个终态批与继续中版本；顺序为失败分析（仅 `failed(application)`）→ 问题整理 → 报告 ensure/发布与 stale 重生成 → 基线批补全分析 → 创建 supplement 批并 merge 节点 → `TryFinalize`。`autonomy_done` / `supplement_attempted` CAS 保证幂等，重试不重复建批；补全/分析失败标记 degraded，不回滚已完成的基线批次。
+> - **失败分析/问题整理**：三个 profile `supplement-agent`、`failure-analysis-agent`、`issue-triage-agent`，MaxTurns 20 / RunSeconds 600；只提交结构化候选/草稿，服务端校验证据、引用、去重与代码锚点后落库；`failed(environment/session/model/case)` 永不生成缺陷单。
+> - **DB 断言边界（D48）**：环境级 `db_target` 仅 admin 配置，仅 PostgreSQL；Go API 侧在只读事务中执行单条 `SELECT/WITH/SHOW/EXPLAIN`，受超时、行数、SQL 字节与结果字节上限约束；密码明文存储是 D28 同类例外，但 API/DTO/事件/审计/日志/证据/报告/LLM prompt 永不出现。连接、认证、DNS、权限失败 → `blocked(environment)`；SQL 语法、只读、截断等错误 → `inconclusive(case)`，绝不判应用缺陷。`db_result` 作为证据落文件系统。
+> - **报告**：分析终态后自动 ensure + publish revision 1；读取时按 `input_fingerprint` 判 stale 并只发一次 `report.stale`；重新生成 revision+1，旧 revision 保留（有新 revision 时返回最新 200，否则新建 201）；支持批次差异与 Markdown 导出。P6 `GET /batches/{id}/report` 派生端点保持原样。
+> - **D49 已知差异（T23/P8）**：增量回退标记当前仅在批次 DTO `baseFallbackReason` 与增量计划 `warnings` 可见；报告快照 `content.batch` 不包含 `base_fallback_reason`/`history_rewritten`。D49“报告标该标记”的规格尚未实现，记录为 T23 复核 OpenAPI/规格一致性、P8 补齐报告快照的待办，不影响 P7 批次/报告生成与 stale。
+
 ---
 
 ## 9. 账号与会话（摘要）
@@ -501,11 +533,11 @@ Playwright 浏览器（导航、DOM/A11y、点击输入、快照、截图、stor
 
 | 组 | 表（示例） |
 |---|---|
-| 资源 | company / system / environment / app_model_node / account / account_system_access / session / session_snapshot / session_lease / manual_takeover / code_repository（P2 共 11 表；P6 追加 `auth_flow` 与 `account_system_access.login_flow_id`；`secrets` / `session_blobs` / `session_events` / `probe_recipes` 等需要时再追加） |
-| 版本需求 | version / requirement / requirement_relation / requirement_attachment / clarification_session / clarification_question / decision / version_change（P3 交付 `version` 上下文 7 表；主键按 D29，附件文件按 D30，`version_change` 等后续阶段） |
-| 用例脑图 | case_node / case_step / case_assertion / case_source / case_review / case_review_finding / case_baseline / case_design_run / case_export（P5 交付 `mindmap` 上下文 9 表；雪花主键 D29，审计列 `created_at/updated_at` 按 D34 例外；批准后写 `case_baseline` 并全图只读） |
-| 执行 | run_batch / case_run / step_result / assertion_result / evidence / evidence_ref（P6 交付 `execution` 上下文 6 表；`RunEvent` 复用 `event` 表、不建 `run_event`；`StepRun` 折叠为 `step_result`；Batch 1 报告派生不建 report 表） |
-| 问题报告 | issue / issue_ref / report / report_ref |
+| 资源 | company / system / environment / app_model_node / account / account_system_access / session / session_snapshot / session_lease / manual_takeover / code_repository（P2 共 11 表；P6 追加 `auth_flow` 与 `account_system_access.login_flow_id`；P7 追加环境级 `db_target`，密码明文仅 admin 可读、API 永不回显；`secrets` / `session_blobs` / `session_events` / `probe_recipes` 等需要时再追加） |
+| 版本需求 | version / requirement / requirement_relation / requirement_attachment / clarification_session / clarification_question / decision（P3 交付 `version` 上下文 7 表；P7 追加 `version.continue_phase/continued_at`；`version_change` **P7 不建**，`/changes` 读时派生，D50） |
+| 用例脑图 | case_node / case_step / case_assertion / case_source / case_review / case_review_finding / case_baseline / case_design_run / case_export（P5 交付 `mindmap` 上下文 9 表；P7 扩展 `case_design_run` 的 `supplement/incremental_design` kind 与 `batch_id`；雪花主键 D29，审计列 `created_at/updated_at` 按 D34 例外） |
+| 执行 | run_batch / case_run / step_result / assertion_result / evidence / evidence_ref（P6 交付 `execution` 上下文 6 表；P7 追加 `run_batch.kind/parent_batch_id/base_fallback_reason/graph_hash/supplement_attempted/autonomy_done`、`case_run.source`、`evidence.kind=db_result`；`RunEvent` 复用 `event` 表、不建 `run_event`；`StepRun` 折叠为 `step_result`） |
+| 问题报告 | issue / issue_ref / report / report_ref / analysis_run（P7 交付 `delivery` 上下文 5 表；报告 Markdown 走 `EZTEST_REPORT_DIR`，DB 只存相对路径 + sha256 + size；`db_result` 是 `evidence.kind`，不新增表） |
 | 代码 | code_repository / code_index_run / code_entity / code_edge / code_change_set / code_anchor |
 | 平台 | user_account / admin_config / llm_config / agent_profile / audit_log |
 
@@ -514,8 +546,9 @@ Playwright 浏览器（导航、DOM/A11y、点击输入、快照、截图、stor
 ### 10.3 版本与报告一致性
 
 - 报告记录引用的用例结果/问题/证据/commit 版本；证据或结果变更 → 报告 stale。
-- 批次 Revision：Batch 1..N；报告可切换批次看差异。
-- 删除/归档：版本归档保留只读；证据按保留期 GC（引用中的证据不可删）。
+- 批次 Revision：Batch 1..N；报告可切换批次看差异。P7 `report` 以 `(batch_id,revision)` 唯一，自动发布 revision 1，重生成 revision+1；`input_fingerprint` 判 stale，stale 只提示不删除。
+- P7 问题与报告均为版本域读模型：`issue_ref`/`report_ref` 只存逻辑引用（跨上下文不建 FK），`/changes` 由需求/批次/报告/问题读时派生（D50）。
+- 删除/归档：版本归档保留只读；证据按保留期 GC（引用中的证据不可删）。P7 不做证据 GC，留 P8。
 
 ### 10.4 迁移与备份
 
@@ -537,7 +570,10 @@ Playwright 浏览器（导航、DOM/A11y、点击输入、快照、截图、stor
 /api/versions/{id}/requirements/{rid}/attachments
 /api/versions/{versionId}/mindmap/{nodes,steps,assertions,sources,anchors,order,runs,submit-review,review,reviews,findings,exports}
 /api/versions/{id}/batches / runs / case-runs / step-results
+/api/versions/{id}/batches/{batchId}/analysis
 /api/versions/{id}/issues / reports / changes
+/api/issues / reports                  ← 全局只读中心（跨版本）
+/api/resources/environments/{id}/db-target
 /api/code/{repos,index,search,read,routes,apis,diff,impact}
 /api/agents / agent-profiles / llm-configs
 /api/auth / users / admin
@@ -553,15 +589,18 @@ Playwright 浏览器（导航、DOM/A11y、点击输入、快照、截图、stor
 
 > P6（D39）：新增 `/api/versions/{id}/batches*`（建批、列表、详情、暂停/恢复/取消、case-runs、rerun、report、report/export）、`/api/versions/{id}/evidence/{evidenceId}`（字节）与 `/meta`、`/api/versions/{id}/execution/sessions`；登录配方为 `/api/resources/auth-flows`（admin）。建批/控制类支持 `Idempotency-Key`；所有 execution ID 在 JSON/URL 中为十进制字符串（D29）；版本详情 `GET /api/versions/{id}` 增补 `paused/pause_mode/batch_no`，活跃批次不并入 version DTO。
 
+> P7（D43–D52）：新增 `/api/versions/{id}/issues`（列表/人工建单/详情/PATCH 确认/驳回）、`/api/versions/{id}/reports`（列表/ensure/详情/publish/regenerate/export/diff）、`/api/versions/{id}/batches/{batchId}/analysis`（列表/详情/手动失败分析重试）、`/api/versions/{id}/mindmap/incremental-plan`、`PATCH /api/versions/{id}/mindmap/nodes/{nodeId}/supplement`、`/api/resources/environments/{id}/db-target`（admin；GET/PUT/DELETE/test）；全局只读中心 `GET /api/issues`、`GET /api/reports`；`/api/versions/{id}/changes` 读时派生；`POST /code/analyses` 增可选 `baseCommit`，`code_anchor.subject_kind` 增 `issue`。批 DTO 增 `kind/parentBatchId/graphHash/baseFallbackReason`；版本 DTO 的 `paused/pause_mode/batch_no` 仍为 P6 snake_case，P7 新增 `continuePhase/continuedAt` 为 camelCase。所有 P7 ID 在 JSON/URL/事件中为十进制字符串（D29）；`report` 重生成新 revision 返回 201、已有更新 revision 返回 200。全局中心为只读列表，不做批量确认/导出；跨版本查询适配由 T17b 接线并挂载（未挂载时该组不注册，前端显示错误态）。
+
 ### 11.2 实时事件（SSE）
 
 - 端点：`GET /api/versions/{id}/stream?since={cursor}`。
 - 快照游标：首屏 REST 拿最新事件页 + snapshot_cursor；SSE 从游标起，历史≤cursor、实时>cursor，无洞。
 - 事件字段：seq、type、version_id、batch_id、case_id、step_id、agent_role、session_id、ts、summary、detail、refs(evidence/case/requirement/code)。
-- 事件类型：version.status_changed、batch.started/finished、requirement.added/clarified/updated、case.created/updated/status_changed/reviewed/supplemented/revalidation_marked、run.started/paused/resumed/finished、step.started/finished、agent.activity、evidence.created、issue.created/updated、gate.pending/resolved、human.requested、report.published/stale、code.indexed/code.changed/code.impact_computed。
+- 事件类型：version.status_changed、batch.started/finished、requirement.added/clarified/updated、case.created/updated/status_changed/reviewed/supplemented/revalidation_marked、run.started/paused/resumed/finished、step.started/finished、agent.activity、evidence.created、issue.created/updated、analysis.started/finished、gate.pending/resolved、human.requested、report.published/stale、code.indexed/code.changed/code.impact_computed。
 - P3 事件（channel=`version:{id}`，version_id 必填）：新增 version.created/version.updated、requirement.reopened/deleted、requirement.relation_added/relation_updated/relation_removed、clarification.session_started/session_completed、clarification.question_updated、decision.proposed/decided、attachment.added/removed；原有 version.status_changed、requirement.added/clarified/updated、agent.activity 语义不变。需求事件永不改变或回退 Version.status（D31）。
 - P5 事件（D35，channel=`version:{id}`，version_id 必填）：新增 `case.created`/`case.updated`/`case.deleted`、`case.reviewed`、`case.baseline_frozen`、`case.run_started`/`case.run_finished`、`case.export_ready` 共 8 个；复用既有 `gate.pending`/`gate.resolved`（`gate=mindmap_review`，进入 reviewing / 批准或驳回）。`refs.case` 携带节点 ID（≤20），detail 只放 id/计数/状态摘要（≤64 KiB），不放脑图正文、LLM 输入输出或导出内容。
 - P6 事件（D39/D42，channel=`version:{id}`）：新增 16 个——`batch.created`/`batch.started`/`batch.paused`/`batch.resumed`/`batch.finished`、`run.started`/`run.paused`/`run.resumed`/`run.finished`、`step.started`/`step.finished`、`evidence.created`、`case.status_changed`、`human.requested`、`gate.pending`、`gate.resolved`。复用 P0 `event` 表（不加 `run_event`），detail 只放 id/计数/状态/哈希摘要，不放证据正文、凭据或 LLM 原文；`agent.activity` 经 `activity_channel=version:{id}` 进入同一通道。
+- P7 事件（D43–D52，channel=`version:{id}`）：新增 8 个——`case.supplemented`、`case.revalidation_marked`、`issue.created`、`issue.updated`、`report.published`、`report.stale`、`analysis.started`、`analysis.finished`；ID 一律十进制字符串（D29），detail 只放 id/状态/计数/置信度/降级标记，不放凭据、storageState、证据正文、SQL 结果、报告正文或 LLM 原文。`version.status_changed` 在继续中/完成时增 `phase` 与 `reason`；`issue.updated` 同时覆盖确认/驳回/复发，不新增 `issue.confirmed`/`issue.dismissed`。
 - P3 通道：澄清 SSE 固定广播到 `version:{id}`（客户端不可覆盖）；P1 Agent 会话可选 `activity_channel=version:{id}`，默认 `agent:{session_id}` 不变。
 - 断线重连：Last-Event-ID；去重按 seq；20s 心跳；前端显示"重连中"。
 - 鉴权：单管理员 + 普通用户；会话 token；资源级只读控制。
@@ -569,6 +608,8 @@ Playwright 浏览器（导航、DOM/A11y、点击输入、快照、截图、stor
 ### 11.3 错误与幂等
 
 统一 JSON 错误；创建/控制类接口幂等（request_id）；阻塞/冲突（如版本状态不允许）返回明确错误码与可重试提示。
+
+> P7（D52）新增稳定 `details.reason`（完整表见 P7 设计规格 §7.11）：`version_not_continuable`、`continuing_batch_conflict`、`no_incremental_cases`、`invalid_case_ids`、`invalid_batch_kind`、`invalid_parent_batch`、`autonomy_pending`、`supplement_unavailable`、`supplement_batch_automatic`、`supplement_limit_reached`、`run_in_progress`、`analysis_active`、`analysis_not_applicable`、`issue_state_conflict`、`issue_dismiss_reason_required`、`issue_ref_invalid`、`report_not_publishable`、`report_export_failed`、`report_stale`、`invalid_base_commit`、`db_target_invalid`、`db_target_missing`、`db_connection_failed`、`db_query_failed`、`db_readonly_violation`、`db_result_truncated`、`db_expected_invalid`、`unsupported_subject_kind`；跨版本/不存在批次统一 404 `batch_not_found`。`db_connection_failed` 为 503 且 retryable，其余按 P7 规格映射；message 不回显 SQL 结果或凭据。
 
 ---
 
@@ -588,13 +629,16 @@ Playwright 浏览器（导航、DOM/A11y、点击输入、快照、截图、stor
 
 > P6（D39）：执行会话 / 探索链路 / 实时播报 / 结果与证据 / 报告 5 个执行类 Tab 已由占位替换为真实实现（`frontend/src/features/execution/`），「问题」仍为 P7 占位；Tab 集合仍为 9 项，不新增全屏执行路由。探索链路的问题节点在 P6 显示 P7 空态（不抓取问题数据）。
 
+> P7（D43–D52）：问题 / 报告 Tab 由占位替换为真实实现（`frontend/src/features/delivery/`）；总览补齐指标卡、报告覆盖矩阵、批次时间线与问题 Top；探索链路接入问题节点、AI 补充与 `needs_revalidation` 高亮；版本页新增继续中徽章/横幅、增量计划面板与 admin-only DB 目标配置；新增全局只读中心 `/issues`、`/reports`，深链 `?tab=issues&issue=`、`?tab=report&report=`。Tab 集合仍为 9 项（不新增业务 Tab），`/issues`、`/reports` 为侧边栏独立入口。
+
 ### 12.3 核心交互
 
 - 暂停（优雅/立即）/恢复；"继续中（第 N 批）"硬状态可见；新增需求入口常驻（含 completed）。
-- 探索链路图（需求→用例→结果→问题，AI 补充/受影响高亮）；P6 只渲染需求→用例→结果，问题节点为 P7 空态。
+- 探索链路图（需求→用例→结果→问题，AI 补充/受影响高亮）；P6 只渲染需求→用例→结果，P7 接入问题节点、AI 补充角标与 `needs_revalidation` 黄框，可深链问题/证据/代码。
 - 执行会话（多 Agent 分组 transcript、工具调用折叠、证据内嵌、人工关卡卡）。
 - 代码与变更（commit diff、影响用例、未映射变更、批次时间线）。
-- 人工接管/升级卡片；报告批次切换与差异。
+- 人工接管/升级卡片；报告批次切换、revision/stale、差异与 Markdown 导出。
+- 继续中：徽章/横幅（阶段 + 暂停）、增量计划（新用例/受影响用例/默认勾选/降级 warning）、创建增量批；问题确认/驳回（CAS）与全局中心深链。
 
 ### 12.4 实时与性能
 
@@ -657,6 +701,10 @@ SSE + 快照游标 + seq 去重 + Last-Event-ID；图结构签名防抖；历史
 | P7 | 全自主闭环与交付 | AI 补全、失败分析、问题/报告、继续中增量批次 |
 | P8 | 体验完善与硬化 | 前端完整、Agent 中心、评测、性能/备份/审计 |
 
+> **P7 实现注记（D43–D52）**：P7 已按本阶段规格交付 `delivery` 上下文（`issue/issue_ref/report/report_ref/analysis_run`）、`db_target`、继续中（`continue_phase/continued_at`）、链式批次（kind/parent/autonomy 字段）、受控补全写路径、版本级报告/问题/分析 API、全局只读中心与 P7 前端 Tab/深链。三个 P7 profile 与确定性报告服务、只读 DB 断言、`baseCommit` 影响分析与 `history_rewritten` 回退均已落地；`version_change` 不建表、`code_changed` 不在 `/changes` 返回。P7 的最终门禁按 P7 规格 §13 执行（静态/单元/集成/P7 E2E/gated 真实 LLM 与真实 DB）。
+
+> **P8 遗留（P7 明确不做）**：① `version_change` 表、`code_changed` 变更项与历史时点回放；② 证据 GC 与报告 stale 的联动；③ 多实例自主 worker 的 leader 选举/分布式锁；④ 报告 PDF 与问题外部工单同步；⑤ 问题重开/合并语义与跨批次语义去重增强；⑥ 非 PostgreSQL 目标库；⑦ P6 遗留的 `EXEC_MAX_TOOL_CALLS` 强制、WS 白名单、executor timeout 后台完成；⑧ 知识沉淀/评测/视觉断言；⑨ 报告快照 `content.batch` 补齐 D49 的 `history_rewritten`/`base_fallback_reason`（批次 DTO 与增量计划 `warnings` 已有；T23 复核规格/OpenAPI，P8 实现）。另：P7 全局中心为轻量只读列表，跨版本查询适配与 `IssuesTab` 单文件拆分作为内部余项，不影响上述功能口径。
+
 > 每个 Phase 的 Definition of Done、依赖、并行建议、风险与里程碑见 `implementation-phases.md`。
 
 ---
@@ -703,4 +751,4 @@ SSE + 快照游标 + seq 去重 + Last-Event-ID；图结构签名防抖；历史
 
 ---
 
-*文档版本：v2.2（2026-10-26，设计冻结候选）：代码智能**语言无关**（AI 代码理解为主，**不设计 parser/静态解析器**，不设语言白名单）。本蓝图覆盖系统全貌，用于多阶段迭代；每个 Phase 开始时据此产出阶段规格（接口/DDL/任务/验收），实施顺序见 `implementation-phases.md`。*
+*文档版本：v2.3（2026-10-28，P7 同步）：代码智能**语言无关**（AI 代码理解为主，**不设计 parser/静态解析器**，不设语言白名单）。本蓝图覆盖系统全貌，用于多阶段迭代；每个 Phase 开始时据此产出阶段规格（接口/DDL/任务/验收），实施顺序见 `implementation-phases.md`。*

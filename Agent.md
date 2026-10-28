@@ -150,16 +150,23 @@ EzTest/
 │        ├─ application/              # graph/materialize/review/baseline/export/explore/run 服务、ports
 │        ├─ infrastructure/           # {postgres,filestore,http,eventing,version,resource,codeintel,agent,audit}
 │        └─ interfaces/httpapi/       # /api/versions/{versionId}/mindmap/* handler、DTO
-│     └─ execution/                   # 限界上下文：执行引擎与证据（P6，D39/D40）
+│     ├─ execution/                   # 限界上下文：执行引擎与证据（P6，D39/D40）
 │        ├─ domain/                   # batch/case_run/step_result/assertion_result/evidence/snapshot/verdict/classification/pause/checkpoint/report、提示词常量
 │        ├─ application/              # batch/evidence/report 服务、scheduler/case_runner/recorder/recovery、agent_tool、ports
 │        ├─ infrastructure/           # {postgres,filestore,browser,agent,mindmap,resource,version,eventing,audit}
 │        └─ interfaces/httpapi/       # /api/versions/{id}/{batches,evidence,execution/sessions} handler、DTO
+│     └─ delivery/                    # 限界上下文：问题/报告/分析（P7，D43–D52）
+│        ├─ domain/                   # issue/report/analysis/dedupe/stale/diff/constants/errors
+│        ├─ application/              # issue/report/analysis 服务、agent_tool、ports
+│        ├─ infrastructure/           # {postgres,filestore,agent,eventing,audit,refs,report,codeintel,mindmap,version}
+│        └─ interfaces/httpapi/       # /api/versions/{id}/{issues,reports,batches/{id}/analysis}、/api/{issues,reports} handler、DTO
 ├─ frontend/
 │  ├─ src/app/                        # Next.js App Router，只做页面组装
 │  │  ├─ (app)/agents/                # /agents 路由，挂载 agent-console
+│  │  ├─ (app)/issues/                # /issues 全局问题中心，挂载 delivery
+│  │  ├─ (app)/reports/               # /reports 全局报告中心，挂载 delivery
 │  │  └─ (app)/versions/              # /versions、/versions/[id] 与 /versions/[id]/mindmap 路由，挂载 versions/mindmap
-│  ├─ src/features/{auth,users,llm-settings,sse-test,shell,agent-console,versions,code-intel,mindmap,execution}/
+│  ├─ src/features/{auth,users,llm-settings,sse-test,shell,agent-console,versions,code-intel,mindmap,execution,delivery}/
 │  ├─ src/components/ui/              # 共享 UI 原语
 │  ├─ src/lib/                        # api-client / sse-client / auth-storage / utils
 │  ├─ src/hooks/  src/navigation/  src/styles/
@@ -180,7 +187,7 @@ EzTest/
 └─ .tools/                            # 便携 Go/PostgreSQL（gitignored）
 ```
 
-每个限界上下文**必须**四层齐全：`domain/`、`application/`、`infrastructure/`、`interfaces/httpapi/`。上下文名使用小写单数（`identity`、`eventing`、`llm`、`storage`、`audit`、`agent`、`resource`、`version`、`codeintel`、`mindmap`、`execution`），不得新建 `utils/`、`common/`、`helpers/` 之类杂物目录；共享纯逻辑放 `internal/platform/`。
+每个限界上下文**必须**四层齐全：`domain/`、`application/`、`infrastructure/`、`interfaces/httpapi/`。上下文名使用小写单数（`identity`、`eventing`、`llm`、`storage`、`audit`、`agent`、`resource`、`version`、`codeintel`、`mindmap`、`execution`、`delivery`），不得新建 `utils/`、`common/`、`helpers/` 之类杂物目录；共享纯逻辑放 `internal/platform/`。
 
 P1 新增的 `agent` 上下文位于 `backend/internal/agent/`：`infrastructure/` 含 `postgres`、`llm`、`eventing`、`audit`、`tools` 适配，`interfaces/httpapi/` 暴露 `/api/agents/*`。P3 兼容扩展：Agent 会话新增可选 `activity_channel`（澄清会话为 `version:{id}`；默认回退 `agent:{session_id}` 不变），run 支持文本 + `image_ref` 多模态输入。
 
@@ -193,6 +200,8 @@ P4 新增的 `codeintel` 上下文位于 `backend/internal/codeintel/`：承载�
 P5 新增的 `mindmap` 上下文位于 `backend/internal/mindmap/`：承载用例脑图与评审（D35），四层齐全；`infrastructure/` 含 `postgres`（9 表仓储）、`filestore`（导出物）、`http`（应用探索 HTTP 客户端）、`eventing`、`version`（状态端口适配）、`resource`（应用模型/环境/Session 端口适配）、`codeintel`（事实/锚点/影响端口适配）、`agent`（run 启动/查询端口适配）、`audit` 适配，`interfaces/httpapi/` 暴露 `/api/versions/{versionId}/mindmap/*`。新增 9 张 `case_*` 表：`case_node`/`case_step`/`case_assertion`/`case_source`/`case_review`/`case_review_finding`/`case_baseline`/`case_design_run`/`case_export`（雪花 `BIGINT` 主键 D29；表名/索引名遵循 §6.9/D34，审计列沿用 `created_at/updated_at` 的 D34 显式例外）。导出物走文件系统（D30），`case` 锚点经 codeintel `AnchorService`（D37）；前端 feature 位于 `frontend/src/features/mindmap/`，页面路由 `/versions/[id]/mindmap`。
 
 P6 新增的 `execution` 上下文位于 `backend/internal/execution/`：承载批次/用例执行/暂停恢复/证据/报告（D39/D40），四层齐全；`infrastructure/` 含 `postgres`（6 表仓储）、`filestore`（证据文件）、`browser`（executor HTTP 客户端）、`agent`、`mindmap`、`resource`、`version`、`eventing`、`audit` 适配，`interfaces/httpapi/` 暴露 `/api/versions/{id}/batches*`、`/api/versions/{id}/evidence/*`、`/api/versions/{id}/execution/sessions`。新增 6 张表 `run_batch`/`case_run`/`step_result`/`assertion_result`/`evidence`/`evidence_ref`（雪花 `BIGINT` 主键 D29；表名/索引名遵循 §6.9/D34）；`RunEvent` 复用 P0 `event` 表（不新增 `run_event`），`StepRun` 折叠为 `step_result`（D42）。独立执行器位于 `executor/`（Node + Playwright 1.64.x；`EZTEST_EXECUTOR_URL` 默认 `http://127.0.0.1:13336`，Bearer token），API 镜像不装 Node/Chromium；证据根 `EZTEST_EVIDENCE_DIR` 默认 `.data/evidence`，只存相对路径 + sha256 + 大小。前端 feature 位于 `frontend/src/features/execution/`，登录配方 UI 位于 `frontend/src/features/resources/`。
+
+P7 新增的 `delivery` 上下文位于 `backend/internal/delivery/`：承载问题/报告/分析（D43–D52），四层齐全；`infrastructure/` 含 `postgres`（5 表仓储）、`filestore`（报告 Markdown）、`agent`（失败分析/问题整理运行时端口）、`eventing`、`audit`、`execution`/`mindmap`/`codeintel`/`version` 适配，`interfaces/httpapi/` 暴露 `/api/versions/{id}/issues`、`/api/versions/{id}/reports`、`/api/versions/{id}/batches/{batchId}/analysis` 与全局只读 `/api/issues`、`/api/reports`。新增 5 张表 `issue`/`issue_ref`/`report`/`report_ref`/`analysis_run`（雪花 `BIGINT` 主键 D29；表名/索引名遵循 §6.9/D34）；报告 Markdown 走 `EZTEST_REPORT_DIR`（默认 `.data/reports`），DB 只存相对路径 + sha256 + 大小。自主编排 worker 由 `cmd/eztest` 装配并随进程启停，单实例假设；前端 feature 位于 `frontend/src/features/delivery/`，全局页面路由 `/issues`、`/reports`，版本内问题/报告 Tab 由 `frontend/src/features/delivery/` 提供。
 
 ### 6.2 导入方向（Go，强制）
 
@@ -229,7 +238,8 @@ P6 新增的 `execution` 上下文位于 `backend/internal/execution/`：承载�
 2. 在 `cmd/eztest` 注册依赖；
 3. 在 `internal/db/migrations/` 增加该上下文迁移；
 4. 更新本节 6.1 目录树与 `docs/design/system-blueprint.md` 模块边界（如需）；
-5. 若新增前端页面，在 `frontend/src/features/` 建 feature 并在 `src/app/` 只做路由组装。
+5. 若新增前端页面，在 `frontend/src/features/` 建 feature 并在 `src/app/` 只做路由组装；
+6. 新增常驻后台 worker/周期任务时，由 `cmd/eztest` 注入依赖并随进程生命周期启停，不得在 HTTP handler 或领域层直接启动常驻 goroutine；单实例假设须在模块注释/文档中写明（P7 自主编排 worker 即此形态）。
 
 ### 6.6 ARTEX 参考边界
 
