@@ -182,8 +182,10 @@ func NewHandler(deps Deps) *Handler {
 	return &Handler{deps: deps, logger: logger}
 }
 
-// Register mounts every endpoint whose dependencies are wired. The 27 routes of
-// spec §7.2 are grouped by the service they need.
+// Register mounts every endpoint whose dependencies are wired. The 27 P5 routes
+// of spec §7.2 are grouped by the service they need; the P7 §7.6 additions
+// (incremental plan, supplement node decision) are mounted when the graph service
+// exposes their use cases.
 func (h *Handler) Register(mux *http.ServeMux) {
 	if mux == nil || h == nil {
 		return
@@ -212,7 +214,17 @@ func (h *Handler) Register(mux *http.ServeMux) {
 		}
 	}
 	if h.deps.Runs != nil || h.deps.Explore != nil || h.deps.Reviews != nil {
-		mux.HandleFunc("POST "+base+"/runs", h.startRun)
+		// The dispatcher routes the P7 supplement/incremental_design kinds to the
+		// parent-batch-aware handler and every legacy kind to startRun.
+		mux.HandleFunc("POST "+base+"/runs", h.startRunDispatch)
+	}
+	// The P7 plan/decision endpoints are mounted when the graph service exposes
+	// their use cases (the concrete *application.GraphService always does).
+	if reader, ok := h.deps.Graph.(incrementalPlanReader); ok && reader != nil {
+		mux.HandleFunc("GET "+base+"/incremental-plan", h.getIncrementalPlan)
+	}
+	if decision, ok := h.deps.Graph.(supplementNodeDecision); ok && decision != nil && h.deps.Nodes != nil {
+		mux.HandleFunc("PATCH "+base+"/nodes/{nodeId}/supplement", h.patchSupplementNode)
 	}
 	if h.deps.RunStore != nil {
 		mux.HandleFunc("GET "+base+"/runs", h.listRuns)
