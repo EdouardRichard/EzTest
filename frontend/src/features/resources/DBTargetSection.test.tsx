@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const mocks = vi.hoisted(() => ({
@@ -99,8 +99,9 @@ describe("DBTargetSection", () => {
     mocks.upsertDbTarget.mockResolvedValue({ ...TARGET, host: "db.internal" })
 
     renderSection()
-    const host = await screen.findByLabelText("主机")
-    fireEvent.change(host, { target: { value: "db.internal" } })
+    // Wait for the load effect to seed the form before editing it.
+    await screen.findByDisplayValue("127.0.0.1")
+    fireEvent.change(screen.getByLabelText("主机"), { target: { value: "db.internal" } })
     fireEvent.click(screen.getByRole("button", { name: "保存目标数据库" }))
 
     await waitFor(() => expect(mocks.upsertDbTarget).toHaveBeenCalledTimes(1))
@@ -130,8 +131,9 @@ describe("DBTargetSection", () => {
     mocks.upsertDbTarget.mockResolvedValue(TARGET)
 
     renderSection()
-    const password = await screen.findByLabelText("密码")
-    fireEvent.change(password, { target: { value: "n3w-s3cret" } })
+    // Wait for the load effect to seed the form before editing it.
+    await screen.findByDisplayValue("127.0.0.1")
+    fireEvent.change(screen.getByLabelText("密码"), { target: { value: "n3w-s3cret" } })
     fireEvent.click(screen.getByRole("button", { name: "保存目标数据库" }))
 
     await waitFor(() =>
@@ -151,6 +153,9 @@ describe("DBTargetSection", () => {
     renderSection()
     expect(await screen.findByText("尚未配置目标数据库")).toBeTruthy()
     expect(screen.getByTestId("db-target-password-state").textContent).toContain("未设置")
+    // The blank form is seeded by the load effect after the first paint; flush it
+    // before typing so the keystrokes below are not overwritten by that sync.
+    await act(async () => {})
 
     fireEvent.change(screen.getByLabelText("主机"), { target: { value: "127.0.0.1" } })
     fireEvent.change(screen.getByLabelText("数据库"), { target: { value: "eztest_target" } })
@@ -307,6 +312,13 @@ describe("DBTargetSection", () => {
     renderSection()
     const password = (await screen.findByLabelText("密码")) as HTMLInputElement
     expect(password.placeholder).toContain("必填")
+
+    // The form mounts empty and is filled by the load effect; the password input
+    // exists before that effect lands (more likely under full-suite load). Wait
+    // for the stored host so save validates the credential, not a blank host.
+    await waitFor(() =>
+      expect((screen.getByLabelText("主机") as HTMLInputElement).value).toBe(TARGET.host),
+    )
 
     fireEvent.click(screen.getByRole("button", { name: "保存目标数据库" }))
 
