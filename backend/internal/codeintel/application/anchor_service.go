@@ -153,9 +153,10 @@ func (s *AnchorService) List(ctx context.Context, versionID int64, f domain.Anch
 	return s.deps.Anchors.List(ctx, versionID, f)
 }
 
-// validateAnchorSubject enforces the P4 ownership rules: requirement must belong
-// to the version, app_model must exist in the version's bound system, version
-// must equal the path version.
+// validateAnchorSubject enforces the subject ownership rules: requirement must
+// belong to the version, app_model must exist in the version's bound system,
+// version must equal the path version. Case ownership is validated by the
+// mindmap context (D37).
 func (s *AnchorService) validateAnchorSubject(ctx context.Context, versionID int64, info VersionInfo, subjectKind string, subjectID int64) error {
 	switch subjectKind {
 	case domain.SubjectVersion:
@@ -198,10 +199,15 @@ func (s *AnchorService) validateAnchorSubject(ctx context.Context, versionID int
 		}
 		return domain.NewInvalid("subjectId", "app_model_not_found",
 			fmt.Sprintf("codeintel: app model %d does not belong to the version system %d", subjectID, info.SystemID))
+	case domain.SubjectCase:
+		// Case anchors are owned by the mindmap context (D37): it validates that
+		// subjectID is a case node of versionID before calling, since codeintel
+		// has no dependency on the mindmap context.
+		return nil
 	default:
 		// domain.ValidateSubjectKind already rejected every other kind.
 		return domain.NewInvalid("subjectKind", "unsupported_subject_kind",
-			"codeintel: subjectKind must be one of version, requirement or app_model")
+			"codeintel: subjectKind must be one of version, requirement, app_model or case")
 	}
 }
 

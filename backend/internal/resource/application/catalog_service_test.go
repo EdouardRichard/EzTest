@@ -1055,3 +1055,63 @@ func TestCatalogServiceImportAppModelsRejectsTooManyNodes(t *testing.T) {
 		t.Fatal("an oversized import wrote nodes")
 	}
 }
+
+// TestImportAppModelsDefaultsToImport pins the P5 source default: callers that
+// leave AppModelInput.Source empty keep the P2 import behavior.
+func TestImportAppModelsDefaultsToImport(t *testing.T) {
+	env := newCatalogTestEnv(t)
+	env.seedCatalogSystem(7, "shop")
+
+	created, updated, err := env.service.ImportAppModels(context.Background(), 7, []AppModelInput{
+		{Key: "page:/home", Kind: domain.AppModelKindPage, Name: "Home", Path: "/home", Source: ""},
+	})
+	if err != nil {
+		t.Fatalf("ImportAppModels: %v", err)
+	}
+	if created != 1 || updated != 0 {
+		t.Fatalf("created=%d updated=%d want 1/0", created, updated)
+	}
+	if node := env.appModels.nodes[1]; node.Source != domain.AppModelSourceImport {
+		t.Fatalf("source=%q want %q", node.Source, domain.AppModelSourceImport)
+	}
+}
+
+// TestImportAppModelsAcceptsExploredAndRejectsOther pins the P5 source
+// tri-state: manual/import/explored are stored as-is and any other value is a
+// 422 without writing nodes.
+func TestImportAppModelsAcceptsExploredAndRejectsOther(t *testing.T) {
+	for _, source := range []string{domain.AppModelSourceManual, domain.AppModelSourceExplored} {
+		t.Run("accepts_"+source, func(t *testing.T) {
+			env := newCatalogTestEnv(t)
+			env.seedCatalogSystem(7, "shop")
+
+			created, updated, err := env.service.ImportAppModels(context.Background(), 7, []AppModelInput{
+				{Key: "page:/home", Kind: domain.AppModelKindPage, Name: "Home", Path: "/home", Source: source},
+			})
+			if err != nil {
+				t.Fatalf("ImportAppModels(%q): %v", source, err)
+			}
+			if created != 1 || updated != 0 {
+				t.Fatalf("created=%d updated=%d want 1/0", created, updated)
+			}
+			if node := env.appModels.nodes[1]; node.Source != source {
+				t.Fatalf("source=%q want %q", node.Source, source)
+			}
+		})
+	}
+
+	for _, source := range []string{"ai", "explore", "EXPLORED"} {
+		t.Run("rejects_"+source, func(t *testing.T) {
+			env := newCatalogTestEnv(t)
+			env.seedCatalogSystem(7, "shop")
+
+			_, _, err := env.service.ImportAppModels(context.Background(), 7, []AppModelInput{
+				{Key: "page:/home", Kind: domain.AppModelKindPage, Name: "Home", Path: "/home", Source: source},
+			})
+			assertCatalogServiceError(t, err, domain.KindInvalid, "invalid_app_model_source")
+			if env.appModels.createCalls != 0 || env.appModels.updateCalls != 0 {
+				t.Fatal("an invalid source wrote nodes")
+			}
+		})
+	}
+}

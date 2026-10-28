@@ -202,8 +202,8 @@ func TestAnchorsCRUDAndReason(t *testing.T) {
 			reason: "anchor_duplicate",
 		},
 		{
-			name:   "a case subject kind maps to 422 unsupported_subject_kind",
-			err:    domain.NewInvalid("subjectKind", "unsupported_subject_kind", "codeintel: subjectKind must be one of version, requirement or app_model"),
+			name:   "an unknown subject kind maps to 422 unsupported_subject_kind",
+			err:    domain.NewInvalid("subjectKind", "unsupported_subject_kind", "codeintel: subjectKind must be one of version, requirement, app_model or case"),
 			status: http.StatusUnprocessableEntity,
 			code:   platform.CodeInvalidArgument,
 			reason: "unsupported_subject_kind",

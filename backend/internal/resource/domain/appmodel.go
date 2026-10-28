@@ -15,6 +15,14 @@ const (
 	AppModelKindComponent = "component"
 )
 
+// App model node sources, mirrored from the app_model_node.source CHECK
+// constraint. Explored is written by P5 application exploration (D36).
+const (
+	AppModelSourceManual   = "manual"
+	AppModelSourceImport   = "import"
+	AppModelSourceExplored = "explored"
+)
+
 // maxAppModelKeyLength bounds app model keys (spec §6.6).
 const maxAppModelKeyLength = 512
 

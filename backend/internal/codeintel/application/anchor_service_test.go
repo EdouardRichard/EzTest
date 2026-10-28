@@ -195,8 +195,8 @@ func newAnchorFixture(t *testing.T) *anchorFixture {
 
 // TestAnchorCreateValidationAndDuplicate pins design spec §6.7: subject
 // ownership, file existence at the fixed branch tip, line validation, path
-// normalisation, uniqueness, version-scoped deletion and the case/issue
-// rejection.
+// normalisation, uniqueness, version-scoped deletion, the case acceptance and
+// the issue rejection.
 func TestAnchorCreateValidationAndDuplicate(t *testing.T) {
 	f := newAnchorFixture(t)
 	ctx := context.Background()
@@ -295,13 +295,21 @@ func TestAnchorCreateValidationAndDuplicate(t *testing.T) {
 		t.Fatalf("foreign requirement error = %v, want subject_not_in_version", err)
 	}
 
-	// case/issue are rejected before any lookup.
-	for _, kind := range []string{"case", "issue"} {
-		if _, err := f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
-			SubjectKind: kind, SubjectID: impactRequirementID, FilePath: impactClientPath,
-		}); domain.Reason(err) != "unsupported_subject_kind" {
-			t.Fatalf("%s error = %v, want unsupported_subject_kind", kind, err)
-		}
+	// Case anchors are accepted (D37); the mindmap context owns the subject
+	// lookup, while issue stays reserved.
+	caseAnchor, err := f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
+		SubjectKind: domain.SubjectCase, SubjectID: impactRequirementID, FilePath: impactServerPath,
+	})
+	if err != nil {
+		t.Fatalf("case anchor error = %v", err)
+	}
+	if caseAnchor.SubjectKind != domain.SubjectCase {
+		t.Fatalf("case anchor subject=%q", caseAnchor.SubjectKind)
+	}
+	if _, err := f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
+		SubjectKind: "issue", SubjectID: impactRequirementID, FilePath: impactClientPath,
+	}); domain.Reason(err) != "unsupported_subject_kind" {
+		t.Fatalf("issue error = %v, want unsupported_subject_kind", err)
 	}
 
 	// Escaping paths are rejected; backslashes are normalised.
