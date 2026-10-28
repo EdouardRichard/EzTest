@@ -10,9 +10,11 @@ name: eztest
 #   docker compose --env-file ../.env up -d --build
 #
 # Required in the repo-root .env for interpolation (see ../.env.example):
-#   POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB
+#   POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB, EZTEST_EXECUTOR_TOKEN
 # The api service also reads ../.env through env_file for the EZTEST_* and
 # lowercase llm_* variables. `.env` is gitignored and must never be committed.
+# The executor is internal-only: it publishes no host port, and only api holds
+# the bearer token.
 
 services:
   postgres:
@@ -53,6 +55,8 @@ services:
       EZTEST_SNOWFLAKE_NODE_ID: ${EZTEST_SNOWFLAKE_NODE_ID:-1}
       EZTEST_OPENAPI_PATH: docs/openapi/api.yaml
       EZTEST_ENABLE_TEST_ENDPOINTS: ${EZTEST_ENABLE_TEST_ENDPOINTS:-false}
+      EZTEST_EXECUTOR_URL: ${EZTEST_EXECUTOR_URL:-http://executor:13336}
+      EZTEST_EXECUTOR_TOKEN: ${EZTEST_EXECUTOR_TOKEN:-}
     ports:
       - "13333:13333"
     volumes:
@@ -63,6 +67,27 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:13333/healthz >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  # Playwright executor (protocol A'). Internal-only: no published ports, one
+  # bearer token shared with the api process, /dev/shm sized for Chromium.
+  executor:
+    build:
+      context: ../executor
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      EZTEST_EXECUTOR_ADDR: 0.0.0.0:13336
+      EZTEST_EXECUTOR_TOKEN: ${EZTEST_EXECUTOR_TOKEN:?set EZTEST_EXECUTOR_TOKEN in the environment or ../.env}
+      EZTEST_EXECUTOR_MAX_CONTEXTS: ${EZTEST_EXECUTOR_MAX_CONTEXTS:-8}
+    shm_size: 1gb
+    expose:
+      - "13336"
+    healthcheck:
+      test: ["CMD", "node", "src/healthcheck.mjs"]
       interval: 10s
       timeout: 5s
       retries: 6

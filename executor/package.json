@@ -1,0 +1,17 @@
+{
+  "name": "eztest-executor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "EzTest Playwright execution service (executor protocol A')",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "node --test --test-concurrency=1 \"test/*.test.mjs\""
+  },
+  "dependencies": {
+    "playwright": "1.64.1"
+  }
+}

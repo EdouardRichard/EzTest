@@ -49,6 +49,27 @@ function Import-DotEnv {
 
 Import-DotEnv -Path $envPath
 
+function Write-ExecutorHealthHint {
+    $executorUrl = $env:EZTEST_EXECUTOR_URL
+    if ([string]::IsNullOrWhiteSpace($executorUrl)) {
+        $executorUrl = "http://127.0.0.1:13336"
+    }
+    $healthUrl = $executorUrl.TrimEnd("/") + "/healthz"
+    $headers = @{}
+    if (-not [string]::IsNullOrWhiteSpace($env:EZTEST_EXECUTOR_TOKEN)) {
+        $headers["Authorization"] = "Bearer " + $env:EZTEST_EXECUTOR_TOKEN
+    }
+    try {
+        Invoke-WebRequest -Uri $healthUrl -Headers $headers -TimeoutSec 2 -UseBasicParsing | Out-Null
+        Write-Host "Executor: healthy at $healthUrl" -ForegroundColor Green
+    } catch {
+        Write-Host "Executor: not reachable at $healthUrl - start it with scripts\dev-executor.ps1" -ForegroundColor Yellow
+    }
+}
+
+# The executor is a separate process on purpose; only report whether it is up.
+Write-ExecutorHealthHint
+
 # Run from backend/ because the Go module root is there, but keep the OpenAPI
 # document reachable at the configured default path.
 $env:EZTEST_OPENAPI_PATH = Join-Path $repoRoot "docs\openapi\api.yaml"
