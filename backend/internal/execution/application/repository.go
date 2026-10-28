@@ -99,8 +99,8 @@ type CaseRunRepository interface {
 	SetStatus(ctx context.Context, caseRunID int64, from, to domain.CaseRunStatus, at time.Time) (domain.CaseRun, error)
 	// FinishCaseRun stores a terminal outcome (status, failure class, reason,
 	// summary, finished_at, duration, cleanup flags) with a CAS that requires the
-	// stored run to be running or interrupted. An already terminal run is
-	// domain.ErrCaseRunTerminal.
+	// stored run to still be running. An interrupted/paused or already terminal run
+	// is domain.ErrCaseRunTerminal.
 	FinishCaseRun(ctx context.Context, run domain.CaseRun) (domain.CaseRun, error)
 }
 

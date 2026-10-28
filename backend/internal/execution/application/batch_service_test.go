@@ -110,7 +110,7 @@ func testSnapshotView(caseNodeID int64, graphHash string) CaseSnapshotSourceView
 			Title:         fmt.Sprintf("case %d", caseNodeID),
 			Priority:      "P1",
 			Preconditions: "signed in",
-			TestData:      map[string]any{"key": "value"},
+			TestData:      map[string]any{"key": "value", "nested": map[string]any{"n": 1}},
 		},
 		Steps: []domain.CaseSnapshotStep{
 			{Seq: 1, Action: "open the list", Expected: "list visible", Data: map[string]any{"page": 1}},
@@ -194,9 +194,17 @@ func TestCreatePinsBaselineAndSnapshots(t *testing.T) {
 		}
 	}
 
-	wantSetBatchNo := []setBatchNoCall{{versionID: 7, batchNo: 1, actor: 1}}
-	if !reflect.DeepEqual(deps.version.setBatchNoCalls, wantSetBatchNo) {
-		t.Fatalf("SetBatchNo calls = %+v, want %+v", deps.version.setBatchNoCalls, wantSetBatchNo)
+	if !reflect.DeepEqual(deps.version.allocateCalls, []int64{7}) {
+		t.Fatalf("AllocateBatchNo calls = %v, want [7]", deps.version.allocateCalls)
+	}
+	if len(deps.version.setBatchNoCalls) != 0 {
+		t.Fatalf("create must record batch_no through allocation, not SetBatchNo: %+v", deps.version.setBatchNoCalls)
+	}
+	if len(deps.version.releaseCalls) != 0 {
+		t.Fatalf("a successful create must not release its batch_no: %+v", deps.version.releaseCalls)
+	}
+	if deps.version.batchNo != 1 {
+		t.Fatalf("version batch_no = %d, want 1", deps.version.batchNo)
 	}
 	if !reflect.DeepEqual(deps.events.types, []string{"batch.created", "batch.started"}) {
 		t.Fatalf("event types = %v", deps.events.types)
@@ -252,11 +260,69 @@ func TestCreateRejectsActiveBatch(t *testing.T) {
 	deps.repo.createErr = domain.ErrBatchActive
 	_, err := service.Create(context.Background(), 7, 1, nil)
 	wantReason(t, err, "batch_active")
-	if len(deps.version.setBatchNoCalls) != 0 {
-		t.Fatalf("batch_no must not advance when the create lost: %+v", deps.version.setBatchNoCalls)
+	if !reflect.DeepEqual(deps.version.allocateCalls, []int64{7}) {
+		t.Fatalf("the number must be allocated before the create attempt: %v", deps.version.allocateCalls)
+	}
+	// The lost create must hand the number back so a later batch is not stuck.
+	if !reflect.DeepEqual(deps.version.releaseCalls, []releaseBatchNoCall{{versionID: 7, allocated: 1}}) {
+		t.Fatalf("ReleaseBatchNo calls = %+v, want one for 1", deps.version.releaseCalls)
+	}
+	if deps.version.batchNo != 0 {
+		t.Fatalf("version batch_no = %d after a lost create, want 0", deps.version.batchNo)
+	}
+	if len(deps.repo.createdRuns) != 0 {
+		t.Fatalf("a rejected create must not persist runs: %+v", deps.repo.createdRuns)
 	}
 	if len(deps.events.types) != 0 {
 		t.Fatalf("a rejected create must not publish events: %v", deps.events.types)
+	}
+}
+
+func TestCreateFailsBeforeWritingWhenAllocationFails(t *testing.T) {
+	service, deps := newBatchServiceTest(t)
+	allocateErr := errors.New("version store unavailable")
+	deps.version.allocateErr = allocateErr
+
+	_, err := service.Create(context.Background(), 7, 1, nil)
+	if !errors.Is(err, allocateErr) {
+		t.Fatalf("error = %v, want %v", err, allocateErr)
+	}
+	if deps.repo.createCalls != 0 {
+		t.Fatalf("an allocation failure must not create a batch (calls=%d)", deps.repo.createCalls)
+	}
+	if len(deps.repo.createdRuns) != 0 {
+		t.Fatalf("an allocation failure must not create runs: %+v", deps.repo.createdRuns)
+	}
+	if len(deps.events.types) != 0 {
+		t.Fatalf("an allocation failure must not publish events: %v", deps.events.types)
+	}
+}
+
+func TestCreateCompensatesFailedCreateSoTheNextCreateSucceeds(t *testing.T) {
+	service, deps := newBatchServiceTest(t)
+	createErr := errors.New("insert batch failed")
+	deps.repo.createErr = createErr
+
+	if _, err := service.Create(context.Background(), 7, 1, nil); !errors.Is(err, createErr) {
+		t.Fatalf("error = %v, want the original %v", err, createErr)
+	}
+	if !reflect.DeepEqual(deps.version.releaseCalls, []releaseBatchNoCall{{versionID: 7, allocated: 1}}) {
+		t.Fatalf("ReleaseBatchNo calls = %+v, want one for 1", deps.version.releaseCalls)
+	}
+	if deps.version.batchNo != 0 {
+		t.Fatalf("version batch_no = %d after compensation, want 0", deps.version.batchNo)
+	}
+	if len(deps.events.types) != 0 {
+		t.Fatalf("a failed create must not publish events: %v", deps.events.types)
+	}
+
+	deps.repo.createErr = nil
+	batch, err := service.Create(context.Background(), 7, 1, nil)
+	if err != nil {
+		t.Fatalf("the next create must succeed, got %v", err)
+	}
+	if batch.BatchNo != 1 {
+		t.Fatalf("next batch_no = %d, want the compensated 1", batch.BatchNo)
 	}
 }
 
@@ -267,13 +333,21 @@ func TestCreateRejectsNoCases(t *testing.T) {
 	wantReason(t, err, "no_cases")
 }
 
-func TestCreateMapsDuplicateBatchToBatchActive(t *testing.T) {
+func TestCreateDoesNotMislabelRepositoryConflictAsBatchActive(t *testing.T) {
 	service, deps := newBatchServiceTest(t)
-	deps.repo.createErr = fmt.Errorf("%w: duplicate batch_no", ErrConflict)
+	conflict := fmt.Errorf("%w: duplicate primary key", ErrConflict)
+	deps.repo.createErr = conflict
+
 	_, err := service.Create(context.Background(), 7, 1, nil)
-	wantReason(t, err, "batch_active")
-	if len(deps.version.setBatchNoCalls) != 0 {
-		t.Fatalf("a lost create must not advance batch_no")
+	if !errors.Is(err, conflict) {
+		t.Fatalf("error = %v, want the repository conflict unchanged", err)
+	}
+	var reasonErr *domain.ReasonError
+	if errors.As(err, &reasonErr) && reasonErr.Reason == "batch_active" {
+		t.Fatalf("a repository conflict must not be mislabelled batch_active: %v", err)
+	}
+	if !reflect.DeepEqual(deps.version.releaseCalls, []releaseBatchNoCall{{versionID: 7, allocated: 1}}) {
+		t.Fatalf("a conflicting create must still release its number: %+v", deps.version.releaseCalls)
 	}
 }
 
@@ -416,6 +490,17 @@ func TestPauseRejectsInvalidModeAndState(t *testing.T) {
 		_, err := service.Pause(context.Background(), 7, 55, domain.PauseModeGraceful, 9)
 		wantReason(t, err, "batch_finished")
 	})
+	t.Run("finished while still paused", func(t *testing.T) {
+		service, deps := newBatchServiceTest(t)
+		deps.seedBatch(domain.BatchStatusCancelled, true)
+		_, err := service.Pause(context.Background(), 7, 55, domain.PauseModeGraceful, 9)
+		// A terminal batch is finished even when its pause flag was never
+		// cleared; already_paused would hide the terminal state.
+		wantReason(t, err, "batch_finished")
+		if len(deps.repo.pauseCalls) != 0 {
+			t.Fatalf("a terminal batch must not be paused: %+v", deps.repo.pauseCalls)
+		}
+	})
 }
 
 func TestResumeOnlyPausedBatch(t *testing.T) {
@@ -487,6 +572,14 @@ func TestCancelSkipsPendingAndInterruptsRunning(t *testing.T) {
 			t.Fatalf("run %d status = %s, want %s", id, got, want)
 		}
 	}
+	// An interrupted run left browser state behind, so the same-attempt resume
+	// must run cleanup first (spec §5.4, invariant 5).
+	if !deps.runs.runs[102].CleanupRequired {
+		t.Fatalf("interrupted run 102 must require cleanup: %+v", deps.runs.runs[102])
+	}
+	if deps.runs.runs[101].CleanupRequired || deps.runs.runs[103].CleanupRequired {
+		t.Fatalf("skipped/passed runs must not require cleanup: %+v", deps.runs.runs)
+	}
 	if len(deps.runs.statusCalls) != 2 {
 		t.Fatalf("SetStatus calls = %+v, want 2", deps.runs.statusCalls)
 	}
@@ -515,6 +608,63 @@ func TestCancelRejectsFinishedBatch(t *testing.T) {
 	deps.seedBatch(domain.BatchStatusFailed, false)
 	_, err := service.Cancel(context.Background(), 7, 55, 9)
 	wantReason(t, err, "batch_finished")
+	if len(deps.version.markPausedCalls) != 0 {
+		t.Fatalf("a finished batch must not touch the version mirror: %+v", deps.version.markPausedCalls)
+	}
+}
+
+func TestCancelClearsPausedBatchAndVersionMirror(t *testing.T) {
+	service, deps := newBatchServiceTest(t)
+	deps.seedBatch(domain.BatchStatusRunning, true)
+	deps.version.paused = true
+	deps.seedRun(domain.CaseRun{ID: 101, BatchID: 55, VersionID: 7, CaseNodeID: 11, Attempt: 1, Status: domain.CaseRunStatusPending})
+	deps.seedRun(domain.CaseRun{ID: 102, BatchID: 55, VersionID: 7, CaseNodeID: 12, Attempt: 1, Status: domain.CaseRunStatusRunning})
+
+	batch, err := service.Cancel(context.Background(), 7, 55, 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batch.Status != domain.BatchStatusCancelled {
+		t.Fatalf("batch status = %s, want cancelled", batch.Status)
+	}
+	if batch.Paused {
+		t.Fatalf("a cancelled batch must not stay paused: %+v", batch)
+	}
+	wantPause := []pauseCall{{batchID: 55, paused: false, mode: domain.PauseModeGraceful, reason: ""}}
+	if !reflect.DeepEqual(deps.repo.pauseCalls, wantPause) {
+		t.Fatalf("SetPaused calls = %+v, want %+v", deps.repo.pauseCalls, wantPause)
+	}
+	// The version mirror must be cleared too, otherwise the version stays
+	// paused forever while the batch that owned the flag is terminal.
+	wantVersion := []markPausedCall{{versionID: 7, paused: false, mode: "graceful", reason: "", actor: 9}}
+	if !reflect.DeepEqual(deps.version.markPausedCalls, wantVersion) {
+		t.Fatalf("MarkPaused calls = %+v, want %+v", deps.version.markPausedCalls, wantVersion)
+	}
+	if !deps.runs.runs[102].CleanupRequired {
+		t.Fatalf("interrupted run must require cleanup: %+v", deps.runs.runs[102])
+	}
+	if !reflect.DeepEqual(deps.events.types, []string{"batch.finished"}) {
+		t.Fatalf("event types = %v, want batch.finished", deps.events.types)
+	}
+}
+
+func TestCancelRepairsInterruptedRunCleanupFlag(t *testing.T) {
+	service, deps := newBatchServiceTest(t)
+	deps.seedBatch(domain.BatchStatusRunning, false)
+	// An earlier partial cancel left the run interrupted without cleanup.
+	deps.seedRun(domain.CaseRun{ID: 101, BatchID: 55, VersionID: 7, CaseNodeID: 11, Attempt: 1,
+		Status: domain.CaseRunStatusInterrupted, CleanupRequired: false})
+
+	if _, err := service.Cancel(context.Background(), 7, 55, 9); err != nil {
+		t.Fatal(err)
+	}
+	if !deps.runs.runs[101].CleanupRequired {
+		t.Fatalf("an interrupted run must not stay without cleanup: %+v", deps.runs.runs[101])
+	}
+	// The run was already interrupted, so no status transition is needed.
+	if len(deps.runs.statusCalls) != 0 {
+		t.Fatalf("SetStatus calls = %+v, want none", deps.runs.statusCalls)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -567,6 +717,61 @@ func TestRerunCreatesNextAttempt(t *testing.T) {
 	if len(deps.runs.createCalls) != 1 || deps.runs.createCalls[0].ID != rerun.ID {
 		t.Fatalf("CreateCaseRun calls = %+v", deps.runs.createCalls)
 	}
+	// Rerun only creates a pending attempt; the scheduler owns run.started and
+	// emits it when it dispatches that attempt. Publishing here would double
+	// the event for one dispatch.
+	if len(deps.events.types) != 0 {
+		t.Fatalf("rerun must not publish an event, got %v", deps.events.types)
+	}
+}
+
+func TestRerunDeepCopiesSnapshotMaps(t *testing.T) {
+	service, deps := newBatchServiceTest(t)
+	deps.seedBatch(domain.BatchStatusRunning, false)
+	view := testSnapshotView(12, testBaselineHash)
+	failed := domain.CaseRun{
+		ID:           101,
+		BatchID:      55,
+		VersionID:    7,
+		CaseNodeID:   12,
+		CaseRevision: 2,
+		CaseHash:     domain.CanonicalCaseHash(view.asSnapshot(testNow)),
+		Snapshot:     view.asSnapshot(testNow),
+		Attempt:      1,
+		Status:       domain.CaseRunStatusFailed,
+	}
+	deps.seedRun(failed)
+
+	rerun, err := service.Rerun(context.Background(), 7, 55, 101, 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Mutating the original run's snapshot must not leak into the new attempt,
+	// including the nested test_data and step data maps.
+	original := deps.runs.runs[101]
+	original.Snapshot.Node.TestData["key"] = "changed"
+	original.Snapshot.Node.TestData["nested"].(map[string]any)["n"] = 99
+	original.Snapshot.Steps[0].Data["page"] = 42
+	deps.runs.runs[101] = original
+
+	copied := deps.runs.runs[rerun.ID]
+	if got := copied.Snapshot.Node.TestData["key"]; got != "value" {
+		t.Fatalf("rerun test_data aliased the original: key = %v", got)
+	}
+	if got := copied.Snapshot.Node.TestData["nested"].(map[string]any)["n"]; got != 1 {
+		t.Fatalf("rerun nested test_data aliased the original: n = %v", got)
+	}
+	if got := copied.Snapshot.Steps[0].Data["page"]; got != 1 {
+		t.Fatalf("rerun step data aliased the original: page = %v", got)
+	}
+
+	// The reverse direction must hold as well.
+	copied.Snapshot.Node.TestData["key"] = "rerun-changed"
+	deps.runs.runs[rerun.ID] = copied
+	if got := deps.runs.runs[101].Snapshot.Node.TestData["key"]; got != "changed" {
+		t.Fatalf("original test_data aliased the rerun: key = %v", got)
+	}
 }
 
 func TestRerunRejectsNonTerminalCaseRun(t *testing.T) {
@@ -616,6 +821,21 @@ type setBatchNoCall struct {
 	actor     int64
 }
 
+type releaseBatchNoCall struct {
+	versionID int64
+	allocated int
+}
+
+// AllocateBatchNo and ReleaseBatchNo keep recovery_test.go's older fake
+// satisfying VersionPort now that batch-number allocation is part of the port.
+// Recovery never creates a batch, so the stubs fail closed instead of inventing
+// a number.
+func (f *recoveryVersionPort) AllocateBatchNo(context.Context, int64) (int, error) {
+	return 0, errors.New("execution: recovery must not allocate a batch number")
+}
+
+func (f *recoveryVersionPort) ReleaseBatchNo(context.Context, int64, int) error { return nil }
+
 type markPausedCall struct {
 	versionID int64
 	paused    bool
@@ -635,6 +855,10 @@ type fakeVersionPort struct {
 
 	markPausedCalls []markPausedCall
 	markPausedErr   error
+	allocateCalls   []int64
+	allocateErr     error
+	releaseCalls    []releaseBatchNoCall
+	releaseErr      error
 	setBatchNoCalls []setBatchNoCall
 	setBatchNoErr   error
 	completeCalls   int
@@ -658,6 +882,28 @@ func (f *fakeVersionPort) GetVersion(ctx context.Context, versionID int64) (Vers
 func (f *fakeVersionPort) MarkPaused(ctx context.Context, versionID int64, paused bool, mode, reason string, actor int64) error {
 	f.markPausedCalls = append(f.markPausedCalls, markPausedCall{versionID, paused, mode, reason, actor})
 	return f.markPausedErr
+}
+
+func (f *fakeVersionPort) AllocateBatchNo(ctx context.Context, versionID int64) (int, error) {
+	f.allocateCalls = append(f.allocateCalls, versionID)
+	if f.allocateErr != nil {
+		return 0, f.allocateErr
+	}
+	f.batchNo++
+	return f.batchNo, nil
+}
+
+func (f *fakeVersionPort) ReleaseBatchNo(ctx context.Context, versionID int64, allocated int) error {
+	f.releaseCalls = append(f.releaseCalls, releaseBatchNoCall{versionID: versionID, allocated: allocated})
+	if f.releaseErr != nil {
+		return f.releaseErr
+	}
+	// The production adapter only rolls a number back while it is still the
+	// newest one; mirror that so tests catch a service that reuses stale ids.
+	if f.batchNo == allocated {
+		f.batchNo = allocated - 1
+	}
+	return nil
 }
 
 func (f *fakeVersionPort) SetBatchNo(ctx context.Context, versionID int64, batchNo int, actor int64) error {

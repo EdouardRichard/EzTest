@@ -26,6 +26,18 @@ type VersionPort interface {
 	// MarkPaused mirrors the batch pause flag onto the version. It must not
 	// change the version status.
 	MarkPaused(ctx context.Context, versionID int64, paused bool, mode, reason string, actor int64) error
+	// AllocateBatchNo atomically increments version.batch_no and returns the new
+	// value (T17 implements it as a single UPDATE ... RETURNING). Batch creation
+	// allocates before it inserts the batch, so a created batch always carries a
+	// number the version already recorded and the unique (version_id, batch_no)
+	// index can only reject a genuinely concurrent creator. Numbers are
+	// monotonic, not gapless: a failed create leaves the number unused.
+	AllocateBatchNo(ctx context.Context, versionID int64) (int, error)
+	// ReleaseBatchNo compensates a failed create: it decrements batch_no back to
+	// allocated-1 only while the stored value still equals allocated, so an
+	// allocation made by a concurrent creator is never rolled back. (T17
+	// implements it.)
+	ReleaseBatchNo(ctx context.Context, versionID int64, allocated int) error
 	// SetBatchNo records the newest batch number monotonically.
 	SetBatchNo(ctx context.Context, versionID int64, batchNo int, actor int64) error
 	// CompleteExecution moves an executing, unpaused version to completed.
@@ -136,16 +148,20 @@ type VersionRef struct {
 }
 
 // SessionRef is one leased session ready for an execution context (spec §5.9).
+// StorageStateKind distinguishes a browser storage_state document from a
+// token/apikey/basic header bundle; a token session exposes Headers only, with
+// empty browser state, so downstream can skip creating a browser context.
 // StorageState and SessionStorage are injected into the browser context;
 // Headers carry token/apikey/basic authentication for http.request. Nothing
 // here is ever logged or published.
 type SessionRef struct {
-	SessionID      int64
-	SnapshotID     int64
-	StorageState   json.RawMessage
-	SessionStorage json.RawMessage
-	Headers        map[string]string
-	ExpiresAt      *time.Time
+	SessionID        int64
+	SnapshotID       int64
+	StorageStateKind string
+	StorageState     json.RawMessage
+	SessionStorage   json.RawMessage
+	Headers          map[string]string
+	ExpiresAt        *time.Time
 }
 
 // EnvironmentRef is the environment projection used by a case run
@@ -259,11 +275,25 @@ type FinishInput struct {
 	EvidenceIDs []int64
 }
 
+// CaseContextCompletedStep is one recorded step of the resume checkpoint
+// (spec §5.5). The actual result and evidence count let a resumed agent continue
+// after the step without replaying it or re-reading its transcript.
+type CaseContextCompletedStep struct {
+	Seq           int
+	Status        domain.StepStatus
+	Actual        string
+	EvidenceCount int
+}
+
 // CaseContextView is the execution agent's read model of one case run
 // (spec §5.5): the pinned run, its checkpoint and the target allowlist.
+// CompletedSteps/RemainingSteps are the resume checkpoint the runtime prompt and
+// the execution.case_context tool render; CompletedSeqs stays the compact form.
 type CaseContextView struct {
 	CaseRun            domain.CaseRun
 	CompletedSeqs      []int
+	CompletedSteps     []CaseContextCompletedStep
+	RemainingSteps     []domain.CaseSnapshotStep
 	InterruptedStepSeq *int
 	CleanupRequired    bool
 	BaseURL            string
