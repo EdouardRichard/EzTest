@@ -272,6 +272,11 @@ type ReviewRepository interface {
 	GetLatest(ctx context.Context, versionID int64) (domain.CaseReview, error)
 	GetApproved(ctx context.Context, versionID int64) (domain.CaseReview, error)
 	Decide(ctx context.Context, reviewID int64, status string, comment string, actor int64) (domain.CaseReview, error)
+	// Reopen demotes an approved review back to draft when a freeze failed or a
+	// stale approval has no baseline, so the version is not wedged behind the
+	// uk_case_review_approved unique index. Implementations must only update a
+	// row whose current status is approved.
+	Reopen(ctx context.Context, reviewID int64, comment string, actor int64) (domain.CaseReview, error)
 	List(ctx context.Context, versionID int64, limit int, cursor string) ([]domain.CaseReview, string, bool, error)
 }
 

@@ -140,11 +140,12 @@ func (s *ReviewService) StartReview(ctx context.Context, versionID, actor int64)
 //  2. open blocker findings require acknowledgeFindings=true, otherwise the
 //     request fails with blocker_findings_open and the blocker ids and nothing is
 //     written;
-//  3. the latest draft review is approved (or an approved review with no findings
-//     is created when the version has none);
+//  3. a stale approved review with no baseline is demoted to draft, then the
+//     latest draft review is approved (or an approved review with no findings is
+//     created when the version has none);
 //  4. BaselineService.Freeze writes the baseline and the reviewed nodes in one
 //     transaction, then moves the version to executing (with compensation when
-//     that transition loses the race);
+//     that transition loses the race); a failed freeze demotes the review again;
 //  5. gate.resolved and case.baseline_frozen are published after the commit.
 func (s *ReviewService) Approve(ctx context.Context, versionID, actor int64, cmd ReviewCommand) (ApproveResult, error) {
 	if err := s.validateApprove(); err != nil {
@@ -183,12 +184,22 @@ func (s *ReviewService) Approve(ctx context.Context, versionID, actor int64, cmd
 			FindingIDs: blockerIDs,
 		}
 	}
+	// A stale approved review whose baseline was never written (an interrupted
+	// or compensated approval) would collide with uk_case_review_approved when
+	// the current round is approved. Revert it first; the caller verified above
+	// that the version has no baseline yet.
+	if err := s.revertStaleApprovedReview(ctx, versionID, actor); err != nil {
+		return ApproveResult{}, err
+	}
 	review, err := s.approveReview(ctx, versionID, actor, cmd.Comment)
 	if err != nil {
 		return ApproveResult{}, err
 	}
 	frozen, err := s.deps.Baseline.Freeze(ctx, versionID, actor)
 	if err != nil {
+		// The review was already approved; put it back to draft so the approval
+		// can be retried instead of wedging the version (spec §6.4 compensation).
+		s.revertReviewAfterFreezeFailure(ctx, versionID, review, actor)
 		return ApproveResult{}, err
 	}
 	version, err = s.deps.Versions.GetVersion(ctx, versionID)
@@ -352,9 +363,9 @@ func (s *ReviewService) openBlockerIDs(ctx context.Context, versionID int64, ack
 	return ids, nil
 }
 
-// approveReview approves the latest draft review, reuses an already-approved one
-// (left by a compensated approval) and creates an approved review with no
-// findings when the version has none.
+// approveReview approves the latest draft review and creates an approved review
+// with no findings when the version has none. An already-approved row is reused
+// only when it appeared concurrently: a stale one was demoted by the caller.
 func (s *ReviewService) approveReview(ctx context.Context, versionID, actor int64, comment string) (domain.CaseReview, error) {
 	latest, err := s.deps.Reviews.GetLatest(ctx, versionID)
 	if err != nil {
@@ -371,6 +382,53 @@ func (s *ReviewService) approveReview(ctx context.Context, versionID, actor int6
 	default:
 		// A rejected round cannot be approved again; record a fresh approval.
 		return s.createReview(ctx, versionID, actor, domain.ReviewApproved, comment)
+	}
+}
+
+// revertStaleApprovedReview demotes an approved review that has no baseline back
+// to draft, so the current approval can record its own approved row without
+// colliding with uk_case_review_approved. The caller has already established that
+// the version has no baseline; the re-check here covers a concurrent freeze.
+func (s *ReviewService) revertStaleApprovedReview(ctx context.Context, versionID, actor int64) error {
+	approved, err := s.deps.Reviews.GetApproved(ctx, versionID)
+	if err != nil {
+		if reviewIsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	baseline, err := loadBaseline(ctx, s.deps.Baselines, versionID)
+	if err != nil {
+		return err
+	}
+	if baseline != nil {
+		return nil
+	}
+	if _, err := s.deps.Reviews.Reopen(ctx, approved.ID, "", actor); err != nil {
+		return err
+	}
+	return nil
+}
+
+// revertReviewAfterFreezeFailure compensates a failed baseline freeze by putting
+// the already-approved review back to draft. A concurrent approval that committed
+// a baseline wins: the review then stays bound to it. The caller keeps the
+// original freeze error, so a failed revert is only logged as a warning.
+func (s *ReviewService) revertReviewAfterFreezeFailure(ctx context.Context, versionID int64, review domain.CaseReview, actor int64) {
+	baseline, err := loadBaseline(ctx, s.deps.Baselines, versionID)
+	if err != nil {
+		slog.WarnContext(ctx, "mindmap: could not confirm the baseline absence after a failed freeze; review left approved",
+			"version_id", versionID, "review_id", review.ID, "error", err)
+		return
+	}
+	if baseline != nil {
+		return
+	}
+	// Reopen only updates an approved row; the empty comment keeps the approval
+	// comment recorded on the review.
+	if _, err := s.deps.Reviews.Reopen(ctx, review.ID, "", actor); err != nil {
+		slog.WarnContext(ctx, "mindmap: revert review after a failed baseline freeze failed",
+			"version_id", versionID, "review_id", review.ID, "error", err)
 	}
 }
 

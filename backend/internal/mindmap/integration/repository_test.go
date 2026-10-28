@@ -581,6 +581,49 @@ func reviewIDs(reviews []domain.CaseReview) []int64 {
 	return ids
 }
 
+// TestReviewReopen covers Reopen, the approved→draft demotion used by the
+// approval compensation paths: it only updates an approved row, keeps the stored
+// comment when the new one is empty, frees uk_case_review_approved for the next
+// approval, and maps a missing row to review_not_found.
+func TestReviewReopen(t *testing.T) {
+	pool := testutil.OpenTestDB(t)
+	ctx := context.Background()
+	repo := postgres.NewReviewRepository(pool)
+
+	approved, err := repo.Create(ctx, newReview(1451, testVersion, domain.ReviewApproved, testTime))
+	requireNoError(t, err, "create approved review")
+	// The unique index rejects a second approved review of the version.
+	_, err = repo.Create(ctx, newReview(1452, testVersion, domain.ReviewApproved, testTime.Add(time.Minute)))
+	requireDomainError(t, err, domain.KindConflict, "baseline_frozen")
+
+	reopened, err := repo.Reopen(ctx, approved.ID, "freeze failed", 42)
+	requireNoError(t, err, "reopen approved review")
+	if reopened.Status != domain.ReviewDraft {
+		t.Fatalf("reopened status = %s, want draft", reopened.Status)
+	}
+	if reopened.Comment != "freeze failed" {
+		t.Fatalf("reopened comment = %q, want the new comment", reopened.Comment)
+	}
+
+	// Reopen is a one-shot CAS: the row is no longer approved.
+	_, err = repo.Reopen(ctx, approved.ID, "again", 42)
+	requireDomainError(t, err, domain.KindConflict, "baseline_frozen")
+
+	// The approved slot is free again.
+	next := newReview(1452, testVersion, domain.ReviewApproved, testTime.Add(2*time.Minute))
+	next.Comment = "keep me"
+	next, err = repo.Create(ctx, next)
+	requireNoError(t, err, "create approved review after reopen")
+	kept, err := repo.Reopen(ctx, next.ID, "", 42)
+	requireNoError(t, err, "reopen with an empty comment")
+	if kept.Comment != "keep me" {
+		t.Fatalf("comment = %q, want the stored one kept", kept.Comment)
+	}
+
+	_, err = repo.Reopen(ctx, 999999, "", 42)
+	requireDomainError(t, err, domain.KindNotFound, "review_not_found")
+}
+
 // TestCascadeDeleteScenario proves deleting a scenario cascades through the
 // subtree while a version-level finding only loses its node link.
 func TestCascadeDeleteScenario(t *testing.T) {

@@ -25,4 +25,9 @@ type CaseExport struct {
 	CreatedBy  int64
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
+	// Reused marks a row that ExportService.Create returned from the
+	// baseline-bound reuse lookup instead of writing it. It is transport
+	// metadata only (the HTTP layer answers 200 instead of 201 for a reuse,
+	// spec §7.2 endpoint 25) and is never persisted or serialized.
+	Reused bool `json:"-"`
 }

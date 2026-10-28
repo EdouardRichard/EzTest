@@ -155,11 +155,17 @@ func (s *reviewRunStarter) Start(_ context.Context, versionID, actor int64, cmd 
 
 // baselineServiceFor wires the production baseline service to the shared fixture.
 func baselineServiceFor(f *runFixture, lifecycle *reviewVersionLifecycle) *application.BaselineService {
+	return baselineServiceWithGraph(f, lifecycle, reviewGraph{f})
+}
+
+// baselineServiceWithGraph wires the baseline service to an explicit graph
+// transaction runner (edit/failure fixtures).
+func baselineServiceWithGraph(f *runFixture, lifecycle *reviewVersionLifecycle, graph application.GraphRepository) *application.BaselineService {
 	if lifecycle == nil {
 		lifecycle = &reviewVersionLifecycle{f: f}
 	}
 	return application.NewBaselineService(application.BaselineDeps{
-		Graph:      reviewGraph{f},
+		Graph:      graph,
 		Nodes:      reviewNodeRepo{runNodeRepo{f}},
 		Steps:      runStepRepo{f},
 		Assertions: runAssertionRepo{f},
@@ -648,5 +654,100 @@ func TestReviewListFindingsAndUpdate(t *testing.T) {
 		t.Fatal("updating an unknown finding must fail")
 	} else if reason := reviewDomainReason(t, err); reason != "finding_not_found" {
 		t.Fatalf("reason=%q want finding_not_found", reason)
+	}
+}
+
+// TestApproveRevertsStaleApprovedReview covers the recovery from a stale
+// approved review left by an interrupted approval: no baseline exists, so the
+// approval reverts it to draft before approving the current round. Only one
+// approved review may remain (uk_case_review_approved).
+func TestApproveRevertsStaleApprovedReview(t *testing.T) {
+	ctx := context.Background()
+	fixture := newRunFixture()
+	fixture.version.Status = "reviewing"
+	seedReviewGraph(fixture)
+	stale := fixture.seedReview(9001, domain.ReviewApproved)
+	current := fixture.seedReview(9002, domain.ReviewDraft)
+	service := reviewServiceFor(fixture, nil, nil)
+
+	result, err := service.Approve(ctx, runTestVersionID, 42, application.ReviewCommand{
+		Decision: application.ReviewDecisionApprove,
+	})
+	if err != nil {
+		t.Fatalf("approve with a stale approved review: %v", err)
+	}
+	if fixture.reviews[stale.ID].Status != domain.ReviewDraft {
+		t.Fatalf("stale review status=%s want draft", fixture.reviews[stale.ID].Status)
+	}
+	if result.Review.ID != current.ID || result.Review.Status != domain.ReviewApproved {
+		t.Fatalf("approved review=%+v want the current round %d approved", result.Review, current.ID)
+	}
+	if result.Baseline.ReviewID != current.ID {
+		t.Fatalf("baseline review=%d want %d", result.Baseline.ReviewID, current.ID)
+	}
+	approved := 0
+	for _, review := range fixture.reviews {
+		if review.Status != domain.ReviewApproved {
+			continue
+		}
+		approved++
+		if review.ID != current.ID {
+			t.Fatalf("review %d stayed approved; only %d may be approved", review.ID, current.ID)
+		}
+	}
+	if approved != 1 {
+		t.Fatalf("approved reviews=%d want exactly 1", approved)
+	}
+}
+
+// TestApproveRevertsReviewWhenFreezeFails covers the freeze compensation: an
+// approval that cannot freeze (the version transition lost the race) must put
+// its review back to draft, so a retry can approve again.
+func TestApproveRevertsReviewWhenFreezeFails(t *testing.T) {
+	ctx := context.Background()
+	fixture := newRunFixture()
+	fixture.version.Status = "reviewing"
+	seedReviewGraph(fixture)
+	review := fixture.seedReview(9001, domain.ReviewDraft)
+	lifecycle := &reviewVersionLifecycle{
+		f:          fixture,
+		approveErr: errors.New("version service unavailable"),
+	}
+	service := reviewServiceFor(fixture, lifecycle, nil)
+
+	_, err := service.Approve(ctx, runTestVersionID, 42, application.ReviewCommand{
+		Decision: application.ReviewDecisionApprove,
+	})
+	if err == nil {
+		t.Fatal("approve must fail when the baseline freeze fails")
+	}
+	if reason := reviewDomainReason(t, err); reason != "version_state_conflict" {
+		t.Fatalf("reason=%q want version_state_conflict", reason)
+	}
+	if fixture.reviews[review.ID].Status != domain.ReviewDraft {
+		t.Fatalf("review status=%s want draft after the freeze compensation", fixture.reviews[review.ID].Status)
+	}
+	if fixture.baseline != nil {
+		t.Fatalf("baseline=%+v want none after the freeze compensation", fixture.baseline)
+	}
+	if fixture.version.Status != "reviewing" {
+		t.Fatalf("version status=%s want reviewing", fixture.version.Status)
+	}
+
+	lifecycle.approveErr = nil
+	result, err := service.Approve(ctx, runTestVersionID, 42, application.ReviewCommand{
+		Decision: application.ReviewDecisionApprove,
+	})
+	if err != nil {
+		t.Fatalf("retry approve after the compensation: %v", err)
+	}
+	if result.Baseline.ReviewID != review.ID {
+		t.Fatalf("baseline review=%d want %d", result.Baseline.ReviewID, review.ID)
+	}
+	if fixture.reviews[review.ID].Status != domain.ReviewApproved {
+		t.Fatalf("review status=%s want approved after the retry", fixture.reviews[review.ID].Status)
+	}
+	if fixture.version.Status != "executing" {
+		t.Fatalf("version status=%s want executing", fixture.version.Status)
 	}
 }

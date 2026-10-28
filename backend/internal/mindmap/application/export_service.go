@@ -130,6 +130,9 @@ func (s *ExportService) Create(ctx context.Context, versionID, actor int64, form
 	if baseline != nil {
 		existing, findErr := s.deps.Exports.FindByBaselineFormat(ctx, versionID, format, &baseline.ID)
 		if findErr == nil {
+			// The caller gets an existing row back instead of a new one: the
+			// HTTP layer answers 200 rather than 201 (spec §7.2 endpoint 25).
+			existing.Reused = true
 			return existing, nil
 		}
 		if !exportIsNotFound(findErr) {
@@ -223,7 +226,10 @@ func (s *ExportService) Download(ctx context.Context, versionID, exportID int64)
 	}
 	reader, err := s.deps.Store.Open(export.FilePath)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
+		// The stored path comes from the metadata row, never from the request:
+		// a missing file or a row whose path no longer resolves inside the root
+		// is corrupt metadata (500 export_corrupted), not a client error.
+		if errors.Is(err, fs.ErrNotExist) || exportPathInvalid(err) {
 			return nil, domain.CaseExport{}, exportCorruptedError(exportID)
 		}
 		return nil, domain.CaseExport{}, err
@@ -407,8 +413,9 @@ func (s *ExportService) removeFile(rel string) {
 	}
 }
 
-// publishExport emits case.export_ready after the metadata commit. The detail
-// carries ids/format/size only, never export content (spec §6.11/D30).
+// publishExport emits case.export_ready after the metadata commit. Spec §6.10
+// requires the summary to carry format and exportId; the detail carries
+// ids/format/size only, never export content (spec §6.11/D30).
 func (s *ExportService) publishExport(ctx context.Context, export domain.CaseExport, actor int64) {
 	if s.deps.Events == nil {
 		return
@@ -416,8 +423,8 @@ func (s *ExportService) publishExport(ctx context.Context, export domain.CaseExp
 	event := Event{
 		VersionID: export.VersionID,
 		Type:      domain.EventCaseExportReady,
-		Summary: fmt.Sprintf("case export ready: %s (%d bytes)",
-			export.Format, export.SizeBytes),
+		Summary: fmt.Sprintf("case export ready: %s %d (%d bytes)",
+			export.Format, export.ID, export.SizeBytes),
 		ActorID: actor,
 		Detail: map[string]any{
 			"exportId":  export.ID,
@@ -481,6 +488,16 @@ func exportBaselineID(baseline *domain.CaseBaseline) *int64 {
 func exportIsNotFound(err error) bool {
 	var domainErr *domain.Error
 	return errors.As(err, &domainErr) && domainErr.Kind == domain.KindNotFound
+}
+
+// exportPathInvalid reports whether err is the store's invalid_storage_path
+// rejection. Download only ever passes a stored metadata path to the store, so
+// such a rejection means the row is corrupt (500 export_corrupted) rather than
+// that the request was invalid (422 invalid_storage_path).
+func exportPathInvalid(err error) bool {
+	var domainErr *domain.Error
+	return errors.As(err, &domainErr) && domainErr.Kind == domain.KindInvalid &&
+		domainErr.Reason == "invalid_storage_path"
 }
 
 // exportCorruptedError builds the 500 export_corrupted of spec §7.2 endpoint 27.

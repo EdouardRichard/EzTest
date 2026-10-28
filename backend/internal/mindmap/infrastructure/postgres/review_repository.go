@@ -150,6 +150,28 @@ func (r *ReviewRepository) Decide(ctx context.Context, reviewID int64, status st
 	return decided, nil
 }
 
+// Reopen demotes an approved review back to draft, freeing
+// uk_case_review_approved for the next approval (spec §6.4 compensation). Only a
+// row whose current status is approved is updated; an empty comment keeps the
+// stored one. A missing row is review_not_found and an existing non-approved row
+// is baseline_frozen.
+func (r *ReviewRepository) Reopen(ctx context.Context, reviewID int64, comment string, _ int64) (domain.CaseReview, error) {
+	const query = `UPDATE case_review
+		SET status = 'draft',
+		    comment = CASE WHEN $2 = '' THEN comment ELSE $2 END,
+		    updated_at = now()
+		WHERE id = $1 AND status = 'approved'
+		RETURNING ` + reviewColumnList
+	reopened, err := scanReview(r.q.QueryRow(ctx, query, reviewID, comment))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.CaseReview{}, r.reopenConflict(ctx, reviewID)
+		}
+		return domain.CaseReview{}, fmt.Errorf("postgres: reopen case review: %w", err)
+	}
+	return reopened, nil
+}
+
 // decideConflict classifies a zero-row decision CAS: a missing row is
 // review_not_found, an already-approved row is baseline_frozen (approving it
 // froze the version), and any other already-decided row stays a generic
@@ -168,6 +190,20 @@ func (r *ReviewRepository) decideConflict(ctx context.Context, reviewID int64) e
 	}
 	return domain.NewConflict("conflict",
 		fmt.Sprintf("review %d is already %s", reviewID, status))
+}
+
+// reopenConflict classifies a zero-row reopen CAS: a missing row is
+// review_not_found and an existing row that is not approved is baseline_frozen.
+func (r *ReviewRepository) reopenConflict(ctx context.Context, reviewID int64) error {
+	var status string
+	if err := r.q.QueryRow(ctx, `SELECT status FROM case_review WHERE id = $1`, reviewID).Scan(&status); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return notFound("review", reviewID)
+		}
+		return fmt.Errorf("postgres: read case review status after reopen: %w", err)
+	}
+	return domain.NewConflict("baseline_frozen",
+		fmt.Sprintf("review %d is %s, not approved", reviewID, status))
 }
 
 // List returns one page ordered by created_at DESC, id DESC with an opaque

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/mindmap/domain"
@@ -72,30 +73,18 @@ func (s *BaselineService) Freeze(ctx context.Context, versionID, actor int64) (d
 	if err != nil {
 		return domain.CaseBaseline{}, err
 	}
-	snapshot, err := s.loadSnapshot(ctx, versionID)
-	if err != nil {
-		return domain.CaseBaseline{}, err
-	}
-	// Keep the pre-freeze node rows: the compensation restores status and
-	// revision exactly, including the revision bump of UpdateStatusByVersion.
-	preFreeze := append([]domain.CaseNode(nil), snapshot.Nodes...)
 	id, err := s.nextID()
 	if err != nil {
 		return domain.CaseBaseline{}, err
 	}
-	baseline := domain.CaseBaseline{
-		ID:                 id,
-		VersionID:          versionID,
-		ReviewID:           review.ID,
-		NodeCount:          len(snapshot.Nodes),
-		CaseCount:          baselineCaseCount(snapshot.Nodes),
-		GraphHash:          domain.CanonicalGraphHash(snapshot),
-		CodeBaselineCommit: version.CodeBaselineCommit,
-		FrozenBy:           actor,
-		FrozenAt:           s.now(),
-	}
+	frozenAt := s.now()
 
+	// The snapshot, the canonical hash, the counts and the pre-freeze rows are
+	// all read inside the freeze transaction (spec §6.4): a concurrent edit
+	// committed before the transaction must be part of the frozen baseline, and
+	// the compensation needs the exact rows the transaction saw.
 	var frozen domain.CaseBaseline
+	var preFreeze []domain.CaseNode
 	err = s.deps.Graph.InTx(ctx, func(tx GraphTx) error {
 		if tx.Baselines() == nil || tx.Nodes() == nil {
 			return errors.New("mindmap: baseline transaction repositories are not configured")
@@ -109,6 +98,22 @@ func (s *BaselineService) Freeze(ctx context.Context, versionID, actor int64) (d
 		}
 		if current != nil {
 			return baselineFrozenError(versionID)
+		}
+		snapshot, err := loadSnapshotTx(ctx, tx, versionID)
+		if err != nil {
+			return err
+		}
+		preFreeze = append([]domain.CaseNode(nil), snapshot.Nodes...)
+		baseline := domain.CaseBaseline{
+			ID:                 id,
+			VersionID:          versionID,
+			ReviewID:           review.ID,
+			NodeCount:          len(snapshot.Nodes),
+			CaseCount:          baselineCaseCount(snapshot.Nodes),
+			GraphHash:          domain.CanonicalGraphHash(snapshot),
+			CodeBaselineCommit: version.CodeBaselineCommit,
+			FrozenBy:           actor,
+			FrozenAt:           frozenAt,
 		}
 		stored, err := tx.Baselines().Create(ctx, baseline)
 		if err != nil {
@@ -140,38 +145,21 @@ func (s *BaselineService) validate() error {
 	return nil
 }
 
-// loadSnapshot reads the whole graph of versionID for canonical hashing.
-func (s *BaselineService) loadSnapshot(ctx context.Context, versionID int64) (domain.GraphSnapshot, error) {
-	nodes, err := s.deps.Nodes.ListByVersion(ctx, versionID)
+// loadSnapshotTx reads the whole graph of versionID through the transaction's
+// repositories, so the hash and the counts describe exactly the rows the freeze
+// transaction commits.
+func loadSnapshotTx(ctx context.Context, tx GraphTx, versionID int64) (domain.GraphSnapshot, error) {
+	state, err := loadGraphStateTx(ctx, tx, versionID)
 	if err != nil {
 		return domain.GraphSnapshot{}, err
 	}
-	steps, err := s.deps.Steps.ListByVersion(ctx, versionID)
-	if err != nil {
-		return domain.GraphSnapshot{}, err
-	}
-	assertions, err := s.deps.Assertions.ListByVersion(ctx, versionID)
-	if err != nil {
-		return domain.GraphSnapshot{}, err
-	}
-	sources, err := s.deps.Sources.ListByVersion(ctx, versionID)
-	if err != nil {
-		return domain.GraphSnapshot{}, err
-	}
-	snapshot := domain.GraphSnapshot{
+	return domain.GraphSnapshot{
 		VersionID:  versionID,
-		Nodes:      nodes,
-		Steps:      make(map[int64][]domain.CaseStep),
-		Assertions: make(map[int64][]domain.CaseAssertion),
-		Sources:    sources,
-	}
-	for _, step := range steps {
-		snapshot.Steps[step.NodeID] = append(snapshot.Steps[step.NodeID], step)
-	}
-	for _, assertion := range assertions {
-		snapshot.Assertions[assertion.NodeID] = append(snapshot.Assertions[assertion.NodeID], assertion)
-	}
-	return snapshot, nil
+		Nodes:      state.nodes,
+		Steps:      state.steps,
+		Assertions: state.assertions,
+		Sources:    state.sources,
+	}, nil
 }
 
 // approvedReview returns the approved review the baseline belongs to. The review
@@ -213,6 +201,11 @@ func (s *BaselineService) compensate(ctx context.Context, versionID int64, preFr
 		return tx.Nodes().RestoreStatusByVersion(ctx, versionID, preFreeze)
 	})
 	if compensationErr != nil {
+		// The graph is left half-frozen (baseline + reviewed nodes with the
+		// version still reviewing): this needs manual repair, so it is logged at
+		// error level and returned as a non-domain internal failure (spec §6.4).
+		slog.ErrorContext(ctx, "mindmap: baseline freeze compensation failed",
+			"version_id", versionID, "cause", cause, "error", compensationErr)
 		return fmt.Errorf("mindmap: baseline freeze of version %d failed (%v) and its compensation failed: %w",
 			versionID, cause, compensationErr)
 	}

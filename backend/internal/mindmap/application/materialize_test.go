@@ -2,6 +2,7 @@ package application_test
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -357,6 +358,7 @@ func TestMaterializeIsIdempotent(t *testing.T) {
 func TestReviewProposalDismissesPreviousAIFindings(t *testing.T) {
 	ctx := context.Background()
 	fixture := newRunFixture()
+	fixture.version.Status = "reviewing"
 	fixture.seedCaseNode(11, 1, "已存在用例")
 	fixture.seedReview(900, domain.ReviewDraft)
 	fixture.seedFinding(901, 900, domain.FindingSourceAI, domain.FindingOpen)
@@ -500,6 +502,267 @@ func TestMaterializeRejectsFrozenVersion(t *testing.T) {
 				t.Fatalf("version status = %q, want unchanged executing", fixture.version.Status)
 			}
 		})
+	}
+}
+
+// TestMaterializeRejectsBaselineWithoutFrozenStatus covers the stale
+// approved/executing mismatch: when a baseline exists but the version snapshot
+// is still designing, design/data-plan materialization must refuse to write.
+func TestMaterializeRejectsBaselineWithoutFrozenStatus(t *testing.T) {
+	cases := []struct {
+		name    string
+		kind    string
+		payload string
+		seed    func(*runFixture)
+	}{
+		{name: "design", kind: domain.RunKindDesign, payload: runValidDesignPayload()},
+		{
+			name:    "data plan",
+			kind:    domain.RunKindDataPlan,
+			payload: `{"items":[{"nodeId":"11","nodeRevision":1,"preconditions":"x"}]}`,
+			seed:    func(f *runFixture) { f.seedCaseNode(11, 1, "人工草稿") },
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			ctx := context.Background()
+			fixture := newDesignFixture()
+			fixture.version.Status = "designing"
+			if testCase.seed != nil {
+				testCase.seed(fixture)
+			}
+			seeded := len(fixture.nodes)
+			fixture.baseline = &domain.CaseBaseline{
+				ID: 1234, VersionID: runTestVersionID, ReviewID: 9001,
+				NodeCount: 1, CaseCount: 1, GraphHash: strings.Repeat("a", 64),
+				FrozenBy: 42, FrozenAt: fixture.now,
+			}
+			run := fixture.seedRunningRun(testCase.kind, testCase.payload)
+			service := fixture.service()
+
+			err := service.Materialize(ctx, run.ID)
+			requireDomainError(t, err, domain.KindStateConflict, "baseline_frozen")
+			if fixture.txCount != 0 {
+				t.Fatalf("InTx calls = %d, want 0 with a frozen baseline", fixture.txCount)
+			}
+			if len(fixture.nodes) != seeded {
+				t.Fatalf("nodes = %d, want the seeded %d untouched", len(fixture.nodes), seeded)
+			}
+			if fixture.runs[run.ID].Status != domain.RunFailed {
+				t.Fatalf("run status = %q, want failed", fixture.runs[run.ID].Status)
+			}
+			if reason, _ := runErrors(t, fixture.runs[run.ID]); reason != "baseline_frozen" {
+				t.Fatalf("run reason = %q, want baseline_frozen", reason)
+			}
+		})
+	}
+}
+
+// TestReviewGatePendingOnlyWhenReviewing covers spec §6.11: gate.pending is the
+// "entered reviewing" signal, so review materialization emits it only while the
+// version is actually reviewing.
+func TestReviewGatePendingOnlyWhenReviewing(t *testing.T) {
+	cases := []struct {
+		name   string
+		status string
+		want   bool
+	}{
+		{name: "reviewing", status: "reviewing", want: true},
+		{name: "designing", status: "designing", want: false},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			ctx := context.Background()
+			fixture := newRunFixture()
+			fixture.version.Status = testCase.status
+			run := fixture.seedRunningRun(domain.RunKindReview,
+				`{"findings":[{"category":"other","severity":"info","detail":"建议补充边界值"}]}`)
+			service := fixture.service()
+
+			if err := service.Materialize(ctx, run.ID); err != nil {
+				t.Fatalf("materialize review run: %v", err)
+			}
+			if got := fixture.hasEvent(domain.EventGatePending); got != testCase.want {
+				t.Fatalf("gate.pending emitted = %v, want %v on a %s version", got, testCase.want, testCase.status)
+			}
+			if !fixture.hasEvent(domain.EventCaseReviewed) {
+				t.Fatal("missing case.reviewed event")
+			}
+		})
+	}
+}
+
+// TestDesignMaterializationEnforcesNodeCap covers spec §7.3: existing nodes plus
+// the proposed scenarios/cases must stay within the 300-node cap, otherwise the
+// run fails with graph_too_large and zero graph writes.
+func TestDesignMaterializationEnforcesNodeCap(t *testing.T) {
+	ctx := context.Background()
+	t.Run("above the cap", func(t *testing.T) {
+		fixture := newDesignFixture()
+		for index := 0; index < 299; index++ {
+			fixture.seedCaseNode(int64(1000+index), 1, fmt.Sprintf("existing-%d", index))
+		}
+		run := fixture.seedRunningRun(domain.RunKindDesign, runValidDesignPayload())
+		service := fixture.service()
+
+		err := service.Materialize(ctx, run.ID)
+		requireDomainError(t, err, domain.KindConflict, "graph_too_large")
+		if fixture.txCount != 0 {
+			t.Fatalf("InTx calls = %d, want 0 for an oversized graph", fixture.txCount)
+		}
+		if len(fixture.nodes) != 299 {
+			t.Fatalf("nodes = %d, want the seeded 299 untouched", len(fixture.nodes))
+		}
+		reason, validationErrors := runErrors(t, fixture.runs[run.ID])
+		if reason != "graph_too_large" || len(validationErrors) == 0 {
+			t.Fatalf("run errors reason=%q validationErrors=%v, want graph_too_large with details",
+				reason, validationErrors)
+		}
+	})
+	t.Run("at the cap", func(t *testing.T) {
+		fixture := newDesignFixture()
+		for index := 0; index < 298; index++ {
+			fixture.seedCaseNode(int64(1000+index), 1, fmt.Sprintf("existing-%d", index))
+		}
+		run := fixture.seedRunningRun(domain.RunKindDesign, runValidDesignPayload())
+		service := fixture.service()
+
+		if err := service.Materialize(ctx, run.ID); err != nil {
+			t.Fatalf("materialize design run at the cap: %v", err)
+		}
+		if len(fixture.nodes) != 300 {
+			t.Fatalf("nodes = %d, want exactly 300", len(fixture.nodes))
+		}
+	})
+}
+
+// TestDataPlanItemsMustBeInRunNodeScope covers spec §6.8: when the run was
+// started with an explicit nodeIds scope, every item must target a node in that
+// scope.
+func TestDataPlanItemsMustBeInRunNodeScope(t *testing.T) {
+	ctx := context.Background()
+	t.Run("out of scope", func(t *testing.T) {
+		fixture := newRunFixture()
+		fixture.seedCaseNode(11, 1, "in scope")
+		fixture.seedCaseNode(12, 1, "out of scope")
+		run := fixture.seedRunningRun(domain.RunKindDataPlan,
+			`{"items":[
+				{"nodeId":"11","nodeRevision":1,"preconditions":"已登录"},
+				{"nodeId":"12","nodeRevision":1,"preconditions":"越界写入"}
+			]}`)
+		run.Input = []byte(`{"kind":"data_plan","nodeIds":[11]}`)
+		fixture.runs[run.ID] = run
+		service := fixture.service()
+
+		err := service.Materialize(ctx, run.ID)
+		requireDomainError(t, err, domain.KindInvalid, "invalid_case_proposal")
+		if fixture.txCount != 0 {
+			t.Fatalf("InTx calls = %d, want 0 for an out-of-scope item", fixture.txCount)
+		}
+		if fixture.nodes[11].Preconditions != "" || fixture.nodes[12].Preconditions != "" {
+			t.Fatalf("out-of-scope submission wrote nodes: %+v", fixture.nodes)
+		}
+		if fixture.runs[run.ID].Status != domain.RunFailed {
+			t.Fatalf("run status = %q, want failed", fixture.runs[run.ID].Status)
+		}
+	})
+	t.Run("in scope", func(t *testing.T) {
+		fixture := newRunFixture()
+		fixture.seedCaseNode(11, 1, "in scope")
+		fixture.seedCaseNode(12, 1, "not targeted")
+		run := fixture.seedRunningRun(domain.RunKindDataPlan,
+			`{"items":[{"nodeId":"11","nodeRevision":1,"preconditions":"已登录"}]}`)
+		run.Input = []byte(`{"kind":"data_plan","nodeIds":[11]}`)
+		fixture.runs[run.ID] = run
+		service := fixture.service()
+
+		if err := service.Materialize(ctx, run.ID); err != nil {
+			t.Fatalf("materialize in-scope data plan: %v", err)
+		}
+		if fixture.nodes[11].Preconditions != "已登录" {
+			t.Fatalf("node 11 preconditions = %q, want the planned value", fixture.nodes[11].Preconditions)
+		}
+		if fixture.nodes[12].Preconditions != "" {
+			t.Fatalf("node 12 was written outside the scope: %+v", fixture.nodes[12])
+		}
+	})
+}
+
+// TestDesignReplaceDeletesDraftsAndRematerializes covers spec §6.7 rule 6 and
+// §10.3: a confirmed mode=replace deletes the draft graph (children cascade),
+// then rematerializes the proposal in the same transaction.
+func TestDesignReplaceDeletesDraftsAndRematerializes(t *testing.T) {
+	ctx := context.Background()
+	fixture := newDesignFixture()
+	parent := int64(11)
+	stepID := int64(13)
+	requirementID := int64(7)
+	fixture.nodes[11] = domain.CaseNode{
+		ID: 11, VersionID: runTestVersionID, Kind: domain.NodeKindScenario,
+		Title: "旧场景", Priority: domain.PriorityP2, Source: domain.NodeSourceUserInput,
+		Status: domain.NodeStatusDraft, SortOrder: 1, Revision: 1,
+		CreatedAt: fixture.now, UpdatedAt: fixture.now,
+	}
+	fixture.nodes[12] = domain.CaseNode{
+		ID: 12, VersionID: runTestVersionID, ParentID: &parent, Kind: domain.NodeKindCase,
+		Title: "旧用例", Priority: domain.PriorityP1, Source: domain.NodeSourceUserInput,
+		Status: domain.NodeStatusDraft, SortOrder: 2, Revision: 1,
+		CreatedAt: fixture.now, UpdatedAt: fixture.now,
+	}
+	fixture.steps[stepID] = domain.CaseStep{
+		ID: stepID, NodeID: 12, Seq: 1, Action: "旧步骤", Source: domain.StepSourceUserInput,
+		CreatedAt: fixture.now, UpdatedAt: fixture.now,
+	}
+	fixture.assertions[14] = domain.CaseAssertion{
+		ID: 14, NodeID: 12, StepID: &stepID, Kind: domain.AssertionKindUI,
+		Expression: "旧断言", Source: domain.NodeSourceUserInput,
+		CreatedAt: fixture.now, UpdatedAt: fixture.now,
+	}
+	fixture.sources[15] = domain.CaseSource{
+		ID: 15, VersionID: runTestVersionID, NodeID: 12, RefKind: domain.RefRequirement,
+		RefID: &requirementID, Source: domain.NodeSourceUserInput, Confidence: domain.ConfidenceHigh,
+		CreatedAt: fixture.now, UpdatedAt: fixture.now,
+	}
+	payload := strings.Replace(runValidDesignPayload(), `"mode": "append"`, `"mode": "replace"`, 1)
+	run := fixture.seedRunningRun(domain.RunKindDesign, payload)
+	run.Input = []byte(`{"mode":"replace","confirmReplace":true}`)
+	fixture.runs[run.ID] = run
+	service := fixture.service()
+
+	if err := service.Materialize(ctx, run.ID); err != nil {
+		t.Fatalf("materialize replace run: %v", err)
+	}
+	if fixture.txCount != 1 {
+		t.Fatalf("InTx calls = %d, want exactly 1", fixture.txCount)
+	}
+	for _, nodeID := range []int64{11, 12} {
+		if _, ok := fixture.nodes[nodeID]; ok {
+			t.Fatalf("draft node %d survived the replace", nodeID)
+		}
+	}
+	if _, ok := fixture.steps[stepID]; ok {
+		t.Fatal("step of a replaced draft survived")
+	}
+	if _, ok := fixture.assertions[14]; ok {
+		t.Fatal("assertion of a replaced draft survived")
+	}
+	if _, ok := fixture.sources[15]; ok {
+		t.Fatal("source of a replaced draft survived")
+	}
+	if len(fixture.nodes) != 2 {
+		t.Fatalf("nodes = %d, want the rematerialized scenario + case", len(fixture.nodes))
+	}
+	if len(fixture.steps) != 1 || len(fixture.assertions) != 1 || len(fixture.sources) != 2 {
+		t.Fatalf("rematerialized rows: steps=%d assertions=%d sources=%d, want 1/1/2",
+			len(fixture.steps), len(fixture.assertions), len(fixture.sources))
+	}
+	for _, node := range fixture.nodes {
+		if node.Source != domain.NodeSourceAIGenerated || node.Status != domain.NodeStatusDraft {
+			t.Fatalf("rematerialized node = %+v, want ai_generated/draft", node)
+		}
+	}
+	if fixture.runs[run.ID].Status != domain.RunDone {
+		t.Fatalf("run status = %q, want done", fixture.runs[run.ID].Status)
 	}
 }
 
