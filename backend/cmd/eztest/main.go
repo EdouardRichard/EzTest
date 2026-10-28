@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -26,6 +27,7 @@ import (
 	codeintelapp "github.com/EdouardRichard/EzTest/backend/internal/codeintel/application"
 	codeinteldomain "github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
 	codeintelaudit "github.com/EdouardRichard/EzTest/backend/internal/codeintel/infrastructure/audit"
+	codeinteldelivery "github.com/EdouardRichard/EzTest/backend/internal/codeintel/infrastructure/delivery"
 	codeinteleventing "github.com/EdouardRichard/EzTest/backend/internal/codeintel/infrastructure/eventing"
 	codeintelgitx "github.com/EdouardRichard/EzTest/backend/internal/codeintel/infrastructure/gitx"
 	codeintelllm "github.com/EdouardRichard/EzTest/backend/internal/codeintel/infrastructure/llm"
@@ -35,6 +37,20 @@ import (
 	codeintelhttp "github.com/EdouardRichard/EzTest/backend/internal/codeintel/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
 	"github.com/EdouardRichard/EzTest/backend/internal/db"
+	deliveryapp "github.com/EdouardRichard/EzTest/backend/internal/delivery/application"
+	deliveryagenttool "github.com/EdouardRichard/EzTest/backend/internal/delivery/application/agent_tool"
+	deliverydomain "github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
+	deliveryagent "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/agent"
+	deliveryaudit "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/audit"
+	deliverycodeintel "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/codeintel"
+	deliveryeventing "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/eventing"
+	deliveryfilestore "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/filestore"
+	deliverymindmap "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/mindmap"
+	deliverypostgres "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/postgres"
+	deliveryrefs "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/refs"
+	deliveryreport "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/report"
+	deliveryversion "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/version"
+	deliveryhttp "github.com/EdouardRichard/EzTest/backend/internal/delivery/interfaces/httpapi"
 	eventingapp "github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
 	eventinginfra "github.com/EdouardRichard/EzTest/backend/internal/eventing/infrastructure"
 	eventpostgres "github.com/EdouardRichard/EzTest/backend/internal/eventing/infrastructure/postgres"
@@ -44,6 +60,8 @@ import (
 	executionagent "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/agent"
 	executionaudit "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/audit"
 	executionbrowser "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/browser"
+	executioncodeintel "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/codeintel"
+	executiondelivery "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/delivery"
 	executioneventing "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/eventing"
 	executionfilestore "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/filestore"
 	executionmindmap "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/mindmap"
@@ -59,6 +77,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/llm/infrastructure/deepseek"
 	llmpostgres "github.com/EdouardRichard/EzTest/backend/internal/llm/infrastructure/postgres"
 	mindmapapp "github.com/EdouardRichard/EzTest/backend/internal/mindmap/application"
+	mindmapsupplementtools "github.com/EdouardRichard/EzTest/backend/internal/mindmap/application/agent_tool"
 	mindmapdomain "github.com/EdouardRichard/EzTest/backend/internal/mindmap/domain"
 	mindmapagent "github.com/EdouardRichard/EzTest/backend/internal/mindmap/infrastructure/agent"
 	mindmapagenttools "github.com/EdouardRichard/EzTest/backend/internal/mindmap/infrastructure/agenttools"
@@ -75,8 +94,10 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/idempotency"
 	resourceapp "github.com/EdouardRichard/EzTest/backend/internal/resource/application"
+	resourceaudit "github.com/EdouardRichard/EzTest/backend/internal/resource/infrastructure/audit"
 	"github.com/EdouardRichard/EzTest/backend/internal/resource/infrastructure/gitexec"
 	"github.com/EdouardRichard/EzTest/backend/internal/resource/infrastructure/httpcheck"
+	"github.com/EdouardRichard/EzTest/backend/internal/resource/infrastructure/pgreadonly"
 	resourcepostgres "github.com/EdouardRichard/EzTest/backend/internal/resource/infrastructure/postgres"
 	resourcehttp "github.com/EdouardRichard/EzTest/backend/internal/resource/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/server"
@@ -84,7 +105,9 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/storage/infrastructure/localfs"
 	storagepostgres "github.com/EdouardRichard/EzTest/backend/internal/storage/infrastructure/postgres"
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
+	versiondomain "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 	versionagent "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/agent"
+	versionaudit "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/audit"
 	versioneventing "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/eventing"
 	versionfilestore "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/filestore"
 	versiongitread "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/gitread"
@@ -123,6 +146,15 @@ const (
 	// creating it eagerly turns a misconfigured EZTEST_EVIDENCE_DIR into a boot
 	// failure. Windows cannot represent the Unix permission bits.
 	executionEvidenceDirPerm os.FileMode = 0o700
+	// deliveryReportDirPerm is the least-privilege mode of the P7 report
+	// Markdown root (spec §6.5/D30). The delivery filestore also creates it on
+	// first use; creating it eagerly turns a misconfigured EZTEST_REPORT_DIR into
+	// a boot failure.
+	deliveryReportDirPerm os.FileMode = 0o700
+	// executionDBAssertPromptRule is the spec §9.1 rule appended idempotently to
+	// an already-seeded execution-agent prompt: db assertions run through the
+	// dedicated tool and the prescribed finish verdicts follow the failure class.
+	executionDBAssertPromptRule = "db 断言必须用 execution.db_assert 执行；连接/权限失败 finish blocked(environment)，SQL/只读/截断错误 finish inconclusive(case)。"
 	// executorHealthTimeout bounds the boot-time executor health warning.
 	executorHealthTimeout = 5 * time.Second
 	// codeIntelWorkerQueueSize is the bounded async-run queue of design spec
@@ -258,6 +290,15 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		httpcheck.NewChecker(), wallClock{})
 	codeRepoService := resourceapp.NewCodeRepoService(
 		resourceCodeRepo, gitexec.NewValidator(), wallClock{})
+	// P7 resource additions (spec §7.8): the administrator-only environment db
+	// target configuration and its read-only prober/querier. The same querier
+	// backs the P6 execution.db_assert adapter below; the audit sink records
+	// resource.db_target.* through the shared P0 audit log.
+	resourceDBTargetRepo := resourcepostgres.NewDBTargetRepository(database.Pool)
+	resourceDBQuerier := pgreadonly.NewQuerier()
+	resourceDBTargetService := resourceapp.NewDBTargetService(
+		resourceDBTargetRepo, resourceCatalogRepo, resourceDBQuerier, snowflake, wallClock{})
+	resourceDBTargetAudit := resourceaudit.NewSink(auditor)
 	resourceHandlers := &resourcehttp.Handlers{
 		Catalog:  resourcehttp.NewCatalogHandler(catalogService),
 		Access:   resourcehttp.NewAccessHandler(accessService),
@@ -265,6 +306,8 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		CodeRepo: resourcehttp.NewCodeRepoHandler(codeRepoService),
 		AuthFlow: resourcehttp.NewAuthFlowHandler(
 			resourceapp.NewAuthFlowService(resourceAuthFlows, resourceCatalogRepo)),
+		DBTarget: resourcehttp.NewDBTargetHandler(
+			resourceDBTargetService, resourcehttp.WithDBTargetAuditSink(resourceDBTargetAudit)),
 	}
 
 	// P3 version context: the PostgreSQL repositories, the cross-context
@@ -289,12 +332,18 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		return fmt.Errorf("set version attachment directory mode on %q: %w", cfg.VersionAttachmentDir, err)
 	}
 	attachmentStore := versionfilestore.New(cfg.VersionAttachmentDir)
+	// P7 version lifecycle audit (spec §11.2): version.continued/completed entries
+	// are recorded through the shared P0 audit log by both the version service
+	// and the requirement paths that can trigger a continuing transition.
+	versionAuditSink := versionaudit.NewSink(auditor)
 	versionService := versionapp.NewVersionService(
 		versionRepo, versionCatalog, versionGit, versionEvents,
-		versionapp.WithIDGenerator(snowflake))
+		versionapp.WithIDGenerator(snowflake),
+		versionapp.WithVersionAuditSink(versionAuditSink))
 	requirementService := versionapp.NewRequirementService(
 		requirementRepo, versionRepo, versionEvents,
-		versionapp.WithRequirementIDGenerator(snowflake))
+		versionapp.WithRequirementIDGenerator(snowflake),
+		versionapp.WithRequirementAuditSink(versionAuditSink))
 	relationService := versionapp.NewRelationService(
 		requirementRepo,
 		versionapp.WithRelationIDGenerator(snowflake),
@@ -423,10 +472,16 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 			MaxChangedFiles: codeinteldomain.MaxChangedFilesStored,
 		},
 	})
+	// P7 issue anchors (spec §7.9): the delivery issue service is built later in
+	// the composition root, so the codeintel issue catalog is bound before the
+	// HTTP server starts. Without it an issue anchor fails loudly instead of
+	// dangling.
+	deliveryIssueCatalog := codeinteldelivery.NewIssueCatalog(nil)
 	codeIntelAnchor := codeintelapp.NewAnchorService(codeintelapp.AnchorServiceDeps{
 		Repos:     codeIntelRepos,
 		Versions:  codeIntelVersions,
 		AppModels: codeIntelRepos,
+		Issues:    deliveryIssueCatalog,
 		Git:       codeIntelGit,
 		Anchors:   codeIntelAnchors,
 		IDs:       snowflake,
@@ -511,6 +566,15 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		return fmt.Errorf("configure mindmap export store (EZTEST_EXPORT_DIR=%q): %w", cfg.ExportDir, err)
 	}
 
+	// P7 cross-context reads (spec §5.3/§6.5): the execution-owned batch and
+	// case-run reads feed the mindmap supplement gates, the delivery report and
+	// failure-analysis readers and the supplement agent tools. They are built
+	// before the mindmap graph service so the parent-batch preconditions are
+	// wired from the first constructed service.
+	executionReads := executiondelivery.NewReadStore(database.Pool)
+	supplementBatches := executionmindmap.NewSupplementBatches(executionReads)
+	mindmapRunByBatch := mindmappostgres.NewRunByBatchReader(database.Pool)
+
 	mindmapGraph := mindmapapp.NewGraphService(mindmapapp.GraphDeps{
 		Graph:        mindmapGraphTx,
 		Nodes:        mindmapNodes,
@@ -521,6 +585,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Versions:     mindmapLifecycle,
 		Requirements: mindmapRequirements,
 		Anchors:      mindmapAnchors,
+		Batches:      supplementBatches,
 		Events:       mindmapEvents,
 		IDs:          snowflake,
 		Clock:        wallClock{},
@@ -613,12 +678,19 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Audit:      executionAudit,
 		Clock:      wallClock{},
 		IDs:        snowflake,
+		// P7 execution.db_assert (spec §9.5): the read-only db target adapter and
+		// the evidence service (db_result capture). Until both are wired the tool
+		// is registered but fails closed.
+		DBQuery:   executionresource.NewDBQuery(resourceDBTargetService, resourceDBQuerier),
+		DBCapture: evidenceService,
 	})
 	var executionAgentRuntime *executionagent.AgentRuntime
 	executionToolSet := executionagenttool.NewToolSet(
 		executionRecorder, executorClient, evidenceService, nil,
 		executionagenttool.Limits{
 			MaxArtifactBytes: int64(cfg.ExecEvidenceMaxBytes),
+			MaxDBResultBytes: int64(cfg.DBResultMaxBytes),
+			MaxDBSQLBytes:    int64(cfg.DBSQLMaxBytes),
 			Session: func(ctx context.Context, caseRunID int64) (executionapp.SessionRef, error) {
 				if executionAgentRuntime == nil {
 					return executionapp.SessionRef{}, errors.New("execution: agent runtime is not bound yet")
@@ -627,6 +699,91 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 			},
 		},
 	)
+
+	// P7 delivery context (spec §5.4/§6.5, D42): the issue/report/analysis
+	// repositories, the cross-context adapters and the analysis worker's ports.
+	// The tool set is registered before NewToolRegistry so the delivery profile
+	// seeds validate against the live registry; the analysis agent runtime needs
+	// the P1 services and is bound after them below.
+	deliveryIssues := deliverypostgres.NewIssueRepository(database.Pool)
+	deliveryReports := deliverypostgres.NewReportRepository(database.Pool)
+	deliveryAnalyses := deliverypostgres.NewAnalysisRepository(database.Pool)
+	if err := os.MkdirAll(cfg.ReportDir, deliveryReportDirPerm); err != nil {
+		return fmt.Errorf("create delivery report directory %q: %w", cfg.ReportDir, err)
+	}
+	if err := os.Chmod(cfg.ReportDir, deliveryReportDirPerm); err != nil {
+		return fmt.Errorf("set delivery report directory mode on %q: %w", cfg.ReportDir, err)
+	}
+	deliveryReportFiles, err := deliveryfilestore.New(cfg.ReportDir)
+	if err != nil {
+		return fmt.Errorf("configure delivery report store (EZTEST_REPORT_DIR=%q): %w", cfg.ReportDir, err)
+	}
+	deliveryIssueEvents := deliveryeventing.NewIssuePublisher(eventService)
+	deliveryReportEvents := deliveryeventing.NewReportPublisher(eventService)
+	deliveryAnalysisEvents := deliveryeventing.NewAnalysisPublisher(eventService)
+	deliveryIssueAudit := deliveryaudit.NewIssueSink(auditor)
+	deliveryReportAudit := deliveryaudit.NewReportSink(auditor)
+	deliveryAnalysisAudit := deliveryaudit.NewAnalysisSink(auditor)
+	deliveryIssueRefs := deliveryrefs.NewValidator(
+		executionQueries, executionBatches, executionEvidence, executionReads,
+		mindmapNodes, requirementService, codeIntelAnchors)
+	deliveryIssueService := deliveryapp.NewIssueService(deliveryapp.IssueServiceDeps{
+		Store:    deliveryIssues,
+		Refs:     deliveryIssueRefs,
+		Versions: deliveryversion.NewIssueVersionReader(versionService),
+		IDs:      snowflake,
+		Clock:    wallClock{},
+		Events:   deliveryIssueEvents,
+		Audit:    deliveryIssueAudit,
+	})
+	// P7 issue code anchors: creation after AI materialization and the read
+	// projections of the issue DTO and the batch report.
+	deliveryCodeAnchors := deliverycodeintel.NewAnchors(codeIntelAnchor)
+	deliveryIssueSources := deliveryreport.NewIssueSources(deliveryIssues, deliveryCodeAnchors)
+	deliveryReportService := deliveryapp.NewReportService(deliveryapp.ReportServiceDeps{
+		Versions: deliveryversion.NewReportVersionReader(versionService),
+		Execution: executiondelivery.NewReportExecution(executionReads,
+			executionresource.NewReportEnvironmentSource(executionVersionPort, catalogService),
+			deliveryAnalyses),
+		Graph:   deliverymindmap.NewReportGraphReader(mindmapGraph, requirementService),
+		Issues:  deliveryIssueSources,
+		Reports: deliveryReports,
+		Files:   deliveryReportFiles,
+		Events:  deliveryReportEvents,
+		Audit:   deliveryReportAudit,
+		IDs:     snowflake,
+		Clock:   wallClock{},
+		Logger:  logger,
+	})
+	// P7 cross-version issue/report centres (spec §7.10, T17b): the delivery-owned
+	// page stores plus the version-name adapter. Both readers share one service;
+	// the HTTP group mounts GET /api/issues and GET /api/reports only when they
+	// are wired (server.New registers the delivery group exactly once).
+	deliveryGlobalStore := deliverypostgres.NewGlobalReadRepository(database.Pool)
+	deliveryGlobalReader := deliveryapp.NewGlobalReaderService(deliveryapp.GlobalReaderDeps{
+		Issues:   deliveryGlobalStore,
+		Reports:  deliveryGlobalStore,
+		Versions: deliveryversion.NewVersionNamesReader(versionService),
+	})
+	// The submission-only analysis service backs the delivery agent tools: the
+	// tool set must be constructed before the P1 run service exists, while the
+	// full service (agent runtime, anchors, events, audit) is assembled after the
+	// P1 services below. Both share the same store, so the split is only a
+	// construction-order concern (no state is duplicated).
+	deliveryAnalysisExecution := executiondelivery.NewAnalysisExecution(executionReads)
+	deliveryAnalysisSubmissions := deliveryapp.NewAnalysisService(deliveryapp.AnalysisDeps{
+		Runs:       deliveryAnalyses,
+		Execution:  deliveryAnalysisExecution,
+		OpenIssues: deliveryIssueSources,
+	})
+	deliveryToolSet := deliveryagenttool.NewTools(deliveryagenttool.ToolDeps{
+		Runs:        deliveryAnalyses,
+		Cases:       deliveryAnalysisExecution,
+		Submissions: deliveryAnalysisSubmissions,
+		Details:     executiondelivery.NewCaseDetail(executionReads),
+		Evidence:    executiondelivery.NewEvidenceMeta(executionReads),
+		Code:        deliverycodeintel.NewCodeRead(versionService, codeIntelQuery),
+	})
 
 	// Agent runtime: the four postgres repositories, the cross-context adapters
 	// (LLM gateway, event sink, audit sink) and the tool registry. The same
@@ -714,6 +871,21 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	// The 15 P6 execution tools are appended before NewToolRegistry so the
 	// execution-agent profile allowlist is validated against the live registry.
 	agentToolList = append(agentToolList, executionToolSet.Tools()...)
+	// The eleven P7 delivery tools (failure analysis and issue triage) are
+	// appended the same way; the submission-only analysis service above backs
+	// them. A missing port disables the whole set, which the profile validation
+	// below reports as an unregistered tool.
+	agentToolList = append(agentToolList, deliveryToolSet...)
+	// The supplement tools (spec §9.2) are registered before the registry so the
+	// supplement-agent seed validates its allowlist against the live registry.
+	agentToolList = append(agentToolList, mindmapsupplementtools.NewTools(mindmapsupplementtools.Deps{
+		Runs:         mindmapRuns,
+		Graphs:       mindmapGraph,
+		Requirements: mindmapRequirements,
+		Impact:       mindmapCodeFacts,
+		Results:      executionmindmap.NewBatchResults(executionReads),
+		Audit:        mindmapAudit,
+	})...)
 	agentRegistry := agentapp.NewToolRegistry(agentToolList...)
 	agentExecutor := agentapp.NewToolExecutor(
 		agentRegistry, agentAuditSink, time.Duration(cfg.AgentToolTimeoutMS)*time.Millisecond)
@@ -739,6 +911,30 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	// Both P1 services exist now; bind them into the P3 adapter before the HTTP
 	// server can accept a clarification request.
 	p1Agents.bind(agentSessionService, runService)
+
+	// P7 delivery agents and the full analysis service. The runtime adapter is
+	// created after the P1 services (it starts scoped agent runs); the full
+	// service adds the agent runtime, the materialization writer, the code
+	// anchors and the event/audit sinks that the submission-only instance above
+	// does not need.
+	deliveryAgentRuntime := deliveryagent.NewAgentRuntime(
+		agentProfileService, agentProfiles, agentSessionService, runService)
+	deliveryAnalysisService := deliveryapp.NewAnalysisService(deliveryapp.AnalysisDeps{
+		Runs:       deliveryAnalyses,
+		Execution:  deliveryAnalysisExecution,
+		Issues:     deliveryIssueService,
+		OpenIssues: deliveryIssueSources,
+		Anchors:    deliveryCodeAnchors,
+		Agents:     deliveryAgentRuntime,
+		Profiles:   deliveryAgentRuntime,
+		Events:     deliveryAnalysisEvents,
+		Audit:      deliveryAnalysisAudit,
+		IDs:        snowflake,
+		Clock:      wallClock{},
+	})
+	// The delivery issue service is bound into the codeintel issue catalog so an
+	// issue anchor validates its subject through the delivery application layer.
+	deliveryIssueCatalog.Bind(deliveryIssueService)
 
 	// P6 execution engine. The agent runtime adapter needs the bound P1
 	// session/run services; its profile seed is validated against the live
@@ -769,6 +965,11 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Browser: executionToolSet,
 		Timeout: time.Duration(cfg.ExecCaseTimeoutMS) * time.Millisecond,
 	})
+	// The autonomous worker is created after the mindmap run service exists (its
+	// supplement segment starts mindmap runs); the scheduler is constructed
+	// earlier, so this holder forwards the batch-terminal signal once the worker
+	// is bound.
+	autonomyTrigger := &autonomyTriggerHolder{}
 	executionScheduler := executionapp.NewScheduler(executionapp.SchedulerDeps{
 		Queue:         executionQueries,
 		Batches:       executionBatches,
@@ -783,6 +984,10 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Browser:       executionToolSet,
 		MaxConcurrent: cfg.ExecMaxConcurrentCases,
 		Tick:          time.Duration(cfg.ExecWorkerIntervalMS) * time.Millisecond,
+		// P7 autonomous chain trigger (spec §5.3/§6.2): the worker itself needs
+		// the mindmap run service, which is constructed after the scheduler, so a
+		// late-bound holder forwards the batch-terminal signal once it is wired.
+		Autonomy: autonomyTrigger,
 	})
 	executionRecovery := executionapp.NewRecovery(executionapp.RecoveryDeps{
 		Queue:    executionQueries,
@@ -826,11 +1031,12 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		time.Now,
 	)
 	// The remaining P5 services. The run coordinator polls the P1 agent runtime
-	// through the mindmap adapter, so it is built once both P1 services exist;
-	// the review, baseline and export services then consume the run coordinator
-	// and the graph repositories.
-	mindmapAgentRuntime := mindmapagent.NewAgentRuntimeAdapter(
-		agentProfileService, agentProfiles, agentSessionService, runService)
+	// through the P7 supplement adapter (it wraps the P5 adapter and starts the
+	// supplement/incremental_design runs scoped), so it is built once both P1
+	// services exist; the review, baseline and export services then consume the
+	// run coordinator and the graph repositories.
+	mindmapSupplementRuntime := mindmapagent.NewSupplementRuntime(
+		agentProfileService, agentProfiles, agentSessionService, runService, mindmapRuns)
 	mindmapRun := mindmapapp.NewRunService(mindmapapp.RunDeps{
 		Runs:         mindmapRuns,
 		Graph:        mindmapGraphTx,
@@ -840,11 +1046,12 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Assertions:   mindmapAssertions,
 		Sources:      mindmapSources,
 		Versions:     mindmapLifecycle,
+		Batches:      supplementBatches,
 		Requirements: mindmapRequirements,
 		Catalog:      mindmapCatalog,
 		CodeFacts:    mindmapCodeFacts,
 		Anchors:      mindmapAnchors,
-		Agents:       mindmapAgentRuntime,
+		Agents:       mindmapSupplementRuntime,
 		Events:       mindmapEvents,
 		IDs:          snowflake,
 		Clock:        wallClock{},
@@ -901,6 +1108,28 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Clock:    wallClock{},
 	})
 
+	// P7 autonomous execution worker (spec §6.2): the durable chain store, the
+	// delivery analysis/report adapters, the mindmap supplement adapter, the P4
+	// impact adapter and the version finalizer. It is constructed before the
+	// seeds and started after them, so the delivery/supplement profiles exist on
+	// the first tick.
+	autonomyWorker := executionapp.NewAutonomyWorker(executionapp.AutonomyWorkerDeps{
+		Store:    executionpostgres.NewAutonomyStore(database.Pool),
+		Versions: executionVersionPort,
+		Analysis: executiondelivery.NewAnalysisPort(deliveryAnalysisService),
+		Reports:  executiondelivery.NewReportPort(deliveryReportService),
+		Supplements: executionmindmap.NewSupplementPort(
+			mindmapRun, executionBatchService, executionMindmapPort, mindmapRunByBatch),
+		Impact:    executioncodeintel.NewImpactPort(codeIntelAnalysis),
+		Finalizer: executionversion.NewFinalizer(versionService),
+		Delivery:  newAutonomyDeliveryPort(deliveryIssueService),
+		Actor:     0,
+		// The spec §16.1 per-tick budget; config validates the 1–20 range and
+		// the worker clamps defensively.
+		BatchesPerTick: cfg.AutonomyBatchesPerTick,
+	})
+	autonomyTrigger.worker = autonomyWorker
+
 	// Startup seeds and cleanup are idempotent: the builtin profile is created
 	// only when its key is absent (an existing, possibly edited row is never
 	// overwritten) and runs left running by a previous process are marked
@@ -913,7 +1142,12 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	if err := ensureP3Profiles(startupCtx, agentProfiles, agentRegistry, logger); err != nil {
 		return err
 	}
-	if err := ensureP5Profiles(startupCtx, mindmapAgentRuntime, agentRegistry, logger); err != nil {
+	if err := ensureP5Profiles(startupCtx, mindmapSupplementRuntime, agentRegistry, logger); err != nil {
+		return err
+	}
+	// The P7 supplement-agent profile is seeded after the P5 profiles: it is the
+	// profile both supplement run kinds start on (spec §9.1/§9.2).
+	if err := ensureSupplementProfile(startupCtx, mindmapSupplementRuntime, agentRegistry, logger); err != nil {
 		return err
 	}
 	// The execution profile is seeded last, after the builtin and P3/P5 seeds, so
@@ -921,6 +1155,17 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	// ConfigPane edits the first row, which must stay the builtin profile that
 	// agent sessions actually run on.
 	if err := ensureExecutionProfile(startupCtx, executionAgentRuntime, agentRegistry, logger); err != nil {
+		return err
+	}
+	// P7 idempotent upgrade of the already-seeded execution profile: add
+	// execution.db_assert to the allowlist and the db-assert rule to the prompt
+	// only when they are missing, so administrator edits are preserved.
+	if err := ensureExecutionDBAssert(startupCtx, agentProfileService, logger); err != nil {
+		return err
+	}
+	// The two delivery agent profiles (failure analysis, issue triage) are seeded
+	// after the other seeds; EnsureBuiltin only inserts a missing key.
+	if err := ensureDeliveryProfiles(startupCtx, deliveryAgentRuntime, agentRegistry, logger); err != nil {
 		return err
 	}
 	if recovered, err := runService.RecoverInterrupted(startupCtx); err != nil {
@@ -956,6 +1201,27 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		}
 	}
 	defer stopExecutionWorkerOnce.Do(stopExecutionWorker)
+
+	// P7 in-process workers. The delivery analysis worker polls its agent
+	// sessions every 2s and recovers the previous process's stale analysis runs
+	// synchronously before the first tick (spec §6.7/§5.6). The autonomous
+	// execution worker advances the batch chains started by the scheduler above.
+	// Both stop before database.Close (registered earlier) but after the HTTP
+	// server drained; they run on detached contexts so an in-flight advance can
+	// persist its terminal state.
+	p7WorkersCtx, cancelP7Workers := context.WithCancel(context.Background())
+	deliveryAnalysisService.Worker(p7WorkersCtx)
+	go autonomyWorker.Start(p7WorkersCtx)
+	// stopP7Workers stops the delivery analysis poller and the autonomous worker
+	// before the P1 run service shuts down: both poll/cancel agent sessions, so
+	// cancelling them after the run service would race the shutdown (the same
+	// ordering rule as the execution scheduler). It is idempotent because both
+	// the signal path and the deferred fallback call it.
+	var stopP7WorkersOnce sync.Once
+	stopP7Workers := func() {
+		stopP7WorkerLoops(cancelP7Workers, autonomyWorker, deliveryAnalysisService)
+	}
+	defer stopP7WorkersOnce.Do(stopP7Workers)
 
 	// The P5 run coordinator is a single in-process worker: it polls the agent
 	// sessions every 2 s (spec §8.4) and first fails the runs a previous process
@@ -1040,6 +1306,18 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Audit:           executionAudit,
 		SessionInfo:     executionSessionInfo{sessions: sessionService, accounts: accessService},
 	})
+	// P7 delivery handler group: issues, reports, analysis runs, the manual
+	// analysis endpoints and the cross-version issue/report centres.
+	deliveryHandlers := deliveryhttp.NewHandlers(deliveryhttp.HandlerDeps{
+		Issues:        deliveryIssueService,
+		IssueRefs:     deliveryIssueService,
+		IssueCodeRefs: deliveryIssueCodeRefs{anchors: deliveryCodeAnchors},
+		Reports:       deliveryReportService,
+		Analyses:      manualAnalysisService{analyses: deliveryAnalysisService, worker: autonomyWorker, versions: versionService, logger: logger},
+		Batches:       executionBatchService,
+		GlobalIssues:  deliveryGlobalReader,
+		GlobalReports: deliveryGlobalReader,
+	})
 	cancelStartup()
 
 	// Every request context descends from baseCtx. Canceling it on shutdown
@@ -1072,6 +1350,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 			CodeIntel: codeIntelHandler,
 			Mindmap:   mindmapHandler,
 			Execution: executionHandlers,
+			Delivery:  deliveryHandlers,
 		}),
 		BaseContext:       baseContext(baseCtx),
 		ReadHeaderTimeout: 10 * time.Second,
@@ -1106,6 +1385,11 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		// would classify the abort as a case outcome (spec §5.12 invariant 7).
 		logger.Info("stopping execution scheduler")
 		stopExecutionWorkerOnce.Do(stopExecutionWorker)
+		// Stop the P7 workers (delivery analysis poller and autonomous chain)
+		// before the Agent run service: they read/cancel agent sessions and must
+		// observe the shutdown first, like the scheduler above.
+		logger.Info("stopping P7 workers")
+		stopP7WorkersOnce.Do(stopP7Workers)
 		// Cancel and drain the Agent runs before the HTTP server: their runners
 		// write terminal rows and activity events with a detached context, so a
 		// short bounded wait lets them finish cleanly.
@@ -1399,4 +1683,282 @@ func codeIntelLLMCompleter(gateway codeintelapp.LLMCompleter, err error, logger 
 		return nil
 	}
 	return gateway
+}
+
+// autonomyTriggerHolder late-binds the autonomous worker into the scheduler.
+// The scheduler is constructed before the mindmap run service, while the worker
+// needs that service's supplement segment; the holder forwards the batch
+// terminal signal once the worker is bound. A nil worker degrades exactly like a
+// nil scheduler trigger: the chain still advances on the worker's next tick.
+type autonomyTriggerHolder struct {
+	worker *executionapp.AutonomyWorker
+}
+
+var _ executionapp.AutonomyTrigger = (*autonomyTriggerHolder)(nil)
+
+// OnBatchTerminal implements executionapp.AutonomyTrigger.
+func (h *autonomyTriggerHolder) OnBatchTerminal(ctx context.Context, batch executiondomain.RunBatch) {
+	if h == nil || h.worker == nil {
+		return
+	}
+	h.worker.OnBatchTerminal(ctx, batch)
+}
+
+// newAutonomyDeliveryPort binds the execution worker's requirement-gap
+// escalation port (T17a, spec §6.4.4) to the delivery issue service. The
+// delivery issue service validates the target version (T2b) and persists the
+// requirement_gap issues; keeping the construction in a helper pins the
+// composition-root adapter contract in the wiring tests.
+func newAutonomyDeliveryPort(issues executiondelivery.RequirementGapWriter) executionapp.DeliveryPort {
+	return executiondelivery.NewRequirementGapIssues(issues)
+}
+
+// p7WorkerStopper is the stop surface of the P7 background loops.
+type p7WorkerStopper interface {
+	Stop()
+}
+
+// stopP7WorkerLoops cancels the shared P7 worker context and then stops the
+// autonomy and delivery-analysis loops. It is called before
+// runService.Shutdown: both loops read/cancel agent sessions, so cancelling
+// them after the run service would race the shutdown (the T17a fix). Kept as a
+// function so the stop contract (cancel first, both loops stopped, nil-safe) is
+// unit-tested; main wraps it in sync.Once because the signal path and the
+// deferred fallback both call it.
+func stopP7WorkerLoops(cancel context.CancelFunc, autonomy, analysis p7WorkerStopper) {
+	if cancel != nil {
+		cancel()
+	}
+	if autonomy != nil {
+		autonomy.Stop()
+	}
+	if analysis != nil {
+		analysis.Stop()
+	}
+}
+
+// deliveryIssueCodeRefs adapts the delivery code-anchor projection to the HTTP
+// consumer port. The adapter lives in the composition root because the HTTP
+// layer's DTO type belongs to the interface package while the anchor read is an
+// infrastructure adapter.
+type deliveryIssueCodeRefs struct {
+	anchors *deliverycodeintel.Anchors
+}
+
+var _ deliveryhttp.IssueCodeRefReader = deliveryIssueCodeRefs{}
+
+// ListIssueCodeRefs implements delivery/interfaces/httpapi.IssueCodeRefReader.
+func (a deliveryIssueCodeRefs) ListIssueCodeRefs(ctx context.Context, versionID, issueID int64) ([]deliveryhttp.IssueCodeRef, error) {
+	if a.anchors == nil {
+		return nil, errors.New("delivery: code anchor reader is not configured")
+	}
+	refs, err := a.anchors.ListIssueCodeRefs(ctx, versionID, issueID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]deliveryhttp.IssueCodeRef, 0, len(refs))
+	for _, ref := range refs {
+		out = append(out, deliveryhttp.IssueCodeRef{
+			AnchorID: ref.AnchorID,
+			Path:     ref.Path,
+			Line:     ref.Line,
+			Kind:     ref.Kind,
+			Label:    ref.Label,
+		})
+	}
+	return out, nil
+}
+
+// profilePatcher is the P1 profile service slice the idempotent P7 profile
+// upgrade needs; *agent/application.ProfileService satisfies it.
+type profilePatcher interface {
+	GetByKey(ctx context.Context, key string) (agentdomain.AgentProfile, error)
+	Update(ctx context.Context, id int64, params agentdomain.UpdateParams, actor *int64) (agentdomain.AgentProfile, error)
+}
+
+// ensureExecutionDBAssert idempotently upgrades an already-seeded execution-agent
+// profile (spec §9.1): it appends execution.db_assert to the tool allowlist and
+// the db-assert rule to the system prompt only when they are missing. The
+// administrator's other edits (prompt text, model, budgets) are preserved because
+// the update carries only the fields that actually changed.
+func ensureExecutionDBAssert(ctx context.Context, profiles profilePatcher, logger *slog.Logger) error {
+	if profiles == nil {
+		return errors.New("P7 execution db_assert profile patch: the profile service is not configured")
+	}
+	seed := executiondomain.ExecutionProfile()
+	stored, err := profiles.GetByKey(ctx, seed.Key)
+	if err != nil {
+		return fmt.Errorf("P7 execution db_assert profile patch: read profile %q: %w", seed.Key, err)
+	}
+	params := agentdomain.UpdateParams{}
+	if !containsString(stored.AllowedTools, executiondomain.ExecutionDBAssertTool) {
+		allowedTools := append(append([]string(nil), stored.AllowedTools...),
+			executiondomain.ExecutionDBAssertTool)
+		params.AllowedTools = &allowedTools
+	}
+	if !strings.Contains(stored.SystemPrompt, executiondomain.ExecutionDBAssertTool) {
+		prompt := strings.TrimRight(stored.SystemPrompt, "\n")
+		if prompt == "" {
+			prompt = executionDBAssertPromptRule
+		} else {
+			prompt += "\n" + executionDBAssertPromptRule
+		}
+		params.SystemPrompt = &prompt
+	}
+	if params.AllowedTools == nil && params.SystemPrompt == nil {
+		return nil
+	}
+	if _, err := profiles.Update(ctx, stored.ID, params, nil); err != nil {
+		return fmt.Errorf("P7 execution db_assert profile patch: update profile %q: %w", seed.Key, err)
+	}
+	logger.Info("patched P6 execution profile for db assertions", "key", seed.Key)
+	return nil
+}
+
+// ensureSupplementProfile seeds the P7 supplement-agent profile (spec §9.1/§9.2)
+// and validates its allowlist against the live registry before the first insert.
+// EnsureProfile only inserts a missing key, so administrator edits survive a
+// restart.
+func ensureSupplementProfile(ctx context.Context, runtime mindmapapp.AgentRuntime, registry *agentapp.ToolRegistry, logger *slog.Logger) error {
+	seed := mindmapdomain.SupplementProfile()
+	if registry == nil {
+		return fmt.Errorf("P7 supplement profile %q cannot be validated: the tool registry is not configured", seed.Key)
+	}
+	if err := mindmapsupplementtools.ValidateTools(registry); err != nil {
+		return fmt.Errorf("P7 supplement profile %q: %w", seed.Key, err)
+	}
+	if err := runtime.EnsureProfile(ctx, seed); err != nil {
+		return fmt.Errorf("seed P7 supplement profile %q: %w", seed.Key, err)
+	}
+	logger.Debug("ensured P7 supplement agent profile", "key", seed.Key)
+	return nil
+}
+
+// ensureDeliveryProfiles validates and seeds the two P7 delivery agent profiles
+// (failure analysis, issue triage): a profile that allows an unregistered tool
+// fails the startup loudly instead of silently offering fewer tools. EnsureBuiltin
+// only inserts a missing key, so an administrator-edited row is never overwritten.
+func ensureDeliveryProfiles(ctx context.Context, runtime *deliveryagent.AgentRuntime, registry *agentapp.ToolRegistry, logger *slog.Logger) error {
+	if registry == nil {
+		return fmt.Errorf("P7 delivery agent profiles cannot be validated: the tool registry is not configured")
+	}
+	if err := deliveryagenttool.ValidateTools(registry); err != nil {
+		return fmt.Errorf("P7 delivery agent profiles: %w", err)
+	}
+	if err := runtime.EnsureProfiles(ctx); err != nil {
+		return fmt.Errorf("seed P7 delivery agent profiles: %w", err)
+	}
+	logger.Debug("ensured P7 delivery agent profiles", "count", len(deliverydomain.AnalysisProfiles()))
+	return nil
+}
+
+// deliveryAnalysisSurface is the manual-analysis read/write surface the delivery
+// HTTP handler consumes; *delivery/application.AnalysisService satisfies it.
+type deliveryAnalysisSurface interface {
+	StartFailure(ctx context.Context, versionID, batchID, actor int64) (deliverydomain.AnalysisRun, error)
+	Get(ctx context.Context, versionID, batchID, analysisID int64) (deliverydomain.AnalysisRun, error)
+	List(ctx context.Context, versionID, batchID int64) ([]deliverydomain.AnalysisRun, error)
+}
+
+// chainResetter reopens a settled autonomous batch chain; the P7 autonomy worker
+// implements it. A manual failure analysis on an already settled chain must make
+// the worker re-enter the batch (spec §6.2/§7.5).
+type chainResetter interface {
+	ResetAutonomyDone(ctx context.Context, batchID int64) (bool, error)
+}
+
+// versionStatusReader reads the owning version before the manual-analysis reset.
+// *version/application.VersionService satisfies it.
+type versionStatusReader interface {
+	Get(ctx context.Context, id int64) (*versionapp.Version, error)
+}
+
+// manualAnalysisService wraps the delivery analysis service for the HTTP manual
+// analysis endpoint: a successful manual start reopens the batch's settled
+// autonomy chain so the worker triages the fresh candidates and re-checks the
+// report. A reset failure is only logged: the analysis run itself is committed
+// and stays processable by the analysis worker.
+//
+// A completed version is terminal/immutable (Lead ruling): the manual run is
+// still created, but autonomy_done is never reset for it, so a settled chain of
+// a completed version cannot be reopened by a manual action.
+type manualAnalysisService struct {
+	analyses deliveryAnalysisSurface
+	worker   chainResetter
+	versions versionStatusReader
+	logger   *slog.Logger
+}
+
+var _ deliveryhttp.AnalysisService = manualAnalysisService{}
+
+// StartFailure implements delivery/interfaces/httpapi.AnalysisService.
+func (m manualAnalysisService) StartFailure(ctx context.Context, versionID, batchID, actor int64) (deliverydomain.AnalysisRun, error) {
+	run, err := m.analyses.StartFailure(ctx, versionID, batchID, actor)
+	if err != nil {
+		return run, err
+	}
+	if m.worker != nil && m.chainReopenAllowed(ctx, versionID) {
+		if _, resetErr := m.worker.ResetAutonomyDone(ctx, batchID); resetErr != nil {
+			m.loggerOrDefault().WarnContext(ctx, "manual analysis could not reopen the autonomy chain",
+				"batch_id", batchID, "version_id", versionID, "error", resetErr)
+		}
+	}
+	return run, nil
+}
+
+// chainReopenAllowed reports whether the settled autonomy chain should be
+// reopened for a manual analysis run. It fails closed when the version status
+// cannot be read and never reopens a completed (terminal/immutable) version.
+func (m manualAnalysisService) chainReopenAllowed(ctx context.Context, versionID int64) bool {
+	logger := m.loggerOrDefault()
+	if m.versions == nil {
+		logger.WarnContext(ctx, "manual analysis left the autonomy chain settled: the version reader is not configured",
+			"version_id", versionID)
+		return false
+	}
+	version, err := m.versions.Get(ctx, versionID)
+	if err != nil {
+		logger.WarnContext(ctx, "manual analysis left the autonomy chain settled: could not read the version status",
+			"version_id", versionID, "error", err)
+		return false
+	}
+	if version == nil {
+		logger.WarnContext(ctx, "manual analysis left the autonomy chain settled: the version reader returned no version",
+			"version_id", versionID)
+		return false
+	}
+	if version.Status == versiondomain.VersionCompleted {
+		logger.InfoContext(ctx, "manual analysis on a completed version left the autonomy chain settled",
+			"version_id", versionID)
+		return false
+	}
+	return true
+}
+
+// loggerOrDefault returns the configured logger or the process default.
+func (m manualAnalysisService) loggerOrDefault() *slog.Logger {
+	if m.logger != nil {
+		return m.logger
+	}
+	return slog.Default()
+}
+
+// Get implements delivery/interfaces/httpapi.AnalysisService.
+func (m manualAnalysisService) Get(ctx context.Context, versionID, batchID, analysisID int64) (deliverydomain.AnalysisRun, error) {
+	return m.analyses.Get(ctx, versionID, batchID, analysisID)
+}
+
+// List implements delivery/interfaces/httpapi.AnalysisService.
+func (m manualAnalysisService) List(ctx context.Context, versionID, batchID int64) ([]deliverydomain.AnalysisRun, error) {
+	return m.analyses.List(ctx, versionID, batchID)
+}
+
+// containsString reports whether values contains want.
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
