@@ -27,6 +27,17 @@ const (
 	AcquisitionImported = "imported"
 )
 
+// Login outcomes reported by an auto-login browser port (spec §5.9). The
+// adapter decides which outcome a page state maps to; the service owns the
+// resulting session transition.
+const (
+	LoginOutcomeValid       = "valid"
+	LoginOutcomeMFA         = "mfa"
+	LoginOutcomeCaptcha     = "captcha"
+	LoginOutcomeInvalid     = "invalid"
+	LoginOutcomeUnreachable = "unreachable"
+)
+
 // Storage state kinds stored in session.storage_state_kind.
 const (
 	StorageStateKindStorageState = "storage_state"

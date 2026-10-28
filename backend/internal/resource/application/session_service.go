@@ -53,6 +53,13 @@ type SessionService struct {
 	systems      domain.SystemRepository
 	checker      LoginChecker
 	clock        Clock
+
+	// Optional auto-login dependencies wired by ConfigureAcquisition (spec
+	// §5.9). A service without them only reuses valid sessions.
+	flows    domain.AuthFlowRepository
+	login    LoginBrowser
+	accounts domain.AccountRepository
+	flights  acquisitionFlights
 }
 
 // ImportSessionInput is the create-session request. Headers carries the token
