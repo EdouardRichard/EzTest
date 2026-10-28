@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"encoding/json"
+	"strconv"
 	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
@@ -191,6 +192,37 @@ type sessionPage struct {
 	Items      []sessionPayload `json:"items"`
 	HasMore    bool             `json:"has_more"`
 	NextCursor *string          `json:"next_cursor"`
+}
+
+// channelSessionPayload is one row of the P6 channel-filtered session list
+// (GET /api/agents/sessions?channel=...). The execution IDs are decimal strings
+// per design spec §5.12 item 9. status is "running" while the session has an
+// active run, otherwise the last run's status, or "idle" when it has no runs.
+type channelSessionPayload struct {
+	ID      string `json:"id"`
+	Channel string `json:"channel"`
+	Title   string `json:"title"`
+	Status  string `json:"status"`
+	Running bool   `json:"running"`
+}
+
+// newChannelSessionPayload maps one session and its run detail to the channel
+// payload.
+func newChannelSessionPayload(session domain.Session, running bool, status string) channelSessionPayload {
+	return channelSessionPayload{
+		ID:      strconv.FormatInt(session.ID, 10),
+		Channel: session.ActivityChannel,
+		Title:   session.Title,
+		Status:  status,
+		Running: running,
+	}
+}
+
+// channelSessionPage is the list body of the channel-filtered session query.
+type channelSessionPage struct {
+	Items      []channelSessionPayload `json:"items"`
+	HasMore    bool                    `json:"has_more"`
+	NextCursor *string                 `json:"next_cursor"`
 }
 
 // updateProfileRequest is the PATCH /api/agents/profiles/{id} body. Only the ten

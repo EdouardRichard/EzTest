@@ -173,15 +173,31 @@ func (h *Handler) ListTools(w http.ResponseWriter, r *http.Request) {
 	}{Data: items})
 }
 
+// sessionChannelLister is the additive P6 session query. It stays an optional
+// interface so P1–P5 SessionService implementations (and their fakes) keep
+// working; the application *SessionService implements it.
+type sessionChannelLister interface {
+	ListByChannel(ctx context.Context, channel string, beforeSeq int64, limit int) ([]domain.Session, bool, error)
+}
+
 // ListSessions returns one cursor-paged session list. The page body is
 // {"data":{"items":[...],"has_more":bool,"next_cursor":"<opaque id>"}}.
+//
+// With ?channel=<value> the endpoint returns the P6 channel-filtered list
+// (decimal string ids, id/channel/title/status/running). Without it the P1
+// unfiltered list is unchanged.
 func (h *Handler) ListSessions(w http.ResponseWriter, r *http.Request) {
-	limit, err := platform.ParseLimit(r.URL.Query().Get("limit"))
+	query := r.URL.Query()
+	if query.Has("channel") {
+		h.listSessionsByChannel(w, r)
+		return
+	}
+	limit, err := platform.ParseLimit(query.Get("limit"))
 	if err != nil {
 		platform.WriteError(w, r, http.StatusBadRequest, platform.CodeInvalidArgument, "invalid limit")
 		return
 	}
-	cursor, err := platform.DecodeCursor(r.URL.Query().Get("cursor"))
+	cursor, err := platform.DecodeCursor(query.Get("cursor"))
 	if err != nil {
 		platform.WriteError(w, r, http.StatusBadRequest, platform.CodeInvalidArgument, "invalid cursor")
 		return
@@ -207,6 +223,75 @@ func (h *Handler) ListSessions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, struct {
 		Data sessionPage `json:"data"`
 	}{Data: page})
+}
+
+// listSessionsByChannel serves the P6 channel-filtered session page. channel is
+// required; an explicit empty value is a request error rather than the P1 list.
+// The run projection (status/running) comes from the session detail lookup, so a
+// session whose newest run finished reports that status.
+func (h *Handler) listSessionsByChannel(w http.ResponseWriter, r *http.Request) {
+	channel := strings.TrimSpace(r.URL.Query().Get("channel"))
+	if channel == "" {
+		platform.WriteError(w, r, http.StatusUnprocessableEntity, platform.CodeInvalidArgument,
+			"channel must not be empty", platform.WithDetails(map[string]any{"field": "channel"}))
+		return
+	}
+	limit, err := platform.ParseLimit(r.URL.Query().Get("limit"))
+	if err != nil {
+		platform.WriteError(w, r, http.StatusBadRequest, platform.CodeInvalidArgument, "invalid limit")
+		return
+	}
+	cursor, err := platform.DecodeCursor(r.URL.Query().Get("cursor"))
+	if err != nil {
+		platform.WriteError(w, r, http.StatusBadRequest, platform.CodeInvalidArgument, "invalid cursor")
+		return
+	}
+	lister, ok := h.sessions.(sessionChannelLister)
+	if !ok {
+		writeInternalError(w, r)
+		return
+	}
+	sessions, hasMore, err := lister.ListByChannel(r.Context(), channel, cursor, limit)
+	if err != nil {
+		writeInternalError(w, r)
+		return
+	}
+	items := make([]channelSessionPayload, len(sessions))
+	for i, session := range sessions {
+		running, status := false, "idle"
+		detail, detailErr := h.sessions.Get(r.Context(), session.ID)
+		switch {
+		case detailErr == nil:
+			running = detail.Running
+			status = channelSessionStatus(detail)
+		case errors.Is(detailErr, domain.ErrNotFound):
+		default:
+			writeInternalError(w, r)
+			return
+		}
+		items[i] = newChannelSessionPayload(session, running, status)
+	}
+	page := channelSessionPage{Items: items, HasMore: hasMore}
+	if hasMore && len(sessions) > 0 {
+		next := platform.EncodeCursor(sessions[len(sessions)-1].ID)
+		page.NextCursor = &next
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Data channelSessionPage `json:"data"`
+	}{Data: page})
+}
+
+// channelSessionStatus returns the channel payload's status: running while the
+// session has an active run, otherwise its newest terminal run status, or
+// "idle" when it has no runs yet.
+func channelSessionStatus(detail domain.SessionDetail) string {
+	if detail.Running {
+		return "running"
+	}
+	if detail.LastRun != nil {
+		return string(detail.LastRun.Status)
+	}
+	return "idle"
 }
 
 // CreateSession creates a session on the requested profile, or on the builtin

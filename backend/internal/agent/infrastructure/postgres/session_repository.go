@@ -21,6 +21,9 @@ type SessionRepository struct {
 	pool *pgxpool.Pool
 }
 
+// SessionRepository also serves the additive P6 channel query.
+var _ agent.ChannelSessionRepository = (*SessionRepository)(nil)
+
 // NewSessionRepository returns a session repository backed by pool.
 func NewSessionRepository(pool *pgxpool.Pool) *SessionRepository {
 	return &SessionRepository{pool: pool}
@@ -216,6 +219,46 @@ func (r *SessionRepository) List(ctx context.Context, cursor int64, limit int, p
 		summaries = summaries[:limit]
 	}
 	return summaries, hasMore, nil
+}
+
+// ListByChannel returns the sessions stamped with one activity channel. The
+// page is ordered by updated_at DESC, id DESC and a positive beforeSeq resumes
+// strictly after the row with that id, using its (updated_at, id) pair as the
+// keyset cursor. The partial activity_channel index backs the filter.
+func (r *SessionRepository) ListByChannel(ctx context.Context, channel string, beforeSeq int64, limit int) ([]agent.Session, bool, error) {
+	if limit <= 0 {
+		return nil, false, fmt.Errorf("postgres: list agent sessions by channel: limit must be positive")
+	}
+	query := sessionSelect + `
+	WHERE s.activity_channel = $1
+	  AND ($2 = 0 OR (s.updated_at, s.id) < (
+		SELECT c.updated_at, c.id FROM agent_session c WHERE c.id = $2
+	  ))
+	ORDER BY s.updated_at DESC, s.id DESC
+	LIMIT $3`
+
+	rows, err := r.pool.Query(ctx, query, channel, beforeSeq, limit+1)
+	if err != nil {
+		return nil, false, fmt.Errorf("postgres: list agent sessions by channel: %w", err)
+	}
+	defer rows.Close()
+
+	sessions := make([]agent.Session, 0, limit+1)
+	for rows.Next() {
+		session, scanErr := scanSession(rows)
+		if scanErr != nil {
+			return nil, false, fmt.Errorf("postgres: scan agent session: %w", scanErr)
+		}
+		sessions = append(sessions, session)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("postgres: list agent sessions by channel: %w", err)
+	}
+	hasMore := len(sessions) > limit
+	if hasMore {
+		sessions = sessions[:limit]
+	}
+	return sessions, hasMore, nil
 }
 
 // Create inserts a session with the P1 defaults (no activity channel). It

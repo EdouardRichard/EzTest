@@ -36,6 +36,20 @@ type SessionRepository interface {
 	Delete(ctx context.Context, id int64) error
 }
 
+// ChannelSessionRepository is the additive P6 query over sessions stamped with
+// an activity channel (agent_session.activity_channel). It is a separate port so
+// P1–P5 SessionRepository implementations stay valid; the postgres repository
+// implements both.
+type ChannelSessionRepository interface {
+	// ListByChannel returns up to limit sessions whose activity_channel equals
+	// channel, ordered by updated_at DESC, id DESC. A positive beforeSeq is the
+	// id of the last row of the previous page; the query resumes strictly after
+	// that row's (updated_at, id) pair so inserts and updates cannot reorder the
+	// remaining pages. hasMore reports whether another row exists after the
+	// returned page.
+	ListByChannel(ctx context.Context, channel string, beforeSeq int64, limit int) ([]Session, bool, error)
+}
+
 // RunRepository is the persistence port for agent runs.
 type RunRepository interface {
 	// CreateTurn atomically inserts a running run, its user message and
