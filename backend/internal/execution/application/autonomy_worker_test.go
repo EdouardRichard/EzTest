@@ -31,6 +31,7 @@ type autoWorld struct {
 	supplements *autoSupplements
 	impact      *autoImpact
 	finalizer   *autoFinalizer
+	delivery    *autoDelivery
 	deps        AutonomyWorkerDeps
 	worker      *AutonomyWorker
 }
@@ -45,6 +46,7 @@ func newAutoWorld(t *testing.T) *autoWorld {
 		supplements: &autoSupplements{},
 		impact:      &autoImpact{},
 		finalizer:   &autoFinalizer{},
+		delivery:    &autoDelivery{},
 	}
 	world.store.seed(domain.RunBatch{
 		ID:         autoBatchID,
@@ -65,6 +67,7 @@ func newAutoWorld(t *testing.T) *autoWorld {
 		Supplements:    world.supplements,
 		Impact:         world.impact,
 		Finalizer:      world.finalizer,
+		Delivery:       world.delivery,
 		Actor:          7,
 		BatchesPerTick: 4,
 	}
@@ -536,6 +539,28 @@ func (s *autoSupplements) MarkNodesMerged(ctx context.Context, versionID int64, 
 	return s.markMergedErr
 }
 
+// autoDelivery is an in-memory DeliveryPort: it records the requirement-gap
+// escalation materialization and can fail it to prove the worker degrades.
+type autoDelivery struct {
+	calls           int
+	err             error
+	lastVersionID   int64
+	lastBatchID     int64
+	lastActor       int64
+	lastEscalations []RequirementGapEscalation
+}
+
+func (d *autoDelivery) CreateRequirementGapIssues(_ context.Context, versionID, batchID int64,
+	escalations []RequirementGapEscalation, actor int64) (int, error) {
+	d.calls++
+	d.lastVersionID, d.lastBatchID, d.lastActor = versionID, batchID, actor
+	d.lastEscalations = append([]RequirementGapEscalation(nil), escalations...)
+	if d.err != nil {
+		return 0, d.err
+	}
+	return len(escalations), nil
+}
+
 // autoImpact is an in-memory CodeImpactPort.
 type autoImpact struct {
 	latest     *ImpactView
@@ -945,6 +970,93 @@ func TestAutonomySupplementFailureFinishes(t *testing.T) {
 	}
 }
 
+func TestAutonomySupplementEscalationsCreateIssues(t *testing.T) {
+	world := newAutoWorld(t)
+	world.seedReadyChain()
+	world.mutateBatch(func(batch *domain.RunBatch) {
+		batch.SupplementAttempted = true
+		batch.CreatedBy = 42
+	})
+	world.supplements.run = &SupplementRunView{
+		ID: 55, Kind: AutonomyRunKindSupplement, Status: AutonomyStatusDone,
+		Escalations: []RequirementGapEscalation{{
+			Title:          "Missing refund requirement",
+			Detail:         "no requirement covers partial refunds",
+			RequirementIDs: []int64{21, 22},
+		}},
+	}
+
+	world.runOnce(t)
+
+	if world.delivery.calls != 1 {
+		t.Fatalf("CreateRequirementGapIssues calls = %d, want 1", world.delivery.calls)
+	}
+	if world.delivery.lastVersionID != autoVersionID || world.delivery.lastBatchID != autoBatchID ||
+		world.delivery.lastActor != 42 {
+		t.Fatalf("escalation scope = version %d batch %d actor %d, want %d/%d/42",
+			world.delivery.lastVersionID, world.delivery.lastBatchID, world.delivery.lastActor,
+			autoVersionID, autoBatchID)
+	}
+	if len(world.delivery.lastEscalations) != 1 ||
+		world.delivery.lastEscalations[0].Title != "Missing refund requirement" ||
+		len(world.delivery.lastEscalations[0].RequirementIDs) != 2 {
+		t.Fatalf("escalations=%+v want the stored requirement gap", world.delivery.lastEscalations)
+	}
+	if world.store.markDoneCalls != 1 || world.finalizer.tryCalls != 1 {
+		t.Fatalf("markDone=%d finalize=%d want the chain settled after materializing",
+			world.store.markDoneCalls, world.finalizer.tryCalls)
+	}
+}
+
+func TestAutonomySupplementEscalationFailureDoesNotWedge(t *testing.T) {
+	world := newAutoWorld(t)
+	world.seedReadyChain()
+	world.mutateBatch(func(batch *domain.RunBatch) { batch.SupplementAttempted = true })
+	world.supplements.run = &SupplementRunView{
+		ID: 55, Kind: AutonomyRunKindSupplement, Status: AutonomyStatusDone,
+		Escalations: []RequirementGapEscalation{{Title: "gap", RequirementIDs: []int64{21}}},
+	}
+	world.delivery.err = errors.New("delivery store unavailable")
+
+	if err := world.worker.RunOnce(context.Background()); err != nil {
+		t.Fatalf("a failed escalation materialization must degrade, not wedge: %v", err)
+	}
+	if world.delivery.calls != 1 {
+		t.Fatalf("CreateRequirementGapIssues calls = %d, want 1", world.delivery.calls)
+	}
+	if world.store.markDoneCalls != 1 || world.finalizer.tryCalls != 1 {
+		t.Fatalf("markDone=%d finalize=%d want the chain settled despite the delivery error",
+			world.store.markDoneCalls, world.finalizer.tryCalls)
+	}
+}
+
+func TestAutonomyIncrementalDesignEscalationsCreateIssuesOnce(t *testing.T) {
+	world := newAutoWorld(t)
+	parent := world.seedDesigning()
+	parent.CreatedBy = 42
+	world.supplements.run = &SupplementRunView{
+		ID: 56, Kind: AutonomyRunKindIncrementalDesign, Status: AutonomyStatusDone,
+		Escalations: []RequirementGapEscalation{{Title: "gap", RequirementIDs: []int64{21}}},
+	}
+
+	world.runOnce(t)
+	if world.delivery.calls != 1 || world.delivery.lastBatchID != autoParentID ||
+		world.delivery.lastActor != 42 {
+		t.Fatalf("design escalation calls=%d scope=%d/%d want one call for parent %d by 42",
+			world.delivery.calls, world.delivery.lastVersionID, world.delivery.lastBatchID, autoParentID)
+	}
+	if world.finalizer.tryCalls != 0 || world.supplements.createCalls != 0 {
+		t.Fatal("the designing segment must wait for the user's incremental batch")
+	}
+
+	// The design run stays terminal while the user confirms the plan; the
+	// in-memory marker makes the issue materialization a one-shot.
+	world.runOnce(t)
+	if world.delivery.calls != 1 {
+		t.Fatalf("CreateRequirementGapIssues calls = %d, want the one-shot marker to hold", world.delivery.calls)
+	}
+}
+
 func TestAutonomyIncrementalSkipsPostSupplement(t *testing.T) {
 	world := newAutoWorld(t)
 	world.seedReadyChain()
@@ -1031,6 +1143,36 @@ func TestAutonomySkipsPausedAndCompletedVersions(t *testing.T) {
 			t.Fatal("a completed version was processed")
 		}
 	})
+}
+
+// TestConfiguredAutonomyBatchesPerTickClamps pins spec §16.1: the worker budget
+// falls back to the default for an unset/invalid value and is clamped to the
+// 1–20 range, so a typo cannot disable the chain or let one tick scan the whole
+// database.
+func TestConfiguredAutonomyBatchesPerTickClamps(t *testing.T) {
+	cases := map[string]int{
+		"":     DefaultAutonomyBatchesPerTick,
+		"0":    DefaultAutonomyBatchesPerTick,
+		"-3":   DefaultAutonomyBatchesPerTick,
+		"abc":  DefaultAutonomyBatchesPerTick,
+		"1":    1,
+		"7":    7,
+		"20":   20,
+		"21":   20,
+		"9999": 20,
+	}
+	for raw, want := range cases {
+		t.Setenv(envAutonomyBatchesPerTick, raw)
+		if got := configuredAutonomyBatchesPerTick(); got != want {
+			t.Fatalf("configuredAutonomyBatchesPerTick(%q)=%d want %d", raw, got, want)
+		}
+	}
+
+	t.Setenv(envAutonomyBatchesPerTick, "40")
+	worker := NewAutonomyWorker(AutonomyWorkerDeps{})
+	if worker.batchesPerTick != 20 {
+		t.Fatalf("worker budget=%d want the clamped 20", worker.batchesPerTick)
+	}
 }
 
 func TestAutonomyProcessesAtMostBatchesPerTick(t *testing.T) {

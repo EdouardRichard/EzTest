@@ -93,13 +93,25 @@ type ReportStateView struct {
 
 // SupplementRunView is the worker's projection of the latest supplement or
 // incremental-design run of a parent batch. Kind distinguishes the two run
-// kinds because both point at the same parent batch.
+// kinds because both point at the same parent batch. Escalations are the
+// validated requirement gaps the run reported (spec §6.4.4); the worker
+// materializes them as delivery requirement_gap issues before settling.
 type SupplementRunView struct {
-	ID         int64
-	Kind       string
-	Status     string
-	NewCaseIDs []int64
-	Degraded   bool
+	ID          int64
+	Kind        string
+	Status      string
+	NewCaseIDs  []int64
+	Degraded    bool
+	Escalations []RequirementGapEscalation
+}
+
+// RequirementGapEscalation is one requirement gap the supplement agent reported
+// (spec §6.4.4/§9.2): a missing requirement coverage with the requirement ids
+// that prove the gap. Delivery creates a requirement_gap issue from it.
+type RequirementGapEscalation struct {
+	Title          string
+	Detail         string
+	RequirementIDs []int64
 }
 
 // ImpactView is the worker's projection of one code impact analysis.
@@ -144,6 +156,15 @@ type SupplementPort interface {
 	GetSupplementRun(ctx context.Context, batchID int64) (*SupplementRunView, error)
 	CreateSupplementBatch(ctx context.Context, versionID, parentBatchID int64, caseIDs []int64, actor int64) (*domain.RunBatch, error)
 	MarkNodesMerged(ctx context.Context, versionID int64, caseIDs []int64, actor int64) error
+}
+
+// DeliveryPort is the delivery issue surface consumed by the worker for the
+// supplement requirement-gap escalations of spec §6.4.4. CreateRequirementGapIssues
+// materializes the validated escalations as AI requirement_gap issues (hard
+// dedupe by version + requirement set), so a retried call is a replay no-op. A
+// failure is logged and degrades the chain, never wedges it (spec §6.7).
+type DeliveryPort interface {
+	CreateRequirementGapIssues(ctx context.Context, versionID, batchID int64, escalations []RequirementGapEscalation, actor int64) (int, error)
 }
 
 // CodeImpactPort is the P4 code-impact surface of the continuing-design segment

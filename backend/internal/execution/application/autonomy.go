@@ -240,6 +240,10 @@ func (w *AutonomyWorker) advanceSupplementResult(ctx context.Context, batch doma
 	if isAutonomyActiveStatus(run.Status) {
 		return false, nil
 	}
+	// Requirement-gap escalations are materialized by delivery after the run is
+	// done and before the chain settles (spec §6.4.4). A delivery failure only
+	// degrades: the chain still settles (spec §6.7).
+	w.materializeRequirementGaps(ctx, batch, run)
 	if run.Status != AutonomyStatusDone || len(run.NewCaseIDs) == 0 {
 		return true, nil
 	}
@@ -333,7 +337,10 @@ func (w *AutonomyWorker) processDesigningVersion(ctx context.Context, designing 
 	}
 	if existing != nil && existing.Kind == AutonomyRunKindIncrementalDesign {
 		// Active runs are awaited; a done/degraded run waits for the user's plan
-		// confirmation. Neither path auto-creates the incremental batch.
+		// confirmation. Neither path auto-creates the incremental batch. A done
+		// run's requirement-gap escalations are materialized once here, because
+		// the design run stays terminal while the plan panel is open.
+		w.materializeRequirementGaps(ctx, *designing.Parent, existing)
 		return nil
 	}
 	if w.deps.Impact != nil {
@@ -465,6 +472,50 @@ func (w *AutonomyWorker) clearStaleReportRegenerated(batchID int64) {
 	w.staleMu.Lock()
 	defer w.staleMu.Unlock()
 	delete(w.staleRegenerated, batchID)
+}
+
+// materializeRequirementGaps hands a done supplement/incremental-design run's
+// validated requirement gaps to delivery (spec §6.4.4). The in-memory one-shot
+// marker avoids repeating the call on every designing-segment tick while the
+// plan panel is open; a worker restart re-calls delivery, whose hard dedupe key
+// makes that a replay. A delivery failure is only logged: the batch chain must
+// still settle (spec §6.7).
+func (w *AutonomyWorker) materializeRequirementGaps(ctx context.Context, batch domain.RunBatch, run *SupplementRunView) {
+	if w == nil || w.deps.Delivery == nil || run == nil ||
+		run.Status != AutonomyStatusDone || len(run.Escalations) == 0 {
+		return
+	}
+	if w.escalationsMaterialized(run.ID) {
+		return
+	}
+	created, err := w.deps.Delivery.CreateRequirementGapIssues(
+		ctx, batch.VersionID, batch.ID, run.Escalations, w.batchActor(batch))
+	if err != nil {
+		slog.WarnContext(ctx, "execution autonomy: requirement-gap issue materialization degraded",
+			"version_id", batch.VersionID, "batch_id", batch.ID, "run_id", run.ID,
+			"escalations", len(run.Escalations), "error", err)
+	} else {
+		slog.InfoContext(ctx, "execution autonomy: requirement-gap issues materialized",
+			"version_id", batch.VersionID, "batch_id", batch.ID, "run_id", run.ID,
+			"escalations", len(run.Escalations), "issues", created)
+	}
+	w.markEscalationsMaterialized(run.ID)
+}
+
+// escalationsMaterialized reports whether the run's escalations were already
+// handed to delivery by this worker instance.
+func (w *AutonomyWorker) escalationsMaterialized(runID int64) bool {
+	w.escalationMu.Lock()
+	defer w.escalationMu.Unlock()
+	_, ok := w.escalationsDone[runID]
+	return ok
+}
+
+// markEscalationsMaterialized records the one-shot escalation materialization.
+func (w *AutonomyWorker) markEscalationsMaterialized(runID int64) {
+	w.escalationMu.Lock()
+	defer w.escalationMu.Unlock()
+	w.escalationsDone[runID] = struct{}{}
 }
 
 // isAutonomyActiveStatus reports whether a run still occupies its single-flight
