@@ -409,6 +409,32 @@ func TestAgentRuntimeGetRunMapsActiveAndLastRun(t *testing.T) {
 	}
 }
 
+// TestAgentRuntimeGetRunMapsTerminalReason pins that the P1 run's terminal
+// reason reaches the execution runner, which needs it to tell an LLM failure
+// apart from a normal end that skipped case_finish.
+func TestAgentRuntimeGetRunMapsTerminalReason(t *testing.T) {
+	fixture := newRuntimeFixture()
+	fixture.sessions.details[88] = agentdomain.SessionDetail{
+		Session: agentdomain.Session{ID: 88},
+		LastRun: &agentdomain.Run{
+			ID:             77,
+			Status:         agentdomain.RunFailed,
+			TerminalReason: agentdomain.ReasonModelError,
+			ErrorMessage:   "upstream request failed",
+		},
+	}
+	state, err := fixture.adapter().GetRun(context.Background(), 88)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if state.TerminalReason != string(agentdomain.ReasonModelError) {
+		t.Fatalf("terminal reason = %q, want %q", state.TerminalReason, agentdomain.ReasonModelError)
+	}
+	if state.Status != string(agentdomain.RunFailed) || state.Error != "upstream request failed" {
+		t.Fatalf("terminal run state=%+v", state)
+	}
+}
+
 // TestAgentRuntimeCancelRunDelegates pins the abort delegation and idle handling.
 func TestAgentRuntimeCancelRunDelegates(t *testing.T) {
 	fixture := newRuntimeFixture()

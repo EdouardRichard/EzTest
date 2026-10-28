@@ -578,24 +578,92 @@ func (r *CaseRunner) publish(ctx context.Context, event Event) {
 }
 
 // agentTerminalCode maps a terminal agent run state to a classification tool
-// code and an audit reason. An agent that ends without case_finish is
-// inconclusive(case), never failed.
+// code and an audit reason. The P1 terminal reason is authoritative when it
+// names a cause: an LLM/model failure is inconclusive(model) even though the
+// run's raw error message is free-form, and a budget cause is
+// inconclusive(model, budget_exhausted). A normal end without case_finish is
+// inconclusive(case), never failed. A shutdown/interrupted reason falls through
+// to the status mapping so a paused run keeps its interrupted semantics.
 func agentTerminalCode(state AgentRunState) (code, reason string) {
 	status := strings.ToLower(strings.TrimSpace(state.Status))
+	terminalReason := strings.ToLower(strings.TrimSpace(state.TerminalReason))
+	switch terminalReason {
+	case "model_error", "llm_error", "gateway_error":
+		return "model_error", terminalReason
+	case "context_overflow", "max_turns", "run_hard_timeout", "timeout":
+		return "budget_exhausted", terminalReason
+	case "shutdown", "interrupted":
+		// A pause/shutdown ends the run without a model fault; keep the
+		// status-derived classification instead of reclassifying it.
+	}
 	switch status {
 	case "done":
 		return "agent_output_invalid", "case run ended without case_finish"
 	case "failed", "aborted":
-		code = strings.TrimSpace(state.Error)
-		if code == "" {
-			code = "internal"
+		detail := strings.TrimSpace(state.Error)
+		if knownAgentToolCode(detail) {
+			return detail, detail
 		}
-		return code, strings.TrimSpace(state.Error)
+		// A failed/aborted run whose cause is not a recognized tool code is an
+		// infrastructure/model fault, never a case defect (spec §5.8).
+		return "internal", detail
 	case "interrupted", "canceled", "cancelled":
 		return "internal", "agent run " + status
 	default:
 		return "internal", "agent run ended as " + status
 	}
+}
+
+// knownAgentToolCodes mirrors the tool error codes domain.Classify recognizes
+// (spec §5.8). A failed/aborted P1 run carries a tool code when the agent
+// produced one, but a model/infrastructure failure carries a free-form message;
+// the lookup keeps such a message from being mistaken for a case defect.
+var knownAgentToolCodes = map[string]struct{}{
+	"host_not_allowed":           {},
+	"dns_failed":                 {},
+	"dns_error":                  {},
+	"connection_refused":         {},
+	"connection_reset":           {},
+	"network_error":              {},
+	"tls_error":                  {},
+	"env_unreachable":            {},
+	"executor_unavailable":       {},
+	"executor_unreachable":       {},
+	"session_unauthorized":       {},
+	"session_expired":            {},
+	"session_invalid":            {},
+	"no_session":                 {},
+	"budget_exhausted":           {},
+	"budget_exceeded":            {},
+	"context_overflow":           {},
+	"max_turns":                  {},
+	"model_error":                {},
+	"llm_error":                  {},
+	"gateway_error":              {},
+	"internal":                   {},
+	"unsupported_assertion_kind": {},
+	"invalid_arguments":          {},
+	"invalid_selector":           {},
+	"invalid_finish":             {},
+	"target_ambiguous":           {},
+	"case_invalid":               {},
+	"invalid_case":               {},
+	"agent_output_invalid":       {},
+	"target_not_found":           {},
+	"timeout":                    {},
+	"assertion_mismatch":         {},
+	"assertion_failed":           {},
+	"step_failed":                {},
+}
+
+// knownAgentToolCode reports whether code is a tool error code the failure
+// classifier understands.
+func knownAgentToolCode(code string) bool {
+	if code == "" {
+		return false
+	}
+	_, ok := knownAgentToolCodes[strings.ToLower(code)]
+	return ok
 }
 
 // toolCodeForError maps an infrastructure error to the classification tool code

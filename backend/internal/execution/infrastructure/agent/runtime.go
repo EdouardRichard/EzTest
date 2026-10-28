@@ -255,10 +255,11 @@ func (a *AgentRuntime) GetRun(ctx context.Context, agentSessionID int64) (execut
 		a.forgetLease(agentSessionID)
 	}
 	return executionapp.AgentRunState{
-		RunID:      run.ID,
-		Status:     string(run.Status),
-		Error:      runErrorMessage(run),
-		FinishedAt: run.EndedAt,
+		RunID:          run.ID,
+		Status:         string(run.Status),
+		TerminalReason: string(run.TerminalReason),
+		Error:          runErrorMessage(run),
+		FinishedAt:     run.EndedAt,
 	}, nil
 }
 
