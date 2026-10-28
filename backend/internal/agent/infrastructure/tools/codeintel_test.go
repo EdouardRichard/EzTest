@@ -168,8 +168,7 @@ type fakeCodeIntelAnalyses struct {
 	startCalls   int
 	startVersion int64
 	startActor   int64
-	startHead    string
-	startForce   bool
+	startInput   codeintelapp.StartAnalysisInput
 
 	latestResult  codeinteldomain.CodeAnalysis
 	latestErr     error
@@ -188,10 +187,10 @@ type fakeCodeIntelAnalyses struct {
 	candidatesAnalysisID int64
 }
 
-// Start records the trigger and returns the canned queued/reused analysis.
-func (f *fakeCodeIntelAnalyses) Start(_ context.Context, versionID, actorID int64, headCommit string, force bool) (codeinteldomain.CodeAnalysis, bool, error) {
+// Start records the trigger input and returns the canned queued/reused analysis.
+func (f *fakeCodeIntelAnalyses) Start(_ context.Context, versionID, actorID int64, in codeintelapp.StartAnalysisInput) (codeinteldomain.CodeAnalysis, bool, error) {
 	f.startCalls++
-	f.startVersion, f.startActor, f.startHead, f.startForce = versionID, actorID, headCommit, force
+	f.startVersion, f.startActor, f.startInput = versionID, actorID, in
 	if f.startErr != nil {
 		return codeinteldomain.CodeAnalysis{}, false, f.startErr
 	}
@@ -950,8 +949,9 @@ func TestCodeIntelAnalyzeTriggersWithoutBlocking(t *testing.T) {
 	if fakes.analyses.startCalls != 1 ||
 		fakes.analyses.startVersion != 77 ||
 		fakes.analyses.startActor != 42 ||
-		fakes.analyses.startHead != codeIntelTestCommitA ||
-		!fakes.analyses.startForce {
+		fakes.analyses.startInput.HeadCommit != codeIntelTestCommitA ||
+		fakes.analyses.startInput.BaseCommit != "" ||
+		!fakes.analyses.startInput.Force {
 		t.Fatalf("start mapping=%+v", fakes.analyses)
 	}
 	if fakes.analyses.latestCalls != 0 || fakes.analyses.candidatesCalls != 0 {
@@ -969,6 +969,9 @@ func TestCodeIntelAnalyzeTriggersWithoutBlocking(t *testing.T) {
 		content := codeIntelContentMap(t, result)
 		if content["reused"] != true || content["status"] != codeinteldomain.RunDone || content["analysisId"] != "12" {
 			t.Fatalf("reused output=%v", content)
+		}
+		if reusedFake.analyses.startInput != (codeintelapp.StartAnalysisInput{}) {
+			t.Fatalf("start input=%+v want the zero value without head/base/force", reusedFake.analyses.startInput)
 		}
 	})
 

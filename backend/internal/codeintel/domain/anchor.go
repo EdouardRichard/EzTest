@@ -3,13 +3,13 @@ package domain
 import "time"
 
 // Anchor subject kinds. version, requirement and app_model are the P4 subjects;
-// case is added by P5 (D37) and issue stays reserved for P6 (design spec §6.7,
-// INV-15).
+// case is added by P5 (D37) and issue by P7 (design spec §4.2.8/§7.9).
 const (
 	SubjectVersion     = "version"
 	SubjectRequirement = "requirement"
 	SubjectAppModel    = "app_model"
 	SubjectCase        = "case"
+	SubjectIssue       = "issue"
 )
 
 // CodeAnchor binds a version-scoped subject to a file/location in a repository.
@@ -39,15 +39,15 @@ type CreateAnchorParams struct {
 	EndLine     *int
 }
 
-// ValidateSubjectKind accepts the four anchor subject kinds of P5 (D37) and
+// ValidateSubjectKind accepts the five anchor subject kinds of P7 (D37/§7.9) and
 // rejects every other kind with reason unsupported_subject_kind (design spec
-// §6.7).
+// §6.7/§7.9).
 func ValidateSubjectKind(kind string) error {
 	switch kind {
-	case SubjectVersion, SubjectRequirement, SubjectAppModel, SubjectCase:
+	case SubjectVersion, SubjectRequirement, SubjectAppModel, SubjectCase, SubjectIssue:
 		return nil
 	default:
 		return NewInvalid("subjectKind", "unsupported_subject_kind",
-			"codeintel: subjectKind must be one of version, requirement, app_model or case")
+			"codeintel: subjectKind must be one of version, requirement, app_model, case or issue")
 	}
 }

@@ -20,6 +20,22 @@ const (
 	anchorConfidenceDefault = domain.ConfidenceHigh
 )
 
+// IssueInfo is the version-scoped slice of a delivery issue the codeintel
+// context needs to validate an issue anchor's ownership (design spec §7.9).
+type IssueInfo struct {
+	ID        int64
+	VersionID int64
+}
+
+// IssueCatalog validates issue anchor subjects through the delivery application
+// layer. A missing or foreign issue is reported as found=false (the delivery
+// adapter maps its version-scoped not-found), never as a domain verdict here;
+// operational failures are returned as errors. Issue anchors are owned by the
+// delivery context (design spec §7.9).
+type IssueCatalog interface {
+	GetIssue(ctx context.Context, versionID, issueID int64) (IssueInfo, bool, error)
+}
+
 // AnchorServiceDeps are the ports of the version-scoped anchor use case. The
 // repository catalog resolves the checkout used to validate the anchored file at
 // the fixed branch tip, and the P2/P3 catalogs validate subject ownership.
@@ -27,6 +43,7 @@ type AnchorServiceDeps struct {
 	Repos     RepoCatalog
 	Versions  VersionCatalog
 	AppModels AppModelCatalog
+	Issues    IssueCatalog
 	Git       GitReader
 	Anchors   AnchorRepository
 	IDs       IDGenerator
@@ -155,8 +172,8 @@ func (s *AnchorService) List(ctx context.Context, versionID int64, f domain.Anch
 
 // validateAnchorSubject enforces the subject ownership rules: requirement must
 // belong to the version, app_model must exist in the version's bound system,
-// version must equal the path version. Case ownership is validated by the
-// mindmap context (D37).
+// version must equal the path version, and issue must exist in the path version.
+// Case ownership is validated by the mindmap context (D37).
 func (s *AnchorService) validateAnchorSubject(ctx context.Context, versionID int64, info VersionInfo, subjectKind string, subjectID int64) error {
 	switch subjectKind {
 	case domain.SubjectVersion:
@@ -204,10 +221,25 @@ func (s *AnchorService) validateAnchorSubject(ctx context.Context, versionID int
 		// subjectID is a case node of versionID before calling, since codeintel
 		// has no dependency on the mindmap context.
 		return nil
+	case domain.SubjectIssue:
+		// Issue anchors are owned by the delivery context (design spec §7.9):
+		// the issue must exist in the path version.
+		if s.deps.Issues == nil {
+			return errors.New("codeintel: issue catalog is not configured")
+		}
+		issue, found, err := s.deps.Issues.GetIssue(ctx, versionID, subjectID)
+		if err != nil {
+			return err
+		}
+		if !found || issue.ID != subjectID || issue.VersionID != versionID {
+			return domain.NewInvalid("subjectId", "subject_not_in_version",
+				fmt.Sprintf("codeintel: issue %d does not belong to version %d", subjectID, versionID))
+		}
+		return nil
 	default:
 		// domain.ValidateSubjectKind already rejected every other kind.
 		return domain.NewInvalid("subjectKind", "unsupported_subject_kind",
-			"codeintel: subjectKind must be one of version, requirement, app_model or case")
+			"codeintel: subjectKind must be one of version, requirement, app_model, case or issue")
 	}
 }
 

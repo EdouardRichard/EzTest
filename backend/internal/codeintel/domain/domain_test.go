@@ -200,12 +200,12 @@ func TestCandidateOrderTieBreak(t *testing.T) {
 }
 
 func TestValidateSubjectKind(t *testing.T) {
-	for _, kind := range []string{SubjectVersion, SubjectRequirement, SubjectAppModel, SubjectCase} {
+	for _, kind := range []string{"version", "requirement", "app_model", "case", "issue"} {
 		if err := ValidateSubjectKind(kind); err != nil {
 			t.Fatalf("ValidateSubjectKind(%q) rejected a supported subject: %v", kind, err)
 		}
 	}
-	for _, kind := range []string{"", "issue", "user"} {
+	for _, kind := range []string{"", "Issue", "user"} {
 		err := ValidateSubjectKind(kind)
 		if err == nil {
 			t.Fatalf("ValidateSubjectKind(%q) accepted an unsupported subject", kind)
@@ -229,10 +229,21 @@ func TestAnchorSubjectCaseAccepted(t *testing.T) {
 	}
 }
 
+// TestAnchorSubjectIssueAccepted pins P7 design spec §7.9: issue is a
+// first-class anchor subject now that the code_anchor CHECK is widened.
+func TestAnchorSubjectIssueAccepted(t *testing.T) {
+	if SubjectIssue != "issue" {
+		t.Fatalf("SubjectIssue=%q want issue", SubjectIssue)
+	}
+	if err := ValidateSubjectKind(SubjectIssue); err != nil {
+		t.Fatalf("ValidateSubjectKind(SubjectIssue) = %v, want nil", err)
+	}
+}
+
 // TestAnchorSubjectUnknownRejected pins the stable unsupported_subject_kind
-// reason and the four-kind message for an unknown anchor subject.
+// reason and the five-kind message for an unknown anchor subject.
 func TestAnchorSubjectUnknownRejected(t *testing.T) {
-	for _, kind := range []string{"", "issue", "Case", "user"} {
+	for _, kind := range []string{"", "Issue", "Case", "user"} {
 		err := ValidateSubjectKind(kind)
 		if err == nil {
 			t.Fatalf("ValidateSubjectKind(%q) accepted an unknown subject", kind)
@@ -243,8 +254,8 @@ func TestAnchorSubjectUnknownRejected(t *testing.T) {
 		if got := Reason(err); got != "unsupported_subject_kind" {
 			t.Fatalf("ValidateSubjectKind(%q) reason=%q want unsupported_subject_kind", kind, got)
 		}
-		if !strings.Contains(err.Error(), "version, requirement, app_model or case") {
-			t.Fatalf("ValidateSubjectKind(%q) message=%q does not list the four kinds", kind, err.Error())
+		if !strings.Contains(err.Error(), "version, requirement, app_model, case or issue") {
+			t.Fatalf("ValidateSubjectKind(%q) message=%q does not list the five kinds", kind, err.Error())
 		}
 	}
 }

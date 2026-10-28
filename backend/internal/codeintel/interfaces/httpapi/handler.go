@@ -48,11 +48,12 @@ type QueryService interface {
 }
 
 // AnalysisService is the version-scoped impact-analysis use case consumed by the
-// HTTP layer (design spec §7.3). *application.AnalysisService implements it. The
-// Start reuse bool drives the 200/202 distinction; PatchCandidate enforces the
+// HTTP layer (design spec §7.3/§7.9). *application.AnalysisService implements
+// it. The Start input carries the optional head/base commits and the force flag;
+// its reuse bool drives the 200/202 distinction. PatchCandidate enforces the
 // done state and the analysis/candidate ownership itself.
 type AnalysisService interface {
-	Start(ctx context.Context, versionID, actorID int64, headCommit string, force bool) (domain.CodeAnalysis, bool, error)
+	Start(ctx context.Context, versionID, actorID int64, in application.StartAnalysisInput) (domain.CodeAnalysis, bool, error)
 	Get(ctx context.Context, versionID, analysisID int64) (domain.CodeAnalysis, error)
 	GetLatest(ctx context.Context, versionID int64) (domain.CodeAnalysis, error)
 	ListCandidates(ctx context.Context, analysisID int64) ([]domain.ImpactCandidate, error)

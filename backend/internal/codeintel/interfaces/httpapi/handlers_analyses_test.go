@@ -154,6 +154,7 @@ type analysisStartCall struct {
 	VersionID  int64
 	ActorID    int64
 	HeadCommit string
+	BaseCommit string
 	Force      bool
 }
 
@@ -176,7 +177,7 @@ type analysisPatchCall struct {
 // double. Each method records its arguments and delegates to the configured
 // function.
 type fakeAnalysisService struct {
-	startFn          func(context.Context, int64, int64, string, bool) (domain.CodeAnalysis, bool, error)
+	startFn          func(context.Context, int64, int64, application.StartAnalysisInput) (domain.CodeAnalysis, bool, error)
 	getFn            func(context.Context, int64, int64) (domain.CodeAnalysis, error)
 	latestFn         func(context.Context, int64) (domain.CodeAnalysis, error)
 	listCandidatesFn func(context.Context, int64) ([]domain.ImpactCandidate, error)
@@ -189,12 +190,15 @@ type fakeAnalysisService struct {
 	patchCalls          []analysisPatchCall
 }
 
-func (f *fakeAnalysisService) Start(ctx context.Context, versionID, actorID int64, headCommit string, force bool) (domain.CodeAnalysis, bool, error) {
-	f.startCalls = append(f.startCalls, analysisStartCall{VersionID: versionID, ActorID: actorID, HeadCommit: headCommit, Force: force})
+func (f *fakeAnalysisService) Start(ctx context.Context, versionID, actorID int64, in application.StartAnalysisInput) (domain.CodeAnalysis, bool, error) {
+	f.startCalls = append(f.startCalls, analysisStartCall{
+		VersionID: versionID, ActorID: actorID,
+		HeadCommit: in.HeadCommit, BaseCommit: in.BaseCommit, Force: in.Force,
+	})
 	if f.startFn == nil {
 		return domain.CodeAnalysis{}, false, nil
 	}
-	return f.startFn(ctx, versionID, actorID, headCommit, force)
+	return f.startFn(ctx, versionID, actorID, in)
 }
 
 func (f *fakeAnalysisService) Get(ctx context.Context, versionID, analysisID int64) (domain.CodeAnalysis, error) {
@@ -324,12 +328,12 @@ func TestAnalysisStartReuseForceAndConflicts(t *testing.T) {
 	done := testAnalysis()
 
 	t.Run("a new analysis is 202 with reused=false", func(t *testing.T) {
-		analyses := &fakeAnalysisService{startFn: func(context.Context, int64, int64, string, bool) (domain.CodeAnalysis, bool, error) {
+		analyses := &fakeAnalysisService{startFn: func(context.Context, int64, int64, application.StartAnalysisInput) (domain.CodeAnalysis, bool, error) {
 			return queued, false, nil
 		}}
 		handler := newTestHandler(t, HandlerDeps{Analyses: analyses})
 		recorder := serveJSON(t, handler, http.MethodPost, "/api/versions/42/code/analyses", userToken,
-			map[string]any{"headCommit": commitB, "force": false})
+			map[string]any{"headCommit": commitB, "baseCommit": commitA, "force": false})
 		if recorder.Code != http.StatusAccepted {
 			t.Fatalf("status = %d, want 202 (body %s)", recorder.Code, recorder.Body.String())
 		}
@@ -341,14 +345,29 @@ func TestAnalysisStartReuseForceAndConflicts(t *testing.T) {
 			body.Data.AnalysisVersion != 1 || body.Data.Reused {
 			t.Fatalf("accepted body = %+v, want id 8801 queued v1 reused=false", body.Data)
 		}
-		want := analysisStartCall{VersionID: 42, ActorID: testUserID, HeadCommit: commitB}
+		want := analysisStartCall{VersionID: 42, ActorID: testUserID, HeadCommit: commitB, BaseCommit: commitA}
 		if got := analyses.startCalls; len(got) != 1 || got[0] != want {
 			t.Fatalf("Start call = %+v, want %+v", got, want)
 		}
 	})
 
+	t.Run("baseCommit is optional and forwarded as the empty default", func(t *testing.T) {
+		analyses := &fakeAnalysisService{startFn: func(context.Context, int64, int64, application.StartAnalysisInput) (domain.CodeAnalysis, bool, error) {
+			return queued, false, nil
+		}}
+		handler := newTestHandler(t, HandlerDeps{Analyses: analyses})
+		recorder := serveJSON(t, handler, http.MethodPost, "/api/versions/42/code/analyses", userToken,
+			map[string]any{"baseCommit": commitA})
+		if recorder.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want 202 (body %s)", recorder.Code, recorder.Body.String())
+		}
+		if got := analyses.startCalls; len(got) != 1 || got[0].BaseCommit != commitA || got[0].HeadCommit != "" {
+			t.Fatalf("Start call = %+v, want baseCommit %s and the default head", got, commitA)
+		}
+	})
+
 	t.Run("reused analysis is 200 with reused=true", func(t *testing.T) {
-		analyses := &fakeAnalysisService{startFn: func(context.Context, int64, int64, string, bool) (domain.CodeAnalysis, bool, error) {
+		analyses := &fakeAnalysisService{startFn: func(context.Context, int64, int64, application.StartAnalysisInput) (domain.CodeAnalysis, bool, error) {
 			return done, true, nil
 		}}
 		handler := newTestHandler(t, HandlerDeps{Analyses: analyses})
@@ -369,7 +388,7 @@ func TestAnalysisStartReuseForceAndConflicts(t *testing.T) {
 	})
 
 	t.Run("force is forwarded to the application service", func(t *testing.T) {
-		analyses := &fakeAnalysisService{startFn: func(context.Context, int64, int64, string, bool) (domain.CodeAnalysis, bool, error) {
+		analyses := &fakeAnalysisService{startFn: func(context.Context, int64, int64, application.StartAnalysisInput) (domain.CodeAnalysis, bool, error) {
 			return queued, false, nil
 		}}
 		handler := newTestHandler(t, HandlerDeps{Analyses: analyses})
@@ -416,6 +435,14 @@ func TestAnalysisStartReuseForceAndConflicts(t *testing.T) {
 			field:  "headCommit",
 		},
 		{
+			name:   "invalid base maps to 422 invalid_base_commit",
+			err:    domain.NewInvalid("baseCommit", "invalid_base_commit", "codeintel: baseCommit must be a 40-hex ancestor of HEAD"),
+			status: http.StatusUnprocessableEntity,
+			code:   platform.CodeInvalidArgument,
+			reason: "invalid_base_commit",
+			field:  "baseCommit",
+		},
+		{
 			name: "a full queue maps to retryable 429 analysis_queue_full",
 			err: fmt.Errorf("%w: %w",
 				domain.NewConflict("analysis_queue_full", "codeintel: the analysis queue is full"),
@@ -428,7 +455,7 @@ func TestAnalysisStartReuseForceAndConflicts(t *testing.T) {
 	}
 	for _, testCase := range reasonCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			analyses := &fakeAnalysisService{startFn: func(context.Context, int64, int64, string, bool) (domain.CodeAnalysis, bool, error) {
+			analyses := &fakeAnalysisService{startFn: func(context.Context, int64, int64, application.StartAnalysisInput) (domain.CodeAnalysis, bool, error) {
 				return domain.CodeAnalysis{}, false, testCase.err
 			}}
 			handler := newTestHandler(t, HandlerDeps{Analyses: analyses})
@@ -493,6 +520,14 @@ func TestAnalysisStartReuseForceAndConflicts(t *testing.T) {
 			name:   "a non-boolean force is rejected",
 			target: "/api/versions/42/code/analyses",
 			body:   `{"force":"yes"}`,
+			status: http.StatusBadRequest,
+			code:   platform.CodeInvalidArgument,
+			reason: "invalid_json",
+		},
+		{
+			name:   "a non-string baseCommit is rejected",
+			target: "/api/versions/42/code/analyses",
+			body:   `{"baseCommit":123}`,
 			status: http.StatusBadRequest,
 			code:   platform.CodeInvalidArgument,
 			reason: "invalid_json",

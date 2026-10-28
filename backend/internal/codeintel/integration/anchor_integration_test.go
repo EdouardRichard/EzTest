@@ -3,9 +3,9 @@
 package integration
 
 // This file wires the real AnchorService over the real gitx/PostgreSQL/P2/P3
-// adapters to prove design spec §6.7 against real storage and a real repository
-// checkout: subject ownership, fixed-branch file validation, point uniqueness,
-// version-scoped deletion, case acceptance and the issue rejection.
+// adapters to prove design spec §6.7/§7.9 against real storage and a real
+// repository checkout: subject ownership, fixed-branch file validation, point
+// uniqueness, version-scoped deletion, case and issue acceptance.
 
 import (
 	"context"
@@ -28,6 +28,21 @@ import (
 	versionpg "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/postgres"
 )
 
+// anchorIssueCatalog is the version-scoped delivery IssueCatalog double: only one
+// (version, issue) pair exists. codeintel never reads the delivery tables for an
+// anchor, so the integration test needs no delivery fixture rows.
+type anchorIssueCatalog struct {
+	versionID int64
+	issueID   int64
+}
+
+func (c anchorIssueCatalog) GetIssue(_ context.Context, versionID, issueID int64) (codeintelapp.IssueInfo, bool, error) {
+	if versionID != c.versionID || issueID != c.issueID {
+		return codeintelapp.IssueInfo{}, false, nil
+	}
+	return codeintelapp.IssueInfo{ID: issueID, VersionID: versionID}, true, nil
+}
+
 // anchorIntegrationFixture is the wired anchor service and the seeded ids.
 type anchorIntegrationFixture struct {
 	service             *codeintelapp.AnchorService
@@ -36,6 +51,7 @@ type anchorIntegrationFixture struct {
 	repoID              int64
 	versionID           int64
 	requirementID       int64
+	issueID             int64
 	systemID            int64
 	appModelID          int64
 	otherSystemID       int64
@@ -83,10 +99,12 @@ func newAnchorIntegrationFixture(t *testing.T, pool *pgxpool.Pool) *anchorIntegr
 	if err != nil {
 		t.Fatalf("new anchor snowflake generator: %v", err)
 	}
+	issueID := nextSeedID()
 	service := codeintelapp.NewAnchorService(codeintelapp.AnchorServiceDeps{
 		Repos:     repoCatalog,
 		Versions:  versionCatalog,
 		AppModels: repoCatalog,
+		Issues:    anchorIssueCatalog{versionID: versionID, issueID: issueID},
 		Git:       gitx.NewGitReader(gitx.GitConfig{CommandTimeout: 10 * time.Second}),
 		Anchors:   codeintelpg.NewAnchorRepository(pool),
 		IDs:       generator,
@@ -99,6 +117,7 @@ func newAnchorIntegrationFixture(t *testing.T, pool *pgxpool.Pool) *anchorIntegr
 		repoID:              repoID,
 		versionID:           versionID,
 		requirementID:       requirementID,
+		issueID:             issueID,
 		systemID:            systemID,
 		appModelID:          appModelID,
 		otherSystemID:       otherSystemID,
@@ -185,7 +204,8 @@ func TestAnchorIntegrationCRUDUniquenessAndOwnership(t *testing.T) {
 		t.Fatalf("foreign requirement error = %v, want subject_not_in_version", err)
 	}
 
-	// Case anchors are accepted (D37); issue is still reserved (INV-15).
+	// Case anchors are accepted (D37); issue anchors are accepted by P7 and must
+	// belong to the path version (design spec §7.9).
 	caseAnchor, err := fixture.service.Create(ctx, fixture.versionID, 1, domain.CreateAnchorParams{
 		SubjectKind: domain.SubjectCase, SubjectID: fixture.requirementID, FilePath: analysisServerPath,
 	})
@@ -195,10 +215,19 @@ func TestAnchorIntegrationCRUDUniquenessAndOwnership(t *testing.T) {
 	if caseAnchor.SubjectKind != domain.SubjectCase {
 		t.Fatalf("case anchor subject = %q, want case", caseAnchor.SubjectKind)
 	}
-	if _, err := fixture.service.Create(ctx, fixture.versionID, 1, domain.CreateAnchorParams{
-		SubjectKind: "issue", SubjectID: fixture.requirementID, FilePath: analysisClientPath,
-	}); domain.Reason(err) != "unsupported_subject_kind" {
-		t.Fatalf("issue anchor error = %v, want unsupported_subject_kind", err)
+	issueAnchor, err := fixture.service.Create(ctx, fixture.versionID, 1, domain.CreateAnchorParams{
+		SubjectKind: domain.SubjectIssue, SubjectID: fixture.issueID, FilePath: analysisClientPath,
+	})
+	if err != nil {
+		t.Fatalf("Create issue anchor: %v", err)
+	}
+	if issueAnchor.SubjectKind != domain.SubjectIssue || issueAnchor.SubjectID != fixture.issueID {
+		t.Fatalf("issue anchor = %+v, want the delivery issue of this version", issueAnchor)
+	}
+	if _, err := fixture.service.Create(ctx, fixture.secondVersionID, 1, domain.CreateAnchorParams{
+		SubjectKind: domain.SubjectIssue, SubjectID: fixture.issueID, FilePath: analysisClientPath,
+	}); domain.Reason(err) != "subject_not_in_version" {
+		t.Fatalf("foreign issue error = %v, want subject_not_in_version", err)
 	}
 
 	// The deleted fixture file does not exist at the fixed branch tip.

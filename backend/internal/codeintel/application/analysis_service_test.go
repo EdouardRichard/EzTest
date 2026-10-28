@@ -604,6 +604,12 @@ type analysisFindReusableCall struct {
 	prompt    string
 }
 
+type analysisVersionCall struct {
+	versionID int64
+	base      string
+	head      string
+}
+
 type analysisSelectionUpdate struct {
 	analysisID  int64
 	candidateID int64
@@ -620,6 +626,7 @@ type analysisRepo struct {
 
 	findCalls      []analysisFindReusableCall
 	nextCalls      int
+	nextArgs       []analysisVersionCall
 	creates        []domain.CodeAnalysis
 	updates        []domain.CodeAnalysis
 	selections     []analysisSelectionUpdate
@@ -710,10 +717,11 @@ func (r *analysisRepo) HasActive(context.Context, int64) (bool, error) {
 	return r.active, r.activeErr
 }
 
-func (r *analysisRepo) NextAnalysisVersion(context.Context, int64, string, string) (int, error) {
+func (r *analysisRepo) NextAnalysisVersion(_ context.Context, versionID int64, base, head string) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.nextCalls++
+	r.nextArgs = append(r.nextArgs, analysisVersionCall{versionID: versionID, base: base, head: head})
 	return r.next, r.nextErr
 }
 
@@ -1080,7 +1088,7 @@ func (f *analysisFixture) rebuild() {
 // startAnalysis triggers one analysis with the fixture's default version/actor.
 func (f *analysisFixture) startAnalysis(t *testing.T, force bool) domain.CodeAnalysis {
 	t.Helper()
-	analysis, reused, err := f.svc.Start(context.Background(), 11, 42, "", force)
+	analysis, reused, err := f.svc.Start(context.Background(), 11, 42, StartAnalysisInput{Force: force})
 	if err != nil {
 		t.Fatalf("Start error = %v", err)
 	}
@@ -1273,7 +1281,7 @@ func TestStartValidationAndReuse(t *testing.T) {
 		f := newAnalysisFixture(t)
 		f.versions.info.HasRepo = false
 
-		_, _, err := f.svc.Start(context.Background(), 11, 42, "", false)
+		_, _, err := f.svc.Start(context.Background(), 11, 42, StartAnalysisInput{})
 		if !errors.Is(err, domain.ErrInvalid) || domain.Reason(err) != "code_repository_not_bound" {
 			t.Fatalf("Start error = %v, want code_repository_not_bound", err)
 		}
@@ -1286,7 +1294,7 @@ func TestStartValidationAndReuse(t *testing.T) {
 		f := newAnalysisFixture(t)
 		f.versions.info.BaselineCommit = ""
 
-		_, _, err := f.svc.Start(context.Background(), 11, 42, "", false)
+		_, _, err := f.svc.Start(context.Background(), 11, 42, StartAnalysisInput{})
 		if !errors.Is(err, domain.ErrInvalid) || domain.Reason(err) != "baseline_commit_missing" {
 			t.Fatalf("Start error = %v, want baseline_commit_missing", err)
 		}
@@ -1298,7 +1306,7 @@ func TestStartValidationAndReuse(t *testing.T) {
 		info.Status = "disabled"
 		f.repos.infos[3] = info
 
-		_, _, err := f.svc.Start(context.Background(), 11, 42, "", false)
+		_, _, err := f.svc.Start(context.Background(), 11, 42, StartAnalysisInput{})
 		if !errors.Is(err, domain.ErrInvalid) || domain.Reason(err) != "code_repository_disabled" {
 			t.Fatalf("Start error = %v, want code_repository_disabled", err)
 		}
@@ -1307,7 +1315,7 @@ func TestStartValidationAndReuse(t *testing.T) {
 	t.Run("malformed explicit head is invalid", func(t *testing.T) {
 		f := newAnalysisFixture(t)
 
-		_, _, err := f.svc.Start(context.Background(), 11, 42, "not-a-commit", false)
+		_, _, err := f.svc.Start(context.Background(), 11, 42, StartAnalysisInput{HeadCommit: "not-a-commit"})
 		if !errors.Is(err, domain.ErrInvalid) || domain.Reason(err) != "invalid_head" {
 			t.Fatalf("Start error = %v, want invalid_head", err)
 		}
@@ -1320,7 +1328,7 @@ func TestStartValidationAndReuse(t *testing.T) {
 		f := newAnalysisFixture(t)
 		f.git.ancestor = false
 
-		_, _, err := f.svc.Start(context.Background(), 11, 42, testCommitC, false)
+		_, _, err := f.svc.Start(context.Background(), 11, 42, StartAnalysisInput{HeadCommit: testCommitC})
 		if !errors.Is(err, domain.ErrInvalid) || domain.Reason(err) != "invalid_head" {
 			t.Fatalf("Start error = %v, want invalid_head", err)
 		}
@@ -1336,10 +1344,163 @@ func TestStartValidationAndReuse(t *testing.T) {
 		}
 	})
 
+	t.Run("malformed explicit base is invalid_base_commit", func(t *testing.T) {
+		f := newAnalysisFixture(t)
+
+		_, _, err := f.svc.Start(context.Background(), 11, 42,
+			StartAnalysisInput{BaseCommit: "not-a-commit"})
+		if !errors.Is(err, domain.ErrInvalid) || domain.Reason(err) != "invalid_base_commit" {
+			t.Fatalf("Start error = %v, want invalid_base_commit", err)
+		}
+		if len(f.git.ancestorCalls) != 0 || len(f.git.headCalls) != 0 {
+			t.Fatal("malformed base must not be resolved")
+		}
+		if len(f.analyses.findCalls) != 0 || len(f.analyses.creates) != 0 || len(f.queue.jobs) != 0 {
+			t.Fatal("rejected Start must not reach reuse/create/enqueue")
+		}
+	})
+
+	t.Run("explicit base must be an ancestor of the live head", func(t *testing.T) {
+		f := newAnalysisFixture(t)
+		f.git.ancestor = false
+
+		_, _, err := f.svc.Start(context.Background(), 11, 42,
+			StartAnalysisInput{BaseCommit: testCommitA})
+		if !errors.Is(err, domain.ErrInvalid) || domain.Reason(err) != "invalid_base_commit" {
+			t.Fatalf("Start error = %v, want invalid_base_commit", err)
+		}
+		if len(f.git.headCalls) != 1 || f.git.headCalls[0] != "main" {
+			t.Fatalf("Head calls = %v, want the fixed branch tip resolved once", f.git.headCalls)
+		}
+		if len(f.git.ancestorCalls) != 1 {
+			t.Fatalf("IsAncestor calls = %d, want 1", len(f.git.ancestorCalls))
+		}
+		call := f.git.ancestorCalls[0]
+		if call.localPath != "/repo" || call.base != testCommitA || call.head != testCommitB {
+			t.Fatalf("IsAncestor args = %+v, want /repo %s %s", call, testCommitA, testCommitB)
+		}
+		if len(f.analyses.findCalls) != 0 || len(f.analyses.creates) != 0 || len(f.queue.jobs) != 0 {
+			t.Fatal("rejected base must not reach reuse/create/enqueue")
+		}
+	})
+
+	t.Run("explicit base with an explicit head forms the analysed range", func(t *testing.T) {
+		f := newAnalysisFixture(t)
+
+		analysis, _, err := f.svc.Start(context.Background(), 11, 42,
+			StartAnalysisInput{BaseCommit: testCommitB, HeadCommit: testCommitC})
+		if err != nil {
+			t.Fatalf("Start error = %v", err)
+		}
+		if analysis.BaseCommit != testCommitB || analysis.HeadCommit != testCommitC {
+			t.Fatalf("commits = %s..%s, want %s..%s",
+				analysis.BaseCommit, analysis.HeadCommit, testCommitB, testCommitC)
+		}
+		if len(f.git.ancestorCalls) != 1 ||
+			f.git.ancestorCalls[0].base != testCommitB || f.git.ancestorCalls[0].head != testCommitC {
+			t.Fatalf("IsAncestor calls = %+v, want the explicit base..head range", f.git.ancestorCalls)
+		}
+		if len(f.git.headCalls) != 0 {
+			t.Fatal("an explicit head must not resolve the branch tip")
+		}
+	})
+
+	t.Run("a non-ancestor explicit base reports invalid_base_commit", func(t *testing.T) {
+		f := newAnalysisFixture(t)
+		f.git.ancestor = false
+
+		_, _, err := f.svc.Start(context.Background(), 11, 42,
+			StartAnalysisInput{BaseCommit: testCommitB, HeadCommit: testCommitC})
+		if !errors.Is(err, domain.ErrInvalid) || domain.Reason(err) != "invalid_base_commit" {
+			t.Fatalf("Start error = %v, want invalid_base_commit", err)
+		}
+	})
+
+	t.Run("an unresolvable explicit base reports invalid_base_commit", func(t *testing.T) {
+		f := newAnalysisFixture(t)
+		f.git.ancestorErr = domain.NewInvalid("commit", "commit_not_found", "unknown commit")
+
+		_, _, err := f.svc.Start(context.Background(), 11, 42,
+			StartAnalysisInput{BaseCommit: testCommitB})
+		if !errors.Is(err, domain.ErrInvalid) || domain.Reason(err) != "invalid_base_commit" {
+			t.Fatalf("Start error = %v, want invalid_base_commit", err)
+		}
+	})
+
+	t.Run("explicit base participates in reuse and version allocation", func(t *testing.T) {
+		f := newAnalysisFixture(t)
+		f.analyses.next = 4
+
+		analysis, reused, err := f.svc.Start(context.Background(), 11, 42,
+			StartAnalysisInput{BaseCommit: testCommitB})
+		if err != nil {
+			t.Fatalf("Start error = %v", err)
+		}
+		if reused {
+			t.Fatal("Start reused = true, want a new analysis")
+		}
+		if analysis.BaseCommit != testCommitB || analysis.HeadCommit != testCommitB {
+			t.Fatalf("commits = %s..%s, want %s..%s",
+				analysis.BaseCommit, analysis.HeadCommit, testCommitB, testCommitB)
+		}
+		if analysis.AnalysisVersion != 4 {
+			t.Fatalf("analysisVersion = %d, want 4", analysis.AnalysisVersion)
+		}
+		want := analysisFindReusableCall{
+			versionID: 11, repoID: 3, base: testCommitB, head: testCommitB,
+			model: analysisTestModel, prompt: analysisTestPrompt,
+		}
+		if len(f.analyses.findCalls) != 1 || !reflect.DeepEqual(f.analyses.findCalls[0], want) {
+			t.Fatalf("FindReusable calls = %+v, want %+v", f.analyses.findCalls, want)
+		}
+		wantVersion := analysisVersionCall{versionID: 11, base: testCommitB, head: testCommitB}
+		if len(f.analyses.nextArgs) != 1 || f.analyses.nextArgs[0] != wantVersion {
+			t.Fatalf("NextAnalysisVersion args = %+v, want %+v", f.analyses.nextArgs, wantVersion)
+		}
+	})
+
+	t.Run("explicit base reuses the done analysis of the same range", func(t *testing.T) {
+		f := newAnalysisFixture(t)
+		done := domain.CodeAnalysis{
+			ID: 901, VersionID: 11, RepoID: 3, BaseCommit: testCommitB, HeadCommit: testCommitB,
+			Status: domain.RunDone, AnalysisVersion: 2,
+		}
+		f.analyses.reusable = &done
+
+		analysis, reused, err := f.svc.Start(context.Background(), 11, 42,
+			StartAnalysisInput{BaseCommit: testCommitB})
+		if err != nil {
+			t.Fatalf("Start error = %v", err)
+		}
+		if !reused || analysis.ID != 901 {
+			t.Fatalf("Start = %+v reused=%v, want the done analysis of the explicit range", analysis, reused)
+		}
+		if len(f.analyses.findCalls) != 1 || f.analyses.findCalls[0].base != testCommitB {
+			t.Fatalf("FindReusable calls = %+v, want the explicit base", f.analyses.findCalls)
+		}
+		if len(f.analyses.creates) != 0 || len(f.queue.jobs) != 0 {
+			t.Fatal("reuse must not create or enqueue")
+		}
+	})
+
+	t.Run("explicit base is accepted without a version baseline", func(t *testing.T) {
+		f := newAnalysisFixture(t)
+		f.versions.info.BaselineCommit = ""
+
+		analysis, _, err := f.svc.Start(context.Background(), 11, 42,
+			StartAnalysisInput{BaseCommit: testCommitB})
+		if err != nil {
+			t.Fatalf("Start error = %v", err)
+		}
+		if analysis.BaseCommit != testCommitB {
+			t.Fatalf("base = %s, want the explicit %s", analysis.BaseCommit, testCommitB)
+		}
+	})
+
 	t.Run("queued analysis carries the resolved head and identity", func(t *testing.T) {
 		f := newAnalysisFixture(t)
 
-		analysis, reused, err := f.svc.Start(context.Background(), 11, 42, "", false)
+		analysis, reused, err := f.svc.Start(context.Background(), 11, 42, StartAnalysisInput{})
 		if err != nil {
 			t.Fatalf("Start error = %v", err)
 		}
@@ -1391,7 +1552,7 @@ func TestStartValidationAndReuse(t *testing.T) {
 	t.Run("explicit descendant head is accepted", func(t *testing.T) {
 		f := newAnalysisFixture(t)
 
-		analysis, _, err := f.svc.Start(context.Background(), 11, 42, testCommitC, false)
+		analysis, _, err := f.svc.Start(context.Background(), 11, 42, StartAnalysisInput{HeadCommit: testCommitC})
 		if err != nil {
 			t.Fatalf("Start error = %v", err)
 		}
@@ -1408,7 +1569,7 @@ func TestStartValidationAndReuse(t *testing.T) {
 		f.versions.info.BaselineCommit = testCommitB
 		f.git.head = testCommitB
 
-		analysis, _, err := f.svc.Start(context.Background(), 11, 42, "", false)
+		analysis, _, err := f.svc.Start(context.Background(), 11, 42, StartAnalysisInput{})
 		if err != nil {
 			t.Fatalf("Start error = %v", err)
 		}
@@ -1426,7 +1587,7 @@ func TestStartValidationAndReuse(t *testing.T) {
 		}
 		f.analyses.reusable = &done
 
-		analysis, reused, err := f.svc.Start(context.Background(), 11, 42, "", false)
+		analysis, reused, err := f.svc.Start(context.Background(), 11, 42, StartAnalysisInput{})
 		if err != nil {
 			t.Fatalf("Start error = %v", err)
 		}
@@ -1454,7 +1615,7 @@ func TestStartValidationAndReuse(t *testing.T) {
 		f.analyses.reusable = &done
 		f.analyses.next = 2
 
-		analysis, reused, err := f.svc.Start(context.Background(), 11, 42, "", true)
+		analysis, reused, err := f.svc.Start(context.Background(), 11, 42, StartAnalysisInput{Force: true})
 		if err != nil {
 			t.Fatalf("Start error = %v", err)
 		}
@@ -1476,7 +1637,7 @@ func TestStartValidationAndReuse(t *testing.T) {
 		f := newAnalysisFixture(t)
 		f.analyses.active = true
 
-		_, _, err := f.svc.Start(context.Background(), 11, 42, "", false)
+		_, _, err := f.svc.Start(context.Background(), 11, 42, StartAnalysisInput{})
 		if !errors.Is(err, domain.ErrConflict) || domain.Reason(err) != "analysis_in_progress" {
 			t.Fatalf("Start error = %v, want analysis_in_progress", err)
 		}
@@ -1490,7 +1651,7 @@ func TestStartValidationAndReuse(t *testing.T) {
 		f.llm = nil
 		f.rebuild()
 
-		analysis, _, err := f.svc.Start(context.Background(), 11, 42, "", false)
+		analysis, _, err := f.svc.Start(context.Background(), 11, 42, StartAnalysisInput{})
 		if err != nil {
 			t.Fatalf("Start error = %v", err)
 		}
@@ -1503,7 +1664,7 @@ func TestStartValidationAndReuse(t *testing.T) {
 		f := newAnalysisFixture(t)
 		f.queue.err = ErrQueueFull
 
-		analysis, reused, err := f.svc.Start(context.Background(), 11, 42, "", false)
+		analysis, reused, err := f.svc.Start(context.Background(), 11, 42, StartAnalysisInput{})
 		if err == nil {
 			t.Fatal("Start error = nil, want queue-full error")
 		}
@@ -1525,7 +1686,7 @@ func TestStartValidationAndReuse(t *testing.T) {
 		}
 		// The failed analysis is terminal: a later trigger is allowed again.
 		f.queue.err = nil
-		if _, _, err := f.svc.Start(context.Background(), 11, 42, "", false); err != nil {
+		if _, _, err := f.svc.Start(context.Background(), 11, 42, StartAnalysisInput{}); err != nil {
 			t.Fatalf("Start after queue-full failure error = %v, want nil", err)
 		}
 	})
@@ -1534,7 +1695,7 @@ func TestStartValidationAndReuse(t *testing.T) {
 		f := newAnalysisFixture(t)
 		f.versions.err = errors.New("version catalog down")
 
-		if _, _, err := f.svc.Start(context.Background(), 11, 42, "", false); err == nil {
+		if _, _, err := f.svc.Start(context.Background(), 11, 42, StartAnalysisInput{}); err == nil {
 			t.Fatal("Start error = nil, want the version lookup error")
 		}
 	})
@@ -1543,7 +1704,7 @@ func TestStartValidationAndReuse(t *testing.T) {
 		f := newAnalysisFixture(t)
 		f.analyses.createErr = errors.New("db down")
 
-		if _, _, err := f.svc.Start(context.Background(), 11, 42, "", false); err == nil {
+		if _, _, err := f.svc.Start(context.Background(), 11, 42, StartAnalysisInput{}); err == nil {
 			t.Fatal("Start error = nil, want the create error")
 		}
 		if len(f.queue.jobs) != 0 {
@@ -2342,7 +2503,7 @@ func TestRunPropagatesTriggerRequestIDToCompletionAudit(t *testing.T) {
 
 	const requestID = "req_e2e_analyze_1234"
 	analysis, reused, err := f.svc.Start(
-		platform.WithRequestID(context.Background(), requestID), 11, 42, "", false)
+		platform.WithRequestID(context.Background(), requestID), 11, 42, StartAnalysisInput{})
 	if err != nil {
 		t.Fatalf("Start error = %v", err)
 	}
@@ -2993,7 +3154,7 @@ func TestStartUsesRepositoryFixedBranchForLiveHead(t *testing.T) {
 	repo.FixedBranch = "release"
 	f.repos.infos[3] = repo
 
-	if _, _, err := f.svc.Start(context.Background(), 11, 42, "", false); err != nil {
+	if _, _, err := f.svc.Start(context.Background(), 11, 42, StartAnalysisInput{}); err != nil {
 		t.Fatalf("Start error = %v", err)
 	}
 	if len(f.git.headCalls) != 1 || f.git.headCalls[0] != "release" {

@@ -2,11 +2,55 @@ package application
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
 )
+
+// impactIssueID is the delivery issue id served by the anchor fixture's issue
+// catalog. Its foreign counterpart belongs to another version and must be
+// rejected by the anchor ownership check.
+const (
+	impactIssueID        int64 = 9301
+	impactForeignIssueID int64 = 9302
+)
+
+// issueCatalogCall records one IssueCatalog lookup.
+type issueCatalogCall struct {
+	versionID int64
+	issueID   int64
+}
+
+// stubIssueCatalog is the application IssueCatalog double. It serves the issues
+// registered for their own version and reports a missing/foreign issue as
+// found=false, like the delivery adapter maps its version-scoped not-found.
+type stubIssueCatalog struct {
+	owners map[int64]int64 // issueID -> versionID
+	err    error
+	calls  []issueCatalogCall
+}
+
+func newStubIssueCatalog() *stubIssueCatalog {
+	return &stubIssueCatalog{owners: make(map[int64]int64)}
+}
+
+func (s *stubIssueCatalog) add(versionID, issueID int64) {
+	s.owners[issueID] = versionID
+}
+
+func (s *stubIssueCatalog) GetIssue(_ context.Context, versionID, issueID int64) (IssueInfo, bool, error) {
+	s.calls = append(s.calls, issueCatalogCall{versionID: versionID, issueID: issueID})
+	if s.err != nil {
+		return IssueInfo{}, false, s.err
+	}
+	owner, ok := s.owners[issueID]
+	if !ok {
+		return IssueInfo{}, false, nil
+	}
+	return IssueInfo{ID: issueID, VersionID: owner}, true, nil
+}
 
 // anchorStore is a stateful in-memory AnchorRepository used by the anchor
 // service unit tests. It enforces the same point uniqueness and version-scoped
@@ -137,6 +181,7 @@ type anchorFixture struct {
 	repos     *stubRepos
 	versions  *stubVersions
 	appModels *impactAppModels
+	issues    *stubIssueCatalog
 	git       *stubGit
 	anchors   *anchorStore
 	ids       *stubIDs
@@ -176,15 +221,19 @@ func newAnchorFixture(t *testing.T) *anchorFixture {
 			Name:     "Orders",
 			Path:     "/orders",
 		}}},
+		issues:  newStubIssueCatalog(),
 		git:     &stubGit{head: testCommitA},
 		anchors: newAnchorStore(),
 		ids:     &stubIDs{next: 6000},
 		clock:   &stubClock{now: impactTestTime},
 	}
+	f.issues.add(impactVersionID, impactIssueID)
+	f.issues.add(impactVersionID+1, impactForeignIssueID)
 	f.svc = NewAnchorService(AnchorServiceDeps{
 		Repos:     f.repos,
 		Versions:  f.versions,
 		AppModels: f.appModels,
+		Issues:    f.issues,
 		Git:       f.git,
 		Anchors:   f.anchors,
 		IDs:       f.ids,
@@ -296,7 +345,7 @@ func TestAnchorCreateValidationAndDuplicate(t *testing.T) {
 	}
 
 	// Case anchors are accepted (D37); the mindmap context owns the subject
-	// lookup, while issue stays reserved.
+	// lookup. Issue anchors are accepted by P7 (design spec §7.9).
 	caseAnchor, err := f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
 		SubjectKind: domain.SubjectCase, SubjectID: impactRequirementID, FilePath: impactServerPath,
 	})
@@ -306,10 +355,14 @@ func TestAnchorCreateValidationAndDuplicate(t *testing.T) {
 	if caseAnchor.SubjectKind != domain.SubjectCase {
 		t.Fatalf("case anchor subject=%q", caseAnchor.SubjectKind)
 	}
-	if _, err := f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
-		SubjectKind: "issue", SubjectID: impactRequirementID, FilePath: impactClientPath,
-	}); domain.Reason(err) != "unsupported_subject_kind" {
-		t.Fatalf("issue error = %v, want unsupported_subject_kind", err)
+	issueAnchor, err := f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
+		SubjectKind: domain.SubjectIssue, SubjectID: impactIssueID, FilePath: impactClientPath,
+	})
+	if err != nil {
+		t.Fatalf("issue anchor error = %v", err)
+	}
+	if issueAnchor.SubjectKind != domain.SubjectIssue || issueAnchor.SubjectID != impactIssueID {
+		t.Fatalf("issue anchor subject=%s/%d", issueAnchor.SubjectKind, issueAnchor.SubjectID)
 	}
 
 	// Escaping paths are rejected; backslashes are normalised.
@@ -373,6 +426,98 @@ func TestAnchorCreateValidationAndDuplicate(t *testing.T) {
 	}
 	if len(f.anchors.listCalls) == 0 {
 		t.Fatal("List did not reach the repository")
+	}
+}
+
+// TestAnchorIssueSubjectOwnership pins design spec §7.9: an issue anchor may
+// only reference an issue of the path version, a foreign/missing issue is the
+// P4 ownership reason subject_not_in_version, and the issue anchors are listable
+// and deletable through the version-scoped service.
+func TestAnchorIssueSubjectOwnership(t *testing.T) {
+	f := newAnchorFixture(t)
+	ctx := context.Background()
+
+	created, err := f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
+		SubjectKind: domain.SubjectIssue, SubjectID: impactIssueID, FilePath: impactClientPath,
+	})
+	if err != nil {
+		t.Fatalf("issue anchor Create error = %v", err)
+	}
+	if created.SubjectKind != domain.SubjectIssue || created.SubjectID != impactIssueID {
+		t.Fatalf("issue anchor subject = %s/%d, want issue/%d", created.SubjectKind, created.SubjectID, impactIssueID)
+	}
+	if len(f.issues.calls) != 1 ||
+		f.issues.calls[0] != (issueCatalogCall{versionID: impactVersionID, issueID: impactIssueID}) {
+		t.Fatalf("issue catalog calls = %+v, want one (%d, %d)", f.issues.calls, impactVersionID, impactIssueID)
+	}
+
+	// An issue of another version is rejected before the file is validated.
+	fileCalls := len(f.git.fileCalls)
+	_, err = f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
+		SubjectKind: domain.SubjectIssue, SubjectID: impactForeignIssueID, FilePath: impactServerPath,
+	})
+	if !errors.Is(err, domain.ErrInvalid) || domain.Reason(err) != "subject_not_in_version" {
+		t.Fatalf("foreign issue error = %v, want invalid subject_not_in_version", err)
+	}
+	if len(f.git.fileCalls) != fileCalls {
+		t.Fatal("a foreign issue must be rejected before the file validation")
+	}
+
+	// An unknown issue is rejected the same way.
+	if _, err := f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
+		SubjectKind: domain.SubjectIssue, SubjectID: 999999, FilePath: impactServerPath,
+	}); domain.Reason(err) != "subject_not_in_version" {
+		t.Fatalf("unknown issue error = %v, want subject_not_in_version", err)
+	}
+
+	// A catalog failure is an operational error, not a domain verdict.
+	f.issues.err = errors.New("delivery down")
+	if _, err := f.svc.Create(ctx, impactVersionID, 7, domain.CreateAnchorParams{
+		SubjectKind: domain.SubjectIssue, SubjectID: impactIssueID, FilePath: impactServerPath,
+	}); err == nil || !errors.Is(err, f.issues.err) {
+		t.Fatalf("catalog failure error = %v, want the delivery error", err)
+	}
+	f.issues.err = nil
+
+	// Querying issue anchors by subject returns them (version-scoped list).
+	issueSubject := impactIssueID
+	listed, err := f.svc.List(ctx, impactVersionID, domain.AnchorFilter{
+		SubjectKind: domain.SubjectIssue, SubjectID: &issueSubject,
+	})
+	if err != nil {
+		t.Fatalf("List issue anchors error = %v", err)
+	}
+	if len(listed) != 1 || listed[0].ID != created.ID || listed[0].SubjectKind != domain.SubjectIssue {
+		t.Fatalf("listed issue anchors = %+v, want the created one", listed)
+	}
+
+	// Deletion stays version-scoped.
+	if err := f.svc.Delete(ctx, impactVersionID+1, created.ID); domain.Reason(err) != "anchor_not_found" {
+		t.Fatalf("foreign delete error = %v, want anchor_not_found", err)
+	}
+	if err := f.svc.Delete(ctx, impactVersionID, created.ID); err != nil {
+		t.Fatalf("Delete issue anchor error = %v", err)
+	}
+}
+
+// TestAnchorIssueSubjectRequiresCatalog pins the fail-loud wiring contract: an
+// issue anchor without the delivery issue catalog is a configuration error, not
+// a silently accepted cross-version subject.
+func TestAnchorIssueSubjectRequiresCatalog(t *testing.T) {
+	f := newAnchorFixture(t)
+	svc := NewAnchorService(AnchorServiceDeps{
+		Repos:     f.repos,
+		Versions:  f.versions,
+		AppModels: f.appModels,
+		Git:       f.git,
+		Anchors:   f.anchors,
+		IDs:       f.ids,
+		Clock:     f.clock,
+	})
+	if _, err := svc.Create(context.Background(), impactVersionID, 7, domain.CreateAnchorParams{
+		SubjectKind: domain.SubjectIssue, SubjectID: impactIssueID, FilePath: impactClientPath,
+	}); err == nil {
+		t.Fatal("Create error = nil, want the missing issue catalog to fail loudly")
 	}
 }
 
