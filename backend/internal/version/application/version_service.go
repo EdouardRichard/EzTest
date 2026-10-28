@@ -573,6 +573,103 @@ func (s *VersionService) EnterDesign(ctx context.Context, id int64, acknowledge 
 	return updated, warnings, nil
 }
 
+// EnterReview moves a designing version to reviewing (spec §6.3). It is called
+// on a successful design generation (auto) or by submit-review (manual). When
+// the version is already reviewing the call is idempotent: it returns the
+// current version and must not publish a duplicate event. This includes losing
+// the compare-and-swap to a concurrent reviewer, which is re-read and treated
+// as the same idempotent success.
+func (s *VersionService) EnterReview(ctx context.Context, id int64, actor int64) (*Version, error) {
+	current, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if current.Status == domain.VersionReviewing {
+		return current, nil
+	}
+	if current.Status != domain.VersionDesigning {
+		return nil, domain.NewStateConflict("version_state_conflict",
+			fmt.Sprintf("version %d is %s, enter-review requires designing", id, current.Status))
+	}
+
+	updated, err := s.repo.UpdateStatus(ctx, id, domain.VersionDesigning, domain.VersionReviewing, actor)
+	if err != nil {
+		// The CAS may have lost to a concurrent reviewer that already committed
+		// reviewing; re-read and return it instead of a spurious conflict.
+		latest, readErr := s.repo.Get(ctx, id)
+		if readErr == nil && latest.Status == domain.VersionReviewing {
+			return latest, nil
+		}
+		return nil, err
+	}
+	s.publish(ctx, VersionEvent{
+		VersionID: id,
+		Type:      "version.status_changed",
+		Summary:   "version status changed from designing to reviewing",
+		ActorID:   actor,
+		Source:    domain.SourceUser,
+		Detail:    map[string]any{"from": domain.VersionDesigning, "to": domain.VersionReviewing},
+	})
+	return updated, nil
+}
+
+// RejectReview returns a reviewing version to designing (spec §6.3). The
+// mindmap context writes the review decision; this action only moves the
+// version state so the graph stays editable.
+func (s *VersionService) RejectReview(ctx context.Context, id int64, actor int64) (*Version, error) {
+	current, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if current.Status != domain.VersionReviewing {
+		return nil, domain.NewStateConflict("version_state_conflict",
+			fmt.Sprintf("version %d is %s, reject-review requires reviewing", id, current.Status))
+	}
+
+	updated, err := s.repo.UpdateStatus(ctx, id, domain.VersionReviewing, domain.VersionDesigning, actor)
+	if err != nil {
+		return nil, err
+	}
+	s.publish(ctx, VersionEvent{
+		VersionID: id,
+		Type:      "version.status_changed",
+		Summary:   "version status changed from reviewing to designing",
+		ActorID:   actor,
+		Source:    domain.SourceUser,
+		Detail:    map[string]any{"from": domain.VersionReviewing, "to": domain.VersionDesigning},
+	})
+	return updated, nil
+}
+
+// ApproveBaseline moves a reviewing version to executing (spec §6.3/§6.4). The
+// mindmap context freezes the case baseline around this call; this action only
+// drives the version state and never updates the mindmap tables. Once the
+// version is executing, a second approve is a version_state_conflict.
+func (s *VersionService) ApproveBaseline(ctx context.Context, id int64, actor int64) (*Version, error) {
+	current, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if current.Status != domain.VersionReviewing {
+		return nil, domain.NewStateConflict("version_state_conflict",
+			fmt.Sprintf("version %d is %s, approve-baseline requires reviewing", id, current.Status))
+	}
+
+	updated, err := s.repo.UpdateStatus(ctx, id, domain.VersionReviewing, domain.VersionExecuting, actor)
+	if err != nil {
+		return nil, err
+	}
+	s.publish(ctx, VersionEvent{
+		VersionID: id,
+		Type:      "version.status_changed",
+		Summary:   "version status changed from reviewing to executing",
+		ActorID:   actor,
+		Source:    domain.SourceUser,
+		Detail:    map[string]any{"from": domain.VersionReviewing, "to": domain.VersionExecuting},
+	})
+	return updated, nil
+}
+
 // publish emits one event after a committed write. Publication failures are
 // logged and swallowed: clients read the authoritative state from the API and
 // the event stream self-heals on refresh (spec §6.10).

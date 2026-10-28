@@ -48,6 +48,10 @@ type fakeVersionRepo struct {
 	binds      int
 	statuses   int
 	lastFilter domain.VersionFilter
+	// beforeStatus, when set, runs once just before the next status
+	// compare-and-swap. Tests use it to simulate a concurrent writer that
+	// commits between the service's read and its CAS.
+	beforeStatus func(id int64)
 }
 
 // newFakeVersionRepo returns an empty repository.
@@ -184,6 +188,11 @@ func (r *fakeVersionRepo) UpdateBindings(_ context.Context, id int64, expected i
 
 // UpdateStatus applies a status compare-and-swap.
 func (r *fakeVersionRepo) UpdateStatus(_ context.Context, id int64, from, to string, actor int64) (*domain.Version, error) {
+	if r.beforeStatus != nil {
+		hook := r.beforeStatus
+		r.beforeStatus = nil
+		hook(id)
+	}
 	stored, ok := r.versions[id]
 	if !ok || stored.Status != from {
 		return nil, domain.NewStateConflict("version_state_conflict", "version status does not allow this action")
@@ -981,4 +990,204 @@ func TestEnterDesignWarningsRequireAck(t *testing.T) {
 			})
 		}
 	})
+}
+
+// reviewAction is one P5 version review lifecycle action under test.
+type reviewAction struct {
+	name string
+	call func(*application.VersionService, int64) (*domain.Version, error)
+}
+
+// reviewActions returns the three review lifecycle actions bound to actor 42.
+func reviewActions() []reviewAction {
+	return []reviewAction{
+		{name: "EnterReview", call: func(s *application.VersionService, id int64) (*domain.Version, error) {
+			return s.EnterReview(context.Background(), id, 42)
+		}},
+		{name: "RejectReview", call: func(s *application.VersionService, id int64) (*domain.Version, error) {
+			return s.RejectReview(context.Background(), id, 42)
+		}},
+		{name: "ApproveBaseline", call: func(s *application.VersionService, id int64) (*domain.Version, error) {
+			return s.ApproveBaseline(context.Background(), id, 42)
+		}},
+	}
+}
+
+// assertStatusChangedEvent asserts one version.status_changed event carrying the
+// expected from/to detail.
+func assertStatusChangedEvent(t *testing.T, events *fakeEvents, versionID int64, from, to string) {
+	t.Helper()
+	if len(events.events) != 1 {
+		t.Fatalf("events = %d, want 1 (%+v)", len(events.events), events.events)
+	}
+	event := events.events[0]
+	if event.Type != "version.status_changed" || event.VersionID != versionID ||
+		event.ActorID != 42 || event.Source != domain.SourceUser {
+		t.Fatalf("event = %+v", event)
+	}
+	if event.Detail["from"] != from || event.Detail["to"] != to {
+		t.Fatalf("event detail = %+v, want %s -> %s", event.Detail, from, to)
+	}
+}
+
+func TestEnterReviewMovesDesigningToReviewing(t *testing.T) {
+	f := newVersionFixture()
+	stored := f.repo.seed(domain.Version{ID: 100, Name: "Order v2", Status: domain.VersionDesigning, CreatedBy: 1, UpdatedBy: 1})
+
+	updated, err := f.service.EnterReview(context.Background(), stored.ID, 42)
+	if err != nil {
+		t.Fatalf("EnterReview: %v", err)
+	}
+
+	if updated.Status != domain.VersionReviewing || updated.Revision != 2 || updated.UpdatedBy != 42 {
+		t.Fatalf("status/revision/updatedBy = %s/%d/%d, want reviewing/2/42",
+			updated.Status, updated.Revision, updated.UpdatedBy)
+	}
+	if got := f.repo.versions[stored.ID]; got.Status != domain.VersionReviewing {
+		t.Fatalf("stored status = %s, want reviewing", got.Status)
+	}
+	assertStatusChangedEvent(t, f.events, stored.ID, domain.VersionDesigning, domain.VersionReviewing)
+}
+
+func TestEnterReviewIsIdempotent(t *testing.T) {
+	t.Run("already reviewing returns the current version without a duplicate event", func(t *testing.T) {
+		f := newVersionFixture()
+		stored := f.repo.seed(domain.Version{
+			ID: 100, Name: "Order v2", Status: domain.VersionReviewing, Revision: 3, CreatedBy: 1, UpdatedBy: 2,
+		})
+
+		updated, err := f.service.EnterReview(context.Background(), stored.ID, 42)
+		if err != nil {
+			t.Fatalf("EnterReview must be idempotent when already reviewing (spec §6.3): %v", err)
+		}
+
+		if updated.ID != stored.ID || updated.Status != domain.VersionReviewing || updated.Revision != 3 {
+			t.Fatalf("version = %+v, want the unchanged reviewing version", updated)
+		}
+		if f.repo.statuses != 0 {
+			t.Fatalf("idempotent EnterReview wrote the repository %d times", f.repo.statuses)
+		}
+		if len(f.events.events) != 0 {
+			t.Fatalf("idempotent EnterReview published a duplicate event: %+v", f.events.events)
+		}
+	})
+
+	t.Run("losing the CAS to a concurrent reviewer is also idempotent", func(t *testing.T) {
+		f := newVersionFixture()
+		stored := f.repo.seed(domain.Version{ID: 100, Name: "Order v2", Status: domain.VersionDesigning, CreatedBy: 1, UpdatedBy: 1})
+		// Another writer commits reviewing between the service's read and its CAS.
+		f.repo.beforeStatus = func(id int64) {
+			row := f.repo.versions[id]
+			row.Status = domain.VersionReviewing
+			row.Revision++
+			f.repo.versions[id] = row
+		}
+
+		updated, err := f.service.EnterReview(context.Background(), stored.ID, 42)
+		if err != nil {
+			t.Fatalf("EnterReview must re-read and succeed after a lost CAS when reviewing: %v", err)
+		}
+
+		if updated.Status != domain.VersionReviewing {
+			t.Fatalf("status = %s, want the concurrently committed reviewing", updated.Status)
+		}
+		if f.repo.statuses != 0 {
+			t.Fatalf("losing CAS still wrote %d status transitions", f.repo.statuses)
+		}
+		if len(f.events.events) != 0 {
+			t.Fatalf("losing CAS published a transition event: %+v", f.events.events)
+		}
+	})
+}
+
+func TestRejectReviewReturnsVersionToDesigning(t *testing.T) {
+	f := newVersionFixture()
+	stored := f.repo.seed(domain.Version{ID: 100, Name: "Order v2", Status: domain.VersionReviewing, CreatedBy: 1, UpdatedBy: 1})
+
+	updated, err := f.service.RejectReview(context.Background(), stored.ID, 42)
+	if err != nil {
+		t.Fatalf("RejectReview: %v", err)
+	}
+
+	if updated.Status != domain.VersionDesigning || updated.Revision != 2 || updated.UpdatedBy != 42 {
+		t.Fatalf("status/revision/updatedBy = %s/%d/%d, want designing/2/42",
+			updated.Status, updated.Revision, updated.UpdatedBy)
+	}
+	if got := f.repo.versions[stored.ID]; got.Status != domain.VersionDesigning {
+		t.Fatalf("stored status = %s, want designing", got.Status)
+	}
+	assertStatusChangedEvent(t, f.events, stored.ID, domain.VersionReviewing, domain.VersionDesigning)
+}
+
+func TestApproveBaselineStartsExecuting(t *testing.T) {
+	f := newVersionFixture()
+	stored := f.repo.seed(domain.Version{ID: 100, Name: "Order v2", Status: domain.VersionReviewing, CreatedBy: 1, UpdatedBy: 1})
+
+	updated, err := f.service.ApproveBaseline(context.Background(), stored.ID, 42)
+	if err != nil {
+		t.Fatalf("ApproveBaseline: %v", err)
+	}
+
+	if updated.Status != domain.VersionExecuting || updated.Revision != 2 || updated.UpdatedBy != 42 {
+		t.Fatalf("status/revision/updatedBy = %s/%d/%d, want executing/2/42",
+			updated.Status, updated.Revision, updated.UpdatedBy)
+	}
+	if got := f.repo.versions[stored.ID]; got.Status != domain.VersionExecuting {
+		t.Fatalf("stored status = %s, want executing", got.Status)
+	}
+	assertStatusChangedEvent(t, f.events, stored.ID, domain.VersionReviewing, domain.VersionExecuting)
+}
+
+func TestReviewActionsRejectInvalidFromState(t *testing.T) {
+	cases := []struct {
+		action string
+		status string
+	}{
+		{"EnterReview", domain.VersionDraft},
+		{"EnterReview", domain.VersionClarifying},
+		{"EnterReview", domain.VersionExecuting},
+		{"RejectReview", domain.VersionDesigning},
+		{"RejectReview", domain.VersionExecuting},
+		{"ApproveBaseline", domain.VersionDesigning},
+		{"ApproveBaseline", domain.VersionClarifying},
+	}
+	actions := map[string]reviewAction{}
+	for _, action := range reviewActions() {
+		actions[action.name] = action
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.action+" from "+tc.status, func(t *testing.T) {
+			f := newVersionFixture()
+			stored := f.repo.seed(domain.Version{ID: 100, Name: "Order v2", Status: tc.status, CreatedBy: 1, UpdatedBy: 1})
+
+			_, err := actions[tc.action].call(f.service, stored.ID)
+
+			assertDomainReason(t, err, domain.KindStateConflict, "version_state_conflict")
+			if got := f.repo.versions[stored.ID]; got.Status != tc.status || got.Revision != 1 {
+				t.Fatalf("status/revision = %s/%d, want %s/1", got.Status, got.Revision, tc.status)
+			}
+			if f.repo.statuses != 0 {
+				t.Fatalf("invalid transition wrote the repository %d times", f.repo.statuses)
+			}
+			if len(f.events.events) != 0 {
+				t.Fatalf("invalid transition published events: %+v", f.events.events)
+			}
+		})
+	}
+}
+
+func TestReviewActionsRequireExistingVersion(t *testing.T) {
+	for _, action := range reviewActions() {
+		t.Run(action.name, func(t *testing.T) {
+			f := newVersionFixture()
+
+			_, err := action.call(f.service, 999)
+
+			assertDomainReason(t, err, domain.KindNotFound, "not_found")
+			if len(f.events.events) != 0 {
+				t.Fatalf("missing version published events: %+v", f.events.events)
+			}
+		})
+	}
 }
