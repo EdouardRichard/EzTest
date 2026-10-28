@@ -125,7 +125,7 @@ func seedIndexRepo(t *testing.T, db *pgxpool.Pool, localPath string) int64 {
 	key := fmt.Sprintf("p4-index-%d", nextSeedID())
 	var repoID int64
 	if err := db.QueryRow(ctx,
-		`INSERT INTO code_repositories (key, name, local_path) VALUES ($1, $2, $3) RETURNING id`,
+		`INSERT INTO code_repository (key, name, local_path) VALUES ($1, $2, $3) RETURNING id`,
 		key, "P4 index repository", localPath,
 	).Scan(&repoID); err != nil {
 		t.Fatalf("seed code repository: %v", err)
@@ -257,7 +257,7 @@ func TestIndexIntegrationRunsIndexAndMarksIndexed(t *testing.T) {
 	var lastIndexedAt *time.Time
 	var lastCommit string
 	if err := pool.QueryRow(ctx,
-		`SELECT last_indexed_at, last_commit FROM code_repositories WHERE id = $1`, repoID,
+		`SELECT last_indexed_at, last_commit FROM code_repository WHERE id = $1`, repoID,
 	).Scan(&lastIndexedAt, &lastCommit); err != nil {
 		t.Fatalf("read repository index state: %v", err)
 	}
@@ -322,7 +322,7 @@ func TestIndexIntegrationTruncatesAtMaxFiles(t *testing.T) {
 
 	var lastIndexedAt *time.Time
 	if err := pool.QueryRow(ctx,
-		`SELECT last_indexed_at FROM code_repositories WHERE id = $1`, repoID,
+		`SELECT last_indexed_at FROM code_repository WHERE id = $1`, repoID,
 	).Scan(&lastIndexedAt); err != nil {
 		t.Fatalf("read last_indexed_at: %v", err)
 	}

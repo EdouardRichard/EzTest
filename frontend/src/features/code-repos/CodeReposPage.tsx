@@ -28,7 +28,7 @@ type CodeRepoForm = {
 }
 
 /**
- * Defaults from the code_repositories DDL. The backend applies them only when
+ * Defaults from the code_repository DDL. The backend applies them only when
  * `excludeGlobs` is omitted, so the create form must send them explicitly.
  */
 const DEFAULT_EXCLUDE_GLOBS = ".git/**, node_modules/**, dist/**, build/**, vendor/**"

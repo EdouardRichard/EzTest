@@ -192,6 +192,7 @@ P4 新增的 `codeintel` 上下文位于 `backend/internal/codeintel/`：承载�
 - 启动时获取 `pg_advisory_lock`，按版本顺序事务执行，写 `schema_migrations`；重复执行无副作用。
 - 一个迁移文件只属于一个上下文；跨上下文外键需显式评审。
 - 种子数据只允许幂等初始化（管理员、默认 LLM 配置），不得写入业务样例数据。
+- 表名/字段名/索引名遵循 §6.9（D34）；历史表改名走新增迁移，不改已应用迁移与既有字段/约束/索引名。
 
 ### 6.4 前端规则
 
@@ -232,6 +233,17 @@ P4 新增的 `codeintel` 上下文位于 `backend/internal/codeintel/`：承载�
 3. 新功能不得新增对 P0 `storage` 内容寻址对象存储的依赖；该上下文冻结为既有能力/历史兼容，确需复用须在阶段规格中显式记录理由与 D#。
 4. 删除采用“DB 元数据 + best-effort 文件删除”；孤儿文件由 GC/保留策略处理，不阻塞业务。
 5. 下载/读取必须鉴权，不对外暴露内部存储路径；文件内容视为不可信数据。
+
+### 6.9 数据库命名规约（D34）
+
+1. **表名**：小写字母/数字/下划线；**单数**；禁止保留字；推荐 `业务名称_表的作用`（如 `case_review_finding`）；禁止 `tbl_`/`tb_` 前缀。
+2. **字段名**：小写+下划线；布尔用 `is_` 前缀；禁止保留字；P5 **不改**任何既有字段名。
+3. **主键**：`id BIGINT`（雪花，D29），不做自增、不做 unsigned 语义（PostgreSQL 无 unsigned）；每表必须有主键。
+4. **审计字段**：P5 起新表沿用 `created_at TIMESTAMPTZ NOT NULL DEFAULT now()`、`updated_at TIMESTAMPTZ NOT NULL DEFAULT now()`（对阿里“id/gmt_create/gmt_modified 三字段”的**显式例外**，理由：与本仓库既有字段/Go 映射一致，避免两套时间字段语义）。
+5. **索引命名**：`pk_<表名>`（主键约束）、`uk_<表名>_<列...>`（唯一）、`idx_<表名>_<列...>`（普通）。阿里原文的 `pk_字段名`/`uk_字段名` 在 PostgreSQL 下要求 schema 内全库唯一，按此适配落地。
+6. **迁移**：`<context>_<NNNN>_<desc>.sql` 只追加；改名/扩宽 CHECK 用新迁移；一个文件只属一个上下文。
+7. **外键**：跨上下文不建 FK，只做 BIGINT 逻辑引用；同上下文内 FK 可选。
+8. **例外**：`schema_migrations`（迁移框架表，类比 `flyway_schema_history`）不改名；历史阶段规格（P2/P3/P4 spec）作为交付记录保留旧名，主蓝图 §10.2 更新为规范名。
 
 ---
 

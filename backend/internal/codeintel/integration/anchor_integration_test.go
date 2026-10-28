@@ -54,7 +54,7 @@ func newAnchorIntegrationFixture(t *testing.T, pool *pgxpool.Pool) *anchorIntegr
 	repoID, versionID, requirementID := seedAnalysisRepoVersion(t, pool, dir, base)
 
 	systemID := impactIntegrationSeedSystem(t, pool)
-	if _, err := pool.Exec(ctx, `UPDATE versions SET system_id = $1 WHERE id = $2`, systemID, versionID); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE version SET system_id = $1 WHERE id = $2`, systemID, versionID); err != nil {
 		t.Fatalf("bind version system: %v", err)
 	}
 	appModelID := impactIntegrationSeedAppModel(t, pool, systemID,

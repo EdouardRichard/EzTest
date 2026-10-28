@@ -56,7 +56,7 @@ func seedRepoVersionRequirement(t *testing.T, db *pgxpool.Pool) (repoID, version
 
 	repoKey := fmt.Sprintf("p4-seed-%d", nextSeedID())
 	if err := db.QueryRow(ctx,
-		`INSERT INTO code_repositories (key, name, local_path) VALUES ($1, $2, $3) RETURNING id`,
+		`INSERT INTO code_repository (key, name, local_path) VALUES ($1, $2, $3) RETURNING id`,
 		repoKey, "P4 seed repository", "/tmp/"+repoKey,
 	).Scan(&repoID); err != nil {
 		t.Fatalf("seed code repository: %v", err)
@@ -64,7 +64,7 @@ func seedRepoVersionRequirement(t *testing.T, db *pgxpool.Pool) (repoID, version
 
 	versionID = nextSeedID()
 	if _, err := db.Exec(ctx,
-		`INSERT INTO versions
+		`INSERT INTO version
 			(id, name, status, code_repository_id, code_branch, code_baseline_commit, created_by, updated_by)
 		 VALUES ($1, $2, 'draft', $3, 'main', $4, 1, 1)`,
 		versionID, "P4 seed version", repoID, seedBaseCommit,
@@ -74,7 +74,7 @@ func seedRepoVersionRequirement(t *testing.T, db *pgxpool.Pool) (repoID, version
 
 	requirementID = nextSeedID()
 	if _, err := db.Exec(ctx,
-		`INSERT INTO requirements (id, version_id, title, created_by, updated_by)
+		`INSERT INTO requirement (id, version_id, title, created_by, updated_by)
 		 VALUES ($1, $2, $3, 1, 1)`,
 		requirementID, versionID, "P4 seed requirement",
 	); err != nil {

@@ -31,7 +31,7 @@ import {
  * confirmed, the live SSE transcript is visible, and reload/reconnect lose
  * nothing. Item 4 (multimodal recon) is covered at the end: the outgoing request
  * carries exactly one resolved `image_url`, the oversized image is annotated as
- * skipped, and no data URL reaches `agent_messages`.
+ * skipped, and no data URL reaches `agent_message`.
  */
 
 const QUESTION_ONE = "P3 问题一：订单金额达到多少需要人工审核？"

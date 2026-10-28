@@ -175,7 +175,7 @@ func ParseQueryLimit(r *http.Request) (int, error) {
 
 // ParseBeforeID parses the optional raw P1 message id of ?before_id=. The value
 // is deliberately not a P3 snowflake string: clarification messages are P1
-// agent_messages and page backwards by their numeric ids (spec §7.5). An empty
+// agent_message and page backwards by their numeric ids (spec §7.5). An empty
 // value means "the newest page".
 func ParseBeforeID(r *http.Request) (int64, error) {
 	raw := strings.TrimSpace(r.URL.Query().Get("before_id"))

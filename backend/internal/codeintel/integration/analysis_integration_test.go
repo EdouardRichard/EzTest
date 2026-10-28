@@ -148,11 +148,11 @@ func seedAnalysisRepoVersion(t *testing.T, pool *pgxpool.Pool, dir, base string)
 	repoID, versionID, requirementID = seedRepoVersionRequirement(t, pool)
 	ctx := context.Background()
 	if _, err := pool.Exec(ctx,
-		`UPDATE code_repositories SET local_path = $1 WHERE id = $2`, dir, repoID); err != nil {
+		`UPDATE code_repository SET local_path = $1 WHERE id = $2`, dir, repoID); err != nil {
 		t.Fatalf("point code repository at the fixture: %v", err)
 	}
 	if _, err := pool.Exec(ctx,
-		`UPDATE versions SET code_branch = 'main', code_baseline_commit = $1 WHERE id = $2`,
+		`UPDATE version SET code_branch = 'main', code_baseline_commit = $1 WHERE id = $2`,
 		base, versionID); err != nil {
 		t.Fatalf("point version at the fixture baseline: %v", err)
 	}
@@ -164,7 +164,7 @@ func seedAnalysisVersion(t *testing.T, pool *pgxpool.Pool, repoID int64, base st
 	t.Helper()
 	versionID := nextSeedID()
 	if _, err := pool.Exec(context.Background(),
-		`INSERT INTO versions
+		`INSERT INTO version
 			(id, name, status, code_repository_id, code_branch, code_baseline_commit, created_by, updated_by)
 		 VALUES ($1, $2, 'draft', $3, 'main', $4, 1, 1)`,
 		versionID, fmt.Sprintf("P4 analysis version %d", versionID), repoID, base,

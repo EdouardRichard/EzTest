@@ -359,7 +359,7 @@ export type ClarificationToolCall = {
 }
 
 /**
- * One clarification message projected from P1 `agent_messages` (spec §7.5).
+ * One clarification message projected from P1 `agent_message` (spec §7.5).
  * `id`/`runId` are P1 numbers; the session ID is not part of this projection.
  */
 export type ClarificationMessage = {
