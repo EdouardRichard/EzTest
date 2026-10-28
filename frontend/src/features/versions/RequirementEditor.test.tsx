@@ -188,6 +188,33 @@ describe("RequirementEditor", () => {
     expect(onUpdated).toHaveBeenCalledWith(reopened)
   })
 
+  it("warns that creating a requirement enters continuing on a completed version", () => {
+    const { rerender } = renderEditor({ creating: true, versionStatus: "completed" })
+
+    expect(
+      screen.getByText("当前版本已完成：创建需求后将自动进入继续中，并开始增量澄清。"),
+    ).toBeTruthy()
+
+    rerender(
+      <RequirementEditor
+        versionId={VERSION_ID}
+        requirement={null}
+        creating
+        versionStatus="designing"
+        onCreated={vi.fn()}
+        onUpdated={vi.fn()}
+        onDeleted={vi.fn()}
+        onCancelCreate={vi.fn()}
+        onReload={vi.fn()}
+        onAttachmentsChanged={vi.fn()}
+      />,
+    )
+
+    expect(
+      screen.queryByText("当前版本已完成：创建需求后将自动进入继续中，并开始增量澄清。"),
+    ).toBeNull()
+  })
+
   it("creates a requirement after validating the title", async () => {
     const created = requirement({ id: "1844674407370956009", title: "退款审核", revision: 1 })
     mocks.createRequirement.mockResolvedValue(created)

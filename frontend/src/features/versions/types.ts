@@ -33,8 +33,26 @@ export type VersionBindings = {
 }
 
 /**
+ * Continuing phase of a version (spec §5.1/§7.2). The backend returns null when
+ * the version is not continuing, so the empty string only exists as a defensive
+ * display value.
+ */
+export type ContinuePhase = "" | "clarifying" | "designing" | "executing"
+
+/** Batch provenance of a run batch (spec §5.3/§7.7). */
+export type BatchKind = "baseline" | "incremental" | "supplement"
+
+/** Case-run provenance inside a batch (spec §5.3). */
+export type CaseSource = "baseline" | "ai_supplement"
+
+/**
  * `VersionDTO` (spec §7.2). `id` is a 64-bit snowflake serialized as a decimal
  * string and must never be converted with `Number()`.
+ *
+ * The P6 execution-state fields use the server wire keys `paused`/`pause_mode`/
+ * `batch_no` (the DTO keeps those names), and the P7 continuing fields use
+ * `continuePhase`/`continuedAt`. They are optional so older fixtures remain
+ * valid; a missing value reads as "not paused"/"not continuing".
  */
 export type Version = {
   id: string
@@ -42,6 +60,13 @@ export type Version = {
   label: string
   description: string
   status: VersionStatus
+  paused?: boolean
+  /** Pause mode of the version (`graceful`/`immediate`), snake_case on the wire. */
+  pause_mode?: string
+  /** Highest batch number allocated so far; the continuing badge shows N+1. */
+  batch_no?: number
+  continuePhase?: ContinuePhase | null
+  continuedAt?: string | null
   systemId: number | null
   environmentId: number | null
   codeRepositoryId: number | null
@@ -458,4 +483,79 @@ export type CreateDecisionBody = {
 export type UpdateDecisionBody = {
   status: "accepted" | "rejected"
   rationale?: string
+}
+
+// --- Continuing / incremental plan (spec §7.6/§7.7) -----------------------
+
+/** One materialized supplement case of the incremental plan. */
+export type IncrementalPlanNewCase = {
+  /** P3 snowflake as a decimal string (D29). */
+  nodeId: string
+  title: string
+  priority: string
+  confidence: string
+  requirementIds: string[]
+  status: string
+}
+
+/** One affected existing case proposal of the incremental plan. */
+export type IncrementalPlanAffectedCase = {
+  nodeId: string
+  title: string
+  confidence: string
+  reason: string
+  source: string
+  /** True for the default high/medium confidence selection. */
+  selected: boolean
+}
+
+/** One P4 code change that could not be mapped to a case. */
+export type IncrementalPlanChange = {
+  path: string
+  summary: string
+}
+
+/** One stable plan warning (`impact_unavailable`, `history_rewritten`, …). */
+export type IncrementalPlanWarning = {
+  code: string
+  message: string
+}
+
+/** The latest `incremental_design` run summary; absent before the first run. */
+export type IncrementalPlanRun = {
+  id: string
+  kind: string
+  status: string
+  result: Record<string, unknown>
+}
+
+/** `IncrementalPlanView` of spec §7.6; every collection is always present. */
+export type IncrementalPlan = {
+  versionId: string
+  phase: string
+  parentBatchId: string | null
+  run: IncrementalPlanRun | null
+  newCases: IncrementalPlanNewCase[]
+  affectedCases: IncrementalPlanAffectedCase[]
+  unmappedChanges: IncrementalPlanChange[]
+  /** Backend default selection: all new cases + high/medium affected cases. */
+  defaultCaseIds: string[]
+  warnings: IncrementalPlanWarning[]
+  degraded: boolean
+}
+
+/** Body of the incremental batch creation; `kind` is fixed by the API helper. */
+export type CreateIncrementalBatchBody = {
+  caseIds: string[]
+  /** The parent (latest terminal) batch; a decimal string (D29). */
+  parentBatchId: string
+}
+
+/** Minimal batch projection returned by `POST /batches` for the panel. */
+export type CreatedBatch = {
+  id: string
+  batch_no: number
+  status: string
+  kind?: BatchKind
+  parentBatchId?: string | null
 }

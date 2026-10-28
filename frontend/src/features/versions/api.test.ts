@@ -8,6 +8,7 @@ import {
   confirmRequirement,
   createClarificationQuestion,
   createDecision,
+  createIncrementalBatch,
   createRelation,
   createRequirement,
   createVersion,
@@ -18,6 +19,7 @@ import {
   enterDesign,
   fetchVersionEvents,
   getClarification,
+  getIncrementalPlan,
   getVersion,
   listAttachments,
   listClarificationMessages,
@@ -44,6 +46,7 @@ import type {
   ClarificationMessage,
   ClarificationQuestion,
   ClarificationSession,
+  IncrementalPlan,
   Requirement,
   RequirementAttachment,
   RequirementRelation,
@@ -955,5 +958,160 @@ describe("clarification api", () => {
     expect(request.url.endsWith(`/api/versions/${VERSION_ID}/decisions/${DECISION_ID}`)).toBe(true)
     expect(request.method).toBe("PATCH")
     expect(jsonBody(request)).toEqual({ status: "accepted" })
+  })
+})
+
+// --- Continuing / incremental plan (spec §7.6/§7.7) ------------------------
+
+const PARENT_BATCH_ID = "1844674407370955301"
+const INCREMENTAL_BATCH_ID = "1844674407370955309"
+const NEW_CASE_ID = "1844674407370955302"
+const AFFECTED_CASE_ID = "1844674407370955303"
+const LOW_CASE_ID = "1844674407370955304"
+const PLAN_RUN_ID = "1844674407370955305"
+
+const INCREMENTAL_PLAN: IncrementalPlan = {
+  versionId: VERSION_ID,
+  phase: "designing",
+  parentBatchId: PARENT_BATCH_ID,
+  run: {
+    id: PLAN_RUN_ID,
+    kind: "incremental_design",
+    status: "done",
+    result: {},
+  },
+  newCases: [
+    {
+      nodeId: NEW_CASE_ID,
+      title: "新增退款用例",
+      priority: "P1",
+      confidence: "high",
+      requirementIds: [REQUIREMENT_ID],
+      status: "supplemented",
+    },
+  ],
+  affectedCases: [
+    {
+      nodeId: AFFECTED_CASE_ID,
+      title: "受影响的下单用例",
+      confidence: "medium",
+      reason: "退款接口变更",
+      source: "code",
+      selected: true,
+    },
+    {
+      nodeId: LOW_CASE_ID,
+      title: "低置信用例",
+      confidence: "low",
+      reason: "可能受影响",
+      source: "requirement",
+      selected: false,
+    },
+  ],
+  unmappedChanges: [{ path: "src/api/refund.ts", summary: "退款接口新增 reason 参数" }],
+  defaultCaseIds: [NEW_CASE_ID, AFFECTED_CASE_ID],
+  warnings: [{ code: "impact_unavailable", message: "影响分析不可用" }],
+  degraded: false,
+}
+
+const CREATED_BATCH = {
+  id: INCREMENTAL_BATCH_ID,
+  version_id: VERSION_ID,
+  batch_no: 2,
+  status: "planned" as const,
+  kind: "incremental" as const,
+  parentBatchId: PARENT_BATCH_ID,
+  graphHash: "b".repeat(64),
+  baseFallbackReason: "",
+  paused: false,
+  pause_mode: "",
+  pause_reason: "",
+  baseline_hash: "a".repeat(64),
+  code_baseline_commit: null,
+  head_commit: null,
+  counts: {
+    total: 2,
+    passed: 0,
+    failed: 0,
+    blocked: 0,
+    inconclusive: 0,
+    skipped: 0,
+    interrupted: 0,
+  },
+  created_by: "1",
+  started_at: null,
+  finished_at: null,
+  failure_reason: "",
+  created_at: "2026-10-28T10:00:00Z",
+  updated_at: "2026-10-28T10:00:00Z",
+}
+
+describe("continuing and incremental plan api", () => {
+  beforeEach(() => {
+    fetchMock.mockReset()
+    vi.stubGlobal("fetch", fetchMock)
+    setToken("test-token")
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it("reads the incremental plan with string ids and collections intact", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ data: INCREMENTAL_PLAN }))
+
+    const plan = await getIncrementalPlan(VERSION_ID)
+
+    expect(plan).toEqual(INCREMENTAL_PLAN)
+    expect(typeof plan.versionId).toBe("string")
+    expect(typeof plan.parentBatchId).toBe("string")
+    expect(typeof plan.defaultCaseIds[0]).toBe("string")
+    expect(plan.defaultCaseIds).toEqual([NEW_CASE_ID, AFFECTED_CASE_ID])
+    expect(plan.affectedCases.map((item) => item.selected)).toEqual([true, false])
+
+    const request = lastRequest()
+    expect(request.url.endsWith(`/api/versions/${VERSION_ID}/mindmap/incremental-plan`)).toBe(true)
+    expect(request.method).toBe("GET")
+    expect(request.headers.Authorization).toBe("Bearer test-token")
+  })
+
+  it("normalizes an empty plan so the panel never renders undefined", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        data: { versionId: VERSION_ID, phase: "", parentBatchId: null, run: null },
+      }),
+    )
+
+    const plan = await getIncrementalPlan(VERSION_ID)
+
+    expect(plan.run).toBeNull()
+    expect(plan.newCases).toEqual([])
+    expect(plan.affectedCases).toEqual([])
+    expect(plan.unmappedChanges).toEqual([])
+    expect(plan.defaultCaseIds).toEqual([])
+    expect(plan.warnings).toEqual([])
+    expect(plan.degraded).toBe(false)
+  })
+
+  it("creates an incremental batch with kind, caseIds and parentBatchId", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ data: CREATED_BATCH }, 201))
+
+    const created = await createIncrementalBatch(VERSION_ID, {
+      caseIds: [NEW_CASE_ID, AFFECTED_CASE_ID],
+      parentBatchId: PARENT_BATCH_ID,
+    })
+
+    expect(created.id).toBe(INCREMENTAL_BATCH_ID)
+    expect(typeof created.id).toBe("string")
+    expect(created.batch_no).toBe(2)
+
+    const request = lastRequest()
+    expect(request.url.endsWith(`/api/versions/${VERSION_ID}/batches`)).toBe(true)
+    expect(request.method).toBe("POST")
+    expect(jsonBody(request)).toEqual({
+      kind: "incremental",
+      caseIds: [NEW_CASE_ID, AFFECTED_CASE_ID],
+      parentBatchId: PARENT_BATCH_ID,
+    })
   })
 })

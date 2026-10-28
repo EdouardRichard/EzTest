@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { ApiError } from "@/lib/api-client"
@@ -50,12 +50,20 @@ const mocks = vi.hoisted(() => ({
   createBatch: vi.fn(),
   pauseBatch: vi.fn(),
   resumeBatch: vi.fn(),
+  createRequirement: vi.fn(),
+  getIncrementalPlan: vi.fn(),
+  useIssues: vi.fn(),
+  useReports: vi.fn(),
+  issuesProps: vi.fn(),
+  reportsProps: vi.fn(),
 }))
 
 vi.mock("./api", () => ({
   getVersion: mocks.getVersion,
   startClarification: mocks.startClarification,
   enterDesign: mocks.enterDesign,
+  createRequirement: mocks.createRequirement,
+  getIncrementalPlan: mocks.getIncrementalPlan,
   listRequirements: mocks.listRequirements,
   listRelations: mocks.listRelations,
   getClarification: mocks.getClarification,
@@ -89,6 +97,61 @@ vi.mock("@/features/execution/api", () => ({
   listExecutionSessions: mocks.listExecutionSessions,
 }))
 
+// The delivery tabs are covered by their own suites; the overview data is
+// projected through the delivery hooks, which this container test stubs with
+// empty projections unless a case sets them.
+vi.mock("@/features/delivery/hooks/useIssues", () => ({ useIssues: mocks.useIssues }))
+vi.mock("@/features/delivery/hooks/useReports", () => ({
+  useReports: mocks.useReports,
+  useReport: mocks.useReport,
+}))
+vi.mock("@/features/delivery/components/IssuesTab", () => ({
+  IssuesTab: (props: {
+    versionId: string
+    issueId?: string
+    degraded?: boolean
+    onIssueChange?: (issueId: string) => void
+  }) => {
+    mocks.issuesProps(props)
+    return <div data-testid="issues-tab">issues for {props.versionId}</div>
+  },
+}))
+vi.mock("@/features/delivery/components/ReportsTab", () => ({
+  ReportsTab: (props: {
+    versionId: string
+    batchId?: string
+    reportId?: string
+    onBatchChange?: (batchId: string) => void
+    onReportChange?: (reportId: string) => void
+  }) => {
+    mocks.reportsProps(props)
+    return <div data-testid="report-tab">reports for {props.versionId}</div>
+  },
+}))
+
+// The real exploration tab is covered by its own suite; the container only
+// needs its issue deep-link navigation callback here.
+vi.mock("@/features/execution/components/ExplorationTab", () => ({
+  ExplorationTab: ({
+    versionId,
+    onNavigate,
+  }: {
+    versionId: string
+    onNavigate?: (target: { kind: "issue"; id: string }) => void
+  }) => (
+    <div data-testid="exploration-tab">
+      exploration for {versionId}
+      <button
+        type="button"
+        data-testid="exploration-issue-link"
+        onClick={() => onNavigate?.({ kind: "issue", id: "1844674407370955410" })}
+      >
+        探索问题
+      </button>
+    </div>
+  ),
+}))
+
 vi.mock("@/features/mindmap/api", () => ({
   getGraph: vi.fn(async () => ({
     versionId: "1844674407370955161",
@@ -120,7 +183,7 @@ import VersionDetailRoutePage from "@/app/(app)/versions/[id]/page"
 import type { Analysis, ChangeList, IndexRun } from "@/features/code-intel/types"
 import type { Batch } from "@/features/execution/types"
 
-import type { Version } from "./types"
+import type { Requirement, Version, VersionEvent } from "./types"
 import { VersionDetailPage } from "./VersionDetailPage"
 
 /** A snowflake ID that a JS number cannot hold; it must stay a string verbatim. */
@@ -164,18 +227,68 @@ const TAB_LABELS = [
   "代码与变更",
 ]
 
-const PLACEHOLDER_TABS = [["问题", "P7"]] as const
-
-/** The five P6 tab slots and the root test id each real tab renders. */
+/** The four P6 execution tab slots and the root test id each real tab renders. */
 const EXECUTION_TAB_SLOTS = [
   ["执行会话", "sessions-tab"],
   ["探索链路", "exploration-tab"],
   ["实时播报", "broadcast-tab"],
   ["结果与证据", "results-tab"],
+] as const
+
+/** The two P7 delivery tabs mounted in place of the P3 placeholders. */
+const DELIVERY_TAB_SLOTS = [
+  ["问题", "issues-tab"],
   ["报告", "report-tab"],
 ] as const
 
+/** Result sent by POST requirements; the backend DTO keys stay camelCase. */
+const CREATED_REQUIREMENT: Requirement = {
+  id: "1844674407370956009",
+  versionId: VERSION_ID,
+  title: "退款审核",
+  description: "",
+  acceptanceCriteria: "",
+  priority: "should",
+  status: "draft",
+  source: "user",
+  lastUpdateSource: "user",
+  revision: 1,
+  confirmedAt: null,
+  confirmedBy: null,
+  openQuestionCount: 0,
+  relationCount: 0,
+  attachmentCount: 0,
+  createdBy: 1,
+  updatedBy: 1,
+  createdAt: "2026-10-28T10:00:00Z",
+  updatedAt: "2026-10-28T10:00:00Z",
+}
+
+function versionEvent(seq: number, type: string): VersionEvent {
+  return {
+    seq,
+    channel: `version:${VERSION_ID}`,
+    type,
+    version_id: VERSION_ID,
+    batch_id: null,
+    case_id: null,
+    step_id: null,
+    agent_role: null,
+    session_id: null,
+    ts: "2026-10-28T10:00:00Z",
+    summary: "版本状态变化",
+    detail: { phase: "clarifying", reason: "new_requirement" },
+    refs: { evidence: [], case: [], requirement: [], code: [] },
+  }
+}
+
 const ACTIVE_BATCH_ID = "1844674407370955165"
+/** Batches for the header selector / overview report entry. */
+const HEADER_BATCH_1 = "1844674407370955171"
+const HEADER_BATCH_2 = "1844674407370955172"
+const ISSUE_ID = "1844674407370955410"
+const REPORT_ID = "1844674407370955501"
+const SECOND_REPORT_ID = "1844674407370955502"
 
 function batchFixture(overrides: Partial<Batch> = {}): Batch {
   return {
@@ -212,6 +325,21 @@ function batchesResult(batches: Batch[] = []) {
     nextCursor: "",
     hasMore: false,
     loading: false,
+    error: "",
+    streamStatus: "live" as const,
+    refresh: vi.fn().mockResolvedValue(undefined),
+  }
+}
+
+function deliveryPage<T>(items: T[] = []) {
+  return {
+    items,
+    reports: items,
+    issues: items,
+    nextCursor: "",
+    hasMore: false,
+    loading: false,
+    loadingMore: false,
     error: "",
     streamStatus: "live" as const,
     refresh: vi.fn().mockResolvedValue(undefined),
@@ -286,6 +414,29 @@ const CODE_ANALYSIS: Analysis = {
   createdAt: "2026-10-28T01:00:00Z",
   startedAt: "2026-10-28T01:00:00Z",
   finishedAt: "2026-10-28T01:02:03Z",
+}
+
+/** Minimal report list item for the page-level degraded flag / deep-link tests. */
+const REPORT_SUMMARY = {
+  id: REPORT_ID,
+  versionId: VERSION_ID,
+  batchId: HEADER_BATCH_1,
+  revision: 1,
+  status: "published",
+  title: "Batch 1 报告",
+  inputFingerprint: "f".repeat(64),
+  markdown: { sha256: "e".repeat(64), sizeBytes: 1024, downloadPath: "" },
+  staleReason: "",
+  publishedAt: "2026-10-28T11:00:00Z",
+  createdAt: "2026-10-28T11:00:00Z",
+  updatedAt: "2026-10-28T11:00:00Z",
+}
+
+const DEGRADED_REPORT = {
+  ...REPORT_SUMMARY,
+  batchNo: 1,
+  batchKind: "baseline",
+  content: { degraded: true, requirements: [] },
 }
 
 describe("VersionDetailPage", () => {
@@ -363,6 +514,29 @@ describe("VersionDetailPage", () => {
     codeIntelMocks.getVersionChanges.mockResolvedValue(CODE_CHANGES)
     codeIntelMocks.getLatestIndexRun.mockResolvedValue(CODE_INDEX)
     codeIntelMocks.getLatestAnalysis.mockResolvedValue(CODE_ANALYSIS)
+    mocks.useIssues.mockImplementation(() => deliveryPage())
+    mocks.useReports.mockReturnValue(deliveryPage())
+    mocks.useReport.mockReturnValue({
+      data: null,
+      report: null,
+      loading: false,
+      error: "",
+      streamStatus: "live",
+      refresh: vi.fn(),
+    })
+    mocks.createRequirement.mockResolvedValue(CREATED_REQUIREMENT)
+    mocks.getIncrementalPlan.mockResolvedValue({
+      versionId: VERSION_ID,
+      phase: "clarifying",
+      parentBatchId: null,
+      run: null,
+      newCases: [],
+      affectedCases: [],
+      unmappedChanges: [],
+      defaultCaseIds: [],
+      warnings: [],
+      degraded: false,
+    })
   })
 
   afterEach(() => {
@@ -393,36 +567,38 @@ describe("VersionDetailPage", () => {
     await waitFor(() =>
       expect(screen.getByRole("tab", { name: "总览" }).getAttribute("aria-selected")).toBe("true"),
     )
-    expect(screen.getByRole("heading", { name: "需求" })).toBeTruthy()
-    expect(screen.getByText("已确认 1 · 未澄清 2")).toBeTruthy()
-    expect(screen.getByRole("heading", { name: "待澄清问题" })).toBeTruthy()
-    expect(screen.getByRole("heading", { name: "关系" })).toBeTruthy()
-    expect(screen.getByText("关系数量由需求工作台加载，总览不做推测。")).toBeTruthy()
-    expect(screen.getByRole("heading", { name: "资源绑定" })).toBeTruthy()
-    expect(screen.getByText("订单系统")).toBeTruthy()
 
-    expect(screen.getByRole("heading", { name: "执行批次" })).toBeTruthy()
-    expect(screen.getByText("暂无批次数据，执行引擎在 P6 阶段接入。")).toBeTruthy()
-    expect(screen.getByRole("heading", { name: "用例脑图" })).toBeTruthy()
-    const mindmapLink = screen.getByTestId("overview-open-mindmap")
-    expect(mindmapLink.getAttribute("href")).toBe(`/versions/${VERSION_ID}/mindmap`)
-    expect(screen.getByRole("heading", { name: "问题" })).toBeTruthy()
-    expect(screen.getByText("暂无问题，问题中心在 P7 阶段接入。")).toBeTruthy()
+    const metrics = screen.getByTestId("overview-metrics")
+    expect(within(metrics).getByRole("heading", { name: "需求覆盖" })).toBeTruthy()
+    expect(within(metrics).getByText(/已确认 1 \/ 已覆盖 — \/ 缺口 —/)).toBeTruthy()
+    expect(within(metrics).getByRole("heading", { name: "用例结果" })).toBeTruthy()
+    expect(within(metrics).getByText("暂无执行结果")).toBeTruthy()
+    expect(within(metrics).getByRole("heading", { name: "问题" })).toBeTruthy()
+    expect(within(metrics).getByText("未解决 0 · 已确认 0")).toBeTruthy()
+    expect(within(metrics).getByRole("heading", { name: "当前批次" })).toBeTruthy()
+
+    expect(screen.getByTestId("overview-coverage-matrix")).toBeTruthy()
+    expect(screen.getByText("暂无报告，生成批次报告后展示覆盖矩阵。")).toBeTruthy()
+    expect(screen.getByTestId("overview-batch-timeline")).toBeTruthy()
+    expect(screen.getAllByText("暂无批次").length).toBeGreaterThan(0)
+    expect(screen.getByTestId("overview-issue-top")).toBeTruthy()
+    expect(screen.getByText("暂无未解决问题。")).toBeTruthy()
+    expect(screen.getByTestId("overview-code-summary")).toBeTruthy()
+    expect(screen.getByRole("button", { name: "查看代码与变更" })).toBeTruthy()
   })
 
-  it("switches tabs, syncs ?tab= and returns from the issues placeholder", async () => {
+  it("switches tabs, syncs ?tab= and returns from the issues tab", async () => {
     render(<VersionDetailPage versionId={VERSION_ID} />)
     await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
 
     fireEvent.mouseDown(screen.getByRole("tab", { name: "问题" }))
 
     await waitFor(() => expect(window.location.search).toContain("tab=issues"))
-    expect(await screen.findByRole("heading", { name: "问题" })).toBeTruthy()
-    expect(screen.getByText("阶段 P7")).toBeTruthy()
-    expect(screen.getByText("该 Tab 尚未接入数据，不展示占位假数据。")).toBeTruthy()
-    expect(screen.queryAllByRole("table")).toHaveLength(0)
+    expect(await screen.findByTestId("issues-tab")).toBeTruthy()
+    expect(screen.queryByText("阶段 P7")).toBeNull()
+    expect(screen.queryByText("该 Tab 尚未接入数据，不展示占位假数据。")).toBeNull()
 
-    fireEvent.click(screen.getByRole("button", { name: "返回需求与澄清工作台" }))
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "需求与澄清" }))
 
     await waitFor(() =>
       expect(screen.getByRole("tab", { name: "需求与澄清" }).getAttribute("aria-selected")).toBe(
@@ -433,7 +609,7 @@ describe("VersionDetailPage", () => {
     await waitFor(() => expect(window.location.search).toContain("tab=requirements"))
   })
 
-  it("renders the five P6 execution tab slots instead of placeholders", async () => {
+  it("renders the four P6 execution tab slots instead of placeholders", async () => {
     render(<VersionDetailPage versionId={VERSION_ID} />)
     await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
 
@@ -446,17 +622,16 @@ describe("VersionDetailPage", () => {
     }
   })
 
-  it("still labels the issues tab as the remaining P7 placeholder", async () => {
+  it("mounts the real delivery issues and report tabs", async () => {
     render(<VersionDetailPage versionId={VERSION_ID} />)
     await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
 
-    for (const [label, phase] of PLACEHOLDER_TABS) {
+    for (const [label, testId] of DELIVERY_TAB_SLOTS) {
       fireEvent.mouseDown(screen.getByRole("tab", { name: label }))
 
-      expect(await screen.findByRole("heading", { name: label })).toBeTruthy()
-      expect(screen.getByText(`阶段 ${phase}`)).toBeTruthy()
-      expect(screen.queryAllByRole("table")).toHaveLength(0)
-      expect(screen.queryAllByRole("row")).toHaveLength(0)
+      expect(await screen.findByTestId(testId)).toBeTruthy()
+      expect(screen.queryByText("阶段 P7")).toBeNull()
+      expect(screen.queryByText("该 Tab 尚未接入数据，不展示占位假数据。")).toBeNull()
     }
   })
 
@@ -596,6 +771,81 @@ describe("VersionDetailPage", () => {
     expect(await screen.findByText("2 个需求未澄清")).toBeTruthy()
   })
 
+  it("shows 继续中（第 2 批） after creating a requirement on a completed version", async () => {
+    const completed: Version = { ...VERSION, status: "completed", batch_no: 1, continuePhase: null }
+    const continuing: Version = {
+      ...VERSION,
+      status: "continuing",
+      batch_no: 1,
+      continuePhase: "clarifying",
+      revision: 4,
+    }
+    mocks.getVersion.mockReset()
+    mocks.getVersion.mockResolvedValueOnce(completed).mockResolvedValue(continuing)
+    // Start outside the workbench so the header entry is what navigates.
+    window.history.replaceState(null, "", `/versions/${VERSION_ID}?tab=overview`)
+
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+    await waitFor(() =>
+      expect(screen.getByRole("tab", { name: "总览" }).getAttribute("aria-selected")).toBe("true"),
+    )
+    expect(screen.queryByTestId("continuing-badge")).toBeNull()
+
+    // The completed-version entry opens the requirements workbench, where the
+    // requirement is created; the backend turns the version into continuing.
+    fireEvent.click(screen.getByTestId("add-requirement-btn"))
+    await waitFor(() =>
+      expect(screen.getByRole("tab", { name: "需求与澄清" }).getAttribute("aria-selected")).toBe(
+        "true",
+      ),
+    )
+    expect(await screen.findByRole("heading", { name: "新增需求" })).toBeTruthy()
+
+    fireEvent.change(screen.getByLabelText("标题"), { target: { value: "退款审核" } })
+    fireEvent.click(screen.getByRole("button", { name: "创建需求" }))
+
+    await waitFor(() => expect(mocks.createRequirement).toHaveBeenCalled())
+    await waitFor(() => expect(mocks.getVersion).toHaveBeenCalledTimes(2))
+
+    expect((await screen.findByTestId("continuing-badge")).textContent).toContain(
+      "继续中（第 2 批）",
+    )
+    expect(screen.getByTestId("continuing-banner").textContent).toContain("增量澄清")
+    expect(screen.getByTestId("add-requirement-btn")).toBeTruthy()
+    expect(screen.getByTestId("view-changes-btn")).toBeTruthy()
+  })
+
+  it("refetches the version when a version.status_changed event arrives", async () => {
+    const completed: Version = { ...VERSION, status: "completed", batch_no: 1, continuePhase: null }
+    const continuing: Version = {
+      ...VERSION,
+      status: "continuing",
+      batch_no: 1,
+      continuePhase: "designing",
+      revision: 4,
+    }
+    mocks.getVersion.mockReset()
+    mocks.getVersion.mockResolvedValueOnce(completed).mockResolvedValue(continuing)
+
+    const { rerender } = render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+    expect(screen.queryByTestId("continuing-banner")).toBeNull()
+
+    mocks.useVersionStream.mockReturnValue({
+      events: [versionEvent(7, "version.status_changed")],
+      status: "live",
+      reconnect: vi.fn(),
+    })
+    rerender(<VersionDetailPage versionId={VERSION_ID} />)
+
+    await waitFor(() => expect(mocks.getVersion).toHaveBeenCalledTimes(2))
+    expect((await screen.findByTestId("continuing-badge")).textContent).toContain(
+      "继续中（第 2 批）",
+    )
+    expect(screen.getByTestId("continue-phase-label").textContent).toContain("增量设计")
+  })
+
   it("keeps the last data, reports a load failure and retries", async () => {
     mocks.getVersion
       .mockRejectedValueOnce(
@@ -612,6 +862,164 @@ describe("VersionDetailPage", () => {
 
     expect(await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })).toBeTruthy()
     expect(mocks.getVersion).toHaveBeenCalledTimes(2)
+  })
+
+  it("honours ?tab=issues&issue= and syncs the URL when the issue opens or closes", async () => {
+    window.history.replaceState(null, "", `/versions/${VERSION_ID}?tab=issues&issue=${ISSUE_ID}`)
+
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+
+    await waitFor(() =>
+      expect(mocks.issuesProps).toHaveBeenLastCalledWith(
+        expect.objectContaining({ issueId: ISSUE_ID }),
+      ),
+    )
+    expect(window.location.search).toContain("tab=issues")
+    expect(window.location.search).toContain(`issue=${ISSUE_ID}`)
+
+    act(() => {
+      mocks.issuesProps.mock.calls.at(-1)?.[0].onIssueChange?.("")
+    })
+    await waitFor(() => expect(window.location.search).not.toContain("issue="))
+    expect(window.location.search).toContain("tab=issues")
+    await waitFor(() =>
+      expect(mocks.issuesProps).toHaveBeenLastCalledWith(expect.objectContaining({ issueId: "" })),
+    )
+
+    act(() => {
+      mocks.issuesProps.mock.calls.at(-1)?.[0].onIssueChange?.(ISSUE_ID)
+    })
+    await waitFor(() => expect(window.location.search).toContain(`issue=${ISSUE_ID}`))
+    expect(window.location.search).toContain("tab=issues")
+  })
+
+  it("honours ?tab=report&report= and syncs the URL when the report changes", async () => {
+    window.history.replaceState(null, "", `/versions/${VERSION_ID}?tab=report&report=${REPORT_ID}`)
+
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+
+    await waitFor(() =>
+      expect(mocks.reportsProps).toHaveBeenLastCalledWith(
+        expect.objectContaining({ reportId: REPORT_ID }),
+      ),
+    )
+    expect(window.location.search).toContain("tab=report")
+    expect(window.location.search).toContain(`report=${REPORT_ID}`)
+
+    act(() => {
+      mocks.reportsProps.mock.calls.at(-1)?.[0].onReportChange?.(SECOND_REPORT_ID)
+    })
+    await waitFor(() => expect(window.location.search).toContain(`report=${SECOND_REPORT_ID}`))
+    expect(window.location.search).toContain("tab=report")
+  })
+
+  it("selects the overview report batch and the header batch selector for the report tab", async () => {
+    mocks.getVersion.mockResolvedValue({ ...VERSION, status: "completed" })
+    const earlier = batchFixture({
+      id: HEADER_BATCH_1,
+      batch_no: 1,
+      status: "done",
+      finished_at: "2026-10-28T01:00:00Z",
+    })
+    const later = batchFixture({
+      id: HEADER_BATCH_2,
+      batch_no: 2,
+      status: "done",
+      finished_at: "2026-10-28T02:00:00Z",
+    })
+    mocks.useBatches.mockReturnValue(batchesResult([later, earlier]))
+    window.history.replaceState(null, "", `/versions/${VERSION_ID}?tab=overview`)
+
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+    await waitFor(() =>
+      expect(screen.getByRole("tab", { name: "总览" }).getAttribute("aria-selected")).toBe("true"),
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "查看 Batch 1 报告" }))
+
+    await waitFor(() => expect(window.location.search).toContain("tab=report"))
+    await waitFor(() =>
+      expect(mocks.reportsProps).toHaveBeenLastCalledWith(
+        expect.objectContaining({ batchId: HEADER_BATCH_1 }),
+      ),
+    )
+
+    fireEvent.change(screen.getByTestId("exec-batch-selector"), {
+      target: { value: HEADER_BATCH_2 },
+    })
+    await waitFor(() =>
+      expect(mocks.reportsProps).toHaveBeenLastCalledWith(
+        expect.objectContaining({ batchId: HEADER_BATCH_2 }),
+      ),
+    )
+    expect(window.location.search).toContain("tab=report")
+  })
+
+  it("opens the requirement create editor from 新增需求 with a non-empty requirement list", async () => {
+    mocks.getVersion.mockResolvedValue({ ...VERSION, status: "completed" })
+    mocks.listRequirements.mockResolvedValue({
+      items: [CREATED_REQUIREMENT],
+      nextCursor: "",
+      hasMore: false,
+    })
+    window.history.replaceState(null, "", `/versions/${VERSION_ID}?tab=overview`)
+
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+
+    fireEvent.click(await screen.findByTestId("add-requirement-btn"))
+
+    await waitFor(() =>
+      expect(screen.getByRole("tab", { name: "需求与澄清" }).getAttribute("aria-selected")).toBe(
+        "true",
+      ),
+    )
+    expect(await screen.findByRole("heading", { name: "新增需求" })).toBeTruthy()
+    expect(screen.getByRole("button", { name: "创建需求" })).toBeTruthy()
+    expect(screen.queryByRole("heading", { name: "编辑需求" })).toBeNull()
+  })
+
+  it("opens the issues deep link when exploration navigates to an issue", async () => {
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "探索链路" }))
+    fireEvent.click(await screen.findByTestId("exploration-issue-link"))
+
+    await waitFor(() =>
+      expect(screen.getByRole("tab", { name: "问题" }).getAttribute("aria-selected")).toBe("true"),
+    )
+    expect(window.location.search).toContain("tab=issues")
+    expect(window.location.search).toContain(`issue=1844674407370955410`)
+    expect(mocks.issuesProps).toHaveBeenLastCalledWith(
+      expect.objectContaining({ issueId: "1844674407370955410" }),
+    )
+  })
+
+  it("passes the latest report degraded flag to the issues tab", async () => {
+    mocks.useReports.mockReturnValue(deliveryPage([REPORT_SUMMARY]))
+    mocks.useReport.mockReturnValue({
+      data: DEGRADED_REPORT,
+      report: DEGRADED_REPORT,
+      loading: false,
+      error: "",
+      streamStatus: "live" as const,
+      refresh: vi.fn(),
+    })
+
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "问题" }))
+
+    await waitFor(() =>
+      expect(mocks.issuesProps).toHaveBeenLastCalledWith(
+        expect.objectContaining({ degraded: true }),
+      ),
+    )
   })
 
   it("renders the detail route with the string id from the dynamic segment", async () => {
