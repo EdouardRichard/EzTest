@@ -253,17 +253,40 @@ test("creates a bound version, relations, confirmation, design entry, reload and
   // 8. Tab switching, deep links and placeholders.
   await page.getByRole("tab", { name: "总览" }).click()
   await expect(page).toHaveURL(/[?&]tab=overview/)
-  const overview = page.getByRole("region", { name: "版本指标" })
-  await expect(overview).toBeVisible()
-  await expect(overview.getByRole("heading", { name: "需求", exact: true })).toBeVisible()
-  await expect(overview.getByText("已确认 1 · 未澄清 2")).toBeVisible()
-  await expect(overview.getByText(systemName)).toBeVisible()
-  await expect(overview.getByText(environmentName)).toBeVisible()
-  await expect(overview.getByText(repoName)).toBeVisible()
+  // T19 replaced the P3 overview region with the P7 metric cards, coverage
+  // matrix and batch timeline. The confirmed count still comes from the
+  // version snapshot; the report-derived sections keep their documented empty
+  // states because this throwaway version has no execution batch yet.
+  const overviewMetrics = page.getByTestId("overview-metrics")
+  await expect(overviewMetrics).toBeVisible()
+  await expect(
+    overviewMetrics.getByRole("heading", { name: "需求覆盖", exact: true }),
+  ).toBeVisible()
+  await expect(overviewMetrics.getByText("已确认 1 / 已覆盖 — / 缺口 —")).toBeVisible()
+  await expect(
+    overviewMetrics.getByRole("heading", { name: "用例结果", exact: true }),
+  ).toBeVisible()
+  await expect(overviewMetrics.getByText("暂无执行结果", { exact: true })).toBeVisible()
+  const coverageMatrix = page.getByTestId("overview-coverage-matrix")
+  await expect(coverageMatrix).toBeVisible()
+  await expect(
+    coverageMatrix.getByRole("heading", { name: "需求 × 用例覆盖矩阵", exact: true }),
+  ).toBeVisible()
+  await expect(
+    coverageMatrix.getByText("暂无报告，生成批次报告后展示覆盖矩阵。", { exact: true }),
+  ).toBeVisible()
+  const batchTimeline = page.getByTestId("overview-batch-timeline")
+  await expect(batchTimeline).toBeVisible()
+  await expect(batchTimeline.getByText("暂无批次", { exact: true })).toBeVisible()
+  // The binding names live in the version header shared by every tab.
+  await expect(page.getByText(`系统：${systemName}`)).toBeVisible()
+  await expect(page.getByText(`环境：${environmentName}`)).toBeVisible()
+  await expect(page.getByText(`代码仓：${repoName}`)).toBeVisible()
 
   await page.reload()
   await expect(page.getByRole("tab", { name: "总览" })).toHaveAttribute("aria-selected", "true")
-  await expect(page.getByRole("region", { name: "版本指标" })).toBeVisible()
+  await expect(page.getByTestId("overview-metrics")).toBeVisible()
+  await expect(page.getByText("已确认 1 / 已覆盖 — / 缺口 —")).toBeVisible()
 
   await page.getByRole("tab", { name: "执行会话" }).click()
   await expect(page).toHaveURL(/[?&]tab=sessions/)

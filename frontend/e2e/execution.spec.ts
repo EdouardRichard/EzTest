@@ -435,22 +435,78 @@ test("P6 执行端到端：seed → 批次 → 暂停/恢复 → 结果/证据 �
     const versionId = normalSeed.version.id
     const report = await getReport(request, token, versionId, graceful.batchId)
     expect(report.batch.id).toBe(graceful.batchId)
+    expect(report.batch.batch_no).toBe(graceful.done.batch_no)
+    // Restore the P6 report identity on the kept API view: the delivery report
+    // header/fingerprint does not carry the baseline hash, so assert it against
+    // the executed batch and keep the resolved environment context here too.
+    expect(report.batch.baseline_hash, "the report must keep the executed baseline").toBe(
+      graceful.done.baseline_hash,
+    )
+    expect(report.environment.base_url, "the report must carry the fixture base URL").toContain(
+      "127.0.0.1",
+    )
+    const environmentName = report.environment.environment
+    const systemName = report.environment.system
+    expect(environmentName, "the report must name the bound environment").not.toBe("")
+    expect(systemName, "the report must name the bound system").not.toBe("")
+    expect(environmentName, "the two context names must be distinguishable").not.toBe(systemName)
     expect(report.summary.case_count).toBe(1)
     expect(report.summary.by_status.passed).toBe(1)
     expect(report.cases).toHaveLength(1)
     expect(report.cases[0]?.status).toBe("passed")
     expect(report.summary.evidence_count).toBeGreaterThan(0)
 
+    // The autonomy worker normally creates revision 1 asynchronously; ensure the
+    // report through the same API the UI uses first, so the UI wait never
+    // depends on a worker tick alone. The revision badge below stays the real
+    // UI assertion.
+    const ensured = await request.post(`${API_URL}/api/versions/${versionId}/reports`, {
+      headers: { Authorization: `Bearer ${token}` },
+      data: { batchId: graceful.batchId },
+    })
+    expect([200, 201], `ensure the batch report: unexpected HTTP ${ensured.status()}`).toContain(
+      ensured.status(),
+    )
+
     await page.getByRole("tab", { name: "报告" }).click()
+    // T18 replaced the P6 execution report surface with the delivery report
+    // tab: batch selector, immutable revision header and the stored snapshot.
     await expect(page.getByTestId("report-tab")).toBeVisible()
+    const reportRevision = page.getByTestId("report-revision-badge")
+    await expect(reportRevision).toHaveText("revision 1", { timeout: 60_000 })
+    await expect(page.getByText(`Batch #${graceful.done.batch_no}`, { exact: true })).toBeVisible()
+
+    const reportBatchSelector = page.getByTestId("report-batch-selector")
+    await expect(reportBatchSelector).toBeVisible()
+    await expect(reportBatchSelector).toHaveValue(graceful.batchId)
+    await expect(reportBatchSelector.locator(`option[value="${graceful.batchId}"]`)).toContainText(
+      `Batch #${graceful.done.batch_no}`,
+    )
+
     await expect(page.getByTestId("report-summary")).toBeVisible({ timeout: 60_000 })
     await expect(page.getByTestId("report-summary-case-count")).toHaveText("1")
     await expect(page.getByTestId("report-summary-passed")).toHaveText("1")
     await expect(page.getByTestId("report-cases")).toBeVisible()
-    await expect(page.getByTestId(`report-case-row-${graceful.caseRunId}`)).toBeVisible()
-    await expect(page.getByTestId("report-baseline")).toHaveText(graceful.done.baseline_hash)
-    await expect(page.getByTestId("report-environment")).toContainText("127.0.0.1")
-    await expect(page.getByTestId("report-batch-selector")).toBeVisible()
+    const reportCaseRow = page.getByTestId(`report-case-row-${graceful.caseRunId}`)
+    await expect(reportCaseRow).toBeVisible()
+    await expect(reportCaseRow.getByTestId("report-case-source")).toHaveAttribute(
+      "data-source",
+      "baseline",
+    )
+
+    // The appendix keeps the P6 report context (environment/system). Scope each
+    // assertion to the <dd> following its own <dt> so a swapped pair fails; the
+    // expected names come from the P6 report API, which resolves the same
+    // version bindings as the delivery appendix.
+    const reportAppendix = page.getByTestId("report-appendix")
+    const appendixValue = (label: string) =>
+      reportAppendix
+        .locator("dt", { hasText: new RegExp(`^${label}$`) })
+        .locator("xpath=following-sibling::dd[1]")
+    await expect(appendixValue("环境"), "环境 must show the bound environment").toHaveText(
+      environmentName,
+    )
+    await expect(appendixValue("系统"), "系统 must show the bound system").toHaveText(systemName)
 
     const [download] = await Promise.all([
       page.waitForEvent("download"),
@@ -461,10 +517,10 @@ test("P6 执行端到端：seed → 批次 → 暂停/恢复 → 结果/证据 �
     expect(downloadPath, "the Markdown export must produce a readable file").not.toBeNull()
     if (downloadPath === null) throw new Error("Markdown export path is unavailable")
     const markdown = readFileSync(downloadPath, "utf8")
-    expect(markdown).toContain("# 执行报告：批次 #1")
-    expect(markdown).toContain("## 用例明细")
+    expect(markdown).toContain("## 1. 执行摘要")
+    expect(markdown).toContain("## 3. 用例结果")
+    expect(markdown).toContain(`Batch ${graceful.done.batch_no}`)
     expect(markdown).toContain("P6 登录后创建订单")
-    expect(markdown).toContain("通过")
     expect(markdown.includes(ADMIN_PASSWORD), "the report must not leak the admin password").toBe(
       false,
     )
@@ -472,7 +528,9 @@ test("P6 执行端到端：seed → 批次 → 暂停/恢复 → 结果/证据 �
       markdown.includes(FIXTURE_PASSWORD),
       "the report must not leak the fixture password",
     ).toBe(false)
-    await expect(page.getByText("已导出", { exact: false })).toBeVisible()
+    await expect(page.getByTestId("report-export-notice")).toContainText("已导出", {
+      timeout: 30_000,
+    })
     await expectNoPasswordLeak(page, "报告")
   })
 
