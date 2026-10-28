@@ -14,3 +14,13 @@ version_0002_clarification.sql
 agent_0002_activity_channel.sql
 codeintel_0001_code_facts.sql
 codeintel_0002_code_impact.sql
+identity_0003_rename_tables.sql
+platform_0002_rename_tables.sql
+eventing_0002_rename_tables.sql
+audit_0002_rename_tables.sql
+llm_0002_rename_tables.sql
+storage_0002_rename_tables.sql
+agent_0003_rename_tables.sql
+resource_0004_rename_tables.sql
+version_0003_rename_tables.sql
+codeintel_0003_rename_tables.sql
