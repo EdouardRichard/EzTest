@@ -68,7 +68,7 @@
 | PG1 | 版本列表 / 首页 | `/versions` | 开发/测试 |
 | PG2 | 版本工作台（需求 + 澄清） | `/versions/{id}`（默认 Tab） | 开发/测试 |
 | PG3 | 版本详情 · 执行实时视图 | `/versions/{id}?tab=sessions` | 开发/测试 |
-| PG4 | 用例脑图（全屏编辑/评审） | `/versions/{id}/mindmap` | 开发/测试 |
+| PG4 | 用例脑图（全屏编辑/评审；P5 已交付） | `/versions/{id}/mindmap` | 开发/测试 |
 | PG5 | 问题中心 | `/versions/{id}?tab=issues` / `/issues` | 开发/测试 |
 | PG6 | 报告中心 | `/versions/{id}?tab=report` | 开发/测试 |
 | PG7 | 本地代码仓（管理员） | `/code-repos` | 管理员 |
@@ -79,6 +79,8 @@
 > 编号说明：`PG1–PG10` 为页面编号，不是实施阶段编号；实施阶段见 `implementation-phases.md`。
 
 版本详情是核心页：P3 默认进入「需求与澄清」工作台（`?tab=` 深链），关键过程在同一页多 Tab 内完成（ARTEX 任务详情模式）；其余 Tab 按实施阶段交付。
+
+> P5（D35）：PG4 全屏脑图已交付（`/versions/{id}/mindmap`），为独立路由（不计入版本详情 9 Tab）；入口为 `VersionHeader` 的「用例脑图」按钮与版本列表选择后进入。前端 feature 位于 `frontend/src/features/mindmap/`，核心组件 `MindmapCanvas`（手写 SVG 确定性 tidy-tree）、`CaseEditor`（节点属性 + 步骤/断言，revision OCC）、`ReviewPanel`（findings 处置、批准/驳回、blocker 确认）、`ExportMenu`（Markdown/Mermaid/OPML 下载 + PNG 光栅化）。
 
 ---
 
@@ -109,7 +111,7 @@
 | **报告 Report** | 批次报告、覆盖矩阵、问题汇总、结论、差异 | 批次切换、导出 | P3 占位 / P6 Batch 1 / P7 完整 |
 | **代码与变更 Code & Changes** | 本地仓 commit diff、变更文件/实体、映射页面/接口/用例、受影响用例、批次时间线 | 查看 diff、影响面、重跑 | P3 占位 / P4 |
 | 需求与澄清 Requirements | 多需求列表、关系图、附件、澄清对话、问题清单、决策 | 回答/确认/重开/新增需求 | P3（默认 Tab） |
-| 用例脑图 Mind Map | 树/图、评审、AI 补充、受影响标记 | 编辑、通过、导出 | P5（独立入口，P3 不展示） |
+| 用例脑图 Mind Map | 树/图、评审、AI 补充、受影响标记 | 编辑、通过、导出 | P5 已交付（独立入口，P3 不展示） |
 | 资源与会话 Resources | 环境指纹、账号/Session、接管记录 | 验证/接管/撤销 | P2（独立入口，P3 不展示） |
 
 > 说明：P3 默认进入「需求与澄清」工作台（PG2），`?tab=overview|sessions|exploration|broadcast|results|issues|report|code` 深链；其余 8 个 Tab 为骨架/占位——总览为骨架，其余显示标题、目标阶段、简短说明与返回工作台链接，不渲染假数据；「用例脑图」「资源与会话」P3 不放进 Tab 集合。需求与澄清主要放在版本工作台（PG2 页面），脑图有全屏页（PG4）；版本详情内保留入口即可。
@@ -183,7 +185,7 @@
 ### 4.4 其他页面
 
 - **版本工作台（PG2）**：多需求列表 + 需求编辑器（draft 可编辑，clarified 只读 + 重开）+ 附件上传/下载/删除 + 需求关系图 + 澄清对话 + 问题清单 + 决策记录 + 新增需求（任何状态可用）；P3 经 `version:{id}` 通道 SSE 实时刷新，刷新/重连先 REST 快照恢复。
-- **用例脑图全屏（PG4）**：树/图视图、评审、AI 补充区、受影响标记、导出。
+- **用例脑图全屏（PG4，P5 已交付）**：树/图视图、评审、AI 补充区、受影响标记、导出；独立路由 `/versions/{id}/mindmap`（不计入 9 Tab），入口来自 `VersionHeader` 与版本列表；组件 `MindmapCanvas`/`CaseEditor`/`ReviewPanel`/`ExportMenu`。
 - **本地代码仓（PG7，管理员）**：`/code-repos`；仓库列表与创建/编辑（本地路径、固定分支、include/exclude）、保存时只读 git 校验（失败显示 422 reason）、当前 commit、「未索引（P4）」索引占位。
 - **公共资源（PG8）**：`/resources` 四 Tab——系统与环境 / 应用模型 / 账号与访问 / 会话；管理员可写，普通用户只读（Session 支持导入、校验、人工确认、失效/撤销、接管）。
 - **Agent 中心（PG9）**：13 角色、提示词/工具/模型/技能配置、运行观察、质量指标（实施 P8）。
@@ -266,6 +268,10 @@ reviewing → 横幅"待评审" → 全屏脑图 → 编辑/评论 → [通过�
 | ToolCallBlock | 工具调用一行 + 展开 | 参数/结果/耗时/证据 |
 | EvidenceViewer | 截图/HTTP/日志 | 抽屉 + lightbox + 对比 |
 | GraphCanvas | 探索链路/脑图 | React Flow、MiniMap、按需展开、防抖 |
+| **MindmapCanvas** | 用例脑图全屏画布 | 手写 SVG 确定性 tidy-tree；折叠/选中/键盘/缩放/fit/平移，无图库 |
+| **CaseEditor** | 场景/用例属性与步骤/断言编辑 | revision OCC、上下移、删除保护 |
+| **ReviewPanel** | 发起评审、findings 处置、批准/驳回 | 按严重级分组、blocker 确认、驳回评论 |
+| **ExportMenu** | Markdown/Mermaid/OPML 下载与 PNG 导出 | Content-Disposition 文件名、SVG→canvas 光栅化 |
 | StatusBadge / Progress | 全站状态（含"继续中"） | 统一色板与文案 |
 | HumanGateCard | 评审/接管/升级 | 内联卡 + 待办中心 |
 | BatchTimeline | 批次/commit/报告差异 | 时间线 + 差异列表 |
@@ -291,7 +297,7 @@ reviewing → 横幅"待评审" → 全屏脑图 → 编辑/评论 → [通过�
 | 6 | 版本详情 8 Tab（P3 交付总览骨架；其余 7 个 Tab 为占位并标注归属阶段）：总览/执行会话/探索链路/实时播报/结果与证据/问题/报告/代码与变更 | P3/P4/P6/P7（见 §2.9） |
 | 7 | 执行实时视图：SSE + 快照游标 + 暂停（优雅/立即）/恢复 + 人工接管卡 | P6 |
 | 8 | 继续中硬状态徽章/横幅 + 新增需求入口 | P7 |
-| 9 | 用例脑图：树视图 + 评审通过 + 导出 Markdown/Mermaid | P5 |
+| 9 | 用例脑图：树视图 + 评审通过 + 导出 Markdown/Mermaid | P5（已交付） |
 | 10 | 公共资源（管理员）：系统/环境/账号/Session + 本地 Git 代码仓路径/索引状态 | P2 |
 | 11 | 代码与变更 Tab：commit diff、变更实体→用例影响、受影响用例、批次时间线、代码↔用例深链 | P4 |
 | 12 | 版本切换器、全局搜索、待办中心 | P8 |

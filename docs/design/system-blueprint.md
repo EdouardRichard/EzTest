@@ -155,6 +155,10 @@
 | D32 | **D32 P4 代码理解与影响分析 v1**：新增 `codeintel` 限界上下文（DDD 四层，`Agent.md` §6.1 登记），复用 P2 `code_repositories`（BIGSERIAL，API number），新增 9 表（雪花 ID：`code_change_sets`/`code_index_runs`/`code_entities`/`code_edges`/`code_fact_versions`/`code_analysis_cache`/`code_analyses`/`code_impact_candidates`/`code_anchors`），`repo_id`/`version_id`/`requirement_id`/`app_model_id` 均为逻辑引用、不建跨上下文 FK。T0 只读 Git 文件级能力（tree/blob hash/文件级 diff/按需 unified diff/行读取/commit/HEAD；不含 parser）；T1 服务化：应用服务直调 P0 LLM 网关（chat 协议 + JSON 提示词 + 严格解析 + 证据校验），异步 run（202/轮询/SSE；单实例进程内 worker，默认并发 1）；**不新增 Agent profile**，仅注册 `code_*` 只读工具薄壳（P3 `code.tree`/`code.read` 契约不变）。证据必须为 `path + start/end line + 摘录 sha256`，按 **commit 内容**校验；失败降为 low 线索，不参与自动影响。影响分析 v1 输出受影响**需求/应用模型**与 `unmapped_changes`；`affected.cases` 结构保留、P5 接入（P4 无 case/issue 实体）。跨栈契约存 `code_edges.rel='route_to_api'`（method + 归一化 path）。API 为 `/api/code/*`（仓库级）与 `/api/versions/{id}/code/*`（版本级）；仓库配置/索引 admin，其余登录用户。版本分析完成发 `code.changed`/`code.impact_computed`（`version:{id}`，仅摘要）。AI 不可用 → `done + degraded`，T0-only，HTTP 2xx 不阻塞。明确不做 parser/符号级/字段级分析、用例锚点实体、批次、全仓 AI 分析、线上仓、monorepo 子项目配置。 |
 | D33 | **D33 P4 缓存与版本化**：文件级分析缓存键 = `(repo, commit, path, file_hash, model, prompt_version)`（file_hash 为 `git-sha1:<40hex>` 或内容 `sha256:<hex>`）；命中不调 LLM。事实按 `fact_key` 版本化：`code_fact_versions` 保存历史，body 语义相同则复用，不同则 `version+1` 并写旧版 `superseded_at`；`code_entities` 仅保存当前版本。影响分析同 `(version, base, head, model, prompt_version, fact 版本集)` 默认复用（`reused=true`）；`force` 或模型/提示词变化新建 `analysis_version`，不覆盖旧记录。候选集合/顺序/默认勾选确定性：source 优先级 direct > contract > relation > ai，再按 confidence、subject kind/id；low 默认不选中但可人工选中。证据摘录哈希 `sha256`，按 commit 内容复算；同 commit 重跑影响结果一致。P4 不提供事实人工修正与版本对比 UI（CI-M1）。 |
 | D34 | **D34（数据库命名规约）**：全项目表名/索引名遵循阿里《Java 开发手册》数据库规约并做 PostgreSQL 适配——表名单数、小写+下划线、禁保留字、推荐 `业务_作用`；索引 `pk_<表>/uk_<表>_<列>/idx_<表>_<列>`；P5 起新表沿用 `created_at/updated_at`（对“id/gmt_create/gmt_modified 三字段”的显式例外）；历史表以新增 rename 迁移改名，字段/约束/既有索引名不变，`schema_migrations` 为框架表例外；规约同步 `Agent.md` §6.9 与蓝图 §10.2。 |
+| D35 | **D35（P5 用例脑图与评审）**：新增 `mindmap` 限界上下文（`Agent.md` §6.1 登记）与 9 张 `case_*` 表；树/步骤/断言/来源/评审/基线/run/导出模型按本规格 §5–§7；状态流转 `designing→reviewing→executing`，驳回回 `designing`，基线冻结后只读且只评审一次（D5）；4 个 Agent 采用"P1 运行时 + 单一结构化提交工具 + 服务端校验单事务物化"，不新增配置面；评审 blocker 批准需显式确认；导出见 D38；`affected.cases` 在 P5 只读映射，正式接入归 P6/P7。 |
+| D36 | **D36（应用探索边界）**：应用探索仅 HTTP 只读（GET/HEAD）、环境白名单、请求/深度/超时上限、跳过状态变更链接；管理员触发；产物 `app_model_nodes.source='explored'`（扩宽 CHECK + `AppModelInput.Source`）；LLM 不可用时确定性 BFS 降级；浏览器探索与 Session 注入归 P6。 |
+| D37 | **D37（锚点主体扩展 case）**：`code_anchors.subject_kind` 扩宽至含 `case`；P4 规格中"case 预留"正式接入；不改既有字段/唯一索引/其他主体行为；锚点经 codeintel `AnchorService` 创建/删除，由 mindmap 调用。 |
+| D38 | **D38（脑图导出）**：服务端 Markdown/Mermaid/OPML 三格式落文件系统（D30）+ sha256 + 元数据；PNG 由前端对 SVG 画布光栅化下载（不入库）；关闭蓝图 §17.4（XMind 非必需，OPML 为通用导入格式）。 |
 
 ---
 
@@ -247,6 +251,8 @@ Version（status/paused/batch_no/continue_phase）
           └─ source: user_input / ai_generated / ai_supplement（回填）
 ```
 
+> P5（D35）细化：`CaseGraph` = `case_node` 树，`kind ∈ {scenario, case}`（`scenario` 最多嵌套 2 层，`case` 为叶子）；每个 `case` 下挂 `case_step`（action/expected/data，seq 从 1 连续）与 `case_assertion`（ui/api/db/text）；来源存 `case_source`（`requirement/app_model/ai_run/manual`，需求来源必须属于本版本且 `clarified`）；`CaseNode.status` 在 P5 只实现 `draft→reviewed`（批准冻结），`executed`/`supplemented`/`merged`/`rejected`/`needs_revalidation` 为 P6/P7 预留；用例代码锚点复用 codeintel `code_anchor(subject_kind='case')`（D37）。
+
 ### 5.3 执行与交付域
 
 ```text
@@ -260,6 +266,7 @@ Version ─< VersionChange（新增需求/影响面/批次差异）
 
 - `需求/用例/问题 ↔ 应用模型（页面/路由/接口/组件）`
 - `用例/问题 ↔ 代码实体（file:line / symbol / route / api）`
+- `用例 ↔ 需求 / 代码 / 应用模型（P5/D37）`：用例经 `case_source` 关联已确认需求与应用模型节点，经 codeintel `code_anchor(subject_kind='case')` 关联 `file:line` / route / api；删除用例时同步清理其锚点。
 - `API 契约：前端调用点 ↔ 后端接口端点（method + 归一化 path）`
 - `证据 ↔ 用例步骤/问题/代码位置`
 - `报告 ↔ 批次/用例/问题/证据/commit`
@@ -271,7 +278,7 @@ Version ─< VersionChange（新增需求/影响面/批次差异）
 | Version.status | draft / clarifying / designing / reviewing / executing / **continuing** / completed / archived |
 | Version 标志 | `paused`（bool）、`pause_mode`（graceful/immediate）、`batch_no`、`continue_phase`、`code_baseline_commit` |
 | Requirement | draft（候选）→ clarified（已确认）→ designed → verified / obsolete |
-| CaseNode | draft → reviewed（基线）→ executed；AI 补充：supplemented → merged/rejected；受影响：needs_revalidation |
+| CaseNode | draft → reviewed（基线）→ executed；AI 补充：supplemented → merged/rejected；受影响：needs_revalidation。P5（D35）只实现 `draft→reviewed`（批准冻结）；`executed`/`supplemented`/`merged`/`rejected`/`needs_revalidation` 为 P6/P7 预留 |
 | RunBatch | planned → running → paused(标记) → done / failed / cancelled |
 | CaseRun | pending → running → passed / failed / blocked / inconclusive / skipped / interrupted |
 | Session | pending / acquiring / needs_manual / valid / refreshing / expired / invalid / revoked / failed；`expiring` 为派生值，不落库（详见 auth-session-model） |
@@ -477,7 +484,7 @@ Playwright 浏览器（导航、DOM/A11y、点击输入、快照、截图、stor
 |---|---|
 | 资源 | company / system / environment / app_model_node / account / account_system_access / session / session_snapshot / session_lease / manual_takeover / code_repository（P2 共 11 表；`secrets` / `session_blobs` / `session_events` / `auth_flows` / `probe_recipes` 等 P6 需要时追加） |
 | 版本需求 | version / requirement / requirement_relation / requirement_attachment / clarification_session / clarification_question / decision / version_change（P3 交付 `version` 上下文 7 表；主键按 D29，附件文件按 D30，`version_change` 等后续阶段） |
-| 用例脑图 | case_node / case_step / case_assertion / case_source / case_review / case_review_finding / case_baseline / case_design_run / case_export |
+| 用例脑图 | case_node / case_step / case_assertion / case_source / case_review / case_review_finding / case_baseline / case_design_run / case_export（P5 交付 `mindmap` 上下文 9 表；雪花主键 D29，审计列 `created_at/updated_at` 按 D34 例外；批准后写 `case_baseline` 并全图只读） |
 | 执行 | run_batch / case_run / step_result / run_event(activity) / evidence / evidence_ref |
 | 问题报告 | issue / issue_ref / report / report_ref |
 | 代码 | code_repository / code_index_run / code_entity / code_edge / code_change_set / code_anchor |
@@ -509,7 +516,7 @@ Playwright 浏览器（导航、DOM/A11y、点击输入、快照、截图、stor
 /api/versions/{id}/{bindings,start-clarification,enter-design}
 /api/versions/{id}/{requirements,relations,clarification,decisions}
 /api/versions/{id}/requirements/{rid}/attachments
-/api/versions/{id}/mindmap/{nodes,steps,assertions,review,export}
+/api/versions/{versionId}/mindmap/{nodes,steps,assertions,sources,anchors,order,runs,submit-review,review,reviews,findings,exports}
 /api/versions/{id}/batches / runs / case-runs / step-results
 /api/versions/{id}/issues / reports / changes
 /api/code/{repos,index,search,read,routes,apis,diff,impact}
@@ -523,6 +530,8 @@ Playwright 浏览器（导航、DOM/A11y、点击输入、快照、截图、stor
 
 > P3（D31）：`/api/versions/*` 集合/详情/动作/绑定/附件/事件/流；全部登录用户可写；P3 自有 ID 在 JSON/URL 中为十进制字符串（D29）。
 
+> P5（D35）：`/api/versions/{versionId}/mindmap/*` 共 27 个端点（图读取、节点/步骤/断言/来源/锚点 CRUD、排序、4 类 run、提交评审、批准/驳回、评审历史、发现项处置、导出历史与下载）；ID 在 JSON/URL 中为十进制字符串（D29），`POST runs`/`review`/`export`/`submit-review` 支持 `Idempotency-Key`，事件走既有 `version:{id}` 通道。
+
 ### 11.2 实时事件（SSE）
 
 - 端点：`GET /api/versions/{id}/stream?since={cursor}`。
@@ -530,6 +539,7 @@ Playwright 浏览器（导航、DOM/A11y、点击输入、快照、截图、stor
 - 事件字段：seq、type、version_id、batch_id、case_id、step_id、agent_role、session_id、ts、summary、detail、refs(evidence/case/requirement/code)。
 - 事件类型：version.status_changed、batch.started/finished、requirement.added/clarified/updated、case.created/updated/status_changed/reviewed/supplemented/revalidation_marked、run.started/paused/resumed/finished、step.started/finished、agent.activity、evidence.created、issue.created/updated、gate.pending/resolved、human.requested、report.published/stale、code.indexed/code.changed/code.impact_computed。
 - P3 事件（channel=`version:{id}`，version_id 必填）：新增 version.created/version.updated、requirement.reopened/deleted、requirement.relation_added/relation_updated/relation_removed、clarification.session_started/session_completed、clarification.question_updated、decision.proposed/decided、attachment.added/removed；原有 version.status_changed、requirement.added/clarified/updated、agent.activity 语义不变。需求事件永不改变或回退 Version.status（D31）。
+- P5 事件（D35，channel=`version:{id}`，version_id 必填）：新增 `case.created`/`case.updated`/`case.deleted`、`case.reviewed`、`case.baseline_frozen`、`case.run_started`/`case.run_finished`、`case.export_ready` 共 8 个；复用既有 `gate.pending`/`gate.resolved`（`gate=mindmap_review`，进入 reviewing / 批准或驳回）。`refs.case` 携带节点 ID（≤20），detail 只放 id/计数/状态摘要（≤64 KiB），不放脑图正文、LLM 输入输出或导出内容。
 - P3 通道：澄清 SSE 固定广播到 `version:{id}`（客户端不可覆盖）；P1 Agent 会话可选 `activity_channel=version:{id}`，默认 `agent:{session_id}` 不变。
 - 断线重连：Last-Event-ID；去重按 seq；20s 心跳；前端显示"重连中"。
 - 鉴权：单管理员 + 普通用户；会话 token；资源级只读控制。
@@ -551,6 +561,8 @@ Playwright 浏览器（导航、DOM/A11y、点击输入、快照、截图、stor
 总览 · 需求与澄清 · 探索链路 · 执行会话 · 实时播报 · 用例脑图 · 结果与证据 · 问题 · 报告 · 代码与变更 · 资源与会话。其中「需求与澄清」为 P3 新增工作台；D18 的 8 个 Tab 分阶段交付（P3 容器/总览、P4 代码与变更、P6 执行类、P7 问题/报告）；「用例脑图」「资源与会话」为独立入口（P5/P2）；实施 P0 只交付应用壳与最小设置页。
 
 > P3 Tab 为 **9 项**：**需求与澄清**（默认工作台，功能）+ D18 的 8 Tab（总览为骨架，执行会话/探索链路/实时播报/结果与证据/问题/报告/代码与变更均为占位并标注归属阶段）；「用例脑图」「资源与会话」仍为独立入口（P5/P2），P3 不放进 Tab 集合（D18；见 P3 阶段规格 §9.1）。
+
+> P5（D35）：用例脑图全屏页已交付（`/versions/{id}/mindmap`），为独立入口（不计入上述 9 个 Tab），从 `VersionHeader` 与版本列表进入。
 
 ### 12.3 核心交互
 
@@ -645,7 +657,7 @@ SSE + 快照游标 + seq 去重 + Last-Event-ID；图结构签名防抖；历史
 1. **monorepo 子项目映射**：多项目目录如何归属（按构建配置/人工配置）？P2 先人工配置子项目根目录即可？
 2. **被测系统与环境清单**：P2 接入哪几个系统/环境？（影响探索/账号/Session 配置）
 3. **执行并发规模**：单版本默认几个执行 Agent？同时几个版本？
-4. **报告/脑图导出格式优先级**：Markdown + Mermaid/PNG 是否足够？XMind 是否必须？
+4. **报告/脑图导出格式优先级**：Markdown + Mermaid/PNG 是否足够？XMind 是否必须？（已由 D38 关闭：Markdown/Mermaid/OPML 服务端生成，PNG 前端对 SVG 画布光栅化；XMind 非必需，OPML 为通用导入格式）
 5. **是否需要多用户同时操作同一版本**（协作编辑/评审）？首版可先单用户操作 + 读写锁。
 6. **问题单是否需要导出到外部系统**（后续是否接 Jira/禅道）？本轮不做，但要预留字段/接口。
 7. **AI 代码分析预算**：每次影响分析/设计读多少文件、token 上限？（默认：变更文件 + 相关检索文件，限长）
