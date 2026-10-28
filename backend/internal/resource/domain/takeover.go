@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-// Takeover reasons, mirrored from the manual_takeovers.reason CHECK
+// Takeover reasons, mirrored from the manual_takeover.reason CHECK
 // constraint.
 const (
 	TakeoverReasonMFA          = "mfa"
@@ -15,7 +15,7 @@ const (
 	TakeoverReasonOther        = "other"
 )
 
-// Takeover statuses, mirrored from the manual_takeovers.status CHECK
+// Takeover statuses, mirrored from the manual_takeover.status CHECK
 // constraint.
 const (
 	TakeoverStatusWaiting   = "waiting"

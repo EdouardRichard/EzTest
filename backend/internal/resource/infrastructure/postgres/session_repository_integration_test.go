@@ -16,7 +16,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
 )
 
-// sessionFixture is one account×system×environment×access diamond seeded with
+// sessionFixture is one account脳system脳environment脳access diamond seeded with
 // raw SQL, so the session repository tests do not depend on the catalog or
 // access repositories.
 type sessionFixture struct {
@@ -32,7 +32,7 @@ func sessionSeedSystem(t *testing.T, ctx context.Context, pool *pgxpool.Pool, co
 	t.Helper()
 	var id int64
 	if err := pool.QueryRow(ctx,
-		`INSERT INTO systems (company_id, key, name, kind, base_url)
+		`INSERT INTO system (company_id, key, name, kind, base_url)
 		 VALUES ($1, $2, $2, 'web', 'http://localhost:13335')
 		 RETURNING id`,
 		companyID, key).Scan(&id); err != nil {
@@ -46,7 +46,7 @@ func sessionSeedEnvironment(t *testing.T, ctx context.Context, pool *pgxpool.Poo
 	t.Helper()
 	var id int64
 	if err := pool.QueryRow(ctx,
-		`INSERT INTO environments (system_id, key, name, base_url, kind)
+		`INSERT INTO environment (system_id, key, name, base_url, kind)
 		 VALUES ($1, $2, $2, 'http://localhost:13335', 'dev')
 		 RETURNING id`,
 		systemID, key).Scan(&id); err != nil {
@@ -60,7 +60,7 @@ func sessionSeedAccount(t *testing.T, ctx context.Context, pool *pgxpool.Pool, c
 	t.Helper()
 	var id int64
 	if err := pool.QueryRow(ctx,
-		`INSERT INTO accounts (company_id, key, label, kind)
+		`INSERT INTO account (company_id, key, label, kind)
 		 VALUES ($1, $2, $2, 'human')
 		 RETURNING id`,
 		companyID, key).Scan(&id); err != nil {
@@ -74,7 +74,7 @@ func sessionSeedAccess(t *testing.T, ctx context.Context, pool *pgxpool.Pool, ac
 	t.Helper()
 	var id int64
 	if err := pool.QueryRow(ctx,
-		`INSERT INTO account_system_accesses (account_id, system_id, auth_type)
+		`INSERT INTO account_system_access (account_id, system_id, auth_type)
 		 VALUES ($1, $2, 'password')
 		 RETURNING id`,
 		accountID, systemID).Scan(&id); err != nil {
@@ -511,7 +511,7 @@ func TestSessionRepositoryLeases(t *testing.T) {
 	var releasedReason string
 	var releasedAt *time.Time
 	if err := pool.QueryRow(ctx,
-		`SELECT released_reason, released_at FROM session_leases WHERE id = $1`,
+		`SELECT released_reason, released_at FROM session_lease WHERE id = $1`,
 		held.ID).Scan(&releasedReason, &releasedAt); err != nil {
 		t.Fatal(err)
 	}
@@ -540,7 +540,7 @@ func TestSessionRepositoryLeases(t *testing.T) {
 		t.Fatalf("second release-all: %v", err)
 	}
 	if err := pool.QueryRow(ctx,
-		`SELECT released_reason FROM session_leases WHERE id = $1`,
+		`SELECT released_reason FROM session_lease WHERE id = $1`,
 		reacquired.ID).Scan(&releasedReason); err != nil {
 		t.Fatal(err)
 	}
@@ -567,7 +567,7 @@ func TestSessionRepositoryLeases(t *testing.T) {
 	var reclaimReason string
 	var reclaimAt *time.Time
 	if err := pool.QueryRow(ctx,
-		`SELECT released_reason, released_at FROM session_leases WHERE id = $1`,
+		`SELECT released_reason, released_at FROM session_lease WHERE id = $1`,
 		expiredLease.ID).Scan(&reclaimReason, &reclaimAt); err != nil {
 		t.Fatal(err)
 	}

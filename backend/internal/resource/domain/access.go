@@ -2,7 +2,7 @@ package domain
 
 import "time"
 
-// Auth types, mirrored from the account_system_accesses.auth_type CHECK
+// Auth types, mirrored from the account_system_access.auth_type CHECK
 // constraint.
 const (
 	AuthTypePassword = "password"

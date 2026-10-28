@@ -12,23 +12,23 @@ import (
 )
 
 // Catalog bounds and defaults. The session TTL range mirrors the
-// systems.default_session_ttl_seconds CHECK constraint.
+// system.default_session_ttl_seconds CHECK constraint.
 const (
 	defaultSystemSessionTTLSeconds = 3600
 	minSystemSessionTTLSeconds     = 60
 	maxSystemSessionTTLSeconds     = 604800
 
-	// maxEnvironmentAllowedHosts bounds environments.allowed_hosts (spec §7.2).
+	// maxEnvironmentAllowedHosts bounds environment.allowed_hosts (spec 鎼?.2).
 	maxEnvironmentAllowedHosts = 50
-	// maxAllowedHostLength bounds one allowed host (spec §7.2).
+	// maxAllowedHostLength bounds one allowed host (spec 鎼?.2).
 	maxAllowedHostLength = 253
 
-	// maxAppModelImportNodes bounds one JSON import (spec §6.6).
+	// maxAppModelImportNodes bounds one JSON import (spec 鎼?.6).
 	maxAppModelImportNodes = 5000
 	// maxAppModelDepth bounds a node's ancestor chain, the node itself included.
 	maxAppModelDepth = 32
 
-	// App model sources mirror the app_model_nodes.source CHECK constraint.
+	// App model sources mirror the app_model_node.source CHECK constraint.
 	appModelSourceManual = "manual"
 	appModelSourceImport = "import"
 )
@@ -141,7 +141,7 @@ func validateBaseURL(raw string) error {
 	return nil
 }
 
-// validateSystemKind enforces the systems.kind CHECK constraint.
+// validateSystemKind enforces the system.kind CHECK constraint.
 func validateSystemKind(kind string) error {
 	if kind != domain.SystemKindWeb && kind != domain.SystemKindAPI {
 		return domain.NewInvalid("kind", "invalid_kind", "kind must be web or api")
@@ -149,7 +149,7 @@ func validateSystemKind(kind string) error {
 	return nil
 }
 
-// validateSystemStatus enforces the systems.status CHECK constraint.
+// validateSystemStatus enforces the system.status CHECK constraint.
 func validateSystemStatus(status string) error {
 	if status != domain.StatusActive && status != domain.StatusDisabled {
 		return domain.NewInvalid("status", "invalid_status", "status must be active or disabled")
@@ -166,7 +166,7 @@ func validateDefaultSessionTTL(ttl int) error {
 	return nil
 }
 
-// validateEnvironmentKind enforces the environments.kind CHECK constraint.
+// validateEnvironmentKind enforces the environment.kind CHECK constraint.
 func validateEnvironmentKind(kind string) error {
 	switch kind {
 	case domain.EnvironmentKindDev, domain.EnvironmentKindStaging,
@@ -217,7 +217,7 @@ func appModelDepthError() *domain.Error {
 
 // effectiveAppModelMethod returns the stored method. An API node without an
 // explicit method derives it from the immutable "api:<METHOD> <path>" key so the
-// app_model_nodes CHECK (kind <> 'api' OR method <> ”) always holds.
+// app_model_node CHECK (kind <> 'api' OR method <> 閳? always holds.
 func effectiveAppModelMethod(kind, key, method string) string {
 	method = strings.TrimSpace(method)
 	if method != "" {

@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-// resourceKeyRE is the documented resource key format (spec §7.2): 2-64
+// resourceKeyRE is the documented resource key format (spec 搂7.2): 2-64
 // characters, lowercase letters/digits first and then letters, digits, '_' or
 // '-'.
 var resourceKeyRE = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{1,63}$`)
@@ -20,7 +20,7 @@ func ValidateResourceKey(key string) error {
 	return nil
 }
 
-// System kinds, mirrored from the systems.kind CHECK constraint.
+// System kinds, mirrored from the system.kind CHECK constraint.
 const (
 	SystemKindWeb = "web"
 	SystemKindAPI = "api"

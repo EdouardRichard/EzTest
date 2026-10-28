@@ -26,12 +26,12 @@ const catalogDefaultCompanyKey = "default"
 func seedCatalogCompany(t *testing.T, ctx context.Context, pool *pgxpool.Pool) *domain.Company {
 	t.Helper()
 	if _, err := pool.Exec(ctx,
-		`INSERT INTO companies (key, name) VALUES ('default', 'Default') ON CONFLICT (key) DO NOTHING`); err != nil {
+		`INSERT INTO company (key, name) VALUES ('default', 'Default') ON CONFLICT (key) DO NOTHING`); err != nil {
 		t.Fatalf("seed default company: %v", err)
 	}
 	var company domain.Company
 	if err := pool.QueryRow(ctx,
-		`SELECT id, key, name, status, created_at, updated_at FROM companies WHERE key = 'default'`).Scan(
+		`SELECT id, key, name, status, created_at, updated_at FROM company WHERE key = 'default'`).Scan(
 		&company.ID, &company.Key, &company.Name, &company.Status,
 		&company.CreatedAt, &company.UpdatedAt); err != nil {
 		t.Fatalf("load seeded company: %v", err)
@@ -654,11 +654,11 @@ func TestCatalogRepositoryConflictsAndDependencies(t *testing.T) {
 	assertCatalogKind(t, repo.CreateSystem(ctx, duplicateSystem), domain.KindConflict, "duplicate_key")
 
 	// (company_id, key) is unique, so another company may reuse the key.
-	if _, err := pool.Exec(ctx, `INSERT INTO companies (key, name) VALUES ('other', 'Other')`); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO company (key, name) VALUES ('other', 'Other')`); err != nil {
 		t.Fatal(err)
 	}
 	var otherCompanyID int64
-	if err := pool.QueryRow(ctx, `SELECT id FROM companies WHERE key = 'other'`).Scan(&otherCompanyID); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT id FROM company WHERE key = 'other'`).Scan(&otherCompanyID); err != nil {
 		t.Fatal(err)
 	}
 	otherSystem := &domain.System{CompanyID: otherCompanyID, Key: "shop", Name: "Other shop", Kind: domain.SystemKindWeb, BaseURL: "http://localhost:13335"}

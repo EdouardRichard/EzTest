@@ -25,7 +25,7 @@ const (
 		instructions, requested_by, requested_at, expires_at, completed_at`
 )
 
-// snapshotKindLogin is the only session_snapshots.kind the DDL check allows and
+// snapshotKindLogin is the only session_snapshot.kind the DDL check allows and
 // the value the application layer leaves implicit.
 const snapshotKindLogin = "login"
 
@@ -194,7 +194,7 @@ func (r *SessionRepository) CreateSession(ctx context.Context, s *domain.Session
 	if err != nil {
 		return fmt.Errorf("postgres: encode session storage_state: %w", err)
 	}
-	const query = `INSERT INTO sessions
+	const query = `INSERT INTO session
 		(account_id, system_id, environment_id, access_id, state, acquisition, storage_state,
 		 storage_state_hash, storage_state_kind, cookie_count, origin_count, expires_at,
 		 last_validated_at, last_used_at, failure_reason, invalidated_reason, created_by)
@@ -215,7 +215,7 @@ func (r *SessionRepository) CreateSession(ctx context.Context, s *domain.Session
 // GetSession returns one session by ID.
 func (r *SessionRepository) GetSession(ctx context.Context, id int64) (*domain.Session, error) {
 	session, err := scanSession(r.pool.QueryRow(ctx,
-		`SELECT `+sessionColumnList+` FROM sessions WHERE id = $1`, id))
+		`SELECT `+sessionColumnList+` FROM session WHERE id = $1`, id))
 	if err != nil {
 		return nil, catalogReadError(err, "session", id, "get session")
 	}
@@ -230,7 +230,7 @@ func (r *SessionRepository) ListSessions(ctx context.Context, f domain.SessionFi
 		return nil, false, fmt.Errorf("postgres: list sessions: limit must be positive")
 	}
 	const query = `SELECT ` + sessionColumnList + `
-		FROM sessions
+		FROM session
 		WHERE id > $1
 		  AND ($2 = 0 OR account_id = $2)
 		  AND ($3 = 0 OR system_id = $3)
@@ -277,7 +277,7 @@ func (r *SessionRepository) UpdateSession(ctx context.Context, s *domain.Session
 	if err != nil {
 		return fmt.Errorf("postgres: encode session storage_state: %w", err)
 	}
-	const query = `UPDATE sessions
+	const query = `UPDATE session
 		SET state = $3, storage_state = $4, storage_state_hash = $5, storage_state_kind = $6,
 		    cookie_count = $7, origin_count = $8, expires_at = $9, last_validated_at = $10,
 		    last_used_at = $11, failure_reason = $12, invalidated_reason = $13,
@@ -320,7 +320,7 @@ func (r *SessionRepository) CreateSnapshot(ctx context.Context, s *domain.Snapsh
 	if !s.CapturedAt.IsZero() {
 		capturedAt = s.CapturedAt
 	}
-	const query = `INSERT INTO session_snapshots
+	const query = `INSERT INTO session_snapshot
 		(session_id, kind, items, summary, permission_hash, degraded, captured_at)
 		VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7::timestamptz, now()))
 		RETURNING ` + snapshotColumnList
@@ -339,7 +339,7 @@ func (r *SessionRepository) CreateSnapshot(ctx context.Context, s *domain.Snapsh
 func (r *SessionRepository) GetLatestSnapshot(ctx context.Context, sessionID int64) (*domain.Snapshot, error) {
 	snapshot, err := scanSnapshot(r.pool.QueryRow(ctx,
 		`SELECT `+snapshotColumnList+`
-		   FROM session_snapshots
+		   FROM session_snapshot
 		  WHERE session_id = $1
 		  ORDER BY captured_at DESC, id DESC
 		  LIMIT 1`, sessionID))
@@ -360,7 +360,7 @@ func (r *SessionRepository) ListSnapshots(ctx context.Context, sessionID int64, 
 	}
 	rows, err := r.pool.Query(ctx,
 		`SELECT `+snapshotColumnList+`
-		   FROM session_snapshots
+		   FROM session_snapshot
 		  WHERE session_id = $1 AND id > $2
 		  ORDER BY id ASC
 		  LIMIT $3`,
@@ -406,14 +406,14 @@ func (r *SessionRepository) CreateLease(ctx context.Context, l *domain.Lease) er
 	}()
 
 	if _, err := tx.Exec(ctx,
-		`UPDATE session_leases
+		`UPDATE session_lease
 		    SET released_at = now(), released_reason = $2
 		  WHERE session_id = $1 AND released_at IS NULL AND expires_at <= now()`,
 		l.SessionID, expiredLeaseReleaseReason); err != nil {
 		return fmt.Errorf("postgres: reclaim expired leases: %w", err)
 	}
 
-	const query = `INSERT INTO session_leases (session_id, holder, expires_at)
+	const query = `INSERT INTO session_lease (session_id, holder, expires_at)
 		VALUES ($1, $2, $3)
 		RETURNING ` + leaseColumnList
 	created, err := scanLease(tx.QueryRow(ctx, query, l.SessionID, l.Holder, l.ExpiresAt))
@@ -438,7 +438,7 @@ func (r *SessionRepository) CreateLease(ctx context.Context, l *domain.Lease) er
 func (r *SessionRepository) GetActiveLease(ctx context.Context, sessionID int64) (*domain.Lease, error) {
 	lease, err := scanLease(r.pool.QueryRow(ctx,
 		`SELECT `+leaseColumnList+`
-		   FROM session_leases
+		   FROM session_lease
 		  WHERE session_id = $1 AND released_at IS NULL AND expires_at > now()
 		  ORDER BY id DESC
 		  LIMIT 1`, sessionID))
@@ -456,7 +456,7 @@ func (r *SessionRepository) GetActiveLease(ctx context.Context, sessionID int64)
 // cannot fail the release path.
 func (r *SessionRepository) ReleaseLease(ctx context.Context, sessionID int64, holder, reason string) error {
 	if _, err := r.pool.Exec(ctx,
-		`UPDATE session_leases
+		`UPDATE session_lease
 		    SET released_at = now(), released_reason = $3
 		  WHERE session_id = $1 AND holder = $2 AND released_at IS NULL`,
 		sessionID, holder, reason); err != nil {
@@ -469,7 +469,7 @@ func (r *SessionRepository) ReleaseLease(ctx context.Context, sessionID int64, h
 // session is invalidated or revoked; it is idempotent.
 func (r *SessionRepository) ReleaseAllLeases(ctx context.Context, sessionID int64, reason string) error {
 	if _, err := r.pool.Exec(ctx,
-		`UPDATE session_leases
+		`UPDATE session_lease
 		    SET released_at = now(), released_reason = $2
 		  WHERE session_id = $1 AND released_at IS NULL`,
 		sessionID, reason); err != nil {
@@ -494,7 +494,7 @@ func (r *SessionRepository) CreateTakeover(ctx context.Context, t *domain.Takeov
 	if !t.RequestedAt.IsZero() {
 		requestedAt = t.RequestedAt
 	}
-	const query = `INSERT INTO manual_takeovers
+	const query = `INSERT INTO manual_takeover
 		(session_id, account_id, system_id, environment_id, reason, status, instructions,
 		 requested_by, requested_at, expires_at, completed_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9::timestamptz, now()), $10, $11)
@@ -512,7 +512,7 @@ func (r *SessionRepository) CreateTakeover(ctx context.Context, t *domain.Takeov
 // GetTakeover returns one takeover by ID.
 func (r *SessionRepository) GetTakeover(ctx context.Context, id int64) (*domain.Takeover, error) {
 	takeover, err := scanTakeover(r.pool.QueryRow(ctx,
-		`SELECT `+takeoverColumnList+` FROM manual_takeovers WHERE id = $1`, id))
+		`SELECT `+takeoverColumnList+` FROM manual_takeover WHERE id = $1`, id))
 	if err != nil {
 		return nil, catalogReadError(err, "takeover", id, "get takeover")
 	}
@@ -526,7 +526,7 @@ func (r *SessionRepository) GetTakeover(ctx context.Context, id int64) (*domain.
 func (r *SessionRepository) GetWaitingTakeover(ctx context.Context, sessionID int64) (*domain.Takeover, error) {
 	takeover, err := scanTakeover(r.pool.QueryRow(ctx,
 		`SELECT `+takeoverColumnList+`
-		   FROM manual_takeovers
+		   FROM manual_takeover
 		  WHERE session_id = $1 AND status = $2
 		  ORDER BY id DESC
 		  LIMIT 1`, sessionID, domain.TakeoverStatusWaiting))
@@ -544,7 +544,7 @@ func (r *SessionRepository) GetWaitingTakeover(ctx context.Context, sessionID in
 func (r *SessionRepository) GetLatestTakeover(ctx context.Context, sessionID int64) (*domain.Takeover, error) {
 	takeover, err := scanTakeover(r.pool.QueryRow(ctx,
 		`SELECT `+takeoverColumnList+`
-		   FROM manual_takeovers
+		   FROM manual_takeover
 		  WHERE session_id = $1
 		  ORDER BY requested_at DESC, id DESC
 		  LIMIT 1`, sessionID))
@@ -566,7 +566,7 @@ func (r *SessionRepository) ListTakeovers(ctx context.Context, f domain.Takeover
 	}
 	rows, err := r.pool.Query(ctx,
 		`SELECT `+takeoverColumnList+`
-		   FROM manual_takeovers
+		   FROM manual_takeover
 		  WHERE id > $1
 		    AND ($2 = '' OR status = $2)
 		  ORDER BY id ASC
@@ -607,7 +607,7 @@ func (r *SessionRepository) UpdateTakeover(ctx context.Context, t *domain.Takeov
 	if err != nil {
 		return fmt.Errorf("postgres: encode takeover instructions: %w", err)
 	}
-	const query = `UPDATE manual_takeovers
+	const query = `UPDATE manual_takeover
 		SET status = $3,
 		    instructions = $4,
 		    expires_at = $5,

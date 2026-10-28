@@ -12,7 +12,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/resource/domain"
 )
 
-// defaultSessionTTLSeconds mirrors the systems.default_session_ttl_seconds DDL
+// defaultSessionTTLSeconds mirrors the system.default_session_ttl_seconds DDL
 // default. CreateSystem applies it when the caller leaves the field zero.
 const defaultSessionTTLSeconds = 3600
 
@@ -209,7 +209,7 @@ func (r *CatalogRepository) CreateSystem(ctx context.Context, s *domain.System) 
 	if ttl == 0 {
 		ttl = defaultSessionTTLSeconds
 	}
-	const query = `INSERT INTO systems
+	const query = `INSERT INTO system
 		(company_id, key, name, kind, base_url, default_session_ttl_seconds, notes, status)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING ` + systemColumnList
@@ -225,7 +225,7 @@ func (r *CatalogRepository) CreateSystem(ctx context.Context, s *domain.System) 
 // GetSystem returns one system by ID.
 func (r *CatalogRepository) GetSystem(ctx context.Context, id int64) (*domain.System, error) {
 	system, err := scanSystem(r.pool.QueryRow(ctx,
-		`SELECT `+systemColumnList+` FROM systems WHERE id = $1`, id))
+		`SELECT `+systemColumnList+` FROM system WHERE id = $1`, id))
 	if err != nil {
 		return nil, catalogReadError(err, "system", id, "get system")
 	}
@@ -240,7 +240,7 @@ func (r *CatalogRepository) ListSystems(ctx context.Context, f domain.SystemFilt
 		return nil, false, fmt.Errorf("postgres: list systems: limit must be positive")
 	}
 	const query = `SELECT ` + systemColumnList + `
-		FROM systems
+		FROM system
 		WHERE id > $1
 		  AND ($2 = '' OR status = $2)
 		  AND ($3 = '' OR kind = $3)
@@ -275,7 +275,7 @@ func (r *CatalogRepository) ListSystems(ctx context.Context, f domain.SystemFilt
 // UpdateSystem writes the mutable system columns and refreshes the server
 // timestamps on s. The company and key are immutable after creation.
 func (r *CatalogRepository) UpdateSystem(ctx context.Context, s *domain.System) error {
-	const query = `UPDATE systems
+	const query = `UPDATE system
 		SET name = $2, kind = $3, base_url = $4, default_session_ttl_seconds = $5,
 		    notes = $6, status = $7, updated_at = now()
 		WHERE id = $1
@@ -291,7 +291,7 @@ func (r *CatalogRepository) UpdateSystem(ctx context.Context, s *domain.System) 
 
 // DeleteSystem removes a system; dependent rows cascade in the database.
 func (r *CatalogRepository) DeleteSystem(ctx context.Context, id int64) error {
-	tag, err := r.pool.Exec(ctx, `DELETE FROM systems WHERE id = $1`, id)
+	tag, err := r.pool.Exec(ctx, `DELETE FROM system WHERE id = $1`, id)
 	if err != nil {
 		return catalogWriteError(err, "duplicate key", "delete system")
 	}
@@ -305,7 +305,7 @@ func (r *CatalogRepository) DeleteSystem(ctx context.Context, id int64) error {
 func (r *CatalogRepository) CountEnvironments(ctx context.Context, systemID int64) (int, error) {
 	var count int
 	if err := r.pool.QueryRow(ctx,
-		`SELECT count(*) FROM environments WHERE system_id = $1`, systemID).Scan(&count); err != nil {
+		`SELECT count(*) FROM environment WHERE system_id = $1`, systemID).Scan(&count); err != nil {
 		return 0, fmt.Errorf("postgres: count environments: %w", err)
 	}
 	return count, nil
@@ -315,7 +315,7 @@ func (r *CatalogRepository) CountEnvironments(ctx context.Context, systemID int6
 func (r *CatalogRepository) CountAccesses(ctx context.Context, systemID int64) (int, error) {
 	var count int
 	if err := r.pool.QueryRow(ctx,
-		`SELECT count(*) FROM account_system_accesses WHERE system_id = $1`, systemID).Scan(&count); err != nil {
+		`SELECT count(*) FROM account_system_access WHERE system_id = $1`, systemID).Scan(&count); err != nil {
 		return 0, fmt.Errorf("postgres: count accesses: %w", err)
 	}
 	return count, nil
@@ -332,7 +332,7 @@ func (r *CatalogRepository) CreateEnvironment(ctx context.Context, e *domain.Env
 	if err != nil {
 		return fmt.Errorf("postgres: encode environment login_check: %w", err)
 	}
-	const query = `INSERT INTO environments
+	const query = `INSERT INTO environment
 		(system_id, key, name, base_url, kind, is_prod, allowed_hosts, login_check,
 		 allow_auto_login, require_approval)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
@@ -350,7 +350,7 @@ func (r *CatalogRepository) CreateEnvironment(ctx context.Context, e *domain.Env
 // GetEnvironment returns one environment by ID.
 func (r *CatalogRepository) GetEnvironment(ctx context.Context, id int64) (*domain.Environment, error) {
 	environment, err := scanEnvironment(r.pool.QueryRow(ctx,
-		`SELECT `+environmentColumnList+` FROM environments WHERE id = $1`, id))
+		`SELECT `+environmentColumnList+` FROM environment WHERE id = $1`, id))
 	if err != nil {
 		return nil, catalogReadError(err, "environment", id, "get environment")
 	}
@@ -360,7 +360,7 @@ func (r *CatalogRepository) GetEnvironment(ctx context.Context, id int64) (*doma
 // ListEnvironments returns every environment of a system ordered by ID.
 func (r *CatalogRepository) ListEnvironments(ctx context.Context, systemID int64) ([]domain.Environment, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT `+environmentColumnList+` FROM environments WHERE system_id = $1 ORDER BY id ASC`,
+		`SELECT `+environmentColumnList+` FROM environment WHERE system_id = $1 ORDER BY id ASC`,
 		systemID)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list environments: %w", err)
@@ -392,7 +392,7 @@ func (r *CatalogRepository) UpdateEnvironment(ctx context.Context, e *domain.Env
 	if err != nil {
 		return fmt.Errorf("postgres: encode environment login_check: %w", err)
 	}
-	const query = `UPDATE environments
+	const query = `UPDATE environment
 		SET name = $2, base_url = $3, kind = $4, is_prod = $5, allowed_hosts = $6,
 		    login_check = $7, allow_auto_login = $8, require_approval = $9,
 		    updated_at = now()
@@ -410,7 +410,7 @@ func (r *CatalogRepository) UpdateEnvironment(ctx context.Context, e *domain.Env
 
 // DeleteEnvironment removes an environment.
 func (r *CatalogRepository) DeleteEnvironment(ctx context.Context, id int64) error {
-	tag, err := r.pool.Exec(ctx, `DELETE FROM environments WHERE id = $1`, id)
+	tag, err := r.pool.Exec(ctx, `DELETE FROM environment WHERE id = $1`, id)
 	if err != nil {
 		return catalogWriteError(err, "duplicate key", "delete environment")
 	}
@@ -424,7 +424,7 @@ func (r *CatalogRepository) DeleteEnvironment(ctx context.Context, id int64) err
 func (r *CatalogRepository) CountSessions(ctx context.Context, environmentID int64) (int, error) {
 	var count int
 	if err := r.pool.QueryRow(ctx,
-		`SELECT count(*) FROM sessions WHERE environment_id = $1`, environmentID).Scan(&count); err != nil {
+		`SELECT count(*) FROM session WHERE environment_id = $1`, environmentID).Scan(&count); err != nil {
 		return 0, fmt.Errorf("postgres: count environment sessions: %w", err)
 	}
 	return count, nil
@@ -442,7 +442,7 @@ func (r *CatalogRepository) CreateAppModel(ctx context.Context, n *domain.AppMod
 	if err != nil {
 		return fmt.Errorf("postgres: encode app model meta: %w", err)
 	}
-	const query = `INSERT INTO app_model_nodes
+	const query = `INSERT INTO app_model_node
 		(system_id, parent_id, kind, key, name, path, method, source, meta)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		RETURNING ` + appModelColumnList
@@ -458,7 +458,7 @@ func (r *CatalogRepository) CreateAppModel(ctx context.Context, n *domain.AppMod
 // GetAppModel returns one app model node by ID.
 func (r *CatalogRepository) GetAppModel(ctx context.Context, id int64) (*domain.AppModelNode, error) {
 	node, err := scanAppModel(r.pool.QueryRow(ctx,
-		`SELECT `+appModelColumnList+` FROM app_model_nodes WHERE id = $1`, id))
+		`SELECT `+appModelColumnList+` FROM app_model_node WHERE id = $1`, id))
 	if err != nil {
 		return nil, catalogReadError(err, "app model", id, "get app model")
 	}
@@ -473,12 +473,12 @@ func (r *CatalogRepository) ListAppModels(ctx context.Context, f domain.AppModel
 		return nil, false, fmt.Errorf("postgres: list app models: limit must be positive")
 	}
 	const query = `SELECT ` + appModelColumnList + `
-		FROM app_model_nodes
+		FROM app_model_node
 		WHERE system_id = $1
 		  AND id > $2
 		  AND ($3 = '' OR kind = $3)
 		  AND ($4 = '' OR parent_id = (
-		        SELECT parent.id FROM app_model_nodes parent
+		        SELECT parent.id FROM app_model_node parent
 		        WHERE parent.system_id = $1 AND parent.key = $4))
 		ORDER BY id ASC
 		LIMIT $5`
@@ -516,7 +516,7 @@ func (r *CatalogRepository) UpdateAppModel(ctx context.Context, n *domain.AppMod
 	if err != nil {
 		return fmt.Errorf("postgres: encode app model meta: %w", err)
 	}
-	const query = `UPDATE app_model_nodes
+	const query = `UPDATE app_model_node
 		SET parent_id = $2, name = $3, path = $4, method = $5, source = $6, meta = $7,
 		    updated_at = now()
 		WHERE id = $1
@@ -532,7 +532,7 @@ func (r *CatalogRepository) UpdateAppModel(ctx context.Context, n *domain.AppMod
 
 // DeleteAppModel removes a node; its subtree cascades in the database.
 func (r *CatalogRepository) DeleteAppModel(ctx context.Context, id int64) error {
-	tag, err := r.pool.Exec(ctx, `DELETE FROM app_model_nodes WHERE id = $1`, id)
+	tag, err := r.pool.Exec(ctx, `DELETE FROM app_model_node WHERE id = $1`, id)
 	if err != nil {
 		return catalogWriteError(err, "duplicate key", "delete app model")
 	}
@@ -550,7 +550,7 @@ func (r *CatalogRepository) ListAppModelsByKeys(ctx context.Context, systemID in
 	}
 	rows, err := r.pool.Query(ctx,
 		`SELECT `+appModelColumnList+`
-		   FROM app_model_nodes
+		   FROM app_model_node
 		  WHERE system_id = $1 AND key = ANY($2)
 		  ORDER BY id ASC`,
 		systemID, keys)
@@ -577,7 +577,7 @@ func (r *CatalogRepository) ListAppModelsByKeys(ctx context.Context, systemID in
 // seeded default company.
 func (r *CatalogRepository) GetCompanyByKey(ctx context.Context, key string) (*domain.Company, error) {
 	company, err := scanCompany(r.pool.QueryRow(ctx,
-		`SELECT `+companyColumnList+` FROM companies WHERE key = $1`, key))
+		`SELECT `+companyColumnList+` FROM company WHERE key = $1`, key))
 	if err != nil {
 		return nil, catalogReadError(err, "company", 0, "get company by key")
 	}
