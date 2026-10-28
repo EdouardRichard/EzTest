@@ -17,6 +17,7 @@ import (
 	codeintelhttp "github.com/EdouardRichard/EzTest/backend/internal/codeintel/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
 	eventinghttp "github.com/EdouardRichard/EzTest/backend/internal/eventing/interfaces/httpapi"
+	executionhttp "github.com/EdouardRichard/EzTest/backend/internal/execution/interfaces/httpapi"
 	identity "github.com/EdouardRichard/EzTest/backend/internal/identity/domain"
 	identityhttp "github.com/EdouardRichard/EzTest/backend/internal/identity/interfaces/httpapi"
 	llmapp "github.com/EdouardRichard/EzTest/backend/internal/llm/application"
@@ -114,6 +115,12 @@ type Dependencies struct {
 	// ownership rule enforce their own authorization in the handler (design
 	// spec §7.1/§7.2), so no per-route guard is added here.
 	Mindmap *mindmaphttp.Handler
+	// Execution holds the execution context's HTTP handlers (P6). When set, the
+	// /api/versions/{id}/batches|evidence|execution routes are mounted. They
+	// rely on the global bearer auth: every logged-in user may create and
+	// control batches and read execution data (design spec §5.11), so no
+	// per-route guard is added here.
+	Execution *executionhttp.Handlers
 }
 
 // New assembles the HTTP handler. Middleware runs in the order
@@ -201,6 +208,13 @@ func New(cfg config.Config, logger *slog.Logger, deps Dependencies) http.Handler
 		// when its services are wired, so a partially assembled process never
 		// exposes a route backed by nil dependencies.
 		deps.Mindmap.Register(mux)
+	}
+	if deps.Execution != nil {
+		// The execution routes (P6) sit under /api/versions/{id}/batches,
+		// .../evidence and .../execution. They rely on the global bearer auth
+		// and add no per-route guard (spec §5.11). RegisterRoutes skips nil
+		// groups so a partially wired process mounts only what it has.
+		deps.Execution.RegisterRoutes(mux)
 	}
 	if deps.Events != nil && cfg.EnableTestEndpoints {
 		auditor := deps.Audit

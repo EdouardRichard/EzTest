@@ -37,6 +37,19 @@ import (
 	eventingapp "github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
 	eventinginfra "github.com/EdouardRichard/EzTest/backend/internal/eventing/infrastructure"
 	eventpostgres "github.com/EdouardRichard/EzTest/backend/internal/eventing/infrastructure/postgres"
+	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
+	executionagenttool "github.com/EdouardRichard/EzTest/backend/internal/execution/application/agent_tool"
+	executiondomain "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
+	executionagent "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/agent"
+	executionaudit "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/audit"
+	executionbrowser "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/browser"
+	executioneventing "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/eventing"
+	executionfilestore "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/filestore"
+	executionmindmap "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/mindmap"
+	executionpostgres "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/postgres"
+	executionresource "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/resource"
+	executionversion "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/version"
+	executionhttp "github.com/EdouardRichard/EzTest/backend/internal/execution/interfaces/httpapi"
 	identityapp "github.com/EdouardRichard/EzTest/backend/internal/identity/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/infrastructure/password"
 	identitypostgres "github.com/EdouardRichard/EzTest/backend/internal/identity/infrastructure/postgres"
@@ -104,6 +117,13 @@ const (
 	// (D30). The export filestore creates/tightens it as well; creating it at
 	// startup turns a misconfigured EZTEST_EXPORT_DIR into a boot failure.
 	mindmapExportDirPerm os.FileMode = 0o700
+	// executionEvidenceDirPerm is the least-privilege mode of the P6 evidence
+	// root (spec §5.7/D30). The filestore creates/tightens it on first use;
+	// creating it eagerly turns a misconfigured EZTEST_EVIDENCE_DIR into a boot
+	// failure. Windows cannot represent the Unix permission bits.
+	executionEvidenceDirPerm os.FileMode = 0o700
+	// executorHealthTimeout bounds the boot-time executor health warning.
+	executorHealthTimeout = 5 * time.Second
 	// codeIntelWorkerQueueSize is the bounded async-run queue of design spec
 	// §6.8 (16 jobs; a full queue answers 429 analysis_queue_full).
 	codeIntelWorkerQueueSize = 16
@@ -208,6 +228,14 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		storagepostgres.NewMetadataRepository(database.Pool),
 		auditor,
 	)
+	// One shared Snowflake generator backs every context so ids can never
+	// collide across contexts or services (D29/INV-15). It is created before the
+	// P2 resource context because the auth-flow repository mints its ids too.
+	snowflake, err := id.NewSnowflake(cfg.SnowflakeNodeID)
+	if err != nil {
+		return fmt.Errorf("create snowflake id generator (EZTEST_SNOWFLAKE_NODE_ID=%d): %w",
+			cfg.SnowflakeNodeID, err)
+	}
 
 	// Resource context (P2): the catalog repository backs the company, system,
 	// environment and app-model ports; the access, session and code-repository
@@ -219,10 +247,11 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	resourceAccessRepo := resourcepostgres.NewAccessRepository(database.Pool)
 	resourceSessionRepo := resourcepostgres.NewSessionRepository(database.Pool)
 	resourceCodeRepo := resourcepostgres.NewCodeRepository(database.Pool)
+	resourceAuthFlows := resourcepostgres.NewAuthFlowRepository(database.Pool, snowflake)
 	catalogService := resourceapp.NewCatalogService(
 		resourceCatalogRepo, resourceCatalogRepo, resourceCatalogRepo, resourceCatalogRepo, wallClock{})
 	accessService := resourceapp.NewAccessService(
-		resourceCatalogRepo, resourceAccessRepo, resourceAccessRepo, resourceCatalogRepo)
+		resourceCatalogRepo, resourceAccessRepo, resourceAccessRepo, resourceCatalogRepo, resourceAuthFlows)
 	sessionService := resourceapp.NewSessionService(
 		resourceSessionRepo, resourceAccessRepo, resourceCatalogRepo, resourceCatalogRepo,
 		httpcheck.NewChecker(), wallClock{})
@@ -247,11 +276,6 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	versionEvents := versioneventing.NewEventPublisher(eventService)
 	versionCatalog := versionresource.NewCatalog(catalogService, catalogService, codeRepoService)
 	versionGit := versiongitread.NewGitReader(0)
-	snowflake, err := id.NewSnowflake(cfg.SnowflakeNodeID)
-	if err != nil {
-		return fmt.Errorf("create snowflake id generator (EZTEST_SNOWFLAKE_NODE_ID=%d): %w",
-			cfg.SnowflakeNodeID, err)
-	}
 	// The attachment root is created eagerly with least privilege. The filestore
 	// also creates/tightens it on first use, which covers a root removed while
 	// the process is running; Windows cannot represent the Unix mode bits.
@@ -499,6 +523,97 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Clock:        wallClock{},
 		Logger:       logger,
 	})
+	// The P6 execution context reads the frozen baseline/snapshots and marks
+	// executed cases through this narrow projection (spec §4.2).
+	mindmapExecution := mindmapapp.NewExecutionService(mindmapapp.ExecutionDeps{
+		Graph:      mindmapGraphTx,
+		Nodes:      mindmapNodes,
+		Steps:      mindmapSteps,
+		Assertions: mindmapAssertions,
+		Sources:    mindmapSources,
+		Baselines:  mindmapBaselines,
+		Events:     mindmapEvents,
+		Clock:      wallClock{},
+	})
+
+	// P6 execution context: repositories, cross-context adapters, the evidence
+	// filesystem store, the executor client and the shared tool set. The tool
+	// set is built before the P1 registry so the execution-agent profile seed
+	// validates its allowlist against the live registry (spec §7.1). The agent
+	// runtime adapter does not exist until the P1 services are bound, so the
+	// tools resolve their per-case session through a late-bound closure.
+	executionBatches := executionpostgres.NewBatchRepository(database.Pool)
+	executionCaseRuns := executionpostgres.NewCaseRunRepository(database.Pool)
+	executionSteps := executionpostgres.NewStepRepository(database.Pool)
+	executionAssertions := executionpostgres.NewAssertionRepository(database.Pool)
+	executionEvidence := executionpostgres.NewEvidenceRepository(database.Pool)
+	executionEvidenceRefs := executionpostgres.NewEvidenceRefRepository(database.Pool)
+	executionQueries := executionpostgres.NewExecutionQueries(database.Pool)
+	executionVersionPort := executionversion.New(versionService)
+	executionMindmapPort := executionmindmap.New(mindmapExecution)
+	executionSessionPort := executionresource.New(sessionService, catalogService)
+	executionEvents := executioneventing.New(eventService)
+	executionAudit := executionaudit.NewSink(auditor)
+
+	if err := os.MkdirAll(cfg.EvidenceDir, executionEvidenceDirPerm); err != nil {
+		return fmt.Errorf("create evidence directory %q: %w", cfg.EvidenceDir, err)
+	}
+	if err := os.Chmod(cfg.EvidenceDir, executionEvidenceDirPerm); err != nil {
+		return fmt.Errorf("set evidence directory mode on %q: %w", cfg.EvidenceDir, err)
+	}
+	evidenceStore, err := executionfilestore.New(cfg.EvidenceDir,
+		executionfilestore.WithMaxBytes(int64(cfg.ExecEvidenceMaxBytes)))
+	if err != nil {
+		return fmt.Errorf("configure evidence store (EZTEST_EVIDENCE_DIR=%q): %w", cfg.EvidenceDir, err)
+	}
+	evidenceService := executionapp.NewEvidenceService(
+		executionEvidence, executionEvidenceRefs, executionBatches, evidenceStore, snowflake,
+		executionapp.WithEvidenceMaxBytes(int64(cfg.ExecEvidenceMaxBytes)),
+		executionapp.WithEvidenceMaxPerCaseRun(cfg.ExecEvidencePerCase),
+	)
+	executorClient := executionbrowser.New(cfg.ExecutorURL, cfg.ExecutorToken, 0)
+	if cfg.ExecutorToken == "" {
+		logger.Warn("EZTEST_EXECUTOR_TOKEN is empty; executor calls will be rejected until the API and executor share a token")
+	}
+	// A dead executor is not a startup failure: the executor is an external
+	// service and the batch-create gate answers 503 executor_unavailable until
+	// it is reachable. The boot probe only warns (spec §5.6, §8.4).
+	executorHealthCtx, cancelExecutorHealth := context.WithTimeout(startupCtx, executorHealthTimeout)
+	executorHealthErr := executorClient.Health(executorHealthCtx)
+	cancelExecutorHealth()
+	if executorHealthErr != nil {
+		logger.Warn("executor health probe failed; batch creation will answer 503 executor_unavailable until it is reachable",
+			"url", cfg.ExecutorURL, "error", executorHealthErr)
+	} else {
+		logger.Info("executor health probe succeeded", "url", cfg.ExecutorURL)
+	}
+	executionRecorder := executionapp.NewRecorder(executionapp.RecorderDeps{
+		Locator:    executionQueries,
+		CaseRuns:   executionCaseRuns,
+		Steps:      executionSteps,
+		Assertions: executionAssertions,
+		Evidence:   executionEvidence,
+		Refs:       executionEvidenceRefs,
+		Batches:    executionBatches,
+		Versions:   executionVersionPort,
+		Sessions:   executionSessionPort,
+		Events:     executionEvents,
+		Clock:      wallClock{},
+		IDs:        snowflake,
+	})
+	var executionAgentRuntime *executionagent.AgentRuntime
+	executionToolSet := executionagenttool.NewToolSet(
+		executionRecorder, executorClient, evidenceService, nil,
+		executionagenttool.Limits{
+			MaxArtifactBytes: int64(cfg.ExecEvidenceMaxBytes),
+			Session: func(ctx context.Context, caseRunID int64) (executionapp.SessionRef, error) {
+				if executionAgentRuntime == nil {
+					return executionapp.SessionRef{}, errors.New("execution: agent runtime is not bound yet")
+				}
+				return executionAgentRuntime.SessionForCaseRun(ctx, caseRunID)
+			},
+		},
+	)
 
 	// Agent runtime: the four postgres repositories, the cross-context adapters
 	// (LLM gateway, event sink, audit sink) and the tool registry. The same
@@ -583,6 +698,9 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Findings: mindmapFindings,
 		Audit:    mindmapAudit,
 	})...)
+	// The 15 P6 execution tools are appended before NewToolRegistry so the
+	// execution-agent profile allowlist is validated against the live registry.
+	agentToolList = append(agentToolList, executionToolSet.Tools()...)
 	agentRegistry := agentapp.NewToolRegistry(agentToolList...)
 	agentExecutor := agentapp.NewToolExecutor(
 		agentRegistry, agentAuditSink, time.Duration(cfg.AgentToolTimeoutMS)*time.Millisecond)
@@ -608,6 +726,101 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	// Both P1 services exist now; bind them into the P3 adapter before the HTTP
 	// server can accept a clarification request.
 	p1Agents.bind(agentSessionService, runService)
+
+	// P6 execution engine. The agent runtime adapter needs the bound P1
+	// session/run services; its profile seed is validated against the live
+	// registry before it is written, exactly like the P3/P5 seeds. The scheduler
+	// is the sole dispatcher and is started once below; boot recovery settles
+	// anything a previous process left running before the loop begins.
+	executionAgentRuntime = executionagent.NewAgentRuntime(
+		agentProfileService, agentProfiles, agentSessionService, runService)
+	// The recorder is the live case read model, so the resumed case run's prompt
+	// starts with the completed steps' actuals/evidence counts and the remaining
+	// steps (spec §5.5, T16); both dependencies exist only here.
+	executionAgentRuntime.SetCaseContextSource(executionRecorder)
+	if err := ensureExecutionProfile(startupCtx, executionAgentRuntime, agentRegistry, logger); err != nil {
+		return err
+	}
+	executionRunner := executionapp.NewCaseRunner(executionapp.CaseRunnerDeps{
+		CaseRuns: executionCaseRuns,
+		Steps:    executionSteps,
+		Batches:  executionBatches,
+		Sessions: executionSessionPort,
+		Runtime:  executionAgentRuntime,
+		Mindmap:  executionMindmapPort,
+		Events:   executionEvents,
+		Clock:    wallClock{},
+		// The tools own the per-case executor context; the runner only cancels
+		// and closes that context through this controller.
+		Browser: executionToolSet,
+		Timeout: time.Duration(cfg.ExecCaseTimeoutMS) * time.Millisecond,
+	})
+	executionScheduler := executionapp.NewScheduler(executionapp.SchedulerDeps{
+		Queue:         executionQueries,
+		Batches:       executionBatches,
+		CaseRuns:      executionCaseRuns,
+		Versions:      executionVersionPort,
+		Sessions:      executionSessionPort,
+		Mindmap:       executionMindmapPort,
+		Events:        executionEvents,
+		Clock:         wallClock{},
+		IDs:           snowflake,
+		Runner:        executionRunner,
+		Browser:       executionToolSet,
+		MaxConcurrent: cfg.ExecMaxConcurrentCases,
+		Tick:          time.Duration(cfg.ExecWorkerIntervalMS) * time.Millisecond,
+	})
+	executionRecovery := executionapp.NewRecovery(executionapp.RecoveryDeps{
+		Queue:    executionQueries,
+		Batches:  executionBatches,
+		CaseRuns: executionCaseRuns,
+		Steps:    executionSteps,
+		Versions: executionVersionPort,
+		Sessions: executionSessionPort,
+		Events:   executionEvents,
+		Clock:    wallClock{},
+		// The queue only sees active batches; this scan reaches a terminal batch
+		// whose finished runs lost their lease release, so the periodic sweep
+		// releases those stale sessions too (spec §5.4).
+		LeaseScan: executionQueries,
+	})
+	if err := executionRecovery.Recover(startupCtx); err != nil {
+		return fmt.Errorf("recover execution batches: %w", err)
+	}
+	executionBatchService := executionapp.NewBatchService(executionapp.BatchServiceDeps{
+		Versions: executionVersionPort,
+		Mindmap:  executionMindmapPort,
+		Batches:  executionBatches,
+		CaseRuns: executionCaseRuns,
+		Events:   executionEvents,
+		Clock:    wallClock{},
+		IDs:      snowflake,
+		MaxCases: cfg.ExecMaxCasesPerBatch,
+	})
+	executionReportService := executionapp.NewReportService(
+		executionBatches, executionCaseRuns, executionSteps, executionAssertions,
+		executionEvidence,
+		executionresource.NewReportEnvironmentSource(executionVersionPort, catalogService),
+		time.Now,
+	)
+	// One in-process scheduler loop (spec §5.3). The deferred stop runs before
+	// database.Close (registered earlier) and waits briefly for the in-flight
+	// case runners, which leave the run for boot recovery on shutdown.
+	executionWorkerCtx, cancelExecutionWorker := context.WithCancel(context.Background())
+	go executionScheduler.Start(executionWorkerCtx)
+	defer func() {
+		cancelExecutionWorker()
+		done := make(chan struct{})
+		go func() {
+			executionScheduler.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(shutdownTimeout):
+			logger.Warn("execution scheduler did not drain before shutdown")
+		}
+	}()
 
 	// The remaining P5 services. The run coordinator polls the P1 agent runtime
 	// through the mindmap adapter, so it is built once both P1 services exist;
@@ -771,6 +984,24 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		EventReader:     eventStore,
 		EventSubscriber: eventHub,
 	})
+	// The P6 handler group consumes the batch/case-run services, the evidence
+	// and report services, the tool-controller-free session projection and the
+	// executor health probe. All ids cross this boundary as decimal strings.
+	executionHandlers := executionhttp.NewHandlers(executionhttp.HandlerDeps{
+		Batches:         executionBatchService,
+		CaseRuns:        executionCaseRuns,
+		Steps:           executionSteps,
+		Assertions:      executionAssertions,
+		Evidence:        executionEvidence,
+		EvidenceService: evidenceService,
+		EvidenceRefs:    executionQueries,
+		Reports:         executionReportService,
+		Sessions:        executionSessionPort,
+		AgentSessions:   executionAgentRuntime,
+		Executor:        executorClient,
+		Audit:           executionAudit,
+		SessionInfo:     executionSessionInfo{sessions: sessionService, accounts: accessService},
+	})
 	cancelStartup()
 
 	// Every request context descends from baseCtx. Canceling it on shutdown
@@ -802,6 +1033,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 			Version:   versionHandlers,
 			CodeIntel: codeIntelHandler,
 			Mindmap:   mindmapHandler,
+			Execution: executionHandlers,
 		}),
 		BaseContext:       baseContext(baseCtx),
 		ReadHeaderTimeout: 10 * time.Second,
@@ -967,6 +1199,52 @@ func ensureP5Profiles(ctx context.Context, runtime mindmapapp.AgentRuntime, regi
 	}
 	logger.Debug("ensured P5 agent profiles", "count", len(seeds))
 	return nil
+}
+
+// ensureExecutionProfile seeds the P6 execution-agent profile (spec §7.1) and
+// validates every allowed tool against the live registry before the seed is
+// written. A profile that allows an unregistered tool would silently offer
+// fewer tools than it declares. The seed writer only inserts a missing key, so
+// an administrator-edited row is never overwritten on restart.
+func ensureExecutionProfile(ctx context.Context, runtime executionapp.AgentRuntimePort, registry *agentapp.ToolRegistry, logger *slog.Logger) error {
+	seed := executiondomain.ExecutionProfile()
+	if registry == nil {
+		return fmt.Errorf("P6 execution profile %q cannot be validated: the tool registry is not configured", seed.Key)
+	}
+	if err := executionagenttool.ValidateTools(registry); err != nil {
+		return fmt.Errorf("P6 execution profile %q: %w", seed.Key, err)
+	}
+	if err := runtime.EnsureProfile(ctx); err != nil {
+		return fmt.Errorf("seed P6 execution profile %q: %w", seed.Key, err)
+	}
+	logger.Debug("ensured P6 execution profile", "key", seed.Key)
+	return nil
+}
+
+// executionSessionInfo projects the resource session of a case run without ever
+// exposing its storage state or credentials. The account label is best-effort:
+// a deleted account leaves it empty instead of failing the case-run detail.
+type executionSessionInfo struct {
+	sessions *resourceapp.SessionService
+	accounts *resourceapp.AccessService
+}
+
+// CaseRunSession implements executionhttp.SessionInfoReader.
+func (s executionSessionInfo) CaseRunSession(ctx context.Context, sessionID int64) (executionhttp.CaseRunSession, error) {
+	if s.sessions == nil {
+		return executionhttp.CaseRunSession{}, errors.New("execution: session service is not configured")
+	}
+	session, _, _, _, err := s.sessions.Get(ctx, sessionID)
+	if err != nil {
+		return executionhttp.CaseRunSession{}, err
+	}
+	account := ""
+	if s.accounts != nil {
+		if resolved, accountErr := s.accounts.GetAccount(ctx, session.AccountID); accountErr == nil {
+			account = resolved.Label
+		}
+	}
+	return executionhttp.CaseRunSession{ID: session.ID, Account: account, State: session.State}, nil
 }
 
 // codeIntelRunner adapts the two codeintel async run services to the worker's

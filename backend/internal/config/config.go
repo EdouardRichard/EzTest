@@ -40,6 +40,24 @@ type Config struct {
 	// Markdown/Mermaid/OPML documents are written below this directory. Docker
 	// maps it to /data/exports.
 	ExportDir string
+	// ExecutorURL is the base URL of the standalone Node/Playwright executor
+	// (spec §5.6). ExecutorToken is the bearer token the API process sends on
+	// every executor call; it is never logged.
+	ExecutorURL   string
+	ExecutorToken string
+	// EvidenceDir is the root of the P6 evidence file store (spec §5.7/D30).
+	EvidenceDir string
+	// ExecMaxConcurrentCases, ExecMaxToolCalls, ExecCaseTimeoutMS,
+	// ExecMaxCasesPerBatch, ExecWorkerIntervalMS, ExecEvidenceMaxBytes and
+	// ExecEvidencePerCase are the P6 execution engine limits (spec §5.3, §5.5,
+	// §5.7).
+	ExecMaxConcurrentCases int
+	ExecMaxToolCalls       int
+	ExecCaseTimeoutMS      int
+	ExecMaxCasesPerBatch   int
+	ExecWorkerIntervalMS   int
+	ExecEvidenceMaxBytes   int
+	ExecEvidencePerCase    int
 	// SnowflakeNodeID is this process's 10-bit node ID for application-side
 	// primary key generation (D29). It must be unique per running instance.
 	SnowflakeNodeID int64
@@ -121,6 +139,33 @@ const (
 // spec §4.1: 1–32 lowercase letters, digits, dots and hyphens.
 var codeIntelPromptVersionPattern = regexp.MustCompile(`^[a-z0-9.-]{1,32}$`)
 
+// P6 execution defaults and bounds from design spec §5.3, §5.5 and §5.7.
+const (
+	defaultExecutorURL          = "http://127.0.0.1:13336"
+	defaultEvidenceDir          = ".data/evidence"
+	defaultExecMaxConcurrent    = 3
+	minExecMaxConcurrent        = 1
+	maxExecMaxConcurrent        = 8
+	defaultExecMaxToolCalls     = 80
+	minExecMaxToolCalls         = 1
+	maxExecMaxToolCalls         = 1000
+	defaultExecCaseTimeoutMS    = 900000
+	minExecCaseTimeoutMS        = 1000
+	maxExecCaseTimeoutMS        = 3600000
+	defaultExecMaxCasesPerBatch = 200
+	minExecMaxCasesPerBatch     = 1
+	maxExecMaxCasesPerBatch     = 1000
+	defaultExecWorkerIntervalMS = 2000
+	minExecWorkerIntervalMS     = 100
+	maxExecWorkerIntervalMS     = 60000
+	defaultExecEvidenceMaxBytes = 10 << 20
+	minExecEvidenceMaxBytes     = 1024
+	maxExecEvidenceMaxBytes     = 100 << 20
+	defaultExecEvidencePerCase  = 100
+	minExecEvidencePerCase      = 1
+	maxExecEvidencePerCase      = 1000
+)
+
 // defaultAgentHTTPAllowlist is the localhost-only HTTP allowlist applied when
 // EZTEST_AGENT_HTTP_ALLOWLIST is unset.
 var defaultAgentHTTPAllowlist = []string{"127.0.0.1", "localhost"}
@@ -140,6 +185,9 @@ func Load(getenv func(string) string) (Config, error) {
 		VersionAttachmentDir: valueOr(getenv, "EZTEST_VERSION_ATTACHMENT_DIR",
 			".data/version-attachments"),
 		ExportDir:     valueOr(getenv, "EZTEST_EXPORT_DIR", ".data/exports"),
+		ExecutorURL:   valueOr(getenv, "EZTEST_EXECUTOR_URL", defaultExecutorURL),
+		ExecutorToken: strings.TrimSpace(getenv("EZTEST_EXECUTOR_TOKEN")),
+		EvidenceDir:   valueOr(getenv, "EZTEST_EVIDENCE_DIR", defaultEvidenceDir),
 		OpenAPIPath:   valueOr(getenv, "EZTEST_OPENAPI_PATH", "docs/openapi/api.yaml"),
 		AgentFileRoot: strings.TrimSpace(getenv("EZTEST_AGENT_FILE_ROOT")),
 		LLMSeed: LLMSeed{
@@ -235,6 +283,55 @@ func Load(getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 	cfg.CodeIntelMaxDiffBytes = maxDiffBytes
+
+	execMaxConcurrent, err := parseBoundedInt(getenv, "EZTEST_EXEC_MAX_CONCURRENT_CASES",
+		defaultExecMaxConcurrent, minExecMaxConcurrent, maxExecMaxConcurrent)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.ExecMaxConcurrentCases = execMaxConcurrent
+
+	execMaxToolCalls, err := parseBoundedInt(getenv, "EZTEST_EXEC_MAX_TOOL_CALLS",
+		defaultExecMaxToolCalls, minExecMaxToolCalls, maxExecMaxToolCalls)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.ExecMaxToolCalls = execMaxToolCalls
+
+	execCaseTimeoutMS, err := parseBoundedInt(getenv, "EZTEST_EXEC_CASE_TIMEOUT_MS",
+		defaultExecCaseTimeoutMS, minExecCaseTimeoutMS, maxExecCaseTimeoutMS)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.ExecCaseTimeoutMS = execCaseTimeoutMS
+
+	execMaxCasesPerBatch, err := parseBoundedInt(getenv, "EZTEST_EXEC_MAX_CASES_PER_BATCH",
+		defaultExecMaxCasesPerBatch, minExecMaxCasesPerBatch, maxExecMaxCasesPerBatch)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.ExecMaxCasesPerBatch = execMaxCasesPerBatch
+
+	execWorkerIntervalMS, err := parseBoundedInt(getenv, "EZTEST_EXEC_WORKER_INTERVAL_MS",
+		defaultExecWorkerIntervalMS, minExecWorkerIntervalMS, maxExecWorkerIntervalMS)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.ExecWorkerIntervalMS = execWorkerIntervalMS
+
+	execEvidenceMaxBytes, err := parseBoundedInt(getenv, "EZTEST_EXEC_EVIDENCE_MAX_BYTES",
+		defaultExecEvidenceMaxBytes, minExecEvidenceMaxBytes, maxExecEvidenceMaxBytes)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.ExecEvidenceMaxBytes = execEvidenceMaxBytes
+
+	execEvidencePerCase, err := parseBoundedInt(getenv, "EZTEST_EXEC_EVIDENCE_PER_CASE",
+		defaultExecEvidencePerCase, minExecEvidencePerCase, maxExecEvidencePerCase)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.ExecEvidencePerCase = execEvidencePerCase
 
 	keys, err := parseSecretKeys(getenv("EZTEST_SECRET_KEYS"))
 	if err != nil {
