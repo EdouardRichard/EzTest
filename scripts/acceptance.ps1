@@ -2357,7 +2357,7 @@ writeFileSync(process.argv[3], JSON.stringify({
                                 kind          = "explore"
                                 systemId      = [int64]$current.SystemId
                                 environmentId = [int64]$current.EnvironmentId
-                                startPaths    = @("http://127.0.0.2:13335/p5/home")
+                                startPaths    = @("http://127.0.0.1:13335/p5/home")
                             }
                             Assert-P5Http -Response $exploreStart -Status 202 -Label "POST explore run" | Out-Null
                             $exploreRun = Wait-P5Run -VersionId $exploreVersion.VersionId -RunId ([string]$exploreStart.Data.runId) -Headers $current.AdminHeaders
