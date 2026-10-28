@@ -24,6 +24,7 @@ type AccessService struct {
 	accounts  domain.AccountRepository
 	accesses  domain.AccessRepository
 	systems   domain.SystemRepository
+	authFlows domain.AuthFlowRepository
 }
 
 // CreateAccountInput is the create-account request.
@@ -45,13 +46,16 @@ type UpdateAccountInput struct {
 	Status   *string
 }
 
-// CreateAccessInput is the create-access request.
+// CreateAccessInput is the create-access request. LoginFlowID optionally binds
+// the access to an enabled login recipe of the same system; nil leaves it
+// unbound.
 type CreateAccessInput struct {
 	SystemID          int64
 	AuthType          string
 	Credential        string
 	UsernameOverride  string
 	LoginURL          string
+	LoginFlowID       *int64
 	PermissionNote    string
 	Enabled           bool
 	ConcurrencyLimit  int
@@ -62,13 +66,17 @@ type CreateAccessInput struct {
 // the field unchanged, matching spec §7.4: Credential == nil keeps the stored
 // credential, *Credential == "" clears it, any other value replaces it.
 // ClearSessionTTL sets session_ttl_seconds to NULL and wins over
-// SessionTTLSeconds; with both unset the stored TTL is kept.
+// SessionTTLSeconds; with both unset the stored TTL is kept. LoginFlowID binds
+// a recipe, ClearLoginFlow unbinds it (and wins over LoginFlowID); with both
+// unset the stored binding is kept.
 type UpdateAccessInput struct {
 	AuthType          *string
 	UsernameOverride  *string
 	LoginURL          *string
 	PermissionNote    *string
 	Credential        *string
+	LoginFlowID       *int64
+	ClearLoginFlow    bool
 	Enabled           *bool
 	ConcurrencyLimit  *int
 	SessionTTLSeconds *int
@@ -76,14 +84,23 @@ type UpdateAccessInput struct {
 }
 
 // NewAccessService wires the account and access use cases to their
-// repositories.
-func NewAccessService(companies domain.CompanyRepository, accounts domain.AccountRepository, accesses domain.AccessRepository, systems domain.SystemRepository) *AccessService {
-	return &AccessService{
+// repositories. The optional auth flow repository validates login_flow_id
+// bindings (spec §5.9); when it is omitted a binding is rejected as
+// auth_flow_invalid instead of being stored unverified.
+func NewAccessService(companies domain.CompanyRepository, accounts domain.AccountRepository, accesses domain.AccessRepository, systems domain.SystemRepository, authFlows ...domain.AuthFlowRepository) *AccessService {
+	service := &AccessService{
 		companies: companies,
 		accounts:  accounts,
 		accesses:  accesses,
 		systems:   systems,
 	}
+	for _, flows := range authFlows {
+		if flows != nil {
+			service.authFlows = flows
+			break
+		}
+	}
+	return service
 }
 
 // validateAccountKind enforces the account.kind CHECK constraint.
@@ -146,6 +163,46 @@ func cloneAccessSessionTTL(ttl *int) *int {
 	}
 	cloned := *ttl
 	return &cloned
+}
+
+// cloneInt64 copies the optional login flow id so a stored access never aliases
+// the caller's request value.
+func cloneInt64(id *int64) *int64 {
+	if id == nil {
+		return nil
+	}
+	cloned := *id
+	return &cloned
+}
+
+// invalidAccessLoginFlow returns the shared 422 auth_flow_invalid error for a
+// login_flow_id that cannot be bound (spec §5.9).
+func invalidAccessLoginFlow(message string) *domain.Error {
+	return domain.NewInvalid("login_flow_id", "auth_flow_invalid", message)
+}
+
+// validateAccessLoginFlow enforces the auto-login eligibility of spec §5.9: the
+// referenced recipe must exist, be enabled and belong to the access's system.
+// A missing validator is a wiring error, so binding is rejected (fail closed)
+// rather than stored unverified.
+func (s *AccessService) validateAccessLoginFlow(ctx context.Context, flowID, systemID int64) error {
+	if s.authFlows == nil {
+		return invalidAccessLoginFlow("login_flow_id cannot be validated: auth flow repository is not configured")
+	}
+	flow, err := s.authFlows.GetAuthFlow(ctx, flowID)
+	if err != nil {
+		if isNotFound(err) {
+			return invalidAccessLoginFlow("login_flow_id does not reference an existing login flow")
+		}
+		return err
+	}
+	if !flow.Enabled {
+		return invalidAccessLoginFlow("login_flow_id must reference an enabled login flow")
+	}
+	if flow.SystemID != systemID {
+		return invalidAccessLoginFlow("login_flow_id must reference a login flow of the same system")
+	}
+	return nil
 }
 
 // GetAccount returns one account by id.
@@ -273,6 +330,11 @@ func (s *AccessService) CreateAccess(ctx context.Context, accountID int64, in Cr
 	if _, err := s.systems.GetSystem(ctx, in.SystemID); err != nil {
 		return nil, err
 	}
+	if in.LoginFlowID != nil {
+		if err := s.validateAccessLoginFlow(ctx, *in.LoginFlowID, in.SystemID); err != nil {
+			return nil, err
+		}
+	}
 
 	access := &domain.Access{
 		AccountID:         accountID,
@@ -281,6 +343,7 @@ func (s *AccessService) CreateAccess(ctx context.Context, accountID int64, in Cr
 		Credential:        in.Credential,
 		UsernameOverride:  in.UsernameOverride,
 		LoginURL:          in.LoginURL,
+		LoginFlowID:       cloneInt64(in.LoginFlowID),
 		Enabled:           in.Enabled,
 		ConcurrencyLimit:  in.ConcurrencyLimit,
 		SessionTTLSeconds: cloneAccessSessionTTL(in.SessionTTLSeconds),
@@ -328,6 +391,15 @@ func (s *AccessService) UpdateAccess(ctx context.Context, id int64, in UpdateAcc
 			return nil, err
 		}
 		access.ConcurrencyLimit = *in.ConcurrencyLimit
+	}
+	switch {
+	case in.ClearLoginFlow:
+		access.LoginFlowID = nil
+	case in.LoginFlowID != nil:
+		if err := s.validateAccessLoginFlow(ctx, *in.LoginFlowID, access.SystemID); err != nil {
+			return nil, err
+		}
+		access.LoginFlowID = cloneInt64(in.LoginFlowID)
 	}
 	switch {
 	case in.ClearSessionTTL:

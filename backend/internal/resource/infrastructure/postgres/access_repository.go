@@ -13,7 +13,7 @@ import (
 // the scan order scanAccount/scanAccess expect.
 const (
 	accountColumnList = `id, company_id, key, label, username, kind, status, notes, created_at, updated_at`
-	accessColumnList  = `id, account_id, system_id, auth_type, credential, username_override, login_url, enabled, concurrency_limit, session_ttl_seconds, permission_note, created_at, updated_at`
+	accessColumnList  = `id, account_id, system_id, auth_type, credential, username_override, login_url, login_flow_id, enabled, concurrency_limit, session_ttl_seconds, permission_note, created_at, updated_at`
 )
 
 // AccessRepository implements the account and access persistence ports on a
@@ -67,6 +67,7 @@ func scanAccess(row rowScanner) (domain.Access, error) {
 		&access.Credential,
 		&access.UsernameOverride,
 		&access.LoginURL,
+		&access.LoginFlowID,
 		&access.Enabled,
 		&access.ConcurrencyLimit,
 		&access.SessionTTLSeconds,
@@ -205,12 +206,12 @@ func (r *AccessRepository) CountSessionsByAccount(ctx context.Context, accountID
 func (r *AccessRepository) CreateAccess(ctx context.Context, a *domain.Access) error {
 	const query = `INSERT INTO account_system_access
 		(account_id, system_id, auth_type, credential, username_override, login_url,
-		 enabled, concurrency_limit, session_ttl_seconds, permission_note)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		 login_flow_id, enabled, concurrency_limit, session_ttl_seconds, permission_note)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		RETURNING ` + accessColumnList
 	created, err := scanAccess(r.pool.QueryRow(ctx, query,
 		a.AccountID, a.SystemID, a.AuthType, a.Credential, a.UsernameOverride, a.LoginURL,
-		a.Enabled, a.ConcurrencyLimit, a.SessionTTLSeconds, a.PermissionNote))
+		a.LoginFlowID, a.Enabled, a.ConcurrencyLimit, a.SessionTTLSeconds, a.PermissionNote))
 	if err != nil {
 		return catalogWriteError(err, "an access for this account and system already exists", "create access")
 	}
@@ -260,13 +261,13 @@ func (r *AccessRepository) ListAccesses(ctx context.Context, accountID int64) ([
 func (r *AccessRepository) UpdateAccess(ctx context.Context, a *domain.Access) error {
 	const query = `UPDATE account_system_access
 		SET auth_type = $2, credential = $3, username_override = $4, login_url = $5,
-		    enabled = $6, concurrency_limit = $7, session_ttl_seconds = $8,
-		    permission_note = $9, updated_at = now()
+		    login_flow_id = $6, enabled = $7, concurrency_limit = $8,
+		    session_ttl_seconds = $9, permission_note = $10, updated_at = now()
 		WHERE id = $1
 		RETURNING created_at, updated_at`
 	if err := r.pool.QueryRow(ctx, query,
 		a.ID, a.AuthType, a.Credential, a.UsernameOverride, a.LoginURL,
-		a.Enabled, a.ConcurrencyLimit, a.SessionTTLSeconds, a.PermissionNote,
+		a.LoginFlowID, a.Enabled, a.ConcurrencyLimit, a.SessionTTLSeconds, a.PermissionNote,
 	).Scan(&a.CreatedAt, &a.UpdatedAt); err != nil {
 		return catalogWriteBackError(err, "access", a.ID,
 			"an access for this account and system already exists", "update access")

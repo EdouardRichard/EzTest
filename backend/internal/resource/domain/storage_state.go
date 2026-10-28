@@ -60,10 +60,13 @@ type Cookie struct {
 	SameSite string `json:"sameSite"`
 }
 
-// Origin is one browser origin with its localStorage entries.
+// Origin is one browser origin with its localStorage entries. SessionStorage is
+// the additive P6 extension (spec §3.4): states captured before P6 simply omit
+// it, so re-encoding an old state does not invent the field.
 type Origin struct {
-	Origin       string             `json:"origin"`
-	LocalStorage []LocalStorageItem `json:"localStorage"`
+	Origin         string             `json:"origin"`
+	LocalStorage   []LocalStorageItem `json:"localStorage"`
+	SessionStorage []LocalStorageItem `json:"sessionStorage,omitempty"`
 }
 
 // LocalStorageItem is one localStorage key/value pair.
@@ -132,20 +135,11 @@ func parseStorageStateJSON(raw json.RawMessage) (*StorageState, error) {
 		if err := validateOriginURL(origin.Origin); err != nil {
 			return nil, invalidStorageState(field+".origin", err.Error())
 		}
-		if len(origin.LocalStorage) > maxLocalStorageItems {
-			return nil, invalidStorageState(field+".localStorage",
-				fmt.Sprintf("at most %d localStorage items are allowed", maxLocalStorageItems))
+		if err := validateStorageItems(origin.LocalStorage, field+".localStorage", "localStorage"); err != nil {
+			return nil, err
 		}
-		for j, item := range origin.LocalStorage {
-			itemField := fmt.Sprintf("%s.localStorage[%d]", field, j)
-			if len(item.Name) > maxLocalStorageValue {
-				return nil, invalidStorageState(itemField+".name",
-					fmt.Sprintf("localStorage name must be at most %d bytes", maxLocalStorageValue))
-			}
-			if len(item.Value) > maxLocalStorageValue {
-				return nil, invalidStorageState(itemField+".value",
-					fmt.Sprintf("localStorage value must be at most %d bytes", maxLocalStorageValue))
-			}
+		if err := validateStorageItems(origin.SessionStorage, field+".sessionStorage", "sessionStorage"); err != nil {
+			return nil, err
 		}
 	}
 	if doc.Cookies == nil {
@@ -200,6 +194,28 @@ func parseTokenJSON(raw json.RawMessage) (*StorageState, error) {
 		}
 	}
 	return &StorageState{Kind: StorageStateKindToken, Headers: headers}, nil
+}
+
+// validateStorageItems checks the shared localStorage/sessionStorage bounds:
+// at most maxLocalStorageItems entries, each name and value at most
+// maxLocalStorageValue bytes. label names the storage kind in error messages.
+func validateStorageItems(items []LocalStorageItem, field, label string) error {
+	if len(items) > maxLocalStorageItems {
+		return invalidStorageState(field,
+			fmt.Sprintf("at most %d %s items are allowed", maxLocalStorageItems, label))
+	}
+	for j, item := range items {
+		itemField := fmt.Sprintf("%s[%d]", field, j)
+		if len(item.Name) > maxLocalStorageValue {
+			return invalidStorageState(itemField+".name",
+				fmt.Sprintf("%s name must be at most %d bytes", label, maxLocalStorageValue))
+		}
+		if len(item.Value) > maxLocalStorageValue {
+			return invalidStorageState(itemField+".value",
+				fmt.Sprintf("%s value must be at most %d bytes", label, maxLocalStorageValue))
+		}
+	}
+	return nil
 }
 
 // validateOriginURL checks that raw is an absolute http(s) URL of at most

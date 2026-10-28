@@ -3,6 +3,7 @@ package httpapi
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/resource/application"
@@ -73,19 +74,22 @@ func newAccountDTO(account domain.Account) accountDTO {
 
 // accessDTO is the public Access representation (camelCase, spec §7.4). The
 // stored credential is never part of it: credentialSet reports whether one is
-// stored so the UI can offer "clear".
+// stored so the UI can offer "clear". login_flow_id keeps the snake_case name
+// of the P6 login-recipe API (spec §3.4) and is a decimal string or null
+// (spec §6.1).
 type accessDTO struct {
-	ID                int64  `json:"id"`
-	AccountID         int64  `json:"accountId"`
-	SystemID          int64  `json:"systemId"`
-	AuthType          string `json:"authType"`
-	CredentialSet     bool   `json:"credentialSet"`
-	UsernameOverride  string `json:"usernameOverride"`
-	LoginURL          string `json:"loginUrl"`
-	Enabled           bool   `json:"enabled"`
-	ConcurrencyLimit  int    `json:"concurrencyLimit"`
-	SessionTTLSeconds *int   `json:"sessionTtlSeconds"`
-	PermissionNote    string `json:"permissionNote"`
+	ID                int64   `json:"id"`
+	AccountID         int64   `json:"accountId"`
+	SystemID          int64   `json:"systemId"`
+	AuthType          string  `json:"authType"`
+	CredentialSet     bool    `json:"credentialSet"`
+	UsernameOverride  string  `json:"usernameOverride"`
+	LoginURL          string  `json:"loginUrl"`
+	Enabled           bool    `json:"enabled"`
+	ConcurrencyLimit  int     `json:"concurrencyLimit"`
+	SessionTTLSeconds *int    `json:"sessionTtlSeconds"`
+	PermissionNote    string  `json:"permissionNote"`
+	LoginFlowID       *string `json:"login_flow_id"`
 }
 
 // newAccessDTO maps an access to its API shape, reducing the plaintext
@@ -103,7 +107,42 @@ func newAccessDTO(access domain.Access) accessDTO {
 		ConcurrencyLimit:  access.ConcurrencyLimit,
 		SessionTTLSeconds: access.SessionTTLSeconds,
 		PermissionNote:    access.PermissionNote,
+		LoginFlowID:       formatAccessLoginFlowID(access.LoginFlowID),
 	}
+}
+
+// formatAccessLoginFlowID renders the nullable login_flow_id as a decimal
+// string, keeping nil as an explicit JSON null.
+func formatAccessLoginFlowID(id *int64) *string {
+	if id == nil {
+		return nil
+	}
+	formatted := strconv.FormatInt(*id, 10)
+	return &formatted
+}
+
+// parseAccessLoginFlowID decodes the optional login_flow_id body value. An
+// omitted field returns present=false; JSON null returns present=true with a nil
+// id; a decimal string returns the parsed positive id. Everything else is the
+// shared 422 auth_flow_invalid error.
+func parseAccessLoginFlowID(raw json.RawMessage) (id *int64, present bool, err error) {
+	if len(raw) == 0 {
+		return nil, false, nil
+	}
+	if string(raw) == "null" {
+		return nil, true, nil
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err != nil {
+		return nil, true, domain.NewInvalid("login_flow_id", "auth_flow_invalid",
+			"login_flow_id must be a decimal string or null")
+	}
+	parsed, err := strconv.ParseInt(text, 10, 64)
+	if err != nil || parsed <= 0 {
+		return nil, true, domain.NewInvalid("login_flow_id", "auth_flow_invalid",
+			"login_flow_id must be a positive decimal string or null")
+	}
+	return &parsed, true, nil
 }
 
 // createAccountRequest is the POST /accounts body.
@@ -127,23 +166,26 @@ type updateAccountRequest struct {
 
 // createAccessRequest is the POST /accounts/{id}/accesses body. An omitted
 // enabled flag adopts the DDL default (true); an omitted credential leaves
-// credentialSet=false.
+// credentialSet=false; an omitted or null login_flow_id leaves the access
+// unbound.
 type createAccessRequest struct {
-	SystemID          int64  `json:"systemId"`
-	AuthType          string `json:"authType"`
-	Credential        string `json:"credential"`
-	UsernameOverride  string `json:"usernameOverride"`
-	LoginURL          string `json:"loginUrl"`
-	Enabled           *bool  `json:"enabled"`
-	ConcurrencyLimit  int    `json:"concurrencyLimit"`
-	SessionTTLSeconds *int   `json:"sessionTtlSeconds"`
-	PermissionNote    string `json:"permissionNote"`
+	SystemID          int64           `json:"systemId"`
+	AuthType          string          `json:"authType"`
+	Credential        string          `json:"credential"`
+	UsernameOverride  string          `json:"usernameOverride"`
+	LoginURL          string          `json:"loginUrl"`
+	Enabled           *bool           `json:"enabled"`
+	ConcurrencyLimit  int             `json:"concurrencyLimit"`
+	SessionTTLSeconds *int            `json:"sessionTtlSeconds"`
+	PermissionNote    string          `json:"permissionNote"`
+	LoginFlowID       json.RawMessage `json:"login_flow_id"`
 }
 
 // updateAccessRequest is the PATCH /accesses/{id} body. Nil fields are
 // unchanged. credential follows spec §7.4 (omitted=keep, ""=clear,
 // non-empty=replace); sessionTtlSeconds is decoded separately so an explicit
-// JSON null can be told apart from an omitted field.
+// JSON null can be told apart from an omitted field. login_flow_id follows the
+// same rule: omitted=keep, null=unbind, decimal string=bind.
 type updateAccessRequest struct {
 	AuthType         *string `json:"authType"`
 	Credential       *string `json:"credential"`
@@ -157,6 +199,7 @@ type updateAccessRequest struct {
 	// creation, so the value is parsed and discarded.
 	SystemID          *int64          `json:"systemId"`
 	SessionTTLSeconds json.RawMessage `json:"sessionTtlSeconds"`
+	LoginFlowID       json.RawMessage `json:"login_flow_id"`
 }
 
 // ListAccounts returns one cursor page of accounts.
@@ -309,6 +352,11 @@ func (h *AccessHandler) CreateAccess(w http.ResponseWriter, r *http.Request) {
 		WriteServiceError(w, r, err)
 		return
 	}
+	loginFlowID, _, err := parseAccessLoginFlowID(req.LoginFlowID)
+	if err != nil {
+		WriteServiceError(w, r, err)
+		return
+	}
 	enabled := true
 	if req.Enabled != nil {
 		enabled = *req.Enabled
@@ -319,6 +367,7 @@ func (h *AccessHandler) CreateAccess(w http.ResponseWriter, r *http.Request) {
 		Credential:        req.Credential,
 		UsernameOverride:  req.UsernameOverride,
 		LoginURL:          req.LoginURL,
+		LoginFlowID:       loginFlowID,
 		PermissionNote:    req.PermissionNote,
 		Enabled:           enabled,
 		ConcurrencyLimit:  req.ConcurrencyLimit,
@@ -345,6 +394,11 @@ func (h *AccessHandler) UpdateAccess(w http.ResponseWriter, r *http.Request) {
 		WriteServiceError(w, r, err)
 		return
 	}
+	loginFlowID, loginFlowPresent, err := parseAccessLoginFlowID(req.LoginFlowID)
+	if err != nil {
+		WriteServiceError(w, r, err)
+		return
+	}
 	in := application.UpdateAccessInput{
 		AuthType:         req.AuthType,
 		Credential:       req.Credential,
@@ -353,6 +407,13 @@ func (h *AccessHandler) UpdateAccess(w http.ResponseWriter, r *http.Request) {
 		PermissionNote:   req.PermissionNote,
 		Enabled:          req.Enabled,
 		ConcurrencyLimit: req.ConcurrencyLimit,
+	}
+	if loginFlowPresent {
+		if loginFlowID == nil {
+			in.ClearLoginFlow = true
+		} else {
+			in.LoginFlowID = loginFlowID
+		}
 	}
 	if len(req.SessionTTLSeconds) > 0 {
 		if string(req.SessionTTLSeconds) == "null" {

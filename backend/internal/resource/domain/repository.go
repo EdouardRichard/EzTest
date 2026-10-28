@@ -98,6 +98,24 @@ type SessionRepository interface {
 	UpdateTakeover(ctx context.Context, t *Takeover, expectedStatus string) error
 }
 
+// AuthFlowFilter is one cursor page request over the system's login recipes.
+// SystemID narrows the page to one system and is zero for every system.
+type AuthFlowFilter struct {
+	SystemID int64
+	Page     Page
+}
+
+// AuthFlowRepository is the persistence port for login recipes (spec §3.4).
+type AuthFlowRepository interface {
+	CreateAuthFlow(ctx context.Context, f *AuthFlow) error
+	GetAuthFlow(ctx context.Context, id int64) (*AuthFlow, error)
+	// ListAuthFlows returns one page ordered by ID ascending and reports
+	// whether another row exists after it.
+	ListAuthFlows(ctx context.Context, f AuthFlowFilter) ([]AuthFlow, bool, error)
+	UpdateAuthFlow(ctx context.Context, f *AuthFlow) error
+	DeleteAuthFlow(ctx context.Context, id int64) error
+}
+
 // CodeRepoRepository is the persistence port for local code repositories.
 type CodeRepoRepository interface {
 	CreateCodeRepo(ctx context.Context, r *CodeRepository) error

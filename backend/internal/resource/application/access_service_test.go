@@ -271,6 +271,7 @@ type accessTestEnv struct {
 	accounts  *fakeAccessAccountRepo
 	accesses  *fakeAccessAccessRepo
 	systems   *fakeAccessSystemRepo
+	flows     *fakeAuthFlowRepo
 	service   *AccessService
 }
 
@@ -285,8 +286,9 @@ func newAccessTestEnv(t *testing.T) *accessTestEnv {
 		accounts: newFakeAccessAccountRepo(),
 		accesses: newFakeAccessAccessRepo(),
 		systems:  newFakeAccessSystemRepo(),
+		flows:    newFakeAuthFlowRepo(),
 	}
-	env.service = NewAccessService(env.companies, env.accounts, env.accesses, env.systems)
+	env.service = NewAccessService(env.companies, env.accounts, env.accesses, env.systems, env.flows)
 	return env
 }
 
@@ -328,6 +330,20 @@ func (env *accessTestEnv) seedAccess(id, accountID, systemID int64, credential s
 	}
 	env.accesses.accesses[id] = access
 	return access
+}
+
+// seedAuthFlow inserts a login recipe for systemID directly into the fake
+// repository.
+func (env *accessTestEnv) seedAuthFlow(id, systemID int64, enabled bool) domain.AuthFlow {
+	flow := domain.AuthFlow{
+		ID: id, SystemID: systemID, Name: "fixture login",
+		Kind: domain.AuthFlowKindForm, Enabled: enabled,
+	}
+	if id >= env.flows.nextID {
+		env.flows.nextID = id + 1
+	}
+	env.flows.flows[id] = flow
+	return flow
 }
 
 // assertAccessServiceError asserts err is a domain error of kind/reason.
@@ -955,4 +971,217 @@ func authAccessWithTTL(env *accessTestEnv, id, accountID, systemID int64, ttl *i
 	access.SessionTTLSeconds = ttl
 	env.accesses.accesses[id] = access
 	return access
+}
+
+// TestAccessServiceCreateAccessBindsLoginFlow covers binding a new access to an
+// enabled recipe of the same system (spec §5.9 auto-login eligibility).
+func TestAccessServiceCreateAccessBindsLoginFlow(t *testing.T) {
+	env := newAccessTestEnv(t)
+	account := env.seedAccount(3, "fixture-user")
+	system := env.seedSystem(5, "fixture-web")
+	flow := env.seedAuthFlow(7, system.ID, true)
+	flowID := flow.ID
+
+	created, err := env.service.CreateAccess(context.Background(), account.ID, CreateAccessInput{
+		SystemID:         system.ID,
+		AuthType:         domain.AuthTypePassword,
+		Credential:       "s3cret",
+		Enabled:          true,
+		ConcurrencyLimit: 1,
+		LoginFlowID:      &flowID,
+	})
+	if err != nil {
+		t.Fatalf("CreateAccess: %v", err)
+	}
+	if created.LoginFlowID == nil || *created.LoginFlowID != flow.ID {
+		t.Fatalf("login flow=%v want %d", created.LoginFlowID, flow.ID)
+	}
+	stored := env.accesses.accesses[created.ID]
+	if stored.LoginFlowID == nil || *stored.LoginFlowID != flow.ID {
+		t.Fatalf("stored login flow=%v want %d", stored.LoginFlowID, flow.ID)
+	}
+
+	// An omitted login_flow_id keeps the access unbound.
+	unbound, err := env.service.CreateAccess(context.Background(), account.ID, CreateAccessInput{
+		SystemID:         system.ID,
+		AuthType:         domain.AuthTypePassword,
+		Credential:       "s3cret",
+		Enabled:          true,
+		ConcurrencyLimit: 1,
+	})
+	if err != nil {
+		t.Fatalf("CreateAccess without login flow: %v", err)
+	}
+	if unbound.LoginFlowID != nil {
+		t.Fatalf("login flow=%v want nil", *unbound.LoginFlowID)
+	}
+}
+
+// TestAccessServiceCreateAccessRejectsInvalidLoginFlow rejects a recipe that is
+// missing, disabled or owned by another system with the shared 422
+// auth_flow_invalid error (spec §5.9).
+func TestAccessServiceCreateAccessRejectsInvalidLoginFlow(t *testing.T) {
+	cases := []struct {
+		name         string
+		flowID       int64
+		flowSystemID int64
+		flowEnabled  bool
+		seedFlow     bool
+	}{
+		{"nonexistent flow", 99, 5, true, false},
+		{"disabled flow", 7, 5, false, true},
+		{"flow of another system", 7, 6, true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newAccessTestEnv(t)
+			account := env.seedAccount(3, "fixture-user")
+			system := env.seedSystem(5, "fixture-web")
+			env.seedSystem(6, "other-web")
+			if tc.seedFlow {
+				env.seedAuthFlow(tc.flowID, tc.flowSystemID, tc.flowEnabled)
+			}
+			flowID := tc.flowID
+			_, err := env.service.CreateAccess(context.Background(), account.ID, CreateAccessInput{
+				SystemID:         system.ID,
+				AuthType:         domain.AuthTypePassword,
+				Credential:       "s3cret",
+				Enabled:          true,
+				ConcurrencyLimit: 1,
+				LoginFlowID:      &flowID,
+			})
+			domainErr := assertAccessServiceError(t, err, domain.KindInvalid, "auth_flow_invalid")
+			if domainErr.Field != "login_flow_id" {
+				t.Fatalf("field=%q want login_flow_id", domainErr.Field)
+			}
+			if env.accesses.createCalls != 0 {
+				t.Fatal("an invalid login flow reached the repository")
+			}
+		})
+	}
+}
+
+// TestAccessServiceUpdateAccessLoginFlowSemantics covers bind/keep/unbind through
+// the partial update, mirroring the session_ttl_seconds semantics.
+func TestAccessServiceUpdateAccessLoginFlowSemantics(t *testing.T) {
+	env := newAccessTestEnv(t)
+	account := env.seedAccount(3, "fixture-user")
+	system := env.seedSystem(5, "fixture-web")
+	access := env.seedAccess(11, account.ID, system.ID, "s3cret")
+	flow := env.seedAuthFlow(7, system.ID, true)
+	flowID := flow.ID
+
+	updated, err := env.service.UpdateAccess(context.Background(), access.ID, UpdateAccessInput{})
+	if err != nil {
+		t.Fatalf("UpdateAccess omitted login flow: %v", err)
+	}
+	if updated.LoginFlowID != nil {
+		t.Fatalf("login flow=%v want nil", *updated.LoginFlowID)
+	}
+
+	updated, err = env.service.UpdateAccess(context.Background(), access.ID, UpdateAccessInput{LoginFlowID: &flowID})
+	if err != nil {
+		t.Fatalf("UpdateAccess bind login flow: %v", err)
+	}
+	if updated.LoginFlowID == nil || *updated.LoginFlowID != flow.ID {
+		t.Fatalf("login flow=%v want %d", updated.LoginFlowID, flow.ID)
+	}
+	if stored := env.accesses.accesses[access.ID]; stored.LoginFlowID == nil || *stored.LoginFlowID != flow.ID {
+		t.Fatalf("stored login flow=%v want %d", env.accesses.accesses[access.ID].LoginFlowID, flow.ID)
+	}
+
+	// An omitted login_flow_id keeps the stored binding.
+	updated, err = env.service.UpdateAccess(context.Background(), access.ID, UpdateAccessInput{})
+	if err != nil {
+		t.Fatalf("UpdateAccess keep login flow: %v", err)
+	}
+	if updated.LoginFlowID == nil || *updated.LoginFlowID != flow.ID {
+		t.Fatalf("login flow=%v want %d", updated.LoginFlowID, flow.ID)
+	}
+
+	// An explicit null unbinds it.
+	updated, err = env.service.UpdateAccess(context.Background(), access.ID, UpdateAccessInput{ClearLoginFlow: true})
+	if err != nil {
+		t.Fatalf("UpdateAccess clear login flow: %v", err)
+	}
+	if updated.LoginFlowID != nil {
+		t.Fatalf("login flow=%v want nil", *updated.LoginFlowID)
+	}
+	if env.accesses.accesses[access.ID].LoginFlowID != nil {
+		t.Fatal("clear did not persist a NULL login_flow_id")
+	}
+
+	// Clear wins when the request carries both a value and the clear flag.
+	updated, err = env.service.UpdateAccess(context.Background(), access.ID, UpdateAccessInput{
+		LoginFlowID: &flowID, ClearLoginFlow: true,
+	})
+	if err != nil {
+		t.Fatalf("UpdateAccess clear login flow with value: %v", err)
+	}
+	if updated.LoginFlowID != nil {
+		t.Fatalf("login flow=%v want nil", *updated.LoginFlowID)
+	}
+}
+
+// TestAccessServiceLoginFlowRequiresConfiguredRepository documents the fail
+// closed wiring rule: without an auth flow repository a binding is rejected
+// rather than stored unverified.
+func TestAccessServiceLoginFlowRequiresConfiguredRepository(t *testing.T) {
+	env := newAccessTestEnv(t)
+	env.service = NewAccessService(env.companies, env.accounts, env.accesses, env.systems)
+	account := env.seedAccount(3, "fixture-user")
+	system := env.seedSystem(5, "fixture-web")
+	flowID := int64(7)
+
+	_, err := env.service.CreateAccess(context.Background(), account.ID, CreateAccessInput{
+		SystemID: system.ID, AuthType: domain.AuthTypePassword,
+		Credential: "s3cret", Enabled: true, ConcurrencyLimit: 1, LoginFlowID: &flowID,
+	})
+	domainErr := assertAccessServiceError(t, err, domain.KindInvalid, "auth_flow_invalid")
+	if domainErr.Field != "login_flow_id" {
+		t.Fatalf("field=%q want login_flow_id", domainErr.Field)
+	}
+	if env.accesses.createCalls != 0 {
+		t.Fatal("an unverified login flow reached the repository")
+	}
+}
+
+// TestAccessServiceUpdateAccessRejectsInvalidLoginFlow keeps a bad rebind from
+// touching the stored access.
+func TestAccessServiceUpdateAccessRejectsInvalidLoginFlow(t *testing.T) {
+	cases := []struct {
+		name         string
+		flowID       int64
+		flowSystemID int64
+		flowEnabled  bool
+		seedFlow     bool
+	}{
+		{"nonexistent flow", 99, 5, true, false},
+		{"disabled flow", 7, 5, false, true},
+		{"flow of another system", 7, 6, true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newAccessTestEnv(t)
+			account := env.seedAccount(3, "fixture-user")
+			system := env.seedSystem(5, "fixture-web")
+			env.seedSystem(6, "other-web")
+			access := env.seedAccess(11, account.ID, system.ID, "s3cret")
+			if tc.seedFlow {
+				env.seedAuthFlow(tc.flowID, tc.flowSystemID, tc.flowEnabled)
+			}
+			flowID := tc.flowID
+			_, err := env.service.UpdateAccess(context.Background(), access.ID, UpdateAccessInput{LoginFlowID: &flowID})
+			domainErr := assertAccessServiceError(t, err, domain.KindInvalid, "auth_flow_invalid")
+			if domainErr.Field != "login_flow_id" {
+				t.Fatalf("field=%q want login_flow_id", domainErr.Field)
+			}
+			if env.accesses.updateCalls != 0 {
+				t.Fatal("an invalid login flow reached the repository")
+			}
+			if env.accesses.accesses[access.ID].LoginFlowID != nil {
+				t.Fatal("an invalid login flow changed the stored access")
+			}
+		})
+	}
 }
