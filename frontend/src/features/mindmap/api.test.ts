@@ -107,16 +107,10 @@ describe("mindmap api", () => {
     const updateBody = { expression: "订单号存在", nodeRevision: 2 }
 
     await mindmapApi.createAssertion(VERSION_ID, NODE_ID, assertionBody)
-    expect(mocks.apiPost).toHaveBeenCalledWith(
-      `${BASE}/nodes/${NODE_ID}/assertions`,
-      assertionBody,
-    )
+    expect(mocks.apiPost).toHaveBeenCalledWith(`${BASE}/nodes/${NODE_ID}/assertions`, assertionBody)
 
     await mindmapApi.updateAssertion(VERSION_ID, ASSERTION_ID, updateBody)
-    expect(mocks.apiPatch).toHaveBeenCalledWith(
-      `${BASE}/assertions/${ASSERTION_ID}`,
-      updateBody,
-    )
+    expect(mocks.apiPatch).toHaveBeenCalledWith(`${BASE}/assertions/${ASSERTION_ID}`, updateBody)
 
     await mindmapApi.deleteAssertion(VERSION_ID, ASSERTION_ID, 2)
     expect(mocks.apiDelete).toHaveBeenCalledWith(
@@ -195,6 +189,24 @@ describe("mindmap api", () => {
     })
   })
 
+  it("returns the flat findings array and rejects an unexpected payload shape", async () => {
+    const findings = [{ id: FINDING_ID }]
+    mocks.apiGet.mockResolvedValueOnce(findings)
+
+    await expect(mindmapApi.listFindings(VERSION_ID)).resolves.toBe(findings)
+    expect(mocks.apiGet).toHaveBeenLastCalledWith(`${BASE}/findings`)
+
+    // `data: null` is the only empty shape; it resolves to [].
+    mocks.apiGet.mockResolvedValueOnce(null)
+    await expect(mindmapApi.listFindings(VERSION_ID)).resolves.toEqual([])
+
+    // Anything else is a contract violation: never hide findings as "none".
+    mocks.apiGet.mockResolvedValueOnce({ items: [] })
+    await expect(mindmapApi.listFindings(VERSION_ID)).rejects.toThrow(
+      /GET \/findings returned an unexpected payload/,
+    )
+  })
+
   it("covers the export endpoints", async () => {
     const exportBody = { format: "markdown" as const }
     const exportsPage = { items: [], nextCursor: "", hasMore: false }
@@ -203,9 +215,9 @@ describe("mindmap api", () => {
     await mindmapApi.createExport(VERSION_ID, exportBody)
     expect(mocks.apiPost).toHaveBeenCalledWith(`${BASE}/export`, exportBody)
 
-    await expect(mindmapApi.listExports(VERSION_ID, { format: "markdown", limit: 10 })).resolves.toBe(
-      exportsPage,
-    )
+    await expect(
+      mindmapApi.listExports(VERSION_ID, { format: "markdown", limit: 10 }),
+    ).resolves.toBe(exportsPage)
     expect(mocks.apiGetPage).toHaveBeenCalledWith(`${BASE}/exports?format=markdown&limit=10`)
   })
 

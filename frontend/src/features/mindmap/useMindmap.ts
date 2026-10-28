@@ -8,7 +8,7 @@ import type { SSEStatus } from "@/lib/sse-client"
 
 import { mindmapApi } from "./api"
 import { describeMindmapError } from "./error-messages"
-import type { MindmapGraph } from "./types"
+import type { MindmapGraph, NormalizedMindmapGraph } from "./types"
 
 /** At most one graph refresh per window, whichever events trigger it (spec §9.2). */
 export const MINDMAP_REFRESH_THROTTLE_MS = 500
@@ -16,6 +16,32 @@ export const MINDMAP_REFRESH_THROTTLE_MS = 500
 /** SSE event types that can change the graph or its editability (spec §7.5). */
 function isRefreshEvent(type: string): boolean {
   return type.startsWith("case.") || type.startsWith("gate.") || type === "version.status_changed"
+}
+
+/** Events may omit `version_id`; a null id still belongs to the open channel. */
+function isEventForVersion(event: VersionEvent, versionId: string): boolean {
+  return event.version_id === null || event.version_id === versionId
+}
+
+/**
+ * Fills the optional include sections the server may omit (`impactCases` and
+ * per-node `anchors`) so consumers always see arrays. Returns the same object
+ * when nothing is missing, keeping the server snapshot identity.
+ */
+export function normalizeGraph(graph: MindmapGraph): NormalizedMindmapGraph {
+  const complete =
+    Array.isArray(graph.impactCases) && graph.nodes.every((node) => Array.isArray(node.anchors))
+  if (complete) return graph as NormalizedMindmapGraph
+
+  return {
+    ...graph,
+    impactCases: graph.impactCases ?? [],
+    nodes: graph.nodes.map((node) =>
+      Array.isArray(node.anchors)
+        ? (node as NormalizedMindmapGraph["nodes"][number])
+        : { ...node, anchors: [] },
+    ),
+  }
 }
 
 function maxEventSeq(events: VersionEvent[]): number {
@@ -45,7 +71,7 @@ function hasMissedEvents(events: VersionEvent[], previousMax: number): boolean {
 
 export type UseMindmapResult = {
   /** The server-authoritative graph snapshot; null before the first load. */
-  graph: MindmapGraph | null
+  graph: NormalizedMindmapGraph | null
   /** True while the first read for the current version is in flight. */
   loading: boolean
   /** User-facing Chinese failure copy; empty when the last read succeeded. */
@@ -67,7 +93,7 @@ export type UseMindmapResult = {
  * whole snapshot after a conflict or a run.
  */
 export function useMindmap(versionId: string): UseMindmapResult {
-  const [graph, setGraph] = useState<MindmapGraph | null>(null)
+  const [graph, setGraph] = useState<NormalizedMindmapGraph | null>(null)
   const [loading, setLoading] = useState(versionId !== "")
   const [error, setError] = useState("")
 
@@ -98,7 +124,7 @@ export function useMindmap(versionId: string): UseMindmapResult {
         const next = await mindmapApi.getGraph(id)
         if (versionIdRef.current !== id || generationRef.current !== generation) return
         if (requestRef.current !== request) return
-        setGraph(next)
+        setGraph(normalizeGraph(next))
         setError("")
       } catch (caught) {
         if (versionIdRef.current !== id || generationRef.current !== generation) return
@@ -139,7 +165,9 @@ export function useMindmap(versionId: string): UseMindmapResult {
     }, wait)
   }, [runRefresh])
 
-  // Initial load and full reset when the version changes.
+  // Initial load and full reset when the version changes. The high-water seq
+  // belongs to the old channel, so reset it (and drop any pending throttle)
+  // before the new version's events can arrive.
   useEffect(() => {
     versionIdRef.current = versionId
     generationRef.current += 1
@@ -162,21 +190,26 @@ export function useMindmap(versionId: string): UseMindmapResult {
 
   // `case.*`/`gate.*`/`version.status_changed` events refresh the graph, at most
   // once per throttle window. A seq gap means a reset dropped events: refetch
-  // the whole snapshot immediately instead of waiting for the window.
+  // the whole snapshot immediately instead of waiting for the window. Events
+  // from a previous version are ignored: `useVersionStream` clears them on a
+  // version switch, but effects still see the old batch for one commit, and its
+  // seqs would otherwise raise the new channel's high-water mark.
   useEffect(() => {
-    if (versionId === "" || events.length === 0) return
+    if (versionId === "") return
+    const scopedEvents = events.filter((event) => isEventForVersion(event, versionId))
+    if (scopedEvents.length === 0) return
     const id = versionIdRef.current
     const generation = generationRef.current
     const previousMax = maxSeqRef.current
-    const nextMax = maxEventSeq(events)
+    const nextMax = maxEventSeq(scopedEvents)
     if (nextMax > maxSeqRef.current) maxSeqRef.current = nextMax
     if (nextMax <= previousMax) return
 
-    if (hasMissedEvents(events, previousMax)) {
+    if (hasMissedEvents(scopedEvents, previousMax)) {
       void runRefresh(id, generation)
       return
     }
-    if (events.some((event) => event.seq > previousMax && isRefreshEvent(event.type))) {
+    if (scopedEvents.some((event) => event.seq > previousMax && isRefreshEvent(event.type))) {
       scheduleThrottledRefresh()
     }
   }, [events, versionId, runRefresh, scheduleThrottledRefresh])
@@ -202,7 +235,7 @@ export function useMindmap(versionId: string): UseMindmapResult {
   const applyGraph = useCallback((next: MindmapGraph): void => {
     // Invalidate an in-flight read: the write response is newer than it.
     requestRef.current += 1
-    setGraph(next)
+    setGraph(normalizeGraph(next))
     setError("")
   }, [])
 

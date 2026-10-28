@@ -6,7 +6,7 @@ import { ApiError } from "@/lib/api-client"
 import type { SSEStatus } from "@/lib/sse-client"
 
 import { describeMindmapError } from "./error-messages"
-import type { MindmapGraph } from "./types"
+import type { CaseNodeView, MindmapGraph } from "./types"
 
 const mocks = vi.hoisted(() => ({
   apiGet: vi.fn(),
@@ -67,12 +67,34 @@ function graphFixture(overrides: Partial<MindmapGraph> = {}): MindmapGraph {
   }
 }
 
-function event(seq: number, type = "case.created"): VersionEvent {
+function nodeFixture(overrides: Partial<CaseNodeView> = {}): CaseNodeView {
+  return {
+    id: "1844674407370955201",
+    parentId: null,
+    kind: "case",
+    title: "下单成功",
+    description: "",
+    priority: "P2",
+    preconditions: "",
+    testData: null,
+    source: "user_input",
+    status: "draft",
+    sortOrder: 0,
+    revision: 1,
+    steps: [],
+    assertions: [],
+    sources: [],
+    openBlockerCount: 0,
+    ...overrides,
+  }
+}
+
+function event(seq: number, type = "case.created", versionId = VERSION_ID): VersionEvent {
   return {
     seq,
-    channel: `version:${VERSION_ID}`,
+    channel: `version:${versionId}`,
     type,
-    version_id: VERSION_ID,
+    version_id: versionId,
     batch_id: null,
     case_id: null,
     step_id: null,
@@ -299,5 +321,76 @@ describe("useMindmap", () => {
 
     expect(mocks.apiGet).toHaveBeenCalledTimes(2)
     expect(mocks.apiGet).toHaveBeenLastCalledWith(`/api/versions/${OTHER_VERSION_ID}/mindmap`)
+  })
+
+  it("refetches when the new version's event seq restarts below the old high-water mark", async () => {
+    const v1 = graphFixture()
+    const v2 = graphFixture({ versionId: OTHER_VERSION_ID })
+    const v2EventRefresh = graphFixture({
+      versionId: OTHER_VERSION_ID,
+      versionStatus: "reviewing",
+    })
+    mocks.apiGet
+      .mockResolvedValueOnce(v1)
+      .mockResolvedValueOnce(v2)
+      .mockResolvedValueOnce(v2EventRefresh)
+
+    const rendered = renderHook(({ id }: { id: string }) => useMindmap(id), {
+      initialProps: { id: VERSION_ID },
+    })
+    await flushPromises()
+    expect(mocks.apiGet).toHaveBeenCalledTimes(1)
+
+    // V1 has already consumed an event with a much higher seq.
+    await advance(100)
+    streamState = { ...streamState, events: [event(100, "case.created", VERSION_ID)] }
+    rendered.rerender({ id: VERSION_ID })
+    await flushPromises()
+    expect(mocks.apiGet).toHaveBeenCalledTimes(1)
+
+    // Switch to V2 before V1's trailing refresh fires; the still-rendered V1
+    // event must not raise V2's high-water mark (or schedule a V2 refresh).
+    rendered.rerender({ id: OTHER_VERSION_ID })
+    await flushPromises()
+    expect(mocks.apiGet).toHaveBeenCalledTimes(2)
+    expect(mocks.apiGet).toHaveBeenLastCalledWith(`/api/versions/${OTHER_VERSION_ID}/mindmap`)
+
+    await advance(1000)
+    await flushPromises()
+    expect(mocks.apiGet).toHaveBeenCalledTimes(2)
+
+    // V2 starts at seq 1. It is newer than the reset high-water mark, so it must
+    // trigger a read (the throttle window is already open).
+    streamState = { ...streamState, events: [event(1, "case.created", OTHER_VERSION_ID)] }
+    rendered.rerender({ id: OTHER_VERSION_ID })
+    await flushPromises()
+
+    expect(mocks.apiGet).toHaveBeenCalledTimes(3)
+    expect(mocks.apiGet).toHaveBeenLastCalledWith(`/api/versions/${OTHER_VERSION_ID}/mindmap`)
+    expect(rendered.result.current.graph).toBe(v2EventRefresh)
+  })
+
+  it("normalizes absent anchors and impact sections to empty arrays", async () => {
+    const graph = graphFixture({ nodes: [nodeFixture()], impactCases: undefined })
+    mocks.apiGet.mockResolvedValueOnce(graph)
+
+    const rendered = renderHook(() => useMindmap(VERSION_ID))
+    await flushPromises()
+
+    expect(rendered.result.current.graph?.impactCases).toEqual([])
+    expect(rendered.result.current.graph?.nodes[0]?.anchors).toEqual([])
+  })
+
+  it("normalizes a graph applied after a write", async () => {
+    mocks.apiGet.mockResolvedValueOnce(graphFixture())
+
+    const rendered = renderHook(() => useMindmap(VERSION_ID))
+    await flushPromises()
+
+    const applied = graphFixture({ nodes: [nodeFixture()], impactCases: undefined })
+    act(() => rendered.result.current.applyGraph(applied))
+
+    expect(rendered.result.current.graph?.impactCases).toEqual([])
+    expect(rendered.result.current.graph?.nodes[0]?.anchors).toEqual([])
   })
 })

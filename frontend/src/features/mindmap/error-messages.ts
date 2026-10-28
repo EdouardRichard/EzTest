@@ -49,7 +49,7 @@ export function describeMindmapError(err: unknown): string {
   if (!(err instanceof ApiError)) return MINDMAP_ERROR_FALLBACK
   const reason = err.details.reason
   if (typeof reason !== "string") return MINDMAP_ERROR_FALLBACK
-  if (!Object.prototype.hasOwnProperty.call(MINDMAP_REASON_MESSAGES, reason)) {
+  if (!Object.hasOwn(MINDMAP_REASON_MESSAGES, reason)) {
     return MINDMAP_ERROR_FALLBACK
   }
   return MINDMAP_REASON_MESSAGES[reason as MindmapErrorReason]

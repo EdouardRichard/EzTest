@@ -148,6 +148,8 @@ export type CodeAnchorView = {
 /**
  * One node of the graph response (spec §7.3). Scenarios never carry steps,
  * assertions or sources; cases always carry at least one step and assertion.
+ * `anchors` is optional when the read omits `include=anchors`; the loader
+ * normalizes an absent section to `[]` (see `NormalizedCaseNodeView`).
  */
 export type CaseNodeView = {
   id: string
@@ -165,7 +167,7 @@ export type CaseNodeView = {
   steps: CaseStepView[]
   assertions: CaseAssertionView[]
   sources: CaseSourceView[]
-  anchors: CodeAnchorView[]
+  anchors?: CodeAnchorView[]
   openBlockerCount: number
 }
 
@@ -193,12 +195,16 @@ export type BaselineView = {
   codeBaselineCommit: string | null
 }
 
-/** The latest run of one kind, summarised inside the graph response. */
+/**
+ * The latest run of one kind, summarised inside the graph response. The spec
+ * only guarantees `id/status/kind`; `finishedAt` (and the counts) may be
+ * null/absent, and `kind` itself may be inferred from the `latestRuns` key.
+ */
 export type LatestRunView = {
   id: string
-  kind: RunKind
+  kind?: RunKind
   status: RunStatus
-  finishedAt: string | null
+  finishedAt?: string | null
   findingCount?: number
   blockerCount?: number
 }
@@ -224,9 +230,27 @@ export type MindmapGraph = {
   coverage: Coverage
   baseline: BaselineView | null
   latestRuns: LatestRuns
-  impactCases: ImpactCaseView[]
+  /**
+   * Optional when the read omits `include=impact` (or an older server omits
+   * the key); the loader normalizes it to `[]` (see `NormalizedMindmapGraph`).
+   */
+  impactCases?: ImpactCaseView[]
   /** Present only when `include=findings` is requested (spec §7.3). */
   findings?: CaseFindingView[]
+}
+
+/** A node after the loader filled an absent `anchors` section with `[]`. */
+export type NormalizedCaseNodeView = Omit<CaseNodeView, "anchors"> & {
+  anchors: CodeAnchorView[]
+}
+
+/**
+ * A graph after the loader filled the optional include sections, so consumers
+ * (canvas, panels) can iterate `impactCases`/`anchors` without guards.
+ */
+export type NormalizedMindmapGraph = Omit<MindmapGraph, "nodes" | "impactCases"> & {
+  nodes: NormalizedCaseNodeView[]
+  impactCases: ImpactCaseView[]
 }
 
 /** One non-fatal run error; never carries LLM or mindmap bodies (D30). */
@@ -293,6 +317,10 @@ export type CaseExportView = {
   sizeBytes: number
   baselineId: string | null
   createdAt: string
+  /** Lowercase hex sha256 of the file contents (D30), when the server exposes it. */
+  sha256?: string
+  /** Suggested download filename, when the server exposes it. */
+  fileName?: string
 }
 
 /** Optional sections of the graph read (spec §7.3). */
@@ -317,7 +345,13 @@ export type ReviewsQuery = {
   cursor?: string
 }
 
-/** Query for `GET /findings` (spec §7.2 endpoint 23). */
+/**
+ * Query for `GET /findings` (spec §7.2 endpoint 23). The endpoint responds with
+ * `{data: FindingView[]}` — one flat, unpaginated array (not the cursor page
+ * envelope). The shared API client unwraps `data`, so `mindmapApi.listFindings`
+ * resolves to the array itself; a null `data` is the only "empty" shape and is
+ * normalized to `[]` there.
+ */
 export type FindingsQuery = {
   status?: FindingStatus
   severity?: FindingSeverity
