@@ -857,7 +857,9 @@ async function handleP4Scenario(messages, res, stream) {
 //
 // Modes (§10.6): normal (default) | invalid (structurally invalid proposal, so
 // a design run must fail with zero materialization) | degraded (text only, no
-// structured proposal). `POST /__p5-mode` switches the mode at runtime.
+// structured proposal). `degraded` is a SUCCESSFUL text completion, not an LLM
+// failure (T16/T26 decision): the backend records a degraded run instead of a
+// failed one. `POST /__p5-mode` switches the mode at runtime.
 const P5_DESIGN_MARKER = "EzTest 的测试设计 Agent";
 const P5_REVIEW_MARKER = "EzTest 的设计评审 Agent";
 // The spec §10.6 wording and the landed T7 prompt body differ by one character
@@ -873,7 +875,7 @@ const P5_DEGRADED_TEXT = "P5 降级：LLM 不可用，未提交结构化提案�
 const P5_NO_VERSION_TEXT = "P5 无法从运行指令确定 versionId，本轮未提交任何提案。";
 const P5_FINAL_TEXTS = {
   design: "P5 设计完成：已提交 1 个场景与 2 条用例的脑图提案。",
-  review: "P5 评审完成：已提交覆盖、重复与代码未覆盖三类评审发现。",
+  review: "P5 评审完成：已提交覆盖、断言、重复与代码未覆盖四类评审发现。",
   data_plan: "P5 数据规划完成：已提交前置条件与测试数据建议。",
   explore: "P5 探索完成：已提交页面、路由与接口线索。",
 };
@@ -1054,53 +1056,35 @@ function p5VersionId(userText, toolResults) {
 }
 
 /**
- * Resolves the confirmed requirement ids the instruction carries. The fake must
- * never fabricate ids (spec §8.1), so the plan is: explicit id list, then the
- * "已确认需求" table, then the coverage block of case_graph_read, and only then
- * the remaining snowflake-like tokens of the instruction (labelled version/run/
- * system ids are excluded).
+ * Resolves the confirmed requirement ids from the explicit, labelled sources of
+ * the run instruction only: a `requirementIds=[...]` list or the
+ * `## 已确认需求` table of the T10 context builder
+ * (`backend/internal/mindmap/application/run_service.go`, which emits
+ * `- id=<id> title="..." priority=... status=...` lines; the legacy
+ * pipe-separated table is still tolerated). The fake must never fabricate ids
+ * (spec §8.1): without an explicit list/table it returns an empty array so the
+ * server-side unconfirmed_requirements validation fails loudly instead of
+ * covering a made-up requirement.
  */
-function p5RequirementIds(userText, toolResults, versionId) {
-  const values = p5LabelledValues(userText);
+function p5RequirementIds(userText) {
   const listMatch = /(?:requirementIds?|需求\s*(?:ID|id|Ids)?)\s*[:=：]\s*\[([^\]]*)\]/i.exec(userText);
   if (listMatch) {
     const ids = p5Unique(listMatch[1].match(/\d{1,20}/g) || []);
     if (ids.length > 0) return ids;
   }
 
-  const section = /(?:已确认需求|确认需求|需求清单|requirements)[^\n]*\n([\s\S]*?)(?:\n[ \t]*\n|$)/i.exec(
+  // Stop at the next heading so the relation section (`- id=... from=...`) can
+  // never leak into the requirement list.
+  const section = /(?:已确认需求|确认需求|需求清单|requirements)[^\n]*\n([\s\S]*?)(?:\n[ \t]*\n|\n#{1,6}\s|$)/i.exec(
     userText,
   );
-  if (section) {
-    const ids = [];
-    for (const line of section[1].split("\n")) {
-      const lineMatch = /^\s*[*-]?\s*"?(\d{1,20})"?\s*[|｜]/.exec(line);
-      if (lineMatch) ids.push(lineMatch[1]);
-    }
-    if (ids.length > 0) return p5Unique(ids);
+  if (section === null) return [];
+  const ids = [];
+  for (const line of section[1].split("\n")) {
+    const lineMatch = /^\s*[*-]?\s*(?:id\s*[:=：]\s*)?"?(\d{1,20})"?(?=\s|[|｜]|$)/.exec(line);
+    if (lineMatch) ids.push(lineMatch[1]);
   }
-
-  const graphIds = [];
-  for (const result of toolResults) {
-    const parsed = parseJsonObject(result.text);
-    if (parsed === null) continue;
-    for (const key of ["uncoveredRequirementIds", "requirementIds"]) {
-      const found = p5FindKey(parsed, [key], 0);
-      if (!Array.isArray(found)) continue;
-      for (const id of found) {
-        if (/^\d+$/.test(String(id))) graphIds.push(String(id));
-      }
-    }
-    if (graphIds.length > 0) break;
-  }
-  if (graphIds.length > 0) return p5Unique(graphIds);
-
-  const excluded = new Set();
-  if (versionId !== "") excluded.add(versionId);
-  for (const [key, value] of values) {
-    if (!/requirement|需求/.test(key)) excluded.add(value);
-  }
-  return p5Unique(p5LongIds(userText).filter((id) => !excluded.has(id)));
+  return p5Unique(ids);
 }
 
 /** One requirement source per case; the second case reuses the first when needed. */
@@ -1218,7 +1202,7 @@ function p5InvalidProposal(versionId) {
   };
 }
 
-/** §8.2 case.review_submit payload: coverage/duplicate findings + one blocker. */
+/** §8.2 case.review_submit payload: coverage/assertion/duplicate findings + one blocker. */
 function p5ReviewProposal(versionId, toolResults) {
   const caseNodes = p5CaseNodes(toolResults);
   const findings = [
@@ -1226,6 +1210,11 @@ function p5ReviewProposal(versionId, toolResults) {
       category: "coverage",
       severity: "major",
       detail: "P5 评审：已确认需求存在覆盖遗漏，请补充未覆盖需求对应的用例。",
+    },
+    {
+      category: "assertion",
+      severity: "major",
+      detail: "P5 评审：用例缺少对关键预期的步骤级断言，无法验证操作结果。",
     },
     {
       category: "duplicate",
@@ -1238,8 +1227,15 @@ function p5ReviewProposal(versionId, toolResults) {
       detail: "P5 评审：关键代码路径缺少用例覆盖，需补充对应用例后再批准。",
     },
   ];
-  if (caseNodes.length > 0) findings[0].nodeId = String(caseNodes[0].id);
-  if (caseNodes.length > 1) findings[1].nodeId = String(caseNodes[1].id);
+  const attach = (category, node) => {
+    const finding = findings.find((item) => item.category === category);
+    if (finding) finding.nodeId = String(node.id);
+  };
+  if (caseNodes.length > 0) {
+    attach("coverage", caseNodes[0]);
+    attach("assertion", caseNodes[0]);
+  }
+  if (caseNodes.length > 1) attach("duplicate", caseNodes[1]);
   return { versionId, findings };
 }
 
@@ -1345,6 +1341,8 @@ function p5Text(text) {
 
 /** Plans exactly one P5 turn from the role, the run state and the mode. */
 function planP5Turn(kind, run, userText, mode) {
+  // Degraded is a successful completion (200 + text only, no tool call), not an
+  // upstream LLM failure, so the backend records a degraded run (T16/T26).
   if (mode === "degraded") return p5Text(P5_DEGRADED_TEXT);
 
   if (kind === "explore") {
@@ -1379,7 +1377,7 @@ function planP5Turn(kind, run, userText, mode) {
       const proposal =
         mode === "invalid"
           ? p5InvalidProposal(versionId)
-          : p5DesignProposal(versionId, p5RequirementIds(userText, run.toolResults, versionId));
+          : p5DesignProposal(versionId, p5RequirementIds(userText));
       return p5Tool("case_graph_propose", proposal, "P5 设计：提交场景与用例提案");
     }
     return p5Text(P5_FINAL_TEXTS.design);
