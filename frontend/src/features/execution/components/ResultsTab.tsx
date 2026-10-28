@@ -132,9 +132,9 @@ function CaseRunRow({ run, batchLabel, expanded, rerunning, onToggle, onRerun }:
         </StatusBadge>
       </td>
       <td className="px-3 py-2 text-xs text-muted-foreground">{formatDuration(run.duration_ms)}</td>
-      <td className="px-3 py-2 text-xs text-foreground">{run.steps.length}</td>
-      <td className="px-3 py-2 text-xs text-foreground">{run.assertions.length}</td>
-      <td className="px-3 py-2 text-xs text-foreground">{run.evidence.length}</td>
+      <td className="px-3 py-2 text-xs text-foreground">{run.steps.length || "—"}</td>
+      <td className="px-3 py-2 text-xs text-foreground">{run.assertions.length || "—"}</td>
+      <td className="px-3 py-2 text-xs text-foreground">{run.evidence.length || "—"}</td>
       <td className="px-3 py-2">
         <FailureClassBadge failureClass={run.failure_class} />
       </td>

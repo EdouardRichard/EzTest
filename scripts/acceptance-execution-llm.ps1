@@ -282,6 +282,17 @@ function Get-ApiErrorSummary {
     $status = 0
     $reason = ""
     $rawBody = $null
+    # Invoke-Api rethrows the HTTP failure as a plain exception so callers get a
+    # short message. Preserve the status/reason on that exception so
+    # Assert-ApiError can still verify an expected error response.
+    if ($null -ne $ErrorRecord.Exception -and $null -ne $ErrorRecord.Exception.Data -and
+        $ErrorRecord.Exception.Data.Contains("apiStatus")) {
+        return [pscustomobject]@{
+            Status = [int]$ErrorRecord.Exception.Data["apiStatus"]
+            Reason = [string]$ErrorRecord.Exception.Data["apiReason"]
+            Text   = (Get-RedactedText -Text ([string]$ErrorRecord.Exception.Message))
+        }
+    }
     try {
         $response = $ErrorRecord.Exception.Response
         if ($null -ne $response) {
@@ -340,7 +351,10 @@ function Invoke-Api {
         if ($NoThrow) {
             return [pscustomobject]@{ Status = $info.Status; Raw = $null; Data = $null; Error = $info }
         }
-        throw ("{0} {1} failed: HTTP {2} reason={3}" -f $Method, $Path, $info.Status, $info.Reason)
+        $failure = New-Object System.Exception ("{0} {1} failed: HTTP {2} reason={3}" -f $Method, $Path, $info.Status, $info.Reason)
+        $failure.Data["apiStatus"] = $info.Status
+        $failure.Data["apiReason"] = $info.Reason
+        throw $failure
     }
     $raw = $null
     if ($response.Content -is [string] -and -not [string]::IsNullOrWhiteSpace([string]$response.Content)) {
@@ -487,18 +501,22 @@ function New-DesigningVersion {
 }
 
 function New-RealCase {
-    param($Headers, [string]$VersionId, [string]$Title, [string[]]$Actions, [string[]]$Expected, [string]$AssertionTarget, [string]$AssertionExpression, [string]$AssertionExpected)
+    param($Headers, [string]$VersionId, [string]$Title, [string[]]$Actions, [string[]]$Expected, [string]$AssertionTarget, [string]$AssertionExpression, [string]$AssertionExpected, [string]$RequirementId = "")
     $scenario = Invoke-Api -Method Post -Path "/api/versions/$VersionId/mindmap/nodes" -Headers $Headers -Body @{
         kind  = "scenario"
         title = "$Title scenario"
     }
     if ($scenario.Status -ne 201) { throw "POST scenario returned HTTP $($scenario.Status)" }
-    $case = Invoke-Api -Method Post -Path "/api/versions/$VersionId/mindmap/nodes" -Headers $Headers -Body @{
+    $caseBody = @{
         kind     = "case"
         parentId = [string]$scenario.Data.id
         title    = $Title
         priority = "P0"
     }
+    # A case node must reference at least one clarified requirement; the
+    # requirement was created and confirmed by New-DesigningVersion.
+    if (-not [string]::IsNullOrWhiteSpace($RequirementId)) { $caseBody["requirementIds"] = @($RequirementId) }
+    $case = Invoke-Api -Method Post -Path "/api/versions/$VersionId/mindmap/nodes" -Headers $Headers -Body $caseBody
     if ($case.Status -ne 201) { throw "POST case returned HTTP $($case.Status)" }
     $caseId = [string]$case.Data.id
     $stepIds = @()
@@ -525,6 +543,7 @@ function New-RealExecutingVersion {
     param($Headers, [string]$Name, $SystemId, $EnvironmentId, [string]$Kind)
     $version = New-DesigningVersion -Headers $Headers -Name $Name -SystemId $SystemId -EnvironmentId $EnvironmentId
     $versionId = $version.VersionId
+    $requirementId = $version.RequirementId
     $caseIds = @()
     $cases = @()
     switch ($Kind) {
@@ -579,7 +598,8 @@ function New-RealExecutingVersion {
     foreach ($caseSpec in $cases) {
         $created = New-RealCase -Headers $Headers -VersionId $versionId -Title $caseSpec.Title `
             -Actions $caseSpec.Actions -Expected $caseSpec.Expected `
-            -AssertionTarget $caseSpec.Target -AssertionExpression $caseSpec.Expression -AssertionExpected $caseSpec.AssertionExpected
+            -AssertionTarget $caseSpec.Target -AssertionExpression $caseSpec.Expression -AssertionExpected $caseSpec.AssertionExpected `
+            -RequirementId $requirementId
         $caseIds += [string]$created.CaseId
     }
     $submit = Invoke-Api -Method Post -Path "/api/versions/$versionId/mindmap/submit-review" -Headers $Headers -Body @{}
@@ -1152,9 +1172,12 @@ try {
         if ($null -eq $runId) { throw "the restart case never started" }
         Start-Sleep -Milliseconds 800
         Stop-ProcessTree -Process $apiProcess
-        $apiProcess = $null
+        # Invoke-Check runs the body in a child scope; use the script scope so
+        # the finally block stops the restarted API instead of leaving an
+        # orphan on :13333.
+        $script:apiProcess = $null
         Wait-PortFree -Port $apiPort
-        $apiProcess = Start-Process -FilePath $apiExe -WorkingDirectory $backendDir `
+        $script:apiProcess = Start-Process -FilePath $apiExe -WorkingDirectory $backendDir `
             -RedirectStandardOutput $apiOut -RedirectStandardError $apiErr -WindowStyle Hidden -PassThru
         Wait-ForHttp -Url "$apiBaseUrl/api/health" -TimeoutSeconds 120 -Process $apiProcess -Label "API"
         $paused = Wait-Batch -VersionId $restartWorld.VersionId -BatchId $batchId -AllowPaused -TimeoutSeconds 300
@@ -1191,12 +1214,38 @@ try {
         if ($markdown -notmatch 'passed') { throw "the Markdown export has no passed count" }
         if ($markdown -notmatch 'P6 home and orders list') { throw "the Markdown export has no case row" }
         $script:resultData.reportSha256 = $export.Sha256
+        # Persist the verified report artifacts under .tmp/p6-real-llm/ so the
+        # acceptance evidence bundle carries the exact report file and hash.
+        $artifactDir = Join-Path $tmpDir "p6-real-llm"
+        New-Item -ItemType Directory -Force -Path $artifactDir | Out-Null
+        [System.IO.File]::WriteAllBytes((Join-Path $artifactDir "batch1-report.md"), $export.Bytes)
+        [System.IO.File]::WriteAllText(
+            (Join-Path $artifactDir "batch1-report.json"),
+            ((ConvertTo-Json -InputObject $report.Raw -Depth 20) + "`n"),
+            (New-Object System.Text.UTF8Encoding($false)))
     }
 
     Invoke-Check -Name "version events have strictly increasing seq" -Body {
-        $events = Invoke-Api -Method Get -Path "/api/versions/$($main.VersionId)/events?limit=100" -Headers $adminHeaders
-        if ($events.Status -ne 200) { throw "GET events returned HTTP $($events.Status)" }
-        $items = @($events.Data)
+        # The snapshot endpoint returns the newest page and caps limit at 100
+        # (platform.MaxLimit); a long agent transcript pushes batch.created out
+        # of a single page. Page backwards with before_seq so the check sees the
+        # complete version history instead of a truncated window.
+        $items = @()
+        $beforeSeq = 0
+        $pages = 0
+        while ($true) {
+            $path = "/api/versions/$($main.VersionId)/events?limit=100"
+            if ($beforeSeq -gt 0) { $path += "&before_seq=$beforeSeq" }
+            $events = Invoke-Api -Method Get -Path $path -Headers $adminHeaders
+            if ($events.Status -ne 200) { throw "GET events returned HTTP $($events.Status)" }
+            $page = @($events.Data)
+            if ($page.Count -eq 0) { break }
+            $items = @($page) + $items
+            $beforeSeq = [int64]$page[0].seq
+            $pages++
+            if ($pages -gt 100) { throw "the event snapshot pagination did not terminate" }
+            if (-not [bool]$events.Raw.has_more) { break }
+        }
         if ($items.Count -lt 1) { throw "the version event snapshot is empty" }
         $previous = -1
         foreach ($item in $items) {
