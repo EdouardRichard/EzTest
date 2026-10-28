@@ -23,6 +23,10 @@ type VersionRepository interface {
 	UpdateMetadata(ctx context.Context, id int64, expected int, name, label, desc string, actor int64) (*Version, error)
 	UpdateBindings(ctx context.Context, id int64, expected int, b VersionBindings, actor int64) (*Version, error)
 	UpdateStatus(ctx context.Context, id int64, from, to string, actor int64) (*Version, error)
+	// UpdateExecutionState replaces the P6 execution columns (paused,
+	// pause_mode, batch_no) without changing status. It only writes an
+	// executing or continuing version; any other status is a state conflict.
+	UpdateExecutionState(ctx context.Context, id int64, paused bool, pauseMode string, batchNo int, actor int64) (*Version, error)
 	// ListUnclarified returns ids of requirements that are not clarified plus
 	// the number of version-level open questions.
 	ListUnclarified(ctx context.Context, versionID int64) ([]int64, int, error)

@@ -20,6 +20,7 @@ import (
 // versionColumnList is the shared column order of every version query and the
 // order scanVersion expects.
 const versionColumnList = `id, name, label, description, status,
+	paused, pause_mode, batch_no,
 	system_id, environment_id, code_repository_id, code_branch, code_baseline_commit,
 	revision, created_by, updated_by, created_at, updated_at`
 
@@ -59,6 +60,9 @@ func scanVersion(row versionRowScanner) (domain.Version, error) {
 		&version.Label,
 		&version.Description,
 		&version.Status,
+		&version.Paused,
+		&version.PauseMode,
+		&version.BatchNo,
 		&systemID,
 		&environmentID,
 		&codeRepositoryID,
@@ -310,6 +314,26 @@ func (r *VersionRepository) UpdateStatus(ctx context.Context, id int64, from, to
 			return nil, versionStateConflict(id)
 		}
 		return nil, fmt.Errorf("postgres: update version status: %w", err)
+	}
+	return &updated, nil
+}
+
+// UpdateExecutionState replaces the P6 execution columns without changing
+// status. Only an executing or continuing version accepts the write, so a pause
+// or batch update racing a completion loses as a version_state_conflict instead
+// of mutating a finished version.
+func (r *VersionRepository) UpdateExecutionState(ctx context.Context, id int64, paused bool, pauseMode string, batchNo int, actor int64) (*domain.Version, error) {
+	const query = `UPDATE version
+		SET paused = $2, pause_mode = $3, batch_no = $4,
+		    revision = revision + 1, updated_by = $5, updated_at = now()
+		WHERE id = $1 AND status IN ('executing', 'continuing')
+		RETURNING ` + versionColumnList
+	updated, err := scanVersion(r.pool.QueryRow(ctx, query, id, paused, pauseMode, batchNo, actor))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, versionStateConflict(id)
+		}
+		return nil, fmt.Errorf("postgres: update version execution state: %w", err)
 	}
 	return &updated, nil
 }
