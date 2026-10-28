@@ -33,17 +33,23 @@ type CreateVersionCommand struct {
 }
 
 // executionStateRepository is the column-scoped P6 execution-state port used by
-// MarkPaused, SetBatchNo and CompleteExecution. Pausing, batch-number and
-// completion writes are deliberately separate operations: each UPDATE is scoped
-// to its own columns, so a stale read of one field can never roll back a
-// concurrent write of another. The PostgreSQL repository implements this
-// alongside the broader VersionRepository port.
+// MarkPaused, SetBatchNo, AllocateBatchNo, ReleaseBatchNo and CompleteExecution.
+// Pausing, batch-number and completion writes are deliberately separate
+// operations: each UPDATE is scoped to its own columns, so a stale read of one
+// field can never roll back a concurrent write of another. The PostgreSQL
+// repository implements this alongside the broader VersionRepository port.
 type executionStateRepository interface {
 	// SetPaused writes only paused and pause_mode.
 	SetPaused(ctx context.Context, id int64, paused bool, pauseMode string, actor int64) (*Version, error)
 	// SetBatchNo writes only batch_no under a monotonic SQL guard: a lower
 	// number is rejected as a version_state_conflict.
 	SetBatchNo(ctx context.Context, id int64, batchNo int, actor int64) (*Version, error)
+	// AllocateBatchNo atomically increments batch_no with a single UPDATE ...
+	// RETURNING and returns the new number.
+	AllocateBatchNo(ctx context.Context, id int64, actor int64) (int, error)
+	// ReleaseBatchNo compensates a failed create: it decrements batch_no only
+	// while it still equals allocated, and is a no-op otherwise.
+	ReleaseBatchNo(ctx context.Context, id int64, allocated int, actor int64) error
 	// CompleteExecution performs the executing -> completed compare-and-swap
 	// and refuses a paused version.
 	CompleteExecution(ctx context.Context, id int64, actor int64) (*Version, error)
@@ -794,6 +800,35 @@ func (s *VersionService) SetBatchNo(ctx context.Context, id int64, batchNo int, 
 		return nil, err
 	}
 	return repo.SetBatchNo(ctx, id, batchNo, actor)
+}
+
+// AllocateBatchNo atomically increments an executing version's batch_no and
+// returns the new number (spec §5.3). Unlike SetBatchNo it takes no actor: the
+// execution context's native-allocator port has none, so the write is attributed
+// to the system actor 0. The repository performs the whole increment in one
+// UPDATE ... RETURNING under a status guard, so two concurrent batch creators
+// always receive distinct numbers; a missing version is not_found and a
+// non-executing version is a version_state_conflict. The action publishes no
+// event (batch events carry the batch lifecycle).
+func (s *VersionService) AllocateBatchNo(ctx context.Context, id int64) (int, error) {
+	repo, err := s.executionRepo()
+	if err != nil {
+		return 0, err
+	}
+	return repo.AllocateBatchNo(ctx, id, 0)
+}
+
+// ReleaseBatchNo compensates a failed batch create by decrementing batch_no
+// only while the stored value still equals allocated, so a concurrent creator's
+// newer allocation is never rolled back. A missing row or a mismatched number is
+// a tolerated no-op: numbers are monotonic rather than gapless. The action
+// publishes no event.
+func (s *VersionService) ReleaseBatchNo(ctx context.Context, id int64, allocated int) error {
+	repo, err := s.executionRepo()
+	if err != nil {
+		return err
+	}
+	return repo.ReleaseBatchNo(ctx, id, allocated, 0)
 }
 
 // CompleteExecution moves an unpaused executing version to completed (spec

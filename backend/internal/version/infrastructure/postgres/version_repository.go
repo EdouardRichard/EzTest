@@ -358,6 +358,51 @@ func (r *VersionRepository) SetBatchNo(ctx context.Context, id int64, batchNo in
 	return &updated, nil
 }
 
+// AllocateBatchNo atomically increments the batch_no of an executing version
+// with a single UPDATE ... RETURNING, so concurrent allocators always observe
+// distinct numbers. Only executing versions accept the write (a batch is created
+// for an executing version). A zero-row UPDATE is disambiguated with one
+// follow-up status read: a missing row is not_found, any other status is a
+// version_state_conflict.
+func (r *VersionRepository) AllocateBatchNo(ctx context.Context, id int64, actor int64) (int, error) {
+	const query = `UPDATE version
+		SET batch_no = batch_no + 1, revision = revision + 1, updated_by = $2, updated_at = now()
+		WHERE id = $1 AND status = 'executing'
+		RETURNING batch_no`
+	var batchNo int
+	err := r.pool.QueryRow(ctx, query, id, actor).Scan(&batchNo)
+	if err == nil {
+		return batchNo, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return 0, fmt.Errorf("postgres: allocate version batch_no: %w", err)
+	}
+
+	var status string
+	if statusErr := r.pool.QueryRow(ctx, `SELECT status FROM version WHERE id = $1`, id).Scan(&status); statusErr != nil {
+		if errors.Is(statusErr, pgx.ErrNoRows) {
+			return 0, domain.NewNotFound("version", id)
+		}
+		return 0, fmt.Errorf("postgres: read version status after batch allocation: %w", statusErr)
+	}
+	return 0, versionStateConflict(id)
+}
+
+// ReleaseBatchNo compensates a failed batch create with a single guarded
+// decrement: batch_no is restored only while it still equals allocated, so a
+// newer allocation made by a concurrent creator is never rolled back. Zero
+// affected rows is a no-op (already compensated or overtaken); a missing row is
+// tolerated for the same reason.
+func (r *VersionRepository) ReleaseBatchNo(ctx context.Context, id int64, allocated int, actor int64) error {
+	const query = `UPDATE version
+		SET batch_no = batch_no - 1, revision = revision + 1, updated_by = $3, updated_at = now()
+		WHERE id = $1 AND batch_no = $2`
+	if _, err := r.pool.Exec(ctx, query, id, allocated, actor); err != nil {
+		return fmt.Errorf("postgres: release version batch_no: %w", err)
+	}
+	return nil
+}
+
 // CompleteExecution performs the guarded executing -> completed transition.
 // The paused = false predicate is re-checked in SQL, so a pause that commits
 // between the service's read and this write loses as a version_state_conflict
