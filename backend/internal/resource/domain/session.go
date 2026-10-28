@@ -5,8 +5,8 @@ import (
 	"time"
 )
 
-// Session states, mirrored from the sessions.state CHECK constraint. State
-// transitions are CAS updates on (id, state); see spec §6.1.
+// Session states, mirrored from the session.state CHECK constraint. State
+// transitions are CAS updates on (id, state); see spec 搂6.1.
 const (
 	StatePending     = "pending"
 	StateAcquiring   = "acquiring"
@@ -19,7 +19,7 @@ const (
 	StateFailed      = "failed"
 )
 
-// Session acquisition modes, mirrored from the sessions.acquisition CHECK
+// Session acquisition modes, mirrored from the session.acquisition CHECK
 // constraint.
 const (
 	AcquisitionAuto     = "auto"
@@ -27,13 +27,13 @@ const (
 	AcquisitionImported = "imported"
 )
 
-// Storage state kinds stored in sessions.storage_state_kind.
+// Storage state kinds stored in session.storage_state_kind.
 const (
 	StorageStateKindStorageState = "storage_state"
 	StorageStateKindToken        = "token"
 )
 
-// sessionExpiringFloor is the minimum "about to expire" window (spec §6.1).
+// sessionExpiringFloor is the minimum "about to expire" window (spec 搂6.1).
 const sessionExpiringFloor = 5 * time.Minute
 
 // Session is one imported login state for an Account on a System/Environment.

@@ -2,7 +2,7 @@ package domain
 
 import "time"
 
-// Account kinds, mirrored from the accounts.kind CHECK constraint.
+// Account kinds, mirrored from the account.kind CHECK constraint.
 const (
 	AccountKindHuman   = "human"
 	AccountKindService = "service"

@@ -10,20 +10,20 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/resource/domain"
 )
 
-// codeRepoColumnList is the column order every query of code_repositories uses
+// codeRepoColumnList is the column order every query of code_repository uses
 // and the scan order scanCodeRepo expects.
 const codeRepoColumnList = `id, key, name, local_path, fixed_branch, include_globs, exclude_globs,
 	status, last_commit, last_validated_at, last_validation_error, last_indexed_at,
 	created_at, updated_at`
 
 const (
-	// defaultCodeRepoBranch mirrors the code_repositories DDL default.
+	// defaultCodeRepoBranch mirrors the code_repository DDL default.
 	defaultCodeRepoBranch = "main"
-	// defaultCodeRepoStatus mirrors the code_repositories DDL default.
+	// defaultCodeRepoStatus mirrors the code_repository DDL default.
 	defaultCodeRepoStatus = domain.StatusActive
 )
 
-// defaultCodeRepoExcludeGlobs mirrors the code_repositories DDL default. It is
+// defaultCodeRepoExcludeGlobs mirrors the code_repository DDL default. It is
 // applied on create when the caller leaves ExcludeGlobs nil, so the stored row
 // matches what a plain INSERT with no column would produce.
 var defaultCodeRepoExcludeGlobs = []string{
@@ -95,7 +95,7 @@ func (r *CodeRepository) CreateCodeRepo(ctx context.Context, c *domain.CodeRepos
 	if excludeGlobs == nil {
 		excludeGlobs = defaultCodeRepoExcludeGlobs
 	}
-	const query = `INSERT INTO code_repositories
+	const query = `INSERT INTO code_repository
 		(key, name, local_path, fixed_branch, include_globs, exclude_globs, status,
 		 last_commit, last_validated_at, last_validation_error, last_indexed_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
@@ -113,7 +113,7 @@ func (r *CodeRepository) CreateCodeRepo(ctx context.Context, c *domain.CodeRepos
 // GetCodeRepo returns one code repository by ID.
 func (r *CodeRepository) GetCodeRepo(ctx context.Context, id int64) (*domain.CodeRepository, error) {
 	codeRepo, err := scanCodeRepo(r.pool.QueryRow(ctx,
-		`SELECT `+codeRepoColumnList+` FROM code_repositories WHERE id = $1`, id))
+		`SELECT `+codeRepoColumnList+` FROM code_repository WHERE id = $1`, id))
 	if err != nil {
 		return nil, catalogReadError(err, "code repository", id, "get code repository")
 	}
@@ -128,7 +128,7 @@ func (r *CodeRepository) ListCodeRepos(ctx context.Context, f domain.CodeRepoFil
 		return nil, false, fmt.Errorf("postgres: list code repositories: limit must be positive")
 	}
 	const query = `SELECT ` + codeRepoColumnList + `
-		FROM code_repositories
+		FROM code_repository
 		WHERE id > $1
 		  AND ($2 = '' OR status = $2)
 		ORDER BY id ASC
@@ -171,7 +171,7 @@ func (r *CodeRepository) UpdateCodeRepo(ctx context.Context, c *domain.CodeRepos
 	if excludeGlobs == nil {
 		excludeGlobs = []string{}
 	}
-	const query = `UPDATE code_repositories
+	const query = `UPDATE code_repository
 		SET name = $2, local_path = $3, fixed_branch = $4, include_globs = $5,
 		    exclude_globs = $6, status = $7, last_commit = $8,
 		    last_validated_at = $9, last_validation_error = $10, last_indexed_at = $11,
@@ -194,7 +194,7 @@ func (r *CodeRepository) UpdateCodeRepo(ctx context.Context, c *domain.CodeRepos
 // whether the row was written, and a zero count is resolved to the documented
 // disabled/not-found reasons with one read of the status column.
 func (r *CodeRepository) UpdateLastIndexedAt(ctx context.Context, id int64, at time.Time) error {
-	const query = `UPDATE code_repositories
+	const query = `UPDATE code_repository
 		SET last_indexed_at = $2
 		WHERE id = $1 AND status = 'active'`
 	tag, err := r.pool.Exec(ctx, query, id, at)
@@ -209,7 +209,7 @@ func (r *CodeRepository) UpdateLastIndexedAt(ctx context.Context, id int64, at t
 	// keep their existing P2/P4 reasons, so read only the status column.
 	var status string
 	if err := r.pool.QueryRow(ctx,
-		`SELECT status FROM code_repositories WHERE id = $1`, id).Scan(&status); err != nil {
+		`SELECT status FROM code_repository WHERE id = $1`, id).Scan(&status); err != nil {
 		return catalogReadError(err, "code repository", id, "update code repository index timestamp")
 	}
 	if status != domain.StatusActive {
@@ -220,9 +220,9 @@ func (r *CodeRepository) UpdateLastIndexedAt(ctx context.Context, id int64, at t
 }
 
 // DeleteCodeRepo removes a code repository. P2 registers no dependents, so the
-// delete needs no dependency check (spec §6.7).
+// delete needs no dependency check (spec 鎼?.7).
 func (r *CodeRepository) DeleteCodeRepo(ctx context.Context, id int64) error {
-	tag, err := r.pool.Exec(ctx, `DELETE FROM code_repositories WHERE id = $1`, id)
+	tag, err := r.pool.Exec(ctx, `DELETE FROM code_repository WHERE id = $1`, id)
 	if err != nil {
 		return catalogWriteError(err, "duplicate key", "delete code repository")
 	}

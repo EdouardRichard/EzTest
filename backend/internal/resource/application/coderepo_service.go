@@ -10,11 +10,11 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/resource/domain"
 )
 
-// defaultCodeRepoBranch mirrors the code_repositories DDL default: a create
+// defaultCodeRepoBranch mirrors the code_repository DDL default: a create
 // request that omits fixedBranch gets main.
 const defaultCodeRepoBranch = "main"
 
-// CodeRepoService implements the local code repository use cases (spec §6.7).
+// CodeRepoService implements the local code repository use cases (spec 搂6.7).
 // A repository is validated read-only through Git before it is stored, and the
 // last_commit/last_validated_at audit fields are written by the same create or
 // update call, so a failed validation never persists a row.
@@ -51,7 +51,7 @@ func NewCodeRepoService(repos domain.CodeRepoRepository, git GitValidator, clock
 	return &CodeRepoService{repos: repos, git: git, clock: clock}
 }
 
-// validateCodeRepoStatus enforces the code_repositories.status CHECK constraint.
+// validateCodeRepoStatus enforces the code_repository.status CHECK constraint.
 func validateCodeRepoStatus(status string) error {
 	if status != domain.StatusActive && status != domain.StatusDisabled {
 		return domain.NewInvalid("status", "invalid_status", "status must be active or disabled")
@@ -209,7 +209,7 @@ func (s *CodeRepoService) Update(ctx context.Context, id int64, in UpdateCodeRep
 	return codeRepo, nil
 }
 
-// Delete removes a code repository. P2 registers no dependents (spec §6.7).
+// Delete removes a code repository. P2 registers no dependents (spec 搂6.7).
 func (s *CodeRepoService) Delete(ctx context.Context, id int64) error {
 	return s.repos.DeleteCodeRepo(ctx, id)
 }

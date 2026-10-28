@@ -13,7 +13,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
 )
 
-// codeRepoDefaultExcludeGlobs mirrors the code_repositories DDL default that
+// codeRepoDefaultExcludeGlobs mirrors the code_repository DDL default that
 // CreateCodeRepo applies when the caller leaves ExcludeGlobs nil.
 var codeRepoDefaultExcludeGlobs = []string{
 	".git/**", "node_modules/**", "dist/**", "build/**", "vendor/**",
@@ -319,7 +319,7 @@ func TestCodeRepositoryUpdateLastIndexedAt(t *testing.T) {
 	// A concurrent admin edit lands after the caller would have read the row;
 	// the narrow UPDATE must preserve it instead of restoring stale columns.
 	if _, err := pool.Exec(ctx,
-		`UPDATE code_repositories SET name = 'Renamed', local_path = 'D:\work\moved' WHERE id = $1`,
+		`UPDATE code_repository SET name = 'Renamed', local_path = 'D:\work\moved' WHERE id = $1`,
 		active.ID); err != nil {
 		t.Fatal(err)
 	}

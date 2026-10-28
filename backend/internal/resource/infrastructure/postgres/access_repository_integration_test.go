@@ -22,7 +22,7 @@ func accessSeedSystem(t *testing.T, ctx context.Context, pool *pgxpool.Pool, com
 	t.Helper()
 	var id int64
 	if err := pool.QueryRow(ctx,
-		`INSERT INTO systems (company_id, key, name, kind, base_url)
+		`INSERT INTO system (company_id, key, name, kind, base_url)
 		 VALUES ($1, $2, $2, 'web', 'http://localhost:13335')
 		 RETURNING id`,
 		companyID, key).Scan(&id); err != nil {
@@ -36,7 +36,7 @@ func accessSeedEnvironment(t *testing.T, ctx context.Context, pool *pgxpool.Pool
 	t.Helper()
 	var id int64
 	if err := pool.QueryRow(ctx,
-		`INSERT INTO environments (system_id, key, name, base_url, kind)
+		`INSERT INTO environment (system_id, key, name, base_url, kind)
 		 VALUES ($1, $2, $2, 'http://localhost:13335', 'dev')
 		 RETURNING id`,
 		systemID, key).Scan(&id); err != nil {
@@ -51,7 +51,7 @@ func accessSeedSession(t *testing.T, ctx context.Context, pool *pgxpool.Pool, ac
 	t.Helper()
 	var id int64
 	if err := pool.QueryRow(ctx,
-		`INSERT INTO sessions (account_id, system_id, environment_id, access_id, state)
+		`INSERT INTO session (account_id, system_id, environment_id, access_id, state)
 		 VALUES ($1, $2, $3, $4, 'valid')
 		 RETURNING id`,
 		accountID, systemID, environmentID, accessID).Scan(&id); err != nil {
@@ -90,7 +90,7 @@ func TestAccessRepositoryAccountAndAccessRoundTrip(t *testing.T) {
 	sysTwo := accessSeedSystem(t, ctx, pool, company.ID, "shop-two")
 
 	// The API input of CreateAccount has no status, so the repository mirrors
-	// the accounts.status DDL default.
+	// the account.status DDL default.
 	account := &domain.Account{
 		CompanyID: company.ID,
 		Key:       "alice",
@@ -328,7 +328,7 @@ func TestAccessRepositoryCredentialPlaintext(t *testing.T) {
 	}
 	systemID := accessSeedSystem(t, ctx, pool, company.ID, "shop")
 
-	credential := "pa$$w0rd\r\n\ttabs ünïcode "
+	credential := "pa$$w0rd\r\n\ttabs 鐪塶鑼俢ode "
 	access := &domain.Access{
 		AccountID:        account.ID,
 		SystemID:         systemID,
@@ -360,7 +360,7 @@ func TestAccessRepositoryCredentialPlaintext(t *testing.T) {
 		}
 		var stored string
 		if err := pool.QueryRow(ctx,
-			`SELECT credential FROM account_system_accesses WHERE id = $1`, access.ID).Scan(&stored); err != nil {
+			`SELECT credential FROM account_system_access WHERE id = $1`, access.ID).Scan(&stored); err != nil {
 			t.Fatal(err)
 		}
 		if stored != want {
@@ -413,11 +413,11 @@ func TestAccessRepositoryConflictsAndDependencies(t *testing.T) {
 	assertCatalogKind(t, accounts.CreateAccount(ctx, duplicateAccount), domain.KindConflict, "duplicate_key")
 
 	// (company_id, key) is unique, so another company may reuse the key.
-	if _, err := pool.Exec(ctx, `INSERT INTO companies (key, name) VALUES ('other', 'Other')`); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO company (key, name) VALUES ('other', 'Other')`); err != nil {
 		t.Fatal(err)
 	}
 	var otherCompanyID int64
-	if err := pool.QueryRow(ctx, `SELECT id FROM companies WHERE key = 'other'`).Scan(&otherCompanyID); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT id FROM company WHERE key = 'other'`).Scan(&otherCompanyID); err != nil {
 		t.Fatal(err)
 	}
 	foreignAccount := &domain.Account{
