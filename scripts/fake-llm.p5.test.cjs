@@ -32,6 +32,7 @@ const VERSION_ID = "1838293000123";
 const RUN_ID = "1838293000130";
 const REQUIREMENT_ONE = "1838293000124";
 const REQUIREMENT_TWO = "1838293000125";
+const RELATION_ID = "1838293000999";
 const SYSTEM_ID = "42";
 const ENVIRONMENT_ID = "7";
 const NODE_SCENARIO = "1838293000127";
@@ -108,17 +109,37 @@ function agentTools() {
   }));
 }
 
+/**
+ * Mirrors the landed T10 context builder
+ * (`backend/internal/mindmap/application/run_service.go`): a `versionId=` line,
+ * a `## 已确认需求` table of `- id=... title=...` rows, then a `## 需求关系`
+ * section, then the mandatory submission footer.
+ */
 function designInstruction() {
   return [
-    "任务：生成用例脑图（kind=design, mode=append）。",
+    "## 版本",
     "versionId=" + VERSION_ID,
-    "runId=" + RUN_ID,
-    "已确认需求（id | 标题 | 描述摘要）：",
-    REQUIREMENT_ONE + " | 下单主流程 | 用户提交订单并扣减库存。",
-    REQUIREMENT_TWO + " | 退款流程 | 用户申请退款并原路退回。",
+    "status=designing",
+    "runKind=design",
+    "mode=append",
     "systemId=" + SYSTEM_ID,
     "environmentId=" + ENVIRONMENT_ID,
     "baseUrl=" + FIXTURE_BASE,
+    "## 已确认需求",
+    "- id=" + REQUIREMENT_ONE + ' title="下单主流程" priority=must status=clarified',
+    "  description: 用户提交订单时创建订单并扣减库存。",
+    "- id=" + REQUIREMENT_TWO + ' title="退款流程" priority=should status=clarified',
+    "  description: 用户申请退款后原路退回支付金额。",
+    "## 需求关系",
+    "- id=" +
+      RELATION_ID +
+      " from=" +
+      REQUIREMENT_ONE +
+      " to=" +
+      REQUIREMENT_TWO +
+      ' type=depends_on description="退款依赖下单"',
+    "## 任务与提交要求",
+    "任务：生成用例脑图（kind=design, mode=append）。",
     "必须调用 case_graph_propose 提交结构化提案。",
   ].join("\n");
 }
@@ -482,9 +503,7 @@ function assertDesignProposal(args) {
 function assertReviewFindings(args) {
   assert.equal(args.versionId, VERSION_ID);
   assert.ok(Array.isArray(args.findings), "findings must be an array");
-  assert.equal(args.findings.length, 3, "the fake review must carry three findings");
-  const categories = new Set();
-  const severities = new Set();
+  assert.equal(args.findings.length, 4, "the fake review must carry four findings");
   const validCategories = new Set([
     "coverage",
     "assertion",
@@ -503,21 +522,24 @@ function assertReviewFindings(args) {
       assert.equal(typeof finding.nodeId, "string");
       assert.ok(nodeIds.has(finding.nodeId), "unknown nodeId " + finding.nodeId);
     }
-    categories.add(finding.category);
-    severities.add(finding.severity);
   }
-  assert.ok(categories.has("coverage"), "the review must report one coverage finding");
-  assert.ok(categories.has("duplicate"), "the review must report one duplicate finding");
-  assert.ok(categories.has("code_uncovered"), "the review must report one code_uncovered finding");
-  assert.ok(severities.has("major"));
-  assert.ok(severities.has("minor"));
-  assert.equal(
-    args.findings.filter((finding) => finding.severity === "blocker").length,
-    1,
-    "the review must carry exactly one blocker",
+
+  // All four spec §8.2 categories are pinned with their severity, so dropping
+  // any one of them (e.g. the assertion finding) fails this test.
+  const byCategory = new Map(args.findings.map((finding) => [finding.category, finding]));
+  for (const category of ["coverage", "assertion", "duplicate", "code_uncovered"]) {
+    assert.ok(byCategory.has(category), "the review must report one " + category + " finding");
+  }
+  assert.equal(byCategory.get("coverage").severity, "major", "the coverage finding must be major");
+  assert.ok(
+    ["major", "minor"].includes(byCategory.get("assertion").severity),
+    "the assertion finding must be major or minor",
   );
+  assert.equal(byCategory.get("duplicate").severity, "minor", "the duplicate finding must be minor");
+  const blockers = args.findings.filter((finding) => finding.severity === "blocker");
+  assert.equal(blockers.length, 1, "the review must carry exactly one blocker");
   assert.equal(
-    args.findings.find((finding) => finding.severity === "blocker").category,
+    blockers[0].category,
     "code_uncovered",
     "the blocker must be the code_uncovered finding",
   );
@@ -632,6 +654,83 @@ test("design role streaming path emits the same case_graph_read tool call", asyn
   assertUnderscoreToolName(turn.toolCalls[0].name);
   assert.ok(turn.reasoning.length > 0, "the tool turn must carry reasoning_content");
   assert.deepEqual(JSON.parse(turn.toolCalls[0].arguments), { versionId: VERSION_ID });
+});
+
+test("design role stops the requirement table at the next heading", async () => {
+  assert.ok(sharedServer, "shared fake LLM server was not started");
+  const system = promptBody(PROMPT_CONSTS.design, promptsSource);
+  // One requirement plus one relation: if the parser ran past the heading, the
+  // relation id would become the second case's requirement source.
+  const instruction = [
+    "versionId=" + VERSION_ID,
+    "## 已确认需求",
+    "- id=" + REQUIREMENT_ONE + ' title="下单主流程" priority=must status=clarified',
+    "## 需求关系",
+    "- id=" + RELATION_ID + " from=" + REQUIREMENT_ONE + " to=" + REQUIREMENT_ONE,
+  ].join("\n");
+  const { calls } = await driveRun(
+    sharedServer.base,
+    system,
+    instruction,
+    [graphReadResult(), { ok: true }],
+    TOOL_NAMES.design,
+  );
+
+  assert.deepEqual(calls[1].args.cases[0].requirementIds, [REQUIREMENT_ONE]);
+  assert.deepEqual(calls[1].args.cases[1].requirementIds, [REQUIREMENT_ONE]);
+  assert.ok(
+    !JSON.stringify(calls[1].args.cases).includes(RELATION_ID),
+    "a relation id must never become a case requirement source",
+  );
+});
+
+test("design role emits empty requirementIds instead of fabricating ids", async () => {
+  assert.ok(sharedServer, "shared fake LLM server was not started");
+  const system = promptBody(PROMPT_CONSTS.design, promptsSource);
+  // No labelled requirement list/table: runId and the graph coverage ids must
+  // not be guessed as requirement sources (server validation must fail loudly).
+  const instruction = [
+    "versionId=" + VERSION_ID,
+    "runId=" + RUN_ID,
+    "systemId=" + SYSTEM_ID,
+    "必须调用 case_graph_propose 提交结构化提案。",
+  ].join("\n");
+  const { calls } = await driveRun(
+    sharedServer.base,
+    system,
+    instruction,
+    [graphReadResult(), { ok: true }],
+    TOOL_NAMES.design,
+  );
+
+  for (const item of calls[1].args.cases) {
+    assert.deepEqual(
+      item.requirementIds,
+      [],
+      "without an explicit requirement list/table no requirement id may be emitted",
+    );
+  }
+});
+
+test("design role still tolerates the legacy pipe-separated requirement table", async () => {
+  assert.ok(sharedServer, "shared fake LLM server was not started");
+  const system = promptBody(PROMPT_CONSTS.design, promptsSource);
+  const instruction = [
+    "versionId=" + VERSION_ID,
+    "已确认需求（id | 标题）：",
+    REQUIREMENT_ONE + " | 下单主流程",
+    REQUIREMENT_TWO + " | 退款流程",
+  ].join("\n");
+  const { calls } = await driveRun(
+    sharedServer.base,
+    system,
+    instruction,
+    [graphReadResult(), { ok: true }],
+    TOOL_NAMES.design,
+  );
+
+  assert.deepEqual(calls[1].args.cases[0].requirementIds, [REQUIREMENT_ONE]);
+  assert.deepEqual(calls[1].args.cases[1].requirementIds, [REQUIREMENT_TWO]);
 });
 
 // --- review ----------------------------------------------------------------

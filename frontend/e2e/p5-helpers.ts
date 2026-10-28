@@ -224,7 +224,7 @@ export type MindmapSeed = {
   codeRepositoryId: number
   /** The version after entering `designing` (design runs are allowed). */
   version: VersionRecord
-  /** The two clarified requirements created for the version. */
+  /** The two confirmed (clarified) requirements created for the version. */
   requirements: RequirementRecord[]
   /** The seeded P2 application model nodes (page/route/api). */
   appModels: P4AppModelNode[]
@@ -428,8 +428,13 @@ export async function seedMindmapVersion(
 
   // draft -> clarifying (needs at least one requirement) -> confirm -> designing.
   await startVersionClarification(request, token, version.id)
+  // Return the records the confirm calls produced (status `clarified`), not the
+  // pre-confirmation drafts, so callers can rely on the confirmed state.
+  const confirmedRequirements: RequirementRecord[] = []
   for (const requirement of requirements) {
-    await confirmP5Requirement(request, token, version.id, requirement.id)
+    confirmedRequirements.push(
+      await confirmP5Requirement(request, token, version.id, requirement.id),
+    )
   }
   const designing = await enterP5Design(request, token, version.id)
 
@@ -441,7 +446,7 @@ export async function seedMindmapVersion(
     environmentId: environment.id,
     codeRepositoryId: codeRepo.id,
     version: designing,
-    requirements,
+    requirements: confirmedRequirements,
     appModels,
   }
 }
@@ -656,6 +661,12 @@ export async function exportMindmap(
 
 // --- events ----------------------------------------------------------------
 
+/**
+ * `platform.MaxLimit` caps every list endpoint at 100; a larger `limit` is
+ * rejected with 400 `invalid_limit` rather than returning more events.
+ */
+const MAX_EVENT_LIMIT = 100
+
 /** GET /api/versions/{id}/events, optionally filtered to mindmap event types. */
 export async function readCaseEvents(
   request: APIRequestContext,
@@ -663,7 +674,7 @@ export async function readCaseEvents(
   versionId: string,
   options: { limit?: number; types?: string[] } = {},
 ): Promise<MindmapCaseEvent[]> {
-  const limit = options.limit ?? 200
+  const limit = Math.min(options.limit ?? MAX_EVENT_LIMIT, MAX_EVENT_LIMIT)
   const response = await request.get(`${API_URL}/api/versions/${versionId}/events?limit=${limit}`, {
     headers: authHeaders(token),
   })
