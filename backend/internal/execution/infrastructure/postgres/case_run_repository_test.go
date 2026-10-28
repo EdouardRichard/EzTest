@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -92,5 +94,108 @@ func TestFinishCaseRunCASRejectsInterruptedCheckpoint(t *testing.T) {
 	// interrupted row is a checkpoint resume owns, not a verdict to overwrite.
 	if !strings.Contains(q.updateSQL, "WHERE id = $1 AND status = 'running'") {
 		t.Fatalf("finish CAS must accept only a running row, got predicate:\n%s", q.updateSQL)
+	}
+}
+
+// finishPersistQuerier answers the finish UPDATE with a stored row whose
+// session columns come from the SET clause parameter, the way PostgreSQL would:
+// a column the UPDATE does not set keeps its old NULL value. This exercises the
+// repository without a database and catches a missing SET even though the
+// RETURNING column list is shared.
+type finishPersistQuerier struct {
+	sql  string
+	args []any
+}
+
+// Exec implements querier; FinishCaseRun never executes a statement directly.
+func (q *finishPersistQuerier) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, errors.New("unexpected Exec in finish persist test")
+}
+
+// Query implements querier; FinishCaseRun only uses QueryRow.
+func (q *finishPersistQuerier) Query(context.Context, string, ...any) (pgx.Rows, error) {
+	return nil, errors.New("unexpected Query in finish persist test")
+}
+
+// QueryRow records the finish UPDATE and returns the row PostgreSQL would store.
+func (q *finishPersistQuerier) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
+	q.sql = sql
+	q.args = args
+	return fakeScanRow{values: []any{
+		int64(31), int64(11), int64(22), int64(7), 3, strings.Repeat("d", 64), []byte(`{}`),
+		1, domain.CaseRunStatusFailed, nil, "assertion failed", "",
+		finishSetParam(sql, args, "session_id"),
+		finishSetParam(sql, args, "session_snapshot_id"),
+		nil, nil, nil,
+		false, nil, nil, nil, int64(0),
+		scanTestTime, scanTestTime,
+	}}
+}
+
+// finishSetParam resolves the argument bound to a "$N" SET expression, or nil
+// when the UPDATE does not set that column (an old NULL staying untouched).
+func finishSetParam(sql string, args []any, column string) any {
+	pattern := regexp.MustCompile(`\b` + regexp.QuoteMeta(column) + ` = \$(\d+)`)
+	match := pattern.FindStringSubmatch(sql)
+	if match == nil {
+		return nil
+	}
+	position, err := strconv.Atoi(match[1])
+	if err != nil || position < 1 || position > len(args) {
+		return nil
+	}
+	return args[position-1]
+}
+
+// TestFinishCaseRunPersistsSessionIDs pins the T15 residual that left
+// case_run.session_id NULL: the takeover gate scan reads the stored column, so a
+// blocked(session) run finished with the acquired session must write it (and the
+// snapshot id) in the finish UPDATE, not only in RETURNING. A missing SET clause
+// would be invisible to the shared RETURNING/scan and is caught here as a NULL
+// stored session.
+func TestFinishCaseRunPersistsSessionIDs(t *testing.T) {
+	sessionID, snapshotID := int64(51), int64(52)
+	q := &finishPersistQuerier{}
+	repo := &CaseRunRepository{q: q}
+
+	stored, err := repo.FinishCaseRun(context.Background(), domain.CaseRun{
+		ID:                31,
+		Status:            domain.CaseRunStatusFailed,
+		FailureReason:     "takeover_required",
+		SessionID:         &sessionID,
+		SessionSnapshotID: &snapshotID,
+	})
+	if err != nil {
+		t.Fatalf("FinishCaseRun: %v", err)
+	}
+	if stored.SessionID == nil || *stored.SessionID != sessionID {
+		t.Fatalf("finished session_id = %v, want %d", stored.SessionID, sessionID)
+	}
+	if stored.SessionSnapshotID == nil || *stored.SessionSnapshotID != snapshotID {
+		t.Fatalf("finished session_snapshot_id = %v, want %d", stored.SessionSnapshotID, snapshotID)
+	}
+	if !strings.Contains(q.sql, "session_id = $") {
+		t.Fatalf("finish UPDATE does not set session_id:\n%s", q.sql)
+	}
+	if !strings.Contains(q.sql, "session_snapshot_id = $") {
+		t.Fatalf("finish UPDATE does not set session_snapshot_id:\n%s", q.sql)
+	}
+
+	// A run finished without a session must stay NULL, not retain a stray value.
+	q = &finishPersistQuerier{}
+	repo = &CaseRunRepository{q: q}
+	stored, err = repo.FinishCaseRun(context.Background(), domain.CaseRun{
+		ID:     32,
+		Status: domain.CaseRunStatusFailed,
+	})
+	if err != nil {
+		t.Fatalf("FinishCaseRun without session: %v", err)
+	}
+	if stored.SessionID != nil || stored.SessionSnapshotID != nil {
+		t.Fatalf("finished nullable session columns = %v/%v, want nil/nil",
+			stored.SessionID, stored.SessionSnapshotID)
+	}
+	if !strings.Contains(q.sql, "session_id = $") {
+		t.Fatalf("finish UPDATE does not set session_id for a NULL run:\n%s", q.sql)
 	}
 }

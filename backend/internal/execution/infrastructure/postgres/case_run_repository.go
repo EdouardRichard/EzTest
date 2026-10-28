@@ -328,7 +328,10 @@ func (r *CaseRunRepository) SetStatus(ctx context.Context, caseRunID int64, from
 }
 
 // FinishCaseRun stores a terminal outcome with a CAS that requires the stored
-// run to be running. An interrupted run is a resume checkpoint, not a verdict:
+// run to be running. It also pins the acquired session columns: a blocked
+// session run is finished without a preceding UpdateCaseRun, and the takeover
+// gate scan reads case_run.session_id to find its waiting takeover. An
+// interrupted run is a resume checkpoint, not a verdict:
 // recovery, an immediate pause and the recorder store it while the row leaves
 // running, and only a resume may turn it back into pending. A late finish (a
 // stale browser run or an agent submission after a pause) must therefore never
@@ -342,13 +345,15 @@ func (r *CaseRunRepository) FinishCaseRun(ctx context.Context, run domain.CaseRu
 		UPDATE case_run
 		SET status = $2, failure_class = $3, failure_reason = $4, summary = $5,
 		    finished_at = COALESCE($6, now()), duration_ms = $7,
-		    cleanup_required = $8, interrupted_step_seq = $9, updated_at = now()
+		    cleanup_required = $8, interrupted_step_seq = $9,
+		    session_id = $10, session_snapshot_id = $11, updated_at = now()
 		WHERE id = $1 AND status = 'running'
 		RETURNING `+caseRunColumnList,
 		run.ID, run.Status, nullableFailureClass(run.FailureClass),
 		run.FailureReason, run.Summary, nullableTime(run.FinishedAt),
 		run.DurationMS, run.CleanupRequired,
-		nullableInt(interruptedStepParam(run.InterruptedStepSeq))))
+		nullableInt(interruptedStepParam(run.InterruptedStepSeq)),
+		nullableInt(run.SessionID), nullableInt(run.SessionSnapshotID)))
 	if err == nil {
 		return stored, nil
 	}
