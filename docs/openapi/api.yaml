@@ -12268,7 +12268,7 @@ components:
     ReorderStepsRequest:
       type: object
       additionalProperties: false
-      required: [stepIds]
+      required: [stepIds, nodeRevision]
       properties:
         stepIds:
           type: array
@@ -12276,6 +12276,10 @@ components:
           items:
             type: string
             pattern: '^[0-9]{1,19}$'
+        nodeRevision:
+          type: integer
+          minimum: 1
+          description: Current case node revision (optimistic concurrency, spec §6.5).
     StartRunResult:
       type: object
       description: The accepted `POST /runs` result (202).
