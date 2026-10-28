@@ -4,7 +4,7 @@ import { type FormEvent, useEffect, useState } from "react"
 
 import { ApiError } from "@/lib/api-client"
 
-import type { AccessDTO, SystemDTO } from "./types"
+import type { AccessDTO, AuthFlowDTO, SystemDTO } from "./types"
 
 const MIN_CONCURRENCY = 1
 const MAX_CONCURRENCY = 100
@@ -32,6 +32,8 @@ export type AccessWriteInput = {
   sessionTtlSeconds: number | null
   permissionNote: string
   credential?: string
+  /** Omitted keeps the current binding; null clears it (spec §3.4). */
+  login_flow_id?: string | null
 }
 
 type AccessFormState = {
@@ -45,6 +47,7 @@ type AccessFormState = {
   permissionNote: string
   credential: string
   clearCredential: boolean
+  loginFlowId: string
 }
 
 function toFormState(access: AccessDTO | undefined, systems: SystemDTO[]): AccessFormState {
@@ -60,6 +63,7 @@ function toFormState(access: AccessDTO | undefined, systems: SystemDTO[]): Acces
       permissionNote: "",
       credential: "",
       clearCredential: false,
+      loginFlowId: "",
     }
   }
   return {
@@ -73,6 +77,7 @@ function toFormState(access: AccessDTO | undefined, systems: SystemDTO[]): Acces
     permissionNote: access.permissionNote,
     credential: "",
     clearCredential: false,
+    loginFlowId: access.login_flow_id ?? "",
   }
 }
 
@@ -109,6 +114,8 @@ const secondaryButtonClass =
 export type AccessFormProps = {
   accountId: number
   systems: SystemDTO[]
+  /** Login recipes available for binding; filtered by the selected system. */
+  flows?: AuthFlowDTO[]
   access?: AccessDTO
   canWrite: boolean
   onSubmit: (input: unknown) => Promise<void>
@@ -120,11 +127,13 @@ export type AccessFormProps = {
  * spec §7.4: an empty field omits `credential` (keep), the clear box sends an
  * empty string (clear) and a typed value replaces it. The stored credential is
  * never returned by the API, so the input always starts blank and is never
- * echoed back.
+ * echoed back. `login_flow_id` follows the same omission rule: an unchanged
+ * binding is not resubmitted, clearing sends null (spec §3.4).
  */
 export function AccessForm({
   accountId,
   systems,
+  flows = [],
   access,
   canWrite,
   onSubmit,
@@ -150,6 +159,22 @@ export function AccessForm({
 
   function updateForm<K extends keyof AccessFormState>(field: K, value: AccessFormState[K]) {
     setForm((previous) => ({ ...previous, [field]: value }))
+  }
+
+  const systemFlows = flows.filter(
+    (flow) => flow.kind === "form" && flow.system_id === form.systemId,
+  )
+  const boundFlowMissing =
+    form.loginFlowId !== "" && !systemFlows.some((flow) => flow.id === form.loginFlowId)
+
+  // A system change invalidates a binding that belongs to the previous system.
+  function handleSystemChange(systemId: string) {
+    setForm((previous) => {
+      const stillValid = flows.some(
+        (flow) => flow.id === previous.loginFlowId && flow.system_id === systemId,
+      )
+      return { ...previous, systemId, loginFlowId: stillValid ? previous.loginFlowId : "" }
+    })
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -207,6 +232,10 @@ export function AccessForm({
     } else if (form.credential !== "") {
       payload.credential = form.credential
     }
+    // Omission keeps the stored binding; a changed value binds or sends null.
+    const originalLoginFlowId = access?.login_flow_id ?? null
+    const loginFlowId = form.loginFlowId === "" ? null : form.loginFlowId
+    if (loginFlowId !== originalLoginFlowId) payload.login_flow_id = loginFlowId
 
     setSaving(true)
     try {
@@ -248,7 +277,7 @@ export function AccessForm({
           <select
             id="access-system"
             value={form.systemId}
-            onChange={(event) => updateForm("systemId", event.target.value)}
+            onChange={(event) => handleSystemChange(event.target.value)}
             className={inputClass}
           >
             {systems.length === 0 ? <option value="">（暂无系统）</option> : null}
@@ -301,6 +330,29 @@ export function AccessForm({
             placeholder="https://example.test/login"
             className={inputClass}
           />
+        </div>
+        <div>
+          <label htmlFor="access-login-flow" className={labelClass}>
+            登录配方
+          </label>
+          <select
+            id="access-login-flow"
+            data-testid="access-login-flow-select"
+            value={form.loginFlowId}
+            onChange={(event) => updateForm("loginFlowId", event.target.value)}
+            className={inputClass}
+          >
+            <option value="">不绑定（手工/导入会话）</option>
+            {systemFlows.map((flow) => (
+              <option key={flow.id} value={flow.id}>
+                {flow.name}
+                {flow.enabled ? "" : "（停用）"}
+              </option>
+            ))}
+            {boundFlowMissing ? (
+              <option value={form.loginFlowId}>登录配方 #{form.loginFlowId}（未加载）</option>
+            ) : null}
+          </select>
         </div>
         <div>
           <label htmlFor="access-concurrency-limit" className={labelClass}>

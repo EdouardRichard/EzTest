@@ -11,6 +11,8 @@ const mocks = vi.hoisted(() => ({
   createAccess: vi.fn(),
   updateAccess: vi.fn(),
   deleteAccess: vi.fn(),
+  listAuthFlows: vi.fn(),
+  deleteAuthFlow: vi.fn(),
 }))
 
 vi.mock("./api", () => ({
@@ -23,6 +25,8 @@ vi.mock("./api", () => ({
   createAccess: mocks.createAccess,
   updateAccess: mocks.updateAccess,
   deleteAccess: mocks.deleteAccess,
+  listAuthFlows: mocks.listAuthFlows,
+  deleteAuthFlow: mocks.deleteAuthFlow,
 }))
 
 import { ApiError } from "@/lib/api-client"
@@ -122,6 +126,7 @@ describe("AccountsPanel", () => {
       hasMore: false,
     })
     mocks.listAccesses.mockResolvedValue(ACCESSES)
+    mocks.listAuthFlows.mockResolvedValue({ items: [], nextCursor: null, hasMore: false })
   })
 
   afterEach(() => {

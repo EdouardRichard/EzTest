@@ -35,7 +35,7 @@ export function isVersionTab(value: string | null): value is VersionTabValue {
   return value !== null && VERSION_TAB_VALUES.has(value)
 }
 
-/** Tabs delivered by later phases; the owning phase comes from implementation-phases.md. */
+/** Tabs still delivered by later phases; the owning phase comes from implementation-phases.md. */
 const PLACEHOLDER_TABS: readonly {
   value: VersionTabValue
   label: string
@@ -43,40 +43,10 @@ const PLACEHOLDER_TABS: readonly {
   description: string
 }[] = [
   {
-    value: "sessions",
-    label: "执行会话",
-    phase: "P6",
-    description: "版本内执行会话在 P6 阶段接入，将展示 Batch/CaseRun 与 Agent 会话记录。",
-  },
-  {
-    value: "exploration",
-    label: "探索链路",
-    phase: "P6",
-    description: "探索链路在 P6 阶段接入，将展示需求→用例→结果→问题的链路图。",
-  },
-  {
-    value: "broadcast",
-    label: "实时播报",
-    phase: "P6",
-    description: "实时播报在 P6 阶段接入，将展示全量执行事件时间线。",
-  },
-  {
-    value: "results",
-    label: "结果与证据",
-    phase: "P6",
-    description: "结果与证据在 P6 阶段接入，将展示步骤、断言与证据详情。",
-  },
-  {
     value: "issues",
     label: "问题",
     phase: "P7",
     description: "问题中心在 P7 阶段接入，将展示问题列表、确认与驳回。",
-  },
-  {
-    value: "report",
-    label: "报告",
-    phase: "P6",
-    description: "版本报告在 P6 Batch 1、P7 完整版接入，将展示批次报告与差异。",
   },
 ]
 
@@ -90,13 +60,20 @@ export type VersionTabsProps = {
   overview: ReactNode
   /** Real 「代码与变更」 container (P4); required once the tab is opened. */
   code?: ReactNode
+  /** Real execution tabs (P6); each is owned by the execution feature. */
+  sessions?: ReactNode
+  exploration?: ReactNode
+  broadcast?: ReactNode
+  results?: ReactNode
+  report?: ReactNode
 }
 
 /**
  * The nine-tab version detail shell (spec §9.1): the functional requirements
- * slot, the overview skeleton, the P4 code-changes slot and six clearly-labelled
- * placeholders. Radix Tabs provides keyboard navigation; the active tab itself
- * is owned by the container so it can stay in sync with `?tab=`.
+ * slot, the overview skeleton, the five P6 execution slots, the P4 code-changes
+ * slot and the one remaining P7 placeholder. Radix Tabs provides keyboard
+ * navigation; the active tab itself is owned by the container so it can stay in
+ * sync with `?tab=`.
  */
 export function VersionTabs({
   active,
@@ -104,6 +81,11 @@ export function VersionTabs({
   requirements,
   overview,
   code,
+  sessions,
+  exploration,
+  broadcast,
+  results,
+  report,
 }: VersionTabsProps) {
   return (
     <Tabs.Root
@@ -128,8 +110,20 @@ export function VersionTabs({
         {overview}
       </Tabs.Content>
 
-      <Tabs.Content value="code" className="pt-4">
-        {code}
+      <Tabs.Content value="sessions" className="pt-4">
+        {sessions}
+      </Tabs.Content>
+
+      <Tabs.Content value="exploration" className="pt-4">
+        {exploration}
+      </Tabs.Content>
+
+      <Tabs.Content value="broadcast" className="pt-4">
+        {broadcast}
+      </Tabs.Content>
+
+      <Tabs.Content value="results" className="pt-4">
+        {results}
       </Tabs.Content>
 
       {PLACEHOLDER_TABS.map((tab) => (
@@ -142,6 +136,14 @@ export function VersionTabs({
           />
         </Tabs.Content>
       ))}
+
+      <Tabs.Content value="report" className="pt-4">
+        {report}
+      </Tabs.Content>
+
+      <Tabs.Content value="code" className="pt-4">
+        {code}
+      </Tabs.Content>
     </Tabs.Root>
   )
 }
