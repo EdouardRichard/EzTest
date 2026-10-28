@@ -175,6 +175,24 @@ if (-not $SkipIntegration) {
     Write-Host "==> Go integration tests skipped (-SkipIntegration)" -ForegroundColor Yellow
 }
 
+$executorDir = Join-Path $repoRoot "executor"
+if (Test-Path -LiteralPath (Join-Path $executorDir "package.json")) {
+    if (-not (Test-Path -LiteralPath (Join-Path $executorDir "node_modules"))) {
+        throw "executor/node_modules is missing. Run 'pnpm install' in executor/ first."
+    }
+    $pnpmCommand = Get-Command pnpm.cmd -ErrorAction SilentlyContinue
+    if (-not $pnpmCommand) {
+        $pnpmCommand = Get-Command pnpm -ErrorAction SilentlyContinue
+    }
+    if (-not $pnpmCommand) {
+        throw "pnpm is not on PATH. Install pnpm (or enable Corepack) first."
+    }
+    Invoke-Checked -Label "Executor unit tests" -Exe $pnpmCommand.Source -Arguments @("test") -WorkingDirectory $executorDir
+} else {
+    Write-Host ""
+    Write-Host "==> Executor tests skipped (executor/package.json is absent)" -ForegroundColor Yellow
+}
+
 if (-not $SkipFrontend) {
     if (-not (Test-Path -LiteralPath (Join-Path $frontendDir "node_modules"))) {
         throw "frontend/node_modules is missing. Run 'pnpm install' in frontend/ first."
