@@ -10,6 +10,8 @@
 //   POST /v1/chat/completions   (streaming and non-streaming)
 //   GET  /__p4-mode             (test-only: the active P4 scenario mode)
 //   POST /__p4-mode             (test-only: switch the P4 scenario at runtime)
+//   GET  /__p5-mode             (test-only: the active P5 mindmap scenario mode)
+//   POST /__p5-mode             (test-only: switch the P5 scenario at runtime)
 //
 // Every chat-completions request body is appended as one JSON line to
 // .tmp/fake-llm-requests.jsonl so Playwright can assert the outbound wire
@@ -837,6 +839,617 @@ async function handleP4Scenario(messages, res, stream) {
   return true;
 }
 
+// --- P5 deterministic mindmap scenarios (design spec §10.6) ----------------
+//
+// P5 requests are identified by the stable Chinese role markers of the four
+// mindmap profiles (`backend/internal/mindmap/domain/prompts.go`, spec §8.1).
+// Each run is scripted from the number of assistant tool turns already present
+// after the run instruction (same counting trick as P3):
+//
+//   design    case_graph_read -> case_graph_propose -> final text
+//   review    case_graph_read -> case_review_submit -> final text
+//   data_plan case_graph_read -> case_data_plan_submit -> final text
+//   explore   explore_http x2 -> app_model_propose -> final text
+//
+// Tool function names use the P1 gateway's dot->underscore wire form
+// (`internal/agent/infrastructure/llm/gateway.go`), so the backend registers
+// `case.graph_propose` but the model must answer `case_graph_propose`.
+//
+// Modes (§10.6): normal (default) | invalid (structurally invalid proposal, so
+// a design run must fail with zero materialization) | degraded (text only, no
+// structured proposal). `POST /__p5-mode` switches the mode at runtime.
+const P5_DESIGN_MARKER = "EzTest 的测试设计 Agent";
+const P5_REVIEW_MARKER = "EzTest 的设计评审 Agent";
+// The spec §10.6 wording and the landed T7 prompt body differ by one character
+// ("与" vs "/"); both are accepted so a prompt sync cannot silently disable the
+// data-plan scenario.
+const P5_DATA_PLAN_MARKERS = ["EzTest 的数据与前置规划 Agent", "EzTest 的数据/前置规划 Agent"];
+const P5_EXPLORE_MARKER = "EzTest 的应用探索 Agent";
+const P5_MODES = new Set(["normal", "invalid", "degraded"]);
+const P5_TOOL_USAGE = makeUsage(640, 128, 64);
+const P5_TEXT_USAGE = makeUsage(320, 32, 0);
+const P5_EXPLORE_PATHS = ["/p5/home", "/api/orders"];
+const P5_DEGRADED_TEXT = "P5 降级：LLM 不可用，未提交结构化提案，请使用人工路径。";
+const P5_NO_VERSION_TEXT = "P5 无法从运行指令确定 versionId，本轮未提交任何提案。";
+const P5_FINAL_TEXTS = {
+  design: "P5 设计完成：已提交 1 个场景与 2 条用例的脑图提案。",
+  review: "P5 评审完成：已提交覆盖、重复与代码未覆盖三类评审发现。",
+  data_plan: "P5 数据规划完成：已提交前置条件与测试数据建议。",
+  explore: "P5 探索完成：已提交页面、路由与接口线索。",
+};
+
+const P5_INVALID_REQUIREMENT_ID = "999999999999999999";
+
+/** Test-only runtime control of EZTEST_FAKE_LLM_P5_MODE (spec §10.6). */
+async function handleP5ModeControl(req, res) {
+  const raw = await readBody(req);
+  let body;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    sendError(res, 400, "invalid json body");
+    return;
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    sendError(res, 400, "invalid json body");
+    return;
+  }
+  const mode = String(body.mode || "")
+    .trim()
+    .toLowerCase();
+  if (!P5_MODES.has(mode)) {
+    sendError(res, 400, "mode must be one of normal, invalid, degraded");
+    return;
+  }
+  process.env.EZTEST_FAKE_LLM_P5_MODE = mode;
+  sendJson(res, 200, { mode: p5Mode() });
+}
+
+function p5Mode() {
+  const value = String(process.env.EZTEST_FAKE_LLM_P5_MODE || "normal")
+    .trim()
+    .toLowerCase();
+  return P5_MODES.has(value) ? value : "normal";
+}
+
+/** Matches one P5 profile from the system prompt; null for P1-P4. */
+function detectP5Scenario(systemText) {
+  if (systemText.includes(P5_DESIGN_MARKER)) return "design";
+  if (systemText.includes(P5_REVIEW_MARKER)) return "review";
+  if (P5_DATA_PLAN_MARKERS.some((marker) => systemText.includes(marker))) return "data_plan";
+  if (systemText.includes(P5_EXPLORE_MARKER)) return "explore";
+  return null;
+}
+
+/**
+ * Collects the `key=value` / `key: value` identifier pairs of the run
+ * instruction (spec §8.3 leaves the labels to the context builder, so both the
+ * camelCase keys and the Chinese labels are accepted).
+ */
+function p5LabelledValues(text) {
+  const values = new Map();
+  const pattern =
+    /([A-Za-z][A-Za-z0-9_]*|版本|系统|环境|运行|需求)\s*(?:ID|Id|id)?\s*[:=：]\s*"?([0-9]{1,20})"?(?![0-9])/g;
+  let match = pattern.exec(text);
+  while (match !== null) {
+    const key = match[1].toLowerCase();
+    if (!values.has(key)) values.set(key, match[2]);
+    match = pattern.exec(text);
+  }
+  // Tolerate whitespace instead of a separator ("versionId 123", "版本 123").
+  const spaced =
+    /([A-Za-z][A-Za-z0-9_]*|版本|系统|环境|运行)\s*\(?(?:ID|Id|id)?\)?\s+(\d{1,20})(?![0-9])/g;
+  match = spaced.exec(text);
+  while (match !== null) {
+    const key = match[1].toLowerCase();
+    if (!values.has(key)) values.set(key, match[2]);
+    match = spaced.exec(text);
+  }
+  return values;
+}
+
+function p5LabelledId(values, patterns) {
+  for (const [key, value] of values) {
+    if (patterns.some((pattern) => pattern.test(key))) return value;
+  }
+  return "";
+}
+
+/** All long decimal tokens (snowflake-like ids) of the instruction. */
+function p5LongIds(text) {
+  const matches = text.match(/\b\d{10,}\b/g);
+  return matches === null ? [] : matches;
+}
+
+function p5Unique(values) {
+  const seen = new Set();
+  const out = [];
+  for (const value of values) {
+    if (seen.has(value)) continue;
+    seen.add(value);
+    out.push(value);
+  }
+  return out;
+}
+
+/** Depth-bounded lookup of the first scalar/array value for one JSON key. */
+function p5FindKey(value, keys, depth) {
+  if (depth > 8 || value === null || typeof value !== "object") return null;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = p5FindKey(item, keys, depth + 1);
+      if (found !== null) return found;
+    }
+    return null;
+  }
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(value, key)) {
+      const candidate = value[key];
+      if (typeof candidate === "string" || typeof candidate === "number" || Array.isArray(candidate)) {
+        return candidate;
+      }
+    }
+  }
+  for (const child of Object.values(value)) {
+    const found = p5FindKey(child, keys, depth + 1);
+    if (found !== null) return found;
+  }
+  return null;
+}
+
+/** Collects every node-shaped object of a case_graph_read tool result. */
+function p5CollectNodes(value, out, depth) {
+  const nodes = out === undefined ? [] : out;
+  if (depth > 8 || value === null || typeof value !== "object") return nodes;
+  if (Array.isArray(value)) {
+    for (const item of value) p5CollectNodes(item, nodes, depth + 1);
+    return nodes;
+  }
+  if (value.id !== undefined && (value.revision !== undefined || value.kind !== undefined)) {
+    nodes.push(value);
+  }
+  for (const child of Object.values(value)) p5CollectNodes(child, nodes, depth + 1);
+  return nodes;
+}
+
+/** Parses the graph tool results once and returns their case nodes. */
+function p5CaseNodes(toolResults) {
+  const nodes = [];
+  const seen = new Set();
+  for (const result of toolResults) {
+    const parsed = parseJsonObject(result.text);
+    if (parsed === null) continue;
+    for (const node of p5CollectNodes(parsed)) {
+      if (node.kind !== "case" || node.id === undefined) continue;
+      const id = String(node.id);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      nodes.push(node);
+    }
+  }
+  return nodes;
+}
+
+/**
+ * Resolves the version id from the instruction labels/URL, then from the
+ * case_graph_read result and finally from the first snowflake-like id.
+ */
+function p5VersionId(userText, toolResults) {
+  const values = p5LabelledValues(userText);
+  const labelled = p5LabelledId(values, [/version/, /版本/]);
+  if (labelled !== "") return labelled;
+
+  const pathMatch = /\/versions\/(\d+)/.exec(userText);
+  if (pathMatch) return pathMatch[1];
+
+  for (const result of toolResults) {
+    const parsed = parseJsonObject(result.text);
+    if (parsed === null) continue;
+    const found = p5FindKey(parsed, ["versionId"], 0);
+    if (found !== null && /^\d+$/.test(String(found))) return String(found);
+  }
+
+  const longIds = p5LongIds(userText);
+  return longIds.length > 0 ? longIds[0] : "";
+}
+
+/**
+ * Resolves the confirmed requirement ids the instruction carries. The fake must
+ * never fabricate ids (spec §8.1), so the plan is: explicit id list, then the
+ * "已确认需求" table, then the coverage block of case_graph_read, and only then
+ * the remaining snowflake-like tokens of the instruction (labelled version/run/
+ * system ids are excluded).
+ */
+function p5RequirementIds(userText, toolResults, versionId) {
+  const values = p5LabelledValues(userText);
+  const listMatch = /(?:requirementIds?|需求\s*(?:ID|id|Ids)?)\s*[:=：]\s*\[([^\]]*)\]/i.exec(userText);
+  if (listMatch) {
+    const ids = p5Unique(listMatch[1].match(/\d{1,20}/g) || []);
+    if (ids.length > 0) return ids;
+  }
+
+  const section = /(?:已确认需求|确认需求|需求清单|requirements)[^\n]*\n([\s\S]*?)(?:\n[ \t]*\n|$)/i.exec(
+    userText,
+  );
+  if (section) {
+    const ids = [];
+    for (const line of section[1].split("\n")) {
+      const lineMatch = /^\s*[*-]?\s*"?(\d{1,20})"?\s*[|｜]/.exec(line);
+      if (lineMatch) ids.push(lineMatch[1]);
+    }
+    if (ids.length > 0) return p5Unique(ids);
+  }
+
+  const graphIds = [];
+  for (const result of toolResults) {
+    const parsed = parseJsonObject(result.text);
+    if (parsed === null) continue;
+    for (const key of ["uncoveredRequirementIds", "requirementIds"]) {
+      const found = p5FindKey(parsed, [key], 0);
+      if (!Array.isArray(found)) continue;
+      for (const id of found) {
+        if (/^\d+$/.test(String(id))) graphIds.push(String(id));
+      }
+    }
+    if (graphIds.length > 0) break;
+  }
+  if (graphIds.length > 0) return p5Unique(graphIds);
+
+  const excluded = new Set();
+  if (versionId !== "") excluded.add(versionId);
+  for (const [key, value] of values) {
+    if (!/requirement|需求/.test(key)) excluded.add(value);
+  }
+  return p5Unique(p5LongIds(userText).filter((id) => !excluded.has(id)));
+}
+
+/** One requirement source per case; the second case reuses the first when needed. */
+function p5CaseRequirementIds(requirementIds, index) {
+  if (requirementIds.length === 0) return [];
+  return [requirementIds[Math.min(index, requirementIds.length - 1)]];
+}
+
+/** Valid §6.7 proposal: one scenario plus two cases, two steps and one assertion. */
+function p5DesignProposal(versionId, requirementIds) {
+  const steps = [
+    { action: "打开目标页面", expected: "页面正常展示", data: "" },
+    { action: "提交核心操作", expected: "操作成功并给出提示", data: "" },
+  ];
+  return {
+    versionId,
+    mode: "append",
+    scenarios: [
+      {
+        ref: "s1",
+        title: "P5 场景：核心业务流程",
+        parentRef: null,
+        description: "fake LLM P5 设计场景",
+      },
+    ],
+    cases: [
+      {
+        ref: "c1",
+        scenarioRef: "s1",
+        title: "P5 正常主流程用例",
+        priority: "P1",
+        requirementIds: p5CaseRequirementIds(requirementIds, 0),
+        preconditions: "已登录且测试数据已准备",
+        testData: { source: "p5-fake", account: "fixture" },
+        steps: steps.map((step) => ({ ...step })),
+        assertions: [
+          {
+            stepIndex: 1,
+            kind: "ui",
+            target: "/",
+            expression: "成功提示可见",
+            expected: "展示成功提示",
+          },
+        ],
+        anchors: [],
+      },
+      {
+        ref: "c2",
+        scenarioRef: "s1",
+        title: "P5 异常边界用例",
+        priority: "P2",
+        requirementIds: p5CaseRequirementIds(requirementIds, 1),
+        preconditions: "已登录且请求参数非法",
+        testData: { source: "p5-fake", invalidField: "amount" },
+        steps: steps.map((step) => ({ ...step })),
+        assertions: [
+          {
+            stepIndex: 0,
+            kind: "api",
+            target: "/api/orders",
+            expression: "返回 400",
+            expected: "接口拒绝非法输入",
+          },
+        ],
+        anchors: [],
+      },
+    ],
+  };
+}
+
+/**
+ * Structurally invalid §6.7 proposal used by the `invalid` mode: duplicate
+ * scenario/case refs, missing requirement source, unknown priority, out-of-range
+ * stepIndex, unknown assertion kind and a fabricated requirement id. The server
+ * must reject it and materialize nothing (spec §6.7/§10.7 check 7).
+ */
+function p5InvalidProposal(versionId) {
+  return {
+    versionId,
+    mode: "append",
+    scenarios: [
+      { ref: "s1", title: "P5 非法场景", parentRef: null, description: "" },
+      { ref: "s1", title: "P5 重复场景 ref", parentRef: null, description: "" },
+    ],
+    cases: [
+      {
+        ref: "dup",
+        scenarioRef: "s1",
+        title: "P5 非法用例（缺少需求来源）",
+        priority: "P9",
+        requirementIds: [],
+        preconditions: "",
+        testData: null,
+        steps: [{ action: "", expected: "" }],
+        assertions: [
+          {
+            stepIndex: 9,
+            kind: "bogus",
+            target: "",
+            expression: "",
+            expected: "",
+          },
+        ],
+      },
+      {
+        ref: "dup",
+        scenarioRef: "missing_scenario",
+        title: "P5 非法用例（重复 ref 与编造需求）",
+        priority: "P1",
+        requirementIds: [P5_INVALID_REQUIREMENT_ID],
+        steps: [],
+        assertions: [],
+      },
+    ],
+  };
+}
+
+/** §8.2 case.review_submit payload: coverage/duplicate findings + one blocker. */
+function p5ReviewProposal(versionId, toolResults) {
+  const caseNodes = p5CaseNodes(toolResults);
+  const findings = [
+    {
+      category: "coverage",
+      severity: "major",
+      detail: "P5 评审：已确认需求存在覆盖遗漏，请补充未覆盖需求对应的用例。",
+    },
+    {
+      category: "duplicate",
+      severity: "minor",
+      detail: "P5 评审：两条用例的步骤高度重复，建议合并或明确边界差异。",
+    },
+    {
+      category: "code_uncovered",
+      severity: "blocker",
+      detail: "P5 评审：关键代码路径缺少用例覆盖，需补充对应用例后再批准。",
+    },
+  ];
+  if (caseNodes.length > 0) findings[0].nodeId = String(caseNodes[0].id);
+  if (caseNodes.length > 1) findings[1].nodeId = String(caseNodes[1].id);
+  return { versionId, findings };
+}
+
+/** §8.2 case.data_plan_submit payload for the nodes returned by graph_read. */
+function p5DataPlanProposal(versionId, toolResults) {
+  const items = [];
+  for (const node of p5CaseNodes(toolResults)) {
+    if (items.length >= 3) break;
+    const revision = Number.isInteger(node.revision)
+      ? node.revision
+      : Number.parseInt(String(node.revision), 10);
+    items.push({
+      nodeId: String(node.id),
+      nodeRevision: Number.isFinite(revision) && revision >= 1 ? revision : 1,
+      preconditions: "P5 fake 前置：使用测试账号登录并准备订单测试数据",
+      testData: { source: "p5-fake", orderId: "P5-ORDER-1" },
+    });
+  }
+  return { versionId, items };
+}
+
+/** §8.2 app_model_propose payload with one page, one route and one api node. */
+function p5AppModelProposal(systemId) {
+  const proposal = {
+    nodes: [
+      { key: "page:/p5/home", kind: "page", name: "P5 Home", path: "/p5/home" },
+      { key: "route:/p5/orders", kind: "route", name: "P5 Orders", path: "/p5/orders" },
+      {
+        key: "api:GET /api/orders",
+        kind: "api",
+        name: "GET /api/orders",
+        path: "/api/orders",
+        method: "GET",
+      },
+    ],
+  };
+  if (systemId !== "") proposal.systemId = Number(systemId);
+  return proposal;
+}
+
+/** Resolves the exploration starting origin from the instruction or the env. */
+function p5ExploreBaseUrl(userText) {
+  const match = /https?:\/\/[^\s"'<>，。；;）)】]+/.exec(userText);
+  if (match) {
+    const candidate = match[0].replace(/[),.;，。；）)】]+$/g, "");
+    try {
+      return new URL(candidate).origin;
+    } catch {
+      // Fall through to the configured fixture.
+    }
+  }
+  const configured = String(process.env.EZTEST_FAKE_LLM_P5_EXPLORE_BASE_URL || "").trim();
+  if (configured !== "") return configured.replace(/\/+$/, "");
+  const port = String(process.env.FIXTURE_PORT || process.env.EZTEST_E2E_FIXTURE_PORT || "13335");
+  return "http://127.0.0.1:" + port;
+}
+
+function p5JoinUrl(base, pathValue) {
+  return base.replace(/\/+$/, "") + pathValue;
+}
+
+/** Resolves the P2 system id of an exploration instruction. */
+function p5SystemId(userText) {
+  const values = p5LabelledValues(userText);
+  const labelled = p5LabelledId(values, [/system/, /系统/]);
+  if (labelled !== "") return labelled;
+  const match = /(?:系统|system)[^\n]{0,40}?(?:id|ID|Id)?\s*[:=：]?\s*(\d{1,20})/.exec(userText);
+  return match ? match[1] : "";
+}
+
+/** Describes how many tool turns the run already made and their results. */
+function describeP5Run(messages, lastUserIndex) {
+  const callNames = new Map();
+  const toolResults = [];
+  let step = 0;
+  for (let index = lastUserIndex + 1; index < messages.length; index += 1) {
+    const message = messages[index];
+    if (!message) continue;
+    if (message.role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+      step += 1;
+      for (const call of message.tool_calls) {
+        if (call && call.id) callNames.set(call.id, call.function ? call.function.name : "");
+      }
+      continue;
+    }
+    if (message.role === "tool") {
+      toolResults.push({
+        name: callNames.get(message.tool_call_id) || "",
+        text: extractText(message.content),
+      });
+    }
+  }
+  return { step, toolResults };
+}
+
+function p5Tool(name, args, reasoning) {
+  return { kind: "tool", name, arguments: JSON.stringify(args), reasoning };
+}
+
+function p5Text(text) {
+  return { kind: "text", text };
+}
+
+/** Plans exactly one P5 turn from the role, the run state and the mode. */
+function planP5Turn(kind, run, userText, mode) {
+  if (mode === "degraded") return p5Text(P5_DEGRADED_TEXT);
+
+  if (kind === "explore") {
+    const baseUrl = p5ExploreBaseUrl(userText);
+    if (run.step < P5_EXPLORE_PATHS.length) {
+      const pathValue = P5_EXPLORE_PATHS[run.step];
+      return p5Tool(
+        "explore_http",
+        { url: p5JoinUrl(baseUrl, pathValue), method: "GET" },
+        "P5 探索：只读探测 " + pathValue,
+      );
+    }
+    if (run.step === P5_EXPLORE_PATHS.length) {
+      return p5Tool(
+        "app_model_propose",
+        p5AppModelProposal(p5SystemId(userText)),
+        "P5 探索：提交发现的页面/路由/接口",
+      );
+    }
+    return p5Text(P5_FINAL_TEXTS.explore);
+  }
+
+  const versionId = p5VersionId(userText, run.toolResults);
+
+  if (kind === "design") {
+    if (run.step === 0) {
+      if (versionId === "") return p5Text(P5_NO_VERSION_TEXT);
+      return p5Tool("case_graph_read", { versionId }, "P5 设计：读取现有脑图摘要");
+    }
+    if (run.step === 1) {
+      if (versionId === "") return p5Text(P5_NO_VERSION_TEXT);
+      const proposal =
+        mode === "invalid"
+          ? p5InvalidProposal(versionId)
+          : p5DesignProposal(versionId, p5RequirementIds(userText, run.toolResults, versionId));
+      return p5Tool("case_graph_propose", proposal, "P5 设计：提交场景与用例提案");
+    }
+    return p5Text(P5_FINAL_TEXTS.design);
+  }
+
+  if (kind === "review") {
+    if (run.step === 0) {
+      if (versionId === "") return p5Text(P5_NO_VERSION_TEXT);
+      return p5Tool("case_graph_read", { versionId }, "P5 评审：读取现有脑图摘要");
+    }
+    if (run.step === 1) {
+      if (versionId === "") return p5Text(P5_NO_VERSION_TEXT);
+      return p5Tool(
+        "case_review_submit",
+        p5ReviewProposal(versionId, run.toolResults),
+        "P5 评审：提交覆盖/重复/代码未覆盖 findings",
+      );
+    }
+    return p5Text(P5_FINAL_TEXTS.review);
+  }
+
+  if (run.step === 0) {
+    if (versionId === "") return p5Text(P5_NO_VERSION_TEXT);
+    return p5Tool("case_graph_read", { versionId }, "P5 数据规划：读取现有脑图摘要");
+  }
+  if (run.step === 1) {
+    if (versionId === "") return p5Text(P5_NO_VERSION_TEXT);
+    return p5Tool(
+      "case_data_plan_submit",
+      p5DataPlanProposal(versionId, run.toolResults),
+      "P5 数据规划：提交前置条件与测试数据",
+    );
+  }
+  return p5Text(P5_FINAL_TEXTS.data_plan);
+}
+
+/**
+ * Handles one P5 mindmap request. Returns true when the system prompt carried a
+ * P5 role marker, false so the P1-P4 behaviors stay untouched.
+ */
+async function handleP5Scenario(messages, res, stream) {
+  const kind = detectP5Scenario(systemPromptText(messages));
+  if (kind === null) return false;
+
+  const lastUser = findLastUserMessage(messages);
+  const run = lastUser ? describeP5Run(messages, lastUser.index) : { step: 0, toolResults: [] };
+  const plan = lastUser ? planP5Turn(kind, run, lastUser.text, p5Mode()) : p5Text(P5_NO_VERSION_TEXT);
+
+  if (plan.kind === "tool") {
+    const message = {
+      content: null,
+      reasoning_content: plan.reasoning,
+      tool_calls: toolCallPayload(plan.name, plan.arguments, `p5_call_${run.step + 1}`),
+    };
+    if (stream) {
+      await streamToolTurn(res, message, P5_TOOL_USAGE);
+      return true;
+    }
+    sendJson(res, 200, completionBody(message, "tool_calls", P5_TOOL_USAGE));
+    return true;
+  }
+
+  if (stream) {
+    await streamTextTurn(res, plan.text, P5_TEXT_USAGE);
+    return true;
+  }
+  sendJson(res, 200, completionBody({ content: plan.text }, "stop", P5_TEXT_USAGE));
+  return true;
+}
+
 // --- scripted behaviors ----------------------------------------------------
 
 function diagnosticMessage() {
@@ -932,6 +1545,12 @@ async function handleChatCompletions(req, res) {
   // they are detected before the agent tool-call validation below. P1/P2/P3
   // requests never match these markers and keep the original behavior.
   if (await handleP4Scenario(messages, res, stream)) return;
+
+  // P5 mindmap requests carry the role marker of one of the four mindmap
+  // profiles. They are answered before recordRequest and before the agent tools
+  // guard: the plan/step counting must own every turn of the run, and the
+  // degraded mode answers without any tool call.
+  if (await handleP5Scenario(messages, res, stream)) return;
 
   recordRequest(body);
 
@@ -1039,6 +1658,15 @@ async function handleRequest(req, res) {
   }
   if (req.method === "GET" && pathname === "/__p4-mode") {
     sendJson(res, 200, { mode: p4Mode() });
+    return;
+  }
+  // Test-only P5 mindmap scenario control (design spec §10.6).
+  if (req.method === "POST" && pathname === "/__p5-mode") {
+    await handleP5ModeControl(req, res);
+    return;
+  }
+  if (req.method === "GET" && pathname === "/__p5-mode") {
+    sendJson(res, 200, { mode: p5Mode() });
     return;
   }
   sendError(res, 404, "not found");
