@@ -32,8 +32,14 @@ export const NAV_ITEMS: NavItem[] = [
     phase: "P5",
     hint: "在版本详情中打开用例脑图（P5）",
   },
-  { label: "问题", href: "/issues", icon: Bug, phase: "P7", hint: "问题中心（P7）" },
-  { label: "报告", href: "/reports", icon: FileBarChart2, phase: "P6", hint: "版本报告（P6）" },
+  { label: "问题", href: "/issues", icon: Bug, phase: "P7", hint: "全局问题中心（P7）" },
+  {
+    label: "报告",
+    href: "/reports",
+    icon: FileBarChart2,
+    phase: "P7",
+    hint: "版本与全局交付报告（P7）",
+  },
   {
     label: "代码仓",
     href: "/code-repos",

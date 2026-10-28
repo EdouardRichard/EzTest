@@ -21,11 +21,26 @@ describe("navigation items", () => {
     expect(NAV_ITEMS.some((item) => item.href.includes("#"))).toBe(false)
   })
 
+  it("marks the issues and reports entries as P7 global delivery destinations", () => {
+    const issues = NAV_ITEMS.find((item) => item.href === "/issues")
+    const reports = NAV_ITEMS.find((item) => item.href === "/reports")
+
+    expect(issues?.phase).toBe("P7")
+    expect(reports?.phase).toBe("P7")
+    expect(issues?.hint).toContain("P7")
+    expect(reports?.hint).toContain("P7")
+    expect(issues?.hint).toContain("全局")
+    expect(reports?.hint).toContain("全局")
+  })
+
   it("matches exact and nested routes but never hash anchors", () => {
     expect(isActive("/", "/")).toBe(true)
     expect(isActive("/settings", "/settings")).toBe(true)
     expect(isActive("/settings/users", "/settings")).toBe(true)
     expect(isActive("/versions", "/")).toBe(false)
     expect(isActive("/versions", "/versions#mindmap")).toBe(false)
+    expect(isActive("/issues", "/issues")).toBe(true)
+    expect(isActive("/reports", "/reports")).toBe(true)
+    expect(isActive("/issues", "/reports")).toBe(false)
   })
 })

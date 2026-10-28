@@ -1,6 +1,6 @@
 "use client"
 
-import { Globe, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react"
+import { Database, Globe, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react"
 import { type FormEvent, useCallback, useEffect, useState } from "react"
 
 import { EmptyState } from "@/components/ui/EmptyState"
@@ -8,6 +8,7 @@ import { StatusBadge } from "@/components/ui/StatusBadge"
 import { ApiError } from "@/lib/api-client"
 
 import { createEnvironment, deleteEnvironment, listEnvironments, updateEnvironment } from "./api"
+import { DBTargetSection } from "./components/DBTargetSection"
 import type { EnvironmentDTO } from "./types"
 
 const KEY_PATTERN = /^[a-z0-9][a-z0-9_-]{1,63}$/
@@ -164,6 +165,7 @@ export function EnvironmentsPanel({ systemId, canWrite }: EnvironmentsPanelProps
   const [saving, setSaving] = useState(false)
   const [deletingId, setDeletingId] = useState<number | null>(null)
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<number | null>(null)
+  const [dbTargetEnvironmentId, setDbTargetEnvironmentId] = useState<number | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -179,6 +181,8 @@ export function EnvironmentsPanel({ systemId, canWrite }: EnvironmentsPanelProps
 
   useEffect(() => {
     setEnvironments([])
+    // The open section belongs to an environment of the previous system.
+    setDbTargetEnvironmentId(null)
     void load()
   }, [load])
 
@@ -273,6 +277,7 @@ export function EnvironmentsPanel({ systemId, canWrite }: EnvironmentsPanelProps
         setFormOpen(false)
         setEditingId(null)
       }
+      if (dbTargetEnvironmentId === environment.id) setDbTargetEnvironmentId(null)
       setNotice(`已删除环境 ${environment.name}。`)
     } catch (caught) {
       setError(describeError(caught))
@@ -599,6 +604,15 @@ export function EnvironmentsPanel({ systemId, canWrite }: EnvironmentsPanelProps
                       <div className="flex flex-wrap items-center justify-end gap-1.5">
                         <button
                           type="button"
+                          onClick={() => setDbTargetEnvironmentId(environment.id)}
+                          aria-label={`目标数据库 ${environment.name}`}
+                          className={rowActionClass}
+                        >
+                          <Database className="h-3 w-3" aria-hidden="true" />
+                          目标数据库
+                        </button>
+                        <button
+                          type="button"
                           onClick={() => startEdit(environment)}
                           aria-label={`编辑 ${environment.name}`}
                           className={rowActionClass}
@@ -653,6 +667,18 @@ export function EnvironmentsPanel({ systemId, canWrite }: EnvironmentsPanelProps
           </table>
         </div>
       )}
+
+      {dbTargetEnvironmentId !== null && canWrite ? (
+        <DBTargetSection
+          key={dbTargetEnvironmentId}
+          environmentId={dbTargetEnvironmentId}
+          environmentName={
+            environments.find((environment) => environment.id === dbTargetEnvironmentId)?.name ??
+            `环境 #${dbTargetEnvironmentId}`
+          }
+          canWrite={canWrite}
+        />
+      ) : null}
     </section>
   )
 }

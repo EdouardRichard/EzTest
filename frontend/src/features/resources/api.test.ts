@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
+import { ApiError } from "@/lib/api-client"
+
 import {
   cancelTakeover,
   completeTakeover,
@@ -12,8 +14,11 @@ import {
   deleteAccess,
   deleteAccount,
   deleteAppModel,
+  deleteDbTarget,
   deleteEnvironment,
   deleteSystem,
+  describeDBTargetError,
+  getDbTarget,
   getSession,
   importAppModels,
   importSession,
@@ -27,17 +32,21 @@ import {
   listSystems,
   requestTakeover,
   revokeSession,
+  testDbTarget,
   updateAccess,
   updateAccount,
   updateAppModel,
   updateEnvironment,
   updateSystem,
+  upsertDbTarget,
   validateSession,
 } from "./api"
 import type {
   AccessDTO,
   AccountDTO,
   AppModelNodeDTO,
+  DBTargetDTO,
+  DBTargetTestResultDTO,
   EnvironmentDTO,
   SessionDTO,
   SnapshotDTO,
@@ -128,6 +137,37 @@ const SESSION: SessionDTO = {
   failureReason: "",
   invalidatedReason: "",
   expiring: false,
+}
+
+/** DB target ids stay decimal strings (D29); the password never appears. */
+const DB_TARGET: DBTargetDTO = {
+  id: "1844674407370955162",
+  environmentId: "2",
+  name: "orders",
+  host: "127.0.0.1",
+  port: 5432,
+  database: "eztest_target",
+  username: "eztest_ro",
+  credentialSet: true,
+  sslmode: "disable",
+  connectTimeoutMs: 3000,
+  statementTimeoutMs: 5000,
+  maxRows: 100,
+  enabled: true,
+  lastTestedAt: null,
+  lastTestStatus: "",
+  lastTestMessage: "",
+  createdAt: "2026-10-28T00:00:00Z",
+  updatedAt: "2026-10-28T00:00:00Z",
+}
+
+const DB_TARGET_TEST_OK: DBTargetTestResultDTO = {
+  ok: true,
+  latencyMs: 12,
+  serverVersion: "PostgreSQL 16.4",
+  currentUser: "eztest_ro",
+  transactionReadOnly: true,
+  warnings: ["role_has_write_privileges"],
 }
 
 const SNAPSHOT: SnapshotDTO = {
@@ -384,5 +424,105 @@ describe("resources api", () => {
     await expect(cancelTakeover(11)).resolves.toEqual({ id: 11, status: "cancelled" })
     expect(lastRequest().url.endsWith("/api/resources/takeovers/11/cancel")).toBe(true)
     expect(lastRequest().init.method).toBe("POST")
+  })
+
+  it("calls the DB target endpoints from spec §7.8 with string ids", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ data: DB_TARGET }))
+    const target = await getDbTarget(2)
+    expect(target).toEqual(DB_TARGET)
+    expect(lastRequest().url.endsWith("/api/resources/environments/2/db-target")).toBe(true)
+    expect(lastRequest().init.method).toBe("GET")
+    // The DTO keeps snowflake ids as decimal strings; this module never parses them.
+    expect(typeof target?.id).toBe("string")
+    expect(typeof target?.environmentId).toBe("string")
+    expect(target).not.toHaveProperty("password")
+
+    fetchMock.mockResolvedValue(jsonResponse({ data: null }))
+    await expect(getDbTarget(3)).resolves.toBeNull()
+
+    fetchMock.mockResolvedValue(jsonResponse({ data: DB_TARGET }))
+    await expect(
+      upsertDbTarget(2, {
+        host: "127.0.0.1",
+        port: 5432,
+        database: "eztest_target",
+        username: "eztest_ro",
+        password: "s3cret",
+        sslmode: "disable",
+        connectTimeoutMs: 3000,
+        statementTimeoutMs: 5000,
+        maxRows: 100,
+        enabled: true,
+      }),
+    ).resolves.toEqual(DB_TARGET)
+    expect(lastRequest().url.endsWith("/api/resources/environments/2/db-target")).toBe(true)
+    expect(lastRequest().init.method).toBe("PUT")
+    expect(JSON.parse(String(lastRequest().init.body))).toMatchObject({ password: "s3cret" })
+
+    fetchMock.mockResolvedValue(jsonResponse({ data: DB_TARGET_TEST_OK }))
+    await expect(
+      testDbTarget(2, {
+        host: "127.0.0.1",
+        port: 5432,
+        database: "eztest_target",
+        username: "eztest_ro",
+      }),
+    ).resolves.toEqual(DB_TARGET_TEST_OK)
+    expect(lastRequest().url.endsWith("/api/resources/environments/2/db-target/test")).toBe(true)
+    expect(lastRequest().init.method).toBe("POST")
+    expect(JSON.parse(String(lastRequest().init.body))).toEqual({
+      host: "127.0.0.1",
+      port: 5432,
+      database: "eztest_target",
+      username: "eztest_ro",
+    })
+
+    fetchMock.mockResolvedValue(jsonResponse({ data: DB_TARGET_TEST_OK }))
+    await testDbTarget(2)
+    expect(JSON.parse(String(lastRequest().init.body ?? "{}"))).toEqual({})
+
+    fetchMock.mockResolvedValue(new Response(null, { status: 204 }))
+    await expect(deleteDbTarget(2)).resolves.toBeUndefined()
+    expect(lastRequest().url.endsWith("/api/resources/environments/2/db-target")).toBe(true)
+    expect(lastRequest().init.method).toBe("DELETE")
+  })
+
+  it("describes DB target failures with the stable reason and field", () => {
+    expect(
+      describeDBTargetError(
+        new ApiError({ status: 403, code: "forbidden", message: "admin only" }),
+      ),
+    ).toContain("管理员")
+    expect(
+      describeDBTargetError(
+        new ApiError({
+          status: 422,
+          code: "invalid_argument",
+          message: "port must be between 1 and 65535",
+          details: { reason: "db_target_invalid", field: "port" },
+        }),
+      ),
+    ).toContain("port")
+    expect(
+      describeDBTargetError(
+        new ApiError({
+          status: 409,
+          code: "conflict",
+          message: "no target",
+          details: { reason: "db_target_missing" },
+        }),
+      ),
+    ).toContain("未配置")
+    expect(
+      describeDBTargetError(
+        new ApiError({
+          status: 0,
+          code: "network_error",
+          message: "offline",
+          retryable: true,
+        }),
+      ),
+    ).toContain("无法连接")
+    expect(describeDBTargetError(new Error("boom"))).toBe("boom")
   })
 })

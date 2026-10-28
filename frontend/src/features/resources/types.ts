@@ -129,3 +129,57 @@ export type Page<T> = {
   nextCursor: string | null
   hasMore: boolean
 }
+
+/**
+ * Environment read-only PostgreSQL target (spec §7.8). Snowflake ids stay
+ * decimal strings; the password never appears in the DTO, only `credentialSet`.
+ */
+export type DBTargetDTO = {
+  id: string
+  environmentId: string
+  name: string
+  host: string
+  port: number
+  database: string
+  username: string
+  credentialSet: boolean
+  sslmode: string
+  connectTimeoutMs: number
+  statementTimeoutMs: number
+  maxRows: number
+  enabled: boolean
+  lastTestedAt: string | null
+  lastTestStatus: string
+  lastTestMessage: string
+  createdAt: string
+  updatedAt: string
+}
+
+/**
+ * Writable db target fields of spec §7.8. `password` is omitted when the user
+ * leaves the field blank, which keeps the stored credential.
+ */
+export type DBTargetWriteInput = {
+  name?: string
+  host: string
+  port: number
+  database: string
+  username: string
+  password?: string
+  sslmode?: string
+  connectTimeoutMs?: number
+  statementTimeoutMs?: number
+  maxRows?: number
+  enabled?: boolean
+}
+
+/** Result of one connection probe; a failed probe is a 200 with ok=false. */
+export type DBTargetTestResultDTO = {
+  ok: boolean
+  latencyMs: number
+  serverVersion?: string
+  currentUser?: string
+  transactionReadOnly: boolean
+  warnings: string[]
+  error?: { reason: string; message: string }
+}
