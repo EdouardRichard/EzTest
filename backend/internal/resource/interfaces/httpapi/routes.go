@@ -12,6 +12,7 @@ type Handlers struct {
 	Session  *SessionHandler
 	CodeRepo *CodeRepoHandler
 	AuthFlow *AuthFlowHandler
+	DBTarget *DBTargetHandler
 }
 
 // RegisterRoutes mounts the resource endpoints on mux. Each non-nil handler
@@ -33,5 +34,8 @@ func RegisterRoutes(mux *http.ServeMux, h Handlers, adminGuard func(http.Handler
 	}
 	if h.AuthFlow != nil {
 		h.AuthFlow.RegisterRoutes(mux, adminGuard)
+	}
+	if h.DBTarget != nil {
+		h.DBTarget.RegisterRoutes(mux, adminGuard)
 	}
 }
