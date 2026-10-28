@@ -7,16 +7,14 @@ import (
 
 // Finish-validation reason identifiers. Every rejection is an invalid_arguments
 // tool error (spec §5.5) whose Reason carries the stable, machine-readable
-// cause; evidence_missing and unsupported_assertion_kind are the spec §6.4
-// identifiers.
+// cause; evidence_missing is the spec §6.4 identifier.
 const (
-	reasonUnsupportedAssertionKind = "unsupported_assertion_kind"
-	reasonInvalidFinishVerdict     = "invalid_finish_verdict"
-	reasonInvalidStepResults       = "invalid_step_results"
-	reasonInvalidAssertionResults  = "invalid_assertion_results"
-	reasonInvalidFailureClass      = "invalid_failure_class"
-	reasonVerdictNotJustified      = "verdict_not_justified"
-	reasonBudgetExhausted          = "budget_exhausted"
+	reasonInvalidFinishVerdict    = "invalid_finish_verdict"
+	reasonInvalidStepResults      = "invalid_step_results"
+	reasonInvalidAssertionResults = "invalid_assertion_results"
+	reasonInvalidFailureClass     = "invalid_failure_class"
+	reasonVerdictNotJustified     = "verdict_not_justified"
+	reasonBudgetExhausted         = "budget_exhausted"
 )
 
 func finishError(reason, message string) error {
@@ -24,17 +22,17 @@ func finishError(reason, message string) error {
 }
 
 // ValidateFinish is the server-side gate for a case_finish submission. It
-// enforces spec §5.5/§5.8 before the finish is persisted:
+// enforces spec §5.5/§5.8 plus the P7 db-assertion rules of spec §6.6.2 before
+// the finish is persisted:
 //
 //   - every snapshot step has exactly one result, recorded once in ascending seq
 //     order, and no result refers to a step outside the snapshot;
-//   - every non-db snapshot assertion is submitted exactly once, and no result
-//     refers to an assertion outside the snapshot;
+//   - every snapshot assertion — including a db assertion — is submitted
+//     exactly once, and no result refers to an assertion outside the snapshot;
 //   - passed and failed require at least one piece of evidence;
-//   - passed requires every step passed and every non-db assertion passed;
-//   - failed requires at least one failed assertion;
-//   - a snapshot containing a db assertion is only allowed to finish
-//     inconclusive(case), reason unsupported_assertion_kind;
+//   - passed requires every step passed and every assertion passed, including
+//     db assertions;
+//   - failed requires at least one failed assertion, including a db assertion;
 //   - the verdict/failure-class matrix of spec §5.8 must hold;
 //   - a budget-exhausted finish must be inconclusive(model).
 //
@@ -46,16 +44,6 @@ func ValidateFinish(snapshot CaseSnapshot, steps []StepResult, assertions []Asse
 	default:
 		return finishError(reasonInvalidFinishVerdict,
 			fmt.Sprintf("verdict %q is not a valid case-finish verdict", decision.Verdict))
-	}
-
-	// P6 does not support db assertions. Never let such a case pretend to pass,
-	// fail or be blocked; it may only finish inconclusive(case).
-	if snapshotHasDBAssertion(snapshot) {
-		if decision.Verdict != VerdictInconclusive ||
-			decision.FailureClass == nil || *decision.FailureClass != FailureClassCase {
-			return finishError(reasonUnsupportedAssertionKind,
-				"case contains a db assertion; finish as inconclusive(case, unsupported_assertion_kind)")
-		}
 	}
 
 	if err := validateFinishClass(decision); err != nil {
@@ -96,9 +84,6 @@ func ValidateFinish(snapshot CaseSnapshot, steps []StepResult, assertions []Asse
 			}
 		}
 		for _, assertion := range snapshot.Assertions {
-			if isDBAssertion(assertion.Kind) {
-				continue
-			}
 			if !verdictEquals(results[assertion.ID].Verdict, "passed") {
 				return finishError(reasonVerdictNotJustified,
 					fmt.Sprintf("passed requires assertion %d passed", assertion.ID))
@@ -107,7 +92,7 @@ func ValidateFinish(snapshot CaseSnapshot, steps []StepResult, assertions []Asse
 	case VerdictFailed:
 		if !hasFailedAssertion(snapshot, results) {
 			return finishError(reasonVerdictNotJustified,
-				"failed requires at least one failed non-db assertion")
+				"failed requires at least one failed assertion")
 		}
 	}
 
@@ -173,9 +158,9 @@ func validateFinishSteps(snapshot CaseSnapshot, steps []StepResult) error {
 	return nil
 }
 
-// validateFinishAssertions requires every non-db snapshot assertion to be
-// submitted exactly once and rejects results for assertions outside the
-// snapshot. It returns the submitted results indexed by assertion id.
+// validateFinishAssertions requires every snapshot assertion, including a db
+// assertion, to be submitted exactly once and rejects results for assertions
+// outside the snapshot. It returns the submitted results indexed by assertion id.
 func validateFinishAssertions(snapshot CaseSnapshot, assertions []AssertionResult) (map[int64]AssertionResult, error) {
 	snapshotByID := make(map[int64]CaseSnapshotAssertion, len(snapshot.Assertions))
 	for _, assertion := range snapshot.Assertions {
@@ -196,10 +181,6 @@ func validateFinishAssertions(snapshot CaseSnapshot, assertions []AssertionResul
 	}
 
 	for _, assertion := range snapshot.Assertions {
-		if isDBAssertion(assertion.Kind) {
-			// P6 never runs db assertions; the db rule itself is enforced above.
-			continue
-		}
 		if _, ok := results[assertion.ID]; !ok {
 			return nil, finishError(reasonInvalidAssertionResults,
 				fmt.Sprintf("assertion %d was not submitted", assertion.ID))
@@ -208,20 +189,8 @@ func validateFinishAssertions(snapshot CaseSnapshot, assertions []AssertionResul
 	return results, nil
 }
 
-func snapshotHasDBAssertion(snapshot CaseSnapshot) bool {
-	for _, assertion := range snapshot.Assertions {
-		if isDBAssertion(assertion.Kind) {
-			return true
-		}
-	}
-	return false
-}
-
 func hasFailedAssertion(snapshot CaseSnapshot, results map[int64]AssertionResult) bool {
 	for _, assertion := range snapshot.Assertions {
-		if isDBAssertion(assertion.Kind) {
-			continue
-		}
 		if verdictEquals(results[assertion.ID].Verdict, "failed") {
 			return true
 		}
@@ -236,10 +205,6 @@ func hasEvidence(steps []StepResult) bool {
 		}
 	}
 	return false
-}
-
-func isDBAssertion(kind string) bool {
-	return strings.EqualFold(strings.TrimSpace(kind), "db")
 }
 
 func verdictEquals(value, want string) bool {

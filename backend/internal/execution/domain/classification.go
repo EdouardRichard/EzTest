@@ -25,15 +25,17 @@ const (
 )
 
 // classifyToolCode maps a concrete tool error code to its failure-class group.
-// host/network/executor errors are environment, authentication errors are
-// session, model/budget errors are model, malformed submissions and unsupported
-// assertion kinds are case, and only target/assertion evidence problems may be
+// host/network/executor errors and database connection/target problems are
+// environment, authentication errors are session, model/budget errors are model,
+// malformed submissions plus SQL/read-only/truncation/expected-value db
+// problems are case, and only target/assertion evidence problems may be
 // application failures.
 func classifyToolCode(code string) toolCodeClass {
 	switch strings.ToLower(code) {
 	case "host_not_allowed", "dns_failed", "dns_error", "connection_refused",
 		"connection_reset", "network_error", "tls_error", "env_unreachable",
-		"executor_unavailable", "executor_unreachable":
+		"executor_unavailable", "executor_unreachable",
+		"db_connection_failed", "db_target_missing":
 		return toolCodeEnvironment
 	case "session_unauthorized", "session_expired", "session_invalid", "no_session":
 		return toolCodeSession
@@ -42,7 +44,8 @@ func classifyToolCode(code string) toolCodeClass {
 		return toolCodeModel
 	case "unsupported_assertion_kind", "invalid_arguments", "invalid_selector",
 		"invalid_finish", "target_ambiguous", "case_invalid", "invalid_case",
-		"agent_output_invalid":
+		"agent_output_invalid", "db_query_failed", "db_readonly_violation",
+		"db_result_truncated", "db_expected_invalid":
 		return toolCodeCase
 	case "target_not_found", "timeout", "assertion_mismatch", "assertion_failed",
 		"step_failed":
@@ -56,10 +59,14 @@ func classifyToolCode(code string) toolCodeClass {
 // tool error code, the agent's proposed failure class and the evidence count.
 //
 // The tool code wins: an environment, session, model or case code never yields
-// an application failure, even when the agent proposes one. Application
-// failures require at least one piece of evidence; without evidence they are
-// downgraded to inconclusive(case, evidence_missing) as required by spec §5.8.
-// timeout without evidence defaults to blocked(environment) because an
+// an application failure, even when the agent proposes one. A database
+// connection/target problem therefore blocks as environment, while a SQL,
+// read-only, truncation or invalid-expected problem stays inconclusive(case).
+// A database assertion mismatch is the db failure that may blame the
+// application (existing assertion_mismatch/assertion_failed codes).
+// Application failures require at least one piece of evidence; without evidence
+// they are downgraded to inconclusive(case, evidence_missing) as required by
+// spec §5.8. timeout without evidence defaults to blocked(environment) because an
 // unevidenced timeout is most likely an environment problem. A proposal is
 // adopted only when no tool code is present. Unknown codes are isolated as
 // inconclusive(case) instead of being blamed on the application.

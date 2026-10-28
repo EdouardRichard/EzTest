@@ -53,6 +53,36 @@ func TestClassifyToolCodeMatrix(t *testing.T) {
 			wantReason: "unsupported_assertion_kind",
 		},
 		{
+			name: "db connection failure is environment", code: "db_connection_failed",
+			wantVerdict: domain.VerdictBlocked, wantClass: domain.FailureClassEnvironment,
+			wantReason: "db_connection_failed",
+		},
+		{
+			name: "db target missing is environment", code: "db_target_missing",
+			wantVerdict: domain.VerdictBlocked, wantClass: domain.FailureClassEnvironment,
+			wantReason: "db_target_missing",
+		},
+		{
+			name: "db query failure is case", code: "db_query_failed",
+			wantVerdict: domain.VerdictInconclusive, wantClass: domain.FailureClassCase,
+			wantReason: "db_query_failed",
+		},
+		{
+			name: "db readonly violation is case", code: "db_readonly_violation",
+			wantVerdict: domain.VerdictInconclusive, wantClass: domain.FailureClassCase,
+			wantReason: "db_readonly_violation",
+		},
+		{
+			name: "db result truncated is case", code: "db_result_truncated",
+			wantVerdict: domain.VerdictInconclusive, wantClass: domain.FailureClassCase,
+			wantReason: "db_result_truncated",
+		},
+		{
+			name: "db expected invalid is case", code: "db_expected_invalid",
+			wantVerdict: domain.VerdictInconclusive, wantClass: domain.FailureClassCase,
+			wantReason: "db_expected_invalid",
+		},
+		{
 			name: "internal tool error is model", code: "internal",
 			wantVerdict: domain.VerdictInconclusive, wantClass: domain.FailureClassModel,
 			wantReason: "internal",
@@ -155,6 +185,7 @@ func TestClassifyNeverReturnsApplicationForEnvOrSession(t *testing.T) {
 	for _, code := range []string{
 		"host_not_allowed", "dns_failed", "executor_unavailable",
 		"session_unauthorized", "session_expired", "no_session",
+		"db_connection_failed", "db_target_missing",
 	} {
 		// Even a proposed application failure with plenty of evidence must not
 		// turn an environment/session tool error into an application verdict.
@@ -179,6 +210,24 @@ func TestClassifyModelAndBudgetNeverFailed(t *testing.T) {
 		verdict, class, _ := domain.Classify(code, proposedClass("application"), 4)
 		if verdict != domain.VerdictInconclusive || class != domain.FailureClassModel {
 			t.Fatalf("Classify(%q) = %s/%s, want inconclusive/model", code, verdict, class)
+		}
+	}
+}
+
+// TestClassifyDBAssertionMismatchIsApplication pins that a mismatched db
+// assertion is the one db failure that blames the application (spec §6.6.2):
+// with evidence it is failed(application), without evidence it degrades.
+func TestClassifyDBAssertionMismatchIsApplication(t *testing.T) {
+	for _, code := range []string{"assertion_mismatch", "assertion_failed"} {
+		verdict, class, reason := domain.Classify(code, "", 1)
+		if verdict != domain.VerdictFailed || class != domain.FailureClassApplication || reason != code {
+			t.Fatalf("Classify(%q, evidence) = %s/%s/%q, want failed/application/%q",
+				code, verdict, class, reason, code)
+		}
+		verdict, class, reason = domain.Classify(code, "", 0)
+		if verdict != domain.VerdictInconclusive || class != domain.FailureClassCase || reason != "evidence_missing" {
+			t.Fatalf("Classify(%q, no evidence) = %s/%s/%q, want inconclusive/case/evidence_missing",
+				code, verdict, class, reason)
 		}
 	}
 }

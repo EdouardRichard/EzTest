@@ -539,7 +539,11 @@ func TestRecorderFinishCaseRecordsAudit(t *testing.T) {
 	})
 }
 
-func TestRecorderFinishCaseRejectsDBAssertion(t *testing.T) {
+// TestRecorderFinishCaseRequiresDBAssertion pins the P7 rule (spec §6.6.2): a
+// db assertion is a normal assertion. A finish that skips it is rejected as an
+// incomplete assertion submission, and once it is recorded an all-passed finish
+// is admitted.
+func TestRecorderFinishCaseRequiresDBAssertion(t *testing.T) {
 	recorder, world := newRecorderTest(t)
 	snapshot := recorderSnapshot()
 	snapshot.Assertions[0].Kind = "db"
@@ -554,20 +558,21 @@ func TestRecorderFinishCaseRejectsDBAssertion(t *testing.T) {
 	_, err := recorder.FinishCase(context.Background(), run.ID, FinishInput{
 		Decision: domain.FinishDecision{Verdict: domain.VerdictPassed},
 	})
-	wantToolError(t, err, "invalid_arguments", "unsupported_assertion_kind")
+	wantToolError(t, err, "invalid_arguments", "invalid_assertion_results")
 
+	if _, err := recorder.RecordAssertion(context.Background(), run.ID, AssertionRecordInput{
+		AssertionID: 20, Verdict: "passed", Actual: "1", EvidenceIDs: []int64{evidence.ID},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	finished, err := recorder.FinishCase(context.Background(), run.ID, FinishInput{
-		Decision: domain.FinishDecision{
-			Verdict:      domain.VerdictInconclusive,
-			FailureClass: failureClassPointer(domain.FailureClassCase),
-			Reason:       "unsupported_assertion_kind",
-		},
+		Decision: domain.FinishDecision{Verdict: domain.VerdictPassed},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if finished.Status != domain.CaseRunStatusInconclusive {
-		t.Fatalf("status = %s, want inconclusive", finished.Status)
+	if finished.Status != domain.CaseRunStatusPassed {
+		t.Fatalf("status = %s, want passed", finished.Status)
 	}
 }
 

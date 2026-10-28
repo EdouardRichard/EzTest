@@ -27,7 +27,8 @@ func finishSnapshot() domain.CaseSnapshot {
 	}
 }
 
-// finishDBSnapshot adds an unsupported db assertion to the canonical case.
+// finishDBSnapshot adds a db assertion to the canonical case. Since P7 a db
+// assertion is submitted and justified like any other assertion (spec §6.6.2).
 func finishDBSnapshot() domain.CaseSnapshot {
 	snapshot := finishSnapshot()
 	snapshot.Assertions = append(snapshot.Assertions, domain.CaseSnapshotAssertion{
@@ -62,6 +63,16 @@ func failedAssertions() []domain.AssertionResult {
 		{AssertionID: 9, Kind: "ui", Verdict: "passed"},
 		{AssertionID: 10, Kind: "api", Verdict: "failed"},
 	}
+}
+
+// dbPassedAssertions adds the db assertion of finishDBSnapshot as passed.
+func dbPassedAssertions() []domain.AssertionResult {
+	return append(passedAssertions(), domain.AssertionResult{AssertionID: 11, Kind: "db", Verdict: "passed"})
+}
+
+// dbFailedAssertions adds the db assertion of finishDBSnapshot as failed.
+func dbFailedAssertions() []domain.AssertionResult {
+	return append(passedAssertions(), domain.AssertionResult{AssertionID: 11, Kind: "db", Verdict: "failed"})
 }
 
 func withoutEvidence(steps []domain.StepResult) []domain.StepResult {
@@ -126,8 +137,8 @@ func TestValidateFinishMatrix(t *testing.T) {
 			},
 		},
 		{
-			name: "db assertion is inconclusive case", snapshot: finishDBSnapshot(),
-			steps: withoutEvidence(passedSteps()), assertions: passedAssertions(),
+			name: "db assertion is submitted like any other assertion", snapshot: finishDBSnapshot(),
+			steps: withoutEvidence(passedSteps()), assertions: dbFailedAssertions(),
 			decision: domain.FinishDecision{
 				Verdict: domain.VerdictInconclusive, FailureClass: failureClassPtr(domain.FailureClassCase),
 			},
@@ -292,20 +303,68 @@ func TestValidateFinishMatrix(t *testing.T) {
 			wantReason: "invalid_assertion_results",
 		},
 		{
-			name: "db assertion cannot finish failed", snapshot: finishDBSnapshot(),
-			steps: failedSteps(), assertions: failedAssertions(),
+			name: "db assertion passed permits passed", snapshot: finishDBSnapshot(),
+			steps: passedSteps(), assertions: dbPassedAssertions(), decision: passedFinish(),
+		},
+		{
+			name: "db assertion failed permits failed application", snapshot: finishDBSnapshot(),
+			steps: passedSteps(), assertions: dbFailedAssertions(),
 			decision: domain.FinishDecision{
 				Verdict: domain.VerdictFailed, FailureClass: failureClassPtr(domain.FailureClassApplication),
 			},
-			wantReason: "unsupported_assertion_kind",
 		},
 		{
-			name: "db assertion cannot finish model inconclusive", snapshot: finishDBSnapshot(),
+			name: "db assertion failure permits inconclusive case", snapshot: finishDBSnapshot(),
+			steps: withoutEvidence(passedSteps()), assertions: dbFailedAssertions(),
+			decision: domain.FinishDecision{
+				Verdict: domain.VerdictInconclusive, FailureClass: failureClassPtr(domain.FailureClassCase),
+			},
+		},
+		{
+			name: "db assertion failure permits blocked environment", snapshot: finishDBSnapshot(),
+			steps: withoutEvidence(passedSteps()), assertions: dbFailedAssertions(),
+			decision: domain.FinishDecision{
+				Verdict: domain.VerdictBlocked, FailureClass: failureClassPtr(domain.FailureClassEnvironment),
+			},
+		},
+		{
+			name: "db assertion failure permits inconclusive model", snapshot: finishDBSnapshot(),
+			steps: withoutEvidence(passedSteps()), assertions: dbFailedAssertions(),
+			decision: domain.FinishDecision{
+				Verdict: domain.VerdictInconclusive, FailureClass: failureClassPtr(domain.FailureClassModel),
+			},
+		},
+		{
+			name: "db assertion failure blocks passed", snapshot: finishDBSnapshot(),
+			steps: passedSteps(), assertions: dbFailedAssertions(), decision: passedFinish(),
+			wantReason: "verdict_not_justified",
+		},
+		{
+			name: "db assertion never submitted", snapshot: finishDBSnapshot(),
+			steps: passedSteps(), assertions: passedAssertions(), decision: passedFinish(),
+			wantReason: "invalid_assertion_results",
+		},
+		{
+			name: "db assertion never submitted for model inconclusive", snapshot: finishDBSnapshot(),
 			steps: withoutEvidence(passedSteps()), assertions: passedAssertions(),
 			decision: domain.FinishDecision{
 				Verdict: domain.VerdictInconclusive, FailureClass: failureClassPtr(domain.FailureClassModel),
 			},
-			wantReason: "unsupported_assertion_kind",
+			wantReason: "invalid_assertion_results",
+		},
+		{
+			name: "db assertion submitted twice", snapshot: finishDBSnapshot(),
+			steps: passedSteps(), assertions: append(dbPassedAssertions(), domain.AssertionResult{
+				AssertionID: 11, Kind: "db", Verdict: "passed",
+			}),
+			decision: passedFinish(), wantReason: "invalid_assertion_results",
+		},
+		{
+			name: "db assertion outside the snapshot", snapshot: finishDBSnapshot(),
+			steps: passedSteps(), assertions: append(dbPassedAssertions(), domain.AssertionResult{
+				AssertionID: 12, Kind: "db", Verdict: "passed",
+			}),
+			decision: passedFinish(), wantReason: "invalid_assertion_results",
 		},
 	}
 
@@ -343,11 +402,17 @@ func TestValidateFinishRequiresEvidenceForPassed(t *testing.T) {
 	), "evidence_missing")
 }
 
-func TestValidateFinishDBAssertionIsUnsupported(t *testing.T) {
+// TestValidateFinishRequiresDBAssertion pins the P7 rule (spec §6.6.2): a db
+// assertion is an ordinary assertion for the finish gate. It must be submitted
+// exactly once, and an all-passed submission including it is admissible.
+func TestValidateFinishRequiresDBAssertion(t *testing.T) {
 	requireFinishReason(t, domain.ValidateFinish(
-		finishDBSnapshot(), passedSteps(), passedAssertions(),
-		domain.FinishDecision{
-			Verdict: domain.VerdictFailed, FailureClass: failureClassPtr(domain.FailureClassApplication),
-		},
-	), "unsupported_assertion_kind")
+		finishDBSnapshot(), passedSteps(), passedAssertions(), passedFinish(),
+	), "invalid_assertion_results")
+
+	if err := domain.ValidateFinish(
+		finishDBSnapshot(), passedSteps(), dbPassedAssertions(), passedFinish(),
+	); err != nil {
+		t.Fatalf("ValidateFinish with the db assertion passed returned %v, want nil", err)
+	}
 }
