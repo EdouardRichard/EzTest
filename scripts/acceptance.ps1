@@ -2521,7 +2521,9 @@ const expected = {
   [`${prefix}/findings/{findingId}`]: ["patch"],
   [`${prefix}/export`]: ["post"],
   [`${prefix}/exports`]: ["get"],
-  [`${prefix}/exports/{exportId}/download`]: ["get"]
+  [`${prefix}/exports/{exportId}/download`]: ["get"],
+  [`${prefix}/incremental-plan`]: ["get"],
+  [`${prefix}/nodes/{nodeId}/supplement`]: ["patch"]
 };
 const paths = doc.paths || {};
 const errors = [];
@@ -2539,7 +2541,7 @@ for (const [p, methods] of Object.entries(expected)) {
     errors.push("methods " + p + ": got " + got.join(","));
   }
 }
-if (operations !== 27) errors.push("operations=" + operations + " (expected 27)");
+if (operations !== 29) errors.push("operations=" + operations + " (expected 29)");
 const events = (doc.components?.schemas?.VersionEventType?.enum) || [];
 const newEvents = ["case.created", "case.updated", "case.deleted", "case.reviewed",
   "case.baseline_frozen", "case.run_started", "case.run_finished", "case.export_ready"];
@@ -2584,7 +2586,7 @@ writeFileSync(process.argv[3], JSON.stringify({
             if (-not $summary.ok) {
                 throw ("P5 OpenAPI contract violations: " + (@($summary.errors) -join "; "))
             }
-            if ([int]$summary.pathItems -ne 23 -or [int]$summary.operations -ne 27) {
+            if ([int]$summary.pathItems -ne 25 -or [int]$summary.operations -ne 29) {
                 throw "P5 OpenAPI operations/path items mismatch ($($summary.pathItems) paths, $($summary.operations) operations)"
             }
             if ([int]$summary.events -ne 8 -or [int]$summary.reasons -ne 35) {
@@ -3306,9 +3308,9 @@ writeFileSync(process.argv[3], JSON.stringify({
             }
             $eventCount = @([regex]::Matches($eventCatalog.Value, '(?m)^\s+- ') | ForEach-Object { $_.Value }).Count
             $reasonCount = @([regex]::Matches($reasonCatalog.Value, '(?m)^\s+- ') | ForEach-Object { $_.Value }).Count
-            if ($eventCount -lt 16) { throw "VersionEventType has $eventCount entries; expected at least 16 P6 events plus the earlier catalog" }
-            if ($reasonCount -lt 19) { throw "ExecutionErrorReason has $reasonCount entries; expected at least the 19 P6 reasons" }
-            Write-Host "P6 OpenAPI OK: 15 paths, 16 P6 events (catalog $eventCount), 20 P6 reasons (catalog $reasonCount)."
+            if ($eventCount -lt 54) { throw "VersionEventType has $eventCount entries; expected at least 54 (46 P0-P6 + 8 P7 events)" }
+            if ($reasonCount -lt 59) { throw "ExecutionErrorReason has $reasonCount entries; expected at least 59 (20 P6 + 39 P7 reasons)" }
+            Write-Host "P6 OpenAPI OK: 15 paths, 16 P6 events (catalog $eventCount, now including the 8 P7 events), 20 P6 reasons (catalog $reasonCount, now including the P7 reasons)."
         })
 
     if ($StaticOnly) {
@@ -4103,8 +4105,10 @@ writeFileSync(process.argv[3], JSON.stringify({
                         -Detail "auth-flow routes are not mounted (GET /api/resources/auth-flows -> 404); the normal-user 403 assertion cannot run until AuthFlowHandler is wired in the composition root."
                 }
 
-                Add-CheckResult -Dod "P6-2" -CheckName "P6 db assertion (inconclusive case)" -Status "SKIPPED" `
-                    -Detail "The P6 fake LLM has no db-assertion finish scenario; the §5.8 rule (db assertion => inconclusive(case, unsupported_assertion_kind), never passed) is covered by go test ./internal/execution/domain verdict matrix."
+                # The former "P6 db assertion (inconclusive case)" static SKIP is
+                # replaced by the P7 db-assertion check: P7 implements
+                # execution.db_assert and pins the read-only/blocked/inconclusive
+                # classification in the P7 block below.
             }
         } catch {
             Add-CheckResult -Dod "P6" -CheckName "P6 API harness" -Status "FAIL" -Detail $_.Exception.Message
@@ -4135,6 +4139,651 @@ writeFileSync(process.argv[3], JSON.stringify({
             }
         })
 
+    # -----------------------------------------------------------------------
+    # P7 delivery / continuing / autonomy acceptance block (spec §13). All
+    # checks are repository-local and run in -StaticOnly: they pin the OpenAPI
+    # contract, migrations, fake-LLM contract, frontend testids/navigation and
+    # the P6 regression, plus the db-assertion rule that was previously a
+    # static SKIP. The live P7 API paths are exercised by scripts/e2e.ps1 and
+    # the gated real-LLM/DB scripts; the two gated scripts stay SKIPPED here.
+    # -----------------------------------------------------------------------
+    $script:p7DodMapping = @(
+        @{
+            DoD         = "P7-1"
+            Requirement = "Coverage gaps found during execution are supplemented into the mindmap without blocking the baseline"
+            Evidence    = "fake-llm.p7 contract (supplement tool sequence); OpenAPI case.supplemented/IncrementalPlanView; E2E p7-supplement (T25); gated real-LLM script (T28)"
+        },
+        @{
+            DoD         = "P7-2"
+            Requirement = "New requirement -> continuing -> incremental batch -> new report, with pause/resume"
+            Evidence    = "OpenAPI /versions/{id}/changes + continuePhase; P7 batch kind/parentBatchId; fake-llm.p7 continuing modes; E2E p7-continuing (T25)"
+        },
+        @{
+            DoD         = "P7-3"
+            Requirement = "Issues carry steps/evidence/code locations; reports are per batch and go stale"
+            Evidence    = "OpenAPI IssueView/ReportView/ReportDiff; fake-llm.p7 failure+triage+draft contract; P7 OpenAPI reason catalog; E2E p7-issues-report (T25)"
+        },
+        @{
+            DoD         = "P7-4"
+            Requirement = "Read-only, configurable DB assertions execute without false passes; P6 cases rerun"
+            Evidence    = "P7 db-assertion static check; fake-llm.p7 execution_db_assert contract; gated acceptance-p7-db.ps1 (T29, real PostgreSQL)"
+        },
+        @{
+            DoD         = "P7-5"
+            Requirement = "AI unavailability degrades to a baseline-only, manually reviewable run"
+            Evidence    = "fake-llm.p7 degraded mode; OpenAPI report degraded flag; E2E p7-degraded (T25); gated real-LLM check 4 (T28)"
+        }
+    )
+
+    [void](Invoke-Check -Dod "P7-6" -CheckName "P7 migration and deliverables" -Body {
+            $p7MigrationNames = @(
+                "delivery_0001_issue.sql",
+                "delivery_0002_report.sql",
+                "delivery_0003_analysis.sql",
+                "resource_0007_db_target.sql",
+                "version_0005_continue.sql",
+                "execution_0002_autonomy.sql",
+                "mindmap_0002_supplement.sql",
+                "codeintel_0005_issue_anchor.sql"
+            )
+            $previousIndex = [Array]::IndexOf([object[]]$migrationOrder, "resource_0006_auth_flows.sql")
+            if ($previousIndex -lt 0) { throw "order.txt is missing the P6 tail migration resource_0006_auth_flows.sql" }
+            $p7Ddl = ""
+            foreach ($migrationName in $p7MigrationNames) {
+                $migrationPath = Join-Path $backendDir ("internal\db\migrations\" + $migrationName)
+                if (-not (Test-Path -LiteralPath $migrationPath)) { throw "P7 migration is missing: $migrationName" }
+                $migrationIndex = [Array]::IndexOf([object[]]$migrationOrder, $migrationName)
+                if ($migrationIndex -lt 0) { throw "order.txt is missing the P7 migration: $migrationName" }
+                if ($migrationIndex -le $previousIndex) {
+                    throw "order.txt must list $migrationName after the previous P7 migration (index $migrationIndex <= $previousIndex)"
+                }
+                $previousIndex = $migrationIndex
+                $p7Ddl += [System.IO.File]::ReadAllText($migrationPath, [System.Text.Encoding]::UTF8)
+            }
+            foreach ($needle in @(
+                    "CREATE TABLE IF NOT EXISTS issue",
+                    "CREATE TABLE IF NOT EXISTS issue_ref",
+                    "CREATE TABLE IF NOT EXISTS report",
+                    "CREATE TABLE IF NOT EXISTS report_ref",
+                    "CREATE TABLE IF NOT EXISTS analysis_run",
+                    "CREATE TABLE IF NOT EXISTS db_target",
+                    "continue_phase",
+                    "continued_at",
+                    "autonomy_done",
+                    "supplement_attempted",
+                    "source TEXT NOT NULL DEFAULT 'baseline'",
+                    "incremental_design",
+                    "subject_kind IN"
+                )) {
+                if ($p7Ddl -notmatch [regex]::Escape($needle)) { throw "the P7 migrations are missing $needle" }
+            }
+            foreach ($relative in @(
+                    "backend\internal\delivery\domain",
+                    "backend\internal\delivery\application",
+                    "backend\internal\delivery\infrastructure",
+                    "backend\internal\delivery\interfaces\httpapi",
+                    "frontend\src\features\delivery",
+                    "scripts\fake-llm.p7.test.cjs",
+                    "scripts\e2e.ps1"
+                )) {
+                if (-not (Test-Path -LiteralPath (Join-Path $repoRoot $relative))) { throw "missing P7 deliverable $relative" }
+            }
+            Write-Host "P7 migration/deliverables OK: 8 appended migrations in order, delivery/frontend/scripts delivered; issue/report/analysis/db_target tables and the continuing/autonomy/supplement columns exist."
+        })
+
+    [void](Invoke-Check -Dod "P7-6" -CheckName "P7 OpenAPI paths" -Body {
+            $openapi = Get-Content -LiteralPath (Join-Path $repoRoot "docs\openapi\api.yaml") -Raw
+            $p7Paths = @(
+                "/api/versions/{id}/changes:",
+                "/api/versions/{id}/issues:",
+                "/api/versions/{id}/issues/{issueId}:",
+                "/api/issues:",
+                "/api/versions/{id}/reports:",
+                "/api/versions/{id}/reports/{reportId}:",
+                "/api/versions/{id}/reports/{reportId}/publish:",
+                "/api/versions/{id}/reports/{reportId}/regenerate:",
+                "/api/versions/{id}/reports/{reportId}/export:",
+                "/api/versions/{id}/reports/{reportId}/diff:",
+                "/api/reports:",
+                "/api/versions/{id}/batches/{batchId}/analysis:",
+                "/api/versions/{id}/batches/{batchId}/analysis/{analysisId}:",
+                "/api/versions/{versionId}/mindmap/incremental-plan:",
+                "/api/versions/{versionId}/mindmap/nodes/{nodeId}/supplement:",
+                "/api/resources/environments/{id}/db-target:",
+                "/api/resources/environments/{id}/db-target/test:"
+            )
+            foreach ($needle in $p7Paths) {
+                if ($openapi -notmatch [regex]::Escape($needle)) { throw "docs/openapi/api.yaml is missing P7 path $needle" }
+            }
+            $pathsSection = [regex]::Match($openapi, '(?ms)^paths:\r?\n(.*?)^components:')
+            if (-not $pathsSection.Success) { throw "docs/openapi/api.yaml has no paths section" }
+            $pathCount = @([regex]::Matches($pathsSection.Groups[1].Value, '(?m)^  /api/[^:]+:')).Count
+            if ($pathCount -lt 151) { throw "docs/openapi/api.yaml has $pathCount /api paths; expected at least 151 (134 P0-P6 /api paths + 17 P7; the separate /healthz path is excluded)" }
+            Write-Host "P7 OpenAPI paths OK: 17 P7 paths, $pathCount /api paths (plus the separate /healthz path)."
+        })
+
+    [void](Invoke-Check -Dod "P7-6" -CheckName "P7 OpenAPI schemas" -Body {
+            $openapi = Get-Content -LiteralPath (Join-Path $repoRoot "docs\openapi\api.yaml") -Raw
+            $schemasSection = [regex]::Match($openapi, '(?ms)^  schemas:\r?\n(.*)\z')
+            if (-not $schemasSection.Success) { throw "docs/openapi/api.yaml has no schemas section" }
+            $schemaCount = @([regex]::Matches($schemasSection.Groups[1].Value, '(?m)^    [A-Za-z][A-Za-z0-9_]*:\r?$')).Count
+            if ($schemaCount -lt 371) { throw "docs/openapi/api.yaml has $schemaCount schemas; expected at least 371 (306 P0-P6 + 65 P7)" }
+            foreach ($schema in @(
+                    "BatchKind", "CaseSource", "IssueView", "IssueDetailView", "IssueCreateRequest", "IssuePatchRequest",
+                    "GlobalIssueView", "ReportView", "ReportDetailView", "ReportContent", "ReportDiff",
+                    "GlobalReportView", "AnalysisView", "StartAnalysisRunRequest", "IncrementalPlanView",
+                    "SupplementDecisionRequest", "DbTargetView", "DbTargetUpsertRequest", "DbTargetTestRequest",
+                    "DbTargetTestResult", "VersionChange"
+                )) {
+                if ($openapi -notmatch ("(?m)^    " + [regex]::Escape($schema) + ":\r?$")) {
+                    throw "docs/openapi/api.yaml is missing the P7 schema $schema"
+                }
+            }
+            Write-Host "P7 OpenAPI schemas OK: $schemaCount schemas, including the issue/report/analysis/plan/db-target DTOs."
+        })
+
+    [void](Invoke-Check -Dod "P7-6" -CheckName "P7 OpenAPI events" -Body {
+            $openapi = Get-Content -LiteralPath (Join-Path $repoRoot "docs\openapi\api.yaml") -Raw
+            $p7Events = @(
+                "case.supplemented", "case.revalidation_marked", "issue.created", "issue.updated",
+                "report.published", "report.stale", "analysis.started", "analysis.finished"
+            )
+            $eventCatalog = [regex]::Match($openapi, '(?ms)^    VersionEventType:\r?\n.*?(?=^    [A-Za-z]|\z)')
+            if (-not $eventCatalog.Success) { throw "docs/openapi/api.yaml has no VersionEventType catalog" }
+            foreach ($eventType in $p7Events) {
+                if ($eventCatalog.Value -notmatch ('(?m)^\s+- ' + [regex]::Escape($eventType) + '\s*$')) {
+                    throw "docs/openapi/api.yaml VersionEventType is missing P7 event $eventType"
+                }
+            }
+            $eventCount = @([regex]::Matches($eventCatalog.Value, '(?m)^\s+- ')).Count
+            if ($eventCount -lt 54) { throw "VersionEventType has $eventCount entries; expected at least 54 (46 P0-P6 + 8 P7)" }
+            Write-Host "P7 OpenAPI events OK: 8 P7 event types appended ($eventCount catalog entries)."
+        })
+
+    [void](Invoke-Check -Dod "P7-6" -CheckName "P7 OpenAPI reasons" -Body {
+            $openapi = Get-Content -LiteralPath (Join-Path $repoRoot "docs\openapi\api.yaml") -Raw
+            $p7ReasonNeedles = @(
+                "version_not_continuable", "continuing_batch_conflict", "no_incremental_cases", "invalid_case_ids",
+                "baseline_changed", "run_in_progress", "supplement_batch_automatic", "supplement_limit_reached",
+                "analysis_active", "analysis_not_applicable", "issue_state_conflict", "issue_dismiss_reason_required",
+                "issue_ref_invalid", "report_not_publishable", "report_export_failed", "report_stale",
+                "invalid_base_commit", "db_target_invalid", "db_target_missing", "db_connection_failed",
+                "db_query_failed", "db_readonly_violation", "db_result_truncated", "db_expected_invalid",
+                "unsupported_subject_kind", "autonomy_pending", "invalid_parent_batch", "invalid_batch_kind",
+                "supplement_unavailable", "batch_not_found", "invalid_decision"
+            )
+            $reasonCatalog = [regex]::Match($openapi, '(?ms)^    ExecutionErrorReason:\r?\n.*?(?=^    [A-Za-z]|\z)')
+            if (-not $reasonCatalog.Success) { throw "docs/openapi/api.yaml has no ExecutionErrorReason catalog" }
+            foreach ($reason in $p7ReasonNeedles) {
+                if ($reasonCatalog.Value -notmatch ('(?m)^\s+- ' + [regex]::Escape($reason) + '\s*$')) {
+                    throw "docs/openapi/api.yaml ExecutionErrorReason is missing P7 reason $reason"
+                }
+            }
+            $reasonCount = @([regex]::Matches($reasonCatalog.Value, '(?m)^\s+- ')).Count
+            if ($reasonCount -lt 59) { throw "ExecutionErrorReason has $reasonCount entries; expected at least 59 (20 P6 + 39 P7)" }
+            $mindmapReasons = [regex]::Match($openapi, '(?ms)^    MindmapErrorReason:\r?\n.*?(?=^    [A-Za-z]|\z)')
+            if (-not $mindmapReasons.Success) { throw "docs/openapi/api.yaml has no MindmapErrorReason catalog" }
+            foreach ($reason in @("invalid_batch_id", "invalid_decision", "case_status_conflict", "duplicate_supplement", "invalid_supplement_case")) {
+                if ($mindmapReasons.Value -notmatch ('(?m)^\s+- ' + [regex]::Escape($reason) + '\s*$')) {
+                    throw "docs/openapi/api.yaml MindmapErrorReason is missing P7 reason $reason"
+                }
+            }
+            Write-Host "P7 OpenAPI reasons OK: 31 spec/implementation needles, $reasonCount ExecutionErrorReason entries; mindmap P7 reasons reconciled."
+        })
+
+    [void](Invoke-Check -Dod "P7-2" -CheckName "P7 version continuing contract" -Body {
+            $openapi = Get-Content -LiteralPath (Join-Path $repoRoot "docs\openapi\api.yaml") -Raw
+            $versionBlock = [regex]::Match($openapi, '(?ms)^    Version:\r?\n.*?(?=^    VersionEnvelope:)')
+            if (-not $versionBlock.Success) { throw "docs/openapi/api.yaml has no Version schema" }
+            foreach ($field in @("continuePhase", "continuedAt", "paused", "pause_mode", "batch_no")) {
+                if ($versionBlock.Value -notmatch [regex]::Escape($field + ":")) { throw "the Version schema is missing $field" }
+            }
+            $versionChanges = [regex]::Match($openapi, '(?ms)^    VersionChange:\r?\n.*?(?=^    VersionChanges:)')
+            if (-not $versionChanges.Success) { throw "docs/openapi/api.yaml has no VersionChange schema" }
+            foreach ($kind in @("requirement_added", "batch_finished", "report_published", "issue_created", "code_changed")) {
+                if ($openapi -notmatch ('(?m)^    VersionChangeKind:[\s\S]*?^\s+- ' + [regex]::Escape($kind) + '\s*$')) {
+                    throw "the VersionChangeKind enum is missing $kind"
+                }
+            }
+            $handler = [System.IO.File]::ReadAllText((Join-Path $backendDir "internal\version\interfaces\httpapi\handlers_versions.go"), [System.Text.Encoding]::UTF8)
+            if ($handler -notmatch [regex]::Escape('"GET /api/versions/{id}/changes"')) {
+                throw "the version handler does not register GET /api/versions/{id}/changes"
+            }
+            $dto = [System.IO.File]::ReadAllText((Join-Path $backendDir "internal\version\interfaces\httpapi\dto.go"), [System.Text.Encoding]::UTF8)
+            foreach ($needle in @('json:"continuePhase"', 'json:"continuedAt"', 'json:"batch_no"', 'json:"pause_mode"')) {
+                if ($dto -notmatch [regex]::Escape($needle)) { throw "the version DTO is missing $needle" }
+            }
+            $requirementService = [System.IO.File]::ReadAllText((Join-Path $backendDir "internal\version\application\requirement_service.go"), [System.Text.Encoding]::UTF8)
+            if ($requirementService -notmatch [regex]::Escape("version_not_continuable") -or
+                $requirementService -notmatch [regex]::Escape("current.Status == domain.VersionArchived") -or
+                $requirementService -notmatch [regex]::Escape("versionNotContinuableError")) {
+                throw "the version requirement service does not reject archived versions with version_not_continuable"
+            }
+            $httpHelpers = [System.IO.File]::ReadAllText((Join-Path $backendDir "internal\version\interfaces\httpapi\helpers.go"), [System.Text.Encoding]::UTF8)
+            if ($httpHelpers -notmatch [regex]::Escape("case domain.KindConflict, domain.KindDependency, domain.KindStateConflict:") -or
+                $httpHelpers -notmatch [regex]::Escape("status, code = http.StatusConflict, platform.CodeConflict")) {
+                throw "the version HTTP helpers do not map the continuing state conflict to 409"
+            }
+            $requirementPath = [regex]::Match($openapi, '(?ms)^  /api/versions/\{id\}/requirements:\r?\n.*?(?=^  /api/|^components:)')
+            if (-not $requirementPath.Success) { throw "docs/openapi/api.yaml has no /api/versions/{id}/requirements path" }
+            $requirementPost = [regex]::Match($requirementPath.Value, '(?ms)^    post:\r?\n(.*)')
+            if (-not $requirementPost.Success) { throw "the requirements path has no POST operation" }
+            if ($requirementPost.Value -notmatch "(?m)^        '409':" -or
+                $requirementPost.Value -notmatch [regex]::Escape("version_not_continuable") -or
+                $requirementPost.Value -notmatch [regex]::Escape("archived")) {
+                throw "POST /api/versions/{id}/requirements must document the archived-version 409 version_not_continuable response"
+            }
+            Write-Host "P7 continuing contract OK: /changes, continuePhase/continuedAt, snake_case P6 fields, the completed->continuing trigger and the archived 409 contract are wired."
+        })
+
+    [void](Invoke-Check -Dod "P7-3" -CheckName "P7 issue contract" -Body {
+            $openapi = Get-Content -LiteralPath (Join-Path $repoRoot "docs\openapi\api.yaml") -Raw
+            $issueView = [regex]::Match($openapi, '(?ms)^    IssueView:\r?\n.*?(?=^    IssueDetailView:)')
+            if (-not $issueView.Success) { throw "docs/openapi/api.yaml has no IssueView schema" }
+            foreach ($field in @("id", "versionId", "batchId", "caseRunId", "caseNodeId", "stepResultId", "source", "category", "severity", "status", "confidence", "failureClass", "title", "rerunSuggestion", "recurrenceCount", "revision", "refs", "codeRefs")) {
+                if ($issueView.Value -notmatch [regex]::Escape($field + ":")) { throw "IssueView is missing $field" }
+            }
+            if ($issueView.Value -match '(?m)^        description:') { throw "the IssueView list item must omit the description body (detail-only)" }
+            $issueDetail = [regex]::Match($openapi, '(?ms)^    IssueDetailView:\r?\n.*?(?=^    IssueCreateRequest:)')
+            if (-not $issueDetail.Success) { throw "docs/openapi/api.yaml has no IssueDetailView schema" }
+            foreach ($field in @("description", "reproSteps", "expected", "actual", "case", "requirement", "batch")) {
+                if ($issueDetail.Value -notmatch [regex]::Escape($field + ":")) { throw "IssueDetailView is missing $field" }
+            }
+            $handler = [System.IO.File]::ReadAllText((Join-Path $backendDir "internal\delivery\interfaces\httpapi\handlers_issue.go"), [System.Text.Encoding]::UTF8)
+            foreach ($route in @('"GET /api/versions/{id}/issues"', '"POST /api/versions/{id}/issues"', '"GET /api/versions/{id}/issues/{issueId}"', '"PATCH /api/versions/{id}/issues/{issueId}"')) {
+                if ($handler -notmatch [regex]::Escape($route)) { throw "handlers_issue.go does not register $route" }
+            }
+            $globalHandler = [System.IO.File]::ReadAllText((Join-Path $backendDir "internal\delivery\interfaces\httpapi\handlers_global.go"), [System.Text.Encoding]::UTF8)
+            foreach ($route in @('"GET /api/issues"', '"GET /api/reports"')) {
+                if ($globalHandler -notmatch [regex]::Escape($route)) { throw "handlers_global.go does not register $route" }
+            }
+            Write-Host "P7 issue contract OK: list/detail/create/patch, refs/codeRefs, global list and the three issue reasons are pinned."
+        })
+
+    [void](Invoke-Check -Dod "P7-3" -CheckName "P7 report contract" -Body {
+            $openapi = Get-Content -LiteralPath (Join-Path $repoRoot "docs\openapi\api.yaml") -Raw
+            $reportView = [regex]::Match($openapi, '(?ms)^    ReportView:\r?\n.*?(?=^    ReportDetailView:)')
+            if (-not $reportView.Success) { throw "docs/openapi/api.yaml has no ReportView schema" }
+            foreach ($field in @("revision", "status", "inputFingerprint", "markdown", "staleReason", "publishedAt")) {
+                if ($reportView.Value -notmatch [regex]::Escape($field + ":")) { throw "ReportView is missing $field" }
+            }
+            if ($reportView.Value -match [regex]::Escape("markdownPath")) { throw "ReportView must not expose the stored filesystem path" }
+            $reportDetail = [regex]::Match($openapi, '(?ms)^    ReportDetailView:\r?\n.*?(?=^    ReportContent:)')
+            if (-not $reportDetail.Success) { throw "docs/openapi/api.yaml has no ReportDetailView schema" }
+            if ($reportDetail.Value -notmatch 'batchNo:' -or $reportDetail.Value -notmatch 'batchKind:' -or $reportDetail.Value -notmatch 'content:') {
+                throw "ReportDetailView is missing batchNo/batchKind/content"
+            }
+            $reportContent = [regex]::Match($openapi, '(?ms)^    ReportContent:\r?\n.*?(?=^    EnsureReportRequest:)')
+            if (-not $reportContent.Success) { throw "docs/openapi/api.yaml has no ReportContent schema" }
+            foreach ($field in @("eztest.report.v1", "summary", "cases", "requirements", "issues", "risks", "degraded", "appendix")) {
+                if ($reportContent.Value -notmatch [regex]::Escape($field)) { throw "ReportContent is missing $field" }
+            }
+            $regenerate = [regex]::Match($openapi, '(?ms)^  /api/versions/\{id\}/reports/\{reportId\}/regenerate:\r?\n.*?(?=^  /api/|^components:)')
+            if (-not $regenerate.Success -or $regenerate.Value -notmatch "'200':" -or $regenerate.Value -notmatch "'201':") {
+                throw "the regenerate path must document both 201 (new revision) and 200 (newer revision already exists)"
+            }
+            $export = [regex]::Match($openapi, '(?ms)^  /api/versions/\{id\}/reports/\{reportId\}/export:\r?\n.*?(?=^  /api/|^components:)')
+            if (-not $export.Success -or $export.Value -notmatch "X-Content-SHA256" -or $export.Value -notmatch "text/markdown") {
+                throw "the report export path must stream text/markdown with X-Content-SHA256"
+            }
+            foreach ($reason in @("report_not_publishable", "report_export_failed", "report_stale", "report_version_mismatch", "invalid_report_filter", "batch_not_found")) {
+                if ($openapi -notmatch [regex]::Escape($reason)) { throw "docs/openapi/api.yaml is missing report reason $reason" }
+            }
+            $handler = [System.IO.File]::ReadAllText((Join-Path $backendDir "internal\delivery\interfaces\httpapi\handlers_report.go"), [System.Text.Encoding]::UTF8)
+            foreach ($route in @('"GET /api/versions/{id}/reports"', '"POST /api/versions/{id}/reports"', '"POST /api/versions/{id}/reports/{reportId}/regenerate"', '"GET /api/versions/{id}/reports/{reportId}/export"', '"GET /api/versions/{id}/reports/{reportId}/diff"')) {
+                if ($handler -notmatch [regex]::Escape($route)) { throw "handlers_report.go does not register $route" }
+            }
+            Write-Host "P7 report contract OK: list/detail/ensure/publish/regenerate(200+201)/export/diff, content snapshot, reasons and no stored path."
+        })
+
+    [void](Invoke-Check -Dod "P7-3" -CheckName "P7 analysis contract" -Body {
+            $openapi = Get-Content -LiteralPath (Join-Path $repoRoot "docs\openapi\api.yaml") -Raw
+            $analysisView = [regex]::Match($openapi, '(?ms)^    AnalysisView:\r?\n.*?(?=^    StartAnalysisRunRequest:)')
+            if (-not $analysisView.Success) { throw "docs/openapi/api.yaml has no AnalysisView schema" }
+            foreach ($field in @("versionId", "batchId", "kind", "status", "model", "promptVersion", "result", "stats", "errors", "startedAt", "finishedAt", "createdAt")) {
+                if ($analysisView.Value -notmatch [regex]::Escape($field + ":")) { throw "AnalysisView is missing $field" }
+            }
+            $listEnvelope = [regex]::Match($openapi, '(?ms)^    AnalysisListEnvelope:\r?\n.*?(?=^    IncrementalPlanRun:)')
+            if (-not $listEnvelope.Success -or $listEnvelope.Value -notmatch "type:\s*array") {
+                throw "AnalysisListEnvelope must carry the runs as a data array (the endpoint is not paginated)"
+            }
+            foreach ($reason in @("analysis_active", "analysis_not_applicable", "batch_not_found")) {
+                if ($openapi -notmatch [regex]::Escape($reason)) { throw "docs/openapi/api.yaml is missing analysis reason $reason" }
+            }
+            $analysisPath = [regex]::Match($openapi, '(?ms)^  /api/versions/\{id\}/batches/\{batchId\}/analysis:\r?\n.*?(?=^  /api/|^components:)')
+            if (-not $analysisPath.Success) { throw "docs/openapi/api.yaml has no batch analysis path" }
+            $analysisPost = [regex]::Match($analysisPath.Value, '(?ms)^    post:\r?\n(.*)')
+            if (-not $analysisPost.Success -or $analysisPost.Value -notmatch "(?m)^        '202':") {
+                throw "the analysis start POST must document the 202 queued response"
+            }
+            $handler = [System.IO.File]::ReadAllText((Join-Path $backendDir "internal\delivery\interfaces\httpapi\handlers_analysis.go"), [System.Text.Encoding]::UTF8)
+            foreach ($route in @('"GET /api/versions/{id}/batches/{batchId}/analysis"', '"GET /api/versions/{id}/batches/{batchId}/analysis/{analysisId}"', '"POST /api/versions/{id}/batches/{batchId}/analysis"')) {
+                if ($handler -notmatch [regex]::Escape($route)) { throw "handlers_analysis.go does not register $route" }
+            }
+            Write-Host "P7 analysis contract OK: list/detail/manual failure retry, AnalysisView, 409 reasons and the 202 start are pinned."
+        })
+
+    [void](Invoke-Check -Dod "P7-3" -CheckName "P7 global centres contract" -Body {
+            $openapi = Get-Content -LiteralPath (Join-Path $repoRoot "docs\openapi\api.yaml") -Raw
+            foreach ($path in @("/api/issues:", "/api/reports:")) {
+                $block = [regex]::Match($openapi, ('(?ms)^  ' + [regex]::Escape($path) + '\r?\n.*?(?=^  /api/|^components:)'))
+                if (-not $block.Success) { throw "docs/openapi/api.yaml is missing global path $path" }
+                if ($block.Value -notmatch '(?m)^    get:' -or $block.Value -match '(?m)^    (post|patch|put|delete):') {
+                    throw "the global centre $path must be read-only (GET only)"
+                }
+            }
+            $globalIssue = [regex]::Match($openapi, '(?ms)^    GlobalIssueView:\r?\n.*?(?=^    IssueDetailEnvelope:)')
+            if (-not $globalIssue.Success -or $globalIssue.Value -notmatch "versionName:" -or $globalIssue.Value -notmatch "deepLink:") {
+                throw "GlobalIssueView must add versionName and deepLink"
+            }
+            $globalReport = [regex]::Match($openapi, '(?ms)^    GlobalReportView:\r?\n.*?(?=^    ReportDetailEnvelope:)')
+            if (-not $globalReport.Success -or $globalReport.Value -notmatch "versionName:" -or $globalReport.Value -notmatch "deepLink:") {
+                throw "GlobalReportView must add versionName and deepLink"
+            }
+            if ($openapi -notmatch [regex]::Escape("tab:") -or $openapi -notmatch "IssueDeepLink:" -or $openapi -notmatch "ReportDeepLink:") {
+                throw "the global deep-link schemas are missing"
+            }
+            Write-Host "P7 global centres OK: read-only /api/issues and /api/reports with versionName and deep-link fields."
+        })
+
+    [void](Invoke-Check -Dod "P7-2" -CheckName "P7 execution batch/source contract" -Body {
+            $openapi = Get-Content -LiteralPath (Join-Path $repoRoot "docs\openapi\api.yaml") -Raw
+            $batch = [regex]::Match($openapi, '(?ms)^    Batch:\r?\n.*?(?=^    BatchEnvelope:)')
+            if (-not $batch.Success) { throw "docs/openapi/api.yaml has no Batch schema" }
+            foreach ($field in @("kind", "parentBatchId", "graphHash", "baseFallbackReason", "batch_no", "pause_mode")) {
+                if ($batch.Value -notmatch [regex]::Escape($field + ":")) { throw "the Batch schema is missing $field" }
+            }
+            $createBatch = [regex]::Match($openapi, '(?ms)^    CreateBatchRequest:\r?\n.*?(?=^    PauseBatchRequest:)')
+            if (-not $createBatch.Success -or $createBatch.Value -notmatch "kind:" -or $createBatch.Value -notmatch "parentBatchId:") {
+                throw "CreateBatchRequest must accept kind and parentBatchId"
+            }
+            $caseRun = [regex]::Match($openapi, '(?ms)^    CaseRun:\r?\n.*?(?=^    CaseRunList:)')
+            if (-not $caseRun.Success -or $caseRun.Value -notmatch '(?m)^        source:') {
+                throw "the CaseRun schema must carry the P7 source field"
+            }
+            $evidenceKind = [regex]::Match($openapi, '(?ms)^    EvidenceKind:\r?\n.*?(?=^    AuthFlowKind:)')
+            if (-not $evidenceKind.Success -or $evidenceKind.Value -notmatch "db_result") {
+                throw "EvidenceKind must include db_result"
+            }
+            $dto = [System.IO.File]::ReadAllText((Join-Path $backendDir "internal\execution\interfaces\httpapi\dto.go"), [System.Text.Encoding]::UTF8)
+            foreach ($needle in @('json:"kind"', 'json:"parentBatchId,string"', 'json:"graphHash"', 'json:"baseFallbackReason"', 'json:"source"')) {
+                if ($dto -notmatch [regex]::Escape($needle)) { throw "the execution DTO is missing $needle" }
+            }
+            foreach ($reason in @("autonomy_pending", "invalid_parent_batch", "invalid_batch_kind", "supplement_unavailable")) {
+                if ($openapi -notmatch [regex]::Escape($reason)) { throw "docs/openapi/api.yaml is missing the T7 reason $reason" }
+            }
+            Write-Host "P7 execution contract OK: batch kind/parent/graphHash/baseFallback, case-run source, db_result evidence and the four T7 gate reasons."
+        })
+
+    [void](Invoke-Check -Dod "P7-2" -CheckName "P7 mindmap plan/decision contract" -Body {
+            $openapi = Get-Content -LiteralPath (Join-Path $repoRoot "docs\openapi\api.yaml") -Raw
+            $runKind = [regex]::Match($openapi, '(?ms)^    RunKind:\r?\n.*?(?=^    RunStatus:)')
+            if (-not $runKind.Success -or $runKind.Value -notmatch "supplement" -or $runKind.Value -notmatch "incremental_design") {
+                throw "RunKind must add supplement and incremental_design"
+            }
+            $plan = [regex]::Match($openapi, '(?ms)^    IncrementalPlanView:\r?\n.*?(?=^    IncrementalPlanEnvelope:)')
+            if (-not $plan.Success) { throw "docs/openapi/api.yaml has no IncrementalPlanView schema" }
+            foreach ($field in @("versionId", "phase", "parentBatchId", "run", "newCases", "affectedCases", "unmappedChanges", "defaultCaseIds", "warnings", "degraded")) {
+                if ($plan.Value -notmatch [regex]::Escape($field + ":")) { throw "IncrementalPlanView is missing $field" }
+            }
+            $decision = [regex]::Match($openapi, '(?ms)^    SupplementDecisionRequest:\r?\n.*?(?=^    SupplementDecisionView:)')
+            if (-not $decision.Success -or $decision.Value -notmatch "accept" -or $decision.Value -notmatch "reject") {
+                throw "SupplementDecisionRequest must accept accept/reject"
+            }
+            $routes = [System.IO.File]::ReadAllText((Join-Path $backendDir "internal\mindmap\interfaces\httpapi\routes.go"), [System.Text.Encoding]::UTF8)
+            foreach ($route in @('"/incremental-plan"', '"/nodes/{nodeId}/supplement"', '"/runs"')) {
+                if ($routes -notmatch [regex]::Escape($route)) { throw "the mindmap routes are missing $route" }
+            }
+            foreach ($reason in @("invalid_batch_id", "invalid_decision", "case_status_conflict", "duplicate_supplement", "invalid_supplement_case")) {
+                if ($openapi -notmatch [regex]::Escape($reason)) { throw "docs/openapi/api.yaml is missing mindmap reason $reason" }
+            }
+            Write-Host "P7 mindmap contract OK: two new run kinds, incremental plan, accept/reject decision and the P7 mindmap reasons."
+        })
+
+    [void](Invoke-Check -Dod "P7-4" -CheckName "P7 db-target contract" -Body {
+            $openapi = Get-Content -LiteralPath (Join-Path $repoRoot "docs\openapi\api.yaml") -Raw
+            $view = [regex]::Match($openapi, '(?ms)^    DbTargetView:\r?\n.*?(?=^    DbTargetUpsertRequest:)')
+            if (-not $view.Success) { throw "docs/openapi/api.yaml has no DbTargetView schema" }
+            foreach ($field in @("environmentId", "host", "port", "database", "username", "credentialSet", "sslmode", "connectTimeoutMs", "statementTimeoutMs", "maxRows", "enabled")) {
+                if ($view.Value -notmatch [regex]::Escape($field + ":")) { throw "DbTargetView is missing $field" }
+            }
+            if ($view.Value -match '(?m)^        password:') { throw "DbTargetView must never expose the password" }
+            $upsert = [regex]::Match($openapi, '(?ms)^    DbTargetUpsertRequest:\r?\n.*?(?=^    DbTargetTestRequest:)')
+            if (-not $upsert.Success -or $upsert.Value -notmatch "password:") { throw "DbTargetUpsertRequest must accept the write-only password" }
+            foreach ($reason in @("db_target_invalid", "db_target_missing", "db_connection_failed", "db_query_failed", "db_readonly_violation", "db_result_truncated", "db_expected_invalid")) {
+                if ($openapi -notmatch [regex]::Escape($reason)) { throw "docs/openapi/api.yaml is missing db reason $reason" }
+            }
+            $handler = [System.IO.File]::ReadAllText((Join-Path $backendDir "internal\resource\interfaces\httpapi\handlers_db_target.go"), [System.Text.Encoding]::UTF8)
+            foreach ($route in @('"GET /api/resources/environments/{id}/db-target"', '"PUT /api/resources/environments/{id}/db-target"', '"DELETE /api/resources/environments/{id}/db-target"', '"POST /api/resources/environments/{id}/db-target/test"')) {
+                if ($handler -notmatch [regex]::Escape($route)) { throw "handlers_db_target.go does not register $route" }
+                if ($handler -notmatch [regex]::Escape($route + ", guard(http.HandlerFunc(")) {
+                    throw "handlers_db_target.go does not wrap $route in the admin guard"
+                }
+            }
+            $resourceRoutes = [System.IO.File]::ReadAllText((Join-Path $backendDir "internal\resource\interfaces\httpapi\routes.go"), [System.Text.Encoding]::UTF8)
+            if ($resourceRoutes -notmatch [regex]::Escape("h.DBTarget.RegisterRoutes(mux, adminGuard)")) {
+                throw "the db-target routes are not mounted behind the identity admin guard"
+            }
+            $server = [System.IO.File]::ReadAllText((Join-Path $backendDir "internal\server\server.go"), [System.Text.Encoding]::UTF8)
+            if ($server -notmatch [regex]::Escape("resourcehttp.RegisterRoutes(mux, *deps.Resources, resourceGuard)") -or
+                $server -notmatch [regex]::Escape("identityhttp.RequireAdmin(auditRequestContext(next))")) {
+                throw "server.go does not pass the identity RequireAdmin guard to the resource routes"
+            }
+            foreach ($path in @("/api/resources/environments/{id}/db-target:", "/api/resources/environments/{id}/db-target/test:")) {
+                $block = [regex]::Match($openapi, ('(?ms)^  ' + [regex]::Escape($path) + '\r?\n.*?(?=^  /api/|^components:)'))
+                if (-not $block.Success -or $block.Value -notmatch "(?m)^        '403':" -or $block.Value -notmatch "Administrator only") {
+                    throw "the db-target path $path must document the admin-only 403 contract"
+                }
+            }
+            Write-Host "P7 db-target contract OK: admin-guarded CRUD/test with documented 403, credentialSet without password, and the classified db reasons."
+        })
+
+    [void](Invoke-Check -Dod "P7-6" -CheckName "P7 codeintel contract" -Body {
+            $openapi = Get-Content -LiteralPath (Join-Path $repoRoot "docs\openapi\api.yaml") -Raw
+            $anchorKind = [regex]::Match($openapi, '(?ms)^    AnchorSubjectKind:\r?\n.*?(?=^    Anchor:)')
+            if (-not $anchorKind.Success -or $anchorKind.Value -notmatch 'enum: \[version, requirement, app_model, case, issue\]') {
+                throw "AnchorSubjectKind must include issue in its enum"
+            }
+            $startAnalysis = [regex]::Match($openapi, '(?ms)^    StartAnalysisRequest:\r?\n.*?(?=^    StartAnalysisResult:)')
+            if (-not $startAnalysis.Success -or $startAnalysis.Value -notmatch "baseCommit:") {
+                throw "StartAnalysisRequest must accept an optional baseCommit"
+            }
+            $analysis = [regex]::Match($openapi, '(?ms)^    Analysis:\r?\n.*?(?=^    AnalysisEnvelope:)')
+            if (-not $analysis.Success -or $analysis.Value -notmatch "baseCommit:") {
+                throw "the P4 Analysis DTO must carry baseCommit"
+            }
+            $domain = [System.IO.File]::ReadAllText((Join-Path $backendDir "internal\codeintel\domain\anchor.go"), [System.Text.Encoding]::UTF8)
+            if ($domain -notmatch [regex]::Escape('SubjectIssue       = "issue"')) {
+                throw "the codeintel domain does not define SubjectIssue=issue"
+            }
+            $dto = [System.IO.File]::ReadAllText((Join-Path $backendDir "internal\codeintel\interfaces\httpapi\dto.go"), [System.Text.Encoding]::UTF8)
+            if ($dto -notmatch [regex]::Escape('BaseCommit string') -or $dto -notmatch [regex]::Escape('`json:"baseCommit"`')) {
+                throw "the codeintel start-analysis request does not carry baseCommit"
+            }
+            if ($openapi -notmatch [regex]::Escape("invalid_base_commit")) {
+                throw "docs/openapi/api.yaml is missing invalid_base_commit"
+            }
+            Write-Host "P7 codeintel contract OK: issue anchor subject, explicit baseCommit request/DTO and invalid_base_commit are pinned."
+        })
+
+    [void](Invoke-Check -Dod "P7-6" -CheckName "P7 navigation phase" -Body {
+            $navPath = Join-Path $frontendDir "src\navigation\nav-items.ts"
+            if (-not (Test-Path -LiteralPath $navPath)) { throw "frontend/src/navigation/nav-items.ts is missing" }
+            $nav = [System.IO.File]::ReadAllText($navPath, [System.Text.Encoding]::UTF8)
+            foreach ($route in @("/issues", "/reports")) {
+                if ($nav -notmatch ('(?s)href: "' + [regex]::Escape($route) + '".{0,240}phase: "P7"')) {
+                    throw "nav-items.ts must expose $route as a P7 navigation entry"
+                }
+            }
+            foreach ($page in @("issues\page.tsx", "reports\page.tsx")) {
+                $pagePath = Join-Path $frontendDir ("src\app\(app)\" + $page)
+                if (-not (Test-Path -LiteralPath $pagePath)) { throw "the P7 app route page is missing: $page" }
+            }
+            Write-Host "P7 navigation OK: /issues and /reports are P7 entries backed by real pages (no placeholder)."
+        })
+
+    [void](Invoke-Check -Dod "P7-1,P7-2,P7-3" -CheckName "P7 frontend testids" -Body {
+            $sourceFiles = @(Get-ChildItem -LiteralPath (Join-Path $frontendDir "src") -Recurse -File | Where-Object {
+                    ($_.Extension -eq ".tsx" -or $_.Extension -eq ".ts") -and $_.Name -notmatch '\.test\.'
+                })
+            if ($sourceFiles.Count -lt 50) { throw "frontend/src production sources are missing ($($sourceFiles.Count) files)" }
+            $frontendText = ($sourceFiles | ForEach-Object { [System.IO.File]::ReadAllText($_.FullName, [System.Text.Encoding]::UTF8) }) -join "`n"
+            $testids = @(
+                "continuing-badge", "continuing-banner", "continue-phase-label", "add-requirement-btn",
+                "incremental-plan", "incremental-plan-new-case", "incremental-plan-affected-case", "incremental-plan-create-batch", "incremental-plan-warning",
+                "issues-tab", "issue-row-", "issue-detail", "issue-confirm-btn", "issue-dismiss-btn", "issue-dismiss-dialog",
+                "issue-code-ref", "issue-evidence-link", "report-tab", "report-batch-selector", "report-revision-badge",
+                "report-stale-banner", "report-export-btn", "report-diff", "report-diff-base", "report-case-source",
+                "chain-issue-node-", "chain-supplement-badge", "chain-revalidation-badge", "overview-metrics",
+                "overview-batch-timeline", "db-target-form", "db-target-test-btn", "db-target-result",
+                "db-target-readonly-warning", "global-issues-page", "global-reports-page"
+            )
+            if ($testids.Count -ne 36) { throw "the P7 testid list must contain 36 spec §10.9 anchors, got $($testids.Count)" }
+            $missing = @()
+            foreach ($testid in $testids) {
+                # `incremental-plan` is a prefix of the other plan testids, so
+                # pin its exact attribute form instead of the bare token.
+                $needle = if ($testid -eq "incremental-plan") { 'data-testid="incremental-plan"' } else { $testid }
+                if ($frontendText -notmatch [regex]::Escape($needle)) { $missing += $testid }
+            }
+            if ($missing.Count -gt 0) { throw "frontend/src is missing P7 testids: $($missing -join ', ')" }
+            Write-Host "P7 testids OK: all $($testids.Count) spec §10.9 anchors exist in production frontend sources."
+        })
+
+    [void](Invoke-Check -Dod "P7-1,P7-2,P7-3,P7-4,P7-5" -CheckName "P7 fake LLM contract" -Body {
+            $fakePath = Join-Path $scriptsDir "fake-llm.cjs"
+            if (-not (Test-Path -LiteralPath $fakePath)) { throw "scripts/fake-llm.cjs is missing" }
+            $fakeLlm = [System.IO.File]::ReadAllText($fakePath, [System.Text.Encoding]::UTF8)
+            foreach ($needle in @("__p7-mode", "planP7Turn", "execution_db_assert", "supplement_case_propose", "triage_issue_draft", "EzTest 的补全 Agent", "EzTest 的失败分析 Agent", "EzTest 的问题整理 Agent")) {
+                if ($fakeLlm -notmatch [regex]::Escape($needle)) { throw "scripts/fake-llm.cjs is missing the P7 marker $needle" }
+            }
+            $p7TestPath = Join-Path $scriptsDir "fake-llm.p7.test.cjs"
+            if (-not (Test-Path -LiteralPath $p7TestPath)) { throw "scripts/fake-llm.p7.test.cjs is missing" }
+            Invoke-LoggedCommand -Exe $nodeExe `
+                -Arguments @("scripts/fake-llm.p7.test.cjs") `
+                -WorkingDirectory $repoRoot `
+                -LogPath (Join-Path $tmpDir "acceptance-fake-llm-p7.log") `
+                -Label "node scripts/fake-llm.p7.test.cjs" `
+                -SuccessTailLines 8
+            Write-Host "P7 fake LLM contract OK: __p7-mode, supplement/failure/triage markers and the execution_db_assert branch pass the P7 contract test."
+        })
+
+    [void](Invoke-Check -Dod "P7-4" -CheckName "P7 db assertion static" -Body {
+            foreach ($relative in @(
+                    "backend\internal\execution\application\db_assert.go",
+                    "backend\internal\execution\application\agent_tool\db_assert.go",
+                    "backend\internal\execution\infrastructure\resource\db_query.go"
+                )) {
+                if (-not (Test-Path -LiteralPath (Join-Path $repoRoot $relative))) { throw "missing P7 db-assertion implementation $relative" }
+            }
+            $tool = [System.IO.File]::ReadAllText((Join-Path $backendDir "internal\execution\application\agent_tool\db_assert.go"), [System.Text.Encoding]::UTF8)
+            if ($tool -notmatch [regex]::Escape("execution.db_assert")) { throw "the execution agent tool registry does not expose execution.db_assert" }
+            $runner = [System.IO.File]::ReadAllText((Join-Path $backendDir "internal\execution\application\case_runner.go"), [System.Text.Encoding]::UTF8)
+            foreach ($reason in @("db_connection_failed", "db_target_missing", "db_readonly_violation", "db_result_truncated", "db_expected_invalid")) {
+                if ($runner -notmatch [regex]::Escape($reason)) { throw "case_runner.go does not classify $reason" }
+            }
+            $application = [System.IO.File]::ReadAllText((Join-Path $backendDir "internal\execution\application\db_assert.go"), [System.Text.Encoding]::UTF8)
+            foreach ($needle in @("blocked(environment)", "inconclusive(case)", "db_result")) {
+                if ($application -notmatch [regex]::Escape($needle)) { throw "db_assert.go is missing the prescribed classification hint $needle" }
+            }
+            $fakeLlm = [System.IO.File]::ReadAllText((Join-Path $scriptsDir "fake-llm.cjs"), [System.Text.Encoding]::UTF8)
+            if ($fakeLlm -notmatch [regex]::Escape("execution_db_assert")) { throw "the fake LLM has no db-assertion execution path" }
+            Write-Host "P7 db assertion OK: execution.db_assert is the only db path, read-only/truncation/expected errors map to inconclusive(case), connection/target failures to blocked(environment); the P6 static SKIP is removed."
+        })
+
+    [void](Invoke-Check -Dod "P6-8" -CheckName "P6 regression contract" -Body {
+            $openapi = Get-Content -LiteralPath (Join-Path $repoRoot "docs\openapi\api.yaml") -Raw
+            $p6Paths = @(
+                "/api/versions/{id}/batches:",
+                "/api/versions/{id}/batches/{batchId}:",
+                "/api/versions/{id}/batches/{batchId}/pause:",
+                "/api/versions/{id}/batches/{batchId}/resume:",
+                "/api/versions/{id}/batches/{batchId}/cancel:",
+                "/api/versions/{id}/batches/{batchId}/case-runs:",
+                "/api/versions/{id}/batches/{batchId}/case-runs/{caseRunId}:",
+                "/api/versions/{id}/batches/{batchId}/case-runs/{caseRunId}/rerun:",
+                "/api/versions/{id}/batches/{batchId}/report:",
+                "/api/versions/{id}/batches/{batchId}/report/export:",
+                "/api/versions/{id}/evidence/{evidenceId}:",
+                "/api/versions/{id}/evidence/{evidenceId}/meta:",
+                "/api/versions/{id}/execution/sessions:",
+                "/api/resources/auth-flows:",
+                "/api/resources/auth-flows/{id}:"
+            )
+            foreach ($needle in $p6Paths) {
+                if ($openapi -notmatch [regex]::Escape($needle)) { throw "P6 regression: docs/openapi/api.yaml is missing P6 path $needle" }
+            }
+            $p6Events = @(
+                "batch.created", "batch.started", "batch.paused", "batch.resumed", "batch.finished",
+                "run.started", "run.paused", "run.resumed", "run.finished", "step.started", "step.finished",
+                "evidence.created", "case.status_changed", "human.requested", "gate.pending", "gate.resolved"
+            )
+            $eventCatalog = [regex]::Match($openapi, '(?ms)^    VersionEventType:\r?\n.*?(?=^    [A-Za-z]|\z)')
+            foreach ($eventType in $p6Events) {
+                if ($eventCatalog.Value -notmatch ('(?m)^\s+- ' + [regex]::Escape($eventType) + '\s*$')) {
+                    throw "P6 regression: VersionEventType lost $eventType"
+                }
+            }
+            $p6Reasons = @(
+                "version_not_executable", "baseline_required", "baseline_changed", "batch_active", "no_cases",
+                "too_many_cases", "invalid_case_ids", "environment_required", "batch_finished", "already_paused",
+                "not_paused", "invalid_pause_mode", "case_run_terminal", "evidence_missing", "executor_unavailable",
+                "session_unavailable", "unsupported_assertion_kind", "export_failed", "auth_flow_invalid", "takeover_required"
+            )
+            $reasonCatalog = [regex]::Match($openapi, '(?ms)^    ExecutionErrorReason:\r?\n.*?(?=^    [A-Za-z]|\z)')
+            foreach ($reason in $p6Reasons) {
+                if ($reasonCatalog.Value -notmatch ('(?m)^\s+- ' + [regex]::Escape($reason) + '\s*$')) {
+                    throw "P6 regression: ExecutionErrorReason lost $reason"
+                }
+            }
+            if (-not (Test-Path -LiteralPath (Join-Path $scriptsDir "fake-llm.p6.test.cjs"))) { throw "P6 regression: scripts/fake-llm.p6.test.cjs is missing" }
+            Invoke-LoggedCommand -Exe $nodeExe `
+                -Arguments @("scripts/fake-llm.p6.test.cjs") `
+                -WorkingDirectory $repoRoot `
+                -LogPath (Join-Path $tmpDir "acceptance-fake-llm-p6.log") `
+                -Label "node scripts/fake-llm.p6.test.cjs" `
+                -SuccessTailLines 8
+            Write-Host "P6 regression OK: 15 P6 paths, 16 P6 events, 20 P6 reasons and the P6 fake-LLM contract still pass."
+        })
+
+    [void](Invoke-Check -Dod "P6-8" -CheckName "P6 DTO additivity" -Body {
+            $openapi = Get-Content -LiteralPath (Join-Path $repoRoot "docs\openapi\api.yaml") -Raw
+            $batchReport = [regex]::Match($openapi, '(?ms)^    BatchReport:\r?\n.*?(?=^    BatchReportEnvelope:)')
+            if (-not $batchReport.Success) { throw "docs/openapi/api.yaml has no BatchReport schema" }
+            foreach ($field in @("case_count", "by_status", "by_failure_class", "flaky_case_ids", "evidence_count", "generated_at")) {
+                if ($batchReport.Value -notmatch [regex]::Escape($field)) { throw "P6 BatchReport lost $field" }
+            }
+            foreach ($p7Field in @("staleReason", "inputFingerprint", "codeRefs", "evidenceCount")) {
+                if ($batchReport.Value -match [regex]::Escape($p7Field)) {
+                    throw "P6 BatchReport must not absorb the P7 report field $p7Field"
+                }
+            }
+            $runBatchP6Fields = @("batch_no", "pause_mode", "pause_reason", "baseline_hash", "code_baseline_commit", "head_commit", "counts", "created_by", "failure_reason")
+            $batch = [regex]::Match($openapi, '(?ms)^    Batch:\r?\n.*?(?=^    BatchEnvelope:)')
+            foreach ($field in $runBatchP6Fields) {
+                if ($batch.Value -notmatch [regex]::Escape($field)) { throw "the P6 Batch DTO lost $field" }
+            }
+            Write-Host "P6 DTO additivity OK: P7 fields are additive on Batch/CaseRun and the P6 BatchReport DTO is unchanged."
+        })
+
+    [void](Invoke-Check -Dod "P7" -CheckName "P7 DoD mapping" -Body {
+            if (@($script:p7DodMapping).Count -lt 5) { throw "the P7 DoD mapping must cover at least 5 rows" }
+            foreach ($row in $script:p7DodMapping) {
+                if ([string]::IsNullOrWhiteSpace([string]$row.DoD) -or
+                    [string]::IsNullOrWhiteSpace([string]$row.Requirement) -or
+                    [string]::IsNullOrWhiteSpace([string]$row.Evidence)) {
+                    throw "P7 DoD row '$($row.DoD)' is missing its requirement/evidence mapping"
+                }
+            }
+        })
+
+    Add-CheckResult -Dod "P7" -CheckName "P7 real LLM acceptance" -Status "SKIPPED" `
+        -Detail "Gated: run scripts/acceptance-p7-llm.ps1 with EZTEST_RUN_REAL_LLM=1 (supplement, failure analysis/triage, continuing incremental, degraded; T28)."
+    Add-CheckResult -Dod "P7" -CheckName "P7 real DB acceptance" -Status "SKIPPED" `
+        -Detail "Gated: run scripts/acceptance-p7-db.ps1 against a local PostgreSQL read-only target and roles (T29, spec §12.8)."
+    Add-CheckResult -Dod "P7" -CheckName "P7 browser acceptance" -Status "SKIPPED" `
+        -Detail "Gated: Lead-run browser acceptance with screenshots per spec §12.9 (T32)."
+
     Add-CheckResult -Dod "risk" -CheckName "Compose container run" -Status "SKIPPED" `
         -Detail "No Docker on this host; Compose remains static-validation only (Task 15)."
     Add-CheckResult -Dod "4" -CheckName "Real LLM acceptance" -Status "SKIPPED" `
@@ -4150,7 +4799,7 @@ writeFileSync(process.argv[3], JSON.stringify({
     Add-CheckResult -Dod "P6" -CheckName "P6 real LLM acceptance" -Status "SKIPPED" `
         -Detail "Gated: run scripts/acceptance-execution-llm.ps1 with EZTEST_RUN_REAL_LLM=1 (real model executes 3 cases plus failure/pause/restart/report; fails closed when llm_* keys, executor or health are missing)."
 
-    Write-Step "P0-P6 DoD acceptance summary"
+    Write-Step "P0-P7 DoD acceptance summary"
     $table = $checkResults | Format-Table -AutoSize -Wrap | Out-String -Width 200
     Write-Host $table
 
@@ -4284,6 +4933,12 @@ writeFileSync(process.argv[3], JSON.stringify({
     Write-Step "P6 DoD mapping (spec §10.8)"
     $p6Table = @($script:p6DodMapping | ForEach-Object { [pscustomobject]$_ }) | Format-Table -AutoSize -Wrap | Out-String -Width 200
     Write-Host $p6Table
+
+    # P7 exit criteria (spec §13.1) mapped to the static checks above and the
+    # gated real-LLM/DB/browser scripts (T24/T25).
+    Write-Step "P7 DoD mapping (spec §13.1)"
+    $p7Table = @($script:p7DodMapping | ForEach-Object { [pscustomobject]$_ }) | Format-Table -AutoSize -Wrap | Out-String -Width 200
+    Write-Host $p7Table
 
     $failed = @($checkResults | Where-Object { $_.Result -eq "FAIL" })
     $passed = @($checkResults | Where-Object { $_.Result -eq "PASS" })
