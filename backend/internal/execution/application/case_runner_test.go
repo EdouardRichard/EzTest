@@ -210,6 +210,60 @@ func TestCaseRunnerHonorsPauseWhenAgentReadFails(t *testing.T) {
 	}
 }
 
+// TestDBAssertionFailureCodesKeepTheirClass pins the P7 db error mapping
+// (spec §5.7/§6.6.2) end to end inside the runner: the whitelist must recognize
+// every db tool code the classifier knows, and the resulting case-run status must
+// follow the verdict (a connection/target problem blocks, a SQL/read-only/
+// truncation/expected-value problem stays inconclusive(case)).
+func TestDBAssertionFailureCodesKeepTheirClass(t *testing.T) {
+	cases := []struct {
+		code        string
+		wantVerdict domain.Verdict
+		wantClass   domain.FailureClass
+		wantStatus  domain.CaseRunStatus
+	}{
+		{
+			code: "db_connection_failed", wantVerdict: domain.VerdictBlocked,
+			wantClass: domain.FailureClassEnvironment, wantStatus: domain.CaseRunStatusBlocked,
+		},
+		{
+			code: "db_target_missing", wantVerdict: domain.VerdictBlocked,
+			wantClass: domain.FailureClassEnvironment, wantStatus: domain.CaseRunStatusBlocked,
+		},
+		{
+			code: "db_query_failed", wantVerdict: domain.VerdictInconclusive,
+			wantClass: domain.FailureClassCase, wantStatus: domain.CaseRunStatusInconclusive,
+		},
+		{
+			code: "db_readonly_violation", wantVerdict: domain.VerdictInconclusive,
+			wantClass: domain.FailureClassCase, wantStatus: domain.CaseRunStatusInconclusive,
+		},
+		{
+			code: "db_result_truncated", wantVerdict: domain.VerdictInconclusive,
+			wantClass: domain.FailureClassCase, wantStatus: domain.CaseRunStatusInconclusive,
+		},
+		{
+			code: "db_expected_invalid", wantVerdict: domain.VerdictInconclusive,
+			wantClass: domain.FailureClassCase, wantStatus: domain.CaseRunStatusInconclusive,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.code, func(t *testing.T) {
+			if !knownAgentToolCode(tc.code) {
+				t.Fatalf("%q is not in the runner's known tool-code whitelist", tc.code)
+			}
+			verdict, class, reason := domain.Classify(tc.code, "", 0)
+			if verdict != tc.wantVerdict || class != tc.wantClass || reason != tc.code {
+				t.Fatalf("Classify(%q) = %s/%s/%q, want %s/%s/%q",
+					tc.code, verdict, class, reason, tc.wantVerdict, tc.wantClass, tc.code)
+			}
+			if got := caseRunStatusForVerdict(verdict); got != tc.wantStatus {
+				t.Fatalf("case run status = %s, want %s", got, tc.wantStatus)
+			}
+		})
+	}
+}
+
 // TestAgentTerminalCodeMapsTerminalReason pins the terminal-reason mapping: an
 // LLM/model failure must never be blamed on the case, a normal agent end that
 // skipped case_finish stays case, and a pause/shutdown is never turned into a
@@ -286,6 +340,42 @@ func TestAgentTerminalCodeMapsTerminalReason(t *testing.T) {
 			state:      AgentRunState{Status: "failed", Error: "host_not_allowed"},
 			wantCode:   "host_not_allowed",
 			wantReason: "host_not_allowed",
+		},
+		{
+			name:       "db connection failure is preserved",
+			state:      AgentRunState{Status: "failed", Error: "db_connection_failed"},
+			wantCode:   "db_connection_failed",
+			wantReason: "db_connection_failed",
+		},
+		{
+			name:       "db query failure is preserved",
+			state:      AgentRunState{Status: "failed", Error: "db_query_failed"},
+			wantCode:   "db_query_failed",
+			wantReason: "db_query_failed",
+		},
+		{
+			name:       "db readonly violation is preserved",
+			state:      AgentRunState{Status: "failed", Error: "db_readonly_violation"},
+			wantCode:   "db_readonly_violation",
+			wantReason: "db_readonly_violation",
+		},
+		{
+			name:       "db result truncation is preserved",
+			state:      AgentRunState{Status: "failed", Error: "db_result_truncated"},
+			wantCode:   "db_result_truncated",
+			wantReason: "db_result_truncated",
+		},
+		{
+			name:       "db expected invalid is preserved",
+			state:      AgentRunState{Status: "failed", Error: "db_expected_invalid"},
+			wantCode:   "db_expected_invalid",
+			wantReason: "db_expected_invalid",
+		},
+		{
+			name:       "db target missing is preserved",
+			state:      AgentRunState{Status: "failed", Error: "db_target_missing"},
+			wantCode:   "db_target_missing",
+			wantReason: "db_target_missing",
 		},
 		{
 			name:       "interrupted reason untouched",
