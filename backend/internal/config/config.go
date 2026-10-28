@@ -47,6 +47,16 @@ type Config struct {
 	ExecutorToken string
 	// EvidenceDir is the root of the P6 evidence file store (spec §5.7/D30).
 	EvidenceDir string
+	// ReportDir is the root of the P7 delivery report Markdown store (spec
+	// §6.5/D30). Report rows keep only the root-relative path, sha256 and size.
+	ReportDir string
+	// DBResultMaxBytes and DBSQLMaxBytes bound one execution.db_assert query
+	// (spec §16.1): the returned result bytes and the accepted SQL length.
+	DBResultMaxBytes int
+	DBSQLMaxBytes    int
+	// AutonomyBatchesPerTick is the autonomous worker's per-tick batch budget
+	// (spec §16.1: 1–20, default 4).
+	AutonomyBatchesPerTick int
 	// ExecMaxConcurrentCases, ExecMaxToolCalls, ExecCaseTimeoutMS,
 	// ExecMaxCasesPerBatch, ExecWorkerIntervalMS, ExecEvidenceMaxBytes and
 	// ExecEvidencePerCase are the P6 execution engine limits (spec §5.3, §5.5,
@@ -166,6 +176,20 @@ const (
 	maxExecEvidencePerCase      = 1000
 )
 
+// P7 delivery defaults and bounds from design spec §16.1/D30.
+const (
+	defaultReportDir              = ".data/reports"
+	defaultDBResultMaxBytes       = 1048576
+	minDBResultMaxBytes           = 64 << 10
+	maxDBResultMaxBytes           = 16 << 20
+	defaultDBSQLMaxBytes          = 16384
+	minDBSQLMaxBytes              = 1024
+	maxDBSQLMaxBytes              = 64 << 10
+	defaultAutonomyBatchesPerTick = 4
+	minAutonomyBatchesPerTick     = 1
+	maxAutonomyBatchesPerTick     = 20
+)
+
 // defaultAgentHTTPAllowlist is the localhost-only HTTP allowlist applied when
 // EZTEST_AGENT_HTTP_ALLOWLIST is unset.
 var defaultAgentHTTPAllowlist = []string{"127.0.0.1", "localhost"}
@@ -188,6 +212,7 @@ func Load(getenv func(string) string) (Config, error) {
 		ExecutorURL:   valueOr(getenv, "EZTEST_EXECUTOR_URL", defaultExecutorURL),
 		ExecutorToken: strings.TrimSpace(getenv("EZTEST_EXECUTOR_TOKEN")),
 		EvidenceDir:   valueOr(getenv, "EZTEST_EVIDENCE_DIR", defaultEvidenceDir),
+		ReportDir:     valueOr(getenv, "EZTEST_REPORT_DIR", defaultReportDir),
 		OpenAPIPath:   valueOr(getenv, "EZTEST_OPENAPI_PATH", "docs/openapi/api.yaml"),
 		AgentFileRoot: strings.TrimSpace(getenv("EZTEST_AGENT_FILE_ROOT")),
 		LLMSeed: LLMSeed{
@@ -332,6 +357,27 @@ func Load(getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 	cfg.ExecEvidencePerCase = execEvidencePerCase
+
+	dbResultMaxBytes, err := parseBoundedInt(getenv, "EZTEST_DB_RESULT_MAX_BYTES",
+		defaultDBResultMaxBytes, minDBResultMaxBytes, maxDBResultMaxBytes)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.DBResultMaxBytes = dbResultMaxBytes
+
+	dbSQLMaxBytes, err := parseBoundedInt(getenv, "EZTEST_DB_SQL_MAX_BYTES",
+		defaultDBSQLMaxBytes, minDBSQLMaxBytes, maxDBSQLMaxBytes)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.DBSQLMaxBytes = dbSQLMaxBytes
+
+	autonomyBatchesPerTick, err := parseBoundedInt(getenv, "EZTEST_AUTONOMY_BATCHES_PER_TICK",
+		defaultAutonomyBatchesPerTick, minAutonomyBatchesPerTick, maxAutonomyBatchesPerTick)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.AutonomyBatchesPerTick = autonomyBatchesPerTick
 
 	keys, err := parseSecretKeys(getenv("EZTEST_SECRET_KEYS"))
 	if err != nil {

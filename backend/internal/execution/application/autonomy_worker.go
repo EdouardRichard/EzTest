@@ -20,17 +20,21 @@ const (
 	// DefaultAutonomyBatchesPerTick is the per-tick batch budget used when
 	// EZTEST_AUTONOMY_BATCHES_PER_TICK is not configured.
 	DefaultAutonomyBatchesPerTick = 4
+	// MinAutonomyBatchesPerTick and MaxAutonomyBatchesPerTick are the spec §16.1
+	// bounds of the per-tick batch budget.
+	MinAutonomyBatchesPerTick = 1
+	MaxAutonomyBatchesPerTick = 20
 	// envAutonomyBatchesPerTick overrides the per-tick batch budget.
 	envAutonomyBatchesPerTick = "EZTEST_AUTONOMY_BATCHES_PER_TICK"
 )
 
 // AutonomyWorkerDeps are the ports of the autonomous worker. Store and Versions
-// are required; analysis, report, supplement, impact and finalizer may be nil, in
-// which case the corresponding step degrades and the chain still settles the
-// batch (spec §6.7). Actor is the fallback system actor used for writes when a
-// batch has no creator (a P6 legacy row); a batch with a creator attributes its
-// autonomous writes to that user. Clock is injectable for the pass-duration
-// diagnostic. BatchesPerTick overrides the environment budget.
+// are required; analysis, report, supplement, impact, finalizer and delivery may
+// be nil, in which case the corresponding step degrades and the chain still
+// settles the batch (spec §6.7). Actor is the fallback system actor used for
+// writes when a batch has no creator (a P6 legacy row); a batch with a creator
+// attributes its autonomous writes to that user. Clock is injectable for the
+// pass-duration diagnostic. BatchesPerTick overrides the environment budget.
 type AutonomyWorkerDeps struct {
 	Store          AutonomyBatchStore
 	Versions       VersionPort
@@ -39,6 +43,7 @@ type AutonomyWorkerDeps struct {
 	Supplements    SupplementPort
 	Impact         CodeImpactPort
 	Finalizer      VersionFinalizer
+	Delivery       DeliveryPort
 	Clock          Clock
 	Actor          int64
 	BatchesPerTick int
@@ -61,6 +66,13 @@ type AutonomyWorker struct {
 	staleMu          sync.Mutex
 	staleRegenerated map[int64]struct{}
 
+	// escalationMu guards escalationsMaterialized: the in-memory one-shot marker
+	// of supplement/incremental-design runs whose requirement-gap escalations were
+	// already handed to delivery. A restart re-calls delivery, whose hard dedupe
+	// makes the replay a no-op.
+	escalationMu    sync.Mutex
+	escalationsDone map[int64]struct{}
+
 	mu      sync.Mutex
 	cancel  context.CancelFunc
 	running bool
@@ -69,7 +81,9 @@ type AutonomyWorker struct {
 
 // NewAutonomyWorker wires the worker. A zero BatchesPerTick reads
 // EZTEST_AUTONOMY_BATCHES_PER_TICK and otherwise falls back to
-// DefaultAutonomyBatchesPerTick (at least one batch).
+// DefaultAutonomyBatchesPerTick; every value is clamped to spec §16.1's 1–20
+// range so a typo cannot disable the chain or scan the whole database in one
+// tick.
 func NewAutonomyWorker(deps AutonomyWorkerDeps) *AutonomyWorker {
 	if deps.Clock == nil {
 		deps.Clock = wallClock{}
@@ -77,12 +91,14 @@ func NewAutonomyWorker(deps AutonomyWorkerDeps) *AutonomyWorker {
 	if deps.BatchesPerTick <= 0 {
 		deps.BatchesPerTick = configuredAutonomyBatchesPerTick()
 	}
+	deps.BatchesPerTick = clampAutonomyBatchesPerTick(deps.BatchesPerTick)
 	return &AutonomyWorker{
 		deps:             deps,
 		tick:             DefaultAutonomyTick,
 		batchesPerTick:   deps.BatchesPerTick,
 		notify:           make(chan struct{}, 1),
 		staleRegenerated: make(map[int64]struct{}),
+		escalationsDone:  make(map[int64]struct{}),
 	}
 }
 
@@ -311,15 +327,31 @@ func (w *AutonomyWorker) finalizeSweep(ctx context.Context) error {
 }
 
 // configuredAutonomyBatchesPerTick reads and clamps
-// EZTEST_AUTONOMY_BATCHES_PER_TICK.
+// EZTEST_AUTONOMY_BATCHES_PER_TICK (spec §16.1): an unset or unparsable value
+// selects the default, a value below 1 also selects the default (the chain needs
+// at least one batch per tick), and a value above 20 is clamped to 20.
 func configuredAutonomyBatchesPerTick() int {
 	raw := os.Getenv(envAutonomyBatchesPerTick)
 	if raw == "" {
 		return DefaultAutonomyBatchesPerTick
 	}
 	value, err := strconv.Atoi(raw)
-	if err != nil || value <= 0 {
+	if err != nil || value < MinAutonomyBatchesPerTick {
 		return DefaultAutonomyBatchesPerTick
+	}
+	if value > MaxAutonomyBatchesPerTick {
+		return MaxAutonomyBatchesPerTick
+	}
+	return value
+}
+
+// clampAutonomyBatchesPerTick bounds an explicitly configured budget.
+func clampAutonomyBatchesPerTick(value int) int {
+	if value < MinAutonomyBatchesPerTick {
+		return DefaultAutonomyBatchesPerTick
+	}
+	if value > MaxAutonomyBatchesPerTick {
+		return MaxAutonomyBatchesPerTick
 	}
 	return value
 }
