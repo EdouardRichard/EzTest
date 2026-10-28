@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -215,6 +216,7 @@ type accessHTTPTestRepos struct {
 	accounts  *accessHTTPTestAccountRepo
 	accesses  *accessHTTPTestAccessRepo
 	systems   *catalogHTTPTestSystemRepo
+	flows     *authFlowHTTPTestRepo
 }
 
 // newAccessHandlerTestServer mounts the account/access routes behind the real
@@ -225,8 +227,9 @@ func newAccessHandlerTestServer(t *testing.T) (*http.ServeMux, *accessHTTPTestRe
 		accounts: newAccessHTTPTestAccountRepo(),
 		accesses: newAccessHTTPTestAccessRepo(),
 		systems:  newCatalogHTTPTestSystemRepo(),
+		flows:    newAuthFlowHTTPTestRepo(),
 	}
-	service := application.NewAccessService(repos.companies, repos.accounts, repos.accesses, repos.systems)
+	service := application.NewAccessService(repos.companies, repos.accounts, repos.accesses, repos.systems, repos.flows)
 	mux := http.NewServeMux()
 	guard := func(next http.Handler) http.Handler {
 		return identityhttp.AuthMiddleware(catalogHTTPTestAuthenticator{})(identityhttp.RequireAdmin(next))
@@ -796,4 +799,145 @@ func TestAccessHandlerRejectsOversizedBody(t *testing.T) {
 
 	rr = accessRequest(mux, http.MethodPost, "/api/resources/accounts", catalogAdminToken, `{"key":`)
 	assertAccessErrorEnvelope(t, rr, http.StatusUnprocessableEntity, platform.CodeInvalidArgument, "invalid_json")
+}
+
+// TestAccessHandlerLoginFlowBinding covers exposing login_flow_id on reads and
+// bind/keep/unbind on writes (spec §5.9, P6 auto-login).
+func TestAccessHandlerLoginFlowBinding(t *testing.T) {
+	mux, repos := newAccessHandlerTestServer(t)
+	repos.accounts.seed("fixture-user")
+	system := repos.systems.seed("fixture-web")
+	flow := repos.flows.seed(domain.AuthFlow{SystemID: system.ID, Name: "fixture login", Enabled: true})
+	flowID := strconv.FormatInt(flow.ID, 10)
+
+	createBody := `{"systemId":1,"authType":"password","credential":"s3cret","enabled":true,` +
+		`"concurrencyLimit":1,"login_flow_id":"` + flowID + `"}`
+	rr := accessRequest(mux, http.MethodPost, "/api/resources/accounts/1/accesses", catalogAdminToken, createBody)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status=%d want 201 (body=%s)", rr.Code, rr.Body.String())
+	}
+	created := decodeAccessData[map[string]any](t, rr)
+	if created["login_flow_id"] != flowID {
+		t.Fatalf("login_flow_id=%v want %q", created["login_flow_id"], flowID)
+	}
+	if access := repos.accesses.accesses[1]; access.LoginFlowID == nil || *access.LoginFlowID != flow.ID {
+		t.Fatalf("stored login flow=%v want %d", access.LoginFlowID, flow.ID)
+	}
+	assertNoCredentialLeak(t, rr, "s3cret")
+
+	// GET detail exposes the decimal string.
+	rr = accessRequest(mux, http.MethodGet, "/api/resources/accesses/1", catalogUserToken, "")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200 (body=%s)", rr.Code, rr.Body.String())
+	}
+	if detail := decodeAccessData[map[string]any](t, rr); detail["login_flow_id"] != flowID {
+		t.Fatalf("detail login_flow_id=%v want %q", detail["login_flow_id"], flowID)
+	}
+
+	// GET list exposes it too.
+	rr = accessRequest(mux, http.MethodGet, "/api/resources/accounts/1/accesses", catalogUserToken, "")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200 (body=%s)", rr.Code, rr.Body.String())
+	}
+	items := decodeAccessData[[]map[string]any](t, rr)
+	if len(items) != 1 || items[0]["login_flow_id"] != flowID {
+		t.Fatalf("list items=%v want login_flow_id %q", items, flowID)
+	}
+
+	// An omitted login_flow_id keeps the stored binding.
+	rr = accessRequest(mux, http.MethodPatch, "/api/resources/accesses/1", catalogAdminToken,
+		`{"permissionNote":"read-only"}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200 (body=%s)", rr.Code, rr.Body.String())
+	}
+	patched := decodeAccessData[map[string]any](t, rr)
+	if patched["login_flow_id"] != flowID || patched["permissionNote"] != "read-only" {
+		t.Fatalf("patched=%v want the binding kept", patched)
+	}
+
+	// An explicit null unbinds it and reads back as null.
+	rr = accessRequest(mux, http.MethodPatch, "/api/resources/accesses/1", catalogAdminToken,
+		`{"login_flow_id":null}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200 (body=%s)", rr.Code, rr.Body.String())
+	}
+	cleared := decodeAccessData[map[string]any](t, rr)
+	if value, ok := cleared["login_flow_id"]; !ok || value != nil {
+		t.Fatalf("login_flow_id=%v present=%v want an explicit null", value, ok)
+	}
+	if repos.accesses.accesses[1].LoginFlowID != nil {
+		t.Fatal("explicit null did not clear the stored login_flow_id")
+	}
+
+	// Rebinding works after an unbind.
+	rr = accessRequest(mux, http.MethodPatch, "/api/resources/accesses/1", catalogAdminToken,
+		`{"login_flow_id":"`+flowID+`"}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200 (body=%s)", rr.Code, rr.Body.String())
+	}
+	if rebounded := decodeAccessData[map[string]any](t, rr); rebounded["login_flow_id"] != flowID {
+		t.Fatalf("login_flow_id=%v want %q", rebounded["login_flow_id"], flowID)
+	}
+}
+
+// TestAccessHandlerRejectsInvalidLoginFlow maps every invalid binding to 422
+// auth_flow_invalid without writing (spec §5.9).
+func TestAccessHandlerRejectsInvalidLoginFlow(t *testing.T) {
+	mux, repos := newAccessHandlerTestServer(t)
+	repos.accounts.seed("fixture-user")
+	system := repos.systems.seed("fixture-web")
+	otherSystem := repos.systems.seed("fixture-api")
+	repos.accesses.seed(domain.Access{
+		AccountID: 1, SystemID: system.ID, AuthType: domain.AuthTypePassword,
+		Enabled: true, ConcurrencyLimit: 1,
+	})
+	disabledFlow := repos.flows.seed(domain.AuthFlow{SystemID: system.ID, Name: "disabled", Enabled: false})
+	otherSystemFlow := repos.flows.seed(domain.AuthFlow{SystemID: otherSystem.ID, Name: "other", Enabled: true})
+	enabledFlow := repos.flows.seed(domain.AuthFlow{SystemID: system.ID, Name: "enabled", Enabled: true})
+
+	invalidValues := []string{
+		`"abc"`,
+		`""`,
+		`"0"`,
+		`7`,
+		`"999"`,
+		`"` + strconv.FormatInt(disabledFlow.ID, 10) + `"`,
+		`"` + strconv.FormatInt(otherSystemFlow.ID, 10) + `"`,
+	}
+	for _, value := range invalidValues {
+		createBody := `{"systemId":1,"authType":"password","credential":"s3cret","enabled":true,` +
+			`"concurrencyLimit":1,"login_flow_id":` + value + `}`
+		rr := accessRequest(mux, http.MethodPost, "/api/resources/accounts/1/accesses", catalogAdminToken, createBody)
+		apiErr := assertAccessErrorEnvelope(t, rr, http.StatusUnprocessableEntity, platform.CodeInvalidArgument, "auth_flow_invalid")
+		if apiErr.Details["field"] != "login_flow_id" {
+			t.Fatalf("details.field=%v want login_flow_id", apiErr.Details["field"])
+		}
+		if repos.accesses.createCalls != 0 {
+			t.Fatal("an invalid login flow reached the repository")
+		}
+	}
+
+	// Invalid bindings on update are rejected before the repository write too.
+	updateCalls := repos.accesses.updateCalls
+	for _, value := range invalidValues {
+		rr := accessRequest(mux, http.MethodPatch, "/api/resources/accesses/1", catalogAdminToken,
+			`{"login_flow_id":`+value+`}`)
+		apiErr := assertAccessErrorEnvelope(t, rr, http.StatusUnprocessableEntity, platform.CodeInvalidArgument, "auth_flow_invalid")
+		if apiErr.Details["field"] != "login_flow_id" {
+			t.Fatalf("details.field=%v want login_flow_id", apiErr.Details["field"])
+		}
+	}
+	if repos.accesses.updateCalls != updateCalls {
+		t.Fatal("an invalid login flow reached the repository")
+	}
+
+	// A valid same-system enabled flow is accepted on update.
+	rr := accessRequest(mux, http.MethodPatch, "/api/resources/accesses/1", catalogAdminToken,
+		`{"login_flow_id":"`+strconv.FormatInt(enabledFlow.ID, 10)+`"}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200 (body=%s)", rr.Code, rr.Body.String())
+	}
+	if got := repos.accesses.accesses[1].LoginFlowID; got == nil || *got != enabledFlow.ID {
+		t.Fatalf("stored login flow=%v want %d", got, enabledFlow.ID)
+	}
 }
