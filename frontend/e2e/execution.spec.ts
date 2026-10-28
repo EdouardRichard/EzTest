@@ -739,9 +739,7 @@ test("P6 执行端到端：seed → 批次 → 暂停/恢复 → 结果/证据 �
     // P7 autonomy may append a supplement batch after the failed baseline; the
     // P6 intent here is only that the 409/503 gate did not create a second
     // baseline for this untouched version.
-    const baselines = (untouchedBody.data ?? []).filter(
-      (batch) => batch.kind === "baseline",
-    )
+    const baselines = (untouchedBody.data ?? []).filter((batch) => batch.kind === "baseline")
     expect(baselines).toHaveLength(1)
   })
 })
