@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     Runs the P0-P5 acceptance gate for EzTest.
@@ -599,7 +599,13 @@ function Assert-P5ApiError {
     } catch {
         $info = Get-P5ErrorInfo -ErrorRecord $_
         if (-not $info.HasResponse) {
-            throw "$Label failed without an HTTP response: $($_.Exception.Message)"
+            # Invoke-P5Api rethrows a formatted message after a non-2xx response;
+            # recover the status/code/reason so expected-error assertions work.
+            if ($_.Exception.Message -match 'HTTP (-?\d+) code=(\S+) reason=(\S+)') {
+                $info = [pscustomobject]@{ HasResponse = $true; Status = [int]$Matches[1]; Code = $Matches[2]; Reason = $Matches[3] }
+            } else {
+                throw "$Label failed without an HTTP response: $($_.Exception.Message)"
+            }
         }
         if ($info.Status -ne $Status) {
             throw "$Label returned HTTP $($info.Status), expected $Status"
@@ -2416,7 +2422,7 @@ writeFileSync(process.argv[3], JSON.stringify({
 
                 [void](Invoke-Check -Dod "P5-7" -CheckName "P5 events snapshot" -Body {
                         $current = $script:p5
-                        $events = Invoke-P5Api -Method Get -Path "/api/versions/$($current.VersionId)/events?limit=200" -Headers $current.AdminHeaders
+                        $events = Invoke-P5Api -Method Get -Path "/api/versions/$($current.VersionId)/events?limit=100" -Headers $current.AdminHeaders
                         Assert-P5Http -Response $events -Status 200 -Label "GET version events" | Out-Null
                         $items = @($events.Data)
                         if ($items.Count -lt 1) { throw "the version event snapshot is empty" }
@@ -2425,7 +2431,7 @@ writeFileSync(process.argv[3], JSON.stringify({
                             if ($types -notcontains $required) { throw "the version event snapshot is missing $required" }
                         }
                         if (-not [string]::IsNullOrWhiteSpace([string]$current.ReviewVersionId)) {
-                            $reviewEvents = Invoke-P5Api -Method Get -Path "/api/versions/$($current.ReviewVersionId)/events?limit=200" -Headers $current.AdminHeaders
+                            $reviewEvents = Invoke-P5Api -Method Get -Path "/api/versions/$($current.ReviewVersionId)/events?limit=100" -Headers $current.AdminHeaders
                             Assert-P5Http -Response $reviewEvents -Status 200 -Label "GET review version events" | Out-Null
                             $reviewTypes = @($reviewEvents.Data | ForEach-Object { [string]$_.type })
                             if ($reviewTypes -notcontains "case.reviewed") { throw "the review version event snapshot is missing case.reviewed" }
