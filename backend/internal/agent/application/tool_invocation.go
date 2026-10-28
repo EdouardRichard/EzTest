@@ -7,16 +7,20 @@ import "context"
 // the actor, session and profile from the runtime instead of trusting
 // model-supplied arguments (design spec §8.2 item 3, §8.7).
 //
-// BatchID and CaseRunID are the P6 execution scope (design spec §7.3). They are
-// zero for P1–P5 runs. Invocation carries identity only: never credentials,
-// prompts, arguments or results.
+// VersionID, BatchID, CaseRunID, SupplementRunID and AnalysisRunID are the
+// P6/P7 execution scope (design spec §7.3, §9.1). They are zero for P1–P5 runs.
+// Invocation carries identity only: never credentials, prompts, arguments or
+// results.
 type Invocation struct {
-	SessionID   int64
-	RunID       int64
-	ActorUserID *int64
-	ProfileKey  string
-	BatchID     int64
-	CaseRunID   int64
+	SessionID       int64
+	RunID           int64
+	ActorUserID     *int64
+	ProfileKey      string
+	VersionID       int64
+	BatchID         int64
+	CaseRunID       int64
+	SupplementRunID int64
+	AnalysisRunID   int64
 }
 
 // toolInvocationContextKey is the private context key carrying an Invocation.

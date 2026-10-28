@@ -129,12 +129,17 @@ type TurnIDs struct {
 	UserMessageID int64
 }
 
-// RunScope is the P6 execution scope a run belongs to. A P1–P5 run starts with
-// the zero value; an execution case run carries the batch and case-run ids so
-// the tools it invokes can read them from the Invocation context (§7.3).
+// RunScope is the execution/delivery scope a run belongs to. A P1–P5 run starts
+// with the zero value; a P6 execution case run carries the batch and case-run
+// ids, and a P7 delivery run adds the version, supplement-run or analysis-run id
+// so the tools it invokes can read the owning records from the Invocation
+// context (§7.3, §9.1).
 type RunScope struct {
-	BatchID   int64
-	CaseRunID int64
+	VersionID       int64
+	BatchID         int64
+	CaseRunID       int64
+	SupplementRunID int64
+	AnalysisRunID   int64
 }
 
 // StartResult is returned to the API caller when a message starts a run.

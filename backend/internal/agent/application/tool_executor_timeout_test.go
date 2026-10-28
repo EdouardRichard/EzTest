@@ -224,11 +224,13 @@ func TestInvocationRoundTripKeepsP6Fields(t *testing.T) {
 	}
 }
 
-// TestInvocationCarriesNoCredentialsOrPrompts pins the P6 review focus:
+// TestInvocationCarriesNoCredentialsOrPrompts pins the P6/P7 review focus:
 // Invocation is run-scoped identity only. Adding a prompt, credential, secret or
 // payload field to it must fail this test rather than leak into tool contexts.
+// The P7 scope ids (VersionID/SupplementRunID/AnalysisRunID) are ids, not
+// payloads, so they are part of the expected identity field set.
 func TestInvocationCarriesNoCredentialsOrPrompts(t *testing.T) {
-	want := []string{"SessionID", "RunID", "ActorUserID", "ProfileKey", "BatchID", "CaseRunID"}
+	want := []string{"SessionID", "RunID", "ActorUserID", "ProfileKey", "VersionID", "BatchID", "CaseRunID", "SupplementRunID", "AnalysisRunID"}
 	typ := reflect.TypeOf(application.Invocation{})
 	got := make([]string, typ.NumField())
 	for i := 0; i < typ.NumField(); i++ {
