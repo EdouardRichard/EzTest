@@ -262,7 +262,10 @@ func TestDBTargetReadOnlyQuerier(t *testing.T) {
 		domain.QueryLimits{TimeoutMS: 500}); err == nil {
 		t.Fatal("a statement over the timeout must fail")
 	} else {
-		requireQueryReason(t, err, domain.ReasonDBQueryFailed)
+		// A statement timeout is an environment failure (T15 review): the
+		// execution.db_assert tool must prescribe blocked(environment), not
+		// inconclusive(case).
+		requireQueryReason(t, err, domain.ReasonDBConnectionFailed)
 	}
 	if elapsed := time.Since(started); elapsed > 3*time.Second {
 		t.Fatalf("statement timeout took %v", elapsed)

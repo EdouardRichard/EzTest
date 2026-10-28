@@ -38,6 +38,11 @@ type fakeRecorder struct {
 	finishIn  application.FinishInput
 	finish    executiondomain.CaseRun
 	finishErr error
+
+	dbAssertionID int64
+	dbLimits      application.DBAssertLimits
+	dbOutcome     application.DBAssertOutcome
+	dbErr         error
 }
 
 func (f *fakeRecorder) CaseContext(_ context.Context, _ int64) (application.CaseContextView, error) {
@@ -60,6 +65,12 @@ func (f *fakeRecorder) RecordAssertion(_ context.Context, _ int64, in applicatio
 func (f *fakeRecorder) FinishCase(_ context.Context, _ int64, in application.FinishInput) (executiondomain.CaseRun, error) {
 	f.finishIn = in
 	return f.finish, f.finishErr
+}
+
+func (f *fakeRecorder) DBAssert(_ context.Context, _ int64, assertionID int64, limits application.DBAssertLimits) (application.DBAssertOutcome, error) {
+	f.dbAssertionID = assertionID
+	f.dbLimits = limits
+	return f.dbOutcome, f.dbErr
 }
 
 // fakeEvidence records captured artifacts and returns a deterministic row.
@@ -184,6 +195,7 @@ func TestToolsMatchExecutionProfileAllowlist(t *testing.T) {
 		"execution.step_record",
 		"execution.assertion_record",
 		"execution.case_finish",
+		"execution.db_assert",
 	}
 	if len(tools) != len(want) {
 		t.Fatalf("registered %d tools, want %d: %v", len(tools), len(want), toolNames(tools))
@@ -735,6 +747,94 @@ func TestSubmitToolMapsRecorderValidationError(t *testing.T) {
 	}
 }
 
+// TestDBAssertToolCallsRecorderWithAssertionID pins the P7 tool contract (spec
+// §9.5): the agent supplies only assertion_id; the SQL/expected/target are read
+// server-side from the snapshot by the recorder, and the result carries the
+// verdict/preview fields of the spec.
+func TestDBAssertToolCallsRecorderWithAssertionID(t *testing.T) {
+	recorder := &fakeRecorder{
+		view: defaultView(),
+		dbOutcome: application.DBAssertOutcome{
+			AssertionID: 77, Verdict: "passed", RowCount: 1, ElapsedMS: 4,
+			ActualPreview: `{"columns":["count"],"rows":[["3"]]}`,
+		},
+	}
+	tools := New(recorder, nil, nil, nil, Limits{})
+
+	out, err := callTool(t, tools, "execution.db_assert", `{"assertionId":"77"}`)
+	if err != nil {
+		t.Fatalf("execution.db_assert: %v", err)
+	}
+	if recorder.dbAssertionID != 77 {
+		t.Fatalf("assertion id = %d, want 77", recorder.dbAssertionID)
+	}
+	if recorder.dbLimits.MaxResultBytes != DefaultMaxDBResultBytes ||
+		recorder.dbLimits.MaxSQLBytes != DefaultMaxDBSQLBytes {
+		t.Fatalf("db limits = %+v, want the spec defaults", recorder.dbLimits)
+	}
+	var payload struct {
+		AssertionID   string `json:"assertionId"`
+		Verdict       string `json:"verdict"`
+		RowCount      int    `json:"rowCount"`
+		Truncated     bool   `json:"truncated"`
+		ElapsedMS     int64  `json:"elapsedMs"`
+		ActualPreview string `json:"actualPreview"`
+	}
+	if err := json.Unmarshal([]byte(out.Content), &payload); err != nil {
+		t.Fatalf("db_assert result is not JSON: %v (%s)", err, out.Content)
+	}
+	if payload.AssertionID != "77" || payload.Verdict != "passed" ||
+		payload.RowCount != 1 || payload.Truncated || payload.ElapsedMS != 4 ||
+		payload.ActualPreview != recorder.dbOutcome.ActualPreview {
+		t.Fatalf("db_assert payload = %+v", payload)
+	}
+	if strings.Contains(out.Content, "SELECT") || strings.Contains(out.Content, "password") {
+		t.Fatalf("db_assert result leaked server-side state: %s", out.Content)
+	}
+}
+
+// TestDBAssertToolRejectsAgentSuppliedQueryArguments pins that the tool accepts
+// no SQL, expected value, target or credential argument: only assertion_id is
+// part of the schema.
+func TestDBAssertToolRejectsAgentSuppliedQueryArguments(t *testing.T) {
+	recorder := &fakeRecorder{view: defaultView()}
+	tools := New(recorder, nil, nil, nil, Limits{})
+
+	for _, args := range []string{
+		`{"assertionId":"77","sql":"SELECT 1"}`,
+		`{"assertionId":"77","expected":"[[1]]"}`,
+		`{"assertionId":"77","connection":"postgres://user:pass@db/app"}`,
+		`{"assertionId":"77","target":"orders"}`,
+		`{"assertionId":"77","verdict":"passed"}`,
+		`{"assertionId":"0"}`,
+		`{}`,
+	} {
+		_, err := callTool(t, tools, "execution.db_assert", args)
+		requireToolError(t, err, "invalid_arguments")
+	}
+	if recorder.dbAssertionID != 0 {
+		t.Fatalf("a rejected db_assert reached the recorder (assertion %d)", recorder.dbAssertionID)
+	}
+}
+
+// TestDBAssertToolPreservesRecorderToolError pins that a recorded not_run
+// failure reaches the model as the stable reason with the prescribed finish
+// hint, so the agent can finish blocked(environment) or inconclusive(case).
+func TestDBAssertToolPreservesRecorderToolError(t *testing.T) {
+	recorder := &fakeRecorder{
+		view: defaultView(),
+		dbErr: &agentdomain.ToolError{Code: "tool_error",
+			Message: "db_connection_failed: dial tcp: refused; finish blocked(environment)"},
+	}
+	tools := New(recorder, nil, nil, nil, Limits{})
+	_, err := callTool(t, tools, "execution.db_assert", `{"assertionId":"77"}`)
+	toolErr := requireToolError(t, err, "tool_error")
+	if !strings.Contains(toolErr.Message, "db_connection_failed") ||
+		!strings.Contains(toolErr.Message, "blocked(environment)") {
+		t.Fatalf("tool error message = %q", toolErr.Message)
+	}
+}
+
 // TestCaseFinishClosesTheBrowserContext pins the per-case cleanup after a
 // successful terminal submission.
 func TestCaseFinishClosesTheBrowserContext(t *testing.T) {
@@ -773,6 +873,7 @@ func TestToolsRequireCaseRunScope(t *testing.T) {
 		"execution.step_record",
 		"execution.assertion_record",
 		"execution.case_finish",
+		"execution.db_assert",
 	} {
 		_, err := callToolWithInvocation(t, tools, name, `{"url":"https://app.example.test/","seq":1,"status":"passed","assertion_id":"1","verdict":"passed","evidence_ids":["1"]}`, agentapp.Invocation{})
 		requireToolError(t, err, "invalid_arguments")

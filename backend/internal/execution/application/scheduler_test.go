@@ -37,6 +37,7 @@ type schedWorld struct {
 	browser  *schedBrowser
 	ids      *schedIDs
 	clock    *schedClock
+	autonomy *schedAutonomy
 }
 
 // newSchedulerTest wires a Scheduler and its CaseRunner to in-memory fakes. The
@@ -68,6 +69,7 @@ func newSchedulerTest(t *testing.T, maxConcurrent int) (*Scheduler, *schedWorld)
 		Clock:         world.clock,
 		IDs:           world.ids,
 		Runner:        runner,
+		Autonomy:      world.autonomy,
 		MaxConcurrent: maxConcurrent,
 		Tick:          time.Millisecond,
 		LeaseTTL:      time.Minute,
@@ -90,6 +92,7 @@ func newSchedWorld() *schedWorld {
 		browser:  newSchedBrowser(),
 		ids:      &schedIDs{},
 		clock:    &schedClock{now: testNow},
+		autonomy: &schedAutonomy{},
 	}
 	world.batches = newSchedBatchRepo(world.runs)
 	batch := domain.RunBatch{
@@ -323,6 +326,7 @@ func TestSchedulerTakeoverGateAndRequeue(t *testing.T) {
 		CaseNodeID:    10,
 		Attempt:       1,
 		Snapshot:      schedSnapshot(10, "P0"),
+		Source:        domain.CaseSourceAISupplement,
 		Status:        domain.CaseRunStatusBlocked,
 		FailureClass:  failureClassPointer(domain.FailureClassSession),
 		FailureReason: "takeover_required",
@@ -386,6 +390,10 @@ func TestSchedulerTakeoverGateAndRequeue(t *testing.T) {
 	}
 	if requeued.Attempt != 2 || requeued.RetryOfCaseRunID == nil || *requeued.RetryOfCaseRunID != blocked.ID {
 		t.Fatalf("requeued attempt = %+v", requeued)
+	}
+	if requeued.Source != domain.CaseSourceAISupplement {
+		t.Fatalf("requeued source = %q, want the original ai_supplement (T7 finding B)",
+			requeued.Source)
 	}
 	if requeued.Status != domain.CaseRunStatusPending && requeued.Status != domain.CaseRunStatusRunning {
 		t.Fatalf("requeued status = %s", requeued.Status)
@@ -598,8 +606,14 @@ func TestSchedulerCompletesBatchWhenEveryCaseIsTerminal(t *testing.T) {
 	if batch.FinishedAt == nil || !batch.FinishedAt.Equal(testNow) {
 		t.Fatalf("batch finished_at = %v", batch.FinishedAt)
 	}
-	if world.versions.completeCalls != 1 {
-		t.Fatalf("CompleteExecution calls = %d, want 1", world.versions.completeCalls)
+	// The P7 scheduler never completes the version itself: the autonomous chain
+	// settles every terminal batch first and only then finalizes (spec §5.3).
+	if world.versions.completeCalls != 0 {
+		t.Fatalf("CompleteExecution calls = %d, want 0", world.versions.completeCalls)
+	}
+	if len(world.autonomy.batches) != 1 || world.autonomy.batches[0].ID != schedBatchID {
+		t.Fatalf("autonomy hand-off = %+v, want one terminal batch %d",
+			world.autonomy.batches, schedBatchID)
 	}
 	if world.batches.countsCalls == 0 {
 		t.Fatal("finishing a batch must recount it")
@@ -1358,6 +1372,15 @@ func (r *schedAssertionRepo) ListByCaseRun(ctx context.Context, caseRunID int64)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]domain.AssertionResult(nil), r.rows[caseRunID]...), nil
+}
+
+// schedAutonomy is the scheduler's autonomous-chain hand-off fake.
+type schedAutonomy struct {
+	batches []domain.RunBatch
+}
+
+func (a *schedAutonomy) OnBatchTerminal(ctx context.Context, batch domain.RunBatch) {
+	a.batches = append(a.batches, batch)
 }
 
 // schedVersionPort is an in-memory VersionPort.

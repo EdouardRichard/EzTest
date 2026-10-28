@@ -8,6 +8,7 @@ import (
 
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	auditdomain "github.com/EdouardRichard/EzTest/backend/internal/audit/domain"
+	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
 	executiondomain "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
@@ -223,5 +224,44 @@ func TestSinkNilRecorderIsNoop(t *testing.T) {
 	}
 	if err := sink.CaseFinished(ctx, executiondomain.CaseRun{ID: 1, CreatedAt: time.Now()}, 42); err != nil {
 		t.Fatal(err)
+	}
+	if err := sink.DBAssertExecuted(ctx, executionapp.DBAssertAuditEvent{AssertionResultID: 9, CaseRunID: 1}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestSinkDBAssertExecuted pins the spec §11.2 db assertion audit shape: the
+// stable action, the case_run target and ids/verdict/counts only.
+func TestSinkDBAssertExecuted(t *testing.T) {
+	recorder := &fakeRecorder{}
+	sink := NewSink(recorder)
+	event := executionapp.DBAssertAuditEvent{
+		AssertionResultID: 77, CaseRunID: 66, Verdict: "passed", RowCount: 3, ElapsedMS: 12,
+	}
+	if err := sink.DBAssertExecuted(context.Background(), event); err != nil {
+		t.Fatalf("DBAssertExecuted: %v", err)
+	}
+	if len(recorder.entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(recorder.entries))
+	}
+	entry := recorder.entries[0]
+	if entry.Action != ActionDBAssertExecuted || entry.TargetType != targetCaseRun ||
+		entry.TargetID != "66" {
+		t.Fatalf("entry = %+v", entry)
+	}
+	want := map[string]any{
+		"assertion_result_id": int64(77),
+		"case_run_id":         int64(66),
+		"verdict":             "passed",
+		"row_count":           3,
+		"elapsed_ms":          int64(12),
+	}
+	if len(entry.Metadata) != len(want) {
+		t.Fatalf("metadata = %+v", entry.Metadata)
+	}
+	for key, value := range want {
+		if entry.Metadata[key] != value {
+			t.Fatalf("metadata[%q] = %#v, want %#v", key, entry.Metadata[key], value)
+		}
 	}
 }

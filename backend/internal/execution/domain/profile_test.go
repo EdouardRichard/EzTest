@@ -48,6 +48,7 @@ func TestExecutionProfileSeed(t *testing.T) {
 		"execution.step_record",
 		"execution.assertion_record",
 		"execution.case_finish",
+		"execution.db_assert",
 	}
 	if len(profile.AllowedTools) != len(wantTools) {
 		t.Fatalf("allowed tools=%v want %d entries", profile.AllowedTools, len(wantTools))

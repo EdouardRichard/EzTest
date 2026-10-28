@@ -82,6 +82,16 @@ func withoutEvidence(steps []domain.StepResult) []domain.StepResult {
 	return steps
 }
 
+// finishEvidenceCount is the case-run evidence the matrix fixture implies: the
+// evidence artifacts attached to the recorded steps.
+func finishEvidenceCount(steps []domain.StepResult) int {
+	total := 0
+	for _, step := range steps {
+		total += step.EvidenceCount
+	}
+	return total
+}
+
 type finishCase struct {
 	name       string
 	snapshot   domain.CaseSnapshot
@@ -370,7 +380,7 @@ func TestValidateFinishMatrix(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := domain.ValidateFinish(tt.snapshot, tt.steps, tt.assertions, tt.decision)
+			err := domain.ValidateFinish(tt.snapshot, tt.steps, tt.assertions, tt.decision, finishEvidenceCount(tt.steps))
 			if tt.wantReason == "" {
 				if err != nil {
 					t.Fatalf("ValidateFinish returned %v, want nil", err)
@@ -398,7 +408,32 @@ func requireFinishReason(t *testing.T, err error, want string) {
 
 func TestValidateFinishRequiresEvidenceForPassed(t *testing.T) {
 	requireFinishReason(t, domain.ValidateFinish(
-		finishSnapshot(), withoutEvidence(passedSteps()), passedAssertions(), passedFinish(),
+		finishSnapshot(), withoutEvidence(passedSteps()), passedAssertions(), passedFinish(), 0,
+	), "evidence_missing")
+}
+
+// TestValidateFinishCountsDBAssertionEvidence pins spec §6.6.2's evidence rule:
+// passed/failed require at least one evidence artifact and db evidence counts.
+// The evidence argument is the case run's evidence total, not the step-only
+// count, so an assertion/db artifact satisfies the gate with zero step evidence.
+func TestValidateFinishCountsDBAssertionEvidence(t *testing.T) {
+	steps := withoutEvidence(passedSteps())
+	if err := domain.ValidateFinish(
+		finishDBSnapshot(), steps, dbPassedAssertions(), passedFinish(), 1,
+	); err != nil {
+		t.Fatalf("ValidateFinish with db evidence returned %v, want nil", err)
+	}
+
+	requireFinishReason(t, domain.ValidateFinish(
+		finishDBSnapshot(), withoutEvidence(passedSteps()), dbPassedAssertions(), passedFinish(), 0,
+	), "evidence_missing")
+
+	// failed is subject to the same gate.
+	requireFinishReason(t, domain.ValidateFinish(
+		finishDBSnapshot(), withoutEvidence(passedSteps()), dbFailedAssertions(),
+		domain.FinishDecision{
+			Verdict: domain.VerdictFailed, FailureClass: failureClassPtr(domain.FailureClassApplication),
+		}, 0,
 	), "evidence_missing")
 }
 
@@ -407,11 +442,11 @@ func TestValidateFinishRequiresEvidenceForPassed(t *testing.T) {
 // exactly once, and an all-passed submission including it is admissible.
 func TestValidateFinishRequiresDBAssertion(t *testing.T) {
 	requireFinishReason(t, domain.ValidateFinish(
-		finishDBSnapshot(), passedSteps(), passedAssertions(), passedFinish(),
+		finishDBSnapshot(), passedSteps(), passedAssertions(), passedFinish(), finishEvidenceCount(passedSteps()),
 	), "invalid_assertion_results")
 
 	if err := domain.ValidateFinish(
-		finishDBSnapshot(), passedSteps(), dbPassedAssertions(), passedFinish(),
+		finishDBSnapshot(), passedSteps(), dbPassedAssertions(), passedFinish(), finishEvidenceCount(passedSteps()),
 	); err != nil {
 		t.Fatalf("ValidateFinish with the db assertion passed returned %v, want nil", err)
 	}

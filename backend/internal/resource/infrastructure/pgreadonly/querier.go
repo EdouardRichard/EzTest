@@ -346,8 +346,11 @@ func formatUUID(value [16]byte) string {
 }
 
 // classifyQueryError maps a PostgreSQL or transport error onto the stable
-// db_query_failed/db_readonly_violation reasons without echoing the statement or
-// its result.
+// db_connection_failed/db_query_failed/db_readonly_violation reasons without
+// echoing the statement or its result. A statement timeout (SQLSTATE 57014) and
+// a canceled/expired request context are environment failures: the target or
+// the connection could not serve the statement, so execution.db_assert prescribes
+// blocked(environment) rather than inconclusive(case).
 func classifyQueryError(err error) *domain.QueryError {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
@@ -357,22 +360,27 @@ func classifyQueryError(err error) *domain.QueryError {
 				"the statement modifies data but the transaction is read-only")
 		case "42501": // insufficient_privilege
 			return queryFailed("the target role is not allowed to run the statement")
-		case "57014": // query_canceled (statement timeout)
-			return queryFailed("the statement exceeded the statement timeout")
+		case "57014": // query_canceled (statement timeout or cancel)
+			return connectionFailedWith("the statement exceeded the statement timeout")
 		default:
 			return queryFailed("the target database rejected the statement")
 		}
 	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		return queryFailed("the statement exceeded the statement timeout")
+		return connectionFailedWith("the statement exceeded the statement timeout")
 	}
 	return queryFailed("the target database rejected the statement")
 }
 
 // connectionFailed classifies a connect/authentication/DNS failure.
 func connectionFailed() *domain.QueryError {
-	return domain.NewQueryError(domain.ReasonDBConnectionFailed,
-		"failed to connect to the target database")
+	return connectionFailedWith("failed to connect to the target database")
+}
+
+// connectionFailedWith classifies an environment-side database failure with the
+// given safe message.
+func connectionFailedWith(message string) *domain.QueryError {
+	return domain.NewQueryError(domain.ReasonDBConnectionFailed, message)
 }
 
 // queryFailed classifies a SQL execution failure.

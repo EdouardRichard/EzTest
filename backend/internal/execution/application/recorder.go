@@ -37,7 +37,9 @@ type CaseFinishedAuditor interface {
 
 // RecorderDeps are the ports of the structured-submission surface. Locator,
 // CaseRuns, Steps, Assertions, Evidence, Batches, Versions and Sessions are
-// required; Events and Audit are optional.
+// required; Events and Audit are optional. DBQuery and DBCapture are the P7
+// execution.db_assert ports: DBQuery resolves and executes the environment's
+// read-only target, DBCapture persists the db_result evidence artifact.
 type RecorderDeps struct {
 	Locator    CaseRunLocator
 	CaseRuns   CaseRunRepository
@@ -49,6 +51,11 @@ type RecorderDeps struct {
 	Versions   VersionPort
 	Sessions   SessionPort
 	Events     EventPublisher
+	// DBQuery is the read-only database port of execution.db_assert.
+	DBQuery DBQueryPort
+	// DBCapture captures the db_result evidence artifact of execution.db_assert.
+	// *EvidenceService satisfies it.
+	DBCapture EvidenceCapturePort
 	// Audit records execution.case.finished after the terminal finish commits.
 	Audit CaseFinishedAuditor
 	Clock Clock
@@ -281,6 +288,13 @@ func (r *CaseRecorder) RecordAssertion(ctx context.Context, caseRunID int64, in 
 		return domain.AssertionResult{}, recorderToolError(toolCodeInvalidArguments,
 			"assertion %d is not part of case run %d snapshot", in.AssertionID, caseRunID)
 	}
+	// A db assertion result is server-owned (spec §9.5): only execution.db_assert
+	// may write it. Rejecting the generic path closes the forged-passed hole.
+	if strings.EqualFold(strings.TrimSpace(assertion.Kind), "db") {
+		return domain.AssertionResult{}, recorderToolError(toolCodeInvalidArguments,
+			"assertion %d is a db assertion and must be recorded by execution.db_assert (assertion_already_recorded)",
+			in.AssertionID)
+	}
 	existing, err := r.deps.Assertions.ListByCaseRun(ctx, caseRunID)
 	if err != nil {
 		return domain.AssertionResult{}, recorderToolError(toolCodeInternal, "read recorded assertions: %v", err)
@@ -352,7 +366,13 @@ func (r *CaseRecorder) FinishCase(ctx context.Context, caseRunID int64, in Finis
 	if err != nil {
 		return domain.CaseRun{}, recorderToolError(toolCodeInternal, "read recorded assertions: %v", err)
 	}
-	if err := domain.ValidateFinish(run.Snapshot, steps, assertions, in.Decision); err != nil {
+	// The finish evidence gate counts every artifact of the case run: step,
+	// assertion and db_result evidence all satisfy it (spec §6.6.2).
+	evidenceCount, err := r.caseEvidenceCount(ctx, caseRunID)
+	if err != nil {
+		return domain.CaseRun{}, err
+	}
+	if err := domain.ValidateFinish(run.Snapshot, steps, assertions, in.Decision, evidenceCount); err != nil {
 		return domain.CaseRun{}, recorderToolErrorFromReason(err)
 	}
 	// A pause can land while the submission above is validated. Re-read before
@@ -396,7 +416,7 @@ func (r *CaseRecorder) FinishCase(ctx context.Context, caseRunID int64, in Finis
 				"batch_id", run.BatchID, "case_run_id", run.ID, "error", err)
 		}
 	}
-	r.publishFinish(ctx, stored, steps, in.EvidenceIDs)
+	r.publishFinish(ctx, stored, evidenceCount, in.EvidenceIDs)
 	r.auditFinish(ctx, stored)
 	return stored, nil
 }
@@ -415,7 +435,9 @@ func (r *CaseRecorder) auditFinish(ctx context.Context, run domain.CaseRun) {
 }
 
 // publishFinish emits the terminal case events after the finish row committed.
-func (r *CaseRecorder) publishFinish(ctx context.Context, run domain.CaseRun, steps []domain.StepResult, evidenceIDs []int64) {
+// evidenceCount is the case run's committed evidence total (step, assertion and
+// db_result artifacts), the same total the finish gate validated.
+func (r *CaseRecorder) publishFinish(ctx context.Context, run domain.CaseRun, evidenceCount int, evidenceIDs []int64) {
 	detail := map[string]any{
 		"case_run_id": eventID(run.ID),
 		"status":      string(run.Status),
@@ -428,11 +450,7 @@ func (r *CaseRecorder) publishFinish(ctx context.Context, run domain.CaseRun, st
 	if run.FailureReason != "" {
 		detail["failure_reason"] = run.FailureReason
 	}
-	evidenceCount := 0
-	for _, step := range steps {
-		evidenceCount += step.EvidenceCount
-	}
-	detail["evidence_count"] = evidenceCount + len(evidenceIDs)
+	detail["evidence_count"] = evidenceCount
 	refs := EventRefs{
 		EvidenceIDs: copyIDs(evidenceIDs),
 		CaseIDs:     []int64{run.CaseNodeID},
@@ -546,6 +564,20 @@ func (r *CaseRecorder) validateEvidence(ctx context.Context, run domain.CaseRun,
 		seen[id] = struct{}{}
 	}
 	return len(seen), nil
+}
+
+// caseEvidenceCount returns the number of evidence artifacts committed for the
+// case run. It is the finish gate's evidence total: the P6 step count is a
+// subset, and P7 db_result/assertion evidence must count too (spec §6.6.2).
+func (r *CaseRecorder) caseEvidenceCount(ctx context.Context, caseRunID int64) (int, error) {
+	if r.deps.Evidence == nil {
+		return 0, nil
+	}
+	rows, err := r.deps.Evidence.ListByCaseRun(ctx, caseRunID)
+	if err != nil {
+		return 0, recorderToolError(toolCodeInternal, "count case run evidence: %v", err)
+	}
+	return len(rows), nil
 }
 
 // createRefs links the submitted evidence to the recorded result. The

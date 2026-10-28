@@ -8,6 +8,11 @@ import agentdomain "github.com/EdouardRichard/EzTest/backend/internal/agent/doma
 // default-profile lookup never selects it as the runtime's diagnostic default.
 const ExecutionProfileKey = "execution-agent"
 
+// ExecutionDBAssertTool is the P7 db assertion tool (design spec §9.5). It is
+// appended to the execution-agent allowlist seed; the composition root adds it
+// idempotently to an already-seeded profile (EnsureToolAllowed, T17).
+const ExecutionDBAssertTool = "execution.db_assert"
+
 // ExecutionPrompt is the exact eight-point system prompt of design spec §7.2.
 // It is the seed text for the execution-agent profile; an administrator may
 // edit the stored prompt through the P1 profile API afterwards.
@@ -69,5 +74,6 @@ func executionAllowedTools() []string {
 		"execution.step_record",
 		"execution.assertion_record",
 		"execution.case_finish",
+		ExecutionDBAssertTool,
 	}
 }

@@ -10,6 +10,7 @@ import (
 
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	auditdomain "github.com/EdouardRichard/EzTest/backend/internal/audit/domain"
+	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
 	executiondomain "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
@@ -27,6 +28,9 @@ const (
 	ActionBatchCancelled = "execution.batch.cancelled"
 	// ActionCaseFinished is recorded when a case run reaches a terminal state.
 	ActionCaseFinished = "execution.case.finished"
+	// ActionDBAssertExecuted is recorded when execution.db_assert records a db
+	// assertion result (spec §11.2).
+	ActionDBAssertExecuted = "execution.db_assert.executed"
 )
 
 // Audit target types.
@@ -111,6 +115,19 @@ func (s *Sink) CaseFinished(ctx context.Context, run executiondomain.CaseRun, ac
 		metadata["failure_reason"] = run.FailureReason
 	}
 	return s.record(ctx, actor, ActionCaseFinished, targetCaseRun, run.ID, metadata)
+}
+
+// DBAssertExecuted records one db assertion execution (spec §11.2). It carries
+// ids, verdict, row count and duration only: never the SQL, result rows,
+// credentials or model preview.
+func (s *Sink) DBAssertExecuted(ctx context.Context, event executionapp.DBAssertAuditEvent) error {
+	return s.record(ctx, 0, ActionDBAssertExecuted, targetCaseRun, event.CaseRunID, map[string]any{
+		"assertion_result_id": event.AssertionResultID,
+		"case_run_id":         event.CaseRunID,
+		"verdict":             event.Verdict,
+		"row_count":           event.RowCount,
+		"elapsed_ms":          event.ElapsedMS,
+	})
 }
 
 // record appends one audit entry. A nil sink or recorder is a no-op so audit

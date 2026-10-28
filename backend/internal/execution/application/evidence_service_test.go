@@ -343,6 +343,7 @@ func TestCaptureStoresKindExtension(t *testing.T) {
 		{"network_log", "application/json", "json"},
 		{"download", "application/octet-stream", "bin"},
 		{"download", "video/mp4", "bin"},
+		{"db_result", "application/json", "json"},
 	}
 	for i, tc := range cases {
 		evidence, err := service.Capture(context.Background(), CaptureInput{

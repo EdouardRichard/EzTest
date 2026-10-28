@@ -55,6 +55,12 @@ type Limits struct {
 	// HTTPTimeout bounds one http.request when the invocation context has no
 	// deadline (default 30s).
 	HTTPTimeout time.Duration
+	// MaxDBResultBytes caps one db_result evidence artifact of execution.db_assert
+	// (EZTEST_DB_RESULT_MAX_BYTES, default 1 MiB).
+	MaxDBResultBytes int64
+	// MaxDBSQLBytes caps the snapshot SQL of one db assertion
+	// (EZTEST_DB_SQL_MAX_BYTES, default 16 KiB).
+	MaxDBSQLBytes int64
 	// Session resolves the leased session of a case run. The browser tools use
 	// its StorageState/SessionStorage as the executor context's initial state and
 	// http.request injects its authentication Headers. It is optional: without a
@@ -73,6 +79,12 @@ func (l Limits) withDefaults() Limits {
 	}
 	if l.HTTPTimeout <= 0 {
 		l.HTTPTimeout = DefaultHTTPTimeout
+	}
+	if l.MaxDBResultBytes <= 0 {
+		l.MaxDBResultBytes = DefaultMaxDBResultBytes
+	}
+	if l.MaxDBSQLBytes <= 0 {
+		l.MaxDBSQLBytes = DefaultMaxDBSQLBytes
 	}
 	return l
 }
@@ -170,6 +182,7 @@ func (s *toolSet) Tools() []agentdomain.Tool {
 	}, browserDefinitions()...)
 	definitions = append(definitions, httpDefinitions()...)
 	definitions = append(definitions, submitDefinitions()...)
+	definitions = append(definitions, dbAssertDefinitions()...)
 
 	tools := make([]agentdomain.Tool, 0, len(definitions))
 	for _, definition := range definitions {
