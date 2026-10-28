@@ -3,6 +3,8 @@
 // used at JSON boundaries by the layers that persist or serve them.
 package domain
 
+import "fmt"
+
 // BatchStatus mirrors the run_batch.status CHECK constraint.
 type BatchStatus string
 
@@ -74,6 +76,53 @@ const (
 	PauseModeGraceful  PauseMode = "graceful"
 	PauseModeImmediate PauseMode = "immediate"
 )
+
+// BatchKind mirrors the run_batch.kind CHECK constraint (spec §5.3). A P6
+// historical row is always baseline.
+type BatchKind string
+
+// Run batch kinds.
+const (
+	BatchKindBaseline    BatchKind = "baseline"
+	BatchKindIncremental BatchKind = "incremental"
+	BatchKindSupplement  BatchKind = "supplement"
+)
+
+// BaseFallbackHistoryRewritten is the run_batch.base_fallback_reason value of an
+// incremental batch whose parent head could not be used as the base (D49).
+const BaseFallbackHistoryRewritten = "history_rewritten"
+
+// ParseBatchKind normalizes an API kind: an omitted kind is baseline and an
+// unknown kind is rejected. The database CHECK constraint mirrors the same set.
+func ParseBatchKind(raw string) (BatchKind, error) {
+	switch kind := BatchKind(raw); kind {
+	case "":
+		return BatchKindBaseline, nil
+	case BatchKindBaseline, BatchKindIncremental, BatchKindSupplement:
+		return kind, nil
+	default:
+		return "", fmt.Errorf("batch kind %q must be baseline, incremental or supplement", raw)
+	}
+}
+
+// CaseSource mirrors the case_run.source CHECK constraint (spec §5.3): a case
+// run executes either a frozen baseline case or a materialized AI supplement.
+type CaseSource string
+
+// Case run sources.
+const (
+	CaseSourceBaseline     CaseSource = "baseline"
+	CaseSourceAISupplement CaseSource = "ai_supplement"
+)
+
+// ParseCaseSource normalizes a case source. P6 historical rows and snapshots
+// without an origin are baseline (spec §4.2.6).
+func ParseCaseSource(raw string) CaseSource {
+	if CaseSource(raw) == CaseSourceAISupplement {
+		return CaseSourceAISupplement
+	}
+	return CaseSourceBaseline
+}
 
 // FinishDecision is the outcome proposed by an execution agent when it finishes
 // a case run. FailureClass is only meaningful for failed, blocked and

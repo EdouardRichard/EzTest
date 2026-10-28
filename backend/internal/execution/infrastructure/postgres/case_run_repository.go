@@ -17,7 +17,7 @@ import (
 // caseRunColumnList is the shared column order of every case_run query and the
 // order scanCaseRun expects.
 const caseRunColumnList = `id, batch_id, version_id, case_node_id, case_revision,
-	case_hash, case_snapshot, attempt, status, failure_class, failure_reason,
+	case_hash, source, case_snapshot, attempt, status, failure_class, failure_reason,
 	summary, session_id, session_snapshot_id, agent_session_id, agent_run_id,
 	retry_of_case_run_id, cleanup_required, interrupted_step_seq, started_at,
 	finished_at, duration_ms, created_at, updated_at`
@@ -57,6 +57,7 @@ func scanCaseRun(row rowScanner) (domain.CaseRun, error) {
 		&run.CaseNodeID,
 		&run.CaseRevision,
 		&run.CaseHash,
+		&run.Source,
 		&snapshot,
 		&run.Attempt,
 		&run.Status,
@@ -81,6 +82,10 @@ func scanCaseRun(row rowScanner) (domain.CaseRun, error) {
 	if err := json.Unmarshal(snapshot, &run.Snapshot); err != nil {
 		return domain.CaseRun{}, fmt.Errorf("decode case snapshot: %w", err)
 	}
+	// P6 historical rows predate case_run.source: read them as baseline. The
+	// snapshot origin is resolved lazily by CaseSnapshotNode.EffectiveOrigin so a
+	// historical snapshot keeps its exact stored JSON (and copied case_hash).
+	run.Source = domain.ParseCaseSource(string(run.Source))
 	if failureClass != nil {
 		class := domain.FailureClass(*failureClass)
 		run.FailureClass = &class
@@ -107,17 +112,17 @@ func insertCaseRun(ctx context.Context, q querier, run domain.CaseRun) (domain.C
 	stored, err := scanCaseRun(q.QueryRow(ctx, `
 		INSERT INTO case_run
 			(id, batch_id, version_id, case_node_id, case_revision, case_hash,
-			 case_snapshot, attempt, status, failure_class, failure_reason, summary,
-			 session_id, session_snapshot_id, agent_session_id, agent_run_id,
+			 source, case_snapshot, attempt, status, failure_class, failure_reason,
+			 summary, session_id, session_snapshot_id, agent_session_id, agent_run_id,
 			 retry_of_case_run_id, cleanup_required, interrupted_step_seq,
 			 started_at, finished_at, duration_ms, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12,
-		        $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
-		        COALESCE($23, now()), COALESCE($24, now()))
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13,
+		        $14, $15, $16, $17, $18, $19, $20, $21, $22, $23,
+		        COALESCE($24, now()), COALESCE($25, now()))
 		RETURNING `+caseRunColumnList,
 		run.ID, run.BatchID, run.VersionID, run.CaseNodeID, run.CaseRevision,
-		run.CaseHash, string(snapshot), run.Attempt, run.Status,
-		nullableFailureClass(run.FailureClass), run.FailureReason, run.Summary,
+		run.CaseHash, caseSourceParam(run.Source), string(snapshot), run.Attempt,
+		run.Status, nullableFailureClass(run.FailureClass), run.FailureReason, run.Summary,
 		nullableInt(run.SessionID), nullableInt(run.SessionSnapshotID),
 		nullableInt(run.AgentSessionID), nullableInt(run.AgentRunID),
 		nullableInt(run.RetryOfCaseRunID), run.CleanupRequired,
@@ -406,4 +411,10 @@ func isTerminalCaseRunStatus(status domain.CaseRunStatus) bool {
 // fallbacks.
 func caseRunNotFound(caseRunID int64) error {
 	return fmt.Errorf("%w: case run %d", application.ErrCaseRunNotFound, caseRunID)
+}
+
+// caseSourceParam renders the case_run.source binding: an empty source (a
+// caller that predates P7) is baseline, matching the column default and CHECK.
+func caseSourceParam(source domain.CaseSource) string {
+	return string(domain.ParseCaseSource(string(source)))
 }

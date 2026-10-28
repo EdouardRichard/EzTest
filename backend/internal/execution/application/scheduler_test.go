@@ -1066,6 +1066,12 @@ func (b *schedBatchRepo) UpdateBatchFailure(ctx context.Context, batchID int64, 
 	return b.batches[batchID], nil
 }
 
+// CountTerminalBatchesAwaitingAutonomy implements the P7 creation gate; the
+// scheduler never creates a batch, so the fake reports a settled chain.
+func (b *schedBatchRepo) CountTerminalBatchesAwaitingAutonomy(context.Context, int64) (int, error) {
+	return 0, nil
+}
+
 // setPaused flips the pause flag directly (test helper, not the API surface).
 func (b *schedBatchRepo) setPaused(batchID int64, paused bool, mode domain.PauseMode) {
 	if _, err := b.SetPaused(context.Background(), batchID, paused, mode, "user"); err != nil {

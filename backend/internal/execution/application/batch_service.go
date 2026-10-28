@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
@@ -13,10 +15,20 @@ import (
 
 // Batch service defaults and stable identifiers.
 const (
-	// versionStatusExecuting is the only version status that may start a batch
-	// (spec §5.1). The execution domain intentionally does not depend on the
-	// version context's constants.
-	versionStatusExecuting = "executing"
+	// versionStatusExecuting starts baseline/supplement batches and
+	// versionStatusContinuing is the P7 continuation status of incremental
+	// batches (spec §5.1). The execution domain intentionally does not depend on
+	// the version context's constants.
+	versionStatusExecuting  = "executing"
+	versionStatusContinuing = "continuing"
+	// continuePhaseDesigning/continuePhaseExecuting are the only continue
+	// phases that may start an incremental batch (spec §5.3).
+	continuePhaseDesigning = "designing"
+	continuePhaseExecuting = "executing"
+	// Mindmap case node statuses execution reads as gate inputs (spec §5.2).
+	caseNodeStatusDraft        = "draft"
+	caseNodeStatusRejected     = "rejected"
+	caseNodeStatusSupplemented = "supplemented"
 	// DefaultMaxCasesPerBatch is the per-batch case cap used when no
 	// EZTEST_EXEC_MAX_CASES_PER_BATCH value is wired.
 	DefaultMaxCasesPerBatch = 200
@@ -27,8 +39,19 @@ const (
 	caseRunPageSize = 200
 )
 
+// CreateBatchCommand is the create-batch input of spec §5.3/§7.7. An omitted
+// Kind is baseline, CaseIDs selects the batch cases (baseline defaults to the
+// whole baseline) and ParentBatchID links incremental/supplement batches to the
+// previous terminal batch.
+type CreateBatchCommand struct {
+	CaseIDs       []int64
+	Kind          string
+	ParentBatchID *int64
+}
+
 // BatchServiceDeps are the ports of the batch use cases. Versions, Mindmap,
-// Batches, CaseRuns and IDs are required; Events and Clock may be nil.
+// Batches, CaseRuns and IDs are required; Events, Clock and CodeHistory may be
+// nil.
 type BatchServiceDeps struct {
 	Versions VersionPort
 	Mindmap  MindmapPort
@@ -39,6 +62,9 @@ type BatchServiceDeps struct {
 	IDs      IDGenerator
 	// MaxCases is the per-batch case cap (EZTEST_EXEC_MAX_CASES_PER_BATCH).
 	MaxCases int
+	// CodeHistory is the optional D49 commit surface (spec §6.8). Without it an
+	// incremental batch keeps the parent head but cannot pin the current head.
+	CodeHistory CodeHistoryPort
 }
 
 // BatchService owns the run_batch lifecycle: creation with snapshot pinning,
@@ -64,34 +90,43 @@ func NewBatchService(deps BatchServiceDeps) *BatchService {
 	return &BatchService{deps: deps, now: now}
 }
 
-// Create starts a batch for an executing, environment-bound version
-// (spec §5.1, §4.3). It validates every gate, pins the baseline hash and the
-// immutable per-case snapshots, allocates the version's next batch number and
-// then writes the batch and its pending runs in one repository call before
+// Create starts one baseline, incremental or supplement batch (spec §5.1,
+// §5.3, §4.3). It validates the kind-specific gates, pins the baseline hash and
+// the immutable per-case snapshots, allocates the version's next batch number
+// and then writes the batch and its pending runs in one repository call before
 // publishing batch.created and batch.started. Allocating before the insert
 // means a committed batch always carries a batch_no the version already
 // recorded; if the insert fails the number is handed back (when it is still the
 // newest) and the original error is returned, so a failure can never leave a
 // batch with an unrecorded number or wedge future batches. The executor health
-// probe deliberately does not live here: it is an HTTP-layer gate (T19).
+// probe deliberately does not live here: it is an HTTP-layer gate.
 //
-// A nil or empty caseIDs selects every baseline case. Explicit ids must all be
-// baseline cases; duplicates are collapsed.
-func (s *BatchService) Create(ctx context.Context, versionID, actor int64, caseIDs []int64) (*domain.RunBatch, error) {
+// A baseline batch keeps the P6 behavior: an empty CaseIDs selects every
+// baseline case, every snapshot must agree with the frozen baseline hash, and
+// the stored graph_hash is that same baseline hash. An incremental batch
+// requires a continuing version in designing/executing, a non-empty selection
+// from the current working graph and D49 base/head. A supplement batch is
+// worker-only (the HTTP layer rejects a user call): it requires a terminal
+// parent, inherits the parent commits and accepts only materialized supplement
+// nodes, which are marked merged after the commit.
+func (s *BatchService) Create(ctx context.Context, versionID, actor int64, cmd CreateBatchCommand) (*domain.RunBatch, error) {
 	if err := s.requireCreateDeps(); err != nil {
 		return nil, err
+	}
+	kind, err := domain.ParseBatchKind(cmd.Kind)
+	if err != nil {
+		return nil, newInvalidReasonError("invalid_batch_kind", err.Error())
 	}
 	version, err := s.deps.Versions.GetVersion(ctx, versionID)
 	if err != nil {
 		return nil, err
 	}
-	if version.Status != versionStatusExecuting {
-		return nil, newReasonError("version_not_executable",
-			fmt.Sprintf("version %d is %s, execution requires executing", versionID, version.Status))
+	if err := validateVersionForBatchKind(versionID, version, kind); err != nil {
+		return nil, err
 	}
-	if version.SystemID == nil || version.EnvironmentID == nil {
-		return nil, newReasonError("environment_required",
-			fmt.Sprintf("version %d must be bound to a system and an environment", versionID))
+	parent, err := s.terminalParent(ctx, versionID, kind, cmd.ParentBatchID)
+	if err != nil {
+		return nil, err
 	}
 
 	baseline, err := s.deps.Mindmap.Baseline(ctx, versionID)
@@ -107,33 +142,39 @@ func (s *BatchService) Create(ctx context.Context, versionID, actor int64, caseI
 			fmt.Sprintf("version %d has no case baseline", versionID))
 	}
 
-	selected, err := selectCaseIDs(caseIDs, baseline.CaseIDs)
-	if err != nil {
-		return nil, newInvalidReasonError("invalid_case_ids", err.Error())
-	}
-	if len(selected) == 0 {
-		return nil, newReasonError("no_cases",
-			fmt.Sprintf("version %d baseline selects no cases", versionID))
-	}
-	if len(selected) > s.deps.MaxCases {
-		return nil, newInvalidReasonError("too_many_cases",
-			fmt.Sprintf("batch selects %d cases; the limit is %d", len(selected), s.deps.MaxCases))
-	}
-
-	views, err := s.deps.Mindmap.SnapshotCases(ctx, versionID, selected)
-	if err != nil {
-		if errors.Is(err, domain.ErrInvalidCaseIDs) {
-			return nil, newInvalidReasonError("invalid_case_ids", err.Error())
+	// The previous autonomous chain (analysis, report, supplement) must settle
+	// before another baseline/incremental batch starts (spec §5.3).
+	if kind != domain.BatchKindSupplement {
+		awaiting, err := s.deps.Batches.CountTerminalBatchesAwaitingAutonomy(ctx, versionID)
+		if err != nil {
+			return nil, err
 		}
-		return nil, err
+		if awaiting > 0 {
+			return nil, newReasonError("autonomy_pending",
+				fmt.Sprintf("version %d has %d terminal batch(es) whose autonomous chain is not finished",
+					versionID, awaiting))
+		}
 	}
 
 	now := s.now()
+	plan, err := s.planBatch(ctx, versionID, version, kind, cmd, baseline, parent, now)
+	if err != nil {
+		return nil, err
+	}
+	// The merged transition is a mindmap write; fail closed before persisting a
+	// batch that would silently skip it.
+	if len(plan.supplementIDs) > 0 {
+		if _, ok := s.deps.Mindmap.(SupplementGraphPort); !ok {
+			return nil, newReasonError("supplement_unavailable",
+				"the mindmap supplement write path is not configured")
+		}
+	}
+
 	batchID, err := nextID(s.deps.IDs)
 	if err != nil {
 		return nil, err
 	}
-	runs, err := s.buildRuns(batchID, versionID, views, selected, baseline.Hash, now)
+	runs, err := s.buildRuns(batchID, versionID, plan.selected, plan.views, now)
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +186,12 @@ func (s *BatchService) Create(ctx context.Context, versionID, actor int64, caseI
 		Paused:             false,
 		PauseMode:          domain.PauseModeGraceful,
 		BaselineHash:       baseline.Hash,
-		CodeBaselineCommit: copyStringPointer(baseline.CodeCommit),
+		GraphHash:          plan.graphHash,
+		Kind:               kind,
+		ParentBatchID:      copyInt64Pointer(cmd.ParentBatchID),
+		BaseFallbackReason: plan.fallback,
+		CodeBaselineCommit: plan.base,
+		HeadCommit:         plan.head,
 		CaseCount:          len(runs),
 		CreatedBy:          actor,
 		CreatedAt:          now,
@@ -176,17 +222,21 @@ func (s *BatchService) Create(ctx context.Context, versionID, actor int64, caseI
 		return nil, err
 	}
 
+	// Post-commit chain side effects are best effort: the batch is authoritative
+	// and the next worker tick can still observe the stored state.
+	if kind == domain.BatchKindIncremental {
+		s.markContinuePhaseExecuting(ctx, versionID)
+	}
+	if len(plan.supplementIDs) > 0 {
+		s.markSupplementsMerged(ctx, versionID, plan.supplementIDs)
+	}
+
 	s.publish(ctx, Event{
 		Type:      "batch.created",
 		VersionID: versionID,
 		BatchID:   created.ID,
 		Summary:   "batch created",
-		Detail: map[string]any{
-			"batch_no":      created.BatchNo,
-			"case_count":    created.CaseCount,
-			"baseline_hash": created.BaselineHash,
-			"status":        string(created.Status),
-		},
+		Detail:    batchCreatedDetail(created),
 	})
 	s.publish(ctx, Event{
 		Type:      "batch.started",
@@ -197,9 +247,390 @@ func (s *BatchService) Create(ctx context.Context, versionID, actor int64, caseI
 			"batch_no":   created.BatchNo,
 			"case_count": created.CaseCount,
 			"status":     string(created.Status),
+			"kind":       string(created.Kind),
 		},
 	})
 	return &created, nil
+}
+
+// batchPlan is the resolved input of one batch create: the selected cases, their
+// pinned snapshots, the working graph hash, D49 commits and supplement nodes.
+type batchPlan struct {
+	selected      []int64
+	views         map[int64]CaseSnapshotSourceView
+	graphHash     string
+	base          *string
+	head          *string
+	fallback      string
+	supplementIDs []int64
+}
+
+// planBatch applies the kind-specific selection, graph-hash and commit rules.
+func (s *BatchService) planBatch(ctx context.Context, versionID int64, version VersionRef, kind domain.BatchKind, cmd CreateBatchCommand, baseline BaselineRef, parent *domain.RunBatch, now time.Time) (batchPlan, error) {
+	if kind == domain.BatchKindBaseline {
+		return s.planBaseline(ctx, versionID, version, cmd, baseline, now)
+	}
+	return s.planChained(ctx, versionID, version, kind, cmd, baseline, parent, now)
+}
+
+// planBaseline keeps the P6 selection and baseline-drift gate.
+func (s *BatchService) planBaseline(ctx context.Context, versionID int64, version VersionRef, cmd CreateBatchCommand, baseline BaselineRef, now time.Time) (batchPlan, error) {
+	selected, err := selectCaseIDs(cmd.CaseIDs, baseline.CaseIDs)
+	if err != nil {
+		return batchPlan{}, newInvalidReasonError("invalid_case_ids", err.Error())
+	}
+	if len(selected) == 0 {
+		return batchPlan{}, newReasonError("no_cases",
+			fmt.Sprintf("version %d baseline selects no cases", versionID))
+	}
+	if len(selected) > s.deps.MaxCases {
+		return batchPlan{}, newInvalidReasonError("too_many_cases",
+			fmt.Sprintf("batch selects %d cases; the limit is %d", len(selected), s.deps.MaxCases))
+	}
+	views, err := s.snapshotCases(ctx, versionID, selected)
+	if err != nil {
+		return batchPlan{}, err
+	}
+	for _, caseNodeID := range selected {
+		view := views[caseNodeID]
+		// A baseline batch executes only frozen baseline cases; a supplement
+		// node belongs to the next chained batch (spec §5.3).
+		if effectiveViewOrigin(view) != domain.CaseSourceBaseline {
+			return batchPlan{}, newInvalidReasonError("invalid_case_ids",
+				fmt.Sprintf("case %d is a supplement case, not a baseline case", caseNodeID))
+		}
+		if view.GraphHash != baseline.Hash {
+			return batchPlan{}, newReasonError("baseline_changed",
+				fmt.Sprintf("case %d frozen graph hash does not match the baseline", caseNodeID))
+		}
+	}
+	return batchPlan{
+		selected:  selected,
+		views:     views,
+		graphHash: baseline.Hash,
+		base:      firstCommit(baseline.CodeCommit, version.CodeBaselineCommit),
+		head:      s.currentHead(ctx, versionID),
+	}, nil
+}
+
+// planChained resolves an incremental or supplement batch against the current
+// working graph. Both fetch every current case so the stored graph_hash
+// describes the whole working graph, not just the selected subset.
+func (s *BatchService) planChained(ctx context.Context, versionID int64, version VersionRef, kind domain.BatchKind, cmd CreateBatchCommand, baseline BaselineRef, parent *domain.RunBatch, now time.Time) (batchPlan, error) {
+	if len(cmd.CaseIDs) == 0 {
+		if kind == domain.BatchKindIncremental {
+			return batchPlan{}, newReasonError("no_incremental_cases",
+				fmt.Sprintf("version %d incremental batch requires explicit caseIds", versionID))
+		}
+		return batchPlan{}, newInvalidReasonError("invalid_case_ids",
+			"a supplement batch requires explicit caseIds")
+	}
+	currentIDs := sortedUniqueIDs(baseline.CaseIDs)
+	if len(currentIDs) == 0 {
+		if kind == domain.BatchKindIncremental {
+			return batchPlan{}, newReasonError("no_incremental_cases",
+				fmt.Sprintf("version %d has no current working graph cases", versionID))
+		}
+		return batchPlan{}, newInvalidReasonError("invalid_case_ids",
+			"the current working graph has no cases")
+	}
+	views, err := s.snapshotCases(ctx, versionID, currentIDs)
+	if err != nil {
+		return batchPlan{}, err
+	}
+
+	allowed := make([]int64, 0, len(currentIDs))
+	for _, caseNodeID := range currentIDs {
+		view := views[caseNodeID]
+		switch kind {
+		case domain.BatchKindIncremental:
+			// Only cases of the current working graph are selectable; a rejected
+			// or draft node cannot enter a batch (spec §5.2/§5.3).
+			status := normalizedNodeStatus(view.Status)
+			if status == caseNodeStatusRejected || status == caseNodeStatusDraft {
+				continue
+			}
+		case domain.BatchKindSupplement:
+			// A supplement batch executes only this parent's materialized
+			// supplement nodes.
+			if effectiveViewOrigin(view) != domain.CaseSourceAISupplement {
+				continue
+			}
+			status := normalizedNodeStatus(view.Status)
+			if status != "" && status != caseNodeStatusSupplemented {
+				continue
+			}
+		}
+		allowed = append(allowed, caseNodeID)
+	}
+	selected, err := selectCaseIDs(cmd.CaseIDs, allowed)
+	if err != nil {
+		return batchPlan{}, newInvalidReasonError("invalid_case_ids", err.Error())
+	}
+	if len(selected) == 0 {
+		return batchPlan{}, newInvalidReasonError("invalid_case_ids",
+			"no selectable case remains in the current working graph")
+	}
+	if len(selected) > s.deps.MaxCases {
+		return batchPlan{}, newInvalidReasonError("too_many_cases",
+			fmt.Sprintf("batch selects %d cases; the limit is %d", len(selected), s.deps.MaxCases))
+	}
+
+	snapshots := make([]domain.CaseSnapshot, 0, len(currentIDs))
+	for _, caseNodeID := range currentIDs {
+		snapshots = append(snapshots, snapshotFromView(views[caseNodeID], now))
+	}
+	graphHash := domain.WorkingGraphHash(versionID, snapshots)
+	if graphHash == "" {
+		return batchPlan{}, fmt.Errorf("execution: the current working graph of version %d cannot be hashed", versionID)
+	}
+
+	plan := batchPlan{selected: selected, views: views, graphHash: graphHash}
+	for _, caseNodeID := range selected {
+		if effectiveViewOrigin(views[caseNodeID]) == domain.CaseSourceAISupplement {
+			plan.supplementIDs = append(plan.supplementIDs, caseNodeID)
+		}
+	}
+
+	if kind == domain.BatchKindSupplement {
+		if parent == nil {
+			return batchPlan{}, fmt.Errorf("execution: supplement batch of version %d has no parent", versionID)
+		}
+		plan.base = copyStringPointer(parent.CodeBaselineCommit)
+		plan.head = copyStringPointer(parent.HeadCommit)
+		plan.fallback = parent.BaseFallbackReason
+		return plan, nil
+	}
+	versionBase := firstCommit(baseline.CodeCommit, version.CodeBaselineCommit)
+	plan.base, plan.head, plan.fallback = s.incrementalCommits(ctx, versionID, versionBase, parent)
+	return plan, nil
+}
+
+// terminalParent validates the optional/required parent link of a chained
+// batch. A missing or foreign batch is ErrBatchNotFound; a non-terminal parent
+// is invalid_parent_batch.
+func (s *BatchService) terminalParent(ctx context.Context, versionID int64, kind domain.BatchKind, parentID *int64) (*domain.RunBatch, error) {
+	if kind == domain.BatchKindBaseline {
+		if parentID != nil {
+			return nil, newReasonError("invalid_parent_batch",
+				"a baseline batch has no parent batch")
+		}
+		return nil, nil
+	}
+	if parentID == nil {
+		if kind == domain.BatchKindSupplement {
+			return nil, newReasonError("invalid_parent_batch",
+				"a supplement batch requires its parent batch")
+		}
+		return nil, nil
+	}
+	parent, err := s.deps.Batches.GetBatch(ctx, versionID, *parentID)
+	if err != nil {
+		return nil, err
+	}
+	if !isTerminalBatch(parent.Status) {
+		return nil, newReasonError("invalid_parent_batch",
+			fmt.Sprintf("batch %d is %s; a parent batch must be terminal", parent.ID, parent.Status))
+	}
+	return &parent, nil
+}
+
+// snapshotCases fetches and validates the requested snapshots. An id outside
+// the current graph is invalid_case_ids (422).
+func (s *BatchService) snapshotCases(ctx context.Context, versionID int64, caseIDs []int64) (map[int64]CaseSnapshotSourceView, error) {
+	views, err := s.deps.Mindmap.SnapshotCases(ctx, versionID, caseIDs)
+	if err != nil {
+		if errors.Is(err, domain.ErrInvalidCaseIDs) {
+			return nil, newInvalidReasonError("invalid_case_ids", err.Error())
+		}
+		return nil, err
+	}
+	if len(views) != len(caseIDs) {
+		return nil, fmt.Errorf("execution: mindmap returned %d snapshots for %d cases", len(views), len(caseIDs))
+	}
+	byID := make(map[int64]CaseSnapshotSourceView, len(views))
+	for _, view := range views {
+		if _, duplicate := byID[view.CaseNodeID]; duplicate {
+			return nil, fmt.Errorf("execution: mindmap returned duplicate snapshots for case %d", view.CaseNodeID)
+		}
+		byID[view.CaseNodeID] = view
+	}
+	return byID, nil
+}
+
+// incrementalCommits resolves D49: base is the parent head, head is the current
+// branch head, and a missing/non-ancestor parent head falls back to the version
+// baseline with the history_rewritten reason. Without a CodeHistoryPort the
+// current head stays unknown and the parent head is kept as the base.
+func (s *BatchService) incrementalCommits(ctx context.Context, versionID int64, versionBase *string, parent *domain.RunBatch) (*string, *string, string) {
+	head := s.currentHead(ctx, versionID)
+	var parentHead *string
+	if parent != nil {
+		parentHead = parent.HeadCommit
+	}
+	base := parentHead
+	fallback := ""
+	if parent != nil && parentHead == nil {
+		base = versionBase
+		fallback = domain.BaseFallbackHistoryRewritten
+	} else if parent == nil {
+		base = versionBase
+	}
+	if parentHead != nil && head != nil && s.deps.CodeHistory != nil {
+		ancestor, err := s.deps.CodeHistory.IsAncestor(ctx, versionID, *parentHead, *head)
+		if err != nil {
+			slog.WarnContext(ctx, "execution: incremental base ancestry check failed",
+				"version_id", versionID, "base", *parentHead, "head", *head, "error", err)
+			ancestor = false
+		}
+		if !ancestor {
+			base = versionBase
+			fallback = domain.BaseFallbackHistoryRewritten
+		}
+	}
+	return copyStringPointer(base), head, fallback
+}
+
+// currentHead pins the current branch head when the code-history port is wired.
+// A failure degrades to an unknown head instead of blocking the batch.
+func (s *BatchService) currentHead(ctx context.Context, versionID int64) *string {
+	if s.deps.CodeHistory == nil {
+		return nil
+	}
+	head, err := s.deps.CodeHistory.HeadCommit(ctx, versionID)
+	if err != nil {
+		slog.WarnContext(ctx, "execution: resolve current head for a batch",
+			"version_id", versionID, "error", err)
+		return nil
+	}
+	if head == "" {
+		return nil
+	}
+	return &head
+}
+
+// markContinuePhaseExecuting records continue_phase=executing after an
+// incremental batch committed. A missing capability is only logged: the batch
+// is already persisted and the P7 wiring supplies the version method.
+func (s *BatchService) markContinuePhaseExecuting(ctx context.Context, versionID int64) {
+	setter, ok := s.deps.Versions.(ContinuePhasePort)
+	if !ok {
+		slog.WarnContext(ctx, "execution: version continue_phase setter is not configured",
+			"version_id", versionID, "phase", continuePhaseExecuting)
+		return
+	}
+	if err := setter.SetContinuePhase(ctx, versionID, continuePhaseExecuting); err != nil {
+		slog.WarnContext(ctx, "execution: set continue_phase after batch creation",
+			"version_id", versionID, "phase", continuePhaseExecuting, "error", err)
+	}
+}
+
+// markSupplementsMerged adopts the selected supplement nodes once the batch is
+// committed. A failure is logged: the nodes stay supplemented and a later
+// attempt cannot double-adopt them, but the batch already pins its snapshots.
+func (s *BatchService) markSupplementsMerged(ctx context.Context, versionID int64, caseNodeIDs []int64) {
+	marker, ok := s.deps.Mindmap.(SupplementGraphPort)
+	if !ok {
+		return
+	}
+	if err := marker.MarkMerged(ctx, versionID, caseNodeIDs); err != nil {
+		slog.WarnContext(ctx, "execution: mark supplement cases merged",
+			"version_id", versionID, "case_node_ids", caseNodeIDs, "error", err)
+	}
+}
+
+// validateVersionForBatchKind enforces the status/phase gate of each kind.
+func validateVersionForBatchKind(versionID int64, version VersionRef, kind domain.BatchKind) error {
+	switch kind {
+	case domain.BatchKindIncremental:
+		if version.Status != versionStatusContinuing {
+			return newReasonError("version_not_executable",
+				fmt.Sprintf("version %d is %s, an incremental batch requires %s",
+					versionID, version.Status, versionStatusContinuing))
+		}
+		phase := strings.TrimSpace(version.ContinuePhase)
+		if phase != continuePhaseDesigning && phase != continuePhaseExecuting {
+			return newReasonError("continuing_batch_conflict",
+				fmt.Sprintf("version %d continue phase is %q; an incremental batch requires designing or executing",
+					versionID, phase))
+		}
+	default:
+		if version.Status != versionStatusExecuting {
+			return newReasonError("version_not_executable",
+				fmt.Sprintf("version %d is %s, execution requires %s",
+					versionID, version.Status, versionStatusExecuting))
+		}
+	}
+	if version.SystemID == nil || version.EnvironmentID == nil {
+		return newReasonError("environment_required",
+			fmt.Sprintf("version %d must be bound to a system and an environment", versionID))
+	}
+	return nil
+}
+
+// isTerminalBatch reports whether a batch status ended the batch.
+func isTerminalBatch(status domain.BatchStatus) bool {
+	switch status {
+	case domain.BatchStatusDone, domain.BatchStatusFailed, domain.BatchStatusCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+// normalizedNodeStatus lower-cases and trims a mindmap node status.
+func normalizedNodeStatus(status string) string {
+	return strings.ToLower(strings.TrimSpace(status))
+}
+
+// effectiveViewOrigin returns the case provenance, treating a view without an
+// origin (P6 snapshots) as baseline.
+func effectiveViewOrigin(view CaseSnapshotSourceView) domain.CaseSource {
+	origin := view.Origin
+	if origin == "" {
+		origin = view.Node.Origin
+	}
+	return domain.ParseCaseSource(string(origin))
+}
+
+// firstCommit prefers the frozen baseline commit, falling back to the version
+// projection. An empty value is absent.
+func firstCommit(primary, fallback *string) *string {
+	if primary != nil && *primary != "" {
+		return copyStringPointer(primary)
+	}
+	if fallback != nil && *fallback != "" {
+		return copyStringPointer(fallback)
+	}
+	return nil
+}
+
+// copyInt64Pointer copies an optional id so callers cannot mutate the stored
+// value through the returned batch.
+func copyInt64Pointer(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	copied := *value
+	return &copied
+}
+
+// batchCreatedDetail renders the batch.created event detail with the P7 kind,
+// parent link (a decimal string per D29) and working graph hash.
+func batchCreatedDetail(batch domain.RunBatch) map[string]any {
+	detail := map[string]any{
+		"batch_no":             batch.BatchNo,
+		"case_count":           batch.CaseCount,
+		"baseline_hash":        batch.BaselineHash,
+		"graph_hash":           batch.GraphHash,
+		"kind":                 string(batch.Kind),
+		"base_fallback_reason": batch.BaseFallbackReason,
+		"status":               string(batch.Status),
+	}
+	if batch.ParentBatchID != nil {
+		detail["parent_batch_id"] = strconv.FormatInt(*batch.ParentBatchID, 10)
+	}
+	return detail
 }
 
 // Get returns one batch of versionID. A missing or foreign batch is
@@ -481,6 +912,10 @@ func (s *BatchService) Rerun(ctx context.Context, versionID, batchID, caseRunID,
 	}
 	now := s.now()
 	retryOf := run.ID
+	source := run.Source
+	if source == "" {
+		source = run.Snapshot.Node.EffectiveOrigin()
+	}
 	rerun := domain.CaseRun{
 		ID:                 id,
 		BatchID:            run.BatchID,
@@ -488,6 +923,7 @@ func (s *BatchService) Rerun(ctx context.Context, versionID, batchID, caseRunID,
 		CaseNodeID:         run.CaseNodeID,
 		CaseRevision:       run.CaseRevision,
 		CaseHash:           run.CaseHash,
+		Source:             source,
 		Snapshot:           cloneSnapshot(run.Snapshot),
 		Attempt:            run.Attempt + 1,
 		Status:             domain.CaseRunStatusPending,
@@ -505,27 +941,16 @@ func (s *BatchService) Rerun(ctx context.Context, versionID, batchID, caseRunID,
 }
 
 // buildRuns pins one immutable snapshot and one pending run per selected case.
-func (s *BatchService) buildRuns(batchID, versionID int64, views []CaseSnapshotSourceView, selected []int64, baselineHash string, now time.Time) ([]domain.CaseRun, error) {
-	if len(views) != len(selected) {
-		return nil, fmt.Errorf("execution: mindmap returned %d snapshots for %d selected cases", len(views), len(selected))
-	}
-	byID := make(map[int64]CaseSnapshotSourceView, len(views))
-	for _, view := range views {
-		if _, duplicate := byID[view.CaseNodeID]; duplicate {
-			return nil, fmt.Errorf("execution: mindmap returned duplicate snapshots for case %d", view.CaseNodeID)
-		}
-		byID[view.CaseNodeID] = view
-	}
+// Every view was already validated by planBatch against the kind-specific gate;
+// the snapshot and the run source carry the same effective origin.
+func (s *BatchService) buildRuns(batchID, versionID int64, selected []int64, views map[int64]CaseSnapshotSourceView, now time.Time) ([]domain.CaseRun, error) {
 	runs := make([]domain.CaseRun, 0, len(selected))
 	for _, caseNodeID := range selected {
-		view, ok := byID[caseNodeID]
+		view, ok := views[caseNodeID]
 		if !ok {
 			return nil, fmt.Errorf("execution: mindmap returned no snapshot for case %d", caseNodeID)
 		}
-		if view.GraphHash != baselineHash {
-			return nil, newReasonError("baseline_changed",
-				fmt.Sprintf("case %d frozen graph hash does not match the baseline", caseNodeID))
-		}
+		origin := effectiveViewOrigin(view)
 		snapshot := snapshotFromView(view, now)
 		caseHash := domain.CanonicalCaseHash(snapshot)
 		if caseHash == "" {
@@ -542,6 +967,7 @@ func (s *BatchService) buildRuns(batchID, versionID int64, views []CaseSnapshotS
 			CaseNodeID:   caseNodeID,
 			CaseRevision: view.Revision,
 			CaseHash:     caseHash,
+			Source:       origin,
 			Snapshot:     snapshot,
 			Attempt:      1,
 			Status:       domain.CaseRunStatusPending,
@@ -615,24 +1041,25 @@ func (s *BatchService) publish(ctx context.Context, event Event) {
 	}
 }
 
-// selectCaseIDs validates a requested selection against the frozen baseline and
+// selectCaseIDs validates a requested selection against the allowed case set and
 // returns it sorted ascending and deduplicated. An empty request selects every
-// baseline case.
-func selectCaseIDs(requested, baselineIDs []int64) ([]int64, error) {
-	valid := make(map[int64]struct{}, len(baselineIDs))
-	for _, id := range baselineIDs {
+// allowed case; a supplemental/incremental caller rejects an empty request
+// before calling it.
+func selectCaseIDs(requested, allowedIDs []int64) ([]int64, error) {
+	valid := make(map[int64]struct{}, len(allowedIDs))
+	for _, id := range allowedIDs {
 		if id > 0 {
 			valid[id] = struct{}{}
 		}
 	}
 	if len(requested) == 0 {
-		return sortedUniqueIDs(baselineIDs), nil
+		return sortedUniqueIDs(allowedIDs), nil
 	}
 	selected := make([]int64, 0, len(requested))
 	seen := make(map[int64]struct{}, len(requested))
 	for _, id := range requested {
 		if _, ok := valid[id]; !ok {
-			return nil, fmt.Errorf("case %d is not a case of the frozen baseline", id)
+			return nil, fmt.Errorf("case %d is not part of the current case graph", id)
 		}
 		if _, duplicate := seen[id]; duplicate {
 			continue
@@ -666,13 +1093,17 @@ func sortedUniqueIDs(ids []int64) []int64 {
 }
 
 // snapshotFromView pins the mindmap projection into an immutable case snapshot.
+// The node origin is normalized so a P6 view without one stores baseline and a
+// supplement case stores ai_supplement (spec §5.3).
 func snapshotFromView(view CaseSnapshotSourceView, capturedAt time.Time) domain.CaseSnapshot {
 	sources := make([]domain.CaseSnapshotSource, 0, len(view.RequirementIDs))
 	for _, requirementID := range view.RequirementIDs {
 		sources = append(sources, domain.CaseSnapshotSource{RequirementID: requirementID})
 	}
+	node := view.Node
+	node.Origin = effectiveViewOrigin(view)
 	return domain.CaseSnapshot{
-		Node:       view.Node,
+		Node:       node,
 		Steps:      append([]domain.CaseSnapshotStep(nil), view.Steps...),
 		Assertions: append([]domain.CaseSnapshotAssertion(nil), view.Assertions...),
 		Sources:    sources,

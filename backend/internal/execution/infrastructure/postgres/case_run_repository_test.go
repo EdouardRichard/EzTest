@@ -122,7 +122,8 @@ func (q *finishPersistQuerier) QueryRow(_ context.Context, sql string, args ...a
 	q.sql = sql
 	q.args = args
 	return fakeScanRow{values: []any{
-		int64(31), int64(11), int64(22), int64(7), 3, strings.Repeat("d", 64), []byte(`{}`),
+		int64(31), int64(11), int64(22), int64(7), 3, strings.Repeat("d", 64),
+		domain.CaseSourceBaseline, []byte(`{}`),
 		1, domain.CaseRunStatusFailed, nil, "assertion failed", "",
 		finishSetParam(sql, args, "session_id"),
 		finishSetParam(sql, args, "session_snapshot_id"),

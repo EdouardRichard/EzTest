@@ -5,7 +5,9 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 
+	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
@@ -14,10 +16,14 @@ import (
 // case-id array, so 64 KiB is far above any legitimate request.
 const maxBatchBodyBytes int64 = 64 << 10
 
-// createBatchRequest is the POST /api/versions/{id}/batches body. An omitted or
-// empty caseIds selects every baseline case (spec §6.2).
+// createBatchRequest is the POST /api/versions/{id}/batches body (spec §7.7).
+// An omitted kind is baseline; an omitted or empty caseIds selects every
+// baseline case; parentBatchId links incremental batches to the previous
+// terminal batch.
 type createBatchRequest struct {
-	CaseIDs []string `json:"caseIds"`
+	CaseIDs       []string `json:"caseIds"`
+	Kind          string   `json:"kind"`
+	ParentBatchID *string  `json:"parentBatchId"`
 }
 
 // pauseBatchRequest is the POST .../pause body. An omitted mode defaults to
@@ -47,10 +53,11 @@ func (h *BatchHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/versions/{id}/batches/{batchId}/cancel", h.Cancel)
 }
 
-// Create validates the executor health gate and starts a batch (spec §5.1).
-// The executor probe is an HTTP-layer gate: a dead executor answers 503
-// executor_unavailable without persisting a half-created batch. It responds 201
-// with the created batch.
+// Create validates the executor health gate and starts a batch (spec §5.1,
+// §5.3). The executor probe is an HTTP-layer gate: a dead executor answers 503
+// executor_unavailable without persisting a half-created batch. A user may not
+// create a supplement batch (only the autonomy worker does), and the kind is
+// validated before the service runs. It responds 201 with the created batch.
 func (h *BatchHandler) Create(w http.ResponseWriter, r *http.Request) {
 	versionID, err := PathID(r, "id")
 	if err != nil {
@@ -62,7 +69,23 @@ func (h *BatchHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, r, err)
 		return
 	}
+	kind, err := parseCreatedBatchKind(request.Kind)
+	if err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+	if kind == domain.BatchKindSupplement {
+		writeServiceError(w, r, domain.NewReasonError("supplement_batch_automatic",
+			"supplement_batch_automatic",
+			"a supplement batch is created automatically by the autonomous worker", false, nil))
+		return
+	}
 	caseIDs, err := parseCaseIDs(request.CaseIDs)
+	if err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+	parentBatchID, err := parseOptionalDecimalID(request.ParentBatchID)
 	if err != nil {
 		writeServiceError(w, r, err)
 		return
@@ -71,7 +94,11 @@ func (h *BatchHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, r, err)
 		return
 	}
-	batch, err := h.batches.Create(r.Context(), versionID, ActorID(r.Context()), caseIDs)
+	batch, err := h.batches.Create(r.Context(), versionID, ActorID(r.Context()), executionapp.CreateBatchCommand{
+		CaseIDs:       caseIDs,
+		Kind:          string(kind),
+		ParentBatchID: parentBatchID,
+	})
 	if err != nil {
 		writeServiceError(w, r, err)
 		return
@@ -85,7 +112,8 @@ func (h *BatchHandler) Create(w http.ResponseWriter, r *http.Request) {
 }
 
 // List returns one cursor page of batches, newest first, optionally filtered by
-// status. The active-batch lookup of the frontend uses status=running&limit=1.
+// status and P7 kind. The active-batch lookup of the frontend uses
+// status=running&limit=1.
 func (h *BatchHandler) List(w http.ResponseWriter, r *http.Request) {
 	versionID, err := PathID(r, "id")
 	if err != nil {
@@ -97,12 +125,17 @@ func (h *BatchHandler) List(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, r, err)
 		return
 	}
+	kind, err := parseBatchKindFilter(r.URL.Query().Get("kind"))
+	if err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
 	limit, beforeID, err := parsePagination(r)
 	if err != nil {
 		writeServiceError(w, r, err)
 		return
 	}
-	batches, next, hasMore, err := h.listBatches(r.Context(), versionID, status, beforeID, limit)
+	batches, next, hasMore, err := h.listBatches(r.Context(), versionID, status, kind, beforeID, limit)
 	if err != nil {
 		writeServiceError(w, r, err)
 		return
@@ -114,10 +147,10 @@ func (h *BatchHandler) List(w http.ResponseWriter, r *http.Request) {
 	writePage(w, items, next, hasMore)
 }
 
-// listBatches reads one page, applying the status filter by scanning pages while
-// keeping the keyset cursor correct.
-func (h *BatchHandler) listBatches(ctx context.Context, versionID int64, status domain.BatchStatus, beforeID int64, limit int) ([]domain.RunBatch, string, bool, error) {
-	if status == "" {
+// listBatches reads one page, applying the status/kind filters by scanning
+// pages while keeping the keyset cursor correct.
+func (h *BatchHandler) listBatches(ctx context.Context, versionID int64, status domain.BatchStatus, kind domain.BatchKind, beforeID int64, limit int) ([]domain.RunBatch, string, bool, error) {
+	if status == "" && kind == "" {
 		page, hasMore, err := h.batches.List(ctx, versionID, beforeID, limit)
 		if err != nil {
 			return nil, "", false, err
@@ -139,11 +172,15 @@ func (h *BatchHandler) listBatches(ctx context.Context, versionID int64, status 
 		lastScanned := cursor
 		for _, batch := range page {
 			lastScanned = batch.ID
-			if batch.Status == status {
-				collected = append(collected, batch)
-				if len(collected) == limit {
-					return collected, nextCursor(len(collected), collected[len(collected)-1].ID, true), true, nil
-				}
+			if status != "" && batch.Status != status {
+				continue
+			}
+			if kind != "" && effectiveBatchKind(batch) != kind {
+				continue
+			}
+			collected = append(collected, batch)
+			if len(collected) == limit {
+				return collected, nextCursor(len(collected), collected[len(collected)-1].ID, true), true, nil
 			}
 		}
 		if !hasMore || len(page) == 0 {
@@ -274,6 +311,52 @@ func parseCaseIDs(raw []string) ([]int64, error) {
 		ids = append(ids, id)
 	}
 	return ids, nil
+}
+
+// parseOptionalDecimalID parses an optional decimal id string. A nil pointer is
+// an absent id; an empty string is rejected because the DTO uses null.
+func parseOptionalDecimalID(raw *string) (*int64, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	id, err := parseDecimalID(*raw)
+	if err != nil {
+		return nil, newInvalid("invalid_parent_batch", "parentBatchId must be a positive decimal string")
+	}
+	return &id, nil
+}
+
+// parseCreatedBatchKind validates the optional kind of a create request and
+// defaults it to baseline (spec §7.7).
+func parseCreatedBatchKind(raw string) (domain.BatchKind, error) {
+	kind, err := domain.ParseBatchKind(strings.TrimSpace(raw))
+	if err != nil {
+		return "", newInvalid("invalid_batch_kind", err.Error())
+	}
+	return kind, nil
+}
+
+// parseBatchKindFilter validates the optional ?kind= list filter. An empty
+// filter means every kind.
+func parseBatchKindFilter(raw string) (domain.BatchKind, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	kind, err := domain.ParseBatchKind(raw)
+	if err != nil {
+		return "", newInvalid("invalid_batch_kind", err.Error())
+	}
+	return kind, nil
+}
+
+// effectiveBatchKind normalizes a P6 historical batch (no stored kind) to
+// baseline so list filters and DTOs agree.
+func effectiveBatchKind(batch domain.RunBatch) domain.BatchKind {
+	if batch.Kind == "" {
+		return domain.BatchKindBaseline
+	}
+	return batch.Kind
 }
 
 // parseDecimalID parses one positive decimal id string.

@@ -20,13 +20,14 @@ const testBaselineHash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
 // batchTestDeps is the fake world of one BatchService test.
 type batchTestDeps struct {
-	version *fakeVersionPort
-	mindmap *fakeMindmapPort
-	repo    *fakeBatchRepository
-	runs    *fakeCaseRunRepository
-	events  *fakeEventPublisher
-	ids     *fakeIDGenerator
-	clock   *fakeClock
+	version     *fakeVersionPort
+	mindmap     *fakeMindmapPort
+	repo        *fakeBatchRepository
+	runs        *fakeCaseRunRepository
+	events      *fakeEventPublisher
+	ids         *fakeIDGenerator
+	clock       *fakeClock
+	codeHistory *fakeCodeHistory
 }
 
 // newBatchServiceTest returns a service wired to fakes with one executing
@@ -60,7 +61,7 @@ func newBatchServiceTestWithMax(t *testing.T, maxCases int) (*BatchService, *bat
 	deps.repo.caseRuns = deps.runs
 	deps.seedSnapshot(11)
 	deps.seedSnapshot(12)
-	service := NewBatchService(BatchServiceDeps{
+	serviceDeps := BatchServiceDeps{
 		Versions: deps.version,
 		Mindmap:  deps.mindmap,
 		Batches:  deps.repo,
@@ -69,13 +70,26 @@ func newBatchServiceTestWithMax(t *testing.T, maxCases int) (*BatchService, *bat
 		Clock:    deps.clock,
 		IDs:      deps.ids,
 		MaxCases: maxCases,
-	})
+	}
+	if deps.codeHistory != nil {
+		serviceDeps.CodeHistory = deps.codeHistory
+	}
+	service := NewBatchService(serviceDeps)
 	return service, deps
 }
 
 // seedSnapshot seeds the frozen snapshot of one baseline case.
 func (d *batchTestDeps) seedSnapshot(caseNodeID int64) {
 	d.mindmap.snapshots[caseNodeID] = testSnapshotView(caseNodeID, d.mindmap.baseline.Hash)
+}
+
+// seedSupplementSnapshot seeds one materialized AI supplement case of the
+// current working graph (spec §5.2).
+func (d *batchTestDeps) seedSupplementSnapshot(caseNodeID int64) {
+	view := testSnapshotView(caseNodeID, d.mindmap.baseline.Hash)
+	view.Origin = domain.CaseSourceAISupplement
+	view.Status = "supplemented"
+	d.mindmap.snapshots[caseNodeID] = view
 }
 
 // seedBatch stores one batch in the fake repository and returns it.
@@ -88,8 +102,20 @@ func (d *batchTestDeps) seedBatch(status domain.BatchStatus, paused bool) domain
 		Paused:       paused,
 		PauseMode:    domain.PauseModeGraceful,
 		BaselineHash: testBaselineHash,
+		GraphHash:    testBaselineHash,
+		Kind:         domain.BatchKindBaseline,
+		AutonomyDone: true,
 		CreatedBy:    1,
 	}
+	d.repo.batches[batch.ID] = batch
+	return batch
+}
+
+// seedParentBatch stores one terminal parent batch with its pinned commits.
+func (d *batchTestDeps) seedParentBatch(status domain.BatchStatus, codeBaseline, head string) domain.RunBatch {
+	batch := d.seedBatch(status, false)
+	batch.CodeBaselineCommit = &codeBaseline
+	batch.HeadCommit = &head
 	d.repo.batches[batch.ID] = batch
 	return batch
 }
@@ -105,8 +131,11 @@ func testSnapshotView(caseNodeID int64, graphHash string) CaseSnapshotSourceView
 		CaseNodeID: caseNodeID,
 		Revision:   2,
 		GraphHash:  graphHash,
+		Origin:     domain.CaseSourceBaseline,
+		Status:     "reviewed",
 		Node: domain.CaseSnapshotNode{
 			ID:            caseNodeID,
+			Origin:        domain.CaseSourceBaseline,
 			Title:         fmt.Sprintf("case %d", caseNodeID),
 			Priority:      "P1",
 			Preconditions: "signed in",
@@ -140,7 +169,7 @@ func wantReason(t *testing.T, err error, reason string) {
 
 func TestCreatePinsBaselineAndSnapshots(t *testing.T) {
 	service, deps := newBatchServiceTest(t)
-	batch, err := service.Create(context.Background(), 7, 1, nil)
+	batch, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +248,7 @@ func TestCreatePinsBaselineAndSnapshots(t *testing.T) {
 func TestCreateRejectsVersionNotExecutable(t *testing.T) {
 	service, deps := newBatchServiceTest(t)
 	deps.version.status = "draft"
-	_, err := service.Create(context.Background(), 7, 1, nil)
+	_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{})
 	wantReason(t, err, "version_not_executable")
 	if deps.repo.createCalls != 0 {
 		t.Fatalf("a rejected create must not write a batch (calls=%d)", deps.repo.createCalls)
@@ -234,7 +263,7 @@ func TestCreateRejectsMissingEnvironment(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			service, deps := newBatchServiceTest(t)
 			mutate(deps.version)
-			_, err := service.Create(context.Background(), 7, 1, nil)
+			_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{})
 			wantReason(t, err, "environment_required")
 		})
 	}
@@ -244,13 +273,13 @@ func TestCreateRejectsMissingBaseline(t *testing.T) {
 	t.Run("empty baseline ref", func(t *testing.T) {
 		service, deps := newBatchServiceTest(t)
 		deps.mindmap.baseline = BaselineRef{}
-		_, err := service.Create(context.Background(), 7, 1, nil)
+		_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{})
 		wantReason(t, err, "baseline_required")
 	})
 	t.Run("adapter reports missing baseline", func(t *testing.T) {
 		service, deps := newBatchServiceTest(t)
 		deps.mindmap.baselineErr = ErrBaselineRequired
-		_, err := service.Create(context.Background(), 7, 1, nil)
+		_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{})
 		wantReason(t, err, "baseline_required")
 	})
 }
@@ -258,7 +287,7 @@ func TestCreateRejectsMissingBaseline(t *testing.T) {
 func TestCreateRejectsActiveBatch(t *testing.T) {
 	service, deps := newBatchServiceTest(t)
 	deps.repo.createErr = domain.ErrBatchActive
-	_, err := service.Create(context.Background(), 7, 1, nil)
+	_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{})
 	wantReason(t, err, "batch_active")
 	if !reflect.DeepEqual(deps.version.allocateCalls, []int64{7}) {
 		t.Fatalf("the number must be allocated before the create attempt: %v", deps.version.allocateCalls)
@@ -283,7 +312,7 @@ func TestCreateFailsBeforeWritingWhenAllocationFails(t *testing.T) {
 	allocateErr := errors.New("version store unavailable")
 	deps.version.allocateErr = allocateErr
 
-	_, err := service.Create(context.Background(), 7, 1, nil)
+	_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{})
 	if !errors.Is(err, allocateErr) {
 		t.Fatalf("error = %v, want %v", err, allocateErr)
 	}
@@ -303,7 +332,7 @@ func TestCreateCompensatesFailedCreateSoTheNextCreateSucceeds(t *testing.T) {
 	createErr := errors.New("insert batch failed")
 	deps.repo.createErr = createErr
 
-	if _, err := service.Create(context.Background(), 7, 1, nil); !errors.Is(err, createErr) {
+	if _, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{}); !errors.Is(err, createErr) {
 		t.Fatalf("error = %v, want the original %v", err, createErr)
 	}
 	if !reflect.DeepEqual(deps.version.releaseCalls, []releaseBatchNoCall{{versionID: 7, allocated: 1}}) {
@@ -317,7 +346,7 @@ func TestCreateCompensatesFailedCreateSoTheNextCreateSucceeds(t *testing.T) {
 	}
 
 	deps.repo.createErr = nil
-	batch, err := service.Create(context.Background(), 7, 1, nil)
+	batch, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{})
 	if err != nil {
 		t.Fatalf("the next create must succeed, got %v", err)
 	}
@@ -329,7 +358,7 @@ func TestCreateCompensatesFailedCreateSoTheNextCreateSucceeds(t *testing.T) {
 func TestCreateRejectsNoCases(t *testing.T) {
 	service, deps := newBatchServiceTest(t)
 	deps.mindmap.baseline = BaselineRef{Hash: testBaselineHash}
-	_, err := service.Create(context.Background(), 7, 1, nil)
+	_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{})
 	wantReason(t, err, "no_cases")
 }
 
@@ -338,7 +367,7 @@ func TestCreateDoesNotMislabelRepositoryConflictAsBatchActive(t *testing.T) {
 	conflict := fmt.Errorf("%w: duplicate primary key", ErrConflict)
 	deps.repo.createErr = conflict
 
-	_, err := service.Create(context.Background(), 7, 1, nil)
+	_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{})
 	if !errors.Is(err, conflict) {
 		t.Fatalf("error = %v, want the repository conflict unchanged", err)
 	}
@@ -353,13 +382,13 @@ func TestCreateDoesNotMislabelRepositoryConflictAsBatchActive(t *testing.T) {
 
 func TestCreateRejectsTooManyCases(t *testing.T) {
 	service, _ := newBatchServiceTestWithMax(t, 1)
-	_, err := service.Create(context.Background(), 7, 1, nil)
+	_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{})
 	wantReason(t, err, "too_many_cases")
 }
 
 func TestCreateRejectsInvalidCaseIDs(t *testing.T) {
 	service, deps := newBatchServiceTest(t)
-	_, err := service.Create(context.Background(), 7, 1, []int64{11, 99})
+	_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{CaseIDs: []int64{11, 99}})
 	wantReason(t, err, "invalid_case_ids")
 	if len(deps.mindmap.snapshotCalls) != 0 {
 		t.Fatalf("invalid ids must be rejected before snapshotting: %v", deps.mindmap.snapshotCalls)
@@ -371,7 +400,7 @@ func TestCreateRejectsBaselineDrift(t *testing.T) {
 	drifted := deps.mindmap.snapshots[11]
 	drifted.GraphHash = strings.Repeat("b", 64)
 	deps.mindmap.snapshots[11] = drifted
-	_, err := service.Create(context.Background(), 7, 1, nil)
+	_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{})
 	wantReason(t, err, "baseline_changed")
 	if deps.repo.createCalls != 0 {
 		t.Fatalf("baseline drift must not create a partial batch")
@@ -383,7 +412,7 @@ func TestCreateRejectsBaselineDrift(t *testing.T) {
 
 func TestCreateSelectsRequestedCasesAndDeduplicates(t *testing.T) {
 	service, deps := newBatchServiceTest(t)
-	batch, err := service.Create(context.Background(), 7, 1, []int64{12, 12})
+	batch, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{CaseIDs: []int64{12, 12}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -395,6 +424,473 @@ func TestCreateSelectsRequestedCasesAndDeduplicates(t *testing.T) {
 	}
 	if !reflect.DeepEqual(deps.mindmap.snapshotCalls, [][]int64{{12}}) {
 		t.Fatalf("snapshot calls = %v, want [[12]]", deps.mindmap.snapshotCalls)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// P7 kinds, graph hash, source and D49 commits
+// ---------------------------------------------------------------------------
+
+// P7 commit fixtures are full 40-hex ids like the version/codeintel CHECKs.
+const (
+	testVersionBase = "1111111111111111111111111111111111111111"
+	testParentHead  = "2222222222222222222222222222222222222222"
+	testHead        = "3333333333333333333333333333333333333333"
+)
+
+// createBatch runs Create and fails the test on error.
+func createBatch(t *testing.T, service *BatchService, cmd CreateBatchCommand) *domain.RunBatch {
+	t.Helper()
+	batch, err := service.Create(context.Background(), 7, 1, cmd)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	return batch
+}
+
+// newIncrementalWorld is a continuing version whose current working graph is
+// two frozen baseline cases plus one materialized AI supplement.
+func newIncrementalWorld(t *testing.T) (*BatchService, *batchTestDeps) {
+	t.Helper()
+	service, deps := newBatchServiceTest(t)
+	deps.version.status = "continuing"
+	deps.version.continuePhase = "designing"
+	deps.version.codeCommit = ptrString(testVersionBase)
+	deps.mindmap.baseline.CodeCommit = ptrString(testVersionBase)
+	deps.mindmap.baseline.CaseIDs = []int64{11, 12, 13}
+	deps.seedSnapshot(11)
+	deps.seedSnapshot(12)
+	deps.seedSupplementSnapshot(13)
+	return service, deps
+}
+
+// ptrString returns a pointer to value.
+func ptrString(value string) *string { return &value }
+
+func TestCreateBaselineKindDefaultsAndGraphHash(t *testing.T) {
+	service, deps := newBatchServiceTest(t)
+	batch := createBatch(t, service, CreateBatchCommand{})
+
+	if batch.Kind != domain.BatchKindBaseline {
+		t.Fatalf("kind = %q, want baseline", batch.Kind)
+	}
+	if batch.ParentBatchID != nil || batch.BaseFallbackReason != "" {
+		t.Fatalf("baseline parent/fallback = %v/%q", batch.ParentBatchID, batch.BaseFallbackReason)
+	}
+	if batch.SupplementAttempted || batch.AutonomyDone {
+		t.Fatalf("a fresh batch must not be post-processed: %+v", batch)
+	}
+	if batch.GraphHash != testBaselineHash {
+		t.Fatalf("baseline graph hash = %q, want the frozen baseline hash", batch.GraphHash)
+	}
+	for _, run := range deps.repo.createdRuns {
+		if run.Source != domain.CaseSourceBaseline {
+			t.Fatalf("run %d source = %q, want baseline", run.CaseNodeID, run.Source)
+		}
+		if run.Snapshot.Node.EffectiveOrigin() != domain.CaseSourceBaseline {
+			t.Fatalf("run %d snapshot origin = %q, want baseline", run.CaseNodeID, run.Snapshot.Node.Origin)
+		}
+	}
+
+	// The graph hash is stable for the same working graph and does not depend on
+	// the selected subset.
+	second := createBatch(t, service, CreateBatchCommand{CaseIDs: []int64{12}})
+	if second.GraphHash != batch.GraphHash {
+		t.Fatalf("graph hash changed with the selection: %q != %q", second.GraphHash, batch.GraphHash)
+	}
+
+	if len(deps.events.events) == 0 || deps.events.events[0].Detail["kind"] != "baseline" {
+		t.Fatalf("batch.created detail = %#v, want kind=baseline", deps.events.events[0].Detail)
+	}
+}
+
+func TestCreateBaselineRejectsUnfinishedAutonomy(t *testing.T) {
+	service, deps := newBatchServiceTest(t)
+	deps.repo.awaitingAutonomy = 1
+
+	_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{})
+	wantReason(t, err, "autonomy_pending")
+	if deps.repo.createCalls != 0 {
+		t.Fatalf("the autonomy gate must not write a batch (calls=%d)", deps.repo.createCalls)
+	}
+	if len(deps.mindmap.snapshotCalls) != 0 {
+		t.Fatalf("the autonomy gate must run before snapshotting: %v", deps.mindmap.snapshotCalls)
+	}
+	if !reflect.DeepEqual(deps.repo.awaitingCalls, []int64{7}) {
+		t.Fatalf("autonomy gate calls = %v, want [7]", deps.repo.awaitingCalls)
+	}
+}
+
+func TestCreateBaselineRejectsParentBatch(t *testing.T) {
+	service, _ := newBatchServiceTest(t)
+	parent := int64(55)
+	_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{ParentBatchID: &parent})
+	wantReason(t, err, "invalid_parent_batch")
+}
+
+func TestCreateBaselineRejectsSupplementCases(t *testing.T) {
+	service, deps := newBatchServiceTest(t)
+	deps.mindmap.baseline.CaseIDs = []int64{11, 12, 13}
+	deps.seedSupplementSnapshot(13)
+	_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{CaseIDs: []int64{13}})
+	wantReason(t, err, "invalid_case_ids")
+	if deps.repo.createCalls != 0 {
+		t.Fatalf("a supplement case must not enter a baseline batch (calls=%d)", deps.repo.createCalls)
+	}
+}
+
+func TestCreateRejectsUnknownKind(t *testing.T) {
+	service, _ := newBatchServiceTest(t)
+	_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{Kind: "replay"})
+	wantReason(t, err, "invalid_batch_kind")
+}
+
+func TestCreateIncrementalGates(t *testing.T) {
+	t.Run("version must be continuing", func(t *testing.T) {
+		service, deps := newIncrementalWorld(t)
+		deps.version.status = versionStatusExecuting
+		_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{
+			Kind: string(domain.BatchKindIncremental), CaseIDs: []int64{11},
+		})
+		wantReason(t, err, "version_not_executable")
+	})
+	t.Run("phase must allow batches", func(t *testing.T) {
+		for _, phase := range []string{"", "clarifying"} {
+			service, deps := newIncrementalWorld(t)
+			deps.version.continuePhase = phase
+			_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{
+				Kind: string(domain.BatchKindIncremental), CaseIDs: []int64{11},
+			})
+			wantReason(t, err, "continuing_batch_conflict")
+		}
+	})
+	t.Run("environment must be bound", func(t *testing.T) {
+		service, deps := newIncrementalWorld(t)
+		deps.version.environmentID = nil
+		_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{
+			Kind: string(domain.BatchKindIncremental), CaseIDs: []int64{11},
+		})
+		wantReason(t, err, "environment_required")
+	})
+	t.Run("case ids are required", func(t *testing.T) {
+		service, _ := newIncrementalWorld(t)
+		_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{
+			Kind: string(domain.BatchKindIncremental),
+		})
+		wantReason(t, err, "no_incremental_cases")
+	})
+	t.Run("baseline is required", func(t *testing.T) {
+		service, deps := newIncrementalWorld(t)
+		deps.mindmap.baseline = BaselineRef{}
+		_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{
+			Kind: string(domain.BatchKindIncremental), CaseIDs: []int64{11},
+		})
+		wantReason(t, err, "baseline_required")
+	})
+	t.Run("previous autonomy must be done", func(t *testing.T) {
+		service, deps := newIncrementalWorld(t)
+		deps.repo.awaitingAutonomy = 2
+		_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{
+			Kind: string(domain.BatchKindIncremental), CaseIDs: []int64{11},
+		})
+		wantReason(t, err, "autonomy_pending")
+		if len(deps.mindmap.snapshotCalls) != 0 {
+			t.Fatalf("the autonomy gate must run before snapshotting: %v", deps.mindmap.snapshotCalls)
+		}
+	})
+	t.Run("case ids must belong to the current graph", func(t *testing.T) {
+		service, _ := newIncrementalWorld(t)
+		_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{
+			Kind: string(domain.BatchKindIncremental), CaseIDs: []int64{11, 99},
+		})
+		wantReason(t, err, "invalid_case_ids")
+	})
+	t.Run("rejected cases cannot be selected", func(t *testing.T) {
+		service, deps := newIncrementalWorld(t)
+		rejected := testSnapshotView(14, deps.mindmap.baseline.Hash)
+		rejected.Status = "rejected"
+		deps.mindmap.snapshots[14] = rejected
+		deps.mindmap.baseline.CaseIDs = append(deps.mindmap.baseline.CaseIDs, 14)
+		_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{
+			Kind: string(domain.BatchKindIncremental), CaseIDs: []int64{14},
+		})
+		wantReason(t, err, "invalid_case_ids")
+	})
+	t.Run("max cases", func(t *testing.T) {
+		service, deps := newIncrementalWorld(t)
+		service.deps.MaxCases = 1
+		_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{
+			Kind: string(domain.BatchKindIncremental), CaseIDs: []int64{11, 12},
+		})
+		wantReason(t, err, "too_many_cases")
+		_ = deps
+	})
+}
+
+func TestCreateIncrementalPinsWorkingGraphAndSource(t *testing.T) {
+	service, deps := newIncrementalWorld(t)
+	parent := deps.seedParentBatch(domain.BatchStatusDone, testVersionBase, testParentHead)
+	deps.codeHistory = &fakeCodeHistory{head: testHead, ancestor: true}
+	service.deps.CodeHistory = deps.codeHistory
+
+	parentID := parent.ID
+	batch := createBatch(t, service, CreateBatchCommand{
+		Kind:          string(domain.BatchKindIncremental),
+		CaseIDs:       []int64{13, 11},
+		ParentBatchID: &parentID,
+	})
+
+	if batch.Kind != domain.BatchKindIncremental || batch.ParentBatchID == nil || *batch.ParentBatchID != parent.ID {
+		t.Fatalf("incremental identity = %+v", batch)
+	}
+	if batch.CodeBaselineCommit == nil || *batch.CodeBaselineCommit != testParentHead {
+		t.Fatalf("base = %v, want the parent head %q (D49)", batch.CodeBaselineCommit, testParentHead)
+	}
+	if batch.HeadCommit == nil || *batch.HeadCommit != testHead {
+		t.Fatalf("head = %v, want the current head %q", batch.HeadCommit, testHead)
+	}
+	if batch.BaseFallbackReason != "" {
+		t.Fatalf("base fallback = %q, want none", batch.BaseFallbackReason)
+	}
+	if got, want := deps.codeHistory.calls, []fakeIsAncestorCall{{versionID: 7, base: testParentHead, head: testHead}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("IsAncestor calls = %+v, want %+v", got, want)
+	}
+
+	wantHash := domain.WorkingGraphHash(7, []domain.CaseSnapshot{
+		deps.mindmap.snapshots[11].asSnapshot(testNow),
+		deps.mindmap.snapshots[12].asSnapshot(testNow),
+		deps.mindmap.snapshots[13].asSnapshot(testNow),
+	})
+	if batch.GraphHash != wantHash || len(batch.GraphHash) != 64 {
+		t.Fatalf("graph hash = %q, want the current working graph hash %q", batch.GraphHash, wantHash)
+	}
+
+	if len(deps.repo.createdRuns) != 2 {
+		t.Fatalf("runs = %d, want the 2 selected cases", len(deps.repo.createdRuns))
+	}
+	sources := map[int64]domain.CaseSource{}
+	for _, run := range deps.repo.createdRuns {
+		sources[run.CaseNodeID] = run.Source
+		if run.Snapshot.Node.EffectiveOrigin() != run.Source {
+			t.Fatalf("run %d snapshot origin %q != source %q", run.CaseNodeID, run.Snapshot.Node.Origin, run.Source)
+		}
+	}
+	if sources[13] != domain.CaseSourceAISupplement || sources[11] != domain.CaseSourceBaseline {
+		t.Fatalf("run sources = %v, want 13=ai_supplement 11=baseline", sources)
+	}
+
+	if !reflect.DeepEqual(deps.mindmap.markMergedCalls, [][]int64{{13}}) {
+		t.Fatalf("MarkMerged calls = %v, want [[13]]", deps.mindmap.markMergedCalls)
+	}
+	if !reflect.DeepEqual(deps.version.setPhaseCalls, []string{"executing"}) {
+		t.Fatalf("SetContinuePhase calls = %v, want [executing]", deps.version.setPhaseCalls)
+	}
+	if deps.events.events[0].Detail["kind"] != "incremental" {
+		t.Fatalf("batch.created detail = %#v, want kind=incremental", deps.events.events[0].Detail)
+	}
+}
+
+func TestCreateIncrementalFallsBackWhenParentHeadUnusable(t *testing.T) {
+	t.Run("parent head is not an ancestor", func(t *testing.T) {
+		service, deps := newIncrementalWorld(t)
+		parent := deps.seedParentBatch(domain.BatchStatusDone, testVersionBase, testParentHead)
+		service.deps.CodeHistory = &fakeCodeHistory{head: testHead, ancestor: false}
+		parentID := parent.ID
+
+		batch := createBatch(t, service, CreateBatchCommand{
+			Kind: string(domain.BatchKindIncremental), CaseIDs: []int64{11}, ParentBatchID: &parentID,
+		})
+		if batch.CodeBaselineCommit == nil || *batch.CodeBaselineCommit != testVersionBase {
+			t.Fatalf("base = %v, want the version baseline %q", batch.CodeBaselineCommit, testVersionBase)
+		}
+		if batch.HeadCommit == nil || *batch.HeadCommit != testHead {
+			t.Fatalf("head = %v, want the current head", batch.HeadCommit)
+		}
+		if batch.BaseFallbackReason != domain.BaseFallbackHistoryRewritten {
+			t.Fatalf("fallback = %q, want history_rewritten", batch.BaseFallbackReason)
+		}
+	})
+	t.Run("parent has no head", func(t *testing.T) {
+		service, deps := newIncrementalWorld(t)
+		parent := deps.seedBatch(domain.BatchStatusDone, false)
+		parentID := parent.ID
+
+		batch := createBatch(t, service, CreateBatchCommand{
+			Kind: string(domain.BatchKindIncremental), CaseIDs: []int64{11}, ParentBatchID: &parentID,
+		})
+		if batch.CodeBaselineCommit == nil || *batch.CodeBaselineCommit != testVersionBase {
+			t.Fatalf("base = %v, want the version baseline", batch.CodeBaselineCommit)
+		}
+		if batch.BaseFallbackReason != domain.BaseFallbackHistoryRewritten {
+			t.Fatalf("fallback = %q, want history_rewritten", batch.BaseFallbackReason)
+		}
+	})
+	t.Run("no parent uses the version baseline", func(t *testing.T) {
+		service, _ := newIncrementalWorld(t)
+		service.deps.CodeHistory = &fakeCodeHistory{head: testHead}
+		batch := createBatch(t, service, CreateBatchCommand{
+			Kind: string(domain.BatchKindIncremental), CaseIDs: []int64{11},
+		})
+		if batch.CodeBaselineCommit == nil || *batch.CodeBaselineCommit != testVersionBase {
+			t.Fatalf("base = %v, want the version baseline", batch.CodeBaselineCommit)
+		}
+		if batch.BaseFallbackReason != "" {
+			t.Fatalf("fallback = %q, want none for the first incremental batch", batch.BaseFallbackReason)
+		}
+	})
+	t.Run("code history unavailable degrades to the parent head", func(t *testing.T) {
+		service, deps := newIncrementalWorld(t)
+		parent := deps.seedParentBatch(domain.BatchStatusDone, testVersionBase, testParentHead)
+		parentID := parent.ID
+
+		batch := createBatch(t, service, CreateBatchCommand{
+			Kind: string(domain.BatchKindIncremental), CaseIDs: []int64{11}, ParentBatchID: &parentID,
+		})
+		if batch.CodeBaselineCommit == nil || *batch.CodeBaselineCommit != testParentHead {
+			t.Fatalf("base = %v, want the parent head when ancestry cannot be checked", batch.CodeBaselineCommit)
+		}
+		if batch.HeadCommit != nil {
+			t.Fatalf("head = %v, want nil without a code-history port", batch.HeadCommit)
+		}
+	})
+}
+
+func TestCreateIncrementalRejectsNonTerminalParent(t *testing.T) {
+	for _, status := range []domain.BatchStatus{domain.BatchStatusPlanned, domain.BatchStatusRunning} {
+		t.Run(string(status), func(t *testing.T) {
+			service, deps := newIncrementalWorld(t)
+			parent := deps.seedParentBatch(status, testVersionBase, testParentHead)
+			parentID := parent.ID
+			_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{
+				Kind: string(domain.BatchKindIncremental), CaseIDs: []int64{11}, ParentBatchID: &parentID,
+			})
+			wantReason(t, err, "invalid_parent_batch")
+		})
+	}
+}
+
+func TestCreateSupplementInheritsParentAndMarksMerged(t *testing.T) {
+	service, deps := newBatchServiceTest(t)
+	deps.version.codeCommit = ptrString(testVersionBase)
+	deps.mindmap.baseline.CaseIDs = []int64{11, 12, 13}
+	deps.seedSnapshot(11)
+	deps.seedSnapshot(12)
+	deps.seedSupplementSnapshot(13)
+	parent := deps.seedParentBatch(domain.BatchStatusDone, testVersionBase, testParentHead)
+	parent.BaseFallbackReason = domain.BaseFallbackHistoryRewritten
+	deps.repo.batches[parent.ID] = parent
+
+	parentID := parent.ID
+	batch := createBatch(t, service, CreateBatchCommand{
+		Kind:          string(domain.BatchKindSupplement),
+		CaseIDs:       []int64{13},
+		ParentBatchID: &parentID,
+	})
+	if batch.Kind != domain.BatchKindSupplement {
+		t.Fatalf("kind = %q, want supplement", batch.Kind)
+	}
+	if batch.CodeBaselineCommit == nil || *batch.CodeBaselineCommit != testVersionBase ||
+		batch.HeadCommit == nil || *batch.HeadCommit != testParentHead {
+		t.Fatalf("supplement commits = %v/%v, want the parent base/head", batch.CodeBaselineCommit, batch.HeadCommit)
+	}
+	if batch.BaseFallbackReason != domain.BaseFallbackHistoryRewritten {
+		t.Fatalf("fallback = %q, want the parent fallback", batch.BaseFallbackReason)
+	}
+	if len(deps.repo.createdRuns) != 1 || deps.repo.createdRuns[0].Source != domain.CaseSourceAISupplement {
+		t.Fatalf("supplement runs = %+v, want one ai_supplement run", deps.repo.createdRuns)
+	}
+	if !reflect.DeepEqual(deps.mindmap.markMergedCalls, [][]int64{{13}}) {
+		t.Fatalf("MarkMerged calls = %v, want [[13]]", deps.mindmap.markMergedCalls)
+	}
+}
+
+func TestCreateSupplementGates(t *testing.T) {
+	// newSupplementWorld seeds one supplemented node and one terminal parent.
+	newSupplementWorld := func(t *testing.T) (*BatchService, *batchTestDeps, int64) {
+		t.Helper()
+		service, deps := newBatchServiceTest(t)
+		deps.mindmap.baseline.CaseIDs = []int64{11, 12, 13}
+		deps.seedSnapshot(11)
+		deps.seedSnapshot(12)
+		deps.seedSupplementSnapshot(13)
+		parent := deps.seedParentBatch(domain.BatchStatusDone, testVersionBase, testParentHead)
+		return service, deps, parent.ID
+	}
+
+	t.Run("parent is required", func(t *testing.T) {
+		service, _, _ := newSupplementWorld(t)
+		_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{
+			Kind: string(domain.BatchKindSupplement), CaseIDs: []int64{13},
+		})
+		wantReason(t, err, "invalid_parent_batch")
+	})
+	t.Run("parent must be terminal", func(t *testing.T) {
+		service, deps, _ := newSupplementWorld(t)
+		parent := deps.seedBatch(domain.BatchStatusRunning, false)
+		parentID := parent.ID
+		_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{
+			Kind: string(domain.BatchKindSupplement), CaseIDs: []int64{13}, ParentBatchID: &parentID,
+		})
+		wantReason(t, err, "invalid_parent_batch")
+	})
+	t.Run("case ids are required", func(t *testing.T) {
+		service, _, parentID := newSupplementWorld(t)
+		_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{
+			Kind: string(domain.BatchKindSupplement), ParentBatchID: &parentID,
+		})
+		wantReason(t, err, "invalid_case_ids")
+	})
+	t.Run("only supplemented nodes are accepted", func(t *testing.T) {
+		service, _, parentID := newSupplementWorld(t)
+		_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{
+			Kind: string(domain.BatchKindSupplement), CaseIDs: []int64{11}, ParentBatchID: &parentID,
+		})
+		wantReason(t, err, "invalid_case_ids")
+	})
+	t.Run("autonomy gate does not apply to a supplement batch", func(t *testing.T) {
+		service, deps, parentID := newSupplementWorld(t)
+		deps.repo.awaitingAutonomy = 3
+		batch := createBatch(t, service, CreateBatchCommand{
+			Kind: string(domain.BatchKindSupplement), CaseIDs: []int64{13}, ParentBatchID: &parentID,
+		})
+		if batch.Kind != domain.BatchKindSupplement {
+			t.Fatalf("kind = %q, want supplement", batch.Kind)
+		}
+	})
+	t.Run("unknown parent is not found", func(t *testing.T) {
+		service, _, _ := newSupplementWorld(t)
+		missing := int64(999)
+		_, err := service.Create(context.Background(), 7, 1, CreateBatchCommand{
+			Kind: string(domain.BatchKindSupplement), CaseIDs: []int64{13}, ParentBatchID: &missing,
+		})
+		if !errors.Is(err, ErrBatchNotFound) {
+			t.Fatalf("error = %v, want ErrBatchNotFound", err)
+		}
+	})
+}
+
+func TestRerunCopiesSource(t *testing.T) {
+	service, deps := newBatchServiceTest(t)
+	deps.seedBatch(domain.BatchStatusRunning, false)
+	view := testSnapshotView(12, testBaselineHash)
+	view.Origin = domain.CaseSourceAISupplement
+	failed := domain.CaseRun{
+		ID: 101, BatchID: 55, VersionID: 7, CaseNodeID: 12, CaseRevision: 2,
+		CaseHash: domain.CanonicalCaseHash(view.asSnapshot(testNow)),
+		Snapshot: view.asSnapshot(testNow), Source: domain.CaseSourceAISupplement,
+		Attempt: 1, Status: domain.CaseRunStatusFailed,
+	}
+	deps.seedRun(failed)
+
+	rerun, err := service.Rerun(context.Background(), 7, 55, 101, 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rerun.Source != domain.CaseSourceAISupplement {
+		t.Fatalf("rerun source = %q, want ai_supplement", rerun.Source)
+	}
+	if rerun.Snapshot.Node.EffectiveOrigin() != domain.CaseSourceAISupplement {
+		t.Fatalf("rerun snapshot origin = %q, want ai_supplement", rerun.Snapshot.Node.Origin)
 	}
 }
 
@@ -825,8 +1321,10 @@ func (v CaseSnapshotSourceView) asSnapshot(capturedAt time.Time) domain.CaseSnap
 	for _, id := range v.RequirementIDs {
 		sources = append(sources, domain.CaseSnapshotSource{RequirementID: id})
 	}
+	node := v.Node
+	node.Origin = v.Origin
 	return domain.CaseSnapshot{
-		Node:       v.Node,
+		Node:       node,
 		Steps:      v.Steps,
 		Assertions: v.Assertions,
 		Sources:    sources,
@@ -872,6 +1370,7 @@ type fakeVersionPort struct {
 	status        string
 	paused        bool
 	batchNo       int
+	continuePhase string
 	systemID      *int64
 	environmentID *int64
 	codeCommit    *string
@@ -886,6 +1385,8 @@ type fakeVersionPort struct {
 	setBatchNoCalls []setBatchNoCall
 	setBatchNoErr   error
 	completeCalls   int
+	setPhaseCalls   []string
+	setPhaseErr     error
 }
 
 func (f *fakeVersionPort) GetVersion(ctx context.Context, versionID int64) (VersionRef, error) {
@@ -897,10 +1398,22 @@ func (f *fakeVersionPort) GetVersion(ctx context.Context, versionID int64) (Vers
 		Status:             f.status,
 		Paused:             f.paused,
 		BatchNo:            f.batchNo,
+		ContinuePhase:      f.continuePhase,
 		SystemID:           f.systemID,
 		EnvironmentID:      f.environmentID,
 		CodeBaselineCommit: f.codeCommit,
 	}, nil
+}
+
+// SetContinuePhase is the optional P7 version surface consumed through the
+// ContinuePhasePort assertion (spec §5.3).
+func (f *fakeVersionPort) SetContinuePhase(ctx context.Context, versionID int64, phase string) error {
+	f.setPhaseCalls = append(f.setPhaseCalls, phase)
+	if f.setPhaseErr != nil {
+		return f.setPhaseErr
+	}
+	f.continuePhase = phase
+	return nil
 }
 
 func (f *fakeVersionPort) MarkPaused(ctx context.Context, versionID int64, paused bool, mode, reason string, actor int64) error {
@@ -952,6 +1465,9 @@ type fakeMindmapPort struct {
 
 	markExecutedCalls [][]int64
 	markExecutedErr   error
+
+	markMergedCalls [][]int64
+	markMergedErr   error
 }
 
 func (f *fakeMindmapPort) Baseline(ctx context.Context, versionID int64) (BaselineRef, error) {
@@ -980,6 +1496,13 @@ func (f *fakeMindmapPort) SnapshotCases(ctx context.Context, versionID int64, ca
 func (f *fakeMindmapPort) MarkExecuted(ctx context.Context, versionID int64, caseNodeIDs []int64) error {
 	f.markExecutedCalls = append(f.markExecutedCalls, append([]int64(nil), caseNodeIDs...))
 	return f.markExecutedErr
+}
+
+// MarkMerged is the optional supplement graph write consumed through the
+// SupplementGraphPort assertion (spec §5.2/§5.3).
+func (f *fakeMindmapPort) MarkMerged(ctx context.Context, versionID int64, caseNodeIDs []int64) error {
+	f.markMergedCalls = append(f.markMergedCalls, append([]int64(nil), caseNodeIDs...))
+	return f.markMergedErr
 }
 
 type fakeEventPublisher struct {
@@ -1056,6 +1579,10 @@ type fakeBatchRepository struct {
 	countsErr     error
 	failureErr    error
 	failureReason string
+
+	awaitingAutonomy    int
+	awaitingAutonomyErr error
+	awaitingCalls       []int64
 }
 
 func newFakeBatchRepository() *fakeBatchRepository {
@@ -1149,6 +1676,42 @@ func (f *fakeBatchRepository) UpdateBatchFailure(ctx context.Context, batchID in
 		return domain.RunBatch{}, f.failureErr
 	}
 	return f.batches[batchID], nil
+}
+
+// CountTerminalBatchesAwaitingAutonomy implements the P7 creation gate (spec
+// §5.3): a non-zero count means the previous autonomy chain is still settling.
+func (f *fakeBatchRepository) CountTerminalBatchesAwaitingAutonomy(ctx context.Context, versionID int64) (int, error) {
+	f.awaitingCalls = append(f.awaitingCalls, versionID)
+	return f.awaitingAutonomy, f.awaitingAutonomyErr
+}
+
+// fakeCodeHistory is the optional D49 commit surface (spec §6.8/D49).
+type fakeCodeHistory struct {
+	head        string
+	headErr     error
+	ancestor    bool
+	ancestorErr error
+	calls       []fakeIsAncestorCall
+}
+
+type fakeIsAncestorCall struct {
+	versionID  int64
+	base, head string
+}
+
+func (f *fakeCodeHistory) HeadCommit(ctx context.Context, versionID int64) (string, error) {
+	if f.headErr != nil {
+		return "", f.headErr
+	}
+	return f.head, nil
+}
+
+func (f *fakeCodeHistory) IsAncestor(ctx context.Context, versionID int64, base, head string) (bool, error) {
+	f.calls = append(f.calls, fakeIsAncestorCall{versionID: versionID, base: base, head: head})
+	if f.ancestorErr != nil {
+		return false, f.ancestorErr
+	}
+	return f.ancestor, nil
 }
 
 type fakeCaseRunSetStatusCall struct {

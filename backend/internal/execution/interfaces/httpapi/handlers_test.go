@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -98,7 +99,7 @@ func requireEnvelopeError(t *testing.T, rec *httptest.ResponseRecorder, status i
 // ---------------------------------------------------------------------------
 
 type fakeBatchService struct {
-	create func(ctx context.Context, versionID, actor int64, caseIDs []int64) (*domain.RunBatch, error)
+	create func(ctx context.Context, versionID, actor int64, cmd executionapp.CreateBatchCommand) (*domain.RunBatch, error)
 	get    func(ctx context.Context, versionID, batchID int64) (*domain.RunBatch, error)
 	list   func(ctx context.Context, versionID int64, beforeSeq int64, limit int) ([]domain.RunBatch, bool, error)
 	pause  func(ctx context.Context, versionID, batchID int64, mode domain.PauseMode, actor int64) (*domain.RunBatch, error)
@@ -107,11 +108,11 @@ type fakeBatchService struct {
 	rerun  func(ctx context.Context, versionID, batchID, caseRunID, actor int64) (*domain.CaseRun, error)
 }
 
-func (f *fakeBatchService) Create(ctx context.Context, versionID, actor int64, caseIDs []int64) (*domain.RunBatch, error) {
+func (f *fakeBatchService) Create(ctx context.Context, versionID, actor int64, cmd executionapp.CreateBatchCommand) (*domain.RunBatch, error) {
 	if f.create == nil {
 		return nil, errors.New("create not stubbed")
 	}
-	return f.create(ctx, versionID, actor, caseIDs)
+	return f.create(ctx, versionID, actor, cmd)
 }
 
 func (f *fakeBatchService) Get(ctx context.Context, versionID, batchID int64) (*domain.RunBatch, error) {
@@ -313,6 +314,7 @@ func sampleBatch() domain.RunBatch {
 	return domain.RunBatch{
 		ID: 1842, VersionID: 7, BatchNo: 1, Status: domain.BatchStatusRunning,
 		PauseMode: domain.PauseModeGraceful, BaselineHash: strings.Repeat("a", 64),
+		GraphHash: strings.Repeat("a", 64), Kind: domain.BatchKindBaseline,
 		CaseCount: 2, PassedCount: 1, CreatedBy: 2,
 		StartedAt: timePtr(time.Date(2026, 10, 28, 8, 0, 0, 0, time.UTC)),
 		CreatedAt: time.Date(2026, 10, 28, 7, 59, 0, 0, time.UTC),
@@ -324,6 +326,7 @@ func sampleCaseRun() domain.CaseRun {
 	return domain.CaseRun{
 		ID: 1843, BatchID: 1842, VersionID: 7, CaseNodeID: 9001,
 		CaseRevision: 3, Attempt: 1, Status: domain.CaseRunStatusFailed,
+		Source:        domain.CaseSourceBaseline,
 		FailureClass:  failureClassPtr(domain.FailureClassApplication),
 		FailureReason: "assertion_failed", Summary: "login assertion failed",
 		DurationMS: 12345, CleanupRequired: true,
@@ -384,7 +387,7 @@ func happyDeps() HandlerDeps {
 	run := sampleCaseRun()
 	return HandlerDeps{
 		Batches: &fakeBatchService{
-			create: func(_ context.Context, versionID, _ int64, _ []int64) (*domain.RunBatch, error) {
+			create: func(_ context.Context, versionID, _ int64, _ executionapp.CreateBatchCommand) (*domain.RunBatch, error) {
 				created := batch
 				created.VersionID = versionID
 				return &created, nil
@@ -489,7 +492,7 @@ func TestBatchRoutesRequireAuthAndUseStringIDs(t *testing.T) {
 func TestCreateBatchReturns503WhenExecutorIsUnhealthy(t *testing.T) {
 	deps := happyDeps()
 	createCalls := 0
-	deps.Batches.(*fakeBatchService).create = func(context.Context, int64, int64, []int64) (*domain.RunBatch, error) {
+	deps.Batches.(*fakeBatchService).create = func(context.Context, int64, int64, executionapp.CreateBatchCommand) (*domain.RunBatch, error) {
 		createCalls++
 		return nil, errors.New("must not be called")
 	}
@@ -505,7 +508,7 @@ func TestCreateBatchReturns503WhenExecutorIsUnhealthy(t *testing.T) {
 
 func TestCreateBatchReturns409Reason(t *testing.T) {
 	deps := happyDeps()
-	deps.Batches.(*fakeBatchService).create = func(context.Context, int64, int64, []int64) (*domain.RunBatch, error) {
+	deps.Batches.(*fakeBatchService).create = func(context.Context, int64, int64, executionapp.CreateBatchCommand) (*domain.RunBatch, error) {
 		return nil, domain.NewReasonError("version_not_executable", "version_not_executable", "version is designing", false, nil)
 	}
 	handler := newExecutionServer(t, deps)
@@ -523,8 +526,8 @@ func TestCreateBatchRejectsMalformedCaseIDs(t *testing.T) {
 func TestCreateBatchParsesStringCaseIDs(t *testing.T) {
 	deps := happyDeps()
 	var got []int64
-	deps.Batches.(*fakeBatchService).create = func(_ context.Context, _, _ int64, caseIDs []int64) (*domain.RunBatch, error) {
-		got = caseIDs
+	deps.Batches.(*fakeBatchService).create = func(_ context.Context, _, _ int64, cmd executionapp.CreateBatchCommand) (*domain.RunBatch, error) {
+		got = cmd.CaseIDs
 		created := sampleBatch()
 		return &created, nil
 	}
@@ -536,6 +539,133 @@ func TestCreateBatchParsesStringCaseIDs(t *testing.T) {
 	}
 	if len(got) != 2 || got[0] != 9001 || got[1] != 9002 {
 		t.Fatalf("caseIDs=%v want [9001 9002]", got)
+	}
+}
+
+func TestCreateBatchDefaultsToBaselineKind(t *testing.T) {
+	deps := happyDeps()
+	var got executionapp.CreateBatchCommand
+	deps.Batches.(*fakeBatchService).create = func(_ context.Context, _, _ int64, cmd executionapp.CreateBatchCommand) (*domain.RunBatch, error) {
+		got = cmd
+		created := sampleBatch()
+		return &created, nil
+	}
+	handler := newExecutionServer(t, deps)
+
+	rec := doExecutionRequest(handler, http.MethodPost, "/api/versions/7/batches", "ezt_user", `{}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create=%d body=%s want 201", rec.Code, rec.Body)
+	}
+	if got.Kind != string(domain.BatchKindBaseline) || got.ParentBatchID != nil || got.CaseIDs != nil {
+		t.Fatalf("command = %+v, want a baseline command without parent/cases", got)
+	}
+}
+
+func TestCreateBatchPassesKindAndParentCommand(t *testing.T) {
+	deps := happyDeps()
+	var got executionapp.CreateBatchCommand
+	deps.Batches.(*fakeBatchService).create = func(_ context.Context, _, _ int64, cmd executionapp.CreateBatchCommand) (*domain.RunBatch, error) {
+		got = cmd
+		created := sampleBatch()
+		created.Kind = domain.BatchKindIncremental
+		created.GraphHash = strings.Repeat("b", 64)
+		created.BaseFallbackReason = domain.BaseFallbackHistoryRewritten
+		parentID := int64(55)
+		created.ParentBatchID = &parentID
+		return &created, nil
+	}
+	handler := newExecutionServer(t, deps)
+
+	rec := doExecutionRequest(handler, http.MethodPost, "/api/versions/7/batches", "ezt_user",
+		`{"kind":"incremental","caseIds":["9001"],"parentBatchId":"55"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create=%d body=%s want 201", rec.Code, rec.Body)
+	}
+	if got.Kind != "incremental" || got.ParentBatchID == nil || *got.ParentBatchID != 55 ||
+		!reflect.DeepEqual(got.CaseIDs, []int64{9001}) {
+		t.Fatalf("command = %+v, want kind=incremental parent=55 cases=[9001]", got)
+	}
+	body := rec.Body.String()
+	for _, needle := range []string{
+		`"kind":"incremental"`,
+		`"parentBatchId":"55"`,
+		`"graphHash":"` + strings.Repeat("b", 64) + `"`,
+		`"baseFallbackReason":"history_rewritten"`,
+	} {
+		if !strings.Contains(body, needle) {
+			t.Fatalf("batch body %s does not contain %s", body, needle)
+		}
+	}
+}
+
+func TestCreateBatchRejectsSupplementKind(t *testing.T) {
+	deps := happyDeps()
+	createCalls := 0
+	deps.Batches.(*fakeBatchService).create = func(context.Context, int64, int64, executionapp.CreateBatchCommand) (*domain.RunBatch, error) {
+		createCalls++
+		return nil, errors.New("must not be called")
+	}
+	handler := newExecutionServer(t, deps)
+
+	rec := doExecutionRequest(handler, http.MethodPost, "/api/versions/7/batches", "ezt_user",
+		`{"kind":"supplement","parentBatchId":"55"}`)
+	requireEnvelopeError(t, rec, http.StatusConflict, "conflict", "supplement_batch_automatic")
+	if createCalls != 0 {
+		t.Fatalf("a user supplement create must be rejected before the service (calls=%d)", createCalls)
+	}
+}
+
+func TestCreateBatchRejectsInvalidKind(t *testing.T) {
+	handler := newExecutionServer(t, happyDeps())
+	rec := doExecutionRequest(handler, http.MethodPost, "/api/versions/7/batches", "ezt_user", `{"kind":"replay"}`)
+	requireEnvelopeError(t, rec, http.StatusUnprocessableEntity, "invalid_argument", "invalid_batch_kind")
+}
+
+func TestListBatchesFiltersByKind(t *testing.T) {
+	deps := happyDeps()
+	baselineBatch := sampleBatch()
+	incremental := sampleBatch()
+	incremental.ID = 1843
+	incremental.Kind = domain.BatchKindIncremental
+	supplement := sampleBatch()
+	supplement.ID = 1844
+	supplement.Kind = domain.BatchKindSupplement
+	deps.Batches.(*fakeBatchService).list = func(context.Context, int64, int64, int) ([]domain.RunBatch, bool, error) {
+		return []domain.RunBatch{baselineBatch, incremental, supplement}, false, nil
+	}
+	handler := newExecutionServer(t, deps)
+
+	rec := doExecutionRequest(handler, http.MethodGet, "/api/versions/7/batches?kind=supplement", "ezt_user", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list=%d body=%s want 200", rec.Code, rec.Body)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"id":"1844"`) {
+		t.Fatalf("supplement batch missing: %s", body)
+	}
+	if strings.Contains(body, `"id":"1842"`) || strings.Contains(body, `"id":"1843"`) {
+		t.Fatalf("kind filter leaked other kinds: %s", body)
+	}
+
+	rec = doExecutionRequest(handler, http.MethodGet, "/api/versions/7/batches?kind=replay", "ezt_user", "")
+	requireEnvelopeError(t, rec, http.StatusUnprocessableEntity, "invalid_argument", "invalid_batch_kind")
+}
+
+func TestCaseRunDTOCarriesSource(t *testing.T) {
+	deps := happyDeps()
+	run := sampleCaseRun()
+	run.Source = domain.CaseSourceAISupplement
+	deps.CaseRuns.(*fakeCaseRunReader).get = func(context.Context, int64, int64) (domain.CaseRun, error) {
+		return run, nil
+	}
+	handler := newExecutionServer(t, deps)
+
+	rec := doExecutionRequest(handler, http.MethodGet, "/api/versions/7/batches/1842/case-runs/1843", "ezt_user", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("case run=%d body=%s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), `"source":"ai_supplement"`) {
+		t.Fatalf("case run body lacks source: %s", rec.Body)
 	}
 }
 
