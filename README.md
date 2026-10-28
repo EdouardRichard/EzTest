@@ -1,8 +1,11 @@
 # EzTest
 
-EzTest 的 P0 基础阶段（foundation）、P1 Agent 运行时、P2 公共资源/身份、P3 版本/多需求/澄清与 P4 代码理解/影响分析实现：Go 后端 API、Next.js 管理前端、PostgreSQL 持久化，以及 SSE 事件流、对象存储、审计、LLM 配置管理、可对话/可调工具/可实时展示、中止与回放的 Agent 控制台，系统/环境/账号/Session/本地代码仓等公共资源管理，版本工作台、AI 引导澄清、问题/决策/附件/需求关系，和只读的 Git 文件树/文件级 diff/AI 事实/影响候选/锚点。
+EzTest 的 P0 基础阶段（foundation）、P1 Agent 运行时、P2 公共资源/身份、P3 版本/多需求/澄清、P4 代码理解/影响分析、P5 用例脑图、P6 用例执行和 P7 全自主闭环/交付实现：Go 后端 API、Next.js 管理前端、Playwright 执行器、PostgreSQL 持久化，以及 SSE 事件流、对象存储、审计、LLM 配置管理、Agent 控制台、公共资源管理、版本工作台与澄清、代码影响分析、用例脑图、真实浏览器执行/证据/暂停恢复、AI 补全与失败分析、问题/报告、DB 断言和继续中增量批次。
 
-- 分支：`feat/p4-code-intelligence`
+- 分支：`feat/p7-autonomous-loop`
+- P7 阶段规格：[`docs/superpowers/specs/2026-10-28-eztest-p7-autonomous-loop-design.md`](docs/superpowers/specs/2026-10-28-eztest-p7-autonomous-loop-design.md)
+- P6 阶段规格：[`docs/superpowers/specs/2026-10-28-eztest-p6-execution-design.md`](docs/superpowers/specs/2026-10-28-eztest-p6-execution-design.md)
+- P5 阶段规格：[`docs/superpowers/specs/2026-10-28-eztest-p5-mindmap-review-design.md`](docs/superpowers/specs/2026-10-28-eztest-p5-mindmap-review-design.md)
 - P4 阶段规格：[`docs/superpowers/specs/2026-10-28-eztest-p4-code-intelligence-design.md`](docs/superpowers/specs/2026-10-28-eztest-p4-code-intelligence-design.md)
 - P3 阶段规格：[`docs/superpowers/specs/2026-10-27-eztest-p3-version-requirements-design.md`](docs/superpowers/specs/2026-10-27-eztest-p3-version-requirements-design.md)
 - P2 阶段规格：[`docs/superpowers/specs/2026-10-27-eztest-p2-resources-identity-design.md`](docs/superpowers/specs/2026-10-27-eztest-p2-resources-identity-design.md)
@@ -22,7 +25,7 @@ EzTest 的 P0 基础阶段（foundation）、P1 Agent 运行时、P2 公共资�
 - 对象存储：内容寻址（SHA-256）、本地文件系统、10 MiB 上限、下载时完整性校验。
 - 审计：管理员查询、登录/用户/LLM/存储/测试事件动作记录。
 - 统一约定：`{"data": ...}` 成功信封、统一错误信封与错误码、`X-Request-ID`、幂等键、CORS、健康检查、OpenAPI。
-- 本地开发脚本、E2E、P0–P4 验收入口；Docker/Compose 交付文件与静态校验。
+- 本地开发脚本、E2E、P0–P7 验收入口；Docker/Compose 交付文件与静态校验。
 
 P0 **不包含**版本/需求/用例/执行/证据/问题/报告等业务实体与页面，也不包含代码仓库管理、多实例/多租户等能力（详见 P0 阶段规格 §16）。Agent 运行时不在 P0 内，由 P1 在 P0 之上补齐。
 
@@ -57,7 +60,7 @@ cd backend; ..\.tools\go\bin\go.exe test -count=1 ./internal/resource/...
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-integration.ps1 ./internal/resource/...
 # E2E（含 fixture target）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1
-# 完整 P0–P5 验收（含 OpenAPI 契约关键词检查）
+# 完整 P0–P7 验收（含 OpenAPI 契约关键词检查）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1
 ```
 
@@ -91,7 +94,7 @@ pnpm vitest run src/features/versions
 cd ..
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1
 
-# 完整 P0–P5 验收（仓库根；P3/P4/P5 关键词、错误 reason 与事件目录检查；真实 LLM 仍 gated）
+# 完整 P0–P7 验收（仓库根；P3/P4/P5/P7 关键词、错误 reason 与事件目录检查；真实 LLM 仍 gated）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1
 ```
 
@@ -133,7 +136,7 @@ node scripts/fake-llm.p4.test.cjs
 # 仍需 Node、frontend/node_modules/yaml 与 git）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1 -StaticOnly
 
-# 完整 P0–P5 验收（P4/P5 OpenAPI needle、reason、事件、fake-LLM 测试与 P4/P5 Playwright spec 已纳入；真实 LLM 仍 gated）
+# 完整 P0–P7 验收（P4/P5/P7 OpenAPI needle、reason、事件、fake-LLM 测试与 E2E 已纳入；真实 LLM 仍 gated）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1
 ```
 
@@ -174,7 +177,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1 mindmap
 # 仅静态验收（P5 交付物/OpenAPI/迁移改名 + P4 fake-LLM；不需要数据库/API/Playwright）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1 -StaticOnly
 
-# 完整 P0–P5 验收（T16 HTTP 路由未接线时，P5 API 子检查记录 SKIPPED，静态检查仍须 PASS）
+# 完整 P0–P7 验收（P5 API 子检查在路由未接线时记录 SKIPPED，静态检查仍须 PASS）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1
 
 # 真实 LLM 验收（gated；16 个 check，缺 llm_* 键 = 失败而非跳过）
@@ -228,7 +231,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1 executio
 # 静态验收（交付物/迁移/OpenAPI/env/README，不启动数据库/API/executor）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1 -StaticOnly
 
-# 完整 P0–P6 验收（P6 区块会自行启动 fixture/fake LLM/executor 与 API；
+# 完整 P0–P7 验收（P6 区块会自行启动 fixture/fake LLM/executor 与 API；
 # 缺 executor/fixture/fake LLM 时 14 个 P6 API 子检查记录 SKIPPED，静态检查仍须 PASS；
 # 其中 MFA 自动登录接管检查会经 /p6/login?mfa=1 走到 blocked(session)）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1
@@ -250,14 +253,78 @@ P6 证据与结果位置：
 - P6 环境变量：`EZTEST_EXECUTOR_URL`、`EZTEST_EXECUTOR_TOKEN`、`EZTEST_EVIDENCE_DIR`、`EZTEST_EXEC_MAX_CONCURRENT_CASES`（1–8）、`EZTEST_EXEC_MAX_TOOL_CALLS`（1–1000）、`EZTEST_EXEC_CASE_TIMEOUT_MS`（1000–3600000）、`EZTEST_EXEC_MAX_CASES_PER_BATCH`（1–1000）、`EZTEST_EXEC_WORKER_INTERVAL_MS`（100–60000）、`EZTEST_EXEC_EVIDENCE_MAX_BYTES`（1 KiB–100 MiB）、`EZTEST_EXEC_EVIDENCE_PER_CASE`（1–1000），默认值与说明见 `.env.example` P6 段。
 - 运行环境要求：Node 20+、Playwright 1.64.1 的 Chromium（或系统 Chrome/Edge，executor 会回退 channel `chrome`/`msedge`）、本机 PostgreSQL；真实 LLM 验收额外需要可用的 `llm_base_url`/`llm_key`/`llm_model_name` 与网络。
 
-P6 已知限制：单进程调度（多实例分布式租约归 P8）；不支持 db 断言（出现即 `inconclusive(case)`）；不做用例级自动重跑（应用失败仅手动 rerun）；证据无 GC/删除 API；真实 LLM 的分类/暂停结果受模型行为影响，脚本在不符合预期时 fail-closed。
+P6 已知限制：单进程调度（多实例分布式租约归 P8）；P6 阶段不支持 db 断言（P7 已补只读 db 断言）；不做用例级自动重跑（应用失败仅手动 rerun）；证据无 GC/删除 API；真实 LLM 的分类/暂停结果受模型行为影响，脚本在不符合预期时 fail-closed。
+
+## P7 全自主闭环与交付（补全 + 失败分析 + 问题/报告 + 继续中）
+
+P7 新增 `delivery` 限界上下文（问题/报告/分析 run），并加法扩展 version/resource/execution/mindmap/codeintel：基线批次终态后自主编排出报告与补全，完成后新增需求进入 `continuing`，经增量设计/增量批次/报告 revision 回到 `completed`；失败分析/问题整理不可用时批次仍照常执行并标记降级。
+
+- **继续中（D43）**：在 `completed` 版本上成功创建需求会在同事务置 `status=continuing`、`continue_phase=clarifying`、`continued_at`（D31 唯一例外；确认/重开需求不改状态）；`batch_no` 只在建批时分配。`continuing → completed` 由自主协调器在增量批次链收尾后 `TryFinalize` 触发，取代 P6 的“批次完成即版本完成”。
+- **链式批次（D45）**：`run_batch.kind ∈ {baseline,incremental,supplement}` + `parent_batch_id`；单版本单活跃批；每批最多 1 个补全周期、每周期最多 5 条新用例；补全批由 worker 创建，用户不能手工建 supplement 批（409 `supplement_batch_automatic`）。增量批 base=上一终态批 `head_commit`，head=建批时固定分支 HEAD；非祖先（rebase/强推）回退版本基线并标 `base_fallback_reason=history_rewritten`。
+- **自主链（D51）**：单进程 worker 默认 2s tick，单 tick 最多处理 `EZTEST_AUTONOMY_BATCHES_PER_TICK`（默认 4）个终态批/继续中版本；顺序为失败分析（仅 `failed(application)`）→ 问题整理 → 报告 ensure/stale 重生成 → 基线批补全 → supplement 批；`autonomy_done`/`supplement_attempted` CAS 防重复建批。3 个 profile：`supplement-agent`、`failure-analysis-agent`、`issue-triage-agent`，MaxTurns 20 / 600s。
+- **问题（D47）**：`issue` + `issue_ref`；状态 `open → confirmed/dismissed`（终态，不重开）；AI 只为 `failed(application)` 与需求缺口建单，环境/会话/模型/用例失败不生成缺陷；同一 `sha256(version|caseNode|failureClass|normalizedReason)` 去重；确认/驳回任一登录用户可用，驳回必填原因、revision CAS；`code_anchor(subject_kind='issue')` 由服务端校验 `file:line` 与问题归属后创建。
+- **报告（D46）**：`report` 按 `(batch_id, revision)` 唯一；分析终态后自动发布 revision 1；读取时用 `input_fingerprint` 判 stale 并只发一次 `report.stale`；重新生成 revision+1（有新 revision 时返回最新 200，否则新建 201）；支持批次差异与 Markdown（含 Mermaid）导出。P6 `GET /batches/{id}/report` 派生端点保持原样。
+- **DB 断言（D48）**：环境级 `db_target`（admin-only，PostgreSQL）；密码明文存储（D28 同类例外）但 API/DTO/事件/审计/日志/证据/报告/prompt 永不回显；只读事务 + 单条 `SELECT/WITH/SHOW/EXPLAIN` + 超时/行数/SQL 与结果字节上限；连接/权限失败 → `blocked(environment)`，SQL/只读/截断错误 → `inconclusive(case)`；结果落 `db_result` 证据。
+- **API/事件/权限（D52）**：版本级 `/api/versions/{id}/issues`、`/reports`、`/batches/{batchId}/analysis`；全局只读 `/api/issues`、`/api/reports`；环境级 `/api/resources/environments/{id}/db-target`（admin）；mindmap `incremental-plan` 与 `PATCH .../nodes/{nodeId}/supplement`；`baseCommit` 可选与 issue 锚点；`/api/versions/{id}/changes` 读时派生（`version_change` 不建表，`code_changed` 留 P8）。新增 8 个事件（`case.supplemented`、`case.revalidation_marked`、`issue.created/updated`、`report.published/stale`、`analysis.started/finished`）走既有 `version:{id}` 通道；P7 ID 一律十进制字符串。
+- **前端**：问题/报告 Tab、总览完善、继续中徽章/横幅 + 增量计划、admin-only DB 目标区块；全局只读中心 `/issues`、`/reports`；深链 `?tab=issues&issue=`、`?tab=report&report=`、`?tab=results&caseRun=`、`?tab=requirements&requirement=`。
+- **迁移**：`order.txt` 追加 `delivery_0001_issue.sql`、`delivery_0002_report.sql`、`delivery_0003_analysis.sql`、`resource_0007_db_target.sql`、`version_0005_continue.sql`、`execution_0002_autonomy.sql`、`mindmap_0002_supplement.sql`、`codeintel_0005_issue_anchor.sql`。
+
+P7 验收命令（仓库根）：
+
+```powershell
+# P7 后端单元（集成测试需 EZTEST_TEST_DATABASE_URL + -tags=integration）
+cd backend
+..\.tools\go\bin\go.exe test -count=1 ./internal/delivery/... ./internal/version/... ./internal/execution/... ./internal/resource/... ./internal/mindmap/... ./internal/codeintel/... ./cmd/eztest/...
+
+# P7 前端单元（问题/报告/继续中/增量计划/DB 目标/总览）
+cd ..\frontend
+pnpm vitest run src/features/delivery src/features/versions src/features/resources src/features/execution
+
+# P7 fake-LLM 契约（补全/失败分析/问题整理/DB 断言确定性）
+cd ..
+node scripts/fake-llm.p7.test.cjs
+
+# 静态验收（P7 交付物/迁移/OpenAPI/事件/reason/testid；不需要数据库/API）
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1 -StaticOnly
+
+# P7 Playwright E2E（目标命令，T25 交付；执行时由 e2e.ps1 管理服务、fake LLM 与 fixture）
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1 p7-continuing
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1 p7-issues-report
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1 p7-supplement
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1 p7-degraded
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1 p7-db-config
+
+# 完整 P0–P7 验收（P6 区块自行启动 fixture/fake LLM/executor/API；
+# P7 区块仅为仓库本地静态检查，不启动 P7 fixture/API；缺 P5/P6 依赖时对应 API 子检查记录 SKIPPED，静态仍须 PASS）
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1
+```
+
+P7 真实验收（gated，显式开启才产生费用/连接真实库）：
+
+```powershell
+# 真实 LLM：补全/失败分析/问题整理/报告（gated；目标命令，T28 交付）
+$env:EZTEST_RUN_REAL_LLM = "1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance-p7-llm.ps1
+
+# 真实 PostgreSQL 只读 DB 断言（gated；目标命令，T29 交付；先用 fixture-db.ps1 准备目标库/只读角色）
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/fixture-db.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance-p7-db.ps1
+```
+
+P7 证据与结果位置：
+
+- fake LLM / E2E：`.tmp/` 下由 `scripts/e2e.ps1` 管理；DB fixture 目标库 `eztest_p7_target`（只读角色 `eztest_p7_ro`），只用于本机验收。
+- 报告 Markdown：`EZTEST_REPORT_DIR`（默认 `.data/reports`），DB 只存相对路径 + sha256 + 大小；导出响应带 `X-Content-SHA256`。
+- gated 真实验收结果写入 `.tmp/`（只含状态/ID/计数/错误码，不含 prompt、凭据、SQL 结果或证据正文）。
+
+P7 已知限制：`version_change` 表与 `code_changed` 变更项未实现（`/changes` 读时派生，P8）；证据 GC 与报告 stale 联动归 P8；自主 worker 单实例（leader 选举/分布式锁归 P8）；报告 PDF、问题外部工单、问题重开/合并、非 PostgreSQL 目标库归 P8/后续；全局问题/报告中心为只读列表，跨版本查询适配由 T17b 接线，挂载前该组不对外注册；`IssuesTab` 约 300 行未拆分（T18 评审记录 305 行，当前文件 300 行；可维护性余项）；`EZTEST_ANALYSIS_MAX_CASES`/`EZTEST_SUPPLEMENT_MAX_CASES` 为 P7 规格目标变量，当前构建仍以代码固定上限 20/5 执行，尚未读取这两个变量（P8 接线）；`EZTEST_AUTONOMY_BATCHES_PER_TICK` 未对 >20 的值做上限钳制；报告快照 `content.batch` 未暴露 `baseFallbackReason`/`history_rewritten`（仅批次 DTO `baseFallbackReason` 与增量计划 `warnings` 可见；D49 已知差异，归 T23/P8）。P7 运行手册中的 `scripts/e2e.ps1 p7-*`、`scripts/acceptance-p7-llm.ps1`、`scripts/acceptance-p7-db.ps1`、`scripts/fixture-db.ps1` 为目标命令，依赖 T25/T28/T29/T32 交付与实跑证据；当前 README 不宣称这些命令已通过。
 
 ## 技术架构
 
 ### 后端（`backend/`）
 
 - Go 1.24，标准库 `net/http`（Go 1.22+ 方法路由），`pgx/v5` 连接 PostgreSQL 17。
-- DDD 限界上下文：`identity`、`eventing`、`llm`、`storage`、`audit`、P1 的 `agent`、P2 的 `resource`、P3 的 `version` 与 P4 的 `codeintel`；每个上下文四层（`domain` / `application` / `infrastructure` / `interfaces/httpapi`），导入方向约束见 `Agent.md` §6.2。
+- DDD 限界上下文：`identity`、`eventing`、`llm`、`storage`、`audit`、P1 的 `agent`、P2 的 `resource`、P3 的 `version`、P4 的 `codeintel`、P5 的 `mindmap`、P6 的 `execution` 与 P7 的 `delivery`；每个上下文四层（`domain` / `application` / `infrastructure` / `interfaces/httpapi`），导入方向约束见 `Agent.md` §6.2。
 - `cmd/eztest` 是唯一组装根：读取配置、连接数据库、执行迁移、种子管理员/默认 LLM 配置/内置 Agent profile、清理 `interrupted` run、装配 HTTP 服务、在 SIGINT/SIGTERM 时先停止 Agent run 再优雅退出。
 - `internal/server` 只装配路由与中间件：recover → request ID → 日志 → CORS → 认证 → 幂等 → 路由。
 - `internal/platform` 放共享的纯基础设施：错误信封、分页游标、JSON 解码、请求 ID、AES keyring、幂等存储。
@@ -267,7 +334,7 @@ P6 已知限制：单进程调度（多实例分布式租约归 P8）；不支�
 ### 前端（`frontend/`）
 
 - Next.js 16 App Router、React 19、TypeScript、Tailwind CSS 4、Radix 原语、`next-themes`、lucide-react。
-- `src/app/` 只做路由/布局/页面组装；业务在 `src/features/{auth,users,llm-settings,sse-test,agent-console,resources,code-repos,versions,code-intel,mindmap,shell}`；共享 UI 原语在 `src/components/ui/`，跨 feature 导航在 `src/navigation/`。P1 的 `/agents` 页面由 `agent-console` 提供，P2 的 `/resources`（四 Tab）与 `/code-repos` 分别由 `resources`、`code-repos` 提供，P3 的 `/versions` 列表与详情工作台由 `versions` 提供，P4 的「代码与变更」Tab 由 `code-intel` 提供。
+- `src/app/` 只做路由/布局/页面组装；业务在 `src/features/{auth,users,llm-settings,sse-test,agent-console,resources,code-repos,versions,code-intel,mindmap,execution,delivery,shell}`；共享 UI 原语在 `src/components/ui/`，跨 feature 导航在 `src/navigation/`。P1 的 `/agents` 页面由 `agent-console` 提供，P2 的 `/resources`（四 Tab）与 `/code-repos` 分别由 `resources`、`code-repos` 提供，P3 的 `/versions` 列表与详情工作台由 `versions` 提供，P4 的「代码与变更」Tab 由 `code-intel` 提供，P5 的脑图由 `mindmap` 提供，P6 的执行 Tab 由 `execution` 提供，P7 的问题/报告 Tab 与全局 `/issues`、`/reports` 由 `delivery` 提供。
 - 所有 HTTP 请求经 `src/lib/api-client.ts`（Bearer、错误信封、`X-Request-ID`、幂等键）；SSE 经 `src/lib/sse-client.ts`（fetch 流、`Last-Event-ID`、退避重连、心跳超时）。
 - 质量工具：Biome（lint/format）、Vitest + Testing Library、Playwright（使用本机 Chrome/Edge channel，不下载 Chromium）。
 
@@ -298,19 +365,23 @@ EzTest/
 │     ├─ resource/                    # P2 公共资源/身份（四层）
 │     ├─ version/                     # P3 版本/需求/澄清（四层）
 │     ├─ codeintel/                   # P4 代码理解/影响分析（四层）
+│     ├─ mindmap/                     # P5 用例脑图/评审（四层）
+│     ├─ execution/                   # P6 执行/证据/暂停恢复（四层）
+│     ├─ delivery/                    # P7 问题/报告/分析（四层）
 │     ├─ storage/                     # 对象存储（四层）
 │     └─ audit/                       # 审计（四层）
+├─ executor/                          # P6 独立 Node/Playwright 执行器
 ├─ frontend/
-│  ├─ src/app/                        # Next.js App Router 页面组装（含 /agents、/resources、/code-repos、/versions）
-│  ├─ src/features/                   # auth/users/llm-settings/sse-test/agent-console/resources/code-repos/versions/code-intel/mindmap/shell
+│  ├─ src/app/                        # Next.js App Router 页面组装（含 /agents、/resources、/code-repos、/versions、/issues、/reports）
+│  ├─ src/features/                   # auth/users/llm-settings/sse-test/agent-console/resources/code-repos/versions/code-intel/mindmap/execution/delivery/shell
 │  ├─ src/components/ui/              # 共享 UI 原语（StatusBadge/EmptyState）
 │  ├─ src/navigation/                 # 跨 feature 导航数据（侧边栏）
 │  ├─ src/lib/                        # api-client / sse-client / auth-storage
 │  ├─ scripts/validate-compose.mjs    # Compose 静态校验
 │  └─ e2e/                            # Playwright E2E（由 scripts/e2e.ps1 编排）
 ├─ deploy/                            # Dockerfile.api / Dockerfile.web / docker-compose.yml
-├─ scripts/                           # db/dev-api/dev-web/test/e2e/acceptance/fake-llm/fixture-target/acceptance-agent-llm/acceptance-codeintel-llm/acceptance-mindmap-llm
-├─ docs/openapi/api.yaml              # 手工维护的 OpenAPI 3.0（P0 + P1 + P2 + P3 + P4 + P5）
+├─ scripts/                           # db/dev-api/dev-web/test/e2e/acceptance/fake-llm/fixture-target/acceptance-*-llm/acceptance-p7-*
+├─ docs/openapi/api.yaml              # 手工维护的 OpenAPI 3.0（P0–P7）
 ├─ .env.example                       # 环境变量模板（无真实秘密）
 ├─ .tools/                            # 便携 Go/PostgreSQL（gitignored）
 └─ README.md
@@ -378,6 +449,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/db.ps1 start
 | `EZTEST_MINDMAP_MAX_CASES` | 否 | P5 单次设计 run/物化最多 case 数，1–60，默认 `60`。 |
 | `EZTEST_EXPLORE_MAX_REQUESTS` | 否 | P5 单次探索最多 HTTP 请求数，1–40，默认 `40`；超出记 `stats.truncated`。 |
 | `EZTEST_EXPLORE_TIMEOUT_MS` | 否 | P5 探索单请求超时，500–30000 ms，默认 `5000`；另有 60s 总时长与 512 KiB 解析上限。 |
+| `EZTEST_REPORT_DIR` | 否 | P7 报告 Markdown 根目录，默认 `.data/reports`；目录 0700、文件 0600，DB 只存相对路径 + sha256 + 大小。 |
+| `EZTEST_AUTONOMY_BATCHES_PER_TICK` | 否 | P7 自主 worker 单 tick 处理的终态批/继续中版本上限，默认 `4`；未设置或非法值回退默认（规格建议 1–20，当前实现未钳制上限）。 |
+| `EZTEST_ANALYSIS_MAX_CASES` | 否 | P7 规格目标：失败分析单 run 最多用例数（默认 `20`，1–100）；**当前构建以代码固定上限 20 执行，尚未读取该变量**（P8 接线）。 |
+| `EZTEST_SUPPLEMENT_MAX_CASES` | 否 | P7 规格目标：补全单 run 最多新用例数（默认 `5`，1–20）；**当前构建以代码固定上限 5 执行，尚未读取该变量**（P8 接线）。 |
+| `EZTEST_DB_RESULT_MAX_BYTES` | 否 | P7 db 断言单次结果字节上限，64 KiB–16 MiB，默认 `1048576`。 |
+| `EZTEST_DB_SQL_MAX_BYTES` | 否 | P7 db 断言 SQL 文本上限，1 KiB–64 KiB，默认 `16384`。 |
 | `llm_base_url` / `llm_key` / `llm_model_name` | 否 | 首次启动的可选默认 LLM 种子；小写变量名是设计约定，Key 留空则不发起真实调用。P4 复用该配置，不新增模型/Key。 |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Compose | 仅 `deploy/docker-compose.yml` 使用；`POSTGRES_PASSWORD` 必填。 |
 | `NEXT_PUBLIC_API_BASE_URL` | 否 | 浏览器访问的 API origin，默认 `http://localhost:13333`；Compose 构建时内联。 |
@@ -409,6 +486,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/dev-web.ps1
 - 公共资源：<http://localhost:6868/resources>（四 Tab；普通用户只读）
 - 代码仓：<http://localhost:6868/code-repos>（普通用户只读）
 - 版本工作台：<http://localhost:6868/versions>（列表与 `/versions/[id]` 详情；全部登录用户可写）
+- 全局问题中心：<http://localhost:6868/issues>（P7 只读，可深链回版本问题 Tab）
+- 全局报告中心：<http://localhost:6868/reports>（P7 只读，可深链回版本报告 Tab）
 - 用例脑图：<http://localhost:6868/versions/[id]/mindmap>（全屏画布；冻结后只读）
 - API 健康：<http://localhost:13333/api/health>
 - OpenAPI：<http://localhost:13333/api/openapi.yaml>
@@ -450,6 +529,8 @@ pnpm dev
 - P2 公共资源：`/api/resources/*` 使用 camelCase 字段（P0/P1 为 snake_case）；GET 对任意登录用户开放，写/动作仅管理员；`credential` 与 `storageState` 只写不读，响应只含 `credentialSet` 与 storageState hash/形状统计。
 - P3 版本：`/api/versions/*` 使用 camelCase 字段，全部登录用户可读写（无 403）；P3 自有 ID 为十进制字符串，P2 资源 ID/用户 ID 为 number；版本事件固定 `channel=version:{id}`，`GET /api/versions/{id}/stream` 服务端锁定通道；错误细分统一放在 `details.reason`（见 OpenAPI `VersionConflict`/`VersionInvalid`/`VersionUnavailable`）。
 - P4 代码智能：仓库级 `/api/code/repos/*` 与版本级 `/api/versions/{id}/code/*` 使用 camelCase；codeintel 自有 ID/subjectId 为十进制字符串，`repoId` 等为 number；错误 reason 见 OpenAPI `CodeErrorReason`；`code.changed`/`code.impact_computed` 事件走版本 SSE 通道。
+- P6 执行：`/api/versions/{id}/batches*`、`evidence/*`、`execution/sessions` 与 `/api/resources/auth-flows`（admin）；execution ID 为十进制字符串；批次 DTO 兼容 P7 加法字段。
+- P7 交付：`/api/versions/{id}/issues`、`/reports`、`/batches/{batchId}/analysis`、mindmap `incremental-plan`/`supplement`、环境 `db-target`（admin）、全局只读 `/api/issues`、`/api/reports`；版本 DTO 新增 `continuePhase/continuedAt`，但 `paused/pause_mode/batch_no` 仍为 P6 snake_case；P7 事件固定 8 个、ID 一律十进制字符串；`db_target` 密码永不回显。
 - `X-Request-ID` 可传入 `^[A-Za-z0-9_-]{8,128}$`，否则生成 UUID；响应回显。
 - 认证写接口支持 `Idempotency-Key`（24h 重放，同 key 不同 body 为 409）。
 - CORS 只允许 `EZTEST_WEB_ORIGIN`；SSE 支持 `Last-Event-ID`。Agent 活动事件为 `type=agent.activity`、`channel=agent:{session_id}`，复用 P0 快照与 SSE；9 类 `detail.kind` 见 P1 章节与 OpenAPI `AgentActivityDetail`。
@@ -467,6 +548,7 @@ pnpm dev
 | 本地代码仓（读=登录用户，写=管理员） | `GET/POST /api/resources/code-repos`、`GET/PATCH/DELETE /api/resources/code-repos/{id}`、`POST /api/resources/code-repos/{id}/validate` |
 | 版本/需求/澄清（登录用户） | 版本：`GET/POST /api/versions`、`GET/PATCH /api/versions/{id}`、`PUT /api/versions/{id}/bindings`、`POST /api/versions/{id}/start-clarification`/`enter-design`；需求：`GET/POST /api/versions/{id}/requirements`、`GET/PATCH/DELETE .../{rid}`、`POST .../{rid}/confirm`/`reopen`、`GET/POST .../{rid}/attachments`、`GET .../attachments/{aid}/content`、`DELETE .../attachments/{aid}`；关系：`GET/POST /api/versions/{id}/relations`、`PATCH/DELETE .../{relId}`；澄清：`GET /api/versions/{id}/clarification`、`POST .../clarification/sessions`、`POST .../sessions/{sid}/complete`、`GET/POST .../clarification/messages`、`POST .../clarification/analyze`/`recon`、`GET/POST .../clarification/questions`、`PATCH .../questions/{qid}`、`GET/POST .../decisions`、`PATCH .../decisions/{did}`；事件：`GET /api/versions/{id}/events`、`GET /api/versions/{id}/stream`（SSE） |
 | 代码智能（读=登录用户，索引=管理员） | 仓库级：`GET /api/code/repos`、`POST /api/code/repos/{repoId}/index`（管理员）、`GET .../index-runs/latest`、`GET .../index-runs/{runId}`、`GET .../tree`、`GET .../file`、`GET .../diff`、`GET .../diff/file`、`GET .../facts`、`GET .../search`、`GET .../commits/{sha}`；版本级：`GET /api/versions/{id}/code/changes`、`POST/GET .../analyses`、`GET .../analyses/latest`、`GET .../analyses/{analysisId}`、`PATCH .../analyses/{analysisId}/candidates/{candidateId}`、`GET/POST .../anchors`、`DELETE .../anchors/{anchorId}` |
+| P7 交付（登录用户；DB 目标=管理员） | 问题：`GET/POST /api/versions/{id}/issues`、`GET/PATCH .../issues/{issueId}`；报告：`GET/POST /api/versions/{id}/reports`、`GET .../reports/{reportId}`、`POST .../publish`/`regenerate`、`GET .../export`/`diff`；分析：`GET/POST /api/versions/{id}/batches/{batchId}/analysis`、`GET .../analysis/{analysisId}`；增量：`GET /api/versions/{id}/mindmap/incremental-plan`、`PATCH .../mindmap/nodes/{nodeId}/supplement`；全局只读：`GET /api/issues`、`GET /api/reports`；DB 目标（admin）：`GET/PUT/DELETE /api/resources/environments/{id}/db-target`、`POST .../db-target/test` |
 | 事件流 | `GET /api/stream/events`、`GET /api/stream`（SSE）、`POST /api/admin/stream/test-events`（需开启测试端点）；`agent:` 通道仅管理员 |
 | 存储（管理员） | `POST /api/admin/storage/objects`、`GET /api/admin/storage/objects/{sha256}` |
 | 审计（管理员） | `GET /api/admin/audit` |
@@ -488,22 +570,22 @@ pnpm dev
 # 一键本地检查（Go 单元 + Go 集成 + 前端 lint/typecheck/test）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test.ps1
 
-# 完整 P0–P5 验收（Go 单元/集成、Agent 单元/集成、Version 单元/集成、codeintel 单元/集成、
-# 前端 lint/typecheck/test/build、Playwright E2E（含 P4/P5 spec）、迁移重复执行、健康/审计/版本 API 冒烟、
-# 交付物与 OpenAPI P1/P2/P3/P4/P5 契约、P3/P4/P5 错误 reason 与事件目录检查、P4 fake-LLM 契约、
-# P5 mindmap API/手工人链/冻结导出/事件/权限/降级子检查）
+# 完整 P0–P7 验收（Go 单元/集成、Agent 单元/集成、Version 单元/集成、codeintel 单元/集成、
+# 前端 lint/typecheck/test/build、Playwright E2E（含 P4/P5/P6/P7 spec）、迁移重复执行、
+# 健康/审计/版本 API 冒烟、交付物与 OpenAPI P1–P7 契约、错误 reason 与事件目录检查、
+# P4/P7 fake-LLM 契约、P5/P6 功能与权限/降级子检查、P7 仓库本地静态契约）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1
 
-# 仅静态检查（README/OpenAPI/env/Compose/迁移契约 + P5 静态契约 + P4 fake-LLM，不启动数据库/API/Playwright；
-# 仍需 Node、frontend/node_modules/yaml 与 git）
+# 仅静态检查（README/OpenAPI/env/Compose/迁移契约 + P4/P7 fake-LLM + P5/P7 静态契约，
+# 不启动数据库/API/Playwright；仍需 Node、frontend/node_modules/yaml 与 git）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1 -StaticOnly
 
 # 仅 P5 mindmap E2E（fake LLM P5 模式；会自行启动/停止服务与 fixture target）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1 mindmap
 
 # 仅 E2E（会自行启动/停止 API、Web、fake LLM 上游与 fixture target，使用 eztest_e2e 库；
-# 当前覆盖 P0 场景、P1 Agent 控制台、P2 Session、P3 版本工作台/澄清/降级、P4
-# 代码理解/缓存/降级/锚点/仓库索引 5 个 spec，以及 P5 mindmap spec）
+# 覆盖 P0–P7：P1 Agent 控制台、P2 Session、P3 版本工作台/澄清/降级、P4 代码理解 5 个 spec、
+# P5 mindmap、P6 execution，以及 P7 continuing/问题报告/补全/降级/DB 配置 spec（T25 目标））
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1
 
 # Compose 静态校验（不需要 Docker 守护进程）
@@ -525,18 +607,24 @@ node scripts/validate-compose.mjs
 | Codeintel 集成 | `cd backend; $env:EZTEST_TEST_DATABASE_URL=...; ..\.tools\go\bin\go.exe test -tags=integration -count=1 ./internal/codeintel/...` |
 | Mindmap 单元 | `cd backend; ..\.tools\go\bin\go.exe test -count=1 ./internal/mindmap/...` |
 | Mindmap 集成 | `cd backend; $env:EZTEST_TEST_DATABASE_URL=...; ..\.tools\go\bin\go.exe test -tags=integration -count=1 ./internal/mindmap/...` |
+| Execution 单元 | `cd backend; ..\.tools\go\bin\go.exe test -count=1 ./internal/execution/...` |
+| Execution 集成 | `cd backend; $env:EZTEST_TEST_DATABASE_URL=...; ..\.tools\go\bin\go.exe test -tags=integration -count=1 ./internal/execution/...` |
+| Delivery 单元 | `cd backend; ..\.tools\go\bin\go.exe test -count=1 ./internal/delivery/... ./internal/version/... ./internal/resource/...` |
+| Delivery 集成 | `cd backend; $env:EZTEST_TEST_DATABASE_URL=...; ..\.tools\go\bin\go.exe test -tags=integration -count=1 ./internal/delivery/... ./internal/execution/... ./internal/mindmap/...` |
+| Delivery 前端 | `cd frontend; pnpm vitest run src/features/delivery src/features/versions src/features/resources src/features/execution` |
 | Mindmap 前端 | `cd frontend; pnpm vitest run src/features/mindmap` |
 | P4 fake-LLM 契约 | `node scripts/fake-llm.p4.test.cjs`（需先 `scripts/fixture-codeintel-repo.ps1`） |
+| P7 fake-LLM 契约 | `node scripts/fake-llm.p7.test.cjs` |
 | 前端单元 | `cd frontend; pnpm test` |
 | 前端静态/构建 | `cd frontend; pnpm lint; pnpm typecheck; pnpm build` |
 | E2E | `cd frontend; pnpm e2e`（推荐用 `scripts/e2e.ps1` 管理服务、数据库与 fake 上游） |
 
 验收说明：
 
-- 本机没有 Docker，`scripts/acceptance.ps1` 会把“Compose 容器运行”标为 **SKIPPED**；Compose 仅通过 `validate-compose.mjs` 做静态字段校验，不代表已运行验证。P1 真实 Agent LLM、P3 真实 LLM 人工验收、P4 真实 LLM 验收与 P5 真实 LLM 验收同样标为 **SKIPPED**（见下节）。
-- 常规测试不访问真实 LLM：Go 测试使用 `httptest` mock（`/v1/chat/completions`、`/v1/responses`、`/v1/models`，可注入 429/5xx/超时/分片）；`scripts/e2e.ps1` 使用 `scripts/fake-llm.cjs`（127.0.0.1:13334）并覆盖 `llm_*`，E2E 零 LLM 费用；P4 的 `scripts/fake-llm.p4.test.cjs` 同样只启动本地 fake 上游。
-- `acceptance.ps1 -StaticOnly` 可在没有 `.env`/数据库/Playwright 的主机上运行：它校验 README/OpenAPI/env/Compose 契约、从 `order.txt` 动态推导 P4/P5 迁移与表清单、校验 P5 交付物与 mindmap OpenAPI 契约（23 path/27 operation/8 事件/35 reason）、解析 OpenAPI YAML，并执行 P4 fake-LLM 测试。仍需要 Node、`frontend/node_modules/yaml` 与 git（P4 fixture）。
-- `acceptance.ps1` 额外校验 `docs/openapi/api.yaml` 含 P1 的 `/api/agents/sessions`、`agent.activity`、`reasoning_tokens`，P2 的 `/api/resources/systems`、`/api/resources/sessions`、`/api/resources/code-repos`、`storageState`、`credentialSet`，P3 的 `/api/versions`、`clarification`、`enter-design`、`snowflake`、`version-attachments` 关键词、全部 P3 错误 reason（含字段级 `invalid_context_summary`）、全部版本事件类型（含 `clarification.context_updated`），P4 的 `/api/code/repos/{repoId}/index`、`/api/versions/{versionId}/code/analyses`、全部 P4 path/schema、`CodeErrorReason`（含 `analysis_in_progress`、`anchor_duplicate`、`analysis_queue_full`、`git_unavailable`、`path_not_git_repo`）与 `code.changed`/`code.impact_computed` 事件，以及 P5 的 `/api/versions/{versionId}/mindmap` 23 path/27 operation、8 个 `case.*` 事件、全部 35 个 `MindmapErrorReason`、`AnchorSubjectKind=case` 与 `AppModelNode.source=explored`；同时校验 `.env.example` 的 Agent/P3/P4/P5 变量、Compose 的附件目录与 P4 Playwright spec 是否存在；P1/P3/P4/P5 DoD 与检查项/证据的映射会打印在汇总后。T16 路由未接线时 P5 的 8 个 API 子检查记为 **SKIPPED**，静态检查与 DoD 映射仍须 PASS。P4/P5 E2E 由 `scripts/e2e.ps1` 的完整 Playwright 套件执行。
+- 本机没有 Docker，`scripts/acceptance.ps1` 会把“Compose 容器运行”标为 **SKIPPED**；Compose 仅通过 `validate-compose.mjs` 做静态字段校验，不代表已运行验证。P1 真实 Agent LLM、P3 真实 LLM 人工验收、P4/P5/P7 真实 LLM 与 P7 真实 DB 验收同样标为 **SKIPPED**（见下节）。
+- 常规测试不访问真实 LLM：Go 测试使用 `httptest` mock（`/v1/chat/completions`、`/v1/responses`、`/v1/models`，可注入 429/5xx/超时/分片）；`scripts/e2e.ps1` 使用 `scripts/fake-llm.cjs`（127.0.0.1:13334）并覆盖 `llm_*`，E2E 零 LLM 费用；P4 的 `scripts/fake-llm.p4.test.cjs` 与 P7 的 `scripts/fake-llm.p7.test.cjs` 同样只启动本地 fake 上游。
+- `acceptance.ps1 -StaticOnly` 可在没有 `.env`/数据库/Playwright 的主机上运行：它校验 README/OpenAPI/env/Compose 契约、从 `order.txt` 动态推导 P4–P7 迁移与表清单、校验 P5/P7 交付物与 OpenAPI 契约（P7 事件/reason/testid/端点）、解析 OpenAPI YAML，并执行 P4/P7 fake-LLM 测试。仍需要 Node、`frontend/node_modules/yaml` 与 git（P4 fixture）。
+- `acceptance.ps1` 额外校验 `docs/openapi/api.yaml` 含 P1 的 `/api/agents/sessions`、`agent.activity`、`reasoning_tokens`，P2 的 `/api/resources/systems`、`/api/resources/sessions`、`/api/resources/code-repos`、`storageState`、`credentialSet`，P3 的 `/api/versions`、`clarification`、`enter-design`、`snowflake`、`version-attachments` 关键词、全部 P3 错误 reason（含字段级 `invalid_context_summary`）、全部版本事件类型（含 `clarification.context_updated`），P4 的 `/api/code/repos/{repoId}/index`、`/api/versions/{versionId}/code/analyses`、全部 P4 path/schema、`CodeErrorReason`（含 `analysis_in_progress`、`anchor_duplicate`、`analysis_queue_full`、`git_unavailable`、`path_not_git_repo`）与 `code.changed`/`code.impact_computed` 事件，P5 的 `/api/versions/{versionId}/mindmap` 23 path/27 operation、8 个 `case.*` 事件、全部 35 个 `MindmapErrorReason`、`AnchorSubjectKind=case` 与 `AppModelNode.source=explored`，以及 P6/P7 的批次/证据/报告/问题/分析/db-target 端点、P7 8 个事件、全部 P7 reason、`code_anchor.subjectKind=issue` 与 P7 前端 testid/导航 phase；同时校验 `.env.example` 的 Agent/P3/P4/P5/P6 变量、Compose 的附件目录与 P4 Playwright spec 是否存在；P1–P7 DoD 与检查项/证据的映射会打印在汇总后。P5/P6 API 子检查在路由未接线时记为 **SKIPPED**；P7 区块全部为仓库本地静态检查（不启动 P7 服务），静态检查与 DoD 映射仍须 PASS。
 - 通过条件：所有非 SKIPPED 检查 FAIL 数为 0，脚本退出码为 0。
 
 ## 真实 LLM（gated）
@@ -544,14 +632,16 @@ node scripts/validate-compose.mjs
 只有同时满足以下条件才会产生真实上游调用与费用：
 
 1. `.env` 中 `llm_base_url` / `llm_key` / `llm_model_name` 有效；
-2. 显式设置 `EZTEST_RUN_REAL_LLM=1`（P0/P1/P4/P5 脚本）或 `EZTEST_ACCEPTANCE_REAL_LLM=1`（P3 人工验收）；
-3. 运行 P0 连通性验收 `scripts/acceptance-llm.ps1`，或 P1 Agent 真实验收 `scripts/acceptance-agent-llm.ps1`（后者验证 `deepseek-flash` 思考模式 + 工具调用 + 终态，并断言 `reasoning_tokens>0`），或 P4 代码智能真实验收 `scripts/acceptance-codeintel-llm.ps1`（真实 Git diff + 证据哈希 + 候选 + unmapped 完整性 + 缓存/force 版本，结果含 `analysis.model`/`promptVersion` provenance 与 degraded 标记，写入 `.tmp/p4-real-acceptance.json`），或 P5 用例脑图真实验收 `scripts/acceptance-mindmap-llm.ps1`（真实设计/评审/数据规划/探索 + 手工人链 + 三格式导出 + 事件 + 降级 + 幂等，结果写入 `.tmp/p5-real-acceptance.json`），或按 P3 章节人工执行澄清/分析/侦察验收。
+2. 显式设置 `EZTEST_RUN_REAL_LLM=1`（P0/P1/P4/P5/P7 脚本）或 `EZTEST_ACCEPTANCE_REAL_LLM=1`（P3 人工验收）；
+3. 运行 P0 连通性验收 `scripts/acceptance-llm.ps1`，或 P1 Agent 真实验收 `scripts/acceptance-agent-llm.ps1`（后者验证 `deepseek-flash` 思考模式 + 工具调用 + 终态，并断言 `reasoning_tokens>0`），或 P4 代码智能真实验收 `scripts/acceptance-codeintel-llm.ps1`（真实 Git diff + 证据哈希 + 候选 + unmapped 完整性 + 缓存/force 版本，结果含 `analysis.model`/`promptVersion` provenance 与 degraded 标记，写入 `.tmp/p4-real-acceptance.json`），或 P5 用例脑图真实验收 `scripts/acceptance-mindmap-llm.ps1`（真实设计/评审/数据规划/探索 + 手工人链 + 三格式导出 + 事件 + 降级 + 幂等，结果写入 `.tmp/p5-real-acceptance.json`），或 P7 全自主闭环真实验收 `scripts/acceptance-p7-llm.ps1`（补全/失败分析/问题整理/报告 + 降级场景，gated 且 fail-closed），或按 P3 章节人工执行澄清/分析/侦察验收。
+
+P7 真实 DB 验收：先用 `scripts/fixture-db.ps1` 创建/重置 `eztest_p7_target` 与只读角色（本机 PG），再运行 `scripts/acceptance-p7-db.ps1`（连接/权限失败 → `blocked(environment)`，SQL/只读/截断 → `inconclusive(case)`，结果 `db_result` 证据）；两个脚本都只用于本机验收，不写入版本仓库或生产库。
 
 P4 脚本可选配置：`EZTEST_ACCEPTANCE_P4_REPO`（来源 Git 仓库路径，默认当前仓库；脚本总是把它克隆到 `./.tmp/p4-real-repo` 并在克隆内创建唯一验收分支，来源仓库只读、绝不被写入）、`EZTEST_ACCEPTANCE_P4_BASE`/`EZTEST_ACCEPTANCE_P4_HEAD`（显式 40-hex commit 对，base 必须是 head 的祖先且变更文件 ≤20）、`EZTEST_ACCEPTANCE_API_URL`（复用已在运行的 API；默认重置 `eztest_e2e` 并启动当前源码构建的 API，启动前校验数据库 URL 不能通过 query 参数改目标）。默认要求分析结果至少包含 1 条真实 unmapped；若显式 commit 对全映射，可传 `-AllowNoUnmapped` 记录为 skipped/warning（不得静默通过）。脚本不会把仓库内容、提示词或密钥写入日志。默认 fail-closed：`llm_configured=false` 或任一分析（含复用 API 与 force 路径）`degraded=true` 时失败；显式传 `-AllowDegraded` 才记录 `passed_degraded` 并跳过 AI-only 断言（含 cacheHits 断言）。
 
 P5 脚本可选配置：`EZTEST_ACCEPTANCE_API_URL`（复用已在运行的 API）；默认重置 `eztest_e2e`、构建并启动当前源码的 API，使用 `.tmp/p4-e2e-repo` fixture 仓与 `127.0.0.1:13335` fixture target，导出到 `.tmp/p5-real-exports`。缺 `llm_*` 键、任一 run 非 `done`、缺真实锚点且无 `anchorsDropped` 原因都会失败；只有降级 check 预期 `run=failed reason=ai_unavailable`。`-DryRun` 只校验路径、env 键名、数据库目标与工具链，不重置数据库、不启动 API、不调用 LLM。
 
-普通 `go test`、`pnpm test`、E2E 与 `scripts/acceptance.ps1` 都不会访问真实 LLM。P1/P4/P5 的真实验收与 P3 的人工验收都不进入默认门禁，需人工显式执行。配置也可在管理员登录后于设置页创建/更新，Key 留空表示保留原值。
+普通 `go test`、`pnpm test`、E2E 与 `scripts/acceptance.ps1` 都不会访问真实 LLM；P7 的 `acceptance-p7-db.ps1` 也只连接本机 fixture 目标库。P1/P4/P5/P7 的真实验收与 P3 的人工验收都不进入默认门禁，需人工显式执行。配置也可在管理员登录后于设置页创建/更新，Key 留空表示保留原值。
 
 ## 容器部署
 
@@ -565,22 +655,25 @@ P5 脚本可选配置：`EZTEST_ACCEPTANCE_API_URL`（复用已在运行的 API�
 - **本机未安装 Docker**：镜像未构建、Compose 未启动；唯一验证是
   `cd frontend && node scripts/validate-compose.mjs`（解析 YAML，断言服务、端口、健康检查、卷、依赖顺序）。
 
-## 已知限制（P0/P1/P2/P3/P4/P5）
+## 已知限制（P0–P7）
 
-- 单实例部署：SSE 的订阅与广播在进程内完成，不做多实例广播；重启/多副本会丢失实时连接（客户端可重连回放）。Agent run 也由进程内 runner 调度，重启时 `running` 会标记为 `interrupted`，P1 不做跨实例运行。
+- 单实例部署：SSE 的订阅与广播在进程内完成，不做多实例广播；重启/多副本会丢失实时连接（客户端可重连回放）。Agent run 也由进程内 runner 调度，重启时 `running` 会标记为 `interrupted`，P1 不做跨实例运行。P7 自主 worker 同样为单实例，多实例 leader 选举/分布式锁归 P8。
 - 权限：P1 的 `/api/agents/*`、`/agents` 页面与 `agent:` 事件通道均仅管理员可用；P2 的 `/api/resources/*` GET 对任意登录用户开放，写/动作仅管理员（普通用户只读）；P3 的 `/api/versions/*` 与 `/versions` 对全部登录用户开放（无 per-user 授权）。P1–P3 均不做 RBAC。
 - Agent 工具：文件工具默认关闭（空 `EZTEST_AGENT_FILE_ROOT`）；`http.get` 只读、host allowlist、最多 3 次重定向、响应截断 1 MB；P1 不提供浏览器/数据库/写操作等业务工具。
 - P2 资源：Access 凭据与 Session 状态明文存储，且不写审计/事件流（D28）；Session 过期惰性判定、无后台 GC；代码仓只做本地只读路径/分支校验，P4 提供索引与读取；不提供自动登录、ProbeRecipe 或 Session 执行注入。
 - P3 版本域：只实现 `draft → clarifying → designing` 与需求 `draft → clarified`，不提供版本删除/归档、脑图/评审/执行/报告；附件仅落本地文件系统（无 GC/备份，删除 best-effort 可留孤儿文件）；AI 澄清/分析/侦察依赖 P1 Agent 与 LLM，不可用时返回 503 但人工路径可用；单版本最多一个 active 会话与一个运行中 Agent；P3 不写 `audit_logs`。
 - P4 代码智能：只做文件级 Git 与 AI 事实，无 parser/符号级调用链/字段级分析、无全仓 AI 分析、无全文检索；只分析变更文件且受 20 文件/64KiB/摘录行数/超时/队列(16)等上限约束；单实例进程内 worker，无取消、无跨进程恢复；仓库必须本地只读可见，不支持线上仓、分支切换或工作树修改；候选只有需求/应用模型（case/issue 归 P5/P6），版本锚点仅 API 可建；事实无人工修正/版本对比 UI；AI 失败降级为 T0 候选但可能产生 `analysis_queue_full`/`analysis_in_progress` 等 429/409；P4 不写 `audit_logs`（`code.read`/`code.analyze` 审计除外）。
-- P5 用例脑图：探索仅 HTTP GET/HEAD（无浏览器/JS 执行），依赖环境白名单，可能漏掉纯前端渲染页面；PNG 由前端画布生成，无服务端渲染；导出为 Markdown/Mermaid/OPML（不生成 XMind）；冻结后不可解冻，需求重开后的增量重校验、`affected.cases` 正式接入归 P6/P7；`impactCases` 只是 P4 候选映射的只读提示；单实例进程内 run worker（重启把 stale run 置 failed）；explore/data_plan 质量受真实 LLM 影响，脚本在非 `done` 时 fail-closed。
+- P5 用例脑图：探索仅 HTTP GET/HEAD（无浏览器/JS 执行），依赖环境白名单，可能漏掉纯前端渲染页面；PNG 由前端画布生成，无服务端渲染；导出为 Markdown/Mermaid/OPML（不生成 XMind）；冻结后不可解冻，需求重开后的增量重校验、`affected.cases` 正式接入归 P6/P7（P7 已接入受影响用例/补全）；`impactCases` 只是 P4 候选映射的只读提示；单实例进程内 run worker（重启把 stale run 置 failed）；explore/data_plan 质量受真实 LLM 影响，脚本在非 `done` 时 fail-closed。
+- P6 执行：单进程调度（多实例分布式租约归 P8）；db 断言在 P6 阶段不支持（P7 已补只读 db 断言）；不做用例级自动重跑（应用失败仅手动 rerun）；证据无 GC/删除 API；执行器不可用时只能查看历史结果/证据/报告，禁止建批；真实 LLM 的分类/暂停结果受模型行为影响，脚本在不符合预期时 fail-closed。
+- P7 交付：`version_change` 表与 `code_changed` 变更项未实现（`/changes` 读时派生，P8）；证据 GC 与报告 stale 联动归 P8；自主 worker 单实例；报告 PDF、问题外部工单、问题重开/合并、跨批次语义去重增强、非 PostgreSQL 目标库归 P8/后续；全局问题/报告中心为只读列表（不做批量确认/导出），其跨版本查询适配由 T17b 接线，挂载前该组不注册、页面显示错误态；`IssuesTab` 约 300 行未拆分（T18 评审记录 305 行，当前文件 300 行；可维护性余项）；`EZTEST_ANALYSIS_MAX_CASES`/`EZTEST_SUPPLEMENT_MAX_CASES` 为 P7 规格目标变量，当前构建仍以代码固定上限 20/5 执行，尚未读取这两个变量（P8 接线）；`EZTEST_AUTONOMY_BATCHES_PER_TICK` 未对 >20 的值做上限钳制；报告快照 `content.batch` 未暴露 `baseFallbackReason`/`history_rewritten`（仅批次 DTO `baseFallbackReason` 与增量计划 `warnings` 可见；D49 已知差异，归 T23/P8）。P7 运行手册中的 `scripts/e2e.ps1 p7-*`、`scripts/acceptance-p7-llm.ps1`、`scripts/acceptance-p7-db.ps1`、`scripts/fixture-db.ps1` 为目标命令，依赖 T25/T28/T29/T32 交付与实跑证据；当前 README 不宣称这些命令已通过。
+- P7 报告/问题只读引用环境/system/commit 与 `case_run`/证据，不内联 Session storageState/headers/凭据；DB 目标密码明文存储（D48）但任何 API/DTO/事件/审计/日志/证据/报告/prompt 都不回显。
 - 登录 token 存 `sessionStorage`：属于单管理员内网工具的 XSS 边界，未做 CSP/HttpOnly cookie 会话。
 - 无 TLS、反向代理、限流网关或多租户/RBAC；管理员角色是唯一权限分层。
 - 对象存储只有本地内容寻址实现：无公开 URL、GC、保留期、去重清理。
 - LLM `base_url` 由管理员配置且被信任（P0 管理端测试不做 SSRF 白名单）；P1 Agent 工具调用另有 host allowlist。真实调用受上游可用性/限流/费用影响。
 - Compose/镜像仅静态交付，未在本机运行验证；Dockerfile 使用 `golang:1.24.6-alpine`、`node:22-alpine`、`alpine:3.21`，首次构建需要拉取镜像与依赖。
 - 迁移与数据备份需自行负责；丢失 `EZTEST_SECRET_KEYS` 会导致已加密的 LLM Key/headers 不可恢复。
-- 页面覆盖：P0 登录、概览、设置（用户/LLM/SSE 测试），P1 增加 `/agents` 控制台，P2 增加 `/resources`（四 Tab）与 `/code-repos`，P3 增加 `/versions` 列表与详情工作台，P4 实现详情工作台的「代码与变更」Tab，P5 增加 `/versions/[id]/mindmap` 全屏用例脑图页（画布/编辑/评审/运行/导出）；其余侧边栏入口仍为占位页。
+- 页面覆盖：P0 登录、概览、设置（用户/LLM/SSE 测试），P1 增加 `/agents` 控制台，P2 增加 `/resources`（四 Tab）与 `/code-repos`，P3 增加 `/versions` 列表与详情工作台，P4 实现「代码与变更」Tab，P5 增加 `/versions/[id]/mindmap` 全屏用例脑图页，P6 落地执行类 Tab/暂停恢复/证据/报告，P7 落地「问题」「报告」Tab、总览完善、继续中/增量计划、环境 DB 目标与全局 `/issues`、`/reports` 中心；侧边栏其余入口仍为占位页。
 
 ## 许可证
 
