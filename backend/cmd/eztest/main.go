@@ -546,6 +546,9 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	mindmapCatalog := mindmapresource.NewCatalogAdapter(catalogService, catalogService)
 	mindmapSessions := mindmapresource.NewSessionAdapter(sessionService, wallClock{})
 	mindmapCodeFacts := mindmapcodeintel.NewCodeFactsAdapter(codeIntelAnalysis, codeIntelQuery, versionService)
+	// The incremental-design run starter preseed of spec §6.1 step 3b/§7.6 reads
+	// the automatic P4 impact result (T17d) through this narrow adapter.
+	mindmapImpactSummary := mindmapcodeintel.NewImpactSummaryAdapter(codeIntelAnalysis)
 	mindmapAnchors := mindmapcodeintel.NewAnchorAdapter(codeIntelAnchor)
 	mindmapEvents := mindmapeventing.NewEventPublisher(eventService)
 	mindmapAudit := mindmapaudit.NewAuditRecorder(auditor)
@@ -1055,6 +1058,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Requirements: mindmapRequirements,
 		Catalog:      mindmapCatalog,
 		CodeFacts:    mindmapCodeFacts,
+		Impact:       mindmapImpactSummary,
 		Anchors:      mindmapAnchors,
 		Agents:       mindmapSupplementRuntime,
 		Events:       mindmapEvents,

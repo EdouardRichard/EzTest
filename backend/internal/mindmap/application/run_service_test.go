@@ -39,7 +39,11 @@ type runFixture struct {
 	facts     []application.FactSummary
 	// batches is the optional P7 execution-batch reader of the run gates and the
 	// incremental plan; nil degrades the precondition checks with a warning.
-	batches       application.SupplementBatchReader
+	batches application.SupplementBatchReader
+	// impact is the optional P4 impact summary read of the incremental-design
+	// run starter; nil seeds impactAvailable=false with the impact_unavailable
+	// warning (spec §6.1 step 3b/§7.6).
+	impact        application.P4ImpactReader
 	baselineFiles []string
 	files         map[string]bool
 
@@ -111,6 +115,7 @@ func (f *runFixture) service() *application.RunService {
 		Requirements: runRequirementReader{f},
 		Catalog:      runCatalogGateway{f},
 		CodeFacts:    runCodeFactsGateway{f},
+		Impact:       f.impact,
 		Anchors:      runAnchorGateway{f},
 		Agents:       runAgentRuntime{f},
 		Events:       runEventSink{f},

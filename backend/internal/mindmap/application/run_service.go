@@ -71,11 +71,17 @@ type RunDeps struct {
 	Requirements RequirementReader
 	Catalog      CatalogGateway
 	CodeFacts    CodeFactsGateway
-	Anchors      CodeAnchorGateway
-	Agents       AgentRuntime
-	Events       EventPublisher
-	IDs          IDGenerator
-	Clock        Clock
+	// Impact is the optional P4 impact summary read of the incremental_design
+	// run starter. When wired, the starter seeds the run.result impact signal so
+	// the plan can consume the P4 result; without it the run starts with
+	// impactAvailable=false and the impact_unavailable warning (spec §6.1 step
+	// 3b/§7.6).
+	Impact  P4ImpactReader
+	Anchors CodeAnchorGateway
+	Agents  AgentRuntime
+	Events  EventPublisher
+	IDs     IDGenerator
+	Clock   Clock
 }
 
 // StartRunCommand is the POST /runs body of spec §7.2 endpoint 17 extended for
@@ -193,6 +199,86 @@ func runNormalizeCommand(cmd StartRunCommand) StartRunCommand {
 		cmd.Mode = supplementRunModeDesign
 	}
 	return cmd
+}
+
+// incrementalDesignSeedResult is the starter-owned run.result document of an
+// incremental_design run (spec §6.1 step 3b/§7.6). ImpactAvailable is always
+// written; UnmappedChanges stays absent when P4 supplied no result so the plan
+// can tell "no P4" from "P4 ran and found nothing" (the empty array case).
+type incrementalDesignSeedResult struct {
+	ImpactAvailable bool                        `json:"impactAvailable"`
+	UnmappedChanges *[]supplementUnmappedChange `json:"unmappedChanges,omitempty"`
+	Degraded        bool                        `json:"degraded,omitempty"`
+	Warnings        []IncrementalPlanWarning    `json:"warnings,omitempty"`
+}
+
+// incrementalDesignResultSeed builds the P4 impact preseed of an
+// incremental_design run start. It is the only writer of these keys before the
+// agent run; the T14 supplement tools carry them through every result rewrite and
+// the materializer keeps them in the terminal run result. An available P4 result
+// is seeded with its changes and diagnostics (an unmapped_truncated warning
+// keeps impactAvailable=true); every unavailable result keeps the adapter's
+// diagnostics and degraded flag and adds the impact_unavailable warning, without
+// ever fabricating an unmapped change list (spec §6.1 step 3a/3b, §7.6).
+func (s *RunService) incrementalDesignResultSeed(ctx context.Context, versionID int64) json.RawMessage {
+	if s.deps.Impact == nil {
+		return incrementalDesignUnavailableSeed(nil, false)
+	}
+	summary, err := s.deps.Impact.LatestImpactSummary(ctx, versionID)
+	if err != nil {
+		slog.WarnContext(ctx, "mindmap: read the latest P4 impact summary failed; starting the incremental design run without impact",
+			"version_id", versionID, "error", err)
+		return incrementalDesignUnavailableSeed(nil, false)
+	}
+	// A degraded analysis still has a result but spec §6.1 step 3a records
+	// impact_unavailable for it; never present it as a usable impact result.
+	// The adapter's degraded diagnostic travels with the unavailable seed so a
+	// done+degraded analysis stays distinguishable from no analysis at all.
+	if !summary.Available || summary.Degraded {
+		return incrementalDesignUnavailableSeed(summary.Warnings, summary.Degraded)
+	}
+	changes := make([]supplementUnmappedChange, 0, len(summary.UnmappedChanges))
+	for _, change := range summary.UnmappedChanges {
+		changes = append(changes, supplementUnmappedChange{Path: change.Path, Summary: change.Summary})
+	}
+	return encodeIncrementalDesignSeed(incrementalDesignSeedResult{
+		ImpactAvailable: true,
+		UnmappedChanges: &changes,
+		Degraded:        summary.Degraded,
+		Warnings:        summary.Warnings,
+	})
+}
+
+// incrementalDesignUnavailableSeed is the seed of a run whose P4 impact result is
+// missing, degraded or unreadable. The adapter diagnostics (if any) are carried
+// unchanged, including the degraded flag; the plan's impact_unavailable warning
+// is appended exactly once so the plan surfaces the same signal before and after
+// materialization.
+func incrementalDesignUnavailableSeed(warnings []IncrementalPlanWarning, degraded bool) json.RawMessage {
+	merged := make([]IncrementalPlanWarning, 0, len(warnings)+1)
+	merged = append(merged, warnings...)
+	if !planWarningsContainCode(merged, planWarningImpactUnavailable) {
+		merged = append(merged, IncrementalPlanWarning{
+			Code:    planWarningImpactUnavailable,
+			Message: "no P4 impact result is available for this version",
+		})
+	}
+	return encodeIncrementalDesignSeed(incrementalDesignSeedResult{
+		ImpactAvailable: false,
+		Degraded:        degraded,
+		Warnings:        merged,
+	})
+}
+
+// encodeIncrementalDesignSeed serializes the seed document. Its fields are only
+// strings, bools and slices, so a marshal failure cannot happen in practice; the
+// fallback keeps the run startable instead of failing on an impossible error.
+func encodeIncrementalDesignSeed(document incrementalDesignSeedResult) json.RawMessage {
+	encoded, err := json.Marshal(document)
+	if err != nil {
+		return []byte(`{"impactAvailable":false}`)
+	}
+	return encoded
 }
 
 // runEncodeStartInput persists the start command of spec §7.6. The parent batch
@@ -346,6 +432,12 @@ func (s *RunService) Start(ctx context.Context, versionID, actor int64, cmd Star
 		run.Stats = runMergeStats(run.Stats, map[string]any{
 			"warnings": []IncrementalPlanWarning{*batchWarning},
 		})
+	}
+	if cmd.Kind == RunKindIncrementalDesign {
+		// Seed the P4 impact signal before the agent run: it is the only writer
+		// of these keys, and T14's tools plus the materializer carry them into
+		// the plan (spec §6.1 step 3b/§7.6). The supplement kind is not seeded.
+		run.Result = s.incrementalDesignResultSeed(ctx, versionID)
 	}
 	if isSupplementRunKind(cmd.Kind) {
 		// The migration column is the queryable parent-batch link of the P7

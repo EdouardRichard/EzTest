@@ -1485,6 +1485,11 @@ func (s *RunService) materializeSupplement(ctx context.Context, run domain.CaseD
 		}
 		sort.Slice(materialized, func(i, j int) bool { return materialized[i].ID < materialized[j].ID })
 		sort.Slice(affectedMarked, func(i, j int) bool { return affectedMarked[i].node.ID < affectedMarked[j].node.ID })
+		// The starter seeded the P4 diagnostics before the agent run and the
+		// materialization warnings describe skipped items. Merge both, keeping
+		// the seeded warning when a code appears twice, so run.result never
+		// loses the input diagnostics (spec §6.1 step 3b/§7.6).
+		mergedWarnings := mergeIncrementalPlanWarnings(submission.Warnings, warnings)
 		document := supplementRunResultDocument{
 			Materialized:     true,
 			NewCaseIDs:       make([]flexID, 0, len(materialized)),
@@ -1492,7 +1497,7 @@ func (s *RunService) materializeSupplement(ctx context.Context, run domain.CaseD
 			AffectedCases:    affectedRecords,
 			Escalations:      escalations,
 			ImpactAvailable:  impactAvailable,
-			Warnings:         warnings,
+			Warnings:         mergedWarnings,
 			Summary:          truncateRunes(strings.TrimSpace(submission.Summary), runMaxSummaryRunes),
 			Degraded:         submission.Degraded,
 		}
@@ -1521,7 +1526,7 @@ func (s *RunService) materializeSupplement(ctx context.Context, run domain.CaseD
 			"affectedMarked":       len(affectedMarked),
 			"affectedLimitReached": affectedLimitReached,
 			"escalations":          len(escalations),
-			"warnings":             len(warnings),
+			"warnings":             len(mergedWarnings),
 		}
 		finished := s.now()
 		_, err = tx.Runs().UpdateStatus(ctx, run.ID, run.Status, domain.RunDone, RunPatch{
