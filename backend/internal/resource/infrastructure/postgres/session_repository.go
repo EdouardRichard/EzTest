@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -296,6 +297,19 @@ func (r *SessionRepository) UpdateSession(ctx context.Context, s *domain.Session
 		return catalogWriteError(err, "duplicate key", "update session")
 	}
 	*s = updated
+	return nil
+}
+
+// TouchLastUsed records a session's lease acquisition time with a single-column
+// write. Unlike UpdateSession it never rewrites storage state or the other
+// mutable columns, so a stale copy cannot clobber a concurrent login check. A
+// missing row is a no-op: the touch only affects least-recently-used ordering.
+func (r *SessionRepository) TouchLastUsed(ctx context.Context, id int64, at time.Time) error {
+	if _, err := r.pool.Exec(ctx,
+		`UPDATE session SET last_used_at = $2, updated_at = now() WHERE id = $1`,
+		id, at); err != nil {
+		return fmt.Errorf("postgres: touch session last_used_at: %w", err)
+	}
 	return nil
 }
 
