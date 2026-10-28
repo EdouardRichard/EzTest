@@ -455,8 +455,16 @@ func (s *BatchService) Rerun(ctx context.Context, versionID, batchID, caseRunID,
 	if s.deps.Batches == nil || s.deps.CaseRuns == nil {
 		return nil, errors.New("execution: rerun dependencies are not configured")
 	}
-	if _, err := s.deps.Batches.GetBatch(ctx, versionID, batchID); err != nil {
+	batch, err := s.deps.Batches.GetBatch(ctx, versionID, batchID)
+	if err != nil {
 		return nil, err
+	}
+	// The scheduler only dispatches planned/running batches, so a retry created
+	// under a terminal batch would stay pending forever. Reject it here; the UI
+	// may still offer rerun, but the backend is authoritative.
+	if !domain.CanPause(batch.Status) {
+		return nil, newReasonError("batch_finished",
+			fmt.Sprintf("batch %d is %s and cannot be rerun", batchID, batch.Status))
 	}
 	run, err := s.deps.CaseRuns.GetCaseRun(ctx, batchID, caseRunID)
 	if err != nil {

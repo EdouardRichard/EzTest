@@ -785,6 +785,30 @@ func TestRerunRejectsNonTerminalCaseRun(t *testing.T) {
 	}
 }
 
+// TestRerunRejectsFinishedBatch pins that a rerun of a terminal batch is
+// rejected as batch_finished instead of creating an attempt the scheduler can
+// never dispatch (it only scans planned/running batches).
+func TestRerunRejectsFinishedBatch(t *testing.T) {
+	for _, status := range []domain.BatchStatus{
+		domain.BatchStatusDone, domain.BatchStatusFailed, domain.BatchStatusCancelled,
+	} {
+		t.Run(string(status), func(t *testing.T) {
+			service, deps := newBatchServiceTest(t)
+			deps.seedBatch(status, false)
+			deps.seedRun(domain.CaseRun{
+				ID: 101, BatchID: 55, VersionID: 7, CaseNodeID: 11, Attempt: 1,
+				Status: domain.CaseRunStatusFailed,
+			})
+
+			_, err := service.Rerun(context.Background(), 7, 55, 101, 9)
+			wantReason(t, err, "batch_finished")
+			if len(deps.runs.createCalls) != 0 {
+				t.Fatal("a finished-batch rerun must not create an attempt")
+			}
+		})
+	}
+}
+
 func TestRerunRejectsUnknownCaseRun(t *testing.T) {
 	service, deps := newBatchServiceTest(t)
 	deps.seedBatch(domain.BatchStatusRunning, false)

@@ -311,6 +311,33 @@ func TestAgentTerminalCodeMapsTerminalReason(t *testing.T) {
 	}
 }
 
+// TestCaseRunnerLeavesRunRunningOnShutdown pins that a run aborted by the
+// process shutdown is never classified: the case run stays running for boot
+// recovery, while the tools' browser context and the session lease are still
+// released. Classifying the shutdown abort would turn an interrupted process
+// into an inconclusive(case) verdict (spec §5.4, §5.12 invariant 7).
+func TestCaseRunnerLeavesRunRunningOnShutdown(t *testing.T) {
+	runner, world := newCaseRunnerHarness(t)
+	run := runningCaseRun(t, world)
+	world.runtime.setState(AgentRunState{Status: "aborted", TerminalReason: "shutdown"})
+
+	runner.Run(context.Background(), run, SessionRef{SessionID: 500}, world.sessions.environment)
+
+	stored := world.run(t, 1)
+	if stored.Status != domain.CaseRunStatusRunning {
+		t.Fatalf("status = %s, want running (shutdown must not classify)", stored.Status)
+	}
+	if stored.FailureClass != nil || stored.FailureReason != "" || stored.FinishedAt != nil {
+		t.Fatalf("shutdown must not finish the run: %+v", stored)
+	}
+	if got := world.browser.closedIDs(); !reflect.DeepEqual(got, []string{"case:1"}) {
+		t.Fatalf("CloseCase calls = %v, want [case:1]", got)
+	}
+	if !world.sessions.released(500, "released") {
+		t.Fatalf("session lease was not released best-effort: %+v", world.sessions.releases)
+	}
+}
+
 // TestCaseRunnerClassifiesAgentTerminalReason pins the case-run outcome of the
 // two acceptance-critical terminal reasons: an LLM failure becomes
 // inconclusive(model), while a normal end without case_finish stays

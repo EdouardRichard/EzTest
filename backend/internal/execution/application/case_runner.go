@@ -210,8 +210,24 @@ func (r *CaseRunner) afterAgentTerminal(ctx context.Context, run domain.CaseRun,
 		run = current
 	}
 
+	// A shutdown aborts the agent run without a verdict. Classifying it would
+	// record an inconclusive case for an interrupted process, so the run is left
+	// running: boot recovery owns the interrupted transition. Only the tools'
+	// execution context and the session lease are released (spec §5.4, §5.12
+	// invariant 7).
+	if isShutdownTerminalReason(state.TerminalReason) {
+		r.teardown(ctx, run, session.SessionID)
+		return
+	}
+
 	code, reason := agentTerminalCode(state)
 	r.finishOutcome(ctx, run, code, reason, r.stepEvidenceCount(ctx, run.ID), session)
+}
+
+// isShutdownTerminalReason reports whether a terminal agent run ended because
+// the process shut down, rather than because of a model or case outcome.
+func isShutdownTerminalReason(reason string) bool {
+	return strings.EqualFold(strings.TrimSpace(reason), "shutdown")
 }
 
 // handlePause applies a pause request observed at a step boundary. A terminal

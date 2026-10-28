@@ -44,6 +44,10 @@ func (h *EvidenceHandler) Download(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", mimeType)
 	w.Header().Set("X-Content-SHA256", evidence.SHA256)
+	// Evidence is user-influenced content: force a download and stop the browser
+	// from MIME-sniffing a different type than the one recorded (spec §5.7).
+	w.Header().Set("Content-Disposition", "attachment")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Length", strconv.FormatInt(evidence.SizeBytes, 10))
 	w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
 	w.WriteHeader(http.StatusOK)

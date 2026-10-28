@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -609,6 +610,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Versions:   executionVersionPort,
 		Sessions:   executionSessionPort,
 		Events:     executionEvents,
+		Audit:      executionAudit,
 		Clock:      wallClock{},
 		IDs:        snowflake,
 	})
@@ -934,7 +936,13 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	// in-flight case runners, which leave the run for boot recovery on shutdown.
 	executionWorkerCtx, cancelExecutionWorker := context.WithCancel(context.Background())
 	go executionScheduler.Start(executionWorkerCtx)
-	defer func() {
+	// stopExecutionWorker stops dispatching and waits for the in-flight case
+	// runners. It runs before the P1 run service cancels the agent runs (and
+	// again as a deferred fallback): the runner must observe the process
+	// shutdown first and leave its case run for boot recovery instead of
+	// classifying the agent abort as a case outcome (spec §5.12 invariant 7).
+	var stopExecutionWorkerOnce sync.Once
+	stopExecutionWorker := func() {
 		cancelExecutionWorker()
 		done := make(chan struct{})
 		go func() {
@@ -946,7 +954,8 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		case <-time.After(shutdownTimeout):
 			logger.Warn("execution scheduler did not drain before shutdown")
 		}
-	}()
+	}
+	defer stopExecutionWorkerOnce.Do(stopExecutionWorker)
 
 	// The P5 run coordinator is a single in-process worker: it polls the agent
 	// sessions every 2 s (spec §8.4) and first fails the runs a previous process
@@ -1090,6 +1099,13 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		// r.Context().Done() and would otherwise keep Shutdown waiting until
 		// the grace period expires.
 		cancelBase()
+		// Stop the execution scheduler and drain the in-flight case runners
+		// BEFORE the Agent run service: the runners must observe the shutdown
+		// and leave their case runs running for boot recovery. Reversing the
+		// order would let the P1 cancel abort the agent run first, so the runner
+		// would classify the abort as a case outcome (spec §5.12 invariant 7).
+		logger.Info("stopping execution scheduler")
+		stopExecutionWorkerOnce.Do(stopExecutionWorker)
 		// Cancel and drain the Agent runs before the HTTP server: their runners
 		// write terminal rows and activity events with a detached context, so a
 		// short bounded wait lets them finish cleanly.
