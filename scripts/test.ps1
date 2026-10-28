@@ -30,6 +30,15 @@ $backendDir = Join-Path $repoRoot "backend"
 $frontendDir = Join-Path $repoRoot "frontend"
 $envPath = Join-Path $repoRoot ".env"
 
+$nodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
+if (-not $nodeCommand) {
+    $nodeCommand = Get-Command node -ErrorAction SilentlyContinue
+}
+if (-not $nodeCommand) {
+    throw "Node.js is not available on PATH. The fake LLM P7 contract needs node."
+}
+$nodeExe = $nodeCommand.Source
+
 function Import-DotEnv {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) {
@@ -192,6 +201,17 @@ if (Test-Path -LiteralPath (Join-Path $executorDir "package.json")) {
     Write-Host ""
     Write-Host "==> Executor tests skipped (executor/package.json is absent)" -ForegroundColor Yellow
 }
+
+# The fake LLM contracts pin the deterministic P3-P7 scenario scripts. The P7
+# contract is the fast gate for the supplement/failure-analysis/triage/
+# execution.db_assert scenarios; the P6 contract stays as the regression pin.
+if (-not (Test-Path -LiteralPath (Join-Path $repoRoot "scripts\fake-llm.p7.test.cjs"))) {
+    throw "scripts/fake-llm.p7.test.cjs is missing; the P7 fake-LLM contract is part of the test gate."
+}
+Invoke-Checked -Label "Fake LLM P7 contract" -Exe $nodeExe `
+    -Arguments @("scripts/fake-llm.p7.test.cjs") -WorkingDirectory $repoRoot
+Invoke-Checked -Label "Fake LLM P6 regression contract" -Exe $nodeExe `
+    -Arguments @("scripts/fake-llm.p6.test.cjs") -WorkingDirectory $repoRoot
 
 if (-not $SkipFrontend) {
     if (-not (Test-Path -LiteralPath (Join-Path $frontendDir "node_modules"))) {

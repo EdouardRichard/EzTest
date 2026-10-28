@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: EzTest API
-  version: 0.7.0
+  version: 0.8.0
   description: |
     Hand-maintained OpenAPI document for the EzTest API: the P0 foundation, the
     P1 Agent runtime, the P2 resource context, the P3 version / requirements /
@@ -91,6 +91,24 @@ info:
       `version:{id}` channel. Evidence bytes and the Markdown report export are
       the only P6 responses that stream content, and no P6 response ever
       exposes filesystem paths, credentials or evidence bodies in JSON.
+    - P7 delivery endpoints add the version-scoped issue list/detail/confirm/
+      dismiss, the batch report lifecycle (ensure/revision/publish/regenerate/
+      export/diff), the batch analysis runs and the read-only cross-version
+      centres (`GET /api/issues`, `GET /api/reports`). Version adds the
+      read-time derived `GET /api/versions/{id}/changes` feed plus the
+      `continuePhase`/`continuedAt` DTO fields and the `continuing` lifecycle.
+      Execution extends the P6 batch DTO with the spec §7.7 camelCase fields
+      `kind`/`parentBatchId`/`graphHash`/`baseFallbackReason` (the older P6
+      fields keep snake_case) and case runs with `source`; mindmap adds the
+      `supplement`/`incremental_design` run kinds, `GET /mindmap/incremental-plan`
+      and the supplement accept/reject endpoint; resources add the
+      administrator-only environment db target; codeintel accepts an explicit
+      `baseCommit` and the `issue` anchor subject. Every P7 id is a decimal
+      string. The eight P7 event types are appended to `VersionEventType`; the
+      P7 error reasons extend `ExecutionErrorReason` (the P7 mindmap-only ones
+      are also listed in `MindmapErrorReason`). No P7 response carries evidence
+      bodies, prompts, credentials, database passwords or report filesystem
+      paths.
 
     This document is served publicly at `GET /api/openapi.yaml`; it is the same
     file under `docs/openapi/api.yaml` in the repository.
@@ -128,7 +146,17 @@ tags:
       Batch 1 report with its Markdown export, and the version's execution
       Agent sessions. The login recipes (`/api/resources/auth-flows`) used for
       automatic session acquisition are administrator-only and carry the
-      `resources` tag.
+      `resources` tag. P7 adds the batch `kind`/`parentBatchId`/`graphHash`/
+      `baseFallbackReason` fields, the case-run `source`, and the autonomy
+      analysis endpoints under `delivery`.
+  - name: delivery
+    description: |
+      P7 delivery: version issues (list/detail/create/confirm/dismiss), batch
+      report revisions (ensure/publish/regenerate/Markdown export/diff),
+      failure and triage analysis runs, and the read-only cross-version issue
+      and report centres. Report/issue IDs and every execution ID they
+      reference are decimal strings; report Markdown bytes are only served by
+      the authenticated export download.
   - name: health
 security: []
 paths:
@@ -3691,8 +3719,20 @@ paths:
       tags: [versions]
       summary: Add a requirement to a version
       description: |
-        Always creates a `draft` requirement with `source=user`; the version
-        status does not change (INV-4). Returns 201.
+        Always creates a `draft` requirement with `source=user`; returns 201
+        with the requirement DTO. P7 (spec §7.2) extends the behaviour: adding
+        a requirement to a `completed` version moves it to
+        `status=continuing`/`continuePhase=clarifying` in the same transaction
+        and emits `version.status_changed` with `phase=clarifying` and
+        `reason=new_requirement`; the version DTO reflects the new
+        `continuedAt`. On a `continuing` version the phase is re-derived
+        atomically after the insert (a draft moves to `clarifying`) without
+        interrupting an active incremental batch (`phase=executing`). The
+        requirement response body is unchanged. A version in any other
+        non-archived status keeps its status and accepts the requirement
+        (INV-4 outside the completed path). An `archived` version rejects the
+        creation with 409 `version_not_continuable` (spec §5.1 rule 6); no
+        requirement is inserted.
       operationId: createRequirement
       security:
         - bearerAuth: []
@@ -3719,6 +3759,15 @@ paths:
           $ref: '#/components/responses/Unauthenticated'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            The version is `archived`, so no requirement may be added
+            (`conflict`, `details.reason=version_not_continuable`). The
+            requirement is not inserted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
         '422':
           $ref: '#/components/responses/VersionInvalid'
         '500':
@@ -4998,15 +5047,18 @@ paths:
       tags: [code]
       summary: Create a code anchor
       description: |
-        Every authenticated user. Accepts `requirement`, `app_model`, `version`
-        and (P5, D37) `case` subjects; only `issue` is 422
-        `unsupported_subject_kind`. The requirement must belong to the version
-        and an app-model subject requires the version's system binding; a
-        `case` subject is accepted here for completeness, while case anchors are
-        normally created through the mindmap endpoints, which validate that the
-        case belongs to the version. The file must exist at the fixed branch
-        tip. A duplicate subject/file/line-range anchor is 409
-        `anchor_duplicate`. Returns 201 with the created anchor.
+        Every authenticated user. Accepts `requirement`, `app_model`, `version`,
+        `case` (P5, D37) and `issue` (P7, spec §7.9) subjects; any other kind is
+        422 `unsupported_subject_kind`. The requirement/issue must belong to the
+        version and an app-model subject requires the version's system binding;
+        a `case` subject is accepted here for completeness, while case anchors
+        are normally created through the mindmap endpoints, which validate that
+        the case belongs to the version. An `issue` anchor is created as a
+        user-created anchor (`createdByKind=user`, `createdBy` = the acting
+        user) and a foreign/missing issue is 422 `subject_not_in_version`. The
+        file must exist at the fixed branch tip. A duplicate subject/file/
+        line-range anchor is 409 `anchor_duplicate`. Returns 201 with the
+        created anchor.
       operationId: createVersionCodeAnchor
       security:
         - bearerAuth: []
@@ -5754,6 +5806,18 @@ paths:
         creates the run (response 202) and fails it asynchronously per spec
         §8.5. Failure reasons are carried in the run's `errors`/`reason`, never
         as LLM or mindmap bodies.
+
+        P7 extends `kind` with `supplement` and `incremental_design` (spec
+        §7.6). Both require `batchId` (the parent execution batch); `supplement`
+        is accepted once the parent baseline batch is terminal (409
+        `supplement_batch_automatic` is not used here; the supplement batch
+        itself is worker-only), and `incremental_design` requires
+        `status=continuing` with `continuePhase=designing` plus a previous
+        terminal batch. A concurrent run of the same kind is 409
+        `run_in_progress`; a missing/invalid parent batch is 422
+        `invalid_batch_id`. The P7 run result (proposed cases/affected cases/
+        escalations) is read through the plan endpoint and the run detail, never
+        from this response.
       operationId: startMindmapRun
       security:
         - bearerAuth: []
@@ -6184,10 +6248,12 @@ paths:
       summary: List the execution batches of a version
       description: |
         Every authenticated user. One cursor page of batches newest first,
-        optionally narrowed by exact `status`. A paused batch keeps
-        `status=running`, so `GET /batches?status=running&limit=1` is how a
-        client finds the version's single active batch (it is deliberately not
-        embedded in the version DTO). Rows never include case runs.
+        optionally narrowed by exact `status` and P7 `kind`. A paused batch
+        keeps `status=running`, so `GET /batches?status=running&limit=1` is how
+        a client finds the version's single active batch (it is deliberately
+        not embedded in the version DTO). Rows never include case runs; P7 rows
+        carry `kind`/`parentBatchId`/`graphHash`/`baseFallbackReason` and an
+        invalid `kind` filter is 422 `invalid_batch_kind`.
       operationId: listExecutionBatches
       security:
         - bearerAuth: []
@@ -6195,6 +6261,7 @@ paths:
         - $ref: '#/components/parameters/RequestID'
         - $ref: '#/components/parameters/VersionPathId'
         - $ref: '#/components/parameters/BatchStatusFilter'
+        - $ref: '#/components/parameters/BatchKindFilter'
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
       responses:
@@ -6222,7 +6289,19 @@ paths:
         `batch.created`/`batch.started`/`run.started`). An omitted `caseIds`
         selects every case of the baseline.
 
-        The pre-flight gate is evaluated in order: version visible (404),
+        P7 adds the `kind`/`parentBatchId` body fields (spec §5.3/§7.7). An
+        omitted kind defaults to `baseline`; an unknown kind is 422
+        `invalid_batch_kind` and a user `kind=supplement` is 409
+        `supplement_batch_automatic` (only the autonomy worker creates it). A
+        `baseline` batch keeps the P6 gates below. An `incremental` batch
+        requires `status=continuing` with `continuePhase` `designing`/`executing`
+        (409 `continuing_batch_conflict`), a terminal `parentBatchId`, a
+        non-empty `caseIds` of the current working graph (409
+        `no_incremental_cases`, 422 `invalid_case_ids`) and all terminal
+        batches settled (409 `autonomy_pending`). The response DTO adds
+        `kind`/`parentBatchId`/`graphHash`/`baseFallbackReason`.
+
+        The P6 pre-flight gate is evaluated in order: version visible (404),
         `status=executing` (409 `version_not_executable`), system and
         environment bound (409 `environment_required`), a case baseline exists
         (409 `baseline_required`), no active `planned`/`running` batch (409
@@ -6748,6 +6827,854 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Liveness'
+  /api/versions/{id}/changes:
+    get:
+      tags: [versions]
+      summary: Read the derived change feed of a version
+      description: |
+        Every authenticated user. The feed is derived at read time from the
+        version's requirements, finished batches, published reports and issues
+        (newest first); P7 creates no `version_change` table, and the
+        `code_changed` kind is reserved for P8 (D50) and never emitted in P7.
+        The response is `{"data":{"items":[...],"nextCursor":"...","hasMore":bool}}`.
+        `refId` is the decimal-string id of the referenced row (empty when the
+        row has none). A cursor that is not an opaque page cursor is 422
+        `invalid_cursor`; an unknown version is 404.
+      operationId: getVersionChanges
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of derived changes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VersionChangesEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/VersionInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}/issues:
+    get:
+      tags: [delivery]
+      summary: List the issues of a version
+      description: |
+        Every authenticated user. One page ordered by severity weight
+        (`blocker` → `major` → `minor` → `info`) then id descending. The
+        optional filters are exact `status`/`severity`/`category` plus the
+        execution ids `batchId`/`caseRunId`/`caseNodeId` and the fuzzy title
+        filter `q` (at most 100 characters). List items omit the long
+        description/repro/expected/actual bodies; `refs` and `codeRefs` are
+        always arrays (`codeRefs` is `[]` when codeintel is unwired or has no
+        anchor). An invalid enum/id/`q`/cursor/limit is 422
+        `invalid_argument` with `details.field`. The next cursor is the opaque
+        encoding of the last issue id.
+      operationId: listVersionIssues
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/IssueStatusFilter'
+        - $ref: '#/components/parameters/IssueSeverityFilter'
+        - $ref: '#/components/parameters/IssueCategoryFilter'
+        - $ref: '#/components/parameters/IssueBatchFilter'
+        - $ref: '#/components/parameters/IssueCaseRunFilter'
+        - $ref: '#/components/parameters/IssueCaseNodeFilter'
+        - $ref: '#/components/parameters/IssueSearch'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of issue summaries.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueListEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/DeliveryUnprocessable'
+        '500':
+          $ref: '#/components/responses/DeliveryInternal'
+    post:
+      tags: [delivery]
+      summary: Create a human issue
+      description: |
+        Every authenticated user. Creates an `open` issue with `source=human`
+        and no dedupe key; the body may link a case run, case node and
+        requirement of the same version. A reference that is malformed or
+        belongs to another version is 422 `issue_ref_invalid`; a missing or
+        foreign version is 404. Returns 201 with the issue detail.
+      operationId: createVersionIssue
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueCreateRequest'
+      responses:
+        '201':
+          description: The created issue.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueDetailEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/DeliveryUnprocessable'
+        '500':
+          $ref: '#/components/responses/DeliveryInternal'
+  /api/versions/{id}/issues/{issueId}:
+    get:
+      tags: [delivery]
+      summary: Read one issue
+      description: |
+        Every authenticated user. Returns the full issue detail: the list item
+        fields plus `description`/`reproSteps`/`expected`/`actual`, `refs`,
+        `codeRefs` and the id-only `case`/`requirement`/`batch` summaries.
+        Evidence bodies, prompts and credentials are never returned; a missing
+        or foreign issue is 404 `issue_not_found`.
+      operationId: getVersionIssue
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/IssueId'
+      responses:
+        '200':
+          description: The issue detail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueDetailEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/DeliveryNotFound'
+        '422':
+          $ref: '#/components/responses/DeliveryUnprocessable'
+        '500':
+          $ref: '#/components/responses/DeliveryInternal'
+    patch:
+      tags: [delivery]
+      summary: Confirm or dismiss an issue
+      description: |
+        Every authenticated user. `status` is `confirmed` or `dismissed` and
+        `expectedRevision` is the optimistic-concurrency token. A stale
+        revision or an already terminal issue is 409 `issue_state_conflict`; a
+        dismissal without a non-empty `comment` is 422
+        `issue_dismiss_reason_required`. Both outcomes emit `issue.updated` and
+        return 200 with the detail.
+      operationId: patchVersionIssue
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/IssueId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssuePatchRequest'
+      responses:
+        '200':
+          description: The updated issue.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueDetailEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/DeliveryNotFound'
+        '409':
+          $ref: '#/components/responses/DeliveryConflict'
+        '422':
+          $ref: '#/components/responses/DeliveryUnprocessable'
+        '500':
+          $ref: '#/components/responses/DeliveryInternal'
+  /api/issues:
+    get:
+      tags: [delivery]
+      summary: List issues across versions
+      description: |
+        Every authenticated user; read-only (P7 has no batch confirm/export
+        here). Same filters as the version-scoped list plus `versionId`; each
+        row adds `versionName` and the deep link
+        `{versionId, tab:"issues", issueId}`. Invalid enum/`q`/id/cursor/limit
+        values are 422 `invalid_argument` with `details.field`.
+      operationId: listGlobalIssues
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/IssueStatusFilter'
+        - $ref: '#/components/parameters/IssueSeverityFilter'
+        - $ref: '#/components/parameters/IssueCategoryFilter'
+        - $ref: '#/components/parameters/IssueBatchFilter'
+        - $ref: '#/components/parameters/IssueCaseRunFilter'
+        - $ref: '#/components/parameters/IssueCaseNodeFilter'
+        - $ref: '#/components/parameters/IssueSearch'
+        - $ref: '#/components/parameters/GlobalVersionFilter'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of global issue rows.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GlobalIssueListEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          $ref: '#/components/responses/DeliveryUnprocessable'
+        '500':
+          $ref: '#/components/responses/DeliveryInternal'
+  /api/versions/{id}/reports:
+    get:
+      tags: [delivery]
+      summary: List the report revisions of a version
+      description: |
+        Every authenticated user. One page of report summaries (newest first),
+        optionally narrowed by exact `batchId` and `status`. List items never
+        include `content` or a filesystem path; `markdown.downloadPath` is the
+        authenticated API download path. An invalid status/filter/cursor/limit
+        is 422 `invalid_argument` with `details.field`.
+      operationId: listVersionReports
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/IssueBatchFilter'
+        - $ref: '#/components/parameters/ReportStatusFilter'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of report summaries.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportListEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/DeliveryUnprocessable'
+        '500':
+          $ref: '#/components/responses/DeliveryInternal'
+    post:
+      tags: [delivery]
+      summary: Ensure the report of a batch exists
+      description: |
+        Every authenticated user. Generates and publishes revision 1 when the
+        batch has no live report and returns 201; returns the existing
+        non-stale revision with 200. The batch must belong to the addressed
+        version: an unknown or foreign batch is 404 `batch_not_found`. The
+        route is served only when the composition root wires the execution
+        batch reader; a published report whose inputs changed is returned as
+        `stale` on read. Concurrent creation is resolved by the
+        `(batch, revision)` uniqueness constraint and returns the winning
+        report.
+      operationId: ensureVersionReport
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EnsureReportRequest'
+      responses:
+        '200':
+          description: The live report revision already existed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportDetailEnvelope'
+        '201':
+          description: The report revision was generated and published.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportDetailEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/DeliveryNotFound'
+        '422':
+          $ref: '#/components/responses/DeliveryUnprocessable'
+        '500':
+          $ref: '#/components/responses/DeliveryInternal'
+  /api/versions/{id}/reports/{reportId}:
+    get:
+      tags: [delivery]
+      summary: Read one report revision
+      description: |
+        Every authenticated user. Returns the detail including the
+        deterministic `content` snapshot and the Markdown artifact metadata
+        (`sha256`/`sizeBytes`/`downloadPath`). Reading refreshes the stale
+        state. A report of another version is 404 `report_not_found`; the
+        filesystem path is never exposed.
+      operationId: getVersionReport
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/ReportId'
+      responses:
+        '200':
+          description: The report detail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportDetailEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/DeliveryNotFound'
+        '500':
+          $ref: '#/components/responses/DeliveryInternal'
+  /api/versions/{id}/reports/{reportId}/publish:
+    post:
+      tags: [delivery]
+      summary: Publish a draft report
+      description: |
+        Every authenticated user. Only a `draft` revision can be published;
+        another status (including `stale`) is 409 `report_not_publishable`.
+        The response is the published detail and `report.published` is emitted.
+      operationId: publishVersionReport
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/ReportId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The published report.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportDetailEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/DeliveryNotFound'
+        '409':
+          $ref: '#/components/responses/DeliveryConflict'
+        '500':
+          $ref: '#/components/responses/DeliveryInternal'
+  /api/versions/{id}/reports/{reportId}/regenerate:
+    post:
+      tags: [delivery]
+      summary: Append a new report revision
+      description: |
+        Every authenticated user. Generates revision+1 of the addressed
+        report's batch and returns 201 with the new revision; older revisions
+        are retained. When a newer revision of that batch already exists the
+        newest revision is returned unchanged with 200 instead of appending.
+        A missing/foreign report is 404 `report_not_found`.
+      operationId: regenerateVersionReport
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/ReportId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: A newer revision already exists; returned unchanged.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportDetailEnvelope'
+        '201':
+          description: A new revision was appended.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportDetailEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/DeliveryNotFound'
+        '500':
+          $ref: '#/components/responses/DeliveryInternal'
+  /api/versions/{id}/reports/{reportId}/export:
+    get:
+      tags: [delivery]
+      summary: Download the Markdown report
+      description: |
+        Every authenticated user. Streams the verified Markdown file (Mermaid
+        fenced blocks included) with `text/markdown`, `Content-Disposition`,
+        `X-Content-SHA256` and `Content-Length`; `format` is only `markdown`.
+        A missing or corrupted file is 500 `report_export_failed` with
+        `retryable=true`; the filesystem path is never returned. The audit
+        entry carries the authenticated actor.
+      operationId: exportVersionReport
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/ReportId'
+        - $ref: '#/components/parameters/ReportExportFormat'
+      responses:
+        '200':
+          description: The Markdown bytes.
+          headers:
+            X-Content-SHA256:
+              description: Lowercase hex sha256 of the streamed bytes.
+              schema:
+                type: string
+                pattern: '^[a-f0-9]{64}$'
+            Content-Disposition:
+              description: Attachment filename with a UTF-8 filename fallback.
+              schema:
+                type: string
+            Content-Length:
+              description: Byte length of the streamed Markdown.
+              schema:
+                type: integer
+            Cache-Control:
+              description: Always `no-store`.
+              schema:
+                type: string
+          content:
+            text/markdown:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/DeliveryNotFound'
+        '422':
+          $ref: '#/components/responses/DeliveryUnprocessable'
+        '500':
+          $ref: '#/components/responses/DeliveryInternal'
+  /api/versions/{id}/reports/{reportId}/diff:
+    get:
+      tags: [delivery]
+      summary: Diff two report revisions
+      description: |
+        Every authenticated user. Compares the addressed revision with
+        `baseReportId` (both must belong to the addressed version, otherwise
+        422 `report_version_mismatch`/404). An omitted base selects the newest
+        report of the previous batch of the same version. The deterministic
+        diff classifies cases into new/removed/regressed/recovered/changed and
+        issues into added/fixed.
+      operationId: diffVersionReports
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/ReportId'
+        - $ref: '#/components/parameters/ReportBaseFilter'
+      responses:
+        '200':
+          description: The report diff.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportDiffEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/DeliveryNotFound'
+        '422':
+          $ref: '#/components/responses/DeliveryUnprocessable'
+        '500':
+          $ref: '#/components/responses/DeliveryInternal'
+  /api/reports:
+    get:
+      tags: [delivery]
+      summary: List reports across versions
+      description: |
+        Every authenticated user; read-only. Filters are `versionId` and exact
+        `status`; each row adds `versionName`, `batchNo` and the deep link
+        `{versionId, tab:"report", reportId}`. Invalid filters are 422
+        `invalid_argument` with `details.field`.
+      operationId: listGlobalReports
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/GlobalVersionFilter'
+        - $ref: '#/components/parameters/ReportStatusFilter'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of global report rows.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GlobalReportListEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          $ref: '#/components/responses/DeliveryUnprocessable'
+        '500':
+          $ref: '#/components/responses/DeliveryInternal'
+  /api/versions/{id}/batches/{batchId}/analysis:
+    get:
+      tags: [delivery]
+      summary: List the analysis runs of a batch
+      description: |
+        Every authenticated user. Returns `{"data":[...]}` (no pagination) of
+        the batch's failure and triage runs, optionally filtered by exact
+        `kind` (`failure` or `issue_triage`). The batch must belong to the
+        addressed version (404 `batch_not_found`); invalid kind/id is 422
+        `invalid_argument`. Results never include LLM prompt/input text.
+      operationId: listBatchAnalyses
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/ExecutionBatchId'
+        - $ref: '#/components/parameters/AnalysisKindFilter'
+      responses:
+        '200':
+          description: The analysis runs.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalysisListEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/DeliveryNotFound'
+        '422':
+          $ref: '#/components/responses/DeliveryUnprocessable'
+        '500':
+          $ref: '#/components/responses/DeliveryInternal'
+    post:
+      tags: [delivery]
+      summary: Retry the failure analysis of a terminal batch
+      description: |
+        Every authenticated user. P7 exposes only the manual
+        `{"kind":"failure"}` retry (triage runs are started by the autonomy
+        worker). The batch must be terminal (409 `analysis_not_applicable`
+        otherwise) and have at least one failed(application) case (again 409
+        `analysis_not_applicable`); an already active run of the same kind is
+        409 `analysis_active`. Success is 202 with the queued run and resets
+        the batch autonomy chain so the worker continues.
+      operationId: startBatchAnalysis
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/ExecutionBatchId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartAnalysisRunRequest'
+      responses:
+        '202':
+          description: The queued analysis run.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalysisViewEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/DeliveryNotFound'
+        '409':
+          $ref: '#/components/responses/DeliveryConflict'
+        '422':
+          $ref: '#/components/responses/DeliveryUnprocessable'
+        '500':
+          $ref: '#/components/responses/DeliveryInternal'
+  /api/versions/{id}/batches/{batchId}/analysis/{analysisId}:
+    get:
+      tags: [delivery]
+      summary: Read one analysis run
+      description: |
+        Every authenticated user. Returns the run's `result`/`stats`/`errors`
+        documents (structured JSON, no LLM prompt or raw model text), plus
+        `model`/`promptVersion`/timestamps. The batch must belong to the
+        version (404 `batch_not_found`); a foreign run is 404
+        `analysis_not_found`.
+      operationId: getBatchAnalysis
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/ExecutionBatchId'
+        - $ref: '#/components/parameters/DeliveryAnalysisId'
+      responses:
+        '200':
+          description: The analysis run.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalysisViewEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/DeliveryNotFound'
+        '422':
+          $ref: '#/components/responses/DeliveryUnprocessable'
+        '500':
+          $ref: '#/components/responses/DeliveryInternal'
+  /api/versions/{versionId}/mindmap/incremental-plan:
+    get:
+      tags: [mindmap]
+      summary: Read the incremental design plan of a continuing version
+      description: |
+        Every authenticated user. Returns the latest `incremental_design` run
+        of the version plus the proposed new supplement cases, the affected
+        cases, the unmapped P4 changes, the default selection, warnings and the
+        degraded flag; every collection is an array (an empty plan is 200, not
+        404). `phase` is `designing` or `executing`; `parentBatchId` is null
+        until the design run has a parent batch. The plan never includes LLM
+        input/output or case bodies.
+      operationId: getIncrementalPlan
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+      responses:
+        '200':
+          description: The incremental plan (possibly empty).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncrementalPlanEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '422':
+          $ref: '#/components/responses/MindmapUnprocessable'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
+  /api/versions/{versionId}/mindmap/nodes/{nodeId}/supplement:
+    patch:
+      tags: [mindmap]
+      summary: Accept or reject a supplement case
+      description: |
+        Every authenticated user. Only an `ai_supplement` node that was not
+        executed yet can be decided: `accept` moves it to `merged`, `reject`
+        to `rejected`. The frozen node content is never edited (only the
+        status, `updated_by` and `updated_at` change). A non-supplement node is
+        409 `case_status_conflict`; a decision other than accept/reject is 422
+        `invalid_decision`; a missing node is 404. `case.status_changed` is
+        emitted on success.
+      operationId: decideSupplementNode
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+        - $ref: '#/components/parameters/MindmapNodeId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SupplementDecisionRequest'
+      responses:
+        '200':
+          description: The updated node status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SupplementDecisionEnvelope'
+        '400':
+          $ref: '#/components/responses/MindmapBadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '409':
+          $ref: '#/components/responses/MindmapConflict'
+        '422':
+          $ref: '#/components/responses/MindmapUnprocessable'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
+  /api/resources/environments/{id}/db-target:
+    get:
+      tags: [resources]
+      summary: Read the environment database target
+      description: |
+        Administrator only (403 `forbidden` otherwise). Returns the stored
+        target or `{"data":null}` when the environment has none. The password
+        is never returned: `credentialSet` only reports whether one is stored.
+      operationId: getEnvironmentDBTarget
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceEnvironmentId'
+      responses:
+        '200':
+          description: The target or null.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DbTargetEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+    put:
+      tags: [resources]
+      summary: Create or replace the environment database target
+      description: |
+        Administrator only. Upserts the read-only PostgreSQL target:
+        `host`/`port`/`database`/`username` are required; `password` may be
+        omitted on update to keep the stored value (required on first create);
+        `sslmode`, timeouts, `maxRows` and `enabled` default server-side. An
+        invalid field or missing environment is 422 `db_target_invalid`. The
+        password is accepted write-only and never echoed, logged or audited.
+      operationId: putEnvironmentDBTarget
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceEnvironmentId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DbTargetUpsertRequest'
+      responses:
+        '200':
+          description: The stored target.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DbTargetEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+    delete:
+      tags: [resources]
+      summary: Delete the environment database target
+      description: |
+        Administrator only. Removes the configuration without touching the
+        target database. Returns 204 even when no target was configured.
+      operationId: deleteEnvironmentDBTarget
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceEnvironmentId'
+      responses:
+        '204':
+          description: The target was deleted (or already absent).
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/environments/{id}/db-target/test:
+    post:
+      tags: [resources]
+      summary: Test the environment database connection
+      description: |
+        Administrator only. Probes the stored target or the optional unsaved
+        form override (the request body is never persisted). A failed probe is
+        a 200 with `ok=false` and a stable `error.reason`
+        (`db_connection_failed`, `db_query_failed`, ...) so the form can render
+        it; the password and DSN never appear in the response. `warnings`
+        reports role/read-only observations. A missing or disabled target is
+        409 `db_target_missing`; an invalid environment is 422
+        `db_target_invalid`.
+      operationId: testEnvironmentDBTarget
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/ResourceEnvironmentId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DbTargetTestRequest'
+      responses:
+        '200':
+          description: The probe result (ok or a classified failure).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DbTargetTestResultEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/DBTargetConflict'
+        '422':
+          $ref: '#/components/responses/ResourceInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
   /api/health:
     get:
       tags: [health]
@@ -7407,6 +8334,141 @@ components:
       schema:
         type: string
         pattern: '^[0-9]{1,19}$'
+    IssueId:
+      name: issueId
+      in: path
+      required: true
+      description: |
+        Delivery issue ID as a decimal string. Never parse it into a JavaScript
+        number.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    ReportId:
+      name: reportId
+      in: path
+      required: true
+      description: |
+        Report revision ID as a decimal string. The revision must belong to the
+        version in the path.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    DeliveryAnalysisId:
+      name: analysisId
+      in: path
+      required: true
+      description: Analysis-run ID as a decimal string, owned by the batch in the path.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    IssueStatusFilter:
+      name: status
+      in: query
+      required: false
+      description: Optional exact issue status filter.
+      schema:
+        type: string
+        enum: [open, confirmed, dismissed]
+    IssueSeverityFilter:
+      name: severity
+      in: query
+      required: false
+      description: Optional exact issue severity filter.
+      schema:
+        type: string
+        enum: [blocker, major, minor, info]
+    IssueCategoryFilter:
+      name: category
+      in: query
+      required: false
+      description: Optional exact issue category filter.
+      schema:
+        type: string
+        enum: [defect, requirement_gap, other]
+    IssueBatchFilter:
+      name: batchId
+      in: query
+      required: false
+      description: Optional exact decimal-string execution batch filter.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    IssueCaseRunFilter:
+      name: caseRunId
+      in: query
+      required: false
+      description: Optional exact decimal-string case-run filter.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    IssueCaseNodeFilter:
+      name: caseNodeId
+      in: query
+      required: false
+      description: Optional exact decimal-string case-node filter.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    IssueSearch:
+      name: q
+      in: query
+      required: false
+      description: Fuzzy title search, at most 100 characters.
+      schema:
+        type: string
+        maxLength: 100
+    GlobalVersionFilter:
+      name: versionId
+      in: query
+      required: false
+      description: Optional exact decimal-string version filter.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    ReportStatusFilter:
+      name: status
+      in: query
+      required: false
+      description: Optional exact report status filter.
+      schema:
+        type: string
+        enum: [draft, published, stale]
+    ReportExportFormat:
+      name: format
+      in: query
+      required: false
+      description: Export format. P7 only supports `markdown` (Mermaid embedded); another value is 422 `invalid_argument`.
+      schema:
+        type: string
+        enum: [markdown]
+        default: markdown
+    ReportBaseFilter:
+      name: baseReportId
+      in: query
+      required: false
+      description: |
+        Optional decimal-string base report revision. Omit it to compare with
+        the newest report of the previous batch of the same version. Both
+        reports must belong to the version.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    AnalysisKindFilter:
+      name: kind
+      in: query
+      required: false
+      description: Optional exact analysis kind filter.
+      schema:
+        type: string
+        enum: [failure, issue_triage]
+    BatchKindFilter:
+      name: kind
+      in: query
+      required: false
+      description: Optional exact batch kind filter (P7).
+      schema:
+        $ref: '#/components/schemas/BatchKind'
   responses:
     InvalidArgument:
       description: Invalid input (`invalid_argument` or `idempotency_conflict` for a reused key with a different body).
@@ -7790,6 +8852,74 @@ components:
         definition, or an invalid `login_flow_id` binding; `invalid_limit`,
         `invalid_cursor` and `invalid_id` cover page/path decoding. `details.field`
         names the rejected field and `details.message` is human-readable.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    DeliveryNotFound:
+      description: |
+        A delivery resource is missing or invisible (404 `not_found`). The
+        stable `details.reason` is `batch_not_found` (an unknown batch or one of
+        another version), `issue_not_found`, `report_not_found`,
+        `analysis_not_found` or `node_not_found` (supplement decision). Not
+        found is used instead of 403 so the existence of another version's rows
+        is never disclosed.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    DeliveryConflict:
+      description: |
+        A P7 state conflict (409 `conflict`). The stable `details.reason` is
+        `issue_state_conflict` (stale revision or already terminal issue),
+        `report_not_publishable` (publish of a non-draft report),
+        `report_stale` (an operation only allowed on a published report),
+        `analysis_active` (an active run of the same batch/kind),
+        `analysis_not_applicable` (non-terminal batch or no failed application
+        case), `version_not_continuable`, `continuing_batch_conflict` (an
+        incremental batch was requested in the wrong continuing phase/state),
+        `run_in_progress` (an active supplement/design run),
+        `case_status_conflict` (a supplement decision on a non-supplement or
+        terminal node) or `duplicate_supplement`. `details.field` is set when a
+        request field is at fault and the message is human-readable without
+        echoing internal state.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    DeliveryUnprocessable:
+      description: |
+        A P7 request validation failure (422 `invalid_argument`). The stable
+        `details.reason` is `issue_dismiss_reason_required` (dismissal without
+        a reason), `issue_ref_invalid` (a cross-version/malformed issue
+        reference), `invalid_report_filter`, `report_version_mismatch` (diff
+        bases of another version), `invalid_continue_phase`,
+        `invalid_batch_id` (a malformed/missing supplement parent batch),
+        `invalid_supplement_case`, `invalid_decision` (a supplement decision
+        other than accept/reject) or the generic `invalid_argument` with
+        `details.field` for an invalid enum, decimal id, cursor or limit
+        (`q` over 100 characters included). `details.message` is always
+        human-readable.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    DeliveryInternal:
+      description: |
+        Unexpected delivery failure (500 `internal`). The only retryable P7
+        reason is `report_export_failed` (missing/corrupted Markdown artifact,
+        exactly as the streamed export returns it); any other failure is a
+        non-retryable `internal` without filesystem paths, SQL text, prompts or
+        upstream details.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    DBTargetConflict:
+      description: |
+        The database target cannot be used (409 `conflict`). `details.reason` is
+        `db_target_missing` when the environment has no enabled target; the
+        target database itself is never modified.
       content:
         application/json:
           schema:
@@ -10479,6 +11609,15 @@ components:
         headCommit:
           type: string
           description: Omit/empty to resolve the repository fixed branch tip; otherwise a 40-hex descendant of the baseline.
+        baseCommit:
+          type: string
+          pattern: '^[a-f0-9]{40}$'
+          description: |
+            P7 optional explicit analysis base (spec §7.9): a 40-hex ancestor of
+            the resolved head, lowercase. Omit/empty to keep the P4 behaviour
+            (the version `code_baseline_commit`). A malformed, non-ancestor or
+            unresolvable base is 422 `invalid_base_commit`. The base participates
+            in the analysis cache key and version allocation.
         force:
           type: boolean
           default: false
@@ -10522,9 +11661,13 @@ components:
       description: |
         Anchor subject kinds. P4 accepts `version`, `requirement` and
         `app_model`; P5 (D37) adds `case` for case code anchors, whose ownership
-        and version membership are validated by the mindmap context. `issue`
-        remains reserved for a later phase.
-      enum: [version, requirement, app_model, case]
+        and version membership are validated by the mindmap context. P7 adds
+        `issue` (spec §7.9): the delivery issue must belong to the addressed
+        version, a foreign/missing issue is 422 `subject_not_in_version`, the
+        anchor is created with `createdByKind=user` and the acting user as
+        `createdBy`, and `GET /anchors?subjectKind=issue&subjectId=...` lists
+        them. Any other kind is 422 `unsupported_subject_kind`.
+      enum: [version, requirement, app_model, case, issue]
     Anchor:
       type: object
       description: |
@@ -11108,6 +12251,8 @@ components:
         - paused
         - pause_mode
         - batch_no
+        - continuePhase
+        - continuedAt
       properties:
         id:
           type: string
@@ -11197,6 +12342,25 @@ components:
             in the version DTO (the version context must not depend on the
             execution context); read it through
             `GET /api/versions/{id}/batches?status=running&limit=1`.
+        continuePhase:
+          type: string
+          nullable: true
+          enum: [clarifying, designing, executing]
+          description: |
+            P7 continuing phase (spec §5.1/§7.2). It is only non-null while
+            `status=continuing` (`clarifying` after a new requirement,
+            `designing` while the incremental design runs, then `executing`);
+            it is null on every other status. The underlying DTO field is
+            camelCase (`continuePhase`) while the older P6 fields keep their
+            snake_case names (`paused`, `pause_mode`, `batch_no`).
+        continuedAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            When the version last entered `continuing`; null until then. It is
+            not cleared by later phase changes, only by returning to
+            `completed`.
     VersionEnvelope:
       type: object
       required: [data]
@@ -12176,7 +13340,18 @@ components:
         `gate.pending`/`gate.resolved` (takeover id, session id, reason,
         expiry). Execution events put evidence ids in `refs.evidence` and case
         node ids in `refs.case`, and never carry evidence bytes, prompts,
-        credentials, case bodies or filesystem paths.
+        credentials, case bodies or filesystem paths. P7 adds the eight
+        delivery/continued event types on the same channel:
+        `case.supplemented` (node id, source, requirement count; no case body),
+        `case.revalidation_marked` (node id, confidence, source),
+        `issue.created`/`issue.updated` (issue id, status, severity, source,
+        confidence, revision and recurrence count), `report.published`/
+        `report.stale` (report id, batch id, revision and degraded/reason) and
+        `analysis.started`/`analysis.finished` (analysis id, kind, batch id,
+        status, candidate/issue counts and degraded). P7 detail ids are decimal
+        strings (D29); evidence ids go to `refs.evidence` and case node ids to
+        `refs.case`. P7 events never carry prompt text, evidence bodies, SQL
+        result sets, credentials, report Markdown or filesystem paths.
       enum:
         - version.created
         - version.updated
@@ -12224,6 +13399,14 @@ components:
         - human.requested
         - gate.pending
         - gate.resolved
+        - case.supplemented
+        - case.revalidation_marked
+        - issue.created
+        - issue.updated
+        - report.published
+        - report.stale
+        - analysis.started
+        - analysis.finished
     VersionEvent:
       type: object
       description: |
@@ -12347,8 +13530,13 @@ components:
       enum: [high, medium, low]
     RunKind:
       type: string
-      description: The four mindmap Agent-run kinds.
-      enum: [design, review, data_plan, explore]
+      description: |
+        The mindmap Agent-run kinds. P5 defines `design`, `review`, `data_plan`
+        and `explore`; P7 adds `supplement` (post-batch coverage-gap run, only
+        after the baseline batch is terminal) and `incremental_design`
+        (continuing + `continuePhase=designing`, requires a previous terminal
+        parent batch). The P7 kinds require `batchId`.
+      enum: [design, review, data_plan, explore, supplement, incremental_design]
     RunStatus:
       type: string
       description: |
@@ -13147,6 +14335,16 @@ components:
       properties:
         kind:
           $ref: '#/components/schemas/RunKind'
+        batchId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          description: |
+            Required for the P7 `supplement` and `incremental_design` kinds: the
+            parent execution batch as a decimal string. The batch must belong to
+            the version and be terminal (`supplement`: the finished baseline
+            batch; `incremental_design`: the previous terminal batch). Omitted
+            or malformed for those kinds is 422 `invalid_batch_id`; the legacy
+            P5 kinds ignore it.
         mode:
           type: string
           description: |
@@ -13403,7 +14601,14 @@ components:
         are 409 conflicts or 422 validation errors. `duplicate_key` and
         `invalid_case_proposal` are shared with the platform/P4 error reasons,
         and `invalid_case_proposal`, `environment_unreachable` and
-        `ai_unavailable` also appear on a failed run's `reason`.
+        `ai_unavailable` also appear on a failed run's `reason`. P7 adds
+        `invalid_batch_id` (the `supplement`/`incremental_design` run without a
+        valid parent batch, 422), `invalid_decision` (a supplement decision
+        other than accept/reject, 422), `case_status_conflict` (a supplement
+        decision on a non-supplement/already terminal node, 409),
+        `duplicate_supplement` (a node already materialized, 409) and
+        `invalid_supplement_case` (invalid proposed supplement content, 422);
+        the delivery/execution-side P7 reasons stay in ExecutionErrorReason.
       enum:
         - version_state_conflict
         - baseline_frozen
@@ -13440,6 +14645,11 @@ components:
         - duplicate_key
         - graph_too_large
         - forbidden
+        - invalid_batch_id
+        - invalid_decision
+        - case_status_conflict
+        - duplicate_supplement
+        - invalid_supplement_case
     BatchStatus:
       type: string
       description: |
@@ -13448,6 +14658,23 @@ components:
         keeps `running`, so it still owns the version's single active-batch
         slot (spec §5.1, §5.4).
       enum: [planned, running, done, failed, cancelled]
+    BatchKind:
+      type: string
+      description: |
+        P7 batch kind (spec §5.3): `baseline` runs the frozen baseline,
+        `incremental` runs the selected cases of the current working graph in a
+        continuing version, and `supplement` is the single worker-created child
+        batch of a terminal baseline batch that executes the new AI supplement
+        cases. A P6 historical row without a stored kind reads as `baseline`.
+      enum: [baseline, incremental, supplement]
+    CaseSource:
+      type: string
+      description: |
+        P7 case-run source (spec §5.3): `baseline` for frozen baseline cases and
+        `ai_supplement` for cases materialized by the supplement Agent. The
+        scheduler copies it on session retry and a P6 row without it reads as
+        `baseline`.
+      enum: [baseline, ai_supplement]
     PauseMode:
       type: string
       description: |
@@ -13484,16 +14711,22 @@ components:
       type: string
       description: |
         Assertion-level verdict (distinct from the case-level four-state
-        verdict). `not_run` covers unattempted assertions, `db` assertions
-        (unsupported in P6) and passed/failed claims without evidence.
+        verdict). P7 executes `db` assertions through `execution.db_assert`:
+        a matching result records `passed`, a value mismatch records `failed`,
+        and a classified execution failure (connection/target/query/read-only/
+        truncation/invalid expected value) records `not_run`. `not_run` also
+        covers other unattempted assertions and passed/failed claims without
+        evidence.
       enum: [passed, failed, not_run]
     EvidenceKind:
       type: string
       description: |
         Evidence artifact kind (the `evidence.kind` allow-list). Screenshots,
         downloads and HTTP exchanges are captured automatically; console and
-        network logs are captured when the Agent requests evidence.
-      enum: [screenshot, http_exchange, console_log, network_log, download]
+        network logs are captured when the Agent requests evidence. P7 adds
+        `db_result` (the bounded read-only SQL result captured by
+        `execution.db_assert`; it is metadata/summary JSON, never credentials).
+      enum: [screenshot, http_exchange, console_log, network_log, download, db_result]
     AuthFlowKind:
       type: string
       description: Login recipe kind. P6 supports only the minimal `form` recipe.
@@ -13534,12 +14767,19 @@ components:
         decimal string, including `created_by` and the baseline identity. The
         DTO never embeds its case runs; read them from the case-run endpoints.
         `paused` is independent of `status` (a paused batch keeps `running`),
-        and `pause_mode` is always `graceful` or `immediate`.
+        and `pause_mode` is always `graceful` or `immediate`. P7 appends the
+        camelCase `kind`, `parentBatchId`, `graphHash` and
+        `baseFallbackReason` fields (spec §7.7); a P6 historical row without the
+        chain columns reads as `kind=baseline` with `graphHash=baseline_hash`.
       required:
         - id
         - version_id
         - batch_no
         - status
+        - kind
+        - parentBatchId
+        - graphHash
+        - baseFallbackReason
         - paused
         - pause_mode
         - pause_reason
@@ -13568,6 +14808,30 @@ components:
           description: Per-version sequential batch number starting at 1.
         status:
           $ref: '#/components/schemas/BatchStatus'
+        kind:
+          $ref: '#/components/schemas/BatchKind'
+        parentBatchId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+          description: |
+            Parent batch of a P7 `incremental`/`supplement` batch (decimal
+            string); null for a `baseline` batch.
+        graphHash:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: |
+            P7 working-graph hash pinned by the batch. A baseline batch uses
+            the frozen `baseline_hash`; incremental/supplement batches use the
+            deterministic execution-side working-graph hash (D29 ids/hashes
+            only; the mindmap canonical hash is deferred).
+        baseFallbackReason:
+          type: string
+          enum: ['', history_rewritten]
+          description: |
+            Empty for a normal base/head range; `history_rewritten` when the
+            incremental base fell back because the parent head was missing or
+            no longer an ancestor (D49).
         paused:
           type: boolean
           description: True while pause is in effect; the batch keeps `running`.
@@ -13641,9 +14905,16 @@ components:
     CreateBatchRequest:
       type: object
       description: |
-        Body of `POST /api/versions/{id}/batches`. An omitted or empty
-        `caseIds` selects every case of the frozen baseline; when present,
-        every ID must belong to that baseline (`invalid_case_ids` otherwise).
+        Body of `POST /api/versions/{id}/batches`. An omitted `kind` defaults to
+        `baseline`; an unknown kind is 422 `invalid_batch_kind`. A `baseline`
+        batch follows the P6 gates and an omitted/empty `caseIds` selects every
+        case of the frozen baseline (`invalid_case_ids` when an id is outside
+        it). An `incremental` batch requires `status=continuing` with
+        `continuePhase` `designing`/`executing`, a non-empty `caseIds` of the
+        current working graph and a terminal `parentBatchId`; `supplement`
+        batches are worker-only and a user request is 409
+        `supplement_batch_automatic`. `caseIds` are decimal strings
+        (order-insensitive) and `parentBatchId` is a decimal string.
       properties:
         caseIds:
           type: array
@@ -13652,6 +14923,15 @@ components:
             type: string
             pattern: '^[0-9]{1,19}$'
           maxItems: 500
+        kind:
+          $ref: '#/components/schemas/BatchKind'
+        parentBatchId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          description: |
+            Parent batch of an incremental batch (decimal string). Required for
+            `kind=incremental`; ignored/rejected for baseline; user-created
+            supplement batches are rejected before this field is used.
     PauseBatchRequest:
       type: object
       description: |
@@ -13706,9 +14986,13 @@ components:
         One recorded assertion outcome (spec §6.3). `id` is the decimal-string
         identifier of the recorded assertion result. `verdict` is the
         assertion-level `passed`/`failed`/`not_run`, and a `passed`/`failed`
-        verdict always carries at least one evidence ID. A `db` assertion is
-        always `not_run` and makes the case
-        `inconclusive(case, unsupported_assertion_kind)`.
+        verdict always carries at least one evidence ID. P7 executes `db`
+        assertions through `execution.db_assert` (matching → `passed`, value
+        mismatch → `failed`); only an unexecuted or classified-failure `db`
+        assertion is `not_run`, and the case is then classified from that
+        reason (`blocked(environment)` for connection/target failures,
+        `inconclusive(case)` for query/read-only/truncation/expected-value
+        failures).
       required: [id, kind, target, expected, actual, verdict, evidence_ids]
       properties:
         id:
@@ -13868,6 +15152,7 @@ components:
         - case_revision
         - attempt
         - status
+        - source
         - failure_class
         - failure_reason
         - summary
@@ -13900,6 +15185,12 @@ components:
           minimum: 1
         status:
           $ref: '#/components/schemas/CaseRunStatus'
+        source:
+          allOf:
+            - $ref: '#/components/schemas/CaseSource'
+          description: |
+            P7 execution source of this attempt: `baseline` or `ai_supplement`
+            (copied on a session retry, never relabeled).
         failure_class:
           nullable: true
           allOf:
@@ -14382,24 +15673,50 @@ components:
     ExecutionErrorReason:
       type: string
       description: |
-        Closed set of the P6 `error.details.reason` / case-run failure reason
-        identifiers (spec §6.4 plus the request-level `invalid_pause_mode`).
-        HTTP mapping: `version_not_executable`, `environment_required`,
-        `baseline_required`, `baseline_changed`, `batch_active`, `no_cases`,
-        `batch_finished`, `already_paused`, `not_paused` and
-        `case_run_terminal` are 409 conflicts (`error.code=conflict`);
-        `too_many_cases`, `invalid_case_ids`, `invalid_pause_mode` and
-        `export_failed` are 422 validation errors
-        (`error.code=invalid_argument`); `executor_unavailable` and
-        `session_unavailable` are retryable 503s
-        (`error.code=unavailable`); `auth_flow_invalid` is a 422 on the
-        login-recipe/access endpoints. The remaining values are case-outcome
-        reasons carried by a case run's `failure_reason` (and in the event
-        detail), not by an HTTP error: `evidence_missing`,
-        `unsupported_assertion_kind` and `takeover_required`.
-        `executor_unavailable` and `session_unavailable` are also used as case
-        failure reasons when the executor or the login session becomes
-        unavailable mid-run.
+        Closed set of the P6/P7 `error.details.reason` / case-run failure-reason
+        identifiers. The P6 values keep their meaning (spec §6.4 plus
+        `invalid_pause_mode`). P7 extends the catalog with the spec §7.11
+        delivery/continuing/db reasons and the reasons the P7 implementations
+        actually emit: `batch_not_found` (404 of a delivery batch reference),
+        `invalid_decision` (a supplement decision other than accept/reject),
+        `issue_not_found`/`report_not_found`/`analysis_not_found` (404s),
+        `report_version_mismatch`/`invalid_report_filter` (report validation),
+        `invalid_batch_id` (mindmap supplement/design parent batch) and
+        `invalid_continue_phase`. The T7 gate reasons added by the execution
+        implementation are `autonomy_pending`, `invalid_parent_batch`,
+        `invalid_batch_kind` and `supplement_unavailable`; the batch/issue
+        companions use the spec reasons (`continuing_batch_conflict`,
+        `issue_state_conflict`, ...). `supplement_limit_reached` is kept in the
+        closed catalog per spec §7.11 even though the P7 supplement caps are
+        enforced as run warnings (`case_limit_reached`) rather than an HTTP
+        error. The P7 mindmap-only reasons are also listed in
+        MindmapErrorReason; `subject_not_in_version` remains in CodeErrorReason
+        (P4).
+
+        HTTP mapping: 404 `not_found` for the `*_not_found` values; 409
+        `conflict` for `version_not_continuable`, `continuing_batch_conflict`,
+        `no_incremental_cases`, `run_in_progress`, `supplement_batch_automatic`,
+        `supplement_limit_reached`, `analysis_active`, `analysis_not_applicable`,
+        `issue_state_conflict`, `report_not_publishable`, `report_stale`,
+        `autonomy_pending`, `invalid_parent_batch`, `duplicate_supplement`,
+        `case_status_conflict`, `db_target_missing`, `baseline_changed` and the
+        P6 conflicts; 422 `invalid_argument` for `issue_dismiss_reason_required`,
+        `issue_ref_invalid`, `invalid_base_commit`, `db_target_invalid`,
+        `db_query_failed`, `db_readonly_violation`, `db_result_truncated`,
+        `db_expected_invalid`, `unsupported_subject_kind`, `invalid_batch_kind`,
+        `invalid_batch_id`, `invalid_supplement_case`, `invalid_decision`,
+        `invalid_continue_phase`, `report_version_mismatch`,
+        `invalid_report_filter` and the P6 422s. `report_export_failed` is a
+        retryable 500 and `db_connection_failed` a retryable 503. The remaining
+        values are case-outcome reasons carried by a case run's
+        `failure_reason` (and in the event detail), not by an HTTP error:
+        `evidence_missing`, `unsupported_assertion_kind`, `takeover_required`,
+        `db_connection_failed`, `db_target_missing`, `db_query_failed`,
+        `db_readonly_violation`, `db_result_truncated` and
+        `db_expected_invalid` (all produced by `execution.db_assert`;
+        connection/target failures classify `blocked(environment)`, SQL/
+        read-only/truncation/expected failures `inconclusive(case)` and a value
+        mismatch `failed(application)`).
       enum:
         - version_not_executable
         - baseline_required
@@ -14421,3 +15738,1347 @@ components:
         - auth_flow_invalid
         - takeover_required
         - invalid_pause_mode
+        - version_not_continuable
+        - continuing_batch_conflict
+        - no_incremental_cases
+        - run_in_progress
+        - supplement_batch_automatic
+        - supplement_limit_reached
+        - analysis_active
+        - analysis_not_applicable
+        - issue_state_conflict
+        - issue_dismiss_reason_required
+        - issue_ref_invalid
+        - report_not_publishable
+        - report_export_failed
+        - report_stale
+        - invalid_base_commit
+        - db_target_invalid
+        - db_target_missing
+        - db_connection_failed
+        - db_query_failed
+        - db_readonly_violation
+        - db_result_truncated
+        - db_expected_invalid
+        - unsupported_subject_kind
+        - autonomy_pending
+        - invalid_parent_batch
+        - invalid_batch_kind
+        - supplement_unavailable
+        - batch_not_found
+        - invalid_decision
+        - issue_not_found
+        - report_not_found
+        - analysis_not_found
+        - report_version_mismatch
+        - invalid_report_filter
+        - invalid_batch_id
+        - duplicate_supplement
+        - invalid_supplement_case
+        - case_status_conflict
+        - invalid_continue_phase
+    VersionChangeKind:
+      type: string
+      description: |
+        One derived kind of the version change feed (spec §7.2, D50). The four
+        implemented kinds are computed read-only from requirements, finished
+        batches, published reports and issues; `code_changed` is reserved for
+        P8 (`version_change` table) and is not emitted in P7.
+      enum:
+        - requirement_added
+        - batch_finished
+        - report_published
+        - issue_created
+        - code_changed
+    VersionChange:
+      type: object
+      description: |
+        One item of `GET /api/versions/{id}/changes`. `refId` is the
+        decimal-string id of the referenced row (empty when the source row has
+        none) and `at` is the source timestamp (RFC 3339 UTC).
+      required: [kind, at, refId, summary]
+      properties:
+        kind:
+          $ref: '#/components/schemas/VersionChangeKind'
+        at:
+          type: string
+          format: date-time
+        refId:
+          type: string
+          description: Referenced row id as a decimal string; empty when none.
+        summary:
+          type: string
+          maxLength: 500
+    VersionChanges:
+      type: object
+      description: One page of the derived change feed (newest first).
+      required: [items, nextCursor, hasMore]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/VersionChange'
+        nextCursor:
+          type: string
+          description: Opaque page cursor; empty when `hasMore` is false.
+        hasMore:
+          type: boolean
+    VersionChangesEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/VersionChanges'
+    IssueSource:
+      type: string
+      description: Issue origin (spec §5.4). AI drafts materialize as `ai`; manual creation is `human`.
+      enum: [ai, human]
+    IssueCategory:
+      type: string
+      description: Issue category.
+      enum: [defect, requirement_gap, other]
+    IssueSeverity:
+      type: string
+      description: Issue severity (blocker is the highest).
+      enum: [blocker, major, minor, info]
+    IssueStatus:
+      type: string
+      description: |
+        Issue status. `open` is the only writable state; confirm/dismiss are
+        terminal in P7 (reopen/merge semantics are deferred to P8).
+      enum: [open, confirmed, dismissed]
+    IssueRefKind:
+      type: string
+      description: |
+        Durable issue-reference kinds (spec §4.2.1). IDs are decimal strings
+        except `commit` (a 40-hex SHA).
+      enum: [case_run, case_node, step_result, evidence, requirement, batch, commit, code_anchor]
+    IssueRef:
+      type: object
+      required: [kind, id]
+      properties:
+        kind:
+          $ref: '#/components/schemas/IssueRefKind'
+        id:
+          type: string
+          description: Decimal-string row id, or the 40-hex commit SHA for `commit`.
+    IssueCodeRef:
+      type: object
+      description: |
+        One code anchor of an issue (spec §7.3), read from codeintel
+        `code_anchor(subject_kind='issue')`. A nil/unwired reader degrades to an
+        empty array; the anchor id is a decimal string.
+      required: [anchorId, path, line, kind, label]
+      properties:
+        anchorId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        path:
+          type: string
+          maxLength: 4096
+        line:
+          type: integer
+          minimum: 0
+        kind:
+          type: string
+          description: Anchor location kind, for example `file_line`.
+        label:
+          type: string
+    IssueCaseSummary:
+      type: object
+      description: Id-only case summary of the issue detail.
+      required: [caseRunId, caseNodeId]
+      properties:
+        caseRunId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+        caseNodeId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+    IssueBatchSummary:
+      type: object
+      description: Id-only batch summary of the issue detail.
+      required: [id]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+    IssueRequirementSummary:
+      type: object
+      description: Id-only requirement summary of the issue detail.
+      required: [id]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+    IssueView:
+      type: object
+      description: |
+        `IssueView` list item (spec §7.3). Every id is a decimal string (users
+        included) and every array is non-nil. List items deliberately omit
+        `description`/`reproSteps`/`expected`/`actual` (they are only on
+        IssueDetailView); evidence bodies, prompts and credentials never appear.
+      required:
+        - id
+        - versionId
+        - batchId
+        - caseRunId
+        - caseNodeId
+        - stepResultId
+        - source
+        - category
+        - severity
+        - status
+        - confidence
+        - failureClass
+        - title
+        - rerunSuggestion
+        - recurrenceCount
+        - revision
+        - refs
+        - codeRefs
+        - dismissedReason
+        - createdBy
+        - confirmedBy
+        - confirmedAt
+        - dismissedBy
+        - dismissedAt
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        versionId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        batchId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+        caseRunId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+        caseNodeId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+        stepResultId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+        source:
+          $ref: '#/components/schemas/IssueSource'
+        category:
+          $ref: '#/components/schemas/IssueCategory'
+        severity:
+          $ref: '#/components/schemas/IssueSeverity'
+        status:
+          $ref: '#/components/schemas/IssueStatus'
+        confidence:
+          $ref: '#/components/schemas/Confidence'
+        failureClass:
+          type: string
+          nullable: true
+          enum: [application, environment, session, model, case]
+          description: Failure class for AI issues; null for human issues.
+        title:
+          type: string
+          maxLength: 200
+        rerunSuggestion:
+          type: string
+        recurrenceCount:
+          type: integer
+          minimum: 0
+        revision:
+          type: integer
+          minimum: 1
+          description: Optimistic-concurrency token for PATCH.
+        refs:
+          type: array
+          items:
+            $ref: '#/components/schemas/IssueRef'
+        codeRefs:
+          type: array
+          description: Code anchors of the issue; `[]` when codeintel is unwired or has none.
+          items:
+            $ref: '#/components/schemas/IssueCodeRef'
+        dismissedReason:
+          type: string
+        createdBy:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          description: User ID serialized as a decimal string.
+        confirmedBy:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+        confirmedAt:
+          type: string
+          format: date-time
+          nullable: true
+        dismissedBy:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+        dismissedAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    IssueDetailView:
+      allOf:
+        - $ref: '#/components/schemas/IssueView'
+        - type: object
+          description: |
+            Issue detail: the list item plus the long bodies and id-only
+            summaries.
+          required: [description, reproSteps, expected, actual, case, requirement, batch]
+          properties:
+            description:
+              type: string
+            reproSteps:
+              type: string
+            expected:
+              type: string
+            actual:
+              type: string
+            case:
+              nullable: true
+              allOf:
+                - $ref: '#/components/schemas/IssueCaseSummary'
+            requirement:
+              nullable: true
+              allOf:
+                - $ref: '#/components/schemas/IssueRequirementSummary'
+            batch:
+              nullable: true
+              allOf:
+                - $ref: '#/components/schemas/IssueBatchSummary'
+    IssueCreateRequest:
+      type: object
+      description: |
+        Body of `POST /api/versions/{id}/issues`. `title` and `severity` are
+        required; ids are decimal strings; `source`/`status`/`dedupeKey` are
+        server-owned (`human`/`open`/null).
+      required: [title, severity]
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        severity:
+          $ref: '#/components/schemas/IssueSeverity'
+        description:
+          type: string
+        category:
+          $ref: '#/components/schemas/IssueCategory'
+        confidence:
+          $ref: '#/components/schemas/Confidence'
+        caseRunId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        caseNodeId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        requirementId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        expected:
+          type: string
+        actual:
+          type: string
+        reproSteps:
+          type: string
+    IssuePatchRequest:
+      type: object
+      description: |
+        Body of `PATCH /api/versions/{id}/issues/{issueId}`. `comment` is
+        required (non-empty) for `dismissed`; a stale `expectedRevision` or an
+        already terminal issue is 409 `issue_state_conflict`.
+      required: [status, expectedRevision]
+      properties:
+        status:
+          type: string
+          enum: [confirmed, dismissed]
+        expectedRevision:
+          type: integer
+          minimum: 1
+        comment:
+          type: string
+    IssueDeepLink:
+      type: object
+      required: [versionId, tab, issueId]
+      properties:
+        versionId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        tab:
+          type: string
+          enum: [issues]
+        issueId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+    GlobalIssueView:
+      allOf:
+        - $ref: '#/components/schemas/IssueView'
+        - type: object
+          description: One row of the read-only cross-version issue centre.
+          required: [versionName, deepLink]
+          properties:
+            versionName:
+              type: string
+            deepLink:
+              $ref: '#/components/schemas/IssueDeepLink'
+    IssueDetailEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/IssueDetailView'
+    IssueListEnvelope:
+      type: object
+      description: One cursor page of version issue list items.
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/IssueView'
+        next_cursor:
+          type: string
+          description: Opaque cursor; empty when `has_more` is false.
+        has_more:
+          type: boolean
+    GlobalIssueListEnvelope:
+      type: object
+      description: One cursor page of the global issue centre.
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/GlobalIssueView'
+        next_cursor:
+          type: string
+        has_more:
+          type: boolean
+    ReportStatus:
+      type: string
+      description: |
+        Report revision status. `stale` is a derived warning state set when the
+        report inputs changed after publication; the revision is kept and can be
+        regenerated.
+      enum: [draft, published, stale]
+    ReportMarkdown:
+      type: object
+      description: |
+        Markdown artifact metadata. The stored filesystem path is never
+        exposed; `downloadPath` is the authenticated API export route.
+      required: [sha256, sizeBytes, downloadPath]
+      properties:
+        sha256:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        sizeBytes:
+          type: integer
+          format: int64
+          minimum: 0
+        downloadPath:
+          type: string
+    ReportView:
+      type: object
+      description: |
+        `ReportView` list item (spec §7.4). List items never include `content`.
+        Every id is a decimal string and timestamps are RFC 3339 UTC strings.
+      required:
+        - id
+        - versionId
+        - batchId
+        - revision
+        - status
+        - title
+        - inputFingerprint
+        - markdown
+        - staleReason
+        - publishedAt
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        versionId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        batchId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        revision:
+          type: integer
+          minimum: 1
+        status:
+          $ref: '#/components/schemas/ReportStatus'
+        title:
+          type: string
+        inputFingerprint:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+          description: Deterministic sha256 of the report input (batch/case runs/issues).
+        markdown:
+          $ref: '#/components/schemas/ReportMarkdown'
+        staleReason:
+          type: string
+        publishedAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    ReportDetailView:
+      allOf:
+        - $ref: '#/components/schemas/ReportView'
+        - type: object
+          description: Report detail with the deterministic content snapshot.
+          required: [batchNo, batchKind, content]
+          properties:
+            batchNo:
+              type: integer
+              minimum: 1
+            batchKind:
+              $ref: '#/components/schemas/BatchKind'
+            content:
+              $ref: '#/components/schemas/ReportContent'
+    ReportContent:
+      type: object
+      description: |
+        `eztest.report.v1` snapshot (spec §5.5): deterministic, secret-free and
+        canonically ordered. Every id is a decimal string; every array is
+        non-nil; timestamps are RFC 3339 strings. The snapshot never contains
+        evidence bodies, prompts, SQL results, credentials or file paths.
+      required: [schema, version, batch, summary, cases, requirements, issues, risks, degraded, appendix]
+      properties:
+        schema:
+          type: string
+          enum: [eztest.report.v1]
+        version:
+          type: object
+          required: [id, name, label, status, codeBaselineCommit]
+          properties:
+            id:
+              type: string
+            name:
+              type: string
+            label:
+              type: string
+            status:
+              $ref: '#/components/schemas/VersionStatus'
+            codeBaselineCommit:
+              type: string
+        batch:
+          type: object
+          required: [id, batchNo, kind, status, baselineHash, graphHash, codeBaseCommit, headCommit, startedAt, finishedAt]
+          properties:
+            id:
+              type: string
+            batchNo:
+              type: integer
+            kind:
+              $ref: '#/components/schemas/BatchKind'
+            status:
+              $ref: '#/components/schemas/BatchStatus'
+            baselineHash:
+              type: string
+            graphHash:
+              type: string
+            codeBaseCommit:
+              type: string
+            headCommit:
+              type: string
+            startedAt:
+              type: string
+            finishedAt:
+              type: string
+        summary:
+          type: object
+          required: [caseCount, passed, failed, blocked, inconclusive, skipped, interrupted, flakyCount]
+          properties:
+            caseCount:
+              type: integer
+              minimum: 0
+            passed:
+              type: integer
+              minimum: 0
+            failed:
+              type: integer
+              minimum: 0
+            blocked:
+              type: integer
+              minimum: 0
+            inconclusive:
+              type: integer
+              minimum: 0
+            skipped:
+              type: integer
+              minimum: 0
+            interrupted:
+              type: integer
+              minimum: 0
+            flakyCount:
+              type: integer
+              minimum: 0
+        cases:
+          type: array
+          items:
+            type: object
+            required: [caseRunId, caseNodeId, title, source, status, failureClass, attempt, stepCount, assertionCount, evidenceCount]
+            properties:
+              caseRunId:
+                type: string
+              caseNodeId:
+                type: string
+              title:
+                type: string
+              source:
+                $ref: '#/components/schemas/CaseSource'
+              status:
+                $ref: '#/components/schemas/CaseRunStatus'
+              failureClass:
+                type: string
+                description: Empty when the case passed.
+              attempt:
+                type: integer
+                minimum: 1
+              stepCount:
+                type: integer
+                minimum: 0
+              assertionCount:
+                type: integer
+                minimum: 0
+              evidenceCount:
+                type: integer
+                minimum: 0
+        requirements:
+          type: array
+          items:
+            type: object
+            required: [requirementId, title, status, caseCount, passed, failed]
+            properties:
+              requirementId:
+                type: string
+              title:
+                type: string
+              status:
+                type: string
+              caseCount:
+                type: integer
+                minimum: 0
+              passed:
+                type: integer
+                minimum: 0
+              failed:
+                type: integer
+                minimum: 0
+        issues:
+          type: array
+          description: Severity-ordered issue summary; issue bodies are never embedded.
+          items:
+            type: object
+            required: [issueId, title, severity, status, confidence, category, caseNodeId, codeRefs]
+            properties:
+              issueId:
+                type: string
+              title:
+                type: string
+              severity:
+                $ref: '#/components/schemas/IssueSeverity'
+              status:
+                $ref: '#/components/schemas/IssueStatus'
+              confidence:
+                $ref: '#/components/schemas/Confidence'
+              category:
+                $ref: '#/components/schemas/IssueCategory'
+              caseNodeId:
+                type: string
+              codeRefs:
+                type: array
+                items:
+                  type: object
+                  required: [path, line]
+                  properties:
+                    path:
+                      type: string
+                    line:
+                      type: integer
+                      minimum: 0
+        risks:
+          type: array
+          items:
+            type: string
+        degraded:
+          type: boolean
+          description: True when the AI analysis was unavailable and the report is baseline-only.
+        appendix:
+          type: object
+          required: [environment, system, commit, generatedAt]
+          properties:
+            environment:
+              type: string
+            system:
+              type: string
+            commit:
+              type: string
+            generatedAt:
+              type: string
+    EnsureReportRequest:
+      type: object
+      description: Body of `POST /api/versions/{id}/reports`; the batch must belong to the version.
+      required: [batchId]
+      properties:
+        batchId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+    ReportDiffSummary:
+      type: object
+      required: [addedIssues, fixedIssues, regressed, recovered, newCases, removedCases, changed]
+      properties:
+        addedIssues:
+          type: integer
+        fixedIssues:
+          type: integer
+        regressed:
+          type: integer
+        recovered:
+          type: integer
+        newCases:
+          type: integer
+        removedCases:
+          type: integer
+        changed:
+          type: integer
+    ReportDiffIssue:
+      type: object
+      required: [issueId, title, severity]
+      properties:
+        issueId:
+          type: string
+        title:
+          type: string
+        severity:
+          $ref: '#/components/schemas/IssueSeverity'
+    ReportDiffCase:
+      type: object
+      required: [caseNodeId, title, from, to]
+      properties:
+        caseNodeId:
+          type: string
+        title:
+          type: string
+        from:
+          $ref: '#/components/schemas/CaseRunStatus'
+        to:
+          $ref: '#/components/schemas/CaseRunStatus'
+    ReportDiffNewCase:
+      type: object
+      required: [caseNodeId, title, source]
+      properties:
+        caseNodeId:
+          type: string
+        title:
+          type: string
+        source:
+          $ref: '#/components/schemas/CaseSource'
+    ReportDiff:
+      type: object
+      description: |
+        Deterministic difference between two report revisions of the same
+        version (spec §5.5/§7.4). All lists are non-nil and ordered by case node
+        or issue id; ids are decimal strings.
+      required:
+        - baseReportId
+        - targetReportId
+        - baseBatchNo
+        - targetBatchNo
+        - summary
+        - addedIssues
+        - fixedIssues
+        - regressedCases
+        - recoveredCases
+        - changedCases
+        - newCases
+        - removedCases
+      properties:
+        baseReportId:
+          type: string
+        targetReportId:
+          type: string
+        baseBatchNo:
+          type: integer
+        targetBatchNo:
+          type: integer
+        summary:
+          $ref: '#/components/schemas/ReportDiffSummary'
+        addedIssues:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReportDiffIssue'
+        fixedIssues:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReportDiffIssue'
+        regressedCases:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReportDiffCase'
+        recoveredCases:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReportDiffCase'
+        changedCases:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReportDiffCase'
+        newCases:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReportDiffNewCase'
+        removedCases:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReportDiffNewCase'
+    ReportDeepLink:
+      type: object
+      required: [versionId, tab, reportId]
+      properties:
+        versionId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        tab:
+          type: string
+          enum: [report]
+        reportId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+    GlobalReportView:
+      allOf:
+        - $ref: '#/components/schemas/ReportView'
+        - type: object
+          description: One row of the read-only cross-version report centre.
+          required: [versionName, batchNo, deepLink]
+          properties:
+            versionName:
+              type: string
+            batchNo:
+              type: integer
+              minimum: 0
+            deepLink:
+              $ref: '#/components/schemas/ReportDeepLink'
+    ReportDetailEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/ReportDetailView'
+    ReportListEnvelope:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReportView'
+        next_cursor:
+          type: string
+        has_more:
+          type: boolean
+    ReportDiffEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/ReportDiff'
+    GlobalReportListEnvelope:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/GlobalReportView'
+        next_cursor:
+          type: string
+        has_more:
+          type: boolean
+    AnalysisKind:
+      type: string
+      description: |
+        P7 analysis-run kind: `failure` is the failure-analysis Agent and
+        `issue_triage` the issue-triage Agent (started by the autonomy worker;
+        the manual endpoint only starts `failure`).
+      enum: [failure, issue_triage]
+    AnalysisStatus:
+      type: string
+      description: Analysis-run status. `degraded` means the run finished with a reduced outcome.
+      enum: [queued, running, done, failed, degraded]
+    AnalysisView:
+      type: object
+      description: |
+        `AnalysisView` (spec §7.5): the JSON-safe projection of one analysis
+        run. `result`/`stats`/`errors` are structured JSON (candidate/issue
+        drafts, counters, per-item errors) and are omitted when empty; LLM
+        prompts and raw model text are never included.
+      required:
+        - id
+        - versionId
+        - batchId
+        - kind
+        - status
+        - model
+        - promptVersion
+        - startedAt
+        - finishedAt
+        - createdAt
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        versionId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        batchId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        kind:
+          $ref: '#/components/schemas/AnalysisKind'
+        status:
+          $ref: '#/components/schemas/AnalysisStatus'
+        model:
+          type: string
+        promptVersion:
+          type: string
+          maxLength: 32
+        result:
+          nullable: true
+          description: |
+            Structured analysis result document (candidate/issue-draft arrays
+            and counts); omitted when empty. LLM prompt text and raw model
+            output are never included.
+        stats:
+          nullable: true
+          description: Structured run counters; omitted when empty.
+        errors:
+          nullable: true
+          description: Structured per-item errors/warnings; omitted when empty.
+        startedAt:
+          type: string
+          format: date-time
+          nullable: true
+        finishedAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+    StartAnalysisRunRequest:
+      type: object
+      description: Body of the manual batch analysis start; P7 only supports `failure`.
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [failure]
+    AnalysisViewEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/AnalysisView'
+    AnalysisListEnvelope:
+      type: object
+      description: The batch analysis runs (no pagination).
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/AnalysisView'
+    IncrementalPlanRun:
+      type: object
+      description: |
+        The latest `incremental_design` run of the plan. `result` is the
+        structured run result (proposed cases/affected cases/escalations);
+        LLM prompt text is never included.
+      required: [id, kind, status, result]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        kind:
+          $ref: '#/components/schemas/RunKind'
+        status:
+          $ref: '#/components/schemas/RunStatus'
+        result:
+          nullable: true
+          description: |
+            Structured incremental-design run result (proposed cases/affected
+            cases/escalations/warnings); prompt text is never included.
+    IncrementalPlanNewCase:
+      type: object
+      description: One new supplement case proposed by the incremental design run.
+      required: [nodeId, title, priority, confidence, requirementIds, status]
+      properties:
+        nodeId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        title:
+          type: string
+        priority:
+          $ref: '#/components/schemas/CasePriority'
+        confidence:
+          $ref: '#/components/schemas/Confidence'
+        requirementIds:
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9]{1,19}$'
+        status:
+          $ref: '#/components/schemas/CaseNodeStatus'
+    IncrementalPlanAffectedCase:
+      type: object
+      description: One existing case affected by the change impact (P4 + requirements).
+      required: [nodeId, title, confidence, reason, source, selected]
+      properties:
+        nodeId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        title:
+          type: string
+        confidence:
+          $ref: '#/components/schemas/Confidence'
+        reason:
+          type: string
+        source:
+          type: string
+          enum: [code, requirement]
+        selected:
+          type: boolean
+          description: True when the case is selected by default (high/medium confidence).
+    IncrementalPlanChange:
+      type: object
+      description: One P4 unmapped change shown in the plan (empty when P4 impact is unavailable).
+      required: [path, summary]
+      properties:
+        path:
+          type: string
+        summary:
+          type: string
+    IncrementalPlanWarning:
+      type: object
+      description: One plan warning, for example `impact_unavailable`, `history_rewritten` or `batch_precondition_unavailable`.
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+    IncrementalPlanView:
+      type: object
+      description: |
+        `GET /api/versions/{versionId}/mindmap/incremental-plan` (spec §7.6).
+        Every collection is a non-nil array and an empty plan is 200, not 404.
+        `defaultCaseIds` = all new cases plus the high/medium-confidence affected
+        cases; the user may change the selection before creating the
+        incremental batch.
+      required:
+        - versionId
+        - phase
+        - parentBatchId
+        - run
+        - newCases
+        - affectedCases
+        - unmappedChanges
+        - defaultCaseIds
+        - warnings
+        - degraded
+      properties:
+        versionId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        phase:
+          type: string
+          enum: [designing, executing]
+        parentBatchId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+        run:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/IncrementalPlanRun'
+        newCases:
+          type: array
+          items:
+            $ref: '#/components/schemas/IncrementalPlanNewCase'
+        affectedCases:
+          type: array
+          items:
+            $ref: '#/components/schemas/IncrementalPlanAffectedCase'
+        unmappedChanges:
+          type: array
+          items:
+            $ref: '#/components/schemas/IncrementalPlanChange'
+        defaultCaseIds:
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9]{1,19}$'
+        warnings:
+          type: array
+          items:
+            $ref: '#/components/schemas/IncrementalPlanWarning'
+        degraded:
+          type: boolean
+    IncrementalPlanEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/IncrementalPlanView'
+    SupplementDecisionRequest:
+      type: object
+      required: [decision]
+      properties:
+        decision:
+          type: string
+          enum: [accept, reject]
+    SupplementDecisionView:
+      type: object
+      required: [nodeId, status]
+      properties:
+        nodeId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        status:
+          type: string
+          enum: [merged, rejected]
+    SupplementDecisionEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/SupplementDecisionView'
+    DbTargetView:
+      type: object
+      description: |
+        `DbTargetView` (spec §7.8). The password is never returned:
+        `credentialSet` only reports whether one is stored. IDs are decimal
+        strings; timestamps are RFC 3339 UTC strings.
+      required:
+        - id
+        - environmentId
+        - name
+        - host
+        - port
+        - database
+        - username
+        - credentialSet
+        - sslmode
+        - connectTimeoutMs
+        - statementTimeoutMs
+        - maxRows
+        - enabled
+        - lastTestedAt
+        - lastTestStatus
+        - lastTestMessage
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        environmentId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        name:
+          type: string
+        host:
+          type: string
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        database:
+          type: string
+        username:
+          type: string
+        credentialSet:
+          type: boolean
+          description: True when a password is stored; the password itself is write-only.
+        sslmode:
+          type: string
+          enum: [disable, require, verify-ca, verify-full]
+        connectTimeoutMs:
+          type: integer
+          minimum: 1
+        statementTimeoutMs:
+          type: integer
+          minimum: 1
+        maxRows:
+          type: integer
+          minimum: 1
+        enabled:
+          type: boolean
+        lastTestedAt:
+          type: string
+          format: date-time
+          nullable: true
+        lastTestStatus:
+          type: string
+          enum: ['', ok, failed]
+        lastTestMessage:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    DbTargetUpsertRequest:
+      type: object
+      description: |
+        Body of `PUT /api/resources/environments/{id}/db-target`. `password` is
+        optional on update (omitted = keep the stored value) but required on the
+        first create; the server defaults `sslmode`/timeouts/`maxRows`/`enabled`.
+      required: [host, port, database, username]
+      properties:
+        name:
+          type: string
+        host:
+          type: string
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        database:
+          type: string
+        username:
+          type: string
+        password:
+          type: string
+          description: Write-only; never echoed, logged, audited or returned.
+        sslmode:
+          type: string
+          enum: [disable, require, verify-ca, verify-full]
+        connectTimeoutMs:
+          type: integer
+          minimum: 1
+        statementTimeoutMs:
+          type: integer
+          minimum: 1
+        maxRows:
+          type: integer
+          minimum: 1
+        enabled:
+          type: boolean
+    DbTargetTestRequest:
+      type: object
+      description: |
+        Optional unsaved override for `POST .../db-target/test`. Every field is
+        optional; the body is probed and never persisted.
+      properties:
+        name:
+          type: string
+        host:
+          type: string
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        database:
+          type: string
+        username:
+          type: string
+        password:
+          type: string
+          description: Write-only probe credential; never returned.
+        sslmode:
+          type: string
+          enum: [disable, require, verify-ca, verify-full]
+        connectTimeoutMs:
+          type: integer
+          minimum: 1
+        statementTimeoutMs:
+          type: integer
+          minimum: 1
+        maxRows:
+          type: integer
+          minimum: 1
+        enabled:
+          type: boolean
+    DbTargetTestError:
+      type: object
+      required: [reason, message]
+      properties:
+        reason:
+          type: string
+          description: |
+            Stable classified reason, for example `db_connection_failed`,
+            `db_query_failed`, `db_target_missing` or `db_target_invalid`.
+        message:
+          type: string
+    DbTargetTestResult:
+      type: object
+      description: |
+        The 200 probe result. A failed probe is still 200 with `ok=false` and
+        `error.reason`; the password/DSN never appear.
+      required: [ok, latencyMs, transactionReadOnly, warnings]
+      properties:
+        ok:
+          type: boolean
+        latencyMs:
+          type: integer
+          format: int64
+          minimum: 0
+        serverVersion:
+          type: string
+        currentUser:
+          type: string
+        transactionReadOnly:
+          type: boolean
+          description: True when the probe session is read-only.
+        warnings:
+          type: array
+          items:
+            type: string
+        error:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/DbTargetTestError'
+    DbTargetEnvelope:
+      type: object
+      description: The target or `data:null` when the environment has no target.
+      required: [data]
+      properties:
+        data:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/DbTargetView'
+    DbTargetTestResultEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/DbTargetTestResult'
