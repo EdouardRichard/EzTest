@@ -389,6 +389,25 @@ type CodeAnchorGateway interface {
 	Delete(ctx context.Context, versionID, anchorID int64) error
 }
 
+// Prober performs one read-only HTTP probe for app exploration. The
+// infrastructure/httpclient adapter implements it; application services must
+// depend on this port, never on the adapter package (Agent.md §6.2).
+type ProbeResult struct {
+	URL         string
+	Status      int
+	ContentType string
+	Title       string
+	Links       []string
+	Forms       []string
+	Scripts     []string
+	Body        string
+	Truncated   bool
+}
+
+type Prober interface {
+	Probe(ctx context.Context, rawURL, cookieHeader string) (ProbeResult, error)
+}
+
 // AgentRuntime is the P1 agent runtime port: profile seeding, sessions, text
 // runs, status polling and abort.
 type AgentRuntime interface {
