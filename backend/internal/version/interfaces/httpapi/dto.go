@@ -28,11 +28,18 @@ type versionBindingsDTO struct {
 // versionDTO is the VersionDTO of spec §7.2. The P3-owned id is a decimal JSON
 // string; the P2 resource ids and the user ids stay numbers.
 type versionDTO struct {
-	ID                 int64              `json:"id,string"`
-	Name               string             `json:"name"`
-	Label              string             `json:"label"`
-	Description        string             `json:"description"`
-	Status             string             `json:"status"`
+	ID          int64  `json:"id,string"`
+	Name        string `json:"name"`
+	Label       string `json:"label"`
+	Description string `json:"description"`
+	Status      string `json:"status"`
+	// Paused, PauseMode and BatchNo are the P6 execution-state additions
+	// (execution spec §6.3). The active batch itself is deliberately not part
+	// of the version DTO: the frontend reads it from
+	// GET /api/versions/{id}/batches?status=running&limit=1.
+	Paused             bool               `json:"paused"`
+	PauseMode          string             `json:"pause_mode"`
+	BatchNo            int                `json:"batch_no"`
 	SystemID           *int64             `json:"systemId"`
 	EnvironmentID      *int64             `json:"environmentId"`
 	CodeRepositoryID   *int64             `json:"codeRepositoryId"`
@@ -58,6 +65,9 @@ func newVersionDTO(version *versionapp.Version, counts versionCountsView, bindin
 		Label:              version.Label,
 		Description:        version.Description,
 		Status:             version.Status,
+		Paused:             version.Paused,
+		PauseMode:          version.PauseMode,
+		BatchNo:            version.BatchNo,
 		SystemID:           version.SystemID,
 		EnvironmentID:      version.EnvironmentID,
 		CodeRepositoryID:   version.CodeRepositoryID,

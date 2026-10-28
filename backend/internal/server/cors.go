@@ -12,7 +12,9 @@ const (
 	// send.
 	corsAllowHeaders = "Authorization, Content-Type, X-Request-ID, Idempotency-Key, Last-Event-ID"
 	// corsExposeHeaders is the set of response headers the web client may read.
-	corsExposeHeaders = "X-Request-ID, X-Snapshot-Cursor, Idempotent-Replayed"
+	// Content-Disposition and X-Content-SHA256 are the P6 report-export and
+	// evidence-download headers (spec §6.2, T11 finding).
+	corsExposeHeaders = "X-Request-ID, X-Snapshot-Cursor, Idempotent-Replayed, Content-Disposition, X-Content-SHA256"
 )
 
 // CORS returns middleware that allows exactly the configured web origin. It
