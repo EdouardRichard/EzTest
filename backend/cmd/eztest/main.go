@@ -44,6 +44,19 @@ import (
 	llm "github.com/EdouardRichard/EzTest/backend/internal/llm/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/llm/infrastructure/deepseek"
 	llmpostgres "github.com/EdouardRichard/EzTest/backend/internal/llm/infrastructure/postgres"
+	mindmapapp "github.com/EdouardRichard/EzTest/backend/internal/mindmap/application"
+	mindmapdomain "github.com/EdouardRichard/EzTest/backend/internal/mindmap/domain"
+	mindmapagent "github.com/EdouardRichard/EzTest/backend/internal/mindmap/infrastructure/agent"
+	mindmapagenttools "github.com/EdouardRichard/EzTest/backend/internal/mindmap/infrastructure/agenttools"
+	mindmapaudit "github.com/EdouardRichard/EzTest/backend/internal/mindmap/infrastructure/audit"
+	mindmapcodeintel "github.com/EdouardRichard/EzTest/backend/internal/mindmap/infrastructure/codeintel"
+	mindmapeventing "github.com/EdouardRichard/EzTest/backend/internal/mindmap/infrastructure/eventing"
+	mindmapfilestore "github.com/EdouardRichard/EzTest/backend/internal/mindmap/infrastructure/filestore"
+	mindmaphttpclient "github.com/EdouardRichard/EzTest/backend/internal/mindmap/infrastructure/httpclient"
+	mindmappostgres "github.com/EdouardRichard/EzTest/backend/internal/mindmap/infrastructure/postgres"
+	mindmapresource "github.com/EdouardRichard/EzTest/backend/internal/mindmap/infrastructure/resource"
+	mindmapversion "github.com/EdouardRichard/EzTest/backend/internal/mindmap/infrastructure/version"
+	mindmaphttp "github.com/EdouardRichard/EzTest/backend/internal/mindmap/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/crypto"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/idempotency"
@@ -87,6 +100,10 @@ const (
 	// root (design spec §6.7). It is enforced at startup and by the filestore;
 	// Windows cannot represent the Unix permission bits and ignores them.
 	versionAttachmentDirPerm os.FileMode = 0o700
+	// mindmapExportDirPerm is the least-privilege mode of the P5 export root
+	// (D30). The export filestore creates/tightens it as well; creating it at
+	// startup turns a misconfigured EZTEST_EXPORT_DIR into a boot failure.
+	mindmapExportDirPerm os.FileMode = 0o700
 	// codeIntelWorkerQueueSize is the bounded async-run queue of design spec
 	// §6.8 (16 jobs; a full queue answers 429 analysis_queue_full).
 	codeIntelWorkerQueueSize = 16
@@ -424,6 +441,65 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Repos:    codeIntelRepos,
 	})
 
+	// P5 mindmap context: the nine repositories, the cross-context adapters (P3
+	// version/requirements, P2 catalog/session, P4 code facts and case anchors,
+	// P0 eventing/audit, the read-only HTTP prober and the export filesystem)
+	// and the manual graph service. The graph service is built before the agent
+	// tool registry because the six case_* tools consume it; the run coordinator
+	// needs the P1 session/run services, so it is built after p1Agents.bind.
+	mindmapGraphTx := mindmappostgres.NewGraphTx(database.Pool)
+	mindmapNodes := mindmappostgres.NewNodeRepository(database.Pool)
+	mindmapSteps := mindmappostgres.NewStepRepository(database.Pool)
+	mindmapAssertions := mindmappostgres.NewAssertionRepository(database.Pool)
+	mindmapSources := mindmappostgres.NewSourceRepository(database.Pool)
+	mindmapReviews := mindmappostgres.NewReviewRepository(database.Pool)
+	mindmapFindings := mindmappostgres.NewFindingRepository(database.Pool)
+	mindmapBaselines := mindmappostgres.NewBaselineRepository(database.Pool)
+	mindmapRuns := mindmappostgres.NewRunRepository(database.Pool)
+	mindmapExports := mindmappostgres.NewExportRepository(database.Pool)
+
+	mindmapLifecycle := mindmapversion.NewLifecycleAdapter(versionService)
+	mindmapRequirements := mindmapversion.NewRequirementReader(
+		requirementService, relationService, attachmentService)
+	mindmapCatalog := mindmapresource.NewCatalogAdapter(catalogService, catalogService)
+	mindmapSessions := mindmapresource.NewSessionAdapter(sessionService, wallClock{})
+	mindmapCodeFacts := mindmapcodeintel.NewCodeFactsAdapter(codeIntelAnalysis, codeIntelQuery, versionService)
+	mindmapAnchors := mindmapcodeintel.NewAnchorAdapter(codeIntelAnchor)
+	mindmapEvents := mindmapeventing.NewEventPublisher(eventService)
+	mindmapAudit := mindmapaudit.NewAuditRecorder(auditor)
+	// The prober's configured allowlist is deliberately empty: every probe
+	// carries the environment base host + allowed_hosts explicitly (the
+	// application.Prober contract), so one shared client serves every
+	// environment without weakening the SSRF host check.
+	mindmapProber := mindmaphttpclient.New(mindmaphttpclient.Options{})
+	// Export files live on the filesystem (D30); the store confines every path
+	// to this root and writes 0600 files below 0700 directories. The root is
+	// created eagerly so a missing EZTEST_EXPORT_DIR fails at startup instead of
+	// on the first export request.
+	if err := os.MkdirAll(cfg.ExportDir, mindmapExportDirPerm); err != nil {
+		return fmt.Errorf("create mindmap export directory %q: %w", cfg.ExportDir, err)
+	}
+	mindmapExportStore, err := mindmapfilestore.New(cfg.ExportDir)
+	if err != nil {
+		return fmt.Errorf("configure mindmap export store (EZTEST_EXPORT_DIR=%q): %w", cfg.ExportDir, err)
+	}
+
+	mindmapGraph := mindmapapp.NewGraphService(mindmapapp.GraphDeps{
+		Graph:        mindmapGraphTx,
+		Nodes:        mindmapNodes,
+		Steps:        mindmapSteps,
+		Assertions:   mindmapAssertions,
+		Sources:      mindmapSources,
+		Baselines:    mindmapBaselines,
+		Versions:     mindmapLifecycle,
+		Requirements: mindmapRequirements,
+		Anchors:      mindmapAnchors,
+		Events:       mindmapEvents,
+		IDs:          snowflake,
+		Clock:        wallClock{},
+		Logger:       logger,
+	})
+
 	// Agent runtime: the four postgres repositories, the cross-context adapters
 	// (LLM gateway, event sink, audit sink) and the tool registry. The same
 	// registry instance backs both the run service and the HTTP tool catalog, so
@@ -493,6 +569,20 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Analyses: codeIntelAnalysis,
 		Anchors:  codeIntelAnchor,
 	})...)
+	// The six P5 mindmap tools are appended the same way, before NewToolRegistry,
+	// so ensureP5Profiles below validates their allowlists against the live
+	// registry the P5 runs use (design spec §8.1/§8.2). NewTools fails closed
+	// (returns nil) when a required port is missing, which the startup profile
+	// validation then reports as an unregistered tool.
+	agentToolList = append(agentToolList, mindmapagenttools.NewTools(mindmapagenttools.ToolDeps{
+		Graphs:   mindmapGraph,
+		Runs:     mindmapRuns,
+		Catalog:  mindmapCatalog,
+		Prober:   mindmapProber,
+		Anchors:  mindmapAnchors,
+		Findings: mindmapFindings,
+		Audit:    mindmapAudit,
+	})...)
 	agentRegistry := agentapp.NewToolRegistry(agentToolList...)
 	agentExecutor := agentapp.NewToolExecutor(
 		agentRegistry, agentAuditSink, time.Duration(cfg.AgentToolTimeoutMS)*time.Millisecond)
@@ -519,6 +609,82 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	// server can accept a clarification request.
 	p1Agents.bind(agentSessionService, runService)
 
+	// The remaining P5 services. The run coordinator polls the P1 agent runtime
+	// through the mindmap adapter, so it is built once both P1 services exist;
+	// the review, baseline and export services then consume the run coordinator
+	// and the graph repositories.
+	mindmapAgentRuntime := mindmapagent.NewAgentRuntimeAdapter(
+		agentProfileService, agentProfiles, agentSessionService, runService)
+	mindmapRun := mindmapapp.NewRunService(mindmapapp.RunDeps{
+		Runs:         mindmapRuns,
+		Graph:        mindmapGraphTx,
+		Baselines:    mindmapBaselines,
+		Nodes:        mindmapNodes,
+		Steps:        mindmapSteps,
+		Assertions:   mindmapAssertions,
+		Sources:      mindmapSources,
+		Versions:     mindmapLifecycle,
+		Requirements: mindmapRequirements,
+		Catalog:      mindmapCatalog,
+		CodeFacts:    mindmapCodeFacts,
+		Anchors:      mindmapAnchors,
+		Agents:       mindmapAgentRuntime,
+		Events:       mindmapEvents,
+		IDs:          snowflake,
+		Clock:        wallClock{},
+	})
+	mindmapBaseline := mindmapapp.NewBaselineService(mindmapapp.BaselineDeps{
+		Graph:      mindmapGraphTx,
+		Nodes:      mindmapNodes,
+		Steps:      mindmapSteps,
+		Assertions: mindmapAssertions,
+		Sources:    mindmapSources,
+		Reviews:    mindmapReviews,
+		Baselines:  mindmapBaselines,
+		Versions:   mindmapLifecycle,
+		IDs:        snowflake,
+		Clock:      wallClock{},
+	})
+	mindmapReview := mindmapapp.NewReviewService(mindmapapp.ReviewDeps{
+		Runs:      mindmapRun,
+		Reviews:   mindmapReviews,
+		Findings:  mindmapFindings,
+		Baselines: mindmapBaselines,
+		Versions:  mindmapLifecycle,
+		Events:    mindmapEvents,
+		Baseline:  mindmapBaseline,
+		IDs:       snowflake,
+		Clock:     wallClock{},
+	})
+	mindmapExport := mindmapapp.NewExportService(mindmapapp.ExportDeps{
+		Versions:     mindmapLifecycle,
+		Requirements: mindmapRequirements,
+		Nodes:        mindmapNodes,
+		Steps:        mindmapSteps,
+		Assertions:   mindmapAssertions,
+		Sources:      mindmapSources,
+		Findings:     mindmapFindings,
+		Baselines:    mindmapBaselines,
+		Exports:      mindmapExports,
+		Anchors:      mindmapAnchors,
+		Store:        mindmapExportStore,
+		Events:       mindmapEvents,
+		Audit:        mindmapAudit,
+		IDs:          snowflake,
+		Clock:        wallClock{},
+		Logger:       logger,
+	})
+	mindmapExplore := mindmapapp.NewExploreService(mindmapapp.ExploreDeps{
+		Versions: mindmapLifecycle,
+		Catalog:  mindmapCatalog,
+		Sessions: mindmapSessions,
+		Prober:   mindmapProber,
+		Runs:     mindmapRuns,
+		Events:   mindmapEvents,
+		IDs:      snowflake,
+		Clock:    wallClock{},
+	})
+
 	// Startup seeds and cleanup are idempotent: the builtin profile is created
 	// only when its key is absent (an existing, possibly edited row is never
 	// overwritten) and runs left running by a previous process are marked
@@ -531,11 +697,53 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	if err := ensureP3Profiles(startupCtx, agentProfiles, agentRegistry, logger); err != nil {
 		return err
 	}
+	if err := ensureP5Profiles(startupCtx, mindmapAgentRuntime, agentRegistry, logger); err != nil {
+		return err
+	}
 	if recovered, err := runService.RecoverInterrupted(startupCtx); err != nil {
 		return fmt.Errorf("recover interrupted agent runs: %w", err)
 	} else if recovered > 0 {
 		logger.Info("marked interrupted agent runs", "count", recovered)
 	}
+
+	// The P5 run coordinator is a single in-process worker: it polls the agent
+	// sessions every 2 s (spec §8.4) and first fails the runs a previous process
+	// left queued/running (reason worker_restart) so the per-kind single-flight
+	// slot is never stuck. The deferred stop is registered after database.Close
+	// and therefore runs before it.
+	if recovered, err := mindmapRun.RecoverStale(startupCtx); err != nil {
+		return fmt.Errorf("recover stale mindmap runs: %w", err)
+	} else if recovered > 0 {
+		logger.Info("marked stale mindmap runs failed", "count", recovered)
+	}
+	mindmapWorkerCtx, cancelMindmapWorker := context.WithCancel(context.Background())
+	mindmapRun.Worker(mindmapWorkerCtx)
+	defer func() {
+		cancelMindmapWorker()
+		mindmapRun.Stop()
+	}()
+
+	// The P5 handler group consumes the five services plus the read-only readers
+	// the handlers need next to them: node revisions (the create-step/assertion
+	// bodies carry no token), run pages, findings, case anchors, the frozen
+	// baseline, the export metadata lookup and the version lifecycle.
+	mindmapHandler := mindmaphttp.NewHandler(mindmaphttp.Deps{
+		Graph:     mindmapGraph,
+		Runs:      mindmapRun,
+		Explore:   mindmapExplore,
+		Reviews:   mindmapReview,
+		Exports:   mindmapExport,
+		Nodes:     mindmapNodes,
+		RunStore:  mindmapRuns,
+		Findings:  mindmapFindings,
+		Anchors:   mindmapAnchors,
+		CodeFacts: mindmapCodeFacts,
+		Baselines: mindmapBaselines,
+		ExportIdx: mindmapExports,
+		Versions:  mindmapLifecycle,
+		Events:    mindmapEvents,
+		Logger:    logger,
+	})
 
 	// The P3 HTTP handlers consume the version services, the two aggregate
 	// readers implemented by the repositories, the P2 catalog adapter, the P1
@@ -593,6 +801,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 			Resources: resourceHandlers,
 			Version:   versionHandlers,
 			CodeIntel: codeIntelHandler,
+			Mindmap:   mindmapHandler,
 		}),
 		BaseContext:       baseContext(baseCtx),
 		ReadHeaderTimeout: 10 * time.Second,
@@ -732,6 +941,31 @@ func ensureP3Profiles(ctx context.Context, profiles *agentpostgres.ProfileReposi
 			logger.Info("seeded P3 agent profile", "key", profile.Key)
 		}
 	}
+	return nil
+}
+
+// ensureP5Profiles seeds the four P5 mindmap agent profiles (spec §8.1) and
+// validates every allowed tool against the live registry before the first seed,
+// exactly like ensureP3Profiles: a profile that allows an unregistered tool would
+// silently offer fewer tools than it declares, and the case_* tool names must
+// match the six tools registered above. EnsureProfile delegates to the P1 seed
+// writer, which only inserts a missing key: an admin-edited row is never
+// overwritten, so restarts keep the edited prompts and budgets.
+func ensureP5Profiles(ctx context.Context, runtime mindmapapp.AgentRuntime, registry *agentapp.ToolRegistry, logger *slog.Logger) error {
+	seeds := mindmapdomain.P5Profiles()
+	for _, profile := range seeds {
+		for _, name := range profile.AllowedTools {
+			if tool, ok := registry.Get(name); !ok || tool == nil {
+				return fmt.Errorf("P5 agent profile %q allows tool %q, which is not registered", profile.Key, name)
+			}
+		}
+	}
+	for _, profile := range seeds {
+		if err := runtime.EnsureProfile(ctx, profile); err != nil {
+			return fmt.Errorf("seed P5 agent profile %q: %w", profile.Key, err)
+		}
+	}
+	logger.Debug("ensured P5 agent profiles", "count", len(seeds))
 	return nil
 }
 
