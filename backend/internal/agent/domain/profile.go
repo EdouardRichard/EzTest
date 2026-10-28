@@ -12,7 +12,7 @@ import (
 // profile. It is seeded once at startup and can never be renamed or deleted.
 const BuiltinProfileKey = "runtime-diagnostic"
 
-// profileKeyPattern mirrors the agent_profiles.key CHECK constraint.
+// profileKeyPattern mirrors the agent_profile.key CHECK constraint.
 const profileKeyPattern = `^[a-z][a-z0-9_-]*$`
 
 // Validation bounds from the design spec §10.3. They mirror the DDL checks so
@@ -43,7 +43,7 @@ const (
 var profileKeyRE = regexp.MustCompile(profileKeyPattern)
 
 // AgentProfile is an agent configuration. Field values are persisted in
-// agent_profiles; Model is empty to use the default LLM configuration's model,
+// agent_profile; Model is empty to use the default LLM configuration's model,
 // and MaxTurns is 0 for "unlimited".
 type AgentProfile struct {
 	ID          int64

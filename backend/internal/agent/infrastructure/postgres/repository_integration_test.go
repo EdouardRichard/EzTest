@@ -53,7 +53,7 @@ func TestMigrateAndCreateTurnIsAtomic(t *testing.T) {
 
 	// The migration must create all four tables (migrating twice is covered by
 	// the P0 migration tests).
-	for _, table := range []string{"agent_profiles", "agent_sessions", "agent_runs", "agent_messages"} {
+	for _, table := range []string{"agent_profile", "agent_session", "agent_run", "agent_message"} {
 		var exists bool
 		if err := pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, table).Scan(&exists); err != nil {
 			t.Fatalf("check table %s: %v", table, err)
@@ -124,7 +124,7 @@ func TestMigrateAndCreateTurnIsAtomic(t *testing.T) {
 		t.Fatalf("messages after failed turn=%d want 1", len(listed))
 	}
 	var runCount int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM agent_runs WHERE session_id = $1`, session.ID).Scan(&runCount); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM agent_run WHERE session_id = $1`, session.ID).Scan(&runCount); err != nil {
 		t.Fatalf("count runs: %v", err)
 	}
 	if runCount != 1 {

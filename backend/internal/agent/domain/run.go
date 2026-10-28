@@ -7,7 +7,7 @@ import (
 )
 
 // RunStatus is the lifecycle state of one run. The values mirror the
-// agent_runs.status CHECK constraint.
+// agent_run.status CHECK constraint.
 type RunStatus string
 
 const (
@@ -29,7 +29,7 @@ func (s RunStatus) Valid() bool {
 }
 
 // TerminalReason records why a run reached its terminal status. The values
-// mirror the agent_runs.terminal_reason CHECK constraint.
+// mirror the agent_run.terminal_reason CHECK constraint.
 type TerminalReason string
 
 const (

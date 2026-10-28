@@ -28,8 +28,8 @@ func NewSessionRepository(pool *pgxpool.Pool) *SessionRepository {
 
 // sessionSelect joins the profile so every returned session carries ProfileKey.
 const sessionSelect = `SELECT s.id, s.profile_id, p.key, s.title, s.created_by, s.created_at, s.updated_at, s.last_activity_at, s.activity_channel, s.activity_version_id
-	FROM agent_sessions s
-	JOIN agent_profiles p ON p.id = s.profile_id`
+	FROM agent_session s
+	JOIN agent_profile p ON p.id = s.profile_id`
 
 // scanSession scans one session row in the order Get/Create/UpdateTitle return.
 func scanSession(row rowScanner) (agent.Session, error) {
@@ -156,15 +156,15 @@ func (r *SessionRepository) List(ctx context.Context, cursor int64, limit int, p
 		return nil, false, fmt.Errorf("postgres: list agent sessions: limit must be positive")
 	}
 	query := fmt.Sprintf(`SELECT %s, %s, %s
-	FROM agent_sessions s
-	JOIN agent_profiles p ON p.id = s.profile_id
+	FROM agent_session s
+	JOIN agent_profile p ON p.id = s.profile_id
 	LEFT JOIN LATERAL (
-		SELECT * FROM agent_runs
+		SELECT * FROM agent_run
 		WHERE session_id = s.id AND status = 'running'
 		ORDER BY id DESC LIMIT 1
 	) ar ON true
 	LEFT JOIN LATERAL (
-		SELECT * FROM agent_runs
+		SELECT * FROM agent_run
 		WHERE session_id = s.id AND status <> 'running'
 		ORDER BY id DESC LIMIT 1
 	) lr ON true
@@ -229,13 +229,13 @@ func (r *SessionRepository) Create(ctx context.Context, profileID int64, title s
 // reported as ErrNotFound (the profile_id foreign key rejects it).
 func (r *SessionRepository) CreateWithOptions(ctx context.Context, profileID int64, title string, createdBy *int64, channel string, versionID *string) (agent.Session, error) {
 	const query = `WITH ins AS (
-		INSERT INTO agent_sessions (profile_id, title, created_by, activity_channel, activity_version_id)
+		INSERT INTO agent_session (profile_id, title, created_by, activity_channel, activity_version_id)
 		VALUES ($1, $2, $3, $4, $5)
 		RETURNING id, profile_id, title, created_by, created_at, updated_at, last_activity_at, activity_channel, activity_version_id
 	)
 	SELECT ins.id, ins.profile_id, p.key, ins.title, ins.created_by, ins.created_at, ins.updated_at, ins.last_activity_at, ins.activity_channel, ins.activity_version_id
 	FROM ins
-	JOIN agent_profiles p ON p.id = ins.profile_id`
+	JOIN agent_profile p ON p.id = ins.profile_id`
 	session, err := scanSession(r.pool.QueryRow(ctx, query, profileID, title, createdBy, channel, versionID))
 	if err != nil {
 		if mapped := mapForeignKeyViolation(err); mapped != nil {
@@ -261,14 +261,14 @@ func (r *SessionRepository) Get(ctx context.Context, id int64) (agent.Session, e
 // UpdateTitle changes the session title and returns the stored row.
 func (r *SessionRepository) UpdateTitle(ctx context.Context, id int64, title string) (agent.Session, error) {
 	const query = `WITH upd AS (
-		UPDATE agent_sessions
+		UPDATE agent_session
 		   SET title = $2, updated_at = now()
 		 WHERE id = $1
 		RETURNING id, profile_id, title, created_by, created_at, updated_at, last_activity_at, activity_channel, activity_version_id
 	)
 	SELECT upd.id, upd.profile_id, p.key, upd.title, upd.created_by, upd.created_at, upd.updated_at, upd.last_activity_at, upd.activity_channel, upd.activity_version_id
 	FROM upd
-	JOIN agent_profiles p ON p.id = upd.profile_id`
+	JOIN agent_profile p ON p.id = upd.profile_id`
 	session, err := scanSession(r.pool.QueryRow(ctx, query, id, title))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -285,8 +285,8 @@ func (r *SessionRepository) UpdateTitle(ctx context.Context, id int64, title str
 func (r *SessionRepository) HasRunningByChannel(ctx context.Context, channel string) (bool, error) {
 	const query = `SELECT EXISTS (
 		SELECT 1
-		FROM agent_runs r
-		JOIN agent_sessions s ON s.id = r.session_id
+		FROM agent_run r
+		JOIN agent_session s ON s.id = r.session_id
 		WHERE s.activity_channel = $1 AND r.status = 'running'
 	)`
 	var exists bool
@@ -298,7 +298,7 @@ func (r *SessionRepository) HasRunningByChannel(ctx context.Context, channel str
 
 // Delete removes a session. Messages and runs cascade in the schema.
 func (r *SessionRepository) Delete(ctx context.Context, id int64) error {
-	tag, err := r.pool.Exec(ctx, `DELETE FROM agent_sessions WHERE id = $1`, id)
+	tag, err := r.pool.Exec(ctx, `DELETE FROM agent_session WHERE id = $1`, id)
 	if err != nil {
 		return fmt.Errorf("postgres: delete agent session: %w", err)
 	}

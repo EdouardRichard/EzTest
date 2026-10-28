@@ -674,7 +674,7 @@ func abortCodeFromCause(cause error) (code, message string) {
 
 // CodedError is implemented by port errors that carry a stable public error
 // code. The LLM gateway adapter wraps llm_* codes in an error implementing
-// ErrorCode() so the runner can persist the precise code in agent_runs.
+// ErrorCode() so the runner can persist the precise code in agent_run.
 type CodedError interface {
 	error
 	ErrorCode() string
