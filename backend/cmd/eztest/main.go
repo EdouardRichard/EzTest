@@ -1023,6 +1023,11 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Clock:    wallClock{},
 		IDs:      snowflake,
 		MaxCases: cfg.ExecMaxCasesPerBatch,
+		// D49 commit pinning (spec §6.8): a baseline/incremental batch records
+		// the version's fixed-branch head and the parent-head ancestry, so the
+		// autonomy worker's P4 impact step has an analysable range. Without it
+		// head_commit stays NULL and the worker skips impact (the T28 gap).
+		CodeHistory: executionCodeHistory(codeIntelVersions, codeIntelRepos, codeIntelGit),
 	})
 	executionReportService := executionapp.NewReportService(
 		executionBatches, executionCaseRuns, executionSteps, executionAssertions,
@@ -1711,6 +1716,16 @@ func (h *autonomyTriggerHolder) OnBatchTerminal(ctx context.Context, batch execu
 // composition-root adapter contract in the wiring tests.
 func newAutonomyDeliveryPort(issues executiondelivery.RequirementGapWriter) executionapp.DeliveryPort {
 	return executiondelivery.NewRequirementGapIssues(issues)
+}
+
+// executionCodeHistory builds the D49 commit surface of BatchServiceDeps
+// (spec §6.8): the codeintel version/repository catalogs and the read-only Git
+// reader already wired for P4. A version without an active code repository
+// binding degrades inside BatchService to head_commit=NULL; without this
+// adapter the autonomy worker's automatic P4 impact step has no analysable
+// range and is skipped (Task 28 residual gap).
+func executionCodeHistory(versions codeintelapp.VersionCatalog, repos codeintelapp.RepoCatalog, git codeintelapp.GitReader) executionapp.CodeHistoryPort {
+	return executioncodeintel.NewCodeHistory(versions, repos, git)
 }
 
 // p7WorkerStopper is the stop surface of the P7 background loops.
