@@ -30,3 +30,11 @@ mindmap_0001_cases.sql
 execution_0001_batches.sql
 version_0004_execution_state.sql
 resource_0006_auth_flows.sql
+delivery_0001_issue.sql
+delivery_0002_report.sql
+delivery_0003_analysis.sql
+resource_0007_db_target.sql
+version_0005_continue.sql
+execution_0002_autonomy.sql
+mindmap_0002_supplement.sql
+codeintel_0005_issue_anchor.sql
