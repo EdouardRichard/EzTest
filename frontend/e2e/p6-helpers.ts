@@ -217,6 +217,12 @@ export type ExecutionSeedOptions = {
   caseTitle?: string
   /** Import one valid fixture session; defaults to true (spec §10.5 step 1). */
   seedSession?: boolean
+  /**
+   * Extra snapshot steps appended before the mindmap review. The deterministic
+   * fake run records them one per turn, which widens the pause window the
+   * graceful-pause E2E needs to observe a non-empty checkpoint.
+   */
+  extraSteps?: number
 }
 
 /** The resources the execution E2E needs to run one batch. */
@@ -377,16 +383,29 @@ export async function seedExecutionVersion(
   const suffix = options.suffix ?? uniqueSuffix()
   const fixtureUrl = options.fixtureUrl ?? fixtureTargetUrl()
   const seedSession = options.seedSession !== false
+  const extraSteps = Math.max(0, Math.trunc(options.extraSteps ?? 0))
 
   // Reuse the proven P3/P5 seed: system + environment (fixture host allow-list)
   // + code repository + version bound to two confirmed requirements + designing.
   const base = await seedMindmapVersion(request, { suffix, fixtureUrl })
   const token = base.token
 
-  // Keep the fixture host and allow auto-login for the session/takeover specs.
+  // Allow auto-login for the session/takeover specs and configure the
+  // environment login_check the import path uses to validate a captured state
+  // (without it an import degrades to needs_manual, spec §6.3).
   const envResponse = await request.patch(
     `${API_URL}/api/resources/environments/${base.environmentId}`,
-    { headers: authHeaders(token), data: { allowAutoLogin: true } },
+    {
+      headers: authHeaders(token),
+      data: {
+        allowAutoLogin: true,
+        loginCheck: {
+          url: "/p6/home",
+          expectStatus: [200],
+          bodyContains: "P6 Home",
+        },
+      },
+    },
   )
   await readData(envResponse, 200, "patch execution environment")
 
@@ -461,6 +480,14 @@ export async function seedExecutionVersion(
     action: "提交新建订单并确认创建成功",
     expected: "订单详情显示新订单号",
   })
+  const stepIds = [firstStep.id, secondStep.id]
+  for (let index = 0; index < extraSteps; index += 1) {
+    const extra = await postMindmapStep(request, token, base.version.id, caseNode.id, {
+      action: `执行补充步骤 ${index + 1} 并核对页面状态`,
+      expected: `补充步骤 ${index + 1} 的页面状态正确`,
+    })
+    stepIds.push(extra.id)
+  }
   const assertion = await postMindmapAssertion(request, token, base.version.id, caseNode.id, {
     stepId: secondStep.id,
     kind: "ui",
@@ -511,7 +538,7 @@ export async function seedExecutionVersion(
     requirements: base.requirements,
     scenarioNodeId: scenario.id,
     caseNodeId: caseNode.id,
-    stepIds: [firstStep.id, secondStep.id],
+    stepIds,
     assertionIds: [assertion.id],
     authFlowId: authFlow.id,
     accountId: account.id,

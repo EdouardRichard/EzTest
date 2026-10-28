@@ -7,9 +7,10 @@
     Initialises/resets the eztest_e2e database from EZTEST_DATABASE_URL, builds and
     starts the API on :13333 with EZTEST_HTTP_ADDR=:13333, starts the Next.js web app
     on :6868, starts the deterministic fixture target on :13335 (design spec §9.2),
-    runs the Playwright suite with the installed Chrome/Edge channel, and stops all
-    processes on exit. Secrets are read from the gitignored .env and are never
-    printed.
+    starts the real Playwright executor on :13336 with a shared bearer token (P6,
+    design spec §10.5), runs the Playwright suite with the installed Chrome/Edge
+    channel, and stops all processes on exit. Secrets are read from the gitignored
+    .env and are never printed.
 
 .NOTES
     Compatible with Windows PowerShell 5.1 and PowerShell 7+.
@@ -33,11 +34,15 @@ $apiPort = 13333
 $webPort = 6868
 $fakeLlmPort = 13334
 $fixturePort = 13335
+$executorPort = 13336
 $apiBaseUrl = "http://localhost:$apiPort"
 $webBaseUrl = "http://localhost:$webPort"
 $fakeLlmBaseUrl = "http://127.0.0.1:$fakeLlmPort"
 $fixtureBaseUrl = "http://127.0.0.1:$fixturePort"
+$executorBaseUrl = "http://127.0.0.1:$executorPort"
 $p3AttachmentDir = Join-Path $tmpDir "p3-attachments"
+$evidenceDir = Join-Path $tmpDir "e2e-evidence"
+$executorDir = Join-Path $repoRoot "executor"
 $p4FixtureScript = Join-Path $PSScriptRoot "fixture-codeintel-repo.ps1"
 
 New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
@@ -188,6 +193,7 @@ $apiProcess = $null
 $webProcess = $null
 $fakeProcess = $null
 $fixtureProcess = $null
+$executorProcess = $null
 $apiOut = Join-Path $tmpDir "e2e-api.out.log"
 $apiErr = Join-Path $tmpDir "e2e-api.err.log"
 $webOut = Join-Path $tmpDir "e2e-web.out.log"
@@ -197,6 +203,8 @@ $fakeErr = Join-Path $tmpDir "e2e-fake-llm.err.log"
 $fakeRequestLog = Join-Path $tmpDir "fake-llm-requests.jsonl"
 $fixtureLog = Join-Path $tmpDir "fixture-target.log"
 $fixtureErr = Join-Path $tmpDir "fixture-target.err.log"
+$executorOut = Join-Path $tmpDir "e2e-executor.out.log"
+$executorErr = Join-Path $tmpDir "e2e-executor.err.log"
 $playwrightLog = Join-Path $tmpDir "e2e-playwright.log"
 
 try {
@@ -204,6 +212,7 @@ try {
     Assert-PortFree -Port $webPort
     Assert-PortFree -Port $fakeLlmPort
     Assert-PortFree -Port $fixturePort
+    Assert-PortFree -Port $executorPort
 
     if (-not (Test-Path -LiteralPath (Join-Path $frontendDir "node_modules\next\dist\bin\next"))) {
         throw "frontend/node_modules is missing; run pnpm install in frontend first"
@@ -211,11 +220,31 @@ try {
     if (-not (Test-Path -LiteralPath (Join-Path $frontendDir "node_modules\.bin\playwright.CMD"))) {
         throw "frontend/node_modules/.bin/playwright.CMD is missing; run pnpm install in frontend first"
     }
+    if (-not (Test-Path -LiteralPath (Join-Path $executorDir "node_modules"))) {
+        throw "executor/node_modules is missing; run pnpm install in executor first"
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $executorDir "src\server.mjs"))) {
+        throw "executor/src/server.mjs is missing; the P6 E2E needs the real browser executor"
+    }
 
     $envValues = Read-DotEnv -Path (Join-Path $repoRoot ".env")
     $databaseUrl = Get-RequiredValue -Values $envValues -Key "EZTEST_DATABASE_URL"
     $adminUsername = Get-RequiredValue -Values $envValues -Key "EZTEST_ADMIN_USERNAME"
     $adminPassword = Get-RequiredValue -Values $envValues -Key "EZTEST_ADMIN_PASSWORD"
+
+    # The bearer token shared by the API and the executor (design spec §5.6).
+    # .env wins, then the caller's environment; a deterministic test-only token
+    # keeps a developer .env without the P6 section usable. It is never printed.
+    $executorToken = ""
+    if ($envValues.ContainsKey("EZTEST_EXECUTOR_TOKEN")) {
+        $executorToken = [string]$envValues["EZTEST_EXECUTOR_TOKEN"]
+    }
+    if ([string]::IsNullOrWhiteSpace($executorToken)) {
+        $executorToken = $env:EZTEST_EXECUTOR_TOKEN
+    }
+    if ([string]::IsNullOrWhiteSpace($executorToken)) {
+        $executorToken = "eztest-e2e-executor-token"
+    }
 
     $databaseUri = [System.Uri]$databaseUrl
     if (-not $databaseUri.IsAbsoluteUri) {
@@ -360,6 +389,16 @@ try {
     Wait-ForHttp -Url "$fakeLlmBaseUrl/v1/models" -TimeoutSeconds 30 -Process $fakeProcess -Label "Fake LLM"
     Write-Host "Fake LLM is ready at $fakeLlmBaseUrl"
 
+    # P6 execution E2E state: the evidence file store and the executor endpoint
+    # the API and the browser tools use (design spec §5.6/§5.7).
+    if (Test-Path -LiteralPath $evidenceDir) {
+        Remove-Item -LiteralPath $evidenceDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    New-Item -ItemType Directory -Force -Path $evidenceDir | Out-Null
+    $env:EZTEST_EVIDENCE_DIR = $evidenceDir
+    $env:EZTEST_EXECUTOR_URL = $executorBaseUrl
+    $env:EZTEST_EXECUTOR_TOKEN = $executorToken
+
     Write-Step "Starting API on :$apiPort (database $e2eDbName)"
     # cmd/eztest applies all pending migrations (including P4 codeintel) on
     # startup, before /api/health reports healthy.
@@ -428,6 +467,26 @@ try {
     Wait-ForHttp -Url "$fixtureBaseUrl/health" -TimeoutSeconds 10 -Process $fixtureProcess -Label "Fixture target"
     Write-Host "Fixture target is ready at $fixtureBaseUrl"
 
+    Write-Step "Starting real executor on :$executorPort"
+    # The P6 E2E drives the real Playwright executor through the API's browser
+    # tools (design spec §10.5): same bearer token as the API, loopback address,
+    # and its own health probe before Playwright starts.
+    $env:EZTEST_EXECUTOR_ADDR = "127.0.0.1:$executorPort"
+    if ([string]::IsNullOrWhiteSpace($env:EZTEST_EXECUTOR_MAX_CONTEXTS)) {
+        $env:EZTEST_EXECUTOR_MAX_CONTEXTS = "8"
+    }
+    Remove-Item -LiteralPath $executorOut, $executorErr -ErrorAction SilentlyContinue
+    $executorServer = Join-Path $executorDir "src\server.mjs"
+    $executorProcess = Start-Process -FilePath $nodeExe `
+        -ArgumentList "`"$executorServer`"" `
+        -WorkingDirectory $executorDir `
+        -RedirectStandardOutput $executorOut `
+        -RedirectStandardError $executorErr `
+        -WindowStyle Hidden `
+        -PassThru
+    Wait-ForHttp -Url "$executorBaseUrl/healthz" -TimeoutSeconds 120 -Process $executorProcess -Label "Executor"
+    Write-Host "Executor is healthy at $executorBaseUrl"
+
     Write-Step "Running Playwright (channel: $channel, database: $e2eDbName)"
     $env:EZTEST_E2E_ADMIN_USERNAME = $adminUsername
     $env:EZTEST_E2E_ADMIN_PASSWORD = $adminPassword
@@ -441,6 +500,10 @@ try {
     $env:EZTEST_E2E_FAKE_LLM_LOG = $fakeRequestLog
     $env:EZTEST_E2E_DATABASE_URL = $e2eDatabaseUrl
     $env:EZTEST_E2E_PSQL = $psqlExe
+    # The P6 execution spec watches/controls the real executor: it needs the
+    # health URL and the process id for the executor-down 503 negative.
+    $env:EZTEST_E2E_EXECUTOR_URL = $executorBaseUrl
+    $env:EZTEST_E2E_EXECUTOR_PID = "$($executorProcess.Id)"
     # The harness may set both NO_COLOR and FORCE_COLOR; Node then prints a
     # warning to stderr, which Windows PowerShell surfaces as a noisy error
     # record while the Playwright output is redirected to a file.
@@ -479,15 +542,18 @@ try {
     Write-LogTail -Path $webErr -Label "Web stderr" -Lines 80
     Write-LogTail -Path $fixtureLog -Label "Fixture target stdout" -Lines 40
     Write-LogTail -Path $fixtureErr -Label "Fixture target stderr" -Lines 40
+    Write-LogTail -Path $executorOut -Label "Executor stdout" -Lines 60
+    Write-LogTail -Path $executorErr -Label "Executor stderr" -Lines 60
     Write-LogTail -Path $playwrightLog -Label "Playwright" -Lines 120
 } finally {
     Write-Step "Cleaning up"
+    Stop-ProcessTree -Process $executorProcess
     Stop-ProcessTree -Process $webProcess
     Stop-ProcessTree -Process $apiProcess
     Stop-ProcessTree -Process $fakeProcess
     Stop-ProcessTree -Process $fixtureProcess
     Start-Sleep -Milliseconds 500
-    foreach ($port in @($webPort, $apiPort, $fakeLlmPort, $fixturePort)) {
+    foreach ($port in @($webPort, $apiPort, $fakeLlmPort, $fixturePort, $executorPort)) {
         $listeners = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue
         if ($listeners) {
             Write-Host "WARNING: port $port still has a listener after cleanup" -ForegroundColor Yellow
@@ -495,9 +561,15 @@ try {
     }
     Remove-Item Env:EZTEST_E2E_ADMIN_PASSWORD -ErrorAction SilentlyContinue
     Remove-Item Env:PGPASSWORD -ErrorAction SilentlyContinue
-    # The attachment root and the P3 throwaway resources are test-only files.
+    # The executor token is only needed by the API/executor children above.
+    Remove-Item Env:EZTEST_EXECUTOR_TOKEN -ErrorAction SilentlyContinue
+    # The attachment root, the evidence store and the P3 throwaway resources are
+    # test-only files.
     if (Test-Path -LiteralPath $p3AttachmentDir) {
         Remove-Item -LiteralPath $p3AttachmentDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if (Test-Path -LiteralPath $evidenceDir) {
+        Remove-Item -LiteralPath $evidenceDir -Recurse -Force -ErrorAction SilentlyContinue
     }
     Remove-Item -LiteralPath (Join-Path $tmpDir "p3-e2e-repo") -Recurse -Force -ErrorAction SilentlyContinue
 }
