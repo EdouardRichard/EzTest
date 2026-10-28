@@ -72,9 +72,14 @@ type IssueCodeRefReader interface {
 }
 
 // Compile-time proof that the production services satisfy the consumer ports.
+// The global centres are served by the T17b GlobalReaderService, whose stores are
+// the delivery postgres readers and whose version names come from the version
+// context adapter.
 var (
-	_ ReportService   = (*deliveryapp.ReportService)(nil)
-	_ AnalysisService = (*deliveryapp.AnalysisService)(nil)
+	_ ReportService      = (*deliveryapp.ReportService)(nil)
+	_ AnalysisService    = (*deliveryapp.AnalysisService)(nil)
+	_ GlobalIssueReader  = (*deliveryapp.GlobalReaderService)(nil)
+	_ GlobalReportReader = (*deliveryapp.GlobalReaderService)(nil)
 )
 
 // HandlerDeps is the dependency set of the delivery HTTP handlers. Every field
