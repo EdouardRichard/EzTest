@@ -55,6 +55,9 @@ type fakeCodeQuery struct {
 	entities    []codeinteldomain.CodeEntity
 	factsRepo   int64
 	factsFilter codeinteldomain.EntityFilter
+	treeEntries []codeinteldomain.TreeEntry
+	treeRepo    int64
+	treeCommit  string
 }
 
 // File implements the codeintel commit-pinned file read.
@@ -71,6 +74,17 @@ func (f *fakeCodeQuery) Facts(_ context.Context, repoID int64, filter codeinteld
 	f.factsRepo = repoID
 	f.factsFilter = filter
 	return f.entities, "", false, nil
+}
+
+// Tree implements the codeintel commit-pinned file tree read.
+func (f *fakeCodeQuery) Tree(_ context.Context, repoID int64, _, commit, _ string, limit int) (codeinteldomain.TreePage, error) {
+	f.treeRepo = repoID
+	f.treeCommit = commit
+	entries := f.treeEntries
+	if limit > 0 && len(entries) > limit {
+		entries = entries[:limit]
+	}
+	return codeinteldomain.TreePage{Commit: commit, Entries: entries}, nil
 }
 
 // fakeVersionReader returns one version binding.
@@ -265,5 +279,35 @@ func TestCodeFactsAdapterMapsOperationalErrors(t *testing.T) {
 	adapter := mindmapcodeintel.NewCodeFactsAdapter(&fakeAnalysisReader{err: operational}, &fakeCodeQuery{}, &fakeVersionReader{})
 	if _, err := adapter.GetLatestAnalysis(ctx, 7); !errors.Is(err, operational) {
 		t.Fatalf("GetLatestAnalysis error=%v want the operational error", err)
+	}
+}
+
+// TestCodeFactsAdapterListBaselineFiles covers the T0 fallback: paths come from
+// the version's baseline commit tree and directories are skipped.
+func TestCodeFactsAdapterListBaselineFiles(t *testing.T) {
+	ctx := context.Background()
+	repoID := int64(9)
+	commit := baselineCommit
+	reader := &fakeVersionReader{version: &versionapp.Version{
+		ID:                 7,
+		CodeRepositoryID:   &repoID,
+		CodeBaselineCommit: &commit,
+	}}
+	query := &fakeCodeQuery{treeEntries: []codeinteldomain.TreeEntry{
+		{Path: "src", Type: "tree"},
+		{Path: "src/order.ts", Type: "blob"},
+		{Path: "src/order/page.tsx", Type: "blob"},
+	}}
+	adapter := mindmapcodeintel.NewCodeFactsAdapter(&fakeAnalysisReader{}, query, reader)
+
+	paths, err := adapter.ListBaselineFiles(ctx, 7, 10)
+	if err != nil {
+		t.Fatalf("ListBaselineFiles: %v", err)
+	}
+	if len(paths) != 2 || paths[0] != "src/order.ts" || paths[1] != "src/order/page.tsx" {
+		t.Fatalf("paths=%v want the two blob paths", paths)
+	}
+	if query.treeRepo != repoID || query.treeCommit != commit {
+		t.Fatalf("tree read repo=%d commit=%q want %d/%q", query.treeRepo, query.treeCommit, repoID, commit)
 	}
 }

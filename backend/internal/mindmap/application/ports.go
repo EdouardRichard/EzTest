@@ -384,6 +384,10 @@ type CodeFactsGateway interface {
 	// FileExists validates a path against the version's code baseline commit.
 	FileExists(ctx context.Context, versionID int64, path string) (bool, error)
 	ListFacts(ctx context.Context, versionID int64, limit int) ([]FactSummary, error)
+	// ListBaselineFiles returns file paths from the version's baseline commit
+	// (T0 git tree). It is the fallback context used by design runs when no P4
+	// analysis facts exist, so anchors can still reference real files.
+	ListBaselineFiles(ctx context.Context, versionID int64, limit int) ([]string, error)
 }
 
 // CodeAnchorGateway manages case-anchor rows through the codeintel anchor

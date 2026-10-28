@@ -701,7 +701,27 @@ func (s *RunService) factsInstruction(ctx context.Context, versionID int64) stri
 		return ""
 	}
 	if len(facts) == 0 {
-		return ""
+		// No P4 analysis facts yet: fall back to the T0 git tree at the version
+		// baseline commit so the agent still sees real file paths and can propose
+		// code anchors (spec §6.7 anchors, §8.5 degraded mode).
+		files, fileErr := s.deps.CodeFacts.ListBaselineFiles(ctx, versionID, runMaxInstructionFacts)
+		if fileErr != nil {
+			slog.WarnContext(ctx, "mindmap: list baseline files failed", "version_id", versionID, "error", fileErr)
+			return ""
+		}
+		if len(files) == 0 {
+			return ""
+		}
+		var fallback strings.Builder
+		fallback.WriteString("\n## 代码文件（T0 基线，未运行 P4 分析）\n")
+		fallback.WriteString("以下路径来自版本代码基线 commit；为每条用例至少给出 1 条 anchors（file 必须取自该列表，并带 startLine/endLine）。\n")
+		for index, path := range files {
+			if index >= runMaxInstructionFacts {
+				break
+			}
+			fmt.Fprintf(&fallback, "- path=%q\n", path)
+		}
+		return fallback.String()
 	}
 	var builder strings.Builder
 	builder.WriteString("\n## 代码事实\n")
