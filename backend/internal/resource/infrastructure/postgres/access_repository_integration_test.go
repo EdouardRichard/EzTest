@@ -328,7 +328,7 @@ func TestAccessRepositoryCredentialPlaintext(t *testing.T) {
 	}
 	systemID := accessSeedSystem(t, ctx, pool, company.ID, "shop")
 
-	credential := "pa$$w0rd\r\n\ttabs 鐪塶鑼俢ode "
+	credential := "pa$$w0rd\r\n\ttabs ünïcode "
 	access := &domain.Access{
 		AccountID:        account.ID,
 		SystemID:         systemID,

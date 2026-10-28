@@ -15,7 +15,7 @@ const (
 	AppModelKindComponent = "component"
 )
 
-// maxAppModelKeyLength bounds app model keys (spec 搂6.6).
+// maxAppModelKeyLength bounds app model keys (spec §6.6).
 const maxAppModelKeyLength = 512
 
 // appModelAPIKeyRE matches the "api:<METHOD> <path>" key convention.
@@ -48,7 +48,7 @@ type AppModelFilter struct {
 	Page      Page
 }
 
-// ValidateAppModelKey enforces the key/kind convention of spec 搂6.6:
+// ValidateAppModelKey enforces the key/kind convention of spec §6.6:
 // page:<path>, route:<path>, api:<METHOD> <path>, component:<Name>.
 func ValidateAppModelKey(kind, key string) error {
 	if len(key) == 0 || len(key) > maxAppModelKeyLength {

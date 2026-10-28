@@ -16,7 +16,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
 )
 
-// sessionFixture is one account脳system脳environment脳access diamond seeded with
+// sessionFixture is one account×system×environment×access diamond seeded with
 // raw SQL, so the session repository tests do not depend on the catalog or
 // access repositories.
 type sessionFixture struct {

@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-// resourceKeyRE is the documented resource key format (spec 搂7.2): 2-64
+// resourceKeyRE is the documented resource key format (spec §7.2): 2-64
 // characters, lowercase letters/digits first and then letters, digits, '_' or
 // '-'.
 var resourceKeyRE = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{1,63}$`)

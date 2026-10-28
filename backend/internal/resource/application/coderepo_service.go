@@ -14,7 +14,7 @@ import (
 // request that omits fixedBranch gets main.
 const defaultCodeRepoBranch = "main"
 
-// CodeRepoService implements the local code repository use cases (spec 搂6.7).
+// CodeRepoService implements the local code repository use cases (spec §6.7).
 // A repository is validated read-only through Git before it is stored, and the
 // last_commit/last_validated_at audit fields are written by the same create or
 // update call, so a failed validation never persists a row.
@@ -209,7 +209,7 @@ func (s *CodeRepoService) Update(ctx context.Context, id int64, in UpdateCodeRep
 	return codeRepo, nil
 }
 
-// Delete removes a code repository. P2 registers no dependents (spec 搂6.7).
+// Delete removes a code repository. P2 registers no dependents (spec §6.7).
 func (s *CodeRepoService) Delete(ctx context.Context, id int64) error {
 	return s.repos.DeleteCodeRepo(ctx, id)
 }

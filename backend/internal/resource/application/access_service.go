@@ -7,7 +7,7 @@ import (
 )
 
 // Access limits mirror the account_system_access CHECK constraints (spec
-// 鎼?.2): concurrency_limit BETWEEN 1 AND 100 and a nullable
+// §5.2): concurrency_limit BETWEEN 1 AND 100 and a nullable
 // session_ttl_seconds between 60 and 604800.
 const (
 	minAccessConcurrencyLimit  = 1
@@ -18,7 +18,7 @@ const (
 
 // AccessService implements the account and account/system access use cases. It
 // fixes the company to the seeded default one; requests never carry a company
-// id, and credentials are write-only below the HTTP layer (spec 鎼?.4).
+// id, and credentials are write-only below the HTTP layer (spec §7.4).
 type AccessService struct {
 	companies domain.CompanyRepository
 	accounts  domain.AccountRepository
@@ -59,7 +59,7 @@ type CreateAccessInput struct {
 }
 
 // UpdateAccessInput is the partial update-access request. A nil pointer leaves
-// the field unchanged, matching spec 鎼?.4: Credential == nil keeps the stored
+// the field unchanged, matching spec §7.4: Credential == nil keeps the stored
 // credential, *Credential == "" clears it, any other value replaces it.
 // ClearSessionTTL sets session_ttl_seconds to NULL and wins over
 // SessionTTLSeconds; with both unset the stored TTL is kept.
@@ -226,7 +226,7 @@ func (s *AccessService) UpdateAccount(ctx context.Context, id int64, in UpdateAc
 }
 
 // DeleteAccount deletes an account unless it still has accesses or sessions
-// (spec 鎼?.8).
+// (spec §6.8).
 func (s *AccessService) DeleteAccount(ctx context.Context, id int64) error {
 	accesses, err := s.accounts.CountAccesses(ctx, id)
 	if err != nil {
@@ -308,7 +308,7 @@ func (s *AccessService) UpdateAccess(ctx context.Context, id int64, in UpdateAcc
 	}
 	if in.Credential != nil {
 		// nil keeps the stored credential, "" clears it and any other value
-		// replaces it (spec 鎼?.4).
+		// replaces it (spec §7.4).
 		access.Credential = *in.Credential
 	}
 	if in.UsernameOverride != nil {
@@ -344,7 +344,7 @@ func (s *AccessService) UpdateAccess(ctx context.Context, id int64, in UpdateAcc
 	return access, nil
 }
 
-// DeleteAccess deletes an access unless it still has sessions (spec 鎼?.8).
+// DeleteAccess deletes an access unless it still has sessions (spec §6.8).
 func (s *AccessService) DeleteAccess(ctx context.Context, id int64) error {
 	sessions, err := s.accesses.CountSessionsByAccess(ctx, id)
 	if err != nil {

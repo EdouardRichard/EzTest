@@ -220,7 +220,7 @@ func (r *CodeRepository) UpdateLastIndexedAt(ctx context.Context, id int64, at t
 }
 
 // DeleteCodeRepo removes a code repository. P2 registers no dependents, so the
-// delete needs no dependency check (spec 鎼?.7).
+// delete needs no dependency check (spec §6.7).
 func (r *CodeRepository) DeleteCodeRepo(ctx context.Context, id int64) error {
 	tag, err := r.pool.Exec(ctx, `DELETE FROM code_repository WHERE id = $1`, id)
 	if err != nil {
