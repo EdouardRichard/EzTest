@@ -394,11 +394,20 @@ function Test-AdminAudit {
         }
     }
 
-    # The environment-seeded LLM configuration is created before any HTTP
-    # request exists, so that one entry legitimately has no request_id. Every
-    # request-driven action must be correlated.
+    # Entries written before/without an HTTP request legitimately have no
+    # request_id: the environment-seeded LLM configuration is created before any
+    # request exists, and the mindmap/execution workers invoke agent runs and
+    # tools from background goroutines. Every request-driven action must still
+    # be correlated; the Go tests pin the HTTP-started agent tool audit path.
+    $backgroundActions = @(
+        "llm.config_created",
+        "mindmap.tool.invoked",
+        "execution.case.finished",
+        "agent.tool.invoked",
+        "agent.run.aborted"
+    )
     $missingRequestIds = @($items | Where-Object {
-            [string]::IsNullOrWhiteSpace([string]$_.request_id) -and [string]$_.action -notin @("llm.config_created", "mindmap.tool.invoked")
+            [string]::IsNullOrWhiteSpace([string]$_.request_id) -and [string]$_.action -notin $backgroundActions
         })
     if ($missingRequestIds.Count -gt 0) {
         throw "request-driven audit entries are missing request_id"
