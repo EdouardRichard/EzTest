@@ -284,7 +284,7 @@ func TestClientProbeMapsResult(t *testing.T) {
 	})
 	client := newTestClient(testHost(t, server.URL))
 
-	got, err := client.Probe(context.Background(), server.URL+"/", "")
+	got, err := client.Probe(context.Background(), server.URL+"/", "", nil)
 	if err != nil {
 		t.Fatalf("Probe: %v", err)
 	}
@@ -329,7 +329,7 @@ func TestClientProbeTruncatesBody(t *testing.T) {
 		MaxBodyBytes: 64,
 	})
 
-	got, err := client.Probe(context.Background(), server.URL+"/", "")
+	got, err := client.Probe(context.Background(), server.URL+"/", "", nil)
 	if err != nil {
 		t.Fatalf("Probe: %v", err)
 	}
@@ -338,6 +338,74 @@ func TestClientProbeTruncatesBody(t *testing.T) {
 	}
 	if len(got.Body) != 64 {
 		t.Fatalf("body = %d bytes, want 64", len(got.Body))
+	}
+}
+
+// TestClientProbeUsesExplicitAllowlist pins the documented precedence of
+// Probe's explicit allowedHosts argument: a non-empty per-environment list
+// replaces Options.AllowedHosts and is exhaustive (it is not unioned with the
+// configured list).
+func TestClientProbeUsesExplicitAllowlist(t *testing.T) {
+	server := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, "<title>explicit</title>")
+	})
+	host := testHost(t, server.URL)
+
+	// The configured list is narrower and would reject the server, but the
+	// explicit list wins for this probe.
+	narrow := newTestClient("example.test")
+	got, err := narrow.Probe(context.Background(), server.URL+"/", "", []string{host})
+	if err != nil {
+		t.Fatalf("Probe with explicit allowlist: %v", err)
+	}
+	if got.Title != "explicit" {
+		t.Fatalf("title = %q, want explicit", got.Title)
+	}
+
+	// The explicit list is exhaustive: a host named only in Options.AllowedHosts
+	// is not implicitly added.
+	wide := newTestClient(host)
+	if _, err := wide.Probe(context.Background(), server.URL+"/", "", []string{"example.test"}); !errors.Is(err, application.ErrProbeTargetNotAllowed) {
+		t.Fatalf("error = %v, want ErrProbeTargetNotAllowed", err)
+	}
+}
+
+func TestClientProbeEmptyAllowlistFallsBackToOptions(t *testing.T) {
+	server := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, "<title>configured</title>")
+	})
+	client := newTestClient(testHost(t, server.URL))
+
+	for _, allowed := range [][]string{nil, {}} {
+		got, err := client.Probe(context.Background(), server.URL+"/", "", allowed)
+		if err != nil {
+			t.Fatalf("Probe(allowlist=%v): %v", allowed, err)
+		}
+		if got.Title != "configured" {
+			t.Fatalf("title = %q, want configured", got.Title)
+		}
+	}
+}
+
+// TestClientProbeKeepsConfiguredLoopbackEscapeHatch documents that the explicit
+// allowlist replaces the host list but not the literal-IP allowances the client
+// was built with: those remain the test escape hatch for private destinations.
+func TestClientProbeKeepsConfiguredLoopbackEscapeHatch(t *testing.T) {
+	server := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, "<title>loopback</title>")
+	})
+	client := newTestClient("127.0.0.1", "::1")
+	loopbackURL := strings.Replace(server.URL, "127.0.0.1", "localhost", 1)
+
+	got, err := client.Probe(context.Background(), loopbackURL, "", []string{"localhost"})
+	if err != nil {
+		t.Fatalf("Probe with explicit localhost: %v", err)
+	}
+	if got.Title != "loopback" {
+		t.Fatalf("title = %q, want loopback", got.Title)
 	}
 }
 
@@ -358,7 +426,7 @@ func TestClientProbeRejectsUnsafeTargets(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := tc.client.Probe(context.Background(), tc.rawURL, ""); !errors.Is(err, application.ErrProbeTargetNotAllowed) {
+			if _, err := tc.client.Probe(context.Background(), tc.rawURL, "", nil); !errors.Is(err, application.ErrProbeTargetNotAllowed) {
 				t.Fatalf("Probe(%q) error = %v, want ErrProbeTargetNotAllowed", tc.rawURL, err)
 			}
 		})

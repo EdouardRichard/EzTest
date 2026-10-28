@@ -74,7 +74,8 @@ type ProbeResult struct {
 	Truncated bool
 }
 
-// Options configures one probe client. AllowedHosts is the environment host
+// Options configures one probe client. AllowedHosts is the host allowlist used
+// by Fetch and the fallback of Probe when it is called with an empty explicit
 // allowlist; an empty allowlist denies every host (fail closed). A literal IP
 // entry additionally allows a private/loopback destination.
 type Options struct {
@@ -112,17 +113,24 @@ func New(opts Options) *Client {
 		maxRedirects: opts.MaxRedirects,
 		transport:    http.DefaultTransport,
 	}
-	for _, raw := range opts.AllowedHosts {
-		host := normalizeHost(raw)
+	client.allowedHosts, client.allowedIPs = normalizeAllowlist(opts.AllowedHosts)
+	return client
+}
+
+// normalizeAllowlist splits one host allowlist into bare lowercase hostnames and
+// the literal IPs among them (the explicit private-address escape hatch).
+func normalizeAllowlist(raw []string) (hosts []string, ips []net.IP) {
+	for _, entry := range raw {
+		host := normalizeHost(entry)
 		if host == "" {
 			continue
 		}
-		client.allowedHosts = append(client.allowedHosts, host)
+		hosts = append(hosts, host)
 		if ip := net.ParseIP(host); ip != nil {
-			client.allowedIPs = append(client.allowedIPs, ip)
+			ips = append(ips, ip)
 		}
 	}
-	return client
+	return hosts, ips
 }
 
 // Fetch probes rawURL with GET.
@@ -199,8 +207,21 @@ func (c *Client) FetchMethod(ctx context.Context, method, rawURL, cookieHeader s
 // service decodes it with splitExploreForm. A target rejected by the read-only
 // URL rules is reported as application.ErrProbeTargetNotAllowed so the service
 // can keep its environment_not_allowed mapping without importing this package.
-func (c *Client) Probe(ctx context.Context, rawURL, cookieHeader string) (application.ProbeResult, error) {
-	result, err := c.Fetch(ctx, rawURL, cookieHeader)
+//
+// allowedHosts is the per-environment SSRF allowlist computed by the exploration
+// service (base host plus its allowed_hosts). A non-empty list takes precedence
+// over Options.AllowedHosts and is exhaustive: it is not unioned with the
+// configured host list. An empty or nil list falls back to the configured list.
+// Literal IP entries in the explicit list are treated like IP entries in
+// Options, and the IPs configured at construction remain in force as the
+// private/loopback escape hatch (they only loosen the private-address rule; the
+// host rule always comes from the effective list).
+func (c *Client) Probe(ctx context.Context, rawURL, cookieHeader string, allowedHosts []string) (application.ProbeResult, error) {
+	probeClient := c
+	if len(allowedHosts) > 0 {
+		probeClient = c.scopedToAllowedHosts(allowedHosts)
+	}
+	result, err := probeClient.Fetch(ctx, rawURL, cookieHeader)
 	if err != nil {
 		if errors.Is(err, ErrURLNotAllowed) || errors.Is(err, ErrHostNotAllowed) || errors.Is(err, ErrPrivateIP) {
 			return application.ProbeResult{}, fmt.Errorf("%w: %w", application.ErrProbeTargetNotAllowed, err)
@@ -233,6 +254,20 @@ func (c *Client) Probe(ctx context.Context, rawURL, cookieHeader string) (applic
 		Body:        string(result.Body),
 		Truncated:   result.Truncated,
 	}, nil
+}
+
+// scopedToAllowedHosts returns a probe-scoped copy of c that validates against
+// the explicit per-environment allowlist instead of Options.AllowedHosts. The
+// literal-IP allowances configured at construction are retained: they are the
+// explicit escape hatch that lets tests reach loopback/private destinations,
+// and they only loosen the private-address rule while the host rule still comes
+// from the explicit list.
+func (c *Client) scopedToAllowedHosts(allowedHosts []string) *Client {
+	hosts, ips := normalizeAllowlist(allowedHosts)
+	scoped := *c
+	scoped.allowedHosts = hosts
+	scoped.allowedIPs = append(append([]net.IP(nil), c.allowedIPs...), ips...)
+	return &scoped
 }
 
 // redirectPolicy validates every redirect target. A redirect that leaves the
