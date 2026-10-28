@@ -1000,12 +1000,6 @@ try {
             $dropped = $null
             if ($null -ne $run.Data.stats) { $dropped = $run.Data.stats.anchorsDropped }
             if ($null -eq $dropped -or [int]$dropped -le 0) {
-                    $factCount = [int](Get-PsqlScalar -Database $e2eDbName -Sql "SELECT count(*) FROM code_entity WHERE repo_id = $($script:state.RepoId);")
-                    if ($factCount -eq 0) {
-                        Write-Host "No anchor materialized because the version has no code facts (no P4 analysis was run)."
-                        [void]$script:warnings.Add("design run produced no anchors: no code facts for the repo")
-                        return
-                    }
                 throw "no anchor was materialized and the run does not report anchorsDropped; the anchor outcome is unexplained"
             }
             Write-Host "No anchor materialized; run explains it with stats.anchorsDropped=$dropped."

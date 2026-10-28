@@ -7,6 +7,7 @@ package codeintel
 import (
 	"context"
 	"errors"
+	"strings"
 
 	codeinteldomain "github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
 	mindmapapp "github.com/EdouardRichard/EzTest/backend/internal/mindmap/application"
@@ -27,6 +28,7 @@ type AnalysisReader interface {
 type CodeQuery interface {
 	File(ctx context.Context, actorID, repoID int64, commit, path string, startLine, endLine int) (codeinteldomain.FileWindow, error)
 	Facts(ctx context.Context, repoID int64, filter codeinteldomain.EntityFilter) ([]codeinteldomain.CodeEntity, string, bool, error)
+	Tree(ctx context.Context, repoID int64, prefix, commit, cursor string, limit int) (codeinteldomain.TreePage, error)
 }
 
 // VersionReader is the narrow slice of the P3 version service used to resolve
@@ -168,6 +170,51 @@ func (a *CodeFactsAdapter) ListFacts(ctx context.Context, versionID int64, limit
 		})
 	}
 	return facts, nil
+}
+
+// ListBaselineFiles returns up to limit file paths from the version's code
+// baseline commit (T0 git tree). Design runs use it when ListFacts is empty so
+// the agent still sees real repository paths and can propose code anchors
+// without requiring a P4 analysis run.
+func (a *CodeFactsAdapter) ListBaselineFiles(ctx context.Context, versionID int64, limit int) ([]string, error) {
+	if a == nil || a.queries == nil || a.versions == nil {
+		return nil, errors.New("mindmap: code query is not configured")
+	}
+	if limit <= 0 {
+		return []string{}, nil
+	}
+	version, err := a.versions.Get(ctx, versionID)
+	if err != nil {
+		return nil, mapVersionLookupError(err)
+	}
+	if version == nil {
+		return nil, mindmapdomain.NewNotFound("version", versionID)
+	}
+	if version.CodeRepositoryID == nil || version.CodeBaselineCommit == nil {
+		return []string{}, nil
+	}
+	paths := make([]string, 0, limit)
+	cursor := ""
+	for len(paths) < limit {
+		page, err := a.queries.Tree(ctx, *version.CodeRepositoryID, "", *version.CodeBaselineCommit, cursor, limit-len(paths))
+		if err != nil {
+			return nil, mapCodeIntelError(err)
+		}
+		for _, entry := range page.Entries {
+			if entry.Type == "tree" || entry.Unsupported || strings.HasSuffix(entry.Path, "/") {
+				continue
+			}
+			paths = append(paths, entry.Path)
+			if len(paths) >= limit {
+				break
+			}
+		}
+		if !page.HasMore || page.NextCursor == "" || page.NextCursor == cursor {
+			break
+		}
+		cursor = page.NextCursor
+	}
+	return paths, nil
 }
 
 // isCodeIntelNotFound reports whether err is the codeintel not-found class.

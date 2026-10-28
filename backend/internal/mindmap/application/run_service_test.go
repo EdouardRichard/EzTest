@@ -37,6 +37,7 @@ type runFixture struct {
 	relations []application.RelationSnapshot
 	appModels []application.AppModelSnapshot
 	facts     []application.FactSummary
+	baselineFiles []string
 	files     map[string]bool
 
 	anchors    []application.Anchor
@@ -1063,6 +1064,14 @@ func (g runCodeFactsGateway) ListFacts(_ context.Context, _ int64, limit int) ([
 	return facts, nil
 }
 
+func (g runCodeFactsGateway) ListBaselineFiles(_ context.Context, _ int64, limit int) ([]string, error) {
+	files := append([]string(nil), g.f.baselineFiles...)
+	if limit > 0 && len(files) > limit {
+		files = files[:limit]
+	}
+	return files, nil
+}
+
 // runAnchorGateway implements application.CodeAnchorGateway and records writes.
 type runAnchorGateway struct {
 	f *runFixture
@@ -1332,6 +1341,33 @@ func TestStartInstructionIncludesRequiredContext(t *testing.T) {
 	}
 	if len(instruction) > 64*1024 {
 		t.Fatalf("instruction is %d bytes, want at most 64 KiB", len(instruction))
+	}
+}
+
+// TestStartInstructionFallsBackToT0Files covers the degraded context path: when
+// no P4 analysis facts exist, the instruction still lists baseline file paths so
+// the agent can propose code anchors without an analysis run.
+func TestStartInstructionFallsBackToT0Files(t *testing.T) {
+	ctx := context.Background()
+	fixture := newRunFixture()
+	fixture.confirmed = []application.RequirementSnapshot{{
+		ID: 7, VersionID: runTestVersionID, Title: "结算页加载", Priority: "P1", Status: "clarified",
+	}}
+	fixture.baselineFiles = []string{"src/order/submit.ts", "src/order/page.tsx"}
+	fixture.files = map[string]bool{"src/order/submit.ts": true, "src/order/page.tsx": true}
+	service := fixture.service()
+
+	if _, err := service.Start(ctx, runTestVersionID, 42, application.StartRunCommand{Kind: domain.RunKindDesign}); err != nil {
+		t.Fatalf("start design run: %v", err)
+	}
+	instruction := fixture.texts[0]
+	for _, want := range []string{"代码文件（T0", "src/order/submit.ts", "anchors"} {
+		if !strings.Contains(instruction, want) {
+			t.Fatalf("instruction is missing %q:\n%s", want, instruction)
+		}
+	}
+	if strings.Contains(instruction, "## 代码事实") {
+		t.Fatalf("instruction must not claim P4 facts when none exist:\n%s", instruction)
 	}
 }
 
