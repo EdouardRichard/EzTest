@@ -43,9 +43,10 @@ func NewExecutionService(deps ExecutionDeps) *ExecutionService {
 }
 
 // Baseline returns the frozen baseline of versionID: the canonical graph hash,
-// the optional code baseline commit and every baseline case node id in
-// ascending order. A version without a baseline is the stable 409
-// baseline_required (spec §5.1/§5.2).
+// the optional code baseline commit and every case node id of the current
+// working graph in ascending order (the frozen content plus the P7 supplement
+// nodes appended after the freeze). A version without a baseline is the stable
+// 409 baseline_required (spec §5.1/§5.2).
 func (s *ExecutionService) Baseline(ctx context.Context, versionID int64) (domain.ExecutionBaseline, error) {
 	if err := s.readPorts(); err != nil {
 		return domain.ExecutionBaseline{}, err
@@ -76,10 +77,11 @@ func (s *ExecutionService) Baseline(ctx context.Context, versionID int64) (domai
 }
 
 // SnapshotCases assembles the immutable execution snapshots of versionID. An
-// empty caseIDs selects every baseline case; explicit ids must be case nodes of
-// the version's frozen baseline. The result is ordered by case node id ascending
-// and every case carries its steps by seq, its assertions by id, its requirement
-// sources and the frozen graph hash (spec §5.2).
+// empty caseIDs selects every case of the current working graph; explicit ids
+// must be case nodes of the version (the frozen baseline plus the P7 supplement
+// nodes). The result is ordered by case node id ascending and every case
+// carries its steps by seq, its assertions by id, its requirement sources and
+// the frozen graph hash (spec §5.2).
 func (s *ExecutionService) SnapshotCases(ctx context.Context, versionID int64, caseIDs []int64) ([]domain.ExecutionCase, error) {
 	if err := s.readPorts(); err != nil {
 		return nil, err
@@ -110,13 +112,14 @@ func (s *ExecutionService) SnapshotCases(ctx context.Context, versionID int64, c
 	return snapshots, nil
 }
 
-// MarkExecuted moves the given case nodes from reviewed to executed after their
-// execution finished (spec §5.2). Already-executed cases are an idempotent
-// no-op; any other status is the stable 409 case_status_conflict. The write is
-// one transaction that only touches the case_node status, revision and
-// updated_at: the baseline rows, steps, assertions and sources are never
-// written. One case.status_changed event per changed case is published after
-// the commit through the existing mindmap publisher (spec §5.10).
+// MarkExecuted moves the given case nodes from reviewed, merged or
+// needs_revalidation to executed after their execution finished (spec §5.2,
+// extended by P7). Already-executed cases are an idempotent no-op; any other
+// status is the stable 409 case_status_conflict. The write is one transaction
+// that only touches the case_node status, revision and updated_at: the baseline
+// rows, steps, assertions and sources are never written. One case.status_changed
+// event per changed case is published after the commit through the existing
+// mindmap publisher (spec §5.10).
 //
 // An empty caseIDs list is a successful no-op: there is no case to mark.
 func (s *ExecutionService) MarkExecuted(ctx context.Context, versionID int64, caseIDs []int64) error {
@@ -131,7 +134,7 @@ func (s *ExecutionService) MarkExecuted(ctx context.Context, versionID int64, ca
 		return errors.New("mindmap: execution graph transaction is not configured")
 	}
 	now := s.now()
-	var changed []domain.CaseNode
+	var changed []executionStatusChange
 	err = s.deps.Graph.InTx(ctx, func(tx GraphTx) error {
 		nodes := tx.Nodes()
 		if nodes == nil {
@@ -152,7 +155,7 @@ func (s *ExecutionService) MarkExecuted(ctx context.Context, versionID int64, ca
 			case domain.NodeStatusExecuted:
 				// Idempotent: the case already carries the executed marker.
 				continue
-			case domain.NodeStatusReviewed:
+			case domain.NodeStatusReviewed, domain.NodeStatusMerged, domain.NodeStatusNeedsRevalidation:
 				candidate := node
 				candidate.Status = domain.NodeStatusExecuted
 				candidate.UpdatedAt = now
@@ -160,10 +163,10 @@ func (s *ExecutionService) MarkExecuted(ctx context.Context, versionID int64, ca
 				if err != nil {
 					return err
 				}
-				changed = append(changed, updated)
+				changed = append(changed, executionStatusChange{node: updated, from: node.Status})
 			default:
 				return domain.NewStateConflict("case_status_conflict",
-					fmt.Sprintf("case %d is %s; only a reviewed case can be marked executed",
+					fmt.Sprintf("case %d is %s; only a reviewed, merged or needs_revalidation case can be marked executed",
 						nodeID, node.Status))
 			}
 		}
@@ -172,10 +175,90 @@ func (s *ExecutionService) MarkExecuted(ctx context.Context, versionID int64, ca
 	if err != nil {
 		return err
 	}
-	for _, node := range changed {
-		s.publishStatusChanged(ctx, versionID, node)
+	for _, change := range changed {
+		s.publishStatusChanged(ctx, versionID, change.node, change.from, domain.NodeStatusExecuted)
 	}
 	return nil
+}
+
+// MarkMerged marks the supplemented cases selected by an incremental or supplement
+// batch as merged (spec §5.3: "选中补全节点 → merged"). It is idempotent for an
+// already merged node; any other status is a case_status_conflict. Only the
+// status column moves.
+//
+// The legacy signature has no actor (the T7 SupplementGraphPort predates the
+// actor); it keeps the stored updated_by. MarkMergedBy is the actor-aware form
+// the execution adapter should delegate to once the port carries the actor.
+func (s *ExecutionService) MarkMerged(ctx context.Context, versionID int64, caseIDs []int64) error {
+	return s.MarkMergedBy(ctx, versionID, 0, caseIDs)
+}
+
+// MarkMergedBy marks supplemented cases merged and records the acting user in
+// updated_by. A non-positive actor keeps the stored updated_by (legacy callers).
+func (s *ExecutionService) MarkMergedBy(ctx context.Context, versionID, actor int64, caseIDs []int64) error {
+	if len(caseIDs) == 0 {
+		return nil
+	}
+	ids, err := normalizeExecutionCaseIDs(caseIDs, versionID)
+	if err != nil {
+		return err
+	}
+	if s.deps.Graph == nil {
+		return errors.New("mindmap: execution graph transaction is not configured")
+	}
+	now := s.now()
+	var changed []executionStatusChange
+	err = s.deps.Graph.InTx(ctx, func(tx GraphTx) error {
+		nodes := tx.Nodes()
+		if nodes == nil {
+			return errors.New("mindmap: execution node repository is not configured")
+		}
+		for _, nodeID := range ids {
+			node, err := nodes.Get(ctx, versionID, nodeID)
+			if err != nil {
+				if executionIsNotFound(err) {
+					return invalidCaseIDsError(versionID, nodeID)
+				}
+				return err
+			}
+			if node.Kind != domain.NodeKindCase {
+				return invalidCaseIDsError(versionID, nodeID)
+			}
+			switch node.Status {
+			case domain.NodeStatusMerged:
+				continue
+			case domain.NodeStatusSupplemented:
+				candidate := node
+				candidate.Status = domain.NodeStatusMerged
+				if actor > 0 {
+					candidate.UpdatedBy = actor
+				}
+				candidate.UpdatedAt = now
+				updated, err := nodes.Update(ctx, candidate, node.Revision)
+				if err != nil {
+					return err
+				}
+				changed = append(changed, executionStatusChange{node: updated, from: node.Status})
+			default:
+				return domain.NewStateConflict("case_status_conflict",
+					fmt.Sprintf("case %d is %s; only a supplemented case can be marked merged", nodeID, node.Status))
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for _, change := range changed {
+		s.publishStatusChanged(ctx, versionID, change.node, change.from, domain.NodeStatusMerged)
+	}
+	return nil
+}
+
+// executionStatusChange is one committed status transition awaiting its event.
+type executionStatusChange struct {
+	node domain.CaseNode
+	from string
 }
 
 // readPorts reports the mandatory read ports of the execution projection.
@@ -195,14 +278,14 @@ func (s *ExecutionService) now() time.Time {
 	return time.Now()
 }
 
-// publishStatusChanged emits the case.status_changed event of one executed case
+// publishStatusChanged emits the case.status_changed event of one status move
 // after the commit. The envelope keeps the transition summary only; the case id
 // is a decimal string like every other id of the execution context (spec
 // §5.10/§5.12).
-func (s *ExecutionService) publishStatusChanged(ctx context.Context, versionID int64, node domain.CaseNode) {
-	summary := "case executed"
+func (s *ExecutionService) publishStatusChanged(ctx context.Context, versionID int64, node domain.CaseNode, from, to string) {
+	summary := "case status changed"
 	if title := strings.TrimSpace(node.Title); title != "" {
-		summary = fmt.Sprintf("case %q executed", truncateRunes(title, maxEventTitleRunes))
+		summary = fmt.Sprintf("case %q %s", truncateRunes(title, maxEventTitleRunes), to)
 	}
 	s.publish(ctx, Event{
 		VersionID:  versionID,
@@ -212,8 +295,8 @@ func (s *ExecutionService) publishStatusChanged(ctx context.Context, versionID i
 		Source:     node.Source,
 		Detail: map[string]any{
 			"nodeId":   strconv.FormatInt(node.ID, 10),
-			"from":     domain.NodeStatusReviewed,
-			"to":       domain.NodeStatusExecuted,
+			"from":     from,
+			"to":       to,
 			"revision": node.Revision,
 		},
 	})
@@ -234,10 +317,12 @@ func (s *ExecutionService) publish(ctx context.Context, event Event) {
 	}
 }
 
-// selectExecutionCaseIDs resolves the snapshot selection. The graph of a frozen
-// version is immutable, so the version's case nodes are the baseline case set;
-// an explicit id that is not one of them, or a case created after the freeze,
-// is invalid_case_ids.
+// selectExecutionCaseIDs resolves the snapshot selection. The frozen baseline
+// cases are always selectable; the P7 supplement nodes created after the freeze
+// are selectable too because incremental/supplement batches execute them (spec
+// §5.3: caseIds ⊆ the current working graph, including supplemented/merged/needs
+// _revalidation). A late user-authored case still cannot masquerade as a baseline
+// case: only ai_supplement content is the P7 exception.
 func selectExecutionCaseIDs(nodes []domain.CaseNode, versionID int64, frozenAt time.Time, requested []int64) ([]int64, error) {
 	baselineCases := make(map[int64]domain.CaseNode)
 	for _, node := range nodes {
@@ -260,7 +345,7 @@ func selectExecutionCaseIDs(nodes []domain.CaseNode, versionID int64, frozenAt t
 			return nil, invalidCaseIDsError(versionID, id)
 		}
 		node, ok := baselineCases[id]
-		if !ok || createdAfterFrozenBaseline(node, frozenAt) {
+		if !ok || (!supplementSelectableNode(node) && createdAfterFrozenBaseline(node, frozenAt)) {
 			return nil, invalidCaseIDsError(versionID, id)
 		}
 		if _, duplicate := seen[id]; duplicate {
@@ -271,6 +356,20 @@ func selectExecutionCaseIDs(nodes []domain.CaseNode, versionID int64, frozenAt t
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	return ids, nil
+}
+
+// supplementSelectableNode reports whether a case created after the freeze is
+// still part of the current working graph through the P7 supplement path.
+func supplementSelectableNode(node domain.CaseNode) bool {
+	if node.Source == domain.NodeSourceAISupplement {
+		return true
+	}
+	switch node.Status {
+	case domain.NodeStatusSupplemented, domain.NodeStatusMerged:
+		return true
+	default:
+		return false
+	}
 }
 
 // normalizeExecutionCaseIDs validates and deduplicates the MarkExecuted target
@@ -338,7 +437,18 @@ func buildExecutionCase(node domain.CaseNode, state graphState, graphHash string
 		Assertions:     snapshotAssertions,
 		RequirementIDs: requirementIDsOfCase(state.sources, node.ID),
 		GraphHash:      graphHash,
+		Origin:         executionCaseOrigin(node),
+		Status:         node.Status,
 	}
+}
+
+// executionCaseOrigin normalizes the case_node source to the execution-side
+// origin set (spec §5.2/§5.3): only the AI supplement path is not baseline.
+func executionCaseOrigin(node domain.CaseNode) string {
+	if node.Source == domain.NodeSourceAISupplement {
+		return domain.ExecutionOriginAISupplement
+	}
+	return domain.ExecutionOriginBaseline
 }
 
 // requirementIDsOfCase returns the sorted requirement ids of the node's
@@ -388,7 +498,7 @@ func executionBaselineRequiredError(versionID int64) error {
 // case set.
 func invalidCaseIDsError(versionID, caseID int64) error {
 	return domain.NewInvalid("caseIds", "invalid_case_ids",
-		fmt.Sprintf("case %d is not a case node of the frozen baseline of version %d", caseID, versionID))
+		fmt.Sprintf("case %d is not a case node of the current working graph of version %d", caseID, versionID))
 }
 
 // executionIsNotFound reports whether err is a mindmap not-found domain error.

@@ -62,7 +62,11 @@ func (p *Publisher) Publish(ctx context.Context, event mindmapapp.Event) error {
 		VersionID: &versionID,
 		Summary:   truncateRunes(event.Summary, maxSummaryRunes),
 		Detail:    detail,
-		Refs:      eventingdomain.Refs{Case: caseRefs(event.RefCaseIDs)},
+		Refs: eventingdomain.Refs{
+			Case:        caseRefs(event.RefCaseIDs),
+			Requirement: requirementRefs(event.RefRequirementIDs),
+			Code:        codeRefs(event.RefCodeRefs),
+		},
 	})
 	return err
 }
@@ -100,6 +104,32 @@ func caseRefs(ids []int64) []string {
 			break
 		}
 		refs = append(refs, strconv.FormatInt(id, 10))
+	}
+	return refs
+}
+
+// requirementRefs renders the P7 requirement refs as decimal strings (D29) and
+// caps the list at the envelope refs limit.
+func requirementRefs(ids []int64) []string {
+	refs := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if len(refs) >= maxCaseRefs {
+			break
+		}
+		refs = append(refs, strconv.FormatInt(id, 10))
+	}
+	return refs
+}
+
+// codeRefs copies the P7 code paths and caps the list at the envelope refs
+// limit. Unlike the case ids they are repository-relative paths, not ids.
+func codeRefs(paths []string) []string {
+	refs := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if len(refs) >= maxCaseRefs {
+			break
+		}
+		refs = append(refs, path)
 	}
 	return refs
 }

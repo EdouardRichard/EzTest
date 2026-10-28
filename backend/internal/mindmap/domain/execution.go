@@ -38,11 +38,22 @@ type ExecutionAssertion struct {
 	Expected   string
 }
 
+// Execution case origins consumed by the execution context's P7 batch gates
+// (spec §5.2/§5.3): a case came either from the frozen baseline or from the AI
+// supplement path. The value mirrors case_node.source, normalized to the
+// execution-side origin set.
+const (
+	ExecutionOriginBaseline     = "baseline"
+	ExecutionOriginAISupplement = "ai_supplement"
+)
+
 // ExecutionCase is the immutable per-case projection of a frozen baseline
 // consumed by the execution context (spec §4.2 MindmapPort.SnapshotCases,
 // §5.2). TestData is the raw JSONB document of the case; a nil document stays
 // nil. Steps are ordered by seq and assertions by id so the snapshot is
-// deterministic.
+// deterministic. Origin and Status are the P7 read-only gate inputs: Origin is
+// the normalized baseline|ai_supplement provenance and Status the live
+// case_node status.
 type ExecutionCase struct {
 	NodeID         int64
 	Revision       int
@@ -54,4 +65,6 @@ type ExecutionCase struct {
 	Assertions     []ExecutionAssertion
 	RequirementIDs []int64
 	GraphHash      string
+	Origin         string
+	Status         string
 }

@@ -39,6 +39,11 @@ func NewLifecycleAdapter(versions VersionService) *LifecycleAdapter {
 
 var _ mindmapapp.VersionLifecycle = (*LifecycleAdapter)(nil)
 
+// The P7 run/plan extension is optional on application.VersionLifecycle; the
+// production adapter always satisfies it so the incremental_design gate sees the
+// real continue phase instead of falling back to the version status alone.
+var _ mindmapapp.ContinuePhaseReader = (*LifecycleAdapter)(nil)
+
 // GetVersion returns the mindmap projection of one version. The version status
 // drives editability and the review state machine, so no defaulting happens
 // here: the P3 value is copied as-is.
@@ -88,6 +93,24 @@ func (a *LifecycleAdapter) ApproveBaseline(ctx context.Context, versionID, actor
 		return mindmapapp.VersionSnapshot{}, mapVersionError(err)
 	}
 	return versionSnapshot(version, versionID)
+}
+
+// ContinuePhase implements the optional P7 application.ContinuePhaseReader: it
+// exposes version.continue_phase so the incremental_design run gate and the
+// incremental plan read the real phase. A version without a continuing phase
+// yields "", which the gate rejects. Version errors keep their mindmap mapping.
+func (a *LifecycleAdapter) ContinuePhase(ctx context.Context, versionID int64) (string, error) {
+	if a == nil || a.versions == nil {
+		return "", errors.New("mindmap: version service is not configured")
+	}
+	version, err := a.versions.Get(ctx, versionID)
+	if err != nil {
+		return "", mapVersionError(err)
+	}
+	if version == nil {
+		return "", mindmapdomain.NewNotFound("version", versionID)
+	}
+	return version.ContinuePhase, nil
 }
 
 // versionSnapshot projects one P3 version onto the mindmap read model. Optional

@@ -18,9 +18,11 @@ import (
 
 // stubExecutionBatches is the minimal executionhttp.BatchService used to prove
 // the P6 route group is mounted; the remaining methods return their defaults.
+// Create takes the P7 composite command (T7) so the test adapter satisfies the
+// widened consumer port.
 type stubExecutionBatches struct{}
 
-func (stubExecutionBatches) Create(context.Context, int64, int64, []int64) (*domain.RunBatch, error) {
+func (stubExecutionBatches) Create(context.Context, int64, int64, executionapp.CreateBatchCommand) (*domain.RunBatch, error) {
 	return &domain.RunBatch{ID: 1842, VersionID: 101, BatchNo: 1, Status: domain.BatchStatusRunning}, nil
 }
 

@@ -31,6 +31,51 @@ const (
 	NodeStatusNeedsRevalidation = "needs_revalidation"
 )
 
+// P7 supplement events published on the version channel (spec §5.2). They are
+// owned by the mindmap context because the supplement write paths live here.
+const (
+	EventCaseSupplemented       = "case.supplemented"
+	EventCaseRevalidationMarked = "case.revalidation_marked"
+)
+
+// nodeStatusTransitions is the P7 controlled transition matrix of spec §5.2.
+// Only these edges may be applied by TransitionNodeStatus, MarkMerged and
+// MarkExecuted; AppendSupplementNode only inserts a new node at supplemented.
+// Content columns are never written by any of them.
+var nodeStatusTransitions = map[string]map[string]struct{}{
+	NodeStatusSupplemented: {
+		NodeStatusMerged:   {},
+		NodeStatusRejected: {},
+	},
+	NodeStatusReviewed: {
+		NodeStatusNeedsRevalidation: {},
+		NodeStatusExecuted:          {},
+	},
+	NodeStatusMerged: {
+		NodeStatusExecuted: {},
+		NodeStatusRejected: {},
+	},
+	NodeStatusNeedsRevalidation: {
+		NodeStatusExecuted: {},
+		NodeStatusRejected: {},
+	},
+	NodeStatusExecuted: {
+		NodeStatusNeedsRevalidation: {},
+	},
+}
+
+// CanTransitionNodeStatus reports whether the P7 matrix allows from → to. The
+// same-status edge is always false: callers implement their own idempotency
+// where the spec needs it (MarkExecuted/MarkMerged).
+func CanTransitionNodeStatus(from, to string) bool {
+	targets, ok := nodeStatusTransitions[from]
+	if !ok {
+		return false
+	}
+	_, ok = targets[to]
+	return ok
+}
+
 // Priorities, mirrored from the case_node.priority CHECK constraint.
 const (
 	PriorityP0 = "P0"

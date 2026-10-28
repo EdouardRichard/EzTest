@@ -25,6 +25,8 @@ type fakeVersions struct {
 	batchNoErr   error
 	completeArgs []int64
 	completeErr  error
+	phaseCalls   []phaseCall
+	phaseErr     error
 }
 
 type pauseCall struct {
@@ -39,6 +41,11 @@ type batchNoCall struct {
 	versionID int64
 	batchNo   int
 	actor     int64
+}
+
+type phaseCall struct {
+	versionID int64
+	phase     string
 }
 
 func (f *fakeVersions) Get(context.Context, int64) (*versionapp.Version, error) {
@@ -59,6 +66,11 @@ func (f *fakeVersions) SetBatchNo(_ context.Context, versionID int64, batchNo in
 func (f *fakeVersions) CompleteExecution(_ context.Context, versionID, actor int64) (*versionapp.Version, error) {
 	f.completeArgs = append(f.completeArgs, versionID, actor)
 	return f.version, f.completeErr
+}
+
+func (f *fakeVersions) SetContinuePhase(_ context.Context, versionID int64, phase string) error {
+	f.phaseCalls = append(f.phaseCalls, phaseCall{versionID, phase})
+	return f.phaseErr
 }
 
 // atomicVersions additionally provides the native allocate/release surface a
@@ -86,6 +98,7 @@ func seededVersion() *versionapp.Version {
 		Status:             versiondomain.VersionExecuting,
 		Paused:             true,
 		PauseMode:          versiondomain.PauseModeImmediate,
+		ContinuePhase:      versiondomain.ContinuePhaseDesigning,
 		BatchNo:            3,
 		SystemID:           ptr[int64](11),
 		EnvironmentID:      ptr[int64](12),
@@ -104,6 +117,10 @@ func TestGetVersionMapsExecutionState(t *testing.T) {
 	if ref.ID != 7 || ref.Status != versiondomain.VersionExecuting || !ref.Paused ||
 		ref.PauseMode != versiondomain.PauseModeImmediate || ref.BatchNo != 3 {
 		t.Fatalf("ref = %+v", ref)
+	}
+	// The P7 incremental gate reads the live continue phase from the projection.
+	if ref.ContinuePhase != versiondomain.ContinuePhaseDesigning {
+		t.Fatalf("continue phase = %q, want %q", ref.ContinuePhase, versiondomain.ContinuePhaseDesigning)
 	}
 	if ref.SystemID == nil || *ref.SystemID != 11 ||
 		ref.EnvironmentID == nil || *ref.EnvironmentID != 12 ||
@@ -180,6 +197,30 @@ func TestVersionActionsForwardArgumentsAndMapErrors(t *testing.T) {
 	}
 }
 
+// TestSetContinuePhaseForwardsAndMapsErrors covers the optional P7
+// ContinuePhasePort the batch service asserts after an incremental batch
+// commits (spec §5.1/§5.3).
+func TestSetContinuePhaseForwardsAndMapsErrors(t *testing.T) {
+	ctx := context.Background()
+	service := &fakeVersions{version: seededVersion()}
+	adapter := New(service)
+
+	if err := adapter.SetContinuePhase(ctx, 7, versiondomain.ContinuePhaseExecuting); err != nil {
+		t.Fatal(err)
+	}
+	if len(service.phaseCalls) != 1 ||
+		service.phaseCalls[0] != (phaseCall{7, versiondomain.ContinuePhaseExecuting}) {
+		t.Fatalf("SetContinuePhase args = %+v", service.phaseCalls)
+	}
+
+	service.phaseErr = versiondomain.NewStateConflict("version_state_conflict", "version is completed")
+	err := adapter.SetContinuePhase(ctx, 7, versiondomain.ContinuePhaseExecuting)
+	var reasonErr *executiondomain.ReasonError
+	if !errors.As(err, &reasonErr) || reasonErr.Code != "version_state_conflict" {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestAllocateBatchNoPrefersNativeAllocator(t *testing.T) {
 	service := &atomicVersions{fakeVersions: &fakeVersions{version: seededVersion()}, allocated: 9}
 	allocated, err := New(service).AllocateBatchNo(context.Background(), 7)
@@ -245,6 +286,10 @@ func TestAdapterRejectsNilService(t *testing.T) {
 	if _, err := adapter.AllocateBatchNo(context.Background(), 7); err == nil {
 		t.Fatal("AllocateBatchNo with a nil service = nil error")
 	}
+	if err := adapter.SetContinuePhase(context.Background(), 7, versiondomain.ContinuePhaseExecuting); err == nil {
+		t.Fatal("SetContinuePhase with a nil service = nil error")
+	}
 }
 
 var _ executionapp.VersionPort = (*Adapter)(nil)
+var _ executionapp.ContinuePhasePort = (*Adapter)(nil)

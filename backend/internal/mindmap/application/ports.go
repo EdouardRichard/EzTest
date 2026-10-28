@@ -167,9 +167,15 @@ type Event struct {
 	Type       string
 	Summary    string
 	RefCaseIDs []int64
-	ActorID    int64
-	Source     string
-	Detail     map[string]any
+	// RefRequirementIDs and RefCodeRefs are the P7 envelope refs.requirement and
+	// refs.code lists of spec §8.1 (case.revalidation_marked carries the affected
+	// case's requirement and code references). The eventing adapter renders the
+	// ids as decimal strings and caps the lists at the envelope refs limit.
+	RefRequirementIDs []int64
+	RefCodeRefs       []string
+	ActorID           int64
+	Source            string
+	Detail            map[string]any
 }
 
 // AuditEvent is one audit entry. The same body rules as Event apply: no export

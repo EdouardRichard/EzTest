@@ -109,6 +109,29 @@ func TestEventPublisherEnforcesEnvelopeLimits(t *testing.T) {
 		}
 	})
 
+	t.Run("requirement and code refs are mapped", func(t *testing.T) {
+		recorder := &fakeEventPublisher{}
+		publisher := mindmapeventing.NewEventPublisher(recorder)
+		if err := publisher.Publish(ctx, mindmapapp.Event{
+			VersionID: 1, Type: "case.revalidation_marked", Summary: "u",
+			RefCaseIDs:        []int64{9},
+			RefRequirementIDs: []int64{7, 8},
+			RefCodeRefs:       []string{"src/refund.ts"},
+		}); err != nil {
+			t.Fatalf("Publish: %v", err)
+		}
+		refs := recorder.events[0].Refs
+		if len(refs.Case) != 1 || refs.Case[0] != "9" {
+			t.Fatalf("refs.case=%v want [9]", refs.Case)
+		}
+		if len(refs.Requirement) != 2 || refs.Requirement[0] != "7" || refs.Requirement[1] != "8" {
+			t.Fatalf("refs.requirement=%v want [7 8]", refs.Requirement)
+		}
+		if len(refs.Code) != 1 || refs.Code[0] != "src/refund.ts" {
+			t.Fatalf("refs.code=%v want [src/refund.ts]", refs.Code)
+		}
+	})
+
 	t.Run("oversized detail is rejected", func(t *testing.T) {
 		recorder := &fakeEventPublisher{}
 		publisher := mindmapeventing.NewEventPublisher(recorder)

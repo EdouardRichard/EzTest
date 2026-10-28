@@ -55,14 +55,19 @@ const (
 // resource/code-intel gateways, the agent runtime, the event sink, the id
 // generator and the clock.
 type RunDeps struct {
-	Runs         RunRepository
-	Graph        GraphRepository
-	Baselines    BaselineRepository
-	Nodes        NodeRepository
-	Steps        StepRepository
-	Assertions   AssertionRepository
-	Sources      SourceRepository
-	Versions     VersionLifecycle
+	Runs       RunRepository
+	Graph      GraphRepository
+	Baselines  BaselineRepository
+	Nodes      NodeRepository
+	Steps      StepRepository
+	Assertions AssertionRepository
+	Sources    SourceRepository
+	Versions   VersionLifecycle
+	// Batches is the optional P7 execution-batch reader: when wired, the
+	// supplement/incremental_design parent-batch preconditions of spec §7.6 are
+	// enforced at start; when nil the run starts degraded with the
+	// batch_precondition_unavailable warning instead of bypassing the check.
+	Batches      SupplementBatchReader
 	Requirements RequirementReader
 	Catalog      CatalogGateway
 	CodeFacts    CodeFactsGateway
@@ -73,14 +78,17 @@ type RunDeps struct {
 	Clock        Clock
 }
 
-// StartRunCommand is the POST /runs body of spec §7.2 endpoint 17 restricted to
-// the kinds this service coordinates (design/review/data_plan). Explore runs are
-// owned by the exploration service.
+// StartRunCommand is the POST /runs body of spec §7.2 endpoint 17 extended for
+// the P7 kinds (spec §7.6): design/review/data_plan plus supplement and
+// incremental_design, whose parent batch id is mandatory.
 type StartRunCommand struct {
 	Kind           string  `json:"kind"`
 	Mode           string  `json:"mode,omitempty"`
 	ConfirmReplace bool    `json:"confirmReplace,omitempty"`
 	NodeIDs        []int64 `json:"nodeIds,omitempty"`
+	// BatchID is the parent batch of a supplement/incremental_design run (spec
+	// §7.6). It is required for those kinds and ignored otherwise.
+	BatchID int64 `json:"batchId,omitempty"`
 }
 
 // RunService coordinates the asynchronous design, review and data-plan agent
@@ -111,18 +119,23 @@ func runProfile(kind string) (profileKey, promptVersion string) {
 		return domain.ProfileKeyCaseReview, domain.PromptVersionReview
 	case domain.RunKindDataPlan:
 		return domain.ProfileKeyCaseDataPlan, domain.PromptVersionDataPlan
+	case RunKindSupplement, RunKindIncrementalDesign:
+		// Both P7 kinds run through the supplement-agent profile (spec §9.1/§9.2).
+		return ProfileKeySupplement, PromptVersionSupplement
 	default:
 		return "", ""
 	}
 }
 
-// runHardTimeout is the profile HardTimeout of one kind (spec §8.1).
+// runHardTimeout is the profile HardTimeout of one kind (spec §8.1/§9.1).
 func runHardTimeout(kind string) time.Duration {
 	switch kind {
 	case domain.RunKindDesign, domain.RunKindReview:
 		return 90 * time.Second
 	case domain.RunKindDataPlan, domain.RunKindExplore:
 		return 60 * time.Second
+	case RunKindSupplement, RunKindIncrementalDesign:
+		return 120 * time.Second
 	default:
 		return 90 * time.Second
 	}
@@ -131,11 +144,17 @@ func runHardTimeout(kind string) time.Duration {
 // runStartAllowed reports whether a run of kind may start at the version status.
 // Review runs are read-only, so they stay allowed after the baseline froze the
 // version to executing (spec §6.4 rule 3); design/data_plan write the graph and
-// need an editable version.
+// need an editable version. The P7 supplement run runs after a terminal baseline
+// batch (executing); the incremental_design run runs while the version continues
+// (continuing; the continue_phase=designing check is separate).
 func runStartAllowed(kind, status string) bool {
 	switch kind {
 	case domain.RunKindReview:
 		return status == versionStatusDesigning || status == versionStatusReviewing || status == "executing"
+	case RunKindSupplement:
+		return status == versionStatusExecuting
+	case RunKindIncrementalDesign:
+		return status == versionStatusContinuing
 	default:
 		return status == versionStatusDesigning || status == versionStatusReviewing
 	}
@@ -143,10 +162,109 @@ func runStartAllowed(kind, status string) bool {
 
 // runAllowedStates is the human-readable status list of runStartAllowed.
 func runAllowedStates(kind string) string {
-	if kind == domain.RunKindReview {
+	switch kind {
+	case domain.RunKindReview:
 		return "designing, reviewing or executing"
+	case RunKindSupplement:
+		return "executing"
+	case RunKindIncrementalDesign:
+		return "continuing (designing phase)"
+	default:
+		return "designing or reviewing"
 	}
-	return "designing or reviewing"
+}
+
+// isSupplementRunKind reports whether kind is one of the P7 supplement kinds.
+func isSupplementRunKind(kind string) bool {
+	return kind == RunKindSupplement || kind == RunKindIncrementalDesign
+}
+
+// runNormalizeCommand applies the kind-specific defaults of the P7 runs: the
+// post_batch / incremental_design mode recorded in the run input and instruction
+// (spec §6.4.1).
+func runNormalizeCommand(cmd StartRunCommand) StartRunCommand {
+	if strings.TrimSpace(cmd.Mode) != "" {
+		return cmd
+	}
+	switch cmd.Kind {
+	case RunKindSupplement:
+		cmd.Mode = supplementRunModePost
+	case RunKindIncrementalDesign:
+		cmd.Mode = supplementRunModeDesign
+	}
+	return cmd
+}
+
+// runEncodeStartInput persists the start command of spec §7.6. The parent batch
+// id is written as a decimal JSON string (D29) so every new reader sees the P7
+// boundary convention; runStoredInput still accepts the legacy number shape.
+func runEncodeStartInput(cmd StartRunCommand) ([]byte, error) {
+	input := struct {
+		Kind           string  `json:"kind"`
+		Mode           string  `json:"mode,omitempty"`
+		ConfirmReplace bool    `json:"confirmReplace,omitempty"`
+		NodeIDs        []int64 `json:"nodeIds,omitempty"`
+		BatchID        string  `json:"batchId,omitempty"`
+	}{
+		Kind:           cmd.Kind,
+		Mode:           cmd.Mode,
+		ConfirmReplace: cmd.ConfirmReplace,
+		NodeIDs:        cmd.NodeIDs,
+	}
+	if cmd.BatchID > 0 {
+		input.BatchID = strconv.FormatInt(cmd.BatchID, 10)
+	}
+	encoded, err := json.Marshal(input)
+	if err != nil {
+		return nil, fmt.Errorf("mindmap: encode run input: %w", err)
+	}
+	return encoded, nil
+}
+
+// validateSupplementParentBatch enforces the parent-batch preconditions of spec
+// §5.3/§7.6 for the P7 run kinds when the optional execution-batch reader is
+// wired: the parent batch must belong to the version and be its latest terminal
+// batch. A nil reader is not a silent bypass: the run starts with the
+// batch_precondition_unavailable warning recorded in its stats.
+func (s *RunService) validateSupplementParentBatch(ctx context.Context, versionID int64, cmd StartRunCommand) (*IncrementalPlanWarning, error) {
+	if !isSupplementRunKind(cmd.Kind) {
+		return nil, nil
+	}
+	if s.deps.Batches == nil {
+		return &IncrementalPlanWarning{
+			Code:    planWarningBatchUnavailable,
+			Message: "the execution batch reader is not configured; the parent batch preconditions were not verified",
+		}, nil
+	}
+	batch, err := s.deps.Batches.GetBatch(ctx, cmd.BatchID)
+	if errors.Is(err, ErrSupplementBatchNotFound) {
+		return nil, domain.NewInvalid("batchId", "invalid_batch_id",
+			fmt.Sprintf("parent batch %d does not exist", cmd.BatchID))
+	}
+	if err != nil {
+		return nil, fmt.Errorf("mindmap: read parent batch %d: %w", cmd.BatchID, err)
+	}
+	if batch.VersionID != versionID {
+		return nil, domain.NewInvalid("batchId", "invalid_batch_id",
+			fmt.Sprintf("parent batch %d belongs to version %d, not %d", batch.ID, batch.VersionID, versionID))
+	}
+	if !supplementBatchTerminal(batch.Status) {
+		return nil, domain.NewStateConflict("version_state_conflict",
+			fmt.Sprintf("parent batch %d is %s; a %s run needs a terminal parent batch", batch.ID, batch.Status, cmd.Kind))
+	}
+	latest, err := s.deps.Batches.LatestTerminalBatch(ctx, versionID)
+	if errors.Is(err, ErrSupplementBatchNotFound) {
+		return nil, domain.NewStateConflict("version_state_conflict",
+			fmt.Sprintf("version %d has no terminal batch; a %s run needs one", versionID, cmd.Kind))
+	}
+	if err != nil {
+		return nil, fmt.Errorf("mindmap: read the latest terminal batch of version %d: %w", versionID, err)
+	}
+	if latest.ID != batch.ID {
+		return nil, domain.NewStateConflict("version_state_conflict",
+			fmt.Sprintf("parent batch %d is not the latest terminal batch %d of version %d", batch.ID, latest.ID, versionID))
+	}
+	return nil, nil
 }
 
 // Start validates the version state, the confirmed requirements and the
@@ -158,7 +276,11 @@ func (s *RunService) Start(ctx context.Context, versionID, actor int64, cmd Star
 	profileKey, promptVersion := runProfile(cmd.Kind)
 	if profileKey == "" {
 		return domain.CaseDesignRun{}, domain.NewInvalid("kind", "invalid_run_kind",
-			fmt.Sprintf("run kind %q is not design, review or data_plan", cmd.Kind))
+			fmt.Sprintf("run kind %q is not design, review, data_plan, supplement or incremental_design", cmd.Kind))
+	}
+	if isSupplementRunKind(cmd.Kind) && cmd.BatchID <= 0 {
+		return domain.CaseDesignRun{}, domain.NewInvalid("batchId", "invalid_batch_id",
+			fmt.Sprintf("a %s run requires the parent batch id", cmd.Kind))
 	}
 	if s.deps.Versions == nil || s.deps.Runs == nil || s.deps.Agents == nil {
 		return domain.CaseDesignRun{}, errors.New("mindmap: run coordinator ports are not configured")
@@ -172,6 +294,16 @@ func (s *RunService) Start(ctx context.Context, versionID, actor int64, cmd Star
 			fmt.Sprintf("version %d is %s; mindmap runs of kind %s need %s", versionID, version.Status,
 				cmd.Kind, runAllowedStates(cmd.Kind)))
 	}
+	if cmd.Kind == RunKindIncrementalDesign {
+		if err := s.requireDesigningContinuePhase(ctx, versionID); err != nil {
+			return domain.CaseDesignRun{}, err
+		}
+	}
+	batchWarning, err := s.validateSupplementParentBatch(ctx, versionID, cmd)
+	if err != nil {
+		return domain.CaseDesignRun{}, err
+	}
+	cmd = runNormalizeCommand(cmd)
 	requirements, err := s.confirmedRequirements(ctx, versionID)
 	if err != nil {
 		return domain.CaseDesignRun{}, err
@@ -191,9 +323,9 @@ func (s *RunService) Start(ctx context.Context, versionID, actor int64, cmd Star
 		return domain.CaseDesignRun{}, err
 	}
 	instruction, truncated := s.buildInstruction(ctx, version, cmd, requirements, runID)
-	input, err := json.Marshal(cmd)
+	input, err := runEncodeStartInput(cmd)
 	if err != nil {
-		return domain.CaseDesignRun{}, fmt.Errorf("mindmap: encode run input: %w", err)
+		return domain.CaseDesignRun{}, err
 	}
 	now := s.now()
 	run := domain.CaseDesignRun{
@@ -210,6 +342,17 @@ func (s *RunService) Start(ctx context.Context, versionID, actor int64, cmd Star
 	if truncated {
 		run.Stats = []byte(`{"contextTruncated":true}`)
 	}
+	if batchWarning != nil {
+		run.Stats = runMergeStats(run.Stats, map[string]any{
+			"warnings": []IncrementalPlanWarning{*batchWarning},
+		})
+	}
+	if isSupplementRunKind(cmd.Kind) {
+		// The migration column is the queryable parent-batch link of the P7
+		// supplement chain (T14/T16 read it back by batch id).
+		batchID := cmd.BatchID
+		run.BatchID = &batchID
+	}
 	run, err = s.deps.Runs.Create(ctx, run)
 	if err != nil {
 		return run, err
@@ -218,18 +361,18 @@ func (s *RunService) Start(ctx context.Context, versionID, actor int64, cmd Star
 	sessionID, err := s.deps.Agents.CreateSession(ctx, profileKey, runSessionTitle(version, cmd.Kind), actor,
 		fmt.Sprintf("version:%d", versionID), strconv.FormatInt(versionID, 10))
 	if err != nil {
-		return run, s.abortStart(ctx, run, err)
+		return s.abortOrDegradeStart(ctx, run, err)
 	}
 	agentRunID, err := s.deps.Agents.StartText(ctx, sessionID, instruction, actor)
 	if err != nil {
 		// The session exists but no run was started on it; abort it so the
 		// failed attempt does not leave an active orphan (best-effort).
 		_ = s.deps.Agents.Abort(ctx, sessionID, actor)
-		return run, s.abortStart(ctx, run, err)
+		return s.abortOrDegradeStart(ctx, run, err)
 	}
 	startedAt := s.now()
 	// Keep the pre-update run: on a CAS failure the adapter returns no row, and
-	// abortStart needs the persisted id/status to release the run and the
+	// the compensation needs the persisted id/status to release the run and the
 	// single-flight slot.
 	running, updateErr := s.deps.Runs.UpdateStatus(ctx, run.ID, domain.RunQueued, domain.RunRunning, RunPatch{
 		AgentSessionID: &sessionID,
@@ -238,11 +381,60 @@ func (s *RunService) Start(ctx context.Context, versionID, actor int64, cmd Star
 	})
 	if updateErr != nil {
 		_ = s.deps.Agents.Abort(ctx, sessionID, actor)
-		return run, s.abortStart(ctx, run, updateErr)
+		return s.abortOrDegradeStart(ctx, run, updateErr)
 	}
 	run = running
 	s.publishRunEvent(ctx, run, domain.EventCaseRunStarted, "", nil)
 	return run, nil
+}
+
+// abortOrDegradeStart compensates a failed agent start. The P7 supplement kinds
+// become degraded instead of failed so an unavailable LLM never blocks the
+// autonomous chain (spec §9.7); every legacy kind keeps the ai_unavailable
+// failure.
+func (s *RunService) abortOrDegradeStart(ctx context.Context, run domain.CaseDesignRun, cause error) (domain.CaseDesignRun, error) {
+	if !isSupplementRunKind(run.Kind) {
+		return run, s.abortStart(ctx, run, cause)
+	}
+	degraded, err := s.degradeRunStart(ctx, run)
+	if err != nil {
+		return run, err
+	}
+	return degraded, nil
+}
+
+// degradeRunStart moves a queued supplement run to degraded after the agent
+// runtime could not be started (spec §6.4.5/§9.7).
+func (s *RunService) degradeRunStart(ctx context.Context, run domain.CaseDesignRun) (domain.CaseDesignRun, error) {
+	finished := s.now()
+	updated, err := s.deps.Runs.UpdateStatus(ctx, run.ID, run.Status, domain.RunDegraded, RunPatch{
+		Errors:     runFailureErrors("ai_unavailable", nil),
+		FinishedAt: &finished,
+	})
+	if err != nil {
+		return run, fmt.Errorf("mindmap: start run %d failed and could not be degraded: %w", run.ID, err)
+	}
+	s.publishRunEvent(ctx, updated, domain.EventCaseRunFinished, "ai_unavailable", nil)
+	return updated, nil
+}
+
+// requireDesigningContinuePhase enforces the continue_phase=designing half of the
+// incremental_design gate (spec §7.6) when the version adapter exposes the phase
+// through the optional P7 ContinuePhaseReader.
+func (s *RunService) requireDesigningContinuePhase(ctx context.Context, versionID int64) error {
+	reader, ok := s.deps.Versions.(ContinuePhaseReader)
+	if !ok {
+		return nil
+	}
+	phase, err := reader.ContinuePhase(ctx, versionID)
+	if err != nil {
+		return fmt.Errorf("mindmap: read continue phase of version %d: %w", versionID, err)
+	}
+	if phase != continuePhaseDesigning {
+		return domain.NewStateConflict("version_state_conflict",
+			fmt.Sprintf("version %d continue phase is %q; incremental_design needs designing", versionID, phase))
+	}
+	return nil
 }
 
 // abortStart compensates a failed agent-session start: the queued run becomes
@@ -317,7 +509,7 @@ func (s *RunService) processRun(ctx context.Context, run domain.CaseDesignRun) e
 	switch run.Status {
 	case domain.RunQueued:
 		if !run.CreatedAt.IsZero() && s.now().Sub(run.CreatedAt) > runQueuedStartTimeout {
-			return s.failRun(ctx, run, "agent_start_timeout", nil)
+			return s.failOrDegrade(ctx, run, "agent_start_timeout")
 		}
 		return nil
 	case domain.RunRunning:
@@ -333,10 +525,10 @@ func (s *RunService) processRun(ctx context.Context, run domain.CaseDesignRun) e
 		if run.AgentSessionID != nil && s.deps.Agents != nil {
 			_ = s.deps.Agents.Abort(ctx, *run.AgentSessionID, run.CreatedBy)
 		}
-		return s.failRun(ctx, run, "agent_timeout", nil)
+		return s.failOrDegrade(ctx, run, "agent_timeout")
 	}
 	if run.AgentSessionID == nil {
-		return s.failRun(ctx, run, "agent_start_timeout", nil)
+		return s.failOrDegrade(ctx, run, "agent_start_timeout")
 	}
 	if s.deps.Agents == nil {
 		return errors.New("mindmap: agent runtime is not configured")
@@ -353,7 +545,7 @@ func (s *RunService) processRun(ctx context.Context, run domain.CaseDesignRun) e
 	case "done", "completed", "succeeded":
 		return s.materializeRun(ctx, run)
 	case "failed", "aborted", "interrupted":
-		return s.failRun(ctx, run, "agent_"+status, nil)
+		return s.failOrDegrade(ctx, run, "agent_"+status)
 	default:
 		return nil
 	}
@@ -426,6 +618,20 @@ func (s *RunService) RecoverStale(ctx context.Context) (int64, error) {
 // and publishes the run-finished event. The event is published only when the
 // transition won the status CAS.
 func (s *RunService) failRun(ctx context.Context, run domain.CaseDesignRun, reason string, validationErrors []string) error {
+	return s.finishRun(ctx, run, domain.RunFailed, reason, validationErrors)
+}
+
+// failOrDegrade fails a legacy run and degrades a P7 supplement run, so an
+// unavailable/timeout LLM never blocks the autonomous chain (spec §9.7).
+func (s *RunService) failOrDegrade(ctx context.Context, run domain.CaseDesignRun, reason string) error {
+	if isSupplementRunKind(run.Kind) {
+		return s.finishRun(ctx, run, domain.RunDegraded, reason, nil)
+	}
+	return s.finishRun(ctx, run, domain.RunFailed, reason, nil)
+}
+
+// finishRun applies one terminal status to an active run under the status CAS.
+func (s *RunService) finishRun(ctx context.Context, run domain.CaseDesignRun, status, reason string, validationErrors []string) error {
 	validationErrors = runCapValidationErrors(validationErrors)
 	finished := s.now()
 	patch := RunPatch{
@@ -435,9 +641,9 @@ func (s *RunService) failRun(ctx context.Context, run domain.CaseDesignRun, reas
 	if len(validationErrors) > 0 {
 		patch.Stats = runMergeStats(run.Stats, map[string]any{"validationErrors": validationErrors})
 	}
-	updated, err := s.deps.Runs.UpdateStatus(ctx, run.ID, run.Status, domain.RunFailed, patch)
+	updated, err := s.deps.Runs.UpdateStatus(ctx, run.ID, run.Status, status, patch)
 	if err != nil {
-		return fmt.Errorf("mindmap: fail run %d (%s): %w", run.ID, reason, err)
+		return fmt.Errorf("mindmap: finish run %d as %s (%s): %w", run.ID, status, reason, err)
 	}
 	s.publishRunEvent(ctx, updated, domain.EventCaseRunFinished, reason, nil)
 	return nil
@@ -826,6 +1032,9 @@ func (s *RunService) graphInstructionIndexes(ctx context.Context, versionID int6
 // runSubmitInstruction is the mandatory task footer of spec §8.3 point 7. It is
 // always the last block of the instruction and names the submission tool.
 func runSubmitInstruction(kind string) string {
+	if kind == RunKindSupplement || kind == RunKindIncrementalDesign {
+		return supplementSubmitInstruction(kind)
+	}
 	tool, role := "case.graph_propose", "结构化用例提案"
 	switch kind {
 	case domain.RunKindReview:
@@ -839,6 +1048,24 @@ func runSubmitInstruction(kind string) string {
 	builder.WriteString("禁止编造：需求 ID 必须来自上文已确认需求；文件路径必须来自代码事实或仓库真实路径；不得编造需求、文件、接口或页面。\n")
 	builder.WriteString("失败处理：如果信息不足或工具不可用，明确说明缺少什么（需求、文件、接口或数据），不要猜测，也不要提交不完整的提案。\n")
 	fmt.Fprintf(&builder, "最后确认：必须调用 %s 完成提交（*_submit 工具），不要只输出文字。\n", tool)
+	return builder.String()
+}
+
+// supplementSubmitInstruction is the task footer of the two P7 supplement kinds
+// (spec §9.2). The agent submits through the supplement.* tools instead of a
+// single *_submit tool; a run without findings may finish immediately.
+func supplementSubmitInstruction(kind string) string {
+	var builder strings.Builder
+	builder.WriteString("\n## 任务与提交要求\n")
+	if kind == RunKindIncrementalDesign {
+		builder.WriteString("任务：为继续中的版本做增量设计。先读取已确认需求、现有脑图、最近结果摘要与 P4 影响摘要，再给出新增用例与受影响的旧用例。\n")
+	} else {
+		builder.WriteString("任务：为已完成基线批次的版本做一次后补全。先读取已确认需求、现有脑图与覆盖矩阵，找出缺失或薄弱的用例。\n")
+	}
+	builder.WriteString("提交：新增用例必须调用 supplement.case_propose（单次运行最多 5 条；每条至少 1 个步骤、1 个断言、至少 1 个已确认需求来源）。\n")
+	builder.WriteString("增量设计：调用 supplement.affected_cases_propose 给出受影响的旧用例（最多 20 条；高/中置信默认标记，低置信仅展示）。\n")
+	builder.WriteString("需求缺口：调用 supplement.escalate（最多 3 条），不得自行编造需求。无发现时直接结束，不要提交空提案。\n")
+	builder.WriteString("约束：补全不改基线；只提议，不直接写库。\n")
 	return builder.String()
 }
 
