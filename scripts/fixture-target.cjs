@@ -24,6 +24,18 @@
 //   GET  /p5/admin      -> session-cookie guarded page; without the cookie 302 /login.
 //   GET  /api/orders    -> {"orders":[...]} JSON.
 //   GET  /api/orders/{id} -> one order JSON; unknown ids answer 404 JSON.
+//
+// P6 additive execution fixtures (design spec §10.2):
+//   GET/POST /p6/login    -> form login; success sets the p6_session cookie and
+//                            302 /p6/home, wrong creds show .login-error, and
+//                            ?mfa=1 renders the #mfa challenge instead.
+//   GET  /p6/home         -> authenticated page with orders/new/logout nav.
+//   GET  /p6/orders       -> three-order list; /p6/orders/{id} -> detail.
+//   GET/POST /p6/orders/new -> form + in-memory order creation.
+//   GET  /api/p6/orders[/{id}] -> JSON list/detail.
+//   GET  /p6/slow?ms=8000 -> deliberately slow page for pause tests.
+//   GET  /p6/assert-fail  -> page whose result text contradicts the expectation.
+//   GET  /p6/requires-auth-> authenticated page that 302s to /p6/login.
 // Existing routes and their behavior are unchanged.
 
 const http = require("node:http");
@@ -252,6 +264,257 @@ function p5OrderNotFoundPage() {
 `;
 }
 
+// --- P6 execution fixtures (design spec §10.2) -----------------------------
+
+const P6_USERNAME = "fixture";
+const P6_PASSWORD = "fixture-pass";
+const P6_COOKIE = "p6_session";
+const P6_SESSION_VALUE = "ok";
+const P6_ORDERS = [
+  { id: 1, number: "P6-ORDER-1", status: "created", amount: 100, currency: "CNY" },
+  { id: 2, number: "P6-ORDER-2", status: "paid", amount: 250, currency: "CNY" },
+  { id: 3, number: "P6-ORDER-3", status: "cancelled", amount: 75, currency: "CNY" },
+];
+
+const P6_LOGIN_FORM = `
+    <form method="post" action="/p6/login">
+      <label for="username">Username</label>
+      <input id="username" name="username" type="text" autocomplete="username" required />
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required />
+      <button type="submit">Sign in</button>
+    </form>`;
+
+/** One P6 login page; `mfa` renders the visible #mfa challenge block. */
+function p6LoginPage(message, mfa) {
+  const error = message ? `<p class="login-error" role="alert">${message}</p>` : "";
+  const challenge = mfa
+    ? `<section id="mfa" aria-label="MFA challenge"><h2>MFA required</h2><p>Enter the authenticator code.</p></section>`
+    : "";
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>P6 Login</title>
+  </head>
+  <body>
+    <main>
+      <h1>P6 Login</h1>
+      ${error}
+      ${challenge}
+      ${P6_LOGIN_FORM}
+    </main>
+  </body>
+</html>
+`;
+}
+
+function p6MfaPage() {
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>P6 MFA</title>
+  </head>
+  <body>
+    <main>
+      <h1>P6 MFA</h1>
+      <section id="mfa" aria-label="MFA challenge">
+        <p>Multi-factor authentication is required. Continue in the authenticated session.</p>
+      </section>
+    </main>
+  </body>
+</html>
+`;
+}
+
+const P6_HOME_PAGE = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>P6 Home</title>
+  </head>
+  <body>
+    <main id="p6-home">
+      <h1>P6 Home</h1>
+      <nav aria-label="P6 navigation">
+        <a href="/p6/orders">Orders</a>
+        <a href="/p6/orders/new">New order</a>
+        <a href="/p6/logout">Logout</a>
+      </nav>
+      <p>Signed in to the P6 fixture application.</p>
+    </main>
+  </body>
+</html>
+`;
+
+const P6_ORDERS_PAGE = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>P6 Orders</title>
+  </head>
+  <body>
+    <main>
+      <h1>P6 Orders</h1>
+      <nav aria-label="P6 navigation">
+        <a href="/p6/home">Home</a>
+        <a href="/p6/orders/new">New order</a>
+      </nav>
+      <ul id="orders">
+        ${P6_ORDERS.map(
+          (order) =>
+            `<li><a href="/p6/orders/${order.id}">${order.number}</a> <span class="order-status">${order.status}</span> <span class="order-amount">${order.amount} ${order.currency}</span></li>`,
+        ).join("\n        ")}
+      </ul>
+    </main>
+  </body>
+</html>
+`;
+
+function p6OrderPage(order) {
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>P6 Order ${order.id}</title>
+  </head>
+  <body>
+    <main>
+      <h1>P6 Order ${order.id}</h1>
+      <dl>
+        <dt>Number</dt><dd id="order-number">${order.number}</dd>
+        <dt>Status</dt><dd id="order-status">${order.status}</dd>
+        <dt>Amount</dt><dd id="order-amount">${order.amount} ${order.currency}</dd>
+      </dl>
+      <a href="/p6/orders">Order list</a>
+    </main>
+  </body>
+</html>
+`;
+}
+
+function p6OrderNotFoundPage() {
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>P6 Order not found</title>
+  </head>
+  <body>
+    <main>
+      <h1>P6 Order not found</h1>
+      <a href="/p6/orders">Order list</a>
+    </main>
+  </body>
+</html>
+`;
+}
+
+const P6_NEW_ORDER_PAGE = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>P6 New order</title>
+  </head>
+  <body>
+    <main>
+      <h1>New order</h1>
+      <form method="post" action="/p6/orders/new">
+        <label for="order-number">Order number</label>
+        <input id="order-number" name="number" type="text" value="" required />
+        <label for="order-amount">Amount</label>
+        <input id="order-amount" name="amount" type="number" value="100" min="0" />
+        <button type="submit">Create order</button>
+      </form>
+      <a href="/p6/orders">Order list</a>
+    </main>
+  </body>
+</html>
+`;
+
+const P6_ASSERT_FAIL_PAGE = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>P6 Assert fail</title>
+  </head>
+  <body>
+    <main>
+      <h1>P6 Assert fail</h1>
+      <p id="result">P6 assert-fail: unexpected result, the expected success text is absent.</p>
+      <a href="/p6/orders">Order list</a>
+    </main>
+  </body>
+</html>
+`;
+
+const P6_REQUIRES_AUTH_PAGE = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>P6 Requires auth</title>
+  </head>
+  <body>
+    <main>
+      <h1>P6 Requires auth</h1>
+      <p>Authenticated page. A missing session redirects to the login form.</p>
+      <a href="/p6/home">Home</a>
+    </main>
+  </body>
+</html>
+`;
+
+function p6SessionCookie() {
+  return `${P6_COOKIE}=${P6_SESSION_VALUE}; HttpOnly; Path=/; SameSite=Lax`;
+}
+
+function p6Authorized(req) {
+  return readCookie(req, P6_COOKIE) === P6_SESSION_VALUE;
+}
+
+function p6OrderById(rawId) {
+  const id = Number.parseInt(rawId, 10);
+  return P6_ORDERS.find((order) => order.id === id) || null;
+}
+
+/** Creates one in-memory order and returns it. */
+function p6CreateOrder(number, amount) {
+  const id = P6_ORDERS.reduce((max, order) => Math.max(max, order.id), 0) + 1;
+  const order = {
+    id,
+    number: number.trim() || `P6-ORDER-${id}`,
+    status: "created",
+    amount: Number.isFinite(amount) ? amount : 0,
+    currency: "CNY",
+  };
+  P6_ORDERS.push(order);
+  return order;
+}
+
+/** GET renders the form; POST validates the fixture credentials. */
+function handleP6LoginGet(req, res, mfa) {
+  sendHtml(res, 200, p6LoginPage("", mfa));
+}
+
+async function handleP6LoginPost(req, res, mfa) {
+  const raw = await readBody(req);
+  const form = new URLSearchParams(raw);
+  const username = form.get("username") || "";
+  const password = form.get("password") || "";
+  if (username !== P6_USERNAME || password !== P6_PASSWORD) {
+    sendHtml(res, 401, p6LoginPage("Invalid username or password", mfa));
+    return;
+  }
+  if (mfa) {
+    // Password accepted, but the second factor is still outstanding: no session
+    // cookie is issued so the login flow detects #mfa and requests a takeover.
+    sendHtml(res, 200, p6MfaPage());
+    return;
+  }
+  redirect(res, "/p6/home", { "Set-Cookie": p6SessionCookie() });
+}
+
 function loginPage(message) {
   const error = message ? `<p role="alert">${message}</p>` : "";
   return `<!doctype html>
@@ -327,8 +590,10 @@ function handleP5Order(req, res, order) {
 
 async function handleRequest(req, res) {
   let pathname;
+  let requestUrl;
   try {
-    pathname = new URL(req.url, "http://" + HOST + ":" + PORT).pathname;
+    requestUrl = new URL(req.url, "http://" + HOST + ":" + PORT);
+    pathname = requestUrl.pathname;
   } catch {
     sendText(res, 400, "invalid request url");
     return;
@@ -426,6 +691,147 @@ async function handleRequest(req, res) {
       return;
     }
     handleP5Order(req, res, p5OrderById(p5OrderAPIPath[1]));
+    return;
+  }
+
+  // --- P6 additive execution fixtures (design spec §10.2) ------------------
+  // The routes below are new and leave every existing route untouched.
+  if (pathname === "/p6/login") {
+    if (req.method !== "GET" && req.method !== "POST") {
+      sendMethodNotAllowed(res, ["GET", "POST"]);
+      return;
+    }
+    const mfa = requestUrl.searchParams.get("mfa") === "1";
+    if (req.method === "GET") {
+      handleP6LoginGet(req, res, mfa);
+      return;
+    }
+    await handleP6LoginPost(req, res, mfa);
+    return;
+  }
+  if (pathname === "/p6/logout") {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      sendMethodNotAllowed(res, ["GET", "HEAD"]);
+      return;
+    }
+    redirect(res, "/p6/login", {
+      "Set-Cookie": `${P6_COOKIE}=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax`,
+    });
+    return;
+  }
+  if (pathname === "/p6/slow") {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      sendMethodNotAllowed(res, ["GET", "HEAD"]);
+      return;
+    }
+    const rawMs = Number.parseInt(requestUrl.searchParams.get("ms") || "", 10);
+    const delay = Number.isFinite(rawMs) ? Math.min(Math.max(rawMs, 0), 60000) : 8000;
+    setTimeout(() => {
+      sendHtml(
+        res,
+        200,
+        `<!doctype html><html lang="en"><head><meta charset="utf-8" /><title>P6 Slow</title></head><body><main><h1>P6 Slow</h1><p id="slow-result">Slow response complete after ${delay} ms.</p></main></body></html>\n`,
+      );
+    }, delay);
+    return;
+  }
+
+  const p6GuardedPage =
+    pathname === "/p6/home" ||
+    pathname === "/p6/orders" ||
+    pathname === "/p6/orders/new" ||
+    pathname === "/p6/assert-fail" ||
+    pathname === "/p6/requires-auth";
+  if (p6GuardedPage) {
+    if (pathname === "/p6/orders/new") {
+      if (req.method !== "GET" && req.method !== "POST" && req.method !== "HEAD") {
+        sendMethodNotAllowed(res, ["GET", "POST", "HEAD"]);
+        return;
+      }
+    } else if (req.method !== "GET" && req.method !== "HEAD") {
+      sendMethodNotAllowed(res, ["GET", "HEAD"]);
+      return;
+    }
+    if (!p6Authorized(req)) {
+      redirect(res, "/p6/login");
+      return;
+    }
+    if (pathname === "/p6/home") {
+      sendHtml(res, 200, P6_HOME_PAGE);
+      return;
+    }
+    if (pathname === "/p6/orders") {
+      sendHtml(res, 200, P6_ORDERS_PAGE);
+      return;
+    }
+    if (pathname === "/p6/orders/new") {
+      if (req.method === "POST") {
+        const raw = await readBody(req);
+        const form = new URLSearchParams(raw);
+        const amount = Number.parseFloat(form.get("amount") || "0");
+        const order = p6CreateOrder(form.get("number") || "", amount);
+        redirect(res, `/p6/orders/${order.id}`);
+        return;
+      }
+      sendHtml(res, 200, P6_NEW_ORDER_PAGE);
+      return;
+    }
+    if (pathname === "/p6/assert-fail") {
+      sendHtml(res, 200, P6_ASSERT_FAIL_PAGE);
+      return;
+    }
+    sendHtml(res, 200, P6_REQUIRES_AUTH_PAGE);
+    return;
+  }
+
+  const p6OrderPagePath = /^\/p6\/orders\/(\d+)$/.exec(pathname);
+  if (p6OrderPagePath !== null) {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      sendMethodNotAllowed(res, ["GET", "HEAD"]);
+      return;
+    }
+    if (!p6Authorized(req)) {
+      redirect(res, "/p6/login");
+      return;
+    }
+    const order = p6OrderById(p6OrderPagePath[1]);
+    if (order === null) {
+      sendHtml(res, 404, p6OrderNotFoundPage());
+      return;
+    }
+    sendHtml(res, 200, p6OrderPage(order));
+    return;
+  }
+
+  if (pathname === "/api/p6/orders") {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      sendMethodNotAllowed(res, ["GET", "HEAD"]);
+      return;
+    }
+    if (!p6Authorized(req)) {
+      sendJson(res, 401, { error: "unauthorized" });
+      return;
+    }
+    sendJson(res, 200, { orders: P6_ORDERS });
+    return;
+  }
+
+  const p6OrderAPIPath = /^\/api\/p6\/orders\/(\d+)$/.exec(pathname);
+  if (p6OrderAPIPath !== null) {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      sendMethodNotAllowed(res, ["GET", "HEAD"]);
+      return;
+    }
+    if (!p6Authorized(req)) {
+      sendJson(res, 401, { error: "unauthorized" });
+      return;
+    }
+    const order = p6OrderById(p6OrderAPIPath[1]);
+    if (order === null) {
+      sendJson(res, 404, { error: "order not found" });
+      return;
+    }
+    sendJson(res, 200, order);
     return;
   }
 

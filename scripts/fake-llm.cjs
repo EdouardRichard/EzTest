@@ -12,6 +12,8 @@
 //   POST /__p4-mode             (test-only: switch the P4 scenario at runtime)
 //   GET  /__p5-mode             (test-only: the active P5 mindmap scenario mode)
 //   POST /__p5-mode             (test-only: switch the P5 scenario at runtime)
+//   GET  /__p6-mode             (test-only: the active P6 execution scenario mode)
+//   POST /__p6-mode             (test-only: switch the P6 scenario at runtime)
 //
 // Every chat-completions request body is appended as one JSON line to
 // .tmp/fake-llm-requests.jsonl so Playwright can assert the outbound wire
@@ -1448,6 +1450,319 @@ async function handleP5Scenario(messages, res, stream) {
   return true;
 }
 
+// --- P6 deterministic execution scenarios (design spec §10.2) --------------
+//
+// P6 requests are identified by the stable Chinese system-prompt marker of the
+// execution-agent profile (`backend/internal/execution/domain/profile.go`,
+// spec §7.2). Every run is scripted from the number of assistant tool turns
+// already present after the run instruction (same counting trick as P3/P5):
+//
+//   normal   case_context -> goto (/p6/orders/new) -> snapshot -> fill -> click
+//            -> screenshot -> step_record xN -> assertion_record xM -> case_finish(passed)
+//   fail     case_context -> goto (/p6/assert-fail) -> snapshot -> screenshot
+//            -> step_record xN -> assertion_record xM(failed) -> case_finish(failed, application)
+//   blocked  case_context -> goto (/p6/requires-auth) -> snapshot -> screenshot
+//            -> records -> case_finish(blocked, environment)
+//   takeover case_context -> goto (/p6/login?mfa=1) -> snapshot -> screenshot
+//            -> records -> case_finish(blocked, session, reason=mfa_required)
+//   budget   case_context -> two slow goto turns (pause window) -> snapshots forever
+//
+// The recorder validates step/assertion completeness and evidence, so the
+// blocked takeover scenarios also record every step/assertion before finishing.
+// The browser screenshot tool is the evidence source: its `evidence_id` is
+// reused in the step/assertion/finish submissions.
+//
+// Modes: normal (default) | fail | blocked | takeover | budget.
+// `POST /__p6-mode` switches the mode at runtime; every mode answers through
+// the same system prompt so the E2E can switch without restarting the fake.
+const P6_EXECUTION_MARKER = "EzTest 的执行 Agent";
+const P6_MODES = new Set(["normal", "fail", "blocked", "takeover", "budget"]);
+const P6_TOOL_USAGE = makeUsage(960, 220, 96);
+const P6_TEXT_USAGE = makeUsage(220, 24, 0);
+const P6_FINAL_TEXT = "P6 执行结束：已提交用例的步骤、断言与最终结果。";
+const P6_EMPTY_CONTEXT_TEXT = "P6 执行结束：未能读取用例上下文，本轮未提交任何结果。";
+const P6_ORDER_FORM_PATH = "/p6/orders/new";
+const P6_FAIL_PATH = "/p6/assert-fail";
+const P6_REQUIRES_AUTH_PATH = "/p6/requires-auth";
+const P6_MFA_PATH = "/p6/login?mfa=1";
+
+/** Test-only runtime control of EZTEST_FAKE_LLM_P6_MODE (spec §10.2). */
+async function handleP6ModeControl(req, res) {
+  const raw = await readBody(req);
+  let body;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    sendError(res, 400, "invalid json body");
+    return;
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    sendError(res, 400, "invalid json body");
+    return;
+  }
+  const mode = String(body.mode || "")
+    .trim()
+    .toLowerCase();
+  if (!P6_MODES.has(mode)) {
+    sendError(res, 400, "mode must be one of normal, fail, blocked, takeover, budget");
+    return;
+  }
+  process.env.EZTEST_FAKE_LLM_P6_MODE = mode;
+  sendJson(res, 200, { mode: p6Mode() });
+}
+
+function p6Mode() {
+  const value = String(process.env.EZTEST_FAKE_LLM_P6_MODE || "normal")
+    .trim()
+    .toLowerCase();
+  return P6_MODES.has(value) ? value : "normal";
+}
+
+/** Matches the execution-agent system prompt; null for P1-P5. */
+function detectP6Scenario(systemText) {
+  return systemText.includes(P6_EXECUTION_MARKER) ? "execution" : null;
+}
+
+/** Appends the compact P6 request line (never the prompt or case data). */
+function recordP6Request(mode, step) {
+  const entry = { p6: true, mode, step };
+  try {
+    fs.appendFileSync(REQUEST_LOG_PATH, JSON.stringify(entry) + "\n", "utf8");
+  } catch (error) {
+    console.error("fake-llm: failed to append the request log: " + error.message);
+  }
+}
+
+/** Parses one tool result JSON object; null when it is not an object. */
+function p6ParseObject(text) {
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Returns the latest parsed execution.case_context result, or null. */
+function p6CaseContext(toolResults) {
+  for (let index = toolResults.length - 1; index >= 0; index -= 1) {
+    if (toolResults[index].name !== "execution_case_context") continue;
+    const parsed = p6ParseObject(toolResults[index].text);
+    if (parsed !== null) return parsed;
+  }
+  return null;
+}
+
+/** Returns the latest screenshot evidence id, or "". */
+function p6EvidenceId(toolResults) {
+  for (let index = toolResults.length - 1; index >= 0; index -= 1) {
+    if (toolResults[index].name !== "browser_screenshot") continue;
+    const parsed = p6ParseObject(toolResults[index].text);
+    if (parsed !== null && typeof parsed.evidence_id === "string" && /^\d+$/.test(parsed.evidence_id)) {
+      return parsed.evidence_id;
+    }
+  }
+  return "";
+}
+
+function p6Tool(name, args, reasoning) {
+  return { kind: "tool", name, arguments: JSON.stringify(args), reasoning };
+}
+
+function p6Text(text) {
+  return { kind: "text", text };
+}
+
+function p6JoinUrl(base, pathValue) {
+  return String(base || "").replace(/\/+$/, "") + pathValue;
+}
+
+/** Builds one browser.goto plan for the fixture page of the mode. */
+function p6GotoPlan(mode, baseUrl) {
+  const pathValue =
+    mode === "fail"
+      ? P6_FAIL_PATH
+      : mode === "blocked"
+        ? P6_REQUIRES_AUTH_PATH
+        : mode === "takeover"
+          ? P6_MFA_PATH
+          : P6_ORDER_FORM_PATH;
+  return p6Tool(
+    "browser_goto",
+    { url: p6JoinUrl(baseUrl, pathValue) },
+    "P6 执行：打开 " + pathValue,
+  );
+}
+
+/** Plans exactly one P6 turn from the mode and the already executed turns. */
+function planP6Turn(mode, run) {
+  if (run.step === 0) {
+    return p6Tool("execution_case_context", {}, "P6 执行：读取用例快照与恢复检查点");
+  }
+
+  const context = p6CaseContext(run.toolResults);
+  if (context === null) return p6Text(P6_EMPTY_CONTEXT_TEXT);
+
+  const finished = run.toolResults.some((result) => result.name === "execution_case_finish");
+  if (finished) return p6Text(P6_FINAL_TEXT);
+
+  const baseUrl = typeof context.base_url === "string" ? context.base_url : "";
+  if (mode === "budget") {
+    // Two slow navigations create a deterministic in-flight window for the
+    // immediate-pause E2E, then rapid snapshots exhaust the tool-call budget.
+    if (run.step === 1 || run.step === 2) {
+      return p6Tool(
+        "browser_goto",
+        { url: p6JoinUrl(baseUrl, "/p6/slow?ms=8000") },
+        "P6 预算场景：慢响应以验证暂停",
+      );
+    }
+    return p6Tool("browser_snapshot", {}, "P6 预算场景：继续调用工具");
+  }
+
+  const evidenceId = p6EvidenceId(run.toolResults);
+  const steps = (Array.isArray(context.remaining_steps) ? context.remaining_steps : []).filter(
+    (step) => step && Number.isInteger(step.seq) && step.seq > 0,
+  );
+  const assertions = (Array.isArray(context.assertions) ? context.assertions : []).filter(
+    (assertion) => assertion && typeof assertion.assertion_id === "string",
+  );
+
+  // The normal scenario exercises the fixture's create-order form; the other
+  // modes only need a page whose content supports the intended verdict.
+  const prepared =
+    mode === "normal"
+      ? [
+          p6GotoPlan(mode, baseUrl),
+          p6Tool("browser_snapshot", {}, "P6 执行：读取订单表单的 ARIA 快照"),
+          p6Tool(
+            "browser_fill",
+            { target: { selector: "#order-number" }, value: "P6-E2E-ORDER" },
+            "P6 执行：填写订单号",
+          ),
+          p6Tool(
+            "browser_click",
+            { target: { role: "button", name: "Create order" } },
+            "P6 执行：提交新建订单",
+          ),
+          p6Tool("browser_screenshot", {}, "P6 执行：截图作为断言证据"),
+        ]
+      : [
+          p6GotoPlan(mode, baseUrl),
+          p6Tool("browser_snapshot", {}, "P6 执行：读取页面 ARIA 快照"),
+          p6Tool("browser_screenshot", {}, "P6 执行：截图作为断言证据"),
+        ];
+
+  const phase = run.step - 1;
+  if (phase < prepared.length) return prepared[phase];
+  let index = phase - prepared.length;
+
+  if (index < steps.length) {
+    const step = steps[index];
+    if (evidenceId === "") return p6Text(P6_EMPTY_CONTEXT_TEXT);
+    return p6Tool(
+      "execution_step_record",
+      {
+        seq: step.seq,
+        status: "passed",
+        actual: "步骤执行成功",
+        evidence_ids: [evidenceId],
+      },
+      "P6 执行：记录步骤 " + step.seq,
+    );
+  }
+  index -= steps.length;
+
+  if (index < assertions.length) {
+    const assertion = assertions[index];
+    if (evidenceId === "") return p6Text(P6_EMPTY_CONTEXT_TEXT);
+    const failed = mode === "fail";
+    return p6Tool(
+      "execution_assertion_record",
+      {
+        assertion_id: assertion.assertion_id,
+        verdict: failed ? "failed" : "passed",
+        actual: failed ? "页面实际文案与用例期望不一致" : "断言通过：页面文案与期望一致",
+        evidence_ids: [evidenceId],
+      },
+      "P6 执行：记录断言 " + assertion.assertion_id,
+    );
+  }
+  index -= assertions.length;
+
+  if (index === 0) {
+    if (evidenceId === "") return p6Text(P6_EMPTY_CONTEXT_TEXT);
+    if (mode === "fail") {
+      return p6Tool(
+        "execution_case_finish",
+        { verdict: "failed", failure_class: "application", reason: "断言失败：页面文案与期望不一致" },
+        "P6 执行：用例判定为失败（应用缺陷）",
+      );
+    }
+    if (mode === "blocked") {
+      return p6Tool(
+        "execution_case_finish",
+        { verdict: "blocked", failure_class: "environment", reason: "环境不可达：fixture 目标请求失败" },
+        "P6 执行：用例判定为阻塞（环境）",
+      );
+    }
+    if (mode === "takeover") {
+      return p6Tool(
+        "execution_case_finish",
+        { verdict: "blocked", failure_class: "session", reason: "mfa_required：会话需要人工接管" },
+        "P6 执行：用例判定为阻塞（会话）",
+      );
+    }
+    return p6Tool(
+      "execution_case_finish",
+      {
+        verdict: "passed",
+        reason: "全部步骤与断言通过",
+        evidence_ids: [evidenceId],
+      },
+      "P6 执行：用例判定为通过",
+    );
+  }
+
+  return p6Text(P6_FINAL_TEXT);
+}
+
+/**
+ * Handles one P6 execution request. Returns true when the system prompt carried
+ * the execution-agent marker, false so P1-P5 stay untouched.
+ */
+async function handleP6Scenario(messages, res, stream) {
+  const kind = detectP6Scenario(systemPromptText(messages));
+  if (kind === null) return false;
+
+  const lastUser = findLastUserMessage(messages);
+  const run = lastUser ? describeP5Run(messages, lastUser.index) : { step: 0, toolResults: [] };
+  const mode = p6Mode();
+  recordP6Request(mode, run.step);
+
+  const plan = lastUser ? planP6Turn(mode, run) : p6Text(P6_EMPTY_CONTEXT_TEXT);
+  if (plan.kind === "tool") {
+    const message = {
+      content: null,
+      reasoning_content: plan.reasoning,
+      tool_calls: toolCallPayload(plan.name, plan.arguments, `p6_call_${run.step + 1}`),
+    };
+    if (stream) {
+      await streamToolTurn(res, message, P6_TOOL_USAGE);
+      return true;
+    }
+    sendJson(res, 200, completionBody(message, "tool_calls", P6_TOOL_USAGE));
+    return true;
+  }
+
+  if (stream) {
+    await streamTextTurn(res, plan.text, P6_TEXT_USAGE);
+    return true;
+  }
+  sendJson(res, 200, completionBody({ content: plan.text }, "stop", P6_TEXT_USAGE));
+  return true;
+}
+
 // --- scripted behaviors ----------------------------------------------------
 
 function diagnosticMessage() {
@@ -1549,6 +1864,11 @@ async function handleChatCompletions(req, res) {
   // guard: the plan/step counting must own every turn of the run, and the
   // degraded mode answers without any tool call.
   if (await handleP5Scenario(messages, res, stream)) return;
+
+  // P6 execution requests carry the execution-agent system marker. They are
+  // answered after P5 and before recordRequest so the execution plan owns every
+  // turn and P1-P5 request logging stays untouched.
+  if (await handleP6Scenario(messages, res, stream)) return;
 
   recordRequest(body);
 
@@ -1665,6 +1985,15 @@ async function handleRequest(req, res) {
   }
   if (req.method === "GET" && pathname === "/__p5-mode") {
     sendJson(res, 200, { mode: p5Mode() });
+    return;
+  }
+  // Test-only P6 execution scenario control (design spec §10.2).
+  if (req.method === "POST" && pathname === "/__p6-mode") {
+    await handleP6ModeControl(req, res);
+    return;
+  }
+  if (req.method === "GET" && pathname === "/__p6-mode") {
+    sendJson(res, 200, { mode: p6Mode() });
     return;
   }
   sendError(res, 404, "not found");
