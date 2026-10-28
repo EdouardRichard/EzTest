@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
   createAnchor: vi.fn(),
   deleteAnchor: vi.fn(),
   listRequirements: vi.fn(),
+  listAppModels: vi.fn(),
 }))
 
 vi.mock("./api", () => ({
@@ -22,6 +23,10 @@ vi.mock("@/features/versions/api", () => ({
   listRequirements: mocks.listRequirements,
 }))
 
+vi.mock("@/features/resources/api", () => ({
+  listAppModels: mocks.listAppModels,
+}))
+
 import { SourcePanel, type SourceRequirementOption } from "./SourcePanel"
 import type { CaseNodeView, CaseSourceView, CodeAnchorView } from "./types"
 
@@ -34,6 +39,8 @@ const ANCHOR1 = "1844674407370955166"
 const REQ1 = "1844674407370955170"
 const REQ2 = "1844674407370955171"
 const REQ3 = "1844674407370955172"
+const APP_MODEL_ID = 501
+const APP_MODEL_KEY = "page:/orders"
 
 const REQUIREMENTS: SourceRequirementOption[] = [
   { id: REQ1, title: "订单创建", status: "clarified" },
@@ -105,6 +112,7 @@ describe("SourcePanel", () => {
   beforeEach(() => {
     for (const mock of Object.values(mocks)) mock.mockReset()
     mocks.listRequirements.mockResolvedValue({ items: [], nextCursor: "", hasMore: false })
+    mocks.listAppModels.mockResolvedValue({ items: [], nextCursor: null, hasMore: false })
   })
 
   afterEach(cleanup)
@@ -155,6 +163,82 @@ describe("SourcePanel", () => {
       }),
     )
     await waitFor(() => expect(onChanged).toHaveBeenCalled())
+  })
+
+  it("posts the selected app model id and key for an app_model source", async () => {
+    mocks.listAppModels.mockResolvedValue({
+      items: [
+        {
+          id: APP_MODEL_ID,
+          systemId: 9,
+          parentId: null,
+          kind: "page",
+          key: APP_MODEL_KEY,
+          name: "订单列表",
+          path: "/orders",
+          method: "",
+          source: "manual",
+          meta: null,
+        },
+      ],
+      nextCursor: null,
+      hasMore: false,
+    })
+    mocks.createSource.mockResolvedValue(
+      source({
+        id: SRC3,
+        refKind: "app_model",
+        refId: String(APP_MODEL_ID),
+        refKey: APP_MODEL_KEY,
+      }),
+    )
+    const onChanged = vi.fn()
+    renderPanel({ node: node({ sources: [] }), systemId: 9, onChanged })
+
+    await waitFor(() => expect(mocks.listAppModels).toHaveBeenCalledWith(9, { limit: 100 }))
+
+    fireEvent.change(screen.getByLabelText("来源类型"), { target: { value: "app_model" } })
+    const picker = await screen.findByLabelText("选择应用模型")
+    fireEvent.change(picker, { target: { value: String(APP_MODEL_ID) } })
+    fireEvent.click(screen.getByRole("button", { name: "添加来源" }))
+
+    await waitFor(() =>
+      expect(mocks.createSource).toHaveBeenCalledWith(VERSION_ID, NODE_ID, {
+        refKind: "app_model",
+        refId: String(APP_MODEL_ID),
+        refKey: APP_MODEL_KEY,
+      }),
+    )
+    await waitFor(() => expect(onChanged).toHaveBeenCalled())
+  })
+
+  it("adds a manual source with only a refKey", async () => {
+    mocks.createSource.mockResolvedValue(
+      source({ id: SRC3, refKind: "manual", refId: null, refKey: "会议纪要" }),
+    )
+    const onChanged = vi.fn()
+    renderPanel({ node: node({ sources: [] }), onChanged })
+
+    fireEvent.change(screen.getByLabelText("来源类型"), { target: { value: "manual" } })
+    fireEvent.change(screen.getByLabelText("来源引用"), { target: { value: "会议纪要" } })
+    fireEvent.click(screen.getByRole("button", { name: "添加来源" }))
+
+    await waitFor(() =>
+      expect(mocks.createSource).toHaveBeenCalledWith(VERSION_ID, NODE_ID, {
+        refKind: "manual",
+        refKey: "会议纪要",
+      }),
+    )
+  })
+
+  it("explains that an app model source needs a bound system", () => {
+    renderPanel({ node: node({ sources: [] }), systemId: null })
+
+    fireEvent.change(screen.getByLabelText("来源类型"), { target: { value: "app_model" } })
+
+    expect((screen.getByLabelText("选择应用模型") as HTMLSelectElement).disabled).toBe(true)
+    expect(screen.getByText(/未绑定系统/)).toBeTruthy()
+    expect(mocks.listAppModels).not.toHaveBeenCalled()
   })
 
   it("adds and deletes code anchors through the API", async () => {

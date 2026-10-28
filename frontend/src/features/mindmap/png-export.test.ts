@@ -45,10 +45,14 @@ class MockImage {
 function makeSvg(viewBox: string | null = `0 0 ${VIEW_WIDTH} ${VIEW_HEIGHT}`): SVGSVGElement {
   const svg = document.createElementNS(SVG_NS, "svg")
   if (viewBox !== null) svg.setAttribute("viewBox", viewBox)
+  // Mirrors the canvas: the laid-out graph lives under one pan/zoom group.
+  const content = document.createElementNS(SVG_NS, "g")
+  content.setAttribute("transform", "translate(40 30) scale(2)")
   const rect = document.createElementNS(SVG_NS, "rect")
   rect.setAttribute("width", "10")
   rect.setAttribute("height", "10")
-  svg.appendChild(rect)
+  content.appendChild(rect)
+  svg.appendChild(content)
   return svg
 }
 
@@ -108,6 +112,15 @@ describe("svgToPngBlob", () => {
     expect(markup).toContain('xmlns="http://www.w3.org/2000/svg"')
     expect(markup).toContain(`viewBox="0 0 ${VIEW_WIDTH} ${VIEW_HEIGHT}"`)
     expect(markup).toContain("<rect")
+  })
+
+  it("resets the canvas pan/zoom transform so the PNG fits the whole graph", async () => {
+    await svgToPngBlob(makeSvg())
+
+    const source = imageSources[0] ?? ""
+    const markup = decodeURIComponent(source.slice(source.indexOf(",") + 1))
+    expect(markup).not.toContain("translate(40 30) scale(2)")
+    expect(markup).toContain('transform="translate(0 0)"')
   })
 
   it("honours an explicit export size", async () => {

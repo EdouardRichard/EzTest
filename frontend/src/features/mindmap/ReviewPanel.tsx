@@ -53,6 +53,8 @@ export type ReviewPanelProps = {
   versionId: string
   /** Server-authoritative graph snapshot used for status, baseline and node titles. */
   graph: MindmapGraph
+  /** Spec §6.3 status gate: review actions are only open designing/reviewing/executing. */
+  disabled?: boolean
   /** Notifies the page after a successful write so it can refetch the graph. */
   onChanged?: () => void
 }
@@ -65,7 +67,7 @@ export type ReviewPanelProps = {
  * non-empty comment. Failures surface the mapped Chinese `details.reason` copy
  * and never raw server text.
  */
-export function ReviewPanel({ versionId, graph, onChanged }: ReviewPanelProps) {
+export function ReviewPanel({ versionId, graph, disabled = false, onChanged }: ReviewPanelProps) {
   const uid = useId()
   const [findings, setFindings] = useState<CaseFindingView[]>(() => graph.findings ?? [])
   const [loading, setLoading] = useState(true)
@@ -280,7 +282,7 @@ export function ReviewPanel({ versionId, graph, onChanged }: ReviewPanelProps) {
             type="button"
             data-testid="btn-run-review"
             onClick={() => void startReview()}
-            disabled={startingRun}
+            disabled={disabled || startingRun}
             className={BUTTON_CLASS}
           >
             {startingRun ? (
@@ -293,7 +295,7 @@ export function ReviewPanel({ versionId, graph, onChanged }: ReviewPanelProps) {
               type="button"
               data-testid="btn-submit-review"
               onClick={() => void submitReview()}
-              disabled={deciding}
+              disabled={disabled || deciding}
               className={PRIMARY_BUTTON_CLASS}
             >
               提交评审
@@ -318,6 +320,12 @@ export function ReviewPanel({ versionId, graph, onChanged }: ReviewPanelProps) {
           {notice}
         </p>
       )}
+
+      {disabled ? (
+        <p data-testid="review-status-gate" className="mt-2 text-xs text-muted-foreground">
+          当前版本状态不开放评审操作（仅设计、评审、执行阶段开放）。
+        </p>
+      ) : null}
 
       {baselineView === null ? null : (
         <p
@@ -389,7 +397,7 @@ export function ReviewPanel({ versionId, graph, onChanged }: ReviewPanelProps) {
                             <button
                               type="button"
                               onClick={() => void markFinding(item.id, "fixed")}
-                              disabled={busyFindingId === item.id}
+                              disabled={disabled || busyFindingId === item.id}
                               className={BUTTON_CLASS}
                             >
                               {busyFindingId === item.id ? (
@@ -400,7 +408,7 @@ export function ReviewPanel({ versionId, graph, onChanged }: ReviewPanelProps) {
                             <button
                               type="button"
                               onClick={() => void markFinding(item.id, "dismissed")}
-                              disabled={busyFindingId === item.id}
+                              disabled={disabled || busyFindingId === item.id}
                               className={BUTTON_CLASS}
                             >
                               忽略
@@ -464,7 +472,7 @@ export function ReviewPanel({ versionId, graph, onChanged }: ReviewPanelProps) {
             type="button"
             data-testid="btn-reject"
             onClick={() => void decide("reject")}
-            disabled={rejectDisabled}
+            disabled={disabled || rejectDisabled}
             className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-card px-2.5 py-1.5 text-xs font-medium text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             {deciding ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : null}
@@ -474,7 +482,7 @@ export function ReviewPanel({ versionId, graph, onChanged }: ReviewPanelProps) {
             type="button"
             data-testid="btn-approve"
             onClick={() => void decide("approve")}
-            disabled={approveDisabled}
+            disabled={disabled || approveDisabled}
             className={PRIMARY_BUTTON_CLASS}
           >
             {deciding ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : null}

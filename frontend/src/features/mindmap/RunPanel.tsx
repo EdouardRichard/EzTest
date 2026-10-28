@@ -4,6 +4,7 @@ import { Loader2 } from "lucide-react"
 import { useEffect, useId, useMemo, useRef, useState } from "react"
 
 import { StatusBadge, type StatusBadgeVariant } from "@/components/ui/StatusBadge"
+import { useAuth } from "@/features/auth/AuthProvider"
 
 import { mindmapApi } from "./api"
 import { describeMindmapError } from "./error-messages"
@@ -138,25 +139,34 @@ export type RunPanelProps = {
   versionId: string
   /** Server-authoritative graph snapshot carrying `latestRuns`. */
   graph: MindmapGraph
+  /** P2-owned version binding used by the admin-only explore run (spec §6.3). */
+  systemId?: number | null
+  /** P2-owned version binding used by the admin-only explore run (spec §6.3). */
+  environmentId?: number | null
   /** Notifies the page after a run starts or reaches a terminal state. */
   onChanged?: () => void
 }
 
 /**
- * Run panel (spec §9.2): starts design/review/data_plan runs, renders the latest
- * run of each kind with its reason and counters, and keeps queued/running runs
- * fresh by polling `GET /runs/{runId}` every two seconds as the SSE fallback.
+ * Run panel (spec §9.2): starts design/review/data_plan runs, offers the
+ * admin-only explore run, renders the latest run of each kind with its reason
+ * and counters, and keeps queued/running runs fresh by polling
+ * `GET /runs/{runId}` every two seconds as the SSE fallback.
  * A failed/degraded run shows a banner with the mapped reason and the manual
  * path hint; AI unavailability never blocks manual editing. Replacing the draft
  * graph always asks for confirmation first (spec §6.7/§9.2).
  */
-export function RunPanel({ versionId, graph, onChanged }: RunPanelProps) {
+export function RunPanel({ versionId, graph, systemId, environmentId, onChanged }: RunPanelProps) {
+  const { user } = useAuth()
+  const isAdmin = user?.role === "admin"
+  const exploreBound = typeof systemId === "number" && typeof environmentId === "number"
   const uid = useId()
   const [details, setDetails] = useState<Partial<Record<RunKind, CaseRunView>>>({})
   const [starting, setStarting] = useState<RunKind | null>(null)
   const [error, setError] = useState("")
   const [notice, setNotice] = useState("")
   const [mode, setMode] = useState<"append" | "replace">("append")
+  const [exploreStartPaths, setExploreStartPaths] = useState("")
   const inFlightRef = useRef(new Set<string>())
   const onChangedRef = useRef(onChanged)
 
@@ -293,6 +303,47 @@ export function RunPanel({ versionId, graph, onChanged }: RunPanelProps) {
     return detail ?? null
   }
 
+  /**
+   * Admin-only exploration (spec §6.3): a read-only crawl of the bound
+   * environment that imports app-model nodes. Optional start paths are capped
+   * at the backend's limit of 10 (D36).
+   */
+  async function startExplore(): Promise<void> {
+    if (starting !== null) return
+    if (!exploreBound || typeof systemId !== "number" || typeof environmentId !== "number") {
+      return
+    }
+
+    const startPaths = exploreStartPaths
+      .split(/[\n,]/)
+      .map((path) => path.trim())
+      .filter((path) => path !== "")
+      .slice(0, 10)
+
+    setStarting("explore")
+    setError("")
+    setNotice("")
+    try {
+      const body: StartRunBody = { kind: "explore", systemId, environmentId }
+      if (startPaths.length > 0) body.startPaths = startPaths
+      const result = await mindmapApi.startRun(versionId, body)
+      const run = await mindmapApi.getRun(versionId, result.runId)
+      setDetails((previous) => ({ ...previous, [run.kind]: run }))
+      setNotice(
+        isActive(run.status)
+          ? "已提交应用探索运行，状态每 2 秒自动刷新。"
+          : `应用探索运行已结束：${RUN_STATUS_META[run.status].label}`,
+      )
+      onChanged?.()
+    } catch (caught) {
+      setError(describeMindmapError(caught))
+    } finally {
+      setStarting(null)
+    }
+  }
+
+  const exploreRun = latestRunFor("explore")
+
   return (
     <section
       aria-label="AI 运行"
@@ -422,6 +473,67 @@ export function RunPanel({ versionId, graph, onChanged }: RunPanelProps) {
             </article>
           )
         })}
+
+        {isAdmin ? (
+          <article
+            data-testid="run-row-explore"
+            className="rounded-xl border border-dashed border-border px-3 py-2"
+          >
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <div className="min-w-0">
+                <h3 className="text-sm font-semibold">应用探索（管理员）</h3>
+                <p className="mt-0.5 text-xs text-muted-foreground">
+                  只读抓取已绑定环境的页面与接口并导入应用模型，不产生用例。
+                </p>
+              </div>
+              <button
+                type="button"
+                data-testid="btn-explore"
+                onClick={() => void startExplore()}
+                disabled={starting !== null || !exploreBound}
+                className={BUTTON_CLASS}
+              >
+                {starting === "explore" ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                ) : null}
+                {starting === "explore" ? "正在提交…" : "开始应用探索"}
+              </button>
+            </div>
+
+            {exploreBound ? (
+              <label className="mt-2 block text-[11px] text-muted-foreground">
+                起始路径（可选，逗号或换行分隔，最多 10 个）
+                <input
+                  value={exploreStartPaths}
+                  disabled={starting !== null}
+                  placeholder="/p5/home"
+                  onChange={(event) => setExploreStartPaths(event.target.value)}
+                  className="mt-1 w-full rounded-lg border border-border bg-input px-2.5 py-1.5 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-70"
+                />
+              </label>
+            ) : (
+              <p
+                data-testid="explore-unavailable"
+                className="mt-2 rounded-lg border border-amber-500/25 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-700 dark:text-amber-300"
+              >
+                版本未绑定系统或环境，无法启动应用探索；请先在版本详情绑定系统与环境。
+              </p>
+            )}
+
+            {exploreRun === null ? (
+              <p className="mt-2 text-xs text-muted-foreground">尚未运行应用探索。</p>
+            ) : (
+              <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                <span data-testid="run-status-explore">
+                  <StatusBadge variant={RUN_STATUS_META[exploreRun.status].variant}>
+                    {RUN_STATUS_META[exploreRun.status].label}
+                  </StatusBadge>
+                </span>
+                {exploreRun.finishedAt ? <span>{`完成于 ${exploreRun.finishedAt}`}</span> : null}
+              </div>
+            )}
+          </article>
+        ) : null}
       </div>
     </section>
   )

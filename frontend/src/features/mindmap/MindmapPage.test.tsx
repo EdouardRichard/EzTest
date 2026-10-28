@@ -317,6 +317,54 @@ describe("MindmapPage", () => {
     expect((screen.getByLabelText("用例标题") as HTMLInputElement).disabled).toBe(true)
   })
 
+  it("does not claim the baseline is frozen before design and disables review/export", async () => {
+    mockGraph(
+      defaultGraph({
+        versionStatus: "draft",
+        editable: false,
+        baseline: null,
+      }),
+    )
+
+    render(<MindmapPage versionId={VERSION_ID} />)
+
+    expect(await screen.findByTestId("mindmap-canvas")).toBeTruthy()
+    expect(screen.queryByTestId("readonly-banner")).toBeNull()
+    expect(screen.queryByText(/基线已冻结/)).toBeNull()
+
+    const banner = screen.getByTestId("status-banner")
+    expect(banner.textContent).toContain("需求确认并进入设计后可编辑脑图")
+
+    expect((screen.getByTestId("btn-run-review") as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.getByTestId("review-status-gate")).toBeTruthy()
+    for (const testId of [
+      "btn-export-markdown",
+      "btn-export-mermaid",
+      "btn-export-opml",
+      "btn-export-png",
+    ]) {
+      expect((screen.getByTestId(testId) as HTMLButtonElement).disabled).toBe(true)
+    }
+    expect(screen.getByTestId("export-status-gate")).toBeTruthy()
+  })
+
+  it("shows a read-only status banner for a completed version", async () => {
+    mockGraph(
+      defaultGraph({
+        versionStatus: "completed",
+        editable: false,
+        baseline: null,
+      }),
+    )
+
+    render(<MindmapPage versionId={VERSION_ID} />)
+
+    const banner = await screen.findByTestId("status-banner")
+    expect(banner.textContent).toContain("已结束")
+    expect(screen.queryByTestId("readonly-banner")).toBeNull()
+    expect((screen.getByTestId("btn-export-png") as HTMLButtonElement).disabled).toBe(true)
+  })
+
   it("exports the live canvas as a version-named PNG", async () => {
     mockGraph(defaultGraph())
 
