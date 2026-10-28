@@ -224,7 +224,7 @@ func TestIndexIntegrationRunsIndexAndMarksIndexed(t *testing.T) {
 	// vendor/** out of the index.
 	rows, err := pool.Query(ctx,
 		`SELECT path, blob_hash, confidence
-		 FROM code_entities
+		 FROM code_entity
 		 WHERE repo_id = $1 AND commit_sha = $2 AND kind = 'file' AND source = 'git'
 		 ORDER BY path`, repoID, head)
 	if err != nil {
@@ -311,7 +311,7 @@ func TestIndexIntegrationTruncatesAtMaxFiles(t *testing.T) {
 
 	var count int
 	if err := pool.QueryRow(ctx,
-		`SELECT count(*)::int FROM code_entities
+		`SELECT count(*)::int FROM code_entity
 		 WHERE repo_id = $1 AND commit_sha = $2 AND kind = 'file' AND source = 'git'`,
 		repoID, head).Scan(&count); err != nil {
 		t.Fatalf("count file entities: %v", err)

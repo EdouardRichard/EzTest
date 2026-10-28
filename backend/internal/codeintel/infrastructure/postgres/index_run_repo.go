@@ -76,7 +76,7 @@ func (r *IndexRunRepo) Create(ctx context.Context, run domain.IndexRun) error {
 	if err != nil {
 		return fmt.Errorf("postgres: encode index run errors: %w", err)
 	}
-	const query = `INSERT INTO code_index_runs
+	const query = `INSERT INTO code_index_run
 		(id, repo_id, commit_sha, source, status, stats, errors, started_at, finished_at, created_by)
 		VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9, $10)`
 	if _, err := r.pool.Exec(ctx, query,
@@ -101,7 +101,7 @@ func (r *IndexRunRepo) Update(ctx context.Context, run domain.IndexRun) error {
 	if err != nil {
 		return fmt.Errorf("postgres: encode index run errors: %w", err)
 	}
-	const query = `UPDATE code_index_runs
+	const query = `UPDATE code_index_run
 		SET status = $3, stats = $4::jsonb, errors = $5::jsonb,
 		    started_at = $6, finished_at = $7
 		WHERE id = $1 AND repo_id = $2`
@@ -122,7 +122,7 @@ func (r *IndexRunRepo) Update(ctx context.Context, run domain.IndexRun) error {
 // GetByID returns one run of repoID.
 func (r *IndexRunRepo) GetByID(ctx context.Context, repoID, id int64) (domain.IndexRun, error) {
 	run, err := scanIndexRun(r.pool.QueryRow(ctx,
-		`SELECT `+indexRunColumnList+` FROM code_index_runs WHERE id = $1 AND repo_id = $2`,
+		`SELECT `+indexRunColumnList+` FROM code_index_run WHERE id = $1 AND repo_id = $2`,
 		id, repoID))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -138,7 +138,7 @@ func (r *IndexRunRepo) GetByID(ctx context.Context, repoID, id int64) (domain.In
 func (r *IndexRunRepo) GetLatest(ctx context.Context, repoID int64) (domain.IndexRun, error) {
 	run, err := scanIndexRun(r.pool.QueryRow(ctx,
 		`SELECT `+indexRunColumnList+`
-		 FROM code_index_runs
+		 FROM code_index_run
 		 WHERE repo_id = $1
 		 ORDER BY created_at DESC, id DESC
 		 LIMIT 1`, repoID))
@@ -157,7 +157,7 @@ func (r *IndexRunRepo) GetLatest(ctx context.Context, repoID int64) (domain.Inde
 // §6.8. A queued run is aged by created_at, a running one by started_at (with
 // created_at as fallback). It returns the number of recovered runs.
 func (r *IndexRunRepo) RecoverStale(ctx context.Context, before time.Time) (int64, error) {
-	const query = `UPDATE code_index_runs
+	const query = `UPDATE code_index_run
 		SET status = 'failed',
 		    finished_at = now(),
 		    errors = errors || '[{"code":"interrupted"}]'::jsonb

@@ -370,7 +370,7 @@ func TestCodeIntelWiringRecoversStaleRuns(t *testing.T) {
 		{doneIndexID, "done", &stale},
 	} {
 		if _, err := pool.Exec(ctx, `
-			INSERT INTO code_index_runs (id, repo_id, commit_sha, status, created_by, created_at, started_at)
+			INSERT INTO code_index_run (id, repo_id, commit_sha, status, created_by, created_at, started_at)
 			VALUES ($1, $2, $3, $4, 1, $5, $6)`,
 			row.id, repoID, seedHeadCommit, row.status, stale, row.startedAt,
 		); err != nil {
@@ -389,7 +389,7 @@ func TestCodeIntelWiringRecoversStaleRuns(t *testing.T) {
 		{doneAnalysisID, "done", &stale},
 	} {
 		if _, err := pool.Exec(ctx, `
-			INSERT INTO code_analyses
+			INSERT INTO code_analysis
 				(id, version_id, repo_id, base_commit, head_commit, status, prompt_version,
 				 analysis_version, created_by, created_at, started_at)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, $9, $10)`,
@@ -404,8 +404,8 @@ func TestCodeIntelWiringRecoversStaleRuns(t *testing.T) {
 	fixture.worker.Start()
 
 	for table, ids := range map[string][3]int64{
-		"code_index_runs": {queuedIndexID, runningIndexID, doneIndexID},
-		"code_analyses":   {queuedAnalysisID, runningAnalysisID, doneAnalysisID},
+		"code_index_run": {queuedIndexID, runningIndexID, doneIndexID},
+		"code_analysis":   {queuedAnalysisID, runningAnalysisID, doneAnalysisID},
 	} {
 		for index, id := range ids {
 			var status, runErrors string

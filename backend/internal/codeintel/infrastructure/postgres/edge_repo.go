@@ -118,13 +118,13 @@ func (r *EdgeRepo) ReplaceFactEdges(ctx context.Context, repoID int64, commit, f
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	if _, err := tx.Exec(ctx,
-		`DELETE FROM code_edges
+		`DELETE FROM code_edge
 		 WHERE repo_id = $1 AND commit_sha = $2 AND fact_key = $3 AND fact_version = $4`,
 		repoID, commit, factKey, version); err != nil {
 		return fmt.Errorf("postgres: delete fact edges: %w", err)
 	}
 	if len(prepared) > 0 {
-		const insert = `INSERT INTO code_edges
+		const insert = `INSERT INTO code_edge
 			(id, repo_id, commit_sha, src_entity_id, dst_entity_id, rel, source,
 			 confidence, evidence, meta, fact_key, fact_version, analysis_id)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11, $12, $13)
@@ -157,7 +157,7 @@ func (r *EdgeRepo) ReplaceFactEdges(ctx context.Context, repoID int64, commit, f
 func (r *EdgeRepo) ListByEntity(ctx context.Context, repoID int64, commit string, entityID int64) ([]domain.CodeEdge, error) {
 	rows, err := r.pool.Query(ctx,
 		`SELECT `+edgeColumnList+`
-		 FROM code_edges
+		 FROM code_edge
 		 WHERE repo_id = $1 AND commit_sha = $2
 		   AND (src_entity_id = $3 OR dst_entity_id = $3)
 		 ORDER BY id ASC`,
@@ -172,7 +172,7 @@ func (r *EdgeRepo) ListByEntity(ctx context.Context, repoID int64, commit string
 func (r *EdgeRepo) ListByRel(ctx context.Context, repoID int64, commit, rel string) ([]domain.CodeEdge, error) {
 	rows, err := r.pool.Query(ctx,
 		`SELECT `+edgeColumnList+`
-		 FROM code_edges
+		 FROM code_edge
 		 WHERE repo_id = $1 AND commit_sha = $2 AND rel = $3
 		 ORDER BY id ASC`,
 		repoID, commit, rel)

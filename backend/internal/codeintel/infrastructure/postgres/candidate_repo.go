@@ -121,11 +121,11 @@ func (r *CandidateRepo) Replace(ctx context.Context, analysisID int64, items []d
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if _, err := tx.Exec(ctx, `DELETE FROM code_impact_candidates WHERE analysis_id = $1`, analysisID); err != nil {
+	if _, err := tx.Exec(ctx, `DELETE FROM code_impact_candidate WHERE analysis_id = $1`, analysisID); err != nil {
 		return fmt.Errorf("postgres: delete analysis candidates: %w", err)
 	}
 	if len(prepared) > 0 {
-		const insert = `INSERT INTO code_impact_candidates
+		const insert = `INSERT INTO code_impact_candidate
 			(id, analysis_id, subject_kind, subject_id, reason, confidence, source,
 			 evidence, selected, selection_updated_by, selection_updated_at)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11)
@@ -159,7 +159,7 @@ func (r *CandidateRepo) Replace(ctx context.Context, analysisID int64, items []d
 func (r *CandidateRepo) List(ctx context.Context, analysisID int64) ([]domain.ImpactCandidate, error) {
 	rows, err := r.pool.Query(ctx,
 		`SELECT `+candidateColumnList+`
-		 FROM code_impact_candidates
+		 FROM code_impact_candidate
 		 WHERE analysis_id = $1
 		 `+candidateOrder,
 		analysisID)
@@ -186,7 +186,7 @@ func (r *CandidateRepo) List(ctx context.Context, analysisID int64) ([]domain.Im
 func (r *CandidateRepo) Get(ctx context.Context, analysisID, candidateID int64) (domain.ImpactCandidate, error) {
 	candidate, err := scanCandidate(r.pool.QueryRow(ctx,
 		`SELECT `+candidateColumnList+`
-		 FROM code_impact_candidates
+		 FROM code_impact_candidate
 		 WHERE analysis_id = $1 AND id = $2`,
 		analysisID, candidateID))
 	if err != nil {

@@ -163,7 +163,7 @@ type impactCommitFile struct {
 	truncated bool
 }
 
-// impactStats is the planner stats document merged into code_analyses.stats by
+// impactStats is the planner stats document merged into code_analysis.stats by
 // the analysis service. It carries counters only (never code content, reasons or
 // paths), so events/UI can explain the run without leaking source.
 type impactStats struct {

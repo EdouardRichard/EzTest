@@ -215,7 +215,7 @@ func impactAbsentCandidate(candidates []domain.ImpactCandidate, subjectKind stri
 }
 
 // impactStatsDocument mirrors the planner stats JSON the analysis service merges
-// into code_analyses.stats.
+// into code_analysis.stats.
 type impactStatsDocument struct {
 	Candidates         int  `json:"candidates"`
 	Requirements       int  `json:"requirements"`

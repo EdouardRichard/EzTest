@@ -140,7 +140,7 @@ func impactIntegrationSeedAnchor(t *testing.T, pool *pgxpool.Pool, repoID, versi
 	t.Helper()
 	anchorID := nextSeedID()
 	if _, err := pool.Exec(context.Background(),
-		`INSERT INTO code_anchors
+		`INSERT INTO code_anchor
 		 (id, version_id, repo_id, subject_kind, subject_id, file_path, confidence, created_by_kind, created_by)
 		 VALUES ($1, $2, $3, 'requirement', $4, $5, 'high', 'user', 1)`,
 		anchorID, versionID, repoID, requirementID, path); err != nil {
@@ -158,7 +158,7 @@ func impactIntegrationSeedFact(t *testing.T, pool *pgxpool.Pool, id, repoID int6
 	}
 	version := 1
 	if _, err := pool.Exec(context.Background(),
-		`INSERT INTO code_entities
+		`INSERT INTO code_entity
 		 (id, repo_id, commit_sha, kind, path, name, source, confidence, evidence, fact_key, fact_version)
 		 VALUES ($1, $2, $3, $4, $5, $6, 'ai', 'high', $7, $8, $9)`,
 		id, repoID, commit, kind, path, name, evidenceJSON, factKey, version); err != nil {
@@ -176,7 +176,7 @@ func impactIntegrationSeedContractEdge(t *testing.T, pool *pgxpool.Pool, repoID 
 		t.Fatalf("encode contract meta: %v", err)
 	}
 	if _, err := pool.Exec(context.Background(),
-		`INSERT INTO code_edges
+		`INSERT INTO code_edge
 		 (id, repo_id, commit_sha, src_entity_id, dst_entity_id, rel, source, confidence, evidence, meta)
 		 VALUES ($1, $2, $3, $4, $5, 'route_to_api', 'ai', 'high', '[]'::jsonb, $6)`,
 		nextSeedID(), repoID, commit, srcID, dstID, meta); err != nil {

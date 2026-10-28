@@ -73,7 +73,7 @@ func TestChangeSetGetOrCreate(t *testing.T) {
 	// names, not the Go struct names.
 	var storedPath string
 	if err := pool.QueryRow(ctx,
-		`SELECT changed_files -> 0 ->> 'path' FROM code_change_sets WHERE id = $1`, want.ID,
+		`SELECT changed_files -> 0 ->> 'path' FROM code_change_set WHERE id = $1`, want.ID,
 	).Scan(&storedPath); err != nil {
 		t.Fatalf("read changed_files path: %v", err)
 	}
@@ -176,10 +176,10 @@ func TestChangeSetFindByCommits(t *testing.T) {
 	}
 }
 
-// history split of code_entities/code_fact_versions and the fact-body read of
+// history split of code_entity/code_fact_version and the fact-body read of
 // GetVersion.
 // TestEntityUpsertAndFactVersion covers the T0 file upsert, the current-versus-
-// history split of code_entities/code_fact_versions and the fact-body read of
+// history split of code_entity/code_fact_version and the fact-body read of
 // GetVersion.
 func TestEntityUpsertAndFactVersion(t *testing.T) {
 	ctx := context.Background()
@@ -241,7 +241,7 @@ func TestEntityUpsertAndFactVersion(t *testing.T) {
 	}
 	var factRows int
 	if err := pool.QueryRow(ctx,
-		`SELECT count(*)::int FROM code_entities WHERE repo_id = $1 AND commit_sha = $2 AND fact_key = $3`,
+		`SELECT count(*)::int FROM code_entity WHERE repo_id = $1 AND commit_sha = $2 AND fact_key = $3`,
 		repoID, commit, factKey).Scan(&factRows); err != nil {
 		t.Fatalf("count fact rows: %v", err)
 	}
@@ -273,7 +273,7 @@ func TestEntityUpsertAndFactVersion(t *testing.T) {
 	// Fact-version rows keep the caller-supplied Snowflake ids.
 	var storedFactVersionIDs []int64
 	if err := pool.QueryRow(ctx,
-		`SELECT array_agg(id ORDER BY version) FROM code_fact_versions
+		`SELECT array_agg(id ORDER BY version) FROM code_fact_version
 		 WHERE repo_id = $1 AND commit_sha = $2 AND fact_key = $3`,
 		repoID, commit, factKey).Scan(&storedFactVersionIDs); err != nil {
 		t.Fatalf("read fact version ids: %v", err)
@@ -306,7 +306,7 @@ func TestEntityUpsertAndFactVersion(t *testing.T) {
 	}
 	var superseded int
 	if err := pool.QueryRow(ctx, `
-		SELECT count(*)::int FROM code_fact_versions
+		SELECT count(*)::int FROM code_fact_version
 		WHERE repo_id = $1 AND commit_sha = $2 AND fact_key = $3
 		  AND version < 2 AND superseded_at IS NOT NULL`,
 		repoID, commit, factKey).Scan(&superseded); err != nil {
@@ -317,7 +317,7 @@ func TestEntityUpsertAndFactVersion(t *testing.T) {
 	}
 	var currentSuperseded bool
 	if err := pool.QueryRow(ctx, `
-		SELECT superseded_at IS NULL FROM code_fact_versions
+		SELECT superseded_at IS NULL FROM code_fact_version
 		WHERE repo_id = $1 AND commit_sha = $2 AND fact_key = $3 AND version = 2`,
 		repoID, commit, factKey).Scan(&currentSuperseded); err != nil {
 		t.Fatalf("read current version superseded_at: %v", err)
@@ -1105,7 +1105,7 @@ func TestRecoverStaleRuns(t *testing.T) {
 		}
 	}
 	if _, err := pool.Exec(ctx,
-		`UPDATE code_index_runs SET created_at = now() - interval '1 hour' WHERE id = $1`,
+		`UPDATE code_index_run SET created_at = now() - interval '1 hour' WHERE id = $1`,
 		staleQueued.ID); err != nil {
 		t.Fatalf("age stale queued run: %v", err)
 	}
@@ -1177,7 +1177,7 @@ func TestAnalysisRecoverStale(t *testing.T) {
 		}
 	}
 	if _, err := pool.Exec(ctx,
-		`UPDATE code_analyses SET created_at = now() - interval '1 hour' WHERE id = $1`,
+		`UPDATE code_analysis SET created_at = now() - interval '1 hour' WHERE id = $1`,
 		staleQueued.ID); err != nil {
 		t.Fatalf("age stale queued analysis: %v", err)
 	}
@@ -1296,19 +1296,19 @@ func TestRepositoriesRejectMissingIDs(t *testing.T) {
 		}
 		return n
 	}
-	if n := count(`SELECT count(*)::int FROM code_fact_versions WHERE fact_key = 'api:missing'`); n != 0 {
+	if n := count(`SELECT count(*)::int FROM code_fact_version WHERE fact_key = 'api:missing'`); n != 0 {
 		t.Fatalf("rejected fact version rows = %d, want 0", n)
 	}
 	if n := count(`SELECT count(*)::int FROM code_analysis_cache WHERE path = 'src/missing.ts'`); n != 0 {
 		t.Fatalf("rejected cache rows = %d, want 0", n)
 	}
-	if n := count(`SELECT count(*)::int FROM code_entities WHERE path IN ('src/valid.ts', 'src/missing.ts')`); n != 0 {
+	if n := count(`SELECT count(*)::int FROM code_entity WHERE path IN ('src/valid.ts', 'src/missing.ts')`); n != 0 {
 		t.Fatalf("rejected file entity rows = %d, want 0", n)
 	}
-	if n := count(`SELECT count(*)::int FROM code_edges WHERE fact_key = 'client:missing'`); n != 0 {
+	if n := count(`SELECT count(*)::int FROM code_edge WHERE fact_key = 'client:missing'`); n != 0 {
 		t.Fatalf("rejected edge rows = %d, want 0", n)
 	}
-	if n := count(`SELECT count(*)::int FROM code_impact_candidates WHERE analysis_id = 1`); n != 0 {
+	if n := count(`SELECT count(*)::int FROM code_impact_candidate WHERE analysis_id = 1`); n != 0 {
 		t.Fatalf("rejected candidate rows = %d, want 0", n)
 	}
 }

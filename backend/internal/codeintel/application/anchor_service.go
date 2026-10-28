@@ -16,7 +16,7 @@ const (
 	// anchorCreatedByKindUser is the only P4 anchor origin (design spec §6.7;
 	// AI anchors are a later milestone).
 	anchorCreatedByKindUser = "user"
-	// anchorConfidenceDefault matches the code_anchors DDL default.
+	// anchorConfidenceDefault matches the code_anchor DDL default.
 	anchorConfidenceDefault = domain.ConfidenceHigh
 )
 

@@ -84,7 +84,7 @@ type changedFileJSON struct {
 }
 
 // marshalChangedFiles encodes the changed files as the JSONB document stored in
-// code_change_sets.changed_files. An empty list is stored as [].
+// code_change_set.changed_files. An empty list is stored as [].
 func marshalChangedFiles(files []domain.ChangedFile) (string, error) {
 	entries := make([]changedFileJSON, 0, len(files))
 	for _, file := range files {
@@ -178,7 +178,7 @@ func (r *ChangeSetRepo) GetOrCreate(ctx context.Context, cs domain.CodeChangeSet
 	if err != nil {
 		return domain.CodeChangeSet{}, false, fmt.Errorf("postgres: encode change set files: %w", err)
 	}
-	const query = `INSERT INTO code_change_sets
+	const query = `INSERT INTO code_change_set
 		(id, repo_id, base_commit, head_commit, stats, changed_files, truncated)
 		VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7)
 		ON CONFLICT (repo_id, base_commit, head_commit) DO NOTHING`
@@ -204,7 +204,7 @@ func (r *ChangeSetRepo) GetOrCreate(ctx context.Context, cs domain.CodeChangeSet
 func (r *ChangeSetRepo) FindByCommits(ctx context.Context, repoID int64, base, head string) (domain.CodeChangeSet, error) {
 	stored, err := scanChangeSet(r.pool.QueryRow(ctx,
 		`SELECT `+changeSetColumnList+`
-		 FROM code_change_sets
+		 FROM code_change_set
 		 WHERE repo_id = $1 AND base_commit = $2 AND head_commit = $3`,
 		repoID, base, head))
 	if err != nil {
@@ -220,7 +220,7 @@ func (r *ChangeSetRepo) FindByCommits(ctx context.Context, repoID int64, base, h
 // GetByID returns one change set by id.
 func (r *ChangeSetRepo) GetByID(ctx context.Context, id int64) (domain.CodeChangeSet, error) {
 	stored, err := scanChangeSet(r.pool.QueryRow(ctx,
-		`SELECT `+changeSetColumnList+` FROM code_change_sets WHERE id = $1`, id))
+		`SELECT `+changeSetColumnList+` FROM code_change_set WHERE id = $1`, id))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.CodeChangeSet{}, notFoundError("change_set", id)
