@@ -13,7 +13,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/resource/domain"
 )
 
-// Session rules and defaults from spec 鎼?.1-鎼?.5.
+// Session rules and defaults from spec §6.1-§6.5.
 const (
 	// loginCheckNotConfigured is the failure_reason written when the
 	// environment has no login_check; the session goes to needs_manual.
@@ -28,12 +28,12 @@ const (
 	// manualSnapshotReason is the summary.reason of a manual confirmation.
 	manualSnapshotReason = "manual_confirmation"
 
-	// sessionTTLFallbackSeconds is the final TTL fallback of spec 鎼?.2.
+	// sessionTTLFallbackSeconds is the final TTL fallback of spec §6.2.
 	sessionTTLFallbackSeconds = 3600
 
-	// defaultTakeoverTTL is the default takeover lifetime (spec 鎼?.4).
+	// defaultTakeoverTTL is the default takeover lifetime (spec §6.4).
 	defaultTakeoverTTL = 30 * time.Minute
-	// defaultLeaseTTL is the default lease lifetime (spec 鎼?.5).
+	// defaultLeaseTTL is the default lease lifetime (spec §6.5).
 	defaultLeaseTTL = 30 * time.Minute
 
 	// invalidatedLeaseReason and revokedLeaseReason are the released_reason
@@ -44,7 +44,7 @@ const (
 )
 
 // SessionService implements the session, manual takeover and lease use cases
-// (spec 鎼?.1-鎼?.5). Every state change is a compare-and-swap on the current
+// (spec §6.1-§6.5). Every state change is a compare-and-swap on the current
 // state; a lost CAS surfaces as a domain state conflict.
 type SessionService struct {
 	sessions     domain.SessionRepository
@@ -195,7 +195,7 @@ func encodeStorageState(state *domain.StorageState) (json.RawMessage, error) {
 }
 
 // effectiveSessionTTL returns access.session_ttl_seconds, falling back to
-// system.default_session_ttl_seconds and then 3600 (spec 鎼?.2).
+// system.default_session_ttl_seconds and then 3600 (spec §6.2).
 func effectiveSessionTTL(access *domain.Access, system *domain.System) int {
 	ttl := sessionTTLFallbackSeconds
 	if system != nil && system.DefaultSessionTTLSeconds > 0 {
@@ -251,7 +251,7 @@ func (s *SessionService) refreshSessionExpiry(ctx context.Context, session *doma
 }
 
 // permissionHash hashes the sorted items[key,observed] pairs. Manual
-// confirmation hashes the single literal "manual" as required by spec 鎼?.3.
+// confirmation hashes the single literal "manual" as required by spec §6.3.
 func permissionHash(pairs ...string) string {
 	sorted := make([]string, len(pairs))
 	copy(sorted, pairs)
@@ -269,7 +269,7 @@ func mustMarshalJSON(value any) json.RawMessage {
 	return json.RawMessage(encoded)
 }
 
-// buildCheckSnapshot records one login_check outcome per spec 鎼?.3.
+// buildCheckSnapshot records one login_check outcome per spec §6.3.
 func buildCheckSnapshot(sessionID int64, result domain.LoginCheckResult, capturedAt time.Time) *domain.Snapshot {
 	snapshot := &domain.Snapshot{
 		SessionID:  sessionID,
@@ -310,7 +310,7 @@ func buildCheckSnapshot(sessionID int64, result domain.LoginCheckResult, capture
 	return snapshot
 }
 
-// buildManualSnapshot records a manual confirmation per spec 鎼?.3.
+// buildManualSnapshot records a manual confirmation per spec §6.3.
 func buildManualSnapshot(sessionID int64, capturedAt time.Time) *domain.Snapshot {
 	return &domain.Snapshot{
 		SessionID:      sessionID,
@@ -340,7 +340,7 @@ func (s *SessionService) runLoginCheck(ctx context.Context, environment *domain.
 }
 
 // applySessionCheckResult applies the state machine outcome of a check to the
-// session (spec 鎼?.1/鎼?.3). A performed check never leaves invalidated_reason
+// session (spec §6.1/§6.3). A performed check never leaves invalidated_reason
 // behind, because the session is no longer in the invalid state.
 func applySessionCheckResult(session *domain.Session, result domain.LoginCheckResult, now time.Time) {
 	session.InvalidatedReason = ""
@@ -374,7 +374,7 @@ func (s *SessionService) createSnapshot(ctx context.Context, snapshot *domain.Sn
 }
 
 // lazyExpireSession moves a valid session whose expires_at has passed to
-// expired (spec 鎼?.1). A lost CAS means another writer already changed the row,
+// expired (spec §6.1). A lost CAS means another writer already changed the row,
 // so the latest row is read back instead of failing the read path. A failed
 // re-read is returned: serving the stale value would silently report a state the
 // row no longer has.
@@ -401,7 +401,7 @@ func (s *SessionService) lazyExpireSession(ctx context.Context, session *domain.
 	return nil
 }
 
-// lazyExpireTakeover moves an expired waiting takeover to expired (spec 鎼?.4).
+// lazyExpireTakeover moves an expired waiting takeover to expired (spec §6.4).
 // As above a lost CAS is resolved by reading the latest row, and a failed
 // re-read is returned instead of swallowed.
 func (s *SessionService) lazyExpireTakeover(ctx context.Context, takeover *domain.Takeover, now time.Time) error {
@@ -429,7 +429,7 @@ func (s *SessionService) lazyExpireTakeover(ctx context.Context, takeover *domai
 }
 
 // Get returns one session with its latest snapshot, active lease and latest
-// takeover. Absent optional relations are nil, not errors (spec 鎼?.5).
+// takeover. Absent optional relations are nil, not errors (spec §7.5).
 func (s *SessionService) Get(ctx context.Context, id int64) (*domain.Session, *domain.Snapshot, *domain.Lease, *domain.Takeover, error) {
 	session, err := s.sessions.GetSession(ctx, id)
 	if err != nil {
@@ -458,7 +458,7 @@ func (s *SessionService) Get(ctx context.Context, id int64) (*domain.Session, *d
 }
 
 // List returns one page of sessions, lazily expiring the valid rows whose
-// expires_at has passed (spec 鎼?.1).
+// expires_at has passed (spec §6.1).
 func (s *SessionService) List(ctx context.Context, f domain.SessionFilter) ([]domain.Session, bool, error) {
 	sessions, more, err := s.sessions.ListSessions(ctx, f)
 	if err != nil {
@@ -475,7 +475,7 @@ func (s *SessionService) List(ctx context.Context, f domain.SessionFilter) ([]do
 
 // Import creates a pending session from an access's storage state, runs the
 // environment's login_check and applies the resulting valid/needs_manual state
-// (spec 鎼?.1-鎼?.3).
+// (spec §6.1-§6.3).
 func (s *SessionService) Import(ctx context.Context, accessID int64, in ImportSessionInput) (*domain.Session, *domain.Snapshot, error) {
 	if in.EnvironmentID <= 0 {
 		return nil, nil, invalidEnvironmentError()
@@ -548,7 +548,7 @@ func (s *SessionService) Import(ctx context.Context, accessID int64, in ImportSe
 }
 
 // Validate re-runs the login_check for a session in any non-terminal state and
-// applies the resulting state (spec 鎼?.1/鎼?.5).
+// applies the resulting state (spec §6.1/§7.5).
 func (s *SessionService) Validate(ctx context.Context, id int64) (*domain.Session, *domain.Snapshot, error) {
 	session, err := s.sessions.GetSession(ctx, id)
 	if err != nil {
@@ -594,7 +594,7 @@ func (s *SessionService) Validate(ctx context.Context, id int64) (*domain.Sessio
 }
 
 // Confirm marks a pending or needs_manual session valid from a human
-// confirmation and records the degraded manual snapshot (spec 鎼?.3). The
+// confirmation and records the degraded manual snapshot (spec §6.3). The
 // confirmation refreshes expires_at from the still-live stored state; an already
 // expired session is rejected as a state conflict (409 session_state_conflict,
 // matching a lazily expired row) instead of being resurrected as valid.
@@ -640,7 +640,7 @@ func (s *SessionService) Confirm(ctx context.Context, id int64, note string, act
 }
 
 // Invalidate marks a valid, needs_manual or expired session invalid and releases
-// all of its leases (spec 鎼?.1).
+// all of its leases (spec §6.1).
 func (s *SessionService) Invalidate(ctx context.Context, id int64, reason string) (*domain.Session, error) {
 	session, err := s.sessions.GetSession(ctx, id)
 	if err != nil {
@@ -664,7 +664,7 @@ func (s *SessionService) Invalidate(ctx context.Context, id int64, reason string
 }
 
 // Revoke marks any non-revoked session revoked and releases all of its leases
-// (spec 鎼?.1).
+// (spec §6.1).
 func (s *SessionService) Revoke(ctx context.Context, id int64, reason string) (*domain.Session, error) {
 	session, err := s.sessions.GetSession(ctx, id)
 	if err != nil {
@@ -691,7 +691,7 @@ func (s *SessionService) ListSnapshots(ctx context.Context, sessionID int64, pag
 }
 
 // ListTakeovers returns one page of takeovers, lazily expiring the waiting rows
-// whose expires_at has passed (spec 鎼?.4).
+// whose expires_at has passed (spec §6.4).
 func (s *SessionService) ListTakeovers(ctx context.Context, f domain.TakeoverFilter) ([]domain.Takeover, bool, error) {
 	takeovers, more, err := s.sessions.ListTakeovers(ctx, f)
 	if err != nil {
@@ -707,7 +707,7 @@ func (s *SessionService) ListTakeovers(ctx context.Context, f domain.TakeoverFil
 }
 
 // RequestTakeover creates a waiting manual takeover for a non-revoked session
-// and moves the session to needs_manual (spec 鎼?.4). A session may have at most
+// and moves the session to needs_manual (spec §6.4). A session may have at most
 // one waiting takeover.
 func (s *SessionService) RequestTakeover(ctx context.Context, sessionID int64, reason string, instructions json.RawMessage, expiresIn time.Duration, actorID *int64) (*domain.Takeover, *domain.Session, error) {
 	session, err := s.sessions.GetSession(ctx, sessionID)
@@ -721,7 +721,7 @@ func (s *SessionService) RequestTakeover(ctx context.Context, sessionID int64, r
 		return nil, nil, invalidTakeoverReasonError()
 	}
 	now := s.now()
-	// One-waiting invariant: spec 鎼?.4 allows at most one waiting takeover per
+	// One-waiting invariant: spec §6.4 allows at most one waiting takeover per
 	// session. There is no partial unique index and this check-then-insert is
 	// not atomic against a second concurrent admin request, so two truly
 	// simultaneous requests can both pass. Accepted for single-admin P2: the
@@ -779,7 +779,7 @@ func (s *SessionService) RequestTakeover(ctx context.Context, sessionID int64, r
 
 // CompleteTakeover replaces the session's stored login state from a human
 // completion, re-runs the login_check and marks the takeover completed
-// (spec 鎼?.4). expires_at is recomputed from the uploaded state's TTL/cookie
+// (spec §6.4). expires_at is recomputed from the uploaded state's TTL/cookie
 // expiry; the session's previous expiry is never reused.
 func (s *SessionService) CompleteTakeover(ctx context.Context, takeoverID int64, in ReplaceSessionStateInput, actorID *int64) (*domain.Takeover, *domain.Session, *domain.Snapshot, error) {
 	_ = actorID
@@ -862,7 +862,7 @@ func (s *SessionService) CompleteTakeover(ctx context.Context, takeoverID int64,
 }
 
 // CancelTakeover cancels a waiting takeover; the session stays needs_manual
-// (spec 鎼?.4).
+// (spec §6.4).
 func (s *SessionService) CancelTakeover(ctx context.Context, takeoverID int64) (*domain.Takeover, error) {
 	takeover, err := s.sessions.GetTakeover(ctx, takeoverID)
 	if err != nil {
@@ -883,7 +883,7 @@ func (s *SessionService) CancelTakeover(ctx context.Context, takeoverID int64) (
 
 // AcquireLease grants an exclusive, time-bounded lease on a valid, unexpired
 // session. The expiration is capped by the session's own expiration
-// (spec 鎼?.5).
+// (spec §6.5).
 func (s *SessionService) AcquireLease(ctx context.Context, sessionID int64, holder string, ttl time.Duration) (*domain.Lease, error) {
 	session, err := s.sessions.GetSession(ctx, sessionID)
 	if err != nil {

@@ -18,12 +18,12 @@ const (
 	minSystemSessionTTLSeconds     = 60
 	maxSystemSessionTTLSeconds     = 604800
 
-	// maxEnvironmentAllowedHosts bounds environment.allowed_hosts (spec 鎼?.2).
+	// maxEnvironmentAllowedHosts bounds environments.allowed_hosts (spec §7.2).
 	maxEnvironmentAllowedHosts = 50
-	// maxAllowedHostLength bounds one allowed host (spec 鎼?.2).
+	// maxAllowedHostLength bounds one allowed host (spec §7.2).
 	maxAllowedHostLength = 253
 
-	// maxAppModelImportNodes bounds one JSON import (spec 鎼?.6).
+	// maxAppModelImportNodes bounds one JSON import (spec §6.6).
 	maxAppModelImportNodes = 5000
 	// maxAppModelDepth bounds a node's ancestor chain, the node itself included.
 	maxAppModelDepth = 32
@@ -217,7 +217,7 @@ func appModelDepthError() *domain.Error {
 
 // effectiveAppModelMethod returns the stored method. An API node without an
 // explicit method derives it from the immutable "api:<METHOD> <path>" key so the
-// app_model_node CHECK (kind <> 'api' OR method <> 閳? always holds.
+// app_model_nodes CHECK (kind <> 'api' OR method <> ”) always holds.
 func effectiveAppModelMethod(kind, key, method string) string {
 	method = strings.TrimSpace(method)
 	if method != "" {

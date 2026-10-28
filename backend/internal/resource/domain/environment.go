@@ -18,7 +18,7 @@ const (
 )
 
 // LoginCheck is the optional, read-only login verification configured on an
-// environment (spec 搂6.3). It is stored as JSONB in environment.login_check;
+// environment (spec §6.3). It is stored as JSONB in environments.login_check;
 // the JSON tags match that stored document.
 type LoginCheck struct {
 	URL          string `json:"url"`
@@ -36,7 +36,7 @@ type LoginCheckResult struct {
 	Reason   string
 }
 
-// ValidateLoginCheck enforces the optional login_check bounds of spec 搂7.2:
+// ValidateLoginCheck enforces the optional login_check bounds of spec §7.2:
 // URL at most 2048 bytes, at most 10 expect_status values in 100-599, and
 // body_contains at most 512 bytes. An empty URL means "not configured".
 func ValidateLoginCheck(lc *LoginCheck) error {
