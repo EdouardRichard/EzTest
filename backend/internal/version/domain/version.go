@@ -20,6 +20,15 @@ const (
 	VersionArchived   = "archived"
 )
 
+// Pause modes, mirrored from the version.pause_mode CHECK constraint (spec
+// §3.3/§5.4). Graceful stops dispatching and lets the current step finish;
+// immediate cancels the running agent run and marks in-flight steps
+// interrupted.
+const (
+	PauseModeGraceful  = "graceful"
+	PauseModeImmediate = "immediate"
+)
+
 // commitRE mirrors the code_baseline_commit CHECK constraint: exactly 40
 // lowercase hexadecimal characters.
 var commitRE = regexp.MustCompile(`^[0-9a-f]{40}$`)
@@ -33,6 +42,9 @@ type Version struct {
 	Label              string
 	Description        string
 	Status             string
+	Paused             bool
+	PauseMode          string
+	BatchNo            int
 	SystemID           *int64
 	EnvironmentID      *int64
 	CodeRepositoryID   *int64
@@ -115,7 +127,28 @@ func (v *Version) Validate() error {
 		return NewInvalid("status", "invalid_status",
 			"status must be one of draft, clarifying, designing, reviewing, executing, continuing, completed or archived")
 	}
+	if v.PauseMode != "" {
+		if err := ValidatePauseMode(v.PauseMode); err != nil {
+			return err
+		}
+	}
+	if v.BatchNo < 0 {
+		return NewInvalid("batchNo", "invalid_batch_no", "batchNo must not be negative")
+	}
 	return ValidateBindings(v.SystemID, v.EnvironmentID, v.CodeRepositoryID, v.CodeBranch, v.CodeBaselineCommit)
+}
+
+// ValidatePauseMode enforces the version.pause_mode CHECK constraint value set
+// (spec §3.3/§5.4). An empty mode is rejected: callers that do not pause must
+// keep the stored mode instead of clearing it.
+func ValidatePauseMode(mode string) error {
+	switch mode {
+	case PauseModeGraceful, PauseModeImmediate:
+		return nil
+	default:
+		return NewInvalid("pauseMode", "invalid_pause_mode",
+			fmt.Sprintf("pauseMode must be %q or %q", PauseModeGraceful, PauseModeImmediate))
+	}
 }
 
 // ValidateBindings enforces the resource binding rules shared by version

@@ -128,6 +128,7 @@ func (s *VersionService) Create(ctx context.Context, cmd CreateVersionCommand, a
 		Label:              cmd.Label,
 		Description:        cmd.Description,
 		Status:             domain.VersionDraft,
+		PauseMode:          domain.PauseModeGraceful,
 		SystemID:           bindings.SystemID,
 		EnvironmentID:      bindings.EnvironmentID,
 		CodeRepositoryID:   bindings.CodeRepositoryID,
@@ -666,6 +667,124 @@ func (s *VersionService) ApproveBaseline(ctx context.Context, id int64, actor in
 		ActorID:   actor,
 		Source:    domain.SourceUser,
 		Detail:    map[string]any{"from": domain.VersionReviewing, "to": domain.VersionExecuting},
+	})
+	return updated, nil
+}
+
+// MarkPaused sets or clears the execution pause flag of an executing or
+// continuing version (spec §5.3/§5.4). Pausing never changes the version
+// status: only the batch drives case scheduling, the version flag mirrors it
+// for the detail view. The action publishes the existing version.status_changed
+// event with from/to pinned to the unchanged status and the new paused flag in
+// detail; reason is carried for audit only and is not persisted on the version
+// row. Resuming keeps the stored pause mode.
+func (s *VersionService) MarkPaused(ctx context.Context, id int64, paused bool, mode, reason string, actor int64) (*Version, error) {
+	current, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if current.Status != domain.VersionExecuting && current.Status != domain.VersionContinuing {
+		return nil, domain.NewStateConflict("version_state_conflict",
+			fmt.Sprintf("version %d is %s, pause requires executing or continuing", id, current.Status))
+	}
+
+	pauseMode := current.PauseMode
+	if pauseMode == "" {
+		pauseMode = domain.PauseModeGraceful
+	}
+	if paused {
+		if err := domain.ValidatePauseMode(mode); err != nil {
+			return nil, err
+		}
+		pauseMode = mode
+	}
+
+	updated, err := s.repo.UpdateExecutionState(ctx, id, paused, pauseMode, current.BatchNo, actor)
+	if err != nil {
+		return nil, err
+	}
+	detail := map[string]any{
+		"from":   current.Status,
+		"to":     updated.Status,
+		"paused": paused,
+	}
+	if pauseMode != "" {
+		detail["pauseMode"] = pauseMode
+	}
+	if reason != "" {
+		detail["reason"] = reason
+	}
+	summary := "version execution paused"
+	if !paused {
+		summary = "version execution resumed"
+	}
+	s.publish(ctx, VersionEvent{
+		VersionID: id,
+		Type:      "version.status_changed",
+		Summary:   summary,
+		ActorID:   actor,
+		Source:    domain.SourceUser,
+		Detail:    detail,
+	})
+	return updated, nil
+}
+
+// SetBatchNo records the latest batch number of an executing version. Batch
+// numbers are monotonic: a lower number is a version_state_conflict, the same
+// number is an idempotent no-op (so a retried create is safe), and the action
+// does not publish an event (batch events carry the batch lifecycle).
+func (s *VersionService) SetBatchNo(ctx context.Context, id int64, batchNo int, actor int64) (*Version, error) {
+	if batchNo < 0 {
+		return nil, domain.NewInvalid("batchNo", "invalid_batch_no", "batchNo must not be negative")
+	}
+	current, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if batchNo < current.BatchNo {
+		return nil, domain.NewStateConflict("version_state_conflict",
+			fmt.Sprintf("version %d batchNo is %d, cannot decrease to %d", id, current.BatchNo, batchNo))
+	}
+	if batchNo == current.BatchNo {
+		return current, nil
+	}
+
+	pauseMode := current.PauseMode
+	if pauseMode == "" {
+		pauseMode = domain.PauseModeGraceful
+	}
+	return s.repo.UpdateExecutionState(ctx, id, current.Paused, pauseMode, batchNo, actor)
+}
+
+// CompleteExecution moves a version from executing to completed (spec §6.2).
+// The continuing -> completed transition belongs to P7, so a continuing version
+// is a version_state_conflict here; every other source state is rejected the
+// same way. The action publishes version.status_changed.
+func (s *VersionService) CompleteExecution(ctx context.Context, id int64, actor int64) (*Version, error) {
+	current, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if current.Status != domain.VersionExecuting {
+		return nil, domain.NewStateConflict("version_state_conflict",
+			fmt.Sprintf("version %d is %s, complete-execution requires executing", id, current.Status))
+	}
+
+	updated, err := s.repo.UpdateStatus(ctx, id, domain.VersionExecuting, domain.VersionCompleted, actor)
+	if err != nil {
+		return nil, err
+	}
+	s.publish(ctx, VersionEvent{
+		VersionID: id,
+		Type:      "version.status_changed",
+		Summary:   "version status changed from executing to completed",
+		ActorID:   actor,
+		Source:    domain.SourceUser,
+		Detail: map[string]any{
+			"from":   domain.VersionExecuting,
+			"to":     domain.VersionCompleted,
+			"paused": updated.Paused,
+		},
 	})
 	return updated, nil
 }
