@@ -2,8 +2,10 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/mindmap/application"
@@ -95,7 +97,9 @@ func (r *StepRepository) Create(ctx context.Context, s domain.CaseStep) (domain.
 			return domain.CaseStep{}, domain.NewConflict("duplicate_key",
 				fmt.Sprintf("step %d already exists", s.ID))
 		case "uk_case_step_node_seq":
-			return domain.CaseStep{}, domain.NewConflict("conflict",
+			// Another writer touched the node's step subset concurrently: the
+			// application layer's revision set is stale, not the id duplicate.
+			return domain.CaseStep{}, domain.NewStateConflict("case_revision_conflict",
 				fmt.Sprintf("node %d already has a step at seq %d", s.NodeID, s.Seq))
 		}
 		return domain.CaseStep{}, fmt.Errorf("postgres: create case step: %w", err)
@@ -115,7 +119,7 @@ func (r *StepRepository) Update(ctx context.Context, s domain.CaseStep) error {
 		s.ID, s.NodeID, s.Seq, s.Action, s.Expected, s.Data, s.Source, s.UpdatedAt)
 	if err != nil {
 		if uniqueConstraint(err) == "uk_case_step_node_seq" {
-			return domain.NewConflict("conflict",
+			return domain.NewStateConflict("case_revision_conflict",
 				fmt.Sprintf("node %d already has a step at seq %d", s.NodeID, s.Seq))
 		}
 		return fmt.Errorf("postgres: update case step: %w", err)
@@ -160,10 +164,34 @@ func (r *StepRepository) CountByNode(ctx context.Context, nodeID int64) (int, er
 // cycle. When all 30 slots are occupied there is no spare seq (and seq has no
 // value outside the 1..30 CHECK), so the step set is rebuilt around the
 // assertions that reference it (see rebuildStepSeq).
+//
+// The transaction first locks the case_node row: two concurrent reorders of the
+// same node would otherwise move the same rows in opposite directions and
+// deadlock (SQLSTATE 40P01). The lock serializes them; reorders of different
+// nodes stay independent.
 func (r *StepRepository) ReplaceSeq(ctx context.Context, nodeID int64, ordered []int64) error {
 	return withTx(ctx, r.q, func(q querier) error {
+		if err := lockCaseNode(ctx, q, nodeID); err != nil {
+			return err
+		}
 		return replaceStepSeq(ctx, q, nodeID, ordered)
 	})
+}
+
+// lockCaseNode takes the row lock of nodeID for the rest of the transaction. It
+// is the sequence rewrite's serialization point: the node row is locked before
+// any case_step row, so concurrent same-node reorders queue up instead of
+// deadlocking. A missing node is node_not_found.
+func lockCaseNode(ctx context.Context, q querier, nodeID int64) error {
+	var one int
+	if err := q.QueryRow(ctx,
+		`SELECT 1 FROM case_node WHERE id = $1 FOR UPDATE`, nodeID).Scan(&one); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return notFound("node", nodeID)
+		}
+		return fmt.Errorf("postgres: lock case node %d: %w", nodeID, err)
+	}
+	return nil
 }
 
 // replaceStepSeq implements ReplaceSeq inside the transaction q.

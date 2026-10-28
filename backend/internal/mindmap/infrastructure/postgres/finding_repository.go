@@ -56,12 +56,26 @@ func scanFinding(row rowScanner) (domain.CaseReviewFinding, error) {
 }
 
 // CreateBatch inserts the findings of one review round in a single round trip.
-// The whole batch runs inside the caller's transaction when the repository is
-// bound by GraphTx, so a failure inserts none of them.
+// The whole batch runs inside one transaction: when the repository is bound by
+// GraphTx it joins the caller's transaction, otherwise it opens its own, so a
+// failure on any element inserts none of them.
+//
+// pgx already executes a pipeline batch in an implicit transaction, but the
+// explicit transaction makes the atomicity part of this repository's contract
+// rather than a driver detail, and keeps the batch in the caller's transaction
+// when one exists.
 func (r *FindingRepository) CreateBatch(ctx context.Context, findings []domain.CaseReviewFinding) error {
 	if len(findings) == 0 {
 		return nil
 	}
+	return withTx(ctx, r.q, func(q querier) error {
+		return insertFindingBatch(ctx, q, findings)
+	})
+}
+
+// insertFindingBatch pipelines the finding INSERTs on q. The caller owns the
+// transaction.
+func insertFindingBatch(ctx context.Context, q querier, findings []domain.CaseReviewFinding) error {
 	const query = `INSERT INTO case_review_finding
 		(id, review_id, node_id, category, severity, detail, status, source,
 		 created_by, created_at, updated_at)
@@ -73,19 +87,28 @@ func (r *FindingRepository) CreateBatch(ctx context.Context, findings []domain.C
 			finding.Category, finding.Severity, finding.Detail, finding.Status,
 			finding.Source, finding.CreatedBy, finding.CreatedAt, finding.UpdatedAt)
 	}
-	results := r.q.SendBatch(ctx, batch)
-	defer results.Close()
+	results := q.SendBatch(ctx, batch)
+	var batchErr error
 	for _, finding := range findings {
 		if _, err := results.Exec(); err != nil {
 			if uniqueConstraint(err) == "pk_case_review_finding" {
-				return domain.NewConflict("duplicate_key",
+				batchErr = domain.NewConflict("duplicate_key",
 					fmt.Sprintf("finding %d already exists", finding.ID))
+			} else {
+				batchErr = fmt.Errorf("postgres: create case review finding %d: %w", finding.ID, err)
 			}
-			return fmt.Errorf("postgres: create case review finding %d: %w", finding.ID, err)
+			break
 		}
 	}
-	if err := results.Close(); err != nil {
-		return fmt.Errorf("postgres: create case review findings: %w", err)
+	// Close drains the remaining results; the failed element aborted the
+	// transaction, so returning batchErr makes withTx roll back every earlier
+	// insert.
+	closeErr := results.Close()
+	if batchErr != nil {
+		return batchErr
+	}
+	if closeErr != nil {
+		return fmt.Errorf("postgres: create case review findings: %w", closeErr)
 	}
 	return nil
 }

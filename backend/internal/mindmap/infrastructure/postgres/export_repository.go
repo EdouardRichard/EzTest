@@ -69,7 +69,8 @@ func scanExport(row rowScanner) (domain.CaseExport, error) {
 // Create inserts e with its explicit id and the caller-supplied timestamps. A
 // second export of the same frozen (version, format, baseline) violates
 // uk_case_export_baseline; the service looks the reusable export up first, so a
-// collision is a race and maps to conflict (spec §6.10).
+// collision is a concurrent export race and maps to export_conflict (spec
+// §6.10).
 func (r *ExportRepository) Create(ctx context.Context, e domain.CaseExport) (domain.CaseExport, error) {
 	const query = `INSERT INTO case_export
 		(id, version_id, format, file_path, file_sha256, size_bytes,
@@ -87,7 +88,9 @@ func (r *ExportRepository) Create(ctx context.Context, e domain.CaseExport) (dom
 			return domain.CaseExport{}, domain.NewConflict("duplicate_key",
 				fmt.Sprintf("export %d already exists", e.ID))
 		case "uk_case_export_baseline":
-			return domain.CaseExport{}, domain.NewConflict("conflict",
+			// The service looks the reusable export up first, so a collision is
+			// a concurrent frozen-state export race (spec §6.10).
+			return domain.CaseExport{}, domain.NewConflict("export_conflict",
 				fmt.Sprintf("version %d already has a %s export for this baseline", e.VersionID, e.Format))
 		}
 		return domain.CaseExport{}, fmt.Errorf("postgres: create case export: %w", err)

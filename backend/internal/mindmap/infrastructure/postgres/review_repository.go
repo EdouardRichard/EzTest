@@ -127,8 +127,9 @@ func (r *ReviewRepository) GetApproved(ctx context.Context, versionID int64) (do
 	return review, nil
 }
 
-// Decide records the human decision on one draft review. A review that has
-// already been decided is a conflict; a missing review is review_not_found.
+// Decide records the human decision on one draft review. A missing review is
+// review_not_found; a review that is already approved is baseline_frozen (its
+// approval froze the version); any other already-decided review is a conflict.
 func (r *ReviewRepository) Decide(ctx context.Context, reviewID int64, status string, comment string, actor int64) (domain.CaseReview, error) {
 	const query = `UPDATE case_review
 		SET status = $2, comment = $3, decided_by = $4, decided_at = now(),
@@ -150,7 +151,9 @@ func (r *ReviewRepository) Decide(ctx context.Context, reviewID int64, status st
 }
 
 // decideConflict classifies a zero-row decision CAS: a missing row is
-// review_not_found, an already-decided row is a conflict.
+// review_not_found, an already-approved row is baseline_frozen (approving it
+// froze the version), and any other already-decided row stays a generic
+// conflict.
 func (r *ReviewRepository) decideConflict(ctx context.Context, reviewID int64) error {
 	var status string
 	if err := r.q.QueryRow(ctx, `SELECT status FROM case_review WHERE id = $1`, reviewID).Scan(&status); err != nil {
@@ -158,6 +161,10 @@ func (r *ReviewRepository) decideConflict(ctx context.Context, reviewID int64) e
 			return notFound("review", reviewID)
 		}
 		return fmt.Errorf("postgres: read case review status after decision CAS: %w", err)
+	}
+	if status == domain.ReviewApproved {
+		return domain.NewConflict("baseline_frozen",
+			fmt.Sprintf("review %d is already approved", reviewID))
 	}
 	return domain.NewConflict("conflict",
 		fmt.Sprintf("review %d is already %s", reviewID, status))

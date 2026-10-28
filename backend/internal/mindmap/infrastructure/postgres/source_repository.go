@@ -80,8 +80,8 @@ func (r *SourceRepository) ListByVersion(ctx context.Context, versionID int64) (
 }
 
 // Create inserts s with its explicit id. A duplicate of the
-// uk_case_source_ref key (node, ref kind, ref id, ref key) is a 409 conflict
-// (spec §6.2).
+// uk_case_source_ref key (node, ref kind, ref id, ref key) is a
+// duplicate_case_source conflict (spec §6.2/§7.4).
 func (r *SourceRepository) Create(ctx context.Context, s domain.CaseSource) (domain.CaseSource, error) {
 	const query = `INSERT INTO case_source
 		(id, version_id, node_id, ref_kind, ref_id, ref_key, source, confidence,
@@ -98,7 +98,7 @@ func (r *SourceRepository) Create(ctx context.Context, s domain.CaseSource) (dom
 			return domain.CaseSource{}, domain.NewConflict("duplicate_key",
 				fmt.Sprintf("source %d already exists", s.ID))
 		case "uk_case_source_ref":
-			return domain.CaseSource{}, domain.NewConflict("conflict",
+			return domain.CaseSource{}, domain.NewConflict("duplicate_case_source",
 				fmt.Sprintf("node %d already has this %s source", s.NodeID, s.RefKind))
 		}
 		return domain.CaseSource{}, fmt.Errorf("postgres: create case source: %w", err)
