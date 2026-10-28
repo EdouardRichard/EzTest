@@ -27,10 +27,10 @@ export const NAV_ITEMS: NavItem[] = [
   { label: "版本", href: "/versions", icon: Layers, phase: "P3", hint: "版本、多需求与澄清（P3）" },
   {
     label: "用例脑图",
-    href: "/versions#mindmap",
+    href: "/versions",
     icon: Network,
     phase: "P5",
-    hint: "脑图随版本详情提供（P5）",
+    hint: "在版本详情中打开用例脑图（P5）",
   },
   { label: "问题", href: "/issues", icon: Bug, phase: "P7", hint: "问题中心（P7）" },
   { label: "报告", href: "/reports", icon: FileBarChart2, phase: "P6", hint: "版本报告（P6）" },

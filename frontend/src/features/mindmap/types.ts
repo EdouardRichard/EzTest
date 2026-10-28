@@ -414,6 +414,11 @@ export type UpdateStepBody = {
 /** Body of `PUT /nodes/{nodeId}/steps/order`: every step of the case. */
 export type ReorderStepsBody = {
   stepIds: string[]
+  /**
+   * OCC token of the owning node. The step reorder is the one ordering endpoint
+   * that still requires `nodeRevision` (spec §6.5/§7.2 note).
+   */
+  nodeRevision?: number
 }
 
 /** Body of `POST /nodes/{nodeId}/assertions`. */

@@ -1,9 +1,25 @@
+"use client"
+
+import { usePathname } from "next/navigation"
 import type { ReactNode } from "react"
+
+import { cn } from "@/lib/utils"
 
 import { Sidebar } from "./Sidebar"
 import { Topbar } from "./Topbar"
 
+/** The full-screen mindmap route keeps an edge-to-edge canvas (spec §9.1). */
+const FULL_BLEED_PATTERN = /^\/versions\/[^/]+\/mindmap\/?$/
+
+/** Reports whether the route wants the full-width content area, not `max-w-6xl`. */
+export function isFullBleedPath(pathname: string): boolean {
+  return FULL_BLEED_PATTERN.test(pathname)
+}
+
 export function AppShell({ children }: { children: ReactNode }) {
+  const pathname = usePathname() ?? ""
+  const fullBleed = isFullBleedPath(pathname)
+
   return (
     <div className="min-h-screen bg-background">
       <a
@@ -16,7 +32,13 @@ export function AppShell({ children }: { children: ReactNode }) {
       <div className="flex min-h-screen flex-col lg:pl-64">
         <Topbar />
         <main id="main-content" className="flex-1 px-4 py-6 sm:px-6 lg:px-10 lg:py-8">
-          <div className="mx-auto w-full max-w-6xl">{children}</div>
+          <div
+            data-testid="app-content"
+            data-full-bleed={fullBleed ? "true" : "false"}
+            className={cn("mx-auto w-full", fullBleed ? "max-w-none" : "max-w-6xl")}
+          >
+            {children}
+          </div>
         </main>
         <footer className="px-4 pb-6 sm:px-6 lg:px-10">
           <div className="mx-auto flex w-full max-w-6xl flex-wrap items-center justify-between gap-2 text-[11px] text-muted-foreground">

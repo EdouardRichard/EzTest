@@ -15,6 +15,12 @@ describe("navigation items", () => {
     expect(agents?.hint).toBe("Agent 运行时控制台（P8 扩展为 Agent 中心）")
   })
 
+  it("points the case-mindmap entry at the version list and drops invalid hashes", () => {
+    const mindmap = NAV_ITEMS.find((item) => item.label === "用例脑图")
+    expect(mindmap?.href).toBe("/versions")
+    expect(NAV_ITEMS.some((item) => item.href.includes("#"))).toBe(false)
+  })
+
   it("matches exact and nested routes but never hash anchors", () => {
     expect(isActive("/", "/")).toBe(true)
     expect(isActive("/settings", "/settings")).toBe(true)
