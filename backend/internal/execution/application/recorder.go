@@ -29,9 +29,15 @@ type CaseRunLocator interface {
 	GetCaseRunByID(ctx context.Context, caseRunID int64) (domain.CaseRun, error)
 }
 
+// CaseFinishedAuditor records the terminal outcome of one case run
+// (spec §5.11). It is optional: a nil auditor disables the audit entry.
+type CaseFinishedAuditor interface {
+	CaseFinished(ctx context.Context, run domain.CaseRun, actor int64) error
+}
+
 // RecorderDeps are the ports of the structured-submission surface. Locator,
 // CaseRuns, Steps, Assertions, Evidence, Batches, Versions and Sessions are
-// required; Events is optional.
+// required; Events and Audit are optional.
 type RecorderDeps struct {
 	Locator    CaseRunLocator
 	CaseRuns   CaseRunRepository
@@ -43,8 +49,10 @@ type RecorderDeps struct {
 	Versions   VersionPort
 	Sessions   SessionPort
 	Events     EventPublisher
-	Clock      Clock
-	IDs        IDGenerator
+	// Audit records execution.case.finished after the terminal finish commits.
+	Audit CaseFinishedAuditor
+	Clock Clock
+	IDs   IDGenerator
 }
 
 // Recorder implements the execution agent's structured submission surface
@@ -389,7 +397,21 @@ func (r *CaseRecorder) FinishCase(ctx context.Context, caseRunID int64, in Finis
 		}
 	}
 	r.publishFinish(ctx, stored, steps, in.EvidenceIDs)
+	r.auditFinish(ctx, stored)
 	return stored, nil
+}
+
+// auditFinish records execution.case.finished after the terminal row committed.
+// Auditing is best-effort: the finish is authoritative and already durable, so a
+// failed audit write is logged and never fails the submission.
+func (r *CaseRecorder) auditFinish(ctx context.Context, run domain.CaseRun) {
+	if r.deps.Audit == nil {
+		return
+	}
+	if err := r.deps.Audit.CaseFinished(ctx, run, 0); err != nil {
+		slog.WarnContext(ctx, "execution: audit case finish failed",
+			"case_run_id", run.ID, "error", err)
+	}
 }
 
 // publishFinish emits the terminal case events after the finish row committed.

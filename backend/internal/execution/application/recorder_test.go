@@ -460,6 +460,85 @@ func TestRecorderFinishCaseValidates(t *testing.T) {
 	})
 }
 
+// recAudit captures the execution.case.finished audits of one recorder test.
+type recAudit struct {
+	mu      sync.Mutex
+	entries []recAuditEntry
+	err     error
+}
+
+type recAuditEntry struct {
+	run   domain.CaseRun
+	actor int64
+}
+
+func (a *recAudit) CaseFinished(_ context.Context, run domain.CaseRun, actor int64) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.entries = append(a.entries, recAuditEntry{run: run, actor: actor})
+	return a.err
+}
+
+func (a *recAudit) recorded() []recAuditEntry {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]recAuditEntry(nil), a.entries...)
+}
+
+// TestRecorderFinishCaseRecordsAudit pins that a committed terminal finish is
+// audited with the stored run, that an audit failure never fails the finish, and
+// that a recorder without an auditor stays safe.
+func TestRecorderFinishCaseRecordsAudit(t *testing.T) {
+	finishPassed := func(t *testing.T, recorder *CaseRecorder, world *recWorld) domain.CaseRun {
+		t.Helper()
+		run := world.seedRunningRun(recorderSnapshot())
+		evidence := world.evidenceFor(run.ID, "audit")
+		recordStepAndAssertion(t, recorder, run, evidence.ID, domain.StepStatusPassed, "passed")
+		finished, err := recorder.FinishCase(context.Background(), run.ID, FinishInput{
+			Decision: domain.FinishDecision{Verdict: domain.VerdictPassed},
+		})
+		if err != nil {
+			t.Fatalf("FinishCase: %v", err)
+		}
+		return finished
+	}
+
+	t.Run("terminal finish records the audit", func(t *testing.T) {
+		recorder, world := newRecorderTest(t)
+		audit := &recAudit{}
+		recorder.deps.Audit = audit
+		finished := finishPassed(t, recorder, world)
+
+		entries := audit.recorded()
+		if len(entries) != 1 {
+			t.Fatalf("audit entries = %d, want 1", len(entries))
+		}
+		if entries[0].run.ID != finished.ID || entries[0].run.Status != domain.CaseRunStatusPassed {
+			t.Fatalf("audited run = %+v, want stored passed run %d", entries[0].run, finished.ID)
+		}
+		if entries[0].actor != 0 {
+			t.Fatalf("audit actor = %d, want the system actor 0", entries[0].actor)
+		}
+	})
+
+	t.Run("nil auditor is safe", func(t *testing.T) {
+		recorder, world := newRecorderTest(t)
+		finished := finishPassed(t, recorder, world)
+		if finished.Status != domain.CaseRunStatusPassed {
+			t.Fatalf("status = %s, want passed", finished.Status)
+		}
+	})
+
+	t.Run("audit failure is best effort", func(t *testing.T) {
+		recorder, world := newRecorderTest(t)
+		recorder.deps.Audit = &recAudit{err: errors.New("audit store is down")}
+		finished := finishPassed(t, recorder, world)
+		if finished.Status != domain.CaseRunStatusPassed {
+			t.Fatalf("audit failure changed the finish: %+v", finished)
+		}
+	})
+}
+
 func TestRecorderFinishCaseRejectsDBAssertion(t *testing.T) {
 	recorder, world := newRecorderTest(t)
 	snapshot := recorderSnapshot()

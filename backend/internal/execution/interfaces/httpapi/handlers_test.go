@@ -670,6 +670,12 @@ func TestEvidenceDownloadSetsHeadersAndRequiresAuth(t *testing.T) {
 	if got := rec.Header().Get("X-Content-SHA256"); got != strings.Repeat("b", 64) {
 		t.Fatalf("X-Content-SHA256=%q", got)
 	}
+	if got := rec.Header().Get("Content-Disposition"); got != "attachment" {
+		t.Fatalf("Content-Disposition=%q want attachment", got)
+	}
+	if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("X-Content-Type-Options=%q want nosniff", got)
+	}
 	if rec.Body.String() != "PNGDATA" {
 		t.Fatalf("body=%q want the artifact bytes", rec.Body)
 	}
