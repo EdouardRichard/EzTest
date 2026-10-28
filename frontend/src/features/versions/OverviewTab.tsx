@@ -1,3 +1,5 @@
+import Link from "next/link"
+
 import { StatusBadge } from "@/components/ui/StatusBadge"
 
 import type { Version, VersionResource } from "./types"
@@ -13,11 +15,6 @@ const FUTURE_SECTIONS = [
     title: "执行批次",
     phase: "P6",
     description: "暂无批次数据，执行引擎在 P6 阶段接入。",
-  },
-  {
-    title: "用例脑图",
-    phase: "P5",
-    description: "尚未生成用例，脑图在 P5 阶段开放。",
   },
   {
     title: "问题",
@@ -84,6 +81,23 @@ export function OverviewTab({ version }: OverviewTabProps) {
       </section>
 
       <section aria-label="后续阶段空态" className="grid gap-3 lg:grid-cols-3">
+        <Link
+          href={`/versions/${version.id}/mindmap`}
+          data-testid="overview-open-mindmap"
+          className="group rounded-2xl border border-border bg-card p-4 transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <div className="flex flex-wrap items-center gap-2">
+            <h2 className="text-sm font-medium">用例脑图</h2>
+            <StatusBadge variant="info">P5</StatusBadge>
+          </div>
+          <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+            打开用例脑图：按已确认需求生成、编辑并评审用例。
+          </p>
+          <span className="mt-2 inline-flex items-center gap-1 text-xs font-medium text-primary">
+            打开脑图 →
+          </span>
+        </Link>
+
         {FUTURE_SECTIONS.map((section) => (
           <article
             key={section.title}

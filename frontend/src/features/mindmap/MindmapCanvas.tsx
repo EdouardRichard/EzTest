@@ -3,6 +3,7 @@
 import {
   type KeyboardEvent,
   type PointerEvent as ReactPointerEvent,
+  type Ref,
   useCallback,
   useEffect,
   useMemo,
@@ -92,6 +93,11 @@ export type MindmapCanvasProps = {
   /** Scenario ids whose descendants are hidden. */
   collapsed?: readonly string[] | ReadonlySet<string>
   onToggle?: (nodeId: string) => void
+  /**
+   * Optional ref to the rendered `<svg>`, used by the client-side PNG export
+   * (spec §6.10). It stays `null` while the graph has no visible nodes.
+   */
+  svgRef?: Ref<SVGSVGElement>
 }
 
 /**
@@ -106,6 +112,7 @@ export function MindmapCanvas({
   onSelect,
   collapsed,
   onToggle,
+  svgRef,
 }: MindmapCanvasProps) {
   const collapsedSet = useMemo(
     () => new Set<string>((collapsed ?? []) as Iterable<string>),
@@ -372,6 +379,7 @@ export function MindmapCanvas({
           </p>
         ) : (
           <svg
+            ref={svgRef}
             // biome-ignore lint/a11y/noNoninteractiveElementToInteractiveRole: SVG has no native tree container; the WAI-ARIA tree pattern is the accessible equivalent.
             role="tree"
             aria-label={canvasLabel}

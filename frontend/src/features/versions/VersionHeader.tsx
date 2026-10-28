@@ -1,6 +1,6 @@
 "use client"
 
-import { ArrowLeft, Loader2, RefreshCw } from "lucide-react"
+import { ArrowLeft, Loader2, Network, RefreshCw } from "lucide-react"
 import Link from "next/link"
 import { useState } from "react"
 
@@ -214,6 +214,15 @@ export function VersionHeader({ version, refreshing, onRefresh, onUpdated }: Ver
               进入设计
             </button>
           ) : null}
+
+          <Link
+            href={`/versions/${version.id}/mindmap`}
+            data-testid="open-mindmap"
+            className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-2 text-sm font-medium transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <Network className="h-4 w-4" aria-hidden="true" />
+            用例脑图
+          </Link>
 
           <button
             type="button"

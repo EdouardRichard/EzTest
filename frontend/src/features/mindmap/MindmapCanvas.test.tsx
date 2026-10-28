@@ -1,4 +1,5 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { createRef } from "react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { MAX_ZOOM, MIN_ZOOM, MindmapCanvas } from "./MindmapCanvas"
 import type { CaseNodeView, MindmapGraph } from "./types"
@@ -300,6 +301,15 @@ describe("MindmapCanvas", () => {
     expect(after).not.toBe(before)
     expect(after).toContain("translate(60 40)")
     fireEvent.pointerUp(viewport)
+  })
+
+  it("forwards the canvas <svg> through svgRef for the PNG export", () => {
+    const svgRef = createRef<SVGSVGElement>()
+    render(
+      <MindmapCanvas graph={fixtureGraph()} selectedId={null} onSelect={vi.fn()} svgRef={svgRef} />,
+    )
+
+    expect(svgRef.current).toBe(screen.getByRole("tree"))
   })
 
   it("shows an empty hint instead of an empty tree", () => {
