@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
 .SYNOPSIS
     Runs the P0-P5 acceptance gate for EzTest.
@@ -2357,6 +2357,7 @@ writeFileSync(process.argv[3], JSON.stringify({
                                 kind          = "explore"
                                 systemId      = [int64]$current.SystemId
                                 environmentId = [int64]$current.EnvironmentId
+                                startPaths    = @("http://127.0.0.1:13335/p5/home")
                             }
                             Assert-P5Http -Response $exploreStart -Status 202 -Label "POST explore run" | Out-Null
                             $exploreRun = Wait-P5Run -VersionId $exploreVersion.VersionId -RunId ([string]$exploreStart.Data.runId) -Headers $current.AdminHeaders
