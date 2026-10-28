@@ -207,12 +207,15 @@ type AgentRunRef struct {
 	RunID     int64
 }
 
-// AgentRunState is the polled state of one execution agent run.
+// AgentRunState is the polled state of one execution agent run. TerminalReason
+// is the P1 run's terminal reason (agent_run.terminal_reason); it lets the
+// runner tell an LLM/model failure from a normal end that skipped case_finish.
 type AgentRunState struct {
-	RunID      int64
-	Status     string
-	Error      string
-	FinishedAt *time.Time
+	RunID          int64
+	Status         string
+	TerminalReason string
+	Error          string
+	FinishedAt     *time.Time
 }
 
 // AgentSessionRef is one execution agent session listed for the Sessions tab.

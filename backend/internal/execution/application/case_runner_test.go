@@ -110,3 +110,153 @@ func TestTeardownClosesToolOwnedCaseContext(t *testing.T) {
 		t.Fatalf("CancelCase calls = %v, want none", got)
 	}
 }
+
+// TestAgentTerminalCodeMapsTerminalReason pins the terminal-reason mapping: an
+// LLM/model failure must never be blamed on the case, a normal agent end that
+// skipped case_finish stays case, and a pause/shutdown is never turned into a
+// model reason.
+func TestAgentTerminalCodeMapsTerminalReason(t *testing.T) {
+	cases := []struct {
+		name       string
+		state      AgentRunState
+		wantCode   string
+		wantReason string
+	}{
+		{
+			name:       "model error",
+			state:      AgentRunState{Status: "failed", Error: "upstream request failed", TerminalReason: "model_error"},
+			wantCode:   "model_error",
+			wantReason: "model_error",
+		},
+		{
+			name:       "llm error alias",
+			state:      AgentRunState{Status: "failed", TerminalReason: "llm_error"},
+			wantCode:   "model_error",
+			wantReason: "llm_error",
+		},
+		{
+			name:       "gateway error alias",
+			state:      AgentRunState{Status: "failed", TerminalReason: "gateway_error"},
+			wantCode:   "model_error",
+			wantReason: "gateway_error",
+		},
+		{
+			name:       "context overflow",
+			state:      AgentRunState{Status: "failed", TerminalReason: "context_overflow"},
+			wantCode:   "budget_exhausted",
+			wantReason: "context_overflow",
+		},
+		{
+			name:       "max turns",
+			state:      AgentRunState{Status: "done", TerminalReason: "max_turns"},
+			wantCode:   "budget_exhausted",
+			wantReason: "max_turns",
+		},
+		{
+			name:       "run hard timeout",
+			state:      AgentRunState{Status: "aborted", TerminalReason: "run_hard_timeout"},
+			wantCode:   "budget_exhausted",
+			wantReason: "run_hard_timeout",
+		},
+		{
+			name:       "timeout",
+			state:      AgentRunState{Status: "done", TerminalReason: "timeout"},
+			wantCode:   "budget_exhausted",
+			wantReason: "timeout",
+		},
+		{
+			name:       "done without case_finish",
+			state:      AgentRunState{Status: "done", TerminalReason: "completed"},
+			wantCode:   "agent_output_invalid",
+			wantReason: "case run ended without case_finish",
+		},
+		{
+			name:       "failed with an unknown error stays model",
+			state:      AgentRunState{Status: "failed", Error: "upstream socket closed"},
+			wantCode:   "internal",
+			wantReason: "upstream socket closed",
+		},
+		{
+			name:       "aborted with an unknown error stays model",
+			state:      AgentRunState{Status: "aborted", Error: "user aborted", TerminalReason: "aborted_streaming"},
+			wantCode:   "internal",
+			wantReason: "user aborted",
+		},
+		{
+			name:       "known tool code is preserved",
+			state:      AgentRunState{Status: "failed", Error: "host_not_allowed"},
+			wantCode:   "host_not_allowed",
+			wantReason: "host_not_allowed",
+		},
+		{
+			name:       "interrupted reason untouched",
+			state:      AgentRunState{Status: "interrupted", TerminalReason: "interrupted"},
+			wantCode:   "internal",
+			wantReason: "agent run interrupted",
+		},
+		{
+			name:       "shutdown reason untouched",
+			state:      AgentRunState{Status: "aborted", TerminalReason: "shutdown"},
+			wantCode:   "internal",
+			wantReason: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, reason := agentTerminalCode(tc.state)
+			if code != tc.wantCode || reason != tc.wantReason {
+				t.Fatalf("agentTerminalCode(%+v) = (%q, %q), want (%q, %q)",
+					tc.state, code, reason, tc.wantCode, tc.wantReason)
+			}
+		})
+	}
+}
+
+// TestCaseRunnerClassifiesAgentTerminalReason pins the case-run outcome of the
+// two acceptance-critical terminal reasons: an LLM failure becomes
+// inconclusive(model), while a normal end without case_finish stays
+// inconclusive(case).
+func TestCaseRunnerClassifiesAgentTerminalReason(t *testing.T) {
+	cases := []struct {
+		name       string
+		state      AgentRunState
+		wantStatus domain.CaseRunStatus
+		wantClass  domain.FailureClass
+		wantReason string
+	}{
+		{
+			name:       "LLM error becomes inconclusive(model)",
+			state:      AgentRunState{Status: "failed", Error: "upstream request failed", TerminalReason: "model_error"},
+			wantStatus: domain.CaseRunStatusInconclusive,
+			wantClass:  domain.FailureClassModel,
+			wantReason: "model_error",
+		},
+		{
+			name:       "done without case_finish becomes inconclusive(case)",
+			state:      AgentRunState{Status: "done", TerminalReason: "completed"},
+			wantStatus: domain.CaseRunStatusInconclusive,
+			wantClass:  domain.FailureClassCase,
+			wantReason: "case run ended without case_finish",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runner, world := newCaseRunnerHarness(t)
+			run := runningCaseRun(t, world)
+			world.runtime.setState(tc.state)
+
+			runner.Run(context.Background(), run, SessionRef{SessionID: 500}, world.sessions.environment)
+
+			stored := world.run(t, 1)
+			if stored.Status != tc.wantStatus {
+				t.Fatalf("status = %s, want %s", stored.Status, tc.wantStatus)
+			}
+			if stored.FailureClass == nil || *stored.FailureClass != tc.wantClass {
+				t.Fatalf("failure class = %v, want %s", stored.FailureClass, tc.wantClass)
+			}
+			if stored.FailureReason != tc.wantReason {
+				t.Fatalf("failure reason = %q, want %q", stored.FailureReason, tc.wantReason)
+			}
+		})
+	}
+}

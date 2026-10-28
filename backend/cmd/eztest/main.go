@@ -798,6 +798,14 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	if err := executionRecovery.Recover(startupCtx); err != nil {
 		return fmt.Errorf("recover execution batches: %w", err)
 	}
+	// Recover settles the runs of a previous process, but it is scoped to the
+	// active batches: a pending/parked case run (or a terminal batch) can keep a
+	// session lease whose release write was lost. Sweep releases those residual
+	// leases before the scheduler starts, so no lease survives a restart
+	// (spec §5.4). It is idempotent, so a boot that finds nothing is a no-op.
+	if err := executionRecovery.Sweep(startupCtx); err != nil {
+		return fmt.Errorf("sweep execution session leases: %w", err)
+	}
 	executionBatchService := executionapp.NewBatchService(executionapp.BatchServiceDeps{
 		Versions: executionVersionPort,
 		Mindmap:  executionMindmapPort,
