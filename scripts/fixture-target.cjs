@@ -386,6 +386,11 @@ async function handleRequest(req, res) {
       sendHtml(res, 200, P5_ORDERS_PAGE);
       return;
     }
+    if (pathname === "/p5/slow") {
+      // Test-only slow page so concurrent exploration runs overlap.
+      setTimeout(() => sendHtml(res, 200, P5_HOME_PAGE), 2500);
+      return;
+    }
     handleP5Admin(req, res);
     return;
   }
