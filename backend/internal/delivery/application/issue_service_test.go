@@ -50,6 +50,26 @@ func (f *issueFakeAudit) Record(_ context.Context, event IssueAuditEvent) error 
 	return nil
 }
 
+// issueFakeVersionReader is the in-memory IssueVersionReader. The test version
+// exists by default; err makes the lookup fail.
+type issueFakeVersionReader struct {
+	versions map[int64]bool
+	calls    []int64
+	err      error
+}
+
+func newIssueFakeVersionReader() *issueFakeVersionReader {
+	return &issueFakeVersionReader{versions: map[int64]bool{issueTestVersionID: true}}
+}
+
+func (r *issueFakeVersionReader) VersionExists(_ context.Context, versionID int64) (bool, error) {
+	r.calls = append(r.calls, versionID)
+	if r.err != nil {
+		return false, r.err
+	}
+	return r.versions[versionID], nil
+}
+
 // issueFakeStore is an in-memory IssueStore. Its InTx snapshots the maps and
 // restores them when the callback fails, so rollback semantics are exercised by
 // the unit tests without PostgreSQL. Reference ownership is not a store concern:
@@ -317,32 +337,36 @@ func (s *issueRaceStore) Create(ctx context.Context, issue domain.Issue, refs []
 // --- test environment -------------------------------------------------------
 
 type issueTestEnv struct {
-	svc    *IssueManager
-	store  *issueFakeStore
-	refs   *issueFakeRefValidator
-	events *issueFakeEvents
-	audit  *issueFakeAudit
-	ids    *issueTestIDs
-	clock  *issueTestClock
+	svc      *IssueManager
+	store    *issueFakeStore
+	refs     *issueFakeRefValidator
+	versions *issueFakeVersionReader
+	events   *issueFakeEvents
+	audit    *issueFakeAudit
+	ids      *issueTestIDs
+	clock    *issueTestClock
 }
 
 func newIssueTestEnv(t *testing.T) *issueTestEnv {
 	t.Helper()
 	store := newIssueFakeStore()
 	refs := newIssueFakeRefValidator()
+	versions := newIssueFakeVersionReader()
 	events := &issueFakeEvents{}
 	audit := &issueFakeAudit{}
 	ids := &issueTestIDs{next: 1000}
 	clock := &issueTestClock{now: issueTestNow}
 	svc := NewIssueService(IssueServiceDeps{
-		Store:  store,
-		Refs:   refs,
-		IDs:    ids,
-		Clock:  clock,
-		Events: events,
-		Audit:  audit,
+		Store:    store,
+		Versions: versions,
+		Refs:     refs,
+		IDs:      ids,
+		Clock:    clock,
+		Events:   events,
+		Audit:    audit,
 	})
-	return &issueTestEnv{svc: svc, store: store, refs: refs, events: events, audit: audit, ids: ids, clock: clock}
+	return &issueTestEnv{svc: svc, store: store, refs: refs, versions: versions,
+		events: events, audit: audit, ids: ids, clock: clock}
 }
 
 func (e *issueTestEnv) allow(kind string, id, versionID int64) {
@@ -519,6 +543,133 @@ func TestCreateHumanIssue(t *testing.T) {
 	}
 	if _, leaked := entry.Metadata["title"]; leaked {
 		t.Error("audit metadata leaks the issue title")
+	}
+}
+
+// TestCreateHumanIssueChecksVersionExists pins the T2b version gate: a human
+// issue is only created for an existing version, and a missing version is a
+// 404 version_not_found with no row, event or audit entry.
+func TestCreateHumanIssueChecksVersionExists(t *testing.T) {
+	command := func() CreateIssueCommand {
+		return CreateIssueCommand{Title: "login fails", Severity: domain.SeverityMajor}
+	}
+
+	t.Run("existing version passes", func(t *testing.T) {
+		env := newIssueTestEnv(t)
+		issue, err := env.svc.CreateHuman(context.Background(), issueTestVersionID, issueTestActor, command())
+		if err != nil {
+			t.Fatalf("CreateHuman = %v", err)
+		}
+		if issue.VersionID != issueTestVersionID {
+			t.Errorf("version = %d, want %d", issue.VersionID, issueTestVersionID)
+		}
+		if env.store.creates != 1 || len(env.events.published) != 1 || len(env.audit.recorded) != 1 {
+			t.Fatalf("create side effects = %d/%d/%d, want 1/1/1",
+				env.store.creates, len(env.events.published), len(env.audit.recorded))
+		}
+		if len(env.versions.calls) != 1 || env.versions.calls[0] != issueTestVersionID {
+			t.Errorf("version lookups = %v, want one lookup of %d", env.versions.calls, issueTestVersionID)
+		}
+	})
+
+	t.Run("missing version is version_not_found", func(t *testing.T) {
+		const missingVersionID = int64(4040)
+		env := newIssueTestEnv(t)
+		_, err := env.svc.CreateHuman(context.Background(), missingVersionID, issueTestActor, command())
+		var domainErr *domain.Error
+		if !errors.As(err, &domainErr) {
+			t.Fatalf("error type = %T (%v)", err, err)
+		}
+		if domainErr.Kind != domain.KindNotFound || domainErr.Reason != "version_not_found" {
+			t.Fatalf("error = %+v, want 404 version_not_found", domainErr)
+		}
+		if env.store.creates != 0 || len(env.store.issues) != 0 {
+			t.Fatalf("missing version wrote %d creates and %d rows", env.store.creates, len(env.store.issues))
+		}
+		if len(env.events.published) != 0 || len(env.audit.recorded) != 0 {
+			t.Fatalf("missing version published %d events and %d audit entries",
+				len(env.events.published), len(env.audit.recorded))
+		}
+		if len(env.versions.calls) != 1 || env.versions.calls[0] != missingVersionID {
+			t.Errorf("version lookups = %v, want one lookup of %d", env.versions.calls, missingVersionID)
+		}
+	})
+}
+
+// TestCreateHumanIssueFailsClosedWithoutVersionReader proves an unwired version
+// port cannot silently skip the target-version check and create an orphan issue.
+func TestCreateHumanIssueFailsClosedWithoutVersionReader(t *testing.T) {
+	store := newIssueFakeStore()
+	events := &issueFakeEvents{}
+	audit := &issueFakeAudit{}
+	svc := NewIssueService(IssueServiceDeps{
+		Store:  store,
+		IDs:    &issueTestIDs{next: 1000},
+		Clock:  &issueTestClock{now: issueTestNow},
+		Events: events,
+		Audit:  audit,
+	})
+	_, err := svc.CreateHuman(context.Background(), issueTestVersionID, issueTestActor, CreateIssueCommand{
+		Title:    "login fails",
+		Severity: domain.SeverityMajor,
+	})
+	if err == nil {
+		t.Fatal("CreateHuman accepted a version without a version reader")
+	}
+	if store.creates != 0 || len(store.issues) != 0 || len(events.published) != 0 || len(audit.recorded) != 0 {
+		t.Fatalf("unconfigured version reader wrote state: creates=%d rows=%d events=%d audit=%d",
+			store.creates, len(store.issues), len(events.published), len(audit.recorded))
+	}
+}
+
+// TestCreateHumanIssuePropagatesVersionLookupFailure proves a version-reader
+// error is not mistaken for a missing version and writes no issue.
+func TestCreateHumanIssuePropagatesVersionLookupFailure(t *testing.T) {
+	env := newIssueTestEnv(t)
+	lookupErr := errors.New("version store unavailable")
+	env.versions.err = lookupErr
+	_, err := env.svc.CreateHuman(context.Background(), issueTestVersionID, issueTestActor, CreateIssueCommand{
+		Title:    "login fails",
+		Severity: domain.SeverityMajor,
+	})
+	if !errors.Is(err, lookupErr) {
+		t.Fatalf("error = %v, want the wrapped version lookup failure", err)
+	}
+	if env.store.creates != 0 || len(env.store.issues) != 0 ||
+		len(env.events.published) != 0 || len(env.audit.recorded) != 0 {
+		t.Fatalf("failed version lookup wrote state: creates=%d rows=%d events=%d audit=%d",
+			env.store.creates, len(env.store.issues), len(env.events.published), len(env.audit.recorded))
+	}
+}
+
+// TestApplyDraftsChecksVersionExists proves the AI materialization path also
+// refuses to write issues for a nonexistent version.
+func TestApplyDraftsChecksVersionExists(t *testing.T) {
+	const missingVersionID = int64(4040)
+	env := newIssueTestEnv(t)
+	env.allow(domain.RefKindCaseRun, 777, issueTestVersionID)
+	env.allow(domain.RefKindCaseNode, 9001, issueTestVersionID)
+	env.allow(domain.RefKindEvidence, 31, issueTestVersionID)
+
+	_, err := env.svc.ApplyDrafts(context.Background(), missingVersionID, 700, issueTestActor,
+		[]domain.IssueDraft{issueTestValidAIDraft()})
+	var domainErr *domain.Error
+	if !errors.As(err, &domainErr) {
+		t.Fatalf("error type = %T (%v)", err, err)
+	}
+	if domainErr.Kind != domain.KindNotFound || domainErr.Reason != "version_not_found" {
+		t.Fatalf("error = %+v, want 404 version_not_found", domainErr)
+	}
+	if env.store.creates != 0 || len(env.store.issues) != 0 || env.store.inTx != 0 {
+		t.Fatalf("missing version wrote state: creates=%d rows=%d transactions=%d",
+			env.store.creates, len(env.store.issues), env.store.inTx)
+	}
+	if len(env.events.published) != 0 || len(env.audit.recorded) != 0 {
+		t.Fatalf("missing version published %d events and %d audit entries",
+			len(env.events.published), len(env.audit.recorded))
+	}
+	if len(env.versions.calls) != 1 || env.versions.calls[0] != missingVersionID {
+		t.Errorf("version lookups = %v, want one lookup of %d", env.versions.calls, missingVersionID)
 	}
 }
 
@@ -972,12 +1123,13 @@ func TestApplyDraftsRetriesConcurrentDedupeConflict(t *testing.T) {
 	draft := issueTestValidAIDraft()
 	store.raceDedupeKey = draft.DedupeKey
 	svc := NewIssueService(IssueServiceDeps{
-		Store:  store,
-		Refs:   refs,
-		IDs:    &issueTestIDs{next: 1000},
-		Clock:  &issueTestClock{now: issueTestNow},
-		Events: events,
-		Audit:  audit,
+		Store:    store,
+		Versions: newIssueFakeVersionReader(),
+		Refs:     refs,
+		IDs:      &issueTestIDs{next: 1000},
+		Clock:    &issueTestClock{now: issueTestNow},
+		Events:   events,
+		Audit:    audit,
 	})
 
 	issues, err := svc.ApplyDrafts(context.Background(), issueTestVersionID, 700, issueTestActor,
@@ -1402,9 +1554,10 @@ func TestIssueServiceRequiresStore(t *testing.T) {
 func TestCreateHumanIssueRequiresRefValidator(t *testing.T) {
 	store := newIssueFakeStore()
 	svc := NewIssueService(IssueServiceDeps{
-		Store: store,
-		IDs:   &issueTestIDs{next: 1000},
-		Clock: &issueTestClock{now: issueTestNow},
+		Store:    store,
+		Versions: newIssueFakeVersionReader(),
+		IDs:      &issueTestIDs{next: 1000},
+		Clock:    &issueTestClock{now: issueTestNow},
 	})
 	_, err := svc.CreateHuman(context.Background(), issueTestVersionID, issueTestActor, CreateIssueCommand{
 		Title:      "登录失败",
@@ -1431,9 +1584,10 @@ func TestIssueServiceWithoutIDGeneratorFailsWrites(t *testing.T) {
 	store := newIssueFakeStore()
 	refs := newIssueFakeRefValidator()
 	svc := NewIssueService(IssueServiceDeps{
-		Store: store,
-		Refs:  refs,
-		Clock: &issueTestClock{now: issueTestNow},
+		Store:    store,
+		Versions: newIssueFakeVersionReader(),
+		Refs:     refs,
+		Clock:    &issueTestClock{now: issueTestNow},
 	})
 	_, err := svc.CreateHuman(context.Background(), issueTestVersionID, issueTestActor, CreateIssueCommand{
 		Title:    "缺少 ID 生成器",

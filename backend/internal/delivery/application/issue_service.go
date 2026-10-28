@@ -93,7 +93,8 @@ var _ IssueRefReader = (*IssueManager)(nil)
 
 // CreateHuman creates a human-authored open issue (spec §5.4, §7.3): source
 // human, dedupe key null, category defect and confidence medium by default. The
-// referenced case run/node/requirement must belong to the version.
+// target version must exist (version_not_found otherwise) and the referenced
+// case run/node/requirement must belong to the version.
 func (s *IssueManager) CreateHuman(ctx context.Context, versionID, actor int64, cmd CreateIssueCommand) (domain.Issue, error) {
 	if err := s.ready(); err != nil {
 		return domain.Issue{}, err
@@ -101,6 +102,9 @@ func (s *IssueManager) CreateHuman(ctx context.Context, versionID, actor int64, 
 	if versionID <= 0 {
 		return domain.Issue{}, domain.NewInvalid("versionId", domain.ReasonInvalidArgument,
 			"versionId must be a positive id")
+	}
+	if err := s.validateVersion(ctx, versionID); err != nil {
+		return domain.Issue{}, err
 	}
 	title, err := domain.ValidateTitle(cmd.Title)
 	if err != nil {
@@ -168,14 +172,15 @@ func (s *IssueManager) CreateHuman(ctx context.Context, versionID, actor int64, 
 	return created, nil
 }
 
-// ApplyDrafts materializes AI issue drafts (spec §5.4, §6.3): every draft is
-// validated before anything is written, then one transaction dedupes by
-// (version_id, dedupe_key), appends the new occurrence refs and raises the
-// recurrence count, or inserts a new issue. A draft whose incoming refs are all
-// already linked is a replay and changes nothing (Lead replay ruling: identical
-// ref set = replay, no recurrence bump and no issue.updated). A lost unique-key
-// race is retried once outside the failed transaction and merged instead of
-// failing (spec §6.9). Events and audit are published only after the commit.
+// ApplyDrafts materializes AI issue drafts (spec §5.4, §6.3): the target
+// version must exist, then every draft is validated before anything is written,
+// and one transaction dedupes by (version_id, dedupe_key), appends the new
+// occurrence refs and raises the recurrence count, or inserts a new issue. A
+// draft whose incoming refs are all already linked is a replay and changes
+// nothing (Lead replay ruling: identical ref set = replay, no recurrence bump
+// and no issue.updated). A lost unique-key race is retried once outside the
+// failed transaction and merged instead of failing (spec §6.9). Events and audit
+// are published only after the commit.
 func (s *IssueManager) ApplyDrafts(ctx context.Context, versionID, batchID, actor int64, drafts []domain.IssueDraft) ([]domain.Issue, error) {
 	if err := s.ready(); err != nil {
 		return nil, err
@@ -186,6 +191,9 @@ func (s *IssueManager) ApplyDrafts(ctx context.Context, versionID, batchID, acto
 	}
 	if len(drafts) == 0 {
 		return []domain.Issue{}, nil
+	}
+	if err := s.validateVersion(ctx, versionID); err != nil {
+		return nil, err
 	}
 
 	prepared := make([]issuePreparedDraft, len(drafts))
@@ -538,6 +546,24 @@ func issueValidateRefFormats(refs []domain.IssueRef) error {
 		if err := domain.ValidateIssueRef(ref.RefKind, ref.RefID); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// validateVersion rejects an issue write whose target version does not exist.
+// The port is required: without it the check would silently disappear and an
+// orphan issue could be written. A missing version is the stable
+// version_not_found 404; any other lookup failure propagates.
+func (s *IssueManager) validateVersion(ctx context.Context, versionID int64) error {
+	if s.deps.Versions == nil {
+		return errors.New("delivery: issue version reader is not configured")
+	}
+	exists, err := s.deps.Versions.VersionExists(ctx, versionID)
+	if err != nil {
+		return fmt.Errorf("delivery: validate version %d: %w", versionID, err)
+	}
+	if !exists {
+		return domain.NewNotFound("version", versionID)
 	}
 	return nil
 }

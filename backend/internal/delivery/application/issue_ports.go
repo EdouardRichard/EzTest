@@ -70,6 +70,15 @@ type IssueRefValidator interface {
 	ValidateRefs(ctx context.Context, versionID int64, refs []domain.IssueRef) error
 }
 
+// IssueVersionReader reports whether a version exists. Every issue create path
+// checks it before writing so a nonexistent target version cannot create an
+// orphan issue (spec §7.3). Implementations are delivery infrastructure
+// adapters over the version application service; delivery never reads the
+// version table itself (spec §3.2, Agent.md §6.2).
+type IssueVersionReader interface {
+	VersionExists(ctx context.Context, versionID int64) (bool, error)
+}
+
 // IssueIDGenerator mints Snowflake ids. Every delivery id is generated in the
 // application layer and passed explicitly to the repository (D29).
 type IssueIDGenerator interface {
@@ -119,15 +128,17 @@ type IssueAuditRecorder interface {
 }
 
 // IssueServiceDeps are the ports of the issue use cases. Store is required;
+// Versions is required for issue creation (an unwired reader fails closed);
 // Refs is required whenever an issue carries references (writes without it fail
 // closed); IDs is required for writes (no process fallback); Clock falls back to
 // the process clock; Events and Audit are optional (a nil sink disables
 // publication/auditing).
 type IssueServiceDeps struct {
-	Store  IssueStore
-	Refs   IssueRefValidator
-	IDs    IssueIDGenerator
-	Clock  IssueClock
-	Events IssueEventPublisher
-	Audit  IssueAuditRecorder
+	Store    IssueStore
+	Versions IssueVersionReader
+	Refs     IssueRefValidator
+	IDs      IssueIDGenerator
+	Clock    IssueClock
+	Events   IssueEventPublisher
+	Audit    IssueAuditRecorder
 }
