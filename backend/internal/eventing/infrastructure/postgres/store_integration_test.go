@@ -166,7 +166,7 @@ func TestPublishStoresLowercaseRefsJSON(t *testing.T) {
 	var evidence, caseRef, requirement, code *string
 	if err := pool.QueryRow(ctx, `
 		SELECT refs->>'evidence', refs->>'case', refs->>'requirement', refs->>'code'
-		FROM events WHERE channel = $1 AND seq = $2`,
+		FROM event WHERE channel = $1 AND seq = $2`,
 		published.Channel, published.Seq,
 	).Scan(&evidence, &caseRef, &requirement, &code); err != nil {
 		t.Fatal(err)
@@ -192,7 +192,7 @@ func TestPublishStoresLowercaseRefsJSON(t *testing.T) {
 	var oldEvidence, oldCase, oldRequirement, oldCode *string
 	if err := pool.QueryRow(ctx, `
 		SELECT refs->>'Evidence', refs->>'Case', refs->>'Requirement', refs->>'Code'
-		FROM events WHERE channel = $1 AND seq = $2`,
+		FROM event WHERE channel = $1 AND seq = $2`,
 		published.Channel, published.Seq,
 	).Scan(&oldEvidence, &oldCase, &oldRequirement, &oldCode); err != nil {
 		t.Fatal(err)
@@ -232,7 +232,7 @@ func TestPublishRejectsInvalidEvent(t *testing.T) {
 				t.Fatalf("Publish error=%v, want ErrInvalidEvent", err)
 			}
 			var events int
-			if err := pool.QueryRow(ctx, `SELECT count(*) FROM events`).Scan(&events); err != nil {
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM event`).Scan(&events); err != nil {
 				t.Fatal(err)
 			}
 			if events != 0 {
@@ -313,7 +313,7 @@ func TestListAfterCursorTooOldAfterRetention(t *testing.T) {
 	store := eventpostgres.NewEventStore(pool)
 	publishN(t, store, "system", 5)
 
-	if _, err := pool.Exec(ctx, `DELETE FROM events WHERE channel = $1 AND seq <= 2`, "system"); err != nil {
+	if _, err := pool.Exec(ctx, `DELETE FROM event WHERE channel = $1 AND seq <= 2`, "system"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.ListAfter(ctx, "system", 0, 100); !errors.Is(err, eventing.ErrCursorTooOld) {
@@ -336,10 +336,10 @@ func TestListAfterCursorTooOldAfterRebuild(t *testing.T) {
 	store := eventpostgres.NewEventStore(pool)
 	publishN(t, store, "system", 2)
 
-	if _, err := pool.Exec(ctx, `TRUNCATE TABLE events`); err != nil {
+	if _, err := pool.Exec(ctx, `TRUNCATE TABLE event`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE event_channels SET last_seq = 0 WHERE channel = $1`, "system"); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE event_channel SET last_seq = 0 WHERE channel = $1`, "system"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.Publish(ctx, eventing.NewEvent{Channel: "system", Type: "system.test", TS: time.Now().UTC()}); err != nil {

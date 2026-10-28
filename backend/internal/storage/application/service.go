@@ -26,7 +26,7 @@ type Service struct {
 }
 
 // NewService returns the storage use case. metadata is the insert-only
-// storage_objects repository. A nil recorder degrades to a no-op so a
+// storage_object repository. A nil recorder degrades to a no-op so a
 // partially wired process cannot panic on the first upload.
 func NewService(store storage.Store, metadata MetadataRepository, recorder auditapp.Recorder) *Service {
 	if recorder == nil {

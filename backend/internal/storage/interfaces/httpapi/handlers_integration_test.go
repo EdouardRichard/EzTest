@@ -102,7 +102,7 @@ func errorCodeOf(t *testing.T, body []byte) string {
 
 // TestStorageEndToEndAgainstDatabase wires the production composition root
 // against PostgreSQL: real login/roles, the real local filesystem store, the
-// real audit repository and the migration's storage_objects table. It covers
+// real audit repository and the migration's storage_object table. It covers
 // admin/regular permissions, the upload size limit, a content-addressed
 // download and the storage_corrupted path for a tampered file.
 func TestStorageEndToEndAgainstDatabase(t *testing.T) {
@@ -142,11 +142,11 @@ func TestStorageEndToEndAgainstDatabase(t *testing.T) {
 	if err := pool.QueryRow(ctx, `
 		SELECT count(*)
 		FROM information_schema.columns
-		WHERE table_schema = 'public' AND table_name = 'storage_objects'`).Scan(&columns); err != nil {
-		t.Fatalf("storage_objects table is missing: %v", err)
+		WHERE table_schema = 'public' AND table_name = 'storage_object'`).Scan(&columns); err != nil {
+		t.Fatalf("storage_object table is missing: %v", err)
 	}
 	if columns != 5 {
-		t.Fatalf("storage_objects columns=%d want 5 (sha256,size,content_type,relative_path,created_at)", columns)
+		t.Fatalf("storage_object columns=%d want 5 (sha256,size,content_type,relative_path,created_at)", columns)
 	}
 
 	adminToken, adminID := login(t, h, "admin", "admin-pass-123")
@@ -194,10 +194,10 @@ func TestStorageEndToEndAgainstDatabase(t *testing.T) {
 	)
 	if err := pool.QueryRow(ctx, `
 		SELECT sha256, size, content_type, relative_path, created_at
-		FROM storage_objects
+		FROM storage_object
 		WHERE sha256 = $1`, wantID).
 		Scan(&storedSHA, &storedSize, &storedContentType, &storedRelativePath, &storedCreatedAt); err != nil {
-		t.Fatalf("storage_objects row missing: %v", err)
+		t.Fatalf("storage_object row missing: %v", err)
 	}
 	wantRelativePath := wantID[:2] + "/" + wantID[2:4] + "/" + wantID
 	if storedSHA != wantID || storedSize != int64(len(content)) ||
@@ -206,7 +206,7 @@ func TestStorageEndToEndAgainstDatabase(t *testing.T) {
 			storedSHA, storedSize, storedContentType, storedRelativePath, wantID, len(content), wantRelativePath)
 	}
 	if storedCreatedAt.IsZero() {
-		t.Fatal("storage_objects.created_at was not set")
+		t.Fatal("storage_object.created_at was not set")
 	}
 
 	// Re-uploading the same bytes dedupes: the metadata row is reused, the
@@ -230,7 +230,7 @@ func TestStorageEndToEndAgainstDatabase(t *testing.T) {
 		t.Fatalf("dedupe payload=%+v want sha=%s content_type=text/plain", deduped.Data, wantID)
 	}
 	var metadataRows int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM storage_objects WHERE sha256 = $1`, wantID).Scan(&metadataRows); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM storage_object WHERE sha256 = $1`, wantID).Scan(&metadataRows); err != nil {
 		t.Fatalf("count metadata rows: %v", err)
 	}
 	if metadataRows != 1 {

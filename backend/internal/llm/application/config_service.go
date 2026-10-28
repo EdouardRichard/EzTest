@@ -80,7 +80,7 @@ func configMetadata(cfg llm.Config) map[string]any {
 // the service-level default policy used by the admin API: retry_count 0 is a
 // valid explicit value, so the HTTP layer resolves this policy first and only
 // overrides fields the request actually provides. The values mirror the
-// llm_configs column defaults.
+// llm_config column defaults.
 func DefaultCreateParams() llm.CreateParams {
 	return llm.CreateParams{
 		RetryCount:        llm.DefaultRetryCount,

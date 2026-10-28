@@ -13,7 +13,7 @@ import (
 	storageapp "github.com/EdouardRichard/EzTest/backend/internal/storage/application"
 )
 
-// metadataColumns is the column list shared by every storage_objects query and
+// metadataColumns is the column list shared by every storage_object query and
 // the row order scanMetadata expects.
 const metadataColumns = `sha256, size, content_type, relative_path, created_at`
 
@@ -32,7 +32,7 @@ func NewMetadataRepository(pool *pgxpool.Pool) *MetadataRepository {
 // created. The sha256 primary key makes the insert idempotent: uploading bytes
 // that already have a row does nothing and returns false.
 func (r *MetadataRepository) Insert(ctx context.Context, metadata storageapp.ObjectMetadata) (bool, error) {
-	const query = `INSERT INTO storage_objects (sha256, size, content_type, relative_path)
+	const query = `INSERT INTO storage_object (sha256, size, content_type, relative_path)
 		VALUES ($1, $2, $3, $4)
 		ON CONFLICT (sha256) DO NOTHING`
 	tag, err := r.pool.Exec(ctx, query,
@@ -49,7 +49,7 @@ func (r *MetadataRepository) Insert(ctx context.Context, metadata storageapp.Obj
 
 // Find returns the stored metadata for sha256. ok is false when no row exists.
 func (r *MetadataRepository) Find(ctx context.Context, sha256 string) (storageapp.ObjectMetadata, bool, error) {
-	const query = `SELECT ` + metadataColumns + ` FROM storage_objects WHERE sha256 = $1`
+	const query = `SELECT ` + metadataColumns + ` FROM storage_object WHERE sha256 = $1`
 	var metadata storageapp.ObjectMetadata
 	err := r.pool.QueryRow(ctx, query, sha256).Scan(
 		&metadata.SHA256,

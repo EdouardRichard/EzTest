@@ -40,7 +40,7 @@ func (r *capturingRecorder) List(context.Context, int, int64) ([]auditdomain.Ent
 	return r.entries, false, nil
 }
 
-// memoryMetadata is an in-memory storage_objects repository with insert-only
+// memoryMetadata is an in-memory storage_object repository with insert-only
 // semantics, matching the production PostgreSQL repository.
 type memoryMetadata struct {
 	mu   sync.Mutex

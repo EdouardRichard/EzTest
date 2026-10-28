@@ -80,7 +80,7 @@ func (r *Repository) Record(ctx context.Context, entry audit.Entry) error {
 	if !entry.CreatedAt.IsZero() {
 		createdAt = &entry.CreatedAt
 	}
-	const query = `INSERT INTO audit_logs
+	const query = `INSERT INTO audit_log
 		(actor_user_id, action, target_type, target_id, request_id, ip, user_agent, metadata, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, COALESCE($9::timestamptz, now()))`
 	if _, err := r.pool.Exec(ctx, query,
@@ -106,7 +106,7 @@ func (r *Repository) List(ctx context.Context, limit int, afterID int64) ([]audi
 		return nil, false, fmt.Errorf("postgres: list audit entries: limit must be positive")
 	}
 	const query = `SELECT ` + entryColumns + `
-		FROM audit_logs
+		FROM audit_log
 		WHERE ($1 <= 0 OR id < $1)
 		ORDER BY id DESC
 		LIMIT $2`

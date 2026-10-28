@@ -1,6 +1,6 @@
 // Package postgres implements the eventing store port with PostgreSQL. Events
-// and their per-channel seq counters are persisted in `events` and
-// `event_channels`; the seq assignment and the event insert share one
+// and their per-channel seq counters are persisted in `event` and
+// `event_channel`; the seq assignment and the event insert share one
 // transaction so a channel can never expose a gap.
 package postgres
 
@@ -27,12 +27,12 @@ const eventColumns = `channel, seq, type, version_id, batch_id, case_id, step_id
 const (
 	// allocateSeqSQL atomically reserves the next channel-local seq. The first
 	// event of a channel creates the counter row at 1.
-	allocateSeqSQL = `INSERT INTO event_channels (channel, last_seq, updated_at)
+	allocateSeqSQL = `INSERT INTO event_channel (channel, last_seq, updated_at)
 		VALUES ($1, 1, now())
 		ON CONFLICT (channel) DO UPDATE
-		SET last_seq = event_channels.last_seq + 1, updated_at = now()
+		SET last_seq = event_channel.last_seq + 1, updated_at = now()
 		RETURNING last_seq`
-	insertEventSQL = `INSERT INTO events
+	insertEventSQL = `INSERT INTO event
 		(channel, seq, type, version_id, batch_id, case_id, step_id, agent_role, session_id, ts, summary, detail, refs)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13::jsonb)`
 )
@@ -153,7 +153,7 @@ func (s *EventStore) ListAfter(ctx context.Context, channel string, afterSeq int
 		return nil, err
 	}
 	const query = `SELECT ` + eventColumns + `
-		FROM events
+		FROM event
 		WHERE channel = $1 AND seq > $2
 		ORDER BY seq ASC
 		LIMIT $3`
@@ -177,14 +177,14 @@ func (s *EventStore) ListBefore(ctx context.Context, channel string, beforeSeq i
 	)
 	if beforeSeq > 0 {
 		query = `SELECT ` + eventColumns + `
-			FROM events
+			FROM event
 			WHERE channel = $1 AND seq < $2
 			ORDER BY seq DESC
 			LIMIT $3`
 		args = []any{channel, beforeSeq, limit + 1}
 	} else {
 		query = `SELECT ` + eventColumns + `
-			FROM events
+			FROM event
 			WHERE channel = $1
 			ORDER BY seq DESC
 			LIMIT $2`
@@ -205,7 +205,7 @@ func (s *EventStore) ListBefore(ctx context.Context, channel string, beforeSeq i
 // LatestSeq returns the channel's current seq counter. An unknown channel is
 // reported as ErrChannelNotFound so the snapshot endpoint can answer 404.
 func (s *EventStore) LatestSeq(ctx context.Context, channel string) (int64, error) {
-	const query = `SELECT last_seq FROM event_channels WHERE channel = $1`
+	const query = `SELECT last_seq FROM event_channel WHERE channel = $1`
 	var seq int64
 	if err := s.pool.QueryRow(ctx, query, channel).Scan(&seq); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -222,7 +222,7 @@ func (s *EventStore) LatestSeq(ctx context.Context, channel string) (int64, erro
 func (s *EventStore) checkReplayCursor(ctx context.Context, channel string, afterSeq int64) error {
 	var lastSeq int64
 	if err := s.pool.QueryRow(ctx,
-		`SELECT last_seq FROM event_channels WHERE channel = $1`, channel).Scan(&lastSeq); err != nil {
+		`SELECT last_seq FROM event_channel WHERE channel = $1`, channel).Scan(&lastSeq); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// No such channel: a fresh stream (cursor 0) simply has no history;
 			// a non-zero cursor came from a channel that no longer exists.
@@ -239,7 +239,7 @@ func (s *EventStore) checkReplayCursor(ctx context.Context, channel string, afte
 
 	var firstSeq *int64
 	if err := s.pool.QueryRow(ctx,
-		`SELECT MIN(seq) FROM events WHERE channel = $1`, channel).Scan(&firstSeq); err != nil {
+		`SELECT MIN(seq) FROM event WHERE channel = $1`, channel).Scan(&firstSeq); err != nil {
 		return fmt.Errorf("postgres: read first event seq: %w", err)
 	}
 	if firstSeq != nil && afterSeq < *firstSeq-1 {
