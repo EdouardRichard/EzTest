@@ -58,6 +58,9 @@ type runFixture struct {
 	enterReviewErr   error
 	createSessionErr error
 	startTextErr     error
+	// runningCASErr makes the queued→running run status CAS fail, mimicking a
+	// concurrent worker that already moved the row.
+	runningCASErr error
 }
 
 // newRunFixture builds a version with a bound system and code baseline.
@@ -94,6 +97,7 @@ func (f *runFixture) service() *application.RunService {
 	return application.NewRunService(application.RunDeps{
 		Runs:         runRunRepo{f},
 		Graph:        f,
+		Baselines:    runBaselineRepo{f},
 		Nodes:        runNodeRepo{f},
 		Steps:        runStepRepo{f},
 		Assertions:   runAssertionRepo{f},
@@ -364,23 +368,37 @@ func (r runNodeRepo) Delete(_ context.Context, versionID, nodeID int64, expected
 	if current.Revision != expectedRevision {
 		return domain.NewStateConflict("case_revision_conflict", "stale node revision")
 	}
-	delete(r.f.nodes, nodeID)
-	for id, step := range r.f.steps {
-		if step.NodeID == nodeID {
-			delete(r.f.steps, id)
-		}
-	}
-	for id, assertion := range r.f.assertions {
-		if assertion.NodeID == nodeID {
-			delete(r.f.assertions, id)
-		}
-	}
-	for id, source := range r.f.sources {
-		if source.NodeID == nodeID {
-			delete(r.f.sources, id)
-		}
-	}
+	// case_node.parent_id is ON DELETE CASCADE, so removing a scenario removes
+	// its whole subtree; the fixture mirrors that so a replace that deletes only
+	// the roots behaves like PostgreSQL.
+	r.f.deleteNodeSubtree(nodeID)
 	return nil
+}
+
+// deleteNodeSubtree removes one node, its descendants and the child rows of the
+// whole subtree.
+func (f *runFixture) deleteNodeSubtree(nodeID int64) {
+	for id, node := range f.nodes {
+		if node.ParentID != nil && *node.ParentID == nodeID {
+			f.deleteNodeSubtree(id)
+		}
+	}
+	delete(f.nodes, nodeID)
+	for id, step := range f.steps {
+		if step.NodeID == nodeID {
+			delete(f.steps, id)
+		}
+	}
+	for id, assertion := range f.assertions {
+		if assertion.NodeID == nodeID {
+			delete(f.assertions, id)
+		}
+	}
+	for id, source := range f.sources {
+		if source.NodeID == nodeID {
+			delete(f.sources, id)
+		}
+	}
 }
 
 func (r runNodeRepo) UpdateStatusByVersion(_ context.Context, versionID int64, from, to string) (int, error) {
@@ -626,6 +644,11 @@ func (r runRunRepo) List(_ context.Context, _ int64, _, _ string, _ int, _ strin
 }
 
 func (r runRunRepo) UpdateStatus(_ context.Context, runID int64, from, to string, patch application.RunPatch) (domain.CaseDesignRun, error) {
+	if r.f.runningCASErr != nil && from == domain.RunQueued && to == domain.RunRunning {
+		// The strict adapter returns the zero row plus the CAS error; the
+		// coordinator must not rely on that return value.
+		return domain.CaseDesignRun{}, r.f.runningCASErr
+	}
 	run, ok := r.f.runs[runID]
 	if !ok {
 		return domain.CaseDesignRun{}, domain.NewNotFound("run", runID)
@@ -739,6 +762,15 @@ func (r runReviewRepo) Create(_ context.Context, review domain.CaseReview) (doma
 	if _, exists := r.f.reviews[review.ID]; exists {
 		return domain.CaseReview{}, domain.NewConflict("duplicate_key", "review already exists")
 	}
+	// uk_case_review_approved: at most one approved review per version.
+	if review.Status == domain.ReviewApproved {
+		for _, existing := range r.f.reviews {
+			if existing.VersionID == review.VersionID && existing.Status == domain.ReviewApproved {
+				return domain.CaseReview{}, domain.NewConflict("baseline_frozen",
+					"the version already has an approved review")
+			}
+		}
+	}
 	r.f.reviews[review.ID] = review
 	return review, nil
 }
@@ -770,12 +802,52 @@ func (r runReviewRepo) Decide(_ context.Context, reviewID int64, status string, 
 	if !ok {
 		return domain.CaseReview{}, domain.NewNotFound("review", reviewID)
 	}
+	// The PostgreSQL Decide is a draft-only CAS: an already-decided row is a
+	// conflict, and an approved row specifically is baseline_frozen.
+	if review.Status != domain.ReviewDraft {
+		if review.Status == domain.ReviewApproved {
+			return domain.CaseReview{}, domain.NewConflict("baseline_frozen",
+				"the review is already approved")
+		}
+		return domain.CaseReview{}, domain.NewConflict("conflict",
+			"the review is already "+review.Status)
+	}
+	// uk_case_review_approved: approving a second review of the version is a
+	// baseline_frozen conflict, exactly like the PostgreSQL unique index.
+	if status == domain.ReviewApproved {
+		for id, existing := range r.f.reviews {
+			if id != reviewID && existing.VersionID == review.VersionID && existing.Status == domain.ReviewApproved {
+				return domain.CaseReview{}, domain.NewConflict("baseline_frozen",
+					"the version already has an approved review")
+			}
+		}
+	}
 	review.Status = status
 	review.Comment = comment
 	decidedBy := actor
 	review.DecidedBy = &decidedBy
 	decidedAt := r.f.now
 	review.DecidedAt = &decidedAt
+	review.UpdatedAt = r.f.now
+	r.f.reviews[reviewID] = review
+	return review, nil
+}
+
+// Reopen mirrors the PostgreSQL approved-only CAS: a missing row is not found, a
+// non-approved row is a conflict and an empty comment keeps the stored one.
+func (r runReviewRepo) Reopen(_ context.Context, reviewID int64, comment string, _ int64) (domain.CaseReview, error) {
+	review, ok := r.f.reviews[reviewID]
+	if !ok {
+		return domain.CaseReview{}, domain.NewNotFound("review", reviewID)
+	}
+	if review.Status != domain.ReviewApproved {
+		return domain.CaseReview{}, domain.NewConflict("baseline_frozen",
+			"the review is not approved")
+	}
+	review.Status = domain.ReviewDraft
+	if comment != "" {
+		review.Comment = comment
+	}
 	review.UpdatedAt = r.f.now
 	r.f.reviews[reviewID] = review
 	return review, nil
@@ -1469,4 +1541,64 @@ func TestWorkerStopsWithoutLeakingGoroutines(t *testing.T) {
 		t.Fatal("Stop did not terminate the worker loop")
 	}
 	service.Stop()
+}
+
+// TestStartReviewRunAllowedAfterFreeze covers spec §6.4 rule 3: a read-only
+// review run may start on an executing (frozen) version, while design and
+// data-plan runs stay version_state_conflict.
+func TestStartReviewRunAllowedAfterFreeze(t *testing.T) {
+	ctx := context.Background()
+	fixture := newRunFixture()
+	fixture.version.Status = "executing"
+	fixture.confirmed = []application.RequirementSnapshot{{ID: 7, VersionID: runTestVersionID, Status: "clarified"}}
+	service := fixture.service()
+
+	run, err := service.Start(ctx, runTestVersionID, 42, application.StartRunCommand{Kind: domain.RunKindReview})
+	if err != nil {
+		t.Fatalf("start review run on a frozen version: %v", err)
+	}
+	if run.Kind != domain.RunKindReview || run.Status != domain.RunRunning {
+		t.Fatalf("run = %+v, want a running review run", run)
+	}
+	if len(fixture.profiles) != 1 || fixture.profiles[0] != domain.ProfileKeyCaseReview {
+		t.Fatalf("profiles = %v, want [%s]", fixture.profiles, domain.ProfileKeyCaseReview)
+	}
+
+	for _, kind := range []string{domain.RunKindDesign, domain.RunKindDataPlan} {
+		_, err := service.Start(ctx, runTestVersionID, 42, application.StartRunCommand{Kind: kind})
+		requireDomainError(t, err, domain.KindStateConflict, "version_state_conflict")
+	}
+}
+
+// TestStartRunRunningCASFailureAbortsSession covers the queued→running CAS
+// failure: the coordinator keeps the pre-update run (non-zero id/status), aborts
+// the just-created agent session and marks the persisted row failed instead of
+// losing it.
+func TestStartRunRunningCASFailureAbortsSession(t *testing.T) {
+	ctx := context.Background()
+	fixture := newDesignFixture()
+	fixture.runningCASErr = errors.New("run was moved by a concurrent worker")
+	service := fixture.service()
+
+	run, err := service.Start(ctx, runTestVersionID, 42, application.StartRunCommand{Kind: domain.RunKindDesign})
+	requireDomainError(t, err, domain.KindConflict, "ai_unavailable")
+	if run.ID == 0 {
+		t.Fatal("a failed queued→running CAS must not return a zero run")
+	}
+	stored, ok := fixture.runs[run.ID]
+	if !ok {
+		t.Fatalf("run %d was lost", run.ID)
+	}
+	if stored.Status != domain.RunFailed || stored.IsActive() {
+		t.Fatalf("stored run status = %q, want failed and not active", stored.Status)
+	}
+	if reason, _ := runErrors(t, stored); reason != "ai_unavailable" {
+		t.Fatalf("stored run reason = %q, want ai_unavailable", reason)
+	}
+	if len(fixture.aborted) != 1 {
+		t.Fatalf("aborted sessions = %v, want the orphan session aborted", fixture.aborted)
+	}
+	if _, ok := fixture.sessions[fixture.aborted[0]]; !ok {
+		t.Fatalf("aborted session %d was never created", fixture.aborted[0])
+	}
 }

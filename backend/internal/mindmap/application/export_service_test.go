@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -57,6 +59,12 @@ func newExportFixture(t *testing.T) *exportFixture {
 
 // service wires the export service to the fixture ports.
 func (f *exportFixture) service() *application.ExportService {
+	return f.serviceWithExports(exportRepo{f})
+}
+
+// serviceWithExports wires the export service with an alternative export
+// repository, so a test can simulate a failing metadata write.
+func (f *exportFixture) serviceWithExports(exports application.ExportRepository) *application.ExportService {
 	return application.NewExportService(application.ExportDeps{
 		Versions:     graphVersionLifecycle{f.graphFixture},
 		Requirements: graphRequirementReader{f.graphFixture},
@@ -66,7 +74,7 @@ func (f *exportFixture) service() *application.ExportService {
 		Sources:      graphSourceRepo{f.graphFixture},
 		Findings:     exportFindingRepo{f},
 		Baselines:    graphBaselineRepo{f.graphFixture},
-		Exports:      exportRepo{f},
+		Exports:      exports,
 		Anchors:      exportAnchorGateway{f},
 		Store:        f.store,
 		Events:       graphEventSink{f.graphFixture},
@@ -368,6 +376,28 @@ func (r exportRepo) FindByBaselineFormat(_ context.Context, versionID int64, for
 	return found, nil
 }
 
+// failingExportRepo is an application.ExportRepository whose Create fails after
+// the service has already written the export file, so a test can pin the
+// orphan-file cleanup and the absence of a case.export_ready event.
+type failingExportRepo struct {
+	exportRepo
+	err         error
+	creates     int
+	seen        domain.CaseExport
+	fileExisted bool
+}
+
+// Create records the export and whether its file exists, then returns the
+// injected error. The embedded exportRepo still serves the read methods.
+func (r *failingExportRepo) Create(_ context.Context, export domain.CaseExport) (domain.CaseExport, error) {
+	r.creates++
+	r.seen = export
+	if _, err := os.Stat(filepath.Join(r.exportRepo.f.root, filepath.FromSlash(export.FilePath))); err == nil {
+		r.fileExisted = true
+	}
+	return domain.CaseExport{}, r.err
+}
+
 // exportFindingRepo is an in-memory application.FindingRepository limited to the
 // read/list behavior the export service needs.
 type exportFindingRepo struct {
@@ -487,6 +517,9 @@ func TestExportCreateMarkdown(t *testing.T) {
 	if export.BaselineID != nil {
 		t.Fatalf("baseline = %v, want nil for an unfrozen draft", *export.BaselineID)
 	}
+	if export.Reused {
+		t.Fatal("a freshly created export must not be marked reused")
+	}
 	if export.NodeCount != 3 {
 		t.Fatalf("node count = %d, want 3 (one scenario and two cases)", export.NodeCount)
 	}
@@ -567,8 +600,10 @@ func TestExportCreateMarkdown(t *testing.T) {
 	if event.Type != domain.EventCaseExportReady || event.VersionID != 1 || event.ActorID != 42 {
 		t.Fatalf("event = %+v, want a case.export_ready of version 1 by the actor", event)
 	}
-	if !strings.Contains(event.Summary, "markdown") {
-		t.Fatalf("event summary = %q, want the format", event.Summary)
+	// Spec §6.10: the summary carries format, exportId and size (not content).
+	wantSummary := fmt.Sprintf("case export ready: markdown %d (%d bytes)", export.ID, export.SizeBytes)
+	if event.Summary != wantSummary {
+		t.Fatalf("event summary = %q, want %q", event.Summary, wantSummary)
 	}
 	if len(event.Detail) != 3 {
 		t.Fatalf("event detail = %v, want exactly exportId/format/size", event.Detail)
@@ -628,6 +663,9 @@ func TestExportDraftNeverReuses(t *testing.T) {
 		t.Fatalf("stored files = %v, want two distinct drafts", names)
 	}
 	for _, export := range []domain.CaseExport{first, second} {
+		if export.Reused {
+			t.Fatalf("draft export %d must be newly created, never marked reused", export.ID)
+		}
 		content := f.readStored(t, export.FilePath)
 		sum := sha256.Sum256(content)
 		if export.FileSHA256 != hex.EncodeToString(sum[:]) {
@@ -665,10 +703,24 @@ func TestExportReusesOnlyWhenBaselineBound(t *testing.T) {
 	if !strings.Contains(first.FilePath, "baseline-555") {
 		t.Fatalf("file path = %q, want a baseline-555 directory", first.FilePath)
 	}
+	if first.Reused {
+		t.Fatal("the first baseline export is newly created, not reused")
+	}
 
 	reused := mustExport(t, service, domain.ExportMarkdown)
 	if reused.ID != first.ID || reused.FilePath != first.FilePath {
 		t.Fatalf("reused export = %d/%q, want %d/%q", reused.ID, reused.FilePath, first.ID, first.FilePath)
+	}
+	if !reused.Reused {
+		t.Fatal("a baseline-bound export served by the reuse lookup must be marked reused")
+	}
+	// Reused is transport metadata: it must never be serialized.
+	encoded, err := json.Marshal(reused)
+	if err != nil {
+		t.Fatalf("json.Marshal(export): %v", err)
+	}
+	if strings.Contains(string(encoded), "Reused") {
+		t.Fatalf("Reused must be ignored by json.Marshal: %s", encoded)
 	}
 	if len(f.exports) != 1 {
 		t.Fatalf("export rows = %d, want the single reusable baseline export", len(f.exports))
@@ -687,6 +739,9 @@ func TestExportReusesOnlyWhenBaselineBound(t *testing.T) {
 	}
 	if !strings.Contains(opml.FilePath, "baseline-555") || !strings.HasSuffix(opml.FilePath, ".opml") {
 		t.Fatalf("opml file path = %q, want baseline-555 and .opml", opml.FilePath)
+	}
+	if opml.Reused {
+		t.Fatal("a different format is a newly created export, not reused")
 	}
 	if len(f.exports) != 2 {
 		t.Fatalf("export rows = %d, want markdown and opml", len(f.exports))
@@ -937,15 +992,24 @@ func TestExportDownloadVerifiesSHA256(t *testing.T) {
 		t.Fatalf("reason = %q, want export_not_found", reason)
 	}
 
-	// A metadata row that points outside the root is rejected by the store.
+	// A metadata row whose file path escapes the root is a corrupt row, not a
+	// bad request: it must surface as the 500 export_corrupted reason (never the
+	// store's 422 invalid_storage_path), because the caller never supplied it.
 	f.exports[8888] = domain.CaseExport{
 		ID: 8888, VersionID: 1, Format: domain.ExportMarkdown,
 		FilePath: "../escape.md", FileSHA256: strings.Repeat("a", 64), SizeBytes: 1,
 	}
 	if _, _, err := service.Download(context.Background(), 1, 8888); err == nil {
 		t.Fatal("Download accepted a traversal file path")
-	} else if reason := exportReason(t, err); reason != "invalid_storage_path" {
-		t.Fatalf("reason = %q, want invalid_storage_path", reason)
+	} else {
+		var domainErr *domain.Error
+		if !errors.As(err, &domainErr) {
+			t.Fatalf("want *domain.Error, got %T (%v)", err, err)
+		}
+		if domainErr.Kind != "internal" || domainErr.Reason != "export_corrupted" {
+			t.Fatalf("kind/reason = %q/%q, want internal/export_corrupted (%v)",
+				domainErr.Kind, domainErr.Reason, err)
+		}
 	}
 
 	// A metadata row whose file vanished is corruption too.
@@ -1048,6 +1112,44 @@ func TestExportCreateRejectsUnknownVersion(t *testing.T) {
 		t.Fatal("Create accepted an unknown version")
 	} else if reason := exportReason(t, err); reason != "version_not_found" {
 		t.Fatalf("reason = %q, want version_not_found", reason)
+	}
+}
+
+// TestExportCreateFailureRemovesOrphanFile covers the failure path after the
+// file write: when ExportRepository.Create fails, the service removes the
+// already written file best-effort and publishes no case.export_ready (and
+// records no audit entry).
+func TestExportCreateFailureRemovesOrphanFile(t *testing.T) {
+	f := newExportFixture(t)
+	f.addRequirement(9001, "下单")
+	f.addCase(7001, nil, "提交订单", 9001, 0)
+	repoErr := errors.New("metadata write failed")
+	repo := &failingExportRepo{exportRepo: exportRepo{f}, err: repoErr}
+	service := f.serviceWithExports(repo)
+
+	if _, err := service.Create(context.Background(), 1, 42, domain.ExportMarkdown); !errors.Is(err, repoErr) {
+		t.Fatalf("Create error = %v, want the repository failure", err)
+	}
+	if repo.creates != 1 {
+		t.Fatalf("repository Create calls = %d, want 1", repo.creates)
+	}
+	if !repo.fileExisted {
+		t.Fatal("the export file must be written before ExportRepository.Create runs")
+	}
+	if _, err := os.Stat(filepath.Join(f.root, filepath.FromSlash(repo.seen.FilePath))); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphan export file still exists: %v", err)
+	}
+	if names := f.storedNames(t, "versions/1/draft"); len(names) != 0 {
+		t.Fatalf("export dir entries = %v, want no orphan file or temp file", names)
+	}
+	if len(f.exports) != 0 {
+		t.Fatalf("export rows = %d, want none", len(f.exports))
+	}
+	if len(f.events) != 0 {
+		t.Fatalf("events = %d, want no case.export_ready after a failed metadata write", len(f.events))
+	}
+	if len(f.audits) != 0 {
+		t.Fatalf("audits = %d, want no audit after a failed metadata write", len(f.audits))
 	}
 }
 

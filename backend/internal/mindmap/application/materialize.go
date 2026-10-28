@@ -216,6 +216,8 @@ func (s *RunService) rejectRun(ctx context.Context, run domain.CaseDesignRun, re
 	switch reason {
 	case "baseline_frozen":
 		return domain.NewStateConflict(reason, message)
+	case "graph_too_large":
+		return domain.NewConflict(reason, message)
 	case "invalid_run_kind":
 		return domain.NewInvalid("kind", reason, message)
 	default:
@@ -227,7 +229,20 @@ func (s *RunService) rejectRun(ctx context.Context, run domain.CaseDesignRun, re
 // materialization, so a design/data-plan run that outlived a concurrent approval
 // cannot write into a frozen version (spec §6.4 rule 3). Review materialization
 // stays allowed after freezing because it only writes review rows.
+//
+// The baseline row is checked independently of the version snapshot: after a
+// partially failed approval the baseline may exist while the snapshot still looks
+// editable, and in that stale approved/executing mismatch the version is frozen.
 func (s *RunService) requireMaterializableVersion(ctx context.Context, run domain.CaseDesignRun) error {
+	baseline, err := loadBaseline(ctx, s.deps.Baselines, run.VersionID)
+	if err != nil {
+		return fmt.Errorf("mindmap: read baseline of version %d for materialization: %w", run.VersionID, err)
+	}
+	if baseline != nil {
+		return s.rejectRun(ctx, run, "baseline_frozen", []string{
+			fmt.Sprintf("version %d has a frozen baseline; the mindmap is read-only", run.VersionID),
+		})
+	}
 	if s.deps.Versions == nil {
 		return nil
 	}
@@ -309,6 +324,19 @@ func (s *RunService) materializeDesign(ctx context.Context, run domain.CaseDesig
 			}
 		}
 	}
+	// Enforce the 300-node mindmap cap before any write (spec §7.3). Replace
+	// drops the current graph, so only the proposal counts; append adds to it.
+	proposedNodes := len(proposal.Scenarios) + len(proposal.Cases)
+	totalNodes := len(existing) + proposedNodes
+	if mode == "replace" {
+		totalNodes = proposedNodes
+	}
+	if totalNodes > maxGraphNodes {
+		return s.rejectRun(ctx, run, "graph_too_large", []string{
+			fmt.Sprintf("version %d would have %d nodes; the mindmap is limited to %d nodes",
+				run.VersionID, totalNodes, maxGraphNodes),
+		})
+	}
 	built, err := s.buildDesignGraph(ctx, run, proposal, existing)
 	if err != nil {
 		return err
@@ -331,7 +359,13 @@ func (s *RunService) materializeDesign(ctx context.Context, run domain.CaseDesig
 						fmt.Sprintf("node %d is %s; replace only removes draft nodes", node.ID, node.Status))
 				}
 			}
+			// case_node.parent_id is ON DELETE CASCADE: deleting the roots removes
+			// the whole draft subtree. Deleting a descendant after its ancestor
+			// would find a zero-row delete and fail the transaction.
 			for _, node := range existingNodes {
+				if node.ParentID != nil {
+					continue
+				}
 				if err := tx.Nodes().Delete(ctx, run.VersionID, node.ID, node.Revision); err != nil {
 					return err
 				}
@@ -983,7 +1017,11 @@ func (s *RunService) materializeReview(ctx context.Context, run domain.CaseDesig
 			"blockers": blockers,
 		},
 	})
-	s.publishGatePending(ctx, run)
+	// gate.pending means "the version entered reviewing" (spec §6.11): a review
+	// materialized against a still-designing version must not emit it.
+	if s.versionIsReviewing(ctx, run.VersionID) {
+		s.publishGatePending(ctx, run)
+	}
 	doneRun := run
 	doneRun.Status = domain.RunDone
 	s.publishRunEvent(ctx, doneRun, domain.EventCaseRunFinished, "", stats)
@@ -1022,6 +1060,15 @@ func (s *RunService) materializeDataPlan(ctx context.Context, run domain.CaseDes
 	if err := json.Unmarshal(run.Result, &proposal); err != nil {
 		return s.rejectRun(ctx, run, "invalid_case_proposal", []string{"data-plan payload is not valid JSON: " + err.Error()})
 	}
+	// A data-plan run started with an explicit nodeIds list only plans those
+	// nodes (spec §6.8); an item outside the scope is a payload violation.
+	input := runParseInput(run.Input)
+	scope := make(map[int64]struct{}, len(input.NodeIDs))
+	for _, nodeID := range input.NodeIDs {
+		if nodeID > 0 {
+			scope[nodeID] = struct{}{}
+		}
+	}
 	messages := make([]string, 0, 4)
 	add := func(format string, args ...any) {
 		if len(messages) >= materializeMaxValidationErrors {
@@ -1039,6 +1086,10 @@ func (s *RunService) materializeDataPlan(ctx context.Context, run domain.CaseDes
 		prefix := fmt.Sprintf("items[%d]", index)
 		if item.NodeID.Int64() <= 0 {
 			add("%s.nodeId must be a positive id", prefix)
+		} else if len(scope) > 0 {
+			if _, ok := scope[item.NodeID.Int64()]; !ok {
+				add("%s.nodeId %d is outside the run's nodeIds scope", prefix, item.NodeID.Int64())
+			}
 		}
 		if item.NodeRevision <= 0 {
 			add("%s.nodeRevision must be positive", prefix)
@@ -1176,6 +1227,22 @@ func (s *RunService) enterReviewAfterDesign(ctx context.Context, run domain.Case
 		return false
 	}
 	return true
+}
+
+// versionIsReviewing reports whether the version is currently reviewing. It is
+// the gate.pending condition of review materialization; a read failure is logged
+// and treated as "not reviewing" (the committed materialization is not failed by
+// a missing event).
+func (s *RunService) versionIsReviewing(ctx context.Context, versionID int64) bool {
+	if s.deps.Versions == nil {
+		return false
+	}
+	version, err := s.deps.Versions.GetVersion(ctx, versionID)
+	if err != nil {
+		slog.WarnContext(ctx, "mindmap: read version for gate.pending failed", "version_id", versionID, "error", err)
+		return false
+	}
+	return version.Status == versionStatusReviewing
 }
 
 // publishGatePending emits the mindmap review gate event (spec §6.11).

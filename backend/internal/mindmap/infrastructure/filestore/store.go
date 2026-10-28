@@ -281,7 +281,13 @@ func ensureDir(root, dir string) error {
 				return fmt.Errorf("filestore: export path %q is not a directory", current)
 			}
 		case errors.Is(err, fs.ErrNotExist):
-			if err := os.Mkdir(current, dirPerm); err != nil {
+			// MkdirAll, not Mkdir: two concurrent first writes into the same
+			// new version directory both observe ErrNotExist here, and only
+			// treating the peer's directory as success (MkdirAll ignores an
+			// existing directory) keeps the second write from failing with
+			// fs.ErrExist. Symlink/junction checks still run on the resolved
+			// path below.
+			if err := os.MkdirAll(current, dirPerm); err != nil {
 				return fmt.Errorf("filestore: create export directory: %w", err)
 			}
 		default:

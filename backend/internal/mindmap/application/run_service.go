@@ -50,12 +50,14 @@ const (
 )
 
 // RunDeps are the ports of the asynchronous run coordinator: the run store, the
-// graph transaction runner plus its read repositories for context assembly, the
-// version lifecycle, the requirement reader, the resource/code-intel gateways,
-// the agent runtime, the event sink, the id generator and the clock.
+// graph transaction runner plus its read repositories and the baseline store
+// (the frozen-write guard), the version lifecycle, the requirement reader, the
+// resource/code-intel gateways, the agent runtime, the event sink, the id
+// generator and the clock.
 type RunDeps struct {
 	Runs         RunRepository
 	Graph        GraphRepository
+	Baselines    BaselineRepository
 	Nodes        NodeRepository
 	Steps        StepRepository
 	Assertions   AssertionRepository
@@ -126,6 +128,27 @@ func runHardTimeout(kind string) time.Duration {
 	}
 }
 
+// runStartAllowed reports whether a run of kind may start at the version status.
+// Review runs are read-only, so they stay allowed after the baseline froze the
+// version to executing (spec §6.4 rule 3); design/data_plan write the graph and
+// need an editable version.
+func runStartAllowed(kind, status string) bool {
+	switch kind {
+	case domain.RunKindReview:
+		return status == versionStatusDesigning || status == versionStatusReviewing || status == "executing"
+	default:
+		return status == versionStatusDesigning || status == versionStatusReviewing
+	}
+}
+
+// runAllowedStates is the human-readable status list of runStartAllowed.
+func runAllowedStates(kind string) string {
+	if kind == domain.RunKindReview {
+		return "designing, reviewing or executing"
+	}
+	return "designing or reviewing"
+}
+
 // Start validates the version state, the confirmed requirements and the
 // per-kind single-flight slot, then persists a queued run, creates the agent
 // session, starts the instruction and moves the run to running (spec §6.6). A
@@ -144,11 +167,10 @@ func (s *RunService) Start(ctx context.Context, versionID, actor int64, cmd Star
 	if err != nil {
 		return domain.CaseDesignRun{}, err
 	}
-	switch version.Status {
-	case versionStatusDesigning, versionStatusReviewing:
-	default:
+	if !runStartAllowed(cmd.Kind, version.Status) {
 		return domain.CaseDesignRun{}, domain.NewStateConflict("version_state_conflict",
-			fmt.Sprintf("version %d is %s; mindmap runs need designing or reviewing", versionID, version.Status))
+			fmt.Sprintf("version %d is %s; mindmap runs of kind %s need %s", versionID, version.Status,
+				cmd.Kind, runAllowedStates(cmd.Kind)))
 	}
 	requirements, err := s.confirmedRequirements(ctx, versionID)
 	if err != nil {
@@ -206,14 +228,19 @@ func (s *RunService) Start(ctx context.Context, versionID, actor int64, cmd Star
 		return run, s.abortStart(ctx, run, err)
 	}
 	startedAt := s.now()
-	run, err = s.deps.Runs.UpdateStatus(ctx, run.ID, domain.RunQueued, domain.RunRunning, RunPatch{
+	// Keep the pre-update run: on a CAS failure the adapter returns no row, and
+	// abortStart needs the persisted id/status to release the run and the
+	// single-flight slot.
+	running, updateErr := s.deps.Runs.UpdateStatus(ctx, run.ID, domain.RunQueued, domain.RunRunning, RunPatch{
 		AgentSessionID: &sessionID,
 		AgentRunID:     &agentRunID,
 		StartedAt:      &startedAt,
 	})
-	if err != nil {
-		return run, s.abortStart(ctx, run, err)
+	if updateErr != nil {
+		_ = s.deps.Agents.Abort(ctx, sessionID, actor)
+		return run, s.abortStart(ctx, run, updateErr)
 	}
+	run = running
 	s.publishRunEvent(ctx, run, domain.EventCaseRunStarted, "", nil)
 	return run, nil
 }

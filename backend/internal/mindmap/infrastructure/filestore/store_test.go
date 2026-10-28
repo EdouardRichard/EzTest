@@ -11,6 +11,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"sync"
 	"testing"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/mindmap/domain"
@@ -151,6 +153,43 @@ func TestStoreWriteAtomicNoTempLeak(t *testing.T) {
 	if names := dirNames(t, filepath.Join(root, "versions", "100", "draft")); len(names) != 1 ||
 		names[0] != "markdown-5001.md" {
 		t.Fatalf("export dir entries = %v, want [markdown-5001.md]", names)
+	}
+}
+
+// TestStoreConcurrentFirstWritesSameDirectory pins the ensureDir race: two
+// goroutines writing different files into the same not-yet-existing version
+// directory must both succeed. A Lstat-then-Mkdir sequence loses this race with
+// fs.ErrExist; the store must treat the directory created by the peer as
+// success while still validating the resolved path.
+func TestStoreConcurrentFirstWritesSameDirectory(t *testing.T) {
+	store, root := newExportStore(t)
+	for round := 0; round < 20; round++ {
+		dir := "versions/" + strconv.Itoa(round+1) + "/draft/"
+		rels := []string{dir + "markdown-1.md", dir + "opml-2.opml"}
+		start := make(chan struct{})
+		errs := make(chan error, len(rels))
+		var wait sync.WaitGroup
+		for i, rel := range rels {
+			wait.Add(1)
+			go func(content, rel string) {
+				defer wait.Done()
+				<-start
+				if _, _, _, err := store.Write(rel, []byte(content)); err != nil {
+					errs <- err
+				}
+			}("content "+strconv.Itoa(i), rel)
+		}
+		close(start)
+		wait.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatalf("round %d: concurrent first Write: %v", round, err)
+		}
+		for _, rel := range rels {
+			if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(rel))); err != nil {
+				t.Fatalf("round %d: stored file %q: %v", round, rel, err)
+			}
+		}
 	}
 }
 
