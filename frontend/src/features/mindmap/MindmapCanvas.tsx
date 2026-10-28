@@ -11,7 +11,13 @@ import {
 } from "react"
 
 import { layoutMindmap } from "./mindmap-layout"
-import type { CaseNodeKind, CaseNodeStatus, CaseNodeView, CaseSourceKind, MindmapGraph } from "./types"
+import type {
+  CaseNodeKind,
+  CaseNodeStatus,
+  CaseNodeView,
+  CaseSourceKind,
+  MindmapGraph,
+} from "./types"
 
 /** Zoom range enforced by both the buttons and the wheel handler (spec §9.2). */
 export const MIN_ZOOM = 0.5
@@ -125,7 +131,7 @@ export function MindmapCanvas({
     return firstChild
   }, [layout.nodes])
   const impactedCaseIds = useMemo(
-    () => new Set(graph.impactCases.map((impact) => impact.caseNodeId)),
+    () => new Set((graph.impactCases ?? []).map((impact) => impact.caseNodeId)),
     [graph.impactCases],
   )
 
@@ -146,6 +152,7 @@ export function MindmapCanvas({
   }, [focusedId, selectedId, visibleSet, layout.visibleIds])
 
   // A new version is a new canvas: drop stale zoom/pan.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: the version id is not read inside, but a version switch must reset the viewport.
   useEffect(() => {
     setZoom(1)
     setPan({ x: 0, y: 0 })
@@ -184,12 +191,12 @@ export function MindmapCanvas({
   const centerY = layout.nodes.length === 0 ? viewBox.height / 2 : bounds.y + bounds.height / 2
   const contentTransform = `translate(${pan.x} ${pan.y}) translate(${centerX} ${centerY}) scale(${zoom}) translate(${-centerX} ${-centerY})`
 
-  function focusNode(nodeId: string): void {
+  const focusNode = useCallback((nodeId: string): void => {
     const element = itemRefs.current.get(nodeId)
     if (element === undefined) return
     const focus = (element as SVGGElement & { focus?: () => void }).focus
     if (typeof focus === "function") focus.call(element)
-  }
+  }, [])
 
   // Roving focus: after the active node changes, move DOM focus to it so the
   // next Tab/arrow keystroke lands inside the tree (spec §9.2).
@@ -198,7 +205,7 @@ export function MindmapCanvas({
     if (pendingFocusRef.current !== activeId) return
     pendingFocusRef.current = null
     focusNode(activeId)
-  }, [activeId])
+  }, [activeId, focusNode])
 
   function activate(nodeId: string): void {
     pendingFocusRef.current = nodeId
@@ -365,6 +372,7 @@ export function MindmapCanvas({
           </p>
         ) : (
           <svg
+            // biome-ignore lint/a11y/noNoninteractiveElementToInteractiveRole: SVG has no native tree container; the WAI-ARIA tree pattern is the accessible equivalent.
             role="tree"
             aria-label={canvasLabel}
             data-zoom={zoom}
@@ -411,7 +419,6 @@ export function MindmapCanvas({
                 const footer = [blockerLabel, impactLabel].filter((part) => part !== "").join(" · ")
 
                 return (
-                  // biome-ignore lint/a11y/useSemanticElements: SVG items cannot be native treeitems; the WAI-ARIA tree pattern is the accessible equivalent.
                   <g
                     key={node.id}
                     ref={(element) => {
@@ -469,7 +476,12 @@ export function MindmapCanvas({
                       {clipTitle(data.title, 13)}
                     </text>
 
-                    <text x={node.x + 14} y={node.y + 46} fontSize={10.5} fill="var(--muted-foreground, #5b6779)">
+                    <text
+                      x={node.x + 14}
+                      y={node.y + 46}
+                      fontSize={10.5}
+                      fill="var(--muted-foreground, #5b6779)"
+                    >
                       {`${kindLabel} · ${sourceLabel}`}
                     </text>
                     <text
@@ -487,7 +499,11 @@ export function MindmapCanvas({
                         x={node.x + 14}
                         y={node.y + 70}
                         fontSize={10}
-                        fill={data.openBlockerCount > 0 ? "var(--destructive, #dc2626)" : "var(--muted-foreground, #5b6779)"}
+                        fill={
+                          data.openBlockerCount > 0
+                            ? "var(--destructive, #dc2626)"
+                            : "var(--muted-foreground, #5b6779)"
+                        }
                       >
                         {footer}
                       </text>

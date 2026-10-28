@@ -31,11 +31,7 @@ function caseNode(
   }
 }
 
-function scenario(
-  id: string,
-  title: string,
-  overrides: Partial<CaseNodeView> = {},
-): CaseNodeView {
+function scenario(id: string, title: string, overrides: Partial<CaseNodeView> = {}): CaseNodeView {
   return caseNode({ id, title, kind: "scenario", ...overrides })
 }
 
