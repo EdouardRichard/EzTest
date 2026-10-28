@@ -6,11 +6,17 @@ import "context"
 // attaches it to the context handed to Tool.Execute, so P3 tool adapters read
 // the actor, session and profile from the runtime instead of trusting
 // model-supplied arguments (design spec §8.2 item 3, §8.7).
+//
+// BatchID and CaseRunID are the P6 execution scope (design spec §7.3). They are
+// zero for P1–P5 runs. Invocation carries identity only: never credentials,
+// prompts, arguments or results.
 type Invocation struct {
 	SessionID   int64
 	RunID       int64
 	ActorUserID *int64
 	ProfileKey  string
+	BatchID     int64
+	CaseRunID   int64
 }
 
 // toolInvocationContextKey is the private context key carrying an Invocation.

@@ -66,6 +66,10 @@ type runExecution struct {
 	actor   *int64
 	caller  LLMCaller
 	emitter *activityEmitter
+	// scope is the P6 execution scope of this run; the zero value for P1–P5
+	// runs. It is per-execution state, never service-wide, so scopes cannot
+	// leak between runs.
+	scope domain.RunScope
 
 	startedAt       time.Time
 	history         []domain.Message
@@ -108,7 +112,7 @@ type runFinishOptions struct {
 
 // run is the goroutine body: it executes the model/tool loop and always leaves
 // the run in a terminal state.
-func (s *RunService) run(ctx context.Context, runID int64, session domain.Session, profile domain.AgentProfile, caller LLMCaller, actor *int64) {
+func (s *RunService) run(ctx context.Context, runID int64, session domain.Session, profile domain.AgentProfile, caller LLMCaller, actor *int64, scope domain.RunScope) {
 	execution := &runExecution{
 		service: s,
 		runID:   runID,
@@ -117,6 +121,7 @@ func (s *RunService) run(ctx context.Context, runID int64, session domain.Sessio
 		actor:   actor,
 		caller:  caller,
 		emitter: newActivityEmitter(s.deps.Events, session.ID, profile.Key, session.ActivityChannel, session.ActivityVersionID),
+		scope:   scope,
 	}
 	execution.execute(ctx)
 }
@@ -402,6 +407,8 @@ func (ex *runExecution) executeTools(ctx context.Context, calls []domain.ToolCal
 			SessionID:   ex.session.ID,
 			ActorUserID: ex.actor,
 			ProfileKey:  ex.profile.Key,
+			BatchID:     ex.scope.BatchID,
+			CaseRunID:   ex.scope.CaseRunID,
 			Call:        call,
 			Allowed:     ex.profile.AllowedTools,
 		})

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -27,6 +28,10 @@ const (
 	// maxListMessagesLimit bounds one ListMessages page, matching the API's
 	// pagination ceiling.
 	maxListMessagesLimit = 100
+	// defaultListChannelLimit and maxListChannelLimit are the P6 channel-list
+	// page bounds, matching the API's pagination defaults.
+	defaultListChannelLimit = 20
+	maxListChannelLimit     = 100
 )
 
 // RunControl is the subset of the run service the session lifecycle needs. The
@@ -76,6 +81,32 @@ func NewSessionService(
 // responsible for decoding and bounding them.
 func (s *SessionService) List(ctx context.Context, cursor int64, limit int, profileID *int64) ([]domain.SessionSummary, bool, error) {
 	return s.sessions.List(ctx, cursor, limit, profileID)
+}
+
+// ListByChannel returns one page of sessions stamped with a P6 activity channel
+// (for example "version:9"). beforeSeq is the id of the last session of the
+// previous page; zero starts at the newest row. The repository orders by
+// updated_at/id descending, so pages stay stable while sessions are updated.
+//
+// channel is required: a blank value is a request error, never an unfiltered
+// list. limit is defaulted and capped to the API pagination bounds so direct
+// callers cannot request an unbounded page.
+func (s *SessionService) ListByChannel(ctx context.Context, channel string, beforeSeq int64, limit int) ([]domain.Session, bool, error) {
+	channel = strings.TrimSpace(channel)
+	if channel == "" {
+		return nil, false, fmt.Errorf("agent: channel must not be empty")
+	}
+	if limit <= 0 {
+		limit = defaultListChannelLimit
+	}
+	if limit > maxListChannelLimit {
+		limit = maxListChannelLimit
+	}
+	repository, ok := s.sessions.(domain.ChannelSessionRepository)
+	if !ok {
+		return nil, false, fmt.Errorf("agent: session repository does not support channel listing")
+	}
+	return repository.ListByChannel(ctx, channel, beforeSeq, limit)
 }
 
 // SessionOptions carries the optional P3 activity-routing stamp of a new

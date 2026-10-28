@@ -39,6 +39,12 @@ const (
 	toolErrorCodeNotFound         = "not_found"
 )
 
+// maxToolExecutionTimeout is the hard ceiling on a per-tool timeout. The
+// executor's global timeout comes from EZTEST_AGENT_TOOL_TIMEOUT_MS (already
+// bounded by config); a tool's own ToolWithTimeout value is capped here so a
+// tool cannot hold a run open arbitrarily long (design spec §5.6).
+const maxToolExecutionTimeout = 60 * time.Second
+
 // ToolRegistry holds the tools available to Agent runs. It is read-only after
 // construction, so a single registry can serve concurrent runs.
 type ToolRegistry struct {
@@ -133,7 +139,10 @@ func (r *ToolRegistry) ToolInfos() []domain.ToolInfo {
 // ToolCallInput is one tool invocation requested by the model.
 type ToolCallInput struct {
 	RunID, SessionID int64
-	ActorUserID      *int64
+	// BatchID and CaseRunID are the P6 execution scope of the run. They ride
+	// along in the Invocation context unchanged and stay zero for P1–P5 runs.
+	BatchID, CaseRunID int64
+	ActorUserID        *int64
 	// ProfileKey is the key of the profile that owns the run. The executor
 	// forwards it in the Invocation context together with the run, session and
 	// actor identity.
@@ -216,10 +225,12 @@ func (e *ToolExecutor) invoke(ctx context.Context, tool domain.Tool, args json.R
 		RunID:       in.RunID,
 		ActorUserID: in.ActorUserID,
 		ProfileKey:  in.ProfileKey,
+		BatchID:     in.BatchID,
+		CaseRunID:   in.CaseRunID,
 	})
-	if e.timeout > 0 {
+	if timeout := e.toolTimeout(tool); timeout > 0 {
 		var cancel context.CancelFunc
-		toolCtx, cancel = context.WithTimeout(toolCtx, e.timeout)
+		toolCtx, cancel = context.WithTimeout(toolCtx, timeout)
 		defer cancel()
 	}
 
@@ -236,6 +247,22 @@ func (e *ToolExecutor) invoke(ctx context.Context, tool domain.Tool, args json.R
 		return ToolExecution{Result: result, Status: ToolStatusError}
 	}
 	return ToolExecution{Result: result, Status: ToolStatusOK}
+}
+
+// toolTimeout returns the timeout for one invocation. A tool that implements
+// domain.ToolWithTimeout and reports a positive duration overrides the global
+// timeout, capped at maxToolExecutionTimeout. Every other tool keeps the
+// executor's global timeout.
+func (e *ToolExecutor) toolTimeout(tool domain.Tool) time.Duration {
+	if withTimeout, ok := tool.(domain.ToolWithTimeout); ok {
+		if timeout := withTimeout.Timeout(); timeout > 0 {
+			if timeout > maxToolExecutionTimeout {
+				return maxToolExecutionTimeout
+			}
+			return timeout
+		}
+	}
+	return e.timeout
 }
 
 // toolAllowed reports whether name is in the profile's allowlist.

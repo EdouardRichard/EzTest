@@ -3,6 +3,7 @@ package domain
 import (
 	"context"
 	"encoding/json"
+	"time"
 )
 
 // Tool is one capability the model may invoke. Implementations are registered
@@ -17,6 +18,15 @@ type Tool interface {
 	// with IsError set (the run continues); the error return is reserved for
 	// infrastructure failures.
 	Execute(ctx context.Context, args json.RawMessage) (ToolResult, error)
+}
+
+// ToolWithTimeout is the optional extension a Tool implements when one call
+// needs a different bound than the executor's global timeout (design spec §5.6:
+// per-action timeouts). The executor uses Timeout when it is positive, capped at
+// 60s; a zero or negative value keeps the global timeout. Tools that do not
+// implement this interface are unchanged.
+type ToolWithTimeout interface {
+	Timeout() time.Duration
 }
 
 // ToolResult is what a tool reports back to the model. IsError marks a tool
