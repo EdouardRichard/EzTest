@@ -1,11 +1,12 @@
 openapi: 3.0.3
 info:
   title: EzTest API
-  version: 0.5.0
+  version: 0.6.0
   description: |
     Hand-maintained OpenAPI document for the EzTest API: the P0 foundation, the
     P1 Agent runtime, the P2 resource context, the P3 version / requirements /
-    clarification context and the P4 code-intelligence context.
+    clarification context, the P4 code-intelligence context and the P5
+    case-mindmap / design-review context.
 
     Conventions:
     - Successful responses use the `{"data": ...}` envelope. List endpoints add
@@ -62,6 +63,22 @@ info:
       explicitly requested, and errors never echo repository paths or code
       content. P4 adds the `code.changed` and `code.impact_computed` event types
       on the existing `version:{id}` channel; it adds no SSE endpoint.
+    - P5 mindmap endpoints live under `/api/versions/{versionId}/mindmap` and
+      use camelCase payloads (the P5 DTOs). Every mindmap-owned ID (node, step,
+      assertion, source, anchor, run, review, finding, export) and every
+      `versionId`/`requirementId` they reference is a 64-bit snowflake
+      serialized as a decimal string; P2/P1 IDs (`systemId`, `environmentId`,
+      `sessionId`, `agentSessionId`, `agentRunId`, `createdBy`, `reviewerId`)
+      keep their existing number types. Reads and mindmap writes are available
+      to every authenticated user; only `explore` runs (admin) and code-anchor
+      deletion (admin or creator) return 403. Node writes use the node
+      `revision` (and `nodeRevision` for step/assertion writes) as the
+      optimistic-concurrency token. List endpoints use the cursor page
+      envelope; `POST /runs`, `/review`, `/export` and `/submit-review` accept
+      an `Idempotency-Key`. P5 adds the eight `case.*` event types on the
+      existing `version:{id}` channel and never returns mindmap, LLM or export
+      bodies from the JSON endpoints; only the authenticated export download
+      streams bytes.
 
     This document is served publicly at `GET /api/openapi.yaml`; it is the same
     file under `docs/openapi/api.yaml` in the repository.
@@ -86,6 +103,12 @@ tags:
       P4 code intelligence: read-only Git tree/file/diff/commit reads and T0
       facts, administrator-triggered repository indexing, and version-scoped
       change previews, impact analyses, candidate selection and anchors.
+  - name: mindmap
+    description: |
+      P5 case mindmap: version-scoped graph editing (scenarios, cases, steps,
+      assertions, requirement sources and case code anchors), design/review/
+      data-plan/explore Agent runs, review findings, baseline freeze and
+      Markdown/Mermaid/OPML export.
   - name: health
 security: []
 paths:
@@ -4786,11 +4809,14 @@ paths:
       tags: [code]
       summary: Create a code anchor
       description: |
-        Every authenticated user. P4 accepts `requirement`, `app_model` and
-        `version` subjects; `case`/`issue` are 422 `unsupported_subject_kind`.
-        The requirement must belong to the version and an app-model subject
-        requires the version's system binding. The file must exist at the fixed
-        branch tip. A duplicate subject/file/line-range anchor is 409
+        Every authenticated user. Accepts `requirement`, `app_model`, `version`
+        and (P5, D37) `case` subjects; only `issue` is 422
+        `unsupported_subject_kind`. The requirement must belong to the version
+        and an app-model subject requires the version's system binding; a
+        `case` subject is accepted here for completeness, while case anchors are
+        normally created through the mindmap endpoints, which validate that the
+        case belongs to the version. The file must exist at the fixed branch
+        tip. A duplicate subject/file/line-range anchor is 409
         `anchor_duplicate`. Returns 201 with the created anchor.
       operationId: createVersionCodeAnchor
       security:
@@ -4858,6 +4884,1111 @@ paths:
           $ref: '#/components/responses/CodeInvalid'
         '500':
           $ref: '#/components/responses/Internal'
+  /api/versions/{versionId}/mindmap:
+    get:
+      tags: [mindmap]
+      summary: Read the case-mindmap graph of a version
+      description: |
+        Every authenticated user. Returns the whole graph snapshot: scenario and
+        case nodes (each with steps, assertions, sources and anchors), the
+        requirement coverage projection, the frozen baseline (null before
+        approval), the latest run per kind and the read-only P4 impact hints.
+        `include` is a comma-separated subset of `anchors,findings,impact`
+        (default: all sections). Omitting a section never removes its key:
+        `anchors` and `impactCases` are always arrays (empty when omitted),
+        while `findings` is present only when `include=findings`. `editable` is
+        server-owned (`versionStatus` is `designing`/`reviewing` and no baseline
+        is frozen) and must never be inferred by the client. The P5 hard cap is
+        300 nodes (a bigger graph is 409 `graph_too_large`); the
+        `X-Graph-Truncated` header is `false` only when every node was
+        returned.
+      operationId: getVersionMindmap
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+        - $ref: '#/components/parameters/MindmapInclude'
+      responses:
+        '200':
+          description: The graph snapshot.
+          headers:
+            X-Graph-Truncated:
+              description: '`false` only when every node was returned; the P5 hard cap is 300 nodes.'
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MindmapEnvelope'
+        '400':
+          $ref: '#/components/responses/MindmapBadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '409':
+          $ref: '#/components/responses/MindmapConflict'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
+  /api/versions/{versionId}/mindmap/nodes:
+    post:
+      tags: [mindmap]
+      summary: Create a scenario or case node
+      description: |
+        Every authenticated user. Adds one node to the graph and returns 201
+        with it. A `scenario` may nest at most two levels below the version root;
+        a `case` is a leaf and can never have children. A case must end with at
+        least one step, one assertion and one requirement source before
+        `submit-review`, but creation does not require them yet. `parentId`
+        omitted or null creates a root node. `requirementIds` must all belong to
+        this version and be `clarified` (409 `unconfirmed_requirements`). Manual
+        nodes default to `source=user_input`. The server appends the node to the
+        end of its parent's child order. Writes are allowed only while the
+        version is `designing`/`reviewing` and no baseline is frozen (409
+        `version_state_conflict` / 409 `baseline_frozen`).
+      operationId: createMindmapNode
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateNodeRequest'
+            example:
+              kind: case
+              parentId: '1844674407370955201'
+              title: Place an order
+              priority: P1
+              requirementIds: ['1844674407370955165']
+      responses:
+        '201':
+          description: The created node.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseNodeEnvelope'
+        '400':
+          $ref: '#/components/responses/MindmapBadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '409':
+          $ref: '#/components/responses/MindmapConflict'
+        '422':
+          $ref: '#/components/responses/MindmapUnprocessable'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
+  /api/versions/{versionId}/mindmap/nodes/{nodeId}:
+    patch:
+      tags: [mindmap]
+      summary: Update one node (optimistic concurrency)
+      description: |
+        Every authenticated user. Patches the node content; omitted fields keep
+        their stored value and `testData: null` clears the test-data document.
+        `revision` is mandatory and must match the stored node revision
+        (409 `case_revision_conflict` with the current revision when stale). A
+        successful update increments `revision` by one. `requirementIds`, when
+        present, replaces the requirement-source set and must not leave the case
+        with zero requirement sources (409 `invalid_case_tree`). Frozen graphs
+        reject every update with 409 `baseline_frozen`.
+      operationId: updateMindmapNode
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+        - $ref: '#/components/parameters/MindmapNodeId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateNodeRequest'
+            example:
+              title: Place an order as a guest
+              priority: P0
+              revision: 3
+      responses:
+        '200':
+          description: The updated node.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseNodeEnvelope'
+        '400':
+          $ref: '#/components/responses/MindmapBadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '409':
+          $ref: '#/components/responses/MindmapConflict'
+        '422':
+          $ref: '#/components/responses/MindmapUnprocessable'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
+    delete:
+      tags: [mindmap]
+      summary: Delete one node and its subtree
+      description: |
+        Every authenticated user. Deletes the node, its whole scenario subtree,
+        its steps, assertions, sources and (best-effort) case anchors. `revision`
+        is mandatory and must match the stored node revision (409
+        `case_revision_conflict`). Frozen graphs reject the delete with 409
+        `baseline_frozen`. Returns 204 with no body.
+      operationId: deleteMindmapNode
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+        - $ref: '#/components/parameters/MindmapNodeId'
+        - $ref: '#/components/parameters/MindmapRevision'
+      responses:
+        '204':
+          description: The node and its subtree were deleted.
+        '400':
+          $ref: '#/components/responses/MindmapBadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '409':
+          $ref: '#/components/responses/MindmapConflict'
+        '422':
+          $ref: '#/components/responses/MindmapUnprocessable'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
+  /api/versions/{versionId}/mindmap/order:
+    put:
+      tags: [mindmap]
+      summary: Reorder all children of one parent
+      description: |
+        Every authenticated user. Replaces the child order below `parentId`
+        (omitted or null: version root) in one transaction. `nodeIds` must list
+        every child of that parent exactly once; a missing, duplicated or
+        foreign child id is 409 `invalid_case_tree` with no write. This endpoint
+        has no revision token: the last complete write wins (spec §6.5). Frozen
+        graphs reject the reorder with 409 `baseline_frozen`. Returns 204.
+      operationId: reorderMindmapNodes
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReorderRequest'
+            example:
+              parentId: '1844674407370955201'
+              nodeIds: ['1844674407370955202', '1844674407370955203']
+      responses:
+        '204':
+          description: The child order was replaced.
+        '400':
+          $ref: '#/components/responses/MindmapBadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '409':
+          $ref: '#/components/responses/MindmapConflict'
+        '422':
+          $ref: '#/components/responses/MindmapUnprocessable'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
+  /api/versions/{versionId}/mindmap/nodes/{nodeId}/steps:
+    post:
+      tags: [mindmap]
+      summary: Add one step to a case
+      description: |
+        Every authenticated user. Appends a step to a `case` node (scenarios
+        cannot own steps) and returns 201 with it. `afterSeq` inserts after that
+        sequence; omitted appends at the end. The server keeps `seq` contiguous
+        from 1 and refuses a 31st step with 409 `invalid_case_tree`. The step is
+        authored as `source=user_input`; a case needs at least one step before
+        `submit-review`.
+      operationId: createMindmapStep
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+        - $ref: '#/components/parameters/MindmapNodeId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateStepRequest'
+            example:
+              action: Open the product page
+              expected: The price and stock are shown
+              afterSeq: 1
+      responses:
+        '201':
+          description: The created step.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseStepEnvelope'
+        '400':
+          $ref: '#/components/responses/MindmapBadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '409':
+          $ref: '#/components/responses/MindmapConflict'
+        '422':
+          $ref: '#/components/responses/MindmapUnprocessable'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
+  /api/versions/{versionId}/mindmap/steps/{stepId}:
+    patch:
+      tags: [mindmap]
+      summary: Update one step (guarded by the node revision)
+      description: |
+        Every authenticated user. Patches the step; omitted fields keep their
+        stored value. `nodeRevision` is mandatory and must match the owning case
+        node revision (409 `case_revision_conflict`); a successful change
+        increments the node revision by one. The step must belong to a case of
+        this version (404 `step_not_found` otherwise).
+      operationId: updateMindmapStep
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+        - $ref: '#/components/parameters/MindmapStepId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateStepRequest'
+            example:
+              expected: The confirmation dialog appears
+              nodeRevision: 4
+      responses:
+        '200':
+          description: The updated step.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseStepEnvelope'
+        '400':
+          $ref: '#/components/responses/MindmapBadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '409':
+          $ref: '#/components/responses/MindmapConflict'
+        '422':
+          $ref: '#/components/responses/MindmapUnprocessable'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
+    delete:
+      tags: [mindmap]
+      summary: Delete one step and its assertions
+      description: |
+        Every authenticated user. Deletes the step, its assertions and
+        renumbers the remaining steps contiguously. `nodeRevision` is mandatory
+        and must match the owning case node revision (409
+        `case_revision_conflict`). Returns 204.
+      operationId: deleteMindmapStep
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+        - $ref: '#/components/parameters/MindmapStepId'
+        - $ref: '#/components/parameters/MindmapNodeRevision'
+      responses:
+        '204':
+          description: The step and its assertions were deleted.
+        '400':
+          $ref: '#/components/responses/MindmapBadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '409':
+          $ref: '#/components/responses/MindmapConflict'
+        '422':
+          $ref: '#/components/responses/MindmapUnprocessable'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
+  /api/versions/{versionId}/mindmap/nodes/{nodeId}/steps/order:
+    put:
+      tags: [mindmap]
+      summary: Reorder all steps of one case
+      description: |
+        Every authenticated user. Replaces the step order of the case in one
+        transaction. `stepIds` must list every step of the case exactly once
+        (409 `invalid_case_tree` otherwise) and the server renumbers `seq` from
+        1. The owning node revision is incremented. Returns 204.
+      operationId: reorderMindmapSteps
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+        - $ref: '#/components/parameters/MindmapNodeId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReorderStepsRequest'
+            example:
+              stepIds: ['1844674407370955211', '1844674407370955212']
+      responses:
+        '204':
+          description: The step order was replaced.
+        '400':
+          $ref: '#/components/responses/MindmapBadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '409':
+          $ref: '#/components/responses/MindmapConflict'
+        '422':
+          $ref: '#/components/responses/MindmapUnprocessable'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
+  /api/versions/{versionId}/mindmap/nodes/{nodeId}/assertions:
+    post:
+      tags: [mindmap]
+      summary: Add one assertion to a case
+      description: |
+        Every authenticated user. Adds an assertion to a `case` node and returns
+        201 with it. `stepId` omitted or null attaches the assertion to the
+        whole case; otherwise the step must belong to the same case (409
+        `invalid_case_tree`). A case needs at least one assertion before
+        `submit-review`. The assertion is authored as `source=user_input`.
+      operationId: createMindmapAssertion
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+        - $ref: '#/components/parameters/MindmapNodeId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAssertionRequest'
+            example:
+              stepId: '1844674407370955211'
+              kind: ui
+              target: /order/confirm
+              expression: The order number is not empty
+              expected: An order number is generated
+      responses:
+        '201':
+          description: The created assertion.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseAssertionEnvelope'
+        '400':
+          $ref: '#/components/responses/MindmapBadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '409':
+          $ref: '#/components/responses/MindmapConflict'
+        '422':
+          $ref: '#/components/responses/MindmapUnprocessable'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
+  /api/versions/{versionId}/mindmap/assertions/{assertionId}:
+    patch:
+      tags: [mindmap]
+      summary: Update one assertion (guarded by the node revision)
+      description: |
+        Every authenticated user. Patches the assertion; omitted fields keep
+        their stored value. `nodeRevision` is mandatory and must match the owning
+        case node revision (409 `case_revision_conflict`); a successful change
+        increments the node revision by one. The assertion must belong to a case
+        of this version (404 `assertion_not_found` otherwise).
+      operationId: updateMindmapAssertion
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+        - $ref: '#/components/parameters/MindmapAssertionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAssertionRequest'
+            example:
+              expression: The order number matches the expected pattern
+              nodeRevision: 5
+      responses:
+        '200':
+          description: The updated assertion.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseAssertionEnvelope'
+        '400':
+          $ref: '#/components/responses/MindmapBadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '409':
+          $ref: '#/components/responses/MindmapConflict'
+        '422':
+          $ref: '#/components/responses/MindmapUnprocessable'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
+    delete:
+      tags: [mindmap]
+      summary: Delete one assertion
+      description: |
+        Every authenticated user. Deletes the assertion. `nodeRevision` is
+        mandatory and must match the owning case node revision (409
+        `case_revision_conflict`). The last remaining assertion of a case cannot
+        be deleted (409 `invalid_case_tree`). Returns 204.
+      operationId: deleteMindmapAssertion
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+        - $ref: '#/components/parameters/MindmapAssertionId'
+        - $ref: '#/components/parameters/MindmapNodeRevision'
+      responses:
+        '204':
+          description: The assertion was deleted.
+        '400':
+          $ref: '#/components/responses/MindmapBadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '409':
+          $ref: '#/components/responses/MindmapConflict'
+        '422':
+          $ref: '#/components/responses/MindmapUnprocessable'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
+  /api/versions/{versionId}/mindmap/nodes/{nodeId}/sources:
+    post:
+      tags: [mindmap]
+      summary: Add one source to a case
+      description: |
+        Every authenticated user. Adds a `requirement`, `app_model`, `ai_run` or
+        `manual` source to a `case` node (scenarios never carry sources) and
+        returns 201. A `requirement` source must reference a requirement of this
+        version with status `clarified` (404 `requirement_not_found` / 409
+        `requirement_not_clarified`); `refId` is required except for `manual`
+        sources. A duplicate `(refKind, refId, refKey)` is 409
+        `duplicate_case_source`.
+      operationId: createMindmapSource
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+        - $ref: '#/components/parameters/MindmapNodeId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddSourceRequest'
+            example:
+              refKind: requirement
+              refId: '1844674407370955165'
+      responses:
+        '201':
+          description: The created source.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseSourceEnvelope'
+        '400':
+          $ref: '#/components/responses/MindmapBadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '409':
+          $ref: '#/components/responses/MindmapConflict'
+        '422':
+          $ref: '#/components/responses/MindmapUnprocessable'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
+  /api/versions/{versionId}/mindmap/sources/{sourceId}:
+    delete:
+      tags: [mindmap]
+      summary: Delete one case source
+      description: |
+        Every authenticated user. Deletes the source. Removing the last
+        requirement source of a case would leave it uncovered and is 409
+        `invalid_case_tree` (spec §6.2). Returns 204.
+      operationId: deleteMindmapSource
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+        - $ref: '#/components/parameters/MindmapSourceId'
+      responses:
+        '204':
+          description: The source was deleted.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '409':
+          $ref: '#/components/responses/MindmapConflict'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
+  /api/versions/{versionId}/mindmap/nodes/{nodeId}/anchors:
+    post:
+      tags: [mindmap]
+      summary: Attach a code anchor to a case
+      description: |
+        Every authenticated user. Creates a codeintel anchor with
+        `subject_kind=case` through the mindmap context (the case ownership is
+        validated here; D37) and returns 201. The file must exist at the
+        version's fixed code baseline commit; an unavailable code repository or
+        baseline is 422 `code_repo_unavailable`. A duplicate
+        subject/file/line-range anchor is a 409 conflict.
+      operationId: createMindmapAnchor
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+        - $ref: '#/components/parameters/MindmapNodeId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddAnchorRequest'
+            example:
+              filePath: src/order/submit.ts
+              startLine: 120
+              endLine: 140
+              confidence: high
+      responses:
+        '201':
+          description: The created anchor.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MindmapAnchorEnvelope'
+        '400':
+          $ref: '#/components/responses/MindmapBadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '409':
+          $ref: '#/components/responses/MindmapConflict'
+        '422':
+          $ref: '#/components/responses/MindmapUnprocessable'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
+  /api/versions/{versionId}/mindmap/anchors/{anchorId}:
+    delete:
+      tags: [mindmap]
+      summary: Delete a case code anchor
+      description: |
+        Deletes the anchor when the caller is an administrator or the anchor
+        creator (403 `forbidden` otherwise). The anchor must be a `case` anchor
+        of this version (404 `anchor_not_found`). Frozen graphs reject the
+        delete with 409 `baseline_frozen`. Returns 204.
+      operationId: deleteMindmapAnchor
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+        - $ref: '#/components/parameters/MindmapAnchorId'
+      responses:
+        '204':
+          description: The anchor was deleted.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/MindmapForbidden'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '409':
+          $ref: '#/components/responses/MindmapConflict'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
+  /api/versions/{versionId}/mindmap/runs:
+    post:
+      tags: [mindmap]
+      summary: Start one mindmap Agent run
+      description: |
+        Every authenticated user, except `kind=explore`, which is
+        administrator-only (403 `forbidden`). Creates a `case_design_run` and
+        returns 202 with its decimal-string id; the run itself is asynchronous
+        (poll `GET /runs/{runId}` and subscribe to the `version:{id}` SSE
+        channel). Only one queued/running run per `(version, kind)` is allowed:
+        a concurrent start is 409 `run_in_progress`. Runs are allowed only while
+        the version is `designing`/`reviewing` (409 `version_state_conflict`);
+        `explore` additionally needs the version's system and environment
+        bindings (409 `exploration_requires_environment`). `design` accepts
+        `mode=append` (default) or `mode=replace`, and `replace` must carry
+        `confirmReplace=true` (422 otherwise). `data_plan` takes the target
+        `nodeIds` (at most 60). `explore` accepts `systemId`/`environmentId`,
+        an optional `sessionId` and at most 10 `startPaths`. If the Agent
+        runtime cannot start, the run is failed with reason `ai_unavailable`
+        and the call is 409 `ai_unavailable`; a missing LLM configuration still
+        creates the run (response 202) and fails it asynchronously per spec
+        §8.5. Failure reasons are carried in the run's `errors`/`reason`, never
+        as LLM or mindmap bodies.
+      operationId: startMindmapRun
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartRunRequest'
+            example:
+              kind: design
+              mode: append
+      responses:
+        '202':
+          description: The run was accepted and queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StartRunResultEnvelope'
+              example:
+                data:
+                  runId: '1844674407370955301'
+        '400':
+          $ref: '#/components/responses/MindmapBadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/MindmapForbidden'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '409':
+          $ref: '#/components/responses/MindmapConflict'
+        '422':
+          $ref: '#/components/responses/MindmapUnprocessable'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
+    get:
+      tags: [mindmap]
+      summary: List the mindmap runs of a version
+      description: |
+        Every authenticated user. Returns one cursor page of run summaries
+        (newest first), optionally filtered by `kind` and `status`. Run details
+        never include LLM input/output or mindmap bodies.
+      operationId: listMindmapRuns
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+        - $ref: '#/components/parameters/MindmapRunKindFilter'
+        - $ref: '#/components/parameters/MindmapRunStatusFilter'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of runs.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MindmapListEnvelope'
+        '400':
+          $ref: '#/components/responses/MindmapBadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
+  /api/versions/{versionId}/mindmap/runs/{runId}:
+    get:
+      tags: [mindmap]
+      summary: Read one mindmap run
+      description: |
+        Every authenticated user. Returns `status`, `reason`, `stats`, `errors`
+        and the P1 session/run ids; a run of another version is 404
+        `run_not_found`. LLM input/output and proposal bodies are never
+        returned.
+      operationId: getMindmapRun
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+        - $ref: '#/components/parameters/MindmapRunId'
+      responses:
+        '200':
+          description: The run detail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseRunEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
+  /api/versions/{versionId}/mindmap/submit-review:
+    post:
+      tags: [mindmap]
+      summary: Submit the current graph for review
+      description: |
+        Every authenticated user. Moves the version `designing → reviewing`
+        (idempotent: a version already `reviewing` is returned unchanged with no
+        duplicate event) and returns 200 with the updated version. The graph
+        must contain at least one case (`no_cases`) and satisfy every tree rule
+        (`invalid_case_tree`): a case has at least one step, one assertion and
+        one clarified requirement source, step sequences are contiguous and a
+        case is a leaf. A version outside `designing` is 409
+        `version_state_conflict`. The request body is ignored (`{}` is
+        accepted).
+      operationId: submitMindmapReview
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The version in status `reviewing`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubmitReviewResultEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '409':
+          $ref: '#/components/responses/MindmapConflict'
+        '422':
+          $ref: '#/components/responses/MindmapUnprocessable'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
+  /api/versions/{versionId}/mindmap/review:
+    post:
+      tags: [mindmap]
+      summary: Approve or reject the reviewed graph
+      description: |
+        Every authenticated user. `decision=approve` freezes the graph: the
+        server writes the baseline (`case_baseline`), moves every node
+        `draft → reviewed` and the version `reviewing → executing`; any open
+        `severity=blocker` finding requires `acknowledgeFindings=true` (409
+        `blocker_findings_open` with the finding ids, and the findings keep
+        their status). A second approval is 409 `baseline_frozen` (the baseline
+        is reviewed once, D5). `decision=reject` requires a non-empty `comment`,
+        writes a rejected review, creates no baseline and returns the version to
+        `designing`. Returns 200 with `{version, baseline?, review}`; `baseline`
+        is present on approval and null otherwise.
+      operationId: decideMindmapReview
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReviewRequest'
+            example:
+              decision: approve
+              acknowledgeFindings: true
+      responses:
+        '200':
+          description: The decided review.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReviewResultEnvelope'
+        '400':
+          $ref: '#/components/responses/MindmapBadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '409':
+          $ref: '#/components/responses/MindmapConflict'
+        '422':
+          $ref: '#/components/responses/MindmapUnprocessable'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
+  /api/versions/{versionId}/mindmap/reviews:
+    get:
+      tags: [mindmap]
+      summary: List the review history of a version
+      description: |
+        Every authenticated user. Returns one cursor page of review rounds,
+        newest first.
+      operationId: listMindmapReviews
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of reviews.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MindmapListEnvelope'
+        '400':
+          $ref: '#/components/responses/MindmapBadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
+  /api/versions/{versionId}/mindmap/findings:
+    get:
+      tags: [mindmap]
+      summary: List the review findings of a version
+      description: |
+        Every authenticated user. Returns `{"data": [CaseReviewFindingView]}` —
+        one flat, unpaginated array ordered by severity and id, optionally
+        filtered by `status`, `severity` and `nodeId`. This endpoint is the
+        authoritative finding list; `GET /mindmap` only embeds findings when
+        `include=findings`.
+      operationId: listMindmapFindings
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+        - $ref: '#/components/parameters/MindmapFindingStatusFilter'
+        - $ref: '#/components/parameters/MindmapFindingSeverityFilter'
+        - $ref: '#/components/parameters/MindmapFindingNodeFilter'
+      responses:
+        '200':
+          description: The findings of the version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MindmapFindingListEnvelope'
+        '400':
+          $ref: '#/components/responses/MindmapBadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
+  /api/versions/{versionId}/mindmap/findings/{findingId}:
+    patch:
+      tags: [mindmap]
+      summary: Mark one review finding fixed or dismissed
+      description: |
+        Every authenticated user. Human disposition of one finding:
+        `status=fixed` or `status=dismissed` (reopening is not supported).
+        Returns 200 with the updated finding; an unknown or other-version
+        finding is 404 `finding_not_found`.
+      operationId: updateMindmapFinding
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+        - $ref: '#/components/parameters/MindmapFindingId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateFindingRequest'
+            example:
+              status: dismissed
+      responses:
+        '200':
+          description: The updated finding.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseReviewFindingEnvelope'
+        '400':
+          $ref: '#/components/responses/MindmapBadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '422':
+          $ref: '#/components/responses/MindmapUnprocessable'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
+  /api/versions/{versionId}/mindmap/export:
+    post:
+      tags: [mindmap]
+      summary: Generate or reuse a mindmap export file
+      description: |
+        Every authenticated user. Generates one server-side export file
+        (`markdown`, `mermaid` or `opml`) from the current graph or frozen
+        baseline, stores it under the export root and returns 201 with its
+        metadata (id, format, nodeCount, sizeBytes, baselineId, createdAt,
+        sha256). When `(version, format, baseline)` already has a file the
+        existing metadata is returned with 200 instead of writing a new file.
+        Export is allowed while the version is `designing`, `reviewing` or
+        `executing`; a frozen version binds the baseline, an unfrozen one
+        stores `baselineId=null` and does not participate in reuse. A
+        concurrent unique collision is 409 `export_conflict`; PNG is rendered
+        client-side and is not a server export format (422
+        `export_format_unsupported`).
+      operationId: createMindmapExport
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExportRequest'
+            example:
+              format: markdown
+      responses:
+        '201':
+          description: A new export file was generated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseExportEnvelope'
+        '200':
+          description: An existing export for the same baseline and format was reused.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseExportEnvelope'
+        '400':
+          $ref: '#/components/responses/MindmapBadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '409':
+          $ref: '#/components/responses/MindmapConflict'
+        '422':
+          $ref: '#/components/responses/MindmapUnprocessable'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
+  /api/versions/{versionId}/mindmap/exports:
+    get:
+      tags: [mindmap]
+      summary: List the export history of a version
+      description: |
+        Every authenticated user. Returns one cursor page of export metadata,
+        newest first, optionally filtered by `format`. Internal file paths are
+        never returned.
+      operationId: listMindmapExports
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+        - $ref: '#/components/parameters/MindmapExportFormatFilter'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of exports.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MindmapListEnvelope'
+        '400':
+          $ref: '#/components/responses/MindmapBadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
+  /api/versions/{versionId}/mindmap/exports/{exportId}/download:
+    get:
+      tags: [mindmap]
+      summary: Download one generated export file
+      description: |
+        Every authenticated user. Streams the stored file as an
+        `application/octet-stream` attachment with a RFC 5987
+        `Content-Disposition` filename and `X-Content-Type-Options: nosniff`.
+        The server re-reads the file by metadata only and verifies its sha256: a
+        mismatch is 500 `export_corrupted` and internal paths are never exposed.
+        An unknown or other-version export is 404 `export_not_found`.
+      operationId: downloadMindmapExport
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+        - $ref: '#/components/parameters/MindmapExportId'
+      responses:
+        '200':
+          description: The raw export file.
+          headers:
+            Content-Disposition:
+              description: Attachment with a UTF-8 `filename*` parameter.
+              schema:
+                type: string
+            X-Content-Type-Options:
+              description: Always `nosniff`.
+              schema:
+                type: string
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
   /healthz:
     get:
       tags: [health]
@@ -5296,6 +6427,153 @@ components:
       schema:
         type: string
         pattern: '^[a-f0-9]{40}$'
+    MindmapVersionId:
+      name: versionId
+      in: path
+      required: true
+      description: P3 version ID serialized as a decimal string (never a JavaScript number).
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    MindmapNodeId:
+      name: nodeId
+      in: path
+      required: true
+      description: Mindmap node ID (snowflake decimal string) belonging to the version.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    MindmapStepId:
+      name: stepId
+      in: path
+      required: true
+      description: Case-step ID (snowflake decimal string) belonging to a case of the version.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    MindmapAssertionId:
+      name: assertionId
+      in: path
+      required: true
+      description: Case-assertion ID (snowflake decimal string) belonging to a case of the version.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    MindmapSourceId:
+      name: sourceId
+      in: path
+      required: true
+      description: Case-source ID (snowflake decimal string) belonging to a case of the version.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    MindmapAnchorId:
+      name: anchorId
+      in: path
+      required: true
+      description: Codeintel anchor ID (decimal string) of a `case` anchor of the version.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    MindmapRunId:
+      name: runId
+      in: path
+      required: true
+      description: Mindmap run ID (snowflake decimal string) belonging to the version.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    MindmapFindingId:
+      name: findingId
+      in: path
+      required: true
+      description: Review-finding ID (snowflake decimal string) belonging to the version.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    MindmapExportId:
+      name: exportId
+      in: path
+      required: true
+      description: Export ID (snowflake decimal string) belonging to the version.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    MindmapInclude:
+      name: include
+      in: query
+      required: false
+      description: |
+        Comma-separated optional graph sections (`anchors,findings,impact`).
+        Omit for every section. Omitting `anchors`/`impact` still returns those
+        keys as empty arrays; `findings` is only present when it is included.
+      schema:
+        type: string
+        example: anchors,findings,impact
+    MindmapRevision:
+      name: revision
+      in: query
+      required: true
+      description: |
+        The node revision the client last read (optimistic-concurrency token).
+        A stale value is 409 `case_revision_conflict` with the current revision.
+      schema:
+        type: integer
+        minimum: 1
+    MindmapNodeRevision:
+      name: nodeRevision
+      in: query
+      required: true
+      description: |
+        The revision of the case node that owns the step/assertion being
+        changed (optimistic-concurrency token). A stale value is 409
+        `case_revision_conflict`.
+      schema:
+        type: integer
+        minimum: 1
+    MindmapRunKindFilter:
+      name: kind
+      in: query
+      required: false
+      description: Optional exact run kind filter.
+      schema:
+        $ref: '#/components/schemas/RunKind'
+    MindmapRunStatusFilter:
+      name: status
+      in: query
+      required: false
+      description: Optional exact run status filter.
+      schema:
+        $ref: '#/components/schemas/RunStatus'
+    MindmapFindingStatusFilter:
+      name: status
+      in: query
+      required: false
+      description: Optional exact finding status filter.
+      schema:
+        $ref: '#/components/schemas/FindingStatus'
+    MindmapFindingSeverityFilter:
+      name: severity
+      in: query
+      required: false
+      description: Optional exact finding severity filter.
+      schema:
+        $ref: '#/components/schemas/FindingSeverity'
+    MindmapFindingNodeFilter:
+      name: nodeId
+      in: query
+      required: false
+      description: Optional exact node ID filter (snowflake decimal string).
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+    MindmapExportFormatFilter:
+      name: format
+      in: query
+      required: false
+      description: Optional exact export format filter.
+      schema:
+        $ref: '#/components/schemas/ExportFormat'
   responses:
     InvalidArgument:
       description: Invalid input (`invalid_argument` or `idempotency_conflict` for a reused key with a different body).
@@ -5527,6 +6805,83 @@ components:
         (`unavailable`, HTTP 503). `details.reason=git_unavailable` and
         `retryable` is true; no Git output, internal path or code content is
         echoed.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    MindmapBadRequest:
+      description: |
+        The JSON body or query is not valid (`invalid_argument`, HTTP 400).
+        `details.reason` is one of `invalid_json`, `body_too_large`,
+        `invalid_limit`, `invalid_cursor` or `invalid_id`; `details.field`
+        names the rejected field when applicable.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    MindmapForbidden:
+      description: |
+        Authenticated but not allowed (`forbidden`, HTTP 403 with
+        `details.reason=forbidden`). Starting an `explore` run requires the
+        administrator role, and deleting a case code anchor requires an
+        administrator or the anchor creator. Every other mindmap read/write is
+        available to every authenticated user.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    MindmapNotFound:
+      description: |
+        A mindmap object is absent (`not_found`, HTTP 404). `details.reason` is
+        one of `node_not_found`, `step_not_found`, `assertion_not_found`,
+        `source_not_found`, `anchor_not_found`, `review_not_found`,
+        `baseline_not_found`, `finding_not_found`, `run_not_found`,
+        `export_not_found` or `requirement_not_found`; an unknown P3 version on
+        a mindmap route uses the plain `not_found` reason.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    MindmapConflict:
+      description: |
+        A P5 state, revision or uniqueness conflict (`conflict`, HTTP 409).
+        `details.reason` is one of `version_state_conflict` (the version status
+        does not allow the action), `baseline_frozen` (the graph was already
+        approved and is read-only), `case_revision_conflict` (stale `revision`;
+        `details.revision` carries the current value), `invalid_case_tree` (a
+        tree/sequence/coverage rule is broken), `no_cases` (submit-review on an
+        empty graph), `unconfirmed_requirements` (a source or generated case
+        references a requirement that is not `clarified`),
+        `requirement_not_clarified`, `run_in_progress` (same-kind single-flight
+        slot taken), `run_state_conflict`, `blocker_findings_open` (approval
+        without `acknowledgeFindings`; `details.findingIds` lists the blockers),
+        `exploration_requires_environment`, `ai_unavailable`, `export_conflict`
+        (concurrent frozen export), `duplicate_case_source`, `duplicate_key` or
+        `graph_too_large` (over the 300-node cap).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    MindmapUnprocessable:
+      description: |
+        A semantically invalid mindmap request (`invalid_argument`, HTTP 422).
+        `details.reason` is one of `invalid_run_kind`,
+        `environment_not_allowed`, `code_repo_unavailable`,
+        `export_format_unsupported` or a field-level reason such as
+        `invalid_id`/`invalid_json`, always with `details.field` and
+        `details.message`. Async run failures (for example
+        `invalid_case_proposal`, `environment_unreachable` or
+        `ai_unavailable`) are reported on the run's `reason`/`errors` instead of
+        as a request error.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    MindmapServerError:
+      description: |
+        Unexpected server failure (`internal`, HTTP 500) or a stored export file
+        whose bytes no longer match its sha256 (`export_corrupted`, HTTP 500); a
+        corrupted export must be regenerated before it can be downloaded again.
       content:
         application/json:
           schema:
@@ -6928,7 +8283,8 @@ components:
           description: Required for api nodes; empty otherwise.
         source:
           type: string
-          enum: [manual, import]
+          description: P5 application exploration (D36) writes `explored`.
+          enum: [manual, import, explored]
         meta:
           type: object
           additionalProperties: true
@@ -8242,8 +9598,12 @@ components:
           $ref: '#/components/schemas/Candidate'
     AnchorSubjectKind:
       type: string
-      description: P4 anchor subject kinds; `case`/`issue` are reserved for later phases.
-      enum: [version, requirement, app_model]
+      description: |
+        Anchor subject kinds. P4 accepts `version`, `requirement` and
+        `app_model`; P5 (D37) adds `case` for case code anchors, whose ownership
+        and version membership are validated by the mindmap context. `issue`
+        remains reserved for a later phase.
+      enum: [version, requirement, app_model, case]
     Anchor:
       type: object
       description: |
@@ -9854,7 +11214,15 @@ components:
         finishes or degrades; `detail.analysisId`, `detail.analysisVersion`,
         `detail.status`, `detail.degraded` and `detail.counts`). Both put changed
         or evidence paths (up to 20, deduplicated) in `refs.code` and never carry
-        facts, diffs or code content.
+        facts, diffs or code content. P5 adds the eight `case.*` mindmap event
+        types, published on the same channel: `case.created`/`case.updated`/
+        `case.deleted` (node id/kind/source summary), `case.reviewed` (review
+        id, finding and blocker counts), `case.baseline_frozen` (baseline id,
+        node/case counts, graph-hash prefix), `case.run_started`/
+        `case.run_finished` (run id, kind, status, reason) and
+        `case.export_ready` (export id, format, size). They put node ids (up to
+        20) in `refs.case` and never carry mindmap bodies, LLM input/output or
+        export content.
       enum:
         - version.created
         - version.updated
@@ -9878,6 +11246,14 @@ components:
         - agent.activity
         - code.changed
         - code.impact_computed
+        - case.created
+        - case.updated
+        - case.deleted
+        - case.reviewed
+        - case.baseline_frozen
+        - case.run_started
+        - case.run_finished
+        - case.export_ready
     VersionEvent:
       type: object
       description: |
@@ -9962,3 +11338,1131 @@ components:
           description: The version channel's current seq; use it as the SSE `since`/`Last-Event-ID` base.
         has_more:
           type: boolean
+    CaseNodeKind:
+      type: string
+      description: A mindmap node is either a structural scenario or a leaf test case.
+      enum: [scenario, case]
+    CaseNodeStatus:
+      type: string
+      description: |
+        Node life-cycle status. P5 writes `draft` and `reviewed`; the other
+        values are reserved for later phases (execution/补充) and are returned
+        unchanged.
+      enum: [draft, reviewed, executed, supplemented, merged, rejected, needs_revalidation]
+    CasePriority:
+      type: string
+      description: Case priority (P0 highest).
+      enum: [P0, P1, P2, P3]
+    CaseSourceKind:
+      type: string
+      description: Content origin of a node or source.
+      enum: [user_input, ai_generated, ai_supplement]
+    CaseContentSource:
+      type: string
+      description: |
+        Content origin of a step or assertion. Steps and assertions are only
+        ever authored by a user or generated by AI.
+      enum: [user_input, ai_generated]
+    CaseRefKind:
+      type: string
+      description: Reference kinds accepted by `POST /nodes/{nodeId}/sources`.
+      enum: [requirement, app_model, ai_run, manual]
+    AssertionKind:
+      type: string
+      description: Assertion kind.
+      enum: [ui, api, db, text]
+    Confidence:
+      type: string
+      description: Confidence bucket shared by sources, anchors and impact hints.
+      enum: [high, medium, low]
+    RunKind:
+      type: string
+      description: The four mindmap Agent-run kinds.
+      enum: [design, review, data_plan, explore]
+    RunStatus:
+      type: string
+      description: |
+        Run status. `degraded` means the run finished with a reduced outcome
+        (for example deterministic exploration without an LLM).
+      enum: [queued, running, done, failed, degraded]
+    ReviewDecision:
+      type: string
+      description: Decision accepted by `POST /review`.
+      enum: [approve, reject]
+    ReviewStatus:
+      type: string
+      description: Review-round status.
+      enum: [draft, approved, rejected]
+    FindingCategory:
+      type: string
+      description: Review-finding category.
+      enum: [coverage, assertion, executability, duplicate, code_uncovered, other]
+    FindingSeverity:
+      type: string
+      description: Review-finding severity; only `blocker` gates an approval.
+      enum: [blocker, major, minor, info]
+    FindingStatus:
+      type: string
+      description: Review-finding status.
+      enum: [open, fixed, dismissed]
+    FindingSource:
+      type: string
+      description: Review-finding origin.
+      enum: [ai, human]
+    ExportFormat:
+      type: string
+      description: |
+        Server-generated export formats (D38). PNG is rendered client-side from
+        the SVG canvas and is not a server export format.
+      enum: [markdown, mermaid, opml]
+    CaseStepView:
+      type: object
+      description: |
+        One ordered action of a case (spec §7.3). `seq` starts at 1 and stays
+        contiguous; a case has 1-30 steps.
+      required: [id, seq, action, expected, data, source]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        seq:
+          type: integer
+          minimum: 1
+          maximum: 30
+        action:
+          type: string
+          minLength: 1
+          maxLength: 2000
+        expected:
+          type: string
+          maxLength: 2000
+        data:
+          type: string
+        source:
+          $ref: '#/components/schemas/CaseContentSource'
+    CaseAssertionView:
+      type: object
+      description: |
+        One expected outcome of a case (spec §7.3). `stepId` is null when the
+        assertion applies to the whole case.
+      required: [id, stepId, kind, target, expression, expected, source]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        stepId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+        kind:
+          $ref: '#/components/schemas/AssertionKind'
+        target:
+          type: string
+        expression:
+          type: string
+          minLength: 1
+        expected:
+          type: string
+        source:
+          $ref: '#/components/schemas/CaseContentSource'
+    CaseSourceView:
+      type: object
+      description: |
+        One requirement/app-model/run/manual justification of a case (spec
+        §7.3). `refId` is null only for `manual` sources.
+      required: [id, refKind, refId, refKey, source, confidence]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        refKind:
+          $ref: '#/components/schemas/CaseRefKind'
+        refId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+          description: Referenced object id as a decimal string; null only for `manual`.
+        refKey:
+          type: string
+        source:
+          $ref: '#/components/schemas/CaseSourceKind'
+        confidence:
+          $ref: '#/components/schemas/Confidence'
+    CodeAnchorView:
+      type: object
+      description: |
+        One code anchor attached to a case (`subject_kind=case`, D37). `id` is a
+        decimal string; `startLine`/`endLine`/`commitSha` are always present and
+        null when the anchor has no line range or commit pin.
+      required: [id, filePath, startLine, endLine, confidence, commitSha]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        filePath:
+          type: string
+          maxLength: 4096
+        startLine:
+          type: integer
+          minimum: 1
+          nullable: true
+        endLine:
+          type: integer
+          minimum: 1
+          nullable: true
+        confidence:
+          $ref: '#/components/schemas/Confidence'
+        commitSha:
+          type: string
+          pattern: '^[a-f0-9]{40}$'
+          nullable: true
+    CaseNodeView:
+      type: object
+      description: |
+        One node of the graph response (spec §7.3). Scenarios never carry
+        steps/assertions/sources; cases carry at least one step and one
+        assertion before review. `anchors` is always an array (empty when the
+        read omitted `include=anchors`).
+      required:
+        - id
+        - parentId
+        - kind
+        - title
+        - description
+        - priority
+        - preconditions
+        - testData
+        - source
+        - status
+        - sortOrder
+        - revision
+        - steps
+        - assertions
+        - sources
+        - anchors
+        - openBlockerCount
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        parentId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+          description: Parent node id, or null for a root node.
+        kind:
+          $ref: '#/components/schemas/CaseNodeKind'
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        description:
+          type: string
+          maxLength: 4000
+        priority:
+          $ref: '#/components/schemas/CasePriority'
+        preconditions:
+          type: string
+        testData:
+          description: |
+            Free-form JSON test-data document (object, array, scalar or null).
+            The server stores it verbatim and never interprets it. Always
+            present; null when unset.
+          nullable: true
+        source:
+          $ref: '#/components/schemas/CaseSourceKind'
+        status:
+          $ref: '#/components/schemas/CaseNodeStatus'
+        sortOrder:
+          type: integer
+          minimum: 0
+        revision:
+          type: integer
+          minimum: 1
+        steps:
+          type: array
+          items:
+            $ref: '#/components/schemas/CaseStepView'
+        assertions:
+          type: array
+          items:
+            $ref: '#/components/schemas/CaseAssertionView'
+        sources:
+          type: array
+          items:
+            $ref: '#/components/schemas/CaseSourceView'
+        anchors:
+          type: array
+          description: Always present; empty when `include=anchors` was omitted.
+          items:
+            $ref: '#/components/schemas/CodeAnchorView'
+        openBlockerCount:
+          type: integer
+          minimum: 0
+    CoverageCell:
+      type: object
+      description: One requirement row of the coverage matrix.
+      required: [requirementId, caseIds]
+      properties:
+        requirementId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        caseIds:
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9]{1,19}$'
+    CoverageView:
+      type: object
+      description: Requirement ↔ case coverage projection (spec §6.2/§7.3).
+      required: [requirementIds, uncoveredRequirementIds, staleRequirementIds, matrix]
+      properties:
+        requirementIds:
+          type: array
+          description: All clarified requirements considered for coverage.
+          items:
+            type: string
+            pattern: '^[0-9]{1,19}$'
+        uncoveredRequirementIds:
+          type: array
+          description: Clarified requirements that no case covers.
+          items:
+            type: string
+            pattern: '^[0-9]{1,19}$'
+        staleRequirementIds:
+          type: array
+          description: Requirements reopened after their cases were written (read-only hint in P5).
+          items:
+            type: string
+            pattern: '^[0-9]{1,19}$'
+        matrix:
+          type: array
+          items:
+            $ref: '#/components/schemas/CoverageCell'
+    BaselineView:
+      type: object
+      description: The immutable frozen baseline of a version (spec §6.4).
+      required: [id, graphHash, caseCount, nodeCount, frozenAt, codeBaselineCommit]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        graphHash:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: sha256 of the canonical graph document.
+        caseCount:
+          type: integer
+          minimum: 0
+        nodeCount:
+          type: integer
+          minimum: 0
+        frozenAt:
+          type: string
+          format: date-time
+        codeBaselineCommit:
+          type: string
+          pattern: '^[a-f0-9]{40}$'
+          nullable: true
+          description: The version's code baseline commit at freeze time, when one was bound.
+    RunSummaryView:
+      type: object
+      description: |
+        The latest run of one kind, summarised inside the graph response. Only
+        `id`/`status` are guaranteed; `kind`, `finishedAt` and the counts may be
+        absent (null when the run has not finished).
+      required: [id, status]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        kind:
+          $ref: '#/components/schemas/RunKind'
+        status:
+          $ref: '#/components/schemas/RunStatus'
+        finishedAt:
+          type: string
+          format: date-time
+          nullable: true
+        findingCount:
+          type: integer
+          minimum: 0
+          description: Present for a review run summary.
+        blockerCount:
+          type: integer
+          minimum: 0
+          description: Present for a review run summary.
+    ImpactCaseView:
+      type: object
+      description: |
+        One read-only "possibly affected" hint derived from the latest P4 code
+        analysis and mapped through requirement/app-model sources. P5 never
+        mutates node status from it.
+      required: [caseNodeId, reason, confidence, source]
+      properties:
+        caseNodeId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        reason:
+          type: string
+        confidence:
+          $ref: '#/components/schemas/Confidence'
+        source:
+          type: string
+          description: Origin of the hint (for example `relation`).
+    MindmapGraph:
+      type: object
+      description: |
+        The complete `GET /mindmap` response (spec §7.3). `editable` is
+        server-owned (`versionStatus` is `designing`/`reviewing` and no baseline
+        is frozen). `anchors` and `impactCases` are always arrays; `findings` is
+        present only when `include=findings`.
+      required:
+        - versionId
+        - versionStatus
+        - editable
+        - nodes
+        - coverage
+        - baseline
+        - latestRuns
+        - impactCases
+      properties:
+        versionId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        versionStatus:
+          $ref: '#/components/schemas/VersionStatus'
+        editable:
+          type: boolean
+          description: True while the version is `designing`/`reviewing` and no baseline is frozen.
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/CaseNodeView'
+        coverage:
+          $ref: '#/components/schemas/CoverageView'
+        baseline:
+          description: The frozen baseline, or null before approval.
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/BaselineView'
+        latestRuns:
+          type: object
+          description: |
+            Latest run summary keyed by run kind. A kind key is omitted when no
+            run of that kind exists.
+          additionalProperties: false
+          properties:
+            design:
+              $ref: '#/components/schemas/RunSummaryView'
+            review:
+              $ref: '#/components/schemas/RunSummaryView'
+            data_plan:
+              $ref: '#/components/schemas/RunSummaryView'
+            explore:
+              $ref: '#/components/schemas/RunSummaryView'
+        impactCases:
+          type: array
+          description: Always present; empty when `include=impact` was omitted or no hint exists.
+          items:
+            $ref: '#/components/schemas/ImpactCaseView'
+        findings:
+          type: array
+          description: |
+            Present only when `include=findings`; `GET /findings` is the
+            authoritative flat list.
+          items:
+            $ref: '#/components/schemas/CaseReviewFindingView'
+    CaseRunError:
+      type: object
+      description: One non-fatal run error; never carries LLM, mindmap or export bodies.
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+    CaseRunView:
+      type: object
+      description: |
+        A run detail/listing row (spec §7.2 endpoints 17-19). LLM input/output
+        and proposal bodies are never returned. `agentSessionId`/`agentRunId`
+        are P1 IDs and stay numbers; `reason` carries a stable failure reason
+        such as `agent_failed`, `agent_timeout`, `agent_start_timeout`,
+        `worker_restart`, `ai_unavailable`, `invalid_case_proposal`,
+        `environment_unreachable` or `baseline_frozen` (empty when the run did
+        not fail).
+      required:
+        - id
+        - versionId
+        - kind
+        - status
+        - reason
+        - stats
+        - errors
+        - agentSessionId
+        - agentRunId
+        - model
+        - promptVersion
+        - createdBy
+        - createdAt
+        - startedAt
+        - finishedAt
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        versionId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        kind:
+          $ref: '#/components/schemas/RunKind'
+        status:
+          $ref: '#/components/schemas/RunStatus'
+        reason:
+          type: string
+        stats:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: Non-sensitive run statistics (for example materialized counts).
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/CaseRunError'
+        agentSessionId:
+          type: integer
+          format: int64
+          nullable: true
+          description: P1 Agent session ID (a number), null before the session is created.
+        agentRunId:
+          type: integer
+          format: int64
+          nullable: true
+          description: P1 Agent run ID (a number), null before the run is created.
+        model:
+          type: string
+        promptVersion:
+          type: string
+        createdBy:
+          type: integer
+          format: int64
+        createdAt:
+          type: string
+          format: date-time
+        startedAt:
+          type: string
+          format: date-time
+          nullable: true
+        finishedAt:
+          type: string
+          format: date-time
+          nullable: true
+    CaseReviewView:
+      type: object
+      description: One review round of a version's case mindmap (spec §6.3).
+      required:
+        - id
+        - versionId
+        - runId
+        - status
+        - comment
+        - reviewerId
+        - decidedBy
+        - decidedAt
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        versionId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        runId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+          description: The review run that produced the findings; null for a human-only review.
+        status:
+          $ref: '#/components/schemas/ReviewStatus'
+        comment:
+          type: string
+        reviewerId:
+          type: integer
+          format: int64
+        decidedBy:
+          type: integer
+          format: int64
+          nullable: true
+        decidedAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    CaseReviewFindingView:
+      type: object
+      description: |
+        One review finding; `nodeId` is null for version-level findings. A
+        finding is not a P7 issue ticket.
+      required:
+        - id
+        - reviewId
+        - nodeId
+        - category
+        - severity
+        - detail
+        - status
+        - source
+        - createdBy
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        reviewId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        nodeId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+        category:
+          $ref: '#/components/schemas/FindingCategory'
+        severity:
+          $ref: '#/components/schemas/FindingSeverity'
+        detail:
+          type: string
+          minLength: 1
+          maxLength: 2000
+        status:
+          $ref: '#/components/schemas/FindingStatus'
+        source:
+          $ref: '#/components/schemas/FindingSource'
+        createdBy:
+          type: integer
+          format: int64
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    CaseFindingView:
+      description: |
+        Alias of `CaseReviewFindingView` for consumers that use the shorter
+        frontend DTO name; both name the same shape.
+      allOf:
+        - $ref: '#/components/schemas/CaseReviewFindingView'
+    CaseExportView:
+      type: object
+      description: |
+        One server-generated export file (D30/D38); the file itself is fetched
+        from `/exports/{exportId}/download` and internal paths are never exposed.
+      required: [id, versionId, format, nodeCount, sizeBytes, baselineId, createdAt]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        versionId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        format:
+          $ref: '#/components/schemas/ExportFormat'
+        nodeCount:
+          type: integer
+          minimum: 0
+        sizeBytes:
+          type: integer
+          format: int64
+          minimum: 1
+        baselineId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+          description: The frozen baseline this file was generated from; null for a draft export.
+        createdAt:
+          type: string
+          format: date-time
+        sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: Lowercase hex sha256 of the file contents, when the server exposes it.
+        fileName:
+          type: string
+          description: Suggested download filename, when the server exposes it.
+    CreateNodeRequest:
+      type: object
+      additionalProperties: false
+      required: [kind, title]
+      properties:
+        kind:
+          $ref: '#/components/schemas/CaseNodeKind'
+        parentId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+          description: Parent node id; omitted or null creates a root node.
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        description:
+          type: string
+          maxLength: 4000
+        priority:
+          $ref: '#/components/schemas/CasePriority'
+        preconditions:
+          type: string
+        testData:
+          description: Free-form JSON test-data document; the server stores it verbatim.
+          nullable: true
+        requirementIds:
+          type: array
+          description: Requirements this case covers; all must belong to the version and be `clarified`.
+          items:
+            type: string
+            pattern: '^[0-9]{1,19}$'
+        source:
+          description: Defaults to `user_input` for manual creation.
+          allOf:
+            - $ref: '#/components/schemas/CaseSourceKind'
+    UpdateNodeRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        Partial node update; omitted fields keep their stored value. `revision`
+        is the mandatory optimistic-concurrency token.
+      required: [revision]
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        description:
+          type: string
+          maxLength: 4000
+        priority:
+          $ref: '#/components/schemas/CasePriority'
+        preconditions:
+          type: string
+        testData:
+          description: Free-form JSON test-data document; null clears it.
+          nullable: true
+        requirementIds:
+          type: array
+          description: Replaces the requirement-source set; must not leave the case uncovered.
+          items:
+            type: string
+            pattern: '^[0-9]{1,19}$'
+        revision:
+          type: integer
+          minimum: 1
+    CreateStepRequest:
+      type: object
+      additionalProperties: false
+      required: [action]
+      properties:
+        action:
+          type: string
+          minLength: 1
+          maxLength: 2000
+        expected:
+          type: string
+          maxLength: 2000
+        data:
+          type: string
+        afterSeq:
+          type: integer
+          minimum: 0
+          maximum: 30
+          description: Insert after this sequence; omit to append at the end.
+    UpdateStepRequest:
+      type: object
+      additionalProperties: false
+      description: Partial step update guarded by the owning case node revision.
+      required: [nodeRevision]
+      properties:
+        action:
+          type: string
+          minLength: 1
+          maxLength: 2000
+        expected:
+          type: string
+          maxLength: 2000
+        data:
+          type: string
+        nodeRevision:
+          type: integer
+          minimum: 1
+    CreateAssertionRequest:
+      type: object
+      additionalProperties: false
+      required: [kind, expression]
+      properties:
+        stepId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+          description: Attach to this step of the same case; null or omitted applies to the whole case.
+        kind:
+          $ref: '#/components/schemas/AssertionKind'
+        target:
+          type: string
+        expression:
+          type: string
+          minLength: 1
+        expected:
+          type: string
+    UpdateAssertionRequest:
+      type: object
+      additionalProperties: false
+      description: Partial assertion update guarded by the owning case node revision.
+      required: [nodeRevision]
+      properties:
+        kind:
+          $ref: '#/components/schemas/AssertionKind'
+        target:
+          type: string
+        expression:
+          type: string
+          minLength: 1
+        expected:
+          type: string
+        nodeRevision:
+          type: integer
+          minimum: 1
+    AddSourceRequest:
+      type: object
+      additionalProperties: false
+      required: [refKind]
+      properties:
+        refKind:
+          $ref: '#/components/schemas/CaseRefKind'
+        refId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+          description: Referenced object id; required except for `manual` sources.
+        refKey:
+          type: string
+    AddAnchorRequest:
+      type: object
+      additionalProperties: false
+      required: [filePath]
+      properties:
+        filePath:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: Version-relative file path that must exist at the code baseline commit.
+        startLine:
+          type: integer
+          minimum: 1
+        endLine:
+          type: integer
+          minimum: 1
+        confidence:
+          $ref: '#/components/schemas/Confidence'
+    StartRunRequest:
+      type: object
+      additionalProperties: false
+      required: [kind]
+      properties:
+        kind:
+          $ref: '#/components/schemas/RunKind'
+        mode:
+          type: string
+          description: |
+            `design` mode: `append` (default) adds scenarios/cases, `replace`
+            removes every draft node first and requires `confirmReplace=true`.
+          enum: [append, replace]
+        confirmReplace:
+          type: boolean
+          description: Explicit confirmation for `mode=replace`.
+        nodeIds:
+          type: array
+          description: Target nodes for a `data_plan` run (at most 60).
+          maxItems: 60
+          items:
+            type: string
+            pattern: '^[0-9]{1,19}$'
+        systemId:
+          type: integer
+          format: int64
+          minimum: 1
+          description: P2 system id for an `explore` run (a number).
+        environmentId:
+          type: integer
+          format: int64
+          minimum: 1
+          description: P2 environment id for an `explore` run (a number).
+        sessionId:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Optional P2 session id whose cookies authenticate the read-only exploration.
+        startPaths:
+          type: array
+          description: Optional extra exploration seeds (at most 10, still subject to the allowed-hosts whitelist).
+          maxItems: 10
+          items:
+            type: string
+        headCommit:
+          type: string
+          pattern: '^[a-f0-9]{40}$'
+          description: Optional 40-hex code head override for code-aware runs.
+    ReviewRequest:
+      type: object
+      additionalProperties: false
+      required: [decision]
+      properties:
+        decision:
+          $ref: '#/components/schemas/ReviewDecision'
+        comment:
+          type: string
+          description: Human comment; required (non-empty) when `decision=reject`.
+        acknowledgeFindings:
+          type: boolean
+          description: Required to approve while open `blocker` findings exist.
+    UpdateFindingRequest:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          description: Human disposition of the finding (reopening is not supported).
+          enum: [fixed, dismissed]
+    ExportRequest:
+      type: object
+      additionalProperties: false
+      required: [format]
+      properties:
+        format:
+          $ref: '#/components/schemas/ExportFormat'
+    ReorderRequest:
+      type: object
+      additionalProperties: false
+      required: [nodeIds]
+      properties:
+        parentId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+          description: Parent whose children are reordered; omitted or null is the version root.
+        nodeIds:
+          type: array
+          description: |
+            Every child of the parent exactly once, in the new order. A missing,
+            duplicated or foreign id is 409 `invalid_case_tree`.
+          items:
+            type: string
+            pattern: '^[0-9]{1,19}$'
+    ReorderStepsRequest:
+      type: object
+      additionalProperties: false
+      required: [stepIds]
+      properties:
+        stepIds:
+          type: array
+          description: Every step of the case exactly once, in the new order.
+          items:
+            type: string
+            pattern: '^[0-9]{1,19}$'
+    StartRunResult:
+      type: object
+      description: The accepted `POST /runs` result (202).
+      required: [runId]
+      properties:
+        runId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+    StartRunResultEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/StartRunResult'
+    SubmitReviewResult:
+      type: object
+      description: The `POST /submit-review` result (200).
+      required: [version]
+      properties:
+        version:
+          $ref: '#/components/schemas/Version'
+    SubmitReviewResultEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/SubmitReviewResult'
+    ReviewResult:
+      type: object
+      description: |
+        The `POST /review` result (200). `baseline` is present on approval and
+        null on rejection.
+      required: [version, review]
+      properties:
+        version:
+          $ref: '#/components/schemas/Version'
+        baseline:
+          description: The frozen baseline created by an approval, or null.
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/BaselineView'
+        review:
+          $ref: '#/components/schemas/CaseReviewView'
+    ReviewResultEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/ReviewResult'
+    MindmapEnvelope:
+      type: object
+      description: The normal data envelope of `GET /mindmap` (one MindmapGraph).
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/MindmapGraph'
+    MindmapListEnvelope:
+      type: object
+      description: |
+        Cursor page shared by the mindmap list endpoints (spec §7.1). `data`
+        holds the rows of the endpoint's type: `CaseRunView` for `/runs`,
+        `CaseReviewView` for `/reviews` and `CaseExportView` for `/exports`.
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          description: One page of rows of the endpoint's row type.
+          items:
+            anyOf:
+              - $ref: '#/components/schemas/CaseRunView'
+              - $ref: '#/components/schemas/CaseReviewView'
+              - $ref: '#/components/schemas/CaseExportView'
+        next_cursor:
+          type: string
+          description: Opaque cursor for the next page; empty when `has_more` is false.
+        has_more:
+          type: boolean
+    MindmapFindingListEnvelope:
+      type: object
+      description: |
+        The flat, unpaginated `{"data": [CaseReviewFindingView]}` list returned
+        by `GET /findings` (spec §7.3).
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/CaseReviewFindingView'
+    CaseNodeEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/CaseNodeView'
+    CaseStepEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/CaseStepView'
+    CaseAssertionEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/CaseAssertionView'
+    CaseSourceEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/CaseSourceView'
+    MindmapAnchorEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/CodeAnchorView'
+    CaseRunEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/CaseRunView'
+    CaseReviewEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/CaseReviewView'
+    CaseReviewFindingEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/CaseReviewFindingView'
+    CaseExportEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/CaseExportView'
+    MindmapErrorReason:
+      type: string
+      description: |
+        Closed set of P5 mindmap `error.details.reason` values (spec §7.4). HTTP
+        mapping: `*_not_found` is 404; `forbidden` is 403; `export_corrupted` is
+        500; `invalid_case_tree`, `no_cases`, `graph_too_large`,
+        `unconfirmed_requirements` and `requirement_not_clarified` are 409 (the
+        domain layer may still classify them as invalid); the remaining values
+        are 409 conflicts or 422 validation errors. `duplicate_key` and
+        `invalid_case_proposal` are shared with the platform/P4 error reasons,
+        and `invalid_case_proposal`, `environment_unreachable` and
+        `ai_unavailable` also appear on a failed run's `reason`.
+      enum:
+        - version_state_conflict
+        - baseline_frozen
+        - case_revision_conflict
+        - invalid_case_tree
+        - no_cases
+        - unconfirmed_requirements
+        - requirement_not_found
+        - requirement_not_clarified
+        - node_not_found
+        - step_not_found
+        - assertion_not_found
+        - source_not_found
+        - anchor_not_found
+        - review_not_found
+        - baseline_not_found
+        - finding_not_found
+        - run_in_progress
+        - run_not_found
+        - run_state_conflict
+        - invalid_run_kind
+        - invalid_case_proposal
+        - blocker_findings_open
+        - exploration_requires_environment
+        - environment_not_allowed
+        - environment_unreachable
+        - code_repo_unavailable
+        - ai_unavailable
+        - export_format_unsupported
+        - export_not_found
+        - export_conflict
+        - export_corrupted
+        - duplicate_case_source
+        - duplicate_key
+        - graph_too_large
+        - forbidden
