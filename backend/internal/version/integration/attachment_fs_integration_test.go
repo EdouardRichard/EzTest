@@ -289,7 +289,7 @@ func TestAttachmentDraftGateAndLimit(t *testing.T) {
 	}
 	var count int
 	if err := f.pool.QueryRow(ctx,
-		`SELECT count(*)::int FROM requirement_attachments WHERE requirement_id = $1`,
+		`SELECT count(*)::int FROM requirement_attachment WHERE requirement_id = $1`,
 		requirement.ID).Scan(&count); err != nil {
 		t.Fatalf("count attachments: %v", err)
 	}
@@ -364,7 +364,7 @@ func TestAttachmentRequirementCascadeCleanup(t *testing.T) {
 	}
 	var rows int
 	if err := f.pool.QueryRow(ctx,
-		`SELECT count(*)::int FROM requirement_attachments WHERE requirement_id = $1`,
+		`SELECT count(*)::int FROM requirement_attachment WHERE requirement_id = $1`,
 		requirement.ID).Scan(&rows); err != nil {
 		t.Fatalf("count attachment rows: %v", err)
 	}

@@ -154,7 +154,7 @@ func TestRequirementConfirmGateAndReopen(t *testing.T) {
 
 	// An open question of the requirement blocks confirmation.
 	if _, err := f.pool.Exec(ctx, `
-		INSERT INTO clarification_questions (id, version_id, requirement_id, question, status, created_by)
+		INSERT INTO clarification_question (id, version_id, requirement_id, question, status, created_by)
 		VALUES (92001, $1, $2, 'Which coupons?', 'open', 7)`, version.ID, requirement.ID); err != nil {
 		t.Fatalf("insert question: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestRequirementConfirmGateAndReopen(t *testing.T) {
 
 	// Answering it unblocks the confirmation and stamps confirmed_at/by.
 	if _, err := f.pool.Exec(ctx, `
-		UPDATE clarification_questions SET status = 'answered', answer = 'all coupons'
+		UPDATE clarification_question SET status = 'answered', answer = 'all coupons'
 		WHERE id = 92001`); err != nil {
 		t.Fatalf("answer question: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestRequirementConfirmGateAndReopen(t *testing.T) {
 
 	// A decision linked to the requirement survives the reopen.
 	if _, err := f.pool.Exec(ctx, `
-		INSERT INTO decisions (id, version_id, requirement_id, topic, decision, status, source, proposed_by)
+		INSERT INTO decision (id, version_id, requirement_id, topic, decision, status, source, proposed_by)
 		VALUES (93001, $1, $2, 'Coupons', 'Apply all coupons', 'accepted', 'user', 42)`,
 		version.ID, requirement.ID); err != nil {
 		t.Fatalf("insert decision: %v", err)
@@ -204,8 +204,8 @@ func TestRequirementConfirmGateAndReopen(t *testing.T) {
 		t.Fatalf("reopened requirement = %+v", reopened)
 	}
 	for _, query := range []string{
-		`SELECT count(*)::int FROM clarification_questions WHERE id = 92001`,
-		`SELECT count(*)::int FROM decisions WHERE id = 93001`,
+		`SELECT count(*)::int FROM clarification_question WHERE id = 92001`,
+		`SELECT count(*)::int FROM decision WHERE id = 93001`,
 	} {
 		var count int
 		if err := f.pool.QueryRow(ctx, query).Scan(&count); err != nil {
@@ -351,13 +351,13 @@ func TestRequirementDeleteCascades(t *testing.T) {
 		t.Fatalf("Create relation: %v", err)
 	}
 	if _, err := f.pool.Exec(ctx, `
-		INSERT INTO clarification_questions (id, version_id, requirement_id, question, status, created_by)
+		INSERT INTO clarification_question (id, version_id, requirement_id, question, status, created_by)
 		VALUES (92001, $1, $2, 'Requirement question?', 'open', 7),
 		       (92002, $1, NULL, 'Version question?', 'open', 7)`, version.ID, deleted.ID); err != nil {
 		t.Fatalf("insert questions: %v", err)
 	}
 	if _, err := f.pool.Exec(ctx, `
-		INSERT INTO decisions (id, version_id, requirement_id, topic, decision, status, source, proposed_by)
+		INSERT INTO decision (id, version_id, requirement_id, topic, decision, status, source, proposed_by)
 		VALUES (93001, $1, $2, 'Topic', 'Decision', 'proposed', 'ai', 7)`, version.ID, deleted.ID); err != nil {
 		t.Fatalf("insert decision: %v", err)
 	}
@@ -375,10 +375,10 @@ func TestRequirementDeleteCascades(t *testing.T) {
 		t.Fatalf("Delete: %v", err)
 	}
 	for _, query := range []string{
-		`SELECT count(*)::int FROM requirement_relations WHERE from_requirement_id = $1 OR to_requirement_id = $1`,
-		`SELECT count(*)::int FROM clarification_questions WHERE requirement_id = $1`,
-		`SELECT count(*)::int FROM decisions WHERE requirement_id = $1`,
-		`SELECT count(*)::int FROM requirement_attachments WHERE requirement_id = $1`,
+		`SELECT count(*)::int FROM requirement_relation WHERE from_requirement_id = $1 OR to_requirement_id = $1`,
+		`SELECT count(*)::int FROM clarification_question WHERE requirement_id = $1`,
+		`SELECT count(*)::int FROM decision WHERE requirement_id = $1`,
+		`SELECT count(*)::int FROM requirement_attachment WHERE requirement_id = $1`,
 	} {
 		var count int
 		if err := f.pool.QueryRow(ctx, query, deleted.ID).Scan(&count); err != nil {
@@ -390,7 +390,7 @@ func TestRequirementDeleteCascades(t *testing.T) {
 	}
 	// The version-level question and the other requirement survive.
 	var versionQuestions int
-	if err := f.pool.QueryRow(ctx, `SELECT count(*)::int FROM clarification_questions WHERE id = 92002`).Scan(&versionQuestions); err != nil {
+	if err := f.pool.QueryRow(ctx, `SELECT count(*)::int FROM clarification_question WHERE id = 92002`).Scan(&versionQuestions); err != nil {
 		t.Fatalf("count version question: %v", err)
 	}
 	if versionQuestions != 1 {

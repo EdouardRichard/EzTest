@@ -497,13 +497,13 @@ func TestP3WiringEndToEnd(t *testing.T) {
 	pool := testutil.OpenTestDB(t)
 
 	// The test database is truncated after migration: restore the seeded user
-	// (agent_sessions.created_by is an FK) and the default P2 company (the
+	// (agent_session.created_by is an FK) and the default P2 company (the
 	// catalog services resolve it for every write).
-	if _, err := pool.Exec(ctx, `INSERT INTO users (id, username, password_hash, role)
+	if _, err := pool.Exec(ctx, `INSERT INTO user_account (id, username, password_hash, role)
 		VALUES ($1, 'wiring-admin', 'not-used', 'admin')`, wiringUserID); err != nil {
 		t.Fatalf("seed wiring user: %v", err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO companies (key, name) VALUES ('default', 'Default')`); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO company (key, name) VALUES ('default', 'Default')`); err != nil {
 		t.Fatalf("seed default company: %v", err)
 	}
 
@@ -592,7 +592,7 @@ func TestP3WiringEndToEnd(t *testing.T) {
 	}
 	var storagePath string
 	if err := pool.QueryRow(ctx,
-		`SELECT storage_path FROM requirement_attachments WHERE id = $1`, attachmentID).Scan(&storagePath); err != nil {
+		`SELECT storage_path FROM requirement_attachment WHERE id = $1`, attachmentID).Scan(&storagePath); err != nil {
 		t.Fatalf("load attachment storage path: %v", err)
 	}
 	if !strings.HasPrefix(storagePath, strconv.FormatInt(versionID, 10)+"/") {
@@ -662,7 +662,7 @@ func TestP3WiringEndToEnd(t *testing.T) {
 	var activityVersionID *string
 	if err := pool.QueryRow(ctx, `
 		SELECT p.key, s.activity_channel, s.activity_version_id
-		FROM agent_sessions s JOIN agent_profiles p ON p.id = s.profile_id
+		FROM agent_session s JOIN agent_profile p ON p.id = s.profile_id
 		WHERE s.id = $1`, sessionStarted.Data.AgentSessionID).
 		Scan(&profileKey, &activityChannel, &activityVersionID); err != nil {
 		t.Fatalf("load P1 clarification session: %v", err)
@@ -738,7 +738,7 @@ func TestP3WiringEndToEnd(t *testing.T) {
 
 	// The three P3 profiles are seeded and every allowed tool comes from the
 	// real registry, not just from the seed literals.
-	rows, err := pool.Query(ctx, `SELECT key, allowed_tools FROM agent_profiles ORDER BY id`)
+	rows, err := pool.Query(ctx, `SELECT key, allowed_tools FROM agent_profile ORDER BY id`)
 	if err != nil {
 		t.Fatalf("list seeded profiles: %v", err)
 	}

@@ -8,7 +8,7 @@ import (
 	"unicode/utf8"
 )
 
-// Attachment kinds, mirrored from the requirement_attachments.kind CHECK
+// Attachment kinds, mirrored from the requirement_attachment.kind CHECK
 // constraint.
 const (
 	AttachmentText  = "text"
@@ -61,7 +61,7 @@ func KindForMIMEType(mimeType string) (string, error) {
 }
 
 // Validate enforces the attachment bounds of spec §6.7 and the
-// requirement_attachments CHECK constraints.
+// requirement_attachment CHECK constraints.
 func (a *Attachment) Validate() error {
 	if a == nil {
 		return NewInvalid("", "invalid_attachment", "attachment is required")

@@ -100,7 +100,7 @@ var attachmentExtensionMIMEs = map[string][]string{
 }
 
 // attachmentCanonicalMIME maps an allowed extension to the MIME type persisted
-// in requirement_attachments.mime_type (which is also the download
+// in requirement_attachment.mime_type (which is also the download
 // Content-Type). The value is always one of the frozen domain allow-list.
 var attachmentCanonicalMIME = map[string]string{
 	".txt":  "text/plain",
@@ -178,7 +178,7 @@ func (s *AttachmentService) Upload(ctx context.Context, versionID, reqID int64, 
 	// The draft gate and the count caps below are check-then-write: P3 is
 	// single-user, so the narrow race with a concurrent confirm/upload is
 	// accepted. The duplicate-sha pre-check is likewise check-then-write; the
-	// requirement_attachments unique index is its database backstop.
+	// requirement_attachment unique index is its database backstop.
 	if requirement.Status != domain.RequirementDraft {
 		return nil, requirementStateConflictError(reqID, requirement.Status)
 	}
@@ -525,7 +525,7 @@ func (s *AttachmentService) loadScopedAttachment(ctx context.Context, versionID,
 // before any byte is written. The database has no count constraint; the small
 // race between two concurrent uploads is accepted for P3's single-user scope.
 // The duplicate-sha pre-check in Upload is likewise check-then-write, with the
-// requirement_attachments unique index as its database backstop.
+// requirement_attachment unique index as its database backstop.
 func (s *AttachmentService) checkAttachmentCounts(ctx context.Context, reqID, versionID int64) error {
 	perRequirement, perVersion, err := s.repo.CountAttachments(ctx, reqID, versionID)
 	if err != nil {

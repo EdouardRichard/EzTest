@@ -7,7 +7,7 @@ import (
 	"unicode/utf8"
 )
 
-// Requirement statuses, mirrored from the requirements.status CHECK constraint.
+// Requirement statuses, mirrored from the requirement.status CHECK constraint.
 const (
 	RequirementDraft     = "draft"
 	RequirementClarified = "clarified"
@@ -16,7 +16,7 @@ const (
 	RequirementObsolete  = "obsolete"
 )
 
-// Priorities, mirrored from the requirements.priority CHECK constraint.
+// Priorities, mirrored from the requirement.priority CHECK constraint.
 const (
 	PriorityMust   = "must"
 	PriorityShould = "should"
@@ -51,7 +51,7 @@ type Requirement struct {
 }
 
 // Validate enforces the requirement bounds of spec §6.2 and the frozen enums of
-// the requirements CHECK constraints.
+// the requirement CHECK constraints.
 func (r *Requirement) Validate() error {
 	if r == nil {
 		return NewInvalid("", "invalid_requirement", "requirement is required")

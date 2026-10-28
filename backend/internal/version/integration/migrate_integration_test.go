@@ -13,15 +13,16 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// p3Tables are the seven tables introduced by version_0001 and version_0002.
+// p3Tables are the seven tables introduced by version_0001 and version_0002,
+// under the singular names the D34 rename migration gives them.
 var p3Tables = []string{
-	"versions",
-	"requirements",
-	"requirement_relations",
-	"requirement_attachments",
-	"clarification_sessions",
-	"clarification_questions",
-	"decisions",
+	"version",
+	"requirement",
+	"requirement_relation",
+	"requirement_attachment",
+	"clarification_session",
+	"clarification_question",
+	"decision",
 }
 
 // p3Indexes are every index declared by the P3 migrations.
@@ -67,13 +68,13 @@ func TestP3MigrationsApply(t *testing.T) {
 		t.Fatalf("apply embedded migrations a second time: %v", err)
 	}
 
-	// The runner skips already-applied versions, so replay the three P3 SQL
-	// files directly as well: their DDL must be repeatable on its own (IF NOT
-	// EXISTS) and must not record duplicate ledger rows.
+	// The runner skips already-applied versions, so replay the D34 rename
+	// migration directly: its ALTER TABLE/SEQUENCE IF EXISTS statements make it
+	// repeatable on its own (spec §3.3) and it must not record duplicate ledger
+	// rows. The historical version_0001/0002 files cannot be replayed after the
+	// rename: they would recreate the old plural tables.
 	for _, name := range []string{
-		"version_0001_versions_requirements.sql",
-		"version_0002_clarification.sql",
-		"agent_0002_activity_channel.sql",
+		"version_0003_rename_tables.sql",
 	} {
 		sql, err := os.ReadFile("../../db/migrations/" + name)
 		if err != nil {
@@ -103,18 +104,18 @@ func TestP3MigrationsApply(t *testing.T) {
 
 	// agent_0002 extends P1 sessions with the optional version activity channel.
 	for _, column := range []string{"activity_channel", "activity_version_id"} {
-		if !columnExists(t, ctx, pool, "agent_sessions", column) {
-			t.Errorf("agent_sessions.%s does not exist", column)
+		if !columnExists(t, ctx, pool, "agent_session", column) {
+			t.Errorf("agent_session.%s does not exist", column)
 		}
 	}
 
 	// Attachments are stored on the filesystem; the column is storage_path, not
 	// the P0 content-addressed storage_key.
-	if !columnExists(t, ctx, pool, "requirement_attachments", "storage_path") {
-		t.Error("requirement_attachments.storage_path does not exist")
+	if !columnExists(t, ctx, pool, "requirement_attachment", "storage_path") {
+		t.Error("requirement_attachment.storage_path does not exist")
 	}
-	if columnExists(t, ctx, pool, "requirement_attachments", "storage_key") {
-		t.Error("requirement_attachments.storage_key must not exist; attachments store storage_path")
+	if columnExists(t, ctx, pool, "requirement_attachment", "storage_key") {
+		t.Error("requirement_attachment.storage_key must not exist; attachments store storage_path")
 	}
 
 	// A second run must not append duplicate ledger rows: schema_migrations has

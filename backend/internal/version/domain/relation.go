@@ -2,7 +2,7 @@ package domain
 
 import "time"
 
-// Relation types, mirrored from the requirement_relations.relation_type CHECK
+// Relation types, mirrored from the requirement_relation.relation_type CHECK
 // constraint. depends_on is directed; the other three are undirected and stored
 // with from/to preserved.
 const (
