@@ -276,14 +276,23 @@ const P6_ORDERS = [
   { id: 3, number: "P6-ORDER-3", status: "cancelled", amount: 75, currency: "CNY" },
 ];
 
-const P6_LOGIN_FORM = `
-    <form method="post" action="/p6/login">
+/**
+ * The P6 login form. The action keeps the page's query string so a recipe that
+ * navigates to `/p6/login?mfa=1` still reaches the MFA challenge after submit:
+ * a bare `/p6/login` action would drop the query and silently complete a
+ * password-only login, making the takeover path unreachable.
+ */
+function p6LoginForm(mfa) {
+  const action = mfa ? "/p6/login?mfa=1" : "/p6/login";
+  return `
+    <form method="post" action="${action}">
       <label for="username">Username</label>
       <input id="username" name="username" type="text" autocomplete="username" required />
       <label for="password">Password</label>
       <input id="password" name="password" type="password" autocomplete="current-password" required />
       <button type="submit">Sign in</button>
     </form>`;
+}
 
 /** One P6 login page; `mfa` renders the visible #mfa challenge block. */
 function p6LoginPage(message, mfa) {
@@ -302,7 +311,7 @@ function p6LoginPage(message, mfa) {
       <h1>P6 Login</h1>
       ${error}
       ${challenge}
-      ${P6_LOGIN_FORM}
+      ${p6LoginForm(mfa)}
     </main>
   </body>
 </html>

@@ -194,6 +194,64 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance-mindm
 
 P5 已知限制：不做浏览器探索（仅 HTTP GET/HEAD 的确定性 BFS + 可选 AI 归类）；PNG 由前端画布生成、无服务端渲染；导出格式为 Markdown/Mermaid/OPML（不生成 XMind）；冻结后不可解冻，需求重开后的增量重校验归 P7；`impactCases` 只是 P4 候选映射的只读提示。
 
+## P6 用例执行（executor + 证据 + 暂停/恢复 + 报告）
+
+P6 新增 `execution` 限界上下文：在 `executing` 版本上创建运行批次，由真实 Playwright executor（协议 A′）执行基线用例，记录步骤/断言/截图/HTTP 证据，支持优雅/立即暂停与检查点恢复、重启恢复、四态判定与失败分类（application/environment/session/model/case）、Batch 1 JSON/Markdown 报告，以及登录配方（`auth_flow`）驱动的自动登录、Session 失效重取与 MFA 人工接管。版本状态与暂停标记由 version 上下文镜像（`paused`/`pause_mode`/`batch_no`）。
+
+- 迁移：`order.txt` 在 P5 迁移之后追加 `execution_0001_batches.sql`（`run_batch`/`case_run`/`step_result`/`assertion_result`/`evidence`/`evidence_ref` 6 表）、`version_0004_execution_state.sql`（version 的 3 个执行列）与 `resource_0006_auth_flows.sql`（`auth_flow` + `account_system_access.login_flow_id`）。
+- API 前缀 `/api/versions/{id}`：`batches`（创建/列表/详情/暂停/恢复/取消）、`batches/{batchId}/case-runs[/{caseRunId}][/rerun]`、`batches/{batchId}/report[/export]`、`evidence/{evidenceId}[/meta]`、`execution/sessions`；登录配方 `/api/resources/auth-flows`（admin-only）。所有 execution ID 在 JSON/URL/事件/工具参数中都是十进制字符串。
+- 执行事件（16 个）走既有 `version:{id}` 通道：`batch.created|started|paused|resumed|finished`、`run.started|paused|resumed|finished`、`step.started|finished`、`evidence.created`、`case.status_changed`、`human.requested`、`gate.pending`、`gate.resolved`。
+- 证据只写不改：文件位于 `EZTEST_EVIDENCE_DIR`（默认 `.data/evidence`）下的 `{batch_id}/{case_run_id}/{evidence_id}.{ext}`，DB 只存相对路径 + sha256 + 大小；读取校验归属与哈希，响应带 `X-Content-SHA256`，不暴露文件系统路径。
+- 失败分类：`failed(application)` 只来自有证据的断言失败；环境不可达/白名单 → `blocked(environment)`；Session 401/登录失败且重取一次仍失败 → `blocked(session)`；LLM/预算/工具内部错误 → `inconclusive(model)`；db 断言 → `inconclusive(case)`，绝不假通过。
+- 端口（本机）：API `13333`、Playwright executor `13336`、fixture target `13335`、fake LLM `13334`、Web `6868`、PostgreSQL `5433`。executor 与 API 共享 `EZTEST_EXECUTOR_TOKEN`；executor 默认仅绑定回环，Compose 内网不发布宿主端口。
+
+P6 验收命令（仓库根）：
+
+```powershell
+# 终端 1：Playwright executor（读取 .env 的 EZTEST_EXECUTOR_TOKEN）
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/dev-executor.ps1
+
+# P6 Go 单元 + 集成（executor 协议/判定/调度/恢复/报告/HTTP 契约）
+cd backend
+..\.tools\go\bin\go.exe test -count=1 ./internal/execution/...
+$env:EZTEST_TEST_DATABASE_URL = "<eztest_test URL>"
+..\.tools\go\bin\go.exe test -tags=integration -count=1 ./internal/execution/...
+
+# executor 自测（node --test，不依赖数据库）
+cd ..\executor
+pnpm test
+
+# P6 E2E（fake LLM + 真实 executor + fixture；仓库根）
+cd ..
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1 execution
+
+# 静态验收（交付物/迁移/OpenAPI/env/README，不启动数据库/API/executor）
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1 -StaticOnly
+
+# 完整 P0–P6 验收（P6 区块会自行启动 fixture/fake LLM/executor 与 API；
+# 缺 executor/fixture/fake LLM 时 14 个 P6 API 子检查记录 SKIPPED，静态检查仍须 PASS；
+# 其中 MFA 自动登录接管检查会经 /p6/login?mfa=1 走到 blocked(session)）
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1
+
+# 真实 LLM 验收（gated；gated 脚本会重建 eztest_p6_llm、真实模型执行 3 条用例 +
+# 失败分类/暂停/重启/报告；缺 llm_* 键、executor 或健康检查失败即失败而非跳过）
+$env:EZTEST_RUN_REAL_LLM = "1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance-execution-llm.ps1
+
+# DryRun（只校验路径/env 键名/DB URL/工具链，不调用 LLM）
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance-execution-llm.ps1 -DryRun
+```
+
+P6 证据与结果位置：
+
+- MFA 自动登录接管验收：fixture 的 `/p6/login?mfa=1` 页面把查询串保留到表单 `action`，登录配方因此停在 `#mfa` 且不下发会话 Cookie；接受检查断言 `blocked(session, takeover_required)` + `needs_manual` 会话 + waiting takeover + `human.requested`/`gate.pending`。随后用普通 fixture 登录导出的 `storageState` 调用 `POST /api/resources/takeovers/{id}/complete`，断言 `gate.resolved(takeover_completed)`、新 attempt 自动入队并最终 `passed`；若后端未持久化 `case_run.session_id`，该子路径会以明确的 SKIP/限制记录而不是假通过。
+- `scripts/acceptance.ps1` 的 P6 证据根：`.tmp/p6-evidence/`（每批次/用例/证据 ID 分目录）；API/executor/fake LLM/fixture 日志在 `.tmp/acceptance-p6-*.log`。
+- 真实 LLM 验收证据根：`.tmp/p6-real-evidence/`；结果 JSON：`.tmp/p6-real-acceptance.json`（只含状态/ID/计数/耗时，不含 prompt、密钥或证据正文）。
+- P6 环境变量：`EZTEST_EXECUTOR_URL`、`EZTEST_EXECUTOR_TOKEN`、`EZTEST_EVIDENCE_DIR`、`EZTEST_EXEC_MAX_CONCURRENT_CASES`（1–8）、`EZTEST_EXEC_MAX_TOOL_CALLS`（1–1000）、`EZTEST_EXEC_CASE_TIMEOUT_MS`（1000–3600000）、`EZTEST_EXEC_MAX_CASES_PER_BATCH`（1–1000）、`EZTEST_EXEC_WORKER_INTERVAL_MS`（100–60000）、`EZTEST_EXEC_EVIDENCE_MAX_BYTES`（1 KiB–100 MiB）、`EZTEST_EXEC_EVIDENCE_PER_CASE`（1–1000），默认值与说明见 `.env.example` P6 段。
+- 运行环境要求：Node 20+、Playwright 1.64.1 的 Chromium（或系统 Chrome/Edge，executor 会回退 channel `chrome`/`msedge`）、本机 PostgreSQL；真实 LLM 验收额外需要可用的 `llm_base_url`/`llm_key`/`llm_model_name` 与网络。
+
+P6 已知限制：单进程调度（多实例分布式租约归 P8）；不支持 db 断言（出现即 `inconclusive(case)`）；不做用例级自动重跑（应用失败仅手动 rerun）；证据无 GC/删除 API；真实 LLM 的分类/暂停结果受模型行为影响，脚本在不符合预期时 fail-closed。
+
 ## 技术架构
 
 ### 后端（`backend/`）
