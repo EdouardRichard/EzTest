@@ -66,9 +66,9 @@ type runExecution struct {
 	actor   *int64
 	caller  LLMCaller
 	emitter *activityEmitter
-	// scope is the P6 execution scope of this run; the zero value for P1–P5
-	// runs. It is per-execution state, never service-wide, so scopes cannot
-	// leak between runs.
+	// scope is the P6/P7 execution scope of this run; the zero value for
+	// P1–P5 runs. It is per-execution state, never service-wide, so scopes
+	// cannot leak between runs.
 	scope domain.RunScope
 
 	startedAt       time.Time
@@ -403,14 +403,17 @@ func (ex *runExecution) executeTools(ctx context.Context, calls []domain.ToolCal
 		ex.lastToolName = call.Name
 		ex.lastToolPending = true
 		execution := ex.service.deps.Executor.Execute(ctx, ToolCallInput{
-			RunID:       ex.runID,
-			SessionID:   ex.session.ID,
-			ActorUserID: ex.actor,
-			ProfileKey:  ex.profile.Key,
-			BatchID:     ex.scope.BatchID,
-			CaseRunID:   ex.scope.CaseRunID,
-			Call:        call,
-			Allowed:     ex.profile.AllowedTools,
+			RunID:           ex.runID,
+			SessionID:       ex.session.ID,
+			ActorUserID:     ex.actor,
+			ProfileKey:      ex.profile.Key,
+			VersionID:       ex.scope.VersionID,
+			BatchID:         ex.scope.BatchID,
+			CaseRunID:       ex.scope.CaseRunID,
+			SupplementRunID: ex.scope.SupplementRunID,
+			AnalysisRunID:   ex.scope.AnalysisRunID,
+			Call:            call,
+			Allowed:         ex.profile.AllowedTools,
 		})
 		ex.lastToolPending = false
 

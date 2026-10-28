@@ -139,10 +139,11 @@ func (r *ToolRegistry) ToolInfos() []domain.ToolInfo {
 // ToolCallInput is one tool invocation requested by the model.
 type ToolCallInput struct {
 	RunID, SessionID int64
-	// BatchID and CaseRunID are the P6 execution scope of the run. They ride
-	// along in the Invocation context unchanged and stay zero for P1–P5 runs.
-	BatchID, CaseRunID int64
-	ActorUserID        *int64
+	// VersionID, BatchID, CaseRunID, SupplementRunID and AnalysisRunID are the
+	// P6/P7 scope of the run. They ride along in the Invocation context
+	// unchanged and stay zero for P1–P5 runs.
+	VersionID, BatchID, CaseRunID, SupplementRunID, AnalysisRunID int64
+	ActorUserID                                                   *int64
 	// ProfileKey is the key of the profile that owns the run. The executor
 	// forwards it in the Invocation context together with the run, session and
 	// actor identity.
@@ -221,12 +222,15 @@ func (e *ToolExecutor) run(ctx context.Context, in ToolCallInput) (execution Too
 // identity the executor was given; a value a caller left in ctx is replaced.
 func (e *ToolExecutor) invoke(ctx context.Context, tool domain.Tool, args json.RawMessage, in ToolCallInput) ToolExecution {
 	toolCtx := WithToolInvocation(ctx, Invocation{
-		SessionID:   in.SessionID,
-		RunID:       in.RunID,
-		ActorUserID: in.ActorUserID,
-		ProfileKey:  in.ProfileKey,
-		BatchID:     in.BatchID,
-		CaseRunID:   in.CaseRunID,
+		SessionID:       in.SessionID,
+		RunID:           in.RunID,
+		ActorUserID:     in.ActorUserID,
+		ProfileKey:      in.ProfileKey,
+		VersionID:       in.VersionID,
+		BatchID:         in.BatchID,
+		CaseRunID:       in.CaseRunID,
+		SupplementRunID: in.SupplementRunID,
+		AnalysisRunID:   in.AnalysisRunID,
 	})
 	if timeout := e.toolTimeout(tool); timeout > 0 {
 		var cancel context.CancelFunc
