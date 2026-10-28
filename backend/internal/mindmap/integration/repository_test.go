@@ -548,9 +548,10 @@ func TestApprovedReviewUnique(t *testing.T) {
 	if decided.DecidedBy == nil || *decided.DecidedBy != 42 || decided.DecidedAt == nil {
 		t.Fatalf("decided review actor/at = %v/%v", decided.DecidedBy, decided.DecidedAt)
 	}
-	// Deciding an already-decided review is a conflict.
+	// Deciding an already-approved review is a baseline_frozen conflict: the
+	// version is frozen once its review is approved.
 	_, err = repo.Decide(ctx, draft.ID, domain.ReviewRejected, "", 42)
-	requireDomainError(t, err, domain.KindConflict, "conflict")
+	requireDomainError(t, err, domain.KindConflict, "baseline_frozen")
 
 	_, err = repo.Decide(ctx, 999999, domain.ReviewApproved, "", 42)
 	requireDomainError(t, err, domain.KindNotFound, "review_not_found")
@@ -647,8 +648,10 @@ func TestCaseSourceUniqueRef(t *testing.T) {
 	first, err := repo.Create(ctx, newCaseSource(1602, testVersion, node.ID, domain.RefRequirement, &requirementID, "req-801"))
 	requireNoError(t, err, "create source")
 
+	// A duplicate of the (node, ref kind, ref id, ref key) source has its own
+	// reason so clients can point at the reused requirement.
 	_, err = repo.Create(ctx, newCaseSource(1603, testVersion, node.ID, domain.RefRequirement, &requirementID, "req-801"))
-	requireDomainError(t, err, domain.KindConflict, "conflict")
+	requireDomainError(t, err, domain.KindConflict, "duplicate_case_source")
 
 	// The ref_key is part of the dedup key.
 	_, err = repo.Create(ctx, newCaseSource(1604, testVersion, node.ID, domain.RefRequirement, &requirementID, "req-801-alt"))
@@ -728,9 +731,9 @@ func TestExportReuseLookup(t *testing.T) {
 	}
 
 	// A second export of the same frozen (version, format, baseline) is a
-	// conflict, backed by uk_case_export_baseline.
+	// frozen-state race: export_conflict, backed by uk_case_export_baseline.
 	_, err = repo.Create(ctx, newExport(1705, testVersion, domain.ExportMarkdown, &baseline.ID, testTime.Add(2*time.Minute)))
-	requireDomainError(t, err, domain.KindConflict, "conflict")
+	requireDomainError(t, err, domain.KindConflict, "export_conflict")
 
 	_, err = repo.Get(ctx, testVersion, 999999)
 	requireDomainError(t, err, domain.KindNotFound, "export_not_found")
@@ -847,6 +850,30 @@ func TestReviewFindingFlows(t *testing.T) {
 	}
 }
 
+// TestFindingRepositoryCreateBatchAtomic proves the pool-bound repository wraps
+// the whole finding batch in one transaction: a constraint failure on any
+// element persists none of the earlier ones.
+func TestFindingRepositoryCreateBatchAtomic(t *testing.T) {
+	pool := testutil.OpenTestDB(t)
+	ctx := context.Background()
+	reviewRepo := postgres.NewReviewRepository(pool)
+	repo := postgres.NewFindingRepository(pool)
+
+	review, err := reviewRepo.Create(ctx, newReview(1951, testVersion, domain.ReviewDraft, testTime))
+	requireNoError(t, err, "create review")
+
+	valid := newFinding(1952, review.ID, nil, domain.SeverityMinor, domain.FindingOpen)
+	// A non-existent review id violates the review_id foreign key after the
+	// first (valid) finding of the batch has already been inserted.
+	broken := newFinding(1953, 999999, nil, domain.SeverityMinor, domain.FindingOpen)
+	err = repo.CreateBatch(ctx, []domain.CaseReviewFinding{valid, broken})
+	if err == nil {
+		t.Fatal("CreateBatch with a missing review id returned no error")
+	}
+	assertCount(t, ctx, pool, "case_review_finding", "id", valid.ID, 0)
+	assertCount(t, ctx, pool, "case_review_finding", "id", broken.ID, 0)
+}
+
 // mustListFindings lists findings and fails on error.
 func mustListFindings(t *testing.T, ctx context.Context, repo application.FindingRepository, versionID int64, status, severity string) []domain.CaseReviewFinding {
 	t.Helper()
@@ -939,6 +966,11 @@ func TestStepAssertionRepositoryCRUD(t *testing.T) {
 	_, err = stepRepo.Create(ctx, newCaseStep(2105, nodeB.ID, 1))
 	requireNoError(t, err, "create step for node b")
 
+	// A step written onto a seq another step of the same node holds is a
+	// concurrent child-write mismatch: case_revision_conflict.
+	_, err = stepRepo.Create(ctx, newCaseStep(2108, nodeA.ID, 1))
+	requireDomainError(t, err, domain.KindStateConflict, "case_revision_conflict")
+
 	steps, err := stepRepo.ListByVersion(ctx, testVersion)
 	requireNoError(t, err, "list steps")
 	if len(steps) != 3 || steps[0].ID != step1.ID || steps[1].ID != step2.ID || steps[2].ID != 2105 {
@@ -966,6 +998,12 @@ func TestStepAssertionRepositoryCRUD(t *testing.T) {
 	if steps[0].ID != step2.ID || steps[0].Seq != 1 || steps[1].ID != step1.ID || steps[1].Seq != 2 {
 		t.Fatalf("reordered steps = %+v", steps)
 	}
+
+	// Moving step 1 onto step 2's seq is the same node-level write collision.
+	clashing := step1
+	clashing.Seq = 1
+	requireDomainError(t, stepRepo.Update(ctx, clashing),
+		domain.KindStateConflict, "case_revision_conflict")
 
 	// Steps are deletable by (node, step) and a missing row is a step_not_found.
 	requireNoError(t, stepRepo.Delete(ctx, nodeA.ID, step2.ID), "delete step")
@@ -1063,6 +1101,37 @@ func TestStepRepositoryReplaceSeqFullOccupancy(t *testing.T) {
 	if len(assertions) != 1 || assertions[0].StepID == nil || *assertions[0].StepID != steps[0].ID {
 		t.Fatalf("assertions after rebuild = %+v", assertions)
 	}
+}
+
+// TestStepRepositoryReplaceSeqLocksNode covers the node row lock taken at the
+// start of ReplaceSeq: sequential reorders of the same case both succeed, and a
+// missing node is node_not_found before any step lookup can report step_not_found.
+func TestStepRepositoryReplaceSeqLocksNode(t *testing.T) {
+	pool := testutil.OpenTestDB(t)
+	ctx := context.Background()
+	nodeRepo := postgres.NewNodeRepository(pool)
+	stepRepo := postgres.NewStepRepository(pool)
+
+	node := mustCreateNode(t, nodeRepo, newCaseNode(2401, testVersion, nil, domain.NodeKindCase, "case"))
+	first, err := stepRepo.Create(ctx, newCaseStep(2402, node.ID, 1))
+	requireNoError(t, err, "create step 1")
+	second, err := stepRepo.Create(ctx, newCaseStep(2403, node.ID, 2))
+	requireNoError(t, err, "create step 2")
+
+	// Two sequential reorders exercise the lock path twice and must both commit.
+	requireNoError(t, stepRepo.ReplaceSeq(ctx, node.ID, []int64{second.ID, first.ID}), "first reorder")
+	requireNoError(t, stepRepo.ReplaceSeq(ctx, node.ID, []int64{first.ID, second.ID}), "second reorder")
+
+	steps, err := stepRepo.ListByVersion(ctx, testVersion)
+	requireNoError(t, err, "list steps")
+	if len(steps) != 2 || steps[0].ID != first.ID || steps[0].Seq != 1 ||
+		steps[1].ID != second.ID || steps[1].Seq != 2 {
+		t.Fatalf("steps after reorders = %+v", steps)
+	}
+
+	// The row lock resolves the node first: a missing node is node_not_found.
+	err = stepRepo.ReplaceSeq(ctx, 999999, []int64{first.ID, second.ID})
+	requireDomainError(t, err, domain.KindNotFound, "node_not_found")
 }
 
 // TestGraphTxInTxCommitsAndRollsBack proves the graph transaction either writes
