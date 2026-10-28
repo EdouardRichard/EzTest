@@ -911,9 +911,9 @@ try {
     if ($environment.Status -ne 201) { throw "POST environment returned HTTP $($environment.Status)" }
     $script:state.EnvironmentId = $environment.Data.id
     foreach ($appModel in @(
-            @{ key = "real-home"; kind = "page"; name = "P5 fixture home"; path = "/p5/home"; method = "" },
-            @{ key = "real-orders"; kind = "route"; name = "P5 fixture orders"; path = "/p5/orders"; method = "" },
-            @{ key = "real-api-orders"; kind = "api"; name = "P5 fixture orders API"; path = "/api/orders"; method = "GET" }
+            @{ key = "page:/manual/home"; kind = "page"; name = "P5 manual home"; path = "/manual/home"; method = "" },
+            @{ key = "route:/manual/orders"; kind = "route"; name = "P5 manual orders"; path = "/manual/orders"; method = "" },
+            @{ key = "api:GET /manual/orders"; kind = "api"; name = "P5 manual orders API"; path = "/manual/orders"; method = "GET" }
         )) {
         $created = Invoke-Api -Method Post -Uri "$apiBaseUrl/api/resources/systems/$($script:state.SystemId)/app-models" -Headers $adminHeaders -Body $appModel
         if ($created.Status -ne 201) { throw "POST app model returned HTTP $($created.Status)" }
