@@ -42,6 +42,9 @@ $fixtureBaseUrl = "http://127.0.0.1:$fixturePort"
 $executorBaseUrl = "http://127.0.0.1:$executorPort"
 $p3AttachmentDir = Join-Path $tmpDir "p3-attachments"
 $evidenceDir = Join-Path $tmpDir "e2e-evidence"
+# P7 delivery report Markdown store (design spec §6.5/D30). A throwaway path
+# under .tmp keeps report files out of the repository and is cleaned on exit.
+$reportDir = Join-Path $tmpDir "e2e-reports"
 $executorDir = Join-Path $repoRoot "executor"
 $p4FixtureScript = Join-Path $PSScriptRoot "fixture-codeintel-repo.ps1"
 
@@ -378,6 +381,12 @@ try {
         $env:EZTEST_FAKE_LLM_P4_MODE = "ok"
     }
     Write-Host "P4 fake LLM mode: $env:EZTEST_FAKE_LLM_P4_MODE"
+    # P7 fake-agent scenario switch (design spec §12.5): normal|noop|degraded|
+    # invalid. The P7 specs switch it per scenario and always reset it to normal.
+    if ([string]::IsNullOrWhiteSpace($env:EZTEST_FAKE_LLM_P7_MODE)) {
+        $env:EZTEST_FAKE_LLM_P7_MODE = "normal"
+    }
+    Write-Host "P7 fake LLM mode: $env:EZTEST_FAKE_LLM_P7_MODE"
     Remove-Item -LiteralPath $fakeOut, $fakeErr, $fakeRequestLog -ErrorAction SilentlyContinue
     $fakeProcess = Start-Process -FilePath $nodeExe `
         -ArgumentList "`"scripts/fake-llm.cjs`"" `
@@ -398,6 +407,24 @@ try {
     $env:EZTEST_EVIDENCE_DIR = $evidenceDir
     $env:EZTEST_EXECUTOR_URL = $executorBaseUrl
     $env:EZTEST_EXECUTOR_TOKEN = $executorToken
+    # P7 report Markdown store (spec §6.5/D30). The API creates it on boot; a
+    # stale directory from an interrupted run is removed first.
+    if (Test-Path -LiteralPath $reportDir) {
+        Remove-Item -LiteralPath $reportDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    $env:EZTEST_REPORT_DIR = $reportDir
+    # A bigger per-tick batch budget keeps the multi-batch autonomous chains of
+    # the P7 specs from queueing behind each other (spec §6.2).
+    if ([string]::IsNullOrWhiteSpace($env:EZTEST_AUTONOMY_BATCHES_PER_TICK)) {
+        $env:EZTEST_AUTONOMY_BATCHES_PER_TICK = "8"
+    }
+    # The E2E fixture exposes one imported session per access (P6 seed). Running
+    # one case at a time lets the multi-case supplement/incremental batches of
+    # the P7 specs reuse that session instead of blocking the extra cases with
+    # no_session; the P6 specs themselves execute a single case at a time.
+    if ([string]::IsNullOrWhiteSpace($env:EZTEST_EXEC_MAX_CONCURRENT_CASES)) {
+        $env:EZTEST_EXEC_MAX_CONCURRENT_CASES = "1"
+    }
 
     Write-Step "Starting API on :$apiPort (database $e2eDbName)"
     # cmd/eztest applies all pending migrations (including P4 codeintel) on
@@ -504,6 +531,20 @@ try {
     # health URL and the process id for the executor-down 503 negative.
     $env:EZTEST_E2E_EXECUTOR_URL = $executorBaseUrl
     $env:EZTEST_E2E_EXECUTOR_PID = "$($executorProcess.Id)"
+    # The P7 db-config spec fills the real local PostgreSQL target through the
+    # admin form. It reuses the e2e server/role (the role has CREATEDB, which is
+    # exactly the write-privilege warning the spec asserts); the password is
+    # only handed to the browser form and is never printed by this script.
+    $dbSslMode = "disable"
+    if ($databaseUrl -match '[?&]sslmode=([^&]+)') {
+        $dbSslMode = [System.Uri]::UnescapeDataString($matches[1])
+    }
+    $env:EZTEST_E2E_DB_TARGET_HOST = $dbHost
+    $env:EZTEST_E2E_DB_TARGET_PORT = "$dbPort"
+    $env:EZTEST_E2E_DB_TARGET_DATABASE = $e2eDbName
+    $env:EZTEST_E2E_DB_TARGET_USERNAME = $dbUser
+    $env:EZTEST_E2E_DB_TARGET_PASSWORD = $dbPassword
+    $env:EZTEST_E2E_DB_TARGET_SSLMODE = $dbSslMode
     # The harness may set both NO_COLOR and FORCE_COLOR; Node then prints a
     # warning to stderr, which Windows PowerShell surfaces as a noisy error
     # record while the Playwright output is redirected to a file.
@@ -516,8 +557,41 @@ try {
     $previous = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        & $playwright test @PlaywrightArgs *> $playwrightLog
-        $playwrightExit = $LASTEXITCODE
+        $playwrightExit = 0
+        if ($PlaywrightArgs.Count -gt 0) {
+            # A caller-provided filter/path runs exactly as before.
+            & $playwright test @PlaywrightArgs *>> $playwrightLog
+            $playwrightExit = $LASTEXITCODE
+        } else {
+            # The P6 execution spec deliberately stops the real executor at its
+            # end (executor-down 503 negative), so every spec that needs the
+            # executor has to run before it. The default suite therefore runs in
+            # three ordered phases: the existing suite, the P7 suite, and finally
+            # execution.spec.ts (which owns the executor shutdown).
+            $specFiles = @(Get-ChildItem -Path (Join-Path $frontendDir "e2e") -Filter "*.spec.ts" |
+                ForEach-Object { $_.Name })
+            $p7Specs = @($specFiles | Where-Object { $_ -like "p7-*.spec.ts" })
+            $executionSpecs = @($specFiles | Where-Object { $_ -like "*execution.spec.ts" })
+            $bulkSpecs = @($specFiles | Where-Object {
+                $_ -notlike "p7-*.spec.ts" -and $_ -notlike "*execution.spec.ts"
+            })
+            $phases = @(
+                @{ Label = "existing suite (P0-P6)"; Files = $bulkSpecs },
+                @{ Label = "P7 autonomous-loop suite"; Files = $p7Specs },
+                @{ Label = "execution suite (owns the executor shutdown)"; Files = $executionSpecs }
+            )
+            foreach ($phase in $phases) {
+                if ($phase.Files.Count -eq 0) { continue }
+                Write-Host ""
+                Write-Host "--- Playwright phase: $($phase.Label) ---" -ForegroundColor Cyan
+                Add-Content -LiteralPath $playwrightLog -Value "`n--- Playwright phase: $($phase.Label) ---"
+                & $playwright test @($phase.Files) *>> $playwrightLog
+                if ($LASTEXITCODE -ne 0) {
+                    $playwrightExit = $LASTEXITCODE
+                    break
+                }
+            }
+        }
     } finally {
         $ErrorActionPreference = $previous
         Pop-Location
@@ -560,16 +634,20 @@ try {
         }
     }
     Remove-Item Env:EZTEST_E2E_ADMIN_PASSWORD -ErrorAction SilentlyContinue
+    Remove-Item Env:EZTEST_E2E_DB_TARGET_PASSWORD -ErrorAction SilentlyContinue
     Remove-Item Env:PGPASSWORD -ErrorAction SilentlyContinue
     # The executor token is only needed by the API/executor children above.
     Remove-Item Env:EZTEST_EXECUTOR_TOKEN -ErrorAction SilentlyContinue
-    # The attachment root, the evidence store and the P3 throwaway resources are
-    # test-only files.
+    # The attachment root, the evidence/report stores and the P3 throwaway
+    # resources are test-only files.
     if (Test-Path -LiteralPath $p3AttachmentDir) {
         Remove-Item -LiteralPath $p3AttachmentDir -Recurse -Force -ErrorAction SilentlyContinue
     }
     if (Test-Path -LiteralPath $evidenceDir) {
         Remove-Item -LiteralPath $evidenceDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if (Test-Path -LiteralPath $reportDir) {
+        Remove-Item -LiteralPath $reportDir -Recurse -Force -ErrorAction SilentlyContinue
     }
     Remove-Item -LiteralPath (Join-Path $tmpDir "p3-e2e-repo") -Recurse -Force -ErrorAction SilentlyContinue
 }
