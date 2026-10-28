@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"testing"
@@ -108,6 +109,104 @@ func TestTeardownClosesToolOwnedCaseContext(t *testing.T) {
 	}
 	if got := world.browser.canceledIDs(); len(got) != 0 {
 		t.Fatalf("CancelCase calls = %v, want none", got)
+	}
+}
+
+// TestCaseRunnerHonorsPauseWhenAgentEnds pins the pause/terminal race: a pause
+// that cancelled or ended the agent run must be honored before the terminal
+// state is classified. Otherwise the case run is classified inconclusive even
+// though the user asked for a graceful park or an immediate interrupt.
+func TestCaseRunnerHonorsPauseWhenAgentEnds(t *testing.T) {
+	cases := []struct {
+		name        string
+		state       AgentRunState
+		mode        domain.PauseMode
+		wantStatus  domain.CaseRunStatus
+		wantCleanup bool
+		wantStepSeq *int
+	}{
+		{
+			name:       "graceful parks an aborted agent run",
+			state:      AgentRunState{Status: "aborted", Error: "canceled by pause", TerminalReason: "shutdown"},
+			mode:       domain.PauseModeGraceful,
+			wantStatus: domain.CaseRunStatusPending,
+		},
+		{
+			name:       "graceful parks a terminal run without case_finish",
+			state:      AgentRunState{Status: "done", TerminalReason: "completed"},
+			mode:       domain.PauseModeGraceful,
+			wantStatus: domain.CaseRunStatusPending,
+		},
+		{
+			name:        "immediate interrupts an aborted agent run",
+			state:       AgentRunState{Status: "canceled", TerminalReason: "shutdown"},
+			mode:        domain.PauseModeImmediate,
+			wantStatus:  domain.CaseRunStatusInterrupted,
+			wantCleanup: true,
+			wantStepSeq: intPointer(2),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runner, world := newCaseRunnerHarness(t)
+			run := runningCaseRun(t, world)
+			world.steps.seed(domain.StepResult{
+				ID: 11, BatchID: run.BatchID, CaseRunID: run.ID, Seq: 1,
+				Status: domain.StepStatusPassed,
+			})
+			world.steps.seed(domain.StepResult{
+				ID: 12, BatchID: run.BatchID, CaseRunID: run.ID, Seq: 2,
+				Status: domain.StepStatusRunning,
+			})
+			world.runtime.setState(tc.state)
+			world.batches.setPaused(run.BatchID, true, tc.mode)
+
+			runner.Run(context.Background(), run, SessionRef{SessionID: 500}, world.sessions.environment)
+
+			stored := world.run(t, run.ID)
+			if stored.Status != tc.wantStatus {
+				t.Fatalf("status = %s, want %s (class=%v reason=%q)",
+					stored.Status, tc.wantStatus, stored.FailureClass, stored.FailureReason)
+			}
+			if stored.Attempt != run.Attempt {
+				t.Fatalf("attempt = %d, want %d unchanged", stored.Attempt, run.Attempt)
+			}
+			if stored.FailureClass != nil {
+				t.Fatalf("failure class = %s, want no classification", *stored.FailureClass)
+			}
+			if tc.wantStatus == domain.CaseRunStatusPending &&
+				(stored.CleanupRequired || stored.InterruptedStepSeq != nil || stored.FinishedAt != nil) {
+				t.Fatalf("a graceful park must keep the checkpoint clean: %+v", stored)
+			}
+			if stored.CleanupRequired != tc.wantCleanup {
+				t.Fatalf("cleanup_required = %v, want %v", stored.CleanupRequired, tc.wantCleanup)
+			}
+			if !reflect.DeepEqual(stored.InterruptedStepSeq, tc.wantStepSeq) {
+				t.Fatalf("interrupted_step_seq = %v, want %v",
+					stored.InterruptedStepSeq, tc.wantStepSeq)
+			}
+		})
+	}
+}
+
+// TestCaseRunnerHonorsPauseWhenAgentReadFails pins the error terminal path: a
+// runtime read failure that races a pause must park the run, not classify it as
+// an internal failure.
+func TestCaseRunnerHonorsPauseWhenAgentReadFails(t *testing.T) {
+	runner, world := newCaseRunnerHarness(t)
+	run := runningCaseRun(t, world)
+	world.runtime.getErr = errors.New("agent runtime unavailable")
+	world.batches.setPaused(run.BatchID, true, domain.PauseModeGraceful)
+
+	runner.Run(context.Background(), run, SessionRef{SessionID: 500}, world.sessions.environment)
+
+	stored := world.run(t, run.ID)
+	if stored.Status != domain.CaseRunStatusPending {
+		t.Fatalf("status = %s, want pending (class=%v reason=%q)",
+			stored.Status, stored.FailureClass, stored.FailureReason)
+	}
+	if stored.FailureClass != nil {
+		t.Fatalf("failure class = %s, want no classification", *stored.FailureClass)
 	}
 }
 

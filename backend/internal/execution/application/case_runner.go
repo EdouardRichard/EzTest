@@ -135,6 +135,9 @@ func (r *CaseRunner) Run(ctx context.Context, run domain.CaseRun, session Sessio
 		CleanupRequired:    run.CleanupRequired,
 	})
 	if err != nil {
+		if r.honorPauseBeforeTerminal(ctx, run, session) {
+			return
+		}
 		r.finishOutcome(ctx, run, toolCodeForError(err), err.Error(), 0, session)
 		return
 	}
@@ -152,6 +155,9 @@ func (r *CaseRunner) Run(ctx context.Context, run domain.CaseRun, session Sessio
 					return
 				}
 				r.handleShutdown(ctx, run, agent.SessionID, session)
+				return
+			}
+			if r.honorPauseBeforeTerminal(ctx, run, session) {
 				return
 			}
 			r.finishOutcome(ctx, run, toolCodeForError(err), err.Error(), 0, session)
@@ -183,9 +189,14 @@ func (r *CaseRunner) Run(ctx context.Context, run domain.CaseRun, session Sessio
 
 // afterAgentTerminal resolves the case run after the agent run ended. A finish
 // submitted by the agent is authoritative: the run is already terminal and only
-// cleanup remains. Otherwise the terminal agent state is classified server side
-// (an agent that stops without case_finish must not become failed).
+// cleanup remains. A pause that ended (canceled/aborted) the agent run must be
+// honored first: the terminal state came from the pause, so it must not be
+// classified. Otherwise the terminal agent state is classified server side (an
+// agent that stops without case_finish must not become failed).
 func (r *CaseRunner) afterAgentTerminal(ctx context.Context, run domain.CaseRun, state AgentRunState, session SessionRef) {
+	if r.honorPauseBeforeTerminal(ctx, run, session) {
+		return
+	}
 	current, err := r.deps.CaseRuns.GetCaseRun(ctx, run.BatchID, run.ID)
 	if err == nil && isTerminalCaseRun(current.Status) {
 		r.teardown(ctx, current, session.SessionID)
@@ -217,57 +228,96 @@ func (r *CaseRunner) handlePause(ctx context.Context, run domain.CaseRun, mode d
 	}
 
 	_ = r.deps.Runtime.CancelRun(context.WithoutCancel(ctx), agentSessionID)
+	r.applyPause(ctx, run, mode, session)
+}
 
+// honorPauseBeforeTerminal re-checks the authoritative batch pause flag before a
+// terminal/error path classifies the case run. A pause may have canceled or
+// aborted the agent run before the runner observed the flag; classifying that
+// terminal state would turn the requested park/interrupt into inconclusive. It
+// reports whether the pause consumed the path.
+func (r *CaseRunner) honorPauseBeforeTerminal(ctx context.Context, run domain.CaseRun, session SessionRef) bool {
+	batch, ok := r.pauseRequested(ctx, run)
+	if !ok || !batch.Paused {
+		return false
+	}
+	current, err := r.deps.CaseRuns.GetCaseRun(ctx, run.BatchID, run.ID)
+	if err == nil && isTerminalCaseRun(current.Status) {
+		// The case finished before the pause landed; keep its verdict.
+		r.teardown(ctx, current, session.SessionID)
+		return true
+	}
+	if current.ID != 0 {
+		run = current
+	}
+	r.applyPause(ctx, run, pauseModeOf(batch), session)
+	return true
+}
+
+// applyPause parks (graceful) or interrupts (immediate) a running case run. The
+// agent run may already be terminal because the pause canceled it; the caller
+// owns canceling it when needed.
+func (r *CaseRunner) applyPause(ctx context.Context, run domain.CaseRun, mode domain.PauseMode, session SessionRef) {
 	if mode == domain.PauseModeImmediate {
-		if r.deps.Browser != nil {
-			_ = r.deps.Browser.CancelCase(context.WithoutCancel(ctx), run.ID)
-		}
-		now := r.now()
-		interruptedStep := r.interruptedStepSeq(ctx, run)
-		interrupted := run
-		interrupted.Status = domain.CaseRunStatusInterrupted
-		interrupted.FailureClass = nil
-		interrupted.FailureReason = runPauseReason
-		interrupted.CleanupRequired = true
-		interrupted.InterruptedStepSeq = interruptedStep
-		interrupted.FinishedAt = timePointer(now)
-		interrupted.UpdatedAt = now
-		if run.StartedAt != nil {
-			interrupted.DurationMS = nonNegativeMillis(now.Sub(*run.StartedAt))
-		}
-		stored, err := r.deps.CaseRuns.FinishCaseRun(ctx, interrupted)
-		if err != nil {
-			slog.WarnContext(ctx, "execution: interrupt case run failed",
-				"case_run_id", run.ID, "error", err)
-			r.teardown(ctx, run, session.SessionID)
-			return
-		}
-		detail := map[string]any{
-			"case_run_id": eventID(run.ID),
-			"mode":        string(domain.PauseModeImmediate),
-			"status":      string(stored.Status),
-		}
-		if interruptedStep != nil {
-			detail["interrupted_step_seq"] = *interruptedStep
-		}
-		r.publish(ctx, Event{
-			Type:      "run.paused",
-			VersionID: stored.VersionID,
-			BatchID:   stored.BatchID,
-			CaseID:    stored.CaseNodeID,
-			Summary:   "case run interrupted",
-			Detail:    detail,
-			Refs:      EventRefs{CaseIDs: []int64{stored.CaseNodeID}},
-		})
-		r.teardown(ctx, stored, session.SessionID)
+		r.interruptForPause(ctx, run, session)
 		return
 	}
+	r.parkForPause(ctx, run, session)
+}
 
-	// Graceful pause: keep the completed steps and park the same attempt as
-	// pending so a resume continues from the checkpoint (spec §5.4 invariant 4).
-	// Release the lease and the tools' context before the pending CAS: otherwise
-	// a scheduler tick could observe the pending row while the old runner still
-	// owns the resources and start a second runner for the same attempt.
+// interruptForPause records an immediate pause: the case run becomes interrupted
+// with the in-flight step and the cleanup marker, and run.paused is published
+// (spec §5.4).
+func (r *CaseRunner) interruptForPause(ctx context.Context, run domain.CaseRun, session SessionRef) {
+	if r.deps.Browser != nil {
+		_ = r.deps.Browser.CancelCase(context.WithoutCancel(ctx), run.ID)
+	}
+	now := r.now()
+	interruptedStep := r.interruptedStepSeq(ctx, run)
+	interrupted := run
+	interrupted.Status = domain.CaseRunStatusInterrupted
+	interrupted.FailureClass = nil
+	interrupted.FailureReason = runPauseReason
+	interrupted.CleanupRequired = true
+	interrupted.InterruptedStepSeq = interruptedStep
+	interrupted.FinishedAt = timePointer(now)
+	interrupted.UpdatedAt = now
+	if run.StartedAt != nil {
+		interrupted.DurationMS = nonNegativeMillis(now.Sub(*run.StartedAt))
+	}
+	stored, err := r.deps.CaseRuns.FinishCaseRun(ctx, interrupted)
+	if err != nil {
+		slog.WarnContext(ctx, "execution: interrupt case run failed",
+			"case_run_id", run.ID, "error", err)
+		r.teardown(ctx, run, session.SessionID)
+		return
+	}
+	detail := map[string]any{
+		"case_run_id": eventID(run.ID),
+		"mode":        string(domain.PauseModeImmediate),
+		"status":      string(stored.Status),
+	}
+	if interruptedStep != nil {
+		detail["interrupted_step_seq"] = *interruptedStep
+	}
+	r.publish(ctx, Event{
+		Type:      "run.paused",
+		VersionID: stored.VersionID,
+		BatchID:   stored.BatchID,
+		CaseID:    stored.CaseNodeID,
+		Summary:   "case run interrupted",
+		Detail:    detail,
+		Refs:      EventRefs{CaseIDs: []int64{stored.CaseNodeID}},
+	})
+	r.teardown(ctx, stored, session.SessionID)
+}
+
+// parkForPause applies a graceful pause: keep the completed steps and park the
+// same attempt as pending so a resume continues from the checkpoint (spec §5.4
+// invariant 4). The lease and the tools' context are released before the pending
+// CAS: otherwise a scheduler tick could observe the pending row while the old
+// runner still owns the resources and start a second runner for the same attempt.
+func (r *CaseRunner) parkForPause(ctx context.Context, run domain.CaseRun, session SessionRef) {
 	parked := run
 	parked.Status = domain.CaseRunStatusPending
 	r.releaseResources(ctx, parked, session.SessionID)
@@ -308,6 +358,9 @@ func (r *CaseRunner) handlePause(ctx context.Context, run domain.CaseRun, mode d
 // (spec §5.8 invariant 8).
 func (r *CaseRunner) finishTimeout(ctx context.Context, run domain.CaseRun, agentSessionID int64, session SessionRef) {
 	_ = r.deps.Runtime.CancelRun(context.WithoutCancel(ctx), agentSessionID)
+	if r.honorPauseBeforeTerminal(ctx, run, session) {
+		return
+	}
 	r.finishOutcome(ctx, run, "budget_exhausted", "case_timeout", r.stepEvidenceCount(ctx, run.ID), session)
 }
 
