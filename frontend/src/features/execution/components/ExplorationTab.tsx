@@ -31,9 +31,9 @@ import type { CaseRun, CaseRunStatus } from "../types"
 import { ChainGraph } from "./ChainGraph"
 import { FailureClassBadge } from "./FailureClassBadge"
 
-/** Requirements/issues fetched for the chain; keeps the graph at a sane scale. */
-const REQUIREMENT_LIMIT = 200
-const ISSUE_LIMIT = 200
+/** Requirements/issues fetched for the chain; 100 is the backend list cap. */
+const REQUIREMENT_LIMIT = 100
+const ISSUE_LIMIT = 100
 
 const BUTTON_CLASS =
   "inline-flex items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -482,7 +482,8 @@ export function ExplorationTab({
   const [requirements, setRequirements] = useState<Requirement[]>([])
   const [graph, setGraph] = useState<MindmapGraph | null>(null)
   const [metaLoading, setMetaLoading] = useState(true)
-  const [metaError, setMetaError] = useState("")
+  const [requirementsError, setRequirementsError] = useState("")
+  const [graphError, setGraphError] = useState("")
   const [requirementFilter, setRequirementFilter] = useState("")
   const [statusFilter, setStatusFilter] = useState<ChainResultFilter>("")
   const [abnormalOnly, setAbnormalOnly] = useState(false)
@@ -494,18 +495,26 @@ export function ExplorationTab({
   const loadMeta = useCallback(async (): Promise<void> => {
     const requestId = ++requestRef.current
     setMetaLoading(true)
-    setMetaError("")
+    setRequirementsError("")
+    setGraphError("")
     try {
-      const [page, view] = await Promise.all([
+      // Load the two layers independently: one failing request must not discard
+      // the other layer's data. Each failure is surfaced by name below.
+      const [requirementsResult, graphResult] = await Promise.allSettled([
         listRequirements(versionId, { limit: REQUIREMENT_LIMIT }),
         getGraph(versionId),
       ])
       if (requestRef.current !== requestId) return
-      setRequirements(page.items)
-      setGraph(view)
-    } catch (caught) {
-      if (requestRef.current !== requestId) return
-      setMetaError(describeLoadError(caught))
+      if (requirementsResult.status === "fulfilled") {
+        setRequirements(requirementsResult.value.items)
+      } else {
+        setRequirementsError(describeLoadError(requirementsResult.reason))
+      }
+      if (graphResult.status === "fulfilled") {
+        setGraph(graphResult.value)
+      } else {
+        setGraphError(describeLoadError(graphResult.reason))
+      }
     } finally {
       if (requestRef.current === requestId) setMetaLoading(false)
     }
@@ -685,7 +694,16 @@ export function ExplorationTab({
   }, [])
 
   const loading = metaLoading || (batchId !== undefined && batchId !== "" && runsLoading)
-  const error = metaError !== "" ? metaError : runsError
+  const chainLayerErrors = [
+    { layer: "需求层", message: requirementsError },
+    { layer: "用例层", message: graphError },
+    { layer: "结果层", message: runsError },
+  ].filter((entry) => entry.message !== "")
+  const chainErrorText = chainLayerErrors
+    .map((entry) => `${entry.layer}：${entry.message}`)
+    .join("；")
+  const hasChainError = chainLayerErrors.length > 0
+  const issuesUnavailable = issueQuery.error !== ""
   const hasData = layout.nodes.length > 0
   const hasUnfilteredData =
     baseInput.requirements.length + baseInput.cases.length + (baseInput.results?.length ?? 0) > 0
@@ -788,18 +806,26 @@ export function ExplorationTab({
         </label>
       </div>
 
-      {error === "" ? null : (
+      {hasChainError ? (
         <div
-          data-testid="exploration-error"
+          data-testid={hasData ? "exploration-degraded" : "exploration-error"}
           role="alert"
-          className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive"
+          className={
+            hasData
+              ? "flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-500/25 bg-amber-500/10 px-4 py-3 text-sm text-amber-700 dark:text-amber-300"
+              : "flex flex-wrap items-center justify-between gap-2 rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive"
+          }
         >
-          <p>{`加载探索链路失败：${error}`}</p>
+          <p>
+            {hasData
+              ? `部分图层加载失败（${chainErrorText}）。下图仅展示已成功加载的图层。`
+              : `加载探索链路失败：${chainErrorText}`}
+          </p>
           <button type="button" onClick={retry} className={BUTTON_CLASS}>
             重试
           </button>
         </div>
-      )}
+      ) : null}
 
       {loading && !hasData ? (
         <p
@@ -812,7 +838,7 @@ export function ExplorationTab({
         </p>
       ) : null}
 
-      {!loading && error === "" && !hasData && !hasUnfilteredData ? (
+      {!loading && !hasChainError && !hasData && !hasUnfilteredData ? (
         <div data-testid="exploration-empty">
           <EmptyState
             icon={GitBranch}
@@ -822,7 +848,7 @@ export function ExplorationTab({
         </div>
       ) : null}
 
-      {!loading && error === "" && !hasData && hasUnfilteredData ? (
+      {!loading && !hasChainError && !hasData && hasUnfilteredData ? (
         <p
           data-testid="exploration-filtered-empty"
           className="rounded-xl border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground"
@@ -866,12 +892,16 @@ export function ExplorationTab({
       >
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h3 className="text-sm font-semibold">问题节点</h3>
-          <p data-testid="chain-issue-count" className="text-xs text-muted-foreground">
-            {`${issueInputs.length} 个问题`}
+          <p
+            data-testid="chain-issue-count"
+            data-state={issuesUnavailable ? "degraded" : "ready"}
+            className="text-xs text-muted-foreground"
+          >
+            {issuesUnavailable ? "问题数据不可用" : `${issueInputs.length} 个问题`}
           </p>
         </div>
 
-        {issueQuery.error !== "" ? (
+        {issuesUnavailable ? (
           <p
             data-testid="chain-issues-degraded"
             role="alert"

@@ -408,6 +408,18 @@ describe("ExplorationTab", () => {
     expect(onNavigate).toHaveBeenCalledWith({ kind: "case", id: C2 })
   })
 
+  it("keeps every chain request within the backend's 100-item limit cap", async () => {
+    renderTab()
+
+    await screen.findByTestId(`chain-node-${R1}`)
+    expect(mocks.listRequirements).toHaveBeenCalledWith(VERSION_ID, { limit: 100 })
+    expect(mocks.useIssues).toHaveBeenCalledWith(
+      VERSION_ID,
+      { batchId: BATCH_ID, limit: 100 },
+      undefined,
+    )
+  })
+
   it("filters issue nodes between the current batch and all batches", async () => {
     mocks.useIssues.mockImplementation((_versionId: string, filters: { batchId?: string }) =>
       filters.batchId === BATCH_ID
@@ -430,7 +442,7 @@ describe("ExplorationTab", () => {
     expect(screen.queryByTestId(`chain-issue-node-${ISSUE_2}`)).toBeNull()
     expect(mocks.useIssues).toHaveBeenLastCalledWith(
       VERSION_ID,
-      { batchId: BATCH_ID, limit: 200 },
+      { batchId: BATCH_ID, limit: 100 },
       undefined,
     )
 
@@ -440,7 +452,7 @@ describe("ExplorationTab", () => {
 
     expect(await screen.findByTestId(`chain-issue-node-${ISSUE_2}`)).toBeTruthy()
     expect(screen.getByTestId(`chain-issue-node-${ISSUE_1}`)).toBeTruthy()
-    expect(mocks.useIssues).toHaveBeenLastCalledWith(VERSION_ID, { limit: 200 }, undefined)
+    expect(mocks.useIssues).toHaveBeenLastCalledWith(VERSION_ID, { limit: 100 }, undefined)
   })
 
   it("shows AI-supplemented and needs_revalidation cases with text, not colour alone", async () => {
@@ -501,6 +513,58 @@ describe("ExplorationTab", () => {
     // The chain itself still renders.
     expect(screen.getByTestId("chain-graph")).toBeTruthy()
     expect(screen.queryByTestId("chain-issues-empty")).toBeNull()
+  })
+
+  it("does not report zero issues when the issue request is rejected with a 422", async () => {
+    mocks.useIssues.mockReturnValue(
+      issuesResult([], { error: "limit must be an integer between 1 and 100" }),
+    )
+
+    renderTab()
+
+    const degraded = await screen.findByTestId("chain-issues-degraded")
+    expect(degraded.textContent).toContain("limit must be an integer between 1 and 100")
+    expect(screen.queryByTestId("chain-issues-empty")).toBeNull()
+
+    const count = screen.getByTestId("chain-issue-count")
+    expect(count.textContent).toContain("问题数据不可用")
+    expect(count.textContent).not.toContain("0 个问题")
+  })
+
+  it("keeps the case/result layers and names the failed requirement layer", async () => {
+    mocks.listRequirements.mockRejectedValue(
+      new Error("limit must be an integer between 1 and 100"),
+    )
+
+    renderTab()
+
+    // The graph request succeeded, so the cases and results still render.
+    expect(await screen.findByTestId(`chain-node-${C1}`)).toBeTruthy()
+    expect(screen.getByTestId(`chain-node-${CR1}`)).toBeTruthy()
+
+    const degraded = await screen.findByTestId("exploration-degraded")
+    expect(degraded.textContent).toContain("需求层")
+    expect(degraded.textContent).toContain("limit must be an integer between 1 and 100")
+    expect(screen.queryByTestId("exploration-error")).toBeNull()
+  })
+
+  it("shows the chain error and the issue layer hint when every request is rejected", async () => {
+    const message = "limit must be an integer between 1 and 100"
+    mocks.listRequirements.mockRejectedValue(new Error(message))
+    mocks.getGraph.mockRejectedValue(new Error(message))
+    mocks.useCaseRuns.mockReturnValue(caseRunList([]))
+    mocks.useIssues.mockReturnValue(issuesResult([], { error: message }))
+
+    renderTab()
+
+    const error = await screen.findByTestId("exploration-error")
+    expect(error.textContent).toContain(message)
+    expect(error.textContent).toContain("需求层")
+    expect(error.textContent).toContain("用例层")
+    expect(screen.queryByTestId("exploration-empty")).toBeNull()
+    expect((await screen.findByTestId("chain-issues-degraded")).textContent).toContain(message)
+    expect(screen.queryByTestId("chain-issues-empty")).toBeNull()
+    expect(screen.getByTestId("chain-issue-count").textContent).toContain("问题数据不可用")
   })
 
   it("shows the current-batch issue empty state", async () => {
