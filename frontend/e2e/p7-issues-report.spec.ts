@@ -210,6 +210,38 @@ test("P7 问题与报告：失败分析 → 确认/驳回 → stale → 重新�
       })
     })
 
+    await test.step("exploration tab: real chain loads requirements and issue nodes", async () => {
+      await page.goto(`/versions/${encodeURIComponent(versionId)}?tab=exploration`)
+      await expect(page.getByTestId("exploration-tab")).toBeVisible({ timeout: 60_000 })
+      await expect(page.getByTestId("exploration-error")).toHaveCount(0)
+      await expect(page.getByTestId("exploration-degraded")).toHaveCount(0)
+      await expect(page.getByTestId("chain-issues-degraded")).toHaveCount(0)
+
+      // The newest batch is the supplement one; the materialized issues belong
+      // to the baseline batch (and the human issue has no batch), so read the
+      // version-wide issue layer.
+      const batchFilter = page.getByTestId("chain-batch-filter")
+      await expect(batchFilter).toHaveValue("current", { timeout: 60_000 })
+      await batchFilter.selectOption("all")
+
+      await expect(page.getByTestId(`chain-node-${seed.seeded.requirements[0].id}`)).toBeVisible({
+        timeout: 60_000,
+      })
+      await expect(page.getByTestId("chain-issue-count")).toHaveText("2 个问题", {
+        timeout: 60_000,
+      })
+      await expect(page.getByTestId(`chain-issue-node-${aiIssue.id}`)).toBeVisible({
+        timeout: 60_000,
+      })
+      await expect(page.getByTestId(`chain-issue-node-${humanIssue.id}`)).toBeVisible({
+        timeout: 60_000,
+      })
+      await page.screenshot({
+        path: p7ScreenshotPath("p7-issues-05-exploration-issues.png"),
+        fullPage: true,
+      })
+    })
+
     const regenerated = await test.step("report stale banner → regenerate revision 2", async () => {
       await page.goto(
         `/versions/${encodeURIComponent(versionId)}?tab=report&report=${encodeURIComponent(baselineReport.id)}`,
