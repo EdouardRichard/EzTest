@@ -183,10 +183,16 @@ func New(cfg config.Config, logger *slog.Logger, deps Dependencies) http.Handler
 	}
 	if deps.Resources != nil {
 		// The resource reads need only the global bearer auth; every write and
-		// action route carries the per-route admin guard. The handlers derive
-		// the audit actor from the identity context, so no extra metadata
-		// middleware is needed here.
-		resourcehttp.RegisterRoutes(mux, *deps.Resources, identityhttp.RequireAdmin)
+		// action route carries the per-route admin guard. P7 adds the
+		// administrator-only environment db target routes (spec §7.8) to the
+		// same group; the guard also stamps the P0 request metadata so the
+		// resource audit entries (resource.db_target.*) carry request
+		// correlation. The handlers derive the audit actor from the identity
+		// context.
+		resourceGuard := func(next http.Handler) http.Handler {
+			return identityhttp.RequireAdmin(auditRequestContext(next))
+		}
+		resourcehttp.RegisterRoutes(mux, *deps.Resources, resourceGuard)
 	}
 	if deps.Version != nil {
 		// The version routes (P3) rely on the global bearer auth and add no
