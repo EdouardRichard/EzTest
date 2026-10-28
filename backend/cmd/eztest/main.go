@@ -184,7 +184,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	eventService := eventingapp.NewService(eventStore, eventHub)
 	// Content-addressed objects live below EZTEST_STORAGE_DIR; the directory is
 	// created lazily on the first upload. The durable metadata (size, content
-	// type, relative path) lives in the storage_objects table and is read back
+	// type, relative path) lives in the storage_object table and is read back
 	// on Open/Stat so downloads carry the stored media type.
 	storageService := storageapp.NewService(
 		localfs.New(cfg.StorageDir),

@@ -536,7 +536,7 @@ export async function pageToken(page: Page): Promise<string> {
 }
 
 /**
- * Counts persisted `agent_messages` rows that contain a data URL versus an image
+ * Counts persisted `agent_message` rows that contain a data URL versus an image
  * reference. This is the design spec §10.2/D30 assertion that the transient
  * base64 never reaches the database. Returns null when the e2e script did not
  * export the database access used by this check, so a locally started browser
@@ -548,7 +548,7 @@ export function readAgentMessageImageStats(): AgentMessageImageStats {
   if (!psql || !databaseUrl) return null
   const sql =
     "SELECT count(*) FILTER (WHERE content::text LIKE '%data:image%'), " +
-    "count(*) FILTER (WHERE content::text LIKE '%image_ref%') FROM agent_messages;"
+    "count(*) FILTER (WHERE content::text LIKE '%image_ref%') FROM agent_message;"
   let output = ""
   try {
     output = execFileSync(psql, ["-X", "-d", databaseUrl, "-tA", "-c", sql], {

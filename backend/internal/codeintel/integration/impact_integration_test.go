@@ -84,13 +84,13 @@ func impactIntegrationSeedSystem(t *testing.T, pool *pgxpool.Pool) int64 {
 	ctx := context.Background()
 	var companyID int64
 	if err := pool.QueryRow(ctx,
-		`INSERT INTO companies (key, name) VALUES ($1, 'P4 impact') RETURNING id`,
+		`INSERT INTO company (key, name) VALUES ($1, 'P4 impact') RETURNING id`,
 		fmt.Sprintf("p4-impact-company-%d", nextSeedID())).Scan(&companyID); err != nil {
 		t.Fatalf("seed company: %v", err)
 	}
 	var systemID int64
 	if err := pool.QueryRow(ctx,
-		`INSERT INTO systems (company_id, key, name, kind, base_url)
+		`INSERT INTO system (company_id, key, name, kind, base_url)
 		 VALUES ($1, $2, 'P4 impact system', 'web', 'http://127.0.0.1:13335') RETURNING id`,
 		companyID, fmt.Sprintf("p4-impact-system-%d", nextSeedID())).Scan(&systemID); err != nil {
 		t.Fatalf("seed system: %v", err)
@@ -103,7 +103,7 @@ func impactIntegrationSeedAppModel(t *testing.T, pool *pgxpool.Pool, systemID in
 	t.Helper()
 	var nodeID int64
 	if err := pool.QueryRow(context.Background(),
-		`INSERT INTO app_model_nodes (system_id, kind, key, name, path, method)
+		`INSERT INTO app_model_node (system_id, kind, key, name, path, method)
 		 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
 		systemID, kind, key, name, path, method).Scan(&nodeID); err != nil {
 		t.Fatalf("seed app model %s: %v", key, err)
@@ -116,7 +116,7 @@ func impactIntegrationSeedRequirement(t *testing.T, pool *pgxpool.Pool, versionI
 	t.Helper()
 	requirementID := nextSeedID()
 	if _, err := pool.Exec(context.Background(),
-		`INSERT INTO requirements (id, version_id, title, created_by, updated_by)
+		`INSERT INTO requirement (id, version_id, title, created_by, updated_by)
 		 VALUES ($1, $2, $3, 1, 1)`, requirementID, versionID, title); err != nil {
 		t.Fatalf("seed requirement: %v", err)
 	}
@@ -127,7 +127,7 @@ func impactIntegrationSeedRequirement(t *testing.T, pool *pgxpool.Pool, versionI
 func impactIntegrationSeedRelation(t *testing.T, pool *pgxpool.Pool, versionID, fromID, toID int64, relationType string) {
 	t.Helper()
 	if _, err := pool.Exec(context.Background(),
-		`INSERT INTO requirement_relations
+		`INSERT INTO requirement_relation
 		 (id, version_id, from_requirement_id, to_requirement_id, relation_type, created_by)
 		 VALUES ($1, $2, $3, $4, $5, 1)`,
 		nextSeedID(), versionID, fromID, toID, relationType); err != nil {
@@ -200,7 +200,7 @@ func newImpactIntegrationFixture(t *testing.T, pool *pgxpool.Pool) *impactIntegr
 	repoID, versionID, requirementID := seedAnalysisRepoVersion(t, pool, dir, base)
 
 	systemID := impactIntegrationSeedSystem(t, pool)
-	if _, err := pool.Exec(ctx, `UPDATE versions SET system_id = $1 WHERE id = $2`, systemID, versionID); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE version SET system_id = $1 WHERE id = $2`, systemID, versionID); err != nil {
 		t.Fatalf("bind version system: %v", err)
 	}
 	appModelID := impactIntegrationSeedAppModel(t, pool, systemID,
@@ -410,7 +410,7 @@ func TestImpactIntegrationChangedAPIContractPropagation(t *testing.T) {
 	repoID, versionID, _ := seedAnalysisRepoVersion(t, pool, dir, base)
 
 	systemID := impactIntegrationSeedSystem(t, pool)
-	if _, err := pool.Exec(ctx, `UPDATE versions SET system_id = $1 WHERE id = $2`, systemID, versionID); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE version SET system_id = $1 WHERE id = $2`, systemID, versionID); err != nil {
 		t.Fatalf("bind version system: %v", err)
 	}
 	componentID := impactIntegrationSeedAppModel(t, pool, systemID,

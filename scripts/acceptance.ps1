@@ -535,12 +535,15 @@ try {
     # The migration expectation is always derived from order.txt, never
     # hard-coded. The P4 table list is parsed from the codeintel migrations that
     # order.txt actually lists, so adding a migration updates the expectation.
+    # D34 rename migrations only change table names, so their old -> new mapping
+    # is applied before the tables are checked against the live schema.
     $migrationOrder = @(Get-Content -LiteralPath (Join-Path $backendDir "internal\db\migrations\order.txt") | Where-Object { $_.Trim() -ne "" } | ForEach-Object { $_.Trim() })
     $expectedMigrations = $migrationOrder.Count
     if ($expectedMigrations -le 0) { throw "no migrations are listed in order.txt" }
     $p4MigrationNames = @($migrationOrder | Where-Object { $_ -match '^codeintel_.*\.sql$' })
     if ($p4MigrationNames.Count -eq 0) { throw "order.txt lists no P4 codeintel migrations" }
     $p4MigrationTables = @()
+    $p4TableRenames = @{}
     foreach ($migrationName in $p4MigrationNames) {
         $migrationPath = Join-Path $backendDir ("internal\db\migrations\" + $migrationName)
         if (-not (Test-Path -LiteralPath $migrationPath)) {
@@ -550,8 +553,13 @@ try {
         foreach ($tableMatch in [regex]::Matches($migrationSql, 'CREATE TABLE IF NOT EXISTS\s+([a-zA-Z0-9_]+)')) {
             $p4MigrationTables += $tableMatch.Groups[1].Value
         }
+        foreach ($renameMatch in [regex]::Matches($migrationSql, 'ALTER TABLE IF EXISTS\s+([a-zA-Z0-9_]+)\s+RENAME TO\s+([a-zA-Z0-9_]+)')) {
+            $p4TableRenames[$renameMatch.Groups[1].Value] = $renameMatch.Groups[2].Value
+        }
     }
-    $p4MigrationTables = @($p4MigrationTables | Select-Object -Unique)
+    $p4MigrationTables = @($p4MigrationTables | Select-Object -Unique | ForEach-Object {
+            if ($p4TableRenames.ContainsKey($_)) { $p4TableRenames[$_] } else { $_ }
+        })
     if ($p4MigrationTables.Count -eq 0) {
         throw "the codeintel migrations listed in order.txt define no tables"
     }

@@ -436,7 +436,7 @@ try {
     $env:EZTEST_E2E_BASE_URL = $webBaseUrl
     $env:EZTEST_E2E_CHANNEL = $channel
     # P3 specs read the fake upstream log directly and optionally use psql for
-    # the D30 assertion that no image data URL is persisted in agent_messages.
+    # the D30 assertion that no image data URL is persisted in agent_message.
     $env:EZTEST_E2E_FAKE_LLM_URL = $fakeLlmBaseUrl
     $env:EZTEST_E2E_FAKE_LLM_LOG = $fakeRequestLog
     $env:EZTEST_E2E_DATABASE_URL = $e2eDatabaseUrl

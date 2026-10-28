@@ -154,6 +154,7 @@
 | D31 | P3 版本/多需求/澄清采用「Version 粗粒度容器 + Requirement 独立流水线」。新增/确认/重开需求**永不**改变或回退 `Version.status`；P3 只实现 `draft→clarifying→designing` 与 `Requirement draft→clarified`；`designing` 下仍可独立澄清/确认需求。版本「进入设计」允许带未澄清需求，但需 `acknowledgeUnclarified` 二次确认。新需求重新走「澄清→设计→评审→执行」；执行中的批次不因新增需求中断，受影响用例由 P7 的 AI 补全/修改（D3/D17）。P3 新增 `version` 上下文 7 表（versions/requirements/requirement_relations/requirement_attachments/clarification_sessions/clarification_questions/decisions）与 `agent_0002_activity_channel`；主键遵循 D29 雪花 ID（JSON 字符串序列化）；澄清 SSE 走 `version:{id}` 通道，Agent 会话可选 `activity_channel`（默认 `agent:{session_id}` 不变）。所有登录用户可写版本域；附件支持文本+截图并遵循 D30 文件系统存储，截图以 `image_ref` 注入、data URL 仅 LLM 调用瞬态生成，PDF/DOCX 不做。P3 不实现 P4/P5/P6/P7 能力。 |
 | D32 | **D32 P4 代码理解与影响分析 v1**：新增 `codeintel` 限界上下文（DDD 四层，`Agent.md` §6.1 登记），复用 P2 `code_repositories`（BIGSERIAL，API number），新增 9 表（雪花 ID：`code_change_sets`/`code_index_runs`/`code_entities`/`code_edges`/`code_fact_versions`/`code_analysis_cache`/`code_analyses`/`code_impact_candidates`/`code_anchors`），`repo_id`/`version_id`/`requirement_id`/`app_model_id` 均为逻辑引用、不建跨上下文 FK。T0 只读 Git 文件级能力（tree/blob hash/文件级 diff/按需 unified diff/行读取/commit/HEAD；不含 parser）；T1 服务化：应用服务直调 P0 LLM 网关（chat 协议 + JSON 提示词 + 严格解析 + 证据校验），异步 run（202/轮询/SSE；单实例进程内 worker，默认并发 1）；**不新增 Agent profile**，仅注册 `code_*` 只读工具薄壳（P3 `code.tree`/`code.read` 契约不变）。证据必须为 `path + start/end line + 摘录 sha256`，按 **commit 内容**校验；失败降为 low 线索，不参与自动影响。影响分析 v1 输出受影响**需求/应用模型**与 `unmapped_changes`；`affected.cases` 结构保留、P5 接入（P4 无 case/issue 实体）。跨栈契约存 `code_edges.rel='route_to_api'`（method + 归一化 path）。API 为 `/api/code/*`（仓库级）与 `/api/versions/{id}/code/*`（版本级）；仓库配置/索引 admin，其余登录用户。版本分析完成发 `code.changed`/`code.impact_computed`（`version:{id}`，仅摘要）。AI 不可用 → `done + degraded`，T0-only，HTTP 2xx 不阻塞。明确不做 parser/符号级/字段级分析、用例锚点实体、批次、全仓 AI 分析、线上仓、monorepo 子项目配置。 |
 | D33 | **D33 P4 缓存与版本化**：文件级分析缓存键 = `(repo, commit, path, file_hash, model, prompt_version)`（file_hash 为 `git-sha1:<40hex>` 或内容 `sha256:<hex>`）；命中不调 LLM。事实按 `fact_key` 版本化：`code_fact_versions` 保存历史，body 语义相同则复用，不同则 `version+1` 并写旧版 `superseded_at`；`code_entities` 仅保存当前版本。影响分析同 `(version, base, head, model, prompt_version, fact 版本集)` 默认复用（`reused=true`）；`force` 或模型/提示词变化新建 `analysis_version`，不覆盖旧记录。候选集合/顺序/默认勾选确定性：source 优先级 direct > contract > relation > ai，再按 confidence、subject kind/id；low 默认不选中但可人工选中。证据摘录哈希 `sha256`，按 commit 内容复算；同 commit 重跑影响结果一致。P4 不提供事实人工修正与版本对比 UI（CI-M1）。 |
+| D34 | **D34（数据库命名规约）**：全项目表名/索引名遵循阿里《Java 开发手册》数据库规约并做 PostgreSQL 适配——表名单数、小写+下划线、禁保留字、推荐 `业务_作用`；索引 `pk_<表>/uk_<表>_<列>/idx_<表>_<列>`；P5 起新表沿用 `created_at/updated_at`（对“id/gmt_create/gmt_modified 三字段”的显式例外）；历史表以新增 rename 迁移改名，字段/约束/既有索引名不变，`schema_migrations` 为框架表例外；规约同步 `Agent.md` §6.9 与蓝图 §10.2。 |
 
 ---
 
@@ -474,13 +475,15 @@ Playwright 浏览器（导航、DOM/A11y、点击输入、快照、截图、stor
 
 | 组 | 表（示例） |
 |---|---|
-| 资源 | companies / systems / environments / app_model_nodes / accounts / account_system_accesses / sessions / session_snapshots / session_leases / manual_takeovers / code_repositories（P2 共 11 表；`secrets` / `session_blobs` / `session_events` / `auth_flows` / `probe_recipes` 等 P6 需要时追加） |
-| 版本需求 | versions / requirements / requirement_relations / requirement_attachments / clarification_sessions / clarification_questions / decisions / version_changes（P3 交付 `version` 上下文 7 表；主键按 D29，附件文件按 D30，`version_changes` 等后续阶段） |
-| 用例脑图 | case_graph_nodes / case_steps / assertions / case_sources / case_reviews |
-| 执行 | run_batches / case_runs / step_results / run_events(activity) / evidence / evidence_refs |
-| 问题报告 | issues / issue_refs / reports / report_refs |
-| 代码 | code_repositories / code_index_runs / code_entities / code_edges / code_change_sets / code_anchors |
-| 平台 | users / admin_config / llm_configs / agent_profiles / audit_logs |
+| 资源 | company / system / environment / app_model_node / account / account_system_access / session / session_snapshot / session_lease / manual_takeover / code_repository（P2 共 11 表；`secrets` / `session_blobs` / `session_events` / `auth_flows` / `probe_recipes` 等 P6 需要时追加） |
+| 版本需求 | version / requirement / requirement_relation / requirement_attachment / clarification_session / clarification_question / decision / version_change（P3 交付 `version` 上下文 7 表；主键按 D29，附件文件按 D30，`version_change` 等后续阶段） |
+| 用例脑图 | case_node / case_step / case_assertion / case_source / case_review / case_review_finding / case_baseline / case_design_run / case_export |
+| 执行 | run_batch / case_run / step_result / run_event(activity) / evidence / evidence_ref |
+| 问题报告 | issue / issue_ref / report / report_ref |
+| 代码 | code_repository / code_index_run / code_entity / code_edge / code_change_set / code_anchor |
+| 平台 | user_account / admin_config / llm_config / agent_profile / audit_log |
+
+> 表名遵循 D34（单数、小写+下划线、禁保留字）；P5 起 P2/P3/P4 的旧复数表已由 rename 迁移改为上表规范名（字段/约束/既有索引名不变），历史阶段规格（P2/P3/P4 spec）作为交付记录保留旧名，`schema_migrations` 为框架表例外。
 
 ### 10.3 版本与报告一致性
 
