@@ -335,7 +335,7 @@ func TestRecorderFinishCaseValidates(t *testing.T) {
 		})
 		wantToolError(t, err, "invalid_arguments", "not submitted")
 	})
-	t.Run("passed needs step evidence", func(t *testing.T) {
+	t.Run("assertion evidence satisfies the evidence gate", func(t *testing.T) {
 		recorder, world := newRecorderTest(t)
 		run := world.seedRunningRun(recorderSnapshot())
 		evidence := world.evidenceFor(run.ID, "assertion only")
@@ -346,6 +346,28 @@ func TestRecorderFinishCaseValidates(t *testing.T) {
 		}
 		if _, err := recorder.RecordAssertion(context.Background(), run.ID, AssertionRecordInput{
 			AssertionID: 20, Verdict: "passed", EvidenceIDs: []int64{evidence.ID},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		// Spec §6.6.2 counts every evidence artifact of the case run, not only
+		// the step-attached ones.
+		finished, err := recorder.FinishCase(context.Background(), run.ID, FinishInput{
+			Decision: domain.FinishDecision{Verdict: domain.VerdictPassed},
+		})
+		if err != nil {
+			t.Fatalf("FinishCase with assertion evidence: %v", err)
+		}
+		if finished.Status != domain.CaseRunStatusPassed {
+			t.Fatalf("status = %s, want passed", finished.Status)
+		}
+	})
+	t.Run("passed needs evidence", func(t *testing.T) {
+		recorder, world := newRecorderTest(t)
+		snapshot := recorderSnapshot()
+		snapshot.Assertions = nil
+		run := world.seedRunningRun(snapshot)
+		if _, err := recorder.RecordStep(context.Background(), run.ID, StepRecordInput{
+			Seq: 1, Status: domain.StepStatusPassed, Actual: "ok",
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -460,11 +482,14 @@ func TestRecorderFinishCaseValidates(t *testing.T) {
 	})
 }
 
-// recAudit captures the execution.case.finished audits of one recorder test.
+// recAudit captures the execution.case.finished audits of one recorder test and
+// the execution.db_assert.executed events when its DBAssertExecuted method is
+// used.
 type recAudit struct {
-	mu      sync.Mutex
-	entries []recAuditEntry
-	err     error
+	mu        sync.Mutex
+	entries   []recAuditEntry
+	dbEntries []DBAssertAuditEvent
+	err       error
 }
 
 type recAuditEntry struct {
@@ -479,10 +504,23 @@ func (a *recAudit) CaseFinished(_ context.Context, run domain.CaseRun, actor int
 	return a.err
 }
 
+func (a *recAudit) DBAssertExecuted(_ context.Context, event DBAssertAuditEvent) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.dbEntries = append(a.dbEntries, event)
+	return a.err
+}
+
 func (a *recAudit) recorded() []recAuditEntry {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return append([]recAuditEntry(nil), a.entries...)
+}
+
+func (a *recAudit) dbAssertAudits() []DBAssertAuditEvent {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]DBAssertAuditEvent(nil), a.dbEntries...)
 }
 
 // TestRecorderFinishCaseRecordsAudit pins that a committed terminal finish is
@@ -539,41 +577,35 @@ func TestRecorderFinishCaseRecordsAudit(t *testing.T) {
 	})
 }
 
-// TestRecorderFinishCaseRequiresDBAssertion pins the P7 rule (spec §6.6.2): a
-// db assertion is a normal assertion. A finish that skips it is rejected as an
-// incomplete assertion submission, and once it is recorded an all-passed finish
-// is admitted.
-func TestRecorderFinishCaseRequiresDBAssertion(t *testing.T) {
+// TestRecorderRejectsDBAssertionThroughGenericPath pins T8's review fix (spec
+// §9.5): only execution.db_assert writes db assertion results; the generic
+// execution.assertion_record path must reject a snapshot db assertion so the
+// agent cannot forge a passed db result. Skipping db_assert leaves the
+// assertion unsubmitted, so a passed finish is also rejected.
+func TestRecorderRejectsDBAssertionThroughGenericPath(t *testing.T) {
 	recorder, world := newRecorderTest(t)
 	snapshot := recorderSnapshot()
 	snapshot.Assertions[0].Kind = "db"
 	run := world.seedRunningRun(snapshot)
 	evidence := world.evidenceFor(run.ID, "db")
+
+	_, err := recorder.RecordAssertion(context.Background(), run.ID, AssertionRecordInput{
+		AssertionID: 20, Verdict: "passed", Actual: "1", EvidenceIDs: []int64{evidence.ID},
+	})
+	wantToolError(t, err, "invalid_arguments", "db_assert")
+	if rows := world.assertions.rows[run.ID]; len(rows) != 0 {
+		t.Fatalf("generic assertion_record wrote a db result: %+v", rows)
+	}
 	if _, err := recorder.RecordStep(context.Background(), run.ID, StepRecordInput{
 		Seq: 1, Status: domain.StepStatusPassed, Actual: "ok", EvidenceIDs: []int64{evidence.ID},
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	_, err := recorder.FinishCase(context.Background(), run.ID, FinishInput{
+	_, err = recorder.FinishCase(context.Background(), run.ID, FinishInput{
 		Decision: domain.FinishDecision{Verdict: domain.VerdictPassed},
 	})
 	wantToolError(t, err, "invalid_arguments", "invalid_assertion_results")
-
-	if _, err := recorder.RecordAssertion(context.Background(), run.ID, AssertionRecordInput{
-		AssertionID: 20, Verdict: "passed", Actual: "1", EvidenceIDs: []int64{evidence.ID},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	finished, err := recorder.FinishCase(context.Background(), run.ID, FinishInput{
-		Decision: domain.FinishDecision{Verdict: domain.VerdictPassed},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if finished.Status != domain.CaseRunStatusPassed {
-		t.Fatalf("status = %s, want passed", finished.Status)
-	}
 }
 
 func TestRecorderRejectsPausedAndTerminalSubmissions(t *testing.T) {

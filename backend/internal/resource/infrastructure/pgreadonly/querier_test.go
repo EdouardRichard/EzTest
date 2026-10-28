@@ -295,7 +295,9 @@ func TestClassifyQueryError(t *testing.T) {
 		{"read only transaction", &pgconn.PgError{Code: "25006"}, domain.ReasonDBReadonlyViolation},
 		{"insufficient privilege", &pgconn.PgError{Code: "42501"}, domain.ReasonDBQueryFailed},
 		{"syntax error", &pgconn.PgError{Code: "42601"}, domain.ReasonDBQueryFailed},
-		{"statement timeout", &pgconn.PgError{Code: "57014"}, domain.ReasonDBQueryFailed},
+		{"statement timeout", &pgconn.PgError{Code: "57014"}, domain.ReasonDBConnectionFailed},
+		{"context deadline", context.DeadlineExceeded, domain.ReasonDBConnectionFailed},
+		{"context canceled", context.Canceled, domain.ReasonDBConnectionFailed},
 		{"unknown pg error", &pgconn.PgError{Code: "XX000"}, domain.ReasonDBQueryFailed},
 		{"plain error", errors.New("boom"), domain.ReasonDBQueryFailed},
 	}

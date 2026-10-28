@@ -29,7 +29,9 @@ func finishError(reason, message string) error {
 //     order, and no result refers to a step outside the snapshot;
 //   - every snapshot assertion — including a db assertion — is submitted
 //     exactly once, and no result refers to an assertion outside the snapshot;
-//   - passed and failed require at least one piece of evidence;
+//   - passed and failed require at least one piece of evidence; evidenceCount is
+//     the case run's evidence total (step evidence plus assertion/db and finish
+//     evidence, spec §6.6.2);
 //   - passed requires every step passed and every assertion passed, including
 //     db assertions;
 //   - failed requires at least one failed assertion, including a db assertion;
@@ -38,7 +40,7 @@ func finishError(reason, message string) error {
 //
 // It returns nil when the decision is admissible. Rejections are
 // *ReasonError values so the recorder can surface a correctable tool error.
-func ValidateFinish(snapshot CaseSnapshot, steps []StepResult, assertions []AssertionResult, decision FinishDecision) error {
+func ValidateFinish(snapshot CaseSnapshot, steps []StepResult, assertions []AssertionResult, decision FinishDecision, evidenceCount int) error {
 	switch decision.Verdict {
 	case VerdictPassed, VerdictFailed, VerdictBlocked, VerdictInconclusive:
 	default:
@@ -69,7 +71,7 @@ func ValidateFinish(snapshot CaseSnapshot, steps []StepResult, assertions []Asse
 	}
 
 	if decision.Verdict == VerdictPassed || decision.Verdict == VerdictFailed {
-		if !hasEvidence(steps) {
+		if evidenceCount <= 0 {
 			return finishError(reasonEvidenceMissing,
 				"passed and failed finishes require at least one evidence item")
 		}
@@ -192,15 +194,6 @@ func validateFinishAssertions(snapshot CaseSnapshot, assertions []AssertionResul
 func hasFailedAssertion(snapshot CaseSnapshot, results map[int64]AssertionResult) bool {
 	for _, assertion := range snapshot.Assertions {
 		if verdictEquals(results[assertion.ID].Verdict, "failed") {
-			return true
-		}
-	}
-	return false
-}
-
-func hasEvidence(steps []StepResult) bool {
-	for _, step := range steps {
-		if step.EvidenceCount > 0 {
 			return true
 		}
 	}

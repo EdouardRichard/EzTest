@@ -90,6 +90,10 @@ type SchedulerDeps struct {
 	Tick time.Duration
 	// LeaseTTL overrides DefaultCaseLeaseTTL.
 	LeaseTTL time.Duration
+	// Autonomy is the hand-off to the autonomous chain (spec §5.3/§6.2). A nil
+	// trigger degrades: the batch stays autonomy_done=false and the worker
+	// advances it on its next scan.
+	Autonomy AutonomyTrigger
 }
 
 // Scheduler dispatches pending case runs of the active batches: it acquires a
@@ -644,6 +648,13 @@ func (s *Scheduler) requeueBlockedSession(ctx context.Context, batch domain.RunB
 	}
 	now := s.now()
 	retryOf := run.ID
+	source := run.Source
+	if source == "" {
+		// P6 historical rows have no stored source; the snapshot origin is the
+		// same provenance and keeps a supplement retry from reading as baseline
+		// (T7 review finding B).
+		source = run.Snapshot.Node.EffectiveOrigin()
+	}
 	attempt := domain.CaseRun{
 		ID:               id,
 		BatchID:          run.BatchID,
@@ -651,6 +662,7 @@ func (s *Scheduler) requeueBlockedSession(ctx context.Context, batch domain.RunB
 		CaseNodeID:       run.CaseNodeID,
 		CaseRevision:     run.CaseRevision,
 		CaseHash:         run.CaseHash,
+		Source:           source,
 		Snapshot:         cloneSnapshot(run.Snapshot),
 		Attempt:          run.Attempt + 1,
 		Status:           domain.CaseRunStatusPending,
@@ -746,13 +758,12 @@ func (s *Scheduler) completeBatchIfFinished(ctx context.Context, batch domain.Ru
 	if err != nil {
 		return fmt.Errorf("execution: finish batch %d: %w", batch.ID, err)
 	}
-	if s.deps.Versions != nil {
-		if err := s.deps.Versions.CompleteExecution(ctx, batch.VersionID, 0); err != nil {
-			// The batch is still finished; a version that cannot complete (for
-			// example it was manually changed) must not leave the batch stuck.
-			slog.WarnContext(ctx, "execution: complete version failed",
-				"version_id", batch.VersionID, "batch_id", batch.ID, "error", err)
-		}
+	// P7 deliberately no longer completes the version here: the autonomous chain
+	// (analysis -> triage -> report -> supplement) must settle every terminal
+	// batch first, and only then may the version finalize (spec §5.3/§6.2).
+	// The hand-off is best effort; the worker also rescans stored state.
+	if s.deps.Autonomy != nil {
+		s.deps.Autonomy.OnBatchTerminal(ctx, finished)
 	}
 	s.publish(ctx, Event{
 		Type:      "batch.finished",

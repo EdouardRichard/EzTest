@@ -339,11 +339,182 @@ type CaseContextView struct {
 	AllowedHosts       []string
 }
 
+// DB assertion vocabulary (spec §5.7/§7.11) shared by the execution.db_assert
+// use case and the resource adapter. The reason strings are the stable
+// machine-readable values of the error table; every db failure crossing this
+// port carries one of them.
+const (
+	// DBReasonTargetMissing reports an unconfigured or disabled environment
+	// target (environment failure).
+	DBReasonTargetMissing = "db_target_missing"
+	// DBReasonConnectionFailed reports connect/auth/DNS/timeout failures
+	// (environment failure).
+	DBReasonConnectionFailed = "db_connection_failed"
+	// DBReasonQueryFailed reports SQL syntax/permission/execution failures
+	// (case failure).
+	DBReasonQueryFailed = "db_query_failed"
+	// DBReasonReadonlyViolation reports a statement rejected by the read-only
+	// gate (case failure).
+	DBReasonReadonlyViolation = "db_readonly_violation"
+	// DBReasonResultTruncated reports a result above the row/byte limit (case
+	// failure).
+	DBReasonResultTruncated = "db_result_truncated"
+	// DBReasonExpectedInvalid reports an unparseable db assertion expected value
+	// (case failure).
+	DBReasonExpectedInvalid = "db_expected_invalid"
+)
+
+// DBTargetRef is the enabled read-only target of one environment as projected
+// to the execution context. It deliberately carries no credentials: the
+// resource adapter owns the password and the querier call.
+type DBTargetRef struct {
+	EnvironmentID      int64
+	Name               string
+	MaxRows            int
+	StatementTimeoutMS int
+}
+
+// DBQueryLimits bounds one db_assert query. Zero fields fall back to the target
+// configuration and the spec defaults inside the resource adapter.
+type DBQueryLimits struct {
+	MaxRows   int
+	TimeoutMS int
+	MaxBytes  int
+}
+
+// DBQueryResult is the normalized read-only result projection (spec §5.7):
+// every cell is a string, SQL NULL is "null", numbers are plain decimals and
+// timestamps are RFC3339. Truncated reports the row/byte cap was hit; it is not
+// an error.
+type DBQueryResult struct {
+	Columns   []string
+	Rows      [][]string
+	RowCount  int
+	Truncated bool
+	ElapsedMS int64
+}
+
+// DBQueryPort resolves and executes the environment's read-only db target for
+// the execution.db_assert tool. Target returns DBQueryError{db_target_missing}
+// for an unconfigured or disabled target; Query returns a DBQueryError with one
+// of the db_* reasons. Implementations never log or return the password.
+type DBQueryPort interface {
+	Target(ctx context.Context, environmentID int64) (DBTargetRef, error)
+	Query(ctx context.Context, environmentID int64, sql string, limits DBQueryLimits) (DBQueryResult, error)
+}
+
+// DBQueryError is the classified database failure crossing the DBQueryPort. Its
+// Message must be safe to show the agent: no credentials, DSNs or result data.
+type DBQueryError struct {
+	Reason  string
+	Message string
+}
+
+// Error implements error.
+func (e *DBQueryError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Message != "" {
+		return e.Message
+	}
+	return e.Reason
+}
+
+// EvidenceCapturePort is the narrow artifact-capture surface of the
+// execution.db_assert use case. *EvidenceService satisfies it.
+type EvidenceCapturePort interface {
+	Capture(ctx context.Context, in CaptureInput) (domain.Evidence, error)
+}
+
+// DBAssertAuditEvent is one execution.db_assert.executed audit entry (spec
+// §11.2). It carries ids, verdict and counts only: never the SQL, the result
+// rows, credentials or the model preview.
+type DBAssertAuditEvent struct {
+	AssertionResultID int64
+	CaseRunID         int64
+	Verdict           string
+	RowCount          int
+	ElapsedMS         int64
+}
+
+// DBAssertAuditor is the optional audit capability of the execution.db_assert
+// use case. The case-finish auditor is also the db audit sink when it implements
+// this interface; auditing stays best-effort (spec §11.2).
+type DBAssertAuditor interface {
+	DBAssertExecuted(ctx context.Context, event DBAssertAuditEvent) error
+}
+
 // Recorder is the structured submission surface consumed by the execution
 // agent tools (spec §5.5, plan Shared Interfaces). Implemented by T15.
 type Recorder interface {
 	CaseContext(ctx context.Context, caseRunID int64) (CaseContextView, error)
 	RecordStep(ctx context.Context, caseRunID int64, in StepRecordInput) (domain.StepResult, error)
 	RecordAssertion(ctx context.Context, caseRunID int64, in AssertionRecordInput) (domain.AssertionResult, error)
+	// DBAssert executes one db assertion of the case run and records its
+	// db_result evidence and assertion_result idempotently (spec §9.5).
+	DBAssert(ctx context.Context, caseRunID, assertionID int64, limits DBAssertLimits) (DBAssertOutcome, error)
 	FinishCase(ctx context.Context, caseRunID int64, in FinishInput) (domain.CaseRun, error)
+}
+
+// AutonomyTrigger is the scheduler's hand-off to the autonomous chain (spec
+// §5.3/§6.2). The scheduler calls it after a batch terminal CAS committed so the
+// worker can advance the chain immediately instead of waiting for its next tick.
+// A nil trigger degrades: the worker still observes the batch on its next tick.
+type AutonomyTrigger interface {
+	OnBatchTerminal(ctx context.Context, batch domain.RunBatch)
+}
+
+// DesigningVersion is one version of the continuing+designing scan of the
+// autonomous worker (spec §6.2 second section): the version projection and its
+// newest terminal batch, which is the parent of the incremental design run.
+type DesigningVersion struct {
+	Version VersionRef
+	Parent  *domain.RunBatch
+}
+
+// AutonomyBatchStore is the persistence surface of the autonomous worker. Every
+// advance is derived from these reads and compare-and-swap writes, so a worker
+// restart can resume the chain from the stored state (spec §6.2/§6.7).
+//
+// The adapter belongs to the execution context's persistence layer and is wired
+// by T17. The implementation must:
+//   - filter terminal batches by version status (executing/continuing) and
+//     paused=false, and order newest first;
+//   - implement the two CAS writes as single UPDATE ... WHERE <flag> = false
+//     statements reporting whether this call won;
+//   - return nil from SupplementChild when no supplement batch exists.
+type AutonomyBatchStore interface {
+	// PendingAutonomyBatches returns terminal batches (done/failed/cancelled)
+	// with autonomy_done=false whose version is executing or continuing and not
+	// paused, newest first, bounded by limit.
+	PendingAutonomyBatches(ctx context.Context, limit int) ([]domain.RunBatch, error)
+	// DesigningVersions returns the continuing versions whose continue_phase is
+	// designing and that are not paused, each with its newest terminal batch
+	// (Parent is nil when the version never ran a batch).
+	DesigningVersions(ctx context.Context, limit int) ([]DesigningVersion, error)
+	// VersionsAwaitingFinalize is the DB-derived finalize sweep: executing or
+	// continuing versions that have at least one batch, no active (planned or
+	// running) batch, and no terminal batch with autonomy_done=false. It lets a
+	// restarted worker retry a finalize that a crash or an error skipped after
+	// the batch's autonomy_done CAS. Bounded by limit; try-finalize itself
+	// re-checks every condition and is idempotent.
+	VersionsAwaitingFinalize(ctx context.Context, limit int) ([]int64, error)
+	// MarkSupplementAttempted is the per-batch one-cycle CAS
+	// (supplement_attempted false -> true). won reports whether this call won.
+	MarkSupplementAttempted(ctx context.Context, batchID int64) (bool, error)
+	// MarkAutonomyDone is the chain-settled CAS (autonomy_done false -> true).
+	// won reports whether this call won; a lost CAS means the chain was already
+	// settled (for example by a previous worker instance).
+	MarkAutonomyDone(ctx context.Context, batchID int64) (bool, error)
+	// ResetAutonomyDone reopens a settled terminal batch chain
+	// (autonomy_done true -> false) so a manual analysis started on an already
+	// completed chain is picked up by the worker again. won reports whether this
+	// call performed the transition. supplement_attempted is intentionally left
+	// true: a re-analysis must not run the post-batch supplement cycle twice.
+	ResetAutonomyDone(ctx context.Context, batchID int64) (bool, error)
+	// SupplementChild returns the supplement batch whose parent is
+	// parentBatchID, or nil when none exists. A supplement batch is always a
+	// child of a terminal baseline batch (spec §5.3).
+	SupplementChild(ctx context.Context, parentBatchID int64) (*domain.RunBatch, error)
 }
