@@ -2,6 +2,7 @@ package application_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/version/application"
@@ -12,6 +13,24 @@ import (
 // execution-state write. Tests use it to commit a concurrent write between the
 // service's read and its write, exercising the column-scoped guards.
 var beforeExecutionWrite func(id int64)
+
+// fakeAllocatorMu serialises the in-memory native allocate/release writes so
+// the concurrent allocation test exercises the service wiring without racing on
+// the fake map. The real atomicity guarantee is the single PostgreSQL UPDATE,
+// covered by the repository integration test.
+var fakeAllocatorMu sync.Mutex
+
+// nativeBatchAllocator mirrors the execution adapter's optional native allocator
+// port (T17). The adapter prefers this method set over its serialised
+// read-then-write fallback, so a signature drift must fail here.
+type nativeBatchAllocator interface {
+	AllocateBatchNo(ctx context.Context, versionID int64) (int, error)
+	ReleaseBatchNo(ctx context.Context, versionID int64, allocated int) error
+}
+
+// The production version service must keep satisfying the adapter's native
+// allocator so T17 actually uses the atomic path.
+var _ nativeBatchAllocator = (*application.VersionService)(nil)
 
 // runExecutionHook runs and clears the one-shot concurrency hook.
 func (r *fakeVersionRepo) runExecutionHook(id int64) {
@@ -59,6 +78,46 @@ func (r *fakeVersionRepo) SetBatchNo(_ context.Context, id int64, batchNo int, a
 	stored.UpdatedAt = r.stamp(id, stored.Revision)
 	r.versions[id] = stored
 	return &stored, nil
+}
+
+// AllocateBatchNo mirrors the PostgreSQL single-statement allocation: the
+// executing version's batch_no is incremented in one step and the new value is
+// returned. A missing row is not_found, a non-executing row is a state conflict.
+func (r *fakeVersionRepo) AllocateBatchNo(_ context.Context, id int64, actor int64) (int, error) {
+	r.runExecutionHook(id)
+	fakeAllocatorMu.Lock()
+	defer fakeAllocatorMu.Unlock()
+	stored, ok := r.versions[id]
+	if !ok {
+		return 0, domain.NewNotFound("version", id)
+	}
+	if stored.Status != domain.VersionExecuting {
+		return 0, domain.NewStateConflict("version_state_conflict", "version status does not allow this action")
+	}
+	stored.BatchNo++
+	stored.Revision++
+	stored.UpdatedBy = actor
+	stored.UpdatedAt = r.stamp(id, stored.Revision)
+	r.versions[id] = stored
+	return stored.BatchNo, nil
+}
+
+// ReleaseBatchNo mirrors the guarded compensation: batch_no is decremented only
+// while the stored value still equals the allocated one; any other state is a
+// no-op (the number was already compensated or overtaken).
+func (r *fakeVersionRepo) ReleaseBatchNo(_ context.Context, id int64, allocated int, actor int64) error {
+	fakeAllocatorMu.Lock()
+	defer fakeAllocatorMu.Unlock()
+	stored, ok := r.versions[id]
+	if !ok || stored.BatchNo != allocated {
+		return nil
+	}
+	stored.BatchNo--
+	stored.Revision++
+	stored.UpdatedBy = actor
+	stored.UpdatedAt = r.stamp(id, stored.Revision)
+	r.versions[id] = stored
+	return nil
 }
 
 // CompleteExecution mirrors the guarded completion: only an unpaused executing
@@ -453,6 +512,146 @@ func TestSetBatchNoLosesToConcurrentHigherBatch(t *testing.T) {
 	if got := f.repo.versions[stored.ID]; got.BatchNo != 5 {
 		t.Fatalf("stale batch write rolled the row back to %d, want 5", got.BatchNo)
 	}
+}
+
+// TestAllocateBatchNoIncrementsAtomically covers the native allocation path:
+// every call increments the executing version's batch_no exactly once and
+// returns a distinct value, even when callers race.
+func TestAllocateBatchNoIncrementsAtomically(t *testing.T) {
+	f := newVersionFixture()
+	stored := seedExecuting(f)
+
+	const callers = 2
+	values := make([]int, callers)
+	errs := make([]error, callers)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			values[i], errs[i] = f.service.AllocateBatchNo(context.Background(), stored.ID)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	seen := make(map[int]bool, callers)
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("AllocateBatchNo[%d]: %v", i, err)
+		}
+		if values[i] < 1 || values[i] > callers {
+			t.Fatalf("AllocateBatchNo[%d] = %d, want 1..%d", i, values[i], callers)
+		}
+		if seen[values[i]] {
+			t.Fatalf("duplicate batch number %d in %v", values[i], values)
+		}
+		seen[values[i]] = true
+	}
+
+	got := f.repo.versions[stored.ID]
+	if got.BatchNo != callers || got.Status != domain.VersionExecuting {
+		t.Fatalf("stored batchNo/status = %d/%s, want %d/executing", got.BatchNo, got.Status, callers)
+	}
+	if got.Revision != 1+callers {
+		t.Fatalf("revision = %d, want one bump per allocation = %d", got.Revision, 1+callers)
+	}
+	if got.UpdatedBy != 0 {
+		t.Fatalf("updatedBy = %d, want the adapter's system actor 0", got.UpdatedBy)
+	}
+	if len(f.events.events) != 0 {
+		t.Fatalf("AllocateBatchNo published events: %+v", f.events.events)
+	}
+}
+
+// TestReleaseBatchNoRestoresOnlyMatchingValue covers the compensating
+// decrement: only the current newest number is handed back, a stale or unknown
+// number is a no-op, and a missing version is tolerated because the number was
+// already compensated.
+func TestReleaseBatchNoRestoresOnlyMatchingValue(t *testing.T) {
+	f := newVersionFixture()
+	stored := seedExecuting(f)
+	ctx := context.Background()
+
+	first, err := f.service.AllocateBatchNo(ctx, stored.ID)
+	if err != nil {
+		t.Fatalf("AllocateBatchNo first: %v", err)
+	}
+	second, err := f.service.AllocateBatchNo(ctx, stored.ID)
+	if err != nil {
+		t.Fatalf("AllocateBatchNo second: %v", err)
+	}
+	if first != 1 || second != 2 {
+		t.Fatalf("allocated = %d/%d, want 1/2", first, second)
+	}
+
+	// Releasing the stale first number must not decrement the newest one.
+	if err := f.service.ReleaseBatchNo(ctx, stored.ID, first); err != nil {
+		t.Fatalf("ReleaseBatchNo stale: %v", err)
+	}
+	if got := f.repo.versions[stored.ID]; got.BatchNo != second {
+		t.Fatalf("stale release changed batchNo to %d, want %d", got.BatchNo, second)
+	}
+
+	// Releasing the still-current number restores the previous value.
+	if err := f.service.ReleaseBatchNo(ctx, stored.ID, second); err != nil {
+		t.Fatalf("ReleaseBatchNo current: %v", err)
+	}
+	if got := f.repo.versions[stored.ID]; got.BatchNo != first {
+		t.Fatalf("release left batchNo %d, want %d", got.BatchNo, first)
+	}
+
+	// Repeating the compensation and releasing an unknown number are no-ops.
+	if err := f.service.ReleaseBatchNo(ctx, stored.ID, second); err != nil {
+		t.Fatalf("ReleaseBatchNo repeat: %v", err)
+	}
+	if err := f.service.ReleaseBatchNo(ctx, stored.ID, 99); err != nil {
+		t.Fatalf("ReleaseBatchNo unknown: %v", err)
+	}
+	if got := f.repo.versions[stored.ID]; got.BatchNo != first {
+		t.Fatalf("no-op releases changed batchNo to %d, want %d", got.BatchNo, first)
+	}
+
+	// A version that disappeared between allocation and compensation is fine.
+	if err := f.service.ReleaseBatchNo(ctx, 999, 1); err != nil {
+		t.Fatalf("ReleaseBatchNo missing version: %v", err)
+	}
+}
+
+// TestAllocateBatchNoRequiresExecuting covers the status guard and the missing
+// version mapping of the native allocation.
+func TestAllocateBatchNoRequiresExecuting(t *testing.T) {
+	ctx := context.Background()
+	for _, status := range []string{
+		domain.VersionDraft, domain.VersionClarifying, domain.VersionDesigning,
+		domain.VersionReviewing, domain.VersionContinuing, domain.VersionCompleted,
+		domain.VersionArchived,
+	} {
+		t.Run(status, func(t *testing.T) {
+			f := newVersionFixture()
+			stored := f.repo.seed(domain.Version{
+				ID: 100, Name: "Order v2", Status: status,
+				PauseMode: domain.PauseModeGraceful, CreatedBy: 1, UpdatedBy: 1,
+			})
+
+			_, err := f.service.AllocateBatchNo(ctx, stored.ID)
+
+			assertDomainReason(t, err, domain.KindStateConflict, "version_state_conflict")
+			if got := f.repo.versions[stored.ID]; got.BatchNo != 0 || got.Revision != 1 {
+				t.Fatalf("blocked allocation wrote the row: %+v", got)
+			}
+		})
+	}
+
+	t.Run("missing version is 404", func(t *testing.T) {
+		f := newVersionFixture()
+
+		_, err := f.service.AllocateBatchNo(ctx, 999)
+
+		assertDomainReason(t, err, domain.KindNotFound, "not_found")
+	})
 }
 
 // TestCompleteExecutionRejectsPausedVersion covers the completion guard from

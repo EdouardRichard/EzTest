@@ -242,6 +242,157 @@ func TestVersionRepositoryExecutionStateBatchMonotonicConcurrent(t *testing.T) {
 	}
 }
 
+// TestVersionRepositoryAllocateBatchNoAtomic covers the native single-statement
+// allocation: racing callers each increment batch_no exactly once and receive a
+// distinct number, so the unique (version_id, batch_no) index can only reject a
+// genuinely concurrent batch creator.
+func TestVersionRepositoryAllocateBatchNoAtomic(t *testing.T) {
+	ctx := context.Background()
+	pool := testutil.OpenTestDB(t)
+	repo := postgres.NewVersionRepository(pool)
+
+	stored := insertVersion(t, repo, domain.Version{ID: 6005, Name: "Native allocation", CreatedBy: 7, UpdatedBy: 7})
+	if _, err := pool.Exec(ctx, `UPDATE version SET status = 'executing' WHERE id = $1`, stored.ID); err != nil {
+		t.Fatalf("set executing: %v", err)
+	}
+
+	const callers = 2
+	values := make([]int, callers)
+	errs := make([]error, callers)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			values[i], errs[i] = repo.AllocateBatchNo(ctx, stored.ID, 42)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	seen := make(map[int]bool, callers)
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("AllocateBatchNo[%d]: %v", i, err)
+		}
+		if values[i] < 1 || values[i] > callers {
+			t.Fatalf("AllocateBatchNo[%d] = %d, want 1..%d", i, values[i], callers)
+		}
+		if seen[values[i]] {
+			t.Fatalf("duplicate batch number %d in %v", values[i], values)
+		}
+		seen[values[i]] = true
+	}
+
+	got, err := repo.Get(ctx, stored.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.BatchNo != callers || got.Status != domain.VersionExecuting {
+		t.Fatalf("batchNo/status = %d/%s, want %d/executing", got.BatchNo, got.Status, callers)
+	}
+	if got.Revision != 1+callers || got.UpdatedBy != 42 {
+		t.Fatalf("revision/updatedBy = %d/%d, want %d/42", got.Revision, got.UpdatedBy, 1+callers)
+	}
+}
+
+// TestVersionRepositoryReleaseBatchNo covers the guarded compensation: only a
+// release whose number is still stored decrements batch_no; stale, repeated and
+// unknown releases are no-ops, and a missing version is tolerated.
+func TestVersionRepositoryReleaseBatchNo(t *testing.T) {
+	ctx := context.Background()
+	pool := testutil.OpenTestDB(t)
+	repo := postgres.NewVersionRepository(pool)
+
+	stored := insertVersion(t, repo, domain.Version{ID: 6006, Name: "Native release", CreatedBy: 7, UpdatedBy: 7})
+	if _, err := pool.Exec(ctx, `UPDATE version SET status = 'executing' WHERE id = $1`, stored.ID); err != nil {
+		t.Fatalf("set executing: %v", err)
+	}
+
+	first, err := repo.AllocateBatchNo(ctx, stored.ID, 42)
+	if err != nil {
+		t.Fatalf("AllocateBatchNo first: %v", err)
+	}
+	second, err := repo.AllocateBatchNo(ctx, stored.ID, 42)
+	if err != nil {
+		t.Fatalf("AllocateBatchNo second: %v", err)
+	}
+	if first != 1 || second != 2 {
+		t.Fatalf("allocated = %d/%d, want 1/2", first, second)
+	}
+
+	// Retrieving the stale first number must not roll the newest one back.
+	if err := repo.ReleaseBatchNo(ctx, stored.ID, first, 43); err != nil {
+		t.Fatalf("ReleaseBatchNo stale: %v", err)
+	}
+	afterStale, err := repo.Get(ctx, stored.ID)
+	if err != nil {
+		t.Fatalf("Get after stale release: %v", err)
+	}
+	if afterStale.BatchNo != second {
+		t.Fatalf("stale release changed batchNo to %d, want %d", afterStale.BatchNo, second)
+	}
+
+	// Releasing the still-current number restores the previous value.
+	if err := repo.ReleaseBatchNo(ctx, stored.ID, second, 43); err != nil {
+		t.Fatalf("ReleaseBatchNo current: %v", err)
+	}
+	afterCurrent, err := repo.Get(ctx, stored.ID)
+	if err != nil {
+		t.Fatalf("Get after current release: %v", err)
+	}
+	if afterCurrent.BatchNo != first {
+		t.Fatalf("release left batchNo %d, want %d", afterCurrent.BatchNo, first)
+	}
+	if afterCurrent.UpdatedBy != 43 {
+		t.Fatalf("updatedBy = %d, want the compensating actor 43", afterCurrent.UpdatedBy)
+	}
+
+	// Repeating a compensation or releasing an unknown number is a no-op.
+	if err := repo.ReleaseBatchNo(ctx, stored.ID, second, 44); err != nil {
+		t.Fatalf("ReleaseBatchNo repeat: %v", err)
+	}
+	if err := repo.ReleaseBatchNo(ctx, stored.ID, 99, 44); err != nil {
+		t.Fatalf("ReleaseBatchNo unknown: %v", err)
+	}
+	afterNoops, err := repo.Get(ctx, stored.ID)
+	if err != nil {
+		t.Fatalf("Get after no-op releases: %v", err)
+	}
+	if afterNoops.BatchNo != first || afterNoops.UpdatedBy != 43 {
+		t.Fatalf("no-op releases wrote the row: %+v", afterNoops)
+	}
+
+	// A row that disappeared between allocation and compensation is tolerated.
+	if err := repo.ReleaseBatchNo(ctx, 999999, 1, 44); err != nil {
+		t.Fatalf("ReleaseBatchNo missing version: %v", err)
+	}
+}
+
+// TestVersionRepositoryAllocateBatchNoGuards covers the allocation status guard
+// and the missing-version mapping.
+func TestVersionRepositoryAllocateBatchNoGuards(t *testing.T) {
+	ctx := context.Background()
+	pool := testutil.OpenTestDB(t)
+	repo := postgres.NewVersionRepository(pool)
+
+	draft := insertVersion(t, repo, domain.Version{ID: 6007, Name: "Draft allocation", CreatedBy: 7, UpdatedBy: 7})
+	_, err := repo.AllocateBatchNo(ctx, draft.ID, 42)
+	assertVersionKind(t, err, domain.KindStateConflict, "version_state_conflict")
+	afterDraft, err := repo.Get(ctx, draft.ID)
+	if err != nil {
+		t.Fatalf("Get draft: %v", err)
+	}
+	if afterDraft.BatchNo != 0 || afterDraft.Revision != 1 {
+		t.Fatalf("blocked allocation wrote the row: %+v", afterDraft)
+	}
+
+	_, err = repo.AllocateBatchNo(ctx, 999999, 42)
+	assertVersionKind(t, err, domain.KindNotFound, "not_found")
+}
+
 // TestVersionRepositoryExecutionStatePauseCompleteRace races a pause against a
 // completion: the guarded completion and the status-guarded pause must not both
 // win, and the stored row must match the winner.
