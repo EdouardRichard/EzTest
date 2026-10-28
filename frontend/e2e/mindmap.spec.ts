@@ -292,15 +292,47 @@ test("generates, edits, reviews, freezes and exports a P5 case mindmap", async (
     )
     if (unlinked === undefined) throw new Error("no unlinked requirement is left to add")
 
-    // Add a second requirement source, so the UI believes two rows exist.
+    // Add a second requirement source. P7 materializes an extra `ai_run`
+    // provenance source on every generated case, so assert the exact typed set
+    // (two requirement rows plus one AI-run row), not a hard-coded row count.
     await expect(page.getByTestId("source-panel")).toBeVisible()
     await page.getByLabel("选择需求").selectOption(unlinked.id)
     await page.getByRole("button", { name: "添加需求来源" }).click()
-    await expect(page.locator('[data-testid^="source-row-"]')).toHaveCount(2)
+    await expect
+      .poll(
+        async () =>
+          graphNode(await getMindmap(request, token, versionId), caseId).sources.filter(
+            (source) => source.refKind === "requirement",
+          ).length,
+        { timeout: 30_000 },
+      )
+      .toBe(2)
 
     const withTwo = graphNode(await getMindmap(request, token, versionId), caseId)
     const requirementSources = withTwo.sources.filter((source) => source.refKind === "requirement")
     expect(requirementSources).toHaveLength(2)
+    const aiRunSources = withTwo.sources.filter((source) => source.refKind === "ai_run")
+    expect(aiRunSources, "the design run leaves one AI-run provenance source").toHaveLength(1)
+    expect(withTwo.sources.map((source) => source.refKind).sort()).toEqual([
+      "ai_run",
+      "requirement",
+      "requirement",
+    ])
+
+    // Pin every row by its graph source id and keep the P5 guarantee that the
+    // rows render with their content-source and confidence badges.
+    const sourceRows = page.locator('[data-testid^="source-row-"]')
+    await expect(sourceRows).toHaveCount(withTwo.sources.length)
+    await expect(sourceRows.filter({ hasText: "需求：" })).toHaveCount(2)
+    await expect(sourceRows.filter({ hasText: "AI 运行：" })).toHaveCount(1)
+    for (const source of withTwo.sources) {
+      const row = page.getByTestId(`source-row-${source.id}`)
+      await expect(row).toBeVisible()
+      await expect(row).toContainText(source.refKind === "requirement" ? "需求：" : "AI 运行：")
+      await expect(row.getByText(/^(人工|AI|AI 补充)$/)).toBeVisible()
+      await expect(row.getByText(/^置信度 (高|中|低)$/)).toBeVisible()
+    }
+
     const originalSource = requirementSources.find((source) => source.refId === linkedRequirementId)
     const addedSource = requirementSources.find((source) => source.refId === unlinked.id)
     if (originalSource === undefined || addedSource === undefined) {
