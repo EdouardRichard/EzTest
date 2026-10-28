@@ -86,7 +86,7 @@ func scanMessage(row rowScanner) (agent.Message, error) {
 // is the order the history must be replayed in.
 func (r *MessageRepository) ListBySession(ctx context.Context, sessionID int64) ([]agent.Message, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT `+messageColumns+` FROM agent_messages WHERE session_id = $1 ORDER BY id ASC`, sessionID)
+		`SELECT `+messageColumns+` FROM agent_message WHERE session_id = $1 ORDER BY id ASC`, sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list agent messages: %w", err)
 	}
@@ -109,7 +109,7 @@ func (r *MessageRepository) ListBySession(ctx context.Context, sessionID int64) 
 // Get returns one message by ID.
 func (r *MessageRepository) Get(ctx context.Context, id int64) (agent.Message, error) {
 	message, err := scanMessage(r.pool.QueryRow(ctx,
-		`SELECT `+messageColumns+` FROM agent_messages WHERE id = $1`, id))
+		`SELECT `+messageColumns+` FROM agent_message WHERE id = $1`, id))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return agent.Message{}, agent.ErrNotFound
@@ -133,7 +133,7 @@ func (r *MessageRepository) Append(ctx context.Context, message agent.Message) (
 	if err != nil {
 		return agent.Message{}, fmt.Errorf("postgres: encode message usage: %w", err)
 	}
-	const query = `INSERT INTO agent_messages
+	const query = `INSERT INTO agent_message
 		(session_id, run_id, role, content, reasoning, tool_calls, tool_call_id, tool_name, usage)
 		VALUES ($1, $2, $3, $4::jsonb, $5, $6::jsonb, $7, $8, $9::jsonb)
 		RETURNING ` + messageColumns
@@ -162,7 +162,7 @@ func (r *MessageRepository) Append(ctx context.Context, message agent.Message) (
 func (r *MessageRepository) AppendAssistantPlaceholder(ctx context.Context, sessionID, runID int64) (int64, error) {
 	var id int64
 	if err := r.pool.QueryRow(ctx,
-		`INSERT INTO agent_messages (session_id, run_id, role, content)
+		`INSERT INTO agent_message (session_id, run_id, role, content)
 		 VALUES ($1, $2, 'assistant', '[]'::jsonb)
 		 RETURNING id`,
 		sessionID, runID).Scan(&id); err != nil {
@@ -191,7 +191,7 @@ func (r *MessageRepository) CompleteAssistant(ctx context.Context, messageID int
 		return fmt.Errorf("postgres: encode assistant usage: %w", err)
 	}
 	tag, err := r.pool.Exec(ctx,
-		`UPDATE agent_messages
+		`UPDATE agent_message
 		    SET content = $2::jsonb, reasoning = $3, tool_calls = $4::jsonb, usage = $5::jsonb
 		  WHERE id = $1 AND role = 'assistant'`,
 		messageID, content, reasoning, toolCalls, encodedUsage)

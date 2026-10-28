@@ -17,7 +17,7 @@ import (
 const runColumnList = `id, session_id, status, terminal_reason, abort_code, abort_message, error_code, error_message, turns, input_tokens, output_tokens, reasoning_tokens, last_tool_name, last_tool_pending, started_at, ended_at`
 
 // runProjection returns runColumnList qualified with a table alias, so a query
-// can join agent_runs more than once and still share the column order.
+// can join agent_run more than once and still share the column order.
 func runProjection(alias string) string {
 	prefix := alias + "."
 	return prefix + strings.ReplaceAll(runColumnList, ", ", ", "+prefix)
@@ -96,12 +96,12 @@ func (r *RunRepository) CreateTurn(ctx context.Context, sessionID int64, content
 		return agent.TurnIDs{}, fmt.Errorf("postgres: encode user message content: %w", err)
 	}
 	const query = `WITH ins_run AS (
-  INSERT INTO agent_runs (session_id, status) VALUES ($1, 'running') RETURNING id
+  INSERT INTO agent_run (session_id, status) VALUES ($1, 'running') RETURNING id
 ), ins_msg AS (
-  INSERT INTO agent_messages (session_id, run_id, role, content)
+  INSERT INTO agent_message (session_id, run_id, role, content)
   SELECT $1, ins_run.id, 'user', $2::jsonb FROM ins_run RETURNING id
 ), upd AS (
-  UPDATE agent_sessions
+  UPDATE agent_session
      SET last_activity_at = now(), updated_at = now(),
          title = CASE WHEN title = '' THEN $3 ELSE title END
    WHERE id = $1
@@ -120,7 +120,7 @@ SELECT ins_run.id, ins_msg.id FROM ins_run, ins_msg`
 // Get returns one run by ID.
 func (r *RunRepository) Get(ctx context.Context, id int64) (agent.Run, error) {
 	run, err := scanRun(r.pool.QueryRow(ctx,
-		`SELECT `+runColumnList+` FROM agent_runs WHERE id = $1`, id))
+		`SELECT `+runColumnList+` FROM agent_run WHERE id = $1`, id))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return agent.Run{}, agent.ErrNotFound
@@ -134,7 +134,7 @@ func (r *RunRepository) Get(ctx context.Context, id int64) (agent.Run, error) {
 // there is at most one.
 func (r *RunRepository) Active(ctx context.Context, sessionID int64) (agent.Run, error) {
 	run, err := scanRun(r.pool.QueryRow(ctx,
-		`SELECT `+runColumnList+` FROM agent_runs WHERE session_id = $1 AND status = 'running' ORDER BY id DESC LIMIT 1`,
+		`SELECT `+runColumnList+` FROM agent_run WHERE session_id = $1 AND status = 'running' ORDER BY id DESC LIMIT 1`,
 		sessionID))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -149,7 +149,7 @@ func (r *RunRepository) Active(ctx context.Context, sessionID int64) (agent.Run,
 // by Active instead, so it is never returned here.
 func (r *RunRepository) Latest(ctx context.Context, sessionID int64) (agent.Run, error) {
 	run, err := scanRun(r.pool.QueryRow(ctx,
-		`SELECT `+runColumnList+` FROM agent_runs WHERE session_id = $1 AND status <> 'running' ORDER BY id DESC LIMIT 1`,
+		`SELECT `+runColumnList+` FROM agent_run WHERE session_id = $1 AND status <> 'running' ORDER BY id DESC LIMIT 1`,
 		sessionID))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -163,7 +163,7 @@ func (r *RunRepository) Latest(ctx context.Context, sessionID int64) (agent.Run,
 // UpdateProgress records the completed turns and their accumulated usage.
 func (r *RunRepository) UpdateProgress(ctx context.Context, runID int64, turns int, usage agent.Usage) error {
 	tag, err := r.pool.Exec(ctx,
-		`UPDATE agent_runs
+		`UPDATE agent_run
 		    SET turns = $2, input_tokens = $3, output_tokens = $4, reasoning_tokens = $5
 		  WHERE id = $1`,
 		runID, turns, usage.PromptTokens, usage.CompletionTokens, usage.ReasoningTokens)
@@ -188,7 +188,7 @@ func (r *RunRepository) Finish(ctx context.Context, runID int64, result agent.Ru
 		terminalReason = string(result.TerminalReason)
 	}
 	tag, err := r.pool.Exec(ctx,
-		`UPDATE agent_runs
+		`UPDATE agent_run
 		    SET status = $2, terminal_reason = $3, abort_code = $4, abort_message = $5,
 		        error_code = $6, error_message = $7, turns = $8, input_tokens = $9,
 		        output_tokens = $10, reasoning_tokens = $11, last_tool_name = $12,
@@ -223,7 +223,7 @@ func (r *RunRepository) Finish(ctx context.Context, runID int64, result agent.Ru
 // the domain RunRepository port: only the recovery path needs it.
 func (r *RunRepository) ListRunningInterrupted(ctx context.Context) ([]agent.Run, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT `+runColumnList+` FROM agent_runs WHERE status = 'running' ORDER BY id`)
+		`SELECT `+runColumnList+` FROM agent_run WHERE status = 'running' ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list running agent runs: %w", err)
 	}
@@ -248,7 +248,7 @@ func (r *RunRepository) ListRunningInterrupted(ctx context.Context) ([]agent.Run
 // created and finished by the live in-process runner.
 func (r *RunRepository) MarkRunningInterrupted(ctx context.Context) (int64, error) {
 	tag, err := r.pool.Exec(ctx,
-		`UPDATE agent_runs
+		`UPDATE agent_run
 		    SET status = 'interrupted', terminal_reason = 'interrupted', ended_at = now()
 		  WHERE status = 'running'`)
 	if err != nil {

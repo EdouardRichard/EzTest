@@ -4,7 +4,7 @@ import "time"
 
 // Session is one agent conversation. ProfileKey is filled by the repositories
 // so the API can expose the profile without a second lookup; it is a read-time
-// projection, not a column of agent_sessions.
+// projection, not a column of agent_session.
 type Session struct {
 	ID             int64
 	ProfileID      int64

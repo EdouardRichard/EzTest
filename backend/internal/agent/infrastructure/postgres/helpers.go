@@ -55,7 +55,7 @@ func mapForeignKeyViolation(err error) error {
 }
 
 // nullIfEmpty maps the domain's empty string to SQL NULL, used by the nullable
-// terminal columns of agent_runs.
+// terminal columns of agent_run.
 func nullIfEmpty(value string) any {
 	if value == "" {
 		return nil
@@ -64,7 +64,7 @@ func nullIfEmpty(value string) any {
 }
 
 // encodeParts marshals message parts to the JSONB text stored in
-// agent_messages.content. A nil slice is stored as an empty JSON array, never
+// agent_message.content. A nil slice is stored as an empty JSON array, never
 // as SQL NULL, because the column is NOT NULL.
 func encodeParts(parts []agent.Part) (string, error) {
 	if parts == nil {

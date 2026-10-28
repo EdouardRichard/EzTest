@@ -57,7 +57,7 @@ func scanProfile(row rowScanner) (agent.AgentProfile, error) {
 
 // List returns every profile ordered by ID ascending.
 func (r *ProfileRepository) List(ctx context.Context) ([]agent.AgentProfile, error) {
-	rows, err := r.pool.Query(ctx, `SELECT `+profileColumns+` FROM agent_profiles ORDER BY id ASC`)
+	rows, err := r.pool.Query(ctx, `SELECT `+profileColumns+` FROM agent_profile ORDER BY id ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list agent profiles: %w", err)
 	}
@@ -80,7 +80,7 @@ func (r *ProfileRepository) List(ctx context.Context) ([]agent.AgentProfile, err
 // Get returns one profile by ID.
 func (r *ProfileRepository) Get(ctx context.Context, id int64) (agent.AgentProfile, error) {
 	profile, err := scanProfile(r.pool.QueryRow(ctx,
-		`SELECT `+profileColumns+` FROM agent_profiles WHERE id = $1`, id))
+		`SELECT `+profileColumns+` FROM agent_profile WHERE id = $1`, id))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return agent.AgentProfile{}, agent.ErrNotFound
@@ -102,7 +102,7 @@ func (r *ProfileRepository) Update(ctx context.Context, id int64, params agent.U
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	existing, err := scanProfile(tx.QueryRow(ctx,
-		`SELECT `+profileColumns+` FROM agent_profiles WHERE id = $1 FOR UPDATE`, id))
+		`SELECT `+profileColumns+` FROM agent_profile WHERE id = $1 FOR UPDATE`, id))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return agent.AgentProfile{}, agent.ErrNotFound
@@ -117,7 +117,7 @@ func (r *ProfileRepository) Update(ctx context.Context, id int64, params agent.U
 		allowedTools = []string{}
 	}
 
-	const query = `UPDATE agent_profiles SET
+	const query = `UPDATE agent_profile SET
 		system_prompt = $2, model = $3, allowed_tools = $4, max_turns = $5,
 		run_seconds = $6, hard_timeout_seconds = $7, thinking = $8,
 		reasoning_effort = $9, max_output_tokens = $10, enabled = $11,
@@ -157,7 +157,7 @@ func (r *ProfileRepository) EnsureBuiltin(ctx context.Context, profile agent.Age
 	if allowedTools == nil {
 		allowedTools = []string{}
 	}
-	const query = `INSERT INTO agent_profiles
+	const query = `INSERT INTO agent_profile
 		(key, name, description, builtin, enabled, system_prompt, model, allowed_tools,
 		 max_turns, run_seconds, hard_timeout_seconds, thinking, reasoning_effort, max_output_tokens)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)

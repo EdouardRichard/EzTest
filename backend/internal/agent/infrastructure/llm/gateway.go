@@ -182,7 +182,7 @@ func (c *caller) resolveImageRefs(ctx context.Context, messages []agentapp.LLMMe
 
 // badRequestError is a request the gateway refuses before reaching the upstream.
 // It carries the public llm_bad_request code so the runner persists the precise
-// cause in agent_runs.
+// cause in agent_run.
 func badRequestError(message string) error {
 	return &codedError{code: platform.CodeLLMBadRequest, err: errors.New(message)}
 }
@@ -347,7 +347,7 @@ func forwardStream(ctx context.Context, source <-chan llmapp.StreamEvent, out ch
 }
 
 // codedError carries a stable public error code alongside the upstream cause, so
-// the runner can persist it as agent_runs.error_code (agentapp.CodedError).
+// the runner can persist it as agent_run.error_code (agentapp.CodedError).
 type codedError struct {
 	code string
 	err  error

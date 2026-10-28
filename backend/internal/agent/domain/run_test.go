@@ -20,7 +20,7 @@ func TestTerminalReasonSets(t *testing.T) {
 		agent.ReasonRunHardTimeout,
 		agent.ReasonInterrupted,
 	}
-	// The set must match the agent_runs.terminal_reason CHECK constraint exactly.
+	// The set must match the agent_run.terminal_reason CHECK constraint exactly.
 	if len(reasons) != 11 {
 		t.Fatalf("terminal reason count=%d want 11", len(reasons))
 	}
@@ -51,7 +51,7 @@ func TestTerminalReasonSets(t *testing.T) {
 		agent.RunAborted,
 		agent.RunInterrupted,
 	}
-	// The set must match the agent_runs.status CHECK constraint exactly.
+	// The set must match the agent_run.status CHECK constraint exactly.
 	if len(statuses) != 5 {
 		t.Fatalf("run status count=%d want 5", len(statuses))
 	}
