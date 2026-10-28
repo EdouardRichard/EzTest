@@ -1,4 +1,4 @@
-import { apiDelete, apiGet, apiPatch, apiPost } from "@/lib/api-client"
+import { ApiError, apiDelete, apiGet, apiPatch, apiPost, apiPut } from "@/lib/api-client"
 
 import type {
   AccessDTO,
@@ -6,6 +6,9 @@ import type {
   AppModelNodeDTO,
   AuthFlowDefinitionDTO,
   AuthFlowDTO,
+  DBTargetDTO,
+  DBTargetTestResultDTO,
+  DBTargetWriteInput,
   EnvironmentDTO,
   Page,
   SessionDTO,
@@ -366,4 +369,65 @@ export function completeTakeover(
 
 export function cancelTakeover(id: number): Promise<{ id: number; status: string }> {
   return apiPost<{ id: number; status: string }>(`${takeoverPath(id)}/cancel`)
+}
+
+// --- DB target (spec §7.8, admin-only) --------------------------------------
+
+function dbTargetPath(environmentId: number): string {
+  return `${environmentPath(environmentId)}/db-target`
+}
+
+/**
+ * Reads the environment's read-only database target. The API answers 200 with
+ * `data:null` when nothing is configured yet, so this resolves to null instead
+ * of throwing.
+ */
+export function getDbTarget(environmentId: number): Promise<DBTargetDTO | null> {
+  return apiGet<DBTargetDTO | null>(dbTargetPath(environmentId))
+}
+
+/** Creates or replaces the target; an omitted `password` keeps the stored one. */
+export function upsertDbTarget(
+  environmentId: number,
+  input: DBTargetWriteInput,
+): Promise<DBTargetDTO> {
+  return apiPut<DBTargetDTO>(dbTargetPath(environmentId), input)
+}
+
+export async function deleteDbTarget(environmentId: number): Promise<void> {
+  await apiDelete<void>(dbTargetPath(environmentId))
+}
+
+/**
+ * Probes the connection. With `input` the unsaved form values are tested and
+ * nothing is persisted; without it the stored configuration is probed.
+ */
+export function testDbTarget(
+  environmentId: number,
+  input?: DBTargetWriteInput,
+): Promise<DBTargetTestResultDTO> {
+  return apiPost<DBTargetTestResultDTO>(`${dbTargetPath(environmentId)}/test`, input)
+}
+
+/**
+ * Maps DB target write/test failures onto readable Chinese messages. The stable
+ * reason codes of spec §7.11 stay visible because they drive the form guidance.
+ */
+export function describeDBTargetError(error: unknown): string {
+  if (error instanceof ApiError) {
+    if (error.status === 0) return "无法连接 API 服务，请确认后端已启动。"
+    if (error.status === 403) return "当前账户没有管理员权限，无法维护目标数据库。"
+    if (error.status === 404) return "环境不存在或已被删除。"
+    const reason = typeof error.details.reason === "string" ? error.details.reason : ""
+    const field = typeof error.details.field === "string" ? error.details.field : ""
+    if (reason === "db_target_invalid") {
+      return field === ""
+        ? `目标数据库配置不合法：${error.message}`
+        : `目标数据库配置不合法（${field}）：${error.message}`
+    }
+    if (reason === "db_target_missing") return "该环境尚未配置可用的目标数据库。"
+    if (error.retryable) return `${error.message}（可重试）`
+    return error.message
+  }
+  return error instanceof Error ? error.message : "未知错误"
 }

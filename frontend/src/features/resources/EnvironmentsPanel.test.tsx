@@ -6,6 +6,10 @@ const mocks = vi.hoisted(() => ({
   createEnvironment: vi.fn(),
   updateEnvironment: vi.fn(),
   deleteEnvironment: vi.fn(),
+  getDbTarget: vi.fn(),
+  upsertDbTarget: vi.fn(),
+  deleteDbTarget: vi.fn(),
+  testDbTarget: vi.fn(),
 }))
 
 vi.mock("./api", () => ({
@@ -13,6 +17,11 @@ vi.mock("./api", () => ({
   createEnvironment: mocks.createEnvironment,
   updateEnvironment: mocks.updateEnvironment,
   deleteEnvironment: mocks.deleteEnvironment,
+  getDbTarget: mocks.getDbTarget,
+  upsertDbTarget: mocks.upsertDbTarget,
+  deleteDbTarget: mocks.deleteDbTarget,
+  testDbTarget: mocks.testDbTarget,
+  describeDBTargetError: (error: unknown) => (error instanceof Error ? error.message : "未知错误"),
 }))
 
 import { ApiError } from "@/lib/api-client"
@@ -51,7 +60,12 @@ describe("EnvironmentsPanel", () => {
     mocks.createEnvironment.mockReset()
     mocks.updateEnvironment.mockReset()
     mocks.deleteEnvironment.mockReset()
+    mocks.getDbTarget.mockReset()
+    mocks.upsertDbTarget.mockReset()
+    mocks.deleteDbTarget.mockReset()
+    mocks.testDbTarget.mockReset()
     mocks.listEnvironments.mockResolvedValue([STAGING])
+    mocks.getDbTarget.mockResolvedValue(null)
   })
 
   afterEach(() => {
@@ -295,5 +309,44 @@ describe("EnvironmentsPanel", () => {
     const alert = await screen.findByRole("alert")
     expect(alert.textContent).toContain("has_dependencies")
     expect(screen.getByText("Staging")).toBeTruthy()
+  })
+
+  it("opens the admin-only DB target section for an environment", async () => {
+    render(<EnvironmentsPanel systemId={1} canWrite />)
+    await screen.findByText("Staging")
+
+    expect(screen.queryByTestId("db-target-form")).toBeNull()
+    fireEvent.click(screen.getByRole("button", { name: "目标数据库 Staging" }))
+
+    expect(await screen.findByTestId("db-target-form")).toBeTruthy()
+    await waitFor(() => expect(mocks.getDbTarget).toHaveBeenCalledWith(1))
+    expect(
+      screen.getByText("Staging 的只读 PostgreSQL 目标；仅管理员可维护，密码只写不回显。"),
+    ).toBeTruthy()
+  })
+
+  it("hides the DB target entry point from readonly users", async () => {
+    render(<EnvironmentsPanel systemId={1} canWrite={false} />)
+    await screen.findByText("Staging")
+
+    expect(screen.queryByRole("button", { name: "目标数据库 Staging" })).toBeNull()
+    expect(screen.queryByTestId("db-target-form")).toBeNull()
+    expect(mocks.getDbTarget).not.toHaveBeenCalled()
+  })
+
+  it("closes the DB target section when the selected system changes", async () => {
+    mocks.listEnvironments.mockImplementation(async (systemId: number) =>
+      systemId === 1 ? [STAGING] : [makeEnvironment(9, 2, "other", "Other")],
+    )
+
+    const { rerender } = render(<EnvironmentsPanel systemId={1} canWrite />)
+    await screen.findByText("Staging")
+    fireEvent.click(screen.getByRole("button", { name: "目标数据库 Staging" }))
+    await screen.findByTestId("db-target-form")
+
+    rerender(<EnvironmentsPanel systemId={2} canWrite />)
+
+    expect(await screen.findByText("Other")).toBeTruthy()
+    await waitFor(() => expect(screen.queryByTestId("db-target-section")).toBeNull())
   })
 })
