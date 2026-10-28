@@ -16,7 +16,7 @@ import {
   updateRequirement,
 } from "./api"
 import { REQUIREMENT_STATUS_META } from "./RequirementList"
-import type { Requirement, RequirementPriority } from "./types"
+import type { Requirement, RequirementPriority, VersionStatus } from "./types"
 
 const TITLE_MAX = 300
 const DESCRIPTION_MAX = 20000
@@ -201,11 +201,18 @@ function EditorError({ message, onRefresh }: ErrorBannerProps) {
 
 type CreateRequirementFormProps = {
   versionId: string
+  /** The backend turns a completed version into continuing on creation (§6.1). */
+  versionStatus?: VersionStatus
   onCreated: (requirement: Requirement) => void
   onCancel: () => void
 }
 
-function CreateRequirementForm({ versionId, onCreated, onCancel }: CreateRequirementFormProps) {
+function CreateRequirementForm({
+  versionId,
+  versionStatus,
+  onCreated,
+  onCancel,
+}: CreateRequirementFormProps) {
   const [form, setForm] = useState<RequirementFormState>(EMPTY_FORM)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState("")
@@ -245,6 +252,15 @@ function CreateRequirementForm({ versionId, onCreated, onCancel }: CreateRequire
         <h2 className="text-base font-semibold">新增需求</h2>
         <StatusBadge variant="info">创建后为草稿</StatusBadge>
       </div>
+
+      {versionStatus === "completed" ? (
+        <p
+          role="status"
+          className="rounded-xl border border-sky-500/25 bg-sky-500/10 px-3 py-2 text-xs text-sky-700 dark:text-sky-300"
+        >
+          当前版本已完成：创建需求后将自动进入继续中，并开始增量澄清。
+        </p>
+      ) : null}
 
       <RequirementFields form={form} readOnly={false} onChange={updateForm} />
 
@@ -521,6 +537,8 @@ export type RequirementEditorProps = {
   requirement: Requirement | null
   /** True while the workbench shows the create form instead of an editor. */
   creating: boolean
+  /** Current version status; a completed version warns about continuing. */
+  versionStatus?: VersionStatus
   onCreated: (requirement: Requirement) => void
   onUpdated: (requirement: Requirement) => void
   onDeleted: (requirementId: string) => void
@@ -541,6 +559,7 @@ export function RequirementEditor({
   versionId,
   requirement,
   creating,
+  versionStatus,
   onCreated,
   onUpdated,
   onDeleted,
@@ -556,6 +575,7 @@ export function RequirementEditor({
       >
         <CreateRequirementForm
           versionId={versionId}
+          versionStatus={versionStatus}
           onCreated={onCreated}
           onCancel={onCancelCreate}
         />

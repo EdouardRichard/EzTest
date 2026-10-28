@@ -6,6 +6,7 @@ import {
   Loader2,
   Network,
   Pause,
+  Plus,
   RefreshCw,
   UserRoundCheck,
 } from "lucide-react"
@@ -25,6 +26,8 @@ import type { Batch, PauseMode } from "@/features/execution/types"
 import { ApiError } from "@/lib/api-client"
 
 import { enterDesign, startClarification } from "./api"
+import { ContinuingBanner } from "./ContinuingBanner"
+import { IncrementalPlanPanel } from "./IncrementalPlanPanel"
 import type { Version, VersionResource, VersionStatus } from "./types"
 import type { VersionStreamState } from "./useVersionStream"
 
@@ -38,7 +41,7 @@ export const VERSION_STATUS_META: Record<
   designing: { label: "设计中", variant: "warning" },
   reviewing: { label: "评审中", variant: "info" },
   executing: { label: "执行中", variant: "warning" },
-  continuing: { label: "继续执行", variant: "warning" },
+  continuing: { label: "继续中", variant: "warning" },
   completed: { label: "已完成", variant: "success" },
   archived: { label: "已归档", variant: "neutral" },
 }
@@ -108,6 +111,8 @@ export type VersionHeaderExecution = {
   onBatchChange: (batchId: string) => void
   onOpenReport: () => void
   onOpenSessions: () => void
+  /** Switches to the results tab after the incremental batch is created. */
+  onOpenResults?: () => void
 }
 
 export type VersionHeaderProps = {
@@ -118,6 +123,12 @@ export type VersionHeaderProps = {
   onRefresh: () => void
   /** Receives every version returned by a state-changing action. */
   onUpdated: (version: Version) => void
+  /** Opens the requirements tab for the completed/continuing 新增需求 entry. */
+  onAddRequirement?: () => void
+  /** Opens the code-changes tab for the continuing 查看变更 entry. */
+  onViewChanges?: () => void
+  /** Opens the requirements tab for the continuing 去澄清 action. */
+  onOpenClarification?: () => void
   /** P6 execution controls; absent while the header is used without them. */
   execution?: VersionHeaderExecution
 }
@@ -170,6 +181,9 @@ export function VersionHeader({
   refreshing,
   onRefresh,
   onUpdated,
+  onAddRequirement,
+  onViewChanges,
+  onOpenClarification,
   execution,
 }: VersionHeaderProps) {
   const [busy, setBusy] = useState<"start" | "design" | null>(null)
@@ -178,12 +192,31 @@ export function VersionHeader({
   const [pendingWarnings, setPendingWarnings] = useState<PendingWarnings | null>(null)
   const [pauseDialogOpen, setPauseDialogOpen] = useState(false)
   const [pauseDialogError, setPauseDialogError] = useState("")
+  // The plan panel belongs to one continuing episode. Keying the open state by
+  // version+status closes it on any transition without an effect.
+  const planKey = `${version.id}:${version.status}`
+  const [planState, setPlanState] = useState<{ key: string; open: boolean }>({
+    key: planKey,
+    open: false,
+  })
+  const planOpen = planState.key === planKey && planState.open
 
   const unclarifiedCount = Math.max(version.requirementCount - version.clarifiedCount, 0)
   const executable = version.status === "executing" || version.status === "continuing"
   const activeBatch = execution?.activeBatch ?? null
   const executionPending = execution?.actions.pending ?? ""
   const selectedBatch = execution?.selectedBatchId ?? ""
+  const continuing = version.status === "continuing"
+  // The active incremental batch already owns the next batch number, so the
+  // badge must use it; before allocation (clarify/design) it falls back to the
+  // server `batch_no + 1` rule (spec §10.1 / review ruling).
+  const continuingBatchNo = execution?.activeBatch?.batch_no ?? (version.batch_no ?? 0) + 1
+  const continuingLabel = `继续中（第 ${continuingBatchNo} 批）`
+  const showAddRequirement = version.status === "completed" || continuing
+
+  function togglePlan(): void {
+    setPlanState({ key: planKey, open: !planOpen })
+  }
 
   async function handleStartClarification(): Promise<void> {
     setBusy("start")
@@ -271,9 +304,15 @@ export function VersionHeader({
                 {version.label}
               </span>
             )}
-            <StatusBadge variant={versionStatusVariant(version.status)}>
-              {versionStatusLabel(version.status)}
-            </StatusBadge>
+            {continuing ? (
+              <StatusBadge variant="warning">
+                <span data-testid="continuing-badge">{continuingLabel}</span>
+              </StatusBadge>
+            ) : (
+              <StatusBadge variant={versionStatusVariant(version.status)}>
+                {versionStatusLabel(version.status)}
+              </StatusBadge>
+            )}
           </div>
 
           <p className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
@@ -338,7 +377,7 @@ export function VersionHeader({
             onStart={() => void handleStartBatch()}
           />
 
-          {executable && activeBatch !== null && !activeBatch.paused ? (
+          {executable && (activeBatch === null || !activeBatch.paused) ? (
             <button
               type="button"
               data-testid="exec-pause-btn"
@@ -346,11 +385,42 @@ export function VersionHeader({
                 setPauseDialogError("")
                 setPauseDialogOpen(true)
               }}
-              disabled={executionPending !== "" || execution === undefined}
+              // No active batch (or a paused version) has nothing to pause; the
+              // control stays visible but disabled so the rule is explicit.
+              disabled={
+                executionPending !== "" ||
+                execution === undefined ||
+                activeBatch === null ||
+                version.paused === true
+              }
               className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-2 text-sm font-medium transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
               <Pause className="h-4 w-4" aria-hidden="true" />
               暂停
+            </button>
+          ) : null}
+
+          {showAddRequirement ? (
+            <button
+              type="button"
+              data-testid="add-requirement-btn"
+              onClick={() => onAddRequirement?.()}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-2 text-sm font-medium transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <Plus className="h-4 w-4" aria-hidden="true" />
+              新增需求
+            </button>
+          ) : null}
+
+          {continuing ? (
+            <button
+              type="button"
+              data-testid="view-changes-btn"
+              onClick={() => onViewChanges?.()}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-2 text-sm font-medium transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <FileText className="h-4 w-4" aria-hidden="true" />
+              查看变更
             </button>
           ) : null}
 
@@ -390,6 +460,26 @@ export function VersionHeader({
           </button>
         </div>
       </div>
+
+      {continuing ? (
+        <ContinuingBanner
+          version={version}
+          activeBatch={activeBatch}
+          onClarify={onOpenClarification}
+          onOpenPlan={togglePlan}
+          onOpenSessions={execution?.onOpenSessions}
+        />
+      ) : null}
+
+      {continuing && planOpen ? (
+        <IncrementalPlanPanel
+          versionId={version.id}
+          onCreated={() => {
+            setPlanState({ key: planKey, open: false })
+            execution?.onOpenResults?.()
+          }}
+        />
+      ) : null}
 
       {execution !== undefined && activeBatch?.paused ? (
         <PausedBanner

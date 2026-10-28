@@ -10,7 +10,6 @@ import {
   type ExplorationDeepLink,
   ExplorationTab,
 } from "@/features/execution/components/ExplorationTab"
-import { ReportTab } from "@/features/execution/components/ReportTab"
 import { ResultsTab } from "@/features/execution/components/ResultsTab"
 import { SessionsTab } from "@/features/execution/components/SessionsTab"
 import { useBatches, useExecutionActions } from "@/features/execution/hooks/useExecution"
@@ -45,12 +44,24 @@ function readEvidenceParam(): string {
   return new URLSearchParams(window.location.search).get("evidence") ?? ""
 }
 
-/** Writes the active tab back with replaceState so the deep link survives refresh. */
-function writeTabParam(value: VersionTabValue): void {
+/** Reads the `?issue=` / `?report=` delivery deep links (spec §10.3/§10.4). */
+function readDeepLinkParam(name: "issue" | "report"): string {
+  if (typeof window === "undefined") return ""
+  return new URLSearchParams(window.location.search).get(name) ?? ""
+}
+
+/** Writes one query parameter with replaceState, removing it for an empty value. */
+function writeQueryParam(name: string, value: string): void {
   if (typeof window === "undefined") return
   const url = new URL(window.location.href)
-  url.searchParams.set("tab", value)
+  if (value === "") url.searchParams.delete(name)
+  else url.searchParams.set(name, value)
   window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`)
+}
+
+/** Writes the active tab back with replaceState so the deep link survives refresh. */
+function writeTabParam(value: VersionTabValue): void {
+  writeQueryParam("tab", value)
 }
 
 function describeLoadError(error: unknown): string {
@@ -66,6 +77,9 @@ function describeLoadError(error: unknown): string {
 type RequirementsWorkbenchSlotProps = {
   version: Version
   onChanged: () => void
+  /** Header 新增需求 intent: non-zero opens the create editor in the workbench. */
+  openCreateToken: number
+  onOpenCreateIntentConsumed: () => void
 }
 
 /**
@@ -73,8 +87,20 @@ type RequirementsWorkbenchSlotProps = {
  * clarification column. `onChanged` refetches the version so the header
  * counters stay in sync after requirement writes.
  */
-function RequirementsWorkbenchSlot({ version, onChanged }: RequirementsWorkbenchSlotProps) {
-  return <Workbench version={version} onChanged={onChanged} />
+function RequirementsWorkbenchSlot({
+  version,
+  onChanged,
+  openCreateToken,
+  onOpenCreateIntentConsumed,
+}: RequirementsWorkbenchSlotProps) {
+  return (
+    <Workbench
+      version={version}
+      onChanged={onChanged}
+      openCreateToken={openCreateToken}
+      onOpenCreateIntentConsumed={onOpenCreateIntentConsumed}
+    />
+  )
 }
 
 export type VersionDetailPageProps = {
@@ -95,10 +121,15 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
   const [error, setError] = useState("")
   const [tab, setTab] = useState<VersionTabValue>(DEFAULT_TAB)
   const [evidenceId, setEvidenceId] = useState("")
+  const [issueId, setIssueId] = useState("")
+  const [reportId, setReportId] = useState("")
+  const [createToken, setCreateToken] = useState(0)
   const [takeover, setTakeover] = useState<PendingTakeover | null>(null)
   const [selectedBatchId, setSelectedBatchId] = useState("")
   const [role, setRole] = useState<string | undefined>(undefined)
   const requestRef = useRef(0)
+  /** Highest stream seq already inspected for a version-level refetch. */
+  const versionEventSeqRef = useRef<number | null>(null)
 
   const stream = useVersionStream(versionId)
   const batchPage = useBatches(versionId, {}, stream)
@@ -133,6 +164,8 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
   useEffect(() => {
     setTab(readTabParam())
     setEvidenceId(readEvidenceParam())
+    setIssueId(readDeepLinkParam("issue"))
+    setReportId(readDeepLinkParam("report"))
     setRole(getStoredUser()?.role)
   }, [])
 
@@ -144,6 +177,30 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
     }
   }, [load])
 
+  // Continuing transitions happen on the backend (creating a requirement on a
+  // completed version, phase changes, another window's writes). The persisted
+  // SSE event is the authoritative trigger for a header refetch; the first
+  // snapshot is already covered by the initial load.
+  useEffect(() => {
+    const events = stream.events.filter(
+      (event) => event.version_id === null || event.version_id === versionId,
+    )
+    if (events.length === 0) {
+      versionEventSeqRef.current = null
+      return
+    }
+    const maxSeq = events.reduce((latest, event) => Math.max(latest, event.seq), 0)
+    const previousSeq = versionEventSeqRef.current
+    versionEventSeqRef.current = maxSeq
+    if (previousSeq === null && stream.status !== "live") return
+    const changed = events.some(
+      (event) =>
+        event.seq > (previousSeq ?? -1) &&
+        (event.type.startsWith("version.") || event.type === "requirement.added"),
+    )
+    if (changed) void load()
+  }, [stream.events, stream.status, versionId, load])
+
   const refresh = useCallback(() => {
     void load()
   }, [load])
@@ -153,9 +210,31 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
     writeTabParam(value)
   }
 
+  function handleIssueChange(nextIssueId: string): void {
+    setIssueId(nextIssueId)
+    writeQueryParam("issue", nextIssueId)
+  }
+
+  function handleReportChange(nextReportId: string): void {
+    setReportId(nextReportId)
+    writeQueryParam("report", nextReportId)
+  }
+
+  function handleBatchChange(nextBatchId: string): void {
+    setSelectedBatchId(nextBatchId)
+    // A different batch cannot keep the previous batch's report deep link.
+    setReportId("")
+    writeQueryParam("report", "")
+  }
+
   function handleExplorationNavigate(target: ExplorationDeepLink): void {
     if (target.kind === "result") {
       handleTabChange("results")
+      return
+    }
+    if (target.kind === "issue") {
+      handleIssueChange(target.id)
+      handleTabChange("issues")
       return
     }
     if (target.kind === "case") {
@@ -209,15 +288,22 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
         refreshing={loading}
         onRefresh={refresh}
         onUpdated={setVersion}
+        onAddRequirement={() => {
+          setCreateToken((previous) => previous + 1)
+          handleTabChange("requirements")
+        }}
+        onViewChanges={() => handleTabChange("code")}
+        onOpenClarification={() => handleTabChange("requirements")}
         execution={{
           batches: batchPage.batches,
           activeBatch,
           selectedBatchId: batchId,
           stream,
           actions,
-          onBatchChange: setSelectedBatchId,
+          onBatchChange: handleBatchChange,
           onOpenReport: () => handleTabChange("report"),
           onOpenSessions: () => handleTabChange("sessions"),
+          onOpenResults: () => handleTabChange("results"),
         }}
       />
 
@@ -231,10 +317,37 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
       )}
 
       <VersionTabs
+        versionId={versionId}
         active={tab}
         onTabChange={handleTabChange}
-        requirements={<RequirementsWorkbenchSlot version={version} onChanged={refresh} />}
-        overview={<OverviewTab version={version} />}
+        stream={stream}
+        requirements={
+          <RequirementsWorkbenchSlot
+            version={version}
+            onChanged={refresh}
+            openCreateToken={createToken}
+            onOpenCreateIntentConsumed={() => setCreateToken(0)}
+          />
+        }
+        issueId={issueId}
+        onIssueChange={handleIssueChange}
+        reportId={reportId}
+        onReportChange={handleReportChange}
+        batchId={batchId}
+        onBatchChange={handleBatchChange}
+        overview={
+          <OverviewTab
+            version={version}
+            batches={batchPage.batches}
+            stream={stream}
+            onOpenIssues={() => handleTabChange("issues")}
+            onOpenCode={() => handleTabChange("code")}
+            onOpenReports={(batchIdValue) => {
+              setSelectedBatchId(batchIdValue)
+              handleTabChange("report")
+            }}
+          />
+        }
         sessions={
           <SessionsTab
             versionId={versionId}
@@ -259,13 +372,6 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
             batchId={batchId}
             batchNo={selectedBatch?.batch_no}
             stream={stream}
-          />
-        }
-        report={
-          <ReportTab
-            versionId={versionId}
-            batchId={batchId === "" ? undefined : batchId}
-            onBatchChange={setSelectedBatchId}
           />
         }
         code={<CodeChangesTab versionId={versionId} repoId={version.codeRepositoryId} />}

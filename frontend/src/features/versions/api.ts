@@ -28,10 +28,13 @@ import type {
   ClarificationSession,
   CreateClarificationQuestionBody,
   CreateDecisionBody,
+  CreatedBatch,
+  CreateIncrementalBatchBody,
   CreateRelationBody,
   CreateRequirementBody,
   CreateVersionBody,
   EnterDesignResult,
+  IncrementalPlan,
   Requirement,
   RequirementAttachment,
   RequirementQuery,
@@ -468,4 +471,48 @@ export function updateDecision(
   body: UpdateDecisionBody,
 ): Promise<ClarificationDecision> {
   return apiPatch<ClarificationDecision>(`${decisionsPath(versionId)}/${decisionId}`, body)
+}
+
+// --- Continuing incremental plan (spec §7.6/§7.7) --------------------------
+
+/**
+ * GET mindmap/incremental-plan — the latest design plan of a continuing
+ * version. A version without a finished run returns an empty plan (200), so
+ * every collection is normalized to `[]` and the panel never renders
+ * `undefined`.
+ */
+export async function getIncrementalPlan(versionId: string): Promise<IncrementalPlan> {
+  type Payload = Partial<IncrementalPlan>
+  const payload = await apiGet<Payload>(`${versionPath(versionId)}/mindmap/incremental-plan`)
+  return {
+    versionId: typeof payload.versionId === "string" ? payload.versionId : versionId,
+    phase: typeof payload.phase === "string" ? payload.phase : "",
+    parentBatchId: typeof payload.parentBatchId === "string" ? payload.parentBatchId : null,
+    run: payload.run ?? null,
+    newCases: (payload.newCases ?? []).map((newCase) => ({
+      ...newCase,
+      requirementIds: Array.isArray(newCase.requirementIds) ? newCase.requirementIds : [],
+    })),
+    affectedCases: payload.affectedCases ?? [],
+    unmappedChanges: payload.unmappedChanges ?? [],
+    defaultCaseIds: payload.defaultCaseIds ?? [],
+    warnings: payload.warnings ?? [],
+    degraded: payload.degraded === true,
+  }
+}
+
+/**
+ * POST batches — creates the incremental batch for the selected plan cases.
+ * `kind` is fixed by this helper; the parent batch is required by the
+ * incremental gate (spec §5.3).
+ */
+export function createIncrementalBatch(
+  versionId: string,
+  body: CreateIncrementalBatchBody,
+): Promise<CreatedBatch> {
+  return apiPost<CreatedBatch>(`${versionPath(versionId)}/batches`, {
+    kind: "incremental",
+    caseIds: body.caseIds,
+    parentBatchId: body.parentBatchId,
+  })
 }

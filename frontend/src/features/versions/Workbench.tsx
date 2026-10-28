@@ -104,6 +104,13 @@ export type WorkbenchProps = {
   version: Version
   /** Refreshes the owning container (header counters) after a write. */
   onChanged: () => void
+  /**
+   * Monotonic intent token: a new non-zero value opens the requirement create
+   * editor (the header 新增需求 entry). The workbench acknowledges it so a tab
+   * remount does not reopen the editor.
+   */
+  openCreateToken?: number
+  onOpenCreateIntentConsumed?: () => void
 }
 
 /**
@@ -115,7 +122,12 @@ export type WorkbenchProps = {
  * affected data and notify the container, and load failures keep the last data
  * on screen.
  */
-export function Workbench({ version, onChanged }: WorkbenchProps) {
+export function Workbench({
+  version,
+  onChanged,
+  openCreateToken,
+  onOpenCreateIntentConsumed,
+}: WorkbenchProps) {
   const [requirements, setRequirements] = useState<Requirement[]>([])
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState("")
@@ -244,6 +256,16 @@ export function Workbench({ version, onChanged }: WorkbenchProps) {
       clarificationRequestRef.current += 1
     }
   }, [loadRequirements, loadRelations, loadClarification])
+
+  // The header 新增需求 entry opens the create editor through this intent. The
+  // acknowledgement resets the token so a later tab remount stays on the
+  // normal list/editor surface.
+  useEffect(() => {
+    if (openCreateToken === undefined || openCreateToken === 0) return
+    setCreating(true)
+    setRelationError("")
+    onOpenCreateIntentConsumed?.()
+  }, [openCreateToken, onOpenCreateIntentConsumed])
 
   // AI (and human) writes arrive as version events. The workbench owns the
   // stream, so it must refresh the question/decision panels and the overview
@@ -487,6 +509,7 @@ export function Workbench({ version, onChanged }: WorkbenchProps) {
           versionId={version.id}
           requirement={selectedRequirement}
           creating={creating}
+          versionStatus={version.status}
           onCreated={handleCreated}
           onUpdated={handleUpdated}
           onDeleted={handleDeleted}
