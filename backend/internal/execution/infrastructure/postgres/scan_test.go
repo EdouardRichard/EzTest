@@ -76,11 +76,15 @@ func assignScanValue(dest, value any) error {
 // commit/timestamp columns.
 func TestScanBatchRoundTrip(t *testing.T) {
 	codeCommit := strings.Repeat("c", 40)
+	graphHash := strings.Repeat("b", 64)
+	parentID := int64(44)
 	started := scanTestTime
 	finished := scanTestTime.Add(time.Minute)
 	batch, err := scanBatch(fakeScanRow{values: []any{
 		int64(11), int64(22), 3, domain.BatchStatusRunning, true,
 		domain.PauseModeImmediate, "restart", strings.Repeat("a", 64),
+		graphHash, domain.BatchKindIncremental, parentID,
+		domain.BaseFallbackHistoryRewritten, true, false,
 		codeCommit, nil,
 		5, 2, 1, 1, 1, 0, 0, int64(99), started, finished,
 		"executor crashed", scanTestTime, scanTestTime.Add(2 * time.Minute),
@@ -92,6 +96,12 @@ func TestScanBatchRoundTrip(t *testing.T) {
 		batch.Status != domain.BatchStatusRunning || !batch.Paused ||
 		batch.PauseMode != domain.PauseModeImmediate || batch.PauseReason != "restart" {
 		t.Fatalf("batch identity = %+v", batch)
+	}
+	if batch.GraphHash != graphHash || batch.Kind != domain.BatchKindIncremental ||
+		batch.ParentBatchID == nil || *batch.ParentBatchID != parentID ||
+		batch.BaseFallbackReason != domain.BaseFallbackHistoryRewritten ||
+		!batch.SupplementAttempted || batch.AutonomyDone {
+		t.Fatalf("batch p7 chain columns = %+v", batch)
 	}
 	if batch.CodeBaselineCommit == nil || *batch.CodeBaselineCommit != codeCommit {
 		t.Fatalf("code baseline commit = %v", batch.CodeBaselineCommit)
@@ -116,6 +126,8 @@ func TestScanBatchRoundTrip(t *testing.T) {
 	batch, err = scanBatch(fakeScanRow{values: []any{
 		int64(12), int64(22), 1, domain.BatchStatusPlanned, false,
 		domain.PauseModeGraceful, "", strings.Repeat("b", 64),
+		strings.Repeat("c", 64), domain.BatchKindBaseline, nil,
+		"", false, false,
 		nil, nil,
 		0, 0, 0, 0, 0, 0, 0, int64(7), nil, nil,
 		"", scanTestTime, scanTestTime,
@@ -126,6 +138,10 @@ func TestScanBatchRoundTrip(t *testing.T) {
 	if batch.CodeBaselineCommit != nil || batch.HeadCommit != nil ||
 		batch.StartedAt != nil || batch.FinishedAt != nil {
 		t.Fatalf("nullable batch columns not NULL: %+v", batch)
+	}
+	if batch.ParentBatchID != nil || batch.BaseFallbackReason != "" ||
+		batch.Kind != domain.BatchKindBaseline || batch.SupplementAttempted || batch.AutonomyDone {
+		t.Fatalf("nullable p7 chain columns = %+v", batch)
 	}
 }
 
@@ -147,9 +163,15 @@ func TestScanCaseRunSnapshotAndNulls(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal snapshot: %v", err)
 	}
+	// A P6 historical snapshot has no origin and must read as baseline.
+	historical := []byte(strings.Replace(string(raw), `"origin":"",`, "", 1))
+	if strings.Contains(string(historical), `"origin"`) {
+		t.Fatalf("historical snapshot fixture still carries an origin: %s", historical)
+	}
 
 	run, err := scanCaseRun(fakeScanRow{values: []any{
-		int64(31), int64(11), int64(22), int64(7), 3, strings.Repeat("d", 64), raw,
+		int64(31), int64(11), int64(22), int64(7), 3, strings.Repeat("d", 64), "",
+		historical,
 		1, domain.CaseRunStatusPending, nil, "", "",
 		nil, nil, nil, nil, nil,
 		false, nil, nil, nil, int64(0),
@@ -162,6 +184,12 @@ func TestScanCaseRunSnapshotAndNulls(t *testing.T) {
 		run.CaseRevision != 3 || run.Status != domain.CaseRunStatusPending ||
 		run.CleanupRequired {
 		t.Fatalf("case run identity = %+v", run)
+	}
+	if run.Source != domain.CaseSourceBaseline {
+		t.Fatalf("historical case run source = %q, want baseline", run.Source)
+	}
+	if run.Snapshot.Node.EffectiveOrigin() != domain.CaseSourceBaseline {
+		t.Fatalf("historical snapshot origin = %q, want baseline", run.Snapshot.Node.Origin)
 	}
 	if run.Snapshot.Node.ID != 7 || run.Snapshot.Node.Priority != "P1" ||
 		len(run.Snapshot.Steps) != 1 || len(run.Snapshot.Assertions) != 1 ||
@@ -179,8 +207,15 @@ func TestScanCaseRunSnapshotAndNulls(t *testing.T) {
 	sessionID, sessionSnapshotID, agentSessionID, agentRunID := int64(1), int64(2), int64(3), int64(4)
 	retryOf, interrupted := int64(5), 2
 	started, finished := scanTestTime, scanTestTime.Add(time.Minute)
+	supplementSnapshot := snapshot
+	supplementSnapshot.Node.Origin = domain.CaseSourceAISupplement
+	supplementRaw, err := json.Marshal(supplementSnapshot)
+	if err != nil {
+		t.Fatalf("marshal supplement snapshot: %v", err)
+	}
 	run, err = scanCaseRun(fakeScanRow{values: []any{
-		int64(32), int64(11), int64(22), int64(8), 1, strings.Repeat("e", 64), raw,
+		int64(32), int64(11), int64(22), int64(8), 1, strings.Repeat("e", 64),
+		domain.CaseSourceAISupplement, supplementRaw,
 		2, domain.CaseRunStatusFailed, string(failureClass), "assertion failed", "submitted",
 		sessionID, sessionSnapshotID, agentSessionID, agentRunID, retryOf,
 		true, interrupted, started, finished, int64(1234),
@@ -188,6 +223,10 @@ func TestScanCaseRunSnapshotAndNulls(t *testing.T) {
 	}})
 	if err != nil {
 		t.Fatalf("scanCaseRun full: %v", err)
+	}
+	if run.Source != domain.CaseSourceAISupplement ||
+		run.Snapshot.Node.EffectiveOrigin() != domain.CaseSourceAISupplement {
+		t.Fatalf("supplement run source/origin = %q/%q", run.Source, run.Snapshot.Node.Origin)
 	}
 	if run.FailureClass == nil || *run.FailureClass != failureClass ||
 		run.SessionID == nil || *run.SessionID != sessionID ||
@@ -209,7 +248,8 @@ func TestScanCaseRunSnapshotAndNulls(t *testing.T) {
 
 	// A malformed snapshot is an error, not a silently empty snapshot.
 	_, err = scanCaseRun(fakeScanRow{values: []any{
-		int64(33), int64(11), int64(22), int64(7), 1, strings.Repeat("f", 64), []byte("{"),
+		int64(33), int64(11), int64(22), int64(7), 1, strings.Repeat("f", 64), "",
+		[]byte("{"),
 		1, domain.CaseRunStatusPending, nil, "", "",
 		nil, nil, nil, nil, nil,
 		false, nil, nil, nil, int64(0),

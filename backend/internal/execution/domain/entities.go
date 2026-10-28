@@ -4,17 +4,29 @@ import "time"
 
 // RunBatch is one execution batch of a version. A version has at most one
 // active batch (planned or running), enforced by uk_run_batch_active.
+//
+// Kind, ParentBatchID, GraphHash, BaseFallbackReason, SupplementAttempted and
+// AutonomyDone are the P7 chain fields (spec §5.3, D45): a baseline batch is
+// followed by an automatically created supplement batch, a continuing version
+// runs incremental batches, and GraphHash pins the current working graph the
+// batch snapshotted.
 type RunBatch struct {
-	ID                 int64
-	VersionID          int64
-	BatchNo            int
-	Status             BatchStatus
-	Paused             bool
-	PauseMode          PauseMode
-	PauseReason        string
-	BaselineHash       string
-	CodeBaselineCommit *string
-	HeadCommit         *string
+	ID                  int64
+	VersionID           int64
+	BatchNo             int
+	Status              BatchStatus
+	Paused              bool
+	PauseMode           PauseMode
+	PauseReason         string
+	BaselineHash        string
+	GraphHash           string
+	Kind                BatchKind
+	ParentBatchID       *int64
+	BaseFallbackReason  string
+	SupplementAttempted bool
+	AutonomyDone        bool
+	CodeBaselineCommit  *string
+	HeadCommit          *string
 
 	CaseCount         int
 	PassedCount       int
@@ -33,7 +45,8 @@ type RunBatch struct {
 }
 
 // CaseRun is one attempt at executing a case inside a batch. Its Snapshot is
-// immutable once the batch is created.
+// immutable once the batch is created. Source mirrors the snapshot's node
+// origin (spec §5.3); a P6 historical run is baseline.
 type CaseRun struct {
 	ID           int64
 	BatchID      int64
@@ -41,6 +54,7 @@ type CaseRun struct {
 	CaseNodeID   int64
 	CaseRevision int
 	CaseHash     string
+	Source       CaseSource
 	Snapshot     CaseSnapshot
 
 	Attempt       int

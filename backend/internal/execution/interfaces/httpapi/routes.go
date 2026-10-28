@@ -23,7 +23,7 @@ import (
 // BatchService is the batch application port consumed by the HTTP layer.
 // *application.BatchService implements it.
 type BatchService interface {
-	Create(ctx context.Context, versionID, actor int64, caseIDs []int64) (*domain.RunBatch, error)
+	Create(ctx context.Context, versionID, actor int64, cmd executionapp.CreateBatchCommand) (*domain.RunBatch, error)
 	Get(ctx context.Context, versionID, batchID int64) (*domain.RunBatch, error)
 	List(ctx context.Context, versionID int64, beforeSeq int64, limit int) ([]domain.RunBatch, bool, error)
 	Pause(ctx context.Context, versionID, batchID int64, mode domain.PauseMode, actor int64) (*domain.RunBatch, error)

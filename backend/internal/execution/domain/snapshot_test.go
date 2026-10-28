@@ -63,7 +63,7 @@ func TestCaseSnapshotJSONShapeAndRoundTrip(t *testing.T) {
 	}
 
 	assertJSONKeys(t, "node", top["node"],
-		"id", "title", "priority", "preconditions", "test_data")
+		"id", "origin", "title", "priority", "preconditions", "test_data")
 	var node map[string]json.RawMessage
 	if err := json.Unmarshal(top["node"], &node); err != nil {
 		t.Fatalf("decode node: %v", err)
@@ -118,6 +118,68 @@ func TestCaseSnapshotJSONShapeAndRoundTrip(t *testing.T) {
 	}
 	if !back.CapturedAt.Equal(captured) {
 		t.Fatalf("captured_at round-trip = %v, want %v", back.CapturedAt, captured)
+	}
+}
+
+// graphHashSnapshot is one case of a working-graph fixture.
+func graphHashSnapshot(caseNodeID int64, title string, origin domain.CaseSource) domain.CaseSnapshot {
+	return domain.CaseSnapshot{
+		Node:       domain.CaseSnapshotNode{ID: caseNodeID, Title: title, Priority: "P1", Origin: origin},
+		Steps:      []domain.CaseSnapshotStep{{Seq: 1, Action: "打开列表", Expected: "列表可见"}},
+		Assertions: []domain.CaseSnapshotAssertion{{ID: caseNodeID * 10, StepSeq: 1, Kind: "ui", Expected: "存在"}},
+		GraphHash:  strings.Repeat("b", 64),
+		CapturedAt: time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC),
+	}
+}
+
+func TestWorkingGraphHashStableAndContentSensitive(t *testing.T) {
+	first := []domain.CaseSnapshot{
+		graphHashSnapshot(11, "case 11", domain.CaseSourceBaseline),
+		graphHashSnapshot(12, "case 12", domain.CaseSourceAISupplement),
+	}
+	second := []domain.CaseSnapshot{first[1], first[0]}
+	second[0].CapturedAt = first[0].CapturedAt.Add(time.Hour)
+	second[1].CapturedAt = first[1].CapturedAt.Add(2 * time.Hour)
+	second[0].GraphHash = strings.Repeat("c", 64)
+	second[1].GraphHash = strings.Repeat("d", 64)
+
+	a := domain.WorkingGraphHash(7, first)
+	b := domain.WorkingGraphHash(7, second)
+	if a == "" || len(a) != 64 || a != strings.ToLower(a) {
+		t.Fatalf("working graph hash = %q, want a lowercase 64-hex digest", a)
+	}
+	if a != b {
+		t.Fatalf("working graph hash must ignore input order and snapshot metadata: %s != %s", a, b)
+	}
+	if got := domain.WorkingGraphHash(8, first); got == a {
+		t.Fatal("working graph hash must depend on the version id")
+	}
+
+	changed := append([]domain.CaseSnapshot(nil), first...)
+	changed[0].Node.Title = "renamed"
+	if domain.WorkingGraphHash(7, changed) == a {
+		t.Fatal("working graph hash must change when case content changes")
+	}
+
+	supplemented := append([]domain.CaseSnapshot(nil), first...)
+	supplemented[0].Node.Origin = domain.CaseSourceAISupplement
+	if domain.WorkingGraphHash(7, supplemented) == a {
+		t.Fatal("working graph hash must change when a case origin changes")
+	}
+
+	if got := domain.WorkingGraphHash(7, nil); got != "" {
+		t.Fatalf("empty graph hash = %q, want empty", got)
+	}
+}
+
+func TestCaseSnapshotOriginDefaultsToBaseline(t *testing.T) {
+	node := domain.CaseSnapshotNode{ID: 7}
+	if got := node.EffectiveOrigin(); got != domain.CaseSourceBaseline {
+		t.Fatalf("missing origin = %q, want baseline", got)
+	}
+	node.Origin = domain.CaseSourceAISupplement
+	if got := node.EffectiveOrigin(); got != domain.CaseSourceAISupplement {
+		t.Fatalf("supplement origin = %q", got)
 	}
 }
 

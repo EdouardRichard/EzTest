@@ -16,6 +16,35 @@ import (
 // baseline_required without importing another context's domain.
 var ErrBaselineRequired = errors.New("execution: case baseline is required")
 
+// CodeHistoryPort is the optional code-intelligence surface used to place an
+// incremental batch between the previous batch head and the current branch head
+// (D49, spec §6.8). A nil dependency degrades: the batch records the parent head
+// or the version baseline and leaves head_commit empty rather than blocking.
+type CodeHistoryPort interface {
+	// HeadCommit returns the current commit of the version's fixed branch.
+	HeadCommit(ctx context.Context, versionID int64) (string, error)
+	// IsAncestor reports whether base is an ancestor of head.
+	IsAncestor(ctx context.Context, versionID int64, base, head string) (bool, error)
+}
+
+// SupplementGraphPort is the optional controlled mindmap write surface used
+// after a batch is created: every supplement node adopted by the batch becomes
+// merged (spec §5.2/§5.3). The mindmap service implements it in P7; until it is
+// wired, a batch that selects supplement nodes fails closed instead of
+// silently skipping the state transition.
+type SupplementGraphPort interface {
+	MarkMerged(ctx context.Context, versionID int64, caseNodeIDs []int64) error
+}
+
+// ContinuePhasePort is the optional version surface that records
+// continue_phase=executing when a continuing version starts an incremental
+// batch (spec §5.1/§5.3). It is asserted on VersionPort because the P6 adapter
+// predates the method; a missing capability is logged after the committed
+// batch.
+type ContinuePhasePort interface {
+	SetContinuePhase(ctx context.Context, versionID int64, phase string) error
+}
+
 // VersionPort is the version context's execution-state surface (spec §4.2,
 // plan Shared Interfaces). Execution never owns version status: it only reads
 // the version, mirrors the pause flag and records the latest batch number.
@@ -123,11 +152,16 @@ type BaselineRef struct {
 
 // CaseSnapshotSourceView is one frozen case as returned by the mindmap context.
 // Revision is the case_node revision; GraphHash is the frozen graph hash every
-// case must agree with at batch creation (spec §5.2).
+// case must agree with at batch creation (spec §5.2). Origin is the P7 case
+// provenance (baseline or AI supplement) and Status the mindmap node status;
+// both are read-only gate inputs. An empty Origin is baseline (P6 snapshots
+// have no origin).
 type CaseSnapshotSourceView struct {
 	CaseNodeID     int64
 	Revision       int
 	GraphHash      string
+	Origin         domain.CaseSource
+	Status         string
 	Node           domain.CaseSnapshotNode
 	Steps          []domain.CaseSnapshotStep
 	Assertions     []domain.CaseSnapshotAssertion
@@ -135,12 +169,14 @@ type CaseSnapshotSourceView struct {
 }
 
 // VersionRef is the version projection needed by the batch gates: status and
-// resource bindings, the monotonic batch number and the pause mirror.
+// resource bindings, the monotonic batch number, the pause mirror and the P7
+// continue phase.
 type VersionRef struct {
 	ID                 int64
 	Status             string
 	Paused             bool
 	PauseMode          string
+	ContinuePhase      string
 	BatchNo            int
 	SystemID           *int64
 	EnvironmentID      *int64

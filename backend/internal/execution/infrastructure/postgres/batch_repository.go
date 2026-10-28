@@ -42,7 +42,9 @@ type rowScanner interface {
 // batchColumnList is the shared column order of every run_batch query and the
 // order scanBatch expects.
 const batchColumnList = `id, version_id, batch_no, status, paused, pause_mode,
-	pause_reason, baseline_hash, code_baseline_commit, head_commit,
+	pause_reason, baseline_hash, graph_hash, kind, parent_batch_id,
+	base_fallback_reason, supplement_attempted, autonomy_done,
+	code_baseline_commit, head_commit,
 	case_count, passed_count, failed_count, blocked_count, inconclusive_count,
 	skipped_count, interrupted_count, created_by, started_at, finished_at,
 	failure_reason, created_at, updated_at`
@@ -63,6 +65,7 @@ var _ application.BatchRepository = (*BatchRepository)(nil)
 func scanBatch(row rowScanner) (domain.RunBatch, error) {
 	var (
 		batch              domain.RunBatch
+		parentBatchID      *int64
 		codeBaselineCommit *string
 		headCommit         *string
 		startedAt          *time.Time
@@ -77,6 +80,12 @@ func scanBatch(row rowScanner) (domain.RunBatch, error) {
 		&batch.PauseMode,
 		&batch.PauseReason,
 		&batch.BaselineHash,
+		&batch.GraphHash,
+		&batch.Kind,
+		&parentBatchID,
+		&batch.BaseFallbackReason,
+		&batch.SupplementAttempted,
+		&batch.AutonomyDone,
 		&codeBaselineCommit,
 		&headCommit,
 		&batch.CaseCount,
@@ -95,6 +104,7 @@ func scanBatch(row rowScanner) (domain.RunBatch, error) {
 	); err != nil {
 		return domain.RunBatch{}, err
 	}
+	batch.ParentBatchID = parentBatchID
 	batch.CodeBaselineCommit = codeBaselineCommit
 	batch.HeadCommit = headCommit
 	batch.StartedAt = startedAt
@@ -111,16 +121,21 @@ func (r *BatchRepository) CreateBatchWithRuns(ctx context.Context, batch domain.
 		stored, err := scanBatch(q.QueryRow(ctx, `
 			INSERT INTO run_batch
 				(id, version_id, batch_no, status, paused, pause_mode, pause_reason,
-				 baseline_hash, code_baseline_commit, head_commit,
+				 baseline_hash, graph_hash, kind, parent_batch_id,
+				 base_fallback_reason, supplement_attempted, autonomy_done,
+				 code_baseline_commit, head_commit,
 				 case_count, passed_count, failed_count, blocked_count,
 				 inconclusive_count, skipped_count, interrupted_count, created_by,
 				 started_at, finished_at, failure_reason, created_at, updated_at)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-			        $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21,
-			        COALESCE($22, now()), COALESCE($23, now()))
+			        $11, $12, $13, $14, $15, $16,
+			        $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27,
+			        COALESCE($28, now()), COALESCE($29, now()))
 			RETURNING `+batchColumnList,
 			batch.ID, batch.VersionID, batch.BatchNo, batch.Status, batch.Paused,
-			batch.PauseMode, batch.PauseReason, batch.BaselineHash,
+			batch.PauseMode, batch.PauseReason, batch.BaselineHash, batch.GraphHash,
+			batch.Kind, nullableInt(batch.ParentBatchID), batch.BaseFallbackReason,
+			batch.SupplementAttempted, batch.AutonomyDone,
 			nullableString(batch.CodeBaselineCommit), nullableString(batch.HeadCommit),
 			len(runs), batch.PassedCount, batch.FailedCount, batch.BlockedCount,
 			batch.InconclusiveCount, batch.SkippedCount, batch.InterruptedCount,
@@ -134,6 +149,11 @@ func (r *BatchRepository) CreateBatchWithRuns(ctx context.Context, batch domain.
 			case "uk_run_batch_version_no", "pk_run_batch":
 				return fmt.Errorf("%w: batch %d of version %d already exists",
 					application.ErrConflict, batch.ID, batch.VersionID)
+			}
+			switch checkConstraint(err) {
+			case "ck_run_batch_graph_hash", "ck_run_batch_supplement_parent", "run_batch_kind_check":
+				return fmt.Errorf("%w: batch %d violates the P7 chain constraints: %v",
+					application.ErrConflict, batch.ID, err)
 			}
 			return fmt.Errorf("postgres: create run batch: %w", err)
 		}
@@ -321,6 +341,23 @@ func (r *BatchRepository) UpdateBatchFailure(ctx context.Context, batchID int64,
 		return domain.RunBatch{}, fmt.Errorf("postgres: update run batch failure: %w", err)
 	}
 	return batch, nil
+}
+
+// CountTerminalBatchesAwaitingAutonomy counts the terminal batches of versionID
+// whose autonomous chain (analysis, report, supplement) has not finished yet.
+// The batch creation gate rejects another baseline/incremental batch while the
+// count is non-zero (spec §5.3).
+func (r *BatchRepository) CountTerminalBatchesAwaitingAutonomy(ctx context.Context, versionID int64) (int, error) {
+	var count int
+	err := r.q.QueryRow(ctx, `
+		SELECT count(*) FROM run_batch
+		WHERE version_id = $1
+		  AND status IN ('done', 'failed', 'cancelled')
+		  AND autonomy_done = false`, versionID).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("postgres: count batches awaiting autonomy: %w", err)
+	}
+	return count, nil
 }
 
 // batchState reads the current status and pause flag used to classify a lost

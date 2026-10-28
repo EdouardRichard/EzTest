@@ -21,12 +21,17 @@ type batchCountsDTO struct {
 
 // batchDTO is the BatchDTO of spec §6.3. Every execution-owned id is a decimal
 // string; user ids stay numbers elsewhere but created_by is an execution-scoped
-// string for consistency with the P6 DTO.
+// string for consistency with the P6 DTO. The P7 additive fields use the camel
+// case names fixed by spec §7.7.
 type batchDTO struct {
 	ID                 int64          `json:"id,string"`
 	VersionID          int64          `json:"version_id,string"`
 	BatchNo            int            `json:"batch_no"`
 	Status             string         `json:"status"`
+	Kind               string         `json:"kind"`
+	ParentBatchID      *int64         `json:"parentBatchId,string"`
+	GraphHash          string         `json:"graphHash"`
+	BaseFallbackReason string         `json:"baseFallbackReason"`
 	Paused             bool           `json:"paused"`
 	PauseMode          string         `json:"pause_mode"`
 	PauseReason        string         `json:"pause_reason"`
@@ -42,16 +47,27 @@ type batchDTO struct {
 	UpdatedAt          time.Time      `json:"updated_at"`
 }
 
-// newBatchDTO maps one batch aggregate to the API shape.
+// newBatchDTO maps one batch aggregate to the API shape. A P6 historical row
+// without the P7 chain columns reads as a baseline whose graph hash is its
+// baseline hash (spec §4.2.6).
 func newBatchDTO(batch *domain.RunBatch) batchDTO {
 	if batch == nil {
 		return batchDTO{}
+	}
+	kind := effectiveBatchKind(*batch)
+	graphHash := batch.GraphHash
+	if graphHash == "" {
+		graphHash = batch.BaselineHash
 	}
 	return batchDTO{
 		ID:                 batch.ID,
 		VersionID:          batch.VersionID,
 		BatchNo:            batch.BatchNo,
 		Status:             string(batch.Status),
+		Kind:               string(kind),
+		ParentBatchID:      copyInt64(batch.ParentBatchID),
+		GraphHash:          graphHash,
+		BaseFallbackReason: batch.BaseFallbackReason,
 		Paused:             batch.Paused,
 		PauseMode:          string(batch.PauseMode),
 		PauseReason:        batch.PauseReason,
@@ -167,6 +183,7 @@ type caseRunDTO struct {
 	CaseNodeID       int64               `json:"case_node_id,string"`
 	CaseRevision     int                 `json:"case_revision"`
 	Attempt          int                 `json:"attempt"`
+	Source           string              `json:"source"`
 	Status           string              `json:"status"`
 	FailureClass     *string             `json:"failure_class"`
 	FailureReason    string              `json:"failure_reason"`
@@ -209,6 +226,7 @@ func newCaseRunDTO(run *domain.CaseRun, detail *caseRunDetail) caseRunDTO {
 		CaseNodeID:       run.CaseNodeID,
 		CaseRevision:     run.CaseRevision,
 		Attempt:          run.Attempt,
+		Source:           string(domain.ParseCaseSource(string(run.Source))),
 		Status:           string(run.Status),
 		FailureReason:    run.FailureReason,
 		Summary:          run.Summary,
@@ -487,6 +505,15 @@ func nonNilIntMap(value map[string]int) map[string]int {
 
 // copyString returns an owned copy of an optional string.
 func copyString(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	copied := *value
+	return &copied
+}
+
+// copyInt64 returns an owned copy of an optional id.
+func copyInt64(value *int64) *int64 {
 	if value == nil {
 		return nil
 	}

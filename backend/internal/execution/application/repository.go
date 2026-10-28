@@ -64,6 +64,11 @@ type BatchRepository interface {
 	UpdateCounts(ctx context.Context, batchID int64) (domain.BatchCounts, error)
 	// UpdateBatchFailure records the terminal failure reason.
 	UpdateBatchFailure(ctx context.Context, batchID int64, reason string) (domain.RunBatch, error)
+	// CountTerminalBatchesAwaitingAutonomy returns how many terminal batches of
+	// versionID still have autonomy_done=false. A non-zero count blocks a new
+	// baseline or incremental batch: the previous autonomous chain (analysis,
+	// report, supplement) must settle first (spec §5.3).
+	CountTerminalBatchesAwaitingAutonomy(ctx context.Context, versionID int64) (int, error)
 }
 
 // CaseRunRepository persists case_run rows. The snapshot recorded at creation
