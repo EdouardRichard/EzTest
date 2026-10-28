@@ -449,8 +449,11 @@ func TestToolSpecsAndSchemas(t *testing.T) {
 	}
 
 	wantRequired := map[string][]string{
-		"case.graph_read":       {"versionId"},
-		"case.graph_propose":    {"versionId", "payload"},
+		"case.graph_read": {"versionId"},
+		// case.graph_propose accepts both the flat §6.7 shape (scenarios/cases
+		// at the top level) and the nested compatibility shape (payload), so
+		// only versionId is unconditionally required.
+		"case.graph_propose":    {"versionId"},
 		"case.review_submit":    {"versionId", "findings"},
 		"case.data_plan_submit": {"versionId", "items"},
 		"app_model_propose":     {"systemId", "nodes"},
@@ -746,31 +749,152 @@ func TestGraphProposeStoresPayload(t *testing.T) {
 	}
 }
 
-// TestGraphProposeRejectsOversize pins the 1 MiB proposal cap.
-func TestGraphProposeRejectsOversize(t *testing.T) {
+// TestGraphProposeAcceptsFlatShape pins the spec §6.7 / fake-LLM input shape:
+// scenarios and cases arrive at the top level, with the optional top-level mode
+// and confirmReplace merged into the stored payload.
+func TestGraphProposeAcceptsFlatShape(t *testing.T) {
 	fakes := newToolFakes()
 	fakes.runs.runs = []mindmapdomain.CaseDesignRun{activeRun(501, 7, 11, mindmapdomain.RunKindDesign)}
 	tools := fakes.tools(t)
-	payload, err := json.Marshal(map[string]any{
-		"scenarios": []any{},
-		"cases": []any{map[string]any{
-			"ref": "c1", "title": strings.Repeat("a", (1<<20)+16),
-			"priority": "P1", "requirementIds": []string{"1"},
-			"steps": []any{}, "assertions": []any{},
-		}},
-	})
-	if err != nil {
-		t.Fatalf("marshal oversized payload: %v", err)
-	}
-	args, err := json.Marshal(map[string]any{"versionId": "7", "payload": json.RawMessage(payload)})
-	if err != nil {
-		t.Fatalf("marshal args: %v", err)
-	}
+	args := `{"versionId":"7","mode":"append","confirmReplace":true,` +
+		`"scenarios":[{"ref":"s1","title":"下单主流程","parentRef":null,"description":"场景"}],` +
+		`"cases":[{"ref":"c1","scenarioRef":"s1","title":"正常下单","priority":"P1","requirementIds":["1838"],` +
+		`"preconditions":"已登录","testData":{"sku":"A-1"},"steps":[{"action":"打开","expected":"展示"}],` +
+		`"assertions":[{"kind":"ui","expression":"订单号非空"}]}]}`
 
-	_, executeErr := executeTool(t, tools, "case.graph_propose", string(args), toolContext(11, 42))
-	requireToolErrorCode(t, executeErr, "proposal_too_large")
-	if len(fakes.runs.updates) != 0 {
-		t.Fatal("an oversized proposal must not be stored")
+	result, err := executeTool(t, tools, "case.graph_propose", args, toolContext(11, 42))
+	if err != nil {
+		t.Fatalf("flat case.graph_propose failed: %v", err)
+	}
+	content := decodeContentMap(t, result)
+	if content["stored"] != true || content["proposals"] != float64(1) {
+		t.Fatalf("content=%v", content)
+	}
+	if content["scenarios"] != float64(1) || content["cases"] != float64(1) {
+		t.Fatalf("counts=%v", content)
+	}
+	if len(fakes.runs.updates) != 1 {
+		t.Fatalf("run updates=%d want 1", len(fakes.runs.updates))
+	}
+	var stored map[string]any
+	if err := json.Unmarshal(fakes.runs.updates[0].patch.Result, &stored); err != nil {
+		t.Fatalf("stored result is not JSON: %v", err)
+	}
+	if stored["mode"] != "append" {
+		t.Fatalf("stored mode=%v want append", stored["mode"])
+	}
+	if stored["confirmReplace"] != true {
+		t.Fatalf("top-level confirmReplace must be merged into the payload: %v", stored)
+	}
+	scenarios := asArray(t, stored["scenarios"])
+	if len(scenarios) != 1 || asMap(t, scenarios[0])["ref"] != "s1" {
+		t.Fatalf("stored scenarios=%v", scenarios)
+	}
+	cases := asArray(t, stored["cases"])
+	if len(cases) != 1 || asMap(t, cases[0])["ref"] != "c1" {
+		t.Fatalf("stored cases=%v", cases)
+	}
+}
+
+// TestGraphProposeFlatShapeWinsOverNested pins the documented ambiguity rule:
+// when both shapes are present the flat top-level fields win and the nested
+// payload is ignored.
+func TestGraphProposeFlatShapeWinsOverNested(t *testing.T) {
+	fakes := newToolFakes()
+	fakes.runs.runs = []mindmapdomain.CaseDesignRun{activeRun(501, 7, 11, mindmapdomain.RunKindDesign)}
+	tools := fakes.tools(t)
+	args := `{"versionId":"7","mode":"replace",` +
+		`"scenarios":[{"ref":"flat-s","title":"Flat 场景"}],` +
+		`"cases":[{"ref":"flat-c","title":"Flat 用例","priority":"P2","requirementIds":["1838"],"steps":[],"assertions":[]}],` +
+		`"payload":{"mode":"append","scenarios":[{"ref":"nested-s","title":"Nested 场景"}]}}`
+
+	result, err := executeTool(t, tools, "case.graph_propose", args, toolContext(11, 42))
+	if err != nil {
+		t.Fatalf("flat-wins case.graph_propose failed: %v", err)
+	}
+	content := decodeContentMap(t, result)
+	if content["scenarios"] != float64(1) || content["cases"] != float64(1) {
+		t.Fatalf("counts=%v want the flat proposal", content)
+	}
+	var stored map[string]any
+	if err := json.Unmarshal(fakes.runs.updates[0].patch.Result, &stored); err != nil {
+		t.Fatalf("stored result is not JSON: %v", err)
+	}
+	if stored["mode"] != "replace" {
+		t.Fatalf("stored mode=%v want the flat replace", stored["mode"])
+	}
+	scenarios := asArray(t, stored["scenarios"])
+	if len(scenarios) != 1 || asMap(t, scenarios[0])["ref"] != "flat-s" {
+		t.Fatalf("stored scenarios=%v want the flat scenario", scenarios)
+	}
+	cases := asArray(t, stored["cases"])
+	if len(cases) != 1 || asMap(t, cases[0])["ref"] != "flat-c" {
+		t.Fatalf("stored cases=%v want the flat case", cases)
+	}
+}
+
+// TestGraphProposeRejectsOversize pins the 1 MiB proposal cap on both the nested
+// and the flat input shape.
+func TestGraphProposeRejectsOversize(t *testing.T) {
+	tests := []struct {
+		name string
+		args func(t *testing.T) string
+	}{
+		{
+			name: "nested",
+			args: func(t *testing.T) string {
+				t.Helper()
+				payload, err := json.Marshal(map[string]any{
+					"scenarios": []any{},
+					"cases": []any{map[string]any{
+						"ref": "c1", "title": strings.Repeat("a", (1<<20)+16),
+						"priority": "P1", "requirementIds": []string{"1"},
+						"steps": []any{}, "assertions": []any{},
+					}},
+				})
+				if err != nil {
+					t.Fatalf("marshal oversized payload: %v", err)
+				}
+				args, err := json.Marshal(map[string]any{"versionId": "7", "payload": json.RawMessage(payload)})
+				if err != nil {
+					t.Fatalf("marshal args: %v", err)
+				}
+				return string(args)
+			},
+		},
+		{
+			name: "flat",
+			args: func(t *testing.T) string {
+				t.Helper()
+				args, err := json.Marshal(map[string]any{
+					"versionId": "7",
+					"mode":      "append",
+					"scenarios": []any{},
+					"cases": []any{map[string]any{
+						"ref": "c1", "title": strings.Repeat("a", (1<<20)+16),
+						"priority": "P1", "requirementIds": []string{"1"},
+						"steps": []any{}, "assertions": []any{},
+					}},
+				})
+				if err != nil {
+					t.Fatalf("marshal oversized flat args: %v", err)
+				}
+				return string(args)
+			},
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			fakes := newToolFakes()
+			fakes.runs.runs = []mindmapdomain.CaseDesignRun{activeRun(501, 7, 11, mindmapdomain.RunKindDesign)}
+			tools := fakes.tools(t)
+
+			_, executeErr := executeTool(t, tools, "case.graph_propose", testCase.args(t), toolContext(11, 42))
+			requireToolErrorCode(t, executeErr, "proposal_too_large")
+			if len(fakes.runs.updates) != 0 {
+				t.Fatal("an oversized proposal must not be stored")
+			}
+		})
 	}
 }
 
@@ -788,6 +912,11 @@ func TestSubmitToolsRequireActiveRun(t *testing.T) {
 		{
 			name: "no active run", tool: "case.graph_propose",
 			args: `{"versionId":"7","payload":{"scenarios":[],"cases":[]}}`,
+			runs: nil, context: toolContext(11, 42),
+		},
+		{
+			name: "no active run flat shape", tool: "case.graph_propose",
+			args: `{"versionId":"7","mode":"append","scenarios":[],"cases":[]}`,
 			runs: nil, context: toolContext(11, 42),
 		},
 		{
@@ -841,6 +970,13 @@ func TestGraphProposeValidatesArguments(t *testing.T) {
 		`{"versionId":"7","payload":[]}`,
 		`{"versionId":"7","payload":null}`,
 		`{"versionId":"7","mode":"merge","payload":{"scenarios":[],"cases":[]}}`,
+		// Flat shape: both scenarios and cases are required and must be arrays.
+		`{"versionId":"7","scenarios":[]}`,
+		`{"versionId":"7","cases":[]}`,
+		`{"versionId":"7","scenarios":{},"cases":[]}`,
+		`{"versionId":"7","scenarios":[],"cases":{}}`,
+		`{"versionId":"7","scenarios":null,"cases":[]}`,
+		`{"versionId":"7","mode":"append","anchors":[]}`,
 	}
 	for _, args := range tests {
 		_, err := executeTool(t, tools, "case.graph_propose", args, toolContext(11, 42))
