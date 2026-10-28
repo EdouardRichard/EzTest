@@ -317,11 +317,18 @@ func (g *fakeGit) Read(context.Context, string, string, string, int) (string, er
 type fakeEvents struct {
 	events     []application.VersionEvent
 	publishErr error
+	// onPublish, when set, runs after e is recorded. Tests use it to commit a
+	// concurrent write between the requirement insert and the phase refresh of
+	// the create path.
+	onPublish func(application.VersionEvent)
 }
 
 // Publish records e and returns the configured error.
 func (f *fakeEvents) Publish(_ context.Context, e application.VersionEvent) error {
 	f.events = append(f.events, e)
+	if f.onPublish != nil {
+		f.onPublish(e)
+	}
 	return f.publishErr
 }
 

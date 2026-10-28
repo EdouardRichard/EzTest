@@ -14,13 +14,14 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
 // versionColumnList is the shared column order of every version query and the
 // order scanVersion expects.
 const versionColumnList = `id, name, label, description, status,
-	paused, pause_mode, batch_no,
+	paused, pause_mode, batch_no, continue_phase, continued_at,
 	system_id, environment_id, code_repository_id, code_branch, code_baseline_commit,
 	revision, created_by, updated_by, created_at, updated_at`
 
@@ -48,6 +49,8 @@ var _ domain.VersionRepository = (*VersionRepository)(nil)
 func scanVersion(row versionRowScanner) (domain.Version, error) {
 	var (
 		version            domain.Version
+		continuePhase      *string
+		continuedAt        *time.Time
 		systemID           *int64
 		environmentID      *int64
 		codeRepositoryID   *int64
@@ -63,6 +66,8 @@ func scanVersion(row versionRowScanner) (domain.Version, error) {
 		&version.Paused,
 		&version.PauseMode,
 		&version.BatchNo,
+		&continuePhase,
+		&continuedAt,
 		&systemID,
 		&environmentID,
 		&codeRepositoryID,
@@ -76,6 +81,10 @@ func scanVersion(row versionRowScanner) (domain.Version, error) {
 	); err != nil {
 		return domain.Version{}, err
 	}
+	if continuePhase != nil {
+		version.ContinuePhase = *continuePhase
+	}
+	version.ContinuedAt = continuedAt
 	version.SystemID = systemID
 	version.EnvironmentID = environmentID
 	version.CodeRepositoryID = codeRepositoryID
@@ -358,16 +367,17 @@ func (r *VersionRepository) SetBatchNo(ctx context.Context, id int64, batchNo in
 	return &updated, nil
 }
 
-// AllocateBatchNo atomically increments the batch_no of an executing version
-// with a single UPDATE ... RETURNING, so concurrent allocators always observe
-// distinct numbers. Only executing versions accept the write (a batch is created
-// for an executing version). A zero-row UPDATE is disambiguated with one
-// follow-up status read: a missing row is not_found, any other status is a
+// AllocateBatchNo atomically increments the batch_no of an executing or
+// continuing version with a single UPDATE ... RETURNING, so concurrent
+// allocators always observe distinct numbers. Both statuses accept the write: a
+// baseline/supplement batch belongs to an executing version and a P7 incremental
+// batch is created on a continuing one. A zero-row UPDATE is disambiguated with
+// one follow-up status read: a missing row is not_found, any other status is a
 // version_state_conflict.
 func (r *VersionRepository) AllocateBatchNo(ctx context.Context, id int64, actor int64) (int, error) {
 	const query = `UPDATE version
 		SET batch_no = batch_no + 1, revision = revision + 1, updated_by = $2, updated_at = now()
-		WHERE id = $1 AND status = 'executing'
+		WHERE id = $1 AND status IN ('executing', 'continuing')
 		RETURNING batch_no`
 	var batchNo int
 	err := r.pool.QueryRow(ctx, query, id, actor).Scan(&batchNo)
@@ -420,6 +430,293 @@ func (r *VersionRepository) CompleteExecution(ctx context.Context, id int64, act
 		return nil, fmt.Errorf("postgres: complete version execution: %w", err)
 	}
 	return &updated, nil
+}
+
+// versionNotContinuable is the 409 of the D43 trigger (spec §7.11): the version
+// row is still not completed (typically archived) when the requirement create
+// tried the continue CAS.
+func versionNotContinuable(id int64, status string) error {
+	return domain.NewStateConflict("version_not_continuable",
+		fmt.Sprintf("version %d is %s, requirements can only trigger continuing on a completed version", id, status))
+}
+
+// MarkContinuing performs the completed -> continuing/clarifying CAS (D43/spec
+// §5.1). A zero-row UPDATE is disambiguated with one read: an already continuing
+// row is an idempotent success (transitioned=false), any other status is
+// version_not_continuable.
+func (r *VersionRepository) MarkContinuing(ctx context.Context, id int64, actor int64) (*domain.Version, bool, error) {
+	const query = `UPDATE version
+		SET status = 'continuing', continue_phase = 'clarifying', continued_at = now(),
+		    revision = revision + 1, updated_by = $2, updated_at = now()
+		WHERE id = $1 AND status = 'completed'
+		RETURNING ` + versionColumnList
+	updated, err := scanVersion(r.pool.QueryRow(ctx, query, id, actor))
+	if err == nil {
+		return &updated, true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, fmt.Errorf("postgres: mark version continuing: %w", err)
+	}
+
+	current, readErr := r.Get(ctx, id)
+	if readErr != nil {
+		return nil, false, readErr
+	}
+	if current.Status == domain.VersionContinuing {
+		return current, false, nil
+	}
+	return nil, false, versionNotContinuable(id, current.Status)
+}
+
+// SetContinuePhase writes only the continue_phase column of a continuing
+// version. The empty phase clears it (NULL); a non-continuing row is a
+// version_state_conflict and a missing row is not_found.
+func (r *VersionRepository) SetContinuePhase(ctx context.Context, id int64, phase string, actor int64) (*domain.Version, error) {
+	const query = `UPDATE version
+		SET continue_phase = NULLIF($2, ''), revision = revision + 1, updated_by = $3, updated_at = now()
+		WHERE id = $1 AND status = 'continuing'
+		RETURNING ` + versionColumnList
+	updated, err := scanVersion(r.pool.QueryRow(ctx, query, id, phase, actor))
+	if err == nil {
+		return &updated, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("postgres: set version continue phase: %w", err)
+	}
+	if _, readErr := r.Get(ctx, id); readErr != nil {
+		return nil, readErr
+	}
+	return nil, versionStateConflict(id)
+}
+
+// RefreshContinuePhase atomically derives continue_phase from the requirement
+// statuses of a continuing version (spec §5.1): every requirement non-draft
+// moves it to designing, any draft keeps/moves it to clarifying. The derivation
+// happens inside the UPDATE, so two concurrent confirmations cannot leave a
+// fully confirmed version stuck in clarifying. phase=executing is never
+// interrupted by a requirement write, and an unchanged phase affects zero rows
+// (transitioned=false).
+func (r *VersionRepository) RefreshContinuePhase(ctx context.Context, id int64, actor int64) (*domain.Version, bool, error) {
+	const query = `
+		WITH target AS (
+			SELECT CASE WHEN EXISTS (
+				SELECT 1 FROM requirement WHERE version_id = $1 AND status = 'draft'
+			) THEN 'clarifying' ELSE 'designing' END AS phase
+		)
+		UPDATE version
+		SET continue_phase = target.phase,
+		    revision = revision + 1, updated_by = $2, updated_at = now()
+		FROM target
+		WHERE version.id = $1
+		  AND version.status = 'continuing'
+		  AND version.continue_phase IS DISTINCT FROM 'executing'
+		  AND version.continue_phase IS DISTINCT FROM target.phase
+		RETURNING ` + versionColumnList
+	updated, err := scanVersion(r.pool.QueryRow(ctx, query, id, actor))
+	if err == nil {
+		return &updated, true, nil
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, nil
+	}
+	return nil, false, fmt.Errorf("postgres: refresh version continue phase: %w", err)
+}
+
+// CompleteContinuing performs the continuing -> completed CAS and clears the
+// continue phase. An already completed row is an idempotent success
+// (transitioned=false); any other status is a version_state_conflict.
+func (r *VersionRepository) CompleteContinuing(ctx context.Context, id int64, actor int64) (*domain.Version, bool, error) {
+	const query = `UPDATE version
+		SET status = 'completed', continue_phase = NULL,
+		    revision = revision + 1, updated_by = $2, updated_at = now()
+		WHERE id = $1 AND status = 'continuing'
+		RETURNING ` + versionColumnList
+	updated, err := scanVersion(r.pool.QueryRow(ctx, query, id, actor))
+	if err == nil {
+		return &updated, true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, fmt.Errorf("postgres: complete continuing version: %w", err)
+	}
+	current, readErr := r.Get(ctx, id)
+	if readErr != nil {
+		return nil, false, readErr
+	}
+	if current.Status == domain.VersionCompleted {
+		return current, false, nil
+	}
+	return nil, false, versionStateConflict(id)
+}
+
+// Finalize performs the spec §5.1 rule 5 CAS: executing or continuing (never
+// paused) -> completed with the continue phase cleared. A zero-row UPDATE on an
+// already completed row is an idempotent success (transitioned=false); every
+// other zero-row outcome is a version_state_conflict. The paused predicate is
+// re-checked in SQL so a pause that commits between the service's read and this
+// write can never be finalized.
+func (r *VersionRepository) Finalize(ctx context.Context, id int64, actor int64) (*domain.Version, bool, error) {
+	const query = `UPDATE version
+		SET status = 'completed', continue_phase = NULL,
+		    revision = revision + 1, updated_by = $2, updated_at = now()
+		WHERE id = $1 AND status IN ('executing', 'continuing') AND paused = false
+		RETURNING ` + versionColumnList
+	updated, err := scanVersion(r.pool.QueryRow(ctx, query, id, actor))
+	if err == nil {
+		return &updated, true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, fmt.Errorf("postgres: finalize version: %w", err)
+	}
+	current, readErr := r.Get(ctx, id)
+	if readErr != nil {
+		return nil, false, readErr
+	}
+	if current.Status == domain.VersionCompleted {
+		return current, false, nil
+	}
+	return nil, false, versionStateConflict(id)
+}
+
+// requirementInsertQuery inserts one requirement row and returns the shared
+// column list. It is used by both the plain and the continuing-transaction
+// requirement create paths.
+const requirementInsertQuery = `INSERT INTO requirement
+	(id, version_id, title, description, acceptance_criteria, priority, status,
+	 source, last_update_source, revision, confirmed_at, confirmed_by, created_by, updated_by)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+	RETURNING ` + requirementColumnList
+
+// requirementInsertArgs renders the requirementInsertQuery parameters.
+func requirementInsertArgs(requirement *domain.Requirement) []any {
+	return []any{
+		requirement.ID, requirement.VersionID, requirement.Title, requirement.Description,
+		requirement.AcceptanceCriteria, requirement.Priority, requirement.Status,
+		requirement.Source, requirement.LastUpdateSource, requirement.Revision,
+		requirement.ConfirmedAt, requirement.ConfirmedBy, requirement.CreatedBy, requirement.UpdatedBy,
+	}
+}
+
+// CreateRequirementContinuing inserts the requirement and performs the
+// completed -> continuing CAS in one transaction (D43/spec §6.1 step 1): either
+// both writes commit or neither does. Concurrent creates are serialised by the
+// version row lock, so exactly one of them observes the transition; the others
+// see continuing and only insert their requirement. The returned boolean reports
+// whether this call performed the transition. A non-continuing, non-completed
+// version (archived) is version_not_continuable and rolls the insert back.
+func (r *VersionRepository) CreateRequirementContinuing(ctx context.Context, requirement *domain.Requirement, actor int64) (bool, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("postgres: begin requirement continuing transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	const casQuery = `UPDATE version
+		SET status = 'continuing', continue_phase = 'clarifying', continued_at = now(),
+		    revision = revision + 1, updated_by = $2, updated_at = now()
+		WHERE id = $1 AND status = 'completed'
+		RETURNING id`
+	transitioned := false
+	var versionID int64
+	err = tx.QueryRow(ctx, casQuery, requirement.VersionID, actor).Scan(&versionID)
+	switch {
+	case err == nil:
+		transitioned = true
+	case errors.Is(err, pgx.ErrNoRows):
+		var status string
+		if readErr := tx.QueryRow(ctx,
+			`SELECT status FROM version WHERE id = $1`, requirement.VersionID).Scan(&status); readErr != nil {
+			if errors.Is(readErr, pgx.ErrNoRows) {
+				return false, domain.NewNotFound("version", requirement.VersionID)
+			}
+			return false, fmt.Errorf("postgres: read version status after continuing CAS: %w", readErr)
+		}
+		if status != domain.VersionContinuing {
+			return false, versionNotContinuable(requirement.VersionID, status)
+		}
+	default:
+		return false, fmt.Errorf("postgres: mark version continuing: %w", err)
+	}
+
+	created, err := scanRequirement(tx.QueryRow(ctx, requirementInsertQuery, requirementInsertArgs(requirement)...))
+	if err != nil {
+		return false, requirementCreateError(err, requirement.VersionID)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("postgres: commit requirement continuing transaction: %w", err)
+	}
+	*requirement = created
+	return transitioned, nil
+}
+
+// versionChangesLimit bounds the derived change feed of one version. D50 keeps
+// no snapshot, so the read is a bounded projection over the source rows.
+const versionChangesLimit = 1000
+
+// Changes derives the version change feed at read time (spec §7.2/D50) from the
+// requirement, run_batch, report and issue timestamps of the version. It is a
+// read-only union of the contexts' rows filtered by the version's logical id;
+// no row is ever written or locked. P4 code.changed entries are events rather
+// than rows and are not part of this projection in P7.
+func (r *VersionRepository) Changes(ctx context.Context, versionID int64) ([]domain.VersionChange, error) {
+	const query = `
+		SELECT kind, at, ref_id, summary FROM (
+			SELECT 'requirement_added'::text AS kind, created_at AS at, id::text AS ref_id,
+			       '需求新增：' || left(title, 80) AS summary
+			  FROM requirement WHERE version_id = $1
+			UNION ALL
+			SELECT 'batch_finished', COALESCE(finished_at, created_at), id::text,
+			       '批次结束：第 ' || batch_no || ' 批（' || status || '）'
+			  FROM run_batch WHERE version_id = $1 AND status IN ('done', 'failed', 'cancelled')
+			UNION ALL
+			SELECT 'report_published', published_at, id::text,
+			       '报告发布：revision ' || revision
+			  FROM report WHERE version_id = $1 AND published_at IS NOT NULL
+			UNION ALL
+			SELECT 'issue_created', created_at, id::text,
+			       '问题创建：' || left(title, 80)
+			  FROM issue WHERE version_id = $1
+		) changes
+		ORDER BY at DESC, kind ASC, ref_id DESC
+		LIMIT $2`
+	rows, err := r.pool.Query(ctx, query, versionID, versionChangesLimit)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list version changes: %w", err)
+	}
+	defer rows.Close()
+
+	changes := make([]domain.VersionChange, 0)
+	for rows.Next() {
+		var change domain.VersionChange
+		if err := rows.Scan(&change.Kind, &change.At, &change.RefID, &change.Summary); err != nil {
+			return nil, fmt.Errorf("postgres: scan version change: %w", err)
+		}
+		changes = append(changes, change)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: list version changes: %w", err)
+	}
+	return changes, nil
+}
+
+// FinalizeBatchState implements application.FinalizeBatchReader as a read-only
+// projection of the execution context's run_batch rows (spec §5.1/§6.2). The
+// version context never writes execution state; the counts only feed the
+// finalize decision. A version without batches yields zero counts.
+func (r *VersionRepository) FinalizeBatchState(ctx context.Context, versionID int64) (versionapp.FinalizeBatchState, error) {
+	const query = `SELECT
+			count(*)::int,
+			count(*) FILTER (WHERE status IN ('planned', 'running'))::int,
+			count(*) FILTER (WHERE status IN ('done', 'failed', 'cancelled') AND NOT autonomy_done)::int,
+			count(*) FILTER (WHERE kind = 'incremental')::int
+		FROM run_batch
+		WHERE version_id = $1`
+	var state versionapp.FinalizeBatchState
+	if err := r.pool.QueryRow(ctx, query, versionID).Scan(
+		&state.TotalBatches, &state.ActiveBatches, &state.UnsettledBatches, &state.IncrementalBatches,
+	); err != nil {
+		return versionapp.FinalizeBatchState{}, fmt.Errorf("postgres: read version finalize batch state: %w", err)
+	}
+	return state, nil
 }
 
 // UpdateExecutionState is retained only because domain.VersionRepository still

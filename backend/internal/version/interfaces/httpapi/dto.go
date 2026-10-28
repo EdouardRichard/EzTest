@@ -37,9 +37,14 @@ type versionDTO struct {
 	// (execution spec §6.3). The active batch itself is deliberately not part
 	// of the version DTO: the frontend reads it from
 	// GET /api/versions/{id}/batches?status=running&limit=1.
-	Paused             bool               `json:"paused"`
-	PauseMode          string             `json:"pause_mode"`
-	BatchNo            int                `json:"batch_no"`
+	Paused    bool   `json:"paused"`
+	PauseMode string `json:"pause_mode"`
+	BatchNo   int    `json:"batch_no"`
+	// ContinuePhase and ContinuedAt are the P7 continuing additions (spec §7.2).
+	// Both are null unless the version is continuing; completed clears the
+	// phase (D43).
+	ContinuePhase      *string            `json:"continuePhase"`
+	ContinuedAt        *time.Time         `json:"continuedAt"`
 	SystemID           *int64             `json:"systemId"`
 	EnvironmentID      *int64             `json:"environmentId"`
 	CodeRepositoryID   *int64             `json:"codeRepositoryId"`
@@ -59,6 +64,11 @@ type versionDTO struct {
 // newVersionDTO maps a version aggregate, its aggregate counters and its
 // resolved bindings to the API shape.
 func newVersionDTO(version *versionapp.Version, counts versionCountsView, bindings versionBindingsDTO) versionDTO {
+	var continuePhase *string
+	if version.ContinuePhase != "" {
+		phase := version.ContinuePhase
+		continuePhase = &phase
+	}
 	return versionDTO{
 		ID:                 version.ID,
 		Name:               version.Name,
@@ -68,6 +78,8 @@ func newVersionDTO(version *versionapp.Version, counts versionCountsView, bindin
 		Paused:             version.Paused,
 		PauseMode:          version.PauseMode,
 		BatchNo:            version.BatchNo,
+		ContinuePhase:      continuePhase,
+		ContinuedAt:        version.ContinuedAt,
 		SystemID:           version.SystemID,
 		EnvironmentID:      version.EnvironmentID,
 		CodeRepositoryID:   version.CodeRepositoryID,
@@ -714,4 +726,40 @@ type createDecisionRequest struct {
 type updateDecisionRequest struct {
 	Status    string  `json:"status"`
 	Rationale *string `json:"rationale"`
+}
+
+// versionChangeDTO is one derived item of GET /versions/{id}/changes (spec
+// §7.2): the referenced P7 id is a string and at is the source row timestamp.
+type versionChangeDTO struct {
+	Kind    string    `json:"kind"`
+	At      time.Time `json:"at"`
+	RefID   string    `json:"refId"`
+	Summary string    `json:"summary"`
+}
+
+// versionChangesDTO is the changes page body. It is rendered inside the shared
+// data envelope as {data:{items,nextCursor,hasMore}} and items is always an
+// array.
+type versionChangesDTO struct {
+	Items      []versionChangeDTO `json:"items"`
+	NextCursor string             `json:"nextCursor"`
+	HasMore    bool               `json:"hasMore"`
+}
+
+// newVersionChangesDTO maps one derived change page to its API shape.
+func newVersionChangesDTO(page versionapp.VersionChangePage) versionChangesDTO {
+	items := make([]versionChangeDTO, 0, len(page.Items))
+	for _, change := range page.Items {
+		items = append(items, versionChangeDTO{
+			Kind:    change.Kind,
+			At:      change.At.UTC(),
+			RefID:   change.RefID,
+			Summary: change.Summary,
+		})
+	}
+	return versionChangesDTO{
+		Items:      items,
+		NextCursor: page.NextCursor,
+		HasMore:    page.HasMore,
+	}
 }

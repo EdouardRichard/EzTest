@@ -372,14 +372,36 @@ func TestVersionRepositoryReleaseBatchNo(t *testing.T) {
 }
 
 // TestVersionRepositoryAllocateBatchNoGuards covers the allocation status guard
-// and the missing-version mapping.
+// (executing and continuing allocate, every other status is a conflict) and the
+// missing-version mapping.
 func TestVersionRepositoryAllocateBatchNoGuards(t *testing.T) {
 	ctx := context.Background()
 	pool := testutil.OpenTestDB(t)
 	repo := postgres.NewVersionRepository(pool)
 
+	// P7 incremental batches are created on a continuing version, so it owns
+	// batch-number allocation exactly like an executing one.
+	continuing := insertVersion(t, repo, domain.Version{
+		ID: 6008, Name: "Continuing allocation", Status: domain.VersionContinuing, CreatedBy: 7, UpdatedBy: 7,
+	})
+	allocated, err := repo.AllocateBatchNo(ctx, continuing.ID, 42)
+	if err != nil {
+		t.Fatalf("AllocateBatchNo continuing: %v", err)
+	}
+	if allocated != 1 {
+		t.Fatalf("AllocateBatchNo continuing = %d, want 1", allocated)
+	}
+	afterContinuing, err := repo.Get(ctx, continuing.ID)
+	if err != nil {
+		t.Fatalf("Get continuing: %v", err)
+	}
+	if afterContinuing.BatchNo != 1 || afterContinuing.Status != domain.VersionContinuing ||
+		afterContinuing.Revision != 2 || afterContinuing.UpdatedBy != 42 {
+		t.Fatalf("continuing allocation row = %+v", afterContinuing)
+	}
+
 	draft := insertVersion(t, repo, domain.Version{ID: 6007, Name: "Draft allocation", CreatedBy: 7, UpdatedBy: 7})
-	_, err := repo.AllocateBatchNo(ctx, draft.ID, 42)
+	_, err = repo.AllocateBatchNo(ctx, draft.ID, 42)
 	assertVersionKind(t, err, domain.KindStateConflict, "version_state_conflict")
 	afterDraft, err := repo.Get(ctx, draft.ID)
 	if err != nil {
@@ -387,6 +409,15 @@ func TestVersionRepositoryAllocateBatchNoGuards(t *testing.T) {
 	}
 	if afterDraft.BatchNo != 0 || afterDraft.Revision != 1 {
 		t.Fatalf("blocked allocation wrote the row: %+v", afterDraft)
+	}
+
+	for _, blocked := range []domain.Version{
+		{ID: 6009, Name: "Archived allocation", Status: domain.VersionArchived, CreatedBy: 7, UpdatedBy: 7},
+		{ID: 6010, Name: "Completed allocation", Status: domain.VersionCompleted, CreatedBy: 7, UpdatedBy: 7},
+	} {
+		stored := insertVersion(t, repo, blocked)
+		_, err := repo.AllocateBatchNo(ctx, stored.ID, 42)
+		assertVersionKind(t, err, domain.KindStateConflict, "version_state_conflict")
 	}
 
 	_, err = repo.AllocateBatchNo(ctx, 999999, 42)

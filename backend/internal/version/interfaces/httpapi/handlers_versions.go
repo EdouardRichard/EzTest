@@ -20,6 +20,14 @@ type VersionHandler struct {
 	resources versionapp.ResourceCatalog
 }
 
+// versionChangesService is the optional application slice behind
+// GET /versions/{id}/changes (spec §7.2). *version/application.VersionService
+// implements it; the handler type-asserts h.versions so the frozen VersionService
+// consumer interface does not grow and a fake without the feed keeps compiling.
+type versionChangesService interface {
+	Changes(ctx context.Context, versionID int64, page domain.Page) (versionapp.VersionChangePage, error)
+}
+
 // RegisterRoutes mounts the version routes. Authentication is the server's
 // global middleware: there is no per-route guard.
 func (h *VersionHandler) RegisterRoutes(mux *http.ServeMux) {
@@ -30,6 +38,7 @@ func (h *VersionHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /api/versions/{id}/bindings", h.UpdateBindings)
 	mux.HandleFunc("POST /api/versions/{id}/start-clarification", h.StartClarification)
 	mux.HandleFunc("POST /api/versions/{id}/enter-design", h.EnterDesign)
+	mux.HandleFunc("GET /api/versions/{id}/changes", h.Changes)
 }
 
 // Create validates and inserts a draft version (spec §7.2) and returns 201.
@@ -208,6 +217,35 @@ func (h *VersionHandler) EnterDesign(w http.ResponseWriter, r *http.Request) {
 		Version:  dto,
 		Warnings: warningMessages(warnings),
 	})
+}
+
+// Changes returns the read-time derived change feed of one version (spec
+// §7.2/D50): requirement creations, finished batches, published reports and
+// created issues, newest first. It is an optional version-service slice: a
+// process that did not wire it fails with an internal error instead of
+// silently returning an empty feed.
+func (h *VersionHandler) Changes(w http.ResponseWriter, r *http.Request) {
+	id, err := PathID(r, "id")
+	if err != nil {
+		WriteServiceError(w, r, err)
+		return
+	}
+	page, err := ParsePage(r)
+	if err != nil {
+		WriteServiceError(w, r, err)
+		return
+	}
+	service, ok := h.versions.(versionChangesService)
+	if !ok {
+		WriteServiceError(w, r, errors.New("version: changes service is not configured"))
+		return
+	}
+	result, err := service.Changes(r.Context(), id, page)
+	if err != nil {
+		WriteServiceError(w, r, err)
+		return
+	}
+	WriteData(w, http.StatusOK, newVersionChangesDTO(result))
 }
 
 // writeVersion renders one version DTO with the given status.
