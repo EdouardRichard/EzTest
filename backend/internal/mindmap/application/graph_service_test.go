@@ -25,6 +25,7 @@ type graphFixture struct {
 	confirmed  []application.RequirementSnapshot
 	relations  []application.RelationSnapshot
 	events     []application.Event
+	anchors    application.CodeAnchorGateway
 	now        time.Time
 	nextID     int64
 }
@@ -55,6 +56,7 @@ func (f *graphFixture) service() *application.GraphService {
 		Baselines:    graphBaselineRepo{f},
 		Versions:     graphVersionLifecycle{f},
 		Requirements: graphRequirementReader{f},
+		Anchors:      f.anchors,
 		Events:       graphEventSink{f},
 		IDs:          graphIDGenerator{f},
 		Clock:        graphClock{f},
@@ -598,6 +600,60 @@ type graphClock struct {
 
 func (c graphClock) Now() time.Time {
 	return c.f.now
+}
+
+// graphAnchorGateway is a recording in-memory application.CodeAnchorGateway.
+// DeleteNode must list the anchors of every doomed node and delete each one;
+// the recorded calls prove the cleanup ran after the node transaction.
+type graphAnchorGateway struct {
+	byNode    map[int64][]application.Anchor
+	listed    []int64
+	deleted   []int64
+	listErr   error
+	deleteErr error
+}
+
+func newGraphAnchorGateway() *graphAnchorGateway {
+	return &graphAnchorGateway{byNode: make(map[int64][]application.Anchor)}
+}
+
+func (g *graphAnchorGateway) add(nodeID, anchorID int64) {
+	g.byNode[nodeID] = append(g.byNode[nodeID], application.Anchor{
+		ID:         anchorID,
+		VersionID:  1,
+		SubjectID:  nodeID,
+		FilePath:   "src/order/submit.ts",
+		Confidence: domain.ConfidenceHigh,
+	})
+}
+
+func (g *graphAnchorGateway) Create(context.Context, int64, int64, application.AnchorParams) (application.Anchor, error) {
+	return application.Anchor{}, errors.New("graphAnchorGateway: Create is not used")
+}
+
+func (g *graphAnchorGateway) List(_ context.Context, versionID, nodeID int64) ([]application.Anchor, error) {
+	g.listed = append(g.listed, nodeID)
+	if g.listErr != nil {
+		return nil, g.listErr
+	}
+	return append([]application.Anchor(nil), g.byNode[nodeID]...), nil
+}
+
+func (g *graphAnchorGateway) Delete(_ context.Context, versionID, anchorID int64) error {
+	g.deleted = append(g.deleted, anchorID)
+	if g.deleteErr != nil {
+		return g.deleteErr
+	}
+	for nodeID, list := range g.byNode {
+		kept := make([]application.Anchor, 0, len(list))
+		for _, anchor := range list {
+			if anchor.ID != anchorID {
+				kept = append(kept, anchor)
+			}
+		}
+		g.byNode[nodeID] = kept
+	}
+	return nil
 }
 
 // graphTx implements application.GraphTx over the same fixture.
@@ -1454,6 +1510,178 @@ func TestGetRejectsMissingVersion(t *testing.T) {
 	if _, err := service.Get(ctx, 2); err == nil {
 		t.Fatal("expected an error for a missing version")
 	}
+}
+
+// TestDeleteNodeRemovesAnchorsOfSubtree covers spec §6.1 rule 6: deleting a
+// scenario removes the code anchors of itself and its descendant cases through
+// the CodeAnchorGateway.
+func TestDeleteNodeRemovesAnchorsOfSubtree(t *testing.T) {
+	ctx := context.Background()
+	fixture := newGraphFixture()
+	anchors := newGraphAnchorGateway()
+	fixture.anchors = anchors
+	parentID := int64(10)
+	childID := int64(11)
+	caseID := int64(12)
+	fixture.seedScenario(parentID, nil)
+	fixture.seedScenario(childID, &parentID)
+	fixture.seedCase(caseID, &childID, 7)
+	anchors.add(parentID, 901)
+	anchors.add(childID, 902)
+	anchors.add(caseID, 903)
+	service := fixture.service()
+
+	if err := service.DeleteNode(ctx, 1, parentID, 42, 1); err != nil {
+		t.Fatalf("delete scenario: %v", err)
+	}
+	if len(fixture.nodes) != 0 || len(fixture.steps) != 0 || len(fixture.assertions) != 0 || len(fixture.sources) != 0 {
+		t.Fatalf("cascade left nodes=%d steps=%d assertions=%d sources=%d",
+			len(fixture.nodes), len(fixture.steps), len(fixture.assertions), len(fixture.sources))
+	}
+	sort.Slice(anchors.listed, func(i, j int) bool { return anchors.listed[i] < anchors.listed[j] })
+	if !graphEqualIDs(anchors.listed, []int64{parentID, childID, caseID}) {
+		t.Fatalf("anchor list calls = %v, want every doomed node %v", anchors.listed, []int64{parentID, childID, caseID})
+	}
+	sort.Slice(anchors.deleted, func(i, j int) bool { return anchors.deleted[i] < anchors.deleted[j] })
+	if !graphEqualIDs(anchors.deleted, []int64{901, 902, 903}) {
+		t.Fatalf("deleted anchors = %v, want [901 902 903]", anchors.deleted)
+	}
+	for nodeID, list := range anchors.byNode {
+		if len(list) != 0 {
+			t.Fatalf("anchors of node %d after delete = %+v, want none", nodeID, list)
+		}
+	}
+	requireEvent(t, fixture, 0, domain.EventCaseDeleted)
+}
+
+// TestDeleteNodeAnchorCleanupIsBestEffort covers the best-effort clause of spec
+// §6.1 rule 6: an anchor gateway that cannot list or delete never fails the
+// node delete.
+func TestDeleteNodeAnchorCleanupIsBestEffort(t *testing.T) {
+	cases := []struct {
+		name      string
+		configure func(*graphAnchorGateway)
+	}{
+		{name: "list failure", configure: func(g *graphAnchorGateway) { g.listErr = errors.New("anchor service unavailable") }},
+		{name: "delete failure", configure: func(g *graphAnchorGateway) { g.deleteErr = errors.New("anchor delete denied") }},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			ctx := context.Background()
+			fixture := newGraphFixture()
+			anchors := newGraphAnchorGateway()
+			anchors.add(11, 901)
+			testCase.configure(anchors)
+			fixture.anchors = anchors
+			fixture.seedCase(11, nil, 7)
+			service := fixture.service()
+
+			if err := service.DeleteNode(ctx, 1, 11, 42, 1); err != nil {
+				t.Fatalf("delete must not fail when anchor cleanup fails: %v", err)
+			}
+			if _, ok := fixture.nodes[11]; ok {
+				t.Fatal("node survived the delete")
+			}
+			requireEvent(t, fixture, 0, domain.EventCaseDeleted)
+		})
+	}
+}
+
+// TestDeleteNodeWithoutAnchorGatewaySucceeds covers the optional dependency: a
+// nil AnchorGateway must not block deletion.
+func TestDeleteNodeWithoutAnchorGatewaySucceeds(t *testing.T) {
+	ctx := context.Background()
+	fixture := newGraphFixture()
+	fixture.seedCase(11, nil, 7)
+	service := fixture.service()
+
+	if err := service.DeleteNode(ctx, 1, 11, 42, 1); err != nil {
+		t.Fatalf("delete without an anchor gateway: %v", err)
+	}
+	if _, ok := fixture.nodes[11]; ok {
+		t.Fatal("node survived the delete")
+	}
+	requireEvent(t, fixture, 0, domain.EventCaseDeleted)
+}
+
+// seedScenarios stores count root scenarios so a test can reach the node cap.
+func seedScenarios(fixture *graphFixture, count int) {
+	for index := 0; index < count; index++ {
+		fixture.seedScenario(int64(1000+index), nil)
+	}
+}
+
+// TestGetRejectsGraphOverNodeCap covers spec §7.3: a version with more than 300
+// nodes is graph_too_large (409) on the read path; exactly 300 is allowed.
+func TestGetRejectsGraphOverNodeCap(t *testing.T) {
+	ctx := context.Background()
+	t.Run("at the cap", func(t *testing.T) {
+		fixture := newGraphFixture()
+		seedScenarios(fixture, 300)
+		view, err := fixture.service().Get(ctx, 1)
+		if err != nil {
+			t.Fatalf("get graph at the cap: %v", err)
+		}
+		if len(view.Nodes) != 300 {
+			t.Fatalf("nodes = %d, want 300", len(view.Nodes))
+		}
+	})
+	t.Run("over the cap", func(t *testing.T) {
+		fixture := newGraphFixture()
+		seedScenarios(fixture, 301)
+		_, err := fixture.service().Get(ctx, 1)
+		requireDomainError(t, err, domain.KindConflict, "graph_too_large")
+	})
+}
+
+// TestCreateNodeRejectsGraphAtNodeCap covers spec §7.3 on the write path: the
+// 301st node is graph_too_large and nothing is written.
+func TestCreateNodeRejectsGraphAtNodeCap(t *testing.T) {
+	ctx := context.Background()
+	t.Run("below the cap", func(t *testing.T) {
+		fixture := newGraphFixture()
+		seedScenarios(fixture, 299)
+		service := fixture.service()
+		if _, err := service.CreateNode(ctx, 1, 42, application.CreateNodeCommand{
+			Kind:  domain.NodeKindScenario,
+			Title: "the 300th node",
+		}); err != nil {
+			t.Fatalf("create node below the cap: %v", err)
+		}
+		if len(fixture.nodes) != 300 {
+			t.Fatalf("nodes = %d, want 300", len(fixture.nodes))
+		}
+		requireEvent(t, fixture, 0, domain.EventCaseCreated)
+	})
+	t.Run("at the cap", func(t *testing.T) {
+		fixture := newGraphFixture()
+		seedScenarios(fixture, 300)
+		service := fixture.service()
+		_, err := service.CreateNode(ctx, 1, 42, application.CreateNodeCommand{
+			Kind:  domain.NodeKindScenario,
+			Title: "over the cap",
+		})
+		requireDomainError(t, err, domain.KindConflict, "graph_too_large")
+		if len(fixture.nodes) != 300 {
+			t.Fatalf("rejected create stored %d nodes, want 300", len(fixture.nodes))
+		}
+		if len(fixture.events) != 0 {
+			t.Fatalf("rejected create published %d event(s)", len(fixture.events))
+		}
+	})
+}
+
+// graphEqualIDs reports whether two id lists hold the same values in order.
+func graphEqualIDs(got, want []int64) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for index := range got {
+		if got[index] != want[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func graphIntPtr(value int) *int { return &value }
