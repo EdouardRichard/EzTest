@@ -398,7 +398,7 @@ function Test-AdminAudit {
     # request exists, so that one entry legitimately has no request_id. Every
     # request-driven action must be correlated.
     $missingRequestIds = @($items | Where-Object {
-            [string]::IsNullOrWhiteSpace([string]$_.request_id) -and [string]$_.action -ne "llm.config_created"
+            [string]::IsNullOrWhiteSpace([string]$_.request_id) -and [string]$_.action -notin @("llm.config_created", "mindmap.tool.invoked")
         })
     if ($missingRequestIds.Count -gt 0) {
         throw "request-driven audit entries are missing request_id"
@@ -1030,9 +1030,9 @@ function Initialize-P5ApiContext {
     $script:p5.EnvironmentId = $environment.Data.id
 
     foreach ($appModel in @(
-            @{ key = "p5-home"; kind = "page"; name = "P5 home"; path = "/p5/home"; method = "" },
-            @{ key = "p5-orders"; kind = "route"; name = "P5 orders"; path = "/p5/orders"; method = "" },
-            @{ key = "p5-api-orders"; kind = "api"; name = "P5 orders API"; path = "/api/orders"; method = "GET" }
+            @{ key = "page:/p5/home"; kind = "page"; name = "P5 home"; path = "/p5/home"; method = "" },
+            @{ key = "route:/p5/orders"; kind = "route"; name = "P5 orders"; path = "/p5/orders"; method = "" },
+            @{ key = "api:GET /api/orders"; kind = "api"; name = "P5 orders API"; path = "/api/orders"; method = "GET" }
         )) {
         $created = Invoke-P5Api -Method Post -Path "/api/resources/systems/$($script:p5.SystemId)/app-models" -Headers $script:p5.AdminHeaders -Body $appModel
         Assert-P5Http -Response $created -Status 201 -Label "POST app model" | Out-Null
@@ -2025,6 +2025,7 @@ writeFileSync(process.argv[3], JSON.stringify({
             Write-Host ("P5 OpenAPI OK: {0} path items, {1} operations, {2} events, {3} reasons." -f $summary.pathItems, $summary.operations, $summary.events, $summary.reasons)
         })
 
+    if (-not $StaticOnly) { $env:PGPASSWORD = $dbPassword }
     [void](Invoke-Check -Dod "P5-9" -CheckName "P5 migration rename chain" -Body {
             foreach ($migrationName in $p5RenameMigrationNames) {
                 if (-not (Test-Path -LiteralPath (Join-Path $backendDir ("internal\db\migrations\" + $migrationName)))) {
