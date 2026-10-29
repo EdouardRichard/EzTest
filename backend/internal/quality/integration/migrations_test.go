@@ -100,8 +100,20 @@ func TestRepositoryAndServiceRoundTrip(t *testing.T) {
 		CorpusVersion: "2026-10-29.1",
 		Model:         "fake-llm",
 		Sample:        &sample,
-		Baseline:      map[string]float64{domain.MetricDesignCoverage: 0.80},
-		Summary:       map[string]any{"scenario": "deterministic"},
+		// The deterministic baseline is a complete contract: all six gated
+		// metrics must be present (eval/baseline.json). design_coverage keeps
+		// 0.80 so the sample's 0.8 is a zero regression that still fails the
+		// 0.90 threshold below_threshold; the other keys carry the committed
+		// baseline values.
+		Baseline: map[string]float64{
+			domain.MetricDesignCoverage:         0.80,
+			domain.MetricImpactRecall:           1.00,
+			domain.MetricImpactPrecision:        1.00,
+			domain.MetricClassificationAccuracy: 1.00,
+			domain.MetricIssueFalsePositiveRate: 0.00,
+			domain.MetricSupplementHitRate:      1.00,
+		},
+		Summary: map[string]any{"scenario": "deterministic"},
 	})
 	if err != nil {
 		t.Fatalf("Record() error = %v", err)
