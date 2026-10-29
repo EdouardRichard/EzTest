@@ -3,6 +3,7 @@ package domain
 import (
 	"fmt"
 	"math"
+	"strings"
 	"time"
 )
 
@@ -70,6 +71,15 @@ type VisualAssertion struct {
 // HasBaseline reports whether an approved baseline exists.
 func (v VisualAssertion) HasBaseline() bool {
 	return v.BaselineEvidenceID != nil && *v.BaselineEvidenceID > 0
+}
+
+// UsesSelector reports whether the assertion compares one element instead of the
+// whole viewport. An element capture is sized by the element box and the device
+// scale factor, so an approved baseline of a selector assertion is not required
+// to match viewport×DPR; the executor reports a baseline/actual size difference
+// as inconclusive(environment).
+func (v VisualAssertion) UsesSelector() bool {
+	return strings.TrimSpace(v.Selector) != ""
 }
 
 // ExpectedImageSize returns the device-pixel size a baseline screenshot of this

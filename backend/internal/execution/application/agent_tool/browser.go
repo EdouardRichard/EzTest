@@ -487,6 +487,10 @@ func (s *toolSet) ensureCaseBrowser(ctx context.Context, caseRunID int64, view a
 		BaseURL:      view.BaseURL,
 		AllowedHosts: append([]string(nil), view.AllowedHosts...),
 	}
+	// Playwright fixes the viewport/DPR at context creation. A case with a
+	// visual assertion must be browsed in that assertion's environment, otherwise
+	// its live fingerprint can never match the approved baseline.
+	spec.Viewport, spec.DeviceScaleFactor = application.CaseVisualEnvironment(view.CaseRun.Snapshot)
 	if s.limits.Session != nil {
 		session, err := s.limits.Session(ctx, caseRunID)
 		if err != nil {

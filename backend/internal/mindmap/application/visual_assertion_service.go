@@ -186,8 +186,12 @@ func (s *VisualAssertionService) ensureWritable(ctx context.Context, versionID i
 }
 
 // validateBaselineEvidence proves the artifact is a screenshot or
-// visual_baseline PNG whose device-pixel size matches the assertion viewport and
-// whose bytes/hash are internally consistent.
+// visual_baseline PNG whose bytes/hash are internally consistent. A full-page
+// assertion additionally requires the device-pixel size of the configured
+// viewport×DPR. A selector assertion captures one element, whose size is owned by
+// the element box (not the viewport), so only a decodable PNG with positive
+// dimensions is required; the executor reports a later baseline/actual size
+// difference as inconclusive(environment, visual_environment_mismatch).
 func (s *VisualAssertionService) validateBaselineEvidence(visual domain.VisualAssertion, evidence VisualEvidence) error {
 	kind := strings.ToLower(strings.TrimSpace(evidence.Kind))
 	if _, ok := visualBaselineEvidenceKinds[kind]; !ok {
@@ -218,6 +222,13 @@ func (s *VisualAssertionService) validateBaselineEvidence(visual domain.VisualAs
 	if err != nil {
 		return domain.NewInvalid("evidenceId", "visual_baseline_invalid",
 			"the visual baseline is not a valid PNG image")
+	}
+	if config.Width <= 0 || config.Height <= 0 {
+		return domain.NewInvalid("evidenceId", "visual_baseline_invalid",
+			"the visual baseline has no pixels")
+	}
+	if visual.UsesSelector() {
+		return nil
 	}
 	wantWidth, wantHeight := visual.ExpectedImageSize()
 	if config.Width != wantWidth || config.Height != wantHeight {

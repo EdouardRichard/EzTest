@@ -405,6 +405,75 @@ func TestVisualAssertUnsupportedComparatorFailsClosed(t *testing.T) {
 	}
 }
 
+// failingDiffCapture delegates to the real EvidenceService but fails the
+// visual_diff capture, modelling a storage failure after the visual_actual
+// screenshot was already committed.
+type failingDiffCapture struct {
+	inner EvidenceCapturePort
+}
+
+func (f failingDiffCapture) Capture(ctx context.Context, in CaptureInput) (domain.Evidence, error) {
+	if in.Kind == visualDiffEvidenceKind {
+		return domain.Evidence{}, errors.New("evidence store is full")
+	}
+	return f.inner.Capture(ctx, in)
+}
+
+// TestVisualAssertDiffCaptureFailureKeepsEvidenceResultIdsConsistent pins fix
+// round 1 finding 6: when the diff capture fails after the actual screenshot was
+// persisted, the recorded not_run result must reuse the assertion_result id the
+// actual evidence metadata points at, and the actual evidence must be referenced
+// from that result. Otherwise the evidence would reference a result id that was
+// never stored.
+func TestVisualAssertDiffCaptureFailureKeepsEvidenceResultIdsConsistent(t *testing.T) {
+	recorder, world, store, comparator, _, opts := visualTestWorld(t)
+	comparator.result = VisualCompareResult{
+		EnvironmentMatch: true, ActualPNG: visualPNG, DiffPNG: []byte("\x89PNG\r\n\x1a\ndiff"),
+		DiffRatio: 0.02, Width: 1280, Height: 720, ActualWidth: 1280, ActualHeight: 720,
+	}
+	opts.Capture = failingDiffCapture{inner: NewEvidenceService(world.evidence, world.refs, world.batches, store, world.ids)}
+	run := world.seedRunningRun(visualAssertSnapshot(baselineID(501)))
+	recordVisualStep(t, recorder, run.ID)
+
+	outcome, err := recorder.VisualAssert(context.Background(), run.ID, 31, opts)
+	wantToolError(t, err, "internal", "visual_evidence_capture_failed")
+	if outcome.Verdict != "not_run" || outcome.FailureReason != "visual_evidence_capture_failed" {
+		t.Fatalf("outcome = %+v", outcome)
+	}
+
+	result := visualResultOf(t, world, run.ID)
+	if result.Verdict != "not_run" || result.FailureReason != "visual_evidence_capture_failed" {
+		t.Fatalf("assertion result = %+v", result)
+	}
+	actuals := visualEvidenceOf(t, world, run.ID, "visual_actual")
+	if len(actuals) != 1 {
+		t.Fatalf("visual_actual evidence = %d, want 1", len(actuals))
+	}
+	referencedResultID := metadataInt(actuals[0].Metadata["assertion_result_id"])
+	if referencedResultID != int(result.ID) {
+		t.Fatalf("actual evidence references assertion_result %d, persisted result is %d",
+			referencedResultID, result.ID)
+	}
+	if outcome.ActualEvidenceID != actuals[0].ID {
+		t.Fatalf("outcome actual evidence = %d, persisted %d", outcome.ActualEvidenceID, actuals[0].ID)
+	}
+	if diffs := visualEvidenceOf(t, world, run.ID, "visual_diff"); len(diffs) != 0 {
+		t.Fatalf("failed diff capture wrote evidence: %+v", diffs)
+	}
+
+	// The actual screenshot is an artifact of the recorded result, so the
+	// evidence ref must exist even on the diff-failure path.
+	foundRef := false
+	for _, ref := range world.refs.all() {
+		if ref.EvidenceID == actuals[0].ID && ref.RefKind == "assertion_result" && ref.RefID == result.ID {
+			foundRef = true
+		}
+	}
+	if !foundRef {
+		t.Fatalf("no assertion_result ref for evidence %d -> result %d", actuals[0].ID, result.ID)
+	}
+}
+
 // TestReadVisualBaselineKinds pins the execution-side baseline reader: only a
 // screenshot/visual_baseline PNG is comparable; any other artifact is rejected.
 func TestReadVisualBaselineKinds(t *testing.T) {

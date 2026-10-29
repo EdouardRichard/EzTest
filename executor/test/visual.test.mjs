@@ -245,6 +245,45 @@ test("runVisualCompare supports an element selector", async () => {
   assert.equal(outcome.artifacts.length, 2)
 })
 
+test("runVisualCompare classifies a selector baseline size mismatch as an environment mismatch", async () => {
+  // An element screenshot is device-pixel sized by the element box and DPR, so
+  // it is not required to equal viewport×DPR. When the approved baseline and the
+  // live element screenshot disagree in size, the environment changed under the
+  // baseline: report it as a mismatch (no diff artifact, no internal error).
+  const entry = fakeEntry({
+    actualPng: makePng(100, 100),
+    live: { width: 100, height: 100, dpr: 1 },
+    locatorPng: makePng(40, 30),
+  })
+  const outcome = await runVisualCompare(
+    entry,
+    baseArgs({ selector: "#box", baseline_base64: makePng(50, 20).toString("base64") }),
+    1000,
+  )
+  assert.equal(outcome.result.environment_match, false)
+  assert.equal(outcome.result.diff_ratio, 0)
+  assert.deepEqual(
+    outcome.artifacts.map((item) => item.kind),
+    ["visual_actual"],
+  )
+})
+
+test("runVisualCompare checks the live device scale factor fingerprint", async () => {
+  const page = makePng(100, 100)
+  const entry = fakeEntry({
+    actualPng: page,
+    live: { width: 100, height: 100, dpr: 2 },
+  })
+  const outcome = await runVisualCompare(
+    entry,
+    baseArgs({ device_scale_factor: 1, baseline_base64: page.toString("base64") }),
+    1000,
+  )
+  assert.equal(outcome.result.environment_match, false)
+  assert.equal(outcome.result.actual_device_scale_factor, 2)
+  assert.equal(outcome.artifacts.length, 1)
+})
+
 test("runVisualCompare rejects a missing selector target", async () => {
   const entry = fakeEntry({
     actualPng: makePng(100, 100),

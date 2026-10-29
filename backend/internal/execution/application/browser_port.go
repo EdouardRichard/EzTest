@@ -12,14 +12,18 @@ import (
 // Playwright storage state (cookies/localStorage) used as the context's initial
 // state; SessionStorage maps an origin to the JSON array of {name,value} items
 // injected through an init script; Viewport overrides the browser viewport when
-// both dimensions are positive.
+// both dimensions are positive; DeviceScaleFactor overrides the device scale
+// factor (DPR) when positive. Playwright fixes both at context creation, so a
+// visual assertion's viewport/DPR must be applied here to match its baseline
+// fingerprint.
 type ContextSpec struct {
-	Key            string
-	AllowedHosts   []string
-	BaseURL        string
-	StorageState   json.RawMessage
-	SessionStorage map[string]json.RawMessage
-	Viewport       Viewport
+	Key               string
+	AllowedHosts      []string
+	BaseURL           string
+	StorageState      json.RawMessage
+	SessionStorage    map[string]json.RawMessage
+	Viewport          Viewport
+	DeviceScaleFactor float64
 }
 
 // Viewport is a positive browser viewport. A zero value asks the executor for

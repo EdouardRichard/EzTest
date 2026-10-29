@@ -381,11 +381,25 @@ func (r *CaseRecorder) VisualAssert(ctx context.Context, caseRunID, assertionID 
 			Metadata:  metadata,
 		})
 		if diffErr != nil {
-			return r.recordVisualNotRun(ctx, run, assertion, &visualAssertActual{
-				AssertionID: decimalString(assertionID), Threshold: threshold, EnvironmentMatch: result.EnvironmentMatch,
-				BaselineEvidence: decimalString(baselineEvidenceID), Error: visualReasonCaptureFailed,
-			}, threshold, visualReasonCaptureFailed, "internal",
+			// The actual screenshot is already durable. Reuse the reserved
+			// assertion_result id and record the actual evidence reference so the
+			// metadata stamped on the evidence row always points at a stored
+			// result, even on this failure path.
+			actual := &visualAssertActual{
+				AssertionID:      decimalString(assertionID),
+				DiffRatio:        result.DiffRatio,
+				Threshold:        threshold,
+				EnvironmentMatch: result.EnvironmentMatch,
+				Width:            width,
+				Height:           height,
+				BaselineEvidence: decimalString(baselineEvidenceID),
+				ActualEvidenceID: decimalString(actualEvidence.ID),
+				Error:            visualReasonCaptureFailed,
+			}
+			outcome, recordErr := r.recordVisualNotRunWith(ctx, run, assertion, resultID, actual,
+				[]int64{actualEvidence.ID}, threshold, visualReasonCaptureFailed, "internal",
 				"the visual_diff evidence could not be captured; finish inconclusive(model)")
+			return outcome, recordErr
 		}
 		diffEvidenceID = diffEvidence.ID
 		actualIDs = append(actualIDs, diffEvidenceID)
@@ -445,8 +459,20 @@ func (r *CaseRecorder) VisualAssert(ctx context.Context, caseRunID, assertionID 
 // browser error instead (the tool maps it). The write must succeed: without the
 // assertion submission the finish gate rejects every non-passed finish.
 func (r *CaseRecorder) recordVisualNotRun(ctx context.Context, run domain.CaseRun, assertion domain.CaseSnapshotAssertion, actual *visualAssertActual, threshold float64, reason, code, hint string) (VisualAssertOutcome, error) {
-	if _, err := r.persistVisualAssertion(ctx, run, assertion, 0, visualAssertNotRun, actual, reason); err != nil {
+	return r.recordVisualNotRunWith(ctx, run, assertion, 0, actual, nil, threshold, reason, code, hint)
+}
+
+// recordVisualNotRunWith is recordVisualNotRun with an explicitly reserved
+// assertion_result id and the evidence rows already persisted for it. It keeps
+// the evidence metadata (assertion_result_id) and the stored result consistent on
+// a partial-capture failure.
+func (r *CaseRecorder) recordVisualNotRunWith(ctx context.Context, run domain.CaseRun, assertion domain.CaseSnapshotAssertion, resultID int64, actual *visualAssertActual, evidenceIDs []int64, threshold float64, reason, code, hint string) (VisualAssertOutcome, error) {
+	stored, err := r.persistVisualAssertion(ctx, run, assertion, resultID, visualAssertNotRun, actual, reason)
+	if err != nil {
 		return VisualAssertOutcome{}, err
+	}
+	if len(evidenceIDs) > 0 {
+		r.createRefs(ctx, stored.ID, evidenceIDs, "assertion_result")
 	}
 	class := domain.FailureClassCase
 	if code == "internal" {
@@ -467,6 +493,11 @@ func (r *CaseRecorder) recordVisualNotRun(ctx context.Context, run domain.CaseRu
 		EnvironmentMatch: reason != visualReasonEnvironmentMismatch && reason != visualReasonMissingBaseline,
 		Width:            actual.Width,
 		Height:           actual.Height,
+	}
+	if actual.ActualEvidenceID != "" {
+		if id, parseErr := strconv.ParseInt(actual.ActualEvidenceID, 10, 64); parseErr == nil {
+			outcome.ActualEvidenceID = id
+		}
 	}
 	if code == "" {
 		return outcome, nil
@@ -622,6 +653,22 @@ func visualBaselineReadFailure(err error) (code, reason, hint string) {
 		return visualReasonMissingBaseline, visualReasonMissingBaseline, "finish inconclusive(case)"
 	}
 	return toolCodeInternal, visualReasonReadFailed, "finish inconclusive(model)"
+}
+
+// CaseVisualEnvironment projects the browser environment (viewport and device
+// scale factor) of the first configured kind=visual assertion of a case
+// snapshot, applying the mindmap defaults. Playwright fixes both at context
+// creation, so the execution tool set must create the case context with them to
+// match the baseline fingerprint of a visual comparison. A snapshot without a
+// visual assertion returns the zero values (the executor's defaults).
+func CaseVisualEnvironment(snapshot domain.CaseSnapshot) (Viewport, float64) {
+	for _, assertion := range snapshot.Assertions {
+		if !strings.EqualFold(strings.TrimSpace(assertion.Kind), "visual") || assertion.Visual == nil {
+			continue
+		}
+		return visualViewport(assertion.Visual), visualDeviceScaleFactor(assertion.Visual)
+	}
+	return Viewport{}, 0
 }
 
 // visualViewport projects a snapshot viewport, applying the mindmap defaults

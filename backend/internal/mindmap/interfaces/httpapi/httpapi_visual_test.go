@@ -114,7 +114,9 @@ func TestApproveVisualBaselinePersistsEvidence(t *testing.T) {
 			fake.approveCalls, fake.evidenceID, fake.approveActor, fake.updateVersion, fake.updateID)
 	}
 	data := decodeData(t, rec)
-	if data["baselineEvidenceId"] != "501" || data["approvedBy"] != float64(1) {
+	// D29: every new entity/user id in API JSON is a decimal string, so the
+	// approver id must not be emitted as a JSON number.
+	if data["baselineEvidenceId"] != "501" || data["approvedBy"] != "1" {
 		t.Fatalf("response data = %+v", data)
 	}
 }
@@ -211,4 +213,3 @@ func TestGetGraphProjectsVisualAssertion(t *testing.T) {
 		t.Fatalf("visual parameters = %+v", visual)
 	}
 }
-

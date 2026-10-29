@@ -385,6 +385,48 @@ func TestBrowserContextReusesOneContextAndInjectsSession(t *testing.T) {
 	}
 }
 
+// TestBrowserContextUsesVisualViewportAndDeviceScaleFactor pins the §9.3
+// environment contract: Playwright fixes the viewport and device scale factor at
+// context creation, so a case with a visual assertion must create its context
+// with that assertion's configuration (not the executor default). Without a
+// visual assertion the executor default is kept.
+func TestBrowserContextUsesVisualViewportAndDeviceScaleFactor(t *testing.T) {
+	view := visualView(int64Pointer(501))
+	visual := view.CaseRun.Snapshot.Assertions[len(view.CaseRun.Snapshot.Assertions)-1].Visual
+	visual.ViewportWidth, visual.ViewportHeight = 1440, 900
+	visual.DeviceScaleFactor = 2
+	browser := testutil.NewFakeBrowserExecutor()
+	tools := New(&fakeRecorder{view: view}, browser, &fakeEvidence{}, nil, Limits{})
+
+	if _, err := callTool(t, tools, "browser.goto", `{"url":"https://app.example.test/login"}`); err != nil {
+		t.Fatalf("browser.goto: %v", err)
+	}
+	contexts := browser.Contexts()
+	if len(contexts) != 1 {
+		t.Fatalf("created %d contexts, want 1", len(contexts))
+	}
+	for _, spec := range contexts {
+		if spec.Viewport.Width != 1440 || spec.Viewport.Height != 900 {
+			t.Fatalf("context viewport = %+v, want 1440x900", spec.Viewport)
+		}
+		if spec.DeviceScaleFactor != 2 {
+			t.Fatalf("context device scale factor = %v, want 2", spec.DeviceScaleFactor)
+		}
+	}
+
+	// A case without a visual assertion keeps the executor defaults.
+	plainBrowser := testutil.NewFakeBrowserExecutor()
+	plain := New(&fakeRecorder{view: defaultView()}, plainBrowser, &fakeEvidence{}, nil, Limits{})
+	if _, err := callTool(t, plain, "browser.goto", `{"url":"https://app.example.test/login"}`); err != nil {
+		t.Fatalf("browser.goto (no visual): %v", err)
+	}
+	for _, spec := range plainBrowser.Contexts() {
+		if spec.Viewport.Width != 0 || spec.Viewport.Height != 0 || spec.DeviceScaleFactor != 0 {
+			t.Fatalf("context without visual assertion overrode the environment: %+v", spec)
+		}
+	}
+}
+
 // TestCaseContextRedactsSensitiveDataAndIncludesCheckpoint pins the redaction of
 // test_data/preconditions and the resume checkpoint fields of the read model.
 func TestCaseContextRedactsSensitiveDataAndIncludesCheckpoint(t *testing.T) {
