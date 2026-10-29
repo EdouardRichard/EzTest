@@ -1,0 +1,60 @@
+# syntax=docker/dockerfile:1
+#
+# Multi-stage build for the EzTest Go API. The runtime image is Alpine, runs as
+# a non-root user and ships docs/openapi/api.yaml at the working-directory path
+# the default EZTEST_OPENAPI_PATH expects. Docker is not available on the
+# development host; this file is delivered but not built there.
+
+FROM golang:1.24.6-alpine AS build
+
+WORKDIR /src
+
+# Dependencies first so the module cache layer survives source-only changes.
+COPY backend/go.mod backend/go.sum ./
+RUN go mod download
+
+COPY backend/ ./
+
+ARG VERSION=dev
+ARG COMMIT=
+
+RUN CGO_ENABLED=0 go build -trimpath \
+    -ldflags "-s -w -X github.com/EdouardRichard/EzTest/backend/internal/server.Version=${VERSION} -X github.com/EdouardRichard/EzTest/backend/internal/server.Commit=${COMMIT}" \
+    -o /out/eztest ./cmd/eztest
+
+FROM alpine:3.21
+
+# ca-certificates is required for HTTPS LLM gateways; wget backs the health
+# check; tzdata makes timestamps predictable in logs.
+RUN apk add --no-cache ca-certificates tzdata wget \
+    && addgroup -S -g 10001 eztest \
+    && adduser -S -u 10001 -G eztest -h /app eztest
+
+WORKDIR /app
+
+COPY --from=build --chown=eztest:eztest /out/eztest ./eztest
+COPY --chown=eztest:eztest docs/openapi/api.yaml ./docs/openapi/api.yaml
+
+# Content-addressed objects, version attachments, execution evidence, report
+# Markdown and mindmap exports live on named volumes in docker-compose. Every
+# directory must exist and be owned by the runtime user before the volume is
+# mounted: a fresh named volume inherits root ownership, and the API creates the
+# attachment/report/evidence roots at startup. P8 adds the last three paths.
+RUN mkdir -p /data/objects /data/version-attachments \
+    /data/evidence /data/reports /data/exports \
+    && chown -R eztest:eztest /app /data/objects /data/version-attachments \
+    /data/evidence /data/reports /data/exports
+
+USER eztest
+
+ENV EZTEST_HTTP_ADDR=:13333 \
+    EZTEST_STORAGE_DIR=/data/objects \
+    EZTEST_VERSION_ATTACHMENT_DIR=/data/version-attachments \
+    EZTEST_EVIDENCE_DIR=/data/evidence \
+    EZTEST_REPORT_DIR=/data/reports \
+    EZTEST_EXPORT_DIR=/data/exports \
+    EZTEST_OPENAPI_PATH=docs/openapi/api.yaml
+
+EXPOSE 13333
+
+ENTRYPOINT ["./eztest"]

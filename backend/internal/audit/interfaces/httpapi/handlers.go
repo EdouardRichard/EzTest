@@ -1,0 +1,186 @@
+// Package httpapi is the audit context's HTTP interface: the admin-only audit
+// query endpoint. It only calls the application layer and keeps request and
+// response DTOs separate from the domain entry.
+package httpapi
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	audit "github.com/EdouardRichard/EzTest/backend/internal/audit/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+)
+
+// maxFilterActionLength bounds the action filter so an oversized query string
+// cannot become a giant SQL parameter. Action names are short by design.
+const maxFilterActionLength = 200
+
+// Lister is the audit query port consumed by the admin endpoint. The audit
+// application Service satisfies it.
+type Lister interface {
+	ListFiltered(ctx context.Context, filter audit.ListFilter, limit int, afterID int64) ([]audit.Entry, bool, error)
+}
+
+// Handler serves GET /api/admin/audit. The server mounts it behind the global
+// bearer auth and the per-route admin guard.
+type Handler struct {
+	svc Lister
+}
+
+// NewHandler returns the audit query handler for svc.
+func NewHandler(svc Lister) *Handler {
+	return &Handler{svc: svc}
+}
+
+// ServeHTTP returns one page of audit entries, newest first, in the generic
+// list shape: data plus next_cursor/has_more. The optional actor/action/from/to
+// query parameters narrow the page for the admin viewer; malformed values are a
+// 400 invalid_argument instead of being silently ignored.
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	limit, err := platform.ParseLimit(r.URL.Query().Get("limit"))
+	if err != nil {
+		platform.WriteError(w, r, http.StatusBadRequest, platform.CodeInvalidArgument, "invalid limit")
+		return
+	}
+	afterID, err := platform.DecodeCursor(r.URL.Query().Get("cursor"))
+	if err != nil {
+		platform.WriteError(w, r, http.StatusBadRequest, platform.CodeInvalidArgument, "invalid cursor")
+		return
+	}
+	filter, err := parseListFilter(r.URL.Query())
+	if err != nil {
+		platform.WriteError(w, r, http.StatusBadRequest, platform.CodeInvalidArgument, err.Error())
+		return
+	}
+
+	entries, more, err := h.svc.ListFiltered(r.Context(), filter, limit, afterID)
+	if err != nil {
+		platform.WriteError(w, r, http.StatusInternalServerError, platform.CodeInternal, "internal server error")
+		return
+	}
+	items := make([]entryPayload, len(entries))
+	for i, entry := range entries {
+		items[i] = newEntryPayload(entry)
+	}
+	response := listEnvelope{Data: items, HasMore: more}
+	if more && len(entries) > 0 {
+		response.NextCursor = platform.EncodeCursor(entries[len(entries)-1].ID)
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+// entryPayload is the public representation of one audit entry. It mirrors the
+// persisted entry and never carries credentials (the domain entry contract
+// already excludes them).
+type entryPayload struct {
+	ID          int64          `json:"id"`
+	ActorUserID *int64         `json:"actor_user_id"`
+	Action      string         `json:"action"`
+	TargetType  string         `json:"target_type"`
+	TargetID    string         `json:"target_id"`
+	RequestID   string         `json:"request_id"`
+	IP          string         `json:"ip"`
+	UserAgent   string         `json:"user_agent"`
+	Metadata    map[string]any `json:"metadata"`
+	CreatedAt   time.Time      `json:"created_at"`
+}
+
+func newEntryPayload(entry audit.Entry) entryPayload {
+	metadata := entry.Metadata
+	if metadata == nil {
+		// The contract returns an object, never null.
+		metadata = map[string]any{}
+	}
+	return entryPayload{
+		ID:          entry.ID,
+		ActorUserID: entry.ActorUserID,
+		Action:      entry.Action,
+		TargetType:  entry.TargetType,
+		TargetID:    entry.TargetID,
+		RequestID:   entry.RequestID,
+		IP:          entry.IP,
+		UserAgent:   entry.UserAgent,
+		Metadata:    metadata,
+		CreatedAt:   entry.CreatedAt,
+	}
+}
+
+// listEnvelope is the generic list shape shared by the API: data plus the
+// opaque cursor and the has_more flag.
+type listEnvelope struct {
+	Data       []entryPayload `json:"data"`
+	NextCursor string         `json:"next_cursor"`
+	HasMore    bool           `json:"has_more"`
+}
+
+// writeJSON writes a success response in the shared `{"data": ...}` style.
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+// parseListFilter reads the optional viewer filters from the query string.
+// actor is the numeric acting user id, action is an exact action name, and
+// from/to are inclusive RFC3339 bounds on created_at.
+func parseListFilter(values url.Values) (audit.ListFilter, error) {
+	var filter audit.ListFilter
+
+	if raw := strings.TrimSpace(values.Get("actor")); raw != "" {
+		actor, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || actor <= 0 {
+			return audit.ListFilter{}, errInvalidFilter("actor must be a positive user id")
+		}
+		filter.ActorUserID = &actor
+	}
+
+	if action := strings.TrimSpace(values.Get("action")); action != "" {
+		if len(action) > maxFilterActionLength {
+			return audit.ListFilter{}, errInvalidFilter("action is too long")
+		}
+		filter.Action = action
+	}
+
+	from, err := parseFilterTime(values.Get("from"))
+	if err != nil {
+		return audit.ListFilter{}, errInvalidFilter("from must be an RFC3339 timestamp")
+	}
+	to, err := parseFilterTime(values.Get("to"))
+	if err != nil {
+		return audit.ListFilter{}, errInvalidFilter("to must be an RFC3339 timestamp")
+	}
+	if from != nil && to != nil && from.After(*to) {
+		return audit.ListFilter{}, errInvalidFilter("from must not be after to")
+	}
+	filter.From = from
+	filter.To = to
+	return filter, nil
+}
+
+// parseFilterTime parses one optional RFC3339 bound. An empty value is "no
+// bound" (nil, nil).
+func parseFilterTime(raw string) (*time.Time, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	parsed, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return nil, err
+	}
+	parsed = parsed.UTC()
+	return &parsed, nil
+}
+
+// errInvalidFilter is a small error type whose message is safe to return to the
+// client; it never wraps internal details.
+type invalidFilterError string
+
+func (e invalidFilterError) Error() string { return string(e) }
+
+func errInvalidFilter(message string) error { return invalidFilterError(message) }
