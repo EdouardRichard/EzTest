@@ -8,9 +8,16 @@ import { ReportsTab } from "@/features/delivery/components/ReportsTab"
 import { useReport, useReports } from "@/features/delivery/hooks/useReports"
 import type { DeliveryStream } from "@/features/delivery/types"
 
-/** The nine P3 version-detail tabs (spec §9.1); P7 keeps the count at nine. */
+/**
+ * The ten P8 version-detail tabs (spec §7.1): the functional requirements slot,
+ * the embedded mindmap tab, the overview, the five P6 execution slots, the P4
+ * code slot and the two real P7 delivery tabs (issues/reports). Radix Tabs
+ * provides keyboard navigation; the active tab is owned by the container so it
+ * can stay in sync with `?tab=`.
+ */
 export type VersionTabValue =
   | "requirements"
+  | "mindmap"
   | "overview"
   | "sessions"
   | "exploration"
@@ -22,6 +29,7 @@ export type VersionTabValue =
 
 export const VERSION_TABS: readonly { value: VersionTabValue; label: string }[] = [
   { value: "requirements", label: "需求与澄清" },
+  { value: "mindmap", label: "用例脑图" },
   { value: "overview", label: "总览" },
   { value: "sessions", label: "执行会话" },
   { value: "exploration", label: "探索链路" },
@@ -48,6 +56,8 @@ export type VersionTabsProps = {
   onTabChange: (value: VersionTabValue) => void
   requirements: ReactNode
   overview: ReactNode
+  /** Embedded case-mindmap tab (P8, spec §7.1); owns its own graph read. */
+  mindmap?: ReactNode
   /** Real 「代码与变更」 container (P4); required once the tab is opened. */
   code?: ReactNode
   /** Real execution tabs (P6); each is owned by the execution feature. */
@@ -101,17 +111,19 @@ function ControlledIssuesTab({
 }
 
 /**
- * The nine-tab version detail shell (spec §9.1/§10.1): the functional
- * requirements slot, the overview, the five P6 execution slots, the P4 code
- * slot and the two real P7 delivery tabs (issues/reports) that replaced the
- * P3 placeholders. Radix Tabs provides keyboard navigation; the active tab is
- * owned by the container so it can stay in sync with `?tab=`.
+ * The ten-tab version detail shell (spec §7.1): the requirements slot, the
+ * embedded mindmap, the overview, the five P6 execution slots, the P4 code slot
+ * and the two real P7 delivery tabs (issues/reports). Radix Tabs provides
+ * keyboard navigation; the active tab is owned by the container so it can stay
+ * in sync with `?tab=`. Inactive panels stay unmounted, so the embedded mindmap
+ * (and its graph read) is only paid for once the tab is opened.
  */
 export function VersionTabs({
   versionId,
   active,
   onTabChange,
   requirements,
+  mindmap,
   overview,
   code,
   sessions,
@@ -143,6 +155,10 @@ export function VersionTabs({
 
       <Tabs.Content value="requirements" className="pt-4">
         {requirements}
+      </Tabs.Content>
+
+      <Tabs.Content value="mindmap" data-testid="version-tab-mindmap" className="pt-4">
+        {mindmap}
       </Tabs.Content>
 
       <Tabs.Content value="overview" className="pt-4">

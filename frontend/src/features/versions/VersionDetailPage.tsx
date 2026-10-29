@@ -16,6 +16,7 @@ import { ResultsTab } from "@/features/execution/components/ResultsTab"
 import { SessionsTab } from "@/features/execution/components/SessionsTab"
 import { useBatches, useExecutionActions } from "@/features/execution/hooks/useExecution"
 import type { Batch, PendingTakeover } from "@/features/execution/types"
+import { MindmapPage } from "@/features/mindmap/MindmapPage"
 import { TakeoverDialog } from "@/features/resources/TakeoverDialog"
 import { ApiError } from "@/lib/api-client"
 import { getStoredUser } from "@/lib/auth-storage"
@@ -76,8 +77,8 @@ function readEvidenceParam(): string {
   return new URLSearchParams(window.location.search).get("evidence") ?? ""
 }
 
-/** Reads the `?issue=` / `?report=` delivery deep links (spec §10.3/§10.4). */
-function readDeepLinkParam(name: "issue" | "report"): string {
+/** Reads the `?issue=` / `?report=` / `?case=` deep links (spec §10.3/§10.4, P8 §7.1). */
+function readDeepLinkParam(name: "issue" | "report" | "case"): string {
   if (typeof window === "undefined") return ""
   return new URLSearchParams(window.location.search).get(name) ?? ""
 }
@@ -155,6 +156,8 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
   const [evidenceId, setEvidenceId] = useState("")
   const [issueId, setIssueId] = useState("")
   const [reportId, setReportId] = useState("")
+  /** Selected mindmap node of the `?case=` deep link (P8 §7.1). */
+  const [caseId, setCaseId] = useState("")
   const [createToken, setCreateToken] = useState(0)
   const [takeover, setTakeover] = useState<PendingTakeover | null>(null)
   const [selectedBatchId, setSelectedBatchId] = useState("")
@@ -217,6 +220,7 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
     setEvidenceId(readEvidenceParam())
     setIssueId(readDeepLinkParam("issue"))
     setReportId(readDeepLinkParam("report"))
+    setCaseId(readDeepLinkParam("case"))
     setExplorationFilters(readExplorationFilters())
     setExplorationNodeId(readExplorationNodeParam())
     setSelectedBatchId(readBatchParam())
@@ -286,6 +290,12 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
     writeQueryParam("report", nextReportId)
   }
 
+  /** The mindmap node deep link is owned here so refresh reproduces selection. */
+  function handleCaseChange(nextCaseId: string): void {
+    setCaseId(nextCaseId)
+    writeQueryParam("case", nextCaseId)
+  }
+
   function handleBatchChange(nextBatchId: string): void {
     setSelectedBatchId(nextBatchId)
     writeQueryParam("batch", nextBatchId)
@@ -318,11 +328,10 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
       return
     }
     if (target.kind === "case") {
-      if (typeof window !== "undefined") {
-        window.location.assign(
-          `/versions/${encodeURIComponent(versionId)}/mindmap?case=${encodeURIComponent(target.id)}`,
-        )
-      }
+      // P8 §7.1 keeps the mindmap inside the version detail: a case link opens
+      // the embedded tab instead of leaving for the full-screen route.
+      handleCaseChange(target.id)
+      handleTabChange("mindmap")
       return
     }
     handleTabChange("requirements")
@@ -407,6 +416,18 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
             onChanged={refresh}
             openCreateToken={createToken}
             onOpenCreateIntentConsumed={() => setCreateToken(0)}
+          />
+        }
+        mindmap={
+          <MindmapPage
+            versionId={versionId}
+            embedded
+            initialCaseId={caseId}
+            onCaseChange={handleCaseChange}
+            // The tab and the full-screen route share the same data hook; the
+            // container's version/stream keep the tab from re-reading either.
+            stream={stream}
+            version={version}
           />
         }
         issueId={issueId}

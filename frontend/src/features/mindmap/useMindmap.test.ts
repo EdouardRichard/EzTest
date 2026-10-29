@@ -159,6 +159,29 @@ describe("useMindmap", () => {
     expect(rendered.result.current.streamStatus).toBe("live")
   })
 
+  it("reuses a provided version stream instead of opening its own", async () => {
+    mocks.apiGet.mockResolvedValueOnce(graphFixture())
+    const provided: StreamState = { events: [], status: "reconnecting", reconnect: vi.fn() }
+
+    const rendered = renderHook(() => useMindmap(VERSION_ID, provided))
+    await flushPromises()
+
+    // The container owns the one SSE connection; the hook must not open a
+    // second stream for the same version (empty id never connects).
+    expect(mocks.useVersionStream).toHaveBeenCalledWith("")
+    expect(rendered.result.current.streamStatus).toBe("reconnecting")
+
+    // Events of the shared stream still refresh the embedded graph.
+    const refreshed = graphFixture({ editable: false })
+    mocks.apiGet.mockResolvedValueOnce(refreshed)
+    await advance(1000)
+    provided.events = [event(1)]
+    rendered.rerender()
+    await flushPromises()
+    expect(mocks.apiGet).toHaveBeenCalledTimes(2)
+    expect(rendered.result.current.graph).toBe(refreshed)
+  })
+
   it("surfaces a described error when the initial load fails", async () => {
     const caught = new ApiError({
       status: 409,

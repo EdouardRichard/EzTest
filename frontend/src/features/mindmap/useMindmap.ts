@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 
 import type { VersionEvent } from "@/features/versions/types"
-import { useVersionStream } from "@/features/versions/useVersionStream"
+import { useVersionStream, type VersionStreamState } from "@/features/versions/useVersionStream"
 import type { SSEStatus } from "@/lib/sse-client"
 
 import { mindmapApi } from "./api"
@@ -85,6 +85,18 @@ export type UseMindmapResult = {
 }
 
 /**
+ * One stream per hook tree. A caller that already owns the version stream (the
+ * version detail page embedding the mindmap tab) passes it down; the hook still
+ * calls `useVersionStream("")` to keep hook order stable, and an empty id never
+ * opens a connection. Without a provided stream the page owns one, exactly like
+ * the full-screen route did before the tab existed.
+ */
+function useMindmapStream(versionId: string, provided?: VersionStreamState): VersionStreamState {
+  const own = useVersionStream(provided === undefined ? versionId : "")
+  return provided ?? own
+}
+
+/**
  * Loads one version's case graph and keeps it fresh: the initial `GET /mindmap`
  * is followed by a full refetch on a reconnected stream or a detected event
  * gap, and by a throttled refetch (≤1/500ms) for `case.*`, `gate.*` and
@@ -92,12 +104,12 @@ export type UseMindmapResult = {
  * feed their response back through `applyGraph`, and `refresh()` reconciles the
  * whole snapshot after a conflict or a run.
  */
-export function useMindmap(versionId: string): UseMindmapResult {
+export function useMindmap(versionId: string, stream?: VersionStreamState): UseMindmapResult {
   const [graph, setGraph] = useState<NormalizedMindmapGraph | null>(null)
   const [loading, setLoading] = useState(versionId !== "")
   const [error, setError] = useState("")
 
-  const { events, status } = useVersionStream(versionId)
+  const { events, status } = useMindmapStream(versionId, stream)
 
   const versionIdRef = useRef(versionId)
   const generationRef = useRef(0)
