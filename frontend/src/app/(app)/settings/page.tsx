@@ -77,7 +77,7 @@ export default function SettingsPage() {
             <StatusBadge variant="info">P8</StatusBadge>
           </div>
           <p className="mt-1 text-sm text-muted-foreground">
-            账户信息、主题偏好，以及管理员可见的用户、LLM 与 SSE 测试面板。
+            账户信息、主题偏好，以及管理员可见的用户、LLM、SSE 测试、基础配置与审计日志面板。
           </p>
         </div>
       </header>

@@ -28,6 +28,7 @@ type graphFixture struct {
 	confirmed  []application.RequirementSnapshot
 	relations  []application.RelationSnapshot
 	events     []application.Event
+	audits     []application.AuditEvent
 	anchors    application.CodeAnchorGateway
 	logger     *slog.Logger
 	now        time.Time
@@ -68,6 +69,7 @@ func (f *graphFixture) serviceWithGraph(graph application.GraphRepository) *appl
 		Requirements: graphRequirementReader{f},
 		Anchors:      f.anchors,
 		Events:       graphEventSink{f},
+		Audit:        graphAuditSink{f},
 		IDs:          graphIDGenerator{f},
 		Clock:        graphClock{f},
 		Logger:       f.logger,
@@ -594,6 +596,16 @@ type graphEventSink struct {
 
 func (s graphEventSink) Publish(_ context.Context, event application.Event) error {
 	s.f.events = append(s.f.events, event)
+	return nil
+}
+
+// graphAuditSink records the write-path audit events.
+type graphAuditSink struct {
+	f *graphFixture
+}
+
+func (s graphAuditSink) Record(_ context.Context, event application.AuditEvent) error {
+	s.f.audits = append(s.f.audits, event)
 	return nil
 }
 

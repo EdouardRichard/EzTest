@@ -7,16 +7,23 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
 	"time"
 
 	audit "github.com/EdouardRichard/EzTest/backend/internal/audit/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
+// maxFilterActionLength bounds the action filter so an oversized query string
+// cannot become a giant SQL parameter. Action names are short by design.
+const maxFilterActionLength = 200
+
 // Lister is the audit query port consumed by the admin endpoint. The audit
 // application Service satisfies it.
 type Lister interface {
-	List(ctx context.Context, limit int, afterID int64) ([]audit.Entry, bool, error)
+	ListFiltered(ctx context.Context, filter audit.ListFilter, limit int, afterID int64) ([]audit.Entry, bool, error)
 }
 
 // Handler serves GET /api/admin/audit. The server mounts it behind the global
@@ -31,7 +38,9 @@ func NewHandler(svc Lister) *Handler {
 }
 
 // ServeHTTP returns one page of audit entries, newest first, in the generic
-// list shape: data plus next_cursor/has_more.
+// list shape: data plus next_cursor/has_more. The optional actor/action/from/to
+// query parameters narrow the page for the admin viewer; malformed values are a
+// 400 invalid_argument instead of being silently ignored.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	limit, err := platform.ParseLimit(r.URL.Query().Get("limit"))
 	if err != nil {
@@ -43,8 +52,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		platform.WriteError(w, r, http.StatusBadRequest, platform.CodeInvalidArgument, "invalid cursor")
 		return
 	}
+	filter, err := parseListFilter(r.URL.Query())
+	if err != nil {
+		platform.WriteError(w, r, http.StatusBadRequest, platform.CodeInvalidArgument, err.Error())
+		return
+	}
 
-	entries, more, err := h.svc.List(r.Context(), limit, afterID)
+	entries, more, err := h.svc.ListFiltered(r.Context(), filter, limit, afterID)
 	if err != nil {
 		platform.WriteError(w, r, http.StatusInternalServerError, platform.CodeInternal, "internal server error")
 		return
@@ -110,3 +124,63 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
 }
+
+// parseListFilter reads the optional viewer filters from the query string.
+// actor is the numeric acting user id, action is an exact action name, and
+// from/to are inclusive RFC3339 bounds on created_at.
+func parseListFilter(values url.Values) (audit.ListFilter, error) {
+	var filter audit.ListFilter
+
+	if raw := strings.TrimSpace(values.Get("actor")); raw != "" {
+		actor, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || actor <= 0 {
+			return audit.ListFilter{}, errInvalidFilter("actor must be a positive user id")
+		}
+		filter.ActorUserID = &actor
+	}
+
+	if action := strings.TrimSpace(values.Get("action")); action != "" {
+		if len(action) > maxFilterActionLength {
+			return audit.ListFilter{}, errInvalidFilter("action is too long")
+		}
+		filter.Action = action
+	}
+
+	from, err := parseFilterTime(values.Get("from"))
+	if err != nil {
+		return audit.ListFilter{}, errInvalidFilter("from must be an RFC3339 timestamp")
+	}
+	to, err := parseFilterTime(values.Get("to"))
+	if err != nil {
+		return audit.ListFilter{}, errInvalidFilter("to must be an RFC3339 timestamp")
+	}
+	if from != nil && to != nil && from.After(*to) {
+		return audit.ListFilter{}, errInvalidFilter("from must not be after to")
+	}
+	filter.From = from
+	filter.To = to
+	return filter, nil
+}
+
+// parseFilterTime parses one optional RFC3339 bound. An empty value is "no
+// bound" (nil, nil).
+func parseFilterTime(raw string) (*time.Time, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	parsed, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return nil, err
+	}
+	parsed = parsed.UTC()
+	return &parsed, nil
+}
+
+// errInvalidFilter is a small error type whose message is safe to return to the
+// client; it never wraps internal details.
+type invalidFilterError string
+
+func (e invalidFilterError) Error() string { return string(e) }
+
+func errInvalidFilter(message string) error { return invalidFilterError(message) }

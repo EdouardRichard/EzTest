@@ -42,17 +42,29 @@ func (s *Sink) Record(ctx context.Context, event versionapp.VersionAuditEvent) e
 	if s == nil || s.recorder == nil {
 		return nil
 	}
-	metadata := map[string]any{
-		"from": event.From,
-		"to":   event.To,
+	metadata := make(map[string]any, len(event.Metadata)+3)
+	for key, value := range event.Metadata {
+		metadata[key] = value
+	}
+	if event.From != "" || event.To != "" {
+		metadata["from"] = event.From
+		metadata["to"] = event.To
 	}
 	if event.Phase != "" {
 		metadata["phase"] = event.Phase
 	}
+	targetType := event.TargetType
+	if targetType == "" {
+		targetType = versionTargetType
+	}
+	targetID := event.TargetID
+	if targetID == "" {
+		targetID = strconv.FormatInt(event.VersionID, 10)
+	}
 	entry := auditdomain.Entry{
 		Action:     event.Action,
-		TargetType: versionTargetType,
-		TargetID:   strconv.FormatInt(event.VersionID, 10),
+		TargetType: targetType,
+		TargetID:   targetID,
 		Metadata:   metadata,
 	}
 	if event.ActorID > 0 {

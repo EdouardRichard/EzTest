@@ -260,6 +260,100 @@ func TestIdentityActionsAreAudited(t *testing.T) {
 	}
 }
 
+// TestAuditRepositoryListFiltered proves the viewer filters narrow the page in
+// SQL: actor, exact action and the inclusive from/to window all combine with
+// the ID cursor and keep the newest-first order.
+func TestAuditRepositoryListFiltered(t *testing.T) {
+	pool := testutil.OpenTestDB(t)
+	users := identitypostgres.NewUserRepository(pool)
+	admin, err := users.Create(ctx, identity.CreateParams{
+		Username: "admin", PasswordHash: "hash", Role: identity.RoleAdmin,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := users.Create(ctx, identity.CreateParams{
+		Username: "qa01", PasswordHash: "hash", Role: identity.RoleUser,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	repo := auditpostgres.NewRepository(pool)
+	base := time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)
+	recorded := []audit.Entry{
+		{ActorUserID: &admin.ID, Action: "version.created", CreatedAt: base.Add(1 * time.Hour)},
+		{ActorUserID: &admin.ID, Action: "version.updated", CreatedAt: base.Add(2 * time.Hour)},
+		{ActorUserID: &other.ID, Action: "version.updated", CreatedAt: base.Add(3 * time.Hour)},
+		{Action: "auth.login_failed", CreatedAt: base.Add(4 * time.Hour)},
+	}
+	for _, entry := range recorded {
+		if err := repo.Record(ctx, entry); err != nil {
+			t.Fatalf("record %s: %v", entry.Action, err)
+		}
+	}
+
+	// Actor filter.
+	page, more, err := repo.ListFiltered(ctx, audit.ListFilter{ActorUserID: &admin.ID}, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if more || len(page) != 2 || page[0].Action != "version.updated" || page[1].Action != "version.created" {
+		t.Fatalf("actor filter page=%+v more=%v", page, more)
+	}
+
+	// Exact action filter.
+	page, _, err = repo.ListFiltered(ctx, audit.ListFilter{Action: "version.updated"}, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 2 {
+		t.Fatalf("action filter size=%d want 2", len(page))
+	}
+	for _, entry := range page {
+		if entry.Action != "version.updated" {
+			t.Fatalf("action filter returned %q", entry.Action)
+		}
+	}
+
+	// Inclusive from/to window: only the 03:00 entry is in [03:00, 03:00].
+	from := base.Add(3 * time.Hour)
+	to := base.Add(3 * time.Hour)
+	page, _, err = repo.ListFiltered(ctx, audit.ListFilter{From: &from, To: &to}, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 1 || page[0].Action != "version.updated" || page[0].ActorUserID == nil || *page[0].ActorUserID != other.ID {
+		t.Fatalf("time filter page=%+v", page)
+	}
+
+	// Filter + cursor: the second page of the actor+action filter is empty
+	// because only one admin entry has the action.
+	first, _, err := repo.ListFiltered(ctx, audit.ListFilter{ActorUserID: &admin.ID, Action: "version.updated"}, 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 1 || first[0].Action != "version.updated" {
+		t.Fatalf("combined filter page=%+v", first)
+	}
+	second, more, err := repo.ListFiltered(ctx, audit.ListFilter{ActorUserID: &admin.ID, Action: "version.updated"}, 1, first[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second) != 0 || more {
+		t.Fatalf("cursor under filter page=%+v more=%v", second, more)
+	}
+
+	// A zero filter behaves exactly like List.
+	all, _, err := repo.ListFiltered(ctx, audit.ListFilter{}, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 4 {
+		t.Fatalf("zero filter size=%d want 4", len(all))
+	}
+}
+
 // mustHash hashes plaintext with the real bcrypt adapter.
 func mustHash(t *testing.T, hasher password.Hasher, plaintext string) string {
 	t.Helper()

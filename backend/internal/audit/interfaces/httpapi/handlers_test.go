@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -131,6 +132,75 @@ func TestAuditListRejectsInvalidPagination(t *testing.T) {
 	}
 }
 
+// TestAuditListFilters proves the viewer's filters are parsed into the domain
+// filter and passed to the service: actor user id, exact action and the
+// inclusive from/to time window (RFC3339).
+func TestAuditListFilters(t *testing.T) {
+	lister := &fakeAuditLister{}
+	h := newAuditTestHandler(lister)
+
+	path := "/api/admin/audit?actor=7&action=user.created" +
+		"&from=2026-10-27T00:00:00Z&to=2026-10-28T12:30:00%2B08:00"
+	rec := getAudit(h, path, auditAdminToken)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("audit list=%d %s", rec.Code, rec.Body)
+	}
+	filter := lister.lastFilter
+	if filter.ActorUserID == nil || *filter.ActorUserID != 7 {
+		t.Fatalf("actor filter=%v want 7", filter.ActorUserID)
+	}
+	if filter.Action != "user.created" {
+		t.Fatalf("action filter=%q want user.created", filter.Action)
+	}
+	if filter.From == nil || !filter.From.Equal(time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("from filter=%v", filter.From)
+	}
+	wantTo := time.Date(2026, 10, 28, 4, 30, 0, 0, time.UTC)
+	if filter.To == nil || !filter.To.Equal(wantTo) {
+		t.Fatalf("to filter=%v want %v", filter.To, wantTo)
+	}
+	if lister.lastLimit != platform.DefaultLimit || lister.lastAfterID != 0 {
+		t.Fatalf("lister got limit=%d afterID=%d", lister.lastLimit, lister.lastAfterID)
+	}
+}
+
+// TestAuditListNoFiltersPassZeroFilter pins the backward-compatible query: a
+// plain request still means "newest page, no narrowing".
+func TestAuditListNoFiltersPassZeroFilter(t *testing.T) {
+	lister := &fakeAuditLister{}
+	h := newAuditTestHandler(lister)
+	if rec := getAudit(h, "/api/admin/audit", auditAdminToken); rec.Code != http.StatusOK {
+		t.Fatalf("audit list=%d %s", rec.Code, rec.Body)
+	}
+	if !lister.lastFilter.IsZero() {
+		t.Fatalf("filter=%+v want zero", lister.lastFilter)
+	}
+}
+
+// TestAuditListRejectsInvalidFilters proves malformed filter values are a 400
+// invalid_argument envelope instead of being silently ignored.
+func TestAuditListRejectsInvalidFilters(t *testing.T) {
+	cases := []string{
+		"actor=abc",
+		"actor=-1",
+		"actor=0",
+		"from=not-a-time",
+		"to=2026-10-27",
+		"from=2026-10-28T00:00:00Z&to=2026-10-27T00:00:00Z",
+		"action=" + strings.Repeat("a", 201),
+	}
+	h := newAuditTestHandler(&fakeAuditLister{})
+	for _, query := range cases {
+		rec := getAudit(h, "/api/admin/audit?"+query, auditAdminToken)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: code=%d body=%s want 400", query, rec.Code, rec.Body)
+		}
+		if code := decodeAuditErrorCode(t, rec.Body); code != "invalid_argument" {
+			t.Fatalf("%s: error code=%q want invalid_argument", query, code)
+		}
+	}
+}
+
 // TestAuditListRequiresAdmin proves the endpoint is admin-only: anonymous calls
 // get 401, regular users get 403.
 func TestAuditListRequiresAdmin(t *testing.T) {
@@ -170,16 +240,19 @@ func TestAuditListRepositoryError(t *testing.T) {
 	}
 }
 
-// fakeAuditLister is an in-memory Lister that records the page arguments.
+// fakeAuditLister is an in-memory Lister that records the filter and page
+// arguments it receives.
 type fakeAuditLister struct {
 	entries     []auditdomain.Entry
 	more        bool
 	err         error
+	lastFilter  auditdomain.ListFilter
 	lastLimit   int
 	lastAfterID int64
 }
 
-func (l *fakeAuditLister) List(_ context.Context, limit int, afterID int64) ([]auditdomain.Entry, bool, error) {
+func (l *fakeAuditLister) ListFiltered(_ context.Context, filter auditdomain.ListFilter, limit int, afterID int64) ([]auditdomain.Entry, bool, error) {
+	l.lastFilter = filter
 	l.lastLimit = limit
 	l.lastAfterID = afterID
 	if l.err != nil {

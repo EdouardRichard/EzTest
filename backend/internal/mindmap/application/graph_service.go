@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -62,9 +63,14 @@ type GraphDeps struct {
 	Batches SupplementBatchReader
 	Anchors CodeAnchorGateway
 	Events  EventPublisher
-	IDs     IDGenerator
-	Clock   Clock
-	Logger  *slog.Logger
+	// Audit records the write-path audit entries of spec §10.4. Entries carry
+	// ids, status, revision and the changed part only: case titles, steps,
+	// assertions, sources and bodies are never recorded. A nil recorder keeps
+	// the service silent (tests and partially wired processes).
+	Audit  AuditRecorder
+	IDs    IDGenerator
+	Clock  Clock
+	Logger *slog.Logger
 }
 
 // GraphNode is one node of the mindmap with its child collections attached.
@@ -1369,6 +1375,22 @@ func (s *GraphService) Reorder(ctx context.Context, versionID, actor int64, cmd 
 		Source:     domain.NodeSourceUserInput,
 		Detail:     detail,
 	})
+	if s.deps.Audit != nil {
+		metadata := map[string]any{"version_id": versionID, "count": len(cmd.NodeIDs)}
+		if cmd.ParentID != nil {
+			metadata["parent_id"] = *cmd.ParentID
+		}
+		if err := s.deps.Audit.Record(ctx, AuditEvent{
+			Action:     "mindmap.case_reordered",
+			ActorID:    actor,
+			TargetType: "version",
+			TargetID:   strconv.FormatInt(versionID, 10),
+			Metadata:   metadata,
+		}); err != nil {
+			s.warn(ctx, "mindmap audit record failed",
+				"action", "mindmap.case_reordered", "version_id", versionID, "error", err)
+		}
+	}
 	return nil
 }
 
@@ -1517,6 +1539,45 @@ func (s *GraphService) publishNode(ctx context.Context, eventType string, versio
 		Source:     node.Source,
 		Detail:     detail,
 	})
+	s.auditNodeWrite(ctx, eventType, versionID, actor, node, change)
+}
+
+// auditNodeWrite records one mindmap write-path audit entry (spec §10.4). The
+// entry names the version and case-node ids plus the kind/status/revision and,
+// when the write touched a child collection, that collection. It never carries
+// the case title, description, step text or any other body.
+func (s *GraphService) auditNodeWrite(ctx context.Context, eventType string, versionID, actor int64, node domain.CaseNode, change string) {
+	if s.deps.Audit == nil {
+		return
+	}
+	action := "mindmap.case_updated"
+	switch {
+	case eventType == domain.EventCaseCreated:
+		action = "mindmap.case_created"
+	case eventType == domain.EventCaseDeleted:
+		action = "mindmap.case_deleted"
+	case change != "":
+		action = "mindmap." + change + "_updated"
+	}
+	metadata := map[string]any{
+		"version_id": versionID,
+		"kind":       node.Kind,
+		"status":     node.Status,
+		"revision":   node.Revision,
+	}
+	if change != "" {
+		metadata["change"] = change
+	}
+	if err := s.deps.Audit.Record(ctx, AuditEvent{
+		Action:     action,
+		ActorID:    actor,
+		TargetType: "case_node",
+		TargetID:   strconv.FormatInt(node.ID, 10),
+		Metadata:   metadata,
+	}); err != nil {
+		s.warn(ctx, "mindmap audit record failed",
+			"action", action, "version_id", versionID, "node_id", node.ID, "error", err)
+	}
 }
 
 // deleteAnchors removes every code anchor of the given nodes through the

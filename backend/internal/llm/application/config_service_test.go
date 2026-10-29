@@ -31,6 +31,10 @@ func (r *capturingRecorder) List(context.Context, int, int64) ([]auditdomain.Ent
 	return nil, false, nil
 }
 
+func (r *capturingRecorder) ListFiltered(context.Context, auditdomain.ListFilter, int, int64) ([]auditdomain.Entry, bool, error) {
+	return nil, false, nil
+}
+
 // fakeConfigRepository is an in-memory llm.Repository. Default switching is
 // emulated so unit tests can observe the service's calls; the real transaction
 // is covered by the PostgreSQL integration test.

@@ -355,6 +355,39 @@ func TestRecorderListClampsLimit(t *testing.T) {
 	}
 }
 
+// TestRecorderListFiltered proves the filtered query keeps the same page-size
+// bounds and forwards the filter unchanged.
+func TestRecorderListFiltered(t *testing.T) {
+	repo := &fakeAuditRepo{}
+	rec := auditapp.NewService(repo)
+
+	actor := int64(7)
+	from := time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 10, 28, 0, 0, 0, 0, time.UTC)
+	filter := auditdomain.ListFilter{
+		ActorUserID: &actor,
+		Action:      "user.created",
+		From:        &from,
+		To:          &to,
+	}
+	if _, _, err := rec.ListFiltered(ctx, filter, 101, 42); err != nil {
+		t.Fatal(err)
+	}
+	if repo.lastFilter != filter {
+		// The struct holds pointers; compare the fields the use case must not
+		// rewrite.
+		if repo.lastFilter.ActorUserID == nil || *repo.lastFilter.ActorUserID != actor ||
+			repo.lastFilter.Action != filter.Action ||
+			repo.lastFilter.From == nil || !repo.lastFilter.From.Equal(from) ||
+			repo.lastFilter.To == nil || !repo.lastFilter.To.Equal(to) {
+			t.Fatalf("repository filter=%+v want %+v", repo.lastFilter, filter)
+		}
+	}
+	if repo.lastLimit != 100 || repo.lastAfterID != 42 {
+		t.Fatalf("repository got limit=%d afterID=%d want 100/42", repo.lastLimit, repo.lastAfterID)
+	}
+}
+
 func TestNopRecorder(t *testing.T) {
 	var rec auditapp.Recorder = auditapp.NopRecorder{}
 	if err := rec.Record(ctx, auditdomain.Entry{Action: "test.action"}); err != nil {
@@ -410,6 +443,10 @@ func (r *fakeRecorder) List(context.Context, int, int64) ([]auditdomain.Entry, b
 	return r.entries, false, nil
 }
 
+func (r *fakeRecorder) ListFiltered(context.Context, auditdomain.ListFilter, int, int64) ([]auditdomain.Entry, bool, error) {
+	return r.entries, false, nil
+}
+
 var _ auditapp.Recorder = (*fakeRecorder)(nil)
 
 // fakeAuditRepo is an in-memory auditdomain.Repository used to test the
@@ -417,6 +454,7 @@ var _ auditapp.Recorder = (*fakeRecorder)(nil)
 type fakeAuditRepo struct {
 	auditdomain.Repository
 	entries     []auditdomain.Entry
+	lastFilter  auditdomain.ListFilter
 	lastLimit   int
 	lastAfterID int64
 }
@@ -430,6 +468,11 @@ func (r *fakeAuditRepo) List(_ context.Context, limit int, afterID int64) ([]aud
 	r.lastLimit = limit
 	r.lastAfterID = afterID
 	return nil, false, nil
+}
+
+func (r *fakeAuditRepo) ListFiltered(_ context.Context, filter auditdomain.ListFilter, limit int, afterID int64) ([]auditdomain.Entry, bool, error) {
+	r.lastFilter = filter
+	return r.List(context.Background(), limit, afterID)
 }
 
 // fakeHasher is a trivial Hasher so the audit tests do not pay bcrypt's cost.

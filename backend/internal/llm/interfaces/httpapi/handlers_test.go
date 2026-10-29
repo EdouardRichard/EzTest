@@ -37,6 +37,10 @@ func (r *capturingRecorder) List(context.Context, int, int64) ([]auditdomain.Ent
 	return r.entries, false, nil
 }
 
+func (r *capturingRecorder) ListFiltered(context.Context, auditdomain.ListFilter, int, int64) ([]auditdomain.Entry, bool, error) {
+	return r.entries, false, nil
+}
+
 // fakeConfigService is an in-memory ConfigService. It mirrors the production
 // service's partial-update semantics so the handler DTOs can be asserted.
 type fakeConfigService struct {
