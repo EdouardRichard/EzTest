@@ -7,17 +7,19 @@
  * - `layoutChain(nodes, options)` is the read-model layout used by the React
  *   Flow canvas. It takes the Task 8 `ChainSnapshotNode[]` plus the snapshot's
  *   semantic edges and returns positioned four-layer nodes, the visible edges
- *   and the tight bounds. Requirement groups, sibling cases and stacked
- *   results/issues are ordered deterministically, so the same snapshot always
- *   produces the same coordinates even if the arrays arrive shuffled. Cases
- *   whose requirement was filtered out stay visible in an unassigned group, and
- *   results/issues without a case are kept visible via a synthetic case instead
- *   of being silently dropped.
+ *   and the tight bounds. The backend already returns each layer in display
+ *   order (spec §5.1: requirements/cases by `sortOrder,id`, results by
+ *   `attempt desc`, issues by severity rank), so the layout keeps the input
+ *   array order untouched instead of re-sorting by id; the same ordered
+ *   snapshot always produces the same coordinates. Cases whose requirement was
+ *   filtered out stay visible in an unassigned group, and results/issues
+ *   without a case are kept visible via a synthetic case instead of being
+ *   silently dropped.
  * - `layoutLegacy(input, options)` is the temporary compatibility adapter for
- *   the hand-written SVG `ChainGraph` and `ExplorationTab`. It keeps the P7
- *   input shape, ids and coordinates byte-for-byte so the current canvas keeps
- *   its visual behaviour until Task 10 replaces it. It can be deleted together
- *   with `ChainGraph` afterwards.
+ *   the hand-written SVG `ChainGraph` and `ExplorationTab` (Task 10 删除 once
+ *   the React Flow canvas replaces it). It keeps the P7 input shape, ids and
+ *   coordinates byte-for-byte so the current canvas keeps its visual behaviour
+ *   until then.
  *
  * Issue attachment priority follows the read model (spec §5.1): a `result_issue`
  * edge wins, then a `case_issue` edge, then the DTO's `caseRunId`/`caseNodeId`
@@ -271,6 +273,10 @@ export function autoCollapsedRequirements(
 
 /**
  * Turns the flat requirement/case/result rows into a positioned layered chain.
+ *
+ * Task 10 删除：`layoutLegacy` 只服务于当前手工 SVG `ChainGraph`；React Flow
+ * 画布替换后，本函数与 `LegacyChainLayoutResult`/`LegacyChainLayoutOptions`、
+ * `ChainGraph` 一起移除。
  *
  * Robustness: a result whose case is absent from the graph gets a synthetic
  * case node (and therefore stays visible), while cases without a known
@@ -584,15 +590,23 @@ export function layoutLegacy(
 // Read-model layout (P8 Task 9): input is the Task 8 snapshot nodes + edges.
 // ---------------------------------------------------------------------------
 
-/** Card size per chain layer, in layout units (spec §5.4: 220–240px cards). */
+/**
+ * Card size per chain layer, in layout units (spec §5.4: 232–240px wide).
+ *
+ * This is the single source of truth for both sides of the canvas: the layout
+ * positions every node with these values and the node cards in `nodes/*.tsx`
+ * render their root `<article>` at exactly this width/height. Heights cover the
+ * tallest content a card can show (two-line titles, wrapped badges, summary and
+ * impact lines); text beyond that is clamped and clipped by the card itself.
+ */
 export const CHAIN_CARD_SIZES: Record<
   ChainSnapshotNode["kind"],
   { width: number; height: number }
 > = {
-  requirement: { width: 240, height: 104 },
-  case: { width: 240, height: 112 },
-  result: { width: 236, height: 104 },
-  issue: { width: 220, height: 96 },
+  requirement: { width: 240, height: 120 },
+  case: { width: 240, height: 160 },
+  result: { width: 236, height: 160 },
+  issue: { width: 232, height: 140 },
 }
 
 /** Horizontal gap between two layers of the read-model layout. */
@@ -607,13 +621,6 @@ const READ_MODEL_LAYER_BY_KIND: Record<ChainSnapshotNode["kind"], ChainLayer> = 
   case: 1,
   result: 2,
   issue: 3,
-}
-
-const ISSUE_SEVERITY_RANK: Record<string, number> = {
-  blocker: 0,
-  major: 1,
-  minor: 2,
-  info: 3,
 }
 
 /** One visible node of the read-model layout. */
@@ -705,26 +712,6 @@ function compareDecimalIds(left: string, right: string): number {
   return a < b ? -1 : 1
 }
 
-function issueSeverityWeight(severity: string | undefined): number {
-  return ISSUE_SEVERITY_RANK[severity ?? ""] ?? 4
-}
-
-/** Deterministic per-layer order: requirements/cases by id, results by attempt, issues by severity. */
-function compareSnapshotNodes(left: ChainSnapshotNode, right: ChainSnapshotNode): number {
-  if (left.kind !== right.kind) {
-    return READ_MODEL_LAYER_BY_KIND[left.kind] - READ_MODEL_LAYER_BY_KIND[right.kind]
-  }
-  if (left.kind === "result" && right.kind === "result") {
-    const attemptDiff = (right.attempt ?? 0) - (left.attempt ?? 0)
-    if (attemptDiff !== 0) return attemptDiff
-  }
-  if (left.kind === "issue" && right.kind === "issue") {
-    const rankDiff = issueSeverityWeight(left.severity) - issueSeverityWeight(right.severity)
-    if (rankDiff !== 0) return rankDiff
-  }
-  return compareDecimalIds(left.id, right.id)
-}
-
 function uniqueSnapshotNodes(nodes: readonly ChainSnapshotNode[]): ChainSnapshotNode[] {
   const seen = new Set<string>()
   const unique: ChainSnapshotNode[] = []
@@ -770,12 +757,13 @@ function appendToMap<K, V>(map: Map<K, V[]>, key: K, value: V): void {
 }
 
 /**
- * Lays the Task 8 read-model nodes out as a deterministic four-layer graph.
+ * Lays the Task 8 read-model nodes out as a four-layer graph, preserving the
+ * order the backend returned for every layer (spec §5.1).
  *
- * The layout is a pure function of the nodes + visible set; it never calls
- * `Number()` on an id. Coordinates keep the same meaning as the legacy layout
- * (top-left corner in layout units), but sizes follow the wider React Flow
- * cards of spec §5.4.
+ * The layout is a pure function of the (ordered) nodes + visible set; it never
+ * calls `Number()` on an id. Coordinates keep the same meaning as the legacy
+ * layout (top-left corner in layout units), but sizes follow the wider React
+ * Flow cards of spec §5.4.
  */
 export function layoutChain(
   nodes: readonly ChainSnapshotNode[],
@@ -784,12 +772,13 @@ export function layoutChain(
   const inputNodes = uniqueSnapshotNodes(nodes)
   const inputEdges = uniqueSnapshotEdges(options.edges ?? []).sort(compareSnapshotEdges)
 
-  const requirements = inputNodes
-    .filter((node) => node.kind === "requirement")
-    .sort(compareSnapshotNodes)
-  const realCases = inputNodes.filter((node) => node.kind === "case").sort(compareSnapshotNodes)
-  const results = inputNodes.filter((node) => node.kind === "result").sort(compareSnapshotNodes)
-  const issues = inputNodes.filter((node) => node.kind === "issue").sort(compareSnapshotNodes)
+  // Backend order is authoritative (requirements/cases `sortOrder,id`, results
+  // `attempt desc`, issues `severity rank,created_at desc`); filter each layer
+  // without sorting so the canvas mirrors the API response.
+  const requirements = inputNodes.filter((node) => node.kind === "requirement")
+  const realCases = inputNodes.filter((node) => node.kind === "case")
+  const results = inputNodes.filter((node) => node.kind === "result")
+  const issues = inputNodes.filter((node) => node.kind === "issue")
 
   const requirementById = new Map(requirements.map((node) => [node.id, node]))
   const resultByDomain = new Map(results.map((node) => [chainDomainId(node.id), node]))
@@ -920,7 +909,9 @@ export function layoutChain(
       })
   }
 
-  const allCases = [...caseById.values()].sort(compareSnapshotNodes)
+  // Map insertion order: backend-ordered real cases first, then synthetic
+  // cases in the order their orphan result/issue was encountered.
+  const allCases = [...caseById.values()]
   const casesByRequirement = new Map<string, ChainSnapshotNode[]>()
   for (const requirement of requirements) casesByRequirement.set(requirement.id, [])
   const unassignedCases: ChainSnapshotNode[] = []

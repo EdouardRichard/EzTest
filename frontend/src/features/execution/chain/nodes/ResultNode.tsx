@@ -4,6 +4,7 @@ import { memo } from "react"
 import { StatusBadge } from "@/components/ui/StatusBadge"
 import { FailureClassBadge } from "../../components/FailureClassBadge"
 import type { FailureClass } from "../../types"
+import { CHAIN_CARD_SIZES } from "../chain-layout"
 import { getResultStatusToken, NODE_KIND_TOKENS } from "../chain-tokens"
 import type { ChainSnapshotNode } from "../chain-types"
 
@@ -63,9 +64,13 @@ export const ResultNode = memo(function ResultNode({ data, selected = false }: R
       aria-label={labelParts.join("，")}
       data-selected={selected ? "true" : undefined}
       className={clsx(
-        "w-[236px] rounded-2xl border border-border bg-card p-3 shadow-sm",
+        "overflow-hidden rounded-2xl border border-border bg-card p-3 shadow-sm",
         selected && "ring-2 ring-ring",
       )}
+      style={{
+        width: CHAIN_CARD_SIZES.result.width,
+        height: CHAIN_CARD_SIZES.result.height,
+      }}
     >
       <header className="flex items-center gap-1.5">
         <span

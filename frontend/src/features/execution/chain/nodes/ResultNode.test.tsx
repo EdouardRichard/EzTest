@@ -1,6 +1,7 @@
 import { cleanup, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it } from "vitest"
 
+import { CHAIN_CARD_SIZES } from "../chain-layout"
 import type { ChainSnapshotNode } from "../chain-types"
 import { ResultNode } from "./ResultNode"
 
@@ -50,5 +51,18 @@ describe("ResultNode", () => {
     expect(screen.getByTestId("chain-node-result").textContent).toContain("通过")
     expect(screen.queryByTestId("chain-node-result-failure")).toBeNull()
     expect(screen.getByTestId("chain-node-result-evidence").textContent).toBe("证据 0")
+  })
+
+  it("fills the fixed card slot from the shared layout constants", () => {
+    render(<ResultNode data={RESULT} />)
+
+    const card = screen.getByTestId("chain-node-result")
+    expect(card.style.width).toBe(`${CHAIN_CARD_SIZES.result.width}px`)
+    expect(card.style.height).toBe(`${CHAIN_CARD_SIZES.result.height}px`)
+    expect(card.className).toContain("overflow-hidden")
+    expect(card.querySelector("h3")?.getAttribute("class")).toContain("line-clamp-1")
+    expect(screen.getByTestId("chain-node-result-summary").getAttribute("class")).toContain(
+      "line-clamp-2",
+    )
   })
 })

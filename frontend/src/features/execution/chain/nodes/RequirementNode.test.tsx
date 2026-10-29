@@ -1,6 +1,7 @@
 import { cleanup, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it } from "vitest"
 
+import { CHAIN_CARD_SIZES } from "../chain-layout"
 import type { ChainSnapshotNode } from "../chain-types"
 import { RequirementNode } from "./RequirementNode"
 
@@ -47,5 +48,15 @@ describe("RequirementNode", () => {
     render(<RequirementNode data={{ ...REQUIREMENT, uncovered: false }} />)
 
     expect(screen.queryByTestId("chain-node-requirement-uncovered")).toBeNull()
+  })
+
+  it("fills the fixed card slot from the shared layout constants", () => {
+    render(<RequirementNode data={REQUIREMENT} />)
+
+    const card = screen.getByTestId("chain-node-requirement")
+    expect(card.style.width).toBe(`${CHAIN_CARD_SIZES.requirement.width}px`)
+    expect(card.style.height).toBe(`${CHAIN_CARD_SIZES.requirement.height}px`)
+    expect(card.className).toContain("overflow-hidden")
+    expect(card.querySelector("h3")?.getAttribute("class")).toContain("line-clamp-2")
   })
 })
