@@ -108,13 +108,21 @@ type FinalizeBatchReader interface {
 // VersionAuditEvent is one version lifecycle audit entry (spec §11.2 D52). Only
 // ids/status/phase are recorded; no request payload is ever included.
 type VersionAuditEvent struct {
-	// Action is version.continued or version.completed.
+	// Action is the stable audit action name, for example version.continued.
 	Action    string
 	VersionID int64
 	From      string
 	To        string
 	Phase     string
 	ActorID   int64
+	// TargetType and TargetID optionally name the written aggregate. When they
+	// are empty the sink records the version itself.
+	TargetType string
+	TargetID   string
+	// Metadata holds non-sensitive details such as status, revision or the
+	// names of changed fields. It must never contain titles, descriptions,
+	// prompts, files or credentials.
+	Metadata map[string]any
 }
 
 // VersionAuditSink records version lifecycle audit entries. Like event
@@ -307,6 +315,14 @@ func (s *VersionService) Create(ctx context.Context, cmd CreateVersionCommand, a
 		ActorID:   actor,
 		Source:    domain.SourceUser,
 		Detail:    map[string]any{"status": version.Status},
+	})
+	s.recordAudit(ctx, VersionAuditEvent{
+		Action:     "version.created",
+		VersionID:  version.ID,
+		TargetType: "version",
+		TargetID:   fmt.Sprintf("%d", version.ID),
+		ActorID:    actor,
+		Metadata:   map[string]any{"status": version.Status},
 	})
 	return version, nil
 }
@@ -526,6 +542,14 @@ func (s *VersionService) UpdateMetadata(ctx context.Context, id int64, expected 
 		ActorID:   actor,
 		Source:    domain.SourceUser,
 		Detail:    map[string]any{"changed": changed},
+	})
+	s.recordAudit(ctx, VersionAuditEvent{
+		Action:     "version.updated",
+		VersionID:  id,
+		TargetType: "version",
+		TargetID:   fmt.Sprintf("%d", id),
+		ActorID:    actor,
+		Metadata:   map[string]any{"changed": changed, "revision": updated.Revision},
 	})
 	return updated, nil
 }

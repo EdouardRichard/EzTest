@@ -604,6 +604,10 @@ func (r *capturingRecorder) List(context.Context, int, int64) ([]auditdomain.Ent
 	return append([]auditdomain.Entry(nil), r.entries...), false, nil
 }
 
+func (r *capturingRecorder) ListFiltered(context.Context, auditdomain.ListFilter, int, int64) ([]auditdomain.Entry, bool, error) {
+	return append([]auditdomain.Entry(nil), r.entries...), false, nil
+}
+
 var _ auditapp.Recorder = (*capturingRecorder)(nil)
 
 // lastEntry returns the newest captured entry with action.

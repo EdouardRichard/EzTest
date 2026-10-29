@@ -187,6 +187,17 @@ func (s *RequirementService) Create(ctx context.Context, versionID int64, cmd Cr
 		Source:           requirement.Source,
 		Detail:           map[string]any{"status": requirement.Status, "source": requirement.Source},
 	})
+	// Audit coverage (spec §10.4): the entry names the written requirement and
+	// its status only. The title, description and acceptance criteria must never
+	// enter the audit log.
+	s.recordAudit(ctx, VersionAuditEvent{
+		Action:     "version.requirement_created",
+		VersionID:  versionID,
+		ActorID:    actor,
+		TargetType: "requirement",
+		TargetID:   fmt.Sprintf("%d", requirement.ID),
+		Metadata:   map[string]any{"status": requirement.Status},
+	})
 	if transitioned {
 		s.publish(ctx, VersionEvent{
 			VersionID: versionID,
@@ -266,6 +277,14 @@ func (s *RequirementService) Update(ctx context.Context, versionID, reqID int64,
 		Source:           candidate.LastUpdateSource,
 		Detail:           map[string]any{"changed": changed, "source": candidate.LastUpdateSource},
 	})
+	s.recordAudit(ctx, VersionAuditEvent{
+		Action:     "version.requirement_updated",
+		VersionID:  versionID,
+		ActorID:    actor,
+		TargetType: "requirement",
+		TargetID:   fmt.Sprintf("%d", reqID),
+		Metadata:   map[string]any{"status": candidate.Status, "revision": candidate.Revision},
+	})
 	return &candidate, nil
 }
 
@@ -291,6 +310,14 @@ func (s *RequirementService) Delete(ctx context.Context, versionID, reqID int64,
 		ActorID:          actor,
 		Source:           domain.SourceUser,
 		Detail:           map[string]any{"status": current.Status},
+	})
+	s.recordAudit(ctx, VersionAuditEvent{
+		Action:     "version.requirement_deleted",
+		VersionID:  versionID,
+		ActorID:    actor,
+		TargetType: "requirement",
+		TargetID:   fmt.Sprintf("%d", reqID),
+		Metadata:   map[string]any{"status": current.Status},
 	})
 	return nil
 }
@@ -333,6 +360,14 @@ func (s *RequirementService) Confirm(ctx context.Context, versionID, reqID int64
 	// to designing once every requirement is confirmed, and back to clarifying
 	// while drafts remain. The refresh is atomic and keeps phase=executing.
 	// Failures here never fail the committed confirmation.
+	s.recordAudit(ctx, VersionAuditEvent{
+		Action:     "version.requirement_confirmed",
+		VersionID:  versionID,
+		ActorID:    actor,
+		TargetType: "requirement",
+		TargetID:   fmt.Sprintf("%d", reqID),
+		Metadata:   map[string]any{"status": updated.Status},
+	})
 	s.refreshContinuePhase(ctx, versionID, "", actor)
 	return updated, nil
 }
@@ -435,6 +470,14 @@ func (s *RequirementService) Reopen(ctx context.Context, versionID, reqID int64,
 		ActorID:          actor,
 		Source:           domain.SourceUser,
 		Detail:           map[string]any{"status": updated.Status},
+	})
+	s.recordAudit(ctx, VersionAuditEvent{
+		Action:     "version.requirement_reopened",
+		VersionID:  versionID,
+		ActorID:    actor,
+		TargetType: "requirement",
+		TargetID:   fmt.Sprintf("%d", reqID),
+		Metadata:   map[string]any{"status": updated.Status},
 	})
 	return updated, nil
 }

@@ -783,6 +783,10 @@ func (c *capturingAudit) List(context.Context, int, int64) ([]auditdomain.Entry,
 	return c.entries, false, nil
 }
 
+func (c *capturingAudit) ListFiltered(context.Context, auditdomain.ListFilter, int, int64) ([]auditdomain.Entry, bool, error) {
+	return c.entries, false, nil
+}
+
 // TestEventStreamRoutesWired proves the composition root mounts the stream
 // endpoints, keeps the global auth, enforces admin-only on the test publisher,
 // registers the publisher only when test endpoints are enabled and attaches the

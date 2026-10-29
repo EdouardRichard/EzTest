@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -60,6 +61,24 @@ type SessionService struct {
 	login    LoginBrowser
 	accounts domain.AccountRepository
 	flights  acquisitionFlights
+
+	// audit is the optional write-path audit sink (spec §10.4). A nil sink
+	// keeps the service silent (tests and partially wired processes).
+	audit AuditSink
+}
+
+// SessionServiceOption customises the session service dependencies.
+type SessionServiceOption func(*SessionService)
+
+// WithSessionAuditSink injects the resource write-path audit sink. Entries
+// carry ids and states only: the stored storage state and takeover instructions
+// are never recorded.
+func WithSessionAuditSink(sink AuditSink) SessionServiceOption {
+	return func(s *SessionService) {
+		if sink != nil {
+			s.audit = sink
+		}
+	}
 }
 
 // ImportSessionInput is the create-session request. Headers carries the token
@@ -84,8 +103,8 @@ type ReplaceSessionStateInput struct {
 
 // NewSessionService wires the session use cases to their repositories, the
 // read-only login checker and the injectable clock.
-func NewSessionService(sessions domain.SessionRepository, accesses domain.AccessRepository, environments domain.EnvironmentRepository, systems domain.SystemRepository, checker LoginChecker, clock Clock) *SessionService {
-	return &SessionService{
+func NewSessionService(sessions domain.SessionRepository, accesses domain.AccessRepository, environments domain.EnvironmentRepository, systems domain.SystemRepository, checker LoginChecker, clock Clock, opts ...SessionServiceOption) *SessionService {
+	service := &SessionService{
 		sessions:     sessions,
 		accesses:     accesses,
 		environments: environments,
@@ -93,6 +112,66 @@ func NewSessionService(sessions domain.SessionRepository, accesses domain.Access
 		checker:      checker,
 		clock:        clock,
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(service)
+		}
+	}
+	return service
+}
+
+// recordSessionAudit records one Session lifecycle audit entry. The entry
+// carries ids and the resulting state only; a recorder failure is logged and
+// never fails the committed business write.
+func (s *SessionService) recordSessionAudit(ctx context.Context, event AuditEvent) {
+	if s.audit == nil {
+		return
+	}
+	if err := s.audit.RecordResourceAudit(ctx, event); err != nil {
+		slog.WarnContext(ctx, "resource audit record failed",
+			"action", event.Action,
+			"target_type", event.TargetType,
+			"target_id", event.TargetID,
+			"error", err,
+		)
+	}
+}
+
+// sessionAuditEvent builds the session-target entry with the resulting state.
+func sessionAuditEvent(action string, session *domain.Session, actor *int64) AuditEvent {
+	event := AuditEvent{
+		Action:     action,
+		TargetType: AuditTargetSession,
+		TargetID:   formatID(session.ID),
+		Metadata:   map[string]any{"state": session.State},
+	}
+	if actor != nil {
+		event.ActorID = *actor
+	}
+	return event
+}
+
+// takeoverAuditEvent builds the takeover-target entry. The metadata names the
+// takeover and its session and carries the takeover status only; the requested
+// instructions are never included.
+func takeoverAuditEvent(action string, takeover *domain.Takeover, actor *int64) AuditEvent {
+	metadata := map[string]any{
+		"state":       takeover.Status,
+		"takeover_id": takeover.ID,
+	}
+	if takeover.SessionID != nil {
+		metadata["session_id"] = *takeover.SessionID
+	}
+	event := AuditEvent{
+		Action:     action,
+		TargetType: AuditTargetTakeover,
+		TargetID:   formatID(takeover.ID),
+		Metadata:   metadata,
+	}
+	if actor != nil {
+		event.ActorID = *actor
+	}
+	return event
 }
 
 // now returns the injected clock in UTC; the database stores timestamptz.
@@ -551,6 +630,7 @@ func (s *SessionService) Import(ctx context.Context, accessID int64, in ImportSe
 	if err != nil {
 		return nil, nil, err
 	}
+	s.recordSessionAudit(ctx, sessionAuditEvent(ActionSessionImported, session, in.ActorID))
 	return session, snapshot, nil
 }
 
@@ -597,6 +677,7 @@ func (s *SessionService) Validate(ctx context.Context, id int64) (*domain.Sessio
 	if err != nil {
 		return nil, nil, err
 	}
+	s.recordSessionAudit(ctx, sessionAuditEvent(ActionSessionValidated, session, nil))
 	return session, snapshot, nil
 }
 
@@ -607,7 +688,6 @@ func (s *SessionService) Validate(ctx context.Context, id int64) (*domain.Sessio
 // matching a lazily expired row) instead of being resurrected as valid.
 func (s *SessionService) Confirm(ctx context.Context, id int64, note string, actorID *int64) (*domain.Session, *domain.Snapshot, error) {
 	_ = note
-	_ = actorID
 	session, err := s.sessions.GetSession(ctx, id)
 	if err != nil {
 		return nil, nil, err
@@ -643,6 +723,7 @@ func (s *SessionService) Confirm(ctx context.Context, id int64, note string, act
 	if err != nil {
 		return nil, nil, err
 	}
+	s.recordSessionAudit(ctx, sessionAuditEvent(ActionSessionConfirmed, session, actorID))
 	return session, snapshot, nil
 }
 
@@ -667,6 +748,7 @@ func (s *SessionService) Invalidate(ctx context.Context, id int64, reason string
 	if err := s.sessions.ReleaseAllLeases(ctx, session.ID, invalidatedLeaseReason); err != nil {
 		return nil, err
 	}
+	s.recordSessionAudit(ctx, sessionAuditEvent(ActionSessionInvalidated, session, nil))
 	return session, nil
 }
 
@@ -689,6 +771,7 @@ func (s *SessionService) Revoke(ctx context.Context, id int64, reason string) (*
 	if err := s.sessions.ReleaseAllLeases(ctx, session.ID, revokedLeaseReason); err != nil {
 		return nil, err
 	}
+	s.recordSessionAudit(ctx, sessionAuditEvent(ActionSessionRevoked, session, nil))
 	return session, nil
 }
 
@@ -781,6 +864,7 @@ func (s *SessionService) RequestTakeover(ctx context.Context, sessionID int64, r
 		_ = s.sessions.UpdateTakeover(ctx, &cancelled, domain.TakeoverStatusWaiting)
 		return nil, nil, err
 	}
+	s.recordSessionAudit(ctx, takeoverAuditEvent(ActionTakeoverRequested, takeover, actorID))
 	return takeover, session, nil
 }
 
@@ -789,7 +873,6 @@ func (s *SessionService) RequestTakeover(ctx context.Context, sessionID int64, r
 // (spec §6.4). expires_at is recomputed from the uploaded state's TTL/cookie
 // expiry; the session's previous expiry is never reused.
 func (s *SessionService) CompleteTakeover(ctx context.Context, takeoverID int64, in ReplaceSessionStateInput, actorID *int64) (*domain.Takeover, *domain.Session, *domain.Snapshot, error) {
-	_ = actorID
 	takeover, err := s.sessions.GetTakeover(ctx, takeoverID)
 	if err != nil {
 		return nil, nil, nil, err
@@ -865,6 +948,7 @@ func (s *SessionService) CompleteTakeover(ctx context.Context, takeoverID int64,
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	s.recordSessionAudit(ctx, takeoverAuditEvent(ActionTakeoverCompleted, takeover, actorID))
 	return takeover, session, snapshot, nil
 }
 
@@ -885,6 +969,7 @@ func (s *SessionService) CancelTakeover(ctx context.Context, takeoverID int64) (
 	if err := s.sessions.UpdateTakeover(ctx, takeover, domain.TakeoverStatusWaiting); err != nil {
 		return nil, err
 	}
+	s.recordSessionAudit(ctx, takeoverAuditEvent(ActionTakeoverCancelled, takeover, nil))
 	return takeover, nil
 }
 

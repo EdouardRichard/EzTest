@@ -102,15 +102,40 @@ func (r *Repository) Record(ctx context.Context, entry audit.Entry) error {
 // List returns up to limit entries older than afterID, newest first. afterID
 // <= 0 starts at the newest entry. more reports whether another page exists.
 func (r *Repository) List(ctx context.Context, limit int, afterID int64) ([]audit.Entry, bool, error) {
+	return r.ListFiltered(ctx, audit.ListFilter{}, limit, afterID)
+}
+
+// ListFiltered returns up to limit entries older than afterID, newest first,
+// narrowed by filter. Every filter field is optional; nil/empty fields widen the
+// query instead of matching NULL. The time bounds are inclusive on created_at.
+func (r *Repository) ListFiltered(ctx context.Context, filter audit.ListFilter, limit int, afterID int64) ([]audit.Entry, bool, error) {
 	if limit <= 0 {
 		return nil, false, fmt.Errorf("postgres: list audit entries: limit must be positive")
+	}
+	var (
+		actor *int64
+		from  *time.Time
+		to    *time.Time
+	)
+	if filter.ActorUserID != nil {
+		actor = filter.ActorUserID
+	}
+	if filter.From != nil {
+		from = filter.From
+	}
+	if filter.To != nil {
+		to = filter.To
 	}
 	const query = `SELECT ` + entryColumns + `
 		FROM audit_log
 		WHERE ($1 <= 0 OR id < $1)
+			AND ($2::bigint IS NULL OR actor_user_id = $2)
+			AND ($3 = '' OR action = $3)
+			AND ($4::timestamptz IS NULL OR created_at >= $4)
+			AND ($5::timestamptz IS NULL OR created_at <= $5)
 		ORDER BY id DESC
-		LIMIT $2`
-	rows, err := r.pool.Query(ctx, query, afterID, limit+1)
+		LIMIT $6`
+	rows, err := r.pool.Query(ctx, query, afterID, actor, filter.Action, from, to, limit+1)
 	if err != nil {
 		return nil, false, fmt.Errorf("postgres: list audit entries: %w", err)
 	}

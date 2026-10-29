@@ -45,11 +45,13 @@ const (
 )
 
 // Recorder is the audit port consumed by the other bounded contexts. Recording
-// is append-only; List reads newest first with an ID cursor. Implementations
-// must not include credentials in an entry.
+// is append-only; List reads newest first with an ID cursor and ListFiltered
+// narrows a page (the admin viewer). Implementations must not include
+// credentials in an entry.
 type Recorder interface {
 	Record(ctx context.Context, entry audit.Entry) error
 	List(ctx context.Context, limit int, afterID int64) ([]audit.Entry, bool, error)
+	ListFiltered(ctx context.Context, filter audit.ListFilter, limit int, afterID int64) ([]audit.Entry, bool, error)
 }
 
 // NopRecorder is a Recorder that discards every entry. It is used by tests and
@@ -61,6 +63,11 @@ func (NopRecorder) Record(context.Context, audit.Entry) error { return nil }
 
 // List implements Recorder.
 func (NopRecorder) List(context.Context, int, int64) ([]audit.Entry, bool, error) {
+	return nil, false, nil
+}
+
+// ListFiltered implements Recorder.
+func (NopRecorder) ListFiltered(context.Context, audit.ListFilter, int, int64) ([]audit.Entry, bool, error) {
 	return nil, false, nil
 }
 
@@ -83,11 +90,17 @@ func (s *Service) Record(ctx context.Context, entry audit.Entry) error {
 // List returns a page of entries newest first. Non-positive limits fall back to
 // the default page size and oversized limits are capped.
 func (s *Service) List(ctx context.Context, limit int, afterID int64) ([]audit.Entry, bool, error) {
+	return s.ListFiltered(ctx, audit.ListFilter{}, limit, afterID)
+}
+
+// ListFiltered returns a page of entries newest first, narrowed by filter. The
+// same page-size bounds as List apply. The zero filter means no narrowing.
+func (s *Service) ListFiltered(ctx context.Context, filter audit.ListFilter, limit int, afterID int64) ([]audit.Entry, bool, error) {
 	if limit <= 0 {
 		limit = defaultListLimit
 	}
 	if limit > maxListLimit {
 		limit = maxListLimit
 	}
-	return s.repo.List(ctx, limit, afterID)
+	return s.repo.ListFiltered(ctx, filter, limit, afterID)
 }

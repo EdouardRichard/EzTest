@@ -193,7 +193,10 @@ func TestRequirementCreateTriggersContinuing(t *testing.T) {
 			t.Fatalf("event reason = %v, want new_requirement", f.events.events[1].Detail["reason"])
 		}
 		audits := f.audit.recorded()
-		if len(audits) != 1 || audits[0].Action != "version.continued" || audits[0].ActorID != 42 {
+		if len(audits) != 2 ||
+			audits[0].Action != "version.requirement_created" ||
+			audits[1].Action != "version.continued" ||
+			audits[1].ActorID != 42 {
 			t.Fatalf("audit = %+v", audits)
 		}
 	})

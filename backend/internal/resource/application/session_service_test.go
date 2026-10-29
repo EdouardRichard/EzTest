@@ -428,6 +428,7 @@ type sessionServiceFakes struct {
 	systems   *fakeCatalogSystemRepo
 	checker   *fakeSessionChecker
 	clock     catalogTestClock
+	audit     *fakeResourceAudit
 	service   *SessionService
 	accessID  int64
 	systemID  int64
@@ -446,6 +447,7 @@ func newSessionServiceWithFakes(t *testing.T) (*SessionService, *sessionServiceF
 		systems:   newFakeCatalogSystemRepo(),
 		checker:   &fakeSessionChecker{},
 		clock:     catalogTestClock{now: sessionTestNow},
+		audit:     &fakeResourceAudit{},
 		accessID:  1,
 		systemID:  1,
 		envID:     1,
@@ -468,7 +470,8 @@ func newSessionServiceWithFakes(t *testing.T) (*SessionService, *sessionServiceF
 		AuthType: domain.AuthTypePassword, Enabled: true, ConcurrencyLimit: 1,
 	}
 	f.accesses.nextID = f.accessID + 1
-	f.service = NewSessionService(f.sessions, f.accesses, f.envs, f.systems, f.checker, f.clock)
+	f.service = NewSessionService(f.sessions, f.accesses, f.envs, f.systems, f.checker, f.clock,
+		WithSessionAuditSink(f.audit))
 	return f.service, f
 }
 

@@ -31,8 +31,44 @@ func NewSink(recorder Recorder) *Sink {
 
 var (
 	_ resourceapp.DBTargetAuditSink = (*Sink)(nil)
+	_ resourceapp.AuditSink         = (*Sink)(nil)
 	_ Recorder                      = (*auditapp.Service)(nil)
 )
+
+// RecordResourceAudit implements resource/application.AuditSink. It records one
+// Session lifecycle entry: ids, state and environment id only, never the stored
+// login state, cookies or takeover instructions (spec §10.4).
+func (s *Sink) RecordResourceAudit(ctx context.Context, event resourceapp.AuditEvent) error {
+	if s == nil || s.recorder == nil {
+		return nil
+	}
+	metadata := make(map[string]any, len(event.Metadata))
+	for key, value := range event.Metadata {
+		metadata[key] = value
+	}
+	entry := auditdomain.Entry{
+		Action:     event.Action,
+		TargetType: event.TargetType,
+		TargetID:   event.TargetID,
+		Metadata:   metadata,
+	}
+	if event.ActorID > 0 {
+		actorID := event.ActorID
+		entry.ActorUserID = &actorID
+	} else if actor, ok := auditapp.ActorIDFromContext(ctx); ok && actor > 0 {
+		actorID := actor
+		entry.ActorUserID = &actorID
+	}
+	if meta := auditapp.MetaFromContext(ctx); meta != (auditapp.RequestMeta{}) {
+		entry.RequestID = meta.RequestID
+		entry.IP = meta.IP
+		entry.UserAgent = meta.UserAgent
+	}
+	if entry.RequestID == "" {
+		entry.RequestID = platform.RequestID(ctx)
+	}
+	return s.recorder.Record(ctx, entry)
+}
 
 // RecordDBTargetAudit implements resource/application.DBTargetAuditSink.
 func (s *Sink) RecordDBTargetAudit(ctx context.Context, event resourceapp.DBTargetAuditEvent) error {

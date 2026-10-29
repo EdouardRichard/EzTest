@@ -913,3 +913,7 @@ func (r *fakeAuditRecorder) Record(_ context.Context, entry auditdomain.Entry) e
 func (r *fakeAuditRecorder) List(context.Context, int, int64) ([]auditdomain.Entry, bool, error) {
 	return nil, false, nil
 }
+
+func (r *fakeAuditRecorder) ListFiltered(context.Context, auditdomain.ListFilter, int, int64) ([]auditdomain.Entry, bool, error) {
+	return nil, false, nil
+}

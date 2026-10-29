@@ -101,6 +101,10 @@ func (r *capturingRecorder) List(context.Context, int, int64) ([]auditdomain.Ent
 	return r.entries, false, nil
 }
 
+func (r *capturingRecorder) ListFiltered(context.Context, auditdomain.ListFilter, int, int64) ([]auditdomain.Entry, bool, error) {
+	return r.entries, false, nil
+}
+
 // newTestService wires a fake store and the in-memory metadata repository.
 func newTestService(store *fakeStore) (*Service, *fakeMetadata, *capturingRecorder) {
 	metadata := newFakeMetadata()

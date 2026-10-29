@@ -2,11 +2,14 @@
 
 import * as Tabs from "@radix-ui/react-tabs"
 import type { LucideIcon } from "lucide-react"
-import { KeyRound, RadioTower, Users } from "lucide-react"
+import { KeyRound, RadioTower, ScrollText, Settings2, Users } from "lucide-react"
 
 import { LLMPanel } from "@/features/llm-settings/LLMPanel"
 import { SSETestPanel } from "@/features/sse-test/SSETestPanel"
 import { UsersPanel } from "@/features/users/UsersPanel"
+
+import { AuditLogPage } from "./AuditLogPage"
+import { BasicConfigPanel } from "./BasicConfigPanel"
 
 type SettingsTab = {
   value: string
@@ -18,17 +21,24 @@ const TABS: SettingsTab[] = [
   { value: "users", label: "用户", icon: Users },
   { value: "llm", label: "LLM", icon: KeyRound },
   { value: "sse", label: "SSE 测试", icon: RadioTower },
+  { value: "basic", label: "基础配置", icon: Settings2 },
+  { value: "audit", label: "审计日志", icon: ScrollText },
 ]
 
 /**
  * The admin-only settings tabs. Inactive Radix content is unmounted, which also
- * tears down the SSE test connection when the admin leaves that tab.
+ * tears down the SSE test connection when the admin leaves that tab. The page
+ * renders this group only for administrators; ordinary users keep the theme
+ * panel (spec §8.2).
  */
 export function SettingsTabs() {
   return (
     <section className="rounded-2xl border border-border bg-card p-2 shadow-sm sm:p-3">
       <Tabs.Root defaultValue="users">
-        <Tabs.List aria-label="设置分类" className="grid grid-cols-3 gap-1 rounded-xl bg-muted p-1">
+        <Tabs.List
+          aria-label="设置分类"
+          className="grid grid-cols-2 gap-1 rounded-xl bg-muted p-1 sm:grid-cols-3 lg:grid-cols-5"
+        >
           {TABS.map((tab) => {
             const Icon = tab.icon
             return (
@@ -52,6 +62,12 @@ export function SettingsTabs() {
         </Tabs.Content>
         <Tabs.Content value="sse" className="p-3 sm:p-4">
           <SSETestPanel />
+        </Tabs.Content>
+        <Tabs.Content value="basic" className="p-3 sm:p-4">
+          <BasicConfigPanel />
+        </Tabs.Content>
+        <Tabs.Content value="audit" className="p-3 sm:p-4">
+          <AuditLogPage />
         </Tabs.Content>
       </Tabs.Root>
     </section>
