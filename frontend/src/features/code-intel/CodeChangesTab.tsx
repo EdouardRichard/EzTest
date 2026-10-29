@@ -22,6 +22,7 @@ import {
 } from "./empty"
 import { FactsPanel } from "./FactsPanel"
 import { ImpactPanel } from "./ImpactPanel"
+import { RepoQualityPanel } from "./RepoQualityPanel"
 import type { Analysis, ChangedFile, ChangeList, IndexRun } from "./types"
 import { UnmappedChanges } from "./UnmappedChanges"
 import { useAnalysisPolling } from "./useAnalysisPolling"
@@ -445,6 +446,9 @@ export function CodeChangesTab({ versionId, repoId }: CodeChangesTabProps) {
             </div>
           </div>
           <div className="space-y-4">
+            {effectiveRepoId === null ? null : (
+              <RepoQualityPanel key={effectiveRepoId} repoId={effectiveRepoId} />
+            )}
             <AnalysisSummary analysis={analysis} view={view} />
             <div data-testid="code-impact-slot">
               {analysis === null ? (

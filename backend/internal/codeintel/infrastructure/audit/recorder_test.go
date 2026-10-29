@@ -202,6 +202,59 @@ func TestAuditRecorderNormalizesIDKeys(t *testing.T) {
 	})
 }
 
+// TestAuditRecorderMapsReviewEntry pins the P8 fact-review audit: the action is
+// code.review, the fact/commit/verdict identifiers travel in metadata, and the
+// human note body is dropped even when a caller puts it in the detail map.
+func TestAuditRecorderMapsReviewEntry(t *testing.T) {
+	recorder := &fakeRecorder{}
+	adapter := codeintelaudit.NewRecorder(recorder)
+	note := "证据行号偏移，实际在第 80 行"
+
+	err := adapter.Record(context.Background(), 7, "code.review", "code_repository:42", map[string]any{
+		"repoId":  int64(42),
+		"factId":  int64(9301),
+		"commit":  strings.Repeat("b", 40),
+		"verdict": "incorrect",
+		"reason":  note,
+		"content": "TOP_SECRET_CODE",
+	})
+	if err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	if len(recorder.entries) != 1 {
+		t.Fatalf("entries=%d want 1", len(recorder.entries))
+	}
+	entry := recorder.entries[0]
+	if entry.Action != "code.review" {
+		t.Fatalf("action=%q want code.review", entry.Action)
+	}
+	if entry.ActorUserID == nil || *entry.ActorUserID != 7 {
+		t.Fatalf("actor=%v want 7", entry.ActorUserID)
+	}
+	if entry.TargetType != "code_repository" || entry.TargetID != "42" {
+		t.Fatalf("target=%q/%q want code_repository/42", entry.TargetType, entry.TargetID)
+	}
+	if entry.Metadata["verdict"] != "incorrect" || entry.Metadata["commit"] != strings.Repeat("b", 40) {
+		t.Fatalf("metadata=%v", entry.Metadata)
+	}
+	// D29: identifier values are recorded as decimal strings.
+	if entry.Metadata["factId"] != "9301" || entry.Metadata["repoId"] != "42" {
+		t.Fatalf("metadata ids=%v want decimal strings", entry.Metadata)
+	}
+	raw, err := json.Marshal(entry.Metadata)
+	if err != nil {
+		t.Fatalf("marshal metadata: %v", err)
+	}
+	if strings.Contains(string(raw), note) || strings.Contains(string(raw), "TOP_SECRET_CODE") {
+		t.Fatalf("review audit leaks the note/code body: %s", raw)
+	}
+	for key := range entry.Metadata {
+		if key != "repoId" && key != "factId" && key != "commit" && key != "verdict" {
+			t.Fatalf("metadata contains unexpected key %q: %v", key, entry.Metadata)
+		}
+	}
+}
+
 // TestAuditRecorderErrors pins the failure contract: an unsupported action is
 // rejected without writing, an empty subject falls back to the code target type,
 // and a recorder failure is returned to the caller.

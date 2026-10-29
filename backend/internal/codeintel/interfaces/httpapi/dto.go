@@ -184,9 +184,24 @@ type VersionChangesDTO struct {
 	BatchTimeline []VersionChangeDTO `json:"batchTimeline"`
 }
 
+// FactReviewDTO is one human verdict on a code fact at a commit (design spec
+// §7.2). id/factId are decimal strings (D29), createdBy stays a number and the
+// note is the persisted human reason. The review is additive: an unreviewed
+// fact carries null.
+type FactReviewDTO struct {
+	ID        string    `json:"id"`
+	FactID    string    `json:"factId"`
+	Commit    string    `json:"commit"`
+	Verdict   string    `json:"verdict"`
+	Reason    string    `json:"reason"`
+	CreatedBy int64     `json:"createdBy"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
 // CodeEntityDTO is one file/AI fact entity returned by the facts and search
 // reads (R6). id/analysisId are decimal strings, repoId a number, evidence keeps
-// the camelCase evidence range with the optional excerpt hash.
+// the camelCase evidence range with the optional excerpt hash. Review is the
+// additive P8 human verdict of this fact at this commit (null when unreviewed).
 type CodeEntityDTO struct {
 	ID          string            `json:"id"`
 	RepoID      int64             `json:"repoId"`
@@ -204,6 +219,7 @@ type CodeEntityDTO struct {
 	FactKey     *string           `json:"factKey"`
 	FactVersion *int              `json:"factVersion"`
 	AnalysisID  *string           `json:"analysisId"`
+	Review      *FactReviewDTO    `json:"review"`
 	CreatedAt   *time.Time        `json:"createdAt,omitempty"`
 	UpdatedAt   *time.Time        `json:"updatedAt,omitempty"`
 }
@@ -211,6 +227,68 @@ type CodeEntityDTO struct {
 // FactsPageDTO is one facts/search page's entity array; the shared page envelope
 // supplies next_cursor/has_more.
 type FactsPageDTO []CodeEntityDTO
+
+// EvidenceQualityDTO is the evidence-verification projection of the repository
+// quality block. PassRate is null when no evidence was checked (no data).
+type EvidenceQualityDTO struct {
+	Checks   int      `json:"checks"`
+	Failures int      `json:"failures"`
+	PassRate *float64 `json:"passRate"`
+}
+
+// ConfidenceDistributionDTO is the confidence distribution of the AI facts at
+// the quality head commit.
+type ConfidenceDistributionDTO struct {
+	High   int `json:"high"`
+	Medium int `json:"medium"`
+	Low    int `json:"low"`
+	Total  int `json:"total"`
+}
+
+// FactReviewCountsDTO is the human review counter projection.
+type FactReviewCountsDTO struct {
+	Total     int `json:"total"`
+	Correct   int `json:"correct"`
+	Incorrect int `json:"incorrect"`
+}
+
+// ImpactQualityDTO is the newest evaluation run's impact precision/recall. When
+// the evaluation is unavailable, precision/recall are null, available is false
+// and reason names the degraded source (no_eval_run / no_impact_metric /
+// eval_store_unavailable). evalRunId is a decimal string (D29).
+type ImpactQualityDTO struct {
+	Precision   *float64   `json:"precision"`
+	Recall      *float64   `json:"recall"`
+	Available   bool       `json:"available"`
+	Reason      string     `json:"reason,omitempty"`
+	EvalRunID   *string    `json:"evalRunId"`
+	EvaluatedAt *time.Time `json:"evaluatedAt"`
+}
+
+// QualityAnalysisDTO refs the newest done analysis that supplied the counters.
+type QualityAnalysisDTO struct {
+	ID         string    `json:"id"`
+	HeadCommit string    `json:"headCommit"`
+	AnalyzedAt time.Time `json:"analyzedAt"`
+}
+
+// RepoQualityDTO is the body of GET /api/code/repos/{repoId}/quality (design
+// spec §9.2): evidence pass rate, invalid facts, confidence distribution, human
+// review counters, the newest evaluation's impact precision/recall and the
+// cache hit rate. Missing sources stay null/zero and are flagged, never
+// fabricated; analysis is null for a repository that has never been analysed.
+type RepoQualityDTO struct {
+	RepoID        int64                     `json:"repoId"`
+	GeneratedAt   time.Time                 `json:"generatedAt"`
+	Evidence      EvidenceQualityDTO        `json:"evidence"`
+	InvalidFacts  int                       `json:"invalidFacts"`
+	Confidence    ConfidenceDistributionDTO `json:"confidence"`
+	Reviews       FactReviewCountsDTO       `json:"reviews"`
+	Impact        ImpactQualityDTO          `json:"impact"`
+	CacheHitRate  *float64                  `json:"cacheHitRate"`
+	Analysis      *QualityAnalysisDTO       `json:"analysis"`
+	IndexedCommit string                    `json:"indexedCommit"`
+}
 
 // CommitDTO is the read-only commit metadata of GET /commits/{sha}.
 type CommitDTO struct {
@@ -342,6 +420,14 @@ type startAnalysisRequest struct {
 // is required, so it is a pointer here and a missing value is a 400.
 type patchCandidateRequest struct {
 	Selected *bool `json:"selected"`
+}
+
+// createFactReviewRequest is the POST /facts/{factId}/reviews body (design spec
+// §7.2). verdict is required (closed enum, enforced by the application);
+// reason is an optional human note.
+type createFactReviewRequest struct {
+	Verdict string `json:"verdict"`
+	Reason  string `json:"reason"`
 }
 
 // createAnchorRequest is the POST /anchors body (design spec §7.3). subjectId is
@@ -611,13 +697,79 @@ func newCodeEntityDTO(entity domain.CodeEntity) CodeEntityDTO {
 	return dto
 }
 
-// newFactsPageDTO maps an entity page, always returning a non-nil slice.
-func newFactsPageDTO(entities []domain.CodeEntity) FactsPageDTO {
+// newFactsPageDTO maps an entity page, always returning a non-nil slice. reviews
+// is the additive P8 verdict map keyed by entity id; a nil map renders every
+// review as null (unreviewed fact).
+func newFactsPageDTO(entities []domain.CodeEntity, reviews map[int64]domain.FactReview) FactsPageDTO {
 	dtos := make(FactsPageDTO, 0, len(entities))
 	for _, entity := range entities {
-		dtos = append(dtos, newCodeEntityDTO(entity))
+		dto := newCodeEntityDTO(entity)
+		if review, ok := reviews[entity.ID]; ok {
+			reviewDTO := newFactReviewDTO(review)
+			dto.Review = &reviewDTO
+		}
+		dtos = append(dtos, dto)
 	}
 	return dtos
+}
+
+// newFactReviewDTO maps one persisted human verdict. The review id and the
+// reviewed fact id stay decimal strings (D29).
+func newFactReviewDTO(review domain.FactReview) FactReviewDTO {
+	return FactReviewDTO{
+		ID:        formatID(review.ID),
+		FactID:    formatID(review.FactID),
+		Commit:    review.CommitSHA,
+		Verdict:   review.Verdict,
+		Reason:    review.Reason,
+		CreatedBy: review.CreatedBy,
+		CreatedAt: review.CreatedAt,
+	}
+}
+
+// newRepoQualityDTO maps the repository quality aggregate. Nullable rates and
+// the analysis ref stay null when the source has no data.
+func newRepoQualityDTO(quality application.RepoQuality) RepoQualityDTO {
+	var analysis *QualityAnalysisDTO
+	if quality.Analysis != nil {
+		analysis = &QualityAnalysisDTO{
+			ID:         formatID(quality.Analysis.ID),
+			HeadCommit: quality.Analysis.HeadCommit,
+			AnalyzedAt: quality.Analysis.AnalyzedAt,
+		}
+	}
+	return RepoQualityDTO{
+		RepoID:      quality.RepoID,
+		GeneratedAt: quality.GeneratedAt,
+		Evidence: EvidenceQualityDTO{
+			Checks:   quality.Evidence.Checks,
+			Failures: quality.Evidence.Failures,
+			PassRate: quality.Evidence.PassRate,
+		},
+		InvalidFacts: quality.InvalidFacts,
+		Confidence: ConfidenceDistributionDTO{
+			High:   quality.Confidence.High,
+			Medium: quality.Confidence.Medium,
+			Low:    quality.Confidence.Low,
+			Total:  quality.Confidence.Total,
+		},
+		Reviews: FactReviewCountsDTO{
+			Total:     quality.Reviews.Total,
+			Correct:   quality.Reviews.Correct,
+			Incorrect: quality.Reviews.Incorrect,
+		},
+		Impact: ImpactQualityDTO{
+			Precision:   quality.Impact.Precision,
+			Recall:      quality.Impact.Recall,
+			Available:   quality.Impact.Available,
+			Reason:      quality.Impact.Reason,
+			EvalRunID:   formatOptionalID(quality.Impact.EvalRunID),
+			EvaluatedAt: quality.Impact.EvaluatedAt,
+		},
+		CacheHitRate:  quality.CacheHitRate,
+		Analysis:      analysis,
+		IndexedCommit: quality.IndexedCommit,
+	}
 }
 
 // newCommitDTO maps read-only commit metadata.

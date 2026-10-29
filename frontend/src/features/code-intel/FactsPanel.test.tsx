@@ -3,16 +3,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { ApiError } from "@/lib/api-client"
 
-import type { Analysis, CodeEntity } from "./types"
+import type { Analysis, CodeEntity, FactReview } from "./types"
 
 const mocks = vi.hoisted(() => ({
   getFacts: vi.fn(),
   getFile: vi.fn(),
+  createFactReview: vi.fn(),
 }))
 
 vi.mock("./api", () => ({
   getFacts: mocks.getFacts,
   getFile: mocks.getFile,
+  createFactReview: mocks.createFactReview,
 }))
 
 import { FactsPanel } from "./FactsPanel"
@@ -69,6 +71,20 @@ function entityFixture(overrides: Partial<CodeEntity> = {}): CodeEntity {
 
 function factsPage(items: CodeEntity[], hasMore = false) {
   return { items, nextCursor: hasMore ? "next" : "", hasMore }
+}
+
+/** One persisted human verdict nested in a fact (the additive P8 field). */
+function reviewFixture(overrides: Partial<FactReview> = {}): FactReview {
+  return {
+    id: "9301",
+    factId: "1",
+    commit: HEAD,
+    verdict: "correct",
+    reason: "证据行号已核对",
+    createdBy: 2,
+    createdAt: "2026-10-29T10:00:00Z",
+    ...overrides,
+  }
 }
 
 /** Serves the per-kind fact queries the panel issues (spec §9.2). */
@@ -220,5 +236,91 @@ describe("FactsPanel", () => {
     expect(screen.getByText("分析运行中，代码事实完成后展示。")).toBeTruthy()
     expect(mocks.getFacts).not.toHaveBeenCalled()
     running.unmount()
+  })
+
+  it("shows the persisted human verdict and reason on reviewed facts", async () => {
+    mockFactsByKind([
+      entityFixture({
+        id: "1",
+        kind: "route",
+        name: "GET /orders",
+        review: reviewFixture({ factId: "1", verdict: "correct", reason: "证据行号已核对" }),
+      }),
+      entityFixture({
+        id: "2",
+        kind: "api",
+        name: "POST /api/refund",
+        path: "src/api/refund.ts",
+        review: reviewFixture({
+          id: "9302",
+          factId: "2",
+          verdict: "incorrect",
+          reason: "接口已删除",
+          createdBy: 7,
+        }),
+      }),
+      entityFixture({ id: "3", kind: "component", name: "OrderList", evidence: [] }),
+    ])
+
+    render(<FactsPanel analysis={analysisFixture()} />)
+
+    const badges = await screen.findAllByTestId("fact-review-badge")
+    expect(badges).toHaveLength(2)
+    expect(badges[0]?.textContent).toContain("已人工修正")
+    expect(badges[0]?.getAttribute("data-review-verdict")).toBe("correct")
+    expect(badges[1]?.textContent).toContain("错误")
+    expect(badges[1]?.getAttribute("data-review-verdict")).toBe("incorrect")
+
+    const reasons = screen.getAllByTestId("fact-review-reason")
+    expect(reasons).toHaveLength(2)
+    expect(reasons[0]?.textContent).toContain("证据行号已核对")
+    expect(reasons[1]?.textContent).toContain("接口已删除")
+
+    // An unreviewed fact keeps no marker.
+    const componentRow = screen.getByText("OrderList").closest("li")
+    expect(componentRow?.querySelector('[data-testid="fact-review-badge"]')).toBeNull()
+  })
+
+  it("submits an incorrect verdict with a reason and marks the fact", async () => {
+    mockFactsByKind([entityFixture({ id: "1", kind: "route", name: "GET /orders" })])
+    mocks.createFactReview.mockResolvedValue(
+      reviewFixture({ factId: "1", verdict: "incorrect", reason: "接口已删除", createdBy: 2 }),
+    )
+
+    render(<FactsPanel analysis={analysisFixture()} />)
+
+    fireEvent.click(await screen.findByRole("button", { name: "人工修正 GET /orders" }))
+    fireEvent.change(screen.getByLabelText("修正原因"), { target: { value: "接口已删除" } })
+    fireEvent.click(screen.getByRole("button", { name: "标记为错误" }))
+
+    await waitFor(() =>
+      expect(mocks.createFactReview).toHaveBeenCalledWith(REPO_ID, "1", {
+        verdict: "incorrect",
+        reason: "接口已删除",
+      }),
+    )
+    const badge = await screen.findByTestId("fact-review-badge")
+    expect(badge.textContent).toContain("错误")
+    expect(screen.getByTestId("fact-review-reason").textContent).toContain("接口已删除")
+    // The inline form closes after a successful write.
+    expect(screen.queryByLabelText("修正原因")).toBeNull()
+  })
+
+  it("keeps a failed review write visible with a retry-able error", async () => {
+    mockFactsByKind([entityFixture({ id: "1", kind: "route", name: "GET /orders" })])
+    mocks.createFactReview.mockRejectedValue(
+      new ApiError({ status: 422, code: "invalid_argument", message: "verdict invalid" }),
+    )
+
+    render(<FactsPanel analysis={analysisFixture()} />)
+
+    fireEvent.click(await screen.findByRole("button", { name: "人工修正 GET /orders" }))
+    fireEvent.click(screen.getByRole("button", { name: "标记为正确" }))
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toContain("保存人工修正失败")
+    expect(screen.queryByTestId("fact-review-badge")).toBeNull()
+    // The form stays open so the reviewer can fix and retry.
+    expect(screen.getByLabelText("修正原因")).toBeTruthy()
   })
 })

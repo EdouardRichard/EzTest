@@ -3,11 +3,11 @@
 import { Loader2 } from "lucide-react"
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react"
 
-import { getFacts } from "./api"
+import { createFactReview, getFacts } from "./api"
 import { ConfidenceBadge } from "./ConfidenceBadge"
 import { EvidenceLink } from "./EvidenceLink"
 import { describeCodeError } from "./empty"
-import type { Analysis, CodeEntity } from "./types"
+import type { Analysis, CodeEntity, FactReview, FactReviewVerdict } from "./types"
 
 /** One bounded fact page requested per kind (keeps T0 `file` facts out). */
 export const FACTS_PANEL_LIMIT = 50
@@ -65,6 +65,12 @@ export function FactsPanel({ analysis }: FactsPanelProps) {
   const ready = analysis.status === "done"
 
   const [load, setLoad] = useState<FactsLoad>({ kind: "loading" })
+  /** Persisted human verdicts, seeded from the facts page and updated on write. */
+  const [reviews, setReviews] = useState<Record<string, FactReview>>({})
+  const [editingFactId, setEditingFactId] = useState<string | null>(null)
+  const [reasonDraft, setReasonDraft] = useState("")
+  const [savingReview, setSavingReview] = useState(false)
+  const [reviewError, setReviewError] = useState("")
 
   const loadFacts = useCallback(async (): Promise<void> => {
     const requestId = ++requestRef.current
@@ -87,6 +93,12 @@ export function FactsPanel({ analysis }: FactsPanelProps) {
         const items = Array.isArray(page.items) ? page.items : []
         return items.filter((fact) => fact.kind === kind)
       })
+      const persisted: Record<string, FactReview> = {}
+      for (const fact of facts) {
+        if (fact.review) persisted[fact.id] = fact.review
+      }
+      setReviews(persisted)
+      setEditingFactId(null)
       setLoad({
         kind: "ready",
         facts,
@@ -105,6 +117,41 @@ export function FactsPanel({ analysis }: FactsPanelProps) {
       requestRef.current += 1
     }
   }, [ready, loadFacts])
+
+  function openReviewEditor(fact: CodeEntity): void {
+    setEditingFactId(fact.id)
+    setReasonDraft(reviews[fact.id]?.reason ?? "")
+    setReviewError("")
+  }
+
+  function closeReviewEditor(): void {
+    setEditingFactId(null)
+    setReasonDraft("")
+    setReviewError("")
+  }
+
+  async function submitReview(fact: CodeEntity, verdict: FactReviewVerdict): Promise<void> {
+    if (savingReview) return
+    const reason = reasonDraft.trim()
+    setSavingReview(true)
+    setReviewError("")
+    try {
+      // The same fact/commit is unique: a new verdict overwrites the previous
+      // one server-side, so the local marker simply follows the response.
+      const review = await createFactReview(
+        analysis.repoId,
+        fact.id,
+        reason === "" ? { verdict } : { verdict, reason },
+      )
+      setReviews((current) => ({ ...current, [fact.id]: review }))
+      setEditingFactId(null)
+      setReasonDraft("")
+    } catch (caught) {
+      setReviewError(describeCodeError(caught))
+    } finally {
+      setSavingReview(false)
+    }
+  }
 
   const groups = useMemo(() => {
     if (load.kind !== "ready") return []
@@ -175,6 +222,8 @@ export function FactsPanel({ analysis }: FactsPanelProps) {
               <ul className="divide-y divide-border">
                 {group.facts.map((fact) => {
                   const low = fact.confidence === "low"
+                  const review = reviews[fact.id]
+                  const editing = editingFactId === fact.id
                   return (
                     <li
                       key={fact.id}
@@ -216,6 +265,87 @@ export function FactsPanel({ analysis }: FactsPanelProps) {
                           ))
                         )}
                       </div>
+
+                      {/* Additive P8 human review: persisted marker + reason. */}
+                      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1 text-xs">
+                        {review === undefined ? null : (
+                          <span
+                            data-testid="fact-review-badge"
+                            data-review-verdict={review.verdict}
+                            className={
+                              review.verdict === "correct"
+                                ? "rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 font-medium text-emerald-700 dark:text-emerald-300"
+                                : "rounded-full border border-destructive/30 bg-destructive/10 px-2 py-0.5 font-medium text-destructive"
+                            }
+                          >
+                            {review.verdict === "correct" ? "已人工修正" : "错误"}
+                          </span>
+                        )}
+                        {review === undefined || review.reason === "" ? null : (
+                          <p
+                            data-testid="fact-review-reason"
+                            className="break-all text-muted-foreground"
+                          >
+                            原因：{review.reason}
+                          </p>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => openReviewEditor(fact)}
+                          aria-label={`${review === undefined ? "人工修正" : "重新修正"} ${fact.name}`}
+                          className="rounded-lg border border-border bg-card px-2 py-0.5 text-[11px] font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                        >
+                          {review === undefined ? "人工修正" : "重新修正"}
+                        </button>
+                      </div>
+
+                      {!editing ? null : (
+                        <div className="space-y-2 rounded-xl border border-border bg-muted/30 p-2.5">
+                          <textarea
+                            aria-label="修正原因"
+                            value={reasonDraft}
+                            onChange={(event) => setReasonDraft(event.target.value)}
+                            maxLength={2000}
+                            rows={2}
+                            placeholder="可选：说明修正原因"
+                            className="w-full rounded-lg border border-border bg-card px-2.5 py-1.5 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                          />
+                          <div className="flex flex-wrap gap-2">
+                            <button
+                              type="button"
+                              disabled={savingReview}
+                              onClick={() => void submitReview(fact, "correct")}
+                              className="rounded-lg border border-border bg-card px-2.5 py-1 text-[11px] font-medium text-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                            >
+                              标记为正确
+                            </button>
+                            <button
+                              type="button"
+                              disabled={savingReview}
+                              onClick={() => void submitReview(fact, "incorrect")}
+                              className="rounded-lg border border-destructive/40 bg-destructive/10 px-2.5 py-1 text-[11px] font-medium text-destructive transition-colors hover:bg-destructive/20 disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                            >
+                              标记为错误
+                            </button>
+                            <button
+                              type="button"
+                              disabled={savingReview}
+                              onClick={closeReviewEditor}
+                              className="rounded-lg px-2.5 py-1 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                            >
+                              取消
+                            </button>
+                          </div>
+                          {reviewError === "" ? null : (
+                            <p
+                              role="alert"
+                              className="rounded-lg border border-destructive/30 bg-destructive/10 px-2.5 py-1.5 text-[11px] text-destructive"
+                            >
+                              保存人工修正失败：{reviewError}
+                            </p>
+                          )}
+                        </div>
+                      )}
                     </li>
                   )
                 })}

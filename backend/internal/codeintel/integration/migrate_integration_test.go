@@ -13,9 +13,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// codeIntelTables are the nine codeintel tables after the D34 rename
-// migrations (design spec §3.2/§5). code_analysis_cache is the one table that
-// keeps its name.
+// codeIntelTables are the ten codeintel tables after the D34 rename migrations
+// and the P8 fact-review migration (design spec §3.2/§4.2/§5).
+// code_analysis_cache is the one table that keeps its name.
 var codeIntelTables = []string{
 	"code_change_set",
 	"code_index_run",
@@ -26,6 +26,7 @@ var codeIntelTables = []string{
 	"code_analysis",
 	"code_impact_candidate",
 	"code_anchor",
+	"code_fact_review",
 }
 
 // codeIntelIndexes are every index declared by the codeintel migrations.

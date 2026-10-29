@@ -177,7 +177,15 @@ func (h *Handler) Facts(w http.ResponseWriter, r *http.Request) {
 		WriteServiceError(w, r, err)
 		return
 	}
-	WritePage(w, newFactsPageDTO(entities), nextCursor, hasMore)
+	// The human review marker is additive: a review-store failure must never
+	// fail the facts page itself (the panel still renders the facts).
+	var reviews map[int64]domain.FactReview
+	if h.factReviews != nil && len(entities) > 0 {
+		if loaded, loadErr := h.factReviews.ReviewsForFacts(r.Context(), repoID, entities); loadErr == nil {
+			reviews = loaded
+		}
+	}
+	WritePage(w, newFactsPageDTO(entities, reviews), nextCursor, hasMore)
 }
 
 // Search returns one page of entities whose path or name contains q: a
@@ -215,7 +223,7 @@ func (h *Handler) Search(w http.ResponseWriter, r *http.Request) {
 		WriteServiceError(w, r, err)
 		return
 	}
-	WritePage(w, newFactsPageDTO(entities), nextCursor, hasMore)
+	WritePage(w, newFactsPageDTO(entities, nil), nextCursor, hasMore)
 }
 
 // Commit returns the read-only metadata of one commit. The application service

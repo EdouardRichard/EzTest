@@ -14,6 +14,7 @@ import type {
   CodeEntity,
   FileDiff,
   IndexRun,
+  RepoQuality,
   UnmappedChange,
   VersionChangeBatch,
 } from "./types"
@@ -30,6 +31,7 @@ const mocks = vi.hoisted(() => ({
   listAnchors: vi.fn(),
   createAnchor: vi.fn(),
   deleteAnchor: vi.fn(),
+  getRepoQuality: vi.fn(),
   listRequirements: vi.fn(),
   useVersionStream: vi.fn(),
 }))
@@ -46,6 +48,7 @@ vi.mock("./api", () => ({
   listAnchors: mocks.listAnchors,
   createAnchor: mocks.createAnchor,
   deleteAnchor: mocks.deleteAnchor,
+  getRepoQuality: mocks.getRepoQuality,
 }))
 
 vi.mock("@/features/versions/api", () => ({
@@ -177,6 +180,25 @@ const INDEX_RUNNING: IndexRun = {
   status: "running",
   stats: undefined,
   finishedAt: null,
+}
+
+const REPO_QUALITY: RepoQuality = {
+  repoId: REPO_ID,
+  generatedAt: "2026-10-29T10:00:00Z",
+  evidence: { checks: 20, failures: 5, passRate: 0.75 },
+  invalidFacts: 2,
+  confidence: { high: 4, medium: 2, low: 1, total: 7 },
+  reviews: { total: 3, correct: 2, incorrect: 1 },
+  impact: {
+    precision: 0.75,
+    recall: 0.8,
+    available: true,
+    evalRunId: "9201",
+    evaluatedAt: "2026-10-29T08:00:00Z",
+  },
+  cacheHitRate: 0.5,
+  analysis: { id: ANALYSIS_ID, headCommit: HEAD, analyzedAt: "2026-10-29T09:00:00Z" },
+  indexedCommit: HEAD,
 }
 
 const CANDIDATE: Candidate = {
@@ -316,6 +338,7 @@ function resetMocks(): void {
   mocks.getFacts.mockResolvedValue({ items: [], nextCursor: "", hasMore: false })
   mocks.listRequirements.mockResolvedValue({ items: [REQUIREMENT], nextCursor: "", hasMore: false })
   mocks.listAnchors.mockResolvedValue([])
+  mocks.getRepoQuality.mockResolvedValue(REPO_QUALITY)
 }
 
 /** Resolves the initial effect promises of the container. */
@@ -436,6 +459,23 @@ describe("CodeChangesTab", () => {
     expect(alert.textContent).toContain("分析失败")
     expect(alert.textContent).toContain("AI 服务不可用")
     expect(screen.getByRole("button", { name: "重试分析" })).toBeTruthy()
+  })
+
+  it("mounts the repository quality block for the bound repository", async () => {
+    mockReady()
+
+    renderTab()
+
+    const panel = await screen.findByTestId("repo-quality-panel")
+    expect(panel.textContent).toContain("代码质量")
+    await waitFor(() => expect(mocks.getRepoQuality).toHaveBeenCalledWith(REPO_ID))
+
+    // An unbound version has no repository to aggregate.
+    cleanup()
+    resetMocks()
+    renderTab({ repoId: null })
+    expect(await screen.findByRole("heading", { name: "未绑定代码仓库" })).toBeTruthy()
+    expect(mocks.getRepoQuality).not.toHaveBeenCalled()
   })
 
   it("renders the batch timeline with commits, entities, cases, unmapped and history rewrite", async () => {

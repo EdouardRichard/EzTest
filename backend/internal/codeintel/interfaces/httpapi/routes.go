@@ -53,4 +53,14 @@ func (h *Handler) Register(mux *http.ServeMux) {
 		mux.HandleFunc("POST /api/versions/{id}/code/anchors", h.CreateAnchor)
 		mux.HandleFunc("DELETE /api/versions/{id}/code/anchors/{anchorId}", h.DeleteAnchor)
 	}
+	// P8 fact quality (design spec §7.2/§9.2): the review write is available to
+	// every authenticated user (the server's global bearer middleware) and the
+	// quality aggregate is a read-only login-readable projection. Each group is
+	// mounted only when its service is wired.
+	if h.factReviews != nil {
+		mux.HandleFunc("POST /api/code/repos/{repoId}/facts/{factId}/reviews", h.CreateFactReview)
+	}
+	if h.repoQuality != nil {
+		mux.HandleFunc("GET /api/code/repos/{repoId}/quality", h.RepoQuality)
+	}
 }
