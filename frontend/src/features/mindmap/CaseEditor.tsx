@@ -1077,10 +1077,7 @@ function CaseEditorForm({
                             ["height", "高"],
                           ] as const
                         ).map(([field, label]) => (
-                          <label
-                            key={field}
-                            className="block text-[11px] text-muted-foreground"
-                          >
+                          <label key={field} className="block text-[11px] text-muted-foreground">
                             {label}
                             <input
                               type="number"
@@ -1140,9 +1137,7 @@ function CaseEditorForm({
                         </button>
                       </div>
                     ) : (
-                      <p className="text-[11px] text-muted-foreground">
-                        基线审批需要管理员权限。
-                      </p>
+                      <p className="text-[11px] text-muted-foreground">基线审批需要管理员权限。</p>
                     )}
                   </div>
                 ) : null}

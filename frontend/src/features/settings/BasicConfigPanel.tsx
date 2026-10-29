@@ -1,6 +1,14 @@
 "use client"
 
-import { AlertTriangle, Gauge, HardDrive, RefreshCw, Server, ShieldCheck, Trash2 } from "lucide-react"
+import {
+  AlertTriangle,
+  Gauge,
+  HardDrive,
+  RefreshCw,
+  Server,
+  ShieldCheck,
+  Trash2,
+} from "lucide-react"
 import { useEffect, useRef, useState } from "react"
 import { ErrorState } from "@/components/ui/ErrorState"
 import { StatusBadge } from "@/components/ui/StatusBadge"
@@ -257,8 +265,7 @@ export function BasicConfigPanel() {
   // A purge may only be started from a fresh dry-run preview with candidates;
   // after a real run the button stays disabled until the next dry-run so the
   // destructive action is never repeated blindly.
-  const gcCanExecute =
-    gcReport !== null && gcReport.dryRun && gcReport.candidates > 0
+  const gcCanExecute = gcReport !== null && gcReport.dryRun && gcReport.candidates > 0
 
   /** Runs the admin GC endpoint. dryRun=true previews; false purges. */
   async function runGC(dryRun: boolean) {
@@ -351,7 +358,10 @@ export function BasicConfigPanel() {
         <header className="flex flex-wrap items-start justify-between gap-3">
           <div>
             <div className="flex items-center gap-2">
-              <h3 id="gc-maintenance-title" className="flex items-center gap-2 text-sm font-semibold">
+              <h3
+                id="gc-maintenance-title"
+                className="flex items-center gap-2 text-sm font-semibold"
+              >
                 <Trash2 className="h-4 w-4 text-muted-foreground" aria-hidden="true" />
                 证据 GC
               </h3>
@@ -452,9 +462,7 @@ export function BasicConfigPanel() {
             <div className="rounded-lg bg-muted/40 px-3 py-2">
               <dt className="text-muted-foreground">{gcReport.dryRun ? "模式" : "结果"}</dt>
               <dd className="font-medium">
-                {gcReport.dryRun
-                  ? "dry-run（未删除）"
-                  : `已删除 ${gcReport.deleted} 个`}
+                {gcReport.dryRun ? "dry-run（未删除）" : `已删除 ${gcReport.deleted} 个`}
                 {gcReport.dryRun || (gcReport.failed === 0 && gcReport.skipped === 0)
                   ? null
                   : ` · 失败 ${gcReport.failed} · 跳过 ${gcReport.skipped}`}

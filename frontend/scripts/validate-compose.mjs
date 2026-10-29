@@ -165,7 +165,10 @@ for (const requiredKey of [
 }
 const executorEnvironment = environmentKeys(executor)
 for (const requiredKey of ["EZTEST_EXECUTOR_ADDR", "EZTEST_EXECUTOR_TOKEN"]) {
-  check(executorEnvironment.includes(requiredKey), `executor environment must define ${requiredKey}`)
+  check(
+    executorEnvironment.includes(requiredKey),
+    `executor environment must define ${requiredKey}`,
+  )
 }
 
 check(

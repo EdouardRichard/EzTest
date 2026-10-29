@@ -64,7 +64,9 @@ function caseNode(assertion: CaseAssertionView): CaseNodeView {
     status: "draft",
     sortOrder: 0,
     revision: 7,
-    steps: [{ id: "step-1", seq: 1, action: "打开详情页", expected: "", data: "", source: "user_input" }],
+    steps: [
+      { id: "step-1", seq: 1, action: "打开详情页", expected: "", data: "", source: "user_input" },
+    ],
     assertions: [assertion],
     sources: [],
     anchors: [],

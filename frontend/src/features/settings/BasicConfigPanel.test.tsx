@@ -114,7 +114,10 @@ describe("BasicConfigPanel", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "GC dry-run 预览" }))
     await waitFor(() =>
-      expect(mocks.apiPost).toHaveBeenCalledWith("/api/admin/gc", { dryRun: true, reason: "settings panel" }),
+      expect(mocks.apiPost).toHaveBeenCalledWith("/api/admin/gc", {
+        dryRun: true,
+        reason: "settings panel",
+      }),
     )
     expect(await screen.findByText(/候选 2 个/)).toBeTruthy()
     expect(screen.getByText(/受保护 7 个/)).toBeTruthy()
@@ -153,18 +156,18 @@ describe("BasicConfigPanel", () => {
     )
     expect(await screen.findByText(/已删除 2 个/)).toBeTruthy()
     // After a real purge the destructive action requires a new dry-run.
-    expect((screen.getByRole("button", { name: "执行 GC" }) as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByRole("button", { name: "执行 GC" }) as HTMLButtonElement).disabled).toBe(
+      true,
+    )
   })
 
   it("cancels the second confirmation and shows the disabled error from the API", async () => {
-    mocks.apiPost
-      .mockResolvedValueOnce(DRY_RUN_REPORT)
-      .mockRejectedValueOnce(
-        Object.assign(new Error("evidence GC execution is disabled"), {
-          status: 409,
-          code: "conflict",
-        }),
-      )
+    mocks.apiPost.mockResolvedValueOnce(DRY_RUN_REPORT).mockRejectedValueOnce(
+      Object.assign(new Error("evidence GC execution is disabled"), {
+        status: 409,
+        code: "conflict",
+      }),
+    )
     render(<BasicConfigPanel />)
 
     fireEvent.click(await screen.findByRole("button", { name: "GC dry-run 预览" }))
@@ -199,9 +202,7 @@ describe("BasicConfigPanel", () => {
     expect(await screen.findByText(/候选 2 个/)).toBeTruthy()
     fireEvent.click(screen.getByRole("button", { name: "执行 GC" }))
     fireEvent.click(screen.getByRole("button", { name: "确认执行" }))
-    expect(
-      await screen.findByText(/仅管理员可执行 GC（403）：forbidden/),
-    ).toBeTruthy()
+    expect(await screen.findByText(/仅管理员可执行 GC（403）：forbidden/)).toBeTruthy()
     expect(screen.queryByText(/（409：/)).toBeNull()
   })
 })
