@@ -1,0 +1,26 @@
+{
+  "corpusVersion": "2026-10-29.1",
+  "description": "Deterministic visual-assertion scenario (design spec §9.3). The scenario is exercised against the fixture executor with a frozen visual baseline; the expected classification of each injected outcome lives in eval/ground-truth/visual.json. The runner only needs the two evidence ids and the comparison configuration: the actual screenshot is captured by the executor, never uploaded by the API.",
+  "scenario": {
+    "caseTitle": "收货页视觉回归",
+    "assertion": {
+      "kind": "visual",
+      "selector": "#receipt",
+      "region": { "x": 0, "y": 0, "width": 1, "height": 1 },
+      "threshold": 0.01,
+      "viewport": { "width": 1280, "height": 720 },
+      "deviceScaleFactor": 1
+    },
+    "baseline": {
+      "evidenceKind": "visual_baseline",
+      "mime": "image/png",
+      "approval": "admin",
+      "imageSize": { "width": 1280, "height": 720 }
+    },
+    "evidence": {
+      "actualKind": "visual_actual",
+      "diffKind": "visual_diff",
+      "mime": "image/png"
+    }
+  }
+}

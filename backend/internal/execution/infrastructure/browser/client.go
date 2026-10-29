@@ -60,6 +60,7 @@ type Client struct {
 }
 
 var _ application.BrowserExecutor = (*Client)(nil)
+var _ application.VisualComparator = (*Client)(nil)
 
 // New returns a client for the executor at baseURL. token is sent as the bearer
 // token on every request. timeout bounds one call when ctx carries no deadline;
@@ -211,6 +212,101 @@ func (c *Client) Action(ctx context.Context, ref application.ContextRef, action 
 		return application.ActionResult{}, err
 	}
 	return application.ActionResult{Result: envelope.Result, Artifacts: artifacts}, nil
+}
+
+// CompareVisual implements application.VisualComparator. The executor captures
+// the actual screenshot itself; only the approved baseline copy and the
+// comparison configuration are sent. Protocol failures are returned as typed
+// *application.BrowserError values so the caller's classification never treats
+// an invalid request as a visual mismatch.
+func (c *Client) CompareVisual(ctx context.Context, ref application.ContextRef, req application.VisualCompareRequest) (application.VisualCompareResult, error) {
+	if ref.ID == "" {
+		return application.VisualCompareResult{}, application.NewBrowserError("invalid_request", "executor context id is required")
+	}
+	if len(req.Baseline) == 0 {
+		return application.VisualCompareResult{}, application.NewBrowserError("invalid_request", "a visual baseline PNG is required")
+	}
+	maxBaseline := req.MaxBaselineBytes
+	if maxBaseline <= 0 {
+		maxBaseline = application.DefaultVisualBaselineMaxBytes
+	}
+	if int64(len(req.Baseline)) > maxBaseline {
+		return application.VisualCompareResult{}, application.NewBrowserError("invalid_request",
+			fmt.Sprintf("visual baseline is %d bytes, above the %d byte limit", len(req.Baseline), maxBaseline))
+	}
+	if req.Threshold < 0 || req.Threshold > 0.1 {
+		return application.VisualCompareResult{}, application.NewBrowserError("invalid_request", "visual threshold must be between 0 and 0.1")
+	}
+	if req.Viewport.Width <= 0 || req.Viewport.Height <= 0 {
+		return application.VisualCompareResult{}, application.NewBrowserError("invalid_request", "visual viewport width and height must be positive")
+	}
+	if req.DeviceScaleFactor <= 0 {
+		return application.VisualCompareResult{}, application.NewBrowserError("invalid_request", "visual device scale factor must be positive")
+	}
+
+	args := visualComparePayload{
+		BaselineBase64:    base64.StdEncoding.EncodeToString(req.Baseline),
+		Selector:          req.Selector,
+		Threshold:         req.Threshold,
+		Viewport:          viewportPayload{Width: req.Viewport.Width, Height: req.Viewport.Height},
+		DeviceScaleFactor: req.DeviceScaleFactor,
+	}
+	if req.Region != nil {
+		args.Region = &visualRegionPayload{
+			X: req.Region.X, Y: req.Region.Y,
+			Width: req.Region.Width, Height: req.Region.Height,
+		}
+	}
+	encoded, err := json.Marshal(args)
+	if err != nil {
+		return application.VisualCompareResult{}, application.NewBrowserError("internal", "visual compare request could not be encoded")
+	}
+	outcome, err := c.Action(ctx, ref, application.Action{Name: "visual.compare", Args: encoded})
+	if err != nil {
+		return application.VisualCompareResult{}, err
+	}
+	if outcome.ErrorCode != "" {
+		return application.VisualCompareResult{}, &application.BrowserError{
+			Code:    outcome.ErrorCode,
+			Message: outcome.ErrorMessage,
+		}
+	}
+	var payload visualCompareResultPayload
+	if len(outcome.Result) == 0 || json.Unmarshal(outcome.Result, &payload) != nil {
+		return application.VisualCompareResult{}, application.NewBrowserError("internal",
+			"executor visual compare response is not valid JSON")
+	}
+	if payload.DiffRatio < 0 || payload.DiffRatio > 1 {
+		return application.VisualCompareResult{}, application.NewBrowserError("internal",
+			"executor visual compare response carries an invalid diff ratio")
+	}
+	if payload.Width < 0 || payload.Height < 0 || payload.ActualWidth < 0 || payload.ActualHeight < 0 {
+		return application.VisualCompareResult{}, application.NewBrowserError("internal",
+			"executor visual compare response carries a negative image size")
+	}
+	result := application.VisualCompareResult{
+		DiffRatio:               payload.DiffRatio,
+		Width:                   payload.Width,
+		Height:                  payload.Height,
+		EnvironmentMatch:        payload.EnvironmentMatch,
+		ActualWidth:             payload.ActualWidth,
+		ActualHeight:            payload.ActualHeight,
+		ActualDeviceScaleFactor: payload.ActualDeviceScaleFactor,
+	}
+	for _, box := range payload.MismatchBoxes {
+		result.MismatchBoxes = append(result.MismatchBoxes, application.VisualMismatchBox{
+			X: box.X, Y: box.Y, Width: box.Width, Height: box.Height,
+		})
+	}
+	for _, artifact := range outcome.Artifacts {
+		switch artifact.Kind {
+		case "visual_actual":
+			result.ActualPNG = artifact.Data
+		case "visual_diff":
+			result.DiffPNG = artifact.Data
+		}
+	}
+	return result, nil
 }
 
 // Cancel implements application.BrowserExecutor.
@@ -419,4 +515,41 @@ type actionEnvelope struct {
 	Result    json.RawMessage   `json:"result"`
 	Artifacts []artifactPayload `json:"artifacts"`
 	Error     *protocolError    `json:"error"`
+}
+
+// visualComparePayload is the visual.compare action argument object. The
+// baseline copy is the only image the API sends (design spec §9.3).
+type visualComparePayload struct {
+	BaselineBase64    string               `json:"baseline_base64"`
+	Selector          string               `json:"selector,omitempty"`
+	Region            *visualRegionPayload `json:"region,omitempty"`
+	Threshold         float64              `json:"threshold"`
+	Viewport          viewportPayload      `json:"viewport"`
+	DeviceScaleFactor float64              `json:"device_scale_factor"`
+}
+
+type visualRegionPayload struct {
+	X      float64 `json:"x"`
+	Y      float64 `json:"y"`
+	Width  float64 `json:"width"`
+	Height float64 `json:"height"`
+}
+
+// visualCompareResultPayload is the executor's visual.compare result object.
+type visualCompareResultPayload struct {
+	DiffRatio               float64             `json:"diff_ratio"`
+	Width                   int                 `json:"width"`
+	Height                  int                 `json:"height"`
+	EnvironmentMatch        bool                `json:"environment_match"`
+	ActualWidth             int                 `json:"actual_width"`
+	ActualHeight            int                 `json:"actual_height"`
+	ActualDeviceScaleFactor float64             `json:"actual_device_scale_factor"`
+	MismatchBoxes           []visualMismatchBox `json:"mismatch_boxes"`
+}
+
+type visualMismatchBox struct {
+	X      int `json:"x"`
+	Y      int `json:"y"`
+	Width  int `json:"width"`
+	Height int `json:"height"`
 }

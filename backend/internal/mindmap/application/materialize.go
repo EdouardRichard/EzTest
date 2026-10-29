@@ -593,7 +593,7 @@ func runValidateDesignProposal(proposal agentDesignProposal, confirmed map[int64
 				}
 			}
 			if err := validateAssertionKind(assertion.Kind); err != nil {
-				add("%s.kind %q is not ui, api, db or text", assertionPrefix, assertion.Kind)
+				add("%s.kind %q is not ui, api, db, text or visual", assertionPrefix, assertion.Kind)
 			}
 			if strings.TrimSpace(assertion.Expression) == "" {
 				add("%s.expression must not be empty", assertionPrefix)

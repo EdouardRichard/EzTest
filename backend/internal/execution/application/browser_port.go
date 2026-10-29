@@ -88,8 +88,7 @@ type BrowserExecutor interface {
 	Close(ctx context.Context, ref ContextRef) error
 }
 
-// BrowserError is the typed failure of the executor client. Code is a stable
-// protocol or transport code: the design spec §5.6 executor codes (for example
+// BrowserError is the typed failure of the executor client. Code is a stable// protocol or transport code: the design spec §5.6 executor codes (for example
 // "unauthorized", "context_not_found", "internal") plus "timeout", "canceled"
 // and "executor_unavailable" for transport failures. StatusCode is the HTTP
 // status when the failure came from a response and zero otherwise. Message never
@@ -117,4 +116,67 @@ func (e *BrowserError) Error() string {
 		return "execution: browser executor error: " + e.Code
 	}
 	return "execution: browser executor error: " + e.Code + ": " + e.Message
+}
+
+// DefaultVisualBaselineMaxBytes is the design spec §9.3 baseline size cap (5
+// MiB) applied when the caller does not configure a limit.
+const DefaultVisualBaselineMaxBytes int64 = 5 << 20
+
+// VisualRegion is a normalized screenshot crop (design spec §9.3): all values
+// are in the 0..1 range and (X+Width, Y+Height) stays inside the unit square.
+type VisualRegion struct {
+	X      float64
+	Y      float64
+	Width  float64
+	Height float64
+}
+
+// VisualCompareRequest is one visual.compare invocation. Baseline is the
+// approved baseline PNG; the actual screenshot is captured by the executor in
+// the target page, never sent by the API. Selector is empty for the whole page
+// viewport; Region is nil for no crop.
+type VisualCompareRequest struct {
+	Baseline          []byte
+	Selector          string
+	Region            *VisualRegion
+	Threshold         float64
+	Viewport          Viewport
+	DeviceScaleFactor float64
+	// MaxBaselineBytes caps the request-side baseline copy (0 = the 5 MiB
+	// spec default enforced by the caller).
+	MaxBaselineBytes int64
+}
+
+// VisualMismatchBox is one device-pixel rectangle that contains differing
+// pixels. The coordinates are relative to the compared image.
+type VisualMismatchBox struct {
+	X      int
+	Y      int
+	Width  int
+	Height int
+}
+
+// VisualCompareResult is the executor's decoded visual comparison. ActualPNG and
+// DiffPNG are the hash-verified artifacts of the visual_actual and visual_diff
+// kinds. EnvironmentMatch is false when the live viewport or device scale factor
+// differs from the baseline configuration; the caller must then classify
+// inconclusive(environment) instead of comparing pixels.
+type VisualCompareResult struct {
+	DiffRatio               float64
+	Width                   int
+	Height                  int
+	MismatchBoxes           []VisualMismatchBox
+	EnvironmentMatch        bool
+	ActualWidth             int
+	ActualHeight            int
+	ActualDeviceScaleFactor float64
+	ActualPNG               []byte
+	DiffPNG                 []byte
+}
+
+// VisualComparator is the visual comparison slice of the executor protocol. It
+// is separate from BrowserExecutor so existing fakes and adapters keep
+// compiling; the production *browser.Client implements both.
+type VisualComparator interface {
+	CompareVisual(ctx context.Context, ref ContextRef, req VisualCompareRequest) (VisualCompareResult, error)
 }

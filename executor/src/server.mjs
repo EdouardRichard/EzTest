@@ -15,6 +15,7 @@ import { ContextManager } from "./contexts.mjs"
 import {
   DEFAULT_MAX_CONTEXTS,
   ExecutorError,
+  MAX_ACTION_REQUEST_BYTES,
   MAX_REQUEST_BYTES,
 } from "./security.mjs"
 
@@ -118,8 +119,8 @@ export function readBody(req, limit = MAX_REQUEST_BYTES) {
   })
 }
 
-async function readJsonBody(req) {
-  const buffer = await readBody(req)
+async function readJsonBody(req, limit = MAX_REQUEST_BYTES) {
+  const buffer = await readBody(req, limit)
   if (buffer.length === 0) {
     return {}
   }
@@ -216,7 +217,7 @@ export function createExecutorServer({ token, manager, version = PACKAGE_VERSION
         return sendError(res, 405, "invalid_request", "method not allowed")
       }
       const contextId = decodeId(actionMatch[1])
-      const body = await readJsonBody(req)
+      const body = await readJsonBody(req, MAX_ACTION_REQUEST_BYTES)
       const envelope = await executor.runAction(contextId, body)
       const status = envelope.ok ? 200 : ACTION_ERROR_STATUS[envelope.error.code] ?? 200
       return sendJson(res, status, envelope)

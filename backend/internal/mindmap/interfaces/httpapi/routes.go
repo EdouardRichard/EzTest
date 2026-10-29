@@ -71,6 +71,13 @@ type ExportService interface {
 	Download(ctx context.Context, versionID, exportID int64) (io.ReadCloser, domain.CaseExport, error)
 }
 
+// VisualAssertionService is the P8 visual assertion use-case surface (design
+// spec §9.3). *application.VisualAssertionService satisfies it.
+type VisualAssertionService interface {
+	Update(ctx context.Context, versionID, assertionID, actor int64, cmd application.UpdateVisualAssertionCommand) (domain.VisualAssertion, error)
+	ApproveBaseline(ctx context.Context, versionID, assertionID, actor, evidenceID int64) (domain.VisualAssertion, error)
+}
+
 // NodeReader is the read side the handlers need next to the write services: the
 // current revision of a node (the create-step/assertion bodies carry no token)
 // and the node list the anchor-ownership scan walks.
@@ -151,6 +158,7 @@ type Deps struct {
 	Explore ExploreService
 	Reviews ReviewService
 	Exports ExportService
+	Visual  VisualAssertionService
 
 	Nodes     NodeReader
 	RunStore  RunReader
@@ -206,6 +214,10 @@ func (h *Handler) Register(mux *http.ServeMux) {
 		mux.HandleFunc("DELETE "+base+"/assertions/{assertionId}", h.deleteAssertion)
 		mux.HandleFunc("POST "+base+"/nodes/{nodeId}/sources", h.createSource)
 		mux.HandleFunc("DELETE "+base+"/sources/{sourceId}", h.deleteSource)
+	}
+	if h.deps.Visual != nil {
+		mux.HandleFunc("PUT "+base+"/assertions/{assertionId}/visual", h.updateVisualAssertion)
+		mux.HandleFunc("POST "+base+"/assertions/{assertionId}/visual/baseline", h.approveVisualBaseline)
 	}
 	if h.deps.Anchors != nil && h.deps.Nodes != nil && h.deps.Versions != nil {
 		mux.HandleFunc("POST "+base+"/nodes/{nodeId}/anchors", h.createAnchor)

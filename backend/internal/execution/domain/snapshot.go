@@ -47,14 +47,36 @@ type CaseSnapshotStep struct {
 	Data     map[string]any `json:"data"`
 }
 
+// CaseSnapshotVisual is the frozen visual comparison configuration of a
+// kind=visual assertion (design spec §9.3). A nil baseline_evidence_id makes the
+// assertion inconclusive(case, missing_visual_baseline) at execution time.
+type CaseSnapshotVisual struct {
+	Selector           string          `json:"selector"`
+	Region             *SnapshotRegion `json:"region,omitempty"`
+	Threshold          float64         `json:"threshold"`
+	BaselineEvidenceID *int64          `json:"baseline_evidence_id,omitempty,string"`
+	ViewportWidth      int             `json:"viewport_width"`
+	ViewportHeight     int             `json:"viewport_height"`
+	DeviceScaleFactor  float64         `json:"device_scale_factor"`
+}
+
+// SnapshotRegion is the normalized screenshot crop of a visual assertion.
+type SnapshotRegion struct {
+	X      float64 `json:"x"`
+	Y      float64 `json:"y"`
+	Width  float64 `json:"width"`
+	Height float64 `json:"height"`
+}
+
 // CaseSnapshotAssertion is the assertion projection inside a snapshot.
 type CaseSnapshotAssertion struct {
-	ID         int64  `json:"id,string"`
-	StepSeq    int    `json:"step_seq"`
-	Kind       string `json:"kind"`
-	Target     string `json:"target"`
-	Expression string `json:"expression"`
-	Expected   string `json:"expected"`
+	ID         int64               `json:"id,string"`
+	StepSeq    int                 `json:"step_seq"`
+	Kind       string              `json:"kind"`
+	Target     string              `json:"target"`
+	Expression string              `json:"expression"`
+	Expected   string              `json:"expected"`
+	Visual     *CaseSnapshotVisual `json:"visual,omitempty"`
 }
 
 // CaseSnapshotSource is the requirement provenance of a case snapshot.

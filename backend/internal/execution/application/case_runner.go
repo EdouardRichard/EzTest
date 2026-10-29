@@ -729,6 +729,10 @@ var knownAgentToolCodes = map[string]struct{}{
 	"assertion_mismatch":         {},
 	"assertion_failed":           {},
 	"step_failed":                {},
+	// P8 visual assertion outcomes (design spec §9.3).
+	"missing_visual_baseline":     {},
+	"visual_environment_mismatch": {},
+	"visual_mismatch":             {},
 }
 
 // knownAgentToolCode reports whether code is a tool error code the failure

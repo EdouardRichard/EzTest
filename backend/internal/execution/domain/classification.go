@@ -8,6 +8,11 @@ import "strings"
 const (
 	reasonEvidenceMissing = "evidence_missing"
 	reasonUnclassified    = "unclassified"
+	// Visual assertion reasons of design spec §9.3.
+	reasonMissingVisualBaseline     = "missing_visual_baseline"
+	reasonVisualEnvironmentMismatch = "visual_environment_mismatch"
+	reasonVisualMismatch            = "visual_mismatch"
+	reasonVisualMatch               = "visual_match"
 )
 
 // toolCodeClass groups tool error codes into the failure classes of spec §5.8.
@@ -55,6 +60,25 @@ func classifyToolCode(code string) toolCodeClass {
 	}
 }
 
+// ClassifyVisual derives the terminal verdict and failure class of one visual
+// assertion from its comparison outcome (design spec §9.3). The order matters:
+// a missing baseline is always inconclusive(case), an environment mismatch is
+// inconclusive(environment) and never a false application failure, and only a
+// diff above the threshold blames the application. The audit reason is the
+// stable §9.3 identifier; a passing comparison reports visual_match.
+func ClassifyVisual(hasBaseline, environmentMatches bool, diffRatio, threshold float64) (Verdict, FailureClass, string) {
+	if !hasBaseline {
+		return VerdictInconclusive, FailureClassCase, reasonMissingVisualBaseline
+	}
+	if !environmentMatches {
+		return VerdictInconclusive, FailureClassEnvironment, reasonVisualEnvironmentMismatch
+	}
+	if diffRatio > threshold {
+		return VerdictFailed, FailureClassApplication, reasonVisualMismatch
+	}
+	return VerdictPassed, "", reasonVisualMatch
+}
+
 // Classify derives the terminal verdict and failure class for a case run from a
 // tool error code, the agent's proposed failure class and the evidence count.
 //
@@ -77,6 +101,20 @@ func classifyToolCode(code string) toolCodeClass {
 func Classify(toolCode string, proposed FailureClass, evidenceCount int) (Verdict, FailureClass, string) {
 	code := strings.TrimSpace(toolCode)
 	if code != "" {
+		// Visual assertion outcomes are classified by their own four-state
+		// mapping (design spec §9.3): an environment mismatch is
+		// inconclusive(environment), not blocked(environment).
+		switch strings.ToLower(code) {
+		case reasonMissingVisualBaseline:
+			return VerdictInconclusive, FailureClassCase, code
+		case reasonVisualEnvironmentMismatch:
+			return VerdictInconclusive, FailureClassEnvironment, code
+		case reasonVisualMismatch:
+			if evidenceCount > 0 {
+				return VerdictFailed, FailureClassApplication, code
+			}
+			return VerdictInconclusive, FailureClassCase, reasonEvidenceMissing
+		}
 		switch classifyToolCode(code) {
 		case toolCodeEnvironment:
 			return VerdictBlocked, FailureClassEnvironment, code

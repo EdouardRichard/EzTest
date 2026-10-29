@@ -9,6 +9,10 @@
 import fsp from "node:fs/promises"
 
 export const MAX_REQUEST_BYTES = 1024 * 1024
+// Visual comparisons carry a baseline copy of up to 5 MiB (design spec §9.3),
+// which is ~6.7 MiB once base64 encoded. Only the authenticated action route
+// accepts this larger body; every other route keeps MAX_REQUEST_BYTES.
+export const MAX_ACTION_REQUEST_BYTES = 16 * 1024 * 1024
 export const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024
 export const MAX_SNAPSHOT_CHARS = 12_000
 export const DEFAULT_ACTION_TIMEOUT_MS = 15_000

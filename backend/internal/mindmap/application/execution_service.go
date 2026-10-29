@@ -424,6 +424,7 @@ func buildExecutionCase(node domain.CaseNode, state graphState, graphHash string
 			Target:     assertion.Target,
 			Expression: assertion.Expression,
 			Expected:   assertion.Expected,
+			Visual:     executionVisual(assertion.Visual),
 		})
 	}
 	return domain.ExecutionCase{
@@ -439,6 +440,33 @@ func buildExecutionCase(node domain.CaseNode, state graphState, graphHash string
 		GraphHash:      graphHash,
 		Origin:         executionCaseOrigin(node),
 		Status:         node.Status,
+	}
+}
+
+// executionVisual projects the optional visual comparison configuration into
+// the frozen case snapshot. A non-visual assertion keeps a nil projection.
+func executionVisual(visual *domain.VisualAssertion) *domain.ExecutionVisual {
+	if visual == nil {
+		return nil
+	}
+	var region *domain.VisualRegion
+	if visual.Region != nil {
+		copied := *visual.Region
+		region = &copied
+	}
+	var baseline *int64
+	if visual.BaselineEvidenceID != nil {
+		value := *visual.BaselineEvidenceID
+		baseline = &value
+	}
+	return &domain.ExecutionVisual{
+		Selector:           visual.Selector,
+		Region:             region,
+		Threshold:          visual.Threshold,
+		BaselineEvidenceID: baseline,
+		ViewportWidth:      visual.ViewportWidth,
+		ViewportHeight:     visual.ViewportHeight,
+		DeviceScaleFactor:  visual.DeviceScaleFactor,
 	}
 }
 

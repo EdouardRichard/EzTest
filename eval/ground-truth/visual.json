@@ -1,0 +1,48 @@
+{
+  "corpusVersion": "2026-10-29.1",
+  "description": "Visual assertion classification ground truth (design spec §9.3). Each row is one injected comparison outcome; visual_classification_accuracy = correctly classified outcomes / outcomes (threshold 1.00). A missing baseline and an environment mismatch must never be reported as application failures.",
+  "metric": "visual_classification_accuracy",
+  "threshold": 1.0,
+  "cases": [
+    {
+      "name": "missing baseline",
+      "hasBaseline": false,
+      "environmentMatches": true,
+      "diffRatio": 0,
+      "threshold": 0.01,
+      "expectedVerdict": "inconclusive",
+      "expectedFailureClass": "case",
+      "expectedReason": "missing_visual_baseline"
+    },
+    {
+      "name": "environment mismatch",
+      "hasBaseline": true,
+      "environmentMatches": false,
+      "diffRatio": 0.5,
+      "threshold": 0.01,
+      "expectedVerdict": "inconclusive",
+      "expectedFailureClass": "environment",
+      "expectedReason": "visual_environment_mismatch"
+    },
+    {
+      "name": "diff above threshold",
+      "hasBaseline": true,
+      "environmentMatches": true,
+      "diffRatio": 0.02,
+      "threshold": 0.01,
+      "expectedVerdict": "failed",
+      "expectedFailureClass": "application",
+      "expectedReason": "visual_mismatch"
+    },
+    {
+      "name": "diff at threshold",
+      "hasBaseline": true,
+      "environmentMatches": true,
+      "diffRatio": 0.01,
+      "threshold": 0.01,
+      "expectedVerdict": "passed",
+      "expectedFailureClass": null,
+      "expectedReason": "visual_match"
+    }
+  ]
+}
