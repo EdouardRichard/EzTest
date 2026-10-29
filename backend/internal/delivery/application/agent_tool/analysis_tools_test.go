@@ -2,9 +2,11 @@ package agent_tool
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
+	agentdomain "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	deliveryapp "github.com/EdouardRichard/EzTest/backend/internal/delivery/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
 )
@@ -65,14 +67,7 @@ func TestCaseListReturnsFailedApplicationCases(t *testing.T) {
 // TestCaseListTruncatesAtTheCap pins the §5.6 20 case cap.
 func TestCaseListTruncatesAtTheCap(t *testing.T) {
 	harness := newToolHarness(domain.AnalysisKindFailure)
-	cases := make([]deliveryapp.AnalysisFailedCase, 0, 25)
-	for index := 0; index < 25; index++ {
-		cases = append(cases, deliveryapp.AnalysisFailedCase{
-			CaseRunID: int64(1000 + index), CaseNodeID: int64(2000 + index),
-			FailureClass: domain.FailureClassApplication, Title: "case", EvidenceIDs: []int64{int64(7000 + index)},
-		})
-	}
-	harness.cases.cases = cases
+	harness.cases.cases = configuredFailedCases(25)
 
 	result, err := callTool(t, harness.tools, analysisFailureInvocation, "analysis.case_list", `{"batchId":"9"}`)
 	if err != nil {
@@ -86,6 +81,164 @@ func TestCaseListTruncatesAtTheCap(t *testing.T) {
 	if !out.Truncated {
 		t.Fatal("truncated = false, want true when the batch has more failed cases")
 	}
+}
+
+// TestCaseListKeepsSpecDefaultAtMaxCases20 pins that an explicit MaxCases=20
+// behaves exactly like the unwired default: 20 cases listed and the 21st is
+// outside the ownership scope.
+func TestCaseListKeepsSpecDefaultAtMaxCases20(t *testing.T) {
+	harness := newToolHarnessWithMaxCases(domain.AnalysisKindFailure, domain.AnalysisMaxFailureCandidates)
+	harness.cases.cases = configuredFailedCases(domain.AnalysisMaxFailureCandidates + 1)
+
+	result, err := callTool(t, harness.tools, analysisFailureInvocation, "analysis.case_list", `{"batchId":"9"}`)
+	if err != nil {
+		t.Fatalf("analysis.case_list: %v", err)
+	}
+	var out caseListResult
+	decodeToolResult(t, result, &out)
+	if harness.cases.limit != domain.AnalysisMaxFailureCandidates+1 {
+		t.Fatalf("failed-case read limit = %d, want the default %d",
+			harness.cases.limit, domain.AnalysisMaxFailureCandidates+1)
+	}
+	if len(out.Cases) != domain.AnalysisMaxFailureCandidates || !out.Truncated {
+		t.Fatalf("cases = %d truncated=%v, want the default %d cap with truncation",
+			len(out.Cases), out.Truncated, domain.AnalysisMaxFailureCandidates)
+	}
+	_, err = callTool(t, harness.tools, analysisFailureInvocation, "analysis.case_detail", `{"caseRunId":"1020"}`)
+	requireToolError(t, err, "invalid_arguments")
+}
+
+// TestCaseListHonorsConfiguredMaxCases pins the EZTEST_ANALYSIS_MAX_CASES wiring
+// of the analysis tools: MaxCases=30 lists and reads the 30th failed case while
+// the 31st stays outside the budget, and the read uses MaxCases+1 rows so
+// truncation is detected without reading the whole batch.
+func TestCaseListHonorsConfiguredMaxCases(t *testing.T) {
+	const maxCases = 30
+	harness := newToolHarnessWithMaxCases(domain.AnalysisKindFailure, maxCases)
+	harness.cases.cases = configuredFailedCases(maxCases + 2)
+
+	result, err := callTool(t, harness.tools, analysisFailureInvocation, "analysis.case_list", `{"batchId":"9"}`)
+	if err != nil {
+		t.Fatalf("analysis.case_list: %v", err)
+	}
+	var out caseListResult
+	decodeToolResult(t, result, &out)
+	if harness.cases.limit != maxCases+1 {
+		t.Fatalf("failed-case read limit = %d, want MaxCases+1 = %d", harness.cases.limit, maxCases+1)
+	}
+	if len(out.Cases) != maxCases {
+		t.Fatalf("cases = %d, want the configured %d cap", len(out.Cases), maxCases)
+	}
+	if !out.Truncated {
+		t.Fatal("truncated = false, want true with more failed cases than the configured cap")
+	}
+	last := out.Cases[maxCases-1]
+	if last.CaseRunID != fmt.Sprintf("%d", 1000+maxCases-1) ||
+		last.CaseNodeID != fmt.Sprintf("%d", 2000+maxCases-1) {
+		t.Fatalf("last listed case = %+v, want the %dth case within the budget", last, maxCases)
+	}
+
+	// The 30th case is readable; the 31st is beyond the budget and refused.
+	harness.details.detail = CaseDetail{
+		CaseRunID: 1029, CaseNodeID: 2029, Title: "case-30",
+		Status: "failed", FailureClass: domain.FailureClassApplication,
+		EvidenceIDs: []int64{7029},
+	}
+	detailResult, err := callTool(t, harness.tools, analysisFailureInvocation, "analysis.case_detail", `{"caseRunId":"1029"}`)
+	if err != nil {
+		t.Fatalf("analysis.case_detail for the last case within MaxCases: %v", err)
+	}
+	var detail caseDetailResult
+	decodeToolResult(t, detailResult, &detail)
+	if detail.CaseRunID != "1029" || detail.CaseNodeID != "2029" {
+		t.Fatalf("case detail = %+v, want the 30th failed case", detail)
+	}
+	_, err = callTool(t, harness.tools, analysisFailureInvocation, "analysis.case_detail", `{"caseRunId":"1030"}`)
+	requireToolError(t, err, "invalid_arguments")
+}
+
+// TestCaseListDescriptionUsesConfiguredMaxCases pins that the tool description
+// carries the configured budget instead of the hardcoded spec default.
+func TestCaseListDescriptionUsesConfiguredMaxCases(t *testing.T) {
+	cases := []struct {
+		name     string
+		maxCases int
+		want     string
+	}{
+		{name: "default", maxCases: 0, want: "at most 20"},
+		{name: "configured", maxCases: 30, want: "at most 30"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			harness := newToolHarnessWithMaxCases(domain.AnalysisKindFailure, tc.maxCases)
+			tool := toolNamed(t, harness.tools, domain.ToolAnalysisCaseList)
+			if !strings.Contains(tool.Description(), tc.want) {
+				t.Fatalf("case_list description = %q, want it to contain %q", tool.Description(), tc.want)
+			}
+		})
+	}
+}
+
+// TestCandidateProposeHonorsConfiguredMaxCases pins that the ownership whitelist
+// of analysis.candidate_propose uses the configured failed-case budget: the 30th
+// case's evidence is accepted and the 31st is not.
+func TestCandidateProposeHonorsConfiguredMaxCases(t *testing.T) {
+	const maxCases = 30
+	harness := newToolHarnessWithMaxCases(domain.AnalysisKindFailure, maxCases)
+	harness.cases.cases = configuredFailedCases(maxCases + 1)
+	harness.submissions.candidateResult = failureRunFixture()
+
+	args := `{"candidates":[{"caseRunId":"1029","title":"t","severity":"major","confidence":"high","evidenceIds":["7029"]}]}`
+	if _, err := callTool(t, harness.tools, analysisFailureInvocation, "analysis.candidate_propose", args); err != nil {
+		t.Fatalf("analysis.candidate_propose for the 30th case: %v", err)
+	}
+	if len(harness.submissions.candidates) != 1 || harness.submissions.candidates[0].CaseRunID != 1029 {
+		t.Fatalf("submitted candidates = %+v, want the 30th case", harness.submissions.candidates)
+	}
+
+	// The 31st failed case is outside the budget: its candidate is dropped.
+	args = `{"candidates":[{"caseRunId":"1030","title":"t","severity":"major","confidence":"high","evidenceIds":["7030"]}]}`
+	result, err := callTool(t, harness.tools, analysisFailureInvocation, "analysis.candidate_propose", args)
+	if err != nil {
+		t.Fatalf("analysis.candidate_propose for the out-of-budget case: %v", err)
+	}
+	var out candidateProposeResult
+	decodeToolResult(t, result, &out)
+	if harness.submissions.candidateCalls != 1 {
+		t.Fatalf("submission calls = %d, want the out-of-budget candidate to be dropped", harness.submissions.candidateCalls)
+	}
+	if !strings.Contains(strings.Join(out.Warnings, "\n"), "not a failed application case run") {
+		t.Fatalf("warnings = %v, want the out-of-budget case warning", out.Warnings)
+	}
+}
+
+// configuredFailedCases builds n failed(application) case runs with distinct
+// case-run, case-node and evidence ids.
+func configuredFailedCases(n int) []deliveryapp.AnalysisFailedCase {
+	cases := make([]deliveryapp.AnalysisFailedCase, 0, n)
+	for index := 0; index < n; index++ {
+		cases = append(cases, deliveryapp.AnalysisFailedCase{
+			CaseRunID:     int64(1000 + index),
+			CaseNodeID:    int64(2000 + index),
+			FailureClass:  domain.FailureClassApplication,
+			Title:         fmt.Sprintf("case-%d", index+1),
+			FailureReason: "assertion mismatch",
+			EvidenceIDs:   []int64{int64(7000 + index)},
+		})
+	}
+	return cases
+}
+
+// toolNamed returns one registered tool by name.
+func toolNamed(t *testing.T, tools []agentdomain.Tool, name string) agentdomain.Tool {
+	t.Helper()
+	for _, tool := range tools {
+		if tool.Name() == name {
+			return tool
+		}
+	}
+	t.Fatalf("tool %q is not registered", name)
+	return nil
 }
 
 // caseDetailResult is the analysis.case_detail response.

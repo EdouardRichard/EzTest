@@ -168,6 +168,20 @@ type ToolDeps struct {
 	Details     CaseDetailReader
 	Evidence    EvidenceMetaReader
 	Code        CodeReader
+	// MaxCases is the per-run failed(application) case budget
+	// (EZTEST_ANALYSIS_MAX_CASES, design spec §10.5/§11.4). The analysis
+	// service bounds the run input with the same value; zero keeps the spec
+	// default domain.AnalysisMaxFailureCandidates (20).
+	MaxCases int
+}
+
+// maxCases returns the configured failed-case budget, defaulting to the spec
+// default when the composition root did not wire one.
+func (d ToolDeps) maxCases() int {
+	if d.MaxCases > 0 {
+		return d.MaxCases
+	}
+	return domain.AnalysisMaxFailureCandidates
 }
 
 // ready reports whether every required port is wired.
@@ -281,11 +295,16 @@ func scopeRunningRun(ctx context.Context, deps ToolDeps, kind string) (agentapp.
 }
 
 // failedApplicationCases reads the batch's failed case runs, keeping only the
-// failed(application) entries T4 analyzes (spec §5.6).
-func failedApplicationCases(ctx context.Context, deps ToolDeps, run domain.AnalysisRun) ([]deliveryapp.AnalysisFailedCase, error) {
-	cases, err := deps.Cases.ListFailedCases(ctx, run.VersionID, run.BatchID, domain.AnalysisMaxFailureCandidates+1)
+// failed(application) entries T4 analyzes (spec §5.6). It reads MaxCases+1 rows
+// so truncation is detectable without scanning the whole batch and returns at
+// most MaxCases entries, mirroring AnalysisService.listFailedApplicationCases:
+// the tool views of the same run can never expose a case the service excluded
+// from the run input.
+func failedApplicationCases(ctx context.Context, deps ToolDeps, run domain.AnalysisRun) ([]deliveryapp.AnalysisFailedCase, bool, error) {
+	max := deps.maxCases()
+	cases, err := deps.Cases.ListFailedCases(ctx, run.VersionID, run.BatchID, max+1)
 	if err != nil {
-		return nil, internalErrorf("list failed cases of batch %d: %v", run.BatchID, err)
+		return nil, false, internalErrorf("list failed cases of batch %d: %v", run.BatchID, err)
 	}
 	filtered := make([]deliveryapp.AnalysisFailedCase, 0, len(cases))
 	for _, failedCase := range cases {
@@ -295,7 +314,11 @@ func failedApplicationCases(ctx context.Context, deps ToolDeps, run domain.Analy
 		}
 		filtered = append(filtered, failedCase)
 	}
-	return filtered, nil
+	truncated := len(filtered) > max
+	if truncated {
+		filtered = filtered[:max]
+	}
+	return filtered, truncated, nil
 }
 
 // caseRunIndex projects the failed cases by case run id.

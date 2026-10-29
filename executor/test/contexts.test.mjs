@@ -81,6 +81,50 @@ test("createContext omits deviceScaleFactor when the caller does not set one", a
   }
 })
 
+test("createContext fails closed and closes the context when routeWebSocket is unavailable", async () => {
+  let closed = false
+  const page = { on() {}, once() {}, async close() {} }
+  const context = {
+    async addInitScript() {},
+    async route() {},
+    // routeWebSocket intentionally missing: an older Playwright cannot route
+    // page WebSockets, so a context must never be created unguarded.
+    on() {},
+    async newPage() {
+      return page
+    },
+    async newCDPSession() {
+      return { async send() {}, on() {}, async detach() {} }
+    },
+    async close() {
+      closed = true
+    },
+  }
+  const browser = {
+    version: () => "fake-1.0.0",
+    isConnected: () => true,
+    async newContext() {
+      return context
+    },
+    async close() {},
+  }
+  const manager = new ContextManager({
+    maxContexts: 1,
+    launch: async () => browser,
+    logger: null,
+  })
+  try {
+    await assert.rejects(
+      () => manager.createContext({ allowedHosts: ["127.0.0.1"] }),
+      (error) => error && error.code === "internal" && /intercept WebSocket/i.test(error.message),
+    )
+    assert.equal(closed, true, "the unguarded browser context must be closed instead of leaked")
+    assert.equal(manager.size, 0)
+  } finally {
+    await manager.close()
+  }
+})
+
 test("createContext rejects an out-of-range deviceScaleFactor", async () => {
   const manager = new ContextManager({
     maxContexts: 1,

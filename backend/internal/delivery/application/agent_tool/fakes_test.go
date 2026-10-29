@@ -268,6 +268,20 @@ func detailFixture() CaseDetail {
 // newToolHarness wires NewTools to in-memory fakes. kind selects the persisted
 // run fixture (failure or issue_triage).
 func newToolHarness(kind string) *toolHarness {
+	return newToolHarnessWithOptions(kind, nil)
+}
+
+// newToolHarnessWithMaxCases wires the tool set with a configured failed-case
+// budget (EZTEST_ANALYSIS_MAX_CASES); zero selects the spec default.
+func newToolHarnessWithMaxCases(kind string, maxCases int) *toolHarness {
+	return newToolHarnessWithOptions(kind, func(deps *ToolDeps) {
+		deps.MaxCases = maxCases
+	})
+}
+
+// newToolHarnessWithOptions wires NewTools to in-memory fakes and lets the test
+// adjust the injected dependencies before registration.
+func newToolHarnessWithOptions(kind string, mutate func(*ToolDeps)) *toolHarness {
 	run := failureRunFixture()
 	if kind == domain.AnalysisKindIssueTriage {
 		run = triageRunFixture()
@@ -287,14 +301,18 @@ func newToolHarness(kind string) *toolHarness {
 			"src/cart.ts": {Path: "src/cart.ts", StartLine: 40, EndLine: 50, Content: "func submit() {\n  cart.submit()\n}"},
 		}},
 	}
-	harness.tools = NewTools(ToolDeps{
+	deps := ToolDeps{
 		Runs:        harness.runs,
 		Cases:       harness.cases,
 		Submissions: harness.submissions,
 		Details:     harness.details,
 		Evidence:    harness.evidence,
 		Code:        harness.code,
-	})
+	}
+	if mutate != nil {
+		mutate(&deps)
+	}
+	harness.tools = NewTools(deps)
 	return harness
 }
 

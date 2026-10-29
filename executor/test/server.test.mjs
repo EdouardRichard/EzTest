@@ -4,7 +4,7 @@ import { EventEmitter } from "node:events"
 import http from "node:http"
 
 import { ContextManager } from "../src/contexts.mjs"
-import { createExecutorServer, readBody } from "../src/server.mjs"
+import { createExecutorServer, readBody, startFromEnv } from "../src/server.mjs"
 import { ExecutorError, MAX_REQUEST_BYTES } from "../src/security.mjs"
 import { httpClient, startLocalPage } from "./helpers.mjs"
 
@@ -261,4 +261,26 @@ test("unknown routes and methods are rejected", async () => {
 
   const wrongMethod = await request("/v1/contexts", { method: "GET" })
   assert.equal(wrongMethod.status, 405)
+})
+
+test("startFromEnv wires EZTEST_EXEC_ALLOWED_HOSTS into the context manager", async () => {
+  // Reserve an ephemeral port, then let startFromEnv bind it.
+  const probe = http.createServer()
+  probe.listen(0, "127.0.0.1")
+  await new Promise((resolve) => probe.once("listening", resolve))
+  const { port } = probe.address()
+  await new Promise((resolve) => probe.close(resolve))
+
+  const started = await startFromEnv({
+    EZTEST_EXECUTOR_TOKEN: "env-test-token",
+    EZTEST_EXECUTOR_ADDR: `127.0.0.1:${port}`,
+    EZTEST_EXEC_ALLOWED_HOSTS: "app.example.test, *.internal.test",
+  })
+  assert.ok(started, "startFromEnv returned null for a valid environment")
+  try {
+    assert.deepEqual(started.manager.allowedHosts, ["app.example.test", "*.internal.test"])
+  } finally {
+    await new Promise((resolve) => started.server.close(resolve))
+    await started.manager.close()
+  }
 })

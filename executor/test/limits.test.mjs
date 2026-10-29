@@ -24,12 +24,16 @@ import {
 const CONTEXT_ID = "case_run:1"
 
 /** Builds a fake Playwright Page good enough for the context guards/actions. */
-function fakePage({ hanging = false } = {}) {
+function fakePage({ hanging = false, closeHangs = false } = {}) {
   const page = {
     closed: false,
     on() {},
     once() {},
     async close() {
+      if (closeHangs) {
+        // Simulates a wedged browser that ignores close; recovery must bound it.
+        return new Promise(() => {})
+      }
       page.closed = true
     },
     async title() {
@@ -84,7 +88,12 @@ function fakePage({ hanging = false } = {}) {
 }
 
 /** Builds a fake browser/context pair tracked by the test. */
-function fakeBrowser({ pages = [], hanging = false } = {}) {
+function fakeBrowser({
+  pages = [],
+  hanging = false,
+  closeHangs = false,
+  newPageHangsAfter = Number.POSITIVE_INFINITY,
+} = {}) {
   let wsHandler = null
   const context = {
     mountedPages: pages,
@@ -98,7 +107,11 @@ function fakeBrowser({ pages = [], hanging = false } = {}) {
       return { send: async () => {}, on() {} }
     },
     async newPage() {
-      const page = fakePage({ hanging })
+      if (pages.length >= newPageHangsAfter) {
+        // Simulates a wedged browser that never creates the replacement page.
+        return new Promise(() => {})
+      }
+      const page = fakePage({ hanging, closeHangs })
       pages.push(page)
       return page
     },
@@ -134,6 +147,7 @@ async function createManager(options = {}) {
     logger: null,
     launch: async () => fake.browser,
     ...(options.allowedHosts ? { allowedHosts: options.allowedHosts } : {}),
+    ...(options.recoveryTimeoutMs ? { recoveryTimeoutMs: options.recoveryTimeoutMs } : {}),
   })
   const created = await manager.createContext({
     baseUrl: "http://127.0.0.1:1",
@@ -229,6 +243,63 @@ test("EZTEST_EXEC_ALLOWED_HOSTS can open the executor allow list", async () => {
     fake.wsHandler(remote)
     assert.equal(remote.connected, true)
     assert.equal(remote.closed, null)
+  } finally {
+    await manager.close()
+  }
+})
+
+test("page recovery is bounded when page.close hangs", async () => {
+  const { manager, fake, contextId } = await createManager({
+    hanging: true,
+    closeHangs: true,
+    recoveryTimeoutMs: 50,
+  })
+  try {
+    const started = Date.now()
+    // The action itself must settle: pre-fix, the hanging page.close wedges the
+    // queue forever, so bound the test-side await and fail instead of hanging.
+    const outcome = await Promise.race([
+      manager.runAction(contextId, {
+        action: "wait_for",
+        args: { text: "never", timeout_ms: 10 },
+      }),
+      new Promise((resolve) => setTimeout(() => resolve("test-timeout"), 3_000)),
+    ])
+    assert.notEqual(outcome, "test-timeout", "recovery waited forever on a hanging page.close")
+    assert.equal(outcome.ok, false)
+    assert.equal(outcome.error.code, "executor_timeout")
+    assert.ok(Date.now() - started < 3_000, "recovery waited forever on a hanging page.close")
+
+    // The context still recovered with a fresh page and serves actions.
+    assert.equal(fake.pages.length, 2)
+    const snapshot = await manager.runAction(contextId, { action: "snapshot" })
+    assert.equal(snapshot.ok, true, JSON.stringify(snapshot))
+  } finally {
+    await manager.close()
+  }
+})
+
+test("page recovery is bounded when page recreation hangs", async () => {
+  const { manager, fake, contextId } = await createManager({
+    hanging: true,
+    newPageHangsAfter: 1,
+    recoveryTimeoutMs: 50,
+  })
+  try {
+    assert.equal(fake.pages.length, 1, "context creation opened the initial page")
+    const started = Date.now()
+    const outcome = await Promise.race([
+      manager.runAction(contextId, {
+        action: "wait_for",
+        args: { text: "never", timeout_ms: 10 },
+      }),
+      new Promise((resolve) => setTimeout(() => resolve("test-timeout"), 3_000)),
+    ])
+    assert.notEqual(outcome, "test-timeout", "recovery waited forever on a hanging page recreation")
+    assert.equal(outcome.ok, false)
+    assert.equal(outcome.error.code, "executor_timeout")
+    assert.ok(Date.now() - started < 3_000, "recovery waited forever on a hanging page recreation")
+    assert.equal(fake.pages.length, 1, "a timed-out newPage must not register a page")
   } finally {
     await manager.close()
   }

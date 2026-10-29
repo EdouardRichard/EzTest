@@ -199,6 +199,60 @@ test("service workers are blocked so they cannot bypass the allow list", async (
   })
 })
 
+test("page WebSockets outside allowedHosts are recorded, closed and fail the action", async () => {
+  await withContext(async (context) => {
+    const response = await act(context.contextId, "goto", { url: `${pageServer.url}/wstest` })
+    assert.equal(response.ok, false, JSON.stringify(response))
+    assert.equal(response.error.code, "host_not_allowed")
+
+    // The page observes the policy-violation close (1008), proving the guard
+    // closed the routed socket instead of merely failing the action.
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    const consoleResult = await act(context.contextId, "console", { tail: 20 })
+    assert.equal(consoleResult.ok, true)
+    assert.ok(
+      consoleResult.result.items.some((item) => item.text === "ws-close:1008"),
+      JSON.stringify(consoleResult.result),
+    )
+
+    const network = await act(context.contextId, "network", { tail: 20 })
+    const rejected = network.result.items.find((item) => item.error === "host_not_allowed")
+    assert.ok(rejected, JSON.stringify(network.result))
+    assert.match(rejected.url, /blocked-ws/)
+  })
+})
+
+test("workers are blocked so their WebSockets cannot bypass the allow list", async () => {
+  await withContext(async (context) => {
+    const page = await act(context.contextId, "goto", { url: `${pageServer.url}/workertest` })
+    assert.equal(page.ok, true, JSON.stringify(page.error))
+    const waited = await act(context.contextId, "wait_for", {
+      text: "worker-blocked,sharedworker-blocked",
+      timeout_ms: 5_000,
+    })
+    assert.equal(waited.ok, true, JSON.stringify(waited.error))
+
+    // The blob worker's socket targets an allowed host and would reach the
+    // server if Playwright routed worker WebSockets (it does not) or if worker
+    // creation were still possible.
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    assert.deepEqual(pageServer.upgrades, [], "a worker WebSocket bypassed the guard")
+    const consoleResult = await act(context.contextId, "console", { tail: 20 })
+    assert.ok(
+      consoleResult.result.items.some((item) =>
+        item.text.startsWith("worker-guard:worker-blocked,sharedworker-blocked"),
+      ),
+      JSON.stringify(consoleResult.result),
+    )
+    // The guard itself records the blocked constructors, so the violation stays
+    // visible even if the page swallows the exception.
+    assert.ok(
+      consoleResult.result.items.some((item) => item.text.includes("worker_blocked")),
+      JSON.stringify(consoleResult.result),
+    )
+  })
+})
+
 test("goto refuses file:// urls", async () => {
   await withContext(async (context) => {
     const response = await act(context.contextId, "goto", { url: "file:///C:/Windows/win.ini" })

@@ -34,7 +34,7 @@ type caseSummaryValue struct {
 }
 
 // runCaseList implements analysis.case_list (spec §9.3): the failed(application)
-// case runs of the calling batch, at most 20.
+// case runs of the calling batch, at most EZTEST_ANALYSIS_MAX_CASES.
 func runCaseList(ctx context.Context, deps ToolDeps, args json.RawMessage) (agentdomain.ToolResult, error) {
 	input, err := decodeArguments[caseListInput](args)
 	if err != nil {
@@ -52,13 +52,9 @@ func runCaseList(ctx context.Context, deps ToolDeps, args json.RawMessage) (agen
 		return agentdomain.ToolResult{}, invalidArgumentsf(
 			"batchId %d does not match the analysis run scope (batch %d)", batchID, invocation.BatchID)
 	}
-	cases, err := failedApplicationCases(ctx, deps, run)
+	cases, truncated, err := failedApplicationCases(ctx, deps, run)
 	if err != nil {
 		return agentdomain.ToolResult{}, err
-	}
-	truncated := len(cases) > domain.AnalysisMaxFailureCandidates
-	if truncated {
-		cases = cases[:domain.AnalysisMaxFailureCandidates]
 	}
 	out := caseListOutput{
 		BatchID:   idString(run.BatchID),
@@ -134,7 +130,7 @@ func runCaseDetail(ctx context.Context, deps ToolDeps, args json.RawMessage) (ag
 	if err != nil {
 		return agentdomain.ToolResult{}, err
 	}
-	cases, err := failedApplicationCases(ctx, deps, run)
+	cases, _, err := failedApplicationCases(ctx, deps, run)
 	if err != nil {
 		return agentdomain.ToolResult{}, err
 	}
@@ -204,7 +200,7 @@ func runEvidenceMeta(ctx context.Context, deps ToolDeps, args json.RawMessage) (
 	if err != nil {
 		return agentdomain.ToolResult{}, err
 	}
-	cases, err := failedApplicationCases(ctx, deps, run)
+	cases, _, err := failedApplicationCases(ctx, deps, run)
 	if err != nil {
 		return agentdomain.ToolResult{}, err
 	}

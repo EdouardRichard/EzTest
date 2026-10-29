@@ -13,7 +13,7 @@ import path from "node:path"
 
 import { chromium } from "playwright"
 
-import { executeAction } from "./actions.mjs"
+import { executeAction, withAbort } from "./actions.mjs"
 import {
   DEFAULT_ALLOWED_HOSTS,
   isWebSocketAllowed,
@@ -31,6 +31,10 @@ import {
 import { stripSecretValues } from "./snapshot.mjs"
 
 const READINESS_TTL_MS = 10_000
+// Bound on the best-effort page teardown/recreation of a canceled or wedged
+// action. A browser that never answers page.close/newPage must not keep the
+// context's serialized action queue blocked forever (design spec §10.5).
+const RECOVERY_TIMEOUT_MS = 5_000
 
 function scrub(text, secrets) {
   return stripSecretValues(text, [...secrets])
@@ -280,7 +284,9 @@ function classifyUrl(entry, url) {
  * action as host_not_allowed.
  *
  * Playwright's HTTP guards (CDP Fetch and context.route) never see WebSocket
- * handshakes, so this dedicated guard is the only enforcement point.
+ * handshakes, so this dedicated guard is the only enforcement point. It covers
+ * page-created sockets only; worker-created sockets are prevented by
+ * installWorkerGuard (there is no Playwright API to route them).
  */
 async function installWebSocketGuard(entry, browserContext, executorAllowedHosts, logger = null) {
   if (typeof browserContext.routeWebSocket !== "function") {
@@ -324,6 +330,52 @@ async function installWebSocketGuard(entry, browserContext, executorAllowedHosts
     } catch {
       webSocket.close()
     }
+  })
+}
+
+/**
+ * Blocks page-created Worker/SharedWorker instances in every document of the
+ * context.
+ *
+ * Playwright's `routeWebSocket` only routes WebSockets created by a page; a
+ * dedicated (or shared) worker opens its own sockets below that layer, where no
+ * Playwright API can intercept them. Such a worker could connect to any host
+ * and bypass the allow list, so the executor fails closed and forbids worker
+ * creation. The init script is installed before the first page exists, so a
+ * page script can never capture the original constructors.
+ */
+async function installWorkerGuard(browserContext) {
+  await browserContext.addInitScript(() => {
+    const block = (name) => {
+      const blocked = function () {
+        const message = `${name} creation is blocked by the EzTest executor (worker_blocked)`
+        try {
+          // Record the policy violation in the context console ring even when
+          // the page swallows the constructor error.
+          console.error(`[executor] ${message}`)
+        } catch {
+          // A page without console must still fail closed below.
+        }
+        throw new DOMException(message, "NotAllowedError")
+      }
+      Object.defineProperty(blocked, "name", { value: name, configurable: true })
+      try {
+        Object.defineProperty(globalThis, name, {
+          value: blocked,
+          configurable: false,
+          enumerable: true,
+          writable: false,
+        })
+      } catch {
+        try {
+          globalThis[name] = blocked
+        } catch {
+          // A frozen global leaves no usable constructor either.
+        }
+      }
+    }
+    block("Worker")
+    block("SharedWorker")
   })
 }
 
@@ -481,6 +533,10 @@ export class ContextManager {
   #creating = 0
   #allowDataPages
   #readiness = null
+  // Bound on page.close/newPage during canceled-action recovery. It is an
+  // option so tests can exercise the wedge without waiting the production
+  // timeout; a non-positive value falls back to RECOVERY_TIMEOUT_MS.
+  #recoveryTimeout
   // Executor-wide WebSocket allow list (EZTEST_EXEC_ALLOWED_HOSTS). It is an
   // additional restriction on top of every context's own allowedHosts.
   #allowedHosts
@@ -491,12 +547,16 @@ export class ContextManager {
     logger = null,
     allowedHosts = parseAllowedHosts(process.env.EZTEST_EXEC_ALLOWED_HOSTS),
     allowDataPages = process.env.EZTEST_EXECUTOR_ALLOW_DATA_PAGES === "1",
+    recoveryTimeoutMs = RECOVERY_TIMEOUT_MS,
   } = {}) {
     const parsed = Number(maxContexts)
     this.#maxContexts = Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_CONTEXTS
     this.#launcher = typeof launch === "function" ? launch : launchChromium
     this.#logger = logger
     this.#allowDataPages = allowDataPages === true
+    const recovery = Number(recoveryTimeoutMs)
+    this.#recoveryTimeout =
+      Number.isFinite(recovery) && recovery > 0 ? recovery : RECOVERY_TIMEOUT_MS
     this.#allowedHosts = normalizeAllowedHosts(
       Array.isArray(allowedHosts) && allowedHosts.length > 0 ? allowedHosts : [...DEFAULT_ALLOWED_HOSTS],
     )
@@ -624,83 +684,98 @@ export class ContextManager {
         ...(deviceScaleFactor !== undefined ? { deviceScaleFactor } : {}),
         ...(storageState ? { storageState } : {}),
       })
-      const contextId = `ctx_${this.#nextId++}`
-      const entry = {
-        contextId,
-        key: typeof input.key === "string" ? input.key : null,
-        context: browserContext,
-        page: null,
-        allowedHosts,
-        baseUrl,
-        allowDataPages: this.#allowDataPages,
-        consoleItems: [],
-        networkItems: [],
-        pendingRequests: new Map(),
-        blocked: null,
-        blockedWebSocket: null,
-        secrets: new Set(),
-        tmpDir: null,
-        closed: false,
-        tail: Promise.resolve(),
-        controllers: new Set(),
-        cdpSessions: new Set(),
-        pageGuards: new WeakMap(),
-        readyPages: new WeakSet(),
-        guardPage: null,
-        newPage: null,
-        currentToken: null,
-      }
-      if (Object.keys(sessionStorage).length > 0) {
-        await browserContext.addInitScript((entries) => {
-          try {
-            const items = entries[window.location.origin]
-            if (!items) {
-              return
-            }
-            for (const item of items) {
-              window.sessionStorage.setItem(item.name, item.value)
-            }
-          } catch {
-            // Opaque origins (about:blank, sandboxed frames) cannot store data.
-          }
-        }, sessionStorage)
-      }
-      await installEarlyRouteGuard(entry, browserContext)
-      await installWebSocketGuard(entry, browserContext, this.#allowedHosts, this.#logger)
-      entry.guardPage = (page) => {
-        let pending = entry.pageGuards.get(page)
-        if (!pending) {
-          pending = installPageGuard(entry, page)
-          entry.pageGuards.set(page, pending)
+      let contextId = null
+      try {
+        contextId = `ctx_${this.#nextId++}`
+        const entry = {
+          contextId,
+          key: typeof input.key === "string" ? input.key : null,
+          context: browserContext,
+          page: null,
+          allowedHosts,
+          baseUrl,
+          allowDataPages: this.#allowDataPages,
+          consoleItems: [],
+          networkItems: [],
+          pendingRequests: new Map(),
+          blocked: null,
+          blockedWebSocket: null,
+          secrets: new Set(),
+          tmpDir: null,
+          closed: false,
+          tail: Promise.resolve(),
+          controllers: new Set(),
+          cdpSessions: new Set(),
+          pageGuards: new WeakMap(),
+          readyPages: new WeakSet(),
+          guardPage: null,
+          newPage: null,
+          currentToken: null,
         }
-        return pending
-      }
-      entry.newPage = async () => {
-        const page = await browserContext.newPage()
-        await entry.guardPage(page)
-        return page
-      }
-      // Every page in the context (window.open, target=_blank, ...) must get the
-      // guard before it can load content. A guard that cannot be installed
-      // closes the page instead of leaving it unguarded.
-      browserContext.on("page", (page) => {
-        entry.guardPage(page).catch((error) => {
-          this.#logger?.warn?.(
-            scrub(
-              `[executor] could not guard a ${contextId} page: ${error instanceof Error ? error.message : error}`,
-              entry.secrets,
-            ),
-          )
-          void page.close().catch(() => {})
+        // Worker WebSockets bypass routeWebSocket, so worker creation is
+        // forbidden before the first page exists (fail closed, §10.5).
+        await installWorkerGuard(browserContext)
+        if (Object.keys(sessionStorage).length > 0) {
+          await browserContext.addInitScript((entries) => {
+            try {
+              const items = entries[window.location.origin]
+              if (!items) {
+                return
+              }
+              for (const item of items) {
+                window.sessionStorage.setItem(item.name, item.value)
+              }
+            } catch {
+              // Opaque origins (about:blank, sandboxed frames) cannot store data.
+            }
+          }, sessionStorage)
+        }
+        await installEarlyRouteGuard(entry, browserContext)
+        await installWebSocketGuard(entry, browserContext, this.#allowedHosts, this.#logger)
+        entry.guardPage = (page) => {
+          let pending = entry.pageGuards.get(page)
+          if (!pending) {
+            pending = installPageGuard(entry, page)
+            entry.pageGuards.set(page, pending)
+          }
+          return pending
+        }
+        entry.newPage = async () => {
+          const page = await browserContext.newPage()
+          await entry.guardPage(page)
+          return page
+        }
+        // Every page in the context (window.open, target=_blank, ...) must get the
+        // guard before it can load content. A guard that cannot be installed
+        // closes the page instead of leaving it unguarded.
+        browserContext.on("page", (page) => {
+          entry.guardPage(page).catch((error) => {
+            this.#logger?.warn?.(
+              scrub(
+                `[executor] could not guard a ${contextId} page: ${error instanceof Error ? error.message : error}`,
+                entry.secrets,
+              ),
+            )
+            void page.close().catch(() => {})
+          })
         })
-      })
 
-      const page = await entry.newPage()
-      entry.page = page
+        const page = await entry.newPage()
+        entry.page = page
 
-      this.#contexts.set(contextId, entry)
-      this.#logger?.info?.(`[executor] context ${contextId} created`)
-      return { contextId, browserVersion: browser.version() }
+        this.#contexts.set(contextId, entry)
+        this.#logger?.info?.(`[executor] context ${contextId} created`)
+        return { contextId, browserVersion: browser.version() }
+      } catch (error) {
+        // Never leak a half-created context: if a guard could not be installed
+        // its pages would run without the allow-list enforcement, so the
+        // browser context is closed before the failure is reported.
+        if (contextId !== null) {
+          this.#contexts.delete(contextId)
+        }
+        await browserContext.close().catch(() => {})
+        throw error
+      }
     } finally {
       this.#creating -= 1
     }
@@ -819,13 +894,26 @@ export class ContextManager {
     }
     operation.recovery = (async () => {
       if (page) {
-        await page.close().catch(() => {})
+        // A wedged browser may never answer page.close(); bound the wait so the
+        // context's serialized action queue cannot block forever.
+        await withAbort(page.close(), {
+          timeoutMs: this.#recoveryTimeout,
+          label: `page close of ${entry.contextId}`,
+        }).catch((error) => {
+          this.#logger?.warn?.(
+            `[executor] ${entry.contextId} page close did not settle within ${this.#recoveryTimeout}ms: ${error instanceof Error ? error.message : error}`,
+          )
+        })
       }
       if (entry.closed || entry.page !== page) {
         return
       }
+      const recreation = entry.newPage()
       try {
-        entry.page = await entry.newPage()
+        entry.page = await withAbort(recreation, {
+          timeoutMs: this.#recoveryTimeout,
+          label: `page recreation of ${entry.contextId}`,
+        })
         this.#logger?.info?.(`[executor] context ${entry.contextId} page recreated after cancel`)
       } catch (error) {
         // Leave entry.page empty so the next queued action retries creation.
@@ -833,6 +921,16 @@ export class ContextManager {
         this.#logger?.warn?.(
           `[executor] could not recreate page for ${entry.contextId}: ${error instanceof Error ? error.message : error}`,
         )
+        if (error instanceof ExecutorError && error.code === "executor_timeout") {
+          // If the wedged newPage resolves after the deadline, close its page
+          // instead of leaving it unguarded in the context.
+          recreation.then(
+            (created) => {
+              void created.close().catch(() => {})
+            },
+            () => {},
+          )
+        }
       }
     })()
     return operation.recovery
