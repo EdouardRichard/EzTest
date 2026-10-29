@@ -10,6 +10,7 @@ import {
 } from "@/lib/api-client"
 
 import type {
+  ApproveVisualBaselineBody,
   CaseAssertionView,
   CaseExportView,
   CaseFindingView,
@@ -21,7 +22,6 @@ import type {
   CaseVisualAssertionView,
   CodeAnchorView,
   CreateAnchorBody,
-  ApproveVisualBaselineBody,
   CreateAssertionBody,
   CreateExportBody,
   CreateNodeBody,
