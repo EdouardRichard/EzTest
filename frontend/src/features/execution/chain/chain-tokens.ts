@@ -342,6 +342,11 @@ export function getEdgeKindToken(kind: ChainEdgeKindDTO): ChainToken {
   return EDGE_KIND_TOKENS[kind]
 }
 
+/** True when `status` is one of the eight execution-result statuses. */
+export function isResultStatus(status: string): status is CaseRunStatus {
+  return Object.hasOwn(RESULT_STATUS_TOKENS, status)
+}
+
 /** Looks up a result status; unknown/empty values keep a neutral fallback. */
 export function getResultStatusToken(status: string | undefined | null): ChainStatusToken {
   if (status === undefined || status === null || status.trim() === "") {

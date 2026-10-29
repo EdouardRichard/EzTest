@@ -17,6 +17,7 @@ import {
   getResultStatusToken,
   ISSUE_SEVERITY_TOKENS,
   ISSUE_STATUS_TOKENS,
+  isResultStatus,
   NODE_KIND_TOKENS,
   REQUIREMENT_STATUS_TOKENS,
   RESULT_STATUS_TOKENS,
@@ -182,5 +183,11 @@ describe("token getters", () => {
     expect(getCaseStatusToken("new_state").label).toBe("new_state")
     expect(getIssueSeverityToken("critical").label).toBe("critical")
     expect(getIssueStatusToken("").label).toBe("—")
+  })
+
+  it("recognises exactly the eight result statuses", () => {
+    for (const status of RESULT_STATUSES) expect(isResultStatus(status)).toBe(true)
+    expect(isResultStatus("mystery")).toBe(false)
+    expect(isResultStatus("")).toBe(false)
   })
 })

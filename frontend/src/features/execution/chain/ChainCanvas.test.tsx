@@ -11,6 +11,10 @@ import type { ChainSnapshot, ChainSnapshotEdge, ChainSnapshotNode } from "./chai
  * The canvas is always reached through the same `next/dynamic(..., { ssr:
  * false })` boundary Task 11 will use, so the tests exercise the real lazy
  * boundary of the product instead of importing the client module directly.
+ *
+ * Note: this proves lazy loading only. The suite runs in jsdom, where
+ * `next/dynamic` resolves the loader immediately; it is no evidence that the
+ * module is SSR-safe, which is exactly why Task 11 must keep `ssr: false`.
  */
 const ChainCanvas = dynamic(() => import("./ChainCanvas"), { ssr: false })
 
@@ -229,6 +233,30 @@ function renderCanvas(overrides: Partial<ChainCanvasProps> = {}) {
   return render(<ChainCanvas snapshot={SMALL_SNAPSHOT} {...overrides} />)
 }
 
+/** Invokes the canvas' `onMoveStart` as React Flow would for one viewport move. */
+function moveStart(event: Event | null): void {
+  act(() => {
+    const onMoveStart = flowProbe.props?.onMoveStart as
+      | ((event: Event | null, viewport: unknown) => void)
+      | undefined
+    onMoveStart?.(event, { x: 0, y: 0, zoom: 1 })
+  })
+}
+
+/** Centre of one laid-out node, matching what the follow controller targets. */
+function nodeCentre(
+  nodes: ChainSnapshotNode[],
+  edges: ChainSnapshotEdge[],
+  id: string,
+): { x: number; y: number } {
+  const node = layoutChain(nodes, { edges }).nodes.find((candidate) => candidate.id === id)
+  expect(node).toBeDefined()
+  return {
+    x: (node?.x ?? 0) + (node?.width ?? 0) / 2,
+    y: (node?.y ?? 0) + (node?.height ?? 0) / 2,
+  }
+}
+
 function edgeGroup(container: HTMLElement, kind: string, edgeId: string): Element | null {
   return container.querySelector(`[data-testid="chain-edge-${kind}"][data-edge-id="${edgeId}"]`)
 }
@@ -306,6 +334,32 @@ describe("ChainCanvas", () => {
     expect(flowProbe.props?.edgesFocusable).toBe(false)
   })
 
+  it("hides React Flow's interactive lock so the read-only canvas cannot be unlocked", async () => {
+    const { container } = renderCanvas()
+    await screen.findByTestId("chain-node-requirement")
+
+    // Controls' interactive button toggles nodesDraggable/nodesConnectable/
+    // elementsSelectable back on; the chain must never expose it.
+    expect(container.querySelector(".react-flow__controls-interactive")).toBeNull()
+    // Zoom and fit-to-view stay available.
+    expect(container.querySelector(".react-flow__controls-zoomin")).not.toBeNull()
+    expect(container.querySelector(".react-flow__controls-zoomout")).not.toBeNull()
+    expect(container.querySelector(".react-flow__controls-fitview")).not.toBeNull()
+  })
+
+  it("fills the parent height and clamps zoom-out to the spec minimum", async () => {
+    renderCanvas()
+    const canvas = await screen.findByTestId("chain-canvas")
+
+    // The parent owns the 72vh/60vh height; the canvas itself must not pin a
+    // fixed 600px height that would fight it.
+    expect(canvas.className).toContain("h-full")
+    expect(canvas.className).toContain("w-full")
+    expect(canvas.className).toContain("min-h-[420px]")
+    expect(canvas.className).not.toContain("h-[600px]")
+    expect(flowProbe.props?.minZoom).toBe(0.1)
+  })
+
   it("renders 200 nodes and culls the ones outside the viewport", async () => {
     const { container } = render(<ChainCanvas snapshot={largeSnapshot()} />)
 
@@ -314,49 +368,113 @@ describe("ChainCanvas", () => {
     expect(flowProbe.props?.onlyRenderVisibleElements).toBe(true)
 
     // jsdom has no layout engine, so the test proves culling through the
-    // rendered wrappers: the fit viewport is 800x600 while the graph is tens of
-    // thousands of layout units tall. The mocked ReactFlow props above are the
-    // authoritative assertion for the culling contract.
+    // rendered wrappers: the 800x600 fit viewport shows a slice of the graph,
+    // which is 8,800 layout units tall (50 requirement groups x 176 units).
+    // The mocked ReactFlow props above are the authoritative assertion for the
+    // culling contract; the DOM assertions pin a known-visible and a
+    // known-culled node instead of only asserting "fewer than all".
+    const renderedNodes = (): Element[] => [...container.querySelectorAll(".react-flow__node")]
     await waitFor(
       () => {
-        expect(container.querySelectorAll(".react-flow__node").length).toBeLessThan(200)
+        expect(renderedNodes().length).toBeGreaterThan(0)
+        expect(renderedNodes().length).toBeLessThan(200)
       },
       { timeout: 5000 },
     )
+    expect(nodeWrapper(container, "requirement:25")).not.toBeNull()
+    expect(nodeWrapper(container, "requirement:50")).toBeNull()
   })
 
   it("draws semantic edges with labels, markers and status-driven colours", async () => {
     const { container } = renderCanvas()
     await screen.findAllByTestId("chain-node-result")
 
+    // Inline style beats `.react-flow__edge-path { stroke: var(--xy-edge-stroke) }`
+    // from `@xyflow/react/dist/style.css`; presentation attributes would lose.
     const requirementEdge = edgePath(container, "requirement_case", "e-req-case")
-    expect(requirementEdge.getAttribute("stroke")).toBe(CHAIN_COLOR_STYLES.indigo.stroke)
+    expect(requirementEdge.style.stroke).toBe(CHAIN_COLOR_STYLES.indigo.stroke)
+    expect(requirementEdge.style.strokeWidth).toBe("1.5")
+    expect(requirementEdge.getAttribute("stroke")).toBeNull()
     expect(requirementEdge.getAttribute("marker-end")).toMatch(/^url\(/)
     expect(container.querySelector("marker.react-flow__arrowhead")).not.toBeNull()
     expect(edgeLabel(container, "requirement_case", "e-req-case")).toBe(
       EDGE_KIND_TOKENS.requirement_case.label,
     )
 
-    expect(edgePath(container, "case_result", "e-passed").getAttribute("stroke")).toBe(
+    expect(edgePath(container, "case_result", "e-passed").style.stroke).toBe(
       CHAIN_COLOR_STYLES.emerald.stroke,
     )
-    expect(edgePath(container, "case_result", "e-running").getAttribute("stroke")).toBe(
+    expect(edgePath(container, "case_result", "e-running").style.stroke).toBe(
       CHAIN_COLOR_STYLES.blue.stroke,
     )
-    expect(edgePath(container, "case_result", "e-failed").getAttribute("stroke")).toBe(
+    expect(edgePath(container, "case_result", "e-failed").style.stroke).toBe(
       CHAIN_COLOR_STYLES.red.stroke,
     )
-    expect(edgePath(container, "result_issue", "e-result-issue").getAttribute("stroke")).toBe(
-      CHAIN_COLOR_STYLES.red.stroke,
+    expect(edgePath(container, "result_issue", "e-result-issue").style.stroke).toBe(
+      EDGE_KIND_TOKENS.result_issue.stroke,
     )
-    expect(edgePath(container, "case_issue", "e-case-issue").getAttribute("stroke")).toBe(
-      CHAIN_COLOR_STYLES.red.stroke,
+    expect(edgePath(container, "case_issue", "e-case-issue").style.stroke).toBe(
+      EDGE_KIND_TOKENS.case_issue.stroke,
     )
+    // `case_issue` and `result_issue` deliberately use different tokens.
+    expect(EDGE_KIND_TOKENS.case_issue.stroke).toBe(CHAIN_COLOR_STYLES.violet.stroke)
+    expect(EDGE_KIND_TOKENS.result_issue.stroke).toBe(CHAIN_COLOR_STYLES.red.stroke)
 
     const impactEdge = edgePath(container, "impact_case", "e-impact")
-    expect(impactEdge.getAttribute("stroke")).toBe(CHAIN_COLOR_STYLES.amber.stroke)
-    expect(impactEdge.getAttribute("stroke-dasharray")).toBe("6 6")
+    expect(impactEdge.style.stroke).toBe(CHAIN_COLOR_STYLES.amber.stroke)
+    expect(impactEdge.style.strokeDasharray).toBe("6 6")
     expect(edgeLabel(container, "impact_case", "e-impact")).toBe(EDGE_KIND_TOKENS.impact_case.label)
+  })
+
+  it("falls back to the teal case_result token for unknown or empty result statuses", async () => {
+    const nodes: ChainSnapshotNode[] = [
+      ...SMALL_NODES,
+      {
+        id: "result:4",
+        kind: "result",
+        title: "未知状态",
+        status: "mystery",
+        caseNodeId: "case:1",
+        attempt: 4,
+      },
+      {
+        id: "result:5",
+        kind: "result",
+        title: "空状态",
+        status: "",
+        caseNodeId: "case:1",
+        attempt: 5,
+      },
+    ]
+    const edges: ChainSnapshotEdge[] = [
+      ...SMALL_EDGES,
+      { id: "e-unknown-status", source: "case:1", target: "result:4", kind: "case_result" },
+      { id: "e-empty-status", source: "case:1", target: "result:5", kind: "case_result" },
+    ]
+
+    const { container } = render(<ChainCanvas snapshot={makeSnapshot(nodes, edges)} />)
+    await screen.findAllByTestId("chain-node-result")
+
+    expect(edgePath(container, "case_result", "e-unknown-status").style.stroke).toBe(
+      EDGE_KIND_TOKENS.case_result.stroke,
+    )
+    expect(edgePath(container, "case_result", "e-empty-status").style.stroke).toBe(
+      EDGE_KIND_TOKENS.case_result.stroke,
+    )
+  })
+
+  it("colours MiniMap nodes by their chain kind token", async () => {
+    renderCanvas()
+    await screen.findAllByTestId("chain-node-result")
+
+    const rects = [
+      ...screen.getByTestId("chain-minimap").querySelectorAll("rect.react-flow__minimap-node"),
+    ]
+    const fills = new Set(rects.map((rect) => (rect as SVGElement).style.fill))
+    expect(fills).toContain(CHAIN_COLOR_STYLES.blue.stroke)
+    expect(fills).toContain(CHAIN_COLOR_STYLES.indigo.stroke)
+    expect(fills).toContain(CHAIN_COLOR_STYLES.teal.stroke)
+    expect(fills).toContain(CHAIN_COLOR_STYLES.red.stroke)
   })
 
   it("animates only edges that target a running result", async () => {
@@ -424,41 +542,27 @@ describe("ChainCanvas", () => {
   })
 
   it("centres the running result once and pauses follow after a user pan", async () => {
-    const running = layoutChain(SMALL_SNAPSHOT.nodes, {
-      edges: SMALL_SNAPSHOT.edges,
-    }).nodes.find((node) => node.id === "result:2")
-    expect(running).toBeDefined()
+    const centre = nodeCentre(SMALL_NODES, SMALL_EDGES, "result:2")
 
     const { rerender } = renderCanvas({ follow: true })
 
     await waitFor(() => expect(flowProbe.setCenter).toHaveBeenCalledTimes(1))
-    expect(flowProbe.setCenter).toHaveBeenCalledWith(
-      (running?.x ?? 0) + (running?.width ?? 0) / 2,
-      (running?.y ?? 0) + (running?.height ?? 0) / 2,
-      { zoom: 1.1, duration: 450 },
-    )
+    expect(flowProbe.setCenter).toHaveBeenCalledWith(centre.x, centre.y, {
+      zoom: 1.1,
+      duration: 450,
+    })
     expect(screen.getByTestId("chain-follow-status").getAttribute("data-follow-paused")).toBe(
       "false",
     )
 
     // Programmatic moves carry a null event and must not pause the follow.
-    act(() => {
-      const onMoveStart = flowProbe.props?.onMoveStart as
-        | ((event: Event | null, viewport: unknown) => void)
-        | undefined
-      onMoveStart?.(null, { x: 0, y: 0, zoom: 1 })
-    })
+    moveStart(null)
     expect(screen.getByTestId("chain-follow-status").getAttribute("data-follow-paused")).toBe(
       "false",
     )
 
     // A user pan pauses the follow; a later snapshot refresh must not re-fit.
-    act(() => {
-      const onMoveStart = flowProbe.props?.onMoveStart as
-        | ((event: Event | null, viewport: unknown) => void)
-        | undefined
-      onMoveStart?.(new MouseEvent("mousedown"), { x: 0, y: 0, zoom: 1 })
-    })
+    moveStart(new MouseEvent("mousedown"))
     await waitFor(() =>
       expect(screen.getByTestId("chain-follow-status").getAttribute("data-follow-paused")).toBe(
         "true",
@@ -469,5 +573,105 @@ describe("ChainCanvas", () => {
     rerender(<ChainCanvas snapshot={refreshed(SMALL_SNAPSHOT)} follow />)
     await act(async () => {})
     expect(flowProbe.setCenter).toHaveBeenCalledTimes(callsAfterPause)
+  })
+
+  it("does not re-centre when an unpaused snapshot refreshes", async () => {
+    const centre = nodeCentre(SMALL_NODES, SMALL_EDGES, "result:2")
+
+    const { rerender } = renderCanvas({ follow: true })
+    await waitFor(() => expect(flowProbe.setCenter).toHaveBeenCalledTimes(1))
+
+    // The follow target keeps the same id across refreshes, so the controller
+    // must remember it was already focused even while nobody panned.
+    rerender(<ChainCanvas snapshot={refreshed(SMALL_SNAPSHOT)} follow />)
+    await act(async () => {})
+
+    expect(flowProbe.setCenter).toHaveBeenCalledTimes(1)
+    expect(flowProbe.setCenter).toHaveBeenCalledWith(centre.x, centre.y, {
+      zoom: 1.1,
+      duration: 450,
+    })
+  })
+
+  it("jumps instantly when reduced motion is preferred", async () => {
+    mockReducedMotion(true)
+    const centre = nodeCentre(SMALL_NODES, SMALL_EDGES, "result:2")
+
+    renderCanvas({ follow: true })
+
+    await waitFor(() => expect(flowProbe.setCenter).toHaveBeenCalledTimes(1))
+    expect(flowProbe.setCenter).toHaveBeenCalledWith(centre.x, centre.y, {
+      zoom: 1.1,
+      duration: 0,
+    })
+  })
+
+  it("resumes following and re-centres from the paused state", async () => {
+    renderCanvas({ follow: true })
+    await waitFor(() => expect(flowProbe.setCenter).toHaveBeenCalledTimes(1))
+
+    moveStart(new MouseEvent("mousedown"))
+    await waitFor(() =>
+      expect(screen.getByTestId("chain-follow-status").getAttribute("data-follow-paused")).toBe(
+        "true",
+      ),
+    )
+
+    fireEvent.click(screen.getByTestId("chain-follow-resume"))
+
+    await waitFor(() => expect(flowProbe.setCenter).toHaveBeenCalledTimes(2))
+    expect(screen.getByTestId("chain-follow-status").getAttribute("data-follow-paused")).toBe(
+      "false",
+    )
+  })
+
+  it("follows the first running result in layout order", async () => {
+    const nodes: ChainSnapshotNode[] = [
+      {
+        id: "requirement:1",
+        kind: "requirement",
+        title: "登录需求",
+        status: "clarified",
+        priority: "must",
+        caseCount: 2,
+      },
+      {
+        id: "case:1",
+        kind: "case",
+        title: "登录成功",
+        status: "reviewed",
+        requirementIds: ["requirement:1"],
+      },
+      {
+        id: "result:1",
+        kind: "result",
+        title: "第一次执行",
+        status: "running",
+        caseNodeId: "case:1",
+        attempt: 1,
+      },
+      {
+        id: "result:2",
+        kind: "result",
+        title: "第二次执行",
+        status: "running",
+        caseNodeId: "case:1",
+        attempt: 2,
+      },
+    ]
+    const edges: ChainSnapshotEdge[] = [
+      { id: "e-req", source: "requirement:1", target: "case:1", kind: "requirement_case" },
+      { id: "e-r1", source: "case:1", target: "result:1", kind: "case_result" },
+      { id: "e-r2", source: "case:1", target: "result:2", kind: "case_result" },
+    ]
+    const first = nodeCentre(nodes, edges, "result:1")
+
+    render(<ChainCanvas snapshot={makeSnapshot(nodes, edges)} follow />)
+
+    await waitFor(() => expect(flowProbe.setCenter).toHaveBeenCalledTimes(1))
+    expect(flowProbe.setCenter).toHaveBeenCalledWith(first.x, first.y, {
+      zoom: 1.1,
+      duration: 450,
+    })
   })
 })

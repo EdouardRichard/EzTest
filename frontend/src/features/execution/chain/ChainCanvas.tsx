@@ -22,7 +22,8 @@ import { memo, useCallback, useMemo } from "react"
 
 import type { LaidEdge, PositionedNode } from "./chain-layout"
 import { layoutChain } from "./chain-layout"
-import type { ChainSnapshot, ChainSnapshotNode } from "./chain-types"
+import { CHAIN_COLOR_STYLES, NODE_KIND_TOKENS } from "./chain-tokens"
+import type { ChainNodeKindDTO, ChainSnapshot, ChainSnapshotNode } from "./chain-types"
 import { ChainEdge, type ChainFlowEdge, getChainEdgeMarkerColor } from "./edges/ChainEdge"
 import { CaseNode } from "./nodes/CaseNode"
 import { IssueNode } from "./nodes/IssueNode"
@@ -131,16 +132,30 @@ const ChainIssueNode = memo(function ChainIssueNode({ data, selected }: ChainNod
 
 // Module scope keeps the identities stable across renders (React Flow warns
 // about fresh nodeTypes/edgeTypes objects on every render).
-const NODE_TYPES = {
+const NODE_TYPES: NodeTypes = {
   requirement: ChainRequirementNode,
   case: ChainCaseNode,
   result: ChainResultNode,
   issue: ChainIssueNode,
-} as unknown as NodeTypes
+}
 
-const EDGE_TYPES = { chain: ChainEdge } as unknown as EdgeTypes
+const EDGE_TYPES: EdgeTypes = { chain: ChainEdge }
 
 const FIT_VIEW_OPTIONS = { padding: 0.2 } as const
+/** Spec §5.4: the canvas may zoom out to 0.1 before the graph stops shrinking. */
+const MIN_ZOOM = 0.1
+
+/**
+ * MiniMap fill colour per node kind (spec §5.4: minimap nodes are coloured by
+ * type). The token palette stays the single source; an unexpected node type
+ * falls back to the neutral slate instead of inventing a colour.
+ */
+function chainMiniMapNodeColor(node: Node): string {
+  const kind = typeof node.type === "string" ? node.type : ""
+  return Object.hasOwn(NODE_KIND_TOKENS, kind)
+    ? NODE_KIND_TOKENS[kind as ChainNodeKindDTO].stroke
+    : CHAIN_COLOR_STYLES.slate.stroke
+}
 
 function buildFlowNodes(
   nodes: PositionedNode[],
@@ -190,7 +205,6 @@ function buildFlowEdges(
         type: MarkerType.ArrowClosed,
         color: getChainEdgeMarkerColor(edge.kind, targetStatus),
       },
-      className: running ? "chain-edge-running" : undefined,
     }
   })
 }
@@ -281,7 +295,7 @@ function ChainCanvasFlow({
   return (
     <div
       data-testid="chain-canvas"
-      className="relative h-[600px] w-full overflow-hidden rounded-xl border border-border bg-background"
+      className="relative h-full min-h-[420px] w-full overflow-hidden rounded-xl border border-border bg-background"
     >
       <ReactFlow
         nodes={flowNodes}
@@ -293,6 +307,7 @@ function ChainCanvasFlow({
         onMoveStart={handleMoveStart}
         fitView
         fitViewOptions={FIT_VIEW_OPTIONS}
+        minZoom={MIN_ZOOM}
         onlyRenderVisibleElements
         // React Flow's d3 zoom binds a native dblclick handler on the pane that
         // stops propagation, which would swallow the card's double-click
@@ -307,9 +322,10 @@ function ChainCanvasFlow({
       >
         <Background variant={BackgroundVariant.Dots} gap={16} size={1} />
         <div data-testid="chain-minimap">
-          <MiniMap pannable zoomable />
+          <MiniMap pannable zoomable nodeColor={chainMiniMapNodeColor} />
         </div>
-        <Controls />
+        {/* No interactive lock: it would turn dragging/connecting/selection back on. */}
+        <Controls showInteractive={false} />
       </ReactFlow>
       {follow ? (
         <div
