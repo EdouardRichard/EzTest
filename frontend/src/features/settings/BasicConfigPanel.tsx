@@ -1,10 +1,10 @@
 "use client"
 
-import { Gauge, HardDrive, RefreshCw, Server, ShieldCheck } from "lucide-react"
+import { AlertTriangle, Gauge, HardDrive, RefreshCw, Server, ShieldCheck, Trash2 } from "lucide-react"
 import { useEffect, useState } from "react"
 import { ErrorState } from "@/components/ui/ErrorState"
 import { StatusBadge } from "@/components/ui/StatusBadge"
-import { apiGet, getApiBaseUrl } from "@/lib/api-client"
+import { apiGet, apiPost, getApiBaseUrl } from "@/lib/api-client"
 
 /** The subset of `GET /api/health` the read-only config panel displays. */
 type Health = {
@@ -35,6 +35,29 @@ type ConfigSection = {
   title: string
   icon: typeof Server
   items: ConfigItem[]
+}
+
+/** The `POST /api/admin/gc` report (spec §10.2). */
+type GCReport = {
+  dryRun: boolean
+  candidates: number
+  protected: number
+  bytes: number
+  deleted: number
+  failed: number
+  skipped: number
+  retentionDays: number
+  batchKeep: number
+  runAt?: string
+}
+
+/** Formats a byte count with binary units for the GC report. */
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B"
+  const units = ["B", "KiB", "MiB", "GiB"]
+  const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
+  const value = bytes / 1024 ** exponent
+  return `${value.toFixed(exponent === 0 ? 0 : 1)} ${units[exponent]}`
 }
 
 /** The port of the configured API origin, falling back to the URL defaults. */
@@ -142,6 +165,10 @@ function configSections(health: Health | null): ConfigSection[] {
 export function BasicConfigPanel() {
   const [health, setHealth] = useState<Health | null>(null)
   const [healthError, setHealthError] = useState("")
+  const [gcReport, setGcReport] = useState<GCReport | null>(null)
+  const [gcError, setGcError] = useState("")
+  const [gcLoading, setGcLoading] = useState(false)
+  const [gcConfirming, setGcConfirming] = useState(false)
 
   useEffect(() => {
     let cancelled = false
@@ -158,6 +185,25 @@ export function BasicConfigPanel() {
       cancelled = true
     }
   }, [])
+
+  /** Runs the admin GC endpoint. dryRun=true previews; false purges. */
+  async function runGC(dryRun: boolean) {
+    setGcLoading(true)
+    setGcError("")
+    try {
+      const report = await apiPost<GCReport>("/api/admin/gc", {
+        dryRun,
+        reason: "settings panel",
+      })
+      setGcReport(report)
+      setGcConfirming(false)
+    } catch (error: unknown) {
+      setGcError(error instanceof Error ? error.message : "未知错误")
+      setGcConfirming(false)
+    } finally {
+      setGcLoading(false)
+    }
+  }
 
   const sections = configSections(health)
 
@@ -220,6 +266,113 @@ export function BasicConfigPanel() {
           )
         })}
       </div>
+
+      <section
+        aria-labelledby="gc-maintenance-title"
+        className="rounded-xl border border-border bg-card p-4"
+      >
+        <header className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <div className="flex items-center gap-2">
+              <h3 id="gc-maintenance-title" className="flex items-center gap-2 text-sm font-semibold">
+                <Trash2 className="h-4 w-4 text-muted-foreground" aria-hidden="true" />
+                证据 GC
+              </h3>
+              <StatusBadge variant="info">管理员</StatusBadge>
+            </div>
+            <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
+              先 dry-run 预览超期且未被引用的候选；执行会二次确认，且仅当后端
+              <span className="font-mono"> EZTEST_GC_ENABLED=true </span>
+              时才会删除文件。发布报告、未关闭问题、最近批次、基线证据与运行中批次始终受保护。
+            </p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => runGC(true)}
+              disabled={gcLoading}
+              className="rounded-lg border border-border px-3 py-2 text-sm font-medium hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              GC dry-run 预览
+            </button>
+            <button
+              type="button"
+              onClick={() => setGcConfirming(true)}
+              disabled={gcLoading || gcReport === null}
+              className="rounded-lg bg-destructive px-3 py-2 text-sm font-medium text-destructive-foreground hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              执行 GC
+            </button>
+          </div>
+        </header>
+
+        {gcConfirming ? (
+          <div
+            role="alertdialog"
+            aria-labelledby="gc-confirm-title"
+            className="mt-3 rounded-lg border border-warning/40 bg-warning/10 p-3 text-sm"
+          >
+            <p id="gc-confirm-title" className="flex items-start gap-2 font-medium">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+              确认执行 GC？将删除候选证据文件并保留数据库元数据，此操作不可撤销。
+            </p>
+            <div className="mt-2 flex gap-2">
+              <button
+                type="button"
+                onClick={() => runGC(false)}
+                disabled={gcLoading}
+                className="rounded-lg bg-destructive px-3 py-1.5 text-sm font-medium text-destructive-foreground hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                确认执行
+              </button>
+              <button
+                type="button"
+                onClick={() => setGcConfirming(false)}
+                disabled={gcLoading}
+                className="rounded-lg border border-border px-3 py-1.5 text-sm font-medium hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                取消
+              </button>
+            </div>
+          </div>
+        ) : null}
+
+        {gcError === "" ? null : (
+          <ErrorState
+            title="GC 请求失败"
+            message={`${gcError}（非 dry-run 需要 EZTEST_GC_ENABLED=true）`}
+            className="mt-3 border-warning/40 bg-warning/10 text-warning"
+          />
+        )}
+
+        {gcReport === null ? null : (
+          <dl className="mt-3 grid gap-2 text-sm sm:grid-cols-2 lg:grid-cols-4">
+            <div className="rounded-lg bg-muted/40 px-3 py-2">
+              <dt className="text-muted-foreground">候选</dt>
+              <dd className="font-medium">候选 {gcReport.candidates} 个</dd>
+            </div>
+            <div className="rounded-lg bg-muted/40 px-3 py-2">
+              <dt className="text-muted-foreground">体积</dt>
+              <dd className="font-medium">{formatBytes(gcReport.bytes)}</dd>
+            </div>
+            <div className="rounded-lg bg-muted/40 px-3 py-2">
+              <dt className="text-muted-foreground">受保护</dt>
+              <dd className="font-medium">受保护 {gcReport.protected} 个</dd>
+            </div>
+            <div className="rounded-lg bg-muted/40 px-3 py-2">
+              <dt className="text-muted-foreground">{gcReport.dryRun ? "模式" : "结果"}</dt>
+              <dd className="font-medium">
+                {gcReport.dryRun
+                  ? "dry-run（未删除）"
+                  : `已删除 ${gcReport.deleted} 个`}
+                {gcReport.dryRun || (gcReport.failed === 0 && gcReport.skipped === 0)
+                  ? null
+                  : ` · 失败 ${gcReport.failed} · 跳过 ${gcReport.skipped}`}
+              </dd>
+            </div>
+          </dl>
+        )}
+      </section>
 
       <div className="flex items-start gap-2 rounded-xl border border-border bg-muted/40 px-4 py-3 text-sm text-muted-foreground">
         <RefreshCw className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />

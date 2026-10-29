@@ -4,6 +4,8 @@ package server
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"log/slog"
 	"net"
 	"net/http"
@@ -19,6 +21,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
 	deliveryhttp "github.com/EdouardRichard/EzTest/backend/internal/delivery/interfaces/httpapi"
 	eventinghttp "github.com/EdouardRichard/EzTest/backend/internal/eventing/interfaces/httpapi"
+	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
 	executionhttp "github.com/EdouardRichard/EzTest/backend/internal/execution/interfaces/httpapi"
 	identity "github.com/EdouardRichard/EzTest/backend/internal/identity/domain"
 	identityhttp "github.com/EdouardRichard/EzTest/backend/internal/identity/interfaces/httpapi"
@@ -46,6 +49,12 @@ type Pinger interface {
 type EventService interface {
 	eventinghttp.Snapshotter
 	eventinghttp.Publisher
+}
+
+// GCService is the P8 evidence GC use case mounted at POST /api/admin/gc
+// (spec §10.2). The execution application GCService satisfies it.
+type GCService interface {
+	Run(ctx context.Context, req executionapp.GCRequest) (executionapp.GCReport, error)
 }
 
 // AgentDependencies holds the Agent use cases the server mounts. They are
@@ -156,6 +165,11 @@ type Dependencies struct {
 	// and the per-route admin guard: the eval runner and the quality dashboard
 	// are administrator-only (spec §9.1/§11.5).
 	Quality *qualityhttp.Handlers
+	// GC is the P8 evidence GC use case. When set, POST /api/admin/gc is
+	// mounted behind the global bearer auth and the per-route admin guard
+	// (spec §10.2). Non-dry-run execution is additionally gated by
+	// EZTEST_GC_ENABLED, which the handler checks (409 when disabled).
+	GC GCService
 }
 
 // New assembles the HTTP handler. Middleware runs in the order
@@ -180,6 +194,13 @@ func New(cfg config.Config, logger *slog.Logger, deps Dependencies) http.Handler
 		// The route is mounted here because the admin guard lives in the
 		// identity interface package; the audit handler itself only lists.
 		mux.Handle("GET /api/admin/audit", identityhttp.RequireAdmin(audithttp.NewHandler(deps.Audit)))
+	}
+	if deps.GC != nil {
+		// Evidence GC (P8) is admin-only; the guard also stamps the request
+		// metadata the audit entry carries. A non-dry-run purge is rejected
+		// with 409 unless EZTEST_GC_ENABLED=true (spec §10.2).
+		mux.Handle("POST /api/admin/gc",
+			identityhttp.RequireAdmin(auditRequestContext(handleAdminGC(deps.GC, cfg.GCEnabled))))
 	}
 	if deps.Events != nil {
 		mux.Handle("GET /api/stream/events", agentChannelAdminOnly(eventinghttp.NewSnapshotHandler(deps.Events)))
@@ -429,6 +450,73 @@ func agentChannelAdminOnly(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// gcMaxBodyBytes bounds the admin GC request body. The contract is a tiny JSON
+// object ({dryRun, reason}), so 4 KiB is ample.
+const gcMaxBodyBytes = 4 << 10
+
+// gcRequest is the POST /api/admin/gc body. DryRun is a pointer so an omitted
+// field selects the safe default (dry-run) instead of the zero value.
+type gcRequest struct {
+	DryRun *bool  `json:"dryRun"`
+	Reason string `json:"reason"`
+}
+
+// gcEnvelope wraps the GC report in the shared data envelope.
+type gcEnvelope struct {
+	Data executionapp.GCReport `json:"data"`
+}
+
+// handleAdminGC serves POST /api/admin/gc (spec §10.2). The request defaults to
+// dry-run; an explicit non-dry-run is rejected with 409 when EZTEST_GC_ENABLED
+// is false. The execution service performs the same fail-closed check, so a
+// caller that bypasses the handler cannot purge either.
+func handleAdminGC(service GCService, enabled bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if service == nil {
+			platform.WriteError(w, r, http.StatusServiceUnavailable, platform.CodeUnavailable,
+				"evidence GC is not configured")
+			return
+		}
+		var body gcRequest
+		if err := platform.DecodeJSON(r, &body, gcMaxBodyBytes); err != nil {
+			platform.WriteError(w, r, http.StatusBadRequest, platform.CodeInvalidArgument,
+				"invalid gc request body")
+			return
+		}
+		dryRun := true
+		if body.DryRun != nil {
+			dryRun = *body.DryRun
+		}
+		if !dryRun && !enabled {
+			platform.WriteError(w, r, http.StatusConflict, platform.CodeConflict,
+				"evidence GC execution is disabled; set EZTEST_GC_ENABLED=true")
+			return
+		}
+		actorID := int64(0)
+		if user, ok := identityhttp.UserFromContext(r.Context()); ok {
+			actorID = user.ID
+		}
+		report, err := service.Run(r.Context(), executionapp.GCRequest{
+			DryRun:  dryRun,
+			ActorID: actorID,
+			Reason:  body.Reason,
+		})
+		if err != nil {
+			if errors.Is(err, executionapp.ErrGCDisabled) {
+				platform.WriteError(w, r, http.StatusConflict, platform.CodeConflict,
+					"evidence GC execution is disabled; set EZTEST_GC_ENABLED=true")
+				return
+			}
+			platform.WriteError(w, r, http.StatusInternalServerError, platform.CodeInternal,
+				"evidence GC run failed")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(gcEnvelope{Data: report})
+	}
 }
 
 // remoteIP extracts the peer address of the request. Forwarding headers are

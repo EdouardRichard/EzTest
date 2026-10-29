@@ -1,13 +1,14 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const mocks = vi.hoisted(() => ({
   apiGet: vi.fn(),
+  apiPost: vi.fn(),
 }))
 
 vi.mock("@/lib/api-client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api-client")>()
-  return { ...actual, apiGet: mocks.apiGet }
+  return { ...actual, apiGet: mocks.apiGet, apiPost: mocks.apiPost }
 })
 
 import { BasicConfigPanel } from "./BasicConfigPanel"
@@ -22,9 +23,22 @@ const HEALTH = {
   gc: { enabled: true, retention_days: 12, batch_keep: 5 },
 }
 
+const DRY_RUN_REPORT = {
+  dryRun: true,
+  candidates: 2,
+  protected: 7,
+  bytes: 4096,
+  deleted: 0,
+  failed: 0,
+  skipped: 0,
+  retentionDays: 30,
+  batchKeep: 3,
+}
+
 describe("BasicConfigPanel", () => {
   beforeEach(() => {
     mocks.apiGet.mockReset().mockResolvedValue(HEALTH)
+    mocks.apiPost.mockReset()
   })
 
   afterEach(() => {
@@ -85,5 +99,70 @@ describe("BasicConfigPanel", () => {
     expect(await screen.findByText("无法读取运行信息")).toBeTruthy()
     expect(screen.getByText("限流与保留")).toBeTruthy()
     expect(screen.getByText("30 天")).toBeTruthy()
+  })
+
+  it("previews GC candidates and purges only after the second confirmation", async () => {
+    mocks.apiPost.mockResolvedValueOnce(DRY_RUN_REPORT)
+    render(<BasicConfigPanel />)
+    await waitFor(() => expect(screen.getByText("1.2.3")).toBeTruthy())
+
+    fireEvent.click(screen.getByRole("button", { name: "GC dry-run 预览" }))
+    await waitFor(() =>
+      expect(mocks.apiPost).toHaveBeenCalledWith("/api/admin/gc", { dryRun: true, reason: "settings panel" }),
+    )
+    expect(await screen.findByText(/候选 2 个/)).toBeTruthy()
+    expect(screen.getByText(/受保护 7 个/)).toBeTruthy()
+    expect(screen.getByText(/4\.0 KiB/)).toBeTruthy()
+
+    // The execute button only opens the confirmation; it must not purge yet.
+    fireEvent.click(screen.getByRole("button", { name: "执行 GC" }))
+    expect(mocks.apiPost).toHaveBeenCalledTimes(1)
+    expect(screen.getByRole("button", { name: "确认执行" })).toBeTruthy()
+
+    mocks.apiPost.mockResolvedValueOnce({
+      ...DRY_RUN_REPORT,
+      dryRun: false,
+      deleted: 2,
+      candidates: 2,
+    })
+    fireEvent.click(screen.getByRole("button", { name: "确认执行" }))
+    await waitFor(() =>
+      expect(mocks.apiPost).toHaveBeenLastCalledWith("/api/admin/gc", {
+        dryRun: false,
+        reason: "settings panel",
+      }),
+    )
+    expect(await screen.findByText(/已删除 2 个/)).toBeTruthy()
+  })
+
+  it("cancels the second confirmation and shows the disabled error from the API", async () => {
+    mocks.apiPost
+      .mockResolvedValueOnce(DRY_RUN_REPORT)
+      .mockRejectedValueOnce(
+        Object.assign(new Error("evidence GC execution is disabled"), {
+          status: 409,
+          code: "conflict",
+        }),
+      )
+    render(<BasicConfigPanel />)
+
+    fireEvent.click(await screen.findByRole("button", { name: "GC dry-run 预览" }))
+    expect(await screen.findByText(/候选 2 个/)).toBeTruthy()
+
+    fireEvent.click(screen.getByRole("button", { name: "执行 GC" }))
+    fireEvent.click(screen.getByRole("button", { name: "取消" }))
+    expect(screen.queryByRole("button", { name: "确认执行" })).toBeNull()
+
+    fireEvent.click(screen.getByRole("button", { name: "执行 GC" }))
+    fireEvent.click(screen.getByRole("button", { name: "确认执行" }))
+    expect(
+      await screen.findByText(
+        "evidence GC execution is disabled（非 dry-run 需要 EZTEST_GC_ENABLED=true）",
+      ),
+    ).toBeTruthy()
+    expect(mocks.apiPost).toHaveBeenCalledWith("/api/admin/gc", {
+      dryRun: false,
+      reason: "settings panel",
+    })
   })
 })

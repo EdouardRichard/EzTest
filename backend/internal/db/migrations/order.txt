@@ -42,3 +42,4 @@ codeintel_0006_version_change.sql
 quality_0001_eval.sql
 codeintel_0007_fact_review.sql
 version_0006_knowledge.sql
+execution_0004_evidence_purge.sql
