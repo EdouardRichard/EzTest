@@ -566,17 +566,21 @@ try {
             # The P6 execution spec deliberately stops the real executor at its
             # end (executor-down 503 negative), so every spec that needs the
             # executor has to run before it. The default suite therefore runs in
-            # three ordered phases: the existing suite, the P7 suite, and finally
-            # execution.spec.ts (which owns the executor shutdown).
+            # ordered phases: the existing suite, the P8 exploration-chain suite,
+            # the P7 suite, and finally execution.spec.ts (which owns the
+            # executor shutdown).
             $specFiles = @(Get-ChildItem -Path (Join-Path $frontendDir "e2e") -Filter "*.spec.ts" |
                 ForEach-Object { $_.Name })
+            $p8Specs = @($specFiles | Where-Object { $_ -like "p8-*.spec.ts" })
             $p7Specs = @($specFiles | Where-Object { $_ -like "p7-*.spec.ts" })
             $executionSpecs = @($specFiles | Where-Object { $_ -like "*execution.spec.ts" })
             $bulkSpecs = @($specFiles | Where-Object {
-                $_ -notlike "p7-*.spec.ts" -and $_ -notlike "*execution.spec.ts"
+                $_ -notlike "p8-*.spec.ts" -and $_ -notlike "p7-*.spec.ts" -and
+                $_ -notlike "*execution.spec.ts"
             })
             $phases = @(
                 @{ Label = "existing suite (P0-P6)"; Files = $bulkSpecs },
+                @{ Label = "P8 exploration-chain suite"; Files = $p8Specs },
                 @{ Label = "P7 autonomous-loop suite"; Files = $p7Specs },
                 @{ Label = "execution suite (owns the executor shutdown)"; Files = $executionSpecs }
             )
