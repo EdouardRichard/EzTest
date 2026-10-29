@@ -7,14 +7,28 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // ErrGCDisabled is returned for a non-dry-run purge when EZTEST_GC_ENABLED is
 // false. The HTTP layer maps it to 409 conflict. A dry-run is always allowed.
 var ErrGCDisabled = errors.New("execution: evidence GC is disabled; set EZTEST_GC_ENABLED=true")
+
+// GCCandidateLimit bounds one purge run. A run processes at most this many
+// candidates; a large backlog is drained by repeated runs. The limit is echoed
+// in GCReport so callers can tell "done" from "more work remains".
+const GCCandidateLimit = 10000
+
+// gcCleanupTimeout bounds every metadata/file operation after a candidate is
+// marked purged. The context is detached from the request cancellation
+// (context.WithoutCancel) so a disconnected client can never leave a row marked
+// while the artifact still exists, but it stays bounded so a stuck filesystem
+// cannot hang the maintenance loop forever.
+const gcCleanupTimeout = 30 * time.Second
 
 // errGCHashMismatch marks an artifact whose stored bytes no longer match the
 // recorded sha256/size. It is a skip, not a delete: the row stays unpurged for
@@ -43,18 +57,19 @@ type GCRequest struct {
 
 // GCReport is the stable response of one GC run (spec 10.2): candidates and
 // bytes describe the retained set, protected counts the evidence excluded by
-// the protection rules.
+// the protection rules, and candidateLimit is the per-run cap (GCCandidateLimit).
 type GCReport struct {
-	DryRun        bool      `json:"dryRun"`
-	Candidates    int       `json:"candidates"`
-	Protected     int       `json:"protected"`
-	Bytes         int64     `json:"bytes"`
-	Deleted       int       `json:"deleted"`
-	Failed        int       `json:"failed"`
-	Skipped       int       `json:"skipped"`
-	RetentionDays int       `json:"retentionDays"`
-	BatchKeep     int       `json:"batchKeep"`
-	RunAt         time.Time `json:"runAt"`
+	DryRun         bool      `json:"dryRun"`
+	Candidates     int       `json:"candidates"`
+	Protected      int       `json:"protected"`
+	Bytes          int64     `json:"bytes"`
+	Deleted        int       `json:"deleted"`
+	Failed         int       `json:"failed"`
+	Skipped        int       `json:"skipped"`
+	RetentionDays  int       `json:"retentionDays"`
+	BatchKeep      int       `json:"batchKeep"`
+	CandidateLimit int       `json:"candidateLimit"`
+	RunAt          time.Time `json:"runAt"`
 }
 
 // GCRepository is the persistence surface of the evidence GC. The protection
@@ -173,10 +188,11 @@ func (s *GCService) Run(ctx context.Context, req GCRequest) (GCReport, error) {
 	}
 	now := s.clock.Now()
 	report := GCReport{
-		DryRun:        req.DryRun,
-		RetentionDays: s.retentionDays,
-		BatchKeep:     s.batchKeep,
-		RunAt:         now,
+		DryRun:         req.DryRun,
+		RetentionDays:  s.retentionDays,
+		BatchKeep:      s.batchKeep,
+		CandidateLimit: GCCandidateLimit,
+		RunAt:          now,
 	}
 	candidates, err := s.repo.ListCandidates(ctx, s.retentionDays, s.batchKeep)
 	if err != nil {
@@ -231,27 +247,39 @@ func (s *GCService) purgeOne(ctx context.Context, candidate GCEvidence, req GCRe
 		return gcSkipped
 	}
 	if err := s.verifyArtifact(ctx, candidate); err != nil {
-		// A missing/tampered artifact is deliberately not deleted and not
-		// marked: the metadata row stays unpurged for a later investigation.
+		// A missing artifact means the row is already orphaned: nothing can be
+		// deleted and nothing is marked, so the candidate is skipped (not a
+		// failure) and stays for an operator to reconcile. A tampered artifact
+		// is skipped for the same reason. Other read failures are failures.
 		s.logger.WarnContext(ctx, "evidence gc: skipped, artifact verification failed",
 			"evidence_id", candidate.ID, "error", err)
-		if errors.Is(err, errGCHashMismatch) {
+		if errors.Is(err, errGCHashMismatch) || errors.Is(err, fs.ErrNotExist) {
 			return gcSkipped
 		}
 		return gcFailed
 	}
+	// From this point on the row is about to be marked: the metadata/file
+	// operations must complete even when the request was canceled in between.
+	// A bounded detached context guarantees the remove is attempted and, when
+	// it fails, the rollback can still clear purged_at.
+	cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), gcCleanupTimeout)
+	defer cancelCleanup()
 	at := s.clock.Now()
 	reason := s.purgedReason(req)
-	if err := s.repo.MarkPurged(ctx, candidate.ID, at, reason); err != nil {
-		s.logger.ErrorContext(ctx, "evidence gc: mark purged",
+	if err := s.repo.MarkPurged(cleanupCtx, candidate.ID, at, reason); err != nil {
+		s.logger.ErrorContext(cleanupCtx, "evidence gc: mark purged",
 			"evidence_id", candidate.ID, "error", err)
 		return gcFailed
 	}
-	if err := s.files.Remove(ctx, candidate.Path); err != nil {
-		s.logger.ErrorContext(ctx, "evidence gc: remove artifact",
+	if err := s.files.Remove(cleanupCtx, candidate.Path); err != nil {
+		s.logger.ErrorContext(cleanupCtx, "evidence gc: remove artifact",
 			"evidence_id", candidate.ID, "error", err)
-		if rollbackErr := s.repo.RollbackPurged(ctx, candidate.ID, at); rollbackErr != nil {
-			s.logger.ErrorContext(ctx, "evidence gc: rollback purged mark",
+		// A fresh bounded detached context: the remove may have consumed the
+		// first one's deadline, and the rollback must not be skipped.
+		rollbackCtx, cancelRollback := context.WithTimeout(context.WithoutCancel(ctx), gcCleanupTimeout)
+		defer cancelRollback()
+		if rollbackErr := s.repo.RollbackPurged(rollbackCtx, candidate.ID, at); rollbackErr != nil {
+			s.logger.ErrorContext(rollbackCtx, "evidence gc: rollback purged mark",
 				"evidence_id", candidate.ID, "error", rollbackErr)
 		}
 		return gcFailed
@@ -294,28 +322,33 @@ func (s *GCService) purgedReason(req GCRequest) string {
 	return reason
 }
 
-// sanitizeGCReason keeps a short printable note. Operator input never carries
-// paths or secrets into the database/audit log.
+// sanitizeGCReason keeps a short printable note, including non-ASCII
+// (Chinese) text, because operators write reasons in their own language. Line
+// breaks become spaces and non-printable runes become '_'; the note is capped at
+// 120 runes (not bytes) so a multi-byte note is not truncated mid-character.
+// The note stays a bounded free-text field; it never carries paths or secrets by
+// construction because only operator-supplied text reaches it.
 func sanitizeGCReason(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return ""
 	}
 	var builder strings.Builder
+	count := 0
 	for _, r := range raw {
 		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
-			builder.WriteRune(r)
-		case r == ' ', r == '-', r == '_', r == '.', r == ':', r == '/':
-			builder.WriteRune(r)
-		default:
-			builder.WriteRune('_')
+		case r == '\n' || r == '\r' || r == '\t':
+			r = ' '
+		case !unicode.IsPrint(r):
+			r = '_'
 		}
-		if builder.Len() >= 120 {
+		builder.WriteRune(r)
+		count++
+		if count >= 120 {
 			break
 		}
 	}
-	return builder.String()
+	return strings.TrimSpace(builder.String())
 }
 
 // recordAudit appends the single per-run audit entry. Auditing is best effort:

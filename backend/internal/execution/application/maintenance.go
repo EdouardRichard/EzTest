@@ -168,6 +168,7 @@ func (m *DailyMaintenance) RunOnce(ctx context.Context) error {
 		"skipped", report.Skipped,
 		"retention_days", report.RetentionDays,
 		"batch_keep", report.BatchKeep,
+		"candidate_limit", report.CandidateLimit,
 	)
 	return nil
 }
