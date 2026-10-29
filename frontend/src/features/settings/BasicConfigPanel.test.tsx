@@ -67,6 +67,10 @@ describe("BasicConfigPanel", () => {
     expect(screen.getByText("≤ 2.5s")).toBeTruthy()
     expect(screen.getByText(/EZTEST_EVIDENCE_DIR/)).toBeTruthy()
     expect(screen.getByText(/修改环境变量后需重启后端服务/)).toBeTruthy()
+    // Rate limit and GC come from /api/health; the SLO targets and storage
+    // directories are documented defaults and must say so.
+    expect(screen.getAllByText("（默认值）")).toHaveLength(7)
+    expect(screen.getAllByText(/以服务端配置为准/).length).toBeGreaterThanOrEqual(7)
   })
 
   it("renders no form control and no secret material", async () => {

@@ -29,6 +29,8 @@ type ConfigItem = {
   label: string
   value: string
   hint?: string
+  /** True when the panel can only document the default, not read the effective value. */
+  defaultValue?: boolean
 }
 
 type ConfigSection = {
@@ -152,9 +154,24 @@ function configSections(health: Health | null): ConfigSection[] {
       title: "SLO 阈值",
       icon: Gauge,
       items: [
-        { label: "首屏 / 链路 Tab P95", value: "≤ 2.5s", hint: "200 节点 / 400 边" },
-        { label: "代码变更集 API P95", value: "≤ 2s" },
-        { label: "8 并发批次", value: "0 错误" },
+        {
+          label: "首屏 / 链路 Tab P95",
+          value: "≤ 2.5s",
+          hint: "200 节点 / 400 边；默认值，以服务端配置为准",
+          defaultValue: true,
+        },
+        {
+          label: "代码变更集 API P95",
+          value: "≤ 2s",
+          hint: "默认值，以服务端配置为准",
+          defaultValue: true,
+        },
+        {
+          label: "8 并发批次",
+          value: "0 错误",
+          hint: "默认值，以服务端配置为准",
+          defaultValue: true,
+        },
       ],
     },
     {
@@ -164,14 +181,26 @@ function configSections(health: Health | null): ConfigSection[] {
         {
           label: "证据目录",
           value: ".data/evidence",
-          hint: "EZTEST_EVIDENCE_DIR（只读投影，不展示主机绝对路径）",
+          hint: "EZTEST_EVIDENCE_DIR；默认值，以服务端配置为准，不展示主机绝对路径",
+          defaultValue: true,
         },
-        { label: "报告目录", value: ".data/reports", hint: "EZTEST_REPORT_DIR" },
-        { label: "导出目录", value: ".data/exports", hint: "EZTEST_EXPORT_DIR" },
+        {
+          label: "报告目录",
+          value: ".data/reports",
+          hint: "EZTEST_REPORT_DIR；默认值，以服务端配置为准",
+          defaultValue: true,
+        },
+        {
+          label: "导出目录",
+          value: ".data/exports",
+          hint: "EZTEST_EXPORT_DIR；默认值，以服务端配置为准",
+          defaultValue: true,
+        },
         {
           label: "版本附件目录",
           value: ".data/version-attachments",
-          hint: "EZTEST_VERSION_ATTACHMENT_DIR",
+          hint: "EZTEST_VERSION_ATTACHMENT_DIR；默认值，以服务端配置为准",
+          defaultValue: true,
         },
       ],
     },
@@ -298,6 +327,9 @@ export function BasicConfigPanel() {
                     <dt className="text-muted-foreground">{item.label}</dt>
                     <dd className="text-right">
                       <span className="font-medium">{item.value}</span>
+                      {item.defaultValue ? (
+                        <span className="ml-1 text-[11px] text-muted-foreground">（默认值）</span>
+                      ) : null}
                       {item.hint === undefined ? null : (
                         <span className="mt-0.5 block font-mono text-[11px] text-muted-foreground">
                           {item.hint}

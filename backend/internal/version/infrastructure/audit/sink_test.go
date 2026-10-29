@@ -91,6 +91,67 @@ func TestSinkRecordsRequirementEntry(t *testing.T) {
 	}
 }
 
+// TestSinkTracesRequirementEntriesToVersion pins the requirement projection: an
+// entry whose target is the requirement must still carry the owning version id
+// in metadata, so the audit trail stays traceable after the requirement row is
+// deleted (spec §10.4).
+func TestSinkTracesRequirementEntriesToVersion(t *testing.T) {
+	for _, action := range []string{
+		"version.requirement_created",
+		"version.requirement_updated",
+		"version.requirement_deleted",
+	} {
+		t.Run(action, func(t *testing.T) {
+			recorder := &fakeRecorder{}
+			sink := NewSink(recorder)
+
+			err := sink.Record(context.Background(), versionapp.VersionAuditEvent{
+				Action:     action,
+				VersionID:  42,
+				ActorID:    7,
+				TargetType: "requirement",
+				TargetID:   "77",
+				Metadata:   map[string]any{"status": "draft", "revision": 3},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(recorder.entries) != 1 {
+				t.Fatalf("entries=%d want 1", len(recorder.entries))
+			}
+			entry := recorder.entries[0]
+			if entry.TargetType != "requirement" || entry.TargetID != "77" {
+				t.Fatalf("target=%q/%q want requirement/77", entry.TargetType, entry.TargetID)
+			}
+			if entry.Metadata["version_id"] != int64(42) {
+				t.Fatalf("metadata=%v want version_id=42", entry.Metadata)
+			}
+			if entry.Metadata["status"] != "draft" || entry.Metadata["revision"] != 3 {
+				t.Fatalf("caller metadata lost: %v", entry.Metadata)
+			}
+		})
+	}
+}
+
+// TestSinkKeepsExplicitVersionIDMetadata proves the sink never overwrites a
+// version_id the caller already supplied.
+func TestSinkKeepsExplicitVersionIDMetadata(t *testing.T) {
+	recorder := &fakeRecorder{}
+	err := NewSink(recorder).Record(context.Background(), versionapp.VersionAuditEvent{
+		Action:     "version.requirement_created",
+		VersionID:  42,
+		TargetType: "requirement",
+		TargetID:   "77",
+		Metadata:   map[string]any{"version_id": int64(99)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := recorder.entries[0].Metadata["version_id"]; got != int64(99) {
+		t.Fatalf("version_id=%v want caller value 99", got)
+	}
+}
+
 // TestSinkFailureAndDisabledContract pins the best-effort contract and the nil
 // recorder no-op used by tests and partially wired processes.
 func TestSinkFailureAndDisabledContract(t *testing.T) {

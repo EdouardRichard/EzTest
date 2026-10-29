@@ -3,12 +3,16 @@ package application_test
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/mindmap/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/mindmap/domain"
 )
+
+// graphInt64Text renders an id the way audit target ids are stored.
+func graphInt64Text(id int64) string { return strconv.FormatInt(id, 10) }
 
 // TestGraphWritesAreAudited pins the mindmap audit coverage (spec §10.4): every
 // successful manual graph write records one entry naming the version and node
@@ -52,11 +56,16 @@ func TestGraphWritesAreAudited(t *testing.T) {
 		action     string
 		changed    string
 		targetType string
+		targetID   string
+		revision   int
 	}{
-		{action: "mindmap.case_created", targetType: "case_node"},
-		{action: "mindmap.case_updated", targetType: "case_node"},
-		{action: "mindmap.steps_updated", targetType: "case_node"},
-		{action: "mindmap.case_deleted", targetType: "case_node"},
+		{action: "mindmap.case_created", targetType: "case_node", targetID: graphInt64Text(created.ID), revision: created.Revision},
+		{action: "mindmap.case_updated", targetType: "case_node", targetID: graphInt64Text(updated.ID), revision: updated.Revision},
+		// The child-collection write bumps the node revision inside the
+		// transaction: the audit entry must name the post-write revision (3),
+		// not the pre-write revision read into eventNode (2).
+		{action: "mindmap.steps_updated", targetType: "case_node", targetID: graphInt64Text(created.ID), revision: updated.Revision + 1},
+		{action: "mindmap.case_deleted", targetType: "case_node", targetID: graphInt64Text(scenario.ID), revision: scenario.Revision},
 	}
 	if len(fixture.audits) != len(want) {
 		t.Fatalf("audit events=%d want %d: %+v", len(fixture.audits), len(want), fixture.audits)
@@ -66,14 +75,18 @@ func TestGraphWritesAreAudited(t *testing.T) {
 		if event.Action != expected.action {
 			t.Fatalf("audits[%d].Action=%q want %q", i, event.Action, expected.action)
 		}
-		if event.TargetType != expected.targetType || event.TargetID == "" {
-			t.Fatalf("%s target=%q/%q want %s/<id>", expected.action, event.TargetType, event.TargetID, expected.targetType)
+		if event.TargetType != expected.targetType || event.TargetID != expected.targetID {
+			t.Fatalf("%s target=%q/%q want %s/%s",
+				expected.action, event.TargetType, event.TargetID, expected.targetType, expected.targetID)
 		}
 		if event.ActorID != 42 {
 			t.Fatalf("%s actor=%d want 42", expected.action, event.ActorID)
 		}
 		if event.Metadata["version_id"] != int64(1) {
 			t.Fatalf("%s metadata=%v want version_id=1", expected.action, event.Metadata)
+		}
+		if event.Metadata["revision"] != expected.revision {
+			t.Fatalf("%s revision=%v want %d", expected.action, event.Metadata["revision"], expected.revision)
 		}
 	}
 	if fixture.audits[0].Metadata["kind"] != domain.NodeKindCase {
