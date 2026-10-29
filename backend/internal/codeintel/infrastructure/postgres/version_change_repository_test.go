@@ -159,6 +159,12 @@ func TestVersionChangeRepositorySQLPinsUniqueUpsert(t *testing.T) {
 		"FROM run_batch",
 		"version_id = $1",
 		"ORDER BY batch_no, id",
+		// The batch head is analysis-ready only when a done codeintel analysis of
+		// the same version targets that head; this is the read-time provisional
+		// gate (schema: code_analysis, same context, no cross-context table).
+		"FROM code_analysis",
+		"head_commit = run_batch.head_commit",
+		"status = 'done'",
 	} {
 		if !strings.Contains(listVersionBatchesSQL, needle) {
 			t.Fatalf("batch SQL does not contain %q: %s", needle, listVersionBatchesSQL)

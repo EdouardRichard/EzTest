@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
@@ -39,7 +40,8 @@ type VersionChangeNotifier interface {
 
 // VersionChangeServiceDeps are the ports of the version-change snapshot use
 // case. Changes is the snapshot repository doubled as the read-only run_batch
-// projection; Notifier may be nil (publishing disabled).
+// projection; Notifier may be nil (publishing disabled) and Logger defaults to
+// slog.Default (publish/diff failures are logged, never silently swallowed).
 type VersionChangeServiceDeps struct {
 	Git      GitReader
 	Repos    RepoCatalog
@@ -50,6 +52,7 @@ type VersionChangeServiceDeps struct {
 	Notifier VersionChangeNotifier
 	IDs      IDGenerator
 	Clock    Clock
+	Logger   *slog.Logger
 }
 
 // VersionChangeService derives, persists and reads per-batch change snapshots.
@@ -70,12 +73,26 @@ type VersionChangeTimelineEntry struct {
 	BatchNo     int
 	BatchStatus string
 	BatchKind   string
+	// Provisional reports a snapshot that was computed for display but not
+	// persisted because the batch head has no analysis mapping data yet. It is
+	// recomputed on every read, so the pre-analysis "everything unmapped"
+	// verdict never becomes durable. No code.changed event is published.
+	Provisional bool
+	// Unavailable reports a batch whose deterministic diff could not be
+	// computed. The rest of the timeline is still served, so one broken batch
+	// never fails the whole code tab.
+	Unavailable bool
 }
 
-// Timeline returns the version's batch snapshots ordered Batch 1→N. Missing
-// snapshots are computed and upserted idempotently at read time (D58 fallback),
-// so repeated reads never duplicate rows, re-run the same diff or re-publish the
-// event. A version without a code repository yields an empty, non-nil list.
+// Timeline returns the version's batch snapshots ordered Batch 1→N. A missing
+// snapshot is persisted and announced only after the batch head is analysis-ready
+// (a done analysis targets it, or an AI fact was produced for it); before that
+// the entry is provisional: computed for display, recomputed on every read and
+// never upserted, so the pre-analysis "everything unmapped" verdict cannot be
+// frozen. Once persisted, repeated reads reuse the row without re-running the
+// diff or re-publishing code.changed. A single broken batch diff degrades only
+// that entry (unavailable) instead of failing the whole read. A version without
+// a code repository yields an empty, non-nil list.
 func (s *VersionChangeService) Timeline(ctx context.Context, versionID int64) ([]VersionChangeTimelineEntry, error) {
 	if s == nil || s.deps.Versions == nil || s.deps.Changes == nil {
 		return []VersionChangeTimelineEntry{}, nil
@@ -106,7 +123,7 @@ func (s *VersionChangeService) Timeline(ctx context.Context, versionID int64) ([
 	repoLoaded := false
 	for _, batch := range batches {
 		if change, ok := storedByBatch[batch.ID]; ok {
-			entries = append(entries, versionChangeEntry(change, batch))
+			entries = append(entries, versionChangeEntry(change, batch, false, false))
 			continue
 		}
 		head := strings.TrimSpace(batch.HeadCommit)
@@ -132,15 +149,37 @@ func (s *VersionChangeService) Timeline(ctx context.Context, versionID int64) ([
 		}
 		diff, err := s.deps.Git.Diff(ctx, repo.LocalPath, base, head)
 		if err != nil {
-			return nil, err
+			// One broken batch must not 503 the whole tab: mark it unavailable,
+			// keep the other batches, and leave a log trail. Nothing is persisted
+			// or published for it, so a later read retries the diff.
+			s.logger().Warn("codeintel: version_change batch diff unavailable",
+				"versionId", versionID, "batchId", batch.ID,
+				"baseCommit", base, "headCommit", head, "error", err)
+			change := domain.VersionChange{
+				VersionID:        versionID,
+				BatchID:          batch.ID,
+				BaseCommit:       base,
+				HeadCommit:       head,
+				HistoryRewritten: batch.BaseFallbackReason == domain.BaseFallbackHistoryRewritten,
+				ComputedAt:       s.now(),
+			}
+			entries = append(entries, versionChangeEntry(change, batch, false, true))
+			continue
 		}
-		change, err := s.buildSnapshot(ctx, versionID, repo.ID, batch, base, head, diff)
+		change, factsAvailable, err := s.buildSnapshot(ctx, versionID, repo.ID, batch, base, head, diff)
 		if err != nil {
 			return nil, err
 		}
 		change.VersionID = versionID
 		change.BatchID = batch.ID
 		change.ComputedAt = s.now()
+		if !s.analysisReady(batch, diff, factsAvailable) {
+			// Do not persist a pre-analysis snapshot: it would be frozen by the
+			// (version_id, batch_id) unique key and never repaired after the
+			// analysis produces the mapping facts.
+			entries = append(entries, versionChangeEntry(change, batch, true, false))
+			continue
+		}
 		if s.deps.IDs != nil {
 			change.ID = s.deps.IDs.Next()
 		}
@@ -151,7 +190,7 @@ func (s *VersionChangeService) Timeline(ctx context.Context, versionID int64) ([
 		if created {
 			s.publish(ctx, versionID, storedChange)
 		}
-		entries = append(entries, versionChangeEntry(storedChange, batch))
+		entries = append(entries, versionChangeEntry(storedChange, batch, false, false))
 	}
 
 	sort.SliceStable(entries, func(i, j int) bool {
@@ -165,8 +204,10 @@ func (s *VersionChangeService) Timeline(ctx context.Context, versionID int64) ([
 
 // buildSnapshot summarises one deterministic change set into the per-batch
 // snapshot. Items are path-ordered file summaries; coverage follows the P4
-// INV-8 rule (any verified AI fact or code anchor covers a changed file).
-func (s *VersionChangeService) buildSnapshot(ctx context.Context, versionID, repoID int64, batch domain.VersionBatch, base, head string, diff domain.ChangeSetData) (domain.VersionChange, error) {
+// INV-8 rule (any verified AI fact or code anchor covers a changed file). The
+// bool reports whether at least one verified AI fact exists for the changed
+// paths at the batch head, i.e. the analysis has produced mapping data.
+func (s *VersionChangeService) buildSnapshot(ctx context.Context, versionID, repoID int64, batch domain.VersionBatch, base, head string, diff domain.ChangeSetData) (domain.VersionChange, bool, error) {
 	files := append([]domain.ChangedFile(nil), diff.Files...)
 	sort.SliceStable(files, func(i, j int) bool { return files[i].Path < files[j].Path })
 	paths := make([]string, 0, len(files))
@@ -180,7 +221,7 @@ func (s *VersionChangeService) buildSnapshot(ctx context.Context, versionID, rep
 	if s.deps.Entities != nil && len(paths) > 0 {
 		loaded, err := s.deps.Entities.ListByPaths(ctx, repoID, head, paths)
 		if err != nil {
-			return domain.VersionChange{}, err
+			return domain.VersionChange{}, false, err
 		}
 		entities = loaded
 	}
@@ -188,13 +229,14 @@ func (s *VersionChangeService) buildSnapshot(ctx context.Context, versionID, rep
 	if s.deps.Anchors != nil && len(paths) > 0 {
 		loaded, err := s.deps.Anchors.ListByPaths(ctx, versionID, paths)
 		if err != nil {
-			return domain.VersionChange{}, err
+			return domain.VersionChange{}, false, err
 		}
 		anchors = loaded
 	}
 
 	covered := make(map[string]struct{}, len(paths))
 	subjectsByPath := make(map[string][]domain.VersionChangeSubject)
+	factsAvailable := false
 	for _, entity := range entities {
 		if entity.Path == "" {
 			continue
@@ -202,6 +244,7 @@ func (s *VersionChangeService) buildSnapshot(ctx context.Context, versionID, rep
 		// Coverage mirrors impactCoverageFacts: only a verified AI fact proves
 		// the file was analysed (the T0 file entity never does).
 		if isImpactFactKind(entity.Kind) && impactFactHasVerifiedEvidence(entity) {
+			factsAvailable = true
 			covered[entity.Path] = struct{}{}
 			for _, evidence := range entity.Evidence {
 				if evidence.File != "" {
@@ -280,42 +323,72 @@ func (s *VersionChangeService) buildSnapshot(ctx context.Context, versionID, rep
 		ImpactedCases:    len(impacted),
 		UnmappedCount:    unmapped,
 		Items:            items,
-	}, nil
+	}, factsAvailable, nil
+}
+
+// analysisReady reports whether a missing batch snapshot may be persisted. A
+// batch without changed files has nothing to map and is always ready. Otherwise
+// the batch head must either have a terminal analysis targeting it
+// (batch.HeadAnalysed) or have produced at least one verified AI fact for its
+// changed paths. Mere T0 index completion is deliberately not enough: that is
+// exactly the pre-analysis window in which every file would be frozen as
+// unmapped.
+func (s *VersionChangeService) analysisReady(batch domain.VersionBatch, diff domain.ChangeSetData, factsAvailable bool) bool {
+	if len(diff.Files) == 0 {
+		return true
+	}
+	return batch.HeadAnalysed || factsAvailable
 }
 
 // publish emits the summary-only code.changed event for one created snapshot.
 // Publishing failures never fail the read: the persisted row stays authoritative
-// and the next reader reuses it.
+// and the next reader reuses it. The failure is logged with the batch identity
+// (instead of being silently swallowed) so a broken event bus is observable.
 func (s *VersionChangeService) publish(ctx context.Context, versionID int64, change domain.VersionChange) {
 	if s.deps.Notifier == nil {
 		return
 	}
-	_ = s.deps.Notifier.VersionChanged(ctx, versionID, VersionChangeEvent{
+	if err := s.deps.Notifier.VersionChanged(ctx, versionID, VersionChangeEvent{
 		BatchID:          change.BatchID,
 		BaseCommit:       change.BaseCommit,
 		HeadCommit:       change.HeadCommit,
 		ChangedFiles:     change.ChangedFiles,
 		ImpactedCases:    change.ImpactedCases,
 		HistoryRewritten: change.HistoryRewritten,
-	})
+	}); err != nil {
+		s.logger().Error("codeintel: version_change code.changed publish failed",
+			"versionId", versionID, "batchId", change.BatchID, "error", err)
+	}
 }
 
-// now returns the injected clock reading, or the zero time when no clock is
-// wired (partially wired tests use the repository default instead).
+// now returns the injected clock reading. Without a clock (partially wired
+// process or test) it falls back to the wall clock so computed_at is never the
+// year-1 zero time.
 func (s *VersionChangeService) now() time.Time {
 	if s.deps.Clock == nil {
-		return time.Time{}
+		return time.Now().UTC()
 	}
 	return s.deps.Clock.Now()
 }
 
-// versionChangeEntry attaches the run_batch identity to one stored snapshot.
-func versionChangeEntry(change domain.VersionChange, batch domain.VersionBatch) VersionChangeTimelineEntry {
+// logger returns the injected logger or the process default.
+func (s *VersionChangeService) logger() *slog.Logger {
+	if s.deps.Logger != nil {
+		return s.deps.Logger
+	}
+	return slog.Default()
+}
+
+// versionChangeEntry attaches the run_batch identity to one snapshot and the
+// additive degraded flags the UI needs (provisional / unavailable).
+func versionChangeEntry(change domain.VersionChange, batch domain.VersionBatch, provisional, unavailable bool) VersionChangeTimelineEntry {
 	return VersionChangeTimelineEntry{
 		Change:      change,
 		BatchNo:     batch.BatchNo,
 		BatchStatus: batch.Status,
 		BatchKind:   batch.Kind,
+		Provisional: provisional,
+		Unavailable: unavailable,
 	}
 }
 

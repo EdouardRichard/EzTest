@@ -1,19 +1,25 @@
 package application
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
 )
 
-// version_change_service_test.go pins the P8 搂4.2/搂7.2 version_change snapshot
+// version_change_service_test.go pins the P8 §4.2/§7.2 version_change snapshot
 // contract: one snapshot per (version, batch), generated at read time when an
 // older process did not persist it, upserted idempotently, summarised without
-// any code body, and announced once through the code.changed notifier.
+// any code body, and announced once through the code.changed notifier. A batch
+// whose head has no analysis mapping data yet is provisional: it is recomputed
+// on every read but never persisted, so a pre-analysis all-unmapped snapshot can
+// never be frozen (bug fix round 1).
 
 const (
 	vcCommitA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -367,6 +373,11 @@ func TestVersionChangeTimelineRepeatedReadsAreIdempotent(t *testing.T) {
 	f.git.diffs[vcDiffKey(vcCommitA, vcCommitB)] = domain.ChangeSetData{Files: []domain.ChangedFile{
 		{Path: "src/api/refund.ts", Status: "M", HeadBlobHash: "git-sha1:refund"},
 	}}
+	// An analysis fact at the batch head makes the batch ready to persist; the
+	// provisional rule is covered by its own test.
+	f.entities.byCommit[vcCommitB] = map[string][]domain.CodeEntity{
+		"src/api/refund.ts": {vcEvidenceFact(domain.KindAPI, "POST /api/refund", "src/api/refund.ts")},
+	}
 
 	for attempt := 1; attempt <= 2; attempt++ {
 		entries, err := f.svc.Timeline(context.Background(), 9)
@@ -415,7 +426,7 @@ func TestVersionChangeTimelineNoRepositoryIsEmpty(t *testing.T) {
 	}
 }
 
-// TestVersionChangeTimelineNoChangedFilesIsEmptySnapshot pins the "鏈壒鏃犱唬鐮佸彉鏇?
+// TestVersionChangeTimelineNoChangedFilesIsEmptySnapshot pins the "本批无代码变更"
 // state: a batch whose base..head range has no file change still gets a durable
 // zero-count snapshot (so repeated reads stay cheap) and publishes no error.
 func TestVersionChangeTimelineNoChangedFilesIsEmptySnapshot(t *testing.T) {
@@ -470,22 +481,223 @@ func TestVersionChangeTimelineSkipsBatchesWithoutHead(t *testing.T) {
 	}
 }
 
-// TestVersionChangeTimelinePropagatesOperationalFailures pins that a real Git
-// failure is surfaced instead of silently rendering an empty timeline.
-func TestVersionChangeTimelinePropagatesOperationalFailures(t *testing.T) {
+// TestVersionChangeTimelineMarksOnlyFailedBatchUnavailable pins the degraded
+// read: one batch whose deterministic diff cannot be computed is marked
+// unavailable and logged, while the remaining batches keep their snapshots. A
+// single broken batch must never 503 the whole code tab.
+func TestVersionChangeTimelineMarksOnlyFailedBatchUnavailable(t *testing.T) {
+	f := newVersionChangeFixture(t)
+	var logs bytes.Buffer
+	f.svc.deps.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+	f.store.batches = []domain.VersionBatch{
+		{ID: 11, VersionID: 9, BatchNo: 1, Status: "done", HeadCommit: vcCommitB},
+		{ID: 12, VersionID: 9, BatchNo: 2, Status: "done",
+			CodeBaselineCommit: vcCommitB, HeadCommit: vcCommitC, HeadAnalysed: true},
+	}
+	wantErr := errors.New("git diff failed")
+	f.git.errs[vcDiffKey(vcCommitA, vcCommitB)] = wantErr
+	f.git.diffs[vcDiffKey(vcCommitB, vcCommitC)] = domain.ChangeSetData{Files: []domain.ChangedFile{
+		{Path: "src/api/refund.ts", Status: "M", HeadBlobHash: "git-sha1:refund"},
+	}}
+
+	entries, err := f.svc.Timeline(context.Background(), 9)
+	if err != nil {
+		t.Fatalf("Timeline: %v, want a degraded timeline, not a failure", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("timeline entries = %d, want both batches", len(entries))
+	}
+	unavailable := entries[0]
+	if !unavailable.Unavailable || unavailable.Provisional {
+		t.Fatalf("failed batch = %+v, want unavailable and not provisional", unavailable)
+	}
+	if unavailable.Change.BatchID != 11 || unavailable.Change.BaseCommit != vcCommitA ||
+		unavailable.Change.HeadCommit != vcCommitB || len(unavailable.Change.Items) != 0 {
+		t.Fatalf("unavailable entry = %+v, want the batch range and no items", unavailable)
+	}
+	ready := entries[1]
+	if ready.Unavailable || ready.Provisional {
+		t.Fatalf("healthy batch = %+v, want a persisted snapshot", ready)
+	}
+	if len(f.store.upserts) != 1 || f.store.upserts[0].BatchID != 12 {
+		t.Fatalf("upserts = %+v, want only batch 12", f.store.upserts)
+	}
+	if len(f.notifier.events) != 1 || f.notifier.events[0].BatchID != 12 {
+		t.Fatalf("events = %+v, want only batch 12", f.notifier.events)
+	}
+	if !strings.Contains(logs.String(), "diff unavailable") || !strings.Contains(logs.String(), "git diff failed") {
+		t.Fatalf("log = %q, want the batch diff failure", logs.String())
+	}
+}
+
+// TestVersionChangeTimelineIsProvisionalUntilAnalysisReady pins the fix for the
+// frozen pre-analysis snapshot: before any AI fact exists at the batch head the
+// timeline is computed and returned with provisional=true, but nothing is
+// persisted and no code.changed event is published; once the analysis produces a
+// fact the same read persists the snapshot once and later reads reuse it.
+func TestVersionChangeTimelineIsProvisionalUntilAnalysisReady(t *testing.T) {
 	f := newVersionChangeFixture(t)
 	f.store.batches = []domain.VersionBatch{
 		{ID: 11, VersionID: 9, BatchNo: 1, Status: "done", HeadCommit: vcCommitB},
 	}
-	wantErr := errors.New("git diff failed")
-	f.git.errs[vcDiffKey(vcCommitA, vcCommitB)] = wantErr
+	f.git.diffs[vcDiffKey(vcCommitA, vcCommitB)] = domain.ChangeSetData{Files: []domain.ChangedFile{
+		{Path: "src/api/refund.ts", Status: "M", HeadBlobHash: "git-sha1:refund"},
+		{Path: "src/unmapped.ts", Status: "A", HeadBlobHash: "git-sha1:unmapped"},
+	}}
 
-	if _, err := f.svc.Timeline(context.Background(), 9); !errors.Is(err, wantErr) {
-		t.Fatalf("Timeline error = %v, want the git failure", err)
+	for attempt := 1; attempt <= 2; attempt++ {
+		entries, err := f.svc.Timeline(context.Background(), 9)
+		if err != nil {
+			t.Fatalf("Timeline (provisional read %d): %v", attempt, err)
+		}
+		if len(entries) != 1 || !entries[0].Provisional || entries[0].Unavailable {
+			t.Fatalf("provisional read %d = %+v, want one provisional entry", attempt, entries)
+		}
+		if entries[0].Change.BatchID != 11 || entries[0].Change.VersionID != 9 ||
+			entries[0].Change.HeadCommit != vcCommitB {
+			t.Fatalf("provisional entry = %+v, want the batch identity", entries[0])
+		}
+		if len(entries[0].Change.Items) != 2 || entries[0].Change.ChangedFiles != 2 {
+			t.Fatalf("provisional snapshot = %+v, want the computed file shell", entries[0].Change)
+		}
+		if entries[0].Change.ComputedAt.IsZero() {
+			t.Fatal("provisional computedAt is zero, want the clock reading")
+		}
+		if len(f.store.upserts) != 0 || len(f.store.changes) != 0 {
+			t.Fatalf("provisional reads wrote %d upserts and %d rows, want none",
+				len(f.store.upserts), len(f.store.changes))
+		}
+		if len(f.notifier.events) != 0 {
+			t.Fatalf("provisional reads published %d events, want none", len(f.notifier.events))
+		}
 	}
-	if len(f.store.upserts) != 0 || len(f.notifier.events) != 0 {
-		t.Fatalf("failed generation wrote %d snapshots and %d events, want none",
-			len(f.store.upserts), len(f.notifier.events))
+	if len(f.git.calls) != 2 {
+		t.Fatalf("git diff calls = %d, want one per provisional read", len(f.git.calls))
+	}
+
+	// The analysis completes and writes one fact for the changed API file.
+	f.entities.byCommit[vcCommitB] = map[string][]domain.CodeEntity{
+		"src/api/refund.ts": {vcEvidenceFact(domain.KindAPI, "POST /api/refund", "src/api/refund.ts")},
+	}
+
+	entries, err := f.svc.Timeline(context.Background(), 9)
+	if err != nil {
+		t.Fatalf("Timeline (ready read): %v", err)
+	}
+	if len(entries) != 1 || entries[0].Provisional || entries[0].Unavailable {
+		t.Fatalf("ready read = %+v, want one persisted entry", entries)
+	}
+	if entries[0].Change.ID == 0 || entries[0].Change.UnmappedCount != 1 {
+		t.Fatalf("persisted snapshot = %+v, want an id and one unmapped file", entries[0].Change)
+	}
+	if len(f.store.upserts) != 1 || len(f.store.changes) != 1 {
+		t.Fatalf("ready read wrote %d upserts / %d rows, want exactly one",
+			len(f.store.upserts), len(f.store.changes))
+	}
+	if len(f.notifier.events) != 1 || f.notifier.events[0].BatchID != 11 {
+		t.Fatalf("events = %+v, want one batch-11 event on first persistence", f.notifier.events)
+	}
+
+	// Repeated reads reuse the durable snapshot: no diff, upsert or event.
+	before := len(f.git.calls)
+	entries, err = f.svc.Timeline(context.Background(), 9)
+	if err != nil {
+		t.Fatalf("Timeline (idempotent read): %v", err)
+	}
+	if len(entries) != 1 || entries[0].Provisional {
+		t.Fatalf("idempotent read = %+v", entries)
+	}
+	if len(f.git.calls) != before || len(f.store.upserts) != 1 || len(f.notifier.events) != 1 {
+		t.Fatalf("idempotent read recomputed: git %d, upserts %d, events %d",
+			len(f.git.calls), len(f.store.upserts), len(f.notifier.events))
+	}
+}
+
+// TestVersionChangeTimelineTerminalAnalysisWithoutFactsIsReady pins the
+// zero-fact terminal analysis case: a done analysis of the batch head is enough
+// to persist the snapshot even when every file legitimately has no AI fact
+// (degraded analysis), instead of staying provisional forever.
+func TestVersionChangeTimelineTerminalAnalysisWithoutFactsIsReady(t *testing.T) {
+	f := newVersionChangeFixture(t)
+	f.store.batches = []domain.VersionBatch{
+		{ID: 11, VersionID: 9, BatchNo: 1, Status: "done", HeadCommit: vcCommitB, HeadAnalysed: true},
+	}
+	f.git.diffs[vcDiffKey(vcCommitA, vcCommitB)] = domain.ChangeSetData{Files: []domain.ChangedFile{
+		{Path: "src/generated/config.ts", Status: "M", HeadBlobHash: "git-sha1:config"},
+	}}
+
+	entries, err := f.svc.Timeline(context.Background(), 9)
+	if err != nil {
+		t.Fatalf("Timeline: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Provisional || entries[0].Unavailable {
+		t.Fatalf("timeline = %+v, want a persisted snapshot for a terminal analysis", entries)
+	}
+	if entries[0].Change.UnmappedCount != 1 {
+		t.Fatalf("snapshot = %+v, want the file unmapped", entries[0].Change)
+	}
+	if len(f.store.upserts) != 1 || len(f.notifier.events) != 1 {
+		t.Fatalf("upserts/events = %d/%d, want 1/1", len(f.store.upserts), len(f.notifier.events))
+	}
+}
+
+// TestVersionChangeTimelinePublishFailureIsLoggedNotFatal pins the event
+// failure rule: the snapshot row stays authoritative and the read succeeds, but
+// the swallowed publish error is logged with the batch identity.
+func TestVersionChangeTimelinePublishFailureIsLoggedNotFatal(t *testing.T) {
+	f := newVersionChangeFixture(t)
+	var logs bytes.Buffer
+	f.svc.deps.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+	f.notifier.err = errors.New("event bus down")
+	f.store.batches = []domain.VersionBatch{
+		{ID: 11, VersionID: 9, BatchNo: 1, Status: "done", HeadCommit: vcCommitB, HeadAnalysed: true},
+	}
+	f.git.diffs[vcDiffKey(vcCommitA, vcCommitB)] = domain.ChangeSetData{Files: []domain.ChangedFile{
+		{Path: "src/api/refund.ts", Status: "M", HeadBlobHash: "git-sha1:refund"},
+	}}
+
+	entries, err := f.svc.Timeline(context.Background(), 9)
+	if err != nil {
+		t.Fatalf("Timeline: %v, want the publish failure not to fail the read", err)
+	}
+	if len(entries) != 1 || entries[0].Provisional || entries[0].Unavailable {
+		t.Fatalf("timeline = %+v, want the persisted entry", entries)
+	}
+	if len(f.store.changes) != 1 {
+		t.Fatalf("stored snapshots = %d, want the row to stay authoritative", len(f.store.changes))
+	}
+	if len(f.notifier.events) != 1 {
+		t.Fatalf("publish attempts = %d, want one", len(f.notifier.events))
+	}
+	if !strings.Contains(logs.String(), "code.changed publish failed") ||
+		!strings.Contains(logs.String(), "event bus down") ||
+		!strings.Contains(logs.String(), "batchId=11") {
+		t.Fatalf("log = %q, want the publish failure and batch id", logs.String())
+	}
+}
+
+// TestVersionChangeTimelineDefaultsComputedAtWithoutClock pins the clock
+// fallback: a partially wired service (nil Clock) still records a real
+// computed_at instead of the year-1 zero time.
+func TestVersionChangeTimelineDefaultsComputedAtWithoutClock(t *testing.T) {
+	f := newVersionChangeFixture(t)
+	f.svc.deps.Clock = nil
+	f.store.batches = []domain.VersionBatch{
+		{ID: 11, VersionID: 9, BatchNo: 1, Status: "done", HeadCommit: vcCommitB, HeadAnalysed: true},
+	}
+	f.git.diffs[vcDiffKey(vcCommitA, vcCommitB)] = domain.ChangeSetData{Files: []domain.ChangedFile{
+		{Path: "src/api/refund.ts", Status: "M", HeadBlobHash: "git-sha1:refund"},
+	}}
+
+	if _, err := f.svc.Timeline(context.Background(), 9); err != nil {
+		t.Fatalf("Timeline: %v", err)
+	}
+	if len(f.store.upserts) != 1 {
+		t.Fatalf("upserts = %d, want 1", len(f.store.upserts))
+	}
+	computedAt := f.store.upserts[0].ComputedAt
+	if computedAt.IsZero() || computedAt.Year() < 2020 {
+		t.Fatalf("computedAt = %v, want the current clock reading", computedAt)
 	}
 }
 

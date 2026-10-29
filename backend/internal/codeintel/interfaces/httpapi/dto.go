@@ -156,7 +156,10 @@ type VersionChangeItemDTO struct {
 // VersionChangeDTO is one batchTimeline entry (design spec §7.2/D58): the batch
 // identity, its commit range, the counters and the summary items. batchId is a
 // decimal string (D29); batchNo/status come from the read-time run_batch
-// projection.
+// projection. Provisional marks a computed-but-not-persisted pre-analysis entry
+// (the UI must not present its coverage verdict as final); Unavailable marks a
+// batch whose diff failed, served as a degraded entry instead of failing the
+// whole change list.
 type VersionChangeDTO struct {
 	BatchID          string                 `json:"batchId"`
 	BatchNo          int                    `json:"batchNo"`
@@ -169,6 +172,8 @@ type VersionChangeDTO struct {
 	UnmappedCount    int                    `json:"unmappedCount"`
 	Items            []VersionChangeItemDTO `json:"items"`
 	ComputedAt       time.Time              `json:"computedAt"`
+	Provisional      bool                   `json:"provisional"`
+	Unavailable      bool                   `json:"unavailable"`
 }
 
 // VersionChangesDTO is the additive P8 body of GET
@@ -565,6 +570,8 @@ func newVersionChangeDTO(entry application.VersionChangeTimelineEntry) VersionCh
 		UnmappedCount:    change.UnmappedCount,
 		Items:            items,
 		ComputedAt:       change.ComputedAt,
+		Provisional:      entry.Provisional,
+		Unavailable:      entry.Unavailable,
 	}
 }
 

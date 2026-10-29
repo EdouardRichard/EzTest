@@ -462,6 +462,84 @@ describe("CodeChangesTab", () => {
     // D49 history rewrite marker and the per-batch empty state.
     expect(timeline.textContent).toContain("历史重写")
     expect(timeline.textContent).toContain("本批无代码变更")
+    // DOM order: Batch 1 is rendered before Batch 2 (spec §7.2 Batch 1→N).
+    const renderedOrder = Array.from(
+      timeline.querySelectorAll('[data-testid^="batch-timeline-"]'),
+    ).map((node) => node.getAttribute("data-testid"))
+    expect(renderedOrder).toEqual(["batch-timeline-701", "batch-timeline-702"])
+  })
+
+  it("marks a provisionally computed batch as mapping in progress, never as unmapped", async () => {
+    const provisional: VersionChangeBatch = {
+      batchId: "801",
+      batchNo: 1,
+      batchStatus: "done",
+      baseCommit: BASE,
+      headCommit: HEAD,
+      historyRewritten: false,
+      changedFiles: 2,
+      impactedCases: 0,
+      unmappedCount: 2,
+      provisional: true,
+      computedAt: "2026-10-29T06:00:00Z",
+      items: [
+        {
+          file: "src/api/refund.ts",
+          changeKind: "modified",
+          subjects: [],
+          caseIds: [],
+          unmapped: true,
+        },
+        {
+          file: "src/new/checkout.ts",
+          changeKind: "added",
+          subjects: [],
+          caseIds: [],
+          unmapped: true,
+        },
+      ],
+    }
+    mockReady({ changes: changesFixture({ batchTimeline: [provisional] }) })
+
+    renderTab()
+
+    const timeline = await screen.findByTestId("code-batch-timeline")
+    const hint = await screen.findByTestId("batch-provisional-801")
+    expect(hint.textContent).toContain("映射生成中")
+    expect(timeline.textContent).toContain("映射生成中")
+    // The pre-analysis coverage verdict is not a real unmapped verdict: do not
+    // render the misleading per-item badge, counter or the unmapped section.
+    expect(screen.queryByTestId("batch-unmapped-801")).toBeNull()
+    expect(timeline.textContent).not.toContain("未映射 2")
+    expect(timeline.querySelectorAll("[data-unmapped-file]").length).toBe(0)
+    // The changed-file shell (path + kind) is still visible.
+    expect(timeline.textContent).toContain("src/api/refund.ts")
+    expect(timeline.textContent).toContain("src/new/checkout.ts")
+  })
+
+  it("renders a single unavailable batch without failing the whole timeline", async () => {
+    const unavailable: VersionChangeBatch = {
+      batchId: "802",
+      batchNo: 2,
+      batchStatus: "done",
+      baseCommit: BASE,
+      headCommit: HEAD,
+      historyRewritten: false,
+      changedFiles: 0,
+      impactedCases: 0,
+      unmappedCount: 0,
+      unavailable: true,
+      computedAt: "2026-10-29T06:30:00Z",
+      items: [],
+    }
+    mockReady({ changes: changesFixture({ batchTimeline: [unavailable] }) })
+
+    renderTab()
+
+    const unavailableHint = await screen.findByTestId("batch-unavailable-802")
+    expect(unavailableHint.textContent).toContain("暂不可用")
+    // An unavailable batch must not masquerade as a real "no changes" batch.
+    expect(screen.getByTestId("code-batch-timeline").textContent).not.toContain("本批无代码变更")
   })
 
   it("keeps the legacy change list when the backend omits batchTimeline", async () => {
