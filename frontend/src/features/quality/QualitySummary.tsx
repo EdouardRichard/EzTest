@@ -2,7 +2,13 @@
 
 import { StatusBadge, type StatusBadgeVariant } from "@/components/ui/StatusBadge"
 
-import { METRIC_LABELS, metricCounts, metricIsUpperBound, type EvalRun } from "./types"
+import {
+  type EvalRun,
+  METRIC_LABELS,
+  metricBaseline,
+  metricCounts,
+  metricIsUpperBound,
+} from "./types"
 
 /** Maps a run status to a badge variant and its Chinese label. */
 export function runStatusBadge(status: string): { variant: StatusBadgeVariant; label: string } {
@@ -49,6 +55,18 @@ export function formatRunTime(value: string | null): string {
   })
 }
 
+/**
+ * The header verdict. "全部指标达标" is only true for a passed run that actually
+ * produced metrics; an error run with no metrics must never look like a pass.
+ */
+export function runVerdictText(run: EvalRun): string {
+  if (run.metrics.length === 0) return "无指标"
+  const failedCount = run.metrics.filter((metric) => !metric.passed).length
+  if (run.status === "passed" && failedCount === 0) return "全部指标达标"
+  if (failedCount === 0) return "未通过"
+  return `${failedCount} 项指标未达标`
+}
+
 export type QualitySummaryProps = {
   /** The run to render; the dashboard renders the newest run here. */
   run: EvalRun
@@ -62,8 +80,6 @@ export type QualitySummaryProps = {
  */
 export function QualitySummary({ run }: QualitySummaryProps) {
   const status = runStatusBadge(run.status)
-  const failedCount = run.metrics.filter((metric) => !metric.passed).length
-
   return (
     <section
       data-testid="quality-summary"
@@ -76,7 +92,8 @@ export function QualitySummary({ run }: QualitySummaryProps) {
             最近评测 <span data-testid="quality-run-id">#{run.id}</span>
           </h2>
           <p className="mt-1 text-xs text-muted-foreground">
-            {modeLabel(run.mode)} · 语料 {run.corpusVersion} · 模型 {run.model === "" ? "—" : run.model}
+            {modeLabel(run.mode)} · 语料 {run.corpusVersion} · 模型{" "}
+            {run.model === "" ? "—" : run.model}
           </p>
           <p className="mt-1 text-xs text-muted-foreground">
             完成于 {formatRunTime(run.finishedAt ?? run.startedAt)}
@@ -84,8 +101,8 @@ export function QualitySummary({ run }: QualitySummaryProps) {
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <StatusBadge variant={status.variant}>{status.label}</StatusBadge>
-          <span data-testid="quality-failed-count" className="text-xs text-muted-foreground">
-            {failedCount === 0 ? "全部指标达标" : `${failedCount} 项指标未达标`}
+          <span data-testid="quality-verdict" className="text-xs text-muted-foreground">
+            {runVerdictText(run)}
           </span>
         </div>
       </header>
@@ -100,7 +117,7 @@ export function QualitySummary({ run }: QualitySummaryProps) {
       ) : (
         <div className="overflow-x-auto">
           <table className="w-full min-w-[36rem] border-collapse text-sm">
-            <caption className="sr-only">五项评测指标：数值、阈值与通过状态</caption>
+            <caption className="sr-only">五项评测指标：数值、阈值、基线、通过状态与计数</caption>
             <thead>
               <tr className="border-b border-border text-left text-xs uppercase tracking-wide text-muted-foreground">
                 <th scope="col" className="px-2 py-2 font-medium">
@@ -113,6 +130,9 @@ export function QualitySummary({ run }: QualitySummaryProps) {
                   阈值
                 </th>
                 <th scope="col" className="px-2 py-2 font-medium">
+                  基线
+                </th>
+                <th scope="col" className="px-2 py-2 font-medium">
                   判定
                 </th>
                 <th scope="col" className="px-2 py-2 font-medium">
@@ -123,6 +143,7 @@ export function QualitySummary({ run }: QualitySummaryProps) {
             <tbody>
               {run.metrics.map((metric) => {
                 const counts = metricCounts(metric.detail)
+                const baseline = metricBaseline(metric.detail)
                 const regressed = metric.detail.reason === "baseline_regression"
                 const verdict = runStatusBadge(metric.passed ? "passed" : "failed")
                 return (
@@ -134,12 +155,21 @@ export function QualitySummary({ run }: QualitySummaryProps) {
                     <th scope="row" className="px-2 py-2 text-left font-medium">
                       {METRIC_LABELS[metric.name] ?? metric.name}
                     </th>
-                    <td data-testid={`quality-metric-value-${metric.name}`} className="px-2 py-2 tabular-nums">
+                    <td
+                      data-testid={`quality-metric-value-${metric.name}`}
+                      className="px-2 py-2 tabular-nums"
+                    >
                       {formatMetricPercent(metric.value)}
                     </td>
                     <td className="px-2 py-2 tabular-nums text-muted-foreground">
                       <span aria-hidden="true">{metricIsUpperBound(metric.name) ? "≤" : "≥"} </span>
                       {formatMetricPercent(metric.threshold)}
+                    </td>
+                    <td
+                      data-testid={`quality-metric-baseline-${metric.name}`}
+                      className="px-2 py-2 tabular-nums text-muted-foreground"
+                    >
+                      {baseline === null ? "—" : formatMetricPercent(baseline)}
                     </td>
                     <td className="px-2 py-2">
                       <StatusBadge variant={verdict.variant}>{verdict.label}</StatusBadge>

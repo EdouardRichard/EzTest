@@ -40,14 +40,14 @@ function evalRun(overrides: Partial<EvalRun> = {}): EvalRun {
         value: 0.8,
         threshold: 0.9,
         passed: false,
-        detail: { numerator: 4, denominator: 5, reason: "below_threshold" },
+        detail: { numerator: 4, denominator: 5, baseline: 0.85, reason: "below_threshold" },
       },
       {
         name: "classification_accuracy",
         value: 1,
         threshold: 1,
         passed: true,
-        detail: { numerator: 2, denominator: 2, reason: "ok" },
+        detail: { numerator: 2, denominator: 2, baseline: 1, reason: "ok" },
       },
     ],
     ...overrides,
@@ -113,6 +113,33 @@ describe("QualityPage", () => {
     expect(within(history).getByTestId(`quality-history-row-${RUN_ID}`)).toBeTruthy()
     expect(within(history).getByText("1 / 2")).toBeTruthy()
     expect(mocks.listEvalRuns).toHaveBeenCalledTimes(1)
+  })
+
+  it("shows each metric's admin-visible baseline", async () => {
+    mocks.listEvalRuns.mockResolvedValue(page([evalRun()]))
+
+    render(<QualityPage />)
+
+    const summary = await screen.findByTestId("quality-summary")
+    expect(within(summary).getByTestId("quality-metric-baseline-design_coverage").textContent).toBe(
+      "85.0%",
+    )
+    expect(
+      within(summary).getByTestId("quality-metric-baseline-classification_accuracy").textContent,
+    ).toBe("100.0%")
+  })
+
+  it("never reports an error run with no metrics as all metrics passed", async () => {
+    mocks.listEvalRuns.mockResolvedValue(
+      page([evalRun({ status: "error", metrics: [], summary: { reason: "scenario_failed" } })]),
+    )
+
+    render(<QualityPage />)
+
+    const summary = await screen.findByTestId("quality-summary")
+    expect(screen.getByTestId("quality-no-metrics")).toBeTruthy()
+    expect(within(summary).queryByText("全部指标达标")).toBeNull()
+    expect(within(summary).getByTestId("quality-verdict").textContent).toBe("无指标")
   })
 
   it("shows the empty state before the first evaluation", async () => {

@@ -258,7 +258,7 @@ describe("AgentCenterPage", () => {
   it("renders the latest quality metrics for administrators", async () => {
     mocks.getAgentCenterQuality.mockResolvedValue({
       latest: {
-        run_id: 7,
+        run_id: "7",
         passed: true,
         metrics: { design_coverage: 0.95, issue_false_positive_rate: 0.01 },
         thresholds: { design_coverage: 0.9 },

@@ -44,7 +44,10 @@ type ProfileLister interface {
 // the Agent centre (spec §8.1/§9.1). Task 23 owns the eval tables; before it is
 // wired the provider is nil and the API returns an explicit null.
 type CenterEval struct {
-	RunID      int64              `json:"run_id"`
+	// RunID is the decimal string form of the eval_run id (D29): Snowflake ids
+	// exceed JavaScript's safe-integer range, so the Agent centre must never
+	// project them as JSON numbers.
+	RunID      string             `json:"run_id"`
 	Passed     bool               `json:"passed"`
 	Metrics    map[string]float64 `json:"metrics"`
 	Thresholds map[string]float64 `json:"thresholds"`

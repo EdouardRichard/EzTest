@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
 .SYNOPSIS
     Runs the P0-P8 acceptance gate for EzTest.
@@ -4833,6 +4833,17 @@ writeFileSync(process.argv[3], JSON.stringify({
             if (-not (Test-Path -LiteralPath (Join-Path $scriptsDir "eval.ps1"))) {
                 throw "scripts/eval.ps1 is missing"
             }
+            # Run the runner's own preflight so the DB-target and toolchain
+            # contract is also enforced in -StaticOnly, not just the JSON shape.
+            # Invoke-LoggedCommand surfaces a non-zero eval.ps1 as this check's
+            # failure.
+            Invoke-LoggedCommand -Exe $scriptHost `
+                -Arguments @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                    (Join-Path $scriptsDir "eval.ps1"), "-DryRun") `
+                -WorkingDirectory $repoRoot `
+                -LogPath (Join-Path $tmpDir "acceptance-p8-eval-dry-run.log") `
+                -Label "scripts/eval.ps1 -DryRun" `
+                -SuccessTailLines 10
             Write-Host ("P8 eval corpus OK: {0} JSON artifacts, baseline 6 metrics, corpusVersion {1}." -f `
                     $versions.Count, $distinctVersions[0])
         })

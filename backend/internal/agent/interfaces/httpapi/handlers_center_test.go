@@ -126,6 +126,37 @@ func TestCenterCatalogHandlerHidesInternalErrors(t *testing.T) {
 	}
 }
 
+// TestCenterQualityHandlerKeepsLargeRunIDAsString proves the eval run id keeps
+// the D29 decimal-string contract end-to-end: a Snowflake-sized id above
+// JavaScript's 2^53 safe-integer range must serialize as a JSON string and lose
+// no digits.
+func TestCenterQualityHandlerKeepsLargeRunIDAsString(t *testing.T) {
+	reader := &fakeCenterReader{quality: application.CenterQuality{Latest: &application.CenterEval{
+		RunID:      "9007199254740993", // 2^53+1, not exactly representable as a float64
+		Passed:     true,
+		Metrics:    map[string]float64{"design_coverage": 1},
+		Thresholds: map[string]float64{"design_coverage": 0.9},
+		CreatedAt:  time.Date(2026, 10, 29, 12, 0, 0, 0, time.UTC),
+	}}}
+	rec := centerGet(t, centerTestHandler(reader), "/api/agent-center/quality")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET quality = %d body=%s, want 200", rec.Code, rec.Body)
+	}
+	var body struct {
+		Data struct {
+			Latest struct {
+				RunID json.RawMessage `json:"run_id"`
+			} `json:"latest"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode quality: %v body=%s", err, rec.Body)
+	}
+	if got := strings.TrimSpace(string(body.Data.Latest.RunID)); got != `"9007199254740993"` {
+		t.Fatalf("run_id JSON = %s, want the decimal string \"9007199254740993\" (body=%s)", got, rec.Body)
+	}
+}
+
 // TestCenterSessionsHandlerPassesFiltersAndLimit pins the read-only query
 // projection and the items envelope.
 func TestCenterSessionsHandlerPassesFiltersAndLimit(t *testing.T) {

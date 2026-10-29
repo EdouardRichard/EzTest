@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -1901,7 +1902,7 @@ func (r qualityCenterReader) LatestEvaluation(ctx context.Context) (*agentapp.Ce
 		thresholds[metric.Name] = metric.Threshold
 	}
 	return &agentapp.CenterEval{
-		RunID:      run.ID,
+		RunID:      strconv.FormatInt(run.ID, 10),
 		Passed:     run.Status == qualitydomain.StatusPassed,
 		Metrics:    metrics,
 		Thresholds: thresholds,

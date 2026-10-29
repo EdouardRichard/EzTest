@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -214,6 +215,10 @@ func writeServiceError(w http.ResponseWriter, r *http.Request, err error) {
 		platform.WriteError(w, r, http.StatusNotFound, platform.CodeNotFound, "evaluation run not found")
 		return
 	}
+	// The response is opaque (the underlying error may carry SQL details), but a
+	// 500 must still be observable server-side and correlated with the request.
+	slog.ErrorContext(r.Context(), "quality: eval run request failed",
+		"request_id", platform.RequestID(r.Context()), "error", err)
 	platform.WriteError(w, r, http.StatusInternalServerError, platform.CodeInternal, "internal server error")
 }
 

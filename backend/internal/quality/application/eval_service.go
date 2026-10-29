@@ -44,6 +44,19 @@ func NewService(repo RunRepository, opts ...Option) *Service {
 
 var _ EvalRun = (*Service)(nil)
 
+// deterministicBaselineMetrics are the six deterministic metrics whose
+// committed baseline is part of the gate contract. The regression rule lives in
+// the domain: a partial baseline would silently exempt the missing metrics, so
+// Record rejects it instead.
+var deterministicBaselineMetrics = []string{
+	domain.MetricDesignCoverage,
+	domain.MetricImpactRecall,
+	domain.MetricImpactPrecision,
+	domain.MetricClassificationAccuracy,
+	domain.MetricIssueFalsePositiveRate,
+	domain.MetricSupplementHitRate,
+}
+
 // Record evaluates one corpus observation, persists the terminal run with its
 // metrics and returns the stored aggregate.
 func (s *Service) Record(ctx context.Context, input RecordInput) (domain.Run, error) {
@@ -117,6 +130,19 @@ func (s *Service) Record(ctx context.Context, input RecordInput) (domain.Run, er
 				return domain.Run{}, &ValidationError{Field: invalid.Field, Message: invalid.Message}
 			}
 			return domain.Run{}, &ValidationError{Field: "sample", Message: err.Error()}
+		}
+		if mode == domain.ModeDeterministic {
+			// The runner must post the complete committed baseline: an absent
+			// key would otherwise turn the +0.05 regression rule off for that
+			// metric without any signal.
+			for _, name := range deterministicBaselineMetrics {
+				if _, ok := input.Baseline[name]; !ok {
+					return domain.Run{}, &ValidationError{
+						Field:   "baseline",
+						Message: fmt.Sprintf("baseline is missing the deterministic metric %q", name),
+					}
+				}
+			}
 		}
 		run.Metrics = domain.Evaluate(sample, mode, input.Baseline)
 		run.Status = domain.StatusPassed
