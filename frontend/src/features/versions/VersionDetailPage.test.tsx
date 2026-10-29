@@ -1562,12 +1562,63 @@ describe("VersionDetailPage", () => {
 
     const status = await screen.findByTestId("version-stream-status")
     expect(status.textContent).toContain("重连中")
+    // The reconnect action is not part of the live region: an interactive
+    // control inside role="status" would be announced as status content.
+    expect(status.querySelector("button")).toBeNull()
     // The loaded data is kept: reconnecting is not an empty state.
     expect(screen.getByRole("heading", { level: 1, name: /订单系统 2.0/ })).toBeTruthy()
     expect(screen.getByTestId("requirements-workbench-slot")).toBeTruthy()
 
-    fireEvent.click(within(status).getByRole("button", { name: "重新连接" }))
+    fireEvent.click(
+      within(screen.getByTestId("version-stream-banner")).getByRole("button", {
+        name: "重新连接",
+      }),
+    )
     expect(reconnect).toHaveBeenCalledTimes(1)
+  })
+
+  it("uses the 正在连接 copy for the initial stream connection", async () => {
+    mocks.useVersionStream.mockReturnValue({
+      events: [],
+      status: "connecting",
+      reconnect: vi.fn(),
+    })
+
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+
+    const status = await screen.findByTestId("version-stream-status")
+    expect(status.textContent).toContain("正在连接")
+    // "重连中" is the overview's reconnect wording; a first connection must not
+    // duplicate it.
+    expect(status.textContent).not.toContain("重连中")
+    expect(status.querySelector("button")).toBeNull()
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "总览" }))
+    await screen.findByTestId("overview-metrics")
+    expect(screen.queryByTestId("overview-stream-status")).toBeNull()
+  })
+
+  it("surfaces the API request id when a refresh fails and keeps the last data", async () => {
+    mocks.getVersion.mockResolvedValueOnce(VERSION).mockRejectedValueOnce(
+      new ApiError({
+        status: 500,
+        code: "internal",
+        message: "the API is unavailable",
+        requestId: "req-refresh-1",
+      }),
+    )
+
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+
+    fireEvent.click(screen.getByRole("button", { name: "刷新" }))
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toContain("刷新版本失败")
+    expect(alert.textContent).toContain("请求 ID：req-refresh-1")
+    // The last successful version stays on screen.
+    expect(screen.getByRole("heading", { level: 1, name: /订单系统 2.0/ })).toBeTruthy()
   })
 
   it("syncs exploration Sheet open/close to ?node=", async () => {

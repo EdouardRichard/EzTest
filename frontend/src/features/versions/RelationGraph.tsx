@@ -176,8 +176,9 @@ export function RelationGraph({
             节点按创建顺序环形排布；点击节点可选中对应需求。
           </p>
 
+          {/* biome-ignore lint/a11y/useSemanticElements: an interactive SVG graph cannot be a native <fieldset>; role="group" keeps the focusable nodes exposed, which role="img" would hide. */}
           <svg
-            role="img"
+            role="group"
             aria-label={`需求关系图：${requirements.length} 个需求节点，${relations.length} 条关系`}
             viewBox={`0 0 ${VIEW_WIDTH} ${VIEW_HEIGHT}`}
             className="mt-2 h-auto w-full"
