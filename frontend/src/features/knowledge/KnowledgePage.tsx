@@ -2,7 +2,7 @@
 
 import { BookOpen, Filter, Loader2, RefreshCw, ShieldCheck } from "lucide-react"
 import Link from "next/link"
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 
 import { useAuth } from "@/features/auth/AuthProvider"
 import { ApiError } from "@/lib/api-client"
@@ -22,8 +22,16 @@ import {
 /** Global list page size (the backend caps one page at 100). */
 const PAGE_LIMIT = 50
 
-/** Reads the window query once; the page intentionally avoids useSearchParams so
- * the route needs no Suspense boundary (same pattern as the agent console). */
+/**
+ * Reads the window query; the page intentionally avoids useSearchParams so the
+ * route needs no Suspense boundary (same pattern as the agent console).
+ *
+ * Next's app router applies `history.pushState` in an insertion effect after the
+ * render, so during the first client-navigation render `window.location` still
+ * points at the previous URL. Reading here during render would silently drop the
+ * `?version=`/`?review=` deep links (for example the todo-centre knowledge link);
+ * the mount effect below reads it after the router updated the location.
+ */
 function readInitialParams(): { version: string; review: string } {
   if (typeof window === "undefined") return { version: "", review: "" }
   const params = new URLSearchParams(window.location.search)
@@ -58,12 +66,15 @@ function emptyMessage(status: KnowledgeStatus): string {
 export function KnowledgePage() {
   const { user } = useAuth()
   const isAdmin = user?.role === "admin"
-  const initial = useMemo(readInitialParams, [])
+  const [initial, setInitial] = useState<{ version: string; review: string }>({
+    version: "",
+    review: "",
+  })
 
   const [status, setStatus] = useState<KnowledgeStatus>("approved")
   const [kind, setKind] = useState<KnowledgeKind | "">("")
-  const [versionFilter, setVersionFilter] = useState(initial.version)
-  const [appliedVersion, setAppliedVersion] = useState(initial.version)
+  const [versionFilter, setVersionFilter] = useState("")
+  const [appliedVersion, setAppliedVersion] = useState("")
 
   const [entries, setEntries] = useState<KnowledgeEntry[]>([])
   const [selectedId, setSelectedId] = useState("")
@@ -73,6 +84,19 @@ export function KnowledgePage() {
   const [reviewOpen, setReviewOpen] = useState(false)
   const [reviewFocus, setReviewFocus] = useState("")
   const reviewLinkApplied = useRef(false)
+
+  // The router updates window.location after the first client-navigation
+  // render, so the deep links are read on mount rather than during render (see
+  // readInitialParams). The version filter is applied in the same pass so the
+  // first filtered read already carries it.
+  useEffect(() => {
+    const params = readInitialParams()
+    setInitial(params)
+    if (params.version !== "") {
+      setVersionFilter(params.version)
+      setAppliedVersion(params.version)
+    }
+  }, [])
 
   // Auth loads asynchronously: the ?review= deep link can only open the
   // administrator drawer once the user is known to be an admin. The ref keeps a
