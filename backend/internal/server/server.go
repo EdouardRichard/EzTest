@@ -54,6 +54,11 @@ type AgentDependencies struct {
 	Sessions agenthttp.SessionService
 	Runs     agenthttp.RunControl
 	Tools    agenthttp.ToolCatalog
+	// Center is the read-only P8 Agent-centre use case (13-role catalogue, run
+	// observation, latest quality metrics). Unlike the P1 /api/agents surface it
+	// is readable by every logged-in user, so the server mounts
+	// /api/agent-center/* without the per-route admin guard (spec §8.1/D60).
+	Center agenthttp.CenterReader
 }
 
 // Dependencies holds the collaborators wired into the HTTP layer. Later tasks
@@ -199,6 +204,10 @@ func New(cfg config.Config, logger *slog.Logger, deps Dependencies) http.Handler
 			return identityhttp.RequireAdmin(auditRequestContext(next))
 		}
 		agenthttp.RegisterRoutes(mux, agentHandler, adminGuard)
+		// The P8 Agent centre is a separate read-only surface: every logged-in
+		// user may read the role catalogue, run observation and quality metrics,
+		// while the profile writes above stay admin-only (spec §8.1/D60).
+		agenthttp.RegisterCenterRoutes(mux, agenthttp.NewCenterHandler(deps.Agent.Center))
 	}
 	if deps.Resources != nil {
 		// The resource reads need only the global bearer auth; every write and

@@ -940,6 +940,13 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	agentSessionService := agentapp.NewSessionService(
 		agentProfiles, agentSessions, agentRuns, agentMessages, runService, agentAuditSink)
 	agentToolCatalog := agentapp.NewToolCatalog(agentRegistry)
+	// P8 Agent centre (spec §8.1/D60): the read-only catalogue and run
+	// observation. The optional quality provider stays nil until Task 23 wires
+	// the evaluation context, so /api/agent-center/quality reports null.
+	agentCenterService := agentapp.NewCenterService(agentapp.CenterServiceDeps{
+		Profiles: agentProfileService,
+		Reads:    agentpostgres.NewCenterRepository(database.Pool),
+	})
 	// Both P1 services exist now; bind them into the P3 adapter before the HTTP
 	// server can accept a clarification request.
 	p1Agents.bind(agentSessionService, runService)
@@ -1407,6 +1414,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 				Sessions: agentSessionService,
 				Runs:     runService,
 				Tools:    agentToolCatalog,
+				Center:   agentCenterService,
 			},
 			Resources: resourceHandlers,
 			Version:   versionHandlers,
