@@ -1,40 +1,30 @@
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
-import type { IssueSummary } from "@/features/delivery/types"
-import type { CaseNodeView, MindmapGraph } from "@/features/mindmap/types"
-import type { Requirement } from "@/features/versions/types"
+import type { VersionEvent } from "@/features/versions/types"
+import type { VersionStreamState } from "@/features/versions/useVersionStream"
+import type { SSEStatus } from "@/lib/sse-client"
 
+import type { ChainSnapshot, ChainSnapshotEdge, ChainSnapshotNode } from "../chain/chain-types"
 import type { CaseRun, EvidenceView } from "../types"
 
 const mocks = vi.hoisted(() => ({
-  useCaseRuns: vi.fn(),
-  useIssues: vi.fn(),
-  listRequirements: vi.fn(),
-  getGraph: vi.fn(),
+  useExplorationChain: vi.fn(),
+  useCaseRun: vi.fn(),
+}))
+
+vi.mock("../chain/use-exploration-chain", () => ({
+  useExplorationChain: mocks.useExplorationChain,
 }))
 
 vi.mock("../hooks/useExecution", () => ({
-  useCaseRuns: mocks.useCaseRuns,
+  useCaseRun: mocks.useCaseRun,
 }))
 
-vi.mock("@/features/delivery/hooks/useIssues", () => ({
-  useIssues: mocks.useIssues,
-}))
-
-vi.mock("@/features/versions/api", () => ({
-  listRequirements: mocks.listRequirements,
-}))
-
-vi.mock("@/features/mindmap/api", () => ({
-  getGraph: mocks.getGraph,
-}))
-
-import { ExplorationTab } from "./ExplorationTab"
+import { type ExplorationFilters, ExplorationTab } from "./ExplorationTab"
 
 const VERSION_ID = "1844674407370955161"
 const BATCH_ID = "1844674407370955162"
-const OTHER_BATCH_ID = "1844674407370955163"
 
 const R1 = "1844674407370955101"
 const R2 = "1844674407370955102"
@@ -43,33 +33,26 @@ const C2 = "1844674407370955202"
 const C3 = "1844674407370955203"
 const CR1 = "1844674407370955301"
 const CR2 = "1844674407370955302"
-const CR3 = "1844674407370955303"
 const ISSUE_1 = "1844674407370955501"
-const ISSUE_2 = "1844674407370955502"
 const ISSUE_3 = "1844674407370955503"
 const EVIDENCE = "1844674407370955401"
 
-function requirement(id: string, title: string, overrides: Partial<Requirement> = {}): Requirement {
+function requirementNode(
+  id: string,
+  title: string,
+  overrides: Partial<ChainSnapshotNode> = {},
+): ChainSnapshotNode {
   return {
-    id,
-    versionId: VERSION_ID,
+    id: `requirement:${id}`,
+    kind: "requirement",
     title,
-    description: "",
-    acceptanceCriteria: "",
-    priority: "must",
     status: "clarified",
-    source: "user",
-    lastUpdateSource: "user",
-    revision: 1,
-    confirmedAt: null,
-    confirmedBy: null,
+    priority: "must",
+    uncovered: false,
+    caseCount: 1,
+    executedCount: 1,
+    failedCount: 0,
     openQuestionCount: 0,
-    relationCount: 0,
-    attachmentCount: 0,
-    createdBy: 1,
-    updatedBy: 1,
-    createdAt: "2026-10-28T00:00:00Z",
-    updatedAt: "2026-10-28T00:00:00Z",
     ...overrides,
   }
 }
@@ -78,214 +61,318 @@ function caseNode(
   id: string,
   title: string,
   requirementIds: string[],
-  overrides: Partial<CaseNodeView> = {},
-): CaseNodeView {
+  overrides: Partial<ChainSnapshotNode> = {},
+): ChainSnapshotNode {
   return {
-    id,
-    parentId: null,
+    id: `case:${id}`,
     kind: "case",
     title,
-    description: "",
-    priority: "P2",
-    preconditions: "",
-    testData: null,
-    source: "user_input",
     status: "executed",
-    sortOrder: 0,
-    revision: 1,
-    steps: [],
-    assertions: [],
-    sources: requirementIds.map((requirementId, index) => ({
-      id: `source-${id}-${index}`,
-      refKind: "requirement",
-      refId: requirementId,
-      refKey: "",
-      source: "user_input",
-      confidence: "high",
-    })),
-    anchors: [],
-    openBlockerCount: 0,
+    source: "user_input",
+    revalidation: false,
+    priority: "P2",
+    requirementIds,
+    stepCount: 3,
+    assertionCount: 2,
+    impacted: false,
+    impactReason: "",
     ...overrides,
   }
 }
 
-function graph(nodes: CaseNodeView[]): MindmapGraph {
+function resultNode(
+  id: string,
+  caseNodeId: string,
+  status: string,
+  overrides: Partial<ChainSnapshotNode> = {},
+): ChainSnapshotNode {
+  return {
+    id: `result:${id}`,
+    kind: "result",
+    title: "",
+    status,
+    caseRunId: id,
+    caseNodeId,
+    attempt: 1,
+    durationMs: 0,
+    failureClass: "",
+    evidenceCount: 0,
+    batchId: BATCH_ID,
+    summary: "",
+    ...overrides,
+  }
+}
+
+function issueNode(
+  id: string,
+  title: string,
+  overrides: Partial<ChainSnapshotNode> = {},
+): ChainSnapshotNode {
+  return {
+    id: `issue:${id}`,
+    kind: "issue",
+    title,
+    status: "open",
+    severity: "major",
+    category: "defect",
+    confidence: "high",
+    caseRunId: CR2,
+    caseNodeId: C2,
+    evidenceCount: 1,
+    codeRefCount: 0,
+    ...overrides,
+  }
+}
+
+function requirementCaseEdge(requirementId: string, caseId: string): ChainSnapshotEdge {
+  return {
+    id: `requirement_case:${requirementId}:${caseId}`,
+    source: `requirement:${requirementId}`,
+    target: `case:${caseId}`,
+    kind: "requirement_case",
+  }
+}
+
+function caseResultEdge(caseId: string, resultId: string): ChainSnapshotEdge {
+  return {
+    id: `case_result:${caseId}:${resultId}`,
+    source: `case:${caseId}`,
+    target: `result:${resultId}`,
+    kind: "case_result",
+  }
+}
+
+function resultIssueEdge(resultId: string, issueId: string): ChainSnapshotEdge {
+  return {
+    id: `result_issue:${resultId}:${issueId}`,
+    source: `result:${resultId}`,
+    target: `issue:${issueId}`,
+    kind: "result_issue",
+  }
+}
+
+function countsOf(nodes: ChainSnapshotNode[]): ChainSnapshot["counts"] {
+  const byResultStatus: Record<string, number> = {
+    pending: 0,
+    running: 0,
+    passed: 0,
+    failed: 0,
+    blocked: 0,
+    inconclusive: 0,
+    skipped: 0,
+    interrupted: 0,
+  }
+  const byIssueSeverity: Record<string, number> = {
+    blocker: 0,
+    major: 0,
+    minor: 0,
+    info: 0,
+  }
+  for (const node of nodes) {
+    if (node.kind === "result" && node.status in byResultStatus) {
+      byResultStatus[node.status] = (byResultStatus[node.status] ?? 0) + 1
+    }
+    if (node.kind === "issue" && node.severity !== undefined) {
+      byIssueSeverity[node.severity] = (byIssueSeverity[node.severity] ?? 0) + 1
+    }
+  }
+  return {
+    requirements: nodes.filter((node) => node.kind === "requirement").length,
+    cases: nodes.filter((node) => node.kind === "case").length,
+    results: nodes.filter((node) => node.kind === "result").length,
+    issues: nodes.filter((node) => node.kind === "issue").length,
+    byResultStatus,
+    byIssueSeverity,
+    uncoveredRequirements: 0,
+    revalidationCases: 0,
+    supplementCases: 0,
+  }
+}
+
+function snapshotOf(
+  nodes: ChainSnapshotNode[],
+  edges: ChainSnapshotEdge[] = [],
+  overrides: Partial<ChainSnapshot> = {},
+): ChainSnapshot {
   return {
     versionId: VERSION_ID,
-    versionStatus: "executing",
-    editable: false,
+    batch: { id: BATCH_ID, batchNo: 2, kind: "incremental", status: "done" },
     nodes,
-    coverage: {
-      requirementIds: [R1, R2],
-      uncoveredRequirementIds: [],
-      staleRequirementIds: [],
-      matrix: [],
-    },
-    baseline: null,
-    latestRuns: {},
-    impactCases: [],
+    edges,
+    counts: countsOf(nodes),
+    truncated: { requirements: false, cases: false, results: false, issues: false },
+    generatedAt: "2026-10-29T10:00:00Z",
+    ...overrides,
   }
 }
 
-function evidenceView(id: string): EvidenceView {
-  return {
-    id,
-    kind: "screenshot",
-    mime: "image/png",
-    size_bytes: 2048,
-    sha256: "a".repeat(64),
-  }
+const REQUIREMENT_NODES = [requirementNode(R1, "登录需求"), requirementNode(R2, "下单需求")]
+const CASE_NODES = [caseNode(C1, "登录成功", [R1]), caseNode(C2, "提交订单", [R2])]
+const RESULT_NODES = [
+  resultNode(CR1, C1, "passed", { title: "登录成功", durationMs: 800 }),
+  resultNode(CR2, C2, "failed", {
+    title: "提交订单",
+    attempt: 2,
+    durationMs: 1200,
+    failureClass: "application",
+    evidenceCount: 1,
+    summary: "提交订单返回 500",
+  }),
+]
+const ISSUE_NODES = [issueNode(ISSUE_1, "提交订单失败", { severity: "major" })]
+
+const SNAPSHOT = snapshotOf(
+  [...REQUIREMENT_NODES, ...CASE_NODES, ...RESULT_NODES, ...ISSUE_NODES],
+  [
+    requirementCaseEdge(R1, C1),
+    requirementCaseEdge(R2, C2),
+    caseResultEdge(C1, CR1),
+    caseResultEdge(C2, CR2),
+    resultIssueEdge(CR2, ISSUE_1),
+  ],
+)
+
+const EMPTY_SNAPSHOT = snapshotOf([])
+
+const LOGIN_ONLY_SNAPSHOT = snapshotOf(
+  [
+    requirementNode(R1, "登录需求"),
+    caseNode(C1, "登录成功", [R1]),
+    resultNode(CR1, C1, "passed", { title: "登录成功" }),
+  ],
+  [requirementCaseEdge(R1, C1), caseResultEdge(C1, CR1)],
+)
+
+const FAILED_ONLY_SNAPSHOT = snapshotOf(
+  [
+    requirementNode(R2, "下单需求"),
+    caseNode(C2, "提交订单", [R2]),
+    resultNode(CR2, C2, "failed", {
+      title: "提交订单",
+      attempt: 2,
+      failureClass: "application",
+      evidenceCount: 1,
+      summary: "提交订单返回 500",
+    }),
+    issueNode(ISSUE_1, "提交订单失败"),
+  ],
+  [requirementCaseEdge(R2, C2), caseResultEdge(C2, CR2), resultIssueEdge(CR2, ISSUE_1)],
+)
+
+function stream(events: VersionEvent[] = [], status: SSEStatus = "live"): VersionStreamState {
+  return { events, status, reconnect: vi.fn() }
 }
 
-function caseRun(
-  overrides: Partial<CaseRun> & Pick<CaseRun, "id" | "case_node_id" | "status">,
-): CaseRun {
-  const { id, case_node_id, status, ...rest } = overrides
+const STREAM = stream()
+
+const EVIDENCE_VIEW: EvidenceView = {
+  id: EVIDENCE,
+  kind: "screenshot",
+  mime: "image/png",
+  size_bytes: 2048,
+  sha256: "a".repeat(64),
+}
+
+function caseRun(overrides: Partial<CaseRun> = {}): CaseRun {
   return {
-    id,
-    case_node_id,
-    status,
+    id: CR2,
+    case_node_id: C2,
+    status: "failed",
     batch_id: BATCH_ID,
     case_revision: 1,
-    attempt: 1,
-    failure_class: null,
+    attempt: 2,
+    failure_class: "application",
     failure_reason: "",
-    summary: "",
-    duration_ms: 0,
-    title: "",
+    summary: "提交订单返回 500",
+    duration_ms: 1200,
+    title: "提交订单",
     session: null,
     checkpoint: { completed_seqs: [], cleanup_required: false, interrupted_step_seq: null },
     steps: [],
     assertions: [],
-    evidence: [],
+    evidence: [EVIDENCE_VIEW],
     pending_takeover: null,
-    ...rest,
-  }
-}
-
-function caseRunList(caseRuns: CaseRun[]) {
-  return {
-    caseRuns,
-    nextCursor: "",
-    hasMore: false,
-    loading: false,
-    error: "",
-    streamStatus: "live" as const,
-    refresh: vi.fn(),
-  }
-}
-
-function issue(overrides: Partial<IssueSummary> & Pick<IssueSummary, "id">): IssueSummary {
-  return {
-    versionId: VERSION_ID,
-    batchId: BATCH_ID,
-    caseRunId: CR2,
-    caseNodeId: C2,
-    stepResultId: null,
-    source: "ai",
-    category: "defect",
-    severity: "major",
-    status: "open",
-    confidence: "high",
-    failureClass: "application",
-    title: "提交订单失败",
-    rerunSuggestion: "重跑下单用例",
-    recurrenceCount: 1,
-    revision: 1,
-    refs: [
-      { kind: "case_run", id: CR2 },
-      { kind: "evidence", id: EVIDENCE },
-    ],
-    codeRefs: [],
-    dismissedReason: "",
-    createdBy: "1",
-    confirmedBy: null,
-    confirmedAt: null,
-    dismissedBy: null,
-    dismissedAt: null,
-    createdAt: "2026-10-28T00:00:00Z",
-    updatedAt: "2026-10-28T00:00:00Z",
     ...overrides,
   }
 }
 
-function issuesResult(
-  items: IssueSummary[],
-  overrides: { loading?: boolean; error?: string } = {},
+function chainResult(
+  data: ChainSnapshot | null,
+  overrides: { loading?: boolean; error?: string; streamStatus?: SSEStatus } = {},
 ) {
   return {
-    items,
-    hasMore: false,
+    data,
     loading: overrides.loading ?? false,
-    loadingMore: false,
     error: overrides.error ?? "",
-    streamStatus: "live" as const,
-    refresh: vi.fn(),
-    loadMore: vi.fn(),
+    streamStatus: overrides.streamStatus ?? ("live" as SSEStatus),
+    refresh: vi.fn().mockResolvedValue(undefined),
   }
 }
 
-const REQUIREMENTS = [requirement(R1, "登录需求"), requirement(R2, "下单需求")]
+type CaseRunResource = {
+  caseRun: CaseRun | null
+  loading: boolean
+  error: string
+  streamStatus: SSEStatus
+  refresh: () => Promise<void>
+}
 
-const GRAPH = graph([caseNode(C1, "登录成功", [R1]), caseNode(C2, "提交订单", [R2])])
+function caseRunResult(
+  detail: CaseRun | null,
+  overrides: { loading?: boolean; error?: string } = {},
+): CaseRunResource {
+  return {
+    caseRun: detail,
+    loading: overrides.loading ?? false,
+    error: overrides.error ?? "",
+    streamStatus: "live",
+    refresh: vi.fn(),
+  }
+}
 
-const PASSED_RUN = caseRun({
-  id: CR1,
-  case_node_id: C1,
-  status: "passed",
-  title: "登录成功",
-  duration_ms: 800,
-})
-const FAILED_RUN = caseRun({
-  id: CR2,
-  case_node_id: C2,
-  status: "failed",
-  failure_class: "application",
-  title: "提交订单",
-  summary: "提交订单返回 500",
-  duration_ms: 1200,
-  evidence: [evidenceView(EVIDENCE)],
-})
+type RenderOptions = {
+  stream?: VersionStreamState
+  initialFilters?: Partial<ExplorationFilters>
+  selectedNodeId?: string
+  onSelectedNodeChange?: (nodeId: string) => void
+  onFiltersChange?: (filters: ExplorationFilters) => void
+}
 
-function renderTab(
-  overrides: {
-    onOpenEvidence?: (evidenceId: string) => void
-    onNavigate?: (target: unknown) => void
-  } = {},
-) {
-  const onOpenEvidence = overrides.onOpenEvidence ?? vi.fn()
-  const onNavigate = overrides.onNavigate ?? vi.fn()
+function renderTab(overrides: RenderOptions = {}) {
+  const onOpenEvidence = vi.fn()
+  const onNavigate = vi.fn()
+  const onSelectedNodeChange = overrides.onSelectedNodeChange ?? vi.fn()
+  const onFiltersChange = overrides.onFiltersChange ?? vi.fn()
   const result = render(
     <ExplorationTab
       versionId={VERSION_ID}
       batchId={BATCH_ID}
+      stream={overrides.stream ?? STREAM}
       onOpenEvidence={onOpenEvidence}
       onNavigate={onNavigate}
+      initialFilters={overrides.initialFilters}
+      selectedNodeId={overrides.selectedNodeId}
+      onSelectedNodeChange={onSelectedNodeChange}
+      onFiltersChange={onFiltersChange}
     />,
   )
-  return { ...result, onOpenEvidence, onNavigate }
+  return { ...result, onOpenEvidence, onNavigate, onSelectedNodeChange, onFiltersChange }
 }
 
 beforeEach(() => {
-  mocks.useCaseRuns.mockReset()
-  mocks.useIssues.mockReset()
-  mocks.listRequirements.mockReset()
-  mocks.getGraph.mockReset()
-
-  mocks.useCaseRuns.mockReturnValue(caseRunList([PASSED_RUN, FAILED_RUN]))
-  mocks.useIssues.mockReturnValue(issuesResult([]))
-  mocks.listRequirements.mockResolvedValue({
-    items: REQUIREMENTS,
-    nextCursor: "",
-    hasMore: false,
-  })
-  mocks.getGraph.mockResolvedValue(GRAPH)
+  mocks.useExplorationChain.mockReset()
+  mocks.useCaseRun.mockReset()
+  mocks.useExplorationChain.mockReturnValue(chainResult(SNAPSHOT))
+  mocks.useCaseRun.mockReturnValue(caseRunResult(null))
 })
 
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  vi.useRealTimers()
+})
 
 describe("ExplorationTab", () => {
-  it("renders the requirement → case → result layers with the live issue panel", async () => {
+  it("renders the requirement → case → result layers from the read model", async () => {
     renderTab()
 
     const requirementNode = await screen.findByTestId(`chain-node-${R1}`)
@@ -296,16 +383,37 @@ describe("ExplorationTab", () => {
     expect(caseNodeElement.textContent).toContain("登录成功")
     expect(caseNodeElement.textContent).toContain("用例")
 
-    const passed = screen.getByTestId(`chain-node-${CR1}`)
-    expect(passed.textContent).toContain("通过")
-
-    const failed = screen.getByTestId(`chain-node-${CR2}`)
-    expect(failed.textContent).toContain("失败")
+    expect(screen.getByTestId(`chain-node-${CR1}`).textContent).toContain("通过")
+    expect(screen.getByTestId(`chain-node-${CR2}`).textContent).toContain("失败")
 
     const issuePanel = screen.getByTestId("chain-issue-panel")
     expect(issuePanel.textContent).toContain("问题")
-    expect(screen.getByTestId("chain-issues-empty").textContent).toContain("本批次未发现问题")
+    expect(screen.getByTestId(`chain-issue-node-${ISSUE_1}`).textContent).toContain("提交订单失败")
+    expect(screen.getByTestId("chain-issue-count").textContent).toContain("1 个问题")
     expect(screen.queryByTestId("chain-issue-placeholder")).toBeNull()
+  })
+
+  it("builds requirement edges from the read-model edges, not case requirementIds", async () => {
+    // The case DTO lists R1 and R2, but only the R1 edge exists. The layout must
+    // follow the edges so a filtered-out requirement cannot invent a link.
+    mocks.useExplorationChain.mockReturnValue(
+      chainResult(
+        snapshotOf(
+          [
+            requirementNode(R1, "登录需求"),
+            caseNode(C1, "登录成功", [R1, R2]),
+            resultNode(CR1, C1, "passed", { title: "登录成功" }),
+          ],
+          [requirementCaseEdge(R1, C1), caseResultEdge(C1, CR1)],
+        ),
+      ),
+    )
+
+    renderTab()
+    await screen.findByTestId(`chain-node-${C1}`)
+
+    expect(screen.queryByTestId(`chain-edge-${R1}->${C1}`)).toBeTruthy()
+    expect(screen.queryByTestId(`chain-edge-${R2}->${C1}`)).toBeNull()
   })
 
   it("keeps the status colour, glyph and text alongside each other", async () => {
@@ -322,7 +430,11 @@ describe("ExplorationTab", () => {
     expect(failed.textContent).toContain("✕")
   })
 
-  it("opens a node drawer with summary, evidence and deep-link callbacks", async () => {
+  it("opens a result drawer with attempt, summary and caseRunId-lazy evidence", async () => {
+    mocks.useCaseRun.mockImplementation(
+      (_versionId: string, _batchId: string, caseRunId: string) =>
+        caseRunId === CR2 ? caseRunResult(caseRun()) : caseRunResult(null),
+    )
     const { onOpenEvidence, onNavigate } = renderTab()
 
     fireEvent.click(await screen.findByTestId(`chain-node-${CR2}`))
@@ -331,6 +443,14 @@ describe("ExplorationTab", () => {
     expect(drawer.textContent).toContain("提交订单")
     expect(drawer.textContent).toContain("提交订单返回 500")
     expect(drawer.textContent).toContain("失败")
+    expect(drawer.textContent).toContain("第 2 次尝试")
+
+    // Evidence is not loaded with the chain: the hook is called disabled first.
+    expect(mocks.useCaseRun).toHaveBeenLastCalledWith(VERSION_ID, BATCH_ID, "", STREAM)
+    expect(screen.getByTestId("chain-drawer-load-evidence").textContent).toContain("证据")
+
+    fireEvent.click(screen.getByTestId("chain-drawer-load-evidence"))
+    expect(mocks.useCaseRun).toHaveBeenLastCalledWith(VERSION_ID, BATCH_ID, CR2, STREAM)
 
     fireEvent.click(screen.getByTestId(`chain-drawer-evidence-${EVIDENCE}`))
     expect(onOpenEvidence).toHaveBeenCalledWith(EVIDENCE)
@@ -354,13 +474,20 @@ describe("ExplorationTab", () => {
     expect(onNavigate).toHaveBeenCalledWith({ kind: "requirement", id: R2 })
   })
 
-  it("renders red diamond issue nodes from the delivery issues API", async () => {
-    mocks.useIssues.mockReturnValue(
-      issuesResult([
-        issue({ id: ISSUE_1, title: "提交订单失败", severity: "blocker", status: "open" }),
-      ]),
+  it("renders red diamond issue nodes from the read model", async () => {
+    mocks.useExplorationChain.mockReturnValue(
+      chainResult(
+        snapshotOf(
+          [
+            requirementNode(R2, "下单需求"),
+            caseNode(C2, "提交订单", [R2]),
+            resultNode(CR2, C2, "failed", { title: "提交订单" }),
+            issueNode(ISSUE_1, "提交订单失败", { severity: "blocker" }),
+          ],
+          [requirementCaseEdge(R2, C2), caseResultEdge(C2, CR2), resultIssueEdge(CR2, ISSUE_1)],
+        ),
+      ),
     )
-
     renderTab()
 
     const node = await screen.findByTestId(`chain-issue-node-${ISSUE_1}`)
@@ -374,18 +501,10 @@ describe("ExplorationTab", () => {
     expect(node.getAttribute("data-testid")).toContain(ISSUE_1)
   })
 
-  it("opens the issue drawer with severity, evidence and issue/case deep links", async () => {
-    mocks.useIssues.mockReturnValue(
-      issuesResult([
-        issue({
-          id: ISSUE_1,
-          title: "提交订单失败",
-          severity: "major",
-          status: "confirmed",
-          confidence: "high",
-          category: "defect",
-        }),
-      ]),
+  it("opens the issue drawer with severity, lazy evidence and deep links", async () => {
+    mocks.useCaseRun.mockImplementation(
+      (_versionId: string, _batchId: string, caseRunId: string) =>
+        caseRunId === CR2 ? caseRunResult(caseRun()) : caseRunResult(null),
     )
     const { onOpenEvidence, onNavigate } = renderTab()
 
@@ -394,10 +513,11 @@ describe("ExplorationTab", () => {
     const drawer = screen.getByTestId("chain-drawer")
     expect(drawer.getAttribute("data-kind")).toBe("issue")
     expect(drawer.textContent).toContain("提交订单失败")
-    expect(drawer.textContent).toContain("已确认")
+    expect(drawer.textContent).toContain("待确认")
     expect(drawer.textContent).toContain("严重")
     expect(drawer.textContent).toContain("高")
 
+    fireEvent.click(screen.getByTestId("chain-drawer-load-evidence"))
     fireEvent.click(screen.getByTestId(`chain-drawer-evidence-${EVIDENCE}`))
     expect(onOpenEvidence).toHaveBeenCalledWith(EVIDENCE)
 
@@ -408,63 +528,213 @@ describe("ExplorationTab", () => {
     expect(onNavigate).toHaveBeenCalledWith({ kind: "case", id: C2 })
   })
 
-  it("keeps every chain request within the backend's 100-item limit cap", async () => {
+  it("requests the chain with the batch scope and the read-model defaults", async () => {
     renderTab()
 
     await screen.findByTestId(`chain-node-${R1}`)
-    expect(mocks.listRequirements).toHaveBeenCalledWith(VERSION_ID, { limit: 100 })
-    expect(mocks.useIssues).toHaveBeenCalledWith(
+    expect(mocks.useExplorationChain).toHaveBeenCalledWith(
       VERSION_ID,
-      { batchId: BATCH_ID, limit: 100 },
-      undefined,
+      expect.objectContaining({ batchId: BATCH_ID }),
+      STREAM,
     )
   })
 
-  it("filters issue nodes between the current batch and all batches", async () => {
-    mocks.useIssues.mockImplementation((_versionId: string, filters: { batchId?: string }) =>
-      filters.batchId === BATCH_ID
-        ? issuesResult([issue({ id: ISSUE_1, caseNodeId: C2, caseRunId: CR2 })])
-        : issuesResult([
-            issue({ id: ISSUE_1, caseNodeId: C2, caseRunId: CR2 }),
-            issue({
-              id: ISSUE_2,
-              batchId: OTHER_BATCH_ID,
-              caseNodeId: C1,
-              caseRunId: CR1,
-              title: "登录按钮缺失",
-            }),
-          ]),
+  it("maps the batch filter to the server-side batchId query", async () => {
+    mocks.useExplorationChain.mockImplementation(
+      (_versionId: string, params: { batchId?: string }) =>
+        chainResult(params.batchId === "all" ? SNAPSHOT : SNAPSHOT),
+    )
+    renderTab()
+
+    expect(await screen.findByTestId(`chain-issue-node-${ISSUE_1}`)).toBeTruthy()
+    fireEvent.change(screen.getByTestId("chain-batch-filter"), { target: { value: "all" } })
+
+    expect(mocks.useExplorationChain).toHaveBeenLastCalledWith(
+      VERSION_ID,
+      expect.objectContaining({ batchId: "all" }),
+      STREAM,
+    )
+  })
+
+  it("maps every filter control to the read-model query", async () => {
+    renderTab()
+    await screen.findByTestId(`chain-node-${R1}`)
+
+    fireEvent.change(screen.getByTestId("exploration-filter-requirement"), {
+      target: { value: R1 },
+    })
+    expect(mocks.useExplorationChain).toHaveBeenLastCalledWith(
+      VERSION_ID,
+      expect.objectContaining({ requirementId: R1 }),
+      STREAM,
+    )
+
+    fireEvent.change(screen.getByTestId("exploration-filter-status"), {
+      target: { value: "failed" },
+    })
+    expect(mocks.useExplorationChain).toHaveBeenLastCalledWith(
+      VERSION_ID,
+      expect.objectContaining({ resultStatus: "failed" }),
+      STREAM,
+    )
+
+    fireEvent.click(screen.getByTestId("exploration-filter-abnormal"))
+    expect(mocks.useExplorationChain).toHaveBeenLastCalledWith(
+      VERSION_ID,
+      expect.objectContaining({ abnormalOnly: true }),
+      STREAM,
+    )
+
+    fireEvent.change(screen.getByTestId("exploration-filter-issue-severity"), {
+      target: { value: "major" },
+    })
+    expect(mocks.useExplorationChain).toHaveBeenLastCalledWith(
+      VERSION_ID,
+      expect.objectContaining({ issueSeverity: "major" }),
+      STREAM,
+    )
+
+    fireEvent.change(screen.getByTestId("exploration-filter-issue-status"), {
+      target: { value: "open" },
+    })
+    expect(mocks.useExplorationChain).toHaveBeenLastCalledWith(
+      VERSION_ID,
+      expect.objectContaining({ issueStatus: "open" }),
+      STREAM,
+    )
+
+    fireEvent.click(screen.getByTestId("exploration-filter-supplement"))
+    expect(mocks.useExplorationChain).toHaveBeenLastCalledWith(
+      VERSION_ID,
+      expect.objectContaining({ includeSupplement: false }),
+      STREAM,
+    )
+
+    fireEvent.click(screen.getByTestId("exploration-filter-revalidation"))
+    expect(mocks.useExplorationChain).toHaveBeenLastCalledWith(
+      VERSION_ID,
+      expect.objectContaining({ revalidationOnly: true }),
+      STREAM,
+    )
+  })
+
+  it("debounces the title search by 300ms before querying the server", async () => {
+    vi.useFakeTimers()
+    renderTab()
+
+    fireEvent.change(screen.getByTestId("exploration-filter-search"), {
+      target: { value: "登录" },
+    })
+    act(() => {
+      vi.advanceTimersByTime(299)
+    })
+    expect(mocks.useExplorationChain).not.toHaveBeenLastCalledWith(
+      VERSION_ID,
+      expect.objectContaining({ q: "登录" }),
+      STREAM,
+    )
+
+    act(() => {
+      vi.advanceTimersByTime(1)
+    })
+    expect(mocks.useExplorationChain).toHaveBeenLastCalledWith(
+      VERSION_ID,
+      expect.objectContaining({ q: "登录" }),
+      STREAM,
+    )
+  })
+
+  it("forwards the initial deep-link filters to the first request", async () => {
+    renderTab({
+      initialFilters: {
+        requirementId: R1,
+        resultStatus: "failed",
+        abnormalOnly: true,
+        q: "登录",
+      },
+    })
+
+    expect(mocks.useExplorationChain).toHaveBeenCalledWith(
+      VERSION_ID,
+      expect.objectContaining({
+        requirementId: R1,
+        resultStatus: "failed",
+        abnormalOnly: true,
+        q: "登录",
+      }),
+      STREAM,
+    )
+  })
+
+  it("shows a truncation banner with the real pre-truncation counts", async () => {
+    mocks.useExplorationChain.mockReturnValue(
+      chainResult(
+        snapshotOf(
+          [
+            requirementNode(R1, "登录需求"),
+            caseNode(C1, "登录成功", [R1]),
+            resultNode(CR1, C1, "passed", { title: "登录成功" }),
+          ],
+          [requirementCaseEdge(R1, C1), caseResultEdge(C1, CR1)],
+          {
+            counts: {
+              requirements: 4,
+              cases: 42,
+              results: 43,
+              issues: 2,
+              byResultStatus: {
+                pending: 0,
+                running: 0,
+                passed: 1,
+                failed: 0,
+                blocked: 0,
+                inconclusive: 0,
+                skipped: 0,
+                interrupted: 0,
+              },
+              byIssueSeverity: { blocker: 0, major: 0, minor: 0, info: 0 },
+              uncoveredRequirements: 0,
+              revalidationCases: 0,
+              supplementCases: 0,
+            },
+            truncated: { requirements: false, cases: true, results: true, issues: false },
+          },
+        ),
+      ),
     )
 
     renderTab()
 
-    expect(await screen.findByTestId(`chain-issue-node-${ISSUE_1}`)).toBeTruthy()
-    expect(screen.queryByTestId(`chain-issue-node-${ISSUE_2}`)).toBeNull()
-    expect(mocks.useIssues).toHaveBeenLastCalledWith(
-      VERSION_ID,
-      { batchId: BATCH_ID, limit: 100 },
-      undefined,
+    const banner = await screen.findByTestId("chain-truncated")
+    expect(banner.textContent).toContain("已显示前 3 条")
+    expect(banner.textContent).toContain("共 91 条")
+    expect(banner.textContent).toContain("请收窄筛选")
+  })
+
+  it("shows the stream status as 重连中 while the version stream reconnects", async () => {
+    mocks.useExplorationChain.mockReturnValue(
+      chainResult(SNAPSHOT, { streamStatus: "reconnecting" }),
     )
 
-    fireEvent.change(screen.getByTestId("chain-batch-filter"), {
-      target: { value: "all" },
-    })
+    renderTab()
 
-    expect(await screen.findByTestId(`chain-issue-node-${ISSUE_2}`)).toBeTruthy()
-    expect(screen.getByTestId(`chain-issue-node-${ISSUE_1}`)).toBeTruthy()
-    expect(mocks.useIssues).toHaveBeenLastCalledWith(VERSION_ID, { limit: 100 }, undefined)
+    expect((await screen.findByTestId("chain-stream-status")).textContent).toContain("重连中")
   })
 
   it("shows AI-supplemented and needs_revalidation cases with text, not colour alone", async () => {
-    const revalidation = caseNode(C2, "购物车金额", [R2], { status: "needs_revalidation" })
-    const supplemented = caseNode(C3, "AI 补的边界用例", [R2], {
-      source: "ai_supplement",
-      status: "supplemented",
-    })
-    mocks.getGraph.mockResolvedValue(
-      graph([caseNode(C1, "登录成功", [R1]), revalidation, supplemented]),
+    mocks.useExplorationChain.mockReturnValue(
+      chainResult(
+        snapshotOf(
+          [
+            requirementNode(R2, "下单需求"),
+            caseNode(C1, "登录成功", [R2]),
+            caseNode(C2, "购物车金额", [R2], { status: "needs_revalidation", revalidation: true }),
+            caseNode(C3, "AI 补的边界用例", [R2], { source: "ai_supplement" }),
+          ],
+          [requirementCaseEdge(R2, C1), requirementCaseEdge(R2, C2), requirementCaseEdge(R2, C3)],
+        ),
+      ),
     )
-    mocks.useCaseRuns.mockReturnValue(caseRunList([PASSED_RUN, FAILED_RUN]))
 
     renderTab()
 
@@ -480,17 +750,22 @@ describe("ExplorationTab", () => {
     expect(revalidationNode.getAttribute("data-revalidation")).toBe("true")
   })
 
-  it("lists issues without a case and links them to the issue page", async () => {
-    mocks.useIssues.mockReturnValue(
-      issuesResult([
-        issue({
-          id: ISSUE_3,
-          title: "缺少导出需求",
-          caseNodeId: null,
-          caseRunId: null,
-          category: "requirement_gap",
-        }),
-      ]),
+  it("lists issues without a case edge and links them to the issue page", async () => {
+    mocks.useExplorationChain.mockReturnValue(
+      chainResult(
+        snapshotOf(
+          [
+            requirementNode(R1, "登录需求"),
+            caseNode(C1, "登录成功", [R1]),
+            issueNode(ISSUE_3, "缺少导出需求", {
+              caseNodeId: C1,
+              caseRunId: undefined,
+              category: "requirement_gap",
+            }),
+          ],
+          [requirementCaseEdge(R1, C1)],
+        ),
+      ),
     )
     const { onNavigate } = renderTab()
 
@@ -501,73 +776,45 @@ describe("ExplorationTab", () => {
     expect(screen.queryByTestId(`chain-issue-node-${ISSUE_3}`)).toBeNull()
   })
 
-  it("degrades gracefully when the issue read fails", async () => {
-    mocks.useIssues.mockReturnValue(issuesResult([], { error: "无权限读取问题" }))
+  it("keeps the old data and marks the issue layer unavailable when a refresh fails", async () => {
+    mocks.useExplorationChain.mockReturnValue(chainResult(SNAPSHOT, { error: "无权限读取问题" }))
 
     renderTab()
-
-    const degraded = await screen.findByTestId("chain-issues-degraded")
-    expect(degraded.textContent).toContain("问题数据加载失败")
-    expect(degraded.textContent).toContain("AI 分析降级")
-    expect(degraded.textContent).toContain("不完整")
-    // The chain itself still renders.
-    expect(screen.getByTestId("chain-graph")).toBeTruthy()
-    expect(screen.queryByTestId("chain-issues-empty")).toBeNull()
-  })
-
-  it("does not report zero issues when the issue request is rejected with a 422", async () => {
-    mocks.useIssues.mockReturnValue(
-      issuesResult([], { error: "limit must be an integer between 1 and 100" }),
-    )
-
-    renderTab()
-
-    const degraded = await screen.findByTestId("chain-issues-degraded")
-    expect(degraded.textContent).toContain("limit must be an integer between 1 and 100")
-    expect(screen.queryByTestId("chain-issues-empty")).toBeNull()
-
-    const count = screen.getByTestId("chain-issue-count")
-    expect(count.textContent).toContain("问题数据不可用")
-    expect(count.textContent).not.toContain("0 个问题")
-  })
-
-  it("keeps the case/result layers and names the failed requirement layer", async () => {
-    mocks.listRequirements.mockRejectedValue(
-      new Error("limit must be an integer between 1 and 100"),
-    )
-
-    renderTab()
-
-    // The graph request succeeded, so the cases and results still render.
-    expect(await screen.findByTestId(`chain-node-${C1}`)).toBeTruthy()
-    expect(screen.getByTestId(`chain-node-${CR1}`)).toBeTruthy()
 
     const degraded = await screen.findByTestId("exploration-degraded")
-    expect(degraded.textContent).toContain("需求层")
-    expect(degraded.textContent).toContain("limit must be an integer between 1 and 100")
-    expect(screen.queryByTestId("exploration-error")).toBeNull()
+    expect(degraded.textContent).toContain("无权限读取问题")
+    // The chain itself still renders.
+    expect(screen.getByTestId("chain-graph")).toBeTruthy()
+    const issueDegraded = screen.getByTestId("chain-issues-degraded")
+    expect(issueDegraded.textContent).toContain("无权限读取问题")
+    expect(screen.getByTestId("chain-issue-count").textContent).toContain("问题数据不可用")
+    expect(screen.queryByTestId("chain-issues-empty")).toBeNull()
   })
 
-  it("shows the chain error and the issue layer hint when every request is rejected", async () => {
-    const message = "limit must be an integer between 1 and 100"
-    mocks.listRequirements.mockRejectedValue(new Error(message))
-    mocks.getGraph.mockRejectedValue(new Error(message))
-    mocks.useCaseRuns.mockReturnValue(caseRunList([]))
-    mocks.useIssues.mockReturnValue(issuesResult([], { error: message }))
+  it("shows the chain error and the issue layer hint when the chain read fails", async () => {
+    const message = "limit must be an integer between 1 and 2000"
+    mocks.useExplorationChain.mockReturnValue(chainResult(null, { error: message }))
 
     renderTab()
 
     const error = await screen.findByTestId("exploration-error")
     expect(error.textContent).toContain(message)
-    expect(error.textContent).toContain("需求层")
-    expect(error.textContent).toContain("用例层")
     expect(screen.queryByTestId("exploration-empty")).toBeNull()
     expect((await screen.findByTestId("chain-issues-degraded")).textContent).toContain(message)
     expect(screen.queryByTestId("chain-issues-empty")).toBeNull()
     expect(screen.getByTestId("chain-issue-count").textContent).toContain("问题数据不可用")
   })
 
-  it("shows the current-batch issue empty state", async () => {
+  it("shows the current-batch issue empty state only when the read model has no issues", async () => {
+    mocks.useExplorationChain.mockReturnValue(
+      chainResult(
+        snapshotOf(
+          [requirementNode(R1, "登录需求"), caseNode(C1, "登录成功", [R1])],
+          [requirementCaseEdge(R1, C1)],
+        ),
+      ),
+    )
+
     renderTab()
 
     expect((await screen.findByTestId("chain-issues-empty")).textContent).toContain(
@@ -575,7 +822,11 @@ describe("ExplorationTab", () => {
     )
   })
 
-  it("filters the graph by requirement", async () => {
+  it("narrows the graph through the server when the requirement filter changes", async () => {
+    mocks.useExplorationChain.mockImplementation(
+      (_versionId: string, params: { requirementId?: string }) =>
+        chainResult(params.requirementId === R1 ? LOGIN_ONLY_SNAPSHOT : SNAPSHOT),
+    )
     renderTab()
     await screen.findByTestId(`chain-node-${R1}`)
 
@@ -584,12 +835,17 @@ describe("ExplorationTab", () => {
     })
 
     expect(screen.getByTestId(`chain-node-${R1}`)).toBeTruthy()
-    expect(screen.getByTestId(`chain-node-${C1}`)).toBeTruthy()
     expect(screen.queryByTestId(`chain-node-${R2}`)).toBeNull()
     expect(screen.queryByTestId(`chain-node-${C2}`)).toBeNull()
   })
 
-  it("filters by result status and by abnormal-only", async () => {
+  it("filters by result status and by abnormal-only through the server", async () => {
+    mocks.useExplorationChain.mockImplementation(
+      (_versionId: string, params: { resultStatus?: string; abnormalOnly?: boolean }) =>
+        chainResult(
+          params.resultStatus === "failed" || params.abnormalOnly ? FAILED_ONLY_SNAPSHOT : SNAPSHOT,
+        ),
+    )
     renderTab()
     await screen.findByTestId(`chain-node-${CR1}`)
 
@@ -637,24 +893,27 @@ describe("ExplorationTab", () => {
     expect(screen.getByTestId("chain-graph").getAttribute("data-zoom")).toBe("1")
   })
 
-  it("shows only the latest attempt of a case in the result layer", async () => {
-    const newest = caseRun({
-      id: CR3,
-      case_node_id: C1,
-      status: "passed",
-      attempt: 2,
-      title: "登录成功",
-    })
-    mocks.useCaseRuns.mockReturnValue(caseRunList([newest, PASSED_RUN]))
+  it("hides the result node when the server returns no result for the case", async () => {
+    mocks.useExplorationChain.mockReturnValue(
+      chainResult(
+        snapshotOf(
+          [requirementNode(R1, "登录需求"), caseNode(C1, "登录成功", [R1])],
+          [requirementCaseEdge(R1, C1)],
+        ),
+      ),
+    )
 
     renderTab()
     await screen.findByTestId(`chain-node-${C1}`)
 
-    expect(screen.getByTestId(`chain-node-${CR3}`).textContent).toContain("通过")
     expect(screen.queryByTestId(`chain-node-${CR1}`)).toBeNull()
   })
 
-  it("shows a filtered empty state when the filters hide every node", async () => {
+  it("shows a filtered empty state when the server returns no match", async () => {
+    mocks.useExplorationChain.mockImplementation(
+      (_versionId: string, params: { resultStatus?: string }) =>
+        chainResult(params.resultStatus === "interrupted" ? EMPTY_SNAPSHOT : SNAPSHOT),
+    )
     renderTab()
     await screen.findByTestId(`chain-node-${CR1}`)
 
@@ -668,9 +927,7 @@ describe("ExplorationTab", () => {
   })
 
   it("shows an empty state when the version has no chain nodes", async () => {
-    mocks.listRequirements.mockResolvedValue({ items: [], nextCursor: "", hasMore: false })
-    mocks.getGraph.mockResolvedValue(graph([]))
-    mocks.useCaseRuns.mockReturnValue(caseRunList([]))
+    mocks.useExplorationChain.mockReturnValue(chainResult(EMPTY_SNAPSHOT))
 
     renderTab()
 
@@ -678,5 +935,68 @@ describe("ExplorationTab", () => {
     expect(empty.textContent).toContain("暂无探索链路")
     expect(screen.queryByTestId("chain-drawer")).toBeNull()
     expect(within(screen.getByTestId("exploration-tab")).queryByRole("tree")).toBeNull()
+  })
+
+  it("opens the Sheet from the deep-linked node and reports selection changes", async () => {
+    const { onSelectedNodeChange } = renderTab({ selectedNodeId: `case:${C2}` })
+
+    const drawer = await screen.findByTestId("chain-drawer")
+    expect(drawer.getAttribute("data-kind")).toBe("case")
+    expect(drawer.textContent).toContain("提交订单")
+
+    fireEvent.click(screen.getByTestId("chain-drawer-close"))
+    expect(onSelectedNodeChange).toHaveBeenLastCalledWith("")
+
+    fireEvent.click(screen.getByTestId(`chain-node-${C1}`))
+    expect(onSelectedNodeChange).toHaveBeenLastCalledWith(`case:${C1}`)
+  })
+
+  it("shows 节点不存在 for a stale deep-linked node instead of crashing", async () => {
+    renderTab({ selectedNodeId: `case:${"9".repeat(18)}` })
+
+    await screen.findByTestId("chain-graph")
+    const missing = screen.findByTestId("chain-node-missing")
+    expect((await missing).textContent).toContain("节点不存在")
+    expect(screen.queryByTestId("chain-drawer")).toBeNull()
+  })
+
+  it("reports filter changes so the page can sync the URL", async () => {
+    const onFiltersChange = vi.fn()
+    renderTab({ onFiltersChange })
+    await screen.findByTestId(`chain-node-${R1}`)
+
+    fireEvent.change(screen.getByTestId("exploration-filter-status"), {
+      target: { value: "failed" },
+    })
+    expect(onFiltersChange).toHaveBeenLastCalledWith({
+      requirementId: "",
+      resultStatus: "failed",
+      abnormalOnly: false,
+      q: "",
+    })
+
+    fireEvent.change(screen.getByTestId("exploration-filter-requirement"), {
+      target: { value: R2 },
+    })
+    fireEvent.click(screen.getByTestId("exploration-filter-abnormal"))
+    expect(onFiltersChange).toHaveBeenLastCalledWith({
+      requirementId: R2,
+      resultStatus: "failed",
+      abnormalOnly: true,
+      q: "",
+    })
+  })
+
+  it("does not report zero issues when the issue layer is unavailable", async () => {
+    mocks.useExplorationChain.mockReturnValue(
+      chainResult(SNAPSHOT, { error: "limit must be an integer between 1 and 2000" }),
+    )
+
+    renderTab()
+
+    await screen.findByTestId("chain-issues-degraded")
+    const count = screen.getByTestId("chain-issue-count")
+    expect(count.textContent).toContain("问题数据不可用")
+    expect(count.textContent).not.toContain("0 个问题")
   })
 })
