@@ -14,6 +14,7 @@ import (
 	agenthttp "github.com/EdouardRichard/EzTest/backend/internal/agent/interfaces/httpapi"
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	audithttp "github.com/EdouardRichard/EzTest/backend/internal/audit/interfaces/httpapi"
+	chainhttp "github.com/EdouardRichard/EzTest/backend/internal/chain/interfaces/httpapi"
 	codeintelhttp "github.com/EdouardRichard/EzTest/backend/internal/codeintel/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
 	deliveryhttp "github.com/EdouardRichard/EzTest/backend/internal/delivery/interfaces/httpapi"
@@ -127,6 +128,11 @@ type Dependencies struct {
 	// delivery routes are mounted under /api/versions/{id} and /api. They rely
 	// on the global bearer auth and add no per-route guard (spec §11.1).
 	Delivery *deliveryhttp.Handlers
+	// Chain holds the P8 exploration-chain read-model handlers. When set,
+	// GET /api/versions/{versionId}/exploration-chain is mounted. The route
+	// relies on the global bearer auth and adds no per-route guard: every
+	// logged-in user may read a version's chain (spec §5.1).
+	Chain *chainhttp.Handlers
 }
 
 // New assembles the HTTP handler. Middleware runs in the order
@@ -235,6 +241,13 @@ func New(cfg config.Config, logger *slog.Logger, deps Dependencies) http.Handler
 		// add no per-route guard (spec §11.1); RegisterRoutes skips nil groups
 		// so a partially wired process mounts only what it has.
 		deps.Delivery.RegisterRoutes(mux)
+	}
+	if deps.Chain != nil {
+		// The exploration-chain read model (P8) is mounted at
+		// GET /api/versions/{versionId}/exploration-chain. It relies on the
+		// global bearer auth and adds no per-route guard (spec §5.1: every
+		// logged-in user may read it).
+		deps.Chain.RegisterRoutes(mux)
 	}
 	if deps.Events != nil && cfg.EnableTestEndpoints {
 		auditor := deps.Audit
