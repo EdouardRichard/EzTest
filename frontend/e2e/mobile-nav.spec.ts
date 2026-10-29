@@ -39,7 +39,8 @@ test.describe("phone navigation (375x667)", () => {
     await login(page)
 
     const sidebar = page.locator("aside")
-    const hamburger = page.getByRole("button", { name: "导航菜单" })
+    // exact: true keeps the trigger apart from the drawer's "关闭导航菜单" button.
+    const hamburger = page.getByRole("button", { name: "导航菜单", exact: true })
     const drawer = page.getByRole("dialog", { name: "主导航菜单" })
 
     await expect(sidebar).toBeHidden()

@@ -206,7 +206,9 @@ test("keeps manual clarification paths usable while the AI runtime is unavailabl
   await expect(
     page.getByRole("list", { name: "关系列表" }).getByText(`${reqATitle} → ${reqBTitle}`),
   ).toBeVisible()
-  await expect(page.getByRole("img", { name: /需求关系图：2 个需求节点，1 条关系/ })).toBeVisible()
+  await expect(
+    page.getByRole("group", { name: /需求关系图：2 个需求节点，1 条关系/ }),
+  ).toBeVisible()
   await expect(page.getByText("Application error")).toHaveCount(0)
   await expect(page.getByText("Something went wrong")).toHaveCount(0)
 

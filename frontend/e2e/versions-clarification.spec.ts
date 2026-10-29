@@ -201,7 +201,9 @@ test("clarifies with the fake LLM across two rounds and survives reload/reconnec
   await expect(
     page.getByRole("list", { name: "关系列表" }).getByText(RELATION_DESCRIPTION),
   ).toBeVisible()
-  await expect(page.getByRole("img", { name: "需求关系图：2 个需求节点，1 条关系" })).toBeVisible()
+  await expect(
+    page.getByRole("group", { name: "需求关系图：2 个需求节点，1 条关系" }),
+  ).toBeVisible()
   await page.screenshot({
     path: screenshotPath("versions-clarification-round2.png"),
     fullPage: true,
