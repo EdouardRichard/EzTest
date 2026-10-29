@@ -672,11 +672,11 @@ frontend/src/features/execution/
 ### 10.2 GC/保留
 
 - 配置：`EZTEST_GC_RETENTION_DAYS`（默认 30）、`EZTEST_GC_BATCH_KEEP`（默认 3，最近批保护）、`EZTEST_GC_ENABLED`（默认 false）。
-- 对象：证据文件、附件、导出、报告文件、孤儿文件（无 DB 行）。
-- 保护集：最近 N 批证据；发布报告引用；未关闭（open/confirmed）问题引用；基线证据；visual 基线；当前批次运行中。
-- 行为：`POST /api/admin/gc`（admin）body `{dryRun:true}` 默认 dry-run；返回候选数/字节/保护数；非 dry-run 删除文件并标记 DB（evidence `purged_at`/`purged_reason`，保留元数据）；写审计；UI 设置页展示 dry-run 结果与执行按钮（二次确认）。
+- 对象：证据文件、附件、导出、报告文件、孤儿文件（无 DB 行）。**P8 实施注记（Task 28 fix round 1 re-scope）**：实际自动清理仅覆盖 `EZTEST_EVIDENCE_DIR` 下的执行证据文件；附件、导出、报告文件与无 DB 行的孤儿文件缺少安全的引用/保护判定，**不在 P8 自动删除范围**，明确留给 P9/后续（`docs/operations.md`“已知限制”与设置页文案同步）。
+- 保护集：最近 N 批证据；未关闭（open/confirmed）问题引用；基线证据；visual 基线；当前批次运行中；已清除（`purged_at` 非空）行。**P8 实施注记（fix round 1）**：`report_ref(ref_kind='evidence')` 无生产写入——报告快照只含证据计数，不引用 evidence id——因此发布/过期（stale）报告不是有效的证据保护类，首版的空 claim 已从 SQL/UI/文档移除；`evidence_ref(ref_kind='report'|'issue')` 同样无写入者。若未来引入报告→证据引用，必须恢复保护 SQL 并补“报告服务生成 → GC 保护”的真实 PostgreSQL 集成测试。
+- 行为：`POST /api/admin/gc`（admin）body `{dryRun:true}` 默认 dry-run；返回候选数/字节/保护数/单次候选上限（10000）；非 dry-run 删除文件并标记 DB（evidence `purged_at`/`purged_reason`，保留元数据）；写审计；UI 设置页展示 dry-run 结果与执行按钮（二次确认）。
 - 定时：单实例维护任务每日一次（leader 持有），默认只 dry-run 记录；生产需显式开启。
-- 安全：绝不删除受保护对象；删除前校验 sha256/引用；失败回滚标记不删文件；日志不含内容。
+- 安全：绝不删除受保护对象；删除前校验 sha256/引用；缺失/损坏文件不删除不标记（缺失按跳过，损坏按跳过）；失败回滚标记不删文件；**标记后的删除/回滚使用脱离请求取消的有界后台 context（`context.WithoutCancel` + 30s）**，保证 mark 后必然 remove 或 rollback；`purged_reason` 保留 Unicode、控制字符转义、最多 120 字符；审计 best-effort；日志不含内容。
 
 ### 10.3 备份恢复
 

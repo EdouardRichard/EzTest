@@ -51,7 +51,11 @@ func gcPost(h http.Handler, body, token string) *httptest.ResponseRecorder {
 // TestAdminGCDefaultsToDryRun pins the safe default: an empty body (or an
 // omitted dryRun field) previews, never purges.
 func TestAdminGCDefaultsToDryRun(t *testing.T) {
-	service := &gcRouteService{report: executionapp.GCReport{DryRun: true, Candidates: 2}}
+	service := &gcRouteService{report: executionapp.GCReport{
+		DryRun:         true,
+		Candidates:     2,
+		CandidateLimit: executionapp.GCCandidateLimit,
+	}}
 	h := gcRoutesHandler(false, service)
 
 	rec := gcPost(h, `{}`, "ezt_admin")
@@ -72,6 +76,9 @@ func TestAdminGCDefaultsToDryRun(t *testing.T) {
 	}
 	if body.Data.Candidates != 2 || !body.Data.DryRun {
 		t.Fatalf("data=%+v", body.Data)
+	}
+	if body.Data.CandidateLimit != executionapp.GCCandidateLimit {
+		t.Fatalf("candidateLimit=%d want %d", body.Data.CandidateLimit, executionapp.GCCandidateLimit)
 	}
 }
 

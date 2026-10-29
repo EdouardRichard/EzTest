@@ -26,7 +26,9 @@ type gcFixedClock struct{ now time.Time }
 
 func (c gcFixedClock) Now() time.Time { return c.now }
 
-// gcFakeRepo is an in-memory GCRepository.
+// gcFakeRepo is an in-memory GCRepository. MarkPurged/RollbackPurged honour the
+// context like the real adapter so the canceled-request tests prove the service
+// detaches the destructive phase from the request cancellation.
 type gcFakeRepo struct {
 	candidates  []application.GCEvidence
 	protected   int
@@ -39,6 +41,8 @@ type gcFakeRepo struct {
 	listedKeep      int
 	marked          []gcMarked
 	rolledBack      []int64
+	purged          map[int64]bool
+	rollbackCtxErr  error
 }
 
 type gcMarked struct {
@@ -60,22 +64,56 @@ func (r *gcFakeRepo) IsProtected(_ context.Context, evidenceID int64, _ int) (bo
 	return r.isProtected[evidenceID], nil
 }
 
-func (r *gcFakeRepo) MarkPurged(_ context.Context, evidenceID int64, at time.Time, reason string) error {
+func (r *gcFakeRepo) MarkPurged(ctx context.Context, evidenceID int64, at time.Time, reason string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if r.purged == nil {
+		r.purged = make(map[int64]bool)
+	}
+	if r.purged[evidenceID] {
+		return errors.New("evidence is not an unpurged row")
+	}
+	r.purged[evidenceID] = true
 	r.marked = append(r.marked, gcMarked{id: evidenceID, at: at, reason: reason})
 	return nil
 }
 
-func (r *gcFakeRepo) RollbackPurged(_ context.Context, evidenceID int64, _ time.Time) error {
+func (r *gcFakeRepo) RollbackPurged(ctx context.Context, evidenceID int64, _ time.Time) error {
+	if err := ctx.Err(); err != nil {
+		r.rollbackCtxErr = err
+		return err
+	}
+	if !r.purged[evidenceID] {
+		return errors.New("no purge mark to roll back")
+	}
+	delete(r.purged, evidenceID)
 	r.rolledBack = append(r.rolledBack, evidenceID)
 	return nil
 }
 
+// gcCancelAfterMarkRepo cancels the request context right after MarkPurged,
+// emulating a client disconnect between the metadata write and the file removal.
+type gcCancelAfterMarkRepo struct {
+	application.GCRepository
+	afterMark func()
+}
+
+func (r gcCancelAfterMarkRepo) MarkPurged(ctx context.Context, evidenceID int64, at time.Time, reason string) error {
+	err := r.GCRepository.MarkPurged(ctx, evidenceID, at, reason)
+	if r.afterMark != nil {
+		r.afterMark()
+	}
+	return err
+}
+
 // gcFakeStore is an in-memory evidence filesystem.
 type gcFakeStore struct {
-	files     map[string][]byte
-	removed   []string
-	openErr   error
-	removeErr error
+	files        map[string][]byte
+	removed      []string
+	openErr      error
+	removeErr    error
+	removeCtxErr error
 }
 
 func (s *gcFakeStore) Open(_ context.Context, rel string) (io.ReadCloser, error) {
@@ -89,7 +127,11 @@ func (s *gcFakeStore) Open(_ context.Context, rel string) (io.ReadCloser, error)
 	return io.NopCloser(bytes.NewReader(data)), nil
 }
 
-func (s *gcFakeStore) Remove(_ context.Context, rel string) error {
+func (s *gcFakeStore) Remove(ctx context.Context, rel string) error {
+	s.removeCtxErr = ctx.Err()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.removeErr != nil {
 		return s.removeErr
 	}
@@ -158,6 +200,9 @@ func TestGCDryRunReportsCandidatesWithoutDeleting(t *testing.T) {
 	}
 	if report.Protected != 4 {
 		t.Fatalf("protected=%d want 4", report.Protected)
+	}
+	if report.CandidateLimit != application.GCCandidateLimit {
+		t.Fatalf("candidateLimit=%d want %d", report.CandidateLimit, application.GCCandidateLimit)
 	}
 	if report.Deleted != 0 || report.Skipped != 0 || report.Failed != 0 {
 		t.Fatalf("dry-run changed counters: %+v", report)
@@ -243,9 +288,10 @@ func TestGCHashMismatchDoesNotDelete(t *testing.T) {
 	}
 }
 
-// TestGCMissingFileDoesNotMark pins the failure path: an unreadable file is a
-// failure, never a delete, and the metadata row stays unpurged.
-func TestGCMissingFileDoesNotMark(t *testing.T) {
+// TestGCMissingFileIsSkipped pins the missing-artifact classification: the row
+// is already orphaned (file gone), so it is reported as skipped, not as a
+// failure, and neither marked nor removed.
+func TestGCMissingFileIsSkipped(t *testing.T) {
 	candidates, store := gcCandidates()
 	delete(store.files, candidates[0].Path)
 	repo := &gcFakeRepo{candidates: candidates, isProtected: map[int64]bool{}}
@@ -255,7 +301,7 @@ func TestGCMissingFileDoesNotMark(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if report.Failed != 1 || report.Deleted != 0 {
+	if report.Skipped != 1 || report.Failed != 0 || report.Deleted != 0 {
 		t.Fatalf("report=%+v", report)
 	}
 	if len(repo.marked) != 0 || len(store.removed) != 0 {
@@ -301,6 +347,32 @@ func TestGCPurgeMarksMetadataDeletesFileAndAudits(t *testing.T) {
 	}
 }
 
+// TestGCPurgeReasonPreservesUnicode pins the operator note: Chinese/Unicode text
+// is kept in purged_reason instead of being replaced by underscores; only
+// control characters are sanitized.
+func TestGCPurgeReasonPreservesUnicode(t *testing.T) {
+	candidates, store := gcCandidates()
+	repo := &gcFakeRepo{candidates: candidates, isProtected: map[int64]bool{}}
+	service := gcService(repo, store, &gcFakeAudit{}, time.Now())
+
+	_, err := service.Run(context.Background(), application.GCRequest{
+		DryRun: false, ActorID: 7, Reason: "季度清理：证据-保留\n第二行",
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(repo.marked) != 1 {
+		t.Fatalf("marked=%v", repo.marked)
+	}
+	reason := repo.marked[0].reason
+	if !strings.Contains(reason, "季度清理：证据-保留") {
+		t.Fatalf("purged reason=%q lost the Unicode note", reason)
+	}
+	if strings.ContainsAny(reason, "\n\r") {
+		t.Fatalf("purged reason=%q kept a control character", reason)
+	}
+}
+
 // TestGCRemoveFailureRollsBackPurgeMark proves a failed file removal rolls the
 // metadata mark back, so the row is never left claiming a file it still has.
 func TestGCRemoveFailureRollsBackPurgeMark(t *testing.T) {
@@ -318,6 +390,69 @@ func TestGCRemoveFailureRollsBackPurgeMark(t *testing.T) {
 	}
 	if len(repo.rolledBack) != 1 || repo.rolledBack[0] != 10 {
 		t.Fatalf("rolledBack=%v want [10]", repo.rolledBack)
+	}
+}
+
+// TestGCPurgeRemovesAfterRequestContextCanceled pins the purge ordering under a
+// client disconnect after MarkPurged: the removal must run on a detached
+// context, so the file is actually deleted and the row is not left half-purged.
+func TestGCPurgeRemovesAfterRequestContextCanceled(t *testing.T) {
+	candidates, store := gcCandidates()
+	repo := &gcFakeRepo{candidates: candidates, isProtected: map[int64]bool{}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cancelAfterMark := gcCancelAfterMarkRepo{GCRepository: repo, afterMark: cancel}
+	service := gcService(cancelAfterMark, store, &gcFakeAudit{}, time.Now())
+
+	report, err := service.Run(ctx, application.GCRequest{DryRun: false, ActorID: 7})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if report.Deleted != 1 || report.Failed != 0 {
+		t.Fatalf("report=%+v want deleted=1", report)
+	}
+	if store.removeCtxErr != nil {
+		t.Fatalf("Remove received a canceled context: %v", store.removeCtxErr)
+	}
+	if len(store.removed) != 1 {
+		t.Fatalf("removed=%v want the artifact removed", store.removed)
+	}
+	if len(repo.rolledBack) != 0 || !repo.purged[10] {
+		t.Fatalf("purged=%v rolledBack=%v want the purged mark kept", repo.purged, repo.rolledBack)
+	}
+}
+
+// TestGCPurgeRollbackAfterRequestContextCanceled pins the critical failure path:
+// once MarkPurged committed, a canceled request context must not prevent the
+// compensating rollback. The rollback has to clear purged_at so the row never
+// claims a file it still has.
+func TestGCPurgeRollbackAfterRequestContextCanceled(t *testing.T) {
+	candidates, store := gcCandidates()
+	store.removeErr = errors.New("disk is read-only")
+	repo := &gcFakeRepo{candidates: candidates, isProtected: map[int64]bool{}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cancelAfterMark := gcCancelAfterMarkRepo{GCRepository: repo, afterMark: cancel}
+	service := gcService(cancelAfterMark, store, &gcFakeAudit{}, time.Now())
+
+	report, err := service.Run(ctx, application.GCRequest{DryRun: false, ActorID: 7})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if report.Failed != 1 || report.Deleted != 0 {
+		t.Fatalf("report=%+v want failed=1", report)
+	}
+	if store.removeCtxErr != nil {
+		t.Fatalf("Remove received a canceled context: %v", store.removeCtxErr)
+	}
+	if repo.rollbackCtxErr != nil {
+		t.Fatalf("RollbackPurged received a canceled context: %v", repo.rollbackCtxErr)
+	}
+	if len(repo.rolledBack) != 1 || repo.rolledBack[0] != 10 {
+		t.Fatalf("rolledBack=%v want [10]", repo.rolledBack)
+	}
+	if repo.purged[10] {
+		t.Fatal("purged_at was not cleared after the failed removal")
 	}
 }
 
@@ -367,6 +502,7 @@ func TestGCRepositoryProtectionIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("filestore: %v", err)
 	}
+	relByID := make(map[int64]string)
 	insertEvidence := func(id, batchID int64, kind string, created time.Time) {
 		t.Helper()
 		rel := filepath.ToSlash(filepath.Join("9001", "1", strconv.FormatInt(id, 10)+".png"))
@@ -375,6 +511,7 @@ func TestGCRepositoryProtectionIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("write evidence %d: %v", id, err)
 		}
+		relByID[id] = path
 		_, err = pool.Exec(ctx, `
 			INSERT INTO evidence (id, batch_id, kind, path, sha256, size_bytes, mime, metadata, created_at, updated_at)
 			VALUES ($1, $2, $3, $4, $5, $6, 'image/png', '{}'::jsonb, $7, $7)`,
@@ -395,32 +532,35 @@ func TestGCRepositoryProtectionIntegration(t *testing.T) {
 		baselineKind = "visual_baseline"
 	}
 
-	insertEvidence(1, 100, "screenshot", old) // unreferenced + expired -> candidate
-	insertEvidence(2, 100, baselineKind, old) // baseline -> protected
-	insertEvidence(3, 101, "screenshot", old) // published report ref -> protected
-	insertEvidence(4, 101, "screenshot", old) // open issue ref -> protected
-	insertEvidence(5, 101, "screenshot", old) // dismissed issue ref -> candidate
-	insertEvidence(6, 102, "screenshot", old) // latest-N batch -> protected
-	insertEvidence(7, 103, "screenshot", old) // latest-N batch -> protected
-	insertEvidence(8, 104, "screenshot", old) // running batch -> protected
-	insertEvidence(9, 100, "screenshot", now) // young -> not a candidate
+	insertEvidence(1, 100, "screenshot", old)  // unreferenced + expired -> candidate
+	insertEvidence(2, 100, baselineKind, old)  // baseline (when available) -> protected
+	insertEvidence(3, 100, "screenshot", old)  // published report ref -> NOT a protection claim
+	insertEvidence(4, 101, "screenshot", old)  // open issue ref -> protected
+	insertEvidence(5, 101, "screenshot", old)  // dismissed issue ref -> candidate
+	insertEvidence(6, 102, "screenshot", old)  // latest-N batch -> protected
+	insertEvidence(7, 103, "screenshot", old)  // latest-N batch -> protected
+	insertEvidence(8, 104, "screenshot", old)  // running batch -> protected
+	insertEvidence(9, 100, "screenshot", now)  // young -> not a candidate
+	insertEvidence(10, 100, "screenshot", old) // stale report ref -> NOT a protection claim
 
-	wantProtected := 5
-	wantCandidates := []int64{1, 2, 5}
-	if baselineAvailable {
-		wantProtected = 6
-		wantCandidates = []int64{1, 5}
+	insertReport := func(id int64, revision int, status string, evidenceID string) {
+		t.Helper()
+		_, err := pool.Exec(ctx, `
+			INSERT INTO report (id, version_id, batch_id, revision, status, content, input_fingerprint, created_at, updated_at)
+			VALUES ($1, 9001, 100, $2, $3, '{}'::jsonb, $4, now(), now())`,
+			id, revision, status, strings.Repeat("b", 64))
+		if err != nil {
+			t.Fatalf("insert report %d: %v", id, err)
+		}
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO report_ref (report_id, ref_kind, ref_id) VALUES ($1, 'evidence', $2)`,
+			id, evidenceID); err != nil {
+			t.Fatalf("insert report ref %d: %v", id, err)
+		}
 	}
+	insertReport(500, 1, "published", "3")
+	insertReport(501, 2, "stale", "10")
 
-	_, err = pool.Exec(ctx, `
-		INSERT INTO report (id, version_id, batch_id, revision, status, content, input_fingerprint, created_at, updated_at)
-		VALUES (500, 9001, 101, 1, 'published', '{}'::jsonb, $1, now(), now())`, strings.Repeat("b", 64))
-	if err != nil {
-		t.Fatalf("insert report: %v", err)
-	}
-	if _, err = pool.Exec(ctx, `INSERT INTO report_ref (report_id, ref_kind, ref_id) VALUES (500, 'evidence', '3')`); err != nil {
-		t.Fatalf("insert report ref: %v", err)
-	}
 	insertIssue := func(id int64, status, reason string) {
 		t.Helper()
 		_, err := pool.Exec(ctx, `
@@ -439,12 +579,61 @@ func TestGCRepositoryProtectionIntegration(t *testing.T) {
 	}
 
 	repo := postgres.NewGCRepository(pool)
-	protected, err := repo.CountProtected(ctx, 3)
+	protectedFalse := func(id int64) {
+		t.Helper()
+		got, err := repo.IsProtected(ctx, id, 3)
+		if err != nil {
+			t.Fatalf("IsProtected(%d): %v", id, err)
+		}
+		if got {
+			t.Fatalf("IsProtected(%d)=true want false", id)
+		}
+	}
+	protectedTrue := func(id int64) {
+		t.Helper()
+		got, err := repo.IsProtected(ctx, id, 3)
+		if err != nil {
+			t.Fatalf("IsProtected(%d): %v", id, err)
+		}
+		if !got {
+			t.Fatalf("IsProtected(%d)=false want true", id)
+		}
+	}
+
+	wantProtected := 4
+	if baselineAvailable {
+		wantProtected = 5
+	}
+	wantCandidates := []int64{1, 3, 5, 10}
+	if !baselineAvailable {
+		wantCandidates = []int64{1, 2, 3, 5, 10}
+	}
+
+	// Every protection class answers true for its own row: open-issue
+	// issue_ref, the latest-N batches, the running batch and (when the visual
+	// migration is present) the visual baseline.
+	for _, id := range []int64{4, 6, 7, 8} {
+		protectedTrue(id)
+	}
+	if baselineAvailable {
+		protectedTrue(2)
+	}
+	// A report_ref(ref_kind='evidence') row is not written by report generation:
+	// the report snapshot stores evidence counts, never evidence ids. Neither a
+	// published nor a stale report therefore claims evidence, so the GC must not
+	// pretend to protect it (fix round 1, option B).
+	protectedFalse(3)
+	protectedFalse(10)
+	protectedFalse(1)
+	protectedFalse(5)
+	protectedFalse(9)
+
+	gotProtected, err := repo.CountProtected(ctx, 3)
 	if err != nil {
 		t.Fatalf("CountProtected: %v", err)
 	}
-	if protected != wantProtected {
-		t.Fatalf("protected=%d want %d (baseline kind available=%v)", protected, wantProtected, baselineAvailable)
+	if gotProtected != wantProtected {
+		t.Fatalf("protected=%d want %d (baseline kind available=%v)", gotProtected, wantProtected, baselineAvailable)
 	}
 	candidates, err := repo.ListCandidates(ctx, 30, 3)
 	if err != nil {
@@ -463,6 +652,26 @@ func TestGCRepositoryProtectionIntegration(t *testing.T) {
 		}
 	}
 
+	// Create a reference after the candidate listing, then flip it: the
+	// pre-delete IsProtected re-check must observe both transitions.
+	insertIssue(602, "open", "")
+	if _, err = pool.Exec(ctx, `INSERT INTO issue_ref (issue_id, ref_kind, ref_id) VALUES (602, 'evidence', '1')`); err != nil {
+		t.Fatalf("insert late issue ref: %v", err)
+	}
+	protectedTrue(1)
+	if _, err = pool.Exec(ctx, `UPDATE issue SET status = 'dismissed', dismissed_reason = 'duplicate' WHERE id = 602`); err != nil {
+		t.Fatalf("dismiss late issue: %v", err)
+	}
+	protectedFalse(1)
+	if _, err = pool.Exec(ctx, `UPDATE issue SET status = 'open', dismissed_reason = '' WHERE id = 601`); err != nil {
+		t.Fatalf("reopen dismissed issue: %v", err)
+	}
+	protectedTrue(5)
+	if _, err = pool.Exec(ctx, `UPDATE issue SET status = 'dismissed', dismissed_reason = 'not a defect' WHERE id = 601`); err != nil {
+		t.Fatalf("dismiss reopened issue: %v", err)
+	}
+	protectedFalse(5)
+
 	audit := &gcFakeAudit{}
 	service := application.NewGCService(application.GCDeps{
 		Repository:    repo,
@@ -478,7 +687,7 @@ func TestGCRepositoryProtectionIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if report.Deleted != len(wantCandidates) || report.Failed != 0 {
+	if report.Deleted != len(wantCandidates) || report.Failed != 0 || report.Skipped != 0 {
 		t.Fatalf("report=%+v", report)
 	}
 	for _, id := range wantCandidates {
@@ -489,8 +698,11 @@ func TestGCRepositoryProtectionIntegration(t *testing.T) {
 		if purged == nil {
 			t.Fatalf("evidence %d was not marked purged", id)
 		}
+		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(relByID[id]))); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("evidence %d file still exists after purge (err=%v)", id, err)
+		}
 	}
-	for _, id := range []int64{2, 3, 4, 6, 7, 8, 9} {
+	for _, id := range []int64{2, 3, 4, 6, 7, 8, 9, 10} {
 		if containsID(wantCandidates, id) {
 			continue
 		}
@@ -501,6 +713,181 @@ func TestGCRepositoryProtectionIntegration(t *testing.T) {
 		if purged != nil {
 			t.Fatalf("protected evidence %d was purged", id)
 		}
+		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(relByID[id]))); err != nil {
+			t.Fatalf("protected evidence %d file was removed: %v", id, err)
+		}
+	}
+	// A purged row is part of the protection set, so a second run never
+	// re-processes it.
+	protectedTrue(wantCandidates[0])
+}
+
+// TestGCRepositoryPurgeMetadataIntegration covers the purged_at transitions of
+// the real SQL: MarkPurged is a one-row conditional update, RollbackPurged only
+// clears the exact mark written by this run.
+func TestGCRepositoryPurgeMetadataIntegration(t *testing.T) {
+	pool := testutil.OpenTestDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	old := now.Add(-60 * 24 * time.Hour)
+
+	_, err := pool.Exec(ctx, `
+		INSERT INTO run_batch (id, version_id, batch_no, status, baseline_hash, graph_hash, created_by, created_at, updated_at)
+		VALUES (200, 9002, 1, 'done', $1, $1, 7, now(), now())`, strings.Repeat("c", 64))
+	if err != nil {
+		t.Fatalf("insert batch: %v", err)
+	}
+	if _, err = pool.Exec(ctx, `
+		INSERT INTO evidence (id, batch_id, kind, path, sha256, size_bytes, mime, metadata, created_at, updated_at)
+		VALUES (20, 200, 'screenshot', $1, $2, 12, 'image/png', '{}'::jsonb, $3, $3)`,
+		"9002/1/20.png", strings.Repeat("d", 64), old); err != nil {
+		t.Fatalf("insert evidence: %v", err)
+	}
+
+	repo := postgres.NewGCRepository(pool)
+	at := now.Add(-time.Minute)
+	if err := repo.MarkPurged(ctx, 20, at, "gc: retention=30d batch_keep=3"); err != nil {
+		t.Fatalf("MarkPurged: %v", err)
+	}
+	var purged *time.Time
+	var reason string
+	if err := pool.QueryRow(ctx, `SELECT purged_at, purged_reason FROM evidence WHERE id = 20`).Scan(&purged, &reason); err != nil {
+		t.Fatalf("read purged row: %v", err)
+	}
+	if purged == nil || !purged.UTC().Equal(at) || reason != "gc: retention=30d batch_keep=3" {
+		t.Fatalf("purged=%v reason=%q", purged, reason)
+	}
+
+	// MarkPurged is conditional on purged_at IS NULL: a second call and a
+	// missing row both report a zero-row update instead of silently succeeding.
+	if err := repo.MarkPurged(ctx, 20, at, "again"); err == nil {
+		t.Fatal("MarkPurged on an already purged row succeeded; want zero-row error")
+	}
+	if err := repo.MarkPurged(ctx, 999999, at, "missing"); err == nil {
+		t.Fatal("MarkPurged on a missing row succeeded; want zero-row error")
+	}
+
+	// RollbackPurged only clears the exact mark this run wrote: a foreign
+	// timestamp leaves the row untouched (and is reported as an error).
+	if err := repo.RollbackPurged(ctx, 20, at.Add(time.Second)); err == nil {
+		t.Fatal("RollbackPurged with a foreign mark succeeded; want zero-row error")
+	}
+	if err := pool.QueryRow(ctx, `SELECT purged_at FROM evidence WHERE id = 20`).Scan(&purged); err != nil {
+		t.Fatalf("read purged row after foreign rollback: %v", err)
+	}
+	if purged == nil {
+		t.Fatal("RollbackPurged with a foreign mark cleared the row")
+	}
+	if err := repo.RollbackPurged(ctx, 20, at); err != nil {
+		t.Fatalf("RollbackPurged: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT purged_at, purged_reason FROM evidence WHERE id = 20`).Scan(&purged, &reason); err != nil {
+		t.Fatalf("read rolled back row: %v", err)
+	}
+	if purged != nil || reason != "" {
+		t.Fatalf("rolled back purged=%v reason=%q want NULL/empty", purged, reason)
+	}
+}
+
+// gcCancelAfterMarkRepository wraps the real repository and cancels the request
+// context immediately after MarkPurged commits.
+type gcCancelAfterMarkRepository struct {
+	application.GCRepository
+	cancel context.CancelFunc
+}
+
+func (r gcCancelAfterMarkRepository) MarkPurged(ctx context.Context, evidenceID int64, at time.Time, reason string) error {
+	err := r.GCRepository.MarkPurged(ctx, evidenceID, at, reason)
+	r.cancel()
+	return err
+}
+
+// gcContextRecordingStore wraps the real filestore, records the context state
+// Remove receives and can fail one artifact removal.
+type gcContextRecordingStore struct {
+	inner     application.GCFileStore
+	failPath  string
+	removeCtx []error
+}
+
+func (s *gcContextRecordingStore) Open(ctx context.Context, rel string) (io.ReadCloser, error) {
+	return s.inner.Open(ctx, rel)
+}
+
+func (s *gcContextRecordingStore) Remove(ctx context.Context, rel string) error {
+	s.removeCtx = append(s.removeCtx, ctx.Err())
+	if rel == s.failPath {
+		return errors.New("simulated remove failure")
+	}
+	return s.inner.Remove(ctx, rel)
+}
+
+// TestGCPurgeRollbackIntegrationAfterCanceledRequest proves end to end that a
+// request cancellation between MarkPurged and the file removal still rolls the
+// real purged_at back, and the file is retained.
+func TestGCPurgeRollbackIntegrationAfterCanceledRequest(t *testing.T) {
+	pool := testutil.OpenTestDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	old := now.Add(-60 * 24 * time.Hour)
+
+	for id, batchNo := range map[int64]int{300: 1, 301: 2} {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO run_batch (id, version_id, batch_no, status, baseline_hash, graph_hash, created_by, created_at, updated_at)
+			VALUES ($1, 9003, $2, 'done', $3, $3, 7, now(), now())`,
+			id, batchNo, strings.Repeat("e", 64)); err != nil {
+			t.Fatalf("insert batch %d: %v", id, err)
+		}
+	}
+	root := t.TempDir()
+	store, err := filestore.New(root)
+	if err != nil {
+		t.Fatalf("filestore: %v", err)
+	}
+	rel, digest, size, err := store.Write(ctx, "9003/1/30.png", []byte("evidence-30"))
+	if err != nil {
+		t.Fatalf("write evidence: %v", err)
+	}
+	if _, err = pool.Exec(ctx, `
+		INSERT INTO evidence (id, batch_id, kind, path, sha256, size_bytes, mime, metadata, created_at, updated_at)
+		VALUES (30, 300, 'screenshot', $1, $2, $3, 'image/png', '{}'::jsonb, $4, $4)`,
+		rel, digest, size, old); err != nil {
+		t.Fatalf("insert evidence: %v", err)
+	}
+
+	repo := postgres.NewGCRepository(pool)
+	requestCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	recordingStore := &gcContextRecordingStore{inner: store, failPath: rel}
+	service := application.NewGCService(application.GCDeps{
+		Repository:    gcCancelAfterMarkRepository{GCRepository: repo, cancel: cancel},
+		Files:         recordingStore,
+		Audit:         &gcFakeAudit{},
+		Clock:         gcFixedClock{now: now},
+		Logger:        gcTestLogger(),
+		Enabled:       true,
+		RetentionDays: 30,
+		BatchKeep:     1,
+	})
+	report, err := service.Run(requestCtx, application.GCRequest{DryRun: false, ActorID: 7})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if report.Failed != 1 || report.Deleted != 0 {
+		t.Fatalf("report=%+v want failed=1", report)
+	}
+	if len(recordingStore.removeCtx) != 1 || recordingStore.removeCtx[0] != nil {
+		t.Fatalf("Remove contexts=%v want one live (non-canceled) context", recordingStore.removeCtx)
+	}
+	var purged *time.Time
+	if err := pool.QueryRow(ctx, `SELECT purged_at FROM evidence WHERE id = 30`).Scan(&purged); err != nil {
+		t.Fatalf("read purged_at: %v", err)
+	}
+	if purged != nil {
+		t.Fatal("purged_at was not rolled back after the failed removal")
+	}
+	if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(rel))); err != nil {
+		t.Fatalf("artifact was removed despite the failed purge: %v", err)
 	}
 }
 

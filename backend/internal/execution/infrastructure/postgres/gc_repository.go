@@ -10,21 +10,23 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/execution/application"
 )
 
-// gcCandidateLimit bounds one purge run so a very large backlog cannot hold an
-// unbounded slice in memory. Later runs continue where this one stopped.
-const gcCandidateLimit = 10000
-
 // gcProtectedCTETemplate is the reference-protection query of spec 10.2. The
 // placeholder is the batch-keep parameter ($1 or $2 depending on the caller).
 //
 // Protected evidence:
 //   - every artifact of an active (planned/running) batch;
 //   - every artifact of the latest batchKeep batches of each version;
-//   - evidence referenced by a published report (report_ref);
 //   - evidence referenced by an open/confirmed issue (issue_ref);
-//   - visual-baseline artifacts (evidence.kind);
-//   - evidence referenced from the evidence_ref report/issue rows, for the
-//     legacy P6 reference table.
+//   - visual-baseline artifacts (evidence.kind).
+//
+// The set deliberately contains only references that the application actually
+// writes. In particular report_ref(ref_kind='evidence') is not produced by the
+// report service (the report snapshot carries evidence counts, never evidence
+// ids), so a published/stale report is not a protection claim; the same holds
+// for evidence_ref(ref_kind='report'|'issue'), which has no writer either.
+// Issue refs are canonical decimal id strings, so they are compared as text to
+// avoid bigint cast overflow and to keep the listing and re-check queries
+// consistent.
 const gcProtectedCTETemplate = `
 WITH protected AS (
   SELECT ev.id
@@ -40,33 +42,15 @@ WITH protected AS (
   ) ranked ON ranked.id = ev.batch_id
   WHERE ranked.rn <= %s
   UNION
-  SELECT ref.ref_id::bigint
-  FROM report_ref ref
-  JOIN report rp ON rp.id = ref.report_id
-  WHERE ref.ref_kind = 'evidence'
-    AND ref.ref_id ~ '^[0-9]+$'
-    AND rp.status = 'published'
-  UNION
-  SELECT ref.ref_id::bigint
-  FROM issue_ref ref
+  SELECT ev.id
+  FROM evidence ev
+  JOIN issue_ref ref ON ref.ref_kind = 'evidence' AND ref.ref_id = ev.id::text
   JOIN issue i ON i.id = ref.issue_id
-  WHERE ref.ref_kind = 'evidence'
-    AND ref.ref_id ~ '^[0-9]+$'
-    AND i.status IN ('open', 'confirmed')
+  WHERE i.status IN ('open', 'confirmed')
   UNION
   SELECT ev.id
   FROM evidence ev
   WHERE ev.kind = 'visual_baseline'
-  UNION
-  SELECT er.evidence_id
-  FROM evidence_ref er
-  JOIN report rp ON rp.id = er.ref_id
-  WHERE er.ref_kind = 'report' AND rp.status = 'published'
-  UNION
-  SELECT er.evidence_id
-  FROM evidence_ref er
-  JOIN issue i ON i.id = er.ref_id
-  WHERE er.ref_kind = 'issue' AND i.status IN ('open', 'confirmed')
 )`
 
 // gcProtectedCTE returns the protection CTE bound to keepPlaceholder.
@@ -102,7 +86,7 @@ func (r *GCRepository) ListCandidates(ctx context.Context, retentionDays, batchK
 		  AND ev.created_at < now() - ($1::int * interval '1 day')
 		  AND ev.id NOT IN (SELECT id FROM protected)
 		ORDER BY ev.created_at ASC, ev.id ASC
-		LIMIT `+fmt.Sprintf("%d", gcCandidateLimit),
+		LIMIT `+fmt.Sprintf("%d", application.GCCandidateLimit),
 		retentionDays, batchKeep)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list gc candidates: %w", err)
@@ -165,25 +149,9 @@ func (r *GCRepository) IsProtected(ctx context.Context, evidenceID int64, batchK
 					WHERE ranked.id = ev.batch_id AND ranked.rn <= $2
 				)
 				OR EXISTS (
-					SELECT 1 FROM report_ref ref
-					JOIN report rp ON rp.id = ref.report_id
-					WHERE ref.ref_kind = 'evidence' AND ref.ref_id = ev.id::text AND rp.status = 'published'
-				)
-				OR EXISTS (
 					SELECT 1 FROM issue_ref iref
 					JOIN issue i ON i.id = iref.issue_id
 					WHERE iref.ref_kind = 'evidence' AND iref.ref_id = ev.id::text
-					  AND i.status IN ('open', 'confirmed')
-				)
-				OR EXISTS (
-					SELECT 1 FROM evidence_ref er
-					JOIN report rp ON rp.id = er.ref_id
-					WHERE er.ref_kind = 'report' AND er.evidence_id = ev.id AND rp.status = 'published'
-				)
-				OR EXISTS (
-					SELECT 1 FROM evidence_ref er
-					JOIN issue i ON i.id = er.ref_id
-					WHERE er.ref_kind = 'issue' AND er.evidence_id = ev.id
 					  AND i.status IN ('open', 'confirmed')
 				)
 			)
@@ -212,13 +180,19 @@ func (r *GCRepository) MarkPurged(ctx context.Context, evidenceID int64, at time
 }
 
 // RollbackPurged clears the mark after a failed file removal. It only clears
-// the exact mark this run wrote, so a concurrent purge is never disturbed.
+// the exact mark this run wrote, so a concurrent purge is never disturbed. A
+// zero row-count means the mark is gone or was replaced by another writer; the
+// caller must report that instead of silently claiming the row is unpurged.
 func (r *GCRepository) RollbackPurged(ctx context.Context, evidenceID int64, at time.Time) error {
-	if _, err := r.q.Exec(ctx, `
+	tag, err := r.q.Exec(ctx, `
 		UPDATE evidence
 		SET purged_at = NULL, purged_reason = '', updated_at = now()
-		WHERE id = $1 AND purged_at = $2`, evidenceID, at); err != nil {
+		WHERE id = $1 AND purged_at = $2`, evidenceID, at)
+	if err != nil {
 		return fmt.Errorf("postgres: rollback evidence purge mark: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("postgres: evidence %d purge mark was not rolled back", evidenceID)
 	}
 	return nil
 }

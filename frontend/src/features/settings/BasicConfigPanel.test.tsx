@@ -33,6 +33,7 @@ const DRY_RUN_REPORT = {
   skipped: 0,
   retentionDays: 30,
   batchKeep: 3,
+  candidateLimit: 10000,
 }
 
 describe("BasicConfigPanel", () => {
@@ -49,6 +50,7 @@ describe("BasicConfigPanel", () => {
     render(<BasicConfigPanel />)
 
     expect(screen.getByRole("heading", { name: "基础配置" })).toBeTruthy()
+    expect(screen.getByText("配置只读")).toBeTruthy()
     expect(screen.getByText("运行环境")).toBeTruthy()
     expect(screen.getByText("限流与保留")).toBeTruthy()
     expect(screen.getByText("SLO 阈值")).toBeTruthy()
@@ -113,12 +115,25 @@ describe("BasicConfigPanel", () => {
     expect(await screen.findByText(/候选 2 个/)).toBeTruthy()
     expect(screen.getByText(/受保护 7 个/)).toBeTruthy()
     expect(screen.getByText(/4\.0 KiB/)).toBeTruthy()
+    expect(screen.getByText(/单次最多处理 10000 个候选/)).toBeTruthy()
 
     // The execute button only opens the confirmation; it must not purge yet.
     fireEvent.click(screen.getByRole("button", { name: "执行 GC" }))
     expect(mocks.apiPost).toHaveBeenCalledTimes(1)
     expect(screen.getByRole("button", { name: "确认执行" })).toBeTruthy()
 
+    // Alertdialog focus moves to the least destructive action, and Escape
+    // closes it without a request; focus returns to the execute button.
+    const cancel = screen.getByRole("button", { name: "取消" })
+    await waitFor(() => expect(document.activeElement).toBe(cancel))
+    fireEvent.keyDown(cancel, { key: "Escape" })
+    expect(screen.queryByRole("button", { name: "确认执行" })).toBeNull()
+    await waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByRole("button", { name: "执行 GC" })),
+    )
+    expect(mocks.apiPost).toHaveBeenCalledTimes(1)
+
+    fireEvent.click(screen.getByRole("button", { name: "执行 GC" }))
     mocks.apiPost.mockResolvedValueOnce({
       ...DRY_RUN_REPORT,
       dryRun: false,
@@ -133,6 +148,8 @@ describe("BasicConfigPanel", () => {
       }),
     )
     expect(await screen.findByText(/已删除 2 个/)).toBeTruthy()
+    // After a real purge the destructive action requires a new dry-run.
+    expect((screen.getByRole("button", { name: "执行 GC" }) as HTMLButtonElement).disabled).toBe(true)
   })
 
   it("cancels the second confirmation and shows the disabled error from the API", async () => {
@@ -157,12 +174,30 @@ describe("BasicConfigPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "确认执行" }))
     expect(
       await screen.findByText(
-        "evidence GC execution is disabled（非 dry-run 需要 EZTEST_GC_ENABLED=true）",
+        "evidence GC execution is disabled（409：非 dry-run 需要 EZTEST_GC_ENABLED=true）",
       ),
     ).toBeTruthy()
     expect(mocks.apiPost).toHaveBeenCalledWith("/api/admin/gc", {
       dryRun: false,
       reason: "settings panel",
     })
+  })
+
+  it("labels a 403 as an admin-permission failure instead of a disabled switch", async () => {
+    mocks.apiPost
+      .mockResolvedValueOnce(DRY_RUN_REPORT)
+      .mockRejectedValueOnce(
+        Object.assign(new Error("forbidden"), { status: 403, code: "forbidden" }),
+      )
+    render(<BasicConfigPanel />)
+
+    fireEvent.click(await screen.findByRole("button", { name: "GC dry-run 预览" }))
+    expect(await screen.findByText(/候选 2 个/)).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "执行 GC" }))
+    fireEvent.click(screen.getByRole("button", { name: "确认执行" }))
+    expect(
+      await screen.findByText(/仅管理员可执行 GC（403）：forbidden/),
+    ).toBeTruthy()
+    expect(screen.queryByText(/（409：/)).toBeNull()
   })
 })

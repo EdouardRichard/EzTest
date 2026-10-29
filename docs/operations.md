@@ -139,7 +139,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/restore.ps1 `
 
 ## 证据 GC 与保留
 
-> 设计依据：规格 §10.2/D65。当前章节覆盖**执行证据文件**的保留与清理；导出/附件/报告文件与孤儿文件不在本轮自动删除范围内（见“已知限制”）。
+> 设计依据：规格 §10.2/D65。当前章节覆盖**执行证据文件**（`EZTEST_EVIDENCE_DIR`）的保留与清理。规格 §10.2 的“对象”还列出导出、附件、报告文件与无 DB 行的孤儿文件；P8 **未**自动清理这些对象，已按实现能力明确 re-scope（见“已知限制”与规格 §10.2 实施注记），UI 文案也只承诺执行证据文件。
 
 ### 配置
 
@@ -171,6 +171,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/restore.ps1 `
     "skipped": 0,
     "retentionDays": 30,
     "batchKeep": 3,
+    "candidateLimit": 10000,
     "runAt": "2026-10-29T08:00:00Z"
   }
 }
@@ -178,26 +179,37 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/restore.ps1 `
 
 - `dryRun` 缺省/`true`：只统计候选与受保护数量、候选字节数，**不读文件内容、不删除、不写 purged 元数据**；仍写一条审计（`dry_run=true`）。
 - `dryRun:false`：在 `EZTEST_GC_ENABLED=true` 时逐个删除候选；否则 409。
-- 管理端“设置 → 基础配置”提供 dry-run 预览与二次确认的执行按钮；普通用户无此页面。
+- 单次运行最多处理 `candidateLimit`（当前固定 10000）个候选；`candidates` 等于该值时说明可能还有剩余，再次运行即可继续清理（按 `created_at,id` 升序推进）。
+- 管理端“设置 → 基础配置”提供 dry-run 预览与二次确认的执行按钮；普通用户无此页面，调用该端点返回 403。
 
 ### 保护集（绝不删除）
 
 1. 运行中/计划中的批次（`run_batch.status IN ('planned','running')`）的全部证据。
 2. 每个版本最近 `EZTEST_GC_BATCH_KEEP` 批的证据。
-3. 已发布报告（`report.status='published'`）通过 `report_ref`（`ref_kind='evidence'`）引用的证据，以及旧的 `evidence_ref(ref_kind='report')` 引用。
-4. 未关闭问题（`issue.status IN ('open','confirmed')`）通过 `issue_ref` 引用的证据，以及 `evidence_ref(ref_kind='issue')` 引用。
-5. 基线证据：`evidence.kind='visual_baseline'`（视觉断言迁移启用后由任务 25 写入）。
+3. 未关闭问题（`issue.status IN ('open','confirmed')`）通过 `issue_ref`（`ref_kind='evidence'`）引用的证据。`issue_ref.ref_id` 是十进制字符串，保护 SQL 统一用 `ref_id = evidence.id::text` 比较，避免 bigint 转换越界，也保证候选列表与删除前复核口径一致。
+4. 基线证据：`evidence.kind='visual_baseline'`（视觉断言迁移提供该 kind 后生效；当前工作树若尚未包含该迁移，则不存在此类行，保护条件仍保留）。
+5. 已清除证据（`purged_at IS NOT NULL`）不会再次成为候选；删除前复核也会将其视为受保护。
 6. 最近 N 批以外的候选仍会在删除前**再次**执行引用校验（`IsProtected`），避免候选列出后新建立的引用被误删。
+
+#### 报告引用不在保护集（fix round 1 修正）
+
+P8 首版保护集宣称“已发布报告引用的证据受保护”，但该 claim 是空的：报告快照 `eztest.report.v1` 只携带 `evidenceCount` 计数，**不携带也不引用 evidence id**；报告仓库的 `report_ref` 生产写入只覆盖 `batch/case_run/issue/requirement/commit`，从不写 `ref_kind='evidence'`。`evidence_ref` 的生产写入也只有 `case_run/step_result/assertion_result`，没有 `report/issue`。因此本实现移除了以下空保护分支（SQL、文档、UI 同步）：
+
+- `report_ref(ref_kind='evidence')` + `report.status='published'`（发布报告）；
+- `report.status='stale'` 同理也不保护（stale 只是 published 的失效状态，同样不引用 evidence id）；
+- `evidence_ref(ref_kind='report'|'issue')`（无生产写入）。
+
+目前只保护真实存在的引用类型：最近 N 批、运行中批次、未关闭问题 `issue_ref`、`visual_baseline`、已清除行。如果未来让报告显式引用证据（新增快照字段或发布时写 `report_ref(ref_kind='evidence')`），必须同时恢复保护 SQL，并补一条“报告服务生成 → GC 保护”的真实 PostgreSQL 集成测试。
 
 ### 删除顺序与安全
 
 对每个候选：
 
 1. 引用复核：命中保护集 → 跳过（`skipped`），不删除。
-2. 读取证据文件并复算 SHA-256/大小；与 `evidence.sha256/size_bytes` 不一致或文件缺失 → 跳过/失败，**不删除、不写 purged 标记**。
-3. 写 `evidence.purged_at` / `purged_reason`（保留行与全部元数据）。
-4. 删除文件；删除失败则回滚 purged 标记（`failed`），避免“标记已清理但文件仍在”。
-5. 每次运行写一条审计 `execution.evidence.gc`：只含计数、阈值、dry-run 标志与操作者，不含路径、sha256 或证据内容。
+2. 读取证据文件并复算 SHA-256/大小；与 `evidence.sha256/size_bytes` 不一致 → 跳过（`skipped`），**不删除、不写 purged 标记**。文件已缺失（`fs.ErrNotExist`）同样按跳过处理：行已无文件可删，保留元数据供人工核对，不计为失败（避免 nightly 告警噪声）。
+3. 写 `evidence.purged_at` / `purged_reason`（保留行与全部元数据）。`purged_reason` 支持 Unicode（中文等按原样保留；换行/控制字符转空格或 `_`，最多 120 个字符），便于运维用母语记录原因。
+4. 删除文件。一旦第 3 步提交，后续删除与回滚使用**脱离请求取消的有界后台 context**（`context.WithoutCancel` + 30s 超时）：客户端断开或请求超时都不会把行留在“已标记但文件仍在”的状态；删除失败会再次用新的有界后台 context 回滚 purged 标记（`failed`），失败原因只写日志。
+5. 每次运行写一条审计 `execution.evidence.gc`：只含计数、阈值、dry-run 标志、候选上限与操作者，不含路径、sha256 或证据内容。审计是 **best-effort**：审计 sink 故障只记日志，不会把已完成的 GC 反报为失败。
 
 `purged_reason` 形如 `gc: retention=30d batch_keep=3; reason=<受限操作员备注>`。证据行保留，因此历史 case/step 关联、计数和审计仍可追溯；读取已清除证据会得到“文件缺失”错误，不会读取旧字节。
 
@@ -222,7 +234,10 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:13333/api/admin/gc `
 
 ### 已知限制
 
-- 当前实现清理**执行证据文件**（`EZTEST_EVIDENCE_DIR`）；导出、版本附件、报告 Markdown 与“无 DB 行的孤儿文件”尚未纳入自动删除，后续任务可按同一保护集扩展。
+- **对象范围 re-scope（P8）**：当前自动清理只覆盖**执行证据文件**（`EZTEST_EVIDENCE_DIR`）。规格 §10.2 列出的导出文件、版本附件、报告 Markdown 文件，以及“无 DB 行的孤儿文件”**不在 P8 自动删除范围**；这些对象缺少足够的 DB 引用/保护元数据做安全判定，明确留给 P9/后续任务（规格 §10.2 已加实施注记，UI 文案同步只承诺执行证据文件）。
+- 报告（`published`/`stale`）不参与证据保护：报告快照只有证据计数、没有 evidence id，`report_ref(ref_kind='evidence')` 无生产写入（详见“报告引用不在保护集”）。这是行为边界，不是配置项。
+- 文件缺失但元数据行仍存在的证据会被反复列为候选并跳过；需要人工核对 `purged_at`/文件系统后决定修复或手工清理，P8 不自动改写这类行。
+- 单次运行最多处理 10000 个候选（响应 `candidateLimit`）；超大队列需要多次运行。
 - 定时维护任务已接线：每日一次、leader 持有、默认只 dry-run（见下一节「多实例单活」）；管理员仍可手动 `POST /api/admin/gc`。
 - 证据行保留但文件已删；前端/API 读取此类证据会报文件缺失，应在报表/审计中结合 `purged_at` 解释。
 - 本机验收仅覆盖单元测试与 env-gated PostgreSQL 集成测试；生产首次执行前应在目标环境先跑 dry-run，并核对 `candidates`/`protected`。
