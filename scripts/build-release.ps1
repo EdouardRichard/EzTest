@@ -1775,25 +1775,35 @@ function Write-Checksums {
 # Step 9: package smoke tests (Windows native + one-shot WSL Linux).
 # ---------------------------------------------------------------------------
 function Assert-SmokePortsFree {
-    $inUse = @()
-    foreach ($check in @(
+    # The Windows smoke test stops its throw-away PostgreSQL asynchronously, so a
+    # port can still be bound for a few seconds when the Linux smoke starts. Poll
+    # for a bounded time instead of failing on a transient conflict.
+    param([int]$TimeoutSeconds = 60)
+    $checks = @(
         @{ Port = 13333; Label = "API" },
         @{ Port = 6868; Label = "web" },
         @{ Port = 13336; Label = "executor" },
         @{ Port = 55432; Label = "smoke PostgreSQL (Windows)" },
         @{ Port = 55433; Label = "smoke PostgreSQL (Linux)" }
-    )) {
-        if (Test-TcpPort -TargetHost "127.0.0.1" -Port $check.Port -TimeoutMs 1000) {
-            $inUse += ("{0} ({1})" -f $check.Port, $check.Label)
+    )
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ($true) {
+        $inUse = @()
+        foreach ($check in $checks) {
+            if (Test-TcpPort -TargetHost "127.0.0.1" -Port $check.Port -TimeoutMs 1000) {
+                $inUse += ("{0} ({1})" -f $check.Port, $check.Label)
+            }
         }
-    }
-    if ($inUse.Count -gt 0) {
-        Write-Fail @"
+        if ($inUse.Count -eq 0) { return }
+        if ((Get-Date) -ge $deadline) {
+            Write-Fail @"
 The package smoke test needs these ports free, but they are already in use:
   $($inUse -join ", ")
 Stop the dev/demo stack (api 13333, web 6868, executor 13336) and the throw-away PostgreSQL probes,
 or re-run with -SkipSmoke to only produce the archives.
 "@
+        }
+        Start-Sleep -Milliseconds 1000
     }
 }
 
@@ -1915,8 +1925,15 @@ function Invoke-WindowsSmoke {
             }
         }
         if ($pgStarted) {
-            Start-Process -FilePath $pgCtl -ArgumentList @("-D", $pgData, "-m", "fast", "-w", "stop") -WindowStyle Hidden
-            Start-Sleep -Seconds 2
+            Write-Info "Stopping the throw-away PostgreSQL..."
+            [void](Invoke-ProcessCapture -FilePath $pgCtl -Arguments @("-D", $pgData, "-m", "fast", "-w", "stop") -TimeoutMs 60000)
+            # -w already waits, but poll the port so the next smoke step starts on a
+            # genuinely free port instead of racing the shutdown.
+            $deadline = (Get-Date).AddSeconds(30)
+            while ((Get-Date) -lt $deadline) {
+                if (-not (Test-TcpPort -TargetHost "127.0.0.1" -Port 55432 -TimeoutMs 500)) { break }
+                Start-Sleep -Milliseconds 500
+            }
         }
     }
 }
