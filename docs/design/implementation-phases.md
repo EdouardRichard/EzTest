@@ -304,7 +304,7 @@ P0–P8 ────────────────────────
 
 **风险**：范围膨胀 → 严格按 P0–P7 已交付功能做体验与硬化，不新增业务能力；P2 项默认不做。
 
-> **P8 实施状态（2026-10-29，Task 33 文档同步）**：P8 主体已按本阶段规格落地——探索链路 v2（React Flow + 服务端读模型）、全局壳（版本切换/搜索/待办）、脑图回 Tab、代码与变更完整版、报告 revision/stale、Agent 中心、评测/质量中心、知识沉淀（版本内）、限流/SLO 脚本、证据 GC、备份恢复、多实例单活、安全审计/头。**视觉断言（D62）已接线**：迁移/服务/executor/前端/语料/main/config/agent tool/eval 重放均已提交，两条 `/visual` 路由可用；真实 Chromium 端到端与浏览器验收待 Task 35。**其余未完成项**：① 全量 SLO 真实测量、恢复库应用 smoke、最终真实验收待 Task 35；② 设计规格中部分环境变量（`EZTEST_CHAIN_MAX_NODES`/`EZTEST_SEARCH_MAX_RESULTS_PER_TYPE`/`EZTEST_TODOS_MAX`、`EZTEST_ANALYSIS_MAX_CASES`/`EZTEST_SUPPLEMENT_MAX_CASES`、`EZTEST_VISUAL_DIFF_THRESHOLD`）尚未接线；③ Docker/Compose 未实跑。因此 P8 退出状态应写 **“主体交付、验收收尾中”**，不得写“全部完成”。证据索引见 `docs/acceptance/p8/`（SLO/备份/安全/波次记录）与 `docs/release-notes/p8.md`。
+> **P8 实施状态（2026-10-29，Task 33 文档同步）**：P8 主体已按本阶段规格落地——探索链路 v2（React Flow + 服务端读模型）、全局壳（版本切换/搜索/待办）、脑图回 Tab、代码与变更完整版、报告 revision/stale、Agent 中心、评测/质量中心、知识沉淀（版本内）、限流/SLO 脚本、证据 GC、备份恢复、多实例单活、安全审计/头。**视觉断言（D62）已接线**：迁移/服务/executor/前端/语料/main/config/agent tool/eval 重放均已提交，两条 `/visual` 路由可用；真实 Chromium 端到端与浏览器验收待 Task 35。**其余未完成项**：① 全量 SLO 真实测量、恢复库应用 smoke、最终真实验收待 Task 35；② 设计规格中仍有环境变量未接线（`EZTEST_CHAIN_MAX_NODES`/`EZTEST_SEARCH_MAX_RESULTS_PER_TYPE`/`EZTEST_TODOS_MAX`、`EZTEST_VISUAL_DIFF_THRESHOLD`）；`EZTEST_ANALYSIS_MAX_CASES`（1–50）/`EZTEST_SUPPLEMENT_MAX_CASES`（1–20）与 executor 硬化（工具调用预算 30/1–200、WS 白名单 `EZTEST_EXEC_ALLOWED_HOSTS`、超时收尾）已在 P8 接线；③ Docker/Compose 未实跑。因此 P8 退出状态应写 **“主体交付、验收收尾中”**，不得写“全部完成”。证据索引见 `docs/acceptance/p8/`（SLO/备份/安全/波次记录）与 `docs/release-notes/p8.md`。
 
 ---
 

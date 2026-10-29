@@ -843,7 +843,7 @@ SSE + 快照游标 + seq 去重 + Last-Event-ID；图结构签名防抖；历史
 - **已接线、真实验收待 Task 35**：D62 视觉断言（迁移/服务/executor/前端/语料/main/config/agent tool/eval runner 均已提交；两条 `/visual` 路由已挂载，`case.visual_baseline_approved` 事件生效；真实 Chromium 端到端与浏览器验收待 Task 35）。全量 SLO 真实测量、恢复库应用 smoke、最终真实验收（Task 35）未完成。
 - **re-scope**：GC 只自动清理执行证据文件；导出/附件/报告/孤儿文件留给 P9/后续（需安全引用判定）。
 - **报告保护边界**：报告快照不含 evidence id，`report_ref(ref_kind='evidence')` 无生产写入，因此发布/过期报告不参与证据保护。
-- **配置未接线**：`EZTEST_ANALYSIS_MAX_CASES`/`EZTEST_SUPPLEMENT_MAX_CASES`、`EZTEST_CHAIN_MAX_NODES`/`EZTEST_SEARCH_MAX_RESULTS_PER_TYPE`/`EZTEST_TODOS_MAX` 当前未被构建读取，使用代码默认/请求上限。
+- **配置未接线**：`EZTEST_CHAIN_MAX_NODES`/`EZTEST_SEARCH_MAX_RESULTS_PER_TYPE`/`EZTEST_TODOS_MAX` 当前未被构建读取，使用代码默认/请求上限；`EZTEST_VISUAL_DIFF_THRESHOLD` 仍未读取。`EZTEST_ANALYSIS_MAX_CASES`（1–50）/`EZTEST_SUPPLEMENT_MAX_CASES`（1–20）与执行器硬化（工具调用预算默认 30/范围 1–200、WS 白名单 `EZTEST_EXEC_ALLOWED_HOSTS`、超时收尾）已在 P8 接线；`EZTEST_AUTONOMY_BATCHES_PER_TICK` 默认 4，>20 钳制为 20，<1/非整数启动失败。
 - **多实例**：只做单活锁与执行器硬化；SSE/Agent runner、限流仍非集群级；多实例运维编排归 P9。
 - **安全边界**：token 存 `sessionStorage`，无 HttpOnly 会话；CSP report-only；TLS/反代由部署方负责。
 

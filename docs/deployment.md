@@ -63,15 +63,18 @@ Copy-Item .env.example .env
 | `EZTEST_INSTANCE_ID` | `hostname-pid` | 多副本部署必须每实例唯一。 |
 | `EZTEST_LEADER_LOCK_KEY` | `1163411512` | 所有 API 实例必须一致；派生调度/自主/维护三个 key。 |
 | `EZTEST_KNOWLEDGE_MAX_INJECT` / `MAX_BYTES` | `5` / `4096` | 版本知识注入条数与字节预算；`0` 关闭对应预算。 |
+| `EZTEST_EXEC_MAX_TOOL_CALLS` | `30` | 每个 case run 的 Agent 工具调用预算，1–200；超限该用例 `inconclusive(model, tool_call_budget_exhausted)`。 |
+| `EZTEST_EXEC_ALLOWED_HOSTS` | `localhost,127.0.0.1` | executor 的 WebSocket host 白名单（逗号分隔）；WS 还必须同时通过 context `allowedHosts`，HTTP 导航/请求不受影响。远程目标需显式加入；Compose executor 未注入该变量，按 loopback 默认运行。 |
+| `EZTEST_ANALYSIS_MAX_CASES` / `EZTEST_SUPPLEMENT_MAX_CASES` | `20` / `5` | P8 已接线：失败分析单 run 1–50 条、补全单 run 1–20 条；越界启动失败。 |
 | `EZTEST_VISUAL_BASELINE_MAX_BYTES` | `5242880` | 视觉基线大小上限；API 配置与 executor 都读取，API 范围 64 KiB–20 MiB；审批还校验 PNG 尺寸=viewport×DPR。 |
 | `EZTEST_VISUAL_DIFF_THRESHOLD` | `0.005` | **预留**：当前未读取；阈值来自每条 visual 断言的 `threshold`（0–0.1）。 |
 | `EZTEST_AGENT_FILE_ROOT` | 空 | 为空时 Agent 文件工具不注册；需要时挂载只读目录并指向容器内路径。 |
 | `EZTEST_AGENT_HTTP_ALLOWLIST` | `127.0.0.1,localhost` | Agent `http.get` 白名单；生产按需最小化。 |
-| `EZTEST_AUTONOMY_BATCHES_PER_TICK` | `4` | 自主 worker 每 tick 批预算（1–20）；非整数/越界启动失败，不是回退 4。 |
+| `EZTEST_AUTONOMY_BATCHES_PER_TICK` | `4` | 自主 worker 每 tick 批预算（1–20）；>20 钳制为 20；<1 或非整数启动失败，不是回退 4。 |
 
-> 注意：设计规格中的 `EZTEST_CHAIN_MAX_NODES`、`EZTEST_SEARCH_MAX_RESULTS_PER_TYPE`、`EZTEST_TODOS_MAX` 当前由代码内置默认/接口 `limit` 约束，**构建尚未读取这些环境变量**。视觉断言已接线：API 与宿主启动的 executor 都读取 `EZTEST_VISUAL_BASELINE_MAX_BYTES`（默认 5 MiB），Compose 的 executor 服务当前未注入该变量、按默认 5 MiB 运行；`EZTEST_VISUAL_DIFF_THRESHOLD` 仍未读取。真实 Chromium/executor 端到端验收归 Task 35。不要在生产依赖未接线的变量，详见 [P8 发布说明](release-notes/p8.md)。
+> 注意：设计规格中的 `EZTEST_CHAIN_MAX_NODES`、`EZTEST_SEARCH_MAX_RESULTS_PER_TYPE`、`EZTEST_TODOS_MAX` 当前由代码内置默认/接口 `limit` 约束，**构建尚未读取这些环境变量**。视觉断言已接线：API 与宿主启动的 executor 都读取 `EZTEST_VISUAL_BASELINE_MAX_BYTES`（默认 5 MiB），Compose 的 executor 服务当前未注入该变量、按默认 5 MiB 运行；`EZTEST_VISUAL_DIFF_THRESHOLD` 仍未读取。执行器 WebSocket 默认仅允许 loopback，远程目标需显式配置 `EZTEST_EXEC_ALLOWED_HOSTS`（HTTP 导航/请求不受影响）。真实 Chromium/executor 端到端验收归 Task 35。不要在生产依赖未接线的变量，详见 [P8 发布说明](release-notes/p8.md)。
 >
-> `.env.example` 已包含限流/GC/leader/知识与视觉基线变量（`EZTEST_VISUAL_DIFF_THRESHOLD` 标注为“预留”）；未接线的链路上限/检索/待办变量请按需手工补充。
+> `.env.example` 已包含限流/GC/leader/知识、视觉基线、执行器与 P7 限制变量（`EZTEST_VISUAL_DIFF_THRESHOLD` 标注为“预留”）；未接线的链路上限/检索/待办变量请按需手工补充。
 
 ### 2.4 可选首次启动种子
 

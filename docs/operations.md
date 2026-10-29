@@ -187,7 +187,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/restore.ps1 `
 1. 运行中/计划中的批次（`run_batch.status IN ('planned','running')`）的全部证据。
 2. 每个版本最近 `EZTEST_GC_BATCH_KEEP` 批的证据。
 3. 未关闭问题（`issue.status IN ('open','confirmed')`）通过 `issue_ref`（`ref_kind='evidence'`）引用的证据。`issue_ref.ref_id` 是十进制字符串，保护 SQL 统一用 `ref_id = evidence.id::text` 比较，避免 bigint 转换越界，也保证候选列表与删除前复核口径一致。
-4. 基线证据：`evidence.kind='visual_baseline'`（视觉断言已接线，审批基线会产生此类证据；保护 SQL 对所有 visual_baseline 证据生效，与是否已审批无关）。
+4. 视觉基线证据：GC 保护 `evidence.kind='visual_baseline'` 的行。审批视觉基线只会把断言指向一条**已存在**的 `screenshot` 或 `visual_baseline` 证据（`case_visual_assertion.baseline_evidence_id`），不会新建或复制证据，也不改变证据 kind；当前生产没有写入 `kind='visual_baseline'` 的 producer（executor 比对产生的是 `visual_actual`/`visual_diff`），因此实际被审批的基线通常是执行截图。
 5. 已清除证据（`purged_at IS NOT NULL`）不会再次成为候选；删除前复核也会将其视为受保护。
 6. 最近 N 批以外的候选仍会在删除前**再次**执行引用校验（`IsProtected`），避免候选列出后新建立的引用被误删。
 
@@ -337,11 +337,13 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/slo-chain.ps1 `
 | 认证/用户 | `auth.login_succeeded`、`auth.login_failed`、`auth.logout`、`user.created`、`user.updated`、`user.password_reset` |
 | LLM/存储 | `llm.config_created/updated/deleted`、`llm.test_succeeded/failed`、`storage.object_created` |
 | 版本/需求 | `version.created/updated/continued/completed`、`version.requirement_created/updated/deleted/confirmed/reopened` |
-| 脑图/评审 | `mindmap.case_created/updated/deleted/reordered`、`mindmap.steps_updated`、`case.baseline_approved`、`case.export.created`、`mindmap.tool.invoked` |
-| 执行/GC | `execution.evidence.gc`、执行/接管相关动作；GC 审计为 best-effort（sink 故障只记日志，不回滚已完成的清理）。 |
+| 脑图/评审 | `mindmap.case_created/updated/deleted`、`mindmap.case_reordered`、`mindmap.steps_updated`、`case.export.created`、`mindmap.tool.invoked` |
+| 执行/GC | `execution.evidence.gc`、`agent.tool.invoked`、执行/接管相关动作；GC 审计为 best-effort（sink 故障只记日志，不回滚已完成的清理）。 |
 | 交付 | `delivery.issue.created`、`delivery.analysis.started/finished`、报告发布/导出相关动作 |
 | 资源/Session | `resource.*` 导入/校验/接管/DB 目标等动作 |
 
+> `case.baseline_frozen` 与 `case.visual_baseline_approved` 是版本事件，不是审计动作；mindmap 评审批准链路（`ReviewDeps`）当前没有 audit sink。
+>
 > 动作名是持久化契约，稳定不改；新增写操作应沿用 `<context>.<verb>` 并补测试/文档。
 
 ### 安全头与边界
@@ -415,6 +417,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/slo-chain.ps1 `
 | GC 一直有候选但删不掉 | 文件缺失/哈希不符/受保护引用；按设计跳过，人工核对 `purged_at` 与磁盘。 |
 | 报告 stale | 证据/失败分类计数变化或升级后首次读取；确认后重新生成（新 revision），不要改旧 revision。 |
 | 执行批次失败、executor unavailable | executor 容器/端口/token/Chromium 资源；查 executor `/healthz` 与 API 日志。 |
+| 用例以 `inconclusive(model, tool_call_budget_exhausted)` 结束 | 该 case run 的 Agent 工具调用超过 `EZTEST_EXEC_MAX_TOOL_CALLS`（默认 `30`，1–200）；提高预算或简化用例。这是 model 分类，不会记为 `failed`。 |
+| WebSocket 被拒绝（`host_not_allowed`） | executor 的 `EZTEST_EXEC_ALLOWED_HOSTS` 默认仅 `localhost,127.0.0.1`，且 WS 还需通过 context `allowedHosts`；远程目标需在 executor 进程显式加入 host。HTTP 导航/请求不受该白名单影响。 |
 | LLM 503 `llm_not_configured` | 默认 LLM 缺失/key 解密失败；设置页重配并测试；核对 keyring active 版本。 |
 | 知识未注入 | 仅 `approved` 条目会注入；draft/rejected 不注入。检查条数/字节预算：P5 design 运行的 `stats.knowledgeRefs` 有结构化 ID 列表，P3 澄清/分析/侦察只在提示词中带 `knowledgeRefs:` 行；截断时查 `knowledge_truncated` 日志。 |
 | 审计查不到某个动作 | 该路由可能未接审计；以 `docs/acceptance/p8/security-audit.md` 的覆盖矩阵为准，新增写路径需补审计。 |
@@ -430,7 +434,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/slo-chain.ps1 `
 - **多实例**：只做单活锁与执行器硬化；SSE/Agent runner 仍进程内；限流按实例内存计数；无多实例运维编排（P9）。
 - **权限**：仍是单管理员 + 普通用户两层，无多租户/RBAC；token 存 `sessionStorage`。
 - **迁移**：只追加、无 down migration；回退依赖备份恢复。
-- **配置**：`EZTEST_ANALYSIS_MAX_CASES`/`EZTEST_SUPPLEMENT_MAX_CASES` 仍是 P7 目标变量，当前构建未读取；`EZTEST_CHAIN_MAX_NODES`/`EZTEST_SEARCH_MAX_RESULTS_PER_TYPE`/`EZTEST_TODOS_MAX` 也未接线为环境变量（使用代码默认/请求上限）。以 [发布说明](release-notes/p8.md) 为准。
+- **配置**：`EZTEST_ANALYSIS_MAX_CASES`（1–50，默认 20）与 `EZTEST_SUPPLEMENT_MAX_CASES`（1–20，默认 5）已在 P8 接线；`EZTEST_EXEC_MAX_TOOL_CALLS` 默认 30（1–200），executor 的 WS 白名单 `EZTEST_EXEC_ALLOWED_HOSTS` 默认仅 loopback；`EZTEST_AUTONOMY_BATCHES_PER_TICK` 默认 4，>20 钳制为 20，<1/非整数启动失败。`EZTEST_CHAIN_MAX_NODES`/`EZTEST_SEARCH_MAX_RESULTS_PER_TYPE`/`EZTEST_TODOS_MAX` 仍未接线为环境变量（使用代码默认/请求上限）。以 [发布说明](release-notes/p8.md) 为准。
 
 ## 相关文档
 

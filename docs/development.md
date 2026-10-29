@@ -124,6 +124,8 @@ cd executor
 pnpm test          # node --test，不依赖数据库
 ```
 
+executor 的 WebSocket 白名单由 `EZTEST_EXEC_ALLOWED_HOSTS` 控制（默认 `localhost,127.0.0.1`）；远程目标需显式设置，且 WS 还必须同时通过 context `allowedHosts`。HTTP 导航/请求不受该白名单影响。
+
 ### 3.4 E2E
 
 ```powershell
