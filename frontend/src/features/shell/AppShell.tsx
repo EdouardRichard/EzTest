@@ -1,10 +1,11 @@
 "use client"
 
 import { usePathname } from "next/navigation"
-import type { ReactNode } from "react"
+import { type ReactNode, useCallback, useState } from "react"
 
 import { cn } from "@/lib/utils"
 
+import { MobileNav } from "./MobileNav"
 import { Sidebar } from "./Sidebar"
 import { Topbar } from "./Topbar"
 
@@ -19,6 +20,9 @@ export function isFullBleedPath(pathname: string): boolean {
 export function AppShell({ children }: { children: ReactNode }) {
   const pathname = usePathname() ?? ""
   const fullBleed = isFullBleedPath(pathname)
+  const [mobileNavOpen, setMobileNavOpen] = useState(false)
+  const closeMobileNav = useCallback(() => setMobileNavOpen(false), [])
+  const toggleMobileNav = useCallback(() => setMobileNavOpen((open) => !open), [])
 
   return (
     <div className="min-h-screen bg-background">
@@ -30,7 +34,7 @@ export function AppShell({ children }: { children: ReactNode }) {
       </a>
       <Sidebar />
       <div className="flex min-h-screen flex-col lg:pl-64">
-        <Topbar />
+        <Topbar navOpen={mobileNavOpen} onToggleNav={toggleMobileNav} />
         <main id="main-content" className="flex-1 px-4 py-6 sm:px-6 lg:px-10 lg:py-8">
           <div
             data-testid="app-content"
@@ -47,6 +51,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           </div>
         </footer>
       </div>
+      <MobileNav open={mobileNavOpen} onClose={closeMobileNav} />
     </div>
   )
 }
