@@ -8,6 +8,7 @@ import { useEffect, useState } from "react"
 import { StatusBadge, type StatusBadgeVariant } from "@/components/ui/StatusBadge"
 import { useAuth } from "@/features/auth/AuthProvider"
 
+import { MobileMenuButton } from "./MobileNav"
 import { SearchCommand } from "./search/SearchCommand"
 import { TodoButton } from "./todos/TodoButton"
 import { VersionSwitcher } from "./VersionSwitcher"
@@ -118,11 +119,26 @@ function UserMenu() {
   )
 }
 
-export function Topbar() {
+export type TopbarProps = {
+  /** Whether the mobile navigation drawer is open (drives `aria-expanded`). */
+  navOpen: boolean
+  onToggleNav: () => void
+}
+
+export function Topbar({ navOpen, onToggleNav }: TopbarProps) {
   return (
     <header className="sticky top-0 z-20 border-b border-border bg-background/80 backdrop-blur-xl">
-      <div className="flex h-16 items-center gap-3 px-4 sm:px-6 lg:px-10">
-        <Link href="/" className="flex items-center gap-2 lg:hidden">
+      {/*
+        Phones wrap the version switcher and search onto a second row; from `sm`
+        up the header returns to its original single-row layout whenever the
+        content fits, and wraps instead of overflowing when it does not. Only the
+        <sm order changes, so the desktop tab order stays hamburger → version →
+        search → actions.
+      */}
+      <div className="flex min-h-16 flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2 sm:px-6 sm:py-0 lg:px-10">
+        <MobileMenuButton open={navOpen} onToggle={onToggleNav} />
+
+        <Link href="/" className="flex items-center gap-2 max-sm:order-2 sm:order-none lg:hidden">
           <span className="grid h-8 w-8 place-items-center rounded-lg bg-gradient-to-br from-blue-500 to-sky-400 text-white">
             <FlaskConical className="h-4 w-4" aria-hidden="true" />
           </span>
@@ -130,12 +146,16 @@ export function Topbar() {
         </Link>
 
         {/* P8 global shell slot (spec §6.1): current version + status badge. */}
-        <VersionSwitcher />
+        <div className="min-w-0 max-sm:order-4 sm:order-none">
+          <VersionSwitcher />
+        </div>
 
         {/* P8 global search (spec §6.2): trigger + Ctrl/Cmd+K command palette. */}
-        <SearchCommand />
+        <div className="flex items-center max-sm:order-5 sm:order-none">
+          <SearchCommand />
+        </div>
 
-        <div className="hidden items-center gap-2 sm:flex">
+        <div className="hidden items-center gap-2 max-sm:order-6 sm:order-none sm:flex">
           <StatusBadge variant={ENVIRONMENT.variant}>{ENVIRONMENT.label}</StatusBadge>
           <span className="hidden items-center gap-1.5 rounded-full border border-border bg-card px-2.5 py-1 text-[11px] font-medium text-muted-foreground md:inline-flex">
             <ShieldCheck className="h-3.5 w-3.5 text-emerald-500" aria-hidden="true" />
@@ -143,7 +163,7 @@ export function Topbar() {
           </span>
         </div>
 
-        <div className="ml-auto flex items-center gap-1.5 sm:gap-2">
+        <div className="ml-auto flex items-center gap-1.5 max-sm:order-3 sm:order-none sm:gap-2">
           <TodoButton />
           <ThemeToggle />
           <span className="h-6 w-px bg-border" aria-hidden="true" />
