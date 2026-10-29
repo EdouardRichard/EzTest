@@ -525,6 +525,7 @@ func (s *ReportService) buildContent(
 	if batch.FinishedAt != nil {
 		generatedAt = batch.FinishedAt.UTC().Format(time.RFC3339)
 	}
+	baseFallbackReason, historyRewritten := reportBatchD49Fields(batch.BaseFallbackReason)
 	content := domain.ReportContent{
 		Schema: domain.ReportSchemaV1,
 		Version: domain.ReportVersion{
@@ -535,16 +536,18 @@ func (s *ReportService) buildContent(
 			CodeBaselineCommit: version.CodeBaselineCommit,
 		},
 		Batch: domain.ReportBatch{
-			ID:             reportIDString(batch.ID),
-			BatchNo:        batch.BatchNo,
-			Kind:           batch.Kind,
-			Status:         batch.Status,
-			BaselineHash:   batch.BaselineHash,
-			GraphHash:      batch.GraphHash,
-			CodeBaseCommit: batch.CodeBaseCommit,
-			HeadCommit:     batch.HeadCommit,
-			StartedAt:      reportFormatOptionalTime(batch.StartedAt),
-			FinishedAt:     reportFormatOptionalTime(batch.FinishedAt),
+			ID:                 reportIDString(batch.ID),
+			BatchNo:            batch.BatchNo,
+			Kind:               batch.Kind,
+			Status:             batch.Status,
+			BaselineHash:       batch.BaselineHash,
+			GraphHash:          batch.GraphHash,
+			CodeBaseCommit:     batch.CodeBaseCommit,
+			HeadCommit:         batch.HeadCommit,
+			StartedAt:          reportFormatOptionalTime(batch.StartedAt),
+			FinishedAt:         reportFormatOptionalTime(batch.FinishedAt),
+			BaseFallbackReason: baseFallbackReason,
+			HistoryRewritten:   historyRewritten,
 		},
 		Summary:      summary,
 		Cases:        cases,
@@ -751,16 +754,32 @@ func (s *ReportService) warn(ctx context.Context, message string, args ...any) {
 }
 
 // reportFingerprint maps the ports to the domain fingerprint input and computes
-// its sha256.
+// its sha256. The per-case evidence count and the failure-class tally are part
+// of the input (spec §7.3), so a new evidence row or a reclassification flips a
+// published report to stale on the next read.
 func reportFingerprint(batch ReportBatchSource, runs []ReportCaseRunSource, issues []ReportIssueSource) (string, error) {
 	caseRuns := make([]domain.ReportFingerprintCaseRun, 0, len(runs))
+	failureClasses := domain.ReportFingerprintFailureClasses{}
 	for _, run := range runs {
+		switch run.FailureClass {
+		case "application":
+			failureClasses.Application++
+		case "environment":
+			failureClasses.Environment++
+		case "session":
+			failureClasses.Session++
+		case "model":
+			failureClasses.Model++
+		case "case":
+			failureClasses.Case++
+		}
 		caseRuns = append(caseRuns, domain.ReportFingerprintCaseRun{
-			CaseRunID:    reportIDString(run.CaseRunID),
-			Attempt:      run.Attempt,
-			Status:       run.Status,
-			FailureClass: run.FailureClass,
-			UpdatedAt:    reportFormatFingerprintTime(run.UpdatedAt),
+			CaseRunID:     reportIDString(run.CaseRunID),
+			Attempt:       run.Attempt,
+			Status:        run.Status,
+			FailureClass:  run.FailureClass,
+			EvidenceCount: run.EvidenceCount,
+			UpdatedAt:     reportFormatFingerprintTime(run.UpdatedAt),
 		})
 	}
 	issueRows := make([]domain.ReportFingerprintIssue, 0, len(issues))
@@ -786,11 +805,22 @@ func reportFingerprint(batch ReportBatchSource, runs []ReportCaseRunSource, issu
 				Skipped:      batch.SkippedCount,
 				Interrupted:  batch.InterruptedCount,
 			},
+			FailureClasses: failureClasses,
 		},
 		LatestCaseRuns: caseRuns,
 		Issues:         issueRows,
 	}
 	return input.Compute()
+}
+
+// reportBatchD49Fields records D49 for a freshly generated snapshot. Both values
+// are always set for a new revision: an empty reason is the explicit "no
+// fallback" state. A legacy snapshot without the fields stays nil/unrecorded;
+// history is never rewritten on read.
+func reportBatchD49Fields(reason string) (*string, *bool) {
+	recorded := reason
+	rewritten := reason == domain.ReportBaseFallbackHistoryRewritten
+	return &recorded, &rewritten
 }
 
 // reportRisks derives the deterministic risk bullets of the report.

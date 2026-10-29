@@ -37,18 +37,28 @@ type ReportVersion struct {
 	CodeBaselineCommit string `json:"codeBaselineCommit"`
 }
 
-// ReportBatch is the batch header of the snapshot.
+// ReportBaseFallbackHistoryRewritten is the run_batch.base_fallback_reason value
+// of an incremental batch whose base was rolled back to the version baseline
+// because the previous batch head was not an ancestor of the new head (D49).
+const ReportBaseFallbackHistoryRewritten = "history_rewritten"
+
+// ReportBatch is the batch header of the snapshot. BaseFallbackReason and
+// HistoryRewritten were added in P8 (D49): they are pointers so a legacy
+// snapshot that predates them stays "unrecorded" (nil) instead of being read as
+// an explicit "no fallback"; generated snapshots always record both.
 type ReportBatch struct {
-	ID             string `json:"id"`
-	BatchNo        int    `json:"batchNo"`
-	Kind           string `json:"kind"`
-	Status         string `json:"status"`
-	BaselineHash   string `json:"baselineHash"`
-	GraphHash      string `json:"graphHash"`
-	CodeBaseCommit string `json:"codeBaseCommit"`
-	HeadCommit     string `json:"headCommit"`
-	StartedAt      string `json:"startedAt"`
-	FinishedAt     string `json:"finishedAt"`
+	ID                 string  `json:"id"`
+	BatchNo            int     `json:"batchNo"`
+	Kind               string  `json:"kind"`
+	Status             string  `json:"status"`
+	BaselineHash       string  `json:"baselineHash"`
+	GraphHash          string  `json:"graphHash"`
+	CodeBaseCommit     string  `json:"codeBaseCommit"`
+	HeadCommit         string  `json:"headCommit"`
+	StartedAt          string  `json:"startedAt"`
+	FinishedAt         string  `json:"finishedAt"`
+	BaseFallbackReason *string `json:"baseFallbackReason,omitempty"`
+	HistoryRewritten   *bool   `json:"historyRewritten,omitempty"`
 }
 
 // ReportSummary is the batch tally of the snapshot.
@@ -124,10 +134,22 @@ type ReportFingerprintInput struct {
 
 // ReportFingerprintBatch is the batch part of the fingerprint input.
 type ReportFingerprintBatch struct {
-	ID         string                  `json:"id"`
-	Status     string                  `json:"status"`
-	FinishedAt string                  `json:"finishedAt"`
-	Counts     ReportFingerprintCounts `json:"counts"`
+	ID             string                          `json:"id"`
+	Status         string                          `json:"status"`
+	FinishedAt     string                          `json:"finishedAt"`
+	Counts         ReportFingerprintCounts         `json:"counts"`
+	FailureClasses ReportFingerprintFailureClasses `json:"failureClasses"`
+}
+
+// ReportFingerprintFailureClasses is the batch tally by failure class. A
+// classification change (for example environment→session) must stale the report
+// even when the run status stays the same (spec §7.3).
+type ReportFingerprintFailureClasses struct {
+	Application int `json:"application"`
+	Environment int `json:"environment"`
+	Session     int `json:"session"`
+	Model       int `json:"model"`
+	Case        int `json:"case"`
 }
 
 // ReportFingerprintCounts are the persisted batch counters.
@@ -143,11 +165,12 @@ type ReportFingerprintCounts struct {
 
 // ReportFingerprintCaseRun is one latest case run of the fingerprint input.
 type ReportFingerprintCaseRun struct {
-	CaseRunID    string `json:"caseRunId"`
-	Attempt      int    `json:"attempt"`
-	Status       string `json:"status"`
-	FailureClass string `json:"failureClass"`
-	UpdatedAt    string `json:"updatedAt"`
+	CaseRunID     string `json:"caseRunId"`
+	Attempt       int    `json:"attempt"`
+	Status        string `json:"status"`
+	FailureClass  string `json:"failureClass"`
+	EvidenceCount int    `json:"evidenceCount"`
+	UpdatedAt     string `json:"updatedAt"`
 }
 
 // ReportFingerprintIssue is one linked/open issue of the fingerprint input.
@@ -248,6 +271,16 @@ func (c ReportContent) Validate() error {
 	case "planned", "running", "done", "failed", "cancelled":
 	default:
 		return fmt.Errorf("content batch status %q is invalid", c.Batch.Status)
+	}
+	if (c.Batch.BaseFallbackReason == nil) != (c.Batch.HistoryRewritten == nil) {
+		return fmt.Errorf("content batch baseFallbackReason/historyRewritten must be recorded together")
+	}
+	if c.Batch.HistoryRewritten != nil && *c.Batch.HistoryRewritten {
+		if c.Batch.BaseFallbackReason == nil ||
+			*c.Batch.BaseFallbackReason != ReportBaseFallbackHistoryRewritten {
+			return fmt.Errorf("content batch historyRewritten requires baseFallbackReason %q",
+				ReportBaseFallbackHistoryRewritten)
+		}
 	}
 	if c.Summary.CaseCount < 0 || c.Summary.Passed < 0 || c.Summary.Failed < 0 ||
 		c.Summary.Blocked < 0 || c.Summary.Inconclusive < 0 || c.Summary.Skipped < 0 ||

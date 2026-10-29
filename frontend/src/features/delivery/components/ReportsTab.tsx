@@ -13,6 +13,7 @@ import { ReportBody } from "./ReportBody"
 import { ReportDiff } from "./ReportDiff"
 import { ReportExportButton } from "./ReportExportButton"
 import { ReportHeader } from "./ReportHeader"
+import { ReportRevisionSelector } from "./ReportRevisionSelector"
 
 export type ReportsTabProps = {
   /** P3-owned version id; never re-parsed (spec §7.1). */
@@ -75,7 +76,7 @@ export function ReportsTab({
 
   const batchReports = useReports(
     versionId,
-    activeBatchId === "" ? {} : { batchId: activeBatchId },
+    activeBatchId === "" ? {} : { batchId: activeBatchId, limit: 100 },
     stream,
   )
   const allReports = useReports(versionId, {}, stream)
@@ -262,12 +263,20 @@ export function ReportsTab({
             批次交付报告：revision、stale 提示、差异对比与 Markdown 导出。
           </p>
         </div>
-        <ReportBatchSelector
-          batches={batchPage.batches}
-          value={activeBatchId}
-          disabled={batchPage.loading || batchPage.batches.length === 0}
-          onChange={handleBatchChange}
-        />
+        <div className="flex flex-wrap items-end gap-2">
+          <ReportRevisionSelector
+            reports={batchReports.reports}
+            value={effectiveReportId}
+            disabled={batchReports.loading}
+            onChange={selectReport}
+          />
+          <ReportBatchSelector
+            batches={batchPage.batches}
+            value={activeBatchId}
+            disabled={batchPage.loading || batchPage.batches.length === 0}
+            onChange={handleBatchChange}
+          />
+        </div>
       </header>
 
       {actionError === "" ? null : (

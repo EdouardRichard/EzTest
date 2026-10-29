@@ -209,6 +209,13 @@ export type ReportContentBatch = {
   headCommit: string
   startedAt: string
   finishedAt: string
+  /**
+   * D49 fields added in P8. They are optional because a legacy snapshot that
+   * predates them has no recorded value ("未记录"); generated snapshots always
+   * record both (an empty reason means "no fallback").
+   */
+  baseFallbackReason?: string
+  historyRewritten?: boolean
 }
 
 /** Batch tally of a report snapshot. */

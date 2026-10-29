@@ -120,24 +120,25 @@ func (r *ReadStore) PreviousBatchID(ctx context.Context, versionID, batchID int6
 
 // ReportBatch is the run_batch projection a delivery report needs.
 type ReportBatch struct {
-	ID                int64
-	VersionID         int64
-	BatchNo           int
-	Kind              string
-	Status            string
-	BaselineHash      string
-	GraphHash         string
-	CodeBaseCommit    string
-	HeadCommit        string
-	StartedAt         *time.Time
-	FinishedAt        *time.Time
-	CaseCount         int
-	PassedCount       int
-	FailedCount       int
-	BlockedCount      int
-	InconclusiveCount int
-	SkippedCount      int
-	InterruptedCount  int
+	ID                 int64
+	VersionID          int64
+	BatchNo            int
+	Kind               string
+	Status             string
+	BaselineHash       string
+	GraphHash          string
+	CodeBaseCommit     string
+	HeadCommit         string
+	BaseFallbackReason string
+	StartedAt          *time.Time
+	FinishedAt         *time.Time
+	CaseCount          int
+	PassedCount        int
+	FailedCount        int
+	BlockedCount       int
+	InconclusiveCount  int
+	SkippedCount       int
+	InterruptedCount   int
 }
 
 // GetReportBatch returns one batch of versionID. A missing or foreign batch is
@@ -147,6 +148,7 @@ func (r *ReadStore) GetReportBatch(ctx context.Context, versionID, batchID int64
 	err := r.q.QueryRow(ctx, `
 		SELECT id, version_id, batch_no, kind, status, baseline_hash, graph_hash,
 		       COALESCE(code_baseline_commit, ''), COALESCE(head_commit, ''),
+		       COALESCE(base_fallback_reason, ''),
 		       started_at, finished_at,
 		       case_count, passed_count, failed_count, blocked_count,
 		       inconclusive_count, skipped_count, interrupted_count
@@ -154,6 +156,7 @@ func (r *ReadStore) GetReportBatch(ctx context.Context, versionID, batchID int64
 		WHERE id = $1 AND version_id = $2`, batchID, versionID).Scan(
 		&batch.ID, &batch.VersionID, &batch.BatchNo, &batch.Kind, &batch.Status,
 		&batch.BaselineHash, &batch.GraphHash, &batch.CodeBaseCommit, &batch.HeadCommit,
+		&batch.BaseFallbackReason,
 		&batch.StartedAt, &batch.FinishedAt,
 		&batch.CaseCount, &batch.PassedCount, &batch.FailedCount, &batch.BlockedCount,
 		&batch.InconclusiveCount, &batch.SkippedCount, &batch.InterruptedCount)
