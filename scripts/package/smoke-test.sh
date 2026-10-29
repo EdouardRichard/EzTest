@@ -338,7 +338,16 @@ smoke_context_actions() { # contextId
     [ "$screenshot_status" = "200" ] && [ "$ok" = "true" ] || { printf 'screenshot failed: HTTP %s %s' "$screenshot_status" "$screenshot_json"; return 1; }
     b64="$(printf '%s' "$screenshot_json" | json_field 'artifacts.0.base64' 2>/dev/null || true)"
     [ -n "$b64" ] || { printf 'screenshot returned no base64 artifact.'; return 1; }
-    png="$("$NODE" -e 'const b=Buffer.from(process.argv[1],"base64");process.stdout.write(String(b.length)+":"+b.slice(0,4).toString("hex"))' "$b64" 2>/dev/null || true)"
+    # A screenshot's base64 payload easily exceeds the OS per-argument limit
+    # (MAX_ARG_STRLEN is 128 KiB on Linux), so stream it over stdin instead of
+    # passing it as an argv value.
+    png="$(printf '%s' "$b64" | "$NODE" -e '
+let data = ""
+process.stdin.on("data", (chunk) => { data += chunk }).on("end", () => {
+  const buffer = Buffer.from(data.trim(), "base64")
+  process.stdout.write(String(buffer.length) + ":" + buffer.slice(0, 4).toString("hex"))
+})
+' 2>/dev/null || true)"
     case "$png" in
         0:*) printf 'screenshot artifact decoded to 0 bytes.'; return 1 ;;
         *:89504e47) return 0 ;;
