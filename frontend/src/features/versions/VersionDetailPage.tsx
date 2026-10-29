@@ -9,6 +9,7 @@ import { BroadcastTab } from "@/features/execution/components/BroadcastTab"
 import { EvidenceViewer } from "@/features/execution/components/EvidenceViewer"
 import {
   type ExplorationDeepLink,
+  type ExplorationFilters,
   ExplorationTab,
 } from "@/features/execution/components/ExplorationTab"
 import { ResultsTab } from "@/features/execution/components/ResultsTab"
@@ -32,11 +33,41 @@ const DEFAULT_TAB: VersionTabValue = "requirements"
 /** The batch statuses that occupy the single active-batch slot (spec §5.1). */
 const ACTIVE_BATCH_STATUSES = new Set(["planned", "running"])
 
-/** Reads `?tab=` from the location; unknown values fall back to requirements. */
+/** Reads `?tab=` from the location; an explicit node deep link implies exploration. */
 function readTabParam(): VersionTabValue {
   if (typeof window === "undefined") return DEFAULT_TAB
-  const raw = new URLSearchParams(window.location.search).get("tab")
-  return isVersionTab(raw) ? raw : DEFAULT_TAB
+  const params = new URLSearchParams(window.location.search)
+  const raw = params.get("tab")
+  if (isVersionTab(raw)) return raw
+  if ((params.get("node") ?? "") !== "") return "exploration"
+  return DEFAULT_TAB
+}
+
+/** Reads the exploration filter deep links (`req/status/abnormal/q`). */
+function readExplorationFilters(): ExplorationFilters {
+  if (typeof window === "undefined") {
+    return { requirementId: "", resultStatus: "", abnormalOnly: false, q: "" }
+  }
+  const params = new URLSearchParams(window.location.search)
+  const abnormal = params.get("abnormal") ?? ""
+  return {
+    requirementId: params.get("req") ?? "",
+    resultStatus: params.get("status") ?? "",
+    abnormalOnly: abnormal === "1" || abnormal === "true",
+    q: params.get("q") ?? "",
+  }
+}
+
+/** Reads the `?node=<kind>:<id>` exploration Sheet deep link. */
+function readExplorationNodeParam(): string {
+  if (typeof window === "undefined") return ""
+  return new URLSearchParams(window.location.search).get("node") ?? ""
+}
+
+/** Reads the `?batch=` deep link of the selected execution batch. */
+function readBatchParam(): string {
+  if (typeof window === "undefined") return ""
+  return new URLSearchParams(window.location.search).get("batch") ?? ""
 }
 
 /** Reads the `?evidence=` deep link of the broadcast/results links. */
@@ -127,6 +158,13 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
   const [createToken, setCreateToken] = useState(0)
   const [takeover, setTakeover] = useState<PendingTakeover | null>(null)
   const [selectedBatchId, setSelectedBatchId] = useState("")
+  const [explorationFilters, setExplorationFilters] = useState<ExplorationFilters>({
+    requirementId: "",
+    resultStatus: "",
+    abnormalOnly: false,
+    q: "",
+  })
+  const [explorationNodeId, setExplorationNodeId] = useState("")
   const [role, setRole] = useState<string | undefined>(undefined)
   const requestRef = useRef(0)
   /** Highest stream seq already inspected for a version-level refetch. */
@@ -170,6 +208,9 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
     setEvidenceId(readEvidenceParam())
     setIssueId(readDeepLinkParam("issue"))
     setReportId(readDeepLinkParam("report"))
+    setExplorationFilters(readExplorationFilters())
+    setExplorationNodeId(readExplorationNodeParam())
+    setSelectedBatchId(readBatchParam())
     setRole(getStoredUser()?.role)
   }, [])
 
@@ -238,9 +279,23 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
 
   function handleBatchChange(nextBatchId: string): void {
     setSelectedBatchId(nextBatchId)
+    writeQueryParam("batch", nextBatchId)
     // A different batch cannot keep the previous batch's report deep link.
     setReportId("")
     writeQueryParam("report", "")
+  }
+
+  function handleExplorationFiltersChange(nextFilters: ExplorationFilters): void {
+    setExplorationFilters(nextFilters)
+    writeQueryParam("req", nextFilters.requirementId)
+    writeQueryParam("status", nextFilters.resultStatus)
+    writeQueryParam("abnormal", nextFilters.abnormalOnly ? "1" : "")
+    writeQueryParam("q", nextFilters.q)
+  }
+
+  function handleExplorationNodeChange(nextNodeId: string): void {
+    setExplorationNodeId(nextNodeId)
+    writeQueryParam("node", nextNodeId)
   }
 
   function handleExplorationNavigate(target: ExplorationDeepLink): void {
@@ -381,6 +436,10 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
             stream={stream}
             onOpenEvidence={setEvidenceId}
             onNavigate={handleExplorationNavigate}
+            initialFilters={explorationFilters}
+            onFiltersChange={handleExplorationFiltersChange}
+            selectedNodeId={explorationNodeId}
+            onSelectedNodeChange={handleExplorationNodeChange}
           />
         }
         broadcast={<BroadcastTab versionId={versionId} />}

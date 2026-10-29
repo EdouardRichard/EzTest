@@ -5,14 +5,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
 import { EmptyState } from "@/components/ui/EmptyState"
 import { StatusBadge, type StatusBadgeVariant } from "@/components/ui/StatusBadge"
-import { useIssues } from "@/features/delivery/hooks/useIssues"
-import type { IssueSummary } from "@/features/delivery/types"
-import { getGraph } from "@/features/mindmap/api"
-import type { CaseNodeView, MindmapGraph } from "@/features/mindmap/types"
-import { listRequirements } from "@/features/versions/api"
-import type { Requirement } from "@/features/versions/types"
 import type { VersionStreamState } from "@/features/versions/useVersionStream"
-
+import type { SSEStatus } from "@/lib/sse-client"
+import type { ChainSnapshot, ChainSnapshotNode } from "../chain/chain-types"
+import { chainSnapshotTotal } from "../chain/chain-types"
+import { useExplorationChain } from "../chain/use-exploration-chain"
 import {
   autoCollapsedRequirements,
   type ChainCaseInput,
@@ -22,18 +19,12 @@ import {
   type ChainRequirementInput,
   type ChainResultFilter,
   type ChainResultInput,
-  isAbnormalResultStatus,
   layoutChain,
-  matchesResultFilter,
 } from "../chain-layout"
-import { useCaseRuns } from "../hooks/useExecution"
-import type { CaseRun, CaseRunStatus } from "../types"
+import { useCaseRun } from "../hooks/useExecution"
+import type { CaseRunStatus, FailureClass } from "../types"
 import { ChainGraph } from "./ChainGraph"
 import { FailureClassBadge } from "./FailureClassBadge"
-
-/** Requirements/issues fetched for the chain; 100 is the backend list cap. */
-const REQUIREMENT_LIMIT = 100
-const ISSUE_LIMIT = 100
 
 const BUTTON_CLASS =
   "inline-flex items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -113,6 +104,7 @@ const ISSUE_SEVERITY_BADGE_VARIANTS: Record<string, StatusBadgeVariant> = {
   info: "neutral",
 }
 
+/** Result statuses accepted by the server-side filter (pending/running excluded). */
 const STATUS_FILTER_OPTIONS: readonly { value: ChainResultFilter; label: string }[] = [
   { value: "", label: "全部状态" },
   { value: "passed", label: "通过" },
@@ -121,10 +113,35 @@ const STATUS_FILTER_OPTIONS: readonly { value: ChainResultFilter; label: string 
   { value: "inconclusive", label: "不确定" },
   { value: "skipped", label: "跳过" },
   { value: "interrupted", label: "中断" },
-  { value: "pending", label: "待执行/执行中" },
 ]
 
-/** Deep-link target of the node drawer (spec §10.5: 节点抽屉 + 深链). */
+const ISSUE_STATUS_FILTER_OPTIONS = [
+  { value: "", label: "全部问题状态" },
+  { value: "open", label: "待确认" },
+  { value: "confirmed", label: "已确认" },
+  { value: "dismissed", label: "已驳回" },
+] as const
+
+const ISSUE_SEVERITY_FILTER_OPTIONS = [
+  { value: "", label: "全部严重级" },
+  { value: "blocker", label: "阻断" },
+  { value: "major", label: "严重" },
+  { value: "minor", label: "一般" },
+  { value: "info", label: "提示" },
+] as const
+
+/** Debounce of the `q` server filter (spec §5.5). */
+const SEARCH_DEBOUNCE_MS = 300
+
+/** URL-owned filter subset; the page persists these in the query string. */
+export type ExplorationFilters = {
+  requirementId: string
+  resultStatus: string
+  abnormalOnly: boolean
+  q: string
+}
+
+/** Deep-link target of the node drawer (spec §5.7). */
 export type ExplorationDeepLink =
   | { kind: "requirement"; id: string }
   | { kind: "case"; id: string }
@@ -134,10 +151,7 @@ export type ExplorationDeepLink =
 export type ExplorationTabProps = {
   /** P3 version id; never re-parsed (spec §7.1). */
   versionId: string
-  /**
-   * Optional batch scope. Without it the chain still shows requirements and
-   * cases but has no result layer; the results hook stays disabled.
-   */
+  /** Selected batch; `undefined`/empty lets the read model use its latest batch. */
   batchId?: string
   /** Version stream owned by the tab container; the tab never opens its own. */
   stream?: VersionStreamState
@@ -145,11 +159,14 @@ export type ExplorationTabProps = {
   onOpenEvidence?: (evidenceId: string) => void
   /** Results-tab deep link callback for requirement/case/result nodes. */
   onNavigate?: (target: ExplorationDeepLink) => void
-}
-
-function describeLoadError(error: unknown): string {
-  if (error instanceof Error && error.message !== "") return error.message
-  return "未知错误"
+  /** Filter values read from the URL deep link; used to seed the local filters. */
+  initialFilters?: Partial<ExplorationFilters>
+  /** Called whenever the URL-owned filters change so the page can sync the URL. */
+  onFiltersChange?: (filters: ExplorationFilters) => void
+  /** Deep-linked node (`<kind>:<id>`); when set this Sheet is open. */
+  selectedNodeId?: string
+  /** Called when the user opens/closes a node Sheet so the page can sync the URL. */
+  onSelectedNodeChange?: (nodeId: string) => void
 }
 
 function formatDuration(durationMs: number | undefined): string {
@@ -182,82 +199,266 @@ function issueCategoryLabel(category: string): string {
   return ISSUE_CATEGORY_LABELS[category] ?? (category === "" ? "—" : category)
 }
 
-/** Evidence refs of an issue summary; other ref kinds are not evidence. */
-function issueEvidenceIds(issue: IssueSummary): string[] {
-  return (issue.refs ?? [])
-    .filter((ref) => ref.kind === "evidence" && ref.id !== "")
-    .map((ref) => ref.id)
+function normalizeStatusFilter(value: string | undefined): ChainResultFilter {
+  if (value === undefined) return ""
+  return STATUS_FILTER_OPTIONS.some((option) => option.value === value)
+    ? (value as ChainResultFilter)
+    : ""
 }
 
-/** Maps one delivery issue to the chain issue layer (layout plus drawer data). */
-function toChainIssue(issue: IssueSummary, index: number): ChainIssueInput {
-  return {
-    id: issue.id,
-    title: issue.title,
-    status: issue.status,
-    severity: issue.severity,
-    confidence: issue.confidence,
-    category: issue.category,
-    caseNodeId: issue.caseNodeId,
-    caseRunId: issue.caseRunId,
-    evidenceIds: issueEvidenceIds(issue),
-    sortOrder: index,
-  }
+const FAILURE_CLASSES = new Set<FailureClass>([
+  "application",
+  "environment",
+  "session",
+  "model",
+  "case",
+])
+
+function toFailureClass(value: string | undefined): FailureClass | null {
+  if (value === undefined || value === "") return null
+  return FAILURE_CLASSES.has(value as FailureClass) ? (value as FailureClass) : null
 }
 
-/** True when `candidate` is a newer attempt than `current` (tie-break by id). */
-function isLaterResult(candidate: CaseRun, current: CaseRun | undefined): boolean {
-  if (current === undefined) return true
-  if (candidate.attempt !== current.attempt) return candidate.attempt > current.attempt
-  return candidate.id > current.id
+const CHAIN_NODE_KINDS = new Set<ChainNode["kind"]>(["requirement", "case", "result", "issue"])
+
+function chainNodeLayer(kind: ChainNode["kind"]): ChainNode["layer"] {
+  if (kind === "requirement") return 0
+  if (kind === "case") return 1
+  if (kind === "result") return 2
+  return 3
 }
 
-/** Latest case run per case node; retries do not stack in the chain. */
-function latestResults(caseRuns: readonly CaseRun[]): CaseRun[] {
-  const byCase = new Map<string, CaseRun>()
-  for (const run of caseRuns) {
-    const current = byCase.get(run.case_node_id)
-    if (isLaterResult(run, current)) byCase.set(run.case_node_id, run)
-  }
-  return [...byCase.values()]
+/** Parses the backend node/deep-link id `<kind>:<decimal id>`. */
+function parseChainNodeId(
+  raw: string | null | undefined,
+): { kind: ChainNode["kind"]; id: string } | null {
+  if (raw === null || raw === undefined) return null
+  const separator = raw.indexOf(":")
+  if (separator <= 0 || separator === raw.length - 1) return null
+  const kind = raw.slice(0, separator)
+  const id = raw.slice(separator + 1)
+  if (!CHAIN_NODE_KINDS.has(kind as ChainNode["kind"]) || id === "") return null
+  return { kind: kind as ChainNode["kind"], id }
 }
 
-function requirementIdsByCase(
-  graph: MindmapGraph | null,
-  cases: readonly CaseNodeView[],
-): Map<string, string[]> {
-  const byCase = new Map<string, Set<string>>()
-  function add(caseNodeId: string, requirementId: string): void {
-    const ids = byCase.get(caseNodeId)
-    if (ids === undefined) byCase.set(caseNodeId, new Set([requirementId]))
-    else ids.add(requirementId)
+function domainIdOf(node: ChainSnapshotNode): string {
+  return parseChainNodeId(node.id)?.id ?? node.id
+}
+
+type ChainView = {
+  input: ChainLayoutInput
+  dtoByKey: Map<string, ChainSnapshotNode>
+  /** Batch of each result/case-run, so evidence can be lazily fetched in place. */
+  resultBatchById: Map<string, string>
+}
+
+const EMPTY_CHAIN_VIEW: ChainView = {
+  input: { requirements: [], cases: [], results: [], issues: [] },
+  dtoByKey: new Map(),
+  resultBatchById: new Map(),
+}
+
+/**
+ * Adapts the read-model snapshot onto the existing four-layer layout input.
+ *
+ * Requirement → case links come from the snapshot's `requirement_case` /
+ * `impact_case` edges. `case.requirementIds` is display-only (it may mention
+ * requirements filtered out of the response), so it is never used to create an
+ * edge. Issue attachment is likewise resolved from `result_issue` /
+ * `case_issue` edges; an issue without an edge is passed as unlinked.
+ */
+function toChainView(snapshot: ChainSnapshot | null): ChainView {
+  if (snapshot === null) return EMPTY_CHAIN_VIEW
+
+  const requirementNodes: ChainSnapshotNode[] = []
+  const caseNodes: ChainSnapshotNode[] = []
+  const resultNodes: ChainSnapshotNode[] = []
+  const issueNodes: ChainSnapshotNode[] = []
+  const dtoByKey = new Map<string, ChainSnapshotNode>()
+  for (const node of snapshot.nodes) {
+    dtoByKey.set(node.id, node)
+    if (node.kind === "requirement") requirementNodes.push(node)
+    else if (node.kind === "case") caseNodes.push(node)
+    else if (node.kind === "result") resultNodes.push(node)
+    else issueNodes.push(node)
   }
 
-  for (const cell of graph?.coverage.matrix ?? []) {
-    for (const caseId of cell.caseIds) add(caseId, cell.requirementId)
+  // First pass: case → result links let a result_issue edge resolve its case.
+  const caseByResult = new Map<string, string>()
+  for (const edge of snapshot.edges) {
+    if (edge.kind !== "case_result") continue
+    const source = parseChainNodeId(edge.source)
+    const target = parseChainNodeId(edge.target)
+    if (source?.kind !== "case" || target?.kind !== "result") continue
+    caseByResult.set(target.id, source.id)
   }
-  for (const node of cases) {
-    for (const source of node.sources) {
-      if (source.refKind === "requirement" && source.refId !== null && source.refId !== "") {
-        add(node.id, source.refId)
-      }
+
+  // Second pass: requirement → case links and issue attachments.
+  const requirementIdsByCase = new Map<string, string[]>()
+  const caseByIssue = new Map<string, string>()
+  for (const edge of snapshot.edges) {
+    const source = parseChainNodeId(edge.source)
+    const target = parseChainNodeId(edge.target)
+    if (source === null || target === null) continue
+
+    if (
+      (edge.kind === "requirement_case" || edge.kind === "impact_case") &&
+      source.kind === "requirement" &&
+      target.kind === "case"
+    ) {
+      const ids = requirementIdsByCase.get(target.id)
+      if (ids === undefined) requirementIdsByCase.set(target.id, [source.id])
+      else if (!ids.includes(source.id)) ids.push(source.id)
+      continue
+    }
+
+    if (edge.kind === "case_issue" && source.kind === "case" && target.kind === "issue") {
+      caseByIssue.set(target.id, source.id)
+      continue
+    }
+
+    if (edge.kind === "result_issue" && source.kind === "result" && target.kind === "issue") {
+      const caseId = caseByResult.get(source.id)
+      if (caseId !== undefined) caseByIssue.set(target.id, caseId)
     }
   }
 
-  const result = new Map<string, string[]>()
-  for (const [caseId, ids] of byCase) result.set(caseId, [...ids].sort())
-  return result
+  const requirementInputs: ChainRequirementInput[] = requirementNodes.map((node, index) => ({
+    id: domainIdOf(node),
+    title: node.title,
+    status: node.status,
+    sortOrder: index,
+  }))
+
+  const caseInputs: ChainCaseInput[] = caseNodes.map((node, index) => {
+    const id = domainIdOf(node)
+    return {
+      id,
+      title: node.title,
+      requirementIds: requirementIdsByCase.get(id) ?? [],
+      status: node.status,
+      sortOrder: index,
+      aiSupplemented: node.source === "ai_supplement",
+    }
+  })
+
+  const resultBatchById = new Map<string, string>()
+  const resultInputs: ChainResultInput[] = resultNodes.map((node, index) => {
+    const nodeId = domainIdOf(node)
+    const runId = node.caseRunId ?? nodeId
+    if (node.batchId !== undefined && node.batchId !== "") resultBatchById.set(runId, node.batchId)
+    return {
+      id: runId,
+      caseNodeId: caseByResult.get(runId) ?? node.caseNodeId ?? "",
+      status: node.status as CaseRunStatus,
+      title: node.title,
+      summary: node.summary,
+      durationMs: node.durationMs,
+      failureClass: toFailureClass(node.failureClass),
+      sortOrder: index,
+    }
+  })
+
+  const issueInputs: ChainIssueInput[] = issueNodes.map((node, index) => {
+    const id = domainIdOf(node)
+    // Edges are authoritative: an issue without an incoming issue edge stays
+    // unlinked even when its DTO still carries a stale caseRunId/caseNodeId.
+    const caseNodeId = caseByIssue.get(id) ?? null
+    return {
+      id,
+      title: node.title,
+      status: node.status,
+      severity: node.severity,
+      confidence: node.confidence,
+      category: node.category,
+      caseNodeId,
+      caseRunId: caseNodeId === null ? null : (node.caseRunId ?? null),
+      sortOrder: index,
+    }
+  })
+
+  return {
+    input: {
+      requirements: requirementInputs,
+      cases: caseInputs,
+      results: resultInputs,
+      issues: issueInputs,
+    },
+    dtoByKey,
+    resultBatchById,
+  }
+}
+
+/** A positioned node for a deep-linked node hidden by a collapsed group. */
+function toFallbackChainNode(view: ChainView, dto: ChainSnapshotNode): ChainNode | null {
+  const parsed = parseChainNodeId(dto.id)
+  if (parsed === null) return null
+  const result =
+    parsed.kind === "result"
+      ? view.input.results?.find((row) => row.id === (dto.caseRunId ?? parsed.id))
+      : undefined
+  const issue =
+    parsed.kind === "issue" ? view.input.issues?.find((row) => row.id === parsed.id) : undefined
+  return {
+    id: parsed.id,
+    kind: parsed.kind,
+    layer: chainNodeLayer(parsed.kind),
+    title: dto.title,
+    status: dto.status,
+    x: 0,
+    y: 0,
+    w: 0,
+    h: 0,
+    requirementIds: [],
+    caseNodeId: dto.caseNodeId ?? null,
+    result,
+    issue,
+    hasChildren: false,
+    descendantCount: 0,
+    collapsed: false,
+  }
+}
+
+function mergeRequirementOptions(
+  previous: readonly ChainRequirementInput[],
+  incoming: readonly ChainRequirementInput[],
+): ChainRequirementInput[] {
+  const byId = new Map<string, ChainRequirementInput>()
+  for (const row of previous) byId.set(row.id, row)
+  for (const row of incoming) byId.set(row.id, row)
+  return [...byId.values()].sort((left, right) => {
+    const orderDiff = (left.sortOrder ?? 0) - (right.sortOrder ?? 0)
+    if (orderDiff !== 0) return orderDiff
+    return left.id < right.id ? -1 : left.id > right.id ? 1 : 0
+  })
 }
 
 type ChainDrawerProps = {
   node: ChainNode
+  snapshotNode: ChainSnapshotNode | undefined
+  view: ChainView
+  versionId: string
+  batchId: string
+  stream?: VersionStreamState
   onClose: () => void
   onOpenEvidence?: (evidenceId: string) => void
   onNavigate?: (target: ExplorationDeepLink) => void
 }
 
-/** Node drawer: summary, evidence and deep links (spec §10.5). */
-function ChainDrawer({ node, onClose, onOpenEvidence, onNavigate }: ChainDrawerProps) {
+/** Node Sheet: summary, attempt/batch, lazy evidence and deep links (spec §5.5). */
+function ChainDrawer({
+  node,
+  snapshotNode,
+  view,
+  versionId,
+  batchId,
+  stream,
+  onClose,
+  onOpenEvidence,
+  onNavigate,
+}: ChainDrawerProps) {
+  const [evidenceRequested, setEvidenceRequested] = useState(false)
+
   const kindLabel =
     node.kind === "requirement"
       ? "需求节点"
@@ -278,18 +479,29 @@ function ChainDrawer({ node, onClose, onOpenEvidence, onNavigate }: ChainDrawerP
     node.kind === "result"
       ? (RESULT_BADGE_VARIANTS[node.status as CaseRunStatus] ?? "neutral")
       : node.kind === "issue"
-        ? (ISSUE_SEVERITY_BADGE_VARIANTS[node.issue?.severity ?? ""] ?? "neutral")
+        ? (ISSUE_SEVERITY_BADGE_VARIANTS[snapshotNode?.severity ?? ""] ?? "neutral")
         : "neutral"
-  const evidenceIds =
+
+  const caseRunId =
     node.kind === "result"
-      ? (node.result?.evidenceIds ?? [])
+      ? (snapshotNode?.caseRunId ?? node.result?.id ?? "")
       : node.kind === "issue"
-        ? (node.issue?.evidenceIds ?? [])
-        : []
+        ? (snapshotNode?.caseRunId ?? "")
+        : ""
+  const runBatchId = (caseRunId === "" ? "" : view.resultBatchById.get(caseRunId)) ?? batchId
+  const evidenceCount = snapshotNode?.evidenceCount ?? 0
+  const detail = useCaseRun(
+    versionId,
+    runBatchId,
+    evidenceRequested && caseRunId !== "" ? caseRunId : "",
+    stream,
+  )
+  const evidenceItems = detail.caseRun?.evidence ?? []
+
   const resultCaseId = node.kind === "result" ? node.caseNodeId : null
   const summary =
-    node.kind === "result" && (node.result?.summary ?? "") !== ""
-      ? (node.result?.summary ?? "")
+    node.kind === "result" && (snapshotNode?.summary ?? "") !== ""
+      ? (snapshotNode?.summary ?? "")
       : node.kind === "requirement"
         ? "该需求派生出的用例与执行结果如下。"
         : node.kind === "case"
@@ -329,21 +541,34 @@ function ChainDrawer({ node, onClose, onOpenEvidence, onNavigate }: ChainDrawerP
         {node.kind === "result" && node.result?.failureClass != null ? (
           <FailureClassBadge failureClass={node.result.failureClass} />
         ) : null}
-        {node.kind === "result" && formatDuration(node.result?.durationMs) !== "" ? (
-          <span className="text-xs text-muted-foreground">
-            {`耗时 ${formatDuration(node.result?.durationMs)}`}
+        {node.kind === "result" ? (
+          <span data-testid="chain-drawer-attempt" className="text-xs text-muted-foreground">
+            {`第 ${snapshotNode?.attempt ?? node.result?.sortOrder ?? 1} 次尝试`}
           </span>
+        ) : null}
+        {node.kind === "result" && (snapshotNode?.batchId ?? "") !== "" ? (
+          <span className="text-xs text-muted-foreground">
+            {`批次 ${snapshotNode?.batchId ?? ""}`}
+          </span>
+        ) : null}
+        {node.kind === "result" && formatDuration(snapshotNode?.durationMs) !== "" ? (
+          <span className="text-xs text-muted-foreground">
+            {`耗时 ${formatDuration(snapshotNode?.durationMs)}`}
+          </span>
+        ) : null}
+        {node.kind === "result" || node.kind === "issue" ? (
+          <span className="text-xs text-muted-foreground">{`证据 ${evidenceCount}`}</span>
         ) : null}
         {node.kind === "issue" ? (
           <>
             <span className="text-xs text-muted-foreground">
-              {`严重级：${issueSeverityLabel(node.issue?.severity ?? "")}`}
+              {`严重级：${issueSeverityLabel(snapshotNode?.severity ?? "")}`}
             </span>
             <span className="text-xs text-muted-foreground">
-              {`置信度：${issueConfidenceLabel(node.issue?.confidence ?? "")}`}
+              {`置信度：${issueConfidenceLabel(snapshotNode?.confidence ?? "")}`}
             </span>
             <span className="text-xs text-muted-foreground">
-              {`分类：${issueCategoryLabel(node.issue?.category ?? "")}`}
+              {`分类：${issueCategoryLabel(snapshotNode?.category ?? "")}`}
             </span>
           </>
         ) : null}
@@ -357,9 +582,19 @@ function ChainDrawer({ node, onClose, onOpenEvidence, onNavigate }: ChainDrawerP
         </p>
       ) : null}
       {node.kind === "case" ? (
-        <p className="mt-2 text-xs text-muted-foreground">
-          {`用例状态：${caseStatusLabel(node.status)}`}
-        </p>
+        <>
+          <p className="mt-2 text-xs text-muted-foreground">
+            {`用例状态：${caseStatusLabel(node.status)}`}
+          </p>
+          {(snapshotNode?.requirementIds?.length ?? 0) === 0 ? null : (
+            <p
+              data-testid="chain-drawer-case-requirements"
+              className="mt-1 text-xs text-muted-foreground"
+            >
+              {`关联需求：${(snapshotNode?.requirementIds ?? []).join("、")}`}
+            </p>
+          )}
+        </>
       ) : null}
 
       <div className="mt-3 flex flex-wrap items-center gap-2">
@@ -429,23 +664,53 @@ function ChainDrawer({ node, onClose, onOpenEvidence, onNavigate }: ChainDrawerP
 
       <section data-testid="chain-drawer-evidence" className="mt-4">
         <h4 className="text-xs font-semibold">证据</h4>
-        {evidenceIds.length === 0 ? (
+        {evidenceCount === 0 ? (
           <p className="mt-1 text-xs text-muted-foreground">该节点暂无可查看证据。</p>
+        ) : evidenceRequested ? (
+          detail.loading ? (
+            <p
+              data-testid="chain-drawer-evidence-loading"
+              role="status"
+              className="mt-1 flex items-center gap-2 text-xs text-muted-foreground"
+            >
+              <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+              证据加载中…
+            </p>
+          ) : detail.error !== "" ? (
+            <p
+              data-testid="chain-drawer-evidence-error"
+              role="alert"
+              className="mt-1 text-xs text-destructive"
+            >
+              {`证据加载失败：${detail.error}`}
+            </p>
+          ) : evidenceItems.length === 0 ? (
+            <p className="mt-1 text-xs text-muted-foreground">该节点暂无可查看证据。</p>
+          ) : (
+            <ul className="mt-1.5 flex flex-wrap gap-1.5">
+              {evidenceItems.map((evidence) => (
+                <li key={evidence.id}>
+                  <button
+                    type="button"
+                    data-testid={`chain-drawer-evidence-${evidence.id}`}
+                    onClick={() => onOpenEvidence?.(evidence.id)}
+                    className={BUTTON_CLASS}
+                  >
+                    {`证据 ${evidence.id}`}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )
         ) : (
-          <ul className="mt-1.5 flex flex-wrap gap-1.5">
-            {evidenceIds.map((evidenceId) => (
-              <li key={evidenceId}>
-                <button
-                  type="button"
-                  data-testid={`chain-drawer-evidence-${evidenceId}`}
-                  onClick={() => onOpenEvidence?.(evidenceId)}
-                  className={BUTTON_CLASS}
-                >
-                  {`证据 ${evidenceId}`}
-                </button>
-              </li>
-            ))}
-          </ul>
+          <button
+            type="button"
+            data-testid="chain-drawer-load-evidence"
+            onClick={() => setEvidenceRequested(true)}
+            className={`mt-1.5 ${BUTTON_CLASS}`}
+          >
+            {`加载证据（${evidenceCount}）`}
+          </button>
         )}
       </section>
 
@@ -464,13 +729,19 @@ function ChainDrawer({ node, onClose, onOpenEvidence, onNavigate }: ChainDrawerP
   )
 }
 
+function streamStatusLabel(status: SSEStatus): string {
+  if (status === "reconnecting" || status === "connecting") return "重连中"
+  if (status === "live") return "实时"
+  return "未连接"
+}
+
 /**
- * Exploration chain tab (spec §10.5): requirement → case → result → issue
- * layers drawn as hand-written SVG, status colour plus glyph/text, AI-supplement
- * and needs_revalidation styles, requirement/status/abnormal/batch filters, a
- * node drawer with evidence and deep-link callbacks, and per-requirement
- * collapse (auto-collapsed above 200 nodes). Issue data comes from the delivery
- * `/issues` API (version-scoped, T18) and is merged into the same layout.
+ * Exploration chain tab (spec §5.1/§5.5/§5.7): one read-model snapshot drives
+ * the requirement → case → result → issue layers. The four former REST reads
+ * (requirements/mindmap/case-runs/issues) are gone; every filter is applied by
+ * the server, the version SSE stream coalesces into 500ms refreshes, truncation
+ * and per-layer failures stay explicit, and evidence is lazily loaded by
+ * `caseRunId` from the node Sheet.
  */
 export function ExplorationTab({
   versionId,
@@ -478,204 +749,132 @@ export function ExplorationTab({
   stream,
   onOpenEvidence,
   onNavigate,
+  initialFilters,
+  onFiltersChange,
+  selectedNodeId,
+  onSelectedNodeChange,
 }: ExplorationTabProps) {
-  const [requirements, setRequirements] = useState<Requirement[]>([])
-  const [graph, setGraph] = useState<MindmapGraph | null>(null)
-  const [metaLoading, setMetaLoading] = useState(true)
-  const [requirementsError, setRequirementsError] = useState("")
-  const [graphError, setGraphError] = useState("")
-  const [requirementFilter, setRequirementFilter] = useState("")
-  const [statusFilter, setStatusFilter] = useState<ChainResultFilter>("")
-  const [abnormalOnly, setAbnormalOnly] = useState(false)
-  const [issueBatchFilter, setIssueBatchFilter] = useState<"current" | "all">("current")
-  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const initialRequirementId = initialFilters?.requirementId ?? ""
+  const initialStatus = normalizeStatusFilter(initialFilters?.resultStatus)
+  const initialAbnormal = initialFilters?.abnormalOnly === true
+  const initialSearch = initialFilters?.q ?? ""
+
+  const [requirementFilter, setRequirementFilter] = useState(initialRequirementId)
+  const [statusFilter, setStatusFilter] = useState<ChainResultFilter>(initialStatus)
+  const [abnormalOnly, setAbnormalOnly] = useState(initialAbnormal)
+  const [searchInput, setSearchInput] = useState(initialSearch)
+  const [searchQuery, setSearchQuery] = useState(initialSearch)
+  const [issueStatusFilter, setIssueStatusFilter] = useState("")
+  const [issueSeverityFilter, setIssueSeverityFilter] = useState("")
+  const [includeSupplement, setIncludeSupplement] = useState(true)
+  const [revalidationOnly, setRevalidationOnly] = useState(false)
+  const [batchScope, setBatchScope] = useState<"current" | "all">("current")
+  const [requirementOptions, setRequirementOptions] = useState<ChainRequirementInput[]>([])
+  const [selectedNodeLocal, setSelectedNodeLocal] = useState(selectedNodeId ?? "")
   const [collapsed, setCollapsed] = useState<ReadonlySet<string> | null>(null)
-  const requestRef = useRef(0)
 
-  const loadMeta = useCallback(async (): Promise<void> => {
-    const requestId = ++requestRef.current
-    setMetaLoading(true)
-    setRequirementsError("")
-    setGraphError("")
-    try {
-      // Load the two layers independently: one failing request must not discard
-      // the other layer's data. Each failure is surfaced by name below.
-      const [requirementsResult, graphResult] = await Promise.allSettled([
-        listRequirements(versionId, { limit: REQUIREMENT_LIMIT }),
-        getGraph(versionId),
-      ])
-      if (requestRef.current !== requestId) return
-      if (requirementsResult.status === "fulfilled") {
-        setRequirements(requirementsResult.value.items)
-      } else {
-        setRequirementsError(describeLoadError(requirementsResult.reason))
-      }
-      if (graphResult.status === "fulfilled") {
-        setGraph(graphResult.value)
-      } else {
-        setGraphError(describeLoadError(graphResult.reason))
-      }
-    } finally {
-      if (requestRef.current === requestId) setMetaLoading(false)
-    }
-  }, [versionId])
-
+  const onFiltersChangeRef = useRef(onFiltersChange)
   useEffect(() => {
-    void loadMeta()
-    return () => {
-      // Invalidate a request still in flight for this mount/version.
-      requestRef.current += 1
-    }
-  }, [loadMeta])
+    onFiltersChangeRef.current = onFiltersChange
+  }, [onFiltersChange])
 
-  const {
-    caseRuns,
-    loading: runsLoading,
-    error: runsError,
-    refresh,
-  } = useCaseRuns(versionId, batchId ?? "", {}, stream)
-
-  // Without a batch scope there is nothing to narrow to, so the filter is "all".
-  const effectiveIssueBatchFilter: "current" | "all" =
-    batchId === undefined || batchId === "" ? "all" : issueBatchFilter
-  const issueQuery = useIssues(
+  const effectiveBatchId = batchScope === "all" ? "all" : (batchId ?? "")
+  const chain = useExplorationChain(
     versionId,
-    effectiveIssueBatchFilter === "current" && batchId !== undefined
-      ? { batchId, limit: ISSUE_LIMIT }
-      : { limit: ISSUE_LIMIT },
+    {
+      batchId: effectiveBatchId,
+      requirementId: requirementFilter,
+      resultStatus: statusFilter,
+      abnormalOnly,
+      issueStatus: issueStatusFilter,
+      issueSeverity: issueSeverityFilter,
+      q: searchQuery,
+      includeSupplement,
+      revalidationOnly,
+    },
     stream,
   )
 
-  // A version or batch switch starts a fresh view.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: switching scope must reset the view state even though no value is read.
+  // Persist the URL-owned filters after every change (and on first mount, which
+  // normalizes a shared link into the canonical form).
   useEffect(() => {
-    setRequirementFilter("")
-    setStatusFilter("")
-    setAbnormalOnly(false)
-    setIssueBatchFilter("current")
-    setSelectedId(null)
-    setCollapsed(null)
-  }, [versionId, batchId])
+    onFiltersChangeRef.current?.({
+      requirementId: requirementFilter,
+      resultStatus: statusFilter,
+      abnormalOnly,
+      q: searchQuery,
+    })
+  }, [requirementFilter, statusFilter, abnormalOnly, searchQuery])
 
-  const requirementInputs = useMemo<ChainRequirementInput[]>(
-    () =>
-      requirements.map((requirement, index) => ({
-        id: requirement.id,
-        title: requirement.title,
-        status: requirement.status,
-        sortOrder: index,
-      })),
-    [requirements],
+  // The title search hits the server; debounce it for 300ms (spec §5.5).
+  useEffect(() => {
+    if (searchInput === searchQuery) return
+    const timer = setTimeout(() => {
+      setSearchQuery(searchInput.trim())
+    }, SEARCH_DEBOUNCE_MS)
+    return () => clearTimeout(timer)
+  }, [searchInput, searchQuery])
+
+  // Keep the requirement dropdown populated across filtered responses: a
+  // single-requirement response only carries that requirement node.
+  const view = useMemo(() => toChainView(chain.data), [chain.data])
+  const optionsVersionRef = useRef(versionId)
+  useEffect(() => {
+    if (optionsVersionRef.current === versionId) return
+    optionsVersionRef.current = versionId
+    setRequirementOptions([])
+  }, [versionId])
+  useEffect(() => {
+    if (chain.data === null || chain.data.versionId !== versionId) return
+    const incoming = view.input.requirements
+    if (incoming.length === 0) return
+    setRequirementOptions((previous) => mergeRequirementOptions(previous, incoming))
+  }, [view, versionId, chain.data])
+
+  useEffect(() => {
+    setSelectedNodeLocal(selectedNodeId ?? "")
+  }, [selectedNodeId])
+
+  const selectedNodeParam = selectedNodeId !== undefined ? selectedNodeId : selectedNodeLocal
+
+  const handleSelectNode = useCallback(
+    (nextNodeId: string): void => {
+      setSelectedNodeLocal(nextNodeId)
+      onSelectedNodeChange?.(nextNodeId)
+    },
+    [onSelectedNodeChange],
   )
 
-  const caseInputs = useMemo<ChainCaseInput[]>(() => {
-    if (graph === null) return []
-    const caseNodes = graph.nodes.filter((node) => node.kind === "case")
-    const requirementIds = requirementIdsByCase(graph, caseNodes)
-    return caseNodes.map((node, index) => ({
-      id: node.id,
-      title: node.title,
-      requirementIds: requirementIds.get(node.id) ?? [],
-      status: node.status,
-      sortOrder: index,
-      aiSupplemented: node.source === "ai_supplement",
-    }))
-  }, [graph])
-
-  const resultInputs = useMemo<ChainResultInput[]>(
-    () =>
-      latestResults(caseRuns).map((run, index) => ({
-        id: run.id,
-        caseNodeId: run.case_node_id,
-        status: run.status,
-        title: run.title,
-        summary: run.summary,
-        durationMs: run.duration_ms,
-        failureClass: run.failure_class,
-        evidenceIds: run.evidence.map((evidence) => evidence.id),
-        sortOrder: index,
-      })),
-    [caseRuns],
-  )
-
-  const issueInputs = useMemo<ChainIssueInput[]>(
-    () => issueQuery.items.map((issue, index) => toChainIssue(issue, index)),
-    [issueQuery.items],
-  )
-
-  const baseInput = useMemo<ChainLayoutInput>(
-    () => ({
-      requirements: requirementInputs,
-      cases: caseInputs,
-      results: resultInputs,
-      issues: issueInputs,
-    }),
-    [requirementInputs, caseInputs, resultInputs, issueInputs],
-  )
-
-  const filteredInput = useMemo<ChainLayoutInput>(() => {
-    let nextRequirements = baseInput.requirements
-    let nextCases = baseInput.cases
-    let nextResults = baseInput.results ?? []
-    let nextIssues = baseInput.issues ?? []
-
-    if (requirementFilter !== "") {
-      nextRequirements = nextRequirements.filter((row) => row.id === requirementFilter)
-      nextCases = nextCases.filter((row) => (row.requirementIds ?? []).includes(requirementFilter))
-      const caseIds = new Set(nextCases.map((row) => row.id))
-      nextResults = nextResults.filter((row) => caseIds.has(row.caseNodeId))
-    }
-
-    if (statusFilter !== "" || abnormalOnly) {
-      nextResults = nextResults.filter(
-        (row) =>
-          matchesResultFilter(row.status, statusFilter) &&
-          (!abnormalOnly || isAbnormalResultStatus(row.status)),
-      )
-      const resultCaseIds = new Set(nextResults.map((row) => row.caseNodeId))
-      nextCases = nextCases.filter((row) => resultCaseIds.has(row.id))
-      if (requirementFilter === "") {
-        const remainingRequirementIds = new Set(
-          nextCases.flatMap((row) => row.requirementIds ?? []),
-        )
-        nextRequirements = nextRequirements.filter((row) => remainingRequirementIds.has(row.id))
-      }
-    }
-
-    if (requirementFilter !== "" || statusFilter !== "" || abnormalOnly) {
-      // Graph issues follow their case; unlinked issues stay in the side list.
-      const nextCaseIds = new Set(nextCases.map((row) => row.id))
-      const resultsByRun = new Map((baseInput.results ?? []).map((row) => [row.id, row.caseNodeId]))
-      nextIssues = nextIssues.filter((issue) => {
-        const caseNodeId =
-          issue.caseNodeId !== null && issue.caseNodeId !== undefined && issue.caseNodeId !== ""
-            ? issue.caseNodeId
-            : (resultsByRun.get(issue.caseRunId ?? "") ?? null)
-        return caseNodeId === null ? true : nextCaseIds.has(caseNodeId)
-      })
-    }
-
-    return {
-      requirements: nextRequirements,
-      cases: nextCases,
-      results: nextResults,
-      issues: nextIssues,
-    }
-  }, [baseInput, requirementFilter, statusFilter, abnormalOnly])
-
-  const autoCollapsed = useMemo(() => autoCollapsedRequirements(filteredInput), [filteredInput])
+  const autoCollapsed = useMemo(() => autoCollapsedRequirements(view.input), [view.input])
   const collapsedSet = useMemo(
     () => collapsed ?? new Set(autoCollapsed),
     [collapsed, autoCollapsed],
   )
-
   const layout = useMemo(
-    () => layoutChain(filteredInput, { collapsed: collapsedSet }),
-    [filteredInput, collapsedSet],
+    () => layoutChain(view.input, { collapsed: collapsedSet }),
+    [view.input, collapsedSet],
   )
 
-  const selectedNode =
-    selectedId === null ? null : (layout.nodes.find((node) => node.id === selectedId) ?? null)
+  const parsedSelection = parseChainNodeId(selectedNodeParam)
+  const selectedNode = useMemo(() => {
+    if (parsedSelection === null) return null
+    const visible = layout.nodes.find(
+      (node) => node.kind === parsedSelection.kind && node.id === parsedSelection.id,
+    )
+    if (visible !== undefined) return visible
+    const dto = view.dtoByKey.get(`${parsedSelection.kind}:${parsedSelection.id}`)
+    return dto === undefined ? null : toFallbackChainNode(view, dto)
+  }, [layout, view, parsedSelection])
+  const selectedSnapshotNode =
+    parsedSelection === null
+      ? undefined
+      : view.dtoByKey.get(`${parsedSelection.kind}:${parsedSelection.id}`)
+  const nodeMissing =
+    selectedNodeParam !== "" &&
+    chain.data !== null &&
+    !chain.loading &&
+    chain.error === "" &&
+    selectedNode === null
 
   const toggleRequirement = useCallback(
     (requirementId: string): void => {
@@ -689,29 +888,65 @@ export function ExplorationTab({
     [autoCollapsed],
   )
 
-  const handleSelect = useCallback((node: ChainNode): void => {
-    setSelectedId(node.id)
-  }, [])
+  const handleSelect = useCallback(
+    (node: ChainNode): void => {
+      handleSelectNode(`${node.kind}:${node.id}`)
+    },
+    [handleSelectNode],
+  )
 
-  const loading = metaLoading || (batchId !== undefined && batchId !== "" && runsLoading)
-  const chainLayerErrors = [
-    { layer: "需求层", message: requirementsError },
-    { layer: "用例层", message: graphError },
-    { layer: "结果层", message: runsError },
-  ].filter((entry) => entry.message !== "")
-  const chainErrorText = chainLayerErrors
-    .map((entry) => `${entry.layer}：${entry.message}`)
-    .join("；")
-  const hasChainError = chainLayerErrors.length > 0
-  const issuesUnavailable = issueQuery.error !== ""
+  const requirementSelectOptions = useMemo(() => {
+    if (
+      requirementFilter === "" ||
+      requirementOptions.some((option) => option.id === requirementFilter)
+    ) {
+      return requirementOptions
+    }
+    return [...requirementOptions, { id: requirementFilter, title: `需求 ${requirementFilter}` }]
+  }, [requirementOptions, requirementFilter])
+
+  const counts = chain.data?.counts
+  const totalAvailable = counts === undefined ? 0 : chainSnapshotTotal(counts)
+  const truncatedFlags = chain.data?.truncated
+  const truncatedLayers =
+    truncatedFlags === undefined
+      ? []
+      : (
+          [
+            ["requirements", "需求"],
+            ["cases", "用例"],
+            ["results", "结果"],
+            ["issues", "问题"],
+          ] as const
+        )
+          .filter(([key]) => truncatedFlags[key])
+          .map(([, label]) => label)
+  const isTruncated = truncatedLayers.length > 0
+
+  const filtersActive =
+    requirementFilter !== "" ||
+    statusFilter !== "" ||
+    abnormalOnly ||
+    searchQuery !== "" ||
+    issueStatusFilter !== "" ||
+    issueSeverityFilter !== "" ||
+    !includeSupplement ||
+    revalidationOnly
+
   const hasData = layout.nodes.length > 0
-  const hasUnfilteredData =
-    baseInput.requirements.length + baseInput.cases.length + (baseInput.results?.length ?? 0) > 0
+  const hasSnapshot = chain.data !== null
+  const issuesUnavailable = chain.error !== ""
+  const issueNodeCount = chain.data?.nodes.filter((node) => node.kind === "issue").length ?? 0
+  const issueCountLabel = issuesUnavailable
+    ? "问题数据不可用"
+    : counts === undefined
+      ? "问题加载中…"
+      : chain.data?.truncated.issues === true
+        ? `${issueNodeCount} 个问题（共 ${counts.issues} 个）`
+        : `${counts.issues} 个问题`
 
   function retry(): void {
-    void loadMeta()
-    void refresh()
-    void issueQuery.refresh()
+    void chain.refresh()
   }
 
   return (
@@ -721,10 +956,21 @@ export function ExplorationTab({
           <h2 className="text-base font-semibold tracking-tight">探索链路</h2>
           <p className="mt-0.5 text-xs text-muted-foreground">
             需求 → 用例 → 结果 → 问题的血缘图；红色菱形为问题，虚线 AI
-            角标为补全用例，黄色描边为需重验用例。拖拽平移、滚轮缩放、按需求折叠。
+            角标为补全用例，黄色描边为需重验用例。筛选与搜索由服务端读模型完成，拖拽平移、滚轮缩放、按需求折叠。
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <p
+            data-testid="chain-stream-status"
+            data-state={chain.streamStatus}
+            className={
+              chain.streamStatus === "live"
+                ? "text-xs text-muted-foreground"
+                : "text-xs font-medium text-amber-700 dark:text-amber-300"
+            }
+          >
+            {streamStatusLabel(chain.streamStatus)}
+          </p>
           <p data-testid="exploration-visible-count" className="text-xs text-muted-foreground">
             {`可见 ${layout.visibleIds.length} 个节点${
               layout.hiddenIds.length > 0 ? `，折叠 ${layout.hiddenIds.length} 个` : ""
@@ -734,7 +980,7 @@ export function ExplorationTab({
             type="button"
             data-testid="exploration-refresh"
             onClick={retry}
-            disabled={loading}
+            disabled={chain.loading}
             className={BUTTON_CLASS}
           >
             <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
@@ -743,7 +989,7 @@ export function ExplorationTab({
         </div>
       </header>
 
-      <div className="grid gap-2 rounded-2xl border border-border bg-card p-3 sm:grid-cols-2 lg:grid-cols-5">
+      <div className="grid gap-2 rounded-2xl border border-border bg-card p-3 sm:grid-cols-2 lg:grid-cols-4">
         <label className="text-xs font-medium text-muted-foreground">
           需求
           <select
@@ -753,7 +999,7 @@ export function ExplorationTab({
             className={FIELD_CLASS}
           >
             <option value="">全部需求</option>
-            {baseInput.requirements.map((row) => (
+            {requirementSelectOptions.map((row) => (
               <option key={row.id} value={row.id}>
                 {row.title}
               </option>
@@ -781,10 +1027,8 @@ export function ExplorationTab({
           批次
           <select
             data-testid="chain-batch-filter"
-            value={effectiveIssueBatchFilter}
-            onChange={(event) =>
-              setIssueBatchFilter(event.target.value === "current" ? "current" : "all")
-            }
+            value={batchScope}
+            onChange={(event) => setBatchScope(event.target.value === "all" ? "all" : "current")}
             className={FIELD_CLASS}
           >
             <option value="current" disabled={batchId === undefined || batchId === ""}>
@@ -792,6 +1036,50 @@ export function ExplorationTab({
             </option>
             <option value="all">全部批次</option>
           </select>
+        </label>
+
+        <label className="text-xs font-medium text-muted-foreground">
+          问题严重级
+          <select
+            data-testid="exploration-filter-issue-severity"
+            value={issueSeverityFilter}
+            onChange={(event) => setIssueSeverityFilter(event.target.value)}
+            className={FIELD_CLASS}
+          >
+            {ISSUE_SEVERITY_FILTER_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label className="text-xs font-medium text-muted-foreground">
+          问题状态
+          <select
+            data-testid="exploration-filter-issue-status"
+            value={issueStatusFilter}
+            onChange={(event) => setIssueStatusFilter(event.target.value)}
+            className={FIELD_CLASS}
+          >
+            {ISSUE_STATUS_FILTER_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label className="text-xs font-medium text-muted-foreground">
+          搜索需求/用例
+          <input
+            type="search"
+            data-testid="exploration-filter-search"
+            value={searchInput}
+            onChange={(event) => setSearchInput(event.target.value)}
+            placeholder="标题关键字"
+            className={FIELD_CLASS}
+          />
         </label>
 
         <label className="flex items-end gap-2 pb-1.5 text-xs font-medium text-muted-foreground">
@@ -804,30 +1092,68 @@ export function ExplorationTab({
           />
           仅异常
         </label>
+
+        <div className="flex flex-col justify-end gap-1 text-xs font-medium text-muted-foreground">
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              data-testid="exploration-filter-supplement"
+              checked={includeSupplement}
+              onChange={(event) => setIncludeSupplement(event.target.checked)}
+              className="h-4 w-4 rounded border-border"
+            />
+            包含 AI 补充
+          </label>
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              data-testid="exploration-filter-revalidation"
+              checked={revalidationOnly}
+              onChange={(event) => setRevalidationOnly(event.target.checked)}
+              className="h-4 w-4 rounded border-border"
+            />
+            仅需重验
+          </label>
+        </div>
       </div>
 
-      {hasChainError ? (
+      {isTruncated && chain.data !== null && counts !== undefined ? (
         <div
-          data-testid={hasData ? "exploration-degraded" : "exploration-error"}
-          role="alert"
-          className={
-            hasData
-              ? "flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-500/25 bg-amber-500/10 px-4 py-3 text-sm text-amber-700 dark:text-amber-300"
-              : "flex flex-wrap items-center justify-between gap-2 rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive"
-          }
+          data-testid="chain-truncated"
+          role="status"
+          className="rounded-xl border border-amber-500/25 bg-amber-500/10 px-4 py-3 text-xs text-amber-700 dark:text-amber-300"
         >
-          <p>
-            {hasData
-              ? `部分图层加载失败（${chainErrorText}）。下图仅展示已成功加载的图层。`
-              : `加载探索链路失败：${chainErrorText}`}
-          </p>
+          {`已显示前 ${chain.data.nodes.length} 条（共 ${totalAvailable} 条），请收窄筛选（${truncatedLayers.join("、")}层已截断）。`}
+        </div>
+      ) : null}
+
+      {chain.error !== "" && hasSnapshot ? (
+        <div
+          data-testid="exploration-degraded"
+          role="alert"
+          className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-500/25 bg-amber-500/10 px-4 py-3 text-sm text-amber-700 dark:text-amber-300"
+        >
+          <p>{`链路刷新失败（保留上次数据）：${chain.error}`}</p>
           <button type="button" onClick={retry} className={BUTTON_CLASS}>
             重试
           </button>
         </div>
       ) : null}
 
-      {loading && !hasData ? (
+      {chain.error !== "" && !hasSnapshot && !chain.loading ? (
+        <div
+          data-testid="exploration-error"
+          role="alert"
+          className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive"
+        >
+          <p>{`加载探索链路失败：${chain.error}`}</p>
+          <button type="button" onClick={retry} className={BUTTON_CLASS}>
+            重试
+          </button>
+        </div>
+      ) : null}
+
+      {chain.loading && !hasSnapshot ? (
         <p
           data-testid="exploration-loading"
           role="status"
@@ -838,7 +1164,7 @@ export function ExplorationTab({
         </p>
       ) : null}
 
-      {!loading && !hasChainError && !hasData && !hasUnfilteredData ? (
+      {hasSnapshot && !hasData && totalAvailable === 0 && !filtersActive ? (
         <div data-testid="exploration-empty">
           <EmptyState
             icon={GitBranch}
@@ -848,7 +1174,7 @@ export function ExplorationTab({
         </div>
       ) : null}
 
-      {!loading && !hasChainError && !hasData && hasUnfilteredData ? (
+      {hasSnapshot && !hasData && totalAvailable === 0 && filtersActive ? (
         <p
           data-testid="exploration-filtered-empty"
           className="rounded-xl border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground"
@@ -857,11 +1183,24 @@ export function ExplorationTab({
         </p>
       ) : null}
 
+      {nodeMissing ? (
+        <p
+          data-testid="chain-node-missing"
+          role="alert"
+          className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-dashed border-border px-4 py-3 text-sm text-muted-foreground"
+        >
+          <span>节点不存在或已被刷新，请重新选择链路节点。</span>
+          <button type="button" onClick={() => handleSelectNode("")} className={BUTTON_CLASS}>
+            关闭
+          </button>
+        </p>
+      ) : null}
+
       {hasData ? (
         <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_320px]">
           <ChainGraph
             layout={layout}
-            selectedId={selectedId}
+            selectedId={selectedNode?.id ?? null}
             onSelect={handleSelect}
             onToggleRequirement={toggleRequirement}
           />
@@ -876,8 +1215,14 @@ export function ExplorationTab({
               </aside>
             ) : (
               <ChainDrawer
+                key={`${selectedNode.kind}:${selectedNode.id}`}
                 node={selectedNode}
-                onClose={() => setSelectedId(null)}
+                snapshotNode={selectedSnapshotNode}
+                view={view}
+                versionId={versionId}
+                batchId={batchId ?? ""}
+                stream={stream}
+                onClose={() => handleSelectNode("")}
                 onOpenEvidence={onOpenEvidence}
                 onNavigate={onNavigate}
               />
@@ -897,7 +1242,7 @@ export function ExplorationTab({
             data-state={issuesUnavailable ? "degraded" : "ready"}
             className="text-xs text-muted-foreground"
           >
-            {issuesUnavailable ? "问题数据不可用" : `${issueInputs.length} 个问题`}
+            {issueCountLabel}
           </p>
         </div>
 
@@ -907,9 +1252,9 @@ export function ExplorationTab({
             role="alert"
             className="mt-2 rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
           >
-            {`问题数据加载失败：${issueQuery.error} 问题节点可能不完整（AI 分析降级时同样可能不完整）。`}
+            {`问题数据加载失败：${chain.error} 问题节点可能不完整（AI 分析降级时同样可能不完整）。`}
           </p>
-        ) : issueQuery.loading && issueQuery.items.length === 0 ? (
+        ) : chain.loading && !hasSnapshot ? (
           <p
             data-testid="chain-issues-loading"
             role="status"
@@ -918,14 +1263,14 @@ export function ExplorationTab({
             <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
             问题加载中…
           </p>
-        ) : issueQuery.items.length === 0 ? (
+        ) : counts !== undefined && counts.issues === 0 && chain.data?.truncated.issues !== true ? (
           <p data-testid="chain-issues-empty" className="mt-2 text-xs text-muted-foreground">
             本批次未发现问题。
           </p>
         ) : (
           <p className="mt-2 text-xs text-muted-foreground">
             {`红色菱形为问题节点（${
-              effectiveIssueBatchFilter === "current" ? "当前批次" : "全部批次"
+              batchScope === "all" ? "全部批次" : "当前批次"
             }）；点击节点查看摘要、证据与深链。`}
           </p>
         )}
