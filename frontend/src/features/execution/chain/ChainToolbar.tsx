@@ -1,6 +1,7 @@
 "use client"
 
 import { RotateCcw } from "lucide-react"
+import { useState } from "react"
 
 import { cn } from "@/lib/utils"
 
@@ -85,6 +86,10 @@ export function ChainToolbar({
   onBatchScopeChange,
   className,
 }: ChainToolbarProps) {
+  // Below `lg` the toolbar collapses to a small "筛选" button, so the full
+  // filter panel never covers most of the 60vh canvas on a phone.
+  const [filtersOpen, setFiltersOpen] = useState(false)
+
   function patch(next: Partial<ChainToolbarValue>): void {
     onChange({ ...value, ...next })
   }
@@ -99,7 +104,27 @@ export function ChainToolbar({
         className,
       )}
     >
-      <div className="flex flex-wrap items-end gap-1.5">
+      <div className="flex items-center justify-between gap-2 lg:hidden">
+        <span className="text-[10px] font-medium text-muted-foreground">筛选与视图</span>
+        <button
+          type="button"
+          data-testid="chain-toolbar-filter-toggle"
+          aria-expanded={filtersOpen}
+          aria-controls="chain-toolbar-filters"
+          onClick={() => setFiltersOpen((open) => !open)}
+          className={cn(TOGGLE_CLASS, TOGGLE_OFF_CLASS, "lg:hidden")}
+        >
+          {filtersOpen ? "收起筛选" : "筛选"}
+        </button>
+      </div>
+      <div
+        id="chain-toolbar-filters"
+        data-testid="chain-toolbar-filters"
+        className={cn(
+          "mt-1.5 flex flex-wrap items-end gap-1.5 lg:mt-0",
+          !filtersOpen && "hidden lg:flex",
+        )}
+      >
         <label className={FIELD_LABEL_CLASS}>
           批次
           <select
@@ -253,7 +278,12 @@ export function ChainToolbar({
         <button
           type="button"
           data-testid="chain-toolbar-reset"
-          onClick={() => onChange({ ...CHAIN_TOOLBAR_DEFAULTS })}
+          onClick={() => {
+            // Batch scope is not part of ChainToolbarValue; resetting the rest
+            // would silently leave "全部批次" active without this callback.
+            onBatchScopeChange?.("current")
+            onChange({ ...CHAIN_TOOLBAR_DEFAULTS })
+          }}
           className={BUTTON_CLASS}
         >
           <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />

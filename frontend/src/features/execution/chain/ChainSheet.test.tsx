@@ -83,6 +83,14 @@ const ISSUE_NODE: ChainSnapshotNode = {
   codeRefCount: 2,
 }
 
+const REQUIREMENT_NODE: ChainSnapshotNode = {
+  id: "requirement:1844674407370955101",
+  kind: "requirement",
+  title: "登录需求",
+  status: "clarified",
+  caseCount: 2,
+}
+
 function sheetResult(detail: CaseRun | null) {
   return {
     caseRun: detail,
@@ -96,6 +104,8 @@ function sheetResult(detail: CaseRun | null) {
 type HarnessProps = {
   node: ChainSnapshotNode
   resultBatchId?: string
+  collapsed?: boolean
+  onToggleCollapse?: () => void
   onOpenEvidence?: (evidenceId: string) => void
   onNavigate?: (target: { kind: string; id: string }) => void
 }
@@ -115,6 +125,8 @@ function SheetHarness({ node, ...rest }: HarnessProps) {
           batchId={BATCH_ID}
           stream={STREAM}
           resultBatchId={rest.resultBatchId}
+          collapsed={rest.collapsed}
+          onToggleCollapse={rest.onToggleCollapse}
           onClose={() => setOpen(false)}
           onOpenEvidence={rest.onOpenEvidence}
           onNavigate={rest.onNavigate}
@@ -182,6 +194,43 @@ describe("ChainSheet", () => {
 
     fireEvent.keyDown(last, { key: "Tab" })
     expect(document.activeElement).toBe(close)
+  })
+
+  it("sends Shift+Tab from the dialog itself to the last focusable element", () => {
+    openSheet({ node: RESULT_NODE })
+
+    const sheet = screen.getByTestId("chain-sheet")
+    const focusables = sheet.querySelectorAll<HTMLElement>(
+      'a[href], button:not([disabled]), input, select, textarea, [tabindex]:not([tabindex="-1"])',
+    )
+    const last = focusables[focusables.length - 1]
+
+    // The dialog is its own focus fallback (tabIndex=-1); Shift+Tab must wrap to
+    // the end instead of leaving the modal through the browser chrome.
+    sheet.focus()
+    expect(document.activeElement).toBe(sheet)
+    fireEvent.keyDown(sheet, { key: "Tab", shiftKey: true })
+    expect(document.activeElement).toBe(last)
+  })
+
+  it("offers an explicit requirement collapse control in the Sheet", () => {
+    const onToggleCollapse = vi.fn()
+    openSheet({ node: REQUIREMENT_NODE, collapsed: false, onToggleCollapse })
+
+    const toggle = screen.getByTestId("chain-sheet-toggle-collapse")
+    expect(toggle.getAttribute("aria-expanded")).toBe("true")
+    expect(toggle.textContent).toContain("折叠")
+
+    fireEvent.click(toggle)
+    expect(onToggleCollapse).toHaveBeenCalledTimes(1)
+  })
+
+  it("labels the Sheet collapse control with the expanded state", () => {
+    openSheet({ node: REQUIREMENT_NODE, collapsed: true, onToggleCollapse: vi.fn() })
+
+    const toggle = screen.getByTestId("chain-sheet-toggle-collapse")
+    expect(toggle.getAttribute("aria-expanded")).toBe("false")
+    expect(toggle.textContent).toContain("展开")
   })
 
   it("shows the result status, summary, attempt and batch", () => {

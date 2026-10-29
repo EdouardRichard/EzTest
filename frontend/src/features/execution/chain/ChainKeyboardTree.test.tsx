@@ -1,4 +1,5 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { useState } from "react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import { type ChainKeyboardNode, ChainKeyboardTree } from "./ChainKeyboardTree"
@@ -43,6 +44,7 @@ const NODES: ChainKeyboardNode[] = [
     status: "executed",
     requirementIds: [idOf("requirement", R1)],
     caseNodeId: idOf("case", C1),
+    hasChildren: true,
   }),
   chainNode(CR1, "result", {
     title: "登录成功",
@@ -100,6 +102,19 @@ function item(id: string): HTMLElement {
   return screen.getByTestId(`chain-treeitem-${id}`)
 }
 
+/** Parent that owns the active id, exactly like `ChainCanvas` does. */
+function ControlledTree({ initialActiveId }: { initialActiveId: string }) {
+  const [activeId, setActiveId] = useState<string | null>(initialActiveId)
+  return (
+    <ChainKeyboardTree
+      nodes={NODES}
+      activeId={activeId}
+      onActiveChange={setActiveId}
+      onSelect={vi.fn()}
+    />
+  )
+}
+
 afterEach(() => {
   cleanup()
 })
@@ -123,7 +138,63 @@ describe("ChainKeyboardTree", () => {
     expect(item(idOf("result", CR2)).getAttribute("aria-posinset")).toBe("2")
 
     expect(item(idOf("requirement", R1)).getAttribute("aria-expanded")).toBe("true")
+    expect(item(idOf("case", C1)).getAttribute("aria-expanded")).toBe("true")
     expect(item(idOf("result", CR1)).getAttribute("aria-expanded")).toBeNull()
+  })
+
+  it("exposes aria-expanded for every treeitem that has children", () => {
+    renderTree()
+
+    // A case and a result with visible children are expandable parents too; the
+    // attribute cannot be limited to requirement nodes.
+    expect(item(idOf("case", C1)).getAttribute("aria-expanded")).toBe("true")
+    expect(item(idOf("result", CR1)).getAttribute("aria-expanded")).toBeNull()
+    expect(item(idOf("requirement", R2)).getAttribute("aria-expanded")).toBe("true")
+  })
+
+  it("accepts a controlled activeId and reports keyboard moves through onActiveChange", () => {
+    const onActiveChange = vi.fn()
+    const onSelect = vi.fn()
+    const { rerender } = render(
+      <ChainKeyboardTree
+        nodes={NODES}
+        activeId={idOf("case", C1)}
+        onActiveChange={onActiveChange}
+        onSelect={onSelect}
+      />,
+    )
+
+    expect(item(idOf("case", C1)).getAttribute("tabindex")).toBe("0")
+    expect(item(idOf("requirement", R1)).getAttribute("tabindex")).toBe("-1")
+
+    // Controlled: only the reported value changes; the tree itself must not move
+    // its own tab stop behind the parent's back.
+    fireEvent.keyDown(item(idOf("case", C1)), { key: "ArrowDown" })
+    expect(onActiveChange).toHaveBeenLastCalledWith(idOf("result", CR1))
+    expect(item(idOf("case", C1)).getAttribute("tabindex")).toBe("0")
+
+    rerender(
+      <ChainKeyboardTree
+        nodes={NODES}
+        activeId={idOf("result", CR1)}
+        onActiveChange={onActiveChange}
+        onSelect={onSelect}
+      />,
+    )
+    expect(item(idOf("result", CR1)).getAttribute("tabindex")).toBe("0")
+    expect(item(idOf("result", CR1)).getAttribute("data-active")).toBe("true")
+  })
+
+  it("moves focus with the visible active state when the parent owns it", () => {
+    render(<ControlledTree initialActiveId={idOf("requirement", R1)} />)
+
+    fireEvent.keyDown(item(idOf("requirement", R1)), { key: "ArrowDown" })
+
+    const caseItem = item(idOf("case", C1))
+    expect(document.activeElement).toBe(caseItem)
+    expect(caseItem.getAttribute("tabindex")).toBe("0")
+    expect(caseItem.getAttribute("data-active")).toBe("true")
+    expect(item(idOf("requirement", R1)).getAttribute("data-active")).toBe("false")
   })
 
   it("uses roving focus: exactly one treeitem is tabbable and arrows move it", () => {

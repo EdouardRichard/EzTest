@@ -7,7 +7,10 @@ afterEach(() => {
   cleanup()
 })
 
-function renderToolbar(overrides: Partial<ChainToolbarValue> = {}) {
+function renderToolbar(
+  overrides: Partial<ChainToolbarValue> = {},
+  batchScope: "current" | "all" = "current",
+) {
   const onChange = vi.fn()
   const onBatchScopeChange = vi.fn()
   const value: ChainToolbarValue = { ...CHAIN_TOOLBAR_DEFAULTS, ...overrides }
@@ -16,7 +19,7 @@ function renderToolbar(overrides: Partial<ChainToolbarValue> = {}) {
       value={value}
       onChange={onChange}
       onBatchScopeChange={onBatchScopeChange}
-      batchScope="current"
+      batchScope={batchScope}
       batchId="batch-1"
       requirementOptions={[
         { id: "r-1", title: "登录需求" },
@@ -110,22 +113,45 @@ describe("ChainToolbar", () => {
   })
 
   it("resets every filter and view option to its default", () => {
-    const { onChange } = renderToolbar({
-      requirementId: "r-1",
-      resultStatus: "failed",
-      abnormalOnly: true,
-      issueSeverity: "major",
-      issueStatus: "open",
-      includeSupplement: false,
-      revalidationOnly: true,
-      q: "登录",
-      follow: true,
-      listView: true,
-    })
+    const { onChange, onBatchScopeChange } = renderToolbar(
+      {
+        requirementId: "r-1",
+        resultStatus: "failed",
+        abnormalOnly: true,
+        issueSeverity: "major",
+        issueStatus: "open",
+        includeSupplement: false,
+        revalidationOnly: true,
+        q: "登录",
+        follow: true,
+        listView: true,
+      },
+      "all",
+    )
 
     fireEvent.click(screen.getByTestId("chain-toolbar-reset"))
 
     expect(onChange).toHaveBeenLastCalledWith(CHAIN_TOOLBAR_DEFAULTS)
+    // The batch scope is not part of ChainToolbarValue, so reset must report it
+    // through its own callback instead of silently leaving "全部批次" active.
+    expect(onBatchScopeChange).toHaveBeenLastCalledWith("current")
+  })
+
+  it("folds the filter panel behind a toggle below lg", () => {
+    renderToolbar()
+
+    const toggle = screen.getByTestId("chain-toolbar-filter-toggle")
+    expect(toggle.getAttribute("aria-expanded")).toBe("false")
+    expect(toggle.className).toContain("lg:hidden")
+
+    const panel = screen.getByTestId("chain-toolbar-filters")
+    expect(panel.className).toContain("hidden")
+    expect(panel.className).toContain("lg:flex")
+
+    fireEvent.click(toggle)
+    expect(toggle.getAttribute("aria-expanded")).toBe("true")
+    expect(panel.className).not.toContain("hidden")
+    expect(panel.className).toContain("flex")
   })
 
   it("maps the batch scope selector to its own callback", () => {

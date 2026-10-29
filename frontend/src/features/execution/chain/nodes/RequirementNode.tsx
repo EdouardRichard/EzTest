@@ -1,4 +1,5 @@
 import { clsx } from "clsx"
+import { ChevronDown, ChevronRight } from "lucide-react"
 import { memo } from "react"
 
 import { StatusBadge } from "@/components/ui/StatusBadge"
@@ -13,6 +14,16 @@ import type { ChainSnapshotNode } from "../chain-types"
 export type RequirementNodeProps = {
   data: ChainSnapshotNode
   selected?: boolean
+  /** True when this requirement group is collapsed in the layout. */
+  collapsed?: boolean
+  /** Only requirements with derived cases render the collapse control. */
+  showCollapseToggle?: boolean
+  onToggleCollapse?: () => void
+}
+
+function domainIdOf(nodeId: string): string {
+  const separator = nodeId.indexOf(":")
+  return separator === -1 ? nodeId : nodeId.slice(separator + 1)
 }
 
 /**
@@ -20,10 +31,16 @@ export type RequirementNodeProps = {
  * title, status, priority, coverage gap and the number of derived cases. The
  * accessible label carries the same information, so selection never depends on
  * colour alone.
+ *
+ * The header also carries the explicit collapse/expand control: a pointer user
+ * must not depend on a double click that a single-click Sheet would swallow.
  */
 export const RequirementNode = memo(function RequirementNode({
   data,
   selected = false,
+  collapsed = false,
+  showCollapseToggle = false,
+  onToggleCollapse,
 }: RequirementNodeProps) {
   const kind = NODE_KIND_TOKENS.requirement
   const status = getRequirementStatusToken(data.status)
@@ -73,6 +90,27 @@ export const RequirementNode = memo(function RequirementNode({
         >
           {priority}
         </span>
+        {showCollapseToggle && onToggleCollapse !== undefined ? (
+          <button
+            type="button"
+            data-testid={`chain-node-toggle-${domainIdOf(data.id)}`}
+            aria-expanded={!collapsed}
+            aria-label={`${collapsed ? "展开" : "折叠"}需求：${data.title}`}
+            onClick={(event) => {
+              event.stopPropagation()
+              onToggleCollapse()
+            }}
+            onDoubleClick={(event) => event.stopPropagation()}
+            className="inline-flex h-5 items-center gap-0.5 rounded border border-border bg-card px-1 text-[10px] font-medium text-muted-foreground hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {collapsed ? (
+              <ChevronRight className="h-3 w-3" aria-hidden="true" />
+            ) : (
+              <ChevronDown className="h-3 w-3" aria-hidden="true" />
+            )}
+            {collapsed ? "展开" : "折叠"}
+          </button>
+        ) : null}
       </header>
 
       <h3 className="mt-1.5 line-clamp-2 text-sm font-semibold leading-snug text-card-foreground">
