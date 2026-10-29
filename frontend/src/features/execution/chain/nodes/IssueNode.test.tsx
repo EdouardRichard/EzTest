@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react"
+import { cleanup, render, screen, within } from "@testing-library/react"
 import { afterEach, describe, expect, it } from "vitest"
 
 import { CHAIN_CARD_SIZES } from "../chain-layout"
@@ -42,6 +42,16 @@ describe("IssueNode", () => {
 
     expect(screen.getByTestId("chain-node-issue-severity").textContent).toBe("阻断")
     expect(screen.getByTestId("chain-node-issue-category").textContent).toBe("—")
+  })
+
+  it("exposes the P7 chain-issue-node testid on the node root without dropping the P8 testid", () => {
+    render(<IssueNode data={ISSUE} />)
+
+    // P7 e2e selectors use the decimal issue id (`chain-issue-node-{id}`).
+    const p7Root = screen.getByTestId("chain-issue-node-1844674407370955501")
+    const card = within(p7Root).getByTestId("chain-node-issue")
+    expect(card.getAttribute("data-node-id")).toBe(ISSUE.id)
+    expect(p7Root.textContent).toContain("提交订单失败")
   })
 
   it("fills the fixed card slot from the shared layout constants", () => {

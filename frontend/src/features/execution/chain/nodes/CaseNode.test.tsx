@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react"
+import { cleanup, render, screen, within } from "@testing-library/react"
 import { afterEach, describe, expect, it } from "vitest"
 
 import { CHAIN_CARD_SIZES } from "../chain-layout"
@@ -43,6 +43,29 @@ describe("CaseNode", () => {
     expect(card.className).toContain("border-dashed")
     expect(screen.getByTestId("chain-node-case-ai-badge").textContent).toBe("AI 补充")
     expect(card.getAttribute("aria-label")).toContain("AI 补充")
+  })
+
+  it("exposes the P7 supplement badge testid without dropping the P8 card testid", () => {
+    render(<CaseNode data={{ ...CASE, source: "ai_supplement" }} />)
+
+    const p7Badge = screen.getByTestId("chain-supplement-badge")
+    expect(p7Badge.textContent).toBe("AI 补充")
+    expect(within(p7Badge).getByTestId("chain-node-case-ai-badge")).not.toBeNull()
+  })
+
+  it("exposes the P7 revalidation badge testid without dropping the P8 card testid", () => {
+    render(<CaseNode data={{ ...CASE, status: "needs_revalidation", revalidation: true }} />)
+
+    const p7Badge = screen.getByTestId("chain-revalidation-badge")
+    expect(p7Badge.textContent).toBe("需重验")
+    expect(within(p7Badge).getByTestId("chain-node-case-revalidation")).not.toBeNull()
+  })
+
+  it("renders neither P7 badge for a regular case", () => {
+    render(<CaseNode data={CASE} />)
+
+    expect(screen.queryByTestId("chain-supplement-badge")).toBeNull()
+    expect(screen.queryByTestId("chain-revalidation-badge")).toBeNull()
   })
 
   it("draws an amber ring and badge for a case that needs revalidation", () => {
