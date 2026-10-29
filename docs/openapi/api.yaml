@@ -121,11 +121,13 @@ info:
       `GET /api/versions/{id}/code/changes` gains `batchTimeline`. The rate
       limiter answers 429 `rate_limited` with `Retry-After`; `GET /api/health`
       projects the effective rate-limit and GC thresholds. P8 adds
-      `knowledge.created`/`knowledge.reviewed` events. Visual assertion code and
-      migrations are partially committed, but the routes are **not mounted**
-      (the composition root does not wire `Deps.Visual`) and the execution entry
-      is absent, so this document intentionally does not publish visual
-      assertion endpoints or the `case.visual_baseline_approved` event yet.
+      `knowledge.created`/`knowledge.reviewed` events. Visual assertions (D62)
+      are wired: `PUT /api/versions/{versionId}/mindmap/assertions/{assertionId}/visual`
+      stores the comparison parameters and the admin-only
+      `POST .../visual/baseline` approves the baseline evidence; the execution
+      Agent compares through `execution.visual_assert` and publishes
+      `case.visual_baseline_approved` (IDs/status only). Real browser/executor
+      acceptance remains the Task 35 acceptance item, not a missing route.
 
     This document is served publicly at `GET /api/openapi.yaml`; it is the same
     file under `docs/openapi/api.yaml` in the repository.
@@ -5716,6 +5718,119 @@ paths:
           $ref: '#/components/responses/MindmapUnprocessable'
         '500':
           $ref: '#/components/responses/MindmapServerError'
+  /api/versions/{versionId}/mindmap/assertions/{assertionId}/visual:
+    put:
+      tags: [mindmap]
+      summary: Configure one visual assertion
+      description: |
+        Every authenticated user. Stores the comparison configuration of a
+        `kind=visual` assertion (design spec §9.3): CSS selector, optional
+        normalized region (0..1; omitted/all-zero means the whole viewport),
+        pixel-diff threshold (0..0.1; the UI default is 0.005), viewport and
+        device scale factor. `nodeRevision` is the same node OCC token as every
+        graph write (409 `case_revision_conflict`; a successful write increments
+        the node revision by one). The version must be `designing` or
+        `reviewing` and must not have a frozen baseline (409
+        `version_state_conflict` / `baseline_frozen`); the assertion must belong
+        to a case of this version (404 `assertion_not_found`) and be
+        `kind=visual` (422 `invalid_assertion_kind`). Omitted viewport/DPR fall
+        back to 1280x720 / 1.0. The baseline itself is approved by the
+        administrator through `POST .../visual/baseline`.
+      operationId: updateVisualAssertion
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+        - $ref: '#/components/parameters/MindmapAssertionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateVisualAssertionRequest'
+            example:
+              nodeRevision: 7
+              selector: '[data-testid="order-total"]'
+              region: { x: 0.1, y: 0.2, width: 0.5, height: 0.3 }
+              threshold: 0.005
+              viewport: { width: 1280, height: 720 }
+              deviceScaleFactor: 1
+      responses:
+        '200':
+          description: The stored visual assertion configuration.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VisualAssertionEnvelope'
+        '400':
+          $ref: '#/components/responses/MindmapBadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '409':
+          $ref: '#/components/responses/MindmapConflict'
+        '422':
+          $ref: '#/components/responses/MindmapUnprocessable'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
+  /api/versions/{versionId}/mindmap/assertions/{assertionId}/visual/baseline:
+    post:
+      tags: [mindmap]
+      summary: Approve the visual baseline (admin only)
+      description: |
+        Administrator only (403 `forbidden`). Reads the evidence artifact and
+        records it as the approved baseline of a `kind=visual` assertion. The
+        evidence must belong to a case of this version (404
+        `evidence_not_found`), be a `screenshot` or `visual_baseline` artifact
+        (422 `visual_baseline_invalid`), not exceed
+        `EZTEST_VISUAL_BASELINE_MAX_BYTES` (default 5 MiB; the API accepts
+        64 KiB-20 MiB, 422 `visual_baseline_too_large`), match its recorded
+        sha256/size and be a PNG whose pixel size is exactly
+        `viewportWidth x deviceScaleFactor` by
+        `viewportHeight x deviceScaleFactor`. The version must be `designing`
+        or `reviewing` without a frozen baseline (409
+        `version_state_conflict` / `baseline_frozen`). The write publishes
+        `case.visual_baseline_approved` with only `caseNodeId`, `assertionId`,
+        `baselineEvidenceId`, `approvedBy` and `status` in `detail`; baseline
+        bytes never leave the evidence store.
+      operationId: approveVisualBaseline
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/MindmapVersionId'
+        - $ref: '#/components/parameters/MindmapAssertionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApproveVisualBaselineRequest'
+            example:
+              evidenceId: '1844674407370955300'
+      responses:
+        '200':
+          description: The assertion with the approved baseline recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VisualAssertionEnvelope'
+        '400':
+          $ref: '#/components/responses/MindmapBadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/MindmapForbidden'
+        '404':
+          $ref: '#/components/responses/MindmapNotFound'
+        '409':
+          $ref: '#/components/responses/MindmapConflict'
+        '422':
+          $ref: '#/components/responses/MindmapUnprocessable'
+        '500':
+          $ref: '#/components/responses/MindmapServerError'
   /api/versions/{versionId}/mindmap/nodes/{nodeId}/sources:
     post:
       tags: [mindmap]
@@ -9585,10 +9700,10 @@ components:
     MindmapForbidden:
       description: |
         Authenticated but not allowed (`forbidden`, HTTP 403 with
-        `details.reason=forbidden`). Starting an `explore` run requires the
-        administrator role, and deleting a case code anchor requires an
-        administrator or the anchor creator. Every other mindmap read/write is
-        available to every authenticated user.
+        `details.reason=forbidden`). Starting an `explore` run and approving a
+        visual baseline require the administrator role; deleting a case code
+        anchor requires an administrator or the anchor creator. Every other
+        mindmap read/write is available to every authenticated user.
       content:
         application/json:
           schema:
@@ -9599,8 +9714,8 @@ components:
         one of `node_not_found`, `step_not_found`, `assertion_not_found`,
         `source_not_found`, `anchor_not_found`, `review_not_found`,
         `baseline_not_found`, `finding_not_found`, `run_not_found`,
-        `export_not_found` or `requirement_not_found`; an unknown P3 version on
-        a mindmap route uses the plain `not_found` reason.
+        `export_not_found`, `evidence_not_found` or `requirement_not_found`; an
+        unknown P3 version on a mindmap route uses the plain `not_found` reason.
       content:
         application/json:
           schema:
@@ -9630,7 +9745,11 @@ components:
         A semantically invalid mindmap request (`invalid_argument`, HTTP 422).
         `details.reason` is one of `invalid_run_kind`,
         `environment_not_allowed`, `code_repo_unavailable`,
-        `export_format_unsupported` or a field-level reason such as
+        `export_format_unsupported`, the P8 visual reasons
+        `invalid_visual_selector`/`invalid_visual_region`/
+        `invalid_visual_threshold`/`invalid_visual_viewport`/
+        `invalid_visual_device_scale_factor`/`visual_baseline_invalid`/
+        `visual_baseline_too_large` or a field-level reason such as
         `invalid_id`/`invalid_json`, always with `details.field` and
         `details.message`. Async run failures (for example
         `invalid_case_proposal`, `environment_unreachable` or
@@ -14251,9 +14370,11 @@ components:
         strings (D29); evidence ids go to `refs.evidence` and case node ids to
         `refs.case`. P7 events never carry prompt text, evidence bodies, SQL
         result sets, credentials, report Markdown or filesystem paths. P8 adds
-        `knowledge.created` (draft id, kind, status) and `knowledge.reviewed`
-        (entry id, status, reviewer) to the same channel; both are IDs/status
-        only and never carry knowledge title/body.
+        `knowledge.created` (draft id, kind, status), `knowledge.reviewed`
+        (entry id, status, reviewer) and `case.visual_baseline_approved`
+        (case node id, assertion id, baseline evidence id, approver id, status)
+        to the same channel; all are IDs/status only and never carry knowledge
+        bodies, baseline bytes or filesystem paths.
       enum:
         - version.created
         - version.updated
@@ -14311,6 +14432,7 @@ components:
         - analysis.finished
         - knowledge.created
         - knowledge.reviewed
+        - case.visual_baseline_approved
     VersionEvent:
       type: object
       description: |
@@ -14426,8 +14548,11 @@ components:
       enum: [requirement, app_model, ai_run, manual]
     AssertionKind:
       type: string
-      description: Assertion kind.
-      enum: [ui, api, db, text]
+      description: |
+        Assertion kind. P8 adds `visual` (D62): the comparison parameters live in
+        `visual` (see `VisualAssertionView`) and are configured through
+        `PUT .../assertions/{assertionId}/visual`.
+      enum: [ui, api, db, text, visual]
     Confidence:
       type: string
       description: Confidence bucket shared by sources, anchors and impact hints.
@@ -14527,6 +14652,162 @@ components:
           type: string
         source:
           $ref: '#/components/schemas/CaseContentSource'
+        visual:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/VisualAssertionView'
+          description: |
+            Present only for `kind=visual` assertions; null/absent otherwise
+            (P8 D62).
+    VisualAssertionView:
+      type: object
+      description: |
+        Stored comparison configuration of one `kind=visual` assertion (design
+        spec §9.3). `baselineEvidenceId` is null until an administrator approves
+        a baseline; `approvedBy`/`approvedAt` are recorded atomically with it.
+        IDs are decimal strings; `approvedBy` is the numeric user id.
+      required:
+        - selector
+        - region
+        - threshold
+        - baselineEvidenceId
+        - viewportWidth
+        - viewportHeight
+        - deviceScaleFactor
+        - approvedBy
+        - approvedAt
+        - revision
+      properties:
+        selector:
+          type: string
+          maxLength: 500
+          description: CSS selector captured at comparison time; empty means the full page.
+        region:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/VisualRegionView'
+        threshold:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 0.1
+          description: Allowed fraction of differing pixels (0.005 = 0.5%).
+        baselineEvidenceId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+        viewportWidth:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        viewportHeight:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        deviceScaleFactor:
+          type: number
+          format: double
+          minimum: 0.5
+          maximum: 4
+        approvedBy:
+          type: integer
+          format: int64
+          nullable: true
+        approvedAt:
+          type: string
+          format: date-time
+          nullable: true
+        revision:
+          type: integer
+          minimum: 0
+    VisualRegionView:
+      type: object
+      description: |
+        Normalized crop of one visual assertion. All values are 0..1 and
+        `x + width` / `y + height` stay inside the unit square; null means the
+        whole viewport.
+      required: [x, y, width, height]
+      properties:
+        x:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+        y:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+        width:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+        height:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+    UpdateVisualAssertionRequest:
+      type: object
+      description: |
+        Body of `PUT .../visual`. Only `nodeRevision` is required; an omitted
+        viewport/device scale factor falls back to 1280x720 / 1.0, an omitted or
+        all-zero region means the whole viewport and an omitted threshold is 0
+        (exact match). The stored values are validated against the §9.3 bounds.
+      required: [nodeRevision]
+      properties:
+        nodeRevision:
+          type: integer
+          minimum: 0
+        selector:
+          type: string
+          maxLength: 500
+        region:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/VisualRegionView'
+        threshold:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 0.1
+        viewport:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/VisualViewportRequest'
+        deviceScaleFactor:
+          type: number
+          format: double
+          minimum: 0.5
+          maximum: 4
+    VisualViewportRequest:
+      type: object
+      description: Expected browser viewport of the visual comparison (1-10000 px per side).
+      required: [width, height]
+      properties:
+        width:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        height:
+          type: integer
+          minimum: 1
+          maximum: 10000
+    ApproveVisualBaselineRequest:
+      type: object
+      description: Body of `POST .../visual/baseline`; the evidence id is a decimal string.
+      required: [evidenceId]
+      properties:
+        evidenceId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+    VisualAssertionEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/VisualAssertionView'
     CaseSourceView:
       type: object
       description: |
@@ -15512,7 +15793,13 @@ components:
         decision on a non-supplement/already terminal node, 409),
         `duplicate_supplement` (a node already materialized, 409) and
         `invalid_supplement_case` (invalid proposed supplement content, 422);
-        the delivery/execution-side P7 reasons stay in ExecutionErrorReason.
+        the delivery/execution-side P7 reasons stay in ExecutionErrorReason. P8
+        (D62) adds the visual configuration/baseline reasons
+        `invalid_assertion_id`, `invalid_assertion_kind`, `invalid_evidence_id`,
+        `invalid_visual_selector`, `invalid_visual_region`,
+        `invalid_visual_threshold`, `invalid_visual_viewport`,
+        `invalid_visual_device_scale_factor`, `visual_baseline_invalid`,
+        `visual_baseline_too_large` and `evidence_not_found` (404).
       enum:
         - version_state_conflict
         - baseline_frozen
@@ -15554,6 +15841,17 @@ components:
         - case_status_conflict
         - duplicate_supplement
         - invalid_supplement_case
+        - invalid_assertion_id
+        - invalid_assertion_kind
+        - invalid_evidence_id
+        - invalid_visual_selector
+        - invalid_visual_region
+        - invalid_visual_threshold
+        - invalid_visual_viewport
+        - invalid_visual_device_scale_factor
+        - visual_baseline_invalid
+        - visual_baseline_too_large
+        - evidence_not_found
     BatchStatus:
       type: string
       description: |
@@ -15630,7 +15928,12 @@ components:
         network logs are captured when the Agent requests evidence. P7 adds
         `db_result` (the bounded read-only SQL result captured by
         `execution.db_assert`; it is metadata/summary JSON, never credentials).
-      enum: [screenshot, http_exchange, console_log, network_log, download, db_result]
+        P8 adds the three visual kinds produced by `execution.visual_assert`:
+        `visual_baseline` (an approved baseline capture), `visual_actual` (the
+        live screenshot) and `visual_diff` (the pixel-diff image). The PNG bytes
+        live in the evidence store and are served through the evidence download
+        endpoint, never inline in JSON.
+      enum: [screenshot, http_exchange, console_log, network_log, download, db_result, visual_baseline, visual_actual, visual_diff]
     AuthFlowKind:
       type: string
       description: Login recipe kind. P6 supports only the minimal `form` recipe.
@@ -16620,7 +16923,16 @@ components:
         `db_expected_invalid` (all produced by `execution.db_assert`;
         connection/target failures classify `blocked(environment)`, SQL/
         read-only/truncation/expected failures `inconclusive(case)` and a value
-        mismatch `failed(application)`).
+        mismatch `failed(application)`). P8 adds the visual assertion outcomes
+        produced by `execution.visual_assert` (D62): `missing_visual_baseline`
+        and `visual_environment_mismatch` are `inconclusive(case)` /
+        `inconclusive(environment)`, `visual_mismatch` is
+        `failed(application)` and `visual_match` is the passing reason;
+        `invalid_visual_configuration`, `visual_baseline_invalid`,
+        `visual_baseline_read_failed`, `visual_evidence_capture_failed`,
+        `visual_compare_failed`, `visual_actual_missing` and
+        `visual_artifact_too_large` are case-outcome reasons of a failed
+        comparison (never a silent pass).
       enum:
         - version_not_executable
         - baseline_required
@@ -16681,6 +16993,17 @@ components:
         - invalid_supplement_case
         - case_status_conflict
         - invalid_continue_phase
+        - missing_visual_baseline
+        - visual_environment_mismatch
+        - visual_mismatch
+        - visual_match
+        - invalid_visual_configuration
+        - visual_baseline_invalid
+        - visual_baseline_read_failed
+        - visual_evidence_capture_failed
+        - visual_compare_failed
+        - visual_actual_missing
+        - visual_artifact_too_large
     VersionChangeKind:
       type: string
       description: |

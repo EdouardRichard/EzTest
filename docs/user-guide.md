@@ -102,6 +102,14 @@ EzTest 的主线是：**版本 → 需求/澄清 → 用例脑图/评审 → 执
 - 导出文件下载需要登录；同一冻结基线 + 格式的导出可复用（不再重复写文件）。
 - 导出内容来自当前冻结快照，不包含凭据、Session 原文或 prompt。
 
+### 4.4 视觉断言（P8）
+
+1. 在用例编辑器中把断言类型设为 `visual`，配置 **selector**（CSS 选择器，可空=整页）、**region**（归一化裁剪 0–1，可关闭）、**threshold**（0–0.1，默认 0.005）、**viewport**（默认 1280×720）与 **deviceScaleFactor**（0.5–4，默认 1），保存时带节点 `nodeRevision`。
+2. 管理员从一次执行产生的截图/`visual_baseline` 证据上**审批基线**：证据必须是 PNG、属于该版本用例、sha256/大小匹配、像素尺寸=viewport×DPR；大小受 `EZTEST_VISUAL_BASELINE_MAX_BYTES` 限制（默认 5 MiB，API 允许 64 KiB–20 MiB）。审批成功会记录审批人与时间。
+3. 执行时 Agent 通过 `execution.visual_assert` 比对：无基线 → `inconclusive(case)`（`missing_visual_baseline`）；视口/DPR 与基线不符 → `inconclusive(environment)`（`visual_environment_mismatch`）；像素差异超阈值 → `failed(application)`（`visual_mismatch`）；否则通过。
+4. 比对会生成 `visual_actual`（实际截图）与 `visual_diff`（差异图）证据，可在证据查看器中查看；差异比例/尺寸/环境是否匹配写在断言结果里。
+5. 当前状态：代码与运行时入口已接线，真实 Chromium/executor 端到端验收仍归 Task 35；`EZTEST_VISUAL_DIFF_THRESHOLD` 尚未读取，阈值以每条断言配置为准。
+
 ## 5. 执行、暂停/恢复与人工接管
 
 ### 5.1 开始执行
@@ -128,13 +136,13 @@ EzTest 的主线是：**版本 → 需求/澄清 → 用例脑图/评审 → 执
 ### 5.4 结果、证据与人工接管
 
 - **结果与证据** Tab：用例结果表（失败/阻塞置顶）、步骤/断言展开、终态重跑。
-- 证据查看器按 `kind` 渲染截图、HTTP 请求/响应、console/日志等；显示 sha256/大小/MIME，不显示文件系统路径；支持前后证据对比（P8）。
+- 证据查看器按 `kind` 渲染截图、HTTP 请求/响应、console/日志等；视觉断言会显示 `visual_baseline`/`visual_actual`/`visual_diff` 图片与差异说明；显示 sha256/大小/MIME，不显示文件系统路径；支持前后证据对比（P8）。
 - 需要人工处理时，会话内出现**需要人工接管**卡片：管理员可完成接管；普通用户只读可见。接管完成后可继续执行。
 
 ### 5.5 新需求与“继续中”
 
 - 版本完成后再加需求，可使用**新增需求**进入继续中流程：创建增量批次，只执行受影响/新增用例；页面顶部显示“继续中（第 N 批）”。
-- 补全批次（`supplement`）由 AI 提出新用例，需人工接受/拒绝后才进入执行；自动补全批次受上限保护。
+- 补全批次（`supplement`）由 autonomy worker 在基线批次结束后自动发起补全运行，并把 AI 提出的新用例自动创建成 `supplement` 子批次执行（`supplement_attempted` CAS 防重复；补全新用例上限 5、受影响用例上限 20）。`PATCH .../mindmap/nodes/{nodeId}/supplement` 的 accept/reject 只是可选的 API 状态转移，**当前没有前端入口**，日常使用不需要手工接受/拒绝。
 
 ## 6. 问题与报告
 
@@ -166,7 +174,7 @@ EzTest 的主线是：**版本 → 需求/澄清 → 用例脑图/评审 → 执
 ### 7.2 代码与变更 Tab
 
 - 展示批次时间线（base/head、变更文件数、受影响用例、未映射数）、变更文件/实体、受影响用例、未映射原因。
-- 变更预览优先读持久化的 `version_change` 快照，缺失时才回退读时派生；历史批次可追溯。
+- 文件/实体/受影响用例的“变更预览”是按当前 commit 对**读时实时计算**的 P7 视图（不落快照）；`batchTimeline` 是 P8 额外返回的按批次持久化 `version_change` 快照（Batch 1→N、commit pair、受影响用例、未映射计数），未分析完成的批次标 `provisional`、diff 失败的批次标 `unavailable`；历史批次以时间线为准。
 - 本 Tab 只读展示代码内容窗口/diff 片段，不回传整仓或凭据。
 
 ### 7.3 事实人工修正与质量区块
@@ -193,8 +201,8 @@ EzTest 的主线是：**版本 → 需求/澄清 → 用例脑图/评审 → 执
 ### 8.3 注入与追溯
 
 - 已批准知识会在本版本的**澄清/分析/侦察**与**脑图设计**运行前注入提示词；`review`/`data_plan` 运行不注入。
-- 注入受条数与字节预算限制（`EZTEST_KNOWLEDGE_MAX_INJECT` 默认 5，`EZTEST_KNOWLEDGE_MAX_BYTES` 默认 4096）；超出会截断并记录 `knowledge_truncated` 警告。
-- 运行结果/统计中记录 `knowledgeRefs`（条目 ID 列表），可在运行详情/日志中追溯用了哪些知识；草稿/驳回不会注入。
+- 注入受条数与字节预算限制（`EZTEST_KNOWLEDGE_MAX_INJECT` 默认 5，`EZTEST_KNOWLEDGE_MAX_BYTES` 默认 4096）；超出会截断，并在运行警示/服务端日志中记录 `knowledge_truncated`。
+- 追溯用于注入的知识：**P5 脑图 `design` 运行**在 `stats.knowledgeRefs` 返回条目 ID 列表；**P3 澄清/分析/侦察**不返回结构化字段，只在提示词里带 `knowledgeRefs: ...` 行（截断时服务端日志记 `knowledge_truncated`）。草稿/驳回不会注入。
 - P8 只做版本内闭环；跨版本检索/复用/治理是 P9 候选。
 
 ## 9. 质量中心（管理员）
@@ -235,7 +243,7 @@ EzTest 的主线是：**版本 → 需求/澄清 → 用例脑图/评审 → 执
 
 ## 12. 当前不提供的能力（避免误解）
 
-- **视觉断言**（截图基线/像素差异/基线审批）：代码已有部分实现（迁移、编辑/审批服务、executor 比对、查看器），但 API 装配与 execution agent 执行入口尚未接线；当前页面可能显示相关编辑控件，实际保存/审批/执行不可用。不要把它当作已交付能力，后续接线完成后再更新本手册。
+- **视觉断言**（截图基线/像素差异/基线审批）：已接线（P8 D62），编辑/管理员审批/执行比对入口可用；真实 Chromium/executor 端到端验收归 Task 35，未验收前不要把它写进“已验证”结论。`EZTEST_VISUAL_DIFF_THRESHOLD` 尚未读取，阈值以断言配置为准。
 - 报告 PDF/HTML 导出、问题重开/合并、跨版本知识库、多用户协作/审批、非 PostgreSQL 目标库：P9 候选或未排期。
 - 多实例编排：P8 只有单活锁与单实例 SSE/Agent runner；普通使用无需关心，但不要假设多副本共享实时连接。
 - 外部工单/CI/IM 集成、多租户/RBAC：未实现。
@@ -252,8 +260,9 @@ EzTest 的主线是：**版本 → 需求/澄清 → 用例脑图/评审 → 执
 | 脑图只读/无法编辑 | 基线已冻结；走补充/继续中或在允许状态下重新设计。 |
 | 开始执行按钮不可用 | 版本未进入 `executing`、未冻结基线、无用例，或已有活跃批次。 |
 | 报告 stale | 证据/失败分类变化或升级后首次读取；重新生成追加 revision，不要手改数据库。 |
-| 知识没被注入 | 仅 approved 生效；检查预算、`knowledgeRefs`、是否在澄清/设计运行前提交。 |
+| 知识没被注入 | 仅 approved 生效；检查预算与是否在澄清/设计运行前提交。P5 design 运行看 `stats.knowledgeRefs`，P3 只能从提示词/`knowledge_truncated` 日志确认。 |
 | 质量中心没数据 | 需要先运行 `scripts/eval.ps1` 写入；普通用户无权查看。 |
+| 视觉断言没产生差异证据 | 确认断言 `kind=visual`、管理员已审批基线、版本/批次可执行；无基线时是 `inconclusive(case, missing_visual_baseline)`，视口/DPR 不符是 `inconclusive(environment)`。 |
 | 审计里看不到某操作 | 该路径可能未接审计；以安全审计覆盖矩阵为准，反馈给管理员。 |
 | 429 限流 | 等待 `Retry-After` 或让管理员调整阈值；多副本时限额按实例合计。 |
 

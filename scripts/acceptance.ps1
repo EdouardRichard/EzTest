@@ -26,16 +26,20 @@
     are recorded as SKIPPED (StaticOnly also skips them) so the static gate
     stays green while T16 lands. Container execution and the gated real
     Agent/P3/P4/P5 LLM acceptance are reported as SKIPPED because this host has
-    no Docker and no opt-in for paid calls. Prints P1/P3/P4/P5 DoD mapping
-    tables and exits non-zero on any failure.
+    no Docker and no opt-in for paid calls. The P8 static block additionally runs
+    scripts/check-docs.ps1, which enforces the four P8 documentation categories,
+    the README/.env.example environment keys, the OpenAPI YAML with its 18 P8
+    paths, the Compose services/volumes/health checks/Dockerfiles, a secret scan
+    and the local Markdown links. Prints P1/P3/P4/P5 DoD mapping tables and exits
+    non-zero on any failure.
 
 .PARAMETER StaticOnly
     Runs only the repository-local static checks (README/OpenAPI/env/Compose
-    contracts, the P5 static contract and the P4 fake-LLM test) without
-    requiring .env, the database, the built API or Playwright. It still needs
-    Node, frontend/node_modules/yaml (OpenAPI YAML parse) and git (the P4
-    fixture and fake-LLM test). Useful on a host without PostgreSQL; the full
-    gate remains the default.
+    contracts, scripts/check-docs.ps1, the P5 static contract and the P4 fake-LLM
+    test) without requiring .env, the database, the built API or Playwright. It
+    still needs Node, frontend/node_modules/yaml (OpenAPI YAML parse) and git
+    (the P4 fixture and fake-LLM test). Useful on a host without PostgreSQL; the
+    full gate remains the default.
 
 .NOTES
     Compatible with Windows PowerShell 5.1 and PowerShell 7+.
@@ -2525,13 +2529,28 @@ const expected = {
   [`${prefix}/incremental-plan`]: ["get"],
   [`${prefix}/nodes/{nodeId}/supplement`]: ["patch"]
 };
+// P8 D62 additive visual endpoints. They are deliberately not counted in the
+// P5 path/operation totals, but they must exist and keep their methods so a
+// visual regression cannot silently disappear from the published contract.
+const p8Visual = {
+  [`${prefix}/assertions/{assertionId}/visual`]: ["put"],
+  [`${prefix}/assertions/{assertionId}/visual/baseline`]: ["post"]
+};
 const paths = doc.paths || {};
 const errors = [];
 const actual = Object.keys(paths).filter((p) => p.startsWith(prefix));
 const missing = Object.keys(expected).filter((p) => !(p in paths));
-const extra = actual.filter((p) => !(p in expected));
+const extra = actual.filter((p) => !(p in expected) && !(p in p8Visual));
 if (missing.length) errors.push("missing paths: " + missing.join(", "));
 if (extra.length) errors.push("unexpected paths: " + extra.join(", "));
+for (const [p, methods] of Object.entries(p8Visual)) {
+  const item = paths[p];
+  if (!item) { errors.push("missing P8 visual path: " + p); continue; }
+  const got = ["get", "post", "put", "patch", "delete"].filter((m) => item[m]);
+  if (JSON.stringify(got.sort()) !== JSON.stringify([...methods].sort())) {
+    errors.push("methods " + p + ": got " + got.join(","));
+  }
+}
 let operations = 0;
 for (const [p, methods] of Object.entries(expected)) {
   const item = paths[p] || {};
@@ -2567,7 +2586,7 @@ if (!appSource.includes("explored")) errors.push("AppModelNode.source.explored")
 writeFileSync(process.argv[3], JSON.stringify({
   ok: errors.length === 0,
   errors,
-  pathItems: actual.length,
+  pathItems: actual.length - Object.keys(p8Visual).length,
   operations,
   events: newEvents.filter((event) => events.includes(event)).length,
   reasons: specReasons.filter((reason) => reasons.includes(reason)).length
@@ -4775,6 +4794,21 @@ writeFileSync(process.argv[3], JSON.stringify({
                     throw "P7 DoD row '$($row.DoD)' is missing its requirement/evidence mapping"
                 }
             }
+        })
+
+    # -----------------------------------------------------------------------
+    # P8 documentation / OpenAPI / Compose static contract (scripts/check-docs.ps1).
+    # Repository-local: no database, API or Docker is required. The script exits
+    # non-zero on any violation, so Invoke-LoggedCommand turns it into a FAIL.
+    # -----------------------------------------------------------------------
+    [void](Invoke-Check -Dod "P8" -CheckName "P8 docs/OpenAPI/Compose static contract" -Body {
+            Invoke-LoggedCommand -Exe $scriptHost `
+                -Arguments @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                    (Join-Path $scriptsDir "check-docs.ps1")) `
+                -WorkingDirectory $repoRoot `
+                -LogPath (Join-Path $tmpDir "acceptance-p8-check-docs.log") `
+                -Label "scripts/check-docs.ps1" `
+                -SuccessTailLines 20
         })
 
     # -----------------------------------------------------------------------

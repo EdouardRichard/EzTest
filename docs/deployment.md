@@ -63,13 +63,15 @@ Copy-Item .env.example .env
 | `EZTEST_INSTANCE_ID` | `hostname-pid` | 多副本部署必须每实例唯一。 |
 | `EZTEST_LEADER_LOCK_KEY` | `1163411512` | 所有 API 实例必须一致；派生调度/自主/维护三个 key。 |
 | `EZTEST_KNOWLEDGE_MAX_INJECT` / `MAX_BYTES` | `5` / `4096` | 版本知识注入条数与字节预算；`0` 关闭对应预算。 |
+| `EZTEST_VISUAL_BASELINE_MAX_BYTES` | `5242880` | 视觉基线大小上限；API 配置与 executor 都读取，API 范围 64 KiB–20 MiB；审批还校验 PNG 尺寸=viewport×DPR。 |
+| `EZTEST_VISUAL_DIFF_THRESHOLD` | `0.005` | **预留**：当前未读取；阈值来自每条 visual 断言的 `threshold`（0–0.1）。 |
 | `EZTEST_AGENT_FILE_ROOT` | 空 | 为空时 Agent 文件工具不注册；需要时挂载只读目录并指向容器内路径。 |
 | `EZTEST_AGENT_HTTP_ALLOWLIST` | `127.0.0.1,localhost` | Agent `http.get` 白名单；生产按需最小化。 |
-| `EZTEST_AUTONOMY_BATCHES_PER_TICK` | `4` | 自主 worker 每 tick 批预算（1–20）。 |
+| `EZTEST_AUTONOMY_BATCHES_PER_TICK` | `4` | 自主 worker 每 tick 批预算（1–20）；非整数/越界启动失败，不是回退 4。 |
 
-> 注意：设计规格中的 `EZTEST_CHAIN_MAX_NODES`、`EZTEST_SEARCH_MAX_RESULTS_PER_TYPE`、`EZTEST_TODOS_MAX` 当前由代码内置默认/接口 `limit` 约束，**构建尚未读取这些环境变量**。视觉断言仅 executor 读取 `EZTEST_VISUAL_BASELINE_MAX_BYTES`（默认 5 MiB），后端 config/Compose 未接线；`EZTEST_VISUAL_DIFF_THRESHOLD` 未使用；且视觉断言的运行入口尚未接线。不要在生产依赖未接线的变量，详见 [P8 发布说明](release-notes/p8.md)。
+> 注意：设计规格中的 `EZTEST_CHAIN_MAX_NODES`、`EZTEST_SEARCH_MAX_RESULTS_PER_TYPE`、`EZTEST_TODOS_MAX` 当前由代码内置默认/接口 `limit` 约束，**构建尚未读取这些环境变量**。视觉断言已接线：API 与宿主启动的 executor 都读取 `EZTEST_VISUAL_BASELINE_MAX_BYTES`（默认 5 MiB），Compose 的 executor 服务当前未注入该变量、按默认 5 MiB 运行；`EZTEST_VISUAL_DIFF_THRESHOLD` 仍未读取。真实 Chromium/executor 端到端验收归 Task 35。不要在生产依赖未接线的变量，详见 [P8 发布说明](release-notes/p8.md)。
 >
-> `.env.example` 当前只含限流/GC/leader 段；`EZTEST_KNOWLEDGE_*` 需要时请按上表手动补入 `.env`。
+> `.env.example` 已包含限流/GC/leader/知识与视觉基线变量（`EZTEST_VISUAL_DIFF_THRESHOLD` 标注为“预留”）；未接线的链路上限/检索/待办变量请按需手工补充。
 
 ### 2.4 可选首次启动种子
 
@@ -260,12 +262,15 @@ server {
 本机可做：
 
 ```powershell
-# Compose 字段/卷/健康检查/依赖顺序（不需要 Docker）
+# Compose 字段/卷/健康检查/依赖顺序/Dockerfile（不需要 Docker）
 cd frontend
 node scripts/validate-compose.mjs
 
-# 文档/OpenAPI/README/Compose 静态契约（不需要数据库/Playwright）
+# P8 文档/OpenAPI/Compose 静态契约（四类文档、关键 path、卷、环境变量键、无秘密）
 cd ..
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/check-docs.ps1
+
+# 全量静态验收（含上一行与 P1–P8 契约；不需要数据库/Playwright）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1 -StaticOnly
 ```
 

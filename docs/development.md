@@ -173,6 +173,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/eval.ps1 -RealLL
 ```
 
 - 六个指标：`design_coverage`、`impact_recall`、`impact_precision`、`classification_accuracy`、`issue_false_positive_rate`、`supplement_hit_rate`。
+- 视觉分类指标：`visual_classification_accuracy`（阈值 1.00）。`scripts/eval.ps1` 的预检阶段用 `go run ./internal/execution/evalvisual` 把 `eval/ground-truth/visual.json` 重放进生产 `domain.ClassifyVisual`，`-DryRun` 同样执行并在准确率不足时失败；结果写入 `observation.visual`/`metrics.visual_classification_accuracy`，与六个 §9.1 指标并存。
 - 确定性轨道：阈值 + 基线回归（任一指标比 `baseline.json` 差 >0.05 失败）；真实 LLM 轨道只报告，不阻断。
 - 结果写入 `.tmp/p8-eval/`，并通过 `POST /api/quality/eval-runs`（admin）写入数据库；质量中心只读展示。
 - 修改 fake LLM 输出/语料/真值必须同步提升 `corpusVersion` 并更新基线，在提交说明中给出运行命令与结果。
@@ -195,14 +196,14 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/slo-chain.ps1 `
 
 ## 6. 视觉断言（D62）交付状态
 
-**当前为“代码部分提交、运行未接线”**（Task 25 报告：`PARTIAL`）：
+**已接线**（Task 25 收口提交：迁移、mindmap 服务、executor、前端之外，另含 `main/config` 装配、`execution.visual_assert` 工具、四态 finish 矩阵与 eval runner）：
 
-- 已提交：`mindmap_0003_visual.sql`（`case_visual_assertion` + `visual` kind）、`execution_0005_visual_evidence.sql`（`visual_baseline/visual_actual/visual_diff` 证据 kind）、mindmap 视觉参数/基线审批 service、executor `visual.compare`（`pixelmatch`+`pngjs`）、四态 `ClassifyVisual`、前端编辑/审批/查看器、`eval/corpus/visual.json` 与 `eval/ground-truth/visual.json`。
-- **未接线**：`backend/cmd/eztest/main.go` 未装配 `Deps.Visual`，`config.go` 未解析后端基线大小上限；因此 `PUT /api/versions/{versionId}/mindmap/assertions/{assertionId}/visual`、`POST .../visual/baseline` 两条路由不会挂载（请求 404）。execution agent 也还没有 `execution.visual_assert` 工具，真实 case run 不会产生 `visual_actual/visual_diff` 证据；`scripts/eval.ps1` 未读取视觉语料。
-- 迁移已随启动执行，所以数据库会存在 `case_visual_assertion` 表与新的 evidence kind；这不等于功能可用。
-- 已知设计冲突（接线前必须解决）：`ClassifyVisual` 要求环境不符 → `inconclusive(environment)`，而现有 `domain.ValidateFinish` 只允许 model/case 的 inconclusive；要么扩展 finish 矩阵，要么按产品决策降级为 `blocked(environment)` 并记录 override。Task 25 报告给出了 main/config/agent tool 的精确 patch。
-- 接线完成后必须同步：`docs/openapi/api.yaml`（两条路径、`visual` 断言字段、`case.visual_baseline_approved` 事件）、README、用户手册、前端设计 §4.3.3/§8、系统蓝图 D62、发布说明与 `scripts/acceptance.ps1` 静态契约；并补真实 executor/browser 验收。
-- 在接线前，端到端执行只做常规截图证据；不要声称“视觉断言已可用”。`EZTEST_VISUAL_BASELINE_MAX_BYTES` 仅 executor 读取（默认 5 MiB），后端 config/Compose 尚未接线；`EZTEST_VISUAL_DIFF_THRESHOLD` 未被使用。
+- 数据/API：`mindmap_0003_visual.sql`（`case_visual_assertion` + `visual` kind）、`execution_0005_visual_evidence.sql`（`visual_baseline/visual_actual/visual_diff` 证据 kind）；`PUT /api/versions/{versionId}/mindmap/assertions/{assertionId}/visual`（登录用户，节点 revision OCC）与 `POST .../visual/baseline`（admin 审批）。
+- 执行：executor `visual.compare`（`pixelmatch`+`pngjs`）；Go `CompareVisual`/`ClassifyVisual` 四态；`execution.visual_assert` 工具（`execution-agent` profile 启动时幂等补工具与提示词）；环境不符 → `inconclusive(environment)`，`ValidateFinish` 仅在该 visual mismatch 存在时接受该组合。
+- 配置：`EZTEST_VISUAL_BASELINE_MAX_BYTES`（默认 5 MiB，API 范围 64 KiB–20 MiB）已被 API config 与 executor 读取；`EZTEST_VISUAL_DIFF_THRESHOLD` 仍未读取，阈值保存在每条断言（0–0.1，默认 0.005）。
+- 评测：`eval/corpus/visual.json` + `eval/ground-truth/visual.json` 已接入 `scripts/eval.ps1` 预检，`-DryRun` 也执行 `visual_classification_accuracy`。
+- 文档：OpenAPI 已发布两条 visual path、`visual` 断言字段、三类证据 kind、`case.visual_baseline_approved` 事件与错误 reason；README/用户手册/运维/发布说明已同步。
+- **仍待真实验收**：真实 Chromium 的 Go→executor 端到端比较、浏览器操作与截图证据由 Task 34/35 执行；当前单测/评测通过不代表真实环境已验收。数据库会存在 `case_visual_assertion` 表与 visual evidence kind，属预期。
 
 ## 7. OpenAPI 与文档同步
 
@@ -212,6 +213,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/slo-chain.ps1 `
   2. `components/schemas`（ID 类型、nullable、枚举、分页信封）；
   3. `VersionEventType`/`ErrorEnvelope`/`HealthEnvelope` 等总表；
   4. `scripts/acceptance.ps1` 的关键词检查（若新增 P8 契约）与 README 端点表。
+- 文档/契约自检：`scripts/check-docs.ps1` 断言四类 P8 文档存在、README/`.env.example` 环境变量键、OpenAPI YAML 与 18 个 P8 关键 path、Compose 四服务/六卷/健康检查/卷挂载/Dockerfile、本地 Markdown 链接与秘密扫描；已接入 `scripts/acceptance.ps1 -StaticOnly`（`-Dod P8`）。新增/删除 P8 path 或文档时同步更新该脚本。
 - 约定：成功 `{"data":...}`；列表用 `next_cursor`/`has_more` 或前端专用分页；错误统一信封；写接口支持 `Idempotency-Key`；P3+ ID 十进制字符串。
 - 修改后至少做 YAML 解析：
   ```powershell
@@ -229,7 +231,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/slo-chain.ps1 `
 3. 只做加法式 DDL（新表/新列/放宽约束/新索引）；避免破坏性变更。需要回退时用备份恢复，不写 down migration。
 4. 启动时在 advisory lock 下按顺序事务执行；重复启动幂等；`scripts/acceptance.ps1` 从 `order.txt` 动态推导条数，不要写死数量。
 5. 新迁移必须同步：README/设计文档的数据模型、OpenAPI（如暴露新字段）、评测/验收脚本、备份恢复的目录/表说明（如新增存储）。
-6. P8 迁移示例：`codeintel_0006_version_change.sql`、`codeintel_0007_fact_review.sql`、`version_0006_knowledge.sql`、`quality_0001_eval.sql`、`execution_0004_evidence_purge.sql`、`mindmap_0003_visual.sql`、`execution_0005_visual_evidence.sql`。视觉迁移已提交并执行，但视觉 API/执行入口仍未接线（见 §6）。
+6. P8 迁移示例：`codeintel_0006_version_change.sql`、`codeintel_0007_fact_review.sql`、`version_0006_knowledge.sql`、`quality_0001_eval.sql`、`execution_0004_evidence_purge.sql`、`mindmap_0003_visual.sql`、`execution_0005_visual_evidence.sql`。视觉迁移已提交并随启动执行，视觉 API/执行入口已接线（见 §6）。
 
 ## 9. 依赖与许可治理
 
@@ -252,7 +254,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/slo-chain.ps1 `
 1. Go 单元 `go test -count=1 ./...`、集成 `-tags=integration ./...`（服务 PostgreSQL）。
 2. 前端 `pnpm install --frozen-lockfile`、`lint`、`typecheck`、`test`。
 3. executor `pnpm install`、Playwright Chromium、`pnpm test`。
-4. 静态验收 `scripts/check-ci.ps1` + `scripts/acceptance.ps1 -StaticOnly`。
+4. 静态验收 `scripts/check-ci.ps1` + `scripts/check-docs.ps1` + `scripts/acceptance.ps1 -StaticOnly`。
 
 CI **不跑** gated 真实 LLM、真实浏览器 E2E 与 SLO/备份演练；这些以本地/定时验收为准。合并前至少：
 

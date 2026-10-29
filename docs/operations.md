@@ -187,7 +187,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/restore.ps1 `
 1. 运行中/计划中的批次（`run_batch.status IN ('planned','running')`）的全部证据。
 2. 每个版本最近 `EZTEST_GC_BATCH_KEEP` 批的证据。
 3. 未关闭问题（`issue.status IN ('open','confirmed')`）通过 `issue_ref`（`ref_kind='evidence'`）引用的证据。`issue_ref.ref_id` 是十进制字符串，保护 SQL 统一用 `ref_id = evidence.id::text` 比较，避免 bigint 转换越界，也保证候选列表与删除前复核口径一致。
-4. 基线证据：`evidence.kind='visual_baseline'`（视觉断言迁移已提交并随启动执行，保护条件生效；但视觉执行入口尚未接线，当前生产不会产生此类证据）。
+4. 基线证据：`evidence.kind='visual_baseline'`（视觉断言已接线，审批基线会产生此类证据；保护 SQL 对所有 visual_baseline 证据生效，与是否已审批无关）。
 5. 已清除证据（`purged_at IS NOT NULL`）不会再次成为候选；删除前复核也会将其视为受保护。
 6. 最近 N 批以外的候选仍会在删除前**再次**执行引用校验（`IsProtected`），避免候选列出后新建立的引用被误删。
 
@@ -293,7 +293,7 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:13333/api/admin/gc `
 | --- | --- | --- |
 | 版本总览首屏 API P95 | ≤ 2500 ms | `scripts/slo.ps1 -DryRun` 静态 PASS；真实测量 **SKIP**（未运行，Task 35 最终验收执行）。 |
 | 版本总览浏览器 navigation timing P95 | ≤ 2500 ms | 同上，真实浏览器测量 SKIP。 |
-| 探索链路端点 P95（200 节点/400 边） | ≤ 2500 ms（专项脚本使用 800 ms 本地阈值） | `scripts/slo-chain.ps1` **PASS**：API P95 85.1 ms、画布可交互 1130 ms（本机口径，2026-10-29）。 |
+| 探索链路端点 P95（200 节点/400 边） | ≤ 2500 ms（专项脚本使用 800 ms 本地阈值） | `scripts/slo-chain.ps1` **PASS**：API P95 92.2 ms、画布可交互 1109 ms（本机口径，2026-10-29，见 `docs/acceptance/p8/slo-chain.md`）。 |
 | 批次 8 并发执行 | 0 错误 | 依赖 fixture executor/会话 harness；`scripts/slo.ps1` 在缺失时记 SKIP，未实跑。 |
 | 代码变更集 API P95 | ≤ 2000 ms | `scripts/slo.ps1` 真实测量 SKIP。 |
 | 代码分析非模型开销 | 无固定 P8 门禁 | 由评测/验收脚本报告，未作为硬门禁。 |
@@ -317,7 +317,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/slo-chain.ps1 `
 报告与说明：
 
 - `docs/acceptance/p8/slo.md`：`scripts/slo.ps1` 的输出；当前为 `STATIC-CHECK-PASSED-MEASUREMENTS-SKIPPED`，**不是 SLO PASS**。
-- `docs/acceptance/p8/slo-chain.md`：链路专项 PASS 记录（85.1 ms / 1130 ms）。
+- `docs/acceptance/p8/slo-chain.md`：链路专项 PASS 记录（92.2 ms / 1109 ms）。
 - SLO 是**本地验收口径，不是生产 SLA**；生产必须在目标网络、目标数据量与真实浏览器上重测。
 - SKIP 永远不等于 PASS；脚本在测量到超阈值时以非 0 退出。
 
@@ -337,7 +337,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/slo-chain.ps1 `
 | 认证/用户 | `auth.login_succeeded`、`auth.login_failed`、`auth.logout`、`user.created`、`user.updated`、`user.password_reset` |
 | LLM/存储 | `llm.config_created/updated/deleted`、`llm.test_succeeded/failed`、`storage.object_created` |
 | 版本/需求 | `version.created/updated/continued/completed`、`version.requirement_created/updated/deleted/confirmed/reopened` |
-| 脑图/评审 | `case.created/updated/deleted/reviewed/baseline_approved/exported` 等 |
+| 脑图/评审 | `mindmap.case_created/updated/deleted/reordered`、`mindmap.steps_updated`、`case.baseline_approved`、`case.export.created`、`mindmap.tool.invoked` |
 | 执行/GC | `execution.evidence.gc`、执行/接管相关动作；GC 审计为 best-effort（sink 故障只记日志，不回滚已完成的清理）。 |
 | 交付 | `delivery.issue.created`、`delivery.analysis.started/finished`、报告发布/导出相关动作 |
 | 资源/Session | `resource.*` 导入/校验/接管/DB 目标等动作 |
@@ -416,13 +416,13 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/slo-chain.ps1 `
 | 报告 stale | 证据/失败分类计数变化或升级后首次读取；确认后重新生成（新 revision），不要改旧 revision。 |
 | 执行批次失败、executor unavailable | executor 容器/端口/token/Chromium 资源；查 executor `/healthz` 与 API 日志。 |
 | LLM 503 `llm_not_configured` | 默认 LLM 缺失/key 解密失败；设置页重配并测试；核对 keyring active 版本。 |
-| 知识未注入 | 仅 `approved` 条目会注入；draft/rejected 不注入；检查条数/字节预算与 `knowledgeRefs` 日志/stats。 |
+| 知识未注入 | 仅 `approved` 条目会注入；draft/rejected 不注入。检查条数/字节预算：P5 design 运行的 `stats.knowledgeRefs` 有结构化 ID 列表，P3 澄清/分析/侦察只在提示词中带 `knowledgeRefs:` 行；截断时查 `knowledge_truncated` 日志。 |
 | 审计查不到某个动作 | 该路由可能未接审计；以 `docs/acceptance/p8/security-audit.md` 的覆盖矩阵为准，新增写路径需补审计。 |
 
 ## P8 已知限制与交付状态
 
 - **Docker/Compose 未实跑**：镜像未构建、栈未启动；只有静态校验。首次部署按 [部署指南](deployment.md) 验证。
-- **视觉断言（D62）部分提交、运行未接线**：迁移、mindmap 编辑/审批服务、executor `visual.compare`、前端编辑/审批/查看器与评测语料已提交；但 `cmd/eztest`/`config` 未装配 `Deps.Visual`，两条 `/visual` 路由不挂载，execution agent 也没有视觉执行工具，真实 case run 不会产生 visual 证据；`scripts/eval.ps1` 未接入视觉语料。当前不要对用户宣称视觉断言可用；接线后需同步 README/OpenAPI/用户手册/设计文档。
+- **视觉断言（D62）已接线，真实浏览器验收待 Task 35**：迁移、mindmap 编辑/审批、`main/config` 装配、executor `visual.compare`、`execution.visual_assert`、四态分类、前端编辑/审批/查看器与评测语料均已提交；两条 `/visual` 路由已挂载，`scripts/eval.ps1 -DryRun` 会重放视觉语料并产出 `visual_classification_accuracy`。仍待真实 Chromium 的 Go→executor 端到端与浏览器验收（Task 34/35）；`EZTEST_VISUAL_DIFF_THRESHOLD` 尚未读取，阈值按断言配置。不要写成“真实环境已验收”。
 - **SLO**：`scripts/slo.ps1` 目前只有 dry-run 静态 PASS；真实全量测量待最终验收；链路专项已 PASS（本机口径）。
 - **备份恢复**：DB 行数 + 文件 SHA-256 已演练；恢复库上的应用级 smoke 未做（defer Task 35）。
 - **GC 范围**：只自动清理 `EZTEST_EVIDENCE_DIR` 下证据；导出、附件、报告 Markdown、无 DB 行孤儿文件不自动删除（见上文“证据 GC 与保留”）。
