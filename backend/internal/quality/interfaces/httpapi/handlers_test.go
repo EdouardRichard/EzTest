@@ -1,6 +1,7 @@
 package httpapi_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -423,6 +424,55 @@ func TestServerMountsQualityRoutes(t *testing.T) {
 	}
 	if len(service.listLim) != 1 {
 		t.Fatalf("service calls = %d, want 1 (anonymous and normal user must not reach it)", len(service.listLim))
+	}
+}
+
+// TestInternalErrorsAreLoggedWithRequestID proves a 500 is observable
+// server-side: the handler records the underlying persistence error together
+// with the request id, while the client still receives only the shared opaque
+// envelope (no SQL/database details).
+func TestInternalErrorsAreLoggedWithRequestID(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	service := &fakeEvalRunService{err: errors.New("pgx: relation eval_run does not exist")}
+	handler := server.New(
+		config.Config{Env: "test"},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		server.Dependencies{
+			Auth: tokenAuth{
+				"ezt_admin": {ID: 1, Username: "admin", Role: identity.RoleAdmin, Status: identity.StatusActive},
+			},
+			Quality: qualityhttp.NewHandlers(service),
+		},
+	)
+
+	request := httptest.NewRequest(http.MethodGet, "/api/quality/eval-runs", nil)
+	request.Header.Set("Authorization", "Bearer ezt_admin")
+	request.Header.Set("X-Request-ID", "req_quality_500")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d body=%s, want 500", recorder.Code, recorder.Body)
+	}
+	body := recorder.Body.String()
+	for _, forbidden := range []string{"eval_run", "pgx", "password", "postgres://"} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("500 body leaks %q: %s", forbidden, body)
+		}
+	}
+	if !strings.Contains(body, `"code":"internal"`) || !strings.Contains(body, `"request_id":"req_quality_500"`) {
+		t.Errorf("500 body = %s, want the opaque internal envelope with the request id", body)
+	}
+	logged := logs.String()
+	if !strings.Contains(logged, "req_quality_500") {
+		t.Errorf("500 log has no request_id: %s", logged)
+	}
+	if !strings.Contains(logged, "eval_run does not exist") {
+		t.Errorf("500 log has no underlying error: %s", logged)
 	}
 }
 

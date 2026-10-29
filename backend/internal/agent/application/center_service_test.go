@@ -358,7 +358,7 @@ func TestCenterCatalogPropagatesProfileFailure(t *testing.T) {
 func TestCenterQualityReturnsLatestMetrics(t *testing.T) {
 	created := time.Date(2026, 10, 29, 10, 0, 0, 0, time.UTC)
 	latest := &application.CenterEval{
-		RunID:      7,
+		RunID:      "7",
 		Passed:     true,
 		Metrics:    map[string]float64{"design_coverage": 0.95},
 		Thresholds: map[string]float64{"design_coverage": 0.9},
@@ -374,7 +374,7 @@ func TestCenterQualityReturnsLatestMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Quality() error = %v", err)
 	}
-	if quality.Latest == nil || quality.Latest.RunID != 7 || !quality.Latest.Passed {
+	if quality.Latest == nil || quality.Latest.RunID != "7" || !quality.Latest.Passed {
 		t.Fatalf("Quality().Latest = %+v, want the wired evaluation", quality.Latest)
 	}
 

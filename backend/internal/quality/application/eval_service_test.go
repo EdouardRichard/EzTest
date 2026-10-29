@@ -122,6 +122,11 @@ func TestRecordComputesCorpusMetricsWithThresholdsAndRegression(t *testing.T) {
 			domain.MetricImpactRecall: 0.79,
 			// 0.60 -> 0.50 is a 0.10 drop and must fail the metric.
 			domain.MetricSupplementHitRate: 0.60,
+			// The remaining gated keys are required even when they do not
+			// exercise the regression rule in this scenario.
+			domain.MetricImpactPrecision:        0.75,
+			domain.MetricClassificationAccuracy: 1.00,
+			domain.MetricIssueFalsePositiveRate: 0.00,
 		},
 	})
 	if err != nil {
@@ -192,6 +197,65 @@ func TestRecordComputesCorpusMetricsWithThresholdsAndRegression(t *testing.T) {
 	}
 }
 
+// deterministicBaseline returns the six gated baseline keys the deterministic
+// runner must supply. Every one of them is required so a partial document can
+// never silently disable the regression rule.
+func deterministicBaseline() map[string]float64 {
+	return map[string]float64{
+		domain.MetricDesignCoverage:         1.0,
+		domain.MetricImpactRecall:           1.0,
+		domain.MetricImpactPrecision:        1.0,
+		domain.MetricClassificationAccuracy: 1.0,
+		domain.MetricIssueFalsePositiveRate: 0.0,
+		domain.MetricSupplementHitRate:      1.0,
+	}
+}
+
+// TestRecordRejectsDeterministicBaselineMissingKey proves the baseline document
+// is a complete contract: dropping any one of the six deterministic keys is a
+// 400-class validation error (and nothing is persisted), never a run whose
+// regression gate is silently disabled.
+func TestRecordRejectsDeterministicBaselineMissingKey(t *testing.T) {
+	sample := qualitySample()
+	for _, missing := range []string{
+		domain.MetricDesignCoverage,
+		domain.MetricImpactRecall,
+		domain.MetricImpactPrecision,
+		domain.MetricClassificationAccuracy,
+		domain.MetricIssueFalsePositiveRate,
+		domain.MetricSupplementHitRate,
+	} {
+		t.Run(missing, func(t *testing.T) {
+			baseline := deterministicBaseline()
+			delete(baseline, missing)
+			repo := &fakeRunRepository{}
+			service := newQualityService(repo)
+			_, err := service.Record(context.Background(), RecordInput{
+				Mode:          domain.ModeDeterministic,
+				CorpusVersion: "2026-10-29.1",
+				Sample:        &sample,
+				Baseline:      baseline,
+			})
+			if err == nil {
+				t.Fatalf("Record() without baseline key %q unexpectedly succeeded", missing)
+			}
+			var invalid *ValidationError
+			if !errors.As(err, &invalid) {
+				t.Fatalf("Record() error = %v, want *ValidationError", err)
+			}
+			if invalid.Field != "baseline" {
+				t.Errorf("field = %q, want baseline", invalid.Field)
+			}
+			if !strings.Contains(invalid.Message, missing) {
+				t.Errorf("message = %q, want the missing metric %q named", invalid.Message, missing)
+			}
+			if len(repo.created) != 0 {
+				t.Errorf("persisted %d runs, want 0", len(repo.created))
+			}
+		})
+	}
+}
+
 // TestRecordPassingRunPersistsPassedMetrics proves a corpus observation at or
 // above every threshold persists status passed and one passed metric per
 // definition.
@@ -214,7 +278,8 @@ func TestRecordPassingRunPersistsPassedMetrics(t *testing.T) {
 			SupplementCases:        4,
 			SupplementHits:         4,
 		},
-		Summary: map[string]any{"corpus": "deterministic"},
+		Summary:  map[string]any{"corpus": "deterministic"},
+		Baseline: deterministicBaseline(),
 	})
 	if err != nil {
 		t.Fatalf("Record() error = %v", err)
@@ -437,6 +502,7 @@ func TestRepositoryErrorsAreWrappedWithoutLeaking(t *testing.T) {
 		Mode:          domain.ModeDeterministic,
 		CorpusVersion: "2026-10-29.1",
 		Sample:        &domain.Sample{},
+		Baseline:      deterministicBaseline(),
 	})
 	if err == nil {
 		t.Fatal("Record() unexpectedly succeeded")

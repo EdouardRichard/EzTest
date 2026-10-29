@@ -64,5 +64,6 @@ Playwright executor，然后按阶段执行：创建版本/需求 → 澄清确�
 → 报告；最后按本目录真值计算指标、POST 到 `/api/quality/eval-runs`、比较基线并输出
 `.tmp/p8-eval/{observation,result}.json`。
 
-失败时脚本保留 `.tmp/p8-eval/api.log`、`fake-llm.log`、`executor.log`、`fixture.log` 与
+失败时脚本保留 `.tmp/p8-eval/api.out.log`/`api.err.log`、`fake-llm.out.log`/`fake-llm.err.log`、
+`executor.out.log`/`executor.err.log`、`fixture.out.log`/`fixture.err.log`、`runner.log` 与
 `.tmp/p8-eval/observation.json` 便于复盘；不会打印 `.env` 中的密钥或 LLM key。

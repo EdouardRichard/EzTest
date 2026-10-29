@@ -84,7 +84,8 @@ export type AgentCenterRole = {
 }
 
 export type AgentCenterEval = {
-  run_id: number
+  /** Decimal-string eval run id (D29); Snowflake ids exceed JS safe integers. */
+  run_id: string
   passed: boolean
   metrics: Record<string, number>
   thresholds: Record<string, number>

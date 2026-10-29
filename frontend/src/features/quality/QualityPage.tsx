@@ -6,9 +6,8 @@ import { useCallback, useEffect, useState } from "react"
 import { EmptyState } from "@/components/ui/EmptyState"
 import { useAuth } from "@/features/auth/AuthProvider"
 import { ApiError } from "@/lib/api-client"
-
-import { QualitySummary, formatRunTime, modeLabel, runStatusBadge } from "./QualitySummary"
 import { listEvalRuns } from "./api"
+import { formatRunTime, modeLabel, QualitySummary, runStatusBadge } from "./QualitySummary"
 import type { EvalRun } from "./types"
 
 /** Number of historical runs loaded by the dashboard (server max is 50). */

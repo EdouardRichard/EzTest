@@ -38,9 +38,18 @@ export function metricIsUpperBound(name: string): boolean {
 }
 
 /** Reads the stable numerator/denominator pair of a metric detail document. */
-export function metricCounts(detail: Record<string, unknown>): { numerator: number; denominator: number } | null {
+export function metricCounts(
+  detail: Record<string, unknown>,
+): { numerator: number; denominator: number } | null {
   const numerator = detail.numerator
   const denominator = detail.denominator
   if (typeof numerator !== "number" || typeof denominator !== "number") return null
   return { numerator, denominator }
+}
+
+/** Reads the committed baseline of a metric detail document, if present. */
+export function metricBaseline(detail: Record<string, unknown>): number | null {
+  const baseline = detail.baseline
+  if (typeof baseline !== "number" || !Number.isFinite(baseline)) return null
+  return baseline
 }
