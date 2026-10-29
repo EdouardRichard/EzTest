@@ -44,6 +44,7 @@ type fakeKnowledgeService struct {
 		status    string
 		kind      string
 		page      domain.Page
+		viewer    domain.KnowledgeViewer
 	}
 	lastGlobal struct {
 		versionID *int64
@@ -119,11 +120,12 @@ func (f *fakeKnowledgeService) Review(_ context.Context, versionID, kid int64, i
 }
 
 // List records the version-scoped call.
-func (f *fakeKnowledgeService) List(_ context.Context, versionID int64, status, kind string, page domain.Page) ([]versionapp.KnowledgeEntry, bool, error) {
+func (f *fakeKnowledgeService) List(_ context.Context, versionID int64, status, kind string, page domain.Page, viewer domain.KnowledgeViewer) ([]versionapp.KnowledgeEntry, bool, error) {
 	f.lastList.versionID = versionID
 	f.lastList.status = status
 	f.lastList.kind = kind
 	f.lastList.page = page
+	f.lastList.viewer = viewer
 	if f.listErr != nil {
 		return nil, false, f.listErr
 	}
@@ -242,6 +244,16 @@ func TestKnowledgeListEndpoints(t *testing.T) {
 	if deps.knowledge.lastList.status != "approved" || deps.knowledge.lastList.kind != "pattern" ||
 		deps.knowledge.lastList.page.Limit != 5 {
 		t.Fatalf("list call = %+v", deps.knowledge.lastList)
+	}
+	// A regular user's version read is creator-restricted (approved plus own
+	// drafts/rejections); the admin flag comes from the authenticated identity.
+	if deps.knowledge.lastList.viewer.ID != testUserID || deps.knowledge.lastList.viewer.Admin {
+		t.Fatalf("regular user viewer = %+v", deps.knowledge.lastList.viewer)
+	}
+	recorder = doRequest(handler, http.MethodGet, "/api/versions/100/knowledge", testAdminToken, "")
+	requireStatus(t, recorder, http.StatusOK)
+	if !deps.knowledge.lastList.viewer.Admin || deps.knowledge.lastList.viewer.ID != testAdminID {
+		t.Fatalf("admin viewer = %+v", deps.knowledge.lastList.viewer)
 	}
 
 	// The global read defaults to approved.

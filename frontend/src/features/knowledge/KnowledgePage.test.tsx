@@ -226,6 +226,47 @@ describe("KnowledgePage", () => {
     expect(screen.getByTestId("knowledge-review-item-6001")).toBeTruthy()
   })
 
+  it("opens the review drawer once the async auth resolves", async () => {
+    window.history.pushState({}, "", "/knowledge?review=6001")
+    mocks.useAuth.mockReturnValue({
+      user: null,
+      loading: true,
+      login: vi.fn(),
+      logout: vi.fn(),
+    })
+    mocks.listGlobalKnowledge.mockImplementation((query: { status?: string }) =>
+      Promise.resolve(query.status === "draft" ? page([entry({ status: "draft" })]) : page([])),
+    )
+
+    const view = render(<KnowledgePage />)
+    await screen.findByTestId("knowledge-page")
+    expect(screen.queryByTestId("knowledge-review-drawer")).toBeNull()
+
+    mocks.useAuth.mockReturnValue(adminAuth())
+    view.rerender(<KnowledgePage />)
+    expect(await screen.findByTestId("knowledge-review-drawer")).toBeTruthy()
+    expect(screen.getByTestId("knowledge-review-item-6001")).toBeTruthy()
+  })
+
+  it("keeps the review drawer closed when auth resolves to a regular user", async () => {
+    window.history.pushState({}, "", "/knowledge?review=6001")
+    mocks.useAuth.mockReturnValue({
+      user: null,
+      loading: true,
+      login: vi.fn(),
+      logout: vi.fn(),
+    })
+    mocks.listGlobalKnowledge.mockResolvedValue(page([]))
+
+    const view = render(<KnowledgePage />)
+    await screen.findByTestId("knowledge-page")
+
+    mocks.useAuth.mockReturnValue(userAuth())
+    view.rerender(<KnowledgePage />)
+    await waitFor(() => expect(screen.queryByTestId("knowledge-open-review")).toBeNull())
+    expect(screen.queryByTestId("knowledge-review-drawer")).toBeNull()
+  })
+
   it("hides the review entry from a regular user even with the deep link", async () => {
     window.history.pushState({}, "", "/knowledge?review=6001")
     mocks.listGlobalKnowledge.mockResolvedValue(page([]))

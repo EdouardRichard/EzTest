@@ -7,7 +7,13 @@ vi.mock("next/navigation", () => ({
   usePathname: () => nav.pathname,
 }))
 
-import { normalizeKnowledgeTodos, TODOS_POLL_INTERVAL_MS, useTodos } from "./useTodos"
+import {
+  KNOWLEDGE_QUEUE_LIMIT,
+  mergeKnowledgeTodos,
+  normalizeKnowledgeTodos,
+  TODOS_POLL_INTERVAL_MS,
+  useTodos,
+} from "./useTodos"
 
 const SNAPSHOT = {
   items: [
@@ -147,6 +153,56 @@ describe("useTodos", () => {
     )
     expect(knowledge?.title).toBe("知识审核：支付超时")
     expect(knowledge?.url).toBe("/knowledge?review=1844674407370955161")
+  })
+
+  it("records the knowledge queue cap when the admin page has more drafts", async () => {
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (String(url).includes("/api/knowledge")) {
+        return Promise.resolve(
+          jsonResponse({
+            data: [
+              {
+                id: "6001",
+                versionId: "11",
+                versionName: "版本甲",
+                title: "支付超时",
+                createdAt: "2026-10-29T01:00:00Z",
+              },
+            ],
+            has_more: true,
+          }),
+        )
+      }
+      return Promise.resolve(jsonResponse({ data: SNAPSHOT }))
+    })
+    vi.stubGlobal("fetch", fetchMock)
+
+    const { result } = renderHook(() => useTodos(true))
+    await waitFor(() => expect(result.current.loading).toBe(false))
+
+    expect(String(fetchMock.mock.calls[1]?.[0])).toContain(`limit=${KNOWLEDGE_QUEUE_LIMIT}`)
+    expect(result.current.todos.knowledgeTruncated).toBe(true)
+    expect(result.current.todos.counts.review).toBe(2)
+  })
+
+  it("dedupes merged knowledge drafts and keeps the truncated flag", () => {
+    const snapshot = {
+      items: normalizeKnowledgeTodos([
+        { id: "6001", versionId: "11", versionName: "版本甲", title: "支付超时" },
+      ]),
+      counts: { review: 1, takeover: 0, gate: 0 },
+    }
+    const duplicate = normalizeKnowledgeTodos([
+      { id: "6001", versionId: "11", versionName: "版本甲", title: "支付超时" },
+      { id: "6002", versionId: "11", versionName: "版本甲", title: "幂等键" },
+    ])
+
+    const merged = mergeKnowledgeTodos(snapshot, duplicate, true)
+
+    expect(merged.items).toHaveLength(2)
+    expect(merged.counts.review).toBe(2)
+    expect(merged.knowledgeTruncated).toBe(true)
+    expect(mergeKnowledgeTodos(snapshot, duplicate, false).knowledgeTruncated).toBe(false)
   })
 
   it("does not request the knowledge queue for a regular user", async () => {

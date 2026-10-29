@@ -95,11 +95,23 @@ type KnowledgeEntry struct {
 
 // KnowledgeFilter selects a page of one version's knowledge entries ordered by
 // id ascending. An empty Status matches every status; an empty Kind every kind.
+// ViewerID restricts a non-admin read: when set, only approved entries and the
+// entries created by that user are visible. Nil means every creator (admin or
+// server read).
 type KnowledgeFilter struct {
 	VersionID int64
 	Status    string
 	Kind      string
+	ViewerID  *int64
 	Page      Page
+}
+
+// KnowledgeViewer is the authenticated caller of a version knowledge read. A
+// non-admin only sees approved entries plus their own drafts/rejections; an
+// administrator sees every status.
+type KnowledgeViewer struct {
+	ID    int64
+	Admin bool
 }
 
 // GlobalKnowledgeFilter selects a page of the cross-version knowledge read. An

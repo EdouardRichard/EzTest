@@ -289,6 +289,10 @@ func (s *ClarificationService) SendMessage(ctx context.Context, versionID int64,
 		return StartRunResult{}, errors.New("version: agent sessions are not configured")
 	}
 
+	// Inject the approved version knowledge on the session's first message only
+	// (spec §9.4): repeating the multi-KiB segment on every chat turn would
+	// duplicate it in the growing conversation.
+	message = s.injectKnowledgeOnFirstMessage(ctx, versionID, *session.AgentSessionID, message)
 	runID, err := s.agents.StartText(ctx, *session.AgentSessionID, message, actor)
 	if err != nil {
 		return StartRunResult{}, err
@@ -943,6 +947,29 @@ func (s *ClarificationService) loadDecision(ctx context.Context, versionID, deci
 	return decision, nil
 }
 
+// injectKnowledgeOnFirstMessage prefixes the version's approved "版本知识"
+// segment on the first message of one clarification chat session only. The
+// history read is best-effort: a failure is logged and the message is sent
+// without the segment so a transient read error never blocks the conversation.
+func (s *ClarificationService) injectKnowledgeOnFirstMessage(ctx context.Context, versionID, agentSessionID int64, message string) string {
+	if s.knowledge == nil {
+		return message
+	}
+	messages, _, err := s.agents.Messages(ctx, agentSessionID, 0, 1)
+	if err != nil {
+		slog.WarnContext(ctx, "clarification: chat history read failed; skipping the knowledge segment",
+			"version_id", versionID,
+			"agent_session_id", agentSessionID,
+			"error", err,
+		)
+		return message
+	}
+	if len(messages) > 0 {
+		return message
+	}
+	return s.injectKnowledge(ctx, versionID, message)
+}
+
 // injectKnowledge prefixes instruction with the version's approved "版本知识"
 // segment (spec §9.4). The read is best-effort: a failure is logged and the run
 // starts with the legacy instruction so an unavailable knowledge table never
@@ -959,6 +986,13 @@ func (s *ClarificationService) injectKnowledge(ctx context.Context, versionID in
 			"error", err,
 		)
 		return instruction
+	}
+	if section.Truncated {
+		slog.WarnContext(ctx, "clarification: approved version knowledge exceeded the injection budget",
+			"warning", "knowledge_truncated",
+			"version_id", versionID,
+			"injected", len(section.Refs),
+		)
 	}
 	if strings.TrimSpace(section.Text) == "" {
 		return instruction

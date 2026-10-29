@@ -80,6 +80,7 @@ describe("MobileNav", () => {
     expect(document.getElementById(MOBILE_NAV_ID)?.closest("[hidden]")).toBeNull()
     expect(dialog.getAttribute("aria-modal")).toBe("true")
     expect(within(dialog).getByRole("link", { name: /概览/ })).not.toBeNull()
+    expect(within(dialog).getByRole("link", { name: /知识/ })).not.toBeNull()
     expect(dialog.contains(document.activeElement)).toBe(true)
     expect(document.body.style.overflow).toBe("hidden")
   })

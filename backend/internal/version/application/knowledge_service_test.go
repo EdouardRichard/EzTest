@@ -1,9 +1,11 @@
 package application_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"sort"
 	"strings"
 	"testing"
@@ -100,6 +102,10 @@ func (r *fakeKnowledgeRepo) List(_ context.Context, filter domain.KnowledgeFilte
 			continue
 		}
 		if filter.Kind != "" && stored.Kind != filter.Kind {
+			continue
+		}
+		if filter.ViewerID != nil && stored.Status != domain.KnowledgeApproved &&
+			stored.CreatedBy != *filter.ViewerID {
 			continue
 		}
 		if name, ok := r.versionNames[stored.VersionID]; ok {
@@ -537,18 +543,21 @@ func TestKnowledgeListScoping(t *testing.T) {
 	})
 	f.seedEntry(200, domain.KnowledgeEntry{ID: 32, Status: domain.KnowledgeApproved})
 
-	all, more, err := f.service.List(ctx, 100, "", "", domain.Page{Limit: 10})
+	all, more, err := f.service.List(ctx, 100, "", "", domain.Page{Limit: 10},
+		domain.KnowledgeViewer{Admin: true})
 	if err != nil || more || len(all) != 2 || all[0].ID != first.ID || all[1].ID != second.ID {
 		t.Fatalf("version list = %+v more=%v err=%v", all, more, err)
 	}
 	if all[1].VersionName != "Order v2" {
 		t.Fatalf("version name = %q", all[1].VersionName)
 	}
-	drafts, _, err := f.service.List(ctx, 100, domain.KnowledgeDraft, "", domain.Page{Limit: 10})
+	drafts, _, err := f.service.List(ctx, 100, domain.KnowledgeDraft, "", domain.Page{Limit: 10},
+		domain.KnowledgeViewer{Admin: true})
 	if err != nil || len(drafts) != 1 || drafts[0].ID != first.ID {
 		t.Fatalf("draft list = %+v err=%v", drafts, err)
 	}
-	pitfalls, _, err := f.service.List(ctx, 100, "", domain.KnowledgeKindPitfall, domain.Page{Limit: 10})
+	pitfalls, _, err := f.service.List(ctx, 100, "", domain.KnowledgeKindPitfall, domain.Page{Limit: 10},
+		domain.KnowledgeViewer{Admin: true})
 	if err != nil || len(pitfalls) != 1 || pitfalls[0].ID != second.ID {
 		t.Fatalf("kind filter = %+v err=%v", pitfalls, err)
 	}
@@ -571,6 +580,58 @@ func TestKnowledgeListScoping(t *testing.T) {
 	if err != nil || len(queue) != 1 || queue[0].ID != first.ID {
 		t.Fatalf("global draft queue = %+v err=%v", queue, err)
 	}
+}
+
+// TestKnowledgeListRestrictsNonAdminUnapproved covers the version read policy:
+// a non-admin sees the approved entries of everyone plus only the drafts and
+// rejections they created, while an administrator sees every entry.
+func TestKnowledgeListRestrictsNonAdminUnapproved(t *testing.T) {
+	ctx := context.Background()
+	f := newKnowledgeFixture()
+	f.seedVersion(100, "Order v2")
+	// 40/44 are approved by other users; 41/43 belong to user 8; 42 belongs to
+	// user 9.
+	f.seedEntry(100, domain.KnowledgeEntry{ID: 40, Status: domain.KnowledgeApproved, CreatedBy: 7})
+	f.seedEntry(100, domain.KnowledgeEntry{ID: 41, Status: domain.KnowledgeDraft, CreatedBy: 8})
+	f.seedEntry(100, domain.KnowledgeEntry{ID: 42, Status: domain.KnowledgeDraft, CreatedBy: 9})
+	f.seedEntry(100, domain.KnowledgeEntry{ID: 43, Status: domain.KnowledgeRejected, CreatedBy: 8})
+	f.seedEntry(100, domain.KnowledgeEntry{ID: 44, Status: domain.KnowledgeApproved, CreatedBy: 9})
+
+	own, _, err := f.service.List(ctx, 100, "", "", domain.Page{Limit: 10},
+		domain.KnowledgeViewer{ID: 8})
+	if err != nil {
+		t.Fatalf("non-admin list: %v", err)
+	}
+	if got := knowledgeEntryIDs(own); len(got) != 4 || got[0] != 40 || got[1] != 41 ||
+		got[2] != 43 || got[3] != 44 {
+		t.Fatalf("non-admin ids = %v, want [40 41 43 44]", knowledgeEntryIDs(own))
+	}
+
+	ownDrafts, _, err := f.service.List(ctx, 100, domain.KnowledgeDraft, "", domain.Page{Limit: 10},
+		domain.KnowledgeViewer{ID: 8})
+	if err != nil || len(ownDrafts) != 1 || ownDrafts[0].ID != 41 {
+		t.Fatalf("non-admin drafts = %v err=%v", knowledgeEntryIDs(ownDrafts), err)
+	}
+	approved, _, err := f.service.List(ctx, 100, domain.KnowledgeApproved, "", domain.Page{Limit: 10},
+		domain.KnowledgeViewer{ID: 8})
+	if err != nil || len(approved) != 2 || approved[0].ID != 40 || approved[1].ID != 44 {
+		t.Fatalf("non-admin approved = %v err=%v", knowledgeEntryIDs(approved), err)
+	}
+
+	admin, _, err := f.service.List(ctx, 100, "", "", domain.Page{Limit: 10},
+		domain.KnowledgeViewer{ID: 8, Admin: true})
+	if err != nil || len(admin) != 5 {
+		t.Fatalf("admin ids = %v err=%v, want all five entries", knowledgeEntryIDs(admin), err)
+	}
+}
+
+// knowledgeEntryIDs projects knowledge ids for readable failures.
+func knowledgeEntryIDs(entries []domain.KnowledgeEntry) []int64 {
+	ids := make([]int64, len(entries))
+	for index := range entries {
+		ids[index] = entries[index].ID
+	}
+	return ids
 }
 
 // TestApprovedKnowledgeSectionBudget covers the injection read: only approved
@@ -731,6 +792,114 @@ func TestClarificationRunInjectsApprovedKnowledge(t *testing.T) {
 	first := f.agents.partRuns[0].Parts[0]
 	if first.Type != "text" || !strings.Contains(first.Text, "## 版本知识") {
 		t.Fatalf("recon first part = %+v", first)
+	}
+}
+
+// TestClarificationSendMessageInjectsKnowledgeOnFirstMessageOnly covers the
+// main-chat injection: the approved "版本知识" segment prefixes the first message
+// of each session and never repeats on later messages or later sessions' turns.
+func TestClarificationSendMessageInjectsKnowledgeOnFirstMessageOnly(t *testing.T) {
+	ctx := context.Background()
+	f := newClarificationFixture()
+	version := f.seedVersion(domain.VersionClarifying)
+	session := f.startSession(t, version.ID)
+
+	knowledge := newFakeKnowledgeRepo()
+	knowledge.seed(domain.KnowledgeEntry{
+		ID: 500, VersionID: version.ID, Kind: domain.KnowledgeKindDecision,
+		Title: "Approved decision", Body: "Use the sandbox gateway.",
+		Status: domain.KnowledgeApproved,
+	})
+	f.service = application.NewClarificationService(
+		f.repo, f.requirements, f.versions, f.agents, f.events,
+		application.WithClarificationIDGenerator(f.ids),
+		application.WithClarificationKnowledge(application.NewKnowledgeService(
+			knowledge, f.versions, f.events,
+			application.WithKnowledgeIDGenerator(f.ids),
+		)),
+	)
+
+	if _, err := f.service.SendMessage(ctx, version.ID, "Which coupons apply?", 42); err != nil {
+		t.Fatalf("first SendMessage: %v", err)
+	}
+	if len(f.agents.texts) != 1 {
+		t.Fatalf("first text runs = %d", len(f.agents.texts))
+	}
+	first := f.agents.texts[0].Text
+	if !strings.Contains(first, "## 版本知识") || !strings.Contains(first, "knowledgeRefs: 500") ||
+		!strings.Contains(first, "Approved decision") || !strings.HasSuffix(first, "Which coupons apply?") {
+		t.Fatalf("first message = %q", first)
+	}
+
+	// The second message of the same session is untouched: the 4 KiB segment is
+	// not repeated on every turn.
+	if _, err := f.service.SendMessage(ctx, version.ID, "And the second turn?", 42); err != nil {
+		t.Fatalf("second SendMessage: %v", err)
+	}
+	if len(f.agents.texts) != 2 || f.agents.texts[1].Text != "And the second turn?" {
+		t.Fatalf("second message = %+v", f.agents.texts)
+	}
+
+	// A new session starts a new conversation, so its first message is injected
+	// again.
+	if _, err := f.service.CompleteSession(ctx, version.ID, session.ID, 42); err != nil {
+		t.Fatalf("CompleteSession: %v", err)
+	}
+	f.startSession(t, version.ID)
+	if _, err := f.service.SendMessage(ctx, version.ID, "Fresh session question", 42); err != nil {
+		t.Fatalf("new session SendMessage: %v", err)
+	}
+	if len(f.agents.texts) != 3 || !strings.Contains(f.agents.texts[2].Text, "## 版本知识") ||
+		!strings.HasSuffix(f.agents.texts[2].Text, "Fresh session question") {
+		t.Fatalf("new session first message = %+v", f.agents.texts)
+	}
+}
+
+// TestClarificationSendMessageLogsKnowledgeTruncation covers the budget warning:
+// a truncated approved-knowledge section is recorded with the stable
+// knowledge_truncated warning code instead of being silently shortened.
+func TestClarificationSendMessageLogsKnowledgeTruncation(t *testing.T) {
+	ctx := context.Background()
+	var buffer bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buffer, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	f := newClarificationFixture()
+	version := f.seedVersion(domain.VersionClarifying)
+	f.startSession(t, version.ID)
+
+	knowledge := newFakeKnowledgeRepo()
+	// Six approved entries exceed the default five-entry budget.
+	for id := int64(40); id < 46; id++ {
+		knowledge.seed(domain.KnowledgeEntry{
+			ID: id, VersionID: version.ID, Kind: domain.KnowledgeKindPattern,
+			Title: "approved", Body: strings.Repeat("a", 700), Status: domain.KnowledgeApproved,
+		})
+	}
+	f.service = application.NewClarificationService(
+		f.repo, f.requirements, f.versions, f.agents, f.events,
+		application.WithClarificationIDGenerator(f.ids),
+		application.WithClarificationKnowledge(application.NewKnowledgeService(
+			knowledge, f.versions, f.events,
+			application.WithKnowledgeIDGenerator(f.ids),
+		)),
+	)
+
+	if _, err := f.service.SendMessage(ctx, version.ID, "first", 42); err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	if !strings.Contains(buffer.String(), "knowledge_truncated") {
+		t.Fatalf("truncation warning not logged: %s", buffer.String())
+	}
+
+	// Later turns do not inject, so they must not warn again.
+	buffer.Reset()
+	if _, err := f.service.SendMessage(ctx, version.ID, "second", 42); err != nil {
+		t.Fatalf("second SendMessage: %v", err)
+	}
+	if strings.Contains(buffer.String(), "knowledge_truncated") {
+		t.Fatalf("truncation warning repeated on a later turn: %s", buffer.String())
 	}
 }
 

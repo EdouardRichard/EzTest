@@ -24,6 +24,14 @@ const knowledgeColumnList = `k.id, k.version_id, v.name, k.kind, k.title, k.body
 // knowledgeSelectFrom is the shared FROM clause of the read queries.
 const knowledgeSelectFrom = ` FROM knowledge_entry k LEFT JOIN version v ON v.id = k.version_id`
 
+// knowledgeReturningList is the column list of the INSERT/UPDATE RETURNING
+// clauses. A RETURNING clause has no table alias to prefix (the INSERT has no
+// FROM), so every column is unqualified and the owning version name is read
+// through a scalar subquery on the row's own version_id.
+const knowledgeReturningList = `id, version_id, (SELECT name FROM version WHERE id = version_id),
+	kind, title, body, tags, source_refs, status, confidence, created_by, reviewed_by,
+	review_note, revision, created_at, updated_at`
+
 // KnowledgeRepository implements domain.KnowledgeRepository on a pgx pool. The
 // content edit and the review are revision compare-and-swaps that only apply to
 // a draft; a zero-row write is classified as not-found, state conflict or
@@ -129,7 +137,7 @@ func (r *KnowledgeRepository) Create(ctx context.Context, entry *domain.Knowledg
 		(id, version_id, kind, title, body, tags, source_refs, status, confidence,
 		 created_by, reviewed_by, review_note, revision)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-		RETURNING ` + knowledgeColumnList
+		RETURNING ` + knowledgeReturningList
 	created, err := scanKnowledgeEntry(r.pool.QueryRow(ctx, query,
 		entry.ID, entry.VersionID, entry.Kind, entry.Title, entry.Body, tags, refs,
 		entry.Status, entry.Confidence, entry.CreatedBy, entry.ReviewedBy,
@@ -170,10 +178,12 @@ func (r *KnowledgeRepository) List(ctx context.Context, filter domain.KnowledgeF
 		  AND ($2 = '' OR k.status = $2)
 		  AND ($3 = '' OR k.kind = $3)
 		  AND ($4::boolean = false OR k.id > $5::bigint)
+		  AND ($7::bigint IS NULL OR k.status = 'approved' OR k.created_by = $7)
 		ORDER BY k.id ASC
 		LIMIT $6`
 	rows, err := r.pool.Query(ctx, query,
-		filter.VersionID, filter.Status, filter.Kind, cursorID != 0, cursorID, filter.Page.Limit+1)
+		filter.VersionID, filter.Status, filter.Kind, cursorID != 0, cursorID, filter.Page.Limit+1,
+		filter.ViewerID)
 	if err != nil {
 		return nil, false, fmt.Errorf("postgres: list knowledge entries: %w", err)
 	}
@@ -270,11 +280,9 @@ func (r *KnowledgeRepository) UpdateContent(ctx context.Context, entry *domain.K
 	updated, err := scanKnowledgeEntry(r.pool.QueryRow(ctx,
 		`UPDATE knowledge_entry
 		 SET kind = $3, title = $4, body = $5, tags = $6, source_refs = $7,
-		     confidence = $8, updated_at = now()
+		     confidence = $8, revision = revision + 1, updated_at = now()
 		 WHERE id = $1 AND revision = $2 AND status = 'draft'
-		 RETURNING id, version_id, (SELECT name FROM version WHERE id = version_id),
-		           kind, title, body, tags, source_refs, status, confidence,
-		           created_by, reviewed_by, review_note, revision, created_at, updated_at`,
+		 RETURNING `+knowledgeReturningList,
 		entry.ID, expectedRevision, entry.Kind, entry.Title, entry.Body, tags, refs,
 		entry.Confidence,
 	))
@@ -295,9 +303,7 @@ func (r *KnowledgeRepository) Review(ctx context.Context, entry *domain.Knowledg
 		 SET status = $3, reviewed_by = $4, review_note = $5,
 		     revision = revision + 1, updated_at = now()
 		 WHERE id = $1 AND revision = $2 AND status = 'draft'
-		 RETURNING id, version_id, (SELECT name FROM version WHERE id = version_id),
-		           kind, title, body, tags, source_refs, status, confidence,
-		           created_by, reviewed_by, review_note, revision, created_at, updated_at`,
+		 RETURNING `+knowledgeReturningList,
 		entry.ID, expectedRevision, entry.Status, entry.ReviewedBy, entry.ReviewNote,
 	))
 	if err != nil {

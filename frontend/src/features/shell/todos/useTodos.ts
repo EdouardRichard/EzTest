@@ -3,7 +3,7 @@
 import { usePathname } from "next/navigation"
 import { useCallback, useEffect, useRef, useState } from "react"
 
-import { ApiError, apiGet } from "@/lib/api-client"
+import { ApiError, apiGet, apiGetPage } from "@/lib/api-client"
 
 /** Todo groups of the P8 todo centre (spec §6.3). */
 export type TodoKind = "review" | "takeover" | "gate"
@@ -28,6 +28,11 @@ export type TodoCounts = {
 export type TodoSnapshot = {
   items: TodoItem[]
   counts: TodoCounts
+  /**
+   * True when the admin knowledge-review queue page reported `has_more`: the
+   * review count is then a lower bound of the capped page, not a total.
+   */
+  knowledgeTruncated?: boolean
 }
 
 /** 30 s refresh cadence of the topbar todo centre (spec §6.3). */
@@ -35,15 +40,16 @@ export const TODOS_POLL_INTERVAL_MS = 30_000
 
 const TODOS_PATH = "/api/todos?limit=50"
 
+/** Number of draft knowledge entries merged into one admin snapshot. */
+export const KNOWLEDGE_QUEUE_LIMIT = 50
+
 /**
  * Admin knowledge-review queue (spec §9.4): draft knowledge entries belong to
  * the review group. The route is admin-guarded, so it is only requested for an
- * administrator.
+ * administrator. The page envelope's `has_more` is kept so the merged review
+ * count is documented as a lower bound when the cap is reached.
  */
-const KNOWLEDGE_QUEUE_PATH = "/api/knowledge?status=draft&limit=50"
-
-/** Number of draft knowledge entries merged into one admin snapshot. */
-export const KNOWLEDGE_QUEUE_LIMIT = 50
+const KNOWLEDGE_QUEUE_PATH = `/api/knowledge?status=draft&limit=${KNOWLEDGE_QUEUE_LIMIT}`
 
 const EMPTY_SNAPSHOT: TodoSnapshot = {
   items: [],
@@ -139,31 +145,49 @@ export function normalizeKnowledgeTodos(payload: unknown): TodoItem[] {
 
 /**
  * Merges the admin knowledge-review drafts into the review group: one item per
- * draft, and the review count includes them so the topbar badge and the group
- * badge agree.
+ * distinct draft (deduped by kind/url so a repeated read or a version todo that
+ * already links the same entry is not counted twice), and the review count
+ * includes them so the topbar badge and the group badge agree. `truncated`
+ * records that the queue page reached its cap, making the count a lower bound.
  */
-export function mergeKnowledgeTodos(snapshot: TodoSnapshot, knowledge: TodoItem[]): TodoSnapshot {
-  if (knowledge.length === 0) return snapshot
+export function mergeKnowledgeTodos(
+  snapshot: TodoSnapshot,
+  knowledge: TodoItem[],
+  truncated = false,
+): TodoSnapshot {
+  const seen = new Set(snapshot.items.map((item) => `${item.kind}\u0000${item.url}`))
+  const fresh: TodoItem[] = []
+  for (const item of knowledge) {
+    const key = `${item.kind}\u0000${item.url}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    fresh.push(item)
+  }
+  const knowledgeTruncated = snapshot.knowledgeTruncated === true || truncated
+  if (fresh.length === 0 && !knowledgeTruncated) return snapshot
   return {
-    items: [...snapshot.items, ...knowledge],
+    items: [...snapshot.items, ...fresh],
     counts: {
       ...snapshot.counts,
-      review: snapshot.counts.review + knowledge.length,
+      review: snapshot.counts.review + fresh.length,
     },
+    knowledgeTruncated,
   }
 }
 
 /**
  * Fetches and normalizes one todo-centre snapshot. An administrator additionally
  * reads the draft knowledge queue; a failure of that second read only omits the
- * knowledge items so the shell never loses the version todos.
+ * knowledge items so the shell never loses the version todos. The queue is read
+ * through the page envelope so `has_more` can be recorded instead of silently
+ * undercounting drafts beyond the cap.
  */
 export async function fetchTodos(admin = false): Promise<TodoSnapshot> {
   const snapshot = normalizeTodoSnapshot(await apiGet<unknown>(TODOS_PATH))
   if (!admin) return snapshot
   try {
-    const knowledge = normalizeKnowledgeTodos(await apiGet<unknown>(KNOWLEDGE_QUEUE_PATH))
-    return mergeKnowledgeTodos(snapshot, knowledge)
+    const page = await apiGetPage<unknown>(KNOWLEDGE_QUEUE_PATH)
+    return mergeKnowledgeTodos(snapshot, normalizeKnowledgeTodos(page.items), page.hasMore)
   } catch {
     return snapshot
   }
