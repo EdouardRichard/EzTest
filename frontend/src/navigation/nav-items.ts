@@ -1,5 +1,6 @@
 import type { LucideIcon } from "lucide-react"
 import {
+  BookOpen,
   Bot,
   Boxes,
   Bug,
@@ -22,8 +23,8 @@ export type NavItem = {
   adminOnly?: boolean
 }
 
-// The nine blueprint navigation entries. All entries are live as of P8; the
-// phase field records the release in which each destination first landed. This
+// The blueprint navigation entries. All entries are live as of P8; the phase
+// field records the release in which each destination first landed. This
 // cross-feature navigation data lives outside features/shell (Agent.md §6.4).
 export const NAV_ITEMS: NavItem[] = [
   { label: "概览", href: "/", icon: LayoutDashboard, phase: "P8", hint: "平台概览与系统状态" },
@@ -42,6 +43,13 @@ export const NAV_ITEMS: NavItem[] = [
     icon: FileBarChart2,
     phase: "P7",
     hint: "版本与全局交付报告（P7）",
+  },
+  {
+    label: "知识",
+    href: "/knowledge",
+    icon: BookOpen,
+    phase: "P8",
+    hint: "已批准的版本知识与管理员审核队列（P8）",
   },
   {
     label: "代码仓",

@@ -492,9 +492,23 @@ func (f *fakeAgentSessions) StartParts(_ context.Context, agentSessionID int64, 
 	return id, nil
 }
 
-// Messages is unused by the clarification service.
-func (f *fakeAgentSessions) Messages(context.Context, int64, int64, int) ([]application.AgentMessage, bool, error) {
-	return nil, false, nil
+// Messages projects the recorded text runs of one agent session as persisted P1
+// messages, so the first-message knowledge injection sees a prior turn once the
+// chat has started.
+func (f *fakeAgentSessions) Messages(_ context.Context, agentSessionID, _ int64, _ int) ([]application.AgentMessage, bool, error) {
+	messages := make([]application.AgentMessage, 0, len(f.texts))
+	for index, text := range f.texts {
+		if text.AgentSessionID != agentSessionID {
+			continue
+		}
+		messages = append(messages, application.AgentMessage{
+			ID:    int64(index + 1),
+			RunID: int64(index + 1),
+			Role:  "user",
+			Parts: []application.AgentPart{{Type: "text", Text: text.Text}},
+		})
+	}
+	return messages, false, nil
 }
 
 // HasRunningByChannel reports the configured busy channels.

@@ -218,6 +218,14 @@ export function TodoPanel({
                   />
                 ))}
               </ul>
+              {group.kind === "review" && todos.knowledgeTruncated === true ? (
+                <p
+                  data-testid="todo-knowledge-truncated"
+                  className="px-3 py-1 text-[10px] text-muted-foreground"
+                >
+                  知识审核队列已按上限加载，待评审计数为下限。
+                </p>
+              ) : null}
               {items.length === 0 ? (
                 <p className="px-3 py-1.5 text-[11px] text-muted-foreground">
                   更多条目已超出本次加载范围

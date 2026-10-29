@@ -2,7 +2,7 @@
 
 import { BookOpen, Filter, Loader2, RefreshCw, ShieldCheck } from "lucide-react"
 import Link from "next/link"
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
 import { useAuth } from "@/features/auth/AuthProvider"
 import { ApiError } from "@/lib/api-client"
@@ -60,9 +60,7 @@ export function KnowledgePage() {
   const isAdmin = user?.role === "admin"
   const initial = useMemo(readInitialParams, [])
 
-  const [status, setStatus] = useState<KnowledgeStatus>(
-    initial.review !== "" ? "approved" : "approved",
-  )
+  const [status, setStatus] = useState<KnowledgeStatus>("approved")
   const [kind, setKind] = useState<KnowledgeKind | "">("")
   const [versionFilter, setVersionFilter] = useState(initial.version)
   const [appliedVersion, setAppliedVersion] = useState(initial.version)
@@ -72,8 +70,19 @@ export function KnowledgePage() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState("")
 
-  const [reviewOpen, setReviewOpen] = useState(initial.review !== "" && isAdmin)
-  const [reviewFocus, setReviewFocus] = useState(initial.review)
+  const [reviewOpen, setReviewOpen] = useState(false)
+  const [reviewFocus, setReviewFocus] = useState("")
+  const reviewLinkApplied = useRef(false)
+
+  // Auth loads asynchronously: the ?review= deep link can only open the
+  // administrator drawer once the user is known to be an admin. The ref keeps a
+  // later re-render from reopening a drawer the user explicitly closed.
+  useEffect(() => {
+    if (reviewLinkApplied.current || initial.review === "" || !isAdmin) return
+    reviewLinkApplied.current = true
+    setReviewFocus(initial.review)
+    setReviewOpen(true)
+  }, [isAdmin, initial.review])
 
   const load = useCallback(async () => {
     setLoading(true)

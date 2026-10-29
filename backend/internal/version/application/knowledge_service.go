@@ -327,20 +327,27 @@ func (s *KnowledgeService) Review(ctx context.Context, versionID, knowledgeID in
 	return &candidate, nil
 }
 
-// List returns one page of a version's entries ordered by id ascending.
-func (s *KnowledgeService) List(ctx context.Context, versionID int64, status, kind string, page domain.Page) ([]KnowledgeEntry, bool, error) {
+// List returns one page of a version's entries ordered by id ascending. A
+// non-admin viewer only sees approved entries plus the drafts/rejections they
+// created; administrators see every status (spec §9.4).
+func (s *KnowledgeService) List(ctx context.Context, versionID int64, status, kind string, page domain.Page, viewer domain.KnowledgeViewer) ([]KnowledgeEntry, bool, error) {
 	if _, err := s.ensureVersion(ctx, versionID); err != nil {
 		return nil, false, err
 	}
 	if err := validateKnowledgeFilters(status, kind); err != nil {
 		return nil, false, err
 	}
-	return s.repo.List(ctx, KnowledgeFilter{
+	filter := KnowledgeFilter{
 		VersionID: versionID,
 		Status:    status,
 		Kind:      kind,
 		Page:      page,
-	})
+	}
+	if !viewer.Admin {
+		viewerID := viewer.ID
+		filter.ViewerID = &viewerID
+	}
+	return s.repo.List(ctx, filter)
 }
 
 // ListGlobal returns the cross-version read. An empty status means approved

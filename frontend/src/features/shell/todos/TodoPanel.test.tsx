@@ -96,6 +96,20 @@ describe("TodoPanel", () => {
     expect(screen.getByText("暂无待办")).not.toBeNull()
   })
 
+  it("marks the review count as a lower bound when the knowledge queue is capped", () => {
+    render(
+      <TodoPanel
+        todos={{
+          items: [item({})],
+          counts: { review: 1, takeover: 0, gate: 0 },
+          knowledgeTruncated: true,
+        }}
+      />,
+    )
+
+    expect(screen.getByTestId("todo-knowledge-truncated")).not.toBeNull()
+  })
+
   it("hides the takeover and gate groups for a regular user", () => {
     render(<TodoPanel todos={{ items: [item({})], counts: { review: 1, takeover: 0, gate: 0 } }} />)
 

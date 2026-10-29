@@ -56,7 +56,11 @@ func (h *KnowledgeHandler) List(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	entries, hasMore, err := h.knowledge.List(r.Context(), versionID,
-		r.URL.Query().Get("status"), r.URL.Query().Get("kind"), page)
+		r.URL.Query().Get("status"), r.URL.Query().Get("kind"), page,
+		domain.KnowledgeViewer{
+			ID:    ActorID(r.Context()),
+			Admin: knowledgeActorIsAdmin(r.Context()),
+		})
 	if err != nil {
 		WriteServiceError(w, r, err)
 		return

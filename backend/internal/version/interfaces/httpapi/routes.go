@@ -121,7 +121,7 @@ type KnowledgeService interface {
 	Create(ctx context.Context, versionID int64, input versionapp.CreateKnowledgeInput, actor int64) (*versionapp.KnowledgeEntry, error)
 	Update(ctx context.Context, versionID, knowledgeID int64, input versionapp.UpdateKnowledgeInput, actor int64, admin bool) (*versionapp.KnowledgeEntry, error)
 	Review(ctx context.Context, versionID, knowledgeID int64, input versionapp.ReviewKnowledgeInput, actor int64) (*versionapp.KnowledgeEntry, error)
-	List(ctx context.Context, versionID int64, status, kind string, page domain.Page) ([]versionapp.KnowledgeEntry, bool, error)
+	List(ctx context.Context, versionID int64, status, kind string, page domain.Page, viewer domain.KnowledgeViewer) ([]versionapp.KnowledgeEntry, bool, error)
 	ListGlobal(ctx context.Context, versionID *int64, status, kind string, page domain.Page) ([]versionapp.KnowledgeEntry, bool, error)
 }
 

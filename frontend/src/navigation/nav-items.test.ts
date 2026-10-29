@@ -5,20 +5,35 @@ import { isActive, NAV_ITEMS, visibleNavItems } from "@/navigation/nav-items"
 describe("navigation items", () => {
   it("exposes the current P8 routes and keeps the future phase entries", () => {
     const p8 = NAV_ITEMS.filter((item) => item.phase === "P8")
-    expect(p8.map((item) => item.href)).toEqual(["/", "/agents", "/quality", "/settings"])
+    expect(p8.map((item) => item.href)).toEqual([
+      "/",
+      "/knowledge",
+      "/agents",
+      "/quality",
+      "/settings",
+    ])
     expect(NAV_ITEMS.some((item) => item.phase === "P3")).toBe(true)
   })
 
   it("shows every destination, including the quality centre, to admins", () => {
     const items = visibleNavItems(true)
-    expect(items).toHaveLength(10)
+    expect(items).toHaveLength(11)
     expect(items.some((item) => item.href === "/quality")).toBe(true)
   })
 
   it("hides the admin-only quality centre from normal users", () => {
     const items = visibleNavItems(false)
-    expect(items).toHaveLength(9)
+    expect(items).toHaveLength(10)
     expect(items.some((item) => item.href === "/quality")).toBe(false)
+    expect(items.some((item) => item.href === "/knowledge")).toBe(true)
+  })
+
+  it("adds the knowledge entry for every logged-in user, not only admins", () => {
+    const knowledge = NAV_ITEMS.find((item) => item.href === "/knowledge")
+    expect(knowledge?.label).toBe("知识")
+    expect(knowledge?.phase).toBe("P8")
+    expect(knowledge?.adminOnly).toBeUndefined()
+    expect(visibleNavItems(false).some((item) => item.href === "/knowledge")).toBe(true)
   })
 
   it("marks the agent console route as the P1 agent runtime console", () => {
