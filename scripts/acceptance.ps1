@@ -376,6 +376,116 @@ function Assert-Health {
     }
 }
 
+# Background audit actions run without an HTTP request, so no request_id can be
+# stamped on them. Each exemption below points at the emitter that proves it:
+#   delivery.report.published   execution/application/autonomy.go
+#                               processBatch/processDesigningVersion call
+#                               ReportPort.EnsureReport/RegenerateReport from
+#                               the AutonomyWorker.Start goroutine; the
+#                               execution/infrastructure/delivery adapter then
+#                               calls delivery/application/report_service.go
+#                               generate/Publish -> recordPublishedAudit.
+#   delivery.analysis.started   delivery/application/analysis_worker.go Worker
+#                               -> ProcessOnce -> advanceQueued, and
+#                               execution/application/autonomy.go starts runs
+#                               from the worker goroutine ->
+#                               analysis_service.go recordStarted.
+#   delivery.analysis.finished  the same worker tick -> finish/failRun/
+#                               degradeRun -> recordFinished.
+#   delivery.issue.created      issue_service.go auditCreated is reached by
+#                               ApplyDrafts from analysis_service.go
+#                               materializeTriageFallback and from
+#                               execution/application/autonomy.go
+#                               materializeRequirementGaps (requirement_gaps.go).
+#   version.completed           version/application/version_service.go
+#                               TryFinalize -> recordAudit has no HTTP caller;
+#                               autonomy.go finishChain and autonomy_worker.go
+#                               finalizeSweep -> infrastructure/version/finalizer.go
+#                               invoke it.
+#   execution.evidence.gc       execution/application/maintenance.go
+#                               DailyMaintenance.Start goroutine -> RunOnce ->
+#                               GCService.Run -> recordAudit. The admin HTTP
+#                               route still records its own request_id.
+# The list is action-level because an audit row has no producer column. HTTP
+# actions (auth.login_succeeded, user.created, sse.test_published,
+# version.created, mindmap.*) stay correlated; the self-check below proves both
+# directions. Existing exemptions: llm.config_created (seeded before any
+# request) and the worker/agent tool actions mindmap.tool.invoked,
+# execution.case.finished, agent.tool.invoked and agent.run.aborted.
+$script:backgroundAuditActions = @(
+    "llm.config_created",
+    "mindmap.tool.invoked",
+    "execution.case.finished",
+    "agent.tool.invoked",
+    "agent.run.aborted",
+    # Worker/finalizer/GC emitters documented above; each has code evidence.
+    "delivery.report.published",
+    "delivery.analysis.started",
+    "delivery.analysis.finished",
+    "delivery.issue.created",
+    "version.completed",
+    "execution.evidence.gc"
+)
+
+# Get-MissingRequestIdAuditEntries is the single request_id predicate shared by
+# Test-AdminAudit and the -StaticOnly self-check: request-driven actions must
+# carry a request_id, allowlisted background actions may omit it.
+function Get-MissingRequestIdAuditEntries {
+    param(
+        [object[]]$Entries,
+        [string[]]$BackgroundActions = $script:backgroundAuditActions
+    )
+    $missing = @()
+    foreach ($entry in @($Entries)) {
+        if ($null -eq $entry) { continue }
+        if (-not [string]::IsNullOrWhiteSpace([string]$entry.request_id)) { continue }
+        if ([string]$entry.action -in $BackgroundActions) { continue }
+        $missing += $entry
+    }
+    return $missing
+}
+
+# Assert-AuditRequestIdPolicySelfTest is the negative harness for the rule. It
+# runs in -StaticOnly too: an HTTP action without request_id MUST fail, a
+# documented background action without request_id MUST pass, and a correlated
+# HTTP action MUST pass.
+function Assert-AuditRequestIdPolicySelfTest {
+    $httpActions = @("auth.login_succeeded", "user.created", "sse.test_published", "version.created", "mindmap.case_created")
+    foreach ($action in $httpActions) {
+        if ($action -in $script:backgroundAuditActions) {
+            throw "audit request_id self-check failed: HTTP action '$action' must not be exempt"
+        }
+        $violations = @(Get-MissingRequestIdAuditEntries -Entries @([pscustomobject]@{ action = $action; request_id = "" }))
+        if ($violations.Count -ne 1) {
+            throw "audit request_id self-check failed: HTTP action '$action' without request_id was not rejected"
+        }
+    }
+    $documentedBackground = @(
+        "delivery.report.published",
+        "delivery.analysis.started",
+        "delivery.analysis.finished",
+        "delivery.issue.created",
+        "version.completed",
+        "execution.evidence.gc"
+    )
+    foreach ($action in $documentedBackground) {
+        if ($action -notin $script:backgroundAuditActions) {
+            throw "audit request_id self-check failed: documented background action '$action' is not exempt"
+        }
+    }
+    foreach ($action in $script:backgroundAuditActions) {
+        $violations = @(Get-MissingRequestIdAuditEntries -Entries @([pscustomobject]@{ action = $action; request_id = "" }))
+        if ($violations.Count -ne 0) {
+            throw "audit request_id self-check failed: background action '$action' without request_id was rejected"
+        }
+    }
+    $correlated = @(Get-MissingRequestIdAuditEntries -Entries @([pscustomobject]@{ action = "auth.login_succeeded"; request_id = "req_self_check" }))
+    if ($correlated.Count -ne 0) {
+        throw "audit request_id self-check failed: a correlated HTTP action was rejected"
+    }
+    Write-Host "Audit request_id policy OK: HTTP actions need a request_id; $($script:backgroundAuditActions.Count) background actions are exempt."
+}
+
 function Test-AdminAudit {
     $loginPayload = @{ username = $adminUsername; password = $adminPassword } | ConvertTo-Json -Compress
     $login = Invoke-RestMethod -Method Post -Uri "$apiBaseUrl/api/auth/login" `
@@ -401,23 +511,14 @@ function Test-AdminAudit {
         }
     }
 
-    # Entries written before/without an HTTP request legitimately have no
-    # request_id: the environment-seeded LLM configuration is created before any
-    # request exists, and the mindmap/execution workers invoke agent runs and
-    # tools from background goroutines. Every request-driven action must still
-    # be correlated; the Go tests pin the HTTP-started agent tool audit path.
-    $backgroundActions = @(
-        "llm.config_created",
-        "mindmap.tool.invoked",
-        "execution.case.finished",
-        "agent.tool.invoked",
-        "agent.run.aborted"
-    )
-    $missingRequestIds = @($items | Where-Object {
-            [string]::IsNullOrWhiteSpace([string]$_.request_id) -and [string]$_.action -notin $backgroundActions
-        })
+    # Keep every HTTP-driven action correlated; only the documented background
+    # actions above may omit request_id.
+    Assert-AuditRequestIdPolicySelfTest
+
+    $missingRequestIds = @(Get-MissingRequestIdAuditEntries -Entries $items)
     if ($missingRequestIds.Count -gt 0) {
-        throw "request-driven audit entries are missing request_id"
+        $missingActions = @($missingRequestIds | ForEach-Object { [string]$_.action } | Select-Object -Unique)
+        throw "request-driven audit entries are missing request_id: $($missingRequestIds.Count) entries ($($missingActions -join ', '))"
     }
 
     $auditJson = $audit | ConvertTo-Json -Depth 12 -Compress
@@ -4797,6 +4898,15 @@ writeFileSync(process.argv[3], JSON.stringify({
                     throw "P7 DoD row '$($row.DoD)' is missing its requirement/evidence mapping"
                 }
             }
+        })
+
+    # -----------------------------------------------------------------------
+    # P8 audit request_id policy. Repository-local, so it also runs with
+    # -StaticOnly: an HTTP action without request_id must FAIL and a documented
+    # background action without request_id must PASS.
+    # -----------------------------------------------------------------------
+    [void](Invoke-Check -Dod "P8" -CheckName "P8 audit request_id policy" -Body {
+            Assert-AuditRequestIdPolicySelfTest
         })
 
     # -----------------------------------------------------------------------
