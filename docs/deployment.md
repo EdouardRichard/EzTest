@@ -67,7 +67,7 @@ Copy-Item .env.example .env
 | `EZTEST_AGENT_HTTP_ALLOWLIST` | `127.0.0.1,localhost` | Agent `http.get` 白名单；生产按需最小化。 |
 | `EZTEST_AUTONOMY_BATCHES_PER_TICK` | `4` | 自主 worker 每 tick 批预算（1–20）。 |
 
-> 注意：设计规格中的 `EZTEST_CHAIN_MAX_NODES`、`EZTEST_SEARCH_MAX_RESULTS_PER_TYPE`、`EZTEST_TODOS_MAX` 当前由代码内置默认/接口 `limit` 约束，**构建尚未读取这些环境变量**；视觉断言相关变量也随该能力在途。不要在生产依赖未接线的变量，详见 [P8 发布说明](release-notes/p8.md)。
+> 注意：设计规格中的 `EZTEST_CHAIN_MAX_NODES`、`EZTEST_SEARCH_MAX_RESULTS_PER_TYPE`、`EZTEST_TODOS_MAX` 当前由代码内置默认/接口 `limit` 约束，**构建尚未读取这些环境变量**。视觉断言仅 executor 读取 `EZTEST_VISUAL_BASELINE_MAX_BYTES`（默认 5 MiB），后端 config/Compose 未接线；`EZTEST_VISUAL_DIFF_THRESHOLD` 未使用；且视觉断言的运行入口尚未接线。不要在生产依赖未接线的变量，详见 [P8 发布说明](release-notes/p8.md)。
 >
 > `.env.example` 当前只含限流/GC/leader 段；`EZTEST_KNOWLEDGE_*` 需要时请按上表手动补入 `.env`。
 

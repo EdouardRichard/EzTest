@@ -121,9 +121,11 @@ info:
       `GET /api/versions/{id}/code/changes` gains `batchTimeline`. The rate
       limiter answers 429 `rate_limited` with `Retry-After`; `GET /api/health`
       projects the effective rate-limit and GC thresholds. P8 adds
-      `knowledge.created`/`knowledge.reviewed` events. Visual assertion
-      endpoints are **not** part of this document yet (the capability is not
-      delivered in this revision).
+      `knowledge.created`/`knowledge.reviewed` events. Visual assertion code and
+      migrations are partially committed, but the routes are **not mounted**
+      (the composition root does not wire `Deps.Visual`) and the execution entry
+      is absent, so this document intentionally does not publish visual
+      assertion endpoints or the `case.visual_baseline_approved` event yet.
 
     This document is served publicly at `GET /api/openapi.yaml`; it is the same
     file under `docs/openapi/api.yaml` in the repository.

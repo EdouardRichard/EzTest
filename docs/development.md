@@ -195,13 +195,14 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/slo-chain.ps1 `
 
 ## 6. 视觉断言（D62）交付状态
 
-**截至本提交（`docs(p8)`），视觉断言尚未交付**：
+**当前为“代码部分提交、运行未接线”**（Task 25 报告：`PARTIAL`）：
 
-- Task 25 仍在途；`backend/internal/mindmap` 的视觉服务、`executor` 的 `visual.compare`、`case_visual_assertion` 表与前端基线审批尚未合并。
-- 本仓库当前**不发布** `PUT .../visual`、`POST .../visual/baseline` 等端点，OpenAPI 也不包含；不要按 P8 规格直接调用。
-- 合并后必须同步：`docs/openapi/api.yaml`、README、用户手册、前端设计 §4.3.3/§8、系统蓝图 D62、发布说明与 `scripts/acceptance.ps1` 静态契约。
-- 计划实现（规格 §9.3/D62）：新增 `visual` 断言类型、基线上传/审批 admin-only、区域/全图比对、阈值 `EZTEST_VISUAL_DIFF_THRESHOLD`、基线大小上限；executor 使用 MIT `pixelmatch`+`pngjs`，无基线/环境不符判 `inconclusive`，不假失败。
-- 在交付前，端到端执行只做常规截图证据；不要声称“视觉断言已可用”。
+- 已提交：`mindmap_0003_visual.sql`（`case_visual_assertion` + `visual` kind）、`execution_0005_visual_evidence.sql`（`visual_baseline/visual_actual/visual_diff` 证据 kind）、mindmap 视觉参数/基线审批 service、executor `visual.compare`（`pixelmatch`+`pngjs`）、四态 `ClassifyVisual`、前端编辑/审批/查看器、`eval/corpus/visual.json` 与 `eval/ground-truth/visual.json`。
+- **未接线**：`backend/cmd/eztest/main.go` 未装配 `Deps.Visual`，`config.go` 未解析后端基线大小上限；因此 `PUT /api/versions/{versionId}/mindmap/assertions/{assertionId}/visual`、`POST .../visual/baseline` 两条路由不会挂载（请求 404）。execution agent 也还没有 `execution.visual_assert` 工具，真实 case run 不会产生 `visual_actual/visual_diff` 证据；`scripts/eval.ps1` 未读取视觉语料。
+- 迁移已随启动执行，所以数据库会存在 `case_visual_assertion` 表与新的 evidence kind；这不等于功能可用。
+- 已知设计冲突（接线前必须解决）：`ClassifyVisual` 要求环境不符 → `inconclusive(environment)`，而现有 `domain.ValidateFinish` 只允许 model/case 的 inconclusive；要么扩展 finish 矩阵，要么按产品决策降级为 `blocked(environment)` 并记录 override。Task 25 报告给出了 main/config/agent tool 的精确 patch。
+- 接线完成后必须同步：`docs/openapi/api.yaml`（两条路径、`visual` 断言字段、`case.visual_baseline_approved` 事件）、README、用户手册、前端设计 §4.3.3/§8、系统蓝图 D62、发布说明与 `scripts/acceptance.ps1` 静态契约；并补真实 executor/browser 验收。
+- 在接线前，端到端执行只做常规截图证据；不要声称“视觉断言已可用”。`EZTEST_VISUAL_BASELINE_MAX_BYTES` 仅 executor 读取（默认 5 MiB），后端 config/Compose 尚未接线；`EZTEST_VISUAL_DIFF_THRESHOLD` 未被使用。
 
 ## 7. OpenAPI 与文档同步
 
@@ -228,13 +229,13 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/slo-chain.ps1 `
 3. 只做加法式 DDL（新表/新列/放宽约束/新索引）；避免破坏性变更。需要回退时用备份恢复，不写 down migration。
 4. 启动时在 advisory lock 下按顺序事务执行；重复启动幂等；`scripts/acceptance.ps1` 从 `order.txt` 动态推导条数，不要写死数量。
 5. 新迁移必须同步：README/设计文档的数据模型、OpenAPI（如暴露新字段）、评测/验收脚本、备份恢复的目录/表说明（如新增存储）。
-6. P8 迁移示例：`codeintel_0006_version_change.sql`、`codeintel_0007_fact_review.sql`、`version_0006_knowledge.sql`、`quality_0001_eval.sql`、`execution_0004_evidence_purge.sql`；视觉断言迁移在交付时另行追加（当前工作区在途，未提交）。
+6. P8 迁移示例：`codeintel_0006_version_change.sql`、`codeintel_0007_fact_review.sql`、`version_0006_knowledge.sql`、`quality_0001_eval.sql`、`execution_0004_evidence_purge.sql`、`mindmap_0003_visual.sql`、`execution_0005_visual_evidence.sql`。视觉迁移已提交并执行，但视觉 API/执行入口仍未接线（见 §6）。
 
 ## 9. 依赖与许可治理
 
 - 前端运行时依赖必须为 MIT/Apache-2.0 等宽松许可；新增依赖先确认许可、SSR/测试环境兼容、包体积与安全记录。
 - 当前 P8 新增：`@xyflow/react` 12.12.0（MIT，仅链路画布懒加载）；`axe-core` 4.14.0 为 **dev-only MPL-2.0 例外**（已在 `scripts/security-audit.ps1` 登记，进入生产依赖会 FAIL）。
-- executor 仅 `playwright`（Apache-2.0）；视觉断言交付时再加入 `pixelmatch`/`pngjs`（MIT）并登记。
+- executor 依赖 `playwright`（Apache-2.0）与视觉断言的 `pixelmatch`/`pngjs`（MIT，已提交）；新增依赖需登记并在 `pnpm audit`/许可清单中通过。
 - 锁文件（`frontend/pnpm-lock.yaml`、`executor/pnpm-lock.yaml`）必须提交；升级依赖后跑 `pnpm audit --prod --json` 与前端构建。
 - 安全/许可审计：
   ```powershell

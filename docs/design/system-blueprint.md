@@ -753,7 +753,7 @@ SSE + 快照游标 + seq 去重 + Last-Event-ID；图结构签名防抖；历史
 
 ## 19. P8 实现注记（D53–D69，2026-10-29）
 
-> 本节记录 P8“体验完善与硬化”的落地口径，与 P8 设计规格 §2/§10/§11 配套。P8 **不新增业务域**；视觉断言（D62）在本提交尚未交付，文中已单独标注。
+> 本节记录 P8“体验完善与硬化”的落地口径，与 P8 设计规格 §2/§10/§11 配套。P8 **不新增业务域**；视觉断言（D62）为“代码部分提交、运行未接线”，文中已单独标注。
 
 ### 19.1 决策落地（D53–D69）
 
@@ -768,7 +768,7 @@ SSE + 快照游标 + seq 去重 + Last-Event-ID；图结构签名防抖；历史
 | **D59** | 报告 revision 选择器、D49 快照字段、证据计数入指纹并 stale | 已交付：`ReportsTab` revision 选择器；快照写 `baseFallbackReason/historyRewritten`；只读时指纹变化 → stale + 一次 `report.stale`。 |
 | **D60** | Agent 中心 = 13 角色目录 + 现有 profile 配置 + 运行观察 + 质量指标；只读接口登录可读，写配置仍 admin-only | 已交付：`/agents` 三角色视图；报告/知识角色标注确定性/人工审核，不伪造 profile。 |
 | **D61** | 评测双轨：确定性 fake LLM 为门禁，真实 LLM 只报告 | 已交付：`internal/quality`、`scripts/eval.ps1`、`eval/`；确定性阈值+基线回归，真实 LLM 报告不阻断。 |
-| **D62** | 视觉断言：`visual` 类型 + 独立表 + 人工审批基线 + pixelmatch 比对 + 四态分类 | **未交付（Task 25 在途）**：当前无视觉端点/UI/迁移提交；不要把本项当可用功能。 |
+| **D62** | 视觉断言：`visual` 类型 + 独立表 + 人工审批基线 + pixelmatch 比对 + 四态分类 | **代码部分提交、运行未接线**：迁移、mindmap 参数/审批服务、executor `visual.compare`、前端编辑/审批/查看器、评测语料已提交；但 `cmd/eztest`/`config` 未装配 `Deps.Visual`，`/visual` 路由不挂载，execution agent 无 `visual_assert` 工具，`eval.ps1` 未接语料。接线前不可用。 |
 | **D63** | 知识沉淀版本内闭环：提交→人工审核→批准→注入澄清/设计提示词 | 已交付：`version_0006_knowledge.sql`、`/knowledge`、版本概览提交面板、管理员审核抽屉；注入记录 `knowledgeRefs`，超出预算记 `knowledge_truncated`。 |
 | **D64** | 全局限流 + SLO 测量 | 限流已交付（429+Retry-After+SSE 并发）；SLO 脚本已交付，链路专项实测 PASS，全量 `slo.ps1` 仍为 dry-run SKIP（待最终验收）。 |
 | **D65** | GC/保留：证据/导出/附件/报告/孤儿按保留期清理，引用保护 + dry-run | **已交付但 re-scope**：自动清理只覆盖执行证据文件；导出、附件、报告 Markdown、无 DB 行孤儿文件不自动删除（缺安全引用判定）。默认 dry-run。 |
@@ -808,7 +808,7 @@ SSE + 快照游标 + seq 去重 + Last-Event-ID；图结构签名防抖；历史
 | `version_0006_knowledge.sql` | `knowledge_entry` 版本内知识（kind/status/confidence/tags/source_refs/revision）。 |
 | `quality_0001_eval.sql` | `eval_run` + `eval_metric`（确定性/真实 LLM 双轨、阈值/基线判定）。 |
 | `execution_0004_evidence_purge.sql` | `evidence.purged_at/purged_reason`（GC 保留元数据，不删行）。 |
-| `mindmap_0003_visual.sql` / `execution_0005_visual_evidence.sql` | 视觉断言的 DDL；**当前未提交**，随 D62 交付。 |
+| `mindmap_0003_visual.sql` / `execution_0005_visual_evidence.sql` | 视觉断言的 DDL（已提交并随启动执行；`visual` kind、`case_visual_assertion`、三类 visual 证据 kind）。 |
 
 ### 19.4 探索链路（D53/D54）
 
@@ -839,8 +839,8 @@ SSE + 快照游标 + seq 去重 + Last-Event-ID；图结构签名防抖；历史
 
 ### 19.8 交付状态与已知限制
 
-- **已交付**：D53–D61、D63–D69（D62 除外），以及 P8 前端壳/移动导航/报告 revision/证据对比。
-- **未交付**：D62 视觉断言（Task 25 在途）；全量 SLO 真实测量、恢复库应用 smoke、最终真实验收（Task 35）。
+- **已交付**：D53–D61、D63–D69，以及 P8 前端壳/移动导航/报告 revision/证据对比。
+- **部分提交、未接线**：D62 视觉断言（迁移/服务/executor/前端/语料已提交；main/config/agent tool/eval runner 未接；两条 `/visual` 路由不挂载，`case.visual_baseline_approved` 事件仅在接线后生效）。全量 SLO 真实测量、恢复库应用 smoke、最终真实验收（Task 35）未完成。
 - **re-scope**：GC 只自动清理执行证据文件；导出/附件/报告/孤儿文件留给 P9/后续（需安全引用判定）。
 - **报告保护边界**：报告快照不含 evidence id，`report_ref(ref_kind='evidence')` 无生产写入，因此发布/过期报告不参与证据保护。
 - **配置未接线**：`EZTEST_ANALYSIS_MAX_CASES`/`EZTEST_SUPPLEMENT_MAX_CASES`、`EZTEST_CHAIN_MAX_NODES`/`EZTEST_SEARCH_MAX_RESULTS_PER_TYPE`/`EZTEST_TODOS_MAX` 当前未被构建读取，使用代码默认/请求上限。

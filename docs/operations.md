@@ -187,7 +187,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/restore.ps1 `
 1. 运行中/计划中的批次（`run_batch.status IN ('planned','running')`）的全部证据。
 2. 每个版本最近 `EZTEST_GC_BATCH_KEEP` 批的证据。
 3. 未关闭问题（`issue.status IN ('open','confirmed')`）通过 `issue_ref`（`ref_kind='evidence'`）引用的证据。`issue_ref.ref_id` 是十进制字符串，保护 SQL 统一用 `ref_id = evidence.id::text` 比较，避免 bigint 转换越界，也保证候选列表与删除前复核口径一致。
-4. 基线证据：`evidence.kind='visual_baseline'`（视觉断言迁移提供该 kind 后生效；当前工作树若尚未包含该迁移，则不存在此类行，保护条件仍保留）。
+4. 基线证据：`evidence.kind='visual_baseline'`（视觉断言迁移已提交并随启动执行，保护条件生效；但视觉执行入口尚未接线，当前生产不会产生此类证据）。
 5. 已清除证据（`purged_at IS NOT NULL`）不会再次成为候选；删除前复核也会将其视为受保护。
 6. 最近 N 批以外的候选仍会在删除前**再次**执行引用校验（`IsProtected`），避免候选列出后新建立的引用被误删。
 
@@ -422,7 +422,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/slo-chain.ps1 `
 ## P8 已知限制与交付状态
 
 - **Docker/Compose 未实跑**：镜像未构建、栈未启动；只有静态校验。首次部署按 [部署指南](deployment.md) 验证。
-- **视觉断言（D62）尚未在本提交交付**：Task 25 仍在途；用户手册不包含视觉断言操作，OpenAPI 也不发布相关端点。合并后需同步 README/OpenAPI/用户手册/设计文档。
+- **视觉断言（D62）部分提交、运行未接线**：迁移、mindmap 编辑/审批服务、executor `visual.compare`、前端编辑/审批/查看器与评测语料已提交；但 `cmd/eztest`/`config` 未装配 `Deps.Visual`，两条 `/visual` 路由不挂载，execution agent 也没有视觉执行工具，真实 case run 不会产生 visual 证据；`scripts/eval.ps1` 未接入视觉语料。当前不要对用户宣称视觉断言可用；接线后需同步 README/OpenAPI/用户手册/设计文档。
 - **SLO**：`scripts/slo.ps1` 目前只有 dry-run 静态 PASS；真实全量测量待最终验收；链路专项已 PASS（本机口径）。
 - **备份恢复**：DB 行数 + 文件 SHA-256 已演练；恢复库上的应用级 smoke 未做（defer Task 35）。
 - **GC 范围**：只自动清理 `EZTEST_EVIDENCE_DIR` 下证据；导出、附件、报告 Markdown、无 DB 行孤儿文件不自动删除（见上文“证据 GC 与保留”）。
