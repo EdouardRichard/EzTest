@@ -14,6 +14,7 @@ import {
 } from "react"
 
 import { StatusBadge, type StatusBadgeVariant } from "@/components/ui/StatusBadge"
+import { useAuth } from "@/features/auth/AuthProvider"
 import { getVersion } from "@/features/versions/api"
 import type { Version, VersionStatus } from "@/features/versions/types"
 import type { VersionStreamState } from "@/features/versions/useVersionStream"
@@ -242,6 +243,8 @@ export function MindmapPage({
   version: versionProp,
 }: MindmapPageProps) {
   const { graph, loading, error, streamStatus, refresh } = useMindmap(versionId, stream)
+  const { user } = useAuth()
+  const isAdmin = user?.role === "admin"
 
   const [version, setVersion] = useState<Version | null>(versionProp ?? null)
   const [selectedId, setSelectedId] = useState<string | null>(
@@ -747,6 +750,7 @@ export function MindmapPage({
                 reload()
               }}
               onRefresh={reload}
+              isAdmin={isAdmin}
             />
           ) : (
             <ScenarioEditor
