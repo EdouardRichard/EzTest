@@ -394,13 +394,15 @@ describe("ExplorationTab", () => {
   })
 
   it("builds requirement edges from the read-model edges, not case requirementIds", async () => {
-    // The case DTO lists R1 and R2, but only the R1 edge exists. The layout must
-    // follow the edges so a filtered-out requirement cannot invent a link.
+    // The case DTO lists R1 and R2, but only the R1 edge exists. R2 is a real
+    // node of the response, so the negative assertion proves the missing edge
+    // was not invented from `case.requirementIds`.
     mocks.useExplorationChain.mockReturnValue(
       chainResult(
         snapshotOf(
           [
             requirementNode(R1, "登录需求"),
+            requirementNode(R2, "下单需求"),
             caseNode(C1, "登录成功", [R1, R2]),
             resultNode(CR1, C1, "passed", { title: "登录成功" }),
           ],
@@ -412,6 +414,7 @@ describe("ExplorationTab", () => {
     renderTab()
     await screen.findByTestId(`chain-node-${C1}`)
 
+    expect(screen.getByTestId(`chain-node-${R2}`)).toBeTruthy()
     expect(screen.queryByTestId(`chain-edge-${R1}->${C1}`)).toBeTruthy()
     expect(screen.queryByTestId(`chain-edge-${R2}->${C1}`)).toBeNull()
   })
@@ -526,6 +529,36 @@ describe("ExplorationTab", () => {
 
     fireEvent.click(screen.getByTestId("chain-drawer-open-case"))
     expect(onNavigate).toHaveBeenCalledWith({ kind: "case", id: C2 })
+  })
+
+  it("does not offer a dead-end evidence button for an issue without a caseRunId", async () => {
+    mocks.useExplorationChain.mockReturnValue(
+      chainResult(
+        snapshotOf(
+          [
+            requirementNode(R2, "下单需求"),
+            caseNode(C2, "提交订单", [R2]),
+            resultNode(CR2, C2, "failed", { title: "提交订单" }),
+            issueNode(ISSUE_1, "提交订单失败", { caseRunId: "", evidenceCount: 1 }),
+          ],
+          [requirementCaseEdge(R2, C2), caseResultEdge(C2, CR2), resultIssueEdge(CR2, ISSUE_1)],
+        ),
+      ),
+    )
+    const { onNavigate } = renderTab()
+
+    fireEvent.click(await screen.findByTestId(`chain-issue-node-${ISSUE_1}`))
+
+    // The evidence read is keyed by caseRunId; without one the old button could
+    // only ever resolve to "暂无可查看证据". Point at the issue page instead.
+    expect(screen.queryByTestId("chain-drawer-load-evidence")).toBeNull()
+    const hint = screen.getByTestId("chain-drawer-evidence-unavailable")
+    expect(hint.textContent).toContain("无法加载证据")
+    expect(hint.textContent).toContain("查看问题")
+    expect(mocks.useCaseRun).toHaveBeenLastCalledWith(VERSION_ID, expect.anything(), "", STREAM)
+
+    fireEvent.click(screen.getByTestId("chain-drawer-open-issue"))
+    expect(onNavigate).toHaveBeenCalledWith({ kind: "issue", id: ISSUE_1 })
   })
 
   it("requests the chain with the batch scope and the read-model defaults", async () => {

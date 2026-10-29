@@ -57,6 +57,8 @@ const mocks = vi.hoisted(() => ({
   issuesProps: vi.fn(),
   reportsProps: vi.fn(),
   explorationProps: vi.fn(),
+  getEvidenceMeta: vi.fn(),
+  getEvidenceUrl: vi.fn(),
 }))
 
 vi.mock("./api", () => ({
@@ -96,6 +98,8 @@ vi.mock("@/features/execution/hooks/useExecution", () => ({
 
 vi.mock("@/features/execution/api", () => ({
   listExecutionSessions: mocks.listExecutionSessions,
+  getEvidenceMeta: mocks.getEvidenceMeta,
+  getEvidenceUrl: mocks.getEvidenceUrl,
 }))
 
 // The delivery tabs are covered by their own suites; the overview data is
@@ -563,6 +567,12 @@ describe("VersionDetailPage", () => {
     })
     mocks.useExecutionActions.mockReturnValue(actionsResult())
     mocks.listExecutionSessions.mockResolvedValue({ items: [], nextCursor: "", hasMore: false })
+    // Keep the evidence viewer of a `?evidence=` deep link pending: the test
+    // only pins that the query parameter survives the tab normalization.
+    mocks.getEvidenceMeta.mockReturnValue(new Promise(() => {}))
+    mocks.getEvidenceUrl.mockReturnValue(
+      `/api/versions/${VERSION_ID}/evidence/1844674407370955402/bytes`,
+    )
     mocks.createBatch.mockResolvedValue(batchFixture())
     mocks.pauseBatch.mockResolvedValue(true)
     mocks.resumeBatch.mockResolvedValue(true)
@@ -1231,7 +1241,12 @@ describe("VersionDetailPage", () => {
 
   it("opens the exploration tab and the Sheet from ?node= without ?tab=", async () => {
     const caseNodeId = "1844674407370955210"
-    window.history.replaceState(null, "", `/versions/${VERSION_ID}?node=case:${caseNodeId}`)
+    const evidenceId = "1844674407370955402"
+    window.history.replaceState(
+      null,
+      "",
+      `/versions/${VERSION_ID}?node=case:${caseNodeId}&evidence=${evidenceId}`,
+    )
 
     render(<VersionDetailPage versionId={VERSION_ID} />)
     await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
@@ -1241,6 +1256,14 @@ describe("VersionDetailPage", () => {
         "true",
       ),
     )
+    // The inferred tab is persisted so closing the Sheet (which deletes `node`)
+    // cannot fall back to the requirements tab on refresh.
+    await waitFor(() =>
+      expect(new URLSearchParams(window.location.search).get("tab")).toBe("exploration"),
+    )
+    const params = new URLSearchParams(window.location.search)
+    expect(params.get("node")).toBe(`case:${caseNodeId}`)
+    expect(params.get("evidence")).toBe(evidenceId)
     await waitFor(() =>
       expect(mocks.explorationProps).toHaveBeenLastCalledWith(
         expect.objectContaining({ selectedNodeId: `case:${caseNodeId}` }),

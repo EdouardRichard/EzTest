@@ -490,6 +490,10 @@ function ChainDrawer({
         : ""
   const runBatchId = (caseRunId === "" ? "" : view.resultBatchById.get(caseRunId)) ?? batchId
   const evidenceCount = snapshotNode?.evidenceCount ?? 0
+  // Evidence is read by caseRunId, so an issue without one cannot ever load it.
+  // Do not offer a button that can only resolve to "暂无证据"; point at the
+  // issue page instead (spec §5.5).
+  const evidenceUnavailable = node.kind === "issue" && evidenceCount > 0 && caseRunId === ""
   const detail = useCaseRun(
     versionId,
     runBatchId,
@@ -664,7 +668,14 @@ function ChainDrawer({
 
       <section data-testid="chain-drawer-evidence" className="mt-4">
         <h4 className="text-xs font-semibold">证据</h4>
-        {evidenceCount === 0 ? (
+        {evidenceUnavailable ? (
+          <p
+            data-testid="chain-drawer-evidence-unavailable"
+            className="mt-1 text-xs text-muted-foreground"
+          >
+            该问题未关联执行结果，无法加载证据；请点击“查看问题”查看复现步骤与处理记录。
+          </p>
+        ) : evidenceCount === 0 ? (
           <p className="mt-1 text-xs text-muted-foreground">该节点暂无可查看证据。</p>
         ) : evidenceRequested ? (
           detail.loading ? (

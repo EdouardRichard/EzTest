@@ -147,6 +147,20 @@ function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === "AbortError"
 }
 
+/**
+ * Highest seq of the events already present when the hook mounts. Those events
+ * are catch-up history of the page stream: the initial read already reflects
+ * them, so they must not schedule a refresh that would abort that read.
+ */
+function maxStreamSeq(events: VersionStreamState["events"], versionId: string): number {
+  let maxSeq = 0
+  for (const event of events) {
+    if (event.version_id !== null && event.version_id !== versionId) continue
+    if (event.seq > maxSeq) maxSeq = event.seq
+  }
+  return maxSeq
+}
+
 function describeChainLoadError(error: unknown): string {
   if (error instanceof Error && error.message.trim() !== "") return error.message
   return "未知错误"
@@ -184,7 +198,9 @@ export function useExplorationChain(
   const abortRef = useRef<AbortController | null>(null)
   const requestRef = useRef(0)
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const lastSeqRef = useRef(0)
+  // Start at the mount-time high-water mark: only events that arrive after the
+  // hook mounted are new enough to justify a refresh (spec §5.5).
+  const lastSeqRef = useRef(maxStreamSeq(activeStream.events, versionId))
   const versionRef = useRef(versionId)
 
   const normalized = normalizeChainParams(params)

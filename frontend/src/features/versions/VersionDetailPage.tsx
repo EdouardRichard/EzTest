@@ -204,7 +204,16 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
   }, [versionId])
 
   useEffect(() => {
-    setTab(readTabParam())
+    const initialTab = readTabParam()
+    setTab(initialTab)
+    // A `?node=` deep link implies the exploration tab. Persist the inferred tab
+    // so removing `node` (Sheet close) or changing filters later cannot fall
+    // back to the requirements tab on refresh; every other query parameter is
+    // preserved by writeQueryParam.
+    if (typeof window !== "undefined") {
+      const rawTab = new URLSearchParams(window.location.search).get("tab")
+      if (initialTab === "exploration" && !isVersionTab(rawTab)) writeTabParam("exploration")
+    }
     setEvidenceId(readEvidenceParam())
     setIssueId(readDeepLinkParam("issue"))
     setReportId(readDeepLinkParam("report"))
