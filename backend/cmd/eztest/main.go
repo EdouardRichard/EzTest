@@ -24,6 +24,7 @@ import (
 	agentpostgres "github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/postgres"
 	agenttools "github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/tools"
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
+	auditdomain "github.com/EdouardRichard/EzTest/backend/internal/audit/domain"
 	auditpostgres "github.com/EdouardRichard/EzTest/backend/internal/audit/infrastructure/postgres"
 	chainapp "github.com/EdouardRichard/EzTest/backend/internal/chain/application"
 	chainhttp "github.com/EdouardRichard/EzTest/backend/internal/chain/interfaces/httpapi"
@@ -711,6 +712,19 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		executionapp.WithEvidenceMaxBytes(int64(cfg.ExecEvidenceMaxBytes)),
 		executionapp.WithEvidenceMaxPerCaseRun(cfg.ExecEvidencePerCase),
 	)
+	// P8 evidence GC (spec 10.2): the reference-protection queries live in the
+	// execution postgres adapter and the filesystem store supplies the sha256
+	// pre-check and removal. Non-dry-run is opt-in through EZTEST_GC_ENABLED.
+	gcService := executionapp.NewGCService(executionapp.GCDeps{
+		Repository:    executionpostgres.NewGCRepository(database.Pool),
+		Files:         evidenceStore,
+		Audit:         executionGCAudit{recorder: auditor},
+		Clock:         wallClock{},
+		Logger:        logger,
+		Enabled:       cfg.GCEnabled,
+		RetentionDays: cfg.GCRetentionDays,
+		BatchKeep:     cfg.GCBatchKeep,
+	})
 	executorClient := executionbrowser.New(cfg.ExecutorURL, cfg.ExecutorToken, 0)
 	// Auto-login acquisition drives the stored form recipe through the same
 	// executor client used for case execution and captures the storage_state the
@@ -1492,6 +1506,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 			Workspace: workspaceHandlers,
 			Search:    searchHandlers,
 			Quality:   qualityHandlers,
+			GC:        gcService,
 		}),
 		BaseContext:       baseContext(baseCtx),
 		ReadHeaderTimeout: 10 * time.Second,
@@ -1774,6 +1789,48 @@ type wallClock struct{}
 
 // Now returns the current time.
 func (wallClock) Now() time.Time { return time.Now() }
+
+// executionGCAudit adapts the evidence-GC audit port to the P0 audit recorder.
+// Entries carry counts, thresholds and the actor only: never evidence paths,
+// sha256 values or artifact content (spec 10.2).
+type executionGCAudit struct {
+	recorder auditapp.Recorder
+}
+
+var _ executionapp.GCAuditor = executionGCAudit{}
+
+// GCRunCompleted records one evidence GC run.
+func (a executionGCAudit) GCRunCompleted(ctx context.Context, event executionapp.GCAuditEvent) error {
+	if a.recorder == nil {
+		return nil
+	}
+	entry := auditdomain.Entry{
+		Action:     "execution.evidence.gc",
+		TargetType: "evidence_gc",
+		Metadata: map[string]any{
+			"dry_run":        event.DryRun,
+			"candidates":     event.Candidates,
+			"protected":      event.Protected,
+			"deleted":        event.Deleted,
+			"failed":         event.Failed,
+			"skipped":        event.Skipped,
+			"bytes":          event.Bytes,
+			"retention_days": event.RetentionDays,
+			"batch_keep":     event.BatchKeep,
+			"reason":         event.Reason,
+		},
+	}
+	if event.ActorID > 0 {
+		actor := event.ActorID
+		entry.ActorUserID = &actor
+	}
+	if meta := auditapp.MetaFromContext(ctx); meta != (auditapp.RequestMeta{}) {
+		entry.RequestID = meta.RequestID
+		entry.IP = meta.IP
+		entry.UserAgent = meta.UserAgent
+	}
+	return a.recorder.Record(ctx, entry)
+}
 
 // baseContext returns the http.Server.BaseContext callback that derives every
 // request context from ctx. Canceling ctx on SIGINT/SIGTERM makes handlers that

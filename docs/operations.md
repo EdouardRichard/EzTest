@@ -136,3 +136,93 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/restore.ps1 `
 | `scripts/restore.ps1` | 安全恢复 + 逐文件 SHA-256/行数校验 + `restore-report.json`；`-VerifyOnly` 复核 |
 | `scripts/test-backup.ps1` | 本机端到端演练（`.tmp/p8-backup`），失败非零退出并清理临时库/目录 |
 | `docs/acceptance/p8/backup-drill.md` | 演练记录（RPO/RTO、校验结果、密钥说明） |
+
+## 证据 GC 与保留
+
+> 设计依据：规格 §10.2/D65。当前章节覆盖**执行证据文件**的保留与清理；导出/附件/报告文件与孤儿文件不在本轮自动删除范围内（见“已知限制”）。
+
+### 配置
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `EZTEST_GC_ENABLED` | `false` | 是否允许**非 dry-run** 清理。`false` 时 `POST /api/admin/gc` 的 `{dryRun:false}` 返回 409 `conflict`；dry-run 始终可用。生产需显式开启。 |
+| `EZTEST_GC_RETENTION_DAYS` | `30` | 未引用证据的保留天数（1–3650）。只有 `created_at` 早于该窗口的未清除证据才可能成为候选。 |
+| `EZTEST_GC_BATCH_KEEP` | `3` | 每个版本最近 N 批（按 `batch_no` 降序）的证据始终受保护（1–50）。 |
+
+### API
+
+`POST /api/admin/gc`（admin-only，需 Bearer token 与管理员角色）：
+
+```json
+{ "dryRun": true }
+```
+
+响应（共享 `data` 信封）：
+
+```json
+{
+  "data": {
+    "dryRun": true,
+    "candidates": 12,
+    "protected": 48,
+    "bytes": 7340032,
+    "deleted": 0,
+    "failed": 0,
+    "skipped": 0,
+    "retentionDays": 30,
+    "batchKeep": 3,
+    "runAt": "2026-10-29T08:00:00Z"
+  }
+}
+```
+
+- `dryRun` 缺省/`true`：只统计候选与受保护数量、候选字节数，**不读文件内容、不删除、不写 purged 元数据**；仍写一条审计（`dry_run=true`）。
+- `dryRun:false`：在 `EZTEST_GC_ENABLED=true` 时逐个删除候选；否则 409。
+- 管理端“设置 → 基础配置”提供 dry-run 预览与二次确认的执行按钮；普通用户无此页面。
+
+### 保护集（绝不删除）
+
+1. 运行中/计划中的批次（`run_batch.status IN ('planned','running')`）的全部证据。
+2. 每个版本最近 `EZTEST_GC_BATCH_KEEP` 批的证据。
+3. 已发布报告（`report.status='published'`）通过 `report_ref`（`ref_kind='evidence'`）引用的证据，以及旧的 `evidence_ref(ref_kind='report')` 引用。
+4. 未关闭问题（`issue.status IN ('open','confirmed')`）通过 `issue_ref` 引用的证据，以及 `evidence_ref(ref_kind='issue')` 引用。
+5. 基线证据：`evidence.kind='visual_baseline'`（视觉断言迁移启用后由任务 25 写入）。
+6. 最近 N 批以外的候选仍会在删除前**再次**执行引用校验（`IsProtected`），避免候选列出后新建立的引用被误删。
+
+### 删除顺序与安全
+
+对每个候选：
+
+1. 引用复核：命中保护集 → 跳过（`skipped`），不删除。
+2. 读取证据文件并复算 SHA-256/大小；与 `evidence.sha256/size_bytes` 不一致或文件缺失 → 跳过/失败，**不删除、不写 purged 标记**。
+3. 写 `evidence.purged_at` / `purged_reason`（保留行与全部元数据）。
+4. 删除文件；删除失败则回滚 purged 标记（`failed`），避免“标记已清理但文件仍在”。
+5. 每次运行写一条审计 `execution.evidence.gc`：只含计数、阈值、dry-run 标志与操作者，不含路径、sha256 或证据内容。
+
+`purged_reason` 形如 `gc: retention=30d batch_keep=3; reason=<受限操作员备注>`。证据行保留，因此历史 case/step 关联、计数和审计仍可追溯；读取已清除证据会得到“文件缺失”错误，不会读取旧字节。
+
+### 手动执行示例
+
+```powershell
+# 1) 只预览（任何环境可用）
+$body = @{ dryRun = $true } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:13333/api/admin/gc `
+  -Headers @{ Authorization = "Bearer $env:EZTEST_ADMIN_TOKEN" } `
+  -ContentType application/json -Body $body
+
+# 2) 显式开启后执行（生产需变更管理审批）
+$env:EZTEST_GC_ENABLED = "true"   # 重启 API 生效
+$body = @{ dryRun = $false; reason = "monthly retention" } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:13333/api/admin/gc `
+  -Headers @{ Authorization = "Bearer $env:EZTEST_ADMIN_TOKEN" } `
+  -ContentType application/json -Body $body
+```
+
+`scripts/backup.ps1` 备份的是**当前仍在磁盘上的**证据；GC 删除不可逆，执行前应确保相应备份/保留策略已覆盖业务要求。
+
+### 已知限制
+
+- 当前实现清理**执行证据文件**（`EZTEST_EVIDENCE_DIR`）；导出、版本附件、报告 Markdown 与“无 DB 行的孤儿文件”尚未纳入自动删除，后续任务可按同一保护集扩展。
+- 定时维护任务（每日一次、leader 持有、默认只 dry-run）由多实例单活任务接线；当前需管理员手动触发。
+- 证据行保留但文件已删；前端/API 读取此类证据会报文件缺失，应在报表/审计中结合 `purged_at` 解释。
+- 本机验收仅覆盖单元测试与 env-gated PostgreSQL 集成测试；生产首次执行前应在目标环境先跑 dry-run，并核对 `candidates`/`protected`。
