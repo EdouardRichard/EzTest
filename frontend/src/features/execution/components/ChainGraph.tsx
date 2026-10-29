@@ -10,7 +10,7 @@ import {
   useState,
 } from "react"
 
-import type { ChainLayoutResult, ChainNode } from "../chain-layout"
+import type { ChainNode, LegacyChainLayoutResult } from "../chain/chain-layout"
 import type { CaseRunStatus } from "../types"
 
 /** Zoom range enforced by the buttons and the wheel handler (spec §9.3). */
@@ -162,8 +162,8 @@ type DragState = {
 }
 
 export type ChainGraphProps = {
-  /** Positioned nodes/edges produced by `layoutChain`. */
-  layout: ChainLayoutResult
+  /** Positioned nodes/edges produced by the temporary `layoutLegacy` adapter. */
+  layout: LegacyChainLayoutResult
   selectedId: string | null
   onSelect: (node: ChainNode) => void
   onToggleRequirement: (requirementId: string) => void
