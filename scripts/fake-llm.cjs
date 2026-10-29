@@ -1599,6 +1599,49 @@ function p6GotoPlan(mode, baseUrl) {
   );
 }
 
+/**
+ * Maps the latest execution.visual_assert tool result of the trailing run onto
+ * the finish decision the visual-assertion prompt rule prescribes. It returns
+ * null when the run has not called the visual tool yet, so every existing P6
+ * scenario keeps its mode-driven finish unchanged.
+ */
+function p6VisualFinish(toolResults) {
+  let text = "";
+  for (let index = toolResults.length - 1; index >= 0; index -= 1) {
+    if (toolResults[index].name !== "execution_visual_assert") continue;
+    text = toolResults[index].text;
+    break;
+  }
+  if (text === "") return null;
+  if (text.includes("missing_visual_baseline")) {
+    return { verdict: "inconclusive", failure_class: "case", reason: "missing_visual_baseline" };
+  }
+  if (text.includes("visual_environment_mismatch")) {
+    return {
+      verdict: "inconclusive",
+      failure_class: "environment",
+      reason: "visual_environment_mismatch",
+    };
+  }
+  const parsed = p6ParseObject(text);
+  if (parsed !== null && parsed.classification === "failed") {
+    return {
+      verdict: "failed",
+      failure_class: "application",
+      reason: typeof parsed.reason === "string" ? parsed.reason : "visual_mismatch",
+    };
+  }
+  if (parsed !== null && parsed.classification === "passed") {
+    return { verdict: "passed", reason: "视觉断言通过" };
+  }
+  return {
+    verdict: "inconclusive",
+    failure_class: "case",
+    reason: (parsed !== null && typeof parsed.reason === "string" && parsed.reason) ||
+      "visual_assertion_inconclusive",
+  };
+}
+
 /** Plans exactly one P6 turn from the mode and the already executed turns. */
 function planP6Turn(mode, run) {
   if (run.step === 0) {
@@ -1691,6 +1734,16 @@ function planP6Turn(mode, run) {
         "P7 执行：执行服务器端 db 断言 " + assertion.assertion_id,
       );
     }
+    // P8 visual assertions (design spec §9.3) are executed by the server-owned
+    // execution.visual_assert tool: the agent sends only the assertion id and
+    // the recorded result/evidence drives the final case verdict below.
+    if (assertion.kind === "visual") {
+      return p6Tool(
+        "execution_visual_assert",
+        { assertionId: assertion.assertion_id },
+        "P8 执行：执行视觉断言 " + assertion.assertion_id,
+      );
+    }
     if (evidenceId === "") return p6Text(P6_EMPTY_CONTEXT_TEXT);
     const failed = mode === "fail";
     return p6Tool(
@@ -1708,6 +1761,44 @@ function planP6Turn(mode, run) {
 
   if (index === 0) {
     if (evidenceId === "") return p6Text(P6_EMPTY_CONTEXT_TEXT);
+    // A visual assertion owns the verdict: a missing baseline is
+    // inconclusive(case), an environment mismatch inconclusive(environment), a
+    // pixel diff over the threshold failed(application), otherwise passed.
+    const visualFinish = p6VisualFinish(run.toolResults);
+    if (visualFinish !== null) {
+      if (visualFinish.verdict === "passed") {
+        return p6Tool(
+          "execution_case_finish",
+          {
+            verdict: "passed",
+            reason: visualFinish.reason,
+            evidence_ids: [evidenceId],
+          },
+          "P8 执行：视觉断言通过",
+        );
+      }
+      if (visualFinish.verdict === "failed") {
+        return p6Tool(
+          "execution_case_finish",
+          {
+            verdict: "failed",
+            failure_class: "application",
+            reason: visualFinish.reason,
+            evidence_ids: [evidenceId],
+          },
+          "P8 执行：视觉断言不一致",
+        );
+      }
+      return p6Tool(
+        "execution_case_finish",
+        {
+          verdict: "inconclusive",
+          failure_class: visualFinish.failure_class,
+          reason: visualFinish.reason,
+        },
+        "P8 执行：视觉断言按分类结束",
+      );
+    }
     if (mode === "fail") {
       return p6Tool(
         "execution_case_finish",
