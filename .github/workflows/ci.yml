@@ -1,7 +1,8 @@
-# Baseline EzTest CI. It mirrors the local scripts/test.ps1 gate: Go unit and
-# integration tests, frontend lint/typecheck/test and the executor test, plus
-# the repository-local static acceptance gate. Playwright E2E and real-LLM
-# acceptance stay out of scope: CI needs no browsers and makes no paid calls.
+# Baseline EzTest CI. It runs the same Go, frontend and executor test gates as
+# the local scripts/test.ps1 gate, plus the repository-local static acceptance
+# gate and the CI structural check. Playwright E2E and real-LLM acceptance stay
+# out of scope. The executor tests launch Chromium, so that job installs the
+# browser explicitly instead of relying on the runner image.
 #
 # scripts/acceptance.ps1 resolves its helper PowerShell host as
 # $PSHOME/pwsh.exe, so the static gate runs on a Windows runner (it needs no
@@ -39,6 +40,9 @@ jobs:
           --health-retries 5
     env:
       EZTEST_TEST_DATABASE_URL: postgres://eztest@127.0.0.1:5433/eztest_test?sslmode=disable
+      # Skip the implicit browser download during `pnpm install`; the dedicated
+      # "Install Playwright Chromium" step below installs exactly what the
+      # executor tests need.
       PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
     steps:
       - name: Checkout
@@ -92,6 +96,10 @@ jobs:
         working-directory: executor
         run: pnpm install --frozen-lockfile
 
+      - name: Install Playwright Chromium
+        working-directory: executor
+        run: pnpm exec playwright install --with-deps chromium
+
       - name: Executor unit tests
         working-directory: executor
         run: pnpm test
@@ -103,6 +111,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: CI structural check
+        run: pwsh -NoProfile -File scripts/check-ci.ps1
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
