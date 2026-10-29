@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: EzTest API
-  version: 0.8.0
+  version: 0.9.0
   description: |
     Hand-maintained OpenAPI document for the EzTest API: the P0 foundation, the
     P1 Agent runtime, the P2 resource context, the P3 version / requirements /
@@ -110,6 +110,21 @@ info:
       bodies, prompts, credentials, database passwords or report filesystem
       paths.
 
+    - P8 experience/hardening endpoints add the exploration-chain read model
+      (`GET /api/versions/{versionId}/exploration-chain`), global search
+      (`GET /api/search`), the todo centre (`GET /api/todos`), the read-only
+      Agent centre (`/api/agent-center/*`), version knowledge
+      (`/api/versions/{id}/knowledge`, `/api/knowledge`), code quality and human
+      fact reviews (`/api/code/repos/{repoId}/quality`,
+      `/api/code/repos/{repoId}/facts/{factId}/reviews`), admin evaluation runs
+      (`/api/quality/eval-runs`) and admin evidence GC (`POST /api/admin/gc`).
+      `GET /api/versions/{id}/code/changes` gains `batchTimeline`. The rate
+      limiter answers 429 `rate_limited` with `Retry-After`; `GET /api/health`
+      projects the effective rate-limit and GC thresholds. P8 adds
+      `knowledge.created`/`knowledge.reviewed` events. Visual assertion
+      endpoints are **not** part of this document yet (the capability is not
+      delivered in this revision).
+
     This document is served publicly at `GET /api/openapi.yaml`; it is the same
     file under `docs/openapi/api.yaml` in the repository.
   license:
@@ -157,6 +172,39 @@ tags:
       and report centres. Report/issue IDs and every execution ID they
       reference are decimal strings; report Markdown bytes are only served by
       the authenticated export download.
+  - name: chain
+    description: |
+      P8 exploration-chain read model: one server-side aggregation of the
+      version's requirements, case nodes, latest execution results, issues and
+      code-impact edges. Read-only and available to every authenticated user.
+  - name: search
+    description: |
+      P8 global search across versions, requirements, cases and issues. Each
+      group is capped; a failing provider degrades to partial results instead
+      of failing the whole request.
+  - name: workspace
+    description: |
+      P8 todo centre: versions waiting for review plus (administrators only)
+      execution case runs waiting for manual takeover or gate escalation.
+  - name: agent-center
+    description: |
+      P8 read-only Agent centre: the 13 logical roles, the profile projection,
+      run observation and the latest evaluation metrics. Profile writes remain
+      under the administrator-only `agents` tag.
+  - name: knowledge
+    description: |
+      P8 version knowledge: draft submission, administrator review, approved
+      global read and prompt-injection budgets. Knowledge bodies are never
+      returned in events; IDs are decimal strings.
+  - name: quality
+    description: |
+      P8 quality platform: administrator-only evaluation runs and metrics
+      (deterministic gate plus the report-only real-LLM track), and the
+      login-readable repository quality aggregate / human fact reviews.
+  - name: admin
+    description: |
+      Administrator-only operations that are not part of a business context,
+      currently the evidence GC dry-run/purge.
   - name: health
 security: []
 paths:
@@ -1230,6 +1278,35 @@ paths:
         - $ref: '#/components/parameters/RequestID'
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
+        - name: actor
+          in: query
+          required: false
+          description: Exact acting user ID (positive integer).
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+        - name: action
+          in: query
+          required: false
+          description: Exact audit action name (for example `user.created`); at most 200 characters.
+          schema:
+            type: string
+            maxLength: 200
+        - name: from
+          in: query
+          required: false
+          description: Inclusive lower bound on `created_at` (RFC 3339).
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: false
+          description: Inclusive upper bound on `created_at` (RFC 3339); must not be before `from`.
+          schema:
+            type: string
+            format: date-time
       responses:
         '200':
           description: One page of audit entries.
@@ -4734,13 +4811,17 @@ paths:
   /api/versions/{versionId}/code/changes:
     get:
       tags: [code]
-      summary: Read a version-scoped change preview
+      summary: Read a version-scoped change preview and batch timeline
       description: |
         Every authenticated user. Resolves the version's repository and baseline
         commit, computes the live diff to `head` (default: the repository fixed
-        branch tip) and returns the shared `ChangeList` inside the normal
-        `{"data":...}` envelope. The read never writes a change set: when no
-        persisted change set exists for the pair, `changeSetId` is null.
+        branch tip) and returns the shared `ChangeList` fields plus the additive
+        P8 `batchTimeline` inside the normal `{"data":...}` envelope. The read
+        never writes a change set: when no persisted change set exists for the
+        pair, `changeSetId` is null. `batchTimeline` is the persisted
+        `version_change` snapshot per batch (provisional/unavailable entries are
+        marked); it contains summary counters and changed-entity names only, no
+        code bodies or prompts.
       operationId: getVersionCodeChanges
       security:
         - bearerAuth: []
@@ -4755,11 +4836,11 @@ paths:
             type: string
       responses:
         '200':
-          description: The version change preview.
+          description: The version change preview and batch timeline.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ChangeListEnvelope'
+                $ref: '#/components/schemas/VersionChangeTimelineEnvelope'
         '401':
           $ref: '#/components/responses/Unauthenticated'
         '404':
@@ -7683,7 +7764,8 @@ paths:
         Pings the database with a 2 second timeout. `llm_configured` is true
         only when a default LLM configuration exists and its key can be
         decrypted. Database failure returns 503 with `status: unavailable` and
-        `db: down`.
+        `db: down`. P8 projects the effective `rate_limit` and `gc`
+        thresholds; no path, credential or store location is returned.
       operationId: readiness
       security: []
       responses:
@@ -7715,6 +7797,785 @@ paths:
                 type: string
         '404':
           $ref: '#/components/responses/NotFound'
+  # --- P8 experience / hardening -------------------------------------------
+  /api/versions/{versionId}/exploration-chain:
+    get:
+      tags: [chain]
+      summary: Read the version exploration chain
+      description: |
+        P8 read model for the exploration-chain canvas: resolves the selected
+        batch (latest when omitted), aggregates requirements, case nodes, the
+        latest execution result of each case, issues and code-impact edges, and
+        returns the pre-truncation counts plus per-layer truncation flags. The
+        response is never cached (`Cache-Control: no-store`). Every
+        authenticated user may read it. A malformed query is 400
+        `invalid_argument` with `details.field`; an unknown version or a batch
+        that does not belong to it is 404. Node/edge IDs are
+        `<kind>:<domainId>` strings; case/issue/result IDs are decimal strings.
+      operationId: getExplorationChain
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/CodeVersionId'
+        - name: batchId
+          in: query
+          required: false
+          description: Positive decimal batch id, or `all` for every batch. Omitted selects the latest batch.
+          schema:
+            type: string
+            pattern: '^([0-9]{1,19}|all)$'
+        - name: requirementId
+          in: query
+          required: false
+          description: Restrict the graph to one requirement root (positive decimal id).
+          schema:
+            type: string
+            pattern: '^[0-9]{1,19}$'
+        - name: resultStatus
+          in: query
+          required: false
+          description: Keep results with this status.
+          schema:
+            type: string
+            enum: [passed, failed, blocked, inconclusive, skipped, interrupted]
+        - name: issueStatus
+          in: query
+          required: false
+          description: Keep issues with this status.
+          schema:
+            type: string
+            enum: [open, confirmed, dismissed]
+        - name: issueSeverity
+          in: query
+          required: false
+          description: Keep issues with this severity.
+          schema:
+            type: string
+            enum: [blocker, major, minor, info]
+        - name: q
+          in: query
+          required: false
+          description: Case-insensitive title search; at most 100 characters.
+          schema:
+            type: string
+            maxLength: 100
+        - name: abnormalOnly
+          in: query
+          required: false
+          description: Keep only failed/blocked/inconclusive results and open issues.
+          schema:
+            type: boolean
+            default: false
+        - name: includeSupplement
+          in: query
+          required: false
+          description: Include AI-supplement case nodes (default true).
+          schema:
+            type: boolean
+            default: true
+        - name: revalidationOnly
+          in: query
+          required: false
+          description: Keep only cases whose status is `needs_revalidation`.
+          schema:
+            type: boolean
+            default: false
+        - name: limit
+          in: query
+          required: false
+          description: Total node budget (roots-first allocation), 50-2000.
+          schema:
+            type: integer
+            minimum: 50
+            maximum: 2000
+            default: 300
+        - name: requirementLimit
+          in: query
+          required: false
+          description: Requirement-root budget, 1-500.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 100
+      responses:
+        '200':
+          description: The exploration-chain read model.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExplorationChainEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/search:
+    get:
+      tags: [search]
+      summary: Global search across versions, requirements, cases and issues
+      description: |
+        P8 read-only aggregation. `q` is required (1-100 characters after
+        trimming); `types` is an optional comma-separated subset of
+        `version,requirement,case,issue`; `limit` is the per-type cap (1-20,
+        default 5). A failing provider returns its group as empty and sets
+        `degraded=true` instead of failing the whole request. Multi-word input
+        is matched as a single ILIKE pattern; no cross-context table access is
+        performed by the HTTP layer.
+      operationId: globalSearch
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - name: q
+          in: query
+          required: true
+          description: Keyword, 1-100 characters after trimming.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 100
+        - name: types
+          in: query
+          required: false
+          description: Comma-separated result types; omitted means all four.
+          schema:
+            type: string
+            example: version,requirement
+        - name: limit
+          in: query
+          required: false
+          description: Per-type result cap, 1-20.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 20
+            default: 5
+      responses:
+        '200':
+          description: Search groups (possibly partial/degraded).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchSnapshotEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/todos:
+    get:
+      tags: [workspace]
+      summary: Read the todo centre
+      description: |
+        P8 read-only aggregation. Every authenticated user receives the
+        `review` group (versions in `reviewing`). Administrators additionally
+        receive `takeover` and `gate` items; a regular user never sees them and
+        the execution provider is not queried. Items are sorted review →
+        takeover → gate, then newest first. Counts are pre-limit totals; the
+        item list is capped by `limit`.
+      operationId: listTodos
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - name: limit
+          in: query
+          required: false
+          description: Maximum returned items (counts are unaffected), 1-200.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        '200':
+          description: The todo-centre snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TodoSnapshotEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/agent-center/catalog:
+    get:
+      tags: [agent-center]
+      summary: List the 13 logical Agent roles
+      description: |
+        Read-only catalogue available to every authenticated user. Each role
+        projects its phase, mode (`agent`/`deterministic`/`manual_review`),
+        profile binding (null for the report and knowledge roles), and run
+        statistics. No system prompt, credential or transcript crosses this
+        boundary.
+      operationId: getAgentCenterCatalog
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+      responses:
+        '200':
+          description: The role catalogue plus the latest evaluation summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentCenterCatalogEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/agent-center/sessions:
+    get:
+      tags: [agent-center]
+      summary: Observe Agent runs (read-only)
+      description: |
+        Read-only run observation for every authenticated user. `role` filters
+        by one of the 13 catalogue roles, `status` by the derived run status
+        (`idle`, `running`, `done`, `failed`, `aborted`, `interrupted`);
+        unknown values are 422 `invalid_argument` with `details.field`. The
+        response carries no transcript/prompt/message content.
+      operationId: listAgentCenterSessions
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - name: role
+          in: query
+          required: false
+          description: Catalogue role key (for example `case-design`).
+          schema:
+            type: string
+            maxLength: 64
+        - name: status
+          in: query
+          required: false
+          description: Derived run status.
+          schema:
+            type: string
+            enum: [idle, running, done, failed, aborted, interrupted]
+        - name: limit
+          in: query
+          required: false
+          description: Maximum sessions, 1-100.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: The observed sessions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentCenterSessionPageEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/agent-center/quality:
+    get:
+      tags: [agent-center]
+      summary: Read the latest evaluation metrics
+      description: |
+        Read-only projection of the newest evaluation run, or `{"latest":null}`
+        when no run exists. No metric is invented when data is missing.
+      operationId: getAgentCenterQuality
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+      responses:
+        '200':
+          description: The latest evaluation summary (nullable).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentCenterQualityEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}/knowledge:
+    get:
+      tags: [knowledge]
+      summary: List a version's knowledge entries
+      description: |
+        Cursor page ordered by id ascending. A regular user sees approved
+        entries plus their own drafts/rejections; an administrator sees every
+        status. `status`/`kind` are optional exact filters. The response uses
+        the cursor page envelope (`data`, `next_cursor`, `has_more`).
+      operationId: listVersionKnowledge
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - name: status
+          in: query
+          required: false
+          description: Exact review status filter.
+          schema:
+            type: string
+            enum: [draft, approved, rejected]
+        - name: kind
+          in: query
+          required: false
+          description: Exact knowledge kind filter.
+          schema:
+            type: string
+            enum: [pattern, pitfall, decision, case_idea]
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of knowledge entries.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgeList'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [knowledge]
+      summary: Create a knowledge draft
+      description: |
+        Any authenticated user may submit a draft for a version. `kind`,
+        `title`, `body` and `confidence` are required; title ≤300 characters,
+        body ≤16 KiB, tags ≤20 (each ≤50 characters), sourceRefs ≤20 with
+        `kind` in `requirement,case,issue,evidence` and decimal-string `id`.
+        A successful create returns 201 and publishes `knowledge.created`
+        with IDs/kind/status only (never the body or title).
+      operationId: createVersionKnowledge
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateKnowledgeRequest'
+      responses:
+        '201':
+          description: The created draft.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgeEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/VersionInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}/knowledge/{kid}:
+    patch:
+      tags: [knowledge]
+      summary: Edit a draft knowledge entry
+      description: |
+        Replaces the supplied fields on a draft. `revision` is required and is
+        the optimistic-concurrency token; a stale revision is 409
+        `knowledge_revision_conflict`, and a non-draft entry is 409
+        `knowledge_state_conflict`. Only the creator or an administrator may
+        edit (403 `knowledge_forbidden`).
+      operationId: updateVersionKnowledge
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - name: kid
+          in: path
+          required: true
+          description: Knowledge entry ID (decimal string).
+          schema:
+            type: string
+            pattern: '^[0-9]{1,19}$'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateKnowledgeRequest'
+      responses:
+        '200':
+          description: The updated draft.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgeEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/VersionConflict'
+        '422':
+          $ref: '#/components/responses/VersionInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}/knowledge/{kid}/review:
+    post:
+      tags: [knowledge]
+      summary: Approve or reject a knowledge draft (admin only)
+      description: |
+        Administrator only. `status` is the target state
+        (`approved`/`rejected`); a rejection requires a non-empty `reason`
+        (≤2000 characters). `revision` is required. On success the entry is
+        returned and `knowledge.reviewed` is published with IDs/status only.
+      operationId: reviewVersionKnowledge
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/VersionPathId'
+        - name: kid
+          in: path
+          required: true
+          description: Knowledge entry ID (decimal string).
+          schema:
+            type: string
+            pattern: '^[0-9]{1,19}$'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReviewKnowledgeRequest'
+      responses:
+        '200':
+          description: The reviewed entry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgeEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/VersionConflict'
+        '422':
+          $ref: '#/components/responses/VersionInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/knowledge:
+    get:
+      tags: [knowledge]
+      summary: List approved knowledge across versions
+      description: |
+        Defaults to `status=approved` and is readable by every authenticated
+        user. A non-admin requesting `draft`/`rejected` is 403; administrators
+        use those filters as the review queue. `versionId` optionally narrows
+        to one version. Cursor page ordered by id ascending.
+      operationId: listGlobalKnowledge
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - name: status
+          in: query
+          required: false
+          description: Review status; defaults to `approved`. Non-approved values require admin.
+          schema:
+            type: string
+            enum: [draft, approved, rejected]
+            default: approved
+        - name: kind
+          in: query
+          required: false
+          description: Exact knowledge kind filter.
+          schema:
+            type: string
+            enum: [pattern, pitfall, decision, case_idea]
+        - name: versionId
+          in: query
+          required: false
+          description: Optional positive decimal version filter.
+          schema:
+            type: string
+            pattern: '^[0-9]{1,19}$'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of approved knowledge.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgeList'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/code/repos/{repoId}/quality:
+    get:
+      tags: [quality]
+      summary: Read a repository's quality aggregate
+      description: |
+        Login-readable P8 aggregate: evidence pass rate, invalid facts,
+        confidence distribution, human review counters, the newest evaluation's
+        impact precision/recall and the cache hit rate. Missing sources stay
+        null/zero and are flagged; no metric is fabricated. A missing repository
+        is 422 from the repository catalogue.
+      operationId: getRepoQuality
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/CodeRepoId'
+      responses:
+        '200':
+          description: The repository quality aggregate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RepoQualityEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/CodeInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/code/repos/{repoId}/facts/{factId}/reviews:
+    post:
+      tags: [quality]
+      summary: Record a human verdict on a code fact
+      description: |
+        Any authenticated user may record `correct`/`incorrect` for one fact of
+        the repository, with an optional reason. The verdict is upserted per
+        (repo, fact, commit); an unknown/foreign fact is 404. The write is
+        audited with summary only (no code content).
+      operationId: createFactReview
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/CodeRepoId'
+        - name: factId
+          in: path
+          required: true
+          description: Code entity/fact ID (decimal string).
+          schema:
+            type: string
+            pattern: '^[0-9]{1,19}$'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateFactReviewRequest'
+      responses:
+        '201':
+          description: The recorded/updated review.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FactReviewEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/CodeInvalid'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/quality/eval-runs:
+    get:
+      tags: [quality]
+      summary: List evaluation runs (admin only)
+      operationId: listEvaluationRuns
+      description: |
+        Administrator only. Returns the most recent runs ordered newest first.
+        `limit` is 1-50 (default 20); there is no cursor page on this endpoint.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - name: limit
+          in: query
+          required: false
+          description: Maximum runs, 1-50.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 20
+      responses:
+        '200':
+          description: Evaluation runs.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvaluationRunListEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [quality]
+      summary: Record a terminal evaluation run (admin only)
+      description: |
+        Administrator only; the evaluation runner posts the observed counts and
+        the committed baseline. The server derives the six metrics, applies the
+        deterministic thresholds/baseline regression rule, and returns 201. A
+        sample is required unless `status=error`; the caller cannot claim a
+        pass by status alone. IDs are decimal strings; metric values are JSON
+        numbers. Request body ≤1 MiB, unknown fields are rejected.
+      operationId: recordEvaluationRun
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecordEvaluationRunRequest'
+      responses:
+        '201':
+          description: The recorded run with derived metrics.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvaluationRunEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/quality/eval-runs/{id}:
+    get:
+      tags: [quality]
+      summary: Read one evaluation run (admin only)
+      operationId: getEvaluationRun
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - name: id
+          in: path
+          required: true
+          description: Evaluation run ID (decimal string).
+          schema:
+            type: string
+            pattern: '^[0-9]{1,19}$'
+      responses:
+        '200':
+          description: The evaluation run.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvaluationRunEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/admin/gc:
+    post:
+      tags: [admin]
+      summary: Preview or execute evidence GC (admin only)
+      description: |
+        Administrator only. The request defaults to `dryRun=true`; an explicit
+        `dryRun:false` is 409 `conflict` unless `EZTEST_GC_ENABLED=true`. GC
+        only examines execution evidence files under `EZTEST_EVIDENCE_DIR`:
+        the most recent `EZTEST_GC_BATCH_KEEP` batches per version, planned/
+        running batches, open/confirmed issue references and visual baseline
+        evidence are protected; a candidate must also pass a delete-time
+        reference/hash check. Dry-run does not read file contents or write
+        purge metadata. Each run writes one summary-only audit entry. The
+        report carries counts/bytes, not paths or evidence content.
+      operationId: runEvidenceGC
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RequestID'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EvidenceGCRequest'
+      responses:
+        '200':
+          description: The GC report (dry-run or executed).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvidenceGCReportEnvelope'
+        '400':
+          $ref: '#/components/responses/InvalidArgument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
 components:
   securitySchemes:
     bearerAuth:
@@ -8528,7 +9389,11 @@ components:
           schema:
             $ref: '#/components/schemas/ErrorEnvelope'
     TooManyRequests:
-      description: Login lockout or upstream LLM rate limiting (`rate_limited` / `llm_rate_limited`).
+      description: |
+        Rate limited (`rate_limited`). P8 returns this for the per-user/IP
+        token bucket and for the per-user SSE concurrency cap, with
+        `Retry-After` and `details{scope,reason,limit,retry_after_seconds}`.
+        Login lockout and upstream LLM rate limiting also use this status.
       content:
         application/json:
           schema:
@@ -8975,7 +9840,12 @@ components:
                 from CodeErrorReason, plus `field`/`message` when applicable.
                 P5 mindmap errors carry `reason` from MindmapErrorReason. P6
                 execution errors carry `reason` from ExecutionErrorReason, plus
-                `field`/`message` when applicable.
+                `field`/`message` when applicable. P8 rate-limit errors carry
+                `scope`/`reason`/`limit`/`retry_after_seconds`; knowledge errors
+                carry `reason` such as `knowledge_forbidden`,
+                `knowledge_state_conflict`, `knowledge_revision_conflict` or
+                `invalid_knowledge_*`; chain/search/todos validation errors carry
+                `field` (and `min`/`max` where applicable).
     User:
       type: object
       required: [id, username, role, status]
@@ -10121,7 +10991,7 @@ components:
       properties:
         data:
           type: object
-          required: [status, version, commit, db, llm_configured]
+          required: [status, version, commit, db, llm_configured, rate_limit, gc]
           properties:
             status:
               type: string
@@ -10135,6 +11005,28 @@ components:
               enum: [ok, down]
             llm_configured:
               type: boolean
+            rate_limit:
+              type: object
+              description: Effective, non-secret P8 rate-limit thresholds.
+              required: [rps, burst, sse_max]
+              properties:
+                rps:
+                  type: integer
+                burst:
+                  type: integer
+                sse_max:
+                  type: integer
+            gc:
+              type: object
+              description: Effective, non-secret P8 evidence-GC configuration.
+              required: [enabled, retention_days, batch_keep]
+              properties:
+                enabled:
+                  type: boolean
+                retention_days:
+                  type: integer
+                batch_keep:
+                  type: integer
     # --- P2 resource context ---------------------------------------------
     System:
       type: object
@@ -11305,6 +12197,11 @@ components:
           type: string
           pattern: '^[0-9]{1,19}$'
           nullable: true
+        review:
+          nullable: true
+          description: P8 human verdict on this fact at this commit (null when unreviewed).
+          allOf:
+            - $ref: '#/components/schemas/FactReview'
         createdAt:
           type: string
           format: date-time
@@ -13351,7 +14248,10 @@ components:
         status, candidate/issue counts and degraded). P7 detail ids are decimal
         strings (D29); evidence ids go to `refs.evidence` and case node ids to
         `refs.case`. P7 events never carry prompt text, evidence bodies, SQL
-        result sets, credentials, report Markdown or filesystem paths.
+        result sets, credentials, report Markdown or filesystem paths. P8 adds
+        `knowledge.created` (draft id, kind, status) and `knowledge.reviewed`
+        (entry id, status, reviewer) to the same channel; both are IDs/status
+        only and never carry knowledge title/body.
       enum:
         - version.created
         - version.updated
@@ -13407,6 +14307,8 @@ components:
         - report.stale
         - analysis.started
         - analysis.finished
+        - knowledge.created
+        - knowledge.reviewed
     VersionEvent:
       type: object
       description: |
@@ -15780,10 +16682,11 @@ components:
     VersionChangeKind:
       type: string
       description: |
-        One derived kind of the version change feed (spec §7.2, D50). The four
-        implemented kinds are computed read-only from requirements, finished
-        batches, published reports and issues; `code_changed` is reserved for
-        P8 (`version_change` table) and is not emitted in P7.
+        One item kind of the version change feed (spec §7.2). The P7 feed is
+        derived read-only from requirements, finished batches, published reports
+        and issues. P8 persists `version_change` batch snapshots and emits
+        `code_changed` (the `/code/changes` `batchTimeline` is the richer
+        snapshot; the derived feed also carries the kind).
       enum:
         - requirement_added
         - batch_finished
@@ -17082,3 +17985,1145 @@ components:
       properties:
         data:
           $ref: '#/components/schemas/DbTargetTestResult'
+    # --- P8 chain / search / todos ----------------------------------------
+    ExplorationChainEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/ExplorationChain'
+    ExplorationChain:
+      type: object
+      description: |
+        The server-aggregated exploration-chain read model. Counts are
+        pre-truncation; `truncated` says which layer the node budget cut.
+      required: [versionId, batch, nodes, edges, counts, truncated, generatedAt]
+      properties:
+        versionId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        batch:
+          $ref: '#/components/schemas/ExplorationChainBatch'
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExplorationChainNode'
+        edges:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExplorationChainEdge'
+        counts:
+          $ref: '#/components/schemas/ExplorationChainCounts'
+        truncated:
+          $ref: '#/components/schemas/ExplorationChainTruncated'
+        generatedAt:
+          type: string
+          format: date-time
+    ExplorationChainBatch:
+      type: object
+      description: The resolved batch; `id` is empty when the version has no batch yet.
+      required: [id, batchNo, kind, status]
+      properties:
+        id:
+          type: string
+          description: Decimal batch id, or empty when no batch exists yet.
+        batchNo:
+          type: integer
+          minimum: 0
+        kind:
+          type: string
+          description: Batch kind (`baseline`, `incremental`, `supplement`, or empty when no batch).
+        status:
+          type: string
+          description: Batch status, or empty when no batch.
+    ExplorationChainNode:
+      type: object
+      required: [id, kind, title, status]
+      properties:
+        id:
+          type: string
+          description: '<kind>:<domainId>; kind is requirement/case/result/issue.'
+        kind:
+          type: string
+          enum: [requirement, case, result, issue]
+        title:
+          type: string
+        status:
+          type: string
+        priority:
+          type: string
+          nullable: true
+        uncovered:
+          type: boolean
+          nullable: true
+        caseCount:
+          type: integer
+          nullable: true
+        executedCount:
+          type: integer
+          nullable: true
+        failedCount:
+          type: integer
+          nullable: true
+        openQuestionCount:
+          type: integer
+          nullable: true
+        source:
+          type: string
+          nullable: true
+        revalidation:
+          type: boolean
+          nullable: true
+        requirementIds:
+          type: array
+          nullable: true
+          items:
+            type: string
+        stepCount:
+          type: integer
+          nullable: true
+        assertionCount:
+          type: integer
+          nullable: true
+        impacted:
+          type: boolean
+          nullable: true
+        impactReason:
+          type: string
+          nullable: true
+        caseRunId:
+          type: string
+          nullable: true
+        caseNodeId:
+          type: string
+          nullable: true
+        attempt:
+          type: integer
+          nullable: true
+        durationMs:
+          type: integer
+          format: int64
+          nullable: true
+        failureClass:
+          type: string
+          nullable: true
+        evidenceCount:
+          type: integer
+          nullable: true
+        batchId:
+          type: string
+          nullable: true
+        summary:
+          type: string
+          nullable: true
+        severity:
+          type: string
+          nullable: true
+        category:
+          type: string
+          nullable: true
+        confidence:
+          type: string
+          nullable: true
+        codeRefCount:
+          type: integer
+          nullable: true
+    ExplorationChainEdge:
+      type: object
+      required: [id, source, target, kind]
+      properties:
+        id:
+          type: string
+        source:
+          type: string
+        target:
+          type: string
+        kind:
+          type: string
+          enum: [requirement_case, case_result, result_issue, case_issue, impact_case]
+    ExplorationChainCounts:
+      type: object
+      description: Real filtered totals before the node budget truncates any layer.
+      required:
+        - requirements
+        - cases
+        - results
+        - issues
+        - byResultStatus
+        - byIssueSeverity
+        - uncoveredRequirements
+        - revalidationCases
+        - supplementCases
+      properties:
+        requirements:
+          type: integer
+        cases:
+          type: integer
+        results:
+          type: integer
+        issues:
+          type: integer
+        byResultStatus:
+          type: object
+          additionalProperties:
+            type: integer
+        byIssueSeverity:
+          type: object
+          additionalProperties:
+            type: integer
+        uncoveredRequirements:
+          type: integer
+        revalidationCases:
+          type: integer
+        supplementCases:
+          type: integer
+    ExplorationChainTruncated:
+      type: object
+      required: [requirements, cases, results, issues]
+      properties:
+        requirements:
+          type: boolean
+        cases:
+          type: boolean
+        results:
+          type: boolean
+        issues:
+          type: boolean
+    SearchSnapshotEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/SearchSnapshot'
+    SearchSnapshot:
+      type: object
+      required: [groups, total, truncated]
+      properties:
+        groups:
+          type: array
+          items:
+            $ref: '#/components/schemas/SearchGroup'
+        total:
+          type: integer
+          description: Sum of returned items across groups.
+        truncated:
+          type: boolean
+          description: At least one group hit its per-type cap.
+        degraded:
+          type: boolean
+          description: At least one provider failed; healthy groups are still returned.
+    SearchGroup:
+      type: object
+      required: [type, items]
+      properties:
+        type:
+          type: string
+          enum: [version, requirement, case, issue]
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SearchItem'
+    SearchItem:
+      type: object
+      required: [id, title, subtitle, versionId, versionName, status, url]
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        subtitle:
+          type: string
+        versionId:
+          type: string
+        versionName:
+          type: string
+        status:
+          type: string
+        url:
+          type: string
+          description: Frontend deep link into the owning version tab.
+    TodoSnapshotEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/TodoSnapshot'
+    TodoSnapshot:
+      type: object
+      required: [items, counts]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/TodoItem'
+        counts:
+          $ref: '#/components/schemas/TodoCounts'
+    TodoItem:
+      type: object
+      required: [kind, title, versionId, versionName, severity, createdAt, url]
+      properties:
+        kind:
+          type: string
+          enum: [review, takeover, gate]
+        title:
+          type: string
+        versionId:
+          type: string
+        versionName:
+          type: string
+        severity:
+          type: string
+          enum: [info, warning, major]
+        createdAt:
+          type: string
+          format: date-time
+        url:
+          type: string
+          description: Deep link, for example `/versions/{id}?tab=mindmap`.
+    TodoCounts:
+      type: object
+      description: Pre-limit counts per group.
+      required: [review, takeover, gate]
+      properties:
+        review:
+          type: integer
+        takeover:
+          type: integer
+        gate:
+          type: integer
+    # --- P8 Agent centre ---------------------------------------------------
+    AgentCenterCatalogEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/AgentCenterCatalog'
+    AgentCenterCatalog:
+      type: object
+      required: [roles]
+      properties:
+        roles:
+          type: array
+          items:
+            $ref: '#/components/schemas/AgentCenterRole'
+        latest_eval:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/AgentCenterEval'
+    AgentCenterRole:
+      type: object
+      required:
+        - order
+        - role
+        - name
+        - phase
+        - mode
+        - note
+        - profile_key
+        - profile_id
+        - enabled
+        - model
+        - prompt_version
+        - allowed_tools
+        - stats
+      properties:
+        order:
+          type: integer
+        role:
+          type: string
+        name:
+          type: string
+        phase:
+          type: string
+        mode:
+          type: string
+          enum: [agent, deterministic, manual_review]
+        note:
+          type: string
+        profile_key:
+          type: string
+          nullable: true
+        profile_id:
+          type: integer
+          format: int64
+          nullable: true
+        enabled:
+          type: boolean
+        model:
+          type: string
+        prompt_version:
+          type: string
+          nullable: true
+        allowed_tools:
+          type: array
+          items:
+            type: string
+        stats:
+          $ref: '#/components/schemas/AgentCenterRoleStats'
+    AgentCenterRoleStats:
+      type: object
+      required: [run_count, succeeded_count, failed_count, success_rate]
+      properties:
+        run_count:
+          type: integer
+          format: int64
+        succeeded_count:
+          type: integer
+          format: int64
+        failed_count:
+          type: integer
+          format: int64
+        success_rate:
+          type: number
+          description: succeeded/(succeeded+failed); 0 when no terminal run exists.
+    AgentCenterEval:
+      type: object
+      required: [run_id, passed, metrics, thresholds, created_at]
+      properties:
+        run_id:
+          type: string
+          description: Decimal-string evaluation run id (D29).
+        passed:
+          type: boolean
+        metrics:
+          type: object
+          additionalProperties:
+            type: number
+        thresholds:
+          type: object
+          additionalProperties:
+            type: number
+        created_at:
+          type: string
+          format: date-time
+    AgentCenterQualityEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/AgentCenterQuality'
+    AgentCenterQuality:
+      type: object
+      required: [latest]
+      properties:
+        latest:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/AgentCenterEval'
+    AgentCenterSessionPageEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/AgentCenterSessionPage'
+    AgentCenterSessionPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AgentCenterSession'
+    AgentCenterSession:
+      type: object
+      description: Read-only session observation; carries no transcript or prompt.
+      required: [id, role, title, status, running, created_at, updated_at, last_activity_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        role:
+          type: string
+        title:
+          type: string
+        status:
+          type: string
+          enum: [idle, running, done, failed, aborted, interrupted]
+        running:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        last_activity_at:
+          type: string
+          format: date-time
+    # --- P8 knowledge ------------------------------------------------------
+    KnowledgeEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/KnowledgeEntry'
+    KnowledgeList:
+      type: object
+      description: Cursor page of knowledge entries.
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/KnowledgeEntry'
+        next_cursor:
+          type: string
+          description: Opaque cursor; empty when `has_more` is false.
+        has_more:
+          type: boolean
+    KnowledgeEntry:
+      type: object
+      required:
+        - id
+        - versionId
+        - kind
+        - title
+        - body
+        - tags
+        - sourceRefs
+        - status
+        - confidence
+        - createdBy
+        - reviewedBy
+        - reviewNote
+        - revision
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        versionId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        versionName:
+          type: string
+        kind:
+          type: string
+          enum: [pattern, pitfall, decision, case_idea]
+        title:
+          type: string
+          maxLength: 300
+        body:
+          type: string
+          maxLength: 16384
+        tags:
+          type: array
+          maxItems: 20
+          items:
+            type: string
+            maxLength: 50
+        sourceRefs:
+          type: array
+          maxItems: 20
+          items:
+            $ref: '#/components/schemas/KnowledgeSourceRef'
+        status:
+          type: string
+          enum: [draft, approved, rejected]
+        confidence:
+          type: string
+          enum: [high, medium, low]
+        createdBy:
+          type: integer
+          format: int64
+        reviewedBy:
+          type: integer
+          format: int64
+          nullable: true
+        reviewNote:
+          type: string
+          maxLength: 2000
+        revision:
+          type: integer
+          minimum: 1
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    KnowledgeSourceRef:
+      type: object
+      required: [kind, id]
+      properties:
+        kind:
+          type: string
+          enum: [requirement, case, issue, evidence]
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+    CreateKnowledgeRequest:
+      type: object
+      additionalProperties: false
+      required: [kind, title, body]
+      properties:
+        kind:
+          type: string
+          enum: [pattern, pitfall, decision, case_idea]
+        title:
+          type: string
+          minLength: 1
+          maxLength: 300
+        body:
+          type: string
+          minLength: 1
+          maxLength: 16384
+        confidence:
+          type: string
+          enum: [high, medium, low]
+          description: Optional; defaults to `medium`.
+        tags:
+          type: array
+          maxItems: 20
+          items:
+            type: string
+            minLength: 1
+            maxLength: 50
+        sourceRefs:
+          type: array
+          maxItems: 20
+          items:
+            $ref: '#/components/schemas/KnowledgeSourceRef'
+    UpdateKnowledgeRequest:
+      type: object
+      additionalProperties: false
+      required: [revision]
+      properties:
+        revision:
+          type: integer
+          minimum: 1
+        kind:
+          type: string
+          enum: [pattern, pitfall, decision, case_idea]
+        title:
+          type: string
+          minLength: 1
+          maxLength: 300
+        body:
+          type: string
+          minLength: 1
+          maxLength: 16384
+        confidence:
+          type: string
+          enum: [high, medium, low]
+        tags:
+          type: array
+          maxItems: 20
+          items:
+            type: string
+            minLength: 1
+            maxLength: 50
+        sourceRefs:
+          type: array
+          maxItems: 20
+          items:
+            $ref: '#/components/schemas/KnowledgeSourceRef'
+    ReviewKnowledgeRequest:
+      type: object
+      additionalProperties: false
+      required: [revision, status]
+      properties:
+        revision:
+          type: integer
+          minimum: 1
+        status:
+          type: string
+          enum: [approved, rejected]
+        reason:
+          type: string
+          maxLength: 2000
+          description: Required when `status=rejected`.
+    # --- P8 quality / fact review -----------------------------------------
+    RepoQualityEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/RepoQuality'
+    RepoQuality:
+      type: object
+      required:
+        - repoId
+        - generatedAt
+        - evidence
+        - invalidFacts
+        - confidence
+        - reviews
+        - impact
+        - cacheHitRate
+        - analysis
+        - indexedCommit
+      properties:
+        repoId:
+          type: integer
+          format: int64
+        generatedAt:
+          type: string
+          format: date-time
+        evidence:
+          $ref: '#/components/schemas/RepoQualityEvidence'
+        invalidFacts:
+          type: integer
+        confidence:
+          $ref: '#/components/schemas/ConfidenceDistribution'
+        reviews:
+          $ref: '#/components/schemas/FactReviewCounts'
+        impact:
+          $ref: '#/components/schemas/ImpactQuality'
+        cacheHitRate:
+          type: number
+          nullable: true
+        analysis:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/QualityAnalysisRef'
+        indexedCommit:
+          type: string
+    RepoQualityEvidence:
+      type: object
+      required: [checks, failures, passRate]
+      properties:
+        checks:
+          type: integer
+        failures:
+          type: integer
+        passRate:
+          type: number
+          nullable: true
+          description: Null when no evidence was checked.
+    ConfidenceDistribution:
+      type: object
+      required: [high, medium, low, total]
+      properties:
+        high:
+          type: integer
+        medium:
+          type: integer
+        low:
+          type: integer
+        total:
+          type: integer
+    FactReviewCounts:
+      type: object
+      required: [total, correct, incorrect]
+      properties:
+        total:
+          type: integer
+        correct:
+          type: integer
+        incorrect:
+          type: integer
+    ImpactQuality:
+      type: object
+      required: [precision, recall, available, evalRunId, evaluatedAt]
+      properties:
+        precision:
+          type: number
+          nullable: true
+        recall:
+          type: number
+          nullable: true
+        available:
+          type: boolean
+        reason:
+          type: string
+          description: Degraded source when unavailable (`no_eval_run`, `no_impact_metric`, `eval_store_unavailable`).
+        evalRunId:
+          type: string
+          nullable: true
+        evaluatedAt:
+          type: string
+          format: date-time
+          nullable: true
+    QualityAnalysisRef:
+      type: object
+      required: [id, headCommit, analyzedAt]
+      properties:
+        id:
+          type: string
+        headCommit:
+          type: string
+        analyzedAt:
+          type: string
+          format: date-time
+    FactReviewEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/FactReview'
+    FactReview:
+      type: object
+      required: [id, factId, commit, verdict, reason, createdBy, createdAt]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        factId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        commit:
+          type: string
+          pattern: '^[a-f0-9]{40}$'
+        verdict:
+          type: string
+          enum: [correct, incorrect]
+        reason:
+          type: string
+        createdBy:
+          type: integer
+          format: int64
+        createdAt:
+          type: string
+          format: date-time
+    CreateFactReviewRequest:
+      type: object
+      additionalProperties: false
+      required: [verdict]
+      properties:
+        verdict:
+          type: string
+          enum: [correct, incorrect]
+        reason:
+          type: string
+          maxLength: 2000
+    # --- P8 evaluation -----------------------------------------------------
+    EvaluationRunEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/EvaluationRun'
+    EvaluationRunListEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/EvaluationRun'
+    EvaluationRun:
+      type: object
+      required: [id, mode, corpusVersion, model, status, summary, metrics, startedAt, finishedAt]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        mode:
+          type: string
+          enum: [deterministic, real_llm]
+        corpusVersion:
+          type: string
+          maxLength: 64
+        model:
+          type: string
+          maxLength: 128
+        status:
+          type: string
+          enum: [running, passed, failed, error]
+        summary:
+          type: object
+          additionalProperties: true
+        metrics:
+          type: array
+          items:
+            $ref: '#/components/schemas/EvaluationMetric'
+        startedAt:
+          type: string
+          format: date-time
+        finishedAt:
+          type: string
+          format: date-time
+          nullable: true
+    EvaluationMetric:
+      type: object
+      required: [name, value, threshold, passed, detail]
+      properties:
+        name:
+          type: string
+          enum:
+            - design_coverage
+            - impact_recall
+            - impact_precision
+            - classification_accuracy
+            - issue_false_positive_rate
+            - supplement_hit_rate
+        value:
+          type: number
+        threshold:
+          type: number
+        passed:
+          type: boolean
+        detail:
+          type: object
+          additionalProperties: true
+          description: Numerator/denominator, baseline and `reason` (`ok`, `below_threshold`, `above_threshold`, `baseline_regression`).
+    RecordEvaluationRunRequest:
+      type: object
+      additionalProperties: false
+      required: [mode, corpusVersion]
+      properties:
+        mode:
+          type: string
+          enum: [deterministic, real_llm]
+        corpusVersion:
+          type: string
+          minLength: 1
+          maxLength: 64
+        model:
+          type: string
+          maxLength: 128
+        status:
+          type: string
+          description: Only `error` is meaningful; pass/fail is derived from the metrics.
+        sample:
+          $ref: '#/components/schemas/EvaluationSample'
+        baseline:
+          type: object
+          additionalProperties:
+            type: number
+        summary:
+          type: object
+          additionalProperties: true
+        startedAt:
+          type: string
+          format: date-time
+        finishedAt:
+          type: string
+          format: date-time
+    EvaluationSample:
+      type: object
+      additionalProperties: false
+      required:
+        - confirmedRequirements
+        - coveredRequirements
+        - impactExpected
+        - impactHit
+        - impactSelected
+        - injectedFailures
+        - correctClassifications
+        - aiIssues
+        - truePositiveIssues
+        - supplementCases
+        - supplementHits
+      properties:
+        confirmedRequirements:
+          type: integer
+          minimum: 0
+        coveredRequirements:
+          type: integer
+          minimum: 0
+        impactExpected:
+          type: integer
+          minimum: 0
+        impactHit:
+          type: integer
+          minimum: 0
+        impactSelected:
+          type: integer
+          minimum: 0
+        injectedFailures:
+          type: integer
+          minimum: 0
+        correctClassifications:
+          type: integer
+          minimum: 0
+        aiIssues:
+          type: integer
+          minimum: 0
+        truePositiveIssues:
+          type: integer
+          minimum: 0
+        supplementCases:
+          type: integer
+          minimum: 0
+        supplementHits:
+          type: integer
+          minimum: 0
+    # --- P8 evidence GC ----------------------------------------------------
+    EvidenceGCRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        dryRun:
+          type: boolean
+          default: true
+          description: Omitted means true; `false` requires `EZTEST_GC_ENABLED=true`.
+        reason:
+          type: string
+          maxLength: 120
+          description: Optional operator note; sanitized before it is stored in `purged_reason`.
+    EvidenceGCReportEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/EvidenceGCReport'
+    EvidenceGCReport:
+      type: object
+      required:
+        - dryRun
+        - candidates
+        - protected
+        - bytes
+        - deleted
+        - failed
+        - skipped
+        - retentionDays
+        - batchKeep
+        - candidateLimit
+        - runAt
+      properties:
+        dryRun:
+          type: boolean
+        candidates:
+          type: integer
+        protected:
+          type: integer
+        bytes:
+          type: integer
+          format: int64
+          description: Candidate bytes (dry-run) / attempted bytes.
+        deleted:
+          type: integer
+        failed:
+          type: integer
+        skipped:
+          type: integer
+        retentionDays:
+          type: integer
+        batchKeep:
+          type: integer
+        candidateLimit:
+          type: integer
+          description: Fixed per-run cap (10000).
+        runAt:
+          type: string
+          format: date-time
+    # --- P8 version change timeline ---------------------------------------
+    VersionChangeTimelineEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/VersionCodeChanges'
+    VersionCodeChanges:
+      type: object
+      description: |
+        Additive P8 body of `GET /api/versions/{versionId}/code/changes`: the
+        existing ChangeList fields plus `batchTimeline` (older clients ignore
+        the new array). `provisional` marks a computed-but-not-persisted
+        pre-analysis entry; `unavailable` marks a batch whose diff failed.
+      required:
+        - changeSetId
+        - baseCommit
+        - headCommit
+        - stats
+        - files
+        - nextCursor
+        - hasMore
+        - batchTimeline
+      properties:
+        changeSetId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+          nullable: true
+        baseCommit:
+          type: string
+          pattern: '^[a-f0-9]{40}$'
+        headCommit:
+          type: string
+          pattern: '^[a-f0-9]{40}$'
+        stats:
+          $ref: '#/components/schemas/ChangeSetStats'
+        files:
+          type: array
+          maxItems: 2000
+          items:
+            $ref: '#/components/schemas/ChangedFile'
+        nextCursor:
+          type: string
+          nullable: true
+        hasMore:
+          type: boolean
+        batchTimeline:
+          type: array
+          items:
+            $ref: '#/components/schemas/VersionChangeTimeline'
+    VersionChangeTimeline:
+      type: object
+      required:
+        - batchId
+        - batchNo
+        - batchStatus
+        - baseCommit
+        - headCommit
+        - historyRewritten
+        - changedFiles
+        - impactedCases
+        - unmappedCount
+        - items
+        - computedAt
+        - provisional
+        - unavailable
+      properties:
+        batchId:
+          type: string
+          pattern: '^[0-9]{1,19}$'
+        batchNo:
+          type: integer
+        batchStatus:
+          type: string
+        baseCommit:
+          type: string
+          pattern: '^[a-f0-9]{40}$'
+        headCommit:
+          type: string
+          pattern: '^[a-f0-9]{40}$'
+        historyRewritten:
+          type: boolean
+        changedFiles:
+          type: integer
+        impactedCases:
+          type: integer
+        unmappedCount:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/VersionChangeItem'
+        computedAt:
+          type: string
+          format: date-time
+        provisional:
+          type: boolean
+        unavailable:
+          type: boolean
+    VersionChangeItem:
+      type: object
+      required: [file, changeKind, subjects, caseIds, unmapped]
+      properties:
+        file:
+          type: string
+        changeKind:
+          type: string
+        subjects:
+          type: array
+          items:
+            $ref: '#/components/schemas/VersionChangeSubject'
+        caseIds:
+          type: array
+          items:
+            type: string
+        unmapped:
+          type: boolean
+    VersionChangeSubject:
+      type: object
+      required: [kind, name]
+      properties:
+        kind:
+          type: string
+          enum: [route, api, component]
+        name:
+          type: string

@@ -1,4 +1,4 @@
-# EzTest 系统整体设计蓝图（v2.3 · P7 同步）
+# EzTest 系统整体设计蓝图（v2.4 · P8 同步）
 
 > **文档性质**：本轮设计会话的**主交付物**。用于多阶段迭代开发的唯一"总设计稿"；详细实现规格按阶段拆出，但本蓝图定义系统边界、架构、领域模型、Agent 体系、生命周期、数据/API 轮廓、前端形态、非功能要求与迭代路线。
 > **配套详细设计**：`frontend-design.md`（前端细节）、`code-intelligence.md`（本地 Git 代码仓/影响分析）、`auth-session-model.md`（账号/会话/权限观测）；`system-overview.md` v1.1 为早期版本，内容已并入本文。
@@ -751,4 +751,102 @@ SSE + 快照游标 + seq 去重 + Last-Event-ID；图结构签名防抖；历史
 
 ---
 
-*文档版本：v2.3（2026-10-28，P7 同步）：代码智能**语言无关**（AI 代码理解为主，**不设计 parser/静态解析器**，不设语言白名单）。本蓝图覆盖系统全貌，用于多阶段迭代；每个 Phase 开始时据此产出阶段规格（接口/DDL/任务/验收），实施顺序见 `implementation-phases.md`。*
+## 19. P8 实现注记（D53–D69，2026-10-29）
+
+> 本节记录 P8“体验完善与硬化”的落地口径，与 P8 设计规格 §2/§10/§11 配套。P8 **不新增业务域**；视觉断言（D62）在本提交尚未交付，文中已单独标注。
+
+### 19.1 决策落地（D53–D69）
+
+| # | 决策 | 落地/影响 |
+|---|---|---|
+| **D53** | 探索链路画布改用 `@xyflow/react` 12，保留 `chain-layout`/ARIA/数据 hook；显式修订 P6“不引图库” | 已交付：`features/execution/chain`；React Flow 自带键盘导航被禁用，保留自有 roving focus/ARIA；链路 Tab 懒加载。 |
+| **D54** | 新增服务端链路只读聚合 `GET /api/versions/{id}/exploration-chain`，现有 4 个 REST 端点保留 | 已交付：`internal/chain` 只读读模型，五类 Provider，服务端完成最新 attempt/问题映射/证据计数/覆盖缺口/影响面与预算截断。 |
+| **D55** | 全局搜索用跨上下文只读 Provider；不直接跨域读表 | 已交付：`internal/search`；版本/需求/用例/问题四组，ILIKE，per-type 上限，Provider 失败降级。 |
+| **D56** | 待办中心只读聚合；管理员可见 takeover/gate | 已交付：`internal/workspace` + `/api/todos`；review 全员可见，takeover/gate 服务端按管理员过滤。 |
+| **D57** | 脑图回版本详情 Tab，同时保留 `/versions/{id}/mindmap` 全屏与 `?case=` | 已交付：10 Tab；Tab 与全屏共享 `MindmapPage`，`?tab=mindmap&case=` 深链。 |
+| **D58** | 新增 `version_change` 表与 `code_changed`；`/changes` 优先快照、缺失回退派生 | 已交付：`codeintel_0006_version_change.sql`；`/code/changes` 增加 `batchTimeline`，`code_changed` 事件已发布。 |
+| **D59** | 报告 revision 选择器、D49 快照字段、证据计数入指纹并 stale | 已交付：`ReportsTab` revision 选择器；快照写 `baseFallbackReason/historyRewritten`；只读时指纹变化 → stale + 一次 `report.stale`。 |
+| **D60** | Agent 中心 = 13 角色目录 + 现有 profile 配置 + 运行观察 + 质量指标；只读接口登录可读，写配置仍 admin-only | 已交付：`/agents` 三角色视图；报告/知识角色标注确定性/人工审核，不伪造 profile。 |
+| **D61** | 评测双轨：确定性 fake LLM 为门禁，真实 LLM 只报告 | 已交付：`internal/quality`、`scripts/eval.ps1`、`eval/`；确定性阈值+基线回归，真实 LLM 报告不阻断。 |
+| **D62** | 视觉断言：`visual` 类型 + 独立表 + 人工审批基线 + pixelmatch 比对 + 四态分类 | **未交付（Task 25 在途）**：当前无视觉端点/UI/迁移提交；不要把本项当可用功能。 |
+| **D63** | 知识沉淀版本内闭环：提交→人工审核→批准→注入澄清/设计提示词 | 已交付：`version_0006_knowledge.sql`、`/knowledge`、版本概览提交面板、管理员审核抽屉；注入记录 `knowledgeRefs`，超出预算记 `knowledge_truncated`。 |
+| **D64** | 全局限流 + SLO 测量 | 限流已交付（429+Retry-After+SSE 并发）；SLO 脚本已交付，链路专项实测 PASS，全量 `slo.ps1` 仍为 dry-run SKIP（待最终验收）。 |
+| **D65** | GC/保留：证据/导出/附件/报告/孤儿按保留期清理，引用保护 + dry-run | **已交付但 re-scope**：自动清理只覆盖执行证据文件；导出、附件、报告 Markdown、无 DB 行孤儿文件不自动删除（缺安全引用判定）。默认 dry-run。 |
+| **D66** | 备份恢复：`pg_dump` + 内容目录 + sha256 清单 + 恢复校验 | 已交付：`scripts/backup.ps1`/`restore.ps1`/`test-backup.ps1`；175/175 断言、RPO/RTO 记录；恢复库应用 smoke 未做（defer Task 35）。 |
+| **D67** | 多实例单活：advisory lock + 实例 ID；执行器硬化 | 已交付：`platform/leader`、三个派生 key、每日维护；单实例默认不变；SSE/Agent runner 仍进程内。 |
+| **D68** | 安全审计与覆盖：秘密/依赖/权限脚本 + 审计查看器 + 资源/Session/版本/脑图审计 + 安全头 | 已交付：`security-audit.ps1`、审计筛选/导出、Next 安全头（CSP report-only）、审计覆盖补齐。 |
+| **D69** | 新增 P9 阶段，只承接有明确产品意图的业务候选 | 已在 `implementation-phases.md` 登记 P9；P8 不新增业务能力。 |
+
+### 19.2 架构变化
+
+```
+                    ┌───────────────────────────────┐
+                    │ cmd/eztest（唯一组装根）        │
+                    │  config → db → migrate → seed  │
+                    │  → workers/leader → HTTP       │
+                    └──────────────┬────────────────┘
+       ┌───────────────────────────┼────────────────────────────┐
+       │                           │                            │
+  P8 只读聚合                  业务上下文                  P8 硬化
+  chain / search / workspace   version/knowledge            ratelimit
+  （Provider 端口）             execution/evidence GC       leader lock
+  quality（评测）               codeintel/version_change    security headers
+                               mindmap/delivery/report      backup/restore
+```
+
+- `chain`/`search`/`workspace` 只依赖各上下文暴露的只读 Provider，不导入他域 infra；`quality` 只读自己的评测表。
+- 限流在认证之后、业务之前；多实例下是每实例内存计数，不是集群额度。
+- 执行调度、自主 worker、每日维护各用派生 advisory lock key；锁只覆盖 tick，不覆盖长跑 case runner。
+- 迁移仍启动时在 advisory lock 下执行；P8 只追加迁移。
+
+### 19.3 数据模型增量（P8）
+
+| 迁移 | 内容 |
+|---|---|
+| `codeintel_0006_version_change.sql` | `version_change` 批次代码变更快照（base/head/history_rewritten/changed_files/impacted_cases/items 等）。 |
+| `codeintel_0007_fact_review.sql` | `code_fact_review` 事实人工修正（correct/incorrect + reason，按 repo/fact/commit）。 |
+| `version_0006_knowledge.sql` | `knowledge_entry` 版本内知识（kind/status/confidence/tags/source_refs/revision）。 |
+| `quality_0001_eval.sql` | `eval_run` + `eval_metric`（确定性/真实 LLM 双轨、阈值/基线判定）。 |
+| `execution_0004_evidence_purge.sql` | `evidence.purged_at/purged_reason`（GC 保留元数据，不删行）。 |
+| `mindmap_0003_visual.sql` / `execution_0005_visual_evidence.sql` | 视觉断言的 DDL；**当前未提交**，随 D62 交付。 |
+
+### 19.4 探索链路（D53/D54）
+
+- 服务端一次聚合：版本/批次 → 需求 → 用例（含补充/受影响）→ 每用例最新 attempt → 问题 → 影响边；前端不再做 4 快照拼接。
+- 节点预算 roots-first（需求→用例→结果→问题），`counts` 始终是截断前真实值，`truncated` 标记被裁层；前端用横幅提示，不静默丢失。
+- 画布：React Flow pan/zoom/fit、MiniMap、点阵 Background、自定义节点/带标签边、视口裁剪；图例/Sheet/筛选/跟随执行/空错重连；自有 ARIA tree/roving focus，禁用 React Flow 键盘导航。
+- 深链：`?tab=exploration`、用例/问题/证据深链；问题节点可打开问题详情，受影响用例显示 `needs_revalidation`。
+- 读端点 `Cache-Control: no-store`；查询边界 50–2000 节点/1–500 需求根。
+
+### 19.5 质量与知识（D61/D63）
+
+- 评测：固定语料 + fake LLM/fixture executor 的确定性轨道为硬门禁；六项指标、阈值、基线回归（>0.05 失败）；真实 LLM 轨道只报告。质量中心 `/quality` admin-only，结果通过 admin API 写入。
+- 知识：版本内草稿 → 管理员批准/驳回 → 批准的条目注入本版本澄清/分析/侦察与脑图设计提示词；注入条数/字节预算，运行记录 `knowledgeRefs`；草稿/驳回不注入；跨版本复用归 P9。
+- 代码质量：证据通过率、无效事实、置信度分布、人工复核计数、评测影响精确率/召回率、缓存命中率；缺失数据源显示不可用，不伪造。
+
+### 19.6 硬化与运维（D64–D68）
+
+- 限流：用户/IP 令牌桶 + SSE 并发；429 `rate_limited` + `Retry-After`；健康检查/静态资源/OpenAPI 豁免。
+- GC：默认 dry-run；保护最近 N 批、运行中批次、未关闭问题引用、视觉基线、已清除行；删除前复核 sha256/引用；删除/回滚用 `context.WithoutCancel` 有界后台 context；审计只含计数。
+- 备份：`pg_dump -Fc` + 五个内容目录 tar + manifest sha256/行数；恢复拒绝非空目标/危险库名；manifest 不含密钥。
+- 多实例：`EZTEST_INSTANCE_ID`/`EZTEST_LEADER_LOCK_KEY`，每 tick 抢锁；单实例行为不变；执行器工具调用上限/WS 白名单/超时收尾。
+- 安全：秘密/依赖/权限审计、审计查看器筛选/导出、资源/Session/版本/脑图写审计、Next 安全响应头（CSP report-only）。
+
+### 19.7 事件与 API
+
+- 事件（`version:{id}`）：新增 `knowledge.created`/`knowledge.reviewed`；`code.changed` 由 `version_change`/分析发布；`report.stale` 增加 `reason`。detail 只放 ID/状态/计数，不放正文/凭据。
+- P8 API：链路、搜索、待办、Agent 中心只读、知识 CRUD/审核/全局、代码质量/事实修正、评测、GC；`/code/changes` 增加 `batchTimeline`；`/api/health` 增加 `rate_limit`/`gc` 投影。完整契约见 `docs/openapi/api.yaml`。
+
+### 19.8 交付状态与已知限制
+
+- **已交付**：D53–D61、D63–D69（D62 除外），以及 P8 前端壳/移动导航/报告 revision/证据对比。
+- **未交付**：D62 视觉断言（Task 25 在途）；全量 SLO 真实测量、恢复库应用 smoke、最终真实验收（Task 35）。
+- **re-scope**：GC 只自动清理执行证据文件；导出/附件/报告/孤儿文件留给 P9/后续（需安全引用判定）。
+- **报告保护边界**：报告快照不含 evidence id，`report_ref(ref_kind='evidence')` 无生产写入，因此发布/过期报告不参与证据保护。
+- **配置未接线**：`EZTEST_ANALYSIS_MAX_CASES`/`EZTEST_SUPPLEMENT_MAX_CASES`、`EZTEST_CHAIN_MAX_NODES`/`EZTEST_SEARCH_MAX_RESULTS_PER_TYPE`/`EZTEST_TODOS_MAX` 当前未被构建读取，使用代码默认/请求上限。
+- **多实例**：只做单活锁与执行器硬化；SSE/Agent runner、限流仍非集群级；多实例运维编排归 P9。
+- **安全边界**：token 存 `sessionStorage`，无 HttpOnly 会话；CSP report-only；TLS/反代由部署方负责。
+
+---
+
+*文档版本：v2.4（2026-10-29，P8 同步）：代码智能**语言无关**（AI 代码理解为主，**不设计 parser/静态解析器**，不设语言白名单）。本蓝图覆盖系统全貌，用于多阶段迭代；每个 Phase 开始时据此产出阶段规格（接口/DDL/任务/验收），实施顺序见 `implementation-phases.md`。*

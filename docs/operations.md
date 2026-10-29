@@ -1,7 +1,7 @@
 # EzTest 运维手册
 
-> 本文件由 P8 任务按章节补充。当前章节：备份/恢复与密钥管理（Task 29）。
-> GC、SLO、多实例单活、安全审计与故障处理章节由对应任务追加，勿在本文件重复维护同一主题。
+> 本文件汇总 P8 运维手册：备份/恢复与密钥（Task 29）、证据 GC（Task 28）、多实例单活（Task 30）、限流/SLO（Task 27）、审计/安全（Task 20/32）与故障处理/日志（Task 33 汇总）。
+> 各章节按主题维护；部署步骤见 [部署指南](deployment.md)，不要把本文件当部署清单使用。
 
 ## 备份与恢复
 
@@ -268,3 +268,177 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:13333/api/admin/gc `
 - 完成日志只含计数、保留天数与批次保护数，不含证据路径/sha256/内容。
 - 验证锁：`SELECT pid, classid, objid FROM pg_locks WHERE locktype = 'advisory' AND objid IN (<base>, <base+1>, <base+2>);`（仅持有锁的 tick 期间可见）。
 - 已知边界：advisory lock 依赖所有实例连接同一个 PostgreSQL；跨外部存储/多租户编排不在 P8 范围。SSE 广播与 Agent runner 仍为进程内单实例。
+
+## 限流与 SLO
+
+> 设计依据：规格 §10.1/D64。限流是**进程内**内存令牌桶（每实例独立），不是网关级全局限流；多副本部署时实际允许速率约为“实例数 × 配置值”，需要按实例预算合计。
+
+### 配置与行为
+
+| 变量 | 默认 | 范围 | 行为 |
+| --- | --- | --- | --- |
+| `EZTEST_RATE_LIMIT_RPS` | `50` | 0–1000 | 每用户（认证后）/每 IP（公开路由）每秒补充令牌；`0` 关闭普通桶（SSE 并发上限仍生效）。 |
+| `EZTEST_RATE_LIMIT_BURST` | `100` | 1–5000 | 桶容量/突发。 |
+| `EZTEST_RATE_LIMIT_SSE_MAX` | `10` | 1–100 | 每用户/IP 并发 SSE 流；超限立即 429，提示客户端关闭旧流。 |
+
+- 超限返回 **429**，错误码 `rate_limited`，`Retry-After` 为整数秒；`details` 含 `scope`（`user`/`ip`）、`reason`（`requests_per_second`/`sse_concurrency`）、`limit`、`retry_after_seconds`。
+- `X-Request-ID` 仍照常回显；限流命中日志包含 path/scope/reason/limit/retry_after，**不含 token、用户 ID 明文或请求体**。
+- 豁免：`/healthz`、`/api/health`、`/api/openapi.yaml`、`/favicon.ico`、`/assets/`、`/static/`、`/_next/` 与 CORS 预检；SSE 心跳不计入普通桶。
+- SSE 判定：`GET` 且路径为 `/api/stream`、`/api/stream/events` 或 `Accept: text/event-stream`；连接结束（含 panic）释放槽位。
+- 限流是单实例行为；多副本要按“每个实例”分别配置容量，或用外部网关做全局额度。P8 不做分布式限流。
+
+### SLO 口径与当前状态
+
+| 测量项 | 阈值 | 当前状态 |
+| --- | --- | --- |
+| 版本总览首屏 API P95 | ≤ 2500 ms | `scripts/slo.ps1 -DryRun` 静态 PASS；真实测量 **SKIP**（未运行，Task 35 最终验收执行）。 |
+| 版本总览浏览器 navigation timing P95 | ≤ 2500 ms | 同上，真实浏览器测量 SKIP。 |
+| 探索链路端点 P95（200 节点/400 边） | ≤ 2500 ms（专项脚本使用 800 ms 本地阈值） | `scripts/slo-chain.ps1` **PASS**：API P95 85.1 ms、画布可交互 1130 ms（本机口径，2026-10-29）。 |
+| 批次 8 并发执行 | 0 错误 | 依赖 fixture executor/会话 harness；`scripts/slo.ps1` 在缺失时记 SKIP，未实跑。 |
+| 代码变更集 API P95 | ≤ 2000 ms | `scripts/slo.ps1` 真实测量 SKIP。 |
+| 代码分析非模型开销 | 无固定 P8 门禁 | 由评测/验收脚本报告，未作为硬门禁。 |
+
+命令：
+
+```powershell
+# 静态预检（不需要 API/浏览器；会写 docs/acceptance/p8/slo.md 的 SKIP 报告）
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/slo.ps1 -DryRun
+
+# 本机 SLO 测量（需运行中的 API；Web/Playwright 可选）
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/slo.ps1 `
+  -ApiBaseUrl http://127.0.0.1:13333 -WebBaseUrl http://127.0.0.1:6868
+
+# 链路专项（200 节点/400 边；需要 API + Web + DB）
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/slo-chain.ps1 `
+  -ApiBaseUrl http://127.0.0.1:13333 -WebBaseUrl http://127.0.0.1:6868 `
+  -DatabaseUrl $env:EZTEST_DATABASE_URL
+```
+
+报告与说明：
+
+- `docs/acceptance/p8/slo.md`：`scripts/slo.ps1` 的输出；当前为 `STATIC-CHECK-PASSED-MEASUREMENTS-SKIPPED`，**不是 SLO PASS**。
+- `docs/acceptance/p8/slo-chain.md`：链路专项 PASS 记录（85.1 ms / 1130 ms）。
+- SLO 是**本地验收口径，不是生产 SLA**；生产必须在目标网络、目标数据量与真实浏览器上重测。
+- SKIP 永远不等于 PASS；脚本在测量到超阈值时以非 0 退出。
+
+## 审计与安全
+
+### 审计查看器
+
+- 入口：管理员登录 → `/settings` → **审计日志** Tab；对应 API `GET /api/admin/audit`（admin-only）。
+- 过滤：`actor`（用户 ID）、`action`（精确动作名）、`from`/`to`（RFC3339，含边界）；游标分页，按时间倒序。
+- 导出：前端把**已加载**的条目导出为 CSV/Markdown（浏览器端生成，不新增服务端导出端点）；导出内容同样不含密钥/凭据正文。
+- 审计记录字段：actor、action、target、request_id、IP、user-agent、非敏感 metadata、时间；不记录密码、token、storageState、LLM key、SQL 结果、证据正文、prompt 或知识正文。
+
+### 已覆盖的写操作（P8）
+
+| 域 | 动作示例 |
+| --- | --- |
+| 认证/用户 | `auth.login_succeeded`、`auth.login_failed`、`auth.logout`、`user.created`、`user.updated`、`user.password_reset` |
+| LLM/存储 | `llm.config_created/updated/deleted`、`llm.test_succeeded/failed`、`storage.object_created` |
+| 版本/需求 | `version.created/updated/continued/completed`、`version.requirement_created/updated/deleted/confirmed/reopened` |
+| 脑图/评审 | `case.created/updated/deleted/reviewed/baseline_approved/exported` 等 |
+| 执行/GC | `execution.evidence.gc`、执行/接管相关动作；GC 审计为 best-effort（sink 故障只记日志，不回滚已完成的清理）。 |
+| 交付 | `delivery.issue.created`、`delivery.analysis.started/finished`、报告发布/导出相关动作 |
+| 资源/Session | `resource.*` 导入/校验/接管/DB 目标等动作 |
+
+> 动作名是持久化契约，稳定不改；新增写操作应沿用 `<context>.<verb>` 并补测试/文档。
+
+### 安全头与边界
+
+- Next 下发 `X-Content-Type-Options: nosniff`、`Referrer-Policy: strict-origin-when-cross-origin`、`X-Frame-Options: DENY`、`Permissions-Policy` 与 **`Content-Security-Policy-Report-Only`**；CSP 尚不强制。
+- API 响应不带这些头；生产由反向代理统一补 `HSTS`/CSP/头（见 [部署指南](deployment.md#5-反向代理tls-与安全头)）。
+- 已知边界：token 存 `sessionStorage`，无 HttpOnly 会话；TLS/反代由部署方负责；LLM `base_url` 信任管理员；Access/Session 凭据与 DB 目标密码按既有决策明文存储，但 API 不回显、不入日志/事件/证据/prompt。
+- 权限矩阵与秘密扫描结果见 `docs/acceptance/p8/security-audit.md`；脚本 `scripts/security-audit.ps1`（`-SkipLive` 可离线执行）。
+
+## 密钥与凭据轮换
+
+### `EZTEST_SECRET_KEYS` 轮换
+
+`EZTEST_SECRET_KEYS` 是 `{ "<版本号>": "<base64 32 字节密钥>" }`，`EZTEST_SECRET_KEY_ACTIVE` 指定**新加密**使用的版本。解密会尝试 keyring 中所有版本，因此旧密文仍可读。
+
+推荐步骤（先在测试环境演练）：
+
+1. 生成新密钥（不要复用旧值）：
+   ```powershell
+   $bytes = New-Object byte[] 32
+   [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+   [Convert]::ToBase64String($bytes)
+   ```
+2. 在 `EZTEST_SECRET_KEYS` 中**追加**新版本（如 `"2"`），旧版本保留；把 `EZTEST_SECRET_KEY_ACTIVE` 改为新版本；滚动重启 API。
+3. 重新录入需要由新 key 加密的 LLM 配置：当前没有批量重加密工具；管理员在设置页编辑配置并重新填写 `llm_key`/headers，才会用 active key 重新加密。留空 key 表示保留旧密文。
+4. 用 `/api/health` 的 `llm_configured=true`、LLM 连通性测试和一次真实调用验证解密/加密都正常。
+5. 确认没有密文仍依赖旧版本后，才能从 keyring 移除旧版本；**移除前务必保持备份**。移除后再回滚将无法解密旧数据。
+
+要点：
+
+- 备份不包含 keyring；keyring 丢失且无其它副本时，已加密的 LLM Key/headers **不可恢复**，只能重新录入。
+- 轮换不等于撤销：旧 token/密码策略见下节；不要把 keyring 写进 `.env.example`、工单或聊天记录。
+- 轮换期间新旧实例可能短暂并存；所有实例必须拿到包含新旧版本的同一 keyring，否则旧实例无法解密新密文。
+
+### 其它凭据
+
+- **管理员密码**：通过用户管理重置；旧 token 会被撤销。种子密码仅首次空库创建时使用。
+- **executor token**：API 与 executor 必须同时替换 `EZTEST_EXECUTOR_TOKEN` 并重启两者；轮换窗口内执行批次会失败，选择无批次运行时操作。
+- **数据库密码**：按 PostgreSQL 常规流程轮换；同步更新 `.env`/`POSTGRES_PASSWORD` 与 `EZTEST_DATABASE_URL`，滚动重启 API。恢复脚本不会创建角色/数据库。
+- **LLM Key**：在设置页更新；API/DTO/审计/日志/事件均不回显。审计只记录“测试成功/失败”等动作。
+- **Session/Access 凭据**：按 P2 的导入/失效/撤销流程处理；不提供查看原文的 API。
+
+## 日志与故障处理
+
+### 日志
+
+- 输出到 stdout/stderr，结构化字段含 `request_id`、method/path/status、耗时与错误；级别由 `EZTEST_LOG_LEVEL` 控制（`debug`/`info`/`warn`/`error`）。
+- 不记录密码、token、LLM key、storageState、SQL 结果集、证据正文、prompt、知识正文或文件系统路径（错误信封也不泄漏）。
+- Compose：`docker compose --env-file .env -f deploy/docker-compose.yml logs -f api`；生产建议接日志驱动/采集。
+- 关键启动日志：`instance_id`、`leader_lock_key`、`env`、迁移结果；退出日志同样带 `instance_id`。
+- 限流命中是 `warn`；leader 未获锁是 `debug`；GC/维护完成日志只有计数/阈值。
+
+### 故障排查顺序
+
+1. **看健康**：`GET /healthz`（进程）→ `GET /api/health`（DB/LLM/限流/GC 参数）。
+2. **看日志**：按 `request_id` 关联；先排除 DB、迁移、端口、CORS、executor。
+3. **看权限**：401 = 未认证/过期；403 = 非管理员（或知识编辑者规则）；409 = 状态冲突/GC 未开启；422 = 字段校验；429 = 限流/队列；503 = DB/LLM/executor 不可用。
+4. **看数据**：`purged_at` 解释证据缺失；报告 stale 看 `input_fingerprint` 与证据计数；问题/报告 revision CAS 冲突需刷新后重试。
+5. **不要手改数据库**：先备份；迁移只追加；报告/证据/审计的修复优先走应用流程或恢复演练。
+
+### 常见问题
+
+| 问题 | 判断/处理 |
+| --- | --- |
+| API 启动即失败，提示迁移校验和不匹配 | 历史迁移被修改；不要改已应用迁移，新增迁移修正或从备份恢复。 |
+| `/api/health` 503、`db=down` | PG 未启动/连接串错误/连接池耗尽；查 `pg_isready`、连接数、密码/sslmode。 |
+| 浏览器 401/403 | token 过期或角色不足；管理员接口需 admin；知识编辑仅创建者/admin。 |
+| 429 `rate_limited` | 看 `details.reason` 与 `Retry-After`；调 RPS/BURST/SSE_MAX 或降低并发；多实例按实例合计。 |
+| SSE 断线/无消息 | 反代缓冲/超时；关闭 buffering、放宽 read timeout、用 HTTP/1.1；确认心跳 20s。 |
+| GC 409 | `EZTEST_GC_ENABLED=false`；先 dry-run，生产显式开启并重启。 |
+| GC 一直有候选但删不掉 | 文件缺失/哈希不符/受保护引用；按设计跳过，人工核对 `purged_at` 与磁盘。 |
+| 报告 stale | 证据/失败分类计数变化或升级后首次读取；确认后重新生成（新 revision），不要改旧 revision。 |
+| 执行批次失败、executor unavailable | executor 容器/端口/token/Chromium 资源；查 executor `/healthz` 与 API 日志。 |
+| LLM 503 `llm_not_configured` | 默认 LLM 缺失/key 解密失败；设置页重配并测试；核对 keyring active 版本。 |
+| 知识未注入 | 仅 `approved` 条目会注入；draft/rejected 不注入；检查条数/字节预算与 `knowledgeRefs` 日志/stats。 |
+| 审计查不到某个动作 | 该路由可能未接审计；以 `docs/acceptance/p8/security-audit.md` 的覆盖矩阵为准，新增写路径需补审计。 |
+
+## P8 已知限制与交付状态
+
+- **Docker/Compose 未实跑**：镜像未构建、栈未启动；只有静态校验。首次部署按 [部署指南](deployment.md) 验证。
+- **视觉断言（D62）尚未在本提交交付**：Task 25 仍在途；用户手册不包含视觉断言操作，OpenAPI 也不发布相关端点。合并后需同步 README/OpenAPI/用户手册/设计文档。
+- **SLO**：`scripts/slo.ps1` 目前只有 dry-run 静态 PASS；真实全量测量待最终验收；链路专项已 PASS（本机口径）。
+- **备份恢复**：DB 行数 + 文件 SHA-256 已演练；恢复库上的应用级 smoke 未做（defer Task 35）。
+- **GC 范围**：只自动清理 `EZTEST_EVIDENCE_DIR` 下证据；导出、附件、报告 Markdown、无 DB 行孤儿文件不自动删除（见上文“证据 GC 与保留”）。
+- **报告保护**：报告快照不含 evidence id，`report_ref(ref_kind='evidence')` 无生产写入，故发布/过期报告不参与证据保护；未来引入引用时必须恢复保护 SQL + 真实 PG 集成测试。
+- **多实例**：只做单活锁与执行器硬化；SSE/Agent runner 仍进程内；限流按实例内存计数；无多实例运维编排（P9）。
+- **权限**：仍是单管理员 + 普通用户两层，无多租户/RBAC；token 存 `sessionStorage`。
+- **迁移**：只追加、无 down migration；回退依赖备份恢复。
+- **配置**：`EZTEST_ANALYSIS_MAX_CASES`/`EZTEST_SUPPLEMENT_MAX_CASES` 仍是 P7 目标变量，当前构建未读取；`EZTEST_CHAIN_MAX_NODES`/`EZTEST_SEARCH_MAX_RESULTS_PER_TYPE`/`EZTEST_TODOS_MAX` 也未接线为环境变量（使用代码默认/请求上限）。以 [发布说明](release-notes/p8.md) 为准。
+
+## 相关文档
+
+- [部署指南](deployment.md)
+- [用户手册](user-guide.md)
+- [开发指南](development.md)
+- [P8 发布说明](release-notes/p8.md)
+- [备份演练记录](acceptance/p8/backup-drill.md)
+- [安全审计记录](acceptance/p8/security-audit.md)
+- [链路 SLO 记录](acceptance/p8/slo-chain.md)
+- [SLO 静态报告](acceptance/p8/slo.md)
