@@ -8,6 +8,7 @@ import { useEffect, useState } from "react"
 import { StatusBadge, type StatusBadgeVariant } from "@/components/ui/StatusBadge"
 import { useAuth } from "@/features/auth/AuthProvider"
 
+import { SearchCommand } from "./search/SearchCommand"
 import { TodoButton } from "./todos/TodoButton"
 import { VersionSwitcher } from "./VersionSwitcher"
 
@@ -130,6 +131,9 @@ export function Topbar() {
 
         {/* P8 global shell slot (spec §6.1): current version + status badge. */}
         <VersionSwitcher />
+
+        {/* P8 global search (spec §6.2): trigger + Ctrl/Cmd+K command palette. */}
+        <SearchCommand />
 
         <div className="hidden items-center gap-2 sm:flex">
           <StatusBadge variant={ENVIRONMENT.variant}>{ENVIRONMENT.label}</StatusBadge>

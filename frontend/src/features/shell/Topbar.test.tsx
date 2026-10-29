@@ -16,6 +16,10 @@ vi.mock("./VersionSwitcher", () => ({
   VersionSwitcher: () => <div data-testid="version-switcher" />,
 }))
 
+vi.mock("./search/SearchCommand", () => ({
+  SearchCommand: () => <button data-testid="search-command" type="button" />,
+}))
+
 vi.mock("./todos/TodoButton", () => ({
   TodoButton: () => <button data-testid="todo-button" type="button" />,
 }))
@@ -25,10 +29,11 @@ import { Topbar } from "./Topbar"
 afterEach(cleanup)
 
 describe("Topbar", () => {
-  it("keeps the P8 shell chips and mounts the version switcher and todo centre", () => {
+  it("keeps the P8 shell chips and mounts the version switcher, search and todo centre", () => {
     render(<Topbar />)
 
     expect(screen.getByTestId("version-switcher")).not.toBeNull()
+    expect(screen.getByTestId("search-command")).not.toBeNull()
     expect(screen.getByTestId("todo-button")).not.toBeNull()
     expect(screen.getByText("P8 · 体验硬化")).not.toBeNull()
     expect(screen.getByText("开发环境")).not.toBeNull()

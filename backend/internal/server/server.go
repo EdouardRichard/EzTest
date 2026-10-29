@@ -28,6 +28,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/idempotency"
 	resourcehttp "github.com/EdouardRichard/EzTest/backend/internal/resource/interfaces/httpapi"
+	searchhttp "github.com/EdouardRichard/EzTest/backend/internal/search/interfaces/httpapi"
 	storagehttp "github.com/EdouardRichard/EzTest/backend/internal/storage/interfaces/httpapi"
 	versionhttp "github.com/EdouardRichard/EzTest/backend/internal/version/interfaces/httpapi"
 	workspacehttp "github.com/EdouardRichard/EzTest/backend/internal/workspace/interfaces/httpapi"
@@ -145,6 +146,10 @@ type Dependencies struct {
 	// every logged-in user gets the review group, administrators additionally
 	// get takeover/gate items (spec §6.3).
 	Workspace *workspacehttp.Handlers
+	// Search holds the P8 global-search handler group. When set, GET /api/search
+	// is mounted. It relies on the global bearer auth and adds no per-route
+	// guard: every logged-in user may search (spec §6.2).
+	Search *searchhttp.Handlers
 }
 
 // New assembles the HTTP handler. Middleware runs in the order
@@ -271,6 +276,12 @@ func New(cfg config.Config, logger *slog.Logger, deps Dependencies) http.Handler
 		// identity context and the service filters takeover/gate server-side
 		// (spec §6.3).
 		deps.Workspace.RegisterRoutes(mux)
+	}
+	if deps.Search != nil {
+		// The global search (P8) is mounted at GET /api/search. It relies on the
+		// global bearer auth and adds no per-route guard: every logged-in user
+		// may search (spec §6.2).
+		deps.Search.RegisterRoutes(mux)
 	}
 	if deps.Events != nil && cfg.EnableTestEndpoints {
 		auditor := deps.Audit

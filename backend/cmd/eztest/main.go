@@ -53,6 +53,7 @@ import (
 	deliverypostgres "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/postgres"
 	deliveryrefs "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/refs"
 	deliveryreport "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/report"
+	deliverysearch "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/search"
 	deliveryversion "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/version"
 	deliveryhttp "github.com/EdouardRichard/EzTest/backend/internal/delivery/interfaces/httpapi"
 	eventingapp "github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
@@ -97,6 +98,7 @@ import (
 	mindmaphttpclient "github.com/EdouardRichard/EzTest/backend/internal/mindmap/infrastructure/httpclient"
 	mindmappostgres "github.com/EdouardRichard/EzTest/backend/internal/mindmap/infrastructure/postgres"
 	mindmapresource "github.com/EdouardRichard/EzTest/backend/internal/mindmap/infrastructure/resource"
+	mindmapsearch "github.com/EdouardRichard/EzTest/backend/internal/mindmap/infrastructure/search"
 	mindmapversion "github.com/EdouardRichard/EzTest/backend/internal/mindmap/infrastructure/version"
 	mindmaphttp "github.com/EdouardRichard/EzTest/backend/internal/mindmap/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/crypto"
@@ -109,6 +111,8 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/resource/infrastructure/pgreadonly"
 	resourcepostgres "github.com/EdouardRichard/EzTest/backend/internal/resource/infrastructure/postgres"
 	resourcehttp "github.com/EdouardRichard/EzTest/backend/internal/resource/interfaces/httpapi"
+	searchapp "github.com/EdouardRichard/EzTest/backend/internal/search/application"
+	searchhttp "github.com/EdouardRichard/EzTest/backend/internal/search/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/server"
 	storageapp "github.com/EdouardRichard/EzTest/backend/internal/storage/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/storage/infrastructure/localfs"
@@ -123,6 +127,7 @@ import (
 	versiongitread "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/gitread"
 	versionpostgres "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/postgres"
 	versionresource "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/resource"
+	versionsearch "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/search"
 	versionworkspace "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/workspace"
 	versionhttp "github.com/EdouardRichard/EzTest/backend/internal/version/interfaces/httpapi"
 	workspaceapp "github.com/EdouardRichard/EzTest/backend/internal/workspace/application"
@@ -1388,6 +1393,17 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		user, ok := identityhttp.UserFromContext(ctx)
 		return ok && user.Role == identity.RoleAdmin
 	})
+	// P8 global search (spec §6.2/D55): the search application service aggregates
+	// the three cross-context providers. The version provider owns the version
+	// and requirement results; the mindmap and delivery providers resolve their
+	// version display names through the version application service, so no
+	// context reads another context's table.
+	searchService := searchapp.NewService(searchapp.Providers{
+		Version:  versionsearch.New(database.Pool),
+		Mindmap:  mindmapsearch.New(database.Pool, versionService),
+		Delivery: deliverysearch.New(database.Pool, versionService),
+	})
+	searchHandlers := searchhttp.NewHandlers(searchService)
 	cancelStartup()
 
 	// Every request context descends from baseCtx. Canceling it on shutdown
@@ -1424,6 +1440,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 			Delivery:  deliveryHandlers,
 			Chain:     chainHandlers,
 			Workspace: workspaceHandlers,
+			Search:    searchHandlers,
 		}),
 		BaseContext:       baseContext(baseCtx),
 		ReadHeaderTimeout: 10 * time.Second,
