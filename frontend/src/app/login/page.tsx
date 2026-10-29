@@ -100,7 +100,7 @@ export default function LoginPage() {
           </ul>
         </div>
 
-        <p className="relative text-[11px] text-slate-500">EzTest · P0 平台地基</p>
+        <p className="relative text-[11px] text-slate-500">EzTest · P8</p>
       </section>
 
       <section className="flex flex-col items-center justify-center px-5 py-12 sm:px-8">

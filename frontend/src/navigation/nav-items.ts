@@ -19,11 +19,11 @@ export type NavItem = {
   hint?: string
 }
 
-// The nine blueprint navigation entries. P0 only exposes / and /settings; the
-// remaining entries lead to placeholder pages until their phase lands. This
+// The nine blueprint navigation entries. All entries are live as of P8; the
+// phase field records the release in which each destination first landed. This
 // cross-feature navigation data lives outside features/shell (Agent.md §6.4).
 export const NAV_ITEMS: NavItem[] = [
-  { label: "概览", href: "/", icon: LayoutDashboard, phase: "P0", hint: "平台概览与系统状态" },
+  { label: "概览", href: "/", icon: LayoutDashboard, phase: "P8", hint: "平台概览与系统状态" },
   { label: "版本", href: "/versions", icon: Layers, phase: "P3", hint: "版本、多需求与澄清（P3）" },
   {
     label: "用例脑图",
@@ -52,10 +52,10 @@ export const NAV_ITEMS: NavItem[] = [
     label: "Agent 中心",
     href: "/agents",
     icon: Bot,
-    phase: "P1",
+    phase: "P8",
     hint: "Agent 运行时控制台（P8 扩展为 Agent 中心）",
   },
-  { label: "设置", href: "/settings", icon: Settings, phase: "P0", hint: "账户与平台设置" },
+  { label: "设置", href: "/settings", icon: Settings, phase: "P8", hint: "账户与平台设置" },
 ]
 
 /** Reports whether href is the active route for pathname; hash anchors never match. */

@@ -6,8 +6,10 @@
 .DESCRIPTION
     Asserts:
       - .gitignore lists .data/ and backend/.data/, and git actually ignores them.
-      - The shell sources (frontend/src/features/shell) contain none of the stale
-        P0 copy strings, and use the P8 copy instead.
+      - All sources under frontend/src contain none of the stale P0 copy strings,
+        and the shell sources use the P8 copy instead.
+      - nav-items.ts no longer carries a phase: "P0" badge, and the login footer
+        shows P8 rather than P0.
       - The scratch spec docs/superpowers/specs/Untitled-1.md has been archived
         to the gitignored .tmp/p8-untitled-1.md and is gone from specs/.
     Prints PASS/FAIL per assertion and exits non-zero when any assertion fails.
@@ -73,8 +75,8 @@ if (-not (Test-Path -LiteralPath $gitignorePath -PathType Leaf)) {
     }
 }
 
-# 2. Shell copy: no stale P0 labels, the P8 labels are present.
-$shellRoot = Join-Path $repoRoot "frontend/src/features/shell"
+# 2. Copy: no stale P0 labels anywhere under frontend/src; shell uses P8 copy.
+$srcRoot = Join-Path $repoRoot "frontend/src"
 $p0Copy = @(
     "P0 · 地基版本",
     "P0 地基运行中",
@@ -86,6 +88,31 @@ $p8Copy = @(
     @{ File = "AppShell.tsx"; Text = "EzTest · P8" }
 )
 
+$srcFiles = @()
+if (Test-Path -LiteralPath $srcRoot -PathType Container) {
+    $srcFiles = @(Get-ChildItem -LiteralPath $srcRoot -Recurse -File)
+}
+
+if ($srcFiles.Count -eq 0) {
+    Add-Failure "no sources found under $srcRoot"
+} else {
+    foreach ($needle in $p0Copy) {
+        $hits = @()
+        foreach ($file in $srcFiles) {
+            $text = Read-Utf8File -Path $file.FullName
+            if ($text.Contains($needle)) {
+                $hits += $file.FullName
+            }
+        }
+        if ($hits.Count -eq 0) {
+            Add-Pass "frontend sources contain no stale '$needle'"
+        } else {
+            Add-Failure "frontend sources still contain '$needle': $($hits -join ', ')"
+        }
+    }
+}
+
+$shellRoot = Join-Path $repoRoot "frontend/src/features/shell"
 $shellFiles = @()
 if (Test-Path -LiteralPath $shellRoot -PathType Container) {
     $shellFiles = @(Get-ChildItem -LiteralPath $shellRoot -Recurse -File |
@@ -95,21 +122,6 @@ if (Test-Path -LiteralPath $shellRoot -PathType Container) {
 if ($shellFiles.Count -eq 0) {
     Add-Failure "no TypeScript sources found under $shellRoot"
 } else {
-    foreach ($needle in $p0Copy) {
-        $hits = @()
-        foreach ($file in $shellFiles) {
-            $text = Read-Utf8File -Path $file.FullName
-            if ($text.Contains($needle)) {
-                $hits += $file.FullName
-            }
-        }
-        if ($hits.Count -eq 0) {
-            Add-Pass "shell sources contain no stale '$needle'"
-        } else {
-            Add-Failure "shell sources still contain '$needle': $($hits -join ', ')"
-        }
-    }
-
     foreach ($expectation in $p8Copy) {
         $path = Join-Path $shellRoot $expectation.File
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
@@ -125,7 +137,43 @@ if ($shellFiles.Count -eq 0) {
     }
 }
 
-# 3. The scratch draft is archived (moved, not deleted) under the gitignored .tmp/.
+# 3. Navigation phase badges and the login footer must no longer say P0.
+$navItemsPath = Join-Path $repoRoot "frontend/src/navigation/nav-items.ts"
+if (-not (Test-Path -LiteralPath $navItemsPath -PathType Leaf)) {
+    Add-Failure "missing navigation source $navItemsPath"
+} else {
+    $navText = Read-Utf8File -Path $navItemsPath
+    if ($navText -match 'phase:\s*"P0"') {
+        Add-Failure 'nav-items.ts still contains a phase: "P0" badge'
+    } else {
+        Add-Pass 'nav-items.ts contains no phase: "P0" badge'
+    }
+}
+
+$loginPagePath = Join-Path $repoRoot "frontend/src/app/login/page.tsx"
+if (-not (Test-Path -LiteralPath $loginPagePath -PathType Leaf)) {
+    Add-Failure "missing login page $loginPagePath"
+} else {
+    $loginText = Read-Utf8File -Path $loginPagePath
+    $loginFooterLines = @($loginText -split '\r?\n' | Where-Object { $_ -match 'EzTest ·' })
+    $p0FooterLines = @($loginFooterLines | Where-Object { $_ -match 'P0' })
+
+    if ($loginFooterLines.Count -eq 0) {
+        Add-Failure "login page has no EzTest footer line"
+    } elseif ($p0FooterLines.Count -gt 0) {
+        Add-Failure "login footer still contains P0 copy: $($p0FooterLines -join ' | ')"
+    } else {
+        Add-Pass "login footer contains no P0 copy"
+    }
+
+    if (@($loginFooterLines | Where-Object { $_.Contains("EzTest · P8") }).Count -gt 0) {
+        Add-Pass "login footer contains 'EzTest · P8'"
+    } else {
+        Add-Failure "login footer is missing 'EzTest · P8'"
+    }
+}
+
+# 4. The scratch draft is archived (moved, not deleted) under the gitignored .tmp/.
 $specDraft = Join-Path $repoRoot "docs/superpowers/specs/Untitled-1.md"
 $archivePath = Join-Path $repoRoot ".tmp/p8-untitled-1.md"
 
