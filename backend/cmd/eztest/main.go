@@ -724,6 +724,18 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		executionapp.WithEvidenceMaxBytes(int64(cfg.ExecEvidenceMaxBytes)),
 		executionapp.WithEvidenceMaxPerCaseRun(cfg.ExecEvidencePerCase),
 	)
+	// P8 visual assertions (design spec §9.3): the comparison parameters are
+	// owned by the mindmap context; the approved baseline is read back from the
+	// execution evidence store with version/case ownership re-verified.
+	mindmapVisual := mindmapapp.NewVisualAssertionService(mindmapapp.VisualAssertionDeps{
+		Store:            mindmappostgres.NewVisualAssertionRepository(database.Pool),
+		Evidence:         mindmappostgres.NewVisualBaselineEvidenceRepository(database.Pool, evidenceStore),
+		Versions:         mindmapLifecycle,
+		Baselines:        mindmapBaselines,
+		Events:           mindmapEvents,
+		Clock:            wallClock{},
+		MaxBaselineBytes: int64(cfg.VisualBaselineMaxBytes),
+	})
 	// P8 evidence GC (spec 10.2): the reference-protection queries live in the
 	// execution postgres adapter and the filesystem store supplies the sha256
 	// pre-check and removal. Non-dry-run is opt-in through EZTEST_GC_ENABLED.
@@ -786,9 +798,10 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	executionToolSet := executionagenttool.NewToolSet(
 		executionRecorder, executorClient, evidenceService, nil,
 		executionagenttool.Limits{
-			MaxArtifactBytes: int64(cfg.ExecEvidenceMaxBytes),
-			MaxDBResultBytes: int64(cfg.DBResultMaxBytes),
-			MaxDBSQLBytes:    int64(cfg.DBSQLMaxBytes),
+			MaxArtifactBytes:       int64(cfg.ExecEvidenceMaxBytes),
+			MaxDBResultBytes:       int64(cfg.DBResultMaxBytes),
+			MaxDBSQLBytes:          int64(cfg.DBSQLMaxBytes),
+			VisualBaselineMaxBytes: int64(cfg.VisualBaselineMaxBytes),
 			Session: func(ctx context.Context, caseRunID int64) (executionapp.SessionRef, error) {
 				if executionAgentRuntime == nil {
 					return executionapp.SessionRef{}, errors.New("execution: agent runtime is not bound yet")
@@ -797,6 +810,10 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 			},
 		},
 	)
+	// P8 visual assertions (design spec §9.3): the tool reads the approved
+	// baseline through the evidence service, which re-verifies the batch/version
+	// ownership and the sha256/size on every read.
+	executionToolSet.SetVisualBaseline(evidenceService)
 
 	// P7 delivery context (spec §5.4/§6.5, D42): the issue/report/analysis
 	// repositories, the cross-context adapters and the analysis worker's ports.
@@ -967,8 +984,10 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Findings: mindmapFindings,
 		Audit:    mindmapAudit,
 	})...)
-	// The 15 P6 execution tools are appended before NewToolRegistry so the
-	// execution-agent profile allowlist is validated against the live registry.
+	// The 16 P6 execution tools (ten browser, http.request, three submissions,
+	// execution.db_assert and execution.visual_assert) are appended before
+	// NewToolRegistry so the execution-agent profile allowlist is validated
+	// against the live registry.
 	agentToolList = append(agentToolList, executionToolSet.Tools()...)
 	// The eleven P7 delivery tools (failure analysis and issue triage) are
 	// appended the same way; the submission-only analysis service above backs
@@ -1302,6 +1321,11 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	if err := ensureExecutionDBAssert(startupCtx, agentProfileService, logger); err != nil {
 		return err
 	}
+	// P8 idempotent upgrade of the same profile: add execution.visual_assert
+	// and its §9.3 finish rule only when they are missing (design spec §9.3).
+	if err := executionapp.EnsureExecutionVisualTool(startupCtx, agentProfileService, logger); err != nil {
+		return err
+	}
 	// The two delivery agent profiles (failure analysis, issue triage) are seeded
 	// after the other seeds; EnsureBuiltin only inserts a missing key.
 	if err := ensureDeliveryProfiles(startupCtx, deliveryAgentRuntime, agentRegistry, logger); err != nil {
@@ -1401,6 +1425,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Explore:   mindmapExplore,
 		Reviews:   mindmapReview,
 		Exports:   mindmapExport,
+		Visual:    mindmapVisual,
 		Nodes:     mindmapNodes,
 		RunStore:  mindmapRuns,
 		Findings:  mindmapFindings,

@@ -255,6 +255,47 @@ func TestApproveVisualBaselineRejectsNonPNGEvidence(t *testing.T) {
 	}
 }
 
+// TestApproveVisualBaselineRejectsForeignEvidenceKind pins the §9.3 approval
+// vocabulary: only a screenshot or a dedicated visual_baseline artifact may be
+// promoted to baseline. A download/console PNG (or any other kind) is a 422
+// invalid_argument, never an approved baseline.
+func TestApproveVisualBaselineRejectsForeignEvidenceKind(t *testing.T) {
+	for _, kind := range []string{"download", "http_exchange", "db_result", ""} {
+		fixture := newVisualFixture()
+		data := pngBytes(t, 1280, 720)
+		fixture.evidence.evidence = application.VisualEvidence{
+			ID: 501, Kind: kind, Mime: "image/png", Data: data, SizeBytes: int64(len(data)),
+		}
+		_, err := fixture.service().ApproveBaseline(context.Background(), 5, 77, 1, 501)
+		var domainErr *domain.Error
+		if !errors.As(err, &domainErr) || domainErr.Kind != domain.KindInvalid {
+			t.Fatalf("kind %q: err = %v (%T), want a KindInvalid domain error", kind, err, err)
+		}
+		if reason := visualReason(t, err); reason != "visual_baseline_invalid" {
+			t.Fatalf("kind %q: reason = %q, want visual_baseline_invalid", kind, reason)
+		}
+		if fixture.store.approveCalls != 0 {
+			t.Fatalf("kind %q reached the store", kind)
+		}
+	}
+}
+
+// TestApproveVisualBaselineAcceptsDedicatedBaselineKind proves the second
+// allowed kind, visual_baseline, is approved like a screenshot.
+func TestApproveVisualBaselineAcceptsDedicatedBaselineKind(t *testing.T) {
+	fixture := newVisualFixture()
+	data := pngBytes(t, 1280, 720)
+	fixture.evidence.evidence = application.VisualEvidence{
+		ID: 501, Kind: "visual_baseline", Mime: "image/png", Data: data, SizeBytes: int64(len(data)),
+	}
+	if _, err := fixture.service().ApproveBaseline(context.Background(), 5, 77, 1, 501); err != nil {
+		t.Fatalf("ApproveBaseline: %v", err)
+	}
+	if fixture.store.approvedEvidenceID != 501 {
+		t.Fatalf("approved evidence = %d, want 501", fixture.store.approvedEvidenceID)
+	}
+}
+
 func TestApproveVisualBaselineRejectsDimensionMismatch(t *testing.T) {
 	fixture := newVisualFixture()
 	data := pngBytes(t, 640, 360)

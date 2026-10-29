@@ -263,6 +263,44 @@ func (s *EvidenceService) ListByCaseRun(ctx context.Context, caseRunID int64) ([
 	return s.evidence.ListByCaseRun(ctx, caseRunID)
 }
 
+// pngSignature is the 8-byte PNG magic. A visual baseline must be a PNG; the
+// approved-baseline path validates the full image, the execution read only needs
+// to reject an unrelated artifact before sending it to the executor.
+var pngSignature = []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}
+
+// ReadVisualBaseline reads and verifies the approved baseline artifact of one
+// visual assertion (design spec §9.3). It reuses Open, so the batch/version
+// ownership and the sha256/size proof are the same as every other artifact read,
+// and then enforces the frozen approval vocabulary: only a screenshot or a
+// dedicated visual_baseline PNG may be compared.
+func (s *EvidenceService) ReadVisualBaseline(ctx context.Context, versionID, evidenceID int64) (VisualBaseline, error) {
+	reader, evidence, err := s.Open(ctx, versionID, evidenceID)
+	if err != nil {
+		return VisualBaseline{}, err
+	}
+	defer reader.Close()
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return VisualBaseline{}, evidenceCorruptError(evidenceID, err)
+	}
+	kind := strings.ToLower(strings.TrimSpace(evidence.Kind))
+	if kind != visualBaselineKindScreenshot && kind != visualBaselineKindDedicated {
+		return VisualBaseline{}, invalidEvidenceError("invalid_evidence_kind",
+			fmt.Sprintf("evidence kind %q is not a visual baseline artifact", evidence.Kind))
+	}
+	if len(data) == 0 || !bytes.HasPrefix(data, pngSignature) {
+		return VisualBaseline{}, invalidEvidenceError("invalid_evidence_content",
+			"the visual baseline is not a PNG image")
+	}
+	return VisualBaseline{
+		EvidenceID: evidence.ID,
+		Kind:       evidence.Kind,
+		Mime:       evidence.Mime,
+		SHA256:     evidence.SHA256,
+		Data:       data,
+	}, nil
+}
+
 // createRefs writes the case_run reference and, when present, the step_result
 // reference. Both are best effort: the evidence row is already committed and the
 // refs are traceability enrichment, so a failure is logged, not returned.

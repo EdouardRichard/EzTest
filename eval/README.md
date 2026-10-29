@@ -55,9 +55,12 @@ eval/
 `inconclusive(environment, visual_environment_mismatch)`；diff 超阈值 →
 `failed(application, visual_mismatch)`；否则 passed。
 
-Task 23 的 runner 目前尚未执行该场景（不修改 runner 核心）。接入时需在预检的
-`requiredFiles`、`corpusFiles` 与 `P8_EVAL_*` 环境变量中加入这两个文件，并按
-`ground-truth/visual.json` 的 `cases` 计数（`visual_classification_accuracy`，阈值 1.00）。
+`scripts/eval.ps1` 在预检阶段用 `go run ./internal/execution/evalvisual` 把
+`ground-truth/visual.json` 的每个注入结果送进生产 `domain.ClassifyVisual`，产出
+`visual_classification_accuracy`（阈值 1.00）并校验两份视觉语料的版本/场景契约。
+该指标与六个 §9.1 指标并存：写入 `observation.json`/`result.json` 的 `visual` 明细与
+`metrics.visual_classification_accuracy`，并作为评测记录的 `summary.visual` 观察值；
+`-DryRun` 同样执行该检查并把结果写入 `dry-run.json`，准确性不足直接失败。
 
 ## 维护流程
 

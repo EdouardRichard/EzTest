@@ -35,7 +35,9 @@ func finishError(reason, message string) error {
 //   - passed requires every step passed and every assertion passed, including
 //     db assertions;
 //   - failed requires at least one failed assertion, including a db assertion;
-//   - the verdict/failure-class matrix of spec §5.8 must hold;
+//   - the verdict/failure-class matrix of spec §5.8 must hold; the one §9.3
+//     extension is inconclusive(environment) justified by a recorded visual
+//     environment mismatch;
 //   - a budget-exhausted finish must be inconclusive(model).
 //
 // It returns nil when the decision is admissible. Rejections are
@@ -68,6 +70,18 @@ func ValidateFinish(snapshot CaseSnapshot, steps []StepResult, assertions []Asse
 	results, err := validateFinishAssertions(snapshot, assertions)
 	if err != nil {
 		return err
+	}
+
+	// Design spec §9.3 adds one admissible inconclusive(environment) case: a
+	// visual assertion whose comparison could not run because the live
+	// viewport/DPR differs from the approved baseline. It stays inconclusive
+	// rather than blocked, but requires the recorded §9.3 reason so the matrix is
+	// not widened for arbitrary cases.
+	if decision.Verdict == VerdictInconclusive && decision.FailureClass != nil &&
+		*decision.FailureClass == FailureClassEnvironment &&
+		!hasVisualEnvironmentMismatch(snapshot, results) {
+		return finishError(reasonInvalidFailureClass,
+			"inconclusive(environment) requires a visual environment mismatch")
 	}
 
 	if decision.Verdict == VerdictPassed || decision.Verdict == VerdictFailed {
@@ -119,12 +133,33 @@ func validateFinishClass(decision FinishDecision) error {
 		}
 	case VerdictInconclusive:
 		if decision.FailureClass == nil ||
-			(*decision.FailureClass != FailureClassModel && *decision.FailureClass != FailureClassCase) {
+			(*decision.FailureClass != FailureClassModel && *decision.FailureClass != FailureClassCase &&
+				*decision.FailureClass != FailureClassEnvironment) {
 			return finishError(reasonInvalidFailureClass,
-				"inconclusive requires failure class model or case")
+				"inconclusive requires failure class model, case or a visual environment mismatch")
 		}
 	}
 	return nil
+}
+
+// hasVisualEnvironmentMismatch reports whether a submitted visual assertion is
+// the §9.3 environment mismatch (not_run with the stable reason). It is the only
+// justification that admits inconclusive(environment) at finish time.
+func hasVisualEnvironmentMismatch(snapshot CaseSnapshot, results map[int64]AssertionResult) bool {
+	for _, assertion := range snapshot.Assertions {
+		if !strings.EqualFold(strings.TrimSpace(assertion.Kind), "visual") {
+			continue
+		}
+		result, ok := results[assertion.ID]
+		if !ok {
+			continue
+		}
+		if verdictEquals(result.Verdict, "not_run") &&
+			strings.EqualFold(strings.TrimSpace(result.FailureReason), "visual_environment_mismatch") {
+			return true
+		}
+	}
+	return false
 }
 
 // validateFinishSteps requires exactly the snapshot steps, once each, supplied

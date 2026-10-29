@@ -70,6 +70,9 @@ type Config struct {
 	ExecWorkerIntervalMS   int
 	ExecEvidenceMaxBytes   int
 	ExecEvidencePerCase    int
+	// VisualBaselineMaxBytes caps the approved visual baseline artifact (design
+	// spec §9.3, EZTEST_VISUAL_BASELINE_MAX_BYTES, default 5 MiB).
+	VisualBaselineMaxBytes int
 	// SnowflakeNodeID is this process's 10-bit node ID for application-side
 	// primary key generation (D29). It must be unique per running instance.
 	SnowflakeNodeID int64
@@ -213,6 +216,11 @@ const (
 	defaultGCBatchKeep     = 3
 	minGCBatchKeep         = 1
 	maxGCBatchKeep         = 50
+	// defaultVisualBaselineMaxBytes and its bounds are the design spec §9.3
+	// approved-baseline cap (EZTEST_VISUAL_BASELINE_MAX_BYTES).
+	defaultVisualBaselineMaxBytes = 5 << 20
+	minVisualBaselineMaxBytes     = 64 << 10
+	maxVisualBaselineMaxBytes     = 20 << 20
 	// defaultLeaderLockKey is the stable PostgreSQL advisory lock key of the
 	// multi-instance leader election (design spec §10.5/§11.4).
 	defaultLeaderLockKey int64 = 1163411512
@@ -401,6 +409,13 @@ func Load(getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 	cfg.ExecEvidencePerCase = execEvidencePerCase
+
+	visualBaselineMaxBytes, err := parseBoundedInt(getenv, "EZTEST_VISUAL_BASELINE_MAX_BYTES",
+		defaultVisualBaselineMaxBytes, minVisualBaselineMaxBytes, maxVisualBaselineMaxBytes)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.VisualBaselineMaxBytes = visualBaselineMaxBytes
 
 	dbResultMaxBytes, err := parseBoundedInt(getenv, "EZTEST_DB_RESULT_MAX_BYTES",
 		defaultDBResultMaxBytes, minDBResultMaxBytes, maxDBResultMaxBytes)

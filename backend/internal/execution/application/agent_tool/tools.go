@@ -61,6 +61,10 @@ type Limits struct {
 	// MaxDBSQLBytes caps the snapshot SQL of one db assertion
 	// (EZTEST_DB_SQL_MAX_BYTES, default 16 KiB).
 	MaxDBSQLBytes int64
+	// VisualBaselineMaxBytes caps the approved baseline copy sent to the
+	// executor for one visual comparison (EZTEST_VISUAL_BASELINE_MAX_BYTES,
+	// default 5 MiB).
+	VisualBaselineMaxBytes int64
 	// Session resolves the leased session of a case run. The browser tools use
 	// its StorageState/SessionStorage as the executor context's initial state and
 	// http.request injects its authentication Headers. It is optional: without a
@@ -86,6 +90,9 @@ func (l Limits) withDefaults() Limits {
 	if l.MaxDBSQLBytes <= 0 {
 		l.MaxDBSQLBytes = DefaultMaxDBSQLBytes
 	}
+	if l.VisualBaselineMaxBytes <= 0 {
+		l.VisualBaselineMaxBytes = application.DefaultVisualBaselineMaxBytes
+	}
 	return l
 }
 
@@ -106,6 +113,10 @@ type toolSet struct {
 	evidence   EvidenceCapturer
 	httpClient *http.Client
 	limits     Limits
+	// visualBaseline reads the approved baseline artifact of a visual
+	// assertion. It is optional (SetVisualBaseline); without it a visual
+	// assertion whose baseline exists fails closed as not_run.
+	visualBaseline application.VisualBaselineReader
 
 	mu       sync.Mutex
 	contexts map[int64]caseBrowser
@@ -169,6 +180,17 @@ func New(recorder application.Recorder, browser application.BrowserExecutor, evi
 	return NewToolSet(recorder, browser, evidence, httpClient, limits).Tools()
 }
 
+// SetVisualBaseline wires the approved-baseline reader of the visual assertion
+// tool. It is optional so a partially wired process keeps registering the tool
+// (which then fails closed) instead of changing the frozen NewToolSet
+// signature.
+func (s *toolSet) SetVisualBaseline(reader application.VisualBaselineReader) {
+	if s == nil {
+		return
+	}
+	s.visualBaseline = reader
+}
+
 // Tools returns the execution agent tools of design spec §7.1 in their frozen
 // order.
 func (s *toolSet) Tools() []agentdomain.Tool {
@@ -183,6 +205,7 @@ func (s *toolSet) Tools() []agentdomain.Tool {
 	definitions = append(definitions, httpDefinitions()...)
 	definitions = append(definitions, submitDefinitions()...)
 	definitions = append(definitions, dbAssertDefinitions()...)
+	definitions = append(definitions, visualAssertDefinitions()...)
 
 	tools := make([]agentdomain.Tool, 0, len(definitions))
 	for _, definition := range definitions {

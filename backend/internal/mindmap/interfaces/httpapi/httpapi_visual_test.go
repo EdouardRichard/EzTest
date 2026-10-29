@@ -2,6 +2,7 @@ package httpapi_test
 
 import (
 	"context"
+	"net/http"
 	"testing"
 	"time"
 
@@ -20,6 +21,7 @@ type visualFake struct {
 	approveCalls  int
 	evidenceID    int64
 	approveActor  int64
+	err           error
 	result        domain.VisualAssertion
 }
 
@@ -27,13 +29,13 @@ func (f *visualFake) Update(_ context.Context, versionID, assertionID, actor int
 	f.updateCalls++
 	f.updateVersion, f.updateID, f.updateActor = versionID, assertionID, actor
 	f.updateCmd = cmd
-	return f.result, nil
+	return f.result, f.err
 }
 
 func (f *visualFake) ApproveBaseline(_ context.Context, versionID, assertionID int64, actor, evidenceID int64) (domain.VisualAssertion, error) {
 	f.approveCalls++
 	f.updateVersion, f.updateID, f.approveActor, f.evidenceID = versionID, assertionID, actor, evidenceID
-	return f.result, nil
+	return f.result, f.err
 }
 
 // visualResult is the stored visual projection the fake returns.
@@ -131,3 +133,82 @@ func TestApproveVisualBaselineRejectsInvalidEvidenceID(t *testing.T) {
 		t.Fatalf("invalid evidence ids reached the service")
 	}
 }
+
+// TestApproveVisualBaselineValidationIs422 pins the HTTP status of a rejected
+// baseline artifact: the service's KindInvalid error (foreign kind, non-PNG,
+// oversized) must surface as 422 invalid_argument, never 500.
+func TestApproveVisualBaselineValidationIs422(t *testing.T) {
+	fake := &visualFake{
+		err: domain.NewInvalid("evidenceId", "visual_baseline_invalid",
+			"the visual baseline must be a screenshot or visual_baseline artifact"),
+	}
+	handler := newServer(t, mindmaphttp.Deps{Visual: fake})
+
+	rec := call(t, handler, "POST", "/api/versions/7/mindmap/assertions/77/visual/baseline", tokenAdmin, `{"evidenceId":"501"}`)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d body=%s, want 422", rec.Code, rec.Body)
+	}
+	if reason := reasonOf(t, rec); reason != "visual_baseline_invalid" {
+		t.Fatalf("reason = %q, want visual_baseline_invalid", reason)
+	}
+	if fake.approveCalls != 1 {
+		t.Fatalf("approve calls = %d, want 1", fake.approveCalls)
+	}
+}
+
+// TestGetGraphProjectsVisualAssertion pins the GET read side of the §9.3
+// wiring: the graph DTO carries the visual comparison parameters (selector,
+// threshold, viewport, DPR, approved baseline id) for a kind=visual assertion.
+func TestGetGraphProjectsVisualAssertion(t *testing.T) {
+	approved := int64(501)
+	graph := &graphFake{getFn: func(context.Context, int64) (application.GraphView, error) {
+		return application.GraphView{
+			VersionID:     7,
+			VersionStatus: "designing",
+			Editable:      true,
+			Nodes: []application.GraphNode{{
+				Node: domain.CaseNode{ID: 12, Kind: "case", Title: "收货页视觉回归", Priority: "P1"},
+				Assertions: []domain.CaseAssertion{{
+					ID: 77, NodeID: 12, Kind: domain.AssertionKindVisual,
+					Target: "#receipt", Expected: "一致",
+					Visual: &domain.VisualAssertion{
+						AssertionID: 77, Selector: "#receipt", Threshold: 0.01,
+						BaselineEvidenceID: &approved,
+						ViewportWidth:      1280, ViewportHeight: 720, DeviceScaleFactor: 1,
+					},
+				}},
+			}},
+		}, nil
+	}}
+	handler := newServer(t, mindmaphttp.Deps{Graph: graph, Visual: &visualFake{result: visualResult()}})
+
+	rec := call(t, handler, "GET", "/api/versions/7/mindmap", tokenUser, "")
+	if rec.Code != 200 {
+		t.Fatalf("status = %d body=%s, want 200", rec.Code, rec.Body)
+	}
+	data := decodeData(t, rec)
+	nodes, ok := data["nodes"].([]any)
+	if !ok || len(nodes) != 1 {
+		t.Fatalf("nodes = %+v", data["nodes"])
+	}
+	node, _ := nodes[0].(map[string]any)
+	assertions, ok := node["assertions"].([]any)
+	if !ok || len(assertions) != 1 {
+		t.Fatalf("assertions = %+v", node["assertions"])
+	}
+	assertion, _ := assertions[0].(map[string]any)
+	if assertion["kind"] != "visual" {
+		t.Fatalf("assertion kind = %v", assertion["kind"])
+	}
+	visual, ok := assertion["visual"].(map[string]any)
+	if !ok {
+		t.Fatalf("visual parameters missing: %+v", assertion)
+	}
+	if visual["selector"] != "#receipt" || visual["threshold"] != 0.01 ||
+		visual["baselineEvidenceId"] != "501" ||
+		visual["viewportWidth"] != float64(1280) || visual["viewportHeight"] != float64(720) ||
+		visual["deviceScaleFactor"] != float64(1) {
+		t.Fatalf("visual parameters = %+v", visual)
+	}
+}
+

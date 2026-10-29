@@ -37,6 +37,25 @@ func finishDBSnapshot() domain.CaseSnapshot {
 	return snapshot
 }
 
+// finishVisualSnapshot adds a visual assertion to the canonical case. The
+// assertion is submitted as not_run with the §9.3 environment-mismatch reason by
+// visualEnvironmentAssertions.
+func finishVisualSnapshot() domain.CaseSnapshot {
+	snapshot := finishSnapshot()
+	snapshot.Assertions = append(snapshot.Assertions, domain.CaseSnapshotAssertion{
+		ID: 12, StepSeq: 2, Kind: "visual", Target: "#receipt", Expected: "match",
+	})
+	return snapshot
+}
+
+// visualEnvironmentAssertions submits the visual assertion of
+// finishVisualSnapshot as not_run with the environment-mismatch reason.
+func visualEnvironmentAssertions() []domain.AssertionResult {
+	return append(passedAssertions(), domain.AssertionResult{
+		AssertionID: 12, Kind: "visual", Verdict: "not_run", FailureReason: "visual_environment_mismatch",
+	})
+}
+
 func passedSteps() []domain.StepResult {
 	return []domain.StepResult{
 		{Seq: 1, Status: domain.StepStatusPassed, EvidenceCount: 1},
@@ -147,6 +166,13 @@ func TestValidateFinishMatrix(t *testing.T) {
 			},
 		},
 		{
+			name: "inconclusive environment from a visual mismatch is admissible", snapshot: finishVisualSnapshot(),
+			steps: withoutEvidence(passedSteps()), assertions: visualEnvironmentAssertions(),
+			decision: domain.FinishDecision{
+				Verdict: domain.VerdictInconclusive, FailureClass: failureClassPtr(domain.FailureClassEnvironment),
+			},
+		},
+		{
 			name: "db assertion is submitted like any other assertion", snapshot: finishDBSnapshot(),
 			steps: withoutEvidence(passedSteps()), assertions: dbFailedAssertions(),
 			decision: domain.FinishDecision{
@@ -207,6 +233,25 @@ func TestValidateFinishMatrix(t *testing.T) {
 			steps: passedSteps(), assertions: passedAssertions(),
 			decision: domain.FinishDecision{
 				Verdict: domain.VerdictInconclusive, FailureClass: failureClassPtr(domain.FailureClassSession),
+			},
+			wantReason: "invalid_failure_class",
+		},
+		{
+			name: "inconclusive environment requires a visual mismatch", snapshot: finishSnapshot(),
+			steps: passedSteps(), assertions: passedAssertions(),
+			decision: domain.FinishDecision{
+				Verdict: domain.VerdictInconclusive, FailureClass: failureClassPtr(domain.FailureClassEnvironment),
+			},
+			wantReason: "invalid_failure_class",
+		},
+		{
+			name: "inconclusive environment without the visual reason is rejected", snapshot: finishVisualSnapshot(),
+			steps: withoutEvidence(passedSteps()),
+			assertions: append(passedAssertions(), domain.AssertionResult{
+				AssertionID: 12, Kind: "visual", Verdict: "not_run", FailureReason: "visual_executor_failed",
+			}),
+			decision: domain.FinishDecision{
+				Verdict: domain.VerdictInconclusive, FailureClass: failureClassPtr(domain.FailureClassEnvironment),
 			},
 			wantReason: "invalid_failure_class",
 		},
