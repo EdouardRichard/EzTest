@@ -398,7 +398,13 @@ func TestActionTimeout(t *testing.T) {
 		started := make(chan struct{})
 		var once sync.Once
 		var requests atomic.Int32
+		var cancels atomic.Int32
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/cancel") {
+				cancels.Add(1)
+				writeJSON(w, http.StatusOK, map[string]any{"ok": true, "result": map[string]any{"canceled": true}})
+				return
+			}
 			requests.Add(1)
 			once.Do(func() { close(started) })
 			<-release
@@ -415,7 +421,10 @@ func TestActionTimeout(t *testing.T) {
 			defer cancel()
 		}
 		_, err := client.Action(ctx, browser.ContextRef{ID: "ctx_1"}, browser.Action{Name: "click"})
-		assertBrowserErrorCode(t, err, "timeout")
+		// A timeout of the executor call itself stays distinguishable from an
+		// action-level timeout: it is the model-classified executor_timeout of
+		// design spec §10.5, and the abandoned executor context is canceled.
+		assertBrowserErrorCode(t, err, "executor_timeout")
 		select {
 		case <-started:
 		case <-time.After(2 * time.Second):
@@ -423,6 +432,9 @@ func TestActionTimeout(t *testing.T) {
 		}
 		if got := requests.Load(); got != 1 {
 			t.Fatalf("action requests = %d, want exactly 1", got)
+		}
+		if got := cancels.Load(); got != 1 {
+			t.Fatalf("executor cancel requests = %d, want exactly 1 (the timed-out context must be canceled)", got)
 		}
 	}
 

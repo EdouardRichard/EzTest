@@ -1609,6 +1609,9 @@ type schedBrowser struct {
 	closed   []ContextRef
 	canceled []ContextRef
 	newErr   error
+	// failures is the per-case-run terminal signal the execution tools report
+	// (tool-call budget exhaustion, executor timeout).
+	failures map[int64]string
 }
 
 func newSchedBrowser() *schedBrowser { return &schedBrowser{} }
@@ -1628,6 +1631,24 @@ func (b *schedBrowser) NewContext(ctx context.Context, spec ContextSpec) (Contex
 
 func (b *schedBrowser) Action(ctx context.Context, ref ContextRef, action Action) (ActionResult, error) {
 	return ActionResult{}, nil
+}
+
+// CaseRunFailure implements CaseRunFailureSignaler.
+func (b *schedBrowser) CaseRunFailure(caseRunID int64) (string, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	code, ok := b.failures[caseRunID]
+	return code, ok
+}
+
+// setFailure records the terminal signal of one case run.
+func (b *schedBrowser) setFailure(caseRunID int64, code string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.failures == nil {
+		b.failures = make(map[int64]string)
+	}
+	b.failures[caseRunID] = code
 }
 
 func (b *schedBrowser) Cancel(ctx context.Context, ref ContextRef) error {

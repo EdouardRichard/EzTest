@@ -15,6 +15,11 @@ import { chromium } from "playwright"
 
 import { executeAction } from "./actions.mjs"
 import {
+  DEFAULT_ALLOWED_HOSTS,
+  isWebSocketAllowed,
+  parseAllowedHosts,
+} from "./limits.mjs"
+import {
   DEFAULT_MAX_CONTEXTS,
   ExecutorError,
   hostFromUrl,
@@ -244,6 +249,62 @@ function classifyUrl(entry, url) {
 }
 
 /**
+ * Installs the WebSocket allow-list guard of one browser context (design spec
+ * §10.5). Every WebSocket opened by a page of the context must pass both the
+ * context's allowedHosts and the executor-wide allow list
+ * (EZTEST_EXEC_ALLOWED_HOSTS). A rejected connection is recorded in the context
+ * network log, closed with 1008 (policy violation) and surfaced to the next
+ * action as host_not_allowed.
+ *
+ * Playwright's HTTP guards (CDP Fetch and context.route) never see WebSocket
+ * handshakes, so this dedicated guard is the only enforcement point.
+ */
+async function installWebSocketGuard(entry, browserContext, executorAllowedHosts, logger = null) {
+  if (typeof browserContext.routeWebSocket !== "function") {
+    // Fail closed: an executor that cannot intercept WebSockets must not run
+    // contexts whose WebSocket traffic would bypass the allow list.
+    throw new ExecutorError("internal", "the browser context cannot intercept WebSocket connections")
+  }
+  await browserContext.routeWebSocket(/.*/, (webSocket) => {
+    const url = typeof webSocket.url === "function" ? webSocket.url() : ""
+    if (isWebSocketAllowed(url, entry.allowedHosts, executorAllowedHosts)) {
+      webSocket.connectToServer()
+      return
+    }
+    let host = ""
+    try {
+      host = new URL(url).hostname
+    } catch {
+      host = ""
+    }
+    const recorded = {
+      url: scrub(url, entry.secrets),
+      host: host === "" ? null : host,
+    }
+    entry.blockedWebSocket = recorded
+    pushRing(entry.networkItems, {
+      method: "WS",
+      url: recorded.url,
+      status: null,
+      duration_ms: 0,
+      mime: null,
+      error: "host_not_allowed",
+    })
+    logger?.warn?.(
+      scrub(
+        `[executor] blocked WebSocket connection of ${entry.contextId} to ${host || url}`,
+        entry.secrets,
+      ),
+    )
+    try {
+      webSocket.close({ code: 1008, reason: "host_not_allowed" })
+    } catch {
+      webSocket.close()
+    }
+  })
+}
+
+/**
  * Enforces the host allow list for every request of `page`, including redirect
  * hops and subresources.
  *
@@ -397,11 +458,15 @@ export class ContextManager {
   #creating = 0
   #allowDataPages
   #readiness = null
+  // Executor-wide WebSocket allow list (EZTEST_EXEC_ALLOWED_HOSTS). It is an
+  // additional restriction on top of every context's own allowedHosts.
+  #allowedHosts
 
   constructor({
     maxContexts = DEFAULT_MAX_CONTEXTS,
     launch,
     logger = null,
+    allowedHosts = parseAllowedHosts(process.env.EZTEST_EXEC_ALLOWED_HOSTS),
     allowDataPages = process.env.EZTEST_EXECUTOR_ALLOW_DATA_PAGES === "1",
   } = {}) {
     const parsed = Number(maxContexts)
@@ -409,6 +474,9 @@ export class ContextManager {
     this.#launcher = typeof launch === "function" ? launch : launchChromium
     this.#logger = logger
     this.#allowDataPages = allowDataPages === true
+    this.#allowedHosts = normalizeAllowedHosts(
+      Array.isArray(allowedHosts) && allowedHosts.length > 0 ? allowedHosts : [...DEFAULT_ALLOWED_HOSTS],
+    )
   }
 
   get size() {
@@ -417,6 +485,11 @@ export class ContextManager {
 
   get maxContexts() {
     return this.#maxContexts
+  }
+
+  // allowedHosts is the executor-wide WebSocket allow list.
+  get allowedHosts() {
+    return [...this.#allowedHosts]
   }
 
   async #getBrowser() {
@@ -539,6 +612,7 @@ export class ContextManager {
         networkItems: [],
         pendingRequests: new Map(),
         blocked: null,
+        blockedWebSocket: null,
         secrets: new Set(),
         tmpDir: null,
         closed: false,
@@ -567,6 +641,7 @@ export class ContextManager {
         }, sessionStorage)
       }
       await installEarlyRouteGuard(entry, browserContext)
+      await installWebSocketGuard(entry, browserContext, this.#allowedHosts, this.#logger)
       entry.guardPage = (page) => {
         let pending = entry.pageGuards.get(page)
         if (!pending) {
@@ -636,6 +711,21 @@ export class ContextManager {
         throw new ExecutorError("canceled", "action was canceled before it started")
       }
       entry.blocked = null
+      const takeBlockedWebSocket = () => {
+        if (!entry.blockedWebSocket) {
+          return null
+        }
+        const blocked = entry.blockedWebSocket
+        entry.blockedWebSocket = null
+        return new ExecutorError(
+          "host_not_allowed",
+          `WebSocket connection is not allowed: ${blocked.host ?? blocked.url}`,
+        )
+      }
+      const blockedBefore = takeBlockedWebSocket()
+      if (blockedBefore) {
+        throw blockedBefore
+      }
       if (!entry.page) {
         entry.page = await entry.newPage()
       }
@@ -643,6 +733,13 @@ export class ContextManager {
       entry.currentToken = operation
       try {
         const { result, artifacts } = await executeAction(entry, request, controller.signal)
+        // A cross-host WebSocket opened while the action ran (for example a
+        // page script that connects during goto) fails that action too: it is
+        // recorded in the network log and must not be silently ignored.
+        const blockedDuring = takeBlockedWebSocket()
+        if (blockedDuring) {
+          throw blockedDuring
+        }
         return artifacts && artifacts.length > 0
           ? { ok: true, result, artifacts }
           : { ok: true, result }
@@ -652,6 +749,15 @@ export class ContextManager {
           // operation keeps running unless the page is torn down. Recover before
           // this action leaves the queue so the next action gets a clean page.
           await this.#recoverCanceledPage(entry, operation.page, operation)
+        } else if (error instanceof ExecutorError && error.code === "executor_timeout") {
+          // The hard deadline won over a background browser task that ignored
+          // its own timeout (design spec §10.5). Cancel the operation and
+          // replace the page so it cannot keep the context wedged.
+          controller.abort()
+          await this.#recoverCanceledPage(entry, operation.page, operation)
+          this.#logger?.warn?.(
+            `[executor] ${entry.contextId} action exceeded its hard deadline; page recovered`,
+          )
         }
         if (error instanceof ExecutorError) {
           error.message = scrub(error.message, entry.secrets)

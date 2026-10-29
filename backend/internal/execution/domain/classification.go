@@ -44,8 +44,9 @@ func classifyToolCode(code string) toolCodeClass {
 		return toolCodeEnvironment
 	case "session_unauthorized", "session_expired", "session_invalid", "no_session":
 		return toolCodeSession
-	case "budget_exhausted", "budget_exceeded", "context_overflow", "max_turns",
-		"model_error", "llm_error", "gateway_error", "internal":
+	case "budget_exhausted", "budget_exceeded", "tool_call_budget_exhausted",
+		"context_overflow", "max_turns", "model_error", "llm_error",
+		"gateway_error", "internal", "executor_timeout":
 		return toolCodeModel
 	case "unsupported_assertion_kind", "invalid_arguments", "invalid_selector",
 		"invalid_finish", "target_ambiguous", "case_invalid", "invalid_case",

@@ -59,6 +59,10 @@ type Config struct {
 	// AutonomyBatchesPerTick is the autonomous worker's per-tick batch budget
 	// (spec §16.1: 1–20, default 4).
 	AutonomyBatchesPerTick int
+	// AnalysisMaxCases and SupplementMaxCases are the P8 wired per-run caps of
+	// the failure analysis and supplement runs (design spec §10.5/§11.4).
+	AnalysisMaxCases   int
+	SupplementMaxCases int
 	// ExecMaxConcurrentCases, ExecMaxToolCalls, ExecCaseTimeoutMS,
 	// ExecMaxCasesPerBatch, ExecWorkerIntervalMS, ExecEvidenceMaxBytes and
 	// ExecEvidencePerCase are the P6 execution engine limits (spec §5.3, §5.5,
@@ -179,9 +183,9 @@ const (
 	defaultExecMaxConcurrent    = 3
 	minExecMaxConcurrent        = 1
 	maxExecMaxConcurrent        = 8
-	defaultExecMaxToolCalls     = 80
+	defaultExecMaxToolCalls     = 30
 	minExecMaxToolCalls         = 1
-	maxExecMaxToolCalls         = 1000
+	maxExecMaxToolCalls         = 200
 	defaultExecCaseTimeoutMS    = 900000
 	minExecCaseTimeoutMS        = 1000
 	maxExecCaseTimeoutMS        = 3600000
@@ -240,6 +244,15 @@ const (
 	defaultAutonomyBatchesPerTick = 4
 	minAutonomyBatchesPerTick     = 1
 	maxAutonomyBatchesPerTick     = 20
+	// defaultAnalysisMaxCases, defaultSupplementMaxCases and their bounds are
+	// the P8 wiring targets of design spec §11.4
+	// (EZTEST_ANALYSIS_MAX_CASES / EZTEST_SUPPLEMENT_MAX_CASES).
+	defaultAnalysisMaxCases   = 20
+	minAnalysisMaxCases       = 1
+	maxAnalysisMaxCases       = 50
+	defaultSupplementMaxCases = 5
+	minSupplementMaxCases     = 1
+	maxSupplementMaxCases     = 20
 )
 
 // defaultAgentHTTPAllowlist is the localhost-only HTTP allowlist applied when
@@ -431,7 +444,11 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 	cfg.DBSQLMaxBytes = dbSQLMaxBytes
 
-	autonomyBatchesPerTick, err := parseBoundedInt(getenv, "EZTEST_AUTONOMY_BATCHES_PER_TICK",
+	// The autonomous worker budget clamps values above the spec ceiling to 20
+	// (design spec §10.5: "上限钳制"): a typo must not fail startup and must not
+	// let one tick scan the whole database. Values below 1 or non-integers stay
+	// hard configuration errors.
+	autonomyBatchesPerTick, err := parseUpperClampedInt(getenv, "EZTEST_AUTONOMY_BATCHES_PER_TICK",
 		defaultAutonomyBatchesPerTick, minAutonomyBatchesPerTick, maxAutonomyBatchesPerTick)
 	if err != nil {
 		return Config{}, err
@@ -481,6 +498,20 @@ func Load(getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 	cfg.GCBatchKeep = gcBatchKeep
+
+	analysisMaxCases, err := parseBoundedInt(getenv, "EZTEST_ANALYSIS_MAX_CASES",
+		defaultAnalysisMaxCases, minAnalysisMaxCases, maxAnalysisMaxCases)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.AnalysisMaxCases = analysisMaxCases
+
+	supplementMaxCases, err := parseBoundedInt(getenv, "EZTEST_SUPPLEMENT_MAX_CASES",
+		defaultSupplementMaxCases, minSupplementMaxCases, maxSupplementMaxCases)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.SupplementMaxCases = supplementMaxCases
 
 	cfg.InstanceID = valueOr(getenv, "EZTEST_INSTANCE_ID", defaultInstanceID())
 	if count := utf8.RuneCountInString(cfg.InstanceID); count > maxInstanceIDLength {
@@ -613,6 +644,25 @@ func parseBoundedInt(getenv func(string) string, key string, def, min, max int) 
 	value, err := strconv.Atoi(raw)
 	if err != nil || value < min || value > max {
 		return 0, fmt.Errorf("config: %s must be an integer between %d and %d, got %q", key, min, max, raw)
+	}
+	return value, nil
+}
+
+// parseUpperClampedInt parses one bounded integer setting whose upper overflow
+// is clamped instead of rejected (design spec §10.5: EZTEST_AUTONOMY_BATCHES_PER_TICK
+// upper-bound clamp). An empty value selects def; a non-integer or a value below
+// min is an error so a typo cannot silently disable the feature.
+func parseUpperClampedInt(getenv func(string) string, key string, def, min, max int) (int, error) {
+	raw := strings.TrimSpace(getenv(key))
+	if raw == "" {
+		return def, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < min {
+		return 0, fmt.Errorf("config: %s must be an integer between %d and %d, got %q", key, min, max, raw)
+	}
+	if value > max {
+		return max, nil
 	}
 	return value, nil
 }

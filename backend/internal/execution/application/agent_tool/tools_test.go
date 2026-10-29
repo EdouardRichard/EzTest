@@ -1341,3 +1341,71 @@ func TestVisualAssertToolIsRegistered(t *testing.T) {
 	}
 }
 
+// TestToolCallBudgetDeniesOverLimitCalls pins the P8 tool-call budget
+// (EZTEST_EXEC_MAX_TOOL_CALLS): the first N calls of one case run execute, the
+// (N+1)th is denied with the stable code and the run is reported as budget
+// exhausted to the case runner.
+func TestToolCallBudgetDeniesOverLimitCalls(t *testing.T) {
+	set := NewToolSet(&fakeRecorder{view: defaultView()}, nil, nil, nil, Limits{MaxToolCalls: 2})
+	tools := set.Tools()
+
+	for call := 1; call <= 2; call++ {
+		if _, err := callTool(t, tools, "execution.case_context", `{}`); err != nil {
+			t.Fatalf("call %d within the budget: %v", call, err)
+		}
+	}
+	if code, ok := set.CaseRunFailure(testInvocation.CaseRunID); ok {
+		t.Fatalf("a run within its budget reported a failure %q", code)
+	}
+
+	_, err := callTool(t, tools, "execution.case_context", `{}`)
+	requireToolError(t, err, "tool_call_budget_exhausted")
+	code, ok := set.CaseRunFailure(testInvocation.CaseRunID)
+	if !ok || code != "tool_call_budget_exhausted" {
+		t.Fatalf("case run failure = %q/%v, want tool_call_budget_exhausted", code, ok)
+	}
+
+	// A later call of the same run stays denied and the counter is not reset.
+	_, err = callTool(t, tools, "execution.case_context", `{}`)
+	requireToolError(t, err, "tool_call_budget_exhausted")
+
+	// Another case run has its own independent budget.
+	other := testInvocation
+	other.CaseRunID = 23
+	if _, err := callToolWithInvocation(t, tools, "execution.case_context", `{}`, other); err != nil {
+		t.Fatalf("another case run was charged for the first run's calls: %v", err)
+	}
+}
+
+// TestExecutorTimeoutMarksCaseRunFailure pins the P8 executor timeout contract:
+// an action that timed out in the executor surfaces the stable executor_timeout
+// code and reports it to the case runner as a terminal model failure.
+func TestExecutorTimeoutMarksCaseRunFailure(t *testing.T) {
+	browser := testutil.NewFakeBrowserExecutor()
+	browser.ScriptAction(application.ActionResult{
+		ErrorCode:    "executor_timeout",
+		ErrorMessage: "action timed out and the browser context was recovered",
+	})
+	set := NewToolSet(&fakeRecorder{view: defaultView()}, browser, &fakeEvidence{}, nil,
+		Limits{MaxToolCalls: 5})
+
+	_, err := callTool(t, set.Tools(), "browser.snapshot", `{}`)
+	requireToolError(t, err, "executor_timeout")
+	code, ok := set.CaseRunFailure(testInvocation.CaseRunID)
+	if !ok || code != "executor_timeout" {
+		t.Fatalf("case run failure = %q/%v, want executor_timeout", code, ok)
+	}
+
+	// Once the executor timeout is recorded every further tool call is denied:
+	// the run must not be able to finish as passed afterwards.
+	_, err = callTool(t, set.Tools(), "execution.case_context", `{}`)
+	requireToolError(t, err, "executor_timeout")
+
+	// Closing the case context forgets the signal so a re-dispatch is clean.
+	if err := set.CloseCase(context.Background(), testInvocation.CaseRunID); err != nil {
+		t.Fatalf("CloseCase: %v", err)
+	}
+	if code, ok := set.CaseRunFailure(testInvocation.CaseRunID); ok {
+		t.Fatalf("case run failure %q survived CloseCase", code)
+	}
+}

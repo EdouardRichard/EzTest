@@ -647,6 +647,54 @@ func analysisAuditActions(entries []AnalysisAuditEvent) []string {
 	return actions
 }
 
+// TestStartFailureHonorsConfiguredMaxCases pins the P8 wiring of
+// EZTEST_ANALYSIS_MAX_CASES (design spec §10.5/§11.4): the configured budget,
+// not the compiled default, bounds the failed cases copied into a run.
+func TestStartFailureHonorsConfiguredMaxCases(t *testing.T) {
+	h := newAnalysisHarness()
+	h.service = NewAnalysisService(AnalysisDeps{
+		Runs:       h.store,
+		Execution:  h.execution,
+		Issues:     h.issues,
+		OpenIssues: h.openIssues,
+		Anchors:    h.anchors,
+		Agents:     h.agents,
+		Profiles:   h.profiles,
+		Events:     h.events,
+		Audit:      h.audit,
+		IDs:        h.ids,
+		Clock:      h.clock,
+		MaxCases:   3,
+	})
+	for index := int64(0); index < 5; index++ {
+		h.execution.cases = append(h.execution.cases, AnalysisFailedCase{
+			CaseRunID: 100 + index, CaseNodeID: 200 + index, FailureClass: "application",
+		})
+	}
+
+	run, err := h.service.StartFailure(context.Background(), 7, 9, 42)
+	if err != nil {
+		t.Fatalf("StartFailure: %v", err)
+	}
+	if h.execution.lastLimit != 4 {
+		t.Fatalf("execution limit = %d, want MaxCases+1 = 4", h.execution.lastLimit)
+	}
+	input, err := domain.DecodeFailureInput(run.Input)
+	if err != nil {
+		t.Fatalf("decode failure input: %v", err)
+	}
+	if len(input.CaseRunIDs) != 3 {
+		t.Fatalf("input case runs = %v, want the configured 3", input.CaseRunIDs)
+	}
+	var stats map[string]any
+	if err := json.Unmarshal(run.Stats, &stats); err != nil {
+		t.Fatalf("decode stats %s: %v", run.Stats, err)
+	}
+	if stats["truncated"] != true {
+		t.Fatalf("stats = %v, want truncated=true", stats)
+	}
+}
+
 // TestStartFailureFiltersApplicationFailuresAndTruncates pins spec §5.6/§6.3:
 // only failed(application) case runs enter the input, at most 20, and the
 // overflow is recorded in stats instead of failing.

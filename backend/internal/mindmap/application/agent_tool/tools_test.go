@@ -405,6 +405,37 @@ func TestSupplementCaseProposeCapsAtFive(t *testing.T) {
 	}
 }
 
+// TestSupplementCaseProposeHonorsConfiguredMaxCases pins the P8 wiring of
+// EZTEST_SUPPLEMENT_MAX_CASES (design spec §10.5/§11.4): the configured budget
+// bounds the accumulated supplement cases instead of the compiled default.
+func TestSupplementCaseProposeHonorsConfiguredMaxCases(t *testing.T) {
+	run := testRun(mindmapapp.RunKindSupplement)
+	deps, store := validDeps(run)
+	deps.MaxCases = 2
+	tools := NewTools(deps)
+	ctx := toolContext(run, 2)
+	propose := toolByName(t, tools, "supplement.case_propose")
+
+	payload := executeTool(t, propose, ctx, proposedCases(
+		proposedCase("case 1", "11"), proposedCase("case 2", "11"),
+		proposedCase("case 3", "11")))
+	if accepted, _ := payload["accepted"].(float64); accepted != 2 {
+		t.Fatalf("accepted=%v want the configured 2 (payload=%v)", payload["accepted"], payload)
+	}
+	if !warningsContain(payload["warnings"], "case_limit_reached") {
+		t.Fatalf("warnings=%v want case_limit_reached", payload["warnings"])
+	}
+	var stored struct {
+		Cases []json.RawMessage `json:"cases"`
+	}
+	if err := json.Unmarshal(store.runs[run.ID].Result, &stored); err != nil {
+		t.Fatalf("stored result: %v", err)
+	}
+	if len(stored.Cases) != 2 {
+		t.Fatalf("stored %d cases, want the configured 2", len(stored.Cases))
+	}
+}
+
 // TestSupplementAffectedCasesGatesAndCaps pins the incremental_design-only gate,
 // the node ownership/status validation and the 20-entry cap.
 func TestSupplementAffectedCasesGatesAndCaps(t *testing.T) {

@@ -48,6 +48,17 @@ func TestClassifyToolCodeMatrix(t *testing.T) {
 			wantReason: "budget_exhausted",
 		},
 		{
+			name:        "tool call budget exhaustion is model",
+			code:        "tool_call_budget_exhausted",
+			wantVerdict: domain.VerdictInconclusive, wantClass: domain.FailureClassModel,
+			wantReason: "tool_call_budget_exhausted",
+		},
+		{
+			name: "executor timeout is model", code: "executor_timeout",
+			wantVerdict: domain.VerdictInconclusive, wantClass: domain.FailureClassModel,
+			wantReason: "executor_timeout",
+		},
+		{
 			name: "db assertion kind is case", code: "unsupported_assertion_kind",
 			wantVerdict: domain.VerdictInconclusive, wantClass: domain.FailureClassCase,
 			wantReason: "unsupported_assertion_kind",
