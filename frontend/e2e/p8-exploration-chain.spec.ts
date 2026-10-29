@@ -39,13 +39,14 @@ import {
  * 2. open `?tab=exploration`, prove all four node layers render without an
  *    error/degraded banner, and read the same snapshot from the API to assert
  *    the UI counts are the real read-model counts;
- * 3. open the issue node Sheet, load its evidence and follow the issue deep link;
+ * 3. click the issue card on the real React Flow canvas (real pointer, hit-test
+ *    asserted against the filter toolbar) and follow its deep link;
  * 4. collapse/expand the first requirement and assert the visible/hidden counts;
  * 5. enable 「仅异常」 and assert the passing supplement nodes disappear while
  *    the failed baseline result stays;
  * 6. abort the SSE transport and assert the chain still renders with 重连中;
  * 7. seed >100 requirements through psql and assert the `chain-truncated`
- *    banner on the second version;
+ *    banner on the second version, then remove that throwaway fixture;
  * 8. assert no unexpected console error and no credential is rendered.
  *
  * Nothing is mocked. The truncation fixture inserts reserved high ids through
@@ -199,24 +200,60 @@ function seedTruncatedRequirements(versionId: string): void {
   expect(count, "the truncation fixture must insert 101 requirements").toBe("101")
 }
 
+/**
+ * Removes the throwaway truncation version and its 101 requirements. The E2E
+ * script does reset `eztest_e2e` before each run, but the spec still owns what
+ * it creates: leaving the fixture behind would make a local dev DB (and any
+ * later assertion that lists versions) see an orphan 101-requirement version.
+ */
+function cleanupTruncatedRequirements(versionId: string): void {
+  expect(versionId).toMatch(/^\d+$/)
+  runPsql(`
+    DELETE FROM requirement WHERE version_id = ${versionId}::bigint;
+    DELETE FROM version WHERE id = ${versionId}::bigint;
+  `)
+  const remaining = runPsql(
+    `SELECT (SELECT count(*) FROM requirement WHERE version_id = ${versionId}::bigint)::text
+            || '|' ||
+            (SELECT count(*) FROM version WHERE id = ${versionId}::bigint)::text;`,
+  )
+  expect(remaining, "the truncation fixture must be removed after the assertion").toBe("0|0")
+}
+
 // --- browser helpers --------------------------------------------------------
 
 type BrowserError = { text: string; url: string }
 
 /**
+ * Known dev-server noise that is not an application failure. Deliberately tiny:
+ * a 404 for an API call, a Next.js chunk or any other page resource must still
+ * fail the spec instead of being swallowed by a generic "404" filter.
+ */
+const IGNORED_CONSOLE_ERRORS: readonly RegExp[] = [/favicon\.ico/i, /Download the React DevTools/i]
+
+/**
  * Collects browser console errors and page errors with their request URL, so
- * the deliberate SSE abort can be distinguished from a real page error.
- * Next.js dev-mode favicon/404 noise is filtered like the other P8 specs do.
+ * the deliberate SSE abort can be distinguished from a real page error. Only
+ * the favicon 404 and the React DevTools hint are filtered; every other 404
+ * (API included) stays in the list.
  */
 function captureBrowserErrors(page: Page): { errors: BrowserError[]; stop: () => void } {
   const errors: BrowserError[] = []
   const onConsole = (message: ConsoleMessage): void => {
     if (message.type() !== "error") return
     const text = message.text()
-    if (/favicon\.ico/i.test(text)) return
-    if (/Failed to load resource: the server responded with a status of 404/i.test(text)) return
-    if (/Download the React DevTools/i.test(text)) return
-    errors.push({ text, url: message.location().url })
+    const url = message.location().url
+    if (IGNORED_CONSOLE_ERRORS.some((pattern) => pattern.test(text))) return
+    // The browser reports a failed resource fetch as a generic 404 console
+    // message; only the favicon request may be ignored. An API 404 keeps its
+    // entry (the URL is the fetch target, not the page) and fails the spec.
+    if (
+      /Failed to load resource: the server responded with a status of 404/i.test(text) &&
+      /\/favicon\.ico(?:\?|$)/i.test(url)
+    ) {
+      return
+    }
+    errors.push({ text, url })
   }
   const onPageError = (error: Error): void => {
     errors.push({ text: `pageerror: ${error.message}`, url: "" })
@@ -249,10 +286,10 @@ async function openExploration(page: Page, versionId: string): Promise<void> {
 }
 
 /**
- * Switches between the canvas and the list-view fallback. The floating filter
- * toolbar overlays the top of the canvas, so on a 1280x720 viewport the first
- * node row can start underneath it; the Sheet is opened from the list view so
- * the flow does not depend on the viewport scroll position.
+ * Switches between the canvas and the list-view fallback. The issue Sheet is
+ * opened from the canvas with a real pointer click; the list view stays the
+ * deterministic path for the requirement collapse control (a requirement card
+ * can still sit under the legend overlay at the canvas' left edge).
  */
 async function selectListView(page: Page): Promise<void> {
   await page.getByTestId("chain-toolbar-list").click()
@@ -396,14 +433,54 @@ test("P8 探索链路：四类节点 / 问题 Sheet / 筛选 / 折叠 / 截断 /
       await page.screenshot({ path: wave1Screenshot("p8-chain-01-overview.png"), fullPage: true })
     })
 
-    await test.step("issue node Sheet shows evidence and the issue deep link", async () => {
-      // The floating toolbar overlays the top of the canvas at 1280x720, so a
-      // pointer reaches the baseline issue through the list-view fallback; the
-      // Sheet itself is the same component the canvas opens.
-      await selectListView(page)
-      const issueRow = page.getByTestId(`chain-list-open-${issue.issue.id}`)
-      await expect(issueRow).toBeVisible({ timeout: 30_000 })
-      await issueRow.click()
+    await test.step("issue node opens its Sheet from a real canvas click", async () => {
+      // No list view and no programmatic selection: the real React Flow card is
+      // clicked with the pointer. The toolbar owns its own row above the canvas
+      // (chain-workspace-toolbar), so the top node row must be clickable at the
+      // default 1280x720 viewport without panning first.
+      await expect(page.getByTestId("chain-list-view")).toHaveCount(0)
+      const issueNode = page.getByTestId(chainNodeTestId(`issue:${issue.issue.id}`))
+      await expect(issueNode).toBeVisible({ timeout: 60_000 })
+      await issueNode.scrollIntoViewIfNeeded()
+      type HitProbe = {
+        x: number
+        y: number
+        viewportWidth: number
+        viewportHeight: number
+        hitTestId: string
+        hitInsideToolbar: boolean
+        issueReceivesHit: boolean
+      }
+      const hit = await issueNode.evaluate((element): HitProbe => {
+        const rect = element.getBoundingClientRect()
+        const x = rect.left + rect.width / 2
+        const y = rect.top + rect.height / 2
+        const target = document.elementFromPoint(x, y)
+        const toolbar = document.querySelector<HTMLElement>('[data-testid="chain-toolbar"]')
+        return {
+          x,
+          y,
+          viewportWidth: window.innerWidth,
+          viewportHeight: window.innerHeight,
+          hitTestId: target?.getAttribute("data-testid") ?? target?.tagName ?? "none",
+          hitInsideToolbar: target !== null && toolbar?.contains(target) === true,
+          issueReceivesHit: target !== null && element.contains(target),
+        }
+      })
+      expect(
+        hit.x >= 0 && hit.y >= 0 && hit.x < hit.viewportWidth && hit.y < hit.viewportHeight,
+        `the issue node center (${hit.x}, ${hit.y}) must be inside the viewport`,
+      ).toBe(true)
+      expect(
+        hit.hitInsideToolbar,
+        `the issue node center must not be covered by the filter toolbar (hit ${hit.hitTestId})`,
+      ).toBe(false)
+      expect(
+        hit.issueReceivesHit,
+        `the issue node center must receive the pointer, not ${hit.hitTestId}`,
+      ).toBe(true)
+
+      await issueNode.click()
       const sheet = page.getByTestId("chain-sheet")
       await expect(sheet).toBeVisible({ timeout: 30_000 })
       await expect(sheet).toHaveAttribute("data-node-id", `issue:${issue.issue.id}`)
@@ -438,9 +515,10 @@ test("P8 探索链路：四类节点 / 问题 Sheet / 筛选 / 折叠 / 截断 /
       await expect
         .poll(() => visibleCount(page), { timeout: 60_000 })
         .toBe(snapshotAll.nodes.length)
-      // Use the list-view fallback so the collapse control is never behind the
-      // floating toolbar; the Sheet control is the same state the canvas toggle
-      // drives.
+      // The list view stays the deterministic path for the requirement control:
+      // a requirement card can still sit under the legend overlay at the
+      // canvas' left edge. The Sheet control drives the same collapse state as
+      // the canvas double click.
       await selectListView(page)
       await page.getByTestId(`chain-list-open-${seeded.seed.requirements[0].id}`).click()
       const sheet = page.getByTestId("chain-sheet")
@@ -533,20 +611,31 @@ test("P8 探索链路：四类节点 / 问题 Sheet / 筛选 / 折叠 / 截断 /
         name: `P8 截断验证 ${seeded.seed.suffix}`,
         label: `p8-truncated-${seeded.seed.suffix}`,
       })
-      seedTruncatedRequirements(truncatedVersion.id)
+      try {
+        seedTruncatedRequirements(truncatedVersion.id)
 
-      await openExploration(page, truncatedVersion.id)
-      const banner = page.getByTestId("chain-truncated")
-      await expect(banner).toBeVisible({ timeout: 60_000 })
-      await expect(banner).toContainText("已显示前 100 条（共 101 条）")
-      await expect(banner).toContainText("需求层已截断")
-      await expect(page.getByTestId("exploration-visible-count")).toHaveText("可见 100 个节点", {
-        timeout: 60_000,
-      })
-      await page.screenshot({
-        path: wave1Screenshot("p8-chain-06-truncated.png"),
-        fullPage: true,
-      })
+        await openExploration(page, truncatedVersion.id)
+        const banner = page.getByTestId("chain-truncated")
+        await expect(banner).toBeVisible({ timeout: 60_000 })
+        await expect(banner).toContainText("已显示前 100 条（共 101 条）")
+        await expect(banner).toContainText("需求层已截断")
+        await expect(page.getByTestId("exploration-visible-count")).toHaveText("可见 100 个节点", {
+          timeout: 60_000,
+        })
+        // The count label is layout-derived; wait for the rendered node layer
+        // itself so the evidence screenshot never captures an empty canvas.
+        await expect(page.locator('[data-testid^="chain-node-"]').first()).toBeVisible({
+          timeout: 60_000,
+        })
+        await page.screenshot({
+          path: wave1Screenshot("p8-chain-06-truncated.png"),
+          fullPage: true,
+        })
+      } finally {
+        // The spec removes the 101 requirements and the throwaway version it
+        // created, so a local dev DB does not accumulate orphan fixtures.
+        cleanupTruncatedRequirements(truncatedVersion.id)
+      }
     })
 
     await test.step("no credential leaks and no unexpected console error", async () => {

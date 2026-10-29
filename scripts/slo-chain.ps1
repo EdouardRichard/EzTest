@@ -74,6 +74,9 @@ $frontendDir = Join-Path $repoRoot "frontend"
 $tmpDir = Join-Path $repoRoot ".tmp\p8-slo-chain"
 $metricsPath = Join-Path $tmpDir "metrics.json"
 $reportPath = Join-Path $repoRoot "docs\acceptance\p8\slo-chain.md"
+# The measured JSON is committed next to the report, not only left under the
+# gitignored .tmp directory, so reviewers can audit raw samples/histograms.
+$metricsDocPath = Join-Path $repoRoot "docs\acceptance\p8\slo-chain-metrics.json"
 $probePath = Join-Path $tmpDir "canvas-probe.cjs"
 
 # Design spec section 5.2 (API) and section 1.5/section 5.8 (canvas interactive) thresholds.
@@ -590,6 +593,7 @@ function Write-Outputs {
     )
     New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $reportPath) | Out-Null
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $metricsDocPath) | Out-Null
 
     $failed = @($checks | Where-Object { $_.Status -eq "FAIL" })
     $failedMeasurements = @($measurements.Keys | Where-Object { $measurements[$_].status -eq "FAIL" })
@@ -616,7 +620,10 @@ function Write-Outputs {
         measurements = $measurements
         note         = $Note
     }
-    [System.IO.File]::WriteAllText($metricsPath, ($metrics | ConvertTo-Json -Depth 8),
+    $metricsJSON = $metrics | ConvertTo-Json -Depth 8
+    [System.IO.File]::WriteAllText($metricsPath, $metricsJSON,
+        (New-Object System.Text.UTF8Encoding($false)))
+    [System.IO.File]::WriteAllText($metricsDocPath, $metricsJSON,
         (New-Object System.Text.UTF8Encoding($false)))
 
     $builder = New-Object System.Text.StringBuilder
@@ -627,6 +634,7 @@ function Write-Outputs {
     [void]$builder.AppendLine("- Generated (UTC): $((Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ"))")
     [void]$builder.AppendLine("- API: ``$ApiBase``")
     [void]$builder.AppendLine("- Web: ``$(if ([string]::IsNullOrWhiteSpace($WebBase)) { "(not supplied)" } else { $WebBase })``")
+    [void]$builder.AppendLine("- Metrics JSON: ``docs/acceptance/p8/slo-chain-metrics.json`` (mirror of ``.tmp/p8-slo-chain/metrics.json``)")
     [void]$builder.AppendLine("- Overall status: **$($status.ToUpperInvariant())**")
     if (-not [string]::IsNullOrWhiteSpace($Note)) {
         [void]$builder.AppendLine("- Note: $Note")
@@ -686,6 +694,7 @@ function Write-Outputs {
     [System.IO.File]::WriteAllText($reportPath, $builder.ToString(), (New-Object System.Text.UTF8Encoding($false)))
     Write-Host ""
     Write-Host "Metrics: $metricsPath" -ForegroundColor Green
+    Write-Host "Metrics (acceptance): $metricsDocPath" -ForegroundColor Green
     Write-Host "Report: $reportPath" -ForegroundColor Green
     Write-Host "Status: $($status.ToUpperInvariant())" -ForegroundColor $(if ($status -eq "failed") { "Red" } else { "Green" })
     return $status
