@@ -400,13 +400,18 @@ function Invoke-ProcessWithLog {
         FilePath               = $FilePath
         ArgumentList           = (Format-ProcessArgumentList -Arguments $Arguments)
         NoNewWindow            = $true
-        Wait                   = $true
         PassThru               = $true
         RedirectStandardOutput = $StdOutPath
         RedirectStandardError  = $StdErrPath
     }
     if ($WorkingDirectory.Length -gt 0) { $startParams["WorkingDirectory"] = $WorkingDirectory }
     $process = Start-Process @startParams
+    # Do NOT use Start-Process -Wait here: -Wait waits for the process *tree*, and
+    # the packaged start-eztest script deliberately leaves the API, executor and web
+    # processes running. Waiting for the tree never returns (found while running the
+    # Windows package smoke in the release build). Wait for the launcher only; the
+    # descendants are stopped explicitly by the smoke cleanup.
+    $process.WaitForExit()
     $exitCode = [int]$process.ExitCode
     if (-not $Quiet) {
         foreach ($stream in @(
