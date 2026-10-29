@@ -158,9 +158,49 @@ func TestParseLimit(t *testing.T) {
 		t.Fatalf("MaxLimit=%d, want 100", platform.MaxLimit)
 	}
 
-	for _, raw := range []string{"0", "-1", "101", "abc", "1.5"} {
+	for _, raw := range []string{"0", "-1", "101", "200", "abc", "1.5"} {
 		if got, err := platform.ParseLimit(raw); err == nil {
 			t.Fatalf("ParseLimit(%q)=%d, want an error", raw, got)
+		}
+	}
+}
+
+// TestLimitErrorMessages pins the two distinct limit messages of spec §5.6 C6
+// and the structured details the HTTP layers copy into the error envelope. Both
+// rejection classes must keep matching ErrInvalidLimit.
+func TestLimitErrorMessages(t *testing.T) {
+	type detailer interface {
+		Details() map[string]any
+	}
+
+	for _, testCase := range []struct {
+		raw     string
+		message string
+	}{
+		{"abc", "limit must be an integer"},
+		{"1.5", "limit must be an integer"},
+		{"0", "limit must be between 1 and 100"},
+		{"101", "limit must be between 1 and 100"},
+		{"200", "limit must be between 1 and 100"},
+	} {
+		_, err := platform.ParseLimit(testCase.raw)
+		if err == nil {
+			t.Fatalf("ParseLimit(%q): want an error", testCase.raw)
+		}
+		if !errors.Is(err, platform.ErrInvalidLimit) {
+			t.Fatalf("ParseLimit(%q) error %v does not unwrap to ErrInvalidLimit", testCase.raw, err)
+		}
+		if got := err.Error(); got != testCase.message {
+			t.Fatalf("ParseLimit(%q) message=%q, want %q", testCase.raw, got, testCase.message)
+		}
+		var withDetails detailer
+		if !errors.As(err, &withDetails) {
+			t.Fatalf("ParseLimit(%q) error %T does not expose details", testCase.raw, err)
+		}
+		details := withDetails.Details()
+		if details["field"] != "limit" || details["min"] != 1 || details["max"] != platform.MaxLimit {
+			t.Fatalf("ParseLimit(%q) details=%v, want field=limit min=1 max=%d",
+				testCase.raw, details, platform.MaxLimit)
 		}
 	}
 }

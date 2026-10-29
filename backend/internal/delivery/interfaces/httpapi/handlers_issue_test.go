@@ -10,6 +10,7 @@ import (
 
 	deliveryapp "github.com/EdouardRichard/EzTest/backend/internal/delivery/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
 // issueServer wires the issue handlers with a fake service and refs reader.
@@ -126,6 +127,45 @@ func TestIssueListRejectsInvalidPagination(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			rec := doRequest(h, http.MethodGet, path, "ezt_user", "")
 			requireError(t, rec, http.StatusUnprocessableEntity, "invalid_argument", "invalid_argument", false)
+		})
+	}
+}
+
+// TestIssueListLimitContract pins the delivery side of the shared limit
+// contract (spec §5.6 C6): 100 is accepted, and 200 keeps the existing 422
+// invalid_argument mapping while carrying the clarified message and
+// details{field,min,max}.
+func TestIssueListLimitContract(t *testing.T) {
+	var gotLimit int
+	issues := &fakeIssueService{list: func(_ context.Context, _ int64, filter deliveryapp.IssueFilter) ([]domain.Issue, bool, error) {
+		gotLimit = filter.Limit
+		return nil, false, nil
+	}}
+	h := issueServer(t, issues, &fakeIssueRefs{})
+
+	rec := doRequest(h, http.MethodGet, "/api/versions/101/issues?limit=100", "ezt_user", "")
+	requireStatus(t, rec, http.StatusOK)
+	if gotLimit != platform.MaxLimit {
+		t.Fatalf("list limit=%d want %d", gotLimit, platform.MaxLimit)
+	}
+
+	for _, testCase := range []struct{ name, limit, message string }{
+		{"non-integer", "ten", "limit must be an integer"},
+		{"too large", "200", "limit must be between 1 and 100"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			rec := doRequest(h, http.MethodGet,
+				"/api/versions/101/issues?limit="+testCase.limit, "ezt_user", "")
+			requireError(t, rec, http.StatusUnprocessableEntity, "invalid_argument", "invalid_argument", false)
+			envelope := decodeError(t, rec)
+			if envelope.Error.Message != testCase.message {
+				t.Fatalf("message=%q want %q", envelope.Error.Message, testCase.message)
+			}
+			details := envelope.Error.Details
+			if details["field"] != "limit" || details["min"] != float64(1) ||
+				details["max"] != float64(platform.MaxLimit) {
+				t.Fatalf("details=%v want field=limit min=1 max=%d", details, platform.MaxLimit)
+			}
 		})
 	}
 }

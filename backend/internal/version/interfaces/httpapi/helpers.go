@@ -60,14 +60,21 @@ type requestError struct {
 // Error implements error.
 func (e *requestError) Error() string { return e.Message }
 
-// newBadRequest builds a 400 invalid_argument request error with details.
-func newBadRequest(field, reason, message string) *requestError {
+// newBadRequest builds a 400 invalid_argument request error with details. The
+// optional extra maps are merged into the details after field/reason/message so
+// a caller can attach structured contract fields such as the limit bounds.
+func newBadRequest(field, reason, message string, extra ...map[string]any) *requestError {
 	details := map[string]any{"message": message}
 	if field != "" {
 		details["field"] = field
 	}
 	if reason != "" {
 		details["reason"] = reason
+	}
+	for _, values := range extra {
+		for key, value := range values {
+			details[key] = value
+		}
 	}
 	return &requestError{
 		Status:  http.StatusBadRequest,
@@ -163,10 +170,16 @@ func ParsePage(r *http.Request) (domain.Page, error) {
 
 // ParseQueryLimit parses the limit query parameter alone, for the endpoints that
 // page with a raw numeric cursor (P1 message ids, event sequence numbers) instead
-// of the opaque cursor of ParsePage.
+// of the opaque cursor of ParsePage. A rejected value stays a 400 invalid_limit
+// and carries the distinct message and the shared details{field,min,max} of the
+// limit contract (spec §5.6 C6).
 func ParseQueryLimit(r *http.Request) (int, error) {
 	limit, err := platform.ParseLimit(r.URL.Query().Get("limit"))
 	if err != nil {
+		var limitErr *platform.LimitError
+		if errors.As(err, &limitErr) && limitErr != nil {
+			return 0, newBadRequest("limit", "invalid_limit", limitErr.Error(), limitErr.Details())
+		}
 		return 0, newBadRequest("limit", "invalid_limit",
 			"limit must be an integer between 1 and 100")
 	}
