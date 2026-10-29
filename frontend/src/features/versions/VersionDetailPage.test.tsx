@@ -381,6 +381,9 @@ const HEADER_BATCH_2 = "1844674407370955172"
 const ISSUE_ID = "1844674407370955410"
 const REPORT_ID = "1844674407370955501"
 const SECOND_REPORT_ID = "1844674407370955502"
+/** Evidence deep link ids of a results-tab evidence pair. */
+const EVIDENCE_ID = "1844674407370955402"
+const COMPARE_EVIDENCE_ID = "1844674407370955403"
 /** A mindmap node id for the `?case=` deep link of the embedded mindmap tab. */
 const MINDMAP_CASE_ID = "1844674407370955210"
 
@@ -1084,6 +1087,23 @@ describe("VersionDetailPage", () => {
     expect(mocks.getVersion).toHaveBeenCalledTimes(2)
   })
 
+  it("surfaces the API request id when loading the version fails", async () => {
+    mocks.getVersion.mockRejectedValueOnce(
+      new ApiError({
+        status: 500,
+        code: "internal",
+        message: "the API is unavailable",
+        requestId: "req-server-1",
+      }),
+    )
+
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toContain("加载版本失败")
+    expect(alert.textContent).toContain("请求 ID：req-server-1")
+  })
+
   it("honours ?tab=issues&issue= and syncs the URL when the issue opens or closes", async () => {
     window.history.replaceState(null, "", `/versions/${VERSION_ID}?tab=issues&issue=${ISSUE_ID}`)
 
@@ -1423,6 +1443,57 @@ describe("VersionDetailPage", () => {
         expect.objectContaining({ selectedNodeId: `case:${caseNodeId}` }),
       ),
     )
+  })
+
+  it("opens the evidence comparison from the ?evidence=&compare= deep link", async () => {
+    window.history.replaceState(
+      null,
+      "",
+      `/versions/${VERSION_ID}?evidence=${EVIDENCE_ID}&compare=${COMPARE_EVIDENCE_ID}`,
+    )
+
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+
+    expect(await screen.findByTestId("evidence-viewer")).toBeTruthy()
+    // The primary artifact and the comparison artifact are both loaded through
+    // the existing viewer (the second read proves `compareWith` is wired).
+    await waitFor(() =>
+      expect(mocks.getEvidenceMeta).toHaveBeenCalledWith(
+        VERSION_ID,
+        EVIDENCE_ID,
+        expect.anything(),
+      ),
+    )
+    await waitFor(() =>
+      expect(mocks.getEvidenceMeta).toHaveBeenCalledWith(
+        VERSION_ID,
+        COMPARE_EVIDENCE_ID,
+        expect.anything(),
+      ),
+    )
+    expect(new URLSearchParams(window.location.search).get("compare")).toBe(COMPARE_EVIDENCE_ID)
+  })
+
+  it("announces a reconnecting version stream without replacing the loaded page", async () => {
+    const reconnect = vi.fn()
+    mocks.useVersionStream.mockReturnValue({
+      events: [],
+      status: "reconnecting",
+      reconnect,
+    })
+
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+
+    const status = await screen.findByTestId("version-stream-status")
+    expect(status.textContent).toContain("重连中")
+    // The loaded data is kept: reconnecting is not an empty state.
+    expect(screen.getByRole("heading", { level: 1, name: /订单系统 2.0/ })).toBeTruthy()
+    expect(screen.getByTestId("requirements-workbench-slot")).toBeTruthy()
+
+    fireEvent.click(within(status).getByRole("button", { name: "重新连接" }))
+    expect(reconnect).toHaveBeenCalledTimes(1)
   })
 
   it("syncs exploration Sheet open/close to ?node=", async () => {
