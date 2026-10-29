@@ -117,6 +117,14 @@ func (s *VisualAssertionService) Update(ctx context.Context, versionID, assertio
 // ApproveBaseline validates the evidence artifact against the assertion's
 // viewport/device scale factor and records it as the approved baseline. The
 // caller (HTTP handler) enforces the administrator role.
+//
+// Unlike Update, the approval deliberately does not require the version to be
+// designing/reviewing without a frozen baseline: the only evidence a baseline
+// can be promoted from is a screenshot produced by an execution run, and every
+// execution run happens after the case baseline was frozen. The version status
+// gate would therefore make a visual baseline impossible to approve at all. The
+// evidence ownership/kind/PNG checks below still prove the artifact belongs to
+// the same version and case node, and later batches snapshot the new baseline.
 func (s *VisualAssertionService) ApproveBaseline(ctx context.Context, versionID, assertionID, actor, evidenceID int64) (domain.VisualAssertion, error) {
 	if s == nil || s.deps.Store == nil || s.deps.Evidence == nil {
 		return domain.VisualAssertion{}, errors.New("mindmap: visual baseline dependencies are not configured")
@@ -128,9 +136,6 @@ func (s *VisualAssertionService) ApproveBaseline(ctx context.Context, versionID,
 	if evidenceID <= 0 {
 		return domain.VisualAssertion{}, domain.NewInvalid("evidenceId", "invalid_evidence_id",
 			"evidenceId must be a positive id")
-	}
-	if err := s.ensureWritable(ctx, versionID); err != nil {
-		return domain.VisualAssertion{}, err
 	}
 
 	target, err := s.deps.Store.Get(ctx, versionID, assertionID)
