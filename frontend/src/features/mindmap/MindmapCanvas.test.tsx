@@ -312,6 +312,26 @@ describe("MindmapCanvas", () => {
     expect(svgRef.current).toBe(screen.getByRole("tree"))
   })
 
+  it("fills an embedded container instead of the standalone viewport height", () => {
+    const { unmount } = render(
+      <MindmapCanvas graph={fixtureGraph()} selectedId={null} onSelect={vi.fn()} embedded />,
+    )
+
+    const canvas = screen.getByTestId("mindmap-canvas")
+    expect(canvas.getAttribute("data-embedded")).toBe("true")
+    expect(canvas.className).toContain("h-full")
+
+    const viewport = screen.getByTestId("mindmap-viewport")
+    expect(viewport.className).toContain("flex-1")
+    expect(viewport.className).not.toContain("h-[70vh]")
+    unmount()
+
+    // Default (full-screen) keeps the original bounded viewport height.
+    renderCanvas()
+    expect(screen.getByTestId("mindmap-canvas").getAttribute("data-embedded")).toBeNull()
+    expect(screen.getByTestId("mindmap-viewport").className).toContain("h-[70vh]")
+  })
+
   it("shows an empty hint instead of an empty tree", () => {
     renderCanvas({ graph: fixtureGraph([]) })
 

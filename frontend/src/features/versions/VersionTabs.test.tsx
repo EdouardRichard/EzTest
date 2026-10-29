@@ -213,6 +213,10 @@ describe("VersionTabs", () => {
     fireEvent.mouseDown(screen.getByRole("tab", { name: "用例脑图" }))
     expect(onTabChange).toHaveBeenCalledWith("mindmap")
 
+    // An inactive Radix panel is not mounted, so the embedded graph read is not
+    // paid for until the tab is opened.
+    expect(screen.queryByTestId("mindmap-slot")).toBeNull()
+
     rerender(
       <VersionTabs
         versionId={VERSION_ID}

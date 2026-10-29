@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import type { Version } from "@/features/versions/types"
@@ -170,14 +170,16 @@ type MindmapState = {
 }
 
 function mockGraph(graph: MindmapGraph | null, state: MindmapState = {}) {
+  const refresh = vi.fn().mockResolvedValue(undefined)
   mocks.useMindmap.mockReturnValue({
     graph,
     loading: state.loading ?? false,
     error: state.error ?? "",
     streamStatus: state.streamStatus ?? "live",
-    refresh: vi.fn().mockResolvedValue(undefined),
+    refresh,
     applyGraph: vi.fn(),
   })
+  return { refresh }
 }
 
 beforeEach(() => {
@@ -201,6 +203,77 @@ describe("MindmapPage embedded", () => {
     expect(screen.getByTestId("mindmap-section-review")).toBeTruthy()
     expect(screen.getByTestId("mindmap-section-runs")).toBeTruthy()
     expect(screen.getByTestId("mindmap-section-export")).toBeTruthy()
+  })
+
+  it("shows a compact reconnect status and refreshes on demand in embedded mode", async () => {
+    const { refresh } = mockGraph(defaultGraph(), { streamStatus: "reconnecting" })
+
+    render(<MindmapPage versionId={VERSION_ID} embedded />)
+
+    const bar = await screen.findByTestId("mindmap-embedded-status")
+    const badge = within(bar).getByTestId("stream-status")
+    expect(badge.getAttribute("data-status")).toBe("reconnecting")
+    expect(badge.textContent).toContain("重连中")
+
+    fireEvent.click(within(bar).getByTestId("btn-refresh-mindmap"))
+    expect(refresh).toHaveBeenCalledTimes(1)
+
+    // The full-screen header (title, back link, baseline badge) stays dropped.
+    expect(screen.queryByTestId("mindmap-toolbar")).toBeNull()
+    expect(screen.queryByTestId("mindmap-version-name")).toBeNull()
+    expect(screen.queryByTestId("back-to-version")).toBeNull()
+  })
+
+  it("keeps the compact status bar and refresh action while the stream is live", async () => {
+    mockGraph(defaultGraph(), { streamStatus: "live" })
+
+    render(<MindmapPage versionId={VERSION_ID} embedded />)
+
+    const bar = await screen.findByTestId("mindmap-embedded-status")
+    expect(within(bar).getByTestId("stream-status").textContent).toContain("实时")
+    expect(within(bar).getByTestId("btn-refresh-mindmap")).toBeTruthy()
+  })
+
+  it("shows the status bar while the graph is still loading", async () => {
+    mockGraph(null, { loading: true, streamStatus: "connecting" })
+
+    render(<MindmapPage versionId={VERSION_ID} embedded />)
+
+    const bar = await screen.findByTestId("mindmap-embedded-status")
+    expect(within(bar).getByTestId("stream-status").textContent).toContain("连接中")
+    expect(within(bar).getByTestId("btn-refresh-mindmap")).toBeTruthy()
+    expect(screen.getByTestId("mindmap-loading")).toBeTruthy()
+  })
+
+  it("gives the embedded canvas an explicit height and lets it fill the container", async () => {
+    mockGraph(defaultGraph())
+
+    render(<MindmapPage versionId={VERSION_ID} embedded />)
+
+    const column = await screen.findByTestId("mindmap-canvas-column")
+    expect(column.className).toMatch(/h-\[calc\(100vh-/)
+
+    const canvas = screen.getByTestId("mindmap-canvas")
+    expect(canvas.getAttribute("data-embedded")).toBe("true")
+    expect(canvas.className).toContain("h-full")
+
+    // The viewport follows the container instead of the standalone 70vh height.
+    const viewport = screen.getByTestId("mindmap-viewport")
+    expect(viewport.className).not.toContain("h-[70vh]")
+    expect(viewport.className).toContain("flex-1")
+  })
+
+  it("keeps the standalone viewport height on the full-screen route", async () => {
+    mockGraph(defaultGraph())
+
+    render(<MindmapPage versionId={VERSION_ID} />)
+
+    const column = await screen.findByTestId("mindmap-canvas-column")
+    expect(column.className).not.toMatch(/h-\[calc\(100vh-/)
+    const canvas = screen.getByTestId("mindmap-canvas")
+    expect(canvas.getAttribute("data-embedded")).toBeNull()
+    expect(canvas.className).not.toContain("h-full")
+    expect(screen.getByTestId("mindmap-viewport").className).toContain("h-[70vh]")
   })
 
   it("keeps the embedded loading and error states inside the tab", async () => {
@@ -297,6 +370,9 @@ describe("MindmapPage embedded", () => {
 
     const banner = await screen.findByTestId("readonly-banner")
     expect(banner.textContent).toContain("只读")
+    // The embedded tab hides the full-screen baseline badge as well.
+    expect(screen.queryByTestId("toolbar-baseline")).toBeNull()
+    expect(screen.queryByTestId("mindmap-toolbar")).toBeNull()
     fireEvent.click(screen.getByTestId(`case-node-${CASE_ID}`))
     expect(screen.getByTestId("case-editor-readonly")).toBeTruthy()
   })

@@ -670,6 +670,30 @@ describe("VersionDetailPage", () => {
     expect(screen.getByTestId("requirements-workbench-slot")).toBeTruthy()
   })
 
+  it("does not mount the embedded mindmap tab before it is opened", async () => {
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+
+    // Radix keeps inactive panels unmounted: no MindmapPage, therefore no
+    // `useMindmap` mount and no `GET /mindmap` request. The inactive panel
+    // wrapper stays in the DOM but is hidden and empty.
+    const panel = screen.getByTestId("version-tab-mindmap")
+    expect(panel.hidden).toBe(true)
+    expect(screen.queryByTestId("mindmap-tab")).toBeNull()
+    expect(mocks.mindmapProps).not.toHaveBeenCalled()
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "用例脑图" }))
+
+    expect(await screen.findByTestId("mindmap-tab")).toBeTruthy()
+    expect(mocks.mindmapProps).toHaveBeenCalledTimes(1)
+    expect(mocks.mindmapProps).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        embedded: true,
+        version: expect.objectContaining({ id: VERSION_ID }),
+      }),
+    )
+  })
+
   it("renders the embedded mindmap tab from ?tab=mindmap&case= and syncs the case deep link", async () => {
     window.history.replaceState(
       null,
