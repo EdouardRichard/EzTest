@@ -98,24 +98,25 @@ func (p phasedVersionLifecycle) ContinuePhase(context.Context, int64) (string, e
 // alternative version lifecycle (used for the continue-phase gate tests).
 func runServiceWithVersions(fixture *runFixture, versions application.VersionLifecycle) *application.RunService {
 	return application.NewRunService(application.RunDeps{
-		Runs:         runRunRepo{fixture},
-		Graph:        fixture,
-		Baselines:    runBaselineRepo{fixture},
-		Nodes:        runNodeRepo{fixture},
-		Steps:        runStepRepo{fixture},
-		Assertions:   runAssertionRepo{fixture},
-		Sources:      runSourceRepo{fixture},
-		Versions:     versions,
-		Batches:      fixture.batches,
-		Requirements: runRequirementReader{fixture},
-		Catalog:      runCatalogGateway{fixture},
-		CodeFacts:    runCodeFactsGateway{fixture},
-		Impact:       fixture.impact,
-		Anchors:      runAnchorGateway{fixture},
-		Agents:       runAgentRuntime{fixture},
-		Events:       runEventSink{fixture},
-		IDs:          runIDGenerator{fixture},
-		Clock:        runClock{fixture},
+		Runs:               runRunRepo{fixture},
+		Graph:              fixture,
+		Baselines:          runBaselineRepo{fixture},
+		Nodes:              runNodeRepo{fixture},
+		Steps:              runStepRepo{fixture},
+		Assertions:         runAssertionRepo{fixture},
+		Sources:            runSourceRepo{fixture},
+		Versions:           versions,
+		Batches:            fixture.batches,
+		Requirements:       runRequirementReader{fixture},
+		Catalog:            runCatalogGateway{fixture},
+		CodeFacts:          runCodeFactsGateway{fixture},
+		Impact:             fixture.impact,
+		Anchors:            runAnchorGateway{fixture},
+		Agents:             runAgentRuntime{fixture},
+		Events:             runEventSink{fixture},
+		IDs:                runIDGenerator{fixture},
+		Clock:              runClock{fixture},
+		MaxSupplementCases: fixture.maxSupplementCases,
 	})
 }
 
@@ -342,6 +343,35 @@ func TestMaterializeSupplementSkipsDuplicates(t *testing.T) {
 	}
 	if !hasResultWarning(t, done, "duplicate_case") {
 		t.Fatalf("run result = %s, want a duplicate_case warning", done.Result)
+	}
+}
+
+// TestMaterializeSupplementHonorsConfiguredMaxCases pins the P8 wiring of
+// EZTEST_SUPPLEMENT_MAX_CASES into the materializer: the configured budget, not
+// the compiled 5-case default, bounds the materialized supplement nodes.
+func TestMaterializeSupplementHonorsConfiguredMaxCases(t *testing.T) {
+	fixture := newSupplementMaterializeFixture()
+	fixture.maxSupplementCases = 2
+	cases := make([]string, 0, 3)
+	for index := 1; index <= 3; index++ {
+		cases = append(cases, validSupplementCaseJSON("Configured case "+string(rune('0'+index))))
+	}
+	run := seedSupplementRun(fixture, application.RunKindSupplement, `{"cases":[`+strings.Join(cases, ",")+`]}`)
+
+	if err := fixture.service().Materialize(context.Background(), run.ID); err != nil {
+		t.Fatalf("materialize: %v", err)
+	}
+	supplementNodes := 0
+	for _, node := range fixture.nodes {
+		if node.Source == domain.NodeSourceAISupplement {
+			supplementNodes++
+		}
+	}
+	if supplementNodes != 2 {
+		t.Fatalf("materialized nodes = %d, want the configured 2-case cap", supplementNodes)
+	}
+	if !hasResultWarning(t, fixture.runs[run.ID], "case_limit_reached") {
+		t.Fatalf("run result = %s, want a case_limit_reached warning", fixture.runs[run.ID].Result)
 	}
 }
 

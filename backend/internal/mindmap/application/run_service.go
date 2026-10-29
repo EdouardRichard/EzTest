@@ -87,6 +87,10 @@ type RunDeps struct {
 	Events  EventPublisher
 	IDs     IDGenerator
 	Clock   Clock
+	// MaxSupplementCases is the per-run cap of newly materialized supplement
+	// cases (EZTEST_SUPPLEMENT_MAX_CASES, design spec §10.5/§11.4). Zero keeps
+	// the spec default 5.
+	MaxSupplementCases int
 }
 
 // StartRunCommand is the POST /runs body of spec §7.2 endpoint 17 extended for
@@ -117,7 +121,18 @@ type RunService struct {
 
 // NewRunService wires the run coordinator to its ports.
 func NewRunService(deps RunDeps) *RunService {
+	if deps.MaxSupplementCases <= 0 {
+		deps.MaxSupplementCases = supplementMaxCases
+	}
 	return &RunService{deps: deps}
+}
+
+// maxSupplementCases returns the configured per-run supplement case budget.
+func (s *RunService) maxSupplementCases() int {
+	if s.deps.MaxSupplementCases > 0 {
+		return s.deps.MaxSupplementCases
+	}
+	return supplementMaxCases
 }
 
 // runProfile returns the profile key and prompt version of one coordinated run
@@ -895,7 +910,7 @@ func knowledgeRefIDs(ids []int64) []string {
 }
 
 func (s *RunService) buildInstruction(ctx context.Context, version VersionSnapshot, cmd StartRunCommand, requirements []RequirementSnapshot, runID int64) runBuiltInstruction {
-	footer := runSubmitInstruction(cmd.Kind)
+	footer := runSubmitInstruction(cmd.Kind, s.maxSupplementCases())
 	budget := runMaxInstructionBytes - len(footer)
 	var builder strings.Builder
 	truncated := false
@@ -1188,9 +1203,9 @@ func (s *RunService) graphInstructionIndexes(ctx context.Context, versionID int6
 
 // runSubmitInstruction is the mandatory task footer of spec §8.3 point 7. It is
 // always the last block of the instruction and names the submission tool.
-func runSubmitInstruction(kind string) string {
+func runSubmitInstruction(kind string, maxSupplementCases int) string {
 	if kind == RunKindSupplement || kind == RunKindIncrementalDesign {
-		return supplementSubmitInstruction(kind)
+		return supplementSubmitInstruction(kind, maxSupplementCases)
 	}
 	tool, role := "case.graph_propose", "结构化用例提案"
 	switch kind {
@@ -1211,7 +1226,7 @@ func runSubmitInstruction(kind string) string {
 // supplementSubmitInstruction is the task footer of the two P7 supplement kinds
 // (spec §9.2). The agent submits through the supplement.* tools instead of a
 // single *_submit tool; a run without findings may finish immediately.
-func supplementSubmitInstruction(kind string) string {
+func supplementSubmitInstruction(kind string, maxSupplementCases int) string {
 	var builder strings.Builder
 	builder.WriteString("\n## 任务与提交要求\n")
 	if kind == RunKindIncrementalDesign {
@@ -1219,7 +1234,7 @@ func supplementSubmitInstruction(kind string) string {
 	} else {
 		builder.WriteString("任务：为已完成基线批次的版本做一次后补全。先读取已确认需求、现有脑图与覆盖矩阵，找出缺失或薄弱的用例。\n")
 	}
-	builder.WriteString("提交：新增用例必须调用 supplement.case_propose（单次运行最多 5 条；每条至少 1 个步骤、1 个断言、至少 1 个已确认需求来源）。\n")
+	fmt.Fprintf(&builder, "提交：新增用例必须调用 supplement.case_propose（单次运行最多 %d 条；每条至少 1 个步骤、1 个断言、至少 1 个已确认需求来源）。\n", maxSupplementCases)
 	builder.WriteString("增量设计：调用 supplement.affected_cases_propose 给出受影响的旧用例（最多 20 条；高/中置信默认标记，低置信仅展示）。\n")
 	builder.WriteString("需求缺口：调用 supplement.escalate（最多 3 条），不得自行编造需求。无发现时直接结束，不要提交空提案。\n")
 	builder.WriteString("约束：补全不改基线；只提议，不直接写库。\n")

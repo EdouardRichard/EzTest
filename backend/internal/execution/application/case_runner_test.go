@@ -38,6 +38,7 @@ func newCaseRunnerHarness(t *testing.T) (*CaseRunner, *schedWorld) {
 		Events:       world.events,
 		Clock:        world.clock,
 		Browser:      world.browser,
+		Signals:      world.browser,
 		Timeout:      time.Second,
 		PollInterval: time.Millisecond,
 	})
@@ -474,5 +475,74 @@ func TestCaseRunnerClassifiesAgentTerminalReason(t *testing.T) {
 				t.Fatalf("failure reason = %q, want %q", stored.FailureReason, tc.wantReason)
 			}
 		})
+	}
+}
+
+// TestCaseRunnerFinishesExecutionToolFailures pins the P8 server-enforced
+// terminal outcomes reported by the execution tools: an exhausted tool-call
+// budget and an executor timeout both end the case as inconclusive(model) with
+// the stable reason, cancel the agent run and release the case resources.
+func TestCaseRunnerFinishesExecutionToolFailures(t *testing.T) {
+	cases := []struct {
+		name string
+		code string
+	}{
+		{name: "tool call budget exhausted", code: "tool_call_budget_exhausted"},
+		{name: "executor timeout", code: "executor_timeout"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runner, world := newCaseRunnerHarness(t)
+			run := runningCaseRun(t, world)
+			world.runtime.setState(AgentRunState{Status: "running"})
+			world.browser.setFailure(run.ID, tc.code)
+
+			runner.Run(context.Background(), run, SessionRef{SessionID: 500}, world.sessions.environment)
+
+			stored := world.run(t, 1)
+			if stored.Status != domain.CaseRunStatusInconclusive {
+				t.Fatalf("status = %s, want inconclusive", stored.Status)
+			}
+			if stored.FailureClass == nil || *stored.FailureClass != domain.FailureClassModel {
+				t.Fatalf("failure class = %v, want model", stored.FailureClass)
+			}
+			if stored.FailureReason != tc.code {
+				t.Fatalf("failure reason = %q, want %q", stored.FailureReason, tc.code)
+			}
+			if got := world.runtime.canceled(); len(got) != 1 {
+				t.Fatalf("CancelRun calls = %v, want exactly one", got)
+			}
+			if got := world.browser.closedIDs(); !reflect.DeepEqual(got, []string{"case:1"}) {
+				t.Fatalf("CloseCase calls = %v, want [case:1]", got)
+			}
+			if !world.sessions.released(500, "finished") {
+				t.Fatalf("session lease was not released: %+v", world.sessions.releases)
+			}
+		})
+	}
+}
+
+// TestCaseRunnerSignalWinsOverAgentTerminal pins that the server-side terminal
+// signal stays authoritative when the agent run reaches a terminal state in the
+// same poll: the case must carry executor_timeout, not the agent-derived reason.
+func TestCaseRunnerSignalWinsOverAgentTerminal(t *testing.T) {
+	runner, world := newCaseRunnerHarness(t)
+	run := runningCaseRun(t, world)
+	world.runtime.setState(AgentRunState{
+		Status: "failed", TerminalReason: "model_error", Error: "upstream request failed",
+	})
+	world.browser.setFailure(run.ID, "executor_timeout")
+
+	runner.Run(context.Background(), run, SessionRef{SessionID: 500}, world.sessions.environment)
+
+	stored := world.run(t, 1)
+	if stored.Status != domain.CaseRunStatusInconclusive {
+		t.Fatalf("status = %s, want inconclusive", stored.Status)
+	}
+	if stored.FailureClass == nil || *stored.FailureClass != domain.FailureClassModel {
+		t.Fatalf("failure class = %v, want model", stored.FailureClass)
+	}
+	if stored.FailureReason != "executor_timeout" {
+		t.Fatalf("failure reason = %q, want executor_timeout", stored.FailureReason)
 	}
 }

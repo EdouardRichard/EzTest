@@ -557,6 +557,10 @@ func (s *toolSet) CloseCase(ctx context.Context, caseRunID int64) error {
 	if ok {
 		delete(s.contexts, caseRunID)
 	}
+	// The tool-call budget and any terminal signal are per attempt: a fresh
+	// attempt of the same case must not inherit them.
+	delete(s.toolCalls, caseRunID)
+	delete(s.failures, caseRunID)
 	s.mu.Unlock()
 	if !ok || s.browser == nil {
 		return nil

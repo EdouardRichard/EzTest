@@ -65,6 +65,11 @@ type Limits struct {
 	// executor for one visual comparison (EZTEST_VISUAL_BASELINE_MAX_BYTES,
 	// default 5 MiB).
 	VisualBaselineMaxBytes int64
+	// MaxToolCalls is the per-case tool-call budget
+	// (EZTEST_EXEC_MAX_TOOL_CALLS). A call beyond the budget is denied with the
+	// stable tool_call_budget_exhausted code and the case run is reported as a
+	// terminal model failure; zero disables the budget.
+	MaxToolCalls int
 	// Session resolves the leased session of a case run. The browser tools use
 	// its StorageState/SessionStorage as the executor context's initial state and
 	// http.request injects its authentication Headers. It is optional: without a
@@ -120,6 +125,11 @@ type toolSet struct {
 
 	mu       sync.Mutex
 	contexts map[int64]caseBrowser
+	// toolCalls counts the execution path's tool invocations per case run;
+	// failures records the terminal condition the runner must classify
+	// (tool-call budget exhaustion, executor timeout).
+	toolCalls map[int64]int
+	failures  map[int64]string
 }
 
 // toolDefinition is one tool's frozen metadata and its execution function.
@@ -148,7 +158,94 @@ func (t executionTool) InputSchema() json.RawMessage { return json.RawMessage(t.
 // Execute implements domain.Tool. The case-run scope is read from the P1
 // invocation context the tool executor injects.
 func (t executionTool) Execute(ctx context.Context, args json.RawMessage) (agentdomain.ToolResult, error) {
-	return t.def.run(ctx, t.set, args)
+	if err := t.set.consumeToolCall(ctx); err != nil {
+		return agentdomain.ToolResult{}, err
+	}
+	result, err := t.def.run(ctx, t.set, args)
+	if err != nil {
+		t.set.noteExecutorTimeout(ctx, err)
+	}
+	return result, err
+}
+
+// Tool-call budget and executor timeout codes (design spec §10.5). Both are
+// model-classified terminal reasons: a budget-exhausted or timed-out executor
+// run never becomes an application failure.
+const (
+	toolCodeToolCallBudgetExhausted = "tool_call_budget_exhausted"
+	toolCodeExecutorTimeout         = "executor_timeout"
+)
+
+// consumeToolCall charges one invocation against the case run's tool-call
+// budget (EZTEST_EXEC_MAX_TOOL_CALLS). A call beyond the budget is denied; the
+// runner polls CaseRunFailure and classifies the case as
+// inconclusive(model, tool_call_budget_exhausted).
+func (s *toolSet) consumeToolCall(ctx context.Context) error {
+	if s == nil || s.limits.MaxToolCalls <= 0 {
+		return nil
+	}
+	invocation, ok := agentapp.InvocationFromContext(ctx)
+	if !ok || invocation.CaseRunID <= 0 {
+		return nil
+	}
+	s.mu.Lock()
+	// A run that already reached a server-side terminal condition must not keep
+	// executing tools: this closes the window in which the model could still
+	// submit a passing case_finish after an executor timeout or an over-budget
+	// call.
+	if code, failed := s.failures[invocation.CaseRunID]; failed {
+		s.mu.Unlock()
+		return toolError(code, "the case run already reached a terminal execution condition; stop calling tools")
+	}
+	s.toolCalls[invocation.CaseRunID]++
+	count := s.toolCalls[invocation.CaseRunID]
+	exhausted := count > s.limits.MaxToolCalls
+	if exhausted {
+		s.failures[invocation.CaseRunID] = toolCodeToolCallBudgetExhausted
+	}
+	s.mu.Unlock()
+	if !exhausted {
+		return nil
+	}
+	return toolError(toolCodeToolCallBudgetExhausted, fmt.Sprintf(
+		"the case run exhausted its %d tool-call budget; stop calling tools and let the run finish",
+		s.limits.MaxToolCalls))
+}
+
+// noteExecutorTimeout records a timeout of the executor call itself as the
+// case run's terminal condition. Action-level timeouts (a wait_for deadline)
+// keep their own code; only an executor timeout becomes inconclusive(model).
+func (s *toolSet) noteExecutorTimeout(ctx context.Context, err error) {
+	if s == nil {
+		return
+	}
+	var toolErr *agentdomain.ToolError
+	if !errors.As(err, &toolErr) || toolErr.Code != toolCodeExecutorTimeout {
+		return
+	}
+	invocation, ok := agentapp.InvocationFromContext(ctx)
+	if !ok || invocation.CaseRunID <= 0 {
+		return
+	}
+	s.mu.Lock()
+	if s.failures == nil {
+		s.failures = make(map[int64]string)
+	}
+	s.failures[invocation.CaseRunID] = toolCodeExecutorTimeout
+	s.mu.Unlock()
+}
+
+// CaseRunFailure returns the terminal condition the execution path recorded for
+// a case run. It implements application.CaseRunFailureSignaler so the case
+// runner can finish the run even while the agent run is still polling.
+func (s *toolSet) CaseRunFailure(caseRunID int64) (string, bool) {
+	if s == nil || caseRunID <= 0 {
+		return "", false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	code, ok := s.failures[caseRunID]
+	return code, ok
 }
 
 // ToolSet is the exported handle of one shared execution tool set. It owns the
@@ -168,6 +265,8 @@ func NewToolSet(recorder application.Recorder, browser application.BrowserExecut
 		httpClient: httpClient,
 		limits:     limits.withDefaults(),
 		contexts:   make(map[int64]caseBrowser),
+		toolCalls:  make(map[int64]int),
+		failures:   make(map[int64]string),
 	}
 }
 
@@ -321,6 +420,11 @@ func normalizeBrowserCode(code string) string {
 	switch code {
 	case "timeout":
 		return "timeout"
+	// A timeout of the executor call itself is an infrastructure/model failure:
+	// it stays distinguishable from a target action timeout so the runner
+	// classifies it inconclusive(model, executor_timeout) (design spec §10.5).
+	case "executor_timeout":
+		return "executor_timeout"
 	case "canceled", "cancelled":
 		return "cancelled"
 	case "host_not_allowed", "target_not_found", "target_ambiguous":

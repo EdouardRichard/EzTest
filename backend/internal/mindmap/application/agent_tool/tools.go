@@ -130,6 +130,18 @@ type Deps struct {
 	Results BatchResultReader
 	// Audit records mindmap.tool.invoked. Optional.
 	Audit mindmapapp.AuditRecorder
+	// MaxCases is the per-run supplement case budget
+	// (EZTEST_SUPPLEMENT_MAX_CASES, design spec §10.5/§11.4). Zero keeps the
+	// spec default 5.
+	MaxCases int
+}
+
+// maxCases returns the configured per-run supplement case budget.
+func (d Deps) maxCases() int {
+	if d.MaxCases > 0 {
+		return d.MaxCases
+	}
+	return supplementMaxCases
 }
 
 // toolDefinition is one tool's frozen metadata and its execution function.
@@ -176,7 +188,7 @@ func NewTools(deps Deps) []agentdomain.Tool {
 		},
 		{
 			name:        toolNameCasePropose,
-			description: "Propose new supplement cases (at most 5 per run). Every case needs a title, at least one step, at least one assertion and at least one clarified requirement id; duplicates and invalid items are skipped with warnings. Stored in the active run only; the server materializes it after the run finishes.",
+			description: fmt.Sprintf("Propose new supplement cases (at most %d per run). Every case needs a title, at least one step, at least one assertion and at least one clarified requirement id; duplicates and invalid items are skipped with warnings. Stored in the active run only; the server materializes it after the run finishes.", deps.maxCases()),
 			schema:      schemaCasePropose,
 			run:         runCasePropose,
 		},

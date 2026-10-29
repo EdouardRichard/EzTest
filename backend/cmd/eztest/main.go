@@ -802,6 +802,9 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 			MaxDBResultBytes:       int64(cfg.DBResultMaxBytes),
 			MaxDBSQLBytes:          int64(cfg.DBSQLMaxBytes),
 			VisualBaselineMaxBytes: int64(cfg.VisualBaselineMaxBytes),
+			// P8 tool-call budget (design spec §10.5): the tools count every
+			// invocation and signal the case runner once it is exhausted.
+			MaxToolCalls: cfg.ExecMaxToolCalls,
 			Session: func(ctx context.Context, caseRunID int64) (executionapp.SessionRef, error) {
 				if executionAgentRuntime == nil {
 					return executionapp.SessionRef{}, errors.New("execution: agent runtime is not bound yet")
@@ -890,6 +893,9 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Runs:       deliveryAnalyses,
 		Execution:  deliveryAnalysisExecution,
 		OpenIssues: deliveryIssueSources,
+		// P8 wiring: EZTEST_ANALYSIS_MAX_CASES bounds the failure candidates
+		// accepted by the submission tools (design spec §10.5/§11.4).
+		MaxCases: cfg.AnalysisMaxCases,
 	})
 	deliveryToolSet := deliveryagenttool.NewTools(deliveryagenttool.ToolDeps{
 		Runs:        deliveryAnalyses,
@@ -1003,6 +1009,8 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Impact:       mindmapCodeFacts,
 		Results:      executionmindmap.NewBatchResults(executionReads),
 		Audit:        mindmapAudit,
+		// P8 wiring: EZTEST_SUPPLEMENT_MAX_CASES bounds the per-run proposals.
+		MaxCases: cfg.SupplementMaxCases,
 	})...)
 	agentRegistry := agentapp.NewToolRegistry(agentToolList...)
 	agentExecutor := agentapp.NewToolExecutor(
@@ -1065,6 +1073,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Audit:      deliveryAnalysisAudit,
 		IDs:        snowflake,
 		Clock:      wallClock{},
+		MaxCases:   cfg.AnalysisMaxCases,
 	})
 	// The delivery issue service is bound into the codeintel issue catalog so an
 	// issue anchor validates its subject through the delivery application layer.
@@ -1097,6 +1106,10 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		// The tools own the per-case executor context; the runner only cancels
 		// and closes that context through this controller.
 		Browser: executionToolSet,
+		// The tools count tool calls and record executor timeouts; the runner
+		// polls the signal and persists the inconclusive(model) classification
+		// (design spec §10.5).
+		Signals: executionToolSet,
 		Timeout: time.Duration(cfg.ExecCaseTimeoutMS) * time.Millisecond,
 	})
 	// The autonomous worker is created after the mindmap run service exists (its
@@ -1199,6 +1212,8 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Events:       mindmapEvents,
 		IDs:          snowflake,
 		Clock:        wallClock{},
+		// P8 wiring: EZTEST_SUPPLEMENT_MAX_CASES bounds the materialized cases.
+		MaxSupplementCases: cfg.SupplementMaxCases,
 	})
 	mindmapBaseline := mindmapapp.NewBaselineService(mindmapapp.BaselineDeps{
 		Graph:      mindmapGraphTx,

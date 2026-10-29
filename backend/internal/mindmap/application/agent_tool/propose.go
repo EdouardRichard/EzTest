@@ -50,13 +50,14 @@ func runCasePropose(ctx context.Context, deps Deps, args json.RawMessage) (agent
 	}
 
 	document := decodeSubmission(run.Result)
+	maxCases := deps.maxCases()
 	warnings := make([]warning, 0, 1)
 	accepted := 0
 	for _, proposal := range normalized {
-		if len(document.Cases) >= supplementMaxCases {
+		if len(document.Cases) >= maxCases {
 			warnings = append(warnings, warning{
 				Code:    "case_limit_reached",
-				Message: fmt.Sprintf("a supplement run may add at most %d cases; the rest was skipped", supplementMaxCases),
+				Message: fmt.Sprintf("a supplement run may add at most %d cases; the rest was skipped", maxCases),
 			})
 			break
 		}

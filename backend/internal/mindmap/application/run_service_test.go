@@ -72,6 +72,9 @@ type runFixture struct {
 	// runningCASErr makes the queued→running run status CAS fail, mimicking a
 	// concurrent worker that already moved the row.
 	runningCASErr error
+	// maxSupplementCases overrides the configured supplement case budget of the
+	// service built by service(); zero keeps the production default.
+	maxSupplementCases int
 }
 
 // newRunFixture builds a version with a bound system and code baseline.
@@ -106,25 +109,26 @@ func newRunFixture() *runFixture {
 // service wires the fixture into the production constructor.
 func (f *runFixture) service() *application.RunService {
 	return application.NewRunService(application.RunDeps{
-		Runs:         runRunRepo{f},
-		Graph:        f,
-		Baselines:    runBaselineRepo{f},
-		Nodes:        runNodeRepo{f},
-		Steps:        runStepRepo{f},
-		Assertions:   runAssertionRepo{f},
-		Sources:      runSourceRepo{f},
-		Versions:     runVersionLifecycle{f},
-		Batches:      f.batches,
-		Requirements: runRequirementReader{f},
-		Knowledge:    f.knowledge,
-		Catalog:      runCatalogGateway{f},
-		CodeFacts:    runCodeFactsGateway{f},
-		Impact:       f.impact,
-		Anchors:      runAnchorGateway{f},
-		Agents:       runAgentRuntime{f},
-		Events:       runEventSink{f},
-		IDs:          runIDGenerator{f},
-		Clock:        runClock{f},
+		Runs:               runRunRepo{f},
+		Graph:              f,
+		Baselines:          runBaselineRepo{f},
+		Nodes:              runNodeRepo{f},
+		Steps:              runStepRepo{f},
+		Assertions:         runAssertionRepo{f},
+		Sources:            runSourceRepo{f},
+		Versions:           runVersionLifecycle{f},
+		Batches:            f.batches,
+		Requirements:       runRequirementReader{f},
+		Knowledge:          f.knowledge,
+		Catalog:            runCatalogGateway{f},
+		CodeFacts:          runCodeFactsGateway{f},
+		Impact:             f.impact,
+		Anchors:            runAnchorGateway{f},
+		Agents:             runAgentRuntime{f},
+		Events:             runEventSink{f},
+		IDs:                runIDGenerator{f},
+		Clock:              runClock{f},
+		MaxSupplementCases: f.maxSupplementCases,
 	})
 }
 

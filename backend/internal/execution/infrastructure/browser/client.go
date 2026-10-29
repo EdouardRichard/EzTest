@@ -29,6 +29,10 @@ import (
 const (
 	// defaultTimeout bounds one call when the caller's context has no deadline.
 	defaultTimeout = 30 * time.Second
+	// timeoutCancelBudget bounds the best-effort cancel of a context whose
+	// action timed out. It is deliberately short: the caller is already on an
+	// error path and must not hang on a wedged executor.
+	timeoutCancelBudget = 2 * time.Second
 	// maxResponseBytes caps a decoded executor response. The executor limits one
 	// artifact to 10MB, which is roughly 13.4MB once base64 encoded.
 	maxResponseBytes = 64 << 20
@@ -170,6 +174,13 @@ func (c *Client) Action(ctx context.Context, ref application.ContextRef, action 
 	payload := actionPayload{Action: action.Name, Args: action.Args}
 	status, body, err := c.do(ctx, http.MethodPost, contextPath(ref)+"/actions", payload)
 	if err != nil {
+		// A timed-out action leaves a background task running in the executor.
+		// Cancel its context best-effort on a detached bounded context so it
+		// cannot keep the page/queue wedged (design spec §10.5); the caller then
+		// classifies the case as inconclusive(model, executor_timeout).
+		if isExecutorTimeoutError(err) {
+			c.cancelTimedOutContext(ref)
+		}
 		return application.ActionResult{}, err
 	}
 	// A rejected bearer token is a client failure, not an action outcome.
@@ -409,16 +420,38 @@ func (c *Client) do(ctx context.Context, method, path string, payload any) (int,
 
 // transportError maps a net/http failure to a typed BrowserError. The wrapped
 // error only contains the method, path and URL; it never contains the token or a
-// request body.
+// request body. A call that exhausted its deadline is the executor_timeout of
+// design spec §10.5: an infrastructure/model failure, never an application
+// timeout of the target system.
 func transportError(method, path string, err error) *application.BrowserError {
 	code := "executor_unavailable"
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
-		code = "timeout"
+		code = "executor_timeout"
 	case errors.Is(err, context.Canceled):
 		code = "canceled"
 	}
 	return application.NewBrowserError(code, fmt.Sprintf("executor %s %s failed: %v", method, path, err))
+}
+
+// isExecutorTimeoutError reports whether err is the typed timeout of one
+// executor call.
+func isExecutorTimeoutError(err error) bool {
+	var browserErr *application.BrowserError
+	return errors.As(err, &browserErr) && browserErr != nil && browserErr.Code == "executor_timeout"
+}
+
+// cancelTimedOutContext aborts the in-flight action of a context whose request
+// timed out. The cleanup runs on a detached bounded context so the caller's
+// expired deadline cannot suppress it; a failure is ignored (teardown still
+// closes the context).
+func (c *Client) cancelTimedOutContext(ref application.ContextRef) {
+	if ref.ID == "" {
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), timeoutCancelBudget)
+	defer cancel()
+	_ = c.callOK(cleanupCtx, http.MethodPost, contextPath(ref)+"/cancel")
 }
 
 // errorFromResponse maps a non-2xx response to a typed BrowserError, preferring

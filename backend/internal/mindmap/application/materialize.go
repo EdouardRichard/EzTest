@@ -1420,10 +1420,10 @@ func (s *RunService) materializeSupplement(ctx context.Context, run domain.CaseD
 		}
 		writer := newSupplementGraphWriter(run.VersionID, run.CreatedBy, now, s.deps.IDs, &state)
 		for index, proposal := range submission.Cases {
-			if len(materialized) >= supplementMaxCases {
+			if len(materialized) >= s.maxSupplementCases() {
 				warnings = append(warnings, IncrementalPlanWarning{
 					Code:    "case_limit_reached",
-					Message: fmt.Sprintf("the run may add at most %d cases; the rest was skipped", supplementMaxCases),
+					Message: fmt.Sprintf("the run may add at most %d cases; the rest was skipped", s.maxSupplementCases()),
 				})
 				break
 			}

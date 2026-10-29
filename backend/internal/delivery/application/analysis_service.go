@@ -38,6 +38,10 @@ type AnalysisDeps struct {
 	Audit      AnalysisAuditRecorder
 	IDs        AnalysisIDGenerator
 	Clock      AnalysisClock
+	// MaxCases is the per-run failed-case budget
+	// (EZTEST_ANALYSIS_MAX_CASES, design spec §10.5/§11.4). Zero keeps the
+	// spec default domain.AnalysisMaxFailureCandidates (20).
+	MaxCases int
 }
 
 // AnalysisService coordinates the failure-analysis and issue-triage runs of
@@ -59,9 +63,10 @@ func NewAnalysisService(deps AnalysisDeps) *AnalysisService {
 }
 
 // StartFailure creates and starts the failure-analysis run of one terminal
-// batch. Only failed(application) case runs are accepted, at most 20; the
-// overflow is recorded as stats.truncated. A batch without such a failure is
-// analysis_not_applicable and an already active run is analysis_active.
+// batch. Only failed(application) case runs are accepted, at most
+// EZTEST_ANALYSIS_MAX_CASES (default 20); the overflow is recorded as
+// stats.truncated. A batch without such a failure is analysis_not_applicable
+// and an already active run is analysis_active.
 func (s *AnalysisService) StartFailure(ctx context.Context, versionID, batchID, actor int64) (domain.AnalysisRun, error) {
 	if err := s.requireFailurePorts(); err != nil {
 		return domain.AnalysisRun{}, err
@@ -73,21 +78,13 @@ func (s *AnalysisService) StartFailure(ctx context.Context, versionID, batchID, 
 		return domain.AnalysisRun{}, fmt.Errorf("delivery: check active failure analysis: %w", err)
 	}
 
-	cases, err := s.deps.Execution.ListFailedCases(ctx, versionID, batchID, domain.AnalysisMaxFailureCandidates+1)
+	cases, truncated, err := s.listFailedApplicationCases(ctx, versionID, batchID, s.maxFailureCases())
 	if err != nil {
 		return domain.AnalysisRun{}, fmt.Errorf("delivery: list failed cases of batch %d: %w", batchID, err)
 	}
 	caseRunIDs := make([]int64, 0, len(cases))
 	for _, failedCase := range cases {
-		if failedCase.FailureClass != domain.FailureClassApplication ||
-			failedCase.CaseRunID <= 0 || failedCase.CaseNodeID <= 0 {
-			continue
-		}
 		caseRunIDs = append(caseRunIDs, failedCase.CaseRunID)
-	}
-	truncated := len(caseRunIDs) > domain.AnalysisMaxFailureCandidates
-	if truncated {
-		caseRunIDs = caseRunIDs[:domain.AnalysisMaxFailureCandidates]
 	}
 	if len(caseRunIDs) == 0 {
 		return domain.AnalysisRun{}, domain.NewAnalysisNotApplicable(
@@ -230,17 +227,13 @@ func (s *AnalysisService) ProposeFailureCandidates(ctx context.Context, analysis
 	if s.deps.Execution == nil {
 		return domain.AnalysisRun{}, nil, errors.New("delivery: execution reader is not configured")
 	}
-	cases, err := s.deps.Execution.ListFailedCases(ctx, run.VersionID, run.BatchID, domain.AnalysisMaxFailureCandidates+1)
+	cases, _, err := s.listFailedApplicationCases(ctx, run.VersionID, run.BatchID, s.maxFailureCases())
 	if err != nil {
 		return domain.AnalysisRun{}, nil, fmt.Errorf("delivery: list failed cases of analysis run %d: %w", analysisID, err)
 	}
 	allowed := make(map[int64]int64, len(cases))
 	allowedEvidence := make(map[int64]struct{})
 	for _, failedCase := range cases {
-		if failedCase.FailureClass != domain.FailureClassApplication ||
-			failedCase.CaseRunID <= 0 || failedCase.CaseNodeID <= 0 {
-			continue
-		}
 		allowed[failedCase.CaseRunID] = failedCase.CaseNodeID
 		for _, evidenceID := range failedCase.EvidenceIDs {
 			if evidenceID > 0 {
@@ -757,7 +750,7 @@ func (s *AnalysisService) allowedEvidenceIDs(ctx context.Context, versionID, bat
 	if s.deps.Execution == nil {
 		return nil, false
 	}
-	cases, err := s.deps.Execution.ListFailedCases(ctx, versionID, batchID, domain.AnalysisMaxFailureCandidates+1)
+	cases, _, err := s.listFailedApplicationCases(ctx, versionID, batchID, s.maxFailureCases())
 	if err != nil {
 		slog.WarnContext(ctx, "delivery: list failed cases for evidence validation failed",
 			"version_id", versionID, "batch_id", batchID, "error", err)
@@ -765,9 +758,6 @@ func (s *AnalysisService) allowedEvidenceIDs(ctx context.Context, versionID, bat
 	}
 	allowed := make(map[int64]struct{})
 	for _, failedCase := range cases {
-		if failedCase.FailureClass != domain.FailureClassApplication {
-			continue
-		}
 		for _, evidenceID := range failedCase.EvidenceIDs {
 			if evidenceID > 0 {
 				allowed[evidenceID] = struct{}{}
@@ -775,6 +765,42 @@ func (s *AnalysisService) allowedEvidenceIDs(ctx context.Context, versionID, bat
 		}
 	}
 	return allowed, true
+}
+
+// maxFailureCases returns the configured per-run failed-case budget, defaulting
+// to the spec default when the composition root did not wire one.
+func (s *AnalysisService) maxFailureCases() int {
+	if s.deps.MaxCases > 0 {
+		return s.deps.MaxCases
+	}
+	return domain.AnalysisMaxFailureCandidates
+}
+
+// listFailedApplicationCases reads the failed(application) case runs of one
+// batch bounded by max (design spec §10.5/§11.4). It filters malformed/other
+// classes before applying the budget and reports whether the batch overflowed
+// it. The extra read row tells truncation apart from an exact fit.
+func (s *AnalysisService) listFailedApplicationCases(ctx context.Context, versionID, batchID int64, max int) ([]AnalysisFailedCase, bool, error) {
+	if s.deps.Execution == nil {
+		return nil, false, errors.New("delivery: execution reader is not configured")
+	}
+	cases, err := s.deps.Execution.ListFailedCases(ctx, versionID, batchID, max+1)
+	if err != nil {
+		return nil, false, err
+	}
+	filtered := make([]AnalysisFailedCase, 0, len(cases))
+	for _, failedCase := range cases {
+		if failedCase.FailureClass != domain.FailureClassApplication ||
+			failedCase.CaseRunID <= 0 || failedCase.CaseNodeID <= 0 {
+			continue
+		}
+		filtered = append(filtered, failedCase)
+	}
+	truncated := len(filtered) > max
+	if truncated {
+		filtered = filtered[:max]
+	}
+	return filtered, truncated, nil
 }
 
 // filterMergeTargets enforces the open-only mergeIntoIssueId rule of spec §9.4:

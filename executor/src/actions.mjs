@@ -170,7 +170,14 @@ export function withAbort(promise, { timeoutMs, signal, label }) {
       callback(value)
     }
     const timer = setTimeout(
-      () => finish(reject, new ExecutorError("timeout", `${label} timed out after ${timeoutMs}ms`)),
+      () =>
+        finish(
+          reject,
+          new ExecutorError(
+            "executor_timeout",
+            `${label} exceeded its hard deadline of ${timeoutMs}ms`,
+          ),
+        ),
       timeoutMs,
     )
     const onAbort = () => finish(reject, new ExecutorError("canceled", `${label} was canceled`))

@@ -12,6 +12,7 @@ import http from "node:http"
 import { pathToFileURL } from "node:url"
 
 import { ContextManager } from "./contexts.mjs"
+import { parseAllowedHosts } from "./limits.mjs"
 import {
   DEFAULT_MAX_CONTEXTS,
   ExecutorError,
@@ -283,8 +284,11 @@ export async function startFromEnv(env = process.env) {
   }
   const { host, port } = parseAddress(env.EZTEST_EXECUTOR_ADDR ?? "127.0.0.1:13336")
   const maxContexts = parseMaxContexts(env.EZTEST_EXECUTOR_MAX_CONTEXTS)
+  // P8 hardening (design spec §10.5): the executor-wide WebSocket allow list.
+  // It defaults to loopback; remote targets must be listed explicitly.
+  const allowedHosts = parseAllowedHosts(env.EZTEST_EXEC_ALLOWED_HOSTS)
   const logger = console
-  const manager = new ContextManager({ maxContexts, logger })
+  const manager = new ContextManager({ maxContexts, logger, allowedHosts })
   const server = createExecutorServer({
     token,
     manager,

@@ -41,6 +41,16 @@ var terminalAgentRunStatuses = map[string]struct{}{
 	"cancelled":   {},
 }
 
+// CaseRunFailureSignaler reports a terminal condition the execution path
+// enforced itself while the agent run was still polling (design spec §10.5):
+// an exhausted tool-call budget or an executor timeout. The runner is the
+// authority that persists the classification; the tools only count and signal.
+type CaseRunFailureSignaler interface {
+	// CaseRunFailure returns the stable terminal code of a case run, if the
+	// execution tools recorded one.
+	CaseRunFailure(caseRunID int64) (code string, ok bool)
+}
+
 // CaseRunnerDeps are the ports of one case run. Browser is the controller of
 // the tools' per-case executor context; the runner never creates a context
 // itself. It may be nil in tests that only exercise pause/completion; Runtime,
@@ -58,6 +68,9 @@ type CaseRunnerDeps struct {
 	// tools create lazily. The tools own that context; the runner only acts on
 	// it through this controller.
 	Browser CaseBrowserController
+	// Signals reads the terminal conditions recorded by the execution tools.
+	// When nil, the runner does not enforce tool-call/executor budgets itself.
+	Signals CaseRunFailureSignaler
 	// Timeout overrides DefaultCaseTimeout. A positive value wins; otherwise
 	// EZTEST_EXEC_CASE_TIMEOUT_MS is read.
 	Timeout time.Duration
@@ -161,6 +174,16 @@ func (r *CaseRunner) Run(ctx context.Context, run domain.CaseRun, session Sessio
 				return
 			}
 			r.finishOutcome(ctx, run, toolCodeForError(err), err.Error(), 0, session)
+			return
+		}
+
+		// A tool-call budget exhaustion or an executor timeout is a server-side
+		// terminal condition and is authoritative even when the agent run ended
+		// in the same poll: the tools keep the agent state "running", so the
+		// runner must stop the run and persist the model failure itself
+		// (design spec §10.5). A pause still wins (honorPauseBeforeTerminal).
+		if code, ok := r.caseRunFailure(run.ID); ok {
+			r.finishExecutionFailure(ctx, run, agent.SessionID, session, code)
 			return
 		}
 
@@ -378,6 +401,28 @@ func (r *CaseRunner) finishTimeout(ctx context.Context, run domain.CaseRun, agen
 		return
 	}
 	r.finishOutcome(ctx, run, "budget_exhausted", "case_timeout", r.stepEvidenceCount(ctx, run.ID), session)
+}
+
+// finishExecutionFailure classifies a terminal condition enforced by the
+// execution tools (tool-call budget exhaustion, executor timeout) as
+// inconclusive(model) with the stable reason, cancels the agent run and releases
+// the case resources. The classification code is one of the model-mapped tool
+// codes of design spec §10.5.
+func (r *CaseRunner) finishExecutionFailure(ctx context.Context, run domain.CaseRun, agentSessionID int64, session SessionRef, code string) {
+	_ = r.deps.Runtime.CancelRun(context.WithoutCancel(ctx), agentSessionID)
+	if r.honorPauseBeforeTerminal(ctx, run, session) {
+		return
+	}
+	r.finishOutcome(ctx, run, code, code, r.stepEvidenceCount(ctx, run.ID), session)
+}
+
+// caseRunFailure reads the terminal signal of the execution tools. A nil signal
+// source disables the enforcement (for example in a partial test fixture).
+func (r *CaseRunner) caseRunFailure(caseRunID int64) (string, bool) {
+	if r.deps.Signals == nil {
+		return "", false
+	}
+	return r.deps.Signals.CaseRunFailure(caseRunID)
 }
 
 // handleShutdown releases the executor context and the session lease after the
@@ -706,6 +751,8 @@ var knownAgentToolCodes = map[string]struct{}{
 	"no_session":                 {},
 	"budget_exhausted":           {},
 	"budget_exceeded":            {},
+	"tool_call_budget_exhausted": {},
+	"executor_timeout":           {},
 	"context_overflow":           {},
 	"max_turns":                  {},
 	"model_error":                {},

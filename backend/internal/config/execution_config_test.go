@@ -25,8 +25,8 @@ func TestLoadExecutionDefaults(t *testing.T) {
 	if cfg.ExecMaxConcurrentCases != 3 {
 		t.Fatalf("ExecMaxConcurrentCases=%d", cfg.ExecMaxConcurrentCases)
 	}
-	if cfg.ExecMaxToolCalls != 80 {
-		t.Fatalf("ExecMaxToolCalls=%d", cfg.ExecMaxToolCalls)
+	if cfg.ExecMaxToolCalls != 30 {
+		t.Fatalf("ExecMaxToolCalls=%d want the P8 default 30", cfg.ExecMaxToolCalls)
 	}
 	if cfg.ExecCaseTimeoutMS != 900000 {
 		t.Fatalf("ExecCaseTimeoutMS=%d", cfg.ExecCaseTimeoutMS)
@@ -89,6 +89,7 @@ func TestLoadExecutionBoundsRejectOutOfRange(t *testing.T) {
 		"EZTEST_EXEC_EVIDENCE_MAX_BYTES":   "1",
 		"EZTEST_EXEC_EVIDENCE_PER_CASE":    "5000",
 	}
+	cases["EZTEST_EXEC_MAX_TOOL_CALLS"] = "201"
 	for key, value := range cases {
 		env := validEnv()
 		env[key] = value
