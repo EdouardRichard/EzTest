@@ -17,6 +17,14 @@ import (
 // EZTEST_VISUAL_BASELINE_MAX_BYTES is not configured.
 const DefaultVisualBaselineMaxBytes int64 = 5 << 20
 
+// visualBaselineEvidenceKinds is the frozen approval vocabulary of design spec
+// §9.3: an approved baseline is a browser screenshot or a dedicated
+// visual_baseline capture, never an unrelated PNG artifact.
+var visualBaselineEvidenceKinds = map[string]struct{}{
+	"screenshot":      {},
+	"visual_baseline": {},
+}
+
 // UpdateVisualAssertionCommand is the PUT .../assertions/{assertionId}/visual
 // body. NodeRevision is the node-level OCC token shared with every graph write.
 type UpdateVisualAssertionCommand struct {
@@ -177,9 +185,15 @@ func (s *VisualAssertionService) ensureWritable(ctx context.Context, versionID i
 	}
 }
 
-// validateBaselineEvidence proves the artifact is a PNG whose device-pixel size
-// matches the assertion viewport and whose bytes/hash are internally consistent.
+// validateBaselineEvidence proves the artifact is a screenshot or
+// visual_baseline PNG whose device-pixel size matches the assertion viewport and
+// whose bytes/hash are internally consistent.
 func (s *VisualAssertionService) validateBaselineEvidence(visual domain.VisualAssertion, evidence VisualEvidence) error {
+	kind := strings.ToLower(strings.TrimSpace(evidence.Kind))
+	if _, ok := visualBaselineEvidenceKinds[kind]; !ok {
+		return domain.NewInvalid("evidenceId", "visual_baseline_invalid",
+			"the visual baseline must be a screenshot or visual_baseline artifact")
+	}
 	if evidence.SizeBytes > s.maxBaselineBytes || int64(len(evidence.Data)) > s.maxBaselineBytes {
 		return domain.NewInvalid("evidenceId", "visual_baseline_too_large",
 			"the visual baseline exceeds the configured byte limit")

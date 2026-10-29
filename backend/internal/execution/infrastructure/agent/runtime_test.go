@@ -211,7 +211,7 @@ func TestAgentRuntimeEnsureProfileSeedsExecutionProfile(t *testing.T) {
 	if seed.SystemPrompt != executiondomain.ExecutionPrompt {
 		t.Fatal("seeded system prompt is not the ExecutionPrompt constant")
 	}
-	if len(seed.AllowedTools) != 16 || seed.MaxTurns != 30 || seed.RunSeconds != 900 || seed.HardTimeoutSeconds != 120 {
+	if len(seed.AllowedTools) != 17 || seed.MaxTurns != 30 || seed.RunSeconds != 900 || seed.HardTimeoutSeconds != 120 {
 		t.Fatalf("seed budgets/tools=%+v", seed)
 	}
 }

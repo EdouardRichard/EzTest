@@ -13,6 +13,11 @@ const ExecutionProfileKey = "execution-agent"
 // idempotently to an already-seeded profile (EnsureToolAllowed, T17).
 const ExecutionDBAssertTool = "execution.db_assert"
 
+// ExecutionVisualAssertTool is the P8 visual assertion tool (design spec §9.3).
+// It is appended to the execution-agent allowlist seed and added idempotently to
+// an already-seeded profile by the composition root.
+const ExecutionVisualAssertTool = "execution.visual_assert"
+
 // ExecutionPrompt is the exact eight-point system prompt of design spec §7.2.
 // It is the seed text for the execution-agent profile; an administrator may
 // edit the stored prompt through the P1 profile API afterwards.
@@ -75,5 +80,6 @@ func executionAllowedTools() []string {
 		"execution.assertion_record",
 		"execution.case_finish",
 		ExecutionDBAssertTool,
+		ExecutionVisualAssertTool,
 	}
 }

@@ -289,10 +289,17 @@ func (r *CaseRecorder) RecordAssertion(ctx context.Context, caseRunID int64, in 
 			"assertion %d is not part of case run %d snapshot", in.AssertionID, caseRunID)
 	}
 	// A db assertion result is server-owned (spec §9.5): only execution.db_assert
-	// may write it. Rejecting the generic path closes the forged-passed hole.
-	if strings.EqualFold(strings.TrimSpace(assertion.Kind), "db") {
+	// may write it. Rejecting the generic path closes the forged-passed hole. A
+	// visual assertion result is server-owned for the same reason (spec §9.3):
+	// only execution.visual_assert may record it.
+	switch strings.ToLower(strings.TrimSpace(assertion.Kind)) {
+	case "db":
 		return domain.AssertionResult{}, recorderToolError(toolCodeInvalidArguments,
 			"assertion %d is a db assertion and must be recorded by execution.db_assert (assertion_already_recorded)",
+			in.AssertionID)
+	case "visual":
+		return domain.AssertionResult{}, recorderToolError(toolCodeInvalidArguments,
+			"assertion %d is a visual assertion and must be recorded by execution.visual_assert (assertion_already_recorded)",
 			in.AssertionID)
 	}
 	existing, err := r.deps.Assertions.ListByCaseRun(ctx, caseRunID)

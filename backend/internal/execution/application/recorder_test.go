@@ -608,6 +608,30 @@ func TestRecorderRejectsDBAssertionThroughGenericPath(t *testing.T) {
 	wantToolError(t, err, "invalid_arguments", "invalid_assertion_results")
 }
 
+// TestRecorderRejectsVisualAssertionThroughGenericPath pins the §9.3 analogue of
+// the db rule: only execution.visual_assert writes a visual assertion result; the
+// generic execution.assertion_record path must reject it so the agent cannot
+// forge a passed visual comparison.
+func TestRecorderRejectsVisualAssertionThroughGenericPath(t *testing.T) {
+	recorder, world := newRecorderTest(t)
+	snapshot := recorderSnapshot()
+	snapshot.Assertions[0].Kind = "visual"
+	snapshot.Assertions[0].Visual = &domain.CaseSnapshotVisual{
+		Selector: "#receipt", Threshold: 0.01, ViewportWidth: 1280, ViewportHeight: 720,
+		DeviceScaleFactor: 1,
+	}
+	run := world.seedRunningRun(snapshot)
+	evidence := world.evidenceFor(run.ID, "visual")
+
+	_, err := recorder.RecordAssertion(context.Background(), run.ID, AssertionRecordInput{
+		AssertionID: 20, Verdict: "passed", Actual: "{}", EvidenceIDs: []int64{evidence.ID},
+	})
+	wantToolError(t, err, "invalid_arguments", "visual_assert")
+	if rows := world.assertions.rows[run.ID]; len(rows) != 0 {
+		t.Fatalf("generic assertion_record wrote a visual result: %+v", rows)
+	}
+}
+
 func TestRecorderRejectsPausedAndTerminalSubmissions(t *testing.T) {
 	t.Run("paused", func(t *testing.T) {
 		recorder, world := newRecorderTest(t)

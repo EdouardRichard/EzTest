@@ -43,6 +43,11 @@ type fakeRecorder struct {
 	dbLimits      application.DBAssertLimits
 	dbOutcome     application.DBAssertOutcome
 	dbErr         error
+
+	visualAssertionID int64
+	visualOptions     application.VisualAssertOptions
+	visualOutcome     application.VisualAssertOutcome
+	visualErr         error
 }
 
 func (f *fakeRecorder) CaseContext(_ context.Context, _ int64) (application.CaseContextView, error) {
@@ -71,6 +76,12 @@ func (f *fakeRecorder) DBAssert(_ context.Context, _ int64, assertionID int64, l
 	f.dbAssertionID = assertionID
 	f.dbLimits = limits
 	return f.dbOutcome, f.dbErr
+}
+
+func (f *fakeRecorder) VisualAssert(_ context.Context, _ int64, assertionID int64, opts application.VisualAssertOptions) (application.VisualAssertOutcome, error) {
+	f.visualAssertionID = assertionID
+	f.visualOptions = opts
+	return f.visualOutcome, f.visualErr
 }
 
 // fakeEvidence records captured artifacts and returns a deterministic row.
@@ -173,6 +184,9 @@ func sha256Hex(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// int64Pointer returns a pointer to a copy of value.
+func int64Pointer(value int64) *int64 { return &value }
+
 // TestToolsMatchExecutionProfileAllowlist is the registry contract: the tool
 // names of spec §7.1 exist exactly once, every schema is a JSON object, and the
 // execution-agent allowlist names only registered tools.
@@ -196,6 +210,7 @@ func TestToolsMatchExecutionProfileAllowlist(t *testing.T) {
 		"execution.assertion_record",
 		"execution.case_finish",
 		"execution.db_assert",
+		"execution.visual_assert",
 	}
 	if len(tools) != len(want) {
 		t.Fatalf("registered %d tools, want %d: %v", len(tools), len(want), toolNames(tools))
@@ -1150,3 +1165,179 @@ func TestValidateToolsRequiresEveryProfileTool(t *testing.T) {
 		t.Fatal("ValidateTools(nil registry) must fail")
 	}
 }
+
+// visualView is the default case read model plus one kind=visual assertion.
+func visualView(baseline *int64) application.CaseContextView {
+	view := defaultView()
+	view.CaseRun.Snapshot.Assertions = append(view.CaseRun.Snapshot.Assertions, executiondomain.CaseSnapshotAssertion{
+		ID: 88, StepSeq: 2, Kind: "visual", Target: "#chart", Expected: "match",
+		Visual: &executiondomain.CaseSnapshotVisual{
+			Selector: "#chart", Threshold: 0.01, BaselineEvidenceID: baseline,
+			ViewportWidth: 1280, ViewportHeight: 720, DeviceScaleFactor: 1,
+		},
+	})
+	return view
+}
+
+// visualBrowserFake is a browser executor that also implements the optional
+// VisualComparator slice, mirroring the production client.
+type visualBrowserFake struct {
+	*testutil.FakeBrowserExecutor
+	visualCalls int
+	result      application.VisualCompareResult
+	err         error
+}
+
+func (f *visualBrowserFake) CompareVisual(_ context.Context, _ application.ContextRef, _ application.VisualCompareRequest) (application.VisualCompareResult, error) {
+	f.visualCalls++
+	return f.result, f.err
+}
+
+// fakeVisualBaselineReader is the approved-baseline read port wired through the
+// tool set setter.
+type fakeVisualBaselineReader struct{}
+
+func (fakeVisualBaselineReader) ReadVisualBaseline(context.Context, int64, int64) (application.VisualBaseline, error) {
+	return application.VisualBaseline{EvidenceID: 501, Kind: "visual_baseline", Mime: "image/png", Data: []byte("png")}, nil
+}
+
+// TestVisualAssertToolRejectsExtraArguments pins the frozen argument shape: the
+// agent supplies only assertionId; a model-supplied baseline/config is rejected.
+func TestVisualAssertToolRejectsExtraArguments(t *testing.T) {
+	tools := New(&fakeRecorder{view: visualView(int64Pointer(501))}, testutil.NewFakeBrowserExecutor(), &fakeEvidence{}, nil, Limits{})
+	_, err := callTool(t, tools, "execution.visual_assert",
+		`{"assertionId":"88","baseline_base64":"Zm9v","threshold":0.5}`)
+	requireToolError(t, err, "invalid_arguments")
+}
+
+// TestVisualAssertToolRequiresAVisualSnapshotAssertion rejects an unknown or
+// non-visual assertion id before any browser or recorder work.
+func TestVisualAssertToolRequiresAVisualSnapshotAssertion(t *testing.T) {
+	recorder := &fakeRecorder{view: visualView(int64Pointer(501))}
+	tools := New(recorder, testutil.NewFakeBrowserExecutor(), &fakeEvidence{}, nil, Limits{})
+
+	_, err := callTool(t, tools, "execution.visual_assert", `{"assertionId":"999"}`)
+	requireToolError(t, err, "invalid_arguments")
+
+	uiTools := New(&fakeRecorder{view: defaultView()}, testutil.NewFakeBrowserExecutor(), &fakeEvidence{}, nil, Limits{})
+	_, err = callTool(t, uiTools, "execution.visual_assert", `{"assertionId":"77"}`)
+	requireToolError(t, err, "invalid_arguments")
+	if recorder.visualAssertionID != 0 {
+		t.Fatalf("a rejected assertion reached the recorder (%d)", recorder.visualAssertionID)
+	}
+}
+
+// TestVisualAssertToolSkipsBrowserForUnapprovedBaseline pins the ordering: an
+// assertion without an approved baseline is classified before any executor
+// context is created.
+func TestVisualAssertToolSkipsBrowserForUnapprovedBaseline(t *testing.T) {
+	browser := testutil.NewFakeBrowserExecutor()
+	recorder := &fakeRecorder{
+		view:      visualView(nil),
+		visualErr: &agentdomain.ToolError{Code: "missing_visual_baseline", Message: "no approved visual baseline"},
+	}
+	tools := New(recorder, browser, &fakeEvidence{}, nil, Limits{})
+
+	_, err := callTool(t, tools, "execution.visual_assert", `{"assertionId":"88"}`)
+	requireToolError(t, err, "missing_visual_baseline")
+	if recorder.visualAssertionID != 88 {
+		t.Fatalf("recorder assertion id = %d, want 88", recorder.visualAssertionID)
+	}
+	if recorder.visualOptions.Comparator != nil || recorder.visualOptions.Context.ID != "" {
+		t.Fatalf("missing baseline opened a comparator/context: %+v", recorder.visualOptions)
+	}
+	for _, call := range browser.Calls() {
+		if call.Kind == testutil.FakeCallNewContext {
+			t.Fatal("a missing baseline created an executor context")
+		}
+	}
+}
+
+// TestVisualAssertToolCreatesContextAndDelegates covers the approved-baseline
+// path: the tool creates the case context, hands the comparator and the
+// configured caps to the recorder and projects the recorded outcome.
+func TestVisualAssertToolCreatesContextAndDelegates(t *testing.T) {
+	browser := &visualBrowserFake{FakeBrowserExecutor: testutil.NewFakeBrowserExecutor()}
+	recorder := &fakeRecorder{
+		view: visualView(int64Pointer(501)),
+		visualOutcome: application.VisualAssertOutcome{
+			AssertionID: 88, Verdict: "passed", Classification: "passed",
+			Reason: "visual_match", Threshold: 0.01, HasBaseline: true, EnvironmentMatch: true,
+			ActualEvidenceID: 900, DiffEvidenceID: 901,
+		},
+	}
+	limits := Limits{MaxArtifactBytes: 2048, VisualBaselineMaxBytes: 4096}
+	set := NewToolSet(recorder, browser, &fakeEvidence{}, nil, limits)
+	set.SetVisualBaseline(fakeVisualBaselineReader{})
+	tools := set.Tools()
+
+	out, err := callTool(t, tools, "execution.visual_assert", `{"assertionId":"88"}`)
+	if err != nil {
+		t.Fatalf("execution.visual_assert: %v", err)
+	}
+	if recorder.visualAssertionID != 88 {
+		t.Fatalf("recorder assertion id = %d, want 88", recorder.visualAssertionID)
+	}
+	opts := recorder.visualOptions
+	if opts.Comparator == nil || opts.Context.ID != "fake-ctx-1" {
+		t.Fatalf("comparator/context = %v/%+v", opts.Comparator, opts.Context)
+	}
+	if opts.MaxArtifactBytes != 2048 || opts.MaxBaselineBytes != 4096 {
+		t.Fatalf("caps = %d/%d, want 2048/4096", opts.MaxArtifactBytes, opts.MaxBaselineBytes)
+	}
+	if opts.Capture == nil || opts.Baselines == nil {
+		t.Fatalf("capture/baselines = %v/%v, want both wired", opts.Capture, opts.Baselines)
+	}
+	var payload struct {
+		AssertionID      string `json:"assertionId"`
+		Verdict          string `json:"verdict"`
+		Classification   string `json:"classification"`
+		ActualEvidenceID string `json:"actualEvidenceId"`
+		DiffEvidenceID   string `json:"diffEvidenceId"`
+	}
+	if err := json.Unmarshal([]byte(out.Content), &payload); err != nil {
+		t.Fatalf("result is not JSON: %v (%s)", err, out.Content)
+	}
+	if payload.AssertionID != "88" || payload.Verdict != "passed" ||
+		payload.Classification != "passed" || payload.ActualEvidenceID != "900" ||
+		payload.DiffEvidenceID != "901" {
+		t.Fatalf("result = %+v", payload)
+	}
+}
+
+// TestVisualAssertToolUnsupportedComparatorFailsClosed pins that a browser
+// executor without CompareVisual never fakes a pass: the recorder is told there
+// is no comparator and no context is created.
+func TestVisualAssertToolUnsupportedComparatorFailsClosed(t *testing.T) {
+	browser := testutil.NewFakeBrowserExecutor()
+	recorder := &fakeRecorder{
+		view:      visualView(int64Pointer(501)),
+		visualErr: &agentdomain.ToolError{Code: "unsupported_assertion_kind", Message: "no visual comparator"},
+	}
+	tools := New(recorder, browser, &fakeEvidence{}, nil, Limits{})
+
+	_, err := callTool(t, tools, "execution.visual_assert", `{"assertionId":"88"}`)
+	requireToolError(t, err, "unsupported_assertion_kind")
+	if recorder.visualOptions.Comparator != nil || recorder.visualOptions.Context.ID != "" {
+		t.Fatalf("unsupported comparator created a context: %+v", recorder.visualOptions)
+	}
+	for _, call := range browser.Calls() {
+		if call.Kind == testutil.FakeCallNewContext {
+			t.Fatal("an unsupported comparator created an executor context")
+		}
+	}
+}
+
+// TestVisualAssertToolIsRegistered proves the frozen tool list carries the P8
+// visual assertion tool (the execution-agent profile allowlist validates it).
+func TestVisualAssertToolIsRegistered(t *testing.T) {
+	tools := New(&fakeRecorder{}, testutil.NewFakeBrowserExecutor(), &fakeEvidence{}, nil, Limits{})
+	names := make(map[string]bool, len(tools))
+	for _, tool := range tools {
+		names[tool.Name()] = true
+	}
+	if !names["execution.visual_assert"] {
+		t.Fatal("execution.visual_assert is not registered")
+	}
+}
+

@@ -128,6 +128,49 @@ function Get-CommandExe {
     return $command.Source
 }
 
+# Invoke-VisualEvaluation replays eval/ground-truth/visual.json through the
+# production execution-domain classifier (backend/internal/execution/evalvisual)
+# and returns its JSON metric document. It needs only the Go toolchain, so both
+# the deterministic run and -DryRun consume the same evaluation.
+function Invoke-VisualEvaluation {
+    param([string]$GoExe, [string]$RepoRoot)
+    $backendDir = Join-Path $RepoRoot "backend"
+    $corpusPath = Join-Path $RepoRoot "eval\corpus\visual.json"
+    $truthPath = Join-Path $RepoRoot "eval\ground-truth\visual.json"
+    New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
+    $errLog = Join-Path $tmpDir "visual-eval.err.log"
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "SilentlyContinue"
+    Push-Location $backendDir
+    try {
+        $output = & $GoExe run ./internal/execution/evalvisual -corpus $corpusPath -ground-truth $truthPath 2>$errLog
+        $evalExit = $LASTEXITCODE
+    } finally {
+        Pop-Location
+        $ErrorActionPreference = $previous
+    }
+    if ($evalExit -ne 0) {
+        $detail = ""
+        if (Test-Path -LiteralPath $errLog) {
+            $detail = (Get-Content -LiteralPath $errLog -Raw -Encoding UTF8 -ErrorAction SilentlyContinue)
+        }
+        throw "visual assertion evaluation failed (exit $evalExit): $detail"
+    }
+    try {
+        $result = ($output | Out-String) | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        throw "visual assertion evaluation did not return valid JSON"
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$result.metric)) {
+        throw "visual assertion evaluation returned no metric"
+    }
+    if (-not [bool]$result.passed) {
+        throw ("visual_classification_accuracy {0:P1} is below the {1:P1} threshold ({2}/{3} cases classified correctly)" -f `
+                [double]$result.accuracy, [double]$result.threshold, [int]$result.correct, [int]$result.total)
+    }
+    return $result
+}
+
 # ---------------------------------------------------------------------------
 # Static preflight: corpus, baseline, database target and toolchain. It is
 # shared by -DryRun and the full run so both reject the same broken inputs.
@@ -141,6 +184,8 @@ function Invoke-Preflight {
         "classification truth"   = (Join-Path $truthDir "classification.json")
         "issues ground truth"    = (Join-Path $truthDir "issues.json")
         "supplement ground truth" = (Join-Path $truthDir "supplement.json")
+        "visual corpus"          = (Join-Path $corpusDir "visual.json")
+        "visual ground truth"    = (Join-Path $truthDir "visual.json")
         "baseline"               = (Join-Path $evalRoot "baseline.json")
     }
     $checked = New-Object System.Collections.ArrayList
@@ -157,6 +202,8 @@ function Invoke-Preflight {
     $classification = Read-JsonFile -Path $requiredFiles["classification truth"] -Label "classification ground truth"
     $issuesTruth = Read-JsonFile -Path $requiredFiles["issues ground truth"] -Label "issues ground truth"
     $supplement = Read-JsonFile -Path $requiredFiles["supplement ground truth"] -Label "supplement ground truth"
+    $visualCorpus = Read-JsonFile -Path $requiredFiles["visual corpus"] -Label "visual corpus"
+    $visualTruth = Read-JsonFile -Path $requiredFiles["visual ground truth"] -Label "visual ground truth"
     $baseline = Read-JsonFile -Path $requiredFiles["baseline"] -Label "baseline"
 
     # Corpus version consistency is the freeze contract: a mismatch means a file
@@ -171,6 +218,8 @@ function Invoke-Preflight {
             @{ Name = "classification.json"; Value = [string]$classification.corpusVersion },
             @{ Name = "issues.json"; Value = [string]$issuesTruth.corpusVersion },
             @{ Name = "supplement.json"; Value = [string]$supplement.corpusVersion },
+            @{ Name = "visual.json (corpus)"; Value = [string]$visualCorpus.corpusVersion },
+            @{ Name = "visual.json (ground truth)"; Value = [string]$visualTruth.corpusVersion },
             @{ Name = "baseline.json"; Value = [string]$baseline.corpusVersion }
         )) {
         if ($pair.Value -ne $corpusVersion) {
@@ -225,6 +274,15 @@ function Invoke-Preflight {
     }
     if (@($supplement.expectedCases).Count -eq 0) {
         throw "supplement.json declares no expected cases"
+    }
+    if ([string]$visualCorpus.scenario.assertion.kind -ne "visual") {
+        throw "visual.json scenario.assertion.kind must be visual"
+    }
+    if ([string]$visualTruth.metric -ne "visual_classification_accuracy") {
+        throw "ground-truth/visual.json metric must be visual_classification_accuracy"
+    }
+    if (@($visualTruth.cases).Count -eq 0) {
+        throw "ground-truth/visual.json declares no cases"
     }
 
     $baselineMetrics = @{}
@@ -328,6 +386,10 @@ function Invoke-Preflight {
     if (-not (Test-Path -LiteralPath $scriptHost)) { $scriptHost = Join-Path $PSHOME "powershell.exe" }
     if (-not (Test-Path -LiteralPath $scriptHost)) { throw "cannot locate a PowerShell host to run helper scripts" }
 
+    # The visual scenario is evaluated through the production classifier here so
+    # both the deterministic gate and -DryRun reject a drifted corpus/classifier.
+    $visualEval = Invoke-VisualEvaluation -GoExe $goExe -RepoRoot $repoRoot
+
     if ($RealLLM) {
         if ($env:EZTEST_RUN_REAL_LLM -ne "1") {
             throw "real-LLM evaluation is gated: set EZTEST_RUN_REAL_LLM=1 to run it"
@@ -348,6 +410,9 @@ function Invoke-Preflight {
         Classification   = $classification
         IssuesTruth      = $issuesTruth
         SupplementTruth  = $supplement
+        VisualCorpus     = $visualCorpus
+        VisualTruth      = $visualTruth
+        VisualEval       = $visualEval
         Baseline         = $baseline
         BaselineMetrics  = $baselineMetrics
         EnvValues        = $envValues
@@ -525,6 +590,11 @@ const impactTruth = readJson(process.env.P8_EVAL_GT_IMPACT);
 const classificationTruth = readJson(process.env.P8_EVAL_GT_CLASSIFICATION);
 const issuesTruth = readJson(process.env.P8_EVAL_GT_ISSUES);
 const supplementTruth = readJson(process.env.P8_EVAL_GT_SUPPLEMENT);
+// The visual metric is produced by backend/internal/execution/evalvisual from
+// eval/corpus/visual.json + eval/ground-truth/visual.json through the production
+// classifier; the runner only records it next to the six §9.1 metrics.
+const visualResultPath = process.env.P8_EVAL_VISUAL_RESULT;
+const visualEval = visualResultPath ? readJson(visualResultPath) : null;
 
 const startedAt = new Date();
 const observation = {
@@ -1094,6 +1164,20 @@ async function main() {
   phase("supplement", supplement);
 
   await waitVersionCompleted();
+  if (visualEval) {
+    observation.visual = visualEval;
+    phase("visual-classification", {
+      metric: visualEval.metric,
+      accuracy: visualEval.accuracy,
+      correct: visualEval.correct,
+      total: visualEval.total,
+    });
+    if (DETERMINISTIC && !visualEval.passed) {
+      throw new Error(
+        `visual_classification_accuracy ${visualEval.accuracy} is below the ${visualEval.threshold} threshold`,
+      );
+    }
+  }
   phase("report");
 
   const sample = observation.counts;
@@ -1123,13 +1207,25 @@ async function main() {
         baselineBatchId: observation.batchId,
         supplementBatchId: observation.supplementBatchId ?? null,
         analysisId: observation.analysisId ?? null,
+        visual: visualEval
+          ? {
+              metric: visualEval.metric,
+              accuracy: visualEval.accuracy,
+              threshold: visualEval.threshold,
+              correct: visualEval.correct,
+              total: visualEval.total,
+              passed: visualEval.passed,
+            }
+          : null,
         corpusFiles: [
           "corpus/requirements.json",
           "corpus/environment.json",
+          "corpus/visual.json",
           "ground-truth/impact.json",
           "ground-truth/classification.json",
           "ground-truth/issues.json",
           "ground-truth/supplement.json",
+          "ground-truth/visual.json",
         ],
       },
     },
@@ -1150,6 +1246,19 @@ async function main() {
     };
     if (metric.detail?.reason === "baseline_regression") regressions.push(metric.name);
   }
+  // The §9.3 visual metric is a corpus-level classification detail. It never
+  // replaces the six §9.1 metrics and is gated by the Go helper in preflight.
+  if (visualEval) {
+    metrics[visualEval.metric] = {
+      value: visualEval.accuracy,
+      threshold: visualEval.threshold,
+      passed: visualEval.passed,
+      reason: visualEval.passed ? "ok" : "below_threshold",
+      numerator: visualEval.correct,
+      denominator: visualEval.total,
+      baseline: null,
+    };
+  }
   const gatePassed = run.status === "passed";
   const result = {
     ok: DETERMINISTIC ? gatePassed : true,
@@ -1161,6 +1270,7 @@ async function main() {
     reportOnly: !DETERMINISTIC,
     metrics,
     regressions,
+    visual: visualEval,
     baseline: baselineFile.metrics,
     observationPath,
     finishedAt: observation.finishedAt,
@@ -1209,6 +1319,13 @@ try {
         $dryRunReport["corpusVersion"] = $pre.CorpusVersion
         $dryRunReport["artifacts"] = @($pre.CheckedArtifacts)
         $dryRunReport["baseline"] = $pre.BaselineMetrics
+        $dryRunReport["visual"] = [ordered]@{
+            metric    = [string]$pre.VisualEval.metric
+            accuracy  = [double]$pre.VisualEval.accuracy
+            threshold = [double]$pre.VisualEval.threshold
+            cases     = [int]$pre.VisualEval.total
+            passed    = [bool]$pre.VisualEval.passed
+        }
         $dryRunReport["databaseTarget"] = [ordered]@{
             host         = $pre.DbHost
             port         = $pre.DbPort
@@ -1368,6 +1485,12 @@ try {
         [System.IO.File]::WriteAllText($runnerPath, $runnerScript, (New-Object System.Text.UTF8Encoding($false)))
         $observationPath = Join-Path $tmpDir "observation.json"
         $resultPath = Join-Path $tmpDir "result.json"
+        # The visual metric is computed from the committed corpus/ground truth by
+        # the Go helper and included in the recorded observation/result.
+        $visualEvalPath = Join-Path $tmpDir "visual-eval.json"
+        [System.IO.File]::WriteAllText($visualEvalPath,
+            ($pre.VisualEval | ConvertTo-Json -Depth 8),
+            (New-Object System.Text.UTF8Encoding($false)))
 
         $env:P8_EVAL_API_URL = $apiBaseUrl
         $env:P8_EVAL_ADMIN_USERNAME = $pre.AdminUsername
@@ -1388,6 +1511,7 @@ try {
         $env:P8_EVAL_GT_SUPPLEMENT = Join-Path $truthDir "supplement.json"
         $env:P8_EVAL_OBSERVATION = $observationPath
         $env:P8_EVAL_RESULT = $resultPath
+        $env:P8_EVAL_VISUAL_RESULT = $visualEvalPath
         $env:P8_EVAL_REAL_MODEL = [string]$pre.EnvValues["llm_model_name"]
 
         $runnerLog = Join-Path $tmpDir "runner.log"
@@ -1420,6 +1544,13 @@ try {
             }
             Write-Host ("  {0,-28} {1,8:P1}  threshold {2,6:P1}  {3}{4}" -f `
                     $name, [double]$metric.value, [double]$metric.threshold, $verdict, $counts)
+        }
+        if ($null -ne $result.visual) {
+            $visualVerdict = if ([bool]$result.visual.passed) { "PASS" } else { "FAIL" }
+            Write-Host ("  {0,-28} {1,8:P1}  threshold {2,6:P1}  {3} ({4}/{5})" -f `
+                    [string]$result.visual.metric, [double]$result.visual.accuracy,
+                    [double]$result.visual.threshold, $visualVerdict,
+                    [int]$result.visual.correct, [int]$result.visual.total)
         }
         if (@($result.regressions).Count -gt 0) {
             Write-Host ("  baseline regressions: " + (@($result.regressions) -join ", ")) -ForegroundColor Yellow
