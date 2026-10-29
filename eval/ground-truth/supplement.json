@@ -1,0 +1,16 @@
+{
+  "corpusVersion": "2026-10-29.1",
+  "description": "Supplement ground truth. After the settled baseline batch the autonomy chain runs the deterministic supplement agent, which proposes two ai_supplement cases. supplement_hit_rate = supplement cases matching a truth row / all ai_supplement cases (threshold >= 0.80). Truth rows are matched by their stable titles.",
+  "expectedCases": [
+    {
+      "title": "P7 补全：下单金额校验",
+      "requirementKey": "R1",
+      "gap": "R1 的下单金额边界未在基线用例中覆盖。"
+    },
+    {
+      "title": "P7 补全：退款幂等校验",
+      "requirementKey": "R1",
+      "gap": "R1 的退款幂等场景未在基线用例中覆盖。"
+    }
+  ]
+}

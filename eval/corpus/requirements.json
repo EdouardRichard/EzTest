@@ -1,0 +1,31 @@
+{
+  "corpusVersion": "2026-10-29.1",
+  "description": "P8 deterministic evaluation corpus. The runner creates these requirements through the real P3/P5 APIs, then derives design coverage, impact, classification, issue and supplement metrics against the committed ground truth. Titles are the stable contract with the deterministic fake LLM (scripts/fake-llm.cjs); change the corpus version whenever a title, scenario or ground-truth expectation changes.",
+  "version": {
+    "name": "P8 评测版本",
+    "label": "p8-eval",
+    "description": "P8 评测语料固定版本：两条已确认需求覆盖设计/执行/补全链路。"
+  },
+  "requirements": [
+    {
+      "key": "R1",
+      "title": "P4-AI-IMPACT 下单主流程",
+      "description": "用户提交订单时创建订单并扣减库存。",
+      "acceptanceCriteria": "订单创建成功后库存数量减少。",
+      "priority": "must"
+    },
+    {
+      "key": "R2",
+      "title": "P8 评测：退款流程",
+      "description": "用户申请退款后原路退回支付金额。",
+      "acceptanceCriteria": "退款成功后支付金额原路退回。",
+      "priority": "should"
+    }
+  ],
+  "expected": {
+    "confirmedRequirements": 2,
+    "designCoveredRequirementKeys": ["R1", "R2"],
+    "caseTitles": ["P5 正常主流程用例", "P5 异常边界用例"],
+    "injectedFailureCaseTitles": ["P5 正常主流程用例", "P5 异常边界用例"]
+  }
+}
