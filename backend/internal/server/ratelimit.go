@@ -1,6 +1,7 @@
 package server
 
 import (
+	"container/list"
 	"log/slog"
 	"math"
 	"net/http"
@@ -19,7 +20,9 @@ const (
 	// A user that stops calling for this long starts from a full burst again.
 	rateLimitBucketIdleTTL = 10 * time.Minute
 	// rateLimitMaxEntries bounds the limiter maps so an unauthenticated flood
-	// from many source addresses cannot grow them without bound.
+	// from many source addresses cannot grow them without bound. Ordinary
+	// buckets are evicted least-recently-used in O(1); the SSE map never exceeds
+	// this many live keys because new keys are rejected while it is full.
 	rateLimitMaxEntries = 100_000
 	// rateLimitSweepEvery is the number of requests between idle sweeps.
 	rateLimitSweepEvery = 1024
@@ -28,8 +31,10 @@ const (
 	rateLimitSSERetryAfter = 5
 )
 
-// rateBucket is one token bucket. tokens is a float so refills are exact.
+// rateBucket is one token bucket. tokens is a float so refills are exact. key
+// lets the LRU list find the map entry when it evicts the tail element.
 type rateBucket struct {
+	key    string
 	tokens float64
 	last   time.Time
 }
@@ -44,16 +49,24 @@ type rateBucket struct {
 // The limiter is safe for concurrent use. It is deliberately in-memory: one
 // instance enforces its own limits, which matches the single-instance default
 // (multi-instance deployments configure per-instance budgets).
+//
+// Ordinary buckets are ordered by last use in a linked list so a full map is
+// evicted least-recently-used in O(1) instead of scanning the whole map per new
+// key. The SSE map holds only live per-key concurrency counts (an entry is
+// deleted as soon as its last stream ends), so its size is bounded by the
+// connections the process actually serves.
 type RateLimiter struct {
-	rps     int
-	burst   int
-	sseMax  int
-	now     func() time.Time
-	logger  *slog.Logger
-	mu      sync.Mutex
-	buckets map[string]*rateBucket
-	sse     map[string]int
-	served  uint64
+	rps        int
+	burst      int
+	sseMax     int
+	now        func() time.Time
+	logger     *slog.Logger
+	maxEntries int
+	mu         sync.Mutex
+	buckets    map[string]*list.Element
+	order      *list.List
+	sse        map[string]int
+	served     uint64
 }
 
 // NewRateLimiter returns a limiter configured from cfg. A nil clock uses the
@@ -62,15 +75,21 @@ func NewRateLimiter(cfg config.Config, now func() time.Time) *RateLimiter {
 	if now == nil {
 		now = time.Now
 	}
-	return &RateLimiter{
-		rps:     cfg.RateLimitRPS,
-		burst:   cfg.RateLimitBurst,
-		sseMax:  cfg.RateLimitSSEMax,
-		now:     now,
-		logger:  slog.Default(),
-		buckets: make(map[string]*rateBucket),
-		sse:     make(map[string]int),
+	limiter := &RateLimiter{
+		rps:        cfg.RateLimitRPS,
+		burst:      cfg.RateLimitBurst,
+		sseMax:     cfg.RateLimitSSEMax,
+		now:        now,
+		logger:     slog.Default(),
+		maxEntries: rateLimitMaxEntries,
+		buckets:    make(map[string]*list.Element),
+		order:      list.New(),
+		sse:        make(map[string]int),
 	}
+	if limiter.maxEntries <= 0 {
+		limiter.maxEntries = rateLimitMaxEntries
+	}
+	return limiter
 }
 
 // Middleware wraps next with the rate limit. It must be mounted after the auth
@@ -129,14 +148,18 @@ func (l *RateLimiter) allow(key string) (bool, int) {
 		l.sweepLocked(now)
 	}
 
-	bucket, ok := l.buckets[key]
-	if !ok {
-		if len(l.buckets) >= rateLimitMaxEntries {
-			l.evictOldestLocked()
-		}
-		bucket = &rateBucket{tokens: float64(l.burst), last: now}
-		l.buckets[key] = bucket
+	element, ok := l.buckets[key]
+	if ok {
+		// Move-to-front keeps the list ordered by last use so the tail is the
+		// least recently used bucket.
+		l.order.MoveToFront(element)
+	} else {
+		l.evictLocked()
+		bucket := &rateBucket{key: key, tokens: float64(l.burst), last: now}
+		element = l.order.PushFront(bucket)
+		l.buckets[key] = element
 	}
+	bucket := element.Value.(*rateBucket)
 	if elapsed := now.Sub(bucket.last).Seconds(); elapsed > 0 {
 		bucket.tokens = math.Min(float64(l.burst), bucket.tokens+elapsed*float64(l.rps))
 		bucket.last = now
@@ -152,15 +175,26 @@ func (l *RateLimiter) allow(key string) (bool, int) {
 	return false, retryAfter
 }
 
-// sweepLocked drops buckets idle for longer than rateLimitBucketIdleTTL. It is
+// sweepLocked drops buckets idle for longer than rateLimitBucketIdleTTL. The
+// LRU list is ordered by last use, so idle buckets are contiguous at the tail:
+// the sweep stops at the first active bucket instead of scanning the map. It is
 // called every rateLimitSweepEvery requests so abandoned keys do not stay in
 // memory forever.
 func (l *RateLimiter) sweepLocked(now time.Time) {
-	for key, bucket := range l.buckets {
-		if now.Sub(bucket.last) >= rateLimitBucketIdleTTL {
-			delete(l.buckets, key)
+	for {
+		oldest := l.order.Back()
+		if oldest == nil {
+			return
 		}
+		bucket := oldest.Value.(*rateBucket)
+		if now.Sub(bucket.last) < rateLimitBucketIdleTTL {
+			break
+		}
+		l.order.Remove(oldest)
+		delete(l.buckets, bucket.key)
 	}
+	// Defensive: releaseSSE deletes an entry when its last stream ends, so no
+	// zero-count entry should ever be retained.
 	for key, count := range l.sse {
 		if count <= 0 {
 			delete(l.sse, key)
@@ -168,33 +202,41 @@ func (l *RateLimiter) sweepLocked(now time.Time) {
 	}
 }
 
-// evictOldestLocked removes the least recently refilled bucket when the map
-// reached its cap. It is a linear scan over a large map, but it only runs once
-// the cap is hit, which keeps the steady-state cost off the hot path.
-func (l *RateLimiter) evictOldestLocked() {
-	var oldestKey string
-	var oldest time.Time
-	for key, bucket := range l.buckets {
-		if oldestKey == "" || bucket.last.Before(oldest) {
-			oldestKey, oldest = key, bucket.last
+// evictLocked drops least-recently-used buckets until a new entry fits under
+// the cap. It removes at most one element in steady state and is O(1); the loop
+// also lets tests lower maxEntries at runtime without leaking entries.
+func (l *RateLimiter) evictLocked() {
+	for len(l.buckets) >= l.maxEntries {
+		oldest := l.order.Back()
+		if oldest == nil {
+			return
 		}
-	}
-	if oldestKey != "" {
-		delete(l.buckets, oldestKey)
+		bucket := oldest.Value.(*rateBucket)
+		l.order.Remove(oldest)
+		delete(l.buckets, bucket.key)
 	}
 }
 
-// acquireSSE reserves one stream slot for key.
+// acquireSSE reserves one stream slot for key. Live entries are never evicted:
+// the count is the reservation itself, so dropping it would admit more than
+// sseMax concurrent streams. A new key is instead rejected with 429 while the
+// map is full (which requires that many genuinely live connections). The map
+// therefore never exceeds the cap and holds no zero-count entries.
 func (l *RateLimiter) acquireSSE(key string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if len(l.sse) >= rateLimitMaxEntries {
-		l.evictOldestSSELocked()
+	count := l.sse[key]
+	if count > 0 {
+		if count >= l.sseMax {
+			return false
+		}
+		l.sse[key] = count + 1
+		return true
 	}
-	if l.sse[key] >= l.sseMax {
+	if len(l.sse) >= l.maxEntries {
 		return false
 	}
-	l.sse[key]++
+	l.sse[key] = 1
 	return true
 }
 
@@ -207,18 +249,6 @@ func (l *RateLimiter) releaseSSE(key string) {
 		return
 	}
 	l.sse[key]--
-}
-
-// evictOldestSSELocked drops one arbitrary idle entry when the SSE map is at
-// its cap. Live entries are never dropped because the count itself is the
-// active slot reservation.
-func (l *RateLimiter) evictOldestSSELocked() {
-	for key, count := range l.sse {
-		if count <= 0 {
-			delete(l.sse, key)
-			return
-		}
-	}
 }
 
 // reject writes the shared 429 envelope with Retry-After and records a hit
@@ -280,17 +310,25 @@ func rateLimitExempt(r *http.Request) bool {
 	return false
 }
 
-// isSSERequest reports whether the request is a server-sent-events stream. SSE
-// connections are long-lived, so heartbeats are not ordinary request traffic;
-// they are limited by concurrency instead. The Accept header catches future
-// stream endpoints and the explicit paths pin the two current ones.
+// isSSERequest reports whether the request targets one of the real long-lived
+// event streams. The set is closed and path-based: Accept: text/event-stream is
+// client-controlled and must never move an ordinary request out of its token
+// bucket. GET /api/stream is the global channel stream (including the
+// agent:{session} channels) and GET /api/versions/{id}/stream is the version
+// channel. GET /api/stream/events is a JSON snapshot and stays ordinary.
+// A new streaming endpoint must be added here explicitly.
 func isSSERequest(r *http.Request) bool {
 	if r == nil || r.Method != http.MethodGet {
 		return false
 	}
 	switch r.URL.Path {
-	case "/api/stream", "/api/stream/events":
+	case "/api/stream":
 		return true
 	}
-	return strings.Contains(strings.ToLower(r.Header.Get("Accept")), "text/event-stream")
+	const versionPrefix = "/api/versions/"
+	if !strings.HasPrefix(r.URL.Path, versionPrefix) || !strings.HasSuffix(r.URL.Path, "/stream") {
+		return false
+	}
+	versionID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, versionPrefix), "/stream")
+	return versionID != "" && !strings.Contains(versionID, "/")
 }

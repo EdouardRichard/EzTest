@@ -13,8 +13,10 @@ const (
 	corsAllowHeaders = "Authorization, Content-Type, X-Request-ID, Idempotency-Key, Last-Event-ID"
 	// corsExposeHeaders is the set of response headers the web client may read.
 	// Content-Disposition and X-Content-SHA256 are the P6 report-export and
-	// evidence-download headers (spec §6.2, T11 finding).
-	corsExposeHeaders = "X-Request-ID, X-Snapshot-Cursor, Idempotent-Replayed, Content-Disposition, X-Content-SHA256"
+	// evidence-download headers (spec §6.2, T11 finding). Retry-After is exposed
+	// so the fetch-based SSE client can read the 429 retry hint and close/back
+	// off its existing stream instead of reconnecting blindly.
+	corsExposeHeaders = "X-Request-ID, X-Snapshot-Cursor, Idempotent-Replayed, Content-Disposition, X-Content-SHA256, Retry-After"
 )
 
 // CORS returns middleware that allows exactly the configured web origin. It
