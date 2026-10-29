@@ -392,7 +392,10 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
   }
 
   const batchId = selectedBatch?.id ?? ""
-  const streamReconnecting = stream.status === "reconnecting" || stream.status === "connecting"
+  /** First connection and a dropped live connection are different states. */
+  const streamConnecting = stream.status === "connecting"
+  const streamReconnecting = stream.status === "reconnecting"
+  const streamStatusVisible = streamConnecting || streamReconnecting
 
   return (
     <div className="space-y-4">
@@ -420,16 +423,34 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
         }}
       />
 
-      {streamReconnecting ? (
-        <p
+      {/*
+        The live region stays mounted so a status change is announced; the
+        reconnect button stays outside role="status" (interactive controls are
+        not live-region content). The wrapper hides itself when not needed.
+      */}
+      <div
+        data-testid="version-stream-banner"
+        data-state={stream.status}
+        className={
+          streamStatusVisible
+            ? "flex flex-wrap items-center gap-2 rounded-xl border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
+            : "sr-only"
+        }
+      >
+        {streamStatusVisible ? (
+          <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+        ) : null}
+        <span
           role="status"
           aria-live="polite"
+          aria-atomic="true"
           data-testid="version-stream-status"
           data-state={stream.status}
-          className="flex flex-wrap items-center gap-2 rounded-xl border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
         >
-          <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
-          <span>实时连接重连中，正在保留上次数据。</span>
+          {streamConnecting ? "正在连接实时通道，最新事件可能延迟。" : null}
+          {streamReconnecting ? "实时连接重连中，正在保留上次数据。" : null}
+        </span>
+        {streamStatusVisible ? (
           <button
             type="button"
             onClick={() => stream.reconnect()}
@@ -437,8 +458,8 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
           >
             重新连接
           </button>
-        </p>
-      ) : null}
+        ) : null}
+      </div>
 
       {error === "" ? null : (
         <p
@@ -446,6 +467,7 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
           className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive"
         >
           刷新版本失败：{error}（正在展示上次数据）
+          {errorRequestId === "" ? null : <> 请求 ID：{errorRequestId}</>}
         </p>
       )}
 
