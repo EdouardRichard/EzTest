@@ -12,7 +12,7 @@
 | 项目 | 结果 |
 |---|---|
 | 全量后端/前端/executor 测试（`scripts/test.ps1`） | **PASS** |
-| 静态验收（`scripts/acceptance.ps1 -StaticOnly`） | **PASS**（33 passed / 0 failed / 34 skipped） |
+| 静态验收（`scripts/acceptance.ps1 -StaticOnly`） | **PASS**（最终修复后 **34 passed / 0 failed / 34 skipped**；审计策略新增 1 项检查） |
 | 复合全量验收（`scripts/acceptance.ps1`） | **未跑绿**（本机宿主负载超时；见 §2.2） |
 | 全量 Playwright E2E（`scripts/e2e.ps1`，workers=1） | **PASS**（26 + 9 + 5 + 1 = 41 passed） |
 | 确定性评测（`scripts/eval.ps1`） | **PASS**（6 门禁指标 + 视觉指标全部 PASS） |
@@ -32,6 +32,7 @@
 |---|---|---|
 | `powershell.exe -File scripts/test.ps1` | 19:22–19:34；**All selected checks passed**。Go unit + integration；executor 89；P7 fake 17；P6 fake 16；frontend 138 files / **1183 tests**；lint/typecheck 通过 | `.tmp/p8-final-20261029-192239/test.log` |
 | `powershell.exe -File scripts/acceptance.ps1 -StaticOnly` | 19:32–19:34；**Result: 33 passed, 0 failed, 34 skipped**；`ACCEPTANCE PASSED` | `.tmp/p8-final-20261029-192239/acceptance-static.log` |
+| `powershell.exe -File scripts/acceptance.ps1 -StaticOnly`（最终修复后复跑） | 2026-10-29 22:5x；**Result: 34 passed, 0 failed, 34 skipped**；`ACCEPTANCE PASSED`；新增 `P8 audit request_id policy` 自检（`2cbf2f6`） | 本轮 Lead 复跑输出 |
 | `powershell.exe -File scripts/e2e.ps1` | 22:36–22:42；**E2E PASSED**；existing suite **26 passed** (1.8m)、P8 cross-wave **9 passed** (1.1m)、P7 **5 passed** (1.0m)、execution **1 passed** (32.0s)；Playwright `workers: 1`（`frontend/playwright.config.ts`） | `.tmp/p8-final-20261029-192239/e2e-full-2.log` |
 | `powershell.exe -File scripts/eval.ps1` | 20:44–20:47；**EVAL PASSED**；quality run `374176831311454208`；6 门禁指标 + `visual_classification_accuracy` 全部 PASS | `.tmp/p8-final-20261029-192239/eval-deterministic.log`；`.tmp/p8-eval/result.json` |
 | `EZTEST_RUN_REAL_LLM=1 powershell.exe -File scripts/acceptance-p8-llm.ps1` | 21:05–21:12；**29 checks / 0 failures / 17 screenshots**；真实 DeepSeek + 真实 Chrome；secret scan 13 files / 0 leak；console error 0 | `real-llm/result.json`；日志 `.tmp/p8-final-20261029-192239/acceptance-p8-llm-6.log` |
@@ -53,7 +54,7 @@
 | #4 | **67 passed / 1 failed / 11 skipped** | 唯一失败：审计检查只取最新 100 条，P8 E2E 后 `user.created` 被挤出首页。已在真实 `eztest_e2e` 库验证：`audit_log` 1445 行、`user.created` 11 行、最新 100 行中 0 行；这是**测试分页问题，不是产品缺陷**。已由并行修复 `751f016 test(p8): query audit actions by filter` 改为按 `action=` 过滤查询 |
 | #5/#6 | Go integration 包 600s 超时 | 宿主负载下 `version/infrastructure/postgres` 等包在 600s 边界超时；同一包在 `test.ps1` 与 #4/#5 的其它运行中通过（如 `test.ps1` 的 `resource/infrastructure/postgres` 450s、`version/integration` 535s；#6 中 `version/integration` 596s 通过）。属环境性能不稳定，非功能断言失败 |
 
-补充：对 #4 的审计失败，数据库查询已证明产品审计正常（11 条 `user.created`），修复提交 `751f016` 也把验收脚本改为按 action 过滤；但修复后未再获得一次完整的绿色复合运行（后续两次均停在宿主负载的 Go 包 600s 超时）。因此本记录**不声称复合门禁 PASS**。
+补充：对 #4 的审计失败，数据库查询已证明产品审计正常（11 条 `user.created`），修复提交 `751f016` 把验收脚本改为按 action 过滤；后续 `2cbf2f6` 又对 worker/finalizer/GC 背景动作做 request_id 窄豁免（HTTP 动作仍强制），并在真实 `eztest_e2e` 上通过 live `Test-AdminAudit`。静态验收最终复跑 34/0/34 PASS；但复合 `acceptance.ps1` 全量门禁未再获得一次完整绿色运行（后续两次停在宿主负载的 Go 包 600s 超时），因此本记录**不声称复合门禁 PASS**。
 
 ## 3. 每波 DoD 证据索引（W0–W5）
 
