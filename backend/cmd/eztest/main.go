@@ -24,9 +24,12 @@ import (
 	agenttools "github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/tools"
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	auditpostgres "github.com/EdouardRichard/EzTest/backend/internal/audit/infrastructure/postgres"
+	chainapp "github.com/EdouardRichard/EzTest/backend/internal/chain/application"
+	chainhttp "github.com/EdouardRichard/EzTest/backend/internal/chain/interfaces/httpapi"
 	codeintelapp "github.com/EdouardRichard/EzTest/backend/internal/codeintel/application"
 	codeinteldomain "github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
 	codeintelaudit "github.com/EdouardRichard/EzTest/backend/internal/codeintel/infrastructure/audit"
+	codeintelchain "github.com/EdouardRichard/EzTest/backend/internal/codeintel/infrastructure/chain"
 	codeinteldelivery "github.com/EdouardRichard/EzTest/backend/internal/codeintel/infrastructure/delivery"
 	codeinteleventing "github.com/EdouardRichard/EzTest/backend/internal/codeintel/infrastructure/eventing"
 	codeintelgitx "github.com/EdouardRichard/EzTest/backend/internal/codeintel/infrastructure/gitx"
@@ -42,6 +45,7 @@ import (
 	deliverydomain "github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
 	deliveryagent "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/agent"
 	deliveryaudit "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/audit"
+	deliverychain "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/chain"
 	deliverycodeintel "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/codeintel"
 	deliveryeventing "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/eventing"
 	deliveryfilestore "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/filestore"
@@ -60,6 +64,7 @@ import (
 	executionagent "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/agent"
 	executionaudit "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/audit"
 	executionbrowser "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/browser"
+	executionchain "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/chain"
 	executioncodeintel "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/codeintel"
 	executiondelivery "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/delivery"
 	executioneventing "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/eventing"
@@ -82,6 +87,7 @@ import (
 	mindmapagent "github.com/EdouardRichard/EzTest/backend/internal/mindmap/infrastructure/agent"
 	mindmapagenttools "github.com/EdouardRichard/EzTest/backend/internal/mindmap/infrastructure/agenttools"
 	mindmapaudit "github.com/EdouardRichard/EzTest/backend/internal/mindmap/infrastructure/audit"
+	mindmapchain "github.com/EdouardRichard/EzTest/backend/internal/mindmap/infrastructure/chain"
 	mindmapcodeintel "github.com/EdouardRichard/EzTest/backend/internal/mindmap/infrastructure/codeintel"
 	mindmapeventing "github.com/EdouardRichard/EzTest/backend/internal/mindmap/infrastructure/eventing"
 	mindmapfilestore "github.com/EdouardRichard/EzTest/backend/internal/mindmap/infrastructure/filestore"
@@ -108,6 +114,7 @@ import (
 	versiondomain "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 	versionagent "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/agent"
 	versionaudit "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/audit"
+	versionchain "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/chain"
 	versioneventing "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/eventing"
 	versionfilestore "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/filestore"
 	versiongitread "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/gitread"
@@ -1327,6 +1334,19 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		GlobalIssues:  deliveryGlobalReader,
 		GlobalReports: deliveryGlobalReader,
 	})
+	// P8 exploration-chain read model (spec §5.1/§5.2): the five per-context
+	// providers read their own complete layer in batched statements; the chain
+	// service applies the request filters, the latest-attempt rule and the node
+	// budget. Delivery and codeintel are optional ports, but this process wires
+	// both so no layer degrades.
+	chainService := chainapp.NewService(chainapp.Providers{
+		Version:   versionchain.New(database.Pool),
+		Mindmap:   mindmapchain.New(database.Pool),
+		Execution: executionchain.New(database.Pool),
+		Delivery:  deliverychain.New(database.Pool),
+		CodeIntel: codeintelchain.New(database.Pool),
+	})
+	chainHandlers := chainhttp.NewHandlers(chainService)
 	cancelStartup()
 
 	// Every request context descends from baseCtx. Canceling it on shutdown
@@ -1360,6 +1380,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 			Mindmap:   mindmapHandler,
 			Execution: executionHandlers,
 			Delivery:  deliveryHandlers,
+			Chain:     chainHandlers,
 		}),
 		BaseContext:       baseContext(baseCtx),
 		ReadHeaderTimeout: 10 * time.Second,
