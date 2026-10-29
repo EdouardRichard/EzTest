@@ -45,17 +45,33 @@ function Test-PidAlive {
     }
 }
 
+function Invoke-TaskKill {
+    # taskkill writes "ERROR: ... could not be terminated" to stderr when a child
+    # disappears between the parent kill and the tree walk; that is expected while
+    # stopping a process tree, so capture it instead of surfacing a scary error.
+    param([int]$ProcessId, [switch]$Force)
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $arguments = @("/PID", "$ProcessId", "/T")
+        if ($Force) { $arguments += "/F" }
+        & taskkill.exe @arguments 2>&1 | Out-Null
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+}
+
 function Stop-ProcessTree {
     param([int]$ProcessId, [int]$GraceSeconds = 8)
     # First ask politely (windowed processes get WM_CLOSE); console processes
     # usually ignore it, so fall back to a forced tree kill.
-    & taskkill.exe /PID $ProcessId /T 2>$null | Out-Null
+    Invoke-TaskKill -ProcessId $ProcessId
     $deadline = (Get-Date).AddSeconds($GraceSeconds)
     while ((Get-Date) -lt $deadline) {
         if (-not (Test-PidAlive -ProcessId $ProcessId)) { return $true }
         Start-Sleep -Milliseconds 250
     }
-    & taskkill.exe /PID $ProcessId /T /F 2>$null | Out-Null
+    Invoke-TaskKill -ProcessId $ProcessId -Force
     $deadline = (Get-Date).AddSeconds(10)
     while ((Get-Date) -lt $deadline) {
         if (-not (Test-PidAlive -ProcessId $ProcessId)) { return $true }
