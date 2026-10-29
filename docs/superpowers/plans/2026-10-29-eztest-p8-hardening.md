@@ -173,7 +173,7 @@ git commit -m "ci(p8): add baseline workflow"
 
 **Files:**
 - Modify: `.gitignore`、`frontend/src/features/shell/Topbar.tsx`、`Sidebar.tsx`、`AppShell.tsx`、`README.md`、`deploy/README.md`、`scripts/acceptance.ps1`（头部注释/检查项）
-- Delete: `docs/superpowers/specs/Untitled-1.md`
+- Move: `docs/superpowers/specs/Untitled-1.md` → `.tmp/p8-untitled-1.md`（gitignored 归档，不提交、不删除用户原文）
 
 **Interfaces:**
 - Consumes: 无
@@ -181,11 +181,11 @@ git commit -m "ci(p8): add baseline workflow"
 
 - [ ] **Step 1: 写失败检查**
 
-Create `scripts/check-clean.ps1`：断言 `.gitignore` 含 `.data/`、`backend/.data/`；grep 源码无 `P0 · 地基版本`/`P0 地基运行中`/`P0 平台地基`；断言 `Untitled-1.md` 不存在。Run → FAIL。
+Create `scripts/check-clean.ps1`：断言 `.gitignore` 含 `.data/`、`backend/.data/`；grep 源码无 `P0 · 地基版本`/`P0 地基运行中`/`P0 平台地基`；断言 `docs/superpowers/specs/Untitled-1.md` 不存在且 `.tmp/p8-untitled-1.md` 存在。Run → FAIL。
 
 - [ ] **Step 2: 修改**
 
-`.gitignore` 增加 `.data/` 与 `backend/.data/`；Topbar/Sidebar/AppShell 文案改为 `P8 · 体验硬化`（页脚 `EzTest · P8`）；README 的 P7“目标命令/不宣称通过”改为“已通过记录（见 acceptance.md）”；`acceptance.ps1` 头部 P0–P6 改 P0–P8；删除草稿文件。
+`.gitignore` 增加 `.data/` 与 `backend/.data/`；Topbar/Sidebar/AppShell 文案改为 `P8 · 体验硬化`（页脚 `EzTest · P8`）；README 的 P7“目标命令/不宣称通过”改为“已通过记录（见 acceptance.md）”；`acceptance.ps1` 头部 P0–P6 改 P0–P8；将草稿归档到 `.tmp/p8-untitled-1.md`。
 
 - [ ] **Step 3: 运行检查 + lint/typecheck**
 
