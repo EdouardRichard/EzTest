@@ -97,6 +97,18 @@ type Config struct {
 	CodeIntelMaxExcerptLines       int
 	CodeIntelMaxDiffBytes          int
 
+	// P8 rate limiting (design spec §10.1/§11.4): a per-user (authenticated) or
+	// per-IP (unauthenticated) token bucket plus a per-user SSE concurrency cap.
+	// RateLimitRPS=0 disables the ordinary token bucket.
+	RateLimitRPS    int
+	RateLimitBurst  int
+	RateLimitSSEMax int
+	// P8 evidence GC (design spec §10.2/§11.4). GCEnabled only controls whether
+	// a non-dry-run purge is allowed; a dry-run is always available to admins.
+	GCEnabled       bool
+	GCRetentionDays int
+	GCBatchKeep     int
+
 	EnableTestEndpoints bool
 	LogLevel            slog.Level
 	LLMSeed             LLMSeed
@@ -174,6 +186,25 @@ const (
 	defaultExecEvidencePerCase  = 100
 	minExecEvidencePerCase      = 1
 	maxExecEvidencePerCase      = 1000
+)
+
+// P8 hardening defaults and bounds from design spec §10.1/§10.2/§11.4.
+const (
+	defaultRateLimitRPS    = 50
+	minRateLimitRPS        = 0
+	maxRateLimitRPS        = 1000
+	defaultRateLimitBurst  = 100
+	minRateLimitBurst      = 1
+	maxRateLimitBurst      = 5000
+	defaultRateLimitSSEMax = 10
+	minRateLimitSSEMax     = 1
+	maxRateLimitSSEMax     = 100
+	defaultGCRetentionDays = 30
+	minGCRetentionDays     = 1
+	maxGCRetentionDays     = 3650
+	defaultGCBatchKeep     = 3
+	minGCBatchKeep         = 1
+	maxGCBatchKeep         = 50
 )
 
 // P7 delivery defaults and bounds from design spec §16.1/D30.
@@ -378,6 +409,50 @@ func Load(getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 	cfg.AutonomyBatchesPerTick = autonomyBatchesPerTick
+
+	rateLimitRPS, err := parseBoundedInt(getenv, "EZTEST_RATE_LIMIT_RPS",
+		defaultRateLimitRPS, minRateLimitRPS, maxRateLimitRPS)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.RateLimitRPS = rateLimitRPS
+
+	rateLimitBurst, err := parseBoundedInt(getenv, "EZTEST_RATE_LIMIT_BURST",
+		defaultRateLimitBurst, minRateLimitBurst, maxRateLimitBurst)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.RateLimitBurst = rateLimitBurst
+
+	rateLimitSSEMax, err := parseBoundedInt(getenv, "EZTEST_RATE_LIMIT_SSE_MAX",
+		defaultRateLimitSSEMax, minRateLimitSSEMax, maxRateLimitSSEMax)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.RateLimitSSEMax = rateLimitSSEMax
+
+	rawGCEnabled := strings.TrimSpace(getenv("EZTEST_GC_ENABLED"))
+	if rawGCEnabled != "" {
+		enabled, err := strconv.ParseBool(rawGCEnabled)
+		if err != nil {
+			return Config{}, fmt.Errorf("config: EZTEST_GC_ENABLED must be a boolean, got %q", rawGCEnabled)
+		}
+		cfg.GCEnabled = enabled
+	}
+
+	gcRetentionDays, err := parseBoundedInt(getenv, "EZTEST_GC_RETENTION_DAYS",
+		defaultGCRetentionDays, minGCRetentionDays, maxGCRetentionDays)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.GCRetentionDays = gcRetentionDays
+
+	gcBatchKeep, err := parseBoundedInt(getenv, "EZTEST_GC_BATCH_KEEP",
+		defaultGCBatchKeep, minGCBatchKeep, maxGCBatchKeep)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.GCBatchKeep = gcBatchKeep
 
 	keys, err := parseSecretKeys(getenv("EZTEST_SECRET_KEYS"))
 	if err != nil {

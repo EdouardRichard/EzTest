@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/EdouardRichard/EzTest/backend/internal/config"
 	llm "github.com/EdouardRichard/EzTest/backend/internal/llm/domain"
 )
 
@@ -30,6 +31,23 @@ type healthData struct {
 	Commit        string `json:"commit"`
 	DB            string `json:"db"`
 	LLMConfigured bool   `json:"llm_configured"`
+	// RateLimit and GC are the effective, non-secret configuration thresholds
+	// the admin settings tab projects read-only (spec §10.1/§10.2). They carry
+	// no paths, credentials or store locations.
+	RateLimit rateLimitProjection `json:"rate_limit"`
+	GC        gcProjection        `json:"gc"`
+}
+
+type rateLimitProjection struct {
+	RPS    int `json:"rps"`
+	Burst  int `json:"burst"`
+	SSEMax int `json:"sse_max"`
+}
+
+type gcProjection struct {
+	Enabled       bool `json:"enabled"`
+	RetentionDays int  `json:"retention_days"`
+	BatchKeep     int  `json:"batch_keep"`
 }
 
 // LLMConfigStore reports the decrypted default LLM configuration. The llm
@@ -49,7 +67,8 @@ func handleHealthz(w http.ResponseWriter, _ *http.Request) {
 // handleAPIHealth is the readiness probe. It pings the database with a short
 // timeout and reports 503 when the ping fails. LLM configuration is reported as
 // configured only when a default configuration exists and its key decrypts.
-func handleAPIHealth(pinger Pinger, llmConfigs LLMConfigStore) http.HandlerFunc {
+// The effective rate-limit and GC thresholds are projected read-only.
+func handleAPIHealth(cfg config.Config, pinger Pinger, llmConfigs LLMConfigStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), healthPingTimeout)
 		defer cancel()
@@ -59,6 +78,16 @@ func handleAPIHealth(pinger Pinger, llmConfigs LLMConfigStore) http.HandlerFunc 
 			Version: Version,
 			Commit:  Commit,
 			DB:      "ok",
+			RateLimit: rateLimitProjection{
+				RPS:    cfg.RateLimitRPS,
+				Burst:  cfg.RateLimitBurst,
+				SSEMax: cfg.RateLimitSSEMax,
+			},
+			GC: gcProjection{
+				Enabled:       cfg.GCEnabled,
+				RetentionDays: cfg.GCRetentionDays,
+				BatchKeep:     cfg.GCBatchKeep,
+			},
 		}
 		status := http.StatusOK
 		if pinger == nil || pinger.Ping(ctx) != nil {

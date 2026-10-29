@@ -166,7 +166,7 @@ func New(cfg config.Config, logger *slog.Logger, deps Dependencies) http.Handler
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
-	mux.HandleFunc("GET /api/health", handleAPIHealth(deps.Pinger, deps.LLMConfigs))
+	mux.HandleFunc("GET /api/health", handleAPIHealth(cfg, deps.Pinger, deps.LLMConfigs))
 	// The OpenAPI document is public (see requiresAuthentication) so tooling can
 	// discover the API without a bearer token.
 	mux.HandleFunc("GET /api/openapi.yaml", handleOpenAPIDocument(cfg.OpenAPIPath))
@@ -314,12 +314,18 @@ func New(cfg config.Config, logger *slog.Logger, deps Dependencies) http.Handler
 // mux. It is a separate function so tests can exercise the chain with a local
 // mux. Auth runs before idempotency: idempotency keys are scoped to the
 // authenticated user, so it must see the user that auth stores in the context.
+// The rate limiter sits between auth and the business chain so authenticated
+// requests are keyed by user ID; public routes pass through auth and use the
+// client IP (spec §10.1).
 func withMiddleware(next http.Handler, cfg config.Config, deps Dependencies, logger *slog.Logger) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	limiter := NewRateLimiter(cfg, time.Now)
+	limiter.logger = logger
 	var handler http.Handler = next
 	handler = idempotency.Middleware(deps.Idempotency, authenticatedUserID)(handler)
+	handler = limiter.Middleware()(handler)
 	if deps.Auth != nil {
 		handler = authenticatedAPI(deps.Auth)(handler)
 	}
