@@ -36,6 +36,8 @@ const nextConfig: NextConfig = {
   // The deploy/Dockerfile.web image copies the standalone build.
   output: "standalone",
   async headers() {
+    // scripts/security-audit.ps1 asserts that this catch-all entry returns
+    // securityHeaders; keep the reference explicit if this list is refactored.
     return [{ source: "/:path*", headers: securityHeaders }]
   },
 }
