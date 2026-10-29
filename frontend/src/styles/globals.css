@@ -1,0 +1,121 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --background: #f5f7fb;
+  --foreground: #0f172a;
+  --card: #ffffff;
+  --card-foreground: #0f172a;
+  --muted: #eef2f7;
+  --muted-foreground: #5b6779;
+  --border: #dde3ec;
+  --input: #ffffff;
+  --primary: #2563eb;
+  --primary-foreground: #f8fafc;
+  --accent: #e8efff;
+  --accent-foreground: #1d4ed8;
+  --destructive: #dc2626;
+  --destructive-foreground: #fef2f2;
+  --ring: #3b82f6;
+
+  --sidebar: #0b1324;
+  --sidebar-foreground: #dce5f2;
+  --sidebar-muted: #8fa0b8;
+  --sidebar-border: #1c2940;
+  --sidebar-active: #172554;
+  --sidebar-active-foreground: #bfdbfe;
+}
+
+.dark {
+  --background: #070c16;
+  --foreground: #e5edf9;
+  --card: #0d1524;
+  --card-foreground: #e5edf9;
+  --muted: #141f31;
+  --muted-foreground: #93a3bb;
+  --border: #1d2a40;
+  --input: #0f1929;
+  --primary: #3b82f6;
+  --primary-foreground: #f8fafc;
+  --accent: #13213a;
+  --accent-foreground: #93c5fd;
+  --destructive: #f87171;
+  --destructive-foreground: #450a0a;
+  --ring: #60a5fa;
+
+  --sidebar: #060a12;
+  --sidebar-foreground: #d7e1ef;
+  --sidebar-muted: #8394ad;
+  --sidebar-border: #182338;
+  --sidebar-active: #11213c;
+  --sidebar-active-foreground: #bfdbfe;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-ring: var(--ring);
+
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-muted: var(--sidebar-muted);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-active: var(--sidebar-active);
+  --color-sidebar-active-foreground: var(--sidebar-active-foreground);
+
+  --font-sans: "Inter", "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Code", ui-monospace, monospace;
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+
+  html {
+    color-scheme: light;
+  }
+
+  html.dark {
+    color-scheme: dark;
+  }
+
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    background-color: color-mix(in srgb, var(--color-primary) 28%, transparent);
+  }
+}
+
+.bg-grid {
+  background-image:
+    linear-gradient(to right, rgb(148 163 184 / 0.12) 1px, transparent 1px),
+    linear-gradient(to bottom, rgb(148 163 184 / 0.12) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+
+.login-aurora {
+  background:
+    radial-gradient(60% 50% at 15% 10%, rgb(37 99 235 / 0.38), transparent 70%),
+    radial-gradient(50% 45% at 90% 25%, rgb(14 165 233 / 0.22), transparent 70%),
+    radial-gradient(60% 60% at 70% 90%, rgb(129 140 248 / 0.2), transparent 70%);
+}

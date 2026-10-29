@@ -1,0 +1,45 @@
+# Build context is the repository root (deploy/docker-compose.yml uses `..`).
+# Keep the context small and never send local secrets or toolchains to the
+# Docker daemon.
+
+# Local secrets and per-machine state
+.env
+.env.*
+!.env.example
+*.local.md
+.secrets/
+.tools/
+.tmp/
+.data/
+.superpowers/
+
+# VCS / editors / OS noise
+.git/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# JavaScript dependencies and generated output
+**/node_modules/
+**/.next/
+**/out/
+**/dist/
+**/coverage/
+**/test-results/
+**/playwright-report/
+**/*.tsbuildinfo
+frontend/.next/
+
+# Local logs and binaries
+*.log
+tmp/
+backend/bin/
+**/*.exe
+**/*.test
+
+# Documentation not needed by either image; the API needs docs/openapi only.
+docs/design/
+docs/Pre-Research/
+docs/superpowers/
+docs/dev-setup.local.md

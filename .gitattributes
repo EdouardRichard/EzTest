@@ -1,0 +1,20 @@
+# Migration files are hashed byte-for-byte into schema_migrations; keep them LF
+# on every platform so core.autocrlf cannot change the checksum.
+*.sql text eol=lf
+
+# Biome formats with LF; keep frontend checkouts LF on Windows too.
+frontend/** text eol=lf
+
+# Shell scripts must stay LF: they are shipped into the Linux release package,
+# where CRLF breaks bash parsing (`bash -n` / start-eztest.sh).
+*.sh text eol=lf
+
+# Package runtime scripts/templates are copied byte-for-byte into the Windows and
+# Linux release archives; keep the whole directory LF on every platform.
+scripts/package/** text eol=lf
+
+# Public Markdown documentation is published as-is (READMEs, release notes).
+README.md text eol=lf
+README.zh-CN.md text eol=lf
+docs/public/** text eol=lf
+docs/release-notes/** text eol=lf

@@ -1,0 +1,215 @@
+//go:build integration
+
+package integration
+
+import (
+	"context"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/EdouardRichard/EzTest/backend/internal/db"
+	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// p3Tables are the seven tables introduced by version_0001 and version_0002,
+// under the singular names the D34 rename migration gives them.
+var p3Tables = []string{
+	"version",
+	"requirement",
+	"requirement_relation",
+	"requirement_attachment",
+	"clarification_session",
+	"clarification_question",
+	"decision",
+}
+
+// p3Indexes are every index declared by the P3 migrations.
+var p3Indexes = []string{
+	"idx_versions_status_updated",
+	"idx_versions_updated",
+	"idx_requirements_version_status",
+	"idx_requirements_version_created",
+	"idx_relations_version",
+	"idx_relations_from",
+	"idx_relations_to",
+	"uq_relations_directed",
+	"uq_relations_undirected",
+	"idx_attachments_requirement",
+	"idx_attachments_version",
+	"uq_clarification_active",
+	"idx_clarification_version_started",
+	"idx_questions_version_status",
+	"idx_questions_requirement_status",
+	"idx_decisions_version_status",
+	"idx_decisions_requirement",
+	"idx_agent_sessions_activity_channel",
+}
+
+// partialIndexes must be declared with a WHERE clause.
+var partialIndexes = []string{
+	"uq_relations_directed",
+	"uq_relations_undirected",
+	"uq_clarification_active",
+	"idx_agent_sessions_activity_channel",
+}
+
+// TestP3MigrationsApply opens the migrated test database (OpenTestDB applies
+// the embedded migration set once), runs the migrations a second time and
+// asserts the P3 schema is complete and repeatable: the 7 tables, every P3
+// index, application-generated BIGINT ids without defaults, the filesystem
+// storage_path column, and the P1 activity-channel extension.
+func TestP3MigrationsApply(t *testing.T) {
+	pool := testutil.OpenTestDB(t)
+	ctx := context.Background()
+
+	if err := db.MigrateEmbedded(ctx, pool); err != nil {
+		t.Fatalf("apply embedded migrations a second time: %v", err)
+	}
+
+	// The runner skips already-applied versions, so replay the D34 rename
+	// migration directly: its ALTER TABLE/SEQUENCE IF EXISTS statements make it
+	// repeatable on its own (spec §3.3) and it must not record duplicate ledger
+	// rows. The historical version_0001/0002 files cannot be replayed after the
+	// rename: they would recreate the old plural tables.
+	for _, name := range []string{
+		"version_0003_rename_tables.sql",
+	} {
+		sql, err := os.ReadFile("../../db/migrations/" + name)
+		if err != nil {
+			t.Fatalf("read migration %s: %v", name, err)
+		}
+		if _, err := pool.Exec(ctx, string(sql)); err != nil {
+			t.Fatalf("replay migration %s: %v", name, err)
+		}
+	}
+
+	for _, table := range p3Tables {
+		if !tableExists(t, ctx, pool, table) {
+			t.Errorf("table %s does not exist", table)
+			continue
+		}
+		assertApplicationGeneratedID(t, ctx, pool, table)
+	}
+
+	for _, index := range p3Indexes {
+		if !indexExists(t, ctx, pool, index) {
+			t.Errorf("index %s does not exist", index)
+		}
+	}
+	for _, index := range partialIndexes {
+		assertPartialIndex(t, ctx, pool, index)
+	}
+
+	// agent_0002 extends P1 sessions with the optional version activity channel.
+	for _, column := range []string{"activity_channel", "activity_version_id"} {
+		if !columnExists(t, ctx, pool, "agent_session", column) {
+			t.Errorf("agent_session.%s does not exist", column)
+		}
+	}
+
+	// Attachments are stored on the filesystem; the column is storage_path, not
+	// the P0 content-addressed storage_key.
+	if !columnExists(t, ctx, pool, "requirement_attachment", "storage_path") {
+		t.Error("requirement_attachment.storage_path does not exist")
+	}
+	if columnExists(t, ctx, pool, "requirement_attachment", "storage_key") {
+		t.Error("requirement_attachment.storage_key must not exist; attachments store storage_path")
+	}
+
+	// A second run must not append duplicate ledger rows: schema_migrations has
+	// exactly one row per non-empty order.txt entry.
+	order, err := os.ReadFile("../../db/migrations/order.txt")
+	if err != nil {
+		t.Fatalf("read order.txt: %v", err)
+	}
+	entries := 0
+	for _, line := range strings.Split(string(order), "\n") {
+		if strings.TrimSpace(line) != "" {
+			entries++
+		}
+	}
+	var applied int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM schema_migrations`).Scan(&applied); err != nil {
+		t.Fatalf("count schema_migrations: %v", err)
+	}
+	if applied != entries {
+		t.Errorf("schema_migrations has %d rows, order.txt lists %d migrations", applied, entries)
+	}
+}
+
+// tableExists reports whether a public table exists.
+func tableExists(t *testing.T, ctx context.Context, pool *pgxpool.Pool, table string) bool {
+	t.Helper()
+	var exists bool
+	if err := pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, "public."+table).Scan(&exists); err != nil {
+		t.Fatalf("check table %s: %v", table, err)
+	}
+	return exists
+}
+
+// assertApplicationGeneratedID proves the id column is a BIGINT primary key
+// with no sequence/default: P3 ids are Snowflake values generated by platform/id.
+func assertApplicationGeneratedID(t *testing.T, ctx context.Context, pool *pgxpool.Pool, table string) {
+	t.Helper()
+	var dataType string
+	var hasDefault bool
+	err := pool.QueryRow(ctx, `
+		SELECT data_type, column_default IS NOT NULL
+		FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = $1 AND column_name = 'id'`,
+		table).Scan(&dataType, &hasDefault)
+	if err != nil {
+		t.Errorf("%s.id: %v", table, err)
+		return
+	}
+	if dataType != "bigint" {
+		t.Errorf("%s.id type = %q, want bigint", table, dataType)
+	}
+	if hasDefault {
+		t.Errorf("%s.id has a default; P3 ids are generated by platform/id", table)
+	}
+}
+
+// indexExists reports whether a public index exists.
+func indexExists(t *testing.T, ctx context.Context, pool *pgxpool.Pool, index string) bool {
+	t.Helper()
+	var exists bool
+	if err := pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = $1
+		)`, index).Scan(&exists); err != nil {
+		t.Fatalf("check index %s: %v", index, err)
+	}
+	return exists
+}
+
+// assertPartialIndex proves the index exists and carries a WHERE predicate.
+func assertPartialIndex(t *testing.T, ctx context.Context, pool *pgxpool.Pool, index string) {
+	t.Helper()
+	var definition string
+	if err := pool.QueryRow(ctx, `
+		SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' AND indexname = $1`,
+		index).Scan(&definition); err != nil {
+		t.Errorf("index %s: %v", index, err)
+		return
+	}
+	if !strings.Contains(strings.ToUpper(definition), " WHERE ") {
+		t.Errorf("index %s is not partial: %s", index, definition)
+	}
+}
+
+// columnExists reports whether a public table has the column.
+func columnExists(t *testing.T, ctx context.Context, pool *pgxpool.Pool, table, column string) bool {
+	t.Helper()
+	var exists bool
+	if err := pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2
+		)`, table, column).Scan(&exists); err != nil {
+		t.Fatalf("check column %s.%s: %v", table, column, err)
+	}
+	return exists
+}
