@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 const delivery = vi.hoisted(() => ({
@@ -62,7 +62,7 @@ describe("VersionTabs", () => {
     reportState.report = null
   })
 
-  it("keeps the nine tabs and mounts the delivery issues tab instead of the placeholder", () => {
+  it("keeps the ten tabs in spec order and mounts the delivery issues tab instead of the placeholder", () => {
     render(
       <VersionTabs
         versionId={VERSION_ID}
@@ -73,9 +73,23 @@ describe("VersionTabs", () => {
       />,
     )
 
-    expect(screen.getAllByRole("tab")).toHaveLength(9)
-    expect(VERSION_TABS.map((tab) => tab.label)).toContain("问题")
-    expect(VERSION_TABS.map((tab) => tab.label)).toContain("报告")
+    expect(screen.getAllByRole("tab")).toHaveLength(10)
+    // Spec §7.1: the mindmap tab sits right after requirements.
+    expect(VERSION_TABS.map((tab) => tab.label)).toEqual([
+      "需求与澄清",
+      "用例脑图",
+      "总览",
+      "执行会话",
+      "探索链路",
+      "实时播报",
+      "结果与证据",
+      "问题",
+      "报告",
+      "代码与变更",
+    ])
+    expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual(
+      VERSION_TABS.map((tab) => tab.label),
+    )
 
     expect(screen.getByTestId("issues-tab").textContent).toContain(VERSION_ID)
     expect(delivery.issuesProps).toHaveBeenCalledWith(
@@ -182,5 +196,34 @@ describe("VersionTabs", () => {
       />,
     )
     expect(screen.getByTestId("sessions-slot")).toBeTruthy()
+  })
+
+  it("mounts the embedded mindmap slot under the version-tab-mindmap test id", () => {
+    const onTabChange = vi.fn()
+    const { rerender } = render(
+      <VersionTabs
+        versionId={VERSION_ID}
+        active="requirements"
+        onTabChange={onTabChange}
+        {...CONTENT}
+        mindmap={<div data-testid="mindmap-slot">脑图内容</div>}
+      />,
+    )
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "用例脑图" }))
+    expect(onTabChange).toHaveBeenCalledWith("mindmap")
+
+    rerender(
+      <VersionTabs
+        versionId={VERSION_ID}
+        active="mindmap"
+        onTabChange={onTabChange}
+        {...CONTENT}
+        mindmap={<div data-testid="mindmap-slot">脑图内容</div>}
+      />,
+    )
+    expect(screen.getByRole("tab", { name: "用例脑图" }).getAttribute("aria-selected")).toBe("true")
+    const panel = screen.getByTestId("version-tab-mindmap")
+    expect(within(panel).getByTestId("mindmap-slot")).toBeTruthy()
   })
 })

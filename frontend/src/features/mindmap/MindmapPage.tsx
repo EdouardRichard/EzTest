@@ -16,6 +16,7 @@ import {
 import { StatusBadge, type StatusBadgeVariant } from "@/components/ui/StatusBadge"
 import { getVersion } from "@/features/versions/api"
 import type { Version, VersionStatus } from "@/features/versions/types"
+import type { VersionStreamState } from "@/features/versions/useVersionStream"
 import { versionStatusLabel, versionStatusVariant } from "@/features/versions/VersionHeader"
 import type { SSEStatus } from "@/lib/sse-client"
 
@@ -148,21 +149,56 @@ function CollapsibleSection({ testId, title, description, children }: Collapsibl
 export type MindmapPageProps = {
   /** P3-owned version id from the dynamic route segment; never re-parsed. */
   versionId: string
+  /**
+   * Embedded version-detail tab mode (spec §7.1): drops the full-screen header
+   * and the back link, keeps the canvas/review/run/export surfaces and lets the
+   * height follow the tab container instead of the viewport.
+   */
+  embedded?: boolean
+  /** `?case=` deep link: the node selected on first render (may be unknown). */
+  initialCaseId?: string
+  /** Canvas selection changes, so the container can write `?case=` back. */
+  onCaseChange?: (caseId: string) => void
+  /**
+   * Version stream owned by the container (the embedded tab reuses the version
+   * detail's single SSE connection instead of opening another one).
+   */
+  stream?: VersionStreamState
+  /**
+   * Already-loaded version from the container. The embedded tab must not issue
+   * a second `GET /versions/{id}`; the full-screen route still loads its own.
+   */
+  version?: Version
 }
 
 /**
- * Full-screen case-mindmap page (spec §9.1/§9.2): toolbar, canvas, selected-node
- * editor and the collapsible review/run/export panels. The page is a pure
- * assembly — the whole graph state comes from `useMindmap`, every write is
- * server-authoritative and re-reads through `refresh()`, editability is never
- * inferred from the version status, and a frozen baseline only turns the editing
- * surface read-only (review runs and exports stay available).
+ * Case-mindmap page assembly (spec §9.1/§9.2, P8 §7.1): toolbar, canvas,
+ * selected-node editor and the collapsible review/run/export panels. The page
+ * is a pure assembly — the whole graph state comes from `useMindmap`, every
+ * write is server-authoritative and re-reads through `refresh()`, editability is
+ * never inferred from the version status, and a frozen baseline only turns the
+ * editing surface read-only (review runs and exports stay available).
+ *
+ * The same component backs the full-screen route and the version-detail tab:
+ * `embedded` removes only the page chrome, and `initialCaseId`/`onCaseChange`
+ * carry the `?case=` deep link without the page owning the URL.
  */
-export function MindmapPage({ versionId }: MindmapPageProps) {
-  const { graph, loading, error, streamStatus, refresh } = useMindmap(versionId)
+export function MindmapPage({
+  versionId,
+  embedded = false,
+  initialCaseId = "",
+  onCaseChange,
+  stream,
+  version: versionProp,
+}: MindmapPageProps) {
+  const { graph, loading, error, streamStatus, refresh } = useMindmap(versionId, stream)
 
-  const [version, setVersion] = useState<Version | null>(null)
-  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [version, setVersion] = useState<Version | null>(versionProp ?? null)
+  const [selectedId, setSelectedId] = useState<string | null>(
+    initialCaseId === "" ? null : initialCaseId,
+  )
+  /** Deep-link id kept after selection so an unknown one can show a notice. */
+  const [requestedCaseId, setRequestedCaseId] = useState(initialCaseId)
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set<string>())
   const [notice, setNotice] = useState("")
   const [actionError, setActionError] = useState("")
@@ -178,8 +214,14 @@ export function MindmapPage({ versionId }: MindmapPageProps) {
 
   // The version detail feeds the toolbar title, the PNG filename and the
   // system/environment bindings of the explore run. It is supplementary: a
-  // failed lookup falls back to the version id and disables explore.
+  // failed lookup falls back to the version id and disables explore. The
+  // embedded tab receives the container's already-loaded version instead of
+  // paying for a second read of the same resource.
   useEffect(() => {
+    if (versionProp !== undefined) {
+      setVersion(versionProp)
+      return
+    }
     let cancelled = false
     getVersion(versionId)
       .then((loaded) => {
@@ -191,7 +233,17 @@ export function MindmapPage({ versionId }: MindmapPageProps) {
     return () => {
       cancelled = true
     }
-  }, [versionId])
+  }, [versionId, versionProp])
+
+  const selectNode = useCallback(
+    (nodeId: string) => {
+      setSelectedId(nodeId)
+      // Any explicit selection supersedes (and dismisses) a stale deep link.
+      setRequestedCaseId("")
+      onCaseChange?.(nodeId)
+    },
+    [onCaseChange],
+  )
 
   const toggleCollapsed = useCallback((nodeId: string) => {
     setCollapsed((current) => {
@@ -251,6 +303,8 @@ export function MindmapPage({ versionId }: MindmapPageProps) {
       setManualTitle("")
       setManualOpen(false)
       setSelectedId(created.id)
+      setRequestedCaseId("")
+      onCaseChange?.(created.id)
       setNotice(`已创建${manualKind === "case" ? "用例" : "场景"}「${created.title}」。`)
       await refresh()
     } catch (caught) {
@@ -260,28 +314,37 @@ export function MindmapPage({ versionId }: MindmapPageProps) {
     }
   }
 
-  const stream = STREAM_STATUS_META[streamStatus]
+  const streamBadge = STREAM_STATUS_META[streamStatus]
   const versionLabel = version?.name ?? versionId
+  // The embedded tab follows the version detail container's height instead of
+  // owning the full-screen page (spec §7.1).
+  const rootClass = embedded ? "flex h-full min-h-0 flex-col space-y-3" : "space-y-3"
 
   if (graph === null) {
     return (
-      <div data-testid="mindmap-page" className="space-y-3">
-        <header
-          data-testid="mindmap-toolbar"
-          className="flex flex-wrap items-start justify-between gap-3 rounded-2xl border border-border bg-card p-4"
-        >
-          <div className="min-w-0">
-            <p className="text-xs font-medium text-muted-foreground">用例脑图</p>
-            <h1 className="text-xl font-semibold tracking-tight">{versionLabel}</h1>
-          </div>
-          <span
-            data-testid="stream-status"
-            data-status={streamStatus}
-            className="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-2.5 py-1 text-[11px] font-medium text-muted-foreground"
+      <div
+        data-testid="mindmap-page"
+        data-embedded={embedded ? "true" : undefined}
+        className={rootClass}
+      >
+        {embedded ? null : (
+          <header
+            data-testid="mindmap-toolbar"
+            className="flex flex-wrap items-start justify-between gap-3 rounded-2xl border border-border bg-card p-4"
           >
-            <StatusBadge variant={stream.variant}>{stream.label}</StatusBadge>
-          </span>
-        </header>
+            <div className="min-w-0">
+              <p className="text-xs font-medium text-muted-foreground">用例脑图</p>
+              <h1 className="text-xl font-semibold tracking-tight">{versionLabel}</h1>
+            </div>
+            <span
+              data-testid="stream-status"
+              data-status={streamStatus}
+              className="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-2.5 py-1 text-[11px] font-medium text-muted-foreground"
+            >
+              <StatusBadge variant={streamBadge.variant}>{streamBadge.label}</StatusBadge>
+            </span>
+          </header>
+        )}
 
         {error === "" ? (
           <p
@@ -315,77 +378,91 @@ export function MindmapPage({ versionId }: MindmapPageProps) {
   const noNodes = graph.nodes.length === 0
   const noRequirements = requirementCount === 0
   const reviewExportAllowed = REVIEW_EXPORT_STATUSES.has(graph.versionStatus)
+  // A `?case=` node that is not in the graph (deleted, renamed, other version)
+  // is a dead link: tell the user instead of rendering an editor placeholder
+  // that silently disagrees with the address bar.
+  const caseNotFound =
+    requestedCaseId !== "" && !graph.nodes.some((node) => node.id === requestedCaseId)
 
   return (
-    <div data-testid="mindmap-page" className="space-y-3">
-      <header
-        data-testid="mindmap-toolbar"
-        className="flex flex-wrap items-start justify-between gap-3 rounded-2xl border border-border bg-card p-4"
-      >
-        <div className="min-w-0 space-y-1">
-          <Link
-            href={`/versions/${encodeURIComponent(versionId)}`}
-            data-testid="back-to-version"
-            className="inline-flex items-center gap-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            ← 返回版本详情
-          </Link>
+    <div
+      data-testid="mindmap-page"
+      data-embedded={embedded ? "true" : undefined}
+      className={rootClass}
+    >
+      {embedded ? null : (
+        <header
+          data-testid="mindmap-toolbar"
+          className="flex flex-wrap items-start justify-between gap-3 rounded-2xl border border-border bg-card p-4"
+        >
+          <div className="min-w-0 space-y-1">
+            <Link
+              href={`/versions/${encodeURIComponent(versionId)}`}
+              data-testid="back-to-version"
+              className="inline-flex items-center gap-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              ← 返回版本详情
+            </Link>
 
-          <div className="flex flex-wrap items-center gap-2">
-            <h1 className="text-xl font-semibold tracking-tight">用例脑图</h1>
-            <StatusBadge variant={versionStatusVariant(graph.versionStatus)}>
-              {versionStatusLabel(graph.versionStatus)}
-            </StatusBadge>
-            {graph.baseline === null ? null : (
-              <span
-                data-testid="toolbar-baseline"
-                className="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-[11px] font-medium text-sky-700 dark:text-sky-300"
-              >
-                {`已绑定基线 · ${graph.baseline.caseCount} 个用例`}
-              </span>
-            )}
+            <div className="flex flex-wrap items-center gap-2">
+              <h1 className="text-xl font-semibold tracking-tight">用例脑图</h1>
+              <StatusBadge variant={versionStatusVariant(graph.versionStatus)}>
+                {versionStatusLabel(graph.versionStatus)}
+              </StatusBadge>
+              {graph.baseline === null ? null : (
+                <span
+                  data-testid="toolbar-baseline"
+                  className="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-[11px] font-medium text-sky-700 dark:text-sky-300"
+                >
+                  {`已绑定基线 · ${graph.baseline.caseCount} 个用例`}
+                </span>
+              )}
+            </div>
+
+            <p
+              data-testid="mindmap-version-name"
+              className="truncate text-sm text-muted-foreground"
+            >
+              {versionLabel}
+            </p>
+
+            <p className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+              <span>{`用例 ${caseCount}`}</span>
+              <span>{`场景 ${scenarioCount}`}</span>
+              <span>{`已确认需求 ${requirementCount}`}</span>
+              {uncoveredCount === 0 ? null : (
+                <span className="text-amber-700 dark:text-amber-300">
+                  {`未覆盖需求 ${uncoveredCount}`}
+                </span>
+              )}
+            </p>
           </div>
 
-          <p data-testid="mindmap-version-name" className="truncate text-sm text-muted-foreground">
-            {versionLabel}
-          </p>
-
-          <p className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
-            <span>{`用例 ${caseCount}`}</span>
-            <span>{`场景 ${scenarioCount}`}</span>
-            <span>{`已确认需求 ${requirementCount}`}</span>
-            {uncoveredCount === 0 ? null : (
-              <span className="text-amber-700 dark:text-amber-300">
-                {`未覆盖需求 ${uncoveredCount}`}
-              </span>
-            )}
-          </p>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-1.5">
-          <span
-            data-testid="stream-status"
-            data-status={streamStatus}
-            className="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-2.5 py-1 text-[11px] font-medium"
-          >
-            <StatusBadge variant={stream.variant}>{stream.label}</StatusBadge>
-          </span>
-          <button
-            type="button"
-            data-testid="btn-refresh-mindmap"
-            onClick={reload}
-            disabled={loading}
-            className={SECONDARY_BUTTON_CLASS}
-          >
-            {loading ? (
-              <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
-            ) : (
-              <RefreshCw className="h-4 w-4" aria-hidden="true" />
-            )}
-            刷新
-          </button>
-        </div>
-      </header>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span
+              data-testid="stream-status"
+              data-status={streamStatus}
+              className="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-2.5 py-1 text-[11px] font-medium"
+            >
+              <StatusBadge variant={streamBadge.variant}>{streamBadge.label}</StatusBadge>
+            </span>
+            <button
+              type="button"
+              data-testid="btn-refresh-mindmap"
+              onClick={reload}
+              disabled={loading}
+              className={SECONDARY_BUTTON_CLASS}
+            >
+              {loading ? (
+                <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+              ) : (
+                <RefreshCw className="h-4 w-4" aria-hidden="true" />
+              )}
+              刷新
+            </button>
+          </div>
+        </header>
+      )}
 
       {graph.baseline !== null ? (
         <p
@@ -434,6 +511,16 @@ export function MindmapPage({ versionId }: MindmapPageProps) {
           {notice}
         </p>
       )}
+
+      {caseNotFound ? (
+        <p
+          data-testid="mindmap-case-not-found"
+          role="status"
+          className="rounded-xl border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
+        >
+          {`未找到链接中指定的脑图节点（${requestedCaseId}），可能已被删除；请从画布重新选择。`}
+        </p>
+      ) : null}
 
       {noNodes || !noRequirements ? null : (
         <p
@@ -561,7 +648,7 @@ export function MindmapPage({ versionId }: MindmapPageProps) {
             <MindmapCanvas
               graph={graph}
               selectedId={selectedId}
-              onSelect={setSelectedId}
+              onSelect={selectNode}
               collapsed={collapsed}
               onToggle={toggleCollapsed}
               svgRef={svgRef}
@@ -591,6 +678,8 @@ export function MindmapPage({ versionId }: MindmapPageProps) {
               }}
               onDeleted={() => {
                 setSelectedId(null)
+                setRequestedCaseId("")
+                onCaseChange?.("")
                 reload()
               }}
               onRefresh={reload}
@@ -607,6 +696,8 @@ export function MindmapPage({ versionId }: MindmapPageProps) {
               }}
               onDeleted={() => {
                 setSelectedId(null)
+                setRequestedCaseId("")
+                onCaseChange?.("")
                 reload()
               }}
               onRefresh={reload}

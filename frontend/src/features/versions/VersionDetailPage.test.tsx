@@ -57,6 +57,7 @@ const mocks = vi.hoisted(() => ({
   issuesProps: vi.fn(),
   reportsProps: vi.fn(),
   explorationProps: vi.fn(),
+  mindmapProps: vi.fn(),
   getEvidenceMeta: vi.fn(),
   getEvidenceUrl: vi.fn(),
 }))
@@ -154,7 +155,7 @@ vi.mock("@/features/execution/components/ExplorationTab", () => ({
       q: string
     }) => void
     onSelectedNodeChange?: (nodeId: string) => void
-    onNavigate?: (target: { kind: "issue"; id: string }) => void
+    onNavigate?: (target: { kind: "issue"; id: string } | { kind: "case"; id: string }) => void
   }) => {
     mocks.explorationProps(props)
     return (
@@ -166,6 +167,13 @@ vi.mock("@/features/execution/components/ExplorationTab", () => ({
           onClick={() => props.onNavigate?.({ kind: "issue", id: "1844674407370955410" })}
         >
           探索问题
+        </button>
+        <button
+          type="button"
+          data-testid="exploration-case-link"
+          onClick={() => props.onNavigate?.({ kind: "case", id: MINDMAP_CASE_ID })}
+        >
+          打开脑图用例
         </button>
         <button
           type="button"
@@ -217,6 +225,41 @@ vi.mock("@/features/mindmap/api", () => ({
   })),
 }))
 
+// The embedded mindmap page owns its own suite; this container test pins the
+// tab wiring: the embedded flag, the `?case=` read/write and the shared version
+// stream/version it receives from this page.
+vi.mock("@/features/mindmap/MindmapPage", () => ({
+  MindmapPage: (props: {
+    versionId: string
+    embedded?: boolean
+    initialCaseId?: string
+    onCaseChange?: (caseId: string) => void
+    stream?: { events: unknown[]; status: string }
+    version?: { id: string }
+  }) => {
+    mocks.mindmapProps(props)
+    return (
+      <div data-testid="mindmap-tab">
+        mindmap for {props.versionId}
+        <button
+          type="button"
+          data-testid="mindmap-case-link"
+          onClick={() => props.onCaseChange?.(MINDMAP_CASE_ID)}
+        >
+          选择用例
+        </button>
+        <button
+          type="button"
+          data-testid="mindmap-case-clear"
+          onClick={() => props.onCaseChange?.("")}
+        >
+          清除用例
+        </button>
+      </div>
+    )
+  },
+}))
+
 // The workbench owns the version stream; this suite only covers the tab shell.
 vi.mock("./useVersionStream", () => ({ useVersionStream: mocks.useVersionStream }))
 
@@ -265,6 +308,7 @@ const VERSION: Version = {
 
 const TAB_LABELS = [
   "需求与澄清",
+  "用例脑图",
   "总览",
   "执行会话",
   "探索链路",
@@ -337,6 +381,8 @@ const HEADER_BATCH_2 = "1844674407370955172"
 const ISSUE_ID = "1844674407370955410"
 const REPORT_ID = "1844674407370955501"
 const SECOND_REPORT_ID = "1844674407370955502"
+/** A mindmap node id for the `?case=` deep link of the embedded mindmap tab. */
+const MINDMAP_CASE_ID = "1844674407370955210"
 
 function batchFixture(overrides: Partial<Batch> = {}): Batch {
   return {
@@ -610,7 +656,7 @@ describe("VersionDetailPage", () => {
     window.history.replaceState(null, "", "/")
   })
 
-  it("renders the nine tabs with requirements active by default", async () => {
+  it("renders the ten tabs with requirements active by default", async () => {
     render(<VersionDetailPage versionId={VERSION_ID} />)
 
     expect(await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })).toBeTruthy()
@@ -622,6 +668,90 @@ describe("VersionDetailPage", () => {
       "true",
     )
     expect(screen.getByTestId("requirements-workbench-slot")).toBeTruthy()
+  })
+
+  it("renders the embedded mindmap tab from ?tab=mindmap&case= and syncs the case deep link", async () => {
+    window.history.replaceState(
+      null,
+      "",
+      `/versions/${VERSION_ID}?tab=mindmap&case=${MINDMAP_CASE_ID}`,
+    )
+
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+
+    await waitFor(() =>
+      expect(screen.getByRole("tab", { name: "用例脑图" }).getAttribute("aria-selected")).toBe(
+        "true",
+      ),
+    )
+    expect(await screen.findByTestId("mindmap-tab")).toBeTruthy()
+    expect(screen.getByTestId("version-tab-mindmap").textContent).toContain(
+      `mindmap for ${VERSION_ID}`,
+    )
+    expect(mocks.mindmapProps).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        versionId: VERSION_ID,
+        embedded: true,
+        initialCaseId: MINDMAP_CASE_ID,
+        version: expect.objectContaining({ id: VERSION_ID }),
+      }),
+    )
+    const params = new URLSearchParams(window.location.search)
+    expect(params.get("tab")).toBe("mindmap")
+    expect(params.get("case")).toBe(MINDMAP_CASE_ID)
+
+    act(() => {
+      mocks.mindmapProps.mock.calls.at(-1)?.[0].onCaseChange?.("1844674407370955211")
+    })
+    await waitFor(() =>
+      expect(new URLSearchParams(window.location.search).get("case")).toBe("1844674407370955211"),
+    )
+    expect(new URLSearchParams(window.location.search).get("tab")).toBe("mindmap")
+
+    act(() => {
+      mocks.mindmapProps.mock.calls.at(-1)?.[0].onCaseChange?.("")
+    })
+    await waitFor(() => expect(new URLSearchParams(window.location.search).get("case")).toBeNull())
+    expect(new URLSearchParams(window.location.search).get("tab")).toBe("mindmap")
+  })
+
+  it("opens the embedded mindmap tab from the tab bar without losing other deep links", async () => {
+    window.history.replaceState(null, "", `/versions/${VERSION_ID}?batch=${HEADER_BATCH_1}`)
+
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "用例脑图" }))
+
+    expect(await screen.findByTestId("mindmap-tab")).toBeTruthy()
+    await waitFor(() =>
+      expect(new URLSearchParams(window.location.search).get("tab")).toBe("mindmap"),
+    )
+    expect(new URLSearchParams(window.location.search).get("batch")).toBe(HEADER_BATCH_1)
+    expect(mocks.mindmapProps).toHaveBeenLastCalledWith(
+      expect.objectContaining({ embedded: true, initialCaseId: "" }),
+    )
+  })
+
+  it("opens the embedded mindmap tab from an exploration case link", async () => {
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "探索链路" }))
+    fireEvent.click(await screen.findByTestId("exploration-case-link"))
+
+    await waitFor(() =>
+      expect(screen.getByRole("tab", { name: "用例脑图" }).getAttribute("aria-selected")).toBe(
+        "true",
+      ),
+    )
+    expect(await screen.findByTestId("mindmap-tab")).toBeTruthy()
+    expect(new URLSearchParams(window.location.search).get("tab")).toBe("mindmap")
+    expect(new URLSearchParams(window.location.search).get("case")).toBe(MINDMAP_CASE_ID)
+    expect(mocks.mindmapProps).toHaveBeenLastCalledWith(
+      expect.objectContaining({ initialCaseId: MINDMAP_CASE_ID }),
+    )
   })
 
   it("opens the overview tab from the ?tab=overview deep link", async () => {

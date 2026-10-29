@@ -435,7 +435,37 @@ describe("MindmapPage", () => {
     render(route)
 
     expect(await screen.findByTestId("mindmap-canvas")).toBeTruthy()
-    expect(mocks.useMindmap).toHaveBeenCalledWith(VERSION_ID)
+    expect(mocks.useMindmap).toHaveBeenCalledWith(VERSION_ID, undefined)
+  })
+
+  it("selects the ?case= node on the full-screen mindmap route", async () => {
+    mockGraph(defaultGraph())
+
+    const route = await MindmapRoutePage({
+      params: Promise.resolve({ id: VERSION_ID }),
+      searchParams: Promise.resolve({ case: CASE_ID }),
+    })
+    render(route)
+
+    expect(await screen.findByTestId("case-editor")).toBeTruthy()
+    expect((screen.getByLabelText("用例标题") as HTMLInputElement).value).toBe("取消订单")
+    expect(screen.getByTestId("back-to-version")).toBeTruthy()
+    expect(screen.queryByTestId("mindmap-case-not-found")).toBeNull()
+    expect(mocks.useMindmap).toHaveBeenCalledWith(VERSION_ID, undefined)
+  })
+
+  it("ignores malformed search parameters on the full-screen mindmap route", async () => {
+    mockGraph(defaultGraph())
+
+    const route = await MindmapRoutePage({
+      params: Promise.resolve({ id: VERSION_ID }),
+      searchParams: Promise.resolve({ case: ["1844674407370955103", "extra"] }),
+    })
+    render(route)
+
+    expect(await screen.findByTestId("mindmap-canvas")).toBeTruthy()
+    expect(screen.getByTestId("editor-placeholder")).toBeTruthy()
+    expect(screen.queryByTestId("mindmap-case-not-found")).toBeNull()
   })
 
   it("opens the mindmap from the version header and the overview card", async () => {
