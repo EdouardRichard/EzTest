@@ -132,6 +132,10 @@ func (c *Client) NewContext(ctx context.Context, spec application.ContextSpec) (
 	if spec.Viewport.Width > 0 && spec.Viewport.Height > 0 {
 		payload.Viewport = &viewportPayload{Width: spec.Viewport.Width, Height: spec.Viewport.Height}
 	}
+	if spec.DeviceScaleFactor > 0 {
+		scale := spec.DeviceScaleFactor
+		payload.DeviceScaleFactor = &scale
+	}
 
 	status, body, err := c.do(ctx, http.MethodPost, contextsPath, payload)
 	if err != nil {
@@ -512,12 +516,13 @@ func contextPath(ref application.ContextRef) string {
 }
 
 type createContextPayload struct {
-	Key            string                     `json:"key,omitempty"`
-	AllowedHosts   []string                   `json:"allowedHosts,omitempty"`
-	BaseURL        string                     `json:"baseUrl,omitempty"`
-	StorageState   json.RawMessage            `json:"storageState,omitempty"`
-	SessionStorage map[string]json.RawMessage `json:"sessionStorage,omitempty"`
-	Viewport       *viewportPayload           `json:"viewport,omitempty"`
+	Key               string                     `json:"key,omitempty"`
+	AllowedHosts      []string                   `json:"allowedHosts,omitempty"`
+	BaseURL           string                     `json:"baseUrl,omitempty"`
+	StorageState      json.RawMessage            `json:"storageState,omitempty"`
+	SessionStorage    map[string]json.RawMessage `json:"sessionStorage,omitempty"`
+	Viewport          *viewportPayload           `json:"viewport,omitempty"`
+	DeviceScaleFactor *float64                   `json:"deviceScaleFactor,omitempty"`
 }
 
 type viewportPayload struct {

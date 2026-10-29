@@ -179,6 +179,12 @@ function splitStorageState(input) {
   return { storageState: hasState ? { cookies, origins } : undefined, sessionStorage }
 }
 
+// Device scale factor bounds of design spec §9.3. Playwright fixes the DPR at
+// context creation, so a visual assertion's configured value must be applied
+// here (a later visual.compare only verifies the live fingerprint).
+const MIN_DEVICE_SCALE_FACTOR = 0.5
+const MAX_DEVICE_SCALE_FACTOR = 4
+
 function normalizeViewport(input) {
   if (input === undefined) {
     return undefined
@@ -192,6 +198,23 @@ function normalizeViewport(input) {
     throw invalidArguments("viewport width and height must be positive integers")
   }
   return { width, height }
+}
+
+function normalizeDeviceScaleFactor(input) {
+  if (input === undefined) {
+    return undefined
+  }
+  const value = Number(input)
+  if (
+    !Number.isFinite(value) ||
+    value < MIN_DEVICE_SCALE_FACTOR ||
+    value > MAX_DEVICE_SCALE_FACTOR
+  ) {
+    throw invalidArguments(
+      `deviceScaleFactor must be between ${MIN_DEVICE_SCALE_FACTOR} and ${MAX_DEVICE_SCALE_FACTOR}`,
+    )
+  }
+  return value
 }
 
 function parseBaseUrl(input) {
@@ -578,6 +601,7 @@ export class ContextManager {
       throw invalidArguments("allowedHosts or baseUrl is required")
     }
     const viewport = normalizeViewport(input.viewport)
+    const deviceScaleFactor = normalizeDeviceScaleFactor(input.deviceScaleFactor)
     const { storageState, sessionStorage: stateSessionStorage } = splitStorageState(input.storageState)
     const sessionStorage = {
       ...stateSessionStorage,
@@ -597,6 +621,7 @@ export class ContextManager {
         // reliable way to keep the allow list authoritative.
         serviceWorkers: "block",
         ...(viewport ? { viewport } : {}),
+        ...(deviceScaleFactor !== undefined ? { deviceScaleFactor } : {}),
         ...(storageState ? { storageState } : {}),
       })
       const contextId = `ctx_${this.#nextId++}`

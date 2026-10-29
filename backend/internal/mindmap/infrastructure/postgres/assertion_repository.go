@@ -64,13 +64,12 @@ const visualAssertionProjection = `v.selector, v.region, v.threshold::float8,
 
 // scanAssertionWithVisual scans one assertion row followed by the nullable
 // visual projection (all NULL for a non-visual assertion or a visual assertion
-// whose parameters were never saved).
+// whose parameters were never saved). Both projections are scanned in ONE
+// call: a database row can only be scanned once, so the base assertion and the
+// LEFT JOINed visual columns must be passed to the same Scan.
 func scanAssertionWithVisual(row rowScanner) (domain.CaseAssertion, error) {
-	assertion, err := scanAssertion(row)
-	if err != nil {
-		return domain.CaseAssertion{}, err
-	}
 	var (
+		assertion   domain.CaseAssertion
 		selector    *string
 		rawRegion   []byte
 		threshold   *float64
@@ -85,6 +84,16 @@ func scanAssertionWithVisual(row rowScanner) (domain.CaseAssertion, error) {
 		updatedAt   *time.Time
 	)
 	if err := row.Scan(
+		&assertion.ID,
+		&assertion.NodeID,
+		&assertion.StepID,
+		&assertion.Kind,
+		&assertion.Target,
+		&assertion.Expression,
+		&assertion.Expected,
+		&assertion.Source,
+		&assertion.CreatedAt,
+		&assertion.UpdatedAt,
 		&selector, &rawRegion, &threshold, &baselineID,
 		&viewportW, &viewportH, &scaleFactor,
 		&approvedBy, &approvedAt, &revision, &createdAt, &updatedAt,

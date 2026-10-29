@@ -298,6 +298,9 @@ func TestApproveVisualBaselineAcceptsDedicatedBaselineKind(t *testing.T) {
 
 func TestApproveVisualBaselineRejectsDimensionMismatch(t *testing.T) {
 	fixture := newVisualFixture()
+	// A full-page assertion compares the whole viewport, so the baseline must be
+	// exactly viewport×DPR.
+	fixture.store.target.Visual.Selector = ""
 	data := pngBytes(t, 640, 360)
 	fixture.evidence.evidence = application.VisualEvidence{
 		ID: 501, Kind: "screenshot", Mime: "image/png", Data: data, SizeBytes: int64(len(data)),
@@ -305,6 +308,60 @@ func TestApproveVisualBaselineRejectsDimensionMismatch(t *testing.T) {
 	_, err := fixture.service().ApproveBaseline(context.Background(), 5, 77, 1, 501)
 	if reason := visualReason(t, err); reason != "visual_baseline_invalid" {
 		t.Fatalf("reason = %q, want visual_baseline_invalid", reason)
+	}
+}
+
+// TestApproveVisualBaselineAcceptsFullPageViewportSize proves the strict
+// viewport×DPR check still accepts a correctly sized full-page baseline.
+func TestApproveVisualBaselineAcceptsFullPageViewportSize(t *testing.T) {
+	fixture := newVisualFixture()
+	fixture.store.target.Visual.Selector = ""
+	data := pngBytes(t, 1280, 720)
+	fixture.evidence.evidence = application.VisualEvidence{
+		ID: 501, Kind: "screenshot", Mime: "image/png", Data: data, SizeBytes: int64(len(data)),
+	}
+	if _, err := fixture.service().ApproveBaseline(context.Background(), 5, 77, 1, 501); err != nil {
+		t.Fatalf("ApproveBaseline(full page): %v", err)
+	}
+}
+
+// TestApproveVisualBaselineAcceptsSelectorElementSize pins the selector
+// baseline-size contract: an element screenshot is naturally smaller than
+// viewport×DPR, so approval validates only PNG/size/positive dimensions for a
+// selector assertion. The executor compares the element screenshot against it
+// later; a size difference there is an environment mismatch, not a failure.
+func TestApproveVisualBaselineAcceptsSelectorElementSize(t *testing.T) {
+	fixture := newVisualFixture()
+	if fixture.store.target.Visual.Selector == "" {
+		t.Fatal("fixture must configure a selector assertion")
+	}
+	data := pngBytes(t, 640, 360)
+	fixture.evidence.evidence = application.VisualEvidence{
+		ID: 501, Kind: "screenshot", Mime: "image/png", Data: data, SizeBytes: int64(len(data)),
+	}
+	stored, err := fixture.service().ApproveBaseline(context.Background(), 5, 77, 1, 501)
+	if err != nil {
+		t.Fatalf("ApproveBaseline(selector element): %v", err)
+	}
+	if fixture.store.approvedEvidenceID != 501 || !stored.HasBaseline() {
+		t.Fatalf("selector baseline not approved: store=%d stored=%+v", fixture.store.approvedEvidenceID, stored)
+	}
+}
+
+// TestApproveVisualBaselineRejectsCorruptSelectorBaseline keeps the PNG proof
+// for selector assertions even though the viewport dimension check is relaxed.
+func TestApproveVisualBaselineRejectsCorruptSelectorBaseline(t *testing.T) {
+	fixture := newVisualFixture()
+	fixture.evidence.evidence = application.VisualEvidence{
+		ID: 501, Kind: "screenshot", Mime: "image/png",
+		Data: []byte("not a png"), SizeBytes: int64(len("not a png")),
+	}
+	_, err := fixture.service().ApproveBaseline(context.Background(), 5, 77, 1, 501)
+	if reason := visualReason(t, err); reason != "visual_baseline_invalid" {
+		t.Fatalf("reason = %q, want visual_baseline_invalid", reason)
+	}
+	if fixture.store.approveCalls != 0 {
+		t.Fatalf("corrupt selector baseline reached the store")
 	}
 }
 

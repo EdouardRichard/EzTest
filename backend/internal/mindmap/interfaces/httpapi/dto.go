@@ -177,7 +177,7 @@ type caseVisualAssertionDTO struct {
 	ViewportWidth      int                  `json:"viewportWidth"`
 	ViewportHeight     int                  `json:"viewportHeight"`
 	DeviceScaleFactor  float64              `json:"deviceScaleFactor"`
-	ApprovedBy         *int64               `json:"approvedBy"`
+	ApprovedBy         *string              `json:"approvedBy"`
 	ApprovedAt         *time.Time           `json:"approvedAt"`
 	Revision           int                  `json:"revision"`
 }
@@ -199,7 +199,7 @@ func newVisualAssertionDTO(visual domain.VisualAssertion) *caseVisualAssertionDT
 		ViewportWidth:      visual.ViewportWidth,
 		ViewportHeight:     visual.ViewportHeight,
 		DeviceScaleFactor:  visual.DeviceScaleFactor,
-		ApprovedBy:         visual.ApprovedBy,
+		ApprovedBy:         optIDString(visual.ApprovedBy),
 		Revision:           visual.Revision,
 	}
 	if visual.Region != nil {

@@ -17,7 +17,11 @@ import (
 //   - every artifact of an active (planned/running) batch;
 //   - every artifact of the latest batchKeep batches of each version;
 //   - evidence referenced by an open/confirmed issue (issue_ref);
-//   - visual-baseline artifacts (evidence.kind).
+//   - visual-baseline artifacts (evidence.kind = 'visual_baseline');
+//   - evidence referenced as an approved visual baseline
+//     (case_visual_assertion.baseline_evidence_id). The admin approval endpoint
+//     accepts a plain 'screenshot' artifact too, so the kind check alone would
+//     let GC delete an approved baseline.
 //
 // The set deliberately contains only references that the application actually
 // writes. In particular report_ref(ref_kind='evidence') is not produced by the
@@ -51,6 +55,10 @@ WITH protected AS (
   SELECT ev.id
   FROM evidence ev
   WHERE ev.kind = 'visual_baseline'
+  UNION
+  SELECT va.baseline_evidence_id
+  FROM case_visual_assertion va
+  WHERE va.baseline_evidence_id IS NOT NULL
 )`
 
 // gcProtectedCTE returns the protection CTE bound to keepPlaceholder.
@@ -153,6 +161,10 @@ func (r *GCRepository) IsProtected(ctx context.Context, evidenceID int64, batchK
 					JOIN issue i ON i.id = iref.issue_id
 					WHERE iref.ref_kind = 'evidence' AND iref.ref_id = ev.id::text
 					  AND i.status IN ('open', 'confirmed')
+				)
+				OR EXISTS (
+					SELECT 1 FROM case_visual_assertion va
+					WHERE va.baseline_evidence_id = ev.id
 				)
 			)
 		)`, evidenceID, batchKeep).Scan(&protected)

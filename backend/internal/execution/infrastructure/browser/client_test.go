@@ -115,6 +115,10 @@ func TestNewContextSendsSpec(t *testing.T) {
 			"http://127.0.0.1:13335": json.RawMessage(`[{"name":"k","value":"v"}]`),
 		},
 		Viewport: browser.Viewport{Width: 1440, Height: 900},
+		// A non-default DPR must reach the executor: Playwright fixes the device
+		// scale factor at context creation, so the visual fingerprint of a DPR=2
+		// assertion can only match when the context was created with it.
+		DeviceScaleFactor: 2,
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/contexts" {
@@ -135,6 +139,7 @@ func TestNewContextSendsSpec(t *testing.T) {
 				Width  int `json:"width"`
 				Height int `json:"height"`
 			} `json:"viewport"`
+			DeviceScaleFactor float64 `json:"deviceScaleFactor"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Errorf("decode context request: %v", err)
@@ -158,6 +163,9 @@ func TestNewContextSendsSpec(t *testing.T) {
 		}
 		if body.Viewport.Width != spec.Viewport.Width || body.Viewport.Height != spec.Viewport.Height {
 			t.Errorf("viewport = %dx%d, want %dx%d", body.Viewport.Width, body.Viewport.Height, spec.Viewport.Width, spec.Viewport.Height)
+		}
+		if body.DeviceScaleFactor != spec.DeviceScaleFactor {
+			t.Errorf("deviceScaleFactor = %v, want %v", body.DeviceScaleFactor, spec.DeviceScaleFactor)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"contextId": "ctx_7", "browserVersion": "999.0.0"})
 	}))

@@ -237,9 +237,9 @@ export function mismatchBoxes(left, right, width, height) {
 
 /**
  * Compares two decoded images after applying the same normalized crop. The
- * images must have the same pixel size; a mismatch means the approved baseline
- * was captured with a different configuration and is reported as internal (it
- * is not an application defect).
+ * images must have the same pixel size; runVisualCompare classifies a size
+ * difference as an environment mismatch before calling this helper, so the
+ * check is a defensive invariant against comparing misaligned buffers.
  */
 export function comparePngImages(baselinePng, actualPng, { threshold, region } = {}) {
   const baseline = cropPng(baselinePng, region || null)
@@ -351,14 +351,13 @@ export async function runVisualCompare(entry, args, timeoutMs) {
     return { result, artifacts }
   }
   if (baselinePng.width !== actualPng.width || baselinePng.height !== actualPng.height) {
-    if (config.selector === "") {
-      result.environment_match = false
-      return { result, artifacts }
-    }
-    throw new ExecutorError(
-      "internal",
-      `baseline image ${baselinePng.width}x${baselinePng.height} does not match the element screenshot ${actualPng.width}x${actualPng.height}`,
-    )
+    // The approved baseline and the live capture disagree in size. A full-page
+    // assertion means the viewport or DPR changed under the baseline; a selector
+    // assertion means the element box or its device-pixel size changed. Both are
+    // environment changes: report a mismatch (no diff artifact) so the caller
+    // classifies inconclusive(environment), never an internal error.
+    result.environment_match = false
+    return { result, artifacts }
   }
 
   const comparison = comparePngImages(baselinePng, actualPng, {
