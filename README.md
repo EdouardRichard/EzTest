@@ -461,6 +461,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/db.ps1 start
 | `EZTEST_GC_ENABLED` | 否 | P8 是否允许**非 dry-run** 证据 GC，默认 `false`（`POST /api/admin/gc` 默认/仅 dry-run；`false` 时显式执行返回 409）。 |
 | `EZTEST_GC_RETENTION_DAYS` | 否 | P8 未引用证据保留天数，1–3650，默认 `30`。 |
 | `EZTEST_GC_BATCH_KEEP` | 否 | P8 最近 N 批证据始终受保护，1–50，默认 `3`。 |
+| `EZTEST_INSTANCE_ID` | 否 | P8 多实例 leader 锁的实例标识，出现在启动/退出与锁日志；默认 `hostname-pid`，最长 64 字符。 |
+| `EZTEST_LEADER_LOCK_KEY` | 否 | P8 PostgreSQL advisory lock 基础 key（int64），默认 `1163411512`；调度、自主 worker、每日维护派生出相邻 key，所有 API 实例必须一致。 |
 | `llm_base_url` / `llm_key` / `llm_model_name` | 否 | 首次启动的可选默认 LLM 种子；小写变量名是设计约定，Key 留空则不发起真实调用。P4 复用该配置，不新增模型/Key。 |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Compose | 仅 `deploy/docker-compose.yml` 使用；`POSTGRES_PASSWORD` 必填。 |
 | `NEXT_PUBLIC_API_BASE_URL` | 否 | 浏览器访问的 API origin，默认 `http://localhost:13333`；Compose 构建时内联。 |
@@ -663,7 +665,7 @@ P5 脚本可选配置：`EZTEST_ACCEPTANCE_API_URL`（复用已在运行的 API�
 
 ## 已知限制（P0–P7）
 
-- 单实例部署：SSE 的订阅与广播在进程内完成，不做多实例广播；重启/多副本会丢失实时连接（客户端可重连回放）。Agent run 也由进程内 runner 调度，重启时 `running` 会标记为 `interrupted`，P1 不做跨实例运行。P7 自主 worker 同样为单实例，多实例 leader 选举/分布式锁归 P8。
+- 单实例部署：SSE 的订阅与广播在进程内完成，不做多实例广播；重启/多副本会丢失实时连接（客户端可重连回放）。Agent run 也由进程内 runner 调度，重启时 `running` 会标记为 `interrupted`，P1 不做跨实例运行。P8 起执行调度、P7 自主 worker 与每日 GC 维护通过 PostgreSQL advisory lock 单活（每次 tick 仅一个实例执行，其余实例 debug 跳过）；SSE 广播与 Agent runner 仍为单实例。
 - 权限：P1 的 `/api/agents/*`、`/agents` 页面与 `agent:` 事件通道均仅管理员可用；P2 的 `/api/resources/*` GET 对任意登录用户开放，写/动作仅管理员（普通用户只读）；P3 的 `/api/versions/*` 与 `/versions` 对全部登录用户开放（无 per-user 授权）。P1–P3 均不做 RBAC。
 - Agent 工具：文件工具默认关闭（空 `EZTEST_AGENT_FILE_ROOT`）；`http.get` 只读、host allowlist、最多 3 次重定向、响应截断 1 MB；P1 不提供浏览器/数据库/写操作等业务工具。
 - P2 资源：Access 凭据与 Session 状态明文存储，且不写审计/事件流（D28）；Session 过期惰性判定、无后台 GC；代码仓只做本地只读路径/分支校验，P4 提供索引与读取；不提供自动登录、ProbeRecipe 或 Session 执行注入。

@@ -223,6 +223,33 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:13333/api/admin/gc `
 ### 已知限制
 
 - 当前实现清理**执行证据文件**（`EZTEST_EVIDENCE_DIR`）；导出、版本附件、报告 Markdown 与“无 DB 行的孤儿文件”尚未纳入自动删除，后续任务可按同一保护集扩展。
-- 定时维护任务（每日一次、leader 持有、默认只 dry-run）由多实例单活任务接线；当前需管理员手动触发。
+- 定时维护任务已接线：每日一次、leader 持有、默认只 dry-run（见下一节「多实例单活」）；管理员仍可手动 `POST /api/admin/gc`。
 - 证据行保留但文件已删；前端/API 读取此类证据会报文件缺失，应在报表/审计中结合 `purged_at` 解释。
 - 本机验收仅覆盖单元测试与 env-gated PostgreSQL 集成测试；生产首次执行前应在目标环境先跑 dry-run，并核对 `candidates`/`protected`。
+
+## 多实例单活（leader 锁）与每日维护
+
+> 设计依据：规格 §10.2/§10.5/D67。多个 API 实例共享同一个 PostgreSQL 时，执行调度 tick、自主 worker tick 与每日证据维护通过会话级 advisory lock 单活；单实例部署行为不变。
+
+### 配置
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `EZTEST_INSTANCE_ID` | `hostname-pid` | 实例标识，出现在启动/退出日志与锁 debug 日志；最长 64 字符。多副本部署建议显式设置唯一值。 |
+| `EZTEST_LEADER_LOCK_KEY` | `1163411512` | advisory lock 基础 key（int64）；所有实例必须一致。三个循环派生出相邻 key：调度 = `base`、自主 worker = `base+1`、每日维护 = `base+2`，因此不同循环互不阻塞，而同一循环的多个实例互斥。 |
+
+### 行为
+
+- 每个 tick 先 `pg_try_advisory_lock(key)`：获得锁的实例执行该 tick，结束时 `pg_advisory_unlock` 并归还连接；未获锁的实例跳过该 tick，仅记 debug 日志（不改变已落库状态）。
+- 锁是会话级的：进程崩溃/连接断开后 PostgreSQL 自动释放；优雅退出时 tick 结束即释放，不会把锁留给下一个实例。
+- 单实例（或未配置锁的测试）行为不变：每个 tick 都执行。
+- 启动/退出日志都带 `instance_id`；启动日志同时记录 `leader_lock_key`。锁日志不含任何密钥。
+- 调度/自主 tick 的锁只覆盖"本轮扫描与派发"，不覆盖长跑的 case runner；case 运行的互斥由既有 run/lease CAS 保证。
+
+### 每日维护
+
+- 进程启动后立即执行一次，之后每 24 小时一次；仅 leader 实例执行。
+- 默认 dry-run（不删除文件、不写 purged 标记，只记录候选/受保护/字节数）；设置 `EZTEST_GC_ENABLED=true` 后该定时任务改为真实清理（与 `POST /api/admin/gc` 的开关一致）。
+- 完成日志只含计数、保留天数与批次保护数，不含证据路径/sha256/内容。
+- 验证锁：`SELECT pid, classid, objid FROM pg_locks WHERE locktype = 'advisory' AND objid IN (<base>, <base+1>, <base+2>);`（仅持有锁的 tick 期间可见）。
+- 已知边界：advisory lock 依赖所有实例连接同一个 PostgreSQL；跨外部存储/多租户编排不在 P8 范围。SSE 广播与 Agent runner 仍为进程内单实例。

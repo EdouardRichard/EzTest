@@ -47,6 +47,13 @@ type AutonomyWorkerDeps struct {
 	Clock          Clock
 	Actor          int64
 	BatchesPerTick int
+	// Leader gates every worker pass behind the multi-instance advisory lock
+	// (design spec §10.5). A nil lock keeps the historical single-instance
+	// behavior of running every pass.
+	Leader TickLock
+	// LeaderKey is the advisory lock key of the autonomous loop; normally
+	// AutonomyLeaderKey(EZTEST_LEADER_LOCK_KEY).
+	LeaderKey int64
 }
 
 // AutonomyWorker is the execution-context autonomous orchestrator of spec §6.2.
@@ -235,6 +242,18 @@ func (w *AutonomyWorker) RunOnce(ctx context.Context) error {
 				"elapsed", elapsed, "tick", w.tick)
 		}
 	}()
+	// One autonomous pass at a time across API instances (spec §10.5). A
+	// non-leader skips the pass entirely; the chain is derived from stored state,
+	// so the next leader pass resumes it safely.
+	release, ok, err := acquireAutonomyTick(ctx, w.deps)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	defer release()
+
 	limit := w.batchesPerTick
 	if limit <= 0 {
 		limit = DefaultAutonomyBatchesPerTick

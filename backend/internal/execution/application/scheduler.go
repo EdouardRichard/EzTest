@@ -94,6 +94,13 @@ type SchedulerDeps struct {
 	// trigger degrades: the batch stays autonomy_done=false and the worker
 	// advances it on its next scan.
 	Autonomy AutonomyTrigger
+	// Leader gates every scheduling tick behind the multi-instance advisory
+	// lock (design spec §10.5). A nil lock keeps the historical single-instance
+	// behavior of running every tick.
+	Leader TickLock
+	// LeaderKey is the advisory lock key of the dispatch loop; normally
+	// SchedulerLeaderKey(EZTEST_LEADER_LOCK_KEY).
+	LeaderKey int64
 }
 
 // Scheduler dispatches pending case runs of the active batches: it acquires a
@@ -203,6 +210,19 @@ func (s *Scheduler) RunOnce(ctx context.Context) error {
 	if s == nil || s.deps.Queue == nil {
 		return errors.New("execution: scheduler batch queue is not configured")
 	}
+	// One scheduling tick at a time across API instances: the loser of the
+	// advisory lock skips the whole tick (spec §10.5). The lock is released at
+	// the end of the tick; the launched case runners are not covered, they are
+	// protected by the run/lease compare-and-swaps.
+	release, ok, err := acquireSchedulerTick(ctx, s.deps)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	defer release()
+
 	batches, err := s.deps.Queue.ActiveBatches(ctx)
 	if err != nil {
 		return fmt.Errorf("execution: list active batches: %w", err)

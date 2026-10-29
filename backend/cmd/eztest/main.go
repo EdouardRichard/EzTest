@@ -106,6 +106,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/crypto"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/idempotency"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/leader"
 	qualityapp "github.com/EdouardRichard/EzTest/backend/internal/quality/application"
 	qualitydomain "github.com/EdouardRichard/EzTest/backend/internal/quality/domain"
 	qualitypostgres "github.com/EdouardRichard/EzTest/backend/internal/quality/infrastructure/postgres"
@@ -221,6 +222,12 @@ func main() {
 // serve opens the database, applies pending migrations, then starts the HTTP
 // server and shuts it down gracefully on SIGINT or SIGTERM.
 func serve(cfg config.Config, logger *slog.Logger) error {
+	// Every startup/exit record carries the instance identity so an operator
+	// can correlate the multi-instance logs (design spec §10.5).
+	logger.Info("eztest starting",
+		"instance_id", cfg.InstanceID, "env", cfg.Env, "leader_lock_key", cfg.LeaderLockKey)
+	defer logger.Info("eztest stopped", "instance_id", cfg.InstanceID)
+
 	startupCtx, cancelStartup := context.WithTimeout(context.Background(), startupTimeout)
 	defer cancelStartup()
 
@@ -232,6 +239,11 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	if err := db.MigrateEmbedded(startupCtx, database.Pool); err != nil {
 		return fmt.Errorf("migrate database: %w", err)
 	}
+	// One locker per process: the periodic loops try the advisory lock per tick
+	// and skip while another instance holds it (design spec §10.5). The lock is
+	// released at the end of every tick, so it survives neither a crash nor an
+	// in-flight tick of a dead instance.
+	leaderLocker := leader.New(database.Pool, cfg.InstanceID, logger)
 
 	userRepo := identitypostgres.NewUserRepository(database.Pool)
 	tokenRepo := identitypostgres.NewTokenRepository(database.Pool)
@@ -1091,6 +1103,9 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		// the mindmap run service, which is constructed after the scheduler, so a
 		// late-bound holder forwards the batch-terminal signal once it is wired.
 		Autonomy: autonomyTrigger,
+		// Per-tick multi-instance leader lock (design spec §10.5).
+		Leader:    leaderLocker,
+		LeaderKey: executionapp.SchedulerLeaderKey(cfg.LeaderLockKey),
 	})
 	executionRecovery := executionapp.NewRecovery(executionapp.RecoveryDeps{
 		Queue:    executionQueries,
@@ -1237,8 +1252,22 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		// The spec §16.1 per-tick budget; config validates the 1–20 range and
 		// the worker clamps defensively.
 		BatchesPerTick: cfg.AutonomyBatchesPerTick,
+		// Per-tick multi-instance leader lock (design spec §10.5).
+		Leader:    leaderLocker,
+		LeaderKey: executionapp.AutonomyLeaderKey(cfg.LeaderLockKey),
 	})
 	autonomyTrigger.worker = autonomyWorker
+
+	// P8 daily evidence maintenance (design spec §10.2/§10.5): one leader-only
+	// pass every 24h. It is a dry-run unless EZTEST_GC_ENABLED explicitly opts
+	// into the purge, and its report carries counts only.
+	dailyMaintenance := executionapp.NewDailyMaintenance(executionapp.MaintenanceDeps{
+		GC:        gcService,
+		Leader:    leaderLocker,
+		LeaderKey: executionapp.MaintenanceLeaderKey(cfg.LeaderLockKey),
+		Purge:     cfg.GCEnabled,
+		Logger:    logger,
+	})
 
 	// Startup seeds and cleanup are idempotent: the builtin profile is created
 	// only when its key is absent (an existing, possibly edited row is never
@@ -1332,6 +1361,18 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		stopP7WorkerLoops(cancelP7Workers, autonomyWorker, deliveryAnalysisService)
 	}
 	defer stopP7WorkersOnce.Do(stopP7Workers)
+
+	// P8 daily maintenance loop (design spec §10.2/§10.5): one leader-held
+	// pass per day; it is a dry-run unless EZTEST_GC_ENABLED explicitly enables
+	// the purge. It stops before database.Close like the other loops.
+	maintenanceCtx, cancelMaintenance := context.WithCancel(context.Background())
+	go dailyMaintenance.Start(maintenanceCtx)
+	var stopMaintenanceOnce sync.Once
+	stopMaintenance := func() {
+		cancelMaintenance()
+		dailyMaintenance.Stop()
+	}
+	defer stopMaintenanceOnce.Do(stopMaintenance)
 
 	// The P5 run coordinator is a single in-process worker: it polls the agent
 	// sessions every 2 s (spec §8.4) and first fails the runs a previous process
@@ -1546,6 +1587,10 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		// observe the shutdown first, like the scheduler above.
 		logger.Info("stopping P7 workers")
 		stopP7WorkersOnce.Do(stopP7Workers)
+		// The daily maintenance loop only touches the evidence store and the
+		// database; stop it before the connection pool closes.
+		logger.Info("stopping maintenance loop")
+		stopMaintenanceOnce.Do(stopMaintenance)
 		// Cancel and drain the Agent runs before the HTTP server: their runners
 		// write terminal rows and activity events with a detached context, so a
 		// short bounded wait lets them finish cleanly.
