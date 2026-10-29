@@ -154,6 +154,7 @@ func mapExecutionCase(executionCase mindmapdomain.ExecutionCase) (executionapp.C
 			Target:     assertion.Target,
 			Expression: assertion.Expression,
 			Expected:   assertion.Expected,
+			Visual:     mapExecutionVisual(assertion.Visual),
 		})
 	}
 
@@ -176,6 +177,29 @@ func mapExecutionCase(executionCase mindmapdomain.ExecutionCase) (executionapp.C
 		Assertions:     snapshotAssertions,
 		RequirementIDs: append([]int64(nil), executionCase.RequirementIDs...),
 	}, nil
+}
+
+// mapExecutionVisual projects the optional visual comparison configuration of a
+// kind=visual assertion into the frozen snapshot.
+func mapExecutionVisual(visual *mindmapdomain.ExecutionVisual) *executiondomain.CaseSnapshotVisual {
+	if visual == nil {
+		return nil
+	}
+	mapped := &executiondomain.CaseSnapshotVisual{
+		Selector:           visual.Selector,
+		Threshold:          visual.Threshold,
+		BaselineEvidenceID: visual.BaselineEvidenceID,
+		ViewportWidth:      visual.ViewportWidth,
+		ViewportHeight:     visual.ViewportHeight,
+		DeviceScaleFactor:  visual.DeviceScaleFactor,
+	}
+	if visual.Region != nil {
+		mapped.Region = &executiondomain.SnapshotRegion{
+			X: visual.Region.X, Y: visual.Region.Y,
+			Width: visual.Region.Width, Height: visual.Region.Height,
+		}
+	}
+	return mapped
 }
 
 // decodeRawObject decodes a JSON object document. An absent document is nil; a

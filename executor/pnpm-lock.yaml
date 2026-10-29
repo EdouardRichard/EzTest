@@ -8,11 +8,21 @@ importers:
 
   .:
     dependencies:
+      pixelmatch:
+        specifier: ^8.0.0
+        version: 8.0.0
       playwright:
         specifier: 1.64.1
         version: 1.64.1
+      pngjs:
+        specifier: ^7.0.0
+        version: 7.0.0
 
 packages:
+
+  pixelmatch@8.0.0:
+    resolution: {integrity: sha512-cIqOLfh5k52us715qf3B3+kTOxZv+WDv77HN7xokLScYQGYQHi4m/ynoDIPpvF2LvCyUJGyvzY64i0QCXtzu1g==}
+    hasBin: true
 
   playwright-core@1.64.1:
     resolution: {integrity: sha512-BC4s8y6SEVA6Q1rSxZTto8hI1KUI3xXlHGZgvGqP4IqPdI/a6FX9H29IDNz7vKo9l21b6LfYosScPL6M3xxyDQ==}
@@ -24,10 +34,20 @@ packages:
     engines: {node: '>=20'}
     hasBin: true
 
+  pngjs@7.0.0:
+    resolution: {integrity: sha512-LKWqWJRhstyYo9pGvgor/ivk2w94eSjE3RGVuzLGlr3NmD8bf7RcYGze1mNdEHRP6TRP6rMuDHk5t44hnTRyow==}
+    engines: {node: '>=14.19.0'}
+
 snapshots:
+
+  pixelmatch@8.0.0:
+    dependencies:
+      pngjs: 7.0.0
 
   playwright-core@1.64.1: {}
 
   playwright@1.64.1:
     dependencies:
       playwright-core: 1.64.1
+
+  pngjs@7.0.0: {}

@@ -660,9 +660,10 @@ func normalizeCase(raw rawCaseProposal, confirmed map[int64]struct{}) (casePropo
 	for index, assertion := range raw.Assertions {
 		kind := strings.TrimSpace(assertion.Kind)
 		switch kind {
-		case mindmapdomain.AssertionKindUI, mindmapdomain.AssertionKindAPI, mindmapdomain.AssertionKindDB, mindmapdomain.AssertionKindText:
+		case mindmapdomain.AssertionKindUI, mindmapdomain.AssertionKindAPI, mindmapdomain.AssertionKindDB,
+			mindmapdomain.AssertionKindText, mindmapdomain.AssertionKindVisual:
 		default:
-			return caseProposal{}, invalidArguments(fmt.Sprintf("assertions[%d].kind must be ui, api, db or text", index))
+			return caseProposal{}, invalidArguments(fmt.Sprintf("assertions[%d].kind must be ui, api, db, text or visual", index))
 		}
 		if assertion.StepIndex != nil && (*assertion.StepIndex < 0 || *assertion.StepIndex >= len(steps)) {
 			return caseProposal{}, invalidArguments(fmt.Sprintf("assertions[%d].stepIndex is outside the case steps", index))

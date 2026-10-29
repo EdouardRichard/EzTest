@@ -128,7 +128,7 @@ func (s *EvidenceService) Capture(ctx context.Context, in CaptureInput) (domain.
 	}
 	if !validEvidenceKind(in.Kind) {
 		return domain.Evidence{}, invalidEvidenceError("invalid_evidence_kind",
-			fmt.Sprintf("evidence kind %q is not one of screenshot, http_exchange, console_log, network_log, download or db_result", in.Kind))
+			fmt.Sprintf("evidence kind %q is not in the supported evidence kind set", in.Kind))
 	}
 	if len(in.Data) == 0 {
 		return domain.Evidence{}, invalidEvidenceError("invalid_evidence_content",
@@ -310,14 +310,18 @@ func (s *EvidenceService) discardStored(ctx context.Context, rel string) {
 }
 
 // evidenceKinds is the frozen evidence kind allow-list of the evidence DDL. The
-// P7 migration adds db_result for the execution.db_assert artifact.
+// P7 migration adds db_result for the execution.db_assert artifact; the P8
+// migration adds the visual baseline/actual/diff artifacts (design spec §9.3).
 var evidenceKinds = map[string]struct{}{
-	"screenshot":    {},
-	"http_exchange": {},
-	"console_log":   {},
-	"network_log":   {},
-	"download":      {},
-	"db_result":     {},
+	"screenshot":      {},
+	"http_exchange":   {},
+	"console_log":     {},
+	"network_log":     {},
+	"download":        {},
+	"db_result":       {},
+	"visual_baseline": {},
+	"visual_actual":   {},
+	"visual_diff":     {},
 }
 
 // validEvidenceKind reports whether kind is one of the persisted kinds.

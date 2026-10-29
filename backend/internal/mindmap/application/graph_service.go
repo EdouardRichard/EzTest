@@ -2217,11 +2217,12 @@ func validateAssertionFields(kind, target, expression, expected string) error {
 // validateAssertionKind enforces the case_assertion.kind set.
 func validateAssertionKind(kind string) error {
 	switch kind {
-	case domain.AssertionKindUI, domain.AssertionKindAPI, domain.AssertionKindDB, domain.AssertionKindText:
+	case domain.AssertionKindUI, domain.AssertionKindAPI, domain.AssertionKindDB,
+		domain.AssertionKindText, domain.AssertionKindVisual:
 		return nil
 	default:
 		return domain.NewInvalid("kind", "invalid_assertion_kind",
-			fmt.Sprintf("assertion kind %q is not ui, api, db or text", kind))
+			fmt.Sprintf("assertion kind %q is not ui, api, db, text or visual", kind))
 	}
 }
 

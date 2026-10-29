@@ -26,9 +26,24 @@ type ExecutionStep struct {
 	Data     string
 }
 
+// ExecutionVisual is the frozen comparison configuration of one kind=visual
+// assertion inside an execution snapshot (design spec §9.3). BaselineEvidenceID
+// is nil when no baseline was approved at snapshot time; the execution context
+// then classifies the assertion inconclusive(case, missing_visual_baseline).
+type ExecutionVisual struct {
+	Selector           string
+	Region             *VisualRegion
+	Threshold          float64
+	BaselineEvidenceID *int64
+	ViewportWidth      int
+	ViewportHeight     int
+	DeviceScaleFactor  float64
+}
+
 // ExecutionAssertion is one frozen assertion of an execution case snapshot. ID
 // is the mindmap assertion id; StepSeq is the sequence of the owning step when
-// the assertion is attached to one, otherwise nil (spec §5.2 step_seq).
+// the assertion is attached to one, otherwise nil (spec §5.2 step_seq). Visual
+// is set only for kind=visual assertions.
 type ExecutionAssertion struct {
 	ID         int64
 	StepSeq    *int
@@ -36,6 +51,7 @@ type ExecutionAssertion struct {
 	Target     string
 	Expression string
 	Expected   string
+	Visual     *ExecutionVisual
 }
 
 // Execution case origins consumed by the execution context's P7 batch gates

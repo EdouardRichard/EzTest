@@ -220,6 +220,49 @@ func assertApplicationGeneratedID(t *testing.T, ctx context.Context, pool *pgxpo
 	}
 }
 
+// TestP8VisualAssertionSchema applies the embedded migrations and asserts the
+// P8 §9.3 visual-assertion schema: case_assertion accepts the visual kind, the
+// case_visual_assertion table stores the comparison configuration and the
+// threshold CHECK still rejects out-of-range values.
+func TestP8VisualAssertionSchema(t *testing.T) {
+	pool := testutil.OpenTestDB(t)
+	ctx := context.Background()
+
+	if !tableExists(t, ctx, pool, "case_visual_assertion") {
+		t.Fatalf("case_visual_assertion table does not exist")
+	}
+	assertPrimaryKeyName(t, ctx, pool, "case_visual_assertion", "pk_case_visual_assertion")
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO case_node (id, version_id, kind, title, source, created_by, updated_by)
+		VALUES (9500, 1, 'case', '视觉断言用例', 'user_input', 1, 1)`); err != nil {
+		t.Fatalf("insert case node: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO case_assertion (id, node_id, kind, expression, source)
+		VALUES (9501, 9500, 'visual', '页面与基线一致', 'user_input')`); err != nil {
+		t.Fatalf("case_assertion rejected the visual kind: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO case_visual_assertion
+			(assertion_id, selector, region, threshold, viewport_width, viewport_height,
+			 device_scale_factor, baseline_evidence_id)
+		VALUES (9501, '#receipt', '{"x":0,"y":0,"width":1,"height":1}'::jsonb, 0.01,
+		        1280, 720, 1, 500)`); err != nil {
+		t.Fatalf("insert visual parameters: %v", err)
+	}
+	// The threshold bound is a database invariant, not only a service rule.
+	_, err := pool.Exec(ctx, `
+		INSERT INTO case_visual_assertion (assertion_id, threshold)
+		VALUES (9501, 0.5)`)
+	assertCheckViolation(t, err, "case_visual_assertion.threshold above 0.1")
+	// The widened kind CHECK still rejects an unknown assertion kind.
+	_, err = pool.Exec(ctx, `
+		INSERT INTO case_assertion (id, node_id, kind, expression, source)
+		VALUES (9502, 9500, 'pixel', 'unknown', 'user_input')`)
+	assertCheckViolation(t, err, "case_assertion unknown kind")
+}
+
 // assertCheckViolation requires err to be a PostgreSQL CHECK violation (23514).
 func assertCheckViolation(t *testing.T, err error, what string) {
 	t.Helper()

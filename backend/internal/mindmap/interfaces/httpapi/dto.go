@@ -153,20 +153,71 @@ func newStepDTOs(steps []domain.CaseStep) []caseStepDTO {
 	return DTOs
 }
 
-// caseAssertionDTO is CaseAssertionView (spec §7.3).
+// caseAssertionDTO is CaseAssertionView (spec §7.3). Visual is present only for
+// kind=visual assertions; it carries the comparison parameters of design spec
+// §9.3.
 type caseAssertionDTO struct {
-	ID         string  `json:"id"`
-	StepID     *string `json:"stepId"`
-	Kind       string  `json:"kind"`
-	Target     string  `json:"target"`
-	Expression string  `json:"expression"`
-	Expected   string  `json:"expected"`
-	Source     string  `json:"source"`
+	ID         string                  `json:"id"`
+	StepID     *string                 `json:"stepId"`
+	Kind       string                  `json:"kind"`
+	Target     string                  `json:"target"`
+	Expression string                  `json:"expression"`
+	Expected   string                  `json:"expected"`
+	Source     string                  `json:"source"`
+	Visual     *caseVisualAssertionDTO `json:"visual,omitempty"`
+}
+
+// caseVisualAssertionDTO is the visual comparison configuration projected into
+// the assertion view. IDs are decimal strings (D29); region is normalized.
+type caseVisualAssertionDTO struct {
+	Selector           string               `json:"selector"`
+	Region             *caseVisualRegionDTO `json:"region"`
+	Threshold          float64              `json:"threshold"`
+	BaselineEvidenceID *string              `json:"baselineEvidenceId"`
+	ViewportWidth      int                  `json:"viewportWidth"`
+	ViewportHeight     int                  `json:"viewportHeight"`
+	DeviceScaleFactor  float64              `json:"deviceScaleFactor"`
+	ApprovedBy         *int64               `json:"approvedBy"`
+	ApprovedAt         *time.Time           `json:"approvedAt"`
+	Revision           int                  `json:"revision"`
+}
+
+// caseVisualRegionDTO is the normalized crop of one visual assertion.
+type caseVisualRegionDTO struct {
+	X      float64 `json:"x"`
+	Y      float64 `json:"y"`
+	Width  float64 `json:"width"`
+	Height float64 `json:"height"`
+}
+
+// newVisualAssertionDTO renders one stored visual configuration.
+func newVisualAssertionDTO(visual domain.VisualAssertion) *caseVisualAssertionDTO {
+	DTO := &caseVisualAssertionDTO{
+		Selector:           visual.Selector,
+		Threshold:          visual.Threshold,
+		BaselineEvidenceID: optIDString(visual.BaselineEvidenceID),
+		ViewportWidth:      visual.ViewportWidth,
+		ViewportHeight:     visual.ViewportHeight,
+		DeviceScaleFactor:  visual.DeviceScaleFactor,
+		ApprovedBy:         visual.ApprovedBy,
+		Revision:           visual.Revision,
+	}
+	if visual.Region != nil {
+		DTO.Region = &caseVisualRegionDTO{
+			X: visual.Region.X, Y: visual.Region.Y,
+			Width: visual.Region.Width, Height: visual.Region.Height,
+		}
+	}
+	if visual.ApprovedAt != nil {
+		value := *visual.ApprovedAt
+		DTO.ApprovedAt = &value
+	}
+	return DTO
 }
 
 // newAssertionDTO renders one assertion.
 func newAssertionDTO(assertion domain.CaseAssertion) caseAssertionDTO {
-	return caseAssertionDTO{
+	DTO := caseAssertionDTO{
 		ID:         idString(assertion.ID),
 		StepID:     optIDString(assertion.StepID),
 		Kind:       assertion.Kind,
@@ -175,6 +226,10 @@ func newAssertionDTO(assertion domain.CaseAssertion) caseAssertionDTO {
 		Expected:   assertion.Expected,
 		Source:     assertion.Source,
 	}
+	if assertion.Visual != nil {
+		DTO.Visual = newVisualAssertionDTO(*assertion.Visual)
+	}
+	return DTO
 }
 
 // newAssertionDTOs renders a non-nil assertion array.

@@ -23,12 +23,14 @@ eval/
 ├── baseline.json                  # 上次确定性通过结果的冻结基线（提交入库）
 ├── corpus/
 │   ├── requirements.json          # 固定需求、版本、期望的用例标题契约
-│   └── environment.json           # 固定环境/账号/端口/评测库名
+│   ├── environment.json           # 固定环境/账号/端口/评测库名
+│   └── visual.json                # 视觉断言场景（P8 §9.3）
 └── ground-truth/
     ├── impact.json                # P4 影响候选真值（固定 commit 对）
     ├── classification.json        # 注入失败分类真值
     ├── issues.json                # AI 问题真值（标题稳定契约）
-    └── supplement.json            # 补全缺口真值
+    ├── supplement.json            # 补全缺口真值
+    └── visual.json                # 视觉断言四态分类真值（P8 §9.3）
 ```
 
 ## 指标与阈值（§9.1）
@@ -44,6 +46,18 @@ eval/
 
 回归规则：确定性轨道任一指标比 `baseline.json` 差超过 **0.05** 即失败（问题误报率为“升高”方向）。
 真实 LLM 轨道只报告，不应用回归规则。
+
+## 视觉断言场景（P8 §9.3）
+
+`corpus/visual.json` 冻结视觉断言的场景（选择器/区域/阈值/视口/DPR、基线审批与
+`visual_actual`/`visual_diff` 证据），`ground-truth/visual.json` 冻结四态分类真值：
+无基线 → `inconclusive(case, missing_visual_baseline)`；环境指纹不符 →
+`inconclusive(environment, visual_environment_mismatch)`；diff 超阈值 →
+`failed(application, visual_mismatch)`；否则 passed。
+
+Task 23 的 runner 目前尚未执行该场景（不修改 runner 核心）。接入时需在预检的
+`requiredFiles`、`corpusFiles` 与 `P8_EVAL_*` 环境变量中加入这两个文件，并按
+`ground-truth/visual.json` 的 `cases` 计数（`visual_classification_accuracy`，阈值 1.00）。
 
 ## 维护流程
 

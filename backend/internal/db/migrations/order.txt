@@ -43,3 +43,5 @@ quality_0001_eval.sql
 codeintel_0007_fact_review.sql
 version_0006_knowledge.sql
 execution_0004_evidence_purge.sql
+mindmap_0003_visual.sql
+execution_0005_visual_evidence.sql

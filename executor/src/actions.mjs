@@ -24,6 +24,7 @@ import {
   resolveTimeout,
 } from "./security.mjs"
 import { captureSnapshot, stripSecretValues } from "./snapshot.mjs"
+import { runVisualCompare } from "./visual.mjs"
 
 const WAIT_STATES = new Set(["attached", "detached", "visible", "hidden"])
 const MOUSE_BUTTONS = new Set(["left", "right", "middle"])
@@ -391,6 +392,14 @@ const HANDLERS = {
     }
   },
 
+  // visual.compare (design spec §9.3): the actual screenshot is captured in the
+  // live page, compared against the API-supplied baseline PNG and returned as
+  // visual_actual/visual_diff artifacts. The viewport/DPR fingerprint is checked
+  // inside runVisualCompare.
+  async "visual.compare"(entry, args, timeoutMs) {
+    return runVisualCompare(entry, args, timeoutMs)
+  },
+
   async console(entry, args) {
     const tail = clampTail(args.tail, 50, 200)
     const secrets = knownSecrets(entry, args)
@@ -444,8 +453,7 @@ const HANDLERS = {
     }
   },
 
-  async storage_state(entry, args, timeoutMs) {
-    const includeSessionStorage = args.include_session_storage !== false
+  async storage_state(entry, args, timeoutMs) {    const includeSessionStorage = args.include_session_storage !== false
     const state = await entry.context.storageState()
     const origins = new Map()
     for (const origin of state.origins ?? []) {

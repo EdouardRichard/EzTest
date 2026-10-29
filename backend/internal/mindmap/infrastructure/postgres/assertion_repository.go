@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -53,14 +54,79 @@ func scanAssertion(row rowScanner) (domain.CaseAssertion, error) {
 	return assertion, nil
 }
 
+// visualAssertionProjection is the optional case_visual_assertion projection
+// appended to the graph read. The numeric columns are cast to float8 so pgx can
+// scan them directly.
+const visualAssertionProjection = `v.selector, v.region, v.threshold::float8,
+	v.baseline_evidence_id, v.viewport_width, v.viewport_height,
+	v.device_scale_factor::float8, v.approved_by, v.approved_at, v.revision,
+	v.created_at, v.updated_at`
+
+// scanAssertionWithVisual scans one assertion row followed by the nullable
+// visual projection (all NULL for a non-visual assertion or a visual assertion
+// whose parameters were never saved).
+func scanAssertionWithVisual(row rowScanner) (domain.CaseAssertion, error) {
+	assertion, err := scanAssertion(row)
+	if err != nil {
+		return domain.CaseAssertion{}, err
+	}
+	var (
+		selector    *string
+		rawRegion   []byte
+		threshold   *float64
+		baselineID  *int64
+		viewportW   *int
+		viewportH   *int
+		scaleFactor *float64
+		approvedBy  *int64
+		approvedAt  *time.Time
+		revision    *int
+		createdAt   *time.Time
+		updatedAt   *time.Time
+	)
+	if err := row.Scan(
+		&selector, &rawRegion, &threshold, &baselineID,
+		&viewportW, &viewportH, &scaleFactor,
+		&approvedBy, &approvedAt, &revision, &createdAt, &updatedAt,
+	); err != nil {
+		return domain.CaseAssertion{}, err
+	}
+	if selector == nil {
+		return assertion, nil
+	}
+	visual := domain.VisualAssertion{
+		AssertionID:        assertion.ID,
+		Selector:           *selector,
+		Region:             decodeVisualRegion(rawRegion),
+		Threshold:          valueOr(threshold, domain.VisualThresholdDefault),
+		BaselineEvidenceID: baselineID,
+		ViewportWidth:      valueOr(viewportW, domain.VisualViewportDefaultWidth),
+		ViewportHeight:     valueOr(viewportH, domain.VisualViewportDefaultHeight),
+		DeviceScaleFactor:  valueOr(scaleFactor, domain.VisualDeviceScaleFactorDefault),
+		ApprovedBy:         approvedBy,
+		ApprovedAt:         approvedAt,
+		Revision:           valueOr(revision, 1),
+	}
+	if createdAt != nil {
+		visual.CreatedAt = *createdAt
+	}
+	if updatedAt != nil {
+		visual.UpdatedAt = *updatedAt
+	}
+	assertion.Visual = &visual
+	return assertion, nil
+}
+
 // ListByVersion returns every assertion of the version ordered by owning case
-// and id.
+// and id, with the optional visual comparison parameters attached.
 func (r *AssertionRepository) ListByVersion(ctx context.Context, versionID int64) ([]domain.CaseAssertion, error) {
 	rows, err := r.q.Query(ctx, `
 		SELECT a.id, a.node_id, a.step_id, a.kind, a.target, a.expression,
-		       a.expected, a.source, a.created_at, a.updated_at
+		       a.expected, a.source, a.created_at, a.updated_at,
+		       `+visualAssertionProjection+`
 		FROM case_assertion AS a
 		JOIN case_node AS n ON n.id = a.node_id
+		LEFT JOIN case_visual_assertion AS v ON v.assertion_id = a.id
 		WHERE n.version_id = $1
 		ORDER BY a.node_id ASC, a.id ASC`, versionID)
 	if err != nil {
@@ -70,7 +136,7 @@ func (r *AssertionRepository) ListByVersion(ctx context.Context, versionID int64
 
 	assertions := make([]domain.CaseAssertion, 0)
 	for rows.Next() {
-		assertion, err := scanAssertion(rows)
+		assertion, err := scanAssertionWithVisual(rows)
 		if err != nil {
 			return nil, fmt.Errorf("postgres: scan case assertion: %w", err)
 		}
