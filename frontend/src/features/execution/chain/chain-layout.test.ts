@@ -3,18 +3,9 @@ import {
   autoCollapsedChainRequirements,
   CHAIN_AUTO_COLLAPSE_THRESHOLD,
   CHAIN_CARD_SIZES,
-  CHAIN_CASE_WIDTH,
-  CHAIN_ISSUE_HEIGHT,
-  CHAIN_ISSUE_WIDTH,
-  CHAIN_LAYER_GAP,
   CHAIN_READ_MODEL_LAYER_GAP,
   CHAIN_READ_MODEL_ROW_GAP,
-  CHAIN_REQUIREMENT_WIDTH,
-  CHAIN_RESULT_WIDTH,
-  isAbnormalResultStatus,
   layoutChain,
-  layoutLegacy,
-  matchesResultFilter,
 } from "./chain-layout"
 import type { ChainEdgeKindDTO, ChainSnapshotEdge, ChainSnapshotNode } from "./chain-types"
 
@@ -615,88 +606,5 @@ describe("autoCollapsedChainRequirements", () => {
     const atThreshold = nodesWithTotal(CHAIN_AUTO_COLLAPSE_THRESHOLD)
 
     expect(autoCollapsedChainRequirements(atThreshold)).toEqual([])
-  })
-})
-
-describe("result status helpers", () => {
-  it("classifies abnormal result statuses", () => {
-    expect(isAbnormalResultStatus("failed")).toBe(true)
-    expect(isAbnormalResultStatus("blocked")).toBe(true)
-    expect(isAbnormalResultStatus("inconclusive")).toBe(true)
-    expect(isAbnormalResultStatus("interrupted")).toBe(true)
-    expect(isAbnormalResultStatus("passed")).toBe(false)
-    expect(isAbnormalResultStatus("skipped")).toBe(false)
-  })
-
-  it("groups pending and running under the pending filter", () => {
-    expect(matchesResultFilter("pending", "pending")).toBe(true)
-    expect(matchesResultFilter("running", "pending")).toBe(true)
-    expect(matchesResultFilter("failed", "pending")).toBe(false)
-    expect(matchesResultFilter("failed", "failed")).toBe(true)
-    expect(matchesResultFilter("failed", "")).toBe(true)
-  })
-})
-
-describe("layoutLegacy compatibility adapter", () => {
-  it("keeps the ids, coordinates and edges the current SVG canvas consumes", () => {
-    const result = layoutLegacy({
-      requirements: [{ id: R1, title: "登录需求", status: "clarified", sortOrder: 0 }],
-      cases: [
-        { id: C1, title: "登录成功", requirementIds: [R1], status: "executed", sortOrder: 0 },
-      ],
-      results: [{ id: CR1, caseNodeId: C1, status: "passed", sortOrder: 0 }],
-    })
-
-    expect(result.visibleIds).toEqual([R1, C1, CR1])
-    expect(result.edges.map((edge) => edge.id)).toEqual([`${R1}->${C1}`, `${C1}->${CR1}`])
-    expect(result.nodes[0]).toMatchObject({
-      kind: "requirement",
-      x: 0,
-      y: 0,
-      w: CHAIN_REQUIREMENT_WIDTH,
-    })
-    expect(result.nodes[1]).toMatchObject({
-      kind: "case",
-      x: CHAIN_REQUIREMENT_WIDTH + CHAIN_LAYER_GAP,
-      w: CHAIN_CASE_WIDTH,
-    })
-    expect(result.nodes[2]).toMatchObject({
-      kind: "result",
-      x: CHAIN_REQUIREMENT_WIDTH + CHAIN_LAYER_GAP + CHAIN_CASE_WIDTH + CHAIN_LAYER_GAP,
-      w: CHAIN_RESULT_WIDTH,
-    })
-  })
-
-  it("keeps the legacy issue layer and collapsed-group behaviour", () => {
-    const input = {
-      requirements: [{ id: R1, title: "登录需求", sortOrder: 0 }],
-      cases: [{ id: C1, title: "登录成功", requirementIds: [R1], sortOrder: 0 }],
-      results: [{ id: CR1, caseNodeId: C1, status: "passed" as const, sortOrder: 0 }],
-      issues: [
-        {
-          id: I1,
-          title: "登录报错",
-          status: "open",
-          severity: "major",
-          caseNodeId: C1,
-          caseRunId: CR1,
-          sortOrder: 0,
-        },
-      ],
-    }
-
-    const expanded = layoutLegacy(input)
-    expect(expanded.visibleIds).toEqual([R1, C1, CR1, I1])
-    expect(expanded.edges.find((edge) => edge.targetId === I1)).toMatchObject({
-      kind: "issue-link",
-      sourceId: CR1,
-    })
-    expect(expanded.nodes.find((node) => node.id === I1)).toMatchObject({
-      w: CHAIN_ISSUE_WIDTH,
-      h: CHAIN_ISSUE_HEIGHT,
-    })
-
-    const collapsed = layoutLegacy(input, { collapsed: [R1] })
-    expect(collapsed.hiddenIds).toEqual([C1, CR1, I1])
   })
 })

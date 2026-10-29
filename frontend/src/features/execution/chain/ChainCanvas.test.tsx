@@ -674,4 +674,64 @@ describe("ChainCanvas", () => {
       duration: 450,
     })
   })
+
+  it("exposes the chain through the visually hidden keyboard tree", async () => {
+    const onSelect = vi.fn()
+    const onToggleCollapse = vi.fn()
+    const onEscape = vi.fn()
+    renderCanvas({ onSelect, onToggleCollapse, onEscape })
+
+    await screen.findByTestId("chain-node-requirement")
+    expect(screen.getByRole("tree")).not.toBeNull()
+
+    const requirement = screen.getByTestId("chain-treeitem-requirement:1")
+    expect(requirement.getAttribute("role")).toBe("treeitem")
+    expect(requirement.getAttribute("aria-level")).toBe("1")
+    expect(requirement.getAttribute("aria-expanded")).toBe("true")
+    expect(requirement.getAttribute("aria-setsize")).toBe("1")
+    expect(requirement.getAttribute("tabindex")).toBe("0")
+
+    requirement.focus()
+    fireEvent.keyDown(requirement, { key: "ArrowDown" })
+    const firstCase = screen.getByTestId("chain-treeitem-case:1")
+    expect(document.activeElement).toBe(firstCase)
+    expect(firstCase.getAttribute("tabindex")).toBe("0")
+    expect(requirement.getAttribute("tabindex")).toBe("-1")
+
+    fireEvent.keyDown(firstCase, { key: "Enter" })
+    expect(onSelect).toHaveBeenCalledWith("case:1")
+
+    fireEvent.keyDown(firstCase, { key: "Escape" })
+    expect(onEscape).toHaveBeenCalledTimes(1)
+
+    // Left goes back to the parent, then collapses the expanded requirement.
+    fireEvent.keyDown(firstCase, { key: "ArrowLeft" })
+    expect(document.activeElement).toBe(requirement)
+    fireEvent.keyDown(requirement, { key: "ArrowLeft" })
+    expect(onToggleCollapse).toHaveBeenCalledWith("requirement:1")
+  })
+
+  it("syncs aria-selected and the roving tab stop to selectedId", async () => {
+    renderCanvas({ selectedId: "case:1" })
+
+    await screen.findAllByTestId("chain-node-case")
+    const selected = screen.getByTestId("chain-treeitem-case:1")
+    expect(selected.getAttribute("aria-selected")).toBe("true")
+    expect(selected.getAttribute("tabindex")).toBe("0")
+    expect(screen.getByTestId("chain-treeitem-requirement:1").getAttribute("aria-selected")).toBe(
+      "false",
+    )
+  })
+
+  it("localises React Flow edge labels instead of leaving the English default", async () => {
+    renderCanvas()
+    await screen.findAllByTestId("chain-node-result")
+
+    const edge = screen.getByTestId("rf__edge-e-req-case")
+    const label = edge.getAttribute("aria-label") ?? ""
+    expect(label).toContain(EDGE_KIND_TOKENS.requirement_case.label)
+    expect(label).toContain("登录需求")
+    expect(label).toContain("登录成功")
+    expect(label).not.toContain("Edge from")
+  })
 })

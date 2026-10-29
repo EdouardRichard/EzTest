@@ -376,8 +376,10 @@ describe("ExplorationTab", () => {
     renderTab()
 
     const requirementNode = await screen.findByTestId(`chain-node-${R1}`)
-    expect(requirementNode.getAttribute("role")).toBe("treeitem")
     expect(screen.getByRole("tree")).toBeTruthy()
+    const treeitem = screen.getByTestId(`chain-treeitem-requirement:${R1}`)
+    expect(treeitem.getAttribute("role")).toBe("treeitem")
+    expect(requirementNode.getAttribute("data-kind")).toBe("requirement")
 
     const caseNodeElement = screen.getByTestId(`chain-node-${C1}`)
     expect(caseNodeElement.textContent).toContain("登录成功")
@@ -388,7 +390,8 @@ describe("ExplorationTab", () => {
 
     const issuePanel = screen.getByTestId("chain-issue-panel")
     expect(issuePanel.textContent).toContain("问题")
-    expect(screen.getByTestId(`chain-issue-node-${ISSUE_1}`).textContent).toContain("提交订单失败")
+    const issueNode = screen.getByTestId(`chain-node-${ISSUE_1}`)
+    expect(issueNode.textContent).toContain("提交订单失败")
     expect(screen.getByTestId("chain-issue-count").textContent).toContain("1 个问题")
     expect(screen.queryByTestId("chain-issue-placeholder")).toBeNull()
   })
@@ -414,9 +417,14 @@ describe("ExplorationTab", () => {
     renderTab()
     await screen.findByTestId(`chain-node-${C1}`)
 
+    const edgeFor = (source: string, target: string): Element | null =>
+      document.querySelector(
+        `[data-testid="chain-edge-requirement_case"][data-edge-id="requirement_case:${source}:${target}"]`,
+      )
+
     expect(screen.getByTestId(`chain-node-${R2}`)).toBeTruthy()
-    expect(screen.queryByTestId(`chain-edge-${R1}->${C1}`)).toBeTruthy()
-    expect(screen.queryByTestId(`chain-edge-${R2}->${C1}`)).toBeNull()
+    expect(edgeFor(R1, C1)).not.toBeNull()
+    expect(edgeFor(R2, C1)).toBeNull()
   })
 
   it("keeps the status colour, glyph and text alongside each other", async () => {
@@ -424,13 +432,21 @@ describe("ExplorationTab", () => {
 
     const passed = await screen.findByTestId(`chain-node-${CR1}`)
     const failed = screen.getByTestId(`chain-node-${CR2}`)
+    const passedCard = within(passed).getByTestId("chain-node-result")
+    const failedCard = within(failed).getByTestId("chain-node-result")
 
     expect(passed.getAttribute("data-status")).toBe("passed")
     expect(failed.getAttribute("data-status")).toBe("failed")
-    expect(passed.getAttribute("aria-label")).toContain("通过")
-    expect(failed.getAttribute("aria-label")).toContain("失败")
-    expect(passed.textContent).toContain("✓")
-    expect(failed.textContent).toContain("✕")
+    expect(passedCard.getAttribute("aria-label")).toContain("通过")
+    expect(failedCard.getAttribute("aria-label")).toContain("失败")
+    expect(passed.textContent).toContain("通过")
+    expect(failed.textContent).toContain("失败")
+    // Colour is carried by the status token; the icon and text are redundant
+    // encodings so the status never depends on colour alone.
+    expect(passedCard.querySelector("header span")?.className).toContain("emerald")
+    expect(failedCard.querySelector("header span")?.className).toContain("red")
+    expect(passed.querySelector("svg")).not.toBeNull()
+    expect(failed.querySelector("svg")).not.toBeNull()
   })
 
   it("opens a result drawer with attempt, summary and caseRunId-lazy evidence", async () => {
@@ -440,39 +456,43 @@ describe("ExplorationTab", () => {
     )
     const { onOpenEvidence, onNavigate } = renderTab()
 
-    fireEvent.click(await screen.findByTestId(`chain-node-${CR2}`))
+    const node = await screen.findByTestId(`chain-node-${CR2}`)
+    fireEvent.click(node)
 
-    const drawer = screen.getByTestId("chain-drawer")
-    expect(drawer.textContent).toContain("提交订单")
-    expect(drawer.textContent).toContain("提交订单返回 500")
-    expect(drawer.textContent).toContain("失败")
-    expect(drawer.textContent).toContain("第 2 次尝试")
+    const sheet = screen.getByTestId("chain-sheet")
+    expect(sheet.textContent).toContain("提交订单")
+    expect(sheet.textContent).toContain("提交订单返回 500")
+    expect(sheet.textContent).toContain("失败")
+    expect(sheet.textContent).toContain("第 2 次尝试")
 
     // Evidence is not loaded with the chain: the hook is called disabled first.
     expect(mocks.useCaseRun).toHaveBeenLastCalledWith(VERSION_ID, BATCH_ID, "", STREAM)
-    expect(screen.getByTestId("chain-drawer-load-evidence").textContent).toContain("证据")
+    expect(screen.getByTestId("chain-sheet-load-evidence").textContent).toContain("证据")
 
-    fireEvent.click(screen.getByTestId("chain-drawer-load-evidence"))
+    fireEvent.click(screen.getByTestId("chain-sheet-load-evidence"))
     expect(mocks.useCaseRun).toHaveBeenLastCalledWith(VERSION_ID, BATCH_ID, CR2, STREAM)
 
-    fireEvent.click(screen.getByTestId(`chain-drawer-evidence-${EVIDENCE}`))
+    fireEvent.click(screen.getByTestId(`chain-sheet-evidence-${EVIDENCE}`))
     expect(onOpenEvidence).toHaveBeenCalledWith(EVIDENCE)
 
-    fireEvent.click(screen.getByTestId("chain-drawer-open-case"))
+    fireEvent.click(screen.getByTestId("chain-sheet-open-case"))
     expect(onNavigate).toHaveBeenCalledWith({ kind: "case", id: C2 })
 
-    fireEvent.click(screen.getByTestId("chain-drawer-open-result"))
+    fireEvent.click(screen.getByTestId("chain-sheet-open-result"))
     expect(onNavigate).toHaveBeenCalledWith({ kind: "result", id: CR2 })
 
-    fireEvent.click(screen.getByTestId("chain-drawer-close"))
-    expect(screen.queryByTestId("chain-drawer")).toBeNull()
+    fireEvent.click(screen.getByTestId("chain-sheet-close"))
+    expect(screen.queryByTestId("chain-sheet")).toBeNull()
+    // The canvas node that opened the Sheet gets the focus back.
+    expect(document.activeElement).toBe(node)
   })
 
   it("opens a requirement drawer with its deep link", async () => {
     const { onNavigate } = renderTab()
 
     fireEvent.click(await screen.findByTestId(`chain-node-${R2}`))
-    fireEvent.click(screen.getByTestId("chain-drawer-open-requirement"))
+    expect(screen.getByTestId("chain-sheet").getAttribute("data-kind")).toBe("requirement")
+    fireEvent.click(screen.getByTestId("chain-sheet-open-requirement"))
 
     expect(onNavigate).toHaveBeenCalledWith({ kind: "requirement", id: R2 })
   })
@@ -493,13 +513,16 @@ describe("ExplorationTab", () => {
     )
     renderTab()
 
-    const node = await screen.findByTestId(`chain-issue-node-${ISSUE_1}`)
+    const node = await screen.findByTestId(`chain-node-${ISSUE_1}`)
+    const card = within(node).getByTestId("chain-node-issue")
     expect(node.getAttribute("data-kind")).toBe("issue")
     expect(node.getAttribute("data-severity")).toBe("blocker")
-    expect(node.textContent).toContain("提交订单失败")
-    expect(node.textContent).toContain("阻断")
-    expect(node.getAttribute("aria-label")).toContain("问题")
-    expect(node.querySelector("polygon")?.getAttribute("fill")).toBe("#ef4444")
+    expect(card.textContent).toContain("提交订单失败")
+    expect(card.textContent).toContain("阻断")
+    expect(card.getAttribute("aria-label")).toContain("问题")
+    // The severity token drives the red badge; the icon and text keep the
+    // meaning readable without colour.
+    expect(card.querySelector("header span")?.className).toContain("red")
     // IDs stay decimal strings end-to-end (D29), never Number()'d.
     expect(node.getAttribute("data-testid")).toContain(ISSUE_1)
   })
@@ -511,23 +534,23 @@ describe("ExplorationTab", () => {
     )
     const { onOpenEvidence, onNavigate } = renderTab()
 
-    fireEvent.click(await screen.findByTestId(`chain-issue-node-${ISSUE_1}`))
+    fireEvent.click(await screen.findByTestId(`chain-node-${ISSUE_1}`))
 
-    const drawer = screen.getByTestId("chain-drawer")
-    expect(drawer.getAttribute("data-kind")).toBe("issue")
-    expect(drawer.textContent).toContain("提交订单失败")
-    expect(drawer.textContent).toContain("待确认")
-    expect(drawer.textContent).toContain("严重")
-    expect(drawer.textContent).toContain("高")
+    const sheet = screen.getByTestId("chain-sheet")
+    expect(sheet.getAttribute("data-kind")).toBe("issue")
+    expect(sheet.textContent).toContain("提交订单失败")
+    expect(sheet.textContent).toContain("待确认")
+    expect(sheet.textContent).toContain("严重")
+    expect(sheet.textContent).toContain("高")
 
-    fireEvent.click(screen.getByTestId("chain-drawer-load-evidence"))
-    fireEvent.click(screen.getByTestId(`chain-drawer-evidence-${EVIDENCE}`))
+    fireEvent.click(screen.getByTestId("chain-sheet-load-evidence"))
+    fireEvent.click(screen.getByTestId(`chain-sheet-evidence-${EVIDENCE}`))
     expect(onOpenEvidence).toHaveBeenCalledWith(EVIDENCE)
 
-    fireEvent.click(screen.getByTestId("chain-drawer-open-issue"))
+    fireEvent.click(screen.getByTestId("chain-sheet-open-issue"))
     expect(onNavigate).toHaveBeenCalledWith({ kind: "issue", id: ISSUE_1 })
 
-    fireEvent.click(screen.getByTestId("chain-drawer-open-case"))
+    fireEvent.click(screen.getByTestId("chain-sheet-open-case"))
     expect(onNavigate).toHaveBeenCalledWith({ kind: "case", id: C2 })
   })
 
@@ -547,17 +570,17 @@ describe("ExplorationTab", () => {
     )
     const { onNavigate } = renderTab()
 
-    fireEvent.click(await screen.findByTestId(`chain-issue-node-${ISSUE_1}`))
+    fireEvent.click(await screen.findByTestId(`chain-node-${ISSUE_1}`))
 
     // The evidence read is keyed by caseRunId; without one the old button could
     // only ever resolve to "暂无可查看证据". Point at the issue page instead.
-    expect(screen.queryByTestId("chain-drawer-load-evidence")).toBeNull()
-    const hint = screen.getByTestId("chain-drawer-evidence-unavailable")
+    expect(screen.queryByTestId("chain-sheet-load-evidence")).toBeNull()
+    const hint = screen.getByTestId("chain-sheet-evidence-unavailable")
     expect(hint.textContent).toContain("无法加载证据")
     expect(hint.textContent).toContain("查看问题")
     expect(mocks.useCaseRun).toHaveBeenLastCalledWith(VERSION_ID, expect.anything(), "", STREAM)
 
-    fireEvent.click(screen.getByTestId("chain-drawer-open-issue"))
+    fireEvent.click(screen.getByTestId("chain-sheet-open-issue"))
     expect(onNavigate).toHaveBeenCalledWith({ kind: "issue", id: ISSUE_1 })
   })
 
@@ -579,7 +602,7 @@ describe("ExplorationTab", () => {
     )
     renderTab()
 
-    expect(await screen.findByTestId(`chain-issue-node-${ISSUE_1}`)).toBeTruthy()
+    expect(await screen.findByTestId(`chain-node-${ISSUE_1}`)).toBeTruthy()
     fireEvent.change(screen.getByTestId("chain-batch-filter"), { target: { value: "all" } })
 
     expect(mocks.useExplorationChain).toHaveBeenLastCalledWith(
@@ -772,15 +795,18 @@ describe("ExplorationTab", () => {
     renderTab()
 
     const aiNode = await screen.findByTestId(`chain-node-${C3}`)
-    const aiBadge = screen.getByTestId("chain-supplement-badge")
+    const aiCard = within(aiNode).getByTestId("chain-node-case")
+    expect(aiCard.getAttribute("data-source")).toBe("ai_supplement")
+    expect(aiCard.className).toContain("border-dashed")
+    const aiBadge = within(aiCard).getByTestId("chain-node-case-ai-badge")
     expect(aiBadge.textContent).toContain("AI")
-    expect(aiNode.querySelector("rect")?.getAttribute("stroke-dasharray")).toBe("6 4")
 
     const revalidationNode = screen.getByTestId(`chain-node-${C2}`)
-    const revalidationBadge = screen.getByTestId("chain-revalidation-badge")
+    const revalidationCard = within(revalidationNode).getByTestId("chain-node-case")
+    const revalidationBadge = within(revalidationCard).getByTestId("chain-node-case-revalidation")
     expect(revalidationBadge.textContent).toContain("需重验")
-    expect(revalidationNode.querySelector("rect")?.getAttribute("stroke")).toBe("#f59e0b")
-    expect(revalidationNode.getAttribute("data-revalidation")).toBe("true")
+    expect(revalidationCard.className).toContain("border-amber-500")
+    expect(revalidationCard.getAttribute("data-revalidation")).toBe("true")
   })
 
   it("lists issues without a case edge and links them to the issue page", async () => {
@@ -791,7 +817,10 @@ describe("ExplorationTab", () => {
             requirementNode(R1, "登录需求"),
             caseNode(C1, "登录成功", [R1]),
             issueNode(ISSUE_3, "缺少导出需求", {
-              caseNodeId: C1,
+              // An issue with a caseNodeId is attached by the read-model
+              // fallback even without an edge; only a truly orphan issue is
+              // listed as unlinked (layout priority, spec §5.1).
+              caseNodeId: undefined,
               caseRunId: undefined,
               category: "requirement_gap",
             }),
@@ -806,7 +835,7 @@ describe("ExplorationTab", () => {
     expect(list.textContent).toContain("缺少导出需求")
     fireEvent.click(screen.getByTestId(`chain-unlinked-issue-${ISSUE_3}`))
     expect(onNavigate).toHaveBeenCalledWith({ kind: "issue", id: ISSUE_3 })
-    expect(screen.queryByTestId(`chain-issue-node-${ISSUE_3}`)).toBeNull()
+    expect(screen.queryByTestId(`chain-node-${ISSUE_3}`)).toBeNull()
   })
 
   it("keeps the old data and marks the issue layer unavailable when a refresh fails", async () => {
@@ -817,7 +846,7 @@ describe("ExplorationTab", () => {
     const degraded = await screen.findByTestId("exploration-degraded")
     expect(degraded.textContent).toContain("无权限读取问题")
     // The chain itself still renders.
-    expect(screen.getByTestId("chain-graph")).toBeTruthy()
+    expect(await screen.findByTestId("chain-canvas")).toBeTruthy()
     const issueDegraded = screen.getByTestId("chain-issues-degraded")
     expect(issueDegraded.textContent).toContain("无权限读取问题")
     expect(screen.getByTestId("chain-issue-count").textContent).toContain("问题数据不可用")
@@ -898,32 +927,42 @@ describe("ExplorationTab", () => {
     expect(screen.getByTestId(`chain-node-${CR2}`)).toBeTruthy()
   })
 
-  it("collapses and expands a requirement group", async () => {
+  it("collapses and expands a requirement group from the keyboard tree", async () => {
     renderTab()
 
-    const toggle = await screen.findByTestId(`chain-toggle-${R1}`)
-    fireEvent.click(toggle)
+    const treeitem = await screen.findByTestId(`chain-treeitem-requirement:${R1}`)
+    expect(treeitem.getAttribute("aria-expanded")).toBe("true")
+    expect(screen.getByTestId(`chain-node-${C1}`)).toBeTruthy()
+
+    treeitem.focus()
+    fireEvent.keyDown(treeitem, { key: "ArrowLeft" })
 
     expect(screen.queryByTestId(`chain-node-${C1}`)).toBeNull()
     expect(screen.queryByTestId(`chain-node-${CR1}`)).toBeNull()
-    expect(screen.getByTestId(`chain-node-${R1}`).getAttribute("aria-expanded")).toBe("false")
+    const collapsed = screen.getByTestId(`chain-treeitem-requirement:${R1}`)
+    expect(collapsed.getAttribute("aria-expanded")).toBe("false")
 
-    fireEvent.click(screen.getByTestId(`chain-toggle-${R1}`))
+    fireEvent.keyDown(collapsed, { key: "ArrowRight" })
     expect(screen.getByTestId(`chain-node-${C1}`)).toBeTruthy()
     expect(screen.getByTestId(`chain-node-${CR1}`)).toBeTruthy()
   })
 
-  it("zooms and fits the hand-written SVG", async () => {
+  it("mounts a full-width React Flow canvas with its own zoom controls", async () => {
     renderTab()
-    await screen.findByTestId("chain-graph")
 
-    expect(screen.getByTestId("chain-graph").getAttribute("data-zoom")).toBe("1")
-    fireEvent.click(screen.getByTestId("chain-zoom-in"))
-    expect(screen.getByTestId("chain-graph").getAttribute("data-zoom")).toBe("1.25")
-    expect(screen.getByTestId("chain-zoom-level").textContent).toContain("125")
-
-    fireEvent.click(screen.getByTestId("chain-fit"))
-    expect(screen.getByTestId("chain-graph").getAttribute("data-zoom")).toBe("1")
+    const canvas = await screen.findByTestId("chain-canvas")
+    const workspace = screen.getByTestId("chain-workspace")
+    // Desktop 72vh / mobile 60vh with a 420px floor; the canvas fills it.
+    expect(workspace.className).toContain("h-[60vh]")
+    expect(workspace.className).toContain("min-h-[420px]")
+    expect(workspace.className).toContain("lg:h-[72vh]")
+    expect(canvas.className).toContain("h-full")
+    // Zoom/fit come from React Flow's own controls; the interactive unlock is
+    // never exposed on the read-only chain.
+    expect(canvas.querySelector(".react-flow__controls-zoomin")).not.toBeNull()
+    expect(canvas.querySelector(".react-flow__controls-zoomout")).not.toBeNull()
+    expect(canvas.querySelector(".react-flow__controls-fitview")).not.toBeNull()
+    expect(canvas.querySelector(".react-flow__controls-interactive")).toBeNull()
   })
 
   it("hides the result node when the server returns no result for the case", async () => {
@@ -966,31 +1005,65 @@ describe("ExplorationTab", () => {
 
     const empty = await screen.findByTestId("exploration-empty")
     expect(empty.textContent).toContain("暂无探索链路")
-    expect(screen.queryByTestId("chain-drawer")).toBeNull()
+    expect(screen.queryByTestId("chain-sheet")).toBeNull()
     expect(within(screen.getByTestId("exploration-tab")).queryByRole("tree")).toBeNull()
   })
 
   it("opens the Sheet from the deep-linked node and reports selection changes", async () => {
     const { onSelectedNodeChange } = renderTab({ selectedNodeId: `case:${C2}` })
 
-    const drawer = await screen.findByTestId("chain-drawer")
-    expect(drawer.getAttribute("data-kind")).toBe("case")
-    expect(drawer.textContent).toContain("提交订单")
+    const sheet = await screen.findByTestId("chain-sheet")
+    expect(sheet.getAttribute("data-kind")).toBe("case")
+    expect(sheet.textContent).toContain("提交订单")
 
-    fireEvent.click(screen.getByTestId("chain-drawer-close"))
+    fireEvent.click(screen.getByTestId("chain-sheet-close"))
     expect(onSelectedNodeChange).toHaveBeenLastCalledWith("")
 
-    fireEvent.click(screen.getByTestId(`chain-node-${C1}`))
+    fireEvent.click(await screen.findByTestId(`chain-node-${C1}`))
     expect(onSelectedNodeChange).toHaveBeenLastCalledWith(`case:${C1}`)
   })
 
   it("shows 节点不存在 for a stale deep-linked node instead of crashing", async () => {
     renderTab({ selectedNodeId: `case:${"9".repeat(18)}` })
 
-    await screen.findByTestId("chain-graph")
+    await screen.findByTestId("chain-canvas")
     const missing = screen.findByTestId("chain-node-missing")
     expect((await missing).textContent).toContain("节点不存在")
-    expect(screen.queryByTestId("chain-drawer")).toBeNull()
+    expect(screen.queryByTestId("chain-sheet")).toBeNull()
+  })
+
+  it("renders the legend and toolbar as canvas overlays", async () => {
+    renderTab()
+    await screen.findByTestId("chain-canvas")
+
+    expect(screen.getByTestId("chain-legend")).toBeTruthy()
+    expect(screen.getAllByTestId(/^chain-legend-node-/)).toHaveLength(4)
+    expect(screen.getAllByTestId(/^chain-legend-edge-/)).toHaveLength(5)
+    expect(screen.getByTestId("chain-toolbar")).toBeTruthy()
+    expect(
+      screen.getByTestId("chain-workspace").contains(screen.getByTestId("chain-toolbar")),
+    ).toBe(true)
+  })
+
+  it("switches to the keyboard-accessible list view", async () => {
+    renderTab()
+    await screen.findByTestId("chain-canvas")
+
+    fireEvent.click(screen.getByTestId("chain-toolbar-list"))
+
+    expect(screen.queryByTestId("chain-canvas")).toBeNull()
+    const list = await screen.findByTestId("chain-list-view")
+    expect(list.textContent).toContain("登录需求")
+    expect(list.textContent).toContain("提交订单")
+
+    const openCase = screen.getByTestId(`chain-list-open-${C2}`)
+    expect(openCase.tagName).toBe("BUTTON")
+    fireEvent.click(openCase)
+    expect((await screen.findByTestId("chain-sheet")).textContent).toContain("提交订单")
+    fireEvent.click(screen.getByTestId("chain-sheet-close"))
+
+    fireEvent.click(screen.getByTestId("chain-toolbar-list"))
+    expect(await screen.findByTestId("chain-canvas")).toBeTruthy()
   })
 
   it("reports filter changes so the page can sync the URL", async () => {

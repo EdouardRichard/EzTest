@@ -18,13 +18,18 @@ import {
   ReactFlowProvider,
 } from "@xyflow/react"
 import "@xyflow/react/dist/style.css"
-import { memo, useCallback, useMemo } from "react"
-
+import { memo, type ReactNode, useCallback, useMemo } from "react"
+import { ChainKeyboardTree } from "./ChainKeyboardTree"
 import type { LaidEdge, PositionedNode } from "./chain-layout"
 import { layoutChain } from "./chain-layout"
 import { CHAIN_COLOR_STYLES, NODE_KIND_TOKENS } from "./chain-tokens"
 import type { ChainNodeKindDTO, ChainSnapshot, ChainSnapshotNode } from "./chain-types"
-import { ChainEdge, type ChainFlowEdge, getChainEdgeMarkerColor } from "./edges/ChainEdge"
+import {
+  ChainEdge,
+  type ChainFlowEdge,
+  getChainEdgeLabel,
+  getChainEdgeMarkerColor,
+} from "./edges/ChainEdge"
 import { CaseNode } from "./nodes/CaseNode"
 import { IssueNode } from "./nodes/IssueNode"
 import { RequirementNode } from "./nodes/RequirementNode"
@@ -47,6 +52,8 @@ export type ChainCanvasProps = {
   onToggleCollapse?: (requirementId: string) => void
   /** Centres the viewport on the running result (Task 11 toolbar). */
   follow?: boolean
+  /** Esc on the keyboard tree; the tab closes the Sheet through this. */
+  onEscape?: () => void
 }
 
 /**
@@ -86,6 +93,47 @@ function ChainNodeAnchors() {
 
 type ChainNodeProps = NodeProps<ChainFlowNode>
 
+function domainIdOf(nodeId: string): string {
+  const separator = nodeId.indexOf(":")
+  return separator === -1 ? nodeId : nodeId.slice(separator + 1)
+}
+
+/**
+ * Per-node test/selection hook. React Flow owns the outer `.react-flow__node`
+ * element, so the tab's stable `chain-node-<domain id>` selector and the node's
+ * data attributes live on this content wrapper instead. It adds no size: the
+ * card inside owns the `CHAIN_CARD_SIZES` dimensions.
+ *
+ * `tabIndex={-1}` makes the wrapper programmatically focusable only: clicking
+ * a card focuses it before the Sheet opens, so the Sheet's focus-return goes
+ * back to the node the user actually triggered instead of `<body>`. It stays
+ * out of the Tab order; keyboard navigation lives in `ChainKeyboardTree`.
+ */
+function ChainNodeFrame({ data, children }: { data: ChainSnapshotNode; children: ReactNode }) {
+  return (
+    // biome-ignore lint/a11y/noStaticElementInteractions: React Flow owns the real interactive node; this wrapper only moves programmatic focus after a pointer click.
+    // biome-ignore lint/a11y/useKeyWithClickEvents: keyboard access is provided by the sibling ChainKeyboardTree, not this pointer-only wrapper.
+    <div
+      data-testid={`chain-node-${domainIdOf(data.id)}`}
+      data-node-id={data.id}
+      data-kind={data.kind}
+      data-status={data.status}
+      data-severity={data.kind === "issue" ? (data.severity ?? "") : undefined}
+      data-source={data.kind === "case" ? data.source : undefined}
+      data-revalidation={
+        data.kind === "case" && (data.revalidation === true || data.status === "needs_revalidation")
+          ? "true"
+          : undefined
+      }
+      tabIndex={-1}
+      className="focus:outline-none"
+      onClick={(event) => event.currentTarget.focus()}
+    >
+      {children}
+    </div>
+  )
+}
+
 /**
  * The four node types are the Task 9 cards plus the invisible anchors. No
  * wrapper adds width, height or padding; the card owns its `CHAIN_CARD_SIZES`
@@ -96,37 +144,37 @@ const ChainRequirementNode = memo(function ChainRequirementNode({
   selected,
 }: ChainNodeProps) {
   return (
-    <>
+    <ChainNodeFrame data={data}>
       <RequirementNode data={data} selected={selected} />
       <ChainNodeAnchors />
-    </>
+    </ChainNodeFrame>
   )
 })
 
 const ChainCaseNode = memo(function ChainCaseNode({ data, selected }: ChainNodeProps) {
   return (
-    <>
+    <ChainNodeFrame data={data}>
       <CaseNode data={data} selected={selected} />
       <ChainNodeAnchors />
-    </>
+    </ChainNodeFrame>
   )
 })
 
 const ChainResultNode = memo(function ChainResultNode({ data, selected }: ChainNodeProps) {
   return (
-    <>
+    <ChainNodeFrame data={data}>
       <ResultNode data={data} selected={selected} />
       <ChainNodeAnchors />
-    </>
+    </ChainNodeFrame>
   )
 })
 
 const ChainIssueNode = memo(function ChainIssueNode({ data, selected }: ChainNodeProps) {
   return (
-    <>
+    <ChainNodeFrame data={data}>
       <IssueNode data={data} selected={selected} />
       <ChainNodeAnchors />
-    </>
+    </ChainNodeFrame>
   )
 })
 
@@ -191,9 +239,15 @@ function buildFlowEdges(
   reducedMotion: boolean,
 ): ChainFlowEdge[] {
   return edges.map((edge) => {
+    const source = nodeById.get(edge.sourceId)
     const target = nodeById.get(edge.targetId)
     const targetStatus = target?.kind === "result" ? target.status : undefined
     const running = targetStatus === "running"
+    // React Flow falls back to an English "Edge from X to Y" aria-label; the
+    // localised one keeps the canvas free of untranslated screen-reader text.
+    const kindLabel = getChainEdgeLabel(edge.kind)
+    const sourceTitle = source?.title ?? edge.sourceId
+    const targetTitle = target?.title ?? edge.targetId
     return {
       id: edge.id,
       source: edge.sourceId,
@@ -201,6 +255,7 @@ function buildFlowEdges(
       type: "chain",
       data: { kind: edge.kind, targetStatus },
       animated: running && !reducedMotion,
+      ariaLabel: `${kindLabel === "" ? "链路关系" : kindLabel}：${sourceTitle} → ${targetTitle}`,
       markerEnd: {
         type: MarkerType.ArrowClosed,
         color: getChainEdgeMarkerColor(edge.kind, targetStatus),
@@ -222,6 +277,7 @@ function ChainCanvasFlow({
   collapsed,
   onToggleCollapse,
   follow = false,
+  onEscape,
 }: ChainCanvasProps) {
   const reducedMotion = usePrefersReducedMotion()
 
@@ -271,6 +327,13 @@ function ChainCanvasFlow({
   const handleNodeClick = useCallback<NodeMouseHandler<ChainFlowNode>>(
     (_event, node) => {
       onSelect?.(node.id)
+    },
+    [onSelect],
+  )
+
+  const handleKeyboardSelect = useCallback(
+    (nodeId: string): void => {
+      onSelect?.(nodeId)
     },
     [onSelect],
   )
@@ -327,6 +390,16 @@ function ChainCanvasFlow({
         {/* No interactive lock: it would turn dragging/connecting/selection back on. */}
         <Controls showInteractive={false} />
       </ReactFlow>
+      {/* The canvas is visual-only: this tree is the keyboard/screen-reader
+          contract (roving focus + ARIA levels), while React Flow keeps
+          nodesFocusable/edgesFocusable=false. */}
+      <ChainKeyboardTree
+        nodes={layout.nodes}
+        selectedId={selectedId}
+        onSelect={handleKeyboardSelect}
+        onToggleCollapse={onToggleCollapse}
+        onEscape={onEscape}
+      />
       {follow ? (
         <div
           data-testid="chain-follow-status"
