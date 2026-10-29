@@ -7,8 +7,9 @@ image and a single-instance Docker Compose file with PostgreSQL 17.
 > **Validation status:** Docker is not installed on the development host, so the
 > images have never been built and the Compose stack has never been started
 > there. Only static validation is performed:
-> `cd frontend && node scripts/validate-compose.mjs` (and the Compose contract in
-> `scripts/acceptance.ps1 -StaticOnly`). Do not report the Compose deployment as
+> `cd frontend && node scripts/validate-compose.mjs`, `scripts/check-docs.ps1`
+> (the P8 documentation/OpenAPI/Compose contract) and the Compose contract in
+> `scripts/acceptance.ps1 -StaticOnly`. Do not report the Compose deployment as
 > "verified" — it is delivered and statically checked, not run. See
 > `../docs/deployment.md` for the full deployment/runbook guidance.
 
@@ -55,6 +56,8 @@ passes the repository `.env` to the API container with `env_file`.
 | `EZTEST_GC_ENABLED` / `RETENTION_DAYS` / `BATCH_KEEP` | api | P8 evidence GC (default false / 30 / 3); non-dry-run requires `true`. |
 | `EZTEST_INSTANCE_ID` / `EZTEST_LEADER_LOCK_KEY` | api | Multi-instance leader lock; instance id must be unique, lock key shared. |
 | `EZTEST_KNOWLEDGE_MAX_INJECT` / `MAX_BYTES` | api | P8 knowledge injection budgets (default 5 / 4096). |
+| `EZTEST_VISUAL_BASELINE_MAX_BYTES` | api + executor process | P8 approved visual baseline / comparison cap, 64 KiB-20 MiB, default `5242880` (5 MiB). The API reads it; a host-launched executor reads it too. The Compose executor service does not receive it yet and runs with the 5 MiB default, so extend the executor environment to change its request cap. |
+| `EZTEST_VISUAL_DIFF_THRESHOLD` | api (reserved) | **Reserved:** not read by the current build; the threshold is stored per visual assertion (0-0.1, default 0.005). |
 
 Other `EZTEST_*` values from `.env` are passed through unchanged; Compose
 overrides `EZTEST_DATABASE_URL`, `EZTEST_HTTP_ADDR`, `EZTEST_OPENAPI_PATH` and the
@@ -168,14 +171,22 @@ node scripts/validate-compose.mjs
 ```
 
 The script uses the `yaml` dev dependency to assert services
-`api`/`web`/`postgres`/`executor`, published ports, health checks, the
+`api`/`web`/`postgres`/`executor`, published ports (the executor publishes none
+and exposes only the internal `13336`), health checks on all four services, the
 `pgdata`/`objects`/`attachments`/`evidence`/`reports`/`exports` volumes and the
-`depends_on` / `service_healthy` ordering. It fails with exit code 1 and a list of
-problems. It does not need or contact a Docker daemon. The broader static gate is:
+api mounts for `objects`/`attachments`/`evidence`/`reports`/`exports`, the
+`depends_on` / `service_healthy` ordering, and that the three Dockerfiles exist
+(`deploy/Dockerfile.api`, `deploy/Dockerfile.web`, `executor/Dockerfile`). It
+fails with exit code 1 and a list of problems. It does not need or contact a
+Docker daemon. The broader static gate is:
 
 ```powershell
 cd ..
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/check-docs.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1 -StaticOnly
 ```
 
+`scripts/check-docs.ps1` additionally asserts the four P8 documentation
+categories, the OpenAPI YAML and its key P8 paths, the README/`.env.example`
+environment keys and that the tracked documentation contains no secrets.
 Neither check builds an image or starts a container.

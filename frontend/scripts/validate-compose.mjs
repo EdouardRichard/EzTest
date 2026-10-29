@@ -3,11 +3,11 @@
 //
 // Docker is intentionally not required on this host: the script only parses the
 // YAML document and asserts the deployment contract (services, published ports,
-// health checks, named volumes and startup ordering). It never talks to a
-// container runtime, so passing it must not be reported as "Compose verified by
-// running it".
+// health checks, named volumes, api volume mounts and startup ordering, plus the
+// presence of the Dockerfiles each service builds). It never talks to a container
+// runtime, so passing it must not be reported as "Compose verified by running it".
 
-import { readFileSync } from "node:fs"
+import { existsSync, readFileSync } from "node:fs"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { parse } from "yaml"
@@ -85,21 +85,27 @@ const services = document?.services ?? {}
 const api = service("api", services)
 const web = service("web", services)
 const postgres = service("postgres", services)
+const executor = service("executor", services)
 
-for (const name of ["api", "web", "postgres"]) {
+for (const name of ["api", "web", "postgres", "executor"]) {
   check(Boolean(services[name]), `services.${name} is missing`)
 }
 
 check(portSpecs(api).includes("13333:13333"), "api must publish 13333:13333")
 check(portSpecs(web).includes("6868:6868"), "web must publish 6868:6868")
 check(portSpecs(postgres).includes("5433:5432"), "postgres must publish 5433:5432")
+check(portSpecs(executor).length === 0, "executor must not publish any host port")
+check(
+  (executor.expose ?? []).map(String).includes("13336"),
+  "executor must expose 13336 to the internal network",
+)
 
 check(
   String(postgres.image ?? "").startsWith("postgres:17"),
   "postgres must use the postgres:17 image",
 )
 
-for (const [name, svc] of Object.entries({ api, web, postgres })) {
+for (const [name, svc] of Object.entries({ api, web, postgres, executor })) {
   const healthcheck = svc.healthcheck ?? {}
   const test = healthcheck.test
   const hasTest = Array.isArray(test)
@@ -111,40 +117,56 @@ for (const [name, svc] of Object.entries({ api, web, postgres })) {
 }
 
 const volumeNames = new Set(Object.keys(document?.volumes ?? {}))
-check(volumeNames.has("pgdata"), "top-level volume pgdata is missing")
-check(volumeNames.has("objects"), "top-level volume objects is missing")
-check(volumeNames.has("attachments"), "top-level volume attachments is missing")
+for (const requiredVolume of [
+  "pgdata",
+  "objects",
+  "attachments",
+  "evidence",
+  "reports",
+  "exports",
+]) {
+  check(volumeNames.has(requiredVolume), `top-level volume ${requiredVolume} is missing`)
+}
 
 const postgresMounts = mountTargets(postgres)
 check(
-  postgresMounts.some((mount) => mount.source === "pgdata"),
-  "postgres must mount the pgdata volume",
+  postgresMounts.some(
+    (mount) => mount.source === "pgdata" && mount.target === "/var/lib/postgresql/data",
+  ),
+  "postgres must mount the pgdata volume at /var/lib/postgresql/data",
 )
 const apiMounts = mountTargets(api)
-check(
-  apiMounts.some((mount) => mount.source === "objects" && mount.target === "/data/objects"),
-  "api must mount the objects volume at /data/objects",
-)
-check(
-  apiMounts.some(
-    (mount) => mount.source === "attachments" && mount.target === "/data/version-attachments",
-  ),
-  "api must mount the attachments volume at /data/version-attachments",
-)
+for (const [volume, target] of [
+  ["objects", "/data/objects"],
+  ["attachments", "/data/version-attachments"],
+  ["evidence", "/data/evidence"],
+  ["reports", "/data/reports"],
+  ["exports", "/data/exports"],
+]) {
+  check(
+    apiMounts.some((mount) => mount.source === volume && mount.target === target),
+    `api must mount the ${volume} volume at ${target}`,
+  )
+}
 
 check(hasHealthyDependency(api, "postgres"), "api must depend_on postgres (service_healthy)")
 check(hasHealthyDependency(web, "api"), "web must depend_on api (service_healthy)")
 
 const apiEnvironment = environmentKeys(api)
-check(
-  apiEnvironment.includes("EZTEST_DATABASE_URL"),
-  "api environment must define EZTEST_DATABASE_URL",
-)
-check(apiEnvironment.includes("EZTEST_WEB_ORIGIN"), "api environment must define EZTEST_WEB_ORIGIN")
-check(
-  apiEnvironment.includes("EZTEST_VERSION_ATTACHMENT_DIR"),
-  "api environment must define EZTEST_VERSION_ATTACHMENT_DIR",
-)
+for (const requiredKey of [
+  "EZTEST_DATABASE_URL",
+  "EZTEST_WEB_ORIGIN",
+  "EZTEST_VERSION_ATTACHMENT_DIR",
+  "EZTEST_EVIDENCE_DIR",
+  "EZTEST_REPORT_DIR",
+  "EZTEST_EXPORT_DIR",
+]) {
+  check(apiEnvironment.includes(requiredKey), `api environment must define ${requiredKey}`)
+}
+const executorEnvironment = environmentKeys(executor)
+for (const requiredKey of ["EZTEST_EXECUTOR_ADDR", "EZTEST_EXECUTOR_TOKEN"]) {
+  check(executorEnvironment.includes(requiredKey), `executor environment must define ${requiredKey}`)
+}
 
 check(
   String(api.build?.dockerfile ?? "").includes("Dockerfile.api"),
@@ -154,6 +176,17 @@ check(
   String(web.build?.dockerfile ?? "").includes("Dockerfile.web"),
   "web build must use deploy/Dockerfile.web",
 )
+check(
+  String(executor.build?.dockerfile ?? "").includes("Dockerfile"),
+  "executor build must use the executor Dockerfile",
+)
+for (const dockerfile of [
+  "deploy/Dockerfile.api",
+  "deploy/Dockerfile.web",
+  "executor/Dockerfile",
+]) {
+  check(existsSync(path.join(repoRoot, dockerfile)), `build file ${dockerfile} is missing`)
+}
 
 if (problems.length > 0) {
   console.error(`compose validation failed (${problems.length} problem(s)): ${composePath}`)
@@ -165,5 +198,6 @@ if (problems.length > 0) {
 
 console.log(`compose validation passed: ${composePath}`)
 console.log(
-  "services: api (13333), web (6868), postgres (5433); health checks, volumes and order OK",
+  "services: api (13333), web (6868), postgres (5433), executor (internal 13336); health checks, " +
+    "P8 volumes/mounts and order OK",
 )
