@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // LLMSeed is the optional first-boot LLM configuration, used to seed the
@@ -108,6 +110,12 @@ type Config struct {
 	GCEnabled       bool
 	GCRetentionDays int
 	GCBatchKeep     int
+	// P8 multi-instance leader lock (design spec §10.5). InstanceID identifies
+	// this API process in the startup/shutdown and lock diagnostics. It
+	// defaults to hostname+pid and is capped at 64 characters. LeaderLockKey is
+	// the PostgreSQL advisory lock key every API instance shares.
+	InstanceID    string
+	LeaderLockKey int64
 
 	EnableTestEndpoints bool
 	LogLevel            slog.Level
@@ -205,6 +213,11 @@ const (
 	defaultGCBatchKeep     = 3
 	minGCBatchKeep         = 1
 	maxGCBatchKeep         = 50
+	// defaultLeaderLockKey is the stable PostgreSQL advisory lock key of the
+	// multi-instance leader election (design spec §10.5/§11.4).
+	defaultLeaderLockKey int64 = 1163411512
+	// maxInstanceIDLength bounds EZTEST_INSTANCE_ID, characters not bytes.
+	maxInstanceIDLength = 64
 )
 
 // P7 delivery defaults and bounds from design spec §16.1/D30.
@@ -454,6 +467,18 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 	cfg.GCBatchKeep = gcBatchKeep
 
+	cfg.InstanceID = valueOr(getenv, "EZTEST_INSTANCE_ID", defaultInstanceID())
+	if count := utf8.RuneCountInString(cfg.InstanceID); count > maxInstanceIDLength {
+		return Config{}, fmt.Errorf(
+			"config: EZTEST_INSTANCE_ID must be at most %d characters, got %d",
+			maxInstanceIDLength, count)
+	}
+	leaderLockKey, err := parseLeaderLockKey(getenv("EZTEST_LEADER_LOCK_KEY"))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.LeaderLockKey = leaderLockKey
+
 	keys, err := parseSecretKeys(getenv("EZTEST_SECRET_KEYS"))
 	if err != nil {
 		return Config{}, err
@@ -499,6 +524,46 @@ func valueOr(getenv func(string) string, key, def string) string {
 		return v
 	}
 	return def
+}
+
+// defaultInstanceID returns the hostname+pid identity used when
+// EZTEST_INSTANCE_ID is not configured (design spec §10.5).
+func defaultInstanceID() string {
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = ""
+	}
+	return instanceIDFor(strings.TrimSpace(hostname), os.Getpid())
+}
+
+// instanceIDFor builds a bounded hostname+pid identity. The pid suffix that
+// distinguishes co-located instances is always preserved; an over-long
+// hostname is truncated so the result never exceeds maxInstanceIDLength.
+func instanceIDFor(hostname string, pid int) string {
+	suffix := fmt.Sprintf("-%d", pid)
+	maxHost := maxInstanceIDLength - utf8.RuneCountInString(suffix)
+	if maxHost < 0 {
+		maxHost = 0
+	}
+	runes := []rune(hostname)
+	if len(runes) > maxHost {
+		hostname = string(runes[:maxHost])
+	}
+	return hostname + suffix
+}
+
+// parseLeaderLockKey parses EZTEST_LEADER_LOCK_KEY as a signed 64-bit
+// PostgreSQL advisory lock key. An unset value selects the default key.
+func parseLeaderLockKey(raw string) (int64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return defaultLeaderLockKey, nil
+	}
+	key, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("config: EZTEST_LEADER_LOCK_KEY must be a 64-bit integer, got %q", raw)
+	}
+	return key, nil
 }
 
 // parseAgentHTTPAllowlist parses the comma-separated http.get host allowlist.
