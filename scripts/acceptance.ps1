@@ -391,10 +391,13 @@ function Test-AdminAudit {
     $items = @($audit.data)
     if ($items.Count -eq 0) { throw "audit list is empty after the E2E run" }
 
-    $actions = @($items | ForEach-Object { [string]$_.action })
     foreach ($expected in @("auth.login_succeeded", "user.created", "sse.test_published")) {
-        if ($actions -notcontains $expected) {
-            throw "audit list is missing action '$expected'"
+        $encodedAction = [System.Uri]::EscapeDataString($expected)
+        $filtered = Invoke-RestMethod -Uri "$apiBaseUrl/api/admin/audit?action=$encodedAction&limit=5" -Headers $headers -TimeoutSec 20
+        $filteredItems = @($filtered.data)
+        $matchedItems = @($filteredItems | Where-Object { [string]$_.action -eq $expected })
+        if ($matchedItems.Count -eq 0) {
+            throw "audit action '$expected' is missing: filtered query returned=$($filteredItems.Count), has_more=$([bool]$filtered.has_more), latest_page_total=$($items.Count)"
         }
     }
 
