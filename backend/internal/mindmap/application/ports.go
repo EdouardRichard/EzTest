@@ -398,6 +398,23 @@ type RequirementReader interface {
 	ListRelations(ctx context.Context, versionID int64) ([]RelationSnapshot, error)
 }
 
+// KnowledgeSection is the rendered "版本知识" prompt segment of the version
+// (spec §9.4). Refs lists the approved knowledge ids that made it into Text;
+// Truncated reports that the configured count/byte budget cut the list.
+type KnowledgeSection struct {
+	Text      string
+	Refs      []int64
+	Truncated bool
+}
+
+// KnowledgeReader is the read-only approved-knowledge port consumed before a
+// design run starts. The P3 knowledge service adapts itself to it; the mindmap
+// context never reads the knowledge table directly. Implementations must return
+// only approved entries and apply the injection budget.
+type KnowledgeReader interface {
+	ApprovedKnowledgeSection(ctx context.Context, versionID int64) (KnowledgeSection, error)
+}
+
 // CatalogGateway is the P2 resource catalog port. The mindmap context reads
 // environments/app models and imports explored app model nodes (admin-only,
 // spec §6.9).

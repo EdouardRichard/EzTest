@@ -14,6 +14,7 @@ import type {
   IssueSummary,
   ReportContentRequirement,
 } from "@/features/delivery/types"
+import { KnowledgePanel } from "@/features/knowledge/KnowledgePanel"
 import { ApiError } from "@/lib/api-client"
 
 import { getIncrementalPlan } from "./api"
@@ -576,6 +577,8 @@ export function OverviewTab({
           ) : null}
         </section>
       </div>
+
+      <KnowledgePanel versionId={version.id} />
 
       <Link
         href={`/versions/${version.id}/mindmap`}

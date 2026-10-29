@@ -3,6 +3,8 @@
 import { Bell } from "lucide-react"
 import { useEffect, useRef, useState } from "react"
 
+import { useAuth } from "@/features/auth/AuthProvider"
+
 import { TodoPanel } from "./TodoPanel"
 import { useTodos } from "./useTodos"
 
@@ -13,7 +15,9 @@ import { useTodos } from "./useTodos"
  * the panel, never blocking the shell.
  */
 export function TodoButton() {
-  const { todos, loading, error, refresh } = useTodos()
+  // Administrators additionally review draft knowledge entries (spec §9.4).
+  const { user } = useAuth()
+  const { todos, loading, error, refresh } = useTodos(user?.role === "admin")
   const [open, setOpen] = useState(false)
   const containerRef = useRef<HTMLDivElement>(null)
 

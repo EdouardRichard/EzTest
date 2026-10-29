@@ -5,13 +5,27 @@ import type { TodoSnapshot } from "./useTodos"
 
 const mocks = vi.hoisted(() => ({
   useTodos: vi.fn(),
+  useAuth: vi.fn(),
 }))
 
 vi.mock("./useTodos", () => ({
   useTodos: mocks.useTodos,
 }))
 
+vi.mock("@/features/auth/AuthProvider", () => ({
+  useAuth: mocks.useAuth,
+}))
+
 import { TodoButton } from "./TodoButton"
+
+function authState(role: "admin" | "user") {
+  return {
+    user: { id: 2, username: "qa01", role, status: "active" },
+    loading: false,
+    login: vi.fn(),
+    logout: vi.fn(),
+  }
+}
 
 const SNAPSHOT: TodoSnapshot = {
   items: [
@@ -44,6 +58,8 @@ function baseState() {
 beforeEach(() => {
   mocks.useTodos.mockReset()
   mocks.useTodos.mockReturnValue(todoState())
+  mocks.useAuth.mockReset()
+  mocks.useAuth.mockReturnValue(authState("user"))
 })
 
 afterEach(cleanup)
@@ -91,5 +107,15 @@ describe("TodoButton", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "关闭待办中心" }))
     expect(screen.queryByRole("dialog", { name: "待办中心" })).toBeNull()
+  })
+
+  it("requests the admin knowledge review queue only for administrators", () => {
+    render(<TodoButton />)
+    expect(mocks.useTodos).toHaveBeenLastCalledWith(false)
+    cleanup()
+
+    mocks.useAuth.mockReturnValue(authState("admin"))
+    render(<TodoButton />)
+    expect(mocks.useTodos).toHaveBeenLastCalledWith(true)
   })
 })

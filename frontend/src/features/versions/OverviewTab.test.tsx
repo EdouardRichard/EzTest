@@ -16,6 +16,13 @@ vi.mock("@/features/delivery/hooks/useReports", () => ({
 }))
 vi.mock("@/features/code-intel/api", () => ({ getLatestAnalysis: mocks.getLatestAnalysis }))
 vi.mock("./api", () => ({ getIncrementalPlan: mocks.getIncrementalPlan }))
+// The knowledge entry owns its own data reads; the overview test only proves the
+// version entry point is mounted with the version id.
+vi.mock("@/features/knowledge/KnowledgePanel", () => ({
+  KnowledgePanel: ({ versionId }: { versionId: string }) => (
+    <div data-testid="knowledge-panel-stub">{versionId}</div>
+  ),
+}))
 
 import type { IssueSummary, ReportDetail } from "@/features/delivery/types"
 
@@ -297,6 +304,9 @@ describe("OverviewTab", () => {
     const mindmapLink = screen.getByTestId("overview-open-mindmap")
     expect(mindmapLink.getAttribute("href")).toBe(`/versions/${VERSION_ID}/mindmap`)
     expect(mindmapLink.textContent).toContain("用例脑图")
+
+    // The version overview carries the knowledge entry (spec §9.4).
+    expect(screen.getByTestId("knowledge-panel-stub").textContent).toBe(VERSION_ID)
   })
 
   it("renders the coverage matrix summary and batch timeline with kind labels", () => {

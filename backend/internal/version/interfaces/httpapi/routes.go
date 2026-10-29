@@ -115,6 +115,16 @@ type ClarificationMessagesReader interface {
 	Messages(ctx context.Context, agentSessionID, beforeID int64, limit int) ([]versionapp.AgentMessage, bool, error)
 }
 
+// KnowledgeService is the version knowledge application port consumed by the
+// HTTP layer (spec §9.4/§11.1). *application.KnowledgeService implements it.
+type KnowledgeService interface {
+	Create(ctx context.Context, versionID int64, input versionapp.CreateKnowledgeInput, actor int64) (*versionapp.KnowledgeEntry, error)
+	Update(ctx context.Context, versionID, knowledgeID int64, input versionapp.UpdateKnowledgeInput, actor int64, admin bool) (*versionapp.KnowledgeEntry, error)
+	Review(ctx context.Context, versionID, knowledgeID int64, input versionapp.ReviewKnowledgeInput, actor int64) (*versionapp.KnowledgeEntry, error)
+	List(ctx context.Context, versionID int64, status, kind string, page domain.Page) ([]versionapp.KnowledgeEntry, bool, error)
+	ListGlobal(ctx context.Context, versionID *int64, status, kind string, page domain.Page) ([]versionapp.KnowledgeEntry, bool, error)
+}
+
 // EventSnapshotter is the eventing read use case of the version events
 // endpoint. *eventing/application.Service implements it; T16 passes it here.
 type EventSnapshotter interface {
@@ -132,6 +142,7 @@ var (
 	_ RelationService      = (*versionapp.RelationService)(nil)
 	_ AttachmentService    = (*versionapp.AttachmentService)(nil)
 	_ ClarificationService = (*versionapp.ClarificationService)(nil)
+	_ KnowledgeService     = (*versionapp.KnowledgeService)(nil)
 )
 
 // Handlers groups the version context's HTTP handlers so the composition root
@@ -146,6 +157,7 @@ type Handlers struct {
 	Clarification *ClarificationHandler
 	Questions     *QuestionHandler
 	Decisions     *DecisionHandler
+	Knowledge     *KnowledgeHandler
 	Events        *EventHandler
 	Stream        *VersionStreamHandler
 }
@@ -166,6 +178,9 @@ type HandlersDeps struct {
 
 	Clarification         ClarificationService
 	ClarificationMessages ClarificationMessagesReader
+	// Knowledge is the version knowledge use case. When nil, the knowledge
+	// routes are not mounted (spec §9.4).
+	Knowledge KnowledgeService
 	// AIReady probes the AI runtime (LLM configured, tools supported, capacity)
 	// before the four endpoints that start an agent run. A returned error is
 	// mapped to 503 unavailable/ai_unavailable (retryable, spec §8.6). Nil means
@@ -221,6 +236,9 @@ func NewHandlers(deps HandlersDeps) *Handlers {
 	if deps.Events != nil {
 		handlers.Events = &EventHandler{versions: deps.Versions, events: deps.Events}
 	}
+	if deps.Knowledge != nil {
+		handlers.Knowledge = &KnowledgeHandler{knowledge: deps.Knowledge}
+	}
 	if deps.Versions != nil && deps.EventReader != nil && deps.EventSubscriber != nil {
 		handlers.Stream = NewVersionStreamHandler(deps.Versions, deps.EventReader, deps.EventSubscriber, deps.SSEHeartbeat)
 	}
@@ -256,6 +274,9 @@ func RegisterRoutes(mux *http.ServeMux, handlers Handlers) {
 	}
 	if handlers.Decisions != nil {
 		handlers.Decisions.RegisterRoutes(mux)
+	}
+	if handlers.Knowledge != nil {
+		handlers.Knowledge.RegisterRoutes(mux)
 	}
 	if handlers.Events != nil {
 		handlers.Events.RegisterRoutes(mux)

@@ -94,3 +94,24 @@ type ClarificationRepository interface {
 	ListDecisions(ctx context.Context, f DecisionFilter) ([]Decision, bool, error)
 	UpdateDecision(ctx context.Context, d *Decision, fromStatus string) error
 }
+
+// KnowledgeRepository is the persistence port for version knowledge entries.
+// UpdateContent and Review are revision compare-and-swap operations: a missing
+// row is a not-found, a non-draft row a knowledge_state_conflict and a stale
+// revision a knowledge_revision_conflict.
+type KnowledgeRepository interface {
+	Create(ctx context.Context, e *KnowledgeEntry) error
+	Get(ctx context.Context, id int64) (*KnowledgeEntry, error)
+	// List returns one page of a version's entries ordered by id ascending. The
+	// repository fills VersionName from the owning version row.
+	List(ctx context.Context, f KnowledgeFilter) ([]KnowledgeEntry, bool, error)
+	// ListGlobal returns one page of the cross-version read ordered by id
+	// ascending. An empty filter.Status means approved only.
+	ListGlobal(ctx context.Context, f GlobalKnowledgeFilter) ([]KnowledgeEntry, bool, error)
+	// ListApproved returns up to limit approved entries of one version ordered by
+	// id ascending. It is the injection read; it never returns draft/rejected
+	// rows.
+	ListApproved(ctx context.Context, versionID int64, limit int) ([]KnowledgeEntry, error)
+	UpdateContent(ctx context.Context, e *KnowledgeEntry, expectedRevision int) error
+	Review(ctx context.Context, e *KnowledgeEntry, expectedRevision int) error
+}
