@@ -75,7 +75,7 @@ export default function LoginPage() {
 
         <div className="relative max-w-md">
           <p className="text-[11px] font-semibold uppercase tracking-[0.24em] text-sky-300/80">
-            P0 · Foundation
+            P8 · Hardening
           </p>
           <h1 className="mt-4 text-4xl font-semibold leading-[1.15] tracking-tight text-white">
             把 AI 测试的执行过程，

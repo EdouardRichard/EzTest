@@ -6,8 +6,9 @@
 .DESCRIPTION
     Asserts:
       - .gitignore lists .data/ and backend/.data/, and git actually ignores them.
-      - All sources under frontend/src contain none of the stale P0 copy strings,
-        and the shell sources use the P8 copy instead.
+      - All sources under frontend/src contain none of the stale P0 copy strings
+        (including page-level badges and footer labels), and the shell sources
+        use the P8 copy instead.
       - nav-items.ts no longer carries a phase: "P0" badge, and the login footer
         shows P8 rather than P0.
       - The scratch spec docs/superpowers/specs/Untitled-1.md has been archived
@@ -78,9 +79,14 @@ if (-not (Test-Path -LiteralPath $gitignorePath -PathType Leaf)) {
 # 2. Copy: no stale P0 labels anywhere under frontend/src; shell uses P8 copy.
 $srcRoot = Join-Path $repoRoot "frontend/src"
 $p0Copy = @(
+    "P0 · 平台地基",
+    "P0 平台地基",
     "P0 · 地基版本",
     "P0 地基运行中",
-    "P0 平台地基"
+    "P0 · Foundation",
+    ">P0 地基<",
+    # Badge-text form only: case priority enums ("P0") and "P0 紧急" must not trip this.
+    ">P0<"
 )
 $p8Copy = @(
     @{ File = "Topbar.tsx"; Text = "P8 · 体验硬化" },

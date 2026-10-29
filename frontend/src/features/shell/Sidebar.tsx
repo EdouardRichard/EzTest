@@ -56,7 +56,7 @@ export function Sidebar() {
                 <span
                   className={cn(
                     "rounded-full border px-1.5 py-0.5 text-[10px] font-medium leading-none",
-                    item.phase === "P0"
+                    item.phase === "P8"
                       ? "border-emerald-400/25 bg-emerald-400/10 text-emerald-300"
                       : "border-white/10 bg-white/[0.04] text-sidebar-muted",
                   )}

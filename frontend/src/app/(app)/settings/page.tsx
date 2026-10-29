@@ -74,7 +74,7 @@ export default function SettingsPage() {
         <div>
           <div className="flex items-center gap-2">
             <h1 className="text-2xl font-semibold tracking-tight">设置</h1>
-            <StatusBadge variant="info">P0</StatusBadge>
+            <StatusBadge variant="info">P8</StatusBadge>
           </div>
           <p className="mt-1 text-sm text-muted-foreground">
             账户信息、主题偏好，以及管理员可见的用户、LLM 与 SSE 测试面板。
