@@ -580,7 +580,7 @@ try {
             })
             $phases = @(
                 @{ Label = "existing suite (P0-P6)"; Files = $bulkSpecs },
-                @{ Label = "P8 exploration-chain suite"; Files = $p8Specs },
+                @{ Label = "P8 cross-wave suite (shell/version/management/quality/chain)"; Files = $p8Specs },
                 @{ Label = "P7 autonomous-loop suite"; Files = $p7Specs },
                 @{ Label = "execution suite (owns the executor shutdown)"; Files = $executionSpecs }
             )
