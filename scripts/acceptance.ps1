@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
 .SYNOPSIS
     Runs the P0-P8 acceptance gate for EzTest.
@@ -2064,9 +2064,9 @@ try {
                     throw "missing P0/P1 deliverable $relative"
                 }
             }
-            $readme = Get-Content -LiteralPath (Join-Path $repoRoot "README.md") -Raw
+            $readme = Get-Content -LiteralPath (Join-Path $repoRoot "DEVELOPMENT_STATUS.md") -Raw
             if ($readme -notmatch "EZTEST_OPENAPI_PATH") {
-                throw "README raw go-run instructions do not document EZTEST_OPENAPI_PATH"
+                throw "DEVELOPMENT_STATUS raw go-run instructions do not document EZTEST_OPENAPI_PATH"
             }
             $openapi = Get-Content -LiteralPath (Join-Path $repoRoot "docs/openapi/api.yaml") -Raw
             foreach ($needle in @(
@@ -2105,7 +2105,7 @@ try {
         })
 
     [void](Invoke-Check -Dod "P3" -CheckName "P3 deliverables and OpenAPI/SSE contract" -Body {
-            $readme = Get-Content -LiteralPath (Join-Path $repoRoot "README.md") -Raw
+            $readme = Get-Content -LiteralPath (Join-Path $repoRoot "DEVELOPMENT_STATUS.md") -Raw
             foreach ($needle in @(
                     "/versions",
                     "EZTEST_VERSION_ATTACHMENT_DIR",
@@ -2114,7 +2114,7 @@ try {
                     "scripts/acceptance.ps1"
                 )) {
                 if ($readme -notmatch [regex]::Escape($needle)) {
-                    throw "README.md is missing P3 keyword $needle"
+                    throw "DEVELOPMENT_STATUS.md is missing P3 keyword $needle"
                 }
             }
 
@@ -2248,7 +2248,7 @@ try {
         })
 
     [void](Invoke-Check -Dod "P4" -CheckName "P4 deliverables, OpenAPI, fake LLM and migration contract" -Body {
-            $readme = Get-Content -LiteralPath (Join-Path $repoRoot "README.md") -Raw
+            $readme = Get-Content -LiteralPath (Join-Path $repoRoot "DEVELOPMENT_STATUS.md") -Raw
             foreach ($needle in @(
                     "EZTEST_CODEINTEL_MAX_CHANGED_FILES",
                     "EZTEST_CODEINTEL_PROMPT_VERSION",
@@ -2263,7 +2263,7 @@ try {
                     "read-only"
                 )) {
                 if ($readme -notmatch [regex]::Escape($needle)) {
-                    throw "README.md is missing P4 keyword $needle"
+                    throw "DEVELOPMENT_STATUS.md is missing P4 keyword $needle"
                 }
             }
 
@@ -2558,7 +2558,7 @@ try {
                 }
             }
 
-            $readme = Get-Content -LiteralPath (Join-Path $repoRoot "README.md") -Raw
+            $readme = Get-Content -LiteralPath (Join-Path $repoRoot "DEVELOPMENT_STATUS.md") -Raw
             foreach ($needle in @(
                     "P5",
                     "/mindmap",
@@ -2572,7 +2572,7 @@ try {
                     "readonly"
                 )) {
                 if ($readme -notmatch [regex]::Escape($needle)) {
-                    throw "README.md is missing P5 keyword $needle"
+                    throw "DEVELOPMENT_STATUS.md is missing P5 keyword $needle"
                 }
             }
 
@@ -3371,11 +3371,11 @@ writeFileSync(process.argv[3], JSON.stringify({
                 )) {
                 if ($envTemplate -notmatch [regex]::Escape($p6Var)) { throw ".env.example is missing P6 variable $p6Var" }
             }
-            $readme = Get-Content -LiteralPath (Join-Path $repoRoot "README.md") -Raw
+            $readme = Get-Content -LiteralPath (Join-Path $repoRoot "DEVELOPMENT_STATUS.md") -Raw
             foreach ($needle in @("P6", "EZTEST_EXECUTOR_URL", "acceptance-execution-llm.ps1", ".tmp/p6-evidence")) {
-                if ($readme -notmatch [regex]::Escape($needle)) { throw "README.md is missing P6 keyword $needle" }
+                if ($readme -notmatch [regex]::Escape($needle)) { throw "DEVELOPMENT_STATUS.md is missing P6 keyword $needle" }
             }
-            Write-Host "P6 deliverables OK: 3 migrations appended, execution/executor/frontend/scripts present, env/README/Compose documented."
+            Write-Host "P6 deliverables OK: 3 migrations appended, execution/executor/frontend/scripts present, env/DEVELOPMENT_STATUS/Compose documented."
         })
 
     [void](Invoke-Check -Dod "P6-8" -CheckName "P6 OpenAPI contract" -Body {

@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
 .SYNOPSIS
     Static P8 documentation / OpenAPI / Compose contract for EzTest.
@@ -9,7 +9,7 @@
       1. the four P8 documentation categories (deployment, operations,
          user-guide, development) plus the P8 release notes exist and are
          non-trivial;
-      2. README.md and .env.example document the P8 environment keys;
+      2. DEVELOPMENT_STATUS.md and .env.example document the P8 environment keys;
       3. docs/openapi/api.yaml parses with the frontend `yaml` dependency and
          contains the 18 P8 paths (plus the additive batchTimeline contract and
          the case.visual_baseline_approved event);
@@ -139,7 +139,7 @@ foreach ($needle in @("validate-compose.mjs", "executor", "evidence", "reports",
 # 2. README / .env.example environment keys.
 # ---------------------------------------------------------------------------
 Write-Host "==> P8 environment keys"
-$readme = Read-Text -Relative "README.md"
+$readme = Read-Text -Relative "DEVELOPMENT_STATUS.md"
 foreach ($key in @(
         "EZTEST_KNOWLEDGE_MAX_INJECT",
         "EZTEST_KNOWLEDGE_MAX_BYTES",
@@ -155,7 +155,7 @@ foreach ($key in @(
         "EZTEST_LEADER_LOCK_KEY",
         "EZTEST_AUTONOMY_BATCHES_PER_TICK"
     )) {
-    Assert-Contains -Relative "README.md" -Text $readme -Needle $key -Description "the P8 environment table entry"
+    Assert-Contains -Relative "DEVELOPMENT_STATUS.md" -Text $readme -Needle $key -Description "the P8 environment table entry"
 }
 $envTemplate = Read-Text -Relative ".env.example"
 foreach ($key in @(
@@ -302,6 +302,8 @@ Invoke-NodeCheck -Script $composeScript -Arguments @($repoRoot) -Label "Compose 
 Write-Host "==> secret scan"
 $secretFiles = @(
     "README.md",
+    "README.zh-CN.md",
+    "DEVELOPMENT_STATUS.md",
     ".env.example",
     "deploy/README.md",
     "docs/deployment.md",
@@ -353,6 +355,8 @@ if ($null -ne $gitCommand) {
 Write-Host "==> local Markdown links"
 $linkFiles = @(
     "README.md",
+    "README.zh-CN.md",
+    "DEVELOPMENT_STATUS.md",
     "deploy/README.md",
     "docs/deployment.md",
     "docs/operations.md",
@@ -389,5 +393,5 @@ if ($failures.Count -gt 0) {
     exit 1
 }
 Write-Host ""
-Write-Host "check-docs PASSED: 4 P8 documentation categories + release notes, README/.env.example P8 keys, OpenAPI paths, Compose contract, no secrets, local Markdown links."
+Write-Host "check-docs PASSED: 4 P8 documentation categories + release notes, DEVELOPMENT_STATUS/.env.example P8 keys, OpenAPI paths, Compose contract, no secrets, local Markdown links."
 exit 0
