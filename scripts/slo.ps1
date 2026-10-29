@@ -1780,14 +1780,14 @@ if ($DryRun) {
     $envExamplePath = Join-Path $repoRoot ".env.example"
     $envExample = ""
     if (Test-Path -LiteralPath $envExamplePath) { $envExample = Get-Content -LiteralPath $envExamplePath -Raw -Encoding UTF8 }
-    $readmePath = Join-Path $repoRoot "README.md"
+    $readmePath = Join-Path $repoRoot "DEVELOPMENT_STATUS.md"
     $readme = ""
     if (Test-Path -LiteralPath $readmePath) { $readme = Get-Content -LiteralPath $readmePath -Raw -Encoding UTF8 }
     foreach ($key in @("EZTEST_RATE_LIMIT_RPS", "EZTEST_RATE_LIMIT_BURST", "EZTEST_RATE_LIMIT_SSE_MAX", "EZTEST_GC_ENABLED")) {
         if ($envExample.Contains($key) -and $readme.Contains($key)) {
-            Add-Check -Area "docs" -Check $key -Status "PASS" -Detail "documented in .env.example and README"
+            Add-Check -Area "docs" -Check $key -Status "PASS" -Detail "documented in .env.example and DEVELOPMENT_STATUS.md"
         } else {
-            Add-Check -Area "docs" -Check $key -Status "FAIL" -Detail "missing from .env.example or README"
+            Add-Check -Area "docs" -Check $key -Status "FAIL" -Detail "missing from .env.example or DEVELOPMENT_STATUS.md"
         }
     }
 
