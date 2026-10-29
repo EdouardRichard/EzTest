@@ -1,7 +1,7 @@
 "use client"
 
-import { AgentConsole } from "@/features/agent-console/AgentConsole"
+import { AgentCenterPage } from "@/features/agent-console/AgentCenterPage"
 
 export default function AgentsPage() {
-  return <AgentConsole />
+  return <AgentCenterPage />
 }
