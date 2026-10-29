@@ -34,9 +34,51 @@ export type ChangeSetStats = {
 }
 
 /**
+ * One changed entity summary inside a batch snapshot item (spec §4.2: route |
+ * api | component).
+ */
+export type VersionChangeSubject = {
+  kind: string
+  name: string
+}
+
+/**
+ * One persisted summary of a changed file inside a version_change snapshot.
+ * It never carries code content or a diff; `unmapped` is the P4 INV-8 verdict.
+ */
+export type VersionChangeItem = {
+  file: string
+  changeKind: string
+  subjects: VersionChangeSubject[]
+  /** Case node ids, decimal strings that are never re-parsed (spec §7.1). */
+  caseIds: string[]
+  unmapped: boolean
+}
+
+/**
+ * One batchTimeline entry of `GET /api/versions/{id}/code/changes` (P8 D58): the
+ * batch identity, its commit range, counters and summary items. `batchId` is a
+ * decimal string (D29).
+ */
+export type VersionChangeBatch = {
+  batchId: string
+  batchNo: number
+  batchStatus: string
+  baseCommit: string
+  headCommit: string
+  historyRewritten: boolean
+  changedFiles: number
+  impactedCases: number
+  unmappedCount: number
+  items: VersionChangeItem[]
+  computedAt: string
+}
+
+/**
  * `/api/code/repos/{repoId}/diff` and `/api/versions/{id}/code/changes` share
  * this DTO (spec §7.2). `changeSetId` is null for a version preview that has
- * not persisted a change set yet (spec §7.3).
+ * not persisted a change set yet (spec §7.3). `batchTimeline` is additive in
+ * P8: an older backend omits it and the tab renders the unchanged change list.
  */
 export type ChangeList = {
   changeSetId: string | null
@@ -46,6 +88,7 @@ export type ChangeList = {
   files: ChangedFile[]
   nextCursor: string | null
   hasMore: boolean
+  batchTimeline?: VersionChangeBatch[]
 }
 
 /** Counters produced by one T0 index run. */

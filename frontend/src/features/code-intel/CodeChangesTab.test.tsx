@@ -15,6 +15,7 @@ import type {
   FileDiff,
   IndexRun,
   UnmappedChange,
+  VersionChangeBatch,
 } from "./types"
 
 const mocks = vi.hoisted(() => ({
@@ -242,6 +243,54 @@ const CREATED_ANCHOR: Anchor = {
   createdAt: "2026-10-28T01:00:00Z",
 }
 
+/** Two batch snapshots: a mapped batch with cases plus an unmapped file, and an
+ * empty later batch (the「本批无代码变更」state). */
+function batchTimelineFixture(): VersionChangeBatch[] {
+  return [
+    {
+      batchId: "701",
+      batchNo: 1,
+      batchStatus: "done",
+      baseCommit: BASE,
+      headCommit: HEAD,
+      historyRewritten: false,
+      changedFiles: 2,
+      impactedCases: 2,
+      unmappedCount: 1,
+      computedAt: "2026-10-29T04:00:00Z",
+      items: [
+        {
+          file: "src/api/refund.ts",
+          changeKind: "modified",
+          subjects: [{ kind: "api", name: "POST /api/refund" }],
+          caseIds: ["501", "502"],
+          unmapped: false,
+        },
+        {
+          file: "src/legacy/old.ts",
+          changeKind: "deleted",
+          subjects: [],
+          caseIds: [],
+          unmapped: true,
+        },
+      ],
+    },
+    {
+      batchId: "702",
+      batchNo: 2,
+      batchStatus: "done",
+      baseCommit: HEAD,
+      headCommit: "cccccccccccccccccccccccccccccccccccccccc",
+      historyRewritten: true,
+      changedFiles: 0,
+      impactedCases: 0,
+      unmappedCount: 0,
+      computedAt: "2026-10-29T05:00:00Z",
+      items: [],
+    },
+  ]
+}
+
 function codeEvent(seq: number, type = "code.changed"): VersionEvent {
   return {
     seq,
@@ -387,6 +436,60 @@ describe("CodeChangesTab", () => {
     expect(alert.textContent).toContain("分析失败")
     expect(alert.textContent).toContain("AI 服务不可用")
     expect(screen.getByRole("button", { name: "重试分析" })).toBeTruthy()
+  })
+
+  it("renders the batch timeline with commits, entities, cases, unmapped and history rewrite", async () => {
+    mockReady({ changes: changesFixture({ batchTimeline: batchTimelineFixture() }) })
+
+    renderTab()
+
+    // Batch 1→N ordering with the commit pair and per-batch counters.
+    const heading = await screen.findByRole("heading", { name: "批次时间线" })
+    expect(heading).toBeTruthy()
+    const timeline = screen.getByTestId("code-batch-timeline")
+    expect(timeline.textContent).toContain("Batch 1")
+    expect(timeline.textContent).toContain("Batch 2")
+    expect(timeline.textContent).toContain("01234567")
+    expect(timeline.textContent).toContain("变更文件 2 · 影响用例 2 · 未映射 1")
+    // Change file → entity → affected case chain.
+    expect(timeline.textContent).toContain("src/api/refund.ts")
+    expect(timeline.textContent).toContain("POST /api/refund")
+    expect(timeline.textContent).toContain("用例 501")
+    expect(timeline.textContent).toContain("用例 502")
+    // Unmapped change of the batch.
+    const unmapped = screen.getByTestId("batch-unmapped-701")
+    expect(unmapped.textContent).toContain("src/legacy/old.ts")
+    // D49 history rewrite marker and the per-batch empty state.
+    expect(timeline.textContent).toContain("历史重写")
+    expect(timeline.textContent).toContain("本批无代码变更")
+  })
+
+  it("keeps the legacy change list when the backend omits batchTimeline", async () => {
+    mockReady()
+
+    renderTab()
+
+    expect(await screen.findByRole("heading", { name: "变更文件" })).toBeTruthy()
+    expect(screen.queryByRole("heading", { name: "批次时间线" })).toBeNull()
+    expect(screen.getByText("src/api/refund.ts")).toBeTruthy()
+  })
+
+  it("retries the load and renders the batch timeline after a failure", async () => {
+    mocks.getVersionChanges
+      .mockRejectedValueOnce(new Error("network down"))
+      .mockResolvedValueOnce(changesFixture({ batchTimeline: batchTimelineFixture() }))
+    mocks.getLatestIndexRun.mockResolvedValue(INDEX_DONE)
+    mocks.getLatestAnalysis.mockResolvedValue(analysisFixture())
+
+    renderTab()
+
+    expect(await screen.findByRole("heading", { name: "加载代码变更失败" })).toBeTruthy()
+    expect(screen.getByText("network down")).toBeTruthy()
+
+    fireEvent.click(screen.getByRole("button", { name: "重试" }))
+
+    expect(await screen.findByRole("heading", { name: "批次时间线" })).toBeTruthy()
+    expect(mocks.getVersionChanges).toHaveBeenCalledTimes(2)
   })
 
   it("lists changed files and opens the unified diff drawer", async () => {

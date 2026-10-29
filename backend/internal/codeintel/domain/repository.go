@@ -106,3 +106,16 @@ type AnchorRepository interface {
 	List(ctx context.Context, versionID int64, f AnchorFilter) ([]CodeAnchor, error)
 	ListByPaths(ctx context.Context, versionID int64, paths []string) ([]CodeAnchor, error)
 }
+
+// VersionChangeRepository persists the P8 per-batch code-change snapshots and
+// serves the read-only run_batch projection the snapshot generation needs
+// (design spec §4.2/§7.2, D58). Upsert is keyed by (version_id, batch_id) and
+// never overwrites an existing snapshot; the second return value reports whether
+// this call created the row.
+type VersionChangeRepository interface {
+	ListByVersion(ctx context.Context, versionID int64) ([]VersionChange, error)
+	Upsert(ctx context.Context, change VersionChange) (VersionChange, bool, error)
+	// ListBatches returns the version's run_batch projection ordered by batch
+	// number. It never writes execution state.
+	ListBatches(ctx context.Context, versionID int64) ([]VersionBatch, error)
+}

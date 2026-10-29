@@ -182,9 +182,10 @@ func assertP7CheckWidening(t *testing.T, ctx context.Context, pool *pgxpool.Pool
 	}
 }
 
-// assertP7OrderTail proves migrations/order.txt ends with the eight P7
-// migrations in the spec §4.1 order. The integration test runs with the package
-// directory (backend/internal/db) as its working directory.
+// assertP7OrderTail proves migrations/order.txt contains the eight P7
+// migrations as one contiguous block in the spec §4.1 order. Migrations are
+// append-only, so later phases (P8+) may append after the block; the test only
+// pins that the P7 sequence itself was not reordered or rewritten.
 func assertP7OrderTail(t *testing.T) {
 	t.Helper()
 	raw, err := os.ReadFile("migrations/order.txt")
@@ -200,10 +201,13 @@ func assertP7OrderTail(t *testing.T) {
 	if len(names) < len(p7MigrationNames) {
 		t.Fatalf("order.txt has %d migrations, want at least %d", len(names), len(p7MigrationNames))
 	}
-	got := names[len(names)-len(p7MigrationNames):]
-	if strings.Join(got, "|") != strings.Join(p7MigrationNames, "|") {
-		t.Fatalf("order.txt P7 tail = %v, want %v", got, p7MigrationNames)
+	want := strings.Join(p7MigrationNames, "|")
+	for start := 0; start+len(p7MigrationNames) <= len(names); start++ {
+		if strings.Join(names[start:start+len(p7MigrationNames)], "|") == want {
+			return
+		}
 	}
+	t.Fatalf("order.txt P7 block = %v, want the contiguous sequence %v", names, p7MigrationNames)
 }
 
 // TestP7MigrationBackfill upgrades a P6 database that already holds data. A
@@ -300,7 +304,9 @@ func TestP7MigrationBackfill(t *testing.T) {
 }
 
 // p6MigrationFS builds the on-disk P6 migration set (everything before the P7
-// tail) so an upgrade can be exercised without hard-coding the 32 file names.
+// block) so an upgrade can be exercised without hard-coding the 32 file names.
+// The P7 block is located by its first migration instead of by a fixed offset,
+// because later phases append migrations after it (append-only rule).
 func p6MigrationFS(t *testing.T) fstest.MapFS {
 	t.Helper()
 	raw, err := os.ReadFile("migrations/order.txt")
@@ -313,13 +319,19 @@ func p6MigrationFS(t *testing.T) fstest.MapFS {
 			names = append(names, name)
 		}
 	}
-	if len(names) <= len(p7MigrationNames) {
-		t.Fatalf("order.txt has %d migrations, want more than the %d P7 migrations",
-			len(names), len(p7MigrationNames))
+	p7Start := -1
+	for index, name := range names {
+		if name == p7MigrationNames[0] {
+			p7Start = index
+			break
+		}
+	}
+	if p7Start <= 0 {
+		t.Fatalf("order.txt does not contain the P7 block starting at %q", p7MigrationNames[0])
 	}
 	fsys := fstest.MapFS{}
 	var order strings.Builder
-	for _, name := range names[:len(names)-len(p7MigrationNames)] {
+	for _, name := range names[:p7Start] {
 		content, err := os.ReadFile(filepath.Join("migrations", name))
 		if err != nil {
 			t.Fatalf("read P6 migration %s: %v", name, err)

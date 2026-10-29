@@ -7,6 +7,7 @@ import { StatusBadge } from "@/components/ui/StatusBadge"
 import { ApiError } from "@/lib/api-client"
 import { AnchorDialog } from "./AnchorDialog"
 import { getLatestIndexRun, getVersionChanges, startAnalysis } from "./api"
+import { BatchTimeline } from "./BatchTimeline"
 import { ChangedFiles } from "./ChangedFiles"
 import { type CodeAnalysisView, CommitHeader } from "./CommitHeader"
 import { DiffDrawer } from "./DiffDrawer"
@@ -178,9 +179,10 @@ function AwaitingAnalysisPanel({ title, hint }: { title: string; hint: string })
  * 「代码与变更」container (spec §9.1/§9.2): loads the version change preview,
  * gates on the repository index, derives the six UI states (unbound / unindexed
  * / no changes / running / done / degraded, plus a failed error state), polls a
- * running analysis, and opens the unified diff drawer on demand. It never
- * fabricates batches, cases or facts; T11 mounts the facts, impact, unmapped and
- * requirement-anchor panels.
+ * running analysis, renders the additive P8 batch timeline and opens the
+ * unified diff drawer on demand. It never fabricates batches, cases or facts:
+ * the timeline shows only persisted version_change snapshots and T11 mounts the
+ * facts, impact, unmapped and requirement-anchor panels.
  */
 export function CodeChangesTab({ versionId, repoId }: CodeChangesTabProps) {
   const [load, setLoad] = useState<ChangesLoad>(
@@ -413,6 +415,8 @@ export function CodeChangesTab({ versionId, repoId }: CodeChangesTabProps) {
           刷新分析状态失败：{describeCodeError(analysisPolling.error)}
         </p>
       )}
+
+      <BatchTimeline batches={changes.batchTimeline ?? []} />
 
       {changes.files.length === 0 ? (
         <NoChangesCodeState

@@ -60,6 +60,14 @@ type AnalysisService interface {
 	PatchCandidate(ctx context.Context, versionID, analysisID, candidateID, actorID int64, selected bool) (domain.ImpactCandidate, error)
 }
 
+// VersionChangeService is the P8 per-batch snapshot use case consumed by the
+// HTTP layer (design spec §7.2/D58). *application.VersionChangeService
+// implements it. Timeline generates missing snapshots idempotently and returns
+// the version's Batch 1→N timeline entries.
+type VersionChangeService interface {
+	Timeline(ctx context.Context, versionID int64) ([]application.VersionChangeTimelineEntry, error)
+}
+
 // AnchorService is the version-scoped anchor use case consumed by the HTTP layer
 // (design spec §7.3). *application.AnchorService implements it; subject
 // ownership, file existence, line validation and point uniqueness are enforced
@@ -74,21 +82,23 @@ type AnchorService interface {
 // consumer-defined ports above. Tests inject hand-written doubles instead of
 // constructing the services, so the handler tests never need a database/Git.
 var (
-	_ IndexService    = (*application.IndexService)(nil)
-	_ QueryService    = (*application.QueryService)(nil)
-	_ AnalysisService = (*application.AnalysisService)(nil)
-	_ AnchorService   = (*application.AnchorService)(nil)
+	_ IndexService         = (*application.IndexService)(nil)
+	_ QueryService         = (*application.QueryService)(nil)
+	_ AnalysisService      = (*application.AnalysisService)(nil)
+	_ AnchorService        = (*application.AnchorService)(nil)
+	_ VersionChangeService = (*application.VersionChangeService)(nil)
 )
 
 // Handler serves the repository- and version-scoped codeintel endpoints. A nil
 // field leaves the corresponding route group unmounted, which keeps a partially
 // wired process (and the focused tests) from panicking at request time.
 type Handler struct {
-	index    IndexService
-	query    QueryService
-	analyses AnalysisService
-	anchors  AnchorService
-	repos    application.RepoCatalog
+	index          IndexService
+	query          QueryService
+	analyses       AnalysisService
+	anchors        AnchorService
+	versionChanges VersionChangeService
+	repos          application.RepoCatalog
 }
 
 // HandlerDeps are the collaborators the codeintel HTTP handlers consume. T18
@@ -98,6 +108,9 @@ type HandlerDeps struct {
 	Query    QueryService
 	Analyses AnalysisService
 	Anchors  AnchorService
+	// VersionChanges is the P8 per-batch snapshot use case; nil omits the
+	// additive batchTimeline entries while leaving the P7 change list intact.
+	VersionChanges VersionChangeService
 	// Repos is the P2 repository catalog read through the resource application
 	// layer (R24 List backs GET /api/code/repos).
 	Repos application.RepoCatalog
@@ -106,10 +119,11 @@ type HandlerDeps struct {
 // NewHandler wires the repository- and version-scoped handlers.
 func NewHandler(deps HandlerDeps) *Handler {
 	return &Handler{
-		index:    deps.Index,
-		query:    deps.Query,
-		analyses: deps.Analyses,
-		anchors:  deps.Anchors,
-		repos:    deps.Repos,
+		index:          deps.Index,
+		query:          deps.Query,
+		analyses:       deps.Analyses,
+		anchors:        deps.Anchors,
+		versionChanges: deps.VersionChanges,
+		repos:          deps.Repos,
 	}
 }

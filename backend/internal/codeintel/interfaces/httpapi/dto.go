@@ -136,6 +136,49 @@ type ChangeListDTO struct {
 	HasMore     bool              `json:"hasMore"`
 }
 
+// VersionChangeSubjectDTO is one changed entity summary inside a batch
+// snapshot item (design spec §4.2: route | api | component).
+type VersionChangeSubjectDTO struct {
+	Kind string `json:"kind"`
+	Name string `json:"name"`
+}
+
+// VersionChangeItemDTO is the persisted summary of one changed file. It carries
+// no code content, diff or prompt; unmapped marks the P4 INV-8 coverage verdict.
+type VersionChangeItemDTO struct {
+	File       string                    `json:"file"`
+	ChangeKind string                    `json:"changeKind"`
+	Subjects   []VersionChangeSubjectDTO `json:"subjects"`
+	CaseIDs    []string                  `json:"caseIds"`
+	Unmapped   bool                      `json:"unmapped"`
+}
+
+// VersionChangeDTO is one batchTimeline entry (design spec §7.2/D58): the batch
+// identity, its commit range, the counters and the summary items. batchId is a
+// decimal string (D29); batchNo/status come from the read-time run_batch
+// projection.
+type VersionChangeDTO struct {
+	BatchID          string                 `json:"batchId"`
+	BatchNo          int                    `json:"batchNo"`
+	BatchStatus      string                 `json:"batchStatus"`
+	BaseCommit       string                 `json:"baseCommit"`
+	HeadCommit       string                 `json:"headCommit"`
+	HistoryRewritten bool                   `json:"historyRewritten"`
+	ChangedFiles     int                    `json:"changedFiles"`
+	ImpactedCases    int                    `json:"impactedCases"`
+	UnmappedCount    int                    `json:"unmappedCount"`
+	Items            []VersionChangeItemDTO `json:"items"`
+	ComputedAt       time.Time              `json:"computedAt"`
+}
+
+// VersionChangesDTO is the additive P8 body of GET
+// /api/versions/{id}/code/changes: the legacy P7 ChangeList fields are embedded
+// unchanged and batchTimeline is a new array that older clients simply ignore.
+type VersionChangesDTO struct {
+	ChangeListDTO
+	BatchTimeline []VersionChangeDTO `json:"batchTimeline"`
+}
+
 // CodeEntityDTO is one file/AI fact entity returned by the facts and search
 // reads (R6). id/analysisId are decimal strings, repoId a number, evidence keeps
 // the camelCase evidence range with the optional excerpt hash.
@@ -477,6 +520,52 @@ func newChangeListDTO(data domain.ChangeSetData, base, head string, limit int) (
 		dto.NextCursor = &cursor
 	}
 	return dto, nil
+}
+
+// newVersionChangesDTO assembles the P8 body: the unchanged P7 ChangeList plus
+// the additive Batch 1→N timeline. The timeline is always an array (never null)
+// so an empty version renders the empty state rather than a client error.
+func newVersionChangesDTO(changeList ChangeListDTO, entries []application.VersionChangeTimelineEntry) VersionChangesDTO {
+	timeline := make([]VersionChangeDTO, 0, len(entries))
+	for _, entry := range entries {
+		timeline = append(timeline, newVersionChangeDTO(entry))
+	}
+	return VersionChangesDTO{ChangeListDTO: changeList, BatchTimeline: timeline}
+}
+
+// newVersionChangeDTO maps one timeline entry. Items are always arrays and the
+// subject/case arrays are [] rather than null.
+func newVersionChangeDTO(entry application.VersionChangeTimelineEntry) VersionChangeDTO {
+	change := entry.Change
+	items := make([]VersionChangeItemDTO, 0, len(change.Items))
+	for _, item := range change.Items {
+		subjects := make([]VersionChangeSubjectDTO, 0, len(item.Subjects))
+		for _, subject := range item.Subjects {
+			subjects = append(subjects, VersionChangeSubjectDTO{Kind: subject.Kind, Name: subject.Name})
+		}
+		caseIDs := make([]string, 0, len(item.CaseIDs))
+		caseIDs = append(caseIDs, item.CaseIDs...)
+		items = append(items, VersionChangeItemDTO{
+			File:       item.File,
+			ChangeKind: item.ChangeKind,
+			Subjects:   subjects,
+			CaseIDs:    caseIDs,
+			Unmapped:   item.Unmapped,
+		})
+	}
+	return VersionChangeDTO{
+		BatchID:          formatID(change.BatchID),
+		BatchNo:          entry.BatchNo,
+		BatchStatus:      entry.BatchStatus,
+		BaseCommit:       change.BaseCommit,
+		HeadCommit:       change.HeadCommit,
+		HistoryRewritten: change.HistoryRewritten,
+		ChangedFiles:     change.ChangedFiles,
+		ImpactedCases:    change.ImpactedCases,
+		UnmappedCount:    change.UnmappedCount,
+		Items:            items,
+		ComputedAt:       change.ComputedAt,
+	}
 }
 
 // newCodeEntityDTO maps one entity. Evidence is always a non-nil array and the
