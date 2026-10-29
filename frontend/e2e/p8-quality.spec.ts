@@ -565,10 +565,12 @@ async function logout(page: Page): Promise<void> {
 }
 
 /**
- * Switches accounts through the real user menu. The logout redirect can race
- * in-flight shell reads whose token was just cleared, which Chromium reports as
- * a 401 resource console error. That intentional auth transition is outside the
- * console-error assertion window; every other phase stays monitored.
+ * Switches accounts through the real user menu. The outgoing phase is asserted
+ * before the monitor is stopped: stopping first (then only checking the final
+ * monitor) would silently drop every console error raised before the last
+ * account switch. The logout redirect can race in-flight shell reads whose token
+ * was just cleared, which Chromium reports as a 401 resource console error; that
+ * transition happens while no monitor is active, so no exception rule is needed.
  */
 async function switchAccount(
   page: Page,
@@ -576,7 +578,7 @@ async function switchAccount(
   username: string,
   password: string,
 ): Promise<ReturnType<typeof captureConsoleErrors>> {
-  monitor.stop()
+  await expectNoConsoleErrors(monitor, page, `P8 质量（切换到 ${username} 前）`)
   await logout(page)
   await login(page, username, password)
   return captureConsoleErrors(page)
@@ -975,13 +977,25 @@ test("P8 质量中心：admin 指标可见，普通用户 403", async ({ page, r
     const normal = await createNormalUser(request, token, suffix)
 
     const recorded =
-      await test.step("record one real_llm evaluation run through the admin API", async () => {
+      await test.step("record one seeded deterministic fixture evaluation run", async () => {
         const response = await request.post(`${API_URL}/api/quality/eval-runs`, {
           headers: authHeaders(token),
           data: {
-            mode: "real_llm",
+            // This is a seeded, deterministic fixture — never claim a real-model
+            // report in the acceptance evidence. The deterministic track is the
+            // reproducible CI gate (design spec §9.1/D61); the committed baseline
+            // equals the observed sample so the run exercises the pass path.
+            mode: "deterministic",
             corpusVersion,
-            model: "deepseek-flash",
+            model: "deterministic-fixture",
+            baseline: {
+              design_coverage: 1,
+              impact_recall: 1,
+              impact_precision: 0.8,
+              classification_accuracy: 1,
+              issue_false_positive_rate: 0,
+              supplement_hit_rate: 1,
+            },
             sample: {
               confirmedRequirements: 10,
               coveredRequirements: 10,
@@ -995,7 +1009,7 @@ test("P8 质量中心：admin 指标可见，普通用户 403", async ({ page, r
               supplementCases: 5,
               supplementHits: 5,
             },
-            summary: { source: "p8-e2e" },
+            summary: { source: "p8-e2e-deterministic-fixture" },
           },
         })
         const run = await readData<{
@@ -1017,8 +1031,14 @@ test("P8 质量中心：admin 指标可见，普通用户 403", async ({ page, r
       await expect(summary).toBeVisible({ timeout: 60_000 })
       await expect(page.getByTestId("quality-run-id")).toContainText(`#${recorded.id}`)
       await expect(page.getByTestId("quality-verdict")).toContainText("全部指标达标")
+      // The dashboard must label the seeded run as the deterministic track, not
+      // as a real-LLM report.
+      await expect(summary).toContainText("确定性门禁")
+      await expect(summary).not.toContainText("真实 LLM 报告")
       await expect(page.locator('[data-testid^="quality-metric-value-"]')).toHaveCount(6)
-      await expect(page.getByTestId(`quality-history-row-${recorded.id}`)).toBeVisible()
+      await expect(page.getByTestId(`quality-history-row-${recorded.id}`)).toContainText(
+        "确定性门禁",
+      )
       await page.screenshot({
         path: evidencePath("p8-quality-07-quality-admin.png"),
         fullPage: true,

@@ -38,6 +38,9 @@ import {
 
 const USER_PASSWORD = process.env.EZTEST_E2E_USER_PASSWORD?.trim() || "qa-e2e-pass-123"
 
+/** Marker of the console error the phase-boundary regression step injects. */
+const INJECTED_CONSOLE_ERROR = "p8-e2e-injected-early-console-error"
+
 /** Directory of the committed P8 cross-wave acceptance evidence. */
 const ACCEPTANCE_DIR = fileURLToPath(new URL("../../docs/acceptance/p8/e2e", import.meta.url))
 
@@ -110,10 +113,13 @@ async function logout(page: Page): Promise<void> {
 }
 
 /**
- * Switches accounts through the real user menu. The logout redirect can race
- * in-flight shell reads (todos) whose token was just cleared, which Chromium
- * reports as a 401 resource console error. That intentional auth transition is
- * outside the console-error assertion window; every other phase stays monitored.
+ * Switches accounts through the real user menu. The outgoing phase is asserted
+ * before the monitor is stopped: stopping first (then only checking the final
+ * monitor) would silently drop every console error raised before the last
+ * account switch. The logout redirect can race in-flight shell reads (todos)
+ * whose token was just cleared, which Chromium reports as a 401 resource console
+ * error; that transition happens while no monitor is active, so no exception
+ * rule is needed.
  */
 async function switchAccount(
   page: Page,
@@ -121,7 +127,7 @@ async function switchAccount(
   username: string,
   password: string,
 ): Promise<ReturnType<typeof captureConsoleErrors>> {
-  monitor.stop()
+  await expectNoConsoleErrors(monitor, page, `P8 管理面（切换到 ${username} 前）`)
   await logout(page)
   await login(page, username, password)
   return captureConsoleErrors(page)
@@ -197,6 +203,27 @@ test("P8 管理面：Agent 中心只读/可配、审计筛选、基础配置与 
       await expect(page.getByRole("tab", { name: "配置", exact: true })).toBeVisible()
     })
 
+    await test.step("an early-phase console error is caught at the account switch", async () => {
+      // Regression guard for the monitor hand-off: stopping the monitor before
+      // asserting the outgoing phase used to drop every early error. Inject one
+      // and require switchAccount to reject before logging out.
+      await page.evaluate((message) => console.error(message), INJECTED_CONSOLE_ERROR)
+      await expect.poll(() => monitor.errors.join("\n")).toContain(INJECTED_CONSOLE_ERROR)
+
+      let rejected: unknown = null
+      try {
+        monitor = await switchAccount(page, monitor, normal.username, normal.password)
+      } catch (caught) {
+        rejected = caught
+      }
+      expect(rejected, "switchAccount must assert the outgoing phase before logout").not.toBeNull()
+      expect(monitor.errors.join("\n")).toContain(INJECTED_CONSOLE_ERROR)
+      // The rejected switch aborted before logout, so the session is still the
+      // admin one; restart the monitor and let the next step switch for real.
+      await expect(page.getByRole("button", { name: "打开用户菜单" })).toBeVisible()
+      monitor = captureConsoleErrors(page)
+    })
+
     await test.step("ordinary user Agent centre: read-only catalogue, no write controls, 403 write", async () => {
       monitor = await switchAccount(page, monitor, normal.username, normal.password)
       await page.goto("/agents")
@@ -245,6 +272,22 @@ test("P8 管理面：Agent 中心只读/可配、审计筛选、基础配置与 
       await page.screenshot({
         path: evidencePath("p8-management-03-audit-filter.png"),
         fullPage: true,
+      })
+
+      // The actor filter must actually filter: the freshly created normal user
+      // never created a version, so the same action filtered by their id keeps
+      // the explicit empty state (a decorative actor filter would still show the
+      // admin's record).
+      await page.getByLabel("操作者 ID").fill(String(normal.id))
+      await page.getByRole("button", { name: "筛选", exact: true }).click()
+      await expect(page.getByText("没有符合条件的审计记录")).toBeVisible({ timeout: 60_000 })
+      await expect(page.getByText(`version #${auditVersionId}`)).toHaveCount(0)
+
+      // Restore the admin actor so the detail flow opens the target record.
+      await page.getByLabel("操作者 ID").fill(String(admin.id))
+      await page.getByRole("button", { name: "筛选", exact: true }).click()
+      await expect(page.getByText(`version #${auditVersionId}`).first()).toBeVisible({
+        timeout: 60_000,
       })
 
       // Opening one row shows the read-only metadata detail.

@@ -70,6 +70,12 @@ export function KnowledgePage() {
     version: "",
     review: "",
   })
+  /**
+   * False until the mount effect has read the deep links. The load effect must
+   * not fire before then: a request with the empty `appliedVersion` would race
+   * the filtered read and a slower full-list response could overwrite it.
+   */
+  const [paramsReady, setParamsReady] = useState(false)
 
   const [status, setStatus] = useState<KnowledgeStatus>("approved")
   const [kind, setKind] = useState<KnowledgeKind | "">("")
@@ -88,7 +94,8 @@ export function KnowledgePage() {
   // The router updates window.location after the first client-navigation
   // render, so the deep links are read on mount rather than during render (see
   // readInitialParams). The version filter is applied in the same pass so the
-  // first filtered read already carries it.
+  // first filtered read already carries it; `paramsReady` keeps the load effect
+  // from issuing a full-list request before that pass lands.
   useEffect(() => {
     const params = readInitialParams()
     setInitial(params)
@@ -96,6 +103,7 @@ export function KnowledgePage() {
       setVersionFilter(params.version)
       setAppliedVersion(params.version)
     }
+    setParamsReady(true)
   }, [])
 
   // Auth loads asynchronously: the ?review= deep link can only open the
@@ -130,8 +138,9 @@ export function KnowledgePage() {
   }, [status, kind, appliedVersion])
 
   useEffect(() => {
+    if (!paramsReady) return
     void load()
-  }, [load])
+  }, [load, paramsReady])
 
   const selected = entries.find((entry) => entry.id === selectedId) ?? null
 
