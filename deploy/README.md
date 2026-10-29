@@ -1,8 +1,8 @@
 # EzTest deployment
 
-This directory contains the container deployment for the P0 foundation and the
-P1 Agent runtime: a multi-stage Go API image, a Next.js standalone web image and
-a single-instance Docker Compose file with PostgreSQL 17.
+This directory contains the container deployment for the EzTest platform: a
+multi-stage Go API image, a Next.js standalone web image and a single-instance
+Docker Compose file with PostgreSQL 17.
 
 > **Validation status:** Docker is not installed on the development host, so the
 > images have never been built and the Compose stack has never been started
@@ -105,7 +105,7 @@ are idempotent.
   UID 1001).
 - The API stores LLM credentials encrypted with `EZTEST_SECRET_KEYS`. Losing
   that keyring makes stored credentials unrecoverable; back it up.
-- P0/P1 is a single-instance, intranet-oriented deployment. It does not provide
+- EzTest is a single-instance, intranet-oriented deployment. It does not provide
   TLS, multi-tenant isolation, a reverse proxy or public object URLs. Put a
   TLS-terminating proxy in front of ports 13333/6868 if exposed beyond
   localhost, and restrict the PostgreSQL port.

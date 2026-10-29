@@ -76,7 +76,7 @@ export function Sidebar() {
               <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-60" />
               <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-400" />
             </span>
-            P0 地基运行中
+            P8 · 体验硬化
           </div>
           <p className="mt-1.5 text-[11px] leading-relaxed text-sidebar-muted">
             登录、用户管理、LLM 配置、SSE 事件流与审计已接入。

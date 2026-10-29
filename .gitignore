@@ -27,6 +27,10 @@ bin/
 tmp/
 .tmp/
 
+# ---- local runtime data ----
+.data/
+backend/.data/
+
 # ---- os / editor ----
 .DS_Store
 Thumbs.db
