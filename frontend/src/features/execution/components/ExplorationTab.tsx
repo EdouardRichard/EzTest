@@ -7,9 +7,6 @@ import { EmptyState } from "@/components/ui/EmptyState"
 import { StatusBadge, type StatusBadgeVariant } from "@/components/ui/StatusBadge"
 import type { VersionStreamState } from "@/features/versions/useVersionStream"
 import type { SSEStatus } from "@/lib/sse-client"
-import type { ChainSnapshot, ChainSnapshotNode } from "../chain/chain-types"
-import { chainSnapshotTotal } from "../chain/chain-types"
-import { useExplorationChain } from "../chain/use-exploration-chain"
 import {
   autoCollapsedRequirements,
   type ChainCaseInput,
@@ -19,8 +16,11 @@ import {
   type ChainRequirementInput,
   type ChainResultFilter,
   type ChainResultInput,
-  layoutChain,
-} from "../chain-layout"
+  layoutLegacy,
+} from "../chain/chain-layout"
+import type { ChainSnapshot, ChainSnapshotNode } from "../chain/chain-types"
+import { chainSnapshotTotal } from "../chain/chain-types"
+import { useExplorationChain } from "../chain/use-exploration-chain"
 import { useCaseRun } from "../hooks/useExecution"
 import type { CaseRunStatus, FailureClass } from "../types"
 import { ChainGraph } from "./ChainGraph"
@@ -862,7 +862,7 @@ export function ExplorationTab({
     [collapsed, autoCollapsed],
   )
   const layout = useMemo(
-    () => layoutChain(view.input, { collapsed: collapsedSet }),
+    () => layoutLegacy(view.input, { collapsed: collapsedSet }),
     [view.input, collapsedSet],
   )
 
