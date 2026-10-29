@@ -56,6 +56,7 @@ const mocks = vi.hoisted(() => ({
   useReports: vi.fn(),
   issuesProps: vi.fn(),
   reportsProps: vi.fn(),
+  explorationProps: vi.fn(),
 }))
 
 vi.mock("./api", () => ({
@@ -129,27 +130,70 @@ vi.mock("@/features/delivery/components/ReportsTab", () => ({
   },
 }))
 
-// The real exploration tab is covered by its own suite; the container only
-// needs its issue deep-link navigation callback here.
+// The real exploration tab is covered by its own suite; the container test
+// pins the deep-link wiring (params in, URL writes out) and the issue callback.
 vi.mock("@/features/execution/components/ExplorationTab", () => ({
-  ExplorationTab: ({
-    versionId,
-    onNavigate,
-  }: {
+  ExplorationTab: (props: {
     versionId: string
+    batchId?: string
+    initialFilters?: {
+      requirementId?: string
+      resultStatus?: string
+      abnormalOnly?: boolean
+      q?: string
+    }
+    selectedNodeId?: string
+    onFiltersChange?: (filters: {
+      requirementId: string
+      resultStatus: string
+      abnormalOnly: boolean
+      q: string
+    }) => void
+    onSelectedNodeChange?: (nodeId: string) => void
     onNavigate?: (target: { kind: "issue"; id: string }) => void
-  }) => (
-    <div data-testid="exploration-tab">
-      exploration for {versionId}
-      <button
-        type="button"
-        data-testid="exploration-issue-link"
-        onClick={() => onNavigate?.({ kind: "issue", id: "1844674407370955410" })}
-      >
-        探索问题
-      </button>
-    </div>
-  ),
+  }) => {
+    mocks.explorationProps(props)
+    return (
+      <div data-testid="exploration-tab">
+        exploration for {props.versionId}
+        <button
+          type="button"
+          data-testid="exploration-issue-link"
+          onClick={() => props.onNavigate?.({ kind: "issue", id: "1844674407370955410" })}
+        >
+          探索问题
+        </button>
+        <button
+          type="button"
+          data-testid="exploration-node-link"
+          onClick={() => props.onSelectedNodeChange?.("case:1844674407370955210")}
+        >
+          打开节点
+        </button>
+        <button
+          type="button"
+          data-testid="exploration-node-close"
+          onClick={() => props.onSelectedNodeChange?.("")}
+        >
+          关闭节点
+        </button>
+        <button
+          type="button"
+          data-testid="exploration-filter-link"
+          onClick={() =>
+            props.onFiltersChange?.({
+              requirementId: "1844674407370955101",
+              resultStatus: "failed",
+              abnormalOnly: true,
+              q: "登录",
+            })
+          }
+        >
+          筛选
+        </button>
+      </div>
+    )
+  },
 }))
 
 vi.mock("@/features/mindmap/api", () => ({
@@ -1137,6 +1181,180 @@ describe("VersionDetailPage", () => {
     expect(window.location.search).toContain(`issue=1844674407370955410`)
     expect(mocks.issuesProps).toHaveBeenLastCalledWith(
       expect.objectContaining({ issueId: "1844674407370955410" }),
+    )
+  })
+
+  it("passes ?node/?batch/?req/?status/?abnormal/?q to the exploration tab", async () => {
+    mocks.getVersion.mockResolvedValue({ ...VERSION, status: "executing" })
+    const earlier = batchFixture({
+      id: HEADER_BATCH_1,
+      batch_no: 1,
+      status: "done",
+      finished_at: "2026-10-28T01:00:00Z",
+    })
+    const later = batchFixture({
+      id: HEADER_BATCH_2,
+      batch_no: 2,
+      status: "done",
+      finished_at: "2026-10-28T02:00:00Z",
+    })
+    mocks.useBatches.mockReturnValue(batchesResult([later, earlier]))
+    const caseNodeId = "1844674407370955210"
+    const requirementId = "1844674407370955101"
+    window.history.replaceState(
+      null,
+      "",
+      `/versions/${VERSION_ID}?tab=exploration&node=case:${caseNodeId}&batch=${HEADER_BATCH_1}&req=${requirementId}&status=failed&abnormal=1&q=${encodeURIComponent("登录")}`,
+    )
+
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+
+    await waitFor(() =>
+      expect(mocks.explorationProps).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          batchId: HEADER_BATCH_1,
+          selectedNodeId: `case:${caseNodeId}`,
+          initialFilters: expect.objectContaining({
+            requirementId,
+            resultStatus: "failed",
+            abnormalOnly: true,
+            q: "登录",
+          }),
+        }),
+      ),
+    )
+    expect((screen.getByTestId("exec-batch-selector") as HTMLSelectElement).value).toBe(
+      HEADER_BATCH_1,
+    )
+  })
+
+  it("opens the exploration tab and the Sheet from ?node= without ?tab=", async () => {
+    const caseNodeId = "1844674407370955210"
+    window.history.replaceState(null, "", `/versions/${VERSION_ID}?node=case:${caseNodeId}`)
+
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+
+    await waitFor(() =>
+      expect(screen.getByRole("tab", { name: "探索链路" }).getAttribute("aria-selected")).toBe(
+        "true",
+      ),
+    )
+    await waitFor(() =>
+      expect(mocks.explorationProps).toHaveBeenLastCalledWith(
+        expect.objectContaining({ selectedNodeId: `case:${caseNodeId}` }),
+      ),
+    )
+  })
+
+  it("syncs exploration Sheet open/close to ?node=", async () => {
+    const caseNodeId = "1844674407370955210"
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "探索链路" }))
+    await screen.findByTestId("exploration-tab")
+    await waitFor(() =>
+      expect(mocks.explorationProps).toHaveBeenLastCalledWith(
+        expect.objectContaining({ selectedNodeId: "" }),
+      ),
+    )
+
+    act(() => {
+      mocks.explorationProps.mock.calls.at(-1)?.[0].onSelectedNodeChange?.(`case:${caseNodeId}`)
+    })
+    await waitFor(() =>
+      expect(new URLSearchParams(window.location.search).get("node")).toBe(`case:${caseNodeId}`),
+    )
+    await waitFor(() =>
+      expect(mocks.explorationProps).toHaveBeenLastCalledWith(
+        expect.objectContaining({ selectedNodeId: `case:${caseNodeId}` }),
+      ),
+    )
+
+    act(() => {
+      mocks.explorationProps.mock.calls.at(-1)?.[0].onSelectedNodeChange?.("")
+    })
+    await waitFor(() => expect(new URLSearchParams(window.location.search).get("node")).toBeNull())
+    await waitFor(() =>
+      expect(mocks.explorationProps).toHaveBeenLastCalledWith(
+        expect.objectContaining({ selectedNodeId: "" }),
+      ),
+    )
+  })
+
+  it("syncs exploration filters to ?req/?status/?abnormal/?q=", async () => {
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "探索链路" }))
+    await screen.findByTestId("exploration-tab")
+
+    act(() => {
+      mocks.explorationProps.mock.calls.at(-1)?.[0].onFiltersChange?.({
+        requirementId: "1844674407370955101",
+        resultStatus: "failed",
+        abnormalOnly: true,
+        q: "登录",
+      })
+    })
+
+    await waitFor(() => {
+      const params = new URLSearchParams(window.location.search)
+      expect(params.get("req")).toBe("1844674407370955101")
+      expect(params.get("status")).toBe("failed")
+      expect(params.get("abnormal")).toBe("1")
+      expect(params.get("q")).toBe("登录")
+      expect(params.get("tab")).toBe("exploration")
+    })
+    await waitFor(() =>
+      expect(mocks.explorationProps).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          initialFilters: expect.objectContaining({
+            requirementId: "1844674407370955101",
+            resultStatus: "failed",
+            abnormalOnly: true,
+            q: "登录",
+          }),
+        }),
+      ),
+    )
+  })
+
+  it("updates ?batch= when the header batch selector changes", async () => {
+    mocks.getVersion.mockResolvedValue({ ...VERSION, status: "executing" })
+    const earlier = batchFixture({
+      id: HEADER_BATCH_1,
+      batch_no: 1,
+      status: "done",
+      finished_at: "2026-10-28T01:00:00Z",
+    })
+    const later = batchFixture({
+      id: HEADER_BATCH_2,
+      batch_no: 2,
+      status: "done",
+      finished_at: "2026-10-28T02:00:00Z",
+    })
+    mocks.useBatches.mockReturnValue(batchesResult([later, earlier]))
+
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "探索链路" }))
+    await screen.findByTestId("exploration-tab")
+
+    fireEvent.change(screen.getByTestId("exec-batch-selector"), {
+      target: { value: HEADER_BATCH_1 },
+    })
+
+    await waitFor(() =>
+      expect(new URLSearchParams(window.location.search).get("batch")).toBe(HEADER_BATCH_1),
+    )
+    await waitFor(() =>
+      expect(mocks.explorationProps).toHaveBeenLastCalledWith(
+        expect.objectContaining({ batchId: HEADER_BATCH_1 }),
+      ),
     )
   })
 
