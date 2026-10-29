@@ -37,6 +37,7 @@ const BATCH_2 = "1844674407370955163"
 const REPORT_1 = "1844674407370955164"
 const REPORT_2 = "1844674407370955165"
 const REPORT_3 = "1844674407370955166"
+const REPORT_2_R1 = "1844674407370955167"
 
 const STREAM = { events: [], status: "live" as const }
 
@@ -76,7 +77,7 @@ function reportContent(overrides: Partial<ReportContent> = {}): ReportContent {
       name: "示例版本",
       label: "",
       status: "completed",
-      codeBaselineCommit: "",
+      codeBaselineCommit: "abc123baseline",
     },
     batch: {
       id: BATCH_2,
@@ -89,6 +90,8 @@ function reportContent(overrides: Partial<ReportContent> = {}): ReportContent {
       headCommit: "",
       startedAt: "2026-10-28T00:00:00Z",
       finishedAt: "2026-10-28T00:00:30Z",
+      baseFallbackReason: "",
+      historyRewritten: false,
     },
     summary: {
       caseCount: 3,
@@ -167,14 +170,20 @@ const REPORT_2_SUMMARY = reportSummary(REPORT_2, BATCH_2, 2, {
   status: "stale",
   staleReason: "批次结果已更新",
 })
+const REPORT_2_R1_SUMMARY = reportSummary(REPORT_2_R1, BATCH_2, 1)
 const REPORT_1_SUMMARY = reportSummary(REPORT_1, BATCH_1, 1)
 
 const DETAIL_2 = reportDetail(REPORT_2, BATCH_2, 2, {
   status: "stale",
   staleReason: "批次结果已更新",
 })
+const DETAIL_2_R1 = reportDetail(REPORT_2_R1, BATCH_2, 1)
+// A P7-era revision: its snapshot predates the D49 fields, so they stay absent.
+const LEGACY_CONTENT = reportContent({ degraded: true })
+delete LEGACY_CONTENT.batch.baseFallbackReason
+delete LEGACY_CONTENT.batch.historyRewritten
 const DETAIL_1 = reportDetail(REPORT_1, BATCH_1, 1, {
-  content: reportContent({ degraded: true }),
+  content: LEGACY_CONTENT,
 })
 
 function emptyPage() {
@@ -215,13 +224,16 @@ describe("ReportsTab", () => {
     mocks.listReports.mockImplementation(
       (_versionId: string, filters: { batchId?: string } = {}) => {
         if (filters.batchId === BATCH_1) return Promise.resolve(page([REPORT_1_SUMMARY]))
-        if (filters.batchId === BATCH_2) return Promise.resolve(page([REPORT_2_SUMMARY]))
-        return Promise.resolve(page([REPORT_2_SUMMARY, REPORT_1_SUMMARY]))
+        if (filters.batchId === BATCH_2)
+          return Promise.resolve(page([REPORT_2_SUMMARY, REPORT_2_R1_SUMMARY]))
+        return Promise.resolve(page([REPORT_2_SUMMARY, REPORT_2_R1_SUMMARY, REPORT_1_SUMMARY]))
       },
     )
-    mocks.getReport.mockImplementation((_versionId: string, reportId: string) =>
-      Promise.resolve(reportId === REPORT_1 ? DETAIL_1 : DETAIL_2),
-    )
+    mocks.getReport.mockImplementation((_versionId: string, reportId: string) => {
+      if (reportId === REPORT_1) return Promise.resolve(DETAIL_1)
+      if (reportId === REPORT_2_R1) return Promise.resolve(DETAIL_2_R1)
+      return Promise.resolve(DETAIL_2)
+    })
     mocks.diffReports.mockResolvedValue(EMPTY_DIFF)
   })
 
@@ -270,6 +282,65 @@ describe("ReportsTab", () => {
     )
     expect(screen.queryByTestId("report-stale-banner")).toBeNull()
     expect(screen.getByTestId("report-degraded").textContent).toContain("AI 分析不可用")
+  })
+
+  it("lists the active batch revisions and switches revision", async () => {
+    const onReportChange = vi.fn()
+    render(<ReportsTab versionId={VERSION_ID} stream={STREAM} onReportChange={onReportChange} />)
+
+    await screen.findByTestId("report-revision-badge")
+    const selector = screen.getByTestId("report-revision-selector") as HTMLSelectElement
+    expect(selector.value).toBe(REPORT_2)
+    expect(mocks.listReports).toHaveBeenCalledWith(
+      VERSION_ID,
+      expect.objectContaining({ batchId: BATCH_2, limit: 100 }),
+      expect.anything(),
+    )
+    expect(
+      within(selector)
+        .getAllByRole("option")
+        .map((option) => (option as HTMLOptionElement).value),
+    ).toEqual([REPORT_2, REPORT_2_R1])
+
+    fireEvent.change(selector, { target: { value: REPORT_2_R1 } })
+    await waitFor(() => expect(onReportChange).toHaveBeenCalledWith(REPORT_2_R1))
+    await waitFor(() =>
+      expect(mocks.getReport).toHaveBeenLastCalledWith(VERSION_ID, REPORT_2_R1, expect.anything()),
+    )
+    await waitFor(() =>
+      expect(screen.getByTestId("report-revision-badge").textContent).toContain("revision 1"),
+    )
+    expect((screen.getByTestId("report-batch-selector") as HTMLSelectElement).value).toBe(BATCH_2)
+  })
+
+  it("shows D49 base fallback fields and the legacy unrecorded state", async () => {
+    const fallbackContent = reportContent()
+    fallbackContent.batch = {
+      ...fallbackContent.batch,
+      baseFallbackReason: "history_rewritten",
+      historyRewritten: true,
+    }
+    const withFallback = reportDetail(REPORT_2, BATCH_2, 2, { content: fallbackContent })
+    mocks.getReport.mockImplementation((_versionId: string, reportId: string) => {
+      if (reportId === REPORT_1) return Promise.resolve(DETAIL_1)
+      if (reportId === REPORT_2_R1) return Promise.resolve(DETAIL_2_R1)
+      return Promise.resolve(withFallback)
+    })
+
+    render(<ReportsTab versionId={VERSION_ID} stream={STREAM} />)
+
+    const fallback = await screen.findByTestId("report-batch-fallback")
+    expect(fallback.textContent).toContain("history_rewritten")
+    expect(fallback.textContent).toContain("历史已回退")
+    expect(screen.getByTestId("report-batch-baseline").textContent).toContain("abc123baseline")
+
+    fireEvent.change(screen.getByTestId("report-batch-selector"), {
+      target: { value: BATCH_1 },
+    })
+    await waitFor(() =>
+      expect(screen.getByTestId("report-batch-fallback").textContent).toContain("未记录"),
+    )
+    expect(screen.getByTestId("report-batch-baseline").textContent).toContain("abc123baseline")
   })
 
   it("regenerates a stale report into a new revision", async () => {
@@ -390,6 +461,9 @@ describe("ReportsTab", () => {
     )
     expect(mocks.getReport).toHaveBeenCalledWith(VERSION_ID, REPORT_1, expect.anything())
     expect((screen.getByTestId("report-batch-selector") as HTMLSelectElement).value).toBe(BATCH_1)
+    expect((screen.getByTestId("report-revision-selector") as HTMLSelectElement).value).toBe(
+      REPORT_1,
+    )
     expect(screen.getByTestId("report-degraded")).toBeTruthy()
   })
 

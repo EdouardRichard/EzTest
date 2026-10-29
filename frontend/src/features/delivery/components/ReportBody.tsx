@@ -10,7 +10,7 @@ import {
   labelOf,
   severityVariant,
 } from "../labels"
-import type { ReportContent } from "../types"
+import type { ReportContent, ReportContentBatch } from "../types"
 
 const TH_CLASS = "px-3 py-2 text-left text-xs font-medium text-muted-foreground"
 const TD_CLASS = "px-3 py-2 text-sm"
@@ -25,6 +25,34 @@ function sourceLabel(source: string): string {
 /** Sum of the per-case evidence counters, shown on the summary card. */
 function evidenceTotal(content: ReportContent): number {
   return content.cases.reduce((sum, item) => sum + item.evidenceCount, 0)
+}
+
+/**
+ * D49 fallback marker. A legacy snapshot has neither field recorded and shows
+ * "未记录" (history is never rewritten); a new snapshot records both, where an
+ * empty reason is an explicit "no fallback".
+ */
+function fallbackLabel(batch: ReportContentBatch): string {
+  if (batch.baseFallbackReason === undefined && batch.historyRewritten === undefined) {
+    return "未记录"
+  }
+  if (batch.historyRewritten === true) {
+    const reason =
+      batch.baseFallbackReason === undefined || batch.baseFallbackReason === ""
+        ? "history_rewritten"
+        : batch.baseFallbackReason
+    return `${reason}（历史已回退）`
+  }
+  if (batch.baseFallbackReason !== undefined && batch.baseFallbackReason !== "") {
+    return batch.baseFallbackReason
+  }
+  return "无回退"
+}
+
+/** The batch base commit, falling back to the version code baseline (D49). */
+function baselineCommit(content: ReportContent): string {
+  if (content.batch.codeBaseCommit !== "") return content.batch.codeBaseCommit
+  return content.version.codeBaselineCommit
 }
 
 export type ReportBodyProps = {
@@ -250,6 +278,16 @@ export function ReportBody({ versionId, content, onOpenIssue, onOpenCase }: Repo
           <div>
             <dt className="text-muted-foreground">系统</dt>
             <dd>{content.appendix.system === "" ? "—" : content.appendix.system}</dd>
+          </div>
+          <div>
+            <dt className="text-muted-foreground">代码基线</dt>
+            <dd data-testid="report-batch-baseline" className="break-all font-mono">
+              {baselineCommit(content) === "" ? "—" : baselineCommit(content)}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-muted-foreground">回退标记</dt>
+            <dd data-testid="report-batch-fallback">{fallbackLabel(content.batch)}</dd>
           </div>
           <div>
             <dt className="text-muted-foreground">代码提交</dt>

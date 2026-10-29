@@ -60,6 +60,9 @@ func renderReportMarkdown(content domain.ReportContent, revision int, fingerprin
 func writeReportMarkdownHeader(builder *strings.Builder, content domain.ReportContent) {
 	fmt.Fprintf(builder, "- 版本状态：%s\n", reportMarkdownPlaceholder(content.Version.Status))
 	fmt.Fprintf(builder, "- 批次状态：%s\n", reportMarkdownPlaceholder(content.Batch.Status))
+	fmt.Fprintf(builder, "- 代码基线：%s\n",
+		reportMarkdownPlaceholder(content.Version.CodeBaselineCommit))
+	fmt.Fprintf(builder, "- 回退标记：%s\n", reportMarkdownFallback(content.Batch))
 	fmt.Fprintf(builder, "- 代码：%s → %s（commit）\n",
 		reportMarkdownPlaceholder(content.Batch.CodeBaseCommit),
 		reportMarkdownPlaceholder(content.Batch.HeadCommit))
@@ -68,6 +71,26 @@ func writeReportMarkdownHeader(builder *strings.Builder, content domain.ReportCo
 		builder.WriteString("- 降级：报告生成时存在 AI 分析/补全降级项，结论可能不完整\n")
 	}
 	builder.WriteString("\n")
+}
+
+// reportMarkdownFallback renders the D49 fallback marker: a legacy snapshot
+// without the fields is "未记录", a new snapshot with an empty reason is "无",
+// and a recorded reason is rendered verbatim with the history_rewritten note.
+func reportMarkdownFallback(batch domain.ReportBatch) string {
+	if batch.BaseFallbackReason == nil && batch.HistoryRewritten == nil {
+		return "未记录"
+	}
+	if batch.HistoryRewritten != nil && *batch.HistoryRewritten {
+		reason := domain.ReportBaseFallbackHistoryRewritten
+		if batch.BaseFallbackReason != nil && *batch.BaseFallbackReason != "" {
+			reason = *batch.BaseFallbackReason
+		}
+		return reason + "（历史已回退）"
+	}
+	if batch.BaseFallbackReason != nil && *batch.BaseFallbackReason != "" {
+		return *batch.BaseFallbackReason
+	}
+	return "无"
 }
 
 // writeReportMarkdownRequirements writes the requirement coverage table.

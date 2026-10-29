@@ -53,7 +53,9 @@ type ReportVersionSource struct {
 // ReportBatchSource is the batch projection a report is generated from. It
 // carries ids/counts/status only: never evidence bodies, credentials or file
 // paths. FlakyCaseIDs and Degraded are computed by the execution-context adapter
-// from the batch's attempts and the autonomy chain.
+// from the batch's attempts and the autonomy chain. BaseFallbackReason mirrors
+// run_batch.base_fallback_reason (D49) and therefore comes from the batch
+// adapter, not from a report-side derivation.
 type ReportBatchSource struct {
 	ID             int64
 	VersionID      int64
@@ -78,6 +80,10 @@ type ReportBatchSource struct {
 	InterruptedCount  int
 	FlakyCaseIDs      []int64
 	Degraded          bool
+	// BaseFallbackReason is the persisted base_fallback_reason of the batch
+	// (empty when the batch did not fall back). It is stored in the report
+	// snapshot as baseFallbackReason/historyRewritten (spec §7.3/D49).
+	BaseFallbackReason string
 }
 
 // ReportCaseRunSource is the latest attempt of one case node in the batch.

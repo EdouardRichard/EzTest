@@ -253,6 +253,103 @@ func TestReportFingerprintStableAndSensitive(t *testing.T) {
 	}
 }
 
+// TestReportContentD49BatchFields pins the §7.3 snapshot extension: a newly
+// generated snapshot records the batch base-fallback reason and the
+// history_rewritten flag, while a legacy snapshot that predates the fields keeps
+// them absent (nil) so history is never rewritten on read.
+func TestReportContentD49BatchFields(t *testing.T) {
+	legacy := reportTestContent()
+	encoded, err := legacy.CanonicalJSON()
+	if err != nil {
+		t.Fatalf("canonical legacy content: %v", err)
+	}
+	for _, key := range []string{`"baseFallbackReason"`, `"historyRewritten"`} {
+		if strings.Contains(string(encoded), key) {
+			t.Fatalf("legacy snapshot unexpectedly carries %s: %s", key, encoded)
+		}
+	}
+	if err := legacy.Validate(); err != nil {
+		t.Fatalf("legacy snapshot without the D49 fields must stay valid: %v", err)
+	}
+
+	reason := "history_rewritten"
+	rewritten := true
+	content := reportTestContent()
+	content.Batch.BaseFallbackReason = &reason
+	content.Batch.HistoryRewritten = &rewritten
+	if err := content.Validate(); err != nil {
+		t.Fatalf("recorded D49 snapshot rejected: %v", err)
+	}
+	encoded, err = content.CanonicalJSON()
+	if err != nil {
+		t.Fatalf("canonical recorded content: %v", err)
+	}
+	for _, needle := range []string{
+		`"baseFallbackReason":"history_rewritten"`,
+		`"historyRewritten":true`,
+	} {
+		if !strings.Contains(string(encoded), needle) {
+			t.Fatalf("recorded snapshot missing %s: %s", needle, encoded)
+		}
+	}
+
+	// The flag and its reason must never disagree.
+	broken := content
+	broken.Batch.BaseFallbackReason = nil
+	if err := broken.Validate(); err == nil {
+		t.Fatal("snapshot with historyRewritten but no baseFallbackReason was accepted")
+	}
+}
+
+// TestReportFingerprintIncludesEvidenceAndFailureClassCounts pins the §7.3 stale
+// linkage: a per-case evidence count or a failure-class tally change must alter
+// the fingerprint even when statuses and timestamps are unchanged.
+func TestReportFingerprintIncludesEvidenceAndFailureClassCounts(t *testing.T) {
+	base := ReportFingerprintInput{
+		Batch: ReportFingerprintBatch{
+			ID:     "20",
+			Status: "done",
+			FailureClasses: ReportFingerprintFailureClasses{
+				Application: 1,
+			},
+		},
+		LatestCaseRuns: []ReportFingerprintCaseRun{
+			{
+				CaseRunID:     "102",
+				Attempt:       1,
+				Status:        "failed",
+				FailureClass:  "application",
+				EvidenceCount: 1,
+			},
+		},
+	}
+	first, err := base.Compute()
+	if err != nil {
+		t.Fatalf("compute fingerprint: %v", err)
+	}
+
+	evidenceChanged := base
+	evidenceChanged.LatestCaseRuns = append([]ReportFingerprintCaseRun(nil), base.LatestCaseRuns...)
+	evidenceChanged.LatestCaseRuns[0].EvidenceCount = 2
+	evidenceDigest, err := evidenceChanged.Compute()
+	if err != nil {
+		t.Fatalf("compute evidence-changed fingerprint: %v", err)
+	}
+	if evidenceDigest == first {
+		t.Fatal("fingerprint ignored a per-case evidence count change")
+	}
+
+	classChanged := base
+	classChanged.Batch.FailureClasses.Application = 2
+	classDigest, err := classChanged.Compute()
+	if err != nil {
+		t.Fatalf("compute failure-class-changed fingerprint: %v", err)
+	}
+	if classDigest == first {
+		t.Fatal("fingerprint ignored a failure-class count change")
+	}
+}
+
 // reportTestTime formats t the way the report fingerprint does.
 func reportTestTime(t time.Time) string {
 	return t.UTC().Format(time.RFC3339Nano)

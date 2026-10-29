@@ -718,6 +718,163 @@ func TestReportStaleMarksOnceAndEnsureRegenerates(t *testing.T) {
 	}
 }
 
+// TestReportSnapshotRecordsBaseFallback pins the D49 snapshot fields of §7.3:
+// the batch's base_fallback_reason is recorded both as the raw reason and as
+// the history_rewritten flag, and the Markdown export carries the code baseline
+// and fallback marker.
+func TestReportSnapshotRecordsBaseFallback(t *testing.T) {
+	setup := newReportTestSetup(t)
+	setup.execution.batch.BaseFallbackReason = "history_rewritten"
+	report, _ := setup.ensure(t)
+
+	if report.Content.Batch.BaseFallbackReason == nil ||
+		*report.Content.Batch.BaseFallbackReason != "history_rewritten" {
+		t.Fatalf("baseFallbackReason = %v, want history_rewritten",
+			report.Content.Batch.BaseFallbackReason)
+	}
+	if report.Content.Batch.HistoryRewritten == nil || !*report.Content.Batch.HistoryRewritten {
+		t.Fatalf("historyRewritten = %v, want true", report.Content.Batch.HistoryRewritten)
+	}
+	body := string(setup.files.files[report.MarkdownPath])
+	for _, needle := range []string{
+		"- 代码基线：" + setup.versions.version.CodeBaselineCommit,
+		"- 回退标记：history_rewritten（历史已回退）",
+	} {
+		if !strings.Contains(body, needle) {
+			t.Fatalf("markdown missing %q:\n%s", needle, body)
+		}
+	}
+}
+
+// TestReportSnapshotRecordsNoFallbackForNewReport pins that a freshly generated
+// report always records the D49 fields: an absent reason is the explicit "no
+// fallback" state, distinct from the legacy "unrecorded" state.
+func TestReportSnapshotRecordsNoFallbackForNewReport(t *testing.T) {
+	setup := newReportTestSetup(t)
+	report, _ := setup.ensure(t)
+
+	if report.Content.Batch.BaseFallbackReason == nil ||
+		*report.Content.Batch.BaseFallbackReason != "" {
+		t.Fatalf("baseFallbackReason = %v, want recorded empty reason",
+			report.Content.Batch.BaseFallbackReason)
+	}
+	if report.Content.Batch.HistoryRewritten == nil || *report.Content.Batch.HistoryRewritten {
+		t.Fatalf("historyRewritten = %v, want recorded false", report.Content.Batch.HistoryRewritten)
+	}
+	body := string(setup.files.files[report.MarkdownPath])
+	if !strings.Contains(body, "- 回退标记：无") {
+		t.Fatalf("markdown missing the no-fallback marker:\n%s", body)
+	}
+}
+
+// TestReportLegacyD49SnapshotStaysUnrecorded pins "missing D49 fields display as
+// unrecorded and never rewrite history": reading a legacy revision whose stored
+// snapshot predates the fields keeps them nil and does not add them to the JSON.
+func TestReportLegacyD49SnapshotStaysUnrecorded(t *testing.T) {
+	setup := newReportTestSetup(t)
+	fingerprint, err := setup.service.currentFingerprint(context.Background(), 10, 20)
+	if err != nil {
+		t.Fatalf("current fingerprint: %v", err)
+	}
+	legacy := reportTestStoredReport(901, 10, 20, domain.ReportStatusPublished,
+		domain.ReportContent{
+			Schema: domain.ReportSchemaV1,
+			Batch:  domain.ReportBatch{ID: "20", BatchNo: 2, Kind: "incremental", Status: "done"},
+		}, setup.clock.now)
+	legacy.InputFingerprint = fingerprint
+	setup.reports.reports[legacy.ID] = legacy
+
+	loaded, err := setup.service.Get(context.Background(), 10, legacy.ID)
+	if err != nil {
+		t.Fatalf("get legacy report: %v", err)
+	}
+	if loaded.Status != domain.ReportStatusPublished {
+		t.Fatalf("legacy status = %q, want published (matching fingerprint)", loaded.Status)
+	}
+	if loaded.Content.Batch.BaseFallbackReason != nil || loaded.Content.Batch.HistoryRewritten != nil {
+		t.Fatalf("legacy D49 fields were rewritten: %+v", loaded.Content.Batch)
+	}
+	encoded := string(reportTestContentJSON(t, loaded))
+	for _, key := range []string{"baseFallbackReason", "historyRewritten"} {
+		if strings.Contains(encoded, key) {
+			t.Fatalf("legacy snapshot gained %q on read: %s", key, encoded)
+		}
+	}
+}
+
+// TestReportStaleOnEvidenceCountChange pins the §7.3 stale linkage: an evidence
+// count change alone marks the published report stale and emits report.stale
+// exactly once with a reason; the old revision keeps its snapshot and Markdown,
+// and Ensure appends revision+1.
+func TestReportStaleOnEvidenceCountChange(t *testing.T) {
+	setup := newReportTestSetup(t)
+	first, _ := setup.ensure(t)
+	oldContentJSON := reportTestContentJSON(t, first)
+	oldMarkdown := append([]byte(nil), setup.files.files[first.MarkdownPath]...)
+
+	// A new evidence row was attached to the latest run: only the evidence count
+	// changes (status, failure class, batch tallies and timestamps are unchanged).
+	setup.execution.cases[0].EvidenceCount++
+
+	stale, err := setup.service.Get(context.Background(), 10, first.ID)
+	if err != nil {
+		t.Fatalf("get report after evidence change: %v", err)
+	}
+	if stale.Status != domain.ReportStatusStale {
+		t.Fatalf("status = %q, want stale after an evidence count change", stale.Status)
+	}
+	if stale.StaleReason != ReportStaleReasonInputChanged {
+		t.Fatalf("stale reason = %q, want %q", stale.StaleReason, ReportStaleReasonInputChanged)
+	}
+	if got := setup.events.countType(ReportEventStale); got != 1 {
+		t.Fatalf("report.stale events = %d, want 1", got)
+	}
+	for _, event := range setup.events.events {
+		if event.Type == ReportEventStale && event.Detail["reason"] != ReportStaleReasonInputChanged {
+			t.Fatalf("report.stale detail reason = %v, want %q",
+				event.Detail["reason"], ReportStaleReasonInputChanged)
+		}
+	}
+
+	// A second read must not publish a second report.stale event.
+	if _, err := setup.service.Get(context.Background(), 10, first.ID); err != nil {
+		t.Fatalf("get stale report again: %v", err)
+	}
+	if got := setup.events.countType(ReportEventStale); got != 1 {
+		t.Fatalf("report.stale events after second read = %d, want 1", got)
+	}
+
+	regenerated, created := setup.ensure(t)
+	if !created {
+		t.Fatal("Ensure on a stale report must create a new revision")
+	}
+	if regenerated.Revision != first.Revision+1 {
+		t.Fatalf("revision = %d, want %d", regenerated.Revision, first.Revision+1)
+	}
+	if got := reportTestCaseEvidenceCount(t, regenerated.Content, "12"); got != 5 {
+		t.Fatalf("regenerated evidence count = %d, want 5", got)
+	}
+	if got := reportTestCaseEvidenceCount(t, first.Content, "12"); got != 4 {
+		t.Fatalf("old revision evidence count = %d, want 4", got)
+	}
+
+	// The old revision keeps its snapshot and Markdown bytes untouched (only its
+	// status/staleReason change, which is the stale linkage itself).
+	storedOld := setup.reports.reports[first.ID]
+	if !bytes.Equal(reportTestContentJSON(t, storedOld), oldContentJSON) {
+		t.Fatal("old revision snapshot was rewritten")
+	}
+	if !bytes.Equal(setup.files.files[storedOld.MarkdownPath], oldMarkdown) {
+		t.Fatal("old revision markdown was rewritten")
+	}
+	if storedOld.Status != domain.ReportStatusStale {
+		t.Fatalf("old revision status = %q, want stale", storedOld.Status)
+	}
+	if got := setup.events.countType(ReportEventPublished); got != 2 {
+		t.Fatalf("report.published events = %d, want 2", got)
+	}
+}
+
 // TestReportRegenerateCreatesNextRevision pins POST regenerate semantics:
 // revision max+1, old revision retained, and a newer revision returned as-is.
 func TestReportRegenerateCreatesNextRevision(t *testing.T) {
@@ -1084,6 +1241,18 @@ func TestReportListRefreshesStale(t *testing.T) {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+// reportTestCaseEvidenceCount returns the evidence count of one case node.
+func reportTestCaseEvidenceCount(t *testing.T, content domain.ReportContent, caseNodeID string) int {
+	t.Helper()
+	for _, item := range content.Cases {
+		if item.CaseNodeID == caseNodeID {
+			return item.EvidenceCount
+		}
+	}
+	t.Fatalf("case node %s not found in the content", caseNodeID)
+	return 0
+}
 
 func reportTestContains(values []string, want string) bool {
 	for _, value := range values {
