@@ -159,8 +159,8 @@ P8 把 EzTest 从“P0–P7 功能可跑”推进到“可长期使用/可扩展
 | `codeintel_0006_version_change.sql` | `version_change` 批次代码变更快照 |
 | `codeintel_0007_fact_review.sql` | `code_fact_review` 人工事实修正 |
 | `version_0006_knowledge.sql` | `knowledge_entry` 版本内知识 |
-| `mindmap_0003_visual.sql` | `case_assertion` / `assertion_result` 放开 `visual` kind + `case_visual_assertion` |
-| `execution_0003_visual_evidence.sql` | `evidence.kind` 放宽 `visual_baseline`/`visual_diff` |
+| `mindmap_0003_visual.sql` | `case_assertion` 放开 `visual` kind + `case_visual_assertion` |
+| `execution_0003_visual_evidence.sql` | `assertion_result` 放开 `visual` kind；`evidence.kind` 放宽 `visual_baseline`/`visual_actual`/`visual_diff` |
 | `execution_0004_evidence_purge.sql` | `evidence.purged_at/purged_reason`（GC 元数据保留） |
 | `quality_0001_eval.sql` | `eval_run` + `eval_metric` |
 
@@ -222,9 +222,6 @@ CREATE TABLE knowledge_entry (
 ALTER TABLE case_assertion DROP CONSTRAINT IF EXISTS case_assertion_kind_check;
 ALTER TABLE case_assertion ADD CONSTRAINT ck_case_assertion_kind
   CHECK (kind IN ('ui','api','db','text','visual'));
-ALTER TABLE assertion_result DROP CONSTRAINT IF EXISTS assertion_result_kind_check;
-ALTER TABLE assertion_result ADD CONSTRAINT ck_assertion_result_kind
-  CHECK (kind IN ('ui','api','db','text','visual'));
 CREATE TABLE case_visual_assertion (
   assertion_id        BIGINT PRIMARY KEY,
   selector            TEXT NOT NULL DEFAULT '',
@@ -240,6 +237,9 @@ CREATE TABLE case_visual_assertion (
 );
 
 -- execution_0003_visual_evidence.sql（节选）
+ALTER TABLE assertion_result DROP CONSTRAINT IF EXISTS assertion_result_kind_check;
+ALTER TABLE assertion_result ADD CONSTRAINT ck_assertion_result_kind
+  CHECK (kind IN ('ui','api','db','text','visual'));
 ALTER TABLE evidence DROP CONSTRAINT IF EXISTS evidence_kind_check;
 ALTER TABLE evidence DROP CONSTRAINT IF EXISTS ck_evidence_kind;
 ALTER TABLE evidence ADD CONSTRAINT ck_evidence_kind CHECK (kind IN
