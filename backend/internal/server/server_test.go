@@ -552,7 +552,7 @@ func TestMiddlewareChainKeepsPublicRoutesPublic(t *testing.T) {
 	// public routes to exercise the auth carve-outs without the full server.
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
-	mux.HandleFunc("GET /api/health", handleAPIHealth(deps.Pinger, nil))
+	mux.HandleFunc("GET /api/health", handleAPIHealth(config.Config{Env: "test"}, deps.Pinger, nil))
 	mux.HandleFunc("GET /api/openapi.yaml", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})

@@ -18,6 +18,8 @@ const HEALTH = {
   commit: "abcdef1234567890",
   db: "ok",
   llm_configured: true,
+  rate_limit: { rps: 25, burst: 50, sse_max: 4 },
+  gc: { enabled: true, retention_days: 12, batch_keep: 5 },
 }
 
 describe("BasicConfigPanel", () => {
@@ -40,8 +42,12 @@ describe("BasicConfigPanel", () => {
 
     await waitFor(() => expect(screen.getByText("1.2.3")).toBeTruthy())
     expect(screen.getByText(/abcdef1/)).toBeTruthy()
-    expect(screen.getByText("50 次/秒 · 突发 100")).toBeTruthy()
-    expect(screen.getByText("30 天")).toBeTruthy()
+    // The panel projects the effective health values, not hard-coded defaults.
+    expect(screen.getByText("25 次/秒 · 突发 50")).toBeTruthy()
+    expect(screen.getByText("4 / 用户")).toBeTruthy()
+    expect(screen.getByText("12 天")).toBeTruthy()
+    expect(screen.getByText("5 批")).toBeTruthy()
+    expect(screen.getByText("允许非 dry-run")).toBeTruthy()
     expect(screen.getByText("≤ 2.5s")).toBeTruthy()
     expect(screen.getByText(/EZTEST_EVIDENCE_DIR/)).toBeTruthy()
     expect(screen.getByText(/修改环境变量后需重启后端服务/)).toBeTruthy()
@@ -51,7 +57,7 @@ describe("BasicConfigPanel", () => {
     const { container } = render(<BasicConfigPanel />)
     await waitFor(() => expect(screen.getByText("1.2.3")).toBeTruthy())
 
-    // Read-only projection: no inputs, selects or textareas exist.
+    // Read-only config projection: no inputs, selects or textareas exist.
     expect(container.querySelectorAll("input, textarea, select")).toHaveLength(0)
 
     const text = (document.body.textContent ?? "").toLowerCase()

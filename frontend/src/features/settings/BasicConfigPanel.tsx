@@ -13,6 +13,16 @@ type Health = {
   commit: string
   db: string
   llm_configured: boolean
+  rate_limit?: {
+    rps: number
+    burst: number
+    sse_max: number
+  }
+  gc?: {
+    enabled: boolean
+    retention_days: number
+    batch_keep: number
+  }
 }
 
 type ConfigItem = {
@@ -55,6 +65,20 @@ function configSections(health: Health | null): ConfigSection[] {
   const commit = health === null ? "—" : health.commit === "" ? "—" : health.commit.slice(0, 7)
   const llm = health === null ? "读取中…" : health.llm_configured ? "已配置" : "未配置"
   const database = health === null ? "读取中…" : health.db === "ok" ? "正常" : "异常"
+  // The effective thresholds come from /api/health; the documented defaults are
+  // shown until the probe answers and remain visible when it is unreachable.
+  const rateLimit = health?.rate_limit
+  const rateLimitValue =
+    rateLimit === undefined
+      ? "50 次/秒 · 突发 100"
+      : rateLimit.rps === 0
+        ? "已关闭"
+        : `${rateLimit.rps} 次/秒 · 突发 ${rateLimit.burst}`
+  const sseValue = rateLimit === undefined ? "10 / 用户" : `${rateLimit.sse_max} / 用户`
+  const gc = health?.gc
+  const retentionValue = gc === undefined ? "30 天" : `${gc.retention_days} 天`
+  const batchKeepValue = gc === undefined ? "3 批" : `${gc.batch_keep} 批`
+  const gcState = gc === undefined ? "默认关闭" : gc.enabled ? "允许非 dry-run" : "仅 dry-run"
   return [
     {
       title: "运行环境",
@@ -72,11 +96,11 @@ function configSections(health: Health | null): ConfigSection[] {
       title: "限流与保留",
       icon: ShieldCheck,
       items: [
-        { label: "限流阈值", value: "50 次/秒 · 突发 100", hint: "EZTEST_RATE_LIMIT_*" },
-        { label: "SSE 并发", value: "10 / 用户", hint: "EZTEST_RATE_LIMIT_SSE_MAX" },
-        { label: "GC 保留期", value: "30 天", hint: "EZTEST_GC_RETENTION_DAYS" },
-        { label: "最近批保护", value: "3 批", hint: "EZTEST_GC_BATCH_KEEP" },
-        { label: "定时 GC", value: "默认关闭", hint: "EZTEST_GC_ENABLED；只读投影" },
+        { label: "限流阈值", value: rateLimitValue, hint: "EZTEST_RATE_LIMIT_RPS / _BURST" },
+        { label: "SSE 并发", value: sseValue, hint: "EZTEST_RATE_LIMIT_SSE_MAX" },
+        { label: "GC 保留期", value: retentionValue, hint: "EZTEST_GC_RETENTION_DAYS" },
+        { label: "最近批保护", value: batchKeepValue, hint: "EZTEST_GC_BATCH_KEEP" },
+        { label: "GC 执行模式", value: gcState, hint: "EZTEST_GC_ENABLED；只读投影" },
       ],
     },
     {

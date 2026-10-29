@@ -455,6 +455,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/db.ps1 start
 | `EZTEST_SUPPLEMENT_MAX_CASES` | 否 | P7 规格目标：补全单 run 最多新用例数（默认 `5`，1–20）；**当前构建以代码固定上限 5 执行，尚未读取该变量**（P8 接线）。 |
 | `EZTEST_DB_RESULT_MAX_BYTES` | 否 | P7 db 断言单次结果字节上限，64 KiB–16 MiB，默认 `1048576`。 |
 | `EZTEST_DB_SQL_MAX_BYTES` | 否 | P7 db 断言 SQL 文本上限，1 KiB–64 KiB，默认 `16384`。 |
+| `EZTEST_RATE_LIMIT_RPS` | 否 | P8 每用户（认证后）/IP（公开路由）令牌桶速率，0–1000，默认 `50`；`0` 关闭普通令牌桶（SSE 并发上限仍生效）。超限返回 429 `rate_limited` + `Retry-After`。 |
+| `EZTEST_RATE_LIMIT_BURST` | 否 | P8 令牌桶突发容量，1–5000，默认 `100`。 |
+| `EZTEST_RATE_LIMIT_SSE_MAX` | 否 | P8 每用户/IP 并发 SSE 流上限，1–100，默认 `10`；超并发 429。SSE 心跳不计入普通桶。 |
+| `EZTEST_GC_ENABLED` | 否 | P8 是否允许**非 dry-run** 证据 GC，默认 `false`（`POST /api/admin/gc` 默认/仅 dry-run；`false` 时显式执行返回 409）。 |
+| `EZTEST_GC_RETENTION_DAYS` | 否 | P8 未引用证据保留天数，1–3650，默认 `30`。 |
+| `EZTEST_GC_BATCH_KEEP` | 否 | P8 最近 N 批证据始终受保护，1–50，默认 `3`。 |
 | `llm_base_url` / `llm_key` / `llm_model_name` | 否 | 首次启动的可选默认 LLM 种子；小写变量名是设计约定，Key 留空则不发起真实调用。P4 复用该配置，不新增模型/Key。 |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Compose | 仅 `deploy/docker-compose.yml` 使用；`POSTGRES_PASSWORD` 必填。 |
 | `NEXT_PUBLIC_API_BASE_URL` | 否 | 浏览器访问的 API origin，默认 `http://localhost:13333`；Compose 构建时内联。 |
