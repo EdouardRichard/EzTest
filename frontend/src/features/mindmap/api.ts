@@ -18,8 +18,10 @@ import type {
   CaseRunView,
   CaseSourceView,
   CaseStepView,
+  CaseVisualAssertionView,
   CodeAnchorView,
   CreateAnchorBody,
+  ApproveVisualBaselineBody,
   CreateAssertionBody,
   CreateExportBody,
   CreateNodeBody,
@@ -44,6 +46,7 @@ import type {
   UpdateFindingBody,
   UpdateNodeBody,
   UpdateStepBody,
+  UpdateVisualAssertionBody,
 } from "./types"
 
 /** Version-context prefix. The version id stays a decimal string (spec §7.1). */
@@ -222,6 +225,30 @@ export function deleteAssertion(
   )
 }
 
+/** PUT /assertions/{assertionId}/visual — visual comparison parameters (§9.3). */
+export function updateVisualAssertion(
+  versionId: string,
+  assertionId: string,
+  body: UpdateVisualAssertionBody,
+): Promise<CaseVisualAssertionView> {
+  return apiPut<CaseVisualAssertionView>(
+    `${mindmapPath(versionId)}/assertions/${encodeURIComponent(assertionId)}/visual`,
+    body,
+  )
+}
+
+/** POST /assertions/{assertionId}/visual/baseline — admin baseline approval. */
+export function approveVisualBaseline(
+  versionId: string,
+  assertionId: string,
+  body: ApproveVisualBaselineBody,
+): Promise<CaseVisualAssertionView> {
+  return apiPost<CaseVisualAssertionView>(
+    `${mindmapPath(versionId)}/assertions/${encodeURIComponent(assertionId)}/visual/baseline`,
+    body,
+  )
+}
+
 /** POST /nodes/{nodeId}/sources — 201 with the created source (endpoint 13). */
 export function createSource(
   versionId: string,
@@ -392,6 +419,8 @@ export const mindmapApi = {
   createAssertion,
   updateAssertion,
   deleteAssertion,
+  updateVisualAssertion,
+  approveVisualBaseline,
   createSource,
   deleteSource,
   createAnchor,

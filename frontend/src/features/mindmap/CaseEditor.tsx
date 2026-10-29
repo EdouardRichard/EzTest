@@ -25,7 +25,46 @@ const ASSERTION_KIND_OPTIONS: readonly { value: AssertionKind; label: string }[]
   { value: "api", label: "接口" },
   { value: "db", label: "数据库" },
   { value: "text", label: "文本" },
+  { value: "visual", label: "视觉" },
 ]
+
+/** Editable text state of one visual assertion configuration. */
+type VisualDraft = {
+  selector: string
+  threshold: string
+  viewportWidth: string
+  viewportHeight: string
+  deviceScaleFactor: string
+  useRegion: boolean
+  x: string
+  y: string
+  width: string
+  height: string
+  /** Evidence id the administrator wants to approve as the baseline. */
+  baselineEvidenceId: string
+}
+
+const VISUAL_DEFAULT_THRESHOLD = 0.005
+const VISUAL_DEFAULT_VIEWPORT_WIDTH = 1280
+const VISUAL_DEFAULT_VIEWPORT_HEIGHT = 720
+
+/** Builds the editable draft of one visual assertion (server defaults when unset). */
+function toVisualDraft(assertion: CaseAssertionView): VisualDraft {
+  const visual = assertion.visual ?? null
+  return {
+    selector: visual?.selector ?? "",
+    threshold: String(visual?.threshold ?? VISUAL_DEFAULT_THRESHOLD),
+    viewportWidth: String(visual?.viewportWidth ?? VISUAL_DEFAULT_VIEWPORT_WIDTH),
+    viewportHeight: String(visual?.viewportHeight ?? VISUAL_DEFAULT_VIEWPORT_HEIGHT),
+    deviceScaleFactor: String(visual?.deviceScaleFactor ?? 1),
+    useRegion: visual?.region != null,
+    x: String(visual?.region?.x ?? 0),
+    y: String(visual?.region?.y ?? 0),
+    width: String(visual?.region?.width ?? 1),
+    height: String(visual?.region?.height ?? 1),
+    baselineEvidenceId: "",
+  }
+}
 
 const STATUS_LABEL: Record<CaseNodeStatus, string> = {
   draft: "草稿",
@@ -114,6 +153,8 @@ export type CaseEditorProps = {
   onDeleted: (nodeId: string) => void
   /** Optional reload hook rendered in the 409 stale-draft banner. */
   onRefresh?: () => void
+  /** Server-owned administrator role; enables visual baseline approval. */
+  isAdmin?: boolean
 }
 
 /**
@@ -148,6 +189,7 @@ function CaseEditorForm({
   onSaved,
   onDeleted,
   onRefresh,
+  isAdmin = false,
 }: CaseEditorProps) {
   const uid = useId()
   const [form, setForm] = useState<EditorFormState>(() => toFormState(node))
@@ -163,6 +205,13 @@ function CaseEditorForm({
     target: "",
     expression: "",
     expected: "",
+  })
+  const [visualDrafts, setVisualDrafts] = useState<Record<string, VisualDraft>>(() => {
+    const drafts: Record<string, VisualDraft> = {}
+    for (const assertion of node.assertions) {
+      if (assertion.kind === "visual") drafts[assertion.id] = toVisualDraft(assertion)
+    }
+    return drafts
   })
 
   function updateForm(patch: Partial<EditorFormState>): void {
@@ -351,6 +400,91 @@ function CaseEditorForm({
       await mindmapApi.deleteAssertion(versionId, assertion.id, revision)
       setAssertions((current) => current.filter((item) => item.id !== assertion.id))
     })
+  }
+
+  function visualDraft(assertion: CaseAssertionView): VisualDraft {
+    return visualDrafts[assertion.id] ?? toVisualDraft(assertion)
+  }
+
+  function updateVisualDraft(assertion: CaseAssertionView, patch: Partial<VisualDraft>): void {
+    setVisualDrafts((current) => ({
+      ...current,
+      [assertion.id]: { ...(current[assertion.id] ?? toVisualDraft(assertion)), ...patch },
+    }))
+  }
+
+  /** Persists the selector/region/threshold/viewport of one visual assertion. */
+  function handleSaveVisual(assertion: CaseAssertionView): void {
+    const draft = visualDraft(assertion)
+    const threshold = Number(draft.threshold)
+    const viewportWidth = Number(draft.viewportWidth)
+    const viewportHeight = Number(draft.viewportHeight)
+    const deviceScaleFactor = Number(draft.deviceScaleFactor)
+    if (
+      !Number.isFinite(threshold) ||
+      !Number.isInteger(viewportWidth) ||
+      !Number.isInteger(viewportHeight) ||
+      !Number.isFinite(deviceScaleFactor)
+    ) {
+      setError({ message: "视觉断言参数必须是有效数字。", stale: false })
+      return
+    }
+    let region: { x: number; y: number; width: number; height: number } | null = null
+    if (draft.useRegion) {
+      const coordinates = [draft.x, draft.y, draft.width, draft.height].map(Number)
+      if (coordinates.some((value) => !Number.isFinite(value))) {
+        setError({ message: "视觉区域坐标必须是有效数字。", stale: false })
+        return
+      }
+      region = {
+        x: coordinates[0] ?? 0,
+        y: coordinates[1] ?? 0,
+        width: coordinates[2] ?? 0,
+        height: coordinates[3] ?? 0,
+      }
+    }
+    void perform(`visual-${assertion.id}`, async () => {
+      const updated = await mindmapApi.updateVisualAssertion(versionId, assertion.id, {
+        nodeRevision: revision,
+        selector: draft.selector.trim(),
+        region,
+        threshold,
+        viewport: { width: viewportWidth, height: viewportHeight },
+        deviceScaleFactor,
+      })
+      setAssertions((current) =>
+        current.map((item) => (item.id === assertion.id ? { ...item, visual: updated } : item)),
+      )
+      setVisualDrafts((current) => ({
+        ...current,
+        [assertion.id]: { ...draft, baselineEvidenceId: "" },
+      }))
+    })
+  }
+
+  /** Administrator-only baseline approval (design spec §9.3). */
+  async function handleApproveBaseline(assertion: CaseAssertionView): Promise<void> {
+    const evidenceId = visualDraft(assertion).baselineEvidenceId.trim()
+    if (evidenceId === "") {
+      setError({ message: "请填写作为基线的证据 ID。", stale: false })
+      return
+    }
+    setBusy(`baseline-${assertion.id}`)
+    setError(null)
+    try {
+      const updated = await mindmapApi.approveVisualBaseline(versionId, assertion.id, {
+        evidenceId,
+      })
+      setAssertions((current) =>
+        current.map((item) => (item.id === assertion.id ? { ...item, visual: updated } : item)),
+      )
+      // Baseline approval is an annotation: the node revision does not change.
+      onSaved()
+    } catch (caught) {
+      setError(toEditorError(caught))
+    } finally {
+      setBusy(null)
+    }
   }
 
   async function handleDeleteNode(): Promise<void> {
@@ -832,6 +966,186 @@ function CaseEditorForm({
                     />
                   </label>
                 </div>
+                {assertion.kind === "visual" ? (
+                  <div
+                    data-testid={`assertion-visual-${assertion.id}`}
+                    className="mt-2 space-y-2 rounded-lg border border-dashed border-border p-2"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-1">
+                      <span className="text-[11px] font-medium text-muted-foreground">
+                        视觉比对参数
+                      </span>
+                      <span className="text-[11px] text-muted-foreground">
+                        {assertion.visual?.baselineEvidenceId
+                          ? `基线 #${assertion.visual.baselineEvidenceId}`
+                          : "基线未设置"}
+                      </span>
+                    </div>
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      <label className="block text-[11px] text-muted-foreground">
+                        选择器（空=整页）
+                        <input
+                          aria-label={`断言 ${index + 1} 视觉选择器`}
+                          value={visualDraft(assertion).selector}
+                          disabled={!editable || controlsDisabled}
+                          onChange={(event) =>
+                            updateVisualDraft(assertion, { selector: event.target.value })
+                          }
+                          className={FIELD_CLASS}
+                        />
+                      </label>
+                      <label className="block text-[11px] text-muted-foreground">
+                        阈值（0–0.1）
+                        <input
+                          type="number"
+                          step="0.001"
+                          min="0"
+                          max="0.1"
+                          aria-label={`断言 ${index + 1} 视觉阈值`}
+                          value={visualDraft(assertion).threshold}
+                          disabled={!editable || controlsDisabled}
+                          onChange={(event) =>
+                            updateVisualDraft(assertion, { threshold: event.target.value })
+                          }
+                          className={FIELD_CLASS}
+                        />
+                      </label>
+                      <label className="block text-[11px] text-muted-foreground">
+                        视口宽
+                        <input
+                          type="number"
+                          min="1"
+                          aria-label={`断言 ${index + 1} 视口宽`}
+                          value={visualDraft(assertion).viewportWidth}
+                          disabled={!editable || controlsDisabled}
+                          onChange={(event) =>
+                            updateVisualDraft(assertion, { viewportWidth: event.target.value })
+                          }
+                          className={FIELD_CLASS}
+                        />
+                      </label>
+                      <label className="block text-[11px] text-muted-foreground">
+                        视口高
+                        <input
+                          type="number"
+                          min="1"
+                          aria-label={`断言 ${index + 1} 视口高`}
+                          value={visualDraft(assertion).viewportHeight}
+                          disabled={!editable || controlsDisabled}
+                          onChange={(event) =>
+                            updateVisualDraft(assertion, { viewportHeight: event.target.value })
+                          }
+                          className={FIELD_CLASS}
+                        />
+                      </label>
+                      <label className="block text-[11px] text-muted-foreground">
+                        DPR
+                        <input
+                          type="number"
+                          step="0.5"
+                          min="0.5"
+                          max="4"
+                          aria-label={`断言 ${index + 1} 视觉 DPR`}
+                          value={visualDraft(assertion).deviceScaleFactor}
+                          disabled={!editable || controlsDisabled}
+                          onChange={(event) =>
+                            updateVisualDraft(assertion, { deviceScaleFactor: event.target.value })
+                          }
+                          className={FIELD_CLASS}
+                        />
+                      </label>
+                      <label className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                        <input
+                          type="checkbox"
+                          aria-label={`断言 ${index + 1} 启用区域裁剪`}
+                          checked={visualDraft(assertion).useRegion}
+                          disabled={!editable || controlsDisabled}
+                          onChange={(event) =>
+                            updateVisualDraft(assertion, { useRegion: event.target.checked })
+                          }
+                        />
+                        区域裁剪（归一化坐标）
+                      </label>
+                    </div>
+                    {visualDraft(assertion).useRegion ? (
+                      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                        {(
+                          [
+                            ["x", "X"],
+                            ["y", "Y"],
+                            ["width", "宽"],
+                            ["height", "高"],
+                          ] as const
+                        ).map(([field, label]) => (
+                          <label
+                            key={field}
+                            className="block text-[11px] text-muted-foreground"
+                          >
+                            {label}
+                            <input
+                              type="number"
+                              step="0.01"
+                              min="0"
+                              max="1"
+                              aria-label={`断言 ${index + 1} 区域 ${field}`}
+                              value={visualDraft(assertion)[field]}
+                              disabled={!editable || controlsDisabled}
+                              onChange={(event) =>
+                                updateVisualDraft(assertion, { [field]: event.target.value })
+                              }
+                              className={FIELD_CLASS}
+                            />
+                          </label>
+                        ))}
+                      </div>
+                    ) : null}
+                    <div className="flex flex-wrap items-end justify-between gap-2">
+                      <button
+                        type="button"
+                        aria-label={`保存视觉参数 ${index + 1}`}
+                        disabled={!editable || controlsDisabled}
+                        onClick={() => handleSaveVisual(assertion)}
+                        className={SMALL_BUTTON_CLASS}
+                      >
+                        保存视觉参数
+                      </button>
+                      <span className="text-[11px] text-muted-foreground">
+                        {`修订 ${assertion.visual?.revision ?? 0}`}
+                      </span>
+                    </div>
+                    {isAdmin ? (
+                      <div className="flex flex-wrap items-end gap-2 rounded-lg bg-muted/30 p-2">
+                        <label className="block flex-1 text-[11px] text-muted-foreground">
+                          基线证据 ID（管理员审批）
+                          <input
+                            aria-label={`断言 ${index + 1} 基线证据 ID`}
+                            value={visualDraft(assertion).baselineEvidenceId}
+                            disabled={controlsDisabled}
+                            onChange={(event) =>
+                              updateVisualDraft(assertion, {
+                                baselineEvidenceId: event.target.value,
+                              })
+                            }
+                            className={FIELD_CLASS}
+                          />
+                        </label>
+                        <button
+                          type="button"
+                          aria-label={`审批基线 ${index + 1}`}
+                          disabled={controlsDisabled}
+                          onClick={() => void handleApproveBaseline(assertion)}
+                          className={SMALL_BUTTON_CLASS}
+                        >
+                          审批为基线
+                        </button>
+                      </div>
+                    ) : (
+                      <p className="text-[11px] text-muted-foreground">
+                        基线审批需要管理员权限。
+                      </p>
+                    )}
+                  </div>
+                ) : null}
               </li>
             ))}
           </ol>

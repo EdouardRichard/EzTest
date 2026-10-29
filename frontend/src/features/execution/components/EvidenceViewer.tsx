@@ -13,7 +13,7 @@ import { parseDbResultEvidence } from "../db-result"
 import { describeExecutionError } from "../execution-errors"
 import type { EvidenceMeta, EvidenceView } from "../types"
 
-/** Human labels of the frozen evidence kinds (spec §5.7, P7 §10.6). */
+/** Human labels of the frozen evidence kinds (spec §5.7, P7 §10.6, P8 §9.3). */
 export const EVIDENCE_KIND_LABELS: Record<string, string> = {
   screenshot: "截图",
   http_exchange: "HTTP 交换",
@@ -21,6 +21,17 @@ export const EVIDENCE_KIND_LABELS: Record<string, string> = {
   network_log: "网络日志",
   download: "下载文件",
   db_result: "数据库结果",
+  visual_baseline: "视觉基线",
+  visual_actual: "视觉实际截图",
+  visual_diff: "视觉差异图",
+}
+
+/** Image evidence kinds rendered as an <img> from an object URL. */
+const IMAGE_KINDS = new Set(["screenshot", "visual_baseline", "visual_actual", "visual_diff"])
+
+/** True when the kind is an image artifact (screenshot or visual evidence). */
+export function isImageEvidenceKind(kind: string): boolean {
+  return IMAGE_KINDS.has(kind)
 }
 
 /** Label for any evidence kind; unknown values stay visible instead of blank. */
@@ -87,7 +98,7 @@ const FOCUSABLE_SELECTOR =
 
 /** Kinds whose bytes are displayed/downloaded rather than parsed as JSON. */
 function isBinaryKind(kind: string): boolean {
-  return kind === "screenshot" || kind === "download"
+  return isImageEvidenceKind(kind) || kind === "download"
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -521,8 +532,8 @@ export function EvidenceViewer({
   const screenshotCompare =
     ready !== null &&
     compareReady !== null &&
-    ready.meta.kind === "screenshot" &&
-    compareReady.meta.kind === "screenshot"
+    isImageEvidenceKind(ready.meta.kind) &&
+    isImageEvidenceKind(compareReady.meta.kind)
       ? { primary: ready, compare: compareReady }
       : null
 
@@ -539,18 +550,31 @@ export function EvidenceViewer({
   }
 
   function renderReady(content: Extract<ViewerState, { status: "ready" }>) {
-    if (content.meta.kind === "screenshot") {
+    if (isImageEvidenceKind(content.meta.kind)) {
+      const isVisual = content.meta.kind !== "screenshot"
+      const label = evidenceKindLabel(content.meta.kind)
       return (
         <figure className="space-y-2">
+          {content.meta.kind === "visual_diff" ? (
+            <p
+              data-testid="evidence-visual-diff"
+              className="rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
+            >
+              差异图：高亮像素为实际截图与基线不一致的区域。
+            </p>
+          ) : null}
           {/* biome-ignore lint/performance/noImgElement: evidence bytes come from an object URL, not a static asset */}
           <img
             src={content.objectUrl}
-            alt={`截图证据 ${content.meta.id}`}
-            data-testid="evidence-screenshot"
+            alt={`${label}证据 ${content.meta.id}`}
+            data-testid={isVisual ? "evidence-visual-image" : "evidence-screenshot"}
+            data-visual-kind={isVisual ? content.meta.kind : undefined}
             className="mx-auto max-h-[68vh] w-auto rounded-xl border border-border bg-muted/30 object-contain"
           />
           <figcaption className="text-center text-[11px] text-muted-foreground">
-            截图证据 · 点击遮罩或按 Esc 关闭
+            {isVisual
+              ? `${label} · 可与其他截图并排/滑块对比 · 点击遮罩或按 Esc 关闭`
+              : "截图证据 · 点击遮罩或按 Esc 关闭"}
           </figcaption>
         </figure>
       )
