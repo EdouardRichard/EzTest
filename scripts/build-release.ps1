@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
 .SYNOPSIS
     Builds the Docker-free EzTest release packages (Windows x64 + Linux x64).
@@ -2036,7 +2036,25 @@ exit 0
     $linuxScript = $linuxScript.Replace("__TAR_PATH__", (ConvertTo-WslPath -WindowsPath $TarGzPath))
     $linuxScript = $linuxScript.Replace("__PACKAGE_NAME__", $packageName)
     $linuxScript = $linuxScript.Replace("__JAR_URL__", $script:ZonkyPostgresJarUrl)
-    Write-FileUtf8NoBom -Path $scriptPath -Text $linuxScript.Replace("`r`n", "`n")
+    $linuxScript = $linuxScript.Replace("`r`n", "`n")
+    # Prefer the cached PostgreSQL jar when present: the WSL download of the
+    # ~15 MB zonky artifact has timed out on slow links, which would fail the
+    # smoke step for a packaging-unrelated reason.
+    $cachedJar = Join-Path $script:CacheDir "zonky-pg17-linux-amd64.jar"
+    if (Test-Path -LiteralPath $cachedJar) {
+        $downloadBlock = "    echo `"downloading PostgreSQL 17 linux binaries (~15 MB)...`"`n" +
+            "    curl -fsSL --max-time 300 -o `"`$ROOT/pg17.jar`" `"`$JAR_URL`" || { echo `"PG_JAR_DOWNLOAD_FAILED`"; exit 1; }"
+        $wslJarPath = ConvertTo-WslPath -WindowsPath $cachedJar
+        $copyBlock = '    cp "' + $wslJarPath + '" "$ROOT/pg17.jar" || { echo "PG_JAR_COPY_FAILED"; exit 1; }'
+        $patched = $linuxScript.Replace($downloadBlock, $copyBlock)
+        if ($patched -eq $linuxScript) {
+            Write-Warn "Could not inject the cached PostgreSQL jar into the Linux smoke script; falling back to the download."
+        } else {
+            $linuxScript = $patched
+            Write-Info "Linux smoke test will use the cached PostgreSQL jar: $cachedJar"
+        }
+    }
+    Write-FileUtf8NoBom -Path $scriptPath -Text $linuxScript
     $wslScriptPath = ConvertTo-WslPath -WindowsPath $scriptPath
     $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
     if ($null -eq $wsl) { Write-Warn "WSL disappeared; skipping the Linux package smoke test."; return "skipped" }
