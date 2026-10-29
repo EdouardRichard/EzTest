@@ -77,6 +77,56 @@ const PRIMARY_BUTTON_CLASS =
 const SECONDARY_BUTTON_CLASS =
   "inline-flex items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-2 text-sm font-medium transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
 
+/**
+ * Height of the embedded canvas column. The version-detail tab sits below the
+ * page chrome (topbar, version header, tab bar), so the canvas follows the
+ * viewport instead of always occupying the full-screen 70vh viewport.
+ */
+const EMBEDDED_CANVAS_HEIGHT_CLASS = "h-[calc(100vh-20rem)] min-h-[420px]"
+
+type EmbeddedStatusBarProps = {
+  streamStatus: SSEStatus
+  loading: boolean
+  onRefresh: () => void
+}
+
+/**
+ * Compact status strip of the embedded tab (spec §7.1): the tab drops the
+ * full-screen header, but the stream state and a manual refresh must stay
+ * visible. It intentionally carries no title, back link or baseline badge.
+ */
+function EmbeddedStatusBar({ streamStatus, loading, onRefresh }: EmbeddedStatusBarProps) {
+  const meta = STREAM_STATUS_META[streamStatus]
+  return (
+    <div
+      data-testid="mindmap-embedded-status"
+      className="flex flex-wrap items-center justify-end gap-1.5 rounded-xl border border-border bg-card px-3 py-2"
+    >
+      <span
+        data-testid="stream-status"
+        data-status={streamStatus}
+        className="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-2.5 py-1 text-[11px] font-medium"
+      >
+        <StatusBadge variant={meta.variant}>{meta.label}</StatusBadge>
+      </span>
+      <button
+        type="button"
+        data-testid="btn-refresh-mindmap"
+        onClick={onRefresh}
+        disabled={loading}
+        className={SECONDARY_BUTTON_CLASS}
+      >
+        {loading ? (
+          <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+        ) : (
+          <RefreshCw className="h-4 w-4" aria-hidden="true" />
+        )}
+        刷新
+      </button>
+    </div>
+  )
+}
+
 /** Number of nodes removed together with a scenario (delete confirmation copy). */
 function countDescendants(nodes: readonly CaseNodeView[], rootId: string): number {
   const childrenByParent = new Map<string, string[]>()
@@ -316,9 +366,9 @@ export function MindmapPage({
 
   const streamBadge = STREAM_STATUS_META[streamStatus]
   const versionLabel = version?.name ?? versionId
-  // The embedded tab follows the version detail container's height instead of
-  // owning the full-screen page (spec §7.1).
-  const rootClass = embedded ? "flex h-full min-h-0 flex-col space-y-3" : "space-y-3"
+  // The embedded tab follows the tab content instead of owning the full-screen
+  // page; its canvas column carries the explicit height (spec §7.1).
+  const rootClass = embedded ? "flex min-h-0 flex-col space-y-3" : "space-y-3"
 
   if (graph === null) {
     return (
@@ -345,6 +395,10 @@ export function MindmapPage({
             </span>
           </header>
         )}
+
+        {embedded ? (
+          <EmbeddedStatusBar streamStatus={streamStatus} loading={loading} onRefresh={reload} />
+        ) : null}
 
         {error === "" ? (
           <p
@@ -464,6 +518,10 @@ export function MindmapPage({
         </header>
       )}
 
+      {embedded ? (
+        <EmbeddedStatusBar streamStatus={streamStatus} loading={loading} onRefresh={reload} />
+      ) : null}
+
       {graph.baseline !== null ? (
         <p
           data-testid="readonly-banner"
@@ -539,7 +597,12 @@ export function MindmapPage({
       )}
 
       <div className="grid min-w-0 gap-3 xl:grid-cols-[minmax(0,1fr)_24rem]">
-        <div className="min-w-0 space-y-3">
+        <div
+          data-testid="mindmap-canvas-column"
+          className={
+            embedded ? `flex min-w-0 flex-col ${EMBEDDED_CANVAS_HEIGHT_CLASS}` : "min-w-0 space-y-3"
+          }
+        >
           {noNodes ? (
             <section
               data-testid="mindmap-empty"
@@ -652,6 +715,7 @@ export function MindmapPage({
               collapsed={collapsed}
               onToggle={toggleCollapsed}
               svgRef={svgRef}
+              embedded={embedded}
             />
           )}
         </div>

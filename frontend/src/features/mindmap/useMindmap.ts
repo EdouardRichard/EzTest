@@ -110,6 +110,8 @@ export function useMindmap(versionId: string, stream?: VersionStreamState): UseM
   const [error, setError] = useState("")
 
   const { events, status } = useMindmapStream(versionId, stream)
+  const eventsRef = useRef(events)
+  eventsRef.current = events
 
   const versionIdRef = useRef(versionId)
   const generationRef = useRef(0)
@@ -179,13 +181,19 @@ export function useMindmap(versionId: string, stream?: VersionStreamState): UseM
 
   // Initial load and full reset when the version changes. The high-water seq
   // belongs to the old channel, so reset it (and drop any pending throttle)
-  // before the new version's events can arrive.
+  // before the new version's events can arrive. Events already held by the
+  // stream at mount (the embedded tab shares the version detail's long-lived
+  // channel) predate this read and form the baseline, exactly like a
+  // delivery/execution projection of the same stream (T8): they must not
+  // trigger an immediate second `GET /mindmap`.
   useEffect(() => {
     versionIdRef.current = versionId
     generationRef.current += 1
     requestRef.current += 1
     cancelTrailing()
-    maxSeqRef.current = 0
+    maxSeqRef.current = maxEventSeq(
+      eventsRef.current.filter((event) => isEventForVersion(event, versionId)),
+    )
     lastRefreshAtRef.current = Date.now()
     setGraph(null)
     setError("")

@@ -98,6 +98,11 @@ export type MindmapCanvasProps = {
    * (spec §6.10). It stays `null` while the graph has no visible nodes.
    */
   svgRef?: Ref<SVGSVGElement>
+  /**
+   * Embedded layout: fill the parent's explicit height (the version-detail tab
+   * sets it) instead of owning the standalone 70vh viewport height.
+   */
+  embedded?: boolean
 }
 
 /**
@@ -113,6 +118,7 @@ export function MindmapCanvas({
   collapsed,
   onToggle,
   svgRef,
+  embedded = false,
 }: MindmapCanvasProps) {
   const collapsedSet = useMemo(
     () => new Set<string>((collapsed ?? []) as Iterable<string>),
@@ -315,8 +321,11 @@ export function MindmapCanvas({
     <section
       data-testid="mindmap-canvas"
       data-zoom={zoom}
+      data-embedded={embedded ? "true" : undefined}
       aria-label="用例脑图"
-      className="flex min-h-0 min-w-0 flex-col gap-2 rounded-2xl border border-border bg-card p-3"
+      className={`flex min-h-0 min-w-0 flex-col gap-2 rounded-2xl border border-border bg-card p-3 ${
+        embedded ? "h-full" : ""
+      }`}
     >
       <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="text-xs text-muted-foreground">
@@ -366,7 +375,9 @@ export function MindmapCanvas({
       <div
         ref={viewportRef}
         data-testid="mindmap-viewport"
-        className="relative h-[70vh] min-h-[420px] w-full touch-none overflow-hidden rounded-xl border border-border bg-muted/20"
+        className={`relative w-full touch-none overflow-hidden rounded-xl border border-border bg-muted/20 ${
+          embedded ? "min-h-0 flex-1" : "h-[70vh] min-h-[420px]"
+        }`}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={endDrag}

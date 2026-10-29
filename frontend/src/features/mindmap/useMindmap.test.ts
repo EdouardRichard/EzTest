@@ -35,7 +35,7 @@ vi.mock("@/features/versions/useVersionStream", () => ({
   useVersionStream: mocks.useVersionStream,
 }))
 
-import { useMindmap } from "./useMindmap"
+import { MINDMAP_REFRESH_THROTTLE_MS, useMindmap } from "./useMindmap"
 
 const VERSION_ID = "1844674407370955161"
 const OTHER_VERSION_ID = "1844674407370955162"
@@ -180,6 +180,36 @@ describe("useMindmap", () => {
     await flushPromises()
     expect(mocks.apiGet).toHaveBeenCalledTimes(2)
     expect(rendered.result.current.graph).toBe(refreshed)
+  })
+
+  it("treats the events already in the provided stream as the mount-time baseline", async () => {
+    mocks.apiGet.mockResolvedValueOnce(graphFixture())
+    // The version detail has been listening for a while, so the shared stream
+    // already holds case events when the embedded tab mounts.
+    const provided: StreamState = {
+      events: [event(4), event(5)],
+      status: "live",
+      reconnect: vi.fn(),
+    }
+
+    const rendered = renderHook(() => useMindmap(VERSION_ID, provided))
+    await flushPromises()
+    expect(mocks.apiGet).toHaveBeenCalledTimes(1)
+
+    // Historical events must not trigger a second read (not even a trailing one).
+    await advance(MINDMAP_REFRESH_THROTTLE_MS + 100)
+    await flushPromises()
+    expect(mocks.apiGet).toHaveBeenCalledTimes(1)
+    expect(rendered.result.current.graph).not.toBeNull()
+
+    // A genuinely new event still refreshes the graph exactly once.
+    mocks.apiGet.mockResolvedValueOnce(graphFixture({ editable: false }))
+    provided.events = [event(4), event(5), event(6)]
+    rendered.rerender()
+    await flushPromises()
+    await advance(MINDMAP_REFRESH_THROTTLE_MS + 100)
+    await flushPromises()
+    expect(mocks.apiGet).toHaveBeenCalledTimes(2)
   })
 
   it("surfaces a described error when the initial load fails", async () => {
