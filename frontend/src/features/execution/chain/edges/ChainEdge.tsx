@@ -14,6 +14,7 @@ import {
   type ChainColorName,
   EDGE_KIND_TOKENS,
   getResultStatusToken,
+  isResultStatus,
 } from "../chain-tokens"
 import type { ChainEdgeKindDTO } from "../chain-types"
 
@@ -30,11 +31,13 @@ export type ChainFlowEdge = Edge<ChainEdgeData, "chain">
 /**
  * Semantic colour of one edge kind.
  *
- * The palette is authoritative for `requirement_case` (indigo), `result_issue`
- * and `case_issue` (red, an issue is an issue regardless of layer), and
- * `impact_case` (amber). `case_result` borrows the target result's status token
- * so a passed edge is green and a failed one is red without opening the card;
- * an unknown/absent status falls back to the neutral `case_result` token.
+ * `EDGE_KIND_TOKENS` is the single source of truth (spec §5.4): indigo for
+ * `requirement_case`, red for `result_issue`, violet for `case_issue` and amber
+ * for `impact_case`. `case_result` borrows the target result's status token so a
+ * passed edge is green and a failed one is red without opening the card; an
+ * absent, empty or unknown status falls back to the neutral `case_result` token
+ * (teal) instead of the generic unknown status colour, so the edge still reads
+ * as "execution" rather than as an unknown result.
  */
 export function getChainEdgeColorName(
   kind: ChainEdgeKindDTO | string,
@@ -42,17 +45,21 @@ export function getChainEdgeColorName(
 ): ChainColorName {
   switch (kind) {
     case "requirement_case":
-      return "indigo"
-    case "case_result":
+      return EDGE_KIND_TOKENS.requirement_case.color
+    case "case_result": {
       if (targetStatus === undefined || targetStatus.trim() === "") {
         return EDGE_KIND_TOKENS.case_result.color
       }
-      return getResultStatusToken(targetStatus).color
+      return isResultStatus(targetStatus)
+        ? getResultStatusToken(targetStatus).color
+        : EDGE_KIND_TOKENS.case_result.color
+    }
     case "result_issue":
+      return EDGE_KIND_TOKENS.result_issue.color
     case "case_issue":
-      return "red"
+      return EDGE_KIND_TOKENS.case_issue.color
     case "impact_case":
-      return "amber"
+      return EDGE_KIND_TOKENS.impact_case.color
     default:
       return "slate"
   }
@@ -88,9 +95,13 @@ export function getChainEdgeLabel(kind: ChainEdgeKindDTO | string): string {
  * Custom edge of the exploration chain.
  *
  * Draws the semantic colour, the Chinese kind label and React Flow's arrow
- * marker. The running animation itself is owned by React Flow (`animated` on
- * the edge) so `prefers-reduced-motion` only has to decide whether to set it.
- * `impact_case` is always dashed amber.
+ * marker. The semantic colour and width are passed through inline `style`
+ * rather than SVG presentation attributes: `@xyflow/react/dist/style.css` sets
+ * `.react-flow__edge-path { stroke: var(--xy-edge-stroke); stroke-width: … }`,
+ * and CSS always beats presentation attributes — only inline style wins. The
+ * running animation itself is owned by React Flow (`animated` on the edge) so
+ * `prefers-reduced-motion` only has to decide whether to set it. `impact_case`
+ * is always dashed amber.
  */
 export const ChainEdge = memo(function ChainEdge({
   id,
@@ -124,9 +135,11 @@ export const ChainEdge = memo(function ChainEdge({
           id={id}
           path={path}
           markerEnd={markerEnd}
-          stroke={stroke}
-          strokeWidth={1.5}
-          strokeDasharray={kind === "impact_case" ? "6 6" : undefined}
+          style={{
+            stroke,
+            strokeWidth: 1.5,
+            ...(kind === "impact_case" ? { strokeDasharray: "6 6" } : null),
+          }}
         />
       </g>
       {label === "" ? null : (
