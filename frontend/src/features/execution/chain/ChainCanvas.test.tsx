@@ -357,15 +357,17 @@ describe("ChainCanvas", () => {
     expect(container.querySelector(".react-flow__controls-fitview")).not.toBeNull()
   })
 
-  it("fills the parent height and clamps zoom-out to the spec minimum", async () => {
+  it("fills the parent viewport instead of pinning its own minimum height", async () => {
     renderCanvas()
     const canvas = await screen.findByTestId("chain-canvas")
 
-    // The parent owns the 72vh/60vh height; the canvas itself must not pin a
-    // fixed 600px height that would fight it.
+    // The tab owns the 60vh/72vh workspace and reserves a row for the floating
+    // toolbar; the canvas must fill exactly the remaining viewport. Pinning its
+    // own 420px floor would overflow that row and put the toolbar back on top
+    // of the first node row at 1280x720.
     expect(canvas.className).toContain("h-full")
     expect(canvas.className).toContain("w-full")
-    expect(canvas.className).toContain("min-h-[420px]")
+    expect(canvas.className).not.toContain("min-h-[420px]")
     expect(canvas.className).not.toContain("h-[600px]")
     expect(flowProbe.props?.minZoom).toBe(0.1)
   })

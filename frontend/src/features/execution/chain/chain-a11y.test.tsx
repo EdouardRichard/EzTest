@@ -209,8 +209,11 @@ const SNAPSHOT = chainSnapshot200()
 
 /**
  * Runs axe on the rendered container and fails on serious/critical impact only.
- * Color contrast is disabled because jsdom has no layout/paint engine, exactly
- * like the existing global a11y gate.
+ *
+ * `color-contrast` is disabled because jsdom has no layout/paint engine, so this
+ * gate makes **no contrast claim**. Contrast of the chain is covered separately
+ * by Task 22 and its manual/visual review; this test must not be reported as an
+ * "axe clean with no exclusions" result.
  */
 async function expectNoSeriousA11yViolations(container: HTMLElement): Promise<void> {
   const results = await axe.run(container, {
@@ -278,6 +281,18 @@ describe("探索链路 a11y（200 节点 + 键盘全流程）", () => {
     )
     // The hidden tree renders every node; the canvas itself also mounted.
     expect(screen.getByTestId("chain-canvas")).not.toBeNull()
+    // The filter toolbar must sit above the React Flow viewport, not on top of
+    // the first node row: at 1280x720 a pointer click on a baseline/issue card
+    // would otherwise be swallowed by the overlay. jsdom has no layout engine,
+    // so this pins the structure that the E2E pointer hit-test proves.
+    const toolbar = screen.getByTestId("chain-toolbar")
+    const canvasViewport = screen.getByTestId("chain-canvas-viewport")
+    expect(canvasViewport.contains(toolbar)).toBe(false)
+    expect(toolbar.contains(canvasViewport)).toBe(false)
+    expect(
+      toolbar.compareDocumentPosition(canvasViewport) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).not.toBe(0)
+    expect(canvasViewport.contains(screen.getByTestId("chain-canvas"))).toBe(true)
     expect(screen.getByTestId("exploration-visible-count").textContent).toContain(
       `可见 ${NODE_COUNT} 个节点`,
     )

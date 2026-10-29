@@ -522,7 +522,7 @@ function ChainCanvasFlow({
     <ChainInteractionContext.Provider value={interaction}>
       <div
         data-testid="chain-canvas"
-        className="relative h-full min-h-[420px] w-full overflow-hidden rounded-xl border border-border bg-background"
+        className="relative h-full w-full overflow-hidden rounded-xl border border-border bg-background"
       >
         <ReactFlow
           nodes={flowNodes}

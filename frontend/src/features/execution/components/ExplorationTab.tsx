@@ -31,7 +31,7 @@ import { useExplorationChain } from "../chain/use-exploration-chain"
  */
 const ChainCanvas = dynamic(() => import("../chain/ChainCanvas"), {
   ssr: false,
-  loading: () => <ChainSkeleton className="h-full min-h-[420px]" />,
+  loading: () => <ChainSkeleton className="h-full" />,
 })
 
 const BUTTON_CLASS =
@@ -483,41 +483,54 @@ export function ExplorationTab({
       ) : (
         <div
           data-testid="chain-workspace"
-          className="relative h-[60vh] min-h-[420px] w-full lg:h-[72vh]"
+          className="relative flex h-[60vh] min-h-[420px] w-full flex-col gap-2 lg:h-[72vh]"
         >
-          {hasData && chain.data !== null ? (
-            <div className="absolute inset-0">
-              <ChainCanvas
-                snapshot={chain.data}
-                selectedId={selectedCanvasId}
-                onSelect={handleCanvasSelect}
-                collapsed={collapsedSet}
-                onToggleCollapse={toggleRequirement}
-                follow={follow}
-                onEscape={closeSheet}
-              />
-            </div>
-          ) : null}
-
-          <ChainLegend empty={!hasData || (layout?.nodes.length ?? 0) === 0} />
-
-          <div className="pointer-events-none absolute inset-x-2 top-2 z-30 flex justify-end">
-            <div className="pointer-events-auto max-w-full">{toolbar}</div>
+          {/*
+            The filter toolbar owns its own row above the canvas instead of
+            floating on top of it. React Flow's fitView only knows the size of
+            its own container, so an overlay would fit the first node row
+            underneath the toolbar at 1280x720 and swallow pointer clicks on
+            the baseline/issue cards. With this row the viewport below it is
+            the exact area fitView computes against.
+          */}
+          <div
+            data-testid="chain-workspace-toolbar"
+            className="relative z-30 flex shrink-0 justify-end px-2 pt-2"
+          >
+            <div className="max-w-full">{toolbar}</div>
           </div>
 
-          {!hasData ? (
-            <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 overflow-auto p-4">
-              {chain.loading && !hasSnapshot ? (
-                <ChainSkeleton className="w-full" />
-              ) : chain.error !== "" && !hasSnapshot ? (
-                <div className="w-full">
-                  <ChainError message={chain.error} onRetry={retry} />
-                </div>
-              ) : hasSnapshot ? (
-                <ChainEmpty filtered={filtersActive} />
-              ) : null}
-            </div>
-          ) : null}
+          <div data-testid="chain-canvas-viewport" className="relative min-h-0 flex-1">
+            {hasData && chain.data !== null ? (
+              <div className="absolute inset-0">
+                <ChainCanvas
+                  snapshot={chain.data}
+                  selectedId={selectedCanvasId}
+                  onSelect={handleCanvasSelect}
+                  collapsed={collapsedSet}
+                  onToggleCollapse={toggleRequirement}
+                  follow={follow}
+                  onEscape={closeSheet}
+                />
+              </div>
+            ) : null}
+
+            <ChainLegend empty={!hasData || (layout?.nodes.length ?? 0) === 0} />
+
+            {!hasData ? (
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 overflow-auto p-4">
+                {chain.loading && !hasSnapshot ? (
+                  <ChainSkeleton className="w-full" />
+                ) : chain.error !== "" && !hasSnapshot ? (
+                  <div className="w-full">
+                    <ChainError message={chain.error} onRetry={retry} />
+                  </div>
+                ) : hasSnapshot ? (
+                  <ChainEmpty filtered={filtersActive} />
+                ) : null}
+              </div>
+            ) : null}
+          </div>
         </div>
       )}
 

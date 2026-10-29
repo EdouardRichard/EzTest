@@ -1,0 +1,68 @@
+{
+    "generatedAt":  "2026-10-29T08:47:00.0540691Z",
+    "mode":  "measure",
+    "status":  "passed",
+    "apiBaseUrl":  "http://127.0.0.1:13333",
+    "webBaseUrl":  "http://localhost:6868",
+    "thresholds":  {
+                       "apiP95Ms":  800,
+                       "canvasP95Ms":  2500
+                   },
+    "dataset":  {
+                    "requirements":  50,
+                    "cases":  50,
+                    "results":  50,
+                    "issues":  50,
+                    "nodes":  200,
+                    "edges":  400
+                },
+    "datasetState":  {
+                         "VersionID":  8840000000000000001,
+                         "Requirements":  50,
+                         "Cases":  50,
+                         "Results":  50,
+                         "Issues":  50,
+                         "CaseSources":  300
+                     },
+    "checks":  [
+                   {
+                       "Area":  "environment",
+                       "Check":  "API reachable",
+                       "Status":  "PASS",
+                       "Detail":  "http://127.0.0.1:13333"
+                   },
+                   {
+                       "Area":  "environment",
+                       "Check":  "admin login",
+                       "Status":  "PASS",
+                       "Detail":  "authenticated against the running API"
+                   },
+                   {
+                       "Area":  "dataset",
+                       "Check":  "seed",
+                       "Status":  "PASS",
+                       "Detail":  "50 requirements, 50 cases, 50 results, 50 issues, 300 requirement links"
+                   },
+                   {
+                       "Area":  "dataset",
+                       "Check":  "read model",
+                       "Status":  "PASS",
+                       "Detail":  "GET exploration-chain returned 200 nodes and 400 edges"
+                   }
+               ],
+    "measurements":  {
+                         "chainApiP95Ms":  {
+                                               "status":  "PASS",
+                                               "threshold":  "\u003c= 800 ms",
+                                               "value":  92.2,
+                                               "detail":  "P50 82.4 ms over 20 samples (200 nodes/400 edges)"
+                                           },
+                         "chainCanvasP95Ms":  {
+                                                  "status":  "PASS",
+                                                  "threshold":  "\u003c= 2500 ms",
+                                                  "value":  1109,
+                                                  "detail":  "5 measured navigations (1 warm-up excluded)"
+                                              }
+                     },
+    "note":  "Local measurement. SKIP means the API/database/browser was missing; a measured browser failure is FAIL, never SKIP."
+}
