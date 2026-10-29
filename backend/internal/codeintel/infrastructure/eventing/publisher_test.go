@@ -247,6 +247,65 @@ func TestImpactComputedEventPayloadCaps(t *testing.T) {
 	}
 }
 
+// TestVersionChangedEventCarriesBatchSummaryOnly pins the P8 §11.2
+// version_change code.changed payload: the fixed batch/commit/count/rewritten
+// keys only, a decimal-string batch id (D29), no code content and no paths.
+func TestVersionChangedEventCarriesBatchSummaryOnly(t *testing.T) {
+	ctx := context.Background()
+	recorder := &fakeEventPublisher{}
+	publisher := codeinteleventing.NewPublisher(recorder)
+
+	err := publisher.VersionChanged(ctx, 42, codeintelapp.VersionChangeEvent{
+		BatchID:          11,
+		BaseCommit:       "base-commit",
+		HeadCommit:       "head-commit",
+		ChangedFiles:     3,
+		ImpactedCases:    2,
+		HistoryRewritten: true,
+	})
+	if err != nil {
+		t.Fatalf("VersionChanged: %v", err)
+	}
+	if len(recorder.events) != 1 {
+		t.Fatalf("published %d events, want 1", len(recorder.events))
+	}
+	event := recorder.events[0]
+	if event.Channel != "version:42" || event.VersionID == nil || *event.VersionID != "42" {
+		t.Fatalf("channel/version_id = %q/%v", event.Channel, event.VersionID)
+	}
+	if event.Type != "code.changed" {
+		t.Fatalf("type = %q, want code.changed", event.Type)
+	}
+	if len(event.Refs.Code) != 0 {
+		t.Fatalf("refs.code = %v, want no code paths on the batch summary", event.Refs.Code)
+	}
+	if runes := utf8.RuneCountInString(event.Summary); runes == 0 || runes > 500 {
+		t.Fatalf("summary = %q (%d runes), want 1..500", event.Summary, runes)
+	}
+	if len(event.Detail) > 64<<10 {
+		t.Fatalf("detail is %d bytes, want at most 64 KiB", len(event.Detail))
+	}
+	detail := detailMap(t, event.Detail)
+	if len(detail) != 6 {
+		t.Fatalf("detail = %v, want exactly the six documented keys", detail)
+	}
+	if detail["batchId"] != "11" {
+		t.Fatalf("detail.batchId = %v (%T), want the decimal string \"11\"", detail["batchId"], detail["batchId"])
+	}
+	if detail["baseCommit"] != "base-commit" || detail["headCommit"] != "head-commit" {
+		t.Fatalf("detail commits = %v", detail)
+	}
+	if detail["changedFiles"] != float64(3) || detail["impactedCases"] != float64(2) ||
+		detail["historyRewritten"] != true {
+		t.Fatalf("detail counters = %v", detail)
+	}
+	for _, forbidden := range []string{"content", "diff", "items", "caseIds", "paths"} {
+		if _, ok := detail[forbidden]; ok {
+			t.Fatalf("detail leaks %q: %v", forbidden, detail)
+		}
+	}
+}
+
 // TestPublisherContract covers the remaining envelope rules: nil stats become
 // an empty object, invalid stats fail before publishing, publish failures are
 // returned and a nil publisher is a disabled no-op.
@@ -314,6 +373,9 @@ func TestPublisherContract(t *testing.T) {
 		}
 		if err := publisher.ImpactComputed(ctx, 5, codeintelapp.ImpactEvent{AnalysisID: 1}); err != nil {
 			t.Fatalf("ImpactComputed(nil publisher)=%v want nil", err)
+		}
+		if err := publisher.VersionChanged(ctx, 5, codeintelapp.VersionChangeEvent{BatchID: 1}); err != nil {
+			t.Fatalf("VersionChanged(nil publisher)=%v want nil", err)
 		}
 	})
 }

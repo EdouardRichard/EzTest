@@ -8,13 +8,20 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/codeintel/domain"
 )
 
-// VersionChanges returns the version-scoped change preview (design spec §7.3):
-// the application service resolves the version's bound baseline commit and the
-// head (explicit 40-hex descendant of the baseline, or the repository fixed
-// branch tip live) and computes the diff without persisting it. The ChangeList
-// DTO of R7 is returned inside data; changeSetId stays null until an analysis
-// persists the deterministic change set. The preview is not cursor-paged, so
-// nextCursor is null and hasMore false.
+// VersionChanges returns the version-scoped change preview (design spec
+// §7.3/§7.2, D58): the application service resolves the version's bound baseline
+// commit and the head (explicit 40-hex descendant of the baseline, or the
+// repository fixed branch tip live) and computes the diff without persisting it.
+// The ChangeList DTO of R7 is returned inside data; changeSetId stays null until
+// an analysis persists the deterministic change set. The preview is not cursor-
+// paged, so nextCursor is null and hasMore false.
+//
+// When the P8 per-batch snapshot service is wired, the same response gains an
+// additive batchTimeline array (Batch 1→N, commit pair, impacted cases, unmapped
+// count and summary items). Missing snapshots are generated and upserted by that
+// service; a version without a code repository returns an empty array instead of
+// an error. Every P7 field keeps its exact previous shape, so old clients are
+// unaffected.
 func (h *Handler) VersionChanges(w http.ResponseWriter, r *http.Request) {
 	versionID, err := PathID(r, "id")
 	if err != nil {
@@ -32,7 +39,15 @@ func (h *Handler) VersionChanges(w http.ResponseWriter, r *http.Request) {
 		writeInternalError(w, r)
 		return
 	}
-	WriteData(w, http.StatusOK, dto)
+	entries := make([]application.VersionChangeTimelineEntry, 0)
+	if h.versionChanges != nil {
+		entries, err = h.versionChanges.Timeline(r.Context(), versionID)
+		if err != nil {
+			WriteServiceError(w, r, err)
+			return
+		}
+	}
+	WriteData(w, http.StatusOK, newVersionChangesDTO(dto, entries))
 }
 
 // StartAnalysis triggers a version-scoped impact analysis or reuses the done one

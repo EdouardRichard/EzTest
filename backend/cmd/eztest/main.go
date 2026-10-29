@@ -387,6 +387,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	codeIntelCache := codeintelpg.NewCacheRepository(database.Pool)
 	codeIntelEdges := codeintelpg.NewEdgeRepository(database.Pool)
 	codeIntelAnchors := codeintelpg.NewAnchorRepository(database.Pool)
+	codeIntelVersionChangeRepo := codeintelpg.NewVersionChangeRepository(database.Pool)
 
 	// Cross-context adapters (design spec §3.5): the P2 repository catalog (repo
 	// and app-model reads), the P2 index-state writer, the P3 read-only version
@@ -494,6 +495,20 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		IDs:       snowflake,
 		Clock:     wallClock{},
 	})
+	// P8 D58: per-batch version_change snapshots. Missing snapshots are computed
+	// and upserted on read (older P7 batches never persisted one); the same
+	// eventing publisher announces each created snapshot as code.changed.
+	codeIntelVersionChange := codeintelapp.NewVersionChangeService(codeintelapp.VersionChangeServiceDeps{
+		Git:      codeIntelGit,
+		Repos:    codeIntelRepos,
+		Versions: codeIntelVersions,
+		Entities: codeIntelEntities,
+		Anchors:  codeIntelAnchors,
+		Changes:  codeIntelVersionChangeRepo,
+		Notifier: codeIntelEvents,
+		IDs:      snowflake,
+		Clock:    wallClock{},
+	})
 
 	// Both async services exist now, so the worker can execute them and recover
 	// the previous process's leftover queued/running runs before serving its
@@ -523,11 +538,12 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	// The handler group is assembled here, in the composition root; no service
 	// is constructed inside the HTTP layer (design spec §3.6, Agent.md §6.2).
 	codeIntelHandler := codeintelhttp.NewHandler(codeintelhttp.HandlerDeps{
-		Index:    codeIntelIndex,
-		Query:    codeIntelQuery,
-		Analyses: codeIntelAnalysis,
-		Anchors:  codeIntelAnchor,
-		Repos:    codeIntelRepos,
+		Index:          codeIntelIndex,
+		Query:          codeIntelQuery,
+		Analyses:       codeIntelAnalysis,
+		Anchors:        codeIntelAnchor,
+		VersionChanges: codeIntelVersionChange,
+		Repos:          codeIntelRepos,
 	})
 
 	// P5 mindmap context: the nine repositories, the cross-context adapters (P3

@@ -17,7 +17,9 @@ import (
 // /api/code/repos needs both the repository catalog and the index service for
 // its latest-run projection, the index-run reads need the index service, the
 // live Git/facts reads and the version change preview need the query service,
-// and the version analyses/anchors routes need their own services.
+// and the version analyses/anchors routes need their own services. The version
+// change preview also serves the additive P8 batchTimeline when the snapshot
+// service is wired; without it the P7 ChangeList response stays unchanged.
 func (h *Handler) Register(mux *http.ServeMux) {
 	if h == nil || mux == nil {
 		return

@@ -56,6 +56,7 @@ func NewPublisher(events EventPublisher) *Publisher {
 }
 
 var _ codeintelapp.ImpactNotifier = (*Publisher)(nil)
+var _ codeintelapp.VersionChangeNotifier = (*Publisher)(nil)
 
 // Changed publishes code.changed after a change set is ready. The payload
 // carries the analysis id (as a decimal string: D29/INV-9), both commits and the
@@ -80,6 +81,33 @@ func (p *Publisher) Changed(ctx context.Context, versionID int64, e codeintelapp
 	}
 	return p.publish(ctx, versionID, EventTypeChanged,
 		changedSummary(e.Paths, stats), detail, normalizePaths(e.Paths))
+}
+
+// VersionChanged publishes the P8 version_change code.changed event (design
+// spec §11.2): batch id (decimal string per D29), both commits, the file/impact
+// counters and the history-rewritten flag. The detail is an explicit allowlist,
+// so no code content, path list, items, prompt or model response can ride along.
+func (p *Publisher) VersionChanged(ctx context.Context, versionID int64, e codeintelapp.VersionChangeEvent) error {
+	if p == nil || p.events == nil {
+		return nil
+	}
+	detail, err := encodeDetail(map[string]any{
+		"batchId":          strconv.FormatInt(e.BatchID, 10),
+		"baseCommit":       e.BaseCommit,
+		"headCommit":       e.HeadCommit,
+		"changedFiles":     e.ChangedFiles,
+		"impactedCases":    e.ImpactedCases,
+		"historyRewritten": e.HistoryRewritten,
+	})
+	if err != nil {
+		return err
+	}
+	summary := fmt.Sprintf("code changed: batch %s, %d files, %d impacted cases",
+		strconv.FormatInt(e.BatchID, 10), e.ChangedFiles, e.ImpactedCases)
+	if e.HistoryRewritten {
+		summary += " (history rewritten)"
+	}
+	return p.publish(ctx, versionID, EventTypeChanged, summary, detail, nil)
 }
 
 // ImpactComputed publishes code.impact_computed after an analysis reaches its
