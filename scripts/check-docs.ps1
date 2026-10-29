@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     Static P8 documentation / OpenAPI / Compose contract for EzTest.

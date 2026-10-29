@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     Builds the Docker-free EzTest release packages (Windows x64 + Linux x64).
