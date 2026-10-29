@@ -221,6 +221,10 @@ test("P8 壳：版本切换器保留 Tab/批次，待办分组深链", async ({ 
       await expect(switcher).toBeVisible({ timeout: 60_000 })
       await expect(switcher).toContainText(executionVersion.name)
       await expect(switcher).toContainText("执行中")
+      // The deep link really selected the batch, not only the URL parameter.
+      await expect(page.getByTestId("exec-batch-selector")).toHaveValue(batch.id, {
+        timeout: 60_000,
+      })
 
       await switcher.click()
       const dialog = page.getByRole("dialog", { name: "版本切换" })
@@ -239,6 +243,9 @@ test("P8 壳：版本切换器保留 Tab/批次，待办分组深链", async ({ 
         "aria-selected",
         "true",
       )
+      // The target version owns no batch: the header batch selector disappears
+      // while the query parameter is still preserved (proven by the URL above).
+      await expect(page.getByTestId("exec-batch-selector")).toHaveCount(0)
       const recent = await page.evaluate(() => {
         const raw = window.localStorage.getItem("eztest.recentVersions") ?? "[]"
         return JSON.parse(raw) as Array<{ id: string; name: string }>
@@ -265,6 +272,12 @@ test("P8 壳：版本切换器保留 Tab/批次，待办分组深链", async ({ 
         new RegExp(`/versions/${executionVersion.id}\\?tab=exploration&batch=${batch.id}(?:&|$)`),
       )
       await expect(switcher).toContainText(executionVersion.name)
+      // Switching back to the version that owns the batch re-selects it from the
+      // preserved query instead of falling back to a different (or no) batch.
+      const batchSelector = page.getByTestId("exec-batch-selector")
+      await expect(batchSelector).toBeVisible({ timeout: 30_000 })
+      await expect(batchSelector).toHaveValue(batch.id)
+      await expect(page.getByTestId("batch-kind-badge")).toHaveAttribute("data-kind", "baseline")
       const recentAfterBack = await page.evaluate(() => {
         const raw = window.localStorage.getItem("eztest.recentVersions") ?? "[]"
         return JSON.parse(raw) as Array<{ id: string; name: string }>

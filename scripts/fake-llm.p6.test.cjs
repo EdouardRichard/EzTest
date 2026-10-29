@@ -291,19 +291,25 @@ function resultFor(name) {
 /**
  * Drives one P6 run: requests `count` tool turns, appends a matching result and
  * finally asks for the terminal turn. Returns every call plus the final text.
+ * `options.toolResults` overrides the canonical result of individual tool calls
+ * (the visual contract tests feed the server-owned visual result this way).
  */
-async function driveToolTurns(base, count) {
+async function driveToolTurns(base, count, options = {}) {
   const messages = [
     { role: "system", content: p6SystemPrompt() },
     { role: "user", content: p6Instruction() },
   ];
+  const overrides = options.toolResults || {};
   const calls = [];
   for (let index = 0; index < count; index += 1) {
     const choice = await chat(base, messages);
     const name = choice.message.tool_calls[0].function.name;
     assertUnderscoreToolName(name);
     calls.push({ name, args: JSON.parse(choice.message.tool_calls[0].function.arguments) });
-    appendToolResult(messages, choice, resultFor(name));
+    const result = Object.prototype.hasOwnProperty.call(overrides, name)
+      ? overrides[name]
+      : resultFor(name);
+    appendToolResult(messages, choice, result);
   }
   const finalChoice = await chat(base, messages);
   return { calls, messages, finalChoice };
@@ -400,6 +406,90 @@ test("normal mode streams the same tool turns", async () => {
   assert.equal(first.toolCalls[0].name, "execution_case_context");
   assert.equal(first.finishReason, "tool_calls");
   assert.deepEqual(JSON.parse(first.toolCalls[0].arguments), {});
+});
+
+// --- visual assertions (P8 §9.3) -------------------------------------------
+
+const VISUAL_ASSERTION = {
+  assertion_id: "7102",
+  step_seq: 2,
+  kind: "visual",
+  target: "订单详情全页",
+  expression: "pixelmatch",
+  expected: "视觉一致",
+};
+
+/** The P6 case context with its single ui assertion replaced by one visual one. */
+function visualCaseContext() {
+  return { ...CASE_CONTEXT, assertions: [VISUAL_ASSERTION] };
+}
+
+test("visual assertions map the server result onto all four finish verdicts", async () => {
+  assert.ok(sharedLlm, "shared fake LLM server was not started");
+
+  const outcomes = [
+    {
+      label: "missing baseline",
+      result: { error: "missing_visual_baseline" },
+      verdict: "inconclusive",
+      failureClass: "case",
+      reason: "missing_visual_baseline",
+    },
+    {
+      label: "environment mismatch",
+      result: { classification: "inconclusive", reason: "visual_environment_mismatch" },
+      verdict: "inconclusive",
+      failureClass: "environment",
+      reason: "visual_environment_mismatch",
+    },
+    {
+      label: "pixel mismatch",
+      result: { classification: "failed", reason: "visual_mismatch" },
+      verdict: "failed",
+      failureClass: "application",
+      reason: "visual_mismatch",
+    },
+    {
+      label: "pixel match",
+      result: { classification: "passed" },
+      verdict: "passed",
+      failureClass: undefined,
+      reason: "视觉断言通过",
+    },
+  ];
+
+  for (const outcome of outcomes) {
+    const { calls, finalChoice } = await driveToolTurns(sharedLlm.base, 10, {
+      toolResults: {
+        execution_case_context: visualCaseContext(),
+        execution_visual_assert: JSON.stringify(outcome.result),
+      },
+    });
+
+    assert.deepEqual(
+      calls.map((call) => call.name),
+      [
+        "execution_case_context",
+        "browser_goto",
+        "browser_snapshot",
+        "browser_fill",
+        "browser_click",
+        "browser_screenshot",
+        "execution_step_record",
+        "execution_step_record",
+        "execution_visual_assert",
+        "execution_case_finish",
+      ],
+      outcome.label,
+    );
+    // The agent must delegate the comparison to the server-owned tool: only the
+    // assertion id travels on the wire.
+    assert.deepEqual(calls[8].args, { assertionId: VISUAL_ASSERTION.assertion_id });
+    assert.equal(calls[9].args.verdict, outcome.verdict, outcome.label);
+    assert.equal(calls[9].args.failure_class, outcome.failureClass, outcome.label);
+    assert.equal(calls[9].args.reason, outcome.reason, outcome.label);
+    assertTextTurn(finalChoice, outcome.label);
+  }
 });
 
 // --- fail ------------------------------------------------------------------

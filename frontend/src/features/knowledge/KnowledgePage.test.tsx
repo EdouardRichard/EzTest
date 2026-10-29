@@ -188,6 +188,54 @@ describe("KnowledgePage", () => {
     expect(versionInput.value).toBe("100")
   })
 
+  it("sends no unfiltered first request when the version deep link is present", async () => {
+    window.history.pushState({}, "", "/knowledge?version=100")
+    let resolveFull: (value: ReturnType<typeof page>) => void = () => {}
+    mocks.listGlobalKnowledge.mockImplementation((query: { versionId?: string }) => {
+      if (query.versionId === "100") return Promise.resolve(page([entry()]))
+      return new Promise((resolve) => {
+        resolveFull = resolve
+      })
+    })
+
+    render(<KnowledgePage />)
+    expect(await screen.findByTestId("knowledge-list-item-6001")).toBeTruthy()
+
+    expect(mocks.listGlobalKnowledge.mock.calls.length).toBe(1)
+    expect(mocks.listGlobalKnowledge).toHaveBeenCalledWith({
+      status: "approved",
+      kind: undefined,
+      versionId: "100",
+      limit: 50,
+    })
+    // The filter-ready load must never be raced by a full list read.
+    resolveFull(page([entry({ id: "7001", title: "未过滤条目" })]))
+  })
+
+  it("does not let a delayed unfiltered response overwrite the filtered entries", async () => {
+    window.history.pushState({}, "", "/knowledge?version=100")
+    let resolveFull: (value: ReturnType<typeof page>) => void = () => {}
+    mocks.listGlobalKnowledge.mockImplementation((query: { versionId?: string }) => {
+      if (query.versionId === "100") return Promise.resolve(page([entry()]))
+      return new Promise((resolve) => {
+        resolveFull = resolve
+      })
+    })
+
+    render(<KnowledgePage />)
+    expect(await screen.findByTestId("knowledge-list-item-6001")).toBeTruthy()
+
+    // Simulate the stale full-list response arriving after the filtered one.
+    resolveFull(page([entry({ id: "7001", title: "未过滤条目", versionId: "999" })]))
+    await waitFor(() => expect(screen.queryByTestId("knowledge-list-item-7001")).toBeNull())
+    expect(screen.getByTestId("knowledge-list-item-6001")).toBeTruthy()
+    expect(
+      mocks.listGlobalKnowledge.mock.calls.some(
+        ([query]) => (query as { versionId?: string }).versionId === undefined,
+      ),
+    ).toBe(false)
+  })
+
   it("opens the admin review drawer from the queue button and refreshes after approval", async () => {
     mocks.useAuth.mockReturnValue(adminAuth())
     const draft = entry({ id: "6001", status: "draft", reviewedBy: null, reviewNote: "" })

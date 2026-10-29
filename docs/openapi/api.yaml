@@ -5789,9 +5789,13 @@ paths:
         64 KiB-20 MiB, 422 `visual_baseline_too_large`), match its recorded
         sha256/size and be a PNG whose pixel size is exactly
         `viewportWidth x deviceScaleFactor` by
-        `viewportHeight x deviceScaleFactor`. The version must be `designing`
-        or `reviewing` without a frozen baseline (409
-        `version_state_conflict` / `baseline_frozen`). The write publishes
+        `viewportHeight x deviceScaleFactor`. Approval stays available after the
+        version entered execution and after the case baseline was frozen: the
+        only admissible baseline candidate is a screenshot produced by an
+        execution run, so the `designing`/`reviewing`/no-frozen-baseline gate
+        used by the graph write endpoints does not apply here and this endpoint
+        never answers 409 `version_state_conflict` / `baseline_frozen` for that
+        reason. The write publishes
         `case.visual_baseline_approved` with only `caseNodeId`, `assertionId`,
         `baselineEvidenceId`, `approvedBy` and `status` in `detail`; baseline
         bytes never leave the evidence store.
