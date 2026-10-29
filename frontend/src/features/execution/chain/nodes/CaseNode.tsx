@@ -67,10 +67,10 @@ export const CaseNode = memo(function CaseNode({ data, selected = false }: CaseN
     >
       {aiSupplemented ? (
         <span
-          data-testid="chain-node-case-ai-badge"
+          data-testid="chain-supplement-badge"
           className="absolute right-1 top-1 z-10 rounded-full border border-dashed border-indigo-500/50 bg-card px-1.5 py-0.5 text-[10px] font-semibold leading-none text-indigo-700 shadow-sm dark:text-indigo-300"
         >
-          AI 补充
+          <span data-testid="chain-node-case-ai-badge">AI 补充</span>
         </span>
       ) : null}
 
@@ -103,13 +103,13 @@ export const CaseNode = memo(function CaseNode({ data, selected = false }: CaseN
         </span>
         {needsRevalidation ? (
           <span
-            data-testid="chain-node-case-revalidation"
+            data-testid="chain-revalidation-badge"
             className={clsx(
               "rounded-full border px-2 py-0.5 text-[10px] font-medium leading-none",
               CASE_STATUS_TOKENS.needs_revalidation.badgeClass,
             )}
           >
-            需重验
+            <span data-testid="chain-node-case-revalidation">需重验</span>
           </span>
         ) : null}
         {impacted ? (
