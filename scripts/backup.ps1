@@ -16,14 +16,25 @@
     Secrets are never part of the backup: .env, .env.*, .secrets/ and secrets/
     entries are excluded from the archives and the manifest, and the .env file
     itself is never copied. The database password is passed to the client tools
-    through PGPASSWORD and is never printed.
+    through PGPASSWORD and is never printed. Query parameters from the database
+    URL (sslmode, connect_timeout, application_name, ...) are passed to the
+    client tools through the corresponding PG* environment variables; unknown
+    parameters are rejected instead of being silently dropped.
+
+    Relative content directory values (from .env or the -EvidenceDir-style
+    overrides) are resolved against the API working directory <repo>/backend,
+    because the API process runs there and its defaults (.data/evidence, ...)
+    therefore live in <repo>/backend/.data/. A configured directory that does
+    not exist fails the backup unless -AllowMissingDirs is supplied; with that
+    switch the directory is warned about and recorded as status=missing.
 
     The target directory must not exist yet (or must be empty) so a failed or
     mixed backup cannot silently replace valid evidence. Restore it with
     scripts/restore.ps1.
 
 .PARAMETER TargetDir
-    Destination directory for the backup. Must be absent or empty.
+    Destination directory for the backup. Must be absent or empty. Relative
+    values are resolved against the repository root.
 
 .PARAMETER EnvPath
     .env file to read; defaults to <repo>/.env.
@@ -32,19 +43,28 @@
     Overrides EZTEST_DATABASE_URL from .env (useful for a non-default source).
 
 .PARAMETER EvidenceDir
-    Overrides EZTEST_EVIDENCE_DIR (the P6 evidence directory).
+    Overrides EZTEST_EVIDENCE_DIR (the P6 evidence directory). A relative value
+    is resolved against the API working directory <repo>/backend.
 
 .PARAMETER ReportDir
-    Overrides EZTEST_REPORT_DIR.
+    Overrides EZTEST_REPORT_DIR (relative values resolve against <repo>/backend).
 
 .PARAMETER ExportDir
-    Overrides EZTEST_EXPORT_DIR.
+    Overrides EZTEST_EXPORT_DIR (relative values resolve against <repo>/backend).
 
 .PARAMETER AttachmentDir
-    Overrides EZTEST_VERSION_ATTACHMENT_DIR.
+    Overrides EZTEST_VERSION_ATTACHMENT_DIR (relative values resolve against
+    <repo>/backend).
 
 .PARAMETER ObjectDir
-    Overrides EZTEST_STORAGE_DIR (the object store).
+    Overrides EZTEST_STORAGE_DIR (relative values resolve against
+    <repo>/backend).
+
+.PARAMETER AllowMissingDirs
+    Record configured content directories that do not exist as status=missing
+    (and warn) instead of failing the backup. Without this switch a missing
+    configured directory is treated as a configuration error, because it
+    usually means the directory base is wrong.
 
 .EXAMPLE
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/backup.ps1 -TargetDir .tmp/p8-backup/manual
@@ -62,12 +82,14 @@ param(
     [string]$ReportDir = "",
     [string]$ExportDir = "",
     [string]$AttachmentDir = "",
-    [string]$ObjectDir = ""
+    [string]$ObjectDir = "",
+    [switch]$AllowMissingDirs
 )
 
 $ErrorActionPreference = "Stop"
 
 $script:repoRoot = Split-Path -Parent $PSScriptRoot
+$script:apiRoot = Join-Path $script:repoRoot "backend"
 
 function Write-Step {
     param([string]$Message)
@@ -126,12 +148,87 @@ function Parse-PostgresUrl {
     if ([string]::IsNullOrWhiteSpace($database) -or $database.Contains("/")) {
         throw "EZTEST_DATABASE_URL must include a single database name"
     }
+    $query = [ordered]@{}
+    if (-not [string]::IsNullOrWhiteSpace($uri.Query)) {
+        foreach ($pair in $uri.Query.TrimStart([char[]]"?") -split "&") {
+            if ([string]::IsNullOrWhiteSpace($pair)) { continue }
+            $index = $pair.IndexOf("=")
+            if ($index -lt 0) {
+                $rawKey = $pair
+                $rawValue = ""
+            } else {
+                $rawKey = $pair.Substring(0, $index)
+                $rawValue = $pair.Substring($index + 1)
+            }
+            $key = [System.Uri]::UnescapeDataString($rawKey)
+            if ([string]::IsNullOrWhiteSpace($key)) { throw "database URL contains an empty query parameter name" }
+            $query[$key] = [System.Uri]::UnescapeDataString($rawValue)
+        }
+    }
     return [pscustomobject]@{
         Host     = $uri.Host
         Port     = $(if ($uri.Port -gt 0) { $uri.Port } else { 5432 })
         User     = [System.Uri]::UnescapeDataString($uri.UserInfo.Substring(0, $separator))
         Password = [System.Uri]::UnescapeDataString($uri.UserInfo.Substring($separator + 1))
         Database = $database
+        Query    = $query
+    }
+}
+
+# libpq environment variables for the query parameters we pass through to
+# pg_dump/psql. Unknown parameters are rejected so a typo cannot silently drop
+# TLS or connection settings.
+$script:pgQueryEnvironment = @{
+    "application_name"      = "PGAPPNAME"
+    "connect_timeout"       = "PGCONNECT_TIMEOUT"
+    "sslmode"               = "PGSSLMODE"
+    "sslcert"               = "PGSSLCERT"
+    "sslkey"                = "PGSSLKEY"
+    "sslrootcert"           = "PGSSLROOTCERT"
+    "sslpassword"           = "PGSSLPASSWORD"
+    "sslnegotiation"        = "PGSSLNEGOTIATION"
+    "sslcompression"        = "PGSSLCOMPRESSION"
+    "gssencmode"            = "PGGSSENCMODE"
+    "channel_binding"       = "PGCHANNELBINDING"
+    "target_session_attrs"  = "PGTARGETSESSIONATTRS"
+    "options"               = "PGOPTIONS"
+    "client_encoding"       = "PGCLIENTENCODING"
+    "keepalives"            = "PGKEEPALIVES"
+    "keepalives_idle"       = "PGKEEPALIVESIDLE"
+    "keepalives_interval"   = "PGKEEPALIVESINTERVAL"
+    "keepalives_count"      = "PGKEEPALIVESCOUNT"
+    "passfile"              = "PGPASSFILE"
+    "service"               = "PGSERVICE"
+    "servicefile"           = "PGSERVICEFILE"
+}
+
+function Set-PostgresQueryEnvironment {
+    param($Query)
+    $mapped = @{}
+    foreach ($key in @($Query.Keys)) {
+        $normalized = ([string]$key).ToLowerInvariant()
+        if (-not $script:pgQueryEnvironment.ContainsKey($normalized)) {
+            throw "unsupported database URL query parameter '$key'; set the equivalent libpq PG* environment variable instead"
+        }
+        $mapped[$key] = $script:pgQueryEnvironment[$normalized]
+    }
+    $saved = @{}
+    foreach ($key in @($mapped.Keys)) {
+        $name = $mapped[$key]
+        $saved[$name] = [System.Environment]::GetEnvironmentVariable($name, "Process")
+        Set-Item -Path ("Env:" + $name) -Value ([string]$Query[$key])
+    }
+    return $saved
+}
+
+function Restore-EnvironmentValues {
+    param([hashtable]$Saved)
+    foreach ($name in $Saved.Keys) {
+        if ($null -eq $Saved[$name]) {
+            Remove-Item -Path ("Env:" + $name) -ErrorAction SilentlyContinue
+        } else {
+            Set-Item -Path ("Env:" + $name) -Value $Saved[$name]
+        }
     }
 }
 
@@ -279,12 +376,24 @@ function Resolve-RepoPath {
     return [System.IO.Path]::GetFullPath((Join-Path $script:repoRoot $Path))
 }
 
+function Resolve-ContentPath {
+    param([string]$Path)
+    # The API process runs from <repo>/backend, so its relative content roots
+    # (the .env.example defaults: .data/evidence, .data/reports, ...) are
+    # resolved against backend/, not against the repository root.
+    if ([System.IO.Path]::IsPathRooted($Path)) { return [System.IO.Path]::GetFullPath($Path) }
+    return [System.IO.Path]::GetFullPath((Join-Path $script:apiRoot $Path))
+}
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
 
 try {
 $targetFull = Resolve-RepoPath -Path $TargetDir
+if (-not (Test-Path -LiteralPath $script:apiRoot -PathType Container)) {
+    throw "API working directory not found: $($script:apiRoot) (content directory defaults resolve against it)"
+}
 if ([string]::IsNullOrWhiteSpace($EnvPath)) { $EnvPath = Join-Path $script:repoRoot ".env" }
 $envValues = Read-DotEnv -Path $EnvPath
 $effectiveUrl = if (-not [string]::IsNullOrWhiteSpace($DatabaseUrl)) { $DatabaseUrl } else { [string]$envValues["EZTEST_DATABASE_URL"] }
@@ -308,16 +417,40 @@ $directorySpecs = @(
 $sources = @()
 foreach ($spec in $directorySpecs) {
     $raw = [string]$spec.Override
-    if ([string]::IsNullOrWhiteSpace($raw)) { $raw = [string]$envValues[$spec.ConfigKey] }
-    if ([string]::IsNullOrWhiteSpace($raw)) { $raw = $spec.Default }
+    $sourceKind = "override"
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        $raw = [string]$envValues[$spec.ConfigKey]
+        $sourceKind = "env"
+    }
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        $raw = $spec.Default
+        $sourceKind = "default"
+    }
     $raw = $raw.Trim()
-    $resolved = if ([System.IO.Path]::IsPathRooted($raw)) { $raw } else { Join-Path $script:repoRoot $raw }
+    $resolved = Resolve-ContentPath -Path $raw
     $full = Assert-OutsideRepositoryRoot -Path $resolved -Label $spec.Label
     if ($targetFull.Equals($full, [System.StringComparison]::OrdinalIgnoreCase) -or
         ($targetFull + "\").StartsWith($full + "\", [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "TargetDir must not be inside the '$($spec.Label)' source directory ($full)"
     }
-    $sources += [pscustomobject]@{ Label = $spec.Label; ConfigKey = $spec.ConfigKey; Path = $full }
+    $sources += [pscustomobject]@{
+        Label      = $spec.Label
+        ConfigKey  = $spec.ConfigKey
+        Configured = $raw
+        Source     = $sourceKind
+        Path       = $full
+    }
+}
+
+$missingSources = @($sources | Where-Object { -not (Test-Path -LiteralPath $_.Path -PathType Container) })
+if ($missingSources.Count -gt 0) {
+    if (-not $AllowMissingDirs) {
+        $names = ($missingSources | ForEach-Object { "$($_.Label) ($($_.Path))" }) -join "; "
+        throw "missing content director(ies): $names. Fix the configured path (relative values resolve against $($script:apiRoot)) or pass -AllowMissingDirs to record them as missing."
+    }
+    foreach ($missing in $missingSources) {
+        Write-Warning "content directory '$($missing.Label)' is missing: $($missing.Path); recording status=missing (-AllowMissingDirs)"
+    }
 }
 
 if (Test-Path -LiteralPath $targetFull) {
@@ -341,14 +474,17 @@ if (Test-Path -LiteralPath $targetFull) {
 $startedAt = Get-Date
 $watch = [System.Diagnostics.Stopwatch]::StartNew()
 $previousPgPassword = $env:PGPASSWORD
+$previousPgQueryEnvironment = @{}
 $env:PGPASSWORD = $script:conn.Password
 
 try {
+    $previousPgQueryEnvironment = Set-PostgresQueryEnvironment -Query $script:conn.Query
     Write-Step "Backup plan"
+    Write-Note "content    relative directory values resolve against $($script:apiRoot)"
     Write-Note "database   $($script:conn.Database) on $($script:conn.Host):$($script:conn.Port) (custom format)"
     foreach ($source in $sources) {
         $state = if (Test-Path -LiteralPath $source.Path -PathType Container) { "exists" } else { "missing (recorded as missing)" }
-        Write-Note ("{0,-20} {1} [{2}]" -f $source.Label, $source.Path, $state)
+        Write-Note ("{0,-20} {1} [{2}, {3}]" -f $source.Label, $source.Path, $state, $source.Source)
     }
     Write-Note "target     $targetFull"
     Write-Note "secrets    .env / .env.* / .secrets/ / secrets/ are never archived"
@@ -383,16 +519,20 @@ try {
     $totalFileCount = 0
     foreach ($source in $sources) {
         if (-not (Test-Path -LiteralPath $source.Path -PathType Container)) {
+            Write-Warning "content directory '$($source.Label)' is missing: $($source.Path); recorded as status=missing"
             [void]$directories.Add([ordered]@{
-                    label       = $source.Label
-                    configKey   = $source.ConfigKey
-                    status      = "missing"
-                    archive     = $null
-                    sizeBytes   = 0
-                    sha256      = $null
-                    fileCount   = 0
+                    label        = $source.Label
+                    configKey    = $source.ConfigKey
+                    configured   = $source.Configured
+                    source       = $source.Source
+                    resolvedPath = $source.Path
+                    status       = "missing"
+                    archive      = $null
+                    sizeBytes    = 0
+                    sha256       = $null
+                    fileCount    = 0
                     contentBytes = 0
-                    files       = @()
+                    files        = @()
                 })
             Write-Note ("{0,-20} missing; recorded without an archive" -f $source.Label)
             continue
@@ -410,6 +550,9 @@ try {
         [void]$directories.Add([ordered]@{
                 label        = $source.Label
                 configKey    = $source.ConfigKey
+                configured   = $source.Configured
+                source       = $source.Source
+                resolvedPath = $source.Path
                 status       = "archived"
                 archive      = $archiveRelative
                 sizeBytes    = [long]$archiveSize
@@ -447,6 +590,13 @@ try {
         tool            = "scripts/backup.ps1"
         createdAt       = $startedAt.ToUniversalTime().ToString("o")
         durationSeconds = [math]::Round($watch.Elapsed.TotalSeconds, 2)
+        contentBase     = [ordered]@{
+            absolute = $script:apiRoot
+            relative = $(if ($script:apiRoot.StartsWith(($script:repoRoot.TrimEnd([char[]]"\") + "\"), [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $script:apiRoot.Substring($script:repoRoot.TrimEnd([char[]]"\").Length + 1).Replace('\', '/')
+                } else { $script:apiRoot })
+            rule     = "relative content directory values resolve against the API working directory (<repo>/backend)"
+        }
         repository      = [ordered]@{
             version     = $version
             branch      = $branch
@@ -463,6 +613,7 @@ try {
             rowCounts       = $rowCountsAfter
             rowCountsBefore = $rowCountsBefore
             rowCountsStable = [bool]$rowCountsStable
+            parameters      = @($script:conn.Query.Keys)
         }
         directories     = @($directories)
         configKeys      = @(
@@ -475,11 +626,12 @@ try {
         )
         excluded        = @(".env", ".env.*", ".secrets/**", "secrets/**")
         summary         = [ordered]@{
-            directoryArchives = @($directories | Where-Object { $_.status -eq "archived" }).Count
-            files             = $totalFileCount
-            contentBytes      = [long]$totalContentBytes
-            dumpBytes         = [long]$dumpSize
-            totalBytes        = [long]($totalContentBytes + $dumpSize)
+            directoryArchives   = @($directories | Where-Object { $_.status -eq "archived" }).Count
+            missingDirectories  = @($directories | Where-Object { $_.status -eq "missing" }).Count
+            files               = $totalFileCount
+            contentBytes        = [long]$totalContentBytes
+            dumpBytes           = [long]$dumpSize
+            totalBytes          = [long]($totalContentBytes + $dumpSize)
         }
     }
 
@@ -504,6 +656,7 @@ try {
     Write-Host "Do not restore from ${targetFull}: no valid manifest was written." -ForegroundColor Red
     exit 1
 } finally {
+    Restore-EnvironmentValues -Saved $previousPgQueryEnvironment
     if ($null -eq $previousPgPassword) {
         Remove-Item Env:PGPASSWORD -ErrorAction SilentlyContinue
     } else {

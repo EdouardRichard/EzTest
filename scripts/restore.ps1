@@ -9,22 +9,42 @@
       - the target database must already exist and be empty; a non-empty target
         is refused unless -Force AND -ConfirmOverwrite are both supplied (the
         explicit second confirmation);
-      - the target directory must be absent or empty for the same reason;
+      - the target directory must be absent or empty for the same reason; the
+        database is checked before TargetRoot is created, so a missing target
+        database does not leave a new empty directory behind;
       - the database name must end in _test or _e2e, unless -AllowAnyDatabase is
-        supplied; postgres/template0/template1 and the configured source/test
-        databases are always refused;
-      - the manifest is validated (sizes + sha256 of the dump and every archive)
-        before any target is touched.
+        supplied; -AllowAnyDatabase only bypasses that suffix rule. The
+        configured source database and the EZTEST_TEST_DATABASE_URL database are
+        always refused, and postgres/template0/template1 are always refused;
+      - manifest directory labels must be one of the five known labels
+        (evidence/reports/exports/version-attachments/objects). A label such as
+        ..\..\evil is rejected before any directory is created or extracted;
+      - the manifest is validated (sizes + sha256 of the dump and every archive,
+        plus archive member paths) before any target is touched.
 
     Verification output is written as JSON (restore-report.json) containing the
     per-file sha256 result, row-count comparison, warnings and the fact that
-    secrets are not part of the backup. The script exits non-zero when any
-    verification fails.
+    secrets are not part of the backup. A backup manifest with
+    rowCountsStable=false compares rows only as an advisory: a count difference
+    is reported as a warning and does not fail the restore (the dump itself is
+    a consistent snapshot). The script exits non-zero when any file or archive
+    verification fails, or when a row-count mismatch is not advisory.
+
+    -Force restores with pg_restore --clean --if-exists --no-owner
+    --no-privileges. --clean only drops objects that exist in the dump, so
+    pre-existing extra tables are kept; when the overwrite was explicitly
+    confirmed they are reported as extraTables/warning instead of failing the
+    restore. Content directories are overwritten file-by-file and extra files
+    are reported as unexpected warnings, not deleted.
 
     Secrets: EZTEST_SECRET_KEYS/EZTEST_SECRET_KEY_ACTIVE and the .env file are
     not backed up. The operator must supply them separately; without the same
     keyring the encrypted LLM configuration (llm_configs.api_key / headers)
     cannot be decrypted.
+
+    Database URL query parameters (sslmode, connect_timeout, application_name,
+    ...) are passed to the client tools through the corresponding PG*
+    environment variables; unknown parameters are rejected.
 
 .PARAMETER BackupDir
     Directory created by scripts/backup.ps1 (contains manifest.json).
@@ -54,8 +74,10 @@
     Second, explicit confirmation for -Force. Required together with -Force.
 
 .PARAMETER AllowAnyDatabase
-    Allow a target database whose name does not end in _test/_e2e. The configured
-    source database and the system/template databases are still refused.
+    Allow a target database whose name does not end in _test/_e2e. This only
+    bypasses the suffix rule: the configured source database, the
+    EZTEST_TEST_DATABASE_URL shared test database and the system/template
+    databases are still refused.
 
 .PARAMETER VerifyOnly
     Do not restore or modify anything; re-verify the target directory files
@@ -145,12 +167,84 @@ function Parse-PostgresUrl {
     if ([string]::IsNullOrWhiteSpace($database) -or $database.Contains("/")) {
         throw "database URL must include a single database name"
     }
+    $query = [ordered]@{}
+    if (-not [string]::IsNullOrWhiteSpace($uri.Query)) {
+        foreach ($pair in $uri.Query.TrimStart([char[]]"?") -split "&") {
+            if ([string]::IsNullOrWhiteSpace($pair)) { continue }
+            $index = $pair.IndexOf("=")
+            if ($index -lt 0) {
+                $rawKey = $pair
+                $rawValue = ""
+            } else {
+                $rawKey = $pair.Substring(0, $index)
+                $rawValue = $pair.Substring($index + 1)
+            }
+            $key = [System.Uri]::UnescapeDataString($rawKey)
+            if ([string]::IsNullOrWhiteSpace($key)) { throw "database URL contains an empty query parameter name" }
+            $query[$key] = [System.Uri]::UnescapeDataString($rawValue)
+        }
+    }
     return [pscustomobject]@{
         Host     = $uri.Host
         Port     = $(if ($uri.Port -gt 0) { $uri.Port } else { 5432 })
         User     = [System.Uri]::UnescapeDataString($uri.UserInfo.Substring(0, $separator))
         Password = [System.Uri]::UnescapeDataString($uri.UserInfo.Substring($separator + 1))
         Database = $database
+        Query    = $query
+    }
+}
+
+$script:pgQueryEnvironment = @{
+    "application_name"     = "PGAPPNAME"
+    "connect_timeout"      = "PGCONNECT_TIMEOUT"
+    "sslmode"              = "PGSSLMODE"
+    "sslcert"              = "PGSSLCERT"
+    "sslkey"               = "PGSSLKEY"
+    "sslrootcert"          = "PGSSLROOTCERT"
+    "sslpassword"          = "PGSSLPASSWORD"
+    "sslnegotiation"       = "PGSSLNEGOTIATION"
+    "sslcompression"       = "PGSSLCOMPRESSION"
+    "gssencmode"           = "PGGSSENCMODE"
+    "channel_binding"      = "PGCHANNELBINDING"
+    "target_session_attrs" = "PGTARGETSESSIONATTRS"
+    "options"              = "PGOPTIONS"
+    "client_encoding"      = "PGCLIENTENCODING"
+    "keepalives"           = "PGKEEPALIVES"
+    "keepalives_idle"      = "PGKEEPALIVESIDLE"
+    "keepalives_interval"  = "PGKEEPALIVESINTERVAL"
+    "keepalives_count"     = "PGKEEPALIVESCOUNT"
+    "passfile"             = "PGPASSFILE"
+    "service"              = "PGSERVICE"
+    "servicefile"          = "PGSERVICEFILE"
+}
+
+function Set-PostgresQueryEnvironment {
+    param($Query)
+    $mapped = @{}
+    foreach ($key in @($Query.Keys)) {
+        $normalized = ([string]$key).ToLowerInvariant()
+        if (-not $script:pgQueryEnvironment.ContainsKey($normalized)) {
+            throw "unsupported database URL query parameter '$key'; set the equivalent libpq PG* environment variable instead"
+        }
+        $mapped[$key] = $script:pgQueryEnvironment[$normalized]
+    }
+    $saved = @{}
+    foreach ($key in @($mapped.Keys)) {
+        $name = $mapped[$key]
+        $saved[$name] = [System.Environment]::GetEnvironmentVariable($name, "Process")
+        Set-Item -Path ("Env:" + $name) -Value ([string]$Query[$key])
+    }
+    return $saved
+}
+
+function Restore-EnvironmentValues {
+    param([hashtable]$Saved)
+    foreach ($name in $Saved.Keys) {
+        if ($null -eq $Saved[$name]) {
+            Remove-Item -Path ("Env:" + $name) -ErrorAction SilentlyContinue
+        } else {
+            Set-Item -Path ("Env:" + $name) -Value $Saved[$name]
+        }
     }
 }
 
@@ -220,6 +314,16 @@ function Get-RowCounts {
     return $counts
 }
 
+$script:knownDirectoryLabels = @("evidence", "reports", "exports", "version-attachments", "objects")
+
+function Assert-DirectoryLabel {
+    param([string]$Label)
+    if ([string]::IsNullOrWhiteSpace($Label)) { throw "directory label is empty in the manifest" }
+    if ($script:knownDirectoryLabels -notcontains $Label) {
+        throw "unsupported directory label '$Label' in the manifest (allowed: $($script:knownDirectoryLabels -join ', '))"
+    }
+}
+
 function Assert-RelativePathSafe {
     param([string]$RelativePath, [string]$Label)
     if ([string]::IsNullOrWhiteSpace($RelativePath)) { throw "$Label is empty in the manifest" }
@@ -256,7 +360,7 @@ function Get-FileVerification {
     $verifiedFiles = 0
     foreach ($directory in @($Manifest.directories)) {
         $label = [string]$directory.label
-        Assert-RelativePathSafe -RelativePath $label -Label "directory label"
+        Assert-DirectoryLabel -Label $label
         $directoryRoot = Join-Path $Root $label
         foreach ($file in @($directory.files)) {
             if ($null -eq $file) { continue }
@@ -318,7 +422,14 @@ function Get-ManifestIntegrity {
         }
         $artifacts += $dumpRelative
     }
+    $seenLabels = @{}
     foreach ($directory in @($Manifest.directories)) {
+        $label = [string]$directory.label
+        Assert-DirectoryLabel -Label $label
+        if ($seenLabels.ContainsKey($label)) {
+            throw "duplicate directory label '$label' in the manifest"
+        }
+        $seenLabels[$label] = $true
         if ([string]$directory.status -ne "archived") { continue }
         $archiveRelative = [string]$directory.archive
         Assert-RelativePathSafe -RelativePath $archiveRelative -Label "directory archive path"
@@ -371,10 +482,11 @@ function Compare-RowCounts {
         }
     }
     $extraTables = @($RestoredCounts.Keys | Where-Object { $null -eq $ManifestCounts.PSObject.Properties[$_] })
-    foreach ($table in $extraTables) {
-        [void]$mismatches.Add("$table is not part of the backup (extra tables after restore)")
+    return [pscustomobject]@{
+        Checked     = $checked
+        Mismatches  = @($mismatches)
+        ExtraTables = @($extraTables)
     }
-    return [pscustomobject]@{ Checked = $checked; Mismatches = @($mismatches) }
 }
 
 function Resolve-RepoPath {
@@ -442,15 +554,17 @@ $testDatabaseName = ""
 if (-not [string]::IsNullOrWhiteSpace([string]$envValues["EZTEST_TEST_DATABASE_URL"])) {
     try { $testDatabaseName = (Parse-PostgresUrl -Url ([string]$envValues["EZTEST_TEST_DATABASE_URL"])).Database } catch { $testDatabaseName = "" }
 }
-if (-not $VerifyOnly -and -not $AllowAnyDatabase) {
-    if ($targetDb -notmatch '_(test|e2e)$') {
-        throw "restore targets must end in _test or _e2e (use -AllowAnyDatabase for an explicit override): $targetDb"
-    }
+if (-not $VerifyOnly) {
+    # These guards are unconditional: -AllowAnyDatabase only relaxes the
+    # *_test/*_e2e suffix rule, never the source/shared/system protections.
     if ($targetDb -eq $sourceConn.Database) {
-        throw "refusing to restore over the configured source database '$targetDb' (use -AllowAnyDatabase for an explicit override)"
+        throw "refusing to restore over the configured source database '$targetDb' (-AllowAnyDatabase does not bypass this guard)"
     }
     if (-not [string]::IsNullOrWhiteSpace($testDatabaseName) -and $targetDb -eq $testDatabaseName) {
-        throw "refusing to restore over the shared test database '$targetDb' (use -AllowAnyDatabase for an explicit override)"
+        throw "refusing to restore over the shared test database '$targetDb' (-AllowAnyDatabase does not bypass this guard)"
+    }
+    if (-not $AllowAnyDatabase -and $targetDb -notmatch '_(test|e2e)$') {
+        throw "restore targets must end in _test or _e2e (use -AllowAnyDatabase for an explicit override): $targetDb"
     }
 }
 
@@ -466,6 +580,7 @@ if (-not [string]::IsNullOrWhiteSpace($TargetDatabaseUrl)) {
         User     = $sourceConn.User
         Password = $sourceConn.Password
         Database = $targetDb
+        Query    = $sourceConn.Query
     }
 }
 $script:target = $targetConn
@@ -479,9 +594,11 @@ $warnings = New-Object System.Collections.ArrayList
 $startedAt = Get-Date
 $watch = [System.Diagnostics.Stopwatch]::StartNew()
 $previousPgPassword = $env:PGPASSWORD
+$previousPgQueryEnvironment = @{}
 $env:PGPASSWORD = $targetConn.Password
 
 try {
+    $previousPgQueryEnvironment = Set-PostgresQueryEnvironment -Query $targetConn.Query
     if ($VerifyOnly) {
         Write-Step "Verify-only: checking restored files against the manifest"
         $fileResult = Get-FileVerification -Manifest $manifest -Root $targetRootFull
@@ -539,8 +656,6 @@ try {
             Write-Note "target directory is not empty; -Force -ConfirmOverwrite received, existing files are kept and manifest files are overwritten"
             [void]$warnings.Add("target directory was not empty; existing files were kept and manifest files were overwritten")
         }
-    } elseif (-not (Test-Path -LiteralPath $targetRootFull)) {
-        New-Item -ItemType Directory -Force -Path $targetRootFull | Out-Null
     }
 
     $dbExists = Get-PsqlScalar -Database "postgres" -Operation "checking target database existence" `
@@ -555,6 +670,11 @@ try {
     if ([long]$userObjects -gt 0) {
         Write-Note "target database is not empty; -Force -ConfirmOverwrite received, pg_restore --clean will drop objects present in the dump"
         [void]$warnings.Add("target database was not empty; pg_restore --clean --if-exists was used")
+    }
+    # Only now, after the target database has been validated, create TargetRoot:
+    # a missing target database must not leave a fresh empty directory behind.
+    if (-not (Test-Path -LiteralPath $targetRootFull)) {
+        New-Item -ItemType Directory -Force -Path $targetRootFull | Out-Null
     }
 
     Write-Step "Restoring database $targetDb"
@@ -574,17 +694,33 @@ try {
 
     $restoredCounts = Get-RowCounts -Database $targetDb
     $rowCompare = Compare-RowCounts -ManifestCounts $manifest.database.rowCounts -RestoredCounts $restoredCounts
-    $rowCountsMatch = ($rowCompare.Mismatches.Count -eq 0)
-    Write-Note "row counts: $($rowCompare.Checked) table(s) compared, $($rowCompare.Mismatches.Count) mismatch(es)"
-    if (-not [bool]$manifest.database.rowCountsStable) {
+    $rowCountsStable = [bool]$manifest.database.rowCountsStable
+    $rowCountsAdvisory = -not $rowCountsStable
+    $extraTables = @($rowCompare.ExtraTables)
+    $extraTablesAdvisory = ($extraTables.Count -gt 0 -and $Force -and $ConfirmOverwrite)
+    $rowMismatchMessages = @($rowCompare.Mismatches)
+    if ($extraTables.Count -gt 0 -and -not $extraTablesAdvisory) {
+        foreach ($table in $extraTables) {
+            $rowMismatchMessages += "$table is not part of the backup (extra tables after restore)"
+        }
+    }
+    $rowCountsMatch = ($rowMismatchMessages.Count -eq 0)
+    Write-Note "row counts: $($rowCompare.Checked) table(s) compared, $($rowMismatchMessages.Count) mismatch(es), $($extraTables.Count) extra table(s)"
+    if ($rowCountsAdvisory) {
+        Write-Warning "the backup recorded rowCountsStable=false (database changed during backup); row-count comparison is advisory and does not fail the restore"
         [void]$warnings.Add("the backup recorded rowCountsStable=false (database changed during backup); row-count comparison is advisory")
     }
-    foreach ($mismatch in $rowCompare.Mismatches) { Write-Note "mismatch: $mismatch" }
+    foreach ($mismatch in $rowMismatchMessages) { Write-Note "mismatch: $mismatch" }
+    if ($extraTables.Count -gt 0 -and $extraTablesAdvisory) {
+        Write-Note "target kept extra table(s) not present in the backup: $($extraTables -join ', ')"
+        [void]$warnings.Add("target kept $($extraTables.Count) table(s) that are not part of the backup ($($extraTables -join ', ')); pg_restore --clean only drops objects present in the dump")
+    }
 
     Write-Step "Restoring content directories"
     $restoredArchives = 0
     foreach ($directory in @($manifest.directories)) {
         $label = [string]$directory.label
+        Assert-DirectoryLabel -Label $label
         if ([string]$directory.status -ne "archived") {
             New-Item -ItemType Directory -Force -Path (Join-Path $targetRootFull $label) | Out-Null
             [void]$warnings.Add("directory '$label' was missing at backup time; an empty target directory was created")
@@ -612,7 +748,8 @@ try {
         [void]$warnings.Add("$($fileResult.Unexpected.Count) unexpected file(s) exist in the target but are not part of the backup")
     }
 
-    $passed = ($fileResult.Missing.Count -eq 0 -and $fileResult.Mismatches.Count -eq 0 -and $rowCountsMatch)
+    $passed = ($fileResult.Missing.Count -eq 0 -and $fileResult.Mismatches.Count -eq 0 -and
+        ($rowCountsMatch -or $rowCountsAdvisory))
     $watch.Stop()
     $report = [ordered]@{
         formatVersion   = 1
@@ -625,10 +762,14 @@ try {
         manifestCommit  = [string]$manifest.repository.commit
         target          = [ordered]@{ database = $targetDb; root = $targetRootFull }
         database        = [ordered]@{
-            restored       = $true
-            tablesCompared = $rowCompare.Checked
-            rowCountsMatch = [bool]$rowCountsMatch
-            mismatches     = @($rowCompare.Mismatches)
+            restored            = $true
+            tablesCompared      = $rowCompare.Checked
+            rowCountsMatch      = [bool]$rowCountsMatch
+            rowCountsStable     = [bool]$rowCountsStable
+            rowCountsAdvisory   = [bool]$rowCountsAdvisory
+            extraTables         = @($extraTables)
+            extraTablesAdvisory = [bool]$extraTablesAdvisory
+            mismatches          = @($rowMismatchMessages)
         }
         directories     = [ordered]@{ restoredArchives = $restoredArchives }
         files           = [ordered]@{
@@ -654,7 +795,10 @@ try {
     } else {
         Write-Host "RESTORE FAILED: verification did not pass." -ForegroundColor Red
     }
-    Write-Note "database    $targetDb ($($rowCompare.Checked) table(s) compared, row counts match: $rowCountsMatch)"
+    Write-Note "database    $targetDb ($($rowCompare.Checked) table(s) compared, row counts match: $rowCountsMatch, advisory: $rowCountsAdvisory)"
+    if ($extraTables.Count -gt 0) {
+        Write-Note "extra       $($extraTables.Count) table(s) kept that are not in the backup: $($extraTables -join ', ')"
+    }
     Write-Note "files       $($fileResult.Verified)/$($fileResult.Expected) verified, $($fileResult.Missing.Count) missing, $($fileResult.Mismatches.Count) sha256 mismatch(es)"
     Write-Note "report      $reportFull"
     Write-Note "secrets     not included; supply EZTEST_SECRET_KEYS/EZTEST_SECRET_KEY_ACTIVE separately (encrypted LLM keys are unrecoverable without them)"
@@ -669,6 +813,7 @@ try {
     Write-Host "Target database '$targetDb' / directory '$targetRootFull' was not reported as verified." -ForegroundColor Red
     exit 1
 } finally {
+    Restore-EnvironmentValues -Saved $previousPgQueryEnvironment
     if ($null -eq $previousPgPassword) {
         Remove-Item Env:PGPASSWORD -ErrorAction SilentlyContinue
     } else {
