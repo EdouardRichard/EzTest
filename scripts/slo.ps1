@@ -1071,6 +1071,7 @@ if ($Iterations -lt 3) { $Iterations = 3 }
 $connection = $null
 $datasetState = $null
 $seedError = ""
+$datasetEnvSkip = ""
 $token = ""
 $authHeaders = @{}
 
@@ -1125,9 +1126,11 @@ if (-not [string]::IsNullOrWhiteSpace($token)) {
     $connection = Parse-PostgresUrl -Url $dbUrl
     $script:psqlExe = Resolve-ToolPath -LocalPath (Join-Path $repoRoot ".tools\pgsql\bin\psql.exe") -CommandName "psql.exe"
     if ($null -eq $connection) {
-        Add-Check -Area "dataset" -Check "database URL" -Status "SKIP" -Detail "EZTEST_DATABASE_URL is missing or not a postgres URL"
+        $datasetEnvSkip = "EZTEST_DATABASE_URL is missing or not a postgres URL"
+        Add-Check -Area "dataset" -Check "database URL" -Status "SKIP" -Detail $datasetEnvSkip
     } elseif ([string]::IsNullOrWhiteSpace($script:psqlExe)) {
-        Add-Check -Area "dataset" -Check "psql" -Status "SKIP" -Detail "psql.exe is not available"
+        $datasetEnvSkip = "psql.exe is not available"
+        Add-Check -Area "dataset" -Check "psql" -Status "SKIP" -Detail $datasetEnvSkip
     } else {
         try {
             $datasetState = Invoke-SeedDataset -Connection $connection
@@ -1146,6 +1149,7 @@ if (-not [string]::IsNullOrWhiteSpace($token)) {
         }
     }
 } else {
+    $datasetEnvSkip = "no authenticated API session"
     Add-Check -Area "dataset" -Check "seed" -Status "SKIP" -Detail "no authenticated API session"
 }
 
@@ -1219,14 +1223,28 @@ try {
                 -Value $null -Detail $browser.Detail
         }
     } else {
-        $failure = "dataset was not seeded; measurement did not run"
-        if (-not [string]::IsNullOrWhiteSpace($seedError)) { $failure = "dataset seed failed: $seedError" }
-        foreach ($name in @("overviewApiP95Ms", "overviewBrowserP95Ms", "chainP95Ms", "changesP95Ms")) {
-            switch ($name) {
-                "overviewApiP95Ms" { Add-Measurement -Name $name -Status "FAIL" -Threshold "<= $($thresholds.overviewP95Ms) ms" -Value $null -Detail $failure }
-                "overviewBrowserP95Ms" { Add-Measurement -Name $name -Status "FAIL" -Threshold "<= $($thresholds.overviewP95Ms) ms" -Value $null -Detail $failure }
-                "chainP95Ms" { Add-Measurement -Name $name -Status "FAIL" -Threshold "<= $($thresholds.chainP95Ms) ms" -Value $null -Detail $failure }
-                "changesP95Ms" { Add-Measurement -Name $name -Status "FAIL" -Threshold "<= $($thresholds.changesP95Ms) ms" -Value $null -Detail $failure }
+        if (-not [string]::IsNullOrWhiteSpace($seedError)) {
+            $failure = "dataset seed failed: $seedError"
+            foreach ($name in @("overviewApiP95Ms", "overviewBrowserP95Ms", "chainP95Ms", "changesP95Ms")) {
+                switch ($name) {
+                    "overviewApiP95Ms" { Add-Measurement -Name $name -Status "FAIL" -Threshold "<= $($thresholds.overviewP95Ms) ms" -Value $null -Detail $failure }
+                    "overviewBrowserP95Ms" { Add-Measurement -Name $name -Status "FAIL" -Threshold "<= $($thresholds.overviewP95Ms) ms" -Value $null -Detail $failure }
+                    "chainP95Ms" { Add-Measurement -Name $name -Status "FAIL" -Threshold "<= $($thresholds.chainP95Ms) ms" -Value $null -Detail $failure }
+                    "changesP95Ms" { Add-Measurement -Name $name -Status "FAIL" -Threshold "<= $($thresholds.changesP95Ms) ms" -Value $null -Detail $failure }
+                }
+            }
+        } else {
+            # Missing environment (no admin session / database / psql) is an
+            # explicit SKIP, never a pass.
+            $reason = $datasetEnvSkip
+            if ([string]::IsNullOrWhiteSpace($reason)) { $reason = "dataset was not seeded" }
+            foreach ($name in @("overviewApiP95Ms", "overviewBrowserP95Ms", "chainP95Ms", "changesP95Ms")) {
+                switch ($name) {
+                    "overviewApiP95Ms" { Add-Measurement -Name $name -Status "SKIP" -Threshold "<= $($thresholds.overviewP95Ms) ms" -Value $null -Detail "SKIP: $reason; measurement not executed" }
+                    "overviewBrowserP95Ms" { Add-Measurement -Name $name -Status "SKIP" -Threshold "<= $($thresholds.overviewP95Ms) ms" -Value $null -Detail "SKIP: $reason; measurement not executed" }
+                    "chainP95Ms" { Add-Measurement -Name $name -Status "SKIP" -Threshold "<= $($thresholds.chainP95Ms) ms" -Value $null -Detail "SKIP: $reason; measurement not executed" }
+                    "changesP95Ms" { Add-Measurement -Name $name -Status "SKIP" -Threshold "<= $($thresholds.changesP95Ms) ms" -Value $null -Detail "SKIP: $reason; measurement not executed" }
+                }
             }
         }
     }
