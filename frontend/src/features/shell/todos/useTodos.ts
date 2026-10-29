@@ -35,6 +35,16 @@ export const TODOS_POLL_INTERVAL_MS = 30_000
 
 const TODOS_PATH = "/api/todos?limit=50"
 
+/**
+ * Admin knowledge-review queue (spec §9.4): draft knowledge entries belong to
+ * the review group. The route is admin-guarded, so it is only requested for an
+ * administrator.
+ */
+const KNOWLEDGE_QUEUE_PATH = "/api/knowledge?status=draft&limit=50"
+
+/** Number of draft knowledge entries merged into one admin snapshot. */
+export const KNOWLEDGE_QUEUE_LIMIT = 50
+
 const EMPTY_SNAPSHOT: TodoSnapshot = {
   items: [],
   counts: { review: 0, takeover: 0, gate: 0 },
@@ -101,9 +111,62 @@ function describeError(error: unknown): string {
   return error.message
 }
 
-/** Fetches and normalizes one todo-centre snapshot. */
-export async function fetchTodos(): Promise<TodoSnapshot> {
-  return normalizeTodoSnapshot(await apiGet<unknown>(TODOS_PATH))
+/**
+ * Normalizes the admin draft-knowledge read into review-group todo items. The
+ * entry id is a decimal string and is never converted with `Number()`; the deep
+ * link opens the review drawer focused on that entry.
+ */
+export function normalizeKnowledgeTodos(payload: unknown): TodoItem[] {
+  if (!Array.isArray(payload)) return []
+  const items: TodoItem[] = []
+  for (const raw of payload) {
+    if (!isRecord(raw)) continue
+    const id = text(raw.id)
+    if (id === "") continue
+    const versionId = text(raw.versionId)
+    items.push({
+      kind: "review",
+      title: `知识审核：${text(raw.title) || id}`,
+      versionId,
+      versionName: text(raw.versionName),
+      severity: "info",
+      createdAt: text(raw.createdAt),
+      url: `/knowledge?review=${id}`,
+    })
+  }
+  return items
+}
+
+/**
+ * Merges the admin knowledge-review drafts into the review group: one item per
+ * draft, and the review count includes them so the topbar badge and the group
+ * badge agree.
+ */
+export function mergeKnowledgeTodos(snapshot: TodoSnapshot, knowledge: TodoItem[]): TodoSnapshot {
+  if (knowledge.length === 0) return snapshot
+  return {
+    items: [...snapshot.items, ...knowledge],
+    counts: {
+      ...snapshot.counts,
+      review: snapshot.counts.review + knowledge.length,
+    },
+  }
+}
+
+/**
+ * Fetches and normalizes one todo-centre snapshot. An administrator additionally
+ * reads the draft knowledge queue; a failure of that second read only omits the
+ * knowledge items so the shell never loses the version todos.
+ */
+export async function fetchTodos(admin = false): Promise<TodoSnapshot> {
+  const snapshot = normalizeTodoSnapshot(await apiGet<unknown>(TODOS_PATH))
+  if (!admin) return snapshot
+  try {
+    const knowledge = normalizeKnowledgeTodos(await apiGet<unknown>(KNOWLEDGE_QUEUE_PATH))
+    return mergeKnowledgeTodos(snapshot, knowledge)
+  } catch {
+    return snapshot
+  }
 }
 
 export type UseTodosResult = {
@@ -116,31 +179,35 @@ export type UseTodosResult = {
 
 /**
  * Loads the todo centre, refreshes on every route change and polls every 30 s
- * (spec §6.3). A failed read only sets `error`: the topbar shell keeps
- * rendering and the panel offers a retry.
+ * (spec §6.3). An administrator also gets the draft knowledge queue in the
+ * review group (spec §9.4). A failed read only sets `error`: the topbar shell
+ * keeps rendering and the panel offers a retry.
  */
-export function useTodos(): UseTodosResult {
+export function useTodos(admin = false): UseTodosResult {
   const pathname = usePathname() ?? ""
   const [todos, setTodos] = useState<TodoSnapshot>(EMPTY_SNAPSHOT)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState("")
   const requestRef = useRef(0)
 
-  const load = useCallback(async (showLoading: boolean): Promise<void> => {
-    const requestId = ++requestRef.current
-    if (showLoading) setLoading(true)
-    try {
-      const snapshot = await fetchTodos()
-      if (requestRef.current !== requestId) return
-      setTodos(snapshot)
-      setError("")
-    } catch (caught) {
-      if (requestRef.current !== requestId) return
-      setError(describeError(caught))
-    } finally {
-      if (requestRef.current === requestId) setLoading(false)
-    }
-  }, [])
+  const load = useCallback(
+    async (showLoading: boolean): Promise<void> => {
+      const requestId = ++requestRef.current
+      if (showLoading) setLoading(true)
+      try {
+        const snapshot = await fetchTodos(admin)
+        if (requestRef.current !== requestId) return
+        setTodos(snapshot)
+        setError("")
+      } catch (caught) {
+        if (requestRef.current !== requestId) return
+        setError(describeError(caught))
+      } finally {
+        if (requestRef.current === requestId) setLoading(false)
+      }
+    },
+    [admin],
+  )
 
   // A route change is an explicit refresh trigger (spec §6.3).
   // biome-ignore lint/correctness/useExhaustiveDependencies: pathname is the route-change trigger; load itself is pathname-independent

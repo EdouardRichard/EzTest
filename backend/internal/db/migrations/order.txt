@@ -41,3 +41,4 @@ codeintel_0005_issue_anchor.sql
 codeintel_0006_version_change.sql
 quality_0001_eval.sql
 codeintel_0007_fact_review.sql
+version_0006_knowledge.sql

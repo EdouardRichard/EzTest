@@ -132,6 +132,8 @@ func WriteServiceError(w http.ResponseWriter, r *http.Request, err error) {
 		status, code = http.StatusNotFound, platform.CodeNotFound
 	case domain.KindConflict, domain.KindDependency, domain.KindStateConflict:
 		status, code = http.StatusConflict, platform.CodeConflict
+	case domain.KindForbidden:
+		status, code = http.StatusForbidden, platform.CodeForbidden
 	default:
 		platform.WriteError(w, r, http.StatusInternalServerError, platform.CodeInternal, "internal server error")
 		return

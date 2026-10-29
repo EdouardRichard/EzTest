@@ -43,7 +43,10 @@ type runFixture struct {
 	// impact is the optional P4 impact summary read of the incremental-design
 	// run starter; nil seeds impactAvailable=false with the impact_unavailable
 	// warning (spec §6.1 step 3b/§7.6).
-	impact        application.P4ImpactReader
+	impact application.P4ImpactReader
+	// knowledge is the optional approved version-knowledge read of a design run
+	// (spec §9.4); nil omits the "版本知识" segment.
+	knowledge     application.KnowledgeReader
 	baselineFiles []string
 	files         map[string]bool
 
@@ -113,6 +116,7 @@ func (f *runFixture) service() *application.RunService {
 		Versions:     runVersionLifecycle{f},
 		Batches:      f.batches,
 		Requirements: runRequirementReader{f},
+		Knowledge:    f.knowledge,
 		Catalog:      runCatalogGateway{f},
 		CodeFacts:    runCodeFactsGateway{f},
 		Impact:       f.impact,

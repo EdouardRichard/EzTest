@@ -28,25 +28,38 @@ import (
 var testNow = time.Date(2026, 10, 27, 10, 0, 0, 0, time.UTC)
 
 const (
-	testUserToken = "version-test-token"
-	testUserID    = int64(42)
+	testUserToken  = "version-test-token"
+	testAdminToken = "version-test-admin-token"
+	testUserID     = int64(42)
+	testAdminID    = int64(43)
 )
 
-// testAuthenticator resolves testUserToken to a regular (non-admin) user: P3
-// has no admin-only route, so the same user must be able to read and write.
+// testAuthenticator resolves testUserToken to a regular (non-admin) user and
+// testAdminToken to the administrator the knowledge review/edit rules check.
+// P3 has no admin-only route outside knowledge, so the regular user must still
+// be able to read and write every other route.
 type testAuthenticator struct{}
 
-// Authenticate maps the test bearer token to the seeded regular user.
+// Authenticate maps the test bearer tokens to the seeded users.
 func (testAuthenticator) Authenticate(_ context.Context, rawToken string) (identity.User, error) {
-	if rawToken != testUserToken {
+	switch rawToken {
+	case testUserToken:
+		return identity.User{
+			ID:       testUserID,
+			Username: "tester",
+			Role:     identity.RoleUser,
+			Status:   identity.StatusActive,
+		}, nil
+	case testAdminToken:
+		return identity.User{
+			ID:       testAdminID,
+			Username: "admin",
+			Role:     identity.RoleAdmin,
+			Status:   identity.StatusActive,
+		}, nil
+	default:
 		return identity.User{}, identity.ErrUnauthenticated
 	}
-	return identity.User{
-		ID:       testUserID,
-		Username: "tester",
-		Role:     identity.RoleUser,
-		Status:   identity.StatusActive,
-	}, nil
 }
 
 // readSeekCloser adapts a bytes.Reader to the io.ReadSeekCloser contract of the
@@ -940,6 +953,7 @@ type testDeps struct {
 	attachments      *fakeAttachmentService
 	clarification    *fakeClarificationService
 	messages         *fakeClarificationMessages
+	knowledge        *fakeKnowledgeService
 	aiReady          *fakeAIReady
 	events           *fakeEventSnapshotter
 	eventReader      *fakeEventReader
@@ -960,6 +974,7 @@ func newTestDeps() *testDeps {
 		attachments:      newFakeAttachmentService(&order),
 		clarification:    newFakeClarificationService(),
 		messages:         &fakeClarificationMessages{},
+		knowledge:        newFakeKnowledgeService(),
 		aiReady:          &fakeAIReady{},
 		events:           &fakeEventSnapshotter{},
 		eventReader:      &fakeEventReader{},
@@ -983,6 +998,7 @@ func newTestServer(t *testing.T) (http.Handler, *testDeps) {
 		Attachments:           deps.attachments,
 		Clarification:         deps.clarification,
 		ClarificationMessages: deps.messages,
+		Knowledge:             deps.knowledge,
 		AIReady:               deps.aiReady.Ready,
 		Events:                deps.events,
 		EventReader:           deps.eventReader,

@@ -69,8 +69,13 @@ type RunDeps struct {
 	// batch_precondition_unavailable warning instead of bypassing the check.
 	Batches      SupplementBatchReader
 	Requirements RequirementReader
-	Catalog      CatalogGateway
-	CodeFacts    CodeFactsGateway
+	// Knowledge is the optional approved version-knowledge read: when wired, a
+	// design run appends the "版本知识" segment to its instruction and records
+	// the injected ids as stats.knowledgeRefs (spec §9.4). Review/data_plan runs
+	// never read it.
+	Knowledge KnowledgeReader
+	Catalog   CatalogGateway
+	CodeFacts CodeFactsGateway
 	// Impact is the optional P4 impact summary read of the incremental_design
 	// run starter. When wired, the starter seeds the run.result impact signal so
 	// the plan can consume the P4 result; without it the run starts with
@@ -408,7 +413,8 @@ func (s *RunService) Start(ctx context.Context, versionID, actor int64, cmd Star
 	if err != nil {
 		return domain.CaseDesignRun{}, err
 	}
-	instruction, truncated := s.buildInstruction(ctx, version, cmd, requirements, runID)
+	built := s.buildInstruction(ctx, version, cmd, requirements, runID)
+	instruction := built.Text
 	input, err := runEncodeStartInput(cmd)
 	if err != nil {
 		return domain.CaseDesignRun{}, err
@@ -425,12 +431,28 @@ func (s *RunService) Start(ctx context.Context, versionID, actor int64, cmd Star
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}
-	if truncated {
+	if built.Truncated {
 		run.Stats = []byte(`{"contextTruncated":true}`)
 	}
+	warnings := make([]IncrementalPlanWarning, 0, 2)
 	if batchWarning != nil {
+		warnings = append(warnings, *batchWarning)
+	}
+	if built.KnowledgeTruncated {
+		warnings = append(warnings, IncrementalPlanWarning{
+			Code:    planWarningKnowledgeTruncated,
+			Message: "the approved version knowledge exceeded the injection budget",
+		})
+	}
+	if len(warnings) > 0 {
+		run.Stats = runMergeStats(run.Stats, map[string]any{"warnings": warnings})
+	}
+	if built.KnowledgeTruncated {
+		run.Stats = runMergeStats(run.Stats, map[string]any{"knowledgeTruncated": true})
+	}
+	if len(built.KnowledgeRefs) > 0 {
 		run.Stats = runMergeStats(run.Stats, map[string]any{
-			"warnings": []IncrementalPlanWarning{*batchWarning},
+			"knowledgeRefs": knowledgeRefIDs(built.KnowledgeRefs),
 		})
 	}
 	if cmd.Kind == RunKindIncrementalDesign {
@@ -848,7 +870,31 @@ func (s *RunService) now() time.Time {
 // in priority order under a fixed footer reservation; the first section that
 // does not fit is truncated (or dropped once nothing fits) and the caller
 // records contextTruncated.
-func (s *RunService) buildInstruction(ctx context.Context, version VersionSnapshot, cmd StartRunCommand, requirements []RequirementSnapshot, runID int64) (string, bool) {
+// runBuiltInstruction is one assembled run instruction plus the provenance the
+// run row records: the context-truncation flag and the approved knowledge ids
+// that were injected (spec §9.4).
+type runBuiltInstruction struct {
+	Text               string
+	Truncated          bool
+	KnowledgeRefs      []int64
+	KnowledgeTruncated bool
+}
+
+// planWarningKnowledgeTruncated is the stable run warning of an injection budget
+// that cut the approved version knowledge.
+const planWarningKnowledgeTruncated = "knowledge_truncated"
+
+// knowledgeRefIDs renders the injected knowledge ids as decimal strings: event
+// and run detail ids cross the JSON boundary as strings (D29).
+func knowledgeRefIDs(ids []int64) []string {
+	refs := make([]string, 0, len(ids))
+	for _, id := range ids {
+		refs = append(refs, strconv.FormatInt(id, 10))
+	}
+	return refs
+}
+
+func (s *RunService) buildInstruction(ctx context.Context, version VersionSnapshot, cmd StartRunCommand, requirements []RequirementSnapshot, runID int64) runBuiltInstruction {
 	footer := runSubmitInstruction(cmd.Kind)
 	budget := runMaxInstructionBytes - len(footer)
 	var builder strings.Builder
@@ -866,14 +912,33 @@ func (s *RunService) buildInstruction(ctx context.Context, version VersionSnapsh
 		}
 		truncated = true
 	}
+	built := runBuiltInstruction{}
 	write(s.versionInstruction(version, cmd, runID))
+	if cmd.Kind == domain.RunKindDesign {
+		// The approved version knowledge is a design-run input only (spec §9.4).
+		// The read is best-effort: an unavailable knowledge table never blocks a
+		// design run, it only omits the segment and the knowledgeRefs record.
+		if s.deps.Knowledge != nil {
+			section, err := s.deps.Knowledge.ApprovedKnowledgeSection(ctx, version.ID)
+			if err != nil {
+				slog.WarnContext(ctx, "mindmap: approved knowledge read failed; starting the design run without it",
+					"version_id", version.ID, "error", err)
+			} else if strings.TrimSpace(section.Text) != "" {
+				write(section.Text + "\n")
+				built.KnowledgeRefs = section.Refs
+				built.KnowledgeTruncated = section.Truncated
+			}
+		}
+	}
 	write(runRequirementsInstruction(requirements))
 	write(s.relationsInstruction(ctx, version.ID))
 	write(s.appModelsInstruction(ctx, version))
 	write(s.factsInstruction(ctx, version.ID))
 	write(s.graphInstruction(ctx, version.ID, cmd))
 	builder.WriteString(footer)
-	return builder.String(), truncated
+	built.Text = builder.String()
+	built.Truncated = truncated
+	return built
 }
 
 // versionInstruction renders the version section (spec §8.3 point 1).

@@ -106,6 +106,10 @@ type ClarificationService struct {
 	agents       AgentSessions
 	events       EventPublisher
 	ids          IDGenerator
+	// knowledge is the optional approved-knowledge injection read (spec §9.4).
+	// It is consulted before every one-shot analysis/recon run; a nil injector
+	// disables the "版本知识" segment.
+	knowledge KnowledgeInjector
 }
 
 // ClarificationServiceOption customises the clarification service dependencies.
@@ -120,6 +124,17 @@ func WithClarificationIDGenerator(ids IDGenerator) ClarificationServiceOption {
 	return func(s *ClarificationService) {
 		if ids != nil {
 			s.ids = ids
+		}
+	}
+}
+
+// WithClarificationKnowledge injects the version knowledge read used to append
+// the approved "版本知识" segment to every one-shot clarification run (spec §9.4).
+// A nil injector keeps the legacy instruction.
+func WithClarificationKnowledge(knowledge KnowledgeInjector) ClarificationServiceOption {
+	return func(s *ClarificationService) {
+		if knowledge != nil {
+			s.knowledge = knowledge
 		}
 	}
 }
@@ -322,6 +337,7 @@ func (s *ClarificationService) startOneShot(ctx context.Context, versionID, acto
 	if _, err := s.ensureVersion(ctx, versionID); err != nil {
 		return StartRunResult{}, err
 	}
+	instruction = s.injectKnowledge(ctx, versionID, instruction)
 	session, err := s.repo.GetActiveSession(ctx, versionID)
 	if err != nil {
 		return StartRunResult{}, err
@@ -925,6 +941,29 @@ func (s *ClarificationService) loadDecision(ctx context.Context, versionID, deci
 		return nil, domain.NewNotFound("decision", decisionID)
 	}
 	return decision, nil
+}
+
+// injectKnowledge prefixes instruction with the version's approved "版本知识"
+// segment (spec §9.4). The read is best-effort: a failure is logged and the run
+// starts with the legacy instruction so an unavailable knowledge table never
+// blocks clarification. Draft/rejected entries are excluded by the service's
+// approved-only read.
+func (s *ClarificationService) injectKnowledge(ctx context.Context, versionID int64, instruction string) string {
+	if s.knowledge == nil {
+		return instruction
+	}
+	section, err := s.knowledge.ApprovedKnowledgeSection(ctx, versionID)
+	if err != nil {
+		slog.WarnContext(ctx, "clarification: approved knowledge read failed; starting the run without it",
+			"version_id", versionID,
+			"error", err,
+		)
+		return instruction
+	}
+	if strings.TrimSpace(section.Text) == "" {
+		return instruction
+	}
+	return section.Text + "\n" + instruction
 }
 
 // ensureAgentIdle rejects a write that would start a second agent run on the

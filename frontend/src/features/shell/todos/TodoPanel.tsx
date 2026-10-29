@@ -19,7 +19,7 @@ const GROUPS: readonly GroupMeta[] = [
   {
     kind: "review",
     label: "待评审",
-    description: "等待人工评审的版本",
+    description: "等待人工评审的版本与知识草稿",
     icon: ClipboardCheck,
     accent: "text-sky-500",
   },

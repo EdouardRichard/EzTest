@@ -345,6 +345,15 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	requirementRepo := versionpostgres.NewRequirementRepository(database.Pool)
 	clarificationRepo := versionpostgres.NewClarificationRepository(database.Pool)
 	versionEvents := versioneventing.NewEventPublisher(eventService)
+	// P8 version knowledge (spec §9.4): the knowledge service owns the approved
+	// read that both the P3 one-shot clarification runs and the P5 design runs
+	// inject. The injection budget is the EZTEST_KNOWLEDGE_MAX_INJECT /
+	// EZTEST_KNOWLEDGE_MAX_BYTES contract of spec §11.4.
+	knowledgeRepo := versionpostgres.NewKnowledgeRepository(database.Pool)
+	knowledgeService := versionapp.NewKnowledgeService(
+		knowledgeRepo, versionRepo, versionEvents,
+		versionapp.WithKnowledgeIDGenerator(snowflake),
+		versionapp.WithKnowledgeLimits(versionapp.KnowledgeLimitsFromEnv(os.Getenv)))
 	versionCatalog := versionresource.NewCatalog(catalogService, catalogService, codeRepoService)
 	versionGit := versiongitread.NewGitReader(0)
 	// The attachment root is created eagerly with least privilege. The filestore
@@ -857,7 +866,8 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	agentSessionsAdapter := versionagent.NewAgentSessions(p1Agents, p1Agents, agentProfileService)
 	clarificationService := versionapp.NewClarificationService(
 		clarificationRepo, requirementRepo, versionRepo, agentSessionsAdapter, versionEvents,
-		versionapp.WithClarificationIDGenerator(snowflake))
+		versionapp.WithClarificationIDGenerator(snowflake),
+		versionapp.WithClarificationKnowledge(knowledgeService))
 	agentToolService := versionapp.NewAgentToolService(versionapp.AgentToolServiceDeps{
 		Versions:             versionRepo,
 		Requirements:         requirementRepo,
@@ -1116,6 +1126,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Versions:     mindmapLifecycle,
 		Batches:      supplementBatches,
 		Requirements: mindmapRequirements,
+		Knowledge:    mindmapversion.NewKnowledgeAdapter(knowledgeService),
 		Catalog:      mindmapCatalog,
 		CodeFacts:    mindmapCodeFacts,
 		Impact:       mindmapImpactSummary,
@@ -1345,6 +1356,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Attachments:           attachmentService,
 		Clarification:         clarificationService,
 		ClarificationMessages: agentSessionsAdapter,
+		Knowledge:             knowledgeService,
 		// The readiness probe refuses the clarification endpoints that start a
 		// run while the default LLM configuration is missing or cannot serve
 		// tools (503 ai_unavailable, spec §8.6). Capacity is enforced atomically

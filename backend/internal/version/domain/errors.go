@@ -13,6 +13,10 @@ const (
 	KindConflict      ErrorKind = "conflict"
 	KindDependency    ErrorKind = "dependency"
 	KindStateConflict ErrorKind = "state_conflict"
+	// KindForbidden is an authorization denial (HTTP 403). P3 only returns it
+	// from the knowledge edit rule (creator/admin); every route-level admin
+	// guard is enforced by the identity middleware before the handler runs.
+	KindForbidden ErrorKind = "forbidden"
 )
 
 // Error is the version context's domain error. Field names the offending
@@ -68,4 +72,10 @@ func NewStateConflict(reason, message string) *Error {
 // NewDependency returns a deletion blocked by dependents (HTTP 409).
 func NewDependency(reason, message string) *Error {
 	return &Error{Kind: KindDependency, Reason: reason, Message: message}
+}
+
+// NewForbidden returns an authorization denial (HTTP 403). Reason is the stable
+// details.reason code, for example knowledge_forbidden.
+func NewForbidden(reason, message string) *Error {
+	return &Error{Kind: KindForbidden, Reason: reason, Message: message}
 }
