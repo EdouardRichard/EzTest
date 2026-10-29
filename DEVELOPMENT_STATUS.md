@@ -4,6 +4,9 @@
 > 面向用户的公开 README 位于 [README.md](README.md)（英文）与 [README.zh-CN.md](README.zh-CN.md)（中文）。
 > 该文件**不进入 main 公开发布分支**。
 
+- 架构设计文档（软件工程标准，含 C4 视图、25 条 ADR、质量属性与验证状态）：[`docs/architecture-design.md`](docs/architecture-design.md)
+- 详细设计文档（16 个限界上下文、关键流程/算法、数据/接口/执行器/前端/配置/安全/测试设计）：[`docs/detailed-design.md`](docs/detailed-design.md)
+
 EzTest 的 P0 基础阶段（foundation）、P1 Agent 运行时、P2 公共资源/身份、P3 版本/多需求/澄清、P4 代码理解/影响分析、P5 用例脑图、P6 用例执行、P7 全自主闭环/交付与 P8 体验完善/硬化实现：Go 后端 API、Next.js 管理前端、Playwright 执行器、PostgreSQL 持久化，以及 SSE 事件流、对象存储、审计、LLM 配置管理、Agent 控制台、公共资源管理、版本工作台与澄清、代码影响分析、用例脑图、真实浏览器执行/证据/暂停恢复、AI 补全与失败分析、问题/报告、DB 断言、继续中增量批次、探索链路 v2、全局搜索/待办、知识沉淀、评测/质量中心、限流/SLO、证据 GC、备份恢复与多实例单活。
 
 - 分支：`dev`（P8 硬化阶段；HEAD 见 `git log`）
