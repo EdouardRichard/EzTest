@@ -241,6 +241,42 @@ func TestApproveVisualBaselinePersistsAndPublishesIdentifiersOnly(t *testing.T) 
 	}
 }
 
+// TestApproveVisualBaselineAfterExecutionFreeze pins the only admissible
+// baseline flow of design spec §9.3: the candidate screenshot comes from an
+// execution run, so the version is already executing with a frozen case
+// baseline when the administrator approves it. Update stays closed after the
+// freeze (baseline_frozen); approval must not.
+func TestApproveVisualBaselineAfterExecutionFreeze(t *testing.T) {
+	fixture := newVisualFixture()
+	fixture.versions.status = "executing"
+	fixture.baselines.baseline = &domain.CaseBaseline{ID: 9, VersionID: 5}
+	data := pngBytes(t, 1280, 720)
+	fixture.evidence.evidence = application.VisualEvidence{
+		ID: 501, Kind: "screenshot", Mime: "image/png",
+		Data: data, SizeBytes: int64(len(data)),
+	}
+
+	stored, err := fixture.service().ApproveBaseline(context.Background(), 5, 77, 1, 501)
+	if err != nil {
+		t.Fatalf("ApproveBaseline after the execution freeze: %v", err)
+	}
+	if stored.BaselineEvidenceID == nil || *stored.BaselineEvidenceID != 501 {
+		t.Fatalf("stored baseline = %+v, want evidence 501", stored)
+	}
+
+	// Editing the comparison parameters remains forbidden once the baseline is
+	// frozen; only the baseline pointer is mutable through the approval.
+	_, err = fixture.service().Update(context.Background(), 5, 77, 42, application.UpdateVisualAssertionCommand{
+		NodeRevision: 3, Threshold: 0.02,
+	})
+	if reason := visualReason(t, err); reason != "baseline_frozen" {
+		t.Fatalf("Update reason = %q, want baseline_frozen", reason)
+	}
+	if fixture.store.saveCalls != 0 {
+		t.Fatalf("Update reached the store after the baseline freeze")
+	}
+}
+
 func TestApproveVisualBaselineRejectsNonPNGEvidence(t *testing.T) {
 	fixture := newVisualFixture()
 	fixture.evidence.evidence = application.VisualEvidence{
