@@ -34,10 +34,20 @@ const upsertVersionChangeSQL = `INSERT INTO version_change
 
 // listVersionBatchesSQL is the read-only run_batch projection of one version.
 // It selects only the columns the snapshot generation consumes and never locks
-// or mutates execution state.
+// or mutates execution state. The EXISTS subquery reads the codeintel context's
+// own code_analysis table (never another context) so a batch head is marked
+// analysis-ready only when a terminal analysis targets it; the snapshot
+// generation uses that flag to stay provisional instead of freezing a
+// pre-analysis all-unmapped snapshot.
 const listVersionBatchesSQL = `SELECT id, version_id, batch_no, status, kind,
 		parent_batch_id, base_fallback_reason,
-		COALESCE(code_baseline_commit, ''), COALESCE(head_commit, ''), created_at
+		COALESCE(code_baseline_commit, ''), COALESCE(head_commit, ''), created_at,
+		EXISTS (
+			SELECT 1 FROM code_analysis
+			WHERE code_analysis.version_id = run_batch.version_id
+			  AND code_analysis.head_commit = run_batch.head_commit
+			  AND code_analysis.status = 'done'
+		) AS head_analysed
 	FROM run_batch
 	WHERE version_id = $1
 	ORDER BY batch_no, id`
@@ -251,6 +261,7 @@ func (r *VersionChangeRepo) ListBatches(ctx context.Context, versionID int64) ([
 			&batch.CodeBaselineCommit,
 			&batch.HeadCommit,
 			&batch.CreatedAt,
+			&batch.HeadAnalysed,
 		); err != nil {
 			return nil, fmt.Errorf("postgres: scan version change batch: %w", err)
 		}

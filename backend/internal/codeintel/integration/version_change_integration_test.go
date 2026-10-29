@@ -92,7 +92,9 @@ func TestVersionChangeMigrationAndRepository(t *testing.T) {
 		t.Fatalf("duplicate (version_id, batch_id) error = %v, want SQLSTATE 23505", err)
 	}
 
-	// order.txt ends with the P8 migration.
+	// order.txt lists the P8 migration once, after the P7 codeintel anchor. The
+	// assertion must stay append-only: later P8 migrations (codeintel_0007+)
+	// append behind it, so it must never require the file to be last.
 	orderRaw, err := os.ReadFile("../../db/migrations/order.txt")
 	if err != nil {
 		t.Fatalf("read order.txt: %v", err)
@@ -103,8 +105,25 @@ func TestVersionChangeMigrationAndRepository(t *testing.T) {
 			lines = append(lines, trimmed)
 		}
 	}
-	if len(lines) == 0 || lines[len(lines)-1] != "codeintel_0006_version_change.sql" {
-		t.Fatalf("order.txt tail = %v, want codeintel_0006_version_change.sql appended", lines)
+	orderIndex := func(name string) int {
+		for index, line := range lines {
+			if line == name {
+				return index
+			}
+		}
+		return -1
+	}
+	anchorIndex := orderIndex("codeintel_0005_issue_anchor.sql")
+	versionChangeIndex := orderIndex("codeintel_0006_version_change.sql")
+	if anchorIndex < 0 {
+		t.Fatalf("order.txt = %v, want codeintel_0005_issue_anchor.sql present", lines)
+	}
+	if versionChangeIndex < 0 {
+		t.Fatalf("order.txt = %v, want codeintel_0006_version_change.sql present", lines)
+	}
+	if versionChangeIndex <= anchorIndex {
+		t.Fatalf("order.txt index of codeintel_0006_version_change.sql = %d, want after codeintel_0005_issue_anchor.sql at %d",
+			versionChangeIndex, anchorIndex)
 	}
 
 	// The repository upsert is idempotent on the unique pair: the second write
@@ -174,6 +193,48 @@ func TestVersionChangeMigrationAndRepository(t *testing.T) {
 	}
 	if batches[1].CodeBaselineCommit != seedBaseCommit || batches[1].HeadCommit != seedHeadCommit {
 		t.Fatalf("batch 2 commits = %q..%q", batches[1].CodeBaselineCommit, batches[1].HeadCommit)
+	}
+	// HeadAnalysed stays false while no terminal analysis of the version targets
+	// the batch head: the read-time snapshot generation must stay provisional.
+	if batches[0].HeadAnalysed || batches[1].HeadAnalysed {
+		t.Fatalf("HeadAnalysed before any analysis = %v/%v, want false",
+			batches[0].HeadAnalysed, batches[1].HeadAnalysed)
+	}
+
+	// A done analysis of the version at the batch head makes the batch
+	// analysis-ready; queued/running/failed analyses never do.
+	insertAnalysisRow(t, ctx, pool, 9401, 7002, seedBaseCommit, seedHeadCommit, "running")
+	batches, err = repo.ListBatches(ctx, 7002)
+	if err != nil {
+		t.Fatalf("ListBatches (running analysis): %v", err)
+	}
+	if batches[0].HeadAnalysed {
+		t.Fatal("HeadAnalysed with a running analysis = true, want false")
+	}
+	if _, err := pool.Exec(ctx,
+		`UPDATE code_analysis SET status = 'done' WHERE id = 9401`); err != nil {
+		t.Fatalf("finish analysis 9401: %v", err)
+	}
+	batches, err = repo.ListBatches(ctx, 7002)
+	if err != nil {
+		t.Fatalf("ListBatches (done analysis): %v", err)
+	}
+	if !batches[0].HeadAnalysed || !batches[1].HeadAnalysed {
+		t.Fatalf("HeadAnalysed after a done analysis = %v/%v, want true for both batches sharing the head",
+			batches[0].HeadAnalysed, batches[1].HeadAnalysed)
+	}
+}
+
+// insertAnalysisRow inserts one minimal code_analysis row so the batch
+// readiness projection can be asserted against a real schema.
+func insertAnalysisRow(t *testing.T, ctx context.Context, pool *pgxpool.Pool, id, versionID int64, base, head, status string) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO code_analysis
+			(id, version_id, repo_id, base_commit, head_commit, status, prompt_version, created_by)
+		VALUES ($1, $2, 3, $3, $4, $5, 'test-prompt', 1)`,
+		id, versionID, base, head, status); err != nil {
+		t.Fatalf("insert code_analysis %d: %v", id, err)
 	}
 }
 

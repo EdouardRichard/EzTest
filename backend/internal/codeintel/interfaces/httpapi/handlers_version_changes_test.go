@@ -47,6 +47,8 @@ type versionChangeWire struct {
 	UnmappedCount    int               `json:"unmappedCount"`
 	Items            []json.RawMessage `json:"items"`
 	ComputedAt       string            `json:"computedAt"`
+	Provisional      bool              `json:"provisional"`
+	Unavailable      bool              `json:"unavailable"`
 }
 
 // TestVersionChangesIncludesBatchTimelineAndLegacyFields pins the additive
@@ -242,4 +244,67 @@ func TestVersionChangesTimelineFailureMapsOntoTheSharedEnvelope(t *testing.T) {
 	handler := newTestHandler(t, HandlerDeps{Query: query, VersionChanges: versionChanges})
 	recorder := serve(t, handler, http.MethodGet, "/api/versions/42/code/changes", userToken)
 	assertErrorResponse(t, recorder, http.StatusServiceUnavailable, platform.CodeUnavailable, "git_unavailable")
+}
+
+// TestVersionChangesCarriesProvisionalAndUnavailableFlags pins the additive
+// degraded flags of the batch timeline: the UI needs them to render
+// 「映射生成中」/「本批变更暂不可用」 instead of a misleading empty or all-unmapped
+// batch.
+func TestVersionChangesCarriesProvisionalAndUnavailableFlags(t *testing.T) {
+	query := &fakeQueryService{versionChangesFn: func(context.Context, int64, string) (domain.ChangeSetData, string, string, error) {
+		return domain.ChangeSetData{}, commitA, commitB, nil
+	}}
+	versionChanges := &fakeVersionChangeService{
+		timelineFn: func(context.Context, int64) ([]application.VersionChangeTimelineEntry, error) {
+			return []application.VersionChangeTimelineEntry{
+				{
+					BatchNo: 1, BatchStatus: "done", Provisional: true,
+					Change: domain.VersionChange{
+						BatchID: 11, VersionID: 42, BaseCommit: commitA, HeadCommit: commitB,
+						ChangedFiles: 2, UnmappedCount: 2,
+						Items: []domain.VersionChangeItem{
+							{File: "src/api/refund.ts", ChangeKind: domain.VersionChangeModified, Unmapped: true},
+						},
+					},
+				},
+				{
+					BatchNo: 2, BatchStatus: "done", Unavailable: true,
+					Change: domain.VersionChange{
+						BatchID: 12, VersionID: 42, BaseCommit: commitB, HeadCommit: versionChangeCommitC,
+					},
+				},
+			}, nil
+		},
+	}
+
+	handler := newTestHandler(t, HandlerDeps{Query: query, VersionChanges: versionChanges})
+	recorder := serve(t, handler, http.MethodGet, "/api/versions/42/code/changes", userToken)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", recorder.Code, recorder.Body.String())
+	}
+	var body struct {
+		Data struct {
+			BatchTimeline []versionChangeWire `json:"batchTimeline"`
+		} `json:"data"`
+	}
+	decodeBody(t, recorder, &body)
+	if len(body.Data.BatchTimeline) != 2 {
+		t.Fatalf("batchTimeline = %+v, want 2 entries", body.Data.BatchTimeline)
+	}
+	provisional := body.Data.BatchTimeline[0]
+	if !provisional.Provisional || provisional.Unavailable {
+		t.Fatalf("batch 1 flags = provisional %v unavailable %v, want provisional only",
+			provisional.Provisional, provisional.Unavailable)
+	}
+	if len(provisional.Items) != 1 || provisional.UnmappedCount != 2 {
+		t.Fatalf("provisional batch = %+v, want its computed shell and counters", provisional)
+	}
+	unavailable := body.Data.BatchTimeline[1]
+	if unavailable.Provisional || !unavailable.Unavailable {
+		t.Fatalf("batch 2 flags = provisional %v unavailable %v, want unavailable only",
+			unavailable.Provisional, unavailable.Unavailable)
+	}
+	if len(unavailable.Items) != 0 {
+		t.Fatalf("unavailable batch items = %+v, want []", unavailable.Items)
+	}
 }

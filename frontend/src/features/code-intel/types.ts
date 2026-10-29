@@ -72,6 +72,19 @@ export type VersionChangeBatch = {
   unmappedCount: number
   items: VersionChangeItem[]
   computedAt: string
+  /**
+   * Additive P8 degraded flag: the batch head has no analysis mapping data yet,
+   * so the snapshot is computed provisionally on every read and never reflects
+   * a durable unmapped verdict. The UI says「映射生成中」and suppresses the
+   * pre-analysis unmapped badges. Older backends omit the field (false).
+   */
+  provisional?: boolean
+  /**
+   * Additive P8 degraded flag: this batch's deterministic diff could not be
+   * computed. The rest of the timeline still renders; the batch says
+   *「本批变更暂不可用」instead of pretending it has no changes.
+   */
+  unavailable?: boolean
 }
 
 /**

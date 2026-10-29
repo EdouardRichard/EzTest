@@ -81,6 +81,12 @@ type VersionBatch struct {
 	CodeBaselineCommit string
 	HeadCommit         string
 	CreatedAt          time.Time
+	// HeadAnalysed reports that a terminal (done) codeintel analysis of the same
+	// version targets this batch's head commit. The read-time snapshot
+	// generation only persists a batch once its head is analysed (or it has no
+	// changed files); a read before that returns a provisional, recomputable
+	// snapshot instead of freezing an all-unmapped pre-analysis row.
+	HeadAnalysed bool
 }
 
 // ChangeKindFromStatus maps one deterministic git status (A, M, D, R100, C75,

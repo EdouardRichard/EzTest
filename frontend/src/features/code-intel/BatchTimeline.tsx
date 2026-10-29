@@ -31,6 +31,12 @@ const rewriteBadgeClass =
 const unmappedBadgeClass =
   "inline-flex items-center rounded-full border border-destructive/30 bg-destructive/10 px-2 py-0.5 text-[11px] font-medium text-destructive"
 
+const provisionalBadgeClass =
+  "inline-flex items-center rounded-full border border-sky-500/25 bg-sky-500/10 px-2 py-0.5 text-[11px] font-medium text-sky-700 dark:text-sky-300"
+
+const unavailableBadgeClass =
+  "inline-flex items-center rounded-full border border-destructive/30 bg-destructive/10 px-2 py-0.5 text-[11px] font-medium text-destructive"
+
 const caseBadgeClass =
   "inline-flex items-center rounded-full border border-sky-500/25 bg-sky-500/10 px-2 py-0.5 text-[11px] font-medium text-sky-700 dark:text-sky-300"
 
@@ -42,14 +48,18 @@ function changeKindLabel(kind: string): string {
   return CHANGE_KIND_LABELS[kind] ?? (kind === "" ? "变更" : kind)
 }
 
-/** One file → entities → affected cases row of a batch snapshot. */
-function BatchItem({ item }: { item: VersionChangeItem }) {
+/**
+ * One file → entities → affected cases row of a batch snapshot. A provisional
+ * (pre-analysis) snapshot suppresses the unmapped badge: that verdict is not
+ * final and would otherwise be frozen-misleading.
+ */
+function BatchItem({ item, provisional }: { item: VersionChangeItem; provisional: boolean }) {
   return (
     <li data-testid="batch-change-item" className="rounded-lg border border-border/70 px-2.5 py-2">
       <div className="flex flex-wrap items-center gap-1.5">
         <span className="min-w-0 break-all font-mono text-xs text-foreground">{item.file}</span>
         <span className={badgeClass}>{changeKindLabel(item.changeKind)}</span>
-        {item.unmapped ? <span className={unmappedBadgeClass}>未映射</span> : null}
+        {item.unmapped && !provisional ? <span className={unmappedBadgeClass}>未映射</span> : null}
       </div>
       {item.subjects.length === 0 ? null : (
         <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
@@ -82,9 +92,11 @@ export type BatchTimelineProps = {
  * 「批次时间线」of the code tab (spec §7.2): one entry per batch with its commit
  * range, status, D49 history-rewrite marker, changed-file/affected-case/unmapped
  * counters, the file → entity → case summary chain and the per-batch
- * 「本批无代码变更」empty state. It renders real snapshot data only and never
- * fabricates batches; a missing field renders nothing so old clients keep the
- * P7 change list unchanged.
+ * 「本批无代码变更」empty state. A provisional batch (pre-analysis) says
+ * 「映射生成中」and suppresses the not-yet-final unmapped verdict; a batch whose
+ * diff failed says 「本批变更暂不可用」without breaking the rest of the timeline.
+ * It renders real snapshot data only and never fabricates batches; a missing
+ * field renders nothing so old clients keep the P7 change list unchanged.
  */
 export function BatchTimeline({ batches }: BatchTimelineProps) {
   const headingId = useId()
@@ -105,7 +117,12 @@ export function BatchTimeline({ batches }: BatchTimelineProps) {
 
       <ol className="space-y-3">
         {batches.map((batch) => {
-          const unmapped = batch.items.filter((item) => item.unmapped)
+          const provisional = batch.provisional === true
+          const unavailable = batch.unavailable === true
+          // A provisional/unavailable batch never renders a final unmapped
+          // verdict (the pre-analysis coverage result is meaningless).
+          const unmapped =
+            provisional || unavailable ? [] : batch.items.filter((item) => item.unmapped)
           return (
             <li
               key={batch.batchId}
@@ -115,6 +132,19 @@ export function BatchTimeline({ batches }: BatchTimelineProps) {
               <div className="flex flex-wrap items-center gap-1.5">
                 <h3 className="text-sm font-semibold">Batch {batch.batchNo}</h3>
                 <span className={badgeClass}>{batchStatusLabel(batch.batchStatus)}</span>
+                {provisional ? (
+                  <span className={provisionalBadgeClass} title="批次 head 尚未产生分析映射数据">
+                    映射生成中
+                  </span>
+                ) : null}
+                {unavailable ? (
+                  <span
+                    className={unavailableBadgeClass}
+                    title="该批次确定性 diff 计算失败，其余批次不受影响"
+                  >
+                    变更不可用
+                  </span>
+                ) : null}
                 {batch.historyRewritten ? (
                   <span className={rewriteBadgeClass} title="父批 head 不可用，基线回退到版本基线">
                     历史重写
@@ -125,40 +155,71 @@ export function BatchTimeline({ batches }: BatchTimelineProps) {
               <p className="font-mono text-xs text-muted-foreground">
                 {shortCommit(batch.baseCommit)} → {shortCommit(batch.headCommit)}
               </p>
-              <p className="text-xs text-muted-foreground">
-                {`变更文件 ${batch.changedFiles} · 影响用例 ${batch.impactedCases} · 未映射 ${batch.unmappedCount}`}
-              </p>
 
-              {batch.items.length === 0 ? (
-                <p className="rounded-lg border border-dashed border-border px-3 py-2 text-sm text-muted-foreground">
-                  本批无代码变更
+              {unavailable ? (
+                <p
+                  data-testid={`batch-unavailable-${batch.batchId}`}
+                  role="status"
+                  className="rounded-lg border border-dashed border-destructive/30 px-3 py-2 text-sm text-muted-foreground"
+                >
+                  本批变更暂不可用，请稍后刷新重试。
                 </p>
               ) : (
-                <ul className="space-y-1.5">
-                  {batch.items.map((item) => (
-                    <BatchItem key={`${item.changeKind}:${item.file}`} item={item} />
-                  ))}
-                </ul>
-              )}
+                <>
+                  <p className="text-xs text-muted-foreground">
+                    {provisional
+                      ? `变更文件 ${batch.changedFiles} · 映射生成中`
+                      : `变更文件 ${batch.changedFiles} · 影响用例 ${batch.impactedCases} · 未映射 ${batch.unmappedCount}`}
+                  </p>
 
-              {unmapped.length === 0 ? null : (
-                <div
-                  data-testid={`batch-unmapped-${batch.batchId}`}
-                  className="rounded-lg border border-destructive/25 bg-destructive/5 px-2.5 py-2"
-                >
-                  <h4 className="text-xs font-medium text-destructive">未映射变更</h4>
-                  <ul className="mt-1 space-y-0.5">
-                    {unmapped.map((item) => (
-                      <li
-                        key={item.file}
-                        data-unmapped-file={item.file}
-                        className="break-all font-mono text-xs text-muted-foreground"
-                      >
-                        {item.file}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
+                  {provisional ? (
+                    <p
+                      data-testid={`batch-provisional-${batch.batchId}`}
+                      role="status"
+                      className="rounded-lg border border-sky-500/25 bg-sky-500/10 px-3 py-2 text-sm text-sky-700 dark:text-sky-300"
+                    >
+                      映射生成中：分析完成后自动更新映射，当前不展示未映射判定。
+                    </p>
+                  ) : null}
+
+                  {batch.items.length === 0 ? (
+                    provisional ? null : (
+                      <p className="rounded-lg border border-dashed border-border px-3 py-2 text-sm text-muted-foreground">
+                        本批无代码变更
+                      </p>
+                    )
+                  ) : (
+                    <ul className="space-y-1.5">
+                      {batch.items.map((item) => (
+                        <BatchItem
+                          key={`${item.changeKind}:${item.file}`}
+                          item={item}
+                          provisional={provisional}
+                        />
+                      ))}
+                    </ul>
+                  )}
+
+                  {unmapped.length === 0 ? null : (
+                    <div
+                      data-testid={`batch-unmapped-${batch.batchId}`}
+                      className="rounded-lg border border-destructive/25 bg-destructive/5 px-2.5 py-2"
+                    >
+                      <h4 className="text-xs font-medium text-destructive">未映射变更</h4>
+                      <ul className="mt-1 space-y-0.5">
+                        {unmapped.map((item) => (
+                          <li
+                            key={item.file}
+                            data-unmapped-file={item.file}
+                            className="break-all font-mono text-xs text-muted-foreground"
+                          >
+                            {item.file}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </>
               )}
             </li>
           )
