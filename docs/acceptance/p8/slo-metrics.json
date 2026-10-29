@@ -1,0 +1,146 @@
+{
+    "generatedAt":  "2026-10-29T11:18:28Z",
+    "mode":  "measure",
+    "status":  "passed",
+    "apiBaseUrl":  "http://127.0.0.1:13333",
+    "webBaseUrl":  "http://localhost:6868",
+    "thresholds":  {
+                       "overviewP95Ms":  2500,
+                       "chainP95Ms":  2500,
+                       "changesP95Ms":  2000,
+                       "executionWorkers":  8,
+                       "executionErrors":  0,
+                       "analysisNonModelOverheadMs":  5000
+                   },
+    "dataset":  {
+                    "versions":  100,
+                    "requirements":  50,
+                    "cases":  200,
+                    "edges":  400,
+                    "events":  10000
+                },
+    "datasetState":  {
+                         "Versions":  100,
+                         "Requirements":  50,
+                         "Cases":  200,
+                         "Edges":  400,
+                         "Events":  10000,
+                         "VersionID":  8800000000000000001,
+                         "RepoID":  8,
+                         "RepoReady":  true,
+                         "RepoError":  "",
+                         "RepoPath":  "D:\\Project_new\\EzTest\\.tmp\\p8-slo\\fixture-repo",
+                         "BaseCommit":  "ce0c027cb44bc636b31f8754041d78566405d42b",
+                         "HeadCommit":  "5dc175649664d4c345f7fcac64c8ec5ecca5b016"
+                     },
+    "chainShape":  {
+                       "Nodes":  250,
+                       "Edges":  400,
+                       "Requirements":  50,
+                       "Cases":  200
+                   },
+    "measurementMethod":  {
+                              "executionConcurrency":  {
+                                                           "workers":  8,
+                                                           "cases":  8,
+                                                           "sessions":  8,
+                                                           "observation":  "one real batch through the running API/executor; case-runs polled every 150 ms; PASS requires a done batch, 0 non-passed case runs and observed max running \u003e= 8",
+                                                           "apiRequirement":  "API started with EZTEST_EXECUTOR_URL/EZTEST_EXECUTOR_TOKEN and EZTEST_EXEC_MAX_CONCURRENT_CASES=8"
+                                                       },
+                              "analysisNonModelOverhead":  {
+                                                               "budgetMs":  5000,
+                                                               "method":  "wall clock from the analysis trigger to the terminal state minus the summed model-call durations recorded by the loopback timing proxy",
+                                                               "modelTiming":  true,
+                                                               "llmBaseUrl":  "http://127.0.0.1:13337",
+                                                               "proxyLog":  "D:\\Project_new\\EzTest\\.tmp\\p8-slo\\llm-calls.jsonl",
+                                                               "fallback":  "when model calls cannot be instrumented the reported value is the analysis wall time (an upper bound)"
+                                                           }
+                          },
+    "llmHarness":  {
+                       "allowed":  true,
+                       "reason":  "",
+                       "modelTiming":  true,
+                       "llmBaseUrl":  "http://127.0.0.1:13337",
+                       "proxyLog":  "D:\\Project_new\\EzTest\\.tmp\\p8-slo\\llm-calls.jsonl",
+                       "fixtureReady":  true
+                   },
+    "coverage":  {
+                     "total":  6,
+                     "measured":  6,
+                     "notMeasured":  0,
+                     "missing":  [
+
+                                 ]
+                 },
+    "checks":  [
+                   {
+                       "Area":  "environment",
+                       "Check":  "API reachable",
+                       "Status":  "PASS",
+                       "Detail":  "http://127.0.0.1:13333"
+                   },
+                   {
+                       "Area":  "environment",
+                       "Check":  "admin login",
+                       "Status":  "PASS",
+                       "Detail":  "authenticated against the running API"
+                   },
+                   {
+                       "Area":  "dataset",
+                       "Check":  "seed",
+                       "Status":  "PASS",
+                       "Detail":  "100 versions; measured version 8800000000000000001: 50 clarified requirements, 200 cases, 400 case_source links, 10000 events"
+                   },
+                   {
+                       "Area":  "dataset",
+                       "Check":  "fixture repository",
+                       "Status":  "PASS",
+                       "Detail":  "repoId 8 bound to version 8800000000000000001; main baseline ce0c027cb44bc636b31f8754041d78566405d42b"
+                   },
+                   {
+                       "Area":  "dataset",
+                       "Check":  "chain 200 nodes / 400 edges",
+                       "Status":  "PASS",
+                       "Detail":  "endpoint returned 250 nodes and 400 edges (requirements 50, cases 200) before measuring"
+                   }
+               ],
+    "measurements":  {
+                         "overviewApiP95Ms":  {
+                                                  "status":  "PASS",
+                                                  "threshold":  "\u003c= 2500 ms",
+                                                  "value":  67.1,
+                                                  "detail":  "GET /api/versions/8800000000000000001; P50 42.2 ms over 20 samples"
+                                              },
+                         "chainP95Ms":  {
+                                            "status":  "PASS",
+                                            "threshold":  "\u003c= 2500 ms",
+                                            "value":  95.9,
+                                            "detail":  "P50 80.6 ms over 20 samples; verified 250 nodes/400 edges"
+                                        },
+                         "changesP95Ms":  {
+                                              "status":  "PASS",
+                                              "threshold":  "\u003c= 2000 ms",
+                                              "value":  266.8,
+                                              "detail":  "preflight HTTP 200; P50 234.8 ms over 20 samples"
+                                          },
+                         "overviewBrowserP95Ms":  {
+                                                      "status":  "PASS",
+                                                      "threshold":  "\u003c= 2500 ms",
+                                                      "value":  119.4,
+                                                      "detail":  "5 measured navigations (1 warm-up excluded) to ?tab=overview; overview-metrics rendered"
+                                                  },
+                         "analysisNonModelOverheadMs":  {
+                                                            "status":  "PASS",
+                                                            "threshold":  "non-model \u003c= 5000 ms",
+                                                            "value":  558.7,
+                                                            "detail":  "analysis 374154927703855104 status \u0027done\u0027 on version 8800000000000000001; wall 560.9 ms; model calls 2, model time 2.2 ms; non-model 558.7 ms; server-side run 368 ms; method: wall time from trigger to terminal state minus instrumented model-call time"
+                                                        },
+                         "executionConcurrency":  {
+                                                      "status":  "PASS",
+                                                      "threshold":  "8 workers / 0 errors",
+                                                      "value":  "8/8 passed, max concurrency 8",
+                                                      "detail":  "batch 374154951850463232 status \u0027done\u0027; 8 case runs (passed=8); imported 8 fixture sessions; observed max 8 concurrently running case runs; wall 15956.4 ms"
+                                                  }
+                     },
+    "note":  "Local measurement; the 8-concurrency row ran one real batch of 8 fixture cases and the analysis row split P4 wall time into instrumented model time and non-model overhead. SKIP only marks genuinely missing environment and is reported as INCOMPLETE, never as an SLO PASS."
+}

@@ -43,11 +43,23 @@
     counts only - never prompts, keys or evidence bytes) are written to
     .tmp/p6-real-acceptance.json.
 
+    -ConcurrentCases N (1..8, default 1) keeps the baseline acceptance at one
+    case/session but makes the same fixture harness able to exercise the P8
+    8-concurrency gate: N sessions are imported on an access whose concurrency
+    limit is N, a version with N cases is approved and one batch is run while
+    the harness samples concurrently running case runs. The extra check only
+    runs when N >= 2; the default path is unchanged.
+
 .PARAMETER DryRun
     Validate paths, the .env key presence (names only), the toolchain, the
     fixture/executor scripts and the database URL shape without resetting the
     database, starting processes or spending an LLM call. Exits 0 when the
     preflight passes.
+
+.PARAMETER ConcurrentCases
+    Case/session count for the optional concurrency gate (1..8, default 1).
+    Values >= 2 add the "<N>-concurrency fixture batch" check against the real
+    configured model; the baseline run keeps its single-session semantics.
 
 .NOTES
     This script makes paid upstream calls and is deliberately not part of
@@ -57,7 +69,9 @@
 #>
 [CmdletBinding()]
 param(
-    [switch]$DryRun
+    [switch]$DryRun,
+    [ValidateRange(1, 8)]
+    [int]$ConcurrentCases = 1
 )
 
 $ErrorActionPreference = "Stop"
@@ -105,6 +119,9 @@ $script:resultData = [ordered]@{
     eventCount     = $null
     elapsedMs      = $null
     caseDurations  = @()
+    concurrentCases    = $ConcurrentCases
+    concurrentObserved = $null
+    concurrentErrors   = $null
     checks         = @()
     error          = $null
 }
@@ -593,6 +610,18 @@ function New-RealExecutingVersion {
                 AssertionExpected = "The home page renders navigation"
             }
         }
+        "concurrent" {
+            for ($concurrentIndex = 1; $concurrentIndex -le $ConcurrentCases; $concurrentIndex++) {
+                $cases += @{
+                    Title  = "P6 concurrent case $concurrentIndex"
+                    Actions = @("Open $fixtureBaseUrl/p6/orders")
+                    Expected = @("The fixture orders list is shown")
+                    Target = "body"
+                    Expression = "text contains Order"
+                    AssertionExpected = "The orders page renders order data"
+                }
+            }
+        }
         default { throw "unknown real-LLM case kind '$Kind'" }
     }
     foreach ($caseSpec in $cases) {
@@ -628,7 +657,9 @@ function New-RealWorld {
         [string]$LoginUrl = "",
         [string]$Credential = "fixture-pass",
         [switch]$ImportSession,
-        [string]$Kind = "three"
+        [string]$Kind = "three",
+        [int]$ConcurrencyLimit = 1,
+        [int]$SessionCount = 1
     )
     $stamp = Get-Date -Format "HHmmssfff"
     $system = Invoke-Api -Method Post -Path "/api/resources/systems" -Headers $adminHeaders -Body @{
@@ -685,15 +716,17 @@ function New-RealWorld {
         authType         = "password"
         credential       = $Credential
         usernameOverride = "fixture"
-        concurrencyLimit = 1
+        concurrencyLimit = $ConcurrencyLimit
         loginUrl         = $LoginUrl
         login_flow_id    = [string]$flow.Data.id
         enabled          = $true
     }
     if ($access.Status -ne 201) { throw "POST access returned HTTP $($access.Status)" }
-    $sessionId = $null
+    $sessionIds = @()
     if ($ImportSession) {
-        $sessionId = Import-FixtureSession -Headers $adminHeaders -AccessId $access.Data.id -EnvironmentId $environmentId
+        for ($sessionIndex = 1; $sessionIndex -le $SessionCount; $sessionIndex++) {
+            $sessionIds += Import-FixtureSession -Headers $adminHeaders -AccessId $access.Data.id -EnvironmentId $environmentId
+        }
     }
     $version = New-RealExecutingVersion -Headers $adminHeaders -Name "$Name version" `
         -SystemId $system.Data.id -EnvironmentId $environmentId -Kind $Kind
@@ -703,7 +736,8 @@ function New-RealWorld {
         AuthFlowId    = [string]$flow.Data.id
         AccountId     = $account.Data.id
         AccessId      = $access.Data.id
-        SessionId     = $sessionId
+        SessionId     = $(if ($sessionIds.Count -gt 0) { $sessionIds[0] } else { $null })
+        SessionIds    = @($sessionIds)
         VersionId     = $version.VersionId
         CaseIds       = @($version.CaseIds)
         BaselineHash  = $version.BaselineHash
@@ -1283,6 +1317,53 @@ try {
                 system_id = [string]$main.SystemId; name = "forbidden"; kind = "form"; definition = @{}
             }
         } -Status 403 | Out-Null
+    }
+
+    if ($ConcurrentCases -ge 2) {
+        Invoke-Check -Name "$ConcurrentCases-concurrency fixture batch" -Body {
+            $world = New-RealWorld -Name "P6 real concurrency" -AutoLogin `
+                -LoginUrl "$fixtureBaseUrl/p6/login" -ImportSession -Kind "concurrent" `
+                -ConcurrencyLimit $ConcurrentCases -SessionCount $ConcurrentCases
+            if (@($world.SessionIds).Count -ne $ConcurrentCases) {
+                throw "the concurrency world imported $(@($world.SessionIds).Count) sessions, expected $ConcurrentCases"
+            }
+            if (@($world.CaseIds).Count -ne $ConcurrentCases) {
+                throw "the concurrency world has $(@($world.CaseIds).Count) cases, expected $ConcurrentCases"
+            }
+            $created = Invoke-Api -Method Post -Path "/api/versions/$($world.VersionId)/batches" -Headers $adminHeaders -Body @{
+                caseIds = @($world.CaseIds)
+            }
+            if ($created.Status -ne 201) { throw "POST concurrency batch returned HTTP $($created.Status)" }
+            $batchId = [string]$created.Data.id
+            $observedMax = 0
+            $batch = $null
+            $deadline = (Get-Date).AddSeconds(1800)
+            while ((Get-Date) -lt $deadline) {
+                $batch = Get-Batch -VersionId $world.VersionId -BatchId $batchId
+                $runs = @(Get-CaseRuns -VersionId $world.VersionId -BatchId $batchId)
+                $running = @($runs | Where-Object { [string]$_.status -eq "running" }).Count
+                if ($running -gt $observedMax) { $observedMax = $running }
+                if (@("done", "failed", "cancelled") -contains [string]$batch.status) { break }
+                Start-Sleep -Milliseconds 250
+            }
+            if ($null -eq $batch -or @("done", "failed", "cancelled") -notcontains [string]$batch.status) {
+                throw "the $ConcurrentCases-concurrency batch did not reach a terminal state within 1800 s"
+            }
+            $counts = $batch.counts
+            $errors = [int]$counts.failed + [int]$counts.blocked + [int]$counts.inconclusive +
+                [int]$counts.interrupted + [int]$counts.skipped
+            $script:resultData.concurrentObserved = $observedMax
+            $script:resultData.concurrentErrors = $errors
+            if ([string]$batch.status -ne "done") { throw "the concurrency batch ended '$($batch.status)'" }
+            if ([int]$counts.passed -ne $ConcurrentCases -or $errors -ne 0) {
+                throw "concurrency counts are passed=$($counts.passed) failed=$($counts.failed) blocked=$($counts.blocked) inconclusive=$($counts.inconclusive) interrupted=$($counts.interrupted) skipped=$($counts.skipped), expected $ConcurrentCases passed and 0 errors"
+            }
+            if ($observedMax -lt $ConcurrentCases) {
+                throw "observed max concurrency $observedMax < $ConcurrentCases; check EZTEST_EXEC_MAX_CONCURRENT_CASES and the agent run budget"
+            }
+            Write-Host ("concurrency: {0} cases passed, 0 errors, observed max {1} running, {2} imported sessions" -f `
+                    $ConcurrentCases, $observedMax, @($world.SessionIds).Count)
+        }
     }
 
     Invoke-Check -Name "optional token/time metrics recorded" -Body {
