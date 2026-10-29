@@ -216,6 +216,58 @@ describe("useExplorationChain", () => {
     expect(mocks.apiGet).toHaveBeenCalledTimes(2)
   })
 
+  it("treats the events present at mount as the baseline and only refreshes for new ones", async () => {
+    vi.useFakeTimers()
+    let initialSignal: AbortSignal | undefined
+    let resolveInitial: ((value: ChainSnapshot) => void) | undefined
+    mocks.apiGet
+      .mockImplementationOnce(
+        (_path: string, init?: { signal?: AbortSignal }) =>
+          new Promise<ChainSnapshot>((resolve) => {
+            initialSignal = init?.signal
+            resolveInitial = resolve
+          }),
+      )
+      .mockResolvedValue(snapshot())
+
+    const historical = [versionEvent(4, "case.status_changed"), versionEvent(5, "run.finished")]
+    const { rerender } = renderHook(
+      ({ currentStream }: { currentStream: VersionStreamState }) =>
+        useExplorationChain(VERSION_ID, {}, currentStream),
+      { initialProps: { currentStream: stream(historical) } },
+    )
+    await act(async () => {})
+
+    // Only the initial read goes out; the historical events must not schedule a
+    // catch-up refresh that would abort it.
+    expect(mocks.apiGet).toHaveBeenCalledTimes(1)
+    expect(initialSignal?.aborted).toBe(false)
+    await act(async () => {
+      vi.advanceTimersByTime(500)
+    })
+    await act(async () => {})
+    expect(mocks.apiGet).toHaveBeenCalledTimes(1)
+    expect(initialSignal?.aborted).toBe(false)
+
+    await act(async () => {
+      resolveInitial?.(snapshot())
+    })
+
+    // A genuinely new event after mount coalesces into exactly one refresh.
+    rerender({
+      currentStream: stream([...historical, versionEvent(6, "issue.updated")]),
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(499)
+    })
+    expect(mocks.apiGet).toHaveBeenCalledTimes(1)
+    await act(async () => {
+      vi.advanceTimersByTime(1)
+    })
+    await act(async () => {})
+    expect(mocks.apiGet).toHaveBeenCalledTimes(2)
+  })
+
   it("keeps the previous snapshot and reports the error when a refresh fails", async () => {
     const first = snapshot()
     mocks.apiGet.mockResolvedValueOnce(first).mockRejectedValueOnce(new Error("读取链路失败"))
