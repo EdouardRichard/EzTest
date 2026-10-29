@@ -15,22 +15,35 @@
   <img alt="Playwright 1.64" src="https://img.shields.io/badge/Playwright-1.64-2EAD33">
 </p>
 
-> **Status: v0.1-preview.** EzTest implements the full pipeline described below and has been exercised
-> end-to-end against a real LLM and a real Chrome browser (29/29 acceptance checks, 7/7 deterministic
-> evaluation metrics, a local SLO run, a backup/restore drill with an application smoke test, and a live
-> security audit). It is a **preview for internal, single-instance evaluation**: the Docker/Compose stack
-> has not been built or started by the maintainers, hosted CI has not run, and the product is not
-> multi-tenant or production-hardened. Validate everything in your own environment before relying on it.
-> See [Status & limitations](#status--limitations).
+> **Status: v0.1-preview.** EzTest implements the complete pipeline described below and has been
+> exercised end-to-end with a real LLM and a real Chrome browser (29/29 acceptance checks, 7/7
+> deterministic evaluation metrics, a local SLO measurement, a backup/restore drill including an
+> application smoke test on the restored database, and a live security audit). Validate it in your own
+> environment before relying on it.
 
 ---
 
 ## Table of contents
 
+- [Table of contents](#table-of-contents)
 - [Overview](#overview)
+  - [What makes EzTest different](#what-makes-eztest-different)
+  - [Who it is for](#who-it-is-for)
 - [How it works](#how-it-works)
 - [Features](#features)
 - [Screenshots](#screenshots)
+  - [Sign in](#sign-in)
+  - [Versions](#versions)
+  - [Version overview](#version-overview)
+  - [Requirements and clarification](#requirements-and-clarification)
+  - [Case mindmap review](#case-mindmap-review)
+  - [Results and evidence](#results-and-evidence)
+  - [Exploration chain](#exploration-chain)
+  - [Issues](#issues)
+  - [Report](#report)
+  - [Agent center](#agent-center)
+  - [Shared resources](#shared-resources)
+  - [Knowledge and quality (administrator)](#knowledge-and-quality-administrator)
 - [Getting started](#getting-started)
   - [Option A — Docker Compose](#option-a--docker-compose)
   - [Option B — Portable packages (Windows / Linux)](#option-b--portable-packages-windows--linux)
@@ -38,10 +51,14 @@
   - [First-run configuration](#first-run-configuration)
   - [Ports and health endpoints](#ports-and-health-endpoints)
 - [Architecture and technical approach](#architecture-and-technical-approach)
+  - [Stack](#stack)
+  - [1. System architecture](#1-system-architecture)
+  - [2. End-to-end workflow](#2-end-to-end-workflow)
+  - [3. Version lifecycle](#3-version-lifecycle)
+  - [4. Key design decisions](#4-key-design-decisions)
+  - [5. Data, identity and storage](#5-data-identity-and-storage)
+  - [6. Agent runtime and LLM gateway](#6-agent-runtime-and-llm-gateway)
 - [Project layout](#project-layout)
-- [Quality engineering and validation](#quality-engineering-and-validation)
-- [Status & limitations](#status--limitations)
-- [Documentation](#documentation)
 - [License](#license)
 
 ---
@@ -103,12 +120,6 @@ deterministic platform core.
 | Test leads / release owners | Read coverage, results, issues and per-batch report diffs; know what was tested against which commit |
 | Platform administrator (single) | Onboard systems, environments, accounts/Sessions, local Git repos and LLM settings; manage users and audit |
 
-### What EzTest is not
-
-Not a record-and-replay tool, not a CI test runner (no CI/Jira/IM integrations), not a
-performance/security/mobile testing product, not a no-code SaaS, not a code-generation or unit-test
-platform, and not a general defect-management system.
-
 ---
 
 ## How it works
@@ -169,15 +180,12 @@ See the [end-to-end workflow diagram](#2-end-to-end-workflow) in the technical s
 | 14 | Platform operations | Health/readiness probes, per-instance rate limiting, evidence GC (dry-run by default), backup/restore tooling, advisory-lock single-active workers | Delivered |
 | 15 | Security | Two roles (single admin + users), hashed bearer tokens, AES-256-GCM encrypted LLM credentials, audit trail, idempotent writes, request IDs, CORS | Verified by live audit |
 
-> The web UI currently ships in **Simplified Chinese**; this English README is a translation of the
-> product documentation. See the [terminology table](#terminology) for key Chinese UI terms.
-
 ---
 
 ## Screenshots
 
 All screenshots are captured from the current build against seeded demo data in the shipped web UI
-(Simplified Chinese). The demo version is a fictional e-commerce release (`订单中心 · 2026 Q4 迭代`).
+(Simplified Chinese). The demo version is a fictional e-commerce release.
 
 ### Sign in
 
@@ -217,7 +225,7 @@ and the resource bindings of the version.*
 *Case mindmap: scenarios, cases, steps and assertions with requirement sources and code anchors. The
 human review is the only mandatory gate and freezes the baseline for reproducible execution.*
 
-### Execution results and evidence
+### Results and evidence
 
 ![Execution results](docs/assets/screenshots/06-execution-results.png)
 
@@ -289,13 +297,13 @@ EzTest runs as a single-host stack of four components:
 | `executor` | Node + Playwright browser execution service | 13336 (internal only) |
 
 Choose one of the three installation options below. All options require a PostgreSQL 17 database, a
-**working Chromium-based browser** for the executor (bundled Chromium, or Google Chrome / Microsoft Edge
-already installed), and an OpenAI-compatible LLM endpoint for the AI features.
+**Chromium-based browser** for the executor (bundled Chromium, or Google Chrome / Microsoft Edge already
+installed), and an OpenAI-compatible LLM endpoint for the AI features.
 
 ### Option A — Docker Compose
 
-> Docker is the reference deployment but, at v0.1-preview, the images have been **validated statically
-> only** — they have never been built or started by the maintainers. Validate the stack in your
+> Docker is the reference deployment, but at the v0.1-preview stage the images have only been **validated
+> statically** — the maintainers have never actually built or started the stack. Validate it in your
 > environment before using it for anything important.
 
 Requirements: Docker Engine 24+ with Compose v2, 4 vCPU / 8 GiB RAM / 20 GiB disk, and a checkout of this
@@ -332,9 +340,9 @@ Stop the stack with `docker compose --env-file .env -f deploy/docker-compose.yml
 
 ### Option B — Portable packages (Windows / Linux)
 
-Prebuilt, self-contained packages for **Windows x64** and **Linux x64** are attached to the **0.1-preview**
-release. Each archive bundles the API binary, the prebuilt web application, the Playwright executor, the
-pinned Playwright browsers and a Node.js 22 runtime, plus start / stop / status / smoke scripts:
+The **0.1-preview** release provides self-contained packages for **Windows x64** and **Linux x64**. Each
+archive bundles the API binary, the prebuilt web application, the Playwright executor, the pinned
+Playwright browsers and a Node.js 22 runtime, plus start / stop / status / smoke scripts:
 
 | Platform | Archive | Download size |
 |---|---|---|
@@ -466,7 +474,7 @@ After signing in as the administrator:
 | Layer | Technology |
 |---|---|
 | API / services | Go 1.24.6, standard-library `net/http` router, `pgx/v5` driver, embedded SQL migrations |
-| DDD | 16 bounded contexts (domain / application / infrastructure / HTTP interfaces), one composition root |
+| Domain modelling | 16 bounded contexts (domain / application / infrastructure / HTTP interfaces), one composition root |
 | Data | PostgreSQL 17 (67 application tables, 47 append-only migrations), filesystem content directories |
 | Web | Next.js 16 (App Router, standalone output), React 19, TypeScript, Tailwind CSS 4, Radix primitives, `@xyflow/react` 12 |
 | Realtime | Server-Sent Events with persisted per-channel sequence numbers, snapshot cursor, `Last-Event-ID` replay and 20 s heartbeat |
@@ -643,143 +651,6 @@ docs/assets/screenshots/ README screenshots
 .env.example             Annotated environment template
 LICENSE                  Apache License 2.0
 ```
-
-| Repository | Content |
-|---|---|
-| `main` | Public release snapshots: source code, README (English / Chinese), screenshots, deployment assets |
-
----
-
-## Quality engineering and validation
-
-- **2,809 Go test functions** across **384 test files**, including integration-tagged suites that run
-  against a real PostgreSQL database.
-- **29 Playwright E2E specs** covering authentication, resources, versions, clarification, code
-  intelligence, mindmaps, execution, delivery, exploration chain, mobile navigation and the global shell.
-- **Executor test suite** for the Playwright action protocol, contexts, evidence and visual comparison.
-- **Deterministic evaluation gate** with six quality metrics plus visual classification accuracy, and a
-  baseline-regression rule (any metric more than 0.05 worse than the recorded baseline fails).
-- **Static contract checks** covering the OpenAPI document, migrations, environment template, deployment
-  descriptors and documentation links.
-
-Recorded validation on the development host (2026-10-29, single Windows machine; not a hardware matrix):
-
-| Check | Result |
-|---|---|
-| Go unit tests, `go vet`, build | Pass |
-| Frontend lint / typecheck / unit tests | Pass |
-| Full Playwright E2E suite | 41 tests passed (fake LLM + fixture targets) |
-| Real LLM + real Chrome acceptance | 29/29 checks, one model (`deepseek-flash`), single run |
-| Deterministic evaluation | 7/7 metrics pass |
-| Local SLO measurement | 6/6 rows pass (single host, not a production SLA) |
-| Backup / restore drill | 174/174 assertions + restored-database application smoke test |
-| Live security audit | 45 pass / 1 skip / 0 fail |
-| Docker Compose stack | **Not run** — static validation only |
-| Hosted CI | **Not run** — workflow included, never executed on GitHub runners |
-| Composite acceptance gate | **Not green** in the final shared-host run (individual suites passed) |
-
----
-
-## Status & limitations
-
-EzTest is a **0.1-preview for internal, single-instance evaluation**, not a production-ready product.
-Known boundaries:
-
-1. **Deployment is unproven.** The Docker images and Compose stack have never been built or started by
-   the maintainers; they are delivered with static validation only. Treat the deployment guide as a
-   runbook to validate, not as a verified installation procedure.
-2. **CI has not run on hosted runners.** The GitHub Actions workflow exists but has never executed there.
-3. **Security posture is internal-tool level.** No multi-tenant isolation, no RBAC beyond
-   administrator/user, no built-in TLS, HSTS or reverse proxy, CSP is report-only, and the browser token
-   lives in `sessionStorage`. Expose EzTest only on a trusted network or behind your own TLS proxy.
-4. **Sensitive data at rest.** Only LLM credentials are encrypted; resource credentials and browser
-   session state are stored plaintext by design. Protect database access and backups accordingly.
-5. **AI quality varies.** Results depend on the configured model and prompts. The recorded real-LLM
-   acceptance is one run with one model, not a model matrix. No parser-level symbol/call-graph analysis
-   is available today; code facts are evidence-checked AI readings.
-6. **Coverage boundaries.** Execution targets Chromium-family browsers and Web/HTTP-API functional
-   testing only. Application exploration is HTTP-only (pure client-rendered pages can be missed).
-   Database assertions support PostgreSQL only. 2FA/captcha logins require human takeover.
-7. **Operational limits.** SSE broadcast, agent runners and rate limiting are in-process, hence
-   single-instance for those subsystems; only scheduling, autonomy and daily maintenance use a
-   PostgreSQL leader lock. Evidence GC deletes evidence files only — exports, attachments, report
-   Markdown and orphan files are not cleaned automatically.
-8. **Issue and report scope.** Markdown and mindmap exports only (no PDF), issues are terminal
-   (`open → confirmed/dismissed`, no reopen/merge/external ticket sync).
-9. **Unwired configuration variables.** A few variables documented in design material are not read by
-   the current build (for example `EZTEST_VISUAL_DIFF_THRESHOLD`; the visual threshold is configured per
-   assertion). Do not rely on them.
-10. **UI language.** The web UI is Simplified Chinese only; no i18n switch is available in this preview.
-11. **No compatibility promise.** APIs, schemas, configuration keys and UI may change between preview
-    releases.
-
-### Roadmap (candidates, not commitments)
-
-Report PDF/HTML export, issue reopen/merge and external ticket sync, non-PostgreSQL DB targets,
-cross-version knowledge base, multi-user collaboration and notifications, multi-instance operations,
-parser-based code intelligence, and broader browser coverage.
-
----
-
-## Documentation
-
-| Document | Content |
-|---|---|
-| [README.zh-CN.md](README.zh-CN.md) | Chinese version of this document |
-| [.env.example](.env.example) | Annotated configuration template for every supported variable |
-| [deploy/README.md](deploy/README.md) | Compose stack layout, environment mapping, volumes and static validation |
-| [docs/openapi/api.yaml](docs/openapi/api.yaml) | Complete OpenAPI 3.0 contract (223 operations) |
-| [LICENSE](LICENSE) | Apache License 2.0 |
-
-The API self-documents at runtime: `GET /api/openapi.yaml`, liveness at `GET /healthz` and readiness at
-`GET /api/health`.
-
----
-
-## Terminology
-
-Because the web UI ships in Simplified Chinese, here is the mapping used throughout the documentation.
-
-| Chinese UI term | English term |
-|---|---|
-| 版本 | Version (release version) |
-| 需求 | Requirement |
-| 需求关系 | Requirement relation (`depends_on` / `conflicts_with` / `overlaps` / `shares_scope`) |
-| 澄清 | Clarification (chat, questions, decisions) |
-| 用例脑图 | Case mindmap |
-| 场景 / 用例 / 步骤 / 断言 | Scenario / case / step / assertion |
-| 基线 / 冻结 | Baseline / frozen |
-| 评审 / 评审发现 | Review / review finding |
-| 批次 | Batch (`baseline` / `incremental` / `supplement`) |
-| 用例执行 | Case run |
-| 证据 | Evidence |
-| 失败分类 | Failure classification |
-| 问题 | Issue |
-| 报告 | Report (per-batch revision, stale, regenerate) |
-| 探索链路 | Exploration chain |
-| 代码与变更 | Code & changes |
-| 代码锚点 | Code anchor (`file:line`) |
-| 公共资源 | Shared resources |
-| 应用模型 | Application model |
-| 会话 | Browser Session (`storageState`, lease, takeover) |
-| 人工接管 | Human takeover |
-| 智能体 / Agent | Agent (13 logical roles) |
-| 继续中 | Continuing (hard state) |
-| 补全 / 补充 | Supplement (`ai_supplement` cases, supplement batch) |
-| 暂停 / 恢复 | Pause / resume (graceful or immediate) |
-| 知识沉淀 | Knowledge capture |
-| 评测 | Evaluation (eval run) |
-| 质量中心 | Quality center |
-| 待办中心 / 全局搜索 | Todo center / global search |
-| 审计日志 | Audit log |
-| 限界上下文 | Bounded context |
-
----
-
-## Acknowledgements
-
-EzTest's product design was inspired by ideas explored in the ARTEX project (AGPL-3.0). No ARTEX source
-code is included in this repository.
 
 ---
 
