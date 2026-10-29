@@ -3,6 +3,7 @@ package application
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 )
@@ -10,6 +11,7 @@ import (
 // providerBinding pairs one cross-context provider with the result types it
 // owns (spec §3.3).
 type providerBinding struct {
+	name     string
 	provider Provider
 	types    []string
 }
@@ -19,11 +21,41 @@ type providerBinding struct {
 // independent.
 type Service struct {
 	providers Providers
+	logger    *slog.Logger
+}
+
+// Option customizes the search service's optional collaborators. It keeps the
+// zero-config NewService(providers) call site (the composition root) unchanged.
+type Option func(*Service)
+
+// WithLogger makes the service record provider failures. Without it the process
+// default logger is used, so the composition root logs with its configured
+// logger without an extra wiring change.
+func WithLogger(logger *slog.Logger) Option {
+	return func(service *Service) {
+		if logger != nil {
+			service.logger = logger
+		}
+	}
 }
 
 // NewService builds the global-search aggregation service.
-func NewService(providers Providers) *Service {
-	return &Service{providers: providers}
+func NewService(providers Providers, options ...Option) *Service {
+	service := &Service{providers: providers}
+	for _, option := range options {
+		if option != nil {
+			option(service)
+		}
+	}
+	return service
+}
+
+// loggerOrDefault returns the injected logger or the process default.
+func (s *Service) loggerOrDefault() *slog.Logger {
+	if s != nil && s.logger != nil {
+		return s.logger
+	}
+	return slog.Default()
 }
 
 // Search validates the query, calls the relevant providers in parallel and
@@ -48,9 +80,9 @@ func (s *Service) Search(ctx context.Context, query Query) (Snapshot, error) {
 	limit := normalizeLimit(query.Limit)
 
 	bindings := []providerBinding{
-		{provider: s.providers.Version, types: []string{TypeVersion, TypeRequirement}},
-		{provider: s.providers.Mindmap, types: []string{TypeCase}},
-		{provider: s.providers.Delivery, types: []string{TypeIssue}},
+		{name: "version", provider: s.providers.Version, types: []string{TypeVersion, TypeRequirement}},
+		{name: "mindmap", provider: s.providers.Mindmap, types: []string{TypeCase}},
+		{name: "delivery", provider: s.providers.Delivery, types: []string{TypeIssue}},
 	}
 
 	// Every provider owns at least one requested type: query it concurrently.
@@ -86,8 +118,10 @@ func (s *Service) Search(ctx context.Context, query Query) (Snapshot, error) {
 		outcome := outcomes[index]
 		if outcome.err != nil {
 			// One failing context must not fail the whole search: keep the
-			// healthy groups and tell the caller the result is partial.
+			// healthy groups and tell the caller the result is partial. The
+			// cause is logged server-side only; the client gets degraded=true.
 			degraded = true
+			s.logProviderFailure(ctx, binding, outcome.err)
 			continue
 		}
 		for _, group := range outcome.groups {
@@ -134,6 +168,17 @@ func (s *Service) Search(ctx context.Context, query Query) (Snapshot, error) {
 type providerOutcome struct {
 	groups []Group
 	err    error
+}
+
+// logProviderFailure records the server-side cause of a degraded snapshot. The
+// provider error is never part of the response: the client only learns that the
+// result is partial (degraded=true), while operators get the context and cause.
+func (s *Service) logProviderFailure(ctx context.Context, binding providerBinding, cause error) {
+	s.loggerOrDefault().WarnContext(ctx,
+		"search provider failed; returning partial results",
+		"provider", binding.name,
+		"types", strings.Join(binding.types, ","),
+		"error", cause)
 }
 
 // ownsRequested reports whether any type of the provider was requested.

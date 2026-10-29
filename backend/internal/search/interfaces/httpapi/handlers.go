@@ -95,13 +95,20 @@ func (h *Handlers) handleSearch(w http.ResponseWriter, r *http.Request) {
 	writeData(w, http.StatusOK, snapshot)
 }
 
-// parseTypes validates the optional comma-separated `types` filter. A present
-// but empty value means the default all-types filter (nil).
+// errInvalidTypes marks a present `types` filter that names no type at all
+// (for example `types=` or `types=,,`). A present parameter must not silently
+// fall back to the all-types default.
+var errInvalidTypes = errors.New("invalid types")
+
+// parseTypes validates the optional comma-separated `types` filter. An absent
+// parameter selects every type; a present one must name at least one supported
+// type.
 func parseTypes(r *http.Request) ([]string, error) {
-	raw := strings.TrimSpace(r.URL.Query().Get("types"))
-	if raw == "" {
+	values, present := r.URL.Query()["types"]
+	if !present {
 		return nil, nil
 	}
+	raw := strings.TrimSpace(strings.Join(values, ","))
 	tokens := make([]string, 0, 4)
 	for _, token := range strings.Split(raw, ",") {
 		trimmed := strings.TrimSpace(token)
@@ -109,6 +116,9 @@ func parseTypes(r *http.Request) ([]string, error) {
 			continue
 		}
 		tokens = append(tokens, trimmed)
+	}
+	if len(tokens) == 0 {
+		return nil, errInvalidTypes
 	}
 	if err := searchapp.ValidateTypes(tokens); err != nil {
 		return nil, err

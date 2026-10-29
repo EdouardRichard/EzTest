@@ -22,8 +22,19 @@ const mocks = vi.hoisted(() => ({
 }))
 
 // The shell reads the route to decide whether the page is full-bleed; the test
-// flips this between renders instead of navigating.
-vi.mock("next/navigation", () => ({ usePathname: () => nav.pathname }))
+// flips this between renders instead of navigating. AppShell renders Topbar,
+// which mounts SearchCommand; the command reads the router for its deep links.
+vi.mock("next/navigation", () => ({
+  usePathname: () => nav.pathname,
+  useRouter: () => ({
+    push: vi.fn(),
+    replace: vi.fn(),
+    prefetch: vi.fn(),
+    back: vi.fn(),
+    forward: vi.fn(),
+    refresh: vi.fn(),
+  }),
+}))
 
 // AppShell renders the user menu; the shell test only needs a signed-in user.
 vi.mock("@/features/auth/AuthProvider", () => ({

@@ -168,6 +168,9 @@ export function SearchCommand() {
     }
     if (event.key === "Enter") {
       event.preventDefault()
+      // The snapshot is cleared as soon as a new query loads, but never open a
+      // result while the search is in flight: it could belong to the old query.
+      if (loading) return
       const target = flatItems[activeIndex] ?? flatItems[0]
       if (target !== undefined) openItem(target.item)
       return
