@@ -1,13 +1,13 @@
 name: eztest
 
-# EzTest P0/P1 single-instance deployment.
+# EzTest P0-P8 single-instance deployment.
 #
 # Static validation only on this host: Docker is not installed, so this file is
 # checked by `cd frontend && node scripts/validate-compose.mjs` and has never
 # been started here. Run it on a host with Docker Engine + Compose v2.
 #
-# Usage (from the deploy/ directory, repo-root .env provides the secrets):
-#   docker compose --env-file ../.env up -d --build
+# Usage (from the repository root, so the repo-root .env provides secrets):
+#   docker compose --env-file .env -f deploy/docker-compose.yml up -d --build
 #
 # Required in the repo-root .env for interpolation (see ../.env.example):
 #   POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB, EZTEST_EXECUTOR_TOKEN
@@ -15,6 +15,20 @@ name: eztest
 # lowercase llm_* variables. `.env` is gitignored and must never be committed.
 # The executor is internal-only: it publishes no host port, and only api holds
 # the bearer token.
+#
+# P8 persistent content:
+#   objects      -> /data/objects              (content-addressed storage)
+#   attachments  -> /data/version-attachments  (requirement attachments)
+#   evidence     -> /data/evidence             (execution evidence; GC target)
+#   reports      -> /data/reports              (report Markdown)
+#   exports      -> /data/exports              (mindmap exports)
+#
+# Optional read-only code repositories (P4): mount a host tree read-only and
+# register the container path (for example /repos/app) as the P2 localPath.
+# Uncomment and adjust:
+#   volumes:
+#     - ${EZTEST_CODE_REPO_MOUNT:-./repos}:/repos:ro
+# and optionally set EZTEST_AGENT_FILE_ROOT=/repos for the Agent file tools.
 
 services:
   postgres:
@@ -52,6 +66,9 @@ services:
       EZTEST_DATABASE_URL: postgres://${POSTGRES_USER:-eztest}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in the environment or ../.env}@postgres:5432/${POSTGRES_DB:-eztest}?sslmode=disable
       EZTEST_STORAGE_DIR: /data/objects
       EZTEST_VERSION_ATTACHMENT_DIR: /data/version-attachments
+      EZTEST_EVIDENCE_DIR: /data/evidence
+      EZTEST_REPORT_DIR: /data/reports
+      EZTEST_EXPORT_DIR: /data/exports
       EZTEST_SNOWFLAKE_NODE_ID: ${EZTEST_SNOWFLAKE_NODE_ID:-1}
       EZTEST_OPENAPI_PATH: docs/openapi/api.yaml
       EZTEST_ENABLE_TEST_ENDPOINTS: ${EZTEST_ENABLE_TEST_ENDPOINTS:-false}
@@ -62,6 +79,11 @@ services:
     volumes:
       - objects:/data/objects
       - attachments:/data/version-attachments
+      - evidence:/data/evidence
+      - reports:/data/reports
+      - exports:/data/exports
+      # Optional read-only code repository mount (see the header example):
+      # - ${EZTEST_CODE_REPO_MOUNT:-./repos}:/repos:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -120,3 +142,6 @@ volumes:
   pgdata:
   objects:
   attachments:
+  evidence:
+  reports:
+  exports:

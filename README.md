@@ -1,8 +1,11 @@
 # EzTest
 
-EzTest 的 P0 基础阶段（foundation）、P1 Agent 运行时、P2 公共资源/身份、P3 版本/多需求/澄清、P4 代码理解/影响分析、P5 用例脑图、P6 用例执行和 P7 全自主闭环/交付实现：Go 后端 API、Next.js 管理前端、Playwright 执行器、PostgreSQL 持久化，以及 SSE 事件流、对象存储、审计、LLM 配置管理、Agent 控制台、公共资源管理、版本工作台与澄清、代码影响分析、用例脑图、真实浏览器执行/证据/暂停恢复、AI 补全与失败分析、问题/报告、DB 断言和继续中增量批次。
+EzTest 的 P0 基础阶段（foundation）、P1 Agent 运行时、P2 公共资源/身份、P3 版本/多需求/澄清、P4 代码理解/影响分析、P5 用例脑图、P6 用例执行、P7 全自主闭环/交付与 P8 体验完善/硬化实现：Go 后端 API、Next.js 管理前端、Playwright 执行器、PostgreSQL 持久化，以及 SSE 事件流、对象存储、审计、LLM 配置管理、Agent 控制台、公共资源管理、版本工作台与澄清、代码影响分析、用例脑图、真实浏览器执行/证据/暂停恢复、AI 补全与失败分析、问题/报告、DB 断言、继续中增量批次、探索链路 v2、全局搜索/待办、知识沉淀、评测/质量中心、限流/SLO、证据 GC、备份恢复与多实例单活。
 
-- 分支：`feat/p7-autonomous-loop`
+- 分支：`dev`（P8 硬化阶段；HEAD 见 `git log`）
+- P8 阶段规格：[`docs/superpowers/specs/2026-10-29-eztest-p8-hardening-design.md`](docs/superpowers/specs/2026-10-29-eztest-p8-hardening-design.md)
+- P8 发布说明：[`docs/release-notes/p8.md`](docs/release-notes/p8.md)
+- 部署/运维/用户/开发文档：[`docs/deployment.md`](docs/deployment.md)、[`docs/operations.md`](docs/operations.md)、[`docs/user-guide.md`](docs/user-guide.md)、[`docs/development.md`](docs/development.md)
 - P7 阶段规格：[`docs/superpowers/specs/2026-10-28-eztest-p7-autonomous-loop-design.md`](docs/superpowers/specs/2026-10-28-eztest-p7-autonomous-loop-design.md)
 - P6 阶段规格：[`docs/superpowers/specs/2026-10-28-eztest-p6-execution-design.md`](docs/superpowers/specs/2026-10-28-eztest-p6-execution-design.md)
 - P5 阶段规格：[`docs/superpowers/specs/2026-10-28-eztest-p5-mindmap-review-design.md`](docs/superpowers/specs/2026-10-28-eztest-p5-mindmap-review-design.md)
@@ -25,7 +28,7 @@ EzTest 的 P0 基础阶段（foundation）、P1 Agent 运行时、P2 公共资�
 - 对象存储：内容寻址（SHA-256）、本地文件系统、10 MiB 上限、下载时完整性校验。
 - 审计：管理员查询、登录/用户/LLM/存储/测试事件动作记录。
 - 统一约定：`{"data": ...}` 成功信封、统一错误信封与错误码、`X-Request-ID`、幂等键、CORS、健康检查、OpenAPI。
-- 本地开发脚本、E2E、P0–P7 验收入口；Docker/Compose 交付文件与静态校验。
+- 本地开发脚本、E2E、P0–P8 验收入口；Docker/Compose 交付文件与静态校验。
 
 P0 **不包含**版本/需求/用例/执行/证据/问题/报告等业务实体与页面，也不包含代码仓库管理、多实例/多租户等能力（详见 P0 阶段规格 §16）。Agent 运行时不在 P0 内，由 P1 在 P0 之上补齐。
 
@@ -60,7 +63,7 @@ cd backend; ..\.tools\go\bin\go.exe test -count=1 ./internal/resource/...
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-integration.ps1 ./internal/resource/...
 # E2E（含 fixture target）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1
-# 完整 P0–P7 验收（含 OpenAPI 契约关键词检查）
+# 完整 P0–P8 验收（含 OpenAPI 契约关键词检查）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1
 ```
 
@@ -94,7 +97,7 @@ pnpm vitest run src/features/versions
 cd ..
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1
 
-# 完整 P0–P7 验收（仓库根；P3/P4/P5/P7 关键词、错误 reason 与事件目录检查；真实 LLM 仍 gated）
+# 完整 P0–P8 验收（仓库根；P3/P4/P5/P7 关键词、错误 reason 与事件目录检查；真实 LLM 仍 gated）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1
 ```
 
@@ -136,7 +139,7 @@ node scripts/fake-llm.p4.test.cjs
 # 仍需 Node、frontend/node_modules/yaml 与 git）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1 -StaticOnly
 
-# 完整 P0–P7 验收（P4/P5/P7 OpenAPI needle、reason、事件、fake-LLM 测试与 E2E 已纳入；真实 LLM 仍 gated）
+# 完整 P0–P8 验收（P4/P5/P7 OpenAPI needle、reason、事件、fake-LLM 测试与 E2E 已纳入；真实 LLM 仍 gated）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1
 ```
 
@@ -177,7 +180,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1 mindmap
 # 仅静态验收（P5 交付物/OpenAPI/迁移改名 + P4 fake-LLM；不需要数据库/API/Playwright）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1 -StaticOnly
 
-# 完整 P0–P7 验收（P5 API 子检查在路由未接线时记录 SKIPPED，静态检查仍须 PASS）
+# 完整 P0–P8 验收（P5 API 子检查在路由未接线时记录 SKIPPED，静态检查仍须 PASS）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1
 
 # 真实 LLM 验收（gated；16 个 check，缺 llm_* 键 = 失败而非跳过）
@@ -231,7 +234,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1 executio
 # 静态验收（交付物/迁移/OpenAPI/env/README，不启动数据库/API/executor）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1 -StaticOnly
 
-# 完整 P0–P7 验收（P6 区块会自行启动 fixture/fake LLM/executor 与 API；
+# 完整 P0–P8 验收（P6 区块会自行启动 fixture/fake LLM/executor 与 API；
 # 缺 executor/fixture/fake LLM 时 14 个 P6 API 子检查记录 SKIPPED，静态检查仍须 PASS；
 # 其中 MFA 自动登录接管检查会经 /p6/login?mfa=1 走到 blocked(session)）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1
@@ -253,7 +256,7 @@ P6 证据与结果位置：
 - P6 环境变量：`EZTEST_EXECUTOR_URL`、`EZTEST_EXECUTOR_TOKEN`、`EZTEST_EVIDENCE_DIR`、`EZTEST_EXEC_MAX_CONCURRENT_CASES`（1–8）、`EZTEST_EXEC_MAX_TOOL_CALLS`（1–1000）、`EZTEST_EXEC_CASE_TIMEOUT_MS`（1000–3600000）、`EZTEST_EXEC_MAX_CASES_PER_BATCH`（1–1000）、`EZTEST_EXEC_WORKER_INTERVAL_MS`（100–60000）、`EZTEST_EXEC_EVIDENCE_MAX_BYTES`（1 KiB–100 MiB）、`EZTEST_EXEC_EVIDENCE_PER_CASE`（1–1000），默认值与说明见 `.env.example` P6 段。
 - 运行环境要求：Node 20+、Playwright 1.64.1 的 Chromium（或系统 Chrome/Edge，executor 会回退 channel `chrome`/`msedge`）、本机 PostgreSQL；真实 LLM 验收额外需要可用的 `llm_base_url`/`llm_key`/`llm_model_name` 与网络。
 
-P6 已知限制：单进程调度（多实例分布式租约归 P8）；P6 阶段不支持 db 断言（P7 已补只读 db 断言）；不做用例级自动重跑（应用失败仅手动 rerun）；证据无 GC/删除 API；真实 LLM 的分类/暂停结果受模型行为影响，脚本在不符合预期时 fail-closed。
+P6 当时限制（P7/P8 已更新）：单进程调度在 P8 由 PostgreSQL advisory lock 单活；P6 阶段不支持 db 断言（P7 已补只读 db 断言）；不做用例级自动重跑（应用失败仅手动 rerun）；证据 GC 已于 P8 交付（只清执行证据文件）；真实 LLM 的分类/暂停结果受模型行为影响，脚本在不符合预期时 fail-closed。
 
 ## P7 全自主闭环与交付（补全 + 失败分析 + 问题/报告 + 继续中）
 
@@ -294,7 +297,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1 p7-suppl
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1 p7-degraded
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1 p7-db-config
 
-# 完整 P0–P7 验收（P6 区块自行启动 fixture/fake LLM/executor/API；
+# 完整 P0–P8 验收（P6 区块自行启动 fixture/fake LLM/executor/API；
 # P7 区块仅为仓库本地静态检查，不启动 P7 fixture/API；缺 P5/P6 依赖时对应 API 子检查记录 SKIPPED，静态仍须 PASS）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1
 ```
@@ -317,33 +320,90 @@ P7 证据与结果位置：
 - 报告 Markdown：`EZTEST_REPORT_DIR`（默认 `.data/reports`），DB 只存相对路径 + sha256 + 大小；导出响应带 `X-Content-SHA256`。
 - gated 真实验收结果写入 `.tmp/`（只含状态/ID/计数/错误码，不含 prompt、凭据、SQL 结果或证据正文）。
 
-P7 已知限制：`version_change` 表与 `code_changed` 变更项未实现（`/changes` 读时派生，P8）；证据 GC 与报告 stale 联动归 P8；自主 worker 单实例（leader 选举/分布式锁归 P8）；报告 PDF、问题外部工单、问题重开/合并、非 PostgreSQL 目标库归 P8/后续；全局问题/报告中心为只读列表，跨版本查询适配由 T17b 接线，挂载前该组不对外注册；`IssuesTab` 约 300 行未拆分（T18 评审记录 305 行，当前文件 300 行；可维护性余项）；`EZTEST_ANALYSIS_MAX_CASES`/`EZTEST_SUPPLEMENT_MAX_CASES` 为 P7 规格目标变量，当前构建仍以代码固定上限 20/5 执行，尚未读取这两个变量（P8 接线）；`EZTEST_AUTONOMY_BATCHES_PER_TICK` 未对 >20 的值做上限钳制；报告快照 `content.batch` 未暴露 `baseFallbackReason`/`history_rewritten`（仅批次 DTO `baseFallbackReason` 与增量计划 `warnings` 可见；D49 已知差异，归 T23/P8）。P7 运行手册中的 `scripts/e2e.ps1 p7-*`、`scripts/acceptance-p7-llm.ps1`、`scripts/acceptance-p7-db.ps1`、`scripts/fixture-db.ps1` 已通过记录（见 acceptance.md），依赖 T25/T28/T29/T32 交付。
+P7 当时限制（P8 已收口/更新）：`version_change` 表与 `code_changed` 变更项已在 P8 落地（`GET /api/versions/{id}/code/changes` 的 `batchTimeline`）；证据 GC、报告 stale 联动、多实例 leader 锁已在 P8 落地；报告快照已写入 `baseFallbackReason`/`historyRewritten`；`EZTEST_ANALYSIS_MAX_CASES`/`EZTEST_SUPPLEMENT_MAX_CASES` 与 `EZTEST_AUTONOMY_BATCHES_PER_TICK` 的接线仍以 P8 发布说明为准（见下文“P8 已知限制”）。报告 PDF、问题外部工单、问题重开/合并、非 PostgreSQL 目标库仍不在 P8 范围（P9/后续）。
+
+## P8 体验完善与硬化
+
+P8 在 P0–P7 之上完成“可长期使用/可运维”的体验与硬化，**不新增业务域**。截至本提交（Task 33 文档同步）的实际交付状态：
+
+| 能力 | 状态 | 入口/证据 |
+|---|---|---|
+| 探索链路 v2（服务端读模型 + React Flow 画布 + 图例/Sheet/MiniMap/跟随/截断/ARIA） | 已交付 | `GET /api/versions/{id}/exploration-chain`；`frontend/e2e/p8-exploration-chain.spec.ts`；链路专项 SLO PASS |
+| 顶栏版本切换器、全局搜索、待办中心、移动端导航 | 已交付 | `/api/search`、`/api/todos`；`Ctrl/Cmd+K`；30s 轮询 |
+| 脑图回版本 Tab（保留全屏路由与 `?case=`） | 已交付 | `?tab=mindmap` 与 `/versions/{id}/mindmap` |
+| 代码与变更完整版（`version_change` 快照 + 批次时间线 + 事实人工修正 + 质量区块） | 已交付 | `GET /api/versions/{id}/code/changes`、`GET /api/code/repos/{repoId}/quality`、`POST .../facts/{factId}/reviews` |
+| 报告 revision 选择器/D49 快照/stale 联动 | 已交付 | `?report=`；升级后旧报告首次读取 stale 一次（见发布说明） |
+| Agent 中心（13 角色目录、运行观察、质量指标、只读） | 已交付 | `/agents`、`/api/agent-center/*` |
+| 版本内知识沉淀（草稿→审核→批准→注入） | 已交付 | `/knowledge`、`/api/versions/{id}/knowledge`；概览内提交面板 |
+| 评测平台/质量中心（确定性门禁 + 真实 LLM 报告） | 已交付 | `/quality`、`/api/quality/eval-runs`、`scripts/eval.ps1` |
+| 限流/SLO、证据 GC、备份恢复、多实例单活、安全审计/头 | 已交付（部分验收项待最终运行） | `scripts/slo.ps1`/`slo-chain.ps1`/`backup.ps1`/`security-audit.ps1`；`docs/acceptance/p8/` |
+| **视觉断言（截图基线/像素比对/基线审批）** | **未交付（Task 25 在途）** | 本提交不发布相关端点/页面；不要按 P8 规格调用 |
+| 全量 SLO 真实测量、恢复库应用 smoke、最终真实验收 | **待最终验收（Task 35）** | `docs/acceptance/p8/slo.md` 目前是 SKIP 报告；备份演练未做应用 smoke |
+
+P8 新增/变更模块：
+
+- 后端：`internal/chain`（链路只读读模型）、`internal/search`（跨上下文搜索聚合）、`internal/workspace`（待办）、`internal/quality`（评测）、`platform/leader`（advisory lock）、evidence GC、knowledge、`version_change`/事实修正/质量聚合。
+- 前端：`features/execution/chain`（React Flow）、`features/shell/{search,todos}`、`features/knowledge`、`features/quality`、Agent 中心只读化、移动导航、证据对比、报告 revision 选择器。
+- 部署：`deploy/` 增加证据/报告/导出卷与代码仓只读挂载示例；**本机没有 Docker，Compose 只做静态校验、未实跑**。
+- 迁移（append-only）：`codeintel_0006_version_change.sql`、`codeintel_0007_fact_review.sql`、`version_0006_knowledge.sql`、`quality_0001_eval.sql`、`execution_0004_evidence_purge.sql` 等；视觉迁移在合并时追加。
+
+P8 验收命令（仓库根）：
+
+```powershell
+# P8 后端定向单元（集成测试需 EZTEST_TEST_DATABASE_URL + -tags=integration）
+cd backend
+..\.tools\go\bin\go.exe test -count=1 ./internal/chain/... ./internal/search/... ./internal/workspace/... ./internal/quality/... ./internal/execution/... ./internal/version/... ./internal/codeintel/... ./internal/platform/leader/...
+..\.tools\go\bin\go.exe test -tags=integration -count=1 ./internal/chain/... ./internal/quality/... ./internal/execution/... ./internal/codeintel/... ./internal/platform/leader/...
+
+# P8 前端定向单元
+cd ..\frontend
+pnpm vitest run src/features/execution src/features/shell src/features/knowledge src/features/quality src/features/agent-console src/features/versions src/features/code-intel
+
+# E2E（e2e.ps1 自管服务/DB/fake LLM/fixture/executor）
+cd ..
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1 exploration-chain
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1 mobile-nav
+
+# 评测静态自检 / SLO 静态预检 / 安全审计（离线）/ 备份演练
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/eval.ps1 -DryRun
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/slo.ps1 -DryRun
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/security-audit.ps1 -SkipLive
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-backup.ps1
+
+# 全量静态验收
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1 -StaticOnly
+```
+
+P8 文档入口：部署 [`docs/deployment.md`](docs/deployment.md)、运维 [`docs/operations.md`](docs/operations.md)、用户 [`docs/user-guide.md`](docs/user-guide.md)、开发 [`docs/development.md`](docs/development.md)、发布说明 [`docs/release-notes/p8.md`](docs/release-notes/p8.md)。
+
+
 
 ## 技术架构
 
 ### 后端（`backend/`）
 
 - Go 1.24，标准库 `net/http`（Go 1.22+ 方法路由），`pgx/v5` 连接 PostgreSQL 17。
-- DDD 限界上下文：`identity`、`eventing`、`llm`、`storage`、`audit`、P1 的 `agent`、P2 的 `resource`、P3 的 `version`、P4 的 `codeintel`、P5 的 `mindmap`、P6 的 `execution` 与 P7 的 `delivery`；每个上下文四层（`domain` / `application` / `infrastructure` / `interfaces/httpapi`），导入方向约束见 `Agent.md` §6.2。
-- `cmd/eztest` 是唯一组装根：读取配置、连接数据库、执行迁移、种子管理员/默认 LLM 配置/内置 Agent profile、清理 `interrupted` run、装配 HTTP 服务、在 SIGINT/SIGTERM 时先停止 Agent run 再优雅退出。
-- `internal/server` 只装配路由与中间件：recover → request ID → 日志 → CORS → 认证 → 幂等 → 路由。
-- `internal/platform` 放共享的纯基础设施：错误信封、分页游标、JSON 解码、请求 ID、AES keyring、幂等存储。
+- DDD 限界上下文：`identity`、`eventing`、`llm`、`storage`、`audit`、P1 的 `agent`、P2 的 `resource`、P3 的 `version`、P4 的 `codeintel`、P5 的 `mindmap`、P6 的 `execution`、P7 的 `delivery` 与 P8 的 `chain`/`search`/`workspace`/`quality`；每个上下文四层（`domain` / `application` / `infrastructure` / `interfaces/httpapi`），导入方向约束见 `Agent.md` §6.2。
+- `cmd/eztest` 是唯一组装根：读取配置、连接数据库、执行迁移、种子管理员/默认 LLM 配置/内置 Agent profile、清理 `interrupted` run、装配 HTTP 服务/workers/leader 锁，在 SIGINT/SIGTERM 时先停止 Agent run 再优雅退出。
+- `internal/server` 只装配路由与中间件：recover → request ID → 日志 → CORS → 认证 → 限流 → 幂等 → 路由。
+- `internal/platform` 放共享的纯基础设施：错误信封、分页游标、JSON 解码、请求 ID、AES keyring、幂等存储、P8 `leader` advisory lock 原语。
 - 迁移嵌入二进制，启动时在 advisory lock 下按版本顺序事务执行；重复启动无副作用。
 - 启动时自动执行迁移，无需单独 migrate 命令；`schema_migrations` 记录版本与校验和。
 
 ### 前端（`frontend/`）
 
-- Next.js 16 App Router、React 19、TypeScript、Tailwind CSS 4、Radix 原语、`next-themes`、lucide-react。
-- `src/app/` 只做路由/布局/页面组装；业务在 `src/features/{auth,users,llm-settings,sse-test,agent-console,resources,code-repos,versions,code-intel,mindmap,execution,delivery,shell}`；共享 UI 原语在 `src/components/ui/`，跨 feature 导航在 `src/navigation/`。P1 的 `/agents` 页面由 `agent-console` 提供，P2 的 `/resources`（四 Tab）与 `/code-repos` 分别由 `resources`、`code-repos` 提供，P3 的 `/versions` 列表与详情工作台由 `versions` 提供，P4 的「代码与变更」Tab 由 `code-intel` 提供，P5 的脑图由 `mindmap` 提供，P6 的执行 Tab 由 `execution` 提供，P7 的问题/报告 Tab 与全局 `/issues`、`/reports` 由 `delivery` 提供。
+- Next.js 16 App Router、React 19、TypeScript、Tailwind CSS 4、Radix 原语、`next-themes`、lucide-react、`@xyflow/react` 12。
+- `src/app/` 只做路由/布局/页面组装；业务在 `src/features/{auth,users,llm-settings,sse-test,agent-console,resources,code-repos,versions,code-intel,mindmap,execution,delivery,shell,knowledge,quality}`；共享 UI 原语在 `src/components/ui/`，跨 feature 导航在 `src/navigation/`。P8 新增 `shell/search`/`shell/todos`、`execution/chain`（React Flow）、`knowledge`、`quality`；`/agents`、`/knowledge`、`/quality` 为 P8 页面。
 - 所有 HTTP 请求经 `src/lib/api-client.ts`（Bearer、错误信封、`X-Request-ID`、幂等键）；SSE 经 `src/lib/sse-client.ts`（fetch 流、`Last-Event-ID`、退避重连、心跳超时）。
 - 质量工具：Biome（lint/format）、Vitest + Testing Library、Playwright（使用本机 Chrome/Edge channel，不下载 Chromium）。
+- 安全头：`next.config.ts` 下发 `X-Content-Type-Options`/`Referrer-Policy`/`X-Frame-Options`/`Permissions-Policy` 与 report-only CSP；强制 CSP/TLS/HSTS 由部署侧负责。
 
 ### 部署（`deploy/`）
 
-- `Dockerfile.api`：Go 多阶段构建，Alpine 运行时，非 root 用户，镜像内带 `docs/openapi/api.yaml`。
+- `Dockerfile.api`：Go 多阶段构建，Alpine 运行时，非 root 用户，镜像内带 `docs/openapi/api.yaml`，创建 `objects`/`attachments`/`evidence`/`reports`/`exports` 目录。
 - `Dockerfile.web`：Next.js `standalone` 多阶段构建，非 root 用户，监听 6868。
-- `docker-compose.yml`：`api`（13333）、`web`（6868）、`postgres:17`（5433），健康检查、`pgdata`/`objects` 卷、启动顺序。
-- 本机没有 Docker，Compose 只做静态校验，**未运行过容器**；详见 [`deploy/README.md`](deploy/README.md)。
+- `docker-compose.yml`：`api`（13333）、`web`（6868）、`postgres:17`（5433）、内部 `executor`（13336）；健康检查、`pgdata`/`objects`/`attachments`/`evidence`/`reports`/`exports` 卷、启动顺序；注释提供代码仓只读挂载示例。
+- 本机没有 Docker，Compose 只做静态校验，**未运行过容器**；详见 [`deploy/README.md`](deploy/README.md) 与 [`docs/deployment.md`](docs/deployment.md)。
 
 ## 目录结构
 
@@ -366,22 +426,28 @@ EzTest/
 │     ├─ version/                     # P3 版本/需求/澄清（四层）
 │     ├─ codeintel/                   # P4 代码理解/影响分析（四层）
 │     ├─ mindmap/                     # P5 用例脑图/评审（四层）
-│     ├─ execution/                   # P6 执行/证据/暂停恢复（四层）
+│     ├─ execution/                   # P6 执行/证据/暂停恢复 + P8 GC/leader 接线
 │     ├─ delivery/                    # P7 问题/报告/分析（四层）
+│     ├─ chain/                       # P8 探索链路只读读模型（四层）
+│     ├─ search/                      # P8 全局搜索聚合（四层）
+│     ├─ workspace/                   # P8 待办聚合（四层）
+│     ├─ quality/                     # P8 评测结果（四层）
 │     ├─ storage/                     # 对象存储（四层）
 │     └─ audit/                       # 审计（四层）
 ├─ executor/                          # P6 独立 Node/Playwright 执行器
 ├─ frontend/
-│  ├─ src/app/                        # Next.js App Router 页面组装（含 /agents、/resources、/code-repos、/versions、/issues、/reports）
-│  ├─ src/features/                   # auth/users/llm-settings/sse-test/agent-console/resources/code-repos/versions/code-intel/mindmap/execution/delivery/shell
+│  ├─ src/app/                        # Next.js App Router 页面组装（含 /agents、/resources、/code-repos、/versions、/issues、/reports、/knowledge、/quality）
+│  ├─ src/features/                   # auth/users/.../shell/knowledge/quality（P8 新增 shell/search、todos、execution/chain、knowledge、quality）
 │  ├─ src/components/ui/              # 共享 UI 原语（StatusBadge/EmptyState）
 │  ├─ src/navigation/                 # 跨 feature 导航数据（侧边栏）
 │  ├─ src/lib/                        # api-client / sse-client / auth-storage
 │  ├─ scripts/validate-compose.mjs    # Compose 静态校验
-│  └─ e2e/                            # Playwright E2E（由 scripts/e2e.ps1 编排）
+│  └─ e2e/                            # Playwright E2E（由 scripts/e2e.ps1 编排；P8 含 p8-exploration-chain/mobile-nav）
 ├─ deploy/                            # Dockerfile.api / Dockerfile.web / docker-compose.yml
-├─ scripts/                           # db/dev-api/dev-web/test/e2e/acceptance/fake-llm/fixture-target/acceptance-*-llm/acceptance-p7-*
-├─ docs/openapi/api.yaml              # 手工维护的 OpenAPI 3.0（P0–P7）
+├─ docs/                              # openapi、design、acceptance、deployment/operations/user-guide/development、release-notes
+├─ eval/                              # P8 评测语料/真值/基线
+├─ scripts/                           # db/dev-api/dev-web/test/e2e/acceptance/eval/slo/backup/restore/security-audit/fake-llm/acceptance-*
+├─ docs/openapi/api.yaml              # 手工维护的 OpenAPI 3.0（P0–P8）
 ├─ .env.example                       # 环境变量模板（无真实秘密）
 ├─ .tools/                            # 便携 Go/PostgreSQL（gitignored）
 └─ README.md
@@ -415,7 +481,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/db.ps1 start
 
 ## 环境变量
 
-完整模板见 [`.env.example`](.env.example)。`.env`、`.tools/`、`docs/*.local.md` 均被 gitignore，**禁止提交真实密钥**。
+完整模板见 [`.env.example`](.env.example)。`.env`、`.tools/`、`docs/*.local.md` 均被 gitignore，**禁止提交真实密钥**。P8 知识注入变量（`EZTEST_KNOWLEDGE_*`）与未接线的链路上限/视觉变量见下表，需要时手动补进 `.env`；`.env.example` 当前只含限流/GC/leader 段。
 
 | 变量 | 必填 | 说明 |
 |---|---|---|
@@ -449,10 +515,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/db.ps1 start
 | `EZTEST_MINDMAP_MAX_CASES` | 否 | P5 单次设计 run/物化最多 case 数，1–60，默认 `60`。 |
 | `EZTEST_EXPLORE_MAX_REQUESTS` | 否 | P5 单次探索最多 HTTP 请求数，1–40，默认 `40`；超出记 `stats.truncated`。 |
 | `EZTEST_EXPLORE_TIMEOUT_MS` | 否 | P5 探索单请求超时，500–30000 ms，默认 `5000`；另有 60s 总时长与 512 KiB 解析上限。 |
+| `EZTEST_EVIDENCE_DIR` | 否 | P6 执行证据根目录，默认 `.data/evidence`；DB 只存相对路径 + sha256 + 大小；P8 GC 只清理此目录下的证据文件。 |
 | `EZTEST_REPORT_DIR` | 否 | P7 报告 Markdown 根目录，默认 `.data/reports`；目录 0700、文件 0600，DB 只存相对路径 + sha256 + 大小。 |
 | `EZTEST_AUTONOMY_BATCHES_PER_TICK` | 否 | P7 自主 worker 单 tick 处理的终态批/继续中版本上限，默认 `4`；未设置或非法值回退默认（规格建议 1–20，当前实现未钳制上限）。 |
-| `EZTEST_ANALYSIS_MAX_CASES` | 否 | P7 规格目标：失败分析单 run 最多用例数（默认 `20`，1–100）；**当前构建以代码固定上限 20 执行，尚未读取该变量**（P8 接线）。 |
-| `EZTEST_SUPPLEMENT_MAX_CASES` | 否 | P7 规格目标：补全单 run 最多新用例数（默认 `5`，1–20）；**当前构建以代码固定上限 5 执行，尚未读取该变量**（P8 接线）。 |
+| `EZTEST_ANALYSIS_MAX_CASES` | 否 | P7/P8 规格目标：失败分析单 run 最多用例数（默认 `20`，1–100）；**当前构建仍以代码固定上限 20 执行，尚未读取该变量**（见 P8 已知限制）。 |
+| `EZTEST_SUPPLEMENT_MAX_CASES` | 否 | P7/P8 规格目标：补全单 run 最多新用例数（默认 `5`，1–20）；**当前构建仍以代码固定上限 5 执行，尚未读取该变量**（见 P8 已知限制）。 |
 | `EZTEST_DB_RESULT_MAX_BYTES` | 否 | P7 db 断言单次结果字节上限，64 KiB–16 MiB，默认 `1048576`。 |
 | `EZTEST_DB_SQL_MAX_BYTES` | 否 | P7 db 断言 SQL 文本上限，1 KiB–64 KiB，默认 `16384`。 |
 | `EZTEST_RATE_LIMIT_RPS` | 否 | P8 每用户（认证后）/IP（公开路由）令牌桶速率，0–1000，默认 `50`；`0` 关闭普通令牌桶（SSE 并发上限仍生效）。超限返回 429 `rate_limited` + `Retry-After`。 |
@@ -463,6 +530,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/db.ps1 start
 | `EZTEST_GC_BATCH_KEEP` | 否 | P8 最近 N 批证据始终受保护，1–50，默认 `3`。 |
 | `EZTEST_INSTANCE_ID` | 否 | P8 多实例 leader 锁的实例标识，出现在启动/退出与锁日志；默认 `hostname-pid`，最长 64 字符。 |
 | `EZTEST_LEADER_LOCK_KEY` | 否 | P8 PostgreSQL advisory lock 基础 key（int64），默认 `1163411512`；调度、自主 worker、每日维护派生出相邻 key，所有 API 实例必须一致。 |
+| `EZTEST_KNOWLEDGE_MAX_INJECT` | 否 | P8 版本知识注入条数上限，0–20，默认 `5`；`0` 关闭条数预算。 |
+| `EZTEST_KNOWLEDGE_MAX_BYTES` | 否 | P8 版本知识注入字节上限，0–16384，默认 `4096`；超出截断并记 `knowledge_truncated`。 |
+| `EZTEST_CHAIN_MAX_NODES` | 否 | P8 规格目标（默认 300，50–2000）；**当前构建使用代码默认/请求 `limit`，未读取该环境变量**。 |
+| `EZTEST_SEARCH_MAX_RESULTS_PER_TYPE` | 否 | P8 规格目标（默认 5，1–20）；**当前由请求 `limit` 控制，未读取该环境变量**。 |
+| `EZTEST_TODOS_MAX` | 否 | P8 规格目标（默认 50，1–200）；**当前由请求 `limit` 控制，未读取该环境变量**。 |
+| `EZTEST_VISUAL_DIFF_THRESHOLD` / `EZTEST_VISUAL_BASELINE_MAX_BYTES` | 否 | P8 视觉断言规格目标；**视觉断言尚未交付，当前无效果**（见发布说明）。 |
 | `llm_base_url` / `llm_key` / `llm_model_name` | 否 | 首次启动的可选默认 LLM 种子；小写变量名是设计约定，Key 留空则不发起真实调用。P4 复用该配置，不新增模型/Key。 |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Compose | 仅 `deploy/docker-compose.yml` 使用；`POSTGRES_PASSWORD` 必填。 |
 | `NEXT_PUBLIC_API_BASE_URL` | 否 | 浏览器访问的 API origin，默认 `http://localhost:13333`；Compose 构建时内联。 |
@@ -493,9 +566,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/dev-web.ps1
 - Agent 控制台：<http://localhost:6868/agents>（管理员登录后；普通用户显示仅管理员可用）
 - 公共资源：<http://localhost:6868/resources>（四 Tab；普通用户只读）
 - 代码仓：<http://localhost:6868/code-repos>（普通用户只读）
-- 版本工作台：<http://localhost:6868/versions>（列表与 `/versions/[id]` 详情；全部登录用户可写）
+- 版本工作台：<http://localhost:6868/versions>（列表与 `/versions/[id]` 详情；全部登录用户可写；P8 十个 Tab 含脑图/链路/问题/报告/代码）
 - 全局问题中心：<http://localhost:6868/issues>（P7 只读，可深链回版本问题 Tab）
 - 全局报告中心：<http://localhost:6868/reports>（P7 只读，可深链回版本报告 Tab）
+- 知识库：<http://localhost:6868/knowledge>（P8；普通用户已批准只读，管理员审核队列）
+- 质量中心：<http://localhost:6868/quality>（P8；仅管理员）
+- 设置与审计：<http://localhost:6868/settings>（管理员；含审计日志/基础配置）
 - 用例脑图：<http://localhost:6868/versions/[id]/mindmap>（全屏画布；冻结后只读）
 - API 健康：<http://localhost:13333/api/health>
 - OpenAPI：<http://localhost:13333/api/openapi.yaml>
@@ -539,6 +615,7 @@ pnpm dev
 - P4 代码智能：仓库级 `/api/code/repos/*` 与版本级 `/api/versions/{id}/code/*` 使用 camelCase；codeintel 自有 ID/subjectId 为十进制字符串，`repoId` 等为 number；错误 reason 见 OpenAPI `CodeErrorReason`；`code.changed`/`code.impact_computed` 事件走版本 SSE 通道。
 - P6 执行：`/api/versions/{id}/batches*`、`evidence/*`、`execution/sessions` 与 `/api/resources/auth-flows`（admin）；execution ID 为十进制字符串；批次 DTO 兼容 P7 加法字段。
 - P7 交付：`/api/versions/{id}/issues`、`/reports`、`/batches/{batchId}/analysis`、mindmap `incremental-plan`/`supplement`、环境 `db-target`（admin）、全局只读 `/api/issues`、`/api/reports`；版本 DTO 新增 `continuePhase/continuedAt`，但 `paused/pause_mode/batch_no` 仍为 P6 snake_case；P7 事件固定 8 个、ID 一律十进制字符串；`db_target` 密码永不回显。
+- P8 新增：`GET /api/versions/{id}/exploration-chain`（链路只读聚合）、`GET /api/search`、`GET /api/todos`、`/api/agent-center/{catalog,sessions,quality}`（登录只读）、`/api/versions/{id}/knowledge` 与 `/api/knowledge`（知识草稿/审核/全局已批准）、`/api/code/repos/{repoId}/quality` 与 `.../facts/{factId}/reviews`（质量/事实修正）、`/api/quality/eval-runs`（admin 评测）、`POST /api/admin/gc`（admin，默认 dry-run）；`GET /api/versions/{id}/code/changes` 增加 `batchTimeline`；事件新增 `knowledge.created`/`knowledge.reviewed`，既有 `code.changed`/`report.stale` 语义扩展。限流错误 429 `rate_limited` + `Retry-After`；`GET /api/health` 增加 `rate_limit`/`gc` 只读投影。
 - `X-Request-ID` 可传入 `^[A-Za-z0-9_-]{8,128}$`，否则生成 UUID；响应回显。
 - 认证写接口支持 `Idempotency-Key`（24h 重放，同 key 不同 body 为 409）。
 - CORS 只允许 `EZTEST_WEB_ORIGIN`；SSE 支持 `Last-Event-ID`。Agent 活动事件为 `type=agent.activity`、`channel=agent:{session_id}`，复用 P0 快照与 SSE；9 类 `detail.kind` 见 P1 章节与 OpenAPI `AgentActivityDetail`。
@@ -557,6 +634,7 @@ pnpm dev
 | 版本/需求/澄清（登录用户） | 版本：`GET/POST /api/versions`、`GET/PATCH /api/versions/{id}`、`PUT /api/versions/{id}/bindings`、`POST /api/versions/{id}/start-clarification`/`enter-design`；需求：`GET/POST /api/versions/{id}/requirements`、`GET/PATCH/DELETE .../{rid}`、`POST .../{rid}/confirm`/`reopen`、`GET/POST .../{rid}/attachments`、`GET .../attachments/{aid}/content`、`DELETE .../attachments/{aid}`；关系：`GET/POST /api/versions/{id}/relations`、`PATCH/DELETE .../{relId}`；澄清：`GET /api/versions/{id}/clarification`、`POST .../clarification/sessions`、`POST .../sessions/{sid}/complete`、`GET/POST .../clarification/messages`、`POST .../clarification/analyze`/`recon`、`GET/POST .../clarification/questions`、`PATCH .../questions/{qid}`、`GET/POST .../decisions`、`PATCH .../decisions/{did}`；事件：`GET /api/versions/{id}/events`、`GET /api/versions/{id}/stream`（SSE） |
 | 代码智能（读=登录用户，索引=管理员） | 仓库级：`GET /api/code/repos`、`POST /api/code/repos/{repoId}/index`（管理员）、`GET .../index-runs/latest`、`GET .../index-runs/{runId}`、`GET .../tree`、`GET .../file`、`GET .../diff`、`GET .../diff/file`、`GET .../facts`、`GET .../search`、`GET .../commits/{sha}`；版本级：`GET /api/versions/{id}/code/changes`、`POST/GET .../analyses`、`GET .../analyses/latest`、`GET .../analyses/{analysisId}`、`PATCH .../analyses/{analysisId}/candidates/{candidateId}`、`GET/POST .../anchors`、`DELETE .../anchors/{anchorId}` |
 | P7 交付（登录用户；DB 目标=管理员） | 问题：`GET/POST /api/versions/{id}/issues`、`GET/PATCH .../issues/{issueId}`；报告：`GET/POST /api/versions/{id}/reports`、`GET .../reports/{reportId}`、`POST .../publish`/`regenerate`、`GET .../export`/`diff`；分析：`GET/POST /api/versions/{id}/batches/{batchId}/analysis`、`GET .../analysis/{analysisId}`；增量：`GET /api/versions/{id}/mindmap/incremental-plan`、`PATCH .../mindmap/nodes/{nodeId}/supplement`；全局只读：`GET /api/issues`、`GET /api/reports`；DB 目标（admin）：`GET/PUT/DELETE /api/resources/environments/{id}/db-target`、`POST .../db-target/test` |
+| P8 体验/质量（读=登录用户；评测/GC=管理员） | 链路：`GET /api/versions/{id}/exploration-chain`；搜索：`GET /api/search`；待办：`GET /api/todos`；Agent 中心：`GET /api/agent-center/catalog`/`sessions`/`quality`；知识：`GET/POST /api/versions/{id}/knowledge`、`PATCH .../knowledge/{kid}`、`POST .../knowledge/{kid}/review`（审核=admin）、`GET /api/knowledge`；代码质量/事实修正：`GET /api/code/repos/{repoId}/quality`、`POST .../facts/{factId}/reviews`；评测（admin）：`GET/POST /api/quality/eval-runs`、`GET /api/quality/eval-runs/{id}`；GC（admin）：`POST /api/admin/gc` |
 | 事件流 | `GET /api/stream/events`、`GET /api/stream`（SSE）、`POST /api/admin/stream/test-events`（需开启测试端点）；`agent:` 通道仅管理员 |
 | 存储（管理员） | `POST /api/admin/storage/objects`、`GET /api/admin/storage/objects/{sha256}` |
 | 审计（管理员） | `GET /api/admin/audit` |
@@ -578,23 +656,31 @@ pnpm dev
 # 一键本地检查（Go 单元 + Go 集成 + 前端 lint/typecheck/test）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test.ps1
 
-# 完整 P0–P7 验收（Go 单元/集成、Agent 单元/集成、Version 单元/集成、codeintel 单元/集成、
-# 前端 lint/typecheck/test/build、Playwright E2E（含 P4/P5/P6/P7 spec）、迁移重复执行、
-# 健康/审计/版本 API 冒烟、交付物与 OpenAPI P1–P7 契约、错误 reason 与事件目录检查、
-# P4/P7 fake-LLM 契约、P5/P6 功能与权限/降级子检查、P7 仓库本地静态契约）
+# 完整 P0–P8 验收（Go 单元/集成、Agent/Version/Codeintel/Mindmap/Execution/Delivery/Chain/Search/Workspace/Quality、
+# 前端 lint/typecheck/test/build、Playwright E2E（含 P4–P8 spec）、迁移重复执行、
+# 健康/审计/版本 API 冒烟、交付物与 OpenAPI P1–P8 契约、错误 reason 与事件目录检查、
+# P4/P7 fake-LLM 契约、P5/P6 功能与权限/降级子检查、P7/P8 仓库本地静态契约）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1
 
-# 仅静态检查（README/OpenAPI/env/Compose/迁移契约 + P4/P7 fake-LLM + P5/P7 静态契约，
+# 仅静态检查（README/OpenAPI/env/Compose/迁移契约 + P4/P7 fake-LLM + P5/P7/P8 静态契约，
 # 不启动数据库/API/Playwright；仍需 Node、frontend/node_modules/yaml 与 git）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1 -StaticOnly
 
 # 仅 P5 mindmap E2E（fake LLM P5 模式；会自行启动/停止服务与 fixture target）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1 mindmap
 
-# 仅 E2E（会自行启动/停止 API、Web、fake LLM 上游与 fixture target，使用 eztest_e2e 库；
-# 覆盖 P0–P7：P1 Agent 控制台、P2 Session、P3 版本工作台/澄清/降级、P4 代码理解 5 个 spec、
-# P5 mindmap、P6 execution，以及 P7 continuing/问题报告/补全/降级/DB 配置 spec（T25 目标））
+# 仅 E2E（会自行启动/停止 API、Web、fake LLM 上游、fixture target 与 executor，使用 eztest_e2e 库；
+# 覆盖 P0–P8：P1 Agent 控制台、P2 Session、P3 版本工作台/澄清/降级、P4 代码理解 5 个 spec、
+# P5 mindmap、P6 execution、P7 continuing/问题报告/补全/降级/DB 配置，以及 P8 探索链路/移动导航 spec）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1
+
+# P8 专项
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1 exploration-chain
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1 mobile-nav
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/eval.ps1 -DryRun
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/slo.ps1 -DryRun
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/security-audit.ps1 -SkipLive
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test-backup.ps1
 
 # Compose 静态校验（不需要 Docker 守护进程）
 cd frontend
@@ -620,6 +706,12 @@ node scripts/validate-compose.mjs
 | Delivery 单元 | `cd backend; ..\.tools\go\bin\go.exe test -count=1 ./internal/delivery/... ./internal/version/... ./internal/resource/...` |
 | Delivery 集成 | `cd backend; $env:EZTEST_TEST_DATABASE_URL=...; ..\.tools\go\bin\go.exe test -tags=integration -count=1 ./internal/delivery/... ./internal/execution/... ./internal/mindmap/...` |
 | Delivery 前端 | `cd frontend; pnpm vitest run src/features/delivery src/features/versions src/features/resources src/features/execution` |
+| Chain/Search/Workspace/Quality 单元 | `cd backend; ..\.tools\go\bin\go.exe test -count=1 ./internal/chain/... ./internal/search/... ./internal/workspace/... ./internal/quality/...` |
+| P8 硬化单元 | `cd backend; ..\.tools\go\bin\go.exe test -count=1 ./internal/platform/leader/... ./internal/execution/... ./internal/version/... ./internal/codeintel/...` |
+| P8 前端 | `cd frontend; pnpm vitest run src/features/shell src/features/knowledge src/features/quality src/features/agent-console src/features/execution src/features/versions src/features/code-intel` |
+| 评测 | `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/eval.ps1 -DryRun`（完整门禁见 `eval/README.md`） |
+| SLO | `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/slo.ps1 -DryRun`；链路专项 `scripts/slo-chain.ps1` |
+| 安全/备份 | `scripts/security-audit.ps1 -SkipLive`；`scripts/test-backup.ps1` |
 | Mindmap 前端 | `cd frontend; pnpm vitest run src/features/mindmap` |
 | P4 fake-LLM 契约 | `node scripts/fake-llm.p4.test.cjs`（需先 `scripts/fixture-codeintel-repo.ps1`） |
 | P7 fake-LLM 契约 | `node scripts/fake-llm.p7.test.cjs` |
@@ -631,7 +723,8 @@ node scripts/validate-compose.mjs
 
 - 本机没有 Docker，`scripts/acceptance.ps1` 会把“Compose 容器运行”标为 **SKIPPED**；Compose 仅通过 `validate-compose.mjs` 做静态字段校验，不代表已运行验证。P1 真实 Agent LLM、P3 真实 LLM 人工验收、P4/P5/P7 真实 LLM 与 P7 真实 DB 验收同样标为 **SKIPPED**（见下节）。
 - 常规测试不访问真实 LLM：Go 测试使用 `httptest` mock（`/v1/chat/completions`、`/v1/responses`、`/v1/models`，可注入 429/5xx/超时/分片）；`scripts/e2e.ps1` 使用 `scripts/fake-llm.cjs`（127.0.0.1:13334）并覆盖 `llm_*`，E2E 零 LLM 费用；P4 的 `scripts/fake-llm.p4.test.cjs` 与 P7 的 `scripts/fake-llm.p7.test.cjs` 同样只启动本地 fake 上游。
-- `acceptance.ps1 -StaticOnly` 可在没有 `.env`/数据库/Playwright 的主机上运行：它校验 README/OpenAPI/env/Compose 契约、从 `order.txt` 动态推导 P4–P7 迁移与表清单、校验 P5/P7 交付物与 OpenAPI 契约（P7 事件/reason/testid/端点）、解析 OpenAPI YAML，并执行 P4/P7 fake-LLM 测试。仍需要 Node、`frontend/node_modules/yaml` 与 git（P4 fixture）。
+- `acceptance.ps1 -StaticOnly` 可在没有 `.env`/数据库/Playwright 的主机上运行：它校验 README/OpenAPI/env/Compose 契约、从 `order.txt` 动态推导 P4–P8 迁移与表清单、校验 P5/P7/P8 交付物与 OpenAPI 契约、解析 OpenAPI YAML，并执行 P4/P7 fake-LLM 测试。仍需要 Node、`frontend/node_modules/yaml` 与 git（P4 fixture）。
+- P8 静态检查：`acceptance.ps1 -StaticOnly` 当前覆盖 P8 评测语料/基线（`eval/`）与既有 P1–P7 契约；链路/搜索/待办/Agent 中心/知识/评测/GC 的 OpenAPI 已由本任务同步，但脚本级 P8 契约（如 `scripts/check-docs.ps1`、P8 端点/事件/环境变量断言）仍待后续接入。**视觉断言未交付，不在当前静态契约内**。P5/P6 API 子检查在路由未接线时记为 **SKIPPED**；最终判定仍以非 SKIPPED FAIL 数为 0 为准。
 - `acceptance.ps1` 额外校验 `docs/openapi/api.yaml` 含 P1 的 `/api/agents/sessions`、`agent.activity`、`reasoning_tokens`，P2 的 `/api/resources/systems`、`/api/resources/sessions`、`/api/resources/code-repos`、`storageState`、`credentialSet`，P3 的 `/api/versions`、`clarification`、`enter-design`、`snowflake`、`version-attachments` 关键词、全部 P3 错误 reason（含字段级 `invalid_context_summary`）、全部版本事件类型（含 `clarification.context_updated`），P4 的 `/api/code/repos/{repoId}/index`、`/api/versions/{versionId}/code/analyses`、全部 P4 path/schema、`CodeErrorReason`（含 `analysis_in_progress`、`anchor_duplicate`、`analysis_queue_full`、`git_unavailable`、`path_not_git_repo`）与 `code.changed`/`code.impact_computed` 事件，P5 的 `/api/versions/{versionId}/mindmap` 23 path/27 operation、8 个 `case.*` 事件、全部 35 个 `MindmapErrorReason`、`AnchorSubjectKind=case` 与 `AppModelNode.source=explored`，以及 P6/P7 的批次/证据/报告/问题/分析/db-target 端点、P7 8 个事件、全部 P7 reason、`code_anchor.subjectKind=issue` 与 P7 前端 testid/导航 phase；同时校验 `.env.example` 的 Agent/P3/P4/P5/P6 变量、Compose 的附件目录与 P4 Playwright spec 是否存在；P1–P7 DoD 与检查项/证据的映射会打印在汇总后。P5/P6 API 子检查在路由未接线时记为 **SKIPPED**；P7 区块全部为仓库本地静态检查（不启动 P7 服务），静态检查与 DoD 映射仍须 PASS。
 - 通过条件：所有非 SKIPPED 检查 FAIL 数为 0，脚本退出码为 0。
 
@@ -653,17 +746,19 @@ P5 脚本可选配置：`EZTEST_ACCEPTANCE_API_URL`（复用已在运行的 API�
 
 ## 容器部署
 
-见 [`deploy/README.md`](deploy/README.md)。要点：
+见 [`deploy/README.md`](deploy/README.md) 与 [`docs/deployment.md`](docs/deployment.md)。要点：
 
-- `api` 13333、`web` 6868、`postgres:17` 5433（宿主端口）。
-- 需要仓库根 `.env`（gitignored）提供 `POSTGRES_PASSWORD`、`EZTEST_SECRET_KEYS`、管理员凭据等。
-- 两个运行时镜像都以非 root 用户运行；API 镜像已内置 `docs/openapi/api.yaml`。
+- `api` 13333、`web` 6868、`postgres:17` 5433（宿主端口）；`executor` 仅内部 13336，不发布宿主端口。
+- 需要仓库根 `.env`（gitignored）提供 `POSTGRES_PASSWORD`、`EZTEST_EXECUTOR_TOKEN`、`EZTEST_SECRET_KEYS`、管理员凭据等。
+- 两个运行时镜像都以非 root 用户运行；API 镜像已内置 `docs/openapi/api.yaml`，并创建 objects/attachments/evidence/reports/exports 目录。
+- P8 持久化卷：`pgdata`、`objects`、`attachments`、`evidence`、`reports`、`exports`；`down -v` 会删除它们。
 - Agent 容器默认不启用文件工具（`EZTEST_AGENT_FILE_ROOT` 为空）；需要时把只读目录挂载进容器并设置该变量。`http.get` 默认只允许 localhost，跨主机访问需显式配置 `EZTEST_AGENT_HTTP_ALLOWLIST`。
-- P4 代码仓由运维以 **read-only** 方式挂载进 `api` 容器（例如 Compose `volumes: - "D:/repos/app:/repos/app:ro"`），P2 的 `localPath` 指向容器内路径（`/repos/app`）。P4 不写工作树；挂载可读但不可写是预期配置。
+- P4 代码仓由运维以 **read-only** 方式挂载进 `api` 容器（Compose 已提供注释示例 `./repos:/repos:ro`），P2 的 `localPath` 指向容器内路径（如 `/repos/app`）。P4 不写工作树；挂载可读但不可写是预期配置。
 - **本机未安装 Docker**：镜像未构建、Compose 未启动；唯一验证是
-  `cd frontend && node scripts/validate-compose.mjs`（解析 YAML，断言服务、端口、健康检查、卷、依赖顺序）。
+  `cd frontend && node scripts/validate-compose.mjs`（解析 YAML，断言服务、端口、健康检查、卷、依赖顺序），以及 `scripts/acceptance.ps1 -StaticOnly` 的 Compose 契约检查。
+- TLS/反向代理/HSTS 由部署方负责；SSE 经过反代时必须关闭缓冲（见部署指南）。
 
-## 已知限制（P0–P7）
+## 已知限制（P0–P8）
 
 - 单实例部署：SSE 的订阅与广播在进程内完成，不做多实例广播；重启/多副本会丢失实时连接（客户端可重连回放）。Agent run 也由进程内 runner 调度，重启时 `running` 会标记为 `interrupted`，P1 不做跨实例运行。P8 起执行调度、P7 自主 worker 与每日 GC 维护通过 PostgreSQL advisory lock 单活（每次 tick 仅一个实例执行，其余实例 debug 跳过）；SSE 广播与 Agent runner 仍为单实例。
 - 权限：P1 的 `/api/agents/*`、`/agents` 页面与 `agent:` 事件通道均仅管理员可用；P2 的 `/api/resources/*` GET 对任意登录用户开放，写/动作仅管理员（普通用户只读）；P3 的 `/api/versions/*` 与 `/versions` 对全部登录用户开放（无 per-user 授权）。P1–P3 均不做 RBAC。
@@ -672,16 +767,19 @@ P5 脚本可选配置：`EZTEST_ACCEPTANCE_API_URL`（复用已在运行的 API�
 - P3 版本域：只实现 `draft → clarifying → designing` 与需求 `draft → clarified`，不提供版本删除/归档、脑图/评审/执行/报告；附件仅落本地文件系统（无 GC/备份，删除 best-effort 可留孤儿文件）；AI 澄清/分析/侦察依赖 P1 Agent 与 LLM，不可用时返回 503 但人工路径可用；单版本最多一个 active 会话与一个运行中 Agent；P3 不写 `audit_logs`。
 - P4 代码智能：只做文件级 Git 与 AI 事实，无 parser/符号级调用链/字段级分析、无全仓 AI 分析、无全文检索；只分析变更文件且受 20 文件/64KiB/摘录行数/超时/队列(16)等上限约束；单实例进程内 worker，无取消、无跨进程恢复；仓库必须本地只读可见，不支持线上仓、分支切换或工作树修改；候选只有需求/应用模型（case/issue 归 P5/P6），版本锚点仅 API 可建；事实无人工修正/版本对比 UI；AI 失败降级为 T0 候选但可能产生 `analysis_queue_full`/`analysis_in_progress` 等 429/409；P4 不写 `audit_logs`（`code.read`/`code.analyze` 审计除外）。
 - P5 用例脑图：探索仅 HTTP GET/HEAD（无浏览器/JS 执行），依赖环境白名单，可能漏掉纯前端渲染页面；PNG 由前端画布生成，无服务端渲染；导出为 Markdown/Mermaid/OPML（不生成 XMind）；冻结后不可解冻，需求重开后的增量重校验、`affected.cases` 正式接入归 P6/P7（P7 已接入受影响用例/补全）；`impactCases` 只是 P4 候选映射的只读提示；单实例进程内 run worker（重启把 stale run 置 failed）；explore/data_plan 质量受真实 LLM 影响，脚本在非 `done` 时 fail-closed。
-- P6 执行：单进程调度（多实例分布式租约归 P8）；db 断言在 P6 阶段不支持（P7 已补只读 db 断言）；不做用例级自动重跑（应用失败仅手动 rerun）；证据无 GC/删除 API；执行器不可用时只能查看历史结果/证据/报告，禁止建批；真实 LLM 的分类/暂停结果受模型行为影响，脚本在不符合预期时 fail-closed。
-- P7 交付：`version_change` 表与 `code_changed` 变更项未实现（`/changes` 读时派生，P8）；证据 GC 与报告 stale 联动归 P8；自主 worker 单实例；报告 PDF、问题外部工单、问题重开/合并、跨批次语义去重增强、非 PostgreSQL 目标库归 P8/后续；全局问题/报告中心为只读列表（不做批量确认/导出），其跨版本查询适配由 T17b 接线，挂载前该组不注册、页面显示错误态；`IssuesTab` 约 300 行未拆分（T18 评审记录 305 行，当前文件 300 行；可维护性余项）；`EZTEST_ANALYSIS_MAX_CASES`/`EZTEST_SUPPLEMENT_MAX_CASES` 为 P7 规格目标变量，当前构建仍以代码固定上限 20/5 执行，尚未读取这两个变量（P8 接线）；`EZTEST_AUTONOMY_BATCHES_PER_TICK` 未对 >20 的值做上限钳制；报告快照 `content.batch` 未暴露 `baseFallbackReason`/`history_rewritten`（仅批次 DTO `baseFallbackReason` 与增量计划 `warnings` 可见；D49 已知差异，归 T23/P8）。P7 运行手册中的 `scripts/e2e.ps1 p7-*`、`scripts/acceptance-p7-llm.ps1`、`scripts/acceptance-p7-db.ps1`、`scripts/fixture-db.ps1` 已通过记录（见 acceptance.md），依赖 T25/T28/T29/T32 交付。
-- P7 报告/问题只读引用环境/system/commit 与 `case_run`/证据，不内联 Session storageState/headers/凭据；DB 目标密码明文存储（D48）但任何 API/DTO/事件/审计/日志/证据/报告/prompt 都不回显。
-- 登录 token 存 `sessionStorage`：属于单管理员内网工具的 XSS 边界，未做 CSP/HttpOnly cookie 会话。
-- 无 TLS、反向代理、限流网关或多租户/RBAC；管理员角色是唯一权限分层。
-- 对象存储只有本地内容寻址实现：无公开 URL、GC、保留期、去重清理。
+- P6 执行：单进程调度；P8 起执行调度/自主 worker/每日 GC 维护通过 PostgreSQL advisory lock 单活（每次 tick 仅一个实例执行，其余实例 debug 跳过），但 SSE 广播与 Agent runner 仍为进程内单实例。db 断言为只读；不做用例级自动重跑（应用失败仅手动 rerun）；证据 GC 已交付但**只清 `EZTEST_EVIDENCE_DIR` 下的执行证据文件**（导出/附件/报告/孤儿文件不自动清理）；执行器不可用时只能查看历史结果/证据/报告，禁止建批；真实 LLM 的分类/暂停结果受模型行为影响，脚本在不符合预期时 fail-closed。
+- P7 交付（P8 更新）：`version_change` 表/`code_changed` 已在 P8 落地，`/api/versions/{id}/code/changes` 返回 `batchTimeline`；证据 GC 与报告 stale 联动、多实例 leader 锁已在 P8 落地；报告快照已含 `baseFallbackReason`/`historyRewritten`。仍不提供报告 PDF、问题外部工单、问题重开/合并、跨批次语义去重增强、非 PostgreSQL 目标库；全局问题/报告中心为只读列表；`IssuesTab` 仍较大未拆分（可维护性余项）；`EZTEST_ANALYSIS_MAX_CASES`/`EZTEST_SUPPLEMENT_MAX_CASES` 仍以代码固定上限 20/5 执行，尚未读取；`EZTEST_AUTONOMY_BATCHES_PER_TICK` 仍只按 1–20 校验（未额外钳制）。P7 真实验收脚本的已通过记录见 `acceptance.md`，最终以本分支重跑为准。
+- P8 硬化边界：限流是**每实例内存**计数（多副本需按实例预算合计，无分布式限流）；SSE/Agent runner 仍单实例；GC 只自动清理证据文件，且发布/过期报告不参与证据保护（报告快照不含 evidence id）；`EZTEST_CHAIN_MAX_NODES`/`EZTEST_SEARCH_MAX_RESULTS_PER_TYPE`/`EZTEST_TODOS_MAX` 未接线为环境变量；SLO 只有链路专项真实测量 PASS，`scripts/slo.ps1` 全量为 dry-run SKIP（待最终验收）；备份演练未做恢复库应用 smoke（defer Task 35）。
+- **视觉断言（D62）未交付**：本提交不提供截图基线/像素比对/基线审批端点或页面；Task 25 仍在途，合并后需同步 OpenAPI/README/用户手册/设计文档/release notes。不要把 P8 规格中的视觉断言当作可用功能。
+- 多实例：只做 advisory lock 单活与执行器硬化；无多实例运维编排（P9 候选）；限流/SSE/Agent runner 不是集群级。
+- 登录 token 存 `sessionStorage`：属于单管理员内网工具的 XSS 边界，未做 HttpOnly cookie 会话；CSP 仍为 report-only。
+- 无内置 TLS/反向代理/HSTS；生产由部署方负责（见 `docs/deployment.md`）。无多租户/RBAC，管理员角色是唯一权限分层。
+- 对象存储只有本地内容寻址实现：无公开 URL、保留期或去重清理；P8 GC 不覆盖对象/附件/导出/报告文件。
 - LLM `base_url` 由管理员配置且被信任（P0 管理端测试不做 SSRF 白名单）；P1 Agent 工具调用另有 host allowlist。真实调用受上游可用性/限流/费用影响。
 - Compose/镜像仅静态交付，未在本机运行验证；Dockerfile 使用 `golang:1.24.6-alpine`、`node:22-alpine`、`alpine:3.21`，首次构建需要拉取镜像与依赖。
-- 迁移与数据备份需自行负责；丢失 `EZTEST_SECRET_KEYS` 会导致已加密的 LLM Key/headers 不可恢复。
-- 页面覆盖：P0 登录、概览、设置（用户/LLM/SSE 测试），P1 增加 `/agents` 控制台，P2 增加 `/resources`（四 Tab）与 `/code-repos`，P3 增加 `/versions` 列表与详情工作台，P4 实现「代码与变更」Tab，P5 增加 `/versions/[id]/mindmap` 全屏用例脑图页，P6 落地执行类 Tab/暂停恢复/证据/报告，P7 落地「问题」「报告」Tab、总览完善、继续中/增量计划、环境 DB 目标与全局 `/issues`、`/reports` 中心；侧边栏其余入口仍为占位页。
+- 迁移只追加、无 down migration；回退依赖备份恢复。丢失 `EZTEST_SECRET_KEYS` 会导致已加密的 LLM Key/headers 不可恢复。
+- 页面覆盖：P0 登录、概览、设置；P1 `/agents`（P8 扩展为角色目录/运行观察/质量指标）；P2 `/resources` 与 `/code-repos`；P3 `/versions` 与详情工作台；P4「代码与变更」Tab；P5 全屏脑图；P6 执行类 Tab/暂停恢复/证据/报告；P7 问题/报告 Tab、继续中/增量计划、环境 DB 目标与全局 `/issues`、`/reports`；P8 增加链路 v2、顶栏版本切换/搜索/待办、脑图 Tab、知识库 `/knowledge`、质量中心 `/quality`、移动导航、证据对比、报告 revision 选择器、Agent 中心只读化。
+- P7 报告/问题只读引用环境/system/commit 与 `case_run`/证据，不内联 Session storageState/headers/凭据；DB 目标密码明文存储（D48）但任何 API/DTO/事件/审计/日志/证据/报告/prompt 都不回显。
 
 ## 许可证
 
