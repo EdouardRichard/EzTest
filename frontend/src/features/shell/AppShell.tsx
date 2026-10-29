@@ -42,7 +42,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         </main>
         <footer className="px-4 pb-6 sm:px-6 lg:px-10">
           <div className="mx-auto flex w-full max-w-6xl flex-wrap items-center justify-between gap-2 text-[11px] text-muted-foreground">
-            <span>EzTest · P0 平台地基</span>
+            <span>EzTest · P8</span>
             <span className="font-mono">Next.js 16 · React 19</span>
           </div>
         </footer>

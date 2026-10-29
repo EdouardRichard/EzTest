@@ -1,7 +1,7 @@
 ﻿#requires -Version 5.1
 <#
 .SYNOPSIS
-    Runs the P0-P6 acceptance gate for EzTest.
+    Runs the P0-P8 acceptance gate for EzTest.
 
 .DESCRIPTION
     Executes the Go unit and integration suites, the P1 Agent unit/integration

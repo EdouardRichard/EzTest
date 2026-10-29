@@ -129,7 +129,7 @@ export function Topbar() {
           <StatusBadge variant={ENVIRONMENT.variant}>{ENVIRONMENT.label}</StatusBadge>
           <span className="hidden items-center gap-1.5 rounded-full border border-border bg-card px-2.5 py-1 text-[11px] font-medium text-muted-foreground md:inline-flex">
             <ShieldCheck className="h-3.5 w-3.5 text-emerald-500" aria-hidden="true" />
-            P0 · 地基版本
+            P8 · 体验硬化
           </span>
         </div>
 

@@ -287,7 +287,7 @@ node scripts/fake-llm.p7.test.cjs
 # 静态验收（P7 交付物/迁移/OpenAPI/事件/reason/testid；不需要数据库/API）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1 -StaticOnly
 
-# P7 Playwright E2E（目标命令，T25 交付；执行时由 e2e.ps1 管理服务、fake LLM 与 fixture）
+# P7 Playwright E2E（已通过记录（见 acceptance.md）；执行时由 e2e.ps1 管理服务、fake LLM 与 fixture）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1 p7-continuing
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1 p7-issues-report
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1 p7-supplement
@@ -302,11 +302,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance.ps1
 P7 真实验收（gated，显式开启才产生费用/连接真实库）：
 
 ```powershell
-# 真实 LLM：补全/失败分析/问题整理/报告（gated；目标命令，T28 交付）
+# 真实 LLM：补全/失败分析/问题整理/报告（gated；已通过记录（见 acceptance.md））
 $env:EZTEST_RUN_REAL_LLM = "1"
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance-p7-llm.ps1
 
-# 真实 PostgreSQL 只读 DB 断言（gated；目标命令，T29 交付；先用 fixture-db.ps1 准备目标库/只读角色）
+# 真实 PostgreSQL 只读 DB 断言（gated；已通过记录（见 acceptance.md）；先用 fixture-db.ps1 准备目标库/只读角色）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/fixture-db.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/acceptance-p7-db.ps1
 ```
@@ -317,7 +317,7 @@ P7 证据与结果位置：
 - 报告 Markdown：`EZTEST_REPORT_DIR`（默认 `.data/reports`），DB 只存相对路径 + sha256 + 大小；导出响应带 `X-Content-SHA256`。
 - gated 真实验收结果写入 `.tmp/`（只含状态/ID/计数/错误码，不含 prompt、凭据、SQL 结果或证据正文）。
 
-P7 已知限制：`version_change` 表与 `code_changed` 变更项未实现（`/changes` 读时派生，P8）；证据 GC 与报告 stale 联动归 P8；自主 worker 单实例（leader 选举/分布式锁归 P8）；报告 PDF、问题外部工单、问题重开/合并、非 PostgreSQL 目标库归 P8/后续；全局问题/报告中心为只读列表，跨版本查询适配由 T17b 接线，挂载前该组不对外注册；`IssuesTab` 约 300 行未拆分（T18 评审记录 305 行，当前文件 300 行；可维护性余项）；`EZTEST_ANALYSIS_MAX_CASES`/`EZTEST_SUPPLEMENT_MAX_CASES` 为 P7 规格目标变量，当前构建仍以代码固定上限 20/5 执行，尚未读取这两个变量（P8 接线）；`EZTEST_AUTONOMY_BATCHES_PER_TICK` 未对 >20 的值做上限钳制；报告快照 `content.batch` 未暴露 `baseFallbackReason`/`history_rewritten`（仅批次 DTO `baseFallbackReason` 与增量计划 `warnings` 可见；D49 已知差异，归 T23/P8）。P7 运行手册中的 `scripts/e2e.ps1 p7-*`、`scripts/acceptance-p7-llm.ps1`、`scripts/acceptance-p7-db.ps1`、`scripts/fixture-db.ps1` 为目标命令，依赖 T25/T28/T29/T32 交付与实跑证据；当前 README 不宣称这些命令已通过。
+P7 已知限制：`version_change` 表与 `code_changed` 变更项未实现（`/changes` 读时派生，P8）；证据 GC 与报告 stale 联动归 P8；自主 worker 单实例（leader 选举/分布式锁归 P8）；报告 PDF、问题外部工单、问题重开/合并、非 PostgreSQL 目标库归 P8/后续；全局问题/报告中心为只读列表，跨版本查询适配由 T17b 接线，挂载前该组不对外注册；`IssuesTab` 约 300 行未拆分（T18 评审记录 305 行，当前文件 300 行；可维护性余项）；`EZTEST_ANALYSIS_MAX_CASES`/`EZTEST_SUPPLEMENT_MAX_CASES` 为 P7 规格目标变量，当前构建仍以代码固定上限 20/5 执行，尚未读取这两个变量（P8 接线）；`EZTEST_AUTONOMY_BATCHES_PER_TICK` 未对 >20 的值做上限钳制；报告快照 `content.batch` 未暴露 `baseFallbackReason`/`history_rewritten`（仅批次 DTO `baseFallbackReason` 与增量计划 `warnings` 可见；D49 已知差异，归 T23/P8）。P7 运行手册中的 `scripts/e2e.ps1 p7-*`、`scripts/acceptance-p7-llm.ps1`、`scripts/acceptance-p7-db.ps1`、`scripts/fixture-db.ps1` 已通过记录（见 acceptance.md），依赖 T25/T28/T29/T32 交付。
 
 ## 技术架构
 
@@ -665,7 +665,7 @@ P5 脚本可选配置：`EZTEST_ACCEPTANCE_API_URL`（复用已在运行的 API�
 - P4 代码智能：只做文件级 Git 与 AI 事实，无 parser/符号级调用链/字段级分析、无全仓 AI 分析、无全文检索；只分析变更文件且受 20 文件/64KiB/摘录行数/超时/队列(16)等上限约束；单实例进程内 worker，无取消、无跨进程恢复；仓库必须本地只读可见，不支持线上仓、分支切换或工作树修改；候选只有需求/应用模型（case/issue 归 P5/P6），版本锚点仅 API 可建；事实无人工修正/版本对比 UI；AI 失败降级为 T0 候选但可能产生 `analysis_queue_full`/`analysis_in_progress` 等 429/409；P4 不写 `audit_logs`（`code.read`/`code.analyze` 审计除外）。
 - P5 用例脑图：探索仅 HTTP GET/HEAD（无浏览器/JS 执行），依赖环境白名单，可能漏掉纯前端渲染页面；PNG 由前端画布生成，无服务端渲染；导出为 Markdown/Mermaid/OPML（不生成 XMind）；冻结后不可解冻，需求重开后的增量重校验、`affected.cases` 正式接入归 P6/P7（P7 已接入受影响用例/补全）；`impactCases` 只是 P4 候选映射的只读提示；单实例进程内 run worker（重启把 stale run 置 failed）；explore/data_plan 质量受真实 LLM 影响，脚本在非 `done` 时 fail-closed。
 - P6 执行：单进程调度（多实例分布式租约归 P8）；db 断言在 P6 阶段不支持（P7 已补只读 db 断言）；不做用例级自动重跑（应用失败仅手动 rerun）；证据无 GC/删除 API；执行器不可用时只能查看历史结果/证据/报告，禁止建批；真实 LLM 的分类/暂停结果受模型行为影响，脚本在不符合预期时 fail-closed。
-- P7 交付：`version_change` 表与 `code_changed` 变更项未实现（`/changes` 读时派生，P8）；证据 GC 与报告 stale 联动归 P8；自主 worker 单实例；报告 PDF、问题外部工单、问题重开/合并、跨批次语义去重增强、非 PostgreSQL 目标库归 P8/后续；全局问题/报告中心为只读列表（不做批量确认/导出），其跨版本查询适配由 T17b 接线，挂载前该组不注册、页面显示错误态；`IssuesTab` 约 300 行未拆分（T18 评审记录 305 行，当前文件 300 行；可维护性余项）；`EZTEST_ANALYSIS_MAX_CASES`/`EZTEST_SUPPLEMENT_MAX_CASES` 为 P7 规格目标变量，当前构建仍以代码固定上限 20/5 执行，尚未读取这两个变量（P8 接线）；`EZTEST_AUTONOMY_BATCHES_PER_TICK` 未对 >20 的值做上限钳制；报告快照 `content.batch` 未暴露 `baseFallbackReason`/`history_rewritten`（仅批次 DTO `baseFallbackReason` 与增量计划 `warnings` 可见；D49 已知差异，归 T23/P8）。P7 运行手册中的 `scripts/e2e.ps1 p7-*`、`scripts/acceptance-p7-llm.ps1`、`scripts/acceptance-p7-db.ps1`、`scripts/fixture-db.ps1` 为目标命令，依赖 T25/T28/T29/T32 交付与实跑证据；当前 README 不宣称这些命令已通过。
+- P7 交付：`version_change` 表与 `code_changed` 变更项未实现（`/changes` 读时派生，P8）；证据 GC 与报告 stale 联动归 P8；自主 worker 单实例；报告 PDF、问题外部工单、问题重开/合并、跨批次语义去重增强、非 PostgreSQL 目标库归 P8/后续；全局问题/报告中心为只读列表（不做批量确认/导出），其跨版本查询适配由 T17b 接线，挂载前该组不注册、页面显示错误态；`IssuesTab` 约 300 行未拆分（T18 评审记录 305 行，当前文件 300 行；可维护性余项）；`EZTEST_ANALYSIS_MAX_CASES`/`EZTEST_SUPPLEMENT_MAX_CASES` 为 P7 规格目标变量，当前构建仍以代码固定上限 20/5 执行，尚未读取这两个变量（P8 接线）；`EZTEST_AUTONOMY_BATCHES_PER_TICK` 未对 >20 的值做上限钳制；报告快照 `content.batch` 未暴露 `baseFallbackReason`/`history_rewritten`（仅批次 DTO `baseFallbackReason` 与增量计划 `warnings` 可见；D49 已知差异，归 T23/P8）。P7 运行手册中的 `scripts/e2e.ps1 p7-*`、`scripts/acceptance-p7-llm.ps1`、`scripts/acceptance-p7-db.ps1`、`scripts/fixture-db.ps1` 已通过记录（见 acceptance.md），依赖 T25/T28/T29/T32 交付。
 - P7 报告/问题只读引用环境/system/commit 与 `case_run`/证据，不内联 Session storageState/headers/凭据；DB 目标密码明文存储（D48）但任何 API/DTO/事件/审计/日志/证据/报告/prompt 都不回显。
 - 登录 token 存 `sessionStorage`：属于单管理员内网工具的 XSS 边界，未做 CSP/HttpOnly cookie 会话。
 - 无 TLS、反向代理、限流网关或多租户/RBAC；管理员角色是唯一权限分层。
