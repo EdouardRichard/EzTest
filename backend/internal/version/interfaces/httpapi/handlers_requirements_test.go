@@ -233,6 +233,48 @@ func TestRequirementRoutesCRUDAndCounts(t *testing.T) {
 	})
 }
 
+// TestRequirementListLimitContract pins the shared limit contract of spec §5.6
+// C6 at the requirements boundary: 100 is accepted, and a non-integer or an
+// out-of-range limit keeps the existing 400 invalid_limit mapping but carries
+// the distinct message and details{field,min,max}.
+func TestRequirementListLimitContract(t *testing.T) {
+	handler, deps := newTestServer(t)
+
+	recorder := doRequest(handler, http.MethodGet, "/api/versions/100/requirements?limit=100", testUserToken, "")
+	requireStatus(t, recorder, http.StatusOK)
+	if got := deps.requirements.lastListPage.Limit; got != platform.MaxLimit {
+		t.Fatalf("list limit=%d want %d", got, platform.MaxLimit)
+	}
+
+	for _, testCase := range []struct {
+		name    string
+		limit   string
+		message string
+	}{
+		{"non-integer", "ten", "limit must be an integer"},
+		{"too large", "200", "limit must be between 1 and 100"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			recorder := doRequest(handler, http.MethodGet,
+				"/api/versions/100/requirements?limit="+testCase.limit, testUserToken, "")
+			apiError := requireError(t, recorder, http.StatusBadRequest,
+				platform.CodeInvalidArgument, "invalid_limit")
+			if apiError.Message != testCase.message {
+				t.Fatalf("message=%q want %q", apiError.Message, testCase.message)
+			}
+			if got := apiError.Details["field"]; got != "limit" {
+				t.Fatalf("details.field=%v want limit", got)
+			}
+			if got := apiError.Details["min"]; got != float64(1) {
+				t.Fatalf("details.min=%v want 1", got)
+			}
+			if got := apiError.Details["max"]; got != float64(platform.MaxLimit) {
+				t.Fatalf("details.max=%v want %d", got, platform.MaxLimit)
+			}
+		})
+	}
+}
+
 // TestRequirementConfirmGate409 pins INV-3 at the HTTP boundary: a requirement
 // with open questions is a 409 open_questions_remaining, and the same call
 // succeeds once the questions are closed.

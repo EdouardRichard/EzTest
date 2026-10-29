@@ -232,14 +232,12 @@ func optionalDecimalID(field string, raw *string) (*int64, error) {
 	return &id, nil
 }
 
-// parseLimit parses the shared limit query parameter (1–100, default 20).
+// parseLimit parses the shared limit query parameter (1–100, default 20). A
+// rejected value keeps the delivery surface's existing 422 invalid_argument
+// mapping, but the returned *platform.LimitError carries the clarified message
+// and the shared details{field,min,max} (spec §5.6 C6).
 func parseLimit(r *http.Request) (int, error) {
-	limit, err := platform.ParseLimit(r.URL.Query().Get("limit"))
-	if err != nil {
-		return 0, domain.NewInvalid("limit", domain.ReasonInvalidArgument,
-			"limit must be an integer between 1 and 100")
-	}
-	return limit, nil
+	return platform.ParseLimit(r.URL.Query().Get("limit"))
 }
 
 // parseCursorID decodes the opaque cursor of an id-keyed list.
@@ -350,6 +348,19 @@ func isTerminalBatchStatus(status executiondomain.BatchStatus) bool {
 func writeDeliveryError(w http.ResponseWriter, r *http.Request, err error) {
 	if err == nil {
 		platform.WriteError(w, r, http.StatusInternalServerError, platform.CodeInternal, "internal server error")
+		return
+	}
+
+	// A rejected ?limit= is a request-level error. It keeps this surface's
+	// existing 422 invalid_argument mapping (unlike the version context's 400)
+	// while carrying the clarified message and details{field,min,max} of the
+	// shared limit contract (spec §5.6 C6).
+	var limitErr *platform.LimitError
+	if errors.As(err, &limitErr) && limitErr != nil {
+		details := limitErr.Details()
+		details["reason"] = domain.ReasonInvalidArgument
+		platform.WriteError(w, r, http.StatusUnprocessableEntity, platform.CodeInvalidArgument,
+			limitErr.Error(), platform.WithDetails(details))
 		return
 	}
 
