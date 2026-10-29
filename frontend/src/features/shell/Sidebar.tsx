@@ -7,12 +7,7 @@ import type { ReactNode } from "react"
 
 import { useAuth } from "@/features/auth/AuthProvider"
 import { cn } from "@/lib/utils"
-import { isActive, NAV_ITEMS, type NavItem } from "@/navigation/nav-items"
-
-/** Admin-only destinations (e.g. the quality centre) are hidden from normal users. */
-function isAdminOnly(item: NavItem): boolean {
-  return (item as NavItem & { adminOnly?: boolean }).adminOnly === true
-}
+import { isActive, visibleNavItems } from "@/navigation/nav-items"
 
 /** Brand row shared by the fixed desktop sidebar and the mobile drawer. */
 export function SidebarHeader({ action }: { action?: ReactNode }) {
@@ -58,7 +53,7 @@ export function SidebarNavigation({ mobile = false, onNavigate }: SidebarNavigat
   const pathname = usePathname()
   const { user } = useAuth()
   const admin = user?.role === "admin"
-  const items = NAV_ITEMS.filter((item) => !isAdminOnly(item) || admin)
+  const items = visibleNavItems(admin)
 
   return (
     <>

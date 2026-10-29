@@ -4,6 +4,7 @@ import {
   Boxes,
   Bug,
   FileBarChart2,
+  Gauge,
   GitBranch,
   Layers,
   LayoutDashboard,
@@ -17,6 +18,8 @@ export type NavItem = {
   icon: LucideIcon
   phase: string
   hint?: string
+  /** Admin-only destinations are filtered out for normal users. */
+  adminOnly?: boolean
 }
 
 // The nine blueprint navigation entries. All entries are live as of P8; the
@@ -55,8 +58,21 @@ export const NAV_ITEMS: NavItem[] = [
     phase: "P8",
     hint: "Agent 运行时控制台（P8 扩展为 Agent 中心）",
   },
+  {
+    label: "质量中心",
+    href: "/quality",
+    icon: Gauge,
+    phase: "P8",
+    hint: "评测指标、阈值与基线（仅管理员）",
+    adminOnly: true,
+  },
   { label: "设置", href: "/settings", icon: Settings, phase: "P8", hint: "账户与平台设置" },
 ]
+
+/** Filters the navigation for one viewer: admin-only entries are hidden. */
+export function visibleNavItems(isAdmin: boolean): NavItem[] {
+  return NAV_ITEMS.filter((item) => item.adminOnly !== true || isAdmin)
+}
 
 /** Reports whether href is the active route for pathname; hash anchors never match. */
 export function isActive(pathname: string, href: string): boolean {
