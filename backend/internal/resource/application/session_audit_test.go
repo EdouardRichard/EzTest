@@ -117,6 +117,101 @@ func TestSessionWritesAreAudited(t *testing.T) {
 	}
 }
 
+// TestSessionValidateAndTakeoverCompletionAreAudited covers the two remaining
+// Session lifecycle writes (spec §10.4): validate and complete-takeover each
+// record one entry naming the session/takeover and the resulting state. The
+// rotated token state and the takeover instructions/note sentinels must never
+// enter the audit log.
+func TestSessionValidateAndTakeoverCompletionAreAudited(t *testing.T) {
+	svc, f := newSessionServiceWithFakes(t)
+	f.checker.result = domain.LoginCheckResult{Observed: domain.ObservedAllowed, Status: 200}
+	actor := int64(7)
+
+	valid := f.seedSession(domain.Session{
+		State:     domain.StateValid,
+		ExpiresAt: timePtr(sessionTestNow.Add(time.Hour)),
+	})
+	validated, _, err := svc.Validate(context.Background(), valid.ID)
+	if err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+
+	needsManual := f.seedSession(domain.Session{
+		State:     domain.StateNeedsManual,
+		ExpiresAt: timePtr(sessionTestNow.Add(10 * time.Minute)),
+	})
+	takeover := f.seedTakeover(domain.Takeover{
+		SessionID:    &needsManual.ID,
+		Status:       domain.TakeoverStatusWaiting,
+		Instructions: json.RawMessage(`{"instructions":"SECRET-TAKEOVER-NOTE"}`),
+		ExpiresAt:    timePtr(sessionTestNow.Add(30 * time.Minute)),
+	})
+	completed, _, _, err := svc.CompleteTakeover(context.Background(), takeover.ID,
+		ReplaceSessionStateInput{
+			Kind:         domain.StorageStateKindToken,
+			StorageState: json.RawMessage(`{"headers":{"Authorization":"Bearer SECRET-ROTATED-TOKEN"}}`),
+		}, &actor)
+	if err != nil {
+		t.Fatalf("CompleteTakeover: %v", err)
+	}
+
+	if len(f.audit.events) != 2 {
+		t.Fatalf("audit events=%d want 2: %+v", len(f.audit.events), f.audit.events)
+	}
+	validatedEvent := f.audit.events[0]
+	if validatedEvent.Action != ActionSessionValidated {
+		t.Fatalf("action=%q want %q", validatedEvent.Action, ActionSessionValidated)
+	}
+	if validatedEvent.TargetType != AuditTargetSession ||
+		validatedEvent.TargetID != formatInt(validated.ID) {
+		t.Fatalf("validated target=%q/%q want session/%d",
+			validatedEvent.TargetType, validatedEvent.TargetID, valid.ID)
+	}
+	if validatedEvent.Metadata["state"] != validated.State {
+		t.Fatalf("validated metadata=%v want state=%s", validatedEvent.Metadata, validated.State)
+	}
+
+	completionEvent := f.audit.events[1]
+	if completionEvent.Action != ActionTakeoverCompleted {
+		t.Fatalf("action=%q want %q", completionEvent.Action, ActionTakeoverCompleted)
+	}
+	if completionEvent.TargetType != AuditTargetTakeover ||
+		completionEvent.TargetID != formatInt(completed.ID) {
+		t.Fatalf("completion target=%q/%q want takeover/%d",
+			completionEvent.TargetType, completionEvent.TargetID, completed.ID)
+	}
+	if completionEvent.Metadata["takeover_id"] != completed.ID ||
+		completionEvent.Metadata["session_id"] != needsManual.ID ||
+		completionEvent.Metadata["state"] != domain.TakeoverStatusCompleted {
+		t.Fatalf("completion metadata=%v", completionEvent.Metadata)
+	}
+	if completionEvent.ActorID != actor {
+		t.Fatalf("completion actor=%d want %d", completionEvent.ActorID, actor)
+	}
+
+	raw, err := json.Marshal(f.audit.events)
+	if err != nil {
+		t.Fatalf("marshal audit events: %v", err)
+	}
+	for _, secret := range []string{
+		"fixture-secret-cookie",
+		"fixture-token",
+		"Authorization",
+		"Bearer",
+		"storage_state",
+		"SECRET-TAKEOVER-NOTE",
+		"SECRET-ROTATED-TOKEN",
+		"confirmed by admin",
+	} {
+		if strings.Contains(string(raw), secret) {
+			t.Fatalf("audit events leak %q: %s", secret, raw)
+		}
+	}
+	if strings.Contains(string(raw), "localStorage") {
+		t.Fatalf("audit events leak storage state: %s", raw)
+	}
+}
+
 // timePtr returns a pointer to value.
 func timePtr(value time.Time) *time.Time { return &value }
 

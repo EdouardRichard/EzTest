@@ -8,7 +8,12 @@ import { Skeleton } from "@/components/ui/Skeleton"
 import { StatusBadge } from "@/components/ui/StatusBadge"
 import { apiGetPage } from "@/lib/api-client"
 
-import { buildAuditCSV, buildAuditMarkdown, downloadTextFile } from "./audit-export"
+import {
+  auditExportFilename,
+  buildAuditCSV,
+  buildAuditMarkdown,
+  downloadTextFile,
+} from "./audit-export"
 import {
   AUDIT_PAGE_SIZE,
   type AuditEntry,
@@ -137,10 +142,10 @@ export function AuditLogPage() {
   function handleExport(format: "csv" | "md") {
     if (entries.length === 0) return
     if (format === "csv") {
-      downloadTextFile("audit-log.csv", buildAuditCSV(entries), "text/csv")
+      downloadTextFile(auditExportFilename("csv"), buildAuditCSV(entries), "text/csv")
       return
     }
-    downloadTextFile("audit-log.md", buildAuditMarkdown(entries), "text/markdown")
+    downloadTextFile(auditExportFilename("md"), buildAuditMarkdown(entries), "text/markdown")
   }
 
   const showEmpty = !loading && error === null && entries.length === 0
@@ -189,6 +194,12 @@ export function AuditLogPage() {
           </button>
         </div>
       </header>
+
+      {hasMore ? (
+        <p className="text-xs text-muted-foreground">
+          导出仅包含已加载的 {entries.length} 条记录；还有更多记录未加载，请先加载更多。
+        </p>
+      ) : null}
 
       <form
         aria-label="审计筛选"

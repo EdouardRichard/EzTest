@@ -61,6 +61,15 @@ func (s *Sink) Record(ctx context.Context, event versionapp.VersionAuditEvent) e
 	if targetID == "" {
 		targetID = strconv.FormatInt(event.VersionID, 10)
 	}
+	// An aggregate write (e.g. a requirement) targets the aggregate id, so the
+	// owning version would otherwise be lost: it must stay traceable even after
+	// the aggregate row is deleted (spec §10.4). A caller-supplied version_id
+	// wins; a version-targeted entry already names the version in target_id.
+	if targetType != versionTargetType && event.VersionID > 0 {
+		if _, exists := metadata["version_id"]; !exists {
+			metadata["version_id"] = event.VersionID
+		}
+	}
 	entry := auditdomain.Entry{
 		Action:     event.Action,
 		TargetType: targetType,

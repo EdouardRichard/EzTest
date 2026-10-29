@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { buildAuditCSV, buildAuditMarkdown } from "./audit-export"
+import { auditExportFilename, buildAuditCSV, buildAuditMarkdown } from "./audit-export"
 import type { AuditEntry } from "./audit-types"
 
 const ENTRIES: AuditEntry[] = [
@@ -70,5 +70,11 @@ describe("audit export builders", () => {
     expect(buildAuditMarkdown([]).split("\n")[0]).toBe(
       "| ID | 时间 | 操作 | 操作者 | 目标 | 请求 ID |",
     )
+  })
+
+  it("builds a stable, timestamped export filename", () => {
+    const now = new Date("2026-10-27T04:05:06Z")
+    expect(auditExportFilename("csv", now)).toBe("audit-log-20261027040506.csv")
+    expect(auditExportFilename("md", now)).toBe("audit-log-20261027040506.md")
   })
 })

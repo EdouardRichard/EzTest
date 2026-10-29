@@ -3,6 +3,7 @@ package application_test
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -70,6 +71,7 @@ func TestRequirementWritesAreAudited(t *testing.T) {
 		"version.requirement_reopened",
 		"version.requirement_deleted",
 	}
+	wantTargetID := strconv.FormatInt(created.ID, 10)
 	if len(audit.events) != len(wantActions) {
 		t.Fatalf("audit events=%d want %d: %+v", len(audit.events), len(wantActions), audit.events)
 	}
@@ -78,14 +80,16 @@ func TestRequirementWritesAreAudited(t *testing.T) {
 		if event.Action != want {
 			t.Fatalf("events[%d].Action=%q want %q", i, event.Action, want)
 		}
+		// The version id must survive even after the delete: it is what lets the
+		// audit sink trace the entry back to its version (sink metadata.version_id).
 		if event.VersionID != version.ID {
 			t.Fatalf("%s version=%d want %d", want, event.VersionID, version.ID)
 		}
 		if event.ActorID != 42 {
 			t.Fatalf("%s actor=%d want 42", want, event.ActorID)
 		}
-		if event.TargetType != "requirement" || event.TargetID == "" {
-			t.Fatalf("%s target=%q/%q want requirement/<id>", want, event.TargetType, event.TargetID)
+		if event.TargetType != "requirement" || event.TargetID != wantTargetID {
+			t.Fatalf("%s target=%q/%q want requirement/%s", want, event.TargetType, event.TargetID, wantTargetID)
 		}
 	}
 

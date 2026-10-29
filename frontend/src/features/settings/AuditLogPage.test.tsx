@@ -157,4 +157,30 @@ describe("AuditLogPage", () => {
 
     click.mockRestore()
   })
+
+  it("marks the export as loaded records and uses the timestamped filename when more pages exist", async () => {
+    mocks.apiGetPage.mockResolvedValue(page([ENTRY], "cursor-1", true))
+    const createObjectURL = vi.fn().mockReturnValue("blob:audit")
+    const revokeObjectURL = vi.fn()
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectURL })
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: revokeObjectURL })
+    const downloads: string[] = []
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+      this: HTMLAnchorElement,
+    ) {
+      downloads.push(this.download)
+    })
+    render(<AuditLogPage />)
+
+    expect(await screen.findByText("version.requirement_created")).toBeTruthy()
+    // hasMore means the export cannot silently claim to be the complete log.
+    expect(screen.getByText(/导出仅包含已加载的 1 条记录/)).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "导出 CSV" }))
+    fireEvent.click(screen.getByRole("button", { name: "导出 Markdown" }))
+
+    expect(downloads).toHaveLength(2)
+    expect(downloads[0]).toMatch(/^audit-log-\d{14}\.csv$/)
+    expect(downloads[1]).toMatch(/^audit-log-\d{14}\.md$/)
+    click.mockRestore()
+  })
 })

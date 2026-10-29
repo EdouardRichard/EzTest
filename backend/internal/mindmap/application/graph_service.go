@@ -620,7 +620,6 @@ func (s *GraphService) AddStep(ctx context.Context, versionID, nodeID, actor int
 		if node.Kind != domain.NodeKindCase {
 			return invalidCaseTree("scenario %d must not own steps", nodeID)
 		}
-		eventNode = node
 		existing := sortedSteps(state.steps[nodeID])
 		if len(existing) >= domain.MaxStepsPerCase {
 			return invalidCaseTree("case %d already has %d steps", nodeID, len(existing))
@@ -665,9 +664,11 @@ func (s *GraphService) AddStep(ctx context.Context, versionID, nodeID, actor int
 		if err := tx.Steps().ReplaceSeq(ctx, nodeID, stepIDs(ordered)); err != nil {
 			return err
 		}
-		if _, err := tx.Nodes().Update(ctx, touchNode(node, actor, now), cmd.NodeRevision); err != nil {
+		updatedNode, err := tx.Nodes().Update(ctx, touchNode(node, actor, now), cmd.NodeRevision)
+		if err != nil {
 			return err
 		}
+		eventNode = updatedNode
 		stored.Seq = insertAt + 1
 		created = stored
 		return nil
@@ -727,7 +728,6 @@ func (s *GraphService) UpdateStep(ctx context.Context, versionID, stepID, actor 
 		if node.Kind != domain.NodeKindCase {
 			return invalidCaseTree("scenario %d must not own steps", node.ID)
 		}
-		eventNode = node
 		candidate := step
 		if cmd.Action != nil {
 			candidate.Action = *cmd.Action
@@ -746,9 +746,11 @@ func (s *GraphService) UpdateStep(ctx context.Context, versionID, stepID, actor 
 		if err := tx.Steps().Update(ctx, candidate); err != nil {
 			return err
 		}
-		if _, err := tx.Nodes().Update(ctx, touchNode(node, actor, now), cmd.NodeRevision); err != nil {
+		updatedNode, err := tx.Nodes().Update(ctx, touchNode(node, actor, now), cmd.NodeRevision)
+		if err != nil {
 			return err
 		}
+		eventNode = updatedNode
 		updated = candidate
 		return nil
 	})
@@ -823,10 +825,11 @@ func (s *GraphService) DeleteStep(ctx context.Context, versionID, stepID, actor 
 				return err
 			}
 		}
-		if _, err := tx.Nodes().Update(ctx, touchNode(node, actor, now), nodeRevision); err != nil {
+		updatedNode, err := tx.Nodes().Update(ctx, touchNode(node, actor, now), nodeRevision)
+		if err != nil {
 			return err
 		}
-		eventNode = node
+		eventNode = updatedNode
 		return nil
 	})
 	if err != nil {
@@ -863,7 +866,6 @@ func (s *GraphService) ReorderSteps(ctx context.Context, versionID, nodeID, acto
 		if node.Kind != domain.NodeKindCase {
 			return invalidCaseTree("scenario %d must not own steps", nodeID)
 		}
-		eventNode = node
 		byID := make(map[int64]domain.CaseStep, len(state.steps[nodeID]))
 		for _, step := range state.steps[nodeID] {
 			byID[step.ID] = step
@@ -894,9 +896,11 @@ func (s *GraphService) ReorderSteps(ctx context.Context, versionID, nodeID, acto
 				return err
 			}
 		}
-		if _, err := tx.Nodes().Update(ctx, touchNode(node, actor, now), cmd.NodeRevision); err != nil {
+		updatedNode, err := tx.Nodes().Update(ctx, touchNode(node, actor, now), cmd.NodeRevision)
+		if err != nil {
 			return err
 		}
+		eventNode = updatedNode
 		return nil
 	})
 	if err != nil {
@@ -937,7 +941,6 @@ func (s *GraphService) AddAssertion(ctx context.Context, versionID, nodeID, acto
 		if node.Kind != domain.NodeKindCase {
 			return invalidCaseTree("scenario %d must not own assertions", nodeID)
 		}
-		eventNode = node
 		if cmd.StepID != nil && !stepBelongsTo(state.steps[nodeID], *cmd.StepID) {
 			return invalidCaseTree("assertion references step %d of another case", *cmd.StepID)
 		}
@@ -965,9 +968,11 @@ func (s *GraphService) AddAssertion(ctx context.Context, versionID, nodeID, acto
 		if err != nil {
 			return err
 		}
-		if _, err := tx.Nodes().Update(ctx, touchNode(node, actor, now), cmd.NodeRevision); err != nil {
+		updatedNode, err := tx.Nodes().Update(ctx, touchNode(node, actor, now), cmd.NodeRevision)
+		if err != nil {
 			return err
 		}
+		eventNode = updatedNode
 		created = stored
 		return nil
 	})
@@ -1027,7 +1032,6 @@ func (s *GraphService) UpdateAssertion(ctx context.Context, versionID, assertion
 		if node.Kind != domain.NodeKindCase {
 			return invalidCaseTree("scenario %d must not own assertions", node.ID)
 		}
-		eventNode = node
 		candidate := assertion
 		if cmd.ClearStep {
 			candidate.StepID = nil
@@ -1057,9 +1061,11 @@ func (s *GraphService) UpdateAssertion(ctx context.Context, versionID, assertion
 		if err := tx.Assertions().Update(ctx, candidate); err != nil {
 			return err
 		}
-		if _, err := tx.Nodes().Update(ctx, touchNode(node, actor, now), cmd.NodeRevision); err != nil {
+		updatedNode, err := tx.Nodes().Update(ctx, touchNode(node, actor, now), cmd.NodeRevision)
+		if err != nil {
 			return err
 		}
+		eventNode = updatedNode
 		updated = candidate
 		return nil
 	})
@@ -1114,10 +1120,11 @@ func (s *GraphService) DeleteAssertion(ctx context.Context, versionID, assertion
 		if err := tx.Assertions().Delete(ctx, node.ID, assertion.ID); err != nil {
 			return err
 		}
-		if _, err := tx.Nodes().Update(ctx, touchNode(node, actor, now), nodeRevision); err != nil {
+		updatedNode, err := tx.Nodes().Update(ctx, touchNode(node, actor, now), nodeRevision)
+		if err != nil {
 			return err
 		}
-		eventNode = node
+		eventNode = updatedNode
 		return nil
 	})
 	if err != nil {
@@ -1198,7 +1205,6 @@ func (s *GraphService) AddSource(ctx context.Context, versionID, nodeID, actor i
 			return domain.NewConflict("duplicate_case_source",
 				fmt.Sprintf("node %d already has this %s source", nodeID, cmd.RefKind))
 		}
-		eventNode = node
 		id, err := s.nextID()
 		if err != nil {
 			return err
@@ -1226,9 +1232,11 @@ func (s *GraphService) AddSource(ctx context.Context, versionID, nodeID, actor i
 		// Bump the node revision in the same transaction so a concurrent source
 		// write that read the old revision loses its CAS instead of silently
 		// committing against a changed source set.
-		if _, err := tx.Nodes().Update(ctx, touchNode(node, actor, now), node.Revision); err != nil {
+		updatedNode, err := tx.Nodes().Update(ctx, touchNode(node, actor, now), node.Revision)
+		if err != nil {
 			return err
 		}
+		eventNode = updatedNode
 		created = stored
 		return nil
 	})
@@ -1294,10 +1302,11 @@ func (s *GraphService) DeleteSource(ctx context.Context, versionID, sourceID, ac
 		// Bump the node revision in the same transaction: two overlapping source
 		// deletes read the same revision, so the second loses the CAS instead of
 		// also deleting a row and zeroing the requirement coverage.
-		if _, err := tx.Nodes().Update(ctx, touchNode(node, actor, now), node.Revision); err != nil {
+		updatedNode, err := tx.Nodes().Update(ctx, touchNode(node, actor, now), node.Revision)
+		if err != nil {
 			return err
 		}
-		eventNode = node
+		eventNode = updatedNode
 		return nil
 	})
 	if err != nil {
