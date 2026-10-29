@@ -103,6 +103,11 @@ test.describe("agent console", () => {
 
     await login(page, ADMIN_USERNAME, adminPassword)
     await page.goto("/agents")
+    await expect(page.getByRole("heading", { name: "Agent 中心" })).toBeVisible({
+      timeout: 30_000,
+    })
+    // The P1 console now lives in the admin "配置与控制台" tab of the centre.
+    await page.getByRole("tab", { name: "配置与控制台" }).click()
     await expect(page.getByRole("heading", { name: "Agent 运行时控制台" })).toBeVisible({
       timeout: 30_000,
     })
@@ -202,6 +207,10 @@ test.describe("agent console", () => {
     // run) and their thinking, file.read and usage activities must come back
     // from the event snapshot.
     await page.reload()
+    // The ?session= deep link re-opens the console tab on a fresh load.
+    await expect(page.getByRole("heading", { name: "Agent 中心" })).toBeVisible({
+      timeout: 30_000,
+    })
     await expect(page.getByRole("heading", { name: "Agent 运行时控制台" })).toBeVisible({
       timeout: 30_000,
     })
@@ -229,13 +238,17 @@ test.describe("agent console", () => {
 
     await login(page, ADMIN_USERNAME, adminPassword)
     await page.goto("/agents")
+    await expect(page.getByRole("heading", { name: "Agent 中心" })).toBeVisible({
+      timeout: 30_000,
+    })
+    await page.getByRole("tab", { name: "配置与控制台" }).click()
     await expect(page.getByRole("heading", { name: "Agent 运行时控制台" })).toBeVisible({
       timeout: 30_000,
     })
 
     // The fake ECHO_SYSTEM behavior echoes only the first 80 characters of the
     // system prompt, so the marker must be inserted at the very start.
-    await page.getByRole("tab", { name: "配置" }).click()
+    await page.getByRole("tab", { name: "配置", exact: true }).click()
     const prompt = page.getByLabel("系统提示词")
     await expect(prompt).toBeVisible()
     const originalPrompt = await prompt.inputValue()
@@ -244,14 +257,14 @@ test.describe("agent console", () => {
     await page.getByRole("button", { name: "保存配置" }).click()
     await expect(page.getByRole("status").filter({ hasText: "下次运行生效" })).toBeVisible()
 
-    await page.getByRole("tab", { name: "会话" }).click()
+    await page.getByRole("tab", { name: "会话", exact: true }).click()
     const pane = await startSession(page)
     await sendMessage(pane, "ECHO_SYSTEM")
     await expect(pane.getByText(`system=${marker}`)).toBeVisible({ timeout: 30_000 })
     await expect(pane.getByText("已完成", { exact: true })).toBeVisible()
   })
 
-  test("regular user sees the admin-only state and gets 403", async ({ page, request }) => {
+  test("regular user sees the read-only state and gets 403", async ({ page, request }) => {
     const adminPassword = requireAdminPassword()
     const username = `qa_agent_${Date.now().toString(36)}`
 
@@ -272,9 +285,10 @@ test.describe("agent console", () => {
 
     await login(page, username, USER_PASSWORD)
     await page.goto("/agents")
-    await expect(page.getByRole("heading", { name: "仅管理员可用" })).toBeVisible({
-      timeout: 30_000,
-    })
+    // A regular user gets the read-only centre: no console tab, no session controls.
+    await expect(page.getByTestId("agent-center-page")).toBeVisible({ timeout: 30_000 })
+    await expect(page.getByTestId("readonly-banner")).toBeVisible()
+    await expect(page.getByRole("tab", { name: "配置与控制台" })).toHaveCount(0)
     await expect(page.getByRole("button", { name: "新建会话" })).toHaveCount(0)
     await expect(page.getByLabel("发送消息")).toHaveCount(0)
 

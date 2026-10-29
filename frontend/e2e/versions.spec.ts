@@ -210,7 +210,9 @@ test("creates a bound version, relations, confirmation, design entry, reload and
   await page.getByRole("button", { name: "新增关系" }).click()
   const relationList = page.getByRole("list", { name: "关系列表" })
   await expect(relationList.getByText(`${REQ_A} → ${REQ_B}`)).toBeVisible()
-  await expect(page.getByRole("img", { name: "需求关系图：3 个需求节点，1 条关系" })).toBeVisible()
+  await expect(
+    page.getByRole("group", { name: "需求关系图：3 个需求节点，1 条关系" }),
+  ).toBeVisible()
   await expect(page.locator('[data-testid^="relation-edge-"]')).toHaveCount(1)
 
   // 5. Confirm one requirement (no open questions -> the gate is satisfied).
@@ -247,7 +249,9 @@ test("creates a bound version, relations, confirmation, design entry, reload and
   await expect(page.getByText("未澄清需求 2", { exact: true })).toBeVisible()
   await expect(page.getByText("待澄清问题 0", { exact: true }).first()).toBeVisible()
   await expect(page.getByRole("list", { name: "需求条目" }).getByRole("button")).toHaveCount(3)
-  await expect(page.getByRole("img", { name: "需求关系图：3 个需求节点，1 条关系" })).toBeVisible()
+  await expect(
+    page.getByRole("group", { name: "需求关系图：3 个需求节点，1 条关系" }),
+  ).toBeVisible()
   await expect(requirementButton(page, REQ_B)).toContainText("已澄清")
 
   // 8. Tab switching, deep links and placeholders.
