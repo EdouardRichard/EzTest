@@ -111,6 +111,13 @@ export type WorkbenchProps = {
    */
   openCreateToken?: number
   onOpenCreateIntentConsumed?: () => void
+  /**
+   * Selected requirement of the `?tab=requirements&requirement=` search deep
+   * link. It is applied to the first loaded requirement page; an unknown id
+   * keeps the editor empty and reports the missing requirement instead of
+   * silently selecting another one.
+   */
+  initialRequirementId?: string
 }
 
 /**
@@ -127,6 +134,7 @@ export function Workbench({
   onChanged,
   openCreateToken,
   onOpenCreateIntentConsumed,
+  initialRequirementId,
 }: WorkbenchProps) {
   const [requirements, setRequirements] = useState<Requirement[]>([])
   const [loading, setLoading] = useState(true)
@@ -135,6 +143,8 @@ export function Workbench({
   const [nextCursor, setNextCursor] = useState("")
   const [loadingMore, setLoadingMore] = useState(false)
   const [selectedId, setSelectedId] = useState<string | null>(null)
+  /** Unknown `?requirement=` id: reported once instead of selecting another row. */
+  const [missingRequirementId, setMissingRequirementId] = useState("")
   const [creating, setCreating] = useState(false)
 
   const [relations, setRelations] = useState<RequirementRelation[]>([])
@@ -161,6 +171,8 @@ export function Workbench({
   const clarificationRequestRef = useRef(0)
   /** Highest stream seq already inspected for a clarification panel refresh. */
   const streamEventSeqRef = useRef<number | null>(null)
+  /** Pending `?requirement=` deep link, consumed by the first requirement page. */
+  const initialRequirementRef = useRef((initialRequirementId ?? "").trim())
 
   const stream = useVersionStream(version.id)
 
@@ -185,12 +197,26 @@ export function Workbench({
         setNextCursor(page.nextCursor)
         setHasMore(page.hasMore && page.nextCursor !== "")
         if (!append) {
-          setSelectedId((previous) => {
-            if (previous !== null && page.items.some((item) => item.id === previous)) {
-              return previous
+          // The search deep link wins over the list's default first selection,
+          // but only once: later stream reloads keep the user's own selection.
+          const deepLinkId = initialRequirementRef.current
+          initialRequirementRef.current = ""
+          if (deepLinkId !== "") {
+            if (page.items.some((item) => item.id === deepLinkId)) {
+              setSelectedId(deepLinkId)
+              setMissingRequirementId("")
+            } else {
+              setSelectedId(null)
+              setMissingRequirementId(deepLinkId)
             }
-            return page.items[0]?.id ?? null
-          })
+          } else {
+            setSelectedId((previous) => {
+              if (previous !== null && page.items.some((item) => item.id === previous)) {
+                return previous
+              }
+              return page.items[0]?.id ?? null
+            })
+          }
         }
       } catch (caught) {
         if (requirementsRequestRef.current === requestId) {
@@ -241,6 +267,7 @@ export function Workbench({
   useEffect(() => {
     setRequirements([])
     setSelectedId(null)
+    setMissingRequirementId("")
     setCreating(false)
     setRelations([])
     setClarification(null)
@@ -339,6 +366,7 @@ export function Workbench({
 
   function handleCreated(created: Requirement): void {
     setCreating(false)
+    setMissingRequirementId("")
     setSelectedId(created.id)
     setRequirements((previous) => {
       if (previous.some((item) => item.id === created.id)) {
@@ -484,16 +512,28 @@ export function Workbench({
         </button>
       </div>
 
+      {missingRequirementId === "" ? null : (
+        <p
+          role="status"
+          data-testid="requirement-deep-link-missing"
+          className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
+        >
+          未找到需求 {missingRequirementId}，可能已被删除或不属于当前版本。请从左侧列表重新选择。
+        </p>
+      )}
+
       <div className="grid gap-4 lg:grid-cols-[minmax(0,20rem)_minmax(0,1fr)]">
         <RequirementList
           requirements={requirements}
           selectedId={selectedId}
           onSelect={(requirementId) => {
             setSelectedId(requirementId)
+            setMissingRequirementId("")
             setCreating(false)
           }}
           onCreate={() => {
             setCreating(true)
+            setMissingRequirementId("")
             setRelationError("")
           }}
           creating={creating}
@@ -527,6 +567,7 @@ export function Workbench({
           error={relationsError}
           onSelect={(requirementId) => {
             setSelectedId(requirementId)
+            setMissingRequirementId("")
             setCreating(false)
           }}
         />

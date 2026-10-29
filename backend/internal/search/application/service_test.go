@@ -1,10 +1,13 @@
 package application_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -242,6 +245,52 @@ func TestSearchClampsLimitAtServiceBoundary(t *testing.T) {
 	}
 }
 
+// discardLogger keeps the test output clean for cases that intentionally make a
+// provider fail: the service logs every failure even when the caller only sees a
+// degraded snapshot.
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// TestSearchLogsProviderFailure proves a failed provider is recorded server-side
+// exactly once, while the returned snapshot stays free of the provider error.
+func TestSearchLogsProviderFailure(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	mindmap := &fakeProvider{err: errors.New("case database unavailable")}
+	delivery := &fakeProvider{groups: []search.Group{searchGroup(search.TypeIssue, 1)}}
+	service := search.NewService(search.Providers{Mindmap: mindmap, Delivery: delivery},
+		search.WithLogger(logger))
+
+	snapshot, err := service.Search(context.Background(), search.Query{
+		Text: "登录", Types: []string{search.TypeCase, search.TypeIssue},
+	})
+	if err != nil {
+		t.Fatalf("Search: %v, want a degraded snapshot instead of an error", err)
+	}
+	if !snapshot.Degraded {
+		t.Fatal("degraded = false, want true after a provider failure")
+	}
+	output := logs.String()
+	for _, needle := range []string{
+		"search provider failed", "provider=mindmap", "case database unavailable",
+	} {
+		if !strings.Contains(output, needle) {
+			t.Fatalf("log %q does not contain %q", output, needle)
+		}
+	}
+	if calls := strings.Count(output, "search provider failed"); calls != 1 {
+		t.Fatalf("provider failure logged %d times, want 1: %q", calls, output)
+	}
+	payload, marshalErr := json.Marshal(snapshot)
+	if marshalErr != nil {
+		t.Fatalf("marshal: %v", marshalErr)
+	}
+	if strings.Contains(string(payload), "case database unavailable") {
+		t.Fatalf("provider error leaked into the snapshot: %s", payload)
+	}
+}
+
 // TestSearchDegradesOnProviderError proves spec §6.2's partial-failure rule: one
 // failing provider does not fail the whole request; the remaining groups are
 // returned and the response is marked degraded.
@@ -254,7 +303,7 @@ func TestSearchDegradesOnProviderError(t *testing.T) {
 	delivery := &fakeProvider{groups: []search.Group{searchGroup(search.TypeIssue, 1)}}
 	service := search.NewService(search.Providers{
 		Version: version, Mindmap: mindmap, Delivery: delivery,
-	})
+	}, search.WithLogger(discardLogger()))
 
 	snapshot, err := service.Search(context.Background(), search.Query{Text: "登录"})
 	if err != nil {

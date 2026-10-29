@@ -1,6 +1,7 @@
 package httpapi_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,17 @@ import (
 	searchhttp "github.com/EdouardRichard/EzTest/backend/internal/search/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/server"
 )
+
+// fakeProvider is the per-context provider used by the degraded-search
+// integration test; it serves canned groups or a canned failure.
+type fakeProvider struct {
+	groups []search.Group
+	err    error
+}
+
+func (f fakeProvider) Search(_ context.Context, _ string, _ int) ([]search.Group, error) {
+	return f.groups, f.err
+}
 
 // fakeSearcher records every forwarded query and serves a canned snapshot.
 type fakeSearcher struct {
@@ -51,7 +63,7 @@ func (tokenAuth) Logout(context.Context, string) error { return nil }
 
 // newServer mounts the search handler behind the real bearer middleware, exactly
 // like server.New does for /api routes.
-func newServer(t *testing.T, searcher *fakeSearcher) http.Handler {
+func newServer(t *testing.T, searcher searchhttp.Searcher) http.Handler {
 	t.Helper()
 	mux := http.NewServeMux()
 	handlers := searchhttp.NewHandlers(searcher)
@@ -201,6 +213,9 @@ func TestSearchRejectsInvalidQuery(t *testing.T) {
 		{"/api/search?q=x&limit=21", "limit"},
 		{"/api/search?q=x&limit=abc", "limit"},
 		{"/api/search?q=x&types=bogus", "types"},
+		{"/api/search?q=x&types=", "types"},
+		{"/api/search?q=x&types=,,", "types"},
+		{"/api/search?q=x&types=%20", "types"},
 	}
 	for _, tc := range cases {
 		searcher := &fakeSearcher{}
@@ -243,6 +258,40 @@ func TestSearchServiceErrorIsInternal(t *testing.T) {
 	}
 	if strings.Contains(recorder.Body.String(), "secret database outage detail") {
 		t.Fatalf("body leaked the service error: %s", recorder.Body)
+	}
+}
+
+// TestSearchProviderFailureIsLoggedButNotLeaked proves a degraded search still
+// answers 200 with the healthy groups, records the provider cause server-side,
+// and never exposes that cause to the client (spec §6.2).
+func TestSearchProviderFailureIsLoggedButNotLeaked(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	service := search.NewService(search.Providers{
+		Version: fakeProvider{groups: []search.Group{{
+			Type: search.TypeVersion,
+			Items: []search.Item{{
+				ID: "11", Title: "登录版本", VersionID: "11", VersionName: "登录版本",
+				URL: "/versions/11?tab=overview",
+			}},
+		}}},
+		Mindmap:  fakeProvider{err: errors.New("case database connection refused")},
+		Delivery: fakeProvider{groups: []search.Group{}},
+	}, search.WithLogger(logger))
+
+	recorder := doGet(t, newServer(t, service), "/api/search?q=%E7%99%BB%E5%BD%95", "ezt_user")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s, want a degraded 200", recorder.Code, recorder.Body)
+	}
+	body := recorder.Body.String()
+	if strings.Contains(body, "case database connection refused") {
+		t.Fatalf("body leaked the provider error: %s", body)
+	}
+	if !strings.Contains(body, `"degraded":true`) {
+		t.Fatalf("body = %s, want degraded:true", body)
+	}
+	if !strings.Contains(logs.String(), "case database connection refused") {
+		t.Fatalf("server log %q does not record the provider error", logs.String())
 	}
 }
 

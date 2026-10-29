@@ -253,8 +253,14 @@ function page(items: Requirement[], nextCursor = "", hasMore = false) {
   return { items, nextCursor, hasMore }
 }
 
-function renderWorkbench(onChanged: () => void = vi.fn()) {
-  return render(<Workbench version={VERSION} onChanged={onChanged} />)
+function renderWorkbench(onChanged: () => void = vi.fn(), initialRequirementId?: string) {
+  return render(
+    <Workbench
+      version={VERSION}
+      onChanged={onChanged}
+      initialRequirementId={initialRequirementId}
+    />,
+  )
 }
 
 describe("Workbench", () => {
@@ -306,6 +312,31 @@ describe("Workbench", () => {
     expect(screen.getByText("共 1 条关系")).toBeTruthy()
     expect(screen.getByText("依赖（有向，箭头指向被依赖需求）")).toBeTruthy()
     expect(screen.getByRole("button", { name: "保存绑定" })).toBeTruthy()
+  })
+
+  it("selects the requirement of the ?requirement= deep link from the first page", async () => {
+    const deepLinked = requirement({ id: REQ_C, title: "退款审核" })
+    mocks.listRequirements.mockResolvedValue(page([DRAFT, deepLinked]))
+
+    renderWorkbench(vi.fn(), REQ_C)
+
+    await waitFor(() =>
+      expect((screen.getByLabelText("标题") as HTMLInputElement).value).toBe("退款审核"),
+    )
+    expect(mocks.listAttachments).toHaveBeenCalledWith(VERSION_ID, REQ_C)
+    expect(screen.queryByTestId("requirement-deep-link-missing")).toBeNull()
+  })
+
+  it("keeps an empty selection and reports an unknown ?requirement= id", async () => {
+    mocks.listRequirements.mockResolvedValue(page([DRAFT, CLARIFIED]))
+
+    renderWorkbench(vi.fn(), REQ_C)
+
+    const missing = await screen.findByTestId("requirement-deep-link-missing")
+    expect(missing.textContent).toContain(REQ_C)
+    expect(screen.getByText("未选择需求")).toBeTruthy()
+    // The workbench still renders the loaded list instead of failing the tab.
+    expect(screen.getByRole("region", { name: "需求列表" })).toBeTruthy()
   })
 
   it("creates, edits and confirms a requirement while refreshing version counts", async () => {

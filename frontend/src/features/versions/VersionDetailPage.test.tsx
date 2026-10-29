@@ -25,6 +25,7 @@ const mocks = vi.hoisted(() => ({
   enterDesign: vi.fn(),
   listRequirements: vi.fn(),
   listRelations: vi.fn(),
+  listAttachments: vi.fn(),
   getClarification: vi.fn(),
   listClarificationMessages: vi.fn(),
   sendClarificationMessage: vi.fn(),
@@ -70,6 +71,7 @@ vi.mock("./api", () => ({
   getIncrementalPlan: mocks.getIncrementalPlan,
   listRequirements: mocks.listRequirements,
   listRelations: mocks.listRelations,
+  listAttachments: mocks.listAttachments,
   getClarification: mocks.getClarification,
   listClarificationMessages: mocks.listClarificationMessages,
   sendClarificationMessage: mocks.sendClarificationMessage,
@@ -556,6 +558,7 @@ describe("VersionDetailPage", () => {
     // assertions deterministic.
     mocks.listRequirements.mockResolvedValue({ items: [], nextCursor: "", hasMore: false })
     mocks.listRelations.mockResolvedValue([])
+    mocks.listAttachments.mockResolvedValue([])
     mocks.getClarification.mockResolvedValue({
       session: null,
       questions: { open: 0, answered: 0, dismissed: 0 },
@@ -1349,6 +1352,77 @@ describe("VersionDetailPage", () => {
     expect(await screen.findByRole("heading", { name: "新增需求" })).toBeTruthy()
     expect(screen.getByRole("button", { name: "创建需求" })).toBeTruthy()
     expect(screen.queryByRole("heading", { name: "编辑需求" })).toBeNull()
+  })
+
+  it("selects the requirement of ?tab=requirements&requirement=", async () => {
+    const first: Requirement = {
+      ...CREATED_REQUIREMENT,
+      id: "1844674407370956008",
+      title: "订单创建",
+    }
+    const deepLinked: Requirement = { ...CREATED_REQUIREMENT, title: "退款审核" }
+    mocks.listRequirements.mockResolvedValue({
+      items: [first, deepLinked],
+      nextCursor: "",
+      hasMore: false,
+    })
+    window.history.replaceState(
+      null,
+      "",
+      `/versions/${VERSION_ID}?tab=requirements&requirement=${deepLinked.id}`,
+    )
+
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+
+    await waitFor(() =>
+      expect((screen.getByLabelText("标题") as HTMLInputElement).value).toBe("退款审核"),
+    )
+    expect(screen.getByRole("tab", { name: "需求与澄清" }).getAttribute("aria-selected")).toBe(
+      "true",
+    )
+  })
+
+  it("does not crash on an unknown ?requirement= deep link", async () => {
+    mocks.listRequirements.mockResolvedValue({
+      items: [CREATED_REQUIREMENT],
+      nextCursor: "",
+      hasMore: false,
+    })
+    window.history.replaceState(
+      null,
+      "",
+      `/versions/${VERSION_ID}?tab=requirements&requirement=1844674407370956999`,
+    )
+
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+
+    expect(await screen.findByTestId("requirement-deep-link-missing")).toBeTruthy()
+    expect(screen.getByText("未选择需求")).toBeTruthy()
+    expect(screen.getByRole("tab", { name: "需求与澄清" }).getAttribute("aria-selected")).toBe(
+      "true",
+    )
+  })
+
+  it("keeps ?req= as the exploration requirement filter", async () => {
+    window.history.replaceState(
+      null,
+      "",
+      `/versions/${VERSION_ID}?tab=exploration&req=1844674407370956001`,
+    )
+
+    render(<VersionDetailPage versionId={VERSION_ID} />)
+    await screen.findByRole("heading", { level: 1, name: /订单系统 2.0/ })
+
+    await waitFor(() =>
+      expect(mocks.explorationProps).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          initialFilters: expect.objectContaining({ requirementId: "1844674407370956001" }),
+        }),
+      ),
+    )
+    expect(screen.getByRole("tab", { name: "探索链路" }).getAttribute("aria-selected")).toBe("true")
   })
 
   it("opens the issues deep link when exploration navigates to an issue", async () => {

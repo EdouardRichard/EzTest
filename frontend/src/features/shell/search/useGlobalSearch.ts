@@ -242,6 +242,9 @@ export function useGlobalSearch(
     abortRef.current = null
     setLoading(true)
     setError("")
+    // Drop the previous query's hits while the new one loads: keeping them on
+    // screen lets a fast Enter open a stale deep link.
+    setSnapshot(EMPTY_SEARCH_SNAPSHOT)
 
     const timer = window.setTimeout(() => {
       const controller = new AbortController()

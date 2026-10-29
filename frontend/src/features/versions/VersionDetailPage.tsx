@@ -91,6 +91,16 @@ function readDeepLinkParam(name: "issue" | "report" | "case"): string {
   return new URLSearchParams(window.location.search).get(name) ?? ""
 }
 
+/**
+ * Reads the `?requirement=` deep link emitted by global search (P8 §6.2). It
+ * selects that requirement in the requirements workbench; `?req=` remains the
+ * separate exploration filter of the execution tabs.
+ */
+function readRequirementParam(): string {
+  if (typeof window === "undefined") return ""
+  return new URLSearchParams(window.location.search).get("requirement") ?? ""
+}
+
 /** Writes one query parameter with replaceState, removing it for an empty value. */
 function writeQueryParam(name: string, value: string): void {
   if (typeof window === "undefined") return
@@ -121,6 +131,8 @@ type RequirementsWorkbenchSlotProps = {
   /** Header 新增需求 intent: non-zero opens the create editor in the workbench. */
   openCreateToken: number
   onOpenCreateIntentConsumed: () => void
+  /** Requirement selected by the global-search `?requirement=` deep link. */
+  initialRequirementId: string
 }
 
 /**
@@ -133,6 +145,7 @@ function RequirementsWorkbenchSlot({
   onChanged,
   openCreateToken,
   onOpenCreateIntentConsumed,
+  initialRequirementId,
 }: RequirementsWorkbenchSlotProps) {
   return (
     <Workbench
@@ -140,6 +153,7 @@ function RequirementsWorkbenchSlot({
       onChanged={onChanged}
       openCreateToken={openCreateToken}
       onOpenCreateIntentConsumed={onOpenCreateIntentConsumed}
+      initialRequirementId={initialRequirementId}
     />
   )
 }
@@ -169,6 +183,8 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
   const [reportId, setReportId] = useState("")
   /** Selected mindmap node of the `?case=` deep link (P8 §7.1). */
   const [caseId, setCaseId] = useState("")
+  /** Requirement of the global-search `?requirement=` deep link (P8 §6.2). */
+  const [requirementId, setRequirementId] = useState("")
   const [createToken, setCreateToken] = useState(0)
   const [takeover, setTakeover] = useState<PendingTakeover | null>(null)
   const [selectedBatchId, setSelectedBatchId] = useState("")
@@ -237,6 +253,7 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
     setIssueId(readDeepLinkParam("issue"))
     setReportId(readDeepLinkParam("report"))
     setCaseId(readDeepLinkParam("case"))
+    setRequirementId(readRequirementParam())
     setExplorationFilters(readExplorationFilters())
     setExplorationNodeId(readExplorationNodeParam())
     setSelectedBatchId(readBatchParam())
@@ -443,6 +460,7 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
             onChanged={refresh}
             openCreateToken={createToken}
             onOpenCreateIntentConsumed={() => setCreateToken(0)}
+            initialRequirementId={requirementId}
           />
         }
         mindmap={

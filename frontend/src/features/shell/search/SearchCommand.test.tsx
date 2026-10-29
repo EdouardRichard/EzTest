@@ -225,6 +225,64 @@ describe("SearchCommand", () => {
     expect(screen.getAllByText("登录版本").length).toBeGreaterThan(0)
   })
 
+  it("clears the previous results as soon as a new query starts loading", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ data: SNAPSHOT }))
+      .mockImplementationOnce(() => new Promise<Response>(() => {}))
+    vi.stubGlobal("fetch", fetchMock)
+    render(<SearchCommand />)
+    const input = openCommand()
+    await typeQuery(input, "登录")
+    expect(screen.getAllByTestId("search-result-item")).toHaveLength(5)
+
+    fireEvent.change(input, { target: { value: "登录2" } })
+
+    // During the debounce/loading window the previous query's hits must not be
+    // shown (nor openable), otherwise a fast Enter opens the wrong deep link.
+    expect(screen.queryAllByTestId("search-result-item")).toHaveLength(0)
+    expect(screen.getByText("正在搜索…")).not.toBeNull()
+  })
+
+  it("does not open the previous result when Enter is pressed while a new query loads", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ data: SNAPSHOT }))
+      .mockImplementationOnce(() => new Promise<Response>(() => {}))
+    vi.stubGlobal("fetch", fetchMock)
+    render(<SearchCommand />)
+    const input = openCommand()
+    await typeQuery(input, "登录")
+    expect(screen.getAllByTestId("search-result-item")).toHaveLength(5)
+
+    fireEvent.change(input, { target: { value: "登录2" } })
+    fireEvent.keyDown(input, { key: "Enter" })
+
+    expect(nav.push).not.toHaveBeenCalled()
+    expect(screen.getByRole("dialog", { name: "全局搜索" })).not.toBeNull()
+  })
+
+  it("shows the degraded hint when only part of the result set is available", async () => {
+    vi.stubGlobal("fetch", okFetch({ data: { ...SNAPSHOT, degraded: true } }))
+    render(<SearchCommand />)
+    const input = openCommand()
+    await typeQuery(input, "登录")
+
+    expect(screen.getByTestId("search-degraded").textContent).toContain("部分结果暂时不可用")
+  })
+
+  it("opens the palette with the / shortcut outside a text field", () => {
+    vi.stubGlobal("fetch", okFetch())
+    render(<SearchCommand />)
+
+    expect(screen.queryByRole("dialog", { name: "全局搜索" })).toBeNull()
+    fireEvent.keyDown(document, { key: "/" })
+    expect(screen.getByRole("dialog", { name: "全局搜索" })).not.toBeNull()
+
+    fireEvent.keyDown(document, { key: "Escape" })
+    expect(screen.queryByRole("dialog", { name: "全局搜索" })).toBeNull()
+  })
+
   it("renders the empty state for a query without matches", async () => {
     vi.stubGlobal(
       "fetch",
