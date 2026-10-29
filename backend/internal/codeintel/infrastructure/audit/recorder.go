@@ -25,6 +25,10 @@ const (
 	ActionCodeRead = "code.read"
 	// ActionCodeAnalyze is the audit action of an analysis trigger/completion.
 	ActionCodeAnalyze = "code.analyze"
+	// ActionCodeReview is the audit action of a human fact review. The entry
+	// carries identifiers and the verdict only; the review note never enters the
+	// audit log.
+	ActionCodeReview = "code.review"
 
 	// defaultTargetType is used when a caller supplies a subject without a
 	// "<type>:<id>" prefix.
@@ -37,8 +41,9 @@ const (
 
 // allowedDetailKeys is the identifier/status allowlist of the audit metadata.
 // Whatever else a caller puts in the detail map is dropped before the entry is
-// recorded, so code content, diffs and prompts cannot reach the audit log. The
-// commit/path/status keys are strings by contract and copied unchanged.
+// recorded, so code content, diffs, prompts and human review notes cannot reach
+// the audit log. The commit/path/status/verdict keys are strings by contract and
+// copied unchanged.
 var allowedDetailKeys = map[string]struct{}{
 	"repoId":     {},
 	"versionId":  {},
@@ -48,6 +53,8 @@ var allowedDetailKeys = map[string]struct{}{
 	"path":       {},
 	"status":     {},
 	"analysisId": {},
+	"factId":     {},
+	"verdict":    {},
 }
 
 // decimalIDKeys are the allowlisted keys that carry an identifier. D29/INV-9
@@ -58,6 +65,7 @@ var decimalIDKeys = map[string]struct{}{
 	"repoId":     {},
 	"versionId":  {},
 	"analysisId": {},
+	"factId":     {},
 }
 
 // EntryRecorder is the narrow slice of the audit application recorder the
@@ -85,7 +93,7 @@ var _ codeintelapp.AuditRecorder = (*Recorder)(nil)
 // Only the allowlisted identifier/status keys survive in the metadata, and
 // identifier values are recorded as decimal strings.
 func (r *Recorder) Record(ctx context.Context, actorID int64, action, subject string, detail map[string]any) error {
-	if action != ActionCodeRead && action != ActionCodeAnalyze {
+	if action != ActionCodeRead && action != ActionCodeAnalyze && action != ActionCodeReview {
 		return fmt.Errorf("codeintel: unsupported audit action %q", action)
 	}
 	if r == nil || r.recorder == nil {

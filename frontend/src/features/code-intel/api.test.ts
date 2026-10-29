@@ -6,9 +6,11 @@ import type {
   Candidate,
   ChangeList,
   CodeEntity,
+  FactReview,
   FileDiff,
   FileWindow,
   IndexRun,
+  RepoQuality,
   RepoSummary,
   TreeEntry,
 } from "./types"
@@ -31,6 +33,7 @@ vi.mock("@/lib/api-client", () => ({
 
 import {
   createAnchor,
+  createFactReview,
   deleteAnchor,
   getAnalysis,
   getCodeRepos,
@@ -40,6 +43,7 @@ import {
   getFileDiff,
   getLatestAnalysis,
   getLatestIndexRun,
+  getRepoQuality,
   getTree,
   getVersionChanges,
   listAnchors,
@@ -204,6 +208,39 @@ const CODE_ENTITY: CodeEntity = {
   evidence: [{ file: "src/router.ts", startLine: 3, endLine: 5 }],
 }
 
+const FACT_REVIEW: FactReview = {
+  id: "9301",
+  factId: "5001",
+  commit: "abc",
+  verdict: "incorrect",
+  reason: "接口已删除",
+  createdBy: 2,
+  createdAt: "2026-10-29T10:00:00Z",
+}
+
+const REPO_QUALITY: RepoQuality = {
+  repoId: 3,
+  generatedAt: "2026-10-29T10:00:00Z",
+  evidence: { checks: 20, failures: 5, passRate: 0.75 },
+  invalidFacts: 2,
+  confidence: { high: 4, medium: 2, low: 1, total: 7 },
+  reviews: { total: 3, correct: 2, incorrect: 1 },
+  impact: {
+    precision: 0.75,
+    recall: 0.8,
+    available: true,
+    evalRunId: "9201",
+    evaluatedAt: "2026-10-29T08:00:00Z",
+  },
+  cacheHitRate: 0.5,
+  analysis: {
+    id: "9101",
+    headCommit: "def",
+    analyzedAt: "2026-10-29T09:00:00Z",
+  },
+  indexedCommit: "def",
+}
+
 describe("code-intel repository api", () => {
   beforeEach(() => {
     mocks.apiGet.mockReset()
@@ -336,6 +373,34 @@ describe("code-intel repository api", () => {
 
     await listAnchors("1844")
     expect(mocks.apiGet).toHaveBeenCalledWith("/api/versions/1844/code/anchors")
+  })
+
+  it("creates a fact review with the verdict and reason", async () => {
+    mocks.apiPost.mockResolvedValueOnce(FACT_REVIEW)
+
+    await expect(
+      createFactReview(3, "5001", { verdict: "incorrect", reason: "接口已删除" }),
+    ).resolves.toEqual(FACT_REVIEW)
+    expect(mocks.apiPost).toHaveBeenCalledWith("/api/code/repos/3/facts/5001/reviews", {
+      verdict: "incorrect",
+      reason: "接口已删除",
+    })
+  })
+
+  it("encodes a fact id as one path segment instead of coercing it", async () => {
+    mocks.apiPost.mockResolvedValueOnce(FACT_REVIEW)
+
+    await createFactReview(3, "fact/9", { verdict: "correct" })
+    expect(mocks.apiPost).toHaveBeenCalledWith("/api/code/repos/3/facts/fact%2F9/reviews", {
+      verdict: "correct",
+    })
+  })
+
+  it("reads the repository quality aggregate", async () => {
+    mocks.apiGet.mockResolvedValueOnce(REPO_QUALITY)
+
+    await expect(getRepoQuality(3)).resolves.toEqual(REPO_QUALITY)
+    expect(mocks.apiGet).toHaveBeenCalledWith("/api/code/repos/3/quality")
   })
 })
 

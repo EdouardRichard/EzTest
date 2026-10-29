@@ -14,6 +14,97 @@ export type Evidence = {
   excerptHash?: string
 }
 
+/** Human fact-review verdicts of the P8 correction API (spec §7.2). */
+export type FactReviewVerdict = "correct" | "incorrect"
+
+/**
+ * One human verdict on a code fact at a commit (spec §7.2). `id`/`factId` are
+ * decimal strings (D29), `createdBy` stays a number and `reason` is the human
+ * note. A fact is reviewed at most once per commit; a new verdict overwrites the
+ * previous row.
+ */
+export type FactReview = {
+  id: string
+  factId: string
+  commit: string
+  verdict: FactReviewVerdict
+  reason: string
+  createdBy: number
+  createdAt: string
+}
+
+/** Request body of `POST /api/code/repos/{repoId}/facts/{factId}/reviews`. */
+export type CreateFactReviewBody = {
+  verdict: FactReviewVerdict
+  reason?: string
+}
+
+/** Evidence-verification projection of the repository quality block. */
+export type QualityEvidence = {
+  checks: number
+  failures: number
+  /** (checks-failures)/checks, or null when no evidence was checked. */
+  passRate: number | null
+}
+
+/** Confidence distribution of the AI facts at the quality head commit. */
+export type QualityConfidence = {
+  high: number
+  medium: number
+  low: number
+  total: number
+}
+
+/** Human review counters of one repository. */
+export type QualityReviews = {
+  total: number
+  correct: number
+  incorrect: number
+}
+
+/**
+ * Newest evaluation run's impact metrics. When the evaluation is unavailable
+ * (or has never run) precision/recall are null, `available` is false and
+ * `reason` names the degraded source (`no_eval_run` | `no_impact_metric` |
+ * `eval_store_unavailable`).
+ */
+export type QualityImpact = {
+  precision: number | null
+  recall: number | null
+  available: boolean
+  reason?: string
+  /** Evaluation run id, a decimal string (D29). */
+  evalRunId: string | null
+  evaluatedAt: string | null
+}
+
+/** Newest done analysis that supplied the quality counters. */
+export type QualityAnalysisRef = {
+  id: string
+  headCommit: string
+  analyzedAt: string
+}
+
+/**
+ * `GET /api/code/repos/{repoId}/quality` (spec §9.2): evidence pass rate,
+ * invalid facts, confidence distribution, human review counters, the newest
+ * evaluation's impact precision/recall and the cache hit rate. Missing sources
+ * stay null/zero and are flagged; `analysis` is null for a never-analysed
+ * repository.
+ */
+export type RepoQuality = {
+  repoId: number
+  generatedAt: string
+  evidence: QualityEvidence
+  invalidFacts: number
+  confidence: QualityConfidence
+  reviews: QualityReviews
+  impact: QualityImpact
+  cacheHitRate: number | null
+  analysis: QualityAnalysisRef | null
+  indexedCommit: string
+}
+
 /** A file-level change inside a persisted change set (spec §7.2). */
 export type ChangedFile = {
   path: string
@@ -299,6 +390,8 @@ export type CodeEntity = {
   factKey?: string | null
   factVersion?: number | null
   analysisId?: string | null
+  /** Additive P8 human verdict at this commit; null/absent when unreviewed. */
+  review?: FactReview | null
   createdAt?: string
   updatedAt?: string
 }

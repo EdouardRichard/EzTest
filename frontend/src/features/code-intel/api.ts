@@ -8,7 +8,9 @@ import type {
   ChangeList,
   CodeEntity,
   CreateAnchorBody,
+  CreateFactReviewBody,
   DiffQuery,
+  FactReview,
   FactsQuery,
   FileDiff,
   FileDiffQuery,
@@ -16,6 +18,7 @@ import type {
   FileWindow,
   IndexRun,
   IndexRunAccepted,
+  RepoQuality,
   RepoSummary,
   SearchQuery,
   StartAnalysisBody,
@@ -154,6 +157,27 @@ export function searchFacts(repoId: number, params: SearchQuery): Promise<ApiPag
       limit: params.limit,
     }),
   )
+}
+
+/**
+ * POST /api/code/repos/{repoId}/facts/{factId}/reviews — records the logged-in
+ * user's verdict on one fact at its commit (spec §7.2). The same fact/commit is
+ * unique: a new verdict overwrites the previous one.
+ */
+export function createFactReview(
+  repoId: number,
+  factId: string,
+  body: CreateFactReviewBody,
+): Promise<FactReview> {
+  return apiPost<FactReview>(
+    `${repoPath(repoId)}/facts/${encodeURIComponent(factId)}/reviews`,
+    body,
+  )
+}
+
+/** GET /api/code/repos/{repoId}/quality — evidence/review/impact aggregate. */
+export function getRepoQuality(repoId: number): Promise<RepoQuality> {
+  return apiGet<RepoQuality>(`${repoPath(repoId)}/quality`)
 }
 
 /** GET /api/versions/{id}/code/changes — read-only version change preview. */

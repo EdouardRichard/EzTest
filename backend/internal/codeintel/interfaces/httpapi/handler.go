@@ -68,6 +68,23 @@ type VersionChangeService interface {
 	Timeline(ctx context.Context, versionID int64) ([]application.VersionChangeTimelineEntry, error)
 }
 
+// FactReviewService is the P8 human fact review use case consumed by the HTTP
+// layer (design spec §7.2): Create records the logged-in user's verdict on one
+// fact of the path repository (422 invalid input, 404 fact_not_found), and
+// ReviewsForFacts loads the persisted verdicts of one facts page so the DTO can
+// carry the additive review marker. *application.FactReviewService implements it.
+type FactReviewService interface {
+	Create(ctx context.Context, repoID, actorID, factID int64, verdict, reason string) (domain.FactReview, error)
+	ReviewsForFacts(ctx context.Context, repoID int64, entities []domain.CodeEntity) (map[int64]domain.FactReview, error)
+}
+
+// RepoQualityService is the P8 repository quality aggregate consumed by the HTTP
+// layer (design spec §9.2). *application.FactReviewService implements it;
+// missing sources are null/zero and flagged, never fabricated.
+type RepoQualityService interface {
+	Quality(ctx context.Context, repoID int64) (application.RepoQuality, error)
+}
+
 // AnchorService is the version-scoped anchor use case consumed by the HTTP layer
 // (design spec §7.3). *application.AnchorService implements it; subject
 // ownership, file existence, line validation and point uniqueness are enforced
@@ -87,6 +104,8 @@ var (
 	_ AnalysisService      = (*application.AnalysisService)(nil)
 	_ AnchorService        = (*application.AnchorService)(nil)
 	_ VersionChangeService = (*application.VersionChangeService)(nil)
+	_ FactReviewService    = (*application.FactReviewService)(nil)
+	_ RepoQualityService   = (*application.FactReviewService)(nil)
 )
 
 // Handler serves the repository- and version-scoped codeintel endpoints. A nil
@@ -98,6 +117,8 @@ type Handler struct {
 	analyses       AnalysisService
 	anchors        AnchorService
 	versionChanges VersionChangeService
+	factReviews    FactReviewService
+	repoQuality    RepoQualityService
 	repos          application.RepoCatalog
 }
 
@@ -111,6 +132,12 @@ type HandlerDeps struct {
 	// VersionChanges is the P8 per-batch snapshot use case; nil omits the
 	// additive batchTimeline entries while leaving the P7 change list intact.
 	VersionChanges VersionChangeService
+	// FactReviews is the P8 human fact review use case; nil omits the review
+	// route and the additive review marker of the facts page.
+	FactReviews FactReviewService
+	// Quality is the P8 repository quality aggregate; nil omits the quality
+	// route.
+	Quality RepoQualityService
 	// Repos is the P2 repository catalog read through the resource application
 	// layer (R24 List backs GET /api/code/repos).
 	Repos application.RepoCatalog
@@ -124,6 +151,8 @@ func NewHandler(deps HandlerDeps) *Handler {
 		analyses:       deps.Analyses,
 		anchors:        deps.Anchors,
 		versionChanges: deps.VersionChanges,
+		factReviews:    deps.FactReviews,
+		repoQuality:    deps.Quality,
 		repos:          deps.Repos,
 	}
 }
