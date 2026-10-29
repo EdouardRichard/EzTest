@@ -2,6 +2,7 @@ import { clsx } from "clsx"
 import { memo } from "react"
 
 import { StatusBadge } from "@/components/ui/StatusBadge"
+import { CHAIN_CARD_SIZES } from "../chain-layout"
 import {
   getRequirementPriorityLabel,
   getRequirementStatusToken,
@@ -45,9 +46,13 @@ export const RequirementNode = memo(function RequirementNode({
       aria-label={labelParts.join("，")}
       data-selected={selected ? "true" : undefined}
       className={clsx(
-        "w-[240px] rounded-2xl border border-blue-500/30 bg-card p-3 shadow-sm",
+        "overflow-hidden rounded-2xl border border-blue-500/30 bg-card p-3 shadow-sm",
         selected && "ring-2 ring-ring",
       )}
+      style={{
+        width: CHAIN_CARD_SIZES.requirement.width,
+        height: CHAIN_CARD_SIZES.requirement.height,
+      }}
     >
       <header className="flex items-center gap-1.5">
         <span

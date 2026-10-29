@@ -1,6 +1,8 @@
 import { cleanup, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it } from "vitest"
 
+import { CHAIN_CARD_SIZES } from "../chain-layout"
+import { CASE_STATUS_TOKENS } from "../chain-tokens"
 import type { ChainSnapshotNode } from "../chain-types"
 import { CaseNode } from "./CaseNode"
 
@@ -48,8 +50,19 @@ describe("CaseNode", () => {
 
     const card = screen.getByTestId("chain-node-case")
     expect(card.getAttribute("data-revalidation")).toBe("true")
-    expect(card.className).toContain("ring-amber-500")
+    expect(card.className).toContain(CASE_STATUS_TOKENS.needs_revalidation.ringClass)
+    expect(card.className).not.toContain("ring-ring")
     expect(screen.getByTestId("chain-node-case-revalidation").textContent).toBe("需重验")
+  })
+
+  it("lets the selected ring win over the revalidation ring", () => {
+    render(
+      <CaseNode data={{ ...CASE, status: "needs_revalidation", revalidation: true }} selected />,
+    )
+
+    const card = screen.getByTestId("chain-node-case")
+    expect(card.className).toContain("ring-ring")
+    expect(card.className).not.toContain("ring-amber-500")
   })
 
   it("marks an impacted case with its impact reason", () => {
@@ -59,5 +72,15 @@ describe("CaseNode", () => {
     expect(card.getAttribute("data-impacted")).toBe("true")
     expect(screen.getByTestId("chain-node-case-impacted").textContent).toBe("受影响")
     expect(card.getAttribute("aria-label")).toContain("下单接口变更")
+  })
+
+  it("fills the fixed card slot from the shared layout constants", () => {
+    render(<CaseNode data={{ ...CASE, impacted: true, impactReason: "下单接口变更" }} />)
+
+    const card = screen.getByTestId("chain-node-case")
+    expect(card.style.width).toBe(`${CHAIN_CARD_SIZES.case.width}px`)
+    expect(card.style.height).toBe(`${CHAIN_CARD_SIZES.case.height}px`)
+    expect(card.className).toContain("overflow-hidden")
+    expect(card.querySelector("h3")?.getAttribute("class")).toContain("line-clamp-2")
   })
 })

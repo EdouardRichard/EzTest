@@ -7,7 +7,6 @@ import {
   CHAIN_ISSUE_HEIGHT,
   CHAIN_ISSUE_WIDTH,
   CHAIN_LAYER_GAP,
-  CHAIN_READ_MODEL_GROUP_GAP,
   CHAIN_READ_MODEL_LAYER_GAP,
   CHAIN_READ_MODEL_ROW_GAP,
   CHAIN_REQUIREMENT_WIDTH,
@@ -139,6 +138,13 @@ function nodeById(result: ReturnType<typeof layoutChain>, id: string) {
   return node
 }
 
+function idsOfKind(
+  result: ReturnType<typeof layoutChain>,
+  kind: ChainSnapshotNode["kind"],
+): string[] {
+  return result.nodes.filter((node) => node.kind === kind).map((node) => node.id)
+}
+
 describe("layoutChain over the read model", () => {
   it("returns an empty layout for an empty chain", () => {
     const result = layoutChain([])
@@ -202,23 +208,91 @@ describe("layoutChain over the read model", () => {
     expect(nodeById(result, nodeId("case", C2)).y).toBeGreaterThanOrEqual(secondRequirement.y)
   })
 
-  it("is deterministic regardless of the input array order", () => {
-    const nodes = [...baseNodes(), issueNode(I1, "登录报错")]
-    const edges = [
-      ...baseEdges(),
-      chainEdge("result_issue", nodeId("result", CR1), nodeId("issue", I1)),
-    ]
+  it("uses the shared card size constants on every positioned node", () => {
+    const result = layoutChain([...baseNodes(), issueNode(I1, "登录报错", { caseNodeId: C1 })])
 
-    const forward = layoutChain(nodes, { edges })
-    const backward = layoutChain([...nodes].reverse(), { edges: [...edges].reverse() })
-
-    expect(backward.nodes).toEqual(forward.nodes)
-    expect(backward.edges).toEqual(forward.edges)
-    expect(backward.visibleIds).toEqual(forward.visibleIds)
-    expect(backward.bounds).toEqual(forward.bounds)
+    for (const node of result.nodes) {
+      expect({ width: node.width, height: node.height }).toEqual(CHAIN_CARD_SIZES[node.kind])
+    }
   })
 
-  it("orders requirement groups, sibling cases and stacked results deterministically", () => {
+  it("sizes every card layer for its tallest content within the 232–240px width range", () => {
+    for (const kind of ["requirement", "case", "result", "issue"] as const) {
+      expect(CHAIN_CARD_SIZES[kind].width).toBeGreaterThanOrEqual(232)
+      expect(CHAIN_CARD_SIZES[kind].width).toBeLessThanOrEqual(240)
+    }
+    expect(CHAIN_CARD_SIZES.requirement.height).toBeGreaterThanOrEqual(120)
+    expect(CHAIN_CARD_SIZES.case.height).toBeGreaterThanOrEqual(160)
+    expect(CHAIN_CARD_SIZES.result.height).toBeGreaterThanOrEqual(160)
+    expect(CHAIN_CARD_SIZES.issue.height).toBeGreaterThanOrEqual(140)
+  })
+
+  it("preserves the backend order of every layer instead of re-sorting by id", () => {
+    const nodes = [
+      requirementNode(R2, "下单需求"),
+      requirementNode(R1, "登录需求"),
+      caseNode(C3, "未关联用例"),
+      caseNode(C2, "提交订单"),
+      caseNode(C1, "登录成功"),
+      resultNode(CR3, C3, "blocked"),
+      resultNode(CR2, C2, "failed"),
+      resultNode(CR1, C1, "passed"),
+      issueNode(I2, "订单阻断", { severity: "blocker" }),
+      issueNode(I1, "登录报错", { severity: "major" }),
+    ]
+    const edges = [
+      chainEdge("case_result", nodeId("case", C3), nodeId("result", CR3)),
+      chainEdge("case_result", nodeId("case", C2), nodeId("result", CR2)),
+      chainEdge("case_result", nodeId("case", C1), nodeId("result", CR1)),
+      chainEdge("result_issue", nodeId("result", CR3), nodeId("issue", I2)),
+      chainEdge("result_issue", nodeId("result", CR3), nodeId("issue", I1)),
+    ]
+
+    // The backend already returns requirements by `sortOrder,id`, cases by
+    // `sortOrder,id`, results by `attempt desc` and issues by severity rank;
+    // the layout must keep that array order untouched.
+    const result = layoutChain(nodes, { edges })
+
+    expect(idsOfKind(result, "requirement")).toEqual([
+      nodeId("requirement", R2),
+      nodeId("requirement", R1),
+    ])
+    expect(idsOfKind(result, "case")).toEqual([
+      nodeId("case", C3),
+      nodeId("case", C2),
+      nodeId("case", C1),
+    ])
+    expect(idsOfKind(result, "result")).toEqual([
+      nodeId("result", CR3),
+      nodeId("result", CR2),
+      nodeId("result", CR1),
+    ])
+    expect(idsOfKind(result, "issue")).toEqual([nodeId("issue", I2), nodeId("issue", I1)])
+  })
+
+  it("keeps the input order of requirements and sibling cases (300 before 200)", () => {
+    const edges = [
+      chainEdge("requirement_case", nodeId("requirement", "300"), nodeId("case", "300")),
+      chainEdge("requirement_case", nodeId("requirement", "300"), nodeId("case", "200")),
+    ]
+    const result = layoutChain(
+      [
+        requirementNode("300", "需求 300"),
+        requirementNode("200", "需求 200"),
+        caseNode("300", "用例 300"),
+        caseNode("200", "用例 200"),
+      ],
+      { edges },
+    )
+
+    expect(idsOfKind(result, "requirement")).toEqual([
+      nodeId("requirement", "300"),
+      nodeId("requirement", "200"),
+    ])
+    expect(idsOfKind(result, "case")).toEqual([nodeId("case", "300"), nodeId("case", "200")])
+  })
+
+  it("keeps the input order of requirement groups, sibling cases and stacked results", () => {
     const nodes = [
       requirementNode(R2, "下单需求"),
       requirementNode(R1, "登录需求"),
@@ -240,32 +314,32 @@ describe("layoutChain over the read model", () => {
     const result = layoutChain(nodes, { edges })
 
     expect(result.visibleIds).toEqual([
-      nodeId("requirement", R1),
-      nodeId("case", C1),
-      nodeId("result", CR3),
-      nodeId("result", CR1),
       nodeId("requirement", R2),
       nodeId("case", C2),
       nodeId("result", CR2),
+      nodeId("requirement", R1),
+      nodeId("case", C1),
+      nodeId("result", CR1),
+      nodeId("result", CR3),
       nodeId("case", C3),
     ])
-    expect(nodeById(result, nodeId("requirement", R1)).y).toBeLessThan(
-      nodeById(result, nodeId("requirement", R2)).y,
+    expect(nodeById(result, nodeId("requirement", R2)).y).toBeLessThan(
+      nodeById(result, nodeId("requirement", R1)).y,
     )
-    expect(nodeById(result, nodeId("result", CR3)).y).toBeLessThan(
-      nodeById(result, nodeId("result", CR1)).y,
+    expect(nodeById(result, nodeId("result", CR1)).y).toBeLessThan(
+      nodeById(result, nodeId("result", CR3)).y,
     )
     expect(nodeById(result, nodeId("case", C3)).y).toBeGreaterThan(
       nodeById(result, nodeId("case", C2)).y,
     )
   })
 
-  it("stacks several results of one case vertically, newest attempt first", () => {
+  it("stacks the results of one case in the input order", () => {
     const nodes = [
       requirementNode(R1, "登录需求"),
       caseNode(C1, "登录成功"),
-      resultNode(CR1, C1, "passed", { attempt: 1 }),
       resultNode(CR3, C1, "failed", { attempt: 2 }),
+      resultNode(CR1, C1, "passed", { attempt: 1 }),
     ]
     const edges = [
       chainEdge("requirement_case", nodeId("requirement", R1), nodeId("case", C1)),
@@ -275,11 +349,11 @@ describe("layoutChain over the read model", () => {
 
     const result = layoutChain(nodes, { edges })
 
-    const newest = nodeById(result, nodeId("result", CR3))
-    const older = nodeById(result, nodeId("result", CR1))
-    expect(newest.y).toBe(0)
-    expect(older.y).toBe(CHAIN_CARD_SIZES.result.height + CHAIN_READ_MODEL_ROW_GAP)
-    expect(older.x).toBe(newest.x)
+    const first = nodeById(result, nodeId("result", CR3))
+    const second = nodeById(result, nodeId("result", CR1))
+    expect(first.y).toBe(0)
+    expect(second.y).toBe(CHAIN_CARD_SIZES.result.height + CHAIN_READ_MODEL_ROW_GAP)
+    expect(second.x).toBe(first.x)
   })
 
   it("copies the snapshot edges in a deterministic pre-order and keeps their ids", () => {
@@ -456,7 +530,7 @@ describe("layoutChain over the read model", () => {
     ])
   })
 
-  it("keeps the layout deterministic with issue nodes in shuffled order", () => {
+  it("keeps the input order of issue nodes instead of ranking them by severity", () => {
     const major = issueNode(I1, "登录报错", { severity: "major" })
     const blocker = issueNode(I2, "订单阻断", { severity: "blocker" })
     const edges = [
@@ -468,11 +542,12 @@ describe("layoutChain over the read model", () => {
     const forward = layoutChain([...baseNodes(), major, blocker], { edges })
     const backward = layoutChain([...baseNodes(), blocker, major], { edges })
 
-    expect(backward.nodes).toEqual(forward.nodes)
-    expect(forward.nodes.filter((node) => node.kind === "issue").map((node) => node.id)).toEqual([
-      nodeId("issue", I2),
-      nodeId("issue", I1),
-    ])
+    expect(idsOfKind(forward, "issue")).toEqual([nodeId("issue", I1), nodeId("issue", I2)])
+    expect(idsOfKind(backward, "issue")).toEqual([nodeId("issue", I2), nodeId("issue", I1)])
+    expect(nodeById(forward, nodeId("issue", I1)).y).toBe(0)
+    expect(nodeById(forward, nodeId("issue", I2)).y).toBe(
+      CHAIN_CARD_SIZES.issue.height + CHAIN_READ_MODEL_ROW_GAP,
+    )
   })
 
   it("wraps every visible node in the bounds", () => {
@@ -489,6 +564,20 @@ describe("layoutChain over the read model", () => {
     const minY = Math.min(...result.nodes.map((node) => node.y))
 
     expect(result.bounds).toEqual({ x: minX, y: minY, width: maxX - minX, height: maxY - minY })
+    // The bounds are exactly three layer gaps plus the four card widths; the
+    // node components render the same fixed width/height from the constants.
+    const expectedWidth =
+      CHAIN_CARD_SIZES.requirement.width +
+      CHAIN_READ_MODEL_LAYER_GAP +
+      CHAIN_CARD_SIZES.case.width +
+      CHAIN_READ_MODEL_LAYER_GAP +
+      CHAIN_CARD_SIZES.result.width +
+      CHAIN_READ_MODEL_LAYER_GAP +
+      CHAIN_CARD_SIZES.issue.width
+    expect(result.bounds.width).toBe(expectedWidth)
+    for (const node of result.nodes) {
+      expect(node.height).toBe(CHAIN_CARD_SIZES[node.kind].height)
+    }
     for (const node of result.nodes) {
       expect(node.x).toBeGreaterThanOrEqual(result.bounds.x)
       expect(node.y).toBeGreaterThanOrEqual(result.bounds.y)
@@ -609,8 +698,5 @@ describe("layoutLegacy compatibility adapter", () => {
 
     const collapsed = layoutLegacy(input, { collapsed: [R1] })
     expect(collapsed.hiddenIds).toEqual([C1, CR1, I1])
-    expect(collapsed.bounds.width).toBeGreaterThan(0)
-    expect(CHAIN_READ_MODEL_GROUP_GAP).toBeGreaterThan(0)
-    expect(CHAIN_RESULT_WIDTH).toBeGreaterThan(0)
   })
 })

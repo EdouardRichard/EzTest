@@ -128,19 +128,29 @@ describe("CHAIN_TOKENS statuses and severities", () => {
     expect(ISSUE_STATUS_TOKENS.dismissed.label).toBe("已驳回")
   })
 
-  it("covers requirement and case status labels", () => {
-    for (const token of Object.values(REQUIREMENT_STATUS_TOKENS)) expectToken(token)
-    for (const token of Object.values(CASE_STATUS_TOKENS)) expectToken(token)
+  it("covers requirement and case status labels with StatusBadge semantics", () => {
+    for (const token of Object.values(REQUIREMENT_STATUS_TOKENS)) expectStatusToken(token)
+    for (const token of Object.values(CASE_STATUS_TOKENS)) expectStatusToken(token)
     expectUniqueColors(Object.values(REQUIREMENT_STATUS_TOKENS))
     expectUniqueColors(Object.values(CASE_STATUS_TOKENS))
 
     expect(REQUIREMENT_STATUS_TOKENS.clarified.label).toBe("已澄清")
+    expect(REQUIREMENT_STATUS_TOKENS.draft.badgeVariant).toBe("neutral")
+    expect(REQUIREMENT_STATUS_TOKENS.clarified.badgeVariant).toBe("info")
+    expect(REQUIREMENT_STATUS_TOKENS.verified.badgeVariant).toBe("success")
+    expect(REQUIREMENT_STATUS_TOKENS.obsolete.badgeVariant).toBe("neutral")
+
     expect(CASE_STATUS_TOKENS.needs_revalidation.label).toBe("需重验")
+    expect(CASE_STATUS_TOKENS.executed.badgeVariant).toBe("success")
+    expect(CASE_STATUS_TOKENS.rejected.badgeVariant).toBe("danger")
+    expect(CASE_STATUS_TOKENS.needs_revalidation.badgeVariant).toBe("warning")
   })
 
   it("exposes the aggregate palette consumed by the canvas", () => {
     expect(CHAIN_TOKENS.nodes).toBe(NODE_KIND_TOKENS)
     expect(CHAIN_TOKENS.edges).toBe(EDGE_KIND_TOKENS)
+    expect(CHAIN_TOKENS.requirementStatus).toBe(REQUIREMENT_STATUS_TOKENS)
+    expect(CHAIN_TOKENS.caseStatus).toBe(CASE_STATUS_TOKENS)
     expect(CHAIN_TOKENS.resultStatus).toBe(RESULT_STATUS_TOKENS)
     expect(CHAIN_TOKENS.issueSeverity).toBe(ISSUE_SEVERITY_TOKENS)
     expect(CHAIN_TOKENS.issueStatus).toBe(ISSUE_STATUS_TOKENS)

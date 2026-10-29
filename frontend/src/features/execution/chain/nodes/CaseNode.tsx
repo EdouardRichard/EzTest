@@ -2,6 +2,7 @@ import { clsx } from "clsx"
 import { memo } from "react"
 
 import { StatusBadge } from "@/components/ui/StatusBadge"
+import { CHAIN_CARD_SIZES } from "../chain-layout"
 import {
   CASE_STATUS_TOKENS,
   getCasePriorityLabel,
@@ -31,6 +32,10 @@ export const CaseNode = memo(function CaseNode({ data, selected = false }: CaseN
   const impacted = data.impacted === true
   const priority = getCasePriorityLabel(data.priority)
   const impactReason = data.impactReason ?? ""
+  // Both rings are token-driven and mutually exclusive: when a revalidating
+  // case is also selected, the selected ring wins so two `ring-*` colour
+  // utilities never compete for the same box shadow.
+  const revalidationRing = CASE_STATUS_TOKENS.needs_revalidation.ringClass
 
   const labelParts = [`用例：${data.title}`, status.label]
   if (priority !== "—") labelParts.push(priority)
@@ -50,16 +55,20 @@ export const CaseNode = memo(function CaseNode({ data, selected = false }: CaseN
       aria-label={labelParts.join("，")}
       data-selected={selected ? "true" : undefined}
       className={clsx(
-        "relative w-[240px] rounded-2xl border bg-card p-3 shadow-sm",
+        "relative overflow-hidden rounded-2xl border bg-card p-3 shadow-sm",
         aiSupplemented ? "border-dashed border-indigo-500/50" : "border-border",
-        needsRevalidation && "border-amber-500 ring-2 ring-amber-500",
-        selected && "ring-2 ring-ring",
+        needsRevalidation && "border-amber-500",
+        selected ? "ring-2 ring-ring" : needsRevalidation && `ring-2 ${revalidationRing}`,
       )}
+      style={{
+        width: CHAIN_CARD_SIZES.case.width,
+        height: CHAIN_CARD_SIZES.case.height,
+      }}
     >
       {aiSupplemented ? (
         <span
           data-testid="chain-node-case-ai-badge"
-          className="absolute -right-1.5 -top-1.5 rounded-full border border-dashed border-indigo-500/50 bg-card px-1.5 py-0.5 text-[10px] font-semibold leading-none text-indigo-700 shadow-sm dark:text-indigo-300"
+          className="absolute right-1 top-1 z-10 rounded-full border border-dashed border-indigo-500/50 bg-card px-1.5 py-0.5 text-[10px] font-semibold leading-none text-indigo-700 shadow-sm dark:text-indigo-300"
         >
           AI 补充
         </span>
