@@ -161,9 +161,11 @@ func assertCodeAnchorSubjectKind(t *testing.T, ctx context.Context, pool *pgxpoo
 			t.Errorf("code_anchor rejected subject_kind %q: %v", subjectKind, err)
 		}
 	}
+	// P7's codeintel_0005 adds 'issue' to the allowed subject kinds, so the
+	// unknown-value probe uses a kind that no migration defines.
 	_, err = pool.Exec(ctx, `
 		INSERT INTO code_anchor (id, version_id, repo_id, subject_kind, subject_id, file_path, created_by)
-		VALUES (9100, 1, 1, 'issue', 200, 'src/issue.ts', 1)`)
+		VALUES (9100, 1, 1, 'unsupported', 200, 'src/unsupported.ts', 1)`)
 	assertCheckViolation(t, err, "code_anchor.subject_kind unknown value")
 }
 
