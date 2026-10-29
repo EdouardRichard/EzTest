@@ -307,9 +307,13 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		resourceCatalogRepo, resourceCatalogRepo, resourceCatalogRepo, resourceCatalogRepo, wallClock{})
 	accessService := resourceapp.NewAccessService(
 		resourceCatalogRepo, resourceAccessRepo, resourceAccessRepo, resourceCatalogRepo, resourceAuthFlows)
+	// The P0 audit sink records the resource write-path entries: db_target.*
+	// (P7) and the Session lifecycle (spec §10.4) share the same adapter.
+	resourceDBTargetAudit := resourceaudit.NewSink(auditor)
 	sessionService := resourceapp.NewSessionService(
 		resourceSessionRepo, resourceAccessRepo, resourceCatalogRepo, resourceCatalogRepo,
-		httpcheck.NewChecker(), wallClock{})
+		httpcheck.NewChecker(), wallClock{},
+		resourceapp.WithSessionAuditSink(resourceDBTargetAudit))
 	codeRepoService := resourceapp.NewCodeRepoService(
 		resourceCodeRepo, gitexec.NewValidator(), wallClock{})
 	// P7 resource additions (spec §7.8): the administrator-only environment db
@@ -320,7 +324,6 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	resourceDBQuerier := pgreadonly.NewQuerier()
 	resourceDBTargetService := resourceapp.NewDBTargetService(
 		resourceDBTargetRepo, resourceCatalogRepo, resourceDBQuerier, snowflake, wallClock{})
-	resourceDBTargetAudit := resourceaudit.NewSink(auditor)
 	resourceHandlers := &resourcehttp.Handlers{
 		Catalog:  resourcehttp.NewCatalogHandler(catalogService),
 		Access:   resourcehttp.NewAccessHandler(accessService),
@@ -628,9 +631,12 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Anchors:      mindmapAnchors,
 		Batches:      supplementBatches,
 		Events:       mindmapEvents,
-		IDs:          snowflake,
-		Clock:        wallClock{},
-		Logger:       logger,
+		// Spec §10.4: the manual graph writes record id/status-only audit
+		// entries through the shared P0 audit log.
+		Audit:  mindmapAudit,
+		IDs:    snowflake,
+		Clock:  wallClock{},
+		Logger: logger,
 	})
 	// The P6 execution context reads the frozen baseline/snapshots and marks
 	// executed cases through this narrow projection (spec §4.2).
