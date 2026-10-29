@@ -73,10 +73,13 @@ import (
 	executionpostgres "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/postgres"
 	executionresource "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/resource"
 	executionversion "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/version"
+	executionworkspace "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/workspace"
 	executionhttp "github.com/EdouardRichard/EzTest/backend/internal/execution/interfaces/httpapi"
 	identityapp "github.com/EdouardRichard/EzTest/backend/internal/identity/application"
+	identity "github.com/EdouardRichard/EzTest/backend/internal/identity/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/infrastructure/password"
 	identitypostgres "github.com/EdouardRichard/EzTest/backend/internal/identity/infrastructure/postgres"
+	identityhttp "github.com/EdouardRichard/EzTest/backend/internal/identity/interfaces/httpapi"
 	llmapp "github.com/EdouardRichard/EzTest/backend/internal/llm/application"
 	llm "github.com/EdouardRichard/EzTest/backend/internal/llm/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/llm/infrastructure/deepseek"
@@ -120,7 +123,10 @@ import (
 	versiongitread "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/gitread"
 	versionpostgres "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/postgres"
 	versionresource "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/resource"
+	versionworkspace "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/workspace"
 	versionhttp "github.com/EdouardRichard/EzTest/backend/internal/version/interfaces/httpapi"
+	workspaceapp "github.com/EdouardRichard/EzTest/backend/internal/workspace/application"
+	workspacehttp "github.com/EdouardRichard/EzTest/backend/internal/workspace/interfaces/httpapi"
 )
 
 const (
@@ -1363,6 +1369,18 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		CodeIntel: codeintelchain.New(database.Pool),
 	})
 	chainHandlers := chainhttp.NewHandlers(chainService)
+	// P8 todo centre (spec §6.3/D56): the version provider reports the versions
+	// in reviewing, the execution provider the blocked(session) case runs of
+	// active batches (takeover with a waiting manual takeover, gate without one).
+	// The workspace service applies the admin filter and the item limit.
+	workspaceService := workspaceapp.NewService(workspaceapp.Providers{
+		Review:    versionworkspace.New(database.Pool),
+		Execution: executionworkspace.New(database.Pool),
+	})
+	workspaceHandlers := workspacehttp.NewHandlers(workspaceService, func(ctx context.Context) bool {
+		user, ok := identityhttp.UserFromContext(ctx)
+		return ok && user.Role == identity.RoleAdmin
+	})
 	cancelStartup()
 
 	// Every request context descends from baseCtx. Canceling it on shutdown
@@ -1397,6 +1415,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 			Execution: executionHandlers,
 			Delivery:  deliveryHandlers,
 			Chain:     chainHandlers,
+			Workspace: workspaceHandlers,
 		}),
 		BaseContext:       baseContext(baseCtx),
 		ReadHeaderTimeout: 10 * time.Second,

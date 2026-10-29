@@ -30,6 +30,7 @@ import (
 	resourcehttp "github.com/EdouardRichard/EzTest/backend/internal/resource/interfaces/httpapi"
 	storagehttp "github.com/EdouardRichard/EzTest/backend/internal/storage/interfaces/httpapi"
 	versionhttp "github.com/EdouardRichard/EzTest/backend/internal/version/interfaces/httpapi"
+	workspacehttp "github.com/EdouardRichard/EzTest/backend/internal/workspace/interfaces/httpapi"
 )
 
 // Pinger reports whether a backing dependency (for example the database) is
@@ -133,6 +134,12 @@ type Dependencies struct {
 	// relies on the global bearer auth and adds no per-route guard: every
 	// logged-in user may read a version's chain (spec §5.1).
 	Chain *chainhttp.Handlers
+	// Workspace holds the P8 todo-centre handler group. When set,
+	// GET /api/todos is mounted. The route relies on the global bearer auth and
+	// resolves the administrator flag from the authenticated identity itself:
+	// every logged-in user gets the review group, administrators additionally
+	// get takeover/gate items (spec §6.3).
+	Workspace *workspacehttp.Handlers
 }
 
 // New assembles the HTTP handler. Middleware runs in the order
@@ -248,6 +255,13 @@ func New(cfg config.Config, logger *slog.Logger, deps Dependencies) http.Handler
 		// global bearer auth and adds no per-route guard (spec §5.1: every
 		// logged-in user may read it).
 		deps.Chain.RegisterRoutes(mux)
+	}
+	if deps.Workspace != nil {
+		// The todo centre (P8) is mounted at GET /api/todos. It relies on the
+		// global bearer auth; the handler resolves the admin flag from the
+		// identity context and the service filters takeover/gate server-side
+		// (spec §6.3).
+		deps.Workspace.RegisterRoutes(mux)
 	}
 	if deps.Events != nil && cfg.EnableTestEndpoints {
 		auditor := deps.Audit

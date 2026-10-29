@@ -8,6 +8,9 @@ import { useEffect, useState } from "react"
 import { StatusBadge, type StatusBadgeVariant } from "@/components/ui/StatusBadge"
 import { useAuth } from "@/features/auth/AuthProvider"
 
+import { TodoButton } from "./todos/TodoButton"
+import { VersionSwitcher } from "./VersionSwitcher"
+
 type EnvironmentMeta = {
   label: string
   variant: StatusBadgeVariant
@@ -125,6 +128,9 @@ export function Topbar() {
           <span className="text-sm font-semibold tracking-tight">EzTest</span>
         </Link>
 
+        {/* P8 global shell slot (spec §6.1): current version + status badge. */}
+        <VersionSwitcher />
+
         <div className="hidden items-center gap-2 sm:flex">
           <StatusBadge variant={ENVIRONMENT.variant}>{ENVIRONMENT.label}</StatusBadge>
           <span className="hidden items-center gap-1.5 rounded-full border border-border bg-card px-2.5 py-1 text-[11px] font-medium text-muted-foreground md:inline-flex">
@@ -134,6 +140,7 @@ export function Topbar() {
         </div>
 
         <div className="ml-auto flex items-center gap-1.5 sm:gap-2">
+          <TodoButton />
           <ThemeToggle />
           <span className="h-6 w-px bg-border" aria-hidden="true" />
           <UserMenu />
