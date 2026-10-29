@@ -1,0 +1,124 @@
+# Baseline EzTest CI. It mirrors the local scripts/test.ps1 gate: Go unit and
+# integration tests, frontend lint/typecheck/test and the executor test, plus
+# the repository-local static acceptance gate. Playwright E2E and real-LLM
+# acceptance stay out of scope: CI needs no browsers and makes no paid calls.
+#
+# scripts/acceptance.ps1 resolves its helper PowerShell host as
+# $PSHOME/pwsh.exe, so the static gate runs on a Windows runner (it needs no
+# PostgreSQL and no Go toolchain). Everything else runs on Ubuntu.
+
+name: CI
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Go, frontend and executor tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: eztest
+          POSTGRES_DB: eztest_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U eztest -d eztest_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      EZTEST_TEST_DATABASE_URL: postgres://eztest@127.0.0.1:5433/eztest_test?sslmode=disable
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: |
+            frontend/pnpm-lock.yaml
+            executor/pnpm-lock.yaml
+
+      - name: Go unit tests
+        working-directory: backend
+        run: go test -count=1 ./...
+
+      - name: Go integration tests
+        working-directory: backend
+        run: go test -tags=integration -count=1 ./...
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Frontend lint
+        working-directory: frontend
+        run: pnpm lint
+
+      - name: Frontend typecheck
+        working-directory: frontend
+        run: pnpm typecheck
+
+      - name: Frontend unit tests
+        working-directory: frontend
+        run: pnpm test
+
+      - name: Install executor dependencies
+        working-directory: executor
+        run: pnpm install --frozen-lockfile
+
+      - name: Executor unit tests
+        working-directory: executor
+        run: pnpm test
+
+  static-acceptance:
+    name: Static acceptance gate
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies (OpenAPI YAML parser)
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Static acceptance gate
+        run: pwsh -NoProfile -File scripts/acceptance.ps1 -StaticOnly
