@@ -253,7 +253,7 @@ P6 证据与结果位置：
 - MFA 自动登录接管验收：fixture 的 `/p6/login?mfa=1` 页面把查询串保留到表单 `action`，登录配方因此停在 `#mfa` 且不下发会话 Cookie；接受检查断言 `blocked(session, takeover_required)` + `needs_manual` 会话 + waiting takeover + `human.requested`/`gate.pending`。随后用普通 fixture 登录导出的 `storageState` 调用 `POST /api/resources/takeovers/{id}/complete`，断言 `gate.resolved(takeover_completed)`、新 attempt 自动入队并最终 `passed`；若后端未持久化 `case_run.session_id`，该子路径会以明确的 SKIP/限制记录而不是假通过。
 - `scripts/acceptance.ps1` 的 P6 证据根：`.tmp/p6-evidence/`（每批次/用例/证据 ID 分目录）；API/executor/fake LLM/fixture 日志在 `.tmp/acceptance-p6-*.log`。
 - 真实 LLM 验收证据根：`.tmp/p6-real-evidence/`；结果 JSON：`.tmp/p6-real-acceptance.json`（只含状态/ID/计数/耗时，不含 prompt、密钥或证据正文）。
-- P6 环境变量：`EZTEST_EXECUTOR_URL`、`EZTEST_EXECUTOR_TOKEN`、`EZTEST_EVIDENCE_DIR`、`EZTEST_EXEC_MAX_CONCURRENT_CASES`（1–8）、`EZTEST_EXEC_MAX_TOOL_CALLS`（1–1000）、`EZTEST_EXEC_CASE_TIMEOUT_MS`（1000–3600000）、`EZTEST_EXEC_MAX_CASES_PER_BATCH`（1–1000）、`EZTEST_EXEC_WORKER_INTERVAL_MS`（100–60000）、`EZTEST_EXEC_EVIDENCE_MAX_BYTES`（1 KiB–100 MiB）、`EZTEST_EXEC_EVIDENCE_PER_CASE`（1–1000），默认值与说明见 `.env.example` P6 段。
+- P6 环境变量：`EZTEST_EXECUTOR_URL`、`EZTEST_EXECUTOR_TOKEN`、`EZTEST_EVIDENCE_DIR`、`EZTEST_EXEC_MAX_CONCURRENT_CASES`（1–8）、`EZTEST_EXEC_MAX_TOOL_CALLS`（1–200，默认 `30`；超限 `inconclusive(model, tool_call_budget_exhausted)`）、`EZTEST_EXEC_CASE_TIMEOUT_MS`（1000–3600000）、`EZTEST_EXEC_MAX_CASES_PER_BATCH`（1–1000）、`EZTEST_EXEC_WORKER_INTERVAL_MS`（100–60000）、`EZTEST_EXEC_EVIDENCE_MAX_BYTES`（1 KiB–100 MiB）、`EZTEST_EXEC_EVIDENCE_PER_CASE`（1–1000）、`EZTEST_EXEC_ALLOWED_HOSTS`（executor 的 WS 白名单，默认 `localhost,127.0.0.1`；远程目标需显式配置，HTTP 导航/请求不受影响），默认值与说明见 `.env.example` P6 段。
 - 运行环境要求：Node 20+、Playwright 1.64.1 的 Chromium（或系统 Chrome/Edge，executor 会回退 channel `chrome`/`msedge`）、本机 PostgreSQL；真实 LLM 验收额外需要可用的 `llm_base_url`/`llm_key`/`llm_model_name` 与网络。
 
 P6 当时限制（P7/P8 已更新）：单进程调度在 P8 由 PostgreSQL advisory lock 单活；P6 阶段不支持 db 断言（P7 已补只读 db 断言）；不做用例级自动重跑（应用失败仅手动 rerun）；证据 GC 已于 P8 交付（只清执行证据文件）；真实 LLM 的分类/暂停结果受模型行为影响，脚本在不符合预期时 fail-closed。
@@ -264,7 +264,7 @@ P7 新增 `delivery` 限界上下文（问题/报告/分析 run），并加法�
 
 - **继续中（D43）**：在 `completed` 版本上成功创建需求会在同事务置 `status=continuing`、`continue_phase=clarifying`、`continued_at`（D31 唯一例外；确认/重开需求不改状态）；`batch_no` 只在建批时分配。`continuing → completed` 由自主协调器在增量批次链收尾后 `TryFinalize` 触发，取代 P6 的“批次完成即版本完成”。
 - **链式批次（D45）**：`run_batch.kind ∈ {baseline,incremental,supplement}` + `parent_batch_id`；单版本单活跃批；每批最多 1 个补全周期、每周期最多 5 条新用例；补全批由 worker 创建，用户不能手工建 supplement 批（409 `supplement_batch_automatic`）。增量批 base=上一终态批 `head_commit`，head=建批时固定分支 HEAD；非祖先（rebase/强推）回退版本基线并标 `base_fallback_reason=history_rewritten`。
-- **自主链（D51）**：单进程 worker 默认 2s tick，单 tick 最多处理 `EZTEST_AUTONOMY_BATCHES_PER_TICK`（默认 4）个终态批/继续中版本；顺序为失败分析（仅 `failed(application)`）→ 问题整理 → 报告 ensure/stale 重生成 → 基线批补全 → supplement 批；`autonomy_done`/`supplement_attempted` CAS 防重复建批。3 个 profile：`supplement-agent`、`failure-analysis-agent`、`issue-triage-agent`，MaxTurns 20 / 600s。
+- **自主链（D51）**：单进程 worker 默认 2s tick，单 tick 最多处理 `EZTEST_AUTONOMY_BATCHES_PER_TICK`（默认 4；>20 钳制为 20，<1/非整数启动失败）个终态批/继续中版本；顺序为失败分析（仅 `failed(application)`）→ 问题整理 → 报告 ensure/stale 重生成 → 基线批补全 → supplement 批；`autonomy_done`/`supplement_attempted` CAS 防重复建批。3 个 profile：`supplement-agent`、`failure-analysis-agent`、`issue-triage-agent`，MaxTurns 20 / 600s。
 - **问题（D47）**：`issue` + `issue_ref`；状态 `open → confirmed/dismissed`（终态，不重开）；AI 只为 `failed(application)` 与需求缺口建单，环境/会话/模型/用例失败不生成缺陷；同一 `sha256(version|caseNode|failureClass|normalizedReason)` 去重；确认/驳回任一登录用户可用，驳回必填原因、revision CAS；`code_anchor(subject_kind='issue')` 由服务端校验 `file:line` 与问题归属后创建。
 - **报告（D46）**：`report` 按 `(batch_id, revision)` 唯一；分析终态后自动发布 revision 1；读取时用 `input_fingerprint` 判 stale 并只发一次 `report.stale`；重新生成 revision+1（有新 revision 时返回最新 200，否则新建 201）；支持批次差异与 Markdown（含 Mermaid）导出。P6 `GET /batches/{id}/report` 派生端点保持原样。
 - **DB 断言（D48）**：环境级 `db_target`（admin-only，PostgreSQL）；密码明文存储（D28 同类例外）但 API/DTO/事件/审计/日志/证据/报告/prompt 永不回显；只读事务 + 单条 `SELECT/WITH/SHOW/EXPLAIN` + 超时/行数/SQL 与结果字节上限；连接/权限失败 → `blocked(environment)`，SQL/只读/截断错误 → `inconclusive(case)`；结果落 `db_result` 证据。
@@ -320,7 +320,7 @@ P7 证据与结果位置：
 - 报告 Markdown：`EZTEST_REPORT_DIR`（默认 `.data/reports`），DB 只存相对路径 + sha256 + 大小；导出响应带 `X-Content-SHA256`。
 - gated 真实验收结果写入 `.tmp/`（只含状态/ID/计数/错误码，不含 prompt、凭据、SQL 结果或证据正文）。
 
-P7 当时限制（P8 已收口/更新）：`version_change` 表与 `code_changed` 变更项已在 P8 落地（`GET /api/versions/{id}/code/changes` 的 `batchTimeline`）；证据 GC、报告 stale 联动、多实例 leader 锁已在 P8 落地；报告快照已写入 `baseFallbackReason`/`historyRewritten`；`EZTEST_AUTONOMY_BATCHES_PER_TICK` 已在 P8 接线（1–20，越界启动失败），`EZTEST_ANALYSIS_MAX_CASES`/`EZTEST_SUPPLEMENT_MAX_CASES` 仍未接线（见下文“P8 已知限制”）。报告 PDF、问题外部工单、问题重开/合并、非 PostgreSQL 目标库仍不在 P8 范围（P9/后续）。
+P7 当时限制（P8 已收口/更新）：`version_change` 表与 `code_changed` 变更项已在 P8 落地（`GET /api/versions/{id}/code/changes` 的 `batchTimeline`）；证据 GC、报告 stale 联动、多实例 leader 锁已在 P8 落地；报告快照已写入 `baseFallbackReason`/`historyRewritten`；`EZTEST_ANALYSIS_MAX_CASES`（1–50）与 `EZTEST_SUPPLEMENT_MAX_CASES`（1–20）已在 P8 接线；`EZTEST_AUTONOMY_BATCHES_PER_TICK` 已接线（默认 4，>20 钳制为 20，<1/非整数启动失败）。报告 PDF、问题外部工单、问题重开/合并、非 PostgreSQL 目标库仍不在 P8 范围（P9/后续）。
 
 ## P8 体验完善与硬化
 
@@ -484,7 +484,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/db.ps1 start
 
 ## 环境变量
 
-完整模板见 [`.env.example`](.env.example)。`.env`、`.tools/`、`docs/*.local.md` 均被 gitignore，**禁止提交真实密钥**。P8 限流/GC/leader、知识注入与视觉基线大小变量已写入模板；链路上限/检索/待办上限与 `EZTEST_VISUAL_DIFF_THRESHOLD` 仍未接线（模板中标注“预留”），需要时按表手工调整 `.env`。
+完整模板见 [`.env.example`](.env.example)。`.env`、`.tools/`、`docs/*.local.md` 均被 gitignore，**禁止提交真实密钥**。P8 限流/GC/leader、知识注入、视觉基线大小、执行器与 P7 限制变量已写入模板；链路上限/检索/待办上限与 `EZTEST_VISUAL_DIFF_THRESHOLD` 仍未接线（模板中标注“预留”），需要时按表手工调整 `.env`。
 
 | 变量 | 必填 | 说明 |
 |---|---|---|
@@ -519,10 +519,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/db.ps1 start
 | `EZTEST_EXPLORE_MAX_REQUESTS` | 否 | P5 单次探索最多 HTTP 请求数，1–40，默认 `40`；超出记 `stats.truncated`。 |
 | `EZTEST_EXPLORE_TIMEOUT_MS` | 否 | P5 探索单请求超时，500–30000 ms，默认 `5000`；另有 60s 总时长与 512 KiB 解析上限。 |
 | `EZTEST_EVIDENCE_DIR` | 否 | P6 执行证据根目录，默认 `.data/evidence`；DB 只存相对路径 + sha256 + 大小；P8 GC 只清理此目录下的证据文件。 |
+| `EZTEST_EXEC_MAX_TOOL_CALLS` | 否 | P6 每个 case run 的 Agent 工具调用预算，1–200，默认 `30`；超限以 `inconclusive(model, tool_call_budget_exhausted)` 结束，绝不记为 `failed`。 |
+| `EZTEST_EXEC_ALLOWED_HOSTS` | 否 | P6 executor 的 WebSocket host 白名单（逗号分隔），默认 `localhost,127.0.0.1`；WS 还必须同时通过 browser context 的 `allowedHosts`，HTTP 导航/请求不受影响。远程目标需显式加入；Compose executor 当前未注入该变量，按 loopback 默认运行。 |
 | `EZTEST_REPORT_DIR` | 否 | P7 报告 Markdown 根目录，默认 `.data/reports`；目录 0700、文件 0600，DB 只存相对路径 + sha256 + 大小。 |
-| `EZTEST_AUTONOMY_BATCHES_PER_TICK` | 否 | P7 自主 worker 单 tick 处理的终态批/继续中版本上限，1–20，默认 `4`；未设置时用默认值，非整数或越界会导致配置校验失败、进程启动失败（**不是**回退 4）。 |
-| `EZTEST_ANALYSIS_MAX_CASES` | 否 | P7/P8 规格目标：失败分析单 run 最多用例数（默认 `20`，1–100）；**当前构建仍以代码固定上限 20 执行，尚未读取该变量**（见 P8 已知限制）。 |
-| `EZTEST_SUPPLEMENT_MAX_CASES` | 否 | P7/P8 规格目标：补全单 run 最多新用例数（默认 `5`，1–20）；**当前构建仍以代码固定上限 5 执行，尚未读取该变量**（见 P8 已知限制）。 |
+| `EZTEST_AUTONOMY_BATCHES_PER_TICK` | 否 | P7 自主 worker 单 tick 处理的终态批/继续中版本上限，1–20，默认 `4`；未设置时用默认值，<1 或非整数导致启动失败，>20 钳制为 20（不是启动失败，也不是回退 4）。 |
+| `EZTEST_ANALYSIS_MAX_CASES` | 否 | P8 已接线：失败分析单 run 最多用例数，1–50，默认 `20`；超出记录 `truncated`。 |
+| `EZTEST_SUPPLEMENT_MAX_CASES` | 否 | P8 已接线：补全单 run 最多新用例数，1–20，默认 `5`；超出按上限截断。 |
 | `EZTEST_DB_RESULT_MAX_BYTES` | 否 | P7 db 断言单次结果字节上限，64 KiB–16 MiB，默认 `1048576`。 |
 | `EZTEST_DB_SQL_MAX_BYTES` | 否 | P7 db 断言 SQL 文本上限，1 KiB–64 KiB，默认 `16384`。 |
 | `EZTEST_RATE_LIMIT_RPS` | 否 | P8 每用户（认证后）/IP（公开路由）令牌桶速率，0–1000，默认 `50`；`0` 关闭普通令牌桶（SSE 并发上限仍生效）。超限返回 429 `rate_limited` + `Retry-After`。 |
@@ -774,8 +776,8 @@ P5 脚本可选配置：`EZTEST_ACCEPTANCE_API_URL`（复用已在运行的 API�
 - P3 版本域：只实现 `draft → clarifying → designing` 与需求 `draft → clarified`，不提供版本删除/归档、脑图/评审/执行/报告；附件仅落本地文件系统（无 GC/备份，删除 best-effort 可留孤儿文件）；AI 澄清/分析/侦察依赖 P1 Agent 与 LLM，不可用时返回 503 但人工路径可用；单版本最多一个 active 会话与一个运行中 Agent；P3 不写 `audit_logs`。
 - P4 代码智能：只做文件级 Git 与 AI 事实，无 parser/符号级调用链/字段级分析、无全仓 AI 分析、无全文检索；只分析变更文件且受 20 文件/64KiB/摘录行数/超时/队列(16)等上限约束；单实例进程内 worker，无取消、无跨进程恢复；仓库必须本地只读可见，不支持线上仓、分支切换或工作树修改；候选只有需求/应用模型（case/issue 归 P5/P6），版本锚点仅 API 可建；事实无人工修正/版本对比 UI；AI 失败降级为 T0 候选但可能产生 `analysis_queue_full`/`analysis_in_progress` 等 429/409；P4 不写 `audit_logs`（`code.read`/`code.analyze` 审计除外）。
 - P5 用例脑图：探索仅 HTTP GET/HEAD（无浏览器/JS 执行），依赖环境白名单，可能漏掉纯前端渲染页面；PNG 由前端画布生成，无服务端渲染；导出为 Markdown/Mermaid/OPML（不生成 XMind）；冻结后不可解冻，需求重开后的增量重校验、`affected.cases` 正式接入归 P6/P7（P7 已接入受影响用例/补全）；`impactCases` 只是 P4 候选映射的只读提示；单实例进程内 run worker（重启把 stale run 置 failed）；explore/data_plan 质量受真实 LLM 影响，脚本在非 `done` 时 fail-closed。
-- P6 执行：单进程调度；P8 起执行调度/自主 worker/每日 GC 维护通过 PostgreSQL advisory lock 单活（每次 tick 仅一个实例执行，其余实例 debug 跳过），但 SSE 广播与 Agent runner 仍为进程内单实例。db 断言为只读；不做用例级自动重跑（应用失败仅手动 rerun）；证据 GC 已交付但**只清 `EZTEST_EVIDENCE_DIR` 下的执行证据文件**（导出/附件/报告/孤儿文件不自动清理）；执行器不可用时只能查看历史结果/证据/报告，禁止建批；真实 LLM 的分类/暂停结果受模型行为影响，脚本在不符合预期时 fail-closed。
-- P7 交付（P8 更新）：`version_change` 表/`code_changed` 已在 P8 落地，`/api/versions/{id}/code/changes` 返回 `batchTimeline`；证据 GC 与报告 stale 联动、多实例 leader 锁已在 P8 落地；报告快照已含 `baseFallbackReason`/`historyRewritten`。仍不提供报告 PDF、问题外部工单、问题重开/合并、跨批次语义去重增强、非 PostgreSQL 目标库；全局问题/报告中心为只读列表；`IssuesTab` 仍较大未拆分（可维护性余项）；`EZTEST_ANALYSIS_MAX_CASES`/`EZTEST_SUPPLEMENT_MAX_CASES` 仍以代码固定上限 20/5 执行，尚未读取；`EZTEST_AUTONOMY_BATCHES_PER_TICK` 按 1–20 严格校验，越界启动失败。P7 真实验收脚本的已通过记录见 `acceptance.md`，最终以本分支重跑为准。
+- P6 执行：单进程调度；P8 起执行调度/自主 worker/每日 GC 维护通过 PostgreSQL advisory lock 单活（每次 tick 仅一个实例执行，其余实例 debug 跳过），但 SSE 广播与 Agent runner 仍为进程内单实例。db 断言为只读；不做用例级自动重跑（应用失败仅手动 rerun）；证据 GC 已交付但**只清 `EZTEST_EVIDENCE_DIR` 下的执行证据文件**（导出/附件/报告/孤儿文件不自动清理）；执行器不可用时只能查看历史结果/证据/报告，禁止建批；executor 的 WebSocket 默认仅允许 loopback（`EZTEST_EXEC_ALLOWED_HOSTS`，HTTP 导航不受影响），远程目标需显式配置；工具调用预算默认 30（1–200），超限为 `inconclusive(model)`；真实 LLM 的分类/暂停结果受模型行为影响，脚本在不符合预期时 fail-closed。
+- P7 交付（P8 更新）：`version_change` 表/`code_changed` 已在 P8 落地，`/api/versions/{id}/code/changes` 返回 `batchTimeline`；证据 GC 与报告 stale 联动、多实例 leader 锁已在 P8 落地；报告快照已含 `baseFallbackReason`/`historyRewritten`。仍不提供报告 PDF、问题外部工单、问题重开/合并、跨批次语义去重增强、非 PostgreSQL 目标库；全局问题/报告中心为只读列表；`IssuesTab` 仍较大未拆分（可维护性余项）；`EZTEST_ANALYSIS_MAX_CASES`（1–50）与 `EZTEST_SUPPLEMENT_MAX_CASES`（1–20）已于 P8 接线；`EZTEST_AUTONOMY_BATCHES_PER_TICK` 默认 4，>20 钳制为 20，<1/非整数启动失败。P7 真实验收脚本的已通过记录见 `acceptance.md`，最终以本分支重跑为准。
 - P8 硬化边界：限流是**每实例内存**计数（多副本需按实例预算合计，无分布式限流）；SSE/Agent runner 仍单实例；GC 只自动清理证据文件，且发布/过期报告不参与证据保护（报告快照不含 evidence id）；`EZTEST_CHAIN_MAX_NODES`/`EZTEST_SEARCH_MAX_RESULTS_PER_TYPE`/`EZTEST_TODOS_MAX` 未接线为环境变量；SLO 只有链路专项真实测量 PASS，`scripts/slo.ps1` 全量为 dry-run SKIP（待最终验收）；备份演练未做恢复库应用 smoke（defer Task 35）。
 - **视觉断言（D62）已接线，真实浏览器验收待 Task 35**：迁移（`mindmap_0003_visual.sql`、`execution_0005_visual_evidence.sql`）、mindmap 编辑/审批服务、`main/config` 装配、executor `visual.compare`、execution agent `execution.visual_assert`、四态分类、前端编辑/审批/查看器、评测语料均已提交；两条 `/visual` 路由已挂载，OpenAPI 已发布端点/`visual` 字段/`case.visual_baseline_approved` 事件。仍待完成：真实 Chromium 的 Go→executor 端到端比较与浏览器验收（Task 34/35），以及 `EZTEST_VISUAL_DIFF_THRESHOLD` 接线（当前阈值按断言配置）。“代码已接线”不等于“真实环境已验收”。
 - 多实例：只做 advisory lock 单活与执行器硬化；无多实例运维编排（P9 候选）；限流/SSE/Agent runner 不是集群级。

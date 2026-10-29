@@ -56,13 +56,18 @@ passes the repository `.env` to the API container with `env_file`.
 | `EZTEST_GC_ENABLED` / `RETENTION_DAYS` / `BATCH_KEEP` | api | P8 evidence GC (default false / 30 / 3); non-dry-run requires `true`. |
 | `EZTEST_INSTANCE_ID` / `EZTEST_LEADER_LOCK_KEY` | api | Multi-instance leader lock; instance id must be unique, lock key shared. |
 | `EZTEST_KNOWLEDGE_MAX_INJECT` / `MAX_BYTES` | api | P8 knowledge injection budgets (default 5 / 4096). |
+| `EZTEST_EXEC_MAX_TOOL_CALLS` | api | P8 wired per-case Agent tool-call budget, 1-200, default `30`; exhaustion ends the case `inconclusive(model, tool_call_budget_exhausted)`. |
+| `EZTEST_EXEC_ALLOWED_HOSTS` | executor | Executor-wide WebSocket allow list (comma-separated, default `localhost,127.0.0.1`). A page's ws/wss connection must also pass the context `allowedHosts`; HTTP navigation/requests are unaffected. Set remote hosts explicitly. The Compose executor service does not inject this variable yet, so it runs with the loopback default; extend the executor environment to change it. |
+| `EZTEST_ANALYSIS_MAX_CASES` / `EZTEST_SUPPLEMENT_MAX_CASES` / `EZTEST_AUTONOMY_BATCHES_PER_TICK` | api | P8 wired P7 limits: analysis 1-50 (default 20), supplement 1-20 (default 5), autonomy 1-20 (default 4; values above 20 are clamped, non-integer or below 1 fails startup). |
 | `EZTEST_VISUAL_BASELINE_MAX_BYTES` | api + executor process | P8 approved visual baseline / comparison cap, 64 KiB-20 MiB, default `5242880` (5 MiB). The API reads it; a host-launched executor reads it too. The Compose executor service does not receive it yet and runs with the 5 MiB default, so extend the executor environment to change its request cap. |
 | `EZTEST_VISUAL_DIFF_THRESHOLD` | api (reserved) | **Reserved:** not read by the current build; the threshold is stored per visual assertion (0-0.1, default 0.005). |
 
-Other `EZTEST_*` values from `.env` are passed through unchanged; Compose
-overrides `EZTEST_DATABASE_URL`, `EZTEST_HTTP_ADDR`, `EZTEST_OPENAPI_PATH` and the
-five content directories so the containers talk to the `postgres` service and use
-the mounted volumes.
+Other `EZTEST_*` values from `.env` are passed to the `api` service unchanged;
+Compose overrides `EZTEST_DATABASE_URL`, `EZTEST_HTTP_ADDR`, `EZTEST_OPENAPI_PATH`
+and the five content directories so the containers talk to the `postgres` service
+and use the mounted volumes. The `executor` service has an explicit environment
+list; extend it if the container needs `EZTEST_EXEC_ALLOWED_HOSTS` or
+`EZTEST_VISUAL_BASELINE_MAX_BYTES`.
 
 ### Content directories and volumes
 
