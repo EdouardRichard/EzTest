@@ -3,6 +3,8 @@
 import { Loader2 } from "lucide-react"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
+import { ErrorState } from "@/components/ui/ErrorState"
+import { Skeleton } from "@/components/ui/Skeleton"
 import { CodeChangesTab } from "@/features/code-intel/CodeChangesTab"
 import { useReport } from "@/features/delivery/hooks/useReports"
 import { BroadcastTab } from "@/features/execution/components/BroadcastTab"
@@ -75,6 +77,12 @@ function readBatchParam(): string {
 function readEvidenceParam(): string {
   if (typeof window === "undefined") return ""
   return new URLSearchParams(window.location.search).get("evidence") ?? ""
+}
+
+/** Reads the `?compare=` sibling of the `?evidence=` deep link (spec §8.3). */
+function readCompareParam(): string {
+  if (typeof window === "undefined") return ""
+  return new URLSearchParams(window.location.search).get("compare") ?? ""
 }
 
 /** Reads the `?issue=` / `?report=` / `?case=` deep links (spec §10.3/§10.4, P8 §7.1). */
@@ -152,8 +160,11 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
   const [version, setVersion] = useState<Version | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState("")
+  const [errorRequestId, setErrorRequestId] = useState("")
   const [tab, setTab] = useState<VersionTabValue>(DEFAULT_TAB)
   const [evidenceId, setEvidenceId] = useState("")
+  /** Second artifact of the `?evidence=&compare=` deep link (spec §8.3). */
+  const [compareEvidenceId, setCompareEvidenceId] = useState("")
   const [issueId, setIssueId] = useState("")
   const [reportId, setReportId] = useState("")
   /** Selected mindmap node of the `?case=` deep link (P8 §7.1). */
@@ -196,11 +207,15 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
     const requestId = ++requestRef.current
     setLoading(true)
     setError("")
+    setErrorRequestId("")
     try {
       const data = await getVersion(versionId)
       if (requestRef.current === requestId) setVersion(data)
     } catch (caught) {
-      if (requestRef.current === requestId) setError(describeLoadError(caught))
+      if (requestRef.current === requestId) {
+        setError(describeLoadError(caught))
+        setErrorRequestId(caught instanceof ApiError ? caught.requestId : "")
+      }
     } finally {
       if (requestRef.current === requestId) setLoading(false)
     }
@@ -218,6 +233,7 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
       if (initialTab === "exploration" && !isVersionTab(rawTab)) writeTabParam("exploration")
     }
     setEvidenceId(readEvidenceParam())
+    setCompareEvidenceId(readCompareParam())
     setIssueId(readDeepLinkParam("issue"))
     setReportId(readDeepLinkParam("report"))
     setCaseId(readDeepLinkParam("case"))
@@ -345,30 +361,21 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
     return (
       <div className="space-y-4">
         {error === "" ? (
-          <p className="flex items-center gap-2 rounded-xl border border-dashed border-border px-4 py-10 text-sm text-muted-foreground">
-            <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
-            正在加载版本…
-          </p>
+          <Skeleton label="正在加载版本…" lines={4} />
         ) : (
-          <div
-            role="alert"
-            className="space-y-3 rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-6 text-sm text-destructive"
-          >
-            <p>加载版本失败：{error}</p>
-            <button
-              type="button"
-              onClick={refresh}
-              className="rounded-lg border border-border bg-card px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            >
-              重试
-            </button>
-          </div>
+          <ErrorState
+            title="加载版本失败"
+            message={error}
+            requestId={errorRequestId}
+            onRetry={refresh}
+          />
         )}
       </div>
     )
   }
 
   const batchId = selectedBatch?.id ?? ""
+  const streamReconnecting = stream.status === "reconnecting" || stream.status === "connecting"
 
   return (
     <div className="space-y-4">
@@ -395,6 +402,26 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
           onOpenResults: () => handleTabChange("results"),
         }}
       />
+
+      {streamReconnecting ? (
+        <p
+          role="status"
+          aria-live="polite"
+          data-testid="version-stream-status"
+          data-state={stream.status}
+          className="flex flex-wrap items-center gap-2 rounded-xl border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
+        >
+          <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+          <span>实时连接重连中，正在保留上次数据。</span>
+          <button
+            type="button"
+            onClick={() => stream.reconnect()}
+            className="ml-auto rounded-lg border border-border bg-card px-2.5 py-1 text-xs font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            重新连接
+          </button>
+        </p>
+      ) : null}
 
       {error === "" ? null : (
         <p
@@ -488,7 +515,11 @@ export function VersionDetailPage({ versionId }: VersionDetailPageProps) {
         <EvidenceViewer
           versionId={versionId}
           evidenceId={evidenceId}
-          onClose={() => setEvidenceId("")}
+          compareWith={compareEvidenceId}
+          onClose={() => {
+            setEvidenceId("")
+            setCompareEvidenceId("")
+          }}
         />
       )}
 

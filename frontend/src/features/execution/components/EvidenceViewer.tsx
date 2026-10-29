@@ -1,10 +1,12 @@
 // biome-ignore-all lint/suspicious/noArrayIndexKey: db result rows/columns/cells are positional tuples without a domain id, so React keys can only derive from the position.
 "use client"
 
-import { Download, Loader2, X } from "lucide-react"
+import { Download, X } from "lucide-react"
 import { type KeyboardEvent as ReactKeyboardEvent, useEffect, useId, useRef, useState } from "react"
 
-import { apiStreamFetch } from "@/lib/api-client"
+import { ErrorState } from "@/components/ui/ErrorState"
+import { Skeleton } from "@/components/ui/Skeleton"
+import { ApiError, apiStreamFetch } from "@/lib/api-client"
 
 import { getEvidenceMeta, getEvidenceUrl } from "../api"
 import { parseDbResultEvidence } from "../db-result"
@@ -62,8 +64,23 @@ export type LogEvidenceEntry = {
 
 type ViewerState =
   | { status: "loading" }
-  | { status: "error"; message: string }
+  | { status: "error"; message: string; requestId: string }
   | { status: "ready"; meta: EvidenceMeta; text: string; objectUrl: string }
+
+/** Second artifact of the `?compare=` deep link (spec §8.3). */
+type CompareState =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "error"; message: string; requestId: string }
+  | { status: "ready"; meta: EvidenceMeta; text: string; objectUrl: string }
+
+type CompareMode = "side-by-side" | "slider"
+
+type LoadedArtifact = {
+  meta: EvidenceMeta
+  text: string
+  objectUrl: string
+}
 
 const FOCUSABLE_SELECTOR =
   'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
@@ -83,6 +100,63 @@ function parseJson(text: string): unknown {
   } catch {
     return null
   }
+}
+
+function abortError(): Error {
+  const error = new Error("aborted")
+  error.name = "AbortError"
+  return error
+}
+
+/** Request id of a failed read, when the shared error envelope carried one. */
+function requestIdOf(error: unknown): string {
+  if (!(error instanceof ApiError)) return ""
+  const value: unknown = error.requestId
+  return typeof value === "string" ? value : ""
+}
+
+/**
+ * Reads one artifact exactly like the single-evidence path: metadata first, then
+ * bytes through the bearer-aware streaming client. Binary kinds become an object
+ * URL; db results keep their JSON text and also get a downloadable blob URL.
+ * The caller owns revoking the returned URL.
+ */
+async function readArtifact(
+  versionId: string,
+  evidenceId: string,
+  signal: AbortSignal,
+): Promise<LoadedArtifact> {
+  const meta = await getEvidenceMeta(versionId, evidenceId, { signal })
+  if (signal.aborted) throw abortError()
+
+  const response = await apiStreamFetch(getEvidenceUrl(versionId, evidenceId), { signal })
+  if (signal.aborted) throw abortError()
+
+  if (isBinaryKind(meta.kind)) {
+    const blob = await response.blob()
+    const objectUrl = URL.createObjectURL(blob)
+    if (signal.aborted) {
+      URL.revokeObjectURL(objectUrl)
+      throw abortError()
+    }
+    return { meta, text: "", objectUrl }
+  }
+
+  const text = await response.text()
+  if (signal.aborted) throw abortError()
+  if (meta.kind === "db_result") {
+    // The JSON table's download link points at the fetched artifact; the bytes
+    // endpoint still needs the bearer, so a blob URL is used.
+    const objectUrl = URL.createObjectURL(
+      new Blob([text], { type: meta.mime === "" ? "application/json" : meta.mime }),
+    )
+    if (signal.aborted) {
+      URL.revokeObjectURL(objectUrl)
+      throw abortError()
+    }
+    return { meta, text, objectUrl }
+  }
+  return { meta, text, objectUrl: "" }
 }
 
 /** Splits one evidence document into its request/response halves defensively. */
@@ -154,12 +228,162 @@ export function evidenceFilename(meta: Pick<EvidenceMeta, "id" | "mime">): strin
   return `evidence-${meta.id}.${extension}`
 }
 
+const COMPARE_MODE_CLASS =
+  "rounded-md px-2.5 py-1 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+const COMPARE_MODE_ACTIVE_CLASS = "bg-card text-foreground shadow-sm"
+const COMPARE_MODE_IDLE_CLASS = "text-muted-foreground hover:text-foreground"
+
+type ScreenshotCompareProps = {
+  primary: Extract<ViewerState, { status: "ready" }>
+  compare: Extract<CompareState, { status: "ready" }>
+  mode: CompareMode
+  onModeChange: (mode: CompareMode) => void
+  sliderPosition: number
+  onSliderPositionChange: (position: number) => void
+}
+
+/**
+ * Side-by-side / slider comparison of two screenshot artifacts (spec §8.3).
+ * Both panes carry a high-contrast border to mark the compared region; the
+ * pixel-level diff itself belongs to the visual-assertion layer, not the
+ * browser viewer.
+ */
+function ScreenshotCompare({
+  primary,
+  compare,
+  mode,
+  onModeChange,
+  sliderPosition,
+  onSliderPositionChange,
+}: ScreenshotCompareProps) {
+  const headingId = useId()
+
+  return (
+    <section
+      data-testid="evidence-compare"
+      data-mode={mode}
+      aria-labelledby={headingId}
+      className="space-y-3"
+    >
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <h3 id={headingId} className="text-sm font-semibold">
+            证据对比
+          </h3>
+          <p className="mt-0.5 text-[11px] text-muted-foreground">
+            高亮边框标记两侧证据；不做像素级 diff。
+          </p>
+        </div>
+        <fieldset className="flex gap-1 rounded-lg border border-border bg-muted p-1">
+          <legend className="sr-only">对比模式</legend>
+          <button
+            type="button"
+            aria-pressed={mode === "side-by-side"}
+            onClick={() => onModeChange("side-by-side")}
+            className={`${COMPARE_MODE_CLASS} ${
+              mode === "side-by-side" ? COMPARE_MODE_ACTIVE_CLASS : COMPARE_MODE_IDLE_CLASS
+            }`}
+          >
+            并排
+          </button>
+          <button
+            type="button"
+            aria-pressed={mode === "slider"}
+            onClick={() => onModeChange("slider")}
+            className={`${COMPARE_MODE_CLASS} ${
+              mode === "slider" ? COMPARE_MODE_ACTIVE_CLASS : COMPARE_MODE_IDLE_CLASS
+            }`}
+          >
+            滑块
+          </button>
+        </fieldset>
+      </div>
+
+      {mode === "side-by-side" ? (
+        <div className="grid gap-3 lg:grid-cols-2">
+          <figure
+            data-testid="evidence-compare-pane-primary"
+            data-diff-highlight="true"
+            className="space-y-2 rounded-xl border-2 border-amber-500/60 bg-muted/30 p-2"
+          >
+            {/* biome-ignore lint/performance/noImgElement: evidence bytes come from an object URL, not a static asset */}
+            <img
+              src={primary.objectUrl}
+              alt={`对比证据 A ${primary.meta.id}`}
+              data-testid="evidence-compare-image-primary"
+              className="mx-auto max-h-[52vh] w-auto rounded-lg object-contain"
+            />
+            <figcaption className="text-center text-[11px] text-muted-foreground">
+              证据 A（当前）
+            </figcaption>
+          </figure>
+          <figure
+            data-testid="evidence-compare-pane-compare"
+            data-diff-highlight="true"
+            className="space-y-2 rounded-xl border-2 border-amber-500/60 bg-muted/30 p-2"
+          >
+            {/* biome-ignore lint/performance/noImgElement: evidence bytes come from an object URL, not a static asset */}
+            <img
+              src={compare.objectUrl}
+              alt={`对比证据 B ${compare.meta.id}`}
+              data-testid="evidence-compare-image-compare"
+              className="mx-auto max-h-[52vh] w-auto rounded-lg object-contain"
+            />
+            <figcaption className="text-center text-[11px] text-muted-foreground">
+              证据 B（对比）
+            </figcaption>
+          </figure>
+        </div>
+      ) : (
+        <div data-testid="evidence-compare-slider" className="space-y-2">
+          <div className="relative overflow-hidden rounded-xl border-2 border-amber-500/60 bg-muted/30">
+            {/* biome-ignore lint/performance/noImgElement: evidence bytes come from an object URL, not a static asset */}
+            <img
+              src={primary.objectUrl}
+              alt={`对比证据 A ${primary.meta.id}`}
+              data-testid="evidence-compare-image-primary"
+              className="mx-auto block max-h-[58vh] w-auto object-contain"
+            />
+            {/* biome-ignore lint/performance/noImgElement: evidence bytes come from an object URL, not a static asset */}
+            <img
+              src={compare.objectUrl}
+              alt={`对比证据 B ${compare.meta.id}`}
+              data-testid="evidence-compare-image-slider"
+              style={{ clipPath: `inset(0 ${100 - sliderPosition}% 0 0)` }}
+              className="absolute inset-0 h-full w-full object-contain"
+            />
+          </div>
+          <label className="flex items-center gap-2 text-xs text-muted-foreground">
+            <span>对比位置</span>
+            <input
+              type="range"
+              min={0}
+              max={100}
+              value={sliderPosition}
+              aria-label="对比滑块"
+              onChange={(event) => onSliderPositionChange(Number(event.target.value))}
+              className="h-1.5 min-w-0 flex-1 cursor-pointer accent-amber-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            />
+            <span className="w-9 text-right font-mono">{`${sliderPosition}%`}</span>
+          </label>
+        </div>
+      )}
+    </section>
+  )
+}
+
 export type EvidenceViewerProps = {
   /** Version that owns the evidence; the bytes endpoint is version-scoped. */
   versionId: string
   evidenceId: string
   /** Summary already known by the case run, used until the meta read lands. */
   evidence?: EvidenceView | null
+  /**
+   * Second artifact of the `?evidence=&compare=` deep link (spec §8.3). The two
+   * screenshots are shown side by side or through a slider; an empty value keeps
+   * the single-evidence viewer unchanged.
+   */
+  compareWith?: string
   onClose: () => void
 }
 
@@ -169,17 +393,24 @@ export type EvidenceViewerProps = {
  * API client and rendered from an object URL; the filesystem path is never
  * displayed. Rendering is per kind: screenshot image, HTTP request/response
  * panes with a copyable curl, searchable console tail and a download link.
+ * With `compareWith`, two screenshots are compared side by side or with a
+ * slider (spec §8.3); the comparison read is independent so a failure keeps the
+ * primary artifact visible.
  */
 export function EvidenceViewer({
   versionId,
   evidenceId,
   evidence = null,
+  compareWith = "",
   onClose,
 }: EvidenceViewerProps) {
   const titleId = useId()
   const dialogRef = useRef<HTMLDivElement | null>(null)
   const previousFocusRef = useRef<Element | null>(null)
   const [state, setState] = useState<ViewerState>({ status: "loading" })
+  const [compareState, setCompareState] = useState<CompareState>({ status: "idle" })
+  const [compareMode, setCompareMode] = useState<CompareMode>("side-by-side")
+  const [sliderPosition, setSliderPosition] = useState(50)
   const [reloadKey, setReloadKey] = useState(0)
   const [query, setQuery] = useState("")
   const [copied, setCopied] = useState(false)
@@ -192,57 +423,58 @@ export function EvidenceViewer({
     setState({ status: "loading" })
     setQuery("")
     setCopied(false)
+    setCompareMode("side-by-side")
+    setSliderPosition(50)
 
-    async function load(): Promise<void> {
-      const meta = await getEvidenceMeta(versionId, evidenceId, { signal: controller.signal })
-      if (controller.signal.aborted) return
-
-      const response = await apiStreamFetch(getEvidenceUrl(versionId, evidenceId), {
-        signal: controller.signal,
+    readArtifact(versionId, evidenceId, controller.signal)
+      .then((artifact) => {
+        objectUrl = artifact.objectUrl
+        if (!controller.signal.aborted) setState({ status: "ready", ...artifact })
       })
-      if (controller.signal.aborted) return
-
-      if (isBinaryKind(meta.kind)) {
-        const blob = await response.blob()
-        const url = URL.createObjectURL(blob)
-        objectUrl = url
-        if (controller.signal.aborted) {
-          URL.revokeObjectURL(url)
-          return
-        }
-        setState({ status: "ready", meta, text: "", objectUrl: url })
-        return
-      }
-
-      const text = await response.text()
-      if (controller.signal.aborted) return
-      if (meta.kind === "db_result") {
-        // The JSON table's download link points at the fetched artifact; the
-        // bytes endpoint still needs the bearer, so a blob URL is used.
-        const url = URL.createObjectURL(
-          new Blob([text], { type: meta.mime === "" ? "application/json" : meta.mime }),
-        )
-        objectUrl = url
-        if (controller.signal.aborted) {
-          URL.revokeObjectURL(url)
-          return
-        }
-        setState({ status: "ready", meta, text, objectUrl: url })
-        return
-      }
-      setState({ status: "ready", meta, text, objectUrl: "" })
-    }
-
-    load().catch((caught: unknown) => {
-      if (controller.signal.aborted) return
-      setState({ status: "error", message: describeExecutionError(caught) })
-    })
+      .catch((caught: unknown) => {
+        if (controller.signal.aborted) return
+        setState({
+          status: "error",
+          message: describeExecutionError(caught),
+          requestId: requestIdOf(caught),
+        })
+      })
 
     return () => {
       controller.abort()
       if (objectUrl !== "") URL.revokeObjectURL(objectUrl)
     }
   }, [versionId, evidenceId, reloadKey])
+
+  // The comparison artifact is read independently so either side may still
+  // render (and be retried) when the other one fails.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: reloadKey restarts the read
+  useEffect(() => {
+    if (compareWith === "" || compareWith === evidenceId) return
+
+    const controller = new AbortController()
+    let objectUrl = ""
+    setCompareState({ status: "loading" })
+
+    readArtifact(versionId, compareWith, controller.signal)
+      .then((artifact) => {
+        objectUrl = artifact.objectUrl
+        if (!controller.signal.aborted) setCompareState({ status: "ready", ...artifact })
+      })
+      .catch((caught: unknown) => {
+        if (controller.signal.aborted) return
+        setCompareState({
+          status: "error",
+          message: describeExecutionError(caught),
+          requestId: requestIdOf(caught),
+        })
+      })
+
+    return () => {
+      controller.abort()
+      if (objectUrl !== "") URL.revokeObjectURL(objectUrl)
+    }
+  }, [versionId, evidenceId, compareWith, reloadKey])
 
   // Save the opener, focus the dialog, restore focus when it unmounts.
   useEffect(() => {
@@ -284,6 +516,15 @@ export function EvidenceViewer({
   const sha256 = ready?.meta.sha256 ?? evidence?.sha256 ?? ""
   const exchange = ready !== null && kind === "http_exchange" ? parseHttpExchange(ready.text) : null
   const curl = exchange === null ? "" : buildCurl(exchange.request)
+  const compareActive = compareWith !== "" && compareWith !== evidenceId
+  const compareReady = compareState.status === "ready" ? compareState : null
+  const screenshotCompare =
+    ready !== null &&
+    compareReady !== null &&
+    ready.meta.kind === "screenshot" &&
+    compareReady.meta.kind === "screenshot"
+      ? { primary: ready, compare: compareReady }
+      : null
 
   async function handleCopyCurl(): Promise<void> {
     if (curl === "") return
@@ -630,26 +871,52 @@ export function EvidenceViewer({
 
         <div className="min-h-0 flex-1 overflow-auto p-4">
           {state.status === "loading" ? (
-            <p role="status" className="flex items-center gap-2 text-sm text-muted-foreground">
-              <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
-              正在加载证据…
-            </p>
+            <Skeleton label="正在加载证据…" lines={4} />
           ) : state.status === "error" ? (
-            <div
-              role="alert"
-              className="space-y-3 rounded-xl border border-destructive/30 bg-destructive/10 px-4 py-4 text-sm text-destructive"
-            >
-              <p>加载证据失败：{state.message}</p>
-              <button
-                type="button"
-                onClick={() => setReloadKey((key) => key + 1)}
-                className="rounded-lg border border-border bg-card px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                重试
-              </button>
-            </div>
+            <ErrorState
+              title="加载证据失败"
+              message={state.message}
+              requestId={state.requestId}
+              onRetry={() => setReloadKey((key) => key + 1)}
+            />
           ) : (
-            renderReady(state)
+            <div className="space-y-3">
+              {compareActive ? (
+                compareState.status === "loading" ? (
+                  <Skeleton label="正在加载对比证据…" lines={2} />
+                ) : compareState.status === "error" ? (
+                  <ErrorState
+                    title="加载对比证据失败"
+                    message={compareState.message}
+                    requestId={compareState.requestId}
+                    onRetry={() => setReloadKey((key) => key + 1)}
+                  />
+                ) : null
+              ) : null}
+
+              {screenshotCompare === null ? (
+                <>
+                  {compareActive && compareState.status === "ready" ? (
+                    <p
+                      data-testid="evidence-compare-unsupported"
+                      className="rounded-xl border border-dashed border-border px-3 py-2 text-xs text-muted-foreground"
+                    >
+                      仅截图证据支持并排/滑块对比，当前仍展示原证据。
+                    </p>
+                  ) : null}
+                  {renderReady(state)}
+                </>
+              ) : (
+                <ScreenshotCompare
+                  primary={screenshotCompare.primary}
+                  compare={screenshotCompare.compare}
+                  mode={compareMode}
+                  onModeChange={setCompareMode}
+                  sliderPosition={sliderPosition}
+                  onSliderPositionChange={setSliderPosition}
+                />
+              )}
+            </div>
           )}
         </div>
       </div>
