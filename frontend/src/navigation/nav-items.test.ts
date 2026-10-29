@@ -3,15 +3,15 @@ import { describe, expect, it } from "vitest"
 import { isActive, NAV_ITEMS } from "@/navigation/nav-items"
 
 describe("navigation items", () => {
-  it("exposes the two P0 routes and keeps the future phase entries", () => {
-    const p0 = NAV_ITEMS.filter((item) => item.phase === "P0")
-    expect(p0.map((item) => item.href)).toEqual(["/", "/settings"])
+  it("exposes the current P8 routes and keeps the future phase entries", () => {
+    const p8 = NAV_ITEMS.filter((item) => item.phase === "P8")
+    expect(p8.map((item) => item.href)).toEqual(["/", "/agents", "/settings"])
     expect(NAV_ITEMS.some((item) => item.phase === "P3")).toBe(true)
   })
 
   it("marks the agent console route as the P1 agent runtime console", () => {
     const agents = NAV_ITEMS.find((item) => item.href === "/agents")
-    expect(agents?.phase).toBe("P1")
+    expect(agents?.phase).toBe("P8")
     expect(agents?.hint).toBe("Agent 运行时控制台（P8 扩展为 Agent 中心）")
   })
 

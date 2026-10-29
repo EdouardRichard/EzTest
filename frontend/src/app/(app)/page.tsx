@@ -150,7 +150,7 @@ export default function OverviewPage() {
         <div>
           <div className="flex items-center gap-2">
             <h1 className="text-2xl font-semibold tracking-tight">概览</h1>
-            <StatusBadge variant="info">P0 地基</StatusBadge>
+            <StatusBadge variant="info">P8 体验硬化</StatusBadge>
           </div>
           <p className="mt-1 text-sm text-muted-foreground">
             平台与依赖的实时健康状态，以及当前阶段的交付边界。
