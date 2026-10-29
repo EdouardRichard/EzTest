@@ -1,0 +1,15 @@
+{
+  "corpusVersion": "2026-10-29.1",
+  "description": "Issue truth of the deterministic failing batch. The fake failure-analysis/triage agents materialize one AI issue for the first failing case per batch, titled with the `P7 失败分析：` prefix and the case title. issue_false_positive_rate = (AI issues - true positive issues) / AI issues (threshold <= 0.05); the runner matches an AI issue to a truth row by its stable title.",
+  "truePositives": [
+    {
+      "caseTitle": "P5 正常主流程用例",
+      "title": "P7 失败分析：P5 正常主流程用例"
+    },
+    {
+      "caseTitle": "P5 异常边界用例",
+      "title": "P7 失败分析：P5 异常边界用例"
+    }
+  ],
+  "expectedAIIssues": 1
+}

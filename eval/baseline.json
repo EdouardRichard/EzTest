@@ -1,0 +1,14 @@
+{
+  "corpusVersion": "2026-10-29.1",
+  "mode": "deterministic",
+  "updatedAt": "2026-10-29",
+  "description": "Frozen deterministic baseline (design spec §9.1/D61), taken from the first full deterministic pass (run recorded by scripts/eval.ps1; all six metrics at the corpus values below). Any metric more than 0.05 worse than this file fails the eval gate; issue_false_positive_rate is the only upper-bound metric.",
+  "metrics": {
+    "design_coverage": 1.0,
+    "impact_recall": 1.0,
+    "impact_precision": 1.0,
+    "classification_accuracy": 1.0,
+    "issue_false_positive_rate": 0.0,
+    "supplement_hit_rate": 1.0
+  }
+}

@@ -104,6 +104,10 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/crypto"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/idempotency"
+	qualityapp "github.com/EdouardRichard/EzTest/backend/internal/quality/application"
+	qualitydomain "github.com/EdouardRichard/EzTest/backend/internal/quality/domain"
+	qualitypostgres "github.com/EdouardRichard/EzTest/backend/internal/quality/infrastructure/postgres"
+	qualityhttp "github.com/EdouardRichard/EzTest/backend/internal/quality/interfaces/httpapi"
 	resourceapp "github.com/EdouardRichard/EzTest/backend/internal/resource/application"
 	resourceaudit "github.com/EdouardRichard/EzTest/backend/internal/resource/infrastructure/audit"
 	"github.com/EdouardRichard/EzTest/backend/internal/resource/infrastructure/gitexec"
@@ -945,12 +949,21 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	agentSessionService := agentapp.NewSessionService(
 		agentProfiles, agentSessions, agentRuns, agentMessages, runService, agentAuditSink)
 	agentToolCatalog := agentapp.NewToolCatalog(agentRegistry)
-	// P8 Agent centre (spec §8.1/D60): the read-only catalogue and run
-	// observation. The optional quality provider stays nil until Task 23 wires
-	// the evaluation context, so /api/agent-center/quality reports null.
+	// P8 quality platform (spec 搂9.1/D61): the evaluation-run store and service.
+	// Results enter the platform only through the admin HTTP API; the Agent
+	// centre reads the latest run through the composition-root adapter below.
+	qualityService := qualityapp.NewService(
+		qualitypostgres.NewEvalRepository(database.Pool),
+		qualityapp.WithIDGenerator(snowflake),
+		qualityapp.WithClock(wallClock{}),
+	)
+	// P8 Agent centre (spec 搂8.1/D60): the read-only catalogue and run
+	// observation. The quality provider projects the latest evaluation summary;
+	// it returns an explicit null until an evaluation run exists.
 	agentCenterService := agentapp.NewCenterService(agentapp.CenterServiceDeps{
 		Profiles: agentProfileService,
 		Reads:    agentpostgres.NewCenterRepository(database.Pool),
+		Quality:  qualityCenterReader{service: qualityService},
 	})
 	// Both P1 services exist now; bind them into the P3 adapter before the HTTP
 	// server can accept a clarification request.
@@ -1404,6 +1417,9 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Delivery: deliverysearch.New(database.Pool, versionService),
 	})
 	searchHandlers := searchhttp.NewHandlers(searchService)
+	// P8 evaluation dashboard and runner ingest (spec 搂9.1): the handler group
+	// renders the persisted runs; the admin guard is applied by server.New.
+	qualityHandlers := qualityhttp.NewHandlers(qualityService)
 	cancelStartup()
 
 	// Every request context descends from baseCtx. Canceling it on shutdown
@@ -1441,6 +1457,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 			Chain:     chainHandlers,
 			Workspace: workspaceHandlers,
 			Search:    searchHandlers,
+			Quality:   qualityHandlers,
 		}),
 		BaseContext:       baseContext(baseCtx),
 		ReadHeaderTimeout: 10 * time.Second,
@@ -1835,6 +1852,43 @@ func stopP7WorkerLoops(cancel context.CancelFunc, autonomy, analysis p7WorkerSto
 	if analysis != nil {
 		analysis.Stop()
 	}
+}
+
+// qualityCenterReader adapts the quality application service to the Agent
+// centre's consumer-defined QualityReader port (spec 搂3.3/搂8.1). It lives in the
+// composition root so the quality context never imports the agent context. A
+// platform without an evaluation run reports an explicit null instead of zeros.
+type qualityCenterReader struct {
+	service *qualityapp.Service
+}
+
+var _ agentapp.QualityReader = qualityCenterReader{}
+
+// LatestEvaluation implements agent/application.QualityReader.
+func (r qualityCenterReader) LatestEvaluation(ctx context.Context) (*agentapp.CenterEval, error) {
+	if r.service == nil {
+		return nil, nil
+	}
+	run, err := r.service.Latest(ctx)
+	if errors.Is(err, qualityapp.ErrRunNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	metrics := make(map[string]float64, len(run.Metrics))
+	thresholds := make(map[string]float64, len(run.Metrics))
+	for _, metric := range run.Metrics {
+		metrics[metric.Name] = metric.Value
+		thresholds[metric.Name] = metric.Threshold
+	}
+	return &agentapp.CenterEval{
+		RunID:      run.ID,
+		Passed:     run.Status == qualitydomain.StatusPassed,
+		Metrics:    metrics,
+		Thresholds: thresholds,
+		CreatedAt:  run.StartedAt,
+	}, nil
 }
 
 // deliveryIssueCodeRefs adapts the delivery code-anchor projection to the HTTP

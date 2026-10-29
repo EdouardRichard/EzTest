@@ -4777,6 +4777,82 @@ writeFileSync(process.argv[3], JSON.stringify({
             }
         })
 
+    # -----------------------------------------------------------------------
+    # P8 evaluation corpus / runner hook (spec §9.1/D61). The static contract is
+    # checked in every mode (it also covers -StaticOnly); the deterministic gate
+    # itself runs only in the full acceptance mode because it needs PostgreSQL,
+    # the API binary, the fixture executor and the fake LLM.
+    # -----------------------------------------------------------------------
+    [void](Invoke-Check -Dod "P8" -CheckName "P8 eval corpus and baseline" -Body {
+            $evalRoot = Join-Path $repoRoot "eval"
+            $required = @(
+                "README.md",
+                "baseline.json",
+                "corpus\requirements.json",
+                "corpus\environment.json",
+                "ground-truth\impact.json",
+                "ground-truth\classification.json",
+                "ground-truth\issues.json",
+                "ground-truth\supplement.json"
+            )
+            $versions = @{}
+            foreach ($relative in $required) {
+                $path = Join-Path $evalRoot $relative
+                if (-not (Test-Path -LiteralPath $path)) {
+                    throw "missing eval artifact eval/$relative"
+                }
+                if ($relative -like "*.json") {
+                    try {
+                        $document = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+                    } catch {
+                        throw "eval/$relative is not valid JSON"
+                    }
+                    $version = [string]$document.corpusVersion
+                    if ([string]::IsNullOrWhiteSpace($version)) {
+                        throw "eval/$relative has no corpusVersion"
+                    }
+                    $versions[$relative] = $version
+                }
+            }
+            $distinctVersions = @($versions.Values | Select-Object -Unique)
+            if ($distinctVersions.Count -ne 1) {
+                throw "the eval corpus files disagree on corpusVersion"
+            }
+            $baseline = Get-Content -LiteralPath (Join-Path $evalRoot "baseline.json") -Raw -Encoding UTF8 | ConvertFrom-Json
+            foreach ($metric in @("design_coverage", "impact_recall", "impact_precision",
+                    "classification_accuracy", "issue_false_positive_rate", "supplement_hit_rate")) {
+                $property = $baseline.metrics.PSObject.Properties[$metric]
+                if ($null -eq $property) {
+                    throw "eval/baseline.json is missing metric $metric"
+                }
+                $value = 0.0
+                if (-not [double]::TryParse([string]$property.Value, [ref]$value) -or $value -lt 0 -or $value -gt 1) {
+                    throw "eval/baseline.json metric $metric is not a ratio"
+                }
+            }
+            if (-not (Test-Path -LiteralPath (Join-Path $scriptsDir "eval.ps1"))) {
+                throw "scripts/eval.ps1 is missing"
+            }
+            Write-Host ("P8 eval corpus OK: {0} JSON artifacts, baseline 6 metrics, corpusVersion {1}." -f `
+                    $versions.Count, $distinctVersions[0])
+        })
+
+    if ($StaticOnly) {
+        Add-CheckResult -Dod "P8" -CheckName "P8 evaluation gate" -Status "SKIPPED" `
+            -Detail "StaticOnly: the deterministic evaluation gate needs PostgreSQL, the API binary, the executor and the fake LLM."
+    } else {
+        [void](Invoke-Check -Dod "P8" -CheckName "P8 evaluation gate" -Body {
+                Invoke-LoggedCommand -Exe $scriptHost `
+                    -Arguments @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $scriptsDir "eval.ps1")) `
+                    -WorkingDirectory $repoRoot `
+                    -LogPath (Join-Path $tmpDir "acceptance-p8-eval.log") `
+                    -Label "scripts/eval.ps1" `
+                    -SuccessTailLines 20
+            })
+    }
+    Add-CheckResult -Dod "P8" -CheckName "P8 real LLM evaluation" -Status "SKIPPED" `
+        -Detail "Gated: run scripts/eval.ps1 -RealLLM with EZTEST_RUN_REAL_LLM=1 for a report-only real-model run."
+
     Add-CheckResult -Dod "P7" -CheckName "P7 real LLM acceptance" -Status "SKIPPED" `
         -Detail "Gated: run scripts/acceptance-p7-llm.ps1 with EZTEST_RUN_REAL_LLM=1 (supplement, failure analysis/triage, continuing incremental, degraded; T28)."
     Add-CheckResult -Dod "P7" -CheckName "P7 real DB acceptance" -Status "SKIPPED" `

@@ -27,6 +27,7 @@ import (
 	mindmaphttp "github.com/EdouardRichard/EzTest/backend/internal/mindmap/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/idempotency"
+	qualityhttp "github.com/EdouardRichard/EzTest/backend/internal/quality/interfaces/httpapi"
 	resourcehttp "github.com/EdouardRichard/EzTest/backend/internal/resource/interfaces/httpapi"
 	searchhttp "github.com/EdouardRichard/EzTest/backend/internal/search/interfaces/httpapi"
 	storagehttp "github.com/EdouardRichard/EzTest/backend/internal/storage/interfaces/httpapi"
@@ -150,6 +151,11 @@ type Dependencies struct {
 	// is mounted. It relies on the global bearer auth and adds no per-route
 	// guard: every logged-in user may search (spec §6.2).
 	Search *searchhttp.Handlers
+	// Quality holds the P8 evaluation-results handler group. When set, the
+	// /api/quality/eval-runs routes are mounted behind the global bearer auth
+	// and the per-route admin guard: the eval runner and the quality dashboard
+	// are administrator-only (spec §9.1/§11.5).
+	Quality *qualityhttp.Handlers
 }
 
 // New assembles the HTTP handler. Middleware runs in the order
@@ -282,6 +288,15 @@ func New(cfg config.Config, logger *slog.Logger, deps Dependencies) http.Handler
 		// global bearer auth and adds no per-route guard: every logged-in user
 		// may search (spec §6.2).
 		deps.Search.RegisterRoutes(mux)
+	}
+	if deps.Quality != nil {
+		// The evaluation results (P8) are mounted at /api/quality/eval-runs.
+		// Authentication is the global middleware; every route adds the admin
+		// guard because evaluation is administrator-only (spec §9.1/§11.5).
+		qualityGuard := func(next http.Handler) http.Handler {
+			return identityhttp.RequireAdmin(next)
+		}
+		deps.Quality.RegisterRoutes(mux, qualityGuard)
 	}
 	if deps.Events != nil && cfg.EnableTestEndpoints {
 		auditor := deps.Audit
