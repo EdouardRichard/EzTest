@@ -259,6 +259,10 @@ export function ExplorationTab({
       (node) => node.id === `${parsedSelection.kind}:${parsedSelection.id}`,
     )
   }, [parsedSelection, chain.data])
+  const selectedLayoutNode = useMemo(() => {
+    if (selectedSnapshotNode === undefined || layout === null) return undefined
+    return layout.nodes.find((node) => node.id === selectedSnapshotNode.id)
+  }, [selectedSnapshotNode, layout])
   const nodeMissing =
     selectedNodeParam !== "" &&
     chain.data !== null &&
@@ -529,6 +533,12 @@ export function ExplorationTab({
               ? undefined
               : resultBatchByRun.get(selectedSnapshotNode.caseRunId)) ??
             selectedSnapshotNode.batchId
+          }
+          collapsed={selectedLayoutNode?.collapsed ?? false}
+          onToggleCollapse={
+            selectedLayoutNode?.kind === "requirement" && selectedLayoutNode.hasChildren
+              ? () => toggleRequirement(selectedSnapshotNode.id)
+              : undefined
           }
           onClose={closeSheet}
           onOpenEvidence={onOpenEvidence}

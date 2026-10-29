@@ -38,6 +38,10 @@ export type ChainSheetProps = {
   stream?: VersionStreamState
   /** Batch of the result/case-run, resolved by the composition layer. */
   resultBatchId?: string
+  /** Collapse state of the selected requirement group, if it has one. */
+  collapsed?: boolean
+  /** Explicit collapse/expand control for a requirement node's group. */
+  onToggleCollapse?: () => void
   onClose: () => void
   onOpenEvidence?: (evidenceId: string) => void
   onNavigate?: (target: ChainSheetDeepLink) => void
@@ -115,6 +119,8 @@ export function ChainSheet({
   batchId,
   stream,
   resultBatchId,
+  collapsed = false,
+  onToggleCollapse,
   onClose,
   onOpenEvidence,
   onNavigate,
@@ -179,7 +185,7 @@ export function ChainSheet({
     const last = focusables[focusables.length - 1]
     const active = document.activeElement
     if (event.shiftKey) {
-      if (active === first || !dialog.contains(active)) {
+      if (active === first || active === dialog || !dialog.contains(active)) {
         event.preventDefault()
         last.focus()
       }
@@ -278,6 +284,17 @@ export function ChainSheet({
         ) : null}
 
         <div className="flex flex-wrap items-center gap-2">
+          {node.kind === "requirement" && onToggleCollapse !== undefined ? (
+            <button
+              type="button"
+              data-testid="chain-sheet-toggle-collapse"
+              aria-expanded={!collapsed}
+              onClick={onToggleCollapse}
+              className={BUTTON_CLASS}
+            >
+              {collapsed ? "展开该需求组" : "折叠该需求组"}
+            </button>
+          ) : null}
           {node.kind === "requirement" ? (
             <button
               type="button"

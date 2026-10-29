@@ -445,8 +445,10 @@ describe("ExplorationTab", () => {
     // encodings so the status never depends on colour alone.
     expect(passedCard.querySelector("header span")?.className).toContain("emerald")
     expect(failedCard.querySelector("header span")?.className).toContain("red")
-    expect(passed.querySelector("svg")).not.toBeNull()
-    expect(failed.querySelector("svg")).not.toBeNull()
+    // The status icon is the concrete lucide glyph of the status token, not an
+    // arbitrary svg: 通过 uses CircleCheck, 失败 uses CircleX.
+    expect(passedCard.querySelector("svg.lucide-circle-check")).not.toBeNull()
+    expect(failedCard.querySelector("svg.lucide-circle-x")).not.toBeNull()
   })
 
   it("opens a result drawer with attempt, summary and caseRunId-lazy evidence", async () => {
@@ -491,7 +493,10 @@ describe("ExplorationTab", () => {
     const { onNavigate } = renderTab()
 
     fireEvent.click(await screen.findByTestId(`chain-node-${R2}`))
-    expect(screen.getByTestId("chain-sheet").getAttribute("data-kind")).toBe("requirement")
+    // A requirement click waits out the double-click window so a double click
+    // can still collapse the group without a Sheet swallowing the second click.
+    const sheet = await screen.findByTestId("chain-sheet")
+    expect(sheet.getAttribute("data-kind")).toBe("requirement")
     fireEvent.click(screen.getByTestId("chain-sheet-open-requirement"))
 
     expect(onNavigate).toHaveBeenCalledWith({ kind: "requirement", id: R2 })
@@ -608,6 +613,25 @@ describe("ExplorationTab", () => {
     expect(mocks.useExplorationChain).toHaveBeenLastCalledWith(
       VERSION_ID,
       expect.objectContaining({ batchId: "all" }),
+      STREAM,
+    )
+  })
+
+  it("resets the batch scope back to the current batch with the toolbar reset", async () => {
+    renderTab()
+    await screen.findByTestId(`chain-node-${R1}`)
+
+    fireEvent.change(screen.getByTestId("chain-batch-filter"), { target: { value: "all" } })
+    expect(mocks.useExplorationChain).toHaveBeenLastCalledWith(
+      VERSION_ID,
+      expect.objectContaining({ batchId: "all" }),
+      STREAM,
+    )
+
+    fireEvent.click(screen.getByTestId("chain-toolbar-reset"))
+    expect(mocks.useExplorationChain).toHaveBeenLastCalledWith(
+      VERSION_ID,
+      expect.objectContaining({ batchId: BATCH_ID }),
       STREAM,
     )
   })
@@ -947,6 +971,36 @@ describe("ExplorationTab", () => {
     expect(screen.getByTestId(`chain-node-${CR1}`)).toBeTruthy()
   })
 
+  it("collapses from the visible card control and keeps a double click from opening the Sheet", async () => {
+    const { onSelectedNodeChange } = renderTab()
+    await screen.findByTestId(`chain-node-${R1}`)
+    expect(screen.getByTestId(`chain-node-${C1}`)).toBeTruthy()
+
+    // Explicit card control: immediate collapse, no Sheet, no selection change.
+    fireEvent.click(screen.getByTestId(`chain-node-toggle-${R1}`))
+    expect(screen.queryByTestId("chain-sheet")).toBeNull()
+    expect(screen.queryByTestId(`chain-node-${C1}`)).toBeNull()
+    expect(onSelectedNodeChange).not.toHaveBeenCalled()
+
+    // Expand again, then drive the real click/click/dblclick pointer sequence.
+    fireEvent.click(screen.getByTestId(`chain-node-toggle-${R1}`))
+    const expandedCard = await screen.findByTestId(`chain-node-${R1}`)
+    expect(screen.getByTestId(`chain-node-${C1}`)).toBeTruthy()
+
+    vi.useFakeTimers()
+    fireEvent.click(expandedCard)
+    fireEvent.click(expandedCard)
+    fireEvent.doubleClick(expandedCard)
+    act(() => {
+      vi.advanceTimersByTime(500)
+    })
+
+    expect(screen.queryByTestId("chain-sheet")).toBeNull()
+    expect(onSelectedNodeChange).not.toHaveBeenCalled()
+    expect(screen.queryByTestId(`chain-node-${C1}`)).toBeNull()
+    vi.useRealTimers()
+  })
+
   it("mounts a full-width React Flow canvas with its own zoom controls", async () => {
     renderTab()
 
@@ -1043,6 +1097,19 @@ describe("ExplorationTab", () => {
     expect(
       screen.getByTestId("chain-workspace").contains(screen.getByTestId("chain-toolbar")),
     ).toBe(true)
+  })
+
+  it("keeps the follow status slot clear of the legend overlay", async () => {
+    renderTab()
+    await screen.findByTestId("chain-canvas")
+
+    fireEvent.click(screen.getByTestId("chain-toolbar-follow"))
+    const slot = await screen.findByTestId("chain-follow-slot")
+    const legend = screen.getByTestId("chain-legend")
+
+    expect(legend.contains(slot)).toBe(false)
+    expect(slot.className).toContain("bottom-3")
+    expect(slot.className).not.toContain("top-3")
   })
 
   it("switches to the keyboard-accessible list view", async () => {

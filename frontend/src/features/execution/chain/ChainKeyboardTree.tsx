@@ -1,6 +1,6 @@
 "use client"
 
-import { type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react"
+import { type KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react"
 
 import { cn } from "@/lib/utils"
 
@@ -30,6 +30,15 @@ export type ChainKeyboardTreeProps = {
   /** Visible nodes in pre-order (the layout order is the tree order). */
   nodes: readonly ChainKeyboardNode[]
   selectedId?: string | null
+  /**
+   * Controlled active (roving tab stop) id. When provided, the tree reports
+   * every change through `onActiveChange` and never moves its own state; the
+   * canvas owner lifts this so the visible card can follow the keyboard.
+   */
+  activeId?: string | null
+  onActiveChange?: (nodeId: string) => void
+  /** Called only for an actual direction-key move, so the canvas can reveal it. */
+  onActiveNavigate?: (nodeId: string) => void
   onSelect: (nodeId: string) => void
   onToggleCollapse?: (requirementId: string) => void
   onEscape?: () => void
@@ -130,6 +139,9 @@ function buildTreeIndex(nodes: readonly ChainKeyboardNode[]): TreeIndex {
 export function ChainKeyboardTree({
   nodes,
   selectedId = null,
+  activeId,
+  onActiveChange,
+  onActiveNavigate,
   onSelect,
   onToggleCollapse,
   onEscape,
@@ -140,40 +152,66 @@ export function ChainKeyboardTree({
   const itemRefs = useRef(new Map<string, HTMLDivElement>())
   const pendingFocusRef = useRef<string | null>(null)
 
-  const [activeId, setActiveId] = useState<string | null>(() => {
+  const [internalActiveId, setInternalActiveId] = useState<string | null>(() => {
     if (selectedId !== null && nodes.some((node) => node.id === selectedId)) return selectedId
     return nodes[0]?.id ?? null
   })
+  // `activeId !== undefined` makes the tree controlled: the canvas owner owns
+  // the roving tab stop so both the hidden tree and the visible cards can
+  // render the same active node.
+  const isControlled = activeId !== undefined
+  const currentActiveId = isControlled ? (activeId ?? null) : internalActiveId
+
+  const changeActive = useCallback(
+    (nextId: string): void => {
+      if (nextId === currentActiveId) return
+      if (!isControlled) setInternalActiveId(nextId)
+      onActiveChange?.(nextId)
+    },
+    [currentActiveId, isControlled, onActiveChange],
+  )
 
   // A selected node (canvas click or deep link) becomes the roving tab stop.
+  // Only actual selection changes may move it: snapshot refreshes deliver fresh
+  // node arrays and must not reset where the keyboard user currently is.
+  const lastSelectedIdRef = useRef<string | null>(selectedId)
   useEffect(() => {
-    if (selectedId === null || selectedId === "") return
-    if (!nodes.some((node) => node.id === selectedId)) return
-    setActiveId(selectedId)
-  }, [selectedId, nodes])
+    const nextSelectedId = selectedId ?? null
+    if (nextSelectedId === lastSelectedIdRef.current) return
+    lastSelectedIdRef.current = nextSelectedId
+    if (
+      nextSelectedId !== null &&
+      nextSelectedId !== "" &&
+      nodes.some((node) => node.id === nextSelectedId)
+    ) {
+      changeActive(nextSelectedId)
+    }
+  }, [selectedId, nodes, changeActive])
 
-  // Collapsing a group can hide the active node; fall back to the first visible
-  // node so Tab never leads into a detached treeitem. `nodes` is a fresh layout
-  // array whenever the visible set changes, so it is the effect's identity.
+  // Collapsing a group can hide the active node; fall back to the selection or
+  // the first visible node so Tab never leads into a detached treeitem.
   useEffect(() => {
-    setActiveId((previous) => {
-      if (previous !== null && nodes.some((node) => node.id === previous)) return previous
-      if (selectedId !== null && nodes.some((node) => node.id === selectedId)) return selectedId
-      return nodes[0]?.id ?? null
-    })
-  }, [nodes, selectedId])
+    if (currentActiveId !== null && nodes.some((node) => node.id === currentActiveId)) return
+    if (selectedId !== null && selectedId !== "" && nodes.some((node) => node.id === selectedId)) {
+      changeActive(selectedId)
+      return
+    }
+    const firstId = nodes[0]?.id
+    if (firstId !== undefined) changeActive(firstId)
+  }, [nodes, selectedId, currentActiveId, changeActive])
 
   useEffect(() => {
-    if (activeId === null) return
-    if (pendingFocusRef.current !== activeId) return
+    if (currentActiveId === null) return
+    if (pendingFocusRef.current !== currentActiveId) return
     pendingFocusRef.current = null
-    itemRefs.current.get(activeId)?.focus()
-  }, [activeId])
+    itemRefs.current.get(currentActiveId)?.focus()
+  }, [currentActiveId])
 
   function moveTo(nextId: string | null): void {
-    if (nextId === null || nextId === activeId) return
+    if (nextId === null || nextId === currentActiveId) return
     pendingFocusRef.current = nextId
-    setActiveId(nextId)
+    changeActive(nextId)
+    onActiveNavigate?.(nextId)
   }
 
   function firstChildOf(nodeId: string): string | null {
@@ -247,8 +285,13 @@ export function ChainKeyboardTree({
     >
       {nodes.map((node) => {
         const level = tree.levelById.get(node.id) ?? 1
-        const expanded =
-          node.kind === "requirement" && node.hasChildren ? !node.collapsed : undefined
+        // Every node with visible children is an expandable treeitem: only the
+        // requirement can collapse, case/result groups are always expanded.
+        const expanded = node.hasChildren
+          ? node.kind === "requirement"
+            ? !node.collapsed
+            : true
+          : undefined
         return (
           <div
             key={node.id}
@@ -260,15 +303,16 @@ export function ChainKeyboardTree({
             data-testid={`chain-treeitem-${node.id}`}
             data-node-id={node.id}
             data-kind={node.kind}
+            data-active={currentActiveId === node.id ? "true" : "false"}
             aria-level={level}
             aria-setsize={tree.setsizeById.get(node.id) ?? 1}
             aria-posinset={tree.posinsetById.get(node.id) ?? 1}
             aria-selected={selectedId === node.id}
             aria-expanded={expanded}
             aria-label={ariaLabelOf(node)}
-            tabIndex={activeId === node.id ? 0 : -1}
+            tabIndex={currentActiveId === node.id ? 0 : -1}
             className="focus-visible:outline-none"
-            onFocus={() => setActiveId(node.id)}
+            onFocus={() => changeActive(node.id)}
             onKeyDown={(event) => handleKeyDown(event, node)}
             onClick={() => onSelect(node.id)}
           >

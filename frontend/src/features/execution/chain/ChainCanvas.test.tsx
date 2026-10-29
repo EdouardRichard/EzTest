@@ -279,6 +279,15 @@ function nodeWrapper(container: HTMLElement, nodeId: string): HTMLElement | null
   return container.querySelector<HTMLElement>(`.react-flow__node[data-id="${nodeId}"]`)
 }
 
+/** The stable test hook rendered inside the React Flow node wrapper. */
+function nodeFrame(container: HTMLElement, nodeId: string): HTMLElement {
+  const frame = nodeWrapper(container, nodeId)?.querySelector<HTMLElement>(
+    '[data-testid^="chain-node-"]',
+  )
+  expect(frame).not.toBeNull()
+  return frame as HTMLElement
+}
+
 function mockReducedMotion(reduce: boolean): void {
   vi.spyOn(window, "matchMedia").mockImplementation(
     (query: string) =>
@@ -302,6 +311,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
+  vi.useRealTimers()
 })
 
 describe("ChainCanvas", () => {
@@ -515,6 +525,89 @@ describe("ChainCanvas", () => {
     expect(onToggleCollapse).toHaveBeenCalledWith("requirement:1")
   })
 
+  it("shows the keyboard-active node as a visible focus ring on the canvas", async () => {
+    const { container } = renderCanvas()
+    await screen.findByTestId("chain-node-requirement")
+
+    const treeitem = screen.getByTestId("chain-treeitem-requirement:1")
+    treeitem.focus()
+    fireEvent.keyDown(treeitem, { key: "ArrowDown" })
+
+    // The hidden tree is not the visible state: the card itself must react.
+    const activeFrame = nodeFrame(container, "case:1")
+    expect(activeFrame.getAttribute("data-active")).toBe("true")
+    expect(activeFrame.className).toContain("ring-2")
+    const requirementFrame = nodeFrame(container, "requirement:1")
+    expect(requirementFrame.getAttribute("data-active")).toBeNull()
+    expect(requirementFrame.className).not.toContain("ring-2")
+
+    // Moving the keyboard focus also brings the node into the viewport.
+    const centre = nodeCentre(SMALL_NODES, SMALL_EDGES, "case:1")
+    await waitFor(() => expect(flowProbe.setCenter).toHaveBeenCalledTimes(1))
+    expect(flowProbe.setCenter).toHaveBeenCalledWith(
+      centre.x,
+      centre.y,
+      expect.objectContaining({ duration: 300 }),
+    )
+  })
+
+  it("toggles a requirement group through the visible card control without opening the Sheet", async () => {
+    const onSelect = vi.fn()
+    const onToggleCollapse = vi.fn()
+    const { rerender } = renderCanvas({ onSelect, onToggleCollapse })
+
+    const toggle = await screen.findByTestId("chain-node-toggle-1")
+    expect(toggle.getAttribute("aria-expanded")).toBe("true")
+
+    fireEvent.click(toggle)
+    expect(onToggleCollapse).toHaveBeenCalledWith("requirement:1")
+    expect(onSelect).not.toHaveBeenCalled()
+
+    rerender(
+      <ChainCanvas
+        snapshot={SMALL_SNAPSHOT}
+        collapsed={["requirement:1"]}
+        onSelect={onSelect}
+        onToggleCollapse={onToggleCollapse}
+      />,
+    )
+    const collapsedToggle = screen.getByTestId("chain-node-toggle-1")
+    expect(collapsedToggle.getAttribute("aria-expanded")).toBe("false")
+    expect(collapsedToggle.textContent).toContain("展开")
+  })
+
+  it("opens a requirement on a single click but collapses it on a double click", async () => {
+    const onSelect = vi.fn()
+    const onToggleCollapse = vi.fn()
+    renderCanvas({ onSelect, onToggleCollapse })
+    const card = await screen.findByTestId("chain-node-requirement")
+
+    vi.useFakeTimers()
+    fireEvent.click(card)
+    fireEvent.click(card)
+    fireEvent.doubleClick(card)
+    act(() => {
+      vi.advanceTimersByTime(500)
+    })
+
+    // The double click wins: no Sheet, no delayed single-click selection.
+    expect(onSelect).not.toHaveBeenCalled()
+    expect(onToggleCollapse).toHaveBeenCalledTimes(1)
+    expect(onToggleCollapse).toHaveBeenCalledWith("requirement:1")
+
+    // A real single click still opens the Sheet after the double-click window.
+    fireEvent.click(card)
+    act(() => {
+      vi.advanceTimersByTime(249)
+    })
+    expect(onSelect).not.toHaveBeenCalled()
+    act(() => {
+      vi.advanceTimersByTime(1)
+    })
+    expect(onSelect).toHaveBeenCalledWith("requirement:1")
+    vi.useRealTimers()
+  })
+
   it("pulses running result nodes", async () => {
     const { container } = renderCanvas()
     await screen.findAllByTestId("chain-node-result")
@@ -623,6 +716,23 @@ describe("ChainCanvas", () => {
     expect(screen.getByTestId("chain-follow-status").getAttribute("data-follow-paused")).toBe(
       "false",
     )
+  })
+
+  it("places the follow status in its own bottom slot instead of the legend corner", async () => {
+    renderCanvas({ follow: true })
+    await waitFor(() => expect(flowProbe.setCenter).toHaveBeenCalledTimes(1))
+
+    moveStart(new MouseEvent("mousedown"))
+    await waitFor(() =>
+      expect(screen.getByTestId("chain-follow-status").getAttribute("data-follow-paused")).toBe(
+        "true",
+      ),
+    )
+
+    const slot = screen.getByTestId("chain-follow-slot")
+    expect(slot.className).toContain("bottom-3")
+    expect(slot.className).not.toContain("top-3")
+    expect(slot.contains(screen.getByTestId("chain-follow-resume"))).toBe(true)
   })
 
   it("follows the first running result in layout order", async () => {
