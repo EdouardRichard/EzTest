@@ -1419,6 +1419,27 @@ func TestToolCallBudgetDeniesOverLimitCalls(t *testing.T) {
 	}
 }
 
+// TestCaseFinishDeniedAfterBudgetExhaustion pins that budget exhaustion is a
+// server-side terminal condition: even execution.case_finish is refused, so the
+// model cannot turn an over-budget run into passed afterwards.
+func TestCaseFinishDeniedAfterBudgetExhaustion(t *testing.T) {
+	recorder := &fakeRecorder{view: defaultView()}
+	set := NewToolSet(recorder, nil, nil, nil, Limits{MaxToolCalls: 1})
+	tools := set.Tools()
+
+	if _, err := callTool(t, tools, "execution.case_context", `{}`); err != nil {
+		t.Fatalf("first call within the budget: %v", err)
+	}
+	_, err := callTool(t, tools, "execution.case_context", `{}`)
+	requireToolError(t, err, "tool_call_budget_exhausted")
+
+	_, err = callTool(t, tools, "execution.case_finish", `{"verdict":"passed","reason":"done"}`)
+	requireToolError(t, err, "tool_call_budget_exhausted")
+	if recorder.finishIn.Decision.Verdict != "" {
+		t.Fatalf("recorder received case_finish after budget exhaustion: %+v", recorder.finishIn)
+	}
+}
+
 // TestExecutorTimeoutMarksCaseRunFailure pins the P8 executor timeout contract:
 // an action that timed out in the executor surfaces the stable executor_timeout
 // code and reports it to the case runner as a terminal model failure.

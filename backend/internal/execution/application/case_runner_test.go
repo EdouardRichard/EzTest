@@ -522,6 +522,41 @@ func TestCaseRunnerFinishesExecutionToolFailures(t *testing.T) {
 	}
 }
 
+// TestCaseRunnerPauseWinsOverSignal pins the precedence of the two server-side
+// outcomes: an explicit pause is authoritative over a tool-enforced terminal
+// signal, so a paused run parks/interrupts instead of being classified
+// inconclusive(model).
+func TestCaseRunnerPauseWinsOverSignal(t *testing.T) {
+	cases := []struct {
+		name       string
+		mode       domain.PauseMode
+		wantStatus domain.CaseRunStatus
+	}{
+		{name: "graceful parks", mode: domain.PauseModeGraceful, wantStatus: domain.CaseRunStatusPending},
+		{name: "immediate interrupts", mode: domain.PauseModeImmediate, wantStatus: domain.CaseRunStatusInterrupted},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runner, world := newCaseRunnerHarness(t)
+			run := runningCaseRun(t, world)
+			world.runtime.setState(AgentRunState{Status: "running"})
+			world.browser.setFailure(run.ID, "tool_call_budget_exhausted")
+			world.batches.setPaused(run.BatchID, true, tc.mode)
+
+			runner.Run(context.Background(), run, SessionRef{SessionID: 500}, world.sessions.environment)
+
+			stored := world.run(t, run.ID)
+			if stored.Status != tc.wantStatus {
+				t.Fatalf("status = %s, want %s (class=%v reason=%q)",
+					stored.Status, tc.wantStatus, stored.FailureClass, stored.FailureReason)
+			}
+			if stored.FailureClass != nil {
+				t.Fatalf("failure class = %s, want no classification when a pause wins", *stored.FailureClass)
+			}
+		})
+	}
+}
+
 // TestCaseRunnerSignalWinsOverAgentTerminal pins that the server-side terminal
 // signal stays authoritative when the agent run reaches a terminal state in the
 // same poll: the case must carry executor_timeout, not the agent-derived reason.

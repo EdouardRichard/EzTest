@@ -71,6 +71,16 @@ func TestSupplementProfileSeed(t *testing.T) {
 	}
 }
 
+// TestSupplementPromptDoesNotHardcodeTheCap pins that the seeded system prompt
+// does not embed the spec-default case cap: the per-run limit comes from
+// EZTEST_SUPPLEMENT_MAX_CASES and is carried by the run instruction footer, so a
+// hardcoded number would contradict the configured value.
+func TestSupplementPromptDoesNotHardcodeTheCap(t *testing.T) {
+	if strings.Contains(SupplementPrompt, "最多 5 条") {
+		t.Fatal("the supplement prompt hardcodes the 5-case cap; the cap comes from EZTEST_SUPPLEMENT_MAX_CASES")
+	}
+}
+
 // TestSupplementProfileReturnsFreshSlices guarantees one seed call cannot mutate
 // the tools of a later call.
 func TestSupplementProfileReturnsFreshSlices(t *testing.T) {

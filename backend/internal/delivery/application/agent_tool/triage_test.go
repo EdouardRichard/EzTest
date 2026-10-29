@@ -177,6 +177,33 @@ func TestTriageContextReadRejectsForeignReferences(t *testing.T) {
 	requireToolError(t, err, "invalid_arguments")
 }
 
+// TestTriageContextReadHonorsConfiguredMaxCases pins that triage.context_read
+// uses the configured failed-case budget: the 30th failed case is readable and
+// the 31st stays outside the ownership scope.
+func TestTriageContextReadHonorsConfiguredMaxCases(t *testing.T) {
+	const maxCases = 30
+	harness := newToolHarnessWithMaxCases(domain.AnalysisKindIssueTriage, maxCases)
+	harness.cases.cases = configuredFailedCases(maxCases + 1)
+	harness.details.detail = CaseDetail{
+		CaseRunID: 1029, CaseNodeID: 2029, Title: "case-30",
+		Status: "failed", FailureClass: domain.FailureClassApplication,
+		EvidenceIDs: []int64{7029},
+	}
+
+	result, err := callTool(t, harness.tools, analysisTriageInvocation, "triage.context_read", `{"caseRunIds":["1029"]}`)
+	if err != nil {
+		t.Fatalf("triage.context_read for the 30th failed case: %v", err)
+	}
+	var out triageContextResult
+	decodeToolResult(t, result, &out)
+	if len(out.Cases) != 1 || out.Cases[0].CaseRunID != "1029" {
+		t.Fatalf("cases = %+v, want the 30th failed case", out.Cases)
+	}
+
+	_, err = callTool(t, harness.tools, analysisTriageInvocation, "triage.context_read", `{"caseRunIds":["1030"]}`)
+	requireToolError(t, err, "invalid_arguments")
+}
+
 // issueDraftResult is the triage.issue_draft response.
 type issueDraftResult struct {
 	DraftCount int      `json:"draftCount"`

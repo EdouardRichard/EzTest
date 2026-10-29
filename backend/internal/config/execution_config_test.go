@@ -80,22 +80,25 @@ func TestLoadExecutionOverrides(t *testing.T) {
 // TestLoadExecutionBoundsRejectOutOfRange proves each bounded P6 setting names
 // its variable in the error instead of silently accepting a bad value.
 func TestLoadExecutionBoundsRejectOutOfRange(t *testing.T) {
-	cases := map[string]string{
-		"EZTEST_EXEC_MAX_CONCURRENT_CASES": "9",
-		"EZTEST_EXEC_MAX_TOOL_CALLS":       "0",
-		"EZTEST_EXEC_CASE_TIMEOUT_MS":      "10",
-		"EZTEST_EXEC_MAX_CASES_PER_BATCH":  "1001",
-		"EZTEST_EXEC_WORKER_INTERVAL_MS":   "10",
-		"EZTEST_EXEC_EVIDENCE_MAX_BYTES":   "1",
-		"EZTEST_EXEC_EVIDENCE_PER_CASE":    "5000",
+	cases := []struct{ key, value string }{
+		{"EZTEST_EXEC_MAX_CONCURRENT_CASES", "9"},
+		// Both the lower bound (0) and the upper bound (201) of the tool-call
+		// budget must be rejected; a single map entry would silently lose the
+		// lower-bound case when overwritten.
+		{"EZTEST_EXEC_MAX_TOOL_CALLS", "0"},
+		{"EZTEST_EXEC_MAX_TOOL_CALLS", "201"},
+		{"EZTEST_EXEC_CASE_TIMEOUT_MS", "10"},
+		{"EZTEST_EXEC_MAX_CASES_PER_BATCH", "1001"},
+		{"EZTEST_EXEC_WORKER_INTERVAL_MS", "10"},
+		{"EZTEST_EXEC_EVIDENCE_MAX_BYTES", "1"},
+		{"EZTEST_EXEC_EVIDENCE_PER_CASE", "5000"},
 	}
-	cases["EZTEST_EXEC_MAX_TOOL_CALLS"] = "201"
-	for key, value := range cases {
+	for _, tc := range cases {
 		env := validEnv()
-		env[key] = value
+		env[tc.key] = tc.value
 		_, err := Load(func(k string) string { return env[k] })
-		if err == nil || !strings.Contains(err.Error(), key) {
-			t.Fatalf("%s=%s: err=%v want a bound error naming the variable", key, value, err)
+		if err == nil || !strings.Contains(err.Error(), tc.key) {
+			t.Fatalf("%s=%s: err=%v want a bound error naming the variable", tc.key, tc.value, err)
 		}
 	}
 }

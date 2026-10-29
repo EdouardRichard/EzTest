@@ -59,7 +59,7 @@ func runCandidatePropose(ctx context.Context, deps ToolDeps, args json.RawMessag
 	if err != nil {
 		return agentdomain.ToolResult{}, err
 	}
-	cases, err := failedApplicationCases(ctx, deps, run)
+	cases, _, err := failedApplicationCases(ctx, deps, run)
 	if err != nil {
 		return agentdomain.ToolResult{}, err
 	}

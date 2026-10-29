@@ -904,6 +904,10 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Details:     executiondelivery.NewCaseDetail(executionReads),
 		Evidence:    executiondelivery.NewEvidenceMeta(executionReads),
 		Code:        deliverycodeintel.NewCodeRead(versionService, codeIntelQuery),
+		// The tool-side case list/detail/ownership views use the same failed-case
+		// budget as the analysis service so a configured MaxCases>20 is visible
+		// to the agent (design spec §10.5/§11.4).
+		MaxCases: cfg.AnalysisMaxCases,
 	})
 
 	// Agent runtime: the four postgres repositories, the cross-context adapters

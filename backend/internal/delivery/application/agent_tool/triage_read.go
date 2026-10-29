@@ -140,7 +140,7 @@ func runTriageContextRead(ctx context.Context, deps ToolDeps, args json.RawMessa
 	if err != nil {
 		return agentdomain.ToolResult{}, internalErrorf("decode triage input of run %d: %v", run.ID, err)
 	}
-	cases, err := failedApplicationCases(ctx, deps, run)
+	cases, _, err := failedApplicationCases(ctx, deps, run)
 	if err != nil {
 		return agentdomain.ToolResult{}, err
 	}

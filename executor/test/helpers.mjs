@@ -51,6 +51,7 @@ const SPAM_HTML = `<!doctype html>
 export async function startLocalPage() {
   const hits = []
   const aborted = []
+  const upgrades = []
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, "http://127.0.0.1")
     hits.push(url.pathname)
@@ -168,6 +169,58 @@ export async function startLocalPage() {
         res.writeHead(200, { "content-type": "text/plain" })
         res.end("sw-fetch")
         return
+      case "/wstest":
+        // Opened from the page itself: the context WebSocket guard must block
+        // localhost (not in allowedHosts) and close the socket with 1008.
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8" })
+        res.end(
+          `<!doctype html><html><head><title>WS</title></head><body><h1>WS</h1>` +
+            `<script>
+              const socket = new WebSocket('ws://localhost:${req.socket.localPort}/blocked-ws')
+              socket.onopen = () => console.log('ws-open')
+              socket.onclose = (event) => console.log('ws-close:' + event.code)
+              socket.onerror = () => console.log('ws-error')
+            </script></body></html>`,
+        )
+        return
+      case "/workertest":
+        // A page-created Worker/SharedWorker is not covered by Playwright's
+        // routeWebSocket (it only routes page WebSockets), so the executor must
+        // block worker creation itself. The blob worker would open a WebSocket
+        // to an allowed host; a successful upgrade would prove the bypass.
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8" })
+        res.end(
+          `<!doctype html><html><head><title>Worker</title></head><body><h1>Worker</h1>` +
+            `<div id="worker-result">pending</div>` +
+            `<script>
+              const node = document.getElementById('worker-result')
+              const source = "const socket = new WebSocket('ws://127.0.0.1:${req.socket.localPort}/worker-ws');" +
+                "socket.onopen = () => self.postMessage('worker-ws-open');" +
+                "socket.onerror = () => self.postMessage('worker-ws-error')"
+              const blobUrl = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }))
+              const outcomes = []
+              try {
+                const worker = new Worker(blobUrl)
+                worker.onmessage = (event) => { node.textContent = event.data }
+                outcomes.push('worker-created')
+              } catch (error) {
+                outcomes.push('worker-blocked')
+              }
+              try {
+                const shared = new SharedWorker(blobUrl)
+                shared.port.close()
+                outcomes.push('sharedworker-created')
+              } catch (error) {
+                outcomes.push('sharedworker-blocked')
+              }
+              node.textContent = outcomes.join(',')
+              console.log('worker-guard:' + outcomes.join(','))
+              setTimeout(() => {
+                if (node.textContent === 'pending') { node.textContent = 'worker-timeout' }
+              }, 2000)
+            </script></body></html>`,
+        )
+        return
       case "/secret-leak":
         res.writeHead(200, { "content-type": "text/html; charset=utf-8" })
         res.end(
@@ -215,6 +268,12 @@ export async function startLocalPage() {
         res.end("not found")
     }
   })
+  server.on("upgrade", (req, socket) => {
+    // A WebSocket handshake that reaches the server proves the allow-list guard
+    // was bypassed (for example from a worker). Refuse it and record the path.
+    upgrades.push(req.url)
+    socket.destroy()
+  })
   server.listen(0, "127.0.0.1")
   await once(server, "listening")
   const { port } = server.address()
@@ -222,9 +281,11 @@ export async function startLocalPage() {
     url: `http://127.0.0.1:${port}`,
     hits,
     aborted,
+    upgrades,
     clearHits() {
       hits.length = 0
       aborted.length = 0
+      upgrades.length = 0
     },
     async close() {
       server.closeAllConnections?.()

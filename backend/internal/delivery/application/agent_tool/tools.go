@@ -43,7 +43,7 @@ func NewTools(deps ToolDeps) []agentdomain.Tool {
 	definitions := []toolDefinition{
 		{
 			name:        domain.ToolAnalysisCaseList,
-			description: "List the failed(application) case runs of this analysis batch (at most 20): case run/node ids, title, failure class and short reason. No evidence body.",
+			description: fmt.Sprintf("List the failed(application) case runs of this analysis batch (at most %d): case run/node ids, title, failure class and short reason. No evidence body.", deps.maxCases()),
 			schema:      caseListSchema,
 			run:         runCaseList,
 		},
