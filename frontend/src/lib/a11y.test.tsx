@@ -887,7 +887,7 @@ describe("accessibility (axe)", () => {
     } satisfies AgentCenterCatalog)
     mocks.getAgentCenterQuality.mockResolvedValue({
       latest: {
-        run_id: 1,
+        run_id: "9007199254740993",
         passed: true,
         metrics: { design_coverage: 0.9, impact_recall: 0.8 },
         thresholds: { design_coverage: 0.8 },
