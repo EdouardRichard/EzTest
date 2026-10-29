@@ -337,7 +337,7 @@ P8 在 P0–P7 之上完成“可长期使用/可运维”的体验与硬化，*
 | 版本内知识沉淀（草稿→审核→批准→注入） | 已交付 | `/knowledge`、`/api/versions/{id}/knowledge`；概览内提交面板 |
 | 评测平台/质量中心（确定性门禁 + 真实 LLM 报告） | 已交付 | `/quality`、`/api/quality/eval-runs`、`scripts/eval.ps1` |
 | 限流/SLO、证据 GC、备份恢复、多实例单活、安全审计/头 | 已交付（部分验收项待最终运行） | `scripts/slo.ps1`/`slo-chain.ps1`/`backup.ps1`/`security-audit.ps1`；`docs/acceptance/p8/` |
-| **视觉断言（截图基线/像素比对/基线审批）** | **未交付（Task 25 在途）** | 本提交不发布相关端点/页面；不要按 P8 规格调用 |
+| **视觉断言（截图基线/像素比对/基线审批）** | **部分提交、运行未接线（D62）** | 迁移/编辑/审批/executor `visual.compare`/查看器已提交；但 `main/config` 装配与 agent 执行入口未接线，当前 `/visual` 路由不挂载、真实运行不会产生 visual 证据；OpenAPI 暂不发布该契约 |
 | 全量 SLO 真实测量、恢复库应用 smoke、最终真实验收 | **待最终验收（Task 35）** | `docs/acceptance/p8/slo.md` 目前是 SKIP 报告；备份演练未做应用 smoke |
 
 P8 新增/变更模块：
@@ -535,7 +535,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/db.ps1 start
 | `EZTEST_CHAIN_MAX_NODES` | 否 | P8 规格目标（默认 300，50–2000）；**当前构建使用代码默认/请求 `limit`，未读取该环境变量**。 |
 | `EZTEST_SEARCH_MAX_RESULTS_PER_TYPE` | 否 | P8 规格目标（默认 5，1–20）；**当前由请求 `limit` 控制，未读取该环境变量**。 |
 | `EZTEST_TODOS_MAX` | 否 | P8 规格目标（默认 50，1–200）；**当前由请求 `limit` 控制，未读取该环境变量**。 |
-| `EZTEST_VISUAL_DIFF_THRESHOLD` / `EZTEST_VISUAL_BASELINE_MAX_BYTES` | 否 | P8 视觉断言规格目标；**视觉断言尚未交付，当前无效果**（见发布说明）。 |
+| `EZTEST_VISUAL_DIFF_THRESHOLD` / `EZTEST_VISUAL_BASELINE_MAX_BYTES` | 否 | P8 视觉断言规格目标；`EZTEST_VISUAL_BASELINE_MAX_BYTES` 仅 executor 读取（默认 5 MiB），后端 config/Compose 未接线；`EZTEST_VISUAL_DIFF_THRESHOLD` 未使用。**视觉断言运行入口未接线，当前不可用**（见发布说明）。 |
 | `llm_base_url` / `llm_key` / `llm_model_name` | 否 | 首次启动的可选默认 LLM 种子；小写变量名是设计约定，Key 留空则不发起真实调用。P4 复用该配置，不新增模型/Key。 |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Compose | 仅 `deploy/docker-compose.yml` 使用；`POSTGRES_PASSWORD` 必填。 |
 | `NEXT_PUBLIC_API_BASE_URL` | 否 | 浏览器访问的 API origin，默认 `http://localhost:13333`；Compose 构建时内联。 |
@@ -724,7 +724,7 @@ node scripts/validate-compose.mjs
 - 本机没有 Docker，`scripts/acceptance.ps1` 会把“Compose 容器运行”标为 **SKIPPED**；Compose 仅通过 `validate-compose.mjs` 做静态字段校验，不代表已运行验证。P1 真实 Agent LLM、P3 真实 LLM 人工验收、P4/P5/P7 真实 LLM 与 P7 真实 DB 验收同样标为 **SKIPPED**（见下节）。
 - 常规测试不访问真实 LLM：Go 测试使用 `httptest` mock（`/v1/chat/completions`、`/v1/responses`、`/v1/models`，可注入 429/5xx/超时/分片）；`scripts/e2e.ps1` 使用 `scripts/fake-llm.cjs`（127.0.0.1:13334）并覆盖 `llm_*`，E2E 零 LLM 费用；P4 的 `scripts/fake-llm.p4.test.cjs` 与 P7 的 `scripts/fake-llm.p7.test.cjs` 同样只启动本地 fake 上游。
 - `acceptance.ps1 -StaticOnly` 可在没有 `.env`/数据库/Playwright 的主机上运行：它校验 README/OpenAPI/env/Compose 契约、从 `order.txt` 动态推导 P4–P8 迁移与表清单、校验 P5/P7/P8 交付物与 OpenAPI 契约、解析 OpenAPI YAML，并执行 P4/P7 fake-LLM 测试。仍需要 Node、`frontend/node_modules/yaml` 与 git（P4 fixture）。
-- P8 静态检查：`acceptance.ps1 -StaticOnly` 当前覆盖 P8 评测语料/基线（`eval/`）与既有 P1–P7 契约；链路/搜索/待办/Agent 中心/知识/评测/GC 的 OpenAPI 已由本任务同步，但脚本级 P8 契约（如 `scripts/check-docs.ps1`、P8 端点/事件/环境变量断言）仍待后续接入。**视觉断言未交付，不在当前静态契约内**。P5/P6 API 子检查在路由未接线时记为 **SKIPPED**；最终判定仍以非 SKIPPED FAIL 数为 0 为准。
+- P8 静态检查：`acceptance.ps1 -StaticOnly` 当前覆盖 P8 评测语料/基线（`eval/`）与既有 P1–P7 契约；链路/搜索/待办/Agent 中心/知识/评测/GC 的 OpenAPI 已由本任务同步，但脚本级 P8 契约（如 `scripts/check-docs.ps1`、P8 端点/事件/环境变量断言）仍待后续接入。**视觉断言部分代码已提交但未接线，不在当前静态契约内**。P5/P6 API 子检查在路由未接线时记为 **SKIPPED**；最终判定仍以非 SKIPPED FAIL 数为 0 为准。
 - `acceptance.ps1` 额外校验 `docs/openapi/api.yaml` 含 P1 的 `/api/agents/sessions`、`agent.activity`、`reasoning_tokens`，P2 的 `/api/resources/systems`、`/api/resources/sessions`、`/api/resources/code-repos`、`storageState`、`credentialSet`，P3 的 `/api/versions`、`clarification`、`enter-design`、`snowflake`、`version-attachments` 关键词、全部 P3 错误 reason（含字段级 `invalid_context_summary`）、全部版本事件类型（含 `clarification.context_updated`），P4 的 `/api/code/repos/{repoId}/index`、`/api/versions/{versionId}/code/analyses`、全部 P4 path/schema、`CodeErrorReason`（含 `analysis_in_progress`、`anchor_duplicate`、`analysis_queue_full`、`git_unavailable`、`path_not_git_repo`）与 `code.changed`/`code.impact_computed` 事件，P5 的 `/api/versions/{versionId}/mindmap` 23 path/27 operation、8 个 `case.*` 事件、全部 35 个 `MindmapErrorReason`、`AnchorSubjectKind=case` 与 `AppModelNode.source=explored`，以及 P6/P7 的批次/证据/报告/问题/分析/db-target 端点、P7 8 个事件、全部 P7 reason、`code_anchor.subjectKind=issue` 与 P7 前端 testid/导航 phase；同时校验 `.env.example` 的 Agent/P3/P4/P5/P6 变量、Compose 的附件目录与 P4 Playwright spec 是否存在；P1–P7 DoD 与检查项/证据的映射会打印在汇总后。P5/P6 API 子检查在路由未接线时记为 **SKIPPED**；P7 区块全部为仓库本地静态检查（不启动 P7 服务），静态检查与 DoD 映射仍须 PASS。
 - 通过条件：所有非 SKIPPED 检查 FAIL 数为 0，脚本退出码为 0。
 
@@ -770,7 +770,7 @@ P5 脚本可选配置：`EZTEST_ACCEPTANCE_API_URL`（复用已在运行的 API�
 - P6 执行：单进程调度；P8 起执行调度/自主 worker/每日 GC 维护通过 PostgreSQL advisory lock 单活（每次 tick 仅一个实例执行，其余实例 debug 跳过），但 SSE 广播与 Agent runner 仍为进程内单实例。db 断言为只读；不做用例级自动重跑（应用失败仅手动 rerun）；证据 GC 已交付但**只清 `EZTEST_EVIDENCE_DIR` 下的执行证据文件**（导出/附件/报告/孤儿文件不自动清理）；执行器不可用时只能查看历史结果/证据/报告，禁止建批；真实 LLM 的分类/暂停结果受模型行为影响，脚本在不符合预期时 fail-closed。
 - P7 交付（P8 更新）：`version_change` 表/`code_changed` 已在 P8 落地，`/api/versions/{id}/code/changes` 返回 `batchTimeline`；证据 GC 与报告 stale 联动、多实例 leader 锁已在 P8 落地；报告快照已含 `baseFallbackReason`/`historyRewritten`。仍不提供报告 PDF、问题外部工单、问题重开/合并、跨批次语义去重增强、非 PostgreSQL 目标库；全局问题/报告中心为只读列表；`IssuesTab` 仍较大未拆分（可维护性余项）；`EZTEST_ANALYSIS_MAX_CASES`/`EZTEST_SUPPLEMENT_MAX_CASES` 仍以代码固定上限 20/5 执行，尚未读取；`EZTEST_AUTONOMY_BATCHES_PER_TICK` 仍只按 1–20 校验（未额外钳制）。P7 真实验收脚本的已通过记录见 `acceptance.md`，最终以本分支重跑为准。
 - P8 硬化边界：限流是**每实例内存**计数（多副本需按实例预算合计，无分布式限流）；SSE/Agent runner 仍单实例；GC 只自动清理证据文件，且发布/过期报告不参与证据保护（报告快照不含 evidence id）；`EZTEST_CHAIN_MAX_NODES`/`EZTEST_SEARCH_MAX_RESULTS_PER_TYPE`/`EZTEST_TODOS_MAX` 未接线为环境变量；SLO 只有链路专项真实测量 PASS，`scripts/slo.ps1` 全量为 dry-run SKIP（待最终验收）；备份演练未做恢复库应用 smoke（defer Task 35）。
-- **视觉断言（D62）未交付**：本提交不提供截图基线/像素比对/基线审批端点或页面；Task 25 仍在途，合并后需同步 OpenAPI/README/用户手册/设计文档/release notes。不要把 P8 规格中的视觉断言当作可用功能。
+- **视觉断言（D62）部分提交、运行未接线**：迁移（`mindmap_0003_visual.sql`、`execution_0005_visual_evidence.sql`）、mindmap 编辑/审批服务、executor `visual.compare`、前端编辑/审批/查看器、评测语料已提交；但 `cmd/eztest`/`config` 未装配 `Deps.Visual`，因此两条 `/visual` 路由不挂载，execution agent 也没有 `execution.visual_assert` 工具，真实 case run 不会产生 `visual_actual/visual_diff` 证据；`scripts/eval.ps1` 尚未读取视觉语料。当前不要对用户宣称视觉断言可用；合并接线后需同步 OpenAPI/README/用户手册/设计文档/release notes。
 - 多实例：只做 advisory lock 单活与执行器硬化；无多实例运维编排（P9 候选）；限流/SSE/Agent runner 不是集群级。
 - 登录 token 存 `sessionStorage`：属于单管理员内网工具的 XSS 边界，未做 HttpOnly cookie 会话；CSP 仍为 report-only。
 - 无内置 TLS/反向代理/HSTS；生产由部署方负责（见 `docs/deployment.md`）。无多租户/RBAC，管理员角色是唯一权限分层。
