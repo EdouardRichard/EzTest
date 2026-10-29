@@ -416,6 +416,7 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 	codeIntelEdges := codeintelpg.NewEdgeRepository(database.Pool)
 	codeIntelAnchors := codeintelpg.NewAnchorRepository(database.Pool)
 	codeIntelVersionChangeRepo := codeintelpg.NewVersionChangeRepository(database.Pool)
+	codeIntelFactReviewRepo := codeintelpg.NewFactReviewRepository(database.Pool)
 
 	// Cross-context adapters (design spec §3.5): the P2 repository catalog (repo
 	// and app-model reads), the P2 index-state writer, the P3 read-only version
@@ -537,6 +538,18 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		IDs:      snowflake,
 		Clock:    wallClock{},
 	})
+	// P8 code-fact quality (D59): one service backs both the human review write
+	// (POST /api/code/repos/{repoId}/facts/{factId}/reviews) and the repository
+	// quality read (GET /api/code/repos/{repoId}/quality). Both routes are
+	// mounted only when this dependency reaches the HTTP handler group.
+	codeIntelFactReview := codeintelapp.NewFactReviewService(codeintelapp.FactReviewServiceDeps{
+		Repos:   codeIntelRepos,
+		Reviews: codeIntelFactReviewRepo,
+		Audit:   codeIntelAudit,
+		IDs:     snowflake,
+		Clock:   wallClock{},
+		Logger:  logger,
+	})
 
 	// Both async services exist now, so the worker can execute them and recover
 	// the previous process's leftover queued/running runs before serving its
@@ -571,6 +584,8 @@ func serve(cfg config.Config, logger *slog.Logger) error {
 		Analyses:       codeIntelAnalysis,
 		Anchors:        codeIntelAnchor,
 		VersionChanges: codeIntelVersionChange,
+		FactReviews:    codeIntelFactReview,
+		Quality:        codeIntelFactReview,
 		Repos:          codeIntelRepos,
 	})
 
