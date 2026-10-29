@@ -1,0 +1,308 @@
+{
+  "status": "passed",
+  "skipReason": null,
+  "generatedAt": "2026-10-29T13:11:17.958Z",
+  "elapsedMs": 322096,
+  "keyword": "p8llm210555",
+  "llmModel": "deepseek-flash",
+  "checks": [
+    {
+      "name": "admin login and normal user provisioning",
+      "status": "passed",
+      "detail": "admin token and normal user p8llm_p8llm210555"
+    },
+    {
+      "name": "fixture resources and imported session",
+      "status": "passed",
+      "detail": "system 1, environment 1, session 1"
+    },
+    {
+      "name": "real LLM clarification answer persisted",
+      "status": "passed",
+      "detail": "assistant reply 84 chars, session 374182065979002880"
+    },
+    {
+      "name": "real LLM design run created executable cases",
+      "status": "passed",
+      "detail": "run done, nodes 9, executable cases 7"
+    },
+    {
+      "name": "AI-designed case renamed for deterministic search",
+      "status": "passed",
+      "detail": "case 374182258350755842"
+    },
+    {
+      "name": "mindmap review approval freezes a baseline",
+      "status": "passed",
+      "detail": "version executing, baseline 374182262339538944"
+    },
+    {
+      "name": "version overview renders the real-LLM version",
+      "status": "passed",
+      "detail": "version 374182065513435136"
+    },
+    {
+      "name": "requirements tab renders requirements and clarification transcript",
+      "status": "passed",
+      "detail": "requirements visible; clarification text rendered"
+    },
+    {
+      "name": "mindmap tab renders the AI-generated cases",
+      "status": "passed",
+      "detail": "7 case nodes rendered"
+    },
+    {
+      "name": "real-LLM baseline batch executed",
+      "status": "passed",
+      "detail": "batch done, runs 7, counts {\"total\":7,\"passed\":7,\"failed\":0,\"blocked\":0,\"inconclusive\":0,\"skipped\":0,\"interrupted\":0}"
+    },
+    {
+      "name": "execution evidence is persisted",
+      "status": "passed",
+      "detail": "screenshot evidence 374182775005122560"
+    },
+    {
+      "name": "exploration chain renders without an error layer",
+      "status": "passed",
+      "detail": "72 nodes, 0 error layers"
+    },
+    {
+      "name": "issue detail renders with its refs",
+      "status": "passed",
+      "detail": "issue 374182847684022272, evidence refs 0"
+    },
+    {
+      "name": "report Markdown export is downloadable",
+      "status": "passed",
+      "detail": "HTTP 200, 3772 bytes"
+    },
+    {
+      "name": "report tab renders the revision badge",
+      "status": "passed",
+      "detail": "revision 2"
+    },
+    {
+      "name": "todo centre groups the pending knowledge review",
+      "status": "passed",
+      "detail": "review items 1"
+    },
+    {
+      "name": "knowledge draft approved by the administrator",
+      "status": "passed",
+      "detail": "knowledge 374182850942996480 status approved"
+    },
+    {
+      "name": "global search groups version/requirement/case/issue results",
+      "status": "passed",
+      "detail": "groups [\"version\",\"requirement\",\"case\",\"issue\"]"
+    },
+    {
+      "name": "visual version approved into executing",
+      "status": "passed",
+      "detail": "status executing"
+    },
+    {
+      "name": "visual baseline batch produced a real executor screenshot",
+      "status": "passed",
+      "detail": "run inconclusive, verdict not_run, screenshot 374182878134669312"
+    },
+    {
+      "name": "visual baseline approved from real evidence",
+      "status": "passed",
+      "detail": "evidence 374182878134669312"
+    },
+    {
+      "name": "visual version completed after the baseline batch",
+      "status": "passed",
+      "detail": "status completed"
+    },
+    {
+      "name": "incremental visual execution passed with actual/diff evidence",
+      "status": "passed",
+      "detail": "run passed, verdict passed, diff 0"
+    },
+    {
+      "name": "quality centre renders the imported evaluation run",
+      "status": "passed",
+      "detail": "run 374183407199981568, metrics 6, mode deterministic"
+    },
+    {
+      "name": "no secret rendered in quality centre",
+      "status": "passed",
+      "detail": "no configured credential appeared in the page"
+    },
+    {
+      "name": "no Next.js error overlay on the final page",
+      "status": "passed",
+      "detail": "final page rendered"
+    },
+    {
+      "name": "no browser console errors across the real-Chrome walk",
+      "status": "passed",
+      "detail": "0 console errors"
+    },
+    {
+      "name": "normal user reads approved knowledge without review controls",
+      "status": "passed",
+      "detail": "approved entry visible; review controls 0"
+    },
+    {
+      "name": "normal-user console has no errors",
+      "status": "passed",
+      "detail": "0 console errors"
+    }
+  ],
+  "failures": [],
+  "screenshots": [
+    {
+      "name": "real-llm-01-overview.png",
+      "bytes": 119258,
+      "sha256": "62eb881c0f413aff2ee8b3b2e150269f3479367a777aabb41282d238aaeb1ccd",
+      "width": 1600,
+      "height": 1200
+    },
+    {
+      "name": "real-llm-02-requirements-clarification.png",
+      "bytes": 256657,
+      "sha256": "0a05992cc99d457e26e942c60d6059f24a8db44875f220a7996549f5e608f025",
+      "width": 1600,
+      "height": 2786
+    },
+    {
+      "name": "real-llm-03-mindmap.png",
+      "bytes": 234776,
+      "sha256": "11729b86288bd8b5db6b2810d60c1347cdcd191d7bb5d547c02cd7523a4930ad",
+      "width": 1600,
+      "height": 2700
+    },
+    {
+      "name": "real-llm-04-execution-results.png",
+      "bytes": 220252,
+      "sha256": "1fbc63fba6f9e4721d4c7810860c0081e218140673e62f4c0070c6887acb4add",
+      "width": 1600,
+      "height": 1200
+    },
+    {
+      "name": "real-llm-05-execution-evidence.png",
+      "bytes": 239889,
+      "sha256": "316576e56b55d1e5e2e8764712471f9a9a263688d2801c9ad3db3e2471a599b9",
+      "width": 1600,
+      "height": 1750
+    },
+    {
+      "name": "real-llm-06-exploration-chain.png",
+      "bytes": 294295,
+      "sha256": "edda006aa743fd37ba8cbb89f3b35aa07e8b0e8d16e32448976e38bbfa920d0a",
+      "width": 1600,
+      "height": 1434
+    },
+    {
+      "name": "real-llm-07-issue-evidence.png",
+      "bytes": 152410,
+      "sha256": "c4e4ef4cdb4a3464abf4ae1402f4335d655bf9df2bc8b6d6acab0800c8af2ad3",
+      "width": 1600,
+      "height": 1200
+    },
+    {
+      "name": "real-llm-08-report.png",
+      "bytes": 187845,
+      "sha256": "09b7a5669b128dd797ed5ca3b543868785c80c6b1dc296f1dc5025b8ae3485e6",
+      "width": 1600,
+      "height": 1643
+    },
+    {
+      "name": "real-llm-09-todo-centre.png",
+      "bytes": 109717,
+      "sha256": "ef676a8ac91a81c92fbc8b80a4150f995a172b5762e73467defa969b0f208509",
+      "width": 1600,
+      "height": 1200
+    },
+    {
+      "name": "real-llm-10-knowledge-review.png",
+      "bytes": 94407,
+      "sha256": "6750f3a77d8a5f69e7ff03e46b8aa066577c64cb82177294c578d8570ffba290",
+      "width": 1600,
+      "height": 1200
+    },
+    {
+      "name": "real-llm-11-knowledge-approved.png",
+      "bytes": 93323,
+      "sha256": "953f2243a915cc898c1e694f02a803de276f5ddcd7d58f6e396c7c29dba0eac9",
+      "width": 1600,
+      "height": 1200
+    },
+    {
+      "name": "real-llm-12-global-search.png",
+      "bytes": 159176,
+      "sha256": "31870b4d6393b2bd8e4d2dd78403bc3bb1dde27e2da1a6ed6701e213f25b95ad",
+      "width": 1600,
+      "height": 1200
+    },
+    {
+      "name": "real-llm-13-visual-results.png",
+      "bytes": 122312,
+      "sha256": "1ffbb0d18af04421a14f785bd6642f4802edee7b5d00199a8865a304fa49895d",
+      "width": 1600,
+      "height": 1200
+    },
+    {
+      "name": "real-llm-14-visual-actual.png",
+      "bytes": 123176,
+      "sha256": "764623a7037cb11cfb207c97121a754e1038c35338f77ecfaeaddce79838e892",
+      "width": 1600,
+      "height": 1200
+    },
+    {
+      "name": "real-llm-15-visual-diff.png",
+      "bytes": 114326,
+      "sha256": "850050694e2c31490ed2685a726cd1668c5e6f1e218d7f3763f7718752fc1f6c",
+      "width": 1600,
+      "height": 1200
+    },
+    {
+      "name": "real-llm-16-quality-centre.png",
+      "bytes": 108593,
+      "sha256": "fbda9291cc168c7dbcb7a05be9cba423058e4b119dbe71fa8b676537d0dfcbff",
+      "width": 1600,
+      "height": 1200
+    },
+    {
+      "name": "real-llm-17-knowledge-normal-user.png",
+      "bytes": 91117,
+      "sha256": "44bd78af3c883166169e6dc5e9edefee5c25df91d2df1eb67ba4aa525eba8189",
+      "width": 1600,
+      "height": 1200
+    }
+  ],
+  "ids": {
+    "mainVersionId": "374182065513435136",
+    "requirementIds": [
+      "374182065643458560",
+      "374182065706373120"
+    ],
+    "clarificationAssistantChars": 84,
+    "designRunId": "374182083280506880",
+    "generatedCaseIds": [
+      "374182258350755842",
+      "374182258350755882",
+      "374182258350755855",
+      "374182258350755892",
+      "374182258350755864",
+      "374182258350755903",
+      "374182258350755873"
+    ],
+    "searchableCaseId": "374182258350755842",
+    "mainBatchId": "374182273496387584",
+    "issueId": "374182847684022272",
+    "reportId": "374182849122668544",
+    "knowledgeId": "374182850942996480",
+    "visualVersionId": "374182858064924672",
+    "visualAssertionId": "374182858773762048",
+    "visualBaselineBatchId": "374182860275322880",
+    "visualIncrementalBatchId": "374183361884721152",
+    "visualActualEvidenceId": "374183398219976705",
+    "visualDiffEvidenceId": "374183398350000128",
+    "qualityRunId": "374183407199981568"
+  },
+  "error": null
+}
