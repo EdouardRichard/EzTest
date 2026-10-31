@@ -107,6 +107,56 @@ func TestChainFilterNormalize(t *testing.T) {
 	})
 }
 
+func TestChainFilterLimitNormalize(t *testing.T) {
+	tests := []struct {
+		name string
+		in   int
+		want int
+	}{
+		{"zero means unset", 0, 0},
+		{"negative is invalid", -3, 0},
+		{"one is kept", 1, 1},
+		{"default node budget is kept", 300, 300},
+		{"maximum is kept", 1000, 1000},
+		{"above maximum is invalid", 1001, 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := (ChainFilter{Limit: tc.in}).Normalize().Limit; got != tc.want {
+				t.Fatalf("Normalize(Limit: %d).Limit = %d, want %d", tc.in, got, tc.want)
+			}
+		})
+	}
+
+	t.Run("does not mutate the receiver limit", func(t *testing.T) {
+		in := ChainFilter{Limit: 50}
+		_ = in.Normalize()
+		if in.Limit != 50 {
+			t.Fatalf("Normalize mutated Limit to %d", in.Limit)
+		}
+	})
+}
+
+func TestNodeVersionSUTIDs(t *testing.T) {
+	primary := int64(11)
+	labels := []int64{11, 22}
+	node := Node{VersionSUTID: &primary, VersionSUTIDs: labels}
+	if node.VersionSUTID == nil || *node.VersionSUTID != 11 {
+		t.Fatalf("VersionSUTID = %v, want 11", node.VersionSUTID)
+	}
+	if len(node.VersionSUTIDs) != 2 || node.VersionSUTIDs[0] != 11 || node.VersionSUTIDs[1] != 22 {
+		t.Fatalf("VersionSUTIDs = %v, want [11 22]", node.VersionSUTIDs)
+	}
+
+	empty := Node{}
+	if empty.VersionSUTID != nil {
+		t.Fatalf("zero Node VersionSUTID = %v, want nil", empty.VersionSUTID)
+	}
+	if empty.VersionSUTIDs != nil {
+		t.Fatalf("zero Node VersionSUTIDs = %v, want nil", empty.VersionSUTIDs)
+	}
+}
+
 func TestNodeID(t *testing.T) {
 	if got := NodeID(NodeRequirement, 42); got != "requirement:42" {
 		t.Errorf("NodeID(requirement, 42) = %q, want %q", got, "requirement:42")
