@@ -26,6 +26,39 @@ func (s *Service) ListInitialVersionsWithContent(ctx context.Context, limit int)
 	return s.repo.ListInitialVersionsWithContent(ctx, clampReconcilerLimit(limit))
 }
 
+// ListRunningVersions returns the newest running version IDs for the P4
+// reconciler rules (spec §7.3–§7.5), at most limit of them. Completed versions
+// are deliberately excluded: their only P4 rule is the reopen scan, which the
+// requirement/design/execution hooks own, so they must never receive an ensure
+// pass. The scan pages through the version list because the P1 repository only
+// exposes the newest-first summary page; limit is clamped to 1..100.
+func (s *Service) ListRunningVersions(ctx context.Context, limit int) ([]int64, error) {
+	limit = clampReconcilerLimit(limit)
+	ids := make([]int64, 0, limit)
+	var beforeID *int64
+	for len(ids) < limit {
+		summaries, err := s.repo.List(ctx, limit, beforeID)
+		if err != nil {
+			return nil, err
+		}
+		for _, summary := range summaries {
+			if summary.Status != version.StatusRunning {
+				continue
+			}
+			ids = append(ids, summary.ID)
+			if len(ids) == limit {
+				break
+			}
+		}
+		if len(summaries) < limit {
+			break
+		}
+		lastID := summaries[len(summaries)-1].ID
+		beforeID = &lastID
+	}
+	return ids, nil
+}
+
 // ListReconcilable returns the most recent clarification conversations that
 // have messages (newest first) with their messages in ascending ID order.
 func (s *ConversationService) ListReconcilable(ctx context.Context, limit int) ([]ReconcilerConversation, error) {
