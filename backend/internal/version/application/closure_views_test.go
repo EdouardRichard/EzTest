@@ -116,3 +116,20 @@ func TestClosureServiceSummariesByRequirementIDsValidatesAndPropagates(t *testin
 		t.Fatal("SummariesByRequirementIDs dropped the storage error")
 	}
 }
+
+func TestClosureFinalizerRequiresClosureForCurrentVersion(t *testing.T) {
+	env := newClosureEnv(t)
+	env.closures.closures[1001] = []version.RequirementClosure{{
+		ID: 3001, RequirementID: 1001, RequirementVersionID: 1002, CloseRound: 1,
+	}}
+	finalizer := versionapp.NewClosureFinalizer(env.svc)
+	if err := finalizer.Finalize(requestContext(), 1001, 1002); err != nil {
+		t.Fatalf("Finalize current version: %v", err)
+	}
+	if err := finalizer.Finalize(requestContext(), 1001, 9999); err == nil {
+		t.Fatal("Finalize stale requirement version = nil, want retryable error")
+	}
+	if err := finalizer.Finalize(requestContext(), 1001, 0); err == nil {
+		t.Fatal("Finalize missing version = nil, want error")
+	}
+}
