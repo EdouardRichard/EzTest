@@ -204,6 +204,12 @@ export function createExecutorServer({ token, manager, version = PACKAGE_VERSION
     }
 
     if (pathname === "/v1/contexts") {
+      if (req.method === "GET") {
+        // P3 extension (execution design §6.1): context inventory used by the
+        // API for orphan reconciliation and executor capacity accounting.
+        const contexts = typeof executor.list === "function" ? executor.list() : []
+        return sendJson(res, 200, { contexts })
+      }
       if (req.method !== "POST") {
         return sendError(res, 405, "invalid_request", "method not allowed")
       }

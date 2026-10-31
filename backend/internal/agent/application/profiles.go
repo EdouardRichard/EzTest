@@ -23,6 +23,13 @@ const (
 	ProfileKeyDataPlanner   = "data_planner"
 )
 
+// P3 execution profile keys (contracts/agent-profiles-tools.md P3 increment).
+const (
+	ProfileKeyCaseExecutor    = "case_executor"
+	ProfileKeyFailureAnalyst  = "failure_analyst"
+	ProfileKeyCoverageAnalyst = "coverage_analyst"
+)
+
 // System prompts freeze the role boundaries: Host talks only, Curator produces
 // drafts/relations/reopen proposals, Scout reads and summarizes. The
 // [profile:<key>] marker is used by the deterministic fake LLM and is ignored
@@ -262,14 +269,16 @@ func P2Profiles() []agent.AgentProfile {
 	}
 }
 
-// Profiles returns every seed profile (P1 then P2) in startup seeding order.
+// Profiles returns every seed profile (P1 then P2 then P3) in startup seeding
+// order.
 func Profiles() []agent.AgentProfile {
 	profiles := P1Profiles()
 	profiles = append(profiles, P2Profiles()...)
+	profiles = append(profiles, P3Profiles()...)
 	return profiles
 }
 
-// EnsureProfiles idempotently seeds the P1 and P2 profiles. Existing rows
+// EnsureProfiles idempotently seeds the P1, P2 and P3 profiles. Existing rows
 // (including administrator edits) are returned unchanged by the repository.
 func EnsureProfiles(ctx context.Context, repo agent.RuntimeRepository) ([]agent.AgentProfile, error) {
 	seeds := Profiles()

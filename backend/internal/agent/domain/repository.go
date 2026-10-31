@@ -34,6 +34,12 @@ type WorkItemRepository interface {
 	Renew(ctx context.Context, id, epoch int64, lease time.Duration) error
 	// Complete finishes an item.
 	Complete(ctx context.Context, id, epoch int64) error
+	// MarkWaitingHuman parks a running item for a human takeover. It fences on
+	// (id, lease_epoch) and reports ErrLeaseLost when zero rows match.
+	MarkWaitingHuman(ctx context.Context, id, epoch int64) error
+	// Finish closes a waiting_human/pending item without a failure, recording
+	// the reason in last_error. It is idempotent for an already-done item.
+	Finish(ctx context.Context, id int64, reason string) error
 	// Fail records a failure. The repository decides between open (retry with
 	// the supplied backoff) and dead based on retryable/attempts/max_attempts.
 	Fail(ctx context.Context, id, epoch int64, message string, retryable bool, backoff time.Duration) error

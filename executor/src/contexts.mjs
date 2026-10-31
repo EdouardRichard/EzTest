@@ -22,6 +22,7 @@ import {
 import {
   DEFAULT_MAX_CONTEXTS,
   ExecutorError,
+  MAX_CONTEXT_METADATA_BYTES,
   hostFromUrl,
   invalidArguments,
   isAllowedHost,
@@ -236,6 +237,30 @@ function parseBaseUrl(input) {
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
     throw invalidArguments("baseUrl must use http or https")
+  }
+  return input
+}
+
+/**
+ * P3 extension (execution design §6.1): metadata is an opaque JSON object the
+ * API stores to correlate a context with its case_run/version_sut/account role.
+ * It is bounded (2KB) so a caller cannot turn the context table into storage.
+ */
+function normalizeMetadata(input) {
+  if (input === undefined || input === null) {
+    return undefined
+  }
+  if (typeof input !== "object" || Array.isArray(input)) {
+    throw invalidArguments("metadata must be an object")
+  }
+  let encoded
+  try {
+    encoded = JSON.stringify(input)
+  } catch {
+    throw invalidArguments("metadata must be JSON serializable")
+  }
+  if (Buffer.byteLength(encoded) > MAX_CONTEXT_METADATA_BYTES) {
+    throw invalidArguments(`metadata must be at most ${MAX_CONTEXT_METADATA_BYTES} bytes`)
   }
   return input
 }
@@ -575,6 +600,20 @@ export class ContextManager {
     return [...this.#allowedHosts]
   }
 
+  /**
+   * P3 extension (execution design §6.1): context inventory used by
+   * `GET /v1/contexts`, e.g. for orphan reconciliation. `metadata` is omitted
+   * when the context was created without it.
+   */
+  list() {
+    return [...this.#contexts.values()].map((entry) => ({
+      id: entry.contextId,
+      key: entry.key,
+      ...(entry.metadata !== undefined ? { metadata: entry.metadata } : {}),
+      createdAt: entry.createdAt,
+    }))
+  }
+
   async #getBrowser() {
     if (this.#browser) {
       if (this.#browser.isConnected?.() === false) {
@@ -662,6 +701,7 @@ export class ContextManager {
     }
     const viewport = normalizeViewport(input.viewport)
     const deviceScaleFactor = normalizeDeviceScaleFactor(input.deviceScaleFactor)
+    const metadata = normalizeMetadata(input.metadata)
     const { storageState, sessionStorage: stateSessionStorage } = splitStorageState(input.storageState)
     const sessionStorage = {
       ...stateSessionStorage,
@@ -690,6 +730,8 @@ export class ContextManager {
         const entry = {
           contextId,
           key: typeof input.key === "string" ? input.key : null,
+          metadata,
+          createdAt: new Date().toISOString(),
           context: browserContext,
           page: null,
           allowedHosts,

@@ -127,6 +127,12 @@ func ProfileKeyForWorkType(workType string) (string, bool) {
 		return ProfileKeyDesignCritic, true
 	case WorkTypeDesignDataPlan:
 		return ProfileKeyDataPlanner, true
+	case WorkTypeExecuteCase:
+		return ProfileKeyCaseExecutor, true
+	case WorkTypeAnalyzeFailure:
+		return ProfileKeyFailureAnalyst, true
+	case WorkTypeAnalyzeCoverage:
+		return ProfileKeyCoverageAnalyst, true
 	default:
 		return "", false
 	}
@@ -162,6 +168,13 @@ const (
 	WorkTypeDesignDataPlan    = "design.data_plan"
 )
 
+// P3 execution work item types (contracts/task-types.md P3 increment).
+const (
+	WorkTypeExecuteCase     = "execute.case"
+	WorkTypeAnalyzeFailure  = "analyze.failure"
+	WorkTypeAnalyzeCoverage = "analyze.coverage"
+)
+
 // WorkItemPayload is the small reference payload carried by work items. IDs
 // are parsed from decimal strings or JSON numbers for P0 payload
 // compatibility.
@@ -175,6 +188,13 @@ type WorkItemPayload struct {
 	CaseVersionID        int64
 	RoundID              int64
 	Trigger              string
+	// P3 execution payload (contracts/task-types.md §5). DispatchEpoch/Token
+	// fence every case_run result write; the token stays opaque.
+	IntentID      int64
+	WaveID        int64
+	CaseRunID     int64
+	DispatchEpoch int64
+	DispatchToken string
 }
 
 // ToolDeps is the adapter wiring for the P1 tools. The runner adds the
@@ -194,14 +214,25 @@ type WorkerQueue interface {
 	MarkRunning(ctx context.Context, id, epoch int64) error
 	Heartbeat(ctx context.Context, id, epoch int64) error
 	Complete(ctx context.Context, id, epoch int64) error
+	// MarkWaitingHuman parks a running work item for a human takeover.
+	MarkWaitingHuman(ctx context.Context, id, epoch int64) error
+	// Finish closes a waiting_human/pending work item without a failure.
+	Finish(ctx context.Context, id int64, reason string) error
 	Fail(ctx context.Context, id, epoch int64, cause error, retryable bool) error
 	RecoverExpired(ctx context.Context) (int64, error)
 	ListByVersion(ctx context.Context, versionID int64, limit int) ([]agent.WorkItem, error)
 	Lease() time.Duration
 }
 
-// VersionProjector is the version-context surface used by the reconciler to
-// move versions from initial to running when content exists. versionapp.Service
+// RunCanceller registers the cancel function of an in-flight P3 execution run
+// so pause/cancel/human takeover can interrupt it. It is implemented by the
+// execution CaseRunner (application.RunCanceller).
+type RunCanceller interface {
+	RegisterRun(caseRunID int64, cancel context.CancelFunc)
+	ClearRun(caseRunID int64)
+}
+
+// VersionProjector is the version-context surface used by the reconciler to// move versions from initial to running when content exists. versionapp.Service
 // satisfies it directly; its MarkRunning is idempotent and publishes
 // version.started/version.status_changed on the actual transition.
 type VersionProjector interface {

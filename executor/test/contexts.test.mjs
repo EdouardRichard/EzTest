@@ -125,6 +125,67 @@ test("createContext fails closed and closes the context when routeWebSocket is u
   }
 })
 
+test("createContext stores metadata and createdAt and lists contexts", async () => {
+  const manager = new ContextManager({
+    maxContexts: 2,
+    launch: async () => fakeBrowser([]),
+    logger: null,
+  })
+  try {
+    const metadata = {
+      case_run_id: 42,
+      version_sut_id: 7,
+      account_role: "admin",
+      dispatch_epoch: 3,
+      dispatch_token: "dispatch-token",
+    }
+    const created = await manager.createContext({
+      key: "run:42:vs:7:role:admin",
+      allowedHosts: ["127.0.0.1"],
+      metadata,
+    })
+    const contexts = manager.list()
+    assert.equal(contexts.length, 1)
+    assert.equal(contexts[0].id, created.contextId)
+    assert.equal(contexts[0].key, "run:42:vs:7:role:admin")
+    assert.deepEqual(contexts[0].metadata, metadata)
+    assert.equal(typeof contexts[0].createdAt, "string")
+    assert.ok(Number.isFinite(Date.parse(contexts[0].createdAt)))
+
+    await manager.deleteContext(created.contextId)
+    assert.deepEqual(manager.list(), [])
+  } finally {
+    await manager.close()
+  }
+})
+
+test("createContext rejects non-object or oversized metadata", async () => {
+  const manager = new ContextManager({
+    maxContexts: 1,
+    launch: async () => fakeBrowser([]),
+    logger: null,
+  })
+  try {
+    for (const metadata of [["not", "an", "object"], "text", 42]) {
+      await assert.rejects(
+        () => manager.createContext({ allowedHosts: ["127.0.0.1"], metadata }),
+        (error) => error && error.code === "invalid_arguments",
+        `metadata ${JSON.stringify(metadata)} was accepted`,
+      )
+    }
+    await assert.rejects(
+      () => manager.createContext({ allowedHosts: ["127.0.0.1"], metadata: { blob: "x".repeat(3000) } }),
+      (error) => error && error.code === "invalid_arguments",
+    )
+    // An absent or null metadata is valid and is not stored.
+    const created = await manager.createContext({ allowedHosts: ["127.0.0.1"], metadata: null })
+    assert.equal(manager.list()[0].metadata, undefined)
+    await manager.deleteContext(created.contextId)
+  } finally {
+    await manager.close()
+  }
+})
+
 test("createContext rejects an out-of-range deviceScaleFactor", async () => {
   const manager = new ContextManager({
     maxContexts: 1,

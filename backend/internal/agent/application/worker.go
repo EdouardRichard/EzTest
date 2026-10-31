@@ -2,6 +2,7 @@ package agentapp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -66,6 +67,18 @@ func WithWorkerEvents(publisher eventingapp.Publisher) WorkerOption {
 	return func(w *Worker) { w.events = publisher }
 }
 
+// RunSink observes every finished agent run (result and/or classified error).
+// It is used by P3 to let the execution context finalize the case_run after the
+// run loop ends. Sink failures are logged and never change the work item outcome.
+type RunSink interface {
+	OnRunFinished(ctx context.Context, item agent.WorkItem, result RunResult, runErr error) error
+}
+
+// WithWorkerRunSink registers a post-run observer. A nil sink disables it.
+func WithWorkerRunSink(sink RunSink) WorkerOption {
+	return func(w *Worker) { w.runSink = sink }
+}
+
 // Worker claims work items, runs them with bounded concurrency and heartbeats
 // their leases. It is started by cmd/eztest and stopped by cancelling its
 // context; the P1 deployment assumes a single instance.
@@ -76,6 +89,7 @@ type Worker struct {
 	logger     *slog.Logger
 	instanceID string
 	events     eventingapp.Publisher
+	runSink    RunSink
 
 	pollInterval        time.Duration
 	heartbeatInterval   time.Duration
@@ -220,6 +234,11 @@ func (w *Worker) execute(parent context.Context, item agent.WorkItem) {
 		w.logger.Warn("agent worker: dropping result after lease loss", "work_item_id", item.ID)
 		return
 	}
+	// A lease-lost run has no authority to finalize its case_run: the new owner
+	// will. Observing it here would double-finalize/overwrite the redispatch.
+	if !isRunLeaseLost(runErr) {
+		w.notifyRunFinished(item, result, runErr)
+	}
 	if runErr == nil && result.Status == agent.AgentRunDone {
 		if err := w.complete(item); err != nil {
 			w.logger.Error("agent worker: complete failed", "work_item_id", item.ID, "error", err)
@@ -234,6 +253,16 @@ func (w *Worker) execute(parent context.Context, item agent.WorkItem) {
 	w.recordFailure(item, runErr, retryable)
 }
 
+// isRunLeaseLost reports whether a finished run lost its lease, either as a
+// classified RunError or as a platform lease_lost error.
+func isRunLeaseLost(err error) bool {
+	if IsLeaseLost(err) {
+		return true
+	}
+	var runErr *RunError
+	return errors.As(err, &runErr) && runErr.Reason == "lease_lost"
+}
+
 func (w *Worker) complete(item agent.WorkItem) error {
 	ctx, cancel := context.WithTimeout(context.Background(), workerWriteBackTimeout)
 	defer cancel()
@@ -242,6 +271,19 @@ func (w *Worker) complete(item agent.WorkItem) error {
 		w.logger.Warn("agent worker: lease lost while completing", "work_item_id", item.ID)
 	}
 	return err
+}
+
+// notifyRunFinished calls the optional RunSink with a fresh timeout context (the
+// run context may already be canceled). A sink failure is only logged.
+func (w *Worker) notifyRunFinished(item agent.WorkItem, result RunResult, runErr error) {
+	if w.runSink == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), workerWriteBackTimeout)
+	defer cancel()
+	if err := w.runSink.OnRunFinished(ctx, item, result, runErr); err != nil {
+		w.logger.Warn("agent worker: run sink failed", "work_item_id", item.ID, "error", err)
+	}
 }
 
 func (w *Worker) recordFailure(item agent.WorkItem, cause error, retryable bool) {
