@@ -188,6 +188,7 @@ export function ChainTab({ versionId }: ChainTabProps) {
     onIssueChanged: scheduleRefresh,
     onReportChanged: scheduleRefresh,
     onRequirementChanged: scheduleRefresh,
+    onStreamReset: scheduleRefresh,
   })
 
   const selectNode = useCallback(

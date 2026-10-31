@@ -41,6 +41,8 @@ export type VersionEventHandlers = {
   onIssueChanged?: (event: VersionEvent) => void
   /** P4 `report.*`: refresh the report list/detail and current revision. */
   onReportChanged?: (event: VersionEvent) => void
+  /** Synthetic `stream.reset`: refetch every snapshot instead of reconnecting. */
+  onStreamReset?: (data: unknown) => void
   /** Connection state for the status indicator. */
   onStatus?: (status: SSEStatus) => void
 }
@@ -96,7 +98,13 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
           break
         case "version.started":
         case "version.status_changed":
+        case "version.closed":
+        case "version.reopened":
           handlersRef.current.onVersionChanged?.(event)
+          break
+        case "requirement.closed":
+        case "requirement.reopened":
+          handlersRef.current.onRequirementChanged?.(event)
           break
         case "design.graph_delta":
           handlersRef.current.onDesignGraphChanged?.(event)
@@ -167,6 +175,11 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
       url: `${getApiBaseUrl()}/api/stream?channel=version:${versionId}`,
       token: getToken() ?? "",
       onEvent,
+      onReset: (data) => {
+        // `stream.reset` means the cursor fell out of the event window; every
+        // feature refetches its snapshot. No second EventSource is opened.
+        handlersRef.current.onStreamReset?.(data)
+      },
       onStatus: (next) => {
         setStatus(next)
         handlersRef.current.onStatus?.(next)

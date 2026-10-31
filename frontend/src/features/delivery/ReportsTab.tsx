@@ -382,7 +382,7 @@ export function ReportsTab({ versionId }: ReportsTabProps) {
                       <span className="flex flex-wrap items-center gap-1.5">
                         <span className="text-xs font-semibold text-foreground">
                           {REPORT_KIND_LABELS[report.kind]}
-                          {report.kind === "wave" && report.wave_id !== null
+                          {report.kind === "wave" && report.wave_id != null
                             ? ` #${report.wave_id}`
                             : ""}
                         </span>

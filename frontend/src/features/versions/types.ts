@@ -151,9 +151,18 @@ export type Version = {
   pending_design_count?: number
   /** P2: current case versions by status; `superseded` history is excluded. */
   case_counts?: VersionCaseCounts
+  /** P4: set when status becomes `completed`; cleared on reopen. */
+  closed_at?: string | null
+  /** P4: close reason captured with `closed_at`; cleared on reopen. */
+  close_reason?: string | null
   created_by: string
   created_at: string
   updated_at: string
+}
+
+/** `POST /api/versions/{id}/reopen` (reason is mandatory). */
+export type ReopenVersionInput = {
+  reason: string
 }
 
 /** `PATCH /api/versions/{id}` (P0 allowed fields + P2 auto-design flag). */

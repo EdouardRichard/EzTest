@@ -3,30 +3,27 @@
 import { ArrowLeft, Database, FileCode2, Server } from "lucide-react"
 import Link from "next/link"
 import { useRouter, useSearchParams } from "next/navigation"
-import { type ReactNode, useCallback, useEffect, useState } from "react"
+import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react"
 
-import { Badge, type BadgeTone } from "@/components/ui/Badge"
+import { Badge } from "@/components/ui/Badge"
 import { EmptyState } from "@/components/ui/EmptyState"
 import { ErrorState } from "@/components/ui/ErrorState"
 import { LoadingCard } from "@/components/ui/Spinner"
 import { Tabs } from "@/components/ui/Tabs"
 import { ChainTab } from "@/features/chain/ChainTab"
 import { RequirementsTab } from "@/features/clarification/RequirementsTab"
+import { listIssues, listReports } from "@/features/delivery/api"
 import { IssuesTab } from "@/features/delivery/IssuesTab"
 import { ReportsTab } from "@/features/delivery/ReportsTab"
 import { DesignTab } from "@/features/design/DesignTab"
 import { ExecutionTab } from "@/features/execution/ExecutionTab"
+import { TodoDrawer } from "@/features/shell/TodoDrawer"
 import { formatDateTime } from "@/lib/format"
 
 import { getVersion } from "./api"
 import { parseVersionTab, VERSION_TABS } from "./tabs"
-import type { Version, VersionBinding, VersionStatus, VersionTab } from "./types"
-
-const STATUS_META: Record<VersionStatus, { label: string; tone: BadgeTone }> = {
-  initial: { label: "初始", tone: "info" },
-  running: { label: "运行中", tone: "success" },
-  completed: { label: "已完成", tone: "neutral" },
-}
+import type { Version, VersionBinding, VersionTab } from "./types"
+import { VersionHeader } from "./VersionHeader"
 
 type PlaceholderTab = Extract<VersionTab, "code">
 
@@ -222,6 +219,9 @@ export function VersionDetailPage({
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<unknown>(null)
   const [activeTab, setActiveTab] = useState<VersionTab>(() => parseVersionTab(initialTab))
+  const [issueCount, setIssueCount] = useState<number | undefined>(undefined)
+  const [reportRevision, setReportRevision] = useState<number | undefined>(undefined)
+  const [todoOpen, setTodoOpen] = useState(false)
 
   // `?case=` / `?conversation=` deep links for the design workspace. The route
   // already forwards `conversation` for clarification; read the URL here so the
@@ -253,6 +253,43 @@ export function VersionDetailPage({
   useEffect(() => {
     setActiveTab(parseVersionTab(initialTab))
   }, [initialTab])
+
+  // Tab counts come from the real list projections; a failed/missing query
+  // leaves the count absent instead of rendering a misleading zero (spec §9.1).
+  useEffect(() => {
+    let cancelled = false
+    void listIssues(versionId, { status: "open", limit: 100 })
+      .then((items) => {
+        if (!cancelled) setIssueCount(items.filter((issue) => issue.status === "open").length)
+      })
+      .catch(() => {
+        if (!cancelled) setIssueCount(undefined)
+      })
+    void listReports(versionId, { kind: "version", limit: 20 })
+      .then((items) => {
+        if (cancelled) return
+        const versionReport = items.find((report) => report.kind === "version")
+        setReportRevision(versionReport?.current_revision?.revision)
+      })
+      .catch(() => {
+        if (!cancelled) setReportRevision(undefined)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [versionId])
+
+  const tabItems = useMemo(
+    () =>
+      VERSION_TABS.map((tab) => {
+        if (tab.value === "issues" && issueCount !== undefined) return { ...tab, count: issueCount }
+        if (tab.value === "reports" && reportRevision !== undefined) {
+          return { ...tab, count: reportRevision }
+        }
+        return tab
+      }),
+    [issueCount, reportRevision],
+  )
 
   function handleTabChange(value: string): void {
     const next = parseVersionTab(value)
@@ -323,8 +360,6 @@ export function VersionDetailPage({
     )
   }
 
-  const statusMeta = STATUS_META[version.status]
-
   return (
     <div className="space-y-5">
       <Link
@@ -335,28 +370,14 @@ export function VersionDetailPage({
         返回版本列表
       </Link>
 
-      <header className="space-y-3">
-        <div className="flex flex-wrap items-center gap-2">
-          <h1 className="text-xl font-semibold text-foreground">{version.title}</h1>
-          <Badge tone={statusMeta.tone}>{statusMeta.label}</Badge>
-          {version.auto_design_new_requirements ? <Badge tone="info">新需求自动设计</Badge> : null}
-        </div>
-
-        <fieldset className="flex flex-wrap items-center gap-2">
-          <legend className="sr-only">版本 SUT</legend>
-          {version.bindings.map((binding) => (
-            <Badge key={binding.id} tone="info">
-              {binding.sut.name}
-            </Badge>
-          ))}
-          <span className="text-[11px] text-muted-foreground">
-            创建于 {formatDateTime(version.created_at)}
-          </span>
-        </fieldset>
-      </header>
+      <VersionHeader
+        version={version}
+        onOpenTodo={() => setTodoOpen(true)}
+        onReopened={(next) => setVersion(next)}
+      />
 
       <Tabs
-        items={VERSION_TABS}
+        items={tabItems}
         value={activeTab}
         onValueChange={handleTabChange}
         ariaLabel="版本工作区"
@@ -391,6 +412,8 @@ export function VersionDetailPage({
       ) : (
         <TabPlaceholder tab={activeTab} />
       )}
+
+      <TodoDrawer versionId={versionId} open={todoOpen} onClose={() => setTodoOpen(false)} />
     </div>
   )
 }

@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
@@ -11,8 +11,18 @@ const api = vi.hoisted(() => ({
   getVersion: vi.fn(),
   createVersion: vi.fn(),
   getResourceCatalog: vi.fn(),
+  reopenVersion: vi.fn(),
 }))
 vi.mock("./api", () => api)
+
+const deliveryApi = vi.hoisted(() => ({
+  listIssues: vi.fn(),
+  listReports: vi.fn(),
+}))
+vi.mock("@/features/delivery/api", () => deliveryApi)
+
+const executionApi = vi.hoisted(() => ({ listHumanRequests: vi.fn() }))
+vi.mock("@/features/execution/api", () => executionApi)
 
 vi.mock("@/features/clarification/RequirementsTab", async () => {
   const React = await import("react")
@@ -120,6 +130,13 @@ describe("VersionDetailPage", () => {
   beforeEach(() => {
     api.getVersion.mockReset()
     api.getVersion.mockResolvedValue(versionFixture)
+    api.reopenVersion.mockReset()
+    deliveryApi.listIssues.mockReset()
+    deliveryApi.listIssues.mockResolvedValue([])
+    deliveryApi.listReports.mockReset()
+    deliveryApi.listReports.mockResolvedValue([])
+    executionApi.listHumanRequests.mockReset()
+    executionApi.listHumanRequests.mockResolvedValue([])
     navigation.replace.mockReset()
     search.params = new URLSearchParams()
   })
@@ -150,6 +167,32 @@ describe("VersionDetailPage", () => {
     expect(overview).toHaveTextContent("2 个测试账号")
     expect(overview).toHaveTextContent("order-center-web")
     expect(overview).toHaveTextContent("未绑定代码仓")
+  })
+
+  it("shows issue and report tab counts from the list projections", async () => {
+    deliveryApi.listIssues.mockResolvedValue([
+      { id: "9101", status: "open" },
+      { id: "9102", status: "open" },
+    ])
+    deliveryApi.listReports.mockResolvedValue([
+      { id: "8101", kind: "version", current_revision: { revision: 2 } },
+    ])
+
+    render(<VersionDetailPage versionId="2001" />)
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+
+    await waitFor(() => expect(screen.getByRole("tab", { name: /问题/ })).toHaveTextContent("2"))
+    expect(screen.getByRole("tab", { name: /报告/ })).toHaveTextContent("2")
+  })
+
+  it("opens the current-version todo drawer from the version header", async () => {
+    render(<VersionDetailPage versionId="2001" />)
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+
+    fireEvent.click(screen.getByTestId("version-todo-entry"))
+
+    expect(await screen.findByRole("dialog", { name: "待办" })).toBeInTheDocument()
+    expect(executionApi.listHumanRequests).toHaveBeenCalledWith("2001", { status: "open" })
   })
 
   it("honours a deep-linked execution tab and mounts the execution workspace", async () => {
@@ -196,7 +239,7 @@ describe("VersionDetailPage", () => {
     render(<VersionDetailPage versionId="2001" initialTab="issues" />)
 
     await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
-    expect(screen.getByRole("tab", { name: "问题" })).toHaveAttribute("aria-selected", "true")
+    expect(screen.getByRole("tab", { name: /^问题/ })).toHaveAttribute("aria-selected", "true")
     const workspace = screen.getByTestId("issues-workspace")
     expect(workspace).toHaveAttribute("data-version-id", "2001")
     expect(screen.queryByText("问题将在 P4 阶段提供")).not.toBeInTheDocument()
@@ -209,7 +252,7 @@ describe("VersionDetailPage", () => {
     render(<VersionDetailPage versionId="2001" />)
     await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
 
-    fireEvent.click(screen.getByRole("tab", { name: "问题" }))
+    fireEvent.click(screen.getByRole("tab", { name: /^问题/ }))
 
     expect(navigation.replace).toHaveBeenCalledWith("/versions/2001?tab=issues&issue=9101")
   })
