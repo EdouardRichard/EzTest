@@ -102,17 +102,20 @@ type AnalysisRepository interface {
 }
 
 // TaskEnsurer ensures the P4 agent work items. Every method is idempotent and
-// revision-aware: the caller passes the version, report revision or close
-// round that the work-item dedupe key includes (spec §4.4), so a stale ensure
-// cannot reuse an item created for an earlier revision or round.
+// revision-aware: the caller passes the version, report revision, requirement
+// version or close round that the work-item dedupe key includes (spec §4.4), so
+// a stale ensure cannot reuse an item created for an earlier revision or round.
 type TaskEnsurer interface {
 	// EnsureIssueTriage ensures issue.triage for the issue's own version.
 	EnsureIssueTriage(ctx context.Context, issueID, versionID int64) error
 	// EnsureReportTask ensures report.wave or report.version for one report
 	// revision, selected by the report's kind.
 	EnsureReportTask(ctx context.Context, reportID int64, revision int32) error
-	// EnsureRequirementClose ensures requirement.close for one close round.
-	EnsureRequirementClose(ctx context.Context, requirementID int64, closeRound int32) error
+	// EnsureRequirementClose ensures requirement.close for one requirement
+	// version and close round. Its dedupe key is
+	// req-close:{requirement_id}:{requirement_version_id}:{close_round}, so a
+	// closure recorded at an earlier requirement version is never reused.
+	EnsureRequirementClose(ctx context.Context, requirementID, requirementVersionID int64, closeRound int32) error
 	// EnsureVersionClose ensures version.close for the current predicate
 	// fingerprint; a changed predicate naturally produces a new dedupe key.
 	EnsureVersionClose(ctx context.Context, versionID, reportRevisionID int64, predicateFingerprint string) error
