@@ -65,6 +65,17 @@ vi.mock("@/features/execution/ExecutionTab", async () => {
   }
 })
 
+vi.mock("@/features/delivery/IssuesTab", async () => {
+  const React = await import("react")
+  return {
+    IssuesTab: (props: { versionId: string }) =>
+      React.createElement("div", {
+        "data-testid": "issues-workspace",
+        "data-version-id": props.versionId,
+      }),
+  }
+})
+
 const navigation = vi.hoisted(() => ({
   push: vi.fn(),
   replace: vi.fn(),
@@ -159,9 +170,30 @@ describe("VersionDetailPage", () => {
     )
   })
 
+  it("honours a deep-linked issues tab and mounts the issues workspace", async () => {
+    render(<VersionDetailPage versionId="2001" initialTab="issues" />)
+
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+    expect(screen.getByRole("tab", { name: "问题" })).toHaveAttribute("aria-selected", "true")
+    const workspace = screen.getByTestId("issues-workspace")
+    expect(workspace).toHaveAttribute("data-version-id", "2001")
+    expect(screen.queryByText("问题将在 P4 阶段提供")).not.toBeInTheDocument()
+    expect(screen.queryByRole("region", { name: "绑定概览" })).not.toBeInTheDocument()
+  })
+
+  it("keeps the ?issue= deep link when switching to the issues tab", async () => {
+    search.params = new URLSearchParams("tab=overview&issue=9101")
+
+    render(<VersionDetailPage versionId="2001" />)
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+
+    fireEvent.click(screen.getByRole("tab", { name: "问题" }))
+
+    expect(navigation.replace).toHaveBeenCalledWith("/versions/2001?tab=issues&issue=9101")
+  })
+
   it.each([
     ["chain", "探索链路将在 P4 阶段提供"],
-    ["issues", "问题将在 P4 阶段提供"],
     ["reports", "报告将在 P4 阶段提供"],
     ["code", "代码与变更将在 P5 阶段提供"],
   ] as const)("deep links the %s tab to its real phase copy", async (tab, copy) => {
