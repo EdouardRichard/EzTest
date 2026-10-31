@@ -677,6 +677,43 @@ func TestCreateMapsDuplicatePersistenceError(t *testing.T) {
 	}
 }
 
+func TestVersionViewExposesCloseProjection(t *testing.T) {
+	env := newTestEnv(t)
+	view := createVersion(t, env, "Orders Q4")
+	closedAt := testTime.Add(time.Hour)
+	stored := env.repo.versions[view.ID]
+	stored.Status = version.StatusCompleted
+	stored.ClosedAt = &closedAt
+	stored.CloseReason = "all delivery work is done"
+	env.repo.versions[view.ID] = stored
+
+	got, err := env.svc.Get(requestContext(), view.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status != string(version.StatusCompleted) {
+		t.Fatalf("status = %q", got.Status)
+	}
+	if got.ClosedAt == nil || !got.ClosedAt.Equal(closedAt) {
+		t.Fatalf("closed_at = %v", got.ClosedAt)
+	}
+	if got.CloseReason != "all delivery work is done" {
+		t.Fatalf("close_reason = %q", got.CloseReason)
+	}
+
+	stored.Status = version.StatusRunning
+	stored.ClosedAt = nil
+	stored.CloseReason = ""
+	env.repo.versions[view.ID] = stored
+	reopened, err := env.svc.Get(requestContext(), view.ID)
+	if err != nil {
+		t.Fatalf("Get reopened: %v", err)
+	}
+	if reopened.ClosedAt != nil || reopened.CloseReason != "" {
+		t.Fatalf("reopened close projection = %v/%q", reopened.ClosedAt, reopened.CloseReason)
+	}
+}
+
 func TestGetReturnsNestedResourceViews(t *testing.T) {
 	env := newTestEnv(t)
 	created := createVersion(t, env, "Orders Q4")

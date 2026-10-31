@@ -448,6 +448,8 @@ func (s *Service) buildView(ctx context.Context, entity version.Version, binding
 		ConversationCount:         stats.ConversationCount,
 		PendingDesignCount:        pendingDesign,
 		CaseCounts:                caseCounts,
+		ClosedAt:                  entity.ClosedAt,
+		CloseReason:               entity.CloseReason,
 		CreatedBy:                 entity.CreatedBy,
 		CreatedAt:                 entity.CreatedAt,
 		UpdatedAt:                 entity.UpdatedAt,
