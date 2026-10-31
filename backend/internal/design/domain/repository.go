@@ -188,6 +188,14 @@ type GraphRepository interface {
 	// ListExecutableCases lists every current+confirmed case version of a
 	// version in ascending case-version ID order.
 	ListExecutableCases(ctx context.Context, versionID int64) ([]ExecutableCase, error)
+
+	// ReadCaseVersionsByIDs loads case versions by ID regardless of their
+	// current/confirmed status, scoped to one version (a case version of
+	// another version is not returned). It is the historical reader of the
+	// exploration chain: superseded rows keep their title. Missing IDs are
+	// simply absent from the result. It never relaxes the current+confirmed
+	// semantics of the P3 execution readers.
+	ReadCaseVersionsByIDs(ctx context.Context, versionID int64, caseVersionIDs []int64) ([]CaseVersionSummary, error)
 }
 
 // Tx is the write surface of one requirement-scoped advisory-lock transaction.
