@@ -194,12 +194,18 @@ P4 新代码/迁移必须满足 `Agent.md` §6.2–§6.9；Lead 在每个工作�
 | 测试 | 与代码同包/同目录；集成测试放 `internal/<context>/integration` 或 `_test.go`；不把测试辅助代码放进生产包 | 目录审查 |
 | 格式化 | `gofmt -l` 为空；`go vet ./...`；`pnpm typecheck`/`pnpm lint` 通过 | 门禁命令 |
 
-**既有 P0–P3 代码审计结论（只读，2026-11-01）**：
+**既有 P0–P3 代码审计结论（只读，2026-11-01，Lead + 子代理）**：
 
-- 干净项：无 `BIGSERIAL/SERIAL`；domain/application 未反向导入 infrastructure/interfaces；跨上下文无 DB FK；前端仅 `api-client`/`sse-client` 使用 `fetch`；env 仅在 config/testutil 读取；P3 evidence 不可变表的 `updated_at` 例外已有文档。
-- 既有偏差（**不在 P4 修改已冻结迁移**，记录 handoff backlog）：33 个表使用内联 `id BIGINT PRIMARY KEY`（PG 自动名 `<table>_pkey`，非 `pk_<table>`）；8 个未命名 `UNIQUE`（自动名非 `uk_*`）；7 个布尔列无 `is_` 前缀（`enabled/supports_tools/supports_vision/read_only/restart_required/auto_design_new_requirements/selected`）；部分表名/索引名为历史泛名。
-- 布尔字段/既有字段改名会破坏既有契约与字段名约定（D34 §6.9.2），P4 不改；若用户要求约束名修复，需追加 metadata-only 重命名迁移（跨上下文，超出 P4 四迁移范围），作为独立 `P4-D-16` 由用户批准后执行。
-- P4 不复制上述偏差；§3.7 的新表命名/索引/审计列为准。
+- 干净项：无 `BIGSERIAL/SERIAL`；domain/application 未反向导入 infrastructure/interfaces；跨上下文无 DB FK；前端仅 `api-client`/`sse-client` 使用 `fetch`；env 仅在 config/testutil 读取；P3 evidence 不可变表的 `updated_at` 例外已有文档；四层/ID/存储原子写/测试同目录基本合规。
+- 既有偏差（**不在 P4 修改已冻结迁移**，记录 handoff backlog）：33 个表使用内联 `id BIGINT PRIMARY KEY`（PG 自动名 `<table>_pkey`）；8 个未命名 `UNIQUE`（自动名非 `uk_*`）；7 个布尔列无 `is_` 前缀（`enabled/supports_tools/supports_vision/read_only/restart_required/auto_design_new_requirements/selected`）；22 张表缺审计列；部分历史泛名索引；`execution/application` 导入 `agent/domain`、adapter 泄漏 `version.MessagePart`/`storage.ExportArtifact`、execution handler 直持仓储、design 路由内联；`Agent.md` §6.1 仍是 0.1 树（P4 不改）。
+- **P4 范围内顺手修正**（与 P4 集成/安全直接相关，不扩功能）：
+  1. `version` 新增 `Close`（条件 UPDATE + close 字段 + 事件/审计）；人工 reopen 补 actor；PATCH 不允许改 status（现有 `Validate` 允许 completed 但 Update 不写 status，P4 用专用服务并加测试）。
+  2. `agent` 的 `P4Profiles` 并入 `Profiles()`，不覆盖用户编辑；任务→profile 映射补 5 类；reconciler 通过 consumer port 调 delivery/version，不复制 `execution/application→agent/domain` 的越层模式。
+  3. `server/cmd` 采用 `Register` 模式装配 delivery/chain；handler 只调 application service，不直持仓储；新上下文在 `cmd/eztest` 启停。
+  4. **FileStore symlink 收紧**：`storage/infrastructure/filestore.go` 的 `Open`（:92-119）补 `Lstat`/`EvalSymlinks` 根内校验并加测试；报告 HTML 读取复用该实现，必须先修（P4 任务 W2-S）。
+  5. 报告 HTML 入 ledger、校验 owner/role/sha；不写 `report_dir`、不 base64 入库；前端 feature/组件按 §2.5 表。
+- 其余历史问题（含 P1 附件 ledger 例外文档、execution handler 直读仓储、design 内联路由、Agent.md 树）只记 backlog，P4 不重构。
+- 布尔/既有字段改名会破坏既有契约与字段名约定（D34 §6.9.2），P4 不改；历史约束名修复作为 `P4-D-16` 独立合规任务/backlog。
 
 ---
 
@@ -558,7 +564,7 @@ P4 写入方仅 `issue.triage`；`failure/coverage` 仅保留枚举（P3 已把�
 
 ### 5.1 候选生成（确定性）
 
-- 入口一：消费 `execution.failure_candidate` 事件（低延迟）；入口二：reconciler 每轮扫描 `case_run.status='failed' AND failure_class='application'` 且无 `issue_ref(kind='case_run')` 的 case_run（兜底漏事件/重启）。
+- 候选真值 = reconciler 每轮扫描 `case_run.status='failed' AND failure_class='application'` 且无 `issue_ref(kind='case_run')` 的 case_run（兜底漏事件/重启）；`execution.failure_candidate` 仅作 UI/观测事件，P4 不新增内部事件消费者（事件是投影，不作为可靠队列）。
 - 只处理 `failure_class='application'`；`interrupted/skipped/blocked` 等不建 issue。
 - **dedupe_key**：优先使用 P3 payload `dedupe_hint`（必须匹配 `^[0-9a-f]{32}$`）；缺失或不合法时按 P3 同一算法重算：`sha256(fmt.Sprintf("%d|%d|%d|%d|%s", versionID, caseVersionID, stepSeq, assertionSeq, failureClass))[:32]`。`stepSeq/assertionSeq` 取该 case_run 中失败断言的最小 `(step_seq, assertion_seq)`；无断言时均取 0。该键跨波次稳定（不包含 wave_id/case_run_id）。
 - **标题/摘要（确定性合成，不依赖 LLM）**：
@@ -638,7 +644,7 @@ P4 写入方仅 `issue.triage`；`failure/coverage` 仅保留枚举（P3 已把�
 
 ### 6.5 stale 与重生成
 
-- 触发标记：`issue.*`（created/updated/reopened/merged）、`requirement.closed/reopened`、新 case 确认、wave 终态/新 wave report、version 重开。交付侧事件消费者在 `report.status='published'` 时置 `stale` 并发 `report.stale`（每个 current revision 只发一次；已 stale 不重复）；wave 报告与版本报告都适用。
+- 触发标记：由 reconciler 定期重算当前输入指纹（不依赖内部事件消费者；事件只作 UI 投影）：`issue.*`、`requirement.closed/reopened`、新 case 确认、wave 终态/新 wave report、version 重开都会改变指纹；发现 `report.status='published'` 且 `input_fingerprint` 与当前指纹不一致时置 `stale` 并发 `report.stale`（每个 current revision 只发一次；已 stale 不重复）；wave 报告与版本报告都适用。
 - 收尾谓词重算指纹，若 `report.input_fingerprint != ComputeVersionFingerprint()` → 视为 stale（并补标/补事件），close 谓词不满足。
 - `POST regenerate`：计算 `next_revision`，ensure `report.wave|version` 任务（dedupe `report:{report_id}:r{revision}`）；同一 next revision 的活跃任务存在时幂等返回 202；不删除旧 revision；生成期间旧 current 仍可读。
 - 版本报告 ensure 条件：无 draft/生成中的版本报告；需求全 closed/obsolete；无活跃 intent/wave；触发后生成；若最新版本报告指纹不匹配则再生成。
