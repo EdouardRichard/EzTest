@@ -186,12 +186,17 @@ func TestExportRevisionIncrements(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Create: %v", err)
 	}
-	second, err := service.Create(context.Background(), validCreateInput(), 1)
+	secondInput := validCreateInput()
+	secondInput.ID = 9009
+	second, err := service.Create(context.Background(), secondInput, 1)
 	if err != nil {
 		t.Fatalf("second Create: %v", err)
 	}
 	if first.Revision != 1 || second.Revision != 2 {
 		t.Fatalf("revisions = %d, %d", first.Revision, second.Revision)
+	}
+	if second.ID != 9009 {
+		t.Fatalf("caller-assigned export id = %d, want 9009", second.ID)
 	}
 	if second.ID == first.ID {
 		t.Fatalf("export id reused: %d", first.ID)
