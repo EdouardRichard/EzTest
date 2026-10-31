@@ -177,7 +177,7 @@ func newTestAPI(t *testing.T) *testAPI {
 		WorkItems: workQueue, Issues: issueRepo,
 	})
 	versionCloseSvc := versionapp.NewVersionCloseService(versionapp.VersionCloseServiceDeps{
-		Versions: versionRepo, WorkItems: closureReaders, Execution: closureReaders,
+		Versions: versionRepo, WorkItems: closureReaders, Execution: versionadapters.NewVersionCloseExecution(closureReaders),
 		HumanRequests: closureReaders, Requirements: requirementRepo,
 		Reports: versionadapters.NewReportStatusReader(reportSvc), ReportStaler: reportSvc,
 		Tasks: p4Tasks, Audit: auditSvc, Events: eventSvc, Clock: clk,

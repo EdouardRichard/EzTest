@@ -762,7 +762,7 @@ func main() {
 	versionCloseSvc := versionapp.NewVersionCloseService(versionapp.VersionCloseServiceDeps{
 		Versions:      versionRepo,
 		WorkItems:     closureReaders,
-		Execution:     closureReaders,
+		Execution:     versionadapters.NewVersionCloseExecution(closureReaders),
 		HumanRequests: closureReaders,
 		Requirements:  requirementRepo,
 		Reports:       versionadapters.NewReportStatusReader(reportSvc),
