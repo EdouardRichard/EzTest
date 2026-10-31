@@ -166,20 +166,24 @@ func (s *AnalysisService) classifyRun(ctx context.Context, wave execution.RunWav
 		return mapExecutionError(err, "assertion result")
 	}
 	status, class, summary := deterministicResult(run, steps, assertions)
-	if status == run.Status && class == run.FailureClass && summaryEqual(summary, run.Summary) {
-		return nil
+	changed := status != run.Status || class != run.FailureClass || !summaryEqual(summary, run.Summary)
+	if changed {
+		run.Status = status
+		run.FailureClass = class
+		run.Summary = summary
+		if run.FinishedAt == nil {
+			now := s.now()
+			run.FinishedAt = &now
+		}
+		run.UpdatedAt = s.now()
+		if _, err := s.caseRuns.Update(ctx, run); err != nil {
+			return mapExecutionError(err, "case run")
+		}
 	}
-	run.Status = status
-	run.FailureClass = class
-	run.Summary = summary
-	if run.FinishedAt == nil {
-		now := s.now()
-		run.FinishedAt = &now
-	}
-	run.UpdatedAt = s.now()
-	if _, err := s.caseRuns.Update(ctx, run); err != nil {
-		return mapExecutionError(err, "case run")
-	}
+	// Emit the deterministic issue candidate even when the executor already
+	// persisted the same class: the wave-completion analysis is the handoff to
+	// P4 and must not depend on who classified the run first (P3 §8.1). The
+	// hint set keeps repeat analysis in this process idempotent.
 	if class.IsIssueCandidate() {
 		return s.emitFailureCandidate(ctx, wave, run)
 	}
