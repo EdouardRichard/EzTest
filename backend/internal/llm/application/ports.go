@@ -33,6 +33,20 @@ type Client interface {
 	Test(ctx context.Context, cfg llm.Config) (TestResult, error)
 }
 
+// ChatClient is the OpenAI-compatible chat-completions transport used by the
+// P1 agent runtime. Implementations must never include the configured API key
+// (or request headers) in returned errors, and must classify context-window
+// overflows with ErrContextOverflow.
+type ChatClient interface {
+	Chat(ctx context.Context, cfg llm.Config, req ChatRequest) (ChatResponse, error)
+}
+
+// SettingsReader is the small settings port consumed by the chat gateway for
+// llm.request_timeout_seconds and llm.max_retries.
+type SettingsReader interface {
+	Int(ctx context.Context, key string) (int64, error)
+}
+
 // ConfigInput is a partial config used by both create (nil fields take the P0
 // defaults) and update (nil fields keep the stored value; a non-nil empty
 // string clears api_key/headers).

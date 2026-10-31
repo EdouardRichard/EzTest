@@ -18,15 +18,19 @@ import (
 
 // Service owns LLM configuration and model-catalog use cases.
 type Service struct {
-	repo   llm.Repository
-	client Client
-	ids    id.Generator
-	clock  clock.Clock
-	audit  auditapp.Recorder
-	events eventingapp.Publisher
+	repo     llm.Repository
+	client   Client
+	chat     ChatClient
+	settings SettingsReader
+	ids      id.Generator
+	clock    clock.Clock
+	audit    auditapp.Recorder
+	events   eventingapp.Publisher
 }
 
 // New wires the LLM application service. audit and events may be nil in tests.
+// Optional chat-gateway dependencies are supplied through options so the frozen
+// P0 constructor and its behavior stay compatible.
 func New(
 	repo llm.Repository,
 	client Client,
@@ -34,8 +38,13 @@ func New(
 	clk clock.Clock,
 	audit auditapp.Recorder,
 	events eventingapp.Publisher,
+	opts ...Option,
 ) *Service {
-	return &Service{repo: repo, client: client, ids: ids, clock: clk, audit: audit, events: events}
+	service := &Service{repo: repo, client: client, ids: ids, clock: clk, audit: audit, events: events}
+	for _, opt := range opts {
+		opt(service)
+	}
+	return service
 }
 
 // ListConfigs returns every configuration ordered by ID.

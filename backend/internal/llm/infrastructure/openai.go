@@ -124,6 +124,37 @@ func (c *Client) chatProbe(ctx context.Context, cfg llm.Config) error {
 // do performs one upstream request. The Authorization header is controlled
 // exclusively by cfg.APIKey; custom headers cannot override it.
 func (c *Client) do(ctx context.Context, cfg llm.Config, method, suffix string, payload any) ([]byte, error) {
+	request, err := c.newRequest(ctx, cfg, method, suffix, payload)
+	if err != nil {
+		return nil, err
+	}
+
+	response, err := c.http.Do(request)
+	if err != nil {
+		if isTimeout(err) {
+			return nil, errors.New("llm provider request timed out")
+		}
+		var unknownHost *url.Error
+		if errors.As(err, &unknownHost) {
+			return nil, errors.New("llm provider request failed: " + unknownHost.Err.Error())
+		}
+		return nil, errors.New("llm provider request failed")
+	}
+	defer func() { _ = response.Body.Close() }()
+
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxErrorBytes))
+		return nil, fmt.Errorf("llm provider returned HTTP %d", response.StatusCode)
+	}
+	raw, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes))
+	if err != nil {
+		return nil, errors.New("read llm provider response failed")
+	}
+	return raw, nil
+}
+
+// newRequest builds one upstream HTTP request with the configured headers.
+func (c *Client) newRequest(ctx context.Context, cfg llm.Config, method, suffix string, payload any) (*http.Request, error) {
 	endpoint, err := endpointURL(cfg.BaseURL, suffix)
 	if err != nil {
 		return nil, errors.New("llm base url is invalid")
@@ -155,29 +186,7 @@ func (c *Client) do(ctx context.Context, cfg llm.Config, method, suffix string, 
 	if key := strings.TrimSpace(cfg.APIKey); key != "" {
 		request.Header.Set("Authorization", "Bearer "+key)
 	}
-
-	response, err := c.http.Do(request)
-	if err != nil {
-		if isTimeout(err) {
-			return nil, errors.New("llm provider request timed out")
-		}
-		var unknownHost *url.Error
-		if errors.As(err, &unknownHost) {
-			return nil, errors.New("llm provider request failed: " + unknownHost.Err.Error())
-		}
-		return nil, errors.New("llm provider request failed")
-	}
-	defer func() { _ = response.Body.Close() }()
-
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxErrorBytes))
-		return nil, fmt.Errorf("llm provider returned HTTP %d", response.StatusCode)
-	}
-	raw, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes))
-	if err != nil {
-		return nil, errors.New("read llm provider response failed")
-	}
-	return raw, nil
+	return request, nil
 }
 
 // endpointURL appends suffix to the configured base URL. Base URLs may or may
