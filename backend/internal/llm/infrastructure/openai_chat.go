@@ -127,7 +127,7 @@ func (c *Client) doChat(ctx context.Context, cfg llm.Config, payload chatRequest
 
 	raw, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes))
 	if err != nil {
-		return llmapp.ChatResponse{}, true, errors.New("read llm chat response failed")
+		return llmapp.ChatResponse{}, true, fmt.Errorf("read llm chat response failed: %w", err)
 	}
 	parsed, err := parseChatCompletion(raw, names)
 	if err != nil {

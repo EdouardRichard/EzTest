@@ -39,16 +39,19 @@ type Client struct {
 
 var _ llmapp.Client = (*Client)(nil)
 
-// NewClient returns a client with the default 10s timeout.
+// NewClient returns a client with no global HTTP timeout. Each request carries
+// its own context deadline from the configured timeout_seconds (or
+// DefaultTimeout), so long tool-calling completions are not cut off by the
+// P0 probe bound.
 func NewClient() *Client {
-	return NewClientWithHTTPClient(&http.Client{Timeout: DefaultTimeout})
+	return NewClientWithHTTPClient(&http.Client{})
 }
 
 // NewClientWithHTTPClient injects the underlying HTTP client (used by tests to
 // exercise timeouts and httptest servers).
 func NewClientWithHTTPClient(httpClient *http.Client) *Client {
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: DefaultTimeout}
+		httpClient = &http.Client{}
 	}
 	return &Client{http: httpClient}
 }
@@ -124,6 +127,13 @@ func (c *Client) chatProbe(ctx context.Context, cfg llm.Config) error {
 // do performs one upstream request. The Authorization header is controlled
 // exclusively by cfg.APIKey; custom headers cannot override it.
 func (c *Client) do(ctx context.Context, cfg llm.Config, method, suffix string, payload any) ([]byte, error) {
+	timeout := time.Duration(cfg.TimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = DefaultTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	request, err := c.newRequest(ctx, cfg, method, suffix, payload)
 	if err != nil {
 		return nil, err

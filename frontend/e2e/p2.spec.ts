@@ -5,6 +5,10 @@ import { type APIRequestContext, expect, test } from "@playwright/test"
 
 const API = process.env.EZTEST_E2E_API_URL?.trim() || "http://127.0.0.1:14333"
 const FAKE_LLM = process.env.EZTEST_E2E_FAKE_LLM_URL?.trim() || "http://127.0.0.1:13335/v1"
+const LLM_BASE = process.env.EZTEST_E2E_LLM_BASE_URL?.trim() || FAKE_LLM
+const LLM_KEY = process.env.EZTEST_E2E_LLM_KEY?.trim() || "fake-llm-key"
+const LLM_TIMEOUT_SECONDS = Number(process.env.EZTEST_E2E_LLM_TIMEOUT_SECONDS || "30")
+const CASE_TIMEOUT_MS = Number(process.env.EZTEST_E2E_CASE_TIMEOUT_MS || "90000")
 const suffix = `${Date.now()}-${Math.floor(Math.random() * 1000)}`
 
 type Setup = {
@@ -44,9 +48,9 @@ test.beforeAll(async ({ request }) => {
     name: `p2-e2e-llm-${suffix}`,
     provider: "openai",
     protocol: "openai",
-    base_url: FAKE_LLM,
-    api_key: "fake-llm-key",
-    timeout_seconds: 30,
+    base_url: LLM_BASE,
+    api_key: LLM_KEY,
+    timeout_seconds: LLM_TIMEOUT_SECONDS,
     max_retries: 1,
     is_default: true,
   })
@@ -169,7 +173,7 @@ test("P2 design workspace: conversation, live mindmap, case detail, confirm and 
   // New design conversation -> planner/author tasks -> live graph.
   await page.getByTestId("design-new-conversation").click()
   const caseCards = page.locator('[data-testid^="case-card-"]')
-  await expect(caseCards.first()).toBeVisible({ timeout: 90_000 })
+  await expect(caseCards.first()).toBeVisible({ timeout: CASE_TIMEOUT_MS })
   const caseCount = await caseCards.count()
   expect(caseCount).toBeGreaterThanOrEqual(1)
 
