@@ -1,0 +1,488 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>EzTest 0.2 临时 UI 草图</title>
+<link rel="stylesheet" href="./mock.css" />
+</head>
+<body>
+
+<!-- ==================== 需求与澄清 ==================== -->
+<section class="screen active" id="requirements">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">EZ</div>
+      <div><div class="brand-name">EzTest</div><div class="brand-sub">AI 驱动端到端测试</div></div>
+    </div>
+    <div class="nav-label">工作区</div>
+    <div class="nav-item active"><span class="ico">▤</span>版本<span class="badge">6</span></div>
+    <div class="nav-item"><span class="ico">⚑</span>问题<span class="badge">3</span></div>
+    <div class="nav-item"><span class="ico">▥</span>报告</div>
+    <div class="nav-item"><span class="ico">◈</span>知识</div>
+    <div class="nav-item"><span class="ico">▧</span>资源</div>
+    <div class="nav-label" style="margin-top:14px">平台</div>
+    <div class="nav-item"><span class="ico">◎</span>质量</div>
+    <div class="nav-item"><span class="ico">◇</span>Agent 中心</div>
+    <div class="nav-item"><span class="ico">⚙</span>设置</div>
+    <div class="sidebar-foot">开发测试环境 · 受控网络<br/>AI 可读取测试账号凭据</div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <div class="version-switch">
+        <div class="stack"><strong>订单中心 · 2026 Q4 迭代</strong><span>order-center-web 2.4.0</span></div>
+        <span class="status-pill running" style="margin-left:auto"><span class="status-dot"></span>运行中</span>
+      </div>
+      <div class="search">⌕ <span style="flex:1">搜索需求、用例、问题…</span><kbd>Ctrl K</kbd></div>
+      <div class="sys-stack">
+        <span class="sut-chip sut-order">订单中心</span>
+        <span class="sut-chip sut-pay">支付网关</span>
+        <span class="page-chip">12 个页面</span>
+      </div>
+      <div class="top-spacer"></div>
+      <div class="icon-btn" style="position:relative" title="待办">☑<span style="position:absolute;top:-4px;right:-4px;background:#ef4444;color:#fff;border-radius:999px;font-size:9px;line-height:1;padding:2px 4px">3</span></div>
+      <div class="icon-btn">◐</div>
+      <div class="user-chip"><div class="avatar">R</div><div style="line-height:1.2"><div style="font-size:11.5px;font-weight:650">Richard</div><div style="font-size:10px;color:var(--muted)">管理员</div></div></div>
+    </header>
+
+    <div class="content">
+      <div class="version-head">
+        <div class="version-title-row">
+          <h1>订单中心 · 2026 Q4 迭代</h1>
+          <span class="status-pill running"><span class="status-dot"></span>运行中</span>
+          <span class="chip gray">波次 4</span>
+          <span class="chip blue">2 个 SUT</span>
+          <div style="margin-left:auto;display:flex;gap:6px">
+            <button class="btn">版本设置</button>
+            <button class="btn primary">查看探索链路 →</button>
+          </div>
+        </div>
+        <div class="version-meta">
+          <span><b>SUT：</b>订单中心、支付网关（2）</span>
+          <span><b>页面：</b>12 条</span>
+          <span><b>代码仓：</b>order-center-web、payment-gateway（2）</span>
+          <span><b>目标库：</b>order_db、payment_db（2）</span>
+          <span><b>测试账号：</b>4</span>
+        </div>
+        <div class="ai-brief"><span class="spark">✦</span><div><b>AI 版本简报：</b>已读 2 个 SUT、12 个页面、2 个代码仓；3 条需求已澄清、3 条草案待确认；设计团队待你开启下一轮设计；执行团队空闲。</div></div>
+      </div>
+
+      <div class="tabs">
+        <div class="tab">总览</div>
+        <div class="tab active">需求与澄清</div>
+        <div class="tab">用例设计<span class="mini">9</span></div>
+        <div class="tab">执行<span class="mini">4</span></div>
+        <div class="tab">探索链路</div>
+        <div class="tab">问题<span class="mini">1</span></div>
+        <div class="tab">报告</div>
+        <div class="tab">代码与变更</div>
+      </div>
+
+      <div class="req-layout">
+        <section class="card chat-card">
+          <div class="chat-head">
+            <div><div class="title">需求澄清 · 与澄清团队对话</div><div class="desc">对话是主入口；AI 自动读取版本上下文、页面清单、代码仓、知识</div></div>
+            <div style="margin-left:auto;display:flex;gap:6px;align-items:center">
+              <span class="chip green">第 3 轮</span>
+              <button class="btn">历史对话</button>
+              <button class="btn primary">＋ 新增对话</button>
+            </div>
+          </div>
+          <div class="chat-body">
+            <div class="msg ai">
+              <div class="who">AI</div>
+              <div style="max-width:82%">
+                <div class="bubble">我已载入版本上下文：<b>2 个 SUT、12 条页面链接、3 条已澄清需求</b>。直接描述需求，或上传 doc / pdf / md / ppt；我会先读成结构化草案，再逐项澄清。</div>
+                <div class="meta">澄清团队 · 12:40</div>
+              </div>
+            </div>
+
+            <div class="msg user">
+              <div class="who">R</div>
+              <div style="max-width:78%">
+                <div class="bubble">新增退款时效：退款审核通过后 T+1 个工作日原路退回，节假日顺延；另外订单金额超过 5000 需要人工审核。附件是退款规则 V2。</div>
+                <div class="quick-actions" style="justify-content:flex-end"><span class="chip gray">📎 退款规则V2.pdf</span><span class="chip gray">📎 退款流程.png</span></div>
+                <div class="meta">12:41 · 已读</div>
+              </div>
+            </div>
+
+            <div class="msg ai">
+              <div class="who">AI</div>
+              <div style="max-width:86%;flex:1">
+                <div class="bubble">
+                  我把这段拆成 <b>3 条需求草案</b>，并发现 1 条与既有需求重叠、1 条跨系统（订单中心 + 支付网关）。先不急着入库，请你确认边界：
+                  <div class="req-inline">
+                    <div class="top"><span class="name">退款到账时效</span><span class="tag-mini todo">草案 v1</span><span class="sut-chip sut-pay">支付网关</span><span class="page-chip">退款详情</span></div>
+                    <div class="body">退款审核通过后，T+1 个工作日原路退回；遇节假日顺延到下一工作日。</div>
+                    <div class="accept"><b>验收：</b>审核通过时间 + T+1 内到账；节假日顺延；退款金额与订单实付一致。</div>
+                    <div class="actions"><button class="btn tiny">编辑</button><button class="btn tiny success">确认已澄清</button><button class="btn tiny ghost">查看来源</button></div>
+                  </div>
+                  <div class="quick-actions" style="margin-top:8px"><span class="chip gray">另 2 条草案：大额订单人工审核（订单中心）· 退款失败转人工（跨系统）</span></div>
+                  <div class="warn-inline"><b>⚠ 需求回退建议：</b>「退款原路退回」已澄清，但新需求改变了到账时效定义。回退后关联的 2 条用例将标记为 <b>stale</b>，需重新确认。<div class="actions" style="margin-top:7px"><button class="btn tiny amber">确认回退</button><button class="btn tiny ghost">暂不处理</button></div></div>
+                </div>
+                <div class="meta">12:41 · 已更新 3 条需求草案</div>
+              </div>
+            </div>
+
+            <div class="msg ai">
+              <div class="who">AI</div>
+              <div style="max-width:70%">
+                <div class="bubble" style="background:#fff">
+                  <div class="thinking"><span class="pulse"></span>正在分析需求关系与页面覆盖…</div>
+                  <div class="quick-actions"><span class="chip gray">✓ 读取 退款规则V2.pdf（12 页）</span><span class="chip gray">✓ 匹配 退款详情 / 订单创建 页面</span><span class="chip gray">→ 提议关系 1 条</span></div>
+                </div>
+                <div class="meta">12:42 · 澄清团队</div>
+              </div>
+            </div>
+          </div>
+          <div class="composer">
+            <div class="composer-box">
+              <textarea placeholder="描述需求，或上传 doc / pdf / md / ppt…"></textarea>
+              <div class="composer-actions"><span>📎 附件</span><span>@ 需求</span><span>Enter 发送 · Shift+Enter 换行</span><button class="send">发送</button></div>
+            </div>
+          </div>
+        </section>
+
+        <aside class="card req-side">
+          <div class="card-head">
+            <div><h3>需求 <span style="color:var(--muted);font-weight:500">6</span></h3><div class="sub">已澄清 3 · 草案 3 · 已闭环 1</div></div>
+            <div class="right"><button class="btn tiny">＋</button></div>
+          </div>
+          <div class="filters">
+            <span class="pill active">全部 <span class="n">6</span></span>
+            <span class="pill">草案 <span class="n">3</span></span>
+            <span class="pill">已澄清 <span class="n">3</span></span>
+            <span class="pill">已闭环 <span class="n">1</span></span>
+          </div>
+          <div class="bulkbar"><span>☑ 已选 2 条</span><button class="btn tiny primary">批量确认已澄清</button></div>
+          <div class="req-list">
+            <div class="req-item">
+              <div class="line1"><span style="color:var(--muted)">☐</span><span class="title">订单创建与库存扣减</span><span class="tag ok">已澄清</span></div>
+              <div class="line2"><span class="sut-chip sut-order">订单中心</span><span>v3</span><span>3 用例</span><span>已闭环</span></div>
+            </div>
+            <div class="req-item active">
+              <div class="line1"><span style="color:var(--muted)">☑</span><span class="title">退款原路退回</span><span class="tag ok">已澄清</span></div>
+              <div class="line2"><span class="sut-chip sut-pay">支付网关</span><span>v2</span><span>2 用例</span><span style="color:var(--amber)">stale</span></div>
+              <div class="why">新需求改变到账时效定义，2 条用例待重新确认</div>
+            </div>
+            <div class="req-item">
+              <div class="line1"><span style="color:var(--muted)">☑</span><span class="title">退款到账时效</span><span class="tag draft">草案</span></div>
+              <div class="line2"><span class="sut-chip sut-pay">支付网关</span><span class="page-chip">退款详情</span><span>v1</span><span>0 用例</span></div>
+            </div>
+            <div class="req-item">
+              <div class="line1"><span style="color:var(--muted)">☐</span><span class="title">大额订单人工审核</span><span class="tag draft">草案</span></div>
+              <div class="line2"><span class="sut-chip sut-order">订单中心</span><span class="page-chip">订单创建</span><span>v1</span><span>0 用例</span></div>
+            </div>
+            <div class="req-item">
+              <div class="line1"><span style="color:var(--muted)">☐</span><span class="title">退款失败转人工</span><span class="tag draft">草案</span></div>
+              <div class="line2"><span class="sut-chip sut-pay">支付网关</span><span class="sut-chip sut-order">订单中心</span><span>v1</span></div>
+            </div>
+            <div class="req-item">
+              <div class="line1"><span style="color:var(--muted)">☐</span><span class="title">购物车结算金额校验</span><span class="tag closed">已闭环</span></div>
+              <div class="line2"><span class="sut-chip sut-order">订单中心</span><span>v2</span><span>4 用例</span><span>波次 3</span></div>
+            </div>
+          </div>
+          <div class="req-editor">
+            <div class="t">退款到账时效 <span class="tag draft">草案 v1</span></div>
+            <div class="field"><label>标题</label><div class="input">退款到账时效</div></div>
+            <div class="field"><label>描述</label><div class="input" style="min-height:48px">退款审核通过后 T+1 个工作日原路退回；节假日顺延到下一工作日。</div></div>
+            <div class="field"><label>验收标准</label><div class="input" style="min-height:40px">审核通过时间 + T+1 内到账；节假日顺延；金额与订单实付一致。</div></div>
+            <div class="field" style="display:flex;gap:8px">
+              <div style="flex:1"><label>目标 SUT / 页面</label><div class="input"><span class="sut-chip sut-pay">支付网关</span> <span class="page-chip">退款详情</span></div></div>
+              <div style="width:86px"><label>优先级</label><div class="input">P0</div></div>
+            </div>
+            <div class="footer"><button class="btn tiny">保存</button><button class="btn tiny primary">确认已澄清</button></div>
+          </div>
+        </aside>
+      </div>
+
+      <div class="statusbar">
+        <span>✦ AI 最近活动：读取 2 个附件 · 更新 3 条草案 · 提议 1 条关系 · 回退建议 1 条</span>
+        <span class="right"><span>上下文 <b>46%</b> · 摘要已更新</span><span>版本通道 SSE 已连接</span></span>
+      </div>
+    </div>
+  </div>
+  <div class="watermark">EzTest 0.2 · 临时 UI 草图 · 需求与澄清</div>
+</section>
+
+<!-- ==================== 用例设计 ==================== -->
+<section class="screen" id="design">
+  <aside class="sidebar">
+    <div class="brand"><div class="brand-mark">EZ</div><div><div class="brand-name">EzTest</div><div class="brand-sub">AI 驱动端到端测试</div></div></div>
+    <div class="nav-label">工作区</div>
+    <div class="nav-item active"><span class="ico">▤</span>版本<span class="badge">6</span></div>
+    <div class="nav-item"><span class="ico">⚑</span>问题<span class="badge">3</span></div>
+    <div class="nav-item"><span class="ico">▥</span>报告</div>
+    <div class="nav-item"><span class="ico">◈</span>知识</div>
+    <div class="nav-item"><span class="ico">▧</span>资源</div>
+    <div class="nav-label" style="margin-top:14px">平台</div>
+    <div class="nav-item"><span class="ico">◎</span>质量</div>
+    <div class="nav-item"><span class="ico">◇</span>Agent 中心</div>
+    <div class="nav-item"><span class="ico">⚙</span>设置</div>
+    <div class="sidebar-foot">设计团队已激活<br/>本轮扫描 3 个待设计需求</div>
+  </aside>
+  <div class="main">
+    <header class="topbar">
+      <div class="version-switch"><div class="stack"><strong>订单中心 · 2026 Q4 迭代</strong><span>order-center-web 2.4.0</span></div><span class="status-pill running" style="margin-left:auto"><span class="status-dot"></span>运行中</span></div>
+      <div class="search">⌕ <span style="flex:1">搜索需求、用例、问题…</span><kbd>Ctrl K</kbd></div>
+      <div class="sys-stack"><span class="sut-chip sut-order">订单中心</span><span class="sut-chip sut-pay">支付网关</span><span class="page-chip">12 个页面</span></div>
+      <div class="top-spacer"></div>
+      <div class="icon-btn" style="position:relative" title="待办">☑<span style="position:absolute;top:-4px;right:-4px;background:#ef4444;color:#fff;border-radius:999px;font-size:9px;line-height:1;padding:2px 4px">3</span></div><div class="icon-btn">◐</div>
+      <div class="user-chip"><div class="avatar">R</div><div style="line-height:1.2"><div style="font-size:11.5px;font-weight:650">Richard</div><div style="font-size:10px;color:var(--muted)">管理员</div></div></div>
+    </header>
+    <div class="content">
+      <div class="version-head">
+        <div class="version-title-row"><h1>订单中心 · 2026 Q4 迭代</h1><span class="status-pill running"><span class="status-dot"></span>运行中</span><span class="chip gray">波次 4</span><span class="chip blue">2 个 SUT</span><div style="margin-left:auto;display:flex;gap:6px"><button class="btn">导出用例</button><button class="btn primary">查看探索链路 →</button></div></div>
+        <div class="version-meta"><span><b>SUT：</b>订单中心、支付网关（2）</span><span><b>页面：</b>12 条</span><span><b>代码仓：</b>order-center-web、payment-gateway（2）</span><span><b>已确认用例：</b>5</span><span><b>待确认：</b>4</span></div>
+        <div class="ai-brief"><span class="spark">✦</span><div><b>设计团队简报：</b>本轮扫描到 3 个待设计需求、6 个场景缺口；初版脑图已渲染，正在补跨系统用例。确认用例后执行团队会自动领取。</div></div>
+      </div>
+      <div class="tabs">
+        <div class="tab">总览</div><div class="tab">需求与澄清</div><div class="tab active">用例设计<span class="mini">9</span></div><div class="tab">执行<span class="mini">4</span></div><div class="tab">探索链路</div><div class="tab">问题<span class="mini">1</span></div><div class="tab">报告</div><div class="tab">代码与变更</div>
+      </div>
+
+      <div class="design-layout">
+        <section class="card mind-card">
+          <div class="mind-head">
+            <div><div class="title">用例脑图 · 设计轮次 #2</div><div class="desc">需求 → 场景 → 用例；用例可跨 SUT，步骤级指定目标</div></div>
+            <div class="mind-tools"><span class="chip green">设计团队已激活</span><span class="chip gray">本轮 3 个需求</span><div class="zoom"><span>−</span><span>100%</span><span>＋</span><span>适应</span></div></div>
+          </div>
+          <div class="canvas">
+            <svg class="links">
+              <!-- root1 to scenarios -->
+              <path d="M212 50 H230 Q240 50 240 31 H250" stroke="#c7d2fe" stroke-width="1.5" fill="none"/>
+              <path d="M212 50 H240 V113 H250" stroke="#c7d2fe" stroke-width="1.5" fill="none"/>
+              <path d="M212 50 H240 V195 H250" stroke="#c7d2fe" stroke-width="1.5" fill="none"/>
+              <!-- root2 to scenarios -->
+              <path d="M212 290 H230 Q240 290 240 277 H250" stroke="#c7d2fe" stroke-width="1.5" fill="none"/>
+              <path d="M212 290 H240 V374 H250" stroke="#c7d2fe" stroke-width="1.5" fill="none"/>
+              <!-- root3 to scenario -->
+              <path d="M212 470 H230 Q240 470 240 481 H250" stroke="#c7d2fe" stroke-width="1.5" fill="none"/>
+              <!-- scenarios to cases -->
+              <path d="M440 31 H470 Q500 31 500 30" stroke="#dbeafe" stroke-width="1.5" fill="none"/>
+              <path d="M440 31 H470 Q500 31 500 96" stroke="#dbeafe" stroke-width="1.5" fill="none"/>
+              <path d="M440 113 H470 Q500 113 500 162" stroke="#dbeafe" stroke-width="1.5" fill="none"/>
+              <path d="M440 113 H470 Q500 113 500 228" stroke="#dbeafe" stroke-width="1.5" fill="none"/>
+              <path d="M440 195 H470 Q500 195 500 294" stroke="#dbeafe" stroke-width="1.5" fill="none"/>
+              <path d="M440 281 H470 Q500 281 500 360" stroke="#dbeafe" stroke-width="1.5" fill="none"/>
+              <path d="M440 374 H470 Q500 374 500 426" stroke="#dbeafe" stroke-width="1.5" fill="none"/>
+              <path d="M440 481 H470 Q500 481 500 492" stroke="#fde68a" stroke-width="1.5" fill="none" stroke-dasharray="4 3"/>
+            </svg>
+
+            <div class="node root" style="left:16px;top:10px;height:80px">
+              <div class="nh"><div class="title">退款到账时效 <span class="tag-mini ok">已澄清 v3</span></div><div class="meta">支付网关 · 退款详情 / 退款列表</div></div>
+              <div class="stat"><span>场景 3</span><span>用例 5</span><span style="color:var(--green)">覆盖 2/3 已确认</span></div>
+            </div>
+            <div class="node root" style="left:16px;top:280px;height:80px">
+              <div class="nh"><div class="title">大额订单人工审核 <span class="tag-mini ok">已澄清 v1</span></div><div class="meta">订单中心 · 订单创建 / 审核台</div></div>
+              <div class="stat"><span>场景 2</span><span>用例 3</span><span style="color:var(--amber)">覆盖 1/2 已确认</span></div>
+            </div>
+            <div class="node root" style="left:16px;top:460px;height:80px">
+              <div class="nh"><div class="title">跨系统退款闭环 <span class="tag-mini ok">已澄清 v1</span></div><div class="meta">订单中心 + 支付网关 · 跨系统</div></div>
+              <div class="stat"><span>场景 1</span><span>用例 1</span><span style="color:var(--amber)">覆盖 0/2 已确认</span></div>
+            </div>
+
+            <div class="node scenario" style="left:250px;top:0px;height:62px"><div class="title">正常退款</div><div class="meta">2 用例 · 支付网关</div></div>
+            <div class="node scenario" style="left:250px;top:82px;height:62px"><div class="title">时效与节假日</div><div class="meta">2 用例 · 支付网关</div></div>
+            <div class="node scenario" style="left:250px;top:164px;height:62px"><div class="title">部分退款</div><div class="meta">1 用例 · 支付网关</div></div>
+            <div class="node scenario" style="left:250px;top:250px;height:62px"><div class="title">大额审核触发</div><div class="meta">2 用例 · 订单中心</div></div>
+            <div class="node scenario" style="left:250px;top:343px;height:62px"><div class="title">审核后创建</div><div class="meta">1 用例 · 订单中心</div></div>
+            <div class="node scenario" style="left:250px;top:450px;height:62px"><div class="title">跨系统联调</div><div class="meta">1 用例 · 2 个 SUT</div></div>
+
+            <div class="node case ok" style="left:500px;top:0px;height:62px"><div class="title">审核通过后 T+1 原路退回</div><div class="meta"><span class="dot"></span><span class="tag-mini ok">已确认</span><span class="sut-chip sut-pay">支付网关</span><span class="page-chip">退款详情</span><span class="tag-mini">P0</span></div></div>
+            <div class="node case ok" style="left:500px;top:66px;height:62px"><div class="title">退款金额与订单实付一致</div><div class="meta"><span class="dot"></span><span class="tag-mini ok">已确认</span><span class="sut-chip sut-pay">支付网关</span><span class="page-chip">退款详情</span><span class="tag-mini">P0</span></div></div>
+            <div class="node case todo" style="left:500px;top:132px;height:62px"><div class="title">周五 18:00 后审核，T+1 遇周末顺延</div><div class="meta"><span class="dot"></span><span class="tag-mini todo">待确认</span><span class="sut-chip sut-pay">支付网关</span><span class="page-chip">退款详情</span><span class="tag-mini">P1</span></div></div>
+            <div class="node case ok" style="left:500px;top:198px;height:62px"><div class="title">节假日顺延到下一工作日</div><div class="meta"><span class="dot"></span><span class="tag-mini ok">已确认</span><span class="sut-chip sut-pay">支付网关</span><span class="page-chip">退款列表</span><span class="tag-mini">P1</span></div></div>
+            <div class="node case draft" style="left:500px;top:264px;height:62px"><div class="title">部分退款后剩余金额可再次退款</div><div class="meta"><span class="dot"></span><span class="tag-mini">草稿</span><span class="sut-chip sut-pay">支付网关</span><span class="page-chip">退款详情</span><span class="tag-mini">P1</span></div></div>
+            <div class="node case ok" style="left:500px;top:330px;height:62px"><div class="title">&gt;5000 元进入人工审核</div><div class="meta"><span class="dot"></span><span class="tag-mini ok">已确认</span><span class="sut-chip sut-order">订单中心</span><span class="page-chip">订单创建</span><span class="tag-mini">P0</span></div></div>
+            <div class="node case todo" style="left:500px;top:380px;height:62px"><div class="title">审核拒绝不创建订单</div><div class="meta"><span class="dot"></span><span class="tag-mini todo">待确认</span><span class="sut-chip sut-order">订单中心</span><span class="page-chip">审核台</span><span class="tag-mini">P1</span></div></div>
+            <div class="node case new selected" style="left:500px;top:446px;height:62px"><div class="title">订单退款后支付网关到账</div><div class="meta"><span class="dot"></span><span class="tag-mini new">新增待确认</span><span class="sut-chip sut-order">订单中心</span><span class="sut-chip sut-pay">支付网关</span><span class="page-chip">跨系统</span></div></div>
+
+            <div class="legend"><span><i style="background:var(--green)"></i>已确认</span><span><i style="background:var(--amber)"></i>待确认</span><span><i style="background:#94a3b8"></i>草稿</span><span><i style="background:var(--blue)"></i>新增 draft</span><span>拖拽平移 · 滚轮缩放</span></div>
+          </div>
+        </section>
+
+        <aside class="card design-case">
+          <div class="card-head"><div><h3>用例详情</h3><div class="sub">选中：订单退款后支付网关到账</div></div><div class="right"><span class="tag-mini new">新增待确认</span></div></div>
+          <div class="case-body">
+            <div class="case-title">订单退款后支付网关到账</div>
+            <div class="case-meta"><span class="sut-chip sut-order">订单中心</span><span class="sut-chip sut-pay">支付网关</span><span class="page-chip">跨系统</span><span class="tag-mini">P0</span></div>
+            <div class="kv">
+              <div class="k">需求</div><div>跨系统退款闭环 v1</div>
+              <div class="k">场景</div><div>跨系统联调</div>
+              <div class="k">入口页面</div><div>订单详情（订单中心）→ 退款详情（支付网关）</div>
+              <div class="k">账号角色</div><div>订单管理员 · 支付运营</div>
+              <div class="k">执行状态</div><div style="color:var(--muted)">未执行</div>
+            </div>
+            <div class="steps">
+              <div class="t">步骤与目标 SUT</div>
+              <div class="step"><div class="n">1</div><div><span class="sut-chip sut-order">订单中心</span> 打开订单详情，发起退款申请</div></div>
+              <div class="step"><div class="n">2</div><div><span class="sut-chip sut-order">订单中心</span> 审核通过，记录退款单号</div></div>
+              <div class="step"><div class="n">3</div><div><span class="sut-chip sut-pay">支付网关</span> 查询退款单，确认 T+1 到账</div></div>
+              <div class="assert"><b>断言：</b>支付网关退款状态 = 成功；订单中心订单状态 = 已退款；两侧退款单号一致。</div>
+            </div>
+            <div class="steps">
+              <div class="t">覆盖与来源</div>
+              <div class="check"><span class="mark ok">✓</span><div>覆盖需求「跨系统退款闭环」v1 · 场景「跨系统联调」</div></div>
+              <div class="check"><span class="mark warn">!</span><div>页面「订单详情」「退款详情」来自 SUT 页面清单</div></div>
+              <div class="check"><span class="mark ok">✓</span><div>代码锚点：order-service/refund.ts:88、payment/refund.go:142</div></div>
+            </div>
+          </div>
+          <div class="case-foot"><button class="btn tiny">请求修改</button><button class="btn tiny">查看执行结果</button><button class="btn tiny primary">确认用例</button></div>
+        </aside>
+
+        <section class="card design-chat">
+          <div class="chat-head">
+            <div><div class="title">设计团队 · 设计轮次 #2</div><div class="desc">新建对话即开启一轮设计；设计团队自己扫描所有待设计需求</div></div>
+            <div style="margin-left:auto;display:flex;gap:6px;align-items:center"><span class="chip green">实时渲染</span><button class="btn tiny">历史对话</button><button class="btn tiny primary">＋ 新建对话</button></div>
+          </div>
+          <div class="chat-body">
+            <div class="msg ai"><div class="who">AI</div><div style="max-width:84%"><div class="bubble">本轮扫描到 <b>3 个待设计需求、6 个场景缺口</b>。初版脑图已渲染，正在补跨系统用例；确认用例后执行团队会自动领取。</div><div class="meta">设计团队 · 12:46</div></div></div>
+            <div class="msg user"><div class="who">R</div><div style="max-width:70%"><div class="bubble">退款失败转人工补一条；跨系统退款要覆盖订单退款后支付网关到账。</div><div class="meta">12:47</div></div></div>
+            <div class="msg ai"><div class="who">AI</div><div style="max-width:88%"><div class="bubble">已新增 2 条 draft：<b>退款失败转人工</b>（支付网关）、<b>订单退款后支付网关到账</b>（订单中心 + 支付网关）。后者是跨系统用例，步骤已按 SUT 标注；确认后进入可执行集合。<div class="quick-actions"><span class="chip amber">待确认 2</span><span class="chip green">已确认 5</span><span class="chip gray">stale 2</span></div></div><div class="meta">12:47 · 已实时渲染到脑图</div></div></div>
+            <div class="msg ai"><div class="who">AI</div><div style="max-width:82%"><div class="bubble" style="background:#fffbeb;border-color:#fde68a">需求「退款到账时效」v2→v3 变更影响 2 条已确认用例，已置为 <b>stale</b>；重新确认后会恢复执行。你可以逐条确认，也可以按场景/需求批量确认。</div></div></div>
+          </div>
+          <div class="composer"><div class="composer-box"><textarea placeholder="继续和设计团队讨论，或输入要新增/修改的用例…"></textarea><div class="composer-actions"><span>📎 附件</span><span>@ 需求 / 场景</span><span>Enter 发送</span><button class="send">发送</button></div></div></div>
+        </section>
+      </div>
+    </div>
+  </div>
+  <div class="watermark">EzTest 0.2 · 临时 UI 草图 · 用例设计</div>
+</section>
+
+<!-- ==================== 探索链路 ==================== -->
+<section class="screen" id="chain">
+  <aside class="sidebar">
+    <div class="brand"><div class="brand-mark">EZ</div><div><div class="brand-name">EzTest</div><div class="brand-sub">AI 驱动端到端测试</div></div></div>
+    <div class="nav-label">工作区</div>
+    <div class="nav-item active"><span class="ico">▤</span>版本<span class="badge">6</span></div>
+    <div class="nav-item"><span class="ico">⚑</span>问题<span class="badge">3</span></div>
+    <div class="nav-item"><span class="ico">▥</span>报告</div>
+    <div class="nav-item"><span class="ico">◈</span>知识</div>
+    <div class="nav-item"><span class="ico">▧</span>资源</div>
+    <div class="nav-label" style="margin-top:14px">平台</div>
+    <div class="nav-item"><span class="ico">◎</span>质量</div>
+    <div class="nav-item"><span class="ico">◇</span>Agent 中心</div>
+    <div class="nav-item"><span class="ico">⚙</span>设置</div>
+    <div class="sidebar-foot">链路实时跟随执行<br/>DB 为真值 · SSE 为投影</div>
+  </aside>
+  <div class="main">
+    <header class="topbar">
+      <div class="version-switch"><div class="stack"><strong>订单中心 · 2026 Q4 迭代</strong><span>order-center-web 2.4.0</span></div><span class="status-pill running" style="margin-left:auto"><span class="status-dot"></span>运行中</span></div>
+      <div class="search">⌕ <span style="flex:1">搜索节点、需求、用例、问题…</span><kbd>Ctrl K</kbd></div>
+      <div class="sys-stack"><span class="sut-chip sut-order">订单中心</span><span class="sut-chip sut-pay">支付网关</span><span class="page-chip">波次 4</span></div>
+      <div class="top-spacer"></div>
+      <div class="icon-btn" style="position:relative" title="待办">☑<span style="position:absolute;top:-4px;right:-4px;background:#ef4444;color:#fff;border-radius:999px;font-size:9px;line-height:1;padding:2px 4px">3</span></div><div class="icon-btn">◐</div>
+      <div class="user-chip"><div class="avatar">R</div><div style="line-height:1.2"><div style="font-size:11.5px;font-weight:650">Richard</div><div style="font-size:10px;color:var(--muted)">管理员</div></div></div>
+    </header>
+    <div class="content">
+      <div class="version-head">
+        <div class="version-title-row"><h1>订单中心 · 2026 Q4 迭代</h1><span class="status-pill running"><span class="status-dot"></span>运行中</span><span class="chip gray">波次 4</span><span class="chip blue">2 个 SUT</span><div style="margin-left:auto;display:flex;gap:6px"><button class="btn">历史回放</button><button class="btn primary">跟随执行</button></div></div>
+        <div class="version-meta"><span><b>SUT：</b>订单中心、支付网关（2）</span><span><b>需求闭环：</b>2 / 3</span><span><b>用例：</b>9（已确认 5 / 待确认 4）</span><span><b>问题：</b>1 open</span><span><b>报告：</b>波次 4 · published</span></div>
+        <div class="ai-brief"><span class="spark">✦</span><div><b>链路摘要：</b>「退款到账时效」已闭环；「大额订单人工审核」因 1 条失败用例产生 open 问题；「跨系统退款闭环」正在波次 4 执行。链路随执行事件实时更新。</div></div>
+      </div>
+      <div class="tabs"><div class="tab">总览</div><div class="tab">需求与澄清</div><div class="tab">用例设计<span class="mini">9</span></div><div class="tab">执行<span class="mini">4</span></div><div class="tab active">探索链路</div><div class="tab">问题<span class="mini">1</span></div><div class="tab">报告</div><div class="tab">代码与变更</div></div>
+
+      <div class="chain-layout">
+        <section class="card chain-main">
+          <div class="chain-toolbar">
+            <div style="margin-right:4px"><div class="title">探索链路</div><div class="sub">需求 → 用例 → 执行 → 证据/问题 → 闭环</div></div>
+            <span class="filter"><b>SUT</b> 全部 ▾</span>
+            <span class="filter"><b>波次</b> 4 ▾</span>
+            <span class="filter"><b>状态</b> 全部 ▾</span>
+            <span class="filter"><b>结果</b> 含失败 ▾</span>
+            <span class="filter">页面 全部 ▾</span>
+            <div style="margin-left:auto;display:flex;gap:6px;align-items:center"><span class="status-pill running" style="height:26px"><span class="pulse-dot"></span>实时</span><span class="status-pill done" style="height:26px">跟随执行</span></div>
+          </div>
+          <div class="chain-canvas">
+            <svg class="links">
+              <!-- req to cases -->
+              <path d="M206 60 H230 Q240 60 240 50 H250" stroke="#c7d2fe" stroke-width="1.5" fill="none"/>
+              <path d="M206 60 H240 V130 H250" stroke="#c7d2fe" stroke-width="1.5" fill="none"/>
+              <path d="M206 60 H240 V210 H250" stroke="#e2e8f0" stroke-width="1.5" fill="none" stroke-dasharray="4 3"/>
+              <path d="M206 280 H230 Q240 280 240 270 H250" stroke="#c7d2fe" stroke-width="1.5" fill="none"/>
+              <path d="M206 280 H240 V350 H250" stroke="#c7d2fe" stroke-width="1.5" fill="none"/>
+              <path d="M206 470 H230 Q240 470 240 460 H250" stroke="#c7d2fe" stroke-width="1.5" fill="none"/>
+              <!-- cases to runs -->
+              <path d="M456 50 H480 Q500 50 500 54" stroke="#86efac" stroke-width="1.5" fill="none"/>
+              <path d="M456 130 H480 Q500 130 500 54" stroke="#86efac" stroke-width="1.5" fill="none"/>
+              <path d="M456 210 H480 Q500 210 500 270" stroke="#fca5a5" stroke-width="1.5" fill="none"/>
+              <path d="M456 270 H480 Q500 270 500 270" stroke="#fca5a5" stroke-width="1.5" fill="none"/>
+              <path d="M456 350 H480 Q500 350 500 350" stroke="#86efac" stroke-width="1.5" fill="none"/>
+              <path d="M456 460 H480 Q500 460 500 470" stroke="#818cf8" stroke-width="1.5" fill="none"/>
+              <!-- runs to right -->
+              <path d="M696 54 H720 Q740 54 740 60" stroke="#86efac" stroke-width="1.5" fill="none"/>
+              <path d="M696 54 H720 V150 H740" stroke="#86efac" stroke-width="1.5" fill="none"/>
+              <path d="M696 270 H720 V270 H740" stroke="#fca5a5" stroke-width="1.5" fill="none"/>
+              <path d="M696 270 H720 V390 H740" stroke="#cbd5e1" stroke-width="1.5" fill="none" stroke-dasharray="4 3"/>
+              <path d="M696 350 H720 V390 H740" stroke="#86efac" stroke-width="1.5" fill="none"/>
+              <path d="M696 470 H720 V540 H740" stroke="#818cf8" stroke-width="1.5" fill="none" stroke-dasharray="4 3"/>
+              <!-- issue to report -->
+              <path d="M845 305 H870 V390 H850" stroke="#cbd5e1" stroke-width="1.5" fill="none" stroke-dasharray="4 3"/>
+            </svg>
+
+            <div class="chain-node req" style="left:20px;top:20px;height:78px">
+              <div class="ct">退款到账时效 <span class="tag-mini ok">v3</span></div>
+              <div class="cm"><span class="sut-chip sut-pay">支付网关</span><span class="page-chip">退款详情</span></div>
+              <div class="cm" style="margin-top:6px"><span class="ok-dot"></span><span style="color:var(--green);font-weight:650">已闭环 2/2</span><span>·</span><span>2026-10-31 14:12</span></div>
+            </div>
+            <div class="chain-node req" style="left:20px;top:240px;height:78px">
+              <div class="ct">大额订单人工审核 <span class="tag-mini ok">v1</span></div>
+              <div class="cm"><span class="sut-chip sut-order">订单中心</span><span class="page-chip">订单创建</span></div>
+              <div class="cm" style="margin-top:6px"><span class="warn-dot"></span><span style="color:var(--amber);font-weight:650">闭环中 1/2</span><span>·</span><span>1 个 open 问题</span></div>
+            </div>
+            <div class="chain-node req" style="left:20px;top:430px;height:78px">
+              <div class="ct">跨系统退款闭环 <span class="tag-mini ok">v1</span></div>
+              <div class="cm"><span class="sut-chip sut-order">订单中心</span><span class="sut-chip sut-pay">支付网关</span></div>
+              <div class="cm" style="margin-top:6px"><span class="pulse-dot"></span><span style="color:var(--indigo);font-weight:650">执行中 0/1</span><span>·</span><span>波次 4</span></div>
+            </div>
+
+            <div class="chain-node case" style="left:250px;top:18px;height:64px"><div class="ct">审核通过后 T+1 原路退回</div><div class="cm"><span class="tag-mini ok">已确认</span><span class="sut-chip sut-pay">支付网关</span><span class="page-chip">退款详情</span></div></div>
+            <div class="chain-node case" style="left:250px;top:98px;height:64px"><div class="ct">节假日顺延到下一工作日</div><div class="cm"><span class="tag-mini ok">已确认</span><span class="sut-chip sut-pay">支付网关</span><span class="page-chip">退款列表</span></div></div>
+            <div class="chain-node case" style="left:250px;top:178px;height:64px"><div class="ct">退款失败转人工</div><div class="cm"><span class="tag-mini new">新增 draft</span><span class="sut-chip sut-pay">支付网关</span><span class="sut-chip sut-order">订单中心</span></div></div>
+            <div class="chain-node case" style="left:250px;top:258px;height:64px"><div class="ct">&gt;5000 元进入人工审核</div><div class="cm"><span class="tag-mini ok">已确认</span><span class="sut-chip sut-order">订单中心</span><span class="page-chip">订单创建</span></div></div>
+            <div class="chain-node case" style="left:250px;top:338px;height:64px"><div class="ct">审核通过后创建订单</div><div class="cm"><span class="tag-mini ok">已确认</span><span class="sut-chip sut-order">订单中心</span><span class="page-chip">审核台</span></div></div>
+            <div class="chain-node case" style="left:250px;top:430px;height:64px"><div class="ct">订单退款后支付网关到账</div><div class="cm"><span class="tag-mini ok">已确认</span><span class="sut-chip sut-order">订单中心</span><span class="sut-chip sut-pay">支付网关</span></div></div>
+
+            <div class="chain-node run pass" style="left:500px;top:24px;height:64px"><div class="ct"><span class="ok-dot"></span> Run #4-12 · 通过</div><div class="cm">波次 4 · 8.4s · 2 条证据</div><div class="cm" style="margin-top:4px"><span class="page-chip">订单中心</span></div></div>
+            <div class="chain-node run fail" style="left:500px;top:240px;height:64px"><div class="ct"><span class="bad-dot"></span> Run #4-15 · 失败</div><div class="cm">波次 4 · 6.1s · 断言 2/3</div><div class="cm" style="margin-top:4px"><span class="sut-chip sut-order">订单中心</span></div></div>
+            <div class="chain-node run pass" style="left:500px;top:320px;height:64px"><div class="ct"><span class="ok-dot"></span> Run #4-16 · 通过</div><div class="cm">波次 4 · 7.2s · 3 条证据</div><div class="cm" style="margin-top:4px"><span class="sut-chip sut-order">订单中心</span></div></div>
+            <div class="chain-node run running" style="left:500px;top:440px;height:64px"><div class="ct"><span class="pulse-dot"></span> Run #4-21 · 运行中</div><div class="cm">波次 4 · 12.6s · 跨 2 个 SUT</div><div class="cm" style="margin-top:4px"><span class="sut-chip sut-order">订单中心</span><span class="sut-chip sut-pay">支付网关</span></div></div>
+
+            <div class="chain-node report" style="left:740px;top:28px;height:70px"><div class="ct">波次报告 #12 · published</div><div class="cm">2 SUT · 9 用例 · 1 open 问题</div><div class="cm" style="margin-top:4px"><span class="page-chip">HTML / PDF</span><span class="page-chip">as-of 快照</span></div></div>
+            <div class="chain-node closure" style="left:740px;top:128px;height:70px"><div class="ct"><span class="ok-dot"></span> 需求已闭环</div><div class="cm">退款到账时效 v3 · 2/2 用例通过</div><div class="cm" style="margin-top:4px"><span class="page-chip">闭环时间 14:12</span></div></div>
+            <div class="chain-node issue selected" style="left:740px;top:240px;height:84px"><div class="ct">I-1042 退款到账金额不一致</div><div class="cm"><span class="tag-mini" style="color:var(--red);border-color:#fecaca;background:#fef2f2">open</span><span class="tag-mini" style="color:var(--red)">major</span><span class="sut-chip sut-order">订单中心</span></div><div class="cm" style="margin-top:4px">关联 Run #4-15 · 证据 3 条</div></div>
+            <div class="chain-node report" style="left:740px;top:360px;height:70px"><div class="ct">波次 4 执行中</div><div class="cm">5/9 完成 · 1 失败 · 3 运行中</div><div class="cm" style="margin-top:4px"><span class="pulse-dot"></span> 实时更新</div></div>
+            <div class="chain-node case" style="left:740px;top:460px;height:64px;border-style:dashed;opacity:.9"><div class="ct">待确认用例 · 不进入执行</div><div class="cm">退款失败转人工 · 2 个 SUT</div></div>
+
+            <div class="chain-hud"><span class="hud-btn">−</span><span class="hud-btn">100%</span><span class="hud-btn">＋</span><span class="hud-btn">适应</span><span class="hud-btn">小地图</span></div>
+            <div class="chain-legend"><span><i style="background:#818cf8"></i>需求</span><span><i style="background:#38bdf8"></i>用例</span><span><i style="background:var(--green)"></i>通过</span><span><i style="background:var(--red)"></i>失败/问题</span><span><i style="background:var(--blue)"></i>报告</span><span><i style="background:#cbd5e1"></i>虚线=未执行/未确认</span></div>
+          </div>
+          <div class="chain-stats"><span>需求 <b>3</b></span><span>用例 <b>9</b></span><span>波次 <b>4</b></span><span>证据 <b>18</b></span><span>问题 <b>1 open</b></span><span>覆盖 <b>67%</b></span><span class="live"><span class="pulse-dot"></span>实时跟随执行 · 最近事件 2s 前</span></div>
+        </section>
+
+        <aside class="card chain-sheet">
+          <div class="sheet-head"><div class="t">问题详情 · I-1042</div><div class="sheet-badges"><span class="tag-mini" style="color:var(--red);border-color:#fecaca;background:#fef2f2">open</span><span class="tag-mini" style="color:var(--red)">major</span><span class="sut-chip sut-order">订单中心</span><span class="page-chip">订单详情</span></div></div>
+          <div class="sheet-body">
+            <div style="font-weight:750;font-size:13px;line-height:1.5">退款到账金额不一致：订单实付 ¥5,200，退款单金额 ¥5,000</div>
+            <div class="sheet-section"><div class="h">现场</div><div class="sheet-kv"><div class="k">波次</div><div>4 · Run #4-15</div><div class="k">用例</div><div>&gt;5000 元进入人工审核 v2</div><div class="k">断言</div><div>退款金额 = 订单实付 · 失败</div><div class="k">环境</div><div>预发布 · 订单中心 / 支付网关</div><div class="k">代码锚点</div><div>order-service/refund.ts:88</div></div></div>
+            <div class="sheet-section"><div class="h">证据</div><div class="evidence-strip"><div class="screenshot"></div><div class="screenshot"></div><div class="screenshot"></div></div><div style="color:var(--muted);font-size:9.5px;margin-top:5px">截图 3 · 网络 2 · DB 1 · 不可变证据</div></div>
+            <div class="sheet-section"><div class="h">链路追溯</div><div class="trace-line"><span class="b req"></span>大额订单人工审核 v1</div><div class="trace-line"><span class="b case"></span>&gt;5000 元进入人工审核 v2</div><div class="trace-line"><span class="b run"></span>波次 4 · Run #4-15 · 失败</div><div class="trace-line"><span class="b issue"></span>I-1042 · open · major</div><div class="trace-line"><span class="b report"></span>波次报告 #12 · published</div></div>
+            <div class="sheet-section"><div class="h">处置</div><div style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn tiny success">确认问题</button><button class="btn tiny">合并重复</button><button class="btn tiny amber">驳回</button><button class="btn tiny ghost">查看代码</button></div></div>
+          </div>
+          <div class="sheet-foot"><button class="btn tiny">打开报告</button><button class="btn tiny">深链复制</button><button class="btn tiny primary">跟随此链路</button></div>
+        </aside>
+      </div>
+    </div>
+  </div>
+  <div class="watermark">EzTest 0.2 · 临时 UI 草图 · 探索链路</div>
+</section>
+
+<script>
+  const requested = new URLSearchParams(location.search).get('screen') || 'requirements';
+  document.querySelectorAll('.screen').forEach((section) => {
+    section.classList.toggle('active', section.id === requested);
+  });
+</script>
+</body>
+</html>
