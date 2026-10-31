@@ -3,12 +3,13 @@
 > 状态：**completed**
 > 日期：2026-11-01
 > 阶段：P3（`phase-03-execution.md`）
-> 实施分支：`feat/v0.2-p3`（从 `feat/v0.2-p2` @`b4123c8` 拉出）
+> 实施分支：`feat/v0.2-p3`（从 `feat/v0.2-p2` @`b4123c8` 拉出）；**已合入统一集成分支 `feat/v0.2`（2026-11-01，P3 完成点）**
 > 实施 spec：[2026-11-01-eztest-v02-p3-execution-design.md](../../superpowers/specs/2026-11-01-eztest-v02-p3-execution-design.md)
 > 实施 plan：[2026-11-01-eztest-v02-p3-execution.md](../../superpowers/plans/2026-11-01-eztest-v02-p3-execution.md)
 
 ## 0. 启动提示词映射与前置
 
+- 统一阶段分支：`feat/v0.2`（P3 完成点）；后续 P4 从 `feat/v0.2` 拉出并合回该分支。`feat/v0.2-p3` 保留为阶段审计分支。
 - 本阶段按 `implementation-phase-plan.md` 阶段表：**P3 → `phase-03-execution.md`；PREV_HANDOFF=`phase-02-handoff.md`；HANDOFF=`phase-03-handoff.md`**。
 - 读取了 `Agent.md`（并按用户要求把其 P1–P7 编号标注为 **0.1**，不改变其设计权威）、version-V0.2 设计文档、decision-log/open-decisions、全部 phase 文件、全部 P0/P1/P2 contracts、`ui/mock.html`；未修改 `docs/version-V0.2` 设计文档（除 contracts/ 与本 handoff）。
 - 用户裁决：失败/覆盖只落 P3 自有信号（不建 `analysis_run`/`issue`/`report`）；demo 扩展现有 fixture；P3 验收 **仅真实 LLM**；Agent 需支持时间窗口等待（`execution.wait`，含 120s 验收）。
