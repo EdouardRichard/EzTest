@@ -311,7 +311,7 @@ test("P3 execution workspace: auto wave, live results, evidence, pause/resume an
     const image = page.getByTestId("evidence-image")
     const text = page.getByTestId("evidence-text")
     await expect(image.or(text).first()).toBeVisible({ timeout: 30_000 })
-    await page.getByRole("button", { name: "关闭" }).click()
+    await page.getByRole("button", { name: "关闭", exact: true }).click()
   } else {
     test.info().annotations.push({
       type: "note",
