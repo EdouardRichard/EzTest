@@ -212,6 +212,23 @@ func stopWorker(t *testing.T, cancel context.CancelFunc, done <-chan error) {
 	}
 }
 
+func TestWorkerRecoversExpiredLeasesPeriodically(t *testing.T) {
+	queue := newFakeWorkerQueue()
+	executor := &fakeRunExecutor{}
+	worker := newTestWorker(queue, executor, &fakeSettings{},
+		agentapp.WithWorkerPollInterval(2*time.Millisecond),
+		agentapp.WithWorkerRecoveryInterval(3*time.Millisecond),
+	)
+
+	cancel, done := runWorker(t, worker)
+	waitUntil(t, 2*time.Second, func() bool {
+		queue.mu.Lock()
+		defer queue.mu.Unlock()
+		return queue.recoverCalls >= 2
+	}, "periodic lease recovery")
+	stopWorker(t, cancel, done)
+}
+
 func TestWorkerClaimsRunsAndCompletes(t *testing.T) {
 	item := fakeWorkItem(agentapp.WorkTypeChatTurn, agentapp.WorkItemPayload{ConversationID: 20, MessageID: 501})
 	queue := newFakeWorkerQueue(item)

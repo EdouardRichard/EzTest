@@ -149,6 +149,11 @@ func classifyChatFailure(cfg llm.Config, status int, raw []byte) (bool, error) {
 	if strings.TrimSpace(message) == "" {
 		message = string(raw)
 	}
+	for _, value := range cfg.Headers {
+		if strings.TrimSpace(value) != "" {
+			message = strings.ReplaceAll(message, value, "[redacted]")
+		}
+	}
 	message = sanitizeUpstreamMessage(message, cfg.APIKey, 300)
 	if isChatContextOverflow(status, code, message) {
 		return false, fmt.Errorf("%w: provider returned HTTP %d", llmapp.ErrContextOverflow, status)

@@ -250,16 +250,17 @@ func TestConversationPortSnapshotAndMapping(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
-	if snapshot.Summary != "rolling" || len(snapshot.PinnedFacts) != 1 || len(snapshot.Messages) != 1 {
+	if snapshot.Summary != "rolling" || len(snapshot.PinnedFacts) != 1 || len(snapshot.Messages) != 2 {
 		t.Fatalf("snapshot = %#v", snapshot)
 	}
-	if snapshot.Messages[0].ID != 2 || snapshot.Messages[0].Text != "draft created" {
-		t.Fatalf("message = %#v", snapshot.Messages[0])
+	if snapshot.Messages[0].ID != 1 || snapshot.Messages[0].Text != "hello" ||
+		snapshot.Messages[1].ID != 2 || snapshot.Messages[1].Text != "draft created" {
+		t.Fatalf("messages = %#v", snapshot.Messages)
 	}
-	if len(snapshot.Messages[0].Parts) != 2 {
-		t.Fatalf("parts = %#v", snapshot.Messages[0].Parts)
+	if len(snapshot.Messages[1].Parts) != 2 {
+		t.Fatalf("parts = %#v", snapshot.Messages[1].Parts)
 	}
-	card := snapshot.Messages[0].Parts[1]
+	card := snapshot.Messages[1].Parts[1]
 	if card.Type != "requirement_card" || card.Data["requirement_id"] != "501" || card.Data["revision"] != 1 {
 		t.Fatalf("card part = %#v", card)
 	}

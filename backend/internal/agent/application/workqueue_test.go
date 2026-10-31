@@ -120,6 +120,50 @@ func assertAPIError(t *testing.T, err error, status int, code string) {
 	}
 }
 
+func TestWorkQueueEnsurePublishesCreatedOnlyWhenNew(t *testing.T) {
+	repo := &fakeWorkItemRepo{
+		item: agent.WorkItem{
+			ID: 77, VersionID: 10, Team: agent.TeamClarification,
+			Type: "chat.turn", DedupeKey: "opening:1",
+		},
+		created: true,
+	}
+	publisher := &fakePublisher{}
+	queue := newWorkQueue(repo)
+	queue.SetEvents(publisher)
+	ctx := context.Background()
+
+	if _, _, err := queue.Ensure(ctx, agent.NewWorkItem{
+		VersionID: 10, Team: "clarification", Type: "chat.turn", DedupeKey: "opening:1",
+	}); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if len(publisher.events) != 1 {
+		t.Fatalf("events = %#v", publisher.events)
+	}
+	event := publisher.events[0]
+	if event.Type != "work_item.created" || event.Channel != "version:10" {
+		t.Fatalf("event = %#v", event)
+	}
+	if event.Scope["version_id"] != "10" {
+		t.Fatalf("scope = %#v", event.Scope)
+	}
+	if event.Payload["work_item_id"] != "77" || event.Payload["type"] != "chat.turn" ||
+		event.Payload["team"] != "clarification" || event.Payload["dedupe_key"] != "opening:1" {
+		t.Fatalf("payload = %#v", event.Payload)
+	}
+
+	repo.created = false
+	if _, _, err := queue.Ensure(ctx, agent.NewWorkItem{
+		VersionID: 10, Team: "clarification", Type: "chat.turn", DedupeKey: "opening:1",
+	}); err != nil {
+		t.Fatalf("Ensure duplicate: %v", err)
+	}
+	if len(publisher.events) != 1 {
+		t.Fatalf("duplicate ensure published: %#v", publisher.events)
+	}
+}
+
 func TestWorkQueueEnsureValidatesAndDefaults(t *testing.T) {
 	repo := &fakeWorkItemRepo{item: agent.WorkItem{ID: 5}, created: true}
 	queue := newWorkQueue(repo)

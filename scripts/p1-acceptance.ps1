@@ -710,6 +710,11 @@ try {
         throw "AI draft requirement has an unexpected id/revision"
     }
     Write-Log ("      AI draft requirement: id=$aiRequirementID title='" + $draft.title + "'")
+    $provenance = (Invoke-Psql -DatabaseName $testDatabase -SqlText "SELECT COALESCE(created_by_run_id::text, '') FROM requirement WHERE id = $aiRequirementID;") -join ""
+    if ([string]::IsNullOrWhiteSpace($provenance.Trim())) {
+        throw "AI draft requirement has no created_by_run_id provenance"
+    }
+    Write-Log ("      AI provenance: created_by_run_id=" + $provenance.Trim())
     StepPassed "wait for the Host assistant reply and the Curator draft requirement"
 
     # ------------------------------------------------------------ confirms --
@@ -839,6 +844,7 @@ try {
     $events = Get-Array $snapshot.Json.data
     $eventTypes = Get-EventTypes $snapshot
     foreach ($required in @(
+        "work_item.created",
         "conversation.message",
         "requirement.created",
         "requirement.clarified",
@@ -858,6 +864,14 @@ try {
     $requirementEvents = @($events | Where-Object { $_.type -like "requirement.*" })
     foreach ($event in $requirementEvents) {
         if ($null -eq $event.scope.version_id) { throw ("requirement event {0} has no scope.version_id" -f $event.type) }
+    }
+    $workItemEvents = @($events | Where-Object { $_.type -like "work_item.*" })
+    foreach ($event in $workItemEvents) {
+        if ($null -eq $event.scope.version_id) { throw ("work item event {0} has no scope.version_id" -f $event.type) }
+    }
+    $teamRoomPosts = @($events | Where-Object { $_.type -eq "team_room.post" })
+    foreach ($event in $teamRoomPosts) {
+        if ($null -eq $event.payload.refs) { throw "team_room.post payload has no refs" }
     }
     Write-Log ("      SSE events: " + (($eventTypes | Sort-Object -Unique) -join ", "))
     Write-Log ("      snapshot_cursor: " + $cursor)

@@ -216,6 +216,7 @@ type runState struct {
 	turns        int
 	usage        map[string]int
 	messages     []llmapp.ChatMessage
+	userContent  string
 	cards        []ConversationPart
 	overflowHits int
 	softNoted    bool
@@ -385,16 +386,14 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 
 	systemContent := sectionContent(saved, contextSectionSystem)
 	userContent := r.userMessage(ctx, state, attachmentText)
+	state.userContent = userContent
 	if err := r.appendTranscript(ctx, state, agent.MessageRoleSystem, systemContent, nil, nil); err != nil {
 		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}
 	if err := r.appendTranscript(ctx, state, agent.MessageRoleUser, userContent, nil, nil); err != nil {
 		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}
-	state.messages = []llmapp.ChatMessage{
-		{Role: "system", Content: systemContent},
-		{Role: "user", Content: userContent},
-	}
+	state.messages = promptMessages(saved, userContent)
 	return nil
 }
 
@@ -470,7 +469,17 @@ func (r *Runner) loop(ctx context.Context, state *runState) (string, error) {
 	}
 }
 
+func profileAllowsTool(profile agent.AgentProfile, name string) bool {
+	for _, allowed := range profile.AllowedTools {
+		if allowed == name {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *Runner) executeTools(ctx context.Context, state *runState, calls []llmapp.ToolCall) error {
+	ctx = platform.WithAgentRun(ctx, state.run.ID, state.item.ID)
 	scope := tools.Scope{
 		VersionID:      state.item.VersionID,
 		ConversationID: state.payload.ConversationID,
@@ -480,7 +489,13 @@ func (r *Runner) executeTools(ctx context.Context, state *runState, calls []llma
 
 	for _, call := range calls {
 		r.publishActivity(state, "tool", call.Name, "")
-		payload, err := state.registry.Execute(ctx, scope, call.Name, json.RawMessage(call.Arguments))
+		var payload any
+		var err error
+		if !profileAllowsTool(state.profile, call.Name) {
+			err = tools.Invalid("tool", "tool is not allowed for this profile: "+call.Name)
+		} else {
+			payload, err = state.registry.Execute(ctx, scope, call.Name, json.RawMessage(call.Arguments))
+		}
 		content := ""
 		contentRef := ""
 		if err != nil {
@@ -578,12 +593,7 @@ func (r *Runner) handleOverflow(ctx context.Context, state *runState) error {
 	state.input = compacted
 	state.run.ContextPacketID = &saved.ID
 	systemContent := sectionContent(saved, contextSectionSystem)
-	for i := range state.messages {
-		if state.messages[i].Role == "system" {
-			state.messages[i].Content = systemContent
-			break
-		}
-	}
+	state.messages = promptMessages(saved, state.userContent)
 	if err := r.appendTranscript(ctx, state, agent.MessageRoleSystem, systemContent, nil, nil); err != nil {
 		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}
@@ -592,7 +602,6 @@ func (r *Runner) handleOverflow(ctx context.Context, state *runState) error {
 		stored, err := r.conversation.UpdateSummary(ctx, state.item.VersionID, state.payload.ConversationID, info.Summary, state.input.Conversation.PinnedFacts)
 		if err == nil {
 			summaryVersion = stored.Version
-			r.publishSummaryUpdated(state, stored)
 		}
 	}
 	payload := map[string]any{
@@ -798,7 +807,6 @@ func (r *Runner) persistCompaction(ctx context.Context, state *runState, info Co
 		stored, err := r.conversation.UpdateSummary(ctx, state.item.VersionID, state.payload.ConversationID, info.Summary, state.input.Conversation.PinnedFacts)
 		if err == nil {
 			summaryVersion = stored.Version
-			r.publishSummaryUpdated(state, stored)
 		}
 	}
 	payload := map[string]any{
@@ -836,7 +844,6 @@ func (r *Runner) toolDepsForRun(state *runState) tools.Deps {
 		if err != nil {
 			return nil, err
 		}
-		r.publishSummaryUpdated(state, stored)
 		return map[string]any{
 			"conversation_id": idText(scope.ConversationID),
 			"version":         stored.Version,
@@ -973,17 +980,6 @@ func (r *Runner) publishActivity(state *runState, status, tool, summary string) 
 		payload["summary"] = summary
 	}
 	r.publish(state, "agent.activity", payload)
-}
-
-func (r *Runner) publishSummaryUpdated(state *runState, stored ConversationSummary) {
-	if state.payload.ConversationID <= 0 {
-		return
-	}
-	r.publish(state, "conversation.summary_updated", map[string]any{
-		"conversation_id": idText(state.payload.ConversationID),
-		"version":         stored.Version,
-		"token_estimate":  EstimateTokens(stored.Summary),
-	})
 }
 
 func (r *Runner) recordAudit(state *runState, status agent.AgentRunStatus, reason string) {
@@ -1206,6 +1202,33 @@ func sectionContent(packet agent.ContextPacket, name string) string {
 		}
 	}
 	return ""
+}
+
+// promptMessages renders the persisted context packet into the actual model
+// prompt. The system section carries the profile/task instructions; every
+// non-system section (version pack, rolling summary/recent window, team room,
+// artifacts) is injected ahead of the current user message so context is not
+// merely persisted without ever reaching the model.
+func promptMessages(packet agent.ContextPacket, userContent string) []llmapp.ChatMessage {
+	system := sectionContent(packet, contextSectionSystem)
+	var builder strings.Builder
+	for _, section := range packet.Sections {
+		if section.Name == contextSectionSystem || strings.TrimSpace(section.Content) == "" {
+			continue
+		}
+		if builder.Len() > 0 {
+			builder.WriteString("\n\n")
+		}
+		fmt.Fprintf(&builder, "## %s\n%s", section.Name, section.Content)
+	}
+	if builder.Len() > 0 {
+		builder.WriteString("\n\n# 当前用户消息\n")
+	}
+	builder.WriteString(userContent)
+	return []llmapp.ChatMessage{
+		{Role: "system", Content: system},
+		{Role: "user", Content: builder.String()},
+	}
 }
 
 func mergeUsage(target map[string]int, addition map[string]int) {

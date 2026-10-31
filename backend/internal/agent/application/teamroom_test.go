@@ -241,7 +241,9 @@ func TestTeamRoomPostPersistsAndPublishes(t *testing.T) {
 	room, clk := newTeamRoom(repo, nil, publisher)
 	ctx := context.Background()
 
-	post, err := room.Post(ctx, validPost(10, agent.PostKindFinding, "接口已就绪"))
+	input := validPost(10, agent.PostKindFinding, "接口已就绪")
+	input.Refs = []agent.PostRef{{Kind: "attachment", ID: "7001"}}
+	post, err := room.Post(ctx, input)
 	if err != nil {
 		t.Fatalf("Post: %v", err)
 	}
@@ -263,6 +265,15 @@ func TestTeamRoomPostPersistsAndPublishes(t *testing.T) {
 	}
 	if event.Payload["post_id"] != fmt.Sprintf("%d", post.ID) || event.Payload["kind"] != "finding" {
 		t.Fatalf("payload = %#v", event.Payload)
+	}
+	refs, ok := event.Payload["refs"].([]map[string]string)
+	if !ok || len(refs) != len(post.Refs) {
+		t.Fatalf("payload refs = %#v", event.Payload["refs"])
+	}
+	for index, ref := range post.Refs {
+		if refs[index]["kind"] != ref.Kind || refs[index]["id"] != ref.ID {
+			t.Fatalf("payload refs = %#v", refs)
+		}
 	}
 
 	if _, err := room.Post(ctx, validPost(10, "invalid", "x")); err == nil {

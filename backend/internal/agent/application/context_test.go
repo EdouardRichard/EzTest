@@ -172,6 +172,33 @@ func TestContextBuildBudgetUsesModelMetadata(t *testing.T) {
 	})
 }
 
+func TestContextBuildTrimsRecentWindowBelowThreshold(t *testing.T) {
+	in := sampleInput()
+	in.Conversation.RecentMessages = []agentapp.Message{
+		{ID: 1, Role: "user", Content: "第00条消息"},
+		{ID: 2, Role: "assistant", Content: "第01条消息"},
+		{ID: 3, Role: "user", Content: "第02条消息"},
+		{ID: 4, Role: "assistant", Content: "第03条消息"},
+		{ID: 5, Role: "user", Content: "第04条消息"},
+	}
+	packet, info := buildContext(t, contextSettings(), nil, in)
+	if !info.Compacted || info.Summary == "" {
+		t.Fatalf("compaction info = %#v", info)
+	}
+	if !strings.Contains(info.Summary, "第00条消息") {
+		t.Fatalf("summary = %q", info.Summary)
+	}
+	conversation := ""
+	for _, section := range packet.Sections {
+		if section.Name == "conversation" {
+			conversation = section.Content
+		}
+	}
+	if !strings.Contains(conversation, "摘要:") || !strings.Contains(conversation, "第04条消息") {
+		t.Fatalf("conversation section = %q", conversation)
+	}
+}
+
 func TestContextBuildSmallInputKeepsAllSections(t *testing.T) {
 	in := sampleInput()
 	packet, info := buildContext(t, contextSettings(), nil, in)

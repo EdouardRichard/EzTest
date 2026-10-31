@@ -221,7 +221,7 @@ func (r *Reconciler) reconcileAttachments(ctx context.Context) error {
 }
 
 func (r *Reconciler) ensure(ctx context.Context, versionID int64, workType, dedupeKey string, payload map[string]any) (bool, error) {
-	item, created, err := r.queue.Ensure(ctx, agent.NewWorkItem{
+	_, created, err := r.queue.Ensure(ctx, agent.NewWorkItem{
 		VersionID: versionID,
 		Team:      string(agent.TeamClarification),
 		Type:      workType,
@@ -231,33 +231,7 @@ func (r *Reconciler) ensure(ctx context.Context, versionID int64, workType, dedu
 	if err != nil {
 		return false, fmt.Errorf("ensure %s %s: %w", workType, dedupeKey, err)
 	}
-	if created {
-		r.publish(versionID, "work_item.created", map[string]any{
-			"work_item_id": idText(item.ID),
-			"type":         workType,
-			"team":         string(agent.TeamClarification),
-			"dedupe_key":   dedupeKey,
-		})
-	}
 	return created, nil
-}
-
-func (r *Reconciler) publish(versionID int64, eventType string, payload map[string]any) {
-	r.publishToChannels([]string{"version:" + idText(versionID)}, eventType, payload)
-}
-
-func (r *Reconciler) publishToChannels(channels []string, eventType string, payload map[string]any) {
-	if r.events == nil {
-		return
-	}
-	for _, channel := range channels {
-		_ = r.events.Publish(context.Background(), eventingapp.Event{
-			Channel: channel,
-			Type:    eventType,
-			Scope:   map[string]any{"version_id": payload["version_id"]},
-			Payload: payload,
-		})
-	}
 }
 
 func hasBlockingTask(items []agent.WorkItem, workType, dedupeKey string) bool {

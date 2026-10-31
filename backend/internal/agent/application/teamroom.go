@@ -78,11 +78,16 @@ func (s *TeamRoom) Post(ctx context.Context, post agent.TeamRoomPost) (agent.Tea
 		}
 		return agent.TeamRoomPost{}, err
 	}
+	refs := make([]map[string]string, 0, len(stored.Refs))
+	for _, ref := range stored.Refs {
+		refs = append(refs, map[string]string{"kind": ref.Kind, "id": ref.ID})
+	}
 	s.publish(ctx, "team_room.post", stored.VersionID, map[string]any{
 		"version_id": platformid.Format(stored.VersionID),
 		"team":       string(stored.Team),
 		"post_id":    platformid.Format(stored.ID),
 		"kind":       string(stored.Kind),
+		"refs":       refs,
 	})
 	// Digest maintenance is derived state: a failure must not undo the post.
 	s.ensureDigest(ctx, stored.VersionID, stored.Team)

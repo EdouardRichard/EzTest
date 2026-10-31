@@ -179,8 +179,8 @@ func (s *ConversationService) Messages(ctx context.Context, versionID, conversat
 
 // PostUserMessage validates and stores one user message. A repeated
 // client_message_id returns the already-stored message without new side
-// effects; attachment registration happens before the insert so message parts
-// stay self-describing.
+// effects; attachments are registered only after the message insert wins so a
+// failed or idempotent post cannot leave attachment rows for a missing message.
 func (s *ConversationService) PostUserMessage(ctx context.Context, versionID, conversationID int64, parts []version.MessagePart, clientMessageID string, actorID int64) (MessageView, error) {
 	if err := validateConversationIDs(versionID, conversationID); err != nil {
 		return MessageView{}, err
@@ -223,17 +223,6 @@ func (s *ConversationService) PostUserMessage(ctx context.Context, versionID, co
 		message.ClientMessageID = &value
 	}
 
-	if s.attachments != nil {
-		for _, part := range parts {
-			if part.Type != version.MessagePartAttachment {
-				continue
-			}
-			if _, err := s.attachments.RegisterFromMessage(ctx, versionID, message.ID, part, actorID); err != nil {
-				return MessageView{}, err
-			}
-		}
-	}
-
 	existing, created, err := s.repo.PostUserMessage(ctx, conversationID, message)
 	if err != nil {
 		return MessageView{}, mapConversationRepositoryError(err)
@@ -241,6 +230,18 @@ func (s *ConversationService) PostUserMessage(ctx context.Context, versionID, co
 	if !created && existing != nil {
 		s.ensureMessageTasks(ctx, versionID, conversationID, existing.ID)
 		return toMessageView(*existing), nil
+	}
+
+	if s.attachments != nil {
+		// Registration is side-effectful (content refs + ingest tasks); do it
+		// only after the message insert wins so a failed/idempotent post never
+		// leaves attachment rows pointing at a message that does not exist.
+		for _, part := range parts {
+			if part.Type != version.MessagePartAttachment {
+				continue
+			}
+			_, _ = s.attachments.RegisterFromMessage(ctx, versionID, conversationID, message.ID, part, actorID)
+		}
 	}
 
 	s.publishMessageEvent(ctx, versionID, message)

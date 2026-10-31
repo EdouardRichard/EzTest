@@ -189,7 +189,7 @@ type fakeRegistrar struct {
 	id    int64
 }
 
-func (f *fakeRegistrar) RegisterFromMessage(_ context.Context, versionID, messageID int64, part version.MessagePart, actorID int64) (versionapp.AttachmentView, error) {
+func (f *fakeRegistrar) RegisterFromMessage(_ context.Context, versionID, conversationID, messageID int64, part version.MessagePart, actorID int64) (versionapp.AttachmentView, error) {
 	f.calls = append(f.calls, registrarCall{versionID: versionID, messageID: messageID, part: part, actorID: actorID})
 	if f.err != nil {
 		return versionapp.AttachmentView{}, f.err
