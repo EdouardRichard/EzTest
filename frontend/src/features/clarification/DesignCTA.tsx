@@ -1,16 +1,20 @@
 "use client"
 
 import { Sparkles } from "lucide-react"
-
-import { Button } from "@/components/ui/Button"
+import Link from "next/link"
 
 export type DesignCTAProps = {
-  /** `pending_design_count`; P1 equals the clarified requirement count. */
+  versionId: string
+  /** `pending_design_count`: clarified requirements not activated into design. */
   pendingCount: number
 }
 
-/** P1 placeholder: clarified requirements wait for the P2 design conversation. */
-export function DesignCTA({ pendingCount }: DesignCTAProps) {
+/**
+ * Requirements-page design todo (P2): clarified requirements that still need a
+ * design conversation. The action deep-links to the version's design tab where
+ * the first conversation can be created (spec §10.2).
+ */
+export function DesignCTA({ versionId, pendingCount }: DesignCTAProps) {
   if (pendingCount <= 0) return null
 
   return (
@@ -21,11 +25,14 @@ export function DesignCTA({ pendingCount }: DesignCTAProps) {
     >
       <Sparkles className="size-4 text-primary" aria-hidden="true" />
       <p className="text-xs text-foreground">
-        <span className="font-semibold">{pendingCount}</span> 条需求待设计 · P2 提供设计对话
+        <span className="font-semibold">{pendingCount}</span> 条需求待设计
       </p>
-      <Button size="sm" variant="secondary" disabled title="P2 提供设计对话" className="ml-auto">
-        开始设计（P2）
-      </Button>
+      <Link
+        href={`/versions/${encodeURIComponent(versionId)}?tab=design`}
+        className="ml-auto inline-flex h-8 items-center rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+      >
+        开始设计
+      </Link>
     </section>
   )
 }

@@ -8,24 +8,23 @@ describe("DesignCTA", () => {
   afterEach(cleanup)
 
   it("renders nothing when no clarified requirement is waiting for design", () => {
-    const { container } = render(<DesignCTA pendingCount={0} />)
+    const { container } = render(<DesignCTA versionId="2001" pendingCount={0} />)
     expect(container).toBeEmptyDOMElement()
   })
 
-  it("shows the P2 design placeholder with a disabled action", () => {
-    render(<DesignCTA pendingCount={3} />)
+  it("links to the version design tab with the pending count", () => {
+    render(<DesignCTA versionId="2001" pendingCount={3} />)
 
-    expect(screen.getByTestId("design-cta")).toHaveTextContent("3 条需求待设计 · P2 提供设计对话")
-    const action = screen.getByRole("button", { name: /开始设计/ })
-    expect(action).toBeDisabled()
-    expect(action).toHaveAttribute("title", "P2 提供设计对话")
+    expect(screen.getByTestId("design-cta")).toHaveTextContent("3 条需求待设计")
+    const link = screen.getByRole("link", { name: "开始设计" })
+    expect(link).toHaveAttribute("href", "/versions/2001?tab=design")
   })
 
-  it("does not call any design API (P1 renders the placeholder only)", () => {
+  it("does not call any design API from the CTA", () => {
     const fetchSpy = vi.fn()
     vi.stubGlobal("fetch", fetchSpy)
 
-    render(<DesignCTA pendingCount={1} />)
+    render(<DesignCTA versionId="2001" pendingCount={1} />)
 
     expect(fetchSpy).not.toHaveBeenCalled()
     vi.unstubAllGlobals()

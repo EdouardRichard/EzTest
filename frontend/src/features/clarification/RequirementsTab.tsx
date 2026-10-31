@@ -330,7 +330,7 @@ export function RequirementsTab({
         />
 
         <div className="flex min-w-0 flex-col gap-3">
-          <DesignCTA pendingCount={pendingDesignCount} />
+          <DesignCTA versionId={versionId} pendingCount={pendingDesignCount} />
 
           {bulkNotice !== null ? (
             <p

@@ -31,6 +31,23 @@ vi.mock("@/features/clarification/RequirementsTab", async () => {
   }
 })
 
+vi.mock("@/features/design/DesignTab", async () => {
+  const React = await import("react")
+  return {
+    DesignTab: (props: {
+      versionId: string
+      initialCaseId?: string
+      initialConversationId?: string
+    }) =>
+      React.createElement("div", {
+        "data-testid": "design-workspace",
+        "data-version-id": props.versionId,
+        "data-case-id": props.initialCaseId,
+        "data-conversation-id": props.initialConversationId,
+      }),
+  }
+})
+
 const navigation = vi.hoisted(() => ({
   push: vi.fn(),
   replace: vi.fn(),
@@ -39,9 +56,11 @@ const navigation = vi.hoisted(() => ({
   forward: vi.fn(),
   prefetch: vi.fn(),
 }))
+const search = vi.hoisted(() => ({ params: new URLSearchParams() }))
 vi.mock("next/navigation", () => ({
   useRouter: () => navigation,
   usePathname: () => "/versions/2001",
+  useSearchParams: () => search.params,
 }))
 
 import { versionFixture } from "./test-fixtures"
@@ -52,6 +71,7 @@ describe("VersionDetailPage", () => {
     api.getVersion.mockReset()
     api.getVersion.mockResolvedValue(versionFixture)
     navigation.replace.mockReset()
+    search.params = new URLSearchParams()
   })
 
   afterEach(cleanup)
@@ -93,7 +113,6 @@ describe("VersionDetailPage", () => {
   })
 
   it.each([
-    ["design", "用例设计将在 P2 阶段提供"],
     ["chain", "探索链路将在 P4 阶段提供"],
     ["issues", "问题将在 P4 阶段提供"],
     ["reports", "报告将在 P4 阶段提供"],
@@ -112,7 +131,7 @@ describe("VersionDetailPage", () => {
     expect(screen.getByRole("tab", { name: "总览" })).toHaveAttribute("aria-selected", "true")
   })
 
-  it("switches tabs, updates the URL and shows the matching placeholder", async () => {
+  it("switches tabs, updates the URL and mounts the design workspace", async () => {
     render(<VersionDetailPage versionId="2001" />)
     await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
 
@@ -120,7 +139,22 @@ describe("VersionDetailPage", () => {
 
     expect(navigation.replace).toHaveBeenCalledWith("/versions/2001?tab=design")
     expect(screen.getByRole("tab", { name: "用例设计" })).toHaveAttribute("aria-selected", "true")
-    expect(screen.getByText("用例设计将在 P2 阶段提供")).toBeInTheDocument()
+    const workspace = screen.getByTestId("design-workspace")
+    expect(workspace).toHaveAttribute("data-version-id", "2001")
+    expect(screen.queryByText("用例设计将在 P2 阶段提供")).not.toBeInTheDocument()
+  })
+
+  it("forwards the design deep links (?case= and ?conversation=) to the design tab", async () => {
+    search.params = new URLSearchParams("tab=design&case=7001&conversation=4009")
+
+    render(<VersionDetailPage versionId="2001" initialTab="design" />)
+
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+    const workspace = screen.getByTestId("design-workspace")
+    expect(workspace).toHaveAttribute("data-version-id", "2001")
+    expect(workspace).toHaveAttribute("data-case-id", "7001")
+    expect(workspace).toHaveAttribute("data-conversation-id", "4009")
+    expect(navigation.replace).not.toHaveBeenCalled()
   })
 
   it("mounts the clarification workspace when the requirements tab is selected", async () => {
