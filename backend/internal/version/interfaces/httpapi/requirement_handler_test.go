@@ -15,6 +15,7 @@ import (
 
 type stubRequirementService struct {
 	detail    versionapp.RequirementDetail
+	getQueue  []versionapp.RequirementDetail
 	list      []versionapp.RequirementView
 	hasMore   bool
 	confirm   versionapp.ConfirmResult
@@ -66,6 +67,11 @@ func (s *stubRequirementService) Get(_ context.Context, versionID, requirementID
 	s.lastRequestID = requirementID
 	if s.err != nil {
 		return versionapp.RequirementDetail{}, s.err
+	}
+	if len(s.getQueue) > 0 {
+		detail := s.getQueue[0]
+		s.getQueue = s.getQueue[1:]
+		return detail, nil
 	}
 	return s.detail, nil
 }
@@ -131,8 +137,15 @@ var _ versionapi.RequirementService = (*stubRequirementService)(nil)
 
 func newRequirementServer(t *testing.T) (http.Handler, *stubRequirementService) {
 	t.Helper()
+	mux, stub, _ := newRequirementServerWithClosures(t)
+	return mux, stub
+}
+
+func newRequirementServerWithClosures(t *testing.T) (http.Handler, *stubRequirementService, *stubRequirementClosureReader) {
+	t.Helper()
 	stub := &stubRequirementService{}
-	handler := versionapi.NewRequirementHandler(stub)
+	closures := &stubRequirementClosureReader{closures: map[int64]versionapp.RequirementClosureView{}}
+	handler := versionapi.NewRequirementHandler(stub, versionapi.WithRequirementClosures(closures))
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/versions/{id}/requirements", handler.List)
 	mux.HandleFunc("POST /api/versions/{id}/requirements", handler.Create)
@@ -142,7 +155,7 @@ func newRequirementServer(t *testing.T) (http.Handler, *stubRequirementService) 
 	mux.HandleFunc("POST /api/versions/{id}/requirements/{rid}/confirmations", handler.Confirm)
 	mux.HandleFunc("POST /api/versions/{id}/requirements/{rid}/rollback", handler.Rollback)
 	mux.HandleFunc("GET /api/versions/{id}/requirements/{rid}/relations", handler.ListRelations)
-	return mux, stub
+	return mux, stub, closures
 }
 
 func sampleRequirementVersionView() versionapp.RequirementVersionView {
@@ -453,6 +466,223 @@ func TestRequirementHandlerValidationAndServiceErrors(t *testing.T) {
 	stub.err = platform.StateConflict("frozen")
 	if recorder := call(t, handler, http.MethodPatch, "/api/versions/101/requirements/9001", `{"title":"T"}`, actor()); recorder.Code != http.StatusConflict {
 		t.Fatalf("conflict status = %d", recorder.Code)
+	}
+}
+
+type requirementReopenCall struct {
+	requirementID int64
+	reason        string
+}
+
+type stubRequirementReopener struct {
+	err   error
+	calls []requirementReopenCall
+}
+
+func (s *stubRequirementReopener) Reopen(_ context.Context, requirementID int64, reason string) error {
+	s.calls = append(s.calls, requirementReopenCall{requirementID: requirementID, reason: reason})
+	return s.err
+}
+
+var _ versionapi.RequirementReopener = (*stubRequirementReopener)(nil)
+
+type stubRequirementClosureReader struct {
+	closures map[int64]versionapp.RequirementClosureView
+	err      error
+	calls    []int64
+}
+
+func (s *stubRequirementClosureReader) LatestClosure(_ context.Context, requirementID int64) (versionapp.RequirementClosureView, bool, error) {
+	s.calls = append(s.calls, requirementID)
+	if s.err != nil {
+		return versionapp.RequirementClosureView{}, false, s.err
+	}
+	closure, found := s.closures[requirementID]
+	return closure, found, nil
+}
+
+var _ versionapi.RequirementClosureReader = (*stubRequirementClosureReader)(nil)
+
+func newRequirementReopenServer(t *testing.T) (http.Handler, *stubRequirementService, *stubRequirementReopener, *stubRequirementClosureReader) {
+	t.Helper()
+	stub := &stubRequirementService{}
+	reopen := &stubRequirementReopener{}
+	closures := &stubRequirementClosureReader{closures: map[int64]versionapp.RequirementClosureView{}}
+	handler := versionapi.NewRequirementHandler(
+		stub,
+		versionapi.WithRequirementReopener(reopen),
+		versionapi.WithRequirementClosures(closures),
+	)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/versions/{versionId}/requirements/{requirementId}/reopen", handler.Reopen)
+	return mux, stub, reopen, closures
+}
+
+func TestRequirementReopenReturnsDraftWithClosure(t *testing.T) {
+	handler, stub, reopen, closures := newRequirementReopenServer(t)
+	closedAt := testTime
+	closed := sampleRequirementDetail()
+	closed.Status = "closed"
+	closed.ClosedAt = &closedAt
+	draft := sampleRequirementDetail()
+	draft.Status = "draft"
+	draft.ClosedAt = nil
+	stub.getQueue = []versionapp.RequirementDetail{closed, draft}
+	closures.closures[9001] = versionapp.RequirementClosureView{
+		ID: 3001, CloseRound: 1, ClosedAt: testTime, ReopenCount: 2,
+	}
+
+	recorder := call(t, handler, http.MethodPost, "/api/versions/101/requirements/9001/reopen",
+		`{"reason":"reopen after review"}`, actor())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if len(reopen.calls) != 1 {
+		t.Fatalf("reopen calls = %#v", reopen.calls)
+	}
+	reopenCall := reopen.calls[0]
+	if reopenCall.requirementID != 9001 || reopenCall.reason != "reopen after review" {
+		t.Fatalf("reopen call = %#v", reopenCall)
+	}
+	if len(stub.calls) != 2 || stub.lastVersionID != 101 || stub.lastRequestID != 9001 {
+		t.Fatalf("service calls = %#v", stub.calls)
+	}
+	data := dataBody(t, recorder)
+	if data["id"] != "9001" || data["status"] != "draft" {
+		t.Fatalf("data = %#v", data)
+	}
+	if data["closed_at"] != nil {
+		t.Fatalf("reopened requirement keeps closed_at: %#v", data)
+	}
+	closure, ok := data["closure"].(map[string]any)
+	if !ok {
+		t.Fatalf("closure = %#v", data["closure"])
+	}
+	if closure["closure_id"] != "3001" || closure["close_round"] != float64(1) ||
+		closure["closed_at"] != "2026-10-31T12:00:00Z" || closure["reopen_count"] != float64(2) {
+		t.Fatalf("closure = %#v", closure)
+	}
+	if _, ok := closure["checks"]; ok {
+		t.Fatalf("closure exposes internal checks: %#v", closure)
+	}
+}
+
+func TestRequirementReopenRejectsNonClosedRequirement(t *testing.T) {
+	handler, stub, reopen, _ := newRequirementReopenServer(t)
+	stub.detail = sampleRequirementDetail()
+
+	recorder := call(t, handler, http.MethodPost, "/api/versions/101/requirements/9001/reopen",
+		`{"reason":"reopen"}`, actor())
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if code := errorBody(t, recorder)["code"]; code != "state_conflict" {
+		t.Fatalf("error = %#v", errorBody(t, recorder))
+	}
+	if len(reopen.calls) != 0 {
+		t.Fatalf("reopen called for a non-closed requirement: %#v", reopen.calls)
+	}
+	if len(stub.calls) != 1 {
+		t.Fatalf("service calls = %#v", stub.calls)
+	}
+}
+
+func TestRequirementReopenValidatesInputAndMapsErrors(t *testing.T) {
+	cases := []struct {
+		name  string
+		path  string
+		body  string
+		actor *platform.Actor
+		want  int
+		field string
+	}{
+		{"missing reason", "/api/versions/101/requirements/9001/reopen", `{}`, actor(), 400, "reason"},
+		{"blank reason", "/api/versions/101/requirements/9001/reopen", `{"reason":"  "}`, actor(), 400, "reason"},
+		{"malformed body", "/api/versions/101/requirements/9001/reopen", `{"reason":`, actor(), 400, "body"},
+		{"invalid version id", "/api/versions/abc/requirements/9001/reopen", `{"reason":"x"}`, actor(), 400, "versionId"},
+		{"invalid requirement id", "/api/versions/101/requirements/abc/reopen", `{"reason":"x"}`, actor(), 400, "requirementId"},
+		{"missing actor", "/api/versions/101/requirements/9001/reopen", `{"reason":"x"}`, nil, 401, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			handler, stub, reopen, _ := newRequirementReopenServer(t)
+			recorder := call(t, handler, http.MethodPost, tc.path, tc.body, tc.actor)
+			if recorder.Code != tc.want {
+				t.Fatalf("status = %d, want %d, body = %s", recorder.Code, tc.want, recorder.Body.String())
+			}
+			if tc.field != "" {
+				if field := errorBody(t, recorder)["details"].(map[string]any)["field"]; field != tc.field {
+					t.Fatalf("field = %#v, want %q", field, tc.field)
+				}
+			}
+			if len(stub.calls) != 0 || len(reopen.calls) != 0 {
+				t.Fatalf("service called for invalid input: stub=%#v reopen=%#v", stub.calls, reopen.calls)
+			}
+		})
+	}
+
+	missingServer, missingStub, missingReopen, _ := newRequirementReopenServer(t)
+	missingStub.err = platform.NotFound("requirement")
+	if recorder := call(t, missingServer, http.MethodPost, "/api/versions/101/requirements/999/reopen", `{"reason":"x"}`, actor()); recorder.Code != http.StatusNotFound {
+		t.Fatalf("missing status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if len(missingReopen.calls) != 0 {
+		t.Fatalf("reopen called for a missing requirement: %#v", missingReopen.calls)
+	}
+
+	conflictServer, conflictStub, conflictReopen, _ := newRequirementReopenServer(t)
+	closedAt := testTime
+	closed := sampleRequirementDetail()
+	closed.Status = "closed"
+	closed.ClosedAt = &closedAt
+	conflictStub.detail = closed
+	conflictReopen.err = platform.StateConflict("requirement is not closed")
+	if recorder := call(t, conflictServer, http.MethodPost, "/api/versions/101/requirements/9001/reopen", `{"reason":"x"}`, actor()); recorder.Code != http.StatusConflict {
+		t.Fatalf("conflict status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestRequirementViewsExposeCloseProjection(t *testing.T) {
+	handler, stub, closures := newRequirementServerWithClosures(t)
+	closedAt := testTime
+	closed := sampleRequirementView()
+	closed.Status = "closed"
+	closed.ClosedAt = &closedAt
+	stub.list = []versionapp.RequirementView{closed}
+	stub.detail = versionapp.RequirementDetail{RequirementView: closed}
+	closures.closures[9001] = versionapp.RequirementClosureView{
+		ID: 3001, CloseRound: 2, ClosedAt: testTime, ReopenCount: 1,
+	}
+
+	list := call(t, handler, http.MethodGet, "/api/versions/101/requirements", "", actor())
+	if list.Code != http.StatusOK {
+		t.Fatalf("list status = %d, body = %s", list.Code, list.Body.String())
+	}
+	items := dataList(t, list)
+	if len(items) != 1 {
+		t.Fatalf("items = %#v", items)
+	}
+	item := items[0].(map[string]any)
+	if item["status"] != "closed" || item["closed_at"] != "2026-10-31T12:00:00Z" {
+		t.Fatalf("list item = %#v", item)
+	}
+	listClosure := item["closure"].(map[string]any)
+	if listClosure["closure_id"] != "3001" || listClosure["close_round"] != float64(2) ||
+		listClosure["reopen_count"] != float64(1) {
+		t.Fatalf("list closure = %#v", listClosure)
+	}
+
+	get := call(t, handler, http.MethodGet, "/api/versions/101/requirements/9001", "", actor())
+	if get.Code != http.StatusOK {
+		t.Fatalf("get status = %d, body = %s", get.Code, get.Body.String())
+	}
+	data := dataBody(t, get)
+	if data["closed_at"] != "2026-10-31T12:00:00Z" {
+		t.Fatalf("detail closed_at = %#v", data["closed_at"])
+	}
+	detailClosure := data["closure"].(map[string]any)
+	if detailClosure["closure_id"] != "3001" || detailClosure["close_round"] != float64(2) {
+		t.Fatalf("detail closure = %#v", detailClosure)
 	}
 }
 
