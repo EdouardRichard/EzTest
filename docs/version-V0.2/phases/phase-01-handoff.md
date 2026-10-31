@@ -60,8 +60,8 @@ eventing_0002_event_index.sql
 |---|---|---|
 | 全量门禁 | `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test.ps1` | **EXIT=0**；Go 单测+集成全部 ok；前端 43 files / 341 tests；日志 `.tmp/p1/final-gate.log` |
 | API 验收 | `powershell.exe -File scripts/p1-acceptance.ps1 -FakeLLMPort 13335` | **PASS（19 steps）**；隔离 `eztest_v02_e2e`；证据 `.tmp/p1-acceptance/api.log` |
-| 浏览器 E2E | `powershell.exe -File scripts/p1-e2e.ps1` | **PASS**；登录→需求 Tab→新对话→附件→AI 草案→编辑→单条确认→批量确认→团队频道；截图 `.tmp/p1-acceptance/screenshots/requirements-workspace.png`、`team-room.png`；日志 `e2e-playwright.log` |
-| 真实 LLM | `powershell.exe -File scripts/p1-acceptance-llm.ps1` | **PASS**；DeepSeek `deepseek-flash` 真实回复+工具调用+draft+确认；证据 `.tmp/p1-acceptance/llm.log` |
+| 浏览器 E2E | `powershell.exe -File scripts/p1-e2e.ps1` | **PASS**；登录→需求 Tab→新对话→附件→AI 草案→编辑→单条确认→批量确认→团队频道（断言 Scout 已读附件文本）→设计 CTA（断言 3 条待设计）；截图 `.tmp/p1-acceptance/screenshots/requirements-workspace.png`、`team-room.png`；日志 `e2e-playwright.log` |
+| 真实 LLM | `powershell.exe -File scripts/p1-acceptance-llm.ps1` | **PASS**；DeepSeek `deepseek-flash` 真实回复+工具调用+draft+确认；工具名 dot→underscore 映射、脚本 UTF-8 body；证据 `.tmp/p1-acceptance/llm.log` |
 | 生产构建 | `cd frontend; pnpm build` | 成功；12 routes（含 `/versions/[id]`） |
 | 契约解析 | `node -e "yaml.parse(openapi.yaml)"` | YAML OK；53 paths / 81 schemas / `x-frozen: P1` |
 | 迁移幂等 | `go test -tags=integration ./internal/db/...` | 15 migrations；第二次 applied 为空；P1 约束生效 |
