@@ -5,8 +5,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sync"
@@ -104,6 +107,120 @@ func TestFileStoreOpenRejectsMissingAndTraversal(t *testing.T) {
 	if _, err := store.Open(context.Background(), root, "../../etc/passwd"); err == nil {
 		t.Fatal("path traversal: expected error")
 	}
+}
+
+func TestFileStoreOpenRootFile(t *testing.T) {
+	store := storagepg.NewFileStore()
+	root := t.TempDir()
+	file := filepath.Join(root, "report.html")
+	if err := os.WriteFile(file, []byte("<html>ok</html>"), 0o600); err != nil {
+		t.Fatalf("write root file: %v", err)
+	}
+
+	reader, err := store.Open(context.Background(), root, "report.html")
+	if err != nil {
+		t.Fatalf("Open root file: %v", err)
+	}
+	defer reader.Close()
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read root file: %v", err)
+	}
+	if string(got) != "<html>ok</html>" {
+		t.Fatalf("root file content = %q", got)
+	}
+}
+
+func TestFileStoreOpenRejectsAbsoluteAndEscapingPaths(t *testing.T) {
+	store := storagepg.NewFileStore()
+	ctx := context.Background()
+	root := t.TempDir()
+	absolute := filepath.Join(t.TempDir(), "outside.txt")
+	if err := os.WriteFile(absolute, []byte("outside"), 0o600); err != nil {
+		t.Fatalf("write outside file: %v", err)
+	}
+
+	paths := []string{
+		"..",
+		"../outside.txt",
+		"objects/../../outside.txt",
+		absolute,
+	}
+	if runtime.GOOS == "windows" {
+		// Windows separators are valid in file names for path.Clean but become
+		// traversal separators in filepath.Join; both must be rejected.
+		paths = append(paths, `..\..\outside.txt`)
+	}
+	for _, relativePath := range paths {
+		reader, err := store.Open(ctx, root, relativePath)
+		if err == nil {
+			_ = reader.Close()
+			t.Fatalf("Open(%q) escaped the data root", relativePath)
+		}
+		if !errors.Is(err, storagepg.ErrInvalidPath) {
+			t.Fatalf("Open(%q) error = %v, want ErrInvalidPath", relativePath, err)
+		}
+	}
+}
+
+func TestFileStoreOpenRejectsSymlinkEscape(t *testing.T) {
+	store := storagepg.NewFileStore()
+	root := t.TempDir()
+	outside := t.TempDir()
+	secret := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(secret, []byte("outside"), 0o600); err != nil {
+		t.Fatalf("write outside file: %v", err)
+	}
+
+	checked := 0
+	if err := os.Symlink(secret, filepath.Join(root, "escape.txt")); err == nil {
+		checked++
+		assertOpenRejectsLink(t, store, root, "escape.txt", "symlinked file")
+	} else if runtime.GOOS != "windows" {
+		t.Fatalf("create file symlink: %v", err)
+	}
+
+	// Directory links cover the intermediate-component escape. On Windows
+	// without Developer Mode they are created as unprivileged junctions, which
+	// Go reports as irregular reparse points instead of symlinks.
+	if err := createDirLink(filepath.Join(root, "linked-dir"), outside); err == nil {
+		checked++
+		assertOpenRejectsLink(t, store, root, "linked-dir/secret.txt", "symlinked directory")
+	}
+	if err := createDirLink(filepath.Join(root, "escape-dir"), outside); err == nil {
+		checked++
+		assertOpenRejectsLink(t, store, root, "escape-dir", "linked final component")
+	}
+	if checked == 0 {
+		t.Skip("host cannot create symlinks or junctions")
+	}
+}
+
+func assertOpenRejectsLink(t *testing.T, store *storagepg.FileStore, root, relativePath, kind string) {
+	t.Helper()
+	reader, err := store.Open(context.Background(), root, relativePath)
+	if err == nil {
+		_ = reader.Close()
+		t.Fatalf("Open followed a %s outside the data root", kind)
+	}
+	if !errors.Is(err, storagepg.ErrInvalidPath) {
+		t.Fatalf("Open(%s) error = %v, want ErrInvalidPath", kind, err)
+	}
+}
+
+// createDirLink creates a directory symlink where supported and falls back to
+// an unprivileged Windows junction when symbol-link creation needs privileges.
+func createDirLink(link, target string) error {
+	if err := os.Symlink(target, link); err == nil {
+		return nil
+	} else if runtime.GOOS != "windows" {
+		return err
+	}
+	output, err := exec.Command("cmd", "/c", "mklink", "/J", link, target).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("mklink /J: %w: %s", err, output)
+	}
+	return nil
 }
 
 func TestFileStoreRejectsMalformedSHA(t *testing.T) {
