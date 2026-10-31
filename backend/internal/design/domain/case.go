@@ -230,6 +230,11 @@ type CaseVersion struct {
 	Steps               []CaseStep
 	Assertions          []CaseAssertion
 	Sources             []CaseSource
+	// StepCount/AssertionCount/SourceCount are projection-only counts loaded
+	// by list/confirmation queries that do not need the full child rows.
+	StepCount      int
+	AssertionCount int
+	SourceCount    int
 }
 
 // StepProposal is one submitted step.
@@ -481,6 +486,7 @@ func validateCaseProposal(item CaseProposal, field string, ctx ProposalContext, 
 		return platform.Invalid(field+".steps", "a case may have at most 50 steps")
 	}
 	stepSeqs := make(map[int]int, len(item.Steps))
+	stepSUTs := make(map[int]int64, len(item.Steps))
 	for index, step := range item.Steps {
 		stepField := field + ".steps[" + platformid.Format(int64(index)) + "]"
 		if step.Seq != index+1 {
@@ -504,11 +510,11 @@ func validateCaseProposal(item CaseProposal, field string, ctx ProposalContext, 
 				return platform.Invalid(stepField+".target_version_sut_id", "must be one of the case version SUTs")
 			}
 		}
-		targetSUT, err := stepTargetSUT(stepField, step.TargetVersionSUTID, step.TargetPageID, step.TargetAPIID, ctx, caseSUTs)
+		targetSUT, err := stepTargetSUT(stepField, step.TargetVersionSUTID, step.TargetPageID, step.TargetAPIID, ctx, caseSUTs, *item.DefaultVersionSUTID)
 		if err != nil {
 			return err
 		}
-		_ = targetSUT
+		stepSUTs[step.Seq] = *targetSUT
 	}
 
 	if len(item.Assertions) > limits.MaxAssertionsPerCase {
@@ -528,7 +534,7 @@ func validateCaseProposal(item CaseProposal, field string, ctx ProposalContext, 
 		if err := validation.String(assertionField+".expected", assertion.Expected, 0, AssertionExpectMax); err != nil {
 			return err
 		}
-		targetSUT, err := assertionTargetSUT(assertionField, assertion, caseSUTs, ctx)
+		targetSUT, err := assertionTargetSUT(assertionField, assertion, caseSUTs, ctx, stepSUTs[assertion.StepSeq])
 		if err != nil {
 			return err
 		}
@@ -602,19 +608,18 @@ func validateCaseProposal(item CaseProposal, field string, ctx ProposalContext, 
 
 // stepTargetSUT validates a step target and returns the explicit target SUT
 // when set.
-func stepTargetSUT(field string, explicit *int64, pageID, apiID *int64, ctx ProposalContext, caseSUTs map[int64]struct{}) (*int64, error) {
+func stepTargetSUT(field string, explicit *int64, pageID, apiID *int64, ctx ProposalContext, caseSUTs map[int64]struct{}, defaultSUT int64) (*int64, error) {
+	target := defaultSUT
+	if explicit != nil {
+		target = *explicit
+	}
 	if pageID != nil {
 		sut, ok := ctx.PageToSUT[*pageID]
 		if !ok {
 			return nil, platform.Invalid(field+".target_page_id", "page does not belong to a version SUT")
 		}
-		if explicit != nil && sut != *explicit {
-			return nil, platform.Invalid(field+".target_page_id", "page does not belong to the step target SUT")
-		}
-		if explicit == nil {
-			if _, ok := caseSUTs[sut]; !ok {
-				return nil, platform.Invalid(field+".target_page_id", "page does not belong to the case version SUTs")
-			}
+		if sut != target {
+			return nil, platform.Invalid(field+".target_page_id", "page does not belong to the resolved step target SUT")
 		}
 	}
 	if apiID != nil {
@@ -622,41 +627,37 @@ func stepTargetSUT(field string, explicit *int64, pageID, apiID *int64, ctx Prop
 		if !ok {
 			return nil, platform.Invalid(field+".target_api_id", "api does not belong to a version SUT")
 		}
-		if explicit != nil && sut != *explicit {
-			return nil, platform.Invalid(field+".target_api_id", "api does not belong to the step target SUT")
-		}
-		if explicit == nil {
-			if _, ok := caseSUTs[sut]; !ok {
-				return nil, platform.Invalid(field+".target_api_id", "api does not belong to the case version SUTs")
-			}
+		if sut != target {
+			return nil, platform.Invalid(field+".target_api_id", "api does not belong to the resolved step target SUT")
 		}
 	}
-	return explicit, nil
+	_ = caseSUTs
+	return &target, nil
 }
 
 // assertionTargetSUT validates an assertion's optional explicit target SUT and
 // API binding and returns the explicit target when set.
-func assertionTargetSUT(field string, assertion AssertionProposal, caseSUTs map[int64]struct{}, ctx ProposalContext) (*int64, error) {
+func assertionTargetSUT(field string, assertion AssertionProposal, caseSUTs map[int64]struct{}, ctx ProposalContext, stepSUT int64) (*int64, error) {
+	target := stepSUT
 	if assertion.TargetVersionSUTID != nil {
 		if _, ok := caseSUTs[*assertion.TargetVersionSUTID]; !ok {
 			return nil, platform.Invalid(field+".target_version_sut_id", "must be one of the case version SUTs")
 		}
+		if *assertion.TargetVersionSUTID != stepSUT {
+			return nil, platform.Invalid(field+".target_version_sut_id", "must equal the referenced step target SUT")
+		}
+		target = *assertion.TargetVersionSUTID
 	}
 	if assertion.TargetAPIID != nil {
 		sut, ok := ctx.APIToSUT[*assertion.TargetAPIID]
 		if !ok {
 			return nil, platform.Invalid(field+".target_api_id", "api does not belong to a version SUT")
 		}
-		if assertion.TargetVersionSUTID != nil && sut != *assertion.TargetVersionSUTID {
+		if sut != target {
 			return nil, platform.Invalid(field+".target_api_id", "api does not belong to the assertion target SUT")
 		}
-		if assertion.TargetVersionSUTID == nil {
-			if _, ok := caseSUTs[sut]; !ok {
-				return nil, platform.Invalid(field+".target_api_id", "api does not belong to the case version SUTs")
-			}
-		}
 	}
-	return assertion.TargetVersionSUTID, nil
+	return &target, nil
 }
 
 func validateTargetSet(field string, ids []int64, allowed map[int64]struct{}, checkAllowed bool) error {

@@ -11,6 +11,22 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// plannerTxKey carries the advisory-locked transaction through repository
+// calls made by the planner callback, so round/scope writes participate in the
+// same transaction instead of silently using the pool.
+type plannerTxKey struct{}
+
+func withPlannerTx(ctx context.Context, tx pgx.Tx) context.Context {
+	return context.WithValue(ctx, plannerTxKey{}, tx)
+}
+
+func plannerQuerier(ctx context.Context, r *Repository) pgxQuerier {
+	if tx, ok := ctx.Value(plannerTxKey{}).(pgx.Tx); ok {
+		return tx
+	}
+	return r.pool
+}
+
 // WithVersionLock runs fn with the per-version planner advisory lock held.
 func (r *Repository) WithVersionLock(ctx context.Context, versionID int64, fn func(context.Context) error) error {
 	tx, err := r.pool.Begin(ctx)
@@ -21,7 +37,7 @@ func (r *Repository) WithVersionLock(ctx context.Context, versionID int64, fn fu
 	if err := lockVersion(ctx, tx, versionID); err != nil {
 		return err
 	}
-	if err := fn(ctx); err != nil {
+	if err := fn(withPlannerTx(ctx, tx)); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -229,7 +245,8 @@ func scanRound(row pgx.Row) (design.Round, error) {
 
 // GetRoundByConversation returns the round owned by one design conversation.
 func (r *Repository) GetRoundByConversation(ctx context.Context, conversationID int64) (*design.Round, error) {
-	round, err := scanRound(r.pool.QueryRow(ctx, `
+	q := plannerQuerier(ctx, r)
+	round, err := scanRound(q.QueryRow(ctx, `
 		SELECT id, version_id, conversation_id, activation, requirement_ids,
 		       requirement_version_ids, scope, status, created_by, created_at, updated_at
 		FROM design_round
@@ -263,7 +280,8 @@ func (r *Repository) GetRound(ctx context.Context, versionID, roundID int64) (*d
 
 // GetLatestRound returns the newest round of a version.
 func (r *Repository) GetLatestRound(ctx context.Context, versionID int64) (*design.Round, error) {
-	round, err := scanRound(r.pool.QueryRow(ctx, `
+	q := plannerQuerier(ctx, r)
+	round, err := scanRound(q.QueryRow(ctx, `
 		SELECT id, version_id, conversation_id, activation, requirement_ids,
 		       requirement_version_ids, scope, status, created_by, created_at, updated_at
 		FROM design_round
@@ -309,6 +327,7 @@ func (r *Repository) ListRounds(ctx context.Context, versionID int64) ([]design.
 
 // CreateRound inserts one design round. The caller supplies the snowflake ID.
 func (r *Repository) CreateRound(ctx context.Context, round design.Round) (design.Round, error) {
+	q := plannerQuerier(ctx, r)
 	requirementIDs, err := encodeIDArray(round.RequirementIDs)
 	if err != nil {
 		return design.Round{}, err
@@ -324,7 +343,7 @@ func (r *Repository) CreateRound(ctx context.Context, round design.Round) (desig
 	if round.Status == "" {
 		round.Status = design.RoundStatusActive
 	}
-	err = r.pool.QueryRow(ctx, `
+	err = q.QueryRow(ctx, `
 		INSERT INTO design_round (
 			id, version_id, conversation_id, activation, requirement_ids,
 			requirement_version_ids, scope, status, created_by, created_at, updated_at
@@ -341,6 +360,7 @@ func (r *Repository) CreateRound(ctx context.Context, round design.Round) (desig
 
 // UpdateRoundRequirements rewrites the round's requirement snapshot.
 func (r *Repository) UpdateRoundRequirements(ctx context.Context, roundID int64, requirementIDs, requirementVersionIDs []int64) error {
+	q := plannerQuerier(ctx, r)
 	ids, err := encodeIDArray(requirementIDs)
 	if err != nil {
 		return err
@@ -349,7 +369,7 @@ func (r *Repository) UpdateRoundRequirements(ctx context.Context, roundID int64,
 	if err != nil {
 		return err
 	}
-	if _, err := r.pool.Exec(ctx, `
+	if _, err := q.Exec(ctx, `
 		UPDATE design_round
 		SET requirement_ids = $2::jsonb, requirement_version_ids = $3::jsonb, updated_at = now()
 		WHERE id = $1
@@ -363,18 +383,19 @@ func (r *Repository) UpdateRoundRequirements(ctx context.Context, roundID int64,
 // and is idempotent on (version_id, requirement_id). The caller must hold the
 // version lock.
 func (r *Repository) UpsertScope(ctx context.Context, scope design.Scope) (design.Scope, bool, error) {
+	q := plannerQuerier(ctx, r)
 	if scope.Status == "" {
 		scope.Status = design.ScopeStatusActive
 	}
 	var existingID int64
-	err := r.pool.QueryRow(ctx, `
+	err := q.QueryRow(ctx, `
 		SELECT id FROM design_scope WHERE version_id = $1 AND requirement_id = $2
 	`, scope.VersionID, scope.RequirementID).Scan(&existingID)
 	created := false
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		created = true
-		err = r.pool.QueryRow(ctx, `
+		err = q.QueryRow(ctx, `
 			INSERT INTO design_scope (
 				id, version_id, requirement_id, activated_by_round_id, activated_at,
 				status, created_at, updated_at
@@ -389,7 +410,7 @@ func (r *Repository) UpsertScope(ctx context.Context, scope design.Scope) (desig
 		return design.Scope{}, false, fmt.Errorf("read design scope: %w", err)
 	default:
 		scope.ID = existingID
-		if _, err := r.pool.Exec(ctx, `
+		if _, err := q.Exec(ctx, `
 			UPDATE design_scope
 			SET status = 'active', activated_by_round_id = $2, activated_at = $3, updated_at = $4
 			WHERE id = $1
@@ -427,6 +448,27 @@ func (r *Repository) InsertDataPlanRevision(ctx context.Context, versionID, base
 		return design.CaseVersion{}, fmt.Errorf("begin data plan transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
+
+	// Serialize with case.graph_propose on the same requirement. The proposal
+	// path holds the advisory lock while it reads/updates the current pointer;
+	// taking it here prevents a data-plan revision from racing that snapshot and
+	// causing a duplicate (case_id, revision) or a lost pointer update.
+	var requirementID int64
+	if err := tx.QueryRow(ctx, `
+		SELECT s.requirement_id
+		FROM case_version cv
+		JOIN case_entity ce ON ce.id = cv.case_id
+		JOIN case_scenario s ON s.id = ce.scenario_id
+		WHERE cv.id = $1 AND s.version_id = $2
+	`, baseCaseVersionID, versionID).Scan(&requirementID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return design.CaseVersion{}, design.ErrNotFound
+		}
+		return design.CaseVersion{}, fmt.Errorf("resolve data plan requirement: %w", err)
+	}
+	if err := lockRequirement(ctx, tx, versionID, requirementID); err != nil {
+		return design.CaseVersion{}, err
+	}
 
 	var currentVersionID int64
 	var status string

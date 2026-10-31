@@ -8,6 +8,7 @@ import (
 
 	design "github.com/EdouardRichard/EzTest/backend/internal/design/domain"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // VersionTitle returns the version title used by exports.
@@ -22,12 +23,30 @@ func (r *Repository) VersionTitle(ctx context.Context, versionID int64) (string,
 	return title, nil
 }
 
+// pgxQuerier is the read surface shared by the pool and a transaction.
+type pgxQuerier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
 // ReadGraph assembles the full version design graph snapshot.
 func (r *Repository) ReadGraph(ctx context.Context, versionID int64) (design.GraphData, error) {
+	graph, err := readGraph(ctx, r.pool, versionID)
+	if err != nil {
+		return design.GraphData{}, err
+	}
+	if graph.PendingDesignCount, err = r.CountPendingDesign(ctx, versionID); err != nil {
+		return design.GraphData{}, err
+	}
+	return graph, nil
+}
+
+func readGraph(ctx context.Context, q pgxQuerier, versionID int64) (design.GraphData, error) {
 	graph := design.GraphData{VersionID: versionID, Requirements: []design.RequirementGraph{}}
 
 	var autoDesign bool
-	if err := r.pool.QueryRow(ctx, `
+	if err := q.QueryRow(ctx, `
 		SELECT auto_design_new_requirements FROM version WHERE id = $1
 	`, versionID).Scan(&autoDesign); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -37,13 +56,13 @@ func (r *Repository) ReadGraph(ctx context.Context, versionID int64) (design.Gra
 	}
 	graph.AutoDesignNewRequirements = autoDesign
 
-	activeScopes, err := r.activeRequirementIDs(ctx, versionID)
+	activeScopes, err := activeRequirementIDs(ctx, q, versionID)
 	if err != nil {
 		return design.GraphData{}, err
 	}
 
 	requirementIndex := map[int64]int{}
-	requirementRows, err := r.pool.Query(ctx, `
+	requirementRows, err := q.Query(ctx, `
 		SELECT r.id, r.version_id, r.current_version_id, rv.revision, rv.title, r.status,
 		       COALESCE(rv.target_version_suts, '[]'::jsonb)
 		FROM requirement r
@@ -97,7 +116,7 @@ func (r *Repository) ReadGraph(ctx context.Context, versionID int64) (design.Gra
 		scenario    int
 	}
 	scenarioIndex := map[int64]scenarioLocation{}
-	scenarioRows, err := r.pool.Query(ctx, `
+	scenarioRows, err := q.Query(ctx, `
 		SELECT id, version_id, requirement_id, requirement_version_id, name, description,
 		       COALESCE(version_sut_ids, '[]'::jsonb), COALESCE(page_ids, '[]'::jsonb),
 		       COALESCE(api_ids, '[]'::jsonb), sort_order, created_at, updated_at
@@ -132,7 +151,7 @@ func (r *Repository) ReadGraph(ctx context.Context, versionID int64) (design.Gra
 		return design.GraphData{}, fmt.Errorf("scan design graph scenarios: %w", err)
 	}
 
-	caseRows, err := r.pool.Query(ctx, `
+	caseRows, err := q.Query(ctx, `
 		SELECT ce.id, ce.scenario_id, ce.current_version_id, ce.status,
 		       ce.created_by, ce.created_by_run_id, ce.created_at, ce.updated_at,
 		       cv.id, cv.revision, cv.title, COALESCE(cv.description, ''), cv.priority,
@@ -207,15 +226,12 @@ func (r *Repository) ReadGraph(ctx context.Context, versionID int64) (design.Gra
 		graph.Stats.Scenarios += len(requirement.Scenarios)
 		requirement.DesignStatus = designStatus(*requirement, activeScopes)
 	}
-	if graph.PendingDesignCount, err = r.CountPendingDesign(ctx, versionID); err != nil {
-		return design.GraphData{}, err
-	}
 	return graph, nil
 }
 
 // activeRequirementIDs returns the requirement IDs with an active design scope.
-func (r *Repository) activeRequirementIDs(ctx context.Context, versionID int64) (map[int64]struct{}, error) {
-	rows, err := r.pool.Query(ctx, `
+func activeRequirementIDs(ctx context.Context, q pgxQuerier, versionID int64) (map[int64]struct{}, error) {
+	rows, err := q.Query(ctx, `
 		SELECT requirement_id FROM design_scope
 		WHERE version_id = $1 AND status = 'active'
 	`, versionID)
@@ -244,6 +260,12 @@ func designStatus(requirement design.RequirementGraph, activeScopes map[int64]st
 	hasDraft, hasConfirmed, allConfirmed := false, false, true
 	total := 0
 	for _, scenario := range requirement.Scenarios {
+		// Historical scenarios from older requirement versions are preserved for
+		// audit/export, but they must not make the current requirement look stale
+		// or draft forever. Only the current requirement version drives status.
+		if scenario.Scenario.RequirementVersionID != requirement.Requirement.CurrentVersionID {
+			continue
+		}
 		for _, item := range scenario.Cases {
 			total++
 			switch item.Current.Status {

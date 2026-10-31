@@ -7,10 +7,10 @@
     Starts an isolated API (no fake LLM), reads the acceptance-only provider
     config from .env (`llm_api_key`, `llm_base_url`, `llm_model_name`), writes a
     default llm_config through the admin API, refreshes the model catalog, and
-    runs the clarification flow against the real model. The API process still
-    reads only the four EZTEST_* variables.
+    runs the design flow against the real model. The API process still reads
+    only the four EZTEST_* variables.
 
-    Evidence: .tmp/p2-acceptance/llm.log
+    Evidence: .tmp/p2-acceptance/llm.log (full run) or llm-probe.log (-ProbeOnly).
 #>
 [CmdletBinding()]
 param(
@@ -24,6 +24,7 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $logDir = Join-Path $repoRoot ".tmp\p2-acceptance"
 $logFile = Join-Path $logDir "llm.log"
+if ($ProbeOnly) { $logFile = Join-Path $logDir "llm-probe.log" }
 $exePath = Join-Path $repoRoot ".tmp\p2\eztest.exe"
 $testDatabase = "eztest_v02_llm_e2e"
 $apiBase = "http://127.0.0.1:$ApiPort"

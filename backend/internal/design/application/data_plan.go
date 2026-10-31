@@ -15,6 +15,9 @@ import (
 
 // DataPlanInput is one design.data_plan_submit payload.
 type DataPlanInput struct {
+	// RequirementID is the injected tool scope. When set, the target case must
+	// belong to that requirement (P2 scope isolation).
+	RequirementID int64
 	Preconditions *string
 	TestData      json.RawMessage
 }
@@ -56,6 +59,12 @@ func (s *GraphService) SubmitDataPlan(ctx context.Context, versionID, caseVersio
 	detail, err := s.repo.ReadCase(ctx, versionID, current.CaseID, &caseVersionID)
 	if err != nil {
 		return DataPlanResult{}, mapDesignError(err, "case")
+	}
+	if in.RequirementID > 0 && detail.Requirement.ID != in.RequirementID {
+		return DataPlanResult{}, platform.Invalid("case_version_id", "case does not belong to the injected requirement scope")
+	}
+	if detail.Scenario.RequirementVersionID != detail.Requirement.CurrentVersionID {
+		return DataPlanResult{}, platform.StateConflict("the case is bound to an older requirement version")
 	}
 
 	now := s.clock.Now().UTC()

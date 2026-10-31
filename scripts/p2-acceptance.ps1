@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     P2 API acceptance runner (no browser) for EzTest 0.2.
@@ -679,17 +679,35 @@ try {
     if ([int]$detailAfterDesign.Json.data.pending_design_count -ne 0) { throw ("pending_design_count after design={0}, want 0" -f $detailAfterDesign.Json.data.pending_design_count) }
     StepPassed "create design conversation and wait for the initial mindmap"
 
-    Step "confirm one case and one scenario/requirement (idempotent)"
+    $scenarioID = $null
+    foreach ($requirement in (Get-Array $graph.requirements)) {
+        foreach ($scenario in (Get-Array $requirement.scenarios)) {
+            foreach ($case in (Get-Array $scenario.cases)) {
+                if ($case.status -eq "draft" -and [string]$case.case_id -ne $firstCaseID) {
+                    $scenarioID = [string]$scenario.id
+                    break
+                }
+            }
+            if ($null -ne $scenarioID) { break }
+        }
+        if ($null -ne $scenarioID) { break }
+    }
+    if ($null -eq $scenarioID) { throw "no scenario with a second draft case for scenario-scope confirmation" }
+
+    Step "confirm one case, one scenario and one requirement (idempotent)"
     $confirmCase = Invoke-Api -Method "POST" -Path "/api/versions/$versionID/design/confirmations" -Token $token -Body @{ scope = "case"; target_id = $firstCaseID }
     Assert-Status $confirmCase @(200) "confirm case"
     if ((Get-Array $confirmCase.Json.data.confirmed).Count -ne 1) { throw "case confirmation did not confirm one version" }
     $replay = Invoke-Api -Method "POST" -Path "/api/versions/$versionID/design/confirmations" -Token $token -Body @{ scope = "case"; target_id = $firstCaseID }
     Assert-Status $replay @(200) "idempotent case confirmation"
     if ((Get-Array $replay.Json.data.confirmed).Count -ne 0) { throw "repeated case confirmation was not idempotent" }
+    $confirmScenario = Invoke-Api -Method "POST" -Path "/api/versions/$versionID/design/confirmations" -Token $token -Body @{ scope = "scenario"; target_id = $scenarioID }
+    Assert-Status $confirmScenario @(200) "confirm scenario scope"
+    if ((Get-Array $confirmScenario.Json.data.confirmed).Count -lt 1) { throw "scenario confirmation confirmed no draft case" }
     $confirmRequirement = Invoke-Api -Method "POST" -Path "/api/versions/$versionID/design/confirmations" -Token $token -Body @{ scope = "requirement"; target_id = $requirementIDs[1] }
     Assert-Status $confirmRequirement @(200) "confirm requirement scope"
     if ((Get-Array $confirmRequirement.Json.data.confirmed).Count -lt 1) { throw "requirement confirmation confirmed no draft case" }
-    StepPassed "confirm one case and one scenario/requirement (idempotent)"
+    StepPassed "confirm one case, one scenario and one requirement (idempotent)"
 
     Step "design chat modifies the confirmed case, then user confirms the new draft"
     $message = Invoke-Api -Method "POST" -Path "/api/versions/$versionID/conversations/$conversationID/messages" -Token $token -Body @{

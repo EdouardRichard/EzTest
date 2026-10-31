@@ -117,6 +117,7 @@ func (a *Adapter) SubmitDataPlan(ctx context.Context, versionID, caseVersionID i
 		return nil, fmt.Errorf("designadapter: design graph service is not configured")
 	}
 	result, err := a.graph.SubmitDataPlan(ctx, versionID, caseVersionID, runID, designapp.DataPlanInput{
+		RequirementID: in.RequirementID,
 		Preconditions: in.Preconditions,
 		TestData:      append(json.RawMessage(nil), in.TestData...),
 	})

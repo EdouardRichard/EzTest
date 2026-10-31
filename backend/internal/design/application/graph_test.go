@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -260,11 +261,54 @@ func TestReadGraphIncludesStaleAndCounts(t *testing.T) {
 	}
 }
 
+func TestCheckAccumulatedLimitsRejectsNewScenarioOverCap(t *testing.T) {
+	scenarios := make([]design.Scenario, 0, design.DefaultLimits.MaxScenariosPerRequirement)
+	scenarioByKey := map[string]design.Scenario{}
+	for index := 0; index < design.DefaultLimits.MaxScenariosPerRequirement; index++ {
+		scenario := design.Scenario{
+			ID: int64(index + 1), RequirementVersionID: 3002,
+			Name: fmt.Sprintf("场景 %d", index),
+		}
+		scenarios = append(scenarios, scenario)
+		scenarioByKey[design.ScenarioNaturalKey(3002, scenario.Name)] = scenario
+	}
+	in := ProposeInput{
+		RequirementID: 3001, RequirementVersionID: 3002,
+		Scenarios: []ScenarioInput{{Ref: "s1", Name: "新场景"}},
+	}
+	err := checkAccumulatedLimits(in, design.RequirementSnapshot{Scenarios: scenarios}, scenarioByKey, nil)
+	if err == nil {
+		t.Fatal("accumulated scenario cap was not enforced")
+	}
+}
+
+func TestCheckAccumulatedLimitsRejectsNewCaseOverCap(t *testing.T) {
+	scenario := design.Scenario{ID: 5001, RequirementVersionID: 3002, Name: "场景"}
+	cases := make([]design.CaseWithCurrent, 0, design.DefaultLimits.MaxCasesPerRequirement)
+	caseByKey := map[string]design.CaseWithCurrent{}
+	for index := 0; index < design.DefaultLimits.MaxCasesPerRequirement; index++ {
+		title := fmt.Sprintf("用例 %d", index)
+		cases = append(cases, design.CaseWithCurrent{Case: design.CaseEntity{ID: int64(index + 1), ScenarioID: 5001}})
+		caseByKey[design.CaseNaturalKey(5001, title)] = design.CaseWithCurrent{}
+	}
+	in := ProposeInput{
+		RequirementID: 3001, RequirementVersionID: 3002,
+		Scenarios: []ScenarioInput{{Ref: "s1", Name: "场景"}},
+		Cases:     []CaseInput{{Ref: "c1", ScenarioRef: "s1", Title: "新用例"}},
+	}
+	err := checkAccumulatedLimits(in, design.RequirementSnapshot{
+		Scenarios: []design.Scenario{scenario}, Cases: cases,
+	}, map[string]design.Scenario{design.ScenarioNaturalKey(3002, "场景"): scenario}, caseByKey)
+	if err == nil {
+		t.Fatal("accumulated case cap was not enforced")
+	}
+}
+
 func TestGetCaseAndOverview(t *testing.T) {
 	repo := newFakeRepo()
 	repo.caseData = design.CaseData{
 		Case:        design.CaseEntity{ID: 7001, ScenarioID: 5001, CurrentVersionID: int64Ptr(7002), Status: design.CaseStatusDraft},
-		Scenario:    design.Scenario{ID: 5001, Name: "正常登录"},
+		Scenario:    design.Scenario{ID: 5001, Name: "正常登录", RequirementVersionID: repo.requirement.CurrentVersionID},
 		Requirement: repo.requirement,
 		Versions:    []design.CaseVersionSummary{{ID: 7002, Revision: 1, Status: design.CaseStatusDraft, Title: "登录成功"}},
 		Selected: design.CaseVersion{
@@ -294,6 +338,25 @@ func TestGetCaseAndOverview(t *testing.T) {
 	}
 	if overview.ActiveRound == nil || overview.ActiveRound.ID != 8001 || overview.ActiveRound.RoundNo != 1 {
 		t.Fatalf("overview = %+v", overview)
+	}
+}
+
+func TestGetCaseConfirmableRequiresCurrentRequirementVersion(t *testing.T) {
+	repo := newFakeRepo()
+	repo.caseData = design.CaseData{
+		Case:        design.CaseEntity{ID: 7001, ScenarioID: 5001, CurrentVersionID: int64Ptr(7002), Status: design.CaseStatusDraft},
+		Scenario:    design.Scenario{ID: 5001, Name: "旧场景", RequirementVersionID: repo.requirement.CurrentVersionID - 1},
+		Requirement: repo.requirement,
+		Versions:    []design.CaseVersionSummary{{ID: 7002, Revision: 1, Status: design.CaseStatusDraft}},
+		Selected:    design.CaseVersion{ID: 7002, CaseID: 7001, Revision: 1, Status: design.CaseStatusDraft, Title: "旧草案"},
+	}
+	service := NewGraphService(repo, &fakeIDs{}, newFixedClock(), nil, nil, &fakeTeamRoom{})
+	detail, err := service.GetCase(context.Background(), 1001, 7001, nil)
+	if err != nil {
+		t.Fatalf("GetCase: %v", err)
+	}
+	if detail.Confirmable {
+		t.Fatal("old requirement-version draft must not be confirmable")
 	}
 }
 

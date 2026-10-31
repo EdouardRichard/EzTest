@@ -11,7 +11,8 @@ import (
 
 // proposeTx is the design.Tx implementation backed by one pgx transaction.
 type proposeTx struct {
-	tx pgx.Tx
+	tx        pgx.Tx
+	versionID int64
 }
 
 var _ design.Tx = (*proposeTx)(nil)
@@ -27,13 +28,23 @@ func (r *Repository) WithRequirementLock(ctx context.Context, versionID, require
 	if err := lockRequirement(ctx, tx, versionID, requirementID); err != nil {
 		return err
 	}
-	if err := fn(ctx, &proposeTx{tx: tx}); err != nil {
+	if err := fn(ctx, &proposeTx{tx: tx, versionID: versionID}); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit design proposal transaction: %w", err)
 	}
 	return nil
+}
+
+// CurrentGraphHash computes the graph hash from the transaction snapshot, so a
+// base_graph_hash read can be revalidated atomically under the requirement lock.
+func (t *proposeTx) CurrentGraphHash(ctx context.Context) (string, error) {
+	graph, err := readGraph(ctx, t.tx, t.versionID)
+	if err != nil {
+		return "", err
+	}
+	return design.ComputeGraphHash(graph.Requirements)
 }
 
 // RequirementSnapshot loads the scenarios of one requirement version and the
@@ -78,7 +89,10 @@ func (t *proposeTx) RequirementSnapshot(ctx context.Context, versionID, requirem
 		       cv.id, cv.revision, cv.title, cv.description, cv.preconditions, cv.test_data, cv.priority,
 		       cv.default_version_sut_id, COALESCE(cv.version_sut_ids, '[]'::jsonb),
 		       COALESCE(cv.page_ids, '[]'::jsonb), COALESCE(cv.api_ids, '[]'::jsonb),
-		       cv.status, cv.content_hash, cv.created_at
+		       cv.status, cv.content_hash, cv.created_at,
+		       (SELECT count(*) FROM case_step step WHERE step.case_version_id = cv.id),
+		       (SELECT count(*) FROM case_assertion assertion WHERE assertion.case_version_id = cv.id),
+		       (SELECT count(*) FROM case_source source WHERE source.case_version_id = cv.id)
 		FROM case_entity ce
 		JOIN case_version cv ON cv.id = ce.current_version_id
 		WHERE ce.scenario_id = ANY($1)
@@ -289,6 +303,7 @@ func scanCaseWithCurrent(row pgx.Row) (design.CaseWithCurrent, error) {
 		&current.ID, &current.Revision, &current.Title, &current.Description, &current.Preconditions,
 		&testData, &current.Priority, &defaultSUT, &suts, &pages, &apis,
 		&current.Status, &current.ContentHash, &current.CreatedAt,
+		&current.StepCount, &current.AssertionCount, &current.SourceCount,
 	); err != nil {
 		return design.CaseWithCurrent{}, err
 	}
@@ -316,7 +331,10 @@ const caseWithCurrentQuery = `
 	       cv.id, cv.revision, cv.title, cv.description, cv.preconditions, cv.test_data, cv.priority,
 	       cv.default_version_sut_id, COALESCE(cv.version_sut_ids, '[]'::jsonb),
 	       COALESCE(cv.page_ids, '[]'::jsonb), COALESCE(cv.api_ids, '[]'::jsonb),
-	       cv.status, cv.content_hash, cv.created_at
+	       cv.status, cv.content_hash, cv.created_at,
+	       (SELECT count(*) FROM case_step step WHERE step.case_version_id = cv.id),
+	       (SELECT count(*) FROM case_assertion assertion WHERE assertion.case_version_id = cv.id),
+	       (SELECT count(*) FROM case_source source WHERE source.case_version_id = cv.id)
 	FROM case_entity ce
 	JOIN case_version cv ON cv.id = ce.current_version_id
 	JOIN case_scenario s ON s.id = ce.scenario_id

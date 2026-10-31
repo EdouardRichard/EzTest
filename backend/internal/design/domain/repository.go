@@ -174,6 +174,7 @@ type GraphRepository interface {
 
 // Tx is the write surface of one requirement-scoped advisory-lock transaction.
 type Tx interface {
+	CurrentGraphHash(ctx context.Context) (string, error)
 	RequirementSnapshot(ctx context.Context, versionID, requirementID, requirementVersionID int64) (RequirementSnapshot, error)
 	InsertScenario(ctx context.Context, scenario Scenario) (Scenario, error)
 	UpdateScenario(ctx context.Context, scenario Scenario) (Scenario, error)

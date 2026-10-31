@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     P2 real-LLM browser E2E (DeepSeek endpoint, no fake model).
@@ -154,6 +154,7 @@ try {
     $env:EZTEST_E2E_LLM_KEY = $llmKey
     $env:EZTEST_E2E_LLM_TIMEOUT_SECONDS = "300"
     $env:EZTEST_E2E_CASE_TIMEOUT_MS = "240000"
+    $env:EZTEST_E2E_SCREENSHOT_DIR = (Join-Path $logDir "screenshots-llm")
     Push-Location (Join-Path $repoRoot "frontend")
     $previousPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"

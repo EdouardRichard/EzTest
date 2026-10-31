@@ -42,6 +42,15 @@ type ConfirmResult struct {
 	ConfirmedAt time.Time
 }
 
+// countOrLen prefers a projection count and falls back to the loaded slice for
+// fakes/legacy reads that do not materialize the count columns.
+func countOrLen(count, length int) int {
+	if count > 0 {
+		return count
+	}
+	return length
+}
+
 // Confirm freezes the selected draft case versions in one transaction. The
 // selection universe is case / scenario / requirement (spec §4.5).
 func (s *GraphService) Confirm(ctx context.Context, versionID int64, in ConfirmInput, actorID int64) (ConfirmResult, error) {
@@ -97,6 +106,13 @@ func (s *GraphService) Confirm(ctx context.Context, versionID int64, in ConfirmI
 			item, err := tx.Case(ctx, target.CaseID)
 			if err != nil {
 				return err
+			}
+			scenario, err := tx.Scenario(ctx, item.Case.ScenarioID)
+			if err != nil {
+				return err
+			}
+			if scenario.RequirementVersionID != requirement.CurrentVersionID {
+				return platform.Invalid("target_id", "the case is bound to an older requirement version")
 			}
 			candidates = []design.CaseWithCurrent{item}
 		case design.ConfirmScopeScenario:
@@ -165,9 +181,9 @@ func (s *GraphService) Confirm(ctx context.Context, versionID int64, in ConfirmI
 			snapshot := map[string]any{
 				"title":           item.Current.Title,
 				"priority":        item.Current.Priority,
-				"step_count":      len(item.Current.Steps),
-				"assertion_count": len(item.Current.Assertions),
-				"source_count":    len(item.Current.Sources),
+				"step_count":      countOrLen(item.Current.StepCount, len(item.Current.Steps)),
+				"assertion_count": countOrLen(item.Current.AssertionCount, len(item.Current.Assertions)),
+				"source_count":    countOrLen(item.Current.SourceCount, len(item.Current.Sources)),
 				"content_hash":    item.Current.ContentHash,
 			}
 			confirmation := design.Confirmation{

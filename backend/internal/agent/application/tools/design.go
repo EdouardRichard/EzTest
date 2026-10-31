@@ -125,6 +125,7 @@ type ReviewInput struct {
 // DataPlanInput is the parsed design.data_plan_submit payload. Nil fields mean
 // "not provided" so the service keeps the current draft value.
 type DataPlanInput struct {
+	RequirementID int64
 	Preconditions *string
 	TestData      json.RawMessage
 }
@@ -278,6 +279,13 @@ func (t *designGraphRead) Execute(ctx context.Context, scope Scope, raw json.Raw
 	result, err := t.deps.Design.ReadGraph(ctx, scope.VersionID, requirementID, caseID)
 	if err != nil {
 		return nil, mapPortError(err)
+	}
+	if caseID > 0 && requirementID > 0 {
+		if detail, ok := result.(map[string]any); ok {
+			if got, _ := detail["requirement_id"].(string); got != "" && got != fmt.Sprintf("%d", requirementID) {
+				return nil, Invalid("case_id", "case does not belong to the injected requirement scope")
+			}
+		}
 	}
 	return result, nil
 }
@@ -439,7 +447,7 @@ func (t *designDataPlanSubmit) Execute(ctx context.Context, scope Scope, raw jso
 		testData = append(json.RawMessage(nil), trimmed...)
 	}
 	result, portErr := t.deps.Design.SubmitDataPlan(ctx, scope.VersionID, caseVersionID, scope.AgentRunID, DataPlanInput{
-		Preconditions: preconditions, TestData: testData,
+		RequirementID: scope.RequirementID, Preconditions: preconditions, TestData: testData,
 	})
 	if portErr != nil {
 		return nil, mapPortError(portErr)

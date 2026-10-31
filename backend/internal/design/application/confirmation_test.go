@@ -70,6 +70,26 @@ func TestConfirmCaseIdempotent(t *testing.T) {
 	}
 }
 
+func TestConfirmCaseRejectsOldRequirementVersionDraft(t *testing.T) {
+	service, repo, _, _ := newConfirmFixture(t)
+	seedFakeCase(t, repo, 7001, 5001, "旧草案", design.CaseStatusDraft)
+	repo.requirement.CurrentVersionID = 3003
+
+	_, err := service.Confirm(context.Background(), 1001, ConfirmInput{
+		Scope: design.ConfirmScopeCase, TargetID: 7001,
+	}, 42)
+	if err == nil {
+		t.Fatal("Confirm accepted a case bound to an older requirement version")
+	}
+	var apiErr *platform.Error
+	if !errors.As(err, &apiErr) || apiErr.Code != "invalid_argument" {
+		t.Fatalf("Confirm error = %v, want invalid_argument", err)
+	}
+	if len(repo.confirmations) != 0 {
+		t.Fatalf("confirmation rows = %d, want 0", len(repo.confirmations))
+	}
+}
+
 func TestConfirmScenarioConfirmsOnlyDrafts(t *testing.T) {
 	service, repo, _, _ := newConfirmFixture(t)
 	seedFakeCase(t, repo, 7001, 5001, "用例一", design.CaseStatusDraft)
@@ -107,7 +127,7 @@ func TestConfirmScenarioConfirmsOnlyDrafts(t *testing.T) {
 		if len(confirmation.AffectedCaseVersionIDs) != 2 {
 			t.Fatalf("affected ids = %v", confirmation.AffectedCaseVersionIDs)
 		}
-		if confirmation.Snapshot["title"] == nil || confirmation.Snapshot["step_count"] == nil {
+		if confirmation.Snapshot["title"] == nil || confirmation.Snapshot["step_count"] != 1 {
 			t.Fatalf("snapshot = %v", confirmation.Snapshot)
 		}
 	}
