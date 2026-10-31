@@ -278,10 +278,6 @@ func (f *fakeRepo) InsertDataPlanRevision(_ context.Context, versionID, baseCase
 	return copied, nil
 }
 
-func (f *fakeRepo) GetLatestRound(context.Context, int64) (*design.Round, error) {
-	return f.latestRound, nil
-}
-
 // seedFakeCase inserts a case with a deterministic version history. The last
 // version is the current one.
 func seedFakeCase(t *testing.T, repo *fakeRepo, caseID, scenarioID int64, title string, statuses ...string) {
