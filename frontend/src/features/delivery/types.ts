@@ -1,5 +1,5 @@
 /**
- * Wire types for the P4 delivery issue tab (spec §9.2).
+ * Wire types for the P4 delivery issue/report tabs (spec §9.2–§9.3).
  *
  * Field names and enum values are pinned by the frozen P4 OpenAPI contract:
  * IDs are decimal strings, timestamps are RFC3339 UTC, list endpoints use
@@ -87,7 +87,83 @@ export type IssueDetailView = IssueView & {
   related_refs: Record<string, number>
 }
 
+/* --------------------------------- reports --------------------------------- */
+
+export type ReportKind = "wave" | "version"
+
+export type ReportStatus = "draft" | "published" | "stale"
+
+export type ReportRenderStatus = "pending" | "running" | "done" | "failed"
+
+/** `ReportRevisionView`: one append-only immutable revision (spec §9.3). */
+export type ReportRevisionView = {
+  id: string
+  report_id: string
+  revision: number
+  status: ReportStatus
+  as_of: string
+  input_fingerprint: string
+  template_version: string
+  render_status: ReportRenderStatus
+  /** Published + render done + html_ref present. */
+  html_available: boolean
+  /** P4 always false; PDF belongs to P7. */
+  pdf_available: boolean
+  created_at: string
+}
+
+/** `ReportView`: list row / detail header. */
+export type ReportView = {
+  id: string
+  version_id: string
+  wave_id?: string | null
+  kind: ReportKind
+  status: ReportStatus
+  input_fingerprint?: string | null
+  current_revision?: ReportRevisionView | null
+  created_at: string
+  updated_at: string
+}
+
+/** Report-to-entity reference carried by the detail projection. */
+export type ReportRefKind =
+  | "requirement"
+  | "scenario"
+  | "case_version"
+  | "wave"
+  | "case_run"
+  | "issue"
+  | "version_sut"
+
+export type ReportRefView = {
+  kind: ReportRefKind
+  ref_id: string
+}
+
+/** `ReportDetailView`: `ReportView` + revisions + refs. */
+export type ReportDetailView = ReportView & {
+  revisions: ReportRevisionView[]
+  refs: ReportRefView[]
+}
+
+/** `RegenerateReportResult` from the 202 response. */
+export type RegenerateReportResult = {
+  report_id: string
+  revision: number
+  work_item_id?: string | null
+}
+
 /* --------------------------------- requests -------------------------------- */
+
+export type ReportListOptions = {
+  kind?: ReportKind
+  before?: string
+  limit?: number
+}
+
+export type RegenerateReportInput = {
+  reason?: string
+}
 
 export type IssueListOptions = {
   status?: IssueStatus
@@ -161,4 +237,34 @@ export const ISSUE_ACTOR_LABELS: Record<IssueActorKind, string> = {
   user: "用户",
   agent: "代理",
   system: "系统",
+}
+
+/* ------------------------------- report labels ------------------------------ */
+
+export const REPORT_KIND_LABELS: Record<ReportKind, string> = {
+  version: "版本总结",
+  wave: "波次报告",
+}
+
+export const REPORT_STATUS_LABELS: Record<ReportStatus, string> = {
+  draft: "草稿",
+  published: "已发布",
+  stale: "已过期",
+}
+
+export const REPORT_RENDER_STATUS_LABELS: Record<ReportRenderStatus, string> = {
+  pending: "待生成",
+  running: "生成中",
+  done: "已完成",
+  failed: "生成失败",
+}
+
+export const REPORT_REF_LABELS: Record<ReportRefKind, string> = {
+  requirement: "需求",
+  scenario: "场景",
+  case_version: "用例版本",
+  wave: "波次",
+  case_run: "用例运行",
+  issue: "问题",
+  version_sut: "SUT",
 }
