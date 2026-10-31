@@ -59,14 +59,14 @@
 | `docs/design/frontend-design.md` | 前端详细设计 | 详细设计（从属于主蓝图） | 前端/交互/UI |
 | `docs/design/auth-session-model.md` | 账号/会话详细设计 | 详细设计（从属于主蓝图） | 资源/执行前置/账号安全 |
 | `docs/design/system-overview.md` | 早期版本（已归档） | 非权威；不得用于设计决策 | 仅查历史 |
-| `docs/superpowers/specs/` | 阶段设计规格（P0 起） | 阶段实现依据（从属于主蓝图；冲突以主蓝图为准） | 实现某 Phase 前 |
+| `docs/superpowers/specs/` | 阶段设计规格（0.1-P0 起） | 阶段实现依据（从属于主蓝图；冲突以主蓝图为准） | 实现某 Phase 前 |
 | `docs/Pre-Research/`（ARTEX 研究） | 研究/借鉴参考 | 参考（非设计权威）；不得复制源码 | 需要 ARTEX 设计/实现参考时 |
 | 计划/排期/进度类文档（若有） | 实施规划 | **非设计权威**；不得作为设计依据、验收约束或阶段限制 | 仅排期参考 |
 | `LICENSE` + 本地 ARTEX 参考仓库 | 许可与参考实现 | Apache-2.0 / AGPL-3.0 合规边界 | 引入依赖、参考 ARTEX 实现时 |
 
 > 本表即设计文档地图；新增/删除设计文档时更新本表，不另设 README 索引。
 >
-> **阶段编号约定**：`P0–P8` 仅指 `implementation-phases.md` 的实施阶段；其他详细设计的局部里程碑使用独立前缀（`CI-Mx` 代码智能、`AS-Mx` 账号会话），不得复用 `P0–P8`。前端交付归属见 `implementation-phases.md` §2.9。
+> **阶段编号约定**：本文件其余 `P0–P8` 编号均指 **EzTest 0.1** 的 `implementation-phases.md` 实施阶段（0.2 阶段定义见 `docs/version-V0.2/implementation-phase-plan.md`）；其他详细设计的局部里程碑使用独立前缀（`CI-Mx` 代码智能、`AS-Mx` 账号会话），不得复用 `P0–P8`。前端交付归属见 `implementation-phases.md` §2.9。
 
 **按任务查询指引**（章节号以文档实际为准）：
 
@@ -104,6 +104,8 @@
 
 ### 6.1 目录结构（唯一形态）
 
+> **阶段编号说明（2026-11-01）**：本节目录树与 P1–P7 段落中的 P 编号指 **EzTest 0.1** 的阶段（`docs/design/system-blueprint.md` 时代），**不是** `docs/version-V0.2` 的 P0–P8 实施阶段。0.2 的阶段定义见 `docs/version-V0.2/implementation-phase-plan.md`；本节相关段落与目录树注释已加 `0.1-` 前缀。
+
 ```text
 EzTest/
 ├─ backend/
@@ -125,37 +127,37 @@ EzTest/
 │     ├─ llm/                         # 限界上下文：LLM 配置/网关/模型目录
 │     ├─ storage/                     # 限界上下文：对象存储
 │     ├─ audit/                       # 限界上下文：审计
-│     ├─ agent/                       # 限界上下文：Agent 运行时（P1）
+│     ├─ agent/                       # 限界上下文：Agent 运行时（0.1-P1）
 │        ├─ domain/                   # profile/session/run/message/activity/tool
 │        ├─ application/              # run 循环、上下文组装、工具管线、端口
 │        ├─ infrastructure/           # {postgres,llm,eventing,audit,tools}
 │        └─ interfaces/httpapi/       # /api/agents/* handler、DTO
-│     ├─ resource/                    # 限界上下文：公共资源与身份（P2）
+│     ├─ resource/                    # 限界上下文：公共资源与身份（0.1-P2）
 │     │  ├─ domain/                   # company/system/environment/appmodel/account/access/session/snapshot/lease/takeover/coderepo
 │     │  ├─ application/              # catalog/access/session/coderepo 服务、ports
 │     │  ├─ infrastructure/           # {postgres,httpcheck,gitexec}
 │     │  └─ interfaces/httpapi/       # /api/resources/* handler、DTO
-│     ├─ version/                     # 限界上下文：版本/多需求/澄清（P3，D31）
+│     ├─ version/                     # 限界上下文：版本/多需求/澄清（0.1-P3，D31）
 │        ├─ domain/                   # version/requirement/relation/attachment/clarification/decision
 │        ├─ application/              # version/requirement/relation/clarification/attachment 服务、agent_tool、ports
 │        ├─ infrastructure/           # {postgres,filestore,gitread,agent,eventing,resource}
 │        └─ interfaces/httpapi/       # /api/versions/* handler、DTO
-│     ├─ codeintel/                   # 限界上下文：代码智能（P4，D32/D33）
+│     ├─ codeintel/                   # 限界上下文：代码智能（0.1-P4，D32/D33）
 │        ├─ domain/                   # entity/edge/change_set/analysis/fact_version/anchor/evidence/contract/limits
 │        ├─ application/              # index/analysis/impact/anchor 服务、run_worker、prompt/parser、agent_tool、ports
 │        ├─ infrastructure/           # {gitx,postgres,llm,eventing,resource,version,audit}
 │        └─ interfaces/httpapi/       # /api/code/*、/api/versions/{id}/code/* handler、DTO
-│     ├─ mindmap/                     # 限界上下文：用例脑图与评审（P5，D35）
+│     ├─ mindmap/                     # 限界上下文：用例脑图与评审（0.1-P5，D35）
 │        ├─ domain/                   # node/step/assertion/source/review/finding/baseline/run/export、规则、错误、提示词常量
 │        ├─ application/              # graph/materialize/review/baseline/export/explore/run 服务、ports
 │        ├─ infrastructure/           # {postgres,filestore,http,eventing,version,resource,codeintel,agent,audit}
 │        └─ interfaces/httpapi/       # /api/versions/{versionId}/mindmap/* handler、DTO
-│     ├─ execution/                   # 限界上下文：执行引擎与证据（P6，D39/D40）
+│     ├─ execution/                   # 限界上下文：执行引擎与证据（0.1-P6，D39/D40）
 │        ├─ domain/                   # batch/case_run/step_result/assertion_result/evidence/snapshot/verdict/classification/pause/checkpoint/report、提示词常量
 │        ├─ application/              # batch/evidence/report 服务、scheduler/case_runner/recorder/recovery、agent_tool、ports
 │        ├─ infrastructure/           # {postgres,filestore,browser,agent,mindmap,resource,version,eventing,audit}
 │        └─ interfaces/httpapi/       # /api/versions/{id}/{batches,evidence,execution/sessions} handler、DTO
-│     └─ delivery/                    # 限界上下文：问题/报告/分析（P7，D43–D52）
+│     └─ delivery/                    # 限界上下文：问题/报告/分析（0.1-P7，D43–D52）
 │        ├─ domain/                   # issue/report/analysis/dedupe/stale/diff/constants/errors
 │        ├─ application/              # issue/report/analysis 服务、agent_tool、ports
 │        ├─ infrastructure/           # {postgres,filestore,agent,eventing,audit,refs,report,codeintel,mindmap,version}
@@ -182,26 +184,26 @@ EzTest/
 │  ├─ e2e.ps1                         # Playwright E2E（fake 上游）
 │  └─ acceptance-agent-llm.ps1        # gated 真实 LLM 验收
 ├─ docs/openapi/api.yaml              # OpenAPI 契约
-├─ docs/superpowers/specs/            # 阶段设计规格（P0 起）
+├─ docs/superpowers/specs/            # 阶段设计规格（0.1-P0 起）
 ├─ .env.example  .gitignore
 └─ .tools/                            # 便携 Go/PostgreSQL（gitignored）
 ```
 
 每个限界上下文**必须**四层齐全：`domain/`、`application/`、`infrastructure/`、`interfaces/httpapi/`。上下文名使用小写单数（`identity`、`eventing`、`llm`、`storage`、`audit`、`agent`、`resource`、`version`、`codeintel`、`mindmap`、`execution`、`delivery`），不得新建 `utils/`、`common/`、`helpers/` 之类杂物目录；共享纯逻辑放 `internal/platform/`。
 
-P1 新增的 `agent` 上下文位于 `backend/internal/agent/`：`infrastructure/` 含 `postgres`、`llm`、`eventing`、`audit`、`tools` 适配，`interfaces/httpapi/` 暴露 `/api/agents/*`。P3 兼容扩展：Agent 会话新增可选 `activity_channel`（澄清会话为 `version:{id}`；默认回退 `agent:{session_id}` 不变），run 支持文本 + `image_ref` 多模态输入。
+P1 新增的 `agent` 上下文位于 `backend/internal/agent/`（**0.1-P1**）：`infrastructure/` 含 `postgres`、`llm`、`eventing`、`audit`、`tools` 适配，`interfaces/httpapi/` 暴露 `/api/agents/*`。P3 兼容扩展：Agent 会话新增可选 `activity_channel`（澄清会话为 `version:{id}`；默认回退 `agent:{session_id}` 不变），run 支持文本 + `image_ref` 多模态输入。
 
-P2 新增的 `resource` 上下文位于 `backend/internal/resource/`：承载公共资源与身份（D28），`infrastructure/` 含 `postgres`、`httpcheck`、`gitexec` 适配，`interfaces/httpapi/` 暴露 `/api/resources/*`。
+P2 新增的 `resource` 上下文位于 `backend/internal/resource/`（**0.1-P2**）：承载公共资源与身份（D28），`infrastructure/` 含 `postgres`、`httpcheck`、`gitexec` 适配，`interfaces/httpapi/` 暴露 `/api/resources/*`。
 
-P3 新增的 `version` 上下文位于 `backend/internal/version/`：承载版本/多需求/澄清（D31），四层齐全；`infrastructure/` 含 `postgres`、`filestore`、`gitread`、`agent`、`eventing`、`resource` 适配，`interfaces/httpapi/` 暴露 `/api/versions/*`。主键由 `backend/internal/platform/id/snowflake.go` 生成（D29），需求附件走文件系统（D30）；前端 feature 位于 `frontend/src/features/versions/`。
+P3 新增的 `version` 上下文位于 `backend/internal/version/`（**0.1-P3**）：承载版本/多需求/澄清（D31），四层齐全；`infrastructure/` 含 `postgres`、`filestore`、`gitread`、`agent`、`eventing`、`resource` 适配，`interfaces/httpapi/` 暴露 `/api/versions/*`。主键由 `backend/internal/platform/id/snowflake.go` 生成（D29），需求附件走文件系统（D30）；前端 feature 位于 `frontend/src/features/versions/`。
 
-P4 新增的 `codeintel` 上下文位于 `backend/internal/codeintel/`：承载代码理解与影响分析（D32/D33），四层齐全；`infrastructure/` 含 `gitx`、`postgres`、`llm`、`eventing`、`resource`、`version`、`audit` 适配，`interfaces/httpapi/` 暴露仓库级 `/api/code/*` 与版本级 `/api/versions/{id}/code/*`。新增 9 表（雪花 `BIGINT` 主键；`repo_id`/`version_id`/`requirement_id`/`app_model_id` 均为逻辑引用、不建跨上下文 FK）；分析/索引为异步 run（202 + 轮询 + `version:{id}` SSE），复用 P0 LLM 网关，不新增 Agent profile（仅注册 `code_*` 只读工具薄壳，P3 `code.tree`/`code.read` 契约不变）；前端 feature 位于 `frontend/src/features/code-intel/`。
+P4 新增的 `codeintel` 上下文位于 `backend/internal/codeintel/`（**0.1-P4**）：承载代码理解与影响分析（D32/D33），四层齐全；`infrastructure/` 含 `gitx`、`postgres`、`llm`、`eventing`、`resource`、`version`、`audit` 适配，`interfaces/httpapi/` 暴露仓库级 `/api/code/*` 与版本级 `/api/versions/{id}/code/*`。新增 9 表（雪花 `BIGINT` 主键；`repo_id`/`version_id`/`requirement_id`/`app_model_id` 均为逻辑引用、不建跨上下文 FK）；分析/索引为异步 run（202 + 轮询 + `version:{id}` SSE），复用 P0 LLM 网关，不新增 Agent profile（仅注册 `code_*` 只读工具薄壳，P3 `code.tree`/`code.read` 契约不变）；前端 feature 位于 `frontend/src/features/code-intel/`。
 
-P5 新增的 `mindmap` 上下文位于 `backend/internal/mindmap/`：承载用例脑图与评审（D35），四层齐全；`infrastructure/` 含 `postgres`（9 表仓储）、`filestore`（导出物）、`http`（应用探索 HTTP 客户端）、`eventing`、`version`（状态端口适配）、`resource`（应用模型/环境/Session 端口适配）、`codeintel`（事实/锚点/影响端口适配）、`agent`（run 启动/查询端口适配）、`audit` 适配，`interfaces/httpapi/` 暴露 `/api/versions/{versionId}/mindmap/*`。新增 9 张 `case_*` 表：`case_node`/`case_step`/`case_assertion`/`case_source`/`case_review`/`case_review_finding`/`case_baseline`/`case_design_run`/`case_export`（雪花 `BIGINT` 主键 D29；表名/索引名遵循 §6.9/D34，审计列沿用 `created_at/updated_at` 的 D34 显式例外）。导出物走文件系统（D30），`case` 锚点经 codeintel `AnchorService`（D37）；前端 feature 位于 `frontend/src/features/mindmap/`，页面路由 `/versions/[id]/mindmap`。
+P5 新增的 `mindmap` 上下文位于 `backend/internal/mindmap/`（**0.1-P5**）：承载用例脑图与评审（D35），四层齐全；`infrastructure/` 含 `postgres`（9 表仓储）、`filestore`（导出物）、`http`（应用探索 HTTP 客户端）、`eventing`、`version`（状态端口适配）、`resource`（应用模型/环境/Session 端口适配）、`codeintel`（事实/锚点/影响端口适配）、`agent`（run 启动/查询端口适配）、`audit` 适配，`interfaces/httpapi/` 暴露 `/api/versions/{versionId}/mindmap/*`。新增 9 张 `case_*` 表：`case_node`/`case_step`/`case_assertion`/`case_source`/`case_review`/`case_review_finding`/`case_baseline`/`case_design_run`/`case_export`（雪花 `BIGINT` 主键 D29；表名/索引名遵循 §6.9/D34，审计列沿用 `created_at/updated_at` 的 D34 显式例外）。导出物走文件系统（D30），`case` 锚点经 codeintel `AnchorService`（D37）；前端 feature 位于 `frontend/src/features/mindmap/`，页面路由 `/versions/[id]/mindmap`。
 
-P6 新增的 `execution` 上下文位于 `backend/internal/execution/`：承载批次/用例执行/暂停恢复/证据/报告（D39/D40），四层齐全；`infrastructure/` 含 `postgres`（6 表仓储）、`filestore`（证据文件）、`browser`（executor HTTP 客户端）、`agent`、`mindmap`、`resource`、`version`、`eventing`、`audit` 适配，`interfaces/httpapi/` 暴露 `/api/versions/{id}/batches*`、`/api/versions/{id}/evidence/*`、`/api/versions/{id}/execution/sessions`。新增 6 张表 `run_batch`/`case_run`/`step_result`/`assertion_result`/`evidence`/`evidence_ref`（雪花 `BIGINT` 主键 D29；表名/索引名遵循 §6.9/D34）；`RunEvent` 复用 P0 `event` 表（不新增 `run_event`），`StepRun` 折叠为 `step_result`（D42）。独立执行器位于 `executor/`（Node + Playwright 1.64.x；`EZTEST_EXECUTOR_URL` 默认 `http://127.0.0.1:13336`，Bearer token），API 镜像不装 Node/Chromium；证据根 `EZTEST_EVIDENCE_DIR` 默认 `.data/evidence`，只存相对路径 + sha256 + 大小。前端 feature 位于 `frontend/src/features/execution/`，登录配方 UI 位于 `frontend/src/features/resources/`。
+P6 新增的 `execution` 上下文位于 `backend/internal/execution/`（**0.1-P6**）：承载批次/用例执行/暂停恢复/证据/报告（D39/D40），四层齐全；`infrastructure/` 含 `postgres`（6 表仓储）、`filestore`（证据文件）、`browser`（executor HTTP 客户端）、`agent`、`mindmap`、`resource`、`version`、`eventing`、`audit` 适配，`interfaces/httpapi/` 暴露 `/api/versions/{id}/batches*`、`/api/versions/{id}/evidence/*`、`/api/versions/{id}/execution/sessions`。新增 6 张表 `run_batch`/`case_run`/`step_result`/`assertion_result`/`evidence`/`evidence_ref`（雪花 `BIGINT` 主键 D29；表名/索引名遵循 §6.9/D34）；`RunEvent` 复用 P0 `event` 表（不新增 `run_event`），`StepRun` 折叠为 `step_result`（D42）。独立执行器位于 `executor/`（Node + Playwright 1.64.x；`EZTEST_EXECUTOR_URL` 默认 `http://127.0.0.1:13336`，Bearer token），API 镜像不装 Node/Chromium；证据根 `EZTEST_EVIDENCE_DIR` 默认 `.data/evidence`，只存相对路径 + sha256 + 大小。前端 feature 位于 `frontend/src/features/execution/`，登录配方 UI 位于 `frontend/src/features/resources/`。
 
-P7 新增的 `delivery` 上下文位于 `backend/internal/delivery/`：承载问题/报告/分析（D43–D52），四层齐全；`infrastructure/` 含 `postgres`（5 表仓储）、`filestore`（报告 Markdown）、`agent`（失败分析/问题整理运行时端口）、`eventing`、`audit`、`execution`/`mindmap`/`codeintel`/`version` 适配，`interfaces/httpapi/` 暴露 `/api/versions/{id}/issues`、`/api/versions/{id}/reports`、`/api/versions/{id}/batches/{batchId}/analysis` 与全局只读 `/api/issues`、`/api/reports`。新增 5 张表 `issue`/`issue_ref`/`report`/`report_ref`/`analysis_run`（雪花 `BIGINT` 主键 D29；表名/索引名遵循 §6.9/D34）；报告 Markdown 走 `EZTEST_REPORT_DIR`（默认 `.data/reports`），DB 只存相对路径 + sha256 + 大小。自主编排 worker 由 `cmd/eztest` 装配并随进程启停，单实例假设；前端 feature 位于 `frontend/src/features/delivery/`，全局页面路由 `/issues`、`/reports`，版本内问题/报告 Tab 由 `frontend/src/features/delivery/` 提供。
+P7 新增的 `delivery` 上下文位于 `backend/internal/delivery/`（**0.1-P7**）：承载问题/报告/分析（D43–D52），四层齐全；`infrastructure/` 含 `postgres`（5 表仓储）、`filestore`（报告 Markdown）、`agent`（失败分析/问题整理运行时端口）、`eventing`、`audit`、`execution`/`mindmap`/`codeintel`/`version` 适配，`interfaces/httpapi/` 暴露 `/api/versions/{id}/issues`、`/api/versions/{id}/reports`、`/api/versions/{id}/batches/{batchId}/analysis` 与全局只读 `/api/issues`、`/api/reports`。新增 5 张表 `issue`/`issue_ref`/`report`/`report_ref`/`analysis_run`（雪花 `BIGINT` 主键 D29；表名/索引名遵循 §6.9/D34）；报告 Markdown 走 `EZTEST_REPORT_DIR`（默认 `.data/reports`），DB 只存相对路径 + sha256 + 大小。自主编排 worker 由 `cmd/eztest` 装配并随进程启停，单实例假设；前端 feature 位于 `frontend/src/features/delivery/`，全局页面路由 `/issues`、`/reports`，版本内问题/报告 Tab 由 `frontend/src/features/delivery/` 提供。
 
 ### 6.2 导入方向（Go，强制）
 
@@ -239,7 +241,7 @@ P7 新增的 `delivery` 上下文位于 `backend/internal/delivery/`：承载问
 3. 在 `internal/db/migrations/` 增加该上下文迁移；
 4. 更新本节 6.1 目录树与 `docs/design/system-blueprint.md` 模块边界（如需）；
 5. 若新增前端页面，在 `frontend/src/features/` 建 feature 并在 `src/app/` 只做路由组装；
-6. 新增常驻后台 worker/周期任务时，由 `cmd/eztest` 注入依赖并随进程生命周期启停，不得在 HTTP handler 或领域层直接启动常驻 goroutine；单实例假设须在模块注释/文档中写明（P7 自主编排 worker 即此形态）。
+6. 新增常驻后台 worker/周期任务时，由 `cmd/eztest` 注入依赖并随进程生命周期启停，不得在 HTTP handler 或领域层直接启动常驻 goroutine；单实例假设须在模块注释/文档中写明（0.1-P7 自主编排 worker 即此形态）。
 
 ### 6.6 ARTEX 参考边界
 
@@ -249,10 +251,10 @@ P7 新增的 `delivery` 上下文位于 `backend/internal/delivery/`：承载问
 
 ### 6.7 主键与 ID 规范（全项目）
 
-1. 自 P3 起，所有**新增**实体/表的主键统一使用雪花 ID（64-bit：41bit 毫秒 + 10bit 节点 + 12bit 序列），由 `backend/internal/platform/id` 在应用层生成；**禁止新增 `BIGSERIAL`/`SERIAL`/数据库自增主键**。
+1. 自 0.1-P3 起，所有**新增**实体/表的主键统一使用雪花 ID（64-bit：41bit 毫秒 + 10bit 节点 + 12bit 序列），由 `backend/internal/platform/id` 在应用层生成；**禁止新增 `BIGSERIAL`/`SERIAL`/数据库自增主键**。
 2. 同一实体在 DB、Go、JSON、事件与工具参数中使用同一 int64 语义；64-bit ID 在 JSON/工具参数中一律为十进制字符串（避免 JS 精度丢失），URL 路径参数为十进制字符串。
 3. 雪花节点 ID 由 `EZTEST_SNOWFLAKE_NODE_ID` 配置（0–1023，单实例默认 1）；多实例部署必须保证节点唯一。
-4. 既有 P0–P2 的 `BIGSERIAL` 表**不回溯改造**；如需统一，必须单独立项迁移并记录 D#；迁移完成前不得混用同一实体的 ID 类型。
+4. 既有 0.1-P0–P2 的 `BIGSERIAL` 表**不回溯改造**；如需统一，必须单独立项迁移并记录 D#；迁移完成前不得混用同一实体的 ID 类型。
 5. 跨上下文引用与主键同类型（BIGINT），仍按 §6.2 只做逻辑引用、不建 FK。
 
 ### 6.8 文件存储规范（全项目）
@@ -262,18 +264,18 @@ P7 新增的 `delivery` 上下文位于 `backend/internal/delivery/`：承载问
 3. 新功能不得新增对 P0 `storage` 内容寻址对象存储的依赖；该上下文冻结为既有能力/历史兼容，确需复用须在阶段规格中显式记录理由与 D#。
 4. 删除采用“DB 元数据 + best-effort 文件删除”；孤儿文件由 GC/保留策略处理，不阻塞业务。
 5. 下载/读取必须鉴权，不对外暴露内部存储路径；文件内容视为不可信数据。
-6. **P6 证据存储根**：`EZTEST_EVIDENCE_DIR`（默认 `.data/evidence`），布局 `{batch_id}/{case_run_id}/{evidence_id}.{ext}`；数据库只存根内相对路径 + `sha256` + `size` + `mime`，字节不入库；读取校验版本归属、sha256 与 MIME，不暴露文件系统路径；证据不可变（无更新/删除 API），删除仅 P8 GC。
+6. **0.1-P6 证据存储根**：`EZTEST_EVIDENCE_DIR`（默认 `.data/evidence`），布局 `{batch_id}/{case_run_id}/{evidence_id}.{ext}`；数据库只存根内相对路径 + `sha256` + `size` + `mime`，字节不入库；读取校验版本归属、sha256 与 MIME，不暴露文件系统路径；证据不可变（无更新/删除 API），删除仅 0.1-P8 GC。
 
 ### 6.9 数据库命名规约（D34）
 
 1. **表名**：小写字母/数字/下划线；**单数**；禁止保留字；推荐 `业务名称_表的作用`（如 `case_review_finding`）；禁止 `tbl_`/`tb_` 前缀。
 2. **字段名**：小写+下划线；布尔用 `is_` 前缀；禁止保留字；P5 **不改**任何既有字段名。
 3. **主键**：`id BIGINT`（雪花，D29），不做自增、不做 unsigned 语义（PostgreSQL 无 unsigned）；每表必须有主键。
-4. **审计字段**：P5 起新表沿用 `created_at TIMESTAMPTZ NOT NULL DEFAULT now()`、`updated_at TIMESTAMPTZ NOT NULL DEFAULT now()`（对阿里“id/gmt_create/gmt_modified 三字段”的**显式例外**，理由：与本仓库既有字段/Go 映射一致，避免两套时间字段语义）。
+4. **审计字段**：0.1-P5 起新表沿用 `created_at TIMESTAMPTZ NOT NULL DEFAULT now()`、`updated_at TIMESTAMPTZ NOT NULL DEFAULT now()`（对阿里“id/gmt_create/gmt_modified 三字段”的**显式例外**，理由：与本仓库既有字段/Go 映射一致，避免两套时间字段语义）。
 5. **索引命名**：`pk_<表名>`（主键约束）、`uk_<表名>_<列...>`（唯一）、`idx_<表名>_<列...>`（普通）。阿里原文的 `pk_字段名`/`uk_字段名` 在 PostgreSQL 下要求 schema 内全库唯一，按此适配落地。
 6. **迁移**：`<context>_<NNNN>_<desc>.sql` 只追加；改名/扩宽 CHECK 用新迁移；一个文件只属一个上下文。
 7. **外键**：跨上下文不建 FK，只做 BIGINT 逻辑引用；同上下文内 FK 可选。
-8. **例外**：`schema_migrations`（迁移框架表，类比 `flyway_schema_history`）不改名；历史阶段规格（P2/P3/P4 spec）作为交付记录保留旧名，主蓝图 §10.2 更新为规范名。
+8. **例外**：`schema_migrations`（迁移框架表，类比 `flyway_schema_history`）不改名；历史阶段规格（0.1-P2/P3/P4 spec）作为交付记录保留旧名，主蓝图 §10.2 更新为规范名。
 
 ---
 
