@@ -196,6 +196,9 @@ type ConfirmationTx interface {
 	CasesByRequirement(ctx context.Context) ([]CaseWithCurrent, error)
 	ConfirmCaseVersion(ctx context.Context, command ConfirmCaseVersionCommand) error
 	SupersedeVersions(ctx context.Context, caseID, keepVersionID int64, at time.Time) error
+	// SupersededVersionIDs lists the older confirmed/stale versions that
+	// SupersedeVersions would move, so the service can emit one event each.
+	SupersededVersionIDs(ctx context.Context, caseID, keepVersionID int64) ([]int64, error)
 }
 
 // ConfirmationRepository resolves a confirmation target and runs the

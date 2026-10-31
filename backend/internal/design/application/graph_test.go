@@ -16,7 +16,7 @@ func newGraphFixture(t *testing.T) (*GraphService, *fakeRepo, *fakePublisher, *f
 	repo := newFakeRepo()
 	publisher := &fakePublisher{}
 	audit := &fakeAudit{}
-	service := NewGraphService(repo, &fakeIDs{}, newFixedClock(), audit, publisher)
+	service := NewGraphService(repo, &fakeIDs{}, newFixedClock(), audit, publisher, &fakeTeamRoom{})
 	return service, repo, publisher, audit
 }
 
@@ -277,7 +277,7 @@ func TestGetCaseAndOverview(t *testing.T) {
 		ActiveRound:   &design.Round{ID: 8001, ConversationID: 9001, Activation: design.ActivationManual, RequirementIDs: []int64{3001}},
 		ActiveRoundNo: 1,
 	}
-	service := NewGraphService(repo, &fakeIDs{}, newFixedClock(), nil, nil)
+	service := NewGraphService(repo, &fakeIDs{}, newFixedClock(), nil, nil, &fakeTeamRoom{})
 	detail, err := service.GetCase(context.Background(), 1001, 7001, nil)
 	if err != nil {
 		t.Fatalf("GetCase: %v", err)

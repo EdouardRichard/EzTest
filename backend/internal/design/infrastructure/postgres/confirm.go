@@ -135,11 +135,14 @@ func (t *confirmationTx) CasesByScenario(ctx context.Context, scenarioID int64) 
 	return scanCaseList(rows)
 }
 
-// CasesByRequirement returns the locked cases across all current-version
-// scenarios of the confirmation requirement.
+// CasesByRequirement returns the locked cases of the requirement's current
+// revision scenarios.
 func (t *confirmationTx) CasesByRequirement(ctx context.Context) ([]design.CaseWithCurrent, error) {
 	rows, err := t.tx.Query(ctx, caseWithCurrentQuery+`
 		WHERE s.version_id = $1 AND s.requirement_id = $2
+		  AND s.requirement_version_id = (
+		      SELECT current_version_id FROM requirement WHERE id = $2
+		  )
 		ORDER BY ce.id
 		FOR UPDATE OF ce, cv
 	`, t.versionID, t.requirementID)
@@ -221,6 +224,31 @@ func (t *confirmationTx) SupersedeVersions(ctx context.Context, caseID, keepVers
 		return fmt.Errorf("supersede older case versions: %w", err)
 	}
 	return nil
+}
+
+// SupersededVersionIDs lists the versions SupersedeVersions would move.
+func (t *confirmationTx) SupersededVersionIDs(ctx context.Context, caseID, keepVersionID int64) ([]int64, error) {
+	rows, err := t.tx.Query(ctx, `
+		SELECT id FROM case_version
+		WHERE case_id = $1 AND id <> $2 AND status IN ('confirmed', 'stale')
+		ORDER BY id
+	`, caseID, keepVersionID)
+	if err != nil {
+		return nil, fmt.Errorf("list superseded case versions: %w", err)
+	}
+	defer rows.Close()
+	ids := make([]int64, 0)
+	for rows.Next() {
+		var versionID int64
+		if err := rows.Scan(&versionID); err != nil {
+			return nil, fmt.Errorf("scan superseded case version: %w", err)
+		}
+		ids = append(ids, versionID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("scan superseded case versions: %w", err)
+	}
+	return ids, nil
 }
 
 func scanCaseList(rows pgx.Rows) ([]design.CaseWithCurrent, error) {

@@ -20,28 +20,31 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/requestid"
 )
 
-// GraphService serves graph/case reads and the case.graph_propose write path.
+// GraphService serves graph/case reads, the case.graph_propose write path, user
+// confirmations, review/data-plan submissions.
 type GraphService struct {
-	repo   design.Repository
-	ids    platformid.Generator
-	clock  clock.Clock
-	audit  auditapp.Recorder
-	events eventingapp.Publisher
+	repo     design.Repository
+	ids      platformid.Generator
+	clock    clock.Clock
+	audit    auditapp.Recorder
+	events   eventingapp.Publisher
+	teamRoom TeamRoom
 }
 
-// NewGraphService wires the graph service. audit and events are best-effort
-// sinks and may be nil in unit tests.
+// NewGraphService wires the graph service. audit, events and teamRoom are
+// best-effort sinks and may be nil in unit tests.
 func NewGraphService(
 	repo design.Repository,
 	ids platformid.Generator,
 	clk clock.Clock,
 	audit auditapp.Recorder,
 	events eventingapp.Publisher,
+	teamRoom TeamRoom,
 ) *GraphService {
 	if clk == nil {
 		clk = clock.System{}
 	}
-	return &GraphService{repo: repo, ids: ids, clock: clk, audit: audit, events: events}
+	return &GraphService{repo: repo, ids: ids, clock: clk, audit: audit, events: events, teamRoom: teamRoom}
 }
 
 // ReadGraph returns the full version design graph snapshot.
