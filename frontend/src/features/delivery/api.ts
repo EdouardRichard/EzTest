@@ -1,4 +1,4 @@
-import { apiGet, apiGetPage, apiPost } from "@/lib/api-client"
+import { type ApiDownload, apiDownload, apiGet, apiGetPage, apiPost } from "@/lib/api-client"
 
 import type {
   IssueActionInput,
@@ -6,7 +6,13 @@ import type {
   IssueListOptions,
   IssueView,
   MergeIssueInput,
+  RegenerateReportInput,
+  RegenerateReportResult,
   ReopenIssueInput,
+  ReportDetailView,
+  ReportListOptions,
+  ReportRevisionView,
+  ReportView,
 } from "./types"
 
 /** Builds `?a=1&b=2`, skipping empty values (P0/P1 pagination style). */
@@ -26,6 +32,10 @@ function versionPath(versionId: string): string {
 
 function issuePath(versionId: string, issueId: string): string {
   return `${versionPath(versionId)}/issues/${encodeURIComponent(issueId)}`
+}
+
+function reportPath(versionId: string, reportId: string): string {
+  return `${versionPath(versionId)}/reports/${encodeURIComponent(reportId)}`
 }
 
 /** Builds the optional confirm/dismiss body (spec §4.2). */
@@ -105,4 +115,59 @@ export function mergeIssue(
   if (input.reason !== undefined && input.reason.length > 0) body.reason = input.reason
   if (input.expected_revision !== undefined) body.expected_revision = input.expected_revision
   return apiPost<IssueView>(`${issuePath(versionId, issueId)}/merge`, body)
+}
+
+/* ---------------------------------- reports -------------------------------- */
+
+/** `GET /api/versions/{id}/reports` (version summary first, then wave id DESC). */
+export async function listReports(
+  versionId: string,
+  options: ReportListOptions = {},
+): Promise<ReportView[]> {
+  const page = await apiGetPage<ReportView>(
+    `${versionPath(versionId)}/reports${query({
+      kind: options.kind,
+      before: options.before,
+      limit: options.limit ?? 100,
+    })}`,
+  )
+  return page.items
+}
+
+/** `GET .../reports/{reportId}`: current revision, all revisions and refs. */
+export function getReport(versionId: string, reportId: string): Promise<ReportDetailView> {
+  return apiGet<ReportDetailView>(reportPath(versionId, reportId))
+}
+
+/** `GET .../reports/{reportId}/revisions/{revision}` (read-only metadata). */
+export function getRevision(
+  versionId: string,
+  reportId: string,
+  revision: number,
+): Promise<ReportRevisionView> {
+  return apiGet<ReportRevisionView>(
+    `${reportPath(versionId, reportId)}/revisions/${encodeURIComponent(revision)}`,
+  )
+}
+
+/** `POST .../regenerate`: ensures the append-only next revision (202). */
+export function regenerate(
+  versionId: string,
+  reportId: string,
+  input: RegenerateReportInput = {},
+): Promise<RegenerateReportResult> {
+  const body: { reason?: string } = {}
+  if (input.reason !== undefined && input.reason.length > 0) body.reason = input.reason
+  return apiPost<RegenerateReportResult>(`${reportPath(versionId, reportId)}/regenerate`, body)
+}
+
+/** `GET .../revisions/{revision}/html`: authenticated report bytes (spec §9.3). */
+export function downloadHTML(
+  versionId: string,
+  reportId: string,
+  revision: number,
+): Promise<ApiDownload> {
+  return apiDownload(
+    `${reportPath(versionId, reportId)}/revisions/${encodeURIComponent(revision)}/html`,
+  )
 }

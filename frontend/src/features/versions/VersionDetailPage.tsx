@@ -10,8 +10,10 @@ import { EmptyState } from "@/components/ui/EmptyState"
 import { ErrorState } from "@/components/ui/ErrorState"
 import { LoadingCard } from "@/components/ui/Spinner"
 import { Tabs } from "@/components/ui/Tabs"
+import { ChainTab } from "@/features/chain/ChainTab"
 import { RequirementsTab } from "@/features/clarification/RequirementsTab"
 import { IssuesTab } from "@/features/delivery/IssuesTab"
+import { ReportsTab } from "@/features/delivery/ReportsTab"
 import { DesignTab } from "@/features/design/DesignTab"
 import { ExecutionTab } from "@/features/execution/ExecutionTab"
 import { formatDateTime } from "@/lib/format"
@@ -26,28 +28,15 @@ const STATUS_META: Record<VersionStatus, { label: string; tone: BadgeTone }> = {
   completed: { label: "已完成", tone: "neutral" },
 }
 
-type PlaceholderTab = Exclude<
-  VersionTab,
-  "overview" | "requirements" | "design" | "execution" | "issues"
->
+type PlaceholderTab = Extract<VersionTab, "code">
 
 type PlaceholderCopy = {
   label: string
-  phase: "P4" | "P5"
+  phase: "P5"
   description: string
 }
 
 const PLACEHOLDER_COPY: Record<PlaceholderTab, PlaceholderCopy> = {
-  chain: {
-    label: "探索链路",
-    phase: "P4",
-    description: "跨 SUT 的探索链路图、过滤与历史回放由 P4 阶段提供。",
-  },
-  reports: {
-    label: "报告",
-    phase: "P4",
-    description: "波次/版本报告、HTML/PDF 发布与 as-of 修订由 P4 阶段提供。",
-  },
   code: {
     label: "代码与变更",
     phase: "P5",
@@ -289,6 +278,18 @@ export function VersionDetailPage({
       const issueId = searchParams.get("issue")
       if (issueId) params.set("issue", issueId)
     }
+    if (next === "reports") {
+      const reportId = searchParams.get("report")
+      const revision = searchParams.get("revision")
+      if (reportId) params.set("report", reportId)
+      if (revision) params.set("revision", revision)
+    }
+    if (next === "chain") {
+      for (const key of ["node", "issue", "report", "wave"]) {
+        const value = searchParams.get(key)
+        if (value) params.set(key, value)
+      }
+    }
     router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`)
   }
 
@@ -381,8 +382,12 @@ export function VersionDetailPage({
           initialWaveId={executionWaveId}
           initialCaseRunId={executionCaseRunId}
         />
+      ) : activeTab === "chain" ? (
+        <ChainTab versionId={versionId} />
       ) : activeTab === "issues" ? (
         <IssuesTab versionId={versionId} />
+      ) : activeTab === "reports" ? (
+        <ReportsTab versionId={versionId} />
       ) : (
         <TabPlaceholder tab={activeTab} />
       )}

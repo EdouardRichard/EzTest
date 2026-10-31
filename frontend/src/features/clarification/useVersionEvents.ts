@@ -37,6 +37,10 @@ export type VersionEventHandlers = {
   onHumanRequestChanged?: (event: VersionEvent) => void
   /** P3 `execution.*` intent/failure/coverage events. */
   onExecutionChanged?: (event: VersionEvent) => void
+  /** P4 `issue.*`: refresh the issue list/detail and open counts. */
+  onIssueChanged?: (event: VersionEvent) => void
+  /** P4 `report.*`: refresh the report list/detail and current revision. */
+  onReportChanged?: (event: VersionEvent) => void
   /** Connection state for the status indicator. */
   onStatus?: (status: SSEStatus) => void
 }
@@ -139,6 +143,16 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
         case "execution.failure_candidate":
         case "execution.coverage_gap":
           handlersRef.current.onExecutionChanged?.(event)
+          break
+        case "issue.created":
+        case "issue.updated":
+        case "issue.reopened":
+        case "issue.merged":
+          handlersRef.current.onIssueChanged?.(event)
+          break
+        case "report.published":
+        case "report.stale":
+          handlersRef.current.onReportChanged?.(event)
           break
         default:
           if (event.type.startsWith("requirement.")) {
