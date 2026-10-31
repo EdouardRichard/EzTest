@@ -218,10 +218,28 @@ func (s *Scheduler) dispatchPending(ctx context.Context, wave execution.RunWave,
 				[]execution.CaseRunStatus{execution.CaseRunPending}, execution.CaseRunSuperseded, 0, ""); transitionErr != nil {
 				return mapExecutionError(transitionErr, "case run")
 			}
+			publishEvent(ctx, s.events, EventCaseRunFinished, wave.VersionID,
+				map[string]any{"case_run_id": platformid.Format(run.ID), "intent_id": platformid.Format(intent.ID)},
+				map[string]any{
+					"case_run_id": platformid.Format(run.ID),
+					"wave_id":     platformid.Format(wave.ID),
+					"status":      string(execution.CaseRunSuperseded),
+					"reason":      "not_current_confirmed",
+				}, nil)
 			if _, transitionErr := s.intents.Transition(ctx, intent.ID,
 				activeIntentStatuses, execution.IntentSuperseded); transitionErr != nil {
 				return mapExecutionError(transitionErr, "intent")
 			}
+			publishEvent(ctx, s.events, EventIntentSuperseded, wave.VersionID,
+				map[string]any{
+					"intent_id":       platformid.Format(intent.ID),
+					"case_version_id": platformid.Format(intent.CaseVersionID),
+				},
+				map[string]any{
+					"intent_id":       platformid.Format(intent.ID),
+					"case_version_id": platformid.Format(intent.CaseVersionID),
+					"reason":          "not_current_confirmed",
+				}, nil)
 			continue
 		}
 		sutIDs := intent.VersionSUTIDs
