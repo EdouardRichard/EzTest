@@ -271,3 +271,16 @@ export function apiPatch<T>(path: string, body?: unknown, init: RequestOptions =
 export function apiDelete<T>(path: string, init: RequestOptions = {}): Promise<T> {
   return apiFetch<T>(path, { ...init, method: "DELETE" })
 }
+
+/**
+ * Uploads a multipart body (typically `FormData`) through the same entry point
+ * as JSON calls. The browser owns the multipart `Content-Type` boundary, so no
+ * JSON header is attached.
+ */
+export function apiUpload<T>(
+  path: string,
+  formData: FormData,
+  init: RequestOptions = {},
+): Promise<T> {
+  return apiFetch<T>(path, { ...init, method: "POST", body: formData })
+}
