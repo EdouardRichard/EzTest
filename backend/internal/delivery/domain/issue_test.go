@@ -71,6 +71,29 @@ func requireMergeReason(t *testing.T, err error, want string) {
 	}
 }
 
+// mergeChainLookup builds a lookup for nodes consecutive non-merged issues
+// starting at firstID, each pointing at the next. The last node points at
+// terminalID when it is positive and otherwise ends the chain. The target's
+// own first link to firstID is counted in addition to these nodes.
+func mergeChainLookup(firstID int64, nodes int, terminalID int64) func(int64) (Issue, bool) {
+	chain := make(map[int64]Issue, nodes)
+	for offset := 0; offset < nodes; offset++ {
+		id := firstID + int64(offset)
+		node := Issue{ID: id, VersionID: 7, Status: IssueStatusConfirmed}
+		switch {
+		case offset < nodes-1:
+			node.MergedIntoID = int64Pointer(id + 1)
+		case terminalID > 0:
+			node.MergedIntoID = int64Pointer(terminalID)
+		}
+		chain[id] = node
+	}
+	return func(id int64) (Issue, bool) {
+		node, ok := chain[id]
+		return node, ok
+	}
+}
+
 func TestIssueValidateMerge(t *testing.T) {
 	source := Issue{ID: 10, VersionID: 7, Status: IssueStatusOpen}
 	target := Issue{ID: 20, VersionID: 7, Status: IssueStatusConfirmed}
@@ -123,23 +146,30 @@ func TestIssueValidateMerge(t *testing.T) {
 		return Issue{}, false
 	}), MergeReasonTargetInvalid)
 
-	// The merge-chain walk is bounded by MaxIssueMergeChain hops; a chain that
-	// never terminates within the budget is rejected instead of looping.
-	longChain := map[int64]Issue{}
-	for id := int64(100); id < 120; id++ {
-		longChain[id] = Issue{
-			ID:           id,
-			VersionID:    7,
-			Status:       IssueStatusConfirmed,
-			MergedIntoID: int64Pointer(id + 1),
-		}
+	// The merged_into walk is bounded by MaxIssueMergeChain hops. A finite chain
+	// of exactly the budget is accepted, while a longer chain is rejected as an
+	// invalid target (never as a cycle, because no cycle was proven).
+	atBudget := target
+	atBudget.MergedIntoID = int64Pointer(100)
+	if err := ValidateMerge(source, atBudget, mergeChainLookup(100, MaxIssueMergeChain, 0)); err != nil {
+		t.Fatalf("%d-link finite chain rejected: %v", MaxIssueMergeChain, err)
 	}
-	unbounded := target
-	unbounded.MergedIntoID = int64Pointer(100)
-	requireMergeReason(t, ValidateMerge(source, unbounded, func(id int64) (Issue, bool) {
-		issue, ok := longChain[id]
-		return issue, ok
-	}), MergeReasonCycle)
+
+	overBudget := target
+	overBudget.MergedIntoID = int64Pointer(200)
+	requireMergeReason(t,
+		ValidateMerge(source, overBudget, mergeChainLookup(200, MaxIssueMergeChain+1, 0)),
+		MergeReasonTargetInvalid,
+	)
+
+	// A source reached within the budget remains a cycle: the target's first
+	// link plus MaxIssueMergeChain-1 node links make exactly the budget.
+	cycleAtBudget := target
+	cycleAtBudget.MergedIntoID = int64Pointer(400)
+	requireMergeReason(t,
+		ValidateMerge(source, cycleAtBudget, mergeChainLookup(400, MaxIssueMergeChain-1, source.ID)),
+		MergeReasonCycle,
+	)
 
 	mergedSource := source
 	mergedSource.Status = IssueStatusMerged
@@ -153,4 +183,27 @@ func TestIssueValidateMerge(t *testing.T) {
 	if err := ValidateMerge(source, Issue{}, nil); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("missing target ID error = %v, want errors.Is(ErrInvalidArgument)", err)
 	}
+}
+
+func TestIssueValidateMergeMergedTargetWithLongChain(t *testing.T) {
+	source := Issue{ID: 10, VersionID: 7, Status: IssueStatusOpen}
+
+	// A merged target is terminal: it must be rejected before its chain is
+	// followed, so a long chain cannot surface as merge_cycle.
+	longChainTarget := Issue{
+		ID:           20,
+		VersionID:    7,
+		Status:       IssueStatusMerged,
+		MergedIntoID: int64Pointer(300),
+	}
+	requireMergeReason(t,
+		ValidateMerge(source, longChainTarget, mergeChainLookup(300, 20, 0)),
+		MergeReasonTargetInvalid,
+	)
+
+	// Nor may a merged target whose chain points straight back at the source be
+	// reported as a cycle: the invalid target status wins.
+	mergedToSource := longChainTarget
+	mergedToSource.MergedIntoID = int64Pointer(source.ID)
+	requireMergeReason(t, ValidateMerge(source, mergedToSource, nil), MergeReasonTargetInvalid)
 }

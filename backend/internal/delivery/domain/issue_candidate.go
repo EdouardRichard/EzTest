@@ -143,6 +143,11 @@ func validateCandidateInput(in CandidateInput) error {
 	if !validIssueCategory(in.Category) || !validIssueSeverity(in.Severity) {
 		return ErrInvalidArgument
 	}
+	// Only application failures become issues (spec §5.1): constructing a
+	// candidate for any other failure class is a caller bug, not a silent skip.
+	if in.FailureClass != "application" {
+		return ErrInvalidArgument
+	}
 	return nil
 }
 
@@ -174,11 +179,12 @@ func candidateTitle(in CandidateInput) string {
 	return truncateRunes(fmt.Sprintf("%s · %s failure", in.CaseTitle, in.Category), IssueTitleMax)
 }
 
-// candidateSummary prefers case_run.summary and otherwise composes the failed
-// assertion detail (spec §5.1), keeping only non-empty parts in the fixed
-// expected/actual/reason order.
+// candidateSummary prefers a non-blank case_run.summary and otherwise composes
+// the failed assertion detail (spec §5.1), keeping only non-empty parts in the
+// fixed expected/actual/reason order. A whitespace-only case_run summary is
+// treated as absent so it cannot mask the deterministic fallback.
 func candidateSummary(in CandidateInput) string {
-	if in.CaseRunSummary != "" {
+	if strings.TrimSpace(in.CaseRunSummary) != "" {
 		return truncateRunes(in.CaseRunSummary, IssueSummaryMax)
 	}
 	parts := make([]string, 0, 3)

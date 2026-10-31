@@ -14,7 +14,9 @@ var (
 )
 
 // MaxIssueMergeChain bounds how many merged_into hops ValidateMerge follows
-// before rejecting a target whose chain cannot be proven acyclic (spec §5.2).
+// (spec §5.2). A chain still open after this budget is rejected as
+// merge_target_invalid, never as merge_cycle: the walk stops before it could
+// prove that the chain reaches the source.
 const MaxIssueMergeChain = 16
 
 // Stable merge conflict reasons (spec §5.2 details.reason subcodes).
@@ -74,44 +76,47 @@ func ValidateMerge(source Issue, target Issue, lookup func(int64) (Issue, bool))
 	if !CanTransitionIssue(source.Status, IssueStatusMerged) {
 		return ErrStateConflict
 	}
-	if !target.Status.Valid() {
+	if !target.Status.Valid() || target.Status == IssueStatusMerged {
+		// A merged target is terminal, so it must be rejected before its chain
+		// is followed: otherwise a long or cyclic chain would be reported as
+		// merge_cycle even though the target itself is simply invalid.
 		return &MergeError{Reason: MergeReasonTargetInvalid}
 	}
 
-	cycle, broken := mergeChainState(target, source.ID, lookup)
-	switch {
-	case cycle:
-		return &MergeError{Reason: MergeReasonCycle}
-	case broken:
-		return &MergeError{Reason: MergeReasonTargetInvalid}
-	case target.Status == IssueStatusMerged:
-		return &MergeError{Reason: MergeReasonTargetInvalid}
-	default:
-		return nil
-	}
+	return mergeChainError(target, source.ID, lookup)
 }
 
-// mergeChainState follows target's merged_into chain for at most
-// MaxIssueMergeChain hops. It reports a cycle when the source is reached or the
-// budget is exhausted, and broken when a referenced issue cannot be resolved.
-func mergeChainState(target Issue, sourceID int64, lookup func(int64) (Issue, bool)) (cycle, broken bool) {
+// mergeChainError follows target's merged_into chain for at most
+// MaxIssueMergeChain hops (spec §5.2). It returns nil when the chain ends
+// without reaching the source, merge_cycle when the source is reached inside
+// the budget, and merge_target_invalid when a reference cannot be resolved or
+// the chain is still open after the budget. The over-budget case is deliberately
+// not a cycle: the bounded walk cannot prove that the chain ever reaches the
+// source, so it is reported as an invalid target instead. A source lying beyond
+// the budget is therefore also reported as merge_target_invalid.
+func mergeChainError(target Issue, sourceID int64, lookup func(int64) (Issue, bool)) error {
 	current := target
 	for hop := 0; hop < MaxIssueMergeChain; hop++ {
 		if current.MergedIntoID == nil {
-			return false, false
+			return nil
 		}
 		nextID := *current.MergedIntoID
 		if nextID == sourceID {
-			return true, false
+			return &MergeError{Reason: MergeReasonCycle}
 		}
 		if nextID <= 0 || lookup == nil {
-			return false, true
+			return &MergeError{Reason: MergeReasonTargetInvalid}
 		}
 		next, ok := lookup(nextID)
 		if !ok {
-			return false, true
+			return &MergeError{Reason: MergeReasonTargetInvalid}
 		}
 		current = next
 	}
-	return true, false
+	// The budget followed MaxIssueMergeChain links; the chain is finite only if
+	// the last node has no further link.
+	if current.MergedIntoID == nil {
+		return nil
+	}
+	return &MergeError{Reason: MergeReasonTargetInvalid}
 }

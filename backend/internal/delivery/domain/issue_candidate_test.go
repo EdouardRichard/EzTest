@@ -1,10 +1,7 @@
 package delivery
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
-	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -36,19 +33,15 @@ func validCandidateInput() CandidateInput {
 	}
 }
 
-func dedupeFallback(versionID, caseVersionID int64, stepSeq, assertionSeq int, failureClass string) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%d|%d|%d|%d|%s", versionID, caseVersionID, stepSeq, assertionSeq, failureClass)))
-	return hex.EncodeToString(sum[:])[:32]
-}
-
 func TestDedupeKeyMatchesP3Algorithm(t *testing.T) {
-	got := DeriveDedupeKey(11, 22, 3, 4, "application", "")
-	want := dedupeFallback(11, 22, 3, 4, "application")
-	if got != want {
-		t.Fatalf("DeriveDedupeKey = %q, want %q", got, want)
+	// Literal golden: sha256("11|22|3|4|application") hex-truncated to 32 chars
+	// (spec §5.1 P3 algorithm). Pinned so a payload or truncation change fails.
+	const want = "3fe9019f27a6380fa0b193b17845060c"
+	if got := DeriveDedupeKey(11, 22, 3, 4, "application", ""); got != want {
+		t.Fatalf("DeriveDedupeKey = %q, want the pinned P3 key %q", got, want)
 	}
-	if len(got) != 32 {
-		t.Fatalf("dedupe key length = %d, want 32", len(got))
+	if len(want) != 32 {
+		t.Fatalf("pinned dedupe key length = %d, want 32", len(want))
 	}
 }
 
@@ -91,10 +84,11 @@ func TestDedupeKeyPrefersValidHint(t *testing.T) {
 		" " + validHint,
 		validHint[:31] + "-",
 	}
+	// Literal golden: sha256("1|3|4|2|application") hex-truncated to 32 chars.
+	const fallback = "d636156f26735cc17ea3e0806ea2f0b4"
 	for _, hint := range invalidHints {
-		want := dedupeFallback(1, 3, 4, 2, "application")
-		if got := DeriveDedupeKey(1, 3, 4, 2, "application", hint); got != want {
-			t.Errorf("invalid hint %q produced %q, want recomputed %q", hint, got, want)
+		if got := DeriveDedupeKey(1, 3, 4, 2, "application", hint); got != fallback {
+			t.Errorf("invalid hint %q produced %q, want the recomputed P3 key %q", hint, got, fallback)
 		}
 	}
 }
@@ -121,6 +115,8 @@ func TestCandidateInputValidation(t *testing.T) {
 		{"unknown category", func(in *CandidateInput) { in.Category = "other" }},
 		{"missing severity", func(in *CandidateInput) { in.Severity = "" }},
 		{"unknown severity", func(in *CandidateInput) { in.Severity = "blocker" }},
+		{"missing failure class", func(in *CandidateInput) { in.FailureClass = "" }},
+		{"non application failure class", func(in *CandidateInput) { in.FailureClass = "interrupted" }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -245,6 +241,67 @@ func TestCandidateTruncation(t *testing.T) {
 	}
 }
 
+func TestCandidateBounds(t *testing.T) {
+	if IssueTitleMax != 500 {
+		t.Fatalf("IssueTitleMax = %d, want 500", IssueTitleMax)
+	}
+	if IssueSummaryMax != 4000 {
+		t.Fatalf("IssueSummaryMax = %d, want 4000", IssueSummaryMax)
+	}
+
+	// A title of exactly the bound is preserved untouched; one rune more is cut
+	// at the bound. The suffix length is derived from the frozen title format.
+	suffix := " · ui failure"
+	atTitleBound := validCandidateInput()
+	atTitleBound.StepSeq = 0
+	atTitleBound.CaseTitle = strings.Repeat("a", IssueTitleMax-len([]rune(suffix)))
+	issue, _, err := NewIssueCandidate(atTitleBound)
+	if err != nil {
+		t.Fatalf("NewIssueCandidate (title at bound): %v", err)
+	}
+	if runes := []rune(issue.Title); len(runes) != IssueTitleMax {
+		t.Fatalf("title at bound rune length = %d, want %d", len(runes), IssueTitleMax)
+	}
+	if !strings.HasSuffix(issue.Title, suffix) {
+		t.Fatalf("title at bound was truncated: %q", issue.Title)
+	}
+
+	overTitleBound := atTitleBound
+	overTitleBound.CaseTitle += "a"
+	issue, _, err = NewIssueCandidate(overTitleBound)
+	if err != nil {
+		t.Fatalf("NewIssueCandidate (title over bound): %v", err)
+	}
+	if runes := []rune(issue.Title); len(runes) != IssueTitleMax {
+		t.Fatalf("title over bound rune length = %d, want %d", len(runes), IssueTitleMax)
+	}
+	if strings.HasSuffix(issue.Title, suffix) {
+		t.Fatalf("title over bound must be truncated, got %q", issue.Title)
+	}
+
+	// A summary of exactly the bound is preserved; one rune more loses only the
+	// final rune.
+	atSummaryBound := validCandidateInput()
+	atSummaryBound.CaseRunSummary = strings.Repeat("s", IssueSummaryMax-1) + "x"
+	issue, _, err = NewIssueCandidate(atSummaryBound)
+	if err != nil {
+		t.Fatalf("NewIssueCandidate (summary at bound): %v", err)
+	}
+	if issue.Summary != atSummaryBound.CaseRunSummary {
+		t.Fatalf("summary at bound = %q, want it preserved", issue.Summary)
+	}
+
+	overSummaryBound := atSummaryBound
+	overSummaryBound.CaseRunSummary += "y"
+	issue, _, err = NewIssueCandidate(overSummaryBound)
+	if err != nil {
+		t.Fatalf("NewIssueCandidate (summary over bound): %v", err)
+	}
+	if issue.Summary != atSummaryBound.CaseRunSummary {
+		t.Fatalf("summary over bound = %q, want the first %d runes preserved", issue.Summary, IssueSummaryMax)
+	}
+}
+
 func TestCandidateSummaryFallback(t *testing.T) {
 	in := validCandidateInput()
 	in.CaseRunSummary = ""
@@ -264,6 +321,17 @@ func TestCandidateSummaryFallback(t *testing.T) {
 	}
 	if issue.Summary != in.CaseRunSummary {
 		t.Fatalf("summary = %q, want the case_run summary %q", issue.Summary, in.CaseRunSummary)
+	}
+
+	whitespaceOnly := validCandidateInput()
+	whitespaceOnly.CaseRunSummary = " \n\t "
+	issue, _, err = NewIssueCandidate(whitespaceOnly)
+	if err != nil {
+		t.Fatalf("NewIssueCandidate (whitespace summary): %v", err)
+	}
+	want = "expected: HTTP 200\nactual: HTTP 500\nreason: status mismatch"
+	if issue.Summary != want {
+		t.Fatalf("whitespace-only case_run summary must fall back, got %q want %q", issue.Summary, want)
 	}
 
 	in.CaseRunSummary = ""
@@ -290,7 +358,9 @@ func TestCandidateSummaryFallback(t *testing.T) {
 
 func TestCandidateRefs(t *testing.T) {
 	in := validCandidateInput()
-	in.EvidenceIDs = []int64{101, 102, 103, 104, 105, 106, 107, 102}
+	// A duplicate appears inside the first five evidence ids, so the expected
+	// refs below only hold when de-duplication runs before the cap.
+	in.EvidenceIDs = []int64{101, 101, 102, 103, 104, 105, 106}
 	_, refs, err := NewIssueCandidate(in)
 	if err != nil {
 		t.Fatalf("NewIssueCandidate: %v", err)
@@ -346,7 +416,9 @@ func TestCandidateResultRefs(t *testing.T) {
 	in := validCandidateInput()
 	in.WaveID = nil
 	in.EvidenceIDs = nil
-	in.FailedAssertionResultIDs = []int64{301, 302, 303, 304, 305}
+	// A duplicate appears inside the first three assertion ids, so the expected
+	// refs below only hold when de-duplication runs before the cap.
+	in.FailedAssertionResultIDs = []int64{301, 301, 302, 303, 304}
 	_, refs, err := NewIssueCandidate(in)
 	if err != nil {
 		t.Fatalf("NewIssueCandidate: %v", err)
@@ -437,5 +509,39 @@ func TestCandidateFingerprint(t *testing.T) {
 		if other.Fingerprint == base.Fingerprint {
 			t.Errorf("%s change must change the fingerprint", variant.name)
 		}
+	}
+}
+
+func TestCandidateFingerprintGolden(t *testing.T) {
+	in := CandidateInput{
+		VersionID:     11,
+		CaseRunID:     22,
+		CaseVersionID: 33,
+		CaseTitle:     "Login",
+		StepSeq:       3,
+		AssertionSeq:  4,
+		FailureClass:  "application",
+		Category:      "api",
+		Severity:      "major",
+		DedupeHint:    "0123456789abcdef0123456789abcdef",
+	}
+	issue, _, err := NewIssueCandidate(in)
+	if err != nil {
+		t.Fatalf("NewIssueCandidate: %v", err)
+	}
+	if want := "Login · step 3: api failure"; issue.Title != want {
+		t.Fatalf("title = %q, want %q", issue.Title, want)
+	}
+	if issue.DedupeKey != in.DedupeHint {
+		t.Fatalf("dedupe_key = %q, want the hint %q", issue.DedupeKey, in.DedupeHint)
+	}
+	// Literal golden: sha256 of the canonical JSON
+	// {"version_id":11,"case_run_id":22,"case_version_id":33,"step_seq":3,
+	//  "assertion_seq":4,"dedupe_key":"...","title":"Login · step 3: api failure",
+	//  "category":"api","severity":"major"} (spec §5.1). Pinned so any field,
+	// order or encoding change of the fingerprint input fails.
+	const wantFingerprint = "fd6d1c2b3eb8c86450d71496d5f291c4c92c74dfdf06e0bb8781338c2f404985"
+	if issue.Fingerprint != wantFingerprint {
+		t.Fatalf("fingerprint = %q, want the pinned canonical-JSON hash %q", issue.Fingerprint, wantFingerprint)
 	}
 }
