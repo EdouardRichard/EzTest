@@ -66,7 +66,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/contentstore"
 )
 
-var version = "0.2.0-p3"
+var version = "0.2.0-p4"
 
 func hostName() string {
 	name, err := os.Hostname()

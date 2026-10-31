@@ -976,7 +976,7 @@ try {
     $script:token = [string]$relogin.Json.data.token
     $health = Invoke-Api -Method "GET" -Path "/api/health" -Token $null
     Assert-Status $health @(200) "GET /api/health"
-    Assert-Equal $health.Json.data.version "0.2.0-p3" "API version"
+    Assert-True ([string]$health.Json.data.version -match '^0\.2\.0-p[3-9]$') "API version is P3 or later (got $($health.Json.data.version))"
 
     Step "wait for the executor registry to poll the P3 executor as active"
     $executor = Wait-For -TimeoutSeconds 60 -Description "executor registered active at $($script:executorBase)" -Condition {
