@@ -61,7 +61,7 @@ func TestOpenAIChatSendsToolsAndParsesToolCalls(t *testing.T) {
 			"id":"chatcmpl-test",
 			"object":"chat.completion",
 			"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[
-				{"id":"call_fake_1","type":"function","function":{"name":"requirement.draft_create","arguments":"{\"title\":\"login\"}"}}
+				{"id":"call_fake_1","type":"function","function":{"name":"requirement_draft_create","arguments":"{\"title\":\"login\"}"}}
 			]},"finish_reason":"tool_calls"}],
 			"usage":{"prompt_tokens":21,"completion_tokens":7,"total_tokens":28}
 		}`)
@@ -120,7 +120,7 @@ func TestOpenAIChatSendsToolsAndParsesToolCalls(t *testing.T) {
 	}
 	tool := tools[0].(map[string]any)
 	function := tool["function"].(map[string]any)
-	if tool["type"] != "function" || function["name"] != "requirement.draft_create" {
+	if tool["type"] != "function" || function["name"] != "requirement_draft_create" {
 		t.Fatalf("tool = %#v", tool)
 	}
 	if _, ok := function["parameters"].(map[string]any); !ok {
@@ -166,6 +166,10 @@ func TestOpenAIChatSendsToolContinuationMessages(t *testing.T) {
 	toolCall := toolCalls[0].(map[string]any)
 	if toolCall["id"] != "call_1" || toolCall["type"] != "function" {
 		t.Fatalf("tool call = %#v", toolCall)
+	}
+	function := toolCall["function"].(map[string]any)
+	if function["name"] != "requirement_draft_create" {
+		t.Fatalf("assistant history tool name was not sanitized: %#v", function["name"])
 	}
 	toolMessage := messages[1].(map[string]any)
 	if toolMessage["role"] != "tool" || toolMessage["tool_call_id"] != "call_1" {
@@ -351,6 +355,119 @@ func TestOpenAIChatRejectsInvalidSuccessBody(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "choices") {
 		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestOpenAIChatSanitizesAllToolNamesAndKeepsUnknownResponses(t *testing.T) {
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body = captureChatBody(t, r)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"id":"chatcmpl-test",
+			"object":"chat.completion",
+			"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[
+				{"id":"call_1","type":"function","function":{"name":"context_team_room-read","arguments":"{}"}},
+				{"id":"call_2","type":"function","function":{"name":"unknown_tool","arguments":"{}"}}
+			]},"finish_reason":"tool_calls"}],
+			"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+		}`)
+	}))
+	defer server.Close()
+
+	response, err := llminfra.NewClient().Chat(context.Background(), chatConfigFor(server.URL, 0), llmapp.ChatRequest{
+		Model:    "fake-llm",
+		Messages: []llmapp.ChatMessage{{Role: "user", Content: "hi"}},
+		Tools: []llmapp.ToolDefinition{
+			{Name: "context.team_room-read", Description: "read", Parameters: []byte(`{"type":"object"}`)},
+			{Name: "sut.page_list", Description: "pages", Parameters: []byte(`{"type":"object"}`)},
+			{Name: "tool:with space", Description: "weird", Parameters: []byte(`{"type":"object"}`)},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	if len(response.ToolCalls) != 2 {
+		t.Fatalf("tool calls = %#v", response.ToolCalls)
+	}
+	if response.ToolCalls[0].Name != "context.team_room-read" {
+		t.Fatalf("sanitized name was not mapped back: %#v", response.ToolCalls[0])
+	}
+	if response.ToolCalls[1].Name != "unknown_tool" {
+		t.Fatalf("unknown name must stay as returned: %#v", response.ToolCalls[1])
+	}
+
+	tools, ok := body["tools"].([]any)
+	if !ok || len(tools) != 3 {
+		t.Fatalf("tools = %#v", body["tools"])
+	}
+	wantNames := []string{"context_team_room-read", "sut_page_list", "tool_with_space"}
+	for i, want := range wantNames {
+		function := tools[i].(map[string]any)["function"].(map[string]any)
+		if got := function["name"]; got != want {
+			t.Fatalf("tool[%d] name = %#v, want %q", i, got, want)
+		}
+	}
+}
+
+func TestOpenAIChatLeavesPlainToolNamesUnchanged(t *testing.T) {
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body = captureChatBody(t, r)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"id":"chatcmpl-test",
+			"object":"chat.completion",
+			"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[
+				{"id":"call_1","type":"function","function":{"name":"sut_list","arguments":"{}"}}
+			]},"finish_reason":"tool_calls"}],
+			"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+		}`)
+	}))
+	defer server.Close()
+
+	response, err := llminfra.NewClient().Chat(context.Background(), chatConfigFor(server.URL, 0), llmapp.ChatRequest{
+		Model:    "fake-llm",
+		Messages: []llmapp.ChatMessage{{Role: "user", Content: "hi"}},
+		Tools:    []llmapp.ToolDefinition{{Name: "sut_list", Description: "suts", Parameters: []byte(`{"type":"object"}`)}},
+	})
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	tools := body["tools"].([]any)
+	function := tools[0].(map[string]any)["function"].(map[string]any)
+	if function["name"] != "sut_list" {
+		t.Fatalf("plain tool name changed: %#v", function["name"])
+	}
+	if len(response.ToolCalls) != 1 || response.ToolCalls[0].Name != "sut_list" {
+		t.Fatalf("tool calls = %#v", response.ToolCalls)
+	}
+}
+
+func TestOpenAIChatRejectsCollidingSanitizedToolNames(t *testing.T) {
+	var calls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		writeChatCompletion(w)
+	}))
+	defer server.Close()
+
+	_, err := llminfra.NewClient().Chat(context.Background(), chatConfigFor(server.URL, 0), llmapp.ChatRequest{
+		Model:    "fake-llm",
+		Messages: []llmapp.ChatMessage{{Role: "user", Content: "hi"}},
+		Tools: []llmapp.ToolDefinition{
+			{Name: "requirement.draft_create", Description: "dotted", Parameters: []byte(`{"type":"object"}`)},
+			{Name: "requirement_draft_create", Description: "plain", Parameters: []byte(`{"type":"object"}`)},
+		},
+	})
+	if err == nil {
+		t.Fatal("Chat accepted colliding sanitized tool names")
+	}
+	if !strings.Contains(err.Error(), "collide") {
+		t.Fatalf("error = %q", err)
+	}
+	if atomic.LoadInt32(&calls) != 0 {
+		t.Fatalf("upstream was called despite the tool-name collision")
 	}
 }
 

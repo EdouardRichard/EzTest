@@ -21,13 +21,51 @@ const chatRetryBaseDelay = 25 * time.Millisecond
 
 var _ llmapp.ChatClient = (*Client)(nil)
 
+// toolNameMapping maps upstream-safe tool names back to the frozen internal
+// names. DeepSeek rejects function names outside ^[a-zA-Z0-9_-]+$, so dotted
+// names such as requirement.draft_create are sent as requirement_draft_create.
+type toolNameMapping struct {
+	toOriginal map[string]string
+}
+
+// originalName returns the internal tool name for an upstream name; unknown
+// names are returned unchanged.
+func (m *toolNameMapping) originalName(sanitized string) string {
+	if m == nil {
+		return sanitized
+	}
+	if original, ok := m.toOriginal[sanitized]; ok {
+		return original
+	}
+	return sanitized
+}
+
+// sanitizeToolName replaces every rune outside [A-Za-z0-9_-] with '_' so
+// OpenAI-compatible upstreams with strict name patterns accept the request.
+func sanitizeToolName(name string) string {
+	var builder strings.Builder
+	builder.Grow(len(name))
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+			builder.WriteRune(r)
+		default:
+			builder.WriteByte('_')
+		}
+	}
+	return builder.String()
+}
+
 // Chat performs one OpenAI-compatible chat completion with tools. Transient
 // failures (network, timeout, HTTP 429 and 5xx) are retried up to
 // cfg.MaxRetries; other 4xx responses are returned immediately. Context-window
 // overflows are wrapped with llmapp.ErrContextOverflow so the runtime can
 // compact and retry. The configured API key is never included in errors.
 func (c *Client) Chat(ctx context.Context, cfg llm.Config, req llmapp.ChatRequest) (llmapp.ChatResponse, error) {
-	payload := buildChatPayload(req)
+	payload, names, err := buildChatPayload(req)
+	if err != nil {
+		return llmapp.ChatResponse{}, err
+	}
 	attempts := cfg.MaxRetries + 1
 	if attempts < 1 {
 		attempts = 1
@@ -40,7 +78,7 @@ func (c *Client) Chat(ctx context.Context, cfg llm.Config, req llmapp.ChatReques
 				return llmapp.ChatResponse{}, contextErr(ctx, err)
 			}
 		}
-		response, retryable, err := c.doChat(ctx, cfg, payload)
+		response, retryable, err := c.doChat(ctx, cfg, payload, names)
 		if err == nil {
 			return response, nil
 		}
@@ -57,7 +95,7 @@ func (c *Client) Chat(ctx context.Context, cfg llm.Config, req llmapp.ChatReques
 
 // doChat performs one attempt with the per-config request timeout and returns
 // whether the failure is retryable.
-func (c *Client) doChat(ctx context.Context, cfg llm.Config, payload chatRequestPayload) (llmapp.ChatResponse, bool, error) {
+func (c *Client) doChat(ctx context.Context, cfg llm.Config, payload chatRequestPayload, names *toolNameMapping) (llmapp.ChatResponse, bool, error) {
 	timeout := time.Duration(cfg.TimeoutSeconds) * time.Second
 	if timeout <= 0 {
 		timeout = DefaultTimeout
@@ -91,7 +129,7 @@ func (c *Client) doChat(ctx context.Context, cfg llm.Config, payload chatRequest
 	if err != nil {
 		return llmapp.ChatResponse{}, true, errors.New("read llm chat response failed")
 	}
-	parsed, err := parseChatCompletion(raw)
+	parsed, err := parseChatCompletion(raw, names)
 	if err != nil {
 		return llmapp.ChatResponse{}, false, err
 	}
@@ -120,7 +158,9 @@ func classifyChatFailure(cfg llm.Config, status int, raw []byte) (bool, error) {
 }
 
 // buildChatPayload maps the application request to the OpenAI wire format.
-func buildChatPayload(req llmapp.ChatRequest) chatRequestPayload {
+// Function names are sanitized for strict upstreams and the reverse mapping is
+// returned so response tool calls can be restored to the internal names.
+func buildChatPayload(req llmapp.ChatRequest) (chatRequestPayload, *toolNameMapping, error) {
 	messages := make([]chatMessagePayload, 0, len(req.Messages))
 	for _, message := range req.Messages {
 		item := chatMessagePayload{
@@ -133,7 +173,9 @@ func buildChatPayload(req llmapp.ChatRequest) chatRequestPayload {
 				ID:   call.ID,
 				Type: "function",
 				Function: chatFunctionCallPayload{
-					Name:      call.Name,
+					// Assistant history names must match the sanitized tool
+					// definitions sent in the same request.
+					Name:      sanitizeToolName(call.Name),
 					Arguments: call.Arguments,
 				},
 			})
@@ -152,8 +194,17 @@ func buildChatPayload(req llmapp.ChatRequest) chatRequestPayload {
 		payload.MaxTokens = llmapp.DefaultChatMaxOutputTokens
 	}
 	if len(req.Tools) > 0 {
+		names := &toolNameMapping{toOriginal: make(map[string]string, len(req.Tools))}
 		tools := make([]chatToolPayload, 0, len(req.Tools))
 		for _, tool := range req.Tools {
+			sanitized := sanitizeToolName(tool.Name)
+			if existing, ok := names.toOriginal[sanitized]; ok && existing != tool.Name {
+				return chatRequestPayload{}, nil, fmt.Errorf(
+					"llm tool names %q and %q collide after sanitization to %q", existing, tool.Name, sanitized,
+				)
+			}
+			names.toOriginal[sanitized] = tool.Name
+
 			parameters := json.RawMessage(tool.Parameters)
 			if len(parameters) == 0 {
 				parameters = json.RawMessage(`{}`)
@@ -161,7 +212,7 @@ func buildChatPayload(req llmapp.ChatRequest) chatRequestPayload {
 			tools = append(tools, chatToolPayload{
 				Type: "function",
 				Function: chatFunctionDefinition{
-					Name:        tool.Name,
+					Name:        sanitized,
 					Description: tool.Description,
 					Parameters:  parameters,
 				},
@@ -169,12 +220,14 @@ func buildChatPayload(req llmapp.ChatRequest) chatRequestPayload {
 		}
 		payload.Tools = tools
 		payload.ToolChoice = "auto"
+		return payload, names, nil
 	}
-	return payload
+	return payload, nil, nil
 }
 
-// parseChatCompletion decodes a successful OpenAI-compatible completion.
-func parseChatCompletion(raw []byte) (llmapp.ChatResponse, error) {
+// parseChatCompletion decodes a successful OpenAI-compatible completion and
+// maps sanitized function names back to the internal names.
+func parseChatCompletion(raw []byte, names *toolNameMapping) (llmapp.ChatResponse, error) {
 	var payload chatCompletionPayload
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return llmapp.ChatResponse{}, errors.New("decode llm chat response failed")
@@ -190,7 +243,7 @@ func parseChatCompletion(raw []byte) (llmapp.ChatResponse, error) {
 	for _, call := range choice.Message.ToolCalls {
 		response.ToolCalls = append(response.ToolCalls, llmapp.ToolCall{
 			ID:        call.ID,
-			Name:      call.Function.Name,
+			Name:      names.originalName(call.Function.Name),
 			Arguments: call.Function.Arguments,
 		})
 	}
