@@ -1,6 +1,11 @@
-import { GlobalReportsPage } from "@/features/delivery/components/GlobalReportsPage"
+import type { Metadata } from "next"
 
-/** `/reports` route: the global cross-version report center (spec §7.10). */
+import { PlaceholderPage } from "@/components/placeholder-page"
+
+export const metadata: Metadata = { title: "报告" }
+
 export default function ReportsPage() {
-  return <GlobalReportsPage />
+  return (
+    <PlaceholderPage title="报告" phase="P1" description="波次报告、发布快照与跨版本质量趋势。" />
+  )
 }

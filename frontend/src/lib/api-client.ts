@@ -3,7 +3,6 @@ import { clearSession, getToken } from "./auth-storage"
 /** Fallback API origin used when NEXT_PUBLIC_API_BASE_URL is not configured. */
 export const DEFAULT_API_BASE_URL = "http://localhost:13333"
 
-/** Structured, non-sensitive error returned by the shared API error envelope. */
 export type ApiErrorDetails = Record<string, unknown>
 
 export type ApiErrorInit = {
@@ -16,8 +15,8 @@ export type ApiErrorInit = {
 }
 
 /**
- * ApiError carries the API's error envelope (`code`, `request_id`, `retryable`,
- * `details`) instead of exposing the raw Response to feature code.
+ * ApiError carries the API's error envelope (`code`, `message`, `request_id`,
+ * `retryable`, `details`) instead of exposing the raw Response to feature code.
  */
 export class ApiError extends Error {
   readonly status: number
@@ -38,15 +37,11 @@ export class ApiError extends Error {
 }
 
 export type ApiFetchOptions = RequestInit & {
-  /** Explicit token override. `null` means "do not attach a token". */
-  token?: string | null
   /** Optional X-Request-ID sent with the request for end-to-end correlation. */
   requestId?: string
   /** Optional Idempotency-Key for write requests. */
   idempotencyKey?: string
 }
-
-type HeaderRecord = Record<string, string>
 
 export function getApiBaseUrl(): string {
   const configured = process.env.NEXT_PUBLIC_API_BASE_URL?.trim()
@@ -63,29 +58,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
-function toHeaderRecord(headers?: HeadersInit): HeaderRecord {
-  const record: HeaderRecord = {}
-  if (!headers) return record
-  new Headers(headers).forEach((value, key) => {
-    record[key] = value
-  })
-  return record
+function randomHex(byteLength: number): string {
+  const bytes = new Uint8Array(byteLength)
+  if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+    crypto.getRandomValues(bytes)
+  } else {
+    for (let i = 0; i < bytes.length; i += 1) bytes[i] = Math.floor(Math.random() * 256)
+  }
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")
 }
 
-function findHeaderName(headers: HeaderRecord, name: string): string | undefined {
-  const lower = name.toLowerCase()
-  return Object.keys(headers).find((key) => key.toLowerCase() === lower)
-}
-
-function getHeader(headers: HeaderRecord, name: string): string | undefined {
-  const key = findHeaderName(headers, name)
-  return key === undefined ? undefined : headers[key]
-}
-
-function setHeader(headers: HeaderRecord, name: string, value: string): void {
-  const existing = findHeaderName(headers, name)
-  if (existing !== undefined && existing !== name) delete headers[existing]
-  headers[name] = value
+/** Creates a `req_` + 12-hex correlation id matching the backend format. */
+export function createRequestId(): string {
+  return `req_${randomHex(6)}`
 }
 
 function fallbackCode(status: number): string {
@@ -93,6 +78,7 @@ function fallbackCode(status: number): string {
   if (status === 403) return "forbidden"
   if (status === 404) return "not_found"
   if (status === 409) return "conflict"
+  if (status === 413) return "too_large"
   if (status === 429) return "rate_limited"
   if (status === 503) return "unavailable"
   if (status >= 500) return "internal"
@@ -102,6 +88,8 @@ function fallbackCode(status: number): string {
 function fallbackMessage(status: number): string {
   if (status === 0) return "network request failed"
   if (status === 401) return "authentication required"
+  if (status === 403) return "permission denied"
+  if (status === 404) return "resource not found"
   return status >= 500 ? "the API is unavailable" : "the request was rejected"
 }
 
@@ -155,44 +143,38 @@ type PreparedRequest = {
   requestId: string
 }
 
-/**
- * Builds the URL, headers and auth for one request. Keeping this separate lets
- * apiFetch (JSON) and apiStreamFetch (SSE) share the exact same auth/error
- * behavior without duplicating header rules.
- */
 function prepareRequest(path: string, init: ApiFetchOptions): PreparedRequest {
-  const { token, requestId, idempotencyKey, ...requestInit } = init
-  const headers = toHeaderRecord(requestInit.headers)
+  const { requestId, idempotencyKey, ...requestInit } = init
+  const headers = new Headers(requestInit.headers)
 
-  const bearer = token === undefined ? getToken() : token
-  if (bearer) setHeader(headers, "Authorization", `Bearer ${bearer}`)
-  if (!getHeader(headers, "Accept")) setHeader(headers, "Accept", "application/json")
+  const bearer = getToken()
+  if (bearer) headers.set("Authorization", `Bearer ${bearer}`)
+  if (!headers.has("Accept")) headers.set("Accept", "application/json")
   if (
     requestInit.body !== undefined &&
     requestInit.body !== null &&
     typeof requestInit.body === "string" &&
-    !getHeader(headers, "Content-Type")
+    !headers.has("Content-Type")
   ) {
-    setHeader(headers, "Content-Type", "application/json")
+    headers.set("Content-Type", "application/json")
   }
-  if (requestId && !getHeader(headers, "X-Request-ID")) {
-    setHeader(headers, "X-Request-ID", requestId)
-  }
-  if (idempotencyKey && !getHeader(headers, "Idempotency-Key")) {
-    setHeader(headers, "Idempotency-Key", idempotencyKey)
-  }
+  const resolvedRequestId = requestId ?? createRequestId()
+  if (!headers.has("X-Request-ID")) headers.set("X-Request-ID", resolvedRequestId)
+  if (idempotencyKey) headers.set("Idempotency-Key", idempotencyKey)
 
   return {
     url: resolveApiUrl(path),
     init: { ...requestInit, headers },
     bearer: bearer ?? null,
-    requestId: requestId ?? "",
+    requestId: resolvedRequestId,
   }
 }
 
-async function sendRequest(prepared: PreparedRequest): Promise<Response> {
+async function performRequest(path: string, init: ApiFetchOptions): Promise<Response> {
+  const prepared = prepareRequest(path, init)
+  let response: Response
   try {
-    return await fetch(prepared.url, prepared.init)
+    response = await fetch(prepared.url, prepared.init)
   } catch (cause) {
     throw new ApiError({
       status: 0,
@@ -202,34 +184,17 @@ async function sendRequest(prepared: PreparedRequest): Promise<Response> {
       retryable: true,
     })
   }
-}
-
-/**
- * Sends a request and applies the shared 401 rule: clear the local session only
- * when the request actually attached a bearer. Public calls (for example a
- * failed login) must not wipe an unrelated existing session.
- */
-async function performRequest(path: string, init: ApiFetchOptions): Promise<Response> {
-  const prepared = prepareRequest(path, init)
-  const response = await sendRequest(prepared)
   if (response.status === 401 && prepared.bearer) clearSession()
   return response
 }
 
-/**
- * Sends one request and returns the parsed JSON payload without applying the
- * `{"data": ...}` unwrap. Shared by apiFetch (which unwraps) and apiGetPage
- * (which needs the sibling pagination fields the unwrap would drop).
- */
 async function requestPayload(path: string, init: ApiFetchOptions): Promise<unknown> {
   const response = await performRequest(path, init)
-
   if (!response.ok) throw await toApiError(response)
   if (response.status === 204) return undefined
 
   const text = await response.text()
   if (text.length === 0) return undefined
-
   try {
     return JSON.parse(text)
   } catch {
@@ -245,29 +210,12 @@ async function requestPayload(path: string, init: ApiFetchOptions): Promise<unkn
 
 /**
  * The single HTTP entry point for the web app. It prefixes the configured API
- * origin, attaches the bearer token, unwraps `{"data": ...}`, turns error
- * envelopes into ApiError, and clears the local session on an authenticated 401.
+ * origin, attaches the bearer token, sends a correlation id, unwraps
+ * `{"data": ...}`, turns error envelopes into ApiError, and clears the local
+ * session on an authenticated 401.
  */
 export async function apiFetch<T>(path: string, init: ApiFetchOptions = {}): Promise<T> {
   return unwrapData<T>(await requestPayload(path, init))
-}
-
-/**
- * Opens a streaming response (Server-Sent Events) through the same auth and
- * error layer as apiFetch. The caller reads and parses the body; a non-OK
- * response still surfaces as ApiError and an authenticated 401 clears the
- * session. Direct `fetch` stays confined to this module and sse-client.
- */
-export async function apiStreamFetch(path: string, init: ApiFetchOptions = {}): Promise<Response> {
-  const response = await performRequest(path, init)
-  if (!response.ok) throw await toApiError(response)
-  return response
-}
-
-type RequestOptions = Omit<ApiFetchOptions, "method" | "body">
-
-export function apiGet<T>(path: string, init: RequestOptions = {}): Promise<T> {
-  return apiFetch<T>(path, { ...init, method: "GET" })
 }
 
 /** One cursor page from a list endpoint (spec §7.1: `{data, next_cursor, has_more}`). */
@@ -277,10 +225,6 @@ export type ApiPage<T> = {
   hasMore: boolean
 }
 
-/**
- * Reads a page envelope's opaque cursor. List endpoints name it `next_cursor`;
- * the events snapshot names the same concept `snapshot_cursor`.
- */
 function readPageCursor(payload: Record<string, unknown>): string {
   const raw = payload.next_cursor ?? payload.snapshot_cursor
   if (typeof raw === "string") return raw
@@ -290,8 +234,7 @@ function readPageCursor(payload: Record<string, unknown>): string {
 
 /**
  * Fetches one page of a list endpoint while preserving the pagination envelope
- * that apiFetch deliberately unwraps. `nextCursor` is "" when the response has
- * no cursor, so callers can keep paging until `hasMore` is false.
+ * that apiFetch deliberately unwraps.
  */
 export async function apiGetPage<T>(path: string, init: ApiFetchOptions = {}): Promise<ApiPage<T>> {
   const payload = await requestPayload(path, { ...init, method: "GET" })
@@ -303,18 +246,16 @@ export async function apiGetPage<T>(path: string, init: ApiFetchOptions = {}): P
   }
 }
 
+type RequestOptions = Omit<ApiFetchOptions, "method" | "body">
+
+export function apiGet<T>(path: string, init: RequestOptions = {}): Promise<T> {
+  return apiFetch<T>(path, { ...init, method: "GET" })
+}
+
 export function apiPost<T>(path: string, body?: unknown, init: RequestOptions = {}): Promise<T> {
   return apiFetch<T>(path, {
     ...init,
     method: "POST",
-    body: body === undefined ? undefined : JSON.stringify(body),
-  })
-}
-
-export function apiPut<T>(path: string, body?: unknown, init: RequestOptions = {}): Promise<T> {
-  return apiFetch<T>(path, {
-    ...init,
-    method: "PUT",
     body: body === undefined ? undefined : JSON.stringify(body),
   })
 }

@@ -1,6 +1,11 @@
-import { GlobalIssuesPage } from "@/features/delivery/components/GlobalIssuesPage"
+import type { Metadata } from "next"
 
-/** `/issues` route: the global cross-version issue center (spec §7.10). */
+import { PlaceholderPage } from "@/components/placeholder-page"
+
+export const metadata: Metadata = { title: "问题" }
+
 export default function IssuesPage() {
-  return <GlobalIssuesPage />
+  return (
+    <PlaceholderPage title="问题" phase="P1" description="跨版本缺陷跟踪、证据关联与闭环处置。" />
+  )
 }

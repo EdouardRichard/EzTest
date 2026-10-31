@@ -1,90 +1,88 @@
 import type { LucideIcon } from "lucide-react"
-import {
-  BookOpen,
-  Bot,
-  Boxes,
-  Bug,
-  FileBarChart2,
-  Gauge,
-  GitBranch,
-  Layers,
-  LayoutDashboard,
-  Network,
-  Settings,
-} from "lucide-react"
+import { BookOpen, Bot, Bug, Database, FileText, Gauge, Layers, Settings } from "lucide-react"
+
+export type NavSectionId = "workspace" | "platform"
+
+export type NavSection = {
+  id: NavSectionId
+  label: string
+}
 
 export type NavItem = {
+  key: string
   label: string
   href: string
   icon: LucideIcon
-  phase: string
-  hint?: string
-  /** Admin-only destinations are filtered out for normal users. */
-  adminOnly?: boolean
+  section: NavSectionId
+  /** True for global pages that stay placeholders until a later phase. */
+  placeholder?: boolean
+  /** Phase that will provide the real page, shown on placeholder entries. */
+  phase?: string
 }
 
-// The blueprint navigation entries. All entries are live as of P8; the phase
-// field records the release in which each destination first landed. This
-// cross-feature navigation data lives outside features/shell (Agent.md §6.4).
+export const NAV_SECTIONS: NavSection[] = [
+  { id: "workspace", label: "工作区" },
+  { id: "platform", label: "平台" },
+]
+
+/** The eight P0 navigation entries, in product order. */
 export const NAV_ITEMS: NavItem[] = [
-  { label: "概览", href: "/", icon: LayoutDashboard, phase: "P8", hint: "平台概览与系统状态" },
-  { label: "版本", href: "/versions", icon: Layers, phase: "P3", hint: "版本、多需求与澄清（P3）" },
+  { key: "versions", label: "版本", href: "/versions", icon: Layers, section: "workspace" },
   {
-    label: "用例脑图",
-    href: "/versions",
-    icon: Network,
-    phase: "P5",
-    hint: "在版本详情中打开用例脑图（P5）",
+    key: "issues",
+    label: "问题",
+    href: "/issues",
+    icon: Bug,
+    section: "workspace",
+    placeholder: true,
+    phase: "P1",
   },
-  { label: "问题", href: "/issues", icon: Bug, phase: "P7", hint: "全局问题中心（P7）" },
   {
+    key: "reports",
     label: "报告",
     href: "/reports",
-    icon: FileBarChart2,
-    phase: "P7",
-    hint: "版本与全局交付报告（P7）",
+    icon: FileText,
+    section: "workspace",
+    placeholder: true,
+    phase: "P1",
   },
   {
+    key: "knowledge",
     label: "知识",
     href: "/knowledge",
     icon: BookOpen,
-    phase: "P8",
-    hint: "已批准的版本知识与管理员审核队列（P8）",
+    section: "workspace",
+    placeholder: true,
+    phase: "P1",
+  },
+  { key: "resources", label: "资源", href: "/resources", icon: Database, section: "workspace" },
+  {
+    key: "quality",
+    label: "质量",
+    href: "/quality",
+    icon: Gauge,
+    section: "platform",
+    placeholder: true,
+    phase: "P1",
   },
   {
-    label: "代码仓",
-    href: "/code-repos",
-    icon: GitBranch,
-    phase: "P2",
-    hint: "本地 Git 代码仓（P2）",
-  },
-  { label: "公共资源", href: "/resources", icon: Boxes, phase: "P2", hint: "公共资源管理（P2）" },
-  {
+    key: "agents",
     label: "Agent 中心",
     href: "/agents",
     icon: Bot,
-    phase: "P8",
-    hint: "Agent 运行时控制台（P8 扩展为 Agent 中心）",
+    section: "platform",
+    placeholder: true,
+    phase: "P1",
   },
-  {
-    label: "质量中心",
-    href: "/quality",
-    icon: Gauge,
-    phase: "P8",
-    hint: "评测指标、阈值与基线（仅管理员）",
-    adminOnly: true,
-  },
-  { label: "设置", href: "/settings", icon: Settings, phase: "P8", hint: "账户与平台设置" },
+  { key: "settings", label: "设置", href: "/settings", icon: Settings, section: "platform" },
 ]
 
-/** Filters the navigation for one viewer: admin-only entries are hidden. */
-export function visibleNavItems(isAdmin: boolean): NavItem[] {
-  return NAV_ITEMS.filter((item) => item.adminOnly !== true || isAdmin)
+/** A navigation entry owns its exact route and every nested route below it. */
+export function isNavItemActive(pathname: string, item: NavItem): boolean {
+  return pathname === item.href || pathname.startsWith(`${item.href}/`)
 }
 
-/** Reports whether href is the active route for pathname; hash anchors never match. */
-export function isActive(pathname: string, href: string): boolean {
-  if (href.includes("#")) return false
-  if (href === "/") return pathname === "/"
-  return pathname === href || pathname.startsWith(`${href}/`)
+/** Resolves the navigation entry that owns a pathname (used by the topbar title). */
+export function findNavItem(pathname: string): NavItem | undefined {
+  return NAV_ITEMS.find((item) => isNavItemActive(pathname, item))
 }

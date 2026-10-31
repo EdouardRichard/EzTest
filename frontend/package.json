@@ -4,9 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "next dev -p 6868",
+    "dev": "next dev",
     "build": "next build",
-    "start": "next start -p 6868",
+    "start": "next start",
     "lint": "biome check .",
     "format": "biome format --write .",
     "typecheck": "tsc --noEmit",

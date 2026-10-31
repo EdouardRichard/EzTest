@@ -17,6 +17,12 @@
   --accent-foreground: #1d4ed8;
   --destructive: #dc2626;
   --destructive-foreground: #fef2f2;
+  --success: #15803d;
+  --success-foreground: #f0fdf4;
+  --warning: #b45309;
+  --warning-foreground: #fffbeb;
+  --info: #0369a1;
+  --info-foreground: #f0f9ff;
   --ring: #3b82f6;
 
   --sidebar: #0b1324;
@@ -42,6 +48,12 @@
   --accent-foreground: #93c5fd;
   --destructive: #f87171;
   --destructive-foreground: #450a0a;
+  --success: #4ade80;
+  --success-foreground: #052e16;
+  --warning: #fbbf24;
+  --warning-foreground: #451a03;
+  --info: #38bdf8;
+  --info-foreground: #082f49;
   --ring: #60a5fa;
 
   --sidebar: #060a12;
@@ -67,6 +79,12 @@
   --color-accent-foreground: var(--accent-foreground);
   --color-destructive: var(--destructive);
   --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-info: var(--info);
+  --color-info-foreground: var(--info-foreground);
   --color-ring: var(--ring);
 
   --color-sidebar: var(--sidebar);
@@ -113,8 +131,31 @@
   background-size: 32px 32px;
 }
 
+/* Authenticated shell content column: comfortable max width on large screens. */
+.app-content {
+  width: 100%;
+  max-width: 1440px;
+  margin-inline: auto;
+  padding: 24px 20px 40px;
+}
+
+@media (min-width: 1024px) {
+  .app-content {
+    padding: 28px 32px 48px;
+  }
+}
+
+/* Shared card surface used by the login panel and placeholder pages. */
+.surface-card {
+  background-color: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 18px 40px -32px rgb(15 23 42 / 0.45);
+}
+
 .login-aurora {
-  background:
+  background-color: var(--sidebar);
+  background-image:
     radial-gradient(60% 50% at 15% 10%, rgb(37 99 235 / 0.38), transparent 70%),
     radial-gradient(50% 45% at 90% 25%, rgb(14 165 233 / 0.22), transparent 70%),
     radial-gradient(60% 60% at 70% 90%, rgb(129 140 248 / 0.2), transparent 70%);

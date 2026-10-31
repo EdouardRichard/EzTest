@@ -1,73 +1,78 @@
 import { describe, expect, it } from "vitest"
 
-import { isActive, NAV_ITEMS, visibleNavItems } from "@/navigation/nav-items"
+import { findNavItem, isNavItemActive, NAV_ITEMS, NAV_SECTIONS, type NavItem } from "./nav-items"
 
-describe("navigation items", () => {
-  it("exposes the current P8 routes and keeps the future phase entries", () => {
-    const p8 = NAV_ITEMS.filter((item) => item.phase === "P8")
-    expect(p8.map((item) => item.href)).toEqual([
-      "/",
+const labels = ["版本", "问题", "报告", "知识", "资源", "质量", "Agent 中心", "设置"]
+
+describe("NAV_ITEMS", () => {
+  it("has exactly the eight P0 navigation entries in product order", () => {
+    expect(NAV_ITEMS).toHaveLength(8)
+    expect(NAV_ITEMS.map((item) => item.label)).toEqual(labels)
+  })
+
+  it("uses unique keys, hrefs and icons", () => {
+    expect(new Set(NAV_ITEMS.map((item) => item.key)).size).toBe(8)
+    expect(new Set(NAV_ITEMS.map((item) => item.href)).size).toBe(8)
+    expect(new Set(NAV_ITEMS.map((item) => item.icon)).size).toBe(8)
+  })
+
+  it("splits the five workspace entries from the three platform entries", () => {
+    expect(NAV_SECTIONS.map((section) => section.label)).toEqual(["工作区", "平台"])
+    const workspace = NAV_ITEMS.filter((item) => item.section === "workspace")
+    const platform = NAV_ITEMS.filter((item) => item.section === "platform")
+    expect(workspace.map((item) => item.label)).toEqual(["版本", "问题", "报告", "知识", "资源"])
+    expect(platform.map((item) => item.label)).toEqual(["质量", "Agent 中心", "设置"])
+  })
+
+  it("marks only the P1+ global placeholders", () => {
+    const placeholders = NAV_ITEMS.filter((item) => item.placeholder)
+    expect(placeholders.map((item) => item.label)).toEqual([
+      "问题",
+      "报告",
+      "知识",
+      "质量",
+      "Agent 中心",
+    ])
+    const p0 = NAV_ITEMS.filter((item) => !item.placeholder)
+    expect(p0.map((item) => item.label)).toEqual(["版本", "资源", "设置"])
+  })
+
+  it("points every link at its feature route", () => {
+    expect(NAV_ITEMS.map((item) => item.href)).toEqual([
+      "/versions",
+      "/issues",
+      "/reports",
       "/knowledge",
-      "/agents",
+      "/resources",
       "/quality",
+      "/agents",
       "/settings",
     ])
-    expect(NAV_ITEMS.some((item) => item.phase === "P3")).toBe(true)
+  })
+})
+
+describe("isNavItemActive", () => {
+  const versions = NAV_ITEMS[0] as NavItem
+
+  it("activates on the exact route", () => {
+    expect(isNavItemActive("/versions", versions)).toBe(true)
   })
 
-  it("shows every destination, including the quality centre, to admins", () => {
-    const items = visibleNavItems(true)
-    expect(items).toHaveLength(11)
-    expect(items.some((item) => item.href === "/quality")).toBe(true)
+  it("activates for nested routes of the section", () => {
+    expect(isNavItemActive("/versions/1024", versions)).toBe(true)
   })
 
-  it("hides the admin-only quality centre from normal users", () => {
-    const items = visibleNavItems(false)
-    expect(items).toHaveLength(10)
-    expect(items.some((item) => item.href === "/quality")).toBe(false)
-    expect(items.some((item) => item.href === "/knowledge")).toBe(true)
+  it("does not activate on a lookalike prefix or an unrelated route", () => {
+    expect(isNavItemActive("/versions-archive", versions)).toBe(false)
+    expect(isNavItemActive("/resources", versions)).toBe(false)
+    expect(isNavItemActive("/", versions)).toBe(false)
   })
+})
 
-  it("adds the knowledge entry for every logged-in user, not only admins", () => {
-    const knowledge = NAV_ITEMS.find((item) => item.href === "/knowledge")
-    expect(knowledge?.label).toBe("知识")
-    expect(knowledge?.phase).toBe("P8")
-    expect(knowledge?.adminOnly).toBeUndefined()
-    expect(visibleNavItems(false).some((item) => item.href === "/knowledge")).toBe(true)
-  })
-
-  it("marks the agent console route as the P1 agent runtime console", () => {
-    const agents = NAV_ITEMS.find((item) => item.href === "/agents")
-    expect(agents?.phase).toBe("P8")
-    expect(agents?.hint).toBe("Agent 运行时控制台（P8 扩展为 Agent 中心）")
-  })
-
-  it("points the case-mindmap entry at the version list and drops invalid hashes", () => {
-    const mindmap = NAV_ITEMS.find((item) => item.label === "用例脑图")
-    expect(mindmap?.href).toBe("/versions")
-    expect(NAV_ITEMS.some((item) => item.href.includes("#"))).toBe(false)
-  })
-
-  it("marks the issues and reports entries as P7 global delivery destinations", () => {
-    const issues = NAV_ITEMS.find((item) => item.href === "/issues")
-    const reports = NAV_ITEMS.find((item) => item.href === "/reports")
-
-    expect(issues?.phase).toBe("P7")
-    expect(reports?.phase).toBe("P7")
-    expect(issues?.hint).toContain("P7")
-    expect(reports?.hint).toContain("P7")
-    expect(issues?.hint).toContain("全局")
-    expect(reports?.hint).toContain("全局")
-  })
-
-  it("matches exact and nested routes but never hash anchors", () => {
-    expect(isActive("/", "/")).toBe(true)
-    expect(isActive("/settings", "/settings")).toBe(true)
-    expect(isActive("/settings/users", "/settings")).toBe(true)
-    expect(isActive("/versions", "/")).toBe(false)
-    expect(isActive("/versions", "/versions#mindmap")).toBe(false)
-    expect(isActive("/issues", "/issues")).toBe(true)
-    expect(isActive("/reports", "/reports")).toBe(true)
-    expect(isActive("/issues", "/reports")).toBe(false)
+describe("findNavItem", () => {
+  it("finds the entry that owns the current route", () => {
+    expect(findNavItem("/versions/42")?.label).toBe("版本")
+    expect(findNavItem("/agents")?.label).toBe("Agent 中心")
+    expect(findNavItem("/unknown")).toBeUndefined()
   })
 })
