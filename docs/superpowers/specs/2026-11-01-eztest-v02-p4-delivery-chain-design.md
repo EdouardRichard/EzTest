@@ -176,6 +176,30 @@ W1/W2 共享 `delivery/domain/types.go` 由 Lead 先落并冻结；W3 依赖端�
 - 只有外部网络/供应商短时不可用可记录 blocked 并重试；**不得**以 fake 结果替代，不得把行为失败标为“模型不稳定”后跳过。
 - 单测/集成可用 fake port（不调用真实 LLM）；这些测试不构成验收，不写入验收证据表。
 
+### 2.5 代码规范自检（P4 强制）
+
+P4 新代码/迁移必须满足 `Agent.md` §6.2–§6.9；Lead 在每个工作流合并前检查：
+
+| 项 | 要求 | 检查方式 |
+|---|---|---|
+| 目录/四层 | 新上下文 `delivery`/`chain` 四层齐全；不建 utils/common/helpers | 目录审查 |
+| 导入方向 | domain 只依赖标准库/platform；application 不导入 infrastructure/interfaces；跨上下文只依赖 application 端口 | `grep` + `go build ./...` |
+| SQL 位置 | 只在 infrastructure/postgres；handler 不写 SQL、不调 LLM SDK | 代码审查 |
+| ID | 新表主键 `id BIGINT` 雪花；JSON/工具/URL 中 ID 十进制字符串；禁止 BIGSERIAL/SERIAL | 迁移审查 + 测试 |
+| DB 命名 | 按 §3.7：`delivery_*` 表、`pk_/uk_/idx_`（全列名）、`created_at/updated_at`、同上下文 FK、跨上下文逻辑引用 | `p4-contract-check` + 迁移审查 |
+| 文件存储 | 报告 HTML 走 content ledger；二进制不入 PG；不写 `paths.report_dir` | 集成测试 |
+| 设置/env | API 只读 4 项 `EZTEST_*` env；新配置进 DB settings | config 审查 |
+| 前端 | `src/app` 只做路由/组装；请求只走 api-client、SSE 只走 sse-client；feature 结构；共享 UI 在 components/ui；不建 utils 大杂烩 | `grep` + typecheck/lint |
+| 测试 | 与代码同包/同目录；集成测试放 `internal/<context>/integration` 或 `_test.go`；不把测试辅助代码放进生产包 | 目录审查 |
+| 格式化 | `gofmt -l` 为空；`go vet ./...`；`pnpm typecheck`/`pnpm lint` 通过 | 门禁命令 |
+
+**既有 P0–P3 代码审计结论（只读，2026-11-01）**：
+
+- 干净项：无 `BIGSERIAL/SERIAL`；domain/application 未反向导入 infrastructure/interfaces；跨上下文无 DB FK；前端仅 `api-client`/`sse-client` 使用 `fetch`；env 仅在 config/testutil 读取；P3 evidence 不可变表的 `updated_at` 例外已有文档。
+- 既有偏差（**不在 P4 修改已冻结迁移**，记录 handoff backlog）：33 个表使用内联 `id BIGINT PRIMARY KEY`（PG 自动名 `<table>_pkey`，非 `pk_<table>`）；8 个未命名 `UNIQUE`（自动名非 `uk_*`）；7 个布尔列无 `is_` 前缀（`enabled/supports_tools/supports_vision/read_only/restart_required/auto_design_new_requirements/selected`）；部分表名/索引名为历史泛名。
+- 布尔字段/既有字段改名会破坏既有契约与字段名约定（D34 §6.9.2），P4 不改；若用户要求约束名修复，需追加 metadata-only 重命名迁移（跨上下文，超出 P4 四迁移范围），作为独立 `P4-D-16` 由用户批准后执行。
+- P4 不复制上述偏差；§3.7 的新表命名/索引/审计列为准。
+
 ---
 
 ## 3. 数据模型与迁移（只追加 #21–#24）
@@ -184,16 +208,18 @@ W1/W2 共享 `delivery/domain/types.go` 由 Lead 先落并冻结；W3 依赖端�
 
 - 主键 `BIGINT` 雪花，应用层生成（D29）；JSON/工具/API 中 64-bit ID 一律十进制字符串。
 - 跨上下文只做逻辑引用，不建 FK；同上下文可建 FK（`ON DELETE CASCADE` 仅限本规格明确处）。
-- 审计列：可变表 `created_at/updated_at TIMESTAMPTZ NOT NULL DEFAULT now()`；不可变表（ref/history）仅 `created_at`。
+- 审计列：**所有 P4 新表** `created_at/updated_at TIMESTAMPTZ NOT NULL DEFAULT now()`（D34 §6.9.4）；不可变/append-only 表的 `updated_at` 仅插入时初始化，仓储不提供更新方法，不可变语义由接口/测试保证（与 P3 evidence 的“仅 created_at”先例相比，P4 取更严格的 D34 字面口径）。
 - 迁移命名 `<context>_<NNNN>_<desc>.sql`；只追加，不改 #1–#20；`order.txt` 追加末尾；checksum 基于原文，无 down。
 
-### 3.2 `delivery_0001_issue.sql`（order #21，delivery 上下文，3 表）
+### 3.2 `delivery_0001_issue_lifecycle.sql`（order #21，delivery 上下文，3 表）
 
-**`issue`**
+> D34 映射：HLD 字面 `issue→delivery_issue`、`issue_ref→delivery_issue_ref`、`issue_status_history→delivery_issue_status_history`；API/事件/DTO 仍用 `Issue*`，只映射 DB 表名。
+
+**`delivery_issue`**
 
 | 列 | 类型 | 约束/默认 |
 |---|---|---|
-| `id` | BIGINT | PK `pk_issue`（雪花） |
+| `id` | BIGINT | PK `pk_delivery_issue`（雪花） |
 | `version_id` | BIGINT | NOT NULL（逻辑引用 version） |
 | `title` | TEXT | NOT NULL，CHECK `char_length BETWEEN 1 AND 500` |
 | `summary` | TEXT | NOT NULL DEFAULT ''，CHECK `char_length <= 4000` |
@@ -204,68 +230,70 @@ W1/W2 共享 `delivery/domain/types.go` 由 Lead 先落并冻结；W3 依赖端�
 | `fingerprint` | TEXT | NOT NULL DEFAULT ''，CHECK `= '' OR ~ '^[0-9a-f]{64}$'` |
 | `source` | TEXT | NOT NULL DEFAULT 'failure_candidate'，CHECK `failure_candidate` |
 | `expected_revision` | INTEGER | NOT NULL DEFAULT 1，CHECK `> 0`（CAS） |
-| `merged_into_id` | BIGINT | NULL（逻辑引用 issue） |
+| `merged_into_id` | BIGINT | NULL，同上下文 FK `REFERENCES delivery_issue(id)`（合并目标；禁自指由 CHECK 保证） |
 | `merged_at` | TIMESTAMPTZ | NULL |
 | `merged_by` | BIGINT | NULL（逻辑引用 identity） |
 | `reopen_count` | INTEGER | NOT NULL DEFAULT 0，CHECK `>= 0` |
 | `created_by_run_id` | BIGINT | NULL（逻辑引用 agent_run；确定性创建为 NULL） |
 | `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
 
-约束/索引：`pk_issue`；`uk_issue_version_dedupe UNIQUE (version_id, dedupe_key)`；`idx_issue_version_status (version_id, status, id DESC)`；`idx_issue_merged_into (merged_into_id)`；`idx_issue_created_at (created_at)`；CHECK `merged_into_id IS NULL OR merged_into_id <> id`。
+约束/索引：`pk_delivery_issue`；`uk_delivery_issue_version_id_dedupe_key UNIQUE (version_id, dedupe_key)`；`idx_delivery_issue_version_id_status_id (version_id, status, id DESC)`；`idx_delivery_issue_merged_into_id (merged_into_id)`；`idx_delivery_issue_created_at (created_at)`；CHECK `merged_into_id IS NULL OR merged_into_id <> id`。
 
-**`issue_ref`**（不可变）
+**`delivery_issue_ref`**（append-only；`updated_at` 仅初始化）
 
 | 列 | 类型 | 约束/默认 |
 |---|---|---|
-| `id` | BIGINT | PK `pk_issue_ref` |
-| `issue_id` | BIGINT | NOT NULL，FK `REFERENCES issue(id) ON DELETE CASCADE` |
+| `id` | BIGINT | PK `pk_delivery_issue_ref` |
+| `issue_id` | BIGINT | NOT NULL，FK `REFERENCES delivery_issue(id) ON DELETE CASCADE` |
 | `kind` | TEXT | NOT NULL，CHECK `case_run/case_version/wave/step_result/assertion_result/evidence/report/requirement` |
 | `ref_id` | BIGINT | NOT NULL（逻辑引用对应实体） |
 | `version_sut_id` | BIGINT | NULL（逻辑引用 version） |
 | `role` | TEXT | NOT NULL DEFAULT 'source'，CHECK `char_length <= 32` |
-| `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
 
-约束/索引：`uk_issue_ref UNIQUE (issue_id, kind, ref_id, role)`；`idx_issue_ref_kind (kind, ref_id)`；`idx_issue_ref_issue (issue_id, id)`。
+约束/索引：`uk_delivery_issue_ref_issue_id_kind_ref_id_role UNIQUE (issue_id, kind, ref_id, role)`；`idx_delivery_issue_ref_kind_ref_id (kind, ref_id)`；`idx_delivery_issue_ref_issue_id_id (issue_id, id)`。
 
-**`issue_status_history`**（不可变）
+**`delivery_issue_status_history`**（append-only；`updated_at` 仅初始化）
 
 | 列 | 类型 | 约束/默认 |
 |---|---|---|
-| `id` | BIGINT | PK `pk_issue_status_history` |
-| `issue_id` | BIGINT | NOT NULL，FK `REFERENCES issue(id) ON DELETE CASCADE` |
+| `id` | BIGINT | PK `pk_delivery_issue_status_history` |
+| `issue_id` | BIGINT | NOT NULL，FK `REFERENCES delivery_issue(id) ON DELETE CASCADE` |
 | `from_status` | TEXT | NULL（创建时为 NULL），CHECK `NULL OR open/confirmed/dismissed/merged` |
 | `to_status` | TEXT | NOT NULL，CHECK `open/confirmed/dismissed/merged` |
 | `reason` | TEXT | NOT NULL DEFAULT ''，CHECK `char_length <= 2000` |
 | `actor_id` | BIGINT | NULL（逻辑引用 identity） |
 | `actor_kind` | TEXT | NOT NULL，CHECK `user/agent/system` |
-| `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
 
-索引：`idx_issue_status_history_issue (issue_id, id)`。
+索引：`idx_delivery_issue_status_history_issue_id_id (issue_id, id)`。
 
-### 3.3 `delivery_0002_report.sql`（order #22，delivery 上下文，3 表）
+### 3.3 `delivery_0002_report_revision.sql`（order #22，delivery 上下文，3 表）
 
-**`report`**
+> D34 映射：HLD 字面 `report→delivery_report`、`report_revision→delivery_report_revision`、`report_ref→delivery_report_ref`；`content_ref.owner_kind` 仍用语义名 `report_revision`（与 evidence 的 owner_kind 用法一致）。
+
+**`delivery_report`**
 
 | 列 | 类型 | 约束/默认 |
 |---|---|---|
-| `id` | BIGINT | PK `pk_report` |
+| `id` | BIGINT | PK `pk_delivery_report` |
 | `version_id` | BIGINT | NOT NULL（逻辑引用 version） |
 | `wave_id` | BIGINT | NULL（逻辑引用 run_wave；kind=wave 必填） |
 | `kind` | TEXT | NOT NULL，CHECK `wave/version` |
-| `current_revision_id` | BIGINT | NULL（逻辑引用 report_revision） |
+| `current_revision_id` | BIGINT | NULL（逻辑引用 delivery_report_revision） |
 | `status` | TEXT | NOT NULL DEFAULT 'draft'，CHECK `draft/published/stale` |
 | `input_fingerprint` | TEXT | NOT NULL DEFAULT ''，CHECK `= '' OR ~ '^[0-9a-f]{64}$'` |
 | `created_by_run_id` | BIGINT | NULL（逻辑引用 agent_run） |
 | `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
 
-约束/索引：`pk_report`；CHECK `(kind='version' AND wave_id IS NULL) OR (kind='wave' AND wave_id IS NOT NULL)`；partial unique `uk_report_wave (version_id, wave_id) WHERE kind='wave'`、`uk_report_version (version_id) WHERE kind='version'`；`idx_report_version_kind (version_id, kind, id DESC)`；`idx_report_current_revision (current_revision_id)`。
+约束/索引：`pk_delivery_report`；CHECK `(kind='version' AND wave_id IS NULL) OR (kind='wave' AND wave_id IS NOT NULL)`；partial unique `uk_delivery_report_version_id_wave_id (version_id, wave_id) WHERE kind='wave'`、`uk_delivery_report_version_id_kind (version_id) WHERE kind='version'`；`idx_delivery_report_version_id_kind_id (version_id, kind, id DESC)`；`idx_delivery_report_current_revision_id (current_revision_id)`。
 
-**`report_revision`**（内容 append-only）
+**`delivery_report_revision`**（内容 append-only）
 
 | 列 | 类型 | 约束/默认 |
 |---|---|---|
-| `id` | BIGINT | PK `pk_report_revision` |
-| `report_id` | BIGINT | NOT NULL，FK `REFERENCES report(id) ON DELETE CASCADE` |
+| `id` | BIGINT | PK `pk_delivery_report_revision` |
+| `report_id` | BIGINT | NOT NULL，FK `REFERENCES delivery_report(id) ON DELETE CASCADE` |
 | `revision` | INTEGER | NOT NULL，CHECK `> 0` |
 | `status` | TEXT | NOT NULL DEFAULT 'draft'，CHECK `draft/published/stale` |
 | `html_ref` | BIGINT | NULL（逻辑引用 `content_ref.id`；P4 必填后置 published） |
@@ -277,29 +305,31 @@ W1/W2 共享 `delivery/domain/types.go` 由 Lead 先落并冻结；W3 依赖端�
 | `created_by_run_id` | BIGINT | NULL（逻辑引用 agent_run） |
 | `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
 
-约束/索引：`uk_report_revision UNIQUE (report_id, revision)`；`idx_report_revision_report (report_id, revision DESC)`；`idx_report_revision_html_ref (html_ref)`。
+约束/索引：`uk_delivery_report_revision_report_id_revision UNIQUE (report_id, revision)`；`idx_delivery_report_revision_report_id_revision (report_id, revision DESC)`；`idx_delivery_report_revision_html_ref_id (html_ref)`。
 **append-only 约束**：`revision/status/html_ref/input_fingerprint/as_of/template_version` 在**发布落定后**不可变；创建过程中仅允许一次 `draft→published` 落定（同时写 `html_ref/status/render_status`），发布后仅 `pdf_ref/render_status/updated_at` 可更新。服务端仓储只暴露 `FinalizePublished` 与 `MarkRenderMetadata`，不提供发布后的内容更新方法；集成测试用 SQL 尝试更新已发布内容字段必须失败（应用层用例覆盖；DB 触发器可选，不作为 P4 必需）。
 
-**`report_ref`**（不可变）
+**`delivery_report_ref`**（append-only；`updated_at` 仅初始化）
 
 | 列 | 类型 | 约束/默认 |
 |---|---|---|
-| `id` | BIGINT | PK `pk_report_ref` |
-| `report_id` | BIGINT | NOT NULL，FK `REFERENCES report(id) ON DELETE CASCADE` |
-| `report_revision_id` | BIGINT | NOT NULL，FK `REFERENCES report_revision(id) ON DELETE CASCADE` |
+| `id` | BIGINT | PK `pk_delivery_report_ref` |
+| `report_id` | BIGINT | NOT NULL，FK `REFERENCES delivery_report(id) ON DELETE CASCADE` |
+| `report_revision_id` | BIGINT | NOT NULL，FK `REFERENCES delivery_report_revision(id) ON DELETE CASCADE` |
 | `kind` | TEXT | NOT NULL，CHECK `requirement/scenario/case_version/wave/case_run/issue/version_sut` |
 | `ref_id` | BIGINT | NOT NULL（逻辑引用对应实体） |
-| `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
 
-约束/索引：`uk_report_ref UNIQUE (report_revision_id, kind, ref_id)`；`idx_report_ref_kind (kind, ref_id)`；`idx_report_ref_report (report_id, id)`。
+约束/索引：`uk_delivery_report_ref_report_revision_id_kind_ref_id UNIQUE (report_revision_id, kind, ref_id)`；`idx_delivery_report_ref_kind_ref_id (kind, ref_id)`；`idx_delivery_report_ref_report_id_id (report_id, id)`。
 
 ### 3.4 `delivery_0003_analysis_run.sql`（order #23，delivery 上下文，1 表）
 
-**`analysis_run`**
+> D34 映射：HLD 字面 `analysis_run→delivery_analysis_run`。
+
+**`delivery_analysis_run`**
 
 | 列 | 类型 | 约束/默认 |
 |---|---|---|
-| `id` | BIGINT | PK `pk_analysis_run` |
+| `id` | BIGINT | PK `pk_delivery_analysis_run` |
 | `version_id` | BIGINT | NOT NULL（逻辑引用 version） |
 | `kind` | TEXT | NOT NULL，CHECK `failure/coverage/triage` |
 | `status` | TEXT | NOT NULL DEFAULT 'queued'，CHECK `queued/running/done/failed/degraded` |
@@ -310,7 +340,7 @@ W1/W2 共享 `delivery/domain/types.go` 由 Lead 先落并冻结；W3 依赖端�
 | `error` | TEXT | NOT NULL DEFAULT ''，CHECK `char_length <= 2000` |
 | `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
 
-约束/索引：`partial unique uk_analysis_run_active (version_id, kind, dedupe_key) WHERE status IN ('queued','running')`；`uk_analysis_run_agent_run UNIQUE (agent_run_id) WHERE agent_run_id IS NOT NULL`；`idx_analysis_run_version (version_id, kind, id DESC)`。
+约束/索引：`partial unique uk_delivery_analysis_run_version_id_kind_dedupe_key (version_id, kind, dedupe_key) WHERE status IN ('queued','running')`；`uk_delivery_analysis_run_agent_run_id UNIQUE (agent_run_id) WHERE agent_run_id IS NOT NULL`；`idx_delivery_analysis_run_version_id_kind_id (version_id, kind, id DESC)`。
 P4 写入方仅 `issue.triage`；`failure/coverage` 仅保留枚举（P3 已把结果写 `case_run/step/assertion` 与事件，不重复写），P7 如需回填另立契约。
 
 ### 3.5 `version_0005_requirement_closure.sql`（order #24，version 上下文，1 表）
@@ -320,17 +350,17 @@ P4 写入方仅 `issue.triage`；`failure/coverage` 仅保留枚举（P3 已把�
 | 列 | 类型 | 约束/默认 |
 |---|---|---|
 | `id` | BIGINT | PK `pk_requirement_closure` |
-| `requirement_id` | BIGINT | NOT NULL（同上下文逻辑引用 requirement） |
-| `requirement_version_id` | BIGINT | NOT NULL（逻辑引用 requirement_version） |
+| `requirement_id` | BIGINT | NOT NULL，同上下文 FK `REFERENCES requirement(id) ON DELETE CASCADE` |
+| `requirement_version_id` | BIGINT | NOT NULL，同上下文 FK `REFERENCES requirement_version(id) ON DELETE CASCADE` |
 | `close_round` | INTEGER | NOT NULL，CHECK `> 0` |
-| `checks` | JSONB | NOT NULL（服务端重算的校验快照） |
+| `check_result` | JSONB | NOT NULL（服务端重算的校验快照；HLD `checks` 的 DB 字段映射） |
 | `evidence_refs` | JSONB | NOT NULL DEFAULT '[]'（issue/case_run/report 引用） |
 | `closed_by_run_id` | BIGINT | NULL（逻辑引用 agent_run） |
 | `closed_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
 | `reopen_count` | INTEGER | NOT NULL DEFAULT 0，CHECK `>= 0` |
 | `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
 
-约束/索引：`uk_requirement_closure_round UNIQUE (requirement_id, close_round)`；`idx_requirement_closure_requirement (requirement_id, id DESC)`；`idx_requirement_closure_version (requirement_version_id)`。
+约束/索引：`uk_requirement_closure_requirement_id_close_round UNIQUE (requirement_id, close_round)`；`idx_requirement_closure_requirement_id_id (requirement_id, id DESC)`；`idx_requirement_closure_requirement_version_id (requirement_version_id)`。
 重开时更新最新 closure 的 `reopen_count + 1`；再次关闭插入 `close_round = 已有最大轮次 + 1`。closure 行不删除。
 
 ### 3.6 既有表使用（不 ALTER）
@@ -342,6 +372,22 @@ P4 写入方仅 `issue.triage`；`failure/coverage` 仅保留枚举（P3 已把�
 - `requirement.status`（P1）：P4 新增 `closed` 写入与 `closed→draft` 重开路径；`obsolete` 只读。
 - `work_item`（P1）：新增 5 个任务类型；不改表结构。
 - 不新建 chain/todo 表（HLD L229）。
+
+### 3.7 命名与结构规范自检（Agent.md §6.9/D34）
+
+| 检查项 | P4 结论 | 落点 |
+|---|---|---|
+| 表名 | delivery 上下文 7 表统一 `delivery_*` 前缀（`delivery_issue`、`delivery_issue_ref`、`delivery_issue_status_history`、`delivery_report`、`delivery_report_revision`、`delivery_report_ref`、`delivery_analysis_run`）；`requirement_closure` 归 version 家族；全部小写单数、无 `tbl_`/`tb_` 前缀、非保留字 | §3.2–§3.5 |
+| 主键 | 全部 `id BIGINT` 雪花（应用生成），约束名 `pk_<表名>` | §3.2–§3.5 |
+| 唯一/索引 | `uk_<表名>_<列...>`、`idx_<表名>_<列...>`；partial unique 名称保留列、谓词写在 `WHERE`；**无未命名 UNIQUE** | §3.2–§3.5 |
+| 审计列 | 8 表均有 `created_at/updated_at`；append-only 表的 `updated_at` 仅插入初始化（比 P3 不可变例外更严格） | §3.1 |
+| 外键 | 同上下文显式 FK（delivery_issue_ref/delivery_issue_status_history/delivery_report_revision/delivery_report_ref/requirement_closure、delivery_issue.merged_into_id）；跨上下文仅 BIGINT 逻辑引用（version/run_wave/agent_run/content_ref/identity） | §3.2–§3.5 |
+| 字段 | lower_snake；本期无布尔字段（无需 `is_`）；无保留字；JSON/API 中 64-bit ID 十进制字符串 | §3.1 |
+| 迁移 | `<context>_<NNNN>_<desc>.sql`；#21–#24 只追加；不改 #1–#20 | §3.2–§3.5、§14 |
+| 字段映射 | HLD `issue/report/report_revision/report_ref/analysis_run`→DB 加 `delivery_` 前缀；HLD `checks`→DB `check_result`；`html_ref/pdf_ref`→`content_ref.id` | §3.3、§3.5、§6 |
+| 既有代码 | P0–P3 的已冻结迁移/历史命名问题不在 P4 修改（§6.3 禁止改已应用迁移）；P4 代码不得复制违规模式；审计结论进 handoff backlog | §18 |
+
+> 说明：D34 表名规则是“推荐 `业务名称_表的作用`”。P4 delivery 上下文统一 `delivery_*` 前缀（与 P2 `case_*`、P3 `execution_intent` 同思路），避免 `issue`/`report` 这类泛名；HLD/API/事件仍用 `Issue*`/`Report*` 语义名，DB 仅做映射。若用户要求改回 HLD 字面名，需同步改 DS §10/迁移/代码，属契约变更，P4 不自行改。
 
 ---
 
@@ -610,7 +656,7 @@ P4 写入方仅 `issue.triage`；`failure/coverage` 仅保留枚举（P3 已把�
 
 - 新增写路径：`clarified→closed`（`requirement.goal_met` 服务端校验后）；`closed→draft`（用户重开 API 或新 draft 版本创建）。
 - `obsolete` 仍只读（P6 写路径）。
-- `requirement_closure`：每次通过写一行（`close_round = 已有最大轮次+1`）；`checks` 保存服务端重算快照；`evidence_refs` 存 `case_run_id/issue_id/report_id` 引用；`closed_by_run_id` = agent_run id。
+- `requirement_closure`：每次通过写一行（`close_round = 已有最大轮次+1`）；`check_result` 保存服务端重算快照；`evidence_refs` 存 `case_run_id/issue_id/report_id` 引用；`closed_by_run_id` = agent_run id。
 - 重开：最新 closure `reopen_count++`（运营元数据，可更新）；requirement.status 置 `draft`；发 `requirement.reopened`；触发版本重开；需求当前版本不变（P1 语义），下一次澄清/确认流程沿用既有路径。
 - 新 draft 版本创建（P1 既有写入路径）：若 requirement.status=`closed`，在同一服务调用链中置 `draft`、closure.reopen_count++、发事件、版本重开。
 
@@ -823,7 +869,7 @@ P4 写入方仅 `issue.triage`；`failure/coverage` 仅保留枚举（P3 已把�
 | S1 | 问题候选/去重 | 失败 case 自动建 issue（`open`）、refs 含 case_run/case_version/wave；同一 case_version 第二波再失败仍 1 条 issue；确认→confirmed、驳回→dismissed、重开→open（reopen_count=1/history）、合并→merged+merged_into；非法合并 409 | API 响应/DB 查询/日志 |
 | S2 | wave 报告自动发布 | wave 终态后自动生成 HTML 报告；`report/report_revision` published；`html_ref` 指向 content_ref；下载字节 sha/size 一致；`run_wave.report_id` 回填；`report_ref` 有 wave/case_run/issue | API/DB/sha 对比 |
 | S3 | revision/as-of/stale | 修改 issue 后 version report 变 stale（事件一次）；`POST regenerate` 生成 revision 2；revision 1 HTML 字节不变；as_of 递增；旧 revision 仍 published | API/DB/文件 sha |
-| S4 | 需求闭环 | 真实 Version Steward 调 `requirement.goal_met`；两条需求 closed + closure 行（checks 完整）；失败应用用例有 issue 引用；open issue 不阻断；无 issue 的失败用例（构造）校验 409 | DB/API/事件/LLM 日志 |
+| S4 | 需求闭环 | 真实 Version Steward 调 `requirement.goal_met`；两条需求 closed + closure 行（check_result 完整）；失败应用用例有 issue 引用；open issue 不阻断；无 issue 的失败用例（构造）校验 409 | DB/API/事件/LLM 日志 |
 | S5 | 版本报告与收尾 | 版本总结 published 且指纹当前；Steward `version.close_propose` 成功；version completed、closed_at/close_reason/close_run_id 写入；`version.closed` 事件；close 任务自排除验证 | API/DB/事件 |
 | S6 | 重开 | 新需求创建 + 人工 `POST reopen` 均使 completed→running、清 closed_*、发事件；版本报告 stale；再次收尾可回 completed | API/DB/事件 |
 | S7 | 链路 | 实时 SSE 更新；SUT/页面/波次/状态/结果过滤；`?node/issue/report/wave` 深链；按波次历史回看 ≥2 波；superseded 用例标题非空；旧 report revision 可读；issue 历史可读；调低 `chain.max_nodes` 后 `truncated=true` 且 UI 提示 | API/截图 |
@@ -877,8 +923,8 @@ P4 写入方仅 `issue.triage`；`failure/coverage` 仅保留枚举（P3 已把�
 
 | 文件 | P4 变更 | 冻结 |
 |---|---|---|
-| `contracts/db-schema.md` | §10：8 张 P4 表逐列/约束/索引/不变量；§5 上下文归属增 `delivery`（8 表）；`chain` 无表说明；既有表使用说明 | `frozen: P4` |
-| `contracts/migrations-order.md` | §6：`delivery_0001_issue`(#21)、`delivery_0002_report`(#22)、`delivery_0003_analysis_run`(#23)、`version_0005_requirement_closure`(#24)；ownership | `frozen: P4` |
+| `contracts/db-schema.md` | §10：`delivery_issue`/`delivery_issue_ref`/`delivery_issue_status_history`/`delivery_report`/`delivery_report_revision`/`delivery_report_ref`/`delivery_analysis_run`/`requirement_closure` 逐列/约束/索引/不变量；§5 上下文归属增 `delivery`（7 表）；`chain` 无表说明；既有表使用说明 | `frozen: P4` |
+| `contracts/migrations-order.md` | §6：`delivery_0001_issue_lifecycle`(#21)、`delivery_0002_report_revision`(#22)、`delivery_0003_analysis_run`(#23)、`version_0005_requirement_closure`(#24)；ownership | `frozen: P4` |
 | `contracts/events.md` | §13：10 个 P4 事件/payload/频道 | `frozen: P4` |
 | `contracts/openapi.yaml` | `0.2.0-p4`；14 ops；tags Delivery/Chain；新增 schemas；Version/Requirement 视图可选字段 | `x-frozen: P4` |
 | `contracts/task-types.md` | §6：5 个任务类型；`report.render_pdf` 仍 §4 保留 | `frozen: P4` |
@@ -968,7 +1014,8 @@ P4 写入方仅 `issue.triage`；`failure/coverage` 仅保留枚举（P3 已把�
 7. **前置检查**：P5 启动前核对 P4 contracts `frozen: P4`、24 迁移、P4 验收证据、未交付实体表；缺 owner 即停。
 8. **风险**：§17 裁剪为下一阶段关注项。
 9. **裁决索引**：§16 + 用户 2026-11-01 裁决/纠正原话摘要（真实 LLM 原则）。
-10. **停止声明**：P4 完成即停止，不自动进入 P5；等待用户验收/批准。
+10. **规范自检与 backlog**：§2.5 的干净项/既有偏差（33 内联 PK、8 未命名 UNIQUE、7 无 `is_` 布尔列）；P4 新表合规证据；是否追加 `P4-D-16` 约束名修复的结论。
+11. **停止声明**：P4 完成即停止，不自动进入 P5；等待用户验收/批准。
 
 ---
 
