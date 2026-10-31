@@ -22,9 +22,18 @@ type VersionView struct {
 	RequirementCounts         version.RequirementCounts
 	ConversationCount         int
 	PendingDesignCount        int
+	CaseCounts                CaseCounts
 	CreatedBy                 int64
 	CreatedAt                 time.Time
 	UpdatedAt                 time.Time
+}
+
+// CaseCounts is the version projection of current (non-superseded) case
+// versions by status.
+type CaseCounts struct {
+	Draft     int
+	Confirmed int
+	Stale     int
 }
 
 // BindingView is one SUT binding with its selected resources in input order.

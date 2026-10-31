@@ -755,6 +755,65 @@ func TestRequirementRollbackCreatesDraftRevisionAndCallsStaleHook(t *testing.T) 
 
 func errOrNil(_ versionapp.RequirementDetail, err error) error { return err }
 
+func TestRequirementUpdateCallsStaleHookAndEventCarriesAffected(t *testing.T) {
+	env := newRequirementEnv(t)
+	env.hook.affected = []string{"7002", "7004"}
+	created := createRequirement(t, env, "Edit me")
+	if _, err := env.svc.Confirm(requestContext(), env.versionID, created.ID, 42); err != nil {
+		t.Fatalf("Confirm: %v", err)
+	}
+
+	draft := validRequirementDraft(env)
+	draft.Title = "Edited after confirmation"
+	updated, err := env.svc.Update(requestContext(), env.versionID, created.ID, draft, "需求变化", 42)
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if updated.Revision != 2 || updated.Status != "draft" {
+		t.Fatalf("updated = %#v", updated)
+	}
+
+	if len(env.hook.calls) != 1 {
+		t.Fatalf("stale hook calls = %#v", env.hook.calls)
+	}
+	call := env.hook.calls[0]
+	if call.versionID != env.versionID || call.requirementID != created.ID || call.reason != "需求变化" || call.revision != 2 {
+		t.Fatalf("stale call = %#v", call)
+	}
+
+	var versionEvent *eventingapp.Event
+	for i := range env.events.events {
+		event := &env.events.events[i]
+		if event.Type != "requirement.version_created" || event.Payload["revision"] != 2 {
+			continue
+		}
+		versionEvent = event
+	}
+	if versionEvent == nil {
+		t.Fatalf("events = %#v", requirementEventTypes(env.events.events))
+	}
+	affected, ok := versionEvent.Payload["affected_case_version_ids"].([]string)
+	if !ok || len(affected) != 2 || affected[0] != "7002" || affected[1] != "7004" {
+		t.Fatalf("affected = %#v", versionEvent.Payload["affected_case_version_ids"])
+	}
+}
+
+func TestRequirementUpdateStaleHookFailureIsReported(t *testing.T) {
+	env := newRequirementEnv(t)
+	created := createRequirement(t, env, "Edit fails")
+	draft := validRequirementDraft(env)
+	draft.Title = "Edited"
+	env.hook.err = errors.New("design store down")
+
+	if _, err := env.svc.Update(requestContext(), env.versionID, created.ID, draft, "需求变化", 42); err == nil {
+		t.Fatal("stale hook failure was ignored")
+	}
+	if env.repo.requirements[created.ID].CurrentVersionID == nil ||
+		*env.repo.requirements[created.ID].CurrentVersionID == created.CurrentVersionID {
+		t.Fatal("revision was not persisted before the hook failure")
+	}
+}
+
 func TestRequirementRelationsValidateAndEmit(t *testing.T) {
 	env := newRequirementEnv(t)
 	from := createRequirement(t, env, "From")

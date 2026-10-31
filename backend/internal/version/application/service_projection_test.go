@@ -1,12 +1,36 @@
 package versionapp_test
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"testing"
 
 	eventingapp "github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
+	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
+
+// fakeDesignMetrics implements versionapp.DesignMetrics.
+type fakeDesignMetrics struct {
+	pending    int
+	counts     versionapp.CaseCounts
+	pendingErr error
+	countsErr  error
+
+	pendingCalls int
+	countsCalls  int
+}
+
+func (f *fakeDesignMetrics) CountPendingDesign(_ context.Context, versionID int64) (int, error) {
+	f.pendingCalls++
+	return f.pending, f.pendingErr
+}
+
+func (f *fakeDesignMetrics) CaseCounts(_ context.Context, versionID int64) (versionapp.CaseCounts, error) {
+	f.countsCalls++
+	return f.counts, f.countsErr
+}
 
 func TestMarkRunningProjectsVersionOnce(t *testing.T) {
 	env := newTestEnv(t)
@@ -114,5 +138,59 @@ func TestListInitialVersionsWithContentClampsLimit(t *testing.T) {
 	}
 	if env.repo.lastInitialLimit != 1 {
 		t.Fatalf("zero limit = %d, want clamped 1", env.repo.lastInitialLimit)
+	}
+}
+
+func TestVersionViewUsesDesignMetrics(t *testing.T) {
+	env := newTestEnv(t)
+	env.repo.stats = version.VersionStats{
+		Requirements: version.RequirementCounts{Total: 5, Clarified: 3},
+	}
+	created := createVersion(t, env, "Design metrics")
+	metrics := &fakeDesignMetrics{
+		pending: 1,
+		counts:  versionapp.CaseCounts{Draft: 4, Confirmed: 3, Stale: 2},
+	}
+	env.svc.SetDesignMetrics(metrics)
+
+	view, err := env.svc.Get(requestContext(), created.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if view.PendingDesignCount != 1 {
+		t.Fatalf("pending design count = %d, want live design metric", view.PendingDesignCount)
+	}
+	if view.CaseCounts != (versionapp.CaseCounts{Draft: 4, Confirmed: 3, Stale: 2}) {
+		t.Fatalf("case counts = %#v", view.CaseCounts)
+	}
+	if metrics.pendingCalls == 0 || metrics.countsCalls == 0 {
+		t.Fatalf("metrics not called: %#v", metrics)
+	}
+}
+
+func TestVersionViewFallsBackToClarifiedOnMetricsError(t *testing.T) {
+	env := newTestEnv(t)
+	env.repo.stats = version.VersionStats{
+		Requirements: version.RequirementCounts{Total: 5, Clarified: 3},
+	}
+	created := createVersion(t, env, "Design metrics fallback")
+	metrics := &fakeDesignMetrics{
+		pendingErr: errors.New("design store down"),
+		countsErr:  errors.New("design store down"),
+	}
+	env.svc.SetDesignMetrics(metrics)
+
+	view, err := env.svc.Get(requestContext(), created.ID)
+	if err != nil {
+		t.Fatalf("Get must not fail on metrics errors: %v", err)
+	}
+	if view.PendingDesignCount != 3 {
+		t.Fatalf("pending design count = %d, want clarified fallback 3", view.PendingDesignCount)
+	}
+	if view.CaseCounts != (versionapp.CaseCounts{}) {
+		t.Fatalf("case counts = %#v, want zero fallback", view.CaseCounts)
+	}
+	if view.Status != version.StatusInitial || view.Title != "Design metrics fallback" {
+		t.Fatalf("view = %#v", view)
 	}
 }

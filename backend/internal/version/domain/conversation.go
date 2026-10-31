@@ -267,6 +267,11 @@ func DefaultConversationTitle(now time.Time) string {
 	return "需求澄清 " + now.Format("2006-01-02 15:04")
 }
 
+// DefaultDesignConversationTitle renders the default design-chat title.
+func DefaultDesignConversationTitle(now time.Time) string {
+	return "用例设计 " + now.Format("2006-01-02 15:04")
+}
+
 // ValidateConversationKind validates the conversation kind enum.
 func ValidateConversationKind(kind string) error {
 	switch kind {

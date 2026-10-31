@@ -271,15 +271,16 @@ func (r *ConversationRepository) SaveSummary(ctx context.Context, summary versio
 	return saved, nil
 }
 
-// ListReconcilable returns the most recent clarification conversations
-// (including zero-message conversations, so the opening fallback can fire)
-// with all their messages (ascending ID) annotated with the agent profile of
-// the run that produced them. Read-only reconciler support.
+// ListReconcilable returns the most recent conversations (including
+// zero-message conversations, so the opening fallback can fire) with all their
+// messages (ascending ID) annotated with the agent profile of the run that
+// produced them. The kind tells the reconciler whether to apply clarification
+// rules or the design rules. Read-only reconciler support.
 func (r *ConversationRepository) ListReconcilable(ctx context.Context, limit int) ([]version.ReconcilerConversation, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT c.id, c.version_id
+		SELECT c.id, c.version_id, c.kind
 		FROM conversation c
-		WHERE c.kind = 'clarification'
+		WHERE c.kind IN ('clarification', 'design')
 		ORDER BY c.id DESC
 		LIMIT $1
 	`, limit)
@@ -291,7 +292,7 @@ func (r *ConversationRepository) ListReconcilable(ctx context.Context, limit int
 	ids := make([]int64, 0)
 	for rows.Next() {
 		var conversation version.ReconcilerConversation
-		if err := rows.Scan(&conversation.ID, &conversation.VersionID); err != nil {
+		if err := rows.Scan(&conversation.ID, &conversation.VersionID, &conversation.Kind); err != nil {
 			return nil, fmt.Errorf("scan reconcilable conversation: %w", err)
 		}
 		conversation.Messages = []version.ReconcilerMessage{}

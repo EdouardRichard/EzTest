@@ -27,6 +27,7 @@ type Service struct {
 	clock   clock.Clock
 	audit   auditapp.Recorder
 	events  eventingapp.Publisher
+	metrics DesignMetrics
 }
 
 // New wires a version service. audit and events may be nil in unit tests; the
@@ -41,6 +42,14 @@ func New(
 	events eventingapp.Publisher,
 ) *Service {
 	return &Service{repo: repo, catalog: catalog, ids: ids, clock: clk, audit: audit, events: events}
+}
+
+// SetDesignMetrics injects the design projection source. It is optional (P1
+// tests and degraded wiring); a nil source keeps the clarified-count fallback.
+// Returns the service for fluent wiring.
+func (s *Service) SetDesignMetrics(metrics DesignMetrics) *Service {
+	s.metrics = metrics
+	return s
 }
 
 // CreateCommand is the payload for creating a version.
@@ -394,6 +403,18 @@ func (s *Service) buildView(ctx context.Context, entity version.Version, binding
 	if err != nil {
 		return VersionView{}, err
 	}
+	pendingDesign := stats.Requirements.Clarified
+	caseCounts := CaseCounts{}
+	if s.metrics != nil {
+		// Projections are read-only conveniences: a design-store failure must
+		// never break the version detail (P2 spec §9.2 fallback).
+		if pending, metricErr := s.metrics.CountPendingDesign(ctx, entity.ID); metricErr == nil {
+			pendingDesign = pending
+		}
+		if counts, metricErr := s.metrics.CaseCounts(ctx, entity.ID); metricErr == nil {
+			caseCounts = counts
+		}
+	}
 	view := VersionView{
 		ID:                        entity.ID,
 		Title:                     entity.Title,
@@ -402,7 +423,8 @@ func (s *Service) buildView(ctx context.Context, entity version.Version, binding
 		Bindings:                  make([]BindingView, 0, len(bindings)),
 		RequirementCounts:         stats.Requirements,
 		ConversationCount:         stats.ConversationCount,
-		PendingDesignCount:        stats.Requirements.Clarified,
+		PendingDesignCount:        pendingDesign,
+		CaseCounts:                caseCounts,
 		CreatedBy:                 entity.CreatedBy,
 		CreatedAt:                 entity.CreatedAt,
 		UpdatedAt:                 entity.UpdatedAt,

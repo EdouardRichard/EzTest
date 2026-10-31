@@ -169,18 +169,32 @@ func (s *RequirementService) Update(ctx context.Context, versionID, requirementI
 		return RequirementDetail{}, mapRequirementRepositoryError(err)
 	}
 
+	staleHook := s.stale
+	if staleHook == nil {
+		staleHook = NoopCaseStaleHook{}
+	}
+	affected, err := staleHook.MarkRequirementChanged(ctx, versionID, requirementID, reason, revision.Revision)
+	if err != nil {
+		return RequirementDetail{}, err
+	}
+	if affected == nil {
+		affected = []string{}
+	}
+
 	requirementIDString := platformid.Format(requirementID)
 	revisionIDString := platformid.Format(revisionID)
 	s.publishEvent(ctx, versionID, "requirement.version_created", map[string]any{
-		"requirement_id":         requirementIDString,
-		"requirement_version_id": revisionIDString,
-		"revision":               revision.Revision,
-		"status":                 string(version.RequirementDraft),
+		"requirement_id":            requirementIDString,
+		"requirement_version_id":    revisionIDString,
+		"revision":                  revision.Revision,
+		"status":                    string(version.RequirementDraft),
+		"affected_case_version_ids": affected,
 	}, map[string]any{"requirement_id": requirementIDString})
 	s.recordAudit(ctx, actorID, "requirement.updated", "requirement", requirementIDString, map[string]any{
-		"requirement_version_id": revisionIDString,
-		"revision":               revision.Revision,
-		"reason":                 reason,
+		"requirement_version_id":    revisionIDString,
+		"revision":                  revision.Revision,
+		"reason":                    reason,
+		"affected_case_version_ids": affected,
 	})
 	return s.Get(ctx, versionID, requirementID)
 }
@@ -491,10 +505,11 @@ func (s *RequirementService) Rollback(ctx context.Context, versionID, requiremen
 		"affected_case_version_ids": affected,
 	}, map[string]any{"requirement_id": requirementIDString})
 	s.publishEvent(ctx, versionID, "requirement.version_created", map[string]any{
-		"requirement_id":         requirementIDString,
-		"requirement_version_id": revisionIDString,
-		"revision":               revision.Revision,
-		"status":                 string(version.RequirementDraft),
+		"requirement_id":            requirementIDString,
+		"requirement_version_id":    revisionIDString,
+		"revision":                  revision.Revision,
+		"status":                    string(version.RequirementDraft),
+		"affected_case_version_ids": affected,
 	}, map[string]any{"requirement_id": requirementIDString})
 	s.recordAudit(ctx, actorID, "requirement.rolled_back", "requirement", requirementIDString, map[string]any{
 		"from_version_id":           fromRevisionIDString,

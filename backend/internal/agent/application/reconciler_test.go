@@ -337,6 +337,54 @@ func TestReconcilerEnsurePayloads(t *testing.T) {
 	}
 }
 
+func TestReconcilerDesignConversationsSkipCurateAndUseDesignTeam(t *testing.T) {
+	fixture := newReconcilerFixture(t)
+	fixture.conversations.conversations = []agentapp.ReconcilerConversation{
+		{
+			ID: 30, VersionID: 10, Kind: "design",
+			Messages: []agentapp.ReconcilerMessage{{ID: 501, Role: "user"}},
+		},
+		{ID: 31, VersionID: 10, Kind: "design"},
+		{
+			ID: 20, VersionID: 10, Kind: "clarification",
+			Messages: []agentapp.ReconcilerMessage{{ID: 601, Role: "user"}},
+		},
+	}
+
+	if err := fixture.reconciler.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	fixture.queue.mu.Lock()
+	defer fixture.queue.mu.Unlock()
+	byKey := map[string]agent.NewWorkItem{}
+	for _, call := range fixture.queue.ensureCalls {
+		byKey[call.Type+":"+call.DedupeKey] = call
+	}
+	for _, key := range []string{
+		agentapp.WorkTypeChatTurn + ":reply:601",
+		agentapp.WorkTypeRequirementCurate + ":curate:601",
+		agentapp.WorkTypeChatTurn + ":opening:31",
+	} {
+		if _, ok := byKey[key]; !ok {
+			t.Fatalf("missing task %q: %v", key, byKey)
+		}
+	}
+	// The design conversation had a user message; it gets a reply Host task but
+	// no requirement.curate rule.
+	if _, ok := byKey[agentapp.WorkTypeRequirementCurate+":curate:501"]; ok {
+		t.Fatalf("design conversation created requirement.curate: %v", byKey)
+	}
+	if byKey[agentapp.WorkTypeChatTurn+":reply:501"].Team != string(agent.TeamDesign) {
+		t.Fatalf("design reply team = %q", byKey[agentapp.WorkTypeChatTurn+":reply:501"].Team)
+	}
+	if byKey[agentapp.WorkTypeChatTurn+":opening:31"].Team != string(agent.TeamDesign) {
+		t.Fatalf("design opening team = %q", byKey[agentapp.WorkTypeChatTurn+":opening:31"].Team)
+	}
+	if byKey[agentapp.WorkTypeChatTurn+":reply:601"].Team != string(agent.TeamClarification) {
+		t.Fatalf("clarification reply team = %q", byKey[agentapp.WorkTypeChatTurn+":reply:601"].Team)
+	}
+}
+
 var _ agentapp.VersionProjector = (*fakeProjector)(nil)
 var _ agentapp.ConversationReader = (*fakeConversationReader)(nil)
 var _ agentapp.PendingAttachmentReader = (*fakePendingAttachments)(nil)

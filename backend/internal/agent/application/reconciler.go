@@ -127,12 +127,17 @@ func (r *Reconciler) reconcileConversations(ctx context.Context) error {
 			errs = append(errs, fmt.Errorf("list work items for version %d: %w", conversation.VersionID, err))
 			continue
 		}
+		team := agent.TeamClarification
+		design := conversation.Kind == "design"
+		if design {
+			team = agent.TeamDesign
+		}
 
 		// Rule 2: conversation opening.
 		if len(conversation.Messages) == 0 {
 			dedupeKey := fmt.Sprintf("opening:%d", conversation.ID)
 			if !hasBlockingTask(items, WorkTypeChatTurn, dedupeKey) {
-				created, err := r.ensure(ctx, conversation.VersionID, WorkTypeChatTurn, dedupeKey, map[string]any{
+				created, err := r.ensure(ctx, conversation.VersionID, team, WorkTypeChatTurn, dedupeKey, map[string]any{
 					"conversation_id": idText(conversation.ID),
 					"trigger":         "opening",
 				})
@@ -144,7 +149,8 @@ func (r *Reconciler) reconcileConversations(ctx context.Context) error {
 			}
 		}
 
-		// Rules 3 and 4: reply and curation per user message.
+		// Rules 3 and 4: reply and curation per user message. Design
+		// conversations keep the reply Host but never run requirement.curate.
 		for index, message := range conversation.Messages {
 			if message.Role != "user" {
 				continue
@@ -152,7 +158,7 @@ func (r *Reconciler) reconcileConversations(ctx context.Context) error {
 			if !hasAssistantAfter(conversation.Messages, index) {
 				dedupeKey := fmt.Sprintf("reply:%d", message.ID)
 				if !hasBlockingTask(items, WorkTypeChatTurn, dedupeKey) {
-					created, err := r.ensure(ctx, conversation.VersionID, WorkTypeChatTurn, dedupeKey, map[string]any{
+					created, err := r.ensure(ctx, conversation.VersionID, team, WorkTypeChatTurn, dedupeKey, map[string]any{
 						"conversation_id": idText(conversation.ID),
 						"message_id":      idText(message.ID),
 						"trigger":         "user_message",
@@ -164,10 +170,13 @@ func (r *Reconciler) reconcileConversations(ctx context.Context) error {
 					}
 				}
 			}
+			if design {
+				continue
+			}
 			if !hasCuratorAfter(conversation.Messages, index) {
 				dedupeKey := fmt.Sprintf("curate:%d", message.ID)
 				if !hasBlockingTask(items, WorkTypeRequirementCurate, dedupeKey) {
-					created, err := r.ensure(ctx, conversation.VersionID, WorkTypeRequirementCurate, dedupeKey, map[string]any{
+					created, err := r.ensure(ctx, conversation.VersionID, team, WorkTypeRequirementCurate, dedupeKey, map[string]any{
 						"conversation_id": idText(conversation.ID),
 						"message_id":      idText(message.ID),
 					})
@@ -213,17 +222,17 @@ func (r *Reconciler) reconcileAttachments(ctx context.Context) error {
 		if attachment.MessageID > 0 {
 			payload["message_id"] = idText(attachment.MessageID)
 		}
-		if _, err := r.ensure(ctx, attachment.VersionID, WorkTypeAttachmentIngest, dedupeKey, payload); err != nil {
+		if _, err := r.ensure(ctx, attachment.VersionID, agent.TeamClarification, WorkTypeAttachmentIngest, dedupeKey, payload); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
 }
 
-func (r *Reconciler) ensure(ctx context.Context, versionID int64, workType, dedupeKey string, payload map[string]any) (bool, error) {
+func (r *Reconciler) ensure(ctx context.Context, versionID int64, team agent.Team, workType, dedupeKey string, payload map[string]any) (bool, error) {
 	_, created, err := r.queue.Ensure(ctx, agent.NewWorkItem{
 		VersionID: versionID,
-		Team:      string(agent.TeamClarification),
+		Team:      string(team),
 		Type:      workType,
 		DedupeKey: dedupeKey,
 		Payload:   payload,
