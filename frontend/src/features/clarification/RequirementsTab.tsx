@@ -29,7 +29,6 @@ import type {
   RequirementDetail,
   RequirementFilter,
   TargetOptions,
-  VersionClarificationStats,
 } from "./types"
 import { useVersionEvents } from "./useVersionEvents"
 
@@ -210,8 +209,7 @@ export function RequirementsTab({
   const clarifiedCount = requirements.filter(
     (requirement) => requirement.status === "clarified",
   ).length
-  const stats = version as (Version & Partial<VersionClarificationStats>) | null
-  const pendingDesignCount = stats?.pending_design_count ?? clarifiedCount
+  const pendingDesignCount = clarifiedCount
 
   function selectRequirement(requirementId: string): void {
     setSelectedRequirementId(requirementId)
