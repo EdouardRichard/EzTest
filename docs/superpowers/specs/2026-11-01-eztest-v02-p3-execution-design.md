@@ -1,6 +1,7 @@
 # EzTest 0.2 P3 设计（执行/波次/证据/多 SUT）— 实施规格
 
-> 状态：**待用户审核**（2026-11-01）。本规格通过 brainstorming 澄清（P3/P4 边界、demo 目标系统、LLM 验收策略已由用户裁决）。
+> 状态：**用户已审核批准（2026-11-01）**。执行口径：brainstorming 澄清已完成；实施阶段无人值守，Lead 代替用户验收。
+> 用户批准追加：Agent 等待/时间窗口能力（`execution.wait`，含 120s 验收）已纳入本规格。
 > 阶段：P3。阶段文件：`docs/version-V0.2/phases/phase-03-execution.md`。
 > 前置 handoff：`docs/version-V0.2/phases/phase-02-handoff.md`（P2 completed）。
 > 本规格只实现 P3；P4+ 内容只进入 handoff/backlog/契约保留位，不实现、不提前建表。
