@@ -63,11 +63,11 @@ storage_0002_export_artifact.sql
 |---|---|---|
 | 全量门禁 | `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test.ps1` | **EXIT=0**；Go 单测+集成全部 ok；前端 54 files / 413 tests；日志 `.tmp/p2/final-gate.log` |
 | P1 回归验收 | `powershell.exe -File scripts/p1-acceptance.ps1 -FakeLLMPort 13334` | **PASS（19 steps）**；API 版本 `0.2.0-p2`；日志 `.tmp/p1-acceptance/api.log` |
-| P2 API 验收（fake） | `powershell.exe -File scripts/p2-acceptance.ps1 -FakeLLMPort 13334` | **PASS（21 steps）**；脑图、三粒度确认、幂等、Host 修改、stale/重设计、自动并入、附件、4 格式导出、SSE；日志 `.tmp/p2-acceptance/api.log` |
-| P2 浏览器 E2E（fake） | `powershell.exe -File scripts/p2-e2e.ps1` | **1 passed**；登录→设计 Tab→新对话→脑图→详情→确认→Markdown 下载；`e2e-playwright.log` |
-| 真实 LLM 探针 | `powershell.exe -File scripts/p2-acceptance-llm.ps1 -ProbeOnly` | **PASS**；DeepSeek `deepseek-flash`，约 32s 产出 2 条用例（4 steps/3-4 assertions）；日志 `.tmp/p2-acceptance/llm.log` |
-| 真实 LLM API 验收 | `powershell.exe -File scripts/p2-acceptance-llm.ps1` | **PASS**；真实对话→实时图→修改图→requirement 确认 2 版本→Markdown 导出 5914 chars；日志同上 |
-| 真实 LLM 浏览器 E2E | `powershell.exe -File scripts/p2-e2e-llm.ps1` | **1 passed（24.1s）**；真实模型主链路；日志 `.tmp/p2-acceptance/e2e-llm.log` |
+| P2 API 验收（fake） | `powershell.exe -File scripts/p2-acceptance.ps1 -FakeLLMPort 13334` | **PASS（21 steps）**；脑图、case/scenario/requirement 三粒度确认、幂等、Host 修改、stale/重设计、自动并入、附件、4 格式导出、SSE；日志 `.tmp/p2-acceptance/api.log` |
+| P2 浏览器 E2E（fake） | `powershell.exe -File scripts/p2-e2e.ps1` | **1 passed**；登录→设计 Tab→新对话→脑图→详情→确认→Markdown 下载；`e2e-playwright.log`、`screenshots/` |
+| 真实 LLM 探针 | `powershell.exe -File scripts/p2-acceptance-llm.ps1 -ProbeOnly` | **PASS**；DeepSeek `deepseek-flash` 约 22s 产出 2 条用例（首条 4 steps/3 assertions）；日志 `.tmp/p2-acceptance/llm-probe.log` |
+| 真实 LLM API 验收 | `powershell.exe -File scripts/p2-acceptance-llm.ps1` | **PASS**；真实对话→实时图→修改图→requirement 确认 2 版本→Markdown 导出 6043 chars；日志 `.tmp/p2-acceptance/llm.log` |
+| 真实 LLM 浏览器 E2E | `powershell.exe -File scripts/p2-e2e-llm.ps1` | **1 passed（19.4s）**；真实模型主链路；日志 `.tmp/p2-acceptance/e2e-llm.log`、截图 `screenshots-llm/` |
 | Server 集成 | `go test -tags=integration ./internal/server -run TestP2DesignRoutesAndEmptyGraph -v` | **PASS**；路由注册、空图、overview、export create/get/list、非法格式 400、未登录 401 |
 | 契约解析 | `node scripts/p2-contract-check.cjs` | **OK**；60 paths / 100 schemas；P2 增量存在 |
 | 迁移幂等 | `go test -tags=integration ./internal/db/...` | 17 migrations；P2 10 表；重复执行 applied 为空 |
@@ -75,7 +75,7 @@ storage_0002_export_artifact.sql
 验收清单（`phase-02-design.md`）：
 - [x] 已澄清需求 → 新建设计对话 → 团队扫描 → 初版脑图实时渲染。
 - [x] 对话修改 → 新增/修改 draft → 用户确认（单用例/场景/需求）。
-- [x] 需求版本变化 → stale → 重设计；旧 confirmed 在新 draft 确认后 superseded；旧 draft 保留历史。
+- [x] 需求版本变化 → stale → 重设计；同一 case 的新 draft 确认后旧版本 superseded；需求改版产生的新 scenario/case 是新的 case，旧组保持 stale 历史，不跨 case supersede。旧 draft 保留历史。
 - [x] 导出 4 格式可用；D25 开关/待设计 CTA 可验证。
 - [x] 测试全绿；契约 frozen。
 
@@ -100,9 +100,29 @@ storage_0002_export_artifact.sql
 | `case.graph_propose` 校验严格 | 模型一次提交可能被拒；runtime 仅按 agent turn/retry 处理 | 否 | 验收用真实模型验证；后续可加结构化错误提示 |
 | P2 无 `case.confirm` 模型工具 | AI 不能确认；确认只走用户 API | 否 | 架构/需求约束；不得为方便执行开放 |
 | P1 LLM 客户端全局 10s 超时 | 已修复为按配置 timeout；真实验收用 300s | 否 | `5041dd8`；P1 回归验收 PASS |
+| 导出 CSV 列语义/占位符 | CSV 的 `sut_names/page_names/api_targets` 当前为十进制 ID；Mermaid/OPML 未输出“未设计”占位和生成时间 | 否（P3 报告/导出可增强） | 已在评审记录为格式保真缺口；不改变 P2 冻结的 4 格式可用性 |
+| Server 级 P2 E2E 替代 | `TestP2DesignRoutesAndEmptyGraph` 覆盖路由/空图/导出；完整用例流程由 `p2-acceptance.ps1` 覆盖 | 否 | 计划 T17 原意的显式替代；完整 server E2E 留 P3/P8 |
+| requirement Update/Rollback stale hook 非同一事务 | 新 revision 已提交后 hook 失败会返回错误；reconciler stale 安全网可修复 | 否（单实例） | P2-D-16；P3 前如需强一致改为同事务 |
+| planner 任务 enqueue 不在 version tx 内 | round/scope 已走同事务；work item ensure 仍走队列（幂等、reconciler 兜底） | 否 | 失败可重扫；不阻塞 P3 |
+| graph_hash 覆盖范围 | 当前 hash 覆盖需求/场景 ID、名称/排序、case current/content hash；不覆盖 scenario description/version_sut_ids/page_ids/api_ids，纯场景元数据并发更新不会触发 base hash 409 | 否 | 评审 residual；P3 若需要再扩展 hash payload |
+| propose 的 requirement status/current 检查在锁外 | 未传 base_graph_hash 时，并发需求更新仍可能生成旧版本 draft；P2 确认路径已拒绝旧版本，因此不会进入执行集 | 否 | 评审 residual；base hash 传入时锁内复检 |
+| 断言显式 target 与步骤 target 强制相等 | 跨 SUT 断言若确需独立 target 会被拒绝 | 否（P2 语义选择） | 评审 residual；如 P3 需要跨 SUT 断言走增量契约 |
+| 历史版本 draft 的确认按钮 | CaseCard/RequirementNode 对历史 draft 仍显示确认入口，点击后后端 400；CaseDetailPanel 已按 `confirmable` 隐藏 | 否（UX） | 评审 minor；P3 UI 可优化 |
 | Agent 业务写回未按 lease_epoch CAS | 迟到 run 理论上可在接管窗口写图/确认 | 否（P1 单实例；P7 前必修） | P1 handoff 遗留风险；P7 |
 | `Agent.md` §6.1 目录树未更新 | 文档树未列 design 上下文/文件 | 否 | 本阶段不做文档编辑；列入后续文档维护 |
 | P1 长会话重复摘要 | 长设计对话可能重复摘要旧消息 | 否 | P1 遗留；P2/P8 长会话改进 |
+
+## 5a. 独立评审与处置（task-6）
+
+两次独立 read-only review（fresh reviewer + reviewer teammate）结论均为 **CHANGES REQUESTED**。已修复并复测：
+
+- **Critical**：case-scope 确认未校验场景的 `requirement_version_id`，旧需求版本 draft 可被确认。已在 confirmation tx 内校验，并收紧 `confirmable`（selected == current、当前需求版本）；新增 `TestConfirmCaseRejectsOldRequirementVersionDraft` 与 `TestGetCaseConfirmableRequiresCurrentRequirementVersion`。
+- **Important**：`base_graph_hash` 在锁外校验 → 在 requirement lock 内用 `CurrentGraphHash` 重新校验；scenario/case 累计上限 100/200 在事务内执行；确认 snapshot 的 step/assertion/source 计数改为 SQL 投影；data-plan revision 增加 requirement advisory lock；planner round/scope 写走同一 version tx；`sort_order`/`line_no` 契约漂移改为 `sort`/`line`；目标继承的 page/API/db 校验改为按 resolved target；工具增加 case/requirement scope 校验；scenario-scope 加入 P2 API 验收；真实探针使用独立 `llm-probe.log`；真实浏览器截图独立 `screenshots-llm/`。
+- **Semantics**：`design_status` 只由当前 requirement version 的 case 驱动，历史 stale 不再压制当前 confirmed。
+- **保留并记录**：CSV 名称列/占位符保真、server 级完整 P2 E2E 替代、stale hook 非同事务、planner 任务入队不在 version tx、P1 lease_epoch 遗留。见 §5。
+- **复核**：聚焦 re-review 结论 **APPROVED FOR P2**（无 Critical/Important 阻塞）；仅保留 §5 的 minor/residual（graph_hash 场景元数据覆盖、锁外 status 检查、断言 target 过严、历史 draft 按钮 UX）。
+
+复测证据：全量 gate EXIT=0；P1 回归 19 steps PASS；P2 API 21 steps PASS（含 scenario scope）；真实 LLM 探针/API/browser PASS；`node scripts/p2-contract-check.cjs` → 60 paths/100 schemas。
 
 ## 6. 下一阶段输入（P3 执行）
 
