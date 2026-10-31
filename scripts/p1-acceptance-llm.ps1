@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     P1 real-LLM acceptance (DeepSeek official endpoint).
@@ -56,8 +56,9 @@ function Api {
     if (-not [string]::IsNullOrEmpty($token)) { $headers.Authorization = "Bearer $token" }
     $params = @{ Method = $Method; Uri = $apiBase + $Path; Headers = $headers; TimeoutSec = 120 }
     if ($null -ne $Body) {
-        $params.ContentType = "application/json"
-        $params.Body = (ConvertTo-Json -InputObject $Body -Depth 30 -Compress)
+        $params.ContentType = "application/json; charset=utf-8"
+        $json = ConvertTo-Json -InputObject $Body -Depth 30 -Compress
+        $params.Body = [Text.Encoding]::UTF8.GetBytes($json)
     }
     return Invoke-RestMethod @params
 }
