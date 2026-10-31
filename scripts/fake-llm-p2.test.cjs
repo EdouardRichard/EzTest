@@ -104,6 +104,7 @@ const GRAPH = {
       scenarios: [
         {
           id: "5001",
+          requirement_version_id: "3002",
           name: "正常登录",
           cases: [
             {
@@ -160,6 +161,93 @@ const GRAPH_MIXED = {
       status: "clarified",
       target_version_sut_ids: ["9001"],
       scenarios: [],
+    },
+  ],
+};
+
+// GRAPH_REDESIGN models a requirement that changed version: the old scenario
+// and its stale case belong to the previous requirement_version (v1).
+const GRAPH_REDESIGN = {
+  version_id: "1001",
+  graph_hash: "f".repeat(64),
+  requirements: [
+    {
+      requirement_id: "3001",
+      requirement_version_id: "3002",
+      revision: 2,
+      title: "登录（新版）",
+      status: "clarified",
+      target_version_sut_ids: ["9001"],
+      scenarios: [
+        {
+          id: "5001",
+          requirement_version_id: "2902",
+          name: "旧版正常登录",
+          cases: [
+            {
+              case_id: "6001",
+              current_version_id: "6002",
+              revision: 1,
+              title: "旧版用例",
+              status: "stale",
+              default_version_sut_id: "9001",
+              version_sut_ids: ["9001"],
+            },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
+// GRAPH_MIXED_VERSIONS has an old-version scenario first and the current-version
+// scenario second, so case selection must match requirement_version_id, not
+// scenario order.
+const GRAPH_MIXED_VERSIONS = {
+  version_id: "1001",
+  graph_hash: "9".repeat(64),
+  requirements: [
+    {
+      requirement_id: "3001",
+      requirement_version_id: "3002",
+      revision: 2,
+      title: "登录（新版）",
+      status: "clarified",
+      target_version_sut_ids: ["9001"],
+      scenarios: [
+        {
+          id: "5001",
+          requirement_version_id: "2902",
+          name: "旧版登录",
+          cases: [
+            {
+              case_id: "6001",
+              current_version_id: "6002",
+              revision: 1,
+              title: "旧版用例",
+              status: "stale",
+              default_version_sut_id: "9001",
+              version_sut_ids: ["9001"],
+            },
+          ],
+        },
+        {
+          id: "5101",
+          requirement_version_id: "3002",
+          name: "新版登录",
+          cases: [
+            {
+              case_id: "7001",
+              current_version_id: "7002",
+              revision: 1,
+              title: "新版用例",
+              status: "draft",
+              default_version_sut_id: "9001",
+              version_sut_ids: ["9001"],
+            },
+          ],
+        },
+      ],
     },
   ],
 };
@@ -340,6 +428,39 @@ test("case_author selects the scoped clarified requirement", async () => {
   const fallbackProposal = assistantToolCall(fallback.json.choices[0].message);
   assert.equal(fallbackProposal.args.requirement_id, "3001");
   assert.equal(fallbackProposal.args.requirement_version_id, "3002");
+});
+
+test("case_author on a new requirement version ignores old-version scenarios", async () => {
+  const response = await postChat({
+    model: "fake-llm",
+    messages: [systemMarked("case_author", taskScope("3001")), userText("重新设计需求 3001"), toolResult(GRAPH_REDESIGN)],
+  });
+  const propose = assistantToolCall(response.json.choices[0].message);
+  assert.equal(propose.name, "case.graph_propose");
+  assert.equal(propose.args.requirement_id, "3001");
+  assert.equal(propose.args.requirement_version_id, "3002");
+  // The only scenario in the graph belongs to the previous requirement_version
+  // (2902), so redesign must create a new scenario/case instead of reusing it.
+  assert.equal(propose.args.scenarios.length, 1);
+  assert.equal(propose.args.scenarios[0].id, undefined);
+  assert.equal(propose.args.cases.length, 2);
+  for (const item of propose.args.cases) {
+    assert.equal(item.id, undefined);
+    assert.equal(item.scenario_ref, "s1");
+  }
+});
+
+test("design_host updates only cases under the requirement's current version", async () => {
+  const response = await postChat({
+    model: "fake-llm",
+    messages: [systemMarked("design_host"), userText("修改用例"), toolResult(GRAPH_MIXED_VERSIONS)],
+  });
+  const propose = assistantToolCall(response.json.choices[0].message);
+  assert.equal(propose.name, "case.graph_propose");
+  assert.equal(propose.args.requirement_version_id, "3002");
+  assert.equal(propose.args.scenarios.length, 1);
+  assert.equal(propose.args.scenarios[0].id, "5101");
+  assert.equal(propose.args.cases[0].id, "7001");
 });
 
 test("design_critic submits one minor finding before the final text", async () => {
