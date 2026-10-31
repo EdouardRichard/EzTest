@@ -8,3 +8,10 @@ storage_0001_content_ledger.sql
 audit_0001_audit_log.sql
 resource_0001_catalog.sql
 version_0001_versions.sql
+agent_0001_work_item.sql
+agent_0002_team_room.sql
+agent_0003_runtime.sql
+version_0002_requirement.sql
+version_0003_conversation.sql
+version_0004_requirement_attachment.sql
+eventing_0002_event_index.sql
