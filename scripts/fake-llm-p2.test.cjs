@@ -63,8 +63,12 @@ async function postChat(body) {
   return { status: response.status, json };
 }
 
-function systemMarked(profile) {
-  return { role: "system", content: "[profile:" + profile + "] 角色提示词" };
+function systemMarked(profile, extra) {
+  return { role: "system", content: "[profile:" + profile + "] 角色提示词" + (extra || "") };
+}
+
+function taskScope(requirementID) {
+  return "\n# 任务\n作用域:\n- version_id=1001\n- requirement_id=" + requirementID;
 }
 
 function userText(text) {
@@ -133,6 +137,33 @@ const GRAPH_EMPTY = {
   ],
 };
 
+// GRAPH_MIXED puts a non-clarified (rolled-back/draft) requirement first so the
+// author must use the injected requirement scope rather than the first row.
+const GRAPH_MIXED = {
+  version_id: "1001",
+  graph_hash: "e".repeat(64),
+  requirements: [
+    {
+      requirement_id: "2001",
+      requirement_version_id: "2002",
+      revision: 2,
+      title: "被回退的需求",
+      status: "draft",
+      target_version_sut_ids: ["9001"],
+      scenarios: [],
+    },
+    {
+      requirement_id: "3001",
+      requirement_version_id: "3002",
+      revision: 1,
+      title: "登录",
+      status: "clarified",
+      target_version_sut_ids: ["9001"],
+      scenarios: [],
+    },
+  ],
+};
+
 before(startFake);
 after(() => {
   if (child && !child.killed) child.kill();
@@ -192,6 +223,7 @@ test("design_host reads the graph then proposes a draft when asked to modify", a
   assert.equal(propose.args.scenarios[0].id, "5001");
   assert.equal(propose.args.cases.length, 1);
   assert.equal(propose.args.cases[0].id, "7001");
+  assert.equal(propose.args.cases[0].ref, "c1");
 
   const third = await postChat({
     model: "fake-llm",
@@ -215,6 +247,17 @@ test("design_host creates a scenario and case when the graph has none", async ()
   assert.equal(propose.args.scenarios[0].id, undefined);
   assert.equal(propose.args.cases[0].id, undefined);
   assert.equal(propose.args.cases[0].steps.length >= 1, true);
+});
+
+test("design_host proposes against the first clarified requirement when a draft row is first", async () => {
+  const { json } = await postChat({
+    model: "fake-llm",
+    messages: [systemMarked("design_host"), userText("新增用例"), toolResult(GRAPH_MIXED)],
+  });
+  const propose = assistantToolCall(json.choices[0].message);
+  assert.equal(propose.name, "case.graph_propose");
+  assert.equal(propose.args.requirement_id, "3001");
+  assert.equal(propose.args.requirement_version_id, "3002");
 });
 
 test("design_planner returns a scope-only text without tools", async () => {
@@ -246,9 +289,17 @@ test("case_author reads the graph then proposes one scenario and two cases", asy
   assert.equal(propose.args.requirement_version_id, "3002");
   assert.equal(propose.args.scenarios.length, 1);
   assert.equal(propose.args.cases.length, 2);
+  // The design tool validator dedupes by ref: every proposed case (and the
+  // single scenario) must carry a unique ref, and each case must resolve to
+  // the scenario ref.
+  const caseRefs = propose.args.cases.map((item) => item.ref);
+  assert.equal(new Set(caseRefs).size, caseRefs.length, "duplicate case refs: " + JSON.stringify(caseRefs));
+  assert.deepEqual(caseRefs, ["c1", "c2"]);
+  const scenarioRefs = propose.args.scenarios.map((item) => item.ref);
+  assert.equal(new Set(scenarioRefs).size, scenarioRefs.length, "duplicate scenario refs: " + JSON.stringify(scenarioRefs));
   for (const item of propose.args.cases) {
     assert.ok(item.title.length > 0);
-    assert.ok(item.scenario_ref === "s1");
+    assert.ok(scenarioRefs.includes(item.scenario_ref), "unknown scenario_ref: " + item.scenario_ref);
     assert.equal(item.default_version_sut_id, "9001");
     assert.ok(Array.isArray(item.version_sut_ids) && item.version_sut_ids.length > 0);
     assert.ok(item.steps.length >= 1);
@@ -268,6 +319,27 @@ test("case_author reads the graph then proposes one scenario and two cases", asy
   });
   assert.equal(third.json.choices[0].message.tool_calls, undefined);
   assert.ok(third.json.choices[0].message.content.length > 0);
+});
+
+test("case_author selects the scoped clarified requirement", async () => {
+  const scoped = await postChat({
+    model: "fake-llm",
+    messages: [systemMarked("case_author", taskScope("3001")), userText("设计需求 3001"), toolResult(GRAPH_MIXED)],
+  });
+  const propose = assistantToolCall(scoped.json.choices[0].message);
+  assert.equal(propose.name, "case.graph_propose");
+  assert.equal(propose.args.requirement_id, "3001");
+  assert.equal(propose.args.requirement_version_id, "3002");
+
+  // Without a scope marker the author falls back to the first clarified
+  // requirement, never the draft/rolled-back row.
+  const fallback = await postChat({
+    model: "fake-llm",
+    messages: [systemMarked("case_author"), userText("设计需求"), toolResult(GRAPH_MIXED)],
+  });
+  const fallbackProposal = assistantToolCall(fallback.json.choices[0].message);
+  assert.equal(fallbackProposal.args.requirement_id, "3001");
+  assert.equal(fallbackProposal.args.requirement_version_id, "3002");
 });
 
 test("design_critic submits one minor finding before the final text", async () => {
