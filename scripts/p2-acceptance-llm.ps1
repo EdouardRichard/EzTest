@@ -226,6 +226,15 @@ try {
         if ($cases.Count -ge 1) { break }
     }
     if ($cases.Count -lt 1) { throw "real model produced no design case within ${PollTimeoutSeconds}s" }
+    $designRequirementID = ""
+    $graphSnapshot = Api "GET" "/api/versions/$versionID/design/graph" $null
+    foreach ($req in @($graphSnapshot.data.requirements)) {
+        foreach ($scenario in @($req.scenarios)) {
+            if ((@($scenario.cases)).Count -gt 0) { $designRequirementID = [string]$req.requirement_id; break }
+        }
+        if ($designRequirementID -ne "") { break }
+    }
+    if ($designRequirementID -eq "") { throw "real model graph has cases but no requirement id" }
     $first = $cases[0]
     if ($first.status -ne "draft") { throw ("real model first case status is {0}, want draft" -f $first.status) }
     if ([int]$first.step_count -lt 1 -or [int]$first.assertion_count -lt 1) {
@@ -266,7 +275,7 @@ try {
     if (-not $changed) { throw "real model did not change the design graph after a modify request" }
     Log "real model graph changed via design conversation"
 
-    $confirm = Api "POST" "/api/versions/$versionID/design/confirmations" @{ scope = "requirement"; target_id = $requirementIDs[0] }
+    $confirm = Api "POST" "/api/versions/$versionID/design/confirmations" @{ scope = "requirement"; target_id = $designRequirementID }
     $confirmed = @($confirm.data.confirmed)
     if ($confirmed.Count -lt 1) { throw "requirement-scope confirmation confirmed no real-model case" }
     Log ("confirmed real-model case versions: " + $confirmed.Count)
