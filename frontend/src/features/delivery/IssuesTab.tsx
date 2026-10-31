@@ -1,7 +1,7 @@
 "use client"
 
 import { useRouter, useSearchParams } from "next/navigation"
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
 import { Badge, type BadgeTone } from "@/components/ui/Badge"
 import { EmptyState } from "@/components/ui/EmptyState"
@@ -10,6 +10,7 @@ import { Field } from "@/components/ui/Field"
 import { Select } from "@/components/ui/Select"
 import { LoadingCard } from "@/components/ui/Spinner"
 import { Table, type TableColumn } from "@/components/ui/Table"
+import { useVersionEvents } from "@/features/clarification/useVersionEvents"
 import { formatDateTime } from "@/lib/format"
 
 import { confirmIssue, dismissIssue, getIssue, listIssues, reopenIssue } from "./api"
@@ -52,6 +53,9 @@ const STATUS_TONE: Record<IssueStatus, BadgeTone> = {
   dismissed: "neutral",
   merged: "info",
 }
+
+/** SSE bursts (issue.reopened + issue.updated) collapse into one snapshot refetch. */
+const SSE_REFRESH_DEBOUNCE_MS = 350
 
 function buildListOptions(filters: IssueFilters): IssueListOptions {
   const options: IssueListOptions = { limit: 20 }
@@ -213,6 +217,58 @@ export function IssuesTab({ versionId }: IssuesTabProps) {
       }
     }
   }, [fetchIssues, selectedIssueId, versionId])
+
+  const selectedIssueIdRef = useRef(selectedIssueId)
+  selectedIssueIdRef.current = selectedIssueId
+
+  /** Silent snapshot refetch for SSE events: keeps the current view while loading. */
+  const refetchFromEvents = useCallback(async () => {
+    try {
+      setIssues(await fetchIssues())
+    } catch {
+      // Keep the last list snapshot; the next event or manual retry refreshes.
+    }
+    const issueId = selectedIssueIdRef.current
+    if (issueId === null) return
+    try {
+      setDetail(await getIssue(versionId, issueId))
+    } catch {
+      // Keep the last detail snapshot.
+    }
+  }, [fetchIssues, versionId])
+
+  const eventRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const eventRefreshRef = useRef(refetchFromEvents)
+  eventRefreshRef.current = refetchFromEvents
+
+  const scheduleEventRefresh = useCallback(() => {
+    if (eventRefreshTimer.current !== null) clearTimeout(eventRefreshTimer.current)
+    eventRefreshTimer.current = setTimeout(() => {
+      eventRefreshTimer.current = null
+      void eventRefreshRef.current()
+    }, SSE_REFRESH_DEBOUNCE_MS)
+  }, [])
+
+  const refreshNow = useCallback(() => {
+    if (eventRefreshTimer.current !== null) {
+      clearTimeout(eventRefreshTimer.current)
+      eventRefreshTimer.current = null
+    }
+    void eventRefreshRef.current()
+  }, [])
+
+  useEffect(
+    () => () => {
+      if (eventRefreshTimer.current !== null) clearTimeout(eventRefreshTimer.current)
+    },
+    [],
+  )
+
+  // One subscription per rendered tab; events only schedule a snapshot refetch.
+  useVersionEvents(versionId, {
+    onIssueChanged: scheduleEventRefresh,
+    onStreamReset: refreshNow,
+  })
 
   const handleTransition = useCallback(
     async (action: IssueTransitionAction, reason: string): Promise<void> => {

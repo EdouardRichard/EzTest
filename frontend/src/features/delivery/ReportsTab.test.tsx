@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
@@ -33,6 +33,26 @@ vi.mock("next/navigation", () => ({
   useRouter: () => navigation,
   useSearchParams: () => search.params,
 }))
+
+const sse = vi.hoisted(() => ({
+  handlers: null as Record<string, (event: unknown) => void> | null,
+  calls: 0,
+}))
+vi.mock("@/features/clarification/useVersionEvents", async () => {
+  const React = await import("react")
+  return {
+    useVersionEvents: (
+      _versionId: string,
+      handlers: Record<string, (event: unknown) => void>,
+    ): string => {
+      sse.handlers = handlers
+      React.useEffect(() => {
+        sse.calls += 1
+      }, [])
+      return "live"
+    },
+  }
+})
 
 import { ReportsTab } from "./ReportsTab"
 
@@ -157,6 +177,8 @@ describe("ReportsTab", () => {
     for (const fn of Object.values(api)) fn.mockReset()
     navigation.replace.mockReset()
     search.params = new URLSearchParams()
+    sse.handlers = null
+    sse.calls = 0
     mockApi()
   })
 
@@ -237,6 +259,57 @@ describe("ReportsTab", () => {
       expect(within(detailPanel()).getByText(/2026-10-31/)).toHaveTextContent("2026-10-31"),
     )
     expect(navigation.replace).not.toHaveBeenCalled()
+  })
+
+  it("refetches reports and detail on P4 events while keeping the selected revision", async () => {
+    render(<ReportsTab versionId="2001" />)
+    await screen.findByTestId("report-8101")
+    fireEvent.change(await screen.findByLabelText("修订版本"), { target: { value: "1" } })
+    await waitFor(() => expect(api.getRevision).toHaveBeenCalledWith("2001", "8101", 1))
+
+    expect(sse.calls).toBe(1)
+    expect(sse.handlers).not.toBeNull()
+    const listCalls = api.listReports.mock.calls.length
+    const detailCalls = api.getReport.mock.calls.length
+    const revisionCalls = api.getRevision.mock.calls.length
+
+    act(() => {
+      sse.handlers?.onReportChanged?.({ type: "report.stale" })
+      sse.handlers?.onIssueChanged?.({ type: "issue.updated" })
+      sse.handlers?.onRequirementChanged?.({ type: "requirement.closed" })
+      sse.handlers?.onVersionChanged?.({ type: "version.reopened" })
+    })
+
+    await waitFor(() => expect(api.listReports).toHaveBeenCalledTimes(listCalls + 1), {
+      timeout: 2000,
+    })
+    await waitFor(() => expect(api.getReport).toHaveBeenCalledTimes(detailCalls + 1), {
+      timeout: 2000,
+    })
+    await waitFor(() => expect(api.getRevision).toHaveBeenCalledTimes(revisionCalls + 1), {
+      timeout: 2000,
+    })
+
+    // The explicit revision selection is not reset by a live refresh.
+    expect(screen.getByLabelText("修订版本")).toHaveValue("1")
+    expect(within(detailPanel()).getByText(/2026-10-31/)).toHaveTextContent("2026-10-31")
+    expect(navigation.replace).toHaveBeenCalledWith(
+      "/versions/2001?tab=reports&report=8101&revision=1",
+    )
+    expect(sse.calls).toBe(1)
+  })
+
+  it("refetches the report list on stream.reset without a new subscription", async () => {
+    render(<ReportsTab versionId="2001" />)
+    await screen.findByTestId("report-8101")
+    const listCalls = api.listReports.mock.calls.length
+
+    act(() => {
+      sse.handlers?.onStreamReset?.({ reason: "cursor_too_old", snapshot_cursor: 99 })
+    })
+
+    await waitFor(() => expect(api.listReports).toHaveBeenCalledTimes(listCalls + 1))
+    expect(sse.calls).toBe(1)
   })
 
   it("regenerates with a reason, disables duplicate submission and refreshes", async () => {

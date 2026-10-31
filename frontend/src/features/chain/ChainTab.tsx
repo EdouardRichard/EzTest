@@ -35,6 +35,12 @@ import {
 
 export type ChainTabProps = {
   versionId: string
+  /**
+   * Called when a `version.*` event arrives, in addition to the tab's own
+   * debounced chain refresh. The version page uses it to refresh the header and
+   * tab counts; the chain never rebuilds business state from events.
+   */
+  onVersionChanged?: () => void
 }
 
 const REFRESH_DEBOUNCE_MS = 350
@@ -62,7 +68,7 @@ function truncationReasonLabel(reason: ChainTruncationReason): string {
  * truncation warning, event timeline and URL deep links. No business state is
  * rebuilt from events; an event only schedules a debounced snapshot refetch.
  */
-export function ChainTab({ versionId }: ChainTabProps) {
+export function ChainTab({ versionId, onVersionChanged: notifyVersionChanged }: ChainTabProps) {
   const router = useRouter()
   const searchParams = useSearchParams()
 
@@ -188,6 +194,10 @@ export function ChainTab({ versionId }: ChainTabProps) {
     onIssueChanged: scheduleRefresh,
     onReportChanged: scheduleRefresh,
     onRequirementChanged: scheduleRefresh,
+    onVersionChanged: () => {
+      notifyVersionChanged?.()
+      scheduleRefresh()
+    },
     onStreamReset: scheduleRefresh,
   })
 

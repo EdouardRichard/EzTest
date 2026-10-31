@@ -1,10 +1,10 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
 import { ApiError } from "@/lib/api-client"
 
-import type { VersionTab } from "./types"
+import type { Version, VersionTab } from "./types"
 
 const api = vi.hoisted(() => ({
   listVersions: vi.fn(),
@@ -23,6 +23,30 @@ vi.mock("@/features/delivery/api", () => deliveryApi)
 
 const executionApi = vi.hoisted(() => ({ listHumanRequests: vi.fn() }))
 vi.mock("@/features/execution/api", () => executionApi)
+
+const chainProps = vi.hoisted(() => ({
+  onVersionChanged: null as (() => void) | null,
+}))
+
+const sse = vi.hoisted(() => ({
+  handlers: null as Record<string, (event: unknown) => void> | null,
+  calls: 0,
+}))
+vi.mock("@/features/clarification/useVersionEvents", async () => {
+  const React = await import("react")
+  return {
+    useVersionEvents: (
+      _versionId: string,
+      handlers: Record<string, (event: unknown) => void>,
+    ): string => {
+      sse.handlers = handlers
+      React.useEffect(() => {
+        sse.calls += 1
+      }, [])
+      return "live"
+    },
+  }
+})
 
 vi.mock("@/features/clarification/RequirementsTab", async () => {
   const React = await import("react")
@@ -100,11 +124,13 @@ vi.mock("@/features/delivery/ReportsTab", async () => {
 vi.mock("@/features/chain/ChainTab", async () => {
   const React = await import("react")
   return {
-    ChainTab: (props: { versionId: string }) =>
-      React.createElement("div", {
+    ChainTab: (props: { versionId: string; onVersionChanged?: () => void }) => {
+      chainProps.onVersionChanged = props.onVersionChanged ?? null
+      return React.createElement("div", {
         "data-testid": "chain-workspace",
         "data-version-id": props.versionId,
-      }),
+      })
+    },
   }
 })
 
@@ -126,6 +152,13 @@ vi.mock("next/navigation", () => ({
 import { versionFixture } from "./test-fixtures"
 import { VersionDetailPage } from "./VersionDetailPage"
 
+const completedVersion: Version = {
+  ...versionFixture,
+  status: "completed",
+  closed_at: "2026-11-01T03:00:00Z",
+  close_reason: "需求全部闭环，报告已发布",
+}
+
 describe("VersionDetailPage", () => {
   beforeEach(() => {
     api.getVersion.mockReset()
@@ -139,6 +172,9 @@ describe("VersionDetailPage", () => {
     executionApi.listHumanRequests.mockResolvedValue([])
     navigation.replace.mockReset()
     search.params = new URLSearchParams()
+    sse.handlers = null
+    sse.calls = 0
+    chainProps.onVersionChanged = null
   })
 
   afterEach(cleanup)
@@ -183,6 +219,93 @@ describe("VersionDetailPage", () => {
 
     await waitFor(() => expect(screen.getByRole("tab", { name: /问题/ })).toHaveTextContent("2"))
     expect(screen.getByRole("tab", { name: /报告/ })).toHaveTextContent("2")
+  })
+
+  it("subscribes once and refreshes the header and tab counts on version events", async () => {
+    render(<VersionDetailPage versionId="2001" />)
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+    await waitFor(() => expect(deliveryApi.listIssues).toHaveBeenCalledTimes(1))
+    const issueCalls = deliveryApi.listIssues.mock.calls.length
+    const reportCalls = deliveryApi.listReports.mock.calls.length
+
+    expect(sse.calls).toBe(1)
+    expect(sse.handlers).not.toBeNull()
+
+    api.getVersion.mockResolvedValue(completedVersion)
+    act(() => {
+      sse.handlers?.onVersionChanged?.({
+        type: "version.closed",
+        payload: { version_id: "2001" },
+      })
+    })
+
+    expect(await screen.findByText("已完成")).toBeInTheDocument()
+    await waitFor(() => expect(api.getVersion).toHaveBeenCalledTimes(2), { timeout: 2000 })
+    await waitFor(() => expect(deliveryApi.listIssues).toHaveBeenCalledTimes(issueCalls + 1), {
+      timeout: 2000,
+    })
+    await waitFor(() => expect(deliveryApi.listReports).toHaveBeenCalledTimes(reportCalls + 1), {
+      timeout: 2000,
+    })
+    expect(sse.calls).toBe(1)
+  })
+
+  it("refreshes the issue and report counts on P4 tab events", async () => {
+    deliveryApi.listIssues.mockResolvedValue([{ id: "9101", status: "open" }])
+    render(<VersionDetailPage versionId="2001" />)
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+    await waitFor(() => expect(deliveryApi.listIssues).toHaveBeenCalledTimes(1))
+    const issueCalls = deliveryApi.listIssues.mock.calls.length
+    const reportCalls = deliveryApi.listReports.mock.calls.length
+
+    deliveryApi.listIssues.mockResolvedValue([
+      { id: "9101", status: "open" },
+      { id: "9102", status: "open" },
+      { id: "9103", status: "open" },
+    ])
+    act(() => {
+      sse.handlers?.onIssueChanged?.({ type: "issue.created", payload: { issue_id: "9103" } })
+      sse.handlers?.onReportChanged?.({ type: "report.stale", payload: { report_id: "8101" } })
+    })
+
+    await waitFor(() => expect(deliveryApi.listIssues).toHaveBeenCalledTimes(issueCalls + 1), {
+      timeout: 2000,
+    })
+    await waitFor(() => expect(deliveryApi.listReports).toHaveBeenCalledTimes(reportCalls + 1), {
+      timeout: 2000,
+    })
+    await waitFor(() => expect(screen.getByRole("tab", { name: /问题/ })).toHaveTextContent("3"))
+    expect(api.getVersion).toHaveBeenCalledTimes(1)
+  })
+
+  it("refetches the version and counts on stream.reset", async () => {
+    render(<VersionDetailPage versionId="2001" />)
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+    await waitFor(() => expect(deliveryApi.listIssues).toHaveBeenCalledTimes(1))
+
+    act(() => {
+      sse.handlers?.onStreamReset?.({ reason: "cursor_too_old", snapshot_cursor: 99 })
+    })
+
+    await waitFor(() => expect(api.getVersion).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(deliveryApi.listIssues).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(deliveryApi.listReports).toHaveBeenCalledTimes(2))
+  })
+
+  it("hands the version-change refresh into the chain tab", async () => {
+    render(<VersionDetailPage versionId="2001" initialTab="chain" />)
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+    await waitFor(() => expect(deliveryApi.listIssues).toHaveBeenCalledTimes(1))
+
+    expect(chainProps.onVersionChanged).not.toBeNull()
+    act(() => {
+      chainProps.onVersionChanged?.()
+    })
+
+    await waitFor(() => expect(api.getVersion).toHaveBeenCalledTimes(2), { timeout: 2000 })
+    await waitFor(() => expect(deliveryApi.listIssues).toHaveBeenCalledTimes(2), {
+      timeout: 2000,
+    })
   })
 
   it("opens the current-version todo drawer from the version header", async () => {

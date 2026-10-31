@@ -22,16 +22,23 @@ vi.mock("@/features/versions/api", () => versionsApi)
 const sse = vi.hoisted(() => ({
   handlers: null as Record<string, (event: unknown) => void> | null,
   status: "live",
+  calls: 0,
 }))
-vi.mock("@/features/clarification/useVersionEvents", () => ({
-  useVersionEvents: (
-    _versionId: string,
-    handlers: Record<string, (event: unknown) => void>,
-  ): string => {
-    sse.handlers = handlers
-    return sse.status
-  },
-}))
+vi.mock("@/features/clarification/useVersionEvents", async () => {
+  const React = await import("react")
+  return {
+    useVersionEvents: (
+      _versionId: string,
+      handlers: Record<string, (event: unknown) => void>,
+    ): string => {
+      sse.handlers = handlers
+      React.useEffect(() => {
+        sse.calls += 1
+      }, [])
+      return sse.status
+    },
+  }
+})
 
 const navigation = vi.hoisted(() => ({
   push: vi.fn(),
@@ -285,6 +292,7 @@ function mockWorkspace(): void {
   api.listChainEvents.mockResolvedValue(events)
   versionsApi.getVersion.mockResolvedValue(versionFixture)
   sse.handlers = null
+  sse.calls = 0
 }
 
 async function renderChain(): Promise<void> {
@@ -537,6 +545,44 @@ describe("ChainTab", () => {
     })
     await new Promise((resolve) => setTimeout(resolve, 450))
     expect(api.getChain).toHaveBeenCalledTimes(2)
+  })
+
+  it("subscribes once and refetches on P4 issue/report/requirement/version events", async () => {
+    await renderChain()
+    await waitFor(() => expect(api.getChain).toHaveBeenCalledTimes(1))
+    expect(sse.calls).toBe(1)
+
+    for (const handler of [
+      "onIssueChanged",
+      "onReportChanged",
+      "onRequirementChanged",
+      "onVersionChanged",
+    ] as const) {
+      expect(typeof sse.handlers?.[handler]).toBe("function")
+    }
+
+    act(() => {
+      sse.handlers?.onVersionChanged?.({ type: "version.reopened" })
+    })
+    await waitFor(() => expect(api.getChain).toHaveBeenCalledTimes(2), { timeout: 2000 })
+
+    act(() => {
+      sse.handlers?.onReportChanged?.({ type: "report.stale" })
+    })
+    await waitFor(() => expect(api.getChain).toHaveBeenCalledTimes(3), { timeout: 2000 })
+  })
+
+  it("notifies the host when the version projection changes", async () => {
+    const onVersionChanged = vi.fn()
+    render(<ChainTab versionId="2001" onVersionChanged={onVersionChanged} />)
+    await screen.findByTestId("chain-graph")
+
+    act(() => {
+      sse.handlers?.onVersionChanged?.({ type: "version.closed" })
+    })
+
+    expect(onVersionChanged).toHaveBeenCalledTimes(1)
+    await waitFor(() => expect(api.getChain).toHaveBeenCalledTimes(2), { timeout: 2000 })
   })
 
   it("shows an approximate history replay label when a wave is selected", async () => {
