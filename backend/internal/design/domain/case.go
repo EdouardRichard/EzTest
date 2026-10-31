@@ -185,6 +185,7 @@ type CaseAssertion struct {
 	ID                 int64
 	CaseVersionID      int64
 	StepSeq            int
+	AssertionSeq       int
 	Kind               string
 	Target             string
 	Expected           string

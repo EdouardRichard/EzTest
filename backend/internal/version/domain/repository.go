@@ -40,6 +40,9 @@ type Repository interface {
 	// MarkRunning projects the version from initial to running. It reports
 	// whether this call changed the status; the WHERE guard makes it idempotent.
 	MarkRunning(ctx context.Context, id int64, updatedAt time.Time) (bool, error)
+	// Reopen projects a completed version back to running and clears the close
+	// fields (P3 §5.9). It reports whether this call changed the row.
+	Reopen(ctx context.Context, id int64, updatedAt time.Time) (bool, error)
 	// Stats returns the P1 detail aggregates for one version.
 	Stats(ctx context.Context, id int64) (VersionStats, error)
 	// ListInitialVersionsWithContent returns initial versions that already have a

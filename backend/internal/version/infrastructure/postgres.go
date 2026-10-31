@@ -249,6 +249,20 @@ func (r *Repository) MarkRunning(ctx context.Context, id int64, updatedAt time.T
 	return tag.RowsAffected() > 0, nil
 }
 
+// Reopen flips completed -> running and clears the close fields (P3 §5.9).
+// The WHERE guard makes repeated calls no-ops.
+func (r *Repository) Reopen(ctx context.Context, id int64, updatedAt time.Time) (bool, error) {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE version SET status = 'running', closed_at = NULL, close_reason = '',
+			close_run_id = NULL, updated_at = $2
+		WHERE id = $1 AND status = 'completed'
+	`, id, updatedAt)
+	if err != nil {
+		return false, wrapDB("reopen version", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 // Stats returns the P1 detail aggregates: requirement counts, conversation
 // count and (implicitly) the pending-design placeholder.
 func (r *Repository) Stats(ctx context.Context, id int64) (version.VersionStats, error) {

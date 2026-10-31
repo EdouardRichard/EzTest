@@ -112,6 +112,30 @@ type fakeRepo struct {
 	updatedRoundIDs    []int64
 	versionTitle       string
 	caseDataByID       map[int64]design.CaseData
+
+	executableCaseErr error
+	executableCases   map[int64]design.ExecutableCase
+	executableList    []design.ExecutableCase
+}
+
+// ReadExecutableCase implements the P3 execution read port in tests.
+func (f *fakeRepo) ReadExecutableCase(_ context.Context, versionID, caseVersionID int64) (design.ExecutableCase, error) {
+	if f.executableCaseErr != nil {
+		return design.ExecutableCase{}, f.executableCaseErr
+	}
+	item, ok := f.executableCases[caseVersionID]
+	if !ok {
+		return design.ExecutableCase{}, design.ErrNotFound
+	}
+	return item, nil
+}
+
+// ListExecutableCases implements the P3 execution read port in tests.
+func (f *fakeRepo) ListExecutableCases(_ context.Context, versionID int64) ([]design.ExecutableCase, error) {
+	if f.executableCaseErr != nil {
+		return nil, f.executableCaseErr
+	}
+	return f.executableList, nil
 }
 
 type fakeCase struct {
