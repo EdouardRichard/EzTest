@@ -15,3 +15,5 @@ version_0002_requirement.sql
 version_0003_conversation.sql
 version_0004_requirement_attachment.sql
 eventing_0002_event_index.sql
+design_0001_case_model.sql
+storage_0002_export_artifact.sql
