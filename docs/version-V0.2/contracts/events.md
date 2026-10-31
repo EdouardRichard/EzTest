@@ -324,7 +324,7 @@ P0 的频道/信封/SSE/游标/心跳/`stream.reset` 语义不变。P1 业务事
 5. `work_item.created` 由 ensure 是否新建决定；重复 ensure 不重复发事件。
 6. 事件发布失败不回滚业务；reconciler 兜底；P1 仍为单实例 Hub，跨实例 fan-out 属 P7。
 
-## 11. P2 增量事件（`draft: P2`，2026-10-31；阶段末冻结）
+## 11. P2 增量事件（`frozen: P2`，2026-10-31）
 
 P2 事件仍只发布到 `version:{id}` 频道；scope 使用十进制字符串。payload 只带 ID/计数/状态摘要，不含用例正文、步骤全文、LLM prompt/输出、导出内容或内部路径。
 

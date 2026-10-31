@@ -518,7 +518,7 @@
 - `team_room_digest` 多版本保留最近 N 版；`context_packet.hash` 为 64 hex。
 - **`version_sut.scope` 修正**：DB 中页面/API ID 数组为数字；API/事件中按十进制字符串输出（P0 文档此处以本 P1 契约为准）。
 
-## 8. P2 增量表结构（`draft: P2`，2026-10-31；阶段末冻结）
+## 8. P2 增量表结构（`frozen: P2`，2026-10-31）
 
 > 命名按 Agent.md §6.9/D34 方案 A：小写单数、`业务名称_作用`；PK/UK/IDX 显式 `pk_/uk_/idx_`；同上下文 FK 显式，跨上下文只逻辑引用；审计列 `created_at/updated_at`。设计文档字面名映射：`scenario→case_scenario`、`export→export_artifact`、`sort→sort_order`、`line→line_no`、`format→file_format`、`size→size_bytes`、`content_ref→content_object_id`。
 

@@ -7,7 +7,7 @@
 >
 > **P1 冻结状态（2026-10-31）**：`db-schema.md` §7（16 表/索引）、`migrations-order.md` §5a（7 迁移）、`events.md` §10（23 事件）、`settings.md` §4a（不新增键）、`task-types.md`、`agent-profiles-tools.md`、`openapi.yaml` P1 paths/schemas（10 个 path item / 23 schemas）已冻结为 **`frozen: P1`**。P1 的实现证据：`scripts/test.ps1` 全绿、`scripts/p1-acceptance.ps1` 19 步 PASS、`scripts/p1-e2e.ps1` 浏览器 PASS、`scripts/p1-acceptance-llm.ps1` 真实 DeepSeek `deepseek-flash` PASS。P2+ 只能增量，破坏性变更需先停止并更新契约/决策/handoff。
 >
-> **P2 增量状态（2026-10-31，开发中）**：P2 正在追加 design/exports paths/schemas、§11 事件、10 张表/2 个迁移、5 类任务、5 个 profiles、4 个设计工具与 settings §4b。增量以 `x-draft: P2` / `draft: P2` 标记，**阶段末**（实施+验收完成后）翻为 `x-frozen: P2` / `frozen: P2` 并写 handoff 证据；冻结前不得被下一阶段消费。
+> **P2 冻结状态（2026-10-31）**：P2 已完成 design/exports paths/schemas（7 paths / 8 schemas）、§11 事件（9）、10 张表/2 迁移、5 类任务、5 个 profiles、4 个设计工具与 settings §4b。P2 增量已从 `x-draft: P2` / `draft: P2` 翻为 **`x-frozen: P2` / `frozen: P2`**。实现证据：`scripts/test.ps1` 全绿、`scripts/p2-acceptance.ps1` 21 步 PASS、`scripts/p2-e2e.ps1` 浏览器 PASS、`scripts/p2-acceptance-llm.ps1` 真实 DeepSeek `deepseek-flash` PASS、`scripts/p2-e2e-llm.ps1` 真实模型浏览器 PASS。冻结后 P3+ 只能增量，破坏性变更需更新契约/决策/handoff。
 
 ## 目录内容
 

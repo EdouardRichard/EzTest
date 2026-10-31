@@ -17,8 +17,8 @@ const read = (name) => fs.readFileSync(path.join(contractDir, name), "utf8")
 
 const openapi = yaml.parse(read("openapi.yaml"))
 check(openapi && typeof openapi === "object", "openapi parses to an object")
-check(openapi["x-draft"] === "P2" || openapi["x-frozen"] === "P2", "openapi root has x-draft/x-frozen P2")
-check(openapi["x-frozen"] === "P1", "openapi keeps the P1 frozen marker until final freeze")
+check(openapi["x-frozen"] === "P2", "openapi root has x-frozen P2")
+check(openapi["x-draft"] === undefined, "openapi root must not keep x-draft after freeze")
 
 const paths = [
   "/api/versions/{id}/design/graph",

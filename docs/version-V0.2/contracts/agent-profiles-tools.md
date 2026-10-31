@@ -73,7 +73,7 @@ system prompt 必须包含 `[profile:<key>]`（fake LLM 识别；真实模型忽
 
 `conversation.reply` 在 P1 不是工具：assistant 最终文本直接写 `conversation_message`。
 
-## 4. P2 Profiles（启动幂等 seed；`draft: P2`，阶段末冻结）
+## 4. P2 Profiles（启动幂等 seed；`frozen: P2`，2026-10-31）
 
 | key | 名称 | 工具 | budgets |
 |---|---|---|---|

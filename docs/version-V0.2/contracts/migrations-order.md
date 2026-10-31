@@ -123,7 +123,7 @@ eventing_0002_event_index.sql
 - P1 迁移已在集成测试随机 schema 中重复执行验证；开发库/演示库通过启动迁移前滚。
 - 迁移顺序影响：P1 表无跨上下文 FK；`version_0002` 依赖 P0 `version`，`agent_0003` 内部 FK 依赖 `work_item`（同上下文）。回滚方式仍是恢复备份，不提供 down SQL。
 
-## 5b. P2 迁移清单（`draft: P2`，2026-10-31；阶段末冻结）
+## 5b. P2 迁移清单（`frozen: P2`，2026-10-31）
 
 P0/P1 的 15 个迁移保持原样；P2 在 `order.txt` 末尾追加 2 个文件：
 

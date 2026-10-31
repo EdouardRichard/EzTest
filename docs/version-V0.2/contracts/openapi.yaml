@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: EzTest 0.2 API 契约（P0 冻结 + P1 增量）
-  version: 0.2.0-p1
+  version: 0.2.0-p2
   description: |
     EzTest 0.2 P0（平台底座）对外 REST/SSE 契约，来源：
     `docs/superpowers/specs/2026-10-31-eztest-v02-p0-platform-foundation-design.md` §7/§8/§9。
@@ -52,7 +52,7 @@ info:
     ## P1 增量（frozen，2026-10-31）
 
     来源：`docs/superpowers/specs/2026-10-31-eztest-v02-p1-runtime-clarification-design.md`
-    §3/§8/§9/§11/§12。P0 段落保留为历史；文件级 `x-frozen: P1` 为当前冻结标记。
+    §3/§8/§9/§11/§12。P0 段落保留为历史；P1 增量保持冻结，当前文件级标记为 `x-frozen: P2`。
     P1 端点全部要求 Bearer 登录（单团队信任模型，无 admin 限制）；ID 仍为十进制字符串，
     时间 RFC3339 UTC，列表沿用 `{data,next_cursor,has_more}` 信封。
 
@@ -90,8 +90,13 @@ info:
     - 稳定错误码新增 `state_conflict`、`lease_lost`、`ai_unavailable`、`context_overflow`、
       `unsupported_attachment_format`、`extraction_failed`。
     - 不新增通用 `Idempotency-Key`（P1-D16）；P1 单实例 Hub/worker，多副本 fan-out 属 P7。
-x-frozen: P1
-x-draft: P2
+    ### P2 增量（frozen，2026-10-31）
+
+    来源：`docs/superpowers/specs/2026-10-31-eztest-v02-p2-case-design-design.md` §7/§8/§12。
+    新增 design graph/overview/case detail/confirmation、版本级 case 导出创建/列表/元数据/鉴权下载。
+    最新 design 对话始终为当前轮，不新增关闭 API；确认只允许 user/server；导出覆盖整个版本并支持
+    Markdown/Mermaid/OPML/CSV，导出字节写入 P0 内容账本。
+x-frozen: P2
 servers:
   - url: http://localhost:13333
     description: 本地开发默认 API（端口来自 EZTEST_API_PORT，默认 13333）

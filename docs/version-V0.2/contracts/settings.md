@@ -170,7 +170,7 @@ retention 5、report 7、knowledge 2、security 2、feature 2 = **44**。
 - 运行时读取器新增 `Float(ctx,key)`（只读；number 整数拓宽，字符串报错），用于 `context.compact_threshold`；不改变设置 API/存储语义。
 - P1 的 LLM 验收凭据（`.env` 小写 `llm_*`）**不属于**系统设置/env 契约：仅验收脚本读取，经 admin API 写入 `llm_config`。
 
-## 4b. P2 使用说明（`draft: P2`，2026-10-31；阶段末冻结）
+## 4b. P2 使用说明（`frozen: P2`，2026-10-31）
 
 - P2 **不新增** env、设置键或类别；4 项 env、44 键目录保持 P0，P1 语义不变。
 - P2 消费的既有键：`agent.max_turns`、`agent.run_soft_timeout_seconds`、`agent.run_hard_timeout_seconds`、`agent.max_concurrent_runs`、`agent.tool_result_max_bytes`、`context.*`、`team_room.*`、`llm.request_timeout_seconds`、`llm.max_retries`、`paths.data_root`。
