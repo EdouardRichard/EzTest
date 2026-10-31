@@ -1,9 +1,9 @@
 # EzTest 0.2 P2 设计（用例脑图/确认/导出）— 实施规格
 
-> 状态：**待用户审核**（2026-10-31）。用户批准后进入 writing-plans，再无人值守实施。
+> 状态：**用户已审核批准（2026-10-31）**。执行口径：brainstorming 三段（产品行为/数据契约/Agent 交付）已确认；实施阶段无人值守，Lead 代替用户验收。
 > 阶段：P2。阶段文件：`docs/version-V0.2/phases/phase-02-design.md`。
 > 前置 handoff：`docs/version-V0.2/phases/phase-00-handoff.md`（P0 completed）与 `docs/version-V0.2/phases/phase-01-handoff.md`（P1 completed）。
-> 计划：`docs/superpowers/plans/2026-10-31-eztest-v02-p2-case-design.md`（待编写）。
+> 计划：`docs/superpowers/plans/2026-10-31-eztest-v02-p2-case-design.md`。
 > 本规格只实现 P2；P3+ 内容只进入 handoff/backlog/契约保留位，不实现、不提前建表。
 > 本规格不修改 `docs/version-V0.2/**` 设计文档；冲突按权威顺序裁决并记录在 §14。
 
