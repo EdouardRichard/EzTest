@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
 .SYNOPSIS
     P2 API acceptance runner (no browser) for EzTest 0.2.
@@ -7,17 +7,17 @@
     Starts a completely isolated stack:
       * database   : eztest_v02_e2e (dropped and recreated on every run)
       * fake LLM   : scripts/fake-llm.cjs on 127.0.0.1:13334
-      * API        : freshly built .tmp/p1/eztest.exe on 127.0.0.1:14333
-    Then exercises the P1 API journey against admin/admin123:
-      LLM config -> fake model catalog -> SUT/env/page/API -> version ->
-      clarification conversation -> user message + MD attachment -> AI draft ->
-      single confirm -> batch confirm -> rollback -> team room read ->
-      attachment extraction -> SSE snapshot event assertions.
+      * API        : freshly built .tmp/p2/eztest.exe on 127.0.0.1:14333
+    Then exercises the P2 design API journey against admin/admin123:
+      LLM config -> SUT/env/page/API -> version -> clarified requirements ->
+      design conversation -> planner/author draft graph -> case/scenario/
+      requirement confirmations -> design chat modification -> stale/redesign ->
+      auto-join -> design attachment -> 4-format export/download -> SSE.
 
-    The script never fakes a pass. If a P1 endpoint is not registered yet it
-    prints BLOCKED with the exact method/path list and a T13 wiring TODO, and
-    exits with code 2. Unexpected behavior exits with code 1. A full green run
-    exits with code 0 and writes evidence to .tmp/p1-acceptance/api.log.
+    The script never fakes a pass. If a P2 endpoint is not registered yet it
+    prints BLOCKED with the exact method/path list and exits with code 2.
+    Unexpected behavior exits with code 1. A full green run exits with code 0
+    and writes evidence to .tmp/p2-acceptance/api.log.
 
 .NOTES
     Windows PowerShell 5.1+ compatible. No extra PowerShell modules required.
@@ -833,7 +833,7 @@ try {
     }
     if ([int]$autoConversationCount -lt 1) { throw "no auto-created design conversation" }
     $autoList = Get-DesignConversations -VersionID $version2ID -Token $token
-    Write-Log ("      auto design conversations: " + $autoList.Count) "Gray"
+    Write-Log ("      auto design conversations: " + @($autoList).Count) "Gray"
     StepPassed "auto_design_new_requirements creates the first design conversation"
 
     Step "assert the P2 SSE event stream"
