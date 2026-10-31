@@ -6,6 +6,7 @@
 > 本规格只实现 P3；P4+ 内容只进入 handoff/backlog/契约保留位，不实现、不提前建表。
 > 本规格不修改 `docs/version-V0.2/**` 设计文档；冲突按权威顺序裁决并记录在 §17（P3-D）。
 > 用户裁决（2026-11-01）：失败/覆盖分析 **仅 P3 自有信号**（不建 `analysis_run`/`issue`/`report`）；demo **扩展现有 fixture-target**；P3 验收 **仅真实 LLM**；同时把 `Agent.md` 中 0.1 的 P1–P7 编号标注为 0.1。
+> 用户补充（2026-11-01）：**Agent 必须能处理时间窗口/异步等待**（如 120s 确认弹框超时消失）；P3 通过 API 侧 `execution.wait` 工具 + 页面定时器继续运行实现，不占用执行器 action 时限。
 
 ## 0. 依据、阶段映射与前置检查
 
@@ -64,6 +65,7 @@
 10. **验收策略（用户已选 C：仅真实 LLM）**：P3 的 API/E2E 验收脚本全部使用 `.env` 的真实 DeepSeek；不新增/不使用 fake LLM 执行场景。单测/集成测试用 stub/fake port，不属“验收”。真实失败不用 fake 替代；失败即 blocked 并记录。验收用 SQL 预置 draft 用例 + P2 确认 API 生成 current+confirmed（P2 已验收设计流程，P3 不重复跑设计 LLM）。
 11. **Agent.md 0.1 标注**：在 §6.1/§6.5/§6.7–§6.9 的 P 编号前加 `0.1-` 或加显著说明；不改目录树语义、不把 0.1 模型当 0.2 依据。
 12. **P3 表集 10 张**（`P3-D-04`）：7 核心 + `executor_instance` + `evidence_ref` + `human_request`；`sut_account_session` 不建（P3 用 `case_run_sut_context.storage_state` 占位）；`analysis_run` 不建。
+13. **Agent 等待/时间窗口（用户补充）**：新增 `execution.wait {seconds:int(1..300), reason?}` API 侧工具；等待期间租约/心跳继续、页面定时器继续运行、可被暂停/取消/lease 丢失打断；不占用执行器 action 60s 上限；单次 ≤300s、总时长受 `execution.case_timeout_seconds`（默认 900s，可 admin 调整）约束；120s 时间窗口场景纳入验收（`-LongWait`）。执行器仍不引入 sleep 语义（`P3-D-41`）。
 
 ## 1. 目标与退出标准
 
@@ -79,9 +81,10 @@
 7. stale/superseded/非 current 用例取消 active intent、终止在飞 case_run 并记录 `superseded`；不再生成新 intent。
 8. 人工重跑/复测新建 intent（`retest/manual`），旧 intent/结果保留；重复确认不重复执行。
 9. 失败分类正确；仅 `failed(application)` 产问题候选事件/帖；覆盖缺口创建 `design.gap`；P4 可消费 `wave/case_run/step/assertion/evidence/failure_class`。
-10. 证据不可变、sha256/size/version_sut/kind 完整；鉴权下载一致；无更新/删除 API。
-11. 全量测试绿；P1/P2 回归通过；真实 LLM API 验收 + 浏览器 E2E 通过；contracts 冻结 `P3`；`phase-03-handoff.md` 完成。
-12. `Agent.md` 的 0.1 编号已显著标注；P3 未修改 `docs/version-V0.2` 设计文档。
+10. **时间窗口/异步等待可验证**：`execution.wait` 支持 ≥120s 等待；等待期间页面定时器/弹框按预期变化；暂停/取消可中断等待；等待计入用例超时而非失败。
+11. 证据不可变、sha256/size/version_sut/kind 完整；鉴权下载一致；无更新/删除 API。
+12. 全量测试绿；P1/P2 回归通过；真实 LLM API 验收 + 浏览器 E2E 通过；contracts 冻结 `P3`；`phase-03-handoff.md` 完成。
+13. `Agent.md` 的 0.1 编号已显著标注；P3 未修改 `docs/version-V0.2` 设计文档。
 
 **不在 P3**
 - `issue/issue_ref/issue_status_history/analysis_run` 表、问题确认/合并、报告 `report/report_revision`、探索链路（P4）。
@@ -459,13 +462,23 @@ reconciler 每 tick：
 6. 超时：expired；case_run failed(session)，summary.reason=human_timeout；wave 继续。
 7. 用户取消：cancelled；case_run failed(session)，reason=human_cancelled。
 
-### 6.9 上下文生命周期
-
-- 创建 context 懒执行（首个 browser 工具）；记录 `browser_context_id` 到 `case_run_sut_context`（upsert active）。
+### 6.9 上下文生命周期- 创建 context 懒执行（首个 browser 工具）；记录 `browser_context_id` 到 `case_run_sut_context`（upsert active）。
 - 清理：case_run 终态/取消/暂停 immediate → DELETE 每个 context（best-effort，404 忽略）；关闭后 status=closed。
 - TTL：reconciler 对 `created_at < now - execution.executor_context_ttl_seconds` 且 case_run 非 running 的 context 执行 DELETE；对 case_run running 但 context 超 TTL 的不清理（避免打断）。
 - 孤儿：`GET /v1/contexts` 与 DB 对账，删除 DB 无记录且 key 前缀 `run:` 的 context；每 60s 一次。
 - executor 重启后 context 丢失：browser 工具返回 `context_not_found` → case_run interrupted(environment)→重派（§5.5）。
+
+### 6.10 等待与时间窗口（`execution.wait`）
+
+- **动机**：真实需求常含异步/时间窗口（如“确认弹框 120s 后自动消失，视为未确认”“退款 30s 后到账”）。执行器单 action 上限 60s（goto 30s），无法用 `browser.wait_for` 覆盖 120s；且长时间占用浏览器 action 会阻塞同一 context 的取消/清理。
+- **实现**：Agent 工具 `execution.wait {seconds:int(1..300), reason?:string(0..200)}`，在 **API 进程**内等待（`select` on timer/ctx），不调用执行器、不占用 action 时限；页面 JS 定时器在 headless 下继续运行。等待期间 runner 心跳继续续 case_run lease；返回 `{waited_seconds, deadline_at}`，不产生证据（Agent 可在等待后 `browser.snapshot`/`browser.screenshot` 取证）。
+- **边界**：
+  - 单次 1–300s；累计等待**计入** `execution.case_timeout_seconds`；可在 case 超时前被
+    `context` 取消（暂停/取消/lease 丢失/执行器 offline）打断，返回 `lease_lost` 或 `state_conflict`；case_run 按暂停/中断状态机处理，恢复后该 step 重试（等待重跑）。
+  - 若 Agent 需要“等到某条件”而非固定时长，先 `execution.wait` 再 `browser.snapshot`/`db.query` 检查；P3 不新增条件轮询工具（避免隐藏循环；后续可增量）。
+  - 执行器进程不实现 sleep；`browser.wait_for` 仍只用于 ≤60s 的可见性等待。
+  - 120s 窗口是验收必测（`-LongWait`）；默认快验收用 10s 窗口，长验收用 120s 窗口 + `execution.wait(122)`。
+  - 若需求需要 >900s 等待，管理员调整 `execution.case_timeout_seconds`；P3 不承诺无限等待。
 
 ## 7. Agent Profile、任务、工具与上下文
 
@@ -489,7 +502,7 @@ reconciler 每 tick：
 | `failure_analyst` | 失败分析师 | `{max_turns:6, soft_seconds:180, hard_seconds:300}` | `context.task_pack`、`context.team_room_read`、`execution.result_read`、`execution.evidence_read`、`analysis.failure_submit` |
 | `coverage_analyst` | 覆盖分析师 | `{max_turns:6, soft_seconds:180, hard_seconds:300}` | `context.task_pack`、`requirement.read`、`execution.coverage_read`、`analysis.coverage_submit` |
 
-- system prompt 必须含 `[profile:<key>]`；case_executor 明确：严格按用例步骤/断言执行；每步完成后 `execution.step_record`；每条断言后 `execution.assertion_record`；不得改需求/用例/确认；登录失败/2FA 调 `human.request`；无法继续时 `execution.case_finish(blocked)`；不得虚构 passed。
+- system prompt 必须含 `[profile:<key>]`；case_executor 明确：严格按用例步骤/断言执行；每步完成后 `execution.step_record`；每条断言后 `execution.assertion_record`；**步骤要求等待/时间窗口时调用 `execution.wait`（不要用重复 snapshot 空转，也不要假设等待后结果）**；不得改需求/用例/确认；登录失败/2FA 调 `human.request`；无法继续时 `execution.case_finish(blocked)`；不得虚构 passed。
 - `case_executor` 不注册 `case.confirm`/`requirement.*` 写工具；不能关闭版本/合并问题。
 
 ### 7.3 P3 工具（注册；scope 由 runtime 注入，schema 不出现 version_id）
@@ -515,6 +528,7 @@ reconciler 每 tick：
 | `execution.step_record` | `{seq:int,status,observed?:string,error?:string,version_sut_id?}` | upsert；发 `case_run.step_finished` |
 | `execution.assertion_record` | `{step_seq:int,assertion_seq:int,verdict,expected?:string,actual?:string,reason?:string,version_sut_id?}` | expected 由服务端覆写；发 `case_run.assertion_finished` |
 | `execution.evidence` | `{kind:"text",text:string,step_seq?,assertion_seq?}` | 文本证据；二进制只经截图/下载 |
+| `execution.wait` | `{seconds:int(1..300),reason?:string}` | API 侧可中断等待；页面定时器继续；不占执行器 action 时限；累计计入 case 超时（§6.10） |
 | `execution.case_finish` | `{verdict,summary?,failure_class?}` | 候选；服务端按 §4.3 校验/覆写 |
 | `human.request` | `{kind,reason,version_sut_id?,account_role?,challenge_kind?}` | 暂停/等待；不能自我 resolve |
 
@@ -737,7 +751,7 @@ P3 不实现 `/api/internal/executors/*`（pull 注册，P3-D-01）；P7 再加�
 ### 13.1 扩展 `scripts/fixture-target.cjs`（用户裁决 A）
 
 保留现有 `/login`、`/account`、`/api/profile`、`/p5/*`、`/p6/*` 路由行为不变，新增 P3 双 SUT 场景（同一脚本、按 `FIXTURE_VARIANT=orders|payments` 与端口启动两份）：
-- 通用：`/p3/login`（用户名/密码；payments 变体支持 `?mfa=1` 两阶段：密码通过后显示 `#mfa` 验证码输入，校验码 `246810`；错误显示 `.error`）；`/p3/home`（登录后）；`/p3/orders`（列表，含订单 `ORD-1001` 金额 `5200.00` 状态 `paid`）；`/p3/orders/1`（详情，金额文本 `¥5,200.00`；`#refund-amount` 显示 `¥5,000.00`（与实付不一致，用于 application 失败）；`/p3/refund` 表单可创建退款并跳转；`/p3/slow?ms=8000`；`/p3/2fa` 页面）。
+- 通用：`/p3/login`（用户名/密码；payments 变体支持 `?mfa=1` 两阶段：密码通过后显示 `#mfa` 验证码输入，校验码 `246810`；错误显示 `.error`）；`/p3/home`（登录后）；`/p3/orders`（列表，含订单 `ORD-1001` 金额 `5200.00` 状态 `paid`）；`/p3/orders/1`（详情，金额文本 `¥5,200.00`；`#refund-amount` 显示 `¥5,000.00`（与实付不一致，用于 application 失败）；`/p3/refund` 表单可创建退款并跳转；`/p3/slow?ms=8000`；`/p3/timeout-window?ms=10000`（弹出带倒计时确认弹框，`ms` 后自动移除；`#confirm-dialog` 在期间可见，`#confirm-dialog` 消失后出现 `#window-expired` 文本；支持 `ms` 到 120000）；`/p3/2fa` 页面）。
 - payments 变体：`/p3/payments`（显示退款单号/金额/状态）、`/api/p3/payments`（JSON）、`/p3/login?mfa=1`。
 - 健康：`GET /health`；所有页面 loopback。
 - DB 夹具：`scripts/fixture-db.ps1` 扩展（或新 `scripts/p3-fixture-db.ps1`）在目标 PG 建/重置 `p3_orders`/`p3_refunds` 表并 seed：`orders(id=1, amount=5200.00, status='paid')`、`refunds(order_id=1, amount=5000.00, status='created')`；DB 断言用例可 `SELECT status FROM refunds WHERE order_id=1`。
@@ -760,8 +774,9 @@ P3 不实现 `/api/internal/executors/*`（pull 注册，P3-D-01）；P7 再加�
 11. **stale/superseded**：对某 confirmed 用例的需求创建新版本（P1 API）→ case stale → intent superseded、case_run superseded；无新 intent。
 12. **重跑/复测**：失败用例调用 `POST intents {purpose:"retest"}` → 新 intent/wave → 再执行（真实 LLM）；旧结果保留；重复创建 active → 409。
 13. **SSE/证据**：使用 `GET /api/stream?channel=version:{id}` 断言收到 wave/case/evidence/human 事件；`Last-Event-ID` 回放无重复。
-14. **回归**：`scripts/test.ps1`、P1/P2 验收（fake 回归）、`node scripts/p3-contract-check.cjs`、迁移幂等。
-15. **证据落盘**：日志 `.tmp/p3-acceptance/`、截图 `frontend/e2e` 的 `.tmp/p3-acceptance/screenshots/`。
+14. **时间窗口（含 120s）**：`/p3/timeout-window?ms=10000` 用例：打开 → 断言 `#confirm-dialog` 可见 → `execution.wait {seconds:12}` → 断言弹框消失且 `#window-expired` 出现 → 截图证据；默认验收跑 10s。`-LongWait` 模式改用 `ms=120000` + `execution.wait {seconds:122}`，证明 ≥120s 真实时间窗口；断言等待期间 lease 心跳持续、暂停可中断（单测/集成覆盖）、case 不因等待被误判失败。
+15. **回归**：`scripts/test.ps1`、P1/P2 验收（fake 回归）、`node scripts/p3-contract-check.cjs`、迁移幂等。
+16. **证据落盘**：日志 `.tmp/p3-acceptance/`、截图 `frontend/e2e` 的 `.tmp/p3-acceptance/screenshots/`。
 
 `scripts/p3-e2e.ps1`（真实 LLM，浏览器）：
 - 复用 P2 e2e 的服务启动模式；准备 1 条简单通过用例（SQL+确认）；登录 → execution Tab → 观察波次/结果 → 打开证据查看器 → 暂停/恢复 → 重跑；断言 `pageErrors=[]`；截图 `.tmp/p3-acceptance/screenshots/`。
@@ -803,7 +818,7 @@ P3 不实现 `/api/internal/executors/*`（pull 注册，P3-D-01）；P7 再加�
 
 | 层 | 覆盖 |
 |---|---|
-| 领域单测 | intent 唯一/幂等/取消/重跑/superseded；wave 单活跃/状态机/pause/resume/counts；case_run 四态聚合矩阵；failure_class 映射；配额 3/2/1 与跨系统预留；fingerprint/code_baseline/dedupe；evidence 上限/sha；dispatch epoch/token；human timeout |
+| 领域单测 | intent 唯一/幂等/取消/重跑/superseded；wave 单活跃/状态机/pause/resume/counts；case_run 四态聚合矩阵；failure_class 映射；配额 3/2/1 与跨系统预留；fingerprint/code_baseline/dedupe；evidence 上限/sha；dispatch epoch/token；human timeout；`execution.wait` 边界/累计超时/暂停取消中断 |
 | 仓储集成 | 3 迁移幂等（20）；partial unique 生效；case_run 唯一 `(wave,intent)`；step/assertion upsert；executor_instance upsert；human_request resolve CAS |
 | 应用/集成 | intent 生成/重复确认；wave 组波/派发；offline→interrupted→重派（旧 epoch 拒绝）；stale 取消；租约过期恢复；版本 completed→running；cleanup 后释放配额；SSE 事件 |
 | HTTP 集成 | 22 paths 路由/鉴权/分页/错误码/404/409；证据下载 sha/归属；admin executor drain；human resolve |
@@ -878,6 +893,7 @@ P3 不实现 `/api/internal/executors/*`（pull 注册，P3-D-01）；P7 再加�
 | P3-D-38 | 前端 `?wave=`/`?case_run=` 深链；执行 Tab 计数不加后端字段（用 overview） | HLD §8.1；避免 Version 契约破坏性变更 |
 | P3-D-39 | `case_assertion.kind=visual` 在 P3 记 `skipped`，不判 passed；P5 实现 | phase-03 Out/P5 In；不得假通过 |
 | P3-D-40 | 提交/分支：`feat/v0.2-p3` 从 P2 HEAD 拉出；`type(p3):`；验收证据 `.tmp/p3*` | P2 先例；PLAN 频繁提交；无正式规范 |
+| P3-D-41 | **Agent 等待**：新增 API 侧 `execution.wait {seconds:1..300}`；等待不占执行器 action 时限、可被暂停/取消/lease 丢失中断、累计计入 case 超时；执行器不实现 sleep；120s 时间窗口纳入 `-LongWait` 验收 | 用户 2026-11-01 补充；执行器单 action ≤60s；页面定时器继续；租约心跳保持 |
 
 ## 18. 风险与已知缺口（写入 handoff）
 
@@ -892,4 +908,5 @@ P3 不实现 `/api/internal/executors/*`（pull 注册，P3-D-01）；P7 再加�
 9. **SQL 预置验收用例**：绕过 P2 图校验；P2 已验收设计/确认流程，P3 聚焦执行；SQL 夹具只用于验收，不进入产品数据。
 10. **设置 secret 首次启用**：token 默认已知（dev）；对外部署必须修改；UI 掩码/审计。
 11. **Agent.md 0.1 标注**：文档编辑不影响设计权威；若用户希望进一步重写目录树，列入 P8/文档维护。
+12. **长时间等待**：单次 ≤300s、用例 ≤900s（可配）；更长的真实等待需要调整超时或拆用例；等待期间页面若发生导航/上下文丢失按环境失败处理；`execution.wait` 不产生证据，验收必须等待后显式 snapshot/assert。
 
