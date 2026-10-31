@@ -19,8 +19,8 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 8 {
-		t.Fatalf("applied %d migrations, want 8: %v", len(applied), applied)
+	if len(applied) != 15 {
+		t.Fatalf("applied %d migrations, want 15: %v", len(applied), applied)
 	}
 
 	again, err := db.Migrate(ctx, pool)
@@ -37,6 +37,10 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 		"schema_migrations", "sut", "sut_api", "sut_environment", "sut_page",
 		"system_setting", "system_setting_revision", "target_database", "test_account",
 		"version", "version_sut", "version_sut_resource",
+		"work_item", "work_item_attempt", "team_room_post", "team_room_digest",
+		"agent_profile", "agent_run", "agent_message", "context_packet",
+		"requirement", "requirement_version", "requirement_confirmation", "requirement_relation",
+		"conversation", "conversation_message", "conversation_summary", "requirement_attachment",
 	}
 	found := map[string]bool{}
 	rows, err := pool.Query(ctx, `
@@ -154,5 +158,66 @@ func TestSchemaConstraints(t *testing.T) {
 		INSERT INTO event (channel, seq, type) VALUES ('system', 1, 'duplicate')
 	`); err == nil {
 		t.Fatal("duplicate (channel, seq) accepted")
+	}
+
+	// P1 constraints: task dedupe, requirement revisions, one confirmation per
+	// requirement version, and conversation client-message idempotency.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO work_item (id, version_id, team, type, dedupe_key)
+		VALUES (50, 30, 'clarification', 'chat.turn', 'message:1')
+	`); err != nil {
+		t.Fatalf("insert work item: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO work_item (id, version_id, team, type, dedupe_key)
+		VALUES (51, 30, 'clarification', 'chat.turn', 'message:1')
+	`); err == nil {
+		t.Fatal("duplicate work item dedupe key accepted")
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO requirement (id, version_id, status) VALUES (60, 30, 'draft')
+	`); err != nil {
+		t.Fatalf("insert requirement: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO requirement_version (id, requirement_id, revision, title, content_hash)
+		VALUES (70, 60, 1, 'r1', repeat('a', 64))
+	`); err != nil {
+		t.Fatalf("insert requirement version: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO requirement_version (id, requirement_id, revision, title, content_hash)
+		VALUES (71, 60, 1, 'r1-dup', repeat('b', 64))
+	`); err == nil {
+		t.Fatal("duplicate (requirement_id, revision) accepted")
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO requirement_confirmation (id, requirement_version_id, scope, actor_id)
+		VALUES (80, 70, 'requirement', 1)
+	`); err != nil {
+		t.Fatalf("insert requirement confirmation: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO requirement_confirmation (id, requirement_version_id, scope, actor_id)
+		VALUES (81, 70, 'requirement', 1)
+	`); err == nil {
+		t.Fatal("duplicate confirmation for a requirement version accepted")
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO conversation (id, version_id, kind, title) VALUES (90, 30, 'clarification', 'c1')
+	`); err != nil {
+		t.Fatalf("insert conversation: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO conversation_message (id, conversation_id, role, client_message_id)
+		VALUES (100, 90, 'user', 'client-1')
+	`); err != nil {
+		t.Fatalf("insert conversation message: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO conversation_message (id, conversation_id, role, client_message_id)
+		VALUES (101, 90, 'user', 'client-1')
+	`); err == nil {
+		t.Fatal("duplicate conversation client_message_id accepted")
 	}
 }
