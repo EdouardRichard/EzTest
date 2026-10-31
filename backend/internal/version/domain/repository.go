@@ -22,6 +22,13 @@ type Summary struct {
 	UpdatedAt time.Time
 }
 
+// VersionStats is the P1 detail increment: per-status requirement counts, the
+// number of conversations and the pending-design placeholder.
+type VersionStats struct {
+	Requirements      RequirementCounts
+	ConversationCount int
+}
+
 // Repository persists versions, their SUT bindings and the selected database/
 // account rows. Create must write the whole aggregate in one transaction.
 type Repository interface {
@@ -29,6 +36,12 @@ type Repository interface {
 	Get(ctx context.Context, id int64) (Version, []Binding, error)
 	List(ctx context.Context, limit int, beforeID *int64) ([]Summary, error)
 	Update(ctx context.Context, version Version) (Version, error)
+
+	// MarkRunning projects the version from initial to running. It reports
+	// whether this call changed the status; the WHERE guard makes it idempotent.
+	MarkRunning(ctx context.Context, id int64, updatedAt time.Time) (bool, error)
+	// Stats returns the P1 detail aggregates for one version.
+	Stats(ctx context.Context, id int64) (VersionStats, error)
 
 	// Usage guards answer whether a resource is still referenced by a version
 	// binding. They back resourceapp.UsageChecker.

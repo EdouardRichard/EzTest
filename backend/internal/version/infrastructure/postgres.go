@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
@@ -233,6 +234,58 @@ func (r *Repository) Update(ctx context.Context, v version.Version) (version.Ver
 		return version.Version{}, version.ErrNotFound
 	}
 	return v, nil
+}
+
+// MarkRunning flips initial -> running. The WHERE guard makes repeated calls
+// no-ops and reports whether this call changed the row.
+func (r *Repository) MarkRunning(ctx context.Context, id int64, updatedAt time.Time) (bool, error) {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE version SET status = 'running', updated_at = $2
+		WHERE id = $1 AND status = 'initial'
+	`, id, updatedAt)
+	if err != nil {
+		return false, wrapDB("mark version running", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// Stats returns the P1 detail aggregates: requirement counts, conversation
+// count and (implicitly) the pending-design placeholder.
+func (r *Repository) Stats(ctx context.Context, id int64) (version.VersionStats, error) {
+	var stats version.VersionStats
+	rows, err := r.pool.Query(ctx, `
+		SELECT status, count(*) FROM requirement WHERE version_id = $1 GROUP BY status
+	`, id)
+	if err != nil {
+		return version.VersionStats{}, fmt.Errorf("version requirement stats: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var status string
+		var count int
+		if err := rows.Scan(&status, &count); err != nil {
+			return version.VersionStats{}, fmt.Errorf("scan version requirement stats: %w", err)
+		}
+		switch version.RequirementStatus(status) {
+		case version.RequirementDraft:
+			stats.Requirements.Draft = count
+		case version.RequirementClarified:
+			stats.Requirements.Clarified = count
+		case version.RequirementClosed:
+			stats.Requirements.Closed = count
+		case version.RequirementObsolete:
+			stats.Requirements.Obsolete = count
+		}
+		stats.Requirements.Total += count
+	}
+	if err := rows.Err(); err != nil {
+		return version.VersionStats{}, fmt.Errorf("version requirement stats: %w", err)
+	}
+	if err := r.pool.QueryRow(ctx, `SELECT count(*) FROM conversation WHERE version_id = $1`, id).
+		Scan(&stats.ConversationCount); err != nil {
+		return version.VersionStats{}, fmt.Errorf("version conversation count: %w", err)
+	}
+	return stats, nil
 }
 
 // SUTInUse reports whether any version binding references the SUT.

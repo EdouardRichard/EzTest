@@ -7,6 +7,7 @@ import (
 	"time"
 
 	resourceapp "github.com/EdouardRichard/EzTest/backend/internal/resource/application"
+	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
 // VersionView is the detail read model returned by Create/Get/Update. Bindings
@@ -18,6 +19,9 @@ type VersionView struct {
 	Status                    string
 	AutoDesignNewRequirements bool
 	Bindings                  []BindingView
+	RequirementCounts         version.RequirementCounts
+	ConversationCount         int
+	PendingDesignCount        int
 	CreatedBy                 int64
 	CreatedAt                 time.Time
 	UpdatedAt                 time.Time
