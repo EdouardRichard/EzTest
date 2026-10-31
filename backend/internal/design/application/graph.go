@@ -29,6 +29,7 @@ type GraphService struct {
 	audit    auditapp.Recorder
 	events   eventingapp.Publisher
 	teamRoom TeamRoom
+	reopener VersionReopener
 }
 
 // NewGraphService wires the graph service. audit, events and teamRoom are
@@ -45,6 +46,26 @@ func NewGraphService(
 		clk = clock.System{}
 	}
 	return &GraphService{repo: repo, ids: ids, clock: clk, audit: audit, events: events, teamRoom: teamRoom}
+}
+
+// SetVersionReopener attaches the best-effort completed-version reopen
+// projection used after a case confirmation (spec §7.5). It returns the service
+// for fluent wiring.
+func (s *GraphService) SetVersionReopener(reopener VersionReopener) *GraphService {
+	if s != nil {
+		s.reopener = reopener
+	}
+	return s
+}
+
+// reopenCompleted applies the case_confirmed reopen trigger after the
+// confirmation committed. Failures never fail the confirmation: the reopen is a
+// projection and the reconciler remains the fallback.
+func (s *GraphService) reopenCompleted(ctx context.Context, versionID int64, reason string) {
+	if s == nil || s.reopener == nil {
+		return
+	}
+	_ = s.reopener.ReopenIfCompleted(ctx, versionID, "case_confirmed", reason)
 }
 
 // ReadGraph returns the full version design graph snapshot.

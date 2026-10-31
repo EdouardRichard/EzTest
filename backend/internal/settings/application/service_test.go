@@ -130,8 +130,8 @@ func newTestService(t *testing.T, repo *fakeRepo) (*Service, *fakeAudit, *fakePu
 
 func TestDefinitionsAreUniqueAndWellFormed(t *testing.T) {
 	defs := Definitions("http://127.0.0.1:13336")
-	if len(defs) != 49 {
-		t.Fatalf("catalog has %d keys, want 49 (P3: 44 -> 49)", len(defs))
+	if len(defs) != 53 {
+		t.Fatalf("catalog has %d keys, want 53 (P4: 49 -> 53)", len(defs))
 	}
 	seen := map[string]bool{}
 	for _, def := range defs {
@@ -199,6 +199,41 @@ func TestP3ExecutionSettings(t *testing.T) {
 	}
 	if executionKeys != 11 {
 		t.Fatalf("execution settings = %d, want 11 (6 frozen + 5 P3)", executionKeys)
+	}
+}
+
+// TestP4ChainSettings pins the four P4 chain keys (spec §4.5/settings.md
+// §4d): number, non-secret, integer and the configured range/default.
+func TestP4ChainSettings(t *testing.T) {
+	defs := Definitions("http://127.0.0.1:13336")
+	cases := []struct {
+		key string
+		def string
+		min *float64
+		max *float64
+	}{
+		{"chain.max_nodes", "300", floatPtr(1), floatPtr(1000)},
+		{"chain.max_edges", "600", floatPtr(1), floatPtr(2000)},
+		{"chain.max_requirements", "100", floatPtr(1), floatPtr(500)},
+		{"chain.replay_event_limit", "500", floatPtr(1), floatPtr(2000)},
+	}
+	for _, tc := range cases {
+		def := defs[indexOf(t, defs, tc.key)]
+		if def.Type != settings.TypeNumber || def.Category != "chain" || def.Secret || !def.Integer {
+			t.Fatalf("%s = %+v, want number/chain/non-secret/integer", tc.key, def)
+		}
+		if string(def.Default) != tc.def || !floatPtrEqual(def.Min, tc.min) || !floatPtrEqual(def.Max, tc.max) {
+			t.Fatalf("%s = default %s range %v..%v, want %s %v..%v", tc.key, def.Default, def.Min, def.Max, tc.def, tc.min, tc.max)
+		}
+	}
+	chainKeys := 0
+	for _, def := range defs {
+		if def.Category == "chain" {
+			chainKeys++
+		}
+	}
+	if chainKeys != 4 {
+		t.Fatalf("chain settings = %d, want 4", chainKeys)
 	}
 }
 
