@@ -1,7 +1,7 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
 .SYNOPSIS
-    P2 browser E2E for the clarification workspace.
+    P2 browser E2E for the design workspace.
 
 .DESCRIPTION
     Starts an isolated stack and runs frontend/e2e/p2.spec.ts:
