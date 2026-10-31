@@ -3,7 +3,7 @@
 import { ArrowLeft, Database, FileCode2, Server } from "lucide-react"
 import Link from "next/link"
 import { useRouter, useSearchParams } from "next/navigation"
-import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react"
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react"
 
 import { Badge } from "@/components/ui/Badge"
 import { EmptyState } from "@/components/ui/EmptyState"
@@ -12,6 +12,7 @@ import { LoadingCard } from "@/components/ui/Spinner"
 import { Tabs } from "@/components/ui/Tabs"
 import { ChainTab } from "@/features/chain/ChainTab"
 import { RequirementsTab } from "@/features/clarification/RequirementsTab"
+import { useVersionEvents } from "@/features/clarification/useVersionEvents"
 import { listIssues, listReports } from "@/features/delivery/api"
 import { IssuesTab } from "@/features/delivery/IssuesTab"
 import { ReportsTab } from "@/features/delivery/ReportsTab"
@@ -40,6 +41,9 @@ const PLACEHOLDER_COPY: Record<PlaceholderTab, PlaceholderCopy> = {
     description: "代码仓扫描、变更影响与调用链分析由 P5 阶段提供。",
   },
 }
+
+/** SSE bursts (issue.created + report.published + version.closed) collapse into one refresh. */
+const SSE_REFRESH_DEBOUNCE_MS = 350
 
 type CountProps = {
   icon: ReactNode
@@ -246,6 +250,33 @@ export function VersionDetailPage({
     }
   }, [versionId])
 
+  /** Silent projection refresh used by SSE events (no full-page loading flash). */
+  const refreshVersion = useCallback(async () => {
+    try {
+      setVersion(await getVersion(versionId))
+    } catch {
+      // Keep the last projection; the next event or retry refreshes it.
+    }
+  }, [versionId])
+
+  // Tab counts come from the real list projections; a failed/missing query
+  // leaves the count absent instead of rendering a misleading zero (spec §9.1).
+  const refreshCounts = useCallback(async () => {
+    try {
+      const items = await listIssues(versionId, { status: "open", limit: 100 })
+      setIssueCount(items.filter((issue) => issue.status === "open").length)
+    } catch {
+      setIssueCount(undefined)
+    }
+    try {
+      const items = await listReports(versionId, { kind: "version", limit: 20 })
+      const versionReport = items.find((report) => report.kind === "version")
+      setReportRevision(versionReport?.current_revision?.revision)
+    } catch {
+      setReportRevision(undefined)
+    }
+  }, [versionId])
+
   useEffect(() => {
     void load()
   }, [load])
@@ -254,30 +285,63 @@ export function VersionDetailPage({
     setActiveTab(parseVersionTab(initialTab))
   }, [initialTab])
 
-  // Tab counts come from the real list projections; a failed/missing query
-  // leaves the count absent instead of rendering a misleading zero (spec §9.1).
   useEffect(() => {
-    let cancelled = false
-    void listIssues(versionId, { status: "open", limit: 100 })
-      .then((items) => {
-        if (!cancelled) setIssueCount(items.filter((issue) => issue.status === "open").length)
-      })
-      .catch(() => {
-        if (!cancelled) setIssueCount(undefined)
-      })
-    void listReports(versionId, { kind: "version", limit: 20 })
-      .then((items) => {
-        if (cancelled) return
-        const versionReport = items.find((report) => report.kind === "version")
-        setReportRevision(versionReport?.current_revision?.revision)
-      })
-      .catch(() => {
-        if (!cancelled) setReportRevision(undefined)
-      })
-    return () => {
-      cancelled = true
+    void refreshCounts()
+  }, [refreshCounts])
+
+  const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const pendingRefresh = useRef({ version: false, counts: false })
+
+  const runPendingRefresh = useCallback(() => {
+    const pending = pendingRefresh.current
+    pendingRefresh.current = { version: false, counts: false }
+    if (pending.version) void refreshVersion()
+    if (pending.counts) void refreshCounts()
+  }, [refreshVersion, refreshCounts])
+
+  const scheduleRefresh = useCallback(
+    (includeVersion: boolean) => {
+      pendingRefresh.current = {
+        version: pendingRefresh.current.version || includeVersion,
+        counts: true,
+      }
+      if (refreshTimer.current !== null) clearTimeout(refreshTimer.current)
+      refreshTimer.current = setTimeout(() => {
+        refreshTimer.current = null
+        runPendingRefresh()
+      }, SSE_REFRESH_DEBOUNCE_MS)
+    },
+    [runPendingRefresh],
+  )
+
+  const refreshVersionAndCounts = useCallback(() => scheduleRefresh(true), [scheduleRefresh])
+  const refreshCountsOnly = useCallback(() => scheduleRefresh(false), [scheduleRefresh])
+
+  const refreshSnapshotNow = useCallback(() => {
+    if (refreshTimer.current !== null) {
+      clearTimeout(refreshTimer.current)
+      refreshTimer.current = null
     }
-  }, [versionId])
+    pendingRefresh.current = { version: true, counts: true }
+    runPendingRefresh()
+  }, [runPendingRefresh])
+
+  useEffect(
+    () => () => {
+      if (refreshTimer.current !== null) clearTimeout(refreshTimer.current)
+    },
+    [],
+  )
+
+  // One page-level subscription keeps the header projection and the tab counts
+  // live while the mounted tab owns its own workspace subscription.
+  useVersionEvents(versionId, {
+    onVersionChanged: refreshVersionAndCounts,
+    onRequirementChanged: refreshVersionAndCounts,
+    onIssueChanged: refreshCountsOnly,
+    onReportChanged: refreshCountsOnly,
+    onStreamReset: refreshSnapshotNow,
+  })
 
   const tabItems = useMemo(
     () =>
@@ -404,7 +468,7 @@ export function VersionDetailPage({
           initialCaseRunId={executionCaseRunId}
         />
       ) : activeTab === "chain" ? (
-        <ChainTab versionId={versionId} />
+        <ChainTab versionId={versionId} onVersionChanged={refreshVersionAndCounts} />
       ) : activeTab === "issues" ? (
         <IssuesTab versionId={versionId} />
       ) : activeTab === "reports" ? (

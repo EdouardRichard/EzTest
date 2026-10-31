@@ -312,6 +312,8 @@ describe("useVersionEvents", () => {
     expect(onReportChanged.mock.calls[1][0].type).toBe("report.stale")
     expect(onRequirementChanged.mock.calls[0][0].type).toBe("requirement.closed")
     expect(onVersionChanged.mock.calls[1][0].type).toBe("version.reopened")
+    // One connection serves every P4 event family.
+    expect(sse.connectSSE).toHaveBeenCalledTimes(1)
   })
 
   it("notifies stream.reset through a callback without opening another EventSource", () => {

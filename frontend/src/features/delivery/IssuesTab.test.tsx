@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
@@ -29,6 +29,26 @@ vi.mock("next/navigation", () => ({
   useRouter: () => navigation,
   useSearchParams: () => search.params,
 }))
+
+const sse = vi.hoisted(() => ({
+  handlers: null as Record<string, (event: unknown) => void> | null,
+  calls: 0,
+}))
+vi.mock("@/features/clarification/useVersionEvents", async () => {
+  const React = await import("react")
+  return {
+    useVersionEvents: (
+      _versionId: string,
+      handlers: Record<string, (event: unknown) => void>,
+    ): string => {
+      sse.handlers = handlers
+      React.useEffect(() => {
+        sse.calls += 1
+      }, [])
+      return "live"
+    },
+  }
+})
 
 import { IssuesTab } from "./IssuesTab"
 
@@ -184,6 +204,8 @@ describe("IssuesTab", () => {
     for (const fn of Object.values(api)) fn.mockReset()
     navigation.replace.mockReset()
     search.params = new URLSearchParams()
+    sse.handlers = null
+    sse.calls = 0
     mockWorkspace()
   })
 
@@ -265,6 +287,39 @@ describe("IssuesTab", () => {
         limit: 20,
       })
     })
+  })
+
+  it("refetches the list and open detail once for a burst of issue events", async () => {
+    render(<IssuesTab versionId="2001" />)
+    const sheet = await openDetail("9101")
+    expect(within(sheet).getByText("点击提交后未跳转到支付页")).toBeInTheDocument()
+
+    // One subscription per rendered tab: the hook is mounted exactly once.
+    expect(sse.calls).toBe(1)
+    expect(sse.handlers).not.toBeNull()
+
+    act(() => {
+      sse.handlers?.onIssueChanged?.({ type: "issue.created" })
+      sse.handlers?.onIssueChanged?.({ type: "issue.updated" })
+    })
+
+    await waitFor(() => expect(api.listIssues).toHaveBeenCalledTimes(2), { timeout: 2000 })
+    await waitFor(() => expect(api.getIssue).toHaveBeenCalledTimes(2), { timeout: 2000 })
+    expect(sse.calls).toBe(1)
+  })
+
+  it("refetches the list and open detail on stream.reset without a new subscription", async () => {
+    render(<IssuesTab versionId="2001" />)
+    await openDetail("9101")
+    expect(sse.calls).toBe(1)
+
+    act(() => {
+      sse.handlers?.onStreamReset?.({ reason: "cursor_too_old", snapshot_cursor: 99 })
+    })
+
+    await waitFor(() => expect(api.listIssues).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(api.getIssue).toHaveBeenCalledTimes(2))
+    expect(sse.calls).toBe(1)
   })
 
   it("opens the detail sheet from a row and writes ?issue= into the URL", async () => {

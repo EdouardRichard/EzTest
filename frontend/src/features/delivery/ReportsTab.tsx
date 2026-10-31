@@ -2,7 +2,7 @@
 
 import { FileText } from "lucide-react"
 import { useRouter, useSearchParams } from "next/navigation"
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
 import { Badge, type BadgeTone } from "@/components/ui/Badge"
 import { Button } from "@/components/ui/Button"
@@ -12,6 +12,7 @@ import { ErrorState, InlineError } from "@/components/ui/ErrorState"
 import { Field } from "@/components/ui/Field"
 import { LoadingCard } from "@/components/ui/Spinner"
 import { Textarea } from "@/components/ui/Textarea"
+import { useVersionEvents } from "@/features/clarification/useVersionEvents"
 import { formatDateTime } from "@/lib/format"
 
 import { downloadHTML, getReport, getRevision, listReports, regenerate } from "./api"
@@ -35,6 +36,9 @@ const STATUS_TONE: Record<ReportStatus, BadgeTone> = {
   published: "success",
   stale: "warning",
 }
+
+/** SSE bursts (report.stale + report.published) collapse into one snapshot refetch. */
+const SSE_REFRESH_DEBOUNCE_MS = 350
 
 function parseRevision(value: string | null): number | null {
   if (value === null) return null
@@ -180,6 +184,75 @@ export function ReportsTab({ versionId }: ReportsTabProps) {
       cancelled = true
     }
   }, [versionId, detail?.id, selectedRevision])
+
+  const selectedReportIdRef = useRef(selectedReportId)
+  selectedReportIdRef.current = selectedReportId
+  const selectedRevisionRef = useRef(selectedRevision)
+  selectedRevisionRef.current = selectedRevision
+
+  /**
+   * Silent live refetch: the list, the selected report detail and the explicit
+   * revision metadata. `selectedRevision` is never reset here, so a revision the
+   * user picked stays selected while the report gains new revisions upstream.
+   */
+  const refetchFromEvents = useCallback(async () => {
+    try {
+      setReports(await fetchReports())
+    } catch {
+      // Keep the last list snapshot; the next event or manual retry refreshes.
+    }
+    const reportId = selectedReportIdRef.current
+    if (reportId === null) return
+    try {
+      setDetail(await getReport(versionId, reportId))
+    } catch {
+      // Keep the last detail snapshot.
+    }
+    const revisionNumber = selectedRevisionRef.current
+    if (revisionNumber === null) return
+    try {
+      setRevisionView(await getRevision(versionId, reportId, revisionNumber))
+    } catch {
+      // Keep the last revision snapshot.
+    }
+  }, [fetchReports, versionId])
+
+  const eventRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const eventRefreshRef = useRef(refetchFromEvents)
+  eventRefreshRef.current = refetchFromEvents
+
+  const scheduleEventRefresh = useCallback(() => {
+    if (eventRefreshTimer.current !== null) clearTimeout(eventRefreshTimer.current)
+    eventRefreshTimer.current = setTimeout(() => {
+      eventRefreshTimer.current = null
+      void eventRefreshRef.current()
+    }, SSE_REFRESH_DEBOUNCE_MS)
+  }, [])
+
+  const refreshNow = useCallback(() => {
+    if (eventRefreshTimer.current !== null) {
+      clearTimeout(eventRefreshTimer.current)
+      eventRefreshTimer.current = null
+    }
+    void eventRefreshRef.current()
+  }, [])
+
+  useEffect(
+    () => () => {
+      if (eventRefreshTimer.current !== null) clearTimeout(eventRefreshTimer.current)
+    },
+    [],
+  )
+
+  // One subscription per rendered tab; requirement/version events also stale or
+  // publish reports, so they share the same debounced refresh.
+  useVersionEvents(versionId, {
+    onReportChanged: scheduleEventRefresh,
+    onIssueChanged: scheduleEventRefresh,
+    onRequirementChanged: scheduleEventRefresh,
+    onVersionChanged: scheduleEventRefresh,
+    onStreamReset: refreshNow,
+  })
 
   const revision = useMemo(() => {
     if (detail === null || effectiveRevisionNumber === null) return null
