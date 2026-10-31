@@ -3,7 +3,6 @@ package providers
 import (
 	"context"
 	"strconv"
-	"time"
 
 	chainapp "github.com/EdouardRichard/EzTest/backend/internal/chain/application"
 	chain "github.com/EdouardRichard/EzTest/backend/internal/chain/domain"
@@ -32,7 +31,11 @@ func NewDesignProvider(reader DesignReader) *DesignProvider {
 
 var _ chainapp.DesignChainProvider = (*DesignProvider)(nil)
 
-// Scenarios returns every scenario of the version design graph.
+// Scenarios returns every scenario of the version design graph. The graph view
+// does not project scenario timestamps, so the node keeps zero CreatedAt and
+// UpdatedAt: event-range replay must keep scenarios instead of dropping them
+// against a request-time timestamp, and the HTTP DTO supplies a display
+// timestamp from generated_at.
 func (p *DesignProvider) Scenarios(ctx context.Context, versionID int64) ([]chain.Node, error) {
 	graph, err := p.reader.ReadGraph(ctx, versionID)
 	if err != nil {
@@ -45,7 +48,6 @@ func (p *DesignProvider) Scenarios(ctx context.Context, versionID int64) ([]chai
 				continue
 			}
 			requirementID := requirement.RequirementID
-			createdAt := scenarioNodeCreatedAt(graph.GeneratedAt)
 			node := chain.Node{
 				ID:            chain.NodeID(chain.NodeScenario, scenario.ID),
 				Kind:          chain.NodeScenario,
@@ -53,8 +55,6 @@ func (p *DesignProvider) Scenarios(ctx context.Context, versionID int64) ([]chai
 				Label:         scenario.Name,
 				RequirementID: optionalInt64Ptr(requirementID),
 				VersionSUTIDs: sortUniqueIDs(scenario.VersionSUTIDs),
-				CreatedAt:     createdAt,
-				UpdatedAt:     createdAt,
 				Meta: map[string]any{
 					"requirement_version_id": scenario.RequirementVersionID,
 					"sort_order":             scenario.SortOrder,
@@ -169,15 +169,4 @@ func singlePageID(pageIDs []int64) *int64 {
 		return nil
 	}
 	return int64Ptr(pages[0])
-}
-
-// scenarioNodeCreatedAt returns a non-zero created_at for a scenario node. The
-// design graph view does not project the scenario row's timestamps, so the graph
-// snapshot time (the version read timestamp) is the available provider source.
-// A synthetic graph without a timestamp falls back to the clock.
-func scenarioNodeCreatedAt(graphGeneratedAt time.Time) time.Time {
-	if !graphGeneratedAt.IsZero() {
-		return graphGeneratedAt.UTC()
-	}
-	return time.Now().UTC()
 }

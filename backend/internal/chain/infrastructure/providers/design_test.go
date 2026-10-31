@@ -25,7 +25,7 @@ func (s *stubDesignReader) ReadCaseVersionsByIDs(context.Context, int64, []int64
 	return s.rows, s.err
 }
 
-func TestDesignProviderScenariosHaveNonZeroCreatedAt(t *testing.T) {
+func TestDesignProviderScenariosKeepZeroCreatedAt(t *testing.T) {
 	graphAt := time.Date(2026, 11, 1, 5, 0, 0, 0, time.UTC)
 	reader := &stubDesignReader{graph: designapp.GraphView{
 		VersionID:   42,
@@ -53,15 +53,11 @@ func TestDesignProviderScenariosHaveNonZeroCreatedAt(t *testing.T) {
 		t.Fatalf("nodes = %+v, want 2", nodes)
 	}
 	for _, node := range nodes {
-		if node.CreatedAt.IsZero() {
-			t.Errorf("scenario %s created_at is zero", node.ID)
-			continue
-		}
-		if !node.CreatedAt.Equal(graphAt) {
-			t.Errorf("scenario %s created_at = %v, want the graph snapshot time %v", node.ID, node.CreatedAt, graphAt)
-		}
-		if !node.UpdatedAt.Equal(node.CreatedAt) {
-			t.Errorf("scenario %s updated_at = %v, want %v", node.ID, node.UpdatedAt, node.CreatedAt)
+		// The graph view does not project scenario timestamps, and stamping it
+		// with the request-time graph generated_at would make event-range replay
+		// drop every scenario. Zero timestamps are kept by the replay filter.
+		if !node.CreatedAt.IsZero() || !node.UpdatedAt.IsZero() {
+			t.Errorf("scenario %s timestamps = %v/%v, want both zero", node.ID, node.CreatedAt, node.UpdatedAt)
 		}
 	}
 }

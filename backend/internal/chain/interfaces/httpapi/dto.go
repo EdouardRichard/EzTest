@@ -81,7 +81,7 @@ type chainReplayDTO struct {
 func toChainViewDTO(view chain.ChainView) chainViewDTO {
 	nodes := make([]chainNodeDTO, 0, len(view.Nodes))
 	for _, node := range view.Nodes {
-		nodes = append(nodes, toChainNodeDTO(node))
+		nodes = append(nodes, toChainNodeDTO(node, view.GeneratedAt))
 	}
 	edges := make([]chainEdgeDTO, 0, len(view.Edges))
 	for _, edge := range view.Edges {
@@ -124,7 +124,7 @@ func toChainFilterDTO(filter chain.ChainFilter) chainFilterDTO {
 	}
 }
 
-func toChainNodeDTO(node chain.Node) chainNodeDTO {
+func toChainNodeDTO(node chain.Node, generatedAt time.Time) chainNodeDTO {
 	return chainNodeDTO{
 		ID:            node.ID,
 		Kind:          string(node.Kind),
@@ -138,9 +138,25 @@ func toChainNodeDTO(node chain.Node) chainNodeDTO {
 		CaseRunID:     formatChainID(node.CaseRunID),
 		IssueID:       formatChainID(node.IssueID),
 		ReportID:      formatChainID(node.ReportID),
-		CreatedAt:     formatChainTime(node.CreatedAt),
+		CreatedAt:     formatChainTime(chainNodeDisplayCreatedAt(node, generatedAt)),
 		Meta:          sanitizeChainMeta(node.Meta),
 	}
+}
+
+// chainNodeDisplayCreatedAt fills the required created_at field for scenario
+// nodes whose domain timestamp is zero. The design graph reader does not project
+// scenario timestamps; the provider therefore keeps CreatedAt zero so
+// event-range replay keeps the node, and the HTTP projection displays the
+// graph/snapshot time instead. Other node kinds keep their zero timestamp when
+// their provider has none.
+func chainNodeDisplayCreatedAt(node chain.Node, generatedAt time.Time) time.Time {
+	if !node.CreatedAt.IsZero() || node.Kind != chain.NodeScenario {
+		return node.CreatedAt
+	}
+	if !node.UpdatedAt.IsZero() {
+		return node.UpdatedAt
+	}
+	return generatedAt
 }
 
 // chainMetaIDArrayKeys are the node meta keys that carry entity ID arrays.
@@ -281,8 +297,8 @@ func decimalStringValue(value any) (string, bool) {
 
 // formatChainTime renders a node/view timestamp as RFC3339 UTC. A zero time is
 // rendered as the zero RFC3339 instant because created_at is a required field
-// of the contract and providers only leave it unset for entities without a
-// readable timestamp.
+// of the contract. Scenario nodes normally receive a display fallback in
+// chainNodeDisplayCreatedAt before they reach this formatter.
 func formatChainTime(value time.Time) string {
 	return value.UTC().Format(time.RFC3339)
 }
