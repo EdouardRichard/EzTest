@@ -67,6 +67,39 @@ func StateConflict(message string) *Error {
 	return NewError(http.StatusConflict, "state_conflict", message)
 }
 
+// LeaseLost is a 409 when a work-item write-back no longer owns the lease.
+func LeaseLost() *Error {
+	return NewError(http.StatusConflict, "lease_lost", "work item lease was lost")
+}
+
+// AIUnavailable is a retryable 503 when no usable LLM target is configured or
+// the upstream is temporarily unreachable.
+func AIUnavailable(message string) *Error {
+	return &Error{
+		Status:    http.StatusServiceUnavailable,
+		Code:      "ai_unavailable",
+		Message:   message,
+		Retryable: true,
+	}
+}
+
+// ContextOverflow is a retryable 503 when a run could not fit even after
+// deterministic compaction. It is not used for recoverable compaction.
+func ContextOverflow(message string) *Error {
+	return &Error{
+		Status:    http.StatusServiceUnavailable,
+		Code:      "context_overflow",
+		Message:   message,
+		Retryable: true,
+	}
+}
+
+// AttachmentError is a 422 for an attachment that was accepted but could not
+// be parsed. The message POST itself still succeeds.
+func AttachmentError(code, message string) *Error {
+	return NewError(http.StatusUnprocessableEntity, code, message)
+}
+
 // Unavailable is a 503 for a temporary dependency failure.
 func Unavailable(message string) *Error {
 	return &Error{

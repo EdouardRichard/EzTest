@@ -195,16 +195,16 @@ func TestSnapshotReturnsCursorPage(t *testing.T) {
 	}
 	var body struct {
 		Data           []eventDTO `json:"data"`
-		SnapshotCursor string     `json:"snapshot_cursor"`
+		SnapshotCursor int64      `json:"snapshot_cursor"`
 		HasMore        bool       `json:"has_more"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(body.Data) != 2 || body.SnapshotCursor != "7" || !body.HasMore {
+	if len(body.Data) != 2 || body.SnapshotCursor != 7 || !body.HasMore {
 		t.Fatalf("body = %#v", body)
 	}
-	if body.Data[0].Seq != "1" || body.Data[0].Channel != "system" || body.Data[0].Type != "settings.updated" {
+	if body.Data[0].Seq != 1 || body.Data[0].Channel != "system" || body.Data[0].Type != "settings.updated" {
 		t.Fatalf("event = %#v", body.Data[0])
 	}
 	if body.Data[0].ActorID != "9001" || body.Data[0].RequestID != "req_abc" || body.Data[0].CreatedAt == "" {
@@ -294,8 +294,8 @@ func TestStreamReplaysAfterCursorBeforeLive(t *testing.T) {
 	if err := json.Unmarshal([]byte(first.data), &payload); err != nil {
 		t.Fatalf("decode data: %v", err)
 	}
-	if payload.Seq != "2" {
-		t.Fatalf("payload seq = %q", payload.Seq)
+	if payload.Seq != 2 {
+		t.Fatalf("payload seq = %d", payload.Seq)
 	}
 	second := readFrame(t, scanner)
 	if second.id != "3" || second.event != "version.created" {
@@ -303,6 +303,30 @@ func TestStreamReplaysAfterCursorBeforeLive(t *testing.T) {
 	}
 	if _, channel, after, _ := svc.snapshotArgs(); channel != "system" || after != 1 {
 		t.Fatalf("replay args = %q/%d", channel, after)
+	}
+}
+
+func TestStreamSetsSnapshotCursorHeader(t *testing.T) {
+	svc := newFakeService()
+	handler := New(svc)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handler.Stream(w, actorRequest(r, 1))
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/api/stream?channel=system&after=0", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	defer resp.Body.Close()
+	if got := resp.Header.Get("X-Snapshot-Cursor"); got != "10" {
+		t.Fatalf("X-Snapshot-Cursor = %q, want 10", got)
 	}
 }
 
@@ -366,13 +390,13 @@ func TestStreamResetWhenCursorAhead(t *testing.T) {
 		t.Fatalf("reset frame = %#v", frame)
 	}
 	var reset struct {
-		SnapshotCursor string `json:"snapshot_cursor"`
+		SnapshotCursor int64 `json:"snapshot_cursor"`
 	}
 	if err := json.Unmarshal([]byte(frame.data), &reset); err != nil {
 		t.Fatalf("decode reset: %v", err)
 	}
-	if reset.SnapshotCursor != "5" {
-		t.Fatalf("reset cursor = %q", reset.SnapshotCursor)
+	if reset.SnapshotCursor != 5 {
+		t.Fatalf("reset cursor = %d", reset.SnapshotCursor)
 	}
 	if calls, _, _, _ := svc.snapshotArgs(); calls != 0 {
 		t.Fatalf("snapshot called %d times after reset", calls)

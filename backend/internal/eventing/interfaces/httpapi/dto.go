@@ -8,10 +8,11 @@ import (
 )
 
 // eventDTO is the public event shape: the event columns plus the envelope
-// fields. Seq and actor_id are decimal strings like every other ID.
+// fields. Seq is the integer channel cursor; actor_id is a decimal string like
+// every other business ID.
 type eventDTO struct {
 	Channel   string         `json:"channel"`
-	Seq       string         `json:"seq"`
+	Seq       int64          `json:"seq"`
 	Type      string         `json:"type"`
 	Scope     map[string]any `json:"scope"`
 	Payload   map[string]any `json:"payload"`
@@ -31,7 +32,7 @@ func toEventDTO(event eventing.Event) eventDTO {
 	}
 	dto := eventDTO{
 		Channel:   event.Channel,
-		Seq:       strconv.FormatInt(event.Seq, 10),
+		Seq:       event.Seq,
 		Type:      event.Type,
 		Scope:     scope,
 		Payload:   payload,
