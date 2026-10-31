@@ -15,10 +15,11 @@ import (
 // Worker polling constants (P1-D4). The poll interval and heartbeat are
 // constants in production; tests may shorten them through WorkerOption.
 const (
-	DefaultWorkerPollInterval = 300 * time.Millisecond
-	defaultWorkerConcurrency  = 4
-	workerShutdownWait        = 5 * time.Second
-	workerWriteBackTimeout    = 5 * time.Second
+	DefaultWorkerPollInterval     = 300 * time.Millisecond
+	DefaultWorkerRecoveryInterval = 3 * time.Second
+	defaultWorkerConcurrency      = 4
+	workerShutdownWait            = 5 * time.Second
+	workerWriteBackTimeout        = 5 * time.Second
 )
 
 // WorkerOption customizes worker timings (used by tests and future tuning).
@@ -38,6 +39,15 @@ func WithWorkerHeartbeatInterval(interval time.Duration) WorkerOption {
 	return func(w *Worker) {
 		if interval > 0 {
 			w.heartbeatInterval = interval
+		}
+	}
+}
+
+// WithWorkerRecoveryInterval overrides how often expired leases are reclaimed.
+func WithWorkerRecoveryInterval(interval time.Duration) WorkerOption {
+	return func(w *Worker) {
+		if interval > 0 {
+			w.recoveryInterval = interval
 		}
 	}
 }
@@ -69,6 +79,7 @@ type Worker struct {
 
 	pollInterval        time.Duration
 	heartbeatInterval   time.Duration
+	recoveryInterval    time.Duration
 	concurrencyOverride int
 	shutdownWait        time.Duration
 
@@ -95,6 +106,7 @@ func NewWorker(queue WorkerQueue, runner RunExecutor, settings SettingsReader, l
 		instanceID:        instanceID,
 		pollInterval:      DefaultWorkerPollInterval,
 		heartbeatInterval: DefaultHeartbeat,
+		recoveryInterval:  DefaultWorkerRecoveryInterval,
 		shutdownWait:      workerShutdownWait,
 		running:           map[int64]*workerRun{},
 	}
@@ -123,6 +135,8 @@ func (w *Worker) Run(ctx context.Context) error {
 	defer poll.Stop()
 	heartbeat := time.NewTicker(w.heartbeatInterval)
 	defer heartbeat.Stop()
+	recovery := time.NewTicker(w.recoveryInterval)
+	defer recovery.Stop()
 
 	sem := make(chan struct{}, limit)
 	var inflight sync.WaitGroup
@@ -137,6 +151,15 @@ func (w *Worker) Run(ctx context.Context) error {
 			w.claim(ctx, sem, &inflight)
 		case <-heartbeat.C:
 			w.heartbeatAll(ctx)
+		case <-recovery.C:
+			recovered, err := w.queue.RecoverExpired(ctx)
+			if err != nil {
+				if ctx.Err() == nil {
+					w.logger.Warn("agent worker: recover expired leases failed", "error", err)
+				}
+			} else if recovered > 0 {
+				w.logger.Info("agent worker: recovered expired leases", "count", recovered)
+			}
 		}
 	}
 }

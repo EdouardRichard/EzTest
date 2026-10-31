@@ -8,8 +8,11 @@ import (
 	"time"
 
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
+	eventingapp "github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/clock"
+	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/requestid"
 )
 
 // P1 lease constants (spec P1-D4). They are intentionally not settings keys:
@@ -32,6 +35,7 @@ type WorkQueue struct {
 	clock       clock.Clock
 	lease       time.Duration
 	maxAttempts int
+	events      eventingapp.Publisher
 }
 
 // NewWorkQueue wires the work queue. Zero/invalid tuning values fall back to
@@ -49,7 +53,14 @@ func NewWorkQueue(repo agent.WorkItemRepository, clk clock.Clock, lease time.Dur
 	return &WorkQueue{repo: repo, clock: clk, lease: lease, maxAttempts: maxAttempts}
 }
 
-// Ensure inserts a deduplicated open work item.
+// SetEvents attaches the event publisher. Work item creation events are
+// best-effort: a publish failure never rolls back the ensure.
+func (q *WorkQueue) SetEvents(publisher eventingapp.Publisher) {
+	q.events = publisher
+}
+
+// Ensure inserts a deduplicated open work item. When the repository actually
+// creates a new row, it publishes work_item.created exactly once.
 func (q *WorkQueue) Ensure(ctx context.Context, in agent.NewWorkItem) (agent.WorkItem, bool, error) {
 	if in.MaxAttempts == 0 {
 		in.MaxAttempts = q.maxAttempts
@@ -57,7 +68,25 @@ func (q *WorkQueue) Ensure(ctx context.Context, in agent.NewWorkItem) (agent.Wor
 	if err := in.Validate(); err != nil {
 		return agent.WorkItem{}, false, err
 	}
-	return q.repo.Ensure(ctx, in)
+	item, created, err := q.repo.Ensure(ctx, in)
+	if err != nil {
+		return agent.WorkItem{}, false, err
+	}
+	if created && q.events != nil {
+		_ = q.events.Publish(ctx, eventingapp.Event{
+			Channel: "version:" + platformid.Format(item.VersionID),
+			Type:    "work_item.created",
+			Scope:   map[string]any{"version_id": platformid.Format(item.VersionID)},
+			Payload: map[string]any{
+				"work_item_id": platformid.Format(item.ID),
+				"type":         string(item.Type),
+				"team":         string(item.Team),
+				"dedupe_key":   item.DedupeKey,
+			},
+			RequestID: requestid.From(ctx),
+		})
+	}
+	return item, created, nil
 }
 
 // Claim leases the next available item to claimant.

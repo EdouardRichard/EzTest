@@ -130,6 +130,20 @@ func (b *ContextBuilder) Build(ctx context.Context, in ContextInput) (ContextPac
 	budget, threshold, keepRecent := b.resolveBudget(ctx, in)
 	info := CompactInfo{Budget: budget}
 
+	// Keep the recent window bounded even when the whole context is below the
+	// compaction threshold. Older messages are folded into the rolling summary
+	// instead of being silently dropped by the adapter.
+	if keepRecent >= 0 && len(in.Conversation.RecentMessages) > keepRecent {
+		older := in.Conversation.RecentMessages[:len(in.Conversation.RecentMessages)-keepRecent]
+		in.Conversation.RecentMessages = in.Conversation.RecentMessages[len(in.Conversation.RecentMessages)-keepRecent:]
+		summary, usedFallback := b.summarize(ctx, older)
+		in.Conversation.Summary = mergeSummaries(in.Conversation.Summary, summary)
+		info.Compacted = true
+		info.Reason = "window"
+		info.Summary = summary
+		info.UsedFallback = usedFallback
+	}
+
 	sections := renderSections(in)
 	total := totalTokens(sections)
 	info.BeforeTokens = total
@@ -140,17 +154,6 @@ func (b *ContextBuilder) Build(ctx context.Context, in ContextInput) (ContextPac
 
 	info.Compacted = true
 	info.Reason = "threshold"
-
-	// Prefer a model summary for the messages that leave the recent window;
-	// fall back deterministically so compaction can never fail the run.
-	if len(in.Conversation.RecentMessages) > keepRecent {
-		older := in.Conversation.RecentMessages[:len(in.Conversation.RecentMessages)-keepRecent]
-		in.Conversation.RecentMessages = in.Conversation.RecentMessages[len(in.Conversation.RecentMessages)-keepRecent:]
-		summary, usedFallback := b.summarize(ctx, older)
-		in.Conversation.Summary = mergeSummaries(in.Conversation.Summary, summary)
-		info.Summary = summary
-		info.UsedFallback = usedFallback
-	}
 
 	compacted, compactInfo := compactInput(in, budget, keepRecent)
 	in = compacted

@@ -172,6 +172,18 @@ func TestRunnerHostWritesFinalConversationMessage(t *testing.T) {
 	if len(fixture.repo.packets) != 1 {
 		t.Fatalf("context packets = %d", len(fixture.repo.packets))
 	}
+	if len(fixture.chat.requests) == 0 || len(fixture.chat.requests[0].Messages) < 2 {
+		t.Fatalf("chat request missing messages: %#v", fixture.chat.requests)
+	}
+	prompt := ""
+	for _, message := range fixture.chat.requests[0].Messages {
+		prompt += message.Content + "\n"
+	}
+	for _, want := range []string{"订单系统", "此前讨论了登录", "支持手机号登录", "我想做一个登录功能"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("model prompt missing %q: %s", want, prompt)
+		}
+	}
 
 	var roles []string
 	for _, message := range fixture.repo.messages {
@@ -180,6 +192,30 @@ func TestRunnerHostWritesFinalConversationMessage(t *testing.T) {
 	wantRoles := []string{"system", "user", "assistant"}
 	if strings.Join(roles, ",") != strings.Join(wantRoles, ",") {
 		t.Fatalf("agent transcript roles = %v", roles)
+	}
+}
+
+func TestRunnerRejectsToolsOutsideProfileAllowlist(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	fixture.chat.responses = []llmapp.ChatResponse{
+		toolCall(tools.ToolRequirementDraftCreate, `{"title":"越权","description":"x","acceptance_criteria":"x","priority":"P1"}`),
+		{Content: "工具被拒绝，继续澄清。"},
+	}
+
+	if _, err := mustRun(t, fixture, hostItem()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if fixture.requirement.createDraft.Title != "" {
+		t.Fatalf("disallowed tool executed: %#v", fixture.requirement.createDraft)
+	}
+	var toolContent string
+	for _, message := range fixture.chat.requests[1].Messages {
+		if message.Role == "tool" {
+			toolContent = message.Content
+		}
+	}
+	if !strings.Contains(toolContent, "not allowed") {
+		t.Fatalf("tool result = %q", toolContent)
 	}
 }
 
@@ -320,9 +356,11 @@ func TestRunnerSoftTimeoutDropsTools(t *testing.T) {
 
 func TestRunnerCompactsAndRetriesOnContextOverflow(t *testing.T) {
 	fixture := newRunnerFixture(t)
-	fixture.chat.errors = []error{fmt.Errorf("upstream: %w", llmapp.ErrContextOverflow)}
+	// First model call asks for a tool, the second rejects the accumulated
+	// tool result as context overflow, and the retry must drop that history.
+	fixture.chat.errors = []error{nil, fmt.Errorf("upstream: %w", llmapp.ErrContextOverflow)}
 	fixture.chat.responses = []llmapp.ChatResponse{
-		{Content: "recovered"},
+		toolCall(tools.ToolContextVersionPack, `{}`),
 		{Content: "恢复后的回复"},
 	}
 
@@ -333,8 +371,19 @@ func TestRunnerCompactsAndRetriesOnContextOverflow(t *testing.T) {
 	if result.Status != agent.AgentRunDone {
 		t.Fatalf("result = %#v", result)
 	}
-	if fixture.chat.requestCount() != 2 {
-		t.Fatalf("chat calls = %d, want overflow then retry", fixture.chat.requestCount())
+	if fixture.chat.requestCount() != 3 {
+		t.Fatalf("chat calls = %d, want tool, overflow, retry", fixture.chat.requestCount())
+	}
+	requests := fixture.chat.requests
+	before := requests[1]
+	after := requests[2]
+	if len(after.Messages) >= len(before.Messages) {
+		t.Fatalf("overflow retry did not shrink messages: before=%d after=%d", len(before.Messages), len(after.Messages))
+	}
+	for _, message := range after.Messages {
+		if message.Role == "tool" {
+			t.Fatalf("overflow retry kept a tool message: %#v", after.Messages)
+		}
 	}
 	if !containsEvent(fixture.events, "context.compacted") {
 		t.Fatalf("events = %v", eventTypes(fixture.events))

@@ -346,6 +346,16 @@ func (t *requirementReopenPropose) Execute(ctx context.Context, scope Scope, raw
 	if err := validateText("reason", reason, 1, maxReopenReason); err != nil {
 		return nil, err
 	}
+	if t.deps.Requirement == nil {
+		return nil, missingDep("requirements")
+	}
+	current, err := t.deps.Requirement.GetRequirement(ctx, scope.VersionID, requirementID)
+	if err != nil {
+		return nil, mapPortError(err)
+	}
+	if current.Status != "clarified" {
+		return nil, StateConflict("only a clarified requirement can be proposed for reopening")
+	}
 	if t.deps.RollbackProposal == nil {
 		return nil, missingDep("rollback proposal")
 	}

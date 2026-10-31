@@ -271,15 +271,15 @@ func (r *ConversationRepository) SaveSummary(ctx context.Context, summary versio
 	return saved, nil
 }
 
-// ListReconcilable returns the most recent clarification conversations with
-// messages plus all their messages (ascending ID) annotated with the agent
-// profile of the run that produced them. Read-only reconciler support.
+// ListReconcilable returns the most recent clarification conversations
+// (including zero-message conversations, so the opening fallback can fire)
+// with all their messages (ascending ID) annotated with the agent profile of
+// the run that produced them. Read-only reconciler support.
 func (r *ConversationRepository) ListReconcilable(ctx context.Context, limit int) ([]version.ReconcilerConversation, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT c.id, c.version_id
 		FROM conversation c
 		WHERE c.kind = 'clarification'
-		  AND EXISTS (SELECT 1 FROM conversation_message m WHERE m.conversation_id = c.id)
 		ORDER BY c.id DESC
 		LIMIT $1
 	`, limit)

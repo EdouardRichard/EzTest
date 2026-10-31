@@ -19,8 +19,10 @@ const (
 )
 
 // Snapshot loads conversation memory: latest rolling summary, pinned facts and
-// the newest keepRecent messages (keepRecent <= 0 keeps up to the safety cap).
-func (a *Adapter) Snapshot(ctx context.Context, versionID, conversationID int64, keepRecent int) (agentapp.ConversationSnapshot, error) {
+// the conversation messages up to the safety cap. The context builder owns the
+// keep-recent split so older messages can be folded into the rolling summary
+// instead of being silently dropped by the adapter.
+func (a *Adapter) Snapshot(ctx context.Context, versionID, conversationID int64, _ int) (agentapp.ConversationSnapshot, error) {
 	if a.conversations == nil {
 		return agentapp.ConversationSnapshot{}, a.missing("conversations")
 	}
@@ -35,9 +37,6 @@ func (a *Adapter) Snapshot(ctx context.Context, versionID, conversationID int64,
 	messages, err := a.allMessages(ctx, versionID, conversationID)
 	if err != nil {
 		return agentapp.ConversationSnapshot{}, err
-	}
-	if keepRecent > 0 && len(messages) > keepRecent {
-		messages = messages[len(messages)-keepRecent:]
 	}
 	portMessages := make([]agentapp.ConversationMessage, 0, len(messages))
 	for _, message := range messages {

@@ -109,16 +109,20 @@ func TestReconcilerReadPorts(t *testing.T) {
 		t.Fatalf("limited initial ids = %#v, %v", limited, err)
 	}
 
-	// 2) reconcilable conversations: clarification + messages, newest first,
-	// messages ascending with the assistant run's profile key.
+	// 2) reconcilable conversations: clarification (including empty ones, so
+	// the opening fallback can fire), newest first, messages ascending with the
+	// assistant run's profile key.
 	reconcilable, err := conversationRepo.ListReconcilable(ctx, 100)
 	if err != nil {
 		t.Fatalf("ListReconcilable: %v", err)
 	}
-	if len(reconcilable) != 1 || reconcilable[0].ID != conversation.ID || reconcilable[0].VersionID != withMessage.ID {
+	if len(reconcilable) != 2 || reconcilable[0].ID != emptyConversation.ID || reconcilable[1].ID != conversation.ID {
 		t.Fatalf("reconcilable = %#v", reconcilable)
 	}
-	messages := reconcilable[0].Messages
+	if len(reconcilable[0].Messages) != 0 {
+		t.Fatalf("empty conversation messages = %#v", reconcilable[0].Messages)
+	}
+	messages := reconcilable[1].Messages
 	if len(messages) != 2 || messages[0].ID != userMessage.ID || messages[1].ID != assistant.ID {
 		t.Fatalf("messages = %#v", messages)
 	}
@@ -128,7 +132,8 @@ func TestReconcilerReadPorts(t *testing.T) {
 	if messages[1].Role != "assistant" || messages[1].AgentProfileKey != "clarification_host" {
 		t.Fatalf("assistant message = %#v", messages[1])
 	}
-	if limitedReconcilable, err := conversationRepo.ListReconcilable(ctx, 1); err != nil || len(limitedReconcilable) != 1 {
+	if limitedReconcilable, err := conversationRepo.ListReconcilable(ctx, 1); err != nil ||
+		len(limitedReconcilable) != 1 || limitedReconcilable[0].ID != emptyConversation.ID {
 		t.Fatalf("limited reconcilable = %#v, %v", limitedReconcilable, err)
 	}
 

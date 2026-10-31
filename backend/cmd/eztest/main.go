@@ -165,6 +165,7 @@ func main() {
 		versionapp.NoopCaseStaleHook{}, auditSvc, eventSvc, ids, clk)
 	workItems := agentpg.NewWorkItemRepository(pool, ids)
 	workQueue := agentapp.NewWorkQueue(workItems, clk, 30*time.Second, 3)
+	workQueue.SetEvents(eventSvc)
 	teamRoom := agentapp.NewTeamRoom(agentpg.NewTeamRoomRepository(pool, ids), clk, ids, settingsSvc, eventSvc)
 	enqueuer := versionTaskEnqueuer{queue: workQueue}
 	attachmentSvc := versionapp.NewAttachmentService(

@@ -248,7 +248,7 @@ func attachmentPart(sha, name, mime string, size int64) version.MessagePart {
 func registerAttachment(t *testing.T, env *attachmentEnv, sha, name, mime string, data []byte) versionapp.AttachmentView {
 	t.Helper()
 	env.store.put(sha, data, mime)
-	view, err := env.svc.RegisterFromMessage(requestContext(), env.versionID, 7001, attachmentPart(sha, name, mime, int64(len(data))), 42)
+	view, err := env.svc.RegisterFromMessage(requestContext(), env.versionID, 6001, 7001, attachmentPart(sha, name, mime, int64(len(data))), 42)
 	if err != nil {
 		t.Fatalf("RegisterFromMessage: %v", err)
 	}
@@ -284,7 +284,8 @@ func TestRegisterFromMessageCreatesPendingAttachmentAndIngestTask(t *testing.T) 
 	if !ok {
 		t.Fatalf("ingest task missing: %#v", env.queue.tasks)
 	}
-	if task.VersionID != env.versionID || task.Payload["attachment_id"] != idString(view.ID) || task.Payload["message_id"] != "7001" {
+	if task.VersionID != env.versionID || task.Payload["attachment_id"] != idString(view.ID) ||
+		task.Payload["message_id"] != "7001" || task.Payload["conversation_id"] != "6001" {
 		t.Fatalf("task = %#v", task)
 	}
 	if len(env.events.events) != 0 {
@@ -341,7 +342,7 @@ func TestRegisterFromMessageValidatesContent(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := env.svc.RegisterFromMessage(requestContext(), env.versionID, 7001, tc.part, 42)
+			_, err := env.svc.RegisterFromMessage(requestContext(), env.versionID, 6001, 7001, tc.part, 42)
 			if err == nil {
 				t.Fatal("invalid attachment accepted")
 			}

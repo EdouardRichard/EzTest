@@ -293,6 +293,28 @@ func TestOpenAIChatRedactsAPIKeyFromErrors(t *testing.T) {
 	}
 }
 
+func TestOpenAIChatRedactsCustomHeaderValuesFromErrors(t *testing.T) {
+	const headerSecret = "header-secret-value"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"message":"bad header `+headerSecret+`"}}`)
+	}))
+	defer server.Close()
+
+	cfg := chatConfigFor(server.URL, 0)
+	cfg.Headers = map[string]string{"X-Provider-Token": headerSecret}
+	_, err := llminfra.NewClient().Chat(context.Background(), cfg, llmapp.ChatRequest{
+		Model:    "fake-llm",
+		Messages: []llmapp.ChatMessage{{Role: "user", Content: "hi"}},
+	})
+	if err == nil {
+		t.Fatal("Chat succeeded on HTTP 400")
+	}
+	if strings.Contains(err.Error(), headerSecret) {
+		t.Fatalf("custom header leaked in error %q", err)
+	}
+}
+
 func TestOpenAIChatTimesOutPerRequest(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Drain the body so the server observes the client disconnecting when

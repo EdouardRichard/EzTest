@@ -322,12 +322,18 @@ func TestRequirementReopenProposeWritesProposalOnly(t *testing.T) {
 	var gotScope Scope
 	var gotID int64
 	var gotReason string
-	deps := Deps{RollbackProposal: func(_ context.Context, scope Scope, requirementID int64, reason string) (any, error) {
-		gotScope = scope
-		gotID = requirementID
-		gotReason = reason
-		return map[string]any{"message_id": "7001"}, nil
+	port := &fakeRequirementPort{detail: RequirementDetail{
+		RequirementSummary: RequirementSummary{ID: 501, Status: "clarified"},
 	}}
+	deps := Deps{
+		Requirement: port,
+		RollbackProposal: func(_ context.Context, scope Scope, requirementID int64, reason string) (any, error) {
+			gotScope = scope
+			gotID = requirementID
+			gotReason = reason
+			return map[string]any{"message_id": "7001"}, nil
+		},
+	}
 	registry := NewP1Registry(deps)
 	result, err := execute(t, registry, Scope{VersionID: 10, ConversationID: 20, AgentRunID: 30}, ToolRequirementReopenPropose, `{
 		"requirement_id":"501","reason":"需求已变化，需要重新澄清"
@@ -335,12 +341,46 @@ func TestRequirementReopenProposeWritesProposalOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
-	if gotID != 501 || gotReason == "" || gotScope.VersionID != 10 || gotScope.ConversationID != 20 {
+	if port.getVersion != 10 || port.getID != 501 || gotID != 501 || gotReason == "" ||
+		gotScope.VersionID != 10 || gotScope.ConversationID != 20 {
 		t.Fatalf("proposal args = %d %q %#v", gotID, gotReason, gotScope)
 	}
 	body := resultMap(t, result)
 	if body["status"] != "recorded" {
 		t.Fatalf("result = %#v", body)
+	}
+}
+
+func TestRequirementReopenProposeRejectsNonClarifiedAndUnknownScope(t *testing.T) {
+	deps := Deps{
+		Requirement: &fakeRequirementPort{detail: RequirementDetail{
+			RequirementSummary: RequirementSummary{ID: 501, Status: "draft"},
+		}},
+		RollbackProposal: func(context.Context, Scope, int64, string) (any, error) {
+			t.Fatal("proposal must not be written for a draft requirement")
+			return nil, nil
+		},
+	}
+	registry := NewP1Registry(deps)
+	_, err := execute(t, registry, Scope{VersionID: 10, ConversationID: 20}, ToolRequirementReopenPropose,
+		`{"requirement_id":"501","reason":"需要重新澄清"}`)
+	toolErr := asToolError(t, err)
+	if toolErr.Code != CodeStateConflict {
+		t.Fatalf("code = %q", toolErr.Code)
+	}
+
+	outside := &fakeRequirementPort{getErr: NotFound("requirement")}
+	registry = NewP1Registry(Deps{
+		Requirement: outside,
+		RollbackProposal: func(context.Context, Scope, int64, string) (any, error) {
+			t.Fatal("proposal must not be written for an out-of-scope requirement")
+			return nil, nil
+		},
+	})
+	_, err = execute(t, registry, Scope{VersionID: 11, ConversationID: 20}, ToolRequirementReopenPropose,
+		`{"requirement_id":"501","reason":"需要重新澄清"}`)
+	if toolErr := asToolError(t, err); toolErr.Code != CodeNotFound {
+		t.Fatalf("code = %q", toolErr.Code)
 	}
 }
 

@@ -29,6 +29,7 @@ import type {
   RequirementDetail,
   RequirementFilter,
   TargetOptions,
+  VersionClarificationStats,
 } from "./types"
 import { useVersionEvents } from "./useVersionEvents"
 
@@ -102,6 +103,10 @@ export function RequirementsTab({
 
   const loadRequirements = useCallback(async (): Promise<void> => {
     setRequirements(await listRequirements(versionId))
+  }, [versionId])
+
+  const loadVersion = useCallback(async (): Promise<void> => {
+    setVersion(await getVersion(versionId))
   }, [versionId])
 
   const loadWorkspace = useCallback(async () => {
@@ -182,6 +187,7 @@ export function RequirementsTab({
     onAgentActivity: (payload) => setActivity(activityText(payload)),
     onRequirementChanged: (event) => {
       void loadRequirements().catch(() => {})
+      void loadVersion().catch(() => {})
       const changedId =
         typeof event.payload.requirement_id === "string" ? event.payload.requirement_id : undefined
       if (changedId !== undefined && changedId === selectedRequirementId) {
@@ -209,7 +215,8 @@ export function RequirementsTab({
   const clarifiedCount = requirements.filter(
     (requirement) => requirement.status === "clarified",
   ).length
-  const pendingDesignCount = clarifiedCount
+  const stats = version as (Version & Partial<VersionClarificationStats>) | null
+  const pendingDesignCount = stats?.pending_design_count ?? clarifiedCount
 
   function selectRequirement(requirementId: string): void {
     setSelectedRequirementId(requirementId)
@@ -265,7 +272,7 @@ export function RequirementsTab({
       )
       const selectedConfirmed = selectedIds.some((id) => result.confirmed.includes(id))
       setSelectedIds([])
-      await loadRequirements()
+      await Promise.all([loadRequirements(), loadVersion()])
       if (selectedConfirmed && selectedRequirementId !== null) {
         setDetailToken((token) => token + 1)
       }
@@ -279,6 +286,7 @@ export function RequirementsTab({
   function requirementUpdated(next: RequirementDetail): void {
     setDetail(next)
     void loadRequirements().catch(() => {})
+    void loadVersion().catch(() => {})
   }
 
   if (loading) {

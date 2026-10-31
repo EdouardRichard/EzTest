@@ -59,7 +59,7 @@ func NewAttachmentService(
 // the ingest task. Images are stored as references (skipped extraction);
 // legacy .doc/.ppt are marked failed with unsupported_attachment_format
 // without blocking the message.
-func (s *AttachmentService) RegisterFromMessage(ctx context.Context, versionID, messageID int64, part version.MessagePart, actorID int64) (AttachmentView, error) {
+func (s *AttachmentService) RegisterFromMessage(ctx context.Context, versionID, conversationID, messageID int64, part version.MessagePart, actorID int64) (AttachmentView, error) {
 	if versionID <= 0 || messageID <= 0 {
 		return AttachmentView{}, platform.Invalid("attachment", "version and message are required")
 	}
@@ -136,7 +136,7 @@ func (s *AttachmentService) RegisterFromMessage(ctx context.Context, versionID, 
 			"message":       errorText,
 		})
 	case version.AttachmentPending:
-		s.enqueueIngest(ctx, versionID, messageID, attachmentID)
+		s.enqueueIngest(ctx, versionID, conversationID, messageID, attachmentID)
 	}
 	return toAttachmentView(attachment), nil
 }
@@ -397,8 +397,36 @@ func (s *AttachmentService) Extract(ctx context.Context, attachmentID int64) (Ex
 	}
 	defer reader.Close()
 
-	if _, err := s.repo.MarkProcessing(ctx, attachmentID, s.clock.Now()); err != nil {
+	changed, err := s.repo.MarkProcessing(ctx, attachmentID, s.clock.Now())
+	if err != nil {
 		return ExtractionResult{}, mapAttachmentRepositoryError(err)
+	}
+	if !changed {
+		current, err := s.repo.Get(ctx, attachmentID)
+		if err != nil {
+			return ExtractionResult{}, mapAttachmentRepositoryError(err)
+		}
+		switch current.ExtractionStatus {
+		case version.AttachmentDone:
+			result := ExtractionResult{
+				Attachment:            toAttachmentView(current),
+				ExtractedContentRefID: derefInt64(current.ExtractedContentRefID),
+			}
+			if text, err := s.readExtractedText(ctx, current); err == nil {
+				result.Text = text
+				result.Chars = len([]rune(text))
+			}
+			return result, nil
+		case version.AttachmentFailed:
+			return ExtractionResult{
+				Attachment: toAttachmentView(current),
+				ErrorCode:  current.ExtractionErrorCode,
+			}, nil
+		case version.AttachmentSkipped:
+			return ExtractionResult{Attachment: toAttachmentView(current)}, nil
+		default:
+			return ExtractionResult{}, fmt.Errorf("attachment extraction is already in progress")
+		}
 	}
 	text, extractErr := s.extractor.Extract(ctx, attachment.Name, attachment.MIME, reader)
 	if extractErr == nil && int64(len(text)) > version.MaxExtractedTextBytes {
@@ -519,20 +547,24 @@ func (s *AttachmentService) readExtractedText(ctx context.Context, attachment ve
 	return "", version.ErrAttachmentNotFound
 }
 
-func (s *AttachmentService) enqueueIngest(ctx context.Context, versionID, messageID, attachmentID int64) {
+func (s *AttachmentService) enqueueIngest(ctx context.Context, versionID, conversationID, messageID, attachmentID int64) {
 	if s.queue == nil {
 		return
+	}
+	payload := map[string]any{
+		"attachment_id": platformid.Format(attachmentID),
+		"version_id":    platformid.Format(versionID),
+		"message_id":    platformid.Format(messageID),
+	}
+	if conversationID > 0 {
+		payload["conversation_id"] = platformid.Format(conversationID)
 	}
 	_ = s.queue.Ensure(ctx, TaskInput{
 		VersionID: versionID,
 		Team:      "clarification",
 		Type:      "attachment.ingest",
 		DedupeKey: "attachment:" + platformid.Format(attachmentID),
-		Payload: map[string]any{
-			"attachment_id": platformid.Format(attachmentID),
-			"version_id":    platformid.Format(versionID),
-			"message_id":    platformid.Format(messageID),
-		},
+		Payload:   payload,
 	})
 }
 

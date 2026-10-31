@@ -215,9 +215,6 @@ func TestReconcilerEnsuresOpeningOnce(t *testing.T) {
 		t.Fatalf("second Reconcile: %v", err)
 	}
 	assertEnsured(t, fixture.queue, agentapp.WorkTypeChatTurn+":opening:20")
-	if !containsEvent(fixture.events, "work_item.created") {
-		t.Fatalf("events = %v", eventTypes(fixture.events))
-	}
 }
 
 func TestReconcilerEnsuresReplyAndCuratePerUserMessage(t *testing.T) {

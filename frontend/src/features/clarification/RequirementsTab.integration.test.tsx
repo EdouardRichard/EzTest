@@ -130,7 +130,7 @@ describe("RequirementsTab integration", () => {
 
     // The first conversation is selected by default; requirements keep their bound target names.
     expect(screen.getByText(conversationFixture.title)).toBeInTheDocument()
-    expect(api.listMessages).toHaveBeenCalledWith("2001", "4001")
+    await waitFor(() => expect(api.listMessages).toHaveBeenCalledWith("2001", "4001"))
     expect(screen.getByTestId("requirement-item-6001")).toHaveTextContent("支付网关")
   })
 

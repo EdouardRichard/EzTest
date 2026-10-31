@@ -161,13 +161,21 @@ function buildReply(body) {
 }
 
 // lastUserText returns the trimmed text of the last non-empty user message.
+// The runtime prefixes the persisted context packet to the user prompt; keep
+// deterministic replies anchored to the actual current user text.
 function lastUserText(body) {
   const messages = Array.isArray(body.messages) ? body.messages : [];
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const message = messages[i];
     if (!message || message.role !== "user") continue;
-    const text = messageText(message.content).trim();
-    if (text !== "") return text;
+    let text = messageText(message.content).trim();
+    if (text === "") continue;
+    const marker = "# 当前用户消息";
+    const markerIndex = text.lastIndexOf(marker);
+    if (markerIndex >= 0) {
+      text = text.slice(markerIndex + marker.length).trim();
+    }
+    return text;
   }
   return "";
 }

@@ -77,6 +77,7 @@ func (s *RequirementService) Create(ctx context.Context, versionID int64, in Req
 	revision.RequirementID = requirementID
 	revision.Revision = 1
 	revision.CreatedBy = optionalActor(actorID)
+	revision.CreatedByRunID = agentRunID(ctx)
 	revision.CreatedAt = now
 
 	requirement := version.Requirement{
@@ -86,6 +87,7 @@ func (s *RequirementService) Create(ctx context.Context, versionID int64, in Req
 		Status:              version.RequirementDraft,
 		TargetVersionSUTIDs: append([]string{}, revision.TargetVersionSUTs...),
 		CreatedBy:           optionalActor(actorID),
+		CreatedByRunID:      agentRunID(ctx),
 		CreatedAt:           now,
 		UpdatedAt:           now,
 	}
@@ -200,6 +202,11 @@ func (s *RequirementService) Get(ctx context.Context, versionID, requirementID i
 func (s *RequirementService) List(ctx context.Context, versionID int64, status string, limit int, beforeID *int64) ([]RequirementView, bool, error) {
 	if versionID <= 0 {
 		return nil, false, platform.Invalid("id", "must be a positive decimal ID")
+	}
+	if s.versions != nil {
+		if _, err := s.versions.Get(ctx, versionID); err != nil {
+			return nil, false, err
+		}
 	}
 	statusFilter, err := requirementStatusFilter(status)
 	if err != nil {
@@ -445,6 +452,7 @@ func (s *RequirementService) Rollback(ctx context.Context, versionID, requiremen
 		TargetPages:        append([]string{}, current.TargetPages...),
 		TargetAPIs:         append([]string{}, current.TargetAPIs...),
 		CreatedBy:          optionalActor(actorID),
+		CreatedByRunID:     agentRunID(ctx),
 		CreatedAt:          now,
 	}
 	contentHash, err := revision.ComputeContentHash()
@@ -544,6 +552,7 @@ func (s *RequirementService) CreateRelation(ctx context.Context, versionID int64
 		Description:       description,
 		SourceRevisionID:  in.SourceRevisionID,
 		CreatedBy:         optionalActor(actorID),
+		CreatedByRunID:    agentRunID(ctx),
 		CreatedAt:         now,
 	}
 	if err := s.repo.CreateRelation(ctx, relation); err != nil {
@@ -801,9 +810,27 @@ func (s *RequirementService) publishEvent(ctx context.Context, versionID int64, 
 	})
 }
 
+func agentRunID(ctx context.Context) *int64 {
+	run, ok := platform.AgentRunFrom(ctx)
+	if !ok || run.RunID <= 0 {
+		return nil
+	}
+	id := run.RunID
+	return &id
+}
+
 func (s *RequirementService) recordAudit(ctx context.Context, actorID int64, action, targetKind, targetID string, metadata map[string]any) {
 	if s.audit == nil {
 		return
+	}
+	if run, ok := platform.AgentRunFrom(ctx); ok {
+		if metadata == nil {
+			metadata = map[string]any{}
+		}
+		metadata["agent_run_id"] = platformid.Format(run.RunID)
+		if run.WorkItemID > 0 {
+			metadata["work_item_id"] = platformid.Format(run.WorkItemID)
+		}
 	}
 	actor := actorID
 	_ = s.audit.Record(ctx, auditapp.Event{
