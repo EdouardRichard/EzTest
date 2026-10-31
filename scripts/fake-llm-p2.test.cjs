@@ -252,6 +252,82 @@ const GRAPH_MIXED_VERSIONS = {
   ],
 };
 
+// GRAPH_CONFIRMED_FIRST has a confirmed current case before a draft one, so the
+// data planner must skip the confirmed case and target the draft revision.
+const GRAPH_CONFIRMED_FIRST = {
+  version_id: "1001",
+  graph_hash: "8".repeat(64),
+  requirements: [
+    {
+      requirement_id: "3001",
+      requirement_version_id: "3002",
+      revision: 1,
+      title: "登录",
+      status: "clarified",
+      target_version_sut_ids: ["9001"],
+      scenarios: [
+        {
+          id: "5101",
+          requirement_version_id: "3002",
+          name: "正常登录",
+          cases: [
+            {
+              case_id: "7101",
+              current_version_id: "7102",
+              revision: 1,
+              title: "已确认用例",
+              status: "confirmed",
+              default_version_sut_id: "9001",
+              version_sut_ids: ["9001"],
+            },
+            {
+              case_id: "7201",
+              current_version_id: "7202",
+              revision: 1,
+              title: "草稿用例",
+              status: "draft",
+              default_version_sut_id: "9001",
+              version_sut_ids: ["9001"],
+            },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
+const GRAPH_ALL_CONFIRMED = {
+  version_id: "1001",
+  graph_hash: "7".repeat(64),
+  requirements: [
+    {
+      requirement_id: "3001",
+      requirement_version_id: "3002",
+      title: "登录",
+      status: "clarified",
+      target_version_sut_ids: ["9001"],
+      scenarios: [
+        {
+          id: "5101",
+          requirement_version_id: "3002",
+          name: "正常登录",
+          cases: [
+            {
+              case_id: "7101",
+              current_version_id: "7102",
+              revision: 1,
+              title: "已确认用例",
+              status: "confirmed",
+              default_version_sut_id: "9001",
+              version_sut_ids: ["9001"],
+            },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
 before(startFake);
 after(() => {
   if (child && !child.killed) child.kill();
@@ -335,6 +411,33 @@ test("design_host creates a scenario and case when the graph has none", async ()
   assert.equal(propose.args.scenarios[0].id, undefined);
   assert.equal(propose.args.cases[0].id, undefined);
   assert.equal(propose.args.cases[0].steps.length >= 1, true);
+});
+
+test("design_host does not propose on the opening turn or without a modify request", async () => {
+  const opening = "这是设计会话的开场。请向用户简要说明当前设计范围，并提示用户可以在对话中要求新增或修改用例。";
+  const opened = await postChat({
+    model: "fake-llm",
+    messages: [systemMarked("design_host"), userText(opening), toolResult(GRAPH)],
+  });
+  const openingMessage = opened.json.choices[0].message;
+  assert.equal(openingMessage.tool_calls, undefined, "opening turn proposed a case");
+  assert.ok(openingMessage.content.length > 0);
+  assert.equal(openingMessage.content.startsWith("EzTest fake LLM:"), false);
+
+  // A graph result with no user request at all must stay a greeting.
+  const noUser = await postChat({
+    model: "fake-llm",
+    messages: [systemMarked("design_host"), toolResult(GRAPH)],
+  });
+  assert.equal(noUser.json.choices[0].message.tool_calls, undefined, "graph-only turn proposed a case");
+  assert.ok(noUser.json.choices[0].message.content.length > 0);
+
+  // A plain question must not trigger a write either.
+  const question = await postChat({
+    model: "fake-llm",
+    messages: [systemMarked("design_host"), userText("当前脑图覆盖了哪些场景？"), toolResult(GRAPH)],
+  });
+  assert.equal(question.json.choices[0].message.tool_calls, undefined, "question turn proposed a case");
 });
 
 test("design_host proposes against the first clarified requirement when a draft row is first", async () => {
@@ -512,6 +615,24 @@ test("data_planner reads the graph then submits data for the first draft case", 
     ],
   });
   assert.equal(third.json.choices[0].message.tool_calls, undefined);
+});
+
+test("data_planner selects only a current draft case", async () => {
+  const draft = await postChat({
+    model: "fake-llm",
+    messages: [systemMarked("data_planner"), userText("补充需求 3001 的测试数据"), toolResult(GRAPH_CONFIRMED_FIRST)],
+  });
+  const submit = assistantToolCall(draft.json.choices[0].message);
+  assert.equal(submit.name, "design.data_plan_submit");
+  assert.equal(submit.args.case_version_id, "7202", "data planner targeted the confirmed case instead of the draft");
+
+  const confirmedOnly = await postChat({
+    model: "fake-llm",
+    messages: [systemMarked("data_planner"), userText("补充需求 3001 的测试数据"), toolResult(GRAPH_ALL_CONFIRMED)],
+  });
+  const message = confirmedOnly.json.choices[0].message;
+  assert.equal(message.tool_calls, undefined, "data planner targeted a confirmed-only graph");
+  assert.ok(message.content.length > 0);
 });
 
 test("no design profile ever emits case.confirm or granular design write tools", async () => {
