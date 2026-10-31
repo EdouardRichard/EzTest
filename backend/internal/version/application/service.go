@@ -177,6 +177,30 @@ func (s *Service) Update(ctx context.Context, id int64, patch Patch, actorID int
 	return s.buildView(ctx, updated, bindings)
 }
 
+// MarkRunning projects the version from initial to running. It is idempotent:
+// only the first call that flips the status publishes version.started and
+// version.status_changed (to version:{id} and system). The conversation and
+// requirement services call it on the first message/requirement/confirmation;
+// the P1 reconciler is the fallback.
+func (s *Service) MarkRunning(ctx context.Context, id int64) error {
+	if id <= 0 {
+		return platform.Invalid("id", "must be a positive decimal ID")
+	}
+	changed, err := s.repo.MarkRunning(ctx, id, s.clock.Now())
+	if err != nil {
+		return mapRepositoryError(err)
+	}
+	if !changed {
+		// Distinguish "already running" from "missing version".
+		if _, _, err := s.repo.Get(ctx, id); err != nil {
+			return mapRepositoryError(err)
+		}
+		return nil
+	}
+	s.recordStatusProjection(ctx, id)
+	return nil
+}
+
 // validateBindings checks the 1-20 binding cardinality, SUT uniqueness and
 // resource ownership against the resource catalog. It returns the normalized
 // domain bindings (deduplicated IDs, stable order) ready for persistence.
@@ -366,12 +390,19 @@ func positiveUniqueIDs(ids []int64, field string) ([]int64, error) {
 }
 
 func (s *Service) buildView(ctx context.Context, entity version.Version, bindings []version.Binding) (VersionView, error) {
+	stats, err := s.repo.Stats(ctx, entity.ID)
+	if err != nil {
+		return VersionView{}, err
+	}
 	view := VersionView{
 		ID:                        entity.ID,
 		Title:                     entity.Title,
 		Status:                    entity.Status,
 		AutoDesignNewRequirements: entity.AutoDesignNewRequirements,
 		Bindings:                  make([]BindingView, 0, len(bindings)),
+		RequirementCounts:         stats.Requirements,
+		ConversationCount:         stats.ConversationCount,
+		PendingDesignCount:        stats.Requirements.Clarified,
 		CreatedBy:                 entity.CreatedBy,
 		CreatedAt:                 entity.CreatedAt,
 		UpdatedAt:                 entity.UpdatedAt,
@@ -555,6 +586,28 @@ func (s *Service) recordUpdated(ctx context.Context, entity version.Version, act
 			"auto_design_new_requirements": entity.AutoDesignNewRequirements,
 		},
 	})
+}
+
+// recordStatusProjection publishes version.started and version.status_changed
+// for the initial -> running transition. Delivery is best effort.
+func (s *Service) recordStatusProjection(ctx context.Context, versionID int64) {
+	if s.events == nil {
+		return
+	}
+	targetID := platformid.Format(versionID)
+	scope := map[string]any{"version_id": targetID}
+	payload := map[string]any{"from": version.StatusInitial, "to": version.StatusRunning}
+	for _, eventType := range []string{"version.started", "version.status_changed"} {
+		for _, channel := range []string{"version:" + targetID, "system"} {
+			_ = s.events.Publish(ctx, eventingapp.Event{
+				Channel:   channel,
+				Type:      eventType,
+				Scope:     scope,
+				Payload:   payload,
+				RequestID: requestid.From(ctx),
+			})
+		}
+	}
 }
 
 // invalidCatalogLookup turns a resource-catalog not-found into a field-level

@@ -13,14 +13,26 @@ import (
 // ---------- response DTOs ----------
 
 type versionDTO struct {
-	ID                        string       `json:"id"`
-	Title                     string       `json:"title"`
-	Status                    string       `json:"status"`
-	AutoDesignNewRequirements bool         `json:"auto_design_new_requirements"`
-	Bindings                  []bindingDTO `json:"bindings"`
-	CreatedBy                 string       `json:"created_by"`
-	CreatedAt                 string       `json:"created_at"`
-	UpdatedAt                 string       `json:"updated_at"`
+	ID                        string               `json:"id"`
+	Title                     string               `json:"title"`
+	Status                    string               `json:"status"`
+	AutoDesignNewRequirements bool                 `json:"auto_design_new_requirements"`
+	Bindings                  []bindingDTO         `json:"bindings"`
+	RequirementCounts         requirementCountsDTO `json:"requirement_counts"`
+	ConversationCount         int                  `json:"conversation_count"`
+	PendingDesignCount        int                  `json:"pending_design_count"`
+	CreatedBy                 string               `json:"created_by"`
+	CreatedAt                 string               `json:"created_at"`
+	UpdatedAt                 string               `json:"updated_at"`
+}
+
+// requirementCountsDTO is the P1 version-detail increment.
+type requirementCountsDTO struct {
+	Total     int `json:"total"`
+	Draft     int `json:"draft"`
+	Clarified int `json:"clarified"`
+	Closed    int `json:"closed"`
+	Obsolete  int `json:"obsolete"`
 }
 
 type bindingDTO struct {
@@ -149,9 +161,18 @@ func toVersionDTO(view versionapp.VersionView) versionDTO {
 		Status:                    view.Status,
 		AutoDesignNewRequirements: view.AutoDesignNewRequirements,
 		Bindings:                  bindings,
-		CreatedBy:                 strconv.FormatInt(view.CreatedBy, 10),
-		CreatedAt:                 formatTime(view.CreatedAt),
-		UpdatedAt:                 formatTime(view.UpdatedAt),
+		RequirementCounts: requirementCountsDTO{
+			Total:     view.RequirementCounts.Total,
+			Draft:     view.RequirementCounts.Draft,
+			Clarified: view.RequirementCounts.Clarified,
+			Closed:    view.RequirementCounts.Closed,
+			Obsolete:  view.RequirementCounts.Obsolete,
+		},
+		ConversationCount:  view.ConversationCount,
+		PendingDesignCount: view.PendingDesignCount,
+		CreatedBy:          strconv.FormatInt(view.CreatedBy, 10),
+		CreatedAt:          formatTime(view.CreatedAt),
+		UpdatedAt:          formatTime(view.UpdatedAt),
 	}
 }
 

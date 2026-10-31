@@ -152,6 +152,7 @@ type fakeRepo struct {
 	versions  map[int64]version.Version
 	bindings  map[int64][]version.Binding
 	createErr error
+	stats     version.VersionStats
 }
 
 func newFakeRepo() *fakeRepo {
@@ -208,6 +209,24 @@ func (f *fakeRepo) Update(_ context.Context, v version.Version) (version.Version
 	}
 	f.versions[v.ID] = v
 	return v, nil
+}
+
+func (f *fakeRepo) MarkRunning(_ context.Context, id int64, updatedAt time.Time) (bool, error) {
+	v, ok := f.versions[id]
+	if !ok {
+		return false, nil
+	}
+	if v.Status != version.StatusInitial {
+		return false, nil
+	}
+	v.Status = version.StatusRunning
+	v.UpdatedAt = updatedAt
+	f.versions[id] = v
+	return true, nil
+}
+
+func (f *fakeRepo) Stats(_ context.Context, _ int64) (version.VersionStats, error) {
+	return f.stats, nil
 }
 
 func (f *fakeRepo) SUTInUse(_ context.Context, id int64) (bool, error) {
