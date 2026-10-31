@@ -2,6 +2,8 @@
 
 > 状态：模板/机制说明；具体内容由各阶段实施时写入并冻结。
 > 规则：**代码先行、契约后补**不允许；阶段末必须冻结本阶段对外接口。
+>
+> **P0 冻结状态（2026-10-31）**：`openapi.yaml`（43 paths / 66 operations，`x-frozen: P0`）、`events.md`、`db-schema.md`、`migrations-order.md`、`settings.md` 已冻结。`task-types.md` 与 `agent-profiles-tools.md` 按机制说明从 P1 开始写入；P0 未创建。
 
 ## 目录内容
 

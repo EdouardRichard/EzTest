@@ -47,10 +47,16 @@ test.beforeAll(async ({ request }) => {
   })
   token = login.data.token
 
-  const sut = await api<{ data: { id: string } }>(request, "POST", "/api/resources/suts", {
-    name: sutName,
-    intro: "P0 E2E",
-  }, 201)
+  const sut = await api<{ data: { id: string } }>(
+    request,
+    "POST",
+    "/api/resources/suts",
+    {
+      name: sutName,
+      intro: "P0 E2E",
+    },
+    201,
+  )
   setup = { sutID: sut.data.id } as Setup
 
   const environment = await api<{ data: { id: string } }>(
@@ -119,20 +125,26 @@ test.beforeAll(async ({ request }) => {
   )
   setup.repositoryID = repository.data.id
 
-  const version = await api<{ data: { id: string } }>(request, "POST", "/api/versions", {
-    title: versionTitle,
-    bindings: [
-      {
-        sut_id: setup.sutID,
-        environment_id: setup.environmentID,
-        code_repository_id: setup.repositoryID,
-        page_ids: [setup.pageID],
-        api_ids: [setup.apiID],
-        database_ids: [setup.databaseID],
-        accounts: [{ account_id: setup.accountID, role: "buyer" }],
-      },
-    ],
-  }, 201)
+  const version = await api<{ data: { id: string } }>(
+    request,
+    "POST",
+    "/api/versions",
+    {
+      title: versionTitle,
+      bindings: [
+        {
+          sut_id: setup.sutID,
+          environment_id: setup.environmentID,
+          code_repository_id: setup.repositoryID,
+          page_ids: [setup.pageID],
+          api_ids: [setup.apiID],
+          database_ids: [setup.databaseID],
+          accounts: [{ account_id: setup.accountID, role: "buyer" }],
+        },
+      ],
+    },
+    201,
+  )
   setup.versionID = version.data.id
 })
 
@@ -162,8 +174,22 @@ test("P0 admin journey: login, versions, detail, resources, settings", async ({ 
   await page.getByText(versionTitle).first().click()
   await page.waitForURL(new RegExp(`/versions/${setup.versionID}`))
   await expect(page.getByRole("heading", { name: versionTitle })).toBeVisible()
-  for (const label of ["总览", "需求与澄清", "用例设计", "执行", "探索链路", "问题", "报告", "代码与变更"]) {
-    await expect(page.getByRole("tab", { name: new RegExp(label) }).or(page.getByText(label).first()).first()).toBeVisible()
+  for (const label of [
+    "总览",
+    "需求与澄清",
+    "用例设计",
+    "执行",
+    "探索链路",
+    "问题",
+    "报告",
+    "代码与变更",
+  ]) {
+    await expect(
+      page
+        .getByRole("tab", { name: new RegExp(label) })
+        .or(page.getByText(label).first())
+        .first(),
+    ).toBeVisible()
   }
   await expect(page.getByText(sutName).first()).toBeVisible()
   await page.screenshot({ path: path.join(screenshotDir, "version-detail.png"), fullPage: true })

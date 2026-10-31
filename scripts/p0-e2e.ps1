@@ -61,11 +61,16 @@ try {
     $logDir = Join-Path $repoRoot ".tmp\p0-acceptance"
     New-Item -ItemType Directory -Force -Path $logDir | Out-Null
     Push-Location (Join-Path $repoRoot "frontend")
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
     try {
         & pnpm exec playwright test e2e/p0.spec.ts --reporter=list 2>&1 |
             Tee-Object -FilePath (Join-Path $logDir "e2e.log")
         $code = $LASTEXITCODE
-    } finally { Pop-Location }
+    } finally {
+        $ErrorActionPreference = $previousPreference
+        Pop-Location
+    }
     exit $code
 } finally {
     foreach ($process in $started) {
