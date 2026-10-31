@@ -166,13 +166,23 @@ func (f *fakeVersionReopener) ReopenIfCompleted(_ context.Context, versionID int
 	return f.err
 }
 
+type closureTaskCall struct {
+	requirementID        int64
+	requirementVersionID int64
+	closeRound           int32
+}
+
 type fakeClosureTasks struct {
-	calls []int64
+	calls []closureTaskCall
 	err   error
 }
 
-func (f *fakeClosureTasks) EnsureRequirementClose(_ context.Context, requirementID int64) error {
-	f.calls = append(f.calls, requirementID)
+func (f *fakeClosureTasks) EnsureRequirementClose(_ context.Context, requirementID, requirementVersionID int64, closeRound int32) error {
+	f.calls = append(f.calls, closureTaskCall{
+		requirementID:        requirementID,
+		requirementVersionID: requirementVersionID,
+		closeRound:           closeRound,
+	})
 	return f.err
 }
 
@@ -501,8 +511,57 @@ func TestClosureServiceEnsureClosuresEnsuresOnlyEligibleRequirements(t *testing.
 	if err := env.svc.EnsureClosures(requestContext(), 701); err != nil {
 		t.Fatalf("EnsureClosures: %v", err)
 	}
-	if len(env.tasks.calls) != 1 || env.tasks.calls[0] != eligible.ID {
-		t.Fatalf("task ensures = %#v, want [%d]", env.tasks.calls, eligible.ID)
+	if len(env.tasks.calls) != 1 {
+		t.Fatalf("task ensures = %#v, want one eligible call", env.tasks.calls)
+	}
+	want := closureTaskCall{requirementID: eligible.ID, requirementVersionID: 1002, closeRound: 1}
+	if call := env.tasks.calls[0]; call != want {
+		t.Fatalf("task ensure = %#v, want %#v", call, want)
+	}
+}
+
+func TestClosureServiceEnsureClosuresUsesCurrentRequirementVersion(t *testing.T) {
+	env := newClosureEnv(t)
+	requirement := seedClosureRequirement(env, 1001, 701, 1005, version.RequirementClarified)
+	configurePassingClosure(env, requirement.ID)
+
+	if err := env.svc.EnsureClosures(requestContext(), 701); err != nil {
+		t.Fatalf("EnsureClosures: %v", err)
+	}
+	if len(env.tasks.calls) != 1 || env.tasks.calls[0].requirementVersionID != 1005 {
+		t.Fatalf("task ensures = %#v, want requirement version 1005", env.tasks.calls)
+	}
+}
+
+func TestClosureServiceEnsureClosuresUsesNextCloseRound(t *testing.T) {
+	env := newClosureEnv(t)
+	requirement := seedClosureRequirement(env, 1001, 701, 1002, version.RequirementClarified)
+	configurePassingClosure(env, requirement.ID)
+	env.closures.closures[requirement.ID] = []version.RequirementClosure{{
+		ID: 3001, RequirementID: requirement.ID, RequirementVersionID: 1002, CloseRound: 1,
+	}}
+
+	if err := env.svc.EnsureClosures(requestContext(), 701); err != nil {
+		t.Fatalf("EnsureClosures: %v", err)
+	}
+	if len(env.tasks.calls) != 1 || env.tasks.calls[0].closeRound != 2 {
+		t.Fatalf("task ensures = %#v, want close round 2", env.tasks.calls)
+	}
+}
+
+func TestClosureServiceEnsureClosuresReportsClosureLookupErrors(t *testing.T) {
+	env := newClosureEnv(t)
+	requirement := seedClosureRequirement(env, 1001, 701, 1002, version.RequirementClarified)
+	configurePassingClosure(env, requirement.ID)
+	wantErr := errors.New("closure store down")
+	env.closures.latestErr = wantErr
+
+	err := env.svc.EnsureClosures(requestContext(), 701)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("EnsureClosures error = %v, want %v", err, wantErr)
+	}
+	if len(env.tasks.calls) != 0 {
+		t.Fatalf("task ensures = %#v, want none", env.tasks.calls)
 	}
 }
 

@@ -70,8 +70,10 @@ type VersionReopener interface {
 	ReopenIfCompleted(ctx context.Context, versionID int64, trigger, reason string) error
 }
 
-// ClosureTaskEnsurer ensures the requirement.close steward work item. It is
-// idempotent: repeated ensures return the existing item.
+// ClosureTaskEnsurer ensures the requirement.close steward work item for one
+// requirement version and close round. It is idempotent: repeated ensures for
+// the same (requirement, requirement version, close round) return the existing
+// item, while a new revision or close round produces a new work item.
 type ClosureTaskEnsurer interface {
-	EnsureRequirementClose(ctx context.Context, requirementID int64) error
+	EnsureRequirementClose(ctx context.Context, requirementID, requirementVersionID int64, closeRound int32) error
 }
