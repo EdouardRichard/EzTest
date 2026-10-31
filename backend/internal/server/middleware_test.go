@@ -102,6 +102,9 @@ func TestCORSAllowsDerivedOrigins(t *testing.T) {
 	if !strings.Contains(rec.Header().Get("Access-Control-Allow-Headers"), "Last-Event-ID") {
 		t.Fatalf("allow headers = %q", rec.Header().Get("Access-Control-Allow-Headers"))
 	}
+	if !strings.Contains(rec.Header().Get("Access-Control-Allow-Headers"), "Idempotency-Key") {
+		t.Fatalf("allow headers must include Idempotency-Key: %q", rec.Header().Get("Access-Control-Allow-Headers"))
+	}
 }
 
 func TestCORSRejectsUnknownOrigin(t *testing.T) {
