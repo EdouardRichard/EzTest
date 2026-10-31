@@ -55,6 +55,24 @@ func (s *ClosureService) LatestClosure(ctx context.Context, requirementID int64)
 	}, true, nil
 }
 
+// ClosedForVersion reports whether the newest closure round belongs to the
+// given requirement version. It is the requirement.close task finalizer guard:
+// a stale closure from an older requirement version must not satisfy a task for
+// the current version.
+func (s *ClosureService) ClosedForVersion(ctx context.Context, requirementID, requirementVersionID int64) (bool, error) {
+	if requirementID <= 0 || requirementVersionID <= 0 {
+		return false, platform.Invalid("requirement_id", "requirement_id and requirement_version_id must be positive decimal IDs")
+	}
+	if s == nil || s.closures == nil {
+		return false, errors.New("closure service is missing its closure repository")
+	}
+	closure, found, err := s.closures.Latest(ctx, requirementID)
+	if err != nil {
+		return false, mapClosureRepositoryError(err)
+	}
+	return found && closure.RequirementVersionID == requirementVersionID, nil
+}
+
 // SummariesByRequirementIDs returns the newest closure summary of each requested
 // requirement that belongs to versionID and has a closure round. Missing,
 // duplicate, non-positive and foreign-version IDs are skipped, mirroring the

@@ -57,7 +57,10 @@ type RunnerDeps struct {
 	// report.version runs (spec §4.4). It may be nil for deployments without the
 	// P4 report worker, but a report task then fails as a configuration error.
 	ReportFinalizer ReportFinalizer
-	InstanceID      string
+	// RequirementFinalizer verifies that requirement.close runs recorded the
+	// closure for their scoped requirement version (retryable if absent).
+	RequirementFinalizer RequirementFinalizer
+	InstanceID           string
 }
 
 // Runner executes one work item as an agent run: context packet, bounded model
@@ -80,7 +83,8 @@ type Runner struct {
 	toolDeps        tools.Deps
 	taskProvider    TaskContextProvider
 	runCanceller    RunCanceller
-	reportFinalizer ReportFinalizer
+	reportFinalizer      ReportFinalizer
+	requirementFinalizer RequirementFinalizer
 	instanceID      string
 	builder         *ContextBuilder
 }
@@ -104,6 +108,7 @@ func NewRunner(deps RunnerDeps) *Runner {
 		taskProvider:    deps.TaskProvider,
 		runCanceller:    deps.RunCanceller,
 		reportFinalizer: deps.ReportFinalizer,
+		requirementFinalizer: deps.RequirementFinalizer,
 		instanceID:      deps.InstanceID,
 		builder:         NewContextBuilder(deps.Settings, NewLLMSummarizer(deps.Chat)),
 	}
@@ -410,6 +415,12 @@ func (r *Runner) Run(ctx context.Context, item agent.WorkItem) (RunResult, error
 	if err := r.finalizeReport(runCtx, state); err != nil {
 		return r.fail(runCtx, state, err)
 	}
+	// requirement.close only completes when the closure round was actually
+	// written; a transient predicate rejection is retried through the normal
+	// work-item backoff instead of wedging the current close round.
+	if err := r.finalizeRequirement(runCtx, state); err != nil {
+		return r.fail(runCtx, state, err)
+	}
 	return r.finish(state, agent.AgentRunDone, "", false)
 }
 
@@ -439,6 +450,37 @@ func (r *Runner) finalizeReport(ctx context.Context, state *runState) error {
 	if err := r.reportFinalizer.Finalize(ctx, state.payload.ReportID, state.payload.ReportRevision); err != nil {
 		return &RunError{
 			Reason:    "report_finalize_failed",
+			Retryable: true,
+			Cause:     err,
+		}
+	}
+	return nil
+}
+
+// finalizeRequirement runs the requirement.close finalizer. A transient
+// predicate 409 leaves the run marked done by the model loop; without this
+// check the work item would be done with no closure and no new close round.
+func (r *Runner) finalizeRequirement(ctx context.Context, state *runState) error {
+	if state.item.Type != WorkTypeRequirementClose {
+		return nil
+	}
+	if r.requirementFinalizer == nil {
+		return &RunError{
+			Reason:    "tool_failure",
+			Retryable: false,
+			Cause:     errors.New("agent runner has no requirement finalizer"),
+		}
+	}
+	if state.payload.RequirementID <= 0 || state.payload.RequirementVersionID <= 0 {
+		return &RunError{
+			Reason:    "invalid_payload",
+			Retryable: false,
+			Cause:     errors.New("requirement.close payload has no requirement_id/requirement_version_id"),
+		}
+	}
+	if err := r.requirementFinalizer.Finalize(ctx, state.payload.RequirementID, state.payload.RequirementVersionID); err != nil {
+		return &RunError{
+			Reason:    "requirement_finalize_failed",
 			Retryable: true,
 			Cause:     err,
 		}

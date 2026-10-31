@@ -838,7 +838,8 @@ func main() {
 		},
 		TaskProvider:    executionadapters.NewTaskProvider(executionRunner),
 		RunCanceller:    executionRunner,
-		ReportFinalizer: p4ReportFinalizer{service: reportSvc},
+		ReportFinalizer:      p4ReportFinalizer{service: reportSvc},
+		RequirementFinalizer: versionapp.NewClosureFinalizer(closureSvc),
 		InstanceID:      instanceID,
 	})
 	worker := agentapp.NewWorker(workQueue, runner, settingsSvc, slog.Default(), instanceID,
