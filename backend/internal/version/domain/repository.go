@@ -60,3 +60,23 @@ type Repository interface {
 	AccountInUse(ctx context.Context, id int64) (bool, error)
 	RepositoryInUse(ctx context.Context, id int64) (bool, error)
 }
+
+// RequirementClosureRepository persists requirement_closure rounds. Rows are
+// append-only: Close inserts the next close_round and marks the requirement
+// closed in one transaction; Reopen increments the newest row's reopen_count
+// and returns the requirement to draft in one transaction. The unique
+// (requirement_id, close_round) constraint and the requirement row lock make
+// concurrent Close calls mutually exclusive.
+type RequirementClosureRepository interface {
+	// Latest returns the newest closure row of one requirement. A requirement
+	// that was never closed yields found=false with a nil error.
+	Latest(ctx context.Context, requirementID int64) (RequirementClosure, bool, error)
+	// Close inserts the next close round and marks the requirement closed. The
+	// returned closure carries the assigned round. A requirement that is no
+	// longer clarified at commit time yields ErrStateConflict.
+	Close(ctx context.Context, closure RequirementClosure, requirement Requirement) (RequirementClosure, error)
+	// Reopen increments the newest closure's reopen_count and moves the
+	// requirement closed -> draft, clearing closed_at/closed_by_run_id. A
+	// requirement that is not closed yields ErrStateConflict.
+	Reopen(ctx context.Context, requirement Requirement, reopenedAt time.Time) (RequirementClosure, error)
+}

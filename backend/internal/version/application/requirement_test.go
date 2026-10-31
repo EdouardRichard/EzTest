@@ -68,6 +68,14 @@ func (f *fakeRequirementRepo) Get(_ context.Context, versionID, requirementID in
 	return aggregate, nil
 }
 
+func (f *fakeRequirementRepo) GetRequirement(_ context.Context, requirementID int64) (version.Requirement, error) {
+	requirement, ok := f.requirements[requirementID]
+	if !ok {
+		return version.Requirement{}, version.ErrRequirementNotFound
+	}
+	return requirement, nil
+}
+
 func (f *fakeRequirementRepo) GetMany(_ context.Context, versionID int64, ids []int64) ([]version.RequirementWithCurrent, error) {
 	items := make([]version.RequirementWithCurrent, 0, len(ids))
 	for _, id := range ids {
