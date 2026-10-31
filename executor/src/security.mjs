@@ -22,6 +22,9 @@ export const RING_CAPACITY = 500
 export const DEFAULT_MAX_CONTEXTS = 8
 export const MAX_SECRET_ENTRIES = 32
 export const MAX_SECRET_LENGTH = 1024
+// P3 extension (execution design §6.1): context metadata is a small object the
+// API uses to correlate a browser context with its case_run/version_sut/role.
+export const MAX_CONTEXT_METADATA_BYTES = 2048
 
 /** Executor error with a protocol error code (see spec §5.6 for the list). */
 export class ExecutorError extends Error {

@@ -481,6 +481,11 @@ func fakeWorkItem(workType string, payload agentapp.WorkItemPayload) agent.WorkI
 		"case_id":                idStringOrZero(payload.CaseID),
 		"case_version_id":        idStringOrZero(payload.CaseVersionID),
 		"round_id":               idStringOrZero(payload.RoundID),
+		"intent_id":              idStringOrZero(payload.IntentID),
+		"wave_id":                idStringOrZero(payload.WaveID),
+		"case_run_id":            idStringOrZero(payload.CaseRunID),
+		"dispatch_epoch":         idStringOrZero(payload.DispatchEpoch),
+		"dispatch_token":         payload.DispatchToken,
 		"trigger":                payload.Trigger,
 	})
 	leaseEpoch := int64(3)

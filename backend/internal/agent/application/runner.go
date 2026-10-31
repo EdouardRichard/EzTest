@@ -46,6 +46,12 @@ type RunnerDeps struct {
 	TeamRoom     TeamRoomPort
 	Content      ContentWriter
 	ToolDeps     tools.Deps
+	// TaskProvider loads the P3 execution task snapshot (execute.case runs).
+	// P1/P2 work items may leave it nil.
+	TaskProvider TaskContextProvider
+	// RunCanceller registers P3 run cancellation for pause/cancel/human
+	// takeover. It may be nil for P1/P2-only deployments.
+	RunCanceller RunCanceller
 	InstanceID   string
 }
 
@@ -67,6 +73,8 @@ type Runner struct {
 	teamRoom     TeamRoomPort
 	content      ContentWriter
 	toolDeps     tools.Deps
+	taskProvider TaskContextProvider
+	runCanceller RunCanceller
 	instanceID   string
 	builder      *ContextBuilder
 }
@@ -87,6 +95,8 @@ func NewRunner(deps RunnerDeps) *Runner {
 		teamRoom:     deps.TeamRoom,
 		content:      deps.Content,
 		toolDeps:     deps.ToolDeps,
+		taskProvider: deps.TaskProvider,
+		runCanceller: deps.RunCanceller,
 		instanceID:   deps.InstanceID,
 		builder:      NewContextBuilder(deps.Settings, NewLLMSummarizer(deps.Chat)),
 	}
@@ -209,6 +219,23 @@ func ParseWorkItemPayload(raw json.RawMessage) (WorkItemPayload, error) {
 	if payload.RoundID, err = parseID("round_id"); err != nil {
 		return WorkItemPayload{}, err
 	}
+	// P3 execution payload (contracts/task-types.md §5). DispatchEpoch is a
+	// decimal string/number; DispatchToken is opaque and only ever compared.
+	if payload.IntentID, err = parseID("intent_id"); err != nil {
+		return WorkItemPayload{}, err
+	}
+	if payload.WaveID, err = parseID("wave_id"); err != nil {
+		return WorkItemPayload{}, err
+	}
+	if payload.CaseRunID, err = parseID("case_run_id"); err != nil {
+		return WorkItemPayload{}, err
+	}
+	if payload.DispatchEpoch, err = parseID("dispatch_epoch"); err != nil {
+		return WorkItemPayload{}, err
+	}
+	if token, ok := object["dispatch_token"]; ok {
+		_ = json.Unmarshal(token, &payload.DispatchToken)
+	}
 	if trigger, ok := object["trigger"]; ok {
 		_ = json.Unmarshal(trigger, &payload.Trigger)
 	}
@@ -298,6 +325,12 @@ func (r *Runner) Run(ctx context.Context, item agent.WorkItem) (RunResult, error
 	hard := time.Duration(r.hardSeconds(profile)) * time.Second
 	runCtx, cancel := context.WithTimeout(ctx, hard)
 	defer cancel()
+	// Expose the run cancellation to the execution context so pause/cancel/human
+	// takeover can interrupt a long execution.wait or a stuck agent loop.
+	if r.runCanceller != nil && state.payload.CaseRunID > 0 {
+		r.runCanceller.RegisterRun(state.payload.CaseRunID, cancel)
+		defer r.runCanceller.ClearRun(state.payload.CaseRunID)
+	}
 
 	if err := r.prepare(runCtx, state); err != nil {
 		return r.fail(runCtx, state, err)
@@ -376,6 +409,27 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 	}
 	state.input.TeamRoom = r.teamRoomContext(ctx, state.item.VersionID, state.team)
 
+	// P3 execution tasks are loaded from the execution context (CaseRunner),
+	// which also validates the case_run/intent and claims the dispatch lease.
+	if isExecutionWorkType(state.item.Type) {
+		if r.taskProvider == nil {
+			return &RunError{
+				Reason:    "tool_failure",
+				Retryable: false,
+				Cause:     errors.New("agent runner has no execution task provider"),
+			}
+		}
+		executionTask, taskErr := r.taskProvider.ExecutionTask(ctx, state.item)
+		if taskErr != nil {
+			return &RunError{
+				Reason:    "tool_failure",
+				Retryable: executionTaskErrorRetryable(taskErr),
+				Cause:     taskErr,
+			}
+		}
+		state.input.Execution = &executionTask
+	}
+
 	modelInfo, err := r.chat.ResolveModel(ctx, profileModel(state.profile))
 	if err != nil {
 		return &RunError{Reason: "ai_unavailable", Retryable: true, Cause: err}
@@ -403,7 +457,7 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 		})
 	}
 
-	state.registry = tools.NewP2Registry(r.toolDepsForRun(state))
+	state.registry = tools.NewP3Registry(r.toolDepsForRun(state))
 	state.definitions = state.registry.Definitions(state.profile.AllowedTools)
 
 	packet, compactInfo, err := r.builder.Build(ctx, state.input)
@@ -526,6 +580,11 @@ func (r *Runner) executeTools(ctx context.Context, state *runState, calls []llma
 		CaseVersionID:        state.payload.CaseVersionID,
 		RoundID:              state.payload.RoundID,
 		AgentRunID:           state.run.ID,
+		WaveID:               state.payload.WaveID,
+		CaseRunID:            state.payload.CaseRunID,
+		IntentID:             state.payload.IntentID,
+		DispatchEpoch:        state.payload.DispatchEpoch,
+		DispatchToken:        state.payload.DispatchToken,
 	}
 	maxBytes := r.intSetting("agent.tool_result_max_bytes", defaultToolResultMaxBytes)
 
@@ -664,6 +723,11 @@ func (r *Runner) handleOverflow(ctx context.Context, state *runState) error {
 // Scout/Case Author/Design Critic/Data Planner team-room updates.
 func (r *Runner) writeOutputs(ctx context.Context, state *runState, finalText string) error {
 	switch state.profile.Key {
+	case ProfileKeyCaseExecutor, ProfileKeyFailureAnalyst, ProfileKeyCoverageAnalyst:
+		// P3 execution profiles persist their results through the execution
+		// tools (step/assertion/evidence/analysis); the final message is not a
+		// persisted artifact, so an empty reply is not a run failure.
+		return nil
 	case ProfileKeyClarificationHost:
 		if finalText == "" {
 			return &RunError{Reason: "model_error", Retryable: true, Cause: errors.New("host produced an empty final message")}
@@ -957,7 +1021,7 @@ func (r *Runner) toolDepsForRun(state *runState) tools.Deps {
 	}
 	task := state.input.Task
 	deps.TaskPack = func(context.Context, tools.Scope) (any, error) {
-		return taskPackResult(versionID, state.payload.ConversationID, state.run.ID, task), nil
+		return taskPackResult(versionID, state.payload.ConversationID, state.run.ID, task, state.input.Execution), nil
 	}
 	deps.TeamRoomRead = func(ctx context.Context, scope tools.Scope, maxPosts int) (any, error) {
 		room := r.teamRoomContext(ctx, scope.VersionID, state.team)
@@ -1024,6 +1088,15 @@ func (r *Runner) taskContext(state *runState) TaskContext {
 	}
 	if state.payload.RoundID > 0 {
 		scope = append(scope, "round_id="+idText(state.payload.RoundID))
+	}
+	if state.payload.WaveID > 0 {
+		scope = append(scope, "wave_id="+idText(state.payload.WaveID))
+	}
+	if state.payload.CaseRunID > 0 {
+		scope = append(scope, "case_run_id="+idText(state.payload.CaseRunID))
+	}
+	if state.payload.IntentID > 0 {
+		scope = append(scope, "intent_id="+idText(state.payload.IntentID))
 	}
 	switch state.item.Type {
 	case WorkTypeChatTurn:
@@ -1096,6 +1169,42 @@ func (r *Runner) taskContext(state *runState) TaskContext {
 			AcceptanceCriteria: []string{"仅更新当前 draft 版本", "数据可复现且不含真实密钥"},
 			Scope:              scope,
 		}
+	case WorkTypeExecuteCase:
+		return TaskContext{
+			Type: state.item.Type,
+			Goal: "严格按任务上下文中的用例步骤顺序执行，逐步用 execution.step_record 记录，每条断言用 execution.assertion_record 记录，" +
+				"需要等待时用 execution.wait，完成后用 execution.case_finish 提交候选终态。",
+			Constraints: []string{
+				"不得修改需求/用例/确认，不得跳过步骤或断言",
+				"不得虚构 passed；expected 以任务上下文为准",
+				"等待/时间窗口用 execution.wait，不要用重复 snapshot 空转",
+				"密码只经 account.credentials 读取，不得写入证据/日志/回复",
+				"登录失败/2FA 用 human.request 请求人工接管",
+				"无法继续时用 execution.case_finish(blocked) 说明原因",
+			},
+			AcceptanceCriteria: []string{
+				"每个执行过的 step 都有 execution.step_record",
+				"每条执行的断言都有 execution.assertion_record",
+				"最终调用一次 execution.case_finish",
+			},
+			Scope: scope,
+		}
+	case WorkTypeAnalyzeFailure:
+		return TaskContext{
+			Type:               state.item.Type,
+			Goal:               "阅读当前 wave 的失败 case_run 结果与证据，校验/细化 failure_class/category/severity/summary 并用 analysis.failure_submit 逐条提交。",
+			Constraints:        []string{"只读浏览器结果与证据；不执行浏览器、不修改用例/需求", "只能细化 application，不得把非 application 升级为 application", "只在 wave scope 内提交 case_run"},
+			AcceptanceCriteria: []string{"每条提交都基于已有结果/证据", "使用 analysis.failure_submit"},
+			Scope:              scope,
+		}
+	case WorkTypeAnalyzeCoverage:
+		return TaskContext{
+			Type:               state.item.Type,
+			Goal:               "比对 current 需求、已确认用例与最近执行结果，找出执行覆盖缺口并用 analysis.coverage_submit 提交。",
+			Constraints:        []string{"只读覆盖与需求数据；不修改用例/需求、不创建问题", "缺口原因只取 execution_not_run 或 execution_failed_coverage"},
+			AcceptanceCriteria: []string{"每条缺口引用属于当前版本的 requirement 与 wave 内证据", "使用 analysis.coverage_submit"},
+			Scope:              scope,
+		}
 	default:
 		return TaskContext{Type: state.item.Type, Scope: scope}
 	}
@@ -1136,6 +1245,17 @@ func (r *Runner) userMessage(ctx context.Context, state *runState, attachmentTex
 	case WorkTypeDesignDataPlan:
 		return fmt.Sprintf("请为需求 %s（需求版本 %s）当前 draft 用例补充前置条件与测试数据。",
 			idText(state.payload.RequirementID), idText(state.payload.RequirementVersionID))
+	case WorkTypeExecuteCase:
+		if state.input.Execution != nil {
+			if message := strings.TrimSpace(state.input.Execution.UserMessage); message != "" {
+				return message
+			}
+		}
+		return "请按任务上下文中的用例步骤开始执行，并逐步记录结果。"
+	case WorkTypeAnalyzeFailure:
+		return fmt.Sprintf("请分析 wave %s 的失败结果并提交 failure 候选细化。", idText(state.payload.WaveID))
+	case WorkTypeAnalyzeCoverage:
+		return fmt.Sprintf("请分析 wave %s 的执行覆盖缺口并提交覆盖候选。", idText(state.payload.WaveID))
 	default:
 		return "请根据当前任务继续执行。"
 	}
@@ -1314,8 +1434,8 @@ func versionPackResult(pack VersionPack) map[string]any {
 	}
 }
 
-func taskPackResult(versionID, conversationID, runID int64, task TaskContext) map[string]any {
-	return map[string]any{
+func taskPackResult(versionID, conversationID, runID int64, task TaskContext, execution *ExecutionTask) map[string]any {
+	result := map[string]any{
 		"version_id":          idText(versionID),
 		"conversation_id":     idText(conversationID),
 		"agent_run_id":        idText(runID),
@@ -1324,6 +1444,93 @@ func taskPackResult(versionID, conversationID, runID int64, task TaskContext) ma
 		"constraints":         task.Constraints,
 		"acceptance_criteria": task.AcceptanceCriteria,
 		"scope":               task.Scope,
+	}
+	if execution != nil {
+		result["execution"] = executionTaskResult(*execution)
+	}
+	return result
+}
+
+// executionTaskResult renders the P3 execution snapshot for context.task_pack.
+// The one-time human response stays only in the context packet: the tool result
+// is persisted in the agent transcript and must not duplicate a sensitive code.
+func executionTaskResult(task ExecutionTask) map[string]any {
+	suts := make([]map[string]any, 0, len(task.VersionSUTs))
+	for _, sut := range task.VersionSUTs {
+		suts = append(suts, map[string]any{
+			"version_sut_id":   idText(sut.VersionSUTID),
+			"sut_name":         sut.SUTName,
+			"environment_name": sut.EnvironmentName,
+			"base_url":         sut.BaseURL,
+			"page_urls":        sut.PageURLs,
+			"api_endpoints":    sut.APIEndpoints,
+			"account_roles":    sut.AccountRoles,
+		})
+	}
+	steps := make([]map[string]any, 0, len(task.Steps))
+	for _, step := range task.Steps {
+		entry := map[string]any{
+			"seq":                   step.Seq,
+			"action":                step.Action,
+			"expected":              step.Expected,
+			"account_role":          step.AccountRole,
+			"target_version_sut_id": idText(step.TargetVersionSUTID),
+		}
+		if step.PageID != nil {
+			entry["page_id"] = idText(*step.PageID)
+		}
+		if step.APIID != nil {
+			entry["api_id"] = idText(*step.APIID)
+		}
+		steps = append(steps, entry)
+	}
+	assertions := make([]map[string]any, 0, len(task.Assertions))
+	for _, assertion := range task.Assertions {
+		assertions = append(assertions, map[string]any{
+			"step_seq":              assertion.StepSeq,
+			"assertion_seq":         assertion.AssertionSeq,
+			"kind":                  assertion.Kind,
+			"expected":              assertion.Expected,
+			"target_version_sut_id": idText(assertion.TargetVersionSUTID),
+		})
+	}
+	priorSteps := make([]map[string]any, 0, len(task.PriorSteps))
+	for _, prior := range task.PriorSteps {
+		priorSteps = append(priorSteps, map[string]any{
+			"seq":                   prior.Seq,
+			"status":                prior.Status,
+			"observed":              prior.Observed,
+			"error":                 prior.Error,
+			"target_version_sut_id": idText(prior.TargetVersionSUTID),
+		})
+	}
+	priorAssertions := make([]map[string]any, 0, len(task.PriorAssertions))
+	for _, prior := range task.PriorAssertions {
+		priorAssertions = append(priorAssertions, map[string]any{
+			"step_seq":              prior.StepSeq,
+			"assertion_seq":         prior.AssertionSeq,
+			"kind":                  prior.Kind,
+			"verdict":               prior.Verdict,
+			"expected":              prior.Expected,
+			"actual":                prior.Actual,
+			"reason":                prior.Reason,
+			"target_version_sut_id": idText(prior.TargetVersionSUTID),
+		})
+	}
+	return map[string]any{
+		"case_run_id":      idText(task.CaseRunID),
+		"wave_id":          idText(task.WaveID),
+		"intent_id":        idText(task.IntentID),
+		"case_version_id":  idText(task.CaseVersionID),
+		"case_title":       task.CaseTitle,
+		"description":      task.Description,
+		"preconditions":    task.Preconditions,
+		"priority":         task.Priority,
+		"version_suts":     suts,
+		"steps":            steps,
+		"assertions":       assertions,
+		"prior_steps":      priorSteps,
+		"prior_assertions": priorAssertions,
 	}
 }
 
@@ -1383,19 +1590,60 @@ func artifactRefs(state *runState) []ArtifactRef {
 	if state.payload.RoundID > 0 {
 		refs = append(refs, ArtifactRef{Kind: "design_round", ID: idText(state.payload.RoundID)})
 	}
+	if state.payload.WaveID > 0 {
+		refs = append(refs, ArtifactRef{Kind: "run_wave", ID: idText(state.payload.WaveID)})
+	}
+	if state.payload.CaseRunID > 0 {
+		refs = append(refs, ArtifactRef{Kind: "case_run", ID: idText(state.payload.CaseRunID)})
+	}
+	if state.payload.IntentID > 0 {
+		refs = append(refs, ArtifactRef{Kind: "execution_intent", ID: idText(state.payload.IntentID)})
+	}
 	return refs
 }
 
 // teamForProfile selects the collaboration channel: design profiles use the
-// design team room, every P1 profile keeps the clarification team room.
+// design team room, P3 execution profiles use the execution team room, every P1
+// profile keeps the clarification team room.
 func teamForProfile(profileKey string) agent.Team {
 	switch profileKey {
 	case ProfileKeyDesignHost, ProfileKeyDesignPlanner, ProfileKeyCaseAuthor,
 		ProfileKeyDesignCritic, ProfileKeyDataPlanner:
 		return agent.TeamDesign
+	case ProfileKeyCaseExecutor, ProfileKeyFailureAnalyst, ProfileKeyCoverageAnalyst:
+		return agent.TeamExecution
 	default:
 		return agent.TeamClarification
 	}
+}
+
+// isExecutionWorkType reports whether the work item needs the P3 execution task
+// context provider.
+func isExecutionWorkType(workType string) bool {
+	switch workType {
+	case WorkTypeExecuteCase, WorkTypeAnalyzeFailure, WorkTypeAnalyzeCoverage:
+		return true
+	default:
+		return false
+	}
+}
+
+// executionTaskErrorRetryable classifies a task-provider failure: stale scope,
+// missing rows and dispatch-fence conflicts are terminal, infrastructure
+// failures are retryable.
+func executionTaskErrorRetryable(err error) bool {
+	if IsLeaseLost(err) {
+		return false
+	}
+	var apiErr *platform.Error
+	if errors.As(err, &apiErr) {
+		switch apiErr.Status {
+		case 400, 404, 409:
+			return false
+		}
+		return apiErr.Retryable || apiErr.Status >= 500
+	}
+	return true
 }
 
 // requirementCard turns a successful draft tool result into a UI card part.

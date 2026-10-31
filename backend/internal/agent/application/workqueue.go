@@ -113,6 +113,17 @@ func (q *WorkQueue) Complete(ctx context.Context, id, epoch int64) error {
 	return mapLeaseLost(q.repo.Complete(ctx, id, epoch))
 }
 
+// MarkWaitingHuman parks a running work item for a human takeover (P3 §6.8).
+func (q *WorkQueue) MarkWaitingHuman(ctx context.Context, id, epoch int64) error {
+	return mapLeaseLost(q.repo.MarkWaitingHuman(ctx, id, epoch))
+}
+
+// Finish closes a waiting_human/pending work item without a failure (the
+// resolved human takeover creates a fresh execute.case item).
+func (q *WorkQueue) Finish(ctx context.Context, id int64, reason string) error {
+	return q.repo.Finish(ctx, id, reason)
+}
+
 // Fail records a failure. Retryable failures reopen the item after a
 // min(2^attempts, 30s) backoff; other failures are marked dead by the
 // repository once attempts reach max_attempts.

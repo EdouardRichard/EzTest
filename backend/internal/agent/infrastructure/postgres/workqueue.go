@@ -229,6 +229,72 @@ func (r *WorkItemRepository) Complete(ctx context.Context, id, epoch int64) erro
 	return tx.Commit(ctx)
 }
 
+// MarkWaitingHuman parks a running item for a human takeover (P3 §6.8). The
+// lease is released; resolving the request creates a fresh execute.case item.
+func (r *WorkItemRepository) MarkWaitingHuman(ctx context.Context, id, epoch int64) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("mark work item waiting_human: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE work_item
+		SET status = 'waiting_human', claimed_by = NULL, lease_until = NULL,
+		    last_error = 'waiting_human', updated_at = now()
+		WHERE id = $1 AND lease_epoch = $2 AND status IN ('claimed', 'running')
+	`, id, epoch)
+	if err != nil {
+		return wrapDB("mark work item waiting_human", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return agent.ErrLeaseLost
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE work_item_attempt
+		SET status = 'done', finished_at = now()
+		WHERE work_item_id = $1
+		  AND attempt = (SELECT attempts FROM work_item WHERE id = $1)
+		  AND status IN ('claimed', 'running')
+	`, id); err != nil {
+		return wrapDB("mark work item attempt waiting_human", err)
+	}
+	return tx.Commit(ctx)
+}
+
+// Finish closes a waiting_human/pending item without a failure (the human
+// takeover was resolved and a new execute.case item was created).
+func (r *WorkItemRepository) Finish(ctx context.Context, id int64, reason string) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("finish work item: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE work_item
+		SET status = 'done', claimed_by = NULL, lease_until = NULL,
+		    last_error = $2, updated_at = now()
+		WHERE id = $1 AND status IN ('waiting_human', 'pending', 'open', 'claimed', 'running')
+	`, id, reason)
+	if err != nil {
+		return wrapDB("finish work item", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE work_item_attempt
+		SET status = 'done', finished_at = now()
+		WHERE work_item_id = $1
+		  AND attempt = (SELECT attempts FROM work_item WHERE id = $1)
+		  AND status IN ('claimed', 'running')
+	`, id); err != nil {
+		return wrapDB("finish work item attempt", err)
+	}
+	return tx.Commit(ctx)
+}
+
 // Fail records a failure and either re-opens the item (retry backoff) or marks
 // it dead when not retryable or the attempt budget is exhausted.
 func (r *WorkItemRepository) Fail(ctx context.Context, id, epoch int64, message string, retryable bool, backoff time.Duration) error {

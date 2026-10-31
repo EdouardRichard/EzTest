@@ -188,7 +188,7 @@ func TestProfileKeyForWorkTypeP2(t *testing.T) {
 			t.Fatalf("ProfileKeyForWorkType(%q) = %q/%v, want %q", workType, got, ok, want)
 		}
 	}
-	for _, reserved := range []string{"execute.case", "report.wave", "case.confirm"} {
+	for _, reserved := range []string{"report.wave", "case.confirm"} {
 		if _, ok := agentapp.ProfileKeyForWorkType(reserved); ok {
 			t.Fatalf("reserved work type %q mapped to a P2 profile", reserved)
 		}
@@ -203,7 +203,7 @@ func TestEnsureProfilesIsIdempotentAndPreservesAdminEdits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnsureProfiles: %v", err)
 	}
-	wantTotal := len(agentapp.P1Profiles()) + len(agentapp.P2Profiles())
+	wantTotal := len(agentapp.P1Profiles()) + len(agentapp.P2Profiles()) + len(agentapp.P3Profiles())
 	if len(first) != wantTotal {
 		t.Fatalf("seeded = %d, want %d", len(first), wantTotal)
 	}

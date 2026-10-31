@@ -30,15 +30,17 @@ type fakeWorkItemRepo struct {
 	recovered int64
 	items     []agent.WorkItem
 
-	ensureErr   error
-	claimErr    error
-	getErr      error
-	markErr     error
-	renewErr    error
-	completeErr error
-	failErr     error
-	recoverErr  error
-	listErr     error
+	ensureErr       error
+	claimErr        error
+	getErr          error
+	markErr         error
+	renewErr        error
+	completeErr     error
+	failErr         error
+	recoverErr      error
+	listErr         error
+	waitingHumanErr error
+	finishErr       error
 
 	ensured       []agent.NewWorkItem
 	claimants     []string
@@ -48,6 +50,8 @@ type fakeWorkItemRepo struct {
 	renewLease    []time.Duration
 	completed     [][2]int64
 	failed        []failCall
+	waitingHuman  [][2]int64
+	finished      []finishCall
 	listVersionID int64
 	listLimit     int
 }

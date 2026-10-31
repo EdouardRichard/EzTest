@@ -81,6 +81,13 @@ type Scope struct {
 	RoundID              int64
 	AgentRunID           int64
 	VersionSUTIDs        []int64
+	// P3 execution scope (contracts/agent-profiles-tools.md P3 increment). The
+	// case_run dispatch epoch/token fence every result write.
+	WaveID        int64
+	CaseRunID     int64
+	IntentID      int64
+	DispatchEpoch int64
+	DispatchToken string
 }
 
 // Tool is one scoped, schema-described agent tool.
@@ -233,6 +240,9 @@ type Deps struct {
 	// design tools then fail as an internal configuration error.
 	Design           DesignPort
 	RollbackProposal func(ctx context.Context, scope Scope, requirementID int64, reason string) (any, error)
+	// Execution is the P3 execution context surface. It is nil for P1/P2-only
+	// wiring; P3 tools then fail as an internal configuration error.
+	Execution ExecutionPort
 }
 
 // RequirementSummary is one requirement row shown to the model.

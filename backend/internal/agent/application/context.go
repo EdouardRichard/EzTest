@@ -88,6 +88,10 @@ type ContextInput struct {
 	Conversation ConversationContext
 	TeamRoom     TeamRoomContext
 	Artifacts    []ArtifactRef
+	// Execution is the P3 case-executor task snapshot. It is part of the system
+	// section because its steps/assertions/prior results are pinned facts that
+	// compaction must never drop.
+	Execution *ExecutionTask
 }
 
 // Section and ContextPacket are aliases so the builder and the runtime
@@ -310,19 +314,25 @@ func renderSections(in ContextInput) []Section {
 }
 
 func systemContent(in ContextInput) string {
-	parts := make([]string, 0, 2)
+	parts := make([]string, 0, 3)
 	if prompt := strings.TrimSpace(in.Profile.SystemPrompt); prompt != "" {
 		parts = append(parts, prompt)
 	}
 	parts = append(parts, taskBlock(in.Task))
+	if in.Execution != nil {
+		parts = append(parts, executionBlock(*in.Execution))
+	}
 	return strings.Join(parts, "\n\n")
 }
 
 // minimalSystemContent keeps the task block (goal/constraints first) ahead of
 // the profile prompt so extreme truncation cannot lose task constraints.
 func minimalSystemContent(in ContextInput) string {
-	parts := make([]string, 0, 2)
+	parts := make([]string, 0, 3)
 	parts = append(parts, taskBlock(in.Task))
+	if in.Execution != nil {
+		parts = append(parts, executionBlock(*in.Execution))
+	}
 	if prompt := strings.TrimSpace(in.Profile.SystemPrompt); prompt != "" {
 		parts = append(parts, prompt)
 	}
@@ -355,6 +365,95 @@ func taskBlock(task TaskContext) string {
 		for _, scope := range task.Scope {
 			fmt.Fprintf(&builder, "- %s\n", scope)
 		}
+	}
+	return strings.TrimRight(builder.String(), "\n")
+}
+
+// executionBlock renders the P3 case-executor task: the pinned case, its step
+// and assertion truth, the version-SUT bindings and the already-recorded results
+// a resumed run continues from.
+func executionBlock(task ExecutionTask) string {
+	var builder strings.Builder
+	builder.WriteString("# 执行任务\n")
+	fmt.Fprintf(&builder, "用例: %s (case_version_id=%s, case_run_id=%s)\n",
+		task.CaseTitle, idText(task.CaseVersionID), idText(task.CaseRunID))
+	if task.Description != "" {
+		fmt.Fprintf(&builder, "描述: %s\n", task.Description)
+	}
+	if task.Preconditions != "" {
+		fmt.Fprintf(&builder, "前置条件: %s\n", task.Preconditions)
+	}
+	if task.Priority != "" {
+		fmt.Fprintf(&builder, "优先级: %s\n", task.Priority)
+	}
+	if len(task.VersionSUTs) > 0 {
+		builder.WriteString("SUT 绑定:\n")
+		for _, sut := range task.VersionSUTs {
+			fmt.Fprintf(&builder, "- version_sut=%s %s (%s)", idText(sut.VersionSUTID), sut.SUTName, sut.EnvironmentName)
+			if sut.BaseURL != "" {
+				fmt.Fprintf(&builder, " base_url=%s", sut.BaseURL)
+			}
+			if len(sut.PageURLs) > 0 {
+				fmt.Fprintf(&builder, " pages=%s", strings.Join(sut.PageURLs, ", "))
+			}
+			if len(sut.APIEndpoints) > 0 {
+				fmt.Fprintf(&builder, " apis=%s", strings.Join(sut.APIEndpoints, ", "))
+			}
+			if len(sut.AccountRoles) > 0 {
+				fmt.Fprintf(&builder, " roles=%s", strings.Join(sut.AccountRoles, ", "))
+			}
+			builder.WriteString("\n")
+		}
+	}
+	if len(task.Steps) > 0 {
+		builder.WriteString("步骤:\n")
+		for _, step := range task.Steps {
+			fmt.Fprintf(&builder, "- step %d [version_sut=%s", step.Seq, idText(step.TargetVersionSUTID))
+			if step.AccountRole != "" {
+				fmt.Fprintf(&builder, ", role=%s", step.AccountRole)
+			}
+			builder.WriteString("]: ")
+			builder.WriteString(step.Action)
+			if step.Expected != "" {
+				fmt.Fprintf(&builder, "；期望: %s", step.Expected)
+			}
+			builder.WriteString("\n")
+		}
+	}
+	if len(task.Assertions) > 0 {
+		builder.WriteString("断言:\n")
+		for _, assertion := range task.Assertions {
+			fmt.Fprintf(&builder, "- step %d assertion %d [kind=%s, version_sut=%s]: %s\n",
+				assertion.StepSeq, assertion.AssertionSeq, assertion.Kind,
+				idText(assertion.TargetVersionSUTID), assertion.Expected)
+		}
+	}
+	if len(task.PriorSteps) > 0 {
+		builder.WriteString("已完成步骤（续跑，勿重复）：\n")
+		for _, prior := range task.PriorSteps {
+			fmt.Fprintf(&builder, "- step %d %s", prior.Seq, prior.Status)
+			if prior.Observed != "" {
+				fmt.Fprintf(&builder, ": %s", prior.Observed)
+			}
+			if prior.Error != "" {
+				fmt.Fprintf(&builder, " error=%s", prior.Error)
+			}
+			builder.WriteString("\n")
+		}
+	}
+	if len(task.PriorAssertions) > 0 {
+		builder.WriteString("已完成断言（续跑，勿重复）：\n")
+		for _, prior := range task.PriorAssertions {
+			fmt.Fprintf(&builder, "- step %d assertion %d %s kind=%s expected=%q actual=%q",
+				prior.StepSeq, prior.AssertionSeq, prior.Verdict, prior.Kind, prior.Expected, prior.Actual)
+			if prior.Reason != "" {
+				fmt.Fprintf(&builder, " reason=%s", prior.Reason)
+			}
+			builder.WriteString("\n")
+		}
+	}
+	if task.HumanResponse != "" {
+		fmt.Fprintf(&builder, "人工接管响应（一次性，不得写入证据）：%s\n", task.HumanResponse)
 	}
 	return strings.TrimRight(builder.String(), "\n")
 }

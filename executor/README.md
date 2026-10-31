@@ -42,10 +42,17 @@ All endpoints except `/healthz` require `Authorization: Bearer <token>`.
 | Method | Path | Body | Response |
 |---|---|---|---|
 | GET | `/healthz` | — | `{status:"ok" \| "degraded",version,contexts,maxContexts,browserVersion?,error?}` (200 / 503) |
-| POST | `/v1/contexts` | `{key, allowedHosts, baseUrl, storageState, sessionStorage, viewport}` | `{contextId, browserVersion}` |
+| GET | `/v1/contexts` | — | `{contexts:[{id,key,metadata?,createdAt}]}` (P3 extension) |
+| POST | `/v1/contexts` | `{key, allowedHosts, baseUrl, storageState, sessionStorage, viewport, metadata}` | `{contextId, browserVersion}` |
 | POST | `/v1/contexts/{id}/actions` | `{action, args}` | `{ok:true,result,artifacts}` or `{ok:false,error:{code,message}}` |
 | POST | `/v1/contexts/{id}/cancel` | — | `{ok:true,result:{canceled}}` |
 | DELETE | `/v1/contexts/{id}` | — | `{ok:true,result:{closed:true}}` |
+
+`metadata` is an opaque JSON object (≤2KB) stored with the context and returned by
+`GET /v1/contexts`; P3 uses it for `{case_run_id, version_sut_id, account_role,
+dispatch_epoch, dispatch_token}` and for orphan-context reconciliation. A non-object
+or oversized `metadata` is rejected with `400 invalid_arguments`. The list endpoint
+is used by the API to reconcile contexts whose key starts with `run:`.
 
 Actions: `goto`, `snapshot`, `click`, `fill`, `press`, `wait_for`, `screenshot`,
 `console`, `network`, `download`, `storage_state`, `close`.
