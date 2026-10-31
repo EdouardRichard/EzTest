@@ -48,8 +48,9 @@ func NodeID(kind NodeKind, refID int64) string {
 }
 
 // ChainFilter is the exploration-chain query filter (spec §8.3). Pointer fields
-// are optional; FocusNode is a full node ID. Normalize should run before the
-// filter is applied.
+// are optional; FocusNode is a full node ID. Limit overrides the node budget
+// when set: zero means "unset" and lets the service apply the configured
+// budget. Normalize should run before the filter is applied.
 type ChainFilter struct {
 	VersionSUTID *int64
 	PageID       *int64
@@ -59,12 +60,20 @@ type ChainFilter struct {
 	FocusNode    string
 	EventFrom    *int64
 	EventTo      *int64
+	// Limit is the optional node-limit override. Normalize keeps values in
+	// 1..1000 and resets every other value to 0 (unset/default), so an invalid
+	// client value can never raise the service budget cap.
+	Limit int
 }
+
+// maxChainFilterLimit is the hard cap of ChainFilter.Limit (spec §8.3).
+const maxChainFilterLimit = 1000
 
 // Normalize returns a copy of the filter with the canonical query semantics:
 // non-positive IDs and event bounds are dropped, enum-ish text filters are
-// trimmed and lowercased, focus_node is trimmed, and a reversed event interval
-// is put in chronological order. The receiver is not modified.
+// trimmed and lowercased, focus_node is trimmed, an out-of-range limit becomes
+// unset, and a reversed event interval is put in chronological order. The
+// receiver is not modified.
 func (f ChainFilter) Normalize() ChainFilter {
 	f.VersionSUTID = positiveID(f.VersionSUTID)
 	f.PageID = positiveID(f.PageID)
@@ -74,10 +83,19 @@ func (f ChainFilter) Normalize() ChainFilter {
 	f.Status = strings.ToLower(strings.TrimSpace(f.Status))
 	f.Result = strings.ToLower(strings.TrimSpace(f.Result))
 	f.FocusNode = strings.TrimSpace(f.FocusNode)
+	f.Limit = normalizeChainFilterLimit(f.Limit)
 	if f.EventFrom != nil && f.EventTo != nil && *f.EventFrom > *f.EventTo {
 		f.EventFrom, f.EventTo = f.EventTo, f.EventFrom
 	}
 	return f
+}
+
+func normalizeChainFilterLimit(limit int) int {
+	if limit < 1 || limit > maxChainFilterLimit {
+		// Zero means unset: the service applies the configured default budget.
+		return 0
+	}
+	return limit
 }
 
 func positiveID(id *int64) *int64 {
@@ -99,7 +117,11 @@ type Node struct {
 	Status       string
 	Result       string
 	VersionSUTID *int64
-	PageID       *int64
+	// VersionSUTIDs lists every version SUT the node's case version uses, for
+	// multi-SUT labels. VersionSUTID stays the single SUT that owns the failing
+	// step/assertion (or the node's only target) when one exists.
+	VersionSUTIDs []int64
+	PageID        *int64
 	// RequirementID, ScenarioID, CaseVersionID, WaveID, CaseRunID, IssueID,
 	// ReportID and MergedIntoID are the typed edge endpoints of the node.
 	RequirementID *int64

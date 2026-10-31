@@ -52,6 +52,9 @@ type IssueRepository interface {
 	// reports whether the issue was created (false on a dedupe conflict).
 	CreateCandidate(ctx context.Context, issue delivery.Issue, refs []delivery.IssueRef) (delivery.Issue, bool, error)
 	Get(ctx context.Context, versionID, issueID int64) (delivery.Issue, error)
+	// GetByID returns an issue regardless of version, for tools and workers
+	// that resolve an issue ID without the request's version scope.
+	GetByID(ctx context.Context, issueID int64) (delivery.Issue, error)
 	List(ctx context.Context, versionID int64, f IssueFilter) ([]delivery.Issue, error)
 	UpdateStatus(ctx context.Context, u IssueStatusUpdate) (delivery.Issue, error)
 	Merge(ctx context.Context, m IssueMerge) (delivery.Issue, error)
@@ -74,6 +77,9 @@ type ReportFilter struct {
 type ReportRepository interface {
 	CreateReport(ctx context.Context, r delivery.Report) (delivery.Report, error)
 	GetReport(ctx context.Context, versionID, reportID int64) (delivery.Report, error)
+	// GetReportByID returns a report regardless of version, for the report
+	// worker and reconciler that derive the version from the report row.
+	GetReportByID(ctx context.Context, reportID int64) (delivery.Report, error)
 	ListReports(ctx context.Context, versionID int64, f ReportFilter) ([]delivery.Report, error)
 	NextRevision(ctx context.Context, reportID int64) (int32, error)
 	CreateRevision(ctx context.Context, r delivery.ReportRevision) (delivery.ReportRevision, error)
@@ -95,13 +101,21 @@ type AnalysisRepository interface {
 	LatestByIssue(ctx context.Context, issueID int64) (delivery.AnalysisRun, bool, error)
 }
 
-// TaskEnsurer ensures the P4 agent work items. Every method is idempotent.
+// TaskEnsurer ensures the P4 agent work items. Every method is idempotent and
+// revision-aware: the caller passes the version, report revision or close
+// round that the work-item dedupe key includes (spec §4.4), so a stale ensure
+// cannot reuse an item created for an earlier revision or round.
 type TaskEnsurer interface {
-	EnsureIssueTriage(ctx context.Context, issueID int64) error
-	EnsureWaveReport(ctx context.Context, versionID, waveID int64) error
-	EnsureVersionReport(ctx context.Context, versionID int64) error
-	EnsureRequirementClose(ctx context.Context, requirementID int64) error
-	EnsureVersionClose(ctx context.Context, versionID int64) error
+	// EnsureIssueTriage ensures issue.triage for the issue's own version.
+	EnsureIssueTriage(ctx context.Context, issueID, versionID int64) error
+	// EnsureReportTask ensures report.wave or report.version for one report
+	// revision, selected by the report's kind.
+	EnsureReportTask(ctx context.Context, reportID int64, revision int32) error
+	// EnsureRequirementClose ensures requirement.close for one close round.
+	EnsureRequirementClose(ctx context.Context, requirementID int64, closeRound int32) error
+	// EnsureVersionClose ensures version.close for the current predicate
+	// fingerprint; a changed predicate naturally produces a new dedupe key.
+	EnsureVersionClose(ctx context.Context, versionID, reportRevisionID int64, predicateFingerprint string) error
 }
 
 // ExecutionReader is the delivery context's read port into execution. It only
@@ -157,31 +171,48 @@ type Clock interface {
 // CaseRunSnapshot is one case_run projection. VersionSUTID is the version SUT
 // that owns the failing step/assertion; VersionSUTIDs lists every SUT the case
 // version uses (report grouping and issue refs both use version SUT IDs, never
-// bare SUT IDs). Category/Severity carry the P3 deterministic derivation
-// (ui/api/db and major/minor/trivial).
+// bare SUT IDs). RequirementID is the resolvable requirement reference used by
+// issue refs and closure checks. Category/Severity carry the P3 deterministic
+// derivation (ui/api/db and major/minor/trivial).
+//
+// FailedStepSeq/FailedAssertionSeq are the minimal failed assertion pair of the
+// case_run (the smallest (step_seq, assertion_seq)); when the case_run has no
+// failed assertion both are 0, FailedStepResultID is 0 and
+// FailedAssertionResultIDs is nil. FailedExpected, FailedActual and
+// FailedReason carry that assertion's detail and feed the deterministic issue
+// summary when Summary is empty. DedupeHint is the P3
+// execution.failure_candidate dedupe_hint: candidate ingestion uses it only
+// when it is 32 lowercase hex chars and recomputes the key otherwise.
 type CaseRunSnapshot struct {
-	ID                   int64
-	VersionID            int64
-	WaveID               int64
-	CaseVersionID        int64
-	CaseTitle            string
-	VersionSUTID         *int64
-	VersionSUTIDs        []int64
-	Status               string
-	FailureClass         string
-	Summary              string
-	StepCount            int
-	StepFailedCount      int
-	AssertionCount       int
-	AssertionFailedCount int
-	FailedStepSeq        int
-	FailedAssertionSeq   int
-	Category             string
-	Severity             string
-	EvidenceIDs          []int64
-	StartedAt            *time.Time
-	FinishedAt           *time.Time
-	CreatedAt            time.Time
+	ID                       int64
+	VersionID                int64
+	WaveID                   int64
+	CaseVersionID            int64
+	RequirementID            int64
+	CaseTitle                string
+	VersionSUTID             *int64
+	VersionSUTIDs            []int64
+	Status                   string
+	FailureClass             string
+	DedupeHint               string
+	Summary                  string
+	StepCount                int
+	StepFailedCount          int
+	AssertionCount           int
+	AssertionFailedCount     int
+	FailedStepSeq            int
+	FailedAssertionSeq       int
+	FailedStepResultID       int64
+	FailedAssertionResultIDs []int64
+	FailedExpected           string
+	FailedActual             string
+	FailedReason             string
+	Category                 string
+	Severity                 string
+	EvidenceIDs              []int64
+	StartedAt                *time.Time
+	FinishedAt               *time.Time
+	CreatedAt                time.Time
 }
 
 // EvidenceSnapshot is one evidence metadata row; content bytes and paths are
