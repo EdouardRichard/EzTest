@@ -106,8 +106,7 @@ info:
     P3 新增错误码 `evidence_too_large`（证据超 5 MiB，409/413 视体积）与 `executor_unavailable`
     （执行器不可达/未注册，503）；human request 任意登录用户可 resolve，executor 管理仅 admin。
     实时走既有 `GET /api/events` + `GET /api/stream?channel=version:{id}`，事件类型见 `contracts/events.md` §12。
-x-frozen: P2
-x-draft: P3
+x-frozen: P3
 servers:
   - url: http://localhost:13333
     description: 本地开发默认 API（端口来自 EZTEST_API_PORT，默认 13333）

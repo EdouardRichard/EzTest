@@ -58,6 +58,7 @@ $http = $null
 $versionID = ""
 $caseVersionID = ""
 $executorToken = ""
+$script:exitCode = 1
 
 function Log([string]$Message, [string]$Color = "Gray") {
     $line = "[{0}] {1}" -f (Get-Date -Format "HH:mm:ss"), $Message
@@ -205,13 +206,31 @@ try {
     $psql = Join-Path $repoRoot ".tools\pgsql\bin\psql.exe"
     if (-not (Test-Path $psql)) { throw "psql not found at $psql" }
     $oldPassword = $env:PGPASSWORD
+    $oldPreference = $ErrorActionPreference
     $env:PGPASSWORD = $db.Password
     try {
-        & $psql -h $db.Host -p $db.Port -U $db.User -d postgres -v ON_ERROR_STOP=1 `
-            -c "DROP DATABASE IF EXISTS $testDatabase WITH (FORCE);" `
-            -c "CREATE DATABASE $testDatabase;" *> (Join-Path $logDir "e2e-db.log")
-        if ($LASTEXITCODE -ne 0) { throw "database reset failed (see e2e-db.log)" }
-    } finally { $env:PGPASSWORD = $oldPassword }
+        # Native stderr becomes an ErrorRecord under Stop; reset with explicit
+        # exit-code handling and one retry in case another run races the drop.
+        $ErrorActionPreference = "Continue"
+        $resetLog = New-Object System.Collections.ArrayList
+        for ($attempt = 1; $attempt -le 2; $attempt++) {
+            $dropOutput = & $psql -h $db.Host -p $db.Port -U $db.User -d postgres -v ON_ERROR_STOP=1 `
+                -c "DROP DATABASE IF EXISTS $testDatabase WITH (FORCE);" 2>&1
+            $dropExit = $LASTEXITCODE
+            [void]$resetLog.Add(("attempt {0} drop exit={1}: {2}" -f $attempt, $dropExit, ($dropOutput -join " ")))
+            $createOutput = & $psql -h $db.Host -p $db.Port -U $db.User -d postgres -v ON_ERROR_STOP=1 `
+                -c "CREATE DATABASE $testDatabase;" 2>&1
+            $createExit = $LASTEXITCODE
+            [void]$resetLog.Add(("attempt {0} create exit={1}: {2}" -f $attempt, $createExit, ($createOutput -join " ")))
+            if ($dropExit -eq 0 -and $createExit -eq 0) { break }
+            Start-Sleep -Milliseconds 800
+        }
+        Set-Content -LiteralPath (Join-Path $logDir "e2e-db.log") -Value ($resetLog -join [Environment]::NewLine) -Encoding UTF8
+        if ($dropExit -ne 0 -or $createExit -ne 0) { throw "database reset failed (see e2e-db.log)" }
+    } finally {
+        $env:PGPASSWORD = $oldPassword
+        $ErrorActionPreference = $oldPreference
+    }
     Log "isolated database $testDatabase ready" "Cyan"
 
     Log "seeding the P3 target fixture database"
@@ -515,5 +534,3 @@ COMMIT;
     try { if ($null -ne $http) { $http.Dispose() } } catch { }
 }
 exit $script:exitCode
-    if ($null -ne $http) { $http.Dispose() }
-}
