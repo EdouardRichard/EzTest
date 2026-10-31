@@ -9,6 +9,7 @@ import (
 	"time"
 
 	chain "github.com/EdouardRichard/EzTest/backend/internal/chain/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
 var errProviderBoom = errors.New("provider boom")
@@ -35,6 +36,9 @@ type fakeProviders struct {
 	sutNames         map[int64]string
 	pageNames        map[int64]string
 	cursor           int64
+	eventTimes       map[int64]time.Time
+	eventTimeSeqs    []int64
+	eventTimeChannel string
 	errs             map[string]error
 	calls            []string
 	versionIDs       map[string]int64
@@ -51,6 +55,7 @@ func newFakeProviders() *fakeProviders {
 		historical: map[int64]chain.Node{},
 		sutNames:   map[int64]string{},
 		pageNames:  map[int64]string{},
+		eventTimes: map[int64]time.Time{},
 		errs:       map[string]error{},
 		versionIDs: map[string]int64{},
 	}
@@ -167,6 +172,17 @@ func (f *fakeProviders) LatestCursor(ctx context.Context, channel string) (int64
 	return f.cursor, nil
 }
 
+func (f *fakeProviders) EventTime(ctx context.Context, channel string, seq int64) (time.Time, bool, error) {
+	f.calls = append(f.calls, "event_time")
+	f.eventTimeChannel = channel
+	f.eventTimeSeqs = append(f.eventTimeSeqs, seq)
+	if err := f.errs["event_time"]; err != nil {
+		return time.Time{}, false, err
+	}
+	at, ok := f.eventTimes[seq]
+	return at, ok, nil
+}
+
 func chainNode(kind chain.NodeKind, refID int64, label string) chain.Node {
 	return chain.Node{
 		ID:    chain.NodeID(kind, refID),
@@ -243,13 +259,13 @@ func completeFakes() *fakeProviders {
 }
 
 func newService(fakes *fakeProviders, now time.Time) *ChainService {
-	return NewChainService(fakes, fakes, fakes, fakes, fakes, fakes, fakeClock{now: now})
+	return NewChainService(fakes, fakes, fakes, fakes, fakes, fakes, fakes, fakeClock{now: now})
 }
 
 // newServiceWithBudget wires the same fakes with an explicit chain budget, the
 // way P4 settings wiring (task 23) constructs the service.
 func newServiceWithBudget(fakes *fakeProviders, now time.Time, budget chain.Budget) *ChainService {
-	return NewChainService(fakes, fakes, fakes, fakes, fakes, fakes, fakeClock{now: now}, budget)
+	return NewChainService(fakes, fakes, fakes, fakes, fakes, fakes, fakes, fakeClock{now: now}, budget)
 }
 
 // requirementRoots returns count bare requirement roots. Their zero timestamps
@@ -631,6 +647,8 @@ func TestChainServiceReplayModes(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fakes := newFakeProviders()
 			fakes.cursor = 7
+			fakes.eventTimes[5] = now.Add(-time.Hour)
+			fakes.eventTimes[9] = now.Add(time.Hour)
 			view, err := newService(fakes, now).Read(context.Background(), 42, tc.filter)
 			if err != nil {
 				t.Fatalf("Read() error = %v", err)
@@ -651,6 +669,209 @@ func TestChainServiceReplayModes(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestChainServiceEventRangeFiltersNodes(t *testing.T) {
+	now := time.Date(2026, 11, 1, 5, 10, 0, 0, time.UTC)
+	base := time.Date(2026, 11, 1, 5, 0, 0, 0, time.UTC)
+	fakes := completeFakes()
+	// seq 5 -> base+1m (lower bound), seq 7 -> base+4m (upper bound).
+	fakes.eventTimes[5] = base.Add(time.Minute)
+	fakes.eventTimes[7] = base.Add(4 * time.Minute)
+
+	fakes.requirements[0].CreatedAt = base
+	fakes.requirements[0].UpdatedAt = base
+	fakes.scenarios[0].CreatedAt = base.Add(time.Minute)
+	fakes.scenarios[0].UpdatedAt = base.Add(time.Minute)
+	fakes.cases[0].CreatedAt = base.Add(2 * time.Minute)
+	fakes.cases[0].UpdatedAt = base.Add(2 * time.Minute)
+	fakes.caseRuns[0].CreatedAt = base.Add(3 * time.Minute)
+	fakes.caseRuns[0].UpdatedAt = base.Add(3 * time.Minute)
+	fakes.waves[0].CreatedAt = base.Add(4 * time.Minute)
+	fakes.waves[0].UpdatedAt = base.Add(4 * time.Minute)
+	fakes.issues[0].CreatedAt = base.Add(5 * time.Minute)
+	fakes.issues[0].UpdatedAt = base.Add(5 * time.Minute)
+	fakes.reports[0].CreatedAt = time.Time{} // zero timestamps are always kept
+	fakes.reports[0].UpdatedAt = time.Time{}
+	fakes.closures[0].CreatedAt = base.Add(5 * time.Minute)
+	fakes.closures[0].UpdatedAt = base.Add(5 * time.Minute)
+
+	view, err := newService(fakes, now).Read(context.Background(), 42, chain.ChainFilter{
+		EventFrom: ptr(5),
+		EventTo:   ptr(7),
+	})
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+
+	if view.Replay.Mode != chain.ReplayModeRange || !view.Replay.Approximate {
+		t.Errorf("Replay = %+v, want range/approximate", view.Replay)
+	}
+	if !samePtr(view.Replay.EventFrom, ptr(5)) || !samePtr(view.Replay.EventTo, ptr(7)) {
+		t.Errorf("Replay bounds = %v/%v, want 5/7", view.Replay.EventFrom, view.Replay.EventTo)
+	}
+	if fakes.eventTimeChannel != "version:42" {
+		t.Errorf("event time channel = %q, want version:42", fakes.eventTimeChannel)
+	}
+	if !slices.Equal(fakes.eventTimeSeqs, []int64{5, 7}) {
+		t.Errorf("event time seqs = %v, want [5 7]", fakes.eventTimeSeqs)
+	}
+
+	nodes := make(map[string]chain.Node, len(view.Nodes))
+	for _, node := range view.Nodes {
+		nodes[node.ID] = node
+	}
+	for _, id := range []string{
+		"scenario:10", "case_version:100", "wave:7", "case_run:200", "report:900",
+	} {
+		if _, ok := nodes[id]; !ok {
+			t.Errorf("node %q missing from the event range: %v", id, view.Nodes)
+		}
+	}
+	for _, id := range []string{"requirement:1", "issue:300", "closure:400"} {
+		if _, ok := nodes[id]; ok {
+			t.Errorf("node %q outside the event range was not filtered", id)
+		}
+	}
+	if got := view.Counts["requirements"]; got != 0 {
+		t.Errorf("Counts[requirements] = %d, want 0", got)
+	}
+	if got := view.Counts["reports"]; got != 1 {
+		t.Errorf("Counts[reports] = %d, want the zero-timestamp report", got)
+	}
+
+	edges := make(map[string]bool, len(view.Edges))
+	for _, edge := range view.Edges {
+		edges[string(edge.Kind)+"|"+edge.From+"|"+edge.To] = true
+	}
+	for _, want := range []string{
+		"has_case|scenario:10|case_version:100",
+		"executed_by|case_version:100|case_run:200",
+		"contains|wave:7|case_run:200",
+		"reports|wave:7|report:900",
+	} {
+		if !edges[want] {
+			t.Errorf("edge %q missing from the induced range graph: %v", want, view.Edges)
+		}
+	}
+	for _, unwanted := range []string{
+		"has_scenario|requirement:1|scenario:10",
+		"raised|case_run:200|issue:300",
+		"closed_by|requirement:1|closure:400",
+	} {
+		if edges[unwanted] {
+			t.Errorf("edge %q survived with a filtered endpoint", unwanted)
+		}
+	}
+}
+
+func TestChainServiceEventRangeOneSidedAndZeroUnset(t *testing.T) {
+	now := time.Date(2026, 11, 1, 5, 10, 0, 0, time.UTC)
+	base := time.Date(2026, 11, 1, 5, 0, 0, 0, time.UTC)
+
+	t.Run("zero event bounds are unset", func(t *testing.T) {
+		fakes := completeFakes()
+		view, err := newService(fakes, now).Read(context.Background(), 42, chain.ChainFilter{
+			EventFrom: ptr(0),
+			EventTo:   ptr(0),
+		})
+		if err != nil {
+			t.Fatalf("Read() error = %v", err)
+		}
+		if view.Replay.Mode != chain.ReplayModeLive {
+			t.Errorf("Replay.Mode = %q, want live for zero bounds", view.Replay.Mode)
+		}
+		if view.Filters.EventFrom != nil || view.Filters.EventTo != nil {
+			t.Errorf("Filters event bounds = %v/%v, want nil/nil", view.Filters.EventFrom, view.Filters.EventTo)
+		}
+		if slices.Contains(fakes.calls, "event_time") {
+			t.Errorf("event time reader was called for unset bounds: %v", fakes.calls)
+		}
+	})
+
+	t.Run("event_from alone filters only the lower bound", func(t *testing.T) {
+		fakes := completeFakes()
+		fakes.eventTimes[5] = base.Add(2 * time.Minute)
+		fakes.requirements[0].CreatedAt = base.Add(time.Minute)
+		fakes.issues[0].CreatedAt = base.Add(3 * time.Minute)
+		fakes.reports[0].CreatedAt = base.Add(3 * time.Minute)
+		fakes.scenarios[0].CreatedAt = base.Add(3 * time.Minute)
+		fakes.cases[0].CreatedAt = base.Add(3 * time.Minute)
+		fakes.waves[0].CreatedAt = base.Add(3 * time.Minute)
+		fakes.caseRuns[0].CreatedAt = base.Add(3 * time.Minute)
+		fakes.closures[0].CreatedAt = base.Add(3 * time.Minute)
+
+		view, err := newService(fakes, now).Read(context.Background(), 42, chain.ChainFilter{EventFrom: ptr(5)})
+		if err != nil {
+			t.Fatalf("Read() error = %v", err)
+		}
+		if view.Replay.Mode != chain.ReplayModeRange || !view.Replay.Approximate {
+			t.Errorf("Replay = %+v, want range/approximate", view.Replay)
+		}
+		if !samePtr(view.Replay.EventFrom, ptr(5)) || view.Replay.EventTo != nil {
+			t.Errorf("Replay bounds = %v/%v, want 5/nil", view.Replay.EventFrom, view.Replay.EventTo)
+		}
+		nodes := make(map[string]bool, len(view.Nodes))
+		for _, node := range view.Nodes {
+			nodes[node.ID] = true
+		}
+		if nodes["requirement:1"] {
+			t.Errorf("requirement before the lower bound survived")
+		}
+		if !nodes["issue:300"] || !nodes["report:900"] {
+			t.Errorf("upper-unbounded nodes missing: %v", view.Nodes)
+		}
+		if !slices.Equal(fakes.eventTimeSeqs, []int64{5}) {
+			t.Errorf("event time seqs = %v, want [5]", fakes.eventTimeSeqs)
+		}
+	})
+}
+
+func TestChainServiceRejectsInvalidEventBounds(t *testing.T) {
+	now := time.Date(2026, 11, 1, 5, 0, 0, 0, time.UTC)
+
+	t.Run("negative bound", func(t *testing.T) {
+		fakes := completeFakes()
+		_, err := newService(fakes, now).Read(context.Background(), 42, chain.ChainFilter{EventFrom: ptr(-1)})
+		if err == nil {
+			t.Fatal("Read() error = nil, want an invalid event bound error")
+		}
+		var apiErr *platform.Error
+		if !errors.As(err, &apiErr) || apiErr.Status != 400 {
+			t.Fatalf("error = %v, want a 400 platform error", err)
+		}
+		if len(fakes.calls) != 0 {
+			t.Errorf("providers were called for an invalid event bound: %v", fakes.calls)
+		}
+	})
+
+	t.Run("unknown event seq", func(t *testing.T) {
+		fakes := completeFakes()
+		_, err := newService(fakes, now).Read(context.Background(), 42, chain.ChainFilter{
+			EventFrom: ptr(5),
+			EventTo:   ptr(7),
+		})
+		if err == nil {
+			t.Fatal("Read() error = nil, want an unknown event seq error")
+		}
+		if !slices.Equal(fakes.eventTimeSeqs, []int64{5}) {
+			t.Errorf("event time seqs = %v, want [5] before rejecting the missing bound", fakes.eventTimeSeqs)
+		}
+		var apiErr *platform.Error
+		if !errors.As(err, &apiErr) || apiErr.Status != 400 {
+			t.Fatalf("error = %v, want a 400 platform error", err)
+		}
+	})
+
+	t.Run("event reader failure", func(t *testing.T) {
+		fakes := completeFakes()
+		fakes.eventTimes[5] = now
+		fakes.errs["event_time"] = errProviderBoom
+		_, err := newService(fakes, now).Read(context.Background(), 42, chain.ChainFilter{EventFrom: ptr(5)})
+		if !errors.Is(err, errProviderBoom) {
+			t.Fatalf("Read() error = %v, want the event reader error", err)
+		}
+	})
 }
 
 func TestChainServiceLimitOverride(t *testing.T) {

@@ -7,6 +7,7 @@ package httpapi
 import (
 	"context"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -16,6 +17,11 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/httpx"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/validation"
 )
+
+// focusNodePattern is the contract pattern of ChainFocusNode
+// (openapi.yaml, `^[a-z_]+:[0-9]+$`). The handler rejects anything else with
+// 400 before the builder can silently ignore a malformed deep link.
+var focusNodePattern = regexp.MustCompile(`^[a-z_]+:[0-9]+$`)
 
 // Service is the chain application surface the handler needs.
 type Service interface {
@@ -85,7 +91,10 @@ func parseChainFilter(r *http.Request) (chain.ChainFilter, error) {
 	if filter.EventTo, err = optionalEventSeq(query.Get("event_to"), "event_to"); err != nil {
 		return chain.ChainFilter{}, err
 	}
-	filter.FocusNode = query.Get("focus_node")
+	filter.FocusNode = strings.TrimSpace(query.Get("focus_node"))
+	if filter.FocusNode != "" && !focusNodePattern.MatchString(filter.FocusNode) {
+		return chain.ChainFilter{}, platform.Invalid("focus_node", "must match {kind}:{ref_id} with a lowercase kind and a decimal id")
+	}
 	limit, err := optionalChainLimit(query.Get("limit"))
 	if err != nil {
 		return chain.ChainFilter{}, err
@@ -106,6 +115,8 @@ func optionalPositiveID(raw, field string) (*int64, error) {
 	return &value, nil
 }
 
+// optionalEventSeq parses an event seq. Zero is accepted as the documented
+// "unset" value (the service normalizes it away); values below zero are 400.
 func optionalEventSeq(raw, field string) (*int64, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
