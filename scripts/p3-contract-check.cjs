@@ -288,8 +288,10 @@ for (const name of [
 check(dbSchemaText.includes("paths.evidence_dir"), "db-schema.md must record the paths.evidence_dir P3 exception")
 
 // ---------------------------------------------------------------------------
-// Migrations: the 3 P3 files must stay present and ordered (P4+ appends only;
-// the migration total is intentionally not hard-coded).
+// Migrations: the 3 P3 files must stay present and ordered, and the P3 tail
+// must still be applied. P4 re-pins the Go test tail to the P4 four, so the
+// tail proof is anchored on order.txt (the applied order) and on the migration
+// tests expecting every ordered file; the totals are derived, not hard-coded.
 // ---------------------------------------------------------------------------
 const p3Migrations = [
   "execution_0001_intent_wave.sql",
@@ -299,11 +301,14 @@ const p3Migrations = [
 for (const file of p3Migrations) {
   check(fs.existsSync(path.join(migrationsDir, file)), `missing migration file ${file}`)
 }
+const p3Tail = p3Migrations[p3Migrations.length - 1]
 const orderLines = read(path.join(migrationsDir, "order.txt"))
   .split(/\r?\n/)
   .map((line) => line.trim())
   .filter((line) => line.length > 0 && !line.startsWith("#"))
 check(p3Migrations.every((file) => orderLines.includes(file)), "order.txt missing P3 execution migrations")
+check(orderLines.includes(p3Tail), `order.txt must still apply P3 tail ${p3Tail}`)
+check(orderLines.length >= 20, `order.txt must keep at least 20 migrations, found ${orderLines.length}`)
 const p3OrderIndexes = p3Migrations.map((file) => orderLines.indexOf(file))
 check(
   p3OrderIndexes[0] >= 0 &&
@@ -317,12 +322,20 @@ check(
   unitCount !== null && Number(unitCount[1]) >= 20,
   "migrate_test.go must expect at least 20 migrations (P3 baseline preserved)",
 )
+check(
+  unitCount !== null && Number(unitCount[1]) === orderLines.length,
+  `migrate_test.go must expect every migration in order.txt (${orderLines.length})`,
+)
 check(migrateUnit.includes("orderedMigrations"), "migrate_test.go must keep the migration-order test")
 const migrateIntegration = read(path.join(root, "backend", "internal", "db", "migrate_integration_test.go"))
 const integrationCount = /len\(applied\)\s*!=\s*(\d+)/.exec(migrateIntegration)
 check(
   integrationCount !== null && Number(integrationCount[1]) >= 20,
   "migrate_integration_test.go must expect at least 20 migrations (P3 baseline preserved)",
+)
+check(
+  integrationCount !== null && Number(integrationCount[1]) === orderLines.length,
+  `migrate_integration_test.go must expect every migration in order.txt (${orderLines.length})`,
 )
 check(migrateIntegration.includes("TestP3ExecutionTables"), "migrate_integration_test.go missing TestP3ExecutionTables")
 

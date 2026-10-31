@@ -4,19 +4,27 @@
 // Asserts that the P4 delivery/chain increments are frozen in
 // docs/version-V0.2/contracts and that the P0-P3 increments are still present.
 // The OpenAPI document is parsed with the frontend's `yaml` dependency; the
-// markdown contracts are checked with plain string searches and small regexes.
+// markdown contracts are checked with small table parsers and regexes.
 // Exits non-zero with the list of missing items.
 //
-// Migration *files* and `order.txt` are owned by the migration task; this check
-// freezes the migration contract (contracts/migrations-order.md §6) only.
+// The frozen migration contract (contracts/migrations-order.md §6) *and* the
+// on-disk migration set (`backend/internal/db/migrations/`) are asserted: the
+// four P4 SQL files must exist and `order.txt` must apply all 24 migrations,
+// ending with the P4 four.
 const fs = require("node:fs")
 const path = require("node:path")
 
 const root = path.resolve(__dirname, "..")
 const contractDir = path.join(root, "docs", "version-V0.2", "contracts")
+const migrationsDir = path.join(root, "backend", "internal", "db", "migrations")
 const yaml = require(path.join(root, "frontend", "node_modules", "yaml"))
 
 const failures = []
+// Parsed P4 rows, filled below and used for the final reported counts.
+let p4EventTypes = []
+let p4TaskTypes = []
+let p4ProfileKeys = []
+let p4ToolNames = []
 const check = (ok, message) => {
   if (!ok) failures.push(message)
 }
@@ -28,6 +36,81 @@ const lines = (text) =>
     .map((line) => line.trim())
     .filter((line) => line.length > 0)
 
+// Markdown section/table helpers. Frozen increments must be asserted against
+// the defining table row (first column), never against a name mentioned
+// anywhere in the section: prose such as "requirement.close/payload" would
+// otherwise keep the check green after its table row is deleted.
+const sliceSection = (text, startPattern, nextPattern = /^## /m) => {
+  const start = text.search(startPattern)
+  if (start < 0) return ""
+  const fromStart = text.slice(start)
+  const next = fromStart.slice(1).search(nextPattern)
+  return next >= 0 ? fromStart.slice(0, next + 1) : fromStart
+}
+
+const splitTableRow = (line) => {
+  const cells = []
+  let cell = ""
+  let escaped = false
+  for (const char of line.trim()) {
+    if (escaped) {
+      cell += char
+      escaped = false
+      continue
+    }
+    if (char === "\\") {
+      escaped = true
+      continue
+    }
+    if (char === "|") {
+      cells.push(cell.trim())
+      cell = ""
+      continue
+    }
+    cell += char
+  }
+  cells.push(cell.trim())
+  if (cells[0] === "") cells.shift()
+  if (cells[cells.length - 1] === "") cells.pop()
+  return cells
+}
+
+const parseTables = (text) => {
+  const tables = []
+  let rows = null
+  let inFence = false
+  for (const line of text.split(/\r?\n/)) {
+    if (/^\s*```/.test(line)) {
+      inFence = !inFence
+      rows = null
+      continue
+    }
+    if (inFence) continue
+    if (/^\s*\|/.test(line)) {
+      if (!rows) {
+        rows = []
+        tables.push(rows)
+      }
+      rows.push(splitTableRow(line))
+    } else {
+      rows = null
+    }
+  }
+  return tables
+}
+
+const tableHeader = (rows) => (rows[0] ?? []).map((cell) => cell.replace(/`/g, "").trim())
+const tableDataRows = (rows) => {
+  const separator = rows.findIndex((cells) => cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(cell)))
+  return separator >= 0 ? rows.slice(separator + 1) : rows.slice(1)
+}
+const tableFirstColumn = (rows) =>
+  tableDataRows(rows)
+    .map((cells) => (cells[0] ?? "").replace(/`/g, "").trim())
+    .filter((cell) => cell.length > 0)
+const tableText = (rows) => rows.map((cells) => cells.join(" | ")).join("\n")
+const findTable = (tables, predicate) => tables.find(predicate)
+
 // ---------------------------------------------------------------------------
 // OpenAPI: identity, freeze marker, tags, 14 P4 operations.
 // ---------------------------------------------------------------------------
@@ -38,6 +121,23 @@ try {
   failures.push(`openapi.yaml does not parse: ${error.message}`)
 }
 check(openapi && typeof openapi === "object", "openapi parses to an object")
+const p4Ops = [
+  ["/api/versions/{versionId}/issues", "get", "listIssues", "Delivery"],
+  ["/api/versions/{versionId}/issues/{issueId}", "get", "getIssue", "Delivery"],
+  ["/api/versions/{versionId}/issues/{issueId}/confirm", "post", "confirmIssue", "Delivery"],
+  ["/api/versions/{versionId}/issues/{issueId}/dismiss", "post", "dismissIssue", "Delivery"],
+  ["/api/versions/{versionId}/issues/{issueId}/reopen", "post", "reopenIssue", "Delivery"],
+  ["/api/versions/{versionId}/issues/{issueId}/merge", "post", "mergeIssue", "Delivery"],
+  ["/api/versions/{versionId}/reports", "get", "listReports", "Delivery"],
+  ["/api/versions/{versionId}/reports/{reportId}", "get", "getReport", "Delivery"],
+  ["/api/versions/{versionId}/reports/{reportId}/revisions/{revision}", "get", "getReportRevision", "Delivery"],
+  ["/api/versions/{versionId}/reports/{reportId}/revisions/{revision}/html", "get", "downloadReportHTML", "Delivery"],
+  ["/api/versions/{versionId}/reports/{reportId}/regenerate", "post", "regenerateReport", "Delivery"],
+  ["/api/versions/{versionId}/exploration-chain", "get", "getExplorationChain", "Chain"],
+  ["/api/versions/{versionId}/reopen", "post", "reopenVersion", "Versions"],
+  ["/api/versions/{versionId}/requirements/{requirementId}/reopen", "post", "reopenRequirement", "Requirements"],
+]
+check(p4Ops.length === 14, "p4 operation table must list 14 operations")
 if (openapi && typeof openapi === "object") {
   check(openapi.info?.version === "0.2.0-p4", "missing openapi info.version 0.2.0-p4")
   check(openapi["x-frozen"] === "P4", "missing openapi x-frozen P4")
@@ -48,29 +148,52 @@ if (openapi && typeof openapi === "object") {
     check(tagNames.includes(tag), `openapi missing tag ${tag}`)
   }
 
-  const p4Ops = [
-    ["/api/versions/{versionId}/issues", "get", "listIssues", "Delivery"],
-    ["/api/versions/{versionId}/issues/{issueId}", "get", "getIssue", "Delivery"],
-    ["/api/versions/{versionId}/issues/{issueId}/confirm", "post", "confirmIssue", "Delivery"],
-    ["/api/versions/{versionId}/issues/{issueId}/dismiss", "post", "dismissIssue", "Delivery"],
-    ["/api/versions/{versionId}/issues/{issueId}/reopen", "post", "reopenIssue", "Delivery"],
-    ["/api/versions/{versionId}/issues/{issueId}/merge", "post", "mergeIssue", "Delivery"],
-    ["/api/versions/{versionId}/reports", "get", "listReports", "Delivery"],
-    ["/api/versions/{versionId}/reports/{reportId}", "get", "getReport", "Delivery"],
-    ["/api/versions/{versionId}/reports/{reportId}/revisions/{revision}", "get", "getReportRevision", "Delivery"],
-    ["/api/versions/{versionId}/reports/{reportId}/revisions/{revision}/html", "get", "downloadReportHTML", "Delivery"],
-    ["/api/versions/{versionId}/reports/{reportId}/regenerate", "post", "regenerateReport", "Delivery"],
-    ["/api/versions/{versionId}/exploration-chain", "get", "getExplorationChain", "Chain"],
-    ["/api/versions/{versionId}/reopen", "post", "reopenVersion", "Versions"],
-    ["/api/versions/{versionId}/requirements/{requirementId}/reopen", "post", "reopenRequirement", "Requirements"],
-  ]
-  check(p4Ops.length === 14, "p4 operation table must list 14 operations")
   for (const [route, method, operationId, tag] of p4Ops) {
     const operation = openapi.paths?.[route]?.[method]
     check(Boolean(operation), `openapi missing ${method.toUpperCase()} ${route}`)
     check(operation?.operationId === operationId, `${method.toUpperCase()} ${route} operationId must be ${operationId}`)
     check(Array.isArray(operation?.tags) && operation.tags.includes(tag), `${method.toUpperCase()} ${route} must use tag ${tag}`)
   }
+
+  // Every $ref reachable from the 14 P4 operations (request/response/parameter
+  // components, walked transitively) must resolve. In particular, each schema
+  // referenced by a P4 operation must exist in components.schemas; deleting
+  // MergeIssueRequest (only referenced by the merge operation) must fail.
+  const resolveRef = (ref) => {
+    if (!ref.startsWith("#/")) return undefined
+    return ref
+      .slice(2)
+      .split("/")
+      .map((token) => token.replace(/~1/g, "/").replace(/~0/g, "~"))
+      .reduce((value, token) => (value && typeof value === "object" ? value[token] : undefined), openapi)
+  }
+  const p4Refs = new Set()
+  const p4SchemaRefs = new Set()
+  const visitP4Refs = (value) => {
+    if (Array.isArray(value)) {
+      for (const item of value) visitP4Refs(item)
+      return
+    }
+    if (!value || typeof value !== "object") return
+    for (const [key, child] of Object.entries(value)) {
+      if (key !== "$ref" || typeof child !== "string") {
+        visitP4Refs(child)
+        continue
+      }
+      if (p4Refs.has(child)) continue
+      p4Refs.add(child)
+      const target = resolveRef(child)
+      check(target !== undefined, `P4 openapi $ref target missing: ${child}`)
+      if (child.startsWith("#/components/schemas/")) {
+        p4SchemaRefs.add(child.slice("#/components/schemas/".length).replace(/~1/g, "/").replace(/~0/g, "~"))
+      }
+      if (target !== undefined) visitP4Refs(target)
+    }
+  }
+  for (const [route] of p4Ops) {
+    if (openapi.paths?.[route]) visitP4Refs(openapi.paths[route])
+  }
+  check(p4SchemaRefs.size > 0, "P4 openapi operations must reference components.schemas")
 
   // P0-P3 paths must stay present (item by item, never a phase total).
   const priorPaths = lines(`
@@ -305,6 +428,7 @@ ResolveHumanRequestRequest
     "RegenerateReportRequest",
     "VersionReopenRequest",
     "RequirementReopenRequest",
+    "MergeIssueRequest",
   ]) {
     check(Boolean(openapi.components?.schemas?.[schema]), `openapi missing P4 schema ${schema}`)
   }
@@ -465,7 +589,7 @@ const section10Start = dbSchemaText.search(/^## 10\. P4 增量表结构/m)
 const section10 = section10Start >= 0 ? dbSchemaText.slice(section10Start) : ""
 check(section10.length > 0, "db-schema.md missing §10 P4 section")
 check(section10.includes("frozen: P4"), "db-schema.md §10 must be marked frozen: P4")
-for (const table of [
+const p4Tables = [
   "delivery_issue",
   "delivery_issue_ref",
   "delivery_issue_status_history",
@@ -474,7 +598,8 @@ for (const table of [
   "delivery_report_ref",
   "delivery_analysis_run",
   "requirement_closure",
-]) {
+]
+for (const table of p4Tables) {
   check(section10.includes(table), `db-schema.md §10 missing table ${table}`)
 }
 for (const name of [
@@ -559,6 +684,30 @@ for (const [order, file, owner] of p4Migrations) {
   )
   check(section6.includes(owner), `migrations-order.md §6 missing ownership ${owner} for ${file}`)
 }
+
+// On-disk migrations are part of the frozen P4 delivery: the four SQL files
+// must exist and `order.txt` must apply all 24 migrations, P4 last.
+const p4MigrationFiles = p4Migrations.map(([, file]) => file)
+for (const file of p4MigrationFiles) {
+  const absolute = path.join(migrationsDir, file)
+  check(fs.existsSync(absolute) && fs.statSync(absolute).isFile(), `missing on-disk P4 migration ${file}`)
+}
+const orderPath = path.join(migrationsDir, "order.txt")
+let orderLines = []
+try {
+  orderLines = fs
+    .readFileSync(orderPath, "utf8")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"))
+} catch (error) {
+  failures.push(`missing migration order.txt: ${error.message}`)
+}
+check(orderLines.length === 24, `order.txt must apply 24 migrations, found ${orderLines.length}`)
+check(
+  JSON.stringify(orderLines.slice(-p4MigrationFiles.length)) === JSON.stringify(p4MigrationFiles),
+  "order.txt must end with the four P4 migrations in order",
+)
 for (const priorMigration of lines(`
 settings_0001_settings.sql
 identity_0001_identity.sql
@@ -591,11 +740,14 @@ for (const section of ["## 5a. P1 迁移清单", "## 5b. P2 迁移清单", "## 5
 // Events: §13 ten P4 events.
 // ---------------------------------------------------------------------------
 const eventsText = readContract("events.md")
-const section13Start = eventsText.search(/^## 13\. P4 增量事件/m)
-const section13 = section13Start >= 0 ? eventsText.slice(section13Start) : ""
+const section13 = sliceSection(eventsText, /^## 13\. P4 增量事件/m)
 check(section13.length > 0, "events.md missing §13 P4 section")
 check(section13.includes("frozen: P4"), "events.md §13 must be marked frozen: P4")
-for (const event of [
+const eventTable = findTable(parseTables(section13), (rows) => tableHeader(rows)[0] === "type")
+check(Boolean(eventTable), "events.md §13 missing the event type table")
+const eventTableText = eventTable ? tableText(eventTable) : ""
+p4EventTypes = eventTable ? tableFirstColumn(eventTable) : []
+const eventTypes = [
   "issue.created",
   "issue.updated",
   "issue.reopened",
@@ -606,9 +758,11 @@ for (const event of [
   "requirement.reopened",
   "version.closed",
   "version.reopened",
-]) {
-  check(section13.includes(event), `events.md §13 missing event ${event}`)
+]
+for (const event of eventTypes) {
+  check(p4EventTypes.includes(event), `events.md §13 missing event ${event}`)
 }
+check(p4EventTypes.length >= eventTypes.length, `events.md §13 must keep all ${eventTypes.length} P4 event rows`)
 for (const payloadField of [
   "issue_id",
   "merged_into_id",
@@ -618,10 +772,10 @@ for (const payloadField of [
   "close_round",
   "close_run_id",
 ]) {
-  check(section13.includes(payloadField), `events.md §13 missing payload field ${payloadField}`)
+  check(eventTableText.includes(payloadField), `events.md §13 missing payload field ${payloadField}`)
 }
-check(section13.includes("version:{id}"), "events.md §13 must document version:{id} channel")
-check(/system/.test(section13), "events.md §13 must document the system channel for version events")
+check(eventTableText.includes("version:{id}"), "events.md §13 table must document version:{id} channel")
+check(/system/.test(eventTableText), "events.md §13 table must document the system channel for version events")
 
 // P0-P3 event classes must stay present.
 for (const section of ["## 10. P1 增量事件", "## 11. P2 增量事件", "## 12. P3 增量事件"]) {
@@ -650,20 +804,25 @@ execution.coverage_gap
 // Task types: §6 five P4 tasks, §4 no longer lists implemented types.
 // ---------------------------------------------------------------------------
 const taskTypesText = readContract("task-types.md")
-const section6TaskStart = taskTypesText.search(/^## 6\. P4 任务类型/m)
-const section6Task = section6TaskStart >= 0 ? taskTypesText.slice(section6TaskStart) : ""
+const section6Task = sliceSection(taskTypesText, /^## 6\. P4 任务类型/m)
 check(section6Task.length > 0, "task-types.md missing §6 P4 section")
 check(section6Task.includes("frozen: P4"), "task-types.md §6 must be marked frozen: P4")
-for (const taskType of ["issue.triage", "report.wave", "report.version", "requirement.close", "version.close"]) {
-  check(section6Task.includes(`\`${taskType}\``), `task-types.md §6 missing task ${taskType}`)
+const taskTable = findTable(parseTables(section6Task), (rows) => tableHeader(rows)[0] === "type")
+check(Boolean(taskTable), "task-types.md §6 missing the task type table")
+const taskTableText = taskTable ? tableText(taskTable) : ""
+p4TaskTypes = taskTable ? tableFirstColumn(taskTable) : []
+const taskTypes = ["issue.triage", "report.wave", "report.version", "requirement.close", "version.close"]
+for (const taskType of taskTypes) {
+  check(p4TaskTypes.includes(taskType), `task-types.md §6 missing task ${taskType}`)
 }
+check(p4TaskTypes.length >= taskTypes.length, `task-types.md §6 must keep all ${taskTypes.length} P4 task rows`)
 for (const profile of ["issue_triager", "report_writer", "version_steward"]) {
-  check(section6Task.includes(profile), `task-types.md §6 missing profile ${profile}`)
+  check(taskTableText.includes(profile), `task-types.md §6 missing profile ${profile}`)
 }
 for (const dedupe of ["triage:{issue_id}", "report:{report_id}:r{revision}", "req-close:", "ver-close:"]) {
-  check(section6Task.includes(dedupe), `task-types.md §6 missing dedupe key ${dedupe}`)
+  check(taskTableText.includes(dedupe), `task-types.md §6 missing dedupe key ${dedupe}`)
 }
-check(section6Task.includes("predicate_fingerprint"), "task-types.md §6 missing version.close predicate_fingerprint")
+check(taskTableText.includes("predicate_fingerprint"), "task-types.md §6 missing version.close predicate_fingerprint")
 const section4TaskStart = taskTypesText.search(/^## 4\. P4\+ 保留类型/m)
 const section4TaskEnd = taskTypesText.search(/^## 5\. P3 任务类型/m)
 const section4Task =
@@ -678,14 +837,26 @@ check(section4Task.includes("report.render_pdf"), "task-types.md §4 must keep r
 // Profiles/tools: §7 three profiles, eight tools, scope injection.
 // ---------------------------------------------------------------------------
 const profilesText = readContract("agent-profiles-tools.md")
-const section7Start = profilesText.search(/^## 7\. P4 Profiles/m)
-const section7 = section7Start >= 0 ? profilesText.slice(section7Start) : ""
+const section7 = sliceSection(profilesText, /^## 7\. P4 Profiles/m)
 check(section7.length > 0, "agent-profiles-tools.md missing §7 P4 section")
 check(section7.includes("frozen: P4"), "agent-profiles-tools.md §7 must be marked frozen: P4")
-for (const profile of ["issue_triager", "report_writer", "version_steward"]) {
-  check(section7.includes(profile), `agent-profiles-tools.md §7 missing profile ${profile}`)
+const section7Tables = parseTables(section7)
+const profileTable = findTable(
+  section7Tables,
+  (rows) => tableHeader(rows)[0] === "key" && tableHeader(rows).some((cell) => cell.includes("允许工具")),
+)
+const toolTable = findTable(section7Tables, (rows) => tableHeader(rows)[0] === "工具")
+check(Boolean(profileTable), "agent-profiles-tools.md §7 missing the profile table")
+check(Boolean(toolTable), "agent-profiles-tools.md §7 missing the tool table")
+const profileTableText = profileTable ? tableText(profileTable) : ""
+p4ProfileKeys = profileTable ? tableFirstColumn(profileTable) : []
+p4ToolNames = toolTable ? tableFirstColumn(toolTable) : []
+const p4Profiles = ["issue_triager", "report_writer", "version_steward"]
+for (const profile of p4Profiles) {
+  check(p4ProfileKeys.includes(profile), `agent-profiles-tools.md §7 missing profile ${profile}`)
 }
-for (const tool of [
+check(p4ProfileKeys.length >= p4Profiles.length, `agent-profiles-tools.md §7 must keep all ${p4Profiles.length} profile rows`)
+const p4Tools = [
   "issue.read",
   "issue.propose",
   "report.data_read",
@@ -694,13 +865,15 @@ for (const tool of [
   "requirement.goal_met",
   "version.close_propose",
   "requirement.read",
-]) {
-  check(section7.includes(`\`${tool}\``), `agent-profiles-tools.md §7 missing tool ${tool}`)
+]
+for (const tool of p4Tools) {
+  check(p4ToolNames.includes(tool), `agent-profiles-tools.md §7 missing tool ${tool}`)
 }
+check(p4ToolNames.length >= p4Tools.length, `agent-profiles-tools.md §7 must keep all ${p4Tools.length} tool rows`)
 check(section7.includes("version_id"), "agent-profiles-tools.md §7 must document scope injection")
 check(section7.includes("versionId"), "agent-profiles-tools.md §7 must state schemas exclude versionId")
 for (const budget of ["max_turns:6", "soft_seconds:180", "hard_seconds:300"]) {
-  check(section7.includes(budget), `agent-profiles-tools.md §7 missing budget ${budget}`)
+  check(profileTableText.includes(budget), `agent-profiles-tools.md §7 missing budget ${budget}`)
 }
 check(
   /不得伪造|不得尝试确认|只调用白名单/.test(section7),
@@ -724,12 +897,13 @@ const section4d =
   section4dStart >= 0 && section4dEnd > section4dStart ? settingsText.slice(section4dStart, section4dEnd) : ""
 check(section4d.length > 0, "settings.md missing §4d P4 section")
 check(section4d.includes("frozen: P4"), "settings.md §4d must be marked frozen: P4")
-for (const [key, value] of [
+const p4Settings = [
   ["chain.max_nodes", "300"],
   ["chain.max_edges", "600"],
   ["chain.max_requirements", "100"],
   ["chain.replay_event_limit", "500"],
-]) {
+]
+for (const [key, value] of p4Settings) {
   check(
     new RegExp(`\\|\\s*\\d+\\s*\\|\\s*\`${key.replace(/\./g, "\\.")}\`\\s*\\|\\s*number\\s*\\|[^\\n]*\`${value}\``).test(
       settingsText,
@@ -768,7 +942,8 @@ const operationCount = Object.values(openapi.paths).reduce((total, item) => tota
 const schemaCount = Object.keys(openapi.components.schemas).length
 console.log(
   "P4 contract check OK (frozen mode): " +
-    `14 P4 operations; ${pathCount} paths / ${operationCount} operations / ${schemaCount} schemas; ` +
-    "8 P4 tables; 4 P4 migrations (#21-#24); 10 P4 events; " +
-    "5 P4 tasks; 3 P4 profiles; 8 P4 tools; 4 P4 settings keys",
+    `${p4Ops.length} P4 operations; ${pathCount} paths / ${operationCount} operations / ${schemaCount} schemas; ` +
+    `${p4Tables.length} P4 tables; ${p4Migrations.length} P4 migrations (#21-#24); ${p4EventTypes.length} P4 events; ` +
+    `${p4TaskTypes.length} P4 tasks; ${p4ProfileKeys.length} P4 profiles; ${p4ToolNames.length} P4 tools; ` +
+    `${p4Settings.length} P4 settings keys`,
 )
