@@ -211,9 +211,9 @@ func (s *HumanService) Create(ctx context.Context, in HumanCreateInput) (executi
 				}, actorPtr(in.ActorID))
 		}
 	}
-	if s.canceller != nil {
-		s.canceller.CancelRun(run.ID)
-	}
+	// Persist the human_request.created event and audit before cancelling the
+	// in-flight agent run: the tool call shares the run context, so a publish
+	// after CancelRun would be silently dropped (S8 real-LLM acceptance).
 	publishEvent(ctx, s.events, EventHumanCreated, wave.VersionID,
 		map[string]any{
 			"human_request_id": platformid.Format(request.ID),
@@ -226,6 +226,9 @@ func (s *HumanService) Create(ctx context.Context, in HumanCreateInput) (executi
 			"expires_at":       eventTime(request.ExpiresAt),
 		}, actorPtr(in.ActorID))
 	s.record(ctx, "human_request.created", request, in.ActorID)
+	if s.canceller != nil {
+		s.canceller.CancelRun(run.ID)
+	}
 	return request, nil
 }
 
