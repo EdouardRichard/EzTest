@@ -37,7 +37,7 @@ func TestP4RegistryComposesInjectedGroups(t *testing.T) {
 	const injected = "p4.test.injected"
 
 	RegisterP4ToolGroup(nil) // nil groups are ignored defensively
-	RegisterP4ToolGroup(func() []Tool {
+	RegisterP4ToolGroup(func(Deps) []Tool {
 		return []Tool{&p4RegistryTestTool{name: injected}}
 	})
 
@@ -53,5 +53,33 @@ func TestP4RegistryComposesInjectedGroups(t *testing.T) {
 	result, ok := value.(map[string]any)
 	if !ok || result["ok"] != true {
 		t.Fatalf("injected tool result = %#v", value)
+	}
+}
+
+func TestP4RegistryPassesDepsToGroups(t *testing.T) {
+	const injected = "p4.test.deps_injected"
+
+	// The group only exposes its tool when NewP4Registry hands it real deps.
+	RegisterP4ToolGroup(func(deps Deps) []Tool {
+		if deps.VersionPack == nil {
+			return nil
+		}
+		return []Tool{&p4RegistryTestTool{name: injected}}
+	})
+
+	if _, ok := NewP4Registry(Deps{}).Get(injected); ok {
+		t.Fatalf("group exposed %q when NewP4Registry received zero deps", injected)
+	}
+
+	called := false
+	deps := Deps{VersionPack: func(context.Context, Scope) (any, error) {
+		called = true
+		return nil, nil
+	}}
+	if _, ok := NewP4Registry(deps).Get(injected); !ok {
+		t.Fatal("NewP4Registry did not pass its deps to the registered group")
+	}
+	if called {
+		t.Fatal("group must not evaluate the dependency while registering tools")
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -169,11 +170,7 @@ func ParseWorkItemPayload(raw json.RawMessage) (WorkItemPayload, error) {
 	if err := json.Unmarshal(raw, &object); err != nil {
 		return WorkItemPayload{}, fmt.Errorf("work item payload must be a JSON object: %w", err)
 	}
-	parseID := func(field string) (int64, error) {
-		value, ok := object[field]
-		if !ok {
-			return 0, nil
-		}
+	decodeDecimal := func(field string, value json.RawMessage) (int64, error) {
 		text := strings.TrimSpace(string(value))
 		if text == "" || text == "null" || text == `""` {
 			return 0, nil
@@ -193,6 +190,32 @@ func ParseWorkItemPayload(raw json.RawMessage) (WorkItemPayload, error) {
 			return 0, fmt.Errorf("work item payload %s must be a positive decimal ID", field)
 		}
 		return parsed, nil
+	}
+	parseID := func(field string) (int64, error) {
+		value, ok := object[field]
+		if !ok {
+			return 0, nil
+		}
+		return decodeDecimal(field, value)
+	}
+	// parseInt32 decodes a revision/round. The P4 report payloads carry these
+	// as JSON numbers or decimal strings; the first present key wins.
+	parseInt32 := func(fields ...string) (int32, error) {
+		for _, field := range fields {
+			value, ok := object[field]
+			if !ok {
+				continue
+			}
+			parsed, err := decodeDecimal(field, value)
+			if err != nil {
+				return 0, err
+			}
+			if parsed > math.MaxInt32 {
+				return 0, fmt.Errorf("work item payload %s exceeds int32 range", field)
+			}
+			return int32(parsed), nil
+		}
+		return 0, nil
 	}
 	var err error
 	if payload.ConversationID, err = parseID("conversation_id"); err != nil {
@@ -232,6 +255,29 @@ func ParseWorkItemPayload(raw json.RawMessage) (WorkItemPayload, error) {
 	}
 	if payload.DispatchEpoch, err = parseID("dispatch_epoch"); err != nil {
 		return WorkItemPayload{}, err
+	}
+	// P4 delivery/steward payload (contracts/task-types.md §6). ReportRevision
+	// is canonically "report_revision"; the frozen report.wave/report.version
+	// payload spells it "revision", accepted as a compatibility alias.
+	if payload.IssueID, err = parseID("issue_id"); err != nil {
+		return WorkItemPayload{}, err
+	}
+	if payload.ReportID, err = parseID("report_id"); err != nil {
+		return WorkItemPayload{}, err
+	}
+	if payload.ReportRevision, err = parseInt32("report_revision", "revision"); err != nil {
+		return WorkItemPayload{}, err
+	}
+	if payload.CloseRound, err = parseInt32("close_round"); err != nil {
+		return WorkItemPayload{}, err
+	}
+	if payload.ReportRevisionID, err = parseID("report_revision_id"); err != nil {
+		return WorkItemPayload{}, err
+	}
+	if fingerprint, ok := object["predicate_fingerprint"]; ok {
+		if err := json.Unmarshal(fingerprint, &payload.PredicateFingerprint); err != nil {
+			return WorkItemPayload{}, fmt.Errorf("work item payload predicate_fingerprint must be a string")
+		}
 	}
 	if token, ok := object["dispatch_token"]; ok {
 		_ = json.Unmarshal(token, &payload.DispatchToken)
@@ -585,6 +631,13 @@ func (r *Runner) executeTools(ctx context.Context, state *runState, calls []llma
 		IntentID:             state.payload.IntentID,
 		DispatchEpoch:        state.payload.DispatchEpoch,
 		DispatchToken:        state.payload.DispatchToken,
+		// P4 delivery/steward task targets, copied from the work-item payload.
+		IssueID:              state.payload.IssueID,
+		ReportID:             state.payload.ReportID,
+		ReportRevision:       state.payload.ReportRevision,
+		CloseRound:           state.payload.CloseRound,
+		ReportRevisionID:     state.payload.ReportRevisionID,
+		PredicateFingerprint: state.payload.PredicateFingerprint,
 	}
 	maxBytes := r.intSetting("agent.tool_result_max_bytes", defaultToolResultMaxBytes)
 

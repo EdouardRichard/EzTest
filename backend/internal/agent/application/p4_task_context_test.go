@@ -3,10 +3,60 @@ package agentapp
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"testing"
 
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 )
+
+// P4 task-context providers are payload-only by ruling: the registration hook
+// takes no service dependencies, so everything a provider returns must derive
+// from TaskRef (version/type/raw payload). This compile-time pin fails the
+// build if a deps parameter is ever added to the hook.
+var _ func(func(context.Context, TaskRef) (any, bool)) = RegisterP4TaskContext
+
+// TaskRef is the complete provider input: adding a service port here would
+// re-introduce the deps problem the ruling excludes.
+func TestTaskRefCarriesOnlyWorkItemReference(t *testing.T) {
+	typ := reflect.TypeOf(TaskRef{})
+	fields := make([]string, 0, typ.NumField())
+	for i := 0; i < typ.NumField(); i++ {
+		fields = append(fields, typ.Field(i).Name)
+	}
+	want := []string{"VersionID", "Type", "Payload"}
+	if !reflect.DeepEqual(fields, want) {
+		t.Fatalf("TaskRef fields = %v, want %v (payload-only ruling)", fields, want)
+	}
+}
+
+func TestP4TaskContextReturnsOnlyTaskRefDerivedData(t *testing.T) {
+	RegisterP4TaskContext(func(_ context.Context, task TaskRef) (any, bool) {
+		if task.Type != "p4.test.payload_only" {
+			return nil, false
+		}
+		return map[string]any{
+			"version_id": idText(task.VersionID),
+			"issue_id":   task.Payload["issue_id"],
+		}, true
+	})
+
+	value, ok := P4TaskContext(context.Background(), TaskRef{
+		VersionID: 42,
+		Type:      "p4.test.payload_only",
+		Payload:   map[string]any{"issue_id": "501"},
+	})
+	if !ok {
+		t.Fatal("P4TaskContext(payload_only) did not match its provider")
+	}
+	details, ok := value.(map[string]any)
+	if !ok {
+		t.Fatalf("P4TaskContext value = %#v, want a JSON-ready map", value)
+	}
+	want := map[string]any{"version_id": "42", "issue_id": "501"}
+	if !reflect.DeepEqual(details, want) {
+		t.Fatalf("P4TaskContext payload = %#v, want %#v", details, want)
+	}
+}
 
 func TestP4TaskContextUnregisteredReturnsFalse(t *testing.T) {
 	value, ok := P4TaskContext(context.Background(), TaskRef{
