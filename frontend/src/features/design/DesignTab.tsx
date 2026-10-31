@@ -188,19 +188,25 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
     [router, versionId],
   )
 
-  function selectCase(caseId: string): void {
-    setSelectedCaseId(caseId)
-    updateUrl(caseId, activeConversationId)
-  }
+  const selectCase = useCallback(
+    (caseId: string) => {
+      setSelectedCaseId(caseId)
+      updateUrl(caseId, activeConversationId)
+    },
+    [updateUrl, activeConversationId],
+  )
 
-  function selectConversation(conversationId: string): void {
-    setActiveConversationId(conversationId)
-    setStaleNotice(null)
-    setActivity(null)
-    updateUrl(selectedCaseId, conversationId)
-  }
+  const selectConversation = useCallback(
+    (conversationId: string) => {
+      setActiveConversationId(conversationId)
+      setStaleNotice(null)
+      setActivity(null)
+      updateUrl(selectedCaseId, conversationId)
+    },
+    [updateUrl, selectedCaseId],
+  )
 
-  async function handleNewConversation(): Promise<void> {
+  const handleNewConversation = useCallback(async (): Promise<void> => {
     setCreatingConversation(true)
     setCreateError(null)
     try {
@@ -218,7 +224,11 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
     } finally {
       setCreatingConversation(false)
     }
-  }
+  }, [versionId, updateUrl])
+
+  const createConversation = useCallback(() => {
+    void handleNewConversation()
+  }, [handleNewConversation])
 
   const handleConfirm = useCallback(
     async (scope: CaseConfirmationScope, targetId: string): Promise<void> => {
@@ -241,14 +251,38 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
     [versionId, refreshGraph],
   )
 
-  function applyAutoDesign(enabled: boolean): void {
+  // Stable wrappers for DesignMindmap's memoized node data: React Flow must not
+  // see new callback identities on every parent render, or it re-resets the
+  // measured node dimensions and the canvas never becomes visible.
+  const confirmCase = useCallback(
+    (caseId: string) => {
+      void handleConfirm("case", caseId)
+    },
+    [handleConfirm],
+  )
+
+  const confirmScenario = useCallback(
+    (scenarioId: string) => {
+      void handleConfirm("scenario", scenarioId)
+    },
+    [handleConfirm],
+  )
+
+  const confirmRequirement = useCallback(
+    (requirementId: string) => {
+      void handleConfirm("requirement", requirementId)
+    },
+    [handleConfirm],
+  )
+
+  const applyAutoDesign = useCallback((enabled: boolean) => {
     setOverview((current) =>
       current === null ? current : { ...current, auto_design_new_requirements: enabled },
     )
     setGraph((current) =>
       current === null ? current : { ...current, auto_design_new_requirements: enabled },
     )
-  }
+  }, [])
 
   if (loading) {
     return (
@@ -304,9 +338,7 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
             size="sm"
             data-testid="design-new-conversation"
             disabled={creatingConversation}
-            onClick={() => {
-              void handleNewConversation()
-            }}
+            onClick={createConversation}
           >
             {creatingConversation ? "创建中…" : "＋ 新建对话"}
           </Button>
@@ -330,9 +362,7 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
           versionId={versionId}
           pendingCount={graph.pending_design_count}
           hasConversation={false}
-          onCreateConversation={() => {
-            void handleNewConversation()
-          }}
+          onCreateConversation={createConversation}
         />
       ) : null}
 
@@ -344,13 +374,7 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
                 title={EMPTY_REQUIREMENTS_COPY}
                 description="需求确认后，新建设计对话即可让设计团队扫描并生成用例。"
                 action={
-                  <Button
-                    size="sm"
-                    disabled={creatingConversation}
-                    onClick={() => {
-                      void handleNewConversation()
-                    }}
-                  >
+                  <Button size="sm" disabled={creatingConversation} onClick={createConversation}>
                     ＋ 新建对话
                   </Button>
                 }
@@ -363,15 +387,9 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
               selectedCaseId={selectedCaseId}
               confirmingKey={confirmingKey}
               onSelectCase={selectCase}
-              onConfirmCase={(caseId) => {
-                void handleConfirm("case", caseId)
-              }}
-              onConfirmScenario={(scenarioId) => {
-                void handleConfirm("scenario", scenarioId)
-              }}
-              onConfirmRequirement={(requirementId) => {
-                void handleConfirm("requirement", requirementId)
-              }}
+              onConfirmCase={confirmCase}
+              onConfirmScenario={confirmScenario}
+              onConfirmRequirement={confirmRequirement}
             />
           )}
         </div>
@@ -381,9 +399,7 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
           conversations={conversations}
           activeConversationId={activeConversationId}
           onSelectConversation={selectConversation}
-          onCreateConversation={() => {
-            void handleNewConversation()
-          }}
+          onCreateConversation={createConversation}
           creatingConversation={creatingConversation}
           liveMessages={liveMessages}
           activity={activity}
@@ -400,10 +416,8 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
             caseId={selectedCaseId}
             refreshToken={detailToken}
             confirming={confirmingKey === `case:${selectedCaseId ?? ""}`}
-            onConfirm={(caseId) => {
-              void handleConfirm("case", caseId)
-            }}
-            onRequestChange={(title) => setChatDraft(title)}
+            onConfirm={confirmCase}
+            onRequestChange={setChatDraft}
           />
         </div>
       </div>
