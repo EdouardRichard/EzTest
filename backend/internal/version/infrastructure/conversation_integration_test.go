@@ -228,3 +228,47 @@ func TestConversationRepositorySummaryVersioning(t *testing.T) {
 		t.Fatalf("pinned = %#v, %v", pinned, err)
 	}
 }
+
+func TestListReconcilableIncludesKind(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ids := newIDs(t)
+	repo := versionpg.NewConversationRepository(pool, ids)
+	versionRepo := versionpg.New(pool, ids)
+	ctx := context.Background()
+
+	v := sampleVersion(ids, 7)
+	if err := versionRepo.Create(ctx, v, sampleBindings(ids, v.ID)); err != nil {
+		t.Fatalf("create version: %v", err)
+	}
+	clarification := version.Conversation{
+		ID: ids.Next(), VersionID: v.ID, Kind: version.ConversationClarification, Title: "Chat",
+		Status: version.ConversationActive, CreatedAt: testTime, UpdatedAt: testTime,
+	}
+	design := version.Conversation{
+		ID: ids.Next(), VersionID: v.ID, Kind: version.ConversationDesign, Title: "Design",
+		Status: version.ConversationActive, CreatedAt: testTime, UpdatedAt: testTime,
+	}
+	for _, conversation := range []version.Conversation{clarification, design} {
+		if err := repo.Create(ctx, conversation); err != nil {
+			t.Fatalf("Create %s: %v", conversation.Kind, err)
+		}
+	}
+
+	items, err := repo.ListReconcilable(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListReconcilable: %v", err)
+	}
+	byID := make(map[int64]version.ReconcilerConversation, len(items))
+	for _, item := range items {
+		byID[item.ID] = item
+		if item.Messages == nil {
+			t.Fatalf("messages must be a non-nil empty slice: %#v", item)
+		}
+	}
+	if got := byID[clarification.ID]; got.Kind != version.ConversationClarification || got.VersionID != v.ID {
+		t.Fatalf("clarification row = %#v", got)
+	}
+	if got := byID[design.ID]; got.Kind != version.ConversationDesign || got.VersionID != v.ID {
+		t.Fatalf("design row = %#v", got)
+	}
+}

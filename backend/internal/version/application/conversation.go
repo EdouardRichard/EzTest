@@ -43,9 +43,9 @@ func NewConversationService(
 	}
 }
 
-// Create creates a clarification conversation and ensures the opening chat
-// task. Creating an empty conversation does not project the version to
-// running.
+// Create creates a clarification or design conversation and ensures the
+// opening chat task. Creating an empty conversation does not project the
+// version to running.
 func (s *ConversationService) Create(ctx context.Context, versionID int64, kind, title string, actorID int64) (ConversationView, error) {
 	if versionID <= 0 {
 		return ConversationView{}, platform.Invalid("id", "must be a positive decimal ID")
@@ -57,12 +57,16 @@ func (s *ConversationService) Create(ctx context.Context, versionID int64, kind,
 	if kind == "" {
 		kind = version.ConversationClarification
 	}
-	if kind != version.ConversationClarification {
-		return ConversationView{}, platform.Invalid("kind", "P1 only supports clarification conversations")
+	if err := version.ValidateConversationKind(kind); err != nil {
+		return ConversationView{}, err
 	}
 	title = strings.TrimSpace(title)
 	if title == "" {
-		title = version.DefaultConversationTitle(s.clock.Now())
+		if kind == version.ConversationDesign {
+			title = version.DefaultDesignConversationTitle(s.clock.Now())
+		} else {
+			title = version.DefaultConversationTitle(s.clock.Now())
+		}
 	}
 	if err := version.ValidateConversationTitle(title); err != nil {
 		return ConversationView{}, err
@@ -91,7 +95,7 @@ func (s *ConversationService) Create(ctx context.Context, versionID int64, kind,
 	}, map[string]any{"conversation_id": conversationIDString})
 	s.enqueue(ctx, TaskInput{
 		VersionID: versionID,
-		Team:      "clarification",
+		Team:      teamForConversationKind(kind),
 		Type:      "chat.turn",
 		DedupeKey: "opening:" + conversationIDString,
 		Payload: map[string]any{
@@ -185,7 +189,8 @@ func (s *ConversationService) PostUserMessage(ctx context.Context, versionID, co
 	if err := validateConversationIDs(versionID, conversationID); err != nil {
 		return MessageView{}, err
 	}
-	if _, _, err := s.repo.Get(ctx, versionID, conversationID); err != nil {
+	conversation, _, err := s.repo.Get(ctx, versionID, conversationID)
+	if err != nil {
 		return MessageView{}, mapConversationRepositoryError(err)
 	}
 	clientMessageID = strings.TrimSpace(clientMessageID)
@@ -199,7 +204,7 @@ func (s *ConversationService) PostUserMessage(ctx context.Context, versionID, co
 	if clientMessageID != "" {
 		existing, err := s.repo.FindMessageByClientID(ctx, conversationID, clientMessageID)
 		if err == nil && existing != nil {
-			s.ensureMessageTasks(ctx, versionID, conversationID, existing.ID)
+			s.ensureMessageTasks(ctx, versionID, conversation.Kind, conversationID, existing.ID)
 			return toMessageView(*existing), nil
 		}
 		if err != nil && !errors.Is(err, version.ErrMessageNotFound) {
@@ -228,7 +233,7 @@ func (s *ConversationService) PostUserMessage(ctx context.Context, versionID, co
 		return MessageView{}, mapConversationRepositoryError(err)
 	}
 	if !created && existing != nil {
-		s.ensureMessageTasks(ctx, versionID, conversationID, existing.ID)
+		s.ensureMessageTasks(ctx, versionID, conversation.Kind, conversationID, existing.ID)
 		return toMessageView(*existing), nil
 	}
 
@@ -246,7 +251,7 @@ func (s *ConversationService) PostUserMessage(ctx context.Context, versionID, co
 
 	s.publishMessageEvent(ctx, versionID, message)
 	s.markRunning(ctx, versionID)
-	s.ensureMessageTasks(ctx, versionID, conversationID, message.ID)
+	s.ensureMessageTasks(ctx, versionID, conversation.Kind, conversationID, message.ID)
 	return toMessageView(message), nil
 }
 
@@ -299,12 +304,13 @@ func (s *ConversationService) AppendAssistantMessageWithReply(ctx context.Contex
 
 // ---------- tasks and events ----------
 
-func (s *ConversationService) ensureMessageTasks(ctx context.Context, versionID, conversationID, messageID int64) {
+func (s *ConversationService) ensureMessageTasks(ctx context.Context, versionID int64, kind string, conversationID, messageID int64) {
 	conversationIDString := platformid.Format(conversationID)
 	messageIDString := platformid.Format(messageID)
+	team := teamForConversationKind(kind)
 	s.enqueue(ctx, TaskInput{
 		VersionID: versionID,
-		Team:      "clarification",
+		Team:      team,
 		Type:      "chat.turn",
 		DedupeKey: "reply:" + messageIDString,
 		Payload: map[string]any{
@@ -313,9 +319,14 @@ func (s *ConversationService) ensureMessageTasks(ctx context.Context, versionID,
 			"trigger":         "reply",
 		},
 	})
+	// Design conversations are handled by the design team; requirement
+	// curation belongs to clarification conversations only (P2 spec §9.1).
+	if kind == version.ConversationDesign {
+		return
+	}
 	s.enqueue(ctx, TaskInput{
 		VersionID: versionID,
-		Team:      "clarification",
+		Team:      team,
 		Type:      "requirement.curate",
 		DedupeKey: "curate:" + messageIDString,
 		Payload: map[string]any{
@@ -323,6 +334,14 @@ func (s *ConversationService) ensureMessageTasks(ctx context.Context, versionID,
 			"message_id":      messageIDString,
 		},
 	})
+}
+
+// teamForConversationKind selects the work-item team for chat tasks.
+func teamForConversationKind(kind string) string {
+	if kind == version.ConversationDesign {
+		return "design"
+	}
+	return "clarification"
 }
 
 func (s *ConversationService) enqueue(ctx context.Context, task TaskInput) {

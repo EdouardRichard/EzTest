@@ -518,3 +518,27 @@ func TestUpdateVersionSendsPartialPatch(t *testing.T) {
 		t.Fatalf("missing status = %d", missing.Code)
 	}
 }
+
+func TestVersionDTOCaseCounts(t *testing.T) {
+	handler, stub := newTestServer(t)
+	view := sampleView()
+	view.PendingDesignCount = 2
+	view.CaseCounts = versionapp.CaseCounts{Draft: 4, Confirmed: 3, Stale: 2}
+	stub.view = view
+
+	recorder := call(t, handler, http.MethodGet, "/api/versions/101", "", actor())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	data := dataBody(t, recorder)
+	if data["pending_design_count"] != float64(2) {
+		t.Fatalf("pending_design_count = %#v", data["pending_design_count"])
+	}
+	counts, ok := data["case_counts"].(map[string]any)
+	if !ok {
+		t.Fatalf("case_counts = %#v", data["case_counts"])
+	}
+	if counts["draft"] != float64(4) || counts["confirmed"] != float64(3) || counts["stale"] != float64(2) {
+		t.Fatalf("case_counts = %#v", counts)
+	}
+}

@@ -25,12 +25,19 @@ type ConversationService interface {
 
 // ConversationHandler serves the /api/versions/{id}/conversations routes.
 type ConversationHandler struct {
-	svc ConversationService
+	svc    ConversationService
+	design versionapp.DesignStarter
 }
 
-// NewConversationHandler builds the conversation handler.
-func NewConversationHandler(svc ConversationService) *ConversationHandler {
-	return &ConversationHandler{svc: svc}
+// NewConversationHandler builds the conversation handler. design may be
+// omitted in P1-only tests; when provided it is called best effort after a
+// design conversation is created (the agent reconciler is the fallback).
+func NewConversationHandler(svc ConversationService, design ...versionapp.DesignStarter) *ConversationHandler {
+	handler := &ConversationHandler{svc: svc}
+	if len(design) > 0 {
+		handler.design = design[0]
+	}
+	return handler
 }
 
 var _ ConversationService = (*versionapp.ConversationService)(nil)
@@ -86,6 +93,12 @@ func (h *ConversationHandler) Create(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
+	}
+	// Design conversations start their first round through the Planner. The
+	// call is best effort: a failure is repaired by the agent reconciler and
+	// never fails the conversation creation.
+	if view.Kind == version.ConversationDesign && h.design != nil {
+		_ = h.design.StartRound(r.Context(), versionID, view.ID, actorID)
 	}
 	httpx.JSON(w, http.StatusCreated, toConversationDTO(view))
 }

@@ -292,10 +292,16 @@ func TestCreateConversationDefaultsTitleAndEnsuresOpeningTask(t *testing.T) {
 		t.Fatalf("explicit title = %q", explicit.Title)
 	}
 
-	if _, err := env.svc.Create(requestContext(), env.versionID, "design", "", 42); err == nil {
-		t.Fatal("design conversation accepted by the P1 API")
-	} else if field := fieldName(t, err); field != "kind" {
-		t.Fatalf("field = %q", field)
+	design, err := env.svc.Create(requestContext(), env.versionID, "design", "", 42)
+	if err != nil {
+		t.Fatalf("Create design: %v", err)
+	}
+	if design.Kind != "design" || design.Title != "用例设计 2026-10-31 12:00" {
+		t.Fatalf("design = %#v", design)
+	}
+	designTask, ok := env.queue.find("chat.turn", "opening:"+idString(design.ID))
+	if !ok || designTask.Team != "design" {
+		t.Fatalf("design opening task = %#v", designTask)
 	}
 	if _, err := env.svc.Create(requestContext(), 9999, "clarification", "", 42); err == nil {
 		t.Fatal("missing version accepted")
@@ -304,6 +310,60 @@ func TestCreateConversationDefaultsTitleAndEnsuresOpeningTask(t *testing.T) {
 	}
 	if _, err := env.svc.Create(requestContext(), env.versionID, "clarification", strings.Repeat("a", 121), 42); err == nil {
 		t.Fatal("oversized title accepted")
+	}
+}
+
+func TestCreateDesignConversationAllowsDesignAndEnqueuesDesignTeam(t *testing.T) {
+	env := newConversationEnv(t)
+
+	view, err := env.svc.Create(requestContext(), env.versionID, "design", "", 42)
+	if err != nil {
+		t.Fatalf("Create design: %v", err)
+	}
+	if view.Kind != version.ConversationDesign || view.Status != version.ConversationActive {
+		t.Fatalf("view = %#v", view)
+	}
+	if view.Title != "用例设计 2026-10-31 12:00" {
+		t.Fatalf("title = %q", view.Title)
+	}
+	task, ok := env.queue.find("chat.turn", "opening:"+idString(view.ID))
+	if !ok {
+		t.Fatalf("opening task missing: %#v", env.queue.tasks)
+	}
+	if task.Team != "design" || task.VersionID != env.versionID ||
+		task.Payload["conversation_id"] != idString(view.ID) || task.Payload["trigger"] != "opening" {
+		t.Fatalf("task = %#v", task)
+	}
+	if _, ok := env.queue.find("requirement.curate", "curate:"+idString(view.ID)); ok {
+		t.Fatal("design conversation creation enqueued requirement.curate")
+	}
+	if len(env.events.events) != 1 || env.events.events[0].Payload["kind"] != "design" {
+		t.Fatalf("events = %#v", env.events.events)
+	}
+	if versionView, err := env.versionEnv.svc.Get(requestContext(), env.versionID); err != nil ||
+		versionView.Status != version.StatusInitial {
+		t.Fatalf("empty design conversation projected version to %q (%v)", versionView.Status, err)
+	}
+}
+
+func TestDesignConversationUserMessageSkipsCurateAndUsesDesignTeam(t *testing.T) {
+	env := newConversationEnv(t)
+	conversation, err := env.svc.Create(requestContext(), env.versionID, "design", "Design chat", 42)
+	if err != nil {
+		t.Fatalf("Create design: %v", err)
+	}
+	message := postUserMessage(t, env, conversation.ID, []version.MessagePart{{Type: "text", Text: "请新增异常登录用例"}}, "design-1")
+
+	replyTask, ok := env.queue.find("chat.turn", "reply:"+idString(message.ID))
+	if !ok || replyTask.Team != "design" {
+		t.Fatalf("design reply task = %#v, %v", replyTask, ok)
+	}
+	if _, ok := env.queue.find("requirement.curate", "curate:"+idString(message.ID)); ok {
+		t.Fatal("design conversation enqueued requirement.curate")
+	}
+	if versionView, err := env.versionEnv.svc.Get(requestContext(), env.versionID); err != nil ||
+		versionView.Status != version.StatusRunning {
+		t.Fatalf("design message did not project running: %q (%v)", versionView.Status, err)
 	}
 }
 

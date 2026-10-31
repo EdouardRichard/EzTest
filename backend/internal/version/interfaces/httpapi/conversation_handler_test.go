@@ -361,3 +361,64 @@ func TestConversationHandlerValidationAndErrors(t *testing.T) {
 }
 
 var _ = json.RawMessage{}
+
+type designStartCall struct {
+	versionID      int64
+	conversationID int64
+	actorID        int64
+}
+
+type stubDesignStarter struct {
+	calls []designStartCall
+	err   error
+}
+
+func (s *stubDesignStarter) StartRound(_ context.Context, versionID, conversationID, actorID int64) error {
+	s.calls = append(s.calls, designStartCall{versionID: versionID, conversationID: conversationID, actorID: actorID})
+	return s.err
+}
+
+func TestConversationHandlerCallsStartRoundForDesignConversation(t *testing.T) {
+	stub := &stubConversationService{}
+	view := sampleConversationView()
+	view.Kind = "design"
+	view.Title = "用例设计 2026-10-31 12:00"
+	stub.conversation = view
+	starter := &stubDesignStarter{}
+	handler := versionapi.NewConversationHandler(stub, starter)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/versions/{id}/conversations", handler.Create)
+
+	recorder := call(t, mux, http.MethodPost, "/api/versions/101/conversations", `{"kind":"design"}`, actor())
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if stub.lastKind != "design" {
+		t.Fatalf("kind = %q", stub.lastKind)
+	}
+	if len(starter.calls) != 1 {
+		t.Fatalf("StartRound calls = %#v", starter.calls)
+	}
+	if call := starter.calls[0]; call.versionID != 101 || call.conversationID != 8001 || call.actorID != 42 {
+		t.Fatalf("StartRound call = %#v", call)
+	}
+
+	// Planner failure is best effort: the conversation is still created.
+	starter.err = platform.Unavailable("planner")
+	if recorder := call(t, mux, http.MethodPost, "/api/versions/101/conversations", `{"kind":"design"}`, actor()); recorder.Code != http.StatusCreated {
+		t.Fatalf("status after StartRound failure = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if len(starter.calls) != 2 {
+		t.Fatalf("StartRound calls = %d", len(starter.calls))
+	}
+
+	// Clarification conversations keep the P1 behaviour: no Planner call.
+	stub.conversation = sampleConversationView()
+	if recorder := call(t, mux, http.MethodPost, "/api/versions/101/conversations", `{"kind":"clarification"}`, actor()); recorder.Code != http.StatusCreated {
+		t.Fatalf("clarification status = %d", recorder.Code)
+	}
+	if len(starter.calls) != 2 {
+		t.Fatalf("clarification triggered StartRound: %#v", starter.calls)
+	}
+}

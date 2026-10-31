@@ -21,9 +21,17 @@ type versionDTO struct {
 	RequirementCounts         requirementCountsDTO `json:"requirement_counts"`
 	ConversationCount         int                  `json:"conversation_count"`
 	PendingDesignCount        int                  `json:"pending_design_count"`
+	CaseCounts                caseCountsDTO        `json:"case_counts"`
 	CreatedBy                 string               `json:"created_by"`
 	CreatedAt                 string               `json:"created_at"`
 	UpdatedAt                 string               `json:"updated_at"`
+}
+
+// caseCountsDTO is the P2 version-detail increment (current versions only).
+type caseCountsDTO struct {
+	Draft     int `json:"draft"`
+	Confirmed int `json:"confirmed"`
+	Stale     int `json:"stale"`
 }
 
 // requirementCountsDTO is the P1 version-detail increment.
@@ -170,9 +178,14 @@ func toVersionDTO(view versionapp.VersionView) versionDTO {
 		},
 		ConversationCount:  view.ConversationCount,
 		PendingDesignCount: view.PendingDesignCount,
-		CreatedBy:          strconv.FormatInt(view.CreatedBy, 10),
-		CreatedAt:          formatTime(view.CreatedAt),
-		UpdatedAt:          formatTime(view.UpdatedAt),
+		CaseCounts: caseCountsDTO{
+			Draft:     view.CaseCounts.Draft,
+			Confirmed: view.CaseCounts.Confirmed,
+			Stale:     view.CaseCounts.Stale,
+		},
+		CreatedBy: strconv.FormatInt(view.CreatedBy, 10),
+		CreatedAt: formatTime(view.CreatedAt),
+		UpdatedAt: formatTime(view.UpdatedAt),
 	}
 }
 
