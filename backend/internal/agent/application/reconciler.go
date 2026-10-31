@@ -14,25 +14,35 @@ import (
 // reconcilerLimit bounds how many rows each reconciliation rule scans per pass.
 const reconcilerLimit = 100
 
-// ReconcilerDeps wires the P1 reconciler. It only ensures work items and never
-// executes business actions.
+// DesignReconciler is the P2 design control-plane surface run by the agent
+// reconciler on every pass (designapp.Planner implements it). It must be
+// idempotent: repeated scans never add duplicate scopes/rounds/tasks.
+type DesignReconciler interface {
+	Reconcile(ctx context.Context) error
+}
+
+// ReconcilerDeps wires the P1+P2 reconciler. It only ensures work items and
+// never executes business actions.
 type ReconcilerDeps struct {
 	Versions      VersionProjector
 	Conversations ConversationReader
 	Attachments   PendingAttachmentReader
+	Design        DesignReconciler
 	Queue         WorkQueueEnsurer
 	Events        eventingapp.Publisher
 	Clock         clock.Clock
 	Logger        *slog.Logger
 }
 
-// Reconciler periodically repairs the P1 control plane: version projection,
-// conversation opening/reply/curate tasks and attachment ingest tasks. Every
-// ensure uses a dedupe key, so repeated scans never add duplicate work.
+// Reconciler periodically repairs the control plane: version projection,
+// conversation opening/reply/curate tasks, attachment ingest tasks and the P2
+// design planner scan. Every ensure uses a dedupe key, so repeated scans never
+// add duplicate work.
 type Reconciler struct {
 	versions      VersionProjector
 	conversations ConversationReader
 	attachments   PendingAttachmentReader
+	design        DesignReconciler
 	queue         WorkQueueEnsurer
 	events        eventingapp.Publisher
 	clock         clock.Clock
@@ -50,6 +60,7 @@ func NewReconciler(deps ReconcilerDeps) *Reconciler {
 		versions:      deps.Versions,
 		conversations: deps.Conversations,
 		attachments:   deps.Attachments,
+		design:        deps.Design,
 		queue:         deps.Queue,
 		events:        deps.Events,
 		clock:         deps.Clock,
@@ -74,7 +85,23 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	if err := r.reconcileAttachments(ctx); err != nil {
 		errs = append(errs, err)
 	}
+	if err := r.reconcileDesign(ctx); err != nil {
+		errs = append(errs, err)
+	}
 	return errors.Join(errs...)
+}
+
+// reconcileDesign runs the design Planner scan (auto-design, pending scopes,
+// critic/data-plan derivation and the stale safety net). The design reconciler
+// is optional so P1-only wiring keeps starting.
+func (r *Reconciler) reconcileDesign(ctx context.Context) error {
+	if r.design == nil {
+		return nil
+	}
+	if err := r.design.Reconcile(ctx); err != nil {
+		return fmt.Errorf("design reconcile: %w", err)
+	}
+	return nil
 }
 
 // projectVersions moves versions with content from initial to running. The

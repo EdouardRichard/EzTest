@@ -2,6 +2,7 @@ package agentapp_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"sync"
@@ -57,6 +58,25 @@ type fakePendingAttachments struct {
 
 func (r *fakePendingAttachments) ListPendingAttachments(context.Context, int) ([]agentapp.PendingAttachment, error) {
 	return r.attachments, r.err
+}
+
+type fakeDesignReconciler struct {
+	mu    sync.Mutex
+	calls int
+	err   error
+}
+
+func (r *fakeDesignReconciler) Reconcile(context.Context) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls++
+	return r.err
+}
+
+func (r *fakeDesignReconciler) callCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
 }
 
 type fakeEnsurer struct {
@@ -134,6 +154,7 @@ type reconcilerFixture struct {
 	projector     *fakeProjector
 	conversations *fakeConversationReader
 	attachments   *fakePendingAttachments
+	design        *fakeDesignReconciler
 	queue         *fakeEnsurer
 	events        *fakePublisher
 }
@@ -144,6 +165,7 @@ func newReconcilerFixture(t *testing.T) *reconcilerFixture {
 		projector:     &fakeProjector{},
 		conversations: &fakeConversationReader{},
 		attachments:   &fakePendingAttachments{},
+		design:        &fakeDesignReconciler{},
 		queue:         &fakeEnsurer{},
 		events:        &fakePublisher{},
 	}
@@ -151,6 +173,7 @@ func newReconcilerFixture(t *testing.T) *reconcilerFixture {
 		Versions:      fixture.projector,
 		Conversations: fixture.conversations,
 		Attachments:   fixture.attachments,
+		Design:        fixture.design,
 		Queue:         fixture.queue,
 		Events:        fixture.events,
 		Clock:         &manualClock{now: runnerClockStart},
@@ -385,8 +408,52 @@ func TestReconcilerDesignConversationsSkipCurateAndUseDesignTeam(t *testing.T) {
 	}
 }
 
+func TestReconcilerCallsDesignReconcilerEveryPass(t *testing.T) {
+	fixture := newReconcilerFixture(t)
+	for i := 0; i < 2; i++ {
+		if err := fixture.reconciler.Reconcile(context.Background()); err != nil {
+			t.Fatalf("Reconcile %d: %v", i, err)
+		}
+	}
+	if calls := fixture.design.callCount(); calls != 2 {
+		t.Fatalf("design reconciler calls = %d, want one per pass", calls)
+	}
+}
+
+func TestReconcilerJoinsDesignReconcilerErrorAndKeepsOtherRules(t *testing.T) {
+	fixture := newReconcilerFixture(t)
+	designErr := errors.New("design store down")
+	fixture.design.err = designErr
+	fixture.projector.initial = []int64{10}
+
+	err := fixture.reconciler.Reconcile(context.Background())
+	if err == nil {
+		t.Fatal("design reconciler error was swallowed")
+	}
+	if !errors.Is(err, designErr) {
+		t.Fatalf("joined error = %v, want design error", err)
+	}
+	if calls := fixture.design.callCount(); calls != 1 {
+		t.Fatalf("design reconciler calls = %d", calls)
+	}
+	// Earlier rules still ran in the same pass (errors are aggregated).
+	if len(fixture.projector.marked) != 1 || fixture.projector.marked[0] != 10 {
+		t.Fatalf("version projection = %v", fixture.projector.marked)
+	}
+}
+
+func TestReconcilerIsNilSafeWithoutDesignReconciler(t *testing.T) {
+	reconciler := agentapp.NewReconciler(agentapp.ReconcilerDeps{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err := reconciler.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile without a design reconciler: %v", err)
+	}
+}
+
 var _ agentapp.VersionProjector = (*fakeProjector)(nil)
 var _ agentapp.ConversationReader = (*fakeConversationReader)(nil)
 var _ agentapp.PendingAttachmentReader = (*fakePendingAttachments)(nil)
+var _ agentapp.DesignReconciler = (*fakeDesignReconciler)(nil)
 var _ agentapp.WorkQueueEnsurer = (*fakeEnsurer)(nil)
 var _ = time.Second
