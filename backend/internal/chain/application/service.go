@@ -1,0 +1,214 @@
+package chainapp
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	chain "github.com/EdouardRichard/EzTest/backend/internal/chain/domain"
+)
+
+// Clock is the injectable time source of the chain service.
+type Clock interface {
+	Now() time.Time
+}
+
+type systemClock struct{}
+
+func (systemClock) Now() time.Time { return time.Now() }
+
+// ChainService serves the read-only exploration-chain view. It assembles the
+// provider nodes, applies the requested filter/budget in the domain builder,
+// and stamps the version and replay metadata owned by the service.
+type ChainService struct {
+	version   VersionChainProvider
+	design    DesignChainProvider
+	execution ExecutionChainProvider
+	delivery  DeliveryChainProvider
+	resource  ResourceChainProvider
+	cursor    CursorReader
+	clock     Clock
+}
+
+// NewChainService wires the five chain providers, the snapshot-cursor reader
+// and the clock. A nil clock falls back to the system clock.
+func NewChainService(
+	version VersionChainProvider,
+	design DesignChainProvider,
+	execution ExecutionChainProvider,
+	delivery DeliveryChainProvider,
+	resource ResourceChainProvider,
+	cursor CursorReader,
+	clock Clock,
+) *ChainService {
+	if clock == nil {
+		clock = systemClock{}
+	}
+	return &ChainService{
+		version:   version,
+		design:    design,
+		execution: execution,
+		delivery:  delivery,
+		resource:  resource,
+		cursor:    cursor,
+		clock:     clock,
+	}
+}
+
+// Read returns the exploration chain of one version (spec §8.2–§8.4). The
+// filter is normalized once; event-range replay is reported as approximate
+// because P4 never promises an arbitrary as-of snapshot.
+func (s *ChainService) Read(ctx context.Context, versionID int64, f chain.ChainFilter) (chain.ChainView, error) {
+	if versionID <= 0 {
+		return chain.ChainView{}, fmt.Errorf("chain: version_id must be positive: %d", versionID)
+	}
+	f = f.Normalize()
+	budget := chain.ClampBudget(chain.Budget{})
+
+	requirements, err := s.version.Requirements(ctx, versionID, budget.MaxRequirements)
+	if err != nil {
+		return chain.ChainView{}, providerError("load requirements", err)
+	}
+	versionSUTs, err := s.version.VersionSUTs(ctx, versionID)
+	if err != nil {
+		return chain.ChainView{}, providerError("load version SUTs", err)
+	}
+	scenarios, err := s.design.Scenarios(ctx, versionID)
+	if err != nil {
+		return chain.ChainView{}, providerError("load scenarios", err)
+	}
+	cases, err := s.design.Cases(ctx, versionID)
+	if err != nil {
+		return chain.ChainView{}, providerError("load cases", err)
+	}
+	waves, err := s.execution.Waves(ctx, versionID)
+	if err != nil {
+		return chain.ChainView{}, providerError("load waves", err)
+	}
+	caseRuns, err := s.execution.CaseRuns(ctx, versionID)
+	if err != nil {
+		return chain.ChainView{}, providerError("load case runs", err)
+	}
+	if missing := missingCaseVersionIDs(cases, caseRuns); len(missing) > 0 {
+		historical, err := s.design.CaseVersionsByIDs(ctx, versionID, missing)
+		if err != nil {
+			return chain.ChainView{}, providerError("load historical case versions", err)
+		}
+		cases = append(cases, historical...)
+	}
+	issues, err := s.delivery.Issues(ctx, versionID)
+	if err != nil {
+		return chain.ChainView{}, providerError("load issues", err)
+	}
+	reports, err := s.delivery.Reports(ctx, versionID)
+	if err != nil {
+		return chain.ChainView{}, providerError("load reports", err)
+	}
+	closures, err := s.delivery.Closures(ctx, versionID)
+	if err != nil {
+		return chain.ChainView{}, providerError("load closures", err)
+	}
+	sutNames, err := s.resource.SUTNames(ctx, versionID)
+	if err != nil {
+		return chain.ChainView{}, providerError("load SUT names", err)
+	}
+	pageNames, err := s.resource.PageNames(ctx, versionID)
+	if err != nil {
+		return chain.ChainView{}, providerError("load page names", err)
+	}
+	cursor, err := s.cursor.LatestCursor(ctx, versionChannel(versionID))
+	if err != nil {
+		return chain.ChainView{}, providerError("load snapshot cursor", err)
+	}
+
+	view := chain.BuildChain(chain.SourceGraph{
+		Requirements: requirements,
+		Scenarios:    scenarios,
+		Cases:        cases,
+		Waves:        waves,
+		CaseRuns:     caseRuns,
+		Issues:       issues,
+		Reports:      reports,
+		Closures:     closures,
+		SUTs:         mergeSUTNames(versionSUTs, sutNames),
+		Pages:        nonNilNames(pageNames),
+	}, f, budget, cursor, s.clock.Now())
+	view.VersionID = strconv.FormatInt(versionID, 10)
+	return view, nil
+}
+
+func providerError(operation string, err error) error {
+	return fmt.Errorf("chain: %s: %w", operation, err)
+}
+
+func versionChannel(versionID int64) string {
+	return "version:" + strconv.FormatInt(versionID, 10)
+}
+
+// missingCaseVersionIDs lists the case versions referenced by case runs but not
+// returned by the current-case reader. The design provider's historical reader
+// resolves them so superseded rows keep their titles in the chain.
+func missingCaseVersionIDs(cases, caseRuns []chain.Node) []int64 {
+	known := make(map[int64]bool, len(cases))
+	for _, node := range cases {
+		if id, ok := nodeRefID(node); ok {
+			known[id] = true
+		}
+	}
+	missing := map[int64]bool{}
+	for _, node := range caseRuns {
+		if node.CaseVersionID == nil || *node.CaseVersionID <= 0 {
+			continue
+		}
+		if !known[*node.CaseVersionID] {
+			missing[*node.CaseVersionID] = true
+		}
+	}
+	ids := make([]int64, 0, len(missing))
+	for id := range missing {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
+// mergeSUTNames builds the version-SUT-ID label map. VersionSUT nodes provide
+// the binding labels, resource SUT names refine them (they win on conflict).
+func mergeSUTNames(versionSUTs []chain.Node, names map[int64]string) map[int64]string {
+	out := make(map[int64]string, len(versionSUTs)+len(names))
+	for _, node := range versionSUTs {
+		id, ok := nodeRefID(node)
+		if !ok || node.Label == "" {
+			continue
+		}
+		out[id] = node.Label
+	}
+	for id, name := range names {
+		if id > 0 && name != "" {
+			out[id] = name
+		}
+	}
+	return out
+}
+
+func nodeRefID(node chain.Node) (int64, bool) {
+	if id, err := strconv.ParseInt(strings.TrimSpace(node.RefID), 10, 64); err == nil && id > 0 {
+		return id, true
+	}
+	if index := strings.LastIndex(node.ID, ":"); index >= 0 {
+		if id, err := strconv.ParseInt(strings.TrimSpace(node.ID[index+1:]), 10, 64); err == nil && id > 0 {
+			return id, true
+		}
+	}
+	return 0, false
+}
+
+func nonNilNames(names map[int64]string) map[int64]string {
+	if names == nil {
+		return map[int64]string{}
+	}
+	return names
+}
