@@ -1,118 +1,166 @@
 "use client"
 
-import {
-  createContext,
-  type ReactNode,
-  useCallback,
-  useContext,
-  useEffect,
-  useMemo,
-  useState,
-} from "react"
+import { useRouter } from "next/navigation"
+import type { ReactNode } from "react"
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react"
 
+import { LoadingCard } from "@/components/ui/Spinner"
+import { ApiError, apiGet, apiPost } from "@/lib/api-client"
 import {
   AUTH_CLEARED_EVENT,
   type AuthUser,
   clearSession,
-  getStoredUser,
   getToken,
   setSession,
-  setStoredUser,
+  toAuthUser,
 } from "@/lib/auth-storage"
 
-import { fetchMe, loginRequest, logoutRequest } from "./auth-api"
+export type User = AuthUser
 
 export type AuthContextValue = {
-  user: AuthUser | null
-  loading: boolean
+  user: User | null
+  token: string | null
   login: (username: string, password: string) => Promise<void>
+  changePassword: (oldPassword: string, newPassword: string) => Promise<void>
   logout: () => Promise<void>
+  loading: boolean
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null)
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function readUserPayload(payload: unknown): User | null {
+  if (isRecord(payload) && isRecord(payload.user)) return toAuthUser(payload.user)
+  return toAuthUser(payload)
+}
+
+function readSessionPayload(payload: unknown): { token: string; user: User } | null {
+  if (!isRecord(payload)) return null
+  const token = typeof payload.token === "string" ? payload.token : ""
+  const user = readUserPayload(payload)
+  if (token.length === 0 || user === null) return null
+  return { token, user }
+}
+
+function invalidResponse(message: string): ApiError {
+  return new ApiError({ status: 200, code: "invalid_response", message, retryable: false })
+}
+
 /**
- * Holds the current session in memory and mirrors the token + public user in
- * sessionStorage. It never stores credentials or password material.
+ * Owns the browser session: restores it through `GET /api/auth/me`, exposes the
+ * auth commands, and reacts to a session cleared by api-client/sse-client 401s.
  */
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [user, setUser] = useState<AuthUser | null>(null)
+  const [user, setUser] = useState<User | null>(null)
+  const [token, setToken] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    let cancelled = false
-
-    async function restore() {
-      if (!getToken()) {
-        if (!cancelled) setLoading(false)
-        return
-      }
-
-      const cached = getStoredUser()
-      if (cached) {
-        if (!cancelled) {
-          setUser(cached)
-          setLoading(false)
-        }
-        return
-      }
-
-      try {
-        const me = await fetchMe()
-        if (!cancelled) {
-          setUser(me)
-          setStoredUser(me)
-        }
-      } catch {
-        if (!cancelled) clearSession()
-      } finally {
-        if (!cancelled) setLoading(false)
-      }
-    }
-
-    void restore()
-
-    const handleCleared = () => {
-      setUser(null)
+    let active = true
+    const storedToken = getToken()
+    if (storedToken === null) {
       setLoading(false)
+      return () => {
+        active = false
+      }
     }
-    window.addEventListener(AUTH_CLEARED_EVENT, handleCleared)
+
+    setToken(storedToken)
+    void (async () => {
+      try {
+        const payload = await apiGet<unknown>("/api/auth/me")
+        const nextUser = readUserPayload(payload)
+        if (!active) return
+        if (nextUser === null) throw invalidResponse("会话响应缺少用户信息")
+        setUser(nextUser)
+      } catch {
+        if (!active) return
+        clearSession()
+        setUser(null)
+        setToken(null)
+      } finally {
+        if (active) setLoading(false)
+      }
+    })()
+
     return () => {
-      cancelled = true
-      window.removeEventListener(AUTH_CLEARED_EVENT, handleCleared)
+      active = false
     }
   }, [])
 
+  useEffect(() => {
+    const onCleared = () => {
+      setUser(null)
+      setToken(null)
+      setLoading(false)
+    }
+    window.addEventListener(AUTH_CLEARED_EVENT, onCleared)
+    return () => window.removeEventListener(AUTH_CLEARED_EVENT, onCleared)
+  }, [])
+
   const login = useCallback(async (username: string, password: string) => {
-    const result = await loginRequest(username, password)
-    setSession(result.token, result.user)
-    setUser(result.user)
-    setLoading(false)
+    const payload = await apiPost<unknown>("/api/auth/login", { username, password })
+    const session = readSessionPayload(payload)
+    if (session === null) throw invalidResponse("登录响应缺少令牌或用户信息")
+
+    setSession(session.token, session.user)
+    setToken(session.token)
+    setUser(session.user)
+  }, [])
+
+  const changePassword = useCallback(async (oldPassword: string, newPassword: string) => {
+    await apiPost("/api/auth/password", {
+      old_password: oldPassword,
+      new_password: newPassword,
+    })
   }, [])
 
   const logout = useCallback(async () => {
     try {
-      await logoutRequest()
+      await apiPost("/api/auth/logout")
     } catch {
-      // The server session may already be gone; the local session is still
-      // cleared so the user always ends up signed out.
+      // A revoked/expired token must not keep the browser signed in.
     } finally {
       clearSession()
       setUser(null)
-      setLoading(false)
+      setToken(null)
     }
   }, [])
 
   const value = useMemo<AuthContextValue>(
-    () => ({ user, loading, login, logout }),
-    [user, loading, login, logout],
+    () => ({ user, token, login, changePassword, logout, loading }),
+    [user, token, login, changePassword, logout, loading],
   )
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }
 
 export function useAuth(): AuthContextValue {
-  const context = useContext(AuthContext)
-  if (!context) throw new Error("useAuth must be used inside AuthProvider")
-  return context
+  const value = useContext(AuthContext)
+  if (value === null) throw new Error("useAuth must be used inside AuthProvider")
+  return value
+}
+
+/** Redirects signed-out visitors to /login and blocks protected content. */
+export function RequireAuth({ children }: { children: ReactNode }) {
+  const { loading, token } = useAuth()
+  const router = useRouter()
+
+  useEffect(() => {
+    if (!loading && token === null) router.replace("/login")
+  }, [loading, token, router])
+
+  if (loading) {
+    return (
+      <div className="flex min-h-screen items-center justify-center">
+        <LoadingCard label="正在验证会话…" />
+      </div>
+    )
+  }
+
+  if (token === null) return null
+  return <>{children}</>
 }

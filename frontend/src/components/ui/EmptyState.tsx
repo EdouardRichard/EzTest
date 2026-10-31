@@ -1,35 +1,35 @@
-import type { LucideIcon } from "lucide-react"
+import { Inbox } from "lucide-react"
 import type { ReactNode } from "react"
 
-import { cn } from "@/lib/utils"
+import { cn } from "./cn"
 
-type EmptyStateProps = {
-  icon: LucideIcon
+export type EmptyStateProps = {
   title: string
-  description?: string
+  description?: ReactNode
   action?: ReactNode
+  icon?: ReactNode
   className?: string
 }
 
-/** Shared empty/planned state used by placeholder routes and panels. */
-export function EmptyState({ icon: Icon, title, description, action, className }: EmptyStateProps) {
+export function EmptyState({ title, description, action, icon, className }: EmptyStateProps) {
   return (
     <div
       className={cn(
-        "flex flex-col items-center justify-center rounded-2xl border border-dashed bg-card/60 px-6 py-12 text-center",
+        "flex flex-col items-center justify-center gap-3 rounded-xl border border-dashed",
+        "border-border bg-card/60 px-6 py-12 text-center",
         className,
       )}
     >
-      <span className="grid h-12 w-12 place-items-center rounded-2xl bg-muted text-muted-foreground">
-        <Icon className="h-5 w-5" aria-hidden="true" />
-      </span>
-      <h2 className="mt-4 text-base font-semibold tracking-tight">{title}</h2>
-      {description ? (
-        <p className="mt-1.5 max-w-md text-sm leading-relaxed text-muted-foreground">
-          {description}
-        </p>
-      ) : null}
-      {action ? <div className="mt-5">{action}</div> : null}
+      <div className="flex size-10 items-center justify-center rounded-full bg-muted text-muted-foreground">
+        {icon ?? <Inbox className="size-5" aria-hidden="true" />}
+      </div>
+      <div className="space-y-1">
+        <p className="text-sm font-semibold text-foreground">{title}</p>
+        {description ? (
+          <p className="max-w-md text-xs leading-relaxed text-muted-foreground">{description}</p>
+        ) : null}
+      </div>
+      {action ? <div className="pt-1">{action}</div> : null}
     </div>
   )
 }

@@ -1,6 +1,11 @@
-import { QualityPage } from "@/features/quality/QualityPage"
+import type { Metadata } from "next"
 
-/** `/quality` route: the admin evaluation dashboard (spec §9.1/§12 #28). */
-export default function QualityRoutePage() {
-  return <QualityPage />
+import { PlaceholderPage } from "@/components/placeholder-page"
+
+export const metadata: Metadata = { title: "质量" }
+
+export default function QualityPage() {
+  return (
+    <PlaceholderPage title="质量" phase="P1" description="质量度量、门禁策略与测试覆盖趋势。" />
+  )
 }
