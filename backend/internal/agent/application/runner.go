@@ -53,7 +53,11 @@ type RunnerDeps struct {
 	// RunCanceller registers P3 run cancellation for pause/cancel/human
 	// takeover. It may be nil for P1/P2-only deployments.
 	RunCanceller RunCanceller
-	InstanceID   string
+	// ReportFinalizer verifies the published revision of report.wave/
+	// report.version runs (spec §4.4). It may be nil for deployments without the
+	// P4 report worker, but a report task then fails as a configuration error.
+	ReportFinalizer ReportFinalizer
+	InstanceID      string
 }
 
 // Runner executes one work item as an agent run: context packet, bounded model
@@ -61,45 +65,47 @@ type RunnerDeps struct {
 // deletes or closes a requirement; the model can only submit drafts and
 // proposals through the scoped tools.
 type Runner struct {
-	repo         agent.RuntimeRepository
-	chat         llmapp.ChatGateway
-	settings     SettingsReader
-	clock        clock.Clock
-	ids          id.Generator
-	events       eventingapp.Publisher
-	audit        auditapp.Recorder
-	conversation ConversationPort
-	versions     VersionReader
-	attachments  AttachmentReader
-	teamRoom     TeamRoomPort
-	content      ContentWriter
-	toolDeps     tools.Deps
-	taskProvider TaskContextProvider
-	runCanceller RunCanceller
-	instanceID   string
-	builder      *ContextBuilder
+	repo            agent.RuntimeRepository
+	chat            llmapp.ChatGateway
+	settings        SettingsReader
+	clock           clock.Clock
+	ids             id.Generator
+	events          eventingapp.Publisher
+	audit           auditapp.Recorder
+	conversation    ConversationPort
+	versions        VersionReader
+	attachments     AttachmentReader
+	teamRoom        TeamRoomPort
+	content         ContentWriter
+	toolDeps        tools.Deps
+	taskProvider    TaskContextProvider
+	runCanceller    RunCanceller
+	reportFinalizer ReportFinalizer
+	instanceID      string
+	builder         *ContextBuilder
 }
 
 // NewRunner wires the agent runner.
 func NewRunner(deps RunnerDeps) *Runner {
 	return &Runner{
-		repo:         deps.Runtime,
-		chat:         deps.Chat,
-		settings:     deps.Settings,
-		clock:        deps.Clock,
-		ids:          deps.IDs,
-		events:       deps.Events,
-		audit:        deps.Audit,
-		conversation: deps.Conversation,
-		versions:     deps.Versions,
-		attachments:  deps.Attachments,
-		teamRoom:     deps.TeamRoom,
-		content:      deps.Content,
-		toolDeps:     deps.ToolDeps,
-		taskProvider: deps.TaskProvider,
-		runCanceller: deps.RunCanceller,
-		instanceID:   deps.InstanceID,
-		builder:      NewContextBuilder(deps.Settings, NewLLMSummarizer(deps.Chat)),
+		repo:            deps.Runtime,
+		chat:            deps.Chat,
+		settings:        deps.Settings,
+		clock:           deps.Clock,
+		ids:             deps.IDs,
+		events:          deps.Events,
+		audit:           deps.Audit,
+		conversation:    deps.Conversation,
+		versions:        deps.Versions,
+		attachments:     deps.Attachments,
+		teamRoom:        deps.TeamRoom,
+		content:         deps.Content,
+		toolDeps:        deps.ToolDeps,
+		taskProvider:    deps.TaskProvider,
+		runCanceller:    deps.RunCanceller,
+		reportFinalizer: deps.ReportFinalizer,
+		instanceID:      deps.InstanceID,
+		builder:         NewContextBuilder(deps.Settings, NewLLMSummarizer(deps.Chat)),
 	}
 }
 
@@ -399,7 +405,45 @@ func (r *Runner) Run(ctx context.Context, item agent.WorkItem) (RunResult, error
 	if err := r.writeOutputs(runCtx, state, finalText); err != nil {
 		return r.fail(runCtx, state, err)
 	}
+	// report.wave/report.version only complete when the targeted revision is
+	// published; a missing published revision is a retryable task failure.
+	if err := r.finalizeReport(runCtx, state); err != nil {
+		return r.fail(runCtx, state, err)
+	}
 	return r.finish(state, agent.AgentRunDone, "", false)
+}
+
+// finalizeReport runs the report finalizer hook for report tasks. It is a
+// no-op for every other work type: only report.wave/report.version own a report
+// revision whose publication gates the task (spec §4.4/§6.5).
+func (r *Runner) finalizeReport(ctx context.Context, state *runState) error {
+	switch state.item.Type {
+	case WorkTypeReportWave, WorkTypeReportVersion:
+	default:
+		return nil
+	}
+	if r.reportFinalizer == nil {
+		return &RunError{
+			Reason:    "tool_failure",
+			Retryable: false,
+			Cause:     errors.New("agent runner has no report finalizer"),
+		}
+	}
+	if state.payload.ReportID <= 0 || state.payload.ReportRevision <= 0 {
+		return &RunError{
+			Reason:    "invalid_payload",
+			Retryable: false,
+			Cause:     errors.New("report task payload has no report_id/revision"),
+		}
+	}
+	if err := r.reportFinalizer.Finalize(ctx, state.payload.ReportID, state.payload.ReportRevision); err != nil {
+		return &RunError{
+			Reason:    "report_finalize_failed",
+			Retryable: true,
+			Cause:     err,
+		}
+	}
+	return nil
 }
 
 func (r *Runner) createRun(ctx context.Context, item agent.WorkItem, profile agent.AgentProfile, payload WorkItemPayload) (agent.AgentRun, error) {
@@ -776,10 +820,11 @@ func (r *Runner) handleOverflow(ctx context.Context, state *runState) error {
 // Scout/Case Author/Design Critic/Data Planner team-room updates.
 func (r *Runner) writeOutputs(ctx context.Context, state *runState, finalText string) error {
 	switch state.profile.Key {
-	case ProfileKeyCaseExecutor, ProfileKeyFailureAnalyst, ProfileKeyCoverageAnalyst:
-		// P3 execution profiles persist their results through the execution
-		// tools (step/assertion/evidence/analysis); the final message is not a
-		// persisted artifact, so an empty reply is not a run failure.
+	case ProfileKeyCaseExecutor, ProfileKeyFailureAnalyst, ProfileKeyCoverageAnalyst,
+		ProfileKeyIssueTriager, ProfileKeyReportWriter:
+		// P3/P4 profiles persist their results through the scoped tools (or the
+		// report finalizer); the final message is not a persisted artifact, so
+		// an empty reply is not a run failure.
 		return nil
 	case ProfileKeyClarificationHost:
 		if finalText == "" {
