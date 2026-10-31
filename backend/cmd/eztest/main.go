@@ -351,14 +351,42 @@ func (a executionSUTContexts) ListAll(ctx context.Context) ([]execution.CaseRunS
 
 var _ executionapp.SUTContextRepository = executionSUTContexts{}
 
-// runExecutionScheduler drives the deterministic wave planner and the recovery
-// sweep every second (P3 §5.2/§5.5). Errors are logged and retried; the loops
-// exit with the process context.
-func runExecutionScheduler(ctx context.Context, scheduler *executionapp.Scheduler, recovery *executionapp.Recovery) {
-	if scheduler == nil && recovery == nil {
+// runExecutionScheduler drives the deterministic intent scan, wave planner and
+// recovery sweep. Intent generation scans version content every few seconds
+// because case confirmations can arrive without an execution event; the scan is
+// idempotent (P3 §5.1). Errors are logged and retried; the loops exit with the
+// process context.
+func runExecutionScheduler(
+	ctx context.Context,
+	intents *executionapp.IntentService,
+	versions *versionapp.Service,
+	scheduler *executionapp.Scheduler,
+	recovery *executionapp.Recovery,
+) {
+	if scheduler == nil && recovery == nil && intents == nil {
 		return
 	}
-	tick := func() {
+	scanIntents := func() {
+		if intents == nil || versions == nil {
+			return
+		}
+		summaries, _, err := versions.List(ctx, 100, nil)
+		if err != nil {
+			if !errors.Is(err, context.Canceled) {
+				log.Printf("eztest: execution intent scan: list versions: %v", err)
+			}
+			return
+		}
+		for _, summary := range summaries {
+			if _, err := intents.EnsureInitialIntents(ctx, summary.ID); err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("eztest: execution intent scan: version %d: %v", summary.ID, err)
+			}
+		}
+	}
+	tick := func(scan bool) {
+		if scan {
+			scanIntents()
+		}
 		if scheduler != nil {
 			if err := scheduler.Reconcile(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				log.Printf("eztest: execution scheduler: %v", err)
@@ -370,15 +398,17 @@ func runExecutionScheduler(ctx context.Context, scheduler *executionapp.Schedule
 			}
 		}
 	}
-	tick()
+	tick(true)
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	ticks := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			tick()
+			ticks++
+			tick(ticks%5 == 0)
 		}
 	}
 }
@@ -720,7 +750,7 @@ func main() {
 	background.Add(1)
 	go func() {
 		defer background.Done()
-		runExecutionScheduler(ctx, executionScheduler, executionRecovery)
+		runExecutionScheduler(ctx, executionIntents, versionSvc, executionScheduler, executionRecovery)
 	}()
 	background.Add(1)
 	go func() {
