@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest"
 
-import { formatBytes, formatDate, formatDateTime, formatRelativeTime } from "./format"
+import {
+  formatBytes,
+  formatDate,
+  formatDateTime,
+  formatDuration,
+  formatRelativeTime,
+} from "./format"
 
 const pad = (value: number) => String(value).padStart(2, "0")
 const localDateTime = (date: Date) =>
@@ -70,5 +76,36 @@ describe("formatBytes", () => {
   it("returns a dash for invalid input", () => {
     expect(formatBytes(-1)).toBe("—")
     expect(formatBytes(Number.NaN)).toBe("—")
+  })
+})
+
+describe("formatDuration", () => {
+  it("formats step durations in seconds with one decimal", () => {
+    expect(formatDuration(0)).toBe("0.0s")
+    expect(formatDuration(840)).toBe("0.8s")
+    expect(formatDuration(8400)).toBe("8.4s")
+    expect(formatDuration(59_400)).toBe("59.4s")
+  })
+
+  it("formats minute-scale durations as `1m 02s`", () => {
+    expect(formatDuration(60_000)).toBe("1m 00s")
+    expect(formatDuration(62_000)).toBe("1m 02s")
+    expect(formatDuration(3_599_000)).toBe("59m 59s")
+  })
+
+  it("rounds the seconds field and carries into minutes", () => {
+    expect(formatDuration(59_960)).toBe("1m 00s")
+  })
+
+  it("formats hour-scale durations as `1h 02m`", () => {
+    expect(formatDuration(3_600_000)).toBe("1h 00m")
+    expect(formatDuration(3_723_000)).toBe("1h 02m")
+    expect(formatDuration(8 * 3_600_000 + 5 * 60_000)).toBe("8h 05m")
+  })
+
+  it("returns a dash for invalid input", () => {
+    expect(formatDuration(-1)).toBe("—")
+    expect(formatDuration(Number.NaN)).toBe("—")
+    expect(formatDuration(Number.POSITIVE_INFINITY)).toBe("—")
   })
 })

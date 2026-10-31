@@ -45,6 +45,32 @@ export function formatRelativeTime(
 
 const BYTE_UNITS = ["B", "KB", "MB", "GB", "TB"] as const
 
+/**
+ * Human-readable run/step duration. Seconds keep one decimal (`8.4s`),
+ * minute-scale values use `1m 02s` and hour-scale values use `1h 02m`
+ * (spec §12.2). Negative/non-finite input renders a dash.
+ */
+export function formatDuration(ms: number | null | undefined): string {
+  if (typeof ms !== "number" || !Number.isFinite(ms) || ms < 0) return DASH
+  if (ms >= HOUR_MS) {
+    const hours = Math.floor(ms / HOUR_MS)
+    const minutes = Math.floor((ms % HOUR_MS) / MINUTE_MS)
+    return `${hours}h ${pad(minutes)}m`
+  }
+  if (ms >= MINUTE_MS) {
+    let minutes = Math.floor(ms / MINUTE_MS)
+    let seconds = Math.round((ms % MINUTE_MS) / 1000)
+    if (seconds === 60) {
+      minutes += 1
+      seconds = 0
+    }
+    return `${minutes}m ${pad(seconds)}s`
+  }
+  const tenths = Math.round(ms / 100)
+  if (tenths >= 600) return "1m 00s"
+  return `${(tenths / 10).toFixed(1)}s`
+}
+
 /** Human-readable byte size (binary units, one decimal above bytes). */
 export function formatBytes(bytes: number | null | undefined): string {
   if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes < 0) return DASH
