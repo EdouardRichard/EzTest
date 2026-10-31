@@ -10,6 +10,7 @@ import { EmptyState } from "@/components/ui/EmptyState"
 import { ErrorState } from "@/components/ui/ErrorState"
 import { LoadingCard } from "@/components/ui/Spinner"
 import { Tabs } from "@/components/ui/Tabs"
+import { RequirementsTab } from "@/features/clarification/RequirementsTab"
 import { formatDateTime } from "@/lib/format"
 
 import { getVersion } from "./api"
@@ -22,36 +23,44 @@ const STATUS_META: Record<VersionStatus, { label: string; tone: BadgeTone }> = {
   completed: { label: "已完成", tone: "neutral" },
 }
 
-type PlaceholderTab = Exclude<VersionTab, "overview">
+type PlaceholderTab = Exclude<VersionTab, "overview" | "requirements">
 
-const PLACEHOLDER_COPY: Record<PlaceholderTab, { label: string; description: string }> = {
-  requirements: {
-    label: "需求与澄清",
-    description: "需求对话、附件解析、草案确认与需求闭环将在 P1 起提供。",
-  },
+type PlaceholderCopy = {
+  label: string
+  phase: "P2" | "P3" | "P4" | "P5"
+  description: string
+}
+
+const PLACEHOLDER_COPY: Record<PlaceholderTab, PlaceholderCopy> = {
   design: {
     label: "用例设计",
-    description: "AI 设计对话、脑图、用例确认与变更请求将在 P1 起提供。",
+    phase: "P2",
+    description: "AI 设计对话、脑图、用例确认与变更请求由 P2 阶段提供。",
   },
   execution: {
     label: "执行",
-    description: "波次执行、实时记录、证据与人工接管将在 P1 起提供。",
+    phase: "P3",
+    description: "波次执行、实时记录、证据与人工接管由 P3 阶段提供。",
   },
   chain: {
     label: "探索链路",
-    description: "跨 SUT 的探索链路图、过滤与历史回放将在 P1 起提供。",
+    phase: "P4",
+    description: "跨 SUT 的探索链路图、过滤与历史回放由 P4 阶段提供。",
   },
   issues: {
     label: "问题",
-    description: "失败归类、问题去重与复测闭环将在 P1 起提供。",
+    phase: "P4",
+    description: "失败归类、问题去重与复测闭环由 P4 阶段提供。",
   },
   reports: {
     label: "报告",
-    description: "波次/版本报告、HTML/PDF 发布与 as-of 修订将在 P1 起提供。",
+    phase: "P4",
+    description: "波次/版本报告、HTML/PDF 发布与 as-of 修订由 P4 阶段提供。",
   },
   code: {
     label: "代码与变更",
-    description: "代码仓扫描、变更影响与调用链分析将在 P1 起提供。",
+    phase: "P5",
+    description: "代码仓扫描、变更影响与调用链分析由 P5 阶段提供。",
   },
 }
 
@@ -190,8 +199,9 @@ function VersionOverview({ version }: { version: Version }) {
       </section>
 
       <section className="rounded-xl border border-dashed border-border bg-card/60 px-4 py-3 text-xs leading-relaxed text-muted-foreground">
-        需求与澄清、用例设计、执行、链路、问题、报告和代码分析将在 P1 起逐步提供；P0 先完成多 SUT
-        绑定与版本工作区骨架。
+        需求与澄清已在 P1
+        提供；用例设计（P2）、执行（P3）、探索链路/问题/报告（P4）与代码与变更（P5）
+        将按阶段逐步提供。
       </section>
     </div>
   )
@@ -202,9 +212,9 @@ function TabPlaceholder({ tab }: { tab: PlaceholderTab }) {
   return (
     <section aria-label={`${copy.label}占位`} className="surface-card p-6">
       <EmptyState
-        title={`${copy.label}将在 P1 阶段提供`}
+        title={`${copy.label}将在 ${copy.phase} 阶段提供`}
         description={copy.description}
-        action={<Badge tone="warning">P1 阶段提供</Badge>}
+        action={<Badge tone="warning">{copy.phase} 阶段提供</Badge>}
       />
     </section>
   )
@@ -213,10 +223,19 @@ function TabPlaceholder({ tab }: { tab: PlaceholderTab }) {
 export type VersionDetailPageProps = {
   versionId: string
   initialTab?: VersionTab
+  /** Deep link `?conversation=` forwarded to the clarification workspace. */
+  initialConversationId?: string
+  /** Deep link `?requirement=` forwarded to the clarification workspace. */
+  initialRequirementId?: string
 }
 
 /** `/versions/{id}` shell: header, eight URL-backed tabs and the overview. */
-export function VersionDetailPage({ versionId, initialTab }: VersionDetailPageProps) {
+export function VersionDetailPage({
+  versionId,
+  initialTab,
+  initialConversationId,
+  initialRequirementId,
+}: VersionDetailPageProps) {
   const router = useRouter()
   const [version, setVersion] = useState<Version | null>(null)
   const [loading, setLoading] = useState(true)
@@ -247,7 +266,12 @@ export function VersionDetailPage({ versionId, initialTab }: VersionDetailPagePr
   function handleTabChange(value: string): void {
     const next = parseVersionTab(value)
     setActiveTab(next)
-    router.replace(`/versions/${encodeURIComponent(versionId)}?tab=${next}`)
+    const params = new URLSearchParams({ tab: next })
+    if (next === "requirements") {
+      if (initialConversationId) params.set("conversation", initialConversationId)
+      if (initialRequirementId) params.set("requirement", initialRequirementId)
+    }
+    router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`)
   }
 
   if (loading) {
@@ -321,6 +345,12 @@ export function VersionDetailPage({ versionId, initialTab }: VersionDetailPagePr
 
       {activeTab === "overview" ? (
         <VersionOverview version={version} />
+      ) : activeTab === "requirements" ? (
+        <RequirementsTab
+          versionId={versionId}
+          initialConversationId={initialConversationId}
+          initialRequirementId={initialRequirementId}
+        />
       ) : (
         <TabPlaceholder tab={activeTab} />
       )}
