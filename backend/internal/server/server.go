@@ -10,6 +10,8 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/audit/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
+	designapp "github.com/EdouardRichard/EzTest/backend/internal/design/application"
+	designapi "github.com/EdouardRichard/EzTest/backend/internal/design/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/eventing/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/application"
@@ -44,6 +46,9 @@ type Deps struct {
 	Requirements  *versionapp.RequirementService
 	Conversations *versionapp.ConversationService
 	TeamRoom      *agentapp.TeamRoom
+	DesignGraph   *designapp.GraphService
+	DesignExports *designapp.ExportService
+	DesignStarter versionapp.DesignStarter
 }
 
 // New assembles the HTTP middleware chain and every P0 route.
@@ -72,8 +77,9 @@ func New(deps Deps) http.Handler {
 	registerResourceRoutes(mux, authenticated, admin, resourceapi.New(deps.Resource))
 	registerVersionRoutes(mux, authenticated, versionapi.New(deps.Versions))
 	registerRequirementRoutes(mux, authenticated, versionapi.NewRequirementHandler(deps.Requirements))
-	registerConversationRoutes(mux, authenticated, versionapi.NewConversationHandler(deps.Conversations))
+	registerConversationRoutes(mux, authenticated, versionapi.NewConversationHandler(deps.Conversations, deps.DesignStarter))
 	registerTeamRoomRoutes(mux, authenticated, agentapi.NewTeamRoom(deps.TeamRoom, versionExistence{deps.Versions}))
+	registerDesignRoutes(mux, authenticated, designapi.New(deps.DesignGraph, deps.DesignExports))
 
 	return RequestID(Recover(Logging(CORS(deps.Config)(mux))))
 }
@@ -174,6 +180,18 @@ func registerConversationRoutes(mux *http.ServeMux, authenticated func(http.Hand
 
 func registerTeamRoomRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *agentapi.TeamRoomHandler) {
 	mux.Handle("GET /api/versions/{id}/team-rooms/{team}", authenticated(http.HandlerFunc(h.Read)))
+}
+
+// registerDesignRoutes mounts the P2 design graph/confirmation/export API.
+func registerDesignRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *designapi.Handler) {
+	mux.Handle("GET /api/versions/{id}/design/graph", authenticated(http.HandlerFunc(h.ReadGraph)))
+	mux.Handle("GET /api/versions/{id}/design/overview", authenticated(http.HandlerFunc(h.Overview)))
+	mux.Handle("GET /api/versions/{id}/design/cases/{caseId}", authenticated(http.HandlerFunc(h.GetCase)))
+	mux.Handle("POST /api/versions/{id}/design/confirmations", authenticated(http.HandlerFunc(h.Confirm)))
+	mux.Handle("POST /api/versions/{id}/exports", authenticated(http.HandlerFunc(h.CreateExport)))
+	mux.Handle("GET /api/versions/{id}/exports", authenticated(http.HandlerFunc(h.ListExports)))
+	mux.Handle("GET /api/exports/{exportId}", authenticated(http.HandlerFunc(h.GetExport)))
+	mux.Handle("GET /api/exports/{exportId}/download", authenticated(http.HandlerFunc(h.DownloadExport)))
 }
 
 func registerResourceRoutes(mux *http.ServeMux, authenticated, admin func(http.Handler) http.Handler, h *resourceapi.Handler) {

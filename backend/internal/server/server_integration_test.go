@@ -16,6 +16,9 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/audit/infrastructure"
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
+	designapp "github.com/EdouardRichard/EzTest/backend/internal/design/application"
+	designpg "github.com/EdouardRichard/EzTest/backend/internal/design/infrastructure/postgres"
+	"github.com/EdouardRichard/EzTest/backend/internal/design/infrastructure/storageexport"
 	"github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/eventing/infrastructure"
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/application"
@@ -69,6 +72,10 @@ func newTestAPI(t *testing.T) *testAPI {
 	resourceSvc := resourceapp.New(resourcepg.New(pool), ids, clk, nil, auditSvc, eventSvc)
 	versionSvc := versionapp.New(versionpg.New(pool, ids), resourceSvc, ids, clk, auditSvc, eventSvc)
 	resourceSvc.SetUsageChecker(versionSvc)
+	designRepo := designpg.New(pool)
+	designGraph := designapp.NewGraphService(designRepo, ids, clk, auditSvc, eventSvc, nil)
+	storageExportSvc := storageapp.NewExportService(storagepg.NewExportRepository(pool), storageSvc, ids, clk)
+	designExports := designapp.NewExportService(designRepo, storageexport.New(storageExportSvc), ids, clk, eventSvc, auditSvc)
 
 	// Keep integration uploads out of the repository working tree.
 	if _, err := settingsSvc.Update(ctx, "paths.data_root", t.TempDir(), 1); err != nil {
@@ -87,6 +94,9 @@ func newTestAPI(t *testing.T) *testAPI {
 		LLM:      llmSvc,
 		Resource: resourceSvc,
 		Versions: versionSvc,
+
+		DesignGraph:   designGraph,
+		DesignExports: designExports,
 	})
 	httpServer := httptest.NewServer(handler)
 	t.Cleanup(httpServer.Close)
@@ -308,4 +318,60 @@ func TestP0EndToEndFlow(t *testing.T) {
 	}
 
 	t.Logf("P0 flow ok: version=%s sha=%s", versionID, upload.Data.SHA256)
+}
+
+func TestP2DesignRoutesAndEmptyGraph(t *testing.T) {
+	api := newTestAPI(t)
+	api.login("admin", "admin123")
+
+	sut := api.data(api.do(http.MethodPost, "/api/resources/suts", map[string]any{"name": "P2 Design SUT", "intro": "p2"}, http.StatusCreated))
+	sutID := sut["id"].(string)
+	environment := api.data(api.do(http.MethodPost, "/api/resources/suts/"+sutID+"/environments", map[string]any{"name": "dev", "base_url": "http://localhost:8080", "is_default": true}, http.StatusCreated))
+	environmentID := environment["id"].(string)
+	version := api.data(api.do(http.MethodPost, "/api/versions", map[string]any{
+		"title": "P2 Design Version",
+		"bindings": []any{map[string]any{
+			"sut_id": sutID, "environment_id": environmentID,
+			"page_ids": []string{}, "api_ids": []string{}, "database_ids": []string{}, "accounts": []any{},
+		}},
+	}, http.StatusCreated))
+	versionID := version["id"].(string)
+
+	graph := api.data(api.do(http.MethodGet, "/api/versions/"+versionID+"/design/graph", nil, http.StatusOK))
+	if graph["version_id"] != versionID {
+		t.Fatalf("graph version_id = %#v", graph["version_id"])
+	}
+	if graph["pending_design_count"] != float64(0) {
+		t.Fatalf("graph pending_design_count = %#v", graph["pending_design_count"])
+	}
+	if len(graph["requirements"].([]any)) != 0 {
+		t.Fatalf("empty version graph requirements = %#v", graph["requirements"])
+	}
+
+	overview := api.data(api.do(http.MethodGet, "/api/versions/"+versionID+"/design/overview", nil, http.StatusOK))
+	if overview["active_round"] != nil || overview["round_count"] != float64(0) {
+		t.Fatalf("overview = %#v", overview)
+	}
+
+	list := api.do(http.MethodGet, "/api/versions/"+versionID+"/exports", nil, http.StatusOK)
+	if len(list["data"].([]any)) != 0 {
+		t.Fatalf("initial export list = %#v", list)
+	}
+
+	export := api.data(api.do(http.MethodPost, "/api/versions/"+versionID+"/exports", map[string]any{
+		"owner_kind": "case", "owner_id": versionID, "format": "markdown",
+	}, http.StatusCreated))
+	exportID := export["id"].(string)
+	if export["version_id"] != versionID || export["format"] != "markdown" || export["sha256"] == "" {
+		t.Fatalf("export view = %#v", export)
+	}
+	api.do(http.MethodGet, "/api/exports/"+exportID, nil, http.StatusOK)
+	api.do(http.MethodGet, "/api/versions/"+versionID+"/exports", nil, http.StatusOK)
+	api.do(http.MethodPost, "/api/versions/"+versionID+"/exports", map[string]any{
+		"owner_kind": "case", "owner_id": versionID, "format": "pdf",
+	}, http.StatusBadRequest)
+
+	api.token = ""
+	api.do(http.MethodGet, "/api/versions/"+versionID+"/design/graph", nil, http.StatusUnauthorized)
+	api.login("admin", "admin123")
 }

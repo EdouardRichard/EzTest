@@ -17,12 +17,16 @@ import (
 	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/designadapter"
 	agentpg "github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/postgres"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/versionadapter"
 	"github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/audit/infrastructure"
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
 	"github.com/EdouardRichard/EzTest/backend/internal/db"
+	designapp "github.com/EdouardRichard/EzTest/backend/internal/design/application"
+	designpg "github.com/EdouardRichard/EzTest/backend/internal/design/infrastructure/postgres"
+	"github.com/EdouardRichard/EzTest/backend/internal/design/infrastructure/storageexport"
 	"github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/eventing/infrastructure"
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/application"
@@ -99,6 +103,119 @@ func (e versionTaskEnqueuer) Ensure(ctx context.Context, in versionapp.TaskInput
 	return err
 }
 
+// designTaskEnqueuer adapts the design planner's work-queue port to the agent
+// task board. Composition-root only.
+type designTaskEnqueuer struct {
+	queue *agentapp.WorkQueue
+}
+
+func (e designTaskEnqueuer) Ensure(ctx context.Context, in designapp.TaskInput) (bool, error) {
+	if e.queue == nil {
+		return false, nil
+	}
+	_, created, err := e.queue.Ensure(ctx, agent.NewWorkItem{
+		VersionID: in.VersionID,
+		Team:      in.Team,
+		Type:      in.Type,
+		Priority:  in.Priority,
+		DedupeKey: in.DedupeKey,
+		Payload:   in.Payload,
+	})
+	return created, err
+}
+
+// designConversationCreator creates the auto-design conversation through the
+// version conversation service.
+type designConversationCreator struct {
+	svc *versionapp.ConversationService
+}
+
+func (c designConversationCreator) CreateDesign(ctx context.Context, versionID int64, title string) (int64, error) {
+	if c.svc == nil {
+		return 0, errors.New("design conversation creator has no conversation service")
+	}
+	view, err := c.svc.Create(ctx, versionID, "design", title, 0)
+	if err != nil {
+		return 0, err
+	}
+	return view.ID, nil
+}
+
+// designVersionStarter projects a version to running for design activation.
+type designVersionStarter struct {
+	svc *versionapp.Service
+}
+
+func (s designVersionStarter) MarkRunning(ctx context.Context, versionID int64) error {
+	if s.svc == nil {
+		return nil
+	}
+	return s.svc.MarkRunning(ctx, versionID)
+}
+
+// designStarterAdapter adapts the planner StartRound result to versionapp's
+// error-only DesignStarter port.
+type designStarterAdapter struct {
+	planner *designapp.Planner
+}
+
+func (a designStarterAdapter) StartRound(ctx context.Context, versionID, conversationID, actorID int64) error {
+	if a.planner == nil {
+		return errors.New("design starter has no planner")
+	}
+	_, err := a.planner.StartRound(ctx, versionID, conversationID, actorID)
+	return err
+}
+
+// designMetricsAdapter maps designapp.CaseCounts to the version read model.
+type designMetricsAdapter struct {
+	planner *designapp.Planner
+}
+
+func (a designMetricsAdapter) CountPendingDesign(ctx context.Context, versionID int64) (int, error) {
+	if a.planner == nil {
+		return 0, errors.New("design metrics has no planner")
+	}
+	return a.planner.CountPendingDesign(ctx, versionID)
+}
+
+func (a designMetricsAdapter) CaseCounts(ctx context.Context, versionID int64) (versionapp.CaseCounts, error) {
+	if a.planner == nil {
+		return versionapp.CaseCounts{}, nil
+	}
+	counts, err := a.planner.CaseCounts(ctx, versionID)
+	if err != nil {
+		return versionapp.CaseCounts{}, err
+	}
+	return versionapp.CaseCounts{Draft: counts.Draft, Confirmed: counts.Confirmed, Stale: counts.Stale}, nil
+}
+
+// designTeamRoomAdapter maps the design context's post port to the agent team
+// room service, keeping both contexts independent.
+type designTeamRoomAdapter struct {
+	room *agentapp.TeamRoom
+}
+
+func (a designTeamRoomAdapter) Post(ctx context.Context, post designapp.TeamPost) error {
+	if a.room == nil {
+		return nil
+	}
+	refs := make([]agent.PostRef, 0, len(post.Refs))
+	for _, ref := range post.Refs {
+		refs = append(refs, agent.PostRef{Kind: ref.Kind, ID: ref.ID})
+	}
+	_, err := a.room.Post(ctx, agent.TeamRoomPost{
+		VersionID:  post.VersionID,
+		Team:       agent.Team(post.Team),
+		Kind:       agent.PostKind(post.Kind),
+		Content:    post.Content,
+		Refs:       refs,
+		AgentRunID: post.AgentRunID,
+		CreatedBy:  post.CreatedBy,
+	})
+	return err
+}
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -158,11 +275,13 @@ func main() {
 	resourceSvc := resourceapp.New(resourcepg.New(pool), ids, clk, nil, auditSvc, eventSvc)
 	versionSvc := versionapp.New(versionpg.New(pool, ids), resourceSvc, ids, clk, auditSvc, eventSvc)
 	resourceSvc.SetUsageChecker(versionSvc)
+	designRepo := designpg.New(pool)
+	designStale := designapp.NewStaleService(designRepo, clk, auditSvc, eventSvc)
 
 	// P1 control plane and clarification services.
 	requirementSvc := versionapp.NewRequirementService(
 		versionpg.NewRequirementRepository(pool), versionSvc, resourceSvc,
-		versionapp.NoopCaseStaleHook{}, auditSvc, eventSvc, ids, clk)
+		designStale, auditSvc, eventSvc, ids, clk)
 	workItems := agentpg.NewWorkItemRepository(pool, ids)
 	workQueue := agentapp.NewWorkQueue(workItems, clk, 30*time.Second, 3)
 	workQueue.SetEvents(eventSvc)
@@ -174,6 +293,22 @@ func main() {
 	conversationSvc := versionapp.NewConversationService(
 		versionpg.NewConversationRepository(pool, ids), enqueuer, attachmentSvc, versionSvc, clk, ids, eventSvc)
 	ports := versionadapter.New(requirementSvc, conversationSvc, versionSvc, attachmentSvc, storageSvc)
+
+	// P2 design services and cross-context adapters.
+	designTeamRoom := designTeamRoomAdapter{room: teamRoom}
+	designPlanner := designapp.NewPlanner(
+		designRepo, ids, clk, eventSvc,
+		designTaskEnqueuer{queue: workQueue},
+		designTeamRoom,
+		designConversationCreator{svc: conversationSvc},
+		designVersionStarter{svc: versionSvc},
+		designStale,
+	)
+	designGraph := designapp.NewGraphService(designRepo, ids, clk, auditSvc, eventSvc, designTeamRoom)
+	storageExportSvc := storageapp.NewExportService(storagepg.NewExportRepository(pool), storageSvc, ids, clk)
+	designExports := designapp.NewExportService(
+		designRepo, storageexport.New(storageExportSvc), ids, clk, eventSvc, auditSvc)
+	versionSvc.SetDesignMetrics(designMetricsAdapter{planner: designPlanner})
 
 	instanceID := fmt.Sprintf("%s-%d", hostName(), os.Getpid())
 	runtimeRepo := agentpg.NewRuntimeRepository(pool, ids)
@@ -193,7 +328,12 @@ func main() {
 		Attachments:  ports,
 		TeamRoom:     teamRoom,
 		Content:      ports,
-		ToolDeps:     tools.Deps{Requirement: ports, Attachment: ports, Resource: ports},
+		ToolDeps: tools.Deps{
+			Requirement: ports,
+			Attachment:  ports,
+			Resource:    ports,
+			Design:      designadapter.New(designGraph),
+		},
 		InstanceID:   instanceID,
 	})
 	worker := agentapp.NewWorker(workQueue, runner, settingsSvc, slog.Default(), instanceID, agentapp.WithWorkerEvents(eventSvc))
@@ -210,6 +350,7 @@ func main() {
 		Events:        eventSvc,
 		Clock:         clk,
 		Logger:        slog.Default(),
+		Design:        designPlanner,
 	})
 	go runReconciler(ctx, reconciler)
 
@@ -228,6 +369,9 @@ func main() {
 		Requirements:  requirementSvc,
 		Conversations: conversationSvc,
 		TeamRoom:      teamRoom,
+		DesignGraph:   designGraph,
+		DesignExports: designExports,
+		DesignStarter: designStarterAdapter{planner: designPlanner},
 	})
 
 	srv := &http.Server{
