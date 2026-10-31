@@ -288,10 +288,24 @@ for (const name of [
 check(dbSchemaText.includes("paths.evidence_dir"), "db-schema.md must record the paths.evidence_dir P3 exception")
 
 // ---------------------------------------------------------------------------
-// Migrations: the 3 P3 files must stay present and ordered, and the P3 tail
-// must still be applied. P4 re-pins the Go test tail to the P4 four, so the
-// tail proof is anchored on order.txt (the applied order) and on the migration
-// tests expecting every ordered file; the totals are derived, not hard-coded.
+// Migrations: the 3 P3 files must stay present and at the frozen order indices
+// 17-19 (0-based; #18-#20 1-based). P4+ appends only, so the P3 position is
+// absolute: deleting a line elsewhere plus duplicating another to keep the
+// total at 24 must still fail here.
+//
+// P4 re-pins the Go test tail to the P4 four, so the "P3 tail is applied"
+// proof is anchored on order.txt plus the Go tests:
+//  - order.txt keeps execution_* at indices 17-19 (never merely consecutive);
+//  - the Go unit test count and its literal `wantTail` match the last applied
+//    order.txt entries, so the P3 triple (and any later tail) stays applied;
+//  - the integration test keeps the 10 P3 table assertions.
+// Totals stay derived, never hard-coded to 20/24, so a later phase can append
+// a unique #25 after re-pinning its Go tests without breaking this check.
+//
+// Mutation-proof intent (task-0c harness, temporary mirror):
+//  - delete a P3 line + duplicate a prior line -> indices 17-19 fail;
+//  - reorder the P3 triple or move it after a P4 entry -> indices 17-19 fail;
+//  - append a unique P5 #25 with the Go tests re-pinned -> still passes.
 // ---------------------------------------------------------------------------
 const p3Migrations = [
   "execution_0001_intent_wave.sql",
@@ -311,10 +325,8 @@ check(orderLines.includes(p3Tail), `order.txt must still apply P3 tail ${p3Tail}
 check(orderLines.length >= 20, `order.txt must keep at least 20 migrations, found ${orderLines.length}`)
 const p3OrderIndexes = p3Migrations.map((file) => orderLines.indexOf(file))
 check(
-  p3OrderIndexes[0] >= 0 &&
-    p3OrderIndexes[1] === p3OrderIndexes[0] + 1 &&
-    p3OrderIndexes[2] === p3OrderIndexes[1] + 1,
-  "order.txt must keep the 3 execution migrations consecutive and in order",
+  JSON.stringify(p3OrderIndexes) === JSON.stringify([17, 18, 19]),
+  `order.txt must keep the 3 execution migrations at indices 17-19 (1-based 18-20), found ${JSON.stringify(p3OrderIndexes)}`,
 )
 const migrateUnit = read(path.join(root, "backend", "internal", "db", "migrate_test.go"))
 const unitCount = /len\(migrations\)\s*!=\s*(\d+)/.exec(migrateUnit)
@@ -327,6 +339,16 @@ check(
   `migrate_test.go must expect every migration in order.txt (${orderLines.length})`,
 )
 check(migrateUnit.includes("orderedMigrations"), "migrate_test.go must keep the migration-order test")
+// The unit test pins the applied tail literally (`wantTail := []string{...}`);
+// compare it with the order.txt suffix so P4/P5 can re-pin the tail without
+// this P3 check hard-coding a phase total, while a short/reordered tail fails.
+const unitTailMatch = /wantTail\s*:=\s*\[\]string\{([\s\S]*?)\}/.exec(migrateUnit)
+const unitTail = unitTailMatch ? [...unitTailMatch[1].matchAll(/"([^"]+\.sql)"/g)].map((match) => match[1]) : []
+check(unitTail.length >= p3Migrations.length, "migrate_test.go must pin the applied migration tail")
+check(
+  unitTail.length > 0 && JSON.stringify(unitTail) === JSON.stringify(orderLines.slice(-unitTail.length)),
+  "migrate_test.go tail must equal the last applied order.txt entries",
+)
 const migrateIntegration = read(path.join(root, "backend", "internal", "db", "migrate_integration_test.go"))
 const integrationCount = /len\(applied\)\s*!=\s*(\d+)/.exec(migrateIntegration)
 check(
@@ -338,6 +360,11 @@ check(
   `migrate_integration_test.go must expect every migration in order.txt (${orderLines.length})`,
 )
 check(migrateIntegration.includes("TestP3ExecutionTables"), "migrate_integration_test.go missing TestP3ExecutionTables")
+// The P4 re-pin moved the P3 file names out of the Go test tail; keep the P3
+// schema assertions themselves in the integration test instead.
+for (const table of dbTables) {
+  check(migrateIntegration.includes(`"${table}"`), `migrate_integration_test.go missing P3 table ${table}`)
+}
 
 const migrationsOrderText = readContract("migrations-order.md")
 check(/^## 5c\. P3 增量迁移/m.test(migrationsOrderText), "migrations-order.md missing §5c")
