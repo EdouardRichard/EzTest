@@ -17,9 +17,22 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/p4"
+	agentpg "github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/postgres"
 	"github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/audit/infrastructure"
+	chainapp "github.com/EdouardRichard/EzTest/backend/internal/chain/application"
+	chainproviders "github.com/EdouardRichard/EzTest/backend/internal/chain/infrastructure/providers"
+	chainapi "github.com/EdouardRichard/EzTest/backend/internal/chain/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
+	deliveryapp "github.com/EdouardRichard/EzTest/backend/internal/delivery/application"
+	delivery "github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
+	deliveryadapters "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/adapters"
+	deliverycontent "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/content"
+	deliverypg "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/postgres"
+	deliveryrender "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/render"
+	deliveryapi "github.com/EdouardRichard/EzTest/backend/internal/delivery/interfaces/httpapi"
 	designapp "github.com/EdouardRichard/EzTest/backend/internal/design/application"
 	designpg "github.com/EdouardRichard/EzTest/backend/internal/design/infrastructure/postgres"
 	"github.com/EdouardRichard/EzTest/backend/internal/design/infrastructure/storageexport"
@@ -45,13 +58,16 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
 	"github.com/EdouardRichard/EzTest/backend/internal/version/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure"
+	versionadapters "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/adapters"
 )
 
 type testAPI struct {
-	t       *testing.T
-	baseURL string
-	token   string
-	pool    *pgxpool.Pool
+	t         *testing.T
+	baseURL   string
+	token     string
+	pool      *pgxpool.Pool
+	reportSvc *deliveryapp.ReportService
+	issueSvc  *deliveryapp.IssueService
 }
 
 func newTestAPI(t *testing.T) *testAPI {
@@ -79,10 +95,15 @@ func newTestAPI(t *testing.T) *testAPI {
 	llmSvc := llmapp.New(llminfra.NewRepository(pool), llminfra.NewClient(), ids, clk, auditSvc, eventSvc)
 	storageSvc := storageapp.New(storagepg.New(pool), storagepg.NewFileStore(), settingsSvc, ids, auditSvc, eventSvc)
 	resourceSvc := resourceapp.New(resourcepg.New(pool), ids, clk, nil, auditSvc, eventSvc)
-	versionSvc := versionapp.New(versionpg.New(pool, ids), resourceSvc, ids, clk, auditSvc, eventSvc)
+	versionRepo := versionpg.New(pool, ids)
+	versionSvc := versionapp.New(versionRepo, resourceSvc, ids, clk, auditSvc, eventSvc)
 	resourceSvc.SetUsageChecker(versionSvc)
 	designRepo := designpg.New(pool)
 	designGraph := designapp.NewGraphService(designRepo, ids, clk, auditSvc, eventSvc, nil)
+	designStale := designapp.NewStaleService(designRepo, clk, auditSvc, eventSvc)
+	requirementRepo := versionpg.NewRequirementRepository(pool)
+	requirementSvc := versionapp.NewRequirementService(
+		requirementRepo, versionSvc, resourceSvc, designStale, auditSvc, eventSvc, ids, clk)
 	storageExportSvc := storageapp.NewExportService(storagepg.NewExportRepository(pool), storageSvc, ids, clk)
 	designExports := designapp.NewExportService(designRepo, storageexport.New(storageExportSvc), ids, clk, eventSvc, auditSvc)
 
@@ -122,6 +143,67 @@ func newTestAPI(t *testing.T) *testAPI {
 		Registry: executionRegistry,
 	})
 
+	// P4 delivery/chain/steward composition (mirrors cmd/eztest with real
+	// repositories and the real adapters).
+	workQueue := agentapp.NewWorkQueue(agentpg.NewWorkItemRepository(pool, ids), clk, 30*time.Second, 3)
+	issueRepo := deliverypg.NewIssueRepository(pool)
+	analysisRepo := deliverypg.NewAnalysisRepository(pool)
+	reportRepo := deliverypg.NewReportRepository(pool)
+	closureRepo := versionpg.NewClosureRepository(pool)
+	deliveryContent := deliverycontent.New(storageSvc, deliverypg.NewContentRefReader(pool))
+	reportRenderer, err := deliveryrender.NewHTMLRenderer("1")
+	if err != nil {
+		t.Fatalf("report renderer: %v", err)
+	}
+	p4Tasks := p4.NewTaskEnsurer(workQueue, reportRepo, testRequirementVersionLookup{repo: requirementRepo})
+	readDeps := deliveryadapters.Deps{
+		Versions: versionSvc, Requirements: requirementSvc, Closures: closureRepo, Design: designGraph,
+		Waves: executionRepo.Waves, CaseRuns: executionRepo.CaseRuns, Results: executionRepo.Results,
+		Evidence: executionRepo.Evidence, SUTContexts: executionRepo.SUTContexts,
+		Intents: executionRepo.Intents, Humans: executionRepo.Humans, Issues: issueRepo,
+	}
+	deliveryEvents := deliveryadapters.NewEventPublisher(eventSvc)
+	deliveryAudit := deliveryadapters.NewAuditSink(auditSvc)
+	issueSvc := deliveryapp.NewIssueService(
+		issueRepo, deliveryadapters.NewExecutionReader(readDeps), deliveryEvents, deliveryAudit, clk, p4Tasks)
+	issueSvc.WithTriageReader(analysisRepo)
+	reportSvc := deliveryapp.NewReportService(
+		reportRepo, reportRenderer, deliveryContent, deliveryadapters.NewReportDataReader(readDeps),
+		deliveryEvents, deliveryAudit, clk, p4Tasks,
+		delivery.SectionOptions{Summary: true, Results: true, Issues: true, Coverage: true, Evidence: true})
+	closureReaders := versionadapters.NewClosureReaders(versionadapters.Deps{
+		Requirements: requirementRepo, Design: designGraph, CaseRuns: executionRepo.CaseRuns,
+		Waves: executionRepo.Waves, Intents: executionRepo.Intents, Humans: executionRepo.Humans,
+		WorkItems: workQueue, Issues: issueRepo,
+	})
+	versionCloseSvc := versionapp.NewVersionCloseService(versionapp.VersionCloseServiceDeps{
+		Versions: versionRepo, WorkItems: closureReaders, Execution: closureReaders,
+		HumanRequests: closureReaders, Requirements: requirementRepo,
+		Reports: versionadapters.NewReportStatusReader(reportSvc), ReportStaler: reportSvc,
+		Tasks: p4Tasks, Audit: auditSvc, Events: eventSvc, Clock: clk,
+	})
+	closureSvc := versionapp.NewClosureService(versionapp.ClosureServiceDeps{
+		Closures: closureRepo, Requirements: requirementRepo, Cases: closureReaders,
+		Runs: closureReaders, Coverage: closureReaders, Issues: closureReaders,
+		WorkItems: closureReaders, Versions: versionCloseSvc, Tasks: p4Tasks,
+		Audit: auditSvc, Events: eventSvc, IDs: ids, Clock: clk,
+	})
+	requirementSvc.SetVersionReopener(versionCloseSvc)
+	designGraph.SetVersionReopener(versionCloseSvc)
+
+	chainVersionProvider := chainproviders.NewVersionProvider(requirementSvc, versionSvc)
+	chainDesignProvider := chainproviders.NewDesignProvider(designGraph)
+	chainExecutionProvider := chainproviders.NewExecutionProvider(
+		executionRepo.Waves, executionRepo.CaseRuns, executionRepo.SUTContexts)
+	chainDeliveryProvider := chainproviders.NewDeliveryProvider(issueRepo, reportRepo, requirementSvc, closureSvc)
+	chainResourceProvider := chainproviders.NewResourceProvider(versionSvc, resourceSvc)
+	chainCursorProvider := chainproviders.NewEventCursorProvider(eventSvc)
+	chainSvc := chainapp.NewChainService(
+		chainVersionProvider, chainDesignProvider, chainExecutionProvider, chainDeliveryProvider,
+		chainResourceProvider, chainCursorProvider, chainCursorProvider, clk)
+	deliveryHandler := deliveryapi.New(issueSvc, deliveryapi.WithReports(reportSvc))
+	chainHandler := chainapi.New(chainSvc)
+
 	handler := server.New(server.Deps{
 		Config:   config.Config{APIPort: 0, WebPort: 6868, ExecutorPort: 13336},
 		Pool:     pool,
@@ -135,13 +217,18 @@ func newTestAPI(t *testing.T) *testAPI {
 		Resource: resourceSvc,
 		Versions: versionSvc,
 
+		Requirements:  requirementSvc,
 		DesignGraph:   designGraph,
 		DesignExports: designExports,
 		Execution:     executionHandler,
+		Delivery:      deliveryHandler,
+		Chain:         chainHandler,
+		Closure:       closureSvc,
+		VersionClose:  versionCloseSvc,
 	})
 	httpServer := httptest.NewServer(handler)
 	t.Cleanup(httpServer.Close)
-	return &testAPI{t: t, baseURL: httpServer.URL, pool: pool}
+	return &testAPI{t: t, baseURL: httpServer.URL, pool: pool, reportSvc: reportSvc, issueSvc: issueSvc}
 }
 
 func (a *testAPI) do(method, path string, body any, wantStatus int) map[string]any {
@@ -222,8 +309,8 @@ func TestP0EndToEndFlow(t *testing.T) {
 	}
 
 	settings := api.listData(api.do(http.MethodGet, "/api/admin/settings", nil, http.StatusOK))
-	if len(settings) != 49 {
-		t.Fatalf("settings count = %d, want 49 (P3 44->49)", len(settings))
+	if len(settings) != 53 {
+		t.Fatalf("settings count = %d, want 53 (P4 49->53)", len(settings))
 	}
 	updated := api.data(api.do(http.MethodPatch, "/api/admin/settings/execution.global_concurrency", map[string]any{"value": 5}, http.StatusOK))
 	if updated["value"] != float64(5) {

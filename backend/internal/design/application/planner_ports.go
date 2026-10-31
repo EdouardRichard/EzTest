@@ -48,6 +48,15 @@ type VersionStarter interface {
 	MarkRunning(ctx context.Context, versionID int64) error
 }
 
+// VersionReopener clears the completed projection after a design write that
+// changes the version scope (spec §7.5: a newly confirmed case reopens a
+// completed version). main adapts it to
+// versionapp.VersionCloseService.ReopenIfCompleted; the call is best effort and
+// the reconciler is the fallback.
+type VersionReopener interface {
+	ReopenIfCompleted(ctx context.Context, versionID int64, trigger, reason string) error
+}
+
 // Staler marks the confirmed current case versions of a changed requirement
 // stale. StaleService implements it; the reconciler stale safety net uses it.
 type Staler interface {

@@ -19,12 +19,22 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/designadapter"
+	"github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/p4"
 	agentpg "github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/postgres"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/infrastructure/versionadapter"
 	"github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/audit/infrastructure"
+	chainapp "github.com/EdouardRichard/EzTest/backend/internal/chain/application"
+	chainproviders "github.com/EdouardRichard/EzTest/backend/internal/chain/infrastructure/providers"
+	chainapi "github.com/EdouardRichard/EzTest/backend/internal/chain/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
 	"github.com/EdouardRichard/EzTest/backend/internal/db"
+	deliveryapp "github.com/EdouardRichard/EzTest/backend/internal/delivery/application"
+	deliveryadapters "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/adapters"
+	deliverycontent "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/content"
+	deliverypg "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/postgres"
+	deliveryrender "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/render"
+	deliveryapi "github.com/EdouardRichard/EzTest/backend/internal/delivery/interfaces/httpapi"
 	designapp "github.com/EdouardRichard/EzTest/backend/internal/design/application"
 	designpg "github.com/EdouardRichard/EzTest/backend/internal/design/infrastructure/postgres"
 	"github.com/EdouardRichard/EzTest/backend/internal/design/infrastructure/storageexport"
@@ -51,6 +61,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/storage/infrastructure"
 	"github.com/EdouardRichard/EzTest/backend/internal/version/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure"
+	versionadapters "github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/adapters"
 	"github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/attachments"
 	"github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/contentstore"
 )
@@ -502,14 +513,16 @@ func main() {
 		llmapp.WithChatClient(llminfra.NewClient()), llmapp.WithSettingsReader(settingsSvc))
 	storageSvc := storageapp.New(storagepg.New(pool), storagepg.NewFileStore(), settingsSvc, ids, auditSvc, eventSvc)
 	resourceSvc := resourceapp.New(resourcepg.New(pool), ids, clk, nil, auditSvc, eventSvc)
-	versionSvc := versionapp.New(versionpg.New(pool, ids), resourceSvc, ids, clk, auditSvc, eventSvc)
+	versionRepo := versionpg.New(pool, ids)
+	versionSvc := versionapp.New(versionRepo, resourceSvc, ids, clk, auditSvc, eventSvc)
 	resourceSvc.SetUsageChecker(versionSvc)
 	designRepo := designpg.New(pool)
 	designStale := designapp.NewStaleService(designRepo, clk, auditSvc, eventSvc)
 
 	// P1 control plane and clarification services.
+	requirementRepo := versionpg.NewRequirementRepository(pool)
 	requirementSvc := versionapp.NewRequirementService(
-		versionpg.NewRequirementRepository(pool), versionSvc, resourceSvc,
+		requirementRepo, versionSvc, resourceSvc,
 		designStale, auditSvc, eventSvc, ids, clk)
 	workItems := agentpg.NewWorkItemRepository(pool, ids)
 	workQueue := agentapp.NewWorkQueue(workItems, clk, 30*time.Second, 3)
@@ -693,6 +706,108 @@ func main() {
 		Registry:      executorRegistry,
 	})
 
+	// P4 delivery/chain/steward composition. The composition root is the only
+	// place that knows every context; the cross-context reads go through the
+	// application adapters, never through another context's tables.
+	issueRepo := deliverypg.NewIssueRepository(pool)
+	analysisRepo := deliverypg.NewAnalysisRepository(pool)
+	reportRepo := deliverypg.NewReportRepository(pool)
+	closureRepo := versionpg.NewClosureRepository(pool)
+	deliveryContent := deliverycontent.New(storageSvc, deliverypg.NewContentRefReader(pool))
+	templateVersion, err := settingsSvc.String(ctx, "report.template_version")
+	if err != nil || templateVersion == "" {
+		templateVersion = "1"
+	}
+	reportRenderer, err := deliveryrender.NewHTMLRenderer(templateVersion)
+	if err != nil {
+		log.Fatalf("eztest: configure report renderer: %v", err)
+	}
+	p4Tasks := p4.NewTaskEnsurer(workQueue, reportRepo, requirementVersionLookup{repo: requirementRepo})
+
+	readDeps := deliveryadapters.Deps{
+		Versions:     versionSvc,
+		Requirements: requirementSvc,
+		Closures:     closureRepo,
+		Design:       designGraph,
+		Waves:        executionRepo.Waves,
+		CaseRuns:     executionRepo.CaseRuns,
+		Results:      executionRepo.Results,
+		Evidence:     executionRepo.Evidence,
+		SUTContexts:  executionSUTContextRepo,
+		Intents:      executionRepo.Intents,
+		Humans:       executionRepo.Humans,
+		Issues:       issueRepo,
+	}
+	deliveryEvents := deliveryadapters.NewEventPublisher(eventSvc)
+	deliveryAudit := deliveryadapters.NewAuditSink(auditSvc)
+	issueSvc := deliveryapp.NewIssueService(
+		issueRepo, deliveryadapters.NewExecutionReader(readDeps), deliveryEvents, deliveryAudit, clk, p4Tasks)
+	issueSvc.WithTriageReader(analysisRepo)
+	analysisSvc := deliveryapp.NewAnalysisService(analysisRepo, issueSvc, clk)
+	analysisSvc.WithTriagePoster(deliveryTriagePoster{room: teamRoom})
+	reportSvc := deliveryapp.NewReportService(
+		reportRepo, reportRenderer, deliveryContent, deliveryadapters.NewReportDataReader(readDeps),
+		deliveryEvents, deliveryAudit, clk, p4Tasks, p4SectionOptions(ctx, settingsSvc))
+
+	closureReaders := versionadapters.NewClosureReaders(versionadapters.Deps{
+		Requirements: requirementRepo,
+		Design:       designGraph,
+		CaseRuns:     executionRepo.CaseRuns,
+		Waves:        executionRepo.Waves,
+		Intents:      executionRepo.Intents,
+		Humans:       executionRepo.Humans,
+		WorkItems:    workQueue,
+		Issues:       issueRepo,
+	})
+	versionCloseSvc := versionapp.NewVersionCloseService(versionapp.VersionCloseServiceDeps{
+		Versions:      versionRepo,
+		WorkItems:     closureReaders,
+		Execution:     closureReaders,
+		HumanRequests: closureReaders,
+		Requirements:  requirementRepo,
+		Reports:       versionadapters.NewReportStatusReader(reportSvc),
+		ReportStaler:  reportSvc,
+		Tasks:         p4Tasks,
+		Audit:         auditSvc,
+		Events:        eventSvc,
+		Clock:         clk,
+	})
+	closureSvc := versionapp.NewClosureService(versionapp.ClosureServiceDeps{
+		Closures:     closureRepo,
+		Requirements: requirementRepo,
+		Cases:        closureReaders,
+		Runs:         closureReaders,
+		Coverage:     closureReaders,
+		Issues:       closureReaders,
+		WorkItems:    closureReaders,
+		Versions:     versionCloseSvc,
+		Tasks:        p4Tasks,
+		Audit:        auditSvc,
+		Events:       eventSvc,
+		IDs:          ids,
+		Clock:        clk,
+	})
+	// P4 reopen hooks: new requirement drafts and confirmed design cases clear
+	// the completed projection. Both are best effort; the reconciler retries.
+	requirementSvc.SetVersionReopener(versionCloseSvc)
+	designGraph.SetVersionReopener(versionCloseSvc)
+
+	chainVersionProvider := chainproviders.NewVersionProvider(requirementSvc, versionSvc)
+	chainDesignProvider := chainproviders.NewDesignProvider(designGraph)
+	chainExecutionProvider := chainproviders.NewExecutionProvider(
+		executionRepo.Waves, executionRepo.CaseRuns, executionSUTContextRepo)
+	chainDeliveryProvider := chainproviders.NewDeliveryProvider(issueRepo, reportRepo, requirementSvc, closureSvc)
+	chainResourceProvider := chainproviders.NewResourceProvider(versionSvc, resourceSvc)
+	chainCursorProvider := chainproviders.NewEventCursorProvider(eventSvc)
+	chainSvc := chainapp.NewChainService(
+		chainVersionProvider, chainDesignProvider, chainExecutionProvider,
+		chainDeliveryProvider, chainResourceProvider, chainCursorProvider, chainCursorProvider,
+		clk, p4ChainBudget(ctx, settingsSvc))
+	deliveryHandler := deliveryapi.New(issueSvc, deliveryapi.WithReports(reportSvc))
+	chainHandler := chainapi.New(chainSvc)
+
+	registerP4Plugins(issueSvc, analysisSvc, reportSvc, closureSvc, versionCloseSvc)
+
 	runtimeRepo := agentpg.NewRuntimeRepository(pool, ids)
 	if _, err := agentapp.EnsureProfiles(ctx, runtimeRepo); err != nil {
 		log.Fatalf("eztest: seed agent profiles: %v", err)
@@ -717,9 +832,10 @@ func main() {
 			Design:      designadapter.New(designGraph),
 			Execution:   executionRunner,
 		},
-		TaskProvider: executionadapters.NewTaskProvider(executionRunner),
-		RunCanceller: executionRunner,
-		InstanceID:   instanceID,
+		TaskProvider:    executionadapters.NewTaskProvider(executionRunner),
+		RunCanceller:    executionRunner,
+		ReportFinalizer: p4ReportFinalizer{service: reportSvc},
+		InstanceID:      instanceID,
 	})
 	worker := agentapp.NewWorker(workQueue, runner, settingsSvc, slog.Default(), instanceID,
 		agentapp.WithWorkerEvents(eventSvc),
@@ -733,14 +849,16 @@ func main() {
 		}
 	}()
 	reconciler := agentapp.NewReconciler(agentapp.ReconcilerDeps{
-		Versions:      versionSvc,
-		Conversations: ports,
-		Attachments:   ports,
-		Queue:         workQueue,
-		Events:        eventSvc,
-		Clock:         clk,
-		Logger:        slog.Default(),
-		Design:        designPlanner,
+		Versions:        versionSvc,
+		Conversations:   ports,
+		Attachments:     ports,
+		Queue:           workQueue,
+		Events:          eventSvc,
+		Clock:           clk,
+		Logger:          slog.Default(),
+		Design:          designPlanner,
+		P4:              p4.NewEnsurer(issueSvc, reportSvc, closureSvc, versionCloseSvc),
+		RunningVersions: versionSvc,
 	})
 	background.Add(1)
 	go func() {
@@ -777,6 +895,10 @@ func main() {
 		DesignExports: designExports,
 		DesignStarter: designStarterAdapter{planner: designPlanner},
 		Execution:     executionHandler,
+		Delivery:      deliveryHandler,
+		Chain:         chainHandler,
+		Closure:       closureSvc,
+		VersionClose:  versionCloseSvc,
 	})
 
 	srv := &http.Server{
