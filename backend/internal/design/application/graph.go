@@ -726,3 +726,119 @@ func checkAccumulatedLimits(
 	}
 	return nil
 }
+
+// ExecutableCaseView is the P3 execution read projection of one
+// current+confirmed case version. It is the only design surface the execution
+// context consumes; no P2 write semantics change.
+type ExecutableCaseView struct {
+	CaseID               int64
+	CaseVersionID        int64
+	RequirementID        int64
+	RequirementVersionID int64
+	DefaultVersionSUTID  int64
+	Title                string
+	Description          string
+	Preconditions        string
+	Priority             string
+	VersionSUTIDs        []int64
+	Steps                []ExecutableStepView
+	Assertions           []ExecutableAssertionView
+}
+
+// ExecutableStepView is one P3 case step projection.
+type ExecutableStepView struct {
+	Seq                int
+	Action             string
+	Expected           string
+	TargetVersionSUTID int64
+	AccountRole        string
+	PageID             *int64
+	APIID              *int64
+	Data               []byte
+}
+
+// ExecutableAssertionView is one P3 case assertion projection. AssertionSeq is
+// derived server-side by ascending case_assertion ID (P3-D-06).
+type ExecutableAssertionView struct {
+	StepSeq            int
+	AssertionSeq       int
+	Kind               string
+	Expected           string
+	TargetVersionSUTID int64
+	DatabaseID         *int64
+	APIID              *int64
+}
+
+// GetCaseVersion returns one current+confirmed case version for execution. It
+// maps a stale/superseded/draft or foreign case version to not_found.
+func (s *GraphService) GetCaseVersion(ctx context.Context, versionID, caseVersionID int64) (ExecutableCaseView, error) {
+	if err := requirePositiveID("version_id", versionID); err != nil {
+		return ExecutableCaseView{}, err
+	}
+	if err := requirePositiveID("case_version_id", caseVersionID); err != nil {
+		return ExecutableCaseView{}, err
+	}
+	data, err := s.repo.ReadExecutableCase(ctx, versionID, caseVersionID)
+	if err != nil {
+		return ExecutableCaseView{}, mapDesignError(err, "case version")
+	}
+	return executableCaseView(data), nil
+}
+
+// ListExecutable returns every current+confirmed case version of a version.
+func (s *GraphService) ListExecutable(ctx context.Context, versionID int64) ([]ExecutableCaseView, error) {
+	if err := requirePositiveID("version_id", versionID); err != nil {
+		return nil, err
+	}
+	data, err := s.repo.ListExecutableCases(ctx, versionID)
+	if err != nil {
+		return nil, mapDesignError(err, "version")
+	}
+	views := make([]ExecutableCaseView, 0, len(data))
+	for _, item := range data {
+		views = append(views, executableCaseView(item))
+	}
+	return views, nil
+}
+
+func executableCaseView(data design.ExecutableCase) ExecutableCaseView {
+	version := data.Version
+	view := ExecutableCaseView{
+		CaseID:               data.CaseID,
+		CaseVersionID:        version.ID,
+		RequirementID:        data.RequirementID,
+		RequirementVersionID: data.RequirementVersionID,
+		DefaultVersionSUTID:  derefInt64(version.DefaultVersionSUTID),
+		Title:                version.Title,
+		Description:          version.Description,
+		Preconditions:        version.Preconditions,
+		Priority:             version.Priority,
+		VersionSUTIDs:        append([]int64(nil), version.VersionSUTIDs...),
+		Steps:                make([]ExecutableStepView, 0, len(version.Steps)),
+		Assertions:           make([]ExecutableAssertionView, 0, len(version.Assertions)),
+	}
+	for _, step := range version.Steps {
+		view.Steps = append(view.Steps, ExecutableStepView{
+			Seq:                step.Seq,
+			Action:             step.Action,
+			Expected:           step.Expected,
+			TargetVersionSUTID: derefInt64(step.TargetVersionSUTID),
+			AccountRole:        step.AccountRole,
+			PageID:             step.TargetPageID,
+			APIID:              step.TargetAPIID,
+			Data:               append([]byte(nil), step.Data...),
+		})
+	}
+	for _, assertion := range version.Assertions {
+		view.Assertions = append(view.Assertions, ExecutableAssertionView{
+			StepSeq:            assertion.StepSeq,
+			AssertionSeq:       assertion.AssertionSeq,
+			Kind:               assertion.Kind,
+			Expected:           assertion.Expected,
+			TargetVersionSUTID: derefInt64(assertion.TargetVersionSUTID),
+			DatabaseID:         assertion.DatabaseID,
+			APIID:              assertion.TargetAPIID,
+		})
+	}
+	return view
+}

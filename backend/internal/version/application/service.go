@@ -210,6 +210,29 @@ func (s *Service) MarkRunning(ctx context.Context, id int64) error {
 	return nil
 }
 
+// Reopen projects a completed version back to running and clears its close
+// fields (P3 §5.9 / P3-D-28). It is idempotent: only the call that flips
+// completed -> running publishes version.status_changed and records the audit
+// entry. Executing a new intent calls it before creating the intent.
+func (s *Service) Reopen(ctx context.Context, id int64) error {
+	if id <= 0 {
+		return platform.Invalid("id", "must be a positive decimal ID")
+	}
+	changed, err := s.repo.Reopen(ctx, id, s.clock.Now())
+	if err != nil {
+		return mapRepositoryError(err)
+	}
+	if !changed {
+		// Distinguish "already running" from "missing version".
+		if _, _, err := s.repo.Get(ctx, id); err != nil {
+			return mapRepositoryError(err)
+		}
+		return nil
+	}
+	s.recordReopened(ctx, id)
+	return nil
+}
+
 // validateBindings checks the 1-20 binding cardinality, SUT uniqueness and
 // resource ownership against the resource catalog. It returns the normalized
 // domain bindings (deduplicated IDs, stable order) ready for persistence.
@@ -608,6 +631,33 @@ func (s *Service) recordUpdated(ctx context.Context, entity version.Version, act
 			"auto_design_new_requirements": entity.AutoDesignNewRequirements,
 		},
 	})
+}
+
+// recordReopened publishes version.status_changed completed -> running and
+// records the version.reopened audit entry. Delivery is best effort.
+func (s *Service) recordReopened(ctx context.Context, versionID int64) {
+	targetID := platformid.Format(versionID)
+	requestID := requestid.From(ctx)
+	if s.events != nil {
+		scope := map[string]any{"version_id": targetID}
+		payload := map[string]any{"from": version.StatusCompleted, "to": version.StatusRunning}
+		_ = s.events.Publish(ctx, eventingapp.Event{
+			Channel:   "version:" + targetID,
+			Type:      "version.status_changed",
+			Scope:     scope,
+			Payload:   payload,
+			RequestID: requestID,
+		})
+	}
+	if s.audit != nil {
+		_ = s.audit.Record(ctx, auditapp.Event{
+			Action:     "version.reopened",
+			TargetKind: "version",
+			TargetID:   targetID,
+			RequestID:  requestID,
+			Metadata:   map[string]any{"id": targetID, "from": version.StatusCompleted, "to": version.StatusRunning},
+		})
+	}
 }
 
 // recordStatusProjection publishes version.started and version.status_changed

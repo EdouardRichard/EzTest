@@ -1497,3 +1497,49 @@ func mustID(t *testing.T, raw string) int64 {
 	}
 	return value
 }
+
+func TestGetAccountSecretReturnsStoredCredentials(t *testing.T) {
+	h := newHarness()
+	newDataEnv(t, h)
+	account, err := h.svc.CreateAccount(context.Background(), 1001, AccountInput{
+		EnvironmentID: 1002, Username: "order_admin", Password: "s3cret", Roles: []string{"order_admin"},
+	}, 42)
+	if err != nil {
+		t.Fatalf("CreateAccount: %v", err)
+	}
+	username, password, err := h.svc.GetAccountSecret(context.Background(), mustID(t, account.ID))
+	if err != nil {
+		t.Fatalf("GetAccountSecret: %v", err)
+	}
+	if username != "order_admin" || password != "s3cret" {
+		t.Fatalf("secret = %q/%q", username, password)
+	}
+	if _, _, err := h.svc.GetAccountSecret(context.Background(), 999999); err == nil {
+		t.Fatal("missing account must report not_found")
+	}
+	if _, _, err := h.svc.GetAccountSecret(context.Background(), 0); err == nil {
+		t.Fatal("invalid account id must be rejected")
+	}
+}
+
+func TestGetDatabaseSecretReturnsStoredCredentials(t *testing.T) {
+	h := newHarness()
+	newDataEnv(t, h)
+	database, err := h.svc.CreateDatabase(context.Background(), 1001, DatabaseInput{
+		EnvironmentID: 1002, Name: "orders-db",
+		DSN: "postgres://db.example.com:5432/orders", Username: "reader", Password: "pw",
+	}, 42)
+	if err != nil {
+		t.Fatalf("CreateDatabase: %v", err)
+	}
+	dsn, username, password, err := h.svc.GetDatabaseSecret(context.Background(), mustID(t, database.ID))
+	if err != nil {
+		t.Fatalf("GetDatabaseSecret: %v", err)
+	}
+	if dsn != "postgres://db.example.com:5432/orders" || username != "reader" || password != "pw" {
+		t.Fatalf("secret = %q/%q/%q", dsn, username, password)
+	}
+	if _, _, _, err := h.svc.GetDatabaseSecret(context.Background(), 999999); err == nil {
+		t.Fatal("missing database must report not_found")
+	}
+}

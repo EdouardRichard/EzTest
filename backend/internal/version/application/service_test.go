@@ -227,6 +227,23 @@ func (f *fakeRepo) MarkRunning(_ context.Context, id int64, updatedAt time.Time)
 	return true, nil
 }
 
+func (f *fakeRepo) Reopen(_ context.Context, id int64, updatedAt time.Time) (bool, error) {
+	v, ok := f.versions[id]
+	if !ok {
+		return false, nil
+	}
+	if v.Status != version.StatusCompleted {
+		return false, nil
+	}
+	v.Status = version.StatusRunning
+	v.ClosedAt = nil
+	v.CloseReason = ""
+	v.CloseRunID = nil
+	v.UpdatedAt = updatedAt
+	f.versions[id] = v
+	return true, nil
+}
+
 func (f *fakeRepo) Stats(_ context.Context, _ int64) (version.VersionStats, error) {
 	return f.stats, nil
 }
@@ -860,5 +877,69 @@ func TestServiceImplementsUsageChecker(t *testing.T) {
 	page, _, err := env.svc.List(requestContext(), 10, nil)
 	if err != nil || len(page) != 1 || page[0].ID != created.ID || page[0].SUTCount != 1 {
 		t.Fatalf("list = %#v, %v", page, err)
+	}
+}
+
+func TestReopenCompletedVersionPublishesStatusChange(t *testing.T) {
+	env := newTestEnv(t)
+	created := createVersion(t, env, "Reopen me")
+	stored := env.repo.versions[created.ID]
+	stored.Status = version.StatusCompleted
+	closedAt := testTime
+	stored.ClosedAt = &closedAt
+	stored.CloseReason = "done"
+	env.repo.versions[created.ID] = stored
+	env.publisher.events = nil
+	env.audit.events = nil
+
+	if err := env.svc.Reopen(requestContext(), created.ID); err != nil {
+		t.Fatalf("Reopen: %v", err)
+	}
+	reopened := env.repo.versions[created.ID]
+	if reopened.Status != version.StatusRunning {
+		t.Fatalf("status = %s, want running", reopened.Status)
+	}
+	if reopened.ClosedAt != nil || reopened.CloseReason != "" {
+		t.Fatalf("closed fields not cleared: %+v", reopened)
+	}
+	changed := false
+	for _, event := range env.publisher.events {
+		if event.Type != "version.status_changed" {
+			continue
+		}
+		if event.Payload["from"] != version.StatusCompleted || event.Payload["to"] != version.StatusRunning {
+			t.Fatalf("status_changed payload = %+v", event.Payload)
+		}
+		changed = true
+	}
+	if !changed {
+		t.Fatal("version.status_changed completed->running not published")
+	}
+	audited := false
+	for _, event := range env.audit.events {
+		if event.Action == "version.reopened" {
+			audited = true
+		}
+	}
+	if !audited {
+		t.Fatal("version.reopened audit entry missing")
+	}
+
+	// Idempotent: a non-completed version publishes nothing new.
+	eventsBefore := len(env.publisher.events)
+	if err := env.svc.Reopen(requestContext(), created.ID); err != nil {
+		t.Fatalf("second Reopen: %v", err)
+	}
+	if len(env.publisher.events) != eventsBefore {
+		t.Fatal("reopen of a running version must not publish status changes")
+	}
+}
+
+func TestReopenMissingVersion(t *testing.T) {
+	env := newTestEnv(t)
+	err := env.svc.Reopen(requestContext(), 999999)
+	var apiErr *platform.Error
+	if !errors.As(err, &apiErr) || apiErr.Code != "not_found" {
+		t.Fatalf("err = %v, want not_found", err)
 	}
 }

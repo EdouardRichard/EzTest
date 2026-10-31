@@ -161,6 +161,16 @@ type DataPlanPatch struct {
 	TestData      json.RawMessage
 }
 
+// ExecutableCase is the P3 execution read projection: one current+confirmed
+// case version with its requirement context. The execution context maps this
+// onto its own domain snapshot; design never imports execution.
+type ExecutableCase struct {
+	CaseID               int64
+	RequirementID        int64
+	RequirementVersionID int64
+	Version              CaseVersion
+}
+
 // GraphRepository reads design graph snapshots, case detail, overview and the
 // version/requirement projections needed for validation.
 type GraphRepository interface {
@@ -170,6 +180,14 @@ type GraphRepository interface {
 	RequirementContext(ctx context.Context, versionID, requirementID int64) (RequirementRef, error)
 	VersionTitle(ctx context.Context, versionID int64) (string, error)
 	Overview(ctx context.Context, versionID int64) (OverviewData, error)
+
+	// ReadExecutableCase loads one current+confirmed case version that belongs
+	// to the version and whose scenario still targets the current requirement
+	// revision. A stale/superseded/draft case version is ErrNotFound.
+	ReadExecutableCase(ctx context.Context, versionID, caseVersionID int64) (ExecutableCase, error)
+	// ListExecutableCases lists every current+confirmed case version of a
+	// version in ascending case-version ID order.
+	ListExecutableCases(ctx context.Context, versionID int64) ([]ExecutableCase, error)
 }
 
 // Tx is the write surface of one requirement-scoped advisory-lock transaction.

@@ -1053,6 +1053,35 @@ func (s *Service) GetAccount(ctx context.Context, id int64) (AccountView, error)
 	return toAccountView(account), nil
 }
 
+// GetAccountSecret returns the stored username/password of one test account.
+// It is an application-only port for the execution context (P3 §6.6) and is
+// never exposed through HTTP or logged. Callers resolve the account through the
+// version SUT binding first.
+func (s *Service) GetAccountSecret(ctx context.Context, accountID int64) (username, password string, err error) {
+	if accountID <= 0 {
+		return "", "", platform.Invalid("account_id", "must be a positive decimal ID")
+	}
+	account, err := s.repo.GetAccount(ctx, accountID)
+	if err != nil {
+		return "", "", mapRepoError(err, "account", "")
+	}
+	return account.Username, account.Password, nil
+}
+
+// GetDatabaseSecret returns the stored DSN/username/password of one target
+// database. It is an application-only port for the execution context (P3 §6.5)
+// and is never exposed through HTTP or logged.
+func (s *Service) GetDatabaseSecret(ctx context.Context, databaseID int64) (dsn, username, password string, err error) {
+	if databaseID <= 0 {
+		return "", "", "", platform.Invalid("database_id", "must be a positive decimal ID")
+	}
+	database, err := s.repo.GetDatabase(ctx, databaseID)
+	if err != nil {
+		return "", "", "", mapRepoError(err, "database", "")
+	}
+	return database.DSN, database.Username, database.Password, nil
+}
+
 // CreateRepository stores a code repository. Any authenticated user may create
 // one; CreatedBy records the actor.
 func (s *Service) CreateRepository(ctx context.Context, input RepositoryInput, actorID int64) (CodeRepositoryView, error) {
