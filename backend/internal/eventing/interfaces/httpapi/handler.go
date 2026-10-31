@@ -50,7 +50,7 @@ func New(svc Service) *Handler {
 
 type snapshotResponse struct {
 	Data           []eventDTO `json:"data"`
-	SnapshotCursor string     `json:"snapshot_cursor"`
+	SnapshotCursor int64      `json:"snapshot_cursor"`
 	HasMore        bool       `json:"has_more"`
 }
 
@@ -91,7 +91,7 @@ func (h *Handler) Snapshot(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(snapshotResponse{Data: items, SnapshotCursor: cursor, HasMore: page.HasMore})
+	_ = json.NewEncoder(w).Encode(snapshotResponse{Data: items, SnapshotCursor: page.Cursor, HasMore: page.HasMore})
 }
 
 // Stream GET /api/stream?channel=&after= with the SSE Last-Event-ID header.
@@ -163,13 +163,14 @@ func (h *Handler) Stream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("X-Snapshot-Cursor", strconv.FormatInt(bounds.LastSeq, 10))
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
 	if needsReset {
 		data, err := json.Marshal(map[string]any{
 			"channel":         channel,
-			"snapshot_cursor": strconv.FormatInt(cursor, 10),
+			"snapshot_cursor": cursor,
 			"reason":          "cursor_out_of_range",
 		})
 		if err != nil {

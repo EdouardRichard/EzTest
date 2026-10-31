@@ -18,6 +18,11 @@ func TestErrorHelpers(t *testing.T) {
 		{"forbidden", Forbidden(), http.StatusForbidden, "forbidden"},
 		{"not found", NotFound("sut"), http.StatusNotFound, "not_found"},
 		{"conflict", Conflict("already exists"), http.StatusConflict, "conflict"},
+		{"state conflict", StateConflict("invalid transition"), http.StatusConflict, "state_conflict"},
+		{"lease lost", LeaseLost(), http.StatusConflict, "lease_lost"},
+		{"ai unavailable", AIUnavailable("upstream down"), http.StatusServiceUnavailable, "ai_unavailable"},
+		{"context overflow", ContextOverflow("too large"), http.StatusServiceUnavailable, "context_overflow"},
+		{"attachment failed", AttachmentError("extraction_failed", "bad pdf"), http.StatusUnprocessableEntity, "extraction_failed"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -25,6 +30,9 @@ func TestErrorHelpers(t *testing.T) {
 				t.Fatalf("error = %#v, want status %d code %s", tc.err, tc.status, tc.code)
 			}
 		})
+	}
+	if !AIUnavailable("x").Retryable || !ContextOverflow("x").Retryable {
+		t.Fatal("transient LLM errors must be retryable")
 	}
 }
 
