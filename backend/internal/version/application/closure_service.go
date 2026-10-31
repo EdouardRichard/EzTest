@@ -234,13 +234,16 @@ func (s *ClosureService) Reopen(ctx context.Context, requirementID int64, reason
 // EnsureClosures is the reconciler hook: it scans the clarified requirements
 // of one version, recomputes the predicate and idempotently ensures the
 // requirement.close task for every requirement whose checks already pass. The
-// closure task itself is excluded from the open-work count.
+// task targets the requirement's current version and next close round, so its
+// dedupe key is revision- and round-aware (req-close:{requirement_id}:
+// {requirement_version_id}:{close_round}). The closure task itself is excluded
+// from the open-work count.
 func (s *ClosureService) EnsureClosures(ctx context.Context, versionID int64) error {
 	if versionID <= 0 {
 		return platform.Invalid("id", "must be a positive decimal ID")
 	}
-	if s.requirements == nil || s.tasks == nil {
-		return errors.New("closure service is missing its requirement repository or task ensurer")
+	if s.requirements == nil || s.closures == nil || s.tasks == nil {
+		return errors.New("closure service is missing its requirement repository, closure repository or task ensurer")
 	}
 	var beforeID *int64
 	var failures []error
@@ -258,7 +261,12 @@ func (s *ClosureService) EnsureClosures(ctx context.Context, versionID int64) er
 			if !checks.Passed() {
 				continue
 			}
-			if err := s.tasks.EnsureRequirementClose(ctx, item.Requirement.ID); err != nil {
+			closeRound, err := s.nextCloseRound(ctx, item.Requirement.ID)
+			if err != nil {
+				failures = append(failures, fmt.Errorf("load close round for %d: %w", item.Requirement.ID, err))
+				continue
+			}
+			if err := s.tasks.EnsureRequirementClose(ctx, item.Requirement.ID, item.Current.ID, closeRound); err != nil {
 				failures = append(failures, fmt.Errorf("ensure requirement.close for %d: %w", item.Requirement.ID, err))
 			}
 		}
@@ -269,6 +277,19 @@ func (s *ClosureService) EnsureClosures(ctx context.Context, versionID int64) er
 		beforeID = &lastID
 	}
 	return errors.Join(failures...)
+}
+
+// nextCloseRound returns the round the next closure of one requirement will be
+// assigned: the newest recorded round plus one, or 1 when it was never closed.
+func (s *ClosureService) nextCloseRound(ctx context.Context, requirementID int64) (int32, error) {
+	latest, found, err := s.closures.Latest(ctx, requirementID)
+	if err != nil {
+		return 0, err
+	}
+	if !found {
+		return 1, nil
+	}
+	return int32(latest.CloseRound + 1), nil
 }
 
 // evaluate loads the ports and recomputes the checks plus the persisted
