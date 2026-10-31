@@ -11,6 +11,7 @@ import { ErrorState } from "@/components/ui/ErrorState"
 import { LoadingCard } from "@/components/ui/Spinner"
 import { Tabs } from "@/components/ui/Tabs"
 import { RequirementsTab } from "@/features/clarification/RequirementsTab"
+import { IssuesTab } from "@/features/delivery/IssuesTab"
 import { DesignTab } from "@/features/design/DesignTab"
 import { ExecutionTab } from "@/features/execution/ExecutionTab"
 import { formatDateTime } from "@/lib/format"
@@ -25,7 +26,10 @@ const STATUS_META: Record<VersionStatus, { label: string; tone: BadgeTone }> = {
   completed: { label: "已完成", tone: "neutral" },
 }
 
-type PlaceholderTab = Exclude<VersionTab, "overview" | "requirements" | "design" | "execution">
+type PlaceholderTab = Exclude<
+  VersionTab,
+  "overview" | "requirements" | "design" | "execution" | "issues"
+>
 
 type PlaceholderCopy = {
   label: string
@@ -38,11 +42,6 @@ const PLACEHOLDER_COPY: Record<PlaceholderTab, PlaceholderCopy> = {
     label: "探索链路",
     phase: "P4",
     description: "跨 SUT 的探索链路图、过滤与历史回放由 P4 阶段提供。",
-  },
-  issues: {
-    label: "问题",
-    phase: "P4",
-    description: "失败归类、问题去重与复测闭环由 P4 阶段提供。",
   },
   reports: {
     label: "报告",
@@ -286,6 +285,10 @@ export function VersionDetailPage({
       if (waveId) params.set("wave", waveId)
       if (caseRunId) params.set("case_run", caseRunId)
     }
+    if (next === "issues") {
+      const issueId = searchParams.get("issue")
+      if (issueId) params.set("issue", issueId)
+    }
     router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`)
   }
 
@@ -378,6 +381,8 @@ export function VersionDetailPage({
           initialWaveId={executionWaveId}
           initialCaseRunId={executionCaseRunId}
         />
+      ) : activeTab === "issues" ? (
+        <IssuesTab versionId={versionId} />
       ) : (
         <TabPlaceholder tab={activeTab} />
       )}
