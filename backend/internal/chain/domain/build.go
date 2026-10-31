@@ -57,7 +57,9 @@ var chainCountKeys = []string{
 func BuildChain(src SourceGraph, f ChainFilter, b Budget, snapshotCursor int64, now time.Time) ChainView {
 	f = f.Normalize()
 	b = ClampBudget(b)
-	if f.Limit > 0 {
+	// The filter limit is a lower-only override: it may tighten the configured
+	// node budget but never raises it above chain.max_nodes.
+	if f.Limit > 0 && f.Limit < b.MaxNodes {
 		b.MaxNodes = f.Limit
 	}
 

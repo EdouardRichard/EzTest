@@ -535,6 +535,14 @@ func TestChainServiceLimitOverride(t *testing.T) {
 		t.Errorf("Filters.Limit = %d, want 50", view.Filters.Limit)
 	}
 
+	capped, err := newService(newFakeProviders(), now).Read(context.Background(), 42, chain.ChainFilter{Limit: 1000})
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if got := capped.Truncation.MaxNodes; got != chain.DefaultMaxNodes {
+		t.Errorf("Truncation.MaxNodes = %d, want the configured budget %d for limit 1000", got, chain.DefaultMaxNodes)
+	}
+
 	invalid, err := newService(newFakeProviders(), now).Read(context.Background(), 42, chain.ChainFilter{Limit: 5000})
 	if err != nil {
 		t.Fatalf("Read() error = %v", err)

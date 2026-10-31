@@ -854,7 +854,7 @@ func equalFilters(left, right ChainFilter) bool {
 		left.Limit == right.Limit
 }
 
-func TestBuildChainLimitOverride(t *testing.T) {
+func TestBuildChainLimitLowerOnly(t *testing.T) {
 	now := time.Date(2026, 11, 1, 5, 0, 0, 0, time.UTC)
 
 	tests := []struct {
@@ -864,10 +864,22 @@ func TestBuildChainLimitOverride(t *testing.T) {
 		want   int
 	}{
 		{
-			name:   "filter limit overrides the node budget",
+			name:   "limit cannot raise the configured budget",
+			filter: ChainFilter{Limit: 1000},
+			budget: Budget{MaxNodes: 300},
+			want:   300,
+		},
+		{
+			name:   "limit below the configured budget lowers it",
+			filter: ChainFilter{Limit: 100},
+			budget: Budget{MaxNodes: 300},
+			want:   100,
+		},
+		{
+			name:   "limit above a lower configured budget stays at the budget",
 			filter: ChainFilter{Limit: 50},
 			budget: Budget{MaxNodes: 5},
-			want:   50,
+			want:   5,
 		},
 		{
 			name:   "unset limit keeps the budget",
