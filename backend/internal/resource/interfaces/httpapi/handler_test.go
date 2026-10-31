@@ -803,17 +803,16 @@ func TestCatalogShape(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
 	}
-	var body struct {
-		Data []environmentDTO `json:"data"`
-	}
-	_ = body
 	var envelope struct {
-		Data []json.RawMessage `json:"data"`
+		Data struct {
+			SUTs         []json.RawMessage `json:"suts"`
+			Repositories []json.RawMessage `json:"repositories"`
+		} `json:"data"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(envelope.Data) != 1 {
+	if len(envelope.Data.SUTs) != 1 {
 		t.Fatalf("catalog = %s", rec.Body.String())
 	}
 }
