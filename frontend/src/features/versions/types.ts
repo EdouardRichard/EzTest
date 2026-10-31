@@ -148,9 +148,9 @@ export type Version = {
   auto_design_new_requirements: boolean
   bindings: VersionBinding[]
   /** P2: clarified requirements not activated into any design round yet. */
-  pending_design_count: number
+  pending_design_count?: number
   /** P2: current case versions by status; `superseded` history is excluded. */
-  case_counts: VersionCaseCounts
+  case_counts?: VersionCaseCounts
   created_by: string
   created_at: string
   updated_at: string
