@@ -51,7 +51,8 @@ func issueRepoCandidateDefaults(in issueRepoTestCandidate) issueRepoTestCandidat
 		in.assertionSeq = 1
 	}
 	if in.failureClass == "" {
-		in.failureClass = "assertion_failed"
+		// Only application failures become issues (spec §5.1).
+		in.failureClass = "application"
 	}
 	if in.category == "" {
 		in.category = "ui"
