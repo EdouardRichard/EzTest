@@ -29,5 +29,5 @@ type TaskEnqueuer interface {
 // attachment service implements it; conversation messages never block on
 // extraction.
 type MessageAttachmentRegistrar interface {
-	RegisterFromMessage(ctx context.Context, versionID, messageID int64, part version.MessagePart, actorID int64) (version.Attachment, error)
+	RegisterFromMessage(ctx context.Context, versionID, messageID int64, part version.MessagePart, actorID int64) (AttachmentView, error)
 }

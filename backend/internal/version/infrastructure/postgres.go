@@ -288,6 +288,41 @@ func (r *Repository) Stats(ctx context.Context, id int64) (version.VersionStats,
 	return stats, nil
 }
 
+// ListInitialVersionsWithContent returns initial versions that already have a
+// conversation message or requirement (P1 reconciler projection repair).
+func (r *Repository) ListInitialVersionsWithContent(ctx context.Context, limit int) ([]int64, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT v.id FROM version v
+		WHERE v.status = 'initial'
+		  AND (
+			EXISTS (
+				SELECT 1 FROM conversation c
+				JOIN conversation_message m ON m.conversation_id = c.id
+				WHERE c.version_id = v.id
+			)
+			OR EXISTS (SELECT 1 FROM requirement r WHERE r.version_id = v.id)
+		  )
+		ORDER BY v.id
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list initial versions with content: %w", err)
+	}
+	defer rows.Close()
+	ids := make([]int64, 0)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan initial version: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list initial versions with content: %w", err)
+	}
+	return ids, nil
+}
+
 // SUTInUse reports whether any version binding references the SUT.
 func (r *Repository) SUTInUse(ctx context.Context, id int64) (bool, error) {
 	return r.exists(ctx, `SELECT EXISTS (SELECT 1 FROM version_sut WHERE sut_id = $1)`, id)

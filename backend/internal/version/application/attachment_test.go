@@ -21,6 +21,8 @@ type fakeAttachmentRepo struct {
 	attachments          map[int64]version.Attachment
 	conversationMessages map[int64]int64 // message ID -> conversation ID
 	conversations        map[int64]int64 // conversation ID -> version ID
+	pendingForIngest     []version.PendingAttachment
+	lastPendingLimit     int
 	createErr            error
 }
 
@@ -86,6 +88,11 @@ func (f *fakeAttachmentRepo) ConversationExists(_ context.Context, versionID, co
 	}
 	conversationVersion, ok := f.conversations[conversationID]
 	return ok && conversationVersion == versionID, nil
+}
+
+func (f *fakeAttachmentRepo) ListPendingForIngest(_ context.Context, limit int) ([]version.PendingAttachment, error) {
+	f.lastPendingLimit = limit
+	return f.pendingForIngest, nil
 }
 
 func (f *fakeAttachmentRepo) MarkProcessing(_ context.Context, attachmentID int64, updatedAt time.Time) (bool, error) {

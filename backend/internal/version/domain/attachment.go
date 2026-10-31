@@ -113,6 +113,9 @@ type AttachmentRepository interface {
 	MarkProcessing(ctx context.Context, attachmentID int64, updatedAt time.Time) (bool, error)
 	MarkDone(ctx context.Context, attachmentID int64, extractedContentRefID int64, updatedAt time.Time) error
 	MarkFailed(ctx context.Context, attachmentID int64, code, message string, updatedAt time.Time) error
+	// ListPendingForIngest returns the oldest pending attachments for the P1
+	// attachment.ingest reconciler.
+	ListPendingForIngest(ctx context.Context, limit int) ([]PendingAttachment, error)
 }
 
 // SanitizeAttachmentName strips directory components and control characters.
@@ -172,4 +175,13 @@ func DetectAttachmentKind(name, mime string) AttachmentKind {
 	default:
 		return AttachmentUnsupported
 	}
+}
+
+// PendingAttachment is the ingest reconciler row: a pending attachment plus the
+// conversation/message that owns it when linked.
+type PendingAttachment struct {
+	ID             int64
+	VersionID      int64
+	ConversationID int64
+	MessageID      int64
 }
