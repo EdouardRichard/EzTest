@@ -2,8 +2,11 @@ package server
 
 import (
 	"context"
+	"errors"
 	"net/http"
 
+	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
+	agentapi "github.com/EdouardRichard/EzTest/backend/internal/agent/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/audit/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
@@ -27,17 +30,20 @@ import (
 
 // Deps is the fully constructed application surface the HTTP layer exposes.
 type Deps struct {
-	Config   config.Config
-	Pool     *pgxpool.Pool
-	Version  string
-	Settings *settingsapp.Service
-	Identity *identityapp.Service
-	Audit    *auditapp.Service
-	Events   *eventingapp.Service
-	Storage  *storageapp.Service
-	LLM      *llmapp.Service
-	Resource *resourceapp.Service
-	Versions *versionapp.Service
+	Config        config.Config
+	Pool          *pgxpool.Pool
+	Version       string
+	Settings      *settingsapp.Service
+	Identity      *identityapp.Service
+	Audit         *auditapp.Service
+	Events        *eventingapp.Service
+	Storage       *storageapp.Service
+	LLM           *llmapp.Service
+	Resource      *resourceapp.Service
+	Versions      *versionapp.Service
+	Requirements  *versionapp.RequirementService
+	Conversations *versionapp.ConversationService
+	TeamRoom      *agentapp.TeamRoom
 }
 
 // New assembles the HTTP middleware chain and every P0 route.
@@ -65,12 +71,37 @@ func New(deps Deps) http.Handler {
 	registerEventRoutes(mux, authenticated, eventingapi.New(deps.Events))
 	registerResourceRoutes(mux, authenticated, admin, resourceapi.New(deps.Resource))
 	registerVersionRoutes(mux, authenticated, versionapi.New(deps.Versions))
+	registerRequirementRoutes(mux, authenticated, versionapi.NewRequirementHandler(deps.Requirements))
+	registerConversationRoutes(mux, authenticated, versionapi.NewConversationHandler(deps.Conversations))
+	registerTeamRoomRoutes(mux, authenticated, agentapi.NewTeamRoom(deps.TeamRoom, versionExistence{deps.Versions}))
 
 	return RequestID(Recover(Logging(CORS(deps.Config)(mux))))
 }
 
 type identityAuthenticator struct {
 	svc *identityapp.Service
+}
+
+// versionExistence adapts the version application service to the agent team
+// room handler's local Exists port; missing versions become 404, other errors
+// propagate.
+type versionExistence struct {
+	svc *versionapp.Service
+}
+
+func (v versionExistence) Exists(ctx context.Context, id int64) (bool, error) {
+	if v.svc == nil {
+		return false, platform.NewError(http.StatusInternalServerError, "internal", "version service is not configured")
+	}
+	_, err := v.svc.Get(ctx, id)
+	if err == nil {
+		return true, nil
+	}
+	var apiErr *platform.Error
+	if errors.As(err, &apiErr) && apiErr.Code == "not_found" {
+		return false, nil
+	}
+	return false, err
 }
 
 func (a identityAuthenticator) Authenticate(ctx context.Context, token string) (platform.Actor, error) {
@@ -120,6 +151,29 @@ func registerVersionRoutes(mux *http.ServeMux, authenticated func(http.Handler) 
 	mux.Handle("POST /api/versions", authenticated(http.HandlerFunc(h.Create)))
 	mux.Handle("GET /api/versions/{id}", authenticated(http.HandlerFunc(h.Get)))
 	mux.Handle("PATCH /api/versions/{id}", authenticated(http.HandlerFunc(h.Update)))
+}
+
+func registerRequirementRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *versionapi.RequirementHandler) {
+	mux.Handle("GET /api/versions/{id}/requirements", authenticated(http.HandlerFunc(h.List)))
+	mux.Handle("POST /api/versions/{id}/requirements", authenticated(http.HandlerFunc(h.Create)))
+	mux.Handle("POST /api/versions/{id}/requirements/confirmations", authenticated(http.HandlerFunc(h.BatchConfirm)))
+	mux.Handle("GET /api/versions/{id}/requirements/{rid}", authenticated(http.HandlerFunc(h.Get)))
+	mux.Handle("PATCH /api/versions/{id}/requirements/{rid}", authenticated(http.HandlerFunc(h.Update)))
+	mux.Handle("POST /api/versions/{id}/requirements/{rid}/confirmations", authenticated(http.HandlerFunc(h.Confirm)))
+	mux.Handle("POST /api/versions/{id}/requirements/{rid}/rollback", authenticated(http.HandlerFunc(h.Rollback)))
+	mux.Handle("GET /api/versions/{id}/requirements/{rid}/relations", authenticated(http.HandlerFunc(h.ListRelations)))
+}
+
+func registerConversationRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *versionapi.ConversationHandler) {
+	mux.Handle("GET /api/versions/{id}/conversations", authenticated(http.HandlerFunc(h.List)))
+	mux.Handle("POST /api/versions/{id}/conversations", authenticated(http.HandlerFunc(h.Create)))
+	mux.Handle("GET /api/versions/{id}/conversations/{cid}", authenticated(http.HandlerFunc(h.Get)))
+	mux.Handle("GET /api/versions/{id}/conversations/{cid}/messages", authenticated(http.HandlerFunc(h.Messages)))
+	mux.Handle("POST /api/versions/{id}/conversations/{cid}/messages", authenticated(http.HandlerFunc(h.PostMessage)))
+}
+
+func registerTeamRoomRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *agentapi.TeamRoomHandler) {
+	mux.Handle("GET /api/versions/{id}/team-rooms/{team}", authenticated(http.HandlerFunc(h.Read)))
 }
 
 func registerResourceRoutes(mux *http.ServeMux, authenticated, admin func(http.Handler) http.Handler, h *resourceapi.Handler) {
