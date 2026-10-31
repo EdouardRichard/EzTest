@@ -789,8 +789,12 @@ func main() {
 	})
 	// P4 reopen hooks: new requirement drafts and confirmed design cases clear
 	// the completed projection. Both are best effort; the reconciler retries.
+	// The execution intent path uses the same P4 reopen service so a new intent
+	// emits version.reopened (trigger=execution_intent) and marks the version
+	// report stale instead of the P3 status_changed projection only.
 	requirementSvc.SetVersionReopener(versionCloseSvc)
 	designGraph.SetVersionReopener(versionCloseSvc)
+	executionVersionAdapter.SetVersionReopener(versionCloseSvc)
 
 	chainVersionProvider := chainproviders.NewVersionProvider(requirementSvc, versionSvc)
 	chainDesignProvider := chainproviders.NewDesignProvider(designGraph)

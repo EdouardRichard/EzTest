@@ -263,11 +263,12 @@ func (r *Repository) Reopen(ctx context.Context, id int64, updatedAt time.Time) 
 	return tag.RowsAffected() > 0, nil
 }
 
-// Close completes one running version (P4 spec §7.3/§7.4). It locks the version
-// row, re-runs the service predicate through recheck while the lock is held and
-// only then applies the conditional running -> completed UPDATE. A recheck error
-// rolls the transaction back untouched; a version that is no longer running is
-// a state conflict.
+// Close completes one running version (P4 spec §7.3/§7.4). It first takes the
+// version-scoped advisory lock shared with execution intent creation, then locks
+// the version row, re-runs the service predicate through recheck while the lock
+// is held and only then applies the conditional running -> completed UPDATE. A
+// recheck error rolls the transaction back untouched; a version that is no
+// longer running is a state conflict.
 func (r *Repository) Close(ctx context.Context, id int64, close version.VersionCloseFields, recheck func(context.Context, version.Version) error) (version.Version, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -275,6 +276,9 @@ func (r *Repository) Close(ctx context.Context, id int64, close version.VersionC
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	if err := lockVersionTx(ctx, tx, id, "close version"); err != nil {
+		return version.Version{}, err
+	}
 	current, err := scanVersion(tx.QueryRow(ctx, `SELECT `+versionColumns+` FROM version WHERE id = $1 FOR UPDATE`, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return version.Version{}, version.ErrNotFound

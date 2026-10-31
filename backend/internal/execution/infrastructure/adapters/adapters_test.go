@@ -30,8 +30,6 @@ func (f *fakeVersionService) Get(context.Context, int64) (versionapp.VersionView
 	return f.view, f.err
 }
 
-func (f *fakeVersionService) Reopen(context.Context, int64) error { return f.err }
-
 func resourceSUTView() resourceapp.SUTView {
 	return resourceapp.SUTView{ID: "3", Name: "orders"}
 }
@@ -398,3 +396,49 @@ func int64ptrAdapter(value int64) *int64 { return &value }
 
 // silence unused import if a future test drops it
 var _ = strings.TrimSpace
+
+// --- version reopen (P4) ---------------------------------------------------
+
+type reopenCall struct {
+	versionID int64
+	trigger   string
+	reason    string
+}
+
+type fakeVersionReopener struct {
+	calls []reopenCall
+	err   error
+}
+
+func (f *fakeVersionReopener) ReopenIfCompleted(_ context.Context, versionID int64, trigger, reason string) error {
+	f.calls = append(f.calls, reopenCall{versionID: versionID, trigger: trigger, reason: reason})
+	return f.err
+}
+
+// The P3 intent path must project the P4 version.reopened event with the stable
+// execution_intent trigger instead of publishing only version.status_changed.
+func TestVersionAdapterReopenUsesExecutionIntentTrigger(t *testing.T) {
+	adapter := NewVersionAdapter(&fakeVersionService{view: versionViewFixture()})
+	reopener := &fakeVersionReopener{}
+	adapter.SetVersionReopener(reopener)
+
+	if err := adapter.Reopen(context.Background(), 10); err != nil {
+		t.Fatalf("Reopen: %v", err)
+	}
+	if len(reopener.calls) != 1 {
+		t.Fatalf("reopen calls = %#v", reopener.calls)
+	}
+	call := reopener.calls[0]
+	if call.versionID != 10 || call.trigger != "execution_intent" || call.reason != "" {
+		t.Fatalf("reopen call = %#v", call)
+	}
+}
+
+// Without the P4 reopen service the adapter must fail closed rather than emit
+// only the P3 version.status_changed projection.
+func TestVersionAdapterReopenRequiresP4ReopenService(t *testing.T) {
+	adapter := NewVersionAdapter(&fakeVersionService{view: versionViewFixture()})
+	if err := adapter.Reopen(context.Background(), 10); err == nil {
+		t.Fatal("Reopen without the P4 reopen service must fail")
+	}
+}

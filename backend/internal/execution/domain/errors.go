@@ -16,6 +16,14 @@ var (
 	ErrDuplicate = errors.New("execution entity already exists")
 	// ErrStateConflict reports an illegal state transition or stale scope.
 	ErrStateConflict = errors.New("execution entity is in an invalid state")
+	// ErrVersionCompleted reports that a version close committed before the
+	// intent insert took the shared version advisory lock. The intent service
+	// reopens the version through the P4 reopen path and retries.
+	ErrVersionCompleted = errors.New("execution intent version is completed")
+	// ErrRequirementClosed reports that a requirement closure committed before
+	// the intent insert took the shared version advisory lock. A closed
+	// requirement is terminal for intent creation until it is reopened.
+	ErrRequirementClosed = errors.New("execution intent requirement is closed")
 	// ErrInvalidVerdict reports an invalid finish candidate.
 	ErrInvalidVerdict = errors.New("invalid finish candidate")
 )

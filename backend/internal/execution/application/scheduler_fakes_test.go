@@ -77,19 +77,33 @@ func (a *coreAudit) Record(_ context.Context, event auditapp.Event) error {
 // ---- repositories ----
 
 type fakeIntentStore struct {
-	mu      sync.Mutex
-	nextID  int64
-	byID    map[int64]execution.ExecutionIntent
-	createC int
+	mu         sync.Mutex
+	nextID     int64
+	byID       map[int64]execution.ExecutionIntent
+	createC    int
+	createErrs []error // returned (and consumed) before the next successful Create
 }
 
 func newFakeIntentStore() *fakeIntentStore {
 	return &fakeIntentStore{byID: map[int64]execution.ExecutionIntent{}}
 }
 
+// failNextCreate makes the next Create return err, simulating the repository
+// guard that detects a close/closure committed under the version advisory lock.
+func (s *fakeIntentStore) failNextCreate(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.createErrs = append(s.createErrs, err)
+}
+
 func (s *fakeIntentStore) Create(_ context.Context, intent execution.ExecutionIntent) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(s.createErrs) > 0 {
+		err := s.createErrs[0]
+		s.createErrs = s.createErrs[1:]
+		return err
+	}
 	for _, existing := range s.byID {
 		if existing.CaseVersionID == intent.CaseVersionID &&
 			existing.EnvironmentFingerprint == intent.EnvironmentFingerprint &&
