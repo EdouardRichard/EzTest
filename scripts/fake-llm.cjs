@@ -62,6 +62,10 @@ const MAX_BODY_BYTES = 10 * 1024 * 1024;
 const PROFILE_PATTERN = /\[profile:(clarification_host|requirement_curator|context_scout|design_host|design_planner|case_author|design_critic|data_planner)\]/;
 const DESIGN_MODIFY_HINT = /(新增|补充|修改)/;
 const DESIGN_CASE_HINT = "用例";
+// The agent runner injects the task scope into the system section
+// (requirement_id=<decimal>), which lets the fake author pick the requirement
+// the work item is actually scoped to instead of the first graph row.
+const SCOPE_REQUIREMENT_PATTERN = /requirement_id=([1-9][0-9]*)/;
 const OVERFLOW_MARKER = "[fake:context_overflow]";
 const OVERFLOW_HEADER = "x-fake-context-overflow";
 const MAX_CURATOR_TITLE_CHARS = 40;
@@ -347,6 +351,27 @@ function firstGraphCase(requirement) {
   return null;
 }
 
+// scopedRequirementID reads the runtime-injected requirement scope from the
+// task block, so design.requirement/gap runs target the work item's requirement.
+function scopedRequirementID(body) {
+  const match = SCOPE_REQUIREMENT_PATTERN.exec(allSystemText(body));
+  return match ? match[1] : null;
+}
+
+// selectGraphRequirement prefers the requirement named in the injected scope,
+// then the first clarified requirement (never a draft/rolled-back row).
+function selectGraphRequirement(graph, body) {
+  const requirements = Array.isArray(graph.requirements)
+    ? graph.requirements.filter((requirement) => requirement && requirement.requirement_id)
+    : [];
+  const scopedID = scopedRequirementID(body);
+  if (scopedID) {
+    const scoped = requirements.find((requirement) => String(requirement.requirement_id) === scopedID);
+    if (scoped) return scoped;
+  }
+  return requirements.find((requirement) => requirement.status === "clarified") || null;
+}
+
 function scenarioProposal(requirement) {
   const suts = requirementSUTIDs(requirement);
   const scenarios = Array.isArray(requirement.scenarios) ? requirement.scenarios : [];
@@ -364,11 +389,11 @@ function scenarioProposal(requirement) {
   return node;
 }
 
-function caseProposal(requirement, existing, title) {
+function caseProposal(requirement, existing, title, ordinal) {
   const suts = requirementSUTIDs(requirement);
   const requirementVersionID = String(requirement.requirement_version_id || "");
   const node = {
-    ref: "c1",
+    ref: "c" + (ordinal > 0 ? ordinal : 1),
     scenario_ref: "s1",
     title,
     description: "由 fake LLM 生成的确定性用例草案，等待用户确认。",
@@ -403,7 +428,7 @@ function graphProposal(requirement, options) {
     requirement_id: String(requirement.requirement_id),
     requirement_version_id: String(requirement.requirement_version_id),
     scenarios: [scenarioProposal(requirement)],
-    cases: titles.map((title, index) => caseProposal(requirement, index === 0 ? existing : null, title)),
+    cases: titles.map((title, index) => caseProposal(requirement, index === 0 ? existing : null, title, index + 1)),
   };
 }
 
@@ -414,7 +439,7 @@ function designHostOutcome(body, rawBody) {
   }
   const graph = graphResult(body);
   if (graph) {
-    const requirement = firstGraphRequirement(graph);
+    const requirement = selectGraphRequirement(graph, body);
     if (!requirement) {
       return textOutcome("当前版本还没有可设计的已澄清需求。");
     }
@@ -449,7 +474,7 @@ function caseAuthorOutcome(body, rawBody) {
   }
   const graph = graphResult(body);
   if (graph) {
-    const requirement = firstGraphRequirement(graph);
+    const requirement = selectGraphRequirement(graph, body);
     if (!requirement) {
       return textOutcome("没有找到可设计的已澄清需求。");
     }
