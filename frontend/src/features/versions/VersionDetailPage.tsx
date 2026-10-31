@@ -2,7 +2,7 @@
 
 import { ArrowLeft, Database, FileCode2, Server } from "lucide-react"
 import Link from "next/link"
-import { useRouter } from "next/navigation"
+import { useRouter, useSearchParams } from "next/navigation"
 import { type ReactNode, useCallback, useEffect, useState } from "react"
 
 import { Badge, type BadgeTone } from "@/components/ui/Badge"
@@ -11,6 +11,7 @@ import { ErrorState } from "@/components/ui/ErrorState"
 import { LoadingCard } from "@/components/ui/Spinner"
 import { Tabs } from "@/components/ui/Tabs"
 import { RequirementsTab } from "@/features/clarification/RequirementsTab"
+import { DesignTab } from "@/features/design/DesignTab"
 import { formatDateTime } from "@/lib/format"
 
 import { getVersion } from "./api"
@@ -23,20 +24,15 @@ const STATUS_META: Record<VersionStatus, { label: string; tone: BadgeTone }> = {
   completed: { label: "已完成", tone: "neutral" },
 }
 
-type PlaceholderTab = Exclude<VersionTab, "overview" | "requirements">
+type PlaceholderTab = Exclude<VersionTab, "overview" | "requirements" | "design">
 
 type PlaceholderCopy = {
   label: string
-  phase: "P2" | "P3" | "P4" | "P5"
+  phase: "P3" | "P4" | "P5"
   description: string
 }
 
 const PLACEHOLDER_COPY: Record<PlaceholderTab, PlaceholderCopy> = {
-  design: {
-    label: "用例设计",
-    phase: "P2",
-    description: "AI 设计对话、脑图、用例确认与变更请求由 P2 阶段提供。",
-  },
   execution: {
     label: "执行",
     phase: "P3",
@@ -237,10 +233,18 @@ export function VersionDetailPage({
   initialRequirementId,
 }: VersionDetailPageProps) {
   const router = useRouter()
+  const searchParams = useSearchParams()
   const [version, setVersion] = useState<Version | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<unknown>(null)
   const [activeTab, setActiveTab] = useState<VersionTab>(() => parseVersionTab(initialTab))
+
+  // `?case=` / `?conversation=` deep links for the design workspace. The route
+  // already forwards `conversation` for clarification; read the URL here so the
+  // case deep link works without changing `src/app` routing.
+  const designConversationId =
+    initialConversationId ?? searchParams.get("conversation") ?? undefined
+  const designCaseId = searchParams.get("case") ?? undefined
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -270,6 +274,12 @@ export function VersionDetailPage({
     if (next === "requirements") {
       if (initialConversationId) params.set("conversation", initialConversationId)
       if (initialRequirementId) params.set("requirement", initialRequirementId)
+    }
+    if (next === "design") {
+      const conversationId = searchParams.get("conversation") ?? initialConversationId
+      const caseId = searchParams.get("case")
+      if (conversationId) params.set("conversation", conversationId)
+      if (caseId) params.set("case", caseId)
     }
     router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`)
   }
@@ -350,6 +360,12 @@ export function VersionDetailPage({
           versionId={versionId}
           initialConversationId={initialConversationId}
           initialRequirementId={initialRequirementId}
+        />
+      ) : activeTab === "design" ? (
+        <DesignTab
+          versionId={versionId}
+          initialCaseId={designCaseId}
+          initialConversationId={designConversationId}
         />
       ) : (
         <TabPlaceholder tab={activeTab} />

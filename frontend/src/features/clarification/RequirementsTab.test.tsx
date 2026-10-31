@@ -43,6 +43,7 @@ vi.mock("./useVersionEvents", () => ({
 }))
 
 import { RequirementsTab } from "./RequirementsTab"
+import { requirementSecondFixture } from "./test-fixtures"
 
 describe("RequirementsTab shell", () => {
   beforeEach(() => {
@@ -125,5 +126,26 @@ describe("RequirementsTab shell", () => {
 
     expect(await screen.findByText("需求澄清 2026-10-31 10:00")).toBeInTheDocument()
     expect(screen.queryByText("暂无澄清对话")).not.toBeInTheDocument()
+  })
+
+  it("links the pending design CTA to the version design tab", async () => {
+    api.listRequirements.mockResolvedValue([requirementSecondFixture])
+
+    render(<RequirementsTab versionId="2001" />)
+
+    expect(await screen.findByTestId("design-cta")).toHaveTextContent("1 条需求待设计")
+    expect(screen.getByRole("link", { name: "开始设计" })).toHaveAttribute(
+      "href",
+      "/versions/2001?tab=design",
+    )
+  })
+
+  it("prefers the server pending_design_count projection over the local clarified count", async () => {
+    versionsApi.getVersion.mockResolvedValue({ id: "2001", bindings: [], pending_design_count: 4 })
+    api.listRequirements.mockResolvedValue([])
+
+    render(<RequirementsTab versionId="2001" />)
+
+    expect(await screen.findByTestId("design-cta")).toHaveTextContent("4 条需求待设计")
   })
 })
