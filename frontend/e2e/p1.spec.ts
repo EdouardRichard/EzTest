@@ -223,6 +223,7 @@ test("P1 clarification workspace: conversation, AI draft, confirm, batch, team r
   await page.getByRole("button", { name: "批量确认已澄清" }).click()
   await expect(page.getByTestId("bulk-confirm-notice")).toBeVisible({ timeout: 20_000 })
   await expect(page.getByTestId("design-cta")).toBeVisible()
+  await expect(page.getByTestId("design-cta")).toContainText("3 条需求待设计")
 
   // Team room is readable and contains the Scout finding.
   await page.getByTestId("team-room-toggle").click()
