@@ -48,6 +48,23 @@ vi.mock("@/features/design/DesignTab", async () => {
   }
 })
 
+vi.mock("@/features/execution/ExecutionTab", async () => {
+  const React = await import("react")
+  return {
+    ExecutionTab: (props: {
+      versionId: string
+      initialWaveId?: string
+      initialCaseRunId?: string
+    }) =>
+      React.createElement("div", {
+        "data-testid": "execution-workspace",
+        "data-version-id": props.versionId,
+        "data-wave-id": props.initialWaveId,
+        "data-case-run-id": props.initialCaseRunId,
+      }),
+  }
+})
+
 const navigation = vi.hoisted(() => ({
   push: vi.fn(),
   replace: vi.fn(),
@@ -102,14 +119,44 @@ describe("VersionDetailPage", () => {
     expect(overview).toHaveTextContent("未绑定代码仓")
   })
 
-  it("honours a deep-linked execution tab and renders the P3 placeholder", async () => {
+  it("honours a deep-linked execution tab and mounts the execution workspace", async () => {
     render(<VersionDetailPage versionId="2001" initialTab="execution" />)
 
     await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
 
     expect(screen.getByRole("tab", { name: "执行" })).toHaveAttribute("aria-selected", "true")
-    expect(screen.getByText("执行将在 P3 阶段提供")).toBeInTheDocument()
+    const workspace = screen.getByTestId("execution-workspace")
+    expect(workspace).toHaveAttribute("data-version-id", "2001")
+    expect(workspace).not.toHaveAttribute("data-wave-id")
+    expect(workspace).not.toHaveAttribute("data-case-run-id")
+    expect(screen.queryByText("执行将在 P3 阶段提供")).not.toBeInTheDocument()
     expect(screen.queryByRole("region", { name: "绑定概览" })).not.toBeInTheDocument()
+  })
+
+  it("forwards ?wave= and ?case_run= deep links to the execution workspace", async () => {
+    search.params = new URLSearchParams("tab=execution&wave=9202&case_run=9302")
+
+    render(<VersionDetailPage versionId="2001" initialTab="execution" />)
+
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+    const workspace = screen.getByTestId("execution-workspace")
+    expect(workspace).toHaveAttribute("data-version-id", "2001")
+    expect(workspace).toHaveAttribute("data-wave-id", "9202")
+    expect(workspace).toHaveAttribute("data-case-run-id", "9302")
+    expect(navigation.replace).not.toHaveBeenCalled()
+  })
+
+  it("keeps execution deep links when switching to the execution tab", async () => {
+    search.params = new URLSearchParams("tab=overview&wave=9202&case_run=9302")
+
+    render(<VersionDetailPage versionId="2001" />)
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+
+    fireEvent.click(screen.getByRole("tab", { name: "执行" }))
+
+    expect(navigation.replace).toHaveBeenCalledWith(
+      "/versions/2001?tab=execution&wave=9202&case_run=9302",
+    )
   })
 
   it.each([

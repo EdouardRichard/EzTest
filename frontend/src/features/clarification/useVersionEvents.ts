@@ -27,6 +27,16 @@ export type VersionEventHandlers = {
   onDesignRoundChanged?: (event: VersionEvent) => void
   /** `design.export_ready`: refresh export history. */
   onDesignExportReady?: (event: VersionEvent) => void
+  /** P3 `wave.*`: refresh the execution snapshot (the tab debounces). */
+  onWaveChanged?: (event: VersionEvent) => void
+  /** P3 `case_run.*` including step/assertion completion: refresh the trace. */
+  onCaseRunChanged?: (event: VersionEvent) => void
+  /** P3 `evidence.created`: refresh the evidence snapshot. */
+  onEvidenceCreated?: (event: VersionEvent) => void
+  /** P3 `human_request.*`: refresh open takeover requests and pause state. */
+  onHumanRequestChanged?: (event: VersionEvent) => void
+  /** P3 `execution.*` intent/failure/coverage events. */
+  onExecutionChanged?: (event: VersionEvent) => void
   /** Connection state for the status indicator. */
   onStatus?: (status: SSEStatus) => void
 }
@@ -99,6 +109,36 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
           break
         case "design.export_ready":
           handlersRef.current.onDesignExportReady?.(event)
+          break
+        case "wave.created":
+        case "wave.started":
+        case "wave.paused":
+        case "wave.resumed":
+        case "wave.finished":
+          handlersRef.current.onWaveChanged?.(event)
+          break
+        case "case_run.started":
+        case "case_run.paused":
+        case "case_run.resumed":
+        case "case_run.finished":
+        case "case_run.step_finished":
+        case "case_run.assertion_finished":
+          handlersRef.current.onCaseRunChanged?.(event)
+          break
+        case "evidence.created":
+          handlersRef.current.onEvidenceCreated?.(event)
+          break
+        case "human_request.created":
+        case "human_request.resolved":
+        case "human_request.expired":
+          handlersRef.current.onHumanRequestChanged?.(event)
+          break
+        case "execution.intent_created":
+        case "execution.intent_cancelled":
+        case "execution.intent_superseded":
+        case "execution.failure_candidate":
+        case "execution.coverage_gap":
+          handlersRef.current.onExecutionChanged?.(event)
           break
         default:
           if (event.type.startsWith("requirement.")) {

@@ -205,6 +205,78 @@ describe("useVersionEvents", () => {
     expect(onDesignExportReady.mock.calls[0][0].type).toBe("design.export_ready")
   })
 
+  it("routes P3 execution events to the execution handlers", () => {
+    const onWaveChanged = vi.fn()
+    const onCaseRunChanged = vi.fn()
+    const onEvidenceCreated = vi.fn()
+    const onHumanRequestChanged = vi.fn()
+    const onExecutionChanged = vi.fn()
+    render(
+      createElement(Harness, {
+        handlers: {
+          onWaveChanged,
+          onCaseRunChanged,
+          onEvidenceCreated,
+          onHumanRequestChanged,
+          onExecutionChanged,
+        },
+      }),
+    )
+
+    for (const type of [
+      "wave.created",
+      "wave.started",
+      "wave.paused",
+      "wave.resumed",
+      "wave.finished",
+    ]) {
+      connectOptions.onEvent({ event: "message", data: eventFrame(type, { wave_id: "9201" }) })
+    }
+    for (const type of [
+      "case_run.started",
+      "case_run.paused",
+      "case_run.resumed",
+      "case_run.finished",
+      "case_run.step_finished",
+      "case_run.assertion_finished",
+    ]) {
+      connectOptions.onEvent({ event: "message", data: eventFrame(type, { case_run_id: "9301" }) })
+    }
+    connectOptions.onEvent({
+      event: "message",
+      data: eventFrame("evidence.created", { evidence_id: "9401" }),
+    })
+    for (const type of [
+      "human_request.created",
+      "human_request.resolved",
+      "human_request.expired",
+    ]) {
+      connectOptions.onEvent({
+        event: "message",
+        data: eventFrame(type, { human_request_id: "9501" }),
+      })
+    }
+    for (const type of [
+      "execution.intent_created",
+      "execution.intent_cancelled",
+      "execution.intent_superseded",
+      "execution.failure_candidate",
+      "execution.coverage_gap",
+    ]) {
+      connectOptions.onEvent({ event: "message", data: eventFrame(type, { intent_id: "9101" }) })
+    }
+
+    expect(onWaveChanged).toHaveBeenCalledTimes(5)
+    expect(onCaseRunChanged).toHaveBeenCalledTimes(6)
+    expect(onEvidenceCreated).toHaveBeenCalledTimes(1)
+    expect(onHumanRequestChanged).toHaveBeenCalledTimes(3)
+    expect(onExecutionChanged).toHaveBeenCalledTimes(5)
+    expect(onWaveChanged.mock.calls[0][0].type).toBe("wave.created")
+    expect(onCaseRunChanged.mock.calls[0][0].type).toBe("case_run.started")
+    expect(onHumanRequestChanged.mock.calls[2][0].type).toBe("human_request.expired")
+    expect(onExecutionChanged.mock.calls[4][0].type).toBe("execution.coverage_gap")
+  })
+
   it("ignores unknown event types and malformed payloads", () => {
     const onConversationMessage = vi.fn()
     const onRequirementChanged = vi.fn()

@@ -12,6 +12,7 @@ import { LoadingCard } from "@/components/ui/Spinner"
 import { Tabs } from "@/components/ui/Tabs"
 import { RequirementsTab } from "@/features/clarification/RequirementsTab"
 import { DesignTab } from "@/features/design/DesignTab"
+import { ExecutionTab } from "@/features/execution/ExecutionTab"
 import { formatDateTime } from "@/lib/format"
 
 import { getVersion } from "./api"
@@ -24,20 +25,15 @@ const STATUS_META: Record<VersionStatus, { label: string; tone: BadgeTone }> = {
   completed: { label: "已完成", tone: "neutral" },
 }
 
-type PlaceholderTab = Exclude<VersionTab, "overview" | "requirements" | "design">
+type PlaceholderTab = Exclude<VersionTab, "overview" | "requirements" | "design" | "execution">
 
 type PlaceholderCopy = {
   label: string
-  phase: "P3" | "P4" | "P5"
+  phase: "P4" | "P5"
   description: string
 }
 
 const PLACEHOLDER_COPY: Record<PlaceholderTab, PlaceholderCopy> = {
-  execution: {
-    label: "执行",
-    phase: "P3",
-    description: "波次执行、实时记录、证据与人工接管由 P3 阶段提供。",
-  },
   chain: {
     label: "探索链路",
     phase: "P4",
@@ -245,6 +241,9 @@ export function VersionDetailPage({
   const designConversationId =
     initialConversationId ?? searchParams.get("conversation") ?? undefined
   const designCaseId = searchParams.get("case") ?? undefined
+  // `?wave=` / `?case_run=` select a wave/case run inside the execution tab.
+  const executionWaveId = searchParams.get("wave") ?? undefined
+  const executionCaseRunId = searchParams.get("case_run") ?? undefined
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -280,6 +279,12 @@ export function VersionDetailPage({
       const caseId = searchParams.get("case")
       if (conversationId) params.set("conversation", conversationId)
       if (caseId) params.set("case", caseId)
+    }
+    if (next === "execution") {
+      const waveId = searchParams.get("wave")
+      const caseRunId = searchParams.get("case_run")
+      if (waveId) params.set("wave", waveId)
+      if (caseRunId) params.set("case_run", caseRunId)
     }
     router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`)
   }
@@ -366,6 +371,12 @@ export function VersionDetailPage({
           versionId={versionId}
           initialCaseId={designCaseId}
           initialConversationId={designConversationId}
+        />
+      ) : activeTab === "execution" ? (
+        <ExecutionTab
+          versionId={versionId}
+          initialWaveId={executionWaveId}
+          initialCaseRunId={executionCaseRunId}
         />
       ) : (
         <TabPlaceholder tab={activeTab} />
