@@ -856,9 +856,24 @@ try {
 
     Step "assert the P2 SSE event stream"
     $channel = "version:$versionID"
-    $snapshot = Invoke-Api -Method "GET" -Path ("/api/events?channel={0}&limit=200" -f [System.Uri]::EscapeDataString($channel)) -Token $token -Body $null
-    Assert-Status $snapshot @(200) "GET /api/events"
-    $eventTypes = Get-EventTypes $snapshot
+    # P3 automatically starts execution for confirmed cases, so later phases add
+    # many events to the same version channel. Page through the channel instead
+    # of assuming the first 200-event snapshot still contains the P2 events.
+    $eventTypes = @()
+    $after = 1
+    $pages = 0
+    while ($pages -lt 100) {
+        $eventsPath = "/api/events?channel={0}&after={1}&limit=200" -f ([System.Uri]::EscapeDataString($channel)), $after
+        $snapshot = Invoke-Api -Method "GET" -Path $eventsPath -Token $token -Body $null
+        Assert-Status $snapshot @(200) "GET /api/events"
+        $page = Get-Array $snapshot.Json.data
+        if ($page.Count -eq 0) { break }
+        foreach ($event in $page) { $eventTypes += [string]$event.type }
+        $lastEvent = $page[$page.Count - 1]
+        $after = [int64]$lastEvent.seq
+        if (-not $snapshot.Json.has_more) { break }
+        $pages++
+    }
     foreach ($required in @("design.round_started", "design.scope_activated", "design.graph_delta", "design.case_version_created", "design.case_confirmed", "design.case_version_stale", "design.case_version_superseded", "design.export_ready")) {
         Assert-EventPresent -Types $eventTypes -Type $required
     }
