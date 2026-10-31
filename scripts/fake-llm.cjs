@@ -342,8 +342,12 @@ function requirementSUTIDs(requirement) {
 
 function firstGraphCase(requirement) {
   const scenarios = Array.isArray(requirement.scenarios) ? requirement.scenarios : [];
+  const currentVersion = String(requirement.requirement_version_id || "");
   for (const scenario of scenarios) {
-    const cases = scenario && Array.isArray(scenario.cases) ? scenario.cases : [];
+    // Never target a case from a previous requirement version: after a
+    // requirement change the old scenario/cases are stale history.
+    if (!scenario || String(scenario.requirement_version_id) !== currentVersion) continue;
+    const cases = Array.isArray(scenario.cases) ? scenario.cases : [];
     for (const item of cases) {
       if (item && item.case_id) return item;
     }
@@ -375,7 +379,12 @@ function selectGraphRequirement(graph, body) {
 function scenarioProposal(requirement) {
   const suts = requirementSUTIDs(requirement);
   const scenarios = Array.isArray(requirement.scenarios) ? requirement.scenarios : [];
-  const existing = scenarios.find((scenario) => scenario && scenario.id);
+  const currentVersion = String(requirement.requirement_version_id || "");
+  // Only reuse a scenario bound to the current requirement version; scenarios
+  // from an older version are stale history and cannot be updated.
+  const existing = scenarios.find(
+    (scenario) => scenario && scenario.id && String(scenario.requirement_version_id) === currentVersion,
+  );
   const node = {
     ref: "s1",
     name: existing && typeof existing.name === "string" && existing.name !== "" ? existing.name : "AI 设计场景",
