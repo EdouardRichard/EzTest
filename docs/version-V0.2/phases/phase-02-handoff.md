@@ -65,7 +65,7 @@ storage_0002_export_artifact.sql
 | P1 回归验收 | `powershell.exe -File scripts/p1-acceptance.ps1 -FakeLLMPort 13334` | **PASS（19 steps）**；API 版本 `0.2.0-p2`；日志 `.tmp/p1-acceptance/api.log` |
 | P2 API 验收（fake） | `powershell.exe -File scripts/p2-acceptance.ps1 -FakeLLMPort 13334` | **PASS（21 steps）**；脑图、case/scenario/requirement 三粒度确认、幂等、Host 修改、stale/重设计、自动并入、附件、4 格式导出、SSE；日志 `.tmp/p2-acceptance/api.log` |
 | P2 浏览器 E2E（fake） | `powershell.exe -File scripts/p2-e2e.ps1` | **1 passed**；登录→设计 Tab→新对话→脑图→详情→确认→Markdown 下载；`e2e-playwright.log`、`screenshots/` |
-| 真实 LLM 探针 | `powershell.exe -File scripts/p2-acceptance-llm.ps1 -ProbeOnly` | **PASS**；DeepSeek `deepseek-flash` 约 22s 产出 2 条用例（首条 4 steps/3 assertions）；日志 `.tmp/p2-acceptance/llm-probe.log` |
+| 真实 LLM 探针 | `powershell.exe -File scripts/p2-acceptance-llm.ps1 -ProbeOnly` | **PASS**；DeepSeek `deepseek-flash` 约 18s 产出 2 条用例（首条 4 steps/2-3 assertions；真实模型输出有波动）；日志 `.tmp/p2-acceptance/llm-probe.log` |
 | 真实 LLM API 验收 | `powershell.exe -File scripts/p2-acceptance-llm.ps1` | **PASS**；真实对话→实时图→修改图→requirement 确认 2 版本→Markdown 导出 6043 chars；日志 `.tmp/p2-acceptance/llm.log` |
 | 真实 LLM 浏览器 E2E | `powershell.exe -File scripts/p2-e2e-llm.ps1` | **1 passed（19.4s）**；真实模型主链路；日志 `.tmp/p2-acceptance/e2e-llm.log`、截图 `screenshots-llm/` |
 | Server 集成 | `go test -tags=integration ./internal/server -run TestP2DesignRoutesAndEmptyGraph -v` | **PASS**；路由注册、空图、overview、export create/get/list、非法格式 400、未登录 401 |
