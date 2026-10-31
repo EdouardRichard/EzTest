@@ -766,6 +766,7 @@ func requirementViewFromRequirement(requirement version.Requirement, current ver
 		TargetPages:       nonNilStrings(current.TargetPages),
 		TargetAPIs:        nonNilStrings(current.TargetAPIs),
 		UpdatedAt:         requirement.UpdatedAt,
+		ClosedAt:          requirement.ClosedAt,
 	}
 	for _, confirmation := range confirmations {
 		if confirmation.RequirementVersionID == current.ID {

@@ -471,6 +471,27 @@ func TestClosureServiceReopenResetsStateAndStartsNewRound(t *testing.T) {
 	}
 }
 
+func TestClosureServiceReopenAuditsAuthenticatedActor(t *testing.T) {
+	env := newClosureEnv(t)
+	requirement := seedClosureRequirement(env, 1001, 701, 1002, version.RequirementClarified)
+	configurePassingClosure(env, requirement.ID)
+	if _, err := env.svc.Close(requestContext(), requirement.ID, nil); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	env.audit.events = nil
+
+	ctx := platform.WithActor(requestContext(), platform.Actor{ID: 88, Role: "user"})
+	if err := env.svc.Reopen(ctx, requirement.ID, "manual reopen"); err != nil {
+		t.Fatalf("Reopen: %v", err)
+	}
+	if len(env.audit.events) != 1 || env.audit.events[0].Action != "requirement.reopened" {
+		t.Fatalf("audit events = %#v", env.audit.events)
+	}
+	if env.audit.events[0].ActorID == nil || *env.audit.events[0].ActorID != 88 {
+		t.Fatalf("audit actor = %v", env.audit.events[0].ActorID)
+	}
+}
+
 func withRequirementStatus(requirement version.Requirement, status version.RequirementStatus) version.Requirement {
 	requirement.Status = status
 	requirement.UpdatedAt = testTime.Add(time.Minute)

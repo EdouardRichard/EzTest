@@ -427,7 +427,15 @@ func (s *ClosureService) recordAudit(ctx context.Context, action string, require
 	if s.audit == nil {
 		return
 	}
+	// The manual API runs with an authenticated actor in the context; agent-run
+	// closures/reopens carry no HTTP actor and leave it nil.
+	var actorID *int64
+	if actor, ok := platform.ActorFrom(ctx); ok && actor.ID > 0 {
+		id := actor.ID
+		actorID = &id
+	}
 	_ = s.audit.Record(ctx, auditapp.Event{
+		ActorID:    actorID,
 		Action:     action,
 		TargetKind: "requirement",
 		TargetID:   platformid.Format(requirementID),
