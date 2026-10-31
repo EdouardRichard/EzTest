@@ -851,8 +851,9 @@ P4 写入方仅 `issue.triage`；`failure/coverage` 仅保留枚举（P3 已把�
 | 类型/构建 | `pnpm typecheck`、`pnpm lint`、`pnpm build` | EXIT=0 |
 | P4 契约 | `node scripts/p4-contract-check.cjs` | P0–P3 增量仍在；P4 paths/schemas/events/tables/tasks/profiles/settings 齐全；`x-frozen: P4` |
 | P2/P3 契约兼容 | `node scripts/p2-contract-check.cjs`、`node scripts/p3-contract-check.cjs` | PASS（增量仍在，不硬编码总数） |
-| P1/P2 回归 | `scripts/p1-acceptance.ps1 -FakeLLMPort 13334`、`scripts/p2-acceptance.ps1 -FakeLLMPort 13334` | PASS；仅作回归，不属 P4 验收 |
-| P3 回归 | `node scripts/p3-contract-check.cjs` + `go test -tags=integration ./internal/execution/... ./internal/db/...` | PASS；P3 真实 LLM 全量不重跑（P4 不改执行语义；记录理由） |
+| P1 回归 | `scripts/p1-acceptance-llm.ps1`（真实 DeepSeek） | PASS；真实 LLM，不用 fake 替代 |
+| P2 回归 | `scripts/p2-acceptance-llm.ps1`（真实 DeepSeek）+ `scripts/p2-e2e-llm.ps1`（浏览器） | PASS；真实 LLM，不用 fake 替代 |
+| P3 回归 | `scripts/p3-acceptance.ps1`（真实 DeepSeek，16 场景）+ `scripts/p3-e2e.ps1` | PASS；P4 新增 version/design 钩子，必须回归执行语义；不用 fake 替代 |
 | P4 API 验收 | `powershell.exe -File scripts/p4-acceptance.ps1` | S1–S9 PASS（真实 LLM）；日志/scenarios `.tmp/p4-acceptance/` |
 | P4 浏览器 E2E | `powershell.exe -File scripts/p4-e2e.ps1` | S10 PASS；截图 `.tmp/p4-acceptance/screenshots/` |
 
@@ -927,7 +928,7 @@ P4 写入方仅 `issue.triage`；`failure/coverage` 仅保留枚举（P3 已把�
 | P4-D-08 | **版本内待办入口**（Topbar TodoDrawer 读 open human_request + 待设计 CTA）；全局 `/api/todos`/待办中心留 P6；不建 todo 表 | phase-04 L23；P3H L113；HLD L529/L564；phase-06 L242；P3-D-16 | 2026-11-01 用户认可设计 v1 |
 | P4-D-09 | **闭环校验**：失败应用用例须有 issue 引用（open 不阻断）；无 waived UI；Agent 提议 + 服务端重算；self-task 排除 | HLD L470；ARCH L249；D07“失败/未修不阻断” | 2026-11-01 用户认可设计 v1 |
 | P4-D-10 | **契约先行 + 门禁前向兼容**：先契约/迁移再实现；p2/p3 检查改增量仍在；新增 p4 检查 | contracts README L4；P2 先例；phase plan §4 | 2026-11-01 用户认可设计 v1 |
-| P4-D-11 | **验收只用真实 LLM**；真实 LLM 失败=系统缺陷信号（上下文/提示词/工具/scope），按根因修复重跑；fake 仅单测/集成端口 stub，不属验收 | 用户 2026-11-01 纠正；P3S L66；P2-D-30 双轨用于 P1/P2 回归 | 2026-11-01 用户明确纠正 |
+| P4-D-11 | **验收只用真实 LLM**；真实 LLM 失败=系统缺陷信号（上下文/提示词/工具/scope），按根因修复重跑；fake 仅单测/集成端口 stub，不属验收；P1/P2/P3 回归同样使用各自真实 LLM 验收脚本 | 用户 2026-11-01 纠正；P3S L66；P2-D-30 的双轨仅保留单测/集成端口 stub，不用作 P4 验收 | 2026-11-01 用户明确纠正 |
 | P4-D-12 | **分支** `feat/v0.2-p4` 从 `feat/v0.2` 拉出，完成后合回；保留阶段分支 | P3H §0 惯例；用户“在 v0.2 上工作” | 2026-11-01 用户认可设计 v1 |
 | P4-D-13 | **导出归属**：P4 报告 HTML 直下，不扩 `export_artifact`；报告 PDF 导出→P7、链路导出→P6；handoff 显式登记 | HLD L205/L520；P2H L151；避免孤儿化 | 2026-11-01 用户认可设计 v1 |
 | P4-D-14 | **P4 固定内置 HTML + 现有 `report.section_*` 开关**；不做模板编辑器/模板版本化/PDF/worker（P7）；对 phase-04 Out“模板”一词做窄化解释 | ARCH §12.1；HLD L611；OD-2；phase-04 L27 | 2026-11-01 用户选择报告 A（含章节开关） |
