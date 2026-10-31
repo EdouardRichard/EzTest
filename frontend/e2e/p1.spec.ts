@@ -229,6 +229,7 @@ test("P1 clarification workspace: conversation, AI draft, confirm, batch, team r
   await expect(page.getByTestId("team-room-panel")).toBeVisible()
   await expect(page.getByTestId("team-room-posts")).toBeVisible({ timeout: 30_000 })
   await expect(page.getByTestId("team-room-posts").locator("li").first()).toBeVisible()
+  await expect(page.getByTestId("team-room-posts")).toContainText("已读取附件：login-spec.md")
 
   // Evidence screenshots.
   const screenshotDir = path.resolve(process.cwd(), "..", ".tmp", "p1-acceptance", "screenshots")

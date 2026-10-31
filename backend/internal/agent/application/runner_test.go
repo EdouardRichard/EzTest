@@ -55,7 +55,7 @@ func newRunnerFixture(t *testing.T) *runnerFixture {
 			Title: "订单系统", Status: "initial", Requirements: []string{"#501 draft 登录"},
 		}},
 		attachments: &fakeAttachmentReader{info: agentapp.AttachmentInfo{
-			Name: "需求.md", MIME: "text/markdown", Status: "ready", Text: "登录需求正文", TotalChars: 6,
+			Name: "需求.md", MIME: "text/markdown", Status: "done", Text: "登录需求正文", TotalChars: 6,
 		}},
 		team:    &fakeTeamRoomPort{},
 		content: &fakeContentWriter{},
@@ -238,6 +238,13 @@ func TestRunnerScoutWritesTeamRoomFinding(t *testing.T) {
 	}
 	if len(fixture.team.posts) != 1 {
 		t.Fatalf("team posts = %d", len(fixture.team.posts))
+	}
+	if len(fixture.chat.requests) == 0 || len(fixture.chat.requests[0].Messages) < 2 {
+		t.Fatalf("chat request missing user attachment context: %#v", fixture.chat.requests)
+	}
+	userContent := fixture.chat.requests[0].Messages[1].Content
+	if !strings.Contains(userContent, "请阅读附件《需求.md》") || !strings.Contains(userContent, "登录需求正文") {
+		t.Fatalf("scout user content = %q", userContent)
 	}
 	post := fixture.team.posts[0]
 	if post.Team != agent.TeamClarification || post.Kind != agent.PostKindFinding {

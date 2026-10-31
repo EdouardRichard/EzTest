@@ -1091,7 +1091,7 @@ func conversationMessages(messages []ConversationMessage) []Message {
 }
 
 func attachmentUserText(info AttachmentInfo) string {
-	if info.Status != "" && info.Status != "ready" && info.Status != "extracted" {
+	if info.Status != "" && info.Status != "done" && info.Status != "ready" && info.Status != "extracted" {
 		return fmt.Sprintf("附件《%s》解析状态为 %s，错误：%s。请向用户说明无法读取。", info.Name, info.Status, info.Error)
 	}
 	text := truncateRunes(strings.TrimSpace(info.Text), scoutAttachmentTextRunes)
