@@ -59,13 +59,14 @@ func (r *ClosureRepository) Latest(ctx context.Context, requirementID int64) (ve
 }
 
 // Close inserts the next close round and flips the requirement to closed in one
-// transaction. The requirement row is locked first, so concurrent closes
-// serialize: the loser sees the committed closed status and gets
-// ErrStateConflict. After the lock, recheck re-runs the service predicate
-// against the locked requirement; its error rolls the whole transaction back,
-// so a closure can never commit with an evaluation that went stale before the
-// lock. The unique (requirement_id, close_round) constraint remains the final
-// guard.
+// transaction. It first takes the requirement's version-scoped advisory lock
+// (the same key the execution intent creation path takes) and only then locks
+// the requirement row, so concurrent closes serialize and a concurrent intent
+// insert can never commit behind the recheck: the loser sees the committed
+// state. After the lock, recheck re-runs the service predicate against the
+// locked requirement; its error rolls the whole transaction back, so a closure
+// can never commit with an evaluation that went stale before the lock. The
+// unique (requirement_id, close_round) constraint remains the final guard.
 func (r *ClosureRepository) Close(ctx context.Context, closure version.RequirementClosure, requirement version.Requirement, recheck func(context.Context, version.Requirement) error) (version.RequirementClosure, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -73,6 +74,12 @@ func (r *ClosureRepository) Close(ctx context.Context, closure version.Requireme
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// The advisory lock must stay the first lock: the intent creation path takes
+	// the same key before inserting, so one side always observes the other's
+	// committed result.
+	if err := lockVersionTx(ctx, tx, requirement.VersionID, "close requirement"); err != nil {
+		return version.RequirementClosure{}, err
+	}
 	locked, err := scanRequirement(tx.QueryRow(ctx, `
 		SELECT `+requirementColumns+` FROM requirement WHERE id = $1 AND version_id = $2 FOR UPDATE
 	`, requirement.ID, requirement.VersionID))

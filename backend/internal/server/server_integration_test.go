@@ -190,6 +190,7 @@ func newTestAPI(t *testing.T) *testAPI {
 	})
 	requirementSvc.SetVersionReopener(versionCloseSvc)
 	designGraph.SetVersionReopener(versionCloseSvc)
+	executionVersions.SetVersionReopener(versionCloseSvc)
 
 	chainVersionProvider := chainproviders.NewVersionProvider(requirementSvc, versionSvc)
 	chainDesignProvider := chainproviders.NewDesignProvider(designGraph)
