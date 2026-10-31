@@ -1340,16 +1340,37 @@ func (r *Runner) recordAudit(state *runState, status agent.AgentRunStatus, reaso
 func (r *Runner) maxTurns(profile agent.AgentProfile) int {
 	limit := profile.Budgets.MaxTurns
 	setting := r.intSetting("agent.max_turns", defaultMaxTurns)
-	switch {
-	case limit <= 0:
-		limit = setting
-	case setting > 0 && setting < limit:
-		limit = setting
+	// P3 execution profiles carry their own case-scale budget (P3 spec §7.2:
+	// case_executor 60 turns); the generic agent.max_turns (12) is a chat-scale
+	// guard and must not truncate an execution run.
+	if isP3Profile(profile.Key) {
+		if limit <= 0 {
+			limit = setting
+		}
+	} else {
+		switch {
+		case limit <= 0:
+			limit = setting
+		case setting > 0 && setting < limit:
+			limit = setting
+		}
 	}
 	if limit < 1 {
 		limit = 1
 	}
 	return limit
+}
+
+// isP3Profile reports whether the profile belongs to the P3 execution team and
+// therefore uses its own case-scale budgets instead of the chat-scale
+// agent.max_turns guard.
+func isP3Profile(key string) bool {
+	switch key {
+	case ProfileKeyCaseExecutor, ProfileKeyFailureAnalyst, ProfileKeyCoverageAnalyst:
+		return true
+	default:
+		return false
+	}
 }
 
 func (r *Runner) softSeconds(profile agent.AgentProfile) int {
@@ -1618,14 +1639,10 @@ func teamForProfile(profileKey string) agent.Team {
 }
 
 // isExecutionWorkType reports whether the work item needs the P3 execution task
-// context provider.
+// context provider. Only execute.case claims a case_run/dispatch lease;
+// analyze.failure/coverage use the generic wave-scoped task context.
 func isExecutionWorkType(workType string) bool {
-	switch workType {
-	case WorkTypeExecuteCase, WorkTypeAnalyzeFailure, WorkTypeAnalyzeCoverage:
-		return true
-	default:
-		return false
-	}
+	return workType == WorkTypeExecuteCase
 }
 
 // executionTaskErrorRetryable classifies a task-provider failure: stale scope,
