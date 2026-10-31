@@ -17,7 +17,27 @@ func (t *p4RegistryTestTool) Execute(context.Context, Scope, json.RawMessage) (a
 	return map[string]any{"ok": true}, nil
 }
 
+// resetP4ToolGroupsForTest isolates a test from the process-global P4 group
+// registry. Tests register groups through RegisterP4ToolGroup, which appends
+// for the lifetime of the process; without isolation a later test with
+// -shuffle=on would observe groups registered by an earlier one. The snapshot
+// is restored on cleanup so other test files keep the state they started with.
+func resetP4ToolGroupsForTest(t *testing.T) {
+	t.Helper()
+	p4ToolGroupMu.Lock()
+	saved := p4ToolGroups
+	p4ToolGroups = nil
+	p4ToolGroupMu.Unlock()
+	t.Cleanup(func() {
+		p4ToolGroupMu.Lock()
+		p4ToolGroups = saved
+		p4ToolGroupMu.Unlock()
+	})
+}
+
 func TestP4RegistryStartsWithNoInjectedGroups(t *testing.T) {
+	resetP4ToolGroupsForTest(t)
+
 	const injected = "p4.test.injected"
 
 	registry := NewP4Registry(Deps{})
@@ -34,6 +54,8 @@ func TestP4RegistryStartsWithNoInjectedGroups(t *testing.T) {
 }
 
 func TestP4RegistryComposesInjectedGroups(t *testing.T) {
+	resetP4ToolGroupsForTest(t)
+
 	const injected = "p4.test.injected"
 
 	RegisterP4ToolGroup(nil) // nil groups are ignored defensively
@@ -57,6 +79,8 @@ func TestP4RegistryComposesInjectedGroups(t *testing.T) {
 }
 
 func TestP4RegistryPassesDepsToGroups(t *testing.T) {
+	resetP4ToolGroupsForTest(t)
+
 	const injected = "p4.test.deps_injected"
 
 	// The group only exposes its tool when NewP4Registry hands it real deps.

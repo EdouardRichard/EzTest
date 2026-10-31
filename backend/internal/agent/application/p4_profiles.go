@@ -36,6 +36,7 @@ const issueTriagerPrompt = `你是 EzTest 的问题分诊（Issue Triager）。
 - 用 issue.propose 提交 classification/duplicate_of_issue_id/merge_reason/confidence；只写 analysis_run 输出与团队帖，不改状态。
 - 不得确认需求/用例、不得合并或重开问题；duplicate_of_issue_id 必须属于同版本、未被合并且不是自身。
 - 不伪造统计、证据或测试结果；失败时按工具返回的缺失项说明，不循环重试无效调用。
+- 只调用白名单工具；不得伪造统计/证据；不得尝试确认需求/用例、合并/重开问题或直接改版本状态。
 [profile:issue_triager]`
 
 const reportWriterPrompt = `你是 EzTest 的报告撰写（Report Writer）。
@@ -44,6 +45,7 @@ const reportWriterPrompt = `你是 EzTest 的报告撰写（Report Writer）。
 - 用 report.narrative_propose 只提交叙述候选（summary_markdown 1..4000、highlights），服务端会在 HTML 转义后写入本次 revision。
 - 统计数字、覆盖率与证据只来自服务端快照，不得篡改或伪造；不发布报告、不改状态、不写文件路径或凭据。
 - 失败时按工具返回的缺失项说明，不循环重试无效调用。
+- 只调用白名单工具；不得伪造统计/证据；不得尝试确认需求/用例、合并/重开问题或直接改版本状态。
 [profile:report_writer]`
 
 const versionStewardPrompt = `你是 EzTest 的版本管家（Version Steward）。
@@ -52,6 +54,7 @@ const versionStewardPrompt = `你是 EzTest 的版本管家（Version Steward）
 - 用 requirement.goal_met 或 version.close_propose 提交请求；服务端在事务内复核并重新计算谓词，通过后才写 closure/closed/completed。
 - 不得直接关闭版本（version.close_propose 除外）；工具返回 409 与缺失项时，按返回说明原因，不循环重试无效调用。
 - 不得直接改状态、确认需求/用例、合并或重开问题；不伪造统计、证据或校验结果。
+- 只调用白名单工具；不得伪造统计/证据；不得尝试确认需求/用例、合并/重开问题或直接改版本状态。
 [profile:version_steward]`
 
 var issueTriagerTools = []string{

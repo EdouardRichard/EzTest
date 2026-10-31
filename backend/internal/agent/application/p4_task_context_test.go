@@ -15,6 +15,24 @@ import (
 // build if a deps parameter is ever added to the hook.
 var _ func(func(context.Context, TaskRef) (any, bool)) = RegisterP4TaskContext
 
+// resetP4TaskContextsForTest isolates a test from the process-global P4
+// task-context provider list. Registration lasts for the whole test process, so
+// without isolation a provider registered by one test could claim a work-item
+// type in another test when the binary runs with -shuffle=on. The snapshot is
+// restored on cleanup so other test files keep the state they started with.
+func resetP4TaskContextsForTest(t *testing.T) {
+	t.Helper()
+	p4TaskContextMu.Lock()
+	saved := p4TaskContextProviders
+	p4TaskContextProviders = nil
+	p4TaskContextMu.Unlock()
+	t.Cleanup(func() {
+		p4TaskContextMu.Lock()
+		p4TaskContextProviders = saved
+		p4TaskContextMu.Unlock()
+	})
+}
+
 // TaskRef is the complete provider input: adding a service port here would
 // re-introduce the deps problem the ruling excludes.
 func TestTaskRefCarriesOnlyWorkItemReference(t *testing.T) {
@@ -30,6 +48,8 @@ func TestTaskRefCarriesOnlyWorkItemReference(t *testing.T) {
 }
 
 func TestP4TaskContextReturnsOnlyTaskRefDerivedData(t *testing.T) {
+	resetP4TaskContextsForTest(t)
+
 	RegisterP4TaskContext(func(_ context.Context, task TaskRef) (any, bool) {
 		if task.Type != "p4.test.payload_only" {
 			return nil, false
@@ -59,6 +79,8 @@ func TestP4TaskContextReturnsOnlyTaskRefDerivedData(t *testing.T) {
 }
 
 func TestP4TaskContextUnregisteredReturnsFalse(t *testing.T) {
+	resetP4TaskContextsForTest(t)
+
 	value, ok := P4TaskContext(context.Background(), TaskRef{
 		VersionID: 42,
 		Type:      "p4.test.unregistered",
@@ -73,6 +95,8 @@ func TestP4TaskContextUnregisteredReturnsFalse(t *testing.T) {
 }
 
 func TestP4TaskContextFallbackWhenP3SwitchMisses(t *testing.T) {
+	resetP4TaskContextsForTest(t)
+
 	var seen TaskRef
 	RegisterP4TaskContext(func(_ context.Context, task TaskRef) (any, bool) {
 		if task.Type != WorkTypeIssueTriage {
@@ -108,6 +132,8 @@ func TestP4TaskContextFallbackWhenP3SwitchMisses(t *testing.T) {
 }
 
 func TestP4TaskContextDoesNotOverrideHandledP3Types(t *testing.T) {
+	resetP4TaskContextsForTest(t)
+
 	RegisterP4TaskContext(func(_ context.Context, task TaskRef) (any, bool) {
 		if task.Type != WorkTypeAnalyzeCoverage {
 			return nil, false
