@@ -130,8 +130,8 @@ func newTestService(t *testing.T, repo *fakeRepo) (*Service, *fakeAudit, *fakePu
 
 func TestDefinitionsAreUniqueAndWellFormed(t *testing.T) {
 	defs := Definitions("http://127.0.0.1:13336")
-	if len(defs) < 40 {
-		t.Fatalf("catalog has %d keys, want >= 40", len(defs))
+	if len(defs) != 49 {
+		t.Fatalf("catalog has %d keys, want 49 (P3: 44 -> 49)", len(defs))
 	}
 	seen := map[string]bool{}
 	for _, def := range defs {
@@ -157,6 +157,58 @@ func TestDefinitionsAreUniqueAndWellFormed(t *testing.T) {
 	if got := string(defs[indexOf(t, defs, "execution.executor_url")].Default); got != `"http://127.0.0.1:13336"` {
 		t.Fatalf("executor default = %s", got)
 	}
+}
+
+// TestP3ExecutionSettings pins the five P3 keys (spec §11.2, P3-D-19): types,
+// defaults, ranges and the first secret-semantics setting.
+func TestP3ExecutionSettings(t *testing.T) {
+	defs := Definitions("http://127.0.0.1:13336")
+	cases := []struct {
+		key     string
+		typ     settings.Type
+		def     string
+		secret  bool
+		min     *float64
+		max     *float64
+		integer bool
+	}{
+		{"execution.executor_token", settings.TypeString, `"eztest-dev-executor-token"`, true, nil, nil, false},
+		{"execution.executor_heartbeat_seconds", settings.TypeNumber, "10", false, floatPtr(1), floatPtr(60), true},
+		{"execution.executor_offline_seconds", settings.TypeNumber, "30", false, floatPtr(5), floatPtr(300), true},
+		{"execution.executor_context_ttl_seconds", settings.TypeNumber, "300", false, floatPtr(30), floatPtr(3600), true},
+		{"execution.human_request_timeout_seconds", settings.TypeNumber, "1800", false, floatPtr(60), floatPtr(86400), true},
+	}
+	for _, tc := range cases {
+		def := defs[indexOf(t, defs, tc.key)]
+		if def.Type != tc.typ || string(def.Default) != tc.def || def.Secret != tc.secret || def.Integer != tc.integer {
+			t.Fatalf("%s = %+v, want type=%s default=%s secret=%v integer=%v", tc.key, def, tc.typ, tc.def, tc.secret, tc.integer)
+		}
+		if def.Category != "execution" {
+			t.Fatalf("%s category = %q", tc.key, def.Category)
+		}
+		if !floatPtrEqual(def.Min, tc.min) || !floatPtrEqual(def.Max, tc.max) {
+			t.Fatalf("%s range = %v..%v, want %v..%v", tc.key, def.Min, def.Max, tc.min, tc.max)
+		}
+	}
+
+	executionKeys := 0
+	for _, def := range defs {
+		if def.Category == "execution" {
+			executionKeys++
+		}
+	}
+	if executionKeys != 11 {
+		t.Fatalf("execution settings = %d, want 11 (6 frozen + 5 P3)", executionKeys)
+	}
+}
+
+func floatPtr(value float64) *float64 { return &value }
+
+func floatPtrEqual(left, right *float64) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }
 
 func indexOf(t *testing.T, defs []settings.Definition, key string) int {
@@ -256,6 +308,12 @@ func TestUpdateValidatesTypeAndRange(t *testing.T) {
 		{"retention.gc_dry_run", "yes"},
 		{"context.compact_threshold", 0.95},
 		{"context.compact_threshold", 0.2},
+		{"execution.executor_heartbeat_seconds", 0},
+		{"execution.executor_heartbeat_seconds", 61},
+		{"execution.executor_offline_seconds", 4},
+		{"execution.executor_context_ttl_seconds", 3601},
+		{"execution.human_request_timeout_seconds", 59},
+		{"execution.executor_token", 123},
 	}
 	for _, tc := range cases {
 		if _, err := svc.Update(ctx, tc.key, tc.value, 1); err == nil {
@@ -268,6 +326,13 @@ func TestUpdateValidatesTypeAndRange(t *testing.T) {
 	}
 	if _, err := svc.Update(ctx, "context.compact_threshold", 0.75, 1); err != nil {
 		t.Fatalf("valid float rejected: %v", err)
+	}
+	token, err := svc.Update(ctx, "execution.executor_token", "rotated-token", 1)
+	if err != nil {
+		t.Fatalf("valid secret token rejected: %v", err)
+	}
+	if !token.Secret {
+		t.Fatal("executor token must stay a secret setting")
 	}
 }
 

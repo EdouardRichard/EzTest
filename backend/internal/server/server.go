@@ -14,6 +14,7 @@ import (
 	designapi "github.com/EdouardRichard/EzTest/backend/internal/design/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/eventing/interfaces/httpapi"
+	executionhttp "github.com/EdouardRichard/EzTest/backend/internal/execution/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/llm/application"
@@ -49,6 +50,7 @@ type Deps struct {
 	DesignGraph   *designapp.GraphService
 	DesignExports *designapp.ExportService
 	DesignStarter versionapp.DesignStarter
+	Execution     *executionhttp.Handler
 }
 
 // New assembles the HTTP middleware chain and every P0 route.
@@ -80,6 +82,7 @@ func New(deps Deps) http.Handler {
 	registerConversationRoutes(mux, authenticated, versionapi.NewConversationHandler(deps.Conversations, deps.DesignStarter))
 	registerTeamRoomRoutes(mux, authenticated, agentapi.NewTeamRoom(deps.TeamRoom, versionExistence{deps.Versions}))
 	registerDesignRoutes(mux, authenticated, designapi.New(deps.DesignGraph, deps.DesignExports))
+	registerExecutionRoutes(mux, authenticated, admin, deps.Execution)
 
 	return RequestID(Recover(Logging(CORS(deps.Config)(mux))))
 }
@@ -241,4 +244,13 @@ func registerResourceRoutes(mux *http.ServeMux, authenticated, admin func(http.H
 	mux.Handle("GET /api/resources/code-repos/{id}", authenticated(http.HandlerFunc(h.GetRepository)))
 	mux.Handle("PATCH /api/resources/code-repos/{id}", authenticated(http.HandlerFunc(h.UpdateRepository)))
 	mux.Handle("DELETE /api/resources/code-repos/{id}", authenticated(http.HandlerFunc(h.DeleteRepository)))
+}
+
+// registerExecutionRoutes mounts the P3 execution API (21 path items / 22
+// operations, spec §9.2). A nil handler keeps P0–P2 deployments unchanged.
+func registerExecutionRoutes(mux *http.ServeMux, authenticated, admin func(http.Handler) http.Handler, h *executionhttp.Handler) {
+	if h == nil {
+		return
+	}
+	h.Register(mux, authenticated, admin)
 }

@@ -40,6 +40,10 @@ func Definitions(executorURL string) []settings.Definition {
 	minTurns, maxTurns := numberRange(1, 100)
 	minRuns, maxRuns := numberRange(1, 64)
 	minThreshold, maxThreshold := numberRange(0.5, 0.9)
+	minHeartbeat, maxHeartbeat := numberRange(1, 60)
+	minOffline, maxOffline := numberRange(5, 300)
+	minContextTTL, maxContextTTL := numberRange(30, 3600)
+	minHumanTimeout, maxHumanTimeout := numberRange(60, 86400)
 
 	return []settings.Definition{
 		{Key: "runtime.snowflake_node_id", Category: "runtime", Type: settings.TypeNumber, Default: num(1), Integer: true, Min: minNode, Max: maxNode, RestartRequired: true, Description: "Snowflake node ID (0-1023); unique per API instance."},
@@ -55,6 +59,11 @@ func Definitions(executorURL string) []settings.Definition {
 		{Key: "execution.executor_url", Category: "execution", Type: settings.TypeString, Default: str(executorURL), Description: "Playwright executor base URL (seeded from EZTEST_EXECUTOR_PORT)."},
 		{Key: "execution.evidence_max_bytes", Category: "execution", Type: settings.TypeNumber, Default: num(5 * 1024 * 1024), Integer: true, Min: number(0, 0), Description: "Maximum single evidence file size in bytes."},
 		{Key: "execution.case_timeout_seconds", Category: "execution", Type: settings.TypeNumber, Default: num(900), Integer: true, Min: number(1, 0), Description: "Hard timeout for one case run in seconds."},
+		{Key: "execution.executor_token", Category: "execution", Type: settings.TypeString, Default: str("eztest-dev-executor-token"), Secret: true, Description: "Bearer token sent by the API to the Playwright executor; masked in the admin API."},
+		{Key: "execution.executor_heartbeat_seconds", Category: "execution", Type: settings.TypeNumber, Default: num(10), Integer: true, Min: minHeartbeat, Max: maxHeartbeat, Description: "Interval between executor /healthz polls in seconds."},
+		{Key: "execution.executor_offline_seconds", Category: "execution", Type: settings.TypeNumber, Default: num(30), Integer: true, Min: minOffline, Max: maxOffline, Description: "Heartbeat silence after which the executor is marked offline."},
+		{Key: "execution.executor_context_ttl_seconds", Category: "execution", Type: settings.TypeNumber, Default: num(300), Integer: true, Min: minContextTTL, Max: maxContextTTL, Description: "TTL for cleaning executor browser contexts of non-running case runs."},
+		{Key: "execution.human_request_timeout_seconds", Category: "execution", Type: settings.TypeNumber, Default: num(1800), Integer: true, Min: minHumanTimeout, Max: maxHumanTimeout, Description: "Expiry of login_takeover human requests in seconds."},
 
 		{Key: "agent.max_turns", Category: "agent", Type: settings.TypeNumber, Default: num(12), Integer: true, Min: minTurns, Max: maxTurns, Description: "Maximum model turns per agent run."},
 		{Key: "agent.run_soft_timeout_seconds", Category: "agent", Type: settings.TypeNumber, Default: num(300), Integer: true, Min: number(1, 0), Description: "Soft timeout for one agent run in seconds."},

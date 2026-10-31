@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -29,6 +30,12 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/design/infrastructure/storageexport"
 	"github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/eventing/infrastructure"
+	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
+	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
+	executionadapters "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/adapters"
+	executioninfra "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/executor"
+	executionpg "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/postgres"
+	executionhttp "github.com/EdouardRichard/EzTest/backend/internal/execution/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/infrastructure"
 	"github.com/EdouardRichard/EzTest/backend/internal/llm/application"
@@ -48,7 +55,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/contentstore"
 )
 
-var version = "0.2.0-p2"
+var version = "0.2.0-p3"
 
 func hostName() string {
 	name, err := os.Hostname()
@@ -216,6 +223,198 @@ func (a designTeamRoomAdapter) Post(ctx context.Context, post designapp.TeamPost
 	return err
 }
 
+// caseRunCanceller breaks the construction cycle between the execution
+// CaseRunner (which needs the human service to open takeovers) and the human /
+// pause services (which cancel in-flight case executor runs). The runner pointer
+// is assigned once right after it is built; calls only happen at runtime.
+type caseRunCanceller struct {
+	runner *executionapp.CaseRunner
+}
+
+func (c *caseRunCanceller) RegisterRun(caseRunID int64, cancel context.CancelFunc) {
+	if c.runner != nil {
+		c.runner.RegisterRun(caseRunID, cancel)
+	}
+}
+
+func (c *caseRunCanceller) CancelRun(caseRunID int64) {
+	if c.runner != nil {
+		c.runner.CancelRun(caseRunID)
+	}
+}
+
+func (c *caseRunCanceller) ClearRun(caseRunID int64) {
+	if c.runner != nil {
+		c.runner.ClearRun(caseRunID)
+	}
+}
+
+var _ executionapp.RunCanceller = (*caseRunCanceller)(nil)
+
+// executionCoverageAdapter projects the version requirement read model onto the
+// execution coverage port. The execution context consumes only current
+// clarified/closed requirements (P3 §8.1); no P2 semantics change.
+type executionCoverageAdapter struct {
+	requirements *versionapp.RequirementService
+}
+
+func (a executionCoverageAdapter) ListRequirements(ctx context.Context, versionID int64) ([]executionapp.RequirementRef, error) {
+	if a.requirements == nil {
+		return nil, nil
+	}
+	refs := make([]executionapp.RequirementRef, 0)
+	for _, status := range []string{"clarified", "closed"} {
+		var beforeID *int64
+		for {
+			items, hasMore, err := a.requirements.List(ctx, versionID, status, 100, beforeID)
+			if err != nil {
+				return nil, err
+			}
+			for _, item := range items {
+				refs = append(refs, executionapp.RequirementRef{
+					RequirementID:        item.ID,
+					RequirementVersionID: item.CurrentVersionID,
+					Status:               item.Status,
+					Title:                item.Title,
+				})
+			}
+			if !hasMore || len(items) == 0 {
+				break
+			}
+			last := items[len(items)-1].ID
+			beforeID = &last
+		}
+	}
+	return refs, nil
+}
+
+var _ executionapp.CoverageReader = executionCoverageAdapter{}
+
+// executionQuotaReader projects the running case_runs into the frozen quota
+// accounting shape (P3-D-11): each running run counts once globally plus once
+// per version_sut it uses, and a multi-SUT run counts as cross-system.
+type executionQuotaReader struct {
+	caseRuns executionapp.CaseRunRepository
+	intents  executionapp.IntentRepository
+}
+
+func (q executionQuotaReader) RunningCases(ctx context.Context) ([]execution.RunningCase, error) {
+	runs, err := q.caseRuns.ListRunning(ctx)
+	if err != nil {
+		return nil, err
+	}
+	usage := make([]execution.RunningCase, 0, len(runs))
+	for _, run := range runs {
+		versionSUTIDs := []int64{}
+		if q.intents != nil {
+			if intent, err := q.intents.Get(ctx, run.IntentID); err == nil {
+				versionSUTIDs = intent.VersionSUTIDs
+			}
+		}
+		usage = append(usage, execution.RunningCase{
+			CaseRunID:     run.ID,
+			VersionSUTIDs: versionSUTIDs,
+			CrossSystem:   len(versionSUTIDs) > 1,
+		})
+	}
+	return usage, nil
+}
+
+var _ executionapp.QuotaReader = executionQuotaReader{}
+
+// executionSUTContexts adapts the postgres store's CreateSUTContext verb to the
+// application SUTContextRepository port (the store predates the narrow port
+// name). It is composition-root-only wiring, no logic.
+type executionSUTContexts struct {
+	repo *executionpg.SUTContextRepository
+}
+
+func (a executionSUTContexts) Create(ctx context.Context, item execution.CaseRunSUTContext) error {
+	return a.repo.CreateSUTContext(ctx, item)
+}
+
+func (a executionSUTContexts) ListByCaseRun(ctx context.Context, caseRunID int64) ([]execution.CaseRunSUTContext, error) {
+	return a.repo.ListByCaseRun(ctx, caseRunID)
+}
+
+func (a executionSUTContexts) UpdateCAS(ctx context.Context, id int64, mutate func(*execution.CaseRunSUTContext) error) (bool, error) {
+	return a.repo.UpdateCAS(ctx, id, mutate)
+}
+
+func (a executionSUTContexts) ListStale(ctx context.Context, createdBefore time.Time, limit int) ([]execution.CaseRunSUTContext, error) {
+	return a.repo.ListStale(ctx, createdBefore, limit)
+}
+
+func (a executionSUTContexts) ListAll(ctx context.Context) ([]execution.CaseRunSUTContext, error) {
+	return a.repo.ListAll(ctx)
+}
+
+var _ executionapp.SUTContextRepository = executionSUTContexts{}
+
+// runExecutionScheduler drives the deterministic wave planner and the recovery
+// sweep every second (P3 §5.2/§5.5). Errors are logged and retried; the loops
+// exit with the process context.
+func runExecutionScheduler(ctx context.Context, scheduler *executionapp.Scheduler, recovery *executionapp.Recovery) {
+	if scheduler == nil && recovery == nil {
+		return
+	}
+	tick := func() {
+		if scheduler != nil {
+			if err := scheduler.Reconcile(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("eztest: execution scheduler: %v", err)
+			}
+		}
+		if recovery != nil {
+			if err := recovery.Reconcile(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("eztest: execution recovery: %v", err)
+			}
+		}
+	}
+	tick()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			tick()
+		}
+	}
+}
+
+// runExecutorPoller pulls the executor /healthz every
+// execution.executor_heartbeat_seconds (P3 §6.2, P3-D-01). The interval is
+// re-read from the hot settings cache each cycle so an admin change applies
+// without a restart.
+func runExecutorPoller(ctx context.Context, registry *executionapp.Registry, settings *settingsapp.Service) {
+	if registry == nil {
+		return
+	}
+	poll := func() {
+		if err := registry.PollOnce(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("eztest: executor poll: %v", err)
+		}
+	}
+	poll()
+	for {
+		interval := time.Duration(execution.DefaultExecutorHeartbeatSeconds) * time.Second
+		if settings != nil {
+			if seconds, err := settings.Int(ctx, executionapp.SettingExecutorHeartbeatSeconds); err == nil && seconds >= 1 && seconds <= 60 {
+				interval = time.Duration(seconds) * time.Second
+			}
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+			poll()
+		}
+	}
+}
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -311,6 +510,159 @@ func main() {
 	versionSvc.SetDesignMetrics(designMetricsAdapter{planner: designPlanner})
 
 	instanceID := fmt.Sprintf("%s-%d", hostName(), os.Getpid())
+
+	// P3 execution context: repositories, cross-context adapters and services.
+	executionRepo := executionpg.NewRepository(pool, ids)
+	executionSUTContextRepo := executionSUTContexts{repo: executionRepo.SUTContexts}
+	executionVersionAdapter := executionadapters.NewVersionAdapter(versionSvc)
+	executionCases := executionadapters.NewDesignCaseReader(designGraph)
+	executionContent := executionadapters.NewContentStore(storageSvc)
+	executionCredentials := executionadapters.NewCredentialAdapter(versionSvc, resourceSvc, resourceSvc)
+	executionHTTPClient := executionadapters.NewHTTPClient()
+	executionDatabase := executionadapters.NewDatabaseAdapter()
+	executionQueue := executionadapters.NewWorkQueueAdapter(workQueue)
+	executionGaps := executionadapters.NewGapEnsurer(workQueue, requirementSvc)
+	executionTeamRoom := executionadapters.NewTeamRoomAdapter(teamRoom)
+	executionCoverage := executionCoverageAdapter{requirements: requirementSvc}
+
+	executorURL, _ := settingsSvc.String(ctx, executionapp.SettingExecutorURL)
+	executorToken, _ := settingsSvc.String(ctx, executionapp.SettingExecutorToken)
+	executorClient := executioninfra.NewClient(executorURL, executorToken, executioninfra.DefaultTimeout)
+	executorRegistry := executionapp.NewRegistry(executionapp.RegistryDeps{
+		Repo:     executionRepo.Executors,
+		Probe:    executionadapters.NewExecutorProbe(executorClient),
+		Settings: settingsSvc,
+		Clock:    clk,
+		IDs:      ids,
+	})
+	executionCanceller := &caseRunCanceller{}
+	executionHumans := executionapp.NewHumanService(executionapp.HumanServiceDeps{
+		Humans:    executionRepo.Humans,
+		CaseRuns:  executionRepo.CaseRuns,
+		Waves:     executionRepo.Waves,
+		Canceller: executionCanceller,
+		WorkQueue: executionQueue,
+		Settings:  settingsSvc,
+		IDs:       ids,
+		Clock:     clk,
+		Events:    eventSvc,
+		Audit:     auditSvc,
+		Timeout:   1800 * time.Second,
+	})
+	executionRunner := executionapp.NewCaseRunner(executionapp.CaseRunnerDeps{
+		Intents:     executionRepo.Intents,
+		CaseRuns:    executionRepo.CaseRuns,
+		SUTContexts: executionSUTContextRepo,
+		Results:     executionRepo.Results,
+		Evidence:    executionRepo.Evidence,
+		Humans:      executionRepo.Humans,
+		Cases:       executionCases,
+		Bindings:    executionVersionAdapter,
+		APIs:        executionVersionAdapter,
+		Browser:     executionadapters.NewBrowserAdapter(executorClient),
+		Credentials: executionCredentials,
+		Content:     executionContent,
+		HTTPClient:  executionHTTPClient,
+		Database:    executionDatabase,
+		Coverage:    executionCoverage,
+		Gaps:        executionGaps,
+		TeamRoom:    executionTeamRoom,
+		Human:       executionHumans,
+		Settings:    settingsSvc,
+		Clock:       clk,
+		IDs:         ids,
+		Events:      eventSvc,
+		Audit:       auditSvc,
+		InstanceID:  instanceID,
+	})
+	executionCanceller.runner = executionRunner
+	executionIntents := executionapp.NewIntentService(executionapp.IntentServiceDeps{
+		Intents:  executionRepo.Intents,
+		Cases:    executionCases,
+		Versions: executionVersionAdapter,
+		IDs:      ids,
+		Clock:    clk,
+		Events:   eventSvc,
+		Audit:    auditSvc,
+	})
+	executionAnalysis := executionapp.NewAnalysisService(executionapp.AnalysisServiceDeps{
+		Waves:        executionRepo.Waves,
+		CaseRuns:     executionRepo.CaseRuns,
+		Results:      executionRepo.Results,
+		Cases:        executionCases,
+		Requirements: executionCoverage,
+		Gaps:         executionGaps,
+		TeamRoom:     executionTeamRoom,
+		WorkQueue:    executionQueue,
+		Settings:     settingsSvc,
+		Clock:        clk,
+		Events:       eventSvc,
+		Audit:        auditSvc,
+	})
+	executionPause := executionapp.NewPauseService(executionapp.PauseServiceDeps{
+		Intents:   executionRepo.Intents,
+		Waves:     executionRepo.Waves,
+		CaseRuns:  executionRepo.CaseRuns,
+		Humans:    executionRepo.Humans,
+		Contexts:  executionSUTContextRepo,
+		Canceller: executionCanceller,
+		Executor:  executionadapters.NewExecutorControl(executorClient),
+		Clock:     clk,
+		Events:    eventSvc,
+		Audit:     auditSvc,
+	})
+	executionScheduler := executionapp.NewScheduler(executionapp.SchedulerDeps{
+		Intents:     executionRepo.Intents,
+		Waves:       executionRepo.Waves,
+		CaseRuns:    executionRepo.CaseRuns,
+		Cases:       executionCases,
+		Versions:    executionVersionAdapter,
+		Executors:   executorRegistry,
+		WorkQueue:   executionQueue,
+		Quota:       execution.QuotaFromSettings(3, 2, 1),
+		QuotaReader: executionQuotaReader{caseRuns: executionRepo.CaseRuns, intents: executionRepo.Intents},
+		Analyzer:    executionAnalysis,
+		IDs:         ids,
+		Clock:       clk,
+		Events:      eventSvc,
+		Instance:    instanceID,
+		LeaseTTL:    30 * time.Second,
+	})
+	executionRecovery := executionapp.NewRecovery(executionapp.RecoveryDeps{
+		Intents:     executionRepo.Intents,
+		Waves:       executionRepo.Waves,
+		CaseRuns:    executionRepo.CaseRuns,
+		Humans:      executionHumans,
+		Executors:   executionRepo.Executors,
+		Contexts:    executionSUTContextRepo,
+		Cases:       executionCases,
+		WorkQueue:   executionQueue,
+		Canceller:   executionCanceller,
+		Executor:    executionadapters.NewExecutorControl(executorClient),
+		Clock:       clk,
+		Events:      eventSvc,
+		Audit:       auditSvc,
+		MaxAttempts: execution.DefaultMaxDispatchAttempts,
+		ContextTTL:  300 * time.Second,
+	})
+	executionHandler := executionhttp.New(executionhttp.Deps{
+		Intents:       executionRepo.Intents,
+		Waves:         executionRepo.Waves,
+		CaseRuns:      executionRepo.CaseRuns,
+		Results:       executionRepo.Results,
+		Evidence:      executionRepo.Evidence,
+		Humans:        executionRepo.Humans,
+		Executors:     executionRepo.Executors,
+		Cases:         executionCases,
+		Versions:      executionVersionAdapter,
+		Content:       executionContent,
+		Settings:      settingsSvc,
+		IntentService: executionIntents,
+		PauseService:  executionPause,
+		HumanService:  executionHumans,
+		Registry:      executorRegistry,
+	})
+
 	runtimeRepo := agentpg.NewRuntimeRepository(pool, ids)
 	if _, err := agentapp.EnsureProfiles(ctx, runtimeRepo); err != nil {
 		log.Fatalf("eztest: seed agent profiles: %v", err)
@@ -333,11 +685,19 @@ func main() {
 			Attachment:  ports,
 			Resource:    ports,
 			Design:      designadapter.New(designGraph),
+			Execution:   executionRunner,
 		},
+		TaskProvider: executionadapters.NewTaskProvider(executionRunner),
+		RunCanceller: executionRunner,
 		InstanceID:   instanceID,
 	})
-	worker := agentapp.NewWorker(workQueue, runner, settingsSvc, slog.Default(), instanceID, agentapp.WithWorkerEvents(eventSvc))
+	worker := agentapp.NewWorker(workQueue, runner, settingsSvc, slog.Default(), instanceID,
+		agentapp.WithWorkerEvents(eventSvc),
+		agentapp.WithWorkerRunSink(executionadapters.NewRunSink(executionRunner)))
+	var background sync.WaitGroup
+	background.Add(1)
 	go func() {
+		defer background.Done()
 		if err := worker.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("eztest: agent worker stopped: %v", err)
 		}
@@ -352,7 +712,21 @@ func main() {
 		Logger:        slog.Default(),
 		Design:        designPlanner,
 	})
-	go runReconciler(ctx, reconciler)
+	background.Add(1)
+	go func() {
+		defer background.Done()
+		runReconciler(ctx, reconciler)
+	}()
+	background.Add(1)
+	go func() {
+		defer background.Done()
+		runExecutionScheduler(ctx, executionScheduler, executionRecovery)
+	}()
+	background.Add(1)
+	go func() {
+		defer background.Done()
+		runExecutorPoller(ctx, executorRegistry, settingsSvc)
+	}()
 
 	handler := server.New(server.Deps{
 		Config:        cfg,
@@ -372,6 +746,7 @@ func main() {
 		DesignGraph:   designGraph,
 		DesignExports: designExports,
 		DesignStarter: designStarterAdapter{planner: designPlanner},
+		Execution:     executionHandler,
 	})
 
 	srv := &http.Server{
@@ -400,4 +775,6 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("eztest: graceful shutdown failed: %v", err)
 	}
+	background.Wait()
+	log.Printf("eztest: stopped")
 }
