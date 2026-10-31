@@ -119,6 +119,21 @@ test("clarification_host replies referencing the latest user text without tools"
   assert.equal(json.choices[0].finish_reason, "stop");
 });
 
+test("clarification_host opening returns a clean greeting instead of echoing the task", async () => {
+  const { status, json } = await postChat({
+    model: "fake-llm",
+    messages: [
+      systemMarked("clarification_host"),
+      userText("这是澄清会话的开场。请向用户提一个简短的开场问题，引导其描述需求。"),
+    ],
+  });
+  assert.equal(status, 200);
+  const content = json.choices[0].message.content;
+  assert.equal(content, "你好，我是澄清 Host。请描述需求或上传附件，我会整理成结构化草案并逐项澄清。");
+  assert.ok(!content.includes("这是澄清会话的开场"), content);
+  assert.ok(!content.includes("引导其描述需求"), content);
+});
+
 test("requirement_curator requests requirement.draft_create deterministically", async () => {
   const body = {
     model: "fake-llm",
@@ -208,6 +223,20 @@ test("context_scout without a tool result explains there is nothing to read", as
   });
   assert.equal(status, 200);
   assert.ok(json.choices[0].message.content.includes("未发现"));
+});
+
+test("context_scout summarizes the attachment context from the user message", async () => {
+  const userMessage =
+    "请阅读附件《login-spec.md》（text/markdown，共 120 字符）并总结要点：\n登录需求正文，支持手机号登录。";
+  const { status, json } = await postChat({
+    model: "fake-llm",
+    messages: [systemMarked("context_scout"), userText(userMessage)],
+  });
+  assert.equal(status, 200);
+  assert.equal(
+    json.choices[0].message.content,
+    "已读取附件：login-spec.md，共 120 字符。请在团队频道查看摘要要点。",
+  );
 });
 
 test("context overflow marker raises a 400 once per request body", async () => {

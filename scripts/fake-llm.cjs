@@ -53,6 +53,9 @@ const OVERFLOW_MARKER = "[fake:context_overflow]";
 const OVERFLOW_HEADER = "x-fake-context-overflow";
 const MAX_CURATOR_TITLE_CHARS = 40;
 const MAX_CURATOR_QUOTE_CHARS = 40;
+const OPENING_USER_MARKER = "这是澄清会话的开场";
+const HOST_OPENING_REPLY = "你好，我是澄清 Host。请描述需求或上传附件，我会整理成结构化草案并逐项澄清。";
+const ATTACHMENT_PROMPT_PATTERN = /请阅读附件《([^》]+)》（[^，]*，共\s*(\d+)\s*字符）/;
 
 // overflowSeen makes the injected context overflow fire exactly once per
 // distinct request body, so the runtime's compact-and-retry path can recover.
@@ -213,6 +216,9 @@ function textOutcome(text) {
 
 function hostOutcome(body) {
   const text = lastUserText(body);
+  if (text.includes(OPENING_USER_MARKER)) {
+    return textOutcome(HOST_OPENING_REPLY);
+  }
   const quoted = truncateChars(text === "" ? "（空消息）" : text, MAX_CURATOR_QUOTE_CHARS);
   return textOutcome(
     "已收到你的澄清需求：" + quoted + "。请补充使用场景、验收标准与优先级，我会继续追问。",
@@ -249,6 +255,14 @@ function curatorOutcome(body, rawBody) {
 function scoutOutcome(body) {
   const toolResult = lastToolResult(body);
   if (!toolResult) {
+    // attachment.ingest runs do not execute tools: the runtime embeds the parsed
+    // attachment context in the user message, so derive the summary from there.
+    const match = ATTACHMENT_PROMPT_PATTERN.exec(lastUserText(body));
+    if (match) {
+      return textOutcome(
+        "已读取附件：" + match[1] + "，共 " + match[2] + " 字符。请在团队频道查看摘要要点。",
+      );
+    }
     return textOutcome("未发现可读附件，请先上传附件再让我总结。");
   }
   const name =
