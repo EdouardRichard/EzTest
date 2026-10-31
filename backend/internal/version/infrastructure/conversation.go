@@ -271,6 +271,71 @@ func (r *ConversationRepository) SaveSummary(ctx context.Context, summary versio
 	return saved, nil
 }
 
+// ListReconcilable returns the most recent clarification conversations with
+// messages plus all their messages (ascending ID) annotated with the agent
+// profile of the run that produced them. Read-only reconciler support.
+func (r *ConversationRepository) ListReconcilable(ctx context.Context, limit int) ([]version.ReconcilerConversation, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT c.id, c.version_id
+		FROM conversation c
+		WHERE c.kind = 'clarification'
+		  AND EXISTS (SELECT 1 FROM conversation_message m WHERE m.conversation_id = c.id)
+		ORDER BY c.id DESC
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list reconcilable conversations: %w", err)
+	}
+	defer rows.Close()
+	conversations := make([]version.ReconcilerConversation, 0)
+	ids := make([]int64, 0)
+	for rows.Next() {
+		var conversation version.ReconcilerConversation
+		if err := rows.Scan(&conversation.ID, &conversation.VersionID); err != nil {
+			return nil, fmt.Errorf("scan reconcilable conversation: %w", err)
+		}
+		conversation.Messages = []version.ReconcilerMessage{}
+		conversations = append(conversations, conversation)
+		ids = append(ids, conversation.ID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list reconcilable conversations: %w", err)
+	}
+	if len(conversations) == 0 {
+		return conversations, nil
+	}
+
+	messageRows, err := r.pool.Query(ctx, `
+		SELECT m.id, m.conversation_id, m.role, COALESCE(run.profile_key, '')
+		FROM conversation_message m
+		LEFT JOIN agent_run run ON run.id = m.agent_run_id
+		WHERE m.conversation_id = ANY($1::BIGINT[])
+		ORDER BY m.id
+	`, ids)
+	if err != nil {
+		return nil, fmt.Errorf("list reconcilable messages: %w", err)
+	}
+	defer messageRows.Close()
+	index := make(map[int64]int, len(conversations))
+	for position := range conversations {
+		index[conversations[position].ID] = position
+	}
+	for messageRows.Next() {
+		var message version.ReconcilerMessage
+		var conversationID int64
+		if err := messageRows.Scan(&message.ID, &conversationID, &message.Role, &message.AgentProfileKey); err != nil {
+			return nil, fmt.Errorf("scan reconcilable message: %w", err)
+		}
+		if position, ok := index[conversationID]; ok {
+			conversations[position].Messages = append(conversations[position].Messages, message)
+		}
+	}
+	if err := messageRows.Err(); err != nil {
+		return nil, fmt.Errorf("list reconcilable messages: %w", err)
+	}
+	return conversations, nil
+}
+
 // ---------- scanning and codecs ----------
 
 func scanConversation(row rowScanner) (version.Conversation, error) {

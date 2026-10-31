@@ -128,6 +128,35 @@ func (r *AttachmentRepository) ConversationExists(ctx context.Context, versionID
 	return exists, nil
 }
 
+// ListPendingForIngest returns the oldest pending attachments together with
+// their conversation/message linkage (zero when a message is not stored yet).
+func (r *AttachmentRepository) ListPendingForIngest(ctx context.Context, limit int) ([]version.PendingAttachment, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT a.id, a.version_id, COALESCE(m.conversation_id, 0), COALESCE(a.conversation_message_id, 0)
+		FROM requirement_attachment a
+		LEFT JOIN conversation_message m ON m.id = a.conversation_message_id
+		WHERE a.extraction_status = 'pending'
+		ORDER BY a.id
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list pending attachments: %w", err)
+	}
+	defer rows.Close()
+	pending := make([]version.PendingAttachment, 0)
+	for rows.Next() {
+		var item version.PendingAttachment
+		if err := rows.Scan(&item.ID, &item.VersionID, &item.ConversationID, &item.MessageID); err != nil {
+			return nil, fmt.Errorf("scan pending attachment: %w", err)
+		}
+		pending = append(pending, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list pending attachments: %w", err)
+	}
+	return pending, nil
+}
+
 // MarkProcessing flips pending -> processing and reports whether this call
 // changed the row.
 func (r *AttachmentRepository) MarkProcessing(ctx context.Context, attachmentID int64, updatedAt time.Time) (bool, error) {

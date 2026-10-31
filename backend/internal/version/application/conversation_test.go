@@ -17,10 +17,12 @@ import (
 // ---------- fake conversation repository ----------
 
 type fakeConversationRepo struct {
-	conversations map[int64]version.Conversation
-	messages      map[int64][]version.Message
-	summaries     map[int64][]version.ConversationSummary
-	forceExisting *version.Message
+	conversations       map[int64]version.Conversation
+	messages            map[int64][]version.Message
+	summaries           map[int64][]version.ConversationSummary
+	forceExisting       *version.Message
+	reconcilable        []version.ReconcilerConversation
+	lastReconcilerLimit int
 }
 
 func newFakeConversationRepo() *fakeConversationRepo {
@@ -133,6 +135,11 @@ func (f *fakeConversationRepo) AppendAssistantMessage(_ context.Context, convers
 
 func (f *fakeConversationRepo) Summary(_ context.Context, conversationID int64) (*version.ConversationSummary, error) {
 	return f.latestSummary(conversationID), nil
+}
+
+func (f *fakeConversationRepo) ListReconcilable(_ context.Context, limit int) ([]version.ReconcilerConversation, error) {
+	f.lastReconcilerLimit = limit
+	return f.reconcilable, nil
 }
 
 func (f *fakeConversationRepo) SaveSummary(_ context.Context, summary version.ConversationSummary) (version.ConversationSummary, error) {

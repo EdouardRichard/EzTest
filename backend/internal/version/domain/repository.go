@@ -42,6 +42,10 @@ type Repository interface {
 	MarkRunning(ctx context.Context, id int64, updatedAt time.Time) (bool, error)
 	// Stats returns the P1 detail aggregates for one version.
 	Stats(ctx context.Context, id int64) (VersionStats, error)
+	// ListInitialVersionsWithContent returns initial versions that already have a
+	// conversation message or requirement; the P1 reconciler uses it to fix a
+	// missed running projection.
+	ListInitialVersionsWithContent(ctx context.Context, limit int) ([]int64, error)
 
 	// Usage guards answer whether a resource is still referenced by a version
 	// binding. They back resourceapp.UsageChecker.
