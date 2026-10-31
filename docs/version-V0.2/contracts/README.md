@@ -8,6 +8,8 @@
 > **P1 冻结状态（2026-10-31）**：`db-schema.md` §7（16 表/索引）、`migrations-order.md` §5a（7 迁移）、`events.md` §10（23 事件）、`settings.md` §4a（不新增键）、`task-types.md`、`agent-profiles-tools.md`、`openapi.yaml` P1 paths/schemas（10 个 path item / 23 schemas）已冻结为 **`frozen: P1`**。P1 的实现证据：`scripts/test.ps1` 全绿、`scripts/p1-acceptance.ps1` 19 步 PASS、`scripts/p1-e2e.ps1` 浏览器 PASS、`scripts/p1-acceptance-llm.ps1` 真实 DeepSeek `deepseek-flash` PASS。P2+ 只能增量，破坏性变更需先停止并更新契约/决策/handoff。
 >
 > **P2 冻结状态（2026-10-31）**：P2 已完成 design/exports paths/schemas（7 paths / 8 schemas）、§11 事件（9）、10 张表/2 迁移、5 类任务、5 个 profiles、4 个设计工具与 settings §4b。P2 增量已从 `x-draft: P2` / `draft: P2` 翻为 **`x-frozen: P2` / `frozen: P2`**。实现证据：`scripts/test.ps1` 全绿、`scripts/p2-acceptance.ps1` 21 步 PASS、`scripts/p2-e2e.ps1` 浏览器 PASS、`scripts/p2-acceptance-llm.ps1` 真实 DeepSeek `deepseek-flash` PASS、`scripts/p2-e2e-llm.ps1` 真实模型浏览器 PASS。冻结后 P3+ 只能增量，破坏性变更需更新契约/决策/handoff。
+>
+> **P3 契约状态（2026-11-01，阶段内 draft）**：P3 执行/证据/人机请求契约已写入。`openapi.yaml`：`info.version: 0.2.0-p3`，新增 22 个执行/证据/人机请求 operation（21 个 path item；tags `Execution`/`Evidence`/`HumanRequests`）与 22 个 P3 schema，P0/P1/P2 paths/schemas 不变；根仍为 `x-frozen: P2` 并新增 **`x-draft: P3`**，阶段末翻为 `x-frozen: P3`。`events.md` §12（20 事件，`case_run.step_finished` 冻结名）、`db-schema.md` §9（10 表逐列/约束/索引/不变量）、`migrations-order.md` §5c（3 个 execution 迁移，`order.txt` 第 18–20）、`task-types.md` §5（3 任务，已从 §4 移出）、`agent-profiles-tools.md` §6（3 profiles + 执行/等待/接管工具，含 `execution.wait`；§4b 只留 P4+ 预留）、`settings.md` §3/§4c（44→49 键，`execution.executor_token` 首个 secret）均为 **`frozen: P3`**；`executor-protocol.md` 新建并 `frozen: P3`。阶段内证据：`node scripts/p3-contract-check.cjs --draft`、`go test ./internal/db/...`、`go test -tags=integration ./internal/db/...`（20 迁移/10 新表）。冻结后 P4+ 只能增量，破坏性变更需更新契约/决策/handoff。
 
 ## 目录内容
 
@@ -20,6 +22,7 @@
 | `task-types.md` | work_item 类型/状态/去重键 | P1 | 每阶段增量 |
 | `agent-profiles-tools.md` | profile、工具白名单、作用域注入、提交 schema | P1 | 每阶段增量 |
 | `settings.md` | env 4 项、DB 设置键/默认/热加载/重启标记 | P0 | 每阶段增量 |
+| `executor-protocol.md` | 执行器 HTTP 协议、token/注册/心跳/多 SUT 映射/证据交接 | P3 | 每阶段增量 |
 | `handoff-template.md` | 阶段 handoff 模板 | 已有 | 按需 |
 
 ## 冻结规则

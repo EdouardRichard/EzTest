@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: EzTest 0.2 API 契约（P0 冻结 + P1 冻结 + P2 增量）
-  version: 0.2.0-p2
+  version: 0.2.0-p3
   description: |
     EzTest 0.2 P0（平台底座）对外 REST/SSE 契约，来源：
     `docs/superpowers/specs/2026-10-31-eztest-v02-p0-platform-foundation-design.md` §7/§8/§9。
@@ -96,7 +96,18 @@ info:
     新增 design graph/overview/case detail/confirmation、版本级 case 导出创建/列表/元数据/鉴权下载。
     最新 design 对话始终为当前轮，不新增关闭 API；确认只允许 user/server；导出覆盖整个版本并支持
     Markdown/Mermaid/OPML/CSV，导出字节写入 P0 内容账本。
+    ### P3 增量（draft，2026-11-01）
+
+    来源：`docs/superpowers/specs/2026-11-01-eztest-v02-p3-execution-design.md` §9/§10/§11/§14。
+    P0/P1/P2 paths/schemas 保持不变；P3 新增 22 个 path（执行概览/intents/waves/case-runs/evidence/
+    human-requests/admin executors）、Execution/Evidence/HumanRequests 三个 tag 与对应视图。
+    执行是「确认即入队」的意图驱动自动波次，无「开始执行」端点；ID 仍为十进制字符串，时间 RFC3339 UTC，
+    列表沿用 `{data,next_cursor,has_more}`，分页参数为 `before` + `limit`（默认 20，上限 100）。
+    P3 新增错误码 `evidence_too_large`（证据超 5 MiB，409/413 视体积）与 `executor_unavailable`
+    （执行器不可达/未注册，503）；human request 任意登录用户可 resolve，executor 管理仅 admin。
+    实时走既有 `GET /api/events` + `GET /api/stream?channel=version:{id}`，事件类型见 `contracts/events.md` §12。
 x-frozen: P2
+x-draft: P3
 servers:
   - url: http://localhost:13333
     description: 本地开发默认 API（端口来自 EZTEST_API_PORT，默认 13333）
@@ -133,6 +144,12 @@ tags:
     description: 用例设计图、用例详情与三粒度确认（P2）
   - name: Exports
     description: 用例导出与鉴权下载（P2）
+  - name: Execution
+    description: 执行意图、波次、用例结果与执行器管理（P3）
+  - name: Evidence
+    description: 证据元数据与鉴权下载（P3，不可变）
+  - name: HumanRequests
+    description: 登录接管/人机请求（P3）
 
 paths:
   /healthz:
@@ -2841,6 +2858,724 @@ paths:
         '500':
           $ref: '#/components/responses/Internal'
 
+  # -------------------------------------------------------------------------
+  # P3 execution increments (draft, 2026-11-01)
+  # -------------------------------------------------------------------------
+  /api/versions/{id}/execution/overview:
+    get:
+      tags: [Execution]
+      operationId: getExecutionOverview
+      summary: 执行概览（登录用户）
+      description: |
+        活跃波摘要、波次 counts、case_run counts、open human request 数、执行器状态与配额；
+        空态返回零值（`active_wave=null`）。执行器不可达只在派发时返回 `executor_unavailable`（503），概览始终可读。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: 执行概览
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/ExecutionOverview'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/execution/intents:
+    get:
+      tags: [Execution]
+      operationId: listExecutionIntents
+      summary: 执行意图列表（登录用户）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/IntentStatusFilter'
+        - $ref: '#/components/parameters/Before'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 意图列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/IntentView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [Execution]
+      operationId: createExecutionIntent
+      summary: 手工创建 intent（purpose=retest/manual）
+      description: |
+        校验 case_version 属于该版本且为 current+confirmed；同 active 键已存在返回 409 `state_conflict`。
+        `retest` 建议仅对存在失败结果时调用（否则 400）；`manual` 任意当前 confirmed 用例可用。
+        版本为 `completed` 时由服务端清除完成标记回 `running`（P3-D-28）。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateIntentRequest'
+      responses:
+        '201':
+          description: 新建的 intent
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/IntentView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/execution/intents/{intentId}/cancel:
+    post:
+      tags: [Execution]
+      operationId: cancelExecutionIntent
+      summary: 取消 intent（幂等）
+      description: open 直接取消；claimed/running 取消并把它在波次内的非终态 case_run 置 `superseded`；已终态返回当前值。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/IntentID'
+      responses:
+        '200':
+          description: 取消后的 intent
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/IntentView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/waves:
+    get:
+      tags: [Execution]
+      operationId: listRunWaves
+      summary: 波次列表（倒序，登录用户）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/WaveStatusFilter'
+        - $ref: '#/components/parameters/Before'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 波次列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/RunWaveView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/waves/{waveId}:
+    get:
+      tags: [Execution]
+      operationId: getRunWave
+      summary: 波次详情（仅 wave/counts；case_run 走独立分页端点）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/WaveID'
+      responses:
+        '200':
+          description: 波次
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/RunWaveView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/waves/{waveId}/pause:
+    post:
+      tags: [Execution]
+      operationId: pauseRunWave
+      summary: 暂停波次（graceful 默认 / immediate）
+      description: |
+        `graceful` 停止派发 pending、在飞 case_run 允许跑完；`immediate` 取消在飞 case_run 与执行器 context，
+        已完成结果保留。`paused` 仍占单活跃波；已暂停返回 200 当前值（不重复事件）。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/WaveID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PauseWaveRequest'
+      responses:
+        '200':
+          description: 暂停后的波次
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/RunWaveView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/waves/{waveId}/resume:
+    post:
+      tags: [Execution]
+      operationId: resumeRunWave
+      summary: 恢复波次（存在 open human request 时拒绝）
+      description: paused→running；paused case_run→pending（attempts 不变、dispatch_epoch+1）；存在 open human request 返回 409 `state_conflict`（先 resolve）。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/WaveID'
+      responses:
+        '200':
+          description: 恢复后的波次
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/RunWaveView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/waves/{waveId}/cancel:
+    post:
+      tags: [Execution]
+      operationId: cancelRunWave
+      summary: 取消波次（幂等）
+      description: planned/running/paused→cancelled；非终态 case_run→superseded，active intent→cancelled，清理执行器 context，不产生失败分析任务；已终态返回当前值。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/WaveID'
+      responses:
+        '200':
+          description: 取消后的波次
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/RunWaveView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/waves/{waveId}/case-runs:
+    get:
+      tags: [Execution]
+      operationId: listWaveCaseRuns
+      summary: 波次内用例结果分页（倒序）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/WaveID'
+        - $ref: '#/components/parameters/CaseRunStatusFilter'
+        - $ref: '#/components/parameters/Before'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 用例结果列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/CaseRunView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/case-runs/{caseRunId}:
+    get:
+      tags: [Execution]
+      operationId: getCaseRun
+      summary: 用例结果详情（steps + assertions + 前 50 条证据）
+      description: 一次返回 case_run、全部步骤、全部断言与证据前 50 条；更多证据走 `GET /evidence` 分页。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/CaseRunID'
+      responses:
+        '200':
+          description: 用例结果详情
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CaseRunDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/case-runs/{caseRunId}/pause:
+    post:
+      tags: [Execution]
+      operationId: pauseCaseRun
+      summary: 用例级暂停（immediate）
+      description: pending→paused（不派发）；running→立即取消并 paused（保留已完成结果）；已暂停返回 200 当前值。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/CaseRunID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PauseCaseRunRequest'
+      responses:
+        '200':
+          description: 暂停后的用例结果
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CaseRunView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/case-runs/{caseRunId}/resume:
+    post:
+      tags: [Execution]
+      operationId: resumeCaseRun
+      summary: 用例级恢复
+      description: paused→pending（attempts 不变、dispatch_epoch+1），由调度器重新派发；存在 open human request 返回 409。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/CaseRunID'
+      responses:
+        '200':
+          description: 恢复后的用例结果
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CaseRunView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/evidence:
+    get:
+      tags: [Evidence]
+      operationId: listEvidence
+      summary: 证据列表（按 case_run/version_sut/kind 过滤，倒序）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/EvidenceCaseRunFilter'
+        - $ref: '#/components/parameters/EvidenceVersionSUTFilter'
+        - $ref: '#/components/parameters/EvidenceKindFilter'
+        - $ref: '#/components/parameters/Before'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 证据列表（元数据，不含字节/路径）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/EvidenceView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/evidence/{evidenceId}:
+    get:
+      tags: [Evidence]
+      operationId: getEvidence
+      summary: 证据元数据
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/EvidenceID'
+      responses:
+        '200':
+          description: 证据元数据
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/EvidenceView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/evidence/{evidenceId}/content:
+    get:
+      tags: [Evidence]
+      operationId: downloadEvidence
+      summary: 鉴权下载证据字节
+      description: |
+        校验 `case_run → wave → version` 归属；读取 P0 内容账本字节并重算 sha256/大小，与 evidence 行不一致
+        返回 409 `state_conflict`（拒绝下载）。`Content-Disposition` 使用清洗后的 filename；不暴露存储路径。
+        证据不可变，无更新/删除端点；超过 `execution.evidence_max_bytes`（5 MiB）的采集在写入侧返回
+        `evidence_too_large`，不会出现在本端点。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/EvidenceID'
+      responses:
+        '200':
+          description: 证据字节
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+            Content-Length:
+              schema:
+                type: integer
+                format: int64
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: 证据字节与 sha256/size 不一致（state_conflict，拒绝下载）
+          headers:
+            X-Request-ID:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/human-requests:
+    get:
+      tags: [HumanRequests]
+      operationId: listHumanRequests
+      summary: 人机请求列表（status 过滤，倒序）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/HumanRequestStatusFilter'
+        - $ref: '#/components/parameters/Before'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 人机请求列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/HumanRequestView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/human-requests/{humanRequestId}/resolve:
+    post:
+      tags: [HumanRequests]
+      operationId: resolveHumanRequest
+      summary: 完成人机请求（任意登录用户）
+      description: |
+        只允许 `open`；写 response/resolved_by/at 并触发恢复：case_run→pending（attempts 不变、dispatch_epoch+1）、
+        wave→running（仅当 pause_reason=waiting_human 且无其他 open human request）。
+        P3 响应不回显 `code`；非 open 返回 409 `state_conflict`。
+      parameters:
+        - $ref: '#/components/parameters/HumanRequestID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResolveHumanRequestRequest'
+      responses:
+        '200':
+          description: resolve 后的人机请求
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/HumanRequestView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/human-requests/{humanRequestId}/cancel:
+    post:
+      tags: [HumanRequests]
+      operationId: cancelHumanRequest
+      summary: 取消人机请求（放弃该用例）
+      description: open→cancelled，对应 case_run 置 failed(session)、reason=human_cancelled；已 cancelled 幂等 200，resolved/expired 返回 409。
+      parameters:
+        - $ref: '#/components/parameters/HumanRequestID'
+      responses:
+        '200':
+          description: 取消后的人机请求
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/HumanRequestView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/admin/executors:
+    get:
+      tags: [Execution]
+      operationId: listExecutors
+      summary: 执行器实例列表（admin）
+      description: P3 只有一个 endpoint；返回注册/心跳投影，不含 token/token_hash。执行器不可达时 `executor_unavailable`（503）只影响派发，不影响本列表。
+      responses:
+        '200':
+          description: 执行器列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/ExecutorView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/admin/executors/{executorId}/drain:
+    post:
+      tags: [Execution]
+      operationId: drainExecutor
+      summary: 摘流执行器（admin；不影响执行器进程）
+      description: active→draining，停止新派发，在飞 case_run 继续；已 draining 幂等 200。
+      parameters:
+        - $ref: '#/components/parameters/ExecutorID'
+      responses:
+        '200':
+          description: 摘流后的执行器
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/ExecutorView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/admin/executors/{executorId}/activate:
+    post:
+      tags: [Execution]
+      operationId: activateExecutor
+      summary: 恢复执行器（admin；draining/offline→active）
+      parameters:
+        - $ref: '#/components/parameters/ExecutorID'
+      responses:
+        '200':
+          description: 恢复后的执行器
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/ExecutorView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
 components:
   securitySchemes:
     bearerAuth:
@@ -2992,6 +3727,110 @@ components:
         minimum: 1
         maximum: 200
         default: 100
+    IntentID:
+      name: intentId
+      in: path
+      required: true
+      description: 执行意图（execution_intent）雪花 ID 的十进制字符串
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    WaveID:
+      name: waveId
+      in: path
+      required: true
+      description: 波次（run_wave）雪花 ID 的十进制字符串
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    CaseRunID:
+      name: caseRunId
+      in: path
+      required: true
+      description: 用例结果（case_run）雪花 ID 的十进制字符串
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    EvidenceID:
+      name: evidenceId
+      in: path
+      required: true
+      description: 证据（evidence）雪花 ID 的十进制字符串
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    HumanRequestID:
+      name: humanRequestId
+      in: path
+      required: true
+      description: 人机请求（human_request）雪花 ID 的十进制字符串
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    ExecutorID:
+      name: executorId
+      in: path
+      required: true
+      description: 执行器实例（executor_instance）雪花 ID 的十进制字符串
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    IntentStatusFilter:
+      name: status
+      in: query
+      required: false
+      description: intent 状态过滤
+      schema:
+        type: string
+        enum: [open, claimed, running, done, failed, cancelled, superseded]
+    WaveStatusFilter:
+      name: status
+      in: query
+      required: false
+      description: 波次状态过滤
+      schema:
+        type: string
+        enum: [planned, running, paused, done, failed, cancelled]
+    CaseRunStatusFilter:
+      name: status
+      in: query
+      required: false
+      description: case_run 状态过滤（四态 + 过程态）
+      schema:
+        type: string
+        enum: [pending, running, paused, passed, failed, blocked, inconclusive, skipped, interrupted, superseded]
+    EvidenceCaseRunFilter:
+      name: case_run_id
+      in: query
+      required: false
+      description: 按 case_run 过滤证据（十进制字符串）
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    EvidenceVersionSUTFilter:
+      name: version_sut_id
+      in: query
+      required: false
+      description: 按 version_sut 过滤证据（十进制字符串）
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    EvidenceKindFilter:
+      name: kind
+      in: query
+      required: false
+      description: 证据类型过滤
+      schema:
+        type: string
+        enum: [screenshot, snapshot, console, network, http, db, download, text]
+    HumanRequestStatusFilter:
+      name: status
+      in: query
+      required: false
+      description: 人机请求状态过滤
+      schema:
+        type: string
+        enum: [open, resolved, cancelled, expired]
   responses:
     BadRequest:
       description: 请求参数/请求体校验失败（invalid_argument）
@@ -3047,7 +3886,7 @@ components:
           schema:
             $ref: '#/components/schemas/ErrorEnvelope'
     Unavailable:
-      description: 依赖暂时不可用（unavailable / ai_unavailable / context_overflow，retryable=true）
+      description: 依赖暂时不可用（unavailable / ai_unavailable / context_overflow / executor_unavailable，retryable=true）
       headers:
         X-Request-ID:
           schema:
@@ -3077,7 +3916,7 @@ components:
           properties:
             code:
               type: string
-              description: invalid_argument / unauthenticated / forbidden / not_found / conflict / state_conflict / lease_lost / ai_unavailable / context_overflow / unsupported_attachment_format / extraction_failed / unavailable / internal
+              description: invalid_argument / unauthenticated / forbidden / not_found / conflict / state_conflict / lease_lost / ai_unavailable / context_overflow / unsupported_attachment_format / extraction_failed / evidence_too_large / executor_unavailable / unavailable / internal
             message:
               type: string
             request_id:
@@ -5359,3 +6198,581 @@ components:
           format: date-time
         download_url:
           type: string
+
+    # -----------------------------------------------------------------------
+    # P3 execution schemas (draft, 2026-11-01)
+    # -----------------------------------------------------------------------
+    WaveSUTCounts:
+      type: object
+      required: [total, passed, failed, blocked, inconclusive]
+      properties:
+        total:
+          type: integer
+          minimum: 0
+        passed:
+          type: integer
+          minimum: 0
+        failed:
+          type: integer
+          minimum: 0
+        blocked:
+          type: integer
+          minimum: 0
+        inconclusive:
+          type: integer
+          minimum: 0
+    WaveCounts:
+      type: object
+      required: [total, pending, running, paused, passed, failed, blocked, inconclusive, skipped, interrupted, superseded, evidence, by_version_sut]
+      properties:
+        total:
+          type: integer
+          minimum: 0
+          description: 按 case_run 去重计数（不是各 SUT 求和）
+        pending:
+          type: integer
+          minimum: 0
+        running:
+          type: integer
+          minimum: 0
+        paused:
+          type: integer
+          minimum: 0
+        passed:
+          type: integer
+          minimum: 0
+        failed:
+          type: integer
+          minimum: 0
+        blocked:
+          type: integer
+          minimum: 0
+        inconclusive:
+          type: integer
+          minimum: 0
+        skipped:
+          type: integer
+          minimum: 0
+        interrupted:
+          type: integer
+          minimum: 0
+        superseded:
+          type: integer
+          minimum: 0
+        evidence:
+          type: integer
+          minimum: 0
+        by_version_sut:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/WaveSUTCounts'
+          description: 键为 version_sut 十进制字符串；跨系统用例在每个 SUT 下各计一次
+    CaseRunCounts:
+      type: object
+      required: [total, pending, running, paused, passed, failed, blocked, inconclusive, skipped, interrupted, superseded]
+      properties:
+        total:
+          type: integer
+          minimum: 0
+        pending:
+          type: integer
+          minimum: 0
+        running:
+          type: integer
+          minimum: 0
+        paused:
+          type: integer
+          minimum: 0
+        passed:
+          type: integer
+          minimum: 0
+        failed:
+          type: integer
+          minimum: 0
+        blocked:
+          type: integer
+          minimum: 0
+        inconclusive:
+          type: integer
+          minimum: 0
+        skipped:
+          type: integer
+          minimum: 0
+        interrupted:
+          type: integer
+          minimum: 0
+        superseded:
+          type: integer
+          minimum: 0
+    ExecutionQuotas:
+      type: object
+      required: [global, per_sut, cross_system]
+      properties:
+        global:
+          type: integer
+          minimum: 1
+          description: execution.global_concurrency（running case_run 数，默认 3）
+        per_sut:
+          type: integer
+          minimum: 1
+          description: execution.per_sut_concurrency（每 version_sut 的 running case_run 数，默认 2）
+        cross_system:
+          type: integer
+          minimum: 1
+          description: execution.cross_system_concurrency（全局跨系统 running case_run 数，默认 1）
+    ExecutorStatusView:
+      type: object
+      required: [status, endpoint, capacity, active_contexts, version]
+      properties:
+        id:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+          description: 已注册执行器实例 ID；尚未注册时为 null（不建行，P3-D-01）
+        status:
+          type: string
+          enum: [active, draining, offline]
+        endpoint:
+          type: string
+          description: 来自 execution.executor_url
+        capacity:
+          type: integer
+          minimum: 0
+          description: 执行器 maxContexts
+        active_contexts:
+          type: integer
+          minimum: 0
+          description: 执行器 healthz contexts
+        last_heartbeat:
+          type: string
+          nullable: true
+          format: date-time
+        version:
+          type: string
+          description: 执行器 healthz version
+    ExecutionOverview:
+      type: object
+      required: [version_id, active_wave, counts, case_run_counts, open_human_requests, executor, quotas, human_request_timeout_seconds]
+      properties:
+        version_id:
+          type: string
+          pattern: '^[0-9]+$'
+        active_wave:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/RunWaveView'
+          description: 当前单活跃波（planned/running/paused）；无活跃波时为 null
+        counts:
+          $ref: '#/components/schemas/WaveCounts'
+        case_run_counts:
+          $ref: '#/components/schemas/CaseRunCounts'
+        open_human_requests:
+          type: integer
+          minimum: 0
+        executor:
+          $ref: '#/components/schemas/ExecutorStatusView'
+        quotas:
+          $ref: '#/components/schemas/ExecutionQuotas'
+        human_request_timeout_seconds:
+          type: integer
+          minimum: 60
+    RunWaveView:
+      type: object
+      required: [id, version_id, status, trigger, counts, started_at, finished_at, paused_at, pause_mode, pause_reason, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        version_id:
+          type: string
+          pattern: '^[0-9]+$'
+        status:
+          type: string
+          enum: [planned, running, paused, done, failed, cancelled]
+        trigger:
+          type: string
+          enum: [auto, manual, retest]
+        counts:
+          $ref: '#/components/schemas/WaveCounts'
+        started_at:
+          type: string
+          nullable: true
+          format: date-time
+        finished_at:
+          type: string
+          nullable: true
+          format: date-time
+        paused_at:
+          type: string
+          nullable: true
+          format: date-time
+        pause_mode:
+          type: string
+          enum: ['', graceful, immediate]
+        pause_reason:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+    IntentView:
+      type: object
+      required: [id, version_id, case_version_id, case_id, case_title, version_sut_ids, purpose, status, attempt_no, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        version_id:
+          type: string
+          pattern: '^[0-9]+$'
+        case_version_id:
+          type: string
+          pattern: '^[0-9]+$'
+        case_id:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+          description: 逻辑用例 ID（由 case_version 反查；历史版本可能为空）
+        case_title:
+          type: string
+        version_sut_ids:
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9]+$'
+        purpose:
+          type: string
+          enum: [initial, retest, manual]
+        status:
+          type: string
+          enum: [open, claimed, running, done, failed, cancelled, superseded]
+        attempt_no:
+          type: integer
+          minimum: 1
+        created_at:
+          type: string
+          format: date-time
+    CaseRunSummaryView:
+      type: object
+      required: [verdict_reason, assertion_total, assertion_failed, step_total, step_failed, evidence_count, visual_skipped]
+      properties:
+        verdict_reason:
+          type: string
+          description: 终态判定原因，如 incomplete/human_timeout/human_cancelled
+        assertion_total:
+          type: integer
+          minimum: 0
+        assertion_failed:
+          type: integer
+          minimum: 0
+        step_total:
+          type: integer
+          minimum: 0
+        step_failed:
+          type: integer
+          minimum: 0
+        evidence_count:
+          type: integer
+          minimum: 0
+        visual_skipped:
+          type: integer
+          minimum: 0
+          description: P3 visual 断言只记 skipped（P3-D-39；P5 实现）
+        human_request_id:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+    CaseRunView:
+      type: object
+      required: [id, wave_id, intent_id, case_id, case_version_id, title, status, failure_class, attempts, summary, started_at, finished_at, version_sut_ids, evidence_count]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        wave_id:
+          type: string
+          pattern: '^[0-9]+$'
+        intent_id:
+          type: string
+          pattern: '^[0-9]+$'
+        case_id:
+          type: string
+          pattern: '^[0-9]+$'
+        case_version_id:
+          type: string
+          pattern: '^[0-9]+$'
+        title:
+          type: string
+        status:
+          type: string
+          enum: [pending, running, paused, passed, failed, blocked, inconclusive, skipped, interrupted, superseded]
+        failure_class:
+          type: string
+          enum: ['', application, environment, session, model, automation, timeout, executor_lost, blocked, unknown]
+        attempts:
+          type: integer
+          minimum: 0
+        summary:
+          $ref: '#/components/schemas/CaseRunSummaryView'
+        started_at:
+          type: string
+          nullable: true
+          format: date-time
+        finished_at:
+          type: string
+          nullable: true
+          format: date-time
+        version_sut_ids:
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9]+$'
+        evidence_count:
+          type: integer
+          minimum: 0
+    CaseRunStepView:
+      type: object
+      required: [seq, target_version_sut_id, status, observed, error, started_at, finished_at]
+      properties:
+        seq:
+          type: integer
+          minimum: 1
+        target_version_sut_id:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+        status:
+          type: string
+          enum: [pending, running, passed, failed, blocked, skipped]
+        observed:
+          type: object
+          additionalProperties: true
+        error:
+          type: string
+        started_at:
+          type: string
+          nullable: true
+          format: date-time
+        finished_at:
+          type: string
+          nullable: true
+          format: date-time
+    CaseRunAssertionView:
+      type: object
+      required: [step_seq, assertion_seq, kind, verdict, expected, actual, reason, target_version_sut_id]
+      properties:
+        step_seq:
+          type: integer
+          minimum: 1
+        assertion_seq:
+          type: integer
+          minimum: 1
+        kind:
+          type: string
+          enum: [ui, api, db, text, visual]
+        verdict:
+          type: string
+          enum: [passed, failed, inconclusive, skipped]
+        expected:
+          type: string
+        actual:
+          type: string
+        reason:
+          type: string
+        target_version_sut_id:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+    EvidenceView:
+      type: object
+      required: [id, case_run_id, version_sut_id, kind, sha256, size_bytes, mime, filename, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        case_run_id:
+          type: string
+          pattern: '^[0-9]+$'
+        version_sut_id:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+        kind:
+          type: string
+          enum: [screenshot, snapshot, console, network, http, db, download, text]
+        sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        size_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+        mime:
+          type: string
+        filename:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+      description: 证据元数据；不含 content_ref_id/存储路径/凭据。字节走鉴权下载端点。
+    CaseRunDetail:
+      type: object
+      required: [case_run, steps, assertions, evidence]
+      properties:
+        case_run:
+          $ref: '#/components/schemas/CaseRunView'
+        steps:
+          type: array
+          items:
+            $ref: '#/components/schemas/CaseRunStepView'
+        assertions:
+          type: array
+          items:
+            $ref: '#/components/schemas/CaseRunAssertionView'
+        evidence:
+          type: array
+          description: 前 50 条证据元数据；更多走 GET /evidence 分页
+          items:
+            $ref: '#/components/schemas/EvidenceView'
+    HumanRequestPayload:
+      type: object
+      required: [reason, account_role, page_url, challenge_kind]
+      properties:
+        reason:
+          type: string
+        version_sut_id:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+        account_role:
+          type: string
+        page_url:
+          type: string
+        challenge_kind:
+          type: string
+        evidence_id:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+    HumanRequestResponseView:
+      type: object
+      description: P3 只回显 note 摘要，不回显一次性 code/密码
+      properties:
+        note:
+          type: string
+    HumanRequestView:
+      type: object
+      required: [id, version_id, case_run_id, kind, status, payload, expires_at, response, resolved_by, resolved_at, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        version_id:
+          type: string
+          pattern: '^[0-9]+$'
+        case_run_id:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+        kind:
+          type: string
+          enum: [login_takeover, conflict, other]
+        status:
+          type: string
+          enum: [open, resolved, cancelled, expired]
+        payload:
+          $ref: '#/components/schemas/HumanRequestPayload'
+        expires_at:
+          type: string
+          format: date-time
+        response:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/HumanRequestResponseView'
+        resolved_by:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+        resolved_at:
+          type: string
+          nullable: true
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+    ExecutorView:
+      type: object
+      required: [id, name, endpoint, status, capacity, active_contexts, labels, last_heartbeat, version, last_error]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        name:
+          type: string
+        endpoint:
+          type: string
+        status:
+          type: string
+          enum: [active, draining, offline]
+        capacity:
+          type: integer
+          minimum: 0
+        active_contexts:
+          type: integer
+          minimum: 0
+        labels:
+          type: object
+          additionalProperties: true
+        last_heartbeat:
+          type: string
+          nullable: true
+          format: date-time
+        version:
+          type: string
+        last_error:
+          type: string
+      description: admin only；不含 token/token_hash。
+    CreateIntentRequest:
+      type: object
+      required: [case_version_id, purpose]
+      properties:
+        case_version_id:
+          type: string
+          pattern: '^[0-9]+$'
+          description: 必须属于该版本且 current+confirmed
+        purpose:
+          type: string
+          enum: [retest, manual]
+    PauseWaveRequest:
+      type: object
+      required: [mode]
+      properties:
+        mode:
+          type: string
+          enum: [graceful, immediate]
+          description: graceful 允许在飞完成；immediate 取消在飞
+        reason:
+          type: string
+          maxLength: 200
+    PauseCaseRunRequest:
+      type: object
+      required: [mode]
+      properties:
+        mode:
+          type: string
+          enum: [immediate]
+          description: P3 用例级暂停只支持 immediate（取消在飞并保留已落结果）
+    ResolveHumanRequestRequest:
+      type: object
+      required: [response]
+      properties:
+        response:
+          type: object
+          additionalProperties: false
+          properties:
+            code:
+              type: string
+              maxLength: 64
+              description: 一次性验证码（只落库/内存，不回显）
+            note:
+              type: string
+              maxLength: 2000

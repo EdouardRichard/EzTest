@@ -347,3 +347,45 @@ P2 事件仍只发布到 `version:{id}` 频道；scope 使用十进制字符串�
 3. 图事件只带受影响 ID；前端去抖重拉 `GET /design/graph`，不从事件还原整图。
 4. `design.export_ready` 不含导出内容/文件名路径；下载走鉴权端点。
 
+---
+
+## 12. P3 增量事件（`frozen: P3`，2026-11-01）
+
+P3 业务事件一律发布到 `version:{id}` 频道；scope 使用十进制字符串。P0/P1/P2 的频道/信封/SSE/游标/心跳/`stream.reset` 语义不变；P3 **不新增频道、不新增事件端点**，复用 `GET /api/events` 与 `GET /api/stream?channel=version:{id}`。
+
+### 12.1 事件类型（20 个）
+
+| type | 触发 | payload 要点 |
+|---|---|---|
+| `execution.intent_created` | 自动/手工创建 execution intent | `intent_id,case_version_id,purpose,version_sut_ids[]` |
+| `execution.intent_cancelled` | 用户/调度取消 intent | `intent_id,reason` |
+| `execution.intent_superseded` | 用例不再 current+confirmed | `intent_id,case_version_id,reason` |
+| `wave.created` | 事务内创建 run_wave 与 case_run | `wave_id,trigger,intent_count` |
+| `wave.started` | 首个 case_run 进入 running | `wave_id` |
+| `wave.paused` | 波次暂停（graceful/immediate） | `wave_id,mode,reason` |
+| `wave.resumed` | 波次恢复 | `wave_id` |
+| `wave.finished` | 波次进入终态（done/failed/cancelled） | `wave_id,status,counts` |
+| `case_run.started` | 用例派发成功并开始执行 | `wave_id,case_run_id,case_version_id,version_sut_ids[]` |
+| `case_run.paused` | 用例级/波次暂停 | `case_run_id,reason` |
+| `case_run.resumed` | 用例恢复 | `case_run_id` |
+| `case_run.finished` | 用例进入四态终态或过程终态 | `wave_id,case_run_id,status,failure_class,duration_ms` |
+| `case_run.step_finished` | 步骤结果写入（upsert 后） | `case_run_id,step_seq,status,version_sut_id` |
+| `case_run.assertion_finished` | 断言结果写入（upsert 后） | `case_run_id,step_seq,assertion_seq,kind,verdict,version_sut_id` |
+| `evidence.created` | 证据落内容账本 + evidence 行 | `case_run_id,evidence_id,kind,version_sut_id,size_bytes` |
+| `human_request.created` | 登录接管/人机请求创建并暂停 | `human_request_id,case_run_id,kind,expires_at` |
+| `human_request.resolved` | 用户完成人机请求 | `human_request_id,case_run_id,status` |
+| `human_request.expired` | reconciler 扫描超时 | `human_request_id,case_run_id` |
+| `execution.failure_candidate` | 确定性/Agent 失败候选 | `wave_id,case_run_id,failure_class,category,severity,dedupe_hint` |
+| `execution.coverage_gap` | 覆盖缺口 | `wave_id,requirement_id,reason,case_version_id?` |
+
+### 12.2 约束
+
+1. **`case_run.step_finished` 是冻结名称**：HLD 示例中的 `step.finished` 以本契约为准，不单独发布；断言同理用 `case_run.assertion_finished`。
+2. **不新增 `executor.*` 业务事件**：执行器状态属运维投影（管理页直接读 `executor_instance` 表），不污染版本频道（P3-D-30）。
+3. scope 带 `version_id/wave_id/case_run_id/case_version_id/version_sut_id`（按事件需要）；payload 只带 ID/计数/状态摘要。
+4. 事件 payload **不含**证据字节、内部存储路径、凭据/token、一次性验证码、LLM prompt/输出、`storage_state`。
+5. `execution.failure_candidate` 仅对 `failed(application)` 生成；`interrupted/skipped` 不是 failure_class（`interrupted` 的 `failure_class=executor_lost`）。
+6. 事件发布失败不回滚业务写；DB 状态为真值，前端按去抖重拉快照（见 spec §10.2）。
+7. `human_request.resolved` 不携带 `code`/密码；只给状态。
+8. 事件持久化/回放/单实例 Hub 限制沿用 P0 §7；P3 不新增跨实例 fan-out（P7）。
+

@@ -5,6 +5,7 @@ package db_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/db"
@@ -19,8 +20,8 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 17 {
-		t.Fatalf("applied %d migrations, want 17: %v", len(applied), applied)
+	if len(applied) != 20 {
+		t.Fatalf("applied %d migrations, want 20: %v", len(applied), applied)
 	}
 
 	again, err := db.Migrate(ctx, pool)
@@ -43,6 +44,9 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 		"conversation", "conversation_message", "conversation_summary", "requirement_attachment",
 		"case_scenario", "case_entity", "case_version", "case_step", "case_assertion",
 		"case_source", "case_confirmation", "design_round", "design_scope", "export_artifact",
+		"execution_intent", "run_wave", "case_run", "case_run_sut_context",
+		"step_result", "assertion_result", "evidence", "evidence_ref",
+		"executor_instance", "human_request",
 	}
 	found := map[string]bool{}
 	rows, err := pool.Query(ctx, `
@@ -152,6 +156,146 @@ func TestP2SchemaNames(t *testing.T) {
 	}
 	if oldNames != 0 {
 		t.Fatalf("legacy table names present: %d", oldNames)
+	}
+}
+
+func TestP3ExecutionTables(t *testing.T) {
+	pool := testutil.NewEmptyDB(t)
+	ctx := context.Background()
+	applied, err := db.Migrate(ctx, pool)
+	if err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	if len(applied) != 20 {
+		t.Fatalf("applied %d migrations, want 20: %v", len(applied), applied)
+	}
+
+	tables := []string{
+		"execution_intent", "run_wave", "case_run", "case_run_sut_context",
+		"step_result", "assertion_result", "evidence", "evidence_ref",
+		"executor_instance", "human_request",
+	}
+	rows, err := pool.Query(ctx, `
+		SELECT table_name FROM information_schema.tables
+		WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'
+		  AND table_name = ANY($1)
+	`, tables)
+	if err != nil {
+		t.Fatalf("query P3 tables: %v", err)
+	}
+	foundTables := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan table: %v", err)
+		}
+		foundTables[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate tables: %v", err)
+	}
+	for _, name := range tables {
+		if !foundTables[name] {
+			t.Errorf("missing P3 table %s", name)
+		}
+	}
+
+	constraints := []string{
+		"pk_execution_intent", "pk_run_wave", "pk_case_run", "pk_case_run_sut_context",
+		"pk_step_result", "pk_assertion_result", "pk_evidence", "pk_evidence_ref",
+		"pk_executor_instance", "pk_human_request",
+		"uk_case_run_wave_intent", "uk_case_run_sut_context", "uk_step_result_run_seq",
+		"uk_assertion_result_run_step_assertion", "uk_evidence_ref_owner",
+		"uk_executor_instance_endpoint",
+	}
+	rows, err = pool.Query(ctx, `SELECT conname FROM pg_constraint WHERE conname = ANY($1)`, constraints)
+	if err != nil {
+		t.Fatalf("query P3 constraints: %v", err)
+	}
+	foundConstraints := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan constraint: %v", err)
+		}
+		foundConstraints[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate constraints: %v", err)
+	}
+	for _, name := range constraints {
+		if !foundConstraints[name] {
+			t.Errorf("missing P3 constraint %s", name)
+		}
+	}
+
+	// Partial unique indexes are indexes, not constraints (execution intent
+	// active key and single-active-wave invariant).
+	partialIndexes := []string{"uk_execution_intent_active", "uk_run_wave_active"}
+	rows, err = pool.Query(ctx, `
+		SELECT indexname, indexdef FROM pg_indexes
+		WHERE schemaname = current_schema() AND indexname = ANY($1)
+	`, partialIndexes)
+	if err != nil {
+		t.Fatalf("query P3 partial unique indexes: %v", err)
+	}
+	defs := map[string]string{}
+	for rows.Next() {
+		var name, definition string
+		if err := rows.Scan(&name, &definition); err != nil {
+			t.Fatalf("scan index: %v", err)
+		}
+		defs[name] = definition
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate partial indexes: %v", err)
+	}
+	for _, name := range partialIndexes {
+		definition, ok := defs[name]
+		if !ok {
+			t.Errorf("missing P3 partial unique index %s", name)
+			continue
+		}
+		if !strings.Contains(definition, "UNIQUE INDEX") {
+			t.Errorf("%s is not a unique index: %s", name, definition)
+		}
+		if !strings.Contains(definition, "WHERE") {
+			t.Errorf("%s is not partial: %s", name, definition)
+		}
+	}
+
+	indexes := []string{
+		"idx_execution_intent_version_status", "idx_execution_intent_case_version",
+		"idx_execution_intent_dedupe", "idx_run_wave_version", "idx_run_wave_status",
+		"idx_case_run_wave", "idx_case_run_intent", "idx_case_run_case_version",
+		"idx_case_run_lease", "idx_case_run_sut_context_run", "idx_case_run_sut_context_context",
+		"idx_step_result_run", "idx_assertion_result_run",
+		"idx_evidence_case_run", "idx_evidence_version_sut", "idx_evidence_content_ref",
+		"idx_evidence_kind", "idx_evidence_ref_owner", "idx_executor_instance_status",
+		"idx_human_request_version_status", "idx_human_request_case_run", "idx_human_request_expiry",
+	}
+	rows, err = pool.Query(ctx, `
+		SELECT indexname FROM pg_indexes
+		WHERE schemaname = current_schema() AND indexname = ANY($1)
+	`, indexes)
+	if err != nil {
+		t.Fatalf("query P3 indexes: %v", err)
+	}
+	foundIndexes := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan index: %v", err)
+		}
+		foundIndexes[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate indexes: %v", err)
+	}
+	for _, name := range indexes {
+		if !foundIndexes[name] {
+			t.Errorf("missing P3 index %s", name)
+		}
 	}
 }
 

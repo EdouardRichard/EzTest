@@ -546,3 +546,238 @@
 - 同一需求版本内按“场景名 + 用例标题”自然键去重；内容 hash 幂等；`case.graph_propose` 可选 `base_graph_hash` 过期返回 409。
 - `design_scope` 唯一 `(version_id,requirement_id)`；`design_round` 每对话唯一；P2 不关闭设计对话。
 - `export_artifact` 每次新 revision；内容对象 sha256 与大小由服务端校验。
+
+---
+
+## 9. P3 增量表结构（`frozen: P3`，2026-11-01）
+
+> 来源：`docs/superpowers/specs/2026-11-01-eztest-v02-p3-execution-design.md` §3（P3-D-04：10 表）。
+> 迁移：`execution_0001_intent_wave.sql`、`execution_0002_result_evidence.sql`、`execution_0003_executor_human.sql`（`order.txt` 第 18–20 个）。
+> P0/P1/P2 表不变。10 张新表全部雪花 `BIGINT` 主键（应用层生成）、JSON 中 ID 为十进制字符串。跨上下文只逻辑引用、不建 FK；同上下文 FK 显式。`created_at/updated_at` 为审计列；`evidence`/`evidence_ref` 不可变，只有 `created_at`（审计列例外，见 §9.2）。
+> 执行域一律 `version_sut_id`；页面/API/账号/DB 归属由应用层校验，数据库不建跨上下文 FK。
+
+### 9.1 `execution_0001_intent_wave.sql`（execution 上下文，4 表）
+
+**`execution_intent`**（逻辑引用 `version`/`case_version`，无 FK）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `id` | BIGINT | NOT NULL，`pk_execution_intent` PRIMARY KEY |
+| `version_id` | BIGINT | NOT NULL（逻辑引用 version） |
+| `case_version_id` | BIGINT | NOT NULL（逻辑引用 design，无 FK） |
+| `version_sut_ids` | JSONB | NOT NULL DEFAULT `'[]'::jsonb`，CHECK `jsonb_typeof = 'array'`；元素为 ID 十进制字符串 |
+| `environment_fingerprint` | TEXT | NOT NULL，CHECK `~ '^[0-9a-f]{64}$'`（64 hex；算法见 spec §5.1） |
+| `code_baseline` | TEXT | NOT NULL DEFAULT `''`，CHECK `char_length <= 256`；无代码仓绑定为 `''`，否则 64 hex |
+| `purpose` | TEXT | NOT NULL DEFAULT `'initial'`，CHECK `initial/retest/manual` |
+| `status` | TEXT | NOT NULL DEFAULT `'open'`，CHECK `open/claimed/running/done/failed/cancelled/superseded`；`open/claimed/running` 为 active |
+| `dedupe_key` | TEXT | NOT NULL，CHECK `char_length BETWEEN 1 AND 256`（仅日志/work_item 关联，不承担唯一约束） |
+| `attempt_no` | INTEGER | NOT NULL DEFAULT 1，CHECK `>= 1`（同键历史 intent 数 + 1，仅展示） |
+| `created_by` | BIGINT | NULL（逻辑引用 identity） |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+
+约束/索引：
+
+- `pk_execution_intent`；
+- **partial unique** `uk_execution_intent_active` UNIQUE `(case_version_id, environment_fingerprint, code_baseline, purpose) WHERE status IN ('open','claimed','running')`（P3-D-08；重跑/复测在旧 intent 离开 active 后新建）；
+- `idx_execution_intent_version_status (version_id, status, id DESC)`；
+- `idx_execution_intent_case_version (case_version_id, status)`；
+- `idx_execution_intent_dedupe (version_id, dedupe_key)`（**非唯一**；幂等由 partial unique + 状态机保证）。
+
+**`run_wave`**（逻辑引用 `version`，无 FK）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `id` | BIGINT | NOT NULL，`pk_run_wave` PRIMARY KEY |
+| `version_id` | BIGINT | NOT NULL（逻辑引用 version） |
+| `status` | TEXT | NOT NULL DEFAULT `'planned'`，CHECK `planned/running/paused/done/failed/cancelled` |
+| `trigger` | TEXT | NOT NULL DEFAULT `'auto'`，CHECK `auto/manual/retest` |
+| `counts` | JSONB | NOT NULL DEFAULT `'{}'::jsonb`，CHECK `jsonb_typeof = 'object'`；结构见 spec §5.6（含 `by_version_sut`） |
+| `started_at` / `finished_at` / `paused_at` | TIMESTAMPTZ | NULL |
+| `paused_by` | BIGINT | NULL（逻辑引用 identity） |
+| `pause_reason` | TEXT | NOT NULL DEFAULT `''`，CHECK `char_length <= 200` |
+| `pause_mode` | TEXT | NOT NULL DEFAULT `''`，CHECK `''/graceful/immediate` |
+| `report_id` | BIGINT | NULL（P4 逻辑引用；P3 恒 NULL，不建 report 表） |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+
+约束/索引：
+
+- `pk_run_wave`；
+- **partial unique** `uk_run_wave_active` UNIQUE `(version_id) WHERE status IN ('planned','running','paused')`（同版本单活跃波；`paused` 仍占活跃语义，P3-D-10）；
+- `idx_run_wave_version (version_id, id DESC)`；
+- `idx_run_wave_status (status, id)`。
+
+**`case_run`**（同上下文 FK：`wave_id`/`intent_id`）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `id` | BIGINT | NOT NULL，`pk_case_run` PRIMARY KEY |
+| `wave_id` | BIGINT | NOT NULL，`REFERENCES run_wave(id)` |
+| `intent_id` | BIGINT | NOT NULL，`REFERENCES execution_intent(id)` |
+| `case_version_id` | BIGINT | NOT NULL（逻辑引用 design，无 FK） |
+| `status` | TEXT | NOT NULL DEFAULT `'pending'`，CHECK `pending/running/paused/passed/failed/blocked/inconclusive/skipped/interrupted/superseded`（四态 + 过程态合并列，P3-D-05） |
+| `attempts` | INTEGER | NOT NULL DEFAULT 0，CHECK `>= 0` |
+| `failure_class` | TEXT | NOT NULL DEFAULT `''`，CHECK `''/application/environment/session/model/automation/timeout/executor_lost/blocked/unknown`（9 值 + 空） |
+| `summary` | JSONB | NOT NULL DEFAULT `'{}'::jsonb`，CHECK `jsonb_typeof = 'object'`；结构见 spec §3.1/§4.3 |
+| `started_at` / `finished_at` | TIMESTAMPTZ | NULL |
+| `owner_instance` | TEXT | NOT NULL DEFAULT `''`（API 实例标识） |
+| `owner_executor_id` | BIGINT | NULL（逻辑引用 executor_instance；P3 单 endpoint） |
+| `dispatch_epoch` | BIGINT | NOT NULL DEFAULT 0，CHECK `>= 0`（派发栅栏） |
+| `dispatch_token` | TEXT | NOT NULL DEFAULT `''`，CHECK `char_length <= 128`（32 hex 生成；迟到写 CAS） |
+| `lease_until` | TIMESTAMPTZ | NULL（runner 续租；过期由 reconciler 回收） |
+| `paused_at` / `paused_by` | TIMESTAMPTZ / BIGINT | NULL |
+| `pause_reason` | TEXT | NOT NULL DEFAULT `''` |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+
+约束/索引：
+
+- `pk_case_run`；`uk_case_run_wave_intent` UNIQUE `(wave_id, intent_id)`（一个波次内同 intent 只有一个 case_run）；
+- `idx_case_run_wave (wave_id, status, id)`；`idx_case_run_intent (intent_id)`；`idx_case_run_case_version (case_version_id)`；`idx_case_run_lease (status, lease_until)`。
+
+**`case_run_sut_context`**（同上下文 FK：`case_run_id`）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `id` | BIGINT | NOT NULL，`pk_case_run_sut_context` PRIMARY KEY |
+| `case_run_id` | BIGINT | NOT NULL，`REFERENCES case_run(id)` |
+| `version_sut_id` | BIGINT | NOT NULL（逻辑引用 version） |
+| `account_role` | TEXT | NOT NULL DEFAULT `''`，CHECK `char_length <= 100` |
+| `account_id` | BIGINT | NULL（逻辑引用 resource） |
+| `browser_context_id` | TEXT | NOT NULL DEFAULT `''`，CHECK `char_length <= 128`（懒创建后 upsert） |
+| `storage_state` | JSONB | NULL（敏感；API 永不返回；P3 占位，P3-D-17a 后续增量） |
+| `lease_epoch` | BIGINT | NOT NULL DEFAULT 0 |
+| `status` | TEXT | NOT NULL DEFAULT `'creating'`，CHECK `creating/active/closed/failed` |
+| `closed_at` | TIMESTAMPTZ | NULL |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+
+约束/索引：
+
+- `pk_case_run_sut_context`；`uk_case_run_sut_context` UNIQUE `(case_run_id, version_sut_id, account_role)`；
+- `idx_case_run_sut_context_run (case_run_id)`；`idx_case_run_sut_context_context (browser_context_id)`。
+
+### 9.2 `execution_0002_result_evidence.sql`（execution 上下文，4 表）
+
+**`step_result`**（同上下文 FK：`case_run_id`）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `id` | BIGINT | NOT NULL，`pk_step_result` PRIMARY KEY |
+| `case_run_id` | BIGINT | NOT NULL，`REFERENCES case_run(id)` |
+| `seq` | INTEGER | NOT NULL，CHECK `> 0` |
+| `target_version_sut_id` | BIGINT | NULL（逻辑引用 version；空表示继承用例默认） |
+| `status` | TEXT | NOT NULL DEFAULT `'pending'`，CHECK `pending/running/passed/failed/blocked/skipped` |
+| `observed` | JSONB | NOT NULL DEFAULT `'{}'::jsonb`，CHECK `jsonb_typeof = 'object'`（`summary?/output?`） |
+| `error` | TEXT | NOT NULL DEFAULT `''`，CHECK `char_length <= 2000` |
+| `started_at` / `finished_at` | TIMESTAMPTZ | NULL |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+
+约束/索引：`pk_step_result`；`uk_step_result_run_seq` UNIQUE `(case_run_id, seq)`（重复写入 upsert）；`idx_step_result_run (case_run_id, seq)`。
+
+**`assertion_result`**（同上下文 FK：`case_run_id`）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `id` | BIGINT | NOT NULL，`pk_assertion_result` PRIMARY KEY |
+| `case_run_id` | BIGINT | NOT NULL，`REFERENCES case_run(id)` |
+| `step_seq` | INTEGER | NOT NULL，CHECK `> 0` |
+| `assertion_seq` | INTEGER | NOT NULL，CHECK `> 0`（按 `case_assertion.id` 升序派生的 1-based 序号，P3-D-06） |
+| `kind` | TEXT | NOT NULL，CHECK `ui/api/db/text/visual`（取自 P2 `case_assertion.kind`） |
+| `verdict` | TEXT | NOT NULL，CHECK `passed/failed/inconclusive/skipped` |
+| `reason` | TEXT | NOT NULL DEFAULT `''`，CHECK `char_length <= 2000` |
+| `expected` | TEXT | NOT NULL DEFAULT `''`，CHECK `char_length <= 4000`（服务端用 P2 expected 覆写） |
+| `actual` | TEXT | NOT NULL DEFAULT `''`，CHECK `char_length <= 4000` |
+| `target_version_sut_id` | BIGINT | NULL（逻辑引用 version） |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+
+约束/索引：`pk_assertion_result`；`uk_assertion_result_run_step_assertion` UNIQUE `(case_run_id, step_seq, assertion_seq)`（upsert 幂等）；`idx_assertion_result_run (case_run_id, step_seq, assertion_seq)`。
+
+**`evidence`**（不可变；同上下文 FK：`case_run_id`）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `id` | BIGINT | NOT NULL，`pk_evidence` PRIMARY KEY |
+| `case_run_id` | BIGINT | NOT NULL，`REFERENCES case_run(id)` |
+| `version_sut_id` | BIGINT | NULL（逻辑引用 version） |
+| `step_seq` | INTEGER | NULL，CHECK `IS NULL OR > 0` |
+| `assertion_seq` | INTEGER | NULL，CHECK `IS NULL OR > 0` |
+| `kind` | TEXT | NOT NULL，CHECK `screenshot/snapshot/console/network/http/db/download/text`（8 类） |
+| `content_ref_id` | BIGINT | NOT NULL（逻辑引用 P0 `content_ref.id`；字节入内容账本，P3-D-20） |
+| `sha256` | TEXT | NOT NULL，CHECK `~ '^[0-9a-f]{64}$'`（API 侧重算，不信任执行器自报） |
+| `size_bytes` | BIGINT | NOT NULL，CHECK `>= 0` |
+| `mime` | TEXT | NOT NULL DEFAULT `'application/octet-stream'`，CHECK `char_length <= 128` |
+| `filename` | TEXT | NOT NULL DEFAULT `''`，CHECK `char_length <= 255` |
+| `created_by_run_id` | BIGINT | NULL（逻辑引用 agent_run） |
+| `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT now()（**无 `updated_at`**：不可变） |
+
+约束/索引：
+
+- `pk_evidence`；
+- `idx_evidence_case_run (case_run_id, id DESC)`；`idx_evidence_version_sut (version_sut_id, id DESC)`；`idx_evidence_content_ref (content_ref_id)`；`idx_evidence_kind (kind)`。
+
+说明：证据无更新/删除 API；每 `case_run` ≤100 条、单条 ≤ `execution.evidence_max_bytes`（5 MiB）；`paths.evidence_dir` **P3 不使用**（与 P2 `paths.export_dir` 例外一致，P3-D-20），下载走鉴权端点 `GET /api/versions/{id}/evidence/{evidenceId}/content`。
+
+**`evidence_ref`**（不可变；同上下文 FK：`evidence_id`）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `id` | BIGINT | NOT NULL，`pk_evidence_ref` PRIMARY KEY |
+| `evidence_id` | BIGINT | NOT NULL，`REFERENCES evidence(id)` |
+| `owner_kind` | TEXT | NOT NULL，CHECK `case_run/step_result/assertion_result/human_request` |
+| `owner_id` | BIGINT | NOT NULL（逻辑引用对应实体） |
+| `role` | TEXT | NOT NULL DEFAULT `'attachment'`，CHECK `char_length <= 64` |
+| `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT now()（**无 `updated_at`**：不可变） |
+
+约束/索引：`pk_evidence_ref`；`uk_evidence_ref_owner` UNIQUE `(evidence_id, owner_kind, owner_id, role)`；`idx_evidence_ref_owner (owner_kind, owner_id)`。
+
+### 9.3 `execution_0003_executor_human.sql`（execution 上下文，2 表）
+
+**`executor_instance`**（执行器注册/心跳；P7 多执行器预留）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `id` | BIGINT | NOT NULL，`pk_executor_instance` PRIMARY KEY |
+| `name` | TEXT | NOT NULL，CHECK `char_length BETWEEN 1 AND 200`（`host:port`） |
+| `endpoint` | TEXT | NOT NULL，CHECK `char_length BETWEEN 1 AND 500`；UNIQUE |
+| `token_hash` | TEXT | NOT NULL DEFAULT `''`，CHECK `= '' OR ~ '^[0-9a-f]{64}$'`（sha256(token)；不含明文） |
+| `capacity` | INTEGER | NOT NULL DEFAULT 0，CHECK `>= 0`（= 执行器 maxContexts） |
+| `active_contexts` | INTEGER | NOT NULL DEFAULT 0，CHECK `>= 0`（healthz contexts） |
+| `labels` | JSONB | NOT NULL DEFAULT `'{}'::jsonb`，CHECK `jsonb_typeof = 'object'` |
+| `status` | TEXT | NOT NULL DEFAULT `'offline'`，CHECK `active/draining/offline` |
+| `last_heartbeat` | TIMESTAMPTZ | NULL |
+| `version` | TEXT | NOT NULL DEFAULT `''`，CHECK `char_length <= 64`（healthz version） |
+| `last_error` | TEXT | NOT NULL DEFAULT `''`，CHECK `char_length <= 2000` |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+
+约束/索引：`pk_executor_instance`；`uk_executor_instance_endpoint` UNIQUE `(endpoint)`；`idx_executor_instance_status (status, last_heartbeat)`。
+
+说明：P3 单 endpoint，API 按 `execution.executor_heartbeat_seconds` 轮询 `GET {execution.executor_url}/healthz` 后 upsert（P3-D-01）；`draining` 由 admin API 摘流；`offline` 由 `execution.executor_offline_seconds` 判定。P3 不建 `/api/internal/executors/*` push 端点（P7）。
+
+**`human_request`**（版本域对象；migration 归 execution，P3-D-16；同上下文无 FK，`case_run_id` 逻辑引用）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `id` | BIGINT | NOT NULL，`pk_human_request` PRIMARY KEY |
+| `version_id` | BIGINT | NOT NULL（逻辑引用 version） |
+| `case_run_id` | BIGINT | NULL（逻辑引用 case_run；可空） |
+| `kind` | TEXT | NOT NULL，CHECK `login_takeover/conflict/other`（P3 只创建 `login_takeover`，其余保留） |
+| `payload` | JSONB | NOT NULL DEFAULT `'{}'::jsonb`，CHECK `jsonb_typeof = 'object'`；结构 `{reason,version_sut_id,account_role,page_url,challenge_kind,evidence_id?}` |
+| `status` | TEXT | NOT NULL DEFAULT `'open'`，CHECK `open/resolved/cancelled/expired`（不可回退） |
+| `response` | JSONB | NOT NULL DEFAULT `'{}'::jsonb`，CHECK `jsonb_typeof = 'object'`；`{code?,note?}`，API 不回显 `code`/密码 |
+| `expires_at` | TIMESTAMPTZ | NOT NULL（now + `execution.human_request_timeout_seconds`，默认 1800） |
+| `resolved_by` / `resolved_at` | BIGINT / TIMESTAMPTZ | NULL（逻辑引用 identity） |
+| `created_by` | BIGINT | NULL（逻辑引用 identity） |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+
+约束/索引：`pk_human_request`；`idx_human_request_version_status (version_id, status, id DESC)`；`idx_human_request_case_run (case_run_id, status)`；`idx_human_request_expiry (status, expires_at)`。
+
+### 9.4 P3 数据不变量
+
+1. 执行只认 `case_entity.current_version_id = case_version.id AND case_version.status='confirmed'`；stale/superseded/draft 不执行。
+2. 同版本单活跃波（`planned/running/paused`，partial unique）；`paused` 仍占活跃波。
+3. 同 `(case_version_id, environment_fingerprint, code_baseline, purpose)` 只允许一个 active intent（partial unique）；重跑/复测新建 intent，旧 intent 保留。
+4. 一个 `(wave_id, intent_id)` 只有一个 case_run（`uk_case_run_wave_intent`）。
+5. 暂停/终态后清理执行器上下文；未 cleanup 不释放配额。
+6. 证据不可变：无更新/删除 API；`sha256`/`size_bytes` 与内容账本一致；API 不返回 `storage_state`/内部路径/凭据。
+7. 执行域一律 `version_sut_id`；页面/API/账号/DB 必须属于同一 `version_sut`（应用层校验），`sut_id` 只展示。
+8. `case_run` 迟到写必须匹配 `dispatch_epoch + dispatch_token`；不匹配返回 `lease_lost` 且不覆盖数据。
+9. `human_request` 只能 `open → resolved | cancelled | expired`；`expired` 由 reconciler 扫描，不物理删除。
+10. P3 不建 `analysis_run`/`issue`/`report`/`sut_account_session` 表；问题候选与覆盖缺口以事件 + 团队帖 + `design.gap` work item 表达（P3-D-13/P3-D-04）。

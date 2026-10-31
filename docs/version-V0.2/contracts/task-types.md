@@ -8,7 +8,7 @@
 
 `work_item` 是唯一执行队列；状态：
 
-`open → claimed → running → done | failed | dead`；`running → waiting_human`（P3+ 使用）；`failed → open`（重试）或 `dead`（不可重试/超限）。
+`open → claimed → running → done | failed | dead`；`running → waiting_human`（P3 登录接管使用）；`failed → open`（重试）或 `dead`（不可重试/超限）。
 
 | 字段 | 语义 |
 |---|---|
@@ -60,8 +60,25 @@
 - 重试/租约/backoff/dead 语义沿用 P1；design 任务不写 `waiting_human`。
 - `case.confirm` 不是任务、也不是模型工具；确认只走用户/服务端 API。
 
-## 4. P3+ 保留类型（不实现、不创建）
+## 4. P4+ 保留类型（不实现、不创建）
 
-`requirement.close`、`execute.case`、`analyze.failure`、`analyze.coverage`、`issue.triage`、`report.wave`、`report.version`、`report.render_pdf`、`knowledge.review`、`version.close`、`gc.run`、`index.repo`、`visual.*`、`search.*`。
+`requirement.close`、`issue.triage`、`report.wave`、`report.version`、`report.render_pdf`、`knowledge.review`、`version.close`、`gc.run`、`index.repo`、`visual.*`、`search.*`。
 
-这些类型在后续阶段写入本文件并扩展 work_item/worker；P2 不注册对应 profile、不创建任务。
+这些保留类型在后续阶段写入本文件并扩展 work_item/worker；当前阶段不注册对应 profile、不创建任务。
+
+## 5. P3 任务类型（实现；`frozen: P3`，2026-11-01）
+
+P3 把 `execute.case`、`analyze.failure`、`analyze.coverage` 三个类型从 §4 移到本节并实现。
+
+| type | team | profile | dedupe_key | payload | 输出 | 失败语义 |
+|---|---|---|---|---|---|---|
+| `execute.case` | execution | `case_executor` | `execute:{intent_id}:{dispatch_epoch}` | `{intent_id,wave_id,case_run_id,case_version_id,dispatch_epoch,dispatch_token}` | step/assertion/evidence/case_run 终态 | 模型/工具失败按 P1 retry；scope 失效 dead；lease/epoch 冲突 409 `lease_lost`（不覆盖） |
+| `analyze.failure` | execution | `failure_analyst` | `failure:{wave_id}` | `{wave_id,case_run_ids[]}` | 分类建议 + 问题候选帖/事件 | 可重试；最终失败不阻塞 wave 终态（确定性兜底已写） |
+| `analyze.coverage` | execution | `coverage_analyst` | `coverage:{wave_id}` | `{wave_id}` | 缺口帖/事件 + `design.gap` ensure | 可重试；最终失败不阻塞 wave 终态 |
+
+- `analyze.wave` **不注册**（ARCH §5.3 为简写）；`report.wave`/`report.version`、`issue.triage`、`version.close` 不在 P3。
+- 执行 Planner 是确定性 runtime（ARCH §7.1），不注册 profile（P3-D-15）。
+- 创建者：调度器在派发 case_run 时 ensure `execute.case`（dedupe 含 `dispatch_epoch`，重派生成新任务）；wave 进入 `done`/`failed` 终态时 ensure `analyze.failure`/`analyze.coverage`（`cancelled` 不 ensure，P3-D-26）；P2 design reconciler 消费 `design.gap`（已有）。
+- `execute.case` 的租约/心跳沿用 P1：lease 30s、heartbeat 10s；runner 写结果/证据必须匹配 `dispatch_epoch+dispatch_token` CAS。
+- 恢复语义：offline/lease 过期 → 同 case_run `interrupted→pending`（attempts+1、epoch+1，最多 3 次）→ 新 `execute.case`；旧 epoch 写回 409。
+- `analyze.*` 任务在 wave 终态后由确定性兜底先写 `failure_class`/`summary`/候选事件/`design.gap`，Agent 只做增强与解释；Agent 失败不回滚。

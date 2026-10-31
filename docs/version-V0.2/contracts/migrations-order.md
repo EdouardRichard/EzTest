@@ -144,6 +144,31 @@ storage_0002_export_artifact.sql
 - 集成测试断言 17 个迁移、10 张新表、`pk_/uk_/idx_` 名称；重复执行 no-op。
 - 开发库/演示库照常启动前滚；回滚仍为恢复备份，不提供 down SQL。
 
+## 5c. P3 增量迁移（`frozen: P3`，2026-11-01）
+
+P0/P1/P2 的 17 个迁移保持原样；P3 在 `order.txt` 末尾追加 3 个文件（第 18–20 个）：
+
+| 序号 | 迁移文件 | 上下文（ownership） | 创建的表 |
+|---|---|---|---|
+| 18 | `execution_0001_intent_wave.sql` | execution | `execution_intent`、`run_wave`、`case_run`、`case_run_sut_context` |
+| 19 | `execution_0002_result_evidence.sql` | execution | `step_result`、`assertion_result`、`evidence`、`evidence_ref` |
+| 20 | `execution_0003_executor_human.sql` | execution | `executor_instance`、`human_request` |
+
+`order.txt` 末尾追加：
+
+```text
+execution_0001_intent_wave.sql
+execution_0002_result_evidence.sql
+execution_0003_executor_human.sql
+```
+
+- 3 个迁移只追加、不改历史文件；`execution_0001` 内部 FK 依赖同上下文新表（`case_run → run_wave/execution_intent`），`execution_0002` 依赖 `execution_0001`（`step_result/assertion_result/evidence → case_run`，`evidence_ref → evidence`），`execution_0003` 不依赖前两者；固定顺序 18→19→20。
+- **partial unique 用唯一索引实现**（PostgreSQL 的 UNIQUE 约束不支持 `WHERE`）：`uk_execution_intent_active`、`uk_run_wave_active` 位于 `pg_indexes`；其余 `uk_*` 为表约束（`pg_constraint`）。
+- P3 不新增跨上下文 FK；`version_id`/`case_version_id`/`version_sut_id`/`content_ref_id`/`owner_executor_id` 均为逻辑引用。
+- 集成测试断言 20 个迁移、10 张新表、`pk_/uk_/idx_` 名称、两个 partial unique 索引的 `WHERE` 谓词；重复执行迁移为 no-op，checksum 不变。
+- `human_request` 属版本域对象，但迁移归 execution 上下文（P3-D-16）；P3 不建 `analysis_run`/`issue`/`report` 表。
+- 开发库/演示库照常启动前滚；回滚仍为恢复备份，不提供 down SQL。
+
 ## 6. 回滚 / 备份 / 数据库边界
 
 - P0 **只支持前滚**：没有 down migration，也不提供自动回滚。

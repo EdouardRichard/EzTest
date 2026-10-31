@@ -74,15 +74,14 @@ system_setting_revision(
   → 发 `settings.updated` 事件（`system` 频道）→ 写审计。
 - `restart_required` 只做 UI 提示，不阻断更新。
 - 未知 key → 404 `not_found`；类型/区间错误 → 400 `invalid_argument`（`details.field` 指向 key）。
-- `GET /api/admin/settings` 返回完整目录（P0 为 44 项）；PATCH 单项返回更新后的设置项。
+- `GET /api/admin/settings` 返回完整目录（P0 为 44 项；P3 起 49 项）。PATCH 单项返回更新后的设置项。
 
 ### 2.1 secret 语义
 
 - GET 返回 secret 项时：`value=null`、`is_secret=true`。
 - revision 查询中 secret 的 `old_value`/`new_value` 均为 `null`。
 - PATCH secret 项：`value` 省略或 `null` 表示**不修改**；`""` 表示**清空**。
-- P0 的 44 个键**没有 secret 项**；LLM API key 存在 `llm_config.api_key`（独立表），
-  响应只返回 `api_key_set`，不进入设置中心。secret 机制为后续阶段保留并已冻结语义。
+- P0 的 44 个键**没有 secret 项**；P3 新增的 `execution.executor_token` 是**首个 secret 键**（`is_secret=true`）；LLM API key 仍存在 `llm_config.api_key`（独立表），响应只返回 `api_key_set`，不进入设置中心。secret 机制为后续阶段保留并已冻结语义。
 
 ### 2.2 热加载与重启
 
@@ -92,10 +91,11 @@ system_setting_revision(
   （如雪花 node、数据根目录）。UI 只显示提示，不阻止保存。
 - 相对路径按进程 CWD 解析；`paths.data_root` 启动后不可热改（重启生效）。
 
-## 3. P0 设置键目录（44 项，完整冻结）
+## 3. 设置键目录（P0 44 项 + P3 5 项 = 49 项）
 
-`secret` 列全部为 `false`；重启列中“是”对应 `restart_required=true`。
-未给出区间的 `number` 为整数类型，具体上限由后续阶段按合同增量（P0 不额外发明约束）。
+`secret` 列：P0 44 项全部为 `false`；P3 的 `execution.executor_token` 为 `true`（表中以 **secret** 标注），其余 4 项为 `false`。
+重启列中“是”对应 `restart_required=true`。
+未给出区间的 `number` 为整数类型，具体上限由后续阶段按合同增量（P0 不额外发明约束；P3 键的区间见本表）。
 
 | # | key | type | category | default | 取值/说明 | restart |
 |---|---|---|---|---|---|---|
@@ -143,12 +143,17 @@ system_setting_revision(
 | 42 | `security.mask_secrets` | boolean | security | `true` | — | 否 |
 | 43 | `feature.auto_gap_design` | boolean | feature | `true` | — | 否 |
 | 44 | `feature.experimental` | boolean | feature | `false` | — | 否 |
+| 45 | `execution.executor_token` | string | execution | `eztest-dev-executor-token` | **secret=true**；API→executor Bearer；执行器进程用同名 env 接收；UI 掩码；default 已知（dev） | 否 |
+| 46 | `execution.executor_heartbeat_seconds` | number | execution | `10` | 整数 1–60；API 轮询 healthz 间隔 | 否 |
+| 47 | `execution.executor_offline_seconds` | number | execution | `30` | 整数 5–300；心跳超时判 offline（建议 ≥2×heartbeat） | 否 |
+| 48 | `execution.executor_context_ttl_seconds` | number | execution | `300` | 整数 30–3600；非 running case 的 context 清理 TTL | 否 |
+| 49 | `execution.human_request_timeout_seconds` | number | execution | `1800` | 整数 60–86400；login_takeover 过期 | 否 |
 
-类别数量：runtime 1、paths 5、execution 6、agent 5、llm 2、context 4、team_room 3、
-retention 5、report 7、knowledge 2、security 2、feature 2 = **44**。
+类别数量：runtime 1、paths 5、execution 11、agent 5、llm 2、context 4、team_room 3、
+retention 5、report 7、knowledge 2、security 2、feature 2 = **49**（P0 44 + P3 5）。
 
 默认值来源：规格 §5.2（OD-4/OD-8/OD-9/架构 §9–§12）；未在设计中逐项给出的键由 P0 冻结，
-后续阶段只能通过契约变更修改默认值或新增键。
+后续阶段只能通过契约变更修改默认值或新增键；P3 新增 5 键按 spec §11.2 / P3-D-19 冻结。
 
 ## 4. 派生默认值的细节
 
@@ -178,6 +183,20 @@ retention 5、report 7、knowledge 2、security 2、feature 2 = **44**。
 - 设计 profile budgets 存在 `agent_profile.budgets` JSON（启动 seed），不新增设置键。
 - 导出字节写入 P0 内容账本（`content_object`/`content_ref`）；P2 不写 `paths.export_dir`（Agent.md §6.8.3 例外见 spec P2-D-29）。
 - P2 的 LLM 验收凭据仍只来自 `.env` 小写 `llm_*`（验收脚本读取，经 admin API 写入 `llm_config`），不属于 EzTest 启动 env。
+
+## 4c. P3 使用说明（`frozen: P3`，2026-11-01）
+
+- P3 **不新增** EzTest 启动 env：仍是严格 4 项。执行器 token 放 DB 设置 `execution.executor_token`（**首个 secret 键**，`is_secret=true`）：`GET /api/admin/settings` 返回 `value=null`；PATCH `""` 清空、省略/null 不改。执行器**进程自身**用环境变量 `EZTEST_EXECUTOR_TOKEN` 接收同一 token（不是 EzTest API 启动 env）；`scripts/dev-executor.ps1` 从 DB 读取当前值后注入。
+- P3 新增 5 键（44→49；execution 类 6→11）：
+  - `execution.executor_token`：API→executor `Authorization: Bearer`；不得写入日志/事件/证据；对外部署必须修改默认值。
+  - `execution.executor_heartbeat_seconds`：API 轮询执行器 `GET /healthz` 间隔（pull 注册，P3-D-01）。
+  - `execution.executor_offline_seconds`：`now-last_heartbeat` 超过该值判 `offline`（reconciler 处理 running case_run）。
+  - `execution.executor_context_ttl_seconds`：非 running case 的执行器 context 清理 TTL。
+  - `execution.human_request_timeout_seconds`：`login_takeover` 人机请求过期时间（默认 1800s）。
+- P3 继续消费已冻结的执行键：`execution.global_concurrency=3`、`execution.per_sut_concurrency=2`、`execution.cross_system_concurrency=1`、`execution.executor_url`、`execution.evidence_max_bytes=5242880`、`execution.case_timeout_seconds=900`。`execution.wait` 单次 1–300s，累计计入 `case_timeout_seconds`。
+- `paths.evidence_dir` **P3 不使用**（P3-D-20 例外，与 P2 `paths.export_dir` 同源）：证据字节写入 P0 内容账本（`content_object`/`content_ref`），`evidence` 行只存 `content_ref_id/sha256/size/mime/kind`；下载走 P3 鉴权端点。`paths.data_root` 不变。
+- `auto_design_new_requirements` 仍是 `version` 列，不是设置键；P3 不改。
+- P3 的 LLM 验收凭据仍只来自 `.env` 小写 `llm_*`（验收脚本读取，经 admin API 写入 `llm_config`），不属于 EzTest 启动 env。
 
 ## 5. 冻结与变更控制
 
