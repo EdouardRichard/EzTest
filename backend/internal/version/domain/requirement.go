@@ -180,14 +180,18 @@ type RequirementRepository interface {
 	ListRelations(ctx context.Context, versionID, requirementID int64) ([]Relation, error)
 }
 
-// CanTransitionRequirement reports whether P1 may move a requirement between
-// the two statuses. P1 only confirms (draft -> clarified) and re-opens
-// (clarified -> draft); closed/obsolete are reserved.
+// CanTransitionRequirement reports whether the requirement state machine allows
+// a move between two statuses. P1 writes draft <-> clarified; P4 adds
+// closed -> draft (reopen). The clarified -> closed path is owned by the
+// closure service after its server-side predicate passes. Obsolete stays
+// read-only until P6.
 func CanTransitionRequirement(from, to RequirementStatus) bool {
 	switch from {
 	case RequirementDraft:
 		return to == RequirementClarified
 	case RequirementClarified:
+		return to == RequirementDraft
+	case RequirementClosed:
 		return to == RequirementDraft
 	default:
 		return false
