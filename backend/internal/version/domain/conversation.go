@@ -257,6 +257,9 @@ type ConversationRepository interface {
 	Summary(ctx context.Context, conversationID int64) (*ConversationSummary, error)
 	// SaveSummary inserts a new summary version computed by the adapter.
 	SaveSummary(ctx context.Context, summary ConversationSummary) (ConversationSummary, error)
+	// ListReconcilable returns the most recent clarification conversations that
+	// have messages, newest conversation first.
+	ListReconcilable(ctx context.Context, limit int) ([]ReconcilerConversation, error)
 }
 
 // DefaultConversationTitle renders the default clarification title.
@@ -403,4 +406,20 @@ func EstimateTokens(text string) int {
 		return 1
 	}
 	return estimate
+}
+
+// ReconcilerMessage is one message with the agent profile that wrote it (empty
+// for user messages or assistant messages without a run).
+type ReconcilerMessage struct {
+	ID              int64
+	Role            string
+	AgentProfileKey string
+}
+
+// ReconcilerConversation is one clarification conversation with its messages,
+// used by the P1 reconciler to detect runs that never finished.
+type ReconcilerConversation struct {
+	ID        int64
+	VersionID int64
+	Messages  []ReconcilerMessage
 }
