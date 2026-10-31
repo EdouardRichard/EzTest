@@ -6596,6 +6596,14 @@ components:
           type: string
           nullable: true
           pattern: '^[0-9]+$'
+        step_seq:
+          type: integer
+          nullable: true
+          minimum: 1
+        assertion_seq:
+          type: integer
+          nullable: true
+          minimum: 1
         kind:
           type: string
           enum: [screenshot, snapshot, console, network, http, db, download, text]
@@ -6613,7 +6621,7 @@ components:
         created_at:
           type: string
           format: date-time
-      description: 证据元数据；不含 content_ref_id/存储路径/凭据。字节走鉴权下载端点。
+      description: 证据元数据；不含 content_ref_id/存储路径/凭据。step_seq/assertion_seq 可空（用例级证据）。字节走鉴权下载端点。
     CaseRunDetail:
       type: object
       required: [case_run, steps, assertions, evidence]

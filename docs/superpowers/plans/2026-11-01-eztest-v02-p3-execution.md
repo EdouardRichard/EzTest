@@ -193,7 +193,7 @@ git commit -m "feat(p3): add execution tables and migrations"
 ### Task 2: P3 API/事件/任务/Profile/设置/executor 协议契约（阶段内 draft）
 
 **Files:**
-- Modify: `docs/version-V0.2/contracts/openapi.yaml`（22 paths + schemas；`info.version: 0.2.0-p3`；`x-draft: P3`）
+- Modify: `docs/version-V0.2/contracts/openapi.yaml`（21 path items / 22 operations + schemas；`info.version: 0.2.0-p3`；`x-draft: P3`）
 - Modify: `docs/version-V0.2/contracts/events.md`（§12，20 事件）
 - Modify: `docs/version-V0.2/contracts/task-types.md`（§5 + §4 移出）
 - Modify: `docs/version-V0.2/contracts/agent-profiles-tools.md`（§6 + §4b 移出）
@@ -203,19 +203,19 @@ git commit -m "feat(p3): add execution tables and migrations"
 - Modify: `scripts/p3-contract-check.cjs`（API/events/tasks/profiles/settings/protocol 断言）
 
 **Interfaces:**
-- Produces: 后续后端/前端/executor 任务按此契约实现；22 paths 见 Spec §9.2，20 事件见 §10.1。
+- Produces: 后续后端/前端/executor 任务按此契约实现；21 path items / 22 operations 见 Spec §9.2，20 事件见 §10.1。
 
 - [ ] **Step 1: 扩展契约检查为失败测试**
 
 在 `scripts/p3-contract-check.cjs` 增加断言：
-`/api/versions/{id}/execution/overview`、`/waves`、`/waves/{waveId}/pause|resume|cancel`、`/case-runs/{caseRunId}`、`/evidence/{evidenceId}/content`、`/human-requests/{humanRequestId}/resolve`、`/api/admin/executors/{executorId}/drain` 等 22 paths；`execution_intent_created`… 等 20 事件串；`execute.case`/`analyze.failure`/`analyze.coverage`；`case_executor`/`failure_analyst`/`coverage_analyst`；`execution.executor_token` 等 5 键；`executor-protocol.md` 文件存在。
+`/api/versions/{id}/execution/overview`、`/waves`、`/waves/{waveId}/pause|resume|cancel`、`/case-runs/{caseRunId}`、`/evidence/{evidenceId}/content`、`/human-requests/{humanRequestId}/resolve`、`/api/admin/executors/{executorId}/drain` 等 21 path items / 22 operations；`execution_intent_created`… 等 20 事件串；`execute.case`/`analyze.failure`/`analyze.coverage`；`case_executor`/`failure_analyst`/`coverage_analyst`；`execution.executor_token` 等 5 键；`executor-protocol.md` 文件存在。
 
 Run: `node scripts/p3-contract-check.cjs --draft`
 Expected: FAIL（缺 path/schema/事件等）。
 
 - [ ] **Step 2: 写 db 接口契约**
 
-按 Spec §9/§10 逐项补 `openapi.yaml`：tags、22 paths、请求/响应 schema（`ExecutionOverview`、`RunWaveView`、`CaseRunView`、`CaseRunDetail`、`EvidenceView`、`HumanRequestView`、`IntentView`、`ExecutorView`、`PauseWaveRequest`、`CreateIntentRequest`、`ResolveHumanRequestRequest`、`ListEnvelope` 复用）；错误码复用 P0，新增 `evidence_too_large`/`executor_unavailable` 描述。
+按 Spec §9/§10 逐项补 `openapi.yaml`：tags、21 path items / 22 operations、请求/响应 schema（`ExecutionOverview`、`RunWaveView`、`CaseRunView`、`CaseRunDetail`、`EvidenceView`、`HumanRequestView`、`IntentView`、`ExecutorView`、`PauseWaveRequest`、`CreateIntentRequest`、`ResolveHumanRequestRequest`、`ListEnvelope` 复用）；错误码复用 P0，新增 `evidence_too_large`/`executor_unavailable` 描述。
 
 - [ ] **Step 3: 写事件/任务/Profile/设置/协议契约**
 
@@ -689,7 +689,7 @@ git commit -m "feat(p3): add failure and coverage analysis with design gaps"
 - `type Handler struct { ... }` 构造 `NewHandler(deps HandlerDeps)`；`func (h *Handler) Routes(auth, admin func(http.Handler) http.Handler) *http.ServeMux` 或在 server 内注册。
 - `server.Deps` 增加 `Execution *executionhttp.Handler`；`server.New` 增加 `registerExecutionRoutes`。
 - main 装配顺序：settings → ids → clock → audit/eventing → identity/llm/storage/resource/version → design → execution repos/adapters/services → P3 profiles/tools/provider → runner/worker(sink) → scheduler/poller/recovery goroutines → server。
-- 22 paths 按 Spec §9.2；认证/错误码/分页/ID 字符串。
+- 21 path items / 22 operations 按 Spec §9.2；认证/错误码/分页/ID 字符串。
 
 - [ ] **Step 1: 写失败的 server 集成测试**
 
@@ -891,7 +891,7 @@ git commit -m "test(p3): add real-LLM acceptance, E2E and demo scenarios"
 - Evidence: `.tmp/p3/final-gate.log` 等
 
 **Interfaces:**
-- `p3-contract-check.cjs`：断言 `x-frozen: P3`、无 `x-draft`、22 paths/必需 schemas、20 事件、10 表、3 迁移、3 tasks、3 profiles、工具、49 settings、executor-protocol 存在；输出计数。
+- `p3-contract-check.cjs`：断言 `x-frozen: P3`、无 `x-draft`、21 path items / 22 operations、必需 schemas、20 事件、10 表、3 迁移、3 tasks、3 profiles、工具、49 settings、executor-protocol 存在；输出计数。
 - Handoff：Spec §0/§17/§18 + 必含 handoff 三项（表/API/协议/intent 唯一键/并发 3/2/1、P4 输入、风险）。
 
 - [ ] **Step 1: 冻结标记与版本**

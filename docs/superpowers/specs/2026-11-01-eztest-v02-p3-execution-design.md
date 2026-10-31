@@ -788,7 +788,7 @@ P3 不实现 `/api/internal/executors/*`（pull 注册，P3-D-01）；P7 再加�
 
 | 文件 | P3 动作 | 冻结 |
 |---|---|---|
-| `contracts/openapi.yaml` | `info.version: 0.2.0-p3`；新增 22 paths / schemas（§9）；tags Execution/Evidence/HumanRequests；根 `x-frozen: P3`，删除 `x-draft`；P2 paths/schemas 保持 | `x-frozen: P3` |
+| `contracts/openapi.yaml` | `info.version: 0.2.0-p3`；新增 21 path items / 22 operations / schemas（§9）；tags Execution/Evidence/HumanRequests；根 `x-frozen: P3`，删除 `x-draft`；P2 paths/schemas 保持 | `x-frozen: P3` |
 | `contracts/events.md` | §12 P3 20 个事件 + 约束；`step.finished` 以 `case_run.step_finished` 冻结（说明 HLD 示例名映射） | `frozen: P3` |
 | `contracts/db-schema.md` | §9：10 表逐列/PK/UK/IDX/枚举/不变量；说明 `executor_instance`/`evidence_ref`/`human_request` 归属与 `paths.evidence_dir` 例外 | `frozen: P3` |
 | `contracts/migrations-order.md` | §5c：3 个 execution 迁移；`order.txt` 第 18–20 | `frozen: P3` |
@@ -822,7 +822,7 @@ P3 不实现 `/api/internal/executors/*`（pull 注册，P3-D-01）；P7 再加�
 | 领域单测 | intent 唯一/幂等/取消/重跑/superseded；wave 单活跃/状态机/pause/resume/counts；case_run 四态聚合矩阵；failure_class 映射；配额 3/2/1 与跨系统预留；fingerprint/code_baseline/dedupe；evidence 上限/sha；dispatch epoch/token；human timeout；`execution.wait` 边界/累计超时/暂停取消中断 |
 | 仓储集成 | 3 迁移幂等（20）；partial unique 生效；case_run 唯一 `(wave,intent)`；step/assertion upsert；executor_instance upsert；human_request resolve CAS |
 | 应用/集成 | intent 生成/重复确认；wave 组波/派发；offline→interrupted→重派（旧 epoch 拒绝）；stale 取消；租约过期恢复；版本 completed→running；cleanup 后释放配额；SSE 事件 |
-| HTTP 集成 | 22 paths 路由/鉴权/分页/错误码/404/409；证据下载 sha/归属；admin executor drain；human resolve |
+| HTTP 集成 | 22 operations（21 path items）路由/鉴权/分页/错误码/404/409；证据下载 sha/归属；admin executor drain；human resolve |
 | Agent 集成 | profiles seed；ProfileKeyForWorkType；工具 schema scope；step/assertion 写校验；human.request 暂停；runner 结束聚合 |
 | 前端单测 | §12.4 |
 | 真实 LLM 验收 | §13.2（API）+ §13.2 E2E |
@@ -882,7 +882,7 @@ P3 不实现 `/api/internal/executors/*`（pull 注册，P3-D-01）；P7 再加�
 | P3-D-26 | 人工取消波次/用例用 `superseded` 记 case_run；intent cancelled；不发失败分析 | phase-03 取消/退出执行集；ARCH §8.5-8 |
 | P3-D-27 | offline/lease 过期：case_run interrupted→pending（同 ID、attempts+1、epoch+1）最多 3 次；否则 failed(environment) | ARCH §12.4；phase-03 重派；避免无限重试 |
 | P3-D-28 | 版本 completed 时新 intent 触发 reopen（清 closed_at）；P4 收尾 | HLD §6.7；P3/P4 交接 |
-| P3-D-29 | 22 条 API path；证据单独鉴权下载；intents 暴露；admin executors drain/activate | HLD 前缀/phase-03 能力；UI 需要；契约冻结 |
+| P3-D-29 | 22 operations / 21 path items（intents GET+POST 同 path）；证据单独鉴权下载；intents 暴露；admin executors drain/activate | HLD 前缀/phase-03 能力；UI 需要；契约冻结 |
 | P3-D-30 | 事件 20 个；`step.finished` 冻结为 `case_run.step_finished`；不发行 executor 业务事件 | events.md 风格；HLD 示例映射；避免频道污染 |
 | P3-D-31 | 前端三栏（波次/实时/结果+证据）+顶部工具栏/横幅；暂停/接管在 Tab 内；不新增全局路由 | mock.css exec-layout；HLD §8；P2 模式 |
 | P3-D-32 | 实时 = SSE 去抖重拉快照（不本地合并）；复用 useVersionEvents | P2 先例；DB 真值；实现稳定 |
