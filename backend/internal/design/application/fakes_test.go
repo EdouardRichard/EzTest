@@ -95,6 +95,21 @@ type fakeRepo struct {
 	staleEntities []int64
 	dataPlanErr   error
 	latestRound   *design.Round
+
+	clarified          []design.RequirementRef
+	activeScopes       []design.Scope
+	coverage           []design.RequirementCoverage
+	rounds             []design.Round
+	latestConversation int64
+	hasConversation    bool
+	autoDesign         bool
+	candidateVersions  []int64
+	outdated           []design.OutdatedRequirement
+	pendingOverride    *int
+	caseCounts         design.CaseCounts
+	versionStatus      string
+	versionLockCalls   int
+	updatedRoundIDs    []int64
 }
 
 type fakeCase struct {
