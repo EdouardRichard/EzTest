@@ -60,7 +60,7 @@
 
 ### 3.1 `agent_0001_work_item.sql`
 `work_item`：
-`id BIGINT PK`、`version_id BIGINT NOT NULL`、`team TEXT NOT NULL`、`type TEXT NOT NULL`、`status TEXT NOT NULL DEFAULT 'open'`（CHECK 6 态）、`priority INT NOT NULL DEFAULT 0`、`dedupe_key TEXT NOT NULL`、`depends_on BIGINT NULL`、`payload JSONB NOT NULL DEFAULT '{}'`、`claimed_by TEXT NULL`、`lease_until TIMESTAMPTZ NULL`、`lease_epoch BIGINT NOT NULL DEFAULT 0`、`attempts INT NOT NULL DEFAULT 0`、`max_attempts INT NOT NULL DEFAULT 3`、`last_error TEXT NULL`、`available_at TIMESTAMPTZ NOT NULL DEFAULT now()`、`created_at/updated_at`。
+`id BIGINT PK`、`version_id BIGINT NOT NULL`、`team TEXT NOT NULL`、`type TEXT NOT NULL`、`status TEXT NOT NULL DEFAULT 'open'`（CHECK 7 态：open/claimed/running/waiting_human/done/failed/dead；P1 只写前六类 + failed/dead）、`priority INT NOT NULL DEFAULT 0`、`dedupe_key TEXT NOT NULL`、`depends_on BIGINT NULL`、`payload JSONB NOT NULL DEFAULT '{}'`、`claimed_by TEXT NULL`、`lease_until TIMESTAMPTZ NULL`、`lease_epoch BIGINT NOT NULL DEFAULT 0`、`attempts INT NOT NULL DEFAULT 0`、`max_attempts INT NOT NULL DEFAULT 3`、`last_error TEXT NULL`、`available_at TIMESTAMPTZ NOT NULL DEFAULT now()`、`created_at/updated_at`。
 约束/索引：`uk_work_item_dedupe UNIQUE(version_id, type, dedupe_key)`；`idx_work_item_claim (status, available_at, priority DESC, id)`；`idx_work_item_lease (status, lease_until)`；`idx_work_item_version (version_id, status, id)`。
 
 `work_item_attempt`：`id BIGINT PK`、`work_item_id BIGINT NOT NULL REFERENCES work_item(id)`、`attempt INT NOT NULL`、`status TEXT NOT NULL`、`error TEXT NULL`、`started_at`、`finished_at`；`UNIQUE(work_item_id, attempt)`；索引 `idx_work_item_attempt_item (work_item_id, id)`。
@@ -280,6 +280,9 @@ P1 结束冻结：
 - `contracts/agent-profiles-tools.md`（新建）：P1 profile、工具、scope 注入、schema、提交校验；P2+ 工具标 reserved。
 - `contracts/settings.md`：P1 不新增 env/设置键；记录 P1 消费的键（context/agent/team_room/llm）。
 - P0 漂移：openapi 的 LLM list envelope/状态码按实现修正（非破坏性、文档与客户端一致）；`eventing_0002` 补 `(channel,created_at)` 索引；`ResetPasswordRequest` 已对齐不再改；SSE `GET /api/stream` 补发契约要求的 `X-Snapshot-Cursor` 头（不改帧协议/游标语义）；`version_sut.scope` 在 DB 存数字 ID、API 用字符串，P1 requirement target 校验统一转 int64。
+- **P0 额外漂移（研究发现，P1 处理边界）**：`Event.seq`/`snapshot_cursor` 线上为字符串而契约写整数（D4，**待用户裁决**：修代码为整数 or 修契约为字符串）；`auth.login/login_failed/logout`、`user.created/updated` 文档有事件但未发（D6）；未知字段“忽略”文档与 handler 拒绝不一致（D7）；settings 范围/secret PATCH 语义与文档不一致（D8）；`payload_too_large` 未列入稳定错误码（D9）；settings audit/event 顺序（D10）。D6–D10 不在 P1 修，登记 handoff backlog；D11 已在 §3/§12.1 收口。
+- **Agent 审计归属**：`audit_log` 不改 schema；agent/后台写操作 `actor_id=0`（系统），`metadata.agent_run_id/work_item_id` 记录来源；事件 scope 带 `agent_run_id`。
+- **冻结标记**：openapi 使用文件级 `x-frozen: P1`；其他 contract 文件用顶部状态 `frozen: P1`，P0 的 `x-frozen: P0` 保留在历史段落。
 - P0 集成测试期望随 P1 增量更新（迁移数量/表清单、version 频道事件数量、版本详情 fields）；这是测试期望更新，不改变 P0 行为；更新时保留原断言意图并新增 P1 断言。
 - 契约更新由 Lead 统一收口；子代理不并发写共享契约。
 
@@ -337,6 +340,10 @@ P1 结束冻结：
 | Q26 | 权限 | P1 单团队：所有登录用户可读写需求/对话/确认（沿用 P0 版本读写），无 RBAC；admin 仅 P0 资源/设置 |
 | Q27 | 前端数据缺口 | API 提供 requirement_counts/conversation message_count/last_message_at/attachment extraction_status/rollback_proposal；上下文百分比不提供（P1 不做 token 流） |
 | Q28 | 0.1 P1 spec 陷阱 | 不读取/不沿用 `docs/superpowers/specs/2026-10-27-eztest-p1-agent-runtime-design.md` 的 0.1 控制面假设 |
+| — | work_item 状态数 | 按设计 7 态（含 `waiting_human`）；P1 只写 open/claimed/running/done/failed/dead，不写 waiting_human |
+| — | agent 审计 | `audit_log.actor_id=0`（系统）+ metadata `agent_run_id/work_item_id`；不改 P0 audit schema |
+| — | 冻结标记 | openapi 文件级 `x-frozen: P1`；其他契约文件顶部 `frozen: P1` |
+| D4 | Event.seq 线上字符串 vs 契约整数 | **待用户裁决**（见 §11）：P1 默认不在本轮改 P0 行为，若裁决修代码则 T13 同步 DTO/测试/前端类型 |
 
 ## 13. 测试与验收计划
 

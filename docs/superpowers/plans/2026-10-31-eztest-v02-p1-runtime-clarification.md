@@ -77,7 +77,7 @@ Lead: T13 server/main/integration（依赖 T9/T12） → T18 E2E/验收（依赖
 - [ ] **Step 1: 创建分支**：`git switch -c feat/v0.2-p1`（从 `feat/v0.2-p0` HEAD）。
 - [ ] **Step 2: 写迁移 SQL**（7 个文件，严格按 spec §3 列/约束/索引；跨上下文不建 FK；同上下文 FK 只用于 requirement_version→requirement、conversation_message→conversation 等）。
 - [ ] **Step 3: 追加 order.txt**（7 行，末尾；不改已有行）。
-- [ ] **Step 4: 写/更新失败测试**：`TestP1MigrationsApplyTwice`（空 schema 跑两次，第二次 applied 为空、表数量符合预期）、`TestP1RequiredConstraints`（重复 dedupe_key/requirement revision/confirmation 的 requirement_version_id 被拒）；更新 `migrate_integration_test.go` 的 P0 迁移数量/表清单期望（P1 后 15 个迁移、37 张表）。
+- [ ] **Step 4: 写/更新失败测试**：`TestP1MigrationsApplyTwice`（空 schema 跑两次，第二次 applied 为空、表数量符合预期）、`TestP1RequiredConstraints`（重复 dedupe_key/requirement revision/confirmation 的 requirement_version_id 被拒）；更新 `migrate_integration_test.go` 的 P0 迁移数量/表清单期望（P1 后 15 个迁移、37 张业务表 + `schema_migrations` = 38 张 base table）。
 - [ ] **Step 5: 跑测试**：`cd backend; .tools\..\.tools\go\bin\go.exe test -tags=integration ./internal/db/...`（用 `.tools\go\bin\go.exe`；Expected FAIL 先因迁移未写/表不存在）。
 - [ ] **Step 6: 加 PDF 依赖**：`go get rsc.io/pdf@v0.1.1`；确认只新增该直接依赖，不 tidy 其他。
 - [ ] **Step 7: 跑通并提交**：`git add backend/internal/db/migrations backend/go.mod backend/go.sum`；`git commit -m "feat(p1): add runtime and clarification migrations"`。
@@ -96,7 +96,7 @@ Lead: T13 server/main/integration（依赖 T9/T12） → T18 E2E/验收（依赖
 
 **Interfaces:** 以 spec §3/§8/§9/§11 为准；P1 标记 `x-frozen: P1`（冻结在 T20，T2 先写 draft）。
 
-- [ ] **Step 1: db-schema 追加 16 表 + 索引/约束 + 归属**（agent 6 表、version 8 表、eventing 索引；`requirement_attachment` 运行态字段注明 P1-D5）。
+- [ ] **Step 1: db-schema 追加 16 表 + 索引/约束 + 归属**（agent 8 表、version 8 表、eventing 索引；`requirement_attachment` 运行态字段注明 P1-D5；`version_sut.scope` 修正为 DB 数字/API 字符串）。
 - [ ] **Step 2: migrations-order 追加 7 行 + ownership + P1 增量说明**。
 - [ ] **Step 3: events 追加 P1 事件类型、scope 字段、payload 示例、单实例限制不变**。
 - [ ] **Step 4: task-types.md**：P1 实现 `chat.turn/requirement.curate/attachment.ingest`；列 P2+ 保留类型但不实现；写 team/dedupe/输入/输出/失败语义。
