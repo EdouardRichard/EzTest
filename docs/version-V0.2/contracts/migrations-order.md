@@ -123,6 +123,27 @@ eventing_0002_event_index.sql
 - P1 迁移已在集成测试随机 schema 中重复执行验证；开发库/演示库通过启动迁移前滚。
 - 迁移顺序影响：P1 表无跨上下文 FK；`version_0002` 依赖 P0 `version`，`agent_0003` 内部 FK 依赖 `work_item`（同上下文）。回滚方式仍是恢复备份，不提供 down SQL。
 
+## 5b. P2 迁移清单（`draft: P2`，2026-10-31；阶段末冻结）
+
+P0/P1 的 15 个迁移保持原样；P2 在 `order.txt` 末尾追加 2 个文件：
+
+| 序号 | 迁移文件 | 上下文 | 创建 |
+|---|---|---|---|
+| 16 | `design_0001_case_model.sql` | design | `case_scenario`、`case_entity`、`case_version`、`case_step`、`case_assertion`、`case_source`、`case_confirmation`、`design_round`、`design_scope` |
+| 17 | `storage_0002_export_artifact.sql` | storage | `export_artifact` |
+
+`order.txt` 末尾追加：
+
+```text
+design_0001_case_model.sql
+storage_0002_export_artifact.sql
+```
+
+- P2 新表命名按 Agent.md §6.9 方案 A；同上下文 FK 显式，跨上下文只逻辑引用。
+- 迁移 16 先于 17；两者互不依赖，保持固定顺序便于校验。
+- 集成测试断言 17 个迁移、10 张新表、`pk_/uk_/idx_` 名称；重复执行 no-op。
+- 开发库/演示库照常启动前滚；回滚仍为恢复备份，不提供 down SQL。
+
 ## 6. 回滚 / 备份 / 数据库边界
 
 - P0 **只支持前滚**：没有 down migration，也不提供自动回滚。

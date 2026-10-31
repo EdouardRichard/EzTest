@@ -323,3 +323,27 @@ P0 的频道/信封/SSE/游标/心跳/`stream.reset` 语义不变。P1 业务事
 4. 事件中的附件只给 ID/名称/大小/状态，不给文件系统路径/提取全文。
 5. `work_item.created` 由 ensure 是否新建决定；重复 ensure 不重复发事件。
 6. 事件发布失败不回滚业务；reconciler 兜底；P1 仍为单实例 Hub，跨实例 fan-out 属 P7。
+
+## 11. P2 增量事件（`draft: P2`，2026-10-31；阶段末冻结）
+
+P2 事件仍只发布到 `version:{id}` 频道；scope 使用十进制字符串。payload 只带 ID/计数/状态摘要，不含用例正文、步骤全文、LLM prompt/输出、导出内容或内部路径。
+
+| type | 触发 | payload 要点 |
+|---|---|---|
+| `design.round_started` | 新设计轮次开始 | `round_id,conversation_id,activation,requirement_ids` |
+| `design.scope_activated` | 手工/自动激活需求 | `round_id,activation,requirement_ids` |
+| `design.graph_delta` | `case.graph_propose`/`design.data_plan_submit` 落库 | `requirement_id,requirement_version_id,scenario_ids,case_ids,case_version_ids,op` |
+| `design.case_version_created` | 新 draft 版本 | `requirement_id,case_id,case_version_id,revision,status:'draft'` |
+| `design.case_version_stale` | 需求版本变化/失效 | `requirement_id,case_id,case_version_id,reason` |
+| `design.case_version_superseded` | 同一 case 新版本被确认 | `case_id,case_version_id` |
+| `design.case_confirmed` | 用户确认（case/scenario/requirement） | `scope,target_id,batch_id,case_ids,case_version_ids` |
+| `design.review_submitted` | Critic 提交 finding | `requirement_id,round_id,count` |
+| `design.export_ready` | 导出完成 | `export_id,format,size,sha256` |
+
+约束：
+
+1. `requirement.rolled_back` 与 `requirement.version_created` 在 P2 填真实 `affected_case_version_ids`（十进制字符串数组）；字段名与 P1 兼容。
+2. 不新增关闭对话/轮次事件；P2 最新 design 对话始终为当前轮。
+3. 图事件只带受影响 ID；前端去抖重拉 `GET /design/graph`，不从事件还原整图。
+4. `design.export_ready` 不含导出内容/文件名路径；下载走鉴权端点。
+

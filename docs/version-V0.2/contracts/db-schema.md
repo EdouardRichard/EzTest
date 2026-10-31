@@ -517,3 +517,32 @@
 - `conversation_message.(conversation_id,client_message_id)` 唯一（NULL 不冲突）；assistant 通过 `reply_to_message_id` 关联用户消息。
 - `team_room_digest` 多版本保留最近 N 版；`context_packet.hash` 为 64 hex。
 - **`version_sut.scope` 修正**：DB 中页面/API ID 数组为数字；API/事件中按十进制字符串输出（P0 文档此处以本 P1 契约为准）。
+
+## 8. P2 增量表结构（`draft: P2`，2026-10-31；阶段末冻结）
+
+> 命名按 Agent.md §6.9/D34 方案 A：小写单数、`业务名称_作用`；PK/UK/IDX 显式 `pk_/uk_/idx_`；同上下文 FK 显式，跨上下文只逻辑引用；审计列 `created_at/updated_at`。设计文档字面名映射：`scenario→case_scenario`、`export→export_artifact`、`sort→sort_order`、`line→line_no`、`format→file_format`、`size→size_bytes`、`content_ref→content_object_id`。
+
+### 8.1 `design_0001_case_model.sql`（design 上下文，9 表）
+
+- `case_scenario`：`id BIGINT PK`、`version_id/requirement_id/requirement_version_id BIGINT NOT NULL`、`name TEXT(1..200)`、`description`、`version_sut_ids/page_ids/api_ids JSONB`、`sort_order INT >=0`、`created_by/created_by_run_id`、`created_at/updated_at`；`pk_case_scenario`、`uk_case_scenario_requirement_version_name(requirement_version_id,name)`；索引 `idx_case_scenario_requirement`、`idx_case_scenario_requirement_version`。
+- `case_entity`：`id BIGINT PK`、`scenario_id BIGINT NOT NULL REFERENCES case_scenario(id)`、`current_version_id BIGINT NULL`（循环引用，不建 FK）、`status TEXT CHECK draft/confirmed/stale`、审计列；索引 `idx_case_entity_scenario/current/status`。
+- `case_version`（不可变）：`id BIGINT PK`、`case_id BIGINT NOT NULL REFERENCES case_entity(id)`、`revision INT >0`、`title`、`description/preconditions`、`test_data JSONB`、`priority P0..P3`、`default_version_sut_id NULL`、`version_sut_ids/page_ids/api_ids JSONB`、`status CHECK draft/confirmed/stale/superseded`、`content_hash 64hex`、`created_by/run_id`、`created_at/updated_at`；`uk_case_version_case_revision(case_id,revision)`；`idx_case_version_case/status`。
+- `case_step`：`id PK`、`case_version_id FK`、`seq >0`、`action(1..2000)`、`expected`、`target_version_sut_id/target_page_id/target_api_id NULL`、`account_role`、`data JSONB`、审计列；`uk_case_step_version_seq(case_version_id,seq)`；`idx_case_step_version`。
+- `case_assertion`：`id PK`、`case_version_id FK`、`step_seq>0`、`kind CHECK ui/api/db/text/visual`、`target/expected`、`target_version_sut_id/target_api_id/database_id NULL`、审计列；`idx_case_assertion_version(case_version_id,step_seq)`；`step_seq` 归属由应用校验。
+- `case_source`：`id PK`、`case_version_id FK`、`kind CHECK requirement/code/page/api/knowledge`、`ref_id`、`path`、`line_no NULL`、`sha`、审计列；`idx_case_source_version`。
+- `case_confirmation`：`id PK`、`case_version_id FK`、`scope CHECK case/scenario/requirement`、`target_scope_id`、`batch_id(1..64)`、`affected_case_version_ids JSONB`、`snapshot JSONB`、`confirmed_by`、`confirmed_at`、审计列；`uk_case_confirmation_version(case_version_id)`；`idx_case_confirmation_batch/actor`。
+- `design_round`：`id PK`、`version_id`、`conversation_id`、`activation CHECK manual/auto_gap/auto_change/auto_new`、`requirement_ids/requirement_version_ids JSONB`、`scope JSONB`、`status CHECK active/completed`（P2 只写 active）、`created_by`、审计列；`uk_design_round_conversation(conversation_id)`；`idx_design_round_version/status`。
+- `design_scope`：`id PK`、`version_id/requirement_id`、`activated_by_round_id NULL REFERENCES design_round(id)`、`activated_at`、`status CHECK active/closed`（P2 只写 active）、审计列；`uk_design_scope_version_requirement(version_id,requirement_id)`；`idx_design_scope_requirement`。
+
+### 8.2 `storage_0002_export_artifact.sql`（storage 上下文，1 表）
+
+- `export_artifact`：`id PK`、`version_id`、`owner_kind CHECK case/report/chain`、`owner_id`、`revision >0`、`file_format CHECK markdown/mermaid/opml/csv/html/pdf`、`content_object_id TEXT 64hex`、`size_bytes >=0`、`mime`、`filename(1..255)`、`status CHECK ready/failed`、`created_by`、审计列；`uk_export_artifact_version_owner_file_format_revision(version_id,owner_kind,owner_id,file_format,revision)`；`idx_export_artifact_version/created_at`。
+- 导出字节写入 `content_object` 并登记 `content_ref`（owner_kind=`export`，owner_id=export id，role=`content`）；P2 不写 `paths.export_dir`（P2-D-29 例外）。
+
+### 8.3 P2 数据不变量
+
+- `case_entity.current_version_id` 指向最新版本；执行只认 `current_version_id = case_version.id AND status='confirmed'`。
+- `case_version` 不可变；`(case_id,revision)` 唯一；需求改版重设计创建新场景/新用例，旧组 stale 保留。
+- 同一需求版本内按“场景名 + 用例标题”自然键去重；内容 hash 幂等；`case.graph_propose` 可选 `base_graph_hash` 过期返回 409。
+- `design_scope` 唯一 `(version_id,requirement_id)`；`design_round` 每对话唯一；P2 不关闭设计对话。
+- `export_artifact` 每次新 revision；内容对象 sha256 与大小由服务端校验。

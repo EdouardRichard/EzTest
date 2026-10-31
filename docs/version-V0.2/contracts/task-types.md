@@ -45,8 +45,23 @@
 
 **完成语义**：业务产物写入成功且事件发布尝试完成后 `done`；事件失败不回滚业务，reconciler 兜底。
 
-## 3. P2+ 保留类型（不实现、不创建）
+## 3. P2 任务类型（实现；`draft: P2`，阶段末冻结）
 
-`design.round`、`design.requirement`、`design.gap`、`design.critic`、`design.data_plan`、`requirement.close`、`execute.case`、`analyze.failure`、`analyze.coverage`、`issue.triage`、`report.wave`、`report.version`、`report.render_pdf`、`knowledge.review`、`version.close`、`gc.run`、`index.repo`、`visual.*`、`search.*`。
+| type | team | profile | dedupe_key | payload | 输出 | 失败语义 |
+|---|---|---|---|---|---|---|
+| `design.round` | design | `design_planner` | `round:{conversation_id}` | `{conversation_id,round_id}` | 本轮范围说明（assistant message + 团队帖） | 模型不可用可重试；作用域错误 dead |
+| `design.requirement` | design | `case_author` | `design:{requirement_id}:{requirement_version_id}` | `{requirement_id,requirement_version_id,reason}` | 场景/用例 draft（`case.graph_propose`）+ 团队帖 | 结构化校验失败可重试；越权/跨版本 dead |
+| `design.gap` | design | `case_author` | `gap:{requirement_id}:{case_version_id|requirement_version_id}` | `{requirement_id,case_id?,case_version_id?,reason}` | 新 draft（`case.graph_propose`）+ 团队帖 | 同上 |
+| `design.critic` | design | `design_critic` | `critic:{requirement_id}:{requirement_version_id}` | `{requirement_id,requirement_version_id}` | `design.review_submit` finding + 团队帖 | 模型不可用可重试 |
+| `design.data_plan` | design | `data_planner` | `dataplan:{requirement_id}:{requirement_version_id}` | `{requirement_id,requirement_version_id}` | `design.data_plan_submit` 更新 draft + 团队帖 | 仅 draft 可更新；状态冲突不重试 |
 
-这些类型在 P2+ 写入本文件并扩展 work_item/worker；P1 不注册 profile、不创建任务。
+- `chat.turn` 继续服务澄清与设计 Host：`conversation.kind='design'` 时 team=design、profile=`design_host`；澄清保持 P1（team=clarification、clarification_host）。这是语义增量，不新增 type。
+- 创建者：设计对话创建/轮次扫描时 ensure `design.round` 与 `design.requirement`；reconciler 兜底 pending/auto/变化/stale；`design.gap` 由执行侧 `RequestGap` 或 reconciler ensure；critic/data_plan 由 design reconciler 在存在 draft/confirmed 时 ensure。
+- 重试/租约/backoff/dead 语义沿用 P1；design 任务不写 `waiting_human`。
+- `case.confirm` 不是任务、也不是模型工具；确认只走用户/服务端 API。
+
+## 4. P3+ 保留类型（不实现、不创建）
+
+`requirement.close`、`execute.case`、`analyze.failure`、`analyze.coverage`、`issue.triage`、`report.wave`、`report.version`、`report.render_pdf`、`knowledge.review`、`version.close`、`gc.run`、`index.repo`、`visual.*`、`search.*`。
+
+这些类型在后续阶段写入本文件并扩展 work_item/worker；P2 不注册对应 profile、不创建任务。

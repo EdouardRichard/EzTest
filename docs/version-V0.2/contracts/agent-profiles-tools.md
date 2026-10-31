@@ -73,9 +73,31 @@ system prompt 必须包含 `[profile:<key>]`（fake LLM 识别；真实模型忽
 
 `conversation.reply` 在 P1 不是工具：assistant 最终文本直接写 `conversation_message`。
 
-## 4. 预留工具（P2+，不注册）
+## 4. P2 Profiles（启动幂等 seed；`draft: P2`，阶段末冻结）
 
-`requirement.goal_met`、`case.confirm`、`case.graph_propose`、`design.*`、`code.*`、`browser.*`、`http.request`、`db.query`、`execution.*`、`issue.*`、`report.*`、`knowledge.*`、`version.close_propose`、`human.request`、`budget.check`、`account.credentials`、`database.schema_read`、`sut.page_propose`。P2+ 写入本文件并实现服务端校验后启用。
+| key | 名称 | 工具 | budgets |
+|---|---|---|---|
+| `design_host` | 设计 Host | `context.version_pack`、`context.task_pack`、`context.team_room_read`、`context.summary_update`、`requirement.read`、`design.graph_read`、`case.graph_propose`、`attachment.list`、`attachment.read_text`、`sut.list`、`sut.page_list` | `{max_turns:12,soft_seconds:300,hard_seconds:600}` |
+| `design_planner` | 设计 Planner | `context.version_pack`、`context.task_pack`、`context.team_room_read`、`requirement.read`、`design.graph_read` | `{max_turns:6,soft_seconds:180,hard_seconds:300}` |
+| `case_author` | 用例 Author | `context.version_pack`、`context.task_pack`、`requirement.read`、`design.graph_read`、`case.graph_propose`、`sut.list`、`sut.page_list` | `{max_turns:8,soft_seconds:300,hard_seconds:600}` |
+| `design_critic` | 设计 Critic | `context.task_pack`、`design.graph_read`、`design.review_submit` | `{max_turns:4,soft_seconds:120,hard_seconds:300}` |
+| `data_planner` | 数据 Planner | `context.task_pack`、`design.graph_read`、`design.data_plan_submit` | `{max_turns:4,soft_seconds:120,hard_seconds:300}` |
+
+system prompt 必须包含 `[profile:<key>]`，并声明：AI 只能提交 draft/候选，不能确认/删除/关闭；Host 只解释/修改脑图，不确认。
+
+## 4a. P2 工具（注册；scope 由 runtime 注入）
+
+- 读：`design.graph_read`（`{requirement_id?,case_id?}` → 图摘要/用例详情 + `graph_hash`）；复用 P1 `requirement.read`、`attachment.*`、`sut.*`、`context.*`。
+- 写（候选提交 + 服务端校验）：
+  - `case.graph_propose`：`{requirement_id,requirement_version_id,base_graph_hash?,scenarios[],cases[]}`；单事务、自然键去重、内容 hash 幂等；返回 `{scenario_ids,case_ids,case_version_ids,graph_hash}`。
+  - `design.review_submit`：`{summary,findings[{severity,message,requirement_id?,case_id?}]}`；落团队 finding + `design.review_submitted`；不建人工评审表。
+  - `design.data_plan_submit`：`{case_version_id,preconditions?,test_data?}`；仅当前 draft；生成新 draft revision。
+- 不注册 `case.confirm`（仅服务端/用户）、`design.scenario_propose`/`design.case_propose`/`design.case_update`（由 `case.graph_propose` 统一承载）。
+- 工具 schema 不包含 `version_id`/`versionId`；作用域键：`version_id/conversation_id/requirement_id/requirement_version_id/case_id/case_version_id/round_id/version_sut_ids`。
+
+## 4b. P3+ 预留工具（不注册）
+
+`requirement.goal_met`、`code.*`、`browser.*`、`http.request`、`db.query`、`execution.*`、`issue.*`、`report.*`、`knowledge.*`、`version.close_propose`、`human.request`、`budget.check`、`account.credentials`、`database.schema_read`、`sut.page_propose`。P3+ 写入本文件并实现服务端校验后启用。
 
 ## 5. 错误返回（给模型）
 

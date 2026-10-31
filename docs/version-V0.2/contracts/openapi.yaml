@@ -91,6 +91,7 @@ info:
       `unsupported_attachment_format`、`extraction_failed`。
     - 不新增通用 `Idempotency-Key`（P1-D16）；P1 单实例 Hub/worker，多副本 fan-out 属 P7。
 x-frozen: P1
+x-draft: P2
 servers:
   - url: http://localhost:13333
     description: 本地开发默认 API（端口来自 EZTEST_API_PORT，默认 13333）
@@ -123,6 +124,10 @@ tags:
     description: 需求版本、确认、回退与关系（P1）
   - name: Clarification
     description: 澄清团队频道只读摘要/帖子（P1）
+  - name: Design
+    description: 用例设计图、用例详情与三粒度确认（P2）
+  - name: Exports
+    description: 用例导出与鉴权下载（P2）
 
 paths:
   /healthz:
@@ -2562,6 +2567,275 @@ paths:
         '500':
           $ref: '#/components/responses/Internal'
 
+  /api/versions/{id}/design/graph:
+    get:
+      tags: [Design]
+      operationId: getDesignGraph
+      summary: 用例设计图快照（登录用户）
+      description: 返回版本内所有 clarified/已有设计的需求、场景、用例当前版本摘要与统计；图真值在 DB，前端按 SSE 增量事件重拉。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: 设计图
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/DesignGraphView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/design/overview:
+    get:
+      tags: [Design]
+      operationId: getDesignOverview
+      summary: 设计概览（登录用户）
+      description: 待设计计数、自动设计开关、当前设计轮次与轮次号。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: 设计概览
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/DesignOverview'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/design/cases/{caseId}:
+    get:
+      tags: [Design]
+      operationId: getDesignCase
+      summary: 用例详情与版本历史（登录用户）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - name: caseId
+          in: path
+          required: true
+          description: 逻辑用例 ID（十进制字符串）
+          schema:
+            type: string
+            pattern: '^[0-9]+$'
+        - name: version_id
+          in: query
+          required: false
+          description: 可选的历史用例版本 ID；省略返回当前版本
+          schema:
+            type: string
+            pattern: '^[0-9]+$'
+      responses:
+        '200':
+          description: 用例详情
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/DesignCaseDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/design/confirmations:
+    post:
+      tags: [Design]
+      operationId: confirmDesignCases
+      summary: 用户确认用例（case/scenario/requirement 三粒度）
+      description: 仅用户/服务端调用；AI 无确认工具。整批事务；已确认幂等 skip；无 draft 返回 409。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CaseConfirmationRequest'
+      responses:
+        '200':
+          description: 确认结果
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CaseConfirmationResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/exports:
+    get:
+      tags: [Exports]
+      operationId: listExports
+      summary: 导出列表（登录用户）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - name: format
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [markdown, mermaid, opml, csv]
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Before'
+      responses:
+        '200':
+          description: 导出列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/ExportView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [Exports]
+      operationId: createExport
+      summary: 创建整版本用例导出
+      description: P2 只支持 owner_kind=case 且 owner_id=version_id；每次创建新 revision；字节入内容账本。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExportRequest'
+      responses:
+        '201':
+          description: 导出元数据
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/ExportView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          description: 导出内容超过内容账本上限
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/exports/{exportId}:
+    get:
+      tags: [Exports]
+      operationId: getExport
+      summary: 导出元数据（登录用户）
+      parameters:
+        - name: exportId
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[0-9]+$'
+      responses:
+        '200':
+          description: 导出元数据
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/ExportView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/exports/{exportId}/download:
+    get:
+      tags: [Exports]
+      operationId: downloadExport
+      summary: 鉴权下载导出文件
+      description: 校验版本归属与 sha256/size；不暴露内部路径。
+      parameters:
+        - name: exportId
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[0-9]+$'
+      responses:
+        '200':
+          description: 导出文件字节
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
 components:
   securitySchemes:
     bearerAuth:
@@ -3397,7 +3671,9 @@ components:
         pending_design_count:
           type: integer
           minimum: 0
-          description: 已澄清且尚无设计覆盖的需求数；P1 等于 clarified 数，仅用于 CTA 占位（P1-D15）
+          description: 已澄清且未进入 active design_scope 的需求数（P2 替换 P1 占位）
+        case_counts:
+          $ref: '#/components/schemas/CaseCounts'
         created_by:
           type: string
         created_at:
@@ -4147,13 +4423,13 @@ components:
       properties:
         kind:
           type: string
-          enum: [clarification]
-          description: P1 只支持 clarification
+          enum: [clarification, design]
+          description: P2 支持 clarification/design；design 会创建 conversation + 设计轮次
         title:
           type: string
           minLength: 1
           maxLength: 120
-          description: 省略时默认 `需求澄清 YYYY-MM-DD HH:mm`
+          description: 省略时默认 `需求澄清 YYYY-MM-DD HH:mm` 或 `用例设计 YYYY-MM-DD HH:mm`
     PostMessageRequest:
       type: object
       required: [parts]
@@ -4567,3 +4843,514 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/TeamRoomPost'
+    CaseCounts:
+      type: object
+      required: [draft, confirmed, stale]
+      properties:
+        draft:
+          type: integer
+          minimum: 0
+        confirmed:
+          type: integer
+          minimum: 0
+        stale:
+          type: integer
+          minimum: 0
+    DesignGraphStats:
+      type: object
+      required: [requirements, scenarios, cases, draft, confirmed, stale]
+      properties:
+        requirements:
+          type: integer
+          minimum: 0
+        scenarios:
+          type: integer
+          minimum: 0
+        cases:
+          type: integer
+          minimum: 0
+        draft:
+          type: integer
+          minimum: 0
+        confirmed:
+          type: integer
+          minimum: 0
+        stale:
+          type: integer
+          minimum: 0
+    DesignCaseCard:
+      type: object
+      required: [case_id, current_version_id, revision, title, priority, status, default_version_sut_id, version_sut_ids, page_ids, api_ids, step_count, assertion_count, created_at]
+      properties:
+        case_id:
+          type: string
+          pattern: '^[0-9]+$'
+        current_version_id:
+          type: string
+          pattern: '^[0-9]+$'
+        revision:
+          type: integer
+          minimum: 1
+        title:
+          type: string
+        priority:
+          type: string
+          enum: [P0, P1, P2, P3]
+        status:
+          type: string
+          enum: [draft, confirmed, stale]
+        default_version_sut_id:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+        version_sut_ids:
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9]+$'
+        page_ids:
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9]+$'
+        api_ids:
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9]+$'
+        step_count:
+          type: integer
+          minimum: 0
+        assertion_count:
+          type: integer
+          minimum: 0
+        created_at:
+          type: string
+          format: date-time
+    DesignScenario:
+      type: object
+      required: [id, requirement_version_id, name, description, version_sut_ids, page_ids, api_ids, sort_order, cases]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        requirement_version_id:
+          type: string
+          pattern: '^[0-9]+$'
+        name:
+          type: string
+        description:
+          type: string
+        version_sut_ids:
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9]+$'
+        page_ids:
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9]+$'
+        api_ids:
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9]+$'
+        sort_order:
+          type: integer
+          minimum: 0
+        cases:
+          type: array
+          items:
+            $ref: '#/components/schemas/DesignCaseCard'
+    DesignRequirementGraph:
+      type: object
+      required: [requirement_id, requirement_version_id, revision, title, status, design_status, target_version_sut_ids, scenarios]
+      properties:
+        requirement_id:
+          type: string
+          pattern: '^[0-9]+$'
+        requirement_version_id:
+          type: string
+          pattern: '^[0-9]+$'
+        revision:
+          type: integer
+          minimum: 1
+        title:
+          type: string
+        status:
+          type: string
+          enum: [draft, clarified, closed, obsolete]
+        design_status:
+          type: string
+          enum: [pending, in_design, draft, confirmed, stale]
+        target_version_sut_ids:
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9]+$'
+        scenarios:
+          type: array
+          items:
+            $ref: '#/components/schemas/DesignScenario'
+    DesignGraphView:
+      type: object
+      required: [version_id, generated_at, graph_hash, pending_design_count, auto_design_new_requirements, stats, requirements]
+      properties:
+        version_id:
+          type: string
+          pattern: '^[0-9]+$'
+        generated_at:
+          type: string
+          format: date-time
+        graph_hash:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        pending_design_count:
+          type: integer
+          minimum: 0
+        auto_design_new_requirements:
+          type: boolean
+        stats:
+          $ref: '#/components/schemas/DesignGraphStats'
+        requirements:
+          type: array
+          items:
+            $ref: '#/components/schemas/DesignRequirementGraph'
+    DesignStep:
+      type: object
+      required: [seq, action, expected, target_version_sut_id, target_page_id, target_api_id, account_role, data]
+      properties:
+        seq:
+          type: integer
+          minimum: 1
+        action:
+          type: string
+        expected:
+          type: string
+        target_version_sut_id:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+        target_page_id:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+        target_api_id:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+        account_role:
+          type: string
+        data:
+          type: object
+          additionalProperties: true
+    DesignAssertion:
+      type: object
+      required: [step_seq, kind, target, expected, target_version_sut_id, target_api_id, database_id]
+      properties:
+        step_seq:
+          type: integer
+          minimum: 1
+        kind:
+          type: string
+          enum: [ui, api, db, text, visual]
+        target:
+          type: string
+        expected:
+          type: string
+        target_version_sut_id:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+        target_api_id:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+        database_id:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+    DesignSource:
+      type: object
+      required: [kind, ref_id, path, line_no, sha]
+      properties:
+        kind:
+          type: string
+          enum: [requirement, code, page, api, knowledge]
+        ref_id:
+          type: string
+        path:
+          type: string
+        line_no:
+          type: integer
+          nullable: true
+          minimum: 1
+        sha:
+          type: string
+    DesignCaseVersionSummary:
+      type: object
+      required: [case_version_id, revision, status, title, created_at, confirmed_at]
+      properties:
+        case_version_id:
+          type: string
+          pattern: '^[0-9]+$'
+        revision:
+          type: integer
+          minimum: 1
+        status:
+          type: string
+          enum: [draft, confirmed, stale, superseded]
+        title:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        confirmed_at:
+          type: string
+          nullable: true
+          format: date-time
+    DesignCaseVersionDetail:
+      type: object
+      required: [case_version_id, revision, title, description, preconditions, test_data, priority, default_version_sut_id, version_sut_ids, page_ids, api_ids, status, content_hash, created_at, steps, assertions, sources]
+      properties:
+        case_version_id:
+          type: string
+          pattern: '^[0-9]+$'
+        revision:
+          type: integer
+          minimum: 1
+        title:
+          type: string
+        description:
+          type: string
+        preconditions:
+          type: string
+        test_data:
+          type: object
+          additionalProperties: true
+        priority:
+          type: string
+          enum: [P0, P1, P2, P3]
+        default_version_sut_id:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+        version_sut_ids:
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9]+$'
+        page_ids:
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9]+$'
+        api_ids:
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9]+$'
+        status:
+          type: string
+          enum: [draft, confirmed, stale, superseded]
+        content_hash:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        created_at:
+          type: string
+          format: date-time
+        steps:
+          type: array
+          items:
+            $ref: '#/components/schemas/DesignStep'
+        assertions:
+          type: array
+          items:
+            $ref: '#/components/schemas/DesignAssertion'
+        sources:
+          type: array
+          items:
+            $ref: '#/components/schemas/DesignSource'
+    DesignCaseDetail:
+      type: object
+      required: [case_id, status, current_version_id, requirement_id, requirement_version_id, scenario_id, scenario_name, versions, selected, confirmable]
+      properties:
+        case_id:
+          type: string
+          pattern: '^[0-9]+$'
+        status:
+          type: string
+          enum: [draft, confirmed, stale]
+        current_version_id:
+          type: string
+          pattern: '^[0-9]+$'
+        requirement_id:
+          type: string
+          pattern: '^[0-9]+$'
+        requirement_version_id:
+          type: string
+          pattern: '^[0-9]+$'
+        scenario_id:
+          type: string
+          pattern: '^[0-9]+$'
+        scenario_name:
+          type: string
+        versions:
+          type: array
+          items:
+            $ref: '#/components/schemas/DesignCaseVersionSummary'
+        selected:
+          $ref: '#/components/schemas/DesignCaseVersionDetail'
+        confirmable:
+          type: boolean
+    DesignRoundView:
+      type: object
+      required: [id, round_no, conversation_id, activation, requirement_ids, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        round_no:
+          type: integer
+          minimum: 1
+        conversation_id:
+          type: string
+          pattern: '^[0-9]+$'
+        activation:
+          type: string
+          enum: [manual, auto_gap, auto_change, auto_new]
+        requirement_ids:
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9]+$'
+        created_at:
+          type: string
+          format: date-time
+    DesignOverview:
+      type: object
+      required: [pending_design_count, auto_design_new_requirements, round_count, active_round]
+      properties:
+        pending_design_count:
+          type: integer
+          minimum: 0
+        auto_design_new_requirements:
+          type: boolean
+        round_count:
+          type: integer
+          minimum: 0
+        active_round:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/DesignRoundView'
+    CaseConfirmationRequest:
+      type: object
+      required: [scope, target_id]
+      properties:
+        scope:
+          type: string
+          enum: [case, scenario, requirement]
+        target_id:
+          type: string
+          pattern: '^[0-9]+$'
+        batch_id:
+          type: string
+          maxLength: 64
+    CaseConfirmationItem:
+      type: object
+      required: [case_id, case_version_id]
+      properties:
+        case_id:
+          type: string
+          pattern: '^[0-9]+$'
+        case_version_id:
+          type: string
+          pattern: '^[0-9]+$'
+    CaseConfirmationResult:
+      type: object
+      required: [scope, target_id, batch_id, confirmed, skipped, confirmed_at]
+      properties:
+        scope:
+          type: string
+          enum: [case, scenario, requirement]
+        target_id:
+          type: string
+          pattern: '^[0-9]+$'
+        batch_id:
+          type: string
+        confirmed:
+          type: array
+          items:
+            $ref: '#/components/schemas/CaseConfirmationItem'
+        skipped:
+          type: array
+          items:
+            type: object
+            required: [case_id, case_version_id, status]
+            properties:
+              case_id:
+                type: string
+                pattern: '^[0-9]+$'
+              case_version_id:
+                type: string
+                pattern: '^[0-9]+$'
+              status:
+                type: string
+                enum: [draft, confirmed, stale, superseded]
+        confirmed_at:
+          type: string
+          format: date-time
+    ExportRequest:
+      type: object
+      required: [owner_kind, owner_id, format]
+      properties:
+        owner_kind:
+          type: string
+          enum: [case]
+        owner_id:
+          type: string
+          pattern: '^[0-9]+$'
+        format:
+          type: string
+          enum: [markdown, mermaid, opml, csv]
+    ExportView:
+      type: object
+      required: [id, version_id, owner_kind, owner_id, revision, format, size, mime, filename, sha256, status, created_at, download_url]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        version_id:
+          type: string
+          pattern: '^[0-9]+$'
+        owner_kind:
+          type: string
+          enum: [case, report, chain]
+        owner_id:
+          type: string
+          pattern: '^[0-9]+$'
+        revision:
+          type: integer
+          minimum: 1
+        format:
+          type: string
+          enum: [markdown, mermaid, opml, csv, html, pdf]
+        size:
+          type: integer
+          minimum: 0
+        mime:
+          type: string
+        filename:
+          type: string
+        sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        status:
+          type: string
+          enum: [ready, failed]
+        created_at:
+          type: string
+          format: date-time
+        download_url:
+          type: string
