@@ -139,7 +139,143 @@ func toChainNodeDTO(node chain.Node) chainNodeDTO {
 		IssueID:       formatChainID(node.IssueID),
 		ReportID:      formatChainID(node.ReportID),
 		CreatedAt:     formatChainTime(node.CreatedAt),
-		Meta:          node.Meta,
+		Meta:          sanitizeChainMeta(node.Meta),
+	}
+}
+
+// chainMetaIDArrayKeys are the node meta keys that carry entity ID arrays.
+// Meta is an open JSON object, but the public API contract of P4 is that P3+
+// entity IDs are decimal strings; the DTO boundary converts these known arrays
+// (and the ref_id fields of "refs") so the chain response never leaks JSON
+// numbers for snowflake IDs.
+var chainMetaIDArrayKeys = map[string]bool{
+	"page_ids":     true,
+	"issue_ids":    true,
+	"case_run_ids": true,
+}
+
+// sanitizeChainMeta deep-copies the node meta and converts the documented ID
+// arrays to decimal strings. Other values are preserved as-is (counts, labels,
+// timestamps and maps are not entity IDs).
+func sanitizeChainMeta(meta map[string]any) map[string]any {
+	if meta == nil {
+		return nil
+	}
+	out := make(map[string]any, len(meta))
+	for key, value := range meta {
+		switch {
+		case chainMetaIDArrayKeys[key]:
+			out[key] = decimalStringArray(value)
+		case key == "refs":
+			out[key] = sanitizeChainMetaRefs(value)
+		default:
+			out[key] = value
+		}
+	}
+	return out
+}
+
+func decimalStringArray(value any) any {
+	switch values := value.(type) {
+	case []int64:
+		out := make([]string, 0, len(values))
+		for _, item := range values {
+			out = append(out, strconv.FormatInt(item, 10))
+		}
+		return out
+	case []int:
+		out := make([]string, 0, len(values))
+		for _, item := range values {
+			out = append(out, strconv.Itoa(item))
+		}
+		return out
+	case []int32:
+		out := make([]string, 0, len(values))
+		for _, item := range values {
+			out = append(out, strconv.FormatInt(int64(item), 10))
+		}
+		return out
+	case []float64:
+		out := make([]string, 0, len(values))
+		for _, item := range values {
+			out = append(out, strconv.FormatFloat(item, 'f', -1, 64))
+		}
+		return out
+	case []string:
+		return append([]string(nil), values...)
+	case []any:
+		out := make([]any, 0, len(values))
+		for _, item := range values {
+			if formatted, ok := decimalStringValue(item); ok {
+				out = append(out, formatted)
+			} else {
+				out = append(out, item)
+			}
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+func sanitizeChainMetaRefs(value any) any {
+	switch refs := value.(type) {
+	case []map[string]any:
+		out := make([]map[string]any, 0, len(refs))
+		for _, ref := range refs {
+			out = append(out, sanitizeChainMetaRef(ref))
+		}
+		return out
+	case []any:
+		out := make([]any, 0, len(refs))
+		for _, item := range refs {
+			ref, ok := item.(map[string]any)
+			if !ok {
+				out = append(out, item)
+				continue
+			}
+			out = append(out, sanitizeChainMetaRef(ref))
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+func sanitizeChainMetaRef(ref map[string]any) map[string]any {
+	out := make(map[string]any, len(ref))
+	for key, value := range ref {
+		if key == "ref_id" {
+			if formatted, ok := decimalStringValue(value); ok {
+				out[key] = formatted
+				continue
+			}
+		}
+		out[key] = value
+	}
+	return out
+}
+
+func decimalStringValue(value any) (string, bool) {
+	switch number := value.(type) {
+	case int:
+		return strconv.Itoa(number), true
+	case int32:
+		return strconv.FormatInt(int64(number), 10), true
+	case int64:
+		return strconv.FormatInt(number, 10), true
+	case uint:
+		return strconv.FormatUint(uint64(number), 10), true
+	case uint64:
+		return strconv.FormatUint(number, 10), true
+	case float64:
+		return strconv.FormatFloat(number, 'f', -1, 64), true
+	case float32:
+		return strconv.FormatFloat(float64(number), 'f', -1, 32), true
+	case string:
+		return number, true
+	default:
+		return "", false
 	}
 }
 

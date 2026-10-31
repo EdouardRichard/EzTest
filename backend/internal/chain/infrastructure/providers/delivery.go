@@ -8,7 +8,7 @@ import (
 	chain "github.com/EdouardRichard/EzTest/backend/internal/chain/domain"
 	deliveryapp "github.com/EdouardRichard/EzTest/backend/internal/delivery/application"
 	delivery "github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
-	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
+	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 )
 
 // deliveryPageSize is the page size used while draining delivery pagination
@@ -39,32 +39,33 @@ type ReportReader interface {
 	ListRefs(ctx context.Context, reportID int64) ([]delivery.ReportRef, error)
 }
 
-// ClosureLatestReader is the version-context closure read surface. P4 deviation:
-// requirement closures are owned by the version context and no version
-// application read method exists yet, so the chain delivery provider consumes
-// the version RequirementClosureRepository.Latest port (implemented by
-// versionpg.ClosureRepository) instead of reading requirement_closure itself.
-type ClosureLatestReader interface {
-	Latest(ctx context.Context, requirementID int64) (version.RequirementClosure, bool, error)
+// ClosureSummaryReader is the version application closure read surface consumed
+// by the chain delivery provider. The version context owns requirement closures;
+// the batch application read keeps the provider out of the closure repository
+// and supplies the reopened-aware status of the newest closure round.
+type ClosureSummaryReader interface {
+	SummariesByRequirementIDs(ctx context.Context, versionID int64, requirementIDs []int64) (map[int64]versionapp.ClosureSummary, error)
 }
+
+var _ ClosureSummaryReader = (*versionapp.ClosureService)(nil)
 
 // DeliveryProvider supplies issue, report and closure nodes. Issues/reports are
 // read through the delivery application ports; closures are resolved through
-// the version closure port (the documented P4 source deviation, spec §8.1).
+// the version closure summary application read (spec §8.1).
 type DeliveryProvider struct {
 	issues       IssueReader
 	reports      ReportReader
 	requirements RequirementLister
-	closures     ClosureLatestReader
+	closures     ClosureSummaryReader
 }
 
 // NewDeliveryProvider wires the issue/report readers, the version requirement
-// lister (closure enumeration) and the version closure reader.
+// lister (closure enumeration) and the version closure summary reader.
 func NewDeliveryProvider(
 	issues IssueReader,
 	reports ReportReader,
 	requirements RequirementLister,
-	closures ClosureLatestReader,
+	closures ClosureSummaryReader,
 ) *DeliveryProvider {
 	return &DeliveryProvider{issues: issues, reports: reports, requirements: requirements, closures: closures}
 }
@@ -285,39 +286,43 @@ func reportKindLabel(kind delivery.ReportKind) string {
 	}
 }
 
-// Closures returns the newest closure per requirement of the version. The
-// delivery provider resolves them through the version closure port because the
-// version context owns requirement closures (spec §8.1 deviation).
+// Closures returns the newest closure round per requirement of the version. The
+// version application batch read owns both the round and its reopened-aware
+// status, so the chain never touches the version closure repository.
 func (p *DeliveryProvider) Closures(ctx context.Context, versionID int64) ([]chain.Node, error) {
 	requirementIDs, err := p.listRequirements(ctx, versionID)
 	if err != nil {
 		return nil, err
 	}
-	nodes := make([]chain.Node, 0)
+	if len(requirementIDs) == 0 {
+		return []chain.Node{}, nil
+	}
+	summaries, err := p.closures.SummariesByRequirementIDs(ctx, versionID, requirementIDs)
+	if err != nil {
+		return nil, err
+	}
+	nodes := make([]chain.Node, 0, len(summaries))
 	for _, requirementID := range requirementIDs {
-		closure, found, err := p.closures.Latest(ctx, requirementID)
-		if err != nil {
-			return nil, err
-		}
-		if !found || closure.ID <= 0 {
+		summary, found := summaries[requirementID]
+		if !found || summary.ID <= 0 {
 			continue
 		}
 		node := chain.Node{
-			ID:            chain.NodeID(chain.NodeClosure, closure.ID),
+			ID:            chain.NodeID(chain.NodeClosure, summary.ID),
 			Kind:          chain.NodeClosure,
-			RefID:         strconv.FormatInt(closure.ID, 10),
-			Label:         "Closure round " + strconv.Itoa(closure.CloseRound),
-			Status:        "closed",
-			RequirementID: optionalInt64Ptr(closure.RequirementID),
-			CreatedAt:     closure.ClosedAt,
-			UpdatedAt:     closure.UpdatedAt,
+			RefID:         strconv.FormatInt(summary.ID, 10),
+			Label:         "Closure round " + strconv.Itoa(summary.CloseRound),
+			Status:        summary.Status,
+			RequirementID: optionalInt64Ptr(summary.RequirementID),
+			CreatedAt:     summary.ClosedAt,
+			UpdatedAt:     summary.ClosedAt,
 			Meta: map[string]any{
-				"close_round":  closure.CloseRound,
-				"reopen_count": closure.ReopenCount,
+				"close_round":  summary.CloseRound,
+				"reopen_count": summary.ReopenCount,
 			},
 		}
-		if !closure.ClosedAt.IsZero() {
-			node.Meta["closed_at"] = closure.ClosedAt
+		if !summary.ClosedAt.IsZero() {
+			node.Meta["closed_at"] = summary.ClosedAt
 		}
 		nodes = append(nodes, node)
 	}

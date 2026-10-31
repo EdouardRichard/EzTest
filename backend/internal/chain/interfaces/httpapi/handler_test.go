@@ -208,6 +208,74 @@ func TestChainHandlerParsesFiltersAndMapsView(t *testing.T) {
 	}
 }
 
+func TestChainHandlerSerializesMetaIDArraysAsDecimalStrings(t *testing.T) {
+	view := chain.ChainView{
+		VersionID:   "42",
+		GeneratedAt: time.Date(2026, 11, 1, 4, 0, 0, 0, time.UTC),
+		Replay:      chain.ReplayInfo{Mode: chain.ReplayModeLive, Approximate: true},
+		Nodes: []chain.Node{{
+			ID:        "requirement:1",
+			Kind:      chain.NodeRequirement,
+			RefID:     "1",
+			Label:     "Checkout",
+			CreatedAt: time.Date(2026, 11, 1, 3, 0, 0, 0, time.UTC),
+			Meta: map[string]any{
+				"page_ids":       []int64{50, 51},
+				"issue_ids":      []int{300},
+				"case_run_ids":   []int32{200},
+				"evidence_count": 2,
+				"refs": []map[string]any{
+					{"kind": "issue", "ref_id": int64(300)},
+					{"kind": "case_run", "ref_id": 200},
+				},
+			},
+		}},
+	}
+	svc := &fakeChainService{view: view}
+	mux := newChainMux(t, svc)
+
+	recorder := getChain(t, mux, "/api/versions/42/exploration-chain")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	data := decodeChainData(t, recorder)
+	node := data["nodes"].([]any)[0].(map[string]any)
+	meta := node["meta"].(map[string]any)
+
+	if got := meta["page_ids"]; !equalStrings(got, []string{"50", "51"}) {
+		t.Errorf("page_ids = %#v, want [\"50\",\"51\"]", got)
+	}
+	if got := meta["issue_ids"]; !equalStrings(got, []string{"300"}) {
+		t.Errorf("issue_ids = %#v, want [\"300\"]", got)
+	}
+	if got := meta["case_run_ids"]; !equalStrings(got, []string{"200"}) {
+		t.Errorf("case_run_ids = %#v, want [\"200\"]", got)
+	}
+	if meta["evidence_count"] != float64(2) {
+		t.Errorf("non-ID meta value = %#v, want the numeric count", meta["evidence_count"])
+	}
+	refs := meta["refs"].([]any)
+	for index, want := range []string{"300", "200"} {
+		ref := refs[index].(map[string]any)
+		if ref["ref_id"] != want {
+			t.Errorf("refs[%d].ref_id = %#v, want %q", index, ref["ref_id"], want)
+		}
+	}
+}
+
+func equalStrings(value any, want []string) bool {
+	list, ok := value.([]any)
+	if !ok || len(list) != len(want) {
+		return false
+	}
+	for index, item := range list {
+		if item != want[index] {
+			return false
+		}
+	}
+	return true
+}
+
 func TestChainHandlerEmptyGraphIsNot404(t *testing.T) {
 	svc := &fakeChainService{view: chain.ChainView{
 		VersionID:   "42",
@@ -264,6 +332,9 @@ func TestChainHandlerRejectsInvalidQueries(t *testing.T) {
 		{name: "invalid wave id", query: "?wave_id=1.5", field: "wave_id", status: http.StatusBadRequest},
 		{name: "negative event from", query: "?event_from=-1", field: "event_from", status: http.StatusBadRequest},
 		{name: "non numeric event to", query: "?event_to=soon", field: "event_to", status: http.StatusBadRequest},
+		{name: "non numeric focus ref", query: "?focus_node=issue%3Aabc", field: "focus_node", status: http.StatusBadRequest},
+		{name: "invalid focus kind", query: "?focus_node=Issue%3A300", field: "focus_node", status: http.StatusBadRequest},
+		{name: "negative focus ref", query: "?focus_node=issue%3A-1", field: "focus_node", status: http.StatusBadRequest},
 		{name: "limit below range", query: "?limit=0", field: "limit", status: http.StatusBadRequest},
 		{name: "limit above range", query: "?limit=1001", field: "limit", status: http.StatusBadRequest},
 		{name: "non numeric limit", query: "?limit=many", field: "limit", status: http.StatusBadRequest},

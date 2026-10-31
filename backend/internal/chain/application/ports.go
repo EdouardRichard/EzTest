@@ -7,6 +7,7 @@ package chainapp
 
 import (
 	"context"
+	"time"
 
 	chain "github.com/EdouardRichard/EzTest/backend/internal/chain/domain"
 )
@@ -49,4 +50,12 @@ type ResourceChainProvider interface {
 // returns it as ChainView.SnapshotCursor (spec §8.4).
 type CursorReader interface {
 	LatestCursor(ctx context.Context, channel string) (int64, error)
+}
+
+// EventTimeReader maps one event seq of a channel to the event's created_at
+// timestamp. The chain service uses it to turn event_from/event_to into
+// approximate entity created_at bounds (spec §8.4); found=false means the
+// channel no longer exposes a row for that seq.
+type EventTimeReader interface {
+	EventTime(ctx context.Context, channel string, seq int64) (createdAt time.Time, found bool, err error)
 }

@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	chainapp "github.com/EdouardRichard/EzTest/backend/internal/chain/application"
 	chain "github.com/EdouardRichard/EzTest/backend/internal/chain/domain"
@@ -67,7 +68,7 @@ const (
 	itReportID    = 9911
 	itReportRevID = 9912
 	itClosureID   = 9951
-	itEventCursor = 1
+	itEventCursor = 3
 )
 
 var itClock = clock.System{}
@@ -82,7 +83,7 @@ func itDedupeKey() string { return strings.Repeat("c", 32) }
 func newChainProviders(t *testing.T) (*pgxpool.Pool, *ChainServiceBundle) {
 	t.Helper()
 	pool := testutil.NewDB(t)
-	insertChainFixtures(t, pool)
+	eventTimes := insertChainFixtures(t, pool)
 
 	ids, err := platformid.NewSnowflake(1)
 	if err != nil {
@@ -92,12 +93,18 @@ func newChainProviders(t *testing.T) (*pgxpool.Pool, *ChainServiceBundle) {
 	resourceSvc := resourceapp.New(resourceRepo, ids, itClock, nil, nil, nil)
 	versionRepo := versionpg.New(pool, ids)
 	versionSvc := versionapp.New(versionRepo, resourceSvc, ids, itClock, nil, nil)
+	requirementRepo := versionpg.NewRequirementRepository(pool)
 	requirementSvc := versionapp.NewRequirementService(
-		versionpg.NewRequirementRepository(pool), nil, nil, nil, nil, nil, ids, itClock,
+		requirementRepo, nil, nil, nil, nil, nil, ids, itClock,
 	)
 	designSvc := designapp.NewGraphService(designpg.New(pool), ids, itClock, nil, nil, nil)
 	executionRepos := executionpg.NewRepository(pool, ids)
 	closureRepo := versionpg.NewClosureRepository(pool)
+	closureSvc := versionapp.NewClosureService(versionapp.ClosureServiceDeps{
+		Closures:     closureRepo,
+		Requirements: requirementRepo,
+		Clock:        itClock,
+	})
 	issueRepo := deliverypg.NewIssueRepository(pool)
 	reportRepo := deliverypg.NewReportRepository(pool)
 	eventRepo := eventingpg.New(pool)
@@ -106,13 +113,13 @@ func newChainProviders(t *testing.T) (*pgxpool.Pool, *ChainServiceBundle) {
 	versionProvider := NewVersionProvider(requirementSvc, versionSvc)
 	designProvider := NewDesignProvider(designSvc)
 	executionProvider := NewExecutionProvider(executionRepos.Waves, executionRepos.CaseRuns, executionRepos.SUTContexts)
-	deliveryProvider := NewDeliveryProvider(issueRepo, reportRepo, requirementSvc, closureRepo)
+	deliveryProvider := NewDeliveryProvider(issueRepo, reportRepo, requirementSvc, closureSvc)
 	resourceProvider := NewResourceProvider(versionSvc, resourceSvc)
 	cursorProvider := NewEventCursorProvider(eventSvc)
 
 	service := chainapp.NewChainService(
 		versionProvider, designProvider, executionProvider, deliveryProvider,
-		resourceProvider, cursorProvider, itClock,
+		resourceProvider, cursorProvider, cursorProvider, itClock,
 	)
 	return pool, &ChainServiceBundle{
 		Service:      service,
@@ -123,6 +130,7 @@ func newChainProviders(t *testing.T) (*pgxpool.Pool, *ChainServiceBundle) {
 		Resource:     resourceProvider,
 		Cursor:       cursorProvider,
 		DesignReader: designSvc,
+		EventTimes:   eventTimes,
 	}
 }
 
@@ -136,12 +144,14 @@ type ChainServiceBundle struct {
 	Resource     *ResourceProvider
 	Cursor       *EventCursorProvider
 	DesignReader *designapp.GraphService
+	EventTimes   map[int64]time.Time
 }
 
 // insertChainFixtures writes the P4 spec §8.5 integration dataset: 2
 // requirements, 2 current cases plus 1 superseded case version, 2 waves, 2 case
-// runs, 1 issue, 1 report and 1 closure.
-func insertChainFixtures(t *testing.T, pool *pgxpool.Pool) {
+// runs, 1 issue, 1 report and 1 closure. It returns the created_at timestamps of
+// the three appended channel events keyed by seq (1..3).
+func insertChainFixtures(t *testing.T, pool *pgxpool.Pool) map[int64]time.Time {
 	t.Helper()
 	ctx := context.Background()
 	statements := []struct {
@@ -252,13 +262,19 @@ func insertChainFixtures(t *testing.T, pool *pgxpool.Pool) {
 	}
 
 	eventRepo := eventingpg.New(pool)
-	if _, err := eventRepo.Append(ctx, eventing.Event{
-		Channel: "version:" + strconv.FormatInt(itVersionID, 10),
-		Type:    "version.started",
-		Scope:   map[string]any{},
-	}); err != nil {
-		t.Fatalf("append chain event: %v", err)
+	eventTimes := make(map[int64]time.Time, 3)
+	for _, eventType := range []string{"version.started", "requirement.clarified", "case.confirmed"} {
+		stored, err := eventRepo.Append(ctx, eventing.Event{
+			Channel: "version:" + strconv.FormatInt(itVersionID, 10),
+			Type:    eventType,
+			Scope:   map[string]any{},
+		})
+		if err != nil {
+			t.Fatalf("append chain event %q: %v", eventType, err)
+		}
+		eventTimes[stored.Seq] = stored.CreatedAt
 	}
+	return eventTimes
 }
 
 // nodeIndex maps the chain view node ids to their node for assertions.
@@ -337,6 +353,12 @@ func TestProvidersChainIntegration(t *testing.T) {
 	}
 	if node := nodes["case_run:9822"]; !slices.Equal(node.VersionSUTIDs, []int64{itVersionSUT2}) {
 		t.Errorf("case run version SUT ids = %v, want [%d]", node.VersionSUTIDs, itVersionSUT2)
+	}
+	if node := nodes["closure:9951"]; node.Status != versionapp.ClosureSummaryStatusReopened {
+		t.Errorf("closure status = %q, want reopened for the incremented reopen_count", node.Status)
+	}
+	if node := nodes["scenario:9601"]; node.CreatedAt.IsZero() {
+		t.Errorf("scenario created_at is zero: %+v", node)
 	}
 	if node := nodes["issue:9901"]; node.CaseRunID == nil || *node.CaseRunID != itRun2 ||
 		node.WaveID == nil || *node.WaveID != itWave2 ||
@@ -441,6 +463,11 @@ func TestProvidersDirectReads(t *testing.T) {
 	if len(scenarios) != 2 || len(cases) != 2 {
 		t.Errorf("design nodes = %d scenarios, %d cases; want 2/2", len(scenarios), len(cases))
 	}
+	for _, node := range scenarios {
+		if node.CreatedAt.IsZero() {
+			t.Errorf("scenario node created_at is zero: %+v", node)
+		}
+	}
 	for _, node := range cases {
 		if node.ScenarioID == nil || node.RequirementID == nil {
 			t.Errorf("case node misses its edge endpoints: %+v", node)
@@ -510,6 +537,90 @@ func TestProvidersDirectReads(t *testing.T) {
 	}
 	if cursor != itEventCursor {
 		t.Errorf("cursor = %d, want %d", cursor, itEventCursor)
+	}
+}
+
+func TestProvidersEventTimeBySeq(t *testing.T) {
+	_, bundle := newChainProviders(t)
+	ctx := context.Background()
+	channel := "version:" + strconv.FormatInt(itVersionID, 10)
+
+	for seq := int64(1); seq <= 3; seq++ {
+		at, found, err := bundle.Cursor.EventTime(ctx, channel, seq)
+		if err != nil || !found {
+			t.Fatalf("EventTime(%d) = %v/%v/%v", seq, at, found, err)
+		}
+		if !at.Equal(bundle.EventTimes[seq]) {
+			t.Errorf("EventTime(%d) = %v, want %v", seq, at, bundle.EventTimes[seq])
+		}
+	}
+	if _, found, err := bundle.Cursor.EventTime(ctx, channel, 4); err != nil || found {
+		t.Errorf("EventTime(4) = found %v err %v, want not found", found, err)
+	}
+}
+
+func TestProvidersChainIntegrationEventRange(t *testing.T) {
+	pool, bundle := newChainProviders(t)
+	ctx := context.Background()
+	eventTimes := bundle.EventTimes
+	if len(eventTimes) != 3 {
+		t.Fatalf("event times = %v, want three seqs", eventTimes)
+	}
+
+	// Five requirements around the event window: one before the first event,
+	// one at each event boundary, and one after the last event. The version
+	// provider projects UpdatedAt into the chain node CreatedAt, so updated_at
+	// is the timestamp the range filter sees.
+	requirements := []struct {
+		id          int64
+		versionID   int64
+		at          time.Time
+		contentHash string
+	}{
+		{id: 9961, versionID: 9971, at: eventTimes[1].Add(-time.Hour), contentHash: itHash("7")},
+		{id: 9962, versionID: 9972, at: eventTimes[1], contentHash: itHash("8")},
+		{id: 9963, versionID: 9973, at: eventTimes[2], contentHash: itHash("9")},
+		{id: 9964, versionID: 9974, at: eventTimes[3], contentHash: itHash("a")},
+		{id: 9965, versionID: 9975, at: eventTimes[3].Add(time.Hour), contentHash: itHash("b")},
+	}
+	for _, requirement := range requirements {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO requirement (id, version_id, current_version_id, status, target_version_sut_ids,
+			                          created_at, updated_at)
+			VALUES ($1, $2, $3, 'clarified', '[]'::jsonb, $4, $4)`,
+			requirement.id, itVersionID, requirement.versionID, requirement.at); err != nil {
+			t.Fatalf("insert range requirement %d: %v", requirement.id, err)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO requirement_version (id, requirement_id, revision, title, description, priority,
+			                                 content_hash, target_version_suts, created_at)
+			VALUES ($1, $2, 1, 'Range requirement', '', 'P2', $3, '[]'::jsonb, $4)`,
+			requirement.versionID, requirement.id, requirement.contentHash, requirement.at); err != nil {
+			t.Fatalf("insert range requirement version %d: %v", requirement.versionID, err)
+		}
+	}
+
+	from, to := int64(1), int64(3)
+	view, err := bundle.Service.Read(ctx, itVersionID, chain.ChainFilter{EventFrom: &from, EventTo: &to})
+	if err != nil {
+		t.Fatalf("event-range Read: %v", err)
+	}
+	if view.Replay.Mode != chain.ReplayModeRange || !view.Replay.Approximate {
+		t.Errorf("replay = %+v, want range/approximate", view.Replay)
+	}
+	if got := view.Counts["requirements"]; got != 3 {
+		t.Errorf("range requirements = %d, want the three boundary requirements", got)
+	}
+	nodes := nodeIndex(view.Nodes)
+	for _, id := range []string{"requirement:9962", "requirement:9963", "requirement:9964"} {
+		if _, ok := nodes[id]; !ok {
+			t.Errorf("boundary requirement %q missing from the range graph", id)
+		}
+	}
+	for _, id := range []string{"requirement:9961", "requirement:9965", "requirement:9501", "scenario:9601"} {
+		if _, ok := nodes[id]; ok {
+			t.Errorf("node %q outside the event range survived: %v", id, view.Nodes)
+		}
 	}
 }
 

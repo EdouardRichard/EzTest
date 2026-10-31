@@ -30,13 +30,16 @@ type ChainService struct {
 	delivery  DeliveryChainProvider
 	resource  ResourceChainProvider
 	cursor    CursorReader
+	events    EventTimeReader
 	clock     Clock
 	budget    chain.Budget
 }
 
 // NewChainService wires the five chain providers, the snapshot-cursor reader,
-// the clock and the configured chain budget. A nil clock falls back to the
-// system clock. The optional budget is the chain.max_nodes / chain.max_edges /
+// the event-time reader, the clock and the configured chain budget. A nil clock
+// falls back to the system clock. The event-time reader is only needed for
+// event_from/event_to replay; an assembly that never serves a range may pass
+// nil. The optional budget is the chain.max_nodes / chain.max_edges /
 // chain.max_requirements tuple from settings (spec §4.5), clamped through
 // domain.ClampBudget; omitting it keeps the spec defaults. At most one budget
 // is read; extra values are ignored.
@@ -47,6 +50,7 @@ func NewChainService(
 	delivery DeliveryChainProvider,
 	resource ResourceChainProvider,
 	cursor CursorReader,
+	events EventTimeReader,
 	clock Clock,
 	budgets ...chain.Budget,
 ) *ChainService {
@@ -64,19 +68,31 @@ func NewChainService(
 		delivery:  delivery,
 		resource:  resource,
 		cursor:    cursor,
+		events:    events,
 		clock:     clock,
 		budget:    chain.ClampBudget(configured),
 	}
 }
 
 // Read returns the exploration chain of one version (spec §8.2–§8.4). The
-// filter is normalized once; event-range replay is reported as approximate
-// because P4 never promises an arbitrary as-of snapshot.
+// filter is normalized once; event_from/event_to are mapped to inclusive
+// created_at boundaries and provider nodes outside that window are dropped
+// before BuildChain, so the induced edges only connect surviving nodes. Nodes
+// without a timestamp are kept, and replay is reported as approximate because
+// P4 never promises an arbitrary as-of snapshot. A zero event bound is unset; a
+// negative or unresolvable seq is rejected.
 func (s *ChainService) Read(ctx context.Context, versionID int64, f chain.ChainFilter) (chain.ChainView, error) {
 	if versionID <= 0 {
 		return chain.ChainView{}, fmt.Errorf("chain: version_id must be positive: %d", versionID)
 	}
+	if err := validateEventBounds(f); err != nil {
+		return chain.ChainView{}, err
+	}
 	f = f.Normalize()
+	eventLower, eventUpper, err := s.eventTimeBounds(ctx, versionID, f)
+	if err != nil {
+		return chain.ChainView{}, err
+	}
 	budget := chain.ClampBudget(s.budget)
 
 	// Ask for one requirement root beyond the configured budget. A provider that
@@ -147,7 +163,7 @@ func (s *ChainService) Read(ctx context.Context, versionID int64, f chain.ChainF
 		return chain.ChainView{}, providerError("load snapshot cursor", err)
 	}
 
-	view := chain.BuildChain(chain.SourceGraph{
+	source := chain.SourceGraph{
 		Requirements: requirements,
 		Scenarios:    scenarios,
 		Cases:        cases,
@@ -158,7 +174,8 @@ func (s *ChainService) Read(ctx context.Context, versionID int64, f chain.ChainF
 		Closures:     closures,
 		SUTs:         mergeSUTNames(versionSUTs, sutNames),
 		Pages:        nonNilNames(pageNames),
-	}, f, budget, cursor, s.clock.Now())
+	}
+	view := chain.BuildChain(filterSourceGraphByEventRange(source, eventLower, eventUpper), f, budget, cursor, s.clock.Now())
 	view.VersionID = strconv.FormatInt(versionID, 10)
 	return view, nil
 }

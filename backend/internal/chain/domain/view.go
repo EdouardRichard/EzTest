@@ -58,8 +58,12 @@ type ChainFilter struct {
 	Status       string
 	Result       string
 	FocusNode    string
-	EventFrom    *int64
-	EventTo      *int64
+	// EventFrom/EventTo are inclusive channel-local event seqs used for the
+	// approximate created_at replay. Zero means unset: Normalize drops zero and
+	// negative values, so event_from=0&event_to=0 selects live mode rather than
+	// an empty range. The application service rejects negative bounds.
+	EventFrom *int64
+	EventTo   *int64
 	// Limit is the optional node-limit override. Normalize keeps values in
 	// 1..1000 and resets every other value to 0 (unset/default), so an invalid
 	// client value can never raise the service budget cap.
