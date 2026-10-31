@@ -201,6 +201,19 @@ func (s *Service) Int(ctx context.Context, key string) (int64, error) {
 	return value, nil
 }
 
+// Float returns a typed numeric value (integers are accepted and widened).
+func (s *Service) Float(ctx context.Context, key string) (float64, error) {
+	item, err := s.Get(ctx, key)
+	if err != nil {
+		return 0, err
+	}
+	var value float64
+	if err := json.Unmarshal(item.Value, &value); err != nil {
+		return 0, fmt.Errorf("setting %s is not a number: %w", key, err)
+	}
+	return value, nil
+}
+
 // Bool returns a typed boolean value.
 func (s *Service) Bool(ctx context.Context, key string) (bool, error) {
 	item, err := s.Get(ctx, key)

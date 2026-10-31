@@ -292,8 +292,19 @@ func TestTypedGetters(t *testing.T) {
 	if err != nil || !dryRun {
 		t.Fatalf("dry run = %v, %v", dryRun, err)
 	}
+	threshold, err := svc.Float(ctx, "context.compact_threshold")
+	if err != nil || threshold != 0.7 {
+		t.Fatalf("threshold = %v, %v", threshold, err)
+	}
+	concurrency, err := svc.Float(ctx, "execution.global_concurrency")
+	if err != nil || concurrency != 3 {
+		t.Fatalf("widened integer = %v, %v", concurrency, err)
+	}
 	if _, err := svc.String(ctx, "execution.global_concurrency"); err == nil {
 		t.Fatal("String() accepted a number setting")
+	}
+	if _, err := svc.Float(ctx, "paths.data_root"); err == nil {
+		t.Fatal("Float() accepted a string setting")
 	}
 }
 
