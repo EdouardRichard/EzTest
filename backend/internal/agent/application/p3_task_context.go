@@ -95,9 +95,10 @@ type TaskContextProvider interface {
 
 // p4TaskDetails resolves the domain-owned payload for a P4 work item. It is the
 // fallback consulted by Runner.taskContext when the P3 switch has no branch for
-// the type: each P4 domain registers a provider from an init() hook with
-// RegisterP4TaskContext. The TaskRef carries the raw work-item payload so the
-// provider sees its own IDs (decimal strings) without the runtime parsing them.
+// the type: each P4 domain registers a payload-only provider from an init()
+// hook with RegisterP4TaskContext. The TaskRef carries the raw work-item payload
+// so the provider sees its own IDs (decimal strings) without the runtime parsing
+// them; providers get no service deps (see p4_task_context.go).
 func p4TaskDetails(ctx context.Context, item agent.WorkItem) (any, bool) {
 	payload := map[string]any{}
 	if len(item.Payload) > 0 {

@@ -210,6 +210,15 @@ type WorkItemPayload struct {
 	CaseRunID     int64
 	DispatchEpoch int64
 	DispatchToken string
+	// P4 delivery/steward payload (contracts/task-types.md §6). IDs are
+	// decimal strings in JSON, parsed by ParseWorkItemPayload;
+	// RequirementID/RequirementVersionID above are reused by requirement.close.
+	IssueID              int64
+	ReportID             int64
+	ReportRevision       int32
+	CloseRound           int32
+	ReportRevisionID     int64
+	PredicateFingerprint string
 }
 
 // ToolDeps is the adapter wiring for the P1 tools. The runner adds the

@@ -5,9 +5,15 @@ import (
 	"sync"
 )
 
-// TaskRef is the P4 work-item reference handed to domain task-context
-// providers. Payload is the raw work-item payload (IDs stay decimal strings);
-// each domain parses only the keys it owns.
+// TaskRef is the complete input a P4 work-item task-context provider receives:
+// the version, the work-item type and the raw work-item payload (IDs stay
+// decimal strings). Each domain parses only the keys it owns.
+//
+// Ruling: P4 task contexts are payload-derived only. A provider returns JSON
+// derived from this TaskRef and nothing else; it gets no service deps and must
+// not capture application ports from init-time globals. Data beyond the
+// work-item reference is loaded by the domain's scoped tools during the run, so
+// tool scope stays the single access path for domain data.
 type TaskRef struct {
 	VersionID int64
 	Type      string
@@ -17,14 +23,19 @@ type TaskRef struct {
 // P4 task-context providers are registered from domain init() hooks so adding
 // a P4 task type never requires editing the P3 switch in runner.go. Providers
 // are consulted in registration order and the first match wins.
+//
+// The registration hook deliberately has no deps parameter (see TaskRef): init()
+// runs before application services are wired, and a provider that needed ports
+// would either force a shared-file startup hook or bypass tool scope.
 var (
 	p4TaskContextMu        sync.RWMutex
 	p4TaskContextProviders = []func(ctx context.Context, task TaskRef) (any, bool){}
 )
 
-// RegisterP4TaskContext appends one P4 task-context provider. A provider
-// returns its JSON-ready task payload and true when it owns the work-item type,
-// and (nil, false) otherwise. Nil providers are ignored.
+// RegisterP4TaskContext appends one payload-only P4 task-context provider. A
+// provider returns its JSON-ready task payload derived from the TaskRef and
+// true when it owns the work-item type, and (nil, false) otherwise. Nil
+// providers are ignored.
 func RegisterP4TaskContext(fn func(ctx context.Context, task TaskRef) (any, bool)) {
 	if fn == nil {
 		return
