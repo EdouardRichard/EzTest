@@ -115,11 +115,23 @@ func (h *Handler) Catalog(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
-	items := make([]sutDTO, 0, len(views))
-	for _, view := range views {
-		items = append(items, toSUTDTO(view))
+	repositories, _, err := h.svc.ListRepositories(r.Context(), 1000, nil)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
 	}
-	httpx.JSON(w, http.StatusOK, items)
+	suts := make([]sutDTO, 0, len(views))
+	for _, view := range views {
+		suts = append(suts, toSUTDTO(view))
+	}
+	repos := make([]codeRepositoryDTO, 0, len(repositories))
+	for _, view := range repositories {
+		repos = append(repos, toCodeRepositoryDTO(view))
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{
+		"suts":         suts,
+		"repositories": repos,
+	})
 }
 
 // ---------- SUT ----------
