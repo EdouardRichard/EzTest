@@ -150,6 +150,61 @@ describe("useVersionEvents", () => {
     expect(onVersionChanged).toHaveBeenCalledTimes(1)
   })
 
+  it("routes P2 design events to the design handlers", () => {
+    const onDesignGraphChanged = vi.fn()
+    const onDesignCaseChanged = vi.fn()
+    const onDesignRoundChanged = vi.fn()
+    const onDesignExportReady = vi.fn()
+    render(
+      createElement(Harness, {
+        handlers: {
+          onDesignGraphChanged,
+          onDesignCaseChanged,
+          onDesignRoundChanged,
+          onDesignExportReady,
+        },
+      }),
+    )
+
+    connectOptions.onEvent({
+      event: "message",
+      data: eventFrame("design.graph_delta", {
+        requirement_id: "6001",
+        case_ids: ["7001"],
+        op: "propose",
+      }),
+    })
+    for (const type of [
+      "design.case_version_created",
+      "design.case_version_stale",
+      "design.case_version_superseded",
+      "design.case_confirmed",
+    ]) {
+      connectOptions.onEvent({
+        event: "message",
+        data: eventFrame(type, { requirement_id: "6001" }),
+      })
+    }
+    connectOptions.onEvent({
+      event: "message",
+      data: eventFrame("design.round_started", { round_id: "8101" }),
+    })
+    connectOptions.onEvent({
+      event: "message",
+      data: eventFrame("design.scope_activated", { round_id: "8101" }),
+    })
+    connectOptions.onEvent({
+      event: "message",
+      data: eventFrame("design.export_ready", { export_id: "9001", format: "markdown" }),
+    })
+
+    expect(onDesignGraphChanged).toHaveBeenCalledTimes(1)
+    expect(onDesignCaseChanged).toHaveBeenCalledTimes(4)
+    expect(onDesignRoundChanged).toHaveBeenCalledTimes(2)
+    expect(onDesignExportReady).toHaveBeenCalledTimes(1)
+    expect(onDesignExportReady.mock.calls[0][0].type).toBe("design.export_ready")
+  })
+
   it("ignores unknown event types and malformed payloads", () => {
     const onConversationMessage = vi.fn()
     const onRequirementChanged = vi.fn()

@@ -122,7 +122,7 @@ export type ConversationMessage = {
 }
 
 export type CreateConversationRequest = {
-  kind: "clarification"
+  kind: ConversationKind
   title?: string
 }
 

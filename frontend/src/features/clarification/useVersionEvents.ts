@@ -19,6 +19,14 @@ export type VersionEventHandlers = {
   onTeamRoomChanged?: (event: VersionEvent) => void
   /** `version.started` / `version.status_changed`. */
   onVersionChanged?: (event: VersionEvent) => void
+  /** `design.graph_delta`: refetch the design graph snapshot. */
+  onDesignGraphChanged?: (event: VersionEvent) => void
+  /** `design.case_version_*` / `design.case_confirmed`: refresh graph and case detail. */
+  onDesignCaseChanged?: (event: VersionEvent) => void
+  /** `design.round_started` / `design.scope_activated`: refresh overview and conversations. */
+  onDesignRoundChanged?: (event: VersionEvent) => void
+  /** `design.export_ready`: refresh export history. */
+  onDesignExportReady?: (event: VersionEvent) => void
   /** Connection state for the status indicator. */
   onStatus?: (status: SSEStatus) => void
 }
@@ -75,6 +83,22 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
         case "version.started":
         case "version.status_changed":
           handlersRef.current.onVersionChanged?.(event)
+          break
+        case "design.graph_delta":
+          handlersRef.current.onDesignGraphChanged?.(event)
+          break
+        case "design.case_version_created":
+        case "design.case_version_stale":
+        case "design.case_version_superseded":
+        case "design.case_confirmed":
+          handlersRef.current.onDesignCaseChanged?.(event)
+          break
+        case "design.round_started":
+        case "design.scope_activated":
+          handlersRef.current.onDesignRoundChanged?.(event)
+          break
+        case "design.export_ready":
+          handlersRef.current.onDesignExportReady?.(event)
           break
         default:
           if (event.type.startsWith("requirement.")) {
