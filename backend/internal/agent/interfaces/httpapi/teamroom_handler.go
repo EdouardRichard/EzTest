@@ -19,14 +19,23 @@ type TeamRoomService interface {
 	Read(ctx context.Context, versionID int64, team string, limit int) (agentapp.TeamRoomView, error)
 }
 
-// TeamRoomHandler serves GET /api/versions/{id}/team-rooms/{team}.
-type TeamRoomHandler struct {
-	svc TeamRoomService
+// VersionReader reports whether a version exists. It is a local port so the
+// agent context never imports the version application package; cmd/eztest
+// adapts versionapp.Service to it.
+type VersionReader interface {
+	Exists(ctx context.Context, id int64) (bool, error)
 }
 
-// NewTeamRoom builds the team-room read handler.
-func NewTeamRoom(svc TeamRoomService) *TeamRoomHandler {
-	return &TeamRoomHandler{svc: svc}
+// TeamRoomHandler serves GET /api/versions/{id}/team-rooms/{team}.
+type TeamRoomHandler struct {
+	svc      TeamRoomService
+	versions VersionReader
+}
+
+// NewTeamRoom builds the team-room read handler. versions is required: the
+// endpoint must return 404 for an unknown version instead of an empty view.
+func NewTeamRoom(svc TeamRoomService, versions VersionReader) *TeamRoomHandler {
+	return &TeamRoomHandler{svc: svc, versions: versions}
 }
 
 var _ TeamRoomService = (*agentapp.TeamRoom)(nil)
@@ -49,6 +58,15 @@ func (h *TeamRoomHandler) Read(w http.ResponseWriter, r *http.Request) {
 	limit, err := parseLimit(r.URL.Query().Get("limit"))
 	if err != nil {
 		httpx.Error(w, r, err)
+		return
+	}
+	exists, err := h.versions.Exists(r.Context(), versionID)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	if !exists {
+		httpx.Error(w, r, platform.NotFound("version"))
 		return
 	}
 	view, err := h.svc.Read(r.Context(), versionID, string(team), limit)

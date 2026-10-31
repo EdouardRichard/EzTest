@@ -3,6 +3,7 @@ package agentapi_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -38,13 +39,29 @@ func (s *stubTeamRoomService) Read(_ context.Context, versionID int64, team stri
 
 var _ agentapi.TeamRoomService = (*stubTeamRoomService)(nil)
 
-func newHandlerServer(t *testing.T) (http.Handler, *stubTeamRoomService) {
+type stubVersionReader struct {
+	exists bool
+	err    error
+	calls  int
+	lastID int64
+}
+
+func (s *stubVersionReader) Exists(_ context.Context, id int64) (bool, error) {
+	s.calls++
+	s.lastID = id
+	return s.exists, s.err
+}
+
+var _ agentapi.VersionReader = (*stubVersionReader)(nil)
+
+func newHandlerServer(t *testing.T) (http.Handler, *stubTeamRoomService, *stubVersionReader) {
 	t.Helper()
 	stub := &stubTeamRoomService{}
-	handler := agentapi.NewTeamRoom(stub)
+	versions := &stubVersionReader{exists: true}
+	handler := agentapi.NewTeamRoom(stub, versions)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/versions/{id}/team-rooms/{team}", handler.Read)
-	return mux, stub
+	return mux, stub, versions
 }
 
 func teamRoomRequest(t *testing.T, handler http.Handler, path string, actor *platform.Actor) *httptest.ResponseRecorder {
@@ -106,12 +123,15 @@ func sampleRoomView() agentapp.TeamRoomView {
 }
 
 func TestTeamRoomReadReturnsDigestAndPosts(t *testing.T) {
-	handler, stub := newHandlerServer(t)
+	handler, stub, versions := newHandlerServer(t)
 	stub.view = sampleRoomView()
 
 	recorder := teamRoomRequest(t, handler, "/api/versions/10/team-rooms/clarification", &platform.Actor{ID: 42})
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if versions.calls != 1 || versions.lastID != 10 {
+		t.Fatalf("version reader = %#v", versions)
 	}
 	if stub.calls != 1 || stub.lastVer != 10 || stub.lastTeam != "clarification" || stub.lastLim != 20 {
 		t.Fatalf("service call = %#v", stub)
@@ -162,7 +182,7 @@ func TestTeamRoomReadReturnsDigestAndPosts(t *testing.T) {
 }
 
 func TestTeamRoomReadParsesLimit(t *testing.T) {
-	handler, stub := newHandlerServer(t)
+	handler, stub, versions := newHandlerServer(t)
 	stub.view = sampleRoomView()
 
 	recorder := teamRoomRequest(t, handler, "/api/versions/10/team-rooms/design?limit=5", &platform.Actor{ID: 42})
@@ -171,6 +191,9 @@ func TestTeamRoomReadParsesLimit(t *testing.T) {
 	}
 	if stub.lastLim != 5 || stub.lastTeam != "design" {
 		t.Fatalf("args = %d/%q", stub.lastLim, stub.lastTeam)
+	}
+	if versions.calls != 1 {
+		t.Fatalf("version reader calls = %d", versions.calls)
 	}
 
 	for _, limit := range []string{"0", "abc", "101", "-1"} {
@@ -186,7 +209,7 @@ func TestTeamRoomReadParsesLimit(t *testing.T) {
 }
 
 func TestTeamRoomReadValidationAndErrors(t *testing.T) {
-	handler, stub := newHandlerServer(t)
+	handler, stub, versions := newHandlerServer(t)
 	stub.view = sampleRoomView()
 
 	t.Run("invalid team", func(t *testing.T) {
@@ -208,8 +231,8 @@ func TestTeamRoomReadValidationAndErrors(t *testing.T) {
 		if recorder.Code != http.StatusBadRequest {
 			t.Fatalf("status = %d", recorder.Code)
 		}
-		if stub.calls != 0 {
-			t.Fatalf("service called for invalid id")
+		if stub.calls != 0 || versions.calls != 0 {
+			t.Fatalf("service/versions called for invalid id")
 		}
 	})
 
@@ -218,7 +241,7 @@ func TestTeamRoomReadValidationAndErrors(t *testing.T) {
 		if recorder.Code != http.StatusUnauthorized {
 			t.Fatalf("status = %d", recorder.Code)
 		}
-		if stub.calls != 0 {
+		if stub.calls != 0 || versions.calls != 0 {
 			t.Fatalf("service called without actor")
 		}
 	})
@@ -236,8 +259,46 @@ func TestTeamRoomReadValidationAndErrors(t *testing.T) {
 	})
 }
 
+func TestTeamRoomReadVersionNotFound(t *testing.T) {
+	handler, stub, versions := newHandlerServer(t)
+	versions.exists = false
+	stub.view = sampleRoomView()
+
+	recorder := teamRoomRequest(t, handler, "/api/versions/99/team-rooms/clarification", &platform.Actor{ID: 42})
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	errorBody := decodePayload(t, recorder)["error"].(map[string]any)
+	if errorBody["code"] != "not_found" {
+		t.Fatalf("error = %#v", errorBody)
+	}
+	if stub.calls != 0 {
+		t.Fatalf("service called for missing version")
+	}
+	if versions.calls != 1 || versions.lastID != 99 {
+		t.Fatalf("version reader = %#v", versions)
+	}
+}
+
+func TestTeamRoomReadVersionReaderError(t *testing.T) {
+	handler, stub, versions := newHandlerServer(t)
+	versions.err = errors.New("version lookup failed")
+
+	recorder := teamRoomRequest(t, handler, "/api/versions/10/team-rooms/clarification", &platform.Actor{ID: 42})
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	errorBody := decodePayload(t, recorder)["error"].(map[string]any)
+	if errorBody["code"] != "internal" {
+		t.Fatalf("error = %#v", errorBody)
+	}
+	if stub.calls != 0 {
+		t.Fatalf("service called after version reader error")
+	}
+}
+
 func TestTeamRoomReadEmptyDigestAndPosts(t *testing.T) {
-	handler, stub := newHandlerServer(t)
+	handler, stub, _ := newHandlerServer(t)
 	stub.view = agentapp.TeamRoomView{Team: "clarification", Digest: nil, Posts: []agent.TeamRoomPost{}}
 
 	recorder := teamRoomRequest(t, handler, "/api/versions/10/team-rooms/clarification", &platform.Actor{ID: 42})
