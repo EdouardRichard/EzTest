@@ -37,6 +37,25 @@
 //   GET  /p6/assert-fail  -> page whose result text contradicts the expectation.
 //   GET  /p6/requires-auth-> authenticated page that 302s to /p6/login.
 // Existing routes and their behavior are unchanged.
+//
+// P3 additive two-system execution fixtures (design spec §13.1):
+//   GET/POST /p3/login    -> form login; the payments FIXTURE_VARIANT supports
+//                            ?mfa=1: a valid password renders the #mfa code
+//                            challenge and code 246810 completes the login.
+//   GET  /p3/home         -> session-guarded landing page (p3_session cookie).
+//   GET  /p3/orders       -> order list containing ORD-1001 (paid, 5200.00).
+//   GET  /p3/orders/{id}  -> order detail; amount "¥5,200.00" and
+//                            #refund-amount "¥5,000.00" (mismatch on purpose).
+//   GET/POST /p3/refund   -> refund form / in-memory refund creation.
+//   GET  /p3/payments     -> refund list (REF-5001, ¥5,000.00, created).
+//   GET  /p3/2fa          -> standalone MFA page; POST code 246810 logs in.
+//   GET  /p3/slow?ms=8000 -> deliberately slow page for pause tests.
+//   GET  /p3/timeout-window?ms=10000 -> #confirm-dialog stays visible for ms,
+//                            then is removed and #window-expired appears
+//                            (ms is supported up to 120000).
+//   GET  /api/p3/orders, /api/p3/payments -> JSON list endpoints.
+//   FIXTURE_VARIANT=orders|payments selects the demo system (default orders);
+//   FIXTURE_PORT selects the loopback port. No dependencies and loopback only.
 
 const http = require("node:http");
 
@@ -543,6 +562,379 @@ function loginPage(message) {
 `;
 }
 
+// --- P3 execution fixtures (design spec §13.1) -----------------------------
+
+const P3_USERNAME = "fixture";
+const P3_PASSWORD = "fixture-pass";
+const P3_MFA_CODE = "246810";
+const P3_COOKIE = "p3_session";
+const P3_SESSION_VALUE = "ok";
+const P3_VARIANT = process.env.FIXTURE_VARIANT === "payments" ? "payments" : "orders";
+const P3_REFUND_AMOUNT = "5000.00";
+
+const P3_ORDERS = [
+  {
+    id: 1,
+    number: "ORD-1001",
+    amount: "5200.00",
+    currency: "CNY",
+    status: "paid",
+  },
+];
+
+// Seeded refund for order 1. Its amount (5000.00) intentionally differs from the
+// paid amount (5200.00) so an application-level failure case stays available.
+const P3_REFUNDS = [
+  {
+    id: 1,
+    refundNumber: "REF-5001",
+    orderId: 1,
+    amount: P3_REFUND_AMOUNT,
+    currency: "CNY",
+    status: "created",
+  },
+];
+let p3RefundSequence = 1;
+
+function p3VariantName() {
+  return P3_VARIANT === "payments" ? "Payment Gateway" : "Order Center";
+}
+
+/** Formats a numeric string ("5200.00") as the fixture's "¥5,200.00" text. */
+function p3FormatAmount(amount) {
+  const parts = String(amount).split(".");
+  const whole = parts[0] || "0";
+  const fraction = (parts[1] || "00").padEnd(2, "0").slice(0, 2);
+  return "¥" + whole.replace(/\B(?=(\d{3})+(?!\d))/g, ",") + "." + fraction;
+}
+
+function p3SessionCookie() {
+  return `${P3_COOKIE}=${P3_SESSION_VALUE}; HttpOnly; Path=/; SameSite=Lax`;
+}
+
+function p3Authorized(req) {
+  return readCookie(req, P3_COOKIE) === P3_SESSION_VALUE;
+}
+
+function p3LoginForm(mfa) {
+  const action = mfa ? "/p3/login?mfa=1" : "/p3/login";
+  return `
+    <form method="post" action="${action}">
+      <label for="username">Username</label>
+      <input id="username" name="username" type="text" autocomplete="username" required />
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required />
+      <button type="submit">Sign in</button>
+    </form>`;
+}
+
+function p3Page(title, body) {
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>P3 ${title}</title>
+  </head>
+  <body>
+    <main>
+      ${body}
+    </main>
+  </body>
+</html>
+`;
+}
+
+function p3LoginPage(message, mfa) {
+  const error = message ? `<p class="error" role="alert">${message}</p>` : "";
+  const hint = mfa
+    ? `<p class="login-hint">A verification code is required after the password.</p>`
+    : "";
+  return p3Page(
+    `${p3VariantName()} Login`,
+    `<h1>P3 ${p3VariantName()} Login</h1>
+      ${error}
+      ${hint}
+      ${p3LoginForm(mfa)}`,
+  );
+}
+
+function p3MfaPage(message, action) {
+  const error = message ? `<p class="error" role="alert">${message}</p>` : "";
+  const target = action || "/p3/login?mfa=1";
+  return p3Page(
+    "Two-factor authentication",
+    `<h1>P3 Two-factor authentication</h1>
+      ${error}
+      <section id="mfa" aria-label="Two-factor challenge">
+        <h2>Verification required</h2>
+        <p>Enter the 6-digit verification code to continue.</p>
+        <form method="post" action="${target}">
+          <label for="mfa-code">Verification code</label>
+          <input id="mfa-code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" required />
+          <button type="submit">Verify code</button>
+        </form>
+      </section>`,
+  );
+}
+
+function p3HomePage(req) {
+  const signedIn = p3Authorized(req)
+    ? `<p id="session-state">Signed in as ${P3_USERNAME}.</p>`
+    : "";
+  return p3Page(
+    p3VariantName(),
+    `<h1 id="p3-home">P3 ${p3VariantName()}</h1>
+      ${signedIn}
+      <p>EzTest P3 two-system execution fixture (${P3_VARIANT}).</p>
+      <nav aria-label="P3 navigation">
+        <a href="/p3/orders">Orders</a>
+        <a href="/p3/payments">Payments</a>
+        <a href="/p3/timeout-window">Timeout window</a>
+        <a href="/p3/slow">Slow page</a>
+        <a href="/p3/2fa">Two-factor authentication</a>
+        <a href="/p3/logout">Logout</a>
+      </nav>`,
+  );
+}
+
+function p3OrdersPage() {
+  const rows = P3_ORDERS.map(
+    (order) =>
+      `<li><a href="/p3/orders/${order.id}">${order.number}</a> <span class="order-status">${order.status}</span> <span class="order-amount">${p3FormatAmount(order.amount)} (${order.amount} ${order.currency})</span></li>`,
+  ).join("\n        ");
+  return p3Page(
+    "Orders",
+    `<h1>P3 ${p3VariantName()} Orders</h1>
+      <nav aria-label="P3 navigation">
+        <a href="/p3/home">Home</a>
+        <a href="/p3/payments">Payments</a>
+      </nav>
+      <ul id="orders">
+        ${rows}
+      </ul>`,
+  );
+}
+
+function p3OrderPage(order) {
+  return p3Page(
+    `Order ${order.id}`,
+    `<h1>P3 Order ${order.id}</h1>
+      <dl>
+        <dt>Number</dt><dd id="order-number">${order.number}</dd>
+        <dt>Status</dt><dd id="order-status">${order.status}</dd>
+        <dt>Amount</dt><dd id="order-amount">${p3FormatAmount(order.amount)}</dd>
+        <dt>Refund amount</dt><dd id="refund-amount">${p3FormatAmount(P3_REFUND_AMOUNT)}</dd>
+      </dl>
+      <p id="refund-note">The refund amount does not match the paid amount.</p>
+      <a href="/p3/orders">Order list</a>
+      <a href="/p3/refund?order_id=${order.id}">Create refund</a>`,
+  );
+}
+
+function p3OrderNotFoundPage() {
+  return p3Page(
+    "Order not found",
+    `<h1>P3 Order not found</h1>
+      <a href="/p3/orders">Order list</a>`,
+  );
+}
+
+function p3RefundPage(orderId) {
+  return p3Page(
+    "Refund",
+    `<h1>P3 Create refund</h1>
+      <form method="post" action="/p3/refund">
+        <input type="hidden" name="order_id" value="${orderId}" />
+        <label for="refund-amount-input">Refund amount</label>
+        <input id="refund-amount-input" name="amount" type="text" value="${P3_REFUND_AMOUNT}" required />
+        <label for="refund-reason">Reason</label>
+        <input id="refund-reason" name="reason" type="text" value="customer request" />
+        <button type="submit">Create refund</button>
+      </form>
+      <a href="/p3/orders/1">Back to order</a>`,
+  );
+}
+
+function p3PaymentsPage() {
+  const rows = P3_REFUNDS.map((refund) => {
+    const order = P3_ORDERS.find((candidate) => candidate.id === refund.orderId);
+    const orderNumber = order ? order.number : "ORD-?";
+    return `<li data-refund-number="${refund.refundNumber}"><span class="refund-number">${refund.refundNumber}</span> <span class="refund-amount">${p3FormatAmount(refund.amount)} (${refund.amount} ${refund.currency})</span> <span class="refund-status">${refund.status}</span> <a href="/p3/orders/${refund.orderId}">${orderNumber}</a></li>`;
+  }).join("\n        ");
+  return p3Page(
+    "Payments",
+    `<h1>P3 ${p3VariantName()} Payments</h1>
+      <nav aria-label="P3 navigation">
+        <a href="/p3/home">Home</a>
+        <a href="/p3/orders">Orders</a>
+      </nav>
+      <ul id="refunds">
+        ${rows}
+      </ul>`,
+  );
+}
+
+function p3ErrorPage(message) {
+  return p3Page(
+    "Error",
+    `<h1>P3 Error</h1>
+      <p class="error" role="alert">${message}</p>`,
+  );
+}
+
+function p3OrdersPayload() {
+  return {
+    variant: P3_VARIANT,
+    orders: P3_ORDERS.map((order) => ({
+      id: order.id,
+      order_number: order.number,
+      amount: order.amount,
+      currency: order.currency,
+      status: order.status,
+      amount_display: p3FormatAmount(order.amount),
+    })),
+  };
+}
+
+function p3PaymentsPayload() {
+  return {
+    variant: P3_VARIANT,
+    refunds: P3_REFUNDS.map((refund) => ({
+      id: refund.id,
+      refund_number: refund.refundNumber,
+      order_id: refund.orderId,
+      amount: refund.amount,
+      currency: refund.currency,
+      status: refund.status,
+    })),
+  };
+}
+
+/** Creates one in-memory refund and returns it. */
+function p3CreateRefund(orderId, amount) {
+  p3RefundSequence += 1;
+  const refund = {
+    id: p3RefundSequence,
+    refundNumber: "REF-" + (5000 + p3RefundSequence),
+    orderId,
+    amount: amount.toFixed(2),
+    currency: "CNY",
+    status: "created",
+  };
+  P3_REFUNDS.push(refund);
+  return refund;
+}
+
+function p3OrderById(rawId) {
+  const id = Number.parseInt(rawId, 10);
+  return P3_ORDERS.find((order) => order.id === id) || null;
+}
+
+/** GET renders the form; POST validates credentials and the optional second factor. */
+function handleP3LoginGet(req, res, mfa) {
+  sendHtml(res, 200, p3LoginPage("", mfa));
+}
+
+async function handleP3LoginPost(req, res, mfa) {
+  const raw = await readBody(req);
+  const form = new URLSearchParams(raw);
+  const code = form.get("code");
+  if (code !== null) {
+    // Second stage: the password was already accepted and no session exists yet.
+    if (code.trim() === P3_MFA_CODE) {
+      redirect(res, "/p3/home", { "Set-Cookie": p3SessionCookie() });
+      return;
+    }
+    sendHtml(res, 401, p3MfaPage("Invalid verification code"));
+    return;
+  }
+  const username = form.get("username") || "";
+  const password = form.get("password") || "";
+  if (username !== P3_USERNAME || password !== P3_PASSWORD) {
+    sendHtml(res, 401, p3LoginPage("Invalid username or password", mfa));
+    return;
+  }
+  if (mfa) {
+    // Password accepted, but the second factor is outstanding: no session cookie
+    // is issued so the execution Agent has to request the human takeover.
+    sendHtml(res, 200, p3MfaPage(""));
+    return;
+  }
+  redirect(res, "/p3/home", { "Set-Cookie": p3SessionCookie() });
+}
+
+async function handleP3TwoFactorPost(req, res) {
+  const raw = await readBody(req);
+  const code = new URLSearchParams(raw).get("code") || "";
+  if (code.trim() !== P3_MFA_CODE) {
+    sendHtml(res, 401, p3MfaPage("Invalid verification code", "/p3/2fa"));
+    return;
+  }
+  redirect(res, "/p3/home", { "Set-Cookie": p3SessionCookie() });
+}
+
+async function handleP3RefundPost(req, res) {
+  const raw = await readBody(req);
+  const form = new URLSearchParams(raw);
+  const orderId = Number.parseInt(form.get("order_id") || "", 10);
+  const amount = Number.parseFloat((form.get("amount") || "").trim());
+  const order = p3OrderById(orderId);
+  if (order === null) {
+    sendHtml(res, 400, p3ErrorPage("Unknown order for the refund"));
+    return;
+  }
+  if (!Number.isFinite(amount) || amount <= 0) {
+    sendHtml(res, 400, p3ErrorPage("Refund amount must be a positive number"));
+    return;
+  }
+  p3CreateRefund(order.id, amount);
+  redirect(res, "/p3/payments");
+}
+
+function p3TimeoutWindowPage(ms) {
+  const countdownSeconds = Math.max(1, Math.ceil(ms / 1000));
+  return p3Page(
+    "Timeout window",
+    `<h1>P3 Timeout Window</h1>
+      <p id="window-meta" data-ms="${ms}">Closes after ${ms} ms.</p>
+      <div id="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+        <h2 id="confirm-title">Confirm refund</h2>
+        <p>This confirmation window closes automatically in <span id="countdown">${countdownSeconds}</span> seconds.</p>
+        <button id="confirm-button" type="button">Confirm</button>
+      </div>
+      <p id="window-expired" hidden></p>
+      <script>
+        (function () {
+          var ms = ${ms};
+          var remaining = ${countdownSeconds};
+          var countdown = document.getElementById("countdown");
+          var ticker = setInterval(function () {
+            remaining -= 1;
+            if (countdown && remaining > 0) countdown.textContent = String(remaining);
+          }, 1000);
+          setTimeout(function () {
+            clearInterval(ticker);
+            var dialog = document.getElementById("confirm-dialog");
+            if (dialog && dialog.parentNode) dialog.parentNode.removeChild(dialog);
+            var expired = document.getElementById("window-expired");
+            if (expired) {
+              expired.hidden = false;
+              expired.textContent = "The confirmation window expired after " + ms + " ms.";
+            }
+          }, ms);
+        })();
+      </script>`,
+  );
+}
+
+function p3SlowPage(delay) {
+  return p3Page(
+    "Slow",
+    `<h1>P3 Slow</h1>
+      <p id="slow-result">Slow response complete after ${delay} ms.</p>`,
+  );
+}
+
 // --- handlers --------------------------------------------------------------
 
 async function handleLogin(req, res) {
@@ -844,6 +1236,141 @@ async function handleRequest(req, res) {
     return;
   }
 
+  // --- P3 additive two-system execution fixtures (design spec §13.1) ------
+  // The routes below are new and leave every existing route untouched.
+  if (pathname === "/p3/login") {
+    if (req.method !== "GET" && req.method !== "POST" && req.method !== "HEAD") {
+      sendMethodNotAllowed(res, ["GET", "POST"]);
+      return;
+    }
+    const mfa = requestUrl.searchParams.get("mfa") === "1";
+    if (req.method === "POST") {
+      await handleP3LoginPost(req, res, mfa);
+      return;
+    }
+    handleP3LoginGet(req, res, mfa);
+    return;
+  }
+  if (pathname === "/p3/logout") {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      sendMethodNotAllowed(res, ["GET", "HEAD"]);
+      return;
+    }
+    redirect(res, "/p3/login", {
+      "Set-Cookie": `${P3_COOKIE}=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax`,
+    });
+    return;
+  }
+  if (pathname === "/p3/2fa") {
+    if (req.method !== "GET" && req.method !== "POST" && req.method !== "HEAD") {
+      sendMethodNotAllowed(res, ["GET", "POST"]);
+      return;
+    }
+    if (req.method === "POST") {
+      await handleP3TwoFactorPost(req, res);
+      return;
+    }
+    sendHtml(res, 200, p3MfaPage("", "/p3/2fa"));
+    return;
+  }
+  if (pathname === "/p3/home") {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      sendMethodNotAllowed(res, ["GET", "HEAD"]);
+      return;
+    }
+    if (!p3Authorized(req)) {
+      redirect(res, "/p3/login");
+      return;
+    }
+    sendHtml(res, 200, p3HomePage(req));
+    return;
+  }
+  if (pathname === "/p3/orders") {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      sendMethodNotAllowed(res, ["GET", "HEAD"]);
+      return;
+    }
+    sendHtml(res, 200, p3OrdersPage());
+    return;
+  }
+  if (pathname === "/p3/refund") {
+    if (req.method !== "GET" && req.method !== "POST" && req.method !== "HEAD") {
+      sendMethodNotAllowed(res, ["GET", "POST"]);
+      return;
+    }
+    if (req.method === "POST") {
+      await handleP3RefundPost(req, res);
+      return;
+    }
+    const rawOrderId = Number.parseInt(requestUrl.searchParams.get("order_id") || "1", 10);
+    sendHtml(res, 200, p3RefundPage(Number.isFinite(rawOrderId) ? rawOrderId : 1));
+    return;
+  }
+  if (pathname === "/p3/payments") {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      sendMethodNotAllowed(res, ["GET", "HEAD"]);
+      return;
+    }
+    sendHtml(res, 200, p3PaymentsPage());
+    return;
+  }
+  if (pathname === "/p3/slow") {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      sendMethodNotAllowed(res, ["GET", "HEAD"]);
+      return;
+    }
+    const rawDelay = Number.parseInt(requestUrl.searchParams.get("ms") || "", 10);
+    const delay = Number.isFinite(rawDelay) ? Math.min(Math.max(rawDelay, 0), 120000) : 8000;
+    setTimeout(() => {
+      sendHtml(res, 200, p3SlowPage(delay));
+    }, delay);
+    return;
+  }
+  if (pathname === "/p3/timeout-window") {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      sendMethodNotAllowed(res, ["GET", "HEAD"]);
+      return;
+    }
+    const rawWindow = Number.parseInt(requestUrl.searchParams.get("ms") || "", 10);
+    const windowMs = Number.isFinite(rawWindow)
+      ? Math.min(Math.max(rawWindow, 0), 300000)
+      : 10000;
+    sendHtml(res, 200, p3TimeoutWindowPage(windowMs));
+    return;
+  }
+
+  const p3OrderPagePath = /^\/p3\/orders\/(\d+)$/.exec(pathname);
+  if (p3OrderPagePath !== null) {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      sendMethodNotAllowed(res, ["GET", "HEAD"]);
+      return;
+    }
+    const order = p3OrderById(p3OrderPagePath[1]);
+    if (order === null) {
+      sendHtml(res, 404, p3OrderNotFoundPage());
+      return;
+    }
+    sendHtml(res, 200, p3OrderPage(order));
+    return;
+  }
+
+  if (pathname === "/api/p3/orders") {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      sendMethodNotAllowed(res, ["GET", "HEAD"]);
+      return;
+    }
+    sendJson(res, 200, p3OrdersPayload());
+    return;
+  }
+  if (pathname === "/api/p3/payments") {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      sendMethodNotAllowed(res, ["GET", "HEAD"]);
+      return;
+    }
+    sendJson(res, 200, p3PaymentsPayload());
+    return;
+  }
+
   sendText(res, 404, "not found");
 }
 
@@ -871,6 +1398,7 @@ server.on("error", (error) => {
 
 server.listen(PORT, HOST, () => {
   console.log("fixture-target listening on http://" + HOST + ":" + PORT);
+  console.log("fixture-target variant: " + P3_VARIANT);
 });
 
 for (const signal of ["SIGINT", "SIGTERM"]) {
