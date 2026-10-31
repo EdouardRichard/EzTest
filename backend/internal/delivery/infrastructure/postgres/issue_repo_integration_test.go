@@ -10,6 +10,7 @@ import (
 	deliveryapp "github.com/EdouardRichard/EzTest/backend/internal/delivery/application"
 	delivery "github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -258,15 +259,70 @@ func TestIssueRepoCreateCandidate(t *testing.T) {
 	if err != nil || got.ID != created.ID {
 		t.Fatalf("Get = %+v err=%v", got, err)
 	}
-	if _, err := repo.Get(ctx, 200, created.ID); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("Get wrong version error = %v, want ErrNotFound", err)
+	if _, err := repo.Get(ctx, 200, created.ID); !errors.Is(err, delivery.ErrNotFound) {
+		t.Fatalf("Get wrong version error = %v, want delivery.ErrNotFound", err)
 	}
 	byID, err := repo.GetByID(ctx, created.ID)
 	if err != nil || byID.ID != created.ID || byID.VersionID != 100 {
 		t.Fatalf("GetByID = %+v err=%v", byID, err)
 	}
-	if _, err := repo.GetByID(ctx, 999999); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("GetByID missing error = %v, want ErrNotFound", err)
+	if _, err := repo.GetByID(ctx, 999999); !errors.Is(err, delivery.ErrNotFound) {
+		t.Fatalf("GetByID missing error = %v, want delivery.ErrNotFound", err)
+	}
+}
+
+// TestIssueRepoNotFoundSentinel pins the miss classification of every
+// read/write path: the returned error must satisfy errors.Is against the
+// delivery domain sentinel (so callers never import this adapter) and must
+// still unwrap to pgx.ErrNoRows. The adapter-level ErrNotFound stays usable for
+// compatibility.
+func TestIssueRepoNotFoundSentinel(t *testing.T) {
+	repo, _ := newIssueRepoForTest(t)
+	ctx := context.Background()
+
+	_, getErr := repo.Get(ctx, 100, 999999)
+	if !errors.Is(getErr, delivery.ErrNotFound) {
+		t.Fatalf("Get missing error = %v, want errors.Is(delivery.ErrNotFound)", getErr)
+	}
+	if !errors.Is(getErr, pgx.ErrNoRows) {
+		t.Fatalf("Get missing error = %v, want errors.Is(pgx.ErrNoRows)", getErr)
+	}
+	if !errors.Is(getErr, ErrNotFound) {
+		t.Fatalf("Get missing error = %v, want compatibility errors.Is(ErrNotFound)", getErr)
+	}
+
+	_, byIDErr := repo.GetByID(ctx, 999999)
+	if !errors.Is(byIDErr, delivery.ErrNotFound) {
+		t.Fatalf("GetByID missing error = %v, want errors.Is(delivery.ErrNotFound)", byIDErr)
+	}
+	if !errors.Is(byIDErr, pgx.ErrNoRows) {
+		t.Fatalf("GetByID missing error = %v, want errors.Is(pgx.ErrNoRows)", byIDErr)
+	}
+
+	_, updateErr := repo.UpdateStatus(ctx, deliveryapp.IssueStatusUpdate{
+		VersionID: 100,
+		IssueID:   999999,
+		To:        delivery.IssueStatusConfirmed,
+		ActorKind: "user",
+	})
+	if !errors.Is(updateErr, delivery.ErrNotFound) {
+		t.Fatalf("UpdateStatus missing error = %v, want errors.Is(delivery.ErrNotFound)", updateErr)
+	}
+	if !errors.Is(updateErr, pgx.ErrNoRows) {
+		t.Fatalf("UpdateStatus missing error = %v, want errors.Is(pgx.ErrNoRows)", updateErr)
+	}
+
+	_, mergeErr := repo.Merge(ctx, deliveryapp.IssueMerge{
+		VersionID: 100,
+		SourceID:  999999,
+		TargetID:  888888,
+		ActorID:   55,
+	})
+	if !errors.Is(mergeErr, delivery.ErrNotFound) {
+		t.Fatalf("Merge missing source error = %v, want errors.Is(delivery.ErrNotFound)", mergeErr)
+	}
+	if !errors.Is(mergeErr, pgx.ErrNoRows) {
+		t.Fatalf("Merge missing source error = %v, want errors.Is(pgx.ErrNoRows)", mergeErr)
 	}
 }
 
@@ -399,16 +455,16 @@ func TestIssueRepoUpdateStatusCAS(t *testing.T) {
 		IssueID:   999999,
 		To:        delivery.IssueStatusConfirmed,
 		ActorKind: "user",
-	}); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("missing issue update error = %v, want ErrNotFound", err)
+	}); !errors.Is(err, delivery.ErrNotFound) {
+		t.Fatalf("missing issue update error = %v, want delivery.ErrNotFound", err)
 	}
 	if _, err := repo.UpdateStatus(ctx, deliveryapp.IssueStatusUpdate{
 		VersionID: 200,
 		IssueID:   issue.ID,
 		To:        delivery.IssueStatusConfirmed,
 		ActorKind: "user",
-	}); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("cross-version update error = %v, want ErrNotFound", err)
+	}); !errors.Is(err, delivery.ErrNotFound) {
+		t.Fatalf("cross-version update error = %v, want delivery.ErrNotFound", err)
 	}
 }
 
@@ -504,8 +560,8 @@ func TestIssueRepoMerge(t *testing.T) {
 	}
 	if _, err := repo.Merge(ctx, deliveryapp.IssueMerge{
 		VersionID: 100, SourceID: 999999, TargetID: target.ID, ActorID: 55,
-	}); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("missing source merge error = %v, want ErrNotFound", err)
+	}); !errors.Is(err, delivery.ErrNotFound) {
+		t.Fatalf("missing source merge error = %v, want delivery.ErrNotFound", err)
 	}
 
 	// A stale expected_revision is rejected and leaves the source open.
@@ -768,7 +824,7 @@ func TestIssueRepoForeignKeyCascade(t *testing.T) {
 	if refCount != 0 || historyCount != 0 {
 		t.Fatalf("cascade left refs=%d history=%d", refCount, historyCount)
 	}
-	if _, err := repo.GetByID(ctx, issue.ID); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("deleted issue lookup error = %v, want ErrNotFound", err)
+	if _, err := repo.GetByID(ctx, issue.ID); !errors.Is(err, delivery.ErrNotFound) {
+		t.Fatalf("deleted issue lookup error = %v, want delivery.ErrNotFound", err)
 	}
 }

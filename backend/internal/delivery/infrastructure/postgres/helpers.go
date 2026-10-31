@@ -21,11 +21,12 @@ type execer interface {
 	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
 }
 
-// ErrNotFound reports a missing delivery_issue row. The frozen delivery domain
-// ports only define ErrInvalidArgument and ErrStateConflict, so the adapter owns
-// the not-found sentinel. It wraps pgx.ErrNoRows, therefore both
-// errors.Is(err, ErrNotFound) and errors.Is(err, pgx.ErrNoRows) classify a miss.
-var ErrNotFound = fmt.Errorf("delivery: issue not found: %w", pgx.ErrNoRows)
+// ErrNotFound reports a missing delivery_issue row. It wraps both the delivery
+// domain sentinel and pgx.ErrNoRows: callers classify a miss with
+// errors.Is(err, delivery.ErrNotFound) without importing this adapter, while
+// errors.Is(err, pgx.ErrNoRows) keeps working. The adapter-local name is kept
+// for compatibility with earlier call sites.
+var ErrNotFound = fmt.Errorf("%w: %w", delivery.ErrNotFound, pgx.ErrNoRows)
 
 // wrapDB adds operation context and maps pgx's empty result onto ErrNotFound.
 func wrapDB(op string, err error) error {

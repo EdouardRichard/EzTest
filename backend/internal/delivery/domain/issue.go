@@ -9,6 +9,8 @@ var (
 	ErrInvalidArgument = errors.New("delivery: invalid argument")
 	// ErrStateConflict reports an illegal issue lifecycle transition.
 	ErrStateConflict = errors.New("delivery: state conflict")
+	// ErrNotFound reports a missing delivery entity.
+	ErrNotFound = errors.New("not found")
 )
 
 // MaxIssueMergeChain bounds how many merged_into hops ValidateMerge follows
