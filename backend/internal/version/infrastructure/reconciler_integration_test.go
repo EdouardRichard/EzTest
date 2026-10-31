@@ -71,7 +71,9 @@ func TestReconcilerReadPorts(t *testing.T) {
 		t.Fatalf("append assistant message: %v", err)
 	}
 
-	// A design conversation with a message is not reconcilable.
+	// A design conversation is reconcilable too: design chat replies use the
+	// same turn pipeline (P2). It must appear in the read model with its
+	// messages so the reconciler can apply design conversation rules.
 	design := version.Conversation{
 		ID: ids.Next(), VersionID: withMessage.ID, Kind: "design", Title: "Design",
 		Status: version.ConversationActive, CreatedAt: testTime, UpdatedAt: testTime,
@@ -110,19 +112,23 @@ func TestReconcilerReadPorts(t *testing.T) {
 	}
 
 	// 2) reconcilable conversations: clarification (including empty ones, so
-	// the opening fallback can fire), newest first, messages ascending with the
-	// assistant run's profile key.
+	// the opening fallback can fire) and design conversations, newest first,
+	// messages ascending with the assistant run's profile key.
 	reconcilable, err := conversationRepo.ListReconcilable(ctx, 100)
 	if err != nil {
 		t.Fatalf("ListReconcilable: %v", err)
 	}
-	if len(reconcilable) != 2 || reconcilable[0].ID != emptyConversation.ID || reconcilable[1].ID != conversation.ID {
+	if len(reconcilable) != 3 || reconcilable[0].ID != emptyConversation.ID ||
+		reconcilable[1].ID != design.ID || reconcilable[2].ID != conversation.ID {
 		t.Fatalf("reconcilable = %#v", reconcilable)
 	}
 	if len(reconcilable[0].Messages) != 0 {
 		t.Fatalf("empty conversation messages = %#v", reconcilable[0].Messages)
 	}
-	messages := reconcilable[1].Messages
+	if len(reconcilable[1].Messages) != 1 || reconcilable[1].Messages[0].Role != "assistant" {
+		t.Fatalf("design conversation messages = %#v", reconcilable[1].Messages)
+	}
+	messages := reconcilable[2].Messages
 	if len(messages) != 2 || messages[0].ID != userMessage.ID || messages[1].ID != assistant.ID {
 		t.Fatalf("messages = %#v", messages)
 	}
