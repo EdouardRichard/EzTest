@@ -10,6 +10,18 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// VersionTitle returns the version title used by exports.
+func (r *Repository) VersionTitle(ctx context.Context, versionID int64) (string, error) {
+	var title string
+	if err := r.pool.QueryRow(ctx, `SELECT title FROM version WHERE id = $1`, versionID).Scan(&title); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", design.ErrNotFound
+		}
+		return "", fmt.Errorf("read version title: %w", err)
+	}
+	return title, nil
+}
+
 // ReadGraph assembles the full version design graph snapshot.
 func (r *Repository) ReadGraph(ctx context.Context, versionID int64) (design.GraphData, error) {
 	graph := design.GraphData{VersionID: versionID, Requirements: []design.RequirementGraph{}}

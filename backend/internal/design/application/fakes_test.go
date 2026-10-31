@@ -110,6 +110,8 @@ type fakeRepo struct {
 	versionStatus      string
 	versionLockCalls   int
 	updatedRoundIDs    []int64
+	versionTitle       string
+	caseDataByID       map[int64]design.CaseData
 }
 
 type fakeCase struct {
@@ -214,6 +216,9 @@ func (f *fakeRepo) ReadGraph(_ context.Context, versionID int64) (design.GraphDa
 }
 
 func (f *fakeRepo) ReadCase(_ context.Context, versionID, caseID int64, caseVersionID *int64) (design.CaseData, error) {
+	if data, ok := f.caseDataByID[caseID]; ok {
+		return data, nil
+	}
 	if f.caseData.Case.ID != 0 {
 		return f.caseData, nil
 	}
@@ -236,6 +241,13 @@ func (f *fakeRepo) Overview(_ context.Context, versionID int64) (design.Overview
 	overview := f.overview
 	overview.PendingDesignCount = f.pending
 	return overview, nil
+}
+
+func (f *fakeRepo) VersionTitle(_ context.Context, versionID int64) (string, error) {
+	if f.versionTitle == "" {
+		return "测试版本", nil
+	}
+	return f.versionTitle, nil
 }
 
 func (f *fakeRepo) WithRequirementLock(ctx context.Context, versionID, requirementID int64, fn func(context.Context, design.Tx) error) error {

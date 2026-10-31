@@ -168,6 +168,7 @@ type GraphRepository interface {
 	ReadCase(ctx context.Context, versionID, caseID int64, caseVersionID *int64) (CaseData, error)
 	VersionContext(ctx context.Context, versionID int64) (VersionContext, error)
 	RequirementContext(ctx context.Context, versionID, requirementID int64) (RequirementRef, error)
+	VersionTitle(ctx context.Context, versionID int64) (string, error)
 	Overview(ctx context.Context, versionID int64) (OverviewData, error)
 }
 

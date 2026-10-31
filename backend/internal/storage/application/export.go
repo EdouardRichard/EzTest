@@ -38,8 +38,10 @@ func NewExportService(repo ExportRepository, content ContentLedger, ids platform
 	return &ExportService{repo: repo, content: content, ids: ids, clock: clk}
 }
 
-// CreateExportInput is one export creation request.
+// CreateExportInput is one export creation request. A caller that needs the
+// artifact ID up front (for the filename) supplies ID; zero allocates one.
 type CreateExportInput struct {
+	ID        int64
 	VersionID int64
 	OwnerID   int64
 	OwnerKind string
@@ -88,7 +90,10 @@ func (s *ExportService) Create(ctx context.Context, in CreateExportInput, actorI
 	if err != nil {
 		return storage.ExportArtifact{}, err
 	}
-	artifactID := s.ids.Next()
+	artifactID := in.ID
+	if artifactID <= 0 {
+		artifactID = s.ids.Next()
+	}
 	object, err := s.content.Upload(ctx, filename, mime, bytes.NewReader(in.Data), MaxUploadBytes, actorID)
 	if err != nil {
 		return storage.ExportArtifact{}, err
