@@ -1,0 +1,3397 @@
+openapi: 3.0.3
+info:
+  title: EzTest 0.2 P0 Platform Foundation API
+  version: 0.2.0-p0
+  description: |
+    EzTest 0.2 P0（平台底座）对外 REST/SSE 契约，来源：
+    `docs/superpowers/specs/2026-10-31-eztest-v02-p0-platform-foundation-design.md` §7/§8/§9。
+
+    ## 通用约定
+
+    - 成功 JSON 响应统一为 `{"data": ...}`；列表统一为
+      `{"data": [...], "next_cursor": "<id|null>", "has_more": bool}`。
+      没有响应体的成功操作返回 204（登出、改密、重置密码、各 DELETE）。
+    - 错误统一为
+      `{"error": {"code": "...", "message": "...", "request_id": "...", "retryable": false, "details": {}}}`；
+      HTTP 状态码使用 400/401/403/404/409/413/500/503。`X-Request-ID` 在响应头回显。
+    - 所有业务实体 ID 在 JSON/URL 中都是十进制字符串（Go 内部 int64）。例外：
+      `Event.seq` 与 `snapshot_cursor` 是**频道内事件游标**（整数），不是业务实体 ID；
+      `content_object.sha256` 是 64 位小写 hex 内容主键；设置键 `system_setting.key` 是自然键。
+    - 时间一律 RFC3339 UTC；未知请求字段默认忽略；写请求使用
+      `Content-Type: application/json`（上传除外）。
+    - 鉴权：`Authorization: Bearer <token>`。公开端点只有 `/healthz`、`/api/health`、
+      `/api/auth/login`。Token 为不透明随机串，固定 7 天 TTL，不刷新。
+    - 权限：`admin` 组要求 `role=admin`；资源读为登录用户、写为 admin；**代码仓读/写均为登录用户**；
+      版本读/写均为登录用户；`/api/events` 与 `/api/stream` 为登录用户。
+
+    ## 幂等
+
+    **P0 不实现通用 `Idempotency-Key` 请求头，也不保证任意写请求的重复提交幂等。**
+    后续阶段（波次/确认/导出）按设计单独接入幂等语义；调用方不得假设本阶段的写请求具有
+    幂等重放能力。数据库唯一约束带来的重复键错误映射为 409 `conflict`。
+
+    ## 列表分页
+
+    `limit` 默认 20、上限 100；`cursor` 是上一页最后一个实体的十进制 ID。
+    `has_more=false` 时 `next_cursor` 为 `null`（实现也可能返回空串）。
+    事件快照使用 `after`/`snapshot_cursor` 游标，见 `/api/events`。
+
+    ## 事件流
+
+    `GET /api/events` 返回频道快照（最新一页或 `after` 之后的事件）；
+    `GET /api/stream` 返回 SSE。SSE 帧为 `id: <seq>`、`event: <type>`、`data: <Event JSON>`，
+    每 20 秒一行心跳注释；游标过旧时发送合成 `event: stream.reset`（无 id、不持久化）。
+    事件通道仅允许 `system`、`version:{id}`、`user:{id}`；P0 只发布 `system` 与 `version:{id}`。
+    P0 SSE Hub 为单进程内实现，多副本实时 fan-out 属 P7，不在此契约承诺内。
+
+    ## 冻结
+
+    `x-frozen: P0` —— 本文件在 P0 阶段末冻结；后续阶段只能增量修改，破坏性变更需更新本目录
+    与决策记录并同步调用方/测试/迁移/handoff。
+x-frozen: P0
+servers:
+  - url: http://localhost:13333
+    description: 本地开发默认 API（端口来自 EZTEST_API_PORT，默认 13333）
+security:
+  - bearerAuth: []
+tags:
+  - name: Health
+    description: 公开存活/就绪探针
+  - name: Auth
+    description: 登录、登出、当前用户、自助改密
+  - name: AdminUsers
+    description: 管理员用户管理
+  - name: AdminSettings
+    description: 系统设置中心
+  - name: AdminLLM
+    description: LLM 配置与模型目录（P0 只做配置/目录/连通性，不含 chat 网关）
+  - name: AdminAudit
+    description: 审计日志查询
+  - name: Events
+    description: 事件快照与 SSE
+  - name: Content
+    description: 内容对象上传/下载
+  - name: Resources
+    description: SUT/环境/页面/API/目标库/测试账号/代码仓
+  - name: Versions
+    description: 版本与多 SUT 绑定
+
+paths:
+  /healthz:
+    get:
+      tags: [Health]
+      operationId: getLiveness
+      summary: 存活探针（公开）
+      security: []
+      responses:
+        '200':
+          description: 进程存活；固定 `{"status":"ok"}`（不套 data 信封）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+  /api/health:
+    get:
+      tags: [Health]
+      operationId: getReadiness
+      summary: 就绪探针（公开）
+      description: DB ping、版本、settings_loaded、executor_url。DB 不可用时返回 503 且 `data.status=degraded`。
+      security: []
+      responses:
+        '200':
+          description: 就绪
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/HealthData'
+        '503':
+          description: DB 不可用（degraded）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/HealthData'
+  /api/auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: 用户名/密码登录（公开）
+      description: |
+        成功返回明文 token 与过期时间；DB 只存 token 的 SHA-256。错误密码/禁用用户返回 401。
+        默认管理员由启动种子创建：`admin` / `admin123`（仅开发/测试受控环境）。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: 登录成功
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Session'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: 撤销当前 token
+      responses:
+        '204':
+          description: 已登出，无响应体
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/auth/me:
+    get:
+      tags: [Auth]
+      operationId: getMe
+      summary: 当前登录用户
+      responses:
+        '200':
+          description: 当前用户
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/auth/password:
+    post:
+      tags: [Auth]
+      operationId: changePassword
+      summary: 自助改密（旧密码 + 新密码）
+      description: 新密码 8–128 字符；成功后旧 token 仍有效（P0 不强制重登），审计 `auth.password_changed`。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangePasswordRequest'
+      responses:
+        '204':
+          description: 修改成功，无响应体
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/admin/users:
+    get:
+      tags: [AdminUsers]
+      operationId: listUsers
+      summary: 用户列表（admin）
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: 用户分页（按 id 倒序）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [AdminUsers]
+      operationId: createUser
+      summary: 创建普通用户（admin）
+      description: 只能创建 `role=user`；用户名 `^[a-zA-Z0-9_.-]{3,64}$` 创建后不可改；密码 8–128。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateUserRequest'
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/admin/users/{id}:
+    patch:
+      tags: [AdminUsers]
+      operationId: updateUser
+      summary: 更新显示名/状态（admin）
+      description: 不允许提升为 admin，不允许禁用唯一 admin。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserRequest'
+      responses:
+        '200':
+          description: 更新后的用户
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/admin/users/{id}/reset-password:
+    post:
+      tags: [AdminUsers]
+      operationId: resetUserPassword
+      summary: 重置用户密码（admin）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResetPasswordRequest'
+      responses:
+        '204':
+          description: 已重置，无响应体
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/admin/settings:
+    get:
+      tags: [AdminSettings]
+      operationId: listSettings
+      summary: 全部设置（admin，secret 掩码）
+      description: 返回完整目录（P0 为 44 个键），secret 项的 `value` 固定为 `null`。
+      responses:
+        '200':
+          description: 设置数组（不分页）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Setting'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/admin/settings/revisions:
+    get:
+      tags: [AdminSettings]
+      operationId: listSettingRevisions
+      summary: 设置变更历史（admin）
+      parameters:
+        - name: key
+          in: query
+          required: true
+          description: 设置键
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: revision 分页（按 id 倒序）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/SettingRevision'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/admin/settings/{key}:
+    get:
+      tags: [AdminSettings]
+      operationId: getSetting
+      summary: 读取单项设置（admin）
+      parameters:
+        - $ref: '#/components/parameters/SettingKey'
+      responses:
+        '200':
+          description: 设置项
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Setting'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    patch:
+      tags: [AdminSettings]
+      operationId: updateSetting
+      summary: 更新单项设置（admin）
+      description: |
+        校验 key 存在与类型/区间 → 写 revision → 更新 setting（version+1）→ 失效缓存 →
+        发 `settings.updated` 事件 → 审计。更新后立即热加载。
+        secret 项：`value` 省略或 `null` 表示不修改，`""` 表示清空；GET/revision 中 secret 值置 `null`。
+        `restart_required=true` 只做 UI 提示，不阻断更新。
+      parameters:
+        - $ref: '#/components/parameters/SettingKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateSettingRequest'
+      responses:
+        '200':
+          description: 更新后的设置项
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Setting'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/admin/llm/configs:
+    get:
+      tags: [AdminLLM]
+      operationId: listLLMConfigs
+      summary: LLM 配置列表（admin）
+      responses:
+        '200':
+          description: 配置数组（不分页）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/LLMConfig'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [AdminLLM]
+      operationId: createLLMConfig
+      summary: 创建 LLM 配置（admin）
+      description: api_key 明文入库、响应只返回 api_key_set；默认配置唯一。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateLLMConfigRequest'
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/LLMConfig'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/admin/llm/configs/{id}:
+    get:
+      tags: [AdminLLM]
+      operationId: getLLMConfig
+      summary: LLM 配置详情（admin）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: 配置详情
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/LLMConfig'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    patch:
+      tags: [AdminLLM]
+      operationId: updateLLMConfig
+      summary: 更新 LLM 配置（admin）
+      description: 省略字段保持不变；`api_key=""` 清空 key。默认配置唯一（互斥切换）。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateLLMConfigRequest'
+      responses:
+        '200':
+          description: 更新后的配置
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/LLMConfig'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+    delete:
+      tags: [AdminLLM]
+      operationId: deleteLLMConfig
+      summary: 删除 LLM 配置（admin）
+      description: 级联删除其模型目录项。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '204':
+          description: 已删除，无响应体
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/admin/llm/configs/{id}/test:
+    post:
+      tags: [AdminLLM]
+      operationId: testLLMConfig
+      summary: LLM 连通性测试（admin）
+      description: 使用已存配置请求上游（models 或小 chat）；不泄露 key。上游不可达返回 503。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: 测试结果
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/LLMTestResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/admin/llm/configs/{id}/refresh-models:
+    post:
+      tags: [AdminLLM]
+      operationId: refreshLLMModels
+      summary: 拉取并覆盖模型目录（admin）
+      description: 调用上游 `GET {base_url}/models`，按 `(config_id, model)` upsert；失败 503 且不写库。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: 该配置的最新模型目录
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/LLMModel'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/admin/llm/configs/{id}/models:
+    post:
+      tags: [AdminLLM]
+      operationId: addLLMModel
+      summary: 手工新增模型（admin）
+      description: source=manual；同一配置下 model 唯一。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddLLMModelRequest'
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/LLMModel'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/admin/llm/configs/{id}/models/{modelId}:
+    delete:
+      tags: [AdminLLM]
+      operationId: deleteLLMModel
+      summary: 删除模型（admin）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/ModelID'
+      responses:
+        '204':
+          description: 已删除，无响应体
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/admin/llm/models:
+    get:
+      tags: [AdminLLM]
+      operationId: listLLMModels
+      summary: 全部模型（admin）
+      responses:
+        '200':
+          description: 模型数组（不分页）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/LLMModel'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/admin/audit-logs:
+    get:
+      tags: [AdminAudit]
+      operationId: listAuditLogs
+      summary: 审计日志查询（admin）
+      parameters:
+        - name: action
+          in: query
+          required: false
+          description: 精确匹配 action，如 `auth.login`
+          schema:
+            type: string
+        - name: actor
+          in: query
+          required: false
+          description: 操作者用户 ID（十进制字符串）
+          schema:
+            type: string
+            pattern: '^[0-9]+$'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: 审计分页（按 id 倒序）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/AuditLogEntry'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/events:
+    get:
+      tags: [Events]
+      operationId: listEvents
+      summary: 事件快照（登录用户）
+      description: |
+        - `after` 省略/0：取该频道**最新** `limit` 条，按 seq 正序返回；
+        - `after>0`：取 seq > after 的事件，按 seq 正序返回；
+        - `snapshot_cursor` 为请求时刻该频道最新 seq；`has_more` 表示还有更多。
+        `limit` 默认 50、上限 200。未知 channel 或非法游标返回 400。
+      parameters:
+        - $ref: '#/components/parameters/EventChannel'
+        - $ref: '#/components/parameters/EventAfter'
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        '200':
+          description: 事件快照
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventSnapshotEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/stream:
+    get:
+      tags: [Events]
+      operationId: streamEvents
+      summary: 事件 SSE 流（登录用户）
+      description: |
+        `Last-Event-ID` 头优先于 `after` 查询参数。
+        有游标：先订阅进程内 Hub，再回放 DB 中游标之后的事件，最后接实时；
+        无游标：从当前 last_seq 之后只订阅实时（响应头 `X-Snapshot-Cursor` 给出当前末尾）。
+        帧：`id: <seq>`、`event: <type>`、`data: <Event JSON>`；每 20s 心跳注释。
+        游标过旧（`after > last_seq` 或 `after < min(seq)-1`）发送合成
+        `event: stream.reset`（无 id、不持久化、不进入普通事件回调）；P0 不冻结该控制帧的 data 字段，
+        客户端收到后必须重新拉取快照。
+        401 返回 JSON 错误而不是 SSE。
+      parameters:
+        - $ref: '#/components/parameters/EventChannel'
+        - $ref: '#/components/parameters/EventAfter'
+        - $ref: '#/components/parameters/LastEventID'
+      responses:
+        '200':
+          description: SSE 流（长连接）
+          headers:
+            X-Snapshot-Cursor:
+              description: 连接建立时该频道最新 seq
+              schema:
+                type: integer
+                format: int64
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  SSE 文本流。示例：
+                  `id: 42\nevent: version.created\ndata: {"seq":42,...}\n\n`
+                  心跳为注释行（如 `: heartbeat`）；`stream.reset` 帧不带 id。
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/content:
+    post:
+      tags: [Content]
+      operationId: uploadContent
+      summary: 上传内容对象（登录用户，multipart，≤10 MiB）
+      description: |
+        multipart 字段名 `file`。服务端计算 SHA-256、以 `http.DetectContentType` 判定 MIME，
+        写入 `{paths.data_root}/objects/{sha[0:2]}/{sha[2:4]}/{sha}`；重复内容去重。
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        '201':
+          description: 已上传（重复上传返回同一内容对象）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/ContentObject'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          description: 超过 10 MiB 上限
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/content/{sha256}:
+    get:
+      tags: [Content]
+      operationId: downloadContent
+      summary: 下载内容对象（登录用户）
+      description: 校验 64 位小写 hex；读取时校验文件 SHA 与 DB 一致。响应不暴露文件系统路径。
+      parameters:
+        - $ref: '#/components/parameters/SHA256'
+      responses:
+        '200':
+          description: 二进制内容；实际 `Content-Type` 为该对象的存储 MIME（可能不是 application/octet-stream）
+          headers:
+            Content-Type:
+              description: 对象存储的 MIME（服务端 http.DetectContentType 判定）
+              schema:
+                type: string
+            X-Content-SHA256:
+              description: 内容 SHA-256（小写 hex）
+              schema:
+                type: string
+            Cache-Control:
+              description: 私有长缓存（private, max-age=31536000, immutable）
+              schema:
+                type: string
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/catalog:
+    get:
+      tags: [Resources]
+      operationId: getResourceCatalog
+      summary: 资源聚合（登录用户，版本创建用）
+      responses:
+        '200':
+          description: SUT（含环境/页面/API/库/账号）与代码仓
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Catalog'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/suts:
+    get:
+      tags: [Resources]
+      operationId: listSUTs
+      summary: SUT 列表（登录用户）
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: SUT 分页（按 id 倒序）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/SUT'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [Resources]
+      operationId: createSUT
+      summary: 创建 SUT（admin）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSUTRequest'
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/SUT'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/suts/{id}:
+    get:
+      tags: [Resources]
+      operationId: getSUT
+      summary: SUT 详情（登录用户）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: SUT 聚合（含环境/页面/API/库/账号）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/SUT'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    patch:
+      tags: [Resources]
+      operationId: updateSUT
+      summary: 更新 SUT（admin）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateSUTRequest'
+      responses:
+        '200':
+          description: 更新后的 SUT
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/SUT'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+    delete:
+      tags: [Resources]
+      operationId: deleteSUT
+      summary: 删除 SUT（admin）
+      description: 被任何版本绑定/scope 引用时返回 409 conflict。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '204':
+          description: 已删除，无响应体
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/suts/{id}/environments:
+    get:
+      tags: [Resources]
+      operationId: listEnvironments
+      summary: SUT 环境列表（登录用户）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: 环境分页（按 id 倒序）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Environment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [Resources]
+      operationId: createEnvironment
+      summary: 创建环境（admin）
+      description: 同一 SUT 下名称唯一；`is_default` 唯一（应用内事务 unset 其它默认环境）。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateEnvironmentRequest'
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Environment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/environments/{id}:
+    patch:
+      tags: [Resources]
+      operationId: updateEnvironment
+      summary: 更新环境（admin）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateEnvironmentRequest'
+      responses:
+        '200':
+          description: 更新后的环境
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Environment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+    delete:
+      tags: [Resources]
+      operationId: deleteEnvironment
+      summary: 删除环境（admin）
+      description: 被版本绑定/scope 引用时返回 409 conflict。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '204':
+          description: 已删除，无响应体
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/environments/{id}/pages:
+    get:
+      tags: [Resources]
+      operationId: listPages
+      summary: 环境页面列表（登录用户）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: 页面分页（按 id 倒序）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Page'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [Resources]
+      operationId: createPage
+      summary: 创建页面（admin）
+      description: |
+        `name`、`url` 必填；`url` 必须是完整 http(s)；`route_template` 以 `/` 开头，
+        省略时从 URL path 派生。P0 写入 `status=approved`、`source=admin`。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePageRequest'
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Page'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/pages/{id}:
+    patch:
+      tags: [Resources]
+      operationId: updatePage
+      summary: 更新页面（admin）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdatePageRequest'
+      responses:
+        '200':
+          description: 更新后的页面
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Page'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+    delete:
+      tags: [Resources]
+      operationId: deletePage
+      summary: 删除页面（admin）
+      description: 被版本 scope 引用时返回 409 conflict。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '204':
+          description: 已删除，无响应体
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/environments/{id}/pages/import:
+    post:
+      tags: [Resources]
+      operationId: importPages
+      summary: 批量导入页面（admin）
+      description: 请求 `{items:[...]}`；逐项校验，重复键跳过；返回 created/skipped/items；任一非法项整体 400（details.field 指出 index）。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImportPagesRequest'
+      responses:
+        '200':
+          description: 导入结果
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/PageImportResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/environments/{id}/apis:
+    get:
+      tags: [Resources]
+      operationId: listAPIs
+      summary: 环境 API 列表（登录用户）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: API 分页（按 id 倒序）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/SutApi'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [Resources]
+      operationId: createAPI
+      summary: 创建 API（admin）
+      description: method 枚举；`path_template` 以 `/` 开头；P0 写入 `status=approved`、`source=manual`。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAPIRequest'
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/SutApi'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/apis/{id}:
+    patch:
+      tags: [Resources]
+      operationId: updateAPI
+      summary: 更新 API（admin）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAPIRequest'
+      responses:
+        '200':
+          description: 更新后的 API
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/SutApi'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+    delete:
+      tags: [Resources]
+      operationId: deleteAPI
+      summary: 删除 API（admin）
+      description: 被版本 scope 引用时返回 409 conflict。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '204':
+          description: 已删除，无响应体
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/environments/{id}/apis/import:
+    post:
+      tags: [Resources]
+      operationId: importAPIs
+      summary: 批量导入 API（admin）
+      description: 请求 `{items:[...]}`；逐项校验，重复键跳过；返回 created/skipped/items；任一非法项整体 400。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImportAPIsRequest'
+      responses:
+        '200':
+          description: 导入结果
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/ApiImportResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/suts/{id}/databases:
+    get:
+      tags: [Resources]
+      operationId: listDatabases
+      summary: SUT 目标库列表（登录用户）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: 目标库分页（按 id 倒序）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/TargetDatabase'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [Resources]
+      operationId: createDatabase
+      summary: 创建目标库（admin）
+      description: 请求必须指定 `environment_id`；`dsn` 以 postgres:// 或 postgresql:// 开头；read_only 默认 true。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateDatabaseRequest'
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/TargetDatabase'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/databases/{id}:
+    patch:
+      tags: [Resources]
+      operationId: updateDatabase
+      summary: 更新目标库（admin）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateDatabaseRequest'
+      responses:
+        '200':
+          description: 更新后的目标库（密码只返回 password_set）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/TargetDatabase'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+    delete:
+      tags: [Resources]
+      operationId: deleteDatabase
+      summary: 删除目标库（admin）
+      description: 被版本绑定引用时返回 409 conflict。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '204':
+          description: 已删除，无响应体
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/suts/{id}/accounts:
+    get:
+      tags: [Resources]
+      operationId: listAccounts
+      summary: SUT 测试账号列表（登录用户）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: 账号分页（按 id 倒序）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/TestAccount'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [Resources]
+      operationId: createAccount
+      summary: 创建测试账号（admin）
+      description: 请求必须指定 `environment_id`；password 必填；响应只返回 `password_set`。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAccountRequest'
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/TestAccount'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/accounts/{id}:
+    patch:
+      tags: [Resources]
+      operationId: updateAccount
+      summary: 更新测试账号（admin）
+      description: password 省略表示保持原密码。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAccountRequest'
+      responses:
+        '200':
+          description: 更新后的账号（密码只返回 password_set）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/TestAccount'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+    delete:
+      tags: [Resources]
+      operationId: deleteAccount
+      summary: 删除测试账号（admin）
+      description: 被版本绑定引用时返回 409 conflict。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '204':
+          description: 已删除，无响应体
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/code-repos:
+    get:
+      tags: [Resources]
+      operationId: listCodeRepositories
+      summary: 代码仓列表（登录用户）
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: 代码仓分页（按 id 倒序）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/CodeRepository'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [Resources]
+      operationId: createCodeRepository
+      summary: 创建代码仓（任意登录用户）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCodeRepositoryRequest'
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CodeRepository'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/resources/code-repos/{id}:
+    get:
+      tags: [Resources]
+      operationId: getCodeRepository
+      summary: 代码仓详情（登录用户）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: 代码仓
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CodeRepository'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    patch:
+      tags: [Resources]
+      operationId: updateCodeRepository
+      summary: 更新代码仓（任意登录用户）
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateCodeRepositoryRequest'
+      responses:
+        '200':
+          description: 更新后的代码仓
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CodeRepository'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+    delete:
+      tags: [Resources]
+      operationId: deleteCodeRepository
+      summary: 删除代码仓（任意登录用户）
+      description: 被版本绑定引用时返回 409 conflict。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '204':
+          description: 已删除，无响应体
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions:
+    get:
+      tags: [Versions]
+      operationId: listVersions
+      summary: 版本列表（登录用户）
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: 版本分页（按 id 倒序）
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/VersionSummary'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [Versions]
+      operationId: createVersion
+      summary: 创建版本（登录用户）
+      description: |
+        1–20 个 binding；`sut_id` 不重复；环境/页面/API 必须属于同一 SUT+环境；页面/API ID 去重且保留排序；
+        库/账号属于该 SUT+环境；仓库必须存在。校验失败 400 并返回 `details.field`。
+        创建即 `initial`，事件 `version.created` 同时发到 `system` 与 `version:{id}`。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateVersionRequest'
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Version'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+  /api/versions/{id}:
+    get:
+      tags: [Versions]
+      operationId: getVersion
+      summary: 版本详情（登录用户）
+      description: 返回嵌套 bindings（SUT/环境/仓库/页面/API/库/账号摘要；密码永不返回）。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: 版本详情
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Version'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    patch:
+      tags: [Versions]
+      operationId: updateVersion
+      summary: 更新版本标题/开关（登录用户）
+      description: P0 只允许 `title`、`auto_design_new_requirements`；状态不可由 P0 API 修改。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateVersionRequest'
+      responses:
+        '200':
+          description: 更新后的版本
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Version'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+      description: 不透明 token（`ezt_` + base64url），固定 7 天 TTL。
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: 每页条数
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: 上一页最后一个实体的十进制 ID；省略表示第一页
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    ID:
+      name: id
+      in: path
+      required: true
+      description: 业务实体雪花 ID 的十进制字符串
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    ModelID:
+      name: modelId
+      in: path
+      required: true
+      description: 模型实体 ID 的十进制字符串
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    SettingKey:
+      name: key
+      in: path
+      required: true
+      description: 设置键（如 `execution.global_concurrency`）
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9_.-]+$'
+    SHA256:
+      name: sha256
+      in: path
+      required: true
+      description: 内容 SHA-256（64 位小写 hex）
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{64}$'
+    EventChannel:
+      name: channel
+      in: query
+      required: true
+      description: 事件频道；只允许 system / version:{id} / user:{id}
+      schema:
+        type: string
+        pattern: '^(system|version:[1-9][0-9]*|user:[1-9][0-9]*)$'
+    EventAfter:
+      name: after
+      in: query
+      required: false
+      description: 事件游标（频道内 seq）；省略/0 表示取最新一页（快照）或从当前末尾实时（SSE）
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+        default: 0
+    LastEventID:
+      name: Last-Event-ID
+      in: header
+      required: false
+      description: SSE 断线续传游标；存在时优先于 `after` 查询参数
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+  responses:
+    BadRequest:
+      description: 请求参数/请求体校验失败（invalid_argument）
+      headers:
+        X-Request-ID:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Unauthorized:
+      description: 未认证或 token 无效/过期（unauthenticated）
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+        X-Request-ID:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Forbidden:
+      description: 权限不足（forbidden）
+      headers:
+        X-Request-ID:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    NotFound:
+      description: 实体不存在（not_found）
+      headers:
+        X-Request-ID:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Conflict:
+      description: 唯一约束/状态冲突（conflict / state_conflict）
+      headers:
+        X-Request-ID:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Unavailable:
+      description: 依赖暂时不可用（unavailable，retryable=true）
+      headers:
+        X-Request-ID:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Internal:
+      description: 服务端错误（internal）
+      headers:
+        X-Request-ID:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+  schemas:
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, request_id, retryable, details]
+          properties:
+            code:
+              type: string
+              description: invalid_argument / unauthenticated / forbidden / not_found / conflict / state_conflict / unavailable / internal
+            message:
+              type: string
+            request_id:
+              type: string
+              description: 与响应头 X-Request-ID 相同
+            retryable:
+              type: boolean
+            details:
+              type: object
+              additionalProperties: true
+              description: '结构化细节；字段错误通常为 {"field": "..."}'
+    ListEnvelope:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items: {}
+        next_cursor:
+          type: string
+          nullable: true
+          description: 下一页游标（实体 ID 十进制字符串）；has_more=false 时为 null 或空串
+        has_more:
+          type: boolean
+    HealthData:
+      type: object
+      required: [status, version, db, settings_loaded, executor_url]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        version:
+          type: string
+        db:
+          type: string
+          enum: [ok, down]
+        settings_loaded:
+          type: boolean
+        executor_url:
+          type: string
+    User:
+      type: object
+      required: [id, username, display_name, role, status, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        username:
+          type: string
+        display_name:
+          type: string
+        role:
+          type: string
+          enum: [admin, user]
+        status:
+          type: string
+          enum: [active, disabled]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    Session:
+      type: object
+      required: [token, expires_at, user]
+      properties:
+        token:
+          type: string
+          description: 明文 token（仅登录响应返回一次）
+        expires_at:
+          type: string
+          format: date-time
+          description: 固定 7 天 TTL
+        user:
+          $ref: '#/components/schemas/User'
+    Setting:
+      type: object
+      required: [key, category, type, value, is_secret, restart_required, description, version, updated_at]
+      properties:
+        key:
+          type: string
+        category:
+          type: string
+        type:
+          type: string
+          enum: [string, number, boolean, json]
+        value:
+          nullable: true
+          description: 非 secret 为 JSON 值；secret 固定为 null
+        is_secret:
+          type: boolean
+        restart_required:
+          type: boolean
+        description:
+          type: string
+        version:
+          type: integer
+        updated_at:
+          type: string
+          format: date-time
+    SettingRevision:
+      type: object
+      required: [id, key, created_at]
+      properties:
+        id:
+          type: string
+        key:
+          type: string
+        old_value:
+          nullable: true
+          description: secret 项为 null
+        new_value:
+          nullable: true
+          description: secret 项为 null
+        actor_id:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+    LLMConfig:
+      type: object
+      required: [id, name, provider, protocol, base_url, api_key_set, headers, timeout_seconds, max_retries, is_default, status, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        provider:
+          type: string
+          description: P0 默认 openai（字段保留）
+        protocol:
+          type: string
+          enum: [openai, openai_compatible]
+        base_url:
+          type: string
+          format: uri
+        api_key_set:
+          type: boolean
+          description: 是否已配置 API key；明文 key 永不返回
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+        timeout_seconds:
+          type: integer
+          minimum: 1
+          maximum: 600
+        max_retries:
+          type: integer
+          minimum: 0
+          maximum: 10
+        is_default:
+          type: boolean
+        status:
+          type: string
+          enum: [active, disabled]
+        created_by:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    LLMModel:
+      type: object
+      required: [id, config_id, model, display_name, context_window, max_output, supports_tools, supports_vision, source, status, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        config_id:
+          type: string
+        model:
+          type: string
+        display_name:
+          type: string
+        context_window:
+          type: integer
+          minimum: 0
+        max_output:
+          type: integer
+          minimum: 0
+        supports_tools:
+          type: boolean
+        supports_vision:
+          type: boolean
+        source:
+          type: string
+          enum: [catalog, manual]
+        status:
+          type: string
+          enum: [active, disabled]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    RemoteModel:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+        context_window:
+          type: integer
+          minimum: 0
+        max_output:
+          type: integer
+          minimum: 0
+        supports_tools:
+          type: boolean
+        supports_vision:
+          type: boolean
+    LLMTestResult:
+      type: object
+      required: [ok, latency_ms, models]
+      properties:
+        ok:
+          type: boolean
+        latency_ms:
+          type: integer
+          format: int64
+          minimum: 0
+        models:
+          type: array
+          items:
+            $ref: '#/components/schemas/RemoteModel'
+        error:
+          type: string
+          description: 失败摘要（不包含 key）；成功时省略
+    AuditLogEntry:
+      type: object
+      required: [id, action, target_kind, target_id, request_id, ip, user_agent, metadata, created_at]
+      properties:
+        id:
+          type: string
+        actor_id:
+          type: string
+        action:
+          type: string
+        target_kind:
+          type: string
+        target_id:
+          type: string
+        request_id:
+          type: string
+        ip:
+          type: string
+        user_agent:
+          type: string
+        metadata:
+          type: object
+          additionalProperties: true
+        created_at:
+          type: string
+          format: date-time
+    Event:
+      type: object
+      required: [seq, channel, type, scope, payload, created_at]
+      properties:
+        seq:
+          type: integer
+          format: int64
+          minimum: 1
+          description: 频道内事件顺序号（不是业务实体 ID）；SSE id 即该值
+        channel:
+          type: string
+          description: system / version:{id} / user:{id}
+        type:
+          type: string
+          description: 事件类型，见 contracts/events.md
+        scope:
+          type: object
+          additionalProperties: true
+          description: 作用域 ID（字符串），如 {"version_id":"1001"}
+        payload:
+          type: object
+          additionalProperties: true
+          description: 事件负载；永不含密码/token/API key
+        actor_id:
+          type: string
+          nullable: true
+        request_id:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+    EventSnapshotEnvelope:
+      type: object
+      required: [data, snapshot_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Event'
+        snapshot_cursor:
+          type: integer
+          format: int64
+          minimum: 0
+          description: 请求时刻该频道最新 seq（不是业务实体 ID）
+        has_more:
+          type: boolean
+    ContentObject:
+      type: object
+      required: [sha256, size, mime, url]
+      properties:
+        sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        size:
+          type: integer
+          format: int64
+          minimum: 0
+        mime:
+          type: string
+        url:
+          type: string
+          description: 下载路径，如 /api/content/{sha256}
+    SUT:
+      type: object
+      required: [id, name, intro, environments, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        intro:
+          type: string
+        environments:
+          type: array
+          items:
+            $ref: '#/components/schemas/Environment'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    Environment:
+      type: object
+      required: [id, sut_id, name, base_url, is_default, status, pages, apis, databases, accounts, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        sut_id:
+          type: string
+        name:
+          type: string
+        base_url:
+          type: string
+          format: uri
+        is_default:
+          type: boolean
+        status:
+          type: string
+          enum: [active, disabled]
+        pages:
+          type: array
+          items:
+            $ref: '#/components/schemas/Page'
+        apis:
+          type: array
+          items:
+            $ref: '#/components/schemas/SutApi'
+        databases:
+          type: array
+          items:
+            $ref: '#/components/schemas/TargetDatabase'
+        accounts:
+          type: array
+          items:
+            $ref: '#/components/schemas/TestAccount'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    Page:
+      type: object
+      required: [id, sut_id, environment_id, name, url, route_template, page_type, auth_role, module, status, source, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        sut_id:
+          type: string
+        environment_id:
+          type: string
+        name:
+          type: string
+        url:
+          type: string
+          format: uri
+        route_template:
+          type: string
+        page_type:
+          type: string
+        auth_role:
+          type: string
+        module:
+          type: string
+        status:
+          type: string
+          enum: [approved, proposed, rejected]
+        source:
+          type: string
+          enum: [admin, ai, import]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    SutApi:
+      type: object
+      required: [id, sut_id, environment_id, method, path_template, name, auth_role, source, status, schema_ref, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        sut_id:
+          type: string
+        environment_id:
+          type: string
+        method:
+          type: string
+          enum: [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS]
+        path_template:
+          type: string
+        name:
+          type: string
+        auth_role:
+          type: string
+        source:
+          type: string
+          enum: [code, openapi, ai, manual, import]
+        status:
+          type: string
+          enum: [approved, proposed, rejected]
+        schema_ref:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    TargetDatabase:
+      type: object
+      required: [id, sut_id, environment_id, name, dsn, username, password_set, read_only, status, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        sut_id:
+          type: string
+        environment_id:
+          type: string
+        name:
+          type: string
+        dsn:
+          type: string
+        username:
+          type: string
+        password_set:
+          type: boolean
+          description: 密码永不返回，只返回是否已设置
+        read_only:
+          type: boolean
+        status:
+          type: string
+          enum: [active, disabled]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    TestAccount:
+      type: object
+      required: [id, sut_id, environment_id, username, roles, notes, password_set, status, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        sut_id:
+          type: string
+        environment_id:
+          type: string
+        username:
+          type: string
+        roles:
+          type: array
+          items:
+            type: string
+        notes:
+          type: string
+        password_set:
+          type: boolean
+        status:
+          type: string
+          enum: [active, disabled]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    CodeRepository:
+      type: object
+      required: [id, name, path, branch, include, exclude, created_by, status, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        path:
+          type: string
+        branch:
+          type: string
+        include:
+          type: array
+          items:
+            type: string
+        exclude:
+          type: array
+          items:
+            type: string
+        created_by:
+          type: string
+          description: 创建者用户 ID（与 created_at 同源；P0 CodeRepositoryView 的字段）
+        status:
+          type: string
+          enum: [active, disabled]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    Catalog:
+      type: object
+      required: [suts, repositories]
+      properties:
+        suts:
+          type: array
+          items:
+            $ref: '#/components/schemas/SUT'
+        repositories:
+          type: array
+          items:
+            $ref: '#/components/schemas/CodeRepository'
+    VersionSummary:
+      type: object
+      required: [id, title, status, sut_count, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        status:
+          type: string
+          enum: [initial, running, completed]
+        sut_count:
+          type: integer
+          minimum: 0
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    Version:
+      type: object
+      required: [id, title, status, auto_design_new_requirements, bindings, created_by, created_at, updated_at]
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        status:
+          type: string
+          enum: [initial, running, completed]
+        auto_design_new_requirements:
+          type: boolean
+        bindings:
+          type: array
+          items:
+            $ref: '#/components/schemas/Binding'
+        created_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    Binding:
+      type: object
+      required: [id, sut, environment, pages, apis, databases, accounts]
+      properties:
+        id:
+          type: string
+        sut:
+          $ref: '#/components/schemas/SUT'
+        environment:
+          $ref: '#/components/schemas/Environment'
+        repository:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/CodeRepository'
+        pages:
+          type: array
+          items:
+            $ref: '#/components/schemas/Page'
+        apis:
+          type: array
+          items:
+            $ref: '#/components/schemas/SutApi'
+        databases:
+          type: array
+          items:
+            $ref: '#/components/schemas/TargetDatabase'
+        accounts:
+          type: array
+          items:
+            $ref: '#/components/schemas/TestAccount'
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+    ChangePasswordRequest:
+      type: object
+      required: [old_password, new_password]
+      properties:
+        old_password:
+          type: string
+        new_password:
+          type: string
+          minLength: 8
+          maxLength: 128
+    CreateUserRequest:
+      type: object
+      required: [username, display_name, password]
+      properties:
+        username:
+          type: string
+          pattern: '^[a-zA-Z0-9_.-]{3,64}$'
+        display_name:
+          type: string
+        password:
+          type: string
+          minLength: 8
+          maxLength: 128
+    UpdateUserRequest:
+      type: object
+      properties:
+        display_name:
+          type: string
+        status:
+          type: string
+          enum: [active, disabled]
+    ResetPasswordRequest:
+      type: object
+      required: [password]
+      properties:
+        password:
+          type: string
+          minLength: 8
+          maxLength: 128
+    UpdateSettingRequest:
+      type: object
+      properties:
+        value:
+          nullable: true
+          description: 新值；非 secret 必填；secret 可省略或 null（表示不修改），空串表示清空
+    CreateLLMConfigRequest:
+      type: object
+      required: [name, base_url]
+      properties:
+        name:
+          type: string
+          maxLength: 100
+        provider:
+          type: string
+          default: openai
+        protocol:
+          type: string
+          enum: [openai, openai_compatible]
+          default: openai
+        base_url:
+          type: string
+          format: uri
+        api_key:
+          type: string
+          description: 写入值；永不回显
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+        timeout_seconds:
+          type: integer
+          minimum: 1
+          maximum: 600
+          default: 60
+        max_retries:
+          type: integer
+          minimum: 0
+          maximum: 10
+          default: 2
+        is_default:
+          type: boolean
+          default: false
+        status:
+          type: string
+          enum: [active, disabled]
+          default: active
+    UpdateLLMConfigRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          maxLength: 100
+        provider:
+          type: string
+        protocol:
+          type: string
+          enum: [openai, openai_compatible]
+        base_url:
+          type: string
+          format: uri
+        api_key:
+          type: string
+          description: 省略保持；空串清空
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+        timeout_seconds:
+          type: integer
+          minimum: 1
+          maximum: 600
+        max_retries:
+          type: integer
+          minimum: 0
+          maximum: 10
+        is_default:
+          type: boolean
+        status:
+          type: string
+          enum: [active, disabled]
+    AddLLMModelRequest:
+      type: object
+      required: [model]
+      properties:
+        model:
+          type: string
+          maxLength: 200
+        context_window:
+          type: integer
+          minimum: 0
+          default: 0
+        max_output:
+          type: integer
+          minimum: 0
+          default: 0
+        supports_tools:
+          type: boolean
+          default: false
+        supports_vision:
+          type: boolean
+          default: false
+    CreateSUTRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        intro:
+          type: string
+          maxLength: 2000
+          default: ''
+    UpdateSUTRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        intro:
+          type: string
+          maxLength: 2000
+    CreateEnvironmentRequest:
+      type: object
+      required: [name, base_url]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        base_url:
+          type: string
+          format: uri
+        is_default:
+          type: boolean
+          default: false
+        status:
+          type: string
+          enum: [active, disabled]
+          default: active
+    UpdateEnvironmentRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        base_url:
+          type: string
+          format: uri
+        is_default:
+          type: boolean
+        status:
+          type: string
+          enum: [active, disabled]
+    PageInput:
+      type: object
+      required: [name, url]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        url:
+          type: string
+          format: uri
+        route_template:
+          type: string
+          description: 以 / 开头；省略时从 URL path 派生
+        page_type:
+          type: string
+          default: page
+        auth_role:
+          type: string
+          default: ''
+        module:
+          type: string
+          default: ''
+    CreatePageRequest:
+      allOf:
+        - $ref: '#/components/schemas/PageInput'
+    UpdatePageRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        url:
+          type: string
+          format: uri
+        route_template:
+          type: string
+        page_type:
+          type: string
+        auth_role:
+          type: string
+        module:
+          type: string
+    ImportPagesRequest:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/PageInput'
+    PageImportResult:
+      type: object
+      required: [created, skipped, items]
+      properties:
+        created:
+          type: integer
+          minimum: 0
+        skipped:
+          type: integer
+          minimum: 0
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Page'
+    APIInput:
+      type: object
+      required: [method, path_template, name]
+      properties:
+        method:
+          type: string
+          enum: [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS]
+        path_template:
+          type: string
+          description: 以 / 开头
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        auth_role:
+          type: string
+          default: ''
+        schema_ref:
+          type: string
+          default: ''
+    CreateAPIRequest:
+      allOf:
+        - $ref: '#/components/schemas/APIInput'
+    UpdateAPIRequest:
+      type: object
+      properties:
+        method:
+          type: string
+          enum: [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS]
+        path_template:
+          type: string
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        auth_role:
+          type: string
+        schema_ref:
+          type: string
+    ImportAPIsRequest:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/APIInput'
+    ApiImportResult:
+      type: object
+      required: [created, skipped, items]
+      properties:
+        created:
+          type: integer
+          minimum: 0
+        skipped:
+          type: integer
+          minimum: 0
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SutApi'
+    CreateDatabaseRequest:
+      type: object
+      required: [environment_id, name, dsn, username]
+      properties:
+        environment_id:
+          type: string
+          pattern: '^[0-9]+$'
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        kind:
+          type: string
+          enum: [postgres]
+          default: postgres
+        dsn:
+          type: string
+          description: 以 postgres:// 或 postgresql:// 开头
+        username:
+          type: string
+          minLength: 1
+          maxLength: 100
+        password:
+          type: string
+          maxLength: 1000
+          default: ''
+        read_only:
+          type: boolean
+          default: true
+        status:
+          type: string
+          enum: [active, disabled]
+          default: active
+    UpdateDatabaseRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        kind:
+          type: string
+          enum: [postgres]
+        dsn:
+          type: string
+        username:
+          type: string
+          minLength: 1
+          maxLength: 100
+        password:
+          type: string
+          maxLength: 1000
+        read_only:
+          type: boolean
+        status:
+          type: string
+          enum: [active, disabled]
+    CreateAccountRequest:
+      type: object
+      required: [environment_id, username, password]
+      properties:
+        environment_id:
+          type: string
+          pattern: '^[0-9]+$'
+        username:
+          type: string
+          minLength: 1
+          maxLength: 100
+        password:
+          type: string
+          minLength: 1
+          maxLength: 1000
+        roles:
+          type: array
+          maxItems: 20
+          items:
+            type: string
+          default: []
+        notes:
+          type: string
+          maxLength: 2000
+          default: ''
+        status:
+          type: string
+          enum: [active, disabled]
+          default: active
+    UpdateAccountRequest:
+      type: object
+      properties:
+        username:
+          type: string
+          minLength: 1
+          maxLength: 100
+        password:
+          type: string
+          maxLength: 1000
+        roles:
+          type: array
+          maxItems: 20
+          items:
+            type: string
+        notes:
+          type: string
+          maxLength: 2000
+        status:
+          type: string
+          enum: [active, disabled]
+    CreateCodeRepositoryRequest:
+      type: object
+      required: [name, path]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        path:
+          type: string
+          minLength: 1
+          maxLength: 1000
+        branch:
+          type: string
+          maxLength: 200
+          default: ''
+        include:
+          type: array
+          maxItems: 100
+          items:
+            type: string
+          default: []
+        exclude:
+          type: array
+          maxItems: 100
+          items:
+            type: string
+          default: []
+        status:
+          type: string
+          enum: [active, disabled]
+          default: active
+    UpdateCodeRepositoryRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        path:
+          type: string
+          minLength: 1
+          maxLength: 1000
+        branch:
+          type: string
+          maxLength: 200
+        include:
+          type: array
+          maxItems: 100
+          items:
+            type: string
+        exclude:
+          type: array
+          maxItems: 100
+          items:
+            type: string
+        status:
+          type: string
+          enum: [active, disabled]
+    AccountInput:
+      type: object
+      required: [account_id]
+      properties:
+        account_id:
+          type: string
+          pattern: '^[0-9]+$'
+        role:
+          type: string
+          default: ''
+    BindingInput:
+      type: object
+      required: [sut_id, environment_id]
+      properties:
+        sut_id:
+          type: string
+          pattern: '^[0-9]+$'
+        environment_id:
+          type: string
+          pattern: '^[0-9]+$'
+        code_repository_id:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+        page_ids:
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9]+$'
+          default: []
+        api_ids:
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9]+$'
+          default: []
+        database_ids:
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9]+$'
+          default: []
+        accounts:
+          type: array
+          items:
+            $ref: '#/components/schemas/AccountInput'
+          default: []
+    CreateVersionRequest:
+      type: object
+      required: [title, bindings]
+      properties:
+        title:
+          type: string
+          minLength: 1
+        bindings:
+          type: array
+          minItems: 1
+          maxItems: 20
+          items:
+            $ref: '#/components/schemas/BindingInput'
+    UpdateVersionRequest:
+      type: object
+      properties:
+        title:
+          type: string
+          minLength: 1
+        auto_design_new_requirements:
+          type: boolean
