@@ -3,6 +3,7 @@ import { apiGet, apiGetPage, apiPatch, apiPost } from "@/lib/api-client"
 import type {
   Catalog,
   CreateVersionRequest,
+  ReopenVersionInput,
   UpdateVersionRequest,
   Version,
   VersionSummary,
@@ -27,6 +28,13 @@ export function createVersion(payload: CreateVersionRequest): Promise<Version> {
 /** Updates the version's auto-design flag (P2; no new settings keys). */
 export function updateVersion(id: string, payload: UpdateVersionRequest): Promise<Version> {
   return apiPatch<Version>(`/api/versions/${encodeURIComponent(id)}`, payload)
+}
+
+/** `POST /api/versions/{id}/reopen`: completed → running; reason is required. */
+export function reopenVersion(id: string, input: ReopenVersionInput): Promise<Version> {
+  return apiPost<Version>(`/api/versions/${encodeURIComponent(id)}/reopen`, {
+    reason: input.reason,
+  })
 }
 
 /** SUT/environment/page/API/database/account/repository catalog for the wizard. */

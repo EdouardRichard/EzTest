@@ -47,6 +47,41 @@ vi.mock("@/lib/sse-client", () => ({
   },
 }))
 
+const executionApi = vi.hoisted(() => ({ listHumanRequests: vi.fn() }))
+vi.mock("@/features/execution/api", () => executionApi)
+
+const versionsApi = vi.hoisted(() => ({ getVersion: vi.fn() }))
+vi.mock("@/features/versions/api", () => versionsApi)
+
+const humanRequest = {
+  id: "9501",
+  version_id: "2001",
+  case_run_id: "9301",
+  kind: "login_takeover",
+  status: "open",
+  payload: {
+    reason: "需要输入短信验证码",
+    version_sut_id: "3001",
+    account_role: "buyer",
+    page_url: "https://order.test/login",
+    challenge_kind: "sms",
+  },
+  expires_at: "2026-11-01T08:00:00Z",
+  created_at: "2026-11-01T07:00:00Z",
+}
+
+const versionFixture = {
+  id: "2001",
+  title: "订单中心 · 2026 Q4 迭代",
+  status: "running",
+  auto_design_new_requirements: false,
+  bindings: [],
+  pending_design_count: 0,
+  created_by: "9001",
+  created_at: "2026-10-31T10:00:00Z",
+  updated_at: "2026-10-31T10:00:00Z",
+}
+
 import { Topbar } from "./Topbar"
 
 describe("Topbar", () => {
@@ -58,6 +93,10 @@ describe("Topbar", () => {
     auth.changePassword.mockReset()
     nav.replace.mockReset()
     nav.pathname = "/issues"
+    executionApi.listHumanRequests.mockReset()
+    executionApi.listHumanRequests.mockResolvedValue([])
+    versionsApi.getVersion.mockReset()
+    versionsApi.getVersion.mockResolvedValue(versionFixture)
   })
 
   afterEach(cleanup)
@@ -111,5 +150,19 @@ describe("Topbar", () => {
 
     await waitFor(() => expect(auth.logout).toHaveBeenCalledTimes(1))
     expect(nav.replace).toHaveBeenCalledWith("/login")
+  })
+
+  it("shows the current-version todo entry and opens the drawer", async () => {
+    nav.pathname = "/versions/2001"
+    executionApi.listHumanRequests.mockResolvedValue([humanRequest])
+
+    render(<Topbar />)
+
+    const trigger = await screen.findByTestId("todo-drawer-trigger")
+    await waitFor(() => expect(trigger).toHaveTextContent("1"))
+    expect(executionApi.listHumanRequests).toHaveBeenCalledWith("2001", { status: "open" })
+
+    fireEvent.click(trigger)
+    expect(await screen.findByRole("dialog", { name: "待办" })).toBeInTheDocument()
   })
 })

@@ -10,6 +10,8 @@ import { getApiBaseUrl } from "@/lib/api-client"
 import { connectSSE, type SSEStatus } from "@/lib/sse-client"
 import { findNavItem } from "@/navigation/nav-items"
 
+import { TodoDrawerButton } from "./TodoDrawer"
+
 const STATUS_META: Record<SSEStatus, { label: string; dotClassName: string }> = {
   connecting: { label: "连接中", dotClassName: "bg-warning animate-pulse" },
   live: { label: "实时", dotClassName: "bg-success" },
@@ -53,6 +55,7 @@ export function Topbar() {
   const statusMeta = STATUS_META[status]
 
   const title = findNavItem(pathname)?.label ?? "EzTest"
+  const currentVersionId = /^\/versions\/([^/]+)(?:\/|$)/.exec(pathname)?.[1] ?? null
   const displayName = user?.display_name ?? "访客"
   const roleLabel = user ? (ROLE_LABELS[user.role] ?? user.role) : "未登录"
   const avatarText = displayName.slice(0, 1).toUpperCase()
@@ -80,6 +83,8 @@ export function Topbar() {
       </div>
 
       <div className="ml-auto flex items-center gap-2">
+        <TodoDrawerButton versionId={currentVersionId} />
+
         <span
           data-testid="sse-status"
           data-state={status}
