@@ -86,9 +86,12 @@ func NewClosureService(deps ClosureServiceDeps) *ClosureService {
 
 // Close recomputes the eight closure checks server-side and, when they all
 // pass, inserts the next closure round, marks the requirement closed and
-// publishes requirement.closed. Repeated Close on an already closed requirement
-// is idempotent and returns the newest closure. A rejected proposal returns
-// *version.ErrClosePredicateFailed and changes nothing.
+// publishes requirement.closed. The predicate is re-run inside the repository
+// transaction while the requirement row is locked, so a concurrent
+// intent/work item/case run committed after the pre-check rejects the close
+// instead of producing a stale closure. Repeated Close on an already closed
+// requirement is idempotent and returns the newest closure. A rejected proposal
+// returns *version.ErrClosePredicateFailed and changes nothing.
 func (s *ClosureService) Close(ctx context.Context, requirementID int64, runID *int64) (version.RequirementClosure, error) {
 	if requirementID <= 0 {
 		return version.RequirementClosure{}, platform.Invalid("requirement_id", "must be a positive decimal ID")
@@ -144,7 +147,19 @@ func (s *ClosureService) Close(ctx context.Context, requirementID int64, runID *
 	requirement.ClosedByRunID = closedBy
 	requirement.UpdatedAt = now
 
-	stored, err := s.closures.Close(ctx, closure, requirement)
+	stored, err := s.closures.Close(ctx, closure, requirement, func(ctx context.Context, locked version.Requirement) error {
+		// Re-evaluate while the requirement row is locked. A concurrent
+		// work item, intent or case run that committed before this point is
+		// visible here and rejects the close.
+		checks, input, _, err := s.evaluate(ctx, locked)
+		if err != nil {
+			return err
+		}
+		if !checks.Passed() {
+			return &version.ErrClosePredicateFailed{Failed: version.ClosureFailureCounts(input)}
+		}
+		return nil
+	})
 	if err != nil {
 		return version.RequirementClosure{}, mapClosureRepositoryError(err)
 	}
@@ -428,11 +443,20 @@ func (s *ClosureService) recordAudit(ctx context.Context, action string, require
 		return
 	}
 	// The manual API runs with an authenticated actor in the context; agent-run
-	// closures/reopens carry no HTTP actor and leave it nil.
+	// closures/reopens carry a run/work item provenance instead of an HTTP actor.
 	var actorID *int64
 	if actor, ok := platform.ActorFrom(ctx); ok && actor.ID > 0 {
 		id := actor.ID
 		actorID = &id
+	}
+	if run, ok := platform.AgentRunFrom(ctx); ok {
+		if metadata == nil {
+			metadata = map[string]any{}
+		}
+		metadata["agent_run_id"] = platformid.Format(run.RunID)
+		if run.WorkItemID > 0 {
+			metadata["work_item_id"] = platformid.Format(run.WorkItemID)
+		}
 	}
 	_ = s.audit.Record(ctx, auditapp.Event{
 		ActorID:    actorID,
