@@ -194,6 +194,21 @@ func ParseWorkItemPayload(raw json.RawMessage) (WorkItemPayload, error) {
 	if payload.AttachmentID, err = parseID("attachment_id"); err != nil {
 		return WorkItemPayload{}, err
 	}
+	if payload.RequirementID, err = parseID("requirement_id"); err != nil {
+		return WorkItemPayload{}, err
+	}
+	if payload.RequirementVersionID, err = parseID("requirement_version_id"); err != nil {
+		return WorkItemPayload{}, err
+	}
+	if payload.CaseID, err = parseID("case_id"); err != nil {
+		return WorkItemPayload{}, err
+	}
+	if payload.CaseVersionID, err = parseID("case_version_id"); err != nil {
+		return WorkItemPayload{}, err
+	}
+	if payload.RoundID, err = parseID("round_id"); err != nil {
+		return WorkItemPayload{}, err
+	}
 	if trigger, ok := object["trigger"]; ok {
 		_ = json.Unmarshal(trigger, &payload.Trigger)
 	}
@@ -202,24 +217,26 @@ func ParseWorkItemPayload(raw json.RawMessage) (WorkItemPayload, error) {
 
 // runState carries one run's mutable state.
 type runState struct {
-	item         agent.WorkItem
-	payload      WorkItemPayload
-	profile      agent.AgentProfile
-	run          agent.AgentRun
-	input        ContextInput
-	packet       agent.ContextPacket
-	model        llmapp.ModelInfo
-	registry     *tools.Registry
-	definitions  []llmapp.ToolDefinition
-	budget       int
-	softDeadline time.Time
-	turns        int
-	usage        map[string]int
-	messages     []llmapp.ChatMessage
-	userContent  string
-	cards        []ConversationPart
-	overflowHits int
-	softNoted    bool
+	item             agent.WorkItem
+	payload          WorkItemPayload
+	profile          agent.AgentProfile
+	run              agent.AgentRun
+	input            ContextInput
+	packet           agent.ContextPacket
+	model            llmapp.ModelInfo
+	registry         *tools.Registry
+	definitions      []llmapp.ToolDefinition
+	budget           int
+	softDeadline     time.Time
+	turns            int
+	usage            map[string]int
+	messages         []llmapp.ChatMessage
+	userContent      string
+	cards            []ConversationPart
+	conversationKind string
+	team             agent.Team
+	overflowHits     int
+	softNoted        bool
 }
 
 // Run executes one work item. On failure the agent_run row is already marked
@@ -237,6 +254,24 @@ func (r *Runner) Run(ctx context.Context, item agent.WorkItem) (RunResult, error
 	if err != nil {
 		return RunResult{}, &RunError{Reason: "invalid_payload", Retryable: false, Cause: err}
 	}
+	conversationKind := ""
+	if item.Type == WorkTypeChatTurn && payload.ConversationID > 0 {
+		if r.conversation == nil {
+			return RunResult{}, &RunError{
+				Reason:    "tool_failure",
+				Retryable: true,
+				Cause:     errors.New("agent runner has no conversation port"),
+			}
+		}
+		kind, kindErr := r.conversation.ConversationKind(ctx, item.VersionID, payload.ConversationID)
+		if kindErr != nil {
+			return RunResult{}, &RunError{Reason: "tool_failure", Retryable: true, Cause: kindErr}
+		}
+		conversationKind = kind
+		if key, ok := ProfileKeyForConversationKind(kind); ok {
+			profileKey = key
+		}
+	}
 	profile, err := r.repo.GetProfile(ctx, profileKey)
 	if err != nil {
 		return RunResult{}, &RunError{
@@ -251,11 +286,13 @@ func (r *Runner) Run(ctx context.Context, item agent.WorkItem) (RunResult, error
 		return RunResult{}, &RunError{Reason: "run_create_failed", Retryable: true, Cause: err}
 	}
 	state := &runState{
-		item:    item,
-		payload: payload,
-		profile: profile,
-		run:     run,
-		usage:   map[string]int{},
+		item:             item,
+		payload:          payload,
+		profile:          profile,
+		run:              run,
+		usage:            map[string]int{},
+		conversationKind: conversationKind,
+		team:             teamForProfile(profileKey),
 	}
 
 	hard := time.Duration(r.hardSeconds(profile)) * time.Second
@@ -337,7 +374,7 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 			RecentMessages: conversationMessages(snapshot.Messages),
 		}
 	}
-	state.input.TeamRoom = r.teamRoomContext(ctx, state.item.VersionID)
+	state.input.TeamRoom = r.teamRoomContext(ctx, state.item.VersionID, state.team)
 
 	modelInfo, err := r.chat.ResolveModel(ctx, profileModel(state.profile))
 	if err != nil {
@@ -366,7 +403,7 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 		})
 	}
 
-	state.registry = tools.NewP1Registry(r.toolDepsForRun(state))
+	state.registry = tools.NewP2Registry(r.toolDepsForRun(state))
 	state.definitions = state.registry.Definitions(state.profile.AllowedTools)
 
 	packet, compactInfo, err := r.builder.Build(ctx, state.input)
@@ -481,9 +518,14 @@ func profileAllowsTool(profile agent.AgentProfile, name string) bool {
 func (r *Runner) executeTools(ctx context.Context, state *runState, calls []llmapp.ToolCall) error {
 	ctx = platform.WithAgentRun(ctx, state.run.ID, state.item.ID)
 	scope := tools.Scope{
-		VersionID:      state.item.VersionID,
-		ConversationID: state.payload.ConversationID,
-		AgentRunID:     state.run.ID,
+		VersionID:            state.item.VersionID,
+		ConversationID:       state.payload.ConversationID,
+		RequirementID:        state.payload.RequirementID,
+		RequirementVersionID: state.payload.RequirementVersionID,
+		CaseID:               state.payload.CaseID,
+		CaseVersionID:        state.payload.CaseVersionID,
+		RoundID:              state.payload.RoundID,
+		AgentRunID:           state.run.ID,
 	}
 	maxBytes := r.intSetting("agent.tool_result_max_bytes", defaultToolResultMaxBytes)
 
@@ -617,8 +659,9 @@ func (r *Runner) handleOverflow(ctx context.Context, state *runState) error {
 	return nil
 }
 
-// writeOutputs persists the profile-specific result: Host/Curator conversation
-// messages (Curator with requirement cards) and Scout team-room findings.
+// writeOutputs persists the profile-specific result: Host/Curator/Design Host/
+// Design Planner conversation messages (Curator with requirement cards),
+// Scout/Case Author/Design Critic/Data Planner team-room updates.
 func (r *Runner) writeOutputs(ctx context.Context, state *runState, finalText string) error {
 	switch state.profile.Key {
 	case ProfileKeyClarificationHost:
@@ -633,6 +676,61 @@ func (r *Runner) writeOutputs(ctx context.Context, state *runState, finalText st
 			Parts:            []ConversationPart{{Type: "text", Text: finalText}},
 		}); err != nil {
 			return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
+		}
+	case ProfileKeyDesignHost:
+		if finalText == "" {
+			return &RunError{Reason: "model_error", Retryable: true, Cause: errors.New("design host produced an empty final message")}
+		}
+		if state.payload.ConversationID <= 0 {
+			return &RunError{Reason: "invalid_payload", Retryable: false, Cause: errors.New("design host run has no conversation")}
+		}
+		if _, err := r.conversation.AppendAssistantMessage(ctx, AssistantMessageInput{
+			VersionID:        state.item.VersionID,
+			ConversationID:   state.payload.ConversationID,
+			AgentRunID:       state.run.ID,
+			ReplyToMessageID: replyTarget(state.payload.MessageID),
+			Parts:            []ConversationPart{{Type: "text", Text: finalText}},
+		}); err != nil {
+			return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
+		}
+	case ProfileKeyDesignPlanner:
+		if finalText == "" {
+			return &RunError{Reason: "model_error", Retryable: true, Cause: errors.New("design planner produced an empty scope message")}
+		}
+		if state.payload.ConversationID <= 0 {
+			return &RunError{Reason: "invalid_payload", Retryable: false, Cause: errors.New("design planner run has no conversation")}
+		}
+		if _, err := r.conversation.AppendAssistantMessage(ctx, AssistantMessageInput{
+			VersionID:      state.item.VersionID,
+			ConversationID: state.payload.ConversationID,
+			AgentRunID:     state.run.ID,
+			Parts:          []ConversationPart{{Type: "text", Text: finalText}},
+		}); err != nil {
+			return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
+		}
+		if err := r.postDesignUpdate(ctx, state, agent.PostKindStatus, finalText); err != nil {
+			return err
+		}
+	case ProfileKeyCaseAuthor:
+		if finalText == "" {
+			return &RunError{Reason: "model_error", Retryable: true, Cause: errors.New("case author produced no design update")}
+		}
+		if err := r.postDesignUpdate(ctx, state, agent.PostKindStatus, finalText); err != nil {
+			return err
+		}
+	case ProfileKeyDesignCritic:
+		if finalText == "" {
+			return &RunError{Reason: "model_error", Retryable: true, Cause: errors.New("design critic produced no review summary")}
+		}
+		if err := r.postDesignUpdate(ctx, state, agent.PostKindFinding, finalText); err != nil {
+			return err
+		}
+	case ProfileKeyDataPlanner:
+		if finalText == "" {
+			return &RunError{Reason: "model_error", Retryable: true, Cause: errors.New("data planner produced no data update")}
+		}
+		if err := r.postDesignUpdate(ctx, state, agent.PostKindStatus, finalText); err != nil {
+			return err
 		}
 	case ProfileKeyRequirementCurator:
 		if finalText == "" && len(state.cards) == 0 {
@@ -688,6 +786,35 @@ func (r *Runner) writeOutputs(ctx context.Context, state *runState, finalText st
 				return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 			}
 		}
+	}
+	return nil
+}
+
+// postDesignUpdate writes one design team-room update attributed to the run and
+// returns a retryable failure when the team-room port is unavailable.
+func (r *Runner) postDesignUpdate(ctx context.Context, state *runState, kind agent.PostKind, content string) error {
+	if r.teamRoom == nil {
+		return &RunError{Reason: "tool_failure", Retryable: true, Cause: errors.New("agent runner has no team room port")}
+	}
+	refs := []agent.PostRef{}
+	if state.payload.RequirementID > 0 {
+		refs = append(refs, agent.PostRef{Kind: "requirement", ID: idText(state.payload.RequirementID)})
+	}
+	if state.payload.CaseID > 0 {
+		refs = append(refs, agent.PostRef{Kind: "case", ID: idText(state.payload.CaseID)})
+	}
+	if state.payload.RoundID > 0 {
+		refs = append(refs, agent.PostRef{Kind: "design_round", ID: idText(state.payload.RoundID)})
+	}
+	if _, err := r.teamRoom.Post(ctx, agent.TeamRoomPost{
+		VersionID:  state.item.VersionID,
+		Team:       state.team,
+		Kind:       kind,
+		Content:    content,
+		Refs:       refs,
+		AgentRunID: &state.run.ID,
+	}); err != nil {
+		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}
 	return nil
 }
@@ -833,8 +960,8 @@ func (r *Runner) toolDepsForRun(state *runState) tools.Deps {
 		return taskPackResult(versionID, state.payload.ConversationID, state.run.ID, task), nil
 	}
 	deps.TeamRoomRead = func(ctx context.Context, scope tools.Scope, maxPosts int) (any, error) {
-		room := r.teamRoomContext(ctx, scope.VersionID)
-		return teamRoomResult(scope.VersionID, room), nil
+		room := r.teamRoomContext(ctx, scope.VersionID, state.team)
+		return teamRoomResult(scope.VersionID, state.team, room), nil
 	}
 	deps.SummaryUpdate = func(ctx context.Context, scope tools.Scope, summary string, pinned []string) (any, error) {
 		if r.conversation == nil {
@@ -883,8 +1010,32 @@ func (r *Runner) taskContext(state *runState) TaskContext {
 	if state.payload.ConversationID > 0 {
 		scope = append(scope, "conversation_id="+idText(state.payload.ConversationID))
 	}
+	if state.payload.RequirementID > 0 {
+		scope = append(scope, "requirement_id="+idText(state.payload.RequirementID))
+	}
+	if state.payload.RequirementVersionID > 0 {
+		scope = append(scope, "requirement_version_id="+idText(state.payload.RequirementVersionID))
+	}
+	if state.payload.CaseID > 0 {
+		scope = append(scope, "case_id="+idText(state.payload.CaseID))
+	}
+	if state.payload.CaseVersionID > 0 {
+		scope = append(scope, "case_version_id="+idText(state.payload.CaseVersionID))
+	}
+	if state.payload.RoundID > 0 {
+		scope = append(scope, "round_id="+idText(state.payload.RoundID))
+	}
 	switch state.item.Type {
 	case WorkTypeChatTurn:
+		if state.conversationKind == "design" {
+			return TaskContext{
+				Type:               state.item.Type,
+				Goal:               "作为设计 Host 与用户对话，读取脑图并按用户要求提交/修改场景与用例 draft。",
+				Constraints:        []string{"AI 只能提交 draft/候选，不能确认、删除或关闭用例", "确认只属于用户", "不编造需求未表达的内容"},
+				AcceptanceCriteria: []string{"引用用户最新消息", "修改脑图前先 design.graph_read", "用 case.graph_propose 提交草案并说明变化"},
+				Scope:              scope,
+			}
+		}
 		return TaskContext{
 			Type:               state.item.Type,
 			Goal:               "回复用户最新消息，推进需求澄清并指出仍需确认的信息。",
@@ -909,6 +1060,42 @@ func (r *Runner) taskContext(state *runState) TaskContext {
 			AcceptanceCriteria: []string{"输出精简 finding 并引用附件名", "列出至少一个待澄清问题（如有）"},
 			Scope:              ingestScope,
 		}
+	case WorkTypeDesignRound:
+		return TaskContext{
+			Type:               state.item.Type,
+			Goal:               "根据服务端扫描出的本轮设计范围，向用户说明待设计需求与预计场景/用例数量。",
+			Constraints:        []string{"只输出范围说明", "不写库、不调用写工具", "不确认、不删除"},
+			AcceptanceCriteria: []string{"说明本轮作用域与下一步", "不编造未激活需求"},
+			Scope:              scope,
+		}
+	case WorkTypeDesignRequirement, WorkTypeDesignGap:
+		goal := "为指定需求版本设计场景与用例草案：先读取脑图，再用 case.graph_propose 提交 1 个场景与至少 1 条可执行用例。"
+		if state.item.Type == WorkTypeDesignGap {
+			goal = "根据执行/设计缺口补充用例草案：先读取脑图，再用 case.graph_propose 新增或修改 draft 用例。"
+		}
+		return TaskContext{
+			Type:               state.item.Type,
+			Goal:               goal,
+			Constraints:        []string{"只提交 draft/候选，不能确认、删除或关闭用例", "用例必须包含步骤、断言、来源与目标 version_sut", "同一需求版本内更新已有用例时传既有 ID/自然键"},
+			AcceptanceCriteria: []string{"design.graph_read 后再提交", "case.graph_propose 返回 case_version_ids", "向设计团队频道说明变化"},
+			Scope:              scope,
+		}
+	case WorkTypeDesignCritic:
+		return TaskContext{
+			Type:               state.item.Type,
+			Goal:               "内部自审当前需求的场景/用例草案，提交覆盖遗漏、不可执行步骤与断言缺失等 finding。",
+			Constraints:        []string{"只读脑图并使用 design.review_submit", "不修改用例、不确认", "内部自审不构成人工关卡"},
+			AcceptanceCriteria: []string{"至少 1 条可执行 finding", "finding 带 severity 与 message"},
+			Scope:              scope,
+		}
+	case WorkTypeDesignDataPlan:
+		return TaskContext{
+			Type:               state.item.Type,
+			Goal:               "为当前 draft 用例补充前置条件与测试数据，生成新的 draft revision。",
+			Constraints:        []string{"先用 design.graph_read 找到当前 draft 用例", "只使用 design.data_plan_submit", "不确认、不删除；已确认或 stale 版本不可修改"},
+			AcceptanceCriteria: []string{"仅更新当前 draft 版本", "数据可复现且不含真实密钥"},
+			Scope:              scope,
+		}
 	default:
 		return TaskContext{Type: state.item.Type, Scope: scope}
 	}
@@ -926,19 +1113,39 @@ func (r *Runner) userMessage(ctx context.Context, state *runState, attachmentTex
 			}
 		}
 		if state.payload.Trigger == "opening" || state.payload.MessageID == 0 {
+			if state.conversationKind == "design" {
+				return "这是设计会话的开场。请向用户简要说明当前设计范围，并提示用户可以在对话中要求新增或修改用例。"
+			}
 			return "这是澄清会话的开场。请向用户提一个简短的开场问题，引导其描述需求。"
 		}
+		if state.conversationKind == "design" {
+			return "请根据最近的设计对话继续完善用例脑图；需要修改时先 design.graph_read 再 case.graph_propose。"
+		}
 		return "请基于最近对话继续澄清需求。"
+	case WorkTypeDesignRound:
+		return "请根据本轮设计范围，向用户简要说明待设计需求与预计生成的场景/用例数量。"
+	case WorkTypeDesignRequirement:
+		return fmt.Sprintf("请为需求 %s（需求版本 %s）设计场景与用例草案。",
+			idText(state.payload.RequirementID), idText(state.payload.RequirementVersionID))
+	case WorkTypeDesignGap:
+		return fmt.Sprintf("请补齐需求 %s（需求版本 %s）对应的用例缺口并提交 draft。",
+			idText(state.payload.RequirementID), idText(state.payload.RequirementVersionID))
+	case WorkTypeDesignCritic:
+		return fmt.Sprintf("请内部自审需求 %s（需求版本 %s）当前的场景/用例草案并提交 finding。",
+			idText(state.payload.RequirementID), idText(state.payload.RequirementVersionID))
+	case WorkTypeDesignDataPlan:
+		return fmt.Sprintf("请为需求 %s（需求版本 %s）当前 draft 用例补充前置条件与测试数据。",
+			idText(state.payload.RequirementID), idText(state.payload.RequirementVersionID))
 	default:
 		return "请根据当前任务继续执行。"
 	}
 }
 
-func (r *Runner) teamRoomContext(ctx context.Context, versionID int64) TeamRoomContext {
+func (r *Runner) teamRoomContext(ctx context.Context, versionID int64, team agent.Team) TeamRoomContext {
 	if r.teamRoom == nil {
 		return TeamRoomContext{}
 	}
-	room, err := r.teamRoom.Context(ctx, versionID, string(agent.TeamClarification), 10)
+	room, err := r.teamRoom.Context(ctx, versionID, string(team), 10)
 	if err != nil {
 		return TeamRoomContext{}
 	}
@@ -1120,7 +1327,7 @@ func taskPackResult(versionID, conversationID, runID int64, task TaskContext) ma
 	}
 }
 
-func teamRoomResult(versionID int64, room TeamRoomContext) map[string]any {
+func teamRoomResult(versionID int64, team agent.Team, room TeamRoomContext) map[string]any {
 	posts := make([]map[string]any, 0, len(room.Posts))
 	for _, post := range room.Posts {
 		refs := make([]map[string]any, 0, len(post.Refs))
@@ -1137,7 +1344,7 @@ func teamRoomResult(versionID int64, room TeamRoomContext) map[string]any {
 	}
 	result := map[string]any{
 		"version_id": idText(versionID),
-		"team":       string(agent.TeamClarification),
+		"team":       string(team),
 		"posts":      posts,
 	}
 	if room.Digest != nil {
@@ -1161,7 +1368,34 @@ func artifactRefs(state *runState) []ArtifactRef {
 	if state.payload.AttachmentID > 0 {
 		refs = append(refs, ArtifactRef{Kind: "attachment", ID: idText(state.payload.AttachmentID)})
 	}
+	if state.payload.RequirementID > 0 {
+		refs = append(refs, ArtifactRef{Kind: "requirement", ID: idText(state.payload.RequirementID)})
+	}
+	if state.payload.RequirementVersionID > 0 {
+		refs = append(refs, ArtifactRef{Kind: "requirement_version", ID: idText(state.payload.RequirementVersionID)})
+	}
+	if state.payload.CaseID > 0 {
+		refs = append(refs, ArtifactRef{Kind: "case", ID: idText(state.payload.CaseID)})
+	}
+	if state.payload.CaseVersionID > 0 {
+		refs = append(refs, ArtifactRef{Kind: "case_version", ID: idText(state.payload.CaseVersionID)})
+	}
+	if state.payload.RoundID > 0 {
+		refs = append(refs, ArtifactRef{Kind: "design_round", ID: idText(state.payload.RoundID)})
+	}
 	return refs
+}
+
+// teamForProfile selects the collaboration channel: design profiles use the
+// design team room, every P1 profile keeps the clarification team room.
+func teamForProfile(profileKey string) agent.Team {
+	switch profileKey {
+	case ProfileKeyDesignHost, ProfileKeyDesignPlanner, ProfileKeyCaseAuthor,
+		ProfileKeyDesignCritic, ProfileKeyDataPlanner:
+		return agent.TeamDesign
+	default:
+		return agent.TeamClarification
+	}
 }
 
 // requirementCard turns a successful draft tool result into a UI card part.

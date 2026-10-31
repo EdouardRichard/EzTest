@@ -14,6 +14,15 @@ const (
 	ProfileKeyContextScout       = "context_scout"
 )
 
+// P2 design profile keys (contracts/agent-profiles-tools.md P2 increment).
+const (
+	ProfileKeyDesignHost    = "design_host"
+	ProfileKeyDesignPlanner = "design_planner"
+	ProfileKeyCaseAuthor    = "case_author"
+	ProfileKeyDesignCritic  = "design_critic"
+	ProfileKeyDataPlanner   = "data_planner"
+)
+
 // System prompts freeze the role boundaries: Host talks only, Curator produces
 // drafts/relations/reopen proposals, Scout reads and summarizes. The
 // [profile:<key>] marker is used by the deterministic fake LLM and is ignored
@@ -114,10 +123,156 @@ func P1Profiles() []agent.AgentProfile {
 	}
 }
 
-// EnsureProfiles idempotently seeds the P1 profiles. Existing rows (including
-// administrator edits) are returned unchanged by the repository.
+// P2 design prompts. Every prompt declares that AI only submits draft/
+// candidate content and can never confirm, delete or close; the Host only
+// explains and edits the mindmap. The [profile:<key>] marker is used by the
+// deterministic fake LLM and ignored by real models.
+const designHostPrompt = `你是 EzTest 的设计 Host（用例脑图助手）。
+角色边界：
+- 只解释、提问与修改脑图；不确认用例、不删除、不关闭版本或需求。
+- AI 只能提交 draft/候选：场景与用例草案通过 case.graph_propose 写入，等待用户在脑图中确认。
+- 不声称已完成确认；用户要求确认时提示其使用脑图节点上的确认按钮。
+- 设计对话支持附件；可读取附件文本作为设计依据。
+回答使用简洁中文，聚焦用例覆盖与可执行性。
+[profile:design_host]`
+
+const designPlannerPrompt = `你是 EzTest 的设计 Planner（设计轮次规划者）。
+角色边界：
+- 只输出本轮设计范围说明：待设计需求、已激活范围、预计场景/用例数；不写库、不调用写工具。
+- 不确认、不删除、不关闭任何对象；确认只能由用户完成。
+- 范围以服务端 Planner 扫描结果为准，不编造未激活需求。
+用简洁中文说明本轮范围与下一步。
+[profile:design_planner]`
+
+const caseAuthorPrompt = `你是 EzTest 的用例 Author（场景/用例作者）。
+角色边界：
+- 只能通过 case.graph_propose 提交场景与用例 draft；不能确认、删除、关闭用例或需求。
+- 先在 design.graph_read 读取当前脑图，避免重复创建；同一需求版本内修改已有用例时传既有 ID/自然键。
+- 用例必须包含可执行步骤、断言、来源与目标 version_sut；跨系统步骤分别指定目标。
+- 不编造需求未表达的内容；拿不准时写入 draft 并在团队频道说明假设。
+完成后在团队频道说明新增/修改的场景与用例。
+[profile:case_author]`
+
+const designCriticPrompt = `你是 EzTest 的 Design Critic（内部设计自审者）。
+角色边界：
+- 通过 design.review_submit 提交 finding（blocker/important/minor），只读脑图；不修改用例、不确认。
+- 内部自审不构成人工关卡；确认权限只属于用户。
+- 检查覆盖遗漏、步骤不可执行、断言缺失、目标 SUT 错误与重复用例。
+输出简洁、可执行的 finding。
+[profile:design_critic]`
+
+const dataPlannerPrompt = `你是 EzTest 的数据 Planner（测试数据设计者）。
+角色边界：
+- 只通过 design.data_plan_submit 为当前 draft 用例补充前置条件与测试数据，生成新的 draft revision。
+- 不确认、不删除；已确认或 stale 版本不可修改。
+- 先用 design.graph_read 找到当前 draft 用例，数据必须可复现且不包含真实密钥。
+完成后在团队频道说明补充的数据范围。
+[profile:data_planner]`
+
+// designHostTools is the design Host read/write set (contract §5.2).
+var designHostTools = []string{
+	tools.ToolContextVersionPack,
+	tools.ToolContextTaskPack,
+	tools.ToolContextTeamRoomRead,
+	tools.ToolContextSummaryUpdate,
+	tools.ToolRequirementRead,
+	tools.ToolDesignGraphRead,
+	tools.ToolCaseGraphPropose,
+	tools.ToolAttachmentList,
+	tools.ToolAttachmentReadText,
+	tools.ToolSUTList,
+	tools.ToolSUTPageList,
+}
+
+var designPlannerTools = []string{
+	tools.ToolContextVersionPack,
+	tools.ToolContextTaskPack,
+	tools.ToolContextTeamRoomRead,
+	tools.ToolRequirementRead,
+	tools.ToolDesignGraphRead,
+}
+
+var caseAuthorTools = []string{
+	tools.ToolContextVersionPack,
+	tools.ToolContextTaskPack,
+	tools.ToolRequirementRead,
+	tools.ToolDesignGraphRead,
+	tools.ToolCaseGraphPropose,
+	tools.ToolSUTList,
+	tools.ToolSUTPageList,
+}
+
+var designCriticTools = []string{
+	tools.ToolContextTaskPack,
+	tools.ToolDesignGraphRead,
+	tools.ToolDesignReviewSubmit,
+}
+
+var dataPlannerTools = []string{
+	tools.ToolContextTaskPack,
+	tools.ToolDesignGraphRead,
+	tools.ToolDesignDataPlanSubmit,
+}
+
+// P2Profiles returns fresh P2 seed definitions. Budgets and tool sets are
+// frozen by the P2 profile contract; EnsureProfiles never overwrites admin
+// edits.
+func P2Profiles() []agent.AgentProfile {
+	return []agent.AgentProfile{
+		{
+			Key:          ProfileKeyDesignHost,
+			Name:         "设计 Host",
+			SystemPrompt: designHostPrompt,
+			AllowedTools: append([]string(nil), designHostTools...),
+			Budgets:      agent.ProfileBudgets{MaxTurns: 12, SoftSeconds: 300, HardSeconds: 600},
+			Enabled:      true,
+		},
+		{
+			Key:          ProfileKeyDesignPlanner,
+			Name:         "设计 Planner",
+			SystemPrompt: designPlannerPrompt,
+			AllowedTools: append([]string(nil), designPlannerTools...),
+			Budgets:      agent.ProfileBudgets{MaxTurns: 6, SoftSeconds: 180, HardSeconds: 300},
+			Enabled:      true,
+		},
+		{
+			Key:          ProfileKeyCaseAuthor,
+			Name:         "用例 Author",
+			SystemPrompt: caseAuthorPrompt,
+			AllowedTools: append([]string(nil), caseAuthorTools...),
+			Budgets:      agent.ProfileBudgets{MaxTurns: 8, SoftSeconds: 300, HardSeconds: 600},
+			Enabled:      true,
+		},
+		{
+			Key:          ProfileKeyDesignCritic,
+			Name:         "设计 Critic",
+			SystemPrompt: designCriticPrompt,
+			AllowedTools: append([]string(nil), designCriticTools...),
+			Budgets:      agent.ProfileBudgets{MaxTurns: 4, SoftSeconds: 120, HardSeconds: 300},
+			Enabled:      true,
+		},
+		{
+			Key:          ProfileKeyDataPlanner,
+			Name:         "数据 Planner",
+			SystemPrompt: dataPlannerPrompt,
+			AllowedTools: append([]string(nil), dataPlannerTools...),
+			Budgets:      agent.ProfileBudgets{MaxTurns: 4, SoftSeconds: 120, HardSeconds: 300},
+			Enabled:      true,
+		},
+	}
+}
+
+// Profiles returns every seed profile (P1 then P2) in startup seeding order.
+func Profiles() []agent.AgentProfile {
+	profiles := P1Profiles()
+	profiles = append(profiles, P2Profiles()...)
+	return profiles
+}
+
+// EnsureProfiles idempotently seeds the P1 and P2 profiles. Existing rows
+// (including administrator edits) are returned unchanged by the repository.
 func EnsureProfiles(ctx context.Context, repo agent.RuntimeRepository) ([]agent.AgentProfile, error) {
-	seeds := P1Profiles()
+	seeds := Profiles()
 	stored := make([]agent.AgentProfile, 0, len(seeds))
 	for _, seed := range seeds {
 		profile, _, err := repo.EnsureProfile(ctx, seed)
