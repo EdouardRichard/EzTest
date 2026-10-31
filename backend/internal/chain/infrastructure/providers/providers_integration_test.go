@@ -357,8 +357,8 @@ func TestProvidersChainIntegration(t *testing.T) {
 	if node := nodes["closure:9951"]; node.Status != versionapp.ClosureSummaryStatusReopened {
 		t.Errorf("closure status = %q, want reopened for the incremented reopen_count", node.Status)
 	}
-	if node := nodes["scenario:9601"]; node.CreatedAt.IsZero() {
-		t.Errorf("scenario created_at is zero: %+v", node)
+	if node := nodes["scenario:9601"]; !node.CreatedAt.IsZero() || !node.UpdatedAt.IsZero() {
+		t.Errorf("scenario timestamps = %v/%v, want both zero so event-range replay keeps it", node.CreatedAt, node.UpdatedAt)
 	}
 	if node := nodes["issue:9901"]; node.CaseRunID == nil || *node.CaseRunID != itRun2 ||
 		node.WaveID == nil || *node.WaveID != itWave2 ||
@@ -393,6 +393,56 @@ func TestProvidersChainIntegration(t *testing.T) {
 		if !edges[want] {
 			t.Errorf("edge %q missing from %v", want, view.Edges)
 		}
+	}
+}
+
+// TestProvidersChainIntegrationRequirementBudget pins the root pagination fix
+// against the real version repository: one RequirementService.List page is
+// capped at 100 rows, so only a provider that follows the has_more/beforeID
+// cursor can hand BuildChain the MaxRequirements+1-th root and make it report
+// requirement_budget instead of silently serving the page cap.
+func TestProvidersChainIntegrationRequirementBudget(t *testing.T) {
+	pool, bundle := newChainProviders(t)
+	ctx := context.Background()
+
+	const extraRoots = chain.DefaultMaxRequirements + 5
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO requirement (id, version_id, current_version_id, status, target_version_sut_ids,
+		                          created_at, updated_at)
+		SELECT 10000 + g, $1::bigint, 20000 + g, 'clarified', '[]'::jsonb, now(), now()
+		FROM generate_series(1, $2::int) AS g`,
+		itVersionID, extraRoots); err != nil {
+		t.Fatalf("insert bulk requirements: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO requirement_version (id, requirement_id, revision, title, description, priority,
+		                                 content_hash, target_version_suts, created_at)
+		SELECT 20000 + g, 10000 + g, 1, 'Bulk requirement', '', 'P2', repeat('a', 64), '[]'::jsonb, now()
+		FROM generate_series(1, $1::int) AS g`, extraRoots); err != nil {
+		t.Fatalf("insert bulk requirement versions: %v", err)
+	}
+
+	view, err := bundle.Service.Read(ctx, itVersionID, chain.ChainFilter{})
+	if err != nil {
+		t.Fatalf("ChainService.Read: %v", err)
+	}
+	if !view.Truncated || view.Truncation.Reason != chain.TruncationReasonRequirementBudget {
+		t.Fatalf("truncation = %+v, want requirement_budget", view.Truncation)
+	}
+	if got := view.Truncation.MaxRequirements; got != chain.DefaultMaxRequirements {
+		t.Errorf("Truncation.MaxRequirements = %d, want %d", got, chain.DefaultMaxRequirements)
+	}
+	if got := view.Counts["requirements"]; got != chain.DefaultMaxRequirements+1 {
+		t.Errorf("counts[requirements] = %d, want the paged %d roots before truncation", got, chain.DefaultMaxRequirements+1)
+	}
+	requirements := 0
+	for _, node := range view.Nodes {
+		if node.Kind == chain.NodeRequirement {
+			requirements++
+		}
+	}
+	if requirements != chain.DefaultMaxRequirements {
+		t.Errorf("requirement nodes = %d, want the %d selected roots", requirements, chain.DefaultMaxRequirements)
 	}
 }
 
@@ -464,8 +514,8 @@ func TestProvidersDirectReads(t *testing.T) {
 		t.Errorf("design nodes = %d scenarios, %d cases; want 2/2", len(scenarios), len(cases))
 	}
 	for _, node := range scenarios {
-		if node.CreatedAt.IsZero() {
-			t.Errorf("scenario node created_at is zero: %+v", node)
+		if !node.CreatedAt.IsZero() || !node.UpdatedAt.IsZero() {
+			t.Errorf("scenario node timestamps = %v/%v, want zero", node.CreatedAt, node.UpdatedAt)
 		}
 	}
 	for _, node := range cases {
@@ -617,10 +667,26 @@ func TestProvidersChainIntegrationEventRange(t *testing.T) {
 			t.Errorf("boundary requirement %q missing from the range graph", id)
 		}
 	}
-	for _, id := range []string{"requirement:9961", "requirement:9965", "requirement:9501", "scenario:9601"} {
+	for _, id := range []string{"requirement:9961", "requirement:9965", "requirement:9501"} {
 		if _, ok := nodes[id]; ok {
 			t.Errorf("node %q outside the event range survived: %v", id, view.Nodes)
 		}
+	}
+	// Scenario rows do not expose timestamps. The provider keeps CreatedAt /
+	// UpdatedAt zero so this filter retains them; stamping them with the
+	// request-time graph snapshot would drop every scenario from the range.
+	for _, id := range []string{"scenario:9601", "scenario:9602"} {
+		node, ok := nodes[id]
+		if !ok {
+			t.Errorf("scenario %q missing from the event range: %v", id, view.Nodes)
+			continue
+		}
+		if !node.CreatedAt.IsZero() || !node.UpdatedAt.IsZero() {
+			t.Errorf("scenario %q timestamps = %v/%v, want zero inside the range replay", id, node.CreatedAt, node.UpdatedAt)
+		}
+	}
+	if got := view.Counts["scenarios"]; got != 2 {
+		t.Errorf("range scenarios = %d, want 2", got)
 	}
 }
 

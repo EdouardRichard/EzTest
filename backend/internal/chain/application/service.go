@@ -95,18 +95,14 @@ func (s *ChainService) Read(ctx context.Context, versionID int64, f chain.ChainF
 	}
 	budget := chain.ClampBudget(s.budget)
 
-	// Ask for one requirement root beyond the configured budget. A provider that
-	// honors the limit then returns MaxRequirements+1 roots when the dataset is
-	// larger than the budget, and BuildChain truncates to MaxRequirements with
-	// Truncated=true / reason=requirement_budget instead of silently serving the
-	// full page. Providers that cap the page lower than requested (the real
-	// version provider pages through platform/pagination.MaxLimit=100) silently
-	// hide the extra root: the view then reports no truncation and Counts
-	// describe only the returned page. That residual silent provider cap is
-	// accepted in P4 because the VersionChainProvider port exposes no "has more"
-	// signal; fixing it needs a provider change, not a chain one. A provider that
-	// ignores the limit and returns more than MaxRequirements+1 is still
-	// truncated deterministically by BuildChain.
+	// Ask for one requirement root beyond the configured budget. The version
+	// provider pages through RequirementService.List until it has that many
+	// roots or the dataset is exhausted, so the extra root reaches BuildChain
+	// even when one version list page is capped at 100. BuildChain truncates to
+	// MaxRequirements with Truncated=true / reason=requirement_budget instead of
+	// silently serving exactly the budget page. A provider that ignores the
+	// limit and returns more than MaxRequirements+1 is still truncated
+	// deterministically by BuildChain.
 	requirements, err := s.version.Requirements(ctx, versionID, budget.MaxRequirements+1)
 	if err != nil {
 		return chain.ChainView{}, providerError("load requirements", err)

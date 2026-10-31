@@ -13,6 +13,9 @@ import (
 )
 
 // VersionChainProvider supplies requirement and version SUT nodes (spec §8.1).
+// Requirements must return up to limit roots, paging its backing reader when one
+// reader page is capped; the service asks for MaxRequirements+1 so BuildChain
+// can report requirement_budget truncation.
 type VersionChainProvider interface {
 	Requirements(ctx context.Context, versionID int64, limit int) ([]chain.Node, error)
 	VersionSUTs(ctx context.Context, versionID int64) ([]chain.Node, error)

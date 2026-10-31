@@ -12,6 +12,7 @@ import (
 
 	chainapp "github.com/EdouardRichard/EzTest/backend/internal/chain/application"
 	chain "github.com/EdouardRichard/EzTest/backend/internal/chain/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/pagination"
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 )
 
@@ -46,38 +47,67 @@ func NewVersionProvider(requirements RequirementLister, versions VersionReader) 
 
 var _ chainapp.VersionChainProvider = (*VersionProvider)(nil)
 
-// Requirements lists one limited page of version requirements. The node keeps
-// the requirement status (draft/clarified/closed) and its target version SUTs,
+// Requirements lists up to limit version requirement roots. The node keeps the
+// requirement status (draft/clarified/closed) and its target version SUTs,
 // which make the SUT filter match requirement roots.
+//
+// The version application clamps every list page to
+// platform/pagination.MaxLimit, so one List call cannot satisfy a chain root
+// budget above 100. The provider follows the List has_more/beforeID cursor until
+// it collected limit roots or the dataset is exhausted; BuildChain then sees
+// the extra MaxRequirements+1 root and reports requirement_budget truncation.
 func (p *VersionProvider) Requirements(ctx context.Context, versionID int64, limit int) ([]chain.Node, error) {
 	if limit <= 0 {
 		limit = chain.DefaultMaxRequirements
 	}
-	views, _, err := p.requirements.List(ctx, versionID, "", limit, nil)
-	if err != nil {
-		return nil, err
-	}
-	nodes := make([]chain.Node, 0, len(views))
-	for _, view := range views {
-		if view.ID <= 0 {
-			continue
+	nodes := make([]chain.Node, 0, limit)
+	var beforeID *int64
+	for len(nodes) < limit {
+		pageSize := limit - len(nodes)
+		if pageSize > pagination.MaxLimit {
+			pageSize = pagination.MaxLimit
 		}
-		requirementID := view.ID
-		node := chain.Node{
-			ID:            chain.NodeID(chain.NodeRequirement, requirementID),
-			Kind:          chain.NodeRequirement,
-			RefID:         strconv.FormatInt(requirementID, 10),
-			Label:         view.Title,
-			Status:        view.Status,
-			RequirementID: int64Ptr(requirementID),
-			CreatedAt:     view.UpdatedAt,
-			UpdatedAt:     view.UpdatedAt,
-			Meta:          map[string]any{"revision": view.Revision},
+		views, hasMore, err := p.requirements.List(ctx, versionID, "", pageSize, beforeID)
+		if err != nil {
+			return nil, err
 		}
-		if targets := parseDecimalIDs(view.TargetVersionSUTs); len(targets) > 0 {
-			node.VersionSUTIDs = targets
+		if len(views) == 0 {
+			break
 		}
-		nodes = append(nodes, node)
+		if len(views) > pageSize {
+			views = views[:pageSize]
+			hasMore = true
+		}
+		for _, view := range views {
+			if view.ID <= 0 {
+				continue
+			}
+			requirementID := view.ID
+			node := chain.Node{
+				ID:            chain.NodeID(chain.NodeRequirement, requirementID),
+				Kind:          chain.NodeRequirement,
+				RefID:         strconv.FormatInt(requirementID, 10),
+				Label:         view.Title,
+				Status:        view.Status,
+				RequirementID: int64Ptr(requirementID),
+				CreatedAt:     view.UpdatedAt,
+				UpdatedAt:     view.UpdatedAt,
+				Meta:          map[string]any{"revision": view.Revision},
+			}
+			if targets := parseDecimalIDs(view.TargetVersionSUTs); len(targets) > 0 {
+				node.VersionSUTIDs = targets
+			}
+			nodes = append(nodes, node)
+		}
+		if !hasMore || len(nodes) >= limit {
+			break
+		}
+		lastID := views[len(views)-1].ID
+		if lastID <= 0 || (beforeID != nil && lastID >= *beforeID) {
+			// A page that does not advance the id cursor would loop forever.
+			break
+		}
+		beforeID = &lastID
 	}
 	return nodes, nil
 }

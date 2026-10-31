@@ -208,6 +208,49 @@ func TestChainHandlerParsesFiltersAndMapsView(t *testing.T) {
 	}
 }
 
+func TestChainHandlerScenarioCreatedAtUsesDisplayFallback(t *testing.T) {
+	generatedAt := time.Date(2026, 11, 1, 4, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name      string
+		updatedAt time.Time
+		want      string
+	}{
+		{name: "generated_at fallback", want: "2026-11-01T04:00:00Z"},
+		{name: "updated_at fallback", updatedAt: generatedAt.Add(-time.Hour), want: "2026-11-01T03:00:00Z"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			view := chain.ChainView{
+				VersionID:   "42",
+				GeneratedAt: generatedAt,
+				Replay:      chain.ReplayInfo{Mode: chain.ReplayModeRange, Approximate: true},
+				Nodes: []chain.Node{{
+					ID:        "scenario:10",
+					Kind:      chain.NodeScenario,
+					RefID:     "10",
+					Label:     "Pay scenario",
+					CreatedAt: time.Time{},
+					UpdatedAt: test.updatedAt,
+				}},
+			}
+			svc := &fakeChainService{view: view}
+			mux := newChainMux(t, svc)
+
+			recorder := getChain(t, mux, "/api/versions/42/exploration-chain?event_from=10&event_to=20")
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+			data := decodeChainData(t, recorder)
+			node := data["nodes"].([]any)[0].(map[string]any)
+			// Scenario nodes keep a zero domain timestamp so event-range replay
+			// keeps them; the API still needs a display timestamp.
+			if node["created_at"] != test.want {
+				t.Errorf("scenario created_at = %v, want the display fallback %q", node["created_at"], test.want)
+			}
+		})
+	}
+}
+
 func TestChainHandlerSerializesMetaIDArraysAsDecimalStrings(t *testing.T) {
 	view := chain.ChainView{
 		VersionID:   "42",
