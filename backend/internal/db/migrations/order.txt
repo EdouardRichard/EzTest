@@ -17,3 +17,6 @@ version_0004_requirement_attachment.sql
 eventing_0002_event_index.sql
 design_0001_case_model.sql
 storage_0002_export_artifact.sql
+execution_0001_intent_wave.sql
+execution_0002_result_evidence.sql
+execution_0003_executor_human.sql
