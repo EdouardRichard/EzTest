@@ -120,6 +120,22 @@ func TestP4ProfilesMatchContract(t *testing.T) {
 	}
 }
 
+// TestP4ProfilePromptsPinGuardrailClause pins the frozen P4 prompt constraint
+// from contracts/agent-profiles-tools.md §7.1 in every P4 seed prompt.
+func TestP4ProfilePromptsPinGuardrailClause(t *testing.T) {
+	const clause = "只调用白名单工具；不得伪造统计/证据；不得尝试确认需求/用例、合并/重开问题或直接改版本状态。"
+
+	profiles := agentapp.P4Profiles()
+	if len(profiles) != 3 {
+		t.Fatalf("P4 profiles = %d, want 3", len(profiles))
+	}
+	for _, profile := range profiles {
+		if !strings.Contains(profile.SystemPrompt, clause) {
+			t.Errorf("profile %s prompt missing guardrail clause %q: %s", profile.Key, clause, profile.SystemPrompt)
+		}
+	}
+}
+
 func TestProfilesMergesP4WithoutDuplicatingOrOverwriting(t *testing.T) {
 	base := append(agentapp.P1Profiles(), agentapp.P2Profiles()...)
 	base = append(base, agentapp.P3Profiles()...)
