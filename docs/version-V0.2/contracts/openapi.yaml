@@ -2869,18 +2869,19 @@ components:
           enum: [active, disabled]
     ResetPasswordRequest:
       type: object
-      required: [password]
+      required: [new_password]
       properties:
-        password:
+        new_password:
           type: string
           minLength: 8
           maxLength: 128
+          description: 管理端重置密码；与实现一致（POST /api/admin/users/{id}/reset-password）
     UpdateSettingRequest:
       type: object
+      required: [value]
       properties:
         value:
-          nullable: true
-          description: 新值；非 secret 必填；secret 可省略或 null（表示不修改），空串表示清空
+          description: 新值；P0 目录没有 secret 键，null 被 400 拒绝；空串表示清空字符串
     CreateLLMConfigRequest:
       type: object
       required: [name, base_url]
