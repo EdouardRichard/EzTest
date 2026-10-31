@@ -318,6 +318,9 @@ func (r *ReportRepository) CreateRevision(ctx context.Context, revision delivery
 // html_ref/render_status='done'/status='published' and the report points its
 // current_revision_id at it with status='published' and the new fingerprint.
 // Published revisions are immutable: finalizing one again is a state conflict.
+// Publishing never moves the report backwards: a revision lower than the
+// current or the highest published revision is a stale finalize and is
+// rejected without touching either row.
 func (r *ReportRepository) FinalizePublished(ctx context.Context, reportID int64, revision int32, htmlRef int64, fingerprint string) error {
 	ctx = contextOrBackground(ctx)
 	if reportID <= 0 || revision <= 0 || htmlRef <= 0 || !validFingerprint(fingerprint) {
@@ -347,6 +350,31 @@ func (r *ReportRepository) FinalizePublished(ctx context.Context, reportID int64
 		return wrapReportDB("finalize report: lock revision", err)
 	}
 	if delivery.ReportStatus(revisionStatus) == delivery.ReportStatusPublished {
+		return delivery.ErrStateConflict
+	}
+	// Publishing must never move the report backwards. The report row lock above
+	// serializes this check with concurrent finalizers: a revision below the
+	// current one (or below the highest published revision) is a stale finalize
+	// from a slower writer and is rejected before any write.
+	var currentRevision, maxPublishedRevision int32
+	if err := tx.QueryRow(ctx, `
+		SELECT
+			COALESCE((
+				SELECT cur.revision
+				FROM delivery_report_revision cur
+				WHERE cur.id = r.current_revision_id AND cur.report_id = r.id
+			), 0),
+			COALESCE((
+				SELECT MAX(pub.revision)
+				FROM delivery_report_revision pub
+				WHERE pub.report_id = r.id AND pub.status = 'published'
+			), 0)
+		FROM delivery_report r
+		WHERE r.id = $1
+	`, reportID).Scan(&currentRevision, &maxPublishedRevision); err != nil {
+		return wrapReportDB("finalize report: load revision monotonicity", err)
+	}
+	if revision < currentRevision || revision < maxPublishedRevision {
 		return delivery.ErrStateConflict
 	}
 	now := nowUTC()

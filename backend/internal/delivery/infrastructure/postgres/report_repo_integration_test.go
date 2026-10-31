@@ -314,6 +314,123 @@ func TestReportRepoRevisionAndFinalize(t *testing.T) {
 	}
 }
 
+// TestReportRepoFinalizeMonotonic covers the no-backwards-move guard of publish
+// finalization: a revision lower than the report's current revision or lower
+// than the highest published revision is a state conflict that leaves both the
+// report header and the rejected revision untouched.
+func TestReportRepoFinalizeMonotonic(t *testing.T) {
+	repo, pool := newReportRepoForTest(t)
+	ctx := context.Background()
+
+	// Publishing r1 then r2 keeps r2 current; finalizing the older revision
+	// again is a conflict.
+	waveID := int64(700)
+	report := reportRepoCreateReport(t, repo, delivery.Report{
+		VersionID: 100, WaveID: &waveID, Kind: delivery.ReportKindWave,
+	})
+	reportRepoCreateRevision(t, repo, report.ID, 1)
+	second := reportRepoCreateRevision(t, repo, report.ID, 2)
+	firstFingerprint := reportRepoFingerprint("c")
+	secondFingerprint := reportRepoFingerprint("d")
+	if err := repo.FinalizePublished(ctx, report.ID, 1, 9001, firstFingerprint); err != nil {
+		t.Fatalf("FinalizePublished r1: %v", err)
+	}
+	if err := repo.FinalizePublished(ctx, report.ID, 2, 9002, secondFingerprint); err != nil {
+		t.Fatalf("FinalizePublished r2: %v", err)
+	}
+	if err := repo.FinalizePublished(ctx, report.ID, 1, 9003, reportRepoFingerprint("e")); !errors.Is(err, delivery.ErrStateConflict) {
+		t.Fatalf("finalize published r1 after r2 error = %v, want ErrStateConflict", err)
+	}
+	current, err := repo.GetReport(ctx, 100, report.ID)
+	if err != nil {
+		t.Fatalf("GetReport after rejected finalize: %v", err)
+	}
+	if current.CurrentRevisionID == nil || *current.CurrentRevisionID != second.ID ||
+		current.InputFingerprint != secondFingerprint || current.Status != delivery.ReportStatusPublished {
+		t.Fatalf("rejected finalize moved current backwards: %+v", current)
+	}
+	firstStored, err := repo.GetRevision(ctx, report.ID, 1)
+	if err != nil || firstStored.Status != delivery.ReportStatusPublished ||
+		firstStored.HTMLRef == nil || *firstStored.HTMLRef != 9001 ||
+		firstStored.InputFingerprint != firstFingerprint {
+		t.Fatalf("rejected finalize changed r1: %+v err=%v", firstStored, err)
+	}
+
+	// A draft revision below the current one must not move the pointer
+	// backwards; this is the finalize race the row lock has to serialize.
+	otherWaveID := int64(701)
+	draftReport := reportRepoCreateReport(t, repo, delivery.Report{
+		VersionID: 100, WaveID: &otherWaveID, Kind: delivery.ReportKindWave,
+	})
+	reportRepoCreateRevision(t, repo, draftReport.ID, 1)
+	higher := reportRepoCreateRevision(t, repo, draftReport.ID, 2)
+	higherFingerprint := reportRepoFingerprint("f")
+	if err := repo.FinalizePublished(ctx, draftReport.ID, 2, 9102, higherFingerprint); err != nil {
+		t.Fatalf("FinalizePublished higher draft: %v", err)
+	}
+	currentBefore, err := repo.GetReport(ctx, 100, draftReport.ID)
+	if err != nil {
+		t.Fatalf("GetReport before backwards attempt: %v", err)
+	}
+	lowerBefore, err := repo.GetRevision(ctx, draftReport.ID, 1)
+	if err != nil {
+		t.Fatalf("GetRevision before backwards attempt: %v", err)
+	}
+	if err := repo.FinalizePublished(ctx, draftReport.ID, 1, 9101, reportRepoFingerprint("1")); !errors.Is(err, delivery.ErrStateConflict) {
+		t.Fatalf("finalize lower draft revision error = %v, want ErrStateConflict", err)
+	}
+	currentAfter, err := repo.GetReport(ctx, 100, draftReport.ID)
+	if err != nil {
+		t.Fatalf("GetReport after backwards attempt: %v", err)
+	}
+	if currentAfter.CurrentRevisionID == nil || *currentAfter.CurrentRevisionID != higher.ID ||
+		currentAfter.InputFingerprint != higherFingerprint || currentAfter.Status != delivery.ReportStatusPublished ||
+		!currentAfter.UpdatedAt.Equal(currentBefore.UpdatedAt) {
+		t.Fatalf("rejected lower draft changed report: before=%+v after=%+v", currentBefore, currentAfter)
+	}
+	lowerAfter, err := repo.GetRevision(ctx, draftReport.ID, 1)
+	if err != nil {
+		t.Fatalf("GetRevision after backwards attempt: %v", err)
+	}
+	if lowerAfter.Status != delivery.ReportStatusDraft || lowerAfter.RenderStatus != "pending" ||
+		lowerAfter.HTMLRef != nil || lowerAfter.InputFingerprint != lowerBefore.InputFingerprint ||
+		!lowerAfter.UpdatedAt.Equal(lowerBefore.UpdatedAt) {
+		t.Fatalf("rejected lower draft changed revision: before=%+v after=%+v", lowerBefore, lowerAfter)
+	}
+	higherAfter, err := repo.GetRevision(ctx, draftReport.ID, 2)
+	if err != nil || higherAfter.Status != delivery.ReportStatusPublished ||
+		higherAfter.HTMLRef == nil || *higherAfter.HTMLRef != 9102 ||
+		higherAfter.InputFingerprint != higherFingerprint {
+		t.Fatalf("current revision changed by rejected lower draft: %+v err=%v", higherAfter, err)
+	}
+
+	// The highest published revision bounds finalization even when the current
+	// pointer is missing (defense in depth against a partial header write).
+	lastWaveID := int64(702)
+	lastReport := reportRepoCreateReport(t, repo, delivery.Report{
+		VersionID: 100, WaveID: &lastWaveID, Kind: delivery.ReportKindWave,
+	})
+	reportRepoCreateRevision(t, repo, lastReport.ID, 1)
+	reportRepoCreateRevision(t, repo, lastReport.ID, 2)
+	if err := repo.FinalizePublished(ctx, lastReport.ID, 2, 9202, reportRepoFingerprint("2")); err != nil {
+		t.Fatalf("FinalizePublished max published revision: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE delivery_report SET current_revision_id = NULL WHERE id = $1`, lastReport.ID); err != nil {
+		t.Fatalf("clear current revision: %v", err)
+	}
+	if err := repo.FinalizePublished(ctx, lastReport.ID, 1, 9201, reportRepoFingerprint("3")); !errors.Is(err, delivery.ErrStateConflict) {
+		t.Fatalf("finalize below max published error = %v, want ErrStateConflict", err)
+	}
+	lastCurrent, err := repo.GetReport(ctx, 100, lastReport.ID)
+	if err != nil || lastCurrent.CurrentRevisionID != nil {
+		t.Fatalf("rejected finalize set a current revision: %+v err=%v", lastCurrent, err)
+	}
+	lastLower, err := repo.GetRevision(ctx, lastReport.ID, 1)
+	if err != nil || lastLower.Status != delivery.ReportStatusDraft || lastLower.HTMLRef != nil {
+		t.Fatalf("rejected finalize below max published changed r1: %+v err=%v", lastLower, err)
+	}
+}
+
 // TestReportRepoRefsAndWaveReportID covers append-only refs, their idempotent
 // insert and the run_wave.report_id backfill.
 func TestReportRepoRefsAndWaveReportID(t *testing.T) {
