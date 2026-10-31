@@ -206,7 +206,7 @@ P1 工具：
 ### 6.2 对话与消息
 - 创建 conversation（P1 只 clarification）：标题默认 `需求澄清 YYYY-MM-DD HH:mm`，1–120 字；创建 opening 任务。
 - 用户消息 parts：`text`（1–20000 字）和/或 `attachment`（≤10 个）；至少一个非空；`client_message_id` 幂等（≤64，唯一）。
-- assistant 消息由 runtime 写入；parts 可含 `text`、`requirement_card`、`rollback_proposal`、`attachment_activity`。
+- assistant 消息由 runtime 写入；parts 只含 `text`、`requirement_card`、`rollback_proposal`；附件活动通过 `agent.activity`/团队帖子展示，不新增消息 part。
 - 历史消息按 id 游标分页（默认 100，最大 200）；SSE 事件包含完整 message 对象。
 - 摘要：`conversation_summary` 每 conversation 保留最新版本；`pinned_facts` 最多 20 条、每条 ≤500 字。
 - 职责切分（Q3/Q4）：`conversation_message` 只存 UI 线程（user/assistant + parts）；`agent_message` 存 LLM transcript（system/assistant/tool、tool_calls、tool_call_id、usage）；不存在 `agent_session` 表，conversation 即人机会话，run 通过 work_item/agent_run 关联。`conversation_summary` 是线程级记忆，`context_packet` 是单 run 快照，二者都保留。
