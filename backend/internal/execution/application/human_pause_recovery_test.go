@@ -184,6 +184,11 @@ func TestHumanResolveResumesCase(t *testing.T) {
 	if f.events.count(EventHumanResolved) != 1 {
 		t.Fatalf("human_resolved events = %d", f.events.count(EventHumanResolved))
 	}
+	for _, event := range f.events.events {
+		if event.Type == EventCaseRunResumed && event.Channel != "version:100" {
+			t.Fatalf("case_run.resumed channel = %q, want version:100", event.Channel)
+		}
+	}
 }
 
 func TestHumanTimeoutFailsCase(t *testing.T) {
@@ -206,6 +211,11 @@ func TestHumanTimeoutFailsCase(t *testing.T) {
 	failed, _ := f.runs.Get(ctx, 500)
 	if failed.Status != execution.CaseRunFailed || failed.FailureClass != execution.FailureClassSession {
 		t.Fatalf("run = %s/%s, want failed/session", failed.Status, failed.FailureClass)
+	}
+	for _, event := range f.events.events {
+		if event.Type == EventCaseRunFinished && event.Channel != "version:100" {
+			t.Fatalf("case_run.finished channel = %q, want version:100", event.Channel)
+		}
 	}
 	if failed.Summary.VerdictReason != execution.VerdictReasonHumanTimeout {
 		t.Fatalf("verdict reason = %q", failed.Summary.VerdictReason)
