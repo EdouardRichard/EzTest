@@ -2,7 +2,24 @@ package delivery
 
 import (
 	"context"
+	"sort"
 	"time"
+)
+
+// Report input size caps (spec §6.1). A report never includes more than these
+// rows of each list; the capped lists keep the first N by ascending ID and the
+// snapshot records the truncation so the renderer can state it visibly.
+const (
+	MaxReportIssues   = 500
+	MaxReportWaves    = 200
+	MaxReportCaseRuns = 2000
+)
+
+// Stable section names of ReportSnapshot.TruncatedSections.
+const (
+	ReportTruncationIssues   = "issues"
+	ReportTruncationWaves    = "waves"
+	ReportTruncationCaseRuns = "case_runs"
 )
 
 // ReportSnapshot is the deterministic report input of spec §6.1. It is built
@@ -21,6 +38,76 @@ type ReportSnapshot struct {
 	VersionSUTs  []VersionSUTSnapshot
 	Coverage     CoverageSnapshot
 	GeneratedAt  time.Time
+	// TruncatedSections lists the input lists reduced to their §6.1 cap, in a
+	// stable order (issues, waves, case_runs). It is derived metadata, not part
+	// of the fingerprint payload; the renderer prints it as a visible
+	// truncation note. A ReportDataReader that already capped a list at the
+	// boundary sets the matching entry because the service cannot infer
+	// overflow from an exactly-capped list.
+	TruncatedSections []string
+}
+
+// CapReportSnapshot enforces the spec §6.1 report input caps: at most 500
+// issues, 200 waves and 2000 case_runs, keeping the first N by ascending ID.
+// The input is not mutated. TruncatedSections is merged with any truncation
+// markers a ReportDataReader already reported, so a pre-capped list at the
+// boundary still renders its visible note.
+func CapReportSnapshot(snapshot ReportSnapshot) ReportSnapshot {
+	sections := append([]string(nil), snapshot.TruncatedSections...)
+	var cappedIssues, cappedWaves, cappedCaseRuns bool
+	snapshot.Issues, cappedIssues = capReportRows(snapshot.Issues, MaxReportIssues, func(row IssueSnapshot) int64 { return row.ID })
+	snapshot.Waves, cappedWaves = capReportRows(snapshot.Waves, MaxReportWaves, func(row WaveSnapshot) int64 { return row.ID })
+	snapshot.CaseRuns, cappedCaseRuns = capReportRows(snapshot.CaseRuns, MaxReportCaseRuns, func(row CaseRunSnapshot) int64 { return row.ID })
+	if cappedIssues {
+		sections = append(sections, ReportTruncationIssues)
+	}
+	if cappedWaves {
+		sections = append(sections, ReportTruncationWaves)
+	}
+	if cappedCaseRuns {
+		sections = append(sections, ReportTruncationCaseRuns)
+	}
+	snapshot.TruncatedSections = canonicalTruncationSections(sections)
+	return snapshot
+}
+
+// capReportRows returns rows unchanged when in budget and otherwise a copy
+// sorted by ascending ID truncated to limit. Slicing a sorted copy keeps the
+// original snapshot (and therefore reader caches) untouched.
+func capReportRows[T any](rows []T, limit int, id func(T) int64) ([]T, bool) {
+	if len(rows) <= limit {
+		return rows, false
+	}
+	sorted := make([]T, len(rows))
+	copy(sorted, rows)
+	sort.SliceStable(sorted, func(i, j int) bool { return id(sorted[i]) < id(sorted[j]) })
+	return sorted[:limit], true
+}
+
+// canonicalTruncationSections deduplicates markers and orders the known
+// sections canonically (issues, waves, case_runs) so the rendered note is
+// deterministic; unknown reader-provided markers follow in input order.
+func canonicalTruncationSections(sections []string) []string {
+	if len(sections) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(sections))
+	result := make([]string, 0, len(sections))
+	for _, name := range []string{ReportTruncationIssues, ReportTruncationWaves, ReportTruncationCaseRuns} {
+		for _, candidate := range sections {
+			if candidate == name && !seen[name] {
+				seen[name] = true
+				result = append(result, name)
+			}
+		}
+	}
+	for _, name := range sections {
+		if !seen[name] {
+			seen[name] = true
+			result = append(result, name)
+		}
+	}
+	return result
 }
 
 // SectionOptions controls which report sections are rendered (spec §6.2). A

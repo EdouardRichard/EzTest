@@ -138,7 +138,7 @@ func (r *HTMLRenderer) Render(ctx context.Context, snapshot delivery.ReportSnaps
 
 func (r *HTMLRenderer) renderTruncated(data *renderData, state *truncationState) ([]byte, error) {
 	data.Truncated = true
-	data.TruncationNote = state.note()
+	data.TruncationNote = joinTruncationNotes(data.SnapshotTruncationNote, state.note())
 	return r.render(data)
 }
 
@@ -184,6 +184,9 @@ type renderData struct {
 	HasNarrative    bool
 	Truncated       bool
 	TruncationNote  string
+	// SnapshotTruncationNote is the §6.1 cap note derived from the snapshot's
+	// TruncatedSections. The 2 MiB truncation pass appends its own note to it.
+	SnapshotTruncationNote string
 }
 
 // summaryView is the deterministic section summary. Numbers come from the
@@ -222,6 +225,11 @@ func newRenderData(snapshot delivery.ReportSnapshot, narrative string, opts deli
 		VersionID:       snapshot.VersionID,
 		GeneratedAt:     formatTime(snapshot.GeneratedAt),
 		Sections:        opts,
+	}
+	if note := snapshotTruncationNote(snapshot.TruncatedSections); note != "" {
+		data.Truncated = true
+		data.SnapshotTruncationNote = note
+		data.TruncationNote = note
 	}
 	if snapshot.Kind == delivery.ReportKindWave {
 		data.KindLabel = "波次报告"
@@ -419,6 +427,54 @@ func (s *truncationState) note() string {
 	}
 	return "为满足 2 MiB 上限，已按 issues → waves → case_runs 顺序逐步减半并保留 ID 较小的条目。当前保留：" +
 		strings.Join(parts, "；") + "。"
+}
+
+// snapshotTruncationNote renders the visible §6.1 input-cap note. Only the
+// sections named by the snapshot are mentioned; unknown reader-provided markers
+// are still surfaced verbatim so no truncation is silent.
+func snapshotTruncationNote(sections []string) string {
+	if len(sections) == 0 {
+		return ""
+	}
+	labels := map[string]string{
+		delivery.ReportTruncationIssues:   fmt.Sprintf("问题（≤%d）", delivery.MaxReportIssues),
+		delivery.ReportTruncationWaves:    fmt.Sprintf("波次（≤%d）", delivery.MaxReportWaves),
+		delivery.ReportTruncationCaseRuns: fmt.Sprintf("执行结果（≤%d）", delivery.MaxReportCaseRuns),
+	}
+	parts := make([]string, 0, len(sections))
+	seen := make(map[string]bool, len(sections))
+	for _, name := range []string{
+		delivery.ReportTruncationIssues,
+		delivery.ReportTruncationWaves,
+		delivery.ReportTruncationCaseRuns,
+	} {
+		for _, candidate := range sections {
+			if candidate == name && !seen[name] {
+				seen[name] = true
+				parts = append(parts, labels[name])
+			}
+		}
+	}
+	for _, name := range sections {
+		if !seen[name] {
+			seen[name] = true
+			parts = append(parts, name)
+		}
+	}
+	return "报告输入超过规模上限，已按 ID 升序仅保留前 N 条：" + strings.Join(parts, "；") + "。"
+}
+
+// joinTruncationNotes combines the input-cap note with the 2 MiB truncation
+// note without repeating either part across the iterative halving passes.
+func joinTruncationNotes(snapshotNote, sizeNote string) string {
+	switch {
+	case snapshotNote == "":
+		return sizeNote
+	case sizeNote == "":
+		return snapshotNote
+	default:
+		return snapshotNote + " " + sizeNote
+	}
 }
 
 func formatInt64Ptr(value *int64) string {
