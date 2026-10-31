@@ -9,8 +9,10 @@
 //
 // The frozen migration contract (contracts/migrations-order.md §6) *and* the
 // on-disk migration set (`backend/internal/db/migrations/`) are asserted: the
-// four P4 SQL files must exist and `order.txt` must apply all 24 migrations,
-// ending with the P4 four.
+// four P4 SQL files must exist non-empty, `order.txt` must keep the frozen 20
+// P0-P3 entries as positions 1-20, and positions 21-24 must be the P4 four.
+// The order check is forward-compatible: a later phase may append a unique
+// #25+ without re-pinning P4.
 const fs = require("node:fs")
 const path = require("node:path")
 
@@ -585,8 +587,9 @@ for (const [heading, freeze] of [
   check(dbSchemaText.includes(freeze), `db-schema.md missing ${freeze}`)
 }
 
-const section10Start = dbSchemaText.search(/^## 10\. P4 增量表结构/m)
-const section10 = section10Start >= 0 ? dbSchemaText.slice(section10Start) : ""
+// Slice §10 at the next `##` heading, never to EOF: a later phase appending a
+// §11 section must not be able to satisfy P4 assertions with P5+ text.
+const section10 = sliceSection(dbSchemaText, /^## 10\. P4 增量表结构/m)
 check(section10.length > 0, "db-schema.md missing §10 P4 section")
 check(section10.includes("frozen: P4"), "db-schema.md §10 must be marked frozen: P4")
 const p4Tables = [
@@ -685,30 +688,10 @@ for (const [order, file, owner] of p4Migrations) {
   check(section6.includes(owner), `migrations-order.md §6 missing ownership ${owner} for ${file}`)
 }
 
-// On-disk migrations are part of the frozen P4 delivery: the four SQL files
-// must exist and `order.txt` must apply all 24 migrations, P4 last.
-const p4MigrationFiles = p4Migrations.map(([, file]) => file)
-for (const file of p4MigrationFiles) {
-  const absolute = path.join(migrationsDir, file)
-  check(fs.existsSync(absolute) && fs.statSync(absolute).isFile(), `missing on-disk P4 migration ${file}`)
-}
-const orderPath = path.join(migrationsDir, "order.txt")
-let orderLines = []
-try {
-  orderLines = fs
-    .readFileSync(orderPath, "utf8")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0 && !line.startsWith("#"))
-} catch (error) {
-  failures.push(`missing migration order.txt: ${error.message}`)
-}
-check(orderLines.length === 24, `order.txt must apply 24 migrations, found ${orderLines.length}`)
-check(
-  JSON.stringify(orderLines.slice(-p4MigrationFiles.length)) === JSON.stringify(p4MigrationFiles),
-  "order.txt must end with the four P4 migrations in order",
-)
-for (const priorMigration of lines(`
+// The frozen P0-P3 baseline, in applied order. This one source anchors both
+// the contract text (migrations-order.md §5a-§5c) and the on-disk order.txt
+// prefix, so deleting one prior line and duplicating another cannot pass.
+const priorMigrations = lines(`
 settings_0001_settings.sql
 identity_0001_identity.sql
 llm_0001_llm.sql
@@ -729,7 +712,57 @@ storage_0002_export_artifact.sql
 execution_0001_intent_wave.sql
 execution_0002_result_evidence.sql
 execution_0003_executor_human.sql
-`)) {
+`)
+
+// On-disk migrations are part of the frozen P4 delivery: the four SQL files
+// must exist non-empty, the first 20 `order.txt` entries must be the frozen
+// P0-P3 baseline, and entries 21-24 must be the four P4 files.
+//
+// Mutation-proof intent (exercised by the task-0c mutation harness on a
+// temporary mirror; the real repo is never mutated):
+//  - missing/duplicate prior: deleting one P0-P3 line and duplicating another
+//    keeps the count at 24 and the P4 last-four intact; the frozen first-20
+//    slice must reject it.
+//  - reordered prior: swapping two P0-P3 entries keeps count/tail but breaks
+//    the frozen-prefix slice.
+//  - missing/duplicate/reordered P4: the #21-#24 slice rejects substitutions
+//    even when another line pads the total.
+//  - P3 triple: execution_* stays at order indices 17-19 (0-based); enforced
+//    by p3-contract-check.cjs and required by this prefix slice.
+//  - forward compatibility: `>= 24` and unique entries let a later phase
+//    append a unique #25 without re-pinning P4; only positions 1-24 are frozen.
+const p4MigrationFiles = p4Migrations.map(([, file]) => file)
+for (const file of p4MigrationFiles) {
+  const absolute = path.join(migrationsDir, file)
+  const present = fs.existsSync(absolute) && fs.statSync(absolute).isFile()
+  check(present, `missing on-disk P4 migration ${file}`)
+  if (present) {
+    check(fs.statSync(absolute).size > 0, `on-disk P4 migration ${file} must be non-empty`)
+  }
+}
+const orderPath = path.join(migrationsDir, "order.txt")
+let orderLines = []
+try {
+  orderLines = fs
+    .readFileSync(orderPath, "utf8")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"))
+} catch (error) {
+  failures.push(`missing migration order.txt: ${error.message}`)
+}
+check(orderLines.length >= 24, `order.txt must apply at least 24 migrations (P0-P3 + P4), found ${orderLines.length}`)
+check(
+  JSON.stringify(orderLines.slice(0, priorMigrations.length)) === JSON.stringify(priorMigrations),
+  "order.txt must keep the frozen 20 P0-P3 migrations as its first 20 entries in order",
+)
+check(
+  JSON.stringify(orderLines.slice(priorMigrations.length, priorMigrations.length + p4MigrationFiles.length)) ===
+    JSON.stringify(p4MigrationFiles),
+  "order.txt must list the four P4 migrations at positions 21-24",
+)
+check(new Set(orderLines).size === orderLines.length, "order.txt must not list any migration file more than once")
+for (const priorMigration of priorMigrations) {
   check(migrationsOrderText.includes(priorMigration), `migrations-order.md missing P0-P3 migration ${priorMigration}`)
 }
 for (const section of ["## 5a. P1 迁移清单", "## 5b. P2 迁移清单", "## 5c. P3 增量迁移"]) {
@@ -763,6 +796,17 @@ for (const event of eventTypes) {
   check(p4EventTypes.includes(event), `events.md §13 missing event ${event}`)
 }
 check(p4EventTypes.length >= eventTypes.length, `events.md §13 must keep all ${eventTypes.length} P4 event rows`)
+// Per-row payload column: emptying one row's payload cell must fail even when
+// the same field name survives in another row or in prose.
+if (eventTable) {
+  const eventRows = new Map(
+    tableDataRows(eventTable).map((cells) => [(cells[0] ?? "").replace(/`/g, "").trim(), cells]),
+  )
+  for (const event of eventTypes) {
+    const payload = eventRows.get(event)?.[2] ?? ""
+    check(payload.trim().length > 0, `events.md §13 event ${event} must list its payload fields`)
+  }
+}
 for (const payloadField of [
   "issue_id",
   "merged_into_id",
@@ -874,6 +918,19 @@ check(section7.includes("version_id"), "agent-profiles-tools.md §7 must documen
 check(section7.includes("versionId"), "agent-profiles-tools.md §7 must state schemas exclude versionId")
 for (const budget of ["max_turns:6", "soft_seconds:180", "hard_seconds:300"]) {
   check(profileTableText.includes(budget), `agent-profiles-tools.md §7 missing budget ${budget}`)
+}
+// Per-row budgets: every profile must carry the full budget triple in its own
+// row, not merely somewhere in the section.
+if (profileTable) {
+  const profileRows = new Map(
+    tableDataRows(profileTable).map((cells) => [(cells[0] ?? "").replace(/`/g, "").trim(), cells]),
+  )
+  for (const profile of p4Profiles) {
+    const budgets = profileRows.get(profile)?.[2] ?? ""
+    for (const budget of ["max_turns:6", "soft_seconds:180", "hard_seconds:300"]) {
+      check(budgets.includes(budget), `agent-profiles-tools.md §7 profile ${profile} missing budget ${budget}`)
+    }
+  }
 }
 check(
   /不得伪造|不得尝试确认|只调用白名单/.test(section7),
