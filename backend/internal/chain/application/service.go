@@ -31,10 +31,15 @@ type ChainService struct {
 	resource  ResourceChainProvider
 	cursor    CursorReader
 	clock     Clock
+	budget    chain.Budget
 }
 
-// NewChainService wires the five chain providers, the snapshot-cursor reader
-// and the clock. A nil clock falls back to the system clock.
+// NewChainService wires the five chain providers, the snapshot-cursor reader,
+// the clock and the configured chain budget. A nil clock falls back to the
+// system clock. The optional budget is the chain.max_nodes / chain.max_edges /
+// chain.max_requirements tuple from settings (spec §4.5), clamped through
+// domain.ClampBudget; omitting it keeps the spec defaults. At most one budget
+// is read; extra values are ignored.
 func NewChainService(
 	version VersionChainProvider,
 	design DesignChainProvider,
@@ -43,9 +48,14 @@ func NewChainService(
 	resource ResourceChainProvider,
 	cursor CursorReader,
 	clock Clock,
+	budgets ...chain.Budget,
 ) *ChainService {
 	if clock == nil {
 		clock = systemClock{}
+	}
+	configured := chain.Budget{}
+	if len(budgets) > 0 {
+		configured = budgets[0]
 	}
 	return &ChainService{
 		version:   version,
@@ -55,6 +65,7 @@ func NewChainService(
 		resource:  resource,
 		cursor:    cursor,
 		clock:     clock,
+		budget:    chain.ClampBudget(configured),
 	}
 }
 
@@ -66,9 +77,21 @@ func (s *ChainService) Read(ctx context.Context, versionID int64, f chain.ChainF
 		return chain.ChainView{}, fmt.Errorf("chain: version_id must be positive: %d", versionID)
 	}
 	f = f.Normalize()
-	budget := chain.ClampBudget(chain.Budget{})
+	budget := chain.ClampBudget(s.budget)
 
-	requirements, err := s.version.Requirements(ctx, versionID, budget.MaxRequirements)
+	// Ask for one requirement root beyond the configured budget. A provider that
+	// honors the limit then returns MaxRequirements+1 roots when the dataset is
+	// larger than the budget, and BuildChain truncates to MaxRequirements with
+	// Truncated=true / reason=requirement_budget instead of silently serving the
+	// full page. Providers that cap the page lower than requested (the real
+	// version provider pages through platform/pagination.MaxLimit=100) silently
+	// hide the extra root: the view then reports no truncation and Counts
+	// describe only the returned page. That residual silent provider cap is
+	// accepted in P4 because the VersionChainProvider port exposes no "has more"
+	// signal; fixing it needs a provider change, not a chain one. A provider that
+	// ignores the limit and returns more than MaxRequirements+1 is still
+	// truncated deterministically by BuildChain.
+	requirements, err := s.version.Requirements(ctx, versionID, budget.MaxRequirements+1)
 	if err != nil {
 		return chain.ChainView{}, providerError("load requirements", err)
 	}

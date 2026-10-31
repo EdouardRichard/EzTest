@@ -611,6 +611,94 @@ func TestBuildChainRequirementBudget(t *testing.T) {
 	})
 }
 
+// filteredRootSource builds a chain where requirement 4 does not match the SUT
+// filter while its scenario, case, run, issue and closure do. Requirements 1..3
+// are budget candidates, so MaxRequirements: 2 truncates requirement 1 and its
+// subtree. Requirement 4 was never a budget candidate: its subtree must survive
+// even though its root is not part of the filtered graph.
+func filteredRootSource() SourceGraph {
+	src := SourceGraph{
+		SUTs:  map[int64]string{},
+		Pages: map[int64]string{},
+	}
+	start := time.Date(2026, 10, 30, 8, 0, 0, 0, time.UTC)
+	for index := int64(1); index <= 3; index++ {
+		requirement := testNode(NodeRequirement, index, "Requirement "+itoa(index))
+		requirement.Status = "clarified"
+		requirement.VersionSUTIDs = []int64{6}
+		requirement.CreatedAt = start.Add(time.Duration(index) * time.Hour)
+
+		scenario := testNode(NodeScenario, 10+index, "Scenario "+itoa(index))
+		scenario.RequirementID = int64Ptr(index)
+		scenario.VersionSUTIDs = []int64{6}
+
+		caseVersion := testNode(NodeCaseVersion, 100+index, "Case "+itoa(index))
+		caseVersion.RequirementID = int64Ptr(index)
+		caseVersion.ScenarioID = int64Ptr(10 + index)
+		caseVersion.VersionSUTIDs = []int64{6}
+
+		src.Requirements = append(src.Requirements, requirement)
+		src.Scenarios = append(src.Scenarios, scenario)
+		src.Cases = append(src.Cases, caseVersion)
+	}
+
+	orphan := testNode(NodeRequirement, 4, "Requirement 4")
+	orphan.Status = "clarified"
+	scenario := testNode(NodeScenario, 14, "Scenario 4")
+	scenario.RequirementID = int64Ptr(4)
+	scenario.VersionSUTIDs = []int64{6}
+	caseVersion := testNode(NodeCaseVersion, 104, "Case 4")
+	caseVersion.RequirementID = int64Ptr(4)
+	caseVersion.ScenarioID = int64Ptr(14)
+	caseVersion.VersionSUTIDs = []int64{6}
+	caseRun := testNode(NodeCaseRun, 204, "Run 4")
+	caseRun.CaseVersionID = int64Ptr(104)
+	caseRun.VersionSUTIDs = []int64{6}
+	issue := testNode(NodeIssue, 304, "Issue 4")
+	issue.CaseRunID = int64Ptr(204)
+	issue.VersionSUTIDs = []int64{6}
+	closure := testNode(NodeClosure, 404, "Closed 4")
+	closure.RequirementID = int64Ptr(4)
+	closure.VersionSUTIDs = []int64{6}
+
+	src.Requirements = append(src.Requirements, orphan)
+	src.Scenarios = append(src.Scenarios, scenario)
+	src.Cases = append(src.Cases, caseVersion)
+	src.CaseRuns = append(src.CaseRuns, caseRun)
+	src.Issues = append(src.Issues, issue)
+	src.Closures = append(src.Closures, closure)
+	return src
+}
+
+func TestBuildChainRequirementBudgetKeepsFilteredRootDescendants(t *testing.T) {
+	now := time.Date(2026, 11, 1, 5, 0, 0, 0, time.UTC)
+
+	view := BuildChain(
+		filteredRootSource(),
+		ChainFilter{VersionSUTID: int64Ptr(6)},
+		Budget{MaxRequirements: 2},
+		0,
+		now,
+	)
+
+	if !view.Truncated || view.Truncation.Reason != TruncationReasonRequirementBudget {
+		t.Fatalf("truncation = %+v, want requirement_budget", view.Truncation)
+	}
+	// Requirements 2 and 3 are the budget candidates that stay, with their
+	// subtrees; requirement 1's subtree is truncated with its root. Requirement
+	// 4's whole subtree survives because the filter (not the budget) removed the
+	// root, so the budget never considered it.
+	assertNodeIDs(t, view,
+		"requirement:2", "scenario:12", "case_version:102",
+		"requirement:3", "scenario:13", "case_version:103",
+		"scenario:14", "case_version:104", "case_run:204", "issue:304", "closure:404",
+	)
+	if _, ok := nodeIndex(view.Nodes)["requirement:1"]; ok {
+		t.Errorf("requirement:1 survived the requirement budget: %v", sortedNodeIDs(view.Nodes))
+	}
+	assertNoDanglingEdges(t, view)
+}
+
 func TestBuildChainNodeBudget(t *testing.T) {
 	now := time.Date(2026, 11, 1, 5, 0, 0, 0, time.UTC)
 
@@ -641,6 +729,29 @@ func TestBuildChainNodeBudget(t *testing.T) {
 	})
 }
 
+func TestBuildChainNodeBudgetDropsRequirementUnits(t *testing.T) {
+	now := time.Date(2026, 11, 1, 5, 0, 0, 0, time.UTC)
+
+	// 12 filtered nodes: low-priority layers are dropped first, then the oldest
+	// requirement unit (requirement + closure) is removed to reach MaxNodes.
+	view := BuildChain(requirementBudgetSource(), ChainFilter{}, Budget{MaxNodes: 4}, 0, now)
+
+	assertNodeIDs(t, view,
+		"requirement:2", "requirement:3",
+		"closure:402", "closure:403",
+	)
+	if !view.Truncated || view.Truncation.Reason != TruncationReasonNodeBudget {
+		t.Errorf("truncation = %+v, want node_budget", view.Truncation)
+	}
+	if got := view.Truncation.MaxNodes; got != 4 {
+		t.Errorf("Truncation.MaxNodes = %d, want 4", got)
+	}
+	if got := view.Counts["requirements"]; got != 3 {
+		t.Errorf("Counts[requirements] = %d, want the pre-truncation count 3", got)
+	}
+	assertNoDanglingEdges(t, view)
+}
+
 func TestBuildChainEdgeBudget(t *testing.T) {
 	now := time.Date(2026, 11, 1, 5, 0, 0, 0, time.UTC)
 	view := BuildChain(completeSource(), ChainFilter{}, Budget{MaxEdges: 5}, 0, now)
@@ -662,6 +773,39 @@ func TestBuildChainEdgeBudget(t *testing.T) {
 		if _, ok := got[want]; !ok {
 			t.Errorf("edge %+v missing from %v", want, view.Edges)
 		}
+	}
+}
+
+func TestBuildChainEdgeBudgetProtectsFocusPath(t *testing.T) {
+	now := time.Date(2026, 11, 1, 5, 0, 0, 0, time.UTC)
+
+	// 13 induced edges; the five issue:300 ancestry edges bypass the edge budget
+	// even though the second case's has_case/executed_by edges would otherwise
+	// win by the plain priority order.
+	view := BuildChain(filterSource(), ChainFilter{FocusNode: "issue:300"}, Budget{MaxEdges: 5}, 0, now)
+
+	if !view.Truncated || view.Truncation.Reason != TruncationReasonEdgeBudget {
+		t.Fatalf("truncation = %+v, want edge_budget", view.Truncation)
+	}
+	want := []edgeKey{
+		{From: "requirement:1", To: "scenario:10", Kind: EdgeHasScenario},
+		{From: "scenario:10", To: "case_version:100", Kind: EdgeHasCase},
+		{From: "case_version:100", To: "case_run:200", Kind: EdgeExecutedBy},
+		{From: "wave:7", To: "case_run:200", Kind: EdgeContains},
+		{From: "case_run:200", To: "issue:300", Kind: EdgeRaised},
+	}
+	if len(view.Edges) != len(want) {
+		t.Fatalf("edges = %v, want the five protected focus path edges", view.Edges)
+	}
+	got := edgeKeys(view.Edges)
+	for _, edge := range want {
+		if _, ok := got[edge]; !ok {
+			t.Errorf("focus path edge %+v missing from %v", edge, view.Edges)
+		}
+	}
+	unprotected := edgeKey{From: "scenario:10", To: "case_version:101", Kind: EdgeHasCase}
+	if _, ok := got[unprotected]; ok {
+		t.Errorf("unprotected second-branch edge %+v survived the edge budget: %v", unprotected, view.Edges)
 	}
 }
 

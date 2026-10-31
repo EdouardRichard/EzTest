@@ -39,8 +39,11 @@ type fakeProviders struct {
 	calls            []string
 	versionIDs       map[string]int64
 	requirementLimit int
-	historicalIDs    []int64
-	cursorChannel    string
+	// requirementOverflow makes Requirements ignore limit, mimicking a provider
+	// that returns a larger page than the chain service asked for.
+	requirementOverflow bool
+	historicalIDs       []int64
+	cursorChannel       string
 }
 
 func newFakeProviders() *fakeProviders {
@@ -64,6 +67,10 @@ func (f *fakeProviders) Requirements(ctx context.Context, versionID int64, limit
 		return nil, err
 	}
 	f.requirementLimit = limit
+	// Mirror the real VersionProvider pagination: return at most limit roots.
+	if !f.requirementOverflow && limit > 0 && len(f.requirements) > limit {
+		return f.requirements[:limit], nil
+	}
 	return f.requirements, nil
 }
 
@@ -239,6 +246,22 @@ func newService(fakes *fakeProviders, now time.Time) *ChainService {
 	return NewChainService(fakes, fakes, fakes, fakes, fakes, fakes, fakeClock{now: now})
 }
 
+// newServiceWithBudget wires the same fakes with an explicit chain budget, the
+// way P4 settings wiring (task 23) constructs the service.
+func newServiceWithBudget(fakes *fakeProviders, now time.Time, budget chain.Budget) *ChainService {
+	return NewChainService(fakes, fakes, fakes, fakes, fakes, fakes, fakeClock{now: now}, budget)
+}
+
+// requirementRoots returns count bare requirement roots. Their zero timestamps
+// make the builder's tie-break select the highest ref IDs.
+func requirementRoots(count int) []chain.Node {
+	nodes := make([]chain.Node, 0, count)
+	for id := int64(1); id <= int64(count); id++ {
+		nodes = append(nodes, chainNode(chain.NodeRequirement, id, "Requirement "+strconv.FormatInt(id, 10)))
+	}
+	return nodes
+}
+
 func TestChainServiceReadAssemblesView(t *testing.T) {
 	fakes := completeFakes()
 	now := time.Date(2026, 11, 1, 5, 0, 0, 0, time.UTC)
@@ -324,11 +347,122 @@ func TestChainServiceReadAssemblesView(t *testing.T) {
 	if slices.Contains(fakes.calls, "historical") {
 		t.Errorf("historical reader called without a missing case version: %v", fakes.calls)
 	}
-	if fakes.requirementLimit != chain.DefaultMaxRequirements {
-		t.Errorf("Requirements limit = %d, want %d", fakes.requirementLimit, chain.DefaultMaxRequirements)
+	if fakes.requirementLimit != chain.DefaultMaxRequirements+1 {
+		t.Errorf("Requirements limit = %d, want MaxRequirements+1 = %d", fakes.requirementLimit, chain.DefaultMaxRequirements+1)
 	}
 	if fakes.cursorChannel != "version:42" {
 		t.Errorf("cursor channel = %q, want version:42", fakes.cursorChannel)
+	}
+}
+
+// TestChainServiceRequirementBudgetTruncation covers the end-to-end path of the
+// requirement root budget: the service asks the provider for one root more than
+// chain.max_requirements so BuildChain can truncate and report
+// requirement_budget instead of silently serving exactly the budget page.
+func TestChainServiceRequirementBudgetTruncation(t *testing.T) {
+	now := time.Date(2026, 11, 1, 5, 0, 0, 0, time.UTC)
+
+	t.Run("requests one root beyond the budget and reports truncation", func(t *testing.T) {
+		fakes := newFakeProviders()
+		fakes.cursor = 7
+		fakes.requirements = requirementRoots(chain.DefaultMaxRequirements + 1)
+
+		view, err := newService(fakes, now).Read(context.Background(), 42, chain.ChainFilter{})
+		if err != nil {
+			t.Fatalf("Read() error = %v", err)
+		}
+
+		if got := fakes.requirementLimit; got != chain.DefaultMaxRequirements+1 {
+			t.Errorf("Requirements limit = %d, want MaxRequirements+1 = %d", got, chain.DefaultMaxRequirements+1)
+		}
+		if !view.Truncated || view.Truncation.Reason != chain.TruncationReasonRequirementBudget {
+			t.Fatalf("truncation = %+v, want requirement_budget", view.Truncation)
+		}
+		if got := view.Truncation.MaxRequirements; got != chain.DefaultMaxRequirements {
+			t.Errorf("Truncation.MaxRequirements = %d, want %d", got, chain.DefaultMaxRequirements)
+		}
+		if got := len(view.Nodes); got != chain.DefaultMaxRequirements {
+			t.Errorf("nodes = %d, want the %d selected requirements", got, chain.DefaultMaxRequirements)
+		}
+		if got := view.Counts["requirements"]; got != chain.DefaultMaxRequirements+1 {
+			t.Errorf("Counts[requirements] = %d, want the provider page %d before truncation", got, chain.DefaultMaxRequirements+1)
+		}
+		nodes := make(map[string]bool, len(view.Nodes))
+		for _, node := range view.Nodes {
+			nodes[node.ID] = true
+		}
+		if nodes[chain.NodeID(chain.NodeRequirement, 1)] {
+			t.Errorf("oldest requirement survived the root budget: %v", view.Nodes)
+		}
+		if !nodes[chain.NodeID(chain.NodeRequirement, int64(chain.DefaultMaxRequirements+1))] {
+			t.Errorf("newest requirement missing after the root budget: %v", view.Nodes)
+		}
+	})
+
+	t.Run("a provider returning more than the requested page is still truncated", func(t *testing.T) {
+		fakes := newFakeProviders()
+		fakes.cursor = 7
+		fakes.requirementOverflow = true
+		fakes.requirements = requirementRoots(chain.DefaultMaxRequirements + 5)
+
+		view, err := newService(fakes, now).Read(context.Background(), 42, chain.ChainFilter{})
+		if err != nil {
+			t.Fatalf("Read() error = %v", err)
+		}
+		if got := fakes.requirementLimit; got != chain.DefaultMaxRequirements+1 {
+			t.Errorf("Requirements limit = %d, want MaxRequirements+1 = %d", got, chain.DefaultMaxRequirements+1)
+		}
+		if !view.Truncated || view.Truncation.Reason != chain.TruncationReasonRequirementBudget {
+			t.Fatalf("truncation = %+v, want requirement_budget", view.Truncation)
+		}
+		if got := len(view.Nodes); got != chain.DefaultMaxRequirements {
+			t.Errorf("nodes = %d, want %d", got, chain.DefaultMaxRequirements)
+		}
+		if got := view.Counts["requirements"]; got != chain.DefaultMaxRequirements+5 {
+			t.Errorf("Counts[requirements] = %d, want the full provider page %d", got, chain.DefaultMaxRequirements+5)
+		}
+	})
+}
+
+// TestChainServiceUsesConfiguredBudget pins the constructor budget: the service
+// must apply the configured chain.max_nodes/chain.max_edges/
+// chain.max_requirements instead of ClampBudget(Budget{}), and ChainFilter.Limit
+// stays a lower-only override of the configured node budget. Task 23 passes the
+// settings through the same constructor.
+func TestChainServiceUsesConfiguredBudget(t *testing.T) {
+	now := time.Date(2026, 11, 1, 5, 0, 0, 0, time.UTC)
+
+	fakes := completeFakes()
+	service := newServiceWithBudget(fakes, now, chain.Budget{MaxNodes: 3, MaxEdges: 2, MaxRequirements: 2})
+	view, err := service.Read(context.Background(), 42, chain.ChainFilter{})
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+
+	if view.Truncation.MaxNodes != 3 || view.Truncation.MaxEdges != 2 || view.Truncation.MaxRequirements != 2 {
+		t.Errorf("Truncation = %+v, want the configured maxima nodes=3 edges=2 requirements=2", view.Truncation)
+	}
+	if !view.Truncated || view.Truncation.Reason != chain.TruncationReasonNodeBudget {
+		t.Errorf("truncation = %+v, want node_budget", view.Truncation)
+	}
+	if got := len(view.Nodes); got != 3 {
+		t.Errorf("nodes = %d, want the configured node budget 3: %v", got, view.Nodes)
+	}
+	if got := fakes.requirementLimit; got != 3 {
+		t.Errorf("Requirements limit = %d, want MaxRequirements+1 = 3", got)
+	}
+
+	lower := completeFakes()
+	lowered, err := newServiceWithBudget(lower, now, chain.Budget{MaxNodes: 5}).
+		Read(context.Background(), 42, chain.ChainFilter{Limit: 50})
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if got := lowered.Truncation.MaxNodes; got != 5 {
+		t.Errorf("Truncation.MaxNodes = %d, want the configured budget 5 (limit is lower-only)", got)
+	}
+	if got := lower.requirementLimit; got != chain.DefaultMaxRequirements+1 {
+		t.Errorf("Requirements limit = %d, want the default MaxRequirements+1 = %d", got, chain.DefaultMaxRequirements+1)
 	}
 }
 

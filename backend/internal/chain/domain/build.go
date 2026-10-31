@@ -54,6 +54,12 @@ var chainCountKeys = []string{
 // per-node, and truncation is reported through ChainView.Truncated/Truncation.
 // The caller (ChainService) fills ChainView.VersionID because the version is
 // not part of the node graph itself.
+//
+// Counts describe the filter (and focus) result before any budget truncation:
+// they never shrink because a budget dropped nodes or edges. Focus-protected
+// nodes and the focus ancestry path edges are exempt from the budgets, so they
+// keep their place in Counts even when the configured maxima are smaller than
+// the protected set.
 func BuildChain(src SourceGraph, f ChainFilter, b Budget, snapshotCursor int64, now time.Time) ChainView {
 	f = f.Normalize()
 	b = ClampBudget(b)
@@ -634,7 +640,9 @@ func nodeInWave(node Node, waveID int64) bool {
 }
 
 // focus returns the target node plus every ancestor reachable through the
-// semantic parent links, and the exact path edges used by the BFS.
+// semantic parent links, and the exact path edges used by the BFS. The
+// protected set bypasses the requirement and node budgets; the path edges are
+// prioritized by the edge budget.
 func (g *chainGraph) focus(focusNode string) (map[string]bool, map[edgeIdentity]bool) {
 	target, ok := normalizeFocusNode(focusNode)
 	if !ok {
@@ -680,6 +688,9 @@ func normalizeFocusNode(raw string) (string, bool) {
 	return NodeID(kind, id), true
 }
 
+// counts tallies the keep set after filtering and focus protection, before any
+// budget truncation (spec §8.3: counts are the filtered counts, truncation is
+// reported separately).
 func (g *chainGraph) counts(keep map[string]bool) map[string]int {
 	counts := make(map[string]int, len(chainCountKeys))
 	for _, key := range chainCountKeys {
@@ -738,8 +749,15 @@ func (g *chainGraph) applyRequirementBudget(keep map[string]bool, max int, prote
 				delete(out, id)
 			}
 		case NodeClosure, NodeScenario, NodeCaseVersion:
-			if node.RequirementID != nil && !selected[NodeID(NodeRequirement, *node.RequirementID)] {
-				delete(out, id)
+			if node.RequirementID != nil {
+				// Only a requirement that is part of the filtered graph was a
+				// budget candidate. A filtered-out root was never selected, but
+				// the filter (not the budget) removed it, so its subtree must not
+				// be cascaded away here.
+				requirementID := NodeID(NodeRequirement, *node.RequirementID)
+				if keep[requirementID] && !selected[requirementID] {
+					delete(out, id)
+				}
 			}
 		}
 	}
@@ -771,7 +789,8 @@ func (g *chainGraph) applyRequirementBudget(keep map[string]bool, max int, prote
 					caseRunID := NodeID(NodeCaseRun, *node.CaseRunID)
 					drop = keep[caseRunID] && !out[caseRunID]
 				} else if node.RequirementID != nil {
-					drop = !selected[NodeID(NodeRequirement, *node.RequirementID)]
+					requirementID := NodeID(NodeRequirement, *node.RequirementID)
+					drop = keep[requirementID] && !selected[requirementID]
 				}
 			}
 			if drop {
