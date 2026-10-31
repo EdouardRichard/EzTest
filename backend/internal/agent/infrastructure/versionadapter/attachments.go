@@ -9,12 +9,19 @@ import (
 )
 
 // GetAttachment implements agentapp.AttachmentReader for attachment.ingest
-// runs. The version service exposes the originating message ID (not the
-// conversation ID), so ConversationID stays zero here; ingest runs take the
-// conversation scope from the work-item payload.
+// runs. It first runs the idempotent version-side extraction (parse failures
+// become a failed status/error, not a Go error), then returns the refreshed
+// attachment with its extracted text. The version service exposes the
+// originating message ID (not the conversation ID), so ConversationID stays
+// zero here; ingest runs take the conversation scope from the work-item payload.
 func (a *Adapter) GetAttachment(ctx context.Context, versionID, attachmentID int64) (agentapp.AttachmentInfo, error) {
 	if a.attachments == nil {
 		return agentapp.AttachmentInfo{}, a.missing("attachments")
+	}
+	// Extraction is idempotent: pending/processing rows are parsed, done/failed
+	// rows return their stored state. Only infrastructure errors are retryable.
+	if _, err := a.attachments.Extract(ctx, attachmentID); err != nil {
+		return agentapp.AttachmentInfo{}, err
 	}
 	info, err := a.attachments.GetAttachmentInfo(ctx, versionID, attachmentID)
 	if err != nil {

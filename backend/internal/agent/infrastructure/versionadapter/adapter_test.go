@@ -97,11 +97,16 @@ func (f *fakeStorage) Upload(ctx context.Context, filename, mime string, r io.Re
 }
 
 type fakeAttachments struct {
+	extractFn  func(ctx context.Context, attachmentID int64) (versionapp.ExtractionResult, error)
 	getInfoFn  func(ctx context.Context, versionID, attachmentID int64) (versionapp.AttachmentInfo, error)
 	listFn     func(ctx context.Context, versionID, conversationID int64) ([]versionapp.AttachmentMeta, error)
 	readTextFn func(ctx context.Context, versionID, conversationID, attachmentID int64, offset, maxChars int) (string, int, error)
 	imageRefFn func(ctx context.Context, versionID, conversationID, attachmentID int64) (versionapp.AttachmentImageRef, error)
 	pendingFn  func(ctx context.Context, limit int) ([]versionapp.PendingAttachment, error)
+}
+
+func (f *fakeAttachments) Extract(ctx context.Context, attachmentID int64) (versionapp.ExtractionResult, error) {
+	return f.extractFn(ctx, attachmentID)
 }
 
 func (f *fakeAttachments) GetAttachmentInfo(ctx context.Context, versionID, attachmentID int64) (versionapp.AttachmentInfo, error) {
@@ -472,6 +477,9 @@ func TestAttachmentReaderMapsInfo(t *testing.T) {
 	messageID := int64(77)
 	requirementID := int64(501)
 	fake := &fakeAttachments{
+		extractFn: func(_ context.Context, attachmentID int64) (versionapp.ExtractionResult, error) {
+			return versionapp.ExtractionResult{}, nil
+		},
 		getInfoFn: func(_ context.Context, versionID, attachmentID int64) (versionapp.AttachmentInfo, error) {
 			if versionID != 10 || attachmentID != 9 {
 				return versionapp.AttachmentInfo{}, platform.NotFound("attachment")
@@ -565,6 +573,69 @@ func TestAttachmentPortMapsListReadImage(t *testing.T) {
 	}
 	if _, err := empty.ListAttachments(ctx, 10, 20); err == nil {
 		t.Fatal("ListAttachments succeeded without attachment service")
+	}
+}
+
+func TestGetAttachmentRunsIdempotentExtraction(t *testing.T) {
+	ctx := context.Background()
+	var extracted int64
+	var extractedCalls int
+	fake := &fakeAttachments{
+		extractFn: func(_ context.Context, attachmentID int64) (versionapp.ExtractionResult, error) {
+			extracted = attachmentID
+			extractedCalls++
+			return versionapp.ExtractionResult{Chars: 5}, nil
+		},
+		getInfoFn: func(_ context.Context, versionID, attachmentID int64) (versionapp.AttachmentInfo, error) {
+			return versionapp.AttachmentInfo{
+				ID: 9, VersionID: 10, Name: "login-spec.md", MIME: "text/markdown",
+				Status: "done", Text: "hello", TotalChars: 5,
+			}, nil
+		},
+	}
+	adapter := versionadapter.New(nil, nil, nil, fake, nil)
+
+	info, err := adapter.GetAttachment(ctx, 10, 9)
+	if err != nil {
+		t.Fatalf("GetAttachment: %v", err)
+	}
+	if extracted != 9 || extractedCalls != 1 {
+		t.Fatalf("extract calls = %d id=%d", extractedCalls, extracted)
+	}
+	if info.Status != "done" || info.Text != "hello" || info.TotalChars != 5 {
+		t.Fatalf("info = %#v", info)
+	}
+
+	// A failed parse is a domain outcome: no Go error, failed status/error is
+	// returned to the Scout instead of retrying forever.
+	failed := &fakeAttachments{
+		extractFn: func(_ context.Context, attachmentID int64) (versionapp.ExtractionResult, error) {
+			return versionapp.ExtractionResult{ErrorCode: "unsupported_attachment_format"}, nil
+		},
+		getInfoFn: func(_ context.Context, versionID, attachmentID int64) (versionapp.AttachmentInfo, error) {
+			return versionapp.AttachmentInfo{
+				ID: 9, VersionID: 10, Name: "legacy.doc", MIME: "application/msword",
+				Status: "failed", ErrorCode: "unsupported_attachment_format", ErrorText: "legacy doc",
+			}, nil
+		},
+	}
+	failedAdapter := versionadapter.New(nil, nil, nil, failed, nil)
+	info, err = failedAdapter.GetAttachment(ctx, 10, 9)
+	if err != nil {
+		t.Fatalf("failed extraction returned an error: %v", err)
+	}
+	if info.Status != "failed" || !strings.Contains(info.Error, "unsupported_attachment_format") {
+		t.Fatalf("info = %#v", info)
+	}
+
+	// Infrastructure failures stay retryable Go errors.
+	broken := &fakeAttachments{
+		extractFn: func(_ context.Context, attachmentID int64) (versionapp.ExtractionResult, error) {
+			return versionapp.ExtractionResult{}, &platform.Error{Status: 500, Code: "internal"}
+		},
+	}
+	if _, err := versionadapter.New(nil, nil, nil, broken, nil).GetAttachment(ctx, 10, 9); err == nil {
+		t.Fatal("extraction infrastructure error was swallowed")
 	}
 }
 

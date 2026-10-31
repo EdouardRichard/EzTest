@@ -95,13 +95,13 @@ func TestEventsSnapshotAndSSEReplayWithPostgres(t *testing.T) {
 	}
 	var snapshot struct {
 		Data           []json.RawMessage `json:"data"`
-		SnapshotCursor string            `json:"snapshot_cursor"`
+		SnapshotCursor int64             `json:"snapshot_cursor"`
 		HasMore        bool              `json:"has_more"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&snapshot); err != nil {
 		t.Fatalf("decode snapshot: %v", err)
 	}
-	if len(snapshot.Data) != 2 || snapshot.SnapshotCursor != "2" || snapshot.HasMore {
+	if len(snapshot.Data) != 2 || snapshot.SnapshotCursor != 2 || snapshot.HasMore {
 		t.Fatalf("snapshot = %#v", snapshot)
 	}
 

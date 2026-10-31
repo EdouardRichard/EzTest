@@ -175,8 +175,12 @@ func main() {
 	ports := versionadapter.New(requirementSvc, conversationSvc, versionSvc, attachmentSvc, storageSvc)
 
 	instanceID := fmt.Sprintf("%s-%d", hostName(), os.Getpid())
+	runtimeRepo := agentpg.NewRuntimeRepository(pool, ids)
+	if _, err := agentapp.EnsureProfiles(ctx, runtimeRepo); err != nil {
+		log.Fatalf("eztest: seed agent profiles: %v", err)
+	}
 	runner := agentapp.NewRunner(agentapp.RunnerDeps{
-		Runtime:      agentpg.NewRuntimeRepository(pool, ids),
+		Runtime:      runtimeRepo,
 		Chat:         llmSvc,
 		Settings:     settingsSvc,
 		Clock:        clk,
