@@ -380,10 +380,26 @@ func (s *HumanService) resumeCaseRun(ctx context.Context, caseRunID, actorID int
 	if _, err := s.caseRuns.Update(ctx, run); err != nil {
 		return mapExecutionError(err, "case run")
 	}
-	publishEvent(ctx, s.events, EventCaseRunResumed, run.WaveID,
+	// The SSE channel is always version:{version_id}; run.WaveID is not a
+	// version id (S8 acceptance caught the bogus version:{wave_id} channel).
+	versionID, err := s.caseRunVersionID(ctx, run)
+	if err != nil {
+		return err
+	}
+	publishEvent(ctx, s.events, EventCaseRunResumed, versionID,
 		map[string]any{"case_run_id": platformid.Format(run.ID)},
 		map[string]any{"case_run_id": platformid.Format(run.ID)}, actorPtr(actorID))
 	return s.resumeWaveAfterHuman(ctx, caseRunID, actorID)
+}
+
+// caseRunVersionID resolves the owning version for a case_run. RunWave is the
+// only bridge because case_run deliberately stores no cross-context version id.
+func (s *HumanService) caseRunVersionID(ctx context.Context, run execution.CaseRun) (int64, error) {
+	wave, err := s.waves.Get(ctx, run.WaveID)
+	if err != nil {
+		return 0, mapExecutionError(err, "wave")
+	}
+	return wave.VersionID, nil
 }
 
 // resumeWaveAfterHuman resumes a waiting_human wave once it has no other open
@@ -456,7 +472,11 @@ func (s *HumanService) failCaseRun(ctx context.Context, caseRunID int64, reason 
 	if _, err := s.caseRuns.Update(ctx, run); err != nil {
 		return mapExecutionError(err, "case run")
 	}
-	publishEvent(ctx, s.events, EventCaseRunFinished, derefID(&run.WaveID),
+	versionID, err := s.caseRunVersionID(ctx, run)
+	if err != nil {
+		return err
+	}
+	publishEvent(ctx, s.events, EventCaseRunFinished, versionID,
 		map[string]any{"case_run_id": platformid.Format(run.ID)},
 		map[string]any{
 			"case_run_id":   platformid.Format(run.ID),
