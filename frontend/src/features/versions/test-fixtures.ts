@@ -246,6 +246,8 @@ export const versionFixture: Version = {
   title: "订单中心 · 2026 Q4 迭代",
   status: "running",
   auto_design_new_requirements: false,
+  pending_design_count: 2,
+  case_counts: { draft: 3, confirmed: 2, stale: 1 },
   bindings: [
     {
       id: "3001",

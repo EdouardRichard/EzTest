@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import { createVersion, getResourceCatalog, getVersion, listVersions } from "./api"
+import { createVersion, getResourceCatalog, getVersion, listVersions, updateVersion } from "./api"
 import { catalogFixture, versionFixture, versionSummaryFixture } from "./test-fixtures"
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -78,5 +78,19 @@ describe("versions API", () => {
     expect(url).toBe("http://localhost:13333/api/versions")
     expect(init?.method).toBe("POST")
     expect(JSON.parse(String(init?.body))).toEqual(payload)
+  })
+
+  it("patches the auto design flag for the version", async () => {
+    const updated = { ...versionFixture, auto_design_new_requirements: true }
+    fetchMock.mockResolvedValue(jsonResponse({ data: updated }))
+
+    await expect(updateVersion("2001", { auto_design_new_requirements: true })).resolves.toEqual(
+      updated,
+    )
+
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe("http://localhost:13333/api/versions/2001")
+    expect(init?.method).toBe("PATCH")
+    expect(JSON.parse(String(init?.body))).toEqual({ auto_design_new_requirements: true })
   })
 })

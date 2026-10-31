@@ -248,6 +248,45 @@ export async function apiGetPage<T>(path: string, init: ApiFetchOptions = {}): P
 
 type RequestOptions = Omit<ApiFetchOptions, "method" | "body">
 
+function decodeFilename(value: string): string {
+  const encoded = /filename\*=UTF-8''([^;]+)/i.exec(value)
+  if (encoded !== null) {
+    const candidate = encoded[1].trim().replace(/^"|"$/g, "")
+    try {
+      return decodeURIComponent(candidate)
+    } catch {
+      return candidate
+    }
+  }
+  const quoted = /filename="([^"]*)"/i.exec(value)
+  if (quoted !== null) return quoted[1]
+  const bare = /filename=([^;]+)/i.exec(value)
+  return bare === null ? "" : bare[1].trim()
+}
+
+/** One authenticated binary download (export bytes). */
+export type ApiDownload = {
+  blob: Blob
+  /** Resolved from `Content-Disposition`; empty when the header is absent. */
+  filename: string
+  contentType: string
+}
+
+/**
+ * Downloads a binary endpoint through the same bearer/401/error-envelope path
+ * as `apiFetch`. Feature code never calls `fetch` directly and never has to
+ * parse `Content-Disposition` itself (spec §7.4).
+ */
+export async function apiDownload(path: string, init: RequestOptions = {}): Promise<ApiDownload> {
+  const response = await performRequest(path, { ...init, method: "GET" })
+  if (!response.ok) throw await toApiError(response)
+  return {
+    blob: await response.blob(),
+    filename: decodeFilename(response.headers.get("content-disposition") ?? ""),
+    contentType: response.headers.get("content-type") ?? "",
+  }
+}
+
 export function apiGet<T>(path: string, init: RequestOptions = {}): Promise<T> {
   return apiFetch<T>(path, { ...init, method: "GET" })
 }

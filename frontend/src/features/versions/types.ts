@@ -123,6 +123,13 @@ export type VersionSummary = {
   updated_at: string
 }
 
+/** Current case-version projection for one version (P2 spec §7.1/§9.2). */
+export type VersionCaseCounts = {
+  draft: number
+  confirmed: number
+  stale: number
+}
+
 export type VersionBinding = {
   id: string
   sut: SutResource
@@ -140,9 +147,18 @@ export type Version = {
   status: VersionStatus
   auto_design_new_requirements: boolean
   bindings: VersionBinding[]
+  /** P2: clarified requirements not activated into any design round yet. */
+  pending_design_count: number
+  /** P2: current case versions by status; `superseded` history is excluded. */
+  case_counts: VersionCaseCounts
   created_by: string
   created_at: string
   updated_at: string
+}
+
+/** `PATCH /api/versions/{id}` (P0 allowed fields + P2 auto-design flag). */
+export type UpdateVersionRequest = {
+  auto_design_new_requirements?: boolean
 }
 
 /** `CreateVersionRequest` from the OpenAPI contract. */
