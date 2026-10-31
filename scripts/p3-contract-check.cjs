@@ -3,10 +3,12 @@
 //
 // Two modes:
 //   --draft : stage-internal mode. Asserts the P3 increments are present while
-//             openapi.yaml still carries `x-draft: P3` (the stage-end freeze
-//             flips it to `x-frozen: P3`).
-//   default : frozen mode. Asserts `x-frozen: P3` and no `x-draft`.
+//             openapi.yaml still carries a draft/frozen marker at P3 or later.
+//   default : frozen mode. Asserts the P3 increments are present and the root is
+//             frozen at P3 or later (P4+ keeps this check forward-compatible).
 //
+// Forward-compatible by design (P4-D-10): every P3 increment is asserted item
+// by item, but P4+ totals (migrations, events, settings) are never hard-coded.
 // The OpenAPI document is parsed with the frontend's `yaml` dependency; the
 // markdown contracts are checked with plain string searches and small parsers.
 // Exits non-zero with a list of missing items.
@@ -19,6 +21,10 @@ const migrationsDir = path.join(root, "backend", "internal", "db", "migrations")
 const yaml = require(path.join(root, "frontend", "node_modules", "yaml"))
 
 const draftMode = process.argv.includes("--draft")
+const phaseOf = (value) => {
+  const match = /^P(\d+)$/.exec(value ?? "")
+  return match ? Number(match[1]) : 0
+}
 
 const failures = []
 const check = (ok, message) => {
@@ -38,11 +44,18 @@ try {
 }
 check(openapi && typeof openapi === "object", "openapi parses to an object")
 if (openapi && typeof openapi === "object") {
-  check(openapi.info?.version === "0.2.0-p3", "openapi info.version must be 0.2.0-p3")
+  const versionMatch = /^0\.2\.0-p(\d+)$/.exec(openapi.info?.version ?? "")
+  check(
+    versionMatch !== null && Number(versionMatch[1]) >= 3,
+    "openapi info.version must be 0.2.0-p3 or later (P3 increment present)",
+  )
   if (draftMode) {
-    check(openapi["x-draft"] === "P3", "draft mode: openapi root must have x-draft: P3")
+    check(
+      phaseOf(openapi["x-draft"]) >= 3 || phaseOf(openapi["x-frozen"]) >= 3,
+      "draft mode: openapi root must carry x-draft/x-frozen at P3 or later",
+    )
   } else {
-    check(openapi["x-frozen"] === "P3", "frozen mode: openapi root must have x-frozen: P3")
+    check(phaseOf(openapi["x-frozen"]) >= 3, "frozen mode: openapi root must be frozen at P3 or later")
     check(openapi["x-draft"] === undefined, "frozen mode: openapi root must not keep x-draft")
   }
 
@@ -192,14 +205,17 @@ const p3Events = [
 ]
 check(p3Events.length === 20, "p3 event table must list 20 events")
 const eventsText = readContract("events.md")
-check(/^## 12\. P3 增量事件/m.test(eventsText), "events.md missing §12 P3 section")
-check(eventsText.includes("frozen: P3"), "events.md §12 must be marked frozen: P3")
-const eventsSection = eventsText.slice(eventsText.search(/^## 12\. P3 增量事件/m))
+const eventsSectionStart = eventsText.search(/^## 12\. P3 增量事件/m)
+const eventsSectionFrom = eventsSectionStart >= 0 ? eventsText.slice(eventsSectionStart) : ""
+const nextEventsHeading = eventsSectionFrom.slice(1).search(/^## /m)
+const eventsSection = nextEventsHeading >= 0 ? eventsSectionFrom.slice(0, nextEventsHeading + 1) : eventsSectionFrom
+check(eventsSection.length > 0, "events.md missing §12 P3 section")
+check(eventsSection.includes("frozen: P3"), "events.md §12 must be marked frozen: P3")
 const eventRows = [...eventsSection.matchAll(/^\| `([a-z_.]+)` \|/gm)].map((match) => match[1])
 for (const event of p3Events) {
   check(eventRows.includes(event), `events.md §12 missing event ${event}`)
 }
-check(eventRows.length === 20, `events.md §12 must have exactly 20 event rows, found ${eventRows.length}`)
+check(eventRows.length >= p3Events.length, `events.md §12 must keep all ${p3Events.length} P3 events, found ${eventRows.length}`)
 check(eventsSection.includes("case_run.step_finished"), "events.md missing case_run.step_finished freeze note")
 check(eventsSection.includes("executor"), "events.md must state no executor.* business events (P3-D-30)")
 
@@ -272,7 +288,8 @@ for (const name of [
 check(dbSchemaText.includes("paths.evidence_dir"), "db-schema.md must record the paths.evidence_dir P3 exception")
 
 // ---------------------------------------------------------------------------
-// Migrations: 3 new files, order.txt entries 18-20, test counts 20.
+// Migrations: the 3 P3 files must stay present and ordered (P4+ appends only;
+// the migration total is intentionally not hard-coded).
 // ---------------------------------------------------------------------------
 const p3Migrations = [
   "execution_0001_intent_wave.sql",
@@ -286,17 +303,27 @@ const orderLines = read(path.join(migrationsDir, "order.txt"))
   .split(/\r?\n/)
   .map((line) => line.trim())
   .filter((line) => line.length > 0 && !line.startsWith("#"))
-check(orderLines.length === 20, `order.txt must list 20 migrations, found ${orderLines.length}`)
 check(p3Migrations.every((file) => orderLines.includes(file)), "order.txt missing P3 execution migrations")
+const p3OrderIndexes = p3Migrations.map((file) => orderLines.indexOf(file))
 check(
-  JSON.stringify(orderLines.slice(-3)) === JSON.stringify(p3Migrations),
-  "order.txt must append the 3 execution migrations at positions 18-20",
+  p3OrderIndexes[0] >= 0 &&
+    p3OrderIndexes[1] === p3OrderIndexes[0] + 1 &&
+    p3OrderIndexes[2] === p3OrderIndexes[1] + 1,
+  "order.txt must keep the 3 execution migrations consecutive and in order",
 )
 const migrateUnit = read(path.join(root, "backend", "internal", "db", "migrate_test.go"))
-check(/len\(migrations\)\s*!=\s*20/.test(migrateUnit), "migrate_test.go must expect 20 migrations")
-check(migrateUnit.includes("execution_0003_executor_human.sql"), "migrate_test.go must pin the last migration")
+const unitCount = /len\(migrations\)\s*!=\s*(\d+)/.exec(migrateUnit)
+check(
+  unitCount !== null && Number(unitCount[1]) >= 20,
+  "migrate_test.go must expect at least 20 migrations (P3 baseline preserved)",
+)
+check(migrateUnit.includes("orderedMigrations"), "migrate_test.go must keep the migration-order test")
 const migrateIntegration = read(path.join(root, "backend", "internal", "db", "migrate_integration_test.go"))
-check(/len\(applied\)\s*!=\s*20/.test(migrateIntegration), "migrate_integration_test.go must expect 20 migrations")
+const integrationCount = /len\(applied\)\s*!=\s*(\d+)/.exec(migrateIntegration)
+check(
+  integrationCount !== null && Number(integrationCount[1]) >= 20,
+  "migrate_integration_test.go must expect at least 20 migrations (P3 baseline preserved)",
+)
 check(migrateIntegration.includes("TestP3ExecutionTables"), "migrate_integration_test.go missing TestP3ExecutionTables")
 
 const migrationsOrderText = readContract("migrations-order.md")
@@ -322,7 +349,7 @@ check(section4.length > 0, "task-types.md §4 must be renamed to P4+ reserved ty
 for (const taskType of ["execute.case", "analyze.failure", "analyze.coverage"]) {
   check(!section4.includes(taskType), `task-types.md §4 must not list implemented type ${taskType}`)
 }
-check(section4.includes("`requirement.close`"), "task-types.md §4 must keep requirement.close reserved")
+check(taskTypesText.includes("`requirement.close`"), "task-types.md must keep requirement.close (reserved or implemented)")
 
 // ---------------------------------------------------------------------------
 // Profiles/tools: §6 with 3 profiles + P3 tools, §4b keeps only reserved tools.
@@ -375,11 +402,65 @@ for (const enabled of ["browser.*", "`human.request`", "`db.query`", "`execution
 }
 
 // ---------------------------------------------------------------------------
-// Settings: §3 grows to 49 keys (5 new execution keys) + §4c usage.
+// Settings: the P0/P3 keys must stay present item by item (P4 adds chain.*;
+// the total is intentionally not hard-coded).
 // ---------------------------------------------------------------------------
 const settingsText = readContract("settings.md")
 const settingsKeys = [...settingsText.matchAll(/^\|\s*\d+\s*\|\s*`([^`]+)`\s*\|/gm)].map((match) => match[1])
-check(settingsKeys.length === 49, `settings.md §3 must list 49 keys, found ${settingsKeys.length}`)
+check(settingsKeys.length >= 49, `settings.md must keep at least 49 keys, found ${settingsKeys.length}`)
+for (const key of [
+  "runtime.snowflake_node_id",
+  "paths.data_root",
+  "paths.attachment_dir",
+  "paths.evidence_dir",
+  "paths.report_dir",
+  "paths.export_dir",
+  "execution.global_concurrency",
+  "execution.per_sut_concurrency",
+  "execution.cross_system_concurrency",
+  "execution.executor_url",
+  "execution.evidence_max_bytes",
+  "execution.case_timeout_seconds",
+  "agent.max_turns",
+  "agent.run_soft_timeout_seconds",
+  "agent.run_hard_timeout_seconds",
+  "agent.max_concurrent_runs",
+  "agent.tool_result_max_bytes",
+  "llm.request_timeout_seconds",
+  "llm.max_retries",
+  "context.window_tokens",
+  "context.output_reserve_tokens",
+  "context.compact_threshold",
+  "context.keep_recent_messages",
+  "team_room.digest_every_n_posts",
+  "team_room.digest_interval_minutes",
+  "team_room.digest_keep_versions",
+  "retention.temp_hours",
+  "retention.replaced_export_days",
+  "retention.unreferenced_content_days",
+  "retention.gc_grace_hours",
+  "retention.gc_dry_run",
+  "report.template_version",
+  "report.render_pdf",
+  "report.section_summary",
+  "report.section_results",
+  "report.section_issues",
+  "report.section_coverage",
+  "report.section_evidence",
+  "knowledge.injection_budget_tokens",
+  "knowledge.review_required",
+  "security.audit_retention_days",
+  "security.mask_secrets",
+  "feature.auto_gap_design",
+  "feature.experimental",
+  "execution.executor_token",
+  "execution.executor_heartbeat_seconds",
+  "execution.executor_offline_seconds",
+  "execution.executor_context_ttl_seconds",
+  "execution.human_request_timeout_seconds",
+]) {
+  check(settingsKeys.includes(key), `settings.md missing key ${key}`)
+}
 for (const key of [
   "execution.executor_token",
   "execution.executor_heartbeat_seconds",

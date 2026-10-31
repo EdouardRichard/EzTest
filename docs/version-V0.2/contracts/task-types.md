@@ -62,9 +62,9 @@
 
 ## 4. P4+ 保留类型（不实现、不创建）
 
-`requirement.close`、`issue.triage`、`report.wave`、`report.version`、`report.render_pdf`、`knowledge.review`、`version.close`、`gc.run`、`index.repo`、`visual.*`、`search.*`。
+`report.render_pdf`、`knowledge.review`、`gc.run`、`index.repo`、`visual.*`、`search.*`。
 
-这些保留类型在后续阶段写入本文件并扩展 work_item/worker；当前阶段不注册对应 profile、不创建任务。
+P4 已把 5 个预留类型移入 §6 并实现；`report.render_pdf` 仍保留、不注册（PDF 属 P7）。其余保留类型在后续阶段写入本文件并扩展 work_item/worker；当前阶段不注册对应 profile、不创建任务。
 
 ## 5. P3 任务类型（实现；`frozen: P3`，2026-11-01）
 
@@ -82,3 +82,22 @@ P3 把 `execute.case`、`analyze.failure`、`analyze.coverage` 三个类型从 �
 - `execute.case` 的租约/心跳沿用 P1：lease 30s、heartbeat 10s；runner 写结果/证据必须匹配 `dispatch_epoch+dispatch_token` CAS。
 - 恢复语义：offline/lease 过期 → 同 case_run `interrupted→pending`（attempts+1、epoch+1，最多 3 次）→ 新 `execute.case`；旧 epoch 写回 409。
 - `analyze.*` 任务在 wave 终态后由确定性兜底先写 `failure_class`/`summary`/候选事件/`design.gap`，Agent 只做增强与解释；Agent 失败不回滚。
+
+## 6. P4 任务类型（实现；`frozen: P4`，2026-11-01）
+
+P4 把 `issue.triage`、`report.wave`、`report.version`、`requirement.close`、`version.close` 五个类型从 §4 移到本节并实现（P4-D-01/P4-D-02/P4-D-06）。
+
+| type | team | profile | dedupe_key | payload | 输出 | 失败语义 |
+|---|---|---|---|---|---|---|
+| `issue.triage` | delivery | `issue_triager` | `triage:{issue_id}` | `{issue_id,version_id}` | `delivery_analysis_run`（done/degraded）+ 团队帖 + 合并/分诊建议（不改 issue 状态） | 可重试；最终 dead 不影响 issue/报告 |
+| `report.wave` | delivery | `report_writer` | `report:{report_id}:r{revision}` | `{report_id,wave_id,revision}` | 新 `delivery_report_revision`（HTML published）+ 事件 | 可重试；失败时 report/revision 保持 draft/failed，reconciler 补；不伪造 |
+| `report.version` | delivery | `report_writer` | `report:{report_id}:r{revision}` | `{report_id,version_id,revision}` | 新 `delivery_report_revision`（HTML published）+ 事件 | 可重试；版本收尾被阻断直到 published |
+| `requirement.close` | steward | `version_steward` | `req-close:{requirement_id}:{requirement_version_id}:{close_round}` | `{requirement_id,requirement_version_id,close_round}` | `requirement_closure` + requirement `closed` + 事件 | 校验失败 409（可重试）；最终 dead 可见；版本收尾阻断 |
+| `version.close` | steward | `version_steward` | `ver-close:{version_id}:{report_revision_id}:{predicate_fingerprint}` | `{version_id,report_revision_id,predicate_fingerprint}` | version `completed` + `closed_at/close_reason/close_run_id` + 事件 | 事务复核失败 409；最终 dead 可见；不自动降级 |
+
+- **创建者**：reconciler 检测到 wave 终态且无 published wave report → 创建 report 行 + ensure `report.wave`；版本报告条件满足 → ensure `report.version`；issue 候选创建后 ensure `issue.triage`；需求闭环条件满足 → ensure `requirement.close`；版本 close 谓词满足 → ensure `version.close`；API `regenerate` 计算 `revision = max+1` 后 ensure 新任务。重复 ensure 返回既有行，不新增。
+- `report.render_pdf` 继续保留、**不注册**（P7）。
+- 任务租约/心跳/退避/`dead` 沿用 P1/P3；`requirement.close`/`version.close` 不写 `waiting_human`。
+- `version.close` 任务自身从版本 close 谓词的“无开放任务”中排除；`predicate_fingerprint = sha256(canonical(version_id, requirement 状态集合, report_revision_id, open_counts...))`，状态变化自然产生新 dedupe key。
+- `report.wave`/`report.version` 的 revision 在任务创建时确定；同一 next revision 的活跃任务存在时幂等返回 202；旧 revision 不删除。
+- Agent 输出只作候选：`issue.propose` 不改 issue 状态；`report.narrative_propose` 不改统计数字；`requirement.goal_met`/`version.close_propose` 由服务端事务内重算校验，失败返回 409 带失败项（见 `agent-profiles-tools.md` §7）。

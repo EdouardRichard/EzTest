@@ -389,3 +389,34 @@ P3 业务事件一律发布到 `version:{id}` 频道；scope 使用十进制字�
 7. `human_request.resolved` 不携带 `code`/密码；只给状态。
 8. 事件持久化/回放/单实例 Hub 限制沿用 P0 §7；P3 不新增跨实例 fan-out（P7）。
 
+## 13. P4 增量事件（`frozen: P4`，2026-11-01）
+
+P4 业务事件一律发布到 `version:{id}` 频道；scope 使用十进制字符串。`version.closed`/`version.reopened` 同时发布到 `system`（P0 版本状态事件约定）。P0/P1/P2/P3 的频道/信封/SSE/游标/心跳/`stream.reset` 语义不变；P4 **不新增频道、不新增事件端点**，复用 `GET /api/events` 与 `GET /api/stream?channel=version:{id}`。
+
+### 13.1 事件类型（10 个）
+
+| type | 频道 | payload 关键字段 | 说明 |
+|---|---|---|---|
+| `issue.created` | `version:{id}` | `issue_id, status, category, severity, wave_id?, case_run_id?` | 失败候选创建 issue |
+| `issue.updated` | `version:{id}` | `issue_id, from_status, to_status, reason?` | 确认/驳回 |
+| `issue.reopened` | `version:{id}` | `issue_id, reopen_count, reason` | 重开 |
+| `issue.merged` | `version:{id}` | `issue_id, merged_into_id, reason?` | 合并 |
+| `report.published` | `version:{id}` | `report_id, report_revision_id, kind, wave_id?, revision, as_of, html_ref` | HTML 发布 |
+| `report.stale` | `version:{id}` | `report_id, kind, current_revision, reason` | 输入变化 |
+| `requirement.closed` | `version:{id}` | `requirement_id, requirement_version_id, closure_id, close_round, closed_by_run_id?` | 需求闭环 |
+| `requirement.reopened` | `version:{id}` | `requirement_id, from_status, to_status, reason` | 需求重开 |
+| `version.closed` | `version:{id}` + `system` | `version_id, close_run_id?, report_revision_id, closed_at, close_reason` | 版本收尾 |
+| `version.reopened` | `version:{id}` + `system` | `version_id, trigger, reason?` | 版本重开；`trigger=requirement_created/requirement_reopened/case_confirmed/execution_intent/manual` |
+
+### 13.2 约束
+
+1. 事件只作 UI 投影；业务真值以 DB/仓储为准，不以事件重建 issue/report/closure/version 状态。
+2. payload **不含**报告 HTML、证据字节、内部存储路径、凭据/密码/token、LLM prompt/输出、`content_ref` 以外的账本内部字段。
+3. `issue.created` 由候选创建（`INSERT ... ON CONFLICT DO NOTHING`）是否新建决定；重复扫描/事件不重复发；`issue.updated` 覆盖确认/驳回，`issue.reopened`/`issue.merged` 为独立类型。
+4. `report.published` 在报告发布事务提交后 best-effort 发布（含 `report_revision_id`/`as_of`/`html_ref`）；失败不回滚发布，reconciler 兜底。
+5. `report.stale` 每个 current revision 只发一次；已 stale 不重复发（reconciler 重算指纹触发）。
+6. `version.closed`/`version.reopened` 同时发 `version:{id}` 与 `system` 两条独立 `seq`；`trigger` 五值固定，人工重开为 `manual`。
+7. `requirement.closed` 只带服务端重算通过后的 closure 摘要（`closure_id/close_round/closed_by_run_id?`），不携带 `check_result` 全文/内部 SQL/凭据。
+8. 事件发布失败不回滚业务写；P4 仍为单实例 Hub，多副本 fan-out 属 P7。
+9. P4 冻结后 P5+ 只能增量新增事件类型，不得重命名/回退本表类型与 payload 语义。
+
