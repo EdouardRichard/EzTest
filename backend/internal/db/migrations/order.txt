@@ -1,0 +1,10 @@
+# EzTest 0.2 P0 migration order. Every embedded .sql file must appear exactly once.
+# Append new context migrations at the end; never reorder or edit an applied file.
+settings_0001_settings.sql
+identity_0001_identity.sql
+llm_0001_llm.sql
+eventing_0001_events.sql
+storage_0001_content_ledger.sql
+audit_0001_audit_log.sql
+resource_0001_catalog.sql
+version_0001_versions.sql
