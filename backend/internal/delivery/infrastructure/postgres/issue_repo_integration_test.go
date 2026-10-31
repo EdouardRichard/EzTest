@@ -5,6 +5,7 @@ package deliverypg
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	deliveryapp "github.com/EdouardRichard/EzTest/backend/internal/delivery/application"
@@ -404,20 +405,26 @@ func TestIssueRepoUpdateStatusCAS(t *testing.T) {
 		t.Fatalf("reopen history = %+v", last)
 	}
 
-	// Reopening an already open issue does not increment reopen_count.
-	reopenedAgain, err := repo.UpdateStatus(ctx, deliveryapp.IssueStatusUpdate{
+	// open -> open is illegal even without expected_revision: the repository
+	// re-applies the state machine under the row lock, so the rejected update
+	// leaves the status, revision, reopen_count and history untouched.
+	if _, err := repo.UpdateStatus(ctx, deliveryapp.IssueStatusUpdate{
 		VersionID: 100,
 		IssueID:   issue.ID,
 		To:        delivery.IssueStatusOpen,
 		Reason:    "duplicate reopen",
 		ActorID:   88,
 		ActorKind: "user",
-	})
-	if err != nil {
-		t.Fatalf("second reopen: %v", err)
+	}); !errors.Is(err, delivery.ErrStateConflict) {
+		t.Fatalf("open -> open error = %v, want ErrStateConflict", err)
 	}
-	if reopenedAgain.ExpectedRevision != 4 || reopenedAgain.ReopenCount != 1 {
-		t.Fatalf("second reopen issue = %+v", reopenedAgain)
+	unchanged, err := repo.Get(ctx, 100, issue.ID)
+	if err != nil || unchanged.Status != delivery.IssueStatusOpen ||
+		unchanged.ExpectedRevision != 3 || unchanged.ReopenCount != 1 {
+		t.Fatalf("illegal open -> open changed row: %+v err=%v", unchanged, err)
+	}
+	if history, err = repo.ListHistory(ctx, issue.ID); err != nil || len(history) != 3 {
+		t.Fatalf("illegal open -> open history = %d err=%v, want 3", len(history), err)
 	}
 
 	// dismiss -> open increments again; expected_revision is optional.
@@ -432,7 +439,7 @@ func TestIssueRepoUpdateStatusCAS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dismiss: %v", err)
 	}
-	if dismissed.Status != delivery.IssueStatusDismissed || dismissed.ExpectedRevision != 5 || dismissed.ReopenCount != 1 {
+	if dismissed.Status != delivery.IssueStatusDismissed || dismissed.ExpectedRevision != 4 || dismissed.ReopenCount != 1 {
 		t.Fatalf("dismissed issue = %+v", dismissed)
 	}
 	reopenedThird, err := repo.UpdateStatus(ctx, deliveryapp.IssueStatusUpdate{
@@ -446,7 +453,7 @@ func TestIssueRepoUpdateStatusCAS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("third reopen: %v", err)
 	}
-	if reopenedThird.ExpectedRevision != 6 || reopenedThird.ReopenCount != 2 {
+	if reopenedThird.ExpectedRevision != 5 || reopenedThird.ReopenCount != 2 {
 		t.Fatalf("third reopen issue = %+v", reopenedThird)
 	}
 
@@ -467,6 +474,179 @@ func TestIssueRepoUpdateStatusCAS(t *testing.T) {
 	}); !errors.Is(err, delivery.ErrNotFound) {
 		t.Fatalf("cross-version update error = %v, want delivery.ErrNotFound", err)
 	}
+}
+
+// issueRepoRunConcurrentUpdates starts one UpdateStatus per target at the same
+// time and returns one error per call. expected_revision stays nil so the race
+// is decided by the row lock and the state machine, not by a CAS miss.
+func issueRepoRunConcurrentUpdates(repo *IssueRepository, issueID int64, targets ...delivery.IssueStatus) []error {
+	start := make(chan struct{})
+	errs := make([]error, len(targets))
+	var wg sync.WaitGroup
+	for i, to := range targets {
+		wg.Add(1)
+		go func(i int, to delivery.IssueStatus) {
+			defer wg.Done()
+			<-start
+			_, errs[i] = repo.UpdateStatus(context.Background(), deliveryapp.IssueStatusUpdate{
+				VersionID: 100,
+				IssueID:   issueID,
+				To:        to,
+				Reason:    "concurrent transition",
+				ActorID:   91,
+				ActorKind: "user",
+			})
+		}(i, to)
+	}
+	close(start)
+	wg.Wait()
+	return errs
+}
+
+// TestIssueRepoUpdateStatusIllegalTransitions pins the state-machine guard of
+// the update path: every illegal transition is ErrStateConflict and is rejected
+// before any write (no revision bump, no history row).
+func TestIssueRepoUpdateStatusIllegalTransitions(t *testing.T) {
+	repo, _ := newIssueRepoForTest(t)
+	ctx := context.Background()
+
+	openIssue := issueRepoCreateCandidate(t, repo, issueRepoTestCandidate{caseRunID: 3401, caseVersionID: 4401})
+	if _, err := repo.UpdateStatus(ctx, deliveryapp.IssueStatusUpdate{
+		VersionID: 100, IssueID: openIssue.ID, To: delivery.IssueStatusOpen, ActorKind: "user",
+	}); !errors.Is(err, delivery.ErrStateConflict) {
+		t.Fatalf("open -> open error = %v, want ErrStateConflict", err)
+	}
+	stored, err := repo.Get(ctx, 100, openIssue.ID)
+	if err != nil || stored.Status != delivery.IssueStatusOpen || stored.ExpectedRevision != 1 {
+		t.Fatalf("open -> open changed issue: %+v err=%v", stored, err)
+	}
+
+	confirmed := issueRepoCreateCandidate(t, repo, issueRepoTestCandidate{caseRunID: 3402, caseVersionID: 4402})
+	if _, err := repo.UpdateStatus(ctx, deliveryapp.IssueStatusUpdate{
+		VersionID: 100, IssueID: confirmed.ID, To: delivery.IssueStatusConfirmed, ActorKind: "user",
+	}); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+	for _, to := range []delivery.IssueStatus{delivery.IssueStatusDismissed, delivery.IssueStatusConfirmed} {
+		if _, err := repo.UpdateStatus(ctx, deliveryapp.IssueStatusUpdate{
+			VersionID: 100, IssueID: confirmed.ID, To: to, ActorKind: "user",
+		}); !errors.Is(err, delivery.ErrStateConflict) {
+			t.Fatalf("confirmed -> %s error = %v, want ErrStateConflict", to, err)
+		}
+	}
+	stored, err = repo.Get(ctx, 100, confirmed.ID)
+	if err != nil || stored.Status != delivery.IssueStatusConfirmed || stored.ExpectedRevision != 2 {
+		t.Fatalf("confirmed illegal transitions changed issue: %+v err=%v", stored, err)
+	}
+	if history, err := repo.ListHistory(ctx, confirmed.ID); err != nil || len(history) != 2 {
+		t.Fatalf("confirmed illegal transitions history = %d err=%v, want 2", len(history), err)
+	}
+
+	target := issueRepoCreateCandidate(t, repo, issueRepoTestCandidate{caseRunID: 3403, caseVersionID: 4403})
+	merged := issueRepoCreateCandidate(t, repo, issueRepoTestCandidate{caseRunID: 3404, caseVersionID: 4404})
+	if _, err := repo.Merge(ctx, deliveryapp.IssueMerge{
+		VersionID: 100, SourceID: merged.ID, TargetID: target.ID, ActorID: 55,
+	}); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	for _, to := range []delivery.IssueStatus{
+		delivery.IssueStatusOpen,
+		delivery.IssueStatusConfirmed,
+		delivery.IssueStatusDismissed,
+		delivery.IssueStatusMerged,
+	} {
+		if _, err := repo.UpdateStatus(ctx, deliveryapp.IssueStatusUpdate{
+			VersionID: 100, IssueID: merged.ID, To: to, ActorKind: "user",
+		}); !errors.Is(err, delivery.ErrStateConflict) {
+			t.Fatalf("merged -> %s error = %v, want ErrStateConflict", to, err)
+		}
+	}
+	stored, err = repo.Get(ctx, 100, merged.ID)
+	if err != nil || stored.Status != delivery.IssueStatusMerged || stored.ExpectedRevision != 2 {
+		t.Fatalf("merged terminal updates changed issue: %+v err=%v", stored, err)
+	}
+	if history, err := repo.ListHistory(ctx, merged.ID); err != nil || len(history) != 2 {
+		t.Fatalf("merged terminal history = %d err=%v, want 2", len(history), err)
+	}
+}
+
+// TestIssueRepoUpdateStatusConcurrentIllegalTransitions covers the lock-time
+// state machine under racing writers: illegal losers are state conflicts and
+// only a legal winner is persisted. expected_revision is deliberately absent
+// so the row lock, not the CAS, must reject the loser.
+func TestIssueRepoUpdateStatusConcurrentIllegalTransitions(t *testing.T) {
+	t.Run("open to open", func(t *testing.T) {
+		repo, _ := newIssueRepoForTest(t)
+		ctx := context.Background()
+		issue := issueRepoCreateCandidate(t, repo, issueRepoTestCandidate{caseRunID: 3411, caseVersionID: 4411})
+		for i, err := range issueRepoRunConcurrentUpdates(repo, issue.ID, delivery.IssueStatusOpen, delivery.IssueStatusOpen) {
+			if !errors.Is(err, delivery.ErrStateConflict) {
+				t.Fatalf("open -> open [%d] error = %v, want ErrStateConflict", i, err)
+			}
+		}
+		stored, err := repo.Get(ctx, 100, issue.ID)
+		if err != nil || stored.Status != delivery.IssueStatusOpen || stored.ExpectedRevision != 1 || stored.ReopenCount != 0 {
+			t.Fatalf("concurrent open -> open changed issue: %+v err=%v", stored, err)
+		}
+		if history, err := repo.ListHistory(ctx, issue.ID); err != nil || len(history) != 1 {
+			t.Fatalf("concurrent open -> open history = %d err=%v, want 1", len(history), err)
+		}
+	})
+
+	t.Run("merged terminal", func(t *testing.T) {
+		repo, _ := newIssueRepoForTest(t)
+		ctx := context.Background()
+		source := issueRepoCreateCandidate(t, repo, issueRepoTestCandidate{caseRunID: 3412, caseVersionID: 4412})
+		target := issueRepoCreateCandidate(t, repo, issueRepoTestCandidate{caseRunID: 3413, caseVersionID: 4413})
+		if _, err := repo.Merge(ctx, deliveryapp.IssueMerge{
+			VersionID: 100, SourceID: source.ID, TargetID: target.ID, ActorID: 55,
+		}); err != nil {
+			t.Fatalf("merge: %v", err)
+		}
+		for i, err := range issueRepoRunConcurrentUpdates(repo, source.ID, delivery.IssueStatusOpen, delivery.IssueStatusConfirmed) {
+			if !errors.Is(err, delivery.ErrStateConflict) {
+				t.Fatalf("merged terminal [%d] error = %v, want ErrStateConflict", i, err)
+			}
+		}
+		stored, err := repo.Get(ctx, 100, source.ID)
+		if err != nil || stored.Status != delivery.IssueStatusMerged || stored.ExpectedRevision != 2 {
+			t.Fatalf("concurrent merged terminal changed issue: %+v err=%v", stored, err)
+		}
+		if history, err := repo.ListHistory(ctx, source.ID); err != nil || len(history) != 2 {
+			t.Fatalf("concurrent merged terminal history = %d err=%v, want 2", len(history), err)
+		}
+	})
+
+	t.Run("confirm versus dismiss without expected revision", func(t *testing.T) {
+		repo, _ := newIssueRepoForTest(t)
+		ctx := context.Background()
+		issue := issueRepoCreateCandidate(t, repo, issueRepoTestCandidate{caseRunID: 3414, caseVersionID: 4414})
+		errs := issueRepoRunConcurrentUpdates(repo, issue.ID, delivery.IssueStatusConfirmed, delivery.IssueStatusDismissed)
+		var succeeded, conflicted int
+		for i, err := range errs {
+			switch {
+			case err == nil:
+				succeeded++
+			case errors.Is(err, delivery.ErrStateConflict):
+				conflicted++
+			default:
+				t.Fatalf("confirm/dismiss [%d] error = %v, want nil or ErrStateConflict", i, err)
+			}
+		}
+		if succeeded != 1 || conflicted != 1 {
+			t.Fatalf("confirm/dismiss race = %d success %d conflict, want 1/1 (errors: %v)", succeeded, conflicted, errs)
+		}
+		stored, err := repo.Get(ctx, 100, issue.ID)
+		if err != nil || stored.ExpectedRevision != 2 || stored.ReopenCount != 0 {
+			t.Fatalf("confirm/dismiss race issue = %+v err=%v", stored, err)
+		}
+		if stored.Status != delivery.IssueStatusConfirmed && stored.Status != delivery.IssueStatusDismissed {
+			t.Fatalf("confirm/dismiss race status = %q", stored.Status)
+		}
+		if history, err := repo.ListHistory(ctx, issue.ID); err != nil || len(history) != 2 {
+			t.Fatalf("confirm/dismiss race history = %d err=%v, want 2", len(history), err)
+		}
+	})
 }
 
 // TestIssueRepoMerge covers the source->target merge write, its history and the

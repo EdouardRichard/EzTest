@@ -250,9 +250,10 @@ func (r *IssueRepository) List(ctx context.Context, versionID int64, f deliverya
 }
 
 // UpdateStatus applies one status transition with an optional expected_revision
-// CAS. The issue row is locked first so the history row and the revision bump
-// commit atomically with the status. confirmed/dismissed -> open increments
-// reopen_count; a merged issue is terminal.
+// CAS. The issue row is locked first and the domain state machine is re-applied
+// under that lock, so a concurrent writer cannot bypass the lifecycle rules; the
+// history row and the revision bump commit atomically with the status.
+// confirmed/dismissed -> open increments reopen_count; merged is terminal.
 func (r *IssueRepository) UpdateStatus(ctx context.Context, u deliveryapp.IssueStatusUpdate) (delivery.Issue, error) {
 	ctx = contextOrBackground(ctx)
 	tx, err := r.pool.Begin(ctx)
@@ -275,7 +276,10 @@ func (r *IssueRepository) UpdateStatus(ctx context.Context, u deliveryapp.IssueS
 	if err != nil {
 		return delivery.Issue{}, wrapDB("update issue status: lock issue", err)
 	}
-	if delivery.IssueStatus(currentStatus) == delivery.IssueStatusMerged {
+	from := delivery.IssueStatus(currentStatus)
+	if !delivery.CanTransitionIssue(from, u.To) {
+		// Re-applied after the row lock: the caller's pre-check can be stale
+		// when two transitions race, and merged must stay terminal.
 		return delivery.Issue{}, delivery.ErrStateConflict
 	}
 	if u.ExpectedRevision != nil && currentRevision != *u.ExpectedRevision {
@@ -299,7 +303,6 @@ func (r *IssueRepository) UpdateStatus(ctx context.Context, u deliveryapp.IssueS
 	if err != nil {
 		return delivery.Issue{}, wrapDB("update issue status", err)
 	}
-	from := delivery.IssueStatus(currentStatus)
 	if err := r.insertHistory(ctx, tx, delivery.IssueStatusChange{
 		ID:        r.ids.Next(),
 		IssueID:   u.IssueID,
