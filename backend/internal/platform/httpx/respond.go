@@ -18,6 +18,20 @@ func JSON(w http.ResponseWriter, status int, data any) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"data": data})
 }
 
+// List writes a paginated list envelope:
+//
+//	{"data":[...],"next_cursor":"...","has_more":false}
+func List(w http.ResponseWriter, status int, data any, nextCursor string, hasMore bool) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"data":        data,
+		"next_cursor": nextCursor,
+		"has_more":    hasMore,
+	})
+}
+
 // Error writes the shared error envelope. Unknown errors become a safe 500.
 func Error(w http.ResponseWriter, r *http.Request, err error) {
 	apiErr := platform.AsError(err)
