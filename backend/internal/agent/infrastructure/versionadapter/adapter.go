@@ -58,6 +58,10 @@ type VersionService interface {
 // AttachmentService is the version application surface for attachment ingest
 // and the attachment tools. *versionapp.AttachmentService satisfies it.
 type AttachmentService interface {
+	// Extract performs the idempotent attachment.ingest text extraction. Parse
+	// failures are reported through ExtractionResult.ErrorCode with a nil
+	// error; infrastructure failures are Go errors and remain retryable.
+	Extract(ctx context.Context, attachmentID int64) (versionapp.ExtractionResult, error)
 	GetAttachmentInfo(ctx context.Context, versionID, attachmentID int64) (versionapp.AttachmentInfo, error)
 	ListAttachments(ctx context.Context, versionID, conversationID int64) ([]versionapp.AttachmentMeta, error)
 	ReadAttachmentText(ctx context.Context, versionID, conversationID, attachmentID int64, offset, maxChars int) (string, int, error)
