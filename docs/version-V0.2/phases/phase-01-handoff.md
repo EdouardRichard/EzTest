@@ -59,9 +59,10 @@ eventing_0002_event_index.sql
 | 证据 | 命令 | 结果/路径 |
 |---|---|---|
 | 全量门禁 | `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test.ps1` | **EXIT=0**；Go 单测+集成全部 ok；前端 43 files / 341 tests；日志 `.tmp/p1/final-gate.log` |
-| API 验收 | `powershell.exe -File scripts/p1-acceptance.ps1 -FakeLLMPort 13335` | **PASS（19 steps）**；隔离 `eztest_v02_e2e`；证据 `.tmp/p1-acceptance/api.log` |
+| API 验收 | `powershell.exe -File scripts/p1-acceptance.ps1 -FakeLLMPort 13335` | **PASS（19 steps）**；隔离 `eztest_v02_e2e`；含 `work_item.created`/`team_room.post.refs`/`created_by_run_id` 断言；证据 `.tmp/p1-acceptance/api.log` |
 | 浏览器 E2E | `powershell.exe -File scripts/p1-e2e.ps1` | **PASS**；登录→需求 Tab→新对话→附件→AI 草案→编辑→单条确认→批量确认→团队频道（断言 Scout 已读附件文本）→设计 CTA（断言 3 条待设计）；截图 `.tmp/p1-acceptance/screenshots/requirements-workspace.png`、`team-room.png`；日志 `e2e-playwright.log` |
 | 真实 LLM | `powershell.exe -File scripts/p1-acceptance-llm.ps1` | **PASS**；DeepSeek `deepseek-flash` 真实回复+工具调用+draft+确认；工具名 dot→underscore 映射、脚本 UTF-8 body；证据 `.tmp/p1-acceptance/llm.log` |
+| 独立评审 | 两轮 read-only review（`.tmp/p1/review.md` + runtime re-review） | 第一轮 REJECT 的 5 个阻塞项已关闭；复审 **APPROVED for P1**，仅保留“重复摘要”为 P2/长会话改进项 |
 | 生产构建 | `cd frontend; pnpm build` | 成功；12 routes（含 `/versions/[id]`） |
 | 契约解析 | `node -e "yaml.parse(openapi.yaml)"` | YAML OK；53 paths / 81 schemas / `x-frozen: P1` |
 | 迁移幂等 | `go test -tags=integration ./internal/db/...` | 15 migrations；第二次 applied 为空；P1 约束生效 |
@@ -88,6 +89,10 @@ eventing_0002_event_index.sql
 | 附件 content_ref 孤儿竞态 | 极端去重竞态下可能留 ref | 否 | 无删除 API；GC P9 |
 | 需求列表只加载首个 100 条 | >100 需求需后续分页 UI | 否 | API 支持 before cursor |
 | 回退卡仅组件测试 + API 验收 | 浏览器 E2E 未构造 rollback_proposal | 否 | 组件测试覆盖；P2 可补 AI 回退 E2E |
+| 长会话重复摘要 | `conversation_summary` 无 summarized-through cursor；>keepRecent 的每次 run 可能重复摘要旧消息 | 否（P2/P8 长会话改进） | 复审 Important #1；单次运行/本轮验收正常 |
+| Agent 业务写回未按 lease_epoch CAS | 迟到 run 理论上可在接管窗口内写入 assistant 消息/需求版本/团队帖；run 行 FinishRun 已 fencing | 否（P1 单实例；P7 多实例前必修） | 复审 Important；handoff 记录为 P7 前置 |
+| 缺少 P1 server 级集成测试 | 现有 server 集成只覆盖 P0；P1 由 API 验收覆盖 | 否 | T13 计划原意；可补 `p1_server_integration_test.go` |
+| 附件注册失败为 best-effort | message 已写入后附件注册错误被忽略（避免 orphan attachment） | 否 | 比“先注册后插消息”的 orphan 风险更小；P2 可加事务化 |
 | 无通用 `Idempotency-Key` | 确认/消息使用唯一约束/自然幂等 | 否 | P0/P1 记录；后续接中间件 |
 | 单实例 Hub/worker | 多副本实时 fan-out 未承诺 | 否（P7） | P1 单实例假设已写入包注释 |
 | `react-markdown` 新依赖 | 前端构建体积增加 | 否 | 用户已批准 |
