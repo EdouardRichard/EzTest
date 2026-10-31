@@ -96,6 +96,24 @@ func mustRender(t *testing.T, snapshot delivery.ReportSnapshot, narrative string
 	return output
 }
 
+// truncationNote extracts the visible truncation note text so a test can assert
+// exactly which lists the renderer reported as truncated.
+func truncationNote(t *testing.T, output []byte) string {
+	t.Helper()
+	const marker = `<aside class="truncation" data-truncated="true"><strong>报告截断说明</strong><p>`
+	text := string(output)
+	start := strings.Index(text, marker)
+	if start < 0 {
+		t.Fatal("rendered HTML has no visible truncation note")
+	}
+	start += len(marker)
+	end := strings.Index(text[start:], "</p></aside>")
+	if end < 0 {
+		t.Fatal("rendered truncation note is not closed")
+	}
+	return text[start : start+end]
+}
+
 func TestRenderRejectsUnknownTemplateVersion(t *testing.T) {
 	for _, version := range []string{"", "2", "latest", "1 "} {
 		renderer, err := NewHTMLRenderer(version)
@@ -314,6 +332,124 @@ func TestRenderTruncatesOversizedReport(t *testing.T) {
 		kept := strings.Count(text, `<tr data-case-run-id="`)
 		if kept == 0 || kept >= total {
 			t.Fatalf("case runs kept after truncation = %d, want between 1 and %d", kept, total-1)
+		}
+	})
+}
+
+// oversizedIssues returns a single list that is large enough to cross the 2 MiB
+// limit on its own, so tests can force truncation through one known list.
+func oversizedIssues(total int) []delivery.IssueSnapshot {
+	issues := make([]delivery.IssueSnapshot, 0, total)
+	for id := int64(1); id <= int64(total); id++ {
+		issues = append(issues, delivery.IssueSnapshot{
+			ID: id, VersionID: 7, Title: strings.Repeat("x", 900),
+			Status: delivery.IssueStatusOpen, CreatedAt: renderTime,
+		})
+	}
+	return issues
+}
+
+// oversizedWaves mirrors oversizedIssues for the waves list.
+func oversizedWaves(total int) []delivery.WaveSnapshot {
+	waves := make([]delivery.WaveSnapshot, 0, total)
+	for id := int64(1); id <= int64(total); id++ {
+		waves = append(waves, delivery.WaveSnapshot{
+			ID: id, VersionID: 7, Status: "completed", Trigger: strings.Repeat("w", 1200),
+		})
+	}
+	return waves
+}
+
+// TestRenderTruncationNoteOnlyReportsSlicedLists is the R1 regression test:
+// when only the issues list is sliced, untouched waves and case runs keep their
+// full counts, their rows all survive, and the note mentions only issues.
+func TestRenderTruncationNoteOnlyReportsSlicedLists(t *testing.T) {
+	snapshot := delivery.ReportSnapshot{
+		Kind: delivery.ReportKindVersion, VersionID: 7, GeneratedAt: renderTime,
+		Issues: oversizedIssues(4000),
+		Waves: []delivery.WaveSnapshot{
+			{ID: 1, VersionID: 7, Status: "completed", Trigger: "manual"},
+			{ID: 2, VersionID: 7, Status: "completed", Trigger: "schedule"},
+		},
+		CaseRuns: []delivery.CaseRunSnapshot{
+			{ID: 1, VersionID: 7, WaveID: 1, CaseVersionID: 11, CaseTitle: "用例一", Status: "passed", CreatedAt: renderTime},
+			{ID: 2, VersionID: 7, WaveID: 2, CaseVersionID: 12, CaseTitle: "用例二", Status: "failed", CreatedAt: renderTime},
+		},
+	}
+	output := mustRender(t, snapshot, "", allSections())
+	note := truncationNote(t, output)
+	if !strings.Contains(note, "问题 4000 → ") {
+		t.Fatalf("truncation note does not report the sliced issues: %q", note)
+	}
+	if strings.Contains(note, "波次") {
+		t.Fatalf("truncation note reports untouched waves: %q", note)
+	}
+	if strings.Contains(note, "执行结果") {
+		t.Fatalf("truncation note reports untouched case runs: %q", note)
+	}
+	text := string(output)
+	if got, want := strings.Count(text, `<tr data-case-run-id="`), len(snapshot.CaseRuns); got != want {
+		t.Fatalf("case-run rows after truncation = %d, want all %d to survive", got, want)
+	}
+	if got, want := strings.Count(text, `<tr data-wave-id="`), len(snapshot.Waves); got != want {
+		t.Fatalf("wave rows after truncation = %d, want all %d to survive", got, want)
+	}
+}
+
+// TestRenderTruncationIgnoresDisabledSections is the second R1 regression test:
+// data of a disabled section is not rendered, so the renderer must neither
+// halve it nor report it in the truncation note.
+func TestRenderTruncationIgnoresDisabledSections(t *testing.T) {
+	renderer := newTestRenderer(t)
+	base := delivery.ReportSnapshot{Kind: delivery.ReportKindVersion, VersionID: 7, GeneratedAt: renderTime}
+
+	t.Run("issues section disabled", func(t *testing.T) {
+		snapshot := base
+		snapshot.Issues = oversizedIssues(4000)
+		snapshot.Waves = oversizedWaves(2000)
+		opts := allSections()
+		opts.Issues = false
+		output, err := renderer.Render(context.Background(), snapshot, "", opts)
+		if err != nil {
+			t.Fatalf("Render: %v", err)
+		}
+		if len(output) > MaxHTMLBytes {
+			t.Fatalf("truncated output = %d bytes, want <= %d", len(output), MaxHTMLBytes)
+		}
+		note := truncationNote(t, output)
+		if strings.Contains(note, "问题") {
+			t.Fatalf("truncation note reports the disabled issues section: %q", note)
+		}
+		if !strings.Contains(note, "波次 2000 → ") {
+			t.Fatalf("truncation note does not report the sliced waves: %q", note)
+		}
+		if strings.Contains(string(output), `data-issue-id="`) {
+			t.Fatal("disabled issues section rendered issue rows")
+		}
+	})
+
+	t.Run("results section disabled", func(t *testing.T) {
+		snapshot := base
+		snapshot.Issues = oversizedIssues(4000)
+		snapshot.Waves = oversizedWaves(2000)
+		opts := allSections()
+		opts.Results = false
+		output, err := renderer.Render(context.Background(), snapshot, "", opts)
+		if err != nil {
+			t.Fatalf("Render: %v", err)
+		}
+		if len(output) > MaxHTMLBytes {
+			t.Fatalf("truncated output = %d bytes, want <= %d", len(output), MaxHTMLBytes)
+		}
+		note := truncationNote(t, output)
+		if !strings.Contains(note, "问题 4000 → ") {
+			t.Fatalf("truncation note does not report the sliced issues: %q", note)
+		}
+		if strings.Contains(note, "波次") {
+			t.Fatalf("truncation note reports the disabled results section: %q", note)
+		}
+		if strings.Contains(string(output), `data-section="results"`) {
+			t.Fatal("disabled results section was rendered")
 		}
 	})
 }

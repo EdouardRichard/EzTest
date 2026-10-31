@@ -62,7 +62,8 @@ func NewHTMLRenderer(templateVersion string) (*HTMLRenderer, error) {
 // optional plain-text narrative. Narrative text is escaped as plain text and
 // split into preserved lines; it can never inject HTML. When the rendered HTML
 // exceeds MaxHTMLBytes, issues, then waves, then case runs are halved in order
-// and a visible truncation note is added; if the document still exceeds the
+// and a visible truncation note is added; lists whose section is disabled are
+// not rendered and are therefore skipped. If the document still exceeds the
 // limit, Render returns an error instead of silently dropping content.
 func (r *HTMLRenderer) Render(ctx context.Context, snapshot delivery.ReportSnapshot, narrative string, opts delivery.SectionOptions) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
@@ -81,42 +82,58 @@ func (r *HTMLRenderer) Render(ctx context.Context, snapshot delivery.ReportSnaps
 		return output, nil
 	}
 
+	// Kept counts start at the full list sizes: a list is only recorded as
+	// truncated once it is actually sliced. Otherwise untouched lists would be
+	// reported as reduced to zero.
 	state := &truncationState{
 		issuesTotal:   len(data.Issues),
+		issuesKept:    len(data.Issues),
 		wavesTotal:    len(data.Waves),
+		wavesKept:     len(data.Waves),
 		caseRunsTotal: len(data.CaseRuns),
+		caseRunsKept:  len(data.CaseRuns),
 	}
-	for len(data.Issues) > 0 {
-		data.Issues = data.Issues[:len(data.Issues)/2]
-		state.issuesKept = len(data.Issues)
-		if output, err = r.renderTruncated(data, state); err != nil {
-			return nil, err
-		}
-		if len(output) <= MaxHTMLBytes {
-			return output, nil
-		}
-	}
-	for len(data.Waves) > 0 {
-		data.Waves = data.Waves[:len(data.Waves)/2]
-		state.wavesKept = len(data.Waves)
-		if output, err = r.renderTruncated(data, state); err != nil {
-			return nil, err
-		}
-		if len(output) <= MaxHTMLBytes {
-			return output, nil
+	// A list that its section does not render cannot shrink the document, so a
+	// disabled section's list is neither halved nor reported.
+	if opts.Issues {
+		for len(data.Issues) > 0 {
+			data.Issues = data.Issues[:len(data.Issues)/2]
+			state.issuesKept = len(data.Issues)
+			if output, err = r.renderTruncated(data, state); err != nil {
+				return nil, err
+			}
+			if len(output) <= MaxHTMLBytes {
+				return output, nil
+			}
 		}
 	}
-	for len(data.CaseRuns) > 0 {
-		data.CaseRuns = data.CaseRuns[:len(data.CaseRuns)/2]
-		state.caseRunsKept = len(data.CaseRuns)
-		if output, err = r.renderTruncated(data, state); err != nil {
-			return nil, err
-		}
-		if len(output) <= MaxHTMLBytes {
-			return output, nil
+	if opts.Results {
+		for len(data.Waves) > 0 {
+			data.Waves = data.Waves[:len(data.Waves)/2]
+			state.wavesKept = len(data.Waves)
+			if output, err = r.renderTruncated(data, state); err != nil {
+				return nil, err
+			}
+			if len(output) <= MaxHTMLBytes {
+				return output, nil
+			}
 		}
 	}
-	return nil, fmt.Errorf("render: report HTML is %d bytes, still above the %d-byte limit after truncating issues, waves and case runs", len(output), MaxHTMLBytes)
+	// Case runs are visible both as results rows and, through their evidence
+	// rows, in the evidence section, so they are rendered if either is enabled.
+	if opts.Results || opts.Evidence {
+		for len(data.CaseRuns) > 0 {
+			data.CaseRuns = data.CaseRuns[:len(data.CaseRuns)/2]
+			state.caseRunsKept = len(data.CaseRuns)
+			if output, err = r.renderTruncated(data, state); err != nil {
+				return nil, err
+			}
+			if len(output) <= MaxHTMLBytes {
+				return output, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("render: report HTML is %d bytes, still above the %d-byte limit after truncating the rendered lists", len(output), MaxHTMLBytes)
 }
 
 func (r *HTMLRenderer) renderTruncated(data *renderData, state *truncationState) ([]byte, error) {
@@ -373,8 +390,10 @@ func narrativeLines(narrative string) []string {
 	return strings.Split(narrative, "\n")
 }
 
-// truncationState records the original and kept sizes of the truncated lists so
-// the report can state exactly what was reduced (spec §6.2: no silent drop).
+// truncationState records the original and kept sizes of the truncation
+// candidates so the report can state exactly what was reduced (spec §6.2: no
+// silent drop). Kept starts at the full size and decreases only for a list that
+// was actually sliced, so the note never mentions untouched or disabled lists.
 type truncationState struct {
 	issuesTotal   int
 	issuesKept    int
