@@ -280,3 +280,46 @@ data: {"seq":2,"channel":"system","type":"settings.updated","scope":{},"payload"
 : heartbeat
 
 ```
+
+---
+
+## 10. P1 增量事件（`draft: P1`，阶段末冻结）
+
+P0 的频道/信封/SSE/游标/心跳/`stream.reset` 语义不变。P1 业务事件一律发布到 `version:{id}`；版本状态类事件同时发 `system`（如 `version.started`/`version.status_changed`）。P1 **不新增频道**，使用 `scope` 携带会话/需求/run 等 ID。`seq` 与 `snapshot_cursor` 保持**整数**（D4 修代码以符合契约，见 spec §11）。
+
+### 10.1 事件类型
+
+| type | channel | 触发 | payload 要点 |
+|---|---|---|---|
+| `version.started` | `system` + `version:{id}` | 首个对话消息/需求/确认触发 initial→running | `from:"initial",to:"running"` |
+| `version.status_changed` | `system` + `version:{id}` | 版本状态投影变化（含 started 的通用形式） | `from,to` |
+| `conversation.created` | `version:{id}` | 新建澄清会话 | `conversation_id,title,kind` |
+| `conversation.message` | `version:{id}` | 用户/assistant 消息落库 | 完整 message（id/role/parts/refs/created_at）；不含 prompt/密钥/路径 |
+| `conversation.summary_updated` | `version:{id}` | 摘要版本更新 | `conversation_id,version,token_estimate` |
+| `agent.run.started` | `version:{id}` | run 开始 | `run_id,profile_key,work_item_id,conversation_id` |
+| `agent.activity` | `version:{id}` | 工具/思考活动（非 token 增量） | `run_id,conversation_id,status:"thinking|tool",tool?,summary?` |
+| `agent.run.finished` | `version:{id}` | run 成功 | `run_id,turns,usage` |
+| `agent.run.failed` | `version:{id}` | run 失败（非 context_compacted） | `run_id,terminal_reason,retryable` |
+| `context.compacted` | `version:{id}` | 上下文压缩发生（过程事件） | `run_id,conversation_id,summary_version,token_before,token_after` |
+| `requirement.created` | `version:{id}` | 需求逻辑对象创建 | `requirement_id,status,title` |
+| `requirement.version_created` | `version:{id}` | 新不可变版本（创建/编辑/回退） | `requirement_id,requirement_version_id,revision,status` |
+| `requirement.clarified` | `version:{id}` | 用户确认 | `requirement_id,requirement_version_id,scope,batch_id` |
+| `requirement.rolled_back` | `version:{id}` | 用户确认回退到新 draft | `requirement_id,from_version_id,new_version_id,reason,affected_case_version_ids` |
+| `requirement.relation_created` | `version:{id}` | 关系提议落库 | `from_requirement_id,to_requirement_id,kind` |
+| `requirement.attachment_ingested` | `version:{id}` | 附件解析成功 | `attachment_id,message_id,chars` |
+| `requirement.attachment_failed` | `version:{id}` | 附件解析失败 | `attachment_id,message_id,code,message` |
+| `work_item.created` | `version:{id}` | 任务 ensure 新建 | `work_item_id,type,team,dedupe_key` |
+| `work_item.claimed` | `version:{id}` | 领取 | `work_item_id,type,claimed_by,lease_epoch` |
+| `work_item.failed` | `version:{id}` | 失败待重试 | `work_item_id,type,attempt,error` |
+| `work_item.dead` | `version:{id}` | 超限/不可重试 | `work_item_id,type,attempt,error` |
+| `team_room.post` | `version:{id}` | 结构化帖子 | `post_id,team,kind,refs` |
+| `team_room.digest_updated` | `version:{id}` | 新摘要版本 | `team,digest_version,token_estimate` |
+
+### 10.2 约束
+
+1. `requirement.rolled_back` 的 `affected_case_version_ids` 在 P1 由 stale 端口返回（P1 固定 `[]`）；P2 接 case 表后填真实 ID，事件字段不变。
+2. `agent.activity` 不承诺 token 级流式；UI 以完整 `conversation.message` 为准。
+3. `context.compacted` 不是失败终态；`context_overflow_unrecoverable` 才走 `agent.run.failed`。
+4. 事件中的附件只给 ID/名称/大小/状态，不给文件系统路径/提取全文。
+5. `work_item.created` 由 ensure 是否新建决定；重复 ensure 不重复发事件。
+6. 事件发布失败不回滚业务；reconciler 兜底；P1 仍为单实例 Hub，跨实例 fan-out 属 P7。

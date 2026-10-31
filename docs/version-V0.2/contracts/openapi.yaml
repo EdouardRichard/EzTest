@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
-  title: EzTest 0.2 P0 Platform Foundation API
-  version: 0.2.0-p0
+  title: EzTest 0.2 API 契约（P0 冻结 + P1 增量）
+  version: 0.2.0-p1
   description: |
     EzTest 0.2 P0（平台底座）对外 REST/SSE 契约，来源：
     `docs/superpowers/specs/2026-10-31-eztest-v02-p0-platform-foundation-design.md` §7/§8/§9。
@@ -48,7 +48,49 @@ info:
 
     `x-frozen: P0` —— 本文件在 P0 阶段末冻结；后续阶段只能增量修改，破坏性变更需更新本目录
     与决策记录并同步调用方/测试/迁移/handoff。
-x-frozen: P0
+
+    ## P1 增量（draft，2026-10-31）
+
+    来源：`docs/superpowers/specs/2026-10-31-eztest-v02-p1-runtime-clarification-design.md`
+    §3/§8/§9/§11/§12。P0 段落保留为历史；文件级 `x-frozen: P1` 为当前冻结标记。
+    P1 端点全部要求 Bearer 登录（单团队信任模型，无 admin 限制）；ID 仍为十进制字符串，
+    时间 RFC3339 UTC，列表沿用 `{data,next_cursor,has_more}` 信封。
+
+    ### P1 端点
+    - `GET/POST /api/versions/{id}/conversations`：对话列表/新建（仅 `clarification`）。
+    - `GET /api/versions/{id}/conversations/{cid}`：对话详情（含 summary，不含消息）。
+    - `GET/POST /api/versions/{id}/conversations/{cid}/messages`：消息列表（id 升序）/发送用户消息。
+    - `GET/POST /api/versions/{id}/requirements`：需求列表/手工创建 draft。
+    - `GET/PATCH /api/versions/{id}/requirements/{rid}`：需求详情/编辑（生成新不可变 revision）。
+    - `POST /api/versions/{id}/requirements/{rid}/confirmations`：单条确认（幂等）。
+    - `POST /api/versions/{id}/requirements/confirmations`：批量确认（返回 `batch_id`）。
+    - `POST /api/versions/{id}/requirements/{rid}/rollback`：用户确认回退，生成新 draft。
+    - `GET /api/versions/{id}/requirements/{rid}/relations`：需求关系列表。
+    - `GET /api/versions/{id}/team-rooms/{team}`：澄清团队频道只读（digest + 最近帖子）。
+    - `GET /api/versions/{id}` 增量返回 `requirement_counts`、`conversation_count`、
+      `pending_design_count`。
+    - P1 不新增设计/执行/交付 API，不暴露任务板 API（P1-D3），不提供团队频道发帖 API。
+
+    ### P1 事件（详见 `contracts/events.md`）
+    `version.started`、`version.status_changed`、`conversation.created`、`conversation.message`、
+    `conversation.summary_updated`、`agent.run.started`、`agent.activity`、`agent.run.finished`、
+    `agent.run.failed`、`context.compacted`、`requirement.created`、`requirement.version_created`、
+    `requirement.clarified`、`requirement.rolled_back`、`requirement.relation_created`、
+    `requirement.attachment_ingested`、`requirement.attachment_failed`、`work_item.created`、
+    `work_item.claimed`、`work_item.failed`、`work_item.dead`、`team_room.post`、
+    `team_room.digest_updated`。事件只追加，不修改 P0 事件语义。
+
+    ### P1 决策
+    - AI 只能产 draft、关系提议与回退提议；确认/回退必须由用户 API 触发（P1-D9）。
+    - 版本 `initial → running` 由首条对话消息/首个需求/首次确认触发；P1 不写 `completed`。
+    - 需求编辑/回退总是新增不可变 revision；批量确认事务内全量校验，已确认项幂等跳过（P1-D7/D8）。
+    - 聊天不做 token 级流式，使用 `agent.activity` + 完整消息事件（P1-D11）。
+    - 附件支持 md/txt/docx/pptx/pdf；旧 `.doc/.ppt` 失败为 `unsupported_attachment_format`；
+      解析失败不阻塞消息（消息 POST 仍 201）。
+    - 稳定错误码新增 `state_conflict`、`lease_lost`、`ai_unavailable`、`context_overflow`、
+      `unsupported_attachment_format`、`extraction_failed`。
+    - 不新增通用 `Idempotency-Key`（P1-D16）；P1 单实例 Hub/worker，多副本 fan-out 属 P7。
+x-frozen: P1
 servers:
   - url: http://localhost:13333
     description: 本地开发默认 API（端口来自 EZTEST_API_PORT，默认 13333）
@@ -75,6 +117,12 @@ tags:
     description: SUT/环境/页面/API/目标库/测试账号/代码仓
   - name: Versions
     description: 版本与多 SUT 绑定
+  - name: Conversations
+    description: 澄清对话、消息与摘要（P1）
+  - name: Requirements
+    description: 需求版本、确认、回退与关系（P1）
+  - name: Clarification
+    description: 澄清团队频道只读摘要/帖子（P1）
 
 paths:
   /healthz:
@@ -2030,6 +2078,490 @@ paths:
         '500':
           $ref: '#/components/responses/Internal'
 
+  /api/versions/{id}/conversations:
+    get:
+      tags: [Conversations]
+      operationId: listConversations
+      summary: 对话列表（登录用户）
+      description: |
+        按 id 倒序分页；`kind` 省略时返回该版本全部对话（P1 只有 `clarification`）。
+        列表项含 `message_count` 与 `last_message_at`（无消息时 `last_message_at=null`）。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/ConversationKind'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Before'
+      responses:
+        '200':
+          description: 对话分页
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/ConversationSummary'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [Conversations]
+      operationId: createConversation
+      summary: 新建澄清对话（登录用户）
+      description: |
+        仅支持 `kind=clarification`。`title` 省略时默认 `需求澄清 YYYY-MM-DD HH:mm`。
+        创建后 best-effort ensure opening `chat.turn` 任务；仅创建空对话不会把版本投影为 `running`。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateConversationRequest'
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Conversation'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/conversations/{cid}:
+    get:
+      tags: [Conversations]
+      operationId: getConversation
+      summary: 对话详情（登录用户）
+      description: 返回对话元数据与最新摘要 `summary`；不返回消息（消息走 `/messages`）。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/CID'
+      responses:
+        '200':
+          description: 对话详情
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Conversation'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/conversations/{cid}/messages:
+    get:
+      tags: [Conversations]
+      operationId: listConversationMessages
+      summary: 消息列表（id 升序，登录用户）
+      description: |
+        `after` 是消息 ID 游标（十进制字符串），返回 id 大于 `after` 的消息，按 id 升序；
+        省略 `after` 从最早消息开始。默认 100 条，最大 200 条。
+        SSE `conversation.message` 包含完整 message 对象，可直接渲染。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/CID'
+        - $ref: '#/components/parameters/MessageAfter'
+        - $ref: '#/components/parameters/MessageLimit'
+      responses:
+        '200':
+          description: 消息分页
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/ConversationMessage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [Conversations]
+      operationId: postConversationMessage
+      summary: 发送用户消息（登录用户）
+      description: |
+        写入用户消息并 best-effort ensure `chat.turn` / `requirement.curate` 任务（reconciler 兜底）。
+        `client_message_id`（≤64）在同一对话内唯一，重复提交幂等返回既有消息。
+        `attachment` part 引用 `POST /api/content` 上传返回的 `{sha256,name,mime,size}`；
+        附件解析失败不阻塞消息（仍返回 201，失败原因在附件 `extraction_error`）。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/CID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PostMessageRequest'
+      responses:
+        '201':
+          description: 已写入用户消息（幂等重放返回既有消息）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/ConversationMessage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/requirements:
+    get:
+      tags: [Requirements]
+      operationId: listRequirements
+      summary: 需求列表（登录用户）
+      description: |
+        按 id 倒序分页；`status` 省略时返回全部。列表项为当前 revision 摘要，
+        含 `targets` 与 `confirmed_at`（未确认为 null）。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/RequirementStatusFilter'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Before'
+      responses:
+        '200':
+          description: 需求分页
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/RequirementSummary'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [Requirements]
+      operationId: createRequirement
+      summary: 手工创建需求 draft（登录用户）
+      description: |
+        创建 `draft` 需求与 revision=1。`targets` 若提供必须属于该版本绑定
+        （version_sut/page/api），否则 400 并带 `details.field`。
+        首个需求触发版本 `initial → running`；事件 `requirement.created`、
+        `requirement.version_created`。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRequirementRequest'
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/RequirementDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/requirements/confirmations:
+    post:
+      tags: [Requirements]
+      operationId: batchConfirmRequirements
+      summary: 批量确认需求（登录用户）
+      description: |
+        事务内全量校验；已确认项幂等跳过；存在非法 draft 时整体 400（不做部分成功，P1-D8）。
+        返回 `batch_id`、本次确认的 `confirmed` 与跳过的 `skipped`（需求 ID 数组）。
+        事件 `requirement.clarified`；首次确认触发版本 `initial → running`。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchConfirmRequest'
+      responses:
+        '200':
+          description: 批量确认结果
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/BatchConfirmResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/requirements/{rid}:
+    get:
+      tags: [Requirements]
+      operationId: getRequirement
+      summary: 需求详情（登录用户）
+      description: 返回当前版本、历史版本、确认记录、关系与附件。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/RID'
+      responses:
+        '200':
+          description: 需求详情
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/RequirementDetail'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    patch:
+      tags: [Requirements]
+      operationId: updateRequirement
+      summary: 编辑需求（生成新 draft revision）
+      description: |
+        生成新的不可变 revision（revision+1）：`draft → draft`；`clarified` 编辑后
+        需求状态回到 `draft`，旧确认记录仍指向旧 revision。请求体字段语义同创建。
+        事件 `requirement.version_created`。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/RID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateRequirementRequest'
+      responses:
+        '200':
+          description: 更新后的需求详情
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/RequirementDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/requirements/{rid}/confirmations:
+    post:
+      tags: [Requirements]
+      operationId: confirmRequirement
+      summary: 确认单条需求（登录用户）
+      description: |
+        校验 title/description/acceptance_criteria/priority 与 targets 后冻结当前 revision，
+        状态 `draft → clarified`；重复确认幂等返回（`confirmed=false`）。
+        事件 `requirement.clarified`；首次确认触发版本 `initial → running`。无请求体。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/RID'
+      responses:
+        '200':
+          description: 确认结果
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/ConfirmRequirementResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/requirements/{rid}/rollback:
+    post:
+      tags: [Requirements]
+      operationId: rollbackRequirement
+      summary: 用户确认回退需求（登录用户）
+      description: |
+        复制当前版本字段生成新的 `draft` revision（status=draft），版本递增；
+        事件 `requirement.rolled_back`、`requirement.version_created`。
+        P2 stale 钩子在 P1 为空实现，事件携带 `affected_case_version_ids: []`（P1-D12）。
+        AI 不能替用户回退；`proposal_message_id` 指向 AI 的 `rollback_proposal` 消息。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/RID'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RollbackRequest'
+      responses:
+        '200':
+          description: 回退后的需求详情
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/RequirementDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/requirements/{rid}/relations:
+    get:
+      tags: [Requirements]
+      operationId: listRequirementRelations
+      summary: 需求关系列表（登录用户）
+      description: 无分页；关系也可在需求详情中返回。关系由 AI 提议落库，P1 无独立确认 UI。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/RID'
+      responses:
+        '200':
+          description: 关系列表
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/RequirementRelationView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{id}/team-rooms/{team}:
+    get:
+      tags: [Clarification]
+      operationId: getTeamRoom
+      summary: 团队频道只读视图（登录用户）
+      description: |
+        返回指定团队的最新摘要 `digest`（可为 null）与最近帖子（按 id 倒序）。
+        `limit` 1–100，默认 20。P1 只读：不提供发帖/自由聊天 API；频道不触发 Agent。
+      parameters:
+        - $ref: '#/components/parameters/ID'
+        - $ref: '#/components/parameters/Team'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 团队频道视图
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/TeamRoomView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
 components:
   securitySchemes:
     bearerAuth:
@@ -2115,6 +2647,72 @@ components:
         type: integer
         format: int64
         minimum: 0
+    CID:
+      name: cid
+      in: path
+      required: true
+      description: 对话（conversation）雪花 ID 的十进制字符串
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    RID:
+      name: rid
+      in: path
+      required: true
+      description: 需求（requirement）雪花 ID 的十进制字符串
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    Team:
+      name: team
+      in: path
+      required: true
+      description: 团队频道；P1 只读，澄清团队为 `clarification`
+      schema:
+        type: string
+        enum: [clarification, design, execution, delivery, steward]
+    ConversationKind:
+      name: kind
+      in: query
+      required: false
+      description: 对话类型过滤；P1 只产生 clarification
+      schema:
+        type: string
+        enum: [clarification, design]
+    RequirementStatusFilter:
+      name: status
+      in: query
+      required: false
+      description: 需求状态过滤
+      schema:
+        type: string
+        enum: [draft, clarified, closed, obsolete]
+    Before:
+      name: before
+      in: query
+      required: false
+      description: 上一页最后一个实体的十进制 ID（按 id 倒序分页）；省略表示第一页
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    MessageAfter:
+      name: after
+      in: query
+      required: false
+      description: 消息 ID 游标；只返回 id 大于该值的消息（升序）；省略从最早消息开始
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    MessageLimit:
+      name: limit
+      in: query
+      required: false
+      description: 每页消息数（默认 100，最大 200）
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 100
   responses:
     BadRequest:
       description: 请求参数/请求体校验失败（invalid_argument）
@@ -2160,7 +2758,7 @@ components:
           schema:
             $ref: '#/components/schemas/ErrorEnvelope'
     Conflict:
-      description: 唯一约束/状态冲突（conflict / state_conflict）
+      description: 唯一约束/状态冲突（conflict / state_conflict / lease_lost）
       headers:
         X-Request-ID:
           schema:
@@ -2170,7 +2768,7 @@ components:
           schema:
             $ref: '#/components/schemas/ErrorEnvelope'
     Unavailable:
-      description: 依赖暂时不可用（unavailable，retryable=true）
+      description: 依赖暂时不可用（unavailable / ai_unavailable / context_overflow，retryable=true）
       headers:
         X-Request-ID:
           schema:
@@ -2200,7 +2798,7 @@ components:
           properties:
             code:
               type: string
-              description: invalid_argument / unauthenticated / forbidden / not_found / conflict / state_conflict / unavailable / internal
+              description: invalid_argument / unauthenticated / forbidden / not_found / conflict / state_conflict / lease_lost / ai_unavailable / context_overflow / unsupported_attachment_format / extraction_failed / unavailable / internal
             message:
               type: string
             request_id:
@@ -2211,7 +2809,7 @@ components:
             details:
               type: object
               additionalProperties: true
-              description: '结构化细节；字段错误通常为 {"field": "..."}'
+              description: '结构化细节；字段错误通常为 {"field": "..."}；P1 可能带 requirement_id / attachment_id 便于 UI 定位'
     ListEnvelope:
       type: object
       required: [data, next_cursor, has_more]
@@ -2790,6 +3388,16 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Binding'
+        requirement_counts:
+          $ref: '#/components/schemas/RequirementCounts'
+        conversation_count:
+          type: integer
+          minimum: 0
+          description: 版本下对话总数（P1 增量）
+        pending_design_count:
+          type: integer
+          minimum: 0
+          description: 已澄清且尚无设计覆盖的需求数；P1 等于 clarified 数，仅用于 CTA 占位（P1-D15）
         created_by:
           type: string
         created_at:
@@ -3396,3 +4004,565 @@ components:
           minLength: 1
         auto_design_new_requirements:
           type: boolean
+    ConversationSummary:
+      type: object
+      description: 对话列表项（P1 只产生 clarification）
+      required: [id, title, kind, status, message_count, last_message_at, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        title:
+          type: string
+        kind:
+          type: string
+          enum: [clarification, design]
+          description: P1 API 只创建/返回 clarification
+        status:
+          type: string
+          enum: [active, closed]
+        message_count:
+          type: integer
+          minimum: 0
+        last_message_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: 最近一条消息时间；无消息为 null
+        created_at:
+          type: string
+          format: date-time
+    Conversation:
+      description: 对话详情（不含消息；消息走 /messages）
+      allOf:
+        - $ref: '#/components/schemas/ConversationSummary'
+        - type: object
+          required: [summary, updated_at]
+          properties:
+            summary:
+              type: string
+              nullable: true
+              description: 最新 conversation_summary.summary；未生成时为 null
+            updated_at:
+              type: string
+              format: date-time
+    ConversationMessage:
+      type: object
+      description: UI 线程消息（P1 只写 user/assistant）；LLM transcript 不通过本 API 暴露
+      required: [id, conversation_id, role, parts, refs, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        conversation_id:
+          type: string
+          pattern: '^[0-9]+$'
+        role:
+          type: string
+          enum: [user, assistant]
+        parts:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/MessagePart'
+        refs:
+          type: array
+          description: '结构化引用；元素形如 {"kind": "requirement", "id": "3001"}'
+          items:
+            type: object
+            required: [kind, id]
+            properties:
+              kind:
+                type: string
+              id:
+                type: string
+                pattern: '^[0-9]+$'
+        created_at:
+          type: string
+          format: date-time
+    MessagePart:
+      description: |
+        消息 part 判别联合，以 `type` 区分：
+        `text` / `attachment` / `requirement_card` / `rollback_proposal`。
+      oneOf:
+        - type: object
+          required: [type, text]
+          properties:
+            type:
+              type: string
+              enum: [text]
+            text:
+              type: string
+              minLength: 1
+              maxLength: 20000
+        - type: object
+          required: [type, sha256, name, mime, size]
+          properties:
+            type:
+              type: string
+              enum: [attachment]
+            sha256:
+              type: string
+              pattern: '^[0-9a-f]{64}$'
+              description: P0 `POST /api/content` 返回的内容 SHA-256
+            name:
+              type: string
+            mime:
+              type: string
+            size:
+              type: integer
+              minimum: 0
+              maximum: 10485760
+        - type: object
+          required: [type, requirement_id, title, status, revision]
+          properties:
+            type:
+              type: string
+              enum: [requirement_card]
+            requirement_id:
+              type: string
+              pattern: '^[0-9]+$'
+            title:
+              type: string
+            status:
+              type: string
+              enum: [draft, clarified, closed, obsolete]
+            revision:
+              type: integer
+              minimum: 1
+        - type: object
+          required: [type, requirement_id, reason]
+          properties:
+            type:
+              type: string
+              enum: [rollback_proposal]
+            requirement_id:
+              type: string
+              pattern: '^[0-9]+$'
+            reason:
+              type: string
+    CreateConversationRequest:
+      type: object
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [clarification]
+          description: P1 只支持 clarification
+        title:
+          type: string
+          minLength: 1
+          maxLength: 120
+          description: 省略时默认 `需求澄清 YYYY-MM-DD HH:mm`
+    PostMessageRequest:
+      type: object
+      required: [parts]
+      properties:
+        client_message_id:
+          type: string
+          maxLength: 64
+          description: 幂等键；同一对话内唯一
+        parts:
+          type: array
+          minItems: 1
+          description: 至少一个非空 part；`attachment` part 最多 10 个
+          items:
+            $ref: '#/components/schemas/MessagePart'
+    AttachmentView:
+      type: object
+      description: 附件运行态（解析文本作为内容引用保存，不复制进需求版本）
+      required: [id, name, mime, size, extraction_status, extraction_error, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        name:
+          type: string
+        mime:
+          type: string
+        size:
+          type: integer
+          minimum: 0
+          maximum: 10485760
+        extraction_status:
+          type: string
+          enum: [pending, processing, done, failed, skipped]
+        extraction_error:
+          type: object
+          nullable: true
+          required: [code]
+          description: 解析失败时返回稳定错误码；不泄露路径/服务器信息
+          properties:
+            code:
+              type: string
+              enum: [unsupported_attachment_format, extraction_failed]
+            message:
+              type: string
+        created_at:
+          type: string
+          format: date-time
+    RequirementCounts:
+      type: object
+      description: 版本下需求按状态计数（P1 增量）
+      required: [total, draft, clarified, closed, obsolete]
+      properties:
+        total:
+          type: integer
+          minimum: 0
+        draft:
+          type: integer
+          minimum: 0
+        clarified:
+          type: integer
+          minimum: 0
+        closed:
+          type: integer
+          minimum: 0
+        obsolete:
+          type: integer
+          minimum: 0
+    RequirementTargets:
+      type: object
+      description: 需求目标引用的十进制 ID；空数组表示未指定
+      required: [version_suts, pages, apis]
+      properties:
+        version_suts:
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9]+$'
+        pages:
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9]+$'
+        apis:
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9]+$'
+    RequirementSummary:
+      type: object
+      description: 需求列表项（当前 revision 摘要）
+      required: [id, current_version_id, revision, title, status, priority, targets, updated_at, confirmed_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        current_version_id:
+          type: string
+          pattern: '^[0-9]+$'
+          description: 当前 requirement_version ID
+        revision:
+          type: integer
+          minimum: 1
+        title:
+          type: string
+        status:
+          type: string
+          enum: [draft, clarified, closed, obsolete]
+        priority:
+          type: string
+          enum: [P0, P1, P2, P3]
+        targets:
+          $ref: '#/components/schemas/RequirementTargets'
+        updated_at:
+          type: string
+          format: date-time
+        confirmed_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: 当前 revision 的确认时间；未确认为 null
+    RequirementVersionView:
+      type: object
+      description: 不可变需求版本快照
+      required: [id, requirement_id, revision, title, description, acceptance_criteria, priority, constraints, target_version_suts, target_pages, target_apis, content_hash, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        requirement_id:
+          type: string
+          pattern: '^[0-9]+$'
+        revision:
+          type: integer
+          minimum: 1
+        title:
+          type: string
+        description:
+          type: string
+        acceptance_criteria:
+          type: string
+        priority:
+          type: string
+          enum: [P0, P1, P2, P3]
+        constraints:
+          type: object
+          additionalProperties: true
+          description: 业务规则等；推荐子键 business_rules/preconditions/exceptions/data_constraints/dependencies
+        target_version_suts:
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9]+$'
+        target_pages:
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9]+$'
+        target_apis:
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9]+$'
+        content_hash:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: 规范化 JSON 的 SHA-256 hex
+        created_at:
+          type: string
+          format: date-time
+    RequirementConfirmationView:
+      type: object
+      description: 需求版本确认记录
+      required: [id, requirement_version_id, scope, batch_id, actor_id, confirmed_at, affected_requirement_ids]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        requirement_version_id:
+          type: string
+          pattern: '^[0-9]+$'
+        scope:
+          type: string
+          enum: [requirement, batch]
+        batch_id:
+          type: string
+          nullable: true
+        actor_id:
+          type: string
+          pattern: '^[0-9]+$'
+        confirmed_at:
+          type: string
+          format: date-time
+        affected_requirement_ids:
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9]+$'
+    RequirementRelationView:
+      type: object
+      description: 需求关系（同版本、非自环、唯一）
+      required: [id, from_requirement_id, to_requirement_id, kind, description, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        from_requirement_id:
+          type: string
+          pattern: '^[0-9]+$'
+        to_requirement_id:
+          type: string
+          pattern: '^[0-9]+$'
+        kind:
+          type: string
+          enum: [depends_on, conflicts_with, overlaps, shares_scope]
+        description:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+    RequirementDetail:
+      description: 需求详情（摘要字段 + 当前/历史版本 + 确认/关系/附件）
+      allOf:
+        - $ref: '#/components/schemas/RequirementSummary'
+        - type: object
+          required: [current_version, history, confirmations, relations, attachments]
+          properties:
+            current_version:
+              $ref: '#/components/schemas/RequirementVersionView'
+            history:
+              type: array
+              description: 历史版本（revision 倒序，不含当前版本）
+              items:
+                $ref: '#/components/schemas/RequirementVersionView'
+            confirmations:
+              type: array
+              items:
+                $ref: '#/components/schemas/RequirementConfirmationView'
+            relations:
+              type: array
+              items:
+                $ref: '#/components/schemas/RequirementRelationView'
+            attachments:
+              type: array
+              items:
+                $ref: '#/components/schemas/AttachmentView'
+    CreateRequirementRequest:
+      type: object
+      required: [title, description, acceptance_criteria, priority]
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        description:
+          type: string
+          minLength: 1
+          maxLength: 20000
+        acceptance_criteria:
+          type: string
+          minLength: 1
+          maxLength: 20000
+        priority:
+          type: string
+          enum: [P0, P1, P2, P3]
+          default: P2
+        constraints:
+          type: object
+          additionalProperties: true
+          description: 业务规则等；推荐子键 business_rules/preconditions/exceptions/data_constraints/dependencies
+        targets:
+          $ref: '#/components/schemas/RequirementTargets'
+    UpdateRequirementRequest:
+      type: object
+      required: [title, description, acceptance_criteria, priority]
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        description:
+          type: string
+          minLength: 1
+          maxLength: 20000
+        acceptance_criteria:
+          type: string
+          minLength: 1
+          maxLength: 20000
+        priority:
+          type: string
+          enum: [P0, P1, P2, P3]
+        constraints:
+          type: object
+          additionalProperties: true
+        targets:
+          $ref: '#/components/schemas/RequirementTargets'
+        reason:
+          type: string
+          maxLength: 2000
+          description: 变更原因（审计/事件）
+    ConfirmRequirementResult:
+      type: object
+      required: [confirmed, requirement]
+      properties:
+        confirmed:
+          type: boolean
+          description: true=本次新确认；false=此前已确认，幂等返回
+        requirement:
+          $ref: '#/components/schemas/RequirementDetail'
+    BatchConfirmRequest:
+      type: object
+      required: [requirement_ids]
+      properties:
+        requirement_ids:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            pattern: '^[0-9]+$'
+    BatchConfirmResult:
+      type: object
+      required: [batch_id, confirmed, skipped]
+      properties:
+        batch_id:
+          type: string
+        confirmed:
+          type: array
+          description: 本次新确认的需求 ID
+          items:
+            type: string
+            pattern: '^[0-9]+$'
+        skipped:
+          type: array
+          description: 已确认并幂等跳过的需求 ID
+          items:
+            type: string
+            pattern: '^[0-9]+$'
+    RollbackRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+          maxLength: 2000
+        proposal_message_id:
+          type: string
+          pattern: '^[0-9]+$'
+          description: AI `rollback_proposal` 消息 ID；省略表示用户主动回退
+    TeamRoomPost:
+      type: object
+      description: 团队频道帖子（全量审计；不全文回放）
+      required: [id, kind, content, refs, agent_run_id, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        kind:
+          type: string
+          enum: [finding, decision, blocker, handoff, status]
+        content:
+          type: string
+        refs:
+          type: array
+          description: '结构化引用；元素形如 {"kind": "requirement", "id": "3001"}'
+          items:
+            type: object
+            required: [kind, id]
+            properties:
+              kind:
+                type: string
+              id:
+                type: string
+                pattern: '^[0-9]+$'
+        agent_run_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+    TeamRoomView:
+      type: object
+      description: 团队频道只读视图（最新 digest + 最近帖子）
+      required: [team, digest, posts]
+      properties:
+        team:
+          type: string
+          enum: [clarification, design, execution, delivery, steward]
+        digest:
+          type: object
+          nullable: true
+          description: 最新摘要；尚未生成时为 null
+          required: [summary, pinned_post_ids, token_estimate, version, updated_at]
+          properties:
+            summary:
+              type: string
+            pinned_post_ids:
+              type: array
+              items:
+                type: string
+                pattern: '^[0-9]+$'
+            token_estimate:
+              type: integer
+              minimum: 0
+            version:
+              type: integer
+              minimum: 1
+            updated_at:
+              type: string
+              format: date-time
+        posts:
+          type: array
+          items:
+            $ref: '#/components/schemas/TeamRoomPost'

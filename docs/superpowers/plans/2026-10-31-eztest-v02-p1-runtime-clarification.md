@@ -14,7 +14,7 @@
 
 - 权威：`docs/version-V0.2/architecture-design.md`、`high-level-design.md`、`research/decision-log.md`、`research/open-decisions.md`、`phases/phase-01-runtime-clarification.md`、P0 frozen `contracts/`、`phase-00-handoff.md`。冲突按 spec §12.1 裁决；不改设计文档。
 - 阶段按 **P1 = phase-01** 实施（提示词误用了 P0 模板；权威阶段表为准）。
-- `.env` 严格 4 项；P1 不新增 env；不新增设置键（消费 P0 的 context/agent/team_room/llm 键）。真实 LLM 验收只由 `scripts/p1-acceptance-llm.ps1` 读取 `.env` 的非 EzTest 键 `DEEPSEEK_API_KEY/DEEPSEEK_BASE_URL/DEEPSEEK_MODEL`，再经 admin API 写 `llm_config`；API 进程不读这些键。
+- `.env` 严格 4 项；P1 不新增 env；不新增设置键（消费 P0 的 context/agent/team_room/llm 键）。真实 LLM 验收只由 `scripts/p1-acceptance-llm.ps1` 读取 `.env` 的小写键 `llm_api_key/llm_base_url/llm_model_name`（`deepseek-flash`），再经 admin API 写 `llm_config` 并 refresh；API 进程不读这些键。上下文窗口/输出优先从网关模型目录读取，缺失才回退设置。
 - 前端新增 `react-markdown`/`remark-gfm` 由 Lead 在 T14 开始前执行 `pnpm add` 并提交 `package.json`/lockfile；其他代理不得改 `package.json`。
 - 所有新业务 ID 雪花 int64；JSON/URL 一律十进制字符串；事件 `seq` 是数字游标。
 - 迁移只追加；不改 P0 已应用迁移；迁移名 `<context>_<NNNN>_<desc>.sql`；`order.txt` 追加到末尾。P1 迁移：`agent_0001_work_item.sql`、`agent_0002_team_room.sql`、`agent_0003_runtime.sql`、`version_0002_requirement.sql`、`version_0003_conversation.sql`、`version_0004_requirement_attachment.sql`、`eventing_0002_event_index.sql`。
@@ -49,7 +49,8 @@ Lead: T13 server/main/integration（依赖 T9/T12） → T18 E2E/验收（依赖
 ```
 
 **写作用域**
-- backend-runtime：`backend/internal/agent/**`、`backend/internal/llm/**`（仅 chat 增量）、`scripts/fake-llm.cjs`、`scripts/fake-llm-p1.test.cjs`。
+- backend-runtime：`backend/internal/agent/**`（domain/workqueue/teamroom/context，T3–T6）。
+- backend-agent：`backend/internal/llm/**`（仅 chat 增量）、`backend/internal/agent/application/{runner.go,profiles.go,summary.go,ports_agent.go,worker.go,reconciler.go}`、`backend/internal/agent/application/tools/**`、`scripts/fake-llm.cjs`、`scripts/fake-llm-p1.test.cjs`（T7–T9）。
 - backend-domain：`backend/internal/version/**`（新增文件 + 必要的 counts/status 增量）。
 - frontend：`frontend/src/features/clarification/**`、`frontend/src/lib/api-client.ts`、`frontend/src/features/versions/VersionDetailPage.tsx`、`VersionDetailPage.test.tsx`。
 - Lead：`backend/internal/db/migrations/**`、`backend/internal/server/**`、`backend/cmd/eztest/**`、`backend/internal/platform/**`、`backend/internal/testutil/**`、`docs/version-V0.2/contracts/**`、`scripts/p1-*.ps1`、`docs/version-V0.2/phases/phase-01-handoff.md`。
@@ -101,7 +102,7 @@ Lead: T13 server/main/integration（依赖 T9/T12） → T18 E2E/验收（依赖
 - [ ] **Step 2: migrations-order 追加 7 行 + ownership + P1 增量说明**。
 - [ ] **Step 3: events 追加 P1 事件类型、scope 字段、payload 示例、单实例限制不变**。
 - [ ] **Step 4: task-types.md**：P1 实现 `chat.turn/requirement.curate/attachment.ingest`；列 P2+ 保留类型但不实现；写 team/dedupe/输入/输出/失败语义。
-- [ ] **Step 5: agent-profiles-tools.md**：3 个 profile、17 个工具、scope 注入、JSON schema、提交校验、错误返回；P2+ 工具标 reserved。
+- [ ] **Step 5: agent-profiles-tools.md**：3 个 profile、14 个 P1 工具、scope 注入、JSON schema、提交校验、错误返回；P2+ 工具标 reserved。
 - [ ] **Step 6: openapi**：追加 11 个 P1 path（含只读 team-room）、23 个 schema、错误码；P0 LLM list/status 漂移按实现修正（非破坏性）；`info`/`x-frozen` 标 P1 draft。
 - [ ] **Step 7: settings.md**：记录 P1 只消费 P0 键，不新增 env/键；列出 context/agent/team_room/llm 键。
 - [ ] **Step 8: YAML 解析自检**：`node -e "const yaml=require('./frontend/node_modules/yaml'); yaml.parse(require('fs').readFileSync('docs/version-V0.2/contracts/openapi.yaml','utf8')); console.log('ok')"`。
@@ -223,7 +224,8 @@ func (s *TeamRoom) Read(ctx context.Context, versionID int64, team string, limit
 ```go
 type Section struct { Name string; Content string; Refs []string; Optional bool }
 type ContextPacket struct { VersionID int64; Sections []Section; TokenCounts map[string]int; Hash string }
-type ContextInput struct { Profile agent.Profile; Task TaskContext; VersionPack VersionPack; Conversation ConversationContext; TeamRoom TeamRoomContext; Artifacts []ArtifactRef }
+type ContextInput struct { Profile agent.Profile; Task TaskContext; VersionPack VersionPack; Conversation ConversationContext; TeamRoom TeamRoomContext; Artifacts []ArtifactRef; ModelBudget ModelBudget }
+type ModelBudget struct { ContextWindow int; MaxOutput int }
 type ContextBuilder struct{ ... }
 func NewContextBuilder(settings SettingsReader, summarizer Summarizer) *ContextBuilder
 func (b *ContextBuilder) Build(ctx context.Context, in ContextInput) (ContextPacket, error)
@@ -231,14 +233,14 @@ func EstimateTokens(s string) int // runes/2 + 16
 func Compact(input ContextInput, budget int) (ContextInput, CompactInfo)
 type Summarizer interface { Summarize(ctx context.Context, messages []Message) (string, error) }
 ```
-- 预算 = `context.window_tokens - context.output_reserve_tokens - 2048`；阈值 `context.compact_threshold`；保留 pinned + 最近 `context.keep_recent_messages`；LLM 摘要失败→确定性裁剪；最终仍超→最小段。
+- 预算 = `ModelBudget.ContextWindow`（缺失回退 `context.window_tokens`）- 输出预留（不超过 `ModelBudget.MaxOutput`，缺失回退 `context.output_reserve_tokens`）- 2048；阈值 `context.compact_threshold`；保留 pinned + 最近 `context.keep_recent_messages`；LLM 摘要失败→确定性裁剪；最终仍超→最小段。
 - `context.compacted` 事件由 runtime 发，不在纯 builder 里；builder 返回 `Compacted bool`/`Summary` 供上层持久化。
 
 - [ ] **Step 1: 写失败测试**：预算计算；小上下文不压缩；超阈值压缩后 pinned/最近窗口/任务约束保留；Summarizer 失败回退；极端超限仍输出 ≤budget；token 估算中文保守；hash 稳定。
 - [ ] **Step 2-4: TDD 实现并跑通** `go test ./internal/agent/application/ -run 'TestContext|TestCompact|TestEstimate'`。
 - [ ] **Step 5: Lead 提交** `feat(p1): add layered context builder`。
 
-## Task 7: LLM chat 网关与确定性 fake LLM（backend-runtime）
+## Task 7: LLM chat 网关与确定性 fake LLM（backend-agent）
 
 **Files:**
 - Create: `backend/internal/llm/application/chat.go`、`chat_test.go`
@@ -257,19 +259,24 @@ type ChatMessage struct { Role, Content string; ToolCalls []ToolCall; ToolCallID
 type ToolDefinition struct { Name, Description string; Parameters json.RawMessage }
 type ChatRequest struct { Model string; Messages []ChatMessage; Tools []ToolDefinition; MaxOutputTokens int }
 type ChatResponse struct { Content string; ToolCalls []ToolCall; Usage map[string]int; FinishReason string }
-type ChatGateway interface { Chat(ctx context.Context, req ChatRequest) (ChatResponse, error) }
+type ChatGateway interface {
+    Chat(ctx context.Context, req ChatRequest) (ChatResponse, error)
+    ResolveModel(ctx context.Context) (ModelInfo, error)
+}
+type ModelInfo struct { ConfigID int64; Model string; ContextWindow int; MaxOutput int; SupportsTools bool }
 func (s *Service) Chat(ctx context.Context, req ChatRequest) (ChatResponse, error)
+func (s *Service) ResolveModel(ctx context.Context) (ModelInfo, error)
 ```
 - 默认 config/model 解析；超时/重试来自 config；错误脱敏；`context_length_exceeded` 映射 `context_overflow` 可识别错误。
 - Fake 模式：system 含 `[profile:clarification_host]`→文本；`[profile:requirement_curator]`→第一次 `requirement.draft_create` tool_call，收到 tool 结果后最终文本；`[profile:context_scout]`→摘要文本；`[fake:context_overflow]`→首次 400 context_length_exceeded；无标记保持 P0 echo。
 
-- [ ] **Step 1: 写 Go 失败测试**：默认 config/model 选择；无 config→ai_unavailable；tool_calls 解析；timeout/retry；key 不出现在错误；context overflow 可识别。
+- [ ] **Step 1: 写 Go 失败测试**：默认 config/model 选择与 `ResolveModel` 元数据；模型元数据缺失回退；无 config→ai_unavailable；tool_calls 解析；timeout/retry；key 不出现在错误；context overflow 可识别。
 - [ ] **Step 2: 跑失败**、**Step 3: 实现网关**、**Step 4: 跑通** `go test ./internal/llm/...`（含 P0 既有测试）。
 - [ ] **Step 5: 写 fake LLM 测试**：node:test 启动脚本，断言 P0 echo 不变、Host 文本、Curator tool_call→最终文本、Scout 摘要、overflow 首次 400。
 - [ ] **Step 6: 跑通** `node --test scripts/fake-llm-p1.test.cjs`。
 - [ ] **Step 7: Lead 提交** `feat(p1): add chat gateway and deterministic fake agent`。
 
-## Task 8: 工具注册表、run loop 与 profile 种子（backend-runtime）
+## Task 8: 工具注册表、run loop 与 profile 种子（backend-agent）
 
 **Files:**
 - Create: `backend/internal/agent/application/profiles.go`、`profiles_test.go`
@@ -292,7 +299,7 @@ func (r *Runner) Run(ctx context.Context, item agent.WorkItem) (RunResult, error
 ```
 - Tools 的 `Parameters()` 是 JSON Schema，**不得**含 `version_id/versionId`；runtime 把 scope 传给 Execute。
 - 工具清单按 spec §5.5；`context.summary_update` 写 pinned/summary；`requirement.reopen_propose` 只写 `rollback_proposal` 消息 part。
-- Runner：创建 agent_run、context packet、循环调 `ChatGateway`、执行 tool_calls、写 agent_message/tool message、Host 最终消息写 conversation、Curator 卡片、Scout 团队帖；max turns/soft/hard timeout；context overflow 重试；tool result 超 32KiB 落盘；lease heartbeat 由 worker 负责。
+- Runner：创建 agent_run、context packet、循环调 `ChatGateway`、执行 tool_calls、写 agent_message/tool message、Host 最终消息写 conversation、Curator 卡片、Scout 团队帖；每 run 先 `ResolveModel` 取 ContextWindow/MaxOutput 填入 `ContextInput.ModelBudget`；max turns/soft/hard timeout；context overflow 重试；tool result 超 32KiB 落盘；lease heartbeat 由 worker 负责。
 - `profiles.go` 种子常量 + `EnsureProfiles`（key/name/system_prompt/allowed_tools/model/budgets）。
 
 - [ ] **Step 1: 写 profile 失败测试**（3 个 key、工具集合、prompt 含 `[profile:...]`；seed 幂等）。
@@ -301,7 +308,7 @@ func (r *Runner) Run(ctx context.Context, item agent.WorkItem) (RunResult, error
 - [ ] **Step 4: TDD 实现并跑通** `go test ./internal/agent/application/...`（可用 fake ports，不依赖 DB）。
 - [ ] **Step 5: Lead 提交** `feat(p1): add scoped tools and agent run loop`。
 
-## Task 9: Worker 与 P1 Reconciler（backend-runtime）
+## Task 9: Worker 与 P1 Reconciler（backend-agent）
 
 **Files:**
 - Create: `backend/internal/agent/application/worker.go`、`worker_test.go`
@@ -360,6 +367,7 @@ type CaseStaleHook interface { MarkRequirementChanged(ctx context.Context, versi
 - P2 stale：调用 hook，事件带 `affected_case_version_ids`；P1 空实现返回 `[]`。
 - 版本统计：requirement_counts、conversation_count、pending_design_count（=clarified 数）。
 - 资源校验：target_version_suts ⊆ version_sut；target_pages/apis ⊆ 版本 scope（通过 VersionReader/CatalogReader）。
+- HTTP DTO 使用 openapi P1 schemas：列表/创建/更新请求的 `targets:{version_suts,pages,apis}`；详情历史字段 `history`；确认返回 `{confirmed,requirement}`；批量返回 `{batch_id,confirmed,skipped}`。
 
 - [ ] **Step 1: 写 domain 失败测试**（状态迁移、必填校验、priority 枚举、content_hash 稳定、revision 递增）。
 - [ ] **Step 2: 写 service 失败测试**（fakes）：create draft；edit draft→revision+1；confirm 冻结/幂等；batch 全量校验/已确认跳过/非法 400；clarified edit→draft；rollback→新 draft + hook + 事件；跨版本 404；MarkRunning 只一次。
@@ -472,9 +480,9 @@ type Parser interface { Extract(ctx context.Context, name, mime string, r io.Rea
 **Interfaces:**
 ```ts
 export type Version = { id: string; title: string; status: "initial"|"running"|"completed"; requirement_counts: {total:number;draft:number;clarified:number;closed:number;obsolete:number}; conversation_count: number; pending_design_count: number; bindings: ... }
-export type Conversation = { id,title,kind,status,message_count,last_message_at?,created_at }
-export type MessagePart = {type:"text";text:string}|{type:"attachment";sha256:string;name:string;mime:string;size:number}|{type:"requirement_card";requirement_id:string;title:string;status:string;revision:number}|{type:"rollback_proposal";requirement_id:string;reason:string}
-export type Requirement = {...}
+export type Conversation = { id:string; title:string; kind:"clarification"|"design"; status:"active"|"closed"; message_count:number; last_message_at:string|null; created_at:string; summary?:string|null; updated_at?:string }
+export type MessagePart = {type:"text";text:string}|{type:"attachment";sha256:string;name:string;mime:string;size:number}|{type:"requirement_card";requirement_id:string;title:string;status:string;revision:number}|{type:"rollback_proposal";requirement_id:string;requirement_title:string;reason:string}
+export type Requirement = { id:string; current_version_id:string; revision:number; title:string; status:string; priority:string; targets:{version_suts:string[];pages:string[];apis:string[]}; updated_at:string; confirmed_at:string|null; current_version?:...; history?:...; confirmations?:...; relations?:...; attachments?:... }
 ```
 - `apiUpload(path, formData)` uses `apiFetch` with FormData (no JSON content-type).
 - `RequirementsTab` 初始壳只 fetch conversation/requirements counts；不实现 Chat/Sidebar（后续 T15/T16）。
@@ -544,7 +552,7 @@ export type Requirement = {...}
 - Create: `scripts/p1-e2e.ps1`（基于 `p0-e2e.ps1`：fake LLM + API + web + Playwright）
 - Create: `frontend/e2e/p1-requirements.spec.ts`（若 P0 E2E 目录不同，按现有结构）
 - Create: `scripts/p1-acceptance.ps1`（API 动线：任务板并发/恢复、对话/需求/确认/回退/SSE/附件）
-- Create: `scripts/p1-acceptance-llm.ps1`（真实 LLM 必跑：读取 `.env` 的 `DEEPSEEK_API_KEY`/`DEEPSEEK_BASE_URL`/`DEEPSEEK_MODEL`，经 admin API 配置 `llm_config`，跑澄清闭环；缺失凭据则明确失败并阻塞 handoff）
+- Create: `scripts/p1-acceptance-llm.ps1`（真实 LLM 必跑：读取 `.env` 的 `llm_api_key`/`llm_base_url`/`llm_model_name`（deepseek-flash），经 admin API 配置 `llm_config` 并 refresh，跑澄清闭环；缺失凭据则明确失败并阻塞 handoff）
 - Modify: `scripts/fake-llm.cjs`（仅当 T7 未覆盖的 E2E 场景需要；Lead 与 runtime 协调后改）
 - Create/Modify: `.tmp/p1-acceptance/` evidence（gitignored）
 
@@ -554,7 +562,7 @@ export type Requirement = {...}
 - [ ] **Step 2: 写 Playwright spec**（data-testid 稳定选择器；上传生成的小 docx/md；等待 SSE 卡片）。
 - [ ] **Step 3: 跑 E2E** 使用独立 `eztest_v02_e2e` 库、重建 `.tmp/p1/eztest.exe`、独立启动 fake LLM/API/Web；失败按 systematic-debugging 修。
 - [ ] **Step 4: 截图** 登录/需求空态/对话草案/批量确认/回退卡/设计 CTA → `.tmp/p1-acceptance/screenshots/`。
-- [ ] **Step 5: 真实 LLM 验收** 读取 `.env` DeepSeek v4.1 flash 配置，经 admin API 写 `llm_config`，跑“新对话→真实模型澄清→draft→确认”动线；日志 `.tmp/p1-acceptance/llm.log`；凭据缺失则停止并在 handoff 标 blocked，不以 fake 结果替代。
+- [ ] **Step 5: 真实 LLM 验收** 读取 `.env` 的 `llm_api_key/llm_base_url/llm_model_name`（`deepseek-flash`），经 admin API 写 `llm_config` 并 refresh-models，跑“新对话→真实模型澄清→draft→确认”动线；日志 `.tmp/p1-acceptance/llm.log`；凭据缺失则停止并在 handoff 标 blocked，不以 fake 结果替代。
 - [ ] **Step 6: Lead 提交** `test(p1): add acceptance and e2e journeys`。
 
 ## Task 19: 独立评审（reviewer subagent / Lead）
@@ -577,7 +585,7 @@ export type Requirement = {...}
 - Modify: `docs/version-V0.2/README.md`? **不改**（设计文档）；只在 handoff 记录
 - Modify: `.tmp` 不提交
 
-**Interfaces:** handoff 必须含：完成范围、契约变更/冻结、迁移顺序、测试命令/结果、演示路径、真实 LLM 验收结果（DeepSeek v4.1 flash）、已知缺口（.doc/.ppt、stale P2、单实例、上下文估算、P0 D6–D10 backlog）、P2 输入（需求版本/确认/stale 端口/design_scope 占位/工具预留）、风险。
+**Interfaces:** handoff 必须含：完成范围、契约变更/冻结、迁移顺序、测试命令/结果、演示路径、真实 LLM 验收结果（`.env` `llm_*`，`deepseek-flash`）、已知缺口（.doc/.ppt、stale P2、单实例、上下文估算、P0 D6–D10 backlog）、P2 输入（需求版本/确认/stale 端口/design_scope 占位/工具预留）、风险。
 
 - [ ] **Step 1: 全量 gate** `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test.ps1`（Go 单测+集成、pnpm lint/typecheck/test）；日志 `.tmp/p1/final-gate.log`。
 - [ ] **Step 2: 生产构建** `cd frontend; pnpm build`；记录路由。
@@ -598,13 +606,13 @@ export type Requirement = {...}
 
 **Step scan**：每个 Step 是可执行动作/命令/断言；无 “TBD/处理边界/加适当测试”。测试步骤带具体测试名；实现步骤带文件与接口。Task 内部按 TDD：失败测试→跑失败→实现→跑通→提交（Lead 代提交）。
 
-**Type consistency**：`WorkItemStatus`/`WorkItem`/`NewWorkItem` 在 T3/T4/T9 一致；`ChatGateway/ChatRequest/ChatResponse` 在 T7/T8 一致；`RequirementService` 方法与 T8 的 `RequirementWriter` 端口在 T8 实现时按 T10 接口名对齐（T10 先定义，T8 依赖该接口）；`ConversationService` 与 T8 `ConversationPort` 同名方法；`ContextBuilder.Build` 返回 `ContextPacket` 与 `context_packet` 表一致；API JSON 字段在 T2/T10/T11/T14 一致（snake_case，ID 字符串）。
+**Type consistency**：`WorkItemStatus`/`WorkItem`/`NewWorkItem` 在 T3/T4/T9 一致；`ChatGateway/ChatRequest/ChatResponse/ModelInfo/ResolveModel` 在 T7/T8 一致；`ContextInput.ModelBudget` 由 T6 定义、T8 填充；`RequirementService` 方法与 T8 的 `RequirementWriter` 端口在 T8 实现时按 T10 接口名对齐（T10 先定义，T8 依赖该接口）；`ConversationService` 与 T8 `ConversationPort` 同名方法；`ContextBuilder.Build` 返回 `ContextPacket` 与 `context_packet` 表一致；API JSON 字段在 spec §8.5/T2/T10/T11/T14 一致（snake_case，ID 字符串）。
 - 需在实现时锁定的跨任务签名：`RequirementWriter` 的 `AgentCreate/AgentUpdate/AgentReopenProposal/AgentRelation` 由 T8 定义，T10 的 service 方法通过 adapter（Lead 在 T13 装配）适配；若签名不一致，以 T10 service 为准改 T8 端口。
 
 **Review Focus 测试映射**
 1. 契约漂移 → T2 YAML 解析 + T20 逐项比对；handler/DTO 测试。
 2. scope/ID → T8 registry 测试（schema 无 versionId）+ T10 跨版本 404 + T11 跨版本 404。
-3. 压缩丢事实 → T6 压缩保留 pinned/最近/约束 + T8 overflow 重试 + T18 长会话。
+3. 压缩丢事实 → T6 压缩保留 pinned/最近/约束 + 模型窗口优先/回退测试 + T8 overflow 重试 + T18 长会话。
 4. 幂等/租约 → T4 并发领取/过期/epoch + T9 reconciler 重复扫描 + T13 集成。
 5. 旧假设 → T10 确认/回退权限测试 + T19 评审清单 + T20 契约审计。
 
@@ -615,5 +623,5 @@ export type Requirement = {...}
 - T3–T9 是单条 runtime 流水线，串行依赖多；可并行 T5/T6/T7 缩短关键路径。
 - T10/T11 同属 version 上下文，必须一人串行写（backend-domain），避免 package 级冲突。
 - T12 PDF/docx/pptx 解析是本阶段最高不确定项；先做 fixture 与失败测试，若 PDF 库不可用则用最小自研解析并记录缺口（不阻塞其他任务）。
-- T18 真实 LLM 依赖 `.env` 的 DeepSeek 配置；当前 `.env` 只有 4 项 EzTest env，尚无 `DEEPSEEK_*`。实施期间可先跑 fake；验收前若仍缺失，按 blocked 报告，不得伪造。
+- T18 真实 LLM 依赖 `.env` 的小写 `llm_*`（已存在 `llm_api_key/llm_base_url/llm_model_name=deepseek-flash`）；验收前若缺失，按 blocked 报告，不得伪造。上下文窗口以网关模型目录为准，缺失回退设置。
 - T18 E2E 依赖本机 PostgreSQL/Playwright；若环境不满足，用集成测试 + API 验收替代并在 handoff 记录，不得伪造通过。

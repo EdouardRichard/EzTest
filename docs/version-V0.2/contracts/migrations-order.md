@@ -93,6 +93,36 @@ version_0002_clarification.sql
 CREATE TABLE clarification_session ( ... );
 ```
 
+## 5a. P1 迁移清单（`draft: P1`，阶段末冻结）
+
+P0 的 8 个迁移保持原样；P1 在 `order.txt` 末尾追加以下 7 个文件（`backend/internal/db/migrations/`）：
+
+| 序号 | 迁移文件 | 上下文 | 创建/变更 |
+|---|---|---|---|
+| 9 | `agent_0001_work_item.sql` | agent | `work_item`、`work_item_attempt` |
+| 10 | `agent_0002_team_room.sql` | agent | `team_room_post`、`team_room_digest` |
+| 11 | `agent_0003_runtime.sql` | agent | `agent_profile`、`agent_run`、`agent_message`、`context_packet` |
+| 12 | `version_0002_requirement.sql` | version | `requirement`、`requirement_version`、`requirement_confirmation`、`requirement_relation` |
+| 13 | `version_0003_conversation.sql` | version | `conversation`、`conversation_message`、`conversation_summary` |
+| 14 | `version_0004_requirement_attachment.sql` | version | `requirement_attachment` |
+| 15 | `eventing_0002_event_index.sql` | eventing | `idx_event_channel_created_at`（只加索引） |
+
+`order.txt` 末尾原文：
+
+```text
+agent_0001_work_item.sql
+agent_0002_team_room.sql
+agent_0003_runtime.sql
+version_0002_requirement.sql
+version_0003_conversation.sql
+version_0004_requirement_attachment.sql
+eventing_0002_event_index.sql
+```
+
+- 上文的 `version_0002_clarification.sql`/`clarification_session` 只是 P0 的历史示例，**P1 不采用**；P1 使用设计表 `conversation`（见 db-schema §7）。
+- P1 迁移已在集成测试随机 schema 中重复执行验证；开发库/演示库通过启动迁移前滚。
+- 迁移顺序影响：P1 表无跨上下文 FK；`version_0002` 依赖 P0 `version`，`agent_0003` 内部 FK 依赖 `work_item`（同上下文）。回滚方式仍是恢复备份，不提供 down SQL。
+
 ## 6. 回滚 / 备份 / 数据库边界
 
 - P0 **只支持前滚**：没有 down migration，也不提供自动回滚。

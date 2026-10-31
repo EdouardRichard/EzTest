@@ -1,6 +1,6 @@
 # EzTest 0.2 P1 控制面 + 澄清 — 实施规格
 
-> 状态：用户已审核批准（2026-10-31）。执行口径：全部按推荐；附件支持现代 docx/pptx + 旧 .doc/.ppt 明确失败；`Event.seq`/`snapshot_cursor` 修代码为整数；版本 running 由首条对话消息/首个需求/首次确认触发；团队频道补只读 API + 面板；Markdown 用 `react-markdown`；真实 LLM 使用 `.env` 中的 DeepSeek v4.1 flash（仅验收脚本读取，API 仍严格 4 项 env）。
+> 状态：用户已审核批准（2026-10-31）。执行口径：全部按推荐；附件支持现代 docx/pptx + 旧 .doc/.ppt 明确失败；`Event.seq`/`snapshot_cursor` 修代码为整数；版本 running 由首条对话消息/首个需求/首次确认触发；团队频道补只读 API + 面板；Markdown 用 `react-markdown`；真实 LLM 使用 `.env` 的小写 `llm_*` 配置（`llm_model_name=deepseek-flash`，仅验收脚本读取，API 仍严格 4 项 env）；上下文窗口从网关模型目录读取，缺失回退设置。
 > 阶段：P1（控制面 + 澄清）。阶段文件：`docs/version-V0.2/phases/phase-01-runtime-clarification.md`。
 > 前置 handoff：`docs/version-V0.2/phases/phase-00-handoff.md`（P0 completed）。
 > 计划：`docs/superpowers/plans/2026-10-31-eztest-v02-p1-runtime-clarification.md`。
@@ -42,7 +42,7 @@
 
 **不在 P1**
 - 设计/脑图/场景/用例/design_scope/design.round（P2）；执行/波次/意图（P3）；交付/问题/报告/链路（P4+）；代码智能/视觉/质量/搜索/待办/Agent 中心（P5/P6）；P9。
-- 0.1 数据迁移；多副本部署编排（P7）；0.2 全量 E2E/性能/SLO（P8）。真实 LLM 验收在 P1 必跑：使用 `.env` 的 DeepSeek v4.1 flash 配置，由验收脚本经 admin API 写入 `llm_config`；API 进程仍只读严格 4 项 EzTest env。
+- 0.1 数据迁移；多副本部署编排（P7）；0.2 全量 E2E/性能/SLO（P8）。真实 LLM 验收在 P1 必跑：使用 `.env` 的小写 `llm_api_key/llm_base_url/llm_model_name`（`deepseek-flash`），由验收脚本经 admin API 写入 `llm_config` 并刷新模型目录；API 进程仍只读严格 4 项 EzTest env。
 - 通用 `Idempotency-Key` 中间件（P1 的确认/消息用自然幂等 + 唯一约束；handoff 记录）。
 
 ## 2. 实施策略与仓库边界
@@ -142,7 +142,8 @@ system_prompt 常量定义角色边界：Host 只对话不确认；Curator 只�
 - 在 `llm/application` 增加 `ChatGateway` 端口与 `ChatRequest/ChatResponse`：OpenAI-compatible `POST {base_url}/chat/completions`，支持 `tools`、`tool_choice:"auto"`、`temperature=0`（P1 确定性优先）、`max_tokens`（模型 max_output 或 4096）。
 - 目标解析：默认 `llm_config.is_default=true`；模型优先 profile.model（匹配 `llm_model.model`），否则该配置第一条模型；无配置/模型 → `ai_unavailable`。
 - 超时 `llm.request_timeout_seconds`；重试 `llm.max_retries`（仅网络/5xx/429；4xx 不重试）；错误文本不得包含 API key。
-- 预算口径：P1 用全局 `context.window_tokens`（默认 64000）估算；`llm_model.context_window` 的逐模型预算留到 P8 硬化（Q23），handoff 记录。run 的 max turns 取 `min(agent.max_turns, profile.budgets.max_turns)`；profile 未给 soft/hard 时回退 `agent.run_soft_timeout_seconds/run_hard_timeout_seconds`。
+- 预算口径：**优先使用 LLM 网关注册的模型元数据** `llm_model.context_window / max_output`（由 `/models` refresh 写入，`ResolveModel` 解析）；设置 `context.window_tokens / output_reserve_tokens` 仅在元数据缺失/为 0 时回退。预算 = 模型窗口 − 输出预留（不超过模型 max_output，至少保留 2048 工具预留）；`context.compact_threshold` 仍用设置。逐模型窗口不再推迟到 P8（用户裁决，Q23 更新）。
+- `llm_model` 元数据缺失（如真实上游 `/models` 不返回窗口）时按设置回退并在 handoff 记录，不伪造模型能力。
 - 真实上游与 fake 上游都走同一网关；fake LLM 扩展见 §5.6。
 
 ### 5.3 Context packet
@@ -152,7 +153,7 @@ system_prompt 常量定义角色边界：Host 只对话不确认；Curator 只�
 3. `conversation`：滚动摘要 + pinned facts + 最近 `context.keep_recent_messages` 条消息（全文；超出预算时按预算截断）。
 4. `team_room`：最新 digest + 与本任务相关帖子（按 refs/team 过滤，最多 10 条）。
 5. `artifacts`：需求/附件/团队帖引用（id/kind）。
-Token 估算：`runes/2 + 16` 每段（中文保守），总预算 = `context.window_tokens - context.output_reserve_tokens - tool reserve(2048)`。
+Token 估算：`runes/2 + 16` 每段（中文保守），总预算 = `ModelBudget.ContextWindow`（缺失时 `context.window_tokens`）- 输出预留（不超过 `ModelBudget.MaxOutput`，缺失时 `context.output_reserve_tokens`）- tool reserve(2048)，且不低于最小可用预算。
 - 压缩触发：估算 > `context.compact_threshold`（0.7）* 可用预算。顺序：保留 pinned/最近窗口/任务约束 → 旧消息压成摘要（优先 LLM 摘要，失败回退确定性摘要）→ 仍超则裁剪 version_pack/team_room 可选段 → 仍超则只留 system + task + 最近 4 条。写 `conversation_summary`（version+1）与 `context.compacted` 事件；**不判失败**。
 - LLM 返回上下文超限（`context_length_exceeded`/400 含 context）→ 预算减半、强制压缩后重试一次；再失败 → 最小上下文重试；仍失败才按 `ai_unavailable` 失败（记录 terminal_reason=`context_overflow_unrecoverable`，handoff 记录）。
 - 工具结果 > `agent.tool_result_max_bytes`（32KiB）→ 上传为 text content_object，返回 `{head, sha256, content_ref, truncated:true}`；agent_message 记录引用。
@@ -255,6 +256,34 @@ P1 工具：
 ### 8.4 错误码
 `invalid_argument`（400）、`unauthenticated`（401）、`forbidden`（403）、`not_found`（404）、`state_conflict`（409，如确认非法状态/已确认版本再编辑）、`lease_lost`（409）、`ai_unavailable`（503）、`context_overflow`（503，仅不可恢复）、`unsupported_attachment_format`/`extraction_failed`（422，仅作为附件 `extraction_error.code` 返回，消息 POST 本身仍 201）。错误 details 带 `field`/`requirement_id`/`attachment_id` 便于 UI 定位。`platform` 增加上述稳定 reason 常量，HTTP 状态映射沿用 P0 信封。
 
+### 8.5 P1 JSON 字段口径（实现/前端/契约共用）
+
+所有 ID 为十进制字符串；时间 RFC3339；成功 `{data:...}`；列表 `{data:[],next_cursor:"",has_more:false}`。
+
+```json
+ConversationSummary = {id,title,kind,status,message_count,last_message_at,created_at}
+Conversation        = ConversationSummary + {summary:string|null, updated_at}
+ConversationMessage = {id,conversation_id,role,parts,refs,created_at}
+MessagePart = {type:"text",text}
+            | {type:"attachment",sha256,name,mime,size}
+            | {type:"requirement_card",requirement_id,title,status,revision}
+            | {type:"rollback_proposal",requirement_id,requirement_title,reason}
+RequirementTargets = {version_suts:[id],pages:[id],apis:[id]}
+RequirementSummary = {id,current_version_id,revision,title,status,priority,targets:RequirementTargets,updated_at,confirmed_at}
+RequirementDetail  = RequirementSummary + {current_version:RequirementVersionView,history:[RequirementVersionView],confirmations:[RequirementConfirmation],relations:[RequirementRelation],attachments:[Attachment]}
+RequirementVersionView = {id,requirement_id,revision,title,description,acceptance_criteria,priority,constraints,target_version_suts,target_pages,target_apis,content_hash,created_at}
+RequirementConfirmation = {id,requirement_version_id,scope,batch_id,actor_id,confirmed_at,affected_requirement_ids}
+RequirementRelation = {id,from_requirement_id,to_requirement_id,kind,description,created_at}
+Attachment = {id,version_id,requirement_id,requirement_version_id,conversation_message_id,content_ref_id,name,mime,size,extraction_status,extracted_content_ref_id,extraction_error,created_at}
+BatchConfirmResult = {batch_id,confirmed:[requirement_id],skipped:[requirement_id]}
+TeamRoomView = {team,digest:{summary,pinned_post_ids,token_estimate,version,updated_at}|null,posts:[TeamRoomPost]}
+Version detail adds requirement_counts{total,draft,clarified,closed,obsolete}, conversation_count, pending_design_count.
+```
+
+- 创建/更新需求请求：`{title,description,acceptance_criteria,priority,constraints,targets:RequirementTargets}`；更新另可带 `reason`。
+- 单条确认返回 `{data:{confirmed:bool, requirement:RequirementDetail}}`；批量请求 `{requirement_ids}`，返回 `{data:BatchConfirmResult}`；回退请求 `{reason?,proposal_message_id?}`，返回 `{data:RequirementDetail}`。
+- 字段名一旦冻结不得由实现自行改名；以本节 + openapi 的 P1 schemas 为准。
+
 ## 9. 事件（P1 追加；详见 contracts/events.md）
 
 频道：`system`（仅版本状态等系统事件）与 `version:{id}`（P1 全部业务事件）；scope 至少含 `version_id`，相关时带 `conversation_id/requirement_id/requirement_version_id/agent_run_id/work_item_id/attachment_id`。
@@ -314,7 +343,7 @@ P1 结束冻结：
 | P1-D15 | 版本详情增量字段 `pending_design_count` 占位 | P2 design_scope 前提供 CTA；不实现设计 |
 | P1-D16 | P1 确认不使用通用 Idempotency-Key，靠唯一约束/自然幂等 | P0 已记录缺口；确认场景已幂等 |
 | P1-D17 | P0 三个契约漂移按实现修正/补索引 | P0 handoff §2 指定 P1 收口 |
-| P1-D18 | 真实 LLM 验收必跑（DeepSeek v4.1 flash） | 用户已授权读取 `.env`；验收脚本经 admin API 配置 `llm_config`；API 仍严格 4 项 env；凭据缺失则阻塞并报告，不伪造 |
+| P1-D18 | 真实 LLM 验收必跑（`.env` `llm_*`，模型 `deepseek-flash`） | 用户已授权读取 `.env`；验收脚本经 admin API 配置 `llm_config` 并 refresh；API 仍严格 4 项 env；凭据缺失则阻塞并报告，不伪造 |
 
 ### 12.1 文档冲突与缺口的落地裁决（不修改设计文档，写入 handoff）
 
@@ -341,7 +370,7 @@ P1 结束冻结：
 | Q20 | design 待办占位数据源 | `pending_design_count = 已澄清需求数`（P1 无 design_scope）；UI 只显示 CTA 占位，不建设计任务 |
 | Q21 | Idempotency-Key | P1 不建 `idempotency_key` 表；确认/消息用唯一约束与状态幂等；通用中间件留 handoff |
 | Q22 | context_compacted 语义 | 过程事件/恢复路径，不是失败终态；只有不可恢复的 context_overflow 才 failed（terminal_reason=context_overflow_unrecoverable） |
-| Q23 | 上下文预算模型 | P1 用全局 `context.window_tokens`；逐模型窗口 P8；token 估算保守（runes/2） |
+| Q23 | 上下文预算模型 | **优先从 LLM 网关模型目录读取 `context_window/max_output`**；缺失回退 `context.window_tokens/output_reserve_tokens`；token 估算保守（runes/2）；逐模型元数据随 refresh 更新 |
 | Q24 | 需求字段类型/枚举 | title/description/acceptance 文本；priority P0–P3；constraints JSON 子键 business_rules/preconditions/exceptions/data_constraints/dependencies；content_hash = 规范化 JSON 的 sha256 hex |
 | Q25 | 稳定错误码 | 新增 `state_conflict/lease_lost/ai_unavailable/context_overflow/unsupported_attachment_format/extraction_failed`；HTTP 映射见 §8.3 |
 | Q26 | 权限 | P1 单团队：所有登录用户可读写需求/对话/确认（沿用 P0 版本读写），无 RBAC；admin 仅 P0 资源/设置 |
@@ -362,7 +391,7 @@ P1 结束冻结：
 | E2E | fake LLM：登录→版本→新建对话→AI 回复→draft 需求→编辑→确认→批量确认→回退→附件上传→设计 CTA；无 console error | `scripts/p1-e2e.ps1` |
 | API 验收 | 不依赖浏览器：任务板并发/恢复、对话/需求/确认/回退/SSE/附件 | `scripts/p1-acceptance.ps1` |
 | 压力 | 200 条消息 + 大附件 + 摘要保留关键事实；任务 50 并发领取无重复 | `go test -tags=integration ./internal/agent/... ./internal/version/... -run 'Stress|Concurrent'` |
-| 真实 LLM | **必跑**：读取 `.env` 非 EzTest 键 `DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL`（默认 `https://api.deepseek.com`）、`DEEPSEEK_MODEL`（默认 `deepseek-v4.1-flash`）；脚本经 admin API 写 `llm_config` 后跑澄清闭环；API 不读这些键 | `scripts/p1-acceptance-llm.ps1` + `.tmp/p1-acceptance/llm.log` |
+| 真实 LLM | **必跑**：读取 `.env` 小写键 `llm_api_key`、`llm_base_url`（默认 `https://api.deepseek.com`）、`llm_model_name`（默认 `deepseek-flash`）；脚本经 admin API 写 `llm_config`/refresh 后跑澄清闭环；模型窗口从网关目录读取；API 不读这些键 | `scripts/p1-acceptance-llm.ps1` + `.tmp/p1-acceptance/llm.log` |
 
 **验收清单（映射 phase-01）**
 - [ ] 新对话 → Host 读上下文/附件 → Host 回复 + Curator draft 需求。
@@ -371,7 +400,7 @@ P1 结束冻结：
 - [ ] 上下文压缩保留 pinned/最近窗口/任务约束；`context_overflow` 场景不失败。
 - [ ] 附件 md/txt/docx/pptx/pdf 解析；损坏/不支持格式可解释失败。
 - [ ] 版本 initial→running（首条消息/首个需求/首次确认）；requirements Tab、SSE、CTA、团队频道只读面板可见。
-- [ ] 真实 LLM DeepSeek v4.1 flash 验收通过（`.env` 凭据缺失则 handoff 标 blocked，不以 fake 结果替代）。
+- [ ] 真实 LLM 验收通过：`.env` `llm_*`（`deepseek-flash`）；凭据缺失则 handoff 标 blocked，不以 fake 结果替代。
 - [ ] `scripts/test.ps1` 全绿；E2E/验收通过；契约冻结；handoff 完成。
 
 ## 14. 风险与已知缺口（写入 handoff）
@@ -379,6 +408,6 @@ P1 结束冻结：
 2. 旧 `.doc/.ppt`、扫描 PDF、图片视觉理解不在 P1；现代 OOXML/文本 PDF 覆盖主路径。
 3. P1 单实例 Hub/worker；多副本 lease/fencing 原语保留，完整部署 P7。
 4. stale 只到端口/事件，P2 接 case 表后才能端到端验证“用例 stale”。
-5. 真实 LLM 验收使用 DeepSeek v4.1 flash；若 `.env` 缺少 `DEEPSEEK_API_KEY`，验收阻塞并在 handoff 明确，不以 fake LLM 结果冒充真实模型质量。
+5. 真实 LLM 验收使用 `.env` 的 `deepseek-flash`；若缺少 `llm_api_key`，验收阻塞并在 handoff 明确，不以 fake LLM 结果冒充真实模型质量。模型窗口来自网关目录，缺失回退设置并记录。
 6. 任务板无公开 API/UI；P6 Agent 中心再暴露；P1 靠测试与数据验证。
 7. P0 开发库含冒烟数据；P1 演示用独立库/清库重跑，避免名称冲突。

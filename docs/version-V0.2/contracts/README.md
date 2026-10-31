@@ -4,6 +4,8 @@
 > 规则：**代码先行、契约后补**不允许；阶段末必须冻结本阶段对外接口。
 >
 > **P0 冻结状态（2026-10-31）**：`openapi.yaml`（43 paths / 66 operations，`x-frozen: P0`）、`events.md`、`db-schema.md`、`migrations-order.md`、`settings.md` 已冻结。`task-types.md` 与 `agent-profiles-tools.md` 按机制说明从 P1 开始写入；P0 未创建。
+>
+> **P1 增量（draft，2026-10-31）**：`db-schema.md` §7（16 表/索引）、`migrations-order.md` §5a（7 迁移）、`events.md` §10（23 事件）、`settings.md` §4a（不新增键）、`task-types.md`、`agent-profiles-tools.md`、`openapi.yaml` P1 paths/schemas（10 个 path item / 23 schemas）已写入。P1 冻结在阶段末执行，冻结前不视为 P1 frozen。
 
 ## 目录内容
 

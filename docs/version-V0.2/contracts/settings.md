@@ -158,6 +158,18 @@ retention 5、report 7、knowledge 2、security 2、feature 2 = **44**。
   需要修改时通过设置中心 PATCH。
 - 其他键默认值固定，不读取 env。
 
+## 4a. P1 使用说明（`draft: P1`）
+
+- P1 **不新增** env、设置键或类别；44 键目录、类型/默认/热加载/secret 语义保持 P0。
+- P1 消费的键：
+  - `agent.max_turns`、`agent.run_soft_timeout_seconds`、`agent.run_hard_timeout_seconds`、`agent.max_concurrent_runs`、`agent.tool_result_max_bytes`；
+  - `context.output_reserve_tokens`、`context.compact_threshold`、`context.keep_recent_messages`；`context.window_tokens` **仅作模型元数据缺失时的回退**；
+  - `team_room.digest_every_n_posts`、`team_room.digest_interval_minutes`、`team_room.digest_keep_versions`；
+  - `llm.request_timeout_seconds`、`llm.max_retries`、`paths.data_root`、`paths.attachment_dir`。
+- 上下文窗口/最大输出优先来自 LLM 网关注册的 `llm_model.context_window/max_output`（`/models` refresh）；仅缺失时回退 `context.window_tokens/output_reserve_tokens`。
+- 运行时读取器新增 `Float(ctx,key)`（只读；number 整数拓宽，字符串报错），用于 `context.compact_threshold`；不改变设置 API/存储语义。
+- P1 的 LLM 验收凭据（`.env` 小写 `llm_*`）**不属于**系统设置/env 契约：仅验收脚本读取，经 admin API 写入 `llm_config`。
+
 ## 5. 冻结与变更控制
 
 1. P0 冻结：4 项 env、44 键目录、类型/默认值/类别/restart 标记、secret 语义、更新流水线。

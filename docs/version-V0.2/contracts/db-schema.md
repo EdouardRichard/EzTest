@@ -439,6 +439,9 @@
 | audit | `audit_0001_audit_log.sql` | `audit_log` |
 | resource | `resource_0001_catalog.sql` | `sut`、`sut_environment`、`sut_page`、`sut_api`、`target_database`、`test_account`、`code_repository` |
 | version | `version_0001_versions.sql` | `version`、`version_sut`、`version_sut_resource` |
+| version (P1) | `version_0002_requirement.sql`、`version_0003_conversation.sql`、`version_0004_requirement_attachment.sql` | `requirement`、`requirement_version`、`requirement_confirmation`、`requirement_relation`、`conversation`、`conversation_message`、`conversation_summary`、`requirement_attachment` |
+| agent (P1) | `agent_0001_work_item.sql`、`agent_0002_team_room.sql`、`agent_0003_runtime.sql` | `work_item`、`work_item_attempt`、`team_room_post`、`team_room_digest`、`agent_profile`、`agent_run`、`agent_message`、`context_packet` |
+| eventing (P1) | `eventing_0002_event_index.sql` | 仅索引 `idx_event_channel_created_at` |
 | db/migrate | 迁移执行器 | `schema_migrations` |
 
 ## 6. 迁移幂等与数据不变量（摘要）
@@ -448,3 +451,69 @@
 - P0 不迁移 0.1 数据；新库从空 schema 开始。
 - 种子：设置目录 `ON CONFLICT (key) DO NOTHING`；空 `app_user` 表时创建唯一 admin（`admin/admin123`，幂等）。
 - 删除资源受版本绑定守卫：被引用返回 409 `conflict`，不依赖数据库 FK 级联跨上下文。
+
+---
+
+## 7. P1 增量表结构（`draft: P1`，阶段末冻结）
+
+> 来源：`docs/superpowers/specs/2026-10-31-eztest-v02-p1-runtime-clarification-design.md` §3。P1 不修改 P0 表；新增表全部雪花 `BIGINT` 主键、`TIMESTAMPTZ`、CHECK 枚举与 `uk_/idx_` 命名。跨上下文只做逻辑引用，不建 FK。
+
+### 7.1 `agent_0001_work_item.sql`
+
+`work_item`：`id BIGINT PK`、`version_id BIGINT NOT NULL`、`team TEXT NOT NULL`、`type TEXT NOT NULL`、`status TEXT NOT NULL DEFAULT 'open'`（CHECK `open/claimed/running/waiting_human/done/failed/dead`）、`priority INT NOT NULL DEFAULT 0`、`dedupe_key TEXT NOT NULL`、`depends_on BIGINT NULL`、`payload JSONB NOT NULL DEFAULT '{}'`、`claimed_by TEXT NULL`、`lease_until TIMESTAMPTZ NULL`、`lease_epoch BIGINT NOT NULL DEFAULT 0`、`attempts INT NOT NULL DEFAULT 0`、`max_attempts INT NOT NULL DEFAULT 3`、`last_error TEXT NULL`、`available_at TIMESTAMPTZ NOT NULL DEFAULT now()`、`created_at/updated_at`。
+约束/索引：`uk_work_item_dedupe UNIQUE(version_id,type,dedupe_key)`；`idx_work_item_claim(status,available_at,priority DESC,id)`；`idx_work_item_lease(status,lease_until)`；`idx_work_item_version(version_id,status,id)`。
+
+`work_item_attempt`：`id BIGINT PK`、`work_item_id BIGINT NOT NULL REFERENCES work_item(id)`、`attempt INT NOT NULL`、`status TEXT NOT NULL`、`error TEXT NULL`、`started_at`、`finished_at`；`UNIQUE(work_item_id,attempt)`；`idx_work_item_attempt_item(work_item_id,id)`。
+
+### 7.2 `agent_0002_team_room.sql`
+
+`team_room_post`：`id BIGINT PK`、`version_id BIGINT NOT NULL`、`team TEXT NOT NULL`、`kind TEXT NOT NULL`（CHECK `finding/decision/blocker/handoff/status`）、`content TEXT NOT NULL`、`refs JSONB NOT NULL DEFAULT '[]'`、`agent_run_id BIGINT NULL`、`created_by BIGINT NULL`、`created_at`；`idx_team_room_post_team(version_id,team,id DESC)`、`idx_team_room_post_created(version_id,created_at)`。
+
+`team_room_digest`：`id BIGINT PK`、`version_id BIGINT NOT NULL`、`team TEXT NOT NULL`、`summary TEXT NOT NULL`、`pinned_post_ids JSONB NOT NULL DEFAULT '[]'`、`token_estimate INT NOT NULL DEFAULT 0`、`version INT NOT NULL`、`updated_at`；`UNIQUE(version_id,team,version)`；`idx_team_room_digest_latest(version_id,team,version DESC)`。
+
+### 7.3 `agent_0003_runtime.sql`
+
+`agent_profile`：`id BIGINT PK`、`key TEXT NOT NULL UNIQUE`、`name TEXT NOT NULL`、`system_prompt TEXT NOT NULL`、`allowed_tools JSONB NOT NULL DEFAULT '[]'`、`model TEXT NULL`、`budgets JSONB NOT NULL DEFAULT '{}'`、`enabled BOOL NOT NULL DEFAULT true`、`created_at/updated_at`。
+
+`agent_run`：`id BIGINT PK`、`profile_key TEXT NOT NULL`、`work_item_id BIGINT NULL`、`conversation_id BIGINT NULL`、`status TEXT NOT NULL DEFAULT 'running'`（CHECK `running/done/failed/aborted/interrupted`）、`terminal_reason TEXT NULL`、`turns INT NOT NULL DEFAULT 0`、`usage JSONB NOT NULL DEFAULT '{}'`、`owner_instance TEXT NOT NULL`、`lease_epoch BIGINT NOT NULL DEFAULT 0`、`context_packet_id BIGINT NULL`、`started_at`、`finished_at`；`idx_agent_run_work_item(work_item_id)`、`idx_agent_run_conversation(conversation_id,id DESC)`、`idx_agent_run_status(status)`。
+
+`agent_message`：`id BIGINT PK`、`run_id BIGINT NULL`、`conversation_id BIGINT NULL`、`role TEXT NOT NULL`（CHECK `system/user/assistant/tool`）、`parts JSONB NOT NULL DEFAULT '[]'`、`tool_calls JSONB NOT NULL DEFAULT '[]'`、`tool_call_id TEXT NULL`、`usage JSONB NOT NULL DEFAULT '{}'`、`created_at`；`idx_agent_message_run(run_id,id)`、`idx_agent_message_conversation(conversation_id,id)`。
+
+`context_packet`：`id BIGINT PK`、`run_id BIGINT NOT NULL`、`version_id BIGINT NOT NULL`、`sections JSONB NOT NULL`、`token_counts JSONB NOT NULL`、`hash TEXT NOT NULL`（64 hex）、`created_at`；`idx_context_packet_run(run_id)`。
+
+### 7.4 `version_0002_requirement.sql`
+
+`requirement`：`id BIGINT PK`、`version_id BIGINT NOT NULL REFERENCES version(id)`、`current_version_id BIGINT NULL`、`status TEXT NOT NULL DEFAULT 'draft'`（CHECK `draft/clarified/closed/obsolete`）、`target_version_sut_ids JSONB NOT NULL DEFAULT '[]'`、`closed_at NULL`、`closed_by_run_id BIGINT NULL`、`created_by BIGINT NULL`、`created_by_run_id BIGINT NULL`、`source_conversation_id BIGINT NULL`、`created_at/updated_at`；`idx_requirement_version_status(version_id,status,id DESC)`。
+
+`requirement_version`：`id BIGINT PK`、`requirement_id BIGINT NOT NULL REFERENCES requirement(id)`、`revision INT NOT NULL`、`title/description/acceptance_criteria TEXT NOT NULL DEFAULT ''`、`priority TEXT NOT NULL DEFAULT 'P2'`（CHECK `P0/P1/P2/P3`）、`constraints JSONB`、`target_version_suts JSONB`、`target_pages JSONB`、`target_apis JSONB`、`content_hash TEXT NOT NULL`（64 hex）、`created_by BIGINT NULL`、`created_by_run_id BIGINT NULL`、`created_at`；`UNIQUE(requirement_id,revision)`；`idx_requirement_version_latest(requirement_id,id DESC)`。
+
+`requirement_confirmation`：`id BIGINT PK`、`requirement_version_id BIGINT NOT NULL REFERENCES requirement_version(id)`、`scope TEXT NOT NULL`（CHECK `requirement/batch`）、`batch_id TEXT NULL`、`actor_id BIGINT NOT NULL`、`confirmed_at`、`affected_requirement_ids JSONB NOT NULL DEFAULT '[]'`；`UNIQUE(requirement_version_id)`；`idx_requirement_confirmation_batch(batch_id)`、`idx_requirement_confirmation_actor(actor_id,confirmed_at DESC)`。
+
+`requirement_relation`：`id BIGINT PK`、`version_id BIGINT NOT NULL`、`from_requirement_id BIGINT NOT NULL`、`to_requirement_id BIGINT NOT NULL`、`kind TEXT NOT NULL`（CHECK `depends_on/conflicts_with/overlaps/shares_scope`）、`description TEXT NOT NULL DEFAULT ''`、`source_revision_id BIGINT NULL`、`created_by BIGINT NULL`、`created_by_run_id BIGINT NULL`、`created_at`；`CHECK(from_requirement_id<>to_requirement_id)`；`UNIQUE(version_id,from_requirement_id,to_requirement_id,kind)`；`idx_requirement_relation_from/to`。
+
+### 7.5 `version_0003_conversation.sql`
+
+`conversation`：`id BIGINT PK`、`version_id BIGINT NOT NULL REFERENCES version(id)`、`kind TEXT NOT NULL`（CHECK `clarification/design`）、`title TEXT NOT NULL`、`status TEXT NOT NULL DEFAULT 'active'`（CHECK `active/closed`）、`created_by BIGINT NULL`、`created_at/updated_at`；`idx_conversation_version_kind(version_id,kind,id DESC)`。
+
+`conversation_message`：`id BIGINT PK`、`conversation_id BIGINT NOT NULL REFERENCES conversation(id)`、`role TEXT NOT NULL`（CHECK `user/assistant`）、`parts JSONB NOT NULL DEFAULT '[]'`、`refs JSONB NOT NULL DEFAULT '[]'`、`token_usage JSONB NOT NULL DEFAULT '{}'`、`actor_id BIGINT NULL`、`agent_run_id BIGINT NULL`、`client_message_id TEXT NULL`、`reply_to_message_id BIGINT NULL`、`created_at`；`UNIQUE(conversation_id,client_message_id)`；`idx_conversation_message_conversation(conversation_id,id)`、`idx_conversation_message_reply(conversation_id,reply_to_message_id)`。
+
+`conversation_summary`：`id BIGINT PK`、`conversation_id BIGINT NOT NULL REFERENCES conversation(id)`、`summary TEXT NOT NULL`、`pinned_facts JSONB NOT NULL DEFAULT '[]'`、`token_estimate INT NOT NULL DEFAULT 0`、`version INT NOT NULL`、`updated_at`；`UNIQUE(conversation_id,version)`；`idx_conversation_summary_latest(conversation_id,version DESC)`。
+
+### 7.6 `version_0004_requirement_attachment.sql`
+
+`requirement_attachment`：`id BIGINT PK`、`version_id BIGINT NOT NULL`、`requirement_id BIGINT NULL`、`requirement_version_id BIGINT NULL`、`conversation_message_id BIGINT NULL`、`content_ref_id BIGINT NOT NULL`、`name TEXT NOT NULL`、`mime TEXT NOT NULL`、`size BIGINT NOT NULL`、`extraction_status TEXT NOT NULL DEFAULT 'pending'`（CHECK `pending/processing/done/failed/skipped`）、`extracted_content_ref_id BIGINT NULL`、`extraction_error TEXT NULL`、`created_by BIGINT NULL`、`created_at/updated_at`；`idx_requirement_attachment_version(version_id,requirement_id)`、`idx_requirement_attachment_message(conversation_message_id)`、`idx_requirement_attachment_pending(extraction_status,id)`。
+
+- `extracted_content_ref_id/extraction_status/extraction_error/requirement_version_id` 是 HLD“关键字段”之外的运行态字段（P1-D5）；提取文本作为 text `content_object` + `content_ref`，不复制全文进需求版本。
+
+### 7.7 `eventing_0002_event_index.sql`
+
+`CREATE INDEX idx_event_channel_created_at ON event(channel, created_at);`（收口 P0 handoff §2 的索引漂移；不修改 P0 迁移/既有索引）。
+
+### 7.8 P1 数据不变量
+
+- `work_item` 全时唯一 `(version_id,type,dedupe_key)`；重试复用同一行，需再次执行用新 dedupe key。
+- `requirement_version` 不可变；`(requirement_id,revision)` 唯一；`requirement.current_version_id` 由服务端维护。
+- 确认按 `requirement_version_id` 唯一；批量确认每受影响版本一行、共享 `batch_id`、`scope='batch'`。
+- `conversation_message.(conversation_id,client_message_id)` 唯一（NULL 不冲突）；assistant 通过 `reply_to_message_id` 关联用户消息。
+- `team_room_digest` 多版本保留最近 N 版；`context_packet.hash` 为 64 hex。
+- **`version_sut.scope` 修正**：DB 中页面/API ID 数组为数字；API/事件中按十进制字符串输出（P0 文档此处以本 P1 契约为准）。
