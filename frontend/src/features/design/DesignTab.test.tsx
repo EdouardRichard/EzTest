@@ -11,6 +11,9 @@ const api = vi.hoisted(() => ({
   createDesignConversation: vi.fn(),
   getDesignCase: vi.fn(),
   confirmCases: vi.fn(),
+  createExport: vi.fn(),
+  downloadExport: vi.fn(),
+  listExports: vi.fn(),
 }))
 
 vi.mock("./api", () => api)
@@ -25,7 +28,20 @@ vi.mock("@/features/clarification/useVersionEvents", () => ({
   useVersionEvents: () => "live",
 }))
 
+const clarificationApi = vi.hoisted(() => ({
+  listMessages: vi.fn(),
+  postMessage: vi.fn(),
+  getTeamRoom: vi.fn(),
+  uploadContent: vi.fn(),
+  rollbackRequirement: vi.fn(),
+}))
+vi.mock("@/features/clarification/api", () => clarificationApi)
+
+const versionsApi = vi.hoisted(() => ({ updateVersion: vi.fn() }))
+vi.mock("@/features/versions/api", () => versionsApi)
+
 import type { ConversationSummary } from "@/features/clarification/types"
+import { versionFixture } from "@/features/versions/test-fixtures"
 import { DesignTab } from "./DesignTab"
 import { designCaseDetailFixture, designGraphFixture, designOverviewFixture } from "./test-fixtures"
 import type { DesignGraph } from "./types"
@@ -65,7 +81,19 @@ function mockWorkspace(graph: DesignGraph = designGraphFixture) {
 describe("DesignTab", () => {
   beforeEach(() => {
     for (const fn of Object.values(api)) fn.mockReset()
+    for (const fn of Object.values(clarificationApi)) fn.mockReset()
+    versionsApi.updateVersion.mockReset()
     navigation.replace.mockReset()
+    clarificationApi.listMessages.mockResolvedValue([])
+    clarificationApi.getTeamRoom.mockResolvedValue({
+      team: "design",
+      digest: null,
+      posts: [],
+    })
+    versionsApi.updateVersion.mockResolvedValue({
+      ...versionFixture,
+      auto_design_new_requirements: true,
+    })
     mockWorkspace()
   })
 
@@ -193,5 +221,48 @@ describe("DesignTab", () => {
     fireEvent.click(await screen.findByTestId("btn-confirm-requirement-6001"))
 
     expect(await screen.findByText("该需求下没有可确认的 draft 用例")).toBeInTheDocument()
+  })
+
+  it("opens the export format dialog from the toolbar", async () => {
+    render(<DesignTab versionId="2001" />)
+    await screen.findByTestId("export-cases")
+
+    fireEvent.click(screen.getByTestId("export-cases"))
+
+    expect(await screen.findByRole("dialog", { name: "导出用例" })).toBeInTheDocument()
+    expect(screen.getByTestId("export-format-markdown")).toBeInTheDocument()
+  })
+
+  it("toggles the auto-design switch through the version API", async () => {
+    render(<DesignTab versionId="2001" />)
+    const toggle = await screen.findByTestId("auto-design-switch")
+
+    fireEvent.click(toggle)
+
+    await waitFor(() =>
+      expect(versionsApi.updateVersion).toHaveBeenCalledWith("2001", {
+        auto_design_new_requirements: true,
+      }),
+    )
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "true"))
+  })
+
+  it("creates a conversation from the design chat header", async () => {
+    render(<DesignTab versionId="2001" />)
+    await screen.findByTestId("design-chat")
+
+    fireEvent.click(screen.getByTestId("design-chat-new-conversation"))
+
+    expect(api.createDesignConversation).toHaveBeenCalledWith("2001")
+  })
+
+  it("fills the design composer from the case '请求修改' action without sending", async () => {
+    render(<DesignTab versionId="2001" initialCaseId="7001" />)
+    await screen.findByTestId("btn-confirm-detail-7001")
+
+    fireEvent.click(screen.getByRole("button", { name: "请求修改" }))
+
+    expect(screen.getByTestId("composer-textarea")).toHaveValue("请修改：退款 T+1 到账")
+    expect(clarificationApi.postMessage).not.toHaveBeenCalled()
   })
 })

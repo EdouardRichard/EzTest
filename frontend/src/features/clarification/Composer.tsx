@@ -15,32 +15,44 @@ export type ComposerProps = {
   error?: unknown
   disabled?: boolean
   placeholder?: string
+  /** External draft (e.g. the P2 "请求修改" action); controlled when defined. */
+  text?: string
+  onTextChange?: (value: string) => void
 }
 
 /**
  * Chat composer: Enter sends, Shift+Enter inserts a newline, the send button is
  * disabled while a message/attachment is in flight, and the draft survives a
- * failed send.
+ * failed send. `text`/`onTextChange` make the draft controllable so other UI
+ * (design case detail) can prefill it without sending.
  */
 export function Composer({
   onSend,
   error,
   disabled = false,
   placeholder = "描述需求，或上传 doc / pdf / md / ppt…",
+  text,
+  onTextChange,
 }: ComposerProps) {
-  const [value, setValue] = useState("")
+  const [internalValue, setInternalValue] = useState("")
   const [attachments, setAttachments] = useState<UploadedAttachment[]>([])
   const [uploading, setUploading] = useState(false)
   const [sending, setSending] = useState(false)
 
+  const value = text ?? internalValue
   const hasContent = value.trim().length > 0 || attachments.length > 0
   const blocked = disabled || sending || uploading
+
+  function updateValue(next: string): void {
+    if (text === undefined) setInternalValue(next)
+    onTextChange?.(next)
+  }
 
   async function submit(): Promise<void> {
     if (blocked || !hasContent) return
     const parts: NewMessagePart[] = []
-    const text = value.trim()
-    if (text.length > 0) parts.push({ type: "text", text })
+    const draft = value.trim()
+    if (draft.length > 0) parts.push({ type: "text", text: draft })
     for (const attachment of attachments) {
       parts.push({
         type: "attachment",
@@ -55,7 +67,7 @@ export function Composer({
     try {
       const sent = await onSend(parts)
       if (sent) {
-        setValue("")
+        updateValue("")
         setAttachments([])
       }
     } catch {
@@ -87,7 +99,7 @@ export function Composer({
           value={value}
           disabled={disabled}
           placeholder={placeholder}
-          onChange={(event) => setValue(event.target.value)}
+          onChange={(event) => updateValue(event.target.value)}
           onKeyDown={handleKeyDown}
           className={cn(
             "w-full resize-none bg-transparent text-sm text-foreground outline-none",

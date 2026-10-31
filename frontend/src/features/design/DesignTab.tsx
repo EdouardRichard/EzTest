@@ -7,9 +7,9 @@ import { Button } from "@/components/ui/Button"
 import { EmptyState } from "@/components/ui/EmptyState"
 import { ErrorState, InlineError } from "@/components/ui/ErrorState"
 import { LoadingCard } from "@/components/ui/Spinner"
-import type { ConversationSummary } from "@/features/clarification/types"
+import type { ConversationMessage, ConversationSummary } from "@/features/clarification/types"
 import { useVersionEvents } from "@/features/clarification/useVersionEvents"
-
+import { AutoDesignSwitch } from "./AutoDesignSwitch"
 import {
   confirmCases,
   createDesignConversation,
@@ -18,7 +18,10 @@ import {
   listDesignConversations,
 } from "./api"
 import { CaseDetailPanel } from "./CaseDetailPanel"
+import { DesignChat } from "./DesignChat"
 import { DesignMindmap } from "./DesignMindmap"
+import { ExportCasesDialog } from "./ExportCasesDialog"
+import { PendingDesignCTA } from "./PendingDesignCTA"
 import type { CaseConfirmationScope, DesignGraph, DesignOverview } from "./types"
 
 export type DesignTabProps = {
@@ -31,8 +34,16 @@ export type DesignTabProps = {
 
 const EMPTY_REQUIREMENTS_COPY = "暂无已澄清需求，请先在需求与澄清中确认需求"
 
+function activityText(payload: Record<string, unknown>): string | null {
+  const status = typeof payload.status === "string" ? payload.status : ""
+  if (status === "finished" || status === "failed" || status === "done") return null
+  if (typeof payload.activity === "string" && payload.activity.length > 0) return payload.activity
+  if (typeof payload.message === "string" && payload.message.length > 0) return payload.message
+  return "AI 正在处理…"
+}
+
 /**
- * P2 design workspace shell: React Flow mindmap + design chat (top row) and the
+ * P2 design workspace: React Flow mindmap + design chat (top row) and the
  * full-width case detail (bottom row). The URL is the deep-link source of truth
  * and the `version:{id}` SSE channel drives debounced snapshot refreshes; node
  * positions stay local (`layout.ts`) and are never persisted.
@@ -58,6 +69,10 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
   const [staleNotice, setStaleNotice] = useState<string | null>(null)
   const [detailToken, setDetailToken] = useState(0)
   const [chatDraft, setChatDraft] = useState("")
+  const [exportOpen, setExportOpen] = useState(false)
+  const [activity, setActivity] = useState<string | null>(null)
+  const [liveMessages, setLiveMessages] = useState<ConversationMessage[]>([])
+  const [teamRoomToken, setTeamRoomToken] = useState(0)
 
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -137,6 +152,15 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
   )
 
   const sseStatus = useVersionEvents(versionId, {
+    onConversationMessage: (message) => {
+      setActivity(null)
+      setLiveMessages((current) => {
+        if (current.some((existing) => existing.id === message.id)) return current
+        return [...current, message].slice(-200)
+      })
+    },
+    onAgentActivity: (payload) => setActivity(activityText(payload)),
+    onTeamRoomChanged: () => setTeamRoomToken((token) => token + 1),
     onDesignGraphChanged: () => scheduleGraphRefresh(),
     onDesignCaseChanged: (event) => {
       scheduleGraphRefresh()
@@ -167,6 +191,13 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
   function selectCase(caseId: string): void {
     setSelectedCaseId(caseId)
     updateUrl(caseId, activeConversationId)
+  }
+
+  function selectConversation(conversationId: string): void {
+    setActiveConversationId(conversationId)
+    setStaleNotice(null)
+    setActivity(null)
+    updateUrl(selectedCaseId, conversationId)
   }
 
   async function handleNewConversation(): Promise<void> {
@@ -210,6 +241,15 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
     [versionId, refreshGraph],
   )
 
+  function applyAutoDesign(enabled: boolean): void {
+    setOverview((current) =>
+      current === null ? current : { ...current, auto_design_new_requirements: enabled },
+    )
+    setGraph((current) =>
+      current === null ? current : { ...current, auto_design_new_requirements: enabled },
+    )
+  }
+
   if (loading) {
     return (
       <div data-testid="design-tab">
@@ -234,9 +274,6 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
 
   const stats = graph.stats
   const autoDesign = overview?.auto_design_new_requirements ?? graph.auto_design_new_requirements
-  const activeConversation = conversations.find(
-    (conversation) => conversation.id === activeConversationId,
-  )
   const roundTitle = overview?.active_round
     ? `设计轮次 #${overview.active_round.round_no}`
     : "暂无设计轮次"
@@ -250,19 +287,19 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
           {stats.draft} · confirmed {stats.confirmed} · stale {stats.stale}
         </span>
         <div className="ml-auto flex flex-wrap items-center gap-1.5">
-          <Button size="sm" variant="secondary" data-testid="export-cases">
+          <Button
+            size="sm"
+            variant="secondary"
+            data-testid="export-cases"
+            onClick={() => setExportOpen(true)}
+          >
             导出用例
           </Button>
-          <button
-            type="button"
-            data-testid="auto-design-switch"
-            aria-pressed={autoDesign}
-            disabled
-            title="自动设计开关将在下一步接入"
-            className="inline-flex h-8 items-center rounded-md border border-border px-2.5 text-xs text-muted-foreground disabled:opacity-60"
-          >
-            新需求自动设计：{autoDesign ? "开" : "关"}
-          </button>
+          <AutoDesignSwitch
+            versionId={versionId}
+            enabled={autoDesign}
+            onChanged={applyAutoDesign}
+          />
           <Button
             size="sm"
             data-testid="design-new-conversation"
@@ -287,14 +324,16 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
           {confirmNotice}
         </p>
       ) : null}
-      {staleNotice !== null ? (
-        <p
-          data-testid="design-stale-notice"
-          role="status"
-          className="rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-[11px] text-warning"
-        >
-          {staleNotice}
-        </p>
+
+      {conversations.length === 0 ? (
+        <PendingDesignCTA
+          versionId={versionId}
+          pendingCount={graph.pending_design_count}
+          hasConversation={false}
+          onCreateConversation={() => {
+            void handleNewConversation()
+          }}
+        />
       ) : null}
 
       <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_380px]">
@@ -337,34 +376,23 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
           )}
         </div>
 
-        <section
-          data-testid="design-chat"
-          aria-label="设计对话"
-          className="surface-card flex min-h-[560px] flex-col p-3"
-        >
-          <header className="flex items-center gap-2 border-b border-border pb-2">
-            <h2 className="text-sm font-semibold text-foreground">设计对话</h2>
-            <span
-              data-testid="design-sse-status"
-              className="ml-auto text-[10px] text-muted-foreground"
-            >
-              {sseStatus}
-            </span>
-          </header>
-          <div className="flex flex-1 flex-col gap-2 py-3">
-            <p className="text-[11px] text-muted-foreground">
-              {activeConversation?.title ?? "暂无设计对话"}
-            </p>
-            {chatDraft.length > 0 ? (
-              <p
-                data-testid="design-chat-draft"
-                className="rounded-lg border border-border bg-muted px-2 py-1 text-[11px] text-foreground"
-              >
-                {chatDraft}
-              </p>
-            ) : null}
-          </div>
-        </section>
+        <DesignChat
+          versionId={versionId}
+          conversations={conversations}
+          activeConversationId={activeConversationId}
+          onSelectConversation={selectConversation}
+          onCreateConversation={() => {
+            void handleNewConversation()
+          }}
+          creatingConversation={creatingConversation}
+          liveMessages={liveMessages}
+          activity={activity}
+          sseStatus={sseStatus}
+          staleNotice={staleNotice}
+          draftText={chatDraft}
+          onDraftTextChange={setChatDraft}
+          refreshToken={teamRoomToken}
+        />
 
         <div className="lg:col-span-2">
           <CaseDetailPanel
@@ -379,6 +407,12 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
           />
         </div>
       </div>
+
+      <ExportCasesDialog
+        versionId={versionId}
+        open={exportOpen}
+        onClose={() => setExportOpen(false)}
+      />
     </div>
   )
 }

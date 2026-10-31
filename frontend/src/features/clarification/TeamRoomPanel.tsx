@@ -12,35 +12,47 @@ import { formatDateTime } from "@/lib/format"
 
 import { getTeamRoom } from "./api"
 import { TEAM_ROOM_POST_LABEL } from "./labels"
-import type { TeamRoom } from "./types"
+import type { TeamRoom, TeamRoomKind } from "./types"
 
 export type TeamRoomPanelProps = {
   versionId: string
   /** Bumped by `team_room.*` SSE events to refetch while expanded. */
   refreshToken?: number
+  /** Team channel to read; defaults to the P1 clarification room. */
+  team?: TeamRoomKind
+}
+
+const TEAM_ROOM_TITLE: Partial<Record<TeamRoomKind, string>> = {
+  clarification: "澄清团队频道",
+  design: "设计团队频道",
 }
 
 /**
- * Collapsed, read-only view of the clarification team channel (spec §4.4):
- * latest digest + recent posts. P1 exposes no posting/chat controls.
+ * Collapsed, read-only view of a team channel (spec §4.4): latest digest +
+ * recent posts. P1/P2 expose no posting/chat controls.
  */
-export function TeamRoomPanel({ versionId, refreshToken = 0 }: TeamRoomPanelProps) {
+export function TeamRoomPanel({
+  versionId,
+  refreshToken = 0,
+  team = "clarification",
+}: TeamRoomPanelProps) {
   const [open, setOpen] = useState(false)
   const [room, setRoom] = useState<TeamRoom | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<unknown>(null)
+  const title = TEAM_ROOM_TITLE[team] ?? `${team} 团队频道`
 
   const load = useCallback(async () => {
     setLoading(true)
     setError(null)
     try {
-      setRoom(await getTeamRoom(versionId, "clarification"))
+      setRoom(await getTeamRoom(versionId, team))
     } catch (cause) {
       setError(cause)
     } finally {
       setLoading(false)
     }
-  }, [versionId])
+  }, [versionId, team])
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: refreshToken retriggers the fetch on SSE events
   useEffect(() => {
@@ -49,7 +61,7 @@ export function TeamRoomPanel({ versionId, refreshToken = 0 }: TeamRoomPanelProp
   }, [open, load, refreshToken])
 
   return (
-    <section data-testid="team-room-panel" aria-label="澄清团队频道" className="surface-card">
+    <section data-testid="team-room-panel" aria-label={title} className="surface-card">
       <button
         type="button"
         data-testid="team-room-toggle"
@@ -65,7 +77,7 @@ export function TeamRoomPanel({ versionId, refreshToken = 0 }: TeamRoomPanelProp
         ) : (
           <ChevronRight className="size-3.5 text-muted-foreground" aria-hidden="true" />
         )}
-        <span className="text-xs font-semibold text-foreground">澄清团队频道</span>
+        <span className="text-xs font-semibold text-foreground">{title}</span>
         <span className="ml-auto text-[10px] text-muted-foreground">只读</span>
       </button>
 
