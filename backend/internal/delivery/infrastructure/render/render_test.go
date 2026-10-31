@@ -454,6 +454,31 @@ func TestRenderTruncationIgnoresDisabledSections(t *testing.T) {
 	})
 }
 
+// TestRenderSnapshotTruncationNoteIsVisible is the O1 test: when the snapshot
+// service capped an oversized input list, the rendered report must state which
+// lists were capped and the cap sizes, without mentioning untouched lists.
+func TestRenderSnapshotTruncationNoteIsVisible(t *testing.T) {
+	snapshot := sampleSnapshot()
+	snapshot.TruncatedSections = []string{
+		delivery.ReportTruncationIssues,
+		delivery.ReportTruncationCaseRuns,
+	}
+	output := mustRender(t, snapshot, "", allSections())
+	text := string(output)
+	if !strings.Contains(text, `data-truncated="true"`) {
+		t.Fatal("snapshot truncation produced no visible truncation aside")
+	}
+	note := truncationNote(t, output)
+	for _, want := range []string{"问题", "500", "执行结果", "2000"} {
+		if !strings.Contains(note, want) {
+			t.Fatalf("truncation note is missing %q: %q", want, note)
+		}
+	}
+	if strings.Contains(note, "波次") {
+		t.Fatalf("truncation note mentions an untouched list: %q", note)
+	}
+}
+
 func TestRenderFailsWhenNarrativeAloneExceedsLimit(t *testing.T) {
 	renderer := newTestRenderer(t)
 	narrative := strings.Repeat("n", MaxHTMLBytes+1024)

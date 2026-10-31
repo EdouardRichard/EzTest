@@ -7,6 +7,7 @@ package deliveryapp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	delivery "github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
@@ -62,6 +63,59 @@ type IssueRepository interface {
 	ListRefs(ctx context.Context, issueID int64) ([]delivery.IssueRef, error)
 	ListHistory(ctx context.Context, issueID int64) ([]delivery.IssueStatusChange, error)
 	FindByCaseRun(ctx context.Context, versionID, caseRunID int64) (delivery.Issue, bool, error)
+}
+
+// Report repository and content-ledger sentinels. The postgres/content
+// adapters translate their own storage errors into these application-level
+// sentinels so the report service can map them onto the stable API envelope
+// without importing infrastructure packages.
+var (
+	// ErrReportNotFound reports a missing delivery_report or
+	// delivery_report_revision row.
+	ErrReportNotFound = errors.New("delivery: report not found")
+	// ErrReportContentNotFound reports a missing content_ref/content_object.
+	ErrReportContentNotFound = errors.New("delivery: report content not found")
+	// ErrReportContentCorrupt reports a content_ref owner/role mismatch or
+	// stored bytes whose SHA-256/size no longer match the ledger.
+	ErrReportContentCorrupt = errors.New("delivery: report content is corrupt")
+)
+
+// ReportDetail is the read projection of one report: its header, every
+// revision (newest first) and its logical refs.
+type ReportDetail struct {
+	Report    delivery.Report
+	Revisions []delivery.ReportRevision
+	Refs      []delivery.ReportRef
+}
+
+// ContentStore stores and loads report HTML through the P0 content ledger
+// (spec §6.3/§6.4). Implementations must write content_ref with
+// owner_kind='report_revision', owner_id=reportRevisionID and
+// role='report_html', and must validate that ownership plus the stored
+// SHA-256/size on read. Storage paths never cross this port.
+type ContentStore interface {
+	PutReportHTML(ctx context.Context, reportRevisionID int64, html []byte) (contentRefID int64, sha256 string, size int64, err error)
+	OpenReportHTML(ctx context.Context, contentRefID int64) ([]byte, string, int64, error)
+}
+
+// ReportDataReader is the report service's read port into the version,
+// execution, design and delivery projections. It returns the deterministic
+// snapshot of spec §6.1; implementations are responsible for enforcing the
+// section caps and setting ReportSnapshot.TruncatedSections (the service also
+// applies the caps defensively). GeneratedAt is ignored; the service stamps
+// the as-of time.
+type ReportDataReader interface {
+	WaveSnapshot(ctx context.Context, versionID, waveID int64) (delivery.ReportSnapshot, error)
+	VersionSnapshot(ctx context.Context, versionID int64) (delivery.ReportSnapshot, error)
+}
+
+// ReportTriggerReader is an optional extension of ReportDataReader. The §7.4
+// version-report condition also requires no active execution intent and no open
+// human request; those projections are not part of the report snapshot, so a
+// reader that can observe them also implements this port. EnsureReports applies
+// it (via a type assertion) before creating or regenerating the version report.
+type ReportTriggerReader interface {
+	VersionReportReady(ctx context.Context, versionID int64) (bool, error)
 }
 
 // ReportFilter is one descending-ID report page filter.
