@@ -226,6 +226,7 @@ type CaseVersion struct {
 	CreatedBy           *int64
 	CreatedByRunID      *int64
 	CreatedAt           time.Time
+	UpdatedAt           time.Time
 	Steps               []CaseStep
 	Assertions          []CaseAssertion
 	Sources             []CaseSource
