@@ -222,6 +222,7 @@ func (f *scriptedChat) request(index int) llmapp.ChatRequest {
 }
 
 type fakeConversationPort struct {
+	kind        string
 	snapshot    agentapp.ConversationSnapshot
 	messages    map[int64]agentapp.ConversationMessage
 	appended    []agentapp.AssistantMessageInput
@@ -237,7 +238,18 @@ func (f *fakeConversationPort) Snapshot(_ context.Context, versionID, conversati
 	snapshot := f.snapshot
 	snapshot.VersionID = versionID
 	snapshot.ID = conversationID
+	snapshot.Kind = f.kind
 	return snapshot, nil
+}
+
+func (f *fakeConversationPort) ConversationKind(_ context.Context, _, _ int64) (string, error) {
+	if f.snapshotErr != nil {
+		return "", f.snapshotErr
+	}
+	if f.kind == "" {
+		return "clarification", nil
+	}
+	return f.kind, nil
 }
 
 func (f *fakeConversationPort) GetMessage(_ context.Context, versionID, conversationID, messageID int64) (agentapp.ConversationMessage, error) {
@@ -297,12 +309,14 @@ func (f *fakeAttachmentReader) GetAttachment(_ context.Context, versionID, attac
 }
 
 type fakeTeamRoomPort struct {
-	context    agentapp.TeamRoomContext
-	contextErr error
-	posts      []agent.TeamRoomPost
+	context      agentapp.TeamRoomContext
+	contextErr   error
+	contextTeams []string
+	posts        []agent.TeamRoomPost
 }
 
-func (f *fakeTeamRoomPort) Context(_ context.Context, _ int64, _ string, _ int) (agentapp.TeamRoomContext, error) {
+func (f *fakeTeamRoomPort) Context(_ context.Context, _ int64, team string, _ int) (agentapp.TeamRoomContext, error) {
+	f.contextTeams = append(f.contextTeams, team)
 	return f.context, f.contextErr
 }
 
@@ -359,6 +373,75 @@ func (f *fakeRequirementPort) ProposeRelation(context.Context, int64, int64, int
 	return nil
 }
 
+// fakeDesignPort implements tools.DesignPort.
+type fakeDesignPort struct {
+	readCalls         int
+	readVersionID     int64
+	readRequirementID int64
+	readCaseID        int64
+	readResult        any
+	readErr           error
+
+	proposeCalls     int
+	proposeVersionID int64
+	proposeInput     tools.GraphProposal
+	proposeActorID   int64
+	proposeRunID     int64
+	proposeResult    any
+	proposeErr       error
+
+	reviewCalls         int
+	reviewVersionID     int64
+	reviewRequirementID int64
+	reviewRunID         int64
+	reviewInput         tools.ReviewInput
+	reviewResult        any
+	reviewErr           error
+
+	dataPlanCalls         int
+	dataPlanVersionID     int64
+	dataPlanCaseVersionID int64
+	dataPlanRunID         int64
+	dataPlanInput         tools.DataPlanInput
+	dataPlanResult        any
+	dataPlanErr           error
+}
+
+func (f *fakeDesignPort) ReadGraph(_ context.Context, versionID, requirementID, caseID int64) (any, error) {
+	f.readCalls++
+	f.readVersionID = versionID
+	f.readRequirementID = requirementID
+	f.readCaseID = caseID
+	return f.readResult, f.readErr
+}
+
+func (f *fakeDesignPort) ProposeGraph(_ context.Context, versionID int64, in tools.GraphProposal, actorID, runID int64) (any, error) {
+	f.proposeCalls++
+	f.proposeVersionID = versionID
+	f.proposeInput = in
+	f.proposeActorID = actorID
+	f.proposeRunID = runID
+	return f.proposeResult, f.proposeErr
+}
+
+func (f *fakeDesignPort) SubmitReview(_ context.Context, versionID, requirementID int64, runID int64, in tools.ReviewInput) (any, error) {
+	f.reviewCalls++
+	f.reviewVersionID = versionID
+	f.reviewRequirementID = requirementID
+	f.reviewRunID = runID
+	f.reviewInput = in
+	return f.reviewResult, f.reviewErr
+}
+
+func (f *fakeDesignPort) SubmitDataPlan(_ context.Context, versionID, caseVersionID int64, runID int64, in tools.DataPlanInput) (any, error) {
+	f.dataPlanCalls++
+	f.dataPlanVersionID = versionID
+	f.dataPlanCaseVersionID = caseVersionID
+	f.dataPlanRunID = runID
+	f.dataPlanInput = in
+	return f.dataPlanResult, f.dataPlanErr
+}
+
 // fakeAttachmentPort implements tools.AttachmentPort.
 type fakeAttachmentPort struct {
 	attachments []tools.AttachmentMeta
@@ -390,10 +473,15 @@ func (f *fakeResourcePort) ListPages(context.Context, int64, int64) ([]tools.Res
 
 func fakeWorkItem(workType string, payload agentapp.WorkItemPayload) agent.WorkItem {
 	raw, _ := json.Marshal(map[string]any{
-		"conversation_id": idStringOrZero(payload.ConversationID),
-		"message_id":      idStringOrZero(payload.MessageID),
-		"attachment_id":   idStringOrZero(payload.AttachmentID),
-		"trigger":         payload.Trigger,
+		"conversation_id":        idStringOrZero(payload.ConversationID),
+		"message_id":             idStringOrZero(payload.MessageID),
+		"attachment_id":          idStringOrZero(payload.AttachmentID),
+		"requirement_id":         idStringOrZero(payload.RequirementID),
+		"requirement_version_id": idStringOrZero(payload.RequirementVersionID),
+		"case_id":                idStringOrZero(payload.CaseID),
+		"case_version_id":        idStringOrZero(payload.CaseVersionID),
+		"round_id":               idStringOrZero(payload.RoundID),
+		"trigger":                payload.Trigger,
 	})
 	leaseEpoch := int64(3)
 	claimedBy := "worker-1"

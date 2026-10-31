@@ -31,6 +31,7 @@ func (a *Adapter) ListConversations(ctx context.Context, limit int) ([]agentapp.
 		conversations = append(conversations, agentapp.ReconcilerConversation{
 			ID:        item.ID,
 			VersionID: item.VersionID,
+			Kind:      item.Kind,
 			Messages:  messages,
 		})
 	}

@@ -53,10 +53,24 @@ func (a *Adapter) Snapshot(ctx context.Context, versionID, conversationID int64,
 	return agentapp.ConversationSnapshot{
 		ID:          conversation.ID,
 		VersionID:   versionID,
+		Kind:        conversation.Kind,
 		Summary:     summaryText,
 		PinnedFacts: pinned,
 		Messages:    portMessages,
 	}, nil
+}
+
+// ConversationKind resolves the conversation kind for chat.turn Host selection
+// (clarification vs design). Ownership is enforced by the scoped Get.
+func (a *Adapter) ConversationKind(ctx context.Context, versionID, conversationID int64) (string, error) {
+	if a.conversations == nil {
+		return "", a.missing("conversations")
+	}
+	conversation, err := a.conversations.Get(ctx, versionID, conversationID)
+	if err != nil {
+		return "", err
+	}
+	return conversation.Kind, nil
 }
 
 // GetMessage returns one UI-thread message, scoped to its conversation/version.

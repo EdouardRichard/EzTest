@@ -416,10 +416,12 @@ type ReconcilerMessage struct {
 	AgentProfileKey string
 }
 
-// ReconcilerConversation is one clarification conversation with its messages,
-// used by the P1 reconciler to detect runs that never finished.
+// ReconcilerConversation is one conversation with its messages, used by the
+// reconciler to detect runs that never finished. Kind distinguishes
+// clarification (P1 rules) from design (P2 rules).
 type ReconcilerConversation struct {
 	ID        int64
 	VersionID int64
+	Kind      string
 	Messages  []ReconcilerMessage
 }

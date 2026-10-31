@@ -34,6 +34,7 @@ type ConversationMessage struct {
 type ConversationSnapshot struct {
 	ID          int64
 	VersionID   int64
+	Kind        string
 	Summary     string
 	PinnedFacts []string
 	Messages    []ConversationMessage
@@ -62,6 +63,7 @@ type AssistantMessageInput struct {
 // *tools.Error or *platform.Error for business failures.
 type ConversationPort interface {
 	Snapshot(ctx context.Context, versionID, conversationID int64, keepRecent int) (ConversationSnapshot, error)
+	ConversationKind(ctx context.Context, versionID, conversationID int64) (string, error)
 	GetMessage(ctx context.Context, versionID, conversationID, messageID int64) (ConversationMessage, error)
 	AppendAssistantMessage(ctx context.Context, in AssistantMessageInput) (ConversationMessage, error)
 	UpdateSummary(ctx context.Context, versionID, conversationID int64, summary string, pinnedFacts []string) (ConversationSummary, error)
@@ -107,7 +109,8 @@ type ContentWriter interface {
 	PutText(ctx context.Context, owner string, data []byte) (ContentRef, error)
 }
 
-// ProfileKeyForWorkType maps a P1 work item type to its profile (spec §4.2).
+// ProfileKeyForWorkType maps a work item type to its profile (P1 spec §4.2 /
+// P2 spec §5.1).
 func ProfileKeyForWorkType(workType string) (string, bool) {
 	switch workType {
 	case WorkTypeChatTurn:
@@ -116,6 +119,28 @@ func ProfileKeyForWorkType(workType string) (string, bool) {
 		return ProfileKeyRequirementCurator, true
 	case WorkTypeAttachmentIngest:
 		return ProfileKeyContextScout, true
+	case WorkTypeDesignRound:
+		return ProfileKeyDesignPlanner, true
+	case WorkTypeDesignRequirement, WorkTypeDesignGap:
+		return ProfileKeyCaseAuthor, true
+	case WorkTypeDesignCritic:
+		return ProfileKeyDesignCritic, true
+	case WorkTypeDesignDataPlan:
+		return ProfileKeyDataPlanner, true
+	default:
+		return "", false
+	}
+}
+
+// ProfileKeyForConversationKind selects the Host profile for chat.turn runs:
+// clarification conversations keep the P1 Host, design conversations use the
+// design Host (spec §5.1 semantic increment; no new work type).
+func ProfileKeyForConversationKind(kind string) (string, bool) {
+	switch kind {
+	case "clarification":
+		return ProfileKeyClarificationHost, true
+	case "design":
+		return ProfileKeyDesignHost, true
 	default:
 		return "", false
 	}
@@ -128,14 +153,28 @@ const (
 	WorkTypeAttachmentIngest  = "attachment.ingest"
 )
 
-// WorkItemPayload is the small reference payload carried by P1 work items.
-// IDs are parsed from decimal strings or JSON numbers for P0 payload
+// P2 design work item types (contracts/task-types.md P2 increment).
+const (
+	WorkTypeDesignRound       = "design.round"
+	WorkTypeDesignRequirement = "design.requirement"
+	WorkTypeDesignGap         = "design.gap"
+	WorkTypeDesignCritic      = "design.critic"
+	WorkTypeDesignDataPlan    = "design.data_plan"
+)
+
+// WorkItemPayload is the small reference payload carried by work items. IDs
+// are parsed from decimal strings or JSON numbers for P0 payload
 // compatibility.
 type WorkItemPayload struct {
-	ConversationID int64
-	MessageID      int64
-	AttachmentID   int64
-	Trigger        string
+	ConversationID       int64
+	MessageID            int64
+	AttachmentID         int64
+	RequirementID        int64
+	RequirementVersionID int64
+	CaseID               int64
+	CaseVersionID        int64
+	RoundID              int64
+	Trigger              string
 }
 
 // ToolDeps is the adapter wiring for the P1 tools. The runner adds the
@@ -182,6 +221,7 @@ type ReconcilerMessage struct {
 type ReconcilerConversation struct {
 	ID        int64
 	VersionID int64
+	Kind      string
 	Messages  []ReconcilerMessage
 }
 

@@ -72,11 +72,15 @@ func P1ToolNames() []string {
 // Scope is injected by the runtime for every tool execution. It is never part
 // of a tool JSON schema.
 type Scope struct {
-	VersionID      int64
-	ConversationID int64
-	RequirementID  int64
-	AgentRunID     int64
-	VersionSUTIDs  []int64
+	VersionID            int64
+	ConversationID       int64
+	RequirementID        int64
+	RequirementVersionID int64
+	CaseID               int64
+	CaseVersionID        int64
+	RoundID              int64
+	AgentRunID           int64
+	VersionSUTIDs        []int64
 }
 
 // Tool is one scoped, schema-described agent tool.
@@ -218,13 +222,16 @@ func (r *Registry) Execute(ctx context.Context, scope Scope, name string, raw js
 // version/team-room application types; requirement/attachment/resource ports
 // use the typed DTOs below.
 type Deps struct {
-	VersionPack      func(ctx context.Context, scope Scope) (any, error)
-	TaskPack         func(ctx context.Context, scope Scope) (any, error)
-	TeamRoomRead     func(ctx context.Context, scope Scope, maxPosts int) (any, error)
-	SummaryUpdate    func(ctx context.Context, scope Scope, summary string, pinnedFacts []string) (any, error)
-	Requirement      RequirementPort
-	Attachment       AttachmentPort
-	Resource         ResourcePort
+	VersionPack   func(ctx context.Context, scope Scope) (any, error)
+	TaskPack      func(ctx context.Context, scope Scope) (any, error)
+	TeamRoomRead  func(ctx context.Context, scope Scope, maxPosts int) (any, error)
+	SummaryUpdate func(ctx context.Context, scope Scope, summary string, pinnedFacts []string) (any, error)
+	Requirement   RequirementPort
+	Attachment    AttachmentPort
+	Resource      ResourcePort
+	// Design is the P2 design context surface. It is nil for P1-only wiring; the
+	// design tools then fail as an internal configuration error.
+	Design           DesignPort
 	RollbackProposal func(ctx context.Context, scope Scope, requirementID int64, reason string) (any, error)
 }
 
@@ -334,7 +341,24 @@ type ResourcePort interface {
 
 // NewP1Registry registers exactly the P1 tool set (spec §5.5).
 func NewP1Registry(deps Deps) *Registry {
-	return NewRegistry(
+	return NewRegistry(p1Tools(deps)...)
+}
+
+// NewP2Registry registers the frozen P1 tool set plus the P2 design tools.
+// case.confirm and the granular design.* write tools are deliberately absent:
+// confirmation is user/server-only and graph writes go through
+// case.graph_propose (P2-D-5).
+func NewP2Registry(deps Deps) *Registry {
+	return NewRegistry(append(p1Tools(deps),
+		&designGraphRead{deps: deps},
+		&caseGraphPropose{deps: deps},
+		&designReviewSubmit{deps: deps},
+		&designDataPlanSubmit{deps: deps},
+	)...)
+}
+
+func p1Tools(deps Deps) []Tool {
+	return []Tool{
 		&contextVersionPack{deps: deps},
 		&contextTaskPack{deps: deps},
 		&contextTeamRoomRead{deps: deps},
@@ -349,7 +373,7 @@ func NewP1Registry(deps Deps) *Registry {
 		&attachmentImageRef{deps: deps},
 		&sutList{deps: deps},
 		&sutPageList{deps: deps},
-	)
+	}
 }
 
 // --- shared helpers --------------------------------------------------------

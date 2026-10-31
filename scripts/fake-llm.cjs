@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 "use strict";
 
-// Deterministic OpenAI-compatible fake LLM upstream for EzTest 0.2 P0 + P1.
+// Deterministic OpenAI-compatible fake LLM upstream for EzTest 0.2 P0 + P1 + P2.
 //
 // P0 only needs configuration / model catalog / connectivity tests and the
 // acceptance flow. P1 adds a deterministic agent mode used by the clarification
-// runtime; without a profile marker the P0 behaviour is unchanged.
+// runtime; P2 adds the design team profiles. Without a profile marker the P0
+// behaviour is unchanged.
 //
 // Endpoints:
 //   GET  /health               -> {"status":"ok","service":"fake-llm",...}
@@ -25,6 +26,16 @@
 //         tool_call; after a role:"tool" result: final text
 //       - context_scout -> attachment summary derived from the latest role:
 //         "tool" result
+//       - design_host -> design chat text; when the user asks to add/modify a
+//         case, reads design.graph_read then submits case.graph_propose
+//       - design_planner -> scope-only text, no tools
+//       - case_author -> design.graph_read, then case.graph_propose with one
+//         scenario and two draft cases, then final text
+//       - design_critic -> design.review_submit with one minor finding, then
+//         final text
+//       - data_planner -> design.graph_read, then design.data_plan_submit for
+//         the first draft case, then final text
+//       - no profile ever calls case.confirm (user/server-only)
 //   * context overflow  = system marker "[fake:context_overflow]" or request
 //         header X-Fake-Context-Overflow: 1 returns HTTP 400 with
 //         code=context_length_exceeded once per distinct raw request body
@@ -48,7 +59,9 @@ const REPLY_PREFIX = "EzTest fake LLM: ";
 const MAX_REPLY_CHARS = 240;
 const STREAM_CHUNK_CHARS = 16;
 const MAX_BODY_BYTES = 10 * 1024 * 1024;
-const PROFILE_PATTERN = /\[profile:(clarification_host|requirement_curator|context_scout)\]/;
+const PROFILE_PATTERN = /\[profile:(clarification_host|requirement_curator|context_scout|design_host|design_planner|case_author|design_critic|data_planner)\]/;
+const DESIGN_MODIFY_HINT = /(新增|补充|修改)/;
+const DESIGN_CASE_HINT = "用例";
 const OVERFLOW_MARKER = "[fake:context_overflow]";
 const OVERFLOW_HEADER = "x-fake-context-overflow";
 const MAX_CURATOR_TITLE_CHARS = 40;
@@ -284,6 +297,211 @@ function scoutOutcome(body) {
   return textOutcome("已读取附件：" + name + "，共 " + count + " 字符。");
 }
 
+// --- P2 design profiles ----------------------------------------------------
+
+function toolCallOutcome(rawBody, name, args) {
+  return {
+    kind: "tool_calls",
+    calls: [
+      {
+        id: "call-fake-" + bodyHash(rawBody) + "-1",
+        name,
+        arguments: JSON.stringify(args),
+      },
+    ],
+  };
+}
+
+// graphResult returns the parsed design.graph_read result, or null when the
+// latest tool message is not a graph view (error payloads included).
+function graphResult(body) {
+  const result = lastToolResult(body);
+  if (!result || result.error || !Array.isArray(result.requirements)) return null;
+  return result;
+}
+
+// isProposeResult reports whether the latest tool result is a graph proposal
+// result ({scenario_ids,case_ids,case_version_ids,graph_hash}).
+function isProposeResult(result) {
+  return Boolean(result && (Array.isArray(result.case_ids) || Array.isArray(result.scenario_ids)));
+}
+
+function firstGraphRequirement(graph) {
+  return graph.requirements.find((requirement) => requirement && requirement.requirement_id) || null;
+}
+
+function requirementSUTIDs(requirement) {
+  const raw = Array.isArray(requirement.target_version_sut_ids) ? requirement.target_version_sut_ids : [];
+  const ids = raw.filter((value) => typeof value === "string" && /^[1-9][0-9]*$/.test(value));
+  return ids.length > 0 ? ids : ["9001"];
+}
+
+function firstGraphCase(requirement) {
+  const scenarios = Array.isArray(requirement.scenarios) ? requirement.scenarios : [];
+  for (const scenario of scenarios) {
+    const cases = scenario && Array.isArray(scenario.cases) ? scenario.cases : [];
+    for (const item of cases) {
+      if (item && item.case_id) return item;
+    }
+  }
+  return null;
+}
+
+function scenarioProposal(requirement) {
+  const suts = requirementSUTIDs(requirement);
+  const scenarios = Array.isArray(requirement.scenarios) ? requirement.scenarios : [];
+  const existing = scenarios.find((scenario) => scenario && scenario.id);
+  const node = {
+    ref: "s1",
+    name: existing && typeof existing.name === "string" && existing.name !== "" ? existing.name : "AI 设计场景",
+    description: "由 fake LLM 生成的确定性设计场景。",
+    version_sut_ids: suts,
+    page_ids: [],
+    api_ids: [],
+    sort_order: 0,
+  };
+  if (existing) node.id = String(existing.id);
+  return node;
+}
+
+function caseProposal(requirement, existing, title) {
+  const suts = requirementSUTIDs(requirement);
+  const requirementVersionID = String(requirement.requirement_version_id || "");
+  const node = {
+    ref: "c1",
+    scenario_ref: "s1",
+    title,
+    description: "由 fake LLM 生成的确定性用例草案，等待用户确认。",
+    preconditions: "已准备测试账号与运行环境。",
+    test_data: { fake: true },
+    priority: "P2",
+    default_version_sut_id: suts[0],
+    version_sut_ids: suts,
+    page_ids: [],
+    api_ids: [],
+    steps: [
+      { seq: 1, action: "打开被测页面", expected: "页面加载完成", data: {} },
+      { seq: 2, action: "执行核心操作", expected: "操作成功", data: {} },
+    ],
+    assertions: [
+      { step_seq: 1, kind: "ui", target: "页面标题", expected: "标题可见" },
+      { step_seq: 2, kind: "text", target: "结果提示", expected: "操作成功" },
+    ],
+    sources: [
+      { kind: "requirement", ref_id: requirementVersionID, path: "", line: null, sha: "" },
+    ],
+  };
+  if (existing) node.id = String(existing.case_id);
+  return node;
+}
+
+function graphProposal(requirement, options) {
+  const settings = options || {};
+  const titles = Array.isArray(settings.titles) && settings.titles.length > 0 ? settings.titles : ["AI 新增用例"];
+  const existing = settings.updateFirstCase ? firstGraphCase(requirement) : null;
+  return {
+    requirement_id: String(requirement.requirement_id),
+    requirement_version_id: String(requirement.requirement_version_id),
+    scenarios: [scenarioProposal(requirement)],
+    cases: titles.map((title, index) => caseProposal(requirement, index === 0 ? existing : null, title)),
+  };
+}
+
+function designHostOutcome(body, rawBody) {
+  const result = lastToolResult(body);
+  if (result && isProposeResult(result)) {
+    return textOutcome("已提交用例草案（draft），请在脑图中确认或继续提出修改。");
+  }
+  const graph = graphResult(body);
+  if (graph) {
+    const requirement = firstGraphRequirement(graph);
+    if (!requirement) {
+      return textOutcome("当前版本还没有可设计的已澄清需求。");
+    }
+    return toolCallOutcome(
+      rawBody,
+      "case.graph_propose",
+      graphProposal(requirement, { updateFirstCase: true, titles: ["AI 补充用例（设计对话）"] }),
+    );
+  }
+  if (result && result.error) {
+    return textOutcome("读取脑图失败，请稍后重试，或直接在对话中说明要修改的用例。");
+  }
+  const text = lastUserText(body);
+  if (text.includes(DESIGN_CASE_HINT) && DESIGN_MODIFY_HINT.test(text)) {
+    return toolCallOutcome(rawBody, "design.graph_read", {});
+  }
+  return textOutcome(
+    "我是设计 Host。我会读取用例脑图，并可以按你的要求新增或修改场景/用例 draft；请说明要调整的内容。",
+  );
+}
+
+function designPlannerOutcome() {
+  return textOutcome(
+    "本轮设计范围已就绪：设计团队将按当前版本的待设计需求生成场景与用例草案；用户可在脑图中查看并确认。",
+  );
+}
+
+function caseAuthorOutcome(body, rawBody) {
+  const result = lastToolResult(body);
+  if (result && isProposeResult(result)) {
+    return textOutcome("已提交 1 个场景与 2 条用例 draft，等待用户在脑图中确认。");
+  }
+  const graph = graphResult(body);
+  if (graph) {
+    const requirement = firstGraphRequirement(graph);
+    if (!requirement) {
+      return textOutcome("没有找到可设计的已澄清需求。");
+    }
+    return toolCallOutcome(
+      rawBody,
+      "case.graph_propose",
+      graphProposal(requirement, { titles: ["AI 用例 1：核心流程", "AI 用例 2：异常流程"] }),
+    );
+  }
+  if (result && result.error) {
+    return textOutcome("读取脑图失败，请稍后重试。");
+  }
+  return toolCallOutcome(rawBody, "design.graph_read", {});
+}
+
+function designCriticOutcome(body, rawBody) {
+  const result = lastToolResult(body);
+  if (result) {
+    return textOutcome("已完成内部自审并提交 finding；内部自审不构成人工确认关卡。");
+  }
+  return toolCallOutcome(rawBody, "design.review_submit", {
+    summary: "内部自审完成：覆盖与断言基本完整。",
+    findings: [
+      { severity: "minor", message: "建议补充异常路径的断言与测试数据。" },
+    ],
+  });
+}
+
+function dataPlannerOutcome(body, rawBody) {
+  const result = lastToolResult(body);
+  if (result && (result.case_version_id !== undefined || result.revision !== undefined)) {
+    return textOutcome("已为当前 draft 用例补充前置条件与测试数据。");
+  }
+  const graph = graphResult(body);
+  if (graph) {
+    const requirement = firstGraphRequirement(graph);
+    const item = requirement ? firstGraphCase(requirement) : null;
+    if (item && item.current_version_id) {
+      return toolCallOutcome(rawBody, "design.data_plan_submit", {
+        case_version_id: String(item.current_version_id),
+        preconditions: "已登录被测系统并准备测试账号。",
+        test_data: { account: "admin", fake: true },
+      });
+    }
+    return textOutcome("当前需求没有可补充测试数据的 draft 用例。");
+  }
+  if (result && result.error) {
+    return textOutcome("读取脑图失败，请稍后重试。");
+  }
+  return toolCallOutcome(rawBody, "design.graph_read", {});
+}
+
 // chatOutcome selects the deterministic P1 profile reply, falling back to the
 // frozen P0 echo when no profile marker is present.
 function chatOutcome(body, rawBody) {
@@ -294,6 +512,16 @@ function chatOutcome(body, rawBody) {
       return curatorOutcome(body, rawBody);
     case "context_scout":
       return scoutOutcome(body);
+    case "design_host":
+      return designHostOutcome(body, rawBody);
+    case "design_planner":
+      return designPlannerOutcome();
+    case "case_author":
+      return caseAuthorOutcome(body, rawBody);
+    case "design_critic":
+      return designCriticOutcome(body, rawBody);
+    case "data_planner":
+      return dataPlannerOutcome(body, rawBody);
     default:
       return textOutcome(buildReply(body));
   }

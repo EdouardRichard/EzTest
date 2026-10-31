@@ -30,6 +30,7 @@ type runnerFixture struct {
 	events      *fakePublisher
 	audit       *fakeAuditRecorder
 	requirement *fakeRequirementPort
+	design      *fakeDesignPort
 }
 
 func newRunnerFixture(t *testing.T) *runnerFixture {
@@ -71,6 +72,7 @@ func newRunnerFixture(t *testing.T) *runnerFixture {
 			updated: tools.RequirementSummary{ID: 501, CurrentVersionID: 701, Revision: 2, Status: "draft", Title: "登录功能"},
 			detail:  tools.RequirementDetail{RequirementSummary: tools.RequirementSummary{ID: 501, Status: "draft"}},
 		},
+		design: &fakeDesignPort{},
 	}
 	fixture.runner = agentapp.NewRunner(agentapp.RunnerDeps{
 		Runtime:      repo,
@@ -89,6 +91,7 @@ func newRunnerFixture(t *testing.T) *runnerFixture {
 			Requirement: fixture.requirement,
 			Attachment:  &fakeAttachmentPort{},
 			Resource:    &fakeResourcePort{},
+			Design:      fixture.design,
 		},
 		InstanceID: "instance-1",
 	})
@@ -133,6 +136,15 @@ func containsEvent(publisher *fakePublisher, eventType string) bool {
 		}
 	}
 	return false
+}
+
+func requestPrompt(request llmapp.ChatRequest) string {
+	var builder strings.Builder
+	for _, message := range request.Messages {
+		builder.WriteString(message.Content)
+		builder.WriteString("\n")
+	}
+	return builder.String()
 }
 
 func toolCall(name, arguments string) llmapp.ChatResponse {
@@ -445,7 +457,7 @@ func TestRunnerLeaseLostOnFinishIsNotRetried(t *testing.T) {
 
 func TestRunnerRejectsUnknownWorkType(t *testing.T) {
 	fixture := newRunnerFixture(t)
-	item := fakeWorkItem("design.round", agentapp.WorkItemPayload{ConversationID: 20})
+	item := fakeWorkItem("execute.case", agentapp.WorkItemPayload{ConversationID: 20})
 
 	_, err := mustRun(t, fixture, item)
 	if err == nil {
@@ -505,6 +517,194 @@ func TestWorkItemPayloadParsesDecimalStringIDs(t *testing.T) {
 	}
 }
 
+const designProposalJSON = `{"requirement_id":"501","requirement_version_id":"700","scenarios":[{"ref":"s1","name":"正常登录","version_sut_ids":["9001"]}],"cases":[{"ref":"c1","scenario_ref":"s1","title":"账号密码登录成功","priority":"P1","default_version_sut_id":"9001","version_sut_ids":["9001"],"steps":[{"seq":1,"action":"打开登录页","expected":"显示表单"}],"assertions":[{"step_seq":1,"kind":"ui","target":"表单","expected":"可见"}],"sources":[{"kind":"requirement","ref_id":"700"}]}]}`
+
+func designRequirementItem() agent.WorkItem {
+	return fakeWorkItem(agentapp.WorkTypeDesignRequirement, agentapp.WorkItemPayload{
+		ConversationID: 20, RequirementID: 501, RequirementVersionID: 700, Trigger: "manual",
+	})
+}
+
+func TestRunnerDesignHostUsesDesignProfileAndTeamRoom(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	fixture.conv.kind = "design"
+	fixture.chat.responses = []llmapp.ChatResponse{{Content: "我已读取脑图，请告诉我要新增或修改哪条用例。"}}
+
+	item := fakeWorkItem(agentapp.WorkTypeChatTurn, agentapp.WorkItemPayload{
+		ConversationID: 20, Trigger: "opening",
+	})
+	result, err := mustRun(t, fixture, item)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Status != agent.AgentRunDone {
+		t.Fatalf("result = %#v", result)
+	}
+	if len(fixture.conv.appended) != 1 {
+		t.Fatalf("design host assistant messages = %d", len(fixture.conv.appended))
+	}
+	finished := fixture.repo.lastFinished(t)
+	if finished.ProfileKey != agentapp.ProfileKeyDesignHost {
+		t.Fatalf("profile = %q, want design_host", finished.ProfileKey)
+	}
+	if len(fixture.team.contextTeams) == 0 || fixture.team.contextTeams[0] != string(agent.TeamDesign) {
+		t.Fatalf("team room context teams = %v", fixture.team.contextTeams)
+	}
+	prompt := requestPrompt(fixture.chat.request(0))
+	if !strings.Contains(prompt, "设计会话") || strings.Contains(prompt, "澄清会话的开场") {
+		t.Fatalf("design opening prompt = %q", prompt)
+	}
+	for _, definition := range fixture.chat.request(0).Tools {
+		if definition.Name == "case.confirm" {
+			t.Fatal("case.confirm must never be exposed to the model")
+		}
+	}
+}
+
+func TestRunnerDesignAuthorCallsGraphToolsWithScopeAndPostsTeamUpdate(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	fixture.design.readResult = map[string]any{
+		"requirements": []any{map[string]any{"requirement_id": "501"}},
+	}
+	fixture.design.proposeResult = map[string]any{"graph_hash": "after", "case_ids": []string{"7001"}}
+	fixture.chat.responses = []llmapp.ChatResponse{
+		toolCall(tools.ToolDesignGraphRead, `{}`),
+		toolCall(tools.ToolCaseGraphPropose, designProposalJSON),
+		{Content: "已为需求 501 生成 1 个场景与 1 条用例 draft。"},
+	}
+
+	result, err := mustRun(t, fixture, designRequirementItem())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Status != agent.AgentRunDone || result.Turns != 3 {
+		t.Fatalf("result = %#v", result)
+	}
+	if finished := fixture.repo.lastFinished(t); finished.ProfileKey != agentapp.ProfileKeyCaseAuthor {
+		t.Fatalf("profile = %q", finished.ProfileKey)
+	}
+	if fixture.design.readCalls != 1 || fixture.design.readVersionID != 10 || fixture.design.readRequirementID != 501 {
+		t.Fatalf("graph read = %#v", fixture.design)
+	}
+	if fixture.design.proposeCalls != 1 || fixture.design.proposeVersionID != 10 {
+		t.Fatalf("propose call = %#v", fixture.design)
+	}
+	if fixture.design.proposeInput.RequirementID != 501 || fixture.design.proposeInput.RequirementVersionID != 700 {
+		t.Fatalf("proposal = %#v", fixture.design.proposeInput)
+	}
+	if fixture.design.proposeRunID != result.AgentRunID {
+		t.Fatalf("propose run id = %d, want %d", fixture.design.proposeRunID, result.AgentRunID)
+	}
+	if len(fixture.team.posts) != 1 {
+		t.Fatalf("team posts = %#v", fixture.team.posts)
+	}
+	if post := fixture.team.posts[0]; post.Team != agent.TeamDesign || post.Kind != agent.PostKindStatus ||
+		!strings.Contains(post.Content, "场景") {
+		t.Fatalf("post = %#v", post)
+	}
+	if len(fixture.conv.appended) != 0 {
+		t.Fatalf("author wrote a conversation message: %#v", fixture.conv.appended)
+	}
+	prompt := requestPrompt(fixture.chat.request(0))
+	for _, want := range []string{"requirement_id=501", "requirement_version_id=700", "design.requirement"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("design task prompt missing %q: %s", want, prompt)
+		}
+	}
+	if len(fixture.team.contextTeams) == 0 || fixture.team.contextTeams[0] != string(agent.TeamDesign) {
+		t.Fatalf("team room context teams = %v", fixture.team.contextTeams)
+	}
+}
+
+func TestRunnerDesignPlannerWritesAssistantMessageAndTeamPost(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	fixture.conv.kind = "design"
+	fixture.chat.responses = []llmapp.ChatResponse{{Content: "本轮设计范围：1 个待设计需求，预计生成 1 个场景与 2 条用例。"}}
+	item := fakeWorkItem(agentapp.WorkTypeDesignRound, agentapp.WorkItemPayload{
+		ConversationID: 20, RoundID: 9001,
+	})
+
+	if _, err := mustRun(t, fixture, item); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(fixture.conv.appended) != 1 || len(fixture.team.posts) != 1 {
+		t.Fatalf("messages/posts = %d/%d", len(fixture.conv.appended), len(fixture.team.posts))
+	}
+	if post := fixture.team.posts[0]; post.Team != agent.TeamDesign || !strings.Contains(post.Content, "范围") {
+		t.Fatalf("post = %#v", post)
+	}
+	prompt := requestPrompt(fixture.chat.request(0))
+	for _, want := range []string{"design.round", "round_id=9001"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("planner prompt missing %q: %s", want, prompt)
+		}
+	}
+}
+
+func TestRunnerDesignCriticAndDataPlannerSubmitViaScopedTools(t *testing.T) {
+	critic := newRunnerFixture(t)
+	critic.chat.responses = []llmapp.ChatResponse{
+		toolCall(tools.ToolDesignReviewSubmit, `{"summary":"整体可用","findings":[{"severity":"minor","message":"补充异常步骤断言"}]}`),
+		{Content: "已提交 1 条 minor finding。"},
+	}
+	criticItem := fakeWorkItem(agentapp.WorkTypeDesignCritic, agentapp.WorkItemPayload{
+		ConversationID: 20, RequirementID: 501, RequirementVersionID: 700,
+	})
+	if _, err := mustRun(t, critic, criticItem); err != nil {
+		t.Fatalf("critic run: %v", err)
+	}
+	if critic.design.reviewCalls != 1 || critic.design.reviewRequirementID != 501 {
+		t.Fatalf("review call = %#v", critic.design)
+	}
+	if len(critic.team.posts) != 1 || critic.team.posts[0].Kind != agent.PostKindFinding {
+		t.Fatalf("critic posts = %#v", critic.team.posts)
+	}
+	if len(critic.design.reviewInput.Findings) != 1 || critic.design.reviewInput.Findings[0].Message == "" {
+		t.Fatalf("review input = %#v", critic.design.reviewInput)
+	}
+
+	dataPlanner := newRunnerFixture(t)
+	dataPlanner.design.readResult = map[string]any{
+		"cases": []any{map[string]any{"case_id": "7001", "current_version_id": "8001", "status": "draft"}},
+	}
+	dataPlanner.chat.responses = []llmapp.ChatResponse{
+		toolCall(tools.ToolDesignGraphRead, `{}`),
+		toolCall(tools.ToolDesignDataPlanSubmit, `{"case_version_id":"8001","preconditions":"已登录","test_data":{"account":"admin"}}`),
+		{Content: "已为用例补充前置条件与测试数据。"},
+	}
+	dataItem := fakeWorkItem(agentapp.WorkTypeDesignDataPlan, agentapp.WorkItemPayload{
+		ConversationID: 20, RequirementID: 501, RequirementVersionID: 700,
+	})
+	if _, err := mustRun(t, dataPlanner, dataItem); err != nil {
+		t.Fatalf("data planner run: %v", err)
+	}
+	if dataPlanner.design.dataPlanCalls != 1 || dataPlanner.design.dataPlanCaseVersionID != 8001 {
+		t.Fatalf("data plan call = %#v", dataPlanner.design)
+	}
+	if len(dataPlanner.team.posts) != 1 || dataPlanner.team.posts[0].Team != agent.TeamDesign {
+		t.Fatalf("data planner posts = %#v", dataPlanner.team.posts)
+	}
+}
+
+func TestWorkItemPayloadParsesDesignIDs(t *testing.T) {
+	raw, _ := json.Marshal(map[string]any{
+		"conversation_id":        "20",
+		"requirement_id":         "501",
+		"requirement_version_id": "700",
+		"case_id":                "8001",
+		"case_version_id":        "8002",
+		"round_id":               "9001",
+	})
+	payload, err := agentapp.ParseWorkItemPayload(raw)
+	if err != nil {
+		t.Fatalf("ParseWorkItemPayload: %v", err)
+	}
+	if payload.ConversationID != 20 || payload.RequirementID != 501 || payload.RequirementVersionID != 700 ||
+		payload.CaseID != 8001 || payload.CaseVersionID != 8002 || payload.RoundID != 9001 {
+		t.Fatalf("payload = %#v", payload)
+	}
+}
+
 func TestProfileKeyForWorkType(t *testing.T) {
 	cases := map[string]string{
 		agentapp.WorkTypeChatTurn:          agentapp.ProfileKeyClarificationHost,
@@ -517,7 +717,7 @@ func TestProfileKeyForWorkType(t *testing.T) {
 			t.Fatalf("ProfileKeyForWorkType(%q) = %q/%v, want %q", workType, got, ok, want)
 		}
 	}
-	if _, ok := agentapp.ProfileKeyForWorkType("design.round"); ok {
-		t.Fatal("P2+ work type must not map to a P1 profile")
+	if _, ok := agentapp.ProfileKeyForWorkType("execute.case"); ok {
+		t.Fatal("P3+ work type must not map to a P1 profile")
 	}
 }
