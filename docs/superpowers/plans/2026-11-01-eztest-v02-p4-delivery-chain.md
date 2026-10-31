@@ -270,11 +270,10 @@ type AnalysisRepository interface {
   LatestByIssue(ctx, issueID int64) (domain.AnalysisRun, bool, error)
 }
 type TaskEnsurer interface {
-  EnsureIssueTriage(ctx, issueID int64) error
-  EnsureWaveReport(ctx, versionID, waveID int64) error
-  EnsureVersionReport(ctx, versionID int64) error
-  EnsureRequirementClose(ctx, requirementID int64) error
-  EnsureVersionClose(ctx, versionID int64) error
+  EnsureIssueTriage(ctx, issueID, versionID int64) error
+  EnsureReportTask(ctx, reportID int64, revision int32) error
+  EnsureRequirementClose(ctx, requirementID, requirementVersionID int64, closeRound int32) error
+  EnsureVersionClose(ctx, versionID, reportRevisionID int64, predicateFingerprint string) error
 }
 type ExecutionReader interface {
   ListFailedApplicationCaseRuns(ctx, versionID int64) ([]CaseRunSnapshot, error)
@@ -337,8 +336,8 @@ git commit -m "feat(p4): add delivery and chain shared types and ports"
 - Modify: `backend/internal/agent/application/profiles.go:274-294`
 - Modify: `backend/internal/agent/application/p3_task_context.go`（P4 task context 注册回退）
 - Modify: `backend/internal/agent/application/runner.go:460`（工具 registry 使用 `NewP4Registry`，P4 组 init 注册）
-- Create: `backend/internal/agent/application/p4_task_context.go`（`RegisterP4TaskContext(fn func(ctx, task TaskRef) (any, bool))`，各域 init 注册）
-- Create: `backend/internal/agent/application/tools/p4_registry.go`（组合 3 组工具；`RegisterP4ToolGroup(func() []tools.Tool)`，各域工具文件用 `init()` 注册）
+- Create: `backend/internal/agent/application/p4_task_context.go`（`RegisterP4TaskContext(fn func(ctx, task TaskRef) (any, bool))`；payload-only，Task 23 注册）
+- Create: `backend/internal/agent/application/tools/p4_registry.go`（`RegisterP4ToolGroup(fn func(deps tools.Deps) []tools.Tool)`；Task 23 用服务捕获闭包注册）
 - Modify: `backend/internal/storage/infrastructure/filestore.go:92-119`
 - Create/modify: `backend/internal/storage/infrastructure/filestore_test.go`
 
@@ -348,8 +347,8 @@ git commit -m "feat(p4): add delivery and chain shared types and ports"
   - work types：`issue.triage`、`report.wave`、`report.version`、`requirement.close`、`version.close`（常量在 `agent/application`）。
   - mapping：上述 type → `issue_triager`/`report_writer`/`version_steward`。
   - `func P4Profiles() []domain.AgentProfile`；`Profiles()` 追加且去重（DB 编辑优先，不覆盖）。
-  - `func NewP4Registry(deps tools.Deps) *tools.Registry`；`func RegisterP4ToolGroup(fn func() []tools.Tool)`（各域 init 注册，避免并行改同一文件）。
-  - `type TaskRef struct { VersionID int64; Type string; Payload map[string]any }`；`func RegisterP4TaskContext(fn func(ctx context.Context, task TaskRef) (any, bool))`（各域 init 注册；Provider 在 P3 switch 未命中时回退遍历注册项）。
+  - `func NewP4Registry(deps tools.Deps) *tools.Registry`；`func RegisterP4ToolGroup(fn func(deps tools.Deps) []tools.Tool)`（Task 23 在 cmd 注册服务捕获闭包；不用 init）。
+  - `type TaskRef struct { VersionID int64; Type string; Payload map[string]any }`；`func RegisterP4TaskContext(fn func(ctx context.Context, task TaskRef) (any, bool))`（payload-only；Task 23 注册）。
   - `FileStore.Open` 拒绝 symlink/根外路径（`Lstat`+`EvalSymlinks`+`filepath.Rel`）。
 
 - [ ] **Step 1: 写失败测试**
@@ -502,7 +501,7 @@ func (s *IssueService) Merge(ctx context.Context, versionID, sourceID, targetID,
 
 `IssueDetail`：`struct { Issue domain.Issue; Refs []domain.IssueRef; History []domain.IssueStatusChange; Triage *domain.AnalysisRun }`。
 
-- 事件：`issue.created` 纳入、`issue.updated` 确认/驳回、`issue.reopened`、`issue.merged`；audit best-effort；`ScanFailures`/`IngestCandidate` 对新 issue 调 `tasks.EnsureIssueTriage(ctx, issue.ID)`。
+- 事件：`issue.created` 纳入、`issue.updated` 确认/驳回、`issue.reopened`、`issue.merged`；audit best-effort；`ScanFailures`/`IngestCandidate` 对新 issue 调 `tasks.EnsureIssueTriage(ctx, issue.ID, issue.VersionID)`。
 - 错误映射 `ErrStateConflict/ErrNotFound/ErrInvalidArgument`。
 
 - [ ] **Step 1: 写失败单测（fake repo/exec/events/audit/tasks）**
@@ -583,8 +582,8 @@ git commit -m "feat(p4): expose issue API"
 - Create: `backend/internal/delivery/application/analysis_service.go`
 - Create: `backend/internal/delivery/application/analysis_service_test.go`
 - Create: `backend/internal/delivery/application/issue_tools.go`
-- Create: `backend/internal/agent/application/tools/p4_issue_tools.go`（`init(){ RegisterP4ToolGroup(...) }`，不改 p4_registry.go）
-- Create: `backend/internal/agent/application/task_context_p4_issue.go`（`init(){ RegisterP4TaskContext(...) }`）
+- Create: `backend/internal/agent/application/tools/p4_issue_tools.go`（`func IssueTools(svc *IssueService, analysis *AnalysisService) []tools.Tool`；Task 23 注册，不用 init）
+- Create: `backend/internal/agent/application/task_context_p4_issue.go`（`func IssueTaskContext(ref TaskRef) (any, bool)`；payload-only，Task 23 注册）
 - Create: `backend/internal/agent/application/p4_issue_task_test.go`
 
 **Interfaces:**
@@ -592,13 +591,13 @@ git commit -m "feat(p4): expose issue API"
 - Produces:
   - `func NewAnalysisService(repo AnalysisRepository, issues *IssueService, clock Clock) *AnalysisService`；`StartTriage(ctx, issueID int64) (domain.AnalysisRun, error)`、`Complete(ctx, id int64, status domain.AnalysisStatus, output json.RawMessage, errMsg string) error`。
   - tools：`issue.read`（scope issue）、`issue.propose`（仅 analysis_run output + 团队帖，不改状态）；`NewP4Registry` 包含 issue 组。
-  - `issue.triage` 任务由 reconciler 在 Task 15 接线；本任务测试 task context 可读 issue/refs。
+  - `issue.triage` 任务由 reconciler 在 Task 15 接线；本任务测试 payload-only task context（`{issue_id,version_id}`）+ `issue.read` 读取 issue/refs/关联 case_run 摘要。
 
 - [ ] **Step 1: 写失败测试**
 
 analysis repo 集成：active dedupe 唯一、agent_run 1:1、status 迁移、output JSON。
 tool 单测：`issue.propose` 拒绝跨版本/merged/self duplicate；合法输出写 analysis_run + 团队帖；不调用 issue 状态写方法。
-task context：payload `{issue_id}` 生成含 issue/refs/关联 case_run 摘要的 task pack，不含全量会话。
+task context：payload `{issue_id,version_id}` 生成仅含 ID 的 payload-derived task pack；issue/refs/case_run 摘要由 `issue.read` 工具加载，不含全量会话。
 
 - [ ] **Step 2: 运行确认失败**
 
@@ -700,7 +699,7 @@ type ReportService struct { /* repo, renderer, content, data, events, audit, clo
 func NewReportService(repo ReportRepository, renderer ReportRenderer, content ContentStore, data ReportDataReader, events EventPublisher, audit AuditSink, clock Clock, tasks TaskEnsurer, opts SectionOptions) *ReportService
 func (s *ReportService) EnsureWaveReport(ctx context.Context, versionID, waveID int64) (domain.Report, error) // 建 report+revision(draft) 并 ensure report.wave 任务
 func (s *ReportService) EnsureVersionReport(ctx context.Context, versionID int64) (domain.Report, error)
-func (s *ReportService) EnsureReports(ctx context.Context, versionID int64) error // reconciler：按条件 ensure wave/version 报告任务
+func (s *ReportService) EnsureReports(ctx context.Context, versionID int64) error // reconciler：按条件 ensure wave/version 报告任务（tasks.EnsureReportTask(reportID, revision)）
 func (s *ReportService) Publish(ctx context.Context, reportID int64, revision int32, narrative string) (domain.ReportRevision, error)
 func (s *ReportService) Regenerate(ctx context.Context, versionID, reportID int64) (int32, error)
 func (s *ReportService) MarkStaleIfChanged(ctx context.Context, versionID int64) (bool, error)
@@ -748,8 +747,8 @@ git commit -m "feat(p4): add report repository, publish and content ledger"
 **Files:**
 - Create: `backend/internal/delivery/application/report_tools.go`
 - Create: `backend/internal/delivery/application/report_tools_test.go`
-- Create: `backend/internal/agent/application/tools/p4_report_tools.go`（`init(){ RegisterP4ToolGroup(...) }`，不改 p4_registry.go）
-- Create: `backend/internal/agent/application/task_context_p4_report.go`（`init(){ RegisterP4TaskContext(...) }`）
+- Create: `backend/internal/agent/application/tools/p4_report_tools.go`（`func ReportTools(svc *ReportService) []tools.Tool`；Task 23 注册，不用 init）
+- Create: `backend/internal/agent/application/task_context_p4_report.go`（`func ReportTaskContext(ref TaskRef) (any, bool)`；payload-only，Task 23 注册）
 - Create: `backend/internal/agent/application/p4_report_task_test.go`
 - Modify: `backend/internal/agent/application/runner.go`（report.* run 结束 finalizer 钩子）
 - Create: `backend/internal/agent/application/ports_report.go`（`ReportFinalizer`）
@@ -759,12 +758,12 @@ git commit -m "feat(p4): add report repository, publish and content ledger"
 - Produces:
   - tools `report.data_read`（返回当前 task 的 snapshot 摘要，不含字节/凭据）、`report.narrative_propose`（校验 1..4000 纯文本，写 run 临时输出，不直接发布）。
   - `ReportFinalizer interface { Finalize(ctx, reportID int64, revision int32) error }`；runner 对 `report.wave|version` 结束后调用（未发布则返回错误 → 任务重试）。
-  - task context：payload `{report_id, revision, wave_id?, version_id}` 生成 task pack（wave/version 数据摘要）。
+  - task context：payload `{report_id, revision, wave_id?, version_id}` 生成 payload-only task pack；wave/version 数据摘要由 `report.data_read` 工具加载。
 
 - [ ] **Step 1: 写失败测试**
 
 tool 测试：`report.narrative_propose` 拒绝空/超长/HTML 标签仍允许文本；`report.data_read` 只返回计数/ID；越权 report_id 拒绝。
-task context 测试：report.wave/version payload 能取到 report/revision/wave；缺失返回错误。
+task context 测试：report.wave/version payload 能取到 report/revision/wave；缺失返回错误；数据摘要经 `report.data_read` 取得。
 finalizer 测试：未 published → 返回错误；published → nil。
 
 - [ ] **Step 2: 运行确认失败**
@@ -915,7 +914,7 @@ func (s *VersionCloseService) ReopenIfCompleted(ctx context.Context, versionID i
 
 - `Close`：事务内重算谓词；条件 `UPDATE ... WHERE id=$1 AND status='running'`；0 row → `ErrStateConflict`；写 closed_at/close_reason/close_run_id；事件 `version.closed`（version+system）；审计。
 - `ReopenIfCompleted`：条件 `completed→running`，清 closed_*；调 report stale 钩子；事件 `version.reopened`；非 completed no-op。
-- 构造 `NewVersionCloseService(..., tasks TaskEnsurer, reportStatus ReportStatusReader)`；`EnsureVersionClose` 用 tasks 幂等 ensure `version.close`。
+- 构造 `NewVersionCloseService(..., tasks TaskEnsurer, reportStatus ReportStatusReader)`；`EnsureVersionClose` 用 `tasks.EnsureVersionClose(ctx, versionID, reportRevisionID, predicateFingerprint)` 幂等 ensure `version.close`。
 - 谓词排除 `version.close` 自身；`waiting_human` 以 open human_request/paused wave 等价。
 
 - [ ] **Step 1: 写失败测试**
@@ -951,8 +950,8 @@ git commit -m "feat(p4): add version close predicate and reopen service"
 **Files:**
 - Create: `backend/internal/version/application/tools.go`
 - Create: `backend/internal/version/application/tools_test.go`
-- Create: `backend/internal/agent/application/tools/p4_version_tools.go`（`init(){ RegisterP4ToolGroup(...) }`）
-- Create: `backend/internal/agent/application/task_context_p4_closure.go`（`init(){ RegisterP4TaskContext(...) }`）
+- Create: `backend/internal/agent/application/tools/p4_version_tools.go`（`func VersionTools(closure *ClosureService, close *VersionCloseService) []tools.Tool`；Task 23 注册，不用 init）
+- Create: `backend/internal/agent/application/task_context_p4_closure.go`（`func ClosureTaskContext(ref TaskRef) (any, bool)`；payload-only，Task 23 注册）
 - Create: `backend/internal/agent/application/p4_ensure.go`
 - Create: `backend/internal/agent/application/p4_ensure_test.go`
 - Modify: `backend/internal/agent/application/reconciler.go:26-74`（P4 ensurer 调用）
@@ -1322,6 +1321,7 @@ git commit -m "feat(p4): add version header, todo drawer and SSE events"
 - Produces:
   - `server.Deps` 新字段：`Delivery http.Handler`、`Chain http.Handler`（或具体 handler 类型）；`server.New` 注册 `/api/versions/{id}/issues|reports|exploration-chain`、version/requirement reopen、报告 HTML。
   - `cmd/eztest` 构造：`Delivery IssueService/ReportService`、`ChainService` + 5 providers、`ClosureService`、`VersionCloseService`、`P4Ensurer` 组合、`NewP4Registry`、`ReportFinalizer`；reconciler 随进程启停（WaitGroup）。
+- **P4 工具/任务上下文注册**：在 cmd 调用 `RegisterP4ToolGroup` 三次（IssueTools/ReportTools/VersionTools 服务捕获闭包）和 `RegisterP4TaskContext` 三次（Issue/Report/Closure payload-only），确保 runner 的 `NewP4Registry` 含 8 工具；不要用 init 注册。
   - design `VersionReopener interface { ReopenIfCompleted(ctx, versionID int64, trigger, reason string) error }`；case 确认后 best-effort 调用，失败由 reconciler 兜底。
 
 - [ ] **Step 1: 写失败集成测试**
