@@ -62,6 +62,9 @@ const MAX_BODY_BYTES = 10 * 1024 * 1024;
 const PROFILE_PATTERN = /\[profile:(clarification_host|requirement_curator|context_scout|design_host|design_planner|case_author|design_critic|data_planner)\]/;
 const DESIGN_MODIFY_HINT = /(新增|补充|修改)/;
 const DESIGN_CASE_HINT = "用例";
+// Runtime-generated opening prompt; it mentions "新增或修改用例" but is not a
+// user write request, so the Host must not propose on the opening turn.
+const DESIGN_OPENING_MARKER = "设计会话的开场";
 // The agent runner injects the task scope into the system section
 // (requirement_id=<decimal>), which lets the fake author pick the requirement
 // the work item is actually scoped to instead of the first graph row.
@@ -355,6 +358,22 @@ function firstGraphCase(requirement) {
   return null;
 }
 
+// firstDraftGraphCase selects the first current-version case whose current
+// version is a draft. The data planner may only update draft case versions;
+// confirmed/stale rows would fail with state_conflict.
+function firstDraftGraphCase(requirement) {
+  const scenarios = Array.isArray(requirement.scenarios) ? requirement.scenarios : [];
+  const currentVersion = String(requirement.requirement_version_id || "");
+  for (const scenario of scenarios) {
+    if (!scenario || String(scenario.requirement_version_id) !== currentVersion) continue;
+    const cases = Array.isArray(scenario.cases) ? scenario.cases : [];
+    for (const item of cases) {
+      if (item && item.case_id && item.status === "draft" && item.current_version_id) return item;
+    }
+  }
+  return null;
+}
+
 // scopedRequirementID reads the runtime-injected requirement scope from the
 // task block, so design.requirement/gap runs target the work item's requirement.
 function scopedRequirementID(body) {
@@ -441,10 +460,27 @@ function graphProposal(requirement, options) {
   };
 }
 
+// wantsGraphChange reports whether the latest human request asks the Host to
+// add/modify cases. Graph tool results alone never trigger writes: the opening
+// turn (runtime-generated prompt) and plain questions stay conversation-only.
+function wantsGraphChange(body) {
+  const text = lastUserText(body);
+  if (text === "" || text.includes(DESIGN_OPENING_MARKER)) return false;
+  return text.includes(DESIGN_CASE_HINT) && DESIGN_MODIFY_HINT.test(text);
+}
+
 function designHostOutcome(body, rawBody) {
   const result = lastToolResult(body);
   if (result && isProposeResult(result)) {
     return textOutcome("已提交用例草案（draft），请在脑图中确认或继续提出修改。");
+  }
+  if (result && result.error) {
+    return textOutcome("读取脑图失败，请稍后重试，或直接在对话中说明要修改的用例。");
+  }
+  if (!wantsGraphChange(body)) {
+    return textOutcome(
+      "我是设计 Host。我会读取用例脑图，并可以按你的要求新增或修改场景/用例 draft；请说明要调整的内容。",
+    );
   }
   const graph = graphResult(body);
   if (graph) {
@@ -458,16 +494,7 @@ function designHostOutcome(body, rawBody) {
       graphProposal(requirement, { updateFirstCase: true, titles: ["AI 补充用例（设计对话）"] }),
     );
   }
-  if (result && result.error) {
-    return textOutcome("读取脑图失败，请稍后重试，或直接在对话中说明要修改的用例。");
-  }
-  const text = lastUserText(body);
-  if (text.includes(DESIGN_CASE_HINT) && DESIGN_MODIFY_HINT.test(text)) {
-    return toolCallOutcome(rawBody, "design.graph_read", {});
-  }
-  return textOutcome(
-    "我是设计 Host。我会读取用例脑图，并可以按你的要求新增或修改场景/用例 draft；请说明要调整的内容。",
-  );
+  return toolCallOutcome(rawBody, "design.graph_read", {});
 }
 
 function designPlannerOutcome() {
@@ -520,7 +547,7 @@ function dataPlannerOutcome(body, rawBody) {
   const graph = graphResult(body);
   if (graph) {
     const requirement = firstGraphRequirement(graph);
-    const item = requirement ? firstGraphCase(requirement) : null;
+    const item = requirement ? firstDraftGraphCase(requirement) : null;
     if (item && item.current_version_id) {
       return toolCallOutcome(rawBody, "design.data_plan_submit", {
         case_version_id: String(item.current_version_id),
