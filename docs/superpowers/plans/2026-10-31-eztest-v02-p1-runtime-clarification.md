@@ -14,7 +14,8 @@
 
 - 权威：`docs/version-V0.2/architecture-design.md`、`high-level-design.md`、`research/decision-log.md`、`research/open-decisions.md`、`phases/phase-01-runtime-clarification.md`、P0 frozen `contracts/`、`phase-00-handoff.md`。冲突按 spec §12.1 裁决；不改设计文档。
 - 阶段按 **P1 = phase-01** 实施（提示词误用了 P0 模板；权威阶段表为准）。
-- `.env` 严格 4 项；P1 不新增 env；不新增设置键（消费 P0 的 context/agent/team_room/llm 键）。
+- `.env` 严格 4 项；P1 不新增 env；不新增设置键（消费 P0 的 context/agent/team_room/llm 键）。真实 LLM 验收只由 `scripts/p1-acceptance-llm.ps1` 读取 `.env` 的非 EzTest 键 `DEEPSEEK_API_KEY/DEEPSEEK_BASE_URL/DEEPSEEK_MODEL`，再经 admin API 写 `llm_config`；API 进程不读这些键。
+- 前端新增 `react-markdown`/`remark-gfm` 由 Lead 在 T14 开始前执行 `pnpm add` 并提交 `package.json`/lockfile；其他代理不得改 `package.json`。
 - 所有新业务 ID 雪花 int64；JSON/URL 一律十进制字符串；事件 `seq` 是数字游标。
 - 迁移只追加；不改 P0 已应用迁移；迁移名 `<context>_<NNNN>_<desc>.sql`；`order.txt` 追加到末尾。P1 迁移：`agent_0001_work_item.sql`、`agent_0002_team_room.sql`、`agent_0003_runtime.sql`、`version_0002_requirement.sql`、`version_0003_conversation.sql`、`version_0004_requirement_attachment.sql`、`eventing_0002_event_index.sql`。
 - 不恢复 0.1 控制面：无 8 状态版本机、无整版冻结/评审页签、无人工批次、无中心编排 Agent。
@@ -101,7 +102,7 @@ Lead: T13 server/main/integration（依赖 T9/T12） → T18 E2E/验收（依赖
 - [ ] **Step 3: events 追加 P1 事件类型、scope 字段、payload 示例、单实例限制不变**。
 - [ ] **Step 4: task-types.md**：P1 实现 `chat.turn/requirement.curate/attachment.ingest`；列 P2+ 保留类型但不实现；写 team/dedupe/输入/输出/失败语义。
 - [ ] **Step 5: agent-profiles-tools.md**：3 个 profile、17 个工具、scope 注入、JSON schema、提交校验、错误返回；P2+ 工具标 reserved。
-- [ ] **Step 6: openapi**：追加 10 个 P1 path、20 个 schema、错误码；P0 LLM list/status 漂移按实现修正（非破坏性）；`info`/`x-frozen` 标 P1 draft。
+- [ ] **Step 6: openapi**：追加 11 个 P1 path（含只读 team-room）、23 个 schema、错误码；P0 LLM list/status 漂移按实现修正（非破坏性）；`info`/`x-frozen` 标 P1 draft。
 - [ ] **Step 7: settings.md**：记录 P1 只消费 P0 键，不新增 env/键；列出 context/agent/team_room/llm 键。
 - [ ] **Step 8: YAML 解析自检**：`node -e "const yaml=require('./frontend/node_modules/yaml'); yaml.parse(require('fs').readFileSync('docs/version-V0.2/contracts/openapi.yaml','utf8')); console.log('ok')"`。
 - [ ] **Step 9: 提交**：`feat(p1): add frozen-ready P1 contracts`。
@@ -193,6 +194,7 @@ func (q *WorkQueue) ListByVersion(ctx context.Context, versionID int64, limit in
 
 **Files:**
 - Create: `backend/internal/agent/application/teamroom.go`、`teamroom_test.go`
+- Create: `backend/internal/agent/interfaces/httpapi/teamroom_handler.go`、`teamroom_handler_test.go`
 
 **Interfaces:**
 ```go
@@ -201,12 +203,14 @@ func NewTeamRoom(repo agent.TeamRoomRepository, clk clock.Clock, ids id.Generato
 func (s *TeamRoom) Post(ctx context.Context, p agent.TeamRoomPost) (agent.TeamRoomPost, error)
 func (s *TeamRoom) Digest(ctx context.Context, versionID int64, team string) (agent.TeamRoomDigest, error)
 func (s *TeamRoom) Context(ctx context.Context, versionID int64, team string, maxPosts int) (TeamRoomContext, error)
+func (s *TeamRoom) Read(ctx context.Context, versionID int64, team string, limit int) (TeamRoomView, error)
 ```
+- 只读 HTTP：`GET /api/versions/{id}/team-rooms/{team}?limit=`，登录用户；返回最新 digest + 最近帖子（id/kind/content/refs/agent_run_id/created_at）；team 枚举校验；无 digest 返回 null。
 - 摘要阈值读 `team_room.digest_every_n_posts`/`digest_interval_minutes`/`digest_keep_versions`；确定性摘要：标题/kind/首 200 字，decision/blocker 进 pinned；保留最近 N 版并删除更旧。
 - 发布 `team_room.post`/`team_room.digest_updated` 事件。
 
-- [ ] **Step 1: 写失败测试**：不足 20 条且未超时不生成；第 20 条生成；超时生成；摘要含 pinned decision/blocker；N 版后旧版被删；Context 只返回最新 digest+相关帖子。
-- [ ] **Step 2: 跑失败**、**Step 3: 实现**、**Step 4: 跑通** `go test ./internal/agent/application/ -run TestTeamRoom`。
+- [ ] **Step 1: 写失败测试**：不足 20 条且未超时不生成；第 20 条生成；超时生成；摘要含 pinned decision/blocker；N 版后旧版被删；Context 只返回最新 digest+相关帖子；Read 只读/limit/team 校验。
+- [ ] **Step 2: 跑失败**、**Step 3: 实现**、**Step 4: 跑通** `go test ./internal/agent/application/ ./internal/agent/interfaces/httpapi/ -run TestTeamRoom`。
 - [ ] **Step 5: Lead 提交** `feat(p1): add team room and digest`。
 
 ## Task 6: 上下文包、token 预算与压缩（backend-runtime）
@@ -351,7 +355,7 @@ func (s *RequirementService) Rollback(ctx, versionID, reqID int64, reason string
 func (s *RequirementService) CreateRelation(ctx, versionID int64, in RelationInput, actorID int64) (RelationView, error)
 type CaseStaleHook interface { MarkRequirementChanged(ctx context.Context, versionID, requirementID int64, reason string, revision int) ([]string, error) }
 ```
-- 版本投影：Create/Confirm/Rollback 首次触发 `MarkRunning`；事件 `version.started/status_changed`。
+- 版本投影：Create/Confirm 首次触发 `MarkRunning`（首个 requirement/确认）；首条对话消息触发在 T11；事件 `version.started/status_changed`。
 - 编辑/回退生成新 revision；确认写 requirement_confirmation（每 version 唯一）；批量事务；AI 不可确认（Agent 端口不暴露 Confirm）。
 - P2 stale：调用 hook，事件带 `affected_case_version_ids`；P1 空实现返回 `[]`。
 - 版本统计：requirement_counts、conversation_count、pending_design_count（=clarified 数）。
@@ -388,7 +392,7 @@ func (s *ConversationService) Summary(ctx, convID int64) (SummaryView, error)
 func (s *ConversationService) UpdateSummary(ctx, convID int64, summary string, pinned []string) error
 ```
 - 消息 parts：text/attachment；附件校验/落 requirement_attachment + content_ref + ingest 任务；`client_message_id` 唯一幂等。
-- 创建 conversation → opening 任务（best-effort）+ 事件 + 版本 running 投影（由 reconciler 兜底）。
+- 创建 conversation → opening 任务（best-effort）+ 事件；running 投影由首条对话消息（user 或 assistant）/首个 requirement/首次确认触发（reconciler 兜底）；仅创建空 conversation 不触发。
 - 摘要服务：`pinned_facts` 上限 20/500 字；version 递增；事件 `conversation.summary_updated`。
 - 列表/消息游标、计数、last_message_at、message_count。
 
@@ -432,9 +436,10 @@ type Parser interface { Extract(ctx context.Context, name, mime string, r io.Rea
 ## Task 13: 服务器装配、main worker 与后端集成动线（Lead）
 
 **Files:**
-- Modify: `backend/internal/server/server.go`（新 Deps + 注册 requirements/conversations 路由）
+- Modify: `backend/internal/server/server.go`（新 Deps + 注册 requirements/conversations/team-rooms 路由）
 - Modify: `backend/internal/server/server_integration_test.go`（新增 P1 flow；保留 P0；更新 version 频道事件数量/详情字段期望）
 - Modify: `backend/internal/eventing/interfaces/httpapi/handler.go`（SSE 补 `X-Snapshot-Cursor` 响应头；不改帧/游标语义）
+- Modify: `backend/internal/eventing/interfaces/httpapi/dto.go`、`handler.go`、相关测试（D4：Event.seq/snapshot_cursor 输出整数，符合 P0 契约；同步前端事件类型）
 - Create: `backend/internal/agent/infrastructure/versionadapter/`（Lead 装配：把 versionapp RequirementService/ConversationService/VersionService 适配为 agent 端口）
 - Modify: `backend/cmd/eztest/main.go`（装配 agent/requirements/conversations/attachments/llm gateway；启动 worker/reconciler；优雅停止）
 - Modify: `backend/internal/platform/errors.go`（新增稳定 reason 常量/映射；不改既有错误语义）
@@ -443,12 +448,12 @@ type Parser interface { Extract(ctx context.Context, name, mime string, r io.Rea
 
 **Interfaces:**
 - `server.Deps` 增 `Requirements *versionapp.RequirementService`、`Conversations *versionapp.ConversationService`。
-- 路由：`/api/versions/{id}/conversations*`、`/api/versions/{id}/requirements*`，全部 `authenticated`。
+- 路由：`/api/versions/{id}/conversations*`、`/api/versions/{id}/requirements*`、`/api/versions/{id}/team-rooms/{team}`，全部 `authenticated`。
 - main 启动顺序：迁移→设置→ID→audit/events→identity→llm→storage→resource→version→requirement/conversation/attachment→agent(workqueue/teamroom/context/runner)→server→worker/reconciler goroutines；shutdown 先停 worker 再停 HTTP/DB。
 - 集成测试：登录→建版本→建 conversation→POST 用户消息→（直接运行 reconciler+worker with fake runner 或 fake LLM）→需求 draft→确认→回退；SSE 事件存在；403/404 边界。
 
-- [ ] **Step 1: 写编译/路由失败测试**（`TestP1RoutesRegistered` 405/404 行为；未登录 401）。
-- [ ] **Step 2: 实现装配与 main**；确保 P0 测试不回归。
+- [ ] **Step 1: 写编译/路由失败测试**（`TestP1RoutesRegistered` 405/404 行为；未登录 401；D4 seq/snapshot_cursor 为整数）。
+- [ ] **Step 2: 实现装配与 main**；同时修 SSE `X-Snapshot-Cursor` 与 D4 整数输出；确保 P0 测试不回归。
 - [ ] **Step 3: 写 P1 集成 flow**（使用 testutil DB + 真实 repo/service + fake LLM 或 fake runner；不依赖浏览器）。
 - [ ] **Step 4: 跑通** `go test ./internal/server/...` + `go test -tags=integration ./internal/server/...`。
 - [ ] **Step 5: Lead 提交** `feat(p1): wire runtime and clarification APIs`。
@@ -456,6 +461,7 @@ type Parser interface { Extract(ctx context.Context, name, mime string, r io.Rea
 ## Task 14: 前端 API/types、requirements 壳（frontend）
 
 **Files:**
+- Modify: `frontend/package.json`、`frontend/pnpm-lock.yaml`（Lead 在任务开始前执行 `pnpm add react-markdown remark-gfm` 并提交）
 - Create: `frontend/src/features/clarification/types.ts`、`api.ts`、`api.test.ts`
 - Create: `frontend/src/features/clarification/RequirementsTab.tsx`、`RequirementsTab.test.tsx`（先壳：加载/空/错误）
 - Create: `frontend/src/features/clarification/index.ts`
@@ -490,7 +496,7 @@ export type Requirement = {...}
 - ChatPanel props `{versionId, conversationId, onRequirementSelect}`；内部 fetch messages、发送、SSE 刷新、activity 指示。
 - Composer：Enter 发送、Shift+Enter 换行、发送中禁用、附件上传（`POST /api/content`）、错误内联。
 - `useVersionEvents(versionId, handlers)` 用 `connectSSE`；只处理 `conversation.message/agent.activity/requirement.*/version.status_changed`；去重/重连交给 sse-client。
-- RichText：安全渲染段落/换行/粗体/行内代码/列表/链接；转义 HTML；测试 XSS 输入不产生元素。
+- RichText：用 `react-markdown` + `remark-gfm` 渲染 Markdown（禁 raw HTML、链接安全属性）；测试 XSS/HTML 输入不产生可执行节点。
 - RollbackCard：`rollback_proposal` part → 确认回退（POST rollback）→ 回调刷新；暂不处理只本地隐藏。
 - RequirementCard：显示 title/status/revision；点击选中。
 
@@ -499,11 +505,11 @@ export type Requirement = {...}
 - [ ] **Step 3: TDD 实现**；**Step 4: 跑通** `pnpm test -- src/features/clarification` + typecheck/lint。
 - [ ] **Step 5: Lead 提交** `feat(p1): add clarification chat and attachments UI`。
 
-## Task 16: 需求侧栏、编辑器、批量确认与设计 CTA（frontend）
+## Task 16: 需求侧栏、编辑器、批量确认、团队面板与设计 CTA（frontend）
 
 **Files:**
-- Create: `RequirementSidebar.tsx`、`RequirementEditor.tsx`、`BulkConfirmBar.tsx`、`DesignCTA.tsx`
-- Create: `RequirementSidebar.test.tsx`、`RequirementEditor.test.tsx`、`BulkConfirmBar.test.tsx`、`DesignCTA.test.tsx`
+- Create: `RequirementSidebar.tsx`、`RequirementEditor.tsx`、`BulkConfirmBar.tsx`、`DesignCTA.tsx`、`TeamRoomPanel.tsx`
+- Create: `RequirementSidebar.test.tsx`、`RequirementEditor.test.tsx`、`BulkConfirmBar.test.tsx`、`DesignCTA.test.tsx`、`TeamRoomPanel.test.tsx`
 - Modify: `RequirementsTab.tsx`（组合 ChatPanel + Sidebar + CTA）
 
 **Interfaces:**
@@ -511,8 +517,9 @@ export type Requirement = {...}
 - Editor：fields + target multi-select（version_sut/page/api from version bindings）；保存→PATCH；确认→POST confirm；已澄清显示回退提示；错误内联。
 - DesignCTA：`pending_design_count>0` 显示 “N 条需求待设计 · P2 提供设计对话”，按钮 disabled；不调用设计 API。
 - 批量确认：确认后刷新列表/计数；部分已确认幂等；失败显示 details。
+- TeamRoomPanel：折叠只读面板，fetch `GET /api/versions/{id}/team-rooms/clarification`；显示 digest/最近帖子；无数据空态；不提供发帖入口。
 
-- [ ] **Step 1: 写 Sidebar/Bulk/CTA 失败测试**（过滤/选择/批量调用/幂等提示/CTA 显隐）。
+- [ ] **Step 1: 写 Sidebar/Bulk/CTA/TeamRoom 失败测试**（过滤/选择/批量调用/幂等提示/CTA 显隐/面板空态与只读）。
 - [ ] **Step 2: 写 Editor 失败测试**（加载/保存/确认/已澄清回退提示/目标校验）。
 - [ ] **Step 3: TDD 实现**；**Step 4: 跑通** `pnpm test -- src/features/clarification` + typecheck/lint。
 - [ ] **Step 5: Lead 提交** `feat(p1): add requirement sidebar and editor`。
@@ -525,9 +532,9 @@ export type Requirement = {...}
 - Create/Modify: `RequirementsTab.integration.test.tsx`、`VersionDetailPage.test.tsx`
 - Modify: `frontend/src/app/(app)/versions/[id]/page.tsx`（如需传 searchParams）
 
-**Interfaces:** URL 为真值；切换 conversation/requirement 写入 URL；刷新保持；移动端单列、桌面双列；无 console error；空状态/加载/错误/无权限一致。
+**Interfaces:** URL 为真值；切换 conversation/requirement 写入 URL；刷新保持；移动端单列、桌面双列；团队面板折叠只读；无 console error；空状态/加载/错误/无权限一致。
 
-- [ ] **Step 1: 写集成测试**（切换会话/选中需求写 URL；直接打开深链恢复；Tab 切换；空版本）。
+- [ ] **Step 1: 写集成测试**（切换会话/选中需求写 URL；直接打开深链恢复；Tab 切换；团队面板展开/空态；空版本）。
 - [ ] **Step 2: 实现/修正**；**Step 3: 跑通** `pnpm test`、`pnpm typecheck`、`pnpm lint`、`pnpm build`。
 - [ ] **Step 4: Lead 提交** `feat(p1): integrate requirements workspace`。
 
@@ -537,7 +544,7 @@ export type Requirement = {...}
 - Create: `scripts/p1-e2e.ps1`（基于 `p0-e2e.ps1`：fake LLM + API + web + Playwright）
 - Create: `frontend/e2e/p1-requirements.spec.ts`（若 P0 E2E 目录不同，按现有结构）
 - Create: `scripts/p1-acceptance.ps1`（API 动线：任务板并发/恢复、对话/需求/确认/回退/SSE/附件）
-- Create: `scripts/p1-acceptance-llm.ps1`（gated 真实 LLM；`EZTEST_ACCEPTANCE_LLM=1` 才跑）
+- Create: `scripts/p1-acceptance-llm.ps1`（真实 LLM 必跑：读取 `.env` 的 `DEEPSEEK_API_KEY`/`DEEPSEEK_BASE_URL`/`DEEPSEEK_MODEL`，经 admin API 配置 `llm_config`，跑澄清闭环；缺失凭据则明确失败并阻塞 handoff）
 - Modify: `scripts/fake-llm.cjs`（仅当 T7 未覆盖的 E2E 场景需要；Lead 与 runtime 协调后改）
 - Create/Modify: `.tmp/p1-acceptance/` evidence（gitignored）
 
@@ -547,7 +554,7 @@ export type Requirement = {...}
 - [ ] **Step 2: 写 Playwright spec**（data-testid 稳定选择器；上传生成的小 docx/md；等待 SSE 卡片）。
 - [ ] **Step 3: 跑 E2E** 使用独立 `eztest_v02_e2e` 库、重建 `.tmp/p1/eztest.exe`、独立启动 fake LLM/API/Web；失败按 systematic-debugging 修。
 - [ ] **Step 4: 截图** 登录/需求空态/对话草案/批量确认/回退卡/设计 CTA → `.tmp/p1-acceptance/screenshots/`。
-- [ ] **Step 5: gated LLM 脚本** 只做语法/参数校验，不实际调用；handoff 记录未执行。
+- [ ] **Step 5: 真实 LLM 验收** 读取 `.env` DeepSeek v4.1 flash 配置，经 admin API 写 `llm_config`，跑“新对话→真实模型澄清→draft→确认”动线；日志 `.tmp/p1-acceptance/llm.log`；凭据缺失则停止并在 handoff 标 blocked，不以 fake 结果替代。
 - [ ] **Step 6: Lead 提交** `test(p1): add acceptance and e2e journeys`。
 
 ## Task 19: 独立评审（reviewer subagent / Lead）
@@ -570,7 +577,7 @@ export type Requirement = {...}
 - Modify: `docs/version-V0.2/README.md`? **不改**（设计文档）；只在 handoff 记录
 - Modify: `.tmp` 不提交
 
-**Interfaces:** handoff 必须含：完成范围、契约变更/冻结、迁移顺序、测试命令/结果、演示路径、已知缺口（.doc/.ppt、stale P2、真实 LLM、单实例、上下文估算）、P2 输入（需求版本/确认/stale 端口/design_scope 占位/工具预留）、风险。
+**Interfaces:** handoff 必须含：完成范围、契约变更/冻结、迁移顺序、测试命令/结果、演示路径、真实 LLM 验收结果（DeepSeek v4.1 flash）、已知缺口（.doc/.ppt、stale P2、单实例、上下文估算、P0 D6–D10 backlog）、P2 输入（需求版本/确认/stale 端口/design_scope 占位/工具预留）、风险。
 
 - [ ] **Step 1: 全量 gate** `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test.ps1`（Go 单测+集成、pnpm lint/typecheck/test）；日志 `.tmp/p1/final-gate.log`。
 - [ ] **Step 2: 生产构建** `cd frontend; pnpm build`；记录路由。
@@ -585,8 +592,8 @@ export type Requirement = {...}
 ## Self-Review
 
 **Spec coverage**（spec → task）
-- §3 迁移/表 → T1；§8 API → T10/T11/T13；§9 事件 → T5/T10/T11/T13；§4 任务板/租约/reconciler → T3/T4/T9；§5 runtime/context/tools → T6/T7/T8；§6 对话/需求/确认 → T10/T11；§7 附件 → T12；§10 前端 → T14–T17；§11 契约 → T2/T20；§13 测试 → 各任务 + T18/T20；§12 裁决 → 实现口径。
-- P1 验收 1–4 → T8/T10/T11/T9/T18；压力/overflow → T6/T8/T18。
+- §3 迁移/表 → T1；§8 API → T5（team room）/T10/T11/T13；§9 事件 → T5/T10/T11/T13；§4 任务板/租约/reconciler → T3/T4/T9；§5 runtime/context/tools → T6/T7/T8；§6 对话/需求/确认 → T10/T11；§7 附件 → T12；§10 前端 → T14–T17；§11 契约 → T2/T20；§13 测试 → 各任务 + T18/T20；§12 裁决 → 实现口径。
+- P1 验收 1–4 → T8/T10/T11/T9/T18；压力/overflow → T6/T8/T18；团队频道可演示 → T5/T16/T17；真实 LLM → T18/T20。
 - 五类 Review Focus → T2/T8/T6/T4/T10 + T19 独立评审。
 
 **Step scan**：每个 Step 是可执行动作/命令/断言；无 “TBD/处理边界/加适当测试”。测试步骤带具体测试名；实现步骤带文件与接口。Task 内部按 TDD：失败测试→跑失败→实现→跑通→提交（Lead 代提交）。
@@ -608,4 +615,5 @@ export type Requirement = {...}
 - T3–T9 是单条 runtime 流水线，串行依赖多；可并行 T5/T6/T7 缩短关键路径。
 - T10/T11 同属 version 上下文，必须一人串行写（backend-domain），避免 package 级冲突。
 - T12 PDF/docx/pptx 解析是本阶段最高不确定项；先做 fixture 与失败测试，若 PDF 库不可用则用最小自研解析并记录缺口（不阻塞其他任务）。
+- T18 真实 LLM 依赖 `.env` 的 DeepSeek 配置；当前 `.env` 只有 4 项 EzTest env，尚无 `DEEPSEEK_*`。实施期间可先跑 fake；验收前若仍缺失，按 blocked 报告，不得伪造。
 - T18 E2E 依赖本机 PostgreSQL/Playwright；若环境不满足，用集成测试 + API 验收替代并在 handoff 记录，不得伪造通过。

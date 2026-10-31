@@ -1,6 +1,6 @@
 # EzTest 0.2 P1 控制面 + 澄清 — 实施规格
 
-> 状态：implemented-ready（Lead 自审 + 无人值守验收代理）。日期：2026-10-31。
+> 状态：用户已审核批准（2026-10-31）。执行口径：全部按推荐；附件支持现代 docx/pptx + 旧 .doc/.ppt 明确失败；`Event.seq`/`snapshot_cursor` 修代码为整数；版本 running 由首条对话消息/首个需求/首次确认触发；团队频道补只读 API + 面板；Markdown 用 `react-markdown`；真实 LLM 使用 `.env` 中的 DeepSeek v4.1 flash（仅验收脚本读取，API 仍严格 4 项 env）。
 > 阶段：P1（控制面 + 澄清）。阶段文件：`docs/version-V0.2/phases/phase-01-runtime-clarification.md`。
 > 前置 handoff：`docs/version-V0.2/phases/phase-00-handoff.md`（P0 completed）。
 > 计划：`docs/superpowers/plans/2026-10-31-eztest-v02-p1-runtime-clarification.md`。
@@ -24,7 +24,7 @@
 - 澄清页主 UI 是 AI 对话，辅 UI 是需求列表/编辑器；用户单条/批量确认；AI 可提议回退（D16–D18，HLD §6.3/§8）。
 - 附件支持 doc/pdf/md/ppt，解析为文本/图片引用（phase-01；D48）。
 - 团队频道摘要：每 20 条或 10 分钟生成，保留最近 N 版；帖子全量审计；不全文回放（OD-9，settings `team_room.*`）。
-- 版本状态只是投影：`initial → running` 由首个需求/对话/确认触发；P1 不写 `completed`（HLD §2.4/§6.7）。
+- 版本状态只是投影：`initial → running` 由首个对话消息/首个需求/首次确认触发；P1 不写 `completed`（HLD §2.4/§6.7）。
 - P1 新配置只能进 DB 设置中心；`.env` 严格 4 项（D49/D50）。
 
 ## 1. 目标与退出标准
@@ -42,7 +42,7 @@
 
 **不在 P1**
 - 设计/脑图/场景/用例/design_scope/design.round（P2）；执行/波次/意图（P3）；交付/问题/报告/链路（P4+）；代码智能/视觉/质量/搜索/待办/Agent 中心（P5/P6）；P9。
-- 0.1 数据迁移；多副本部署编排（P7）；真实 LLM 强制验收（提供 gated 路径）。
+- 0.1 数据迁移；多副本部署编排（P7）；0.2 全量 E2E/性能/SLO（P8）。真实 LLM 验收在 P1 必跑：使用 `.env` 的 DeepSeek v4.1 flash 配置，由验收脚本经 admin API 写入 `llm_config`；API 进程仍只读严格 4 项 EzTest env。
 - 通用 `Idempotency-Key` 中间件（P1 的确认/消息用自然幂等 + 唯一约束；handoff 记录）。
 
 ## 2. 实施策略与仓库边界
@@ -60,7 +60,7 @@
 
 ### 3.1 `agent_0001_work_item.sql`
 `work_item`：
-`id BIGINT PK`、`version_id BIGINT NOT NULL`、`team TEXT NOT NULL`、`type TEXT NOT NULL`、`status TEXT NOT NULL DEFAULT 'open'`（CHECK 7 态：open/claimed/running/waiting_human/done/failed/dead；P1 只写前六类 + failed/dead）、`priority INT NOT NULL DEFAULT 0`、`dedupe_key TEXT NOT NULL`、`depends_on BIGINT NULL`、`payload JSONB NOT NULL DEFAULT '{}'`、`claimed_by TEXT NULL`、`lease_until TIMESTAMPTZ NULL`、`lease_epoch BIGINT NOT NULL DEFAULT 0`、`attempts INT NOT NULL DEFAULT 0`、`max_attempts INT NOT NULL DEFAULT 3`、`last_error TEXT NULL`、`available_at TIMESTAMPTZ NOT NULL DEFAULT now()`、`created_at/updated_at`。
+`id BIGINT PK`、`version_id BIGINT NOT NULL`、`team TEXT NOT NULL`、`type TEXT NOT NULL`、`status TEXT NOT NULL DEFAULT 'open'`（CHECK 7 态：open/claimed/running/waiting_human/done/failed/dead；P1 只写 open/claimed/running/done/failed/dead，不写 waiting_human）、`priority INT NOT NULL DEFAULT 0`、`dedupe_key TEXT NOT NULL`、`depends_on BIGINT NULL`、`payload JSONB NOT NULL DEFAULT '{}'`、`claimed_by TEXT NULL`、`lease_until TIMESTAMPTZ NULL`、`lease_epoch BIGINT NOT NULL DEFAULT 0`、`attempts INT NOT NULL DEFAULT 0`、`max_attempts INT NOT NULL DEFAULT 3`、`last_error TEXT NULL`、`available_at TIMESTAMPTZ NOT NULL DEFAULT now()`、`created_at/updated_at`。
 约束/索引：`uk_work_item_dedupe UNIQUE(version_id, type, dedupe_key)`；`idx_work_item_claim (status, available_at, priority DESC, id)`；`idx_work_item_lease (status, lease_until)`；`idx_work_item_version (version_id, status, id)`。
 
 `work_item_attempt`：`id BIGINT PK`、`work_item_id BIGINT NOT NULL REFERENCES work_item(id)`、`attempt INT NOT NULL`、`status TEXT NOT NULL`、`error TEXT NULL`、`started_at`、`finished_at`；`UNIQUE(work_item_id, attempt)`；索引 `idx_work_item_attempt_item (work_item_id, id)`。
@@ -113,7 +113,7 @@
 
 ### 4.3 Reconciler（P1 规则）
 每 3s 扫描（常量，落在设计 2–5s）；只做 ensure，不执行业务动作：
-1. 版本投影：存在 conversation 或 requirement 且 `version.status='initial'` → `running`，事件 `version.status_changed`。
+1. 版本投影：存在至少一条 `conversation_message` 或存在 requirement 或存在确认，且 `version.status='initial'` → `running`，事件 `version.status_changed`。仅创建空 conversation 不触发。
 2. 对话开场：conversation 无任何消息且无 open/claimed/running/done 的 opening 任务 → ensure `chat.turn`（dedupe `opening:{conversation_id}`，payload `{conversation_id, trigger:"opening"}`）。
 3. 用户消息回复：存在用户消息且其后（按 id）无 assistant 回复、无 open/claimed/running/done 的对应 `chat.turn` → ensure（dedupe `reply:{message_id}`，payload `{conversation_id,message_id,trigger:"user_message"}`）。
 4. 需求抽取：存在用户消息且无 open/claimed/running/done 的 `requirement.curate` → ensure（dedupe `curate:{message_id}`，payload `{conversation_id,message_id}`）。若该消息后已有 Curator 产生的 assistant 消息，则不再 ensure（查询 `conversation_message.agent_run_id` 关联 profile）。
@@ -123,6 +123,7 @@
 ### 4.4 团队频道与摘要
 - `TeamRoomService.Post(ctx, Post)` 写 `team_room_post` 并发布 `team_room.post`；`refs` 是结构化引用数组（`{kind,id}`）。
 - 摘要触发：插入后统计“自上次 digest 以来的帖子数 ≥ `team_room.digest_every_n_posts`（20）”或“最近 digest 超过 `digest_interval_minutes`（10）分钟”；生成确定性摘要（按 kind 分组、保留 decision/blocker 为 pinned，截断每条），写新 `team_room_digest.version+1`；保留最近 `digest_keep_versions`（5）版，删除更旧。
+- 只读 API：`GET /api/versions/{id}/team-rooms/{team}?limit=`（登录用户；team 枚举 `clarification/design/execution/delivery/steward`）返回 `{data:{team,digest,posts}}`；P1 前端在需求页展示澄清团队摘要/最近帖子（折叠面板），不提供发帖/自由聊天控制面。
 - 频道不触发 Agent；人类 `@` 不在 P1 实现（P2+）。
 
 ## 5. Agent runtime、上下文与工具
@@ -199,7 +200,7 @@ P1 工具：
 - AI 不可确认、不可删除、不可直接改 clarified；只能 draft_create/draft_update（draft）、relation_propose、reopen_propose。
 - 回退：用户确认后，复制当前版本字段生成新 draft revision，status=draft；事件 `requirement.rolled_back` + `requirement.version_created`；调用 P2 stale 钩子（P1 空实现）并携带 `affected_case_version_ids`。
 - 关系：同版本、非自环、kind 合法、唯一；AI 提议落库为候选（无独立确认 UI）。
-- 版本投影：首次 conversation/requirement/confirmation 将 version `initial → running`；P1 不写 completed。
+- 版本投影：首条对话消息（user 或 assistant）/首个 requirement/首次确认将 version `initial → running`；仅创建空 conversation 不触发；P1 不写 completed。
 
 ### 6.2 对话与消息
 - 创建 conversation（P1 只 clarification）：标题默认 `需求澄清 YYYY-MM-DD HH:mm`，1–120 字；创建 opening 任务。
@@ -246,7 +247,12 @@ P1 工具：
 
 `GET /api/versions/{id}` 增量返回 `requirement_counts{total,draft,clarified,closed,obsolete}`、`conversation_count`、`pending_design_count`（=clarified 且无 design_scope 的占位计数；P1 直接=clarified 数）。P1 不新增设计 API。
 
-### 8.3 错误码
+### 8.3 团队频道（只读）
+| 方法/路径 | 说明 |
+|---|---|
+| `GET /api/versions/{id}/team-rooms/{team}?limit=` | 登录用户；返回 `{data:{team,digest:{summary,pinned_post_ids,token_estimate,version,updated_at}|null,posts:[{id,kind,content,refs,agent_run_id,created_at}]}}`；`limit` 1–100 默认 20，按 id desc；P1 不提供发帖/自由聊天 API |
+
+### 8.4 错误码
 `invalid_argument`（400）、`unauthenticated`（401）、`forbidden`（403）、`not_found`（404）、`state_conflict`（409，如确认非法状态/已确认版本再编辑）、`lease_lost`（409）、`ai_unavailable`（503）、`context_overflow`（503，仅不可恢复）、`unsupported_attachment_format`/`extraction_failed`（422，仅作为附件 `extraction_error.code` 返回，消息 POST 本身仍 201）。错误 details 带 `field`/`requirement_id`/`attachment_id` 便于 UI 定位。`platform` 增加上述稳定 reason 常量，HTTP 状态映射沿用 P0 信封。
 
 ## 9. 事件（P1 追加；详见 contracts/events.md）
@@ -265,7 +271,8 @@ P1 工具：
 - `RequirementSidebar`：计数/状态过滤、复选框批量选择、批量确认、需求列表（标题/状态/优先级/target chips）、`RequirementEditor`（标题/描述/验收/优先级/目标 version_sut+页面+API 多选；保存→PATCH；确认→POST；已澄清显示回退提示）、`DesignCTA`（已澄清数>0 时显示 “N 条需求待设计，P2 提供设计对话” 占位）。
 - `RollbackCard`：显示 AI 提议原因 + “确认回退/暂不处理”；确认调用 rollback API。
 - `AttachmentUploader`：文件 ≤10MiB；上传 `POST /api/content`；上传中/失败状态；随消息发送。
-- `RichText`：安全渲染段落/换行/粗体/行内代码/列表/标题/链接（自实现，禁 HTML 注入；不引入新依赖）。
+- `RichText`：用 `react-markdown` + `remark-gfm` 渲染 Markdown（禁用 raw HTML，链接安全属性）；不自行实现解析器。
+- `TeamRoomPanel`：需求页折叠面板，读取只读团队频道 API，展示澄清团队最新摘要 + 最近帖子（只读，无发帖/控制入口）。
 - 错误统一 `ErrorState`/内联提示；发送/确认/保存防重复点击；SSE 断线由 sse-client 自动重连。
 - 版本详情其他 Tab 的占位文案按真实阶段修正（设计 P2、执行 P3、链路/问题/报告 P4、代码 P5）。
 - 测试：api/types 单测；ChatPanel/Composer/attachment、RequirementSidebar/Editor、RollbackCard、DesignCTA、SSE 合并、批量确认、错误态；Playwright 旅程。
@@ -280,7 +287,7 @@ P1 结束冻结：
 - `contracts/agent-profiles-tools.md`（新建）：P1 profile、工具、scope 注入、schema、提交校验；P2+ 工具标 reserved。
 - `contracts/settings.md`：P1 不新增 env/设置键；记录 P1 消费的键（context/agent/team_room/llm）。
 - P0 漂移：openapi 的 LLM list envelope/状态码按实现修正（非破坏性、文档与客户端一致）；`eventing_0002` 补 `(channel,created_at)` 索引；`ResetPasswordRequest` 已对齐不再改；SSE `GET /api/stream` 补发契约要求的 `X-Snapshot-Cursor` 头（不改帧协议/游标语义）；`version_sut.scope` 在 DB 存数字 ID、API 用字符串，P1 requirement target 校验统一转 int64。
-- **P0 额外漂移（研究发现，P1 处理边界）**：`Event.seq`/`snapshot_cursor` 线上为字符串而契约写整数（D4，**待用户裁决**：修代码为整数 or 修契约为字符串）；`auth.login/login_failed/logout`、`user.created/updated` 文档有事件但未发（D6）；未知字段“忽略”文档与 handler 拒绝不一致（D7）；settings 范围/secret PATCH 语义与文档不一致（D8）；`payload_too_large` 未列入稳定错误码（D9）；settings audit/event 顺序（D10）。D6–D10 不在 P1 修，登记 handoff backlog；D11 已在 §3/§12.1 收口。
+- **P0 额外漂移（研究发现，P1 处理边界）**：`Event.seq`/`snapshot_cursor` 线上为字符串而契约写整数（D4，**用户已裁决：修代码为整数**，T13 同步 DTO/测试/前端类型）；`auth.login/login_failed/logout`、`user.created/updated` 文档有事件但未发（D6）；未知字段“忽略”文档与 handler 拒绝不一致（D7）；settings 范围/secret PATCH 语义与文档不一致（D8）；`payload_too_large` 未列入稳定错误码（D9）；settings audit/event 顺序（D10）。D6–D10 不在 P1 修，登记 handoff backlog；D11 已在 §3/§12.1 收口。
 - **Agent 审计归属**：`audit_log` 不改 schema；agent/后台写操作 `actor_id=0`（系统），`metadata.agent_run_id/work_item_id` 记录来源；事件 scope 带 `agent_run_id`。
 - **冻结标记**：openapi 使用文件级 `x-frozen: P1`；其他 contract 文件用顶部状态 `frozen: P1`，P0 的 `x-frozen: P0` 保留在历史段落。
 - P0 集成测试期望随 P1 增量更新（迁移数量/表清单、version 频道事件数量、版本详情 fields）；这是测试期望更新，不改变 P0 行为；更新时保留原断言意图并新增 P1 断言。
@@ -303,11 +310,11 @@ P1 结束冻结：
 | P1-D11 | 聊天不做 token 级流式；用 `agent.activity` + 完整消息事件 | P1 不要求 token streaming；降低复杂度 |
 | P1-D12 | P1 stale 只调用端口 + 发事件（affected 为空），P2 接 case 表 | 不提前建 P2 表；phase-01 “P2 消费” |
 | P1-D13 | 旧版本 `.doc/.ppt` 拒绝；PDF 文本提取限简单文本；扫描件不做 OCR | 无外部工具/不引入重依赖；handoff 风险 |
-| P1-D14 | 前端 Markdown 用自实现安全子集，不新增依赖 | 避免新增 npm 依赖与 XSS；满足段落/粗体/代码/列表 |
+| P1-D14 | 前端 Markdown 用 `react-markdown` + `remark-gfm`（禁 raw HTML） | 满足 D48 完整 Markdown；避免自研解析器边界/XSS 风险；新增依赖由 Lead 显式安装并锁版本 |
 | P1-D15 | 版本详情增量字段 `pending_design_count` 占位 | P2 design_scope 前提供 CTA；不实现设计 |
 | P1-D16 | P1 确认不使用通用 Idempotency-Key，靠唯一约束/自然幂等 | P0 已记录缺口；确认场景已幂等 |
 | P1-D17 | P0 三个契约漂移按实现修正/补索引 | P0 handoff §2 指定 P1 收口 |
-| P1-D18 | 真实 LLM 只提供 gated 脚本，不纳入必跑验收 | 无凭据/成本；fake LLM 确定性验收 |
+| P1-D18 | 真实 LLM 验收必跑（DeepSeek v4.1 flash） | 用户已授权读取 `.env`；验收脚本经 admin API 配置 `llm_config`；API 仍严格 4 项 env；凭据缺失则阻塞并报告，不伪造 |
 
 ### 12.1 文档冲突与缺口的落地裁决（不修改设计文档，写入 handoff）
 
@@ -329,7 +336,7 @@ P1 结束冻结：
 | Q14 | draft 编辑语义 | 所有编辑生成新不可变 revision（draft→draft revision+1）；clarified 编辑同时 status→draft；确认后不可再改该 revision |
 | Q16 | chat.turn vs clarify.turn | 用 HLD/phase-01 的 `chat.turn`；`clarify.turn` 不创建 |
 | Q17 | 迁移示例 clarification_session | 不采用；按设计表 `conversation`，迁移名 `agent_0001/0002/0003`、`version_0002/0003/0004`、`eventing_0002` |
-| Q18 | 版本投影归属 | version service 在首个 conversation/requirement/confirmation 时写 running；reconciler 兜底修正；P1 不写 completed |
+| Q18 | 版本投影归属 | version service 在首条对话消息/首个 requirement/首次确认时写 running；reconciler 兜底修正；P1 不写 completed |
 | Q19 | reconciler 多实例/设置 | P1 单实例（与 P0 Hub 一致）；3s 常量扫描；P7 再做 leader election/多副本 |
 | Q20 | design 待办占位数据源 | `pending_design_count = 已澄清需求数`（P1 无 design_scope）；UI 只显示 CTA 占位，不建设计任务 |
 | Q21 | Idempotency-Key | P1 不建 `idempotency_key` 表；确认/消息用唯一约束与状态幂等；通用中间件留 handoff |
@@ -343,7 +350,7 @@ P1 结束冻结：
 | — | work_item 状态数 | 按设计 7 态（含 `waiting_human`）；P1 只写 open/claimed/running/done/failed/dead，不写 waiting_human |
 | — | agent 审计 | `audit_log.actor_id=0`（系统）+ metadata `agent_run_id/work_item_id`；不改 P0 audit schema |
 | — | 冻结标记 | openapi 文件级 `x-frozen: P1`；其他契约文件顶部 `frozen: P1` |
-| D4 | Event.seq 线上字符串 vs 契约整数 | **待用户裁决**（见 §11）：P1 默认不在本轮改 P0 行为，若裁决修代码则 T13 同步 DTO/测试/前端类型 |
+| D4 | Event.seq 线上字符串 vs 契约整数 | **用户裁决：修代码为整数**；T13 同步 event DTO/handler 测试/前端类型；契约保持整数 |
 
 ## 13. 测试与验收计划
 
@@ -355,7 +362,7 @@ P1 结束冻结：
 | E2E | fake LLM：登录→版本→新建对话→AI 回复→draft 需求→编辑→确认→批量确认→回退→附件上传→设计 CTA；无 console error | `scripts/p1-e2e.ps1` |
 | API 验收 | 不依赖浏览器：任务板并发/恢复、对话/需求/确认/回退/SSE/附件 | `scripts/p1-acceptance.ps1` |
 | 压力 | 200 条消息 + 大附件 + 摘要保留关键事实；任务 50 并发领取无重复 | `go test -tags=integration ./internal/agent/... ./internal/version/... -run 'Stress|Concurrent'` |
-| 真实 LLM | gated：`EZTEST_ACCEPTANCE_LLM=1` 时执行；不跑则 handoff 记录未执行 | `scripts/p1-acceptance-llm.ps1` |
+| 真实 LLM | **必跑**：读取 `.env` 非 EzTest 键 `DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL`（默认 `https://api.deepseek.com`）、`DEEPSEEK_MODEL`（默认 `deepseek-v4.1-flash`）；脚本经 admin API 写 `llm_config` 后跑澄清闭环；API 不读这些键 | `scripts/p1-acceptance-llm.ps1` + `.tmp/p1-acceptance/llm.log` |
 
 **验收清单（映射 phase-01）**
 - [ ] 新对话 → Host 读上下文/附件 → Host 回复 + Curator draft 需求。
@@ -363,7 +370,8 @@ P1 结束冻结：
 - [ ] 并发领取不重复；租约过期恢复；旧 epoch 写回 409；重复扫描不重复任务。
 - [ ] 上下文压缩保留 pinned/最近窗口/任务约束；`context_overflow` 场景不失败。
 - [ ] 附件 md/txt/docx/pptx/pdf 解析；损坏/不支持格式可解释失败。
-- [ ] 版本 initial→running；requirements Tab、SSE、CTA 可见。
+- [ ] 版本 initial→running（首条消息/首个需求/首次确认）；requirements Tab、SSE、CTA、团队频道只读面板可见。
+- [ ] 真实 LLM DeepSeek v4.1 flash 验收通过（`.env` 凭据缺失则 handoff 标 blocked，不以 fake 结果替代）。
 - [ ] `scripts/test.ps1` 全绿；E2E/验收通过；契约冻结；handoff 完成。
 
 ## 14. 风险与已知缺口（写入 handoff）
@@ -371,6 +379,6 @@ P1 结束冻结：
 2. 旧 `.doc/.ppt`、扫描 PDF、图片视觉理解不在 P1；现代 OOXML/文本 PDF 覆盖主路径。
 3. P1 单实例 Hub/worker；多副本 lease/fencing 原语保留，完整部署 P7。
 4. stale 只到端口/事件，P2 接 case 表后才能端到端验证“用例 stale”。
-5. 真实 LLM 未跑；fake LLM 只覆盖脚本化工具调用，不能证明真实模型质量。
+5. 真实 LLM 验收使用 DeepSeek v4.1 flash；若 `.env` 缺少 `DEEPSEEK_API_KEY`，验收阻塞并在 handoff 明确，不以 fake LLM 结果冒充真实模型质量。
 6. 任务板无公开 API/UI；P6 Agent 中心再暴露；P1 靠测试与数据验证。
 7. P0 开发库含冒烟数据；P1 演示用独立库/清库重跑，避免名称冲突。
