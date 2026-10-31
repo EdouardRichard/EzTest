@@ -10,8 +10,8 @@ func TestOrderCoversEverySQLFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("orderedMigrations: %v", err)
 	}
-	if len(migrations) != 15 {
-		t.Fatalf("len = %d, want 15", len(migrations))
+	if len(migrations) != 17 {
+		t.Fatalf("len = %d, want 17", len(migrations))
 	}
 	for _, item := range migrations {
 		if !strings.HasSuffix(item.Name, ".sql") {
@@ -27,7 +27,7 @@ func TestOrderCoversEverySQLFile(t *testing.T) {
 	if migrations[0].Name != "settings_0001_settings.sql" {
 		t.Fatalf("first migration = %q", migrations[0].Name)
 	}
-	if migrations[len(migrations)-1].Name != "eventing_0002_event_index.sql" {
+	if migrations[len(migrations)-1].Name != "storage_0002_export_artifact.sql" {
 		t.Fatalf("last migration = %q", migrations[len(migrations)-1].Name)
 	}
 }
