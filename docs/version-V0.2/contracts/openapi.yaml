@@ -1,6 +1,6 @@
 openapi: 3.0.3
 info:
-  title: EzTest 0.2 API 契约（P0 冻结 + P1 增量）
+  title: EzTest 0.2 API 契约（P0 冻结 + P1 冻结 + P2 增量）
   version: 0.2.0-p2
   description: |
     EzTest 0.2 P0（平台底座）对外 REST/SSE 契约，来源：
@@ -4934,7 +4934,7 @@ components:
           format: date-time
     DesignScenario:
       type: object
-      required: [id, requirement_version_id, name, description, version_sut_ids, page_ids, api_ids, sort_order, cases]
+      required: [id, requirement_version_id, name, description, version_sut_ids, page_ids, api_ids, sort, cases]
       properties:
         id:
           type: string
@@ -4961,7 +4961,7 @@ components:
           items:
             type: string
             pattern: '^[0-9]+$'
-        sort_order:
+        sort:
           type: integer
           minimum: 0
         cases:
@@ -5078,7 +5078,7 @@ components:
           pattern: '^[0-9]+$'
     DesignSource:
       type: object
-      required: [kind, ref_id, path, line_no, sha]
+      required: [kind, ref_id, path, line, sha]
       properties:
         kind:
           type: string
@@ -5087,7 +5087,7 @@ components:
           type: string
         path:
           type: string
-        line_no:
+        line:
           type: integer
           nullable: true
           minimum: 1

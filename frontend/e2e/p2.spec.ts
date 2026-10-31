@@ -195,7 +195,9 @@ test("P2 design workspace: conversation, live mindmap, case detail, confirm and 
   await expect(page.getByTestId("export-status")).toBeVisible({ timeout: 30_000 })
 
   // Evidence screenshots.
-  const screenshotDir = path.resolve(process.cwd(), "..", ".tmp", "p2-acceptance", "screenshots")
+  const screenshotDir =
+    process.env.EZTEST_E2E_SCREENSHOT_DIR?.trim() ||
+    path.resolve(process.cwd(), "..", ".tmp", "p2-acceptance", "screenshots")
   fs.mkdirSync(screenshotDir, { recursive: true })
   await page.screenshot({ path: path.join(screenshotDir, "design-workspace.png"), fullPage: true })
   await page.getByTestId("case-detail").screenshot({

@@ -226,9 +226,13 @@ func (f *fakeRepo) ReadCase(_ context.Context, versionID, caseID int64, caseVers
 	if !ok {
 		return design.CaseData{}, design.ErrNotFound
 	}
+	scenario := design.Scenario{ID: item.entity.ScenarioID}
+	if stored, ok := f.scenarioByID(item.entity.ScenarioID); ok {
+		scenario = stored
+	}
 	data := design.CaseData{
 		Case:        item.entity,
-		Scenario:    design.Scenario{ID: item.entity.ScenarioID},
+		Scenario:    scenario,
 		Requirement: f.requirement,
 	}
 	if item.current != nil {
@@ -277,6 +281,14 @@ func (f *fakeRepo) sortedCases() []*fakeCase {
 // fakeTx applies proposal writes to the in-memory repository.
 type fakeTx struct {
 	repo *fakeRepo
+}
+
+func (t *fakeTx) CurrentGraphHash(ctx context.Context) (string, error) {
+	graph, err := t.repo.ReadGraph(ctx, t.repo.version.VersionID)
+	if err != nil {
+		return "", err
+	}
+	return design.ComputeGraphHash(graph.Requirements)
 }
 
 func (t *fakeTx) RequirementSnapshot(_ context.Context, versionID, requirementID, requirementVersionID int64) (design.RequirementSnapshot, error) {

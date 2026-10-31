@@ -135,6 +135,21 @@ func TestValidateProposalRejectsBadAssertionStep(t *testing.T) {
 	assertInvalidArgument(t, ValidateProposal(in, validProposalContext()))
 }
 
+func TestValidateProposalRejectsInheritedStepTargetMismatch(t *testing.T) {
+	in := validProposal()
+	// Step 1 has no explicit target, so it inherits default 9001; page 6002
+	// belongs to version_sut 9002.
+	in.Cases[0].Steps[0].TargetPageID = int64Ptr(6002)
+	assertInvalidArgument(t, ValidateProposal(in, validProposalContext()))
+}
+
+func TestValidateProposalRejectsAssertionOutsideStepTarget(t *testing.T) {
+	in := validProposal()
+	// Step 1 resolves to default 9001; its assertion API 4001 belongs to 9002.
+	in.Cases[0].Assertions[0].TargetAPIID = int64Ptr(4001)
+	assertInvalidArgument(t, ValidateProposal(in, validProposalContext()))
+}
+
 func TestValidateProposalRejectsCrossSUTPageTarget(t *testing.T) {
 	in := validProposal()
 	// Page 6002 belongs to version_sut 9002, but the step declares 9001.

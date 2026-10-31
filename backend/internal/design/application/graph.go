@@ -144,7 +144,12 @@ func (s *GraphService) GetCase(ctx context.Context, versionID, caseID int64, cas
 		ScenarioName:         data.Scenario.Name,
 		Versions:             make([]CaseVersionSummaryView, 0, len(data.Versions)),
 		Selected:             caseVersionDetailView(data.Selected),
-		Confirmable:          data.Selected.Status == design.CaseStatusDraft && data.Case.Status == design.CaseStatusDraft,
+		Confirmable: data.Selected.ID > 0 &&
+			data.Case.CurrentVersionID != nil &&
+			data.Selected.ID == *data.Case.CurrentVersionID &&
+			data.Selected.Status == design.CaseStatusDraft &&
+			data.Case.Status == design.CaseStatusDraft &&
+			data.Scenario.RequirementVersionID == data.Requirement.CurrentVersionID,
 	}
 	for _, version := range data.Versions {
 		summary := CaseVersionSummaryView{
@@ -253,6 +258,15 @@ func (s *GraphService) Propose(ctx context.Context, versionID int64, in ProposeI
 		if err != nil {
 			return err
 		}
+		if baseHash := strings.TrimSpace(in.BaseGraphHash); baseHash != "" {
+			lockedHash, err := tx.CurrentGraphHash(ctx)
+			if err != nil {
+				return err
+			}
+			if lockedHash != baseHash {
+				return platform.StateConflict("the design graph changed since it was read; re-read the graph and retry")
+			}
+		}
 		scenarioByID := make(map[int64]design.Scenario, len(snapshot.Scenarios))
 		scenarioByKey := make(map[string]design.Scenario, len(snapshot.Scenarios))
 		for _, scenario := range snapshot.Scenarios {
@@ -266,6 +280,9 @@ func (s *GraphService) Propose(ctx context.Context, versionID int64, in ProposeI
 			if item.Current != nil {
 				caseByKey[design.CaseNaturalKey(item.Case.ScenarioID, item.Current.Title)] = item
 			}
+		}
+		if err := checkAccumulatedLimits(in, snapshot, scenarioByKey, caseByKey); err != nil {
+			return err
 		}
 
 		scenarioIDs := make(map[string]int64, len(in.Scenarios))
@@ -655,4 +672,57 @@ func formatIDList(ids []int64) []string {
 		values = append(values, platformid.Format(id))
 	}
 	return values
+}
+
+// checkAccumulatedLimits enforces the per-requirement version caps (P2-D-18)
+// inside the proposal transaction. Only genuinely new scenarios/cases count;
+// updates addressed by ID or natural key do not consume additional slots.
+func checkAccumulatedLimits(
+	in ProposeInput,
+	snapshot design.RequirementSnapshot,
+	scenarioByKey map[string]design.Scenario,
+	caseByKey map[string]design.CaseWithCurrent,
+) error {
+	limits := design.DefaultLimits.Effective()
+	newScenarios := 0
+	scenarioIDsByRef := make(map[string]int64, len(in.Scenarios))
+	for _, scenarioInput := range in.Scenarios {
+		var existing design.Scenario
+		found := false
+		if scenarioInput.ID != nil {
+			for _, scenario := range snapshot.Scenarios {
+				if scenario.ID == *scenarioInput.ID {
+					existing, found = scenario, true
+					break
+				}
+			}
+		} else {
+			existing, found = scenarioByKey[design.ScenarioNaturalKey(in.RequirementVersionID, scenarioInput.Name)]
+		}
+		if found {
+			scenarioIDsByRef[scenarioInput.Ref] = existing.ID
+		} else {
+			newScenarios++
+		}
+	}
+	newCases := 0
+	for _, caseInput := range in.Cases {
+		if caseInput.ID != nil {
+			continue
+		}
+		scenarioID, existingScenario := scenarioIDsByRef[caseInput.ScenarioRef]
+		if existingScenario {
+			if _, found := caseByKey[design.CaseNaturalKey(scenarioID, caseInput.Title)]; found {
+				continue
+			}
+		}
+		newCases++
+	}
+	if len(snapshot.Scenarios)+newScenarios > limits.MaxScenariosPerRequirement {
+		return platform.StateConflict("the requirement has reached its scenario limit")
+	}
+	if len(snapshot.Cases)+newCases > limits.MaxCasesPerRequirement {
+		return platform.StateConflict("the requirement has reached its case limit")
+	}
+	return nil
 }
