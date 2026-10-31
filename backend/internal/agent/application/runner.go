@@ -437,7 +437,7 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 	state.model = modelInfo
 	state.input.ModelBudget = ModelBudget{ContextWindow: modelInfo.ContextWindow, MaxOutput: modelInfo.MaxOutput}
 	state.input.Profile = state.profile
-	state.input.Task = r.taskContext(state)
+	state.input.Task = r.taskContext(ctx, state)
 	state.input.Artifacts = artifactRefs(state)
 
 	attachmentText := ""
@@ -457,7 +457,7 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 		})
 	}
 
-	state.registry = tools.NewP3Registry(r.toolDepsForRun(state))
+	state.registry = tools.NewP4Registry(r.toolDepsForRun(state))
 	state.definitions = state.registry.Definitions(state.profile.AllowedTools)
 
 	packet, compactInfo, err := r.builder.Build(ctx, state.input)
@@ -1021,7 +1021,7 @@ func (r *Runner) toolDepsForRun(state *runState) tools.Deps {
 	}
 	task := state.input.Task
 	deps.TaskPack = func(context.Context, tools.Scope) (any, error) {
-		return taskPackResult(versionID, state.payload.ConversationID, state.run.ID, task, state.input.Execution), nil
+		return taskPackResult(versionID, state.payload.ConversationID, state.run.ID, task, state.input.Execution, state.input.P4Task), nil
 	}
 	deps.TeamRoomRead = func(ctx context.Context, scope tools.Scope, maxPosts int) (any, error) {
 		room := r.teamRoomContext(ctx, scope.VersionID, state.team)
@@ -1066,7 +1066,7 @@ func (r *Runner) toolDepsForRun(state *runState) tools.Deps {
 	return deps
 }
 
-func (r *Runner) taskContext(state *runState) TaskContext {
+func (r *Runner) taskContext(ctx context.Context, state *runState) TaskContext {
 	scope := []string{
 		"version_id=" + idText(state.item.VersionID),
 		"work_item_id=" + idText(state.item.ID),
@@ -1206,6 +1206,12 @@ func (r *Runner) taskContext(state *runState) TaskContext {
 			Scope:              scope,
 		}
 	default:
+		// P4 domains register their task-context providers from init hooks. When
+		// one claims the type, its JSON-ready payload is rendered by
+		// context.task_pack; the P3 switch above owns the P1/P2/P3 descriptions.
+		if details, ok := p4TaskDetails(ctx, state.item); ok {
+			state.input.P4Task = details
+		}
 		return TaskContext{Type: state.item.Type, Scope: scope}
 	}
 }
@@ -1455,7 +1461,7 @@ func versionPackResult(pack VersionPack) map[string]any {
 	}
 }
 
-func taskPackResult(versionID, conversationID, runID int64, task TaskContext, execution *ExecutionTask) map[string]any {
+func taskPackResult(versionID, conversationID, runID int64, task TaskContext, execution *ExecutionTask, p4Task any) map[string]any {
 	result := map[string]any{
 		"version_id":          idText(versionID),
 		"conversation_id":     idText(conversationID),
@@ -1468,6 +1474,9 @@ func taskPackResult(versionID, conversationID, runID int64, task TaskContext, ex
 	}
 	if execution != nil {
 		result["execution"] = executionTaskResult(*execution)
+	}
+	if p4Task != nil {
+		result["p4_task"] = p4Task
 	}
 	return result
 }
@@ -1624,8 +1633,9 @@ func artifactRefs(state *runState) []ArtifactRef {
 }
 
 // teamForProfile selects the collaboration channel: design profiles use the
-// design team room, P3 execution profiles use the execution team room, every P1
-// profile keeps the clarification team room.
+// design team room, P3 execution profiles use the execution team room, P4
+// delivery profiles use the delivery room, the P4 steward uses the steward
+// room, and every P1 profile keeps the clarification team room.
 func teamForProfile(profileKey string) agent.Team {
 	switch profileKey {
 	case ProfileKeyDesignHost, ProfileKeyDesignPlanner, ProfileKeyCaseAuthor,
@@ -1633,6 +1643,10 @@ func teamForProfile(profileKey string) agent.Team {
 		return agent.TeamDesign
 	case ProfileKeyCaseExecutor, ProfileKeyFailureAnalyst, ProfileKeyCoverageAnalyst:
 		return agent.TeamExecution
+	case ProfileKeyIssueTriager, ProfileKeyReportWriter:
+		return agent.TeamDelivery
+	case ProfileKeyVersionSteward:
+		return agent.TeamSteward
 	default:
 		return agent.TeamClarification
 	}

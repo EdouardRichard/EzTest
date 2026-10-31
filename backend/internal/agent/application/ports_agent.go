@@ -110,7 +110,7 @@ type ContentWriter interface {
 }
 
 // ProfileKeyForWorkType maps a work item type to its profile (P1 spec §4.2 /
-// P2 spec §5.1).
+// P2 spec §5.1; the P3/P4 increments reuse the same switch).
 func ProfileKeyForWorkType(workType string) (string, bool) {
 	switch workType {
 	case WorkTypeChatTurn:
@@ -133,6 +133,12 @@ func ProfileKeyForWorkType(workType string) (string, bool) {
 		return ProfileKeyFailureAnalyst, true
 	case WorkTypeAnalyzeCoverage:
 		return ProfileKeyCoverageAnalyst, true
+	case WorkTypeIssueTriage:
+		return ProfileKeyIssueTriager, true
+	case WorkTypeReportWave, WorkTypeReportVersion:
+		return ProfileKeyReportWriter, true
+	case WorkTypeRequirementClose, WorkTypeVersionClose:
+		return ProfileKeyVersionSteward, true
 	default:
 		return "", false
 	}
@@ -173,6 +179,15 @@ const (
 	WorkTypeExecuteCase     = "execute.case"
 	WorkTypeAnalyzeFailure  = "analyze.failure"
 	WorkTypeAnalyzeCoverage = "analyze.coverage"
+)
+
+// P4 delivery/closure work item types (contracts/task-types.md P4 increment).
+const (
+	WorkTypeIssueTriage      = "issue.triage"
+	WorkTypeReportWave       = "report.wave"
+	WorkTypeReportVersion    = "report.version"
+	WorkTypeRequirementClose = "requirement.close"
+	WorkTypeVersionClose     = "version.close"
 )
 
 // WorkItemPayload is the small reference payload carried by work items. IDs

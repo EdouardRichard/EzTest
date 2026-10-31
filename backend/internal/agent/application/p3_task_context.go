@@ -2,6 +2,7 @@ package agentapp
 
 import (
 	"context"
+	"encoding/json"
 
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 )
@@ -90,4 +91,17 @@ type ExecutionPriorAssertion struct {
 // state and claims the dispatch lease.
 type TaskContextProvider interface {
 	ExecutionTask(ctx context.Context, item agent.WorkItem) (ExecutionTask, error)
+}
+
+// p4TaskDetails resolves the domain-owned payload for a P4 work item. It is the
+// fallback consulted by Runner.taskContext when the P3 switch has no branch for
+// the type: each P4 domain registers a provider from an init() hook with
+// RegisterP4TaskContext. The TaskRef carries the raw work-item payload so the
+// provider sees its own IDs (decimal strings) without the runtime parsing them.
+func p4TaskDetails(ctx context.Context, item agent.WorkItem) (any, bool) {
+	payload := map[string]any{}
+	if len(item.Payload) > 0 {
+		_ = json.Unmarshal(item.Payload, &payload)
+	}
+	return P4TaskContext(ctx, TaskRef{VersionID: item.VersionID, Type: item.Type, Payload: payload})
 }
