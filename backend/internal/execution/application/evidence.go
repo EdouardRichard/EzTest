@@ -80,6 +80,11 @@ func (s *CaseRunner) AddEvidence(ctx context.Context, scope tools.Scope, in Evid
 	if versionSUTID != nil && *versionSUTID <= 0 {
 		versionSUTID = nil
 	}
+	if versionSUTID == nil {
+		// Single-SUT runs and tools that omit version_sut_id must still produce
+		// per-SUT evidence (P3 §13.2-2/4: everything carries version_sut_id).
+		versionSUTID = s.defaultEvidenceVersionSUT(ctx, caseRun)
+	}
 	evidenceID := s.nextID()
 	filename := sanitizeEvidenceFilename(in.Filename)
 	ref, err := s.content.PutEvidence(ctx, evidenceID, in.Kind, filename, in.Data)
@@ -115,9 +120,31 @@ func (s *CaseRunner) AddEvidence(ctx context.Context, scope tools.Scope, in Evid
 	return evidence, nil
 }
 
+// defaultEvidenceVersionSUT resolves the SUT attribution for evidence created
+// without an explicit version_sut_id: a single-SUT intent is unambiguous, then
+// the case default target is used. Cross-system runs should pass the target
+// explicitly from the tool scope; nil remains allowed only if the case has no
+// resolvable SUT metadata.
+func (s *CaseRunner) defaultEvidenceVersionSUT(ctx context.Context, caseRun execution.CaseRun) *int64 {
+	if s.intents != nil {
+		if intent, err := s.intents.Get(ctx, caseRun.IntentID); err == nil && len(intent.VersionSUTIDs) == 1 && intent.VersionSUTIDs[0] > 0 {
+			id := intent.VersionSUTIDs[0]
+			return &id
+		}
+	}
+	if s.cases != nil {
+		if intent, err := s.intents.Get(ctx, caseRun.IntentID); err == nil {
+			if snapshot, err := s.cases.GetCaseVersion(ctx, intent.VersionID, caseRun.CaseVersionID); err == nil && snapshot.DefaultVersionSUTID > 0 {
+				id := snapshot.DefaultVersionSUTID
+				return &id
+			}
+		}
+	}
+	return nil
+}
+
 // EvidenceText is the execution.evidence tool: it uploads text evidence.
-func (s *CaseRunner) EvidenceText(ctx context.Context, scope tools.Scope, in tools.EvidenceTextInput) (any, error) {
-	evidence, err := s.AddEvidence(ctx, scope, EvidenceInput{
+func (s *CaseRunner) EvidenceText(ctx context.Context, scope tools.Scope, in tools.EvidenceTextInput) (any, error) {	evidence, err := s.AddEvidence(ctx, scope, EvidenceInput{
 		Kind:         execution.EvidenceKind(in.Kind),
 		Data:         []byte(in.Text),
 		StepSeq:      in.StepSeq,

@@ -424,6 +424,9 @@ func TestEvidenceImmutableAndMaxBytes(t *testing.T) {
 	if first.CaseRunID != 3001 || first.Kind != execution.EvidenceText || first.SizeBytes != 5 {
 		t.Fatalf("evidence = %+v", first)
 	}
+	if first.VersionSUTID == nil || *first.VersionSUTID != 7 {
+		t.Fatalf("single-SUT evidence version_sut_id = %v, want 7", first.VersionSUTID)
+	}
 	second, err := fixture.runner.AddEvidence(context.Background(), p3Scope(), executionapp.EvidenceInput{
 		Kind: execution.EvidenceText, Data: []byte("hello again"),
 	})
