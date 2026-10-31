@@ -1,6 +1,6 @@
 # EzTest 0.2 P1 任务类型契约
 
-> 状态：`draft: P1`（P1 阶段末冻结；P0 未创建本文件）。
+> 状态：`frozen: P1`（2026-10-31；P2+ 只允许增量）。
 > 权威：`docs/version-V0.2/high-level-design.md` §3、`architecture-design.md` §5.3、`phases/phase-01-runtime-clarification.md`。
 > 实现：`backend/internal/agent`（work_item/worker/reconciler）。P2+ 类型只保留，不在 P1 创建。
 

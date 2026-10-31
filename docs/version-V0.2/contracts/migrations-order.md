@@ -93,7 +93,7 @@ version_0002_clarification.sql
 CREATE TABLE clarification_session ( ... );
 ```
 
-## 5a. P1 迁移清单（`draft: P1`，阶段末冻结）
+## 5a. P1 迁移清单（`frozen: P1`，2026-10-31）
 
 P0 的 8 个迁移保持原样；P1 在 `order.txt` 末尾追加以下 7 个文件（`backend/internal/db/migrations/`）：
 

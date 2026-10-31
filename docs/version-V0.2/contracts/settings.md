@@ -158,7 +158,7 @@ retention 5、report 7、knowledge 2、security 2、feature 2 = **44**。
   需要修改时通过设置中心 PATCH。
 - 其他键默认值固定，不读取 env。
 
-## 4a. P1 使用说明（`draft: P1`）
+## 4a. P1 使用说明（`frozen: P1`，2026-10-31）
 
 - P1 **不新增** env、设置键或类别；44 键目录、类型/默认/热加载/secret 语义保持 P0。
 - P1 消费的键：

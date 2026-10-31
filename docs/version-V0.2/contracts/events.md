@@ -283,7 +283,7 @@ data: {"seq":2,"channel":"system","type":"settings.updated","scope":{},"payload"
 
 ---
 
-## 10. P1 增量事件（`draft: P1`，阶段末冻结）
+## 10. P1 增量事件（`frozen: P1`，2026-10-31）
 
 P0 的频道/信封/SSE/游标/心跳/`stream.reset` 语义不变。P1 业务事件一律发布到 `version:{id}`；版本状态类事件同时发 `system`（如 `version.started`/`version.status_changed`）。P1 **不新增频道**，使用 `scope` 携带会话/需求/run 等 ID。`seq` 与 `snapshot_cursor` 保持**整数**（D4 修代码以符合契约，见 spec §11）。
 

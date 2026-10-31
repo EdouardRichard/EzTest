@@ -49,7 +49,7 @@ info:
     `x-frozen: P0` —— 本文件在 P0 阶段末冻结；后续阶段只能增量修改，破坏性变更需更新本目录
     与决策记录并同步调用方/测试/迁移/handoff。
 
-    ## P1 增量（draft，2026-10-31）
+    ## P1 增量（frozen，2026-10-31）
 
     来源：`docs/superpowers/specs/2026-10-31-eztest-v02-p1-runtime-clarification-design.md`
     §3/§8/§9/§11/§12。P0 段落保留为历史；文件级 `x-frozen: P1` 为当前冻结标记。

@@ -454,7 +454,7 @@
 
 ---
 
-## 7. P1 增量表结构（`draft: P1`，阶段末冻结）
+## 7. P1 增量表结构（`frozen: P1`，2026-10-31）
 
 > 来源：`docs/superpowers/specs/2026-10-31-eztest-v02-p1-runtime-clarification-design.md` §3。P1 不修改 P0 表；新增表全部雪花 `BIGINT` 主键、`TIMESTAMPTZ`、CHECK 枚举与 `uk_/idx_` 命名。跨上下文只做逻辑引用，不建 FK。
 

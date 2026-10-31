@@ -1,6 +1,6 @@
 # EzTest 0.2 P1 Agent Profile 与工具契约
 
-> 状态：`draft: P1`（P1 阶段末冻结；P0 未创建本文件）。
+> 状态：`frozen: P1`（2026-10-31；P2+ 只允许增量，破坏性变更走变更控制）。
 > 权威：`architecture-design.md` §7、`high-level-design.md` §4–§5、`phase-01-runtime-clarification.md`、`open-decisions.md`。
 > 实现：`backend/internal/agent/application`（profiles/tools/runner）与 `backend/internal/llm`（chat gateway）。
 

@@ -5,7 +5,7 @@
 >
 > **P0 冻结状态（2026-10-31）**：`openapi.yaml`（43 paths / 66 operations，`x-frozen: P0`）、`events.md`、`db-schema.md`、`migrations-order.md`、`settings.md` 已冻结。`task-types.md` 与 `agent-profiles-tools.md` 按机制说明从 P1 开始写入；P0 未创建。
 >
-> **P1 增量（draft，2026-10-31）**：`db-schema.md` §7（16 表/索引）、`migrations-order.md` §5a（7 迁移）、`events.md` §10（23 事件）、`settings.md` §4a（不新增键）、`task-types.md`、`agent-profiles-tools.md`、`openapi.yaml` P1 paths/schemas（10 个 path item / 23 schemas）已写入。P1 冻结在阶段末执行，冻结前不视为 P1 frozen。
+> **P1 冻结状态（2026-10-31）**：`db-schema.md` §7（16 表/索引）、`migrations-order.md` §5a（7 迁移）、`events.md` §10（23 事件）、`settings.md` §4a（不新增键）、`task-types.md`、`agent-profiles-tools.md`、`openapi.yaml` P1 paths/schemas（10 个 path item / 23 schemas）已冻结为 **`frozen: P1`**。P1 的实现证据：`scripts/test.ps1` 全绿、`scripts/p1-acceptance.ps1` 19 步 PASS、`scripts/p1-e2e.ps1` 浏览器 PASS、`scripts/p1-acceptance-llm.ps1` 真实 DeepSeek v4.1 flash PASS。P2+ 只能增量，破坏性变更需先停止并更新契约/决策/handoff。
 
 ## 目录内容
 
