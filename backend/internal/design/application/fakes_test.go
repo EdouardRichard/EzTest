@@ -89,6 +89,12 @@ type fakeRepo struct {
 	pending int
 
 	proposeErr error
+
+	confirmations []design.Confirmation
+	staleVersions []int64
+	staleEntities []int64
+	dataPlanErr   error
+	latestRound   *design.Round
 }
 
 type fakeCase struct {
