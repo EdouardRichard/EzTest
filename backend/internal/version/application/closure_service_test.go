@@ -19,10 +19,12 @@ type fakeClosureRepo struct {
 	requirements *fakeRequirementRepo
 	closures     map[int64][]version.RequirementClosure
 	closeCalls   int
+	recheckCalls int
 	reopenCalls  int
 	latestErr    error
 	closeErr     error
 	reopenErr    error
+	lockedHook   func(ctx context.Context, locked version.Requirement)
 }
 
 func (f *fakeClosureRepo) Latest(_ context.Context, requirementID int64) (version.RequirementClosure, bool, error) {
@@ -36,7 +38,7 @@ func (f *fakeClosureRepo) Latest(_ context.Context, requirementID int64) (versio
 	return closures[len(closures)-1], true, nil
 }
 
-func (f *fakeClosureRepo) Close(_ context.Context, closure version.RequirementClosure, requirement version.Requirement) (version.RequirementClosure, error) {
+func (f *fakeClosureRepo) Close(ctx context.Context, closure version.RequirementClosure, requirement version.Requirement, recheck func(context.Context, version.Requirement) error) (version.RequirementClosure, error) {
 	f.closeCalls++
 	if f.closeErr != nil {
 		return version.RequirementClosure{}, f.closeErr
@@ -47,6 +49,23 @@ func (f *fakeClosureRepo) Close(_ context.Context, closure version.RequirementCl
 	}
 	if stored.Status != version.RequirementClarified {
 		return version.RequirementClosure{}, version.ErrStateConflict
+	}
+	if f.lockedHook != nil {
+		f.lockedHook(ctx, stored)
+		// The hook simulates a concurrent commit; the recheck must observe the
+		// freshly locked row, exactly like the Postgres FOR UPDATE read.
+		if stored, ok = f.requirements.requirements[requirement.ID]; !ok {
+			return version.RequirementClosure{}, version.ErrRequirementNotFound
+		}
+		if stored.Status != version.RequirementClarified {
+			return version.RequirementClosure{}, version.ErrStateConflict
+		}
+	}
+	f.recheckCalls++
+	if recheck != nil {
+		if err := recheck(ctx, stored); err != nil {
+			return version.RequirementClosure{}, err
+		}
 	}
 	closure.CloseRound = len(f.closures[requirement.ID]) + 1
 	f.closures[requirement.ID] = append(f.closures[requirement.ID], closure)
@@ -409,6 +428,107 @@ func TestClosureServiceCloseIsIdempotentForClosedRequirement(t *testing.T) {
 	}
 	if env.closures.closeCalls != 0 || len(env.events.events) != 0 || len(env.audit.events) != 0 {
 		t.Fatalf("idempotent close wrote side effects")
+	}
+}
+
+func TestClosureServiceCloseRechecksPredicateUnderLock(t *testing.T) {
+	env := newClosureEnv(t)
+	requirement := seedClosureRequirement(env, 1001, 701, 1002, version.RequirementClarified)
+	configurePassingClosure(env, requirement.ID)
+
+	// A new work item commits after the service's pre-check and before the
+	// requirement row lock is granted. Only the in-transaction recheck can see
+	// it, so the close must be rejected instead of committing a stale closure.
+	env.closures.lockedHook = func(_ context.Context, _ version.Requirement) {
+		env.work.counts[requirement.ID] = versionapp.OpenWorkItemCounts{Total: 2, RequirementClose: 1}
+	}
+
+	_, err := env.svc.Close(requestContext(), requirement.ID, nil)
+	var predicateErr *version.ErrClosePredicateFailed
+	if !errors.As(err, &predicateErr) {
+		t.Fatalf("Close error = %v, want ErrClosePredicateFailed", err)
+	}
+	if predicateErr.Failed[version.ClosureCheckNoOpenWork] != 1 {
+		t.Fatalf("failed = %#v, want no_open_work=1", predicateErr.Failed)
+	}
+	if env.closures.closeCalls != 1 || env.closures.recheckCalls != 1 {
+		t.Fatalf("close/recheck calls = %d/%d", env.closures.closeCalls, env.closures.recheckCalls)
+	}
+	if len(env.closures.closures[requirement.ID]) != 0 {
+		t.Fatalf("stale closure persisted: %#v", env.closures.closures[requirement.ID])
+	}
+	if stored := env.requirements.requirements[requirement.ID]; stored.Status != version.RequirementClarified {
+		t.Fatalf("requirement status = %q, want clarified", stored.Status)
+	}
+	if len(env.events.events) != 0 || len(env.audit.events) != 0 {
+		t.Fatalf("rejected close wrote side effects: %#v/%#v", env.events.events, env.audit.events)
+	}
+}
+
+func TestClosureServiceCloseAuditsAuthenticatedActor(t *testing.T) {
+	env := newClosureEnv(t)
+	requirement := seedClosureRequirement(env, 1001, 701, 1002, version.RequirementClarified)
+	configurePassingClosure(env, requirement.ID)
+
+	ctx := platform.WithActor(requestContext(), platform.Actor{ID: 88, Role: "user"})
+	if _, err := env.svc.Close(ctx, requirement.ID, nil); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if len(env.audit.events) != 1 || env.audit.events[0].Action != "requirement.closed" {
+		t.Fatalf("audit events = %#v", env.audit.events)
+	}
+	audit := env.audit.events[0]
+	if audit.ActorID == nil || *audit.ActorID != 88 {
+		t.Fatalf("audit actor = %v", audit.ActorID)
+	}
+	if _, recorded := audit.Metadata["agent_run_id"]; recorded {
+		t.Fatalf("manual close recorded agent provenance: %#v", audit.Metadata)
+	}
+}
+
+func TestClosureServiceCloseAuditsAgentRunProvenance(t *testing.T) {
+	env := newClosureEnv(t)
+	requirement := seedClosureRequirement(env, 1001, 701, 1002, version.RequirementClarified)
+	configurePassingClosure(env, requirement.ID)
+
+	ctx := platform.WithAgentRun(requestContext(), 7001, 8001)
+	if _, err := env.svc.Close(ctx, requirement.ID, nil); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if len(env.audit.events) != 1 {
+		t.Fatalf("audit events = %#v", env.audit.events)
+	}
+	audit := env.audit.events[0]
+	if audit.ActorID != nil {
+		t.Fatalf("agent-run close recorded actor = %v", audit.ActorID)
+	}
+	if audit.Metadata["agent_run_id"] != "7001" || audit.Metadata["work_item_id"] != "8001" {
+		t.Fatalf("audit metadata = %#v", audit.Metadata)
+	}
+}
+
+func TestClosureServiceReopenAuditsAgentRunProvenance(t *testing.T) {
+	env := newClosureEnv(t)
+	requirement := seedClosureRequirement(env, 1001, 701, 1002, version.RequirementClarified)
+	configurePassingClosure(env, requirement.ID)
+	if _, err := env.svc.Close(requestContext(), requirement.ID, nil); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	env.audit.events = nil
+
+	ctx := platform.WithAgentRun(requestContext(), 7002, 8002)
+	if err := env.svc.Reopen(ctx, requirement.ID, "agent reopen"); err != nil {
+		t.Fatalf("Reopen: %v", err)
+	}
+	if len(env.audit.events) != 1 {
+		t.Fatalf("audit events = %#v", env.audit.events)
+	}
+	audit := env.audit.events[0]
+	if audit.Action != "requirement.reopened" || audit.ActorID != nil {
+		t.Fatalf("audit = %#v", audit)
+	}
+	if audit.Metadata["agent_run_id"] != "7002" || audit.Metadata["work_item_id"] != "8002" {
+		t.Fatalf("audit metadata = %#v", audit.Metadata)
 	}
 }
 

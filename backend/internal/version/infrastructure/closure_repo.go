@@ -61,27 +61,34 @@ func (r *ClosureRepository) Latest(ctx context.Context, requirementID int64) (ve
 // Close inserts the next close round and flips the requirement to closed in one
 // transaction. The requirement row is locked first, so concurrent closes
 // serialize: the loser sees the committed closed status and gets
-// ErrStateConflict. The unique (requirement_id, close_round) constraint remains
-// the final guard.
-func (r *ClosureRepository) Close(ctx context.Context, closure version.RequirementClosure, requirement version.Requirement) (version.RequirementClosure, error) {
+// ErrStateConflict. After the lock, recheck re-runs the service predicate
+// against the locked requirement; its error rolls the whole transaction back,
+// so a closure can never commit with an evaluation that went stale before the
+// lock. The unique (requirement_id, close_round) constraint remains the final
+// guard.
+func (r *ClosureRepository) Close(ctx context.Context, closure version.RequirementClosure, requirement version.Requirement, recheck func(context.Context, version.Requirement) error) (version.RequirementClosure, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return version.RequirementClosure{}, fmt.Errorf("close requirement: begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	var status string
-	err = tx.QueryRow(ctx, `
-		SELECT status FROM requirement WHERE id = $1 AND version_id = $2 FOR UPDATE
-	`, requirement.ID, requirement.VersionID).Scan(&status)
+	locked, err := scanRequirement(tx.QueryRow(ctx, `
+		SELECT `+requirementColumns+` FROM requirement WHERE id = $1 AND version_id = $2 FOR UPDATE
+	`, requirement.ID, requirement.VersionID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return version.RequirementClosure{}, version.ErrRequirementNotFound
 	}
 	if err != nil {
 		return version.RequirementClosure{}, fmt.Errorf("close requirement: lock requirement: %w", err)
 	}
-	if version.RequirementStatus(status) != version.RequirementClarified {
+	if locked.Status != version.RequirementClarified {
 		return version.RequirementClosure{}, version.ErrStateConflict
+	}
+	if recheck != nil {
+		if err := recheck(ctx, locked); err != nil {
+			return version.RequirementClosure{}, err
+		}
 	}
 
 	var nextRound int

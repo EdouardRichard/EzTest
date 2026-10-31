@@ -100,10 +100,22 @@ func TestClosureRepoCloseLatestAndChecksJSON(t *testing.T) {
 	fixture := newClosureFixture(t)
 	ctx := context.Background()
 	closure := fixture.newClosure(passingChecks())
+	recheckCalls := 0
+	var lockedStatus version.RequirementStatus
 
-	stored, err := fixture.closureRepo.Close(ctx, closure, fixture.closedRequirement())
+	stored, err := fixture.closureRepo.Close(ctx, closure, fixture.closedRequirement(), func(_ context.Context, locked version.Requirement) error {
+		recheckCalls++
+		lockedStatus = locked.Status
+		if locked.CurrentVersionID == nil || *locked.CurrentVersionID != fixture.revision.ID {
+			return version.ErrStateConflict
+		}
+		return nil
+	})
 	if err != nil {
 		t.Fatalf("Close: %v", err)
+	}
+	if recheckCalls != 1 || lockedStatus != version.RequirementClarified {
+		t.Fatalf("recheck calls/locked status = %d/%q", recheckCalls, lockedStatus)
 	}
 	if stored.ID != closure.ID || stored.CloseRound != 1 {
 		t.Fatalf("stored closure = %#v", stored)
@@ -177,9 +189,16 @@ func TestClosureRepoCloseLatestAndChecksJSON(t *testing.T) {
 		t.Fatalf("missing GetRequirement error = %v", err)
 	}
 
-	// The row lock and status guard reject a second close of the same round.
-	if _, err := fixture.closureRepo.Close(ctx, fixture.newClosure(passingChecks()), fixture.closedRequirement()); !errors.Is(err, version.ErrStateConflict) {
+	// The row lock and status guard reject a second close of the same round; the
+	// recheck never runs against an already closed requirement.
+	if _, err := fixture.closureRepo.Close(ctx, fixture.newClosure(passingChecks()), fixture.closedRequirement(), func(context.Context, version.Requirement) error {
+		recheckCalls++
+		return nil
+	}); !errors.Is(err, version.ErrStateConflict) {
 		t.Fatalf("second Close error = %v, want ErrStateConflict", err)
+	}
+	if recheckCalls != 1 {
+		t.Fatalf("recheck calls after conflict = %d, want 1", recheckCalls)
 	}
 
 	// The unique (requirement_id, close_round) constraint is the final guard.
@@ -199,7 +218,7 @@ func TestClosureRepoForeignKeyRollsBack(t *testing.T) {
 	bad := fixture.newClosure(passingChecks())
 	bad.RequirementVersionID = 999999
 
-	if _, err := fixture.closureRepo.Close(ctx, bad, fixture.closedRequirement()); !errors.Is(err, version.ErrNotFound) {
+	if _, err := fixture.closureRepo.Close(ctx, bad, fixture.closedRequirement(), nil); !errors.Is(err, version.ErrNotFound) {
 		t.Fatalf("bad requirement_version_id error = %v, want ErrNotFound", err)
 	}
 	var (
@@ -225,7 +244,7 @@ func TestClosureRepoForeignKeyRollsBack(t *testing.T) {
 func TestClosureRepoReopenAndNextRound(t *testing.T) {
 	fixture := newClosureFixture(t)
 	ctx := context.Background()
-	first, err := fixture.closureRepo.Close(ctx, fixture.newClosure(passingChecks()), fixture.closedRequirement())
+	first, err := fixture.closureRepo.Close(ctx, fixture.newClosure(passingChecks()), fixture.closedRequirement(), nil)
 	if err != nil {
 		t.Fatalf("first Close: %v", err)
 	}
@@ -270,7 +289,7 @@ func TestClosureRepoReopenAndNextRound(t *testing.T) {
 	`, clarified.ID, clarified.UpdatedAt); err != nil {
 		t.Fatalf("re-clarify requirement: %v", err)
 	}
-	second, err := fixture.closureRepo.Close(ctx, fixture.newClosure(passingChecks()), clarified)
+	second, err := fixture.closureRepo.Close(ctx, fixture.newClosure(passingChecks()), clarified, nil)
 	if err != nil {
 		t.Fatalf("second Close: %v", err)
 	}
@@ -297,6 +316,143 @@ func TestClosureRepoReopenAndNextRound(t *testing.T) {
 	}
 }
 
+func TestClosureRepoCloseRecheckRollsBack(t *testing.T) {
+	fixture := newClosureFixture(t)
+	ctx := context.Background()
+	wantErr := &version.ErrClosePredicateFailed{
+		Failed: map[string]int{version.ClosureCheckNoOpenWork: 1},
+	}
+
+	recheckCalls := 0
+	_, err := fixture.closureRepo.Close(ctx, fixture.newClosure(passingChecks()), fixture.closedRequirement(), func(_ context.Context, locked version.Requirement) error {
+		recheckCalls++
+		// The callback runs after FOR UPDATE: the row still carries the
+		// pre-close projection and the current requirement version.
+		if locked.Status != version.RequirementClarified || locked.ClosedAt != nil || locked.ClosedByRunID != nil {
+			return version.ErrStateConflict
+		}
+		if locked.CurrentVersionID == nil || *locked.CurrentVersionID != fixture.revision.ID {
+			return version.ErrStateConflict
+		}
+		return wantErr
+	})
+	var predicateErr *version.ErrClosePredicateFailed
+	if !errors.As(err, &predicateErr) {
+		t.Fatalf("Close error = %v, want ErrClosePredicateFailed", err)
+	}
+	if predicateErr.Failed[version.ClosureCheckNoOpenWork] != 1 || recheckCalls != 1 {
+		t.Fatalf("predicate/calls = %#v/%d", predicateErr.Failed, recheckCalls)
+	}
+
+	var (
+		closureRows int
+		status      string
+		closedAt    *time.Time
+		runID       *int64
+	)
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT count(*) FROM requirement_closure WHERE requirement_id = $1
+	`, fixture.requirement.ID).Scan(&closureRows); err != nil {
+		t.Fatalf("count closures: %v", err)
+	}
+	if closureRows != 0 {
+		t.Fatalf("recheck failure left %d closure rows", closureRows)
+	}
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT status, closed_at, closed_by_run_id FROM requirement WHERE id = $1
+	`, fixture.requirement.ID).Scan(&status, &closedAt, &runID); err != nil {
+		t.Fatalf("read requirement: %v", err)
+	}
+	if status != string(version.RequirementClarified) || closedAt != nil || runID != nil {
+		t.Fatalf("recheck failure changed requirement = %q/%v/%v", status, closedAt, runID)
+	}
+}
+
+// TestClosureRepoCloseRecheckSeesConcurrentWorkItem proves the recheck runs
+// while the requirement row lock is held: a work item committed between the
+// service pre-check and the lock is visible to the callback, which rejects the
+// close and rolls the whole transaction back.
+func TestClosureRepoCloseRecheckSeesConcurrentWorkItem(t *testing.T) {
+	fixture := newClosureFixture(t)
+	ctx := context.Background()
+
+	locked := make(chan struct{})
+	workCommitted := make(chan struct{})
+	closeErr := make(chan error, 1)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, err := fixture.closureRepo.Close(ctx, fixture.newClosure(passingChecks()), fixture.closedRequirement(), func(callbackCtx context.Context, lockedRequirement version.Requirement) error {
+			if lockedRequirement.Status != version.RequirementClarified {
+				return version.ErrStateConflict
+			}
+			close(locked)
+			<-workCommitted
+			// Re-evaluate through a second connection: the concurrent insert
+			// committed while this close still holds the requirement lock.
+			var open int
+			if err := fixture.pool.QueryRow(callbackCtx, `
+				SELECT count(*) FROM work_item
+				WHERE version_id = $1 AND status IN ('open', 'claimed', 'running')
+			`, fixture.versionID).Scan(&open); err != nil {
+				return err
+			}
+			if open > 0 {
+				return &version.ErrClosePredicateFailed{
+					Failed: map[string]int{version.ClosureCheckNoOpenWork: open},
+				}
+			}
+			return nil
+		})
+		closeErr <- err
+	}()
+
+	<-locked
+	if _, err := fixture.pool.Exec(ctx, `
+		INSERT INTO work_item (id, version_id, team, type, status, priority, dedupe_key)
+		VALUES ($1, $2, 'steward', 'requirement.close', 'open', 0, 'race-open-work')
+	`, fixture.ids.Next(), fixture.versionID); err != nil {
+		t.Fatalf("insert work item: %v", err)
+	}
+	close(workCommitted)
+	wg.Wait()
+
+	var predicateErr *version.ErrClosePredicateFailed
+	if err := <-closeErr; !errors.As(err, &predicateErr) {
+		t.Fatalf("concurrent Close error = %v, want ErrClosePredicateFailed", err)
+	}
+
+	var (
+		closureRows int
+		status      string
+	)
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT count(*) FROM requirement_closure WHERE requirement_id = $1
+	`, fixture.requirement.ID).Scan(&closureRows); err != nil {
+		t.Fatalf("count closures: %v", err)
+	}
+	if closureRows != 0 {
+		t.Fatalf("concurrent close persisted %d closure rows", closureRows)
+	}
+	if err := fixture.pool.QueryRow(ctx, `SELECT status FROM requirement WHERE id = $1`,
+		fixture.requirement.ID).Scan(&status); err != nil {
+		t.Fatalf("read requirement: %v", err)
+	}
+	if status != string(version.RequirementClarified) {
+		t.Fatalf("concurrent close changed status to %q", status)
+	}
+	var openWork int
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT count(*) FROM work_item WHERE version_id = $1 AND status = 'open'
+	`, fixture.versionID).Scan(&openWork); err != nil {
+		t.Fatalf("count work items: %v", err)
+	}
+	if openWork != 1 {
+		t.Fatalf("open work items = %d, want 1", openWork)
+	}
+}
+
 func TestClosureRepoConcurrentCloseOnlyOneWins(t *testing.T) {
 	fixture := newClosureFixture(t)
 	ctx := context.Background()
@@ -314,7 +470,12 @@ func TestClosureRepoConcurrentCloseOnlyOneWins(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			start.Wait()
-			closure, err := fixture.closureRepo.Close(ctx, fixture.newClosure(passingChecks()), fixture.closedRequirement())
+			closure, err := fixture.closureRepo.Close(ctx, fixture.newClosure(passingChecks()), fixture.closedRequirement(), func(_ context.Context, locked version.Requirement) error {
+				if locked.Status != version.RequirementClarified {
+					return version.ErrStateConflict
+				}
+				return nil
+			})
 			results <- result{closure: closure, err: err}
 		}()
 	}
