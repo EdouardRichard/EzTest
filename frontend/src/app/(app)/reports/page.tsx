@@ -1,11 +1,15 @@
 import type { Metadata } from "next"
+import { Suspense } from "react"
 
-import { PlaceholderPage } from "@/components/placeholder-page"
+import { LoadingCard } from "@/components/ui/Spinner"
+import { GlobalReportsPage } from "@/features/delivery/GlobalReportsPage"
 
 export const metadata: Metadata = { title: "报告" }
 
 export default function ReportsPage() {
   return (
-    <PlaceholderPage title="报告" phase="P1" description="波次报告、发布快照与跨版本质量趋势。" />
+    <Suspense fallback={<LoadingCard label="正在加载全局报告…" />}>
+      <GlobalReportsPage />
+    </Suspense>
   )
 }
