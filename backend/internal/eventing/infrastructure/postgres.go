@@ -4,11 +4,13 @@ package eventingpg
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/eventing/domain"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -60,6 +62,24 @@ func (r *Repository) Append(ctx context.Context, event eventing.Event) (eventing
 
 	event.Seq = seq
 	event.CreatedAt = createdAt
+	return event, nil
+}
+
+// Get loads one event by its channel cursor. Missing rows are reported as
+// eventing.ErrNotFound so the cross-instance listener can distinguish a lost
+// race (row gone) from a transient database failure.
+func (r *Repository) Get(ctx context.Context, channel string, seq int64) (eventing.Event, error) {
+	event, err := scanEvent(r.pool.QueryRow(ctx, `
+		SELECT channel, seq, type, envelope, created_at
+		FROM event
+		WHERE channel = $1 AND seq = $2
+	`, channel, seq))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return eventing.Event{}, eventing.ErrNotFound
+	}
+	if err != nil {
+		return eventing.Event{}, fmt.Errorf("get event: %w", err)
+	}
 	return event, nil
 }
 

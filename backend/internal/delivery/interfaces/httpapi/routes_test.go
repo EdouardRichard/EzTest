@@ -50,8 +50,11 @@ func TestIssueRoutesAreRegistered(t *testing.T) {
 func TestReportRoutesAreRegistered(t *testing.T) {
 	reports, _ := reportFixture()
 	html := []byte("<html>report</html>")
+	pdf := []byte("%PDF-1.7 report")
 	reports.html = html
 	reports.htmlRevision = sampleRevision(900, 300, 2, delivery.ReportStatusPublished, "done", int64Ptr(500))
+	reports.pdf = pdf
+	reports.pdfRevision = samplePDFRevision(300, 600)
 	reports.regenerateRevision = 2
 	mux := newDeliveryMux(t, New(nil, WithReports(reports)))
 
@@ -74,6 +77,15 @@ func TestReportRoutesAreRegistered(t *testing.T) {
 	requireStatus(t, recorder, http.StatusOK)
 	if recorder.Body.String() != string(html) {
 		t.Fatalf("html route body = %q", recorder.Body.String())
+	}
+
+	recorder = deliveryCall(t, mux, http.MethodGet, "/api/versions/42/reports/300/revisions/2/pdf", "", nil)
+	requireStatus(t, recorder, http.StatusOK)
+	if recorder.Body.String() != string(pdf) {
+		t.Fatalf("pdf route body = %q", recorder.Body.String())
+	}
+	if len(reports.pdfCalls) != 1 || reports.pdfCalls[0].reportID != 300 {
+		t.Fatalf("pdf route did not reach the report service: %#v", reports.pdfCalls)
 	}
 
 	recorder = deliveryCall(t, mux, http.MethodPost, "/api/versions/42/reports/300/regenerate", "", userActor())

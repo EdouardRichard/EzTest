@@ -24,10 +24,10 @@ func NewContentRefReader(pool *pgxpool.Pool) *ContentRefReader {
 	return &ContentRefReader{pool: pool}
 }
 
-// GetContentRef returns one active content_ref row together with the §6.4
+// GetContentRef returns one active content_ref row together with the §6.4/P7
 // owner check: a delivery_report_revision whose id equals owner_id must point
-// its html_ref at this exact ref. A missing or soft-deleted ref is
-// ErrReportContentNotFound.
+// its html_ref (or, for the PDF pipeline, its pdf_ref) at this exact ref. A
+// missing or soft-deleted ref is ErrReportContentNotFound.
 func (r *ContentRefReader) GetContentRef(ctx context.Context, refID int64) (content.Ref, error) {
 	ctx = contextOrBackground(ctx)
 	var ref content.Ref
@@ -36,7 +36,8 @@ func (r *ContentRefReader) GetContentRef(ctx context.Context, refID int64) (cont
 		       EXISTS (
 			       SELECT 1
 			       FROM delivery_report_revision rev
-			       WHERE rev.id = r.owner_id AND rev.html_ref = r.id
+			       WHERE rev.id = r.owner_id
+			         AND (rev.html_ref = r.id OR rev.pdf_ref = r.id)
 		       )
 		FROM content_ref r
 		WHERE r.id = $1 AND r.deleted_at IS NULL

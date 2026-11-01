@@ -20,9 +20,13 @@ import (
 )
 
 const (
-	// TemplateVersionV1 is the only built-in report template version (spec
-	// §6.2). The setting report.template_version is fixed to this value in P4.
+	// TemplateVersionV1 is the frozen P4 built-in report template: five
+	// sections. Its rendered bytes must never change (spec P7-D-03).
 	TemplateVersionV1 = "1"
+
+	// TemplateVersionV2 is the P7 built-in template: v1 plus the optional
+	// appendix section (report.section_appendix).
+	TemplateVersionV2 = "2"
 
 	// MaxHTMLBytes is the hard upper bound of one rendered report (spec
 	// §6.1/§6.2). Rendering truncates issues, waves and case runs in that order
@@ -40,22 +44,39 @@ type HTMLRenderer struct {
 
 var _ delivery.ReportRenderer = (*HTMLRenderer)(nil)
 
-// NewHTMLRenderer parses the built-in report template. templateVersion only
-// accepts "1" (spec §6.2); any other value is an error because P4 does not
-// support template versioning or user templates.
+// NewHTMLRenderer parses one built-in report template. templateVersion accepts
+// "1" (the frozen P4 five-section layout) and "2" (P7: v1 plus the optional
+// appendix section); any other value is an error because EzTest only ships
+// built-in templates.
 func NewHTMLRenderer(templateVersion string) (*HTMLRenderer, error) {
-	if templateVersion != TemplateVersionV1 {
-		return nil, fmt.Errorf("render: unsupported report template version %q, only %q is built in", templateVersion, TemplateVersionV1)
+	var source string
+	switch templateVersion {
+	case TemplateVersionV1:
+		source = reportTemplateV1
+	case TemplateVersionV2:
+		source = reportTemplateV2
+	default:
+		return nil, fmt.Errorf("render: unsupported report template version %q, only %q and %q are built in", templateVersion, TemplateVersionV1, TemplateVersionV2)
 	}
 	parsed, err := template.New("report").Funcs(template.FuncMap{
 		"int64ptr": formatInt64Ptr,
 		"intptr":   formatIntPtr,
 		"timeptr":  formatTimePtr,
-	}).Parse(reportTemplate)
+	}).Parse(source)
 	if err != nil {
 		return nil, fmt.Errorf("render: parse report template: %w", err)
 	}
 	return &HTMLRenderer{templateVersion: templateVersion, template: parsed}, nil
+}
+
+// TemplateVersion reports the built-in template version of this renderer. The
+// report service records it on every new revision so the revision metadata can
+// never disagree with the rendered bytes (P7-D-03).
+func (r *HTMLRenderer) TemplateVersion() string {
+	if r == nil {
+		return ""
+	}
+	return r.templateVersion
 }
 
 // Render renders one report revision from the deterministic snapshot and the
@@ -170,23 +191,36 @@ type renderData struct {
 	HasWave         bool
 	WaveID          int64
 	GeneratedAt     string
-	Sections        delivery.SectionOptions
-	Requirements    []delivery.RequirementSnapshot
-	Waves           []delivery.WaveSnapshot
-	CaseRuns        []delivery.CaseRunSnapshot
-	Issues          []delivery.IssueSnapshot
-	VersionSUTs     []delivery.VersionSUTSnapshot
-	Coverage        delivery.CoverageSnapshot
-	SUTRows         []sutRow
-	EvidenceRows    []delivery.EvidenceSnapshot
-	Summary         summaryView
-	NarrativeLines  []string
-	HasNarrative    bool
-	Truncated       bool
-	TruncationNote  string
+	// P7 template v2 appendix metadata. The fields are render-only; they never
+	// participate in the report input fingerprint.
+	ReportID         int64
+	ReportRevision   int32
+	InputFingerprint string
+	SectionSwitches  []sectionSwitch
+	Sections         delivery.SectionOptions
+	Requirements     []delivery.RequirementSnapshot
+	Waves            []delivery.WaveSnapshot
+	CaseRuns         []delivery.CaseRunSnapshot
+	Issues           []delivery.IssueSnapshot
+	VersionSUTs      []delivery.VersionSUTSnapshot
+	Coverage         delivery.CoverageSnapshot
+	SUTRows          []sutRow
+	EvidenceRows     []delivery.EvidenceSnapshot
+	Summary          summaryView
+	NarrativeLines   []string
+	HasNarrative     bool
+	Truncated        bool
+	TruncationNote   string
 	// SnapshotTruncationNote is the §6.1 cap note derived from the snapshot's
 	// TruncatedSections. The 2 MiB truncation pass appends its own note to it.
 	SnapshotTruncationNote string
+}
+
+// sectionSwitch is one row of the v2 appendix section-switch list.
+type sectionSwitch struct {
+	Label   string
+	State   string
+	Enabled bool
 }
 
 // summaryView is the deterministic section summary. Numbers come from the
@@ -221,10 +255,14 @@ type sutRow struct {
 
 func newRenderData(snapshot delivery.ReportSnapshot, narrative string, opts delivery.SectionOptions) *renderData {
 	data := &renderData{
-		TemplateVersion: TemplateVersionV1,
-		VersionID:       snapshot.VersionID,
-		GeneratedAt:     formatTime(snapshot.GeneratedAt),
-		Sections:        opts,
+		TemplateVersion:  TemplateVersionV1,
+		VersionID:        snapshot.VersionID,
+		GeneratedAt:      formatTime(snapshot.GeneratedAt),
+		ReportID:         snapshot.ReportID,
+		ReportRevision:   snapshot.ReportRevision,
+		InputFingerprint: snapshot.InputFingerprint,
+		SectionSwitches:  buildSectionSwitches(opts),
+		Sections:         opts,
 	}
 	if note := snapshotTruncationNote(snapshot.TruncatedSections); note != "" {
 		data.Truncated = true
@@ -303,6 +341,25 @@ func newRenderData(snapshot delivery.ReportSnapshot, narrative string, opts deli
 	data.HasNarrative = len(data.NarrativeLines) > 0
 	data.Summary = summarize(snapshot)
 	return data
+}
+
+// buildSectionSwitches renders the v2 appendix section-switch list in the
+// frozen order (summary, results, issues, coverage, evidence, appendix).
+func buildSectionSwitches(opts delivery.SectionOptions) []sectionSwitch {
+	state := func(enabled bool) string {
+		if enabled {
+			return "开"
+		}
+		return "关"
+	}
+	return []sectionSwitch{
+		{Label: "概览", State: state(opts.Summary), Enabled: opts.Summary},
+		{Label: "结果", State: state(opts.Results), Enabled: opts.Results},
+		{Label: "问题", State: state(opts.Issues), Enabled: opts.Issues},
+		{Label: "覆盖", State: state(opts.Coverage), Enabled: opts.Coverage},
+		{Label: "证据", State: state(opts.Evidence), Enabled: opts.Evidence},
+		{Label: "附录", State: state(opts.Appendix), Enabled: opts.Appendix},
+	}
 }
 
 func summarize(snapshot delivery.ReportSnapshot) summaryView {

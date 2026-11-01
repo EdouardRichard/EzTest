@@ -4,8 +4,13 @@ package eventing
 
 import (
 	"context"
+	"errors"
 	"time"
 )
+
+// ErrNotFound is returned by Repository.Get when no event matches the
+// requested channel cursor.
+var ErrNotFound = errors.New("event not found")
 
 // Event is one persisted event. Seq is the channel-scoped cursor; it is not a
 // business entity ID.

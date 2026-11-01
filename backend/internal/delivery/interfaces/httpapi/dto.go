@@ -292,19 +292,22 @@ type ReportView struct {
 }
 
 // ReportRevisionView is one append-only revision projection (contract
-// ReportRevisionView).
+// ReportRevisionView). PDF fields are the P7 non-breaking widening.
 type ReportRevisionView struct {
-	ID               string `json:"id"`
-	ReportID         string `json:"report_id"`
-	Revision         int32  `json:"revision"`
-	Status           string `json:"status"`
-	AsOf             string `json:"as_of"`
-	InputFingerprint string `json:"input_fingerprint"`
-	TemplateVersion  string `json:"template_version"`
-	RenderStatus     string `json:"render_status"`
-	HTMLAvailable    bool   `json:"html_available"`
-	PDFAvailable     bool   `json:"pdf_available"`
-	CreatedAt        string `json:"created_at"`
+	ID               string  `json:"id"`
+	ReportID         string  `json:"report_id"`
+	Revision         int32   `json:"revision"`
+	Status           string  `json:"status"`
+	AsOf             string  `json:"as_of"`
+	InputFingerprint string  `json:"input_fingerprint"`
+	TemplateVersion  string  `json:"template_version"`
+	RenderStatus     string  `json:"render_status"`
+	HTMLAvailable    bool    `json:"html_available"`
+	PDFAvailable     bool    `json:"pdf_available"`
+	PDFStatus        string  `json:"pdf_status"`
+	PDFError         *string `json:"pdf_error"`
+	PDFRenderedAt    *string `json:"pdf_rendered_at"`
+	CreatedAt        string  `json:"created_at"`
 }
 
 // ReportRefView is one report revision logical reference.
@@ -360,8 +363,11 @@ func toReportRevisionView(revision delivery.ReportRevision) ReportRevisionView {
 		RenderStatus:     revision.RenderStatus,
 		HTMLAvailable: revision.Status == delivery.ReportStatusPublished &&
 			revision.RenderStatus == reportRenderDone && revision.HTMLRef != nil,
-		PDFAvailable: false, // P4 never renders PDF (spec §6.3)
-		CreatedAt:    formatTime(revision.CreatedAt),
+		PDFAvailable:  revision.PDFStatus == delivery.PDFStatusDone && revision.PDFRef != nil,
+		PDFStatus:     string(revision.PDFStatus),
+		PDFError:      optionalString(revision.PDFError),
+		PDFRenderedAt: formatOptionalTime(revision.PDFRenderedAt),
+		CreatedAt:     formatTime(revision.CreatedAt),
 	}
 }
 
@@ -501,6 +507,15 @@ func formatOptionalTime(value *time.Time) *string {
 		return nil
 	}
 	return strPtr(formatTime(*value))
+}
+
+// optionalString maps an empty string to JSON null.
+func optionalString(value string) *string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	trimmed := value
+	return &trimmed
 }
 
 func optionalIDString(value *int64) *string {

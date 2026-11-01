@@ -1,6 +1,6 @@
 name: eztest
 
-# EzTest P0-P8 single-instance deployment.
+# EzTest P7 multi-replica deployment shape.
 #
 # Static validation only on this host: Docker is not installed, so this file is
 # checked by `cd frontend && node scripts/validate-compose.mjs` and has never
@@ -9,26 +9,30 @@ name: eztest
 # Usage (from the repository root, so the repo-root .env provides secrets):
 #   docker compose --env-file .env -f deploy/docker-compose.yml up -d --build
 #
-# Required in the repo-root .env for interpolation (see ../.env.example):
-#   POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB, EZTEST_EXECUTOR_TOKEN
-# The api service also reads ../.env through env_file for the EZTEST_* and
-# lowercase llm_* variables. `.env` is gitignored and must never be committed.
-# The executor is internal-only: it publishes no host port, and only api holds
-# the bearer token.
+# Topology:
+#   postgres  PostgreSQL 17 (single coordination surface)
+#   api       API replica 1; publishes 13333; readiness /api/health/ready
+#   api2      API replica 2; internal-only; shares the data volume and PG
+#   renderer  Playwright HTML->PDF worker; internal-only, Bearer token
+#   executor  Playwright case executor; internal-only, Bearer token
+#   web       Next.js web UI; publishes 6868
 #
-# P8 persistent content:
-#   objects      -> /data/objects              (content-addressed storage)
-#   attachments  -> /data/version-attachments  (requirement attachments)
-#   evidence     -> /data/evidence             (execution evidence; GC target)
-#   reports      -> /data/reports              (report Markdown)
-#   exports      -> /data/exports              (mindmap exports)
+# Both API replicas share the named `data` volume mounted at /data. The API
+# image symlinks /app/.data -> /data, so the DB settings `paths.*` keep their
+# default ./.data values and resolve onto the shared volume. `runtime.
+# snowflake_node_id` stays a DB setting: the P7 instance registry allocates a
+# free node id for the second replica automatically.
+#
+# Required in the environment / repo-root .env for interpolation (see
+# ../.env.example): POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB,
+# EZTEST_EXECUTOR_TOKEN, EZTEST_RENDER_TOKEN. The API process itself still reads
+# only the four documented EZTEST_* startup variables.
 #
 # Optional read-only code repositories (P4): mount a host tree read-only and
 # register the container path (for example /repos/app) as the P2 localPath.
-# Uncomment and adjust:
+# Uncomment and adjust on both API replicas:
 #   volumes:
 #     - ${EZTEST_CODE_REPO_MOUNT:-./repos}:/repos:ro
-# and optionally set EZTEST_AGENT_FILE_ROOT=/repos for the Agent file tools.
 
 services:
   postgres:
@@ -50,6 +54,7 @@ services:
       start_period: 10s
 
   api:
+    image: eztest-api:${EZTEST_VERSION:-dev}
     build:
       context: ..
       dockerfile: deploy/Dockerfile.api
@@ -60,42 +65,87 @@ services:
     env_file:
       - ../.env
     environment:
-      EZTEST_ENV: ${EZTEST_ENV:-dev}
-      EZTEST_HTTP_ADDR: ":13333"
-      EZTEST_WEB_ORIGIN: ${EZTEST_WEB_ORIGIN:-http://localhost:6868}
+      EZTEST_API_PORT: "13333"
+      EZTEST_WEB_PORT: "6868"
+      EZTEST_EXECUTOR_PORT: "13336"
       EZTEST_DATABASE_URL: postgres://${POSTGRES_USER:-eztest}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in the environment or ../.env}@postgres:5432/${POSTGRES_DB:-eztest}?sslmode=disable
-      EZTEST_STORAGE_DIR: /data/objects
-      EZTEST_VERSION_ATTACHMENT_DIR: /data/version-attachments
-      EZTEST_EVIDENCE_DIR: /data/evidence
-      EZTEST_REPORT_DIR: /data/reports
-      EZTEST_EXPORT_DIR: /data/exports
-      EZTEST_SNOWFLAKE_NODE_ID: ${EZTEST_SNOWFLAKE_NODE_ID:-1}
-      EZTEST_OPENAPI_PATH: docs/openapi/api.yaml
-      EZTEST_ENABLE_TEST_ENDPOINTS: ${EZTEST_ENABLE_TEST_ENDPOINTS:-false}
-      EZTEST_EXECUTOR_URL: ${EZTEST_EXECUTOR_URL:-http://executor:13336}
-      EZTEST_EXECUTOR_TOKEN: ${EZTEST_EXECUTOR_TOKEN:-}
     ports:
       - "13333:13333"
     volumes:
-      - objects:/data/objects
-      - attachments:/data/version-attachments
-      - evidence:/data/evidence
-      - reports:/data/reports
-      - exports:/data/exports
+      - data:/data
       # Optional read-only code repository mount (see the header example):
       # - ${EZTEST_CODE_REPO_MOUNT:-./repos}:/repos:ro
     depends_on:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:13333/healthz >/dev/null || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:13333/api/health/ready >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  # Second API replica: same image/environment/volume, no published port. Only
+  # one replica exposes 13333; use a reverse proxy for HTTP load balancing.
+  api2:
+    image: eztest-api:${EZTEST_VERSION:-dev}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+      args:
+        VERSION: ${EZTEST_VERSION:-dev}
+        COMMIT: ${EZTEST_COMMIT:-}
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    environment:
+      EZTEST_API_PORT: "13333"
+      EZTEST_WEB_PORT: "6868"
+      EZTEST_EXECUTOR_PORT: "13336"
+      EZTEST_DATABASE_URL: postgres://${POSTGRES_USER:-eztest}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in the environment or ../.env}@postgres:5432/${POSTGRES_DB:-eztest}?sslmode=disable
+    volumes:
+      - data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:13333/api/health/ready >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  # PDF renderer (Playwright, HTML->PDF only). Internal-only: one Bearer token
+  # shared with the API process.
+  renderer:
+    image: eztest-renderer:${EZTEST_VERSION:-dev}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.renderer
+    restart: unless-stopped
+    environment:
+      EZTEST_RENDERER_ADDR: 0.0.0.0:13337
+      EZTEST_RENDER_TOKEN: ${EZTEST_RENDER_TOKEN:?set EZTEST_RENDER_TOKEN in the environment or ../.env}
+    shm_size: 1gb
+    expose:
+      - "13337"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:13337/healthz').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))",
+        ]
       interval: 10s
       timeout: 5s
       retries: 6
       start_period: 20s
 
   # Playwright executor (protocol A'). Internal-only: no published ports, one
-  # bearer token shared with the api process, /dev/shm sized for Chromium.
+  # bearer token shared with the API process, /dev/shm sized for Chromium.
+  # Push registration is optional: export EZTEST_API_URL=http://api:13333 and
+  # extend this environment list to enable it (pull healthz stays enabled).
   executor:
     build:
       context: ../executor
@@ -140,8 +190,7 @@ services:
 
 volumes:
   pgdata:
-  objects:
-  attachments:
-  evidence:
-  reports:
-  exports:
+  # Shared content root for both API replicas: content-addressed objects,
+  # attachments, evidence, report HTML/PDF and exports (DB `paths.*` defaults
+  # resolve to /app/.data -> /data).
+  data:
