@@ -71,7 +71,7 @@ func TestRateLimitSkipsHealthAndSSE(t *testing.T) {
 	handler := RateLimit(settings)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
-	for _, path := range []string{"/healthz", "/api/health", "/api/health/ready", "/api/stream"} {
+	for _, path := range []string{"/healthz", "/api/health", "/api/health/ready", "/api/stream", "/api/internal/executors/heartbeat"} {
 		for i := 0; i < 5; i++ {
 			recorder := httptest.NewRecorder()
 			handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
