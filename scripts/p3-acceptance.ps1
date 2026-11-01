@@ -1565,7 +1565,7 @@ try {
     Pass-Scenario $s5
 
     # ---------------- S6: application failure ----------------------------
-    $s6 = Start-Scenario "S6 failure classification: failed(application), failure_candidate event, team post, no issue/report tables"
+    $s6 = Start-Scenario "S6 failure classification: failed(application), failure_candidate event, team post, P4 tables optional/complete"
 
     Step "assert case C failed with failure_class=application"
     $runC = Wait-For -TimeoutSeconds 60 -Description "case C terminal failed(application)" -Condition {
@@ -1604,9 +1604,9 @@ try {
         Add-SoftFailure ("execution team-room finding contract: " + $_.Exception.Message)
     }
 
-    Step "assert no P4 issue/report/analysis_run tables exist"
+    Step "assert P4 tables, if present, are the complete P4 set (P3 execution must not require them)"
     $forbiddenTables = Invoke-PsqlScalar -DatabaseName $testDatabase -SqlText "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND (table_name ~* '(^|_)(issue|report|analysis_run)($|_)');"
-    Assert-Equal $forbiddenTables "0" "P3 must not create issue/report/analysis_run tables"
+    Assert-True ([int]$forbiddenTables -eq 0 -or [int]$forbiddenTables -eq 8) "P4 tables must be absent (P3-only) or the complete 8-table P4 set (got $forbiddenTables)"
 
     Pass-Scenario $s6
 
