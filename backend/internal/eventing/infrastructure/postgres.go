@@ -235,3 +235,25 @@ func decodeActorID(raw json.RawMessage) (*int64, error) {
 	}
 	return &value, nil
 }
+
+// DeleteOlderThan removes up to limit event rows older than cutoff. The P8
+// leader-gated retention worker drains the log in batches; SSE replay of a
+// deleted cursor keeps its existing stream.reset semantics.
+func (r *Repository) DeleteOlderThan(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	if r == nil || r.pool == nil {
+		return 0, fmt.Errorf("event repository is not configured")
+	}
+	if limit <= 0 {
+		return 0, nil
+	}
+	tag, err := r.pool.Exec(ctx, `
+		WITH doomed AS (
+			SELECT channel, seq FROM event WHERE created_at < $1 ORDER BY created_at LIMIT $2
+		)
+		DELETE FROM event WHERE (channel, seq) IN (SELECT channel, seq FROM doomed)
+	`, cutoff, limit)
+	if err != nil {
+		return 0, fmt.Errorf("delete old events: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}

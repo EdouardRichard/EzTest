@@ -113,3 +113,40 @@ func TestServiceRecordsAndListsThroughRepository(t *testing.T) {
 type ids struct{}
 
 func (ids) Next() int64 { return time.Now().UnixNano() }
+
+func TestDeleteOlderThanRemovesOldAuditRows(t *testing.T) {
+	pool := testutil.NewDB(t)
+	repo := auditpg.New(pool)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	old := now.Add(-100 * 24 * time.Hour)
+	recent := now.Add(-time.Hour)
+	for _, entry := range []audit.Entry{
+		{ID: 9101, Action: "retention.old", CreatedAt: old},
+		{ID: 9102, Action: "retention.recent", CreatedAt: recent},
+	} {
+		if err := repo.Insert(ctx, entry); err != nil {
+			t.Fatalf("Insert(%d): %v", entry.ID, err)
+		}
+	}
+	deleted, err := repo.DeleteOlderThan(ctx, now.Add(-90*24*time.Hour), 10)
+	if err != nil {
+		t.Fatalf("DeleteOlderThan: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("deleted = %d, want 1", deleted)
+	}
+	page, err := repo.List(ctx, audit.Filter{}, 10, nil)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	for _, entry := range page {
+		if entry.ID == 9101 {
+			t.Fatal("old audit row survived retention")
+		}
+		if entry.ID == 9102 {
+			return
+		}
+	}
+	t.Fatal("recent audit row was deleted")
+}
