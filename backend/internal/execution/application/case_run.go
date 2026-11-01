@@ -565,6 +565,7 @@ func (s *CaseRunner) Finish(ctx context.Context, scope tools.Scope, candidate ex
 	if err != nil {
 		return execution.CaseRun{}, mapExecutionError(err, "assertion_result")
 	}
+	steps = execution.NormalizeVisualSteps(steps, assertions)
 	status, class, summary, err := execution.Aggregate(execution.VerdictInput{
 		Case:       caseSnapshot,
 		Steps:      steps,
@@ -662,6 +663,7 @@ func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun executio
 	if err != nil {
 		return mapExecutionError(err, "assertion_result")
 	}
+	steps = execution.NormalizeVisualSteps(steps, assertions)
 	status, class, summary, err := execution.Aggregate(execution.VerdictInput{
 		Case: caseSnapshot, Steps: steps, Assertions: assertions, Finish: &candidate,
 	})
