@@ -446,7 +446,7 @@ function Set-SettingDbString {
 
 function Set-SettingDbNumber {
     param([string]$Key, [int]$Value)
-    return Set-SettingDbJson -Key $Key -JsonLiteral ([string]$Value)
+    return Set-SettingDbJson -Key $Key -JsonLiteral ("to_jsonb(" + $Value + "::numeric)")
 }
 
 function Initialize-Database {
@@ -1832,7 +1832,7 @@ function Scenario-ExecutorLoss {
     $otherRunningText = ($otherRunning | ForEach-Object { $_ -join "|" }) -join "`n"
     $null = Write-Evidence -Name "other-running-case-runs-before.json" -Content $otherRunningText
 
-    Write-Log "hard-killing executor B (taskkill /F /T) while case_run " + $targetRun.CaseRunID + " is running"
+    Write-Log ("hard-killing executor B (taskkill /F /T) while case_run " + $targetRun.CaseRunID + " is running")
     if ($null -ne $script:executorB) { Stop-OwnedProcess -Process $script:executorB.Process }
     $null = Wait-PortClosed -Port $ExecutorPortB -TimeoutSeconds 15
     $null = Add-Check (-not (Test-PortListening -Port $ExecutorPortB)) "executor B process is dead" ("port=" + $ExecutorPortB)
@@ -1897,7 +1897,7 @@ function Scenario-ExecutorLoss {
         $targetRun.CaseRunID + "';"))
     $null = Add-Check ($auditRows -ge 1) "execution.case_run_redispatched audit row recorded" ("rows=" + $auditRows)
 
-    $sameIntentRuns = [int](Get-Scalar "SELECT count(*) FROM case_run WHERE intent_id = " + $targetRun.IntentID + ";")
+    $sameIntentRuns = [int](Get-Scalar ("SELECT count(*) FROM case_run WHERE intent_id = (SELECT intent_id FROM case_run WHERE id = " + $targetRun.CaseRunID + ");"))
     $null = Add-Check ($sameIntentRuns -eq 1) "redispatch reused the single case_run row (no duplicate execution)" ("rows=" + $sameIntentRuns)
     $epochWorkDupes = [int](Get-Scalar (
         "SELECT count(*) FROM (SELECT 1 FROM work_item WHERE type = 'execute.case' AND version_id = " + $targetCase.VersionID +
