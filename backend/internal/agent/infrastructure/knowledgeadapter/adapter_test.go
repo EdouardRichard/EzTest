@@ -87,7 +87,7 @@ func TestRetrieveForVersionDerivesSystemKeysFromVersionFamilies(t *testing.T) {
 	systems := &fakeVersionSystemReader{keys: []string{"payment", "auth"}}
 	adapter := New(service, systems)
 
-	refs, tokens, err := adapter.RetrieveForVersion(context.Background(), 10, nil)
+	refs, tokens, err := adapter.RetrieveForVersion(context.Background(), 10, nil, "")
 	if err != nil {
 		t.Fatalf("RetrieveForVersion: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestRetrieveForVersionUsesExplicitSystemKeys(t *testing.T) {
 	systems := &fakeVersionSystemReader{keys: []string{"payment"}}
 	adapter := New(service, systems)
 
-	if _, _, err := adapter.RetrieveForVersion(context.Background(), 10, []string{"crm"}); err != nil {
+	if _, _, err := adapter.RetrieveForVersion(context.Background(), 10, []string{"crm"}, ""); err != nil {
 		t.Fatalf("RetrieveForVersion: %v", err)
 	}
 	if systems.calls != 0 {
@@ -133,7 +133,7 @@ func TestRetrieveForVersionWithoutSystemReaderInjectsGlobalKnowledge(t *testing.
 	service := &fakeKnowledgeService{}
 	adapter := New(service, nil)
 
-	if _, _, err := adapter.RetrieveForVersion(context.Background(), 10, nil); err != nil {
+	if _, _, err := adapter.RetrieveForVersion(context.Background(), 10, nil, ""); err != nil {
 		t.Fatalf("RetrieveForVersion: %v", err)
 	}
 	if len(service.injectInput.SystemKeys) != 0 {
@@ -146,18 +146,18 @@ func TestRetrieveForVersionPropagatesFailures(t *testing.T) {
 		return nil, platform.Unavailable("knowledge repository unavailable")
 	}}
 	adapter := New(service, nil)
-	if _, _, err := adapter.RetrieveForVersion(context.Background(), 10, nil); err == nil {
+	if _, _, err := adapter.RetrieveForVersion(context.Background(), 10, nil, ""); err == nil {
 		t.Fatal("inject failure was swallowed")
 	}
 
 	systems := &fakeVersionSystemReader{err: errors.New("version read failed")}
 	adapter = New(&fakeKnowledgeService{}, systems)
-	if _, _, err := adapter.RetrieveForVersion(context.Background(), 10, nil); err == nil {
+	if _, _, err := adapter.RetrieveForVersion(context.Background(), 10, nil, ""); err == nil {
 		t.Fatal("version system reader failure was swallowed")
 	}
 
 	adapter = New(nil, nil)
-	if _, _, err := adapter.RetrieveForVersion(context.Background(), 10, nil); err == nil {
+	if _, _, err := adapter.RetrieveForVersion(context.Background(), 10, nil, ""); err == nil {
 		t.Fatal("unwired knowledge service must fail")
 	}
 }
@@ -254,3 +254,17 @@ func TestProposeKnowledgeRejectsInvalidVersion(t *testing.T) {
 }
 
 func stringPtr(value string) *string { return &value }
+
+func TestRetrieveForVersionPassesQuery(t *testing.T) {
+	service := &fakeKnowledgeService{}
+	adapter := New(service, nil)
+	if _, _, err := adapter.RetrieveForVersion(context.Background(), 10, nil, "订单系统 退款"); err != nil {
+		t.Fatalf("RetrieveForVersion: %v", err)
+	}
+	if service.injectInput.Query != "订单系统 退款" {
+		t.Fatalf("inject query = %q", service.injectInput.Query)
+	}
+	if service.injectInput.VersionID != 10 {
+		t.Fatalf("inject version = %d", service.injectInput.VersionID)
+	}
+}
