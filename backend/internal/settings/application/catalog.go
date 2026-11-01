@@ -62,6 +62,9 @@ func Definitions(executorURL string) []settings.Definition {
 	minDPR, maxDPR := numberRange(0.5, 4)
 	minCompareTimeout, maxCompareTimeout := numberRange(5, 300)
 	minWaitTimeout, maxWaitTimeout := numberRange(1, 120)
+	minSearchResults, maxSearchResults := numberRange(1, 20)
+	minTodoItems, maxTodoItems := numberRange(1, 200)
+	minEvalRegression, maxEvalRegression := numberRange(0, 1)
 
 	return []settings.Definition{
 		{Key: "runtime.snowflake_node_id", Category: "runtime", Type: settings.TypeNumber, Default: num(1), Integer: true, Min: minNode, Max: maxNode, RestartRequired: true, Description: "Snowflake node ID (0-1023); unique per API instance."},
@@ -145,5 +148,9 @@ func Definitions(executorURL string) []settings.Definition {
 
 		{Key: "feature.auto_gap_design", Category: "feature", Type: settings.TypeBool, Default: boolean(true), Description: "Allow automatic design proposals for coverage gaps."},
 		{Key: "feature.experimental", Category: "feature", Type: settings.TypeBool, Default: boolean(false), Description: "Enable experimental features."},
+
+		{Key: "search.max_results_per_type", Category: "search", Type: settings.TypeNumber, Default: num(5), Integer: true, Min: minSearchResults, Max: maxSearchResults, Description: "Default maximum results per type for global search (query parameter may override)."},
+		{Key: "todos.max_items", Category: "workspace", Type: settings.TypeNumber, Default: num(50), Integer: true, Min: minTodoItems, Max: maxTodoItems, Description: "Default maximum items returned by the todos center (query parameter may override)."},
+		{Key: "quality.eval_baseline_regression", Category: "quality", Type: settings.TypeNumber, Default: num(0.05), Min: minEvalRegression, Max: maxEvalRegression, Description: "Tolerance marking an eval metric as a baseline regression (report-only, non-blocking)."},
 	}
 }

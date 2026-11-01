@@ -10,8 +10,8 @@ func TestOrderCoversEverySQLFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("orderedMigrations: %v", err)
 	}
-	if len(migrations) != 31 {
-		t.Fatalf("len = %d, want 31", len(migrations))
+	if len(migrations) != 33 {
+		t.Fatalf("len = %d, want 33", len(migrations))
 	}
 	for _, item := range migrations {
 		if !strings.HasSuffix(item.Name, ".sql") {
@@ -35,6 +35,8 @@ func TestOrderCoversEverySQLFile(t *testing.T) {
 		"execution_0004_visual_evidence.sql",
 		"version_0006_version_sut_code_baseline.sql",
 		"agent_0004_code_team.sql",
+		"quality_0001_eval.sql",
+		"agent_0005_profile_prompt_revision.sql",
 	}
 	tail := migrations[len(migrations)-len(wantTail):]
 	for i, want := range wantTail {
