@@ -826,9 +826,22 @@ func main() {
 	chainSvc := chainapp.NewChainService(
 		chainVersionProvider, chainDesignProvider, chainExecutionProvider,
 		chainDeliveryProvider, chainResourceProvider, chainCursorProvider, chainCursorProvider,
-		clk, p4ChainBudget(ctx, settingsSvc))
+		clk, p4ChainBudget(ctx, settingsSvc)).WithSettings(settingsSvc)
 	deliveryHandler := deliveryapi.New(issueSvc, deliveryapi.WithReports(reportSvc))
 	chainHandler := chainapi.New(chainSvc)
+
+	p6Read, err := newP6ReadRuntime(p6ReadDeps{
+		Pool:     pool,
+		IDs:      ids,
+		Clock:    clk,
+		Settings: settingsSvc,
+		Audit:    auditSvc,
+		Issues:   issueSvc,
+		Reports:  reportSvc,
+	})
+	if err != nil {
+		log.Fatalf("eztest: wire P6 read models: %v", err)
+	}
 
 	registerP4Plugins(issueSvc, analysisSvc, reportSvc, closureSvc, versionCloseSvc)
 
@@ -938,6 +951,7 @@ func main() {
 		VersionClose:  versionCloseSvc,
 		CodeIntel:     p5.CodeIntel,
 		Visual:        p5.Visual,
+		P6:            &p6Read.Handlers,
 	})
 
 	srv := &http.Server{
