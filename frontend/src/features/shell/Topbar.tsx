@@ -10,6 +10,8 @@ import { getApiBaseUrl } from "@/lib/api-client"
 import { connectSSE, type SSEStatus } from "@/lib/sse-client"
 import { findNavItem } from "@/navigation/nav-items"
 
+import { CommandPalette } from "@/features/search/CommandPalette"
+
 import { TodoDrawerButton } from "./TodoDrawer"
 
 const STATUS_META: Record<SSEStatus, { label: string; dotClassName: string }> = {
@@ -83,6 +85,7 @@ export function Topbar() {
       </div>
 
       <div className="ml-auto flex items-center gap-2">
+        <CommandPalette />
         <TodoDrawerButton versionId={currentVersionId} />
 
         <span
