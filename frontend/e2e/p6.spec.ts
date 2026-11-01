@@ -8,7 +8,6 @@ import { expect, type Page, test } from "@playwright/test"
  * No fake LLM or fake executor is used: every page reads the real read models,
  * and the prompt admin flow was exercised through the real model in acceptance.
  */
-const API = process.env.EZTEST_E2E_API_URL?.trim() || "http://127.0.0.1:14345"
 const VERSION_ID = process.env.EZTEST_E2E_P6_VERSION_ID?.trim() || "375072010541207552"
 const SCREENSHOT_DIR =
   process.env.EZTEST_E2E_P6_SCREENSHOT_DIR?.trim() ||
@@ -35,7 +34,9 @@ async function loginUI(page: Page, username: string, password: string): Promise<
 
 test.describe.configure({ mode: "serial" })
 
-test("admin sees quality, agent centre, global centres, chain, search and todos", async ({ page }) => {
+test("admin sees quality, agent centre, global centres, chain, search and todos", async ({
+  page,
+}) => {
   await loginUI(page, "admin", "admin123")
 
   await page.goto("/quality")

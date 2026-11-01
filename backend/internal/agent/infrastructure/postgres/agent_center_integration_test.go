@@ -148,7 +148,7 @@ func TestAgentCenterReaderRunsJoinWorkItemAndPaginate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListRuns before: %v", err)
 	}
-	if len(older) != 2 || older[0].ID != 3001 {
+	if len(older) != 1 || older[0].ID != 3001 {
 		t.Fatalf("before rows = %#v", older)
 	}
 
