@@ -22,6 +22,13 @@ const migrationsDir = path.join(root, "backend", "internal", "db", "migrations")
 const yaml = require(path.join(root, "frontend", "node_modules", "yaml"))
 
 const failures = []
+// Forward-compatible freeze marker: P5+ advances info.version/x-frozen, so this
+// P4 check asserts "P4 or later" instead of pinning the P4 literal (mirrors the
+// P4-D-10 change to p3-contract-check.cjs).
+const phaseOf = (value) => {
+  const match = /^P(\d+)$/.exec(value ?? "")
+  return match ? Number(match[1]) : 0
+}
 // Parsed P4 rows, filled below and used for the final reported counts.
 let p4EventTypes = []
 let p4TaskTypes = []
@@ -141,8 +148,12 @@ const p4Ops = [
 ]
 check(p4Ops.length === 14, "p4 operation table must list 14 operations")
 if (openapi && typeof openapi === "object") {
-  check(openapi.info?.version === "0.2.0-p4", "missing openapi info.version 0.2.0-p4")
-  check(openapi["x-frozen"] === "P4", "missing openapi x-frozen P4")
+  const versionMatch = /^0\.2\.0-p(\d+)$/.exec(openapi.info?.version ?? "")
+  check(
+    versionMatch !== null && Number(versionMatch[1]) >= 4,
+    "openapi info.version must be 0.2.0-p4 or later (P4 increment present)",
+  )
+  check(phaseOf(openapi["x-frozen"]) >= 4, "frozen mode: openapi root must be frozen at P4 or later")
   check(openapi["x-draft"] === undefined, "frozen mode: openapi root must not keep x-draft")
 
   const tagNames = (openapi.tags ?? []).map((tag) => tag.name)

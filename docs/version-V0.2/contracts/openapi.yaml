@@ -8012,6 +8012,10 @@ components:
       type: object
       required: [step_seq, kind, target, expected, target_version_sut_id, target_api_id, database_id]
       properties:
+        case_assertion_id:
+          type: string
+          pattern: '^[0-9]+$'
+          description: P5 additive; present when returned by the design case detail (used by visual assertion config).
         step_seq:
           type: integer
           minimum: 1

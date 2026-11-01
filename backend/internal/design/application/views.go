@@ -94,6 +94,7 @@ type CaseStepView struct {
 
 // CaseAssertionView is one assertion of a selected case version.
 type CaseAssertionView struct {
+	ID                 int64
 	StepSeq            int
 	Kind               string
 	Target             string
