@@ -65,9 +65,16 @@ func Definitions(executorURL string) []settings.Definition {
 	minSearchResults, maxSearchResults := numberRange(1, 20)
 	minTodoItems, maxTodoItems := numberRange(1, 200)
 	minEvalRegression, maxEvalRegression := numberRange(0, 1)
+	minRenderAttempts, maxRenderAttempts := numberRange(1, 10)
+	minRenderLease, maxRenderLease := numberRange(30, 1800)
+	minInjectionItems, maxInjectionItems := numberRange(0, 50)
+	minGCInterval, maxGCInterval := numberRange(5, 10080)
+	minGCBatch, maxGCBatch := numberRange(1, 5000)
 
 	return []settings.Definition{
 		{Key: "runtime.snowflake_node_id", Category: "runtime", Type: settings.TypeNumber, Default: num(1), Integer: true, Min: minNode, Max: maxNode, RestartRequired: true, Description: "Snowflake node ID (0-1023); unique per API instance."},
+		{Key: "instance.heartbeat_seconds", Category: "instance", Type: settings.TypeNumber, Default: num(10), Integer: true, Min: minHeartbeat, Max: maxHeartbeat, Description: "Interval between API instance heartbeats in seconds."},
+		{Key: "instance.offline_seconds", Category: "instance", Type: settings.TypeNumber, Default: num(30), Integer: true, Min: minOffline, Max: maxOffline, Description: "Heartbeat silence after which an API instance is marked offline."},
 		{Key: "paths.data_root", Category: "paths", Type: settings.TypeString, Default: str("./.data"), RestartRequired: true, Description: "Root directory for runtime content (relative to the process CWD)."},
 		{Key: "paths.attachment_dir", Category: "paths", Type: settings.TypeString, Default: str("./.data/attachments"), Description: "Requirement attachment directory."},
 		{Key: "paths.evidence_dir", Category: "paths", Type: settings.TypeString, Default: str("./.data/evidence"), Description: "Execution evidence directory."},
@@ -78,6 +85,7 @@ func Definitions(executorURL string) []settings.Definition {
 		{Key: "execution.per_sut_concurrency", Category: "execution", Type: settings.TypeNumber, Default: num(2), Integer: true, Min: minPerSUT, Max: maxPerSUT, Description: "Maximum concurrent case runs per version SUT."},
 		{Key: "execution.cross_system_concurrency", Category: "execution", Type: settings.TypeNumber, Default: num(1), Integer: true, Min: minCross, Max: maxCross, Description: "Maximum concurrent cross-SUT case runs."},
 		{Key: "execution.executor_url", Category: "execution", Type: settings.TypeString, Default: str(executorURL), Description: "Playwright executor base URL (seeded from EZTEST_EXECUTOR_PORT)."},
+		{Key: "execution.executor_urls", Category: "execution", Type: settings.TypeString, Default: str(""), Description: "Additional comma-separated executor endpoints; empty reuses execution.executor_url."},
 		{Key: "execution.evidence_max_bytes", Category: "execution", Type: settings.TypeNumber, Default: num(5 * 1024 * 1024), Integer: true, Min: number(0, 0), Description: "Maximum single evidence file size in bytes."},
 		{Key: "execution.case_timeout_seconds", Category: "execution", Type: settings.TypeNumber, Default: num(900), Integer: true, Min: number(1, 0), Description: "Hard timeout for one case run in seconds."},
 		{Key: "execution.executor_token", Category: "execution", Type: settings.TypeString, Default: str("eztest-dev-executor-token"), Secret: true, Description: "Bearer token sent by the API to the Playwright executor; masked in the admin API."},
@@ -126,9 +134,16 @@ func Definitions(executorURL string) []settings.Definition {
 		{Key: "retention.unreferenced_content_days", Category: "retention", Type: settings.TypeNumber, Default: num(30), Integer: true, Min: number(1, 0), Description: "Retention for unreferenced content."},
 		{Key: "retention.gc_grace_hours", Category: "retention", Type: settings.TypeNumber, Default: num(24), Integer: true, Min: number(1, 0), Description: "GC grace period."},
 		{Key: "retention.gc_dry_run", Category: "retention", Type: settings.TypeBool, Default: boolean(true), Description: "Run GC in dry-run mode by default."},
+		{Key: "retention.gc_interval_minutes", Category: "retention", Type: settings.TypeNumber, Default: num(1440), Integer: true, Min: minGCInterval, Max: maxGCInterval, Description: "Interval between leader-scheduled GC runs in minutes."},
+		{Key: "retention.gc_batch_size", Category: "retention", Type: settings.TypeNumber, Default: num(500), Integer: true, Min: minGCBatch, Max: maxGCBatch, Description: "Maximum candidate rows scanned by one GC pass."},
 
-		{Key: "report.template_version", Category: "report", Type: settings.TypeString, Default: str("1"), Description: "Built-in report template version."},
+		{Key: "report.template_version", Category: "report", Type: settings.TypeString, Default: str("2"), Description: "Built-in report template version (\"1\" or \"2\")."},
 		{Key: "report.render_pdf", Category: "report", Type: settings.TypeBool, Default: boolean(true), Description: "Render PDF alongside the authoritative HTML report."},
+		{Key: "report.section_appendix", Category: "report", Type: settings.TypeBool, Default: boolean(true), Description: "Include the appendix section in v2 reports."},
+		{Key: "report.render_max_attempts", Category: "report", Type: settings.TypeNumber, Default: num(3), Integer: true, Min: minRenderAttempts, Max: maxRenderAttempts, Description: "Maximum PDF render attempts before a revision is marked failed."},
+		{Key: "report.render_lease_seconds", Category: "report", Type: settings.TypeNumber, Default: num(120), Integer: true, Min: minRenderLease, Max: maxRenderLease, Description: "Lease duration for report PDF work items in seconds."},
+		{Key: "report.render_worker_url", Category: "report", Type: settings.TypeString, Default: str("http://127.0.0.1:13337"), Description: "Headless PDF renderer base URL."},
+		{Key: "report.render_token", Category: "report", Type: settings.TypeString, Default: str("eztest-dev-render-token"), Secret: true, Description: "Bearer token sent by the API to the PDF renderer; masked in the admin API."},
 		{Key: "report.section_summary", Category: "report", Type: settings.TypeBool, Default: boolean(true), Description: "Include the summary section in reports."},
 		{Key: "report.section_results", Category: "report", Type: settings.TypeBool, Default: boolean(true), Description: "Include the results section in reports."},
 		{Key: "report.section_issues", Category: "report", Type: settings.TypeBool, Default: boolean(true), Description: "Include the issues section in reports."},
@@ -141,6 +156,7 @@ func Definitions(executorURL string) []settings.Definition {
 		{Key: "chain.replay_event_limit", Category: "chain", Type: settings.TypeNumber, Default: num(500), Integer: true, Min: minChainReplay, Max: maxChainReplay, Description: "Maximum events read for event-range replay."},
 
 		{Key: "knowledge.injection_budget_tokens", Category: "knowledge", Type: settings.TypeNumber, Default: num(4000), Integer: true, Min: number(0, 0), Description: "Token budget for knowledge injected into a prompt."},
+		{Key: "knowledge.injection_max_items", Category: "knowledge", Type: settings.TypeNumber, Default: num(5), Integer: true, Min: minInjectionItems, Max: maxInjectionItems, Description: "Maximum knowledge items injected into one prompt."},
 		{Key: "knowledge.review_required", Category: "knowledge", Type: settings.TypeBool, Default: boolean(true), Description: "Require admin review before knowledge is approved."},
 
 		{Key: "security.audit_retention_days", Category: "security", Type: settings.TypeNumber, Default: num(90), Integer: true, Min: number(1, 0), Description: "Audit log retention in days."},

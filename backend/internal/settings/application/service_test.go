@@ -132,8 +132,8 @@ func newTestService(t *testing.T, repo *fakeRepo) (*Service, *fakeAudit, *fakePu
 
 func TestDefinitionsAreUniqueAndWellFormed(t *testing.T) {
 	defs := Definitions("http://127.0.0.1:13336")
-	if len(defs) != 72 {
-		t.Fatalf("catalog has %d keys, want 72 (P6: 69 -> 72)", len(defs))
+	if len(defs) != 83 {
+		t.Fatalf("catalog has %d keys, want 83 (P7: 72 -> 83)", len(defs))
 	}
 	seen := map[string]bool{}
 	for _, def := range defs {
@@ -199,8 +199,8 @@ func TestP3ExecutionSettings(t *testing.T) {
 			executionKeys++
 		}
 	}
-	if executionKeys != 11 {
-		t.Fatalf("execution settings = %d, want 11 (6 frozen + 5 P3)", executionKeys)
+	if executionKeys != 12 {
+		t.Fatalf("execution settings = %d, want 12 (6 frozen + 5 P3 + 1 P7)", executionKeys)
 	}
 }
 
