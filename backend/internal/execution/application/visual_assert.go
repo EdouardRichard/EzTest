@@ -215,12 +215,22 @@ func (s *CaseRunner) VisualAssert(ctx context.Context, scope tools.Scope, assert
 		return nil, mapExecutionError(baselineErr, "visual_baseline")
 	}
 	baselineInvalid := false
+	configChanged := false
 	baselineBytes, readErr := s.readBaselineBytes(ctx, baseline)
 	if hasBaseline && readErr != nil {
 		// The baseline cannot be used, but the actual capture still runs so the
 		// outcome is a reproducible inconclusive(visual_baseline_invalid).
 		hasBaseline = false
 		baselineInvalid = true
+	}
+	if !hasBaseline && !baselineInvalid {
+		if reader, ok := s.visual.(interface {
+			LatestBaselineConfigRevision(context.Context, int64, int64) (int, bool, error)
+		}); ok {
+			if revision, found, revisionErr := reader.LatestBaselineConfigRevision(ctx, cfg.VersionID, cfg.ID); revisionErr == nil && found && revision != cfg.ConfigRevision {
+				configChanged = true
+			}
+		}
 	}
 
 	args, err := s.visualCompareArgs(ctx, cfg, baselineBytes, hasBaseline)
@@ -274,7 +284,7 @@ func (s *CaseRunner) VisualAssert(ctx context.Context, scope tools.Scope, assert
 		return s.writeVisualFailure(ctx, caseRun, scope, assertion, cfg, VisualReasonActualInvalid, false)
 	}
 
-	classification, reason := classifyVisual(hasBaseline, baselineInvalid, payload.EnvironmentMatch, payload.DiffRatio, cfg.Threshold)
+	classification, reason := classifyVisual(hasBaseline, baselineInvalid, configChanged, payload.EnvironmentMatch, payload.DiffRatio, cfg.Threshold)
 	var diffEvidenceID *int64
 	if classification == VisualClassificationPassed || classification == VisualClassificationFailed {
 		if diffArtifact, ok := visualArtifact(actionResult.Artifacts, "diff_png", "visual_diff"); ok {
@@ -561,10 +571,12 @@ func decodeVisualArtifact(artifact BrowserArtifact) ([]byte, error) {
 	return data, nil
 }
 
-func classifyVisual(hasBaseline, baselineInvalid, environmentMatch bool, diffRatio, threshold float64) (classification, reason string) {
+func classifyVisual(hasBaseline, baselineInvalid, configChanged, environmentMatch bool, diffRatio, threshold float64) (classification, reason string) {
 	switch {
 	case baselineInvalid:
 		return VisualClassificationInconclusive, VisualReasonBaseInvalid
+	case !hasBaseline && configChanged:
+		return VisualClassificationInconclusive, VisualReasonConfigChanged
 	case !hasBaseline:
 		return VisualClassificationInconclusive, VisualReasonMissingBase
 	case !environmentMatch:

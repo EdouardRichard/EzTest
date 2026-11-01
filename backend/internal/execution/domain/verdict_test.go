@@ -428,6 +428,38 @@ func TestVisualMissingBaselineBlockedStepIsInconclusive(t *testing.T) {
 	}
 }
 
+func TestVisualResultOverridesAgentBlocked(t *testing.T) {
+	in := VerdictInput{
+		Case:         visualCaseSnapshot(),
+		AgentFailure: FailureClassBlocked,
+		Steps:        []StepResult{{Seq: 1, Status: StepBlocked, Error: "missing_visual_baseline"}},
+		Assertions: []AssertionResult{
+			passedAssertion(1, 1, "ui"),
+			visualAssertion(1, 2, AssertionInconclusive, "missing_visual_baseline"),
+		},
+	}
+	status, class, summary, err := Aggregate(in)
+	if err != nil || status != CaseRunInconclusive || class != "" || summary.VerdictReason != "missing_visual_baseline" {
+		t.Fatalf("got %s/%s reason=%q err=%v", status, class, summary.VerdictReason, err)
+	}
+}
+
+func TestVisualEnvironmentOverridesAgentFailure(t *testing.T) {
+	in := VerdictInput{
+		Case:         visualCaseSnapshot(),
+		AgentFailure: FailureClassEnvironment,
+		Steps:        []StepResult{{Seq: 1, Status: StepFailed}},
+		Assertions: []AssertionResult{
+			passedAssertion(1, 1, "ui"),
+			visualAssertion(1, 2, AssertionInconclusive, "visual_environment_mismatch"),
+		},
+	}
+	status, class, summary, err := Aggregate(in)
+	if err != nil || status != CaseRunInconclusive || class != FailureClassEnvironment || summary.VerdictReason != "visual_environment_mismatch" {
+		t.Fatalf("got %s/%s reason=%q err=%v", status, class, summary.VerdictReason, err)
+	}
+}
+
 func TestAggregateFailedStepDoesNotUpgradeToApplication(t *testing.T) {
 	in := VerdictInput{
 		Case: caseSnapshotForVerdict(1),

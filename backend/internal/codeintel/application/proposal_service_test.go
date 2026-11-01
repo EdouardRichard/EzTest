@@ -312,3 +312,12 @@ func TestProposalList(t *testing.T) {
 
 // int64Ptr is a tiny test helper.
 func int64Ptr(value int64) *int64 { return &value }
+
+func TestNetworkRouteResolvesBrowserRelativeURL(t *testing.T) {
+	method, path, ok := networkRoute("https://staging.example.test", NetworkRequest{
+		Method: "GET", URL: "/p5/api/orders",
+	})
+	if !ok || method != "GET" || path != "/p5/api/orders" {
+		t.Fatalf("networkRoute = %q %q %v", method, path, ok)
+	}
+}
