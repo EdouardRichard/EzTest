@@ -74,7 +74,7 @@ system_setting_revision(
   → 发 `settings.updated` 事件（`system` 频道）→ 写审计。
 - `restart_required` 只做 UI 提示，不阻断更新。
 - 未知 key → 404 `not_found`；类型/区间错误 → 400 `invalid_argument`（`details.field` 指向 key）。
-- `GET /api/admin/settings` 返回完整目录（P0 为 44 项；P3 起 49 项）。PATCH 单项返回更新后的设置项。
+- `GET /api/admin/settings` 返回完整目录（P8 冻结时 85 项 = P0 44 + P3 5 + P4 4 + P5 16 + P6 3 + P7 11 + P8 2）。PATCH 单项返回更新后的设置项。
 
 ### 2.1 secret 语义
 
@@ -89,9 +89,10 @@ system_setting_revision(
 - 业务代码必须通过设置 Service 读取（不得直接读 env/文件），因此绝大多数键**即时生效**。
 - `restart_required=true` 的键：值会立即写入并热加载，但其**实际运行时效果**需要重启进程
   （如雪花 node、数据根目录）。UI 只显示提示，不阻止保存。
+- `restart_required=false` 只表示**写入即可读到新值**（设置 Service 缓存失效）；若消费方在启动时读取快照（如 `report.render_worker_url`/`report.render_token`/`report.section_*`），实际效果仍可能需重启，见 §4g 的“热加载/语义”列。
 - 相对路径按进程 CWD 解析；`paths.data_root` 启动后不可热改（重启生效）。
 
-## 3. 设置键目录（P0 44 项 + P3 5 项 + P4 4 项 + P5 16 项 + P6 3 项 = 72 项；P7 新增 11 键见 §4g，P7 后共 83 项）
+## 3. 设置键目录（P0 44 项 + P3 5 项 + P4 4 项 + P5 16 项 + P6 3 项 = 72 项；P7 新增 11 键见 §4g，P7 后 = **83** 项；P8 新增 2 键见 §4h，P8 后共 **85** 项）
 
 `secret` 列：P0 44 项全部为 `false`；P3 的 `execution.executor_token` 为 `true`（表中以 **secret** 标注），其余 4 项为 `false`；P4 4 个 `chain.*` 键全部为 `false`；P5 16 个 `codeintel.*`/`visual.*` 键全部为 `false`；P6 3 个 `search.*`/`todos.*`/`quality.*` 键全部为 `false`。
 重启列中“是”对应 `restart_required=true`。
@@ -276,7 +277,7 @@ workspace 1、quality 1 = **72**（P0 44 + P3 5 + P4 4 + P5 16 + P6 3；P7 新�
 ## 4g. P7 使用说明（frozen: P7，2026-11-01）
 
 - P7 **不新增** EzTest 启动 env：仍是严格 4 项（`.env` 只有 `EZTEST_DATABASE_URL`/`EZTEST_API_PORT`/`EZTEST_WEB_PORT`/`EZTEST_EXECUTOR_PORT`）。新增配置一律进设置中心，不引入第 5 个 EzTest env。
-- P7 新增 **11 键**（72→83）；新增 `instance` 类别（2 键）；既有类别增量：report 7→12（+5）、knowledge 2→3（+1）、retention 5→7（+2）、execution 11→12（+1）。11 键全部 `restart_required=false`、热加载；仅 `report.render_token` 为 **secret=true**。
+- P7 新增 **11 键**（72→83）；新增 `instance` 类别（2 键）；既有类别增量：report 7→12（+5）、knowledge 2→3（+1）、retention 5→7（+2）、execution 11→12（+1）。11 键均 `restart_required=false`；DB 值写入后设置 Service 缓存即时失效，但**并非全部即时影响运行时**——部分消费方在启动时读取快照（见下表“热加载/语义”列）；仅 `report.render_token` 为 **secret=true**。
 
 | key | type | category | default | 取值/范围 | secret | restart | 热加载/语义 |
 |---|---|---|---|---|---|---|---|
@@ -304,6 +305,21 @@ workspace 1、quality 1 = **72**（P0 44 + P3 5 + P4 4 + P5 16 + P6 3；P7 新�
   - `runtime.snowflake_node_id`：P0 起用于雪花 node；P7 扩展为 `api_instance.node_id` 的首选值；被占用时取最小空闲 0–1023。
 - 11 键均不标记 `restart_required=true`（DB 值即时写入/读取；设置 Service 缓存失效）；**消费方读取时机不同**：`report.section_appendix`、`report.render_worker_url`、`report.render_token` 以及既有 `report.template_version`/`report.section_*` 在进程启动时读取（重启后生效）；`report.render_pdf`/`report.render_max_attempts` 的发布路径使用启动快照，reconciler/worker 每轮读取 live 值；`report.render_lease_seconds`、`knowledge.injection_max_items`、`retention.gc_*`、`instance.offline_seconds`、`execution.executor_urls` 在下一轮读取/循环生效。secret 语义沿用 P3/P6（`GET /api/admin/settings` 返回 `null`，revision 存 `null`，更新审计不含明文）。
 - 类别计数（P7 后）：runtime 1、paths 5、execution 12、chain 4、agent 5、llm 2、context 4、team_room 3、retention 7、report 12、knowledge 3、security 2、feature 2、codeintel 9、visual 7、search 1、workspace 1、quality 1、instance 2 = **83**（P0 44 + P3 5 + P4 4 + P5 16 + P6 3 + P7 11）。
+
+## 4h. P8 使用说明（frozen: P8，2026-11-02）
+
+- P8 **不新增** EzTest 启动 env：仍是严格 4 项（`.env` 只有 `EZTEST_DATABASE_URL`/`EZTEST_API_PORT`/`EZTEST_WEB_PORT`/`EZTEST_EXECUTOR_PORT`）。新增配置一律进设置中心，不引入第 5 个 EzTest env。
+- P8 新增 **2 键**（83→85）；类别增量：`retention` 7→8（+1，`retention.event_days`）、`security` 2→3（+1，`security.rate_limit_per_minute`）；两键均非 secret、`restart_required=false`。
+- 默认值保守：`security.rate_limit_per_minute=0` 关闭限流；`retention.event_days=90` 只清理超过 90 天的事件。升级既有库无需数据迁移：`settings.SeedDefaults` 幂等插入缺失键。
+
+| key | type | category | default | 取值/范围 | secret | restart | 热加载/语义 |
+|---|---|---|---|---|---|---|---|
+| `security.rate_limit_per_minute` | number | security | `0` | 整数 0–60000；0=关闭 | 否 | 否 | 热加载；每实例全局令牌桶（rate=limit/60，burst=max(limit/10,1)），下一请求生效；总速率=副本数×限额；跳过 `/healthz`/`/api/health`/`/api/health/ready`/`/api/stream` 与静态资源；超限 429 `rate_limited` + `Retry-After`；不写事件 |
+| `retention.event_days` | number | retention | `90` | 整数 1–3650 | 否 | 否 | 热加载；leader 日循环清理 `event.created_at < now()-days`；单批 `retention.gc_batch_size`；审计复用既有 `security.audit_retention_days`（默认 90）；清理写审计 action `retention.cleanup`；下一轮循环生效 |
+
+- 类别计数（P8 后）：runtime 1、paths 5、execution 12、chain 4、agent 5、llm 2、context 4、team_room 3、retention 8、report 12、knowledge 3、security 3、feature 2、codeintel 9、visual 7、search 1、workspace 1、quality 1、instance 2 = **85**（P0 44 + P3 5 + P4 4 + P5 16 + P6 3 + P7 11 + P8 2）。
+- 两者均热加载：限流在下一请求生效（设置读取走热缓存；limit=0 直接放行）；事件保留在下一轮日循环生效（间隔读 `retention.gc_interval_minutes`）。审计保留期沿用 `security.audit_retention_days`，P8 不改其默认/语义。
+- `security.rate_limit_per_minute` 是**实例级**额度，不是用户级；多副本总速率=副本数×限额（P8-D-13）。验收临时设 30 验证 429+`Retry-After`，结束后恢复 0。
 
 ## 5. 冻结与变更控制
 

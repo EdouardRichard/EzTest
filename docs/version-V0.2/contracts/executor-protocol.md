@@ -2,6 +2,7 @@
 
 > 状态：`frozen: P3`（2026-11-01；创建即冻结，P4+ 只允许增量）。
 > P5 增量：§11（`visual.compare`，协议 v1.2，`frozen: P5`，2026-11-01）；§3.3/§4/§8 只做增量补充，P3 语义不变。
+> P8 增量：§12.3 多端点 per-executor 派发转正为 P8 已实现（`frozen: P8`，2026-11-02）；线协议仍 v1.2，action/认证/限额不变。
 > 来源：`docs/superpowers/specs/2026-11-01-eztest-v02-p3-execution-design.md` §6.1/§6.2/§6.10；`architecture-design.md` §11；`high-level-design.md` §1.3。
 > 实现：`executor/src`（Node + Playwright）与 `backend/internal/execution/infrastructure/executor`（API 侧客户端）。
 > 边界：执行器只执行动作/回传证据，不接触 LLM 上下文、不实现 case/wave 语义（P3-D-10/P3-D-35）。P3 的执行主体是 API 内 Case Executor Agent。
@@ -131,11 +132,12 @@ P3 采用 **API pull healthz**（P3-D-01），执行器不主动 push：
 - 单次 ≤300s；累计等待计入 `execution.case_timeout_seconds`（默认 900s，可 admin 调整）；P3 不承诺 >900s 的无限等待。
 - **执行器进程不实现 sleep**；`browser.wait_for` 仍只用于 ≤60s 的可见性等待。120s 时间窗口纳入 `-LongWait` 验收（默认 10s 窗口）。
 
-## 10. P7 保留与变更控制
+## 10. P3 之后保留与变更控制
 
-- P7 保留（P3 不实现）：`/api/internal/executors/*` push 注册/心跳、内部鉴权 scheme、多副本执行器调度与 fan-out、跨实例实时、远程浏览器/VNC、`storage_state` 导入/复用、条件轮询工具（如 wait_until）、>300s 单次等待。
+- P3 记录为 P7 候选项且 **P7 已实现**：`/api/internal/executors/*` push 注册/心跳、内部鉴权 scheme、多副本执行器调度与 fan-out、跨实例实时（详见 §12）；P8 将 §12.3 多端点 per-executor 派发转正。
+- 仍保留（不实现）：远程浏览器/VNC、`storage_state` 导入/复用、条件轮询工具（如 wait_until）、>300s 单次等待。
 - 执行器协议 P3 冻结后只允许**增量**：新增 action/字段必须同时更新本文件、`executor/src`、API 客户端与测试；破坏性变更（改既有 action 语义/认证/大小限额）需先更新契约/决策/handoff。
-- token/注册方式（pull）与 HLD 的 `/api/internal/executors/*` push 差异记录为 P3-D-01/P3-D-02，P7 多副本时补 push（记录于 §10 与 handoff）。
+- token/注册方式（pull）与 HLD 的 `/api/internal/executors/*` push 差异记录为 P3-D-01/P3-D-02；P7 已补 push（§12），P8 仅把多端点派发转正（§12.3），线协议仍 v1.2。
 
 ## 11. P5 增量：`visual.compare`（协议 v1.2，`frozen: P5`，2026-11-01）
 
@@ -200,9 +202,10 @@ P3 采用 **API pull healthz**（P3-D-01），执行器不主动 push：
 
 ### 12.3 容量选择与排空
 
-- **P7 实现边界（多端点派发 = backlog）**：`execution.executor_urls` 非空时，全部端点仍会被 poll/注册/心跳/在管理端列出，但 **派发只限主端点 `execution.executor_url`** 对应的可派发行（composition root 的 `primaryExecutorRegistry.Select`）。次级端点和 push 注册的端点当前只保活、不参与派发。按容量排序（`capacity DESC, last_heartbeat DESC, id ASC`）与跨端点容量选择只在 **per-executor 路由落地（P8 backlog）后** 生效；在此之前不要依赖 `executor_urls` 分流或容量排序。
-- 单端点兼容：`execution.executor_urls` 为空时保持 P3 语义，只从 `execution.executor_url` 对应端点行派发；push 注册的其它端点只保活、不参与派发。
-- 调度只从 `status='active' AND active_contexts < capacity` 的行中选择；多端点派发启用后按 `capacity DESC, last_heartbeat DESC, id ASC` 排序（容量大者优先、最近心跳优先、稳定 id）。
+- **P8 已实现（P8-D-11，per-executor 路由）**：`execution.executor_urls` 非空时，全部端点参与 poll/注册/心跳/管理端列出，并从所有可派发行中按容量选择；派发不再限主端点。组装根使用完整 `Registry`（含 push 注册端点）替换 `primaryExecutorRegistry`，`Registry.Select` 的 `capacity DESC, last_heartbeat DESC, id ASC` 排序生效；`owner_executor_id` 记录真实执行器，`case_run_sut_context.executor_id` 落库。
+- **线协议不变**：仍为 **v1.2**，不新增/修改 action；`BrowserExecutor` 端口按 `executorID` 路由 `CreateContext`/`Action`/`Cancel`/`Close`，HTTP 请求/响应/认证/限额/证据映射与 §11 不变。
+- 单端点兼容：`execution.executor_urls` 为空时保持 P3 语义，只从 `execution.executor_url` 对应端点行派发；push 注册的其它端点只保活、不参与派发（P8 不改变空列表语义）。
+- 调度只从 `status='active' AND active_contexts < capacity` 的行中选择；per-executor 派发按 `capacity DESC, last_heartbeat DESC, id ASC` 排序（容量大者优先、最近心跳优先、稳定 id）。
 - `capacity=0` 永不选中；`draining` 停止新派发、在飞 case_run 继续；`offline` 不派发，pending 等待恢复，running 由 reconciler 按 `interrupted(executor_lost)` 且 `dispatch_epoch++` 重派（最多 3 次，沿用 P3）。
 - 无可用执行器 → 派发返回 503 `executor_unavailable`（沿用 P3 错误语义）；degraded 只影响告警/派发前复检，不直接排除。
 - 不实现跨执行器上下文迁移；一个 case_run 的同一 `(version_sut_id, account_role)` context 仍在同一执行器内复用（§6）。

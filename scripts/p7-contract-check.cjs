@@ -13,8 +13,9 @@
  *   - report.render_pdf task (team ops) + knowledge.propose tool
  *   - PDF / recurrence / SUT family additive fields
  *
- * The totals below are the frozen P7 totals; P8+ gates should relax them to
- * ">=" instead of editing this file.
+ * This gate is forward-compatible with P8+: it proves the P7 increment and
+ * frozen totals still exist, but accepts later phases that only append
+ * migrations/settings/operations (totals use ">=", phase markers accept P7+).
  */
 const fs = require("node:fs")
 const path = require("node:path")
@@ -35,6 +36,10 @@ const check = (ok, message) => {
   }
 }
 const countMatches = (text, pattern) => (text.match(pattern) || []).length
+const phaseOf = (value) => {
+  const match = /^P(\d+)$/.exec(value ?? "")
+  return match ? Number(match[1]) : 0
+}
 
 const openapiText = read("openapi.yaml")
 const db = read("db-schema.md")
@@ -58,8 +63,9 @@ try {
 // OpenAPI identity, counts, tags and the 18 P7 operations.
 // ---------------------------------------------------------------------------
 if (openapi && typeof openapi === "object") {
-  check(openapi.info?.version === "0.2.0-p7", "openapi info.version = 0.2.0-p7")
-  check(openapi["x-frozen"] === "P7", "openapi x-frozen: P7")
+  const openapiPhase = Number((/^0\.2\.0-p(\d+)$/.exec(openapi.info?.version ?? "") || [])[1] || 0)
+  check(openapiPhase >= 7, `openapi info.version 0.2.0-p7+ (got ${openapi.info?.version ?? "missing"})`)
+  check(phaseOf(openapi["x-frozen"]) >= 7, `openapi x-frozen P7+ (got ${openapi["x-frozen"] ?? "missing"})`)
   check(openapi["x-draft"] === undefined, "openapi has no x-draft marker")
   check(!openapiText.includes("x-draft:"), "openapi text has no x-draft: marker")
 
@@ -71,9 +77,9 @@ if (openapi && typeof openapi === "object") {
     }
   }
   const schemas = Object.keys(openapi.components?.schemas ?? {})
-  check(paths.length === 162, `openapi paths = 162 (got ${paths.length})`)
-  check(operations.length === 200, `openapi operations = 200 (got ${operations.length})`)
-  check(schemas.length === 264, `openapi schemas = 264 (got ${schemas.length})`)
+  check(paths.length >= 162, `openapi paths >= 162 (got ${paths.length})`)
+  check(operations.length >= 200, `openapi operations >= 200 (got ${operations.length})`)
+  check(schemas.length >= 264, `openapi schemas >= 264 (got ${schemas.length})`)
 
   const tagNames = (openapi.tags ?? []).map((tag) => tag.name)
   for (const tag of ["Knowledge", "Admin", "Internal"]) {
@@ -320,17 +326,23 @@ if (fs.existsSync(orderPath)) {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith("#"))
-  check(order.length === 40, `order.txt = 40 migrations (got ${order.length})`)
+  check(order.length >= 40, `order.txt >= 40 migrations (got ${order.length})`)
+  const p7Start = order.indexOf(p7MigrationFiles[0])
   check(
-    JSON.stringify(order.slice(-7)) === JSON.stringify(p7MigrationFiles),
-    "order.txt tail = P7 #34-#40",
+    p7Start === 33,
+    `order.txt P7 #34 starts at position 34 (got ${p7Start + 1})`,
+  )
+  check(
+    p7Start >= 0 &&
+      JSON.stringify(order.slice(p7Start, p7Start + 7)) === JSON.stringify(p7MigrationFiles),
+    "order.txt contains P7 #34-#40 as a contiguous block (later phases append only)",
   )
   check(new Set(order).size === order.length, "order.txt has no duplicate entries")
 }
 const sqlFiles = fs
   .readdirSync(migrationsDir)
   .filter((name) => name.endsWith(".sql"))
-check(sqlFiles.length === 40, `migrations/*.sql = 40 files (got ${sqlFiles.length})`)
+check(sqlFiles.length >= 40, `migrations/*.sql >= 40 files (got ${sqlFiles.length})`)
 for (const file of p7MigrationFiles) {
   check(fs.existsSync(path.join(migrationsDir, file)), `migration file ${file}`)
 }
@@ -378,7 +390,7 @@ check(fs.existsSync(catalogPath), "settings catalog.go exists")
 if (fs.existsSync(catalogPath)) {
   const catalog = fs.readFileSync(catalogPath, "utf8")
   const catalogKeys = countMatches(catalog, /\{Key: "/g)
-  check(catalogKeys === 83, `settings catalog keys = 83 (got ${catalogKeys})`)
+  check(catalogKeys >= 83, `settings catalog keys >= 83 (got ${catalogKeys})`)
   for (const key of [
     "report.section_appendix",
     "report.render_max_attempts",
@@ -440,7 +452,10 @@ check(executor.includes("`POST /api/internal/executors/heartbeat`"), "executor-p
 check(executor.includes("`execution.executor_token`"), "executor-protocol Bearer token")
 check(executor.includes("`execution.executor_urls`"), "executor-protocol multi endpoint setting")
 check(executor.includes("`max_contexts`"), "executor-protocol max_contexts alias")
-check(executor.includes("单端点兼容") && executor.includes("不参与派发"), "executor-protocol primary endpoint dispatch restriction")
+check(
+  executor.includes("单端点兼容") && executor.includes("`execution.executor_urls`"),
+  "executor-protocol multi-endpoint + single-endpoint compatibility",
+)
 check(executor.includes("capacity DESC, last_heartbeat DESC, id ASC"), "executor-protocol capacity ordering")
 
 // ---------------------------------------------------------------------------
@@ -466,5 +481,5 @@ if (failures > 0) {
   process.exit(1)
 }
 console.log(
-  "P7 contract check OK: 18 P7 ops / 162 paths / 200 operations / 264 schemas / 6 tables / #34-#40 (40) / 12 events / 83 settings / report.render_pdf (ops) + knowledge.propose",
+  "P7 contract check OK: 18 P7 ops / >=162 paths / >=200 operations / >=264 schemas / 6 tables / #34-#40 / 12 events / >=83 settings / report.render_pdf (ops) + knowledge.propose",
 )

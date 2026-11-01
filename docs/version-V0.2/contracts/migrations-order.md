@@ -287,9 +287,30 @@ agent_0006_ops_team.sql
 - 主键/约束/索引命名：`pk_knowledge_item`、`ck_knowledge_item_scope`、`idx_knowledge_item_scope_status_id`、`idx_knowledge_item_status_id`、`idx_knowledge_item_source_version`、`idx_knowledge_item_search`、`pk_knowledge_revision`、`uk_knowledge_revision_knowledge_id_revision`、`idx_knowledge_revision_knowledge_id_id`、`pk_knowledge_usage`、`idx_knowledge_usage_knowledge_id_id`、`pk_gc_run`、`uk_gc_run_running`、`idx_gc_run_started_at`、`pk_gc_tombstone`、`idx_gc_tombstone_run_id`、`idx_content_ref_live_object`、`idx_content_object_created_at`、`idx_delivery_report_revision_pdf_pending`、`pk_api_instance`、`uk_api_instance_instance_key`、`uk_api_instance_node_id`、`idx_api_instance_status_heartbeat`、`idx_sut_family`。
 - 全部新表雪花 `BIGINT` 主键（应用生成）、`TIMESTAMPTZ`（API 为 RFC3339 UTC）；`knowledge_revision`/`knowledge_usage` 的同上下文 FK、`gc_tombstone.run_id → gc_run.id` 同上下文 FK 显式；跨上下文只做逻辑引用（版本/identity/agent_run/work_item）。
 - 集成测试断言 **40** 个迁移、6 张 P7 新表、`#34–#40` 的尾部顺序、**二次执行 no-op**（`schema_migrations` 不变）；`migrate_test.go` 的 `wantTail` 固定为上述 7 个文件、迁移计数 33→40。
-- 开发库/演示库照常启动前滚；回滚仍为恢复备份，不提供 down SQL（见 §10）。
+- 开发库/演示库照常启动前滚；回滚仍为恢复备份，不提供 down SQL（见 §11）。
 
-## 10. 回滚 / 备份 / 数据库边界
+## 10. P8 增量迁移（frozen: P8，2026-11-02）
+
+P0–P7 的 40 个迁移保持原样；P8 在 `order.txt` 末尾追加 2 个文件（第 41–42 个）：
+
+| 序号 | 迁移文件 | 上下文（ownership） | 创建/变更 |
+|---|---|---|---|
+| 41 | `orchestration_0002_instance_inflight.sql` | orchestration | `api_instance` 新增 `active_requests`/`active_work`（INTEGER NOT NULL DEFAULT 0 + 非负 CHECK；P8 in-flight 计数） |
+| 42 | `execution_0005_case_run_sut_context_executor.sql` | execution | `case_run_sut_context` 新增 `executor_id BIGINT NULL`（逻辑引用 `executor_instance.id`，不建 FK；正数 CHECK） |
+
+`order.txt` 末尾追加：
+
+```text
+orchestration_0002_instance_inflight.sql
+execution_0005_case_run_sut_context_executor.sql
+```
+
+- **P8 不新增表**：业务表合计仍 **85**；#41/#42 只 ALTER 既有表、不建索引、不改历史文件/checksum。迁移执行后 `order.txt` 共 **42** 行。
+- 固定顺序 41→42（orchestration → execution）；只追加、不回改 P0–P7；`api_instance` 既有行默认 0，`case_run_sut_context` 既有行 `executor_id=NULL`。
+- 集成测试断言 **42** 个迁移、P8 不新增表、`#41–#42` 尾部顺序、**二次执行 no-op**（`schema_migrations` 不变）；`migrate_test.go` 的 `wantTail` 追加上述 2 个文件、迁移计数 40→42。
+- 回滚仍为恢复备份，不提供 down SQL（见 §11）；P8 不修改已冻结的 #1–#40。
+
+## 11. 回滚 / 备份 / 数据库边界
 
 - P0 **只支持前滚**：没有 down migration，也不提供自动回滚。
 - 部署/验收前必须备份目标库（`pg_dump` / 环境快照）；恢复方式是恢复备份，而不是执行 down SQL。
@@ -298,7 +319,7 @@ agent_0006_ops_team.sql
 - 多实例同时启动时，advisory lock 使只有一个实例执行迁移，其余等待后看到已完成状态并跳过。
 - 迁移失败时进程必须**拒绝启动 HTTP**（不得带着半迁移 schema 提供服务）。
 
-## 11. 冻结与变更控制
+## 12. 冻结与变更控制
 
 - 本文件在 P0 冻结；P1+ 只能**追加**文件与 `order.txt` 行，并在本文件新增说明。
 - 破坏性变更（改列、改约束、改语义）必须先停止、说明影响面、更新 contracts + 决策记录 + 调用方/测试，再实施。

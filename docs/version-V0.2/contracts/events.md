@@ -503,3 +503,22 @@ P5 事件一律发布到 `version:{version_id}` 频道（索引/分析/视觉）
 8. 审计只追加；metadata 不含 secret/token/知识正文/PDF 字节/内部路径；`knowledge.reject/revoke` 的 reason 可入审计（≤2000），事件同样带 reason。
 9. 事件类型冻结后只能新增，不得重命名/回退；P0–P6 payload 语义不变。
 
+## 17. P8 增量（frozen: P8，2026-11-02）
+
+> 来源：`docs/superpowers/specs/2026-11-02-eztest-v02-p8-hardening-acceptance-design.md` §8。
+> P8 **不新增事件类型**（事件类型仍 **118**）；只新增 1 个审计 action `retention.cleanup`（由 leader 日循环清理 worker 写入）；复用既有 `settings.updated` 作为跨实例设置缓存失效触发，不改变其 payload/频道/SSE/游标语义。
+
+### 17.1 审计 action（1 个）
+
+| action | 触发 | metadata 要点 |
+|---|---|---|
+| `retention.cleanup` | 保留清理 worker 删除过期事件/审计行后（leader 日循环；失败只记日志，不阻塞其他循环） | `events_deleted, audit_deleted, cutoff`；`target_kind=retention`；一轮至多一条；该审计行本身受保留期约束，可被后续清理 |
+
+### 17.2 约束
+
+1. P8 不新增事件类型、频道或事件端点；事件类型计数仍 **118**。
+2. `settings.updated` 复用为跨实例缓存失效触发（P8 H1）：payload 不变；observer 在本实例已加载事件并广播本地 Hub 后触发 `settings.Reload`，不改变 NOTIFY 回放/去重语义。
+3. 事件保留清理只删除 `created_at < cutoff` 的行，按 `(created_at, channel, seq)` 分批（`retention.gc_batch_size`）；旧游标回放缺失事件时按既有 `stream.reset` 语义处理，不破坏 `Last-Event-ID` 回放。
+4. 限流 429 不写新事件；清理审计不含事件正文/内部路径；审计只追加（同 §16.3 #8）。
+5. P8 的 in-flight 计数、多执行器派发、知识 FTS query 均不新增事件；P0–P7 事件类型/payload 语义不变。
+
