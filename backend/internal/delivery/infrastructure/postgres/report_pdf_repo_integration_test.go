@@ -13,6 +13,7 @@ import (
 
 	deliveryapp "github.com/EdouardRichard/EzTest/backend/internal/delivery/application"
 	delivery "github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
 )
 
 // pdfRepoFixture creates one published wave report revision and returns the
@@ -94,7 +95,7 @@ func TestReportRepoPDFLifecycleFencesAndImmutability(t *testing.T) {
 		t.Fatalf("new revision PDF state = %+v", before)
 	}
 
-	renderable, err := fixture.repo.ListRenderableRevisions(ctx, 100)
+	renderable, err := fixture.repo.ListRenderableRevisions(ctx, 100, 3)
 	if err != nil {
 		t.Fatalf("ListRenderableRevisions: %v", err)
 	}
@@ -123,14 +124,14 @@ func TestReportRepoPDFLifecycleFencesAndImmutability(t *testing.T) {
 	if retried := fixture.current(t); retried.PDFAttempts != 2 || retried.PDFStatus != delivery.PDFStatusRunning {
 		t.Fatalf("retried state = %+v", retried)
 	}
-	renderable, err = fixture.repo.ListRenderableRevisions(ctx, 100)
+	renderable, err = fixture.repo.ListRenderableRevisions(ctx, 100, 3)
 	if err != nil || len(renderable) != 0 {
 		t.Fatalf("renderable while running = %+v err=%v, want none", renderable, err)
 	}
 
 	ref := deliveryapp.ReportContentRef{RefID: 9201, SHA256: strings.Repeat("b", 64), Size: 1234}
 	renderedAt := time.Date(2026, 11, 2, 3, 4, 5, 0, time.UTC)
-	if err := fixture.repo.MarkPDFRendered(ctx, before.ID, ref, renderedAt); err != nil {
+	if err := fixture.repo.MarkPDFRendered(ctx, before.ID, ref, 2, renderedAt); err != nil {
 		t.Fatalf("MarkPDFRendered: %v", err)
 	}
 	done := fixture.current(t)
@@ -144,7 +145,7 @@ func TestReportRepoPDFLifecycleFencesAndImmutability(t *testing.T) {
 	assertPDFImmutableColumns(t, before, done)
 
 	// A completed PDF can never be re-rendered or failed again.
-	if err := fixture.repo.MarkPDFRendered(ctx, before.ID, ref, renderedAt); !errors.Is(err, delivery.ErrStateConflict) {
+	if err := fixture.repo.MarkPDFRendered(ctx, before.ID, ref, 2, renderedAt); !errors.Is(err, delivery.ErrStateConflict) {
 		t.Fatalf("duplicate MarkPDFRendered error = %v, want ErrStateConflict", err)
 	}
 	if err := fixture.repo.MarkPDFFailed(ctx, before.ID, "late failure", 2, renderedAt); !errors.Is(err, delivery.ErrStateConflict) {
@@ -171,10 +172,10 @@ func TestReportRepoPDFLifecycleFencesAndImmutability(t *testing.T) {
 		t.Fatalf("failed state = %+v (pdf_error chars %d)", failedAfter, len([]rune(failedAfter.PDFError)))
 	}
 	assertPDFImmutableColumns(t, failedBefore, failedAfter)
-	if err := failedFixture.repo.MarkPDFRendered(ctx, failedBefore.ID, ref, renderedAt); !errors.Is(err, delivery.ErrStateConflict) {
+	if err := failedFixture.repo.MarkPDFRendered(ctx, failedBefore.ID, ref, 1, renderedAt); !errors.Is(err, delivery.ErrStateConflict) {
 		t.Fatalf("MarkPDFRendered after failed error = %v, want ErrStateConflict", err)
 	}
-	renderable, err = failedFixture.repo.ListRenderableRevisions(ctx, 100)
+	renderable, err = failedFixture.repo.ListRenderableRevisions(ctx, 100, 3)
 	if err != nil || len(renderable) != 1 || renderable[0].PDFStatus != delivery.PDFStatusFailed ||
 		renderable[0].PDFAttempts != 2 {
 		t.Fatalf("renderable after failure = %+v err=%v", renderable, err)
@@ -198,7 +199,7 @@ func TestReportRepoPDFLifecycleFencesAndImmutability(t *testing.T) {
 	if err := disabledFixture.repo.MarkPDFRunning(ctx, disabledBefore.ID); !errors.Is(err, delivery.ErrStateConflict) {
 		t.Fatalf("MarkPDFRunning on disabled error = %v, want ErrStateConflict", err)
 	}
-	renderable, err = disabledFixture.repo.ListRenderableRevisions(ctx, 100)
+	renderable, err = disabledFixture.repo.ListRenderableRevisions(ctx, 100, 3)
 	if err != nil || len(renderable) != 0 {
 		t.Fatalf("renderable after disable = %+v err=%v", renderable, err)
 	}
@@ -231,7 +232,7 @@ func TestReportRepoListRenderableFiltersAndLimits(t *testing.T) {
 			t.Fatalf("FinalizePublished r%d: %v", revision, err)
 		}
 	}
-	rows, err := repo.ListRenderableRevisions(ctx, 100)
+	rows, err := repo.ListRenderableRevisions(ctx, 100, 3)
 	if err != nil {
 		t.Fatalf("ListRenderableRevisions: %v", err)
 	}
@@ -258,7 +259,7 @@ func TestReportRepoListRenderableFiltersAndLimits(t *testing.T) {
 			if err := repo.MarkPDFRunning(ctx, row.RevisionID); err != nil {
 				t.Fatalf("MarkPDFRunning: %v", err)
 			}
-			if err := repo.MarkPDFRendered(ctx, row.RevisionID, deliveryapp.ReportContentRef{RefID: 9999, SHA256: strings.Repeat("c", 64), Size: 1}, time.Now().UTC()); err != nil {
+			if err := repo.MarkPDFRendered(ctx, row.RevisionID, deliveryapp.ReportContentRef{RefID: 9999, SHA256: strings.Repeat("c", 64), Size: 1}, 1, time.Now().UTC()); err != nil {
 				t.Fatalf("MarkPDFRendered: %v", err)
 			}
 		}
@@ -270,15 +271,141 @@ func TestReportRepoListRenderableFiltersAndLimits(t *testing.T) {
 	`, report.ID); err != nil {
 		t.Fatalf("mark legacy render failed: %v", err)
 	}
-	rows, err = repo.ListRenderableRevisions(ctx, 100)
+	rows, err = repo.ListRenderableRevisions(ctx, 100, 3)
 	if err != nil || len(rows) != 1 || rows[0].Revision != 3 || rows[0].PDFStatus != delivery.PDFStatusFailed {
 		t.Fatalf("renderable after transitions = %+v err=%v, want only failed revision 3", rows, err)
 	}
 
 	// Limit is applied.
-	rows, err = repo.ListRenderableRevisions(ctx, 0)
+	rows, err = repo.ListRenderableRevisions(ctx, 0, 3)
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("default limit rows = %+v err=%v", rows, err)
+	}
+}
+
+// fixedIDGenerator returns one deterministic snowflake for tests that pin the
+// adapter's injected generator.
+type fixedIDGenerator struct{ id int64 }
+
+func (g fixedIDGenerator) Next() int64 { return g.id }
+
+// TestReportRepoUsesInjectedGeneratorForRenderJob pins fix 6: the adapter must
+// write work_item IDs from the process-wide (registry-node-seeded) generator,
+// not a private node-0 generator.
+func TestReportRepoUsesInjectedGeneratorForRenderJob(t *testing.T) {
+	pool := testutil.NewDB(t)
+	repo := NewReportRepository(pool, fixedIDGenerator{id: 990001})
+	waveID := int64(41)
+	report := reportRepoCreateReport(t, repo, delivery.Report{
+		VersionID: 105, WaveID: &waveID, Kind: delivery.ReportKindWave,
+	})
+	revision := reportRepoCreateRevision(t, repo, report.ID, 1)
+	if err := repo.FinalizePublished(context.Background(), report.ID, 1, int64(9901), reportRepoFingerprint("a")); err != nil {
+		t.Fatalf("FinalizePublished: %v", err)
+	}
+	dedupeKey := "report:990001:rev:1"
+	if err := repo.EnsureRenderJob(context.Background(), revision.ID, report.ID, 105, dedupeKey, 3); err != nil {
+		t.Fatalf("EnsureRenderJob: %v", err)
+	}
+	var workItemID int64
+	if err := pool.QueryRow(context.Background(), `
+		SELECT id FROM work_item WHERE dedupe_key = $1
+	`, dedupeKey).Scan(&workItemID); err != nil {
+		t.Fatalf("read work item: %v", err)
+	}
+	if workItemID != 990001 {
+		t.Fatalf("work_item.id = %d, want the injected generator's 990001", workItemID)
+	}
+}
+
+// TestReportRepoListRenderableSkipsExhaustedRows pins the ensurer starvation
+// fix: 100 failed revisions whose attempt budget is spent must not consume the
+// bounded renderable scan and hide a newer pending revision.
+func TestReportRepoListRenderableSkipsExhaustedRows(t *testing.T) {
+	repo, _ := newReportRepoForTest(t)
+	ctx := context.Background()
+	waveID := int64(40)
+	report := reportRepoCreateReport(t, repo, delivery.Report{
+		VersionID: 104, WaveID: &waveID, Kind: delivery.ReportKindWave,
+	})
+	now := time.Date(2026, 11, 2, 5, 0, 0, 0, time.UTC)
+	for revision := int32(1); revision <= 100; revision++ {
+		reportRepoCreateRevision(t, repo, report.ID, revision)
+		if err := repo.FinalizePublished(ctx, report.ID, revision, int64(20000+revision), reportRepoFingerprint("e")); err != nil {
+			t.Fatalf("FinalizePublished r%d: %v", revision, err)
+		}
+		stored, err := repo.GetRevision(ctx, report.ID, revision)
+		if err != nil {
+			t.Fatalf("GetRevision r%d: %v", revision, err)
+		}
+		if err := repo.MarkPDFRunning(ctx, stored.ID); err != nil {
+			t.Fatalf("MarkPDFRunning r%d: %v", revision, err)
+		}
+		if err := repo.MarkPDFFailed(ctx, stored.ID, "exhausted", 3, now); err != nil {
+			t.Fatalf("MarkPDFFailed r%d: %v", revision, err)
+		}
+	}
+	reportRepoCreateRevision(t, repo, report.ID, 101)
+	if err := repo.FinalizePublished(ctx, report.ID, 101, int64(30001), reportRepoFingerprint("f")); err != nil {
+		t.Fatalf("FinalizePublished pending r101: %v", err)
+	}
+	pending, err := repo.GetRevision(ctx, report.ID, 101)
+	if err != nil {
+		t.Fatalf("GetRevision r101: %v", err)
+	}
+	pendingID := pending.ID
+
+	rows, err := repo.ListRenderableRevisions(ctx, 100, 3)
+	if err != nil {
+		t.Fatalf("ListRenderableRevisions: %v", err)
+	}
+	if len(rows) != 1 || rows[0].RevisionID != pendingID || rows[0].Revision != 101 {
+		t.Fatalf("renderable = %+v, want only the pending revision 101", rows)
+	}
+}
+
+// TestReportRepoPDFAttemptFence pins the cross-attempt fencing of the PDF
+// transitions: a stale worker whose attempt is older than the current
+// pdf_attempts cannot settle the revision (fix 7).
+func TestReportRepoPDFAttemptFence(t *testing.T) {
+	fixture := newPDFRepoFixture(t, 10, 15, 1, 9105)
+	ctx := context.Background()
+	before := fixture.current(t)
+	if err := fixture.repo.MarkPDFRunning(ctx, before.ID); err != nil {
+		t.Fatalf("first MarkPDFRunning: %v", err)
+	}
+	if err := fixture.repo.MarkPDFRunning(ctx, before.ID); err != nil {
+		t.Fatalf("second MarkPDFRunning: %v", err)
+	}
+	if current := fixture.current(t); current.PDFStatus != delivery.PDFStatusRunning || current.PDFAttempts != 2 {
+		t.Fatalf("current PDF state = %+v, want running/attempts=2", current)
+	}
+
+	// A stale attempt-1 worker cannot fail or complete the attempt-2 render.
+	if err := fixture.repo.MarkPDFFailed(ctx, before.ID, "stale failure", 1, time.Now().UTC()); !errors.Is(err, delivery.ErrStateConflict) {
+		t.Fatalf("stale MarkPDFFailed error = %v, want ErrStateConflict", err)
+	}
+	if err := fixture.repo.MarkPDFRendered(ctx, before.ID, deliveryapp.ReportContentRef{
+		RefID: 9205, SHA256: strings.Repeat("d", 64), Size: 10,
+	}, 1, time.Now().UTC()); !errors.Is(err, delivery.ErrStateConflict) {
+		t.Fatalf("stale MarkPDFRendered error = %v, want ErrStateConflict", err)
+	}
+	if current := fixture.current(t); current.PDFStatus != delivery.PDFStatusRunning || current.PDFAttempts != 2 || current.PDFRef != nil {
+		t.Fatalf("stale transitions changed the revision: %+v", current)
+	}
+
+	// The owning attempt settles the revision and a done revision never regresses.
+	renderedAt := time.Date(2026, 11, 2, 6, 0, 0, 0, time.UTC)
+	ref := deliveryapp.ReportContentRef{RefID: 9205, SHA256: strings.Repeat("d", 64), Size: 10}
+	if err := fixture.repo.MarkPDFRendered(ctx, before.ID, ref, 2, renderedAt); err != nil {
+		t.Fatalf("owning MarkPDFRendered: %v", err)
+	}
+	if err := fixture.repo.MarkPDFFailed(ctx, before.ID, "late", 2, time.Now().UTC()); !errors.Is(err, delivery.ErrStateConflict) {
+		t.Fatalf("MarkPDFFailed after done error = %v, want ErrStateConflict", err)
+	}
+	done := fixture.current(t)
+	if done.PDFStatus != delivery.PDFStatusDone || done.PDFRef == nil || *done.PDFRef != 9205 {
+		t.Fatalf("done revision regressed: %+v", done)
 	}
 }
 
@@ -318,7 +445,7 @@ func TestReportRepoEnsureRenderJobIdempotent(t *testing.T) {
 	`, dedupeKey).Scan(&versionID, &team, &wtype, &status, &maxAttempts, &payload); err != nil {
 		t.Fatalf("read work item: %v", err)
 	}
-	if versionID != 7 || team != "delivery" || wtype != "report.render_pdf" ||
+	if versionID != 7 || team != "ops" || wtype != "report.render_pdf" ||
 		status != "open" || maxAttempts != 3 {
 		t.Fatalf("work item = version:%d team:%s type:%s status:%s max:%d", versionID, team, wtype, status, maxAttempts)
 	}

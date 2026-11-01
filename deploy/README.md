@@ -44,7 +44,7 @@ passes the repository `.env` to both API containers with `env_file`.
 | `POSTGRES_PASSWORD` | postgres + api URL | **Required**, no default. |
 | `POSTGRES_DB` | postgres + api URL | Defaults to `eztest`. |
 | `EZTEST_EXECUTOR_TOKEN` | api + executor | **Required**; shared Bearer token. |
-| `EZTEST_RENDER_TOKEN` | api + renderer | **Required**; PDF renderer Bearer token. |
+| `EZTEST_RENDER_TOKEN` | renderer (optional) | PDF renderer Bearer token. Defaults to the DB seed value `eztest-dev-render-token`; if set, also set the DB setting `report.render_token` to the same value. |
 | `NEXT_PUBLIC_API_BASE_URL` | web build | Build-time browser API origin, default `http://localhost:13333`. |
 | `EZTEST_API_URL` | executor (optional) | Leave unset for pull-only registration; see below. |
 
@@ -52,6 +52,31 @@ The API process itself still reads only the four documented 0.2 startup
 variables: `EZTEST_DATABASE_URL`, `EZTEST_API_PORT`, `EZTEST_WEB_PORT`,
 `EZTEST_EXECUTOR_PORT`. Every other runtime knob lives in the database settings
 center (paths, renderer URL/token, instance heartbeat, snowflake node id, ...).
+
+### Renderer settings (required for PDFs)
+
+The renderer container cannot configure the API: the API reads two DB settings
+at boot/worker time. A fresh Compose boot must therefore point the API at the
+Compose service name (the catalogue default `http://127.0.0.1:13337` is the
+standalone/local default, not the container):
+
+| DB setting | Compose value | Notes |
+|---|---|---|
+| `report.render_worker_url` | `http://renderer:13337` | Set once per stack (admin Settings UI or SQL below), then all revisions' PDFs render. |
+| `report.render_token` | `eztest-dev-render-token` | Matches the renderer's default `EZTEST_RENDER_TOKEN`; override both together. |
+
+Set the URL once after the first boot (Compose seeds no business settings):
+
+```sql
+UPDATE system_setting
+SET value = '"http://renderer:13337"'::jsonb, updated_at = now()
+WHERE key = 'report.render_worker_url';
+```
+
+(Use the admin Settings UI instead where available; the token is a secret and is
+masked there.) After this, the leader-gated ensurer/worker backfills PDFs and
+the compose validator remains the only required check (Docker is not installed
+on the development host).
 
 ### Executor push (optional)
 
@@ -96,12 +121,17 @@ From the repository root:
 ```powershell
 # 1. Prepare a deployment environment file (never commit it).
 Copy-Item .env.example .env
-# Edit .env: set POSTGRES_PASSWORD, EZTEST_EXECUTOR_TOKEN, EZTEST_RENDER_TOKEN.
+# Edit .env: set POSTGRES_PASSWORD and EZTEST_EXECUTOR_TOKEN.
+# EZTEST_RENDER_TOKEN is optional (defaults to the DB seed token); set it only
+# together with the DB setting report.render_token.
 
 # 2. Build and start the stack.
 docker compose --env-file .env -f deploy/docker-compose.yml up -d --build
 
-# 3. Inspect health and logs.
+# 3. One-time: point the API at the Compose renderer (DB setting).
+#    See "Renderer settings" above; then PDFs render on a fresh boot.
+
+# 4. Inspect health and logs.
 docker compose --env-file .env -f deploy/docker-compose.yml ps
 docker compose --env-file .env -f deploy/docker-compose.yml logs -f api
 ```

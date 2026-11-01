@@ -70,15 +70,14 @@ type ReportRepository struct {
 
 var _ deliveryapp.ReportRepository = (*ReportRepository)(nil)
 
-// NewReportRepository wraps a pgx pool. The adapter owns the snowflake source
-// of inserted rows; a caller-supplied positive ID is preserved for
-// deterministic replays.
-func NewReportRepository(pool *pgxpool.Pool) *ReportRepository {
-	ids, err := platformid.NewSnowflake(0)
-	if err != nil {
-		// Node 0 is always valid; this only guards a future change of the
-		// platform generator contract.
-		panic(fmt.Sprintf("deliverypg: init snowflake generator: %v", err))
+// NewReportRepository wires the adapter over a pgx pool and the process-wide
+// snowflake generator. The caller MUST pass the generator seeded with this
+// replica's registry-allocated node (P7): a private node-0 generator would
+// collide with other replicas on the work_item IDs written by EnsureRenderJob.
+// A caller-supplied positive row ID is preserved for deterministic replays.
+func NewReportRepository(pool *pgxpool.Pool, ids platformid.Generator) *ReportRepository {
+	if ids == nil {
+		panic("deliverypg: report repository requires an id generator")
 	}
 	return &ReportRepository{pool: pool, ids: ids}
 }
@@ -518,15 +517,22 @@ func (r *ReportRepository) ListRevisions(ctx context.Context, reportID int64) ([
 
 // ListRenderableRevisions returns the published revisions whose PDF still needs
 // work: status published, render_status done, an html_ref, pdf_status
-// pending/failed and no pdf_ref yet. Oldest revision first. The caller applies
-// the report.render_max_attempts bound because that is a settings value.
-func (r *ReportRepository) ListRenderableRevisions(ctx context.Context, limit int) ([]delivery.RenderableRevision, error) {
+// pending/failed, no pdf_ref yet, and (for failed rows) attempts left under
+// report.render_max_attempts. Exhausted failed rows are excluded in SQL so they
+// cannot consume the bounded LIMIT and starve newer pending revisions.
+// Oldest revision first. The existing partial index
+// idx_delivery_report_revision_pdf_pending covers the status filter and the
+// primary key covers the ordered scan, so no new migration is needed.
+func (r *ReportRepository) ListRenderableRevisions(ctx context.Context, limit, maxAttempts int) ([]delivery.RenderableRevision, error) {
 	ctx = contextOrBackground(ctx)
 	if limit <= 0 {
 		limit = 100
 	}
 	if limit > 500 {
 		limit = 500
+	}
+	if maxAttempts < deliveryapp.MinRenderAttempts || maxAttempts > deliveryapp.MaxRenderAttempts {
+		maxAttempts = deliveryapp.DefaultRenderMaxAttempts
 	}
 	rows, err := r.pool.Query(ctx, `
 		SELECT rev.id, rev.report_id, report.version_id, rev.revision,
@@ -538,9 +544,10 @@ func (r *ReportRepository) ListRenderableRevisions(ctx context.Context, limit in
 		  AND rev.html_ref IS NOT NULL
 		  AND rev.pdf_status IN ('pending', 'failed')
 		  AND rev.pdf_ref IS NULL
+		  AND (rev.pdf_status = 'pending' OR rev.pdf_attempts < $2)
 		ORDER BY rev.id
 		LIMIT $1
-	`, limit)
+	`, limit, maxAttempts)
 	if err != nil {
 		return nil, wrapReportDB("list renderable report revisions", err)
 	}
@@ -596,12 +603,17 @@ func (r *ReportRepository) MarkPDFRunning(ctx context.Context, revisionID int64)
 }
 
 // MarkPDFRendered writes the ledger ref of a successful render. It is fenced on
-// pdf_status='running' and an empty pdf_ref; as_of/html_ref/input_fingerprint/
+// pdf_status='running', an empty pdf_ref and an attempt no older than the
+// current pdf_attempts; a stale worker whose lease was taken over can therefore
+// never settle a newer attempt. as_of/html_ref/input_fingerprint/
 // template_version are never part of this UPDATE.
-func (r *ReportRepository) MarkPDFRendered(ctx context.Context, revisionID int64, ref deliveryapp.ReportContentRef, at time.Time) error {
+func (r *ReportRepository) MarkPDFRendered(ctx context.Context, revisionID int64, ref deliveryapp.ReportContentRef, attempts int32, at time.Time) error {
 	ctx = contextOrBackground(ctx)
 	if revisionID <= 0 || ref.RefID <= 0 {
 		return delivery.ErrInvalidArgument
+	}
+	if attempts < 0 {
+		attempts = 0
 	}
 	if at.IsZero() {
 		at = nowUTC()
@@ -618,7 +630,8 @@ func (r *ReportRepository) MarkPDFRendered(ctx context.Context, revisionID int64
 		  AND status = 'published'
 		  AND pdf_status = 'running'
 		  AND pdf_ref IS NULL
-	`, revisionID, ref.RefID, at)
+		  AND pdf_attempts <= $4
+	`, revisionID, ref.RefID, at, attempts)
 	if err != nil {
 		return wrapReportDB("mark report PDF rendered", err)
 	}
@@ -629,7 +642,9 @@ func (r *ReportRepository) MarkPDFRendered(ctx context.Context, revisionID int64
 }
 
 // MarkPDFFailed records a terminal PDF failure. The message is clamped to the
-// delivery_0004 CHECK length; the revision is never failed after it is done.
+// delivery_0004 CHECK length; the revision is never failed after it is done and
+// the write is fenced on the worker's attempt, so a stale worker cannot fail a
+// revision that a newer attempt is rendering.
 func (r *ReportRepository) MarkPDFFailed(ctx context.Context, revisionID int64, message string, attempts int32, at time.Time) error {
 	ctx = contextOrBackground(ctx)
 	if revisionID <= 0 {
@@ -653,6 +668,7 @@ func (r *ReportRepository) MarkPDFFailed(ctx context.Context, revisionID int64, 
 		  AND status = 'published'
 		  AND pdf_status IN ('pending', 'failed', 'running')
 		  AND pdf_ref IS NULL
+		  AND pdf_attempts <= $3
 	`, revisionID, message, attempts, at)
 	if err != nil {
 		return wrapReportDB("mark report PDF failed", err)
@@ -735,15 +751,18 @@ func (r *ReportRepository) EnsureRenderJob(ctx context.Context, revisionID, repo
 	if err != nil {
 		return fmt.Errorf("encode report.render_pdf payload: %w", err)
 	}
+	// team=ops: deterministic worker task, never claimed by the agent worker
+	// (which claims only the five product teams); RenderWorker claims by type.
 	// The work_item IDs are application-generated; the report repository owns a
 	// snowflake source for exactly this kind of composition-root write.
 	_, err = r.pool.Exec(ctx, `
 		INSERT INTO work_item (id, version_id, team, type, status, priority,
 			dedupe_key, payload, max_attempts, available_at, created_at, updated_at)
-		VALUES ($1, $2, 'delivery', 'report.render_pdf', 'open', 0,
-			$3, $4::jsonb, $5, now(), now(), now())
+		VALUES ($1, $2, $3, $4, 'open', 0,
+			$5, $6::jsonb, $7, now(), now(), now())
 		ON CONFLICT (version_id, type, dedupe_key) DO NOTHING
-	`, r.ids.Next(), versionID, dedupeKey, string(payload), maxAttempts)
+	`, r.ids.Next(), versionID, string(deliveryapp.RenderTaskTeam), deliveryapp.RenderTaskType,
+		dedupeKey, string(payload), maxAttempts)
 	if err != nil {
 		return fmt.Errorf("ensure report.render_pdf work item: %w", err)
 	}

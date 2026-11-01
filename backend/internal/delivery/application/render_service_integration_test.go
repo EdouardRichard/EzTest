@@ -79,8 +79,8 @@ func (q integrationRenderQueue) ClaimForTypes(ctx context.Context, claimant stri
 	}, true, nil
 }
 
-func (q integrationRenderQueue) Heartbeat(ctx context.Context, jobID, epoch int64) error {
-	return q.queue.Heartbeat(ctx, jobID, epoch)
+func (q integrationRenderQueue) Heartbeat(ctx context.Context, jobID, epoch int64, lease time.Duration) error {
+	return q.queue.Heartbeat(ctx, jobID, epoch, lease)
 }
 
 func (q integrationRenderQueue) Complete(ctx context.Context, jobID, epoch int64) error {
@@ -149,7 +149,7 @@ func newIntegrationPDFFixture(t *testing.T) *integrationPDFFixture {
 	audit := &integrationReportAudit{}
 	tasks := &integrationReportTasks{}
 	clk := integrationReportClock{now: time.Date(2026, 11, 2, 7, 0, 0, 0, time.UTC)}
-	repo := deliverypg.NewReportRepository(pool)
+	repo := deliverypg.NewReportRepository(pool, ids)
 	svc := deliveryapp.NewReportService(
 		repo, htmlRenderer, content, data, events, audit, clk, tasks,
 		delivery.SectionOptions{Summary: true, Results: true, Issues: true, Coverage: true, Evidence: true, Appendix: true},
@@ -240,7 +240,7 @@ func TestReportPDFPipelineIntegration(t *testing.T) {
 	`, dedupeKey).Scan(&team, &workType, &maxAttempts); err != nil {
 		t.Fatalf("read render work item: %v", err)
 	}
-	if team != "delivery" || workType != "report.render_pdf" || maxAttempts != 3 {
+	if team != "ops" || workType != "report.render_pdf" || maxAttempts != 3 {
 		t.Fatalf("render work item = team:%s type:%s max:%d", team, workType, maxAttempts)
 	}
 
@@ -362,6 +362,19 @@ func TestReportPDFRetryIntegration(t *testing.T) {
 	}
 	if fixture.events.count("report.pdf_ready") != 1 || fixture.events.count("report.pdf_failed") != 0 {
 		t.Fatalf("retry events = %v", fixture.events.types)
+	}
+	// A re-claim (attempt 2) must leave exactly one live report_pdf ref for the
+	// revision: the ledger write is idempotent per revision.
+	var livePDFRefs int
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT count(*) FROM content_ref
+		WHERE owner_kind = 'report_revision' AND owner_id = $1
+		  AND role = 'report_pdf' AND deleted_at IS NULL
+	`, revision.ID).Scan(&livePDFRefs); err != nil {
+		t.Fatalf("count live PDF refs: %v", err)
+	}
+	if livePDFRefs != 1 {
+		t.Fatalf("live report_pdf refs after re-claim = %d, want exactly 1", livePDFRefs)
 	}
 }
 

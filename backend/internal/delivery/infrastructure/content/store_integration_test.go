@@ -388,6 +388,97 @@ func TestContentPutReportPDFValidatesInput(t *testing.T) {
 	}
 }
 
+// TestContentPutReportPDFIsIdempotentPerRevision pins the P7 duplicate-ref fix:
+// a re-render (e.g. after a lease takeover) replaces the revision's existing
+// report_pdf ref instead of appending a second live one, and an identical
+// re-put reuses the same row.
+func TestContentPutReportPDFIsIdempotentPerRevision(t *testing.T) {
+	fixture := newContentFixture(t)
+	ctx := context.Background()
+
+	first, err := fixture.store.PutReportPDF(ctx, 9105, sampleReportPDF)
+	if err != nil {
+		t.Fatalf("first PutReportPDF: %v", err)
+	}
+	secondBytes := append(append([]byte(nil), sampleReportPDF...), []byte("v2\n")...)
+	second, err := fixture.store.PutReportPDF(ctx, 9105, secondBytes)
+	if err != nil {
+		t.Fatalf("second PutReportPDF: %v", err)
+	}
+	if second.SHA256 != contentSHA(secondBytes) {
+		t.Fatalf("second ref sha = %q, want %q", second.SHA256, contentSHA(secondBytes))
+	}
+
+	var liveRefs int
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT count(*) FROM content_ref
+		WHERE owner_kind = 'report_revision' AND owner_id = 9105
+		  AND role = 'report_pdf' AND deleted_at IS NULL
+	`).Scan(&liveRefs); err != nil {
+		t.Fatalf("count live PDF refs: %v", err)
+	}
+	if liveRefs != 1 {
+		t.Fatalf("live report_pdf refs = %d, want exactly 1", liveRefs)
+	}
+	var liveRefID int64
+	var liveObjectID string
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT id, object_id FROM content_ref
+		WHERE owner_kind = 'report_revision' AND owner_id = 9105
+		  AND role = 'report_pdf' AND deleted_at IS NULL
+	`).Scan(&liveRefID, &liveObjectID); err != nil {
+		t.Fatalf("read live PDF ref: %v", err)
+	}
+	if liveRefID != second.RefID || liveObjectID != second.SHA256 {
+		t.Fatalf("live ref = %d/%s, want the replaced ref %d/%s",
+			liveRefID, liveObjectID, second.RefID, second.SHA256)
+	}
+	// The existing row is reused in place (no second content_ref row at all),
+	// so historical ledger consumers and GC see exactly one report_pdf ref.
+	if second.RefID != first.RefID {
+		t.Fatalf("replacement ref = %d, want the reused row %d", second.RefID, first.RefID)
+	}
+	var totalRefs int
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT count(*) FROM content_ref
+		WHERE owner_kind = 'report_revision' AND owner_id = 9105 AND role = 'report_pdf'
+	`).Scan(&totalRefs); err != nil {
+		t.Fatalf("count PDF ref rows: %v", err)
+	}
+	if totalRefs != 1 {
+		t.Fatalf("report_pdf rows = %d, want exactly 1 (no duplicate inserted)", totalRefs)
+	}
+
+	// Re-putting identical bytes reuses the live row (no churn).
+	third, err := fixture.store.PutReportPDF(ctx, 9105, secondBytes)
+	if err != nil {
+		t.Fatalf("third PutReportPDF: %v", err)
+	}
+	if third.RefID != second.RefID {
+		t.Fatalf("identical re-put ref = %d, want reused %d", third.RefID, second.RefID)
+	}
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT count(*) FROM content_ref
+		WHERE owner_kind = 'report_revision' AND owner_id = 9105
+		  AND role = 'report_pdf' AND deleted_at IS NULL
+	`).Scan(&liveRefs); err != nil {
+		t.Fatalf("count live PDF refs after identical re-put: %v", err)
+	}
+	if liveRefs != 1 {
+		t.Fatalf("live report_pdf refs after identical re-put = %d, want 1", liveRefs)
+	}
+
+	// The replacement is the readable PDF.
+	contentFixturePublishPDFRevision(t, fixture, 9105, second.RefID)
+	opened, openedSHA, openedSize, err := fixture.store.OpenReportPDF(ctx, second.RefID)
+	if err != nil {
+		t.Fatalf("OpenReportPDF: %v", err)
+	}
+	if !bytes.Equal(opened, secondBytes) || openedSHA != second.SHA256 || openedSize != second.Size {
+		t.Fatalf("OpenReportPDF = %q/%s/%d", opened, openedSHA, openedSize)
+	}
+}
+
 // TestContentGetReportHTML covers the worker's frozen-HTML read helper.
 func TestContentGetReportHTML(t *testing.T) {
 	fixture := newContentFixture(t)

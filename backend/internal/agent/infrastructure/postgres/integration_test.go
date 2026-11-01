@@ -655,7 +655,7 @@ func TestWorkItemClaimForTypesFiltersAndReclaimsExpiredLeases(t *testing.T) {
 		return item
 	}
 
-	renderPDF := ensureTyped("report.render_pdf", "delivery", "report:1:rev:1", 0)
+	renderPDF := ensureTyped("report.render_pdf", "ops", "report:1:rev:1", 0)
 	// Higher-priority items of other types prove the type filter is applied.
 	ensureTyped("chat.turn", "clarification", "reply:1", 100)
 	ensureTyped("execute.case", "execution", "execute:1", 50)

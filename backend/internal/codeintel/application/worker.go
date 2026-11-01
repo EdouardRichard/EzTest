@@ -90,6 +90,13 @@ func WithWorkerConcurrency(value int) WorkerOption {
 	}
 }
 
+// WithWorkerDrainGate injects the replica drain signal (P7 §4.5). While the
+// gate returns true the worker finishes in-flight handlers but claims no new
+// code-team items; nil means the replica never drains.
+func WithWorkerDrainGate(gate func() bool) WorkerOption {
+	return func(w *Worker) { w.drainGate = gate }
+}
+
 // Worker is the dedicated codeintel worker. It claims only the `code` team, so
 // the product agent worker can never pick up index.repo/code.analyze tasks.
 type Worker struct {
@@ -97,6 +104,7 @@ type Worker struct {
 	handlers   map[string]Handler
 	logger     *slog.Logger
 	instanceID string
+	drainGate  func() bool
 
 	pollInterval      time.Duration
 	heartbeatInterval time.Duration
@@ -170,6 +178,9 @@ func (w *Worker) Run(ctx context.Context) error {
 // drain claims until the queue is empty or the concurrency semaphore is full.
 func (w *Worker) drain(ctx context.Context, sem chan struct{}, inflight *sync.WaitGroup) {
 	for {
+		if w.draining() {
+			return
+		}
 		select {
 		case sem <- struct{}{}:
 		default:
@@ -241,6 +252,11 @@ func (w *Worker) fail(ctx context.Context, item WorkItem, cause error, retryable
 		return
 	}
 	w.logger.Warn("codeintel worker: work item failed", "work_item_id", item.ID, "type", item.Type, "retryable", retryable)
+}
+
+// draining reports the injected P7 drain signal (false when unwired).
+func (w *Worker) draining() bool {
+	return w.drainGate != nil && w.drainGate()
 }
 
 func (w *Worker) track(id int64, entry *workerRun) {

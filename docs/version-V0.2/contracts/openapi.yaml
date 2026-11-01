@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
-  title: EzTest 0.2 API 契约（P0 冻结 + P1 冻结 + P2 增量 + P3/P4/P5/P6 冻结）
-  version: 0.2.0-p6
+  title: EzTest 0.2 API 契约（P0 冻结 + P1 冻结 + P2 增量 + P3/P4/P5/P6/P7 冻结）
+  version: 0.2.0-p7
   description: |
     EzTest 0.2 P0（平台底座）对外 REST/SSE 契约，来源：
     `docs/superpowers/specs/2026-10-31-eztest-v02-p0-platform-foundation-design.md` §7/§8/§9。
@@ -140,7 +140,18 @@ info:
     工具或 executor 协议；不新增通用 `Idempotency-Key`（重复 POST eval-run 允许，以 run id 区分）。
     prompt 正文只在 admin profile API 返回；目录/运行/质量投影永不返回 system_prompt/transcript。
     错误信封复用；业务冲突 `state_conflict`，链路全层失败 503 `provider_unavailable`。
-x-frozen: P6
+    ### P7 增量（frozen，2026-11-01）
+
+    来源：`docs/superpowers/specs/2026-11-01-eztest-v02-p7-p9-design.md` §6/§7/§13。
+    P0–P6 paths/schemas 语义不变，只加新 path 与可选字段；P7 新增 **18 个 operation**
+    （知识 8、GC 3、实例 3、readiness 1、报告 PDF 1、internal executor 2），新增
+    `Knowledge`/`Admin`/`Internal` 三个 tag。`ReportRevisionView.pdf_available` 由 P4 常量
+    false 扩宽为 boolean，并新增 `pdf_status`/`pdf_error`/`pdf_rendered_at`；`IssueView` 新增
+    `recurrence_count`/`last_recurred_at`/`merged_chain`；SUT 读/写模型新增可选 `family`。
+    `GET /api/health/ready` 返回 `{"data": ReadinessView}`（200/503）；报告 PDF 下载的
+    404/409 语义见 operation 说明。内部 executor 端点使用 `execution.executor_token` Bearer，
+    不是用户登录 token。事件见 `contracts/events.md` §16；P7 不新增通用 `Idempotency-Key`。
+x-frozen: P7
 servers:
   - url: http://localhost:13333
     description: 本地开发默认 API（端口来自 EZTEST_API_PORT，默认 13333）
@@ -199,6 +210,12 @@ tags:
     description: 全局待办快照（P6；登录只读、6 kind、权限过滤）
   - name: AgentCenter
     description: Agent 目录/运行观察/质量投影与 profile、提示词配置（P6；读登录、写 admin）
+  - name: Knowledge
+    description: 跨版本知识列表/详情/审核/历史（P7；读与草案写登录，审核 admin）
+  - name: Admin
+    description: 管理员运维：GC run 与 API 实例注册表（P7）
+  - name: Internal
+    description: 执行器内部注册/心跳（P7；非用户 API，Bearer execution.executor_token）
 
 paths:
   /healthz:
@@ -5854,6 +5871,606 @@ paths:
         '500':
           $ref: '#/components/responses/Internal'
 
+  /api/knowledge/items:
+    get:
+      tags: [Knowledge]
+      operationId: listKnowledgeItems
+      summary: 知识列表/全文检索（登录用户）
+      description: |
+        `scope`/`status`/`system_key`/`tag` 过滤；`q` 使用 PostgreSQL
+        `websearch_to_tsquery('simple', q)` + `ts_rank`，按 `id` 游标分页；
+        `limit` 默认 20、上限 100，返回 `{data,next_cursor,has_more}`。
+        `source_stale` 是读取期标记（来源版本不存在），不是状态。
+      parameters:
+        - $ref: '#/components/parameters/KnowledgeScopeFilter'
+        - $ref: '#/components/parameters/KnowledgeStatusFilter'
+        - $ref: '#/components/parameters/KnowledgeSystemKeyFilter'
+        - $ref: '#/components/parameters/KnowledgeTagFilter'
+        - $ref: '#/components/parameters/KnowledgeQFilter'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 知识列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgeListEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [Knowledge]
+      operationId: createKnowledgeItem
+      summary: 创建知识 draft（登录用户）
+      description: |
+        服务端强制 `status=draft`；`scope` 缺省按 `system_key` 推导（无 key → global，
+        有 key → system）。仅 admin 且 `knowledge.review_required=false` 时可一步 approve；
+        AI 通过 `knowledge.propose` 提议时始终为 draft。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/KnowledgeItemCreateRequest'
+      responses:
+        '201':
+          description: 已创建 draft
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/KnowledgeItemView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/knowledge/items/{knowledgeId}:
+    get:
+      tags: [Knowledge]
+      operationId: getKnowledgeItem
+      summary: 知识详情 + 最近 revisions（登录用户）
+      parameters:
+        - $ref: '#/components/parameters/KnowledgeID'
+      responses:
+        '200':
+          description: 知识详情
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/KnowledgeItemDetailView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    patch:
+      tags: [Knowledge]
+      operationId: updateKnowledgeItem
+      summary: 编辑知识草案（作者或 admin；draft/rejected）
+      description: |
+        仅 `status ∈ draft/rejected` 可编辑；写一条追加式 `knowledge_revision` 且
+        `revision+1`；`rejected` 编辑后回到 `draft` 并清空审核/撤回字段。
+      parameters:
+        - $ref: '#/components/parameters/KnowledgeID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/KnowledgeItemUpdateRequest'
+      responses:
+        '200':
+          description: 更新后的知识项
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/KnowledgeItemView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/knowledge/items/{knowledgeId}/approve:
+    post:
+      tags: [Knowledge]
+      operationId: approveKnowledgeItem
+      summary: 审核通过（admin；draft/revoked → approved）
+      description: |
+        允许 `draft/revoked → approved`；`review_required=false` 时 admin 也可在创建/晋升
+        时一步 approve。空请求体允许；非法状态迁移返回 409 `state_conflict`
+        （`details.reason=invalid_transition`）。
+      parameters:
+        - $ref: '#/components/parameters/KnowledgeID'
+      responses:
+        '200':
+          description: 已通过审核
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/KnowledgeItemView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/knowledge/items/{knowledgeId}/reject:
+    post:
+      tags: [Knowledge]
+      operationId: rejectKnowledgeItem
+      summary: 审核驳回（admin；draft → rejected）
+      description: |
+        body `reason` 必填（1–2000）；`draft → rejected`，非法迁移 409 `state_conflict`
+        （`details.reason=invalid_transition`）。
+      parameters:
+        - $ref: '#/components/parameters/KnowledgeID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/KnowledgeReviewRequest'
+      responses:
+        '200':
+          description: 已驳回
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/KnowledgeItemView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/knowledge/items/{knowledgeId}/revoke:
+    post:
+      tags: [Knowledge]
+      operationId: revokeKnowledgeItem
+      summary: 撤回知识（admin；approved → revoked）
+      description: |
+        body `reason` 必填（1–2000）；撤回后立即从后续注入排除；复审 approve 恢复。
+        非法迁移 409 `state_conflict`（`details.reason=invalid_transition`）。
+      parameters:
+        - $ref: '#/components/parameters/KnowledgeID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/KnowledgeReviewRequest'
+      responses:
+        '200':
+          description: 已撤回
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/KnowledgeItemView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/knowledge/items/{knowledgeId}/revisions:
+    get:
+      tags: [Knowledge]
+      operationId: listKnowledgeRevisions
+      summary: 知识内容历史（append-only；登录用户）
+      parameters:
+        - $ref: '#/components/parameters/KnowledgeID'
+      responses:
+        '200':
+          description: 内容历史（revision DESC）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgeRevisionListEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/admin/gc/runs:
+    post:
+      tags: [Admin]
+      operationId: createGCRun
+      summary: 触发统一内容账本 GC（admin；同步执行）
+      description: |
+        `mode=dry_run|apply`；apply 必须 `confirm=true`，否则 400 `confirmation_required`。
+        同一时刻仅允许一个 running run（`uk_gc_run_running` 部分唯一索引），冲突 409
+        `gc_running`。run 在请求内完成并返回，成功为 200（`status=completed`，失败为
+        `status=failed` + `error`）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GCRunCreateRequest'
+      responses:
+        '200':
+          description: 已完成的 GC run
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/GCRunView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+    get:
+      tags: [Admin]
+      operationId: listGCRuns
+      summary: GC 运行历史（admin；started_at DESC）
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: GC run 列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GCRunListEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/admin/gc/runs/{gcRunId}:
+    get:
+      tags: [Admin]
+      operationId: getGCRun
+      summary: GC run 详情（report 明细 + tombstones；admin）
+      parameters:
+        - $ref: '#/components/parameters/GCRunID'
+      responses:
+        '200':
+          description: GC run 详情
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/GCRunDetailView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/admin/instances:
+    get:
+      tags: [Admin]
+      operationId: listInstances
+      summary: API 实例列表（admin）
+      description: 注册表是小规模全量名单；无游标，返回 `{data,next_cursor:"",has_more:false}`。
+      responses:
+        '200':
+          description: API 实例列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InstanceListEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/admin/instances/{id}/drain:
+    post:
+      tags: [Admin]
+      operationId: drainInstance
+      summary: 排空 API 实例（admin；幂等目标态）
+      description: |
+        置 `draining`：readiness 立即 503、该实例停止认领新任务，in-flight 完成；
+        已 draining 再 drain 返回 200 且不变。不允许从 `stopped` 迁移。
+      parameters:
+        - $ref: '#/components/parameters/InstanceID'
+      responses:
+        '200':
+          description: 实例状态
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/InstanceView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/admin/instances/{id}/activate:
+    post:
+      tags: [Admin]
+      operationId: activateInstance
+      summary: 取消排空（admin；幂等目标态）
+      description: |
+        `draining → active`；已 active 再 activate 返回 200 且不变；`stopped` 不可
+        activate（409 `state_conflict`）。
+      parameters:
+        - $ref: '#/components/parameters/InstanceID'
+      responses:
+        '200':
+          description: 实例状态
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/InstanceView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/health/ready:
+    get:
+      tags: [Health]
+      operationId: getPlatformReadiness
+      summary: 平台就绪探针（公开）
+      description: |
+        DB ping + 共享存储写探针 + 本实例非 draining；全部通过 200，否则 503。
+        响应固定 `{"data":{status,database,storage,draining,instance_id}}`；
+        `database`/`storage` 失败值为 `down`，`status` 为 `degraded`。
+      security: []
+      responses:
+        '200':
+          description: 就绪
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/ReadinessView'
+        '503':
+          description: 未就绪（degraded）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/ReadinessView'
+
+  /api/versions/{versionId}/reports/{reportId}/revisions/{revision}/pdf:
+    get:
+      tags: [Delivery]
+      operationId: downloadReportPDF
+      summary: 鉴权下载报告 PDF（独立 renderer 生成）
+      description: |
+        校验版本归属、revision 属于 report、`status='published' AND render_status='done'`；
+        `pdf_status='done'` 且 `pdf_ref` 非空后按内容账本
+        （`owner_kind='report_revision'`、`role='report_pdf'`）读取并校验 sha256/size/`%PDF-`
+        魔数；返回 PDF 字节与 ETag（sha256）。404：revision 不存在/未发布/disabled/PDF 缺失；
+        409：`pdf_not_ready`（pending/running）或 `pdf_failed`（failed）；内容校验失败
+        409 `state_conflict`（`details.reason=report_content_corrupt`）。
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/ReportID'
+        - $ref: '#/components/parameters/Revision'
+      responses:
+        '200':
+          description: 报告 PDF 字节
+          headers:
+            ETag:
+              description: PDF 字节 sha256（双引号包裹）
+              schema:
+                type: string
+            Cache-Control:
+              description: private, no-store
+              schema:
+                type: string
+            X-Content-Type-Options:
+              description: nosniff
+              schema:
+                type: string
+            Content-Disposition:
+              description: inline; filename=report-<report_id>-r<revision>.pdf
+              schema:
+                type: string
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/internal/executors/register:
+    post:
+      tags: [Internal]
+      operationId: registerExecutor
+      summary: 执行器启动注册（internal Bearer；非公开）
+      description: |
+        认证为 `Authorization: Bearer <execution.executor_token>`（DB 设置、常量时间比较），
+        不是用户登录 token。upsert `executor_instance`（`token_hash=sha256(token)`、
+        `last_heartbeat=now`、`last_error=''`）：已有 `draining` 保持，其余置 `active`；
+        重复注册幂等。`capacity` 与别名 `max_contexts` 同时提供时必须相等。
+      security:
+        - internalBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExecutorRegisterRequest'
+      responses:
+        '200':
+          description: 注册后的执行器实例
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/ExecutorInstanceView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/internal/executors/heartbeat:
+    post:
+      tags: [Internal]
+      operationId: heartbeatExecutor
+      summary: 执行器周期心跳（internal Bearer；非公开）
+      description: |
+        认证同 register。endpoint 必须已注册，否则 404 `executor_unknown`（不自动建行）。
+        更新 `active_contexts`（必填）、`capacity`/`version`（可选，0/空保留原值）、
+        `last_heartbeat`；`status` 仅允许 `active|degraded`，degraded 只记告警；
+        `draining` 保持、其余（含 offline）恢复 `active`。
+      security:
+        - internalBearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExecutorHeartbeatRequest'
+      responses:
+        '200':
+          description: 心跳后的执行器实例
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/ExecutorInstanceView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
 components:
   securitySchemes:
     bearerAuth:
@@ -5861,6 +6478,11 @@ components:
       scheme: bearer
       bearerFormat: opaque
       description: 不透明 token（`ezt_` + base64url），固定 7 天 TTL。
+    internalBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+      description: 内部执行器 Bearer（DB 设置 `execution.executor_token`，非用户 token；只用于 /api/internal/executors/*）。
   parameters:
     Limit:
       name: limit
@@ -6700,6 +7322,67 @@ components:
         type: integer
         minimum: 1
         maximum: 500
+    KnowledgeID:
+      name: knowledgeId
+      in: path
+      required: true
+      description: 知识（knowledge_item）雪花 ID 的十进制字符串
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    GCRunID:
+      name: gcRunId
+      in: path
+      required: true
+      description: GC run（gc_run）雪花 ID 的十进制字符串
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    InstanceID:
+      name: id
+      in: path
+      required: true
+      description: API 实例（api_instance）雪花 ID 的十进制字符串
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    KnowledgeScopeFilter:
+      name: scope
+      in: query
+      required: false
+      description: 知识范围过滤
+      schema:
+        type: string
+        enum: [global, system]
+    KnowledgeStatusFilter:
+      name: status
+      in: query
+      required: false
+      description: 知识审核状态过滤
+      schema:
+        type: string
+        enum: [draft, approved, rejected, revoked]
+    KnowledgeSystemKeyFilter:
+      name: system_key
+      in: query
+      required: false
+      description: scope=system 的 SUT family 过滤
+      schema:
+        type: string
+    KnowledgeTagFilter:
+      name: tag
+      in: query
+      required: false
+      description: 标签过滤（数组包含）
+      schema:
+        type: string
+    KnowledgeQFilter:
+      name: q
+      in: query
+      required: false
+      description: 全文检索（title/content/tags；`websearch_to_tsquery('simple', q)`）
+      schema:
+        type: string
   responses:
     BadRequest:
       description: 请求参数/请求体校验失败（invalid_argument）
@@ -7127,6 +7810,12 @@ components:
           type: string
         intro:
           type: string
+        family:
+          type: string
+          nullable: true
+          maxLength: 64
+          pattern: '^[^\sA-Z]*$'
+          description: P7 可选系统族键（小写、无空白，1–64；null 表无 family）；用于 knowledge scope=system 匹配
         environments:
           type: array
           items:
@@ -7611,6 +8300,12 @@ components:
           type: string
           maxLength: 2000
           default: ''
+        family:
+          type: string
+          nullable: true
+          maxLength: 64
+          pattern: '^[^\sA-Z]*$'
+          description: P7 可选系统族键（小写、无空白，1–64）；缺省/null/空串表示不设置
     UpdateSUTRequest:
       type: object
       properties:
@@ -7621,6 +8316,12 @@ components:
         intro:
           type: string
           maxLength: 2000
+        family:
+          type: string
+          nullable: true
+          maxLength: 64
+          pattern: '^[^\sA-Z]*$'
+          description: P7 可选系统族键；省略/null 不改，空串清除，present 必须小写且无空白（1–64）
     CreateEnvironmentRequest:
       type: object
       required: [name, base_url]
@@ -9774,7 +10475,7 @@ components:
           format: date-time
     IssueView:
       type: object
-      required: [id, version_id, title, summary, status, category, severity, source, expected_revision, reopen_count, refs, created_at, updated_at]
+      required: [id, version_id, title, summary, status, category, severity, source, expected_revision, reopen_count, recurrence_count, refs, created_at, updated_at]
       properties:
         id:
           type: string
@@ -9815,6 +10516,22 @@ components:
         reopen_count:
           type: integer
           minimum: 0
+        recurrence_count:
+          type: integer
+          minimum: 0
+          description: P7 复发重定向累计次数（合并后同 dedupe_key 复发计到目标 issue）
+        last_recurred_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: P7 最近一次复发时间；从未复发为 null
+        merged_chain:
+          type: array
+          nullable: true
+          description: P7 读取期沿 merged_into_id 计算的目标链（直接目标在前、终态目标在后，≤16）；非 merged issue 为 null
+          items:
+            type: string
+            pattern: '^[0-9]+$'
         refs:
           type: array
           items:
@@ -9925,7 +10642,7 @@ components:
           format: date-time
     ReportRevisionView:
       type: object
-      required: [id, report_id, revision, status, as_of, input_fingerprint, template_version, render_status, html_available, pdf_available, created_at]
+      required: [id, report_id, revision, status, as_of, input_fingerprint, template_version, render_status, html_available, pdf_available, pdf_status, pdf_error, pdf_rendered_at, created_at]
       properties:
         id:
           type: string
@@ -9956,8 +10673,19 @@ components:
           description: revision published + render done + html_ref 非空
         pdf_available:
           type: boolean
-          enum: [false]
-          description: P4 恒为 false（PDF 属 P7）
+          description: P7 起可为 true（pdf_status=done 且 pdf_ref 非空）；P4 恒为 false
+        pdf_status:
+          type: string
+          enum: [pending, running, done, failed, disabled]
+          description: PDF 渲染状态；disabled 表示 report.render_pdf=false
+        pdf_error:
+          type: string
+          maxLength: 2000
+          nullable: true
+        pdf_rendered_at:
+          type: string
+          format: date-time
+          nullable: true
         created_at:
           type: string
           format: date-time
@@ -12654,3 +13382,478 @@ components:
           minimum: 1
         closure_status:
           type: string
+    KnowledgeItemView:
+      type: object
+      description: P7 知识主记录视图；`source_stale` 为读取期标记，不是状态。
+      required: [id, scope, title, content, tags, status, revision, source_stale, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        scope:
+          type: string
+          enum: [global, system]
+        system_key:
+          type: string
+          maxLength: 64
+          nullable: true
+          description: scope=system 时为 SUT family；global 为 null
+        title:
+          type: string
+          maxLength: 200
+        content:
+          type: string
+          maxLength: 20000
+        tags:
+          type: array
+          maxItems: 20
+          items:
+            type: string
+        status:
+          type: string
+          enum: [draft, approved, rejected, revoked]
+        confidence:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+          nullable: true
+        source_version_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        promoted_from_version_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        revision:
+          type: integer
+          minimum: 1
+        review_reason:
+          type: string
+          maxLength: 2000
+          nullable: true
+        reviewed_by:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        reviewed_at:
+          type: string
+          format: date-time
+          nullable: true
+        revoked_at:
+          type: string
+          format: date-time
+          nullable: true
+        source_stale:
+          type: boolean
+          description: 来源版本不存在时为 true；只读、不落库
+        created_by:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    KnowledgeRevisionView:
+      type: object
+      required: [id, knowledge_id, revision, title, content, tags, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        knowledge_id:
+          type: string
+          pattern: '^[0-9]+$'
+        revision:
+          type: integer
+          minimum: 1
+        title:
+          type: string
+          maxLength: 200
+        content:
+          type: string
+          maxLength: 20000
+        tags:
+          type: array
+          maxItems: 20
+          items:
+            type: string
+        changed_by:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+    KnowledgeItemDetailView:
+      description: 知识详情（KnowledgeItemView + append-only revisions）
+      allOf:
+        - $ref: '#/components/schemas/KnowledgeItemView'
+        - type: object
+          required: [revisions]
+          properties:
+            revisions:
+              type: array
+              items:
+                $ref: '#/components/schemas/KnowledgeRevisionView'
+    KnowledgeItemCreateRequest:
+      type: object
+      required: [title, content]
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        content:
+          type: string
+          minLength: 1
+          maxLength: 20000
+        scope:
+          type: string
+          enum: [global, system]
+          description: 缺省由 system_key 推导；global 不得带 system_key，system 必须带
+        system_key:
+          type: string
+          maxLength: 64
+          nullable: true
+          description: 小写、无空白；对应 sut.family
+        tags:
+          type: array
+          maxItems: 20
+          items:
+            type: string
+        source_version_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        promoted_from_version_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+          description: 缺省等于 source_version_id
+    KnowledgeItemUpdateRequest:
+      type: object
+      description: 省略/null 字段保持原值；仅 draft/rejected 可编辑。
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        content:
+          type: string
+          minLength: 1
+          maxLength: 20000
+        tags:
+          type: array
+          maxItems: 20
+          items:
+            type: string
+        scope:
+          type: string
+          enum: [global, system]
+        system_key:
+          type: string
+          maxLength: 64
+          nullable: true
+    KnowledgeReviewRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 2000
+    KnowledgeListEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/ListEnvelope'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/KnowledgeItemView'
+    KnowledgeRevisionListEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/ListEnvelope'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/KnowledgeRevisionView'
+    GCRunView:
+      type: object
+      required: [id, mode, status, actor_kind, started_at, scanned_objects, scanned_refs, deleted_objects, deleted_refs, deleted_bytes, report]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        mode:
+          type: string
+          enum: [dry_run, apply]
+        status:
+          type: string
+          enum: [running, completed, failed]
+        actor_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+          description: 手动触发为 admin 用户 ID；周期 worker 为 null
+        actor_kind:
+          type: string
+          enum: [user, system]
+        started_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: string
+          format: date-time
+          nullable: true
+        scanned_objects:
+          type: integer
+          minimum: 0
+        scanned_refs:
+          type: integer
+          minimum: 0
+        deleted_objects:
+          type: integer
+          minimum: 0
+        deleted_refs:
+          type: integer
+          minimum: 0
+        deleted_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+        report:
+          type: object
+          additionalProperties: true
+          description: 候选/删除/缺失文件明细（JSONB 对象；不随事件下发）
+        error:
+          type: string
+          nullable: true
+    GCTombstoneView:
+      type: object
+      required: [id, run_id, object_sha, size, mime, relative_path, reason, deleted_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        run_id:
+          type: string
+          pattern: '^[0-9]+$'
+        object_sha:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        size:
+          type: integer
+          format: int64
+          minimum: 0
+        mime:
+          type: string
+        relative_path:
+          type: string
+          description: 相对 paths.data_root 的路径（admin-only；不返回绝对路径）
+        reason:
+          type: string
+          enum: [unreferenced, temp, superseded_export, orphan_file]
+        deleted_at:
+          type: string
+          format: date-time
+    GCRunDetailView:
+      description: GC run 详情（GCRunView + tombstones）
+      allOf:
+        - $ref: '#/components/schemas/GCRunView'
+        - type: object
+          required: [tombstones]
+          properties:
+            tombstones:
+              type: array
+              items:
+                $ref: '#/components/schemas/GCTombstoneView'
+    GCRunCreateRequest:
+      type: object
+      required: [mode]
+      properties:
+        mode:
+          type: string
+          enum: [dry_run, apply]
+        confirm:
+          type: boolean
+          default: false
+          description: apply 必须为 true；否则 400 `confirmation_required`
+    GCRunListEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/ListEnvelope'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/GCRunView'
+    InstanceView:
+      type: object
+      description: API 实例注册表（contracts/db-schema.md §16.4）
+      required: [id, instance_key, hostname, pid, api_port, node_id, status, version, started_at, heartbeat_at, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        instance_key:
+          type: string
+          description: hostname:pid 自然键
+        hostname:
+          type: string
+        pid:
+          type: integer
+          minimum: 1
+        api_port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        node_id:
+          type: integer
+          minimum: 0
+          maximum: 1023
+        status:
+          type: string
+          enum: [active, draining, offline, stopped]
+        version:
+          type: string
+        last_error:
+          type: string
+          nullable: true
+        started_at:
+          type: string
+          format: date-time
+        heartbeat_at:
+          type: string
+          format: date-time
+        draining_at:
+          type: string
+          format: date-time
+          nullable: true
+        stopped_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    InstanceListEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/ListEnvelope'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/InstanceView'
+    ReadinessView:
+      type: object
+      required: [status, database, storage, draining, instance_id]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        database:
+          type: string
+          enum: [ok, down]
+        storage:
+          type: string
+          enum: [ok, down]
+        draining:
+          type: boolean
+        instance_id:
+          type: string
+          description: 本实例 api_instance ID 的十进制字符串；未注册时为空串
+    ExecutorInstanceView:
+      type: object
+      description: 内部 register/heartbeat 的执行器实例视图（无 token hash/labels）
+      required: [instance_id, endpoint, name, status, capacity, active_contexts, version]
+      properties:
+        instance_id:
+          type: string
+          pattern: '^[0-9]+$'
+        endpoint:
+          type: string
+          format: uri
+          maxLength: 500
+        name:
+          type: string
+          maxLength: 200
+        status:
+          type: string
+          enum: [active, draining, offline]
+        capacity:
+          type: integer
+          minimum: 0
+        active_contexts:
+          type: integer
+          minimum: 0
+        version:
+          type: string
+          maxLength: 64
+        last_heartbeat:
+          type: string
+          format: date-time
+          nullable: true
+    ExecutorRegisterRequest:
+      type: object
+      required: [endpoint, name, capacity, version]
+      properties:
+        endpoint:
+          type: string
+          format: uri
+          maxLength: 500
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        capacity:
+          type: integer
+          minimum: 1
+          description: 执行器最大并发 context 数
+        max_contexts:
+          type: integer
+          minimum: 1
+          description: capacity 的同义别名；同时提供时必须相等
+        active_contexts:
+          type: integer
+          minimum: 0
+          default: 0
+        version:
+          type: string
+          minLength: 1
+          maxLength: 64
+        status:
+          type: string
+          enum: [active, degraded]
+    ExecutorHeartbeatRequest:
+      type: object
+      required: [endpoint, active_contexts]
+      properties:
+        endpoint:
+          type: string
+          format: uri
+          maxLength: 500
+        active_contexts:
+          type: integer
+          minimum: 0
+        capacity:
+          type: integer
+          minimum: 0
+          description: 可选；0 表示保留原容量
+        version:
+          type: string
+          maxLength: 64
+        status:
+          type: string
+          enum: [active, degraded]

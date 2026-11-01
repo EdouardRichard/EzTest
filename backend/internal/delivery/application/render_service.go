@@ -62,7 +62,7 @@ func (e *RenderJobEnsurer) ReconcileP7(ctx context.Context) error {
 	if limit <= 0 {
 		limit = renderEnsureLimit
 	}
-	revisions, err := e.jobs.ListRenderableRevisions(ctx, limit)
+	revisions, err := e.jobs.ListRenderableRevisions(ctx, limit, renderMaxAttempts(ctx, e.settings))
 	if err != nil {
 		return fmt.Errorf("list renderable report revisions: %w", err)
 	}
@@ -200,7 +200,7 @@ func (w *RenderWorker) RunOnce(ctx context.Context) (bool, error) {
 
 	var revision delivery.ReportRevision
 	var execErr error
-	execErr = w.withHeartbeat(ctx, job, func() error {
+	execErr = w.withHeartbeat(ctx, job, lease, func() error {
 		revision, execErr = w.render(ctx, job, revisionID, reportID)
 		return execErr
 	})
@@ -298,7 +298,7 @@ func (w *RenderWorker) render(ctx context.Context, job RenderJob, revisionID, re
 			retryable: !isTerminalRenderContentError(err),
 		}
 	}
-	if err := w.jobs.MarkPDFRendered(ctx, revisionID, ref, w.clock.Now()); err != nil {
+	if err := w.jobs.MarkPDFRendered(ctx, revisionID, ref, int32(job.Attempts), w.clock.Now()); err != nil {
 		if errors.Is(err, delivery.ErrStateConflict) {
 			return revision, errRenderSettled
 		}
@@ -309,14 +309,12 @@ func (w *RenderWorker) render(ctx context.Context, job RenderJob, revisionID, re
 }
 
 // withHeartbeat renews the job lease while run executes and stops the renewal
-// before returning.
-func (w *RenderWorker) withHeartbeat(ctx context.Context, job RenderJob, run func() error) error {
+// before returning. lease is the exact duration the claim used, so the renewed
+// lease never shrinks below the claimed one (fix 1).
+func (w *RenderWorker) withHeartbeat(ctx context.Context, job RenderJob, lease time.Duration, run func() error) error {
 	interval := w.heartbeatInterval
 	if interval <= 0 {
-		interval = renderLease(ctx, w.settings) / 3
-		if interval < time.Second {
-			interval = time.Second
-		}
+		interval = renderHeartbeatInterval(lease)
 	}
 	hbCtx, cancel := context.WithCancel(ctx)
 	var wg sync.WaitGroup
@@ -330,7 +328,7 @@ func (w *RenderWorker) withHeartbeat(ctx context.Context, job RenderJob, run fun
 			case <-hbCtx.Done():
 				return
 			case <-ticker.C:
-				if err := w.queue.Heartbeat(hbCtx, job.ID, job.Epoch); err != nil {
+				if err := w.queue.Heartbeat(hbCtx, job.ID, job.Epoch, lease); err != nil {
 					w.logger.Warn("report pdf work item heartbeat failed", "job_id", job.ID, "error", err)
 				}
 			}
@@ -347,6 +345,13 @@ func (w *RenderWorker) withHeartbeat(ctx context.Context, job RenderJob, run fun
 // write actually moved the revision into failed.
 func (w *RenderWorker) failJob(ctx context.Context, job RenderJob, revisionID int64, revision delivery.ReportRevision, failure *renderFailure) error {
 	queueErr := w.queue.Fail(ctx, job.ID, job.Epoch, failure.err, false)
+	if isRenderLeaseLost(queueErr) {
+		// The job was taken over: this worker has no authority to write the
+		// revision state, and the new owner owns the next attempt.
+		w.logger.Warn("report pdf lease lost; skipping revision failure write",
+			"job_id", job.ID, "revision_id", revisionID)
+		return queueErr
+	}
 	if revisionID <= 0 {
 		return queueErr
 	}
@@ -459,6 +464,16 @@ func boundedPDFError(err error) string {
 		return string(runes[:renderMaxPDFError])
 	}
 	return message
+}
+
+// isRenderLeaseLost reports the stable lease_lost conflict returned by the work
+// queue adapter when another claimant took the job over.
+func isRenderLeaseLost(err error) bool {
+	if err == nil {
+		return false
+	}
+	apiErr := platform.AsError(err)
+	return apiErr.Status == 409 && apiErr.Code == "lease_lost"
 }
 
 // isTerminalRenderContentError reports a content-ledger error that a retry

@@ -110,7 +110,7 @@ func (q *WorkQueue) ClaimForTeams(ctx context.Context, claimant string, teams []
 	}
 	for _, team := range teams {
 		if !team.Valid() {
-			return agent.WorkItem{}, false, platform.Invalid("teams", "must contain only clarification, design, execution, delivery, steward, code")
+			return agent.WorkItem{}, false, platform.Invalid("teams", "must contain only clarification, design, execution, delivery, steward, code, ops")
 		}
 	}
 	return q.repo.ClaimForTeams(ctx, claimant, teams, q.lease)
@@ -152,9 +152,16 @@ func (q *WorkQueue) MarkRunning(ctx context.Context, id, epoch int64) error {
 	return mapLeaseLost(q.repo.MarkRunning(ctx, id, epoch))
 }
 
-// Heartbeat extends the current lease without changing the epoch.
-func (q *WorkQueue) Heartbeat(ctx context.Context, id, epoch int64) error {
-	return mapLeaseLost(q.repo.Renew(ctx, id, epoch, q.lease))
+// Heartbeat extends the current lease without changing the epoch. lease is the
+// exact duration the item was claimed with; zero means the queue default. A
+// caller that claims with a longer lease (the report PDF worker) must renew
+// with that same lease, otherwise the renewed lease can expire before the next
+// heartbeat (fix 1: render lease mismatch).
+func (q *WorkQueue) Heartbeat(ctx context.Context, id, epoch int64, lease time.Duration) error {
+	if lease <= 0 {
+		lease = q.lease
+	}
+	return mapLeaseLost(q.repo.Renew(ctx, id, epoch, lease))
 }
 
 // Complete finishes a work item.

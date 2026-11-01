@@ -599,6 +599,67 @@ func TestGCServiceDryRunThenApplyOnRealLedger(t *testing.T) {
 	}
 }
 
+// TestGCReclaimsStaleRunningRun pins fix 3: a crashed GC pass left a 'running'
+// row whose lease expired; the next pass must fail that row and proceed instead
+// of returning 409 gc_running for ever (the partial unique index).
+func TestGCReclaimsStaleRunningRun(t *testing.T) {
+	fixture := newGCIntegrationFixture(t)
+	if _, err := fixture.pool.Exec(fixture.ctx, `
+		INSERT INTO gc_run (id, mode, status, actor_kind, started_at, lease_owner, lease_until)
+		VALUES (950, 'apply', 'running', 'system', now() - interval '1 hour', 'crashed', now() - interval '1 minute')
+	`); err != nil {
+		t.Fatalf("insert stale running run: %v", err)
+	}
+
+	run, err := fixture.svc.Run(fixture.ctx, storage.GCModeDryRun, 1)
+	if err != nil {
+		t.Fatalf("Run after a stale running row: %v", err)
+	}
+	if run.Status != storage.GCRunCompleted {
+		t.Fatalf("new run = %#v", run)
+	}
+
+	var status, errorText string
+	var leaseOwner *string
+	var leaseUntil, finishedAt *time.Time
+	if err := fixture.pool.QueryRow(fixture.ctx, `
+		SELECT status, coalesce(error, ''), lease_owner, lease_until, finished_at
+		FROM gc_run WHERE id = 950
+	`).Scan(&status, &errorText, &leaseOwner, &leaseUntil, &finishedAt); err != nil {
+		t.Fatalf("read reclaimed run: %v", err)
+	}
+	if status != string(storage.GCRunFailed) {
+		t.Fatalf("stale row status = %q, want failed", status)
+	}
+	if !strings.Contains(errorText, "lease") {
+		t.Fatalf("stale row error = %q, want a lease-expired explanation", errorText)
+	}
+	if leaseOwner != nil || leaseUntil != nil {
+		t.Fatalf("stale row lease not cleared: owner=%v until=%v", leaseOwner, leaseUntil)
+	}
+	if finishedAt == nil {
+		t.Fatal("stale row finished_at was not stamped")
+	}
+
+	// A legacy running row with no lease_until is also reclaimable once it is
+	// older than the GC lease window.
+	if _, err := fixture.pool.Exec(fixture.ctx, `
+		INSERT INTO gc_run (id, mode, status, actor_kind, started_at, lease_owner, lease_until)
+		VALUES (951, 'dry_run', 'running', 'system', now() - interval '1 hour', NULL, NULL)
+	`); err != nil {
+		t.Fatalf("insert legacy stale running run: %v", err)
+	}
+	if _, err := fixture.svc.Run(fixture.ctx, storage.GCModeDryRun, 1); err != nil {
+		t.Fatalf("Run after a legacy stale running row: %v", err)
+	}
+	if err := fixture.pool.QueryRow(fixture.ctx, `SELECT status FROM gc_run WHERE id = 951`).Scan(&status); err != nil {
+		t.Fatalf("read legacy reclaimed run: %v", err)
+	}
+	if status != string(storage.GCRunFailed) {
+		t.Fatalf("legacy stale row status = %q, want failed", status)
+	}
+}
+
 func TestGCSingleRunningRunConflictOnRealDB(t *testing.T) {
 	fixture := newGCIntegrationFixture(t)
 	now := time.Now().UTC()

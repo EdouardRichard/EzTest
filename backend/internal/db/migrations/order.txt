@@ -39,3 +39,4 @@ delivery_0004_report_pdf.sql
 orchestration_0001_instance.sql
 resource_0002_sut_family.sql
 delivery_0005_issue_recurrence.sql
+agent_0006_ops_team.sql

@@ -12,6 +12,7 @@ import (
 	deliveryapp "github.com/EdouardRichard/EzTest/backend/internal/delivery/application"
 	delivery "github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
 	deliverypg "github.com/EdouardRichard/EzTest/backend/internal/delivery/infrastructure/postgres"
+	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -112,7 +113,11 @@ type integrationIssueFixture struct {
 func newIntegrationIssueFixture(t *testing.T) *integrationIssueFixture {
 	t.Helper()
 	pool := testutil.NewDB(t)
-	repo := deliverypg.NewIssueRepository(pool)
+	ids, err := platformid.NewSnowflake(0)
+	if err != nil {
+		t.Fatalf("new snowflake: %v", err)
+	}
+	repo := deliverypg.NewIssueRepository(pool, ids)
 	exec := &integrationIssueExecution{snapshots: map[int64]deliveryapp.CaseRunSnapshot{}}
 	events := &integrationIssueEvents{}
 	audit := &integrationIssueAudit{}
@@ -411,10 +416,15 @@ func TestIssueServiceIntegrationReportRevisionStableAfterRecurrence(t *testing.T
 	const versionID = int64(7)
 
 	// The report fixture's version is 7; seed the issue rows in the same schema.
+	ids, err := platformid.NewSnowflake(0)
+	if err != nil {
+		t.Fatalf("new snowflake: %v", err)
+	}
+	issueRepo := deliverypg.NewIssueRepository(fixture.pool, ids)
 	sourceSnapshot := integrationIssueSnapshot(versionID, 3301, 4301)
 	targetSnapshot := integrationIssueSnapshot(versionID, 3302, 4302)
-	source, _ := integrationIssueCreate(t, deliverypg.NewIssueRepository(fixture.pool), sourceSnapshot)
-	target, _ := integrationIssueCreate(t, deliverypg.NewIssueRepository(fixture.pool), targetSnapshot)
+	source, _ := integrationIssueCreate(t, issueRepo, sourceSnapshot)
+	target, _ := integrationIssueCreate(t, issueRepo, targetSnapshot)
 
 	fixture.data.wave.Issues = []delivery.IssueSnapshot{{
 		ID: target.ID, VersionID: versionID, Title: "结算按钮（原始）",
@@ -437,7 +447,6 @@ func TestIssueServiceIntegrationReportRevisionStableAfterRecurrence(t *testing.T
 	}
 
 	// Merge A into B and trigger a recurrence while r1 is already published.
-	issueRepo := deliverypg.NewIssueRepository(fixture.pool)
 	if _, err := issueRepo.Merge(ctx, deliveryapp.IssueMerge{
 		VersionID: versionID, SourceID: source.ID, TargetID: target.ID, ActorID: 77,
 	}); err != nil {

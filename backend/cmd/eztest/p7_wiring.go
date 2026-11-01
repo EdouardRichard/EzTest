@@ -326,12 +326,14 @@ func (q renderQueueAdapter) ClaimForTypes(ctx context.Context, claimant string, 
 	}, true, nil
 }
 
-// Heartbeat implements deliveryapp.RenderQueue.
-func (q renderQueueAdapter) Heartbeat(ctx context.Context, jobID, epoch int64) error {
+// Heartbeat implements deliveryapp.RenderQueue. It renews with the exact lease
+// the job was claimed with (report.render_lease_seconds), never the agent queue
+// default, so the lease cannot lapse between renewals.
+func (q renderQueueAdapter) Heartbeat(ctx context.Context, jobID, epoch int64, lease time.Duration) error {
 	if q.queue == nil {
 		return errors.New("report render queue: work queue is not configured")
 	}
-	return q.queue.Heartbeat(ctx, jobID, epoch)
+	return q.queue.Heartbeat(ctx, jobID, epoch, lease)
 }
 
 // Complete implements deliveryapp.RenderQueue.

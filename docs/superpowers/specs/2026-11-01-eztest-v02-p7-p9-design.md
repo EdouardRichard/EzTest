@@ -22,7 +22,7 @@
 
 ### 1.2 In（本阶段必须交付）
 
-- 迁移 #34–#39（见 §5）与 `order.txt`。
+- 迁移 #34–#40（见 §5）与 `order.txt`。
 - 新限界上下文 `backend/internal/knowledge/`（四层齐全）。
 - 新限界上下文 `backend/internal/orchestration/`（实例注册/leader/readiness/排空；四层齐全）。
 - `delivery`：PDF 渲染任务/状态/下载；问题复发重定向；报告附录章节与模板版本 2。
@@ -116,7 +116,8 @@ PostgreSQL（唯一协调面：lease/fencing、advisory lock、LISTEN/NOTIFY、�
 ### 4.2 D59 报告 PDF（链路）
 
 1. 报告发布（既有）→ revision 的 `pdf_status='pending'`（新列，默认 pending）。
-2. reconciler 新规则（P7 ensurer）：revision `status=published` 且 `render_status='done'`、`report.render_pdf=true`、`pdf_status in (pending,failed)` 且尝试未超限 → ensure work_item `report.render_pdf`（`team=delivery`、`dedupe_key=report:{reportID}:rev:{revision}`、payload `{report_id, report_revision_id}`）。
+2. reconciler 新规则（P7 ensurer）：revision `status=published` 且 `render_status='done'`、`report.render_pdf=true`、`pdf_status in (pending,failed)` 且尝试未超限 → ensure work_item `report.render_pdf`（`team=ops`、`dedupe_key=report:{reportID}:rev:{revision}`、payload `{report_id, report_revision_id}`）。
+   - `team=ops`（而非 `delivery`）：`report.render_pdf` 是确定性 worker 任务，不是 agent 模型任务；P1 agent worker 只领取 `clarification/design/execution/delivery/steward` 五个产品团队，若使用 `delivery` 会被 agent worker 领取并以 `invalid_work_type` 置 dead（验收 S1 的 P7-BUG-01）。专用 `RenderWorker` 用 `ClaimForTypes(["report.render_pdf"])` 领取，不依赖 team；为此新增迁移 #40 把 `work_item.team` 扩为 7 值（+`ops`）。
    - 迁移 #36 的列默认值 `pending` 会把**既有已发布 revision** 纳入补齐队列（P9 要求旧报告也能出 PDF）；补齐受 `retention.gc_batch_size` 无关的每轮扫描上限（reconciler 现有 `reconcilerLimit=100`）约束，可在 `report.render_pdf=false` 时整体关闭。设计记录为“历史 revision PDF 补齐”，不是删除/重写内容。
 3. `delivery` 新增 `RenderWorker`：按 type 认领（新 work_item 认领方法 `ClaimForTypes`），带心跳续租；读已冻结 HTML（content ledger，owner=`report_revision`/role=`report_html`）→ POST renderer `/v1/pdf` → 校验 `%PDF-` 魔数与大小上限 → 写入 ledger（owner=`report_revision`/role=`report_pdf`）→ 受 fence 的元数据更新（`pdf_status='done'`、`pdf_ref`、`pdf_rendered_at`、`pdf_attempts++`）。
 4. 失败：可重试错误 → work_item retry（指数退避由 work_item 提供）；超过 `report.render_max_attempts` → `pdf_status='failed'`、`pdf_error`、事件 `report.pdf_failed`；reconciler 不再自动补（管理员可通过 regenerate/re-enable 触发新 revision）。
@@ -181,7 +182,7 @@ PostgreSQL（唯一协调面：lease/fencing、advisory lock、LISTEN/NOTIFY、�
 
 ---
 
-## 5. 数据模型（迁移 #34–#39）
+## 5. 数据模型（迁移 #34–#40，7 个迁移，总计 40）
 
 > 约定：雪花 `BIGINT` 主键（应用生成）、`TIMESTAMPTZ`、`created_at/updated_at`、索引名 `pk_/uk_/idx_`（`db-schema.md:11-18`）。跨上下文只做逻辑引用。
 
@@ -273,6 +274,17 @@ ALTER TABLE delivery_issue
   ADD COLUMN recurrence_count INTEGER NOT NULL DEFAULT 0 CHECK (recurrence_count >= 0),
   ADD COLUMN last_recurred_at TIMESTAMPTZ NULL;
 ```
+
+### #40 `agent_0006_ops_team.sql`（P7 内部修正）
+
+```sql
+ALTER TABLE work_item DROP CONSTRAINT IF EXISTS chk_work_item_team;
+ALTER TABLE work_item DROP CONSTRAINT IF EXISTS work_item_team_check;
+ALTER TABLE work_item ADD CONSTRAINT chk_work_item_team
+  CHECK (team IN ('clarification', 'design', 'execution', 'delivery', 'steward', 'code', 'ops'));
+```
+
+- `work_item.team` 6→7 值；`ops` 承载确定性 worker 任务（`report.render_pdf`），避免通用 agent worker 误领（§4.2）。无新表、无数据变更；`ops` 不建 team room。
 
 ---
 
@@ -373,7 +385,7 @@ ALTER TABLE delivery_issue
 
 ## 9. 任务、工具与 profile
 
-- **任务类型**：注册 `report.render_pdf`（`team=delivery`，版本域，payload `{report_id, report_revision_id}`，dedupe `report:{reportID}:rev:{revision}`，max_attempts 取 `report.render_max_attempts`）。
+- **任务类型**：注册 `report.render_pdf`（`team=ops`，版本域，payload `{report_id, report_revision_id}`，dedupe `report:{reportID}:rev:{revision}`，max_attempts 取 `report.render_max_attempts`）。`ops` 是确定性 worker 团队：agent worker 只领取 5 个产品团队，render worker 按 type 领取。
 - **工具**：新增 `knowledge.propose`（澄清/设计 profile 白名单；参数 title/content/tags/scope?/system_key?，服务端强制 draft + 当前版本为 source）；`knowledge` 注入进入 `version_pack`。
 - **Profile 白名单增量**：clarification Host/Scout、design Host/Planner/Author 允许 `knowledge.propose`；读取注入无需工具。
 - **worker 装配**：`cmd/eztest` 新增 `RenderWorker`、`GCWorker`、`InstanceRegistry`/`Leader`、`SSE listener`；leader 门控 reconciler/scheduler/poller/GC。
@@ -411,7 +423,7 @@ ALTER TABLE delivery_issue
 ### 12.1 测试层
 
 - **单测**（每个新包）：知识状态机/scope 校验/注入预算排序；GC 候选分类/保护/宽限/保留期；实例 node 分配/leader 门控/readiness；PDF 任务 ensure/重试/元数据 fence；复发链重定向。
-- **集成**（`-tags=integration`）：迁移 #34–#39 幂等与表/索引；知识 FTS/游标；GC apply 的 ref→object→文件顺序与 tombstone/审计；report PDF 元数据不可变性；issue recurrence 事务；`api_instance` 唯一 node_id 分配。
+- **集成**（`-tags=integration`）：迁移 #34–#40 幂等与表/索引；知识 FTS/游标；GC apply 的 ref→object→文件顺序与 tombstone/审计；report PDF 元数据不可变性；issue recurrence 事务；`api_instance` 唯一 node_id 分配；ops 任务不被 agent worker 领取、可被 `ClaimForTypes` 领取。
 - **契约**：`scripts/p7-contract-check.cjs`（新路径/事件/表/迁移/设置/任务/工具计数）+ P2–P6 前向兼容门禁。
 - **多副本演练**：`scripts/p7-multi.ps1`（双进程 + 真实 PG）。
 - **真实 LLM + 真实 Chrome 验收**：`scripts/p7-acceptance.ps1`。
@@ -420,7 +432,7 @@ ALTER TABLE delivery_issue
 ### 12.2 验收场景（S0–S12，真实环境）
 
 - 环境：`eztest_v02_p6`（33 迁移/2 版本/5 波次/2 问题/7 报告/9 revision/53 run/72 设置）克隆为 `eztest_v02_p7`；真实 DeepSeek；真实 Chrome；本机双 API 副本 + renderer。
-- S0 启动：39 迁移、83 设置、renderer health、`/api/health/ready` 200。
+- S0 启动：40 迁移、83 设置、renderer health、`/api/health/ready` 200。
 - S1 报告 PDF：选已发布 revision → 生成 PDF（`%PDF-` + 大小 + sha）→ 下载 200；HTML/as_of 不变；`pdf_available=true`。
 - S2 PDF 重试：停 renderer → 触发新 revision PDF → failed 状态 + 事件 → 启 renderer → 自动重试成功。
 - S3 模板/章节：`report.template_version=2` + 附录开关 on/off；HTML 含/不含附录；旧 revision 仍为 1 且不变。
@@ -449,10 +461,10 @@ ALTER TABLE delivery_issue
 
 - `openapi.yaml`：`0.2.0-p7`、`x-frozen: P7`；新增 16 个 operation（知识 8、GC 3、实例 3、health ready 1、PDF 下载 1）+ 内部 2 个；`ReportRevisionView.pdf_available` 扩宽 + PDF 字段；`IssueView` 复发字段；SUT `family` 可选。
 - `events.md`：§16（12 个新事件，见 §7）。
-- `db-schema.md`：§16（6 张新表 + 3 张既有表列扩展：`delivery_report_revision`、`delivery_issue`、`sut`），并更新 P4 `pdf_ref` 注记为 P7。
-- `migrations-order.md`：§9（#34–#39，`order.txt` 39 条）。
+- `db-schema.md`：§16（6 张新表 + 3 张既有表列扩展：`delivery_report_revision`、`delivery_issue`、`sut`；#40 `work_item.team` 扩为 7 值含 `ops`），并更新 P4 `pdf_ref` 注记为 P7。
+- `migrations-order.md`：§9（#34–#40，`order.txt` 40 条）。
 - `settings.md`：§4g（72→83；`report.template_version` 默认值说明）。
-- `task-types.md`：§8（`report.render_pdf`）。
+- `task-types.md`：§8（`report.render_pdf`，team=`ops`）。
 - `agent-profiles-tools.md`：§10（`knowledge.propose`、注入字段、白名单）。
 - `executor-protocol.md`：§12（push 注册/心跳、多端点、容量选择）。
 - `contracts/README.md`：P7 冻结状态与计数。

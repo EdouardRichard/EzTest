@@ -105,7 +105,7 @@ func (r *WorkItemRepository) ClaimForTeams(ctx context.Context, claimant string,
 	names := make([]string, 0, len(teams))
 	for _, team := range teams {
 		if !team.Valid() {
-			return agent.WorkItem{}, false, platform.Invalid("teams", "must contain only clarification, design, execution, delivery, steward, code")
+			return agent.WorkItem{}, false, platform.Invalid("teams", "must contain only clarification, design, execution, delivery, steward, code, ops")
 		}
 		names = append(names, string(team))
 	}

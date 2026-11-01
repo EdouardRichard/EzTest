@@ -255,9 +255,9 @@ agent_0005_profile_prompt_revision.sql
 - 集成测试断言 **33** 个迁移、3 张 P6 表、**二次执行 no-op**（`schema_migrations` 不变）；`migrate_test.go` 的 `wantTail` 固定为上述 2 个文件、迁移计数 31→33。
 - 开发库/演示库照常启动前滚；回滚仍为恢复备份，不提供 down SQL。
 
-## 9. P7 增量迁移（draft: P7，2026-11-01）
+## 9. P7 增量迁移（frozen: P7，2026-11-01）
 
-P0–P6 的 33 个迁移保持原样；P7 在 `order.txt` 末尾追加 6 个文件（第 34–39 个）：
+P0–P6 的 33 个迁移保持原样；P7 在 `order.txt` 末尾追加 7 个文件（第 34–40 个）：
 
 | 序号 | 迁移文件 | 上下文（ownership） | 创建/变更 |
 |---|---|---|---|
@@ -267,6 +267,7 @@ P0–P6 的 33 个迁移保持原样；P7 在 `order.txt` 末尾追加 6 个文�
 | 37 | `orchestration_0001_instance.sql` | orchestration（P7 新上下文） | 创建 `api_instance`；`idx_api_instance_status_heartbeat` |
 | 38 | `resource_0002_sut_family.sql` | resource | `sut` 新增 `family`；`idx_sut_family` |
 | 39 | `delivery_0005_issue_recurrence.sql` | delivery | `delivery_issue` 新增 `recurrence_count/last_recurred_at` |
+| 40 | `agent_0006_ops_team.sql` | agent | `work_item.team` CHECK 6→7 值（新增 `ops`；P7 内部修正，确定性 worker 任务团队） |
 
 `order.txt` 末尾追加：
 
@@ -277,13 +278,15 @@ delivery_0004_report_pdf.sql
 orchestration_0001_instance.sql
 resource_0002_sut_family.sql
 delivery_0005_issue_recurrence.sql
+agent_0006_ops_team.sql
 ```
 
-- 固定顺序 34→39（knowledge → storage → delivery_pdf → orchestration → resource → delivery_recurrence）；只追加、不改历史文件，`#1–#33` 的 checksum 不变。
-- **P7 新表共 6 张**：knowledge 3（`knowledge_item`、`knowledge_revision`、`knowledge_usage`）+ storage 2（`gc_run`、`gc_tombstone`）+ orchestration 1（`api_instance`）；**既有表扩展 3 张**（`delivery_report_revision`、`sut`、`delivery_issue`），不新增其他表。
+- **P7 内部修正（实现期，冻结前）**：#40 `agent_0006_ops_team.sql` 在 P7 冻结前追加；`work_item.team` 由 6 值扩为 7 值（新增 `ops`）。P7 的 `report.render_pdf` 是确定性 worker 任务，team=`ops`，避免通用 agent worker（只领取 clarification/design/execution/delivery/steward 五个产品团队）把任务领取后以 `invalid_work_type` 置 dead（验收 S1 的 P7-BUG-01）；专用 `RenderWorker` 仍按 `ClaimForTypes(["report.render_pdf"])` 领取。该迁移只扩宽 CHECK，不新增表，`ops` 不建 team room。
+- 固定顺序 34→40（knowledge → storage → delivery_pdf → orchestration → resource → delivery_recurrence → agent_ops_team）；只追加、不改历史文件，`#1–#39` 的 checksum 不变。
+- **P7 新表共 6 张**：knowledge 3（`knowledge_item`、`knowledge_revision`、`knowledge_usage`）+ storage 2（`gc_run`、`gc_tombstone`）+ orchestration 1（`api_instance`）；**既有表扩展 4 张**（`delivery_report_revision`、`sut`、`delivery_issue`、`work_item` 的 team CHECK；前三张为列扩展，`work_item` 仅扩宽 CHECK），不新增其他表。
 - 主键/约束/索引命名：`pk_knowledge_item`、`ck_knowledge_item_scope`、`idx_knowledge_item_scope_status_id`、`idx_knowledge_item_status_id`、`idx_knowledge_item_source_version`、`idx_knowledge_item_search`、`pk_knowledge_revision`、`uk_knowledge_revision_knowledge_id_revision`、`idx_knowledge_revision_knowledge_id_id`、`pk_knowledge_usage`、`idx_knowledge_usage_knowledge_id_id`、`pk_gc_run`、`uk_gc_run_running`、`idx_gc_run_started_at`、`pk_gc_tombstone`、`idx_gc_tombstone_run_id`、`idx_content_ref_live_object`、`idx_content_object_created_at`、`idx_delivery_report_revision_pdf_pending`、`pk_api_instance`、`uk_api_instance_instance_key`、`uk_api_instance_node_id`、`idx_api_instance_status_heartbeat`、`idx_sut_family`。
 - 全部新表雪花 `BIGINT` 主键（应用生成）、`TIMESTAMPTZ`（API 为 RFC3339 UTC）；`knowledge_revision`/`knowledge_usage` 的同上下文 FK、`gc_tombstone.run_id → gc_run.id` 同上下文 FK 显式；跨上下文只做逻辑引用（版本/identity/agent_run/work_item）。
-- 集成测试断言 **39** 个迁移、6 张 P7 新表、`#34–#39` 的尾部顺序、**二次执行 no-op**（`schema_migrations` 不变）；`migrate_test.go` 的 `wantTail` 固定为上述 6 个文件、迁移计数 33→39。
+- 集成测试断言 **40** 个迁移、6 张 P7 新表、`#34–#40` 的尾部顺序、**二次执行 no-op**（`schema_migrations` 不变）；`migrate_test.go` 的 `wantTail` 固定为上述 7 个文件、迁移计数 33→40。
 - 开发库/演示库照常启动前滚；回滚仍为恢复备份，不提供 down SQL（见 §10）。
 
 ## 10. 回滚 / 备份 / 数据库边界

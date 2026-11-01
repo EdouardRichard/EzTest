@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	delivery "github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
+	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -17,7 +18,11 @@ import (
 func newAnalysisRepoForTest(t *testing.T) (*AnalysisRepository, *pgxpool.Pool) {
 	t.Helper()
 	pool := testutil.NewDB(t)
-	return NewAnalysisRepository(pool), pool
+	ids, err := platformid.NewSnowflake(0)
+	if err != nil {
+		t.Fatalf("snowflake: %v", err)
+	}
+	return NewAnalysisRepository(pool, ids), pool
 }
 
 func analysisRepoInput(t *testing.T, issueID string) json.RawMessage {

@@ -74,6 +74,32 @@ func (s *Service) SetLogger(logger *slog.Logger) {
 	}
 }
 
+// instanceIDRetries bounds the fresh-ID retries of one registration. Two
+// replicas that share the bootstrap snowflake node can mint the same
+// api_instance.id when they start in the same millisecond; a short wait crosses
+// the millisecond boundary so the next Next() is distinct.
+const instanceIDRetries = 2
+
+// instanceIDRetryDelay is a variable so tests can pin the retry path quickly.
+var instanceIDRetryDelay = 2 * time.Millisecond
+
+// insertInstance registers one node candidate, reallocating the instance ID and
+// retrying when the primary key collides (bounded). ErrNodeTaken and
+// ErrInstanceKeyTaken are returned untouched so Start can advance candidates.
+func (s *Service) insertInstance(ctx context.Context, candidate orchestration.Instance) (orchestration.Instance, error) {
+	for attempt := 0; ; attempt++ {
+		err := s.repo.Insert(ctx, candidate)
+		if err == nil {
+			return candidate, nil
+		}
+		if !errors.Is(err, orchestration.ErrInstanceIDTaken) || attempt >= instanceIDRetries {
+			return orchestration.Instance{}, err
+		}
+		time.Sleep(instanceIDRetryDelay)
+		candidate.ID = s.ids.Next()
+	}
+}
+
 // Start registers this API replica, allocates a snowflake node ID and starts
 // the heartbeat loop. Preferred is runtime.snowflake_node_id; when it is
 // already owned by a live replica the smallest free node 0..1023 is used and
@@ -126,14 +152,16 @@ func (s *Service) Start(ctx context.Context, meta StartMeta) (orchestration.Inst
 	for _, nodeID := range candidates {
 		candidate := base
 		candidate.NodeID = nodeID
-		err := s.repo.Insert(ctx, candidate)
+		inserted, err := s.insertInstance(ctx, candidate)
 		switch {
 		case err == nil:
-			registered = &candidate
+			registered = &inserted
 		case errors.Is(err, orchestration.ErrNodeTaken):
 			continue
 		case errors.Is(err, orchestration.ErrInstanceKeyTaken):
 			return orchestration.Instance{}, platform.Conflict("instance key is already registered")
+		case errors.Is(err, orchestration.ErrInstanceIDTaken):
+			return orchestration.Instance{}, platform.Conflict("api_instance id collision retry budget exhausted")
 		default:
 			return orchestration.Instance{}, err
 		}

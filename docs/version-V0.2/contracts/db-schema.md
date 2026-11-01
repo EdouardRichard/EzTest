@@ -1345,6 +1345,7 @@
 ### 13.3 `work_item.team` 6 值（`agent_0004_code_team.sql`，#31）
 
 - 由 5 值扩为 6 值：`clarification/design/execution/delivery/steward/code`。
+- P7 的 `agent_0006_ops_team.sql`（#40）在 6 值上追加 `ops`，见 §16.7；`ops` 只承载确定性 worker 任务（`report.render_pdf`），agent worker 仍只领取 5 个产品团队。
 - 实现：`ALTER TABLE work_item DROP CONSTRAINT IF EXISTS work_item_team_check;` 后 `ADD CONSTRAINT chk_work_item_team CHECK (team IN (...6...))`；原内联 CHECK 由 PostgreSQL 自动命名为 `work_item_team_check`。
 - `work_item.version_id` 保持 NOT NULL（codeintel 任务必须版本作用域，B1a）；`team_room_post`/`team_room_digest` 的 team CHECK 不变（P5 不为 `code` 团队建频道）。
 - 任务类型 `index.repo`/`code.analyze` 由应用注册（`task-types.md` §7），不改表结构。
@@ -1468,11 +1469,11 @@
 - `delivery_issue`/`delivery_report`/`delivery_report_revision`/`version` 被全局中心只读复用；不新增表、不加索引，全局列表按 id DESC 走 PK。
 - 命名/结构自检：新表主键 `pk_`、唯一键 `uk_`、普通索引 `idx_`；字段 snake_case；时间 RFC3339 UTC；跨上下文不建 FK；迁移文件只属一个上下文（#32 quality、#33 agent）。
 
-## 16. P7 增量表结构（draft: P7，2026-11-01）
+## 16. P7 增量表结构（frozen: P7，2026-11-01）
 
 > 来源：`docs/superpowers/specs/2026-11-01-eztest-v02-p7-p9-design.md` §5/§13。
-> 迁移：#34–#39（6 个）；新增 bounded context：knowledge（#34）、orchestration（#37）。
-> P0–P6 表结构不变；P7 **新增 6 张表**：knowledge 3（`knowledge_item`、`knowledge_revision`、`knowledge_usage`）+ storage 2（`gc_run`、`gc_tombstone`）+ orchestration 1（`api_instance`）；**扩展 3 张既有表**：`delivery_report_revision`（新增 4 列）、`delivery_issue`（新增 2 列）、`sut`（新增 1 列）。
+> 迁移：#34–#40（7 个）；新增 bounded context：knowledge（#34）、orchestration（#37）。
+> P0–P6 表结构不变；P7 **新增 6 张表**：knowledge 3（`knowledge_item`、`knowledge_revision`、`knowledge_usage`）+ storage 2（`gc_run`、`gc_tombstone`）+ orchestration 1（`api_instance`）；**扩展 4 张既有表**：`delivery_report_revision`（新增 4 列）、`delivery_issue`（新增 2 列）、`sut`（新增 1 列）、`work_item`（team CHECK 6→7 值，#40，不改列）。
 > 全部新表雪花 `BIGINT` 主键（应用生成）、`TIMESTAMPTZ`（API 为 RFC3339 UTC）；跨上下文只做逻辑引用、不建 FK；同上下文 FK 显式。
 
 ### 16.1 `knowledge_0001_knowledge.sql`（#34，knowledge 上下文，3 表）
@@ -1576,7 +1577,8 @@
 
 - `pk_gc_run`；
 - `uk_gc_run_running` UNIQUE `((true)) WHERE status = 'running'`（同一时间只允许一个 running；第二实例冲突 → 409 `gc_running`）；
-- `idx_gc_run_started_at (started_at DESC, id DESC)`（运行历史列表）。
+- `idx_gc_run_started_at (started_at DESC, id DESC)`（运行历史列表）；
+- 运行租约（实现约束，无独立索引）：`CreateRun` 在同一事务内先回收过期 running 行——`lease_until` 已过，或旧行无租约且 `started_at` 早于固定 `GCLease`（15 分钟，900s，代码常量 `storageapp.GCLease`，不新增 settings 键）——将其置 `failed`、写 `finished_at`/`error` 并清空 `lease_owner`/`lease_until`，随后插入新行；只有真正存活的 running 行仍返回 `ErrGCRunning`。终态 `UpdateRun` 同样清空租约。这样一次崩溃/取消不会永久卡住后续 GC。
 
 **`gc_tombstone`**（删除墓碑；append-only；同上下文 FK `run_id`）
 
@@ -1667,11 +1669,18 @@
 - 复发重定向（同 `version_id,dedupe_key` 命中且源 issue `status='merged'`）沿 `merged_into_id` 链（≤16）找到目标：向目标追加 `role='recurrence'` refs（重复跳过）、`recurrence_count+1`、`last_recurred_at=now`、写状态历史（`from=to=目标状态`、`reason='recurrence'`、`actor_kind='system'`）；源 issue 的 refs/历史不变；链断裂/成环 → 事件 `issue.recurred` 带 `redirect_failed=true` 并保持旧行为（追加到源）。
 - `merged_chain` 是读取期沿链计算的 ID 数组（≤16），**不落库**；不新增索引（按既有 `uk_delivery_issue_version_id_dedupe_key` 命中）。
 
-### 16.7 P7 数据不变量
+### 16.7 `agent_0006_ops_team.sql`（#40，agent 上下文，ALTER 1 表）
 
-1. **只追加**：#34–#39 不改 #1–#33 的文件与 checksum；P7 新表 6 张、既有表扩展 3 张，不新增其他表。
-2. **归属**：knowledge（`knowledge_*`，#34）、storage（`gc_run`/`gc_tombstone`，#35）、delivery（`delivery_report_revision` 列，#36；`delivery_issue` 列，#39）、orchestration（`api_instance`，#37）、resource（`sut.family`，#38）；迁移文件只属一个上下文。
-3. **跨上下文只逻辑引用**：`source_version_id`、`promoted_from_version_id`、`created_by`、`reviewed_by`、`agent_run_id`、`work_item_id`、`actor_id`、`created_by_run_id` 等不建 FK；同上下文 FK（`knowledge_revision.knowledge_id`、`knowledge_usage.knowledge_id`、`gc_tombstone.run_id`）显式 `ON DELETE CASCADE`。
+- `work_item.team` 由 6 值扩为 **7 值**：`clarification/design/execution/delivery/steward/code/ops`。
+- 实现：`ALTER TABLE work_item DROP CONSTRAINT IF EXISTS chk_work_item_team;`（当前名，`agent_0004_code_team.sql` #31 添加）并兼容 `DROP CONSTRAINT IF EXISTS work_item_team_check;`（原内联 CHECK 自动名），然后 `ADD CONSTRAINT chk_work_item_team CHECK (team IN (...7...))`。
+- 语义：`ops` 是确定性 worker 任务团队；P7 `report.render_pdf` 的 `work_item.team='ops'`，由 `RenderWorker` 按 `ClaimForTypes` 领取。P1 agent worker 只领取 5 个产品团队，因此不会领取并误杀该任务（验收 S1 的 P7-BUG-01）。
+- 不建 `team_room_post`/`team_room_digest` 的 `ops` 频道；`work_item.version_id` 保持 NOT NULL；只扩宽 CHECK，不改列/数据。
+
+### 16.8 P7 数据不变量
+
+1. **只追加**：#34–#40 不改 #1–#33 的文件与 checksum；P7 新表 6 张、既有表扩展 4 张（含 #40 `work_item.team` CHECK），不新增其他表。
+2. **归属**：knowledge（`knowledge_*`，#34）、storage（`gc_run`/`gc_tombstone`，#35）、delivery（`delivery_report_revision` 列，#36；`delivery_issue` 列，#39）、orchestration（`api_instance`，#37）、resource（`sut.family`，#38）、agent（`work_item.team` CHECK，#40）；迁移文件只属一个上下文。
+3. **跨上下文只逻辑引用**：`source_version_id`、`promoted_from_version_id`、`created_by`、`reviewed_by`、`agent_run_id`、`work_item_id`、`actor_id` 等不建 FK；同上下文 FK（`knowledge_revision.knowledge_id`、`knowledge_usage.knowledge_id`、`gc_tombstone.run_id`）显式 `ON DELETE CASCADE`。
 4. **知识**：`knowledge_item.status` 只允许 §16.1 状态机；reject/revoke 必须带 `review_reason`；`draft/rejected/revoked` 永不注入；`approved` 方可注入；`source_stale` 不建状态/列，读取期过滤；`knowledge_revision` append-only、不做物理删除。
 5. **报告 PDF**：`pdf_status='done'` ⇔ `pdf_ref` 非空；`pdf_status='failed'` 后 reconciler 不再自动补；`report.render_pdf=false` 只影响新 revision（`disabled`）与补齐队列，不删已生成 PDF；PDF 生成失败不影响 report published 与版本收尾谓词。
 6. **GC**：同一时刻至多一个 `running`；`apply` 必须 `confirm=true`；先写 tombstone 再删；删除顺序 ref → object 行 → 文件；保护集与宽限期优先；`dry_run` 绝不删数据。
@@ -1679,4 +1688,5 @@
 8. **实例**：`instance_key`、`node_id` 全表唯一；同一 node 至多一个未回收实例；`draining` 由 admin drain/activate 迁移；状态过期为 `offline`，`stopped` 终态；不批量中断。
 9. **报告 revision 不可变**：§16.3 列出的内容字段在发布后不可变；P7 的 PDF 元数据更新必须使用 fencing（`pdf_ref` 为空且 `pdf_status IN ('pending','failed','running')`）。
 10. 命名/结构自检：新表主键 `pk_`、唯一键 `uk_`、普通索引 `idx_`；字段 snake_case；时间 RFC3339 UTC；JSONB 对象列显式 `jsonb_typeof='object'`；跨上下文不建 FK。
+11. **work_item team 7 值**：`clarification/design/execution/delivery/steward/code/ops`；`ops` 只承载确定性 worker 任务（P7 `report.render_pdf`），不建 team room；agent worker 只领取 5 个产品团队，`RenderWorker` 按 type 领取。
 

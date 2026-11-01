@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"time"
 
 	delivery "github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
@@ -446,7 +447,11 @@ func (s *ReportService) List(ctx context.Context, versionID int64, kind *deliver
 	return reports, nil
 }
 
-// Get returns one report with its revisions (newest first) and logical refs.
+// Get returns one report with its revisions (newest first) and the logical refs
+// of its current revision. delivery_report_ref is append-only across revisions,
+// so the projection must not expose the historical refs: the report detail
+// shows only the current revision's refs (deduplicated by kind/ref_id), never
+// the union of every revision.
 func (s *ReportService) Get(ctx context.Context, versionID, reportID int64) (ReportDetail, error) {
 	if versionID <= 0 || reportID <= 0 {
 		return ReportDetail{}, platform.Invalid("report_id", "must be a positive decimal ID")
@@ -463,7 +468,29 @@ func (s *ReportService) Get(ctx context.Context, versionID, reportID int64) (Rep
 	if err != nil {
 		return ReportDetail{}, mapReportError(err)
 	}
-	return ReportDetail{Report: report, Revisions: revisions, Refs: refs}, nil
+	return ReportDetail{Report: report, Revisions: revisions, Refs: currentRevisionRefs(refs, report.CurrentRevisionID)}, nil
+}
+
+// currentRevisionRefs keeps the refs of the current report revision only and
+// collapses duplicate (kind, ref_id) rows, preserving insertion order. A report
+// without a current revision (draft) falls back to the deduplicated union, since
+// no revision is authoritative yet.
+func currentRevisionRefs(refs []delivery.ReportRef, currentRevisionID *int64) []delivery.ReportRef {
+	current := make([]delivery.ReportRef, 0, len(refs))
+	seen := make(map[string]struct{}, len(refs))
+	filterByRevision := currentRevisionID != nil && *currentRevisionID > 0
+	for _, ref := range refs {
+		if filterByRevision && ref.ReportRevisionID != *currentRevisionID {
+			continue
+		}
+		key := ref.Kind + ":" + strconv.FormatInt(ref.RefID, 10)
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+		seen[key] = struct{}{}
+		current = append(current, ref)
+	}
+	return current
 }
 
 // OpenHTML returns the verified HTML bytes of one published revision. The

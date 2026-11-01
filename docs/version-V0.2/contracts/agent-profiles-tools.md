@@ -396,7 +396,7 @@ system prompt 必须包含 `[profile:<key>]`，并声明：AI 只能提交 draft
 - E2E：admin 编辑 prompt（唯一 token）→ 下一次真实 LLM run 的 system message 含 token；普通用户无 prompt/403；版本历史/恢复；截图（S4）。
 - 前端：目录/运行/质量/配置；只读态；变量 chip 插入；预览；版本 diff/restore；错误 field；空/载/错态。
 
-## 10. P7 Profiles 与知识注入（draft: P7，2026-11-01）
+## 10. P7 Profiles 与知识注入（frozen: P7，2026-11-01）
 
 > 来源：`docs/superpowers/specs/2026-11-01-eztest-v02-p7-p9-design.md` §4.3/§9/§13。
 > 实现：`backend/internal/knowledge`（知识服务/审核）、`backend/internal/agent/application/knowledge.go`（注入适配）、`agent/application/tools/knowledge.go`（工具）、`agent/infrastructure/versionadapter`（`version_pack`）、`agent/application/context.go`（knowledge section）。
@@ -444,7 +444,7 @@ system prompt 必须包含 `[profile:<key>]`，并声明：AI 只能提交 draft
 
 - `version_pack.knowledge[]` 元素字段：`id`（十进制字符串）、`title`、`snippet`（截断正文）、`scope`（`global|system`）、`tokens`（整数估算）。`id` 是 `knowledge_item.id`；**不返回**完整 content/审核人/内部路径。
 - 过滤：仅 `status='approved'`；`scope='global'` 或 `system_key ∈ 版本绑定 SUT 的 family[]`；`source_stale=true`（`source_version_id` 指向的版本不存在）排除；`draft/rejected/revoked` 永不出现。
-- 排序/预算：PostgreSQL 全文（`websearch_to_tsquery('simple', 版本标题/需求标题)` + `ts_rank`）+ id DESC；条数受 `knowledge.injection_max_items`（默认 5，0 关闭）、token 受 `knowledge.injection_budget_tokens`（默认 4000，按 title+content+tags 估算 /3）约束；按 rank 顺序累加，超预算截断后续条目不注入。
+- 排序/预算：仓库按 `ts_rank(search_vector, websearch_to_tsquery('simple', $query)) DESC, id DESC` 排序；当前 runner 注入调用传空 `query`（`ts_rank=0`），实际等价 `id DESC`；`InjectInput.Query` 已预留但尚未接入版本/需求标题（记录为 P8 输入）。条数受 `knowledge.injection_max_items`（默认 5，0 关闭）、token 受 `knowledge.injection_budget_tokens`（默认 4000；按 title+content+tags 的 **UTF-8 字节长度 /3** 估算，下限 1）约束；按排序顺序累加，首条超预算即截断后续条目不注入。
 - 上下文渲染 section `id="knowledge"`，每条一行：`[K-<id>] <title>（<scope>）：<snippet>`；`K-<id>` 是引用 token（模型可在输出中引用 `[K-<id>]`），**不是工具调用**、不触发额外读取。
 - 知识正文是**参考数据**，不提升为系统指令/工具指令；未审核内容（含 AI draft）不进入上下文，避免污染。
 - 每次注入写 `knowledge_usage`（`knowledge_id/agent_run_id/work_item_id/token_estimate/injected_at`），每个被注入条目一行；记录失败只写日志，不影响 run。

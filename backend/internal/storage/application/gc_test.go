@@ -150,6 +150,11 @@ type gcFakeRepo struct {
 	getErr        error
 	listErr       error
 
+	// updateCtxErr records the context state UpdateRun received; the terminal
+	// write must survive request cancellation.
+	updateCtxErr error
+	createdRuns  []storage.GCRun
+
 	runs       map[int64]storage.GCRun
 	runOrder   []int64
 	tombstones []storage.GCTombstone
@@ -181,13 +186,15 @@ func (r *gcFakeRepo) CreateRun(_ context.Context, run storage.GCRun) (storage.GC
 	if r.createErr != nil {
 		return storage.GCRun{}, r.createErr
 	}
+	r.createdRuns = append(r.createdRuns, run)
 	r.runs[run.ID] = run
 	r.runOrder = append(r.runOrder, run.ID)
 	return run, nil
 }
 
-func (r *gcFakeRepo) UpdateRun(_ context.Context, run storage.GCRun) error {
+func (r *gcFakeRepo) UpdateRun(ctx context.Context, run storage.GCRun) error {
 	r.log.add("update_run:" + string(run.Status))
+	r.updateCtxErr = ctx.Err()
 	if r.updateErr != nil {
 		return r.updateErr
 	}
@@ -735,6 +742,54 @@ func TestGCRunConflictsWithRunningRun(t *testing.T) {
 	}
 	if len(fixture.repo.refsPageLimits) != 0 || len(fixture.repo.unrefLimits) != 0 {
 		t.Fatalf("run scanned after conflict: %#v", fixture.log.calls)
+	}
+}
+
+// TestGCRunStampsLease pins the crash-recovery lease: a running gc_run row is
+// created with lease_owner and a lease_until GCLease in the future, so a later
+// pass can reclaim it instead of being wedged behind uk_gc_run_running.
+func TestGCRunStampsLease(t *testing.T) {
+	fixture := newGCFixture(t)
+	run, err := fixture.svc.Run(context.Background(), storage.GCModeDryRun, 1)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(fixture.repo.createdRuns) != 1 {
+		t.Fatalf("created runs = %#v", fixture.repo.createdRuns)
+	}
+	created := fixture.repo.createdRuns[0]
+	if created.LeaseOwner == "" {
+		t.Fatal("gc_run.lease_owner was not stamped")
+	}
+	if created.LeaseUntil == nil {
+		t.Fatal("gc_run.lease_until was not stamped")
+	}
+	if got := created.LeaseUntil.Sub(created.StartedAt); got != GCLease {
+		t.Fatalf("lease window = %v, want %v", got, GCLease)
+	}
+	if run.ID != created.ID {
+		t.Fatalf("finished run = %d, created = %d", run.ID, created.ID)
+	}
+}
+
+// TestGCFinishSurvivesRequestCancellation pins the terminal write: a canceled
+// API request (or shutdown) must still persist failed/completed instead of
+// leaving a running row that wedges every later pass.
+func TestGCFinishSurvivesRequestCancellation(t *testing.T) {
+	fixture := newGCFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := fixture.svc.Run(ctx, storage.GCModeDryRun, 1); err != nil {
+		t.Fatalf("Run with canceled ctx: %v", err)
+	}
+	if fixture.repo.updateCtxErr != nil {
+		t.Fatalf("terminal UpdateRun context error = %v, want a detached context", fixture.repo.updateCtxErr)
+	}
+	if len(fixture.repo.createdRuns) != 1 {
+		t.Fatalf("created runs = %#v", fixture.repo.createdRuns)
+	}
+	if run := fixture.repo.runs[fixture.repo.createdRuns[0].ID]; run.Status != storage.GCRunCompleted {
+		t.Fatalf("terminal status = %q, want completed", run.Status)
 	}
 }
 

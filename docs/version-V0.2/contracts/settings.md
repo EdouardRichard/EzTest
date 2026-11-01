@@ -91,7 +91,7 @@ system_setting_revision(
   （如雪花 node、数据根目录）。UI 只显示提示，不阻止保存。
 - 相对路径按进程 CWD 解析；`paths.data_root` 启动后不可热改（重启生效）。
 
-## 3. 设置键目录（P0 44 项 + P3 5 项 + P4 4 项 + P5 16 项 + P6 3 项 = 72 项）
+## 3. 设置键目录（P0 44 项 + P3 5 项 + P4 4 项 + P5 16 项 + P6 3 项 = 72 项；P7 新增 11 键见 §4g，P7 后共 83 项）
 
 `secret` 列：P0 44 项全部为 `false`；P3 的 `execution.executor_token` 为 `true`（表中以 **secret** 标注），其余 4 项为 `false`；P4 4 个 `chain.*` 键全部为 `false`；P5 16 个 `codeintel.*`/`visual.*` 键全部为 `false`；P6 3 个 `search.*`/`todos.*`/`quality.*` 键全部为 `false`。
 重启列中“是”对应 `restart_required=true`。
@@ -130,7 +130,7 @@ system_setting_revision(
 | 29 | `retention.unreferenced_content_days` | number | retention | `30` | 整数 | 否 |
 | 30 | `retention.gc_grace_hours` | number | retention | `24` | 整数 | 否 |
 | 31 | `retention.gc_dry_run` | boolean | retention | `true` | — | 否 |
-| 32 | `report.template_version` | string | report | `"1"` | 字符串版本号 | 否 |
+| 32 | `report.template_version` | string | report | `"2"`（P7 新库；既有库保留 `"1"`） | `"1"`/`"2"` 版本号 | 否 |
 | 33 | `report.render_pdf` | boolean | report | `true` | — | 否 |
 | 34 | `report.section_summary` | boolean | report | `true` | — | 否 |
 | 35 | `report.section_results` | boolean | report | `true` | — | 否 |
@@ -174,7 +174,7 @@ system_setting_revision(
 
 类别数量：runtime 1、paths 5、execution 11、chain 4、agent 5、llm 2、context 4、team_room 3、
 retention 5、report 7、knowledge 2、security 2、feature 2、codeintel 9、visual 7、search 1、
-workspace 1、quality 1 = **72**（P0 44 + P3 5 + P4 4 + P5 16 + P6 3）。
+workspace 1、quality 1 = **72**（P0 44 + P3 5 + P4 4 + P5 16 + P6 3；P7 新增 11 键后为 **83**，见 §4g）。
 
 默认值来源：规格 §5.2（OD-4/OD-8/OD-9/架构 §9–§12）；未在设计中逐项给出的键由 P0 冻结，
 后续阶段只能通过契约变更修改默认值或新增键；P3 新增 5 键按 spec §11.2 / P3-D-19 冻结。
@@ -273,36 +273,36 @@ workspace 1、quality 1 = **72**（P0 44 + P3 5 + P4 4 + P5 16 + P6 3）。
 - 消费方：search/workspace/quality application 通过设置 Service 读取（不直接读 env/文件）；`quality.eval_baseline_regression` 只用于 `detail.regressed` 标记，阈值本身仍来自评测语料/基线文件。
 - P6 不新增事件、task type/profile/tool/executor 协议；不修改 P0–P5 已冻结键的语义/默认/类别/secret 标记。
 
-## 4g. P7 使用说明（draft: P7，2026-11-01）
+## 4g. P7 使用说明（frozen: P7，2026-11-01）
 
 - P7 **不新增** EzTest 启动 env：仍是严格 4 项（`.env` 只有 `EZTEST_DATABASE_URL`/`EZTEST_API_PORT`/`EZTEST_WEB_PORT`/`EZTEST_EXECUTOR_PORT`）。新增配置一律进设置中心，不引入第 5 个 EzTest env。
 - P7 新增 **11 键**（72→83）；新增 `instance` 类别（2 键）；既有类别增量：report 7→12（+5）、knowledge 2→3（+1）、retention 5→7（+2）、execution 11→12（+1）。11 键全部 `restart_required=false`、热加载；仅 `report.render_token` 为 **secret=true**。
 
 | key | type | category | default | 取值/范围 | secret | restart | 热加载/语义 |
 |---|---|---|---|---|---|---|---|
-| `report.section_appendix` | boolean | report | `true` | — | 否 | 否 | 热加载；报告模板 v2 的附录章节开关；仅 `report.template_version="2"` 时生效；false 不渲染 appendix |
-| `report.render_max_attempts` | number | report | `3` | 整数 1–10 | 否 | 否 | 热加载；`report.render_pdf` 任务的 `max_attempts`；超限置 `pdf_status='failed'` |
-| `report.render_lease_seconds` | number | report | `120` | 整数 30–1800 | 否 | 否 | 热加载；render worker 任务租约与心跳续租；租约过期可被其它副本认领 |
-| `report.render_worker_url` | string | report | `http://127.0.0.1:13337` | 绝对 http(s) URL | 否 | 否 | 热加载；独立 renderer 地址（API 调 `POST {url}/v1/pdf`）；下一次 PDF 任务生效 |
-| `report.render_token` | string | report | `eztest-dev-render-token` | — | **是** | 否 | 热加载；API→renderer Bearer；renderer 进程用 `EZTEST_RENDER_TOKEN` 接收；GET 掩码/`null`，PATCH `""` 清空，省略/null 不改；不得写日志/事件/证据 |
+| `report.section_appendix` | boolean | report | `true` | — | 否 | 否 | 启动读取（与 `report.section_*` 一致，重启后生效）；报告模板 v2 的附录章节开关；仅 `report.template_version="2"` 时生效；false 不渲染 appendix |
+| `report.render_max_attempts` | number | report | `3` | 整数 1–10 | 否 | 否 | 发布路径使用启动快照；reconciler 每轮读取 live 值；已建任务保留 ensure 时的值；超限置 `pdf_status='failed'` |
+| `report.render_lease_seconds` | number | report | `120` | 整数 30–1800 | 否 | 否 | 热加载；render worker 每次认领读取 live 值；租约过期可被其它副本认领 |
+| `report.render_worker_url` | string | report | `http://127.0.0.1:13337` | 绝对 http(s) URL | 否 | 否 | 启动读取（重启生效）；独立 renderer 地址（API 调 `POST {url}/v1/pdf`） |
+| `report.render_token` | string | report | `eztest-dev-render-token` | — | **是** | 否 | 启动读取（重启生效）；API→renderer Bearer；renderer 进程用 `EZTEST_RENDER_TOKEN` 接收；GET 掩码/`null`，PATCH `""` 清空，省略/null 不改；不得写日志/事件/证据 |
 | `knowledge.injection_max_items` | number | knowledge | `5` | 整数 0–50 | 否 | 否 | 热加载；每次 run 注入知识条数上限；0 关闭注入；与 `knowledge.injection_budget_tokens` 同时约束 |
-| `retention.gc_interval_minutes` | number | retention | `1440` | 整数 5–10080 | 否 | 否 | 热加载；leader 周期 GC 间隔（分钟） |
-| `retention.gc_batch_size` | number | retention | `500` | 整数 1–5000 | 否 | 否 | 热加载；单轮 GC 每类候选扫描上限 |
-| `instance.heartbeat_seconds` | number | instance | `10` | 整数 1–60 | 否 | 否 | 热加载；API 实例心跳间隔；rollout 下一轮生效 |
-| `instance.offline_seconds` | number | instance | `30` | 整数 5–300 | 否 | 否 | 热加载；超过该值无心跳判 `offline`；建议 ≥2×`instance.heartbeat_seconds` |
+| `retention.gc_interval_minutes` | number | retention | `1440` | 整数 5–10080 | 否 | 否 | 热加载；leader 周期 GC 间隔（分钟）；下一轮循环生效 |
+| `retention.gc_batch_size` | number | retention | `500` | 整数 1–5000 | 否 | 否 | 热加载；单轮 GC 每类候选扫描上限；下一次 run 生效 |
+| `instance.heartbeat_seconds` | number | instance | `10` | 整数 1–60 | 否 | 否 | 心跳循环在实例注册启动时读取（重启后生效）；maintenance/offline 扫描读取 live 值 |
+| `instance.offline_seconds` | number | instance | `30` | 整数 5–300 | 否 | 否 | 热加载；超过该值无心跳判 `offline`；下一轮扫描生效；建议 ≥2×`instance.heartbeat_seconds` |
 | `execution.executor_urls` | string | execution | `""` | 逗号分隔绝对 http(s) URL；空=沿用 `execution.executor_url` | 否 | 否 | 热加载；额外执行器端点集合；trim/去重；无效项忽略并记日志，不阻塞启动；下一轮 poller 生效 |
 
-- `report.template_version`（既有键，非新增）**默认值变更说明**：seed 默认由 `"1"` 改为 `"2"`（仅新库生效；既有库因 `ON CONFLICT DO NOTHING` 保留原值，可 admin 显式 PATCH 到 `"2"`）。允许值仅 `"1"`/`"2"`；热加载，只影响**新渲染**的 revision，旧 revision 不重渲染；`"1"` 输出与 P4 完全一致；`"2"` 增加附录章节（受 `report.section_appendix` 控制）。因此 P7 是 72→**83**（新增 11 键，不含本默认值变更）。
+- `report.template_version`（既有键，非新增）**默认值变更说明**：seed 默认由 `"1"` 改为 `"2"`（仅新库生效；既有库因 `ON CONFLICT DO NOTHING` 保留原值，可 admin 显式 PATCH 到 `"2"`）。允许值仅 `"1"`/`"2"`；**进程启动时读取**（重启后只影响新渲染的 revision，旧 revision 不重渲染；`"1"` 输出与 P4 完全一致；`"2"` 增加附录章节，受 `report.section_appendix` 控制）。因此 P7 是 72→**83**（新增 11 键，不含本默认值变更）。
 - **P7 消费/扩展的既有键**（P3/P4 已消费的键在 P7 继续消费并扩展语义，不改变原默认/类型）：
-  - `report.render_pdf`：P4 保留不使用；P7 首次实际消费。`true` 时新 revision 排队 PDF；`false` 时新 revision `pdf_status='disabled'`、不建任务，已生成 PDF 不删；可在运行中切换。
-  - `report.template_version`：P4 固定 `"1"`；P7 首次消费版本切换语义；默认/允许值见上。
-  - `report.section_summary`/`report.section_results`/`report.section_issues`/`report.section_coverage`/`report.section_evidence`：P4 起控制 HTML 章节；P7 在 v1/v2 继续生效，并新增 `report.section_appendix`（仅 v2）。
+  - `report.render_pdf`：P4 保留不使用；P7 首次实际消费。`true` 时新 revision 排队 PDF；`false` 时新 revision `pdf_status='disabled'`、不建任务，已生成 PDF 不删。reconciler 每轮读取 live 值（补齐/disable）；发布路径使用进程启动快照，完全切换需重启。
+  - `report.template_version`：P4 固定 `"1"`；P7 首次消费版本切换语义；默认/允许值见上（启动读取）。
+  - `report.section_summary`/`report.section_results`/`report.section_issues`/`report.section_coverage`/`report.section_evidence`：P4 起控制 HTML 章节（启动读取）；P7 在 v1/v2 继续生效，并新增 `report.section_appendix`（仅 v2）。
   - `knowledge.injection_budget_tokens`（默认 4000）与 `knowledge.review_required`（默认 true）：P7 首次实际消费；注入预算与审核门；`review_required=false` 仅允许 admin 创建/晋升时一步 approve，AI 提议仍为 draft。
   - `retention.temp_hours`、`retention.replaced_export_days`、`retention.unreferenced_content_days`、`retention.gc_grace_hours`、`retention.gc_dry_run`：P7 首次实际消费；GC 候选/保护/周期模式。
   - `paths.data_root`：P1 起已消费；P7 扩展用于 GC 文件扫描/删除与 readiness 写探针；多副本必须指向同一共享文件系统（不一致 → readiness 503）。
   - `execution.executor_url`、`execution.executor_token`、`execution.executor_heartbeat_seconds`、`execution.executor_offline_seconds`：P3 起已消费；P7 扩展为多端点 poll、push 内部鉴权、实例/执行器心跳与离线阈值；`execution.executor_token` 同时用于 `POST /api/internal/executors/*`。
   - `runtime.snowflake_node_id`：P0 起用于雪花 node；P7 扩展为 `api_instance.node_id` 的首选值；被占用时取最小空闲 0–1023。
-- 11 键全部热加载（设置 Service 读缓存失效，后续读取/下一轮循环生效）；P7 **不新增** `restart_required=true` 键；secret 语义沿用 P3/P6（`GET /api/admin/settings` 返回 `null`，revision 存 `null`，更新审计不含明文）。
+- 11 键均不标记 `restart_required=true`（DB 值即时写入/读取；设置 Service 缓存失效）；**消费方读取时机不同**：`report.section_appendix`、`report.render_worker_url`、`report.render_token` 以及既有 `report.template_version`/`report.section_*` 在进程启动时读取（重启后生效）；`report.render_pdf`/`report.render_max_attempts` 的发布路径使用启动快照，reconciler/worker 每轮读取 live 值；`report.render_lease_seconds`、`knowledge.injection_max_items`、`retention.gc_*`、`instance.offline_seconds`、`execution.executor_urls` 在下一轮读取/循环生效。secret 语义沿用 P3/P6（`GET /api/admin/settings` 返回 `null`，revision 存 `null`，更新审计不含明文）。
 - 类别计数（P7 后）：runtime 1、paths 5、execution 12、chain 4、agent 5、llm 2、context 4、team_room 3、retention 7、report 12、knowledge 3、security 2、feature 2、codeintel 9、visual 7、search 1、workspace 1、quality 1、instance 2 = **83**（P0 44 + P3 5 + P4 4 + P5 16 + P6 3 + P7 11）。
 
 ## 5. 冻结与变更控制
@@ -310,5 +310,5 @@ workspace 1、quality 1 = **72**（P0 44 + P3 5 + P4 4 + P5 16 + P6 3）。
 1. P0 冻结：4 项 env、44 键目录、类型/默认值/类别/restart 标记、secret 语义、更新流水线。
 2. 后续阶段只能**增量**：新增键必须同时更新本文件、seed 目录、测试与 handoff；不得改已冻结键的语义。
 3. 新增 env 属于破坏性变更：本阶段明确规定没有第 5 个 EzTest 启动 env，任何新配置必须进设置中心。
-4. YAML/JSON 类型严格：`number` 不接受字符串数字；`boolean` 不接受 `"true"` 字符串；`report.template_version` 是字符串 `"1"`。
+4. YAML/JSON 类型严格：`number` 不接受字符串数字；`boolean` 不接受 `"true"` 字符串；`report.template_version` 是字符串 `"1"`/`"2"`（P7 新库默认 `"2"`）。
 5. 所有设置更新都必须写 revision（secret 值置 null）并留下审计；不允许绕过服务直接改表。

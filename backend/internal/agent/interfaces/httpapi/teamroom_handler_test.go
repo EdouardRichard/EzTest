@@ -213,7 +213,7 @@ func TestTeamRoomReadValidationAndErrors(t *testing.T) {
 	stub.view = sampleRoomView()
 
 	t.Run("invalid team", func(t *testing.T) {
-		recorder := teamRoomRequest(t, handler, "/api/versions/10/team-rooms/ops", &platform.Actor{ID: 42})
+		recorder := teamRoomRequest(t, handler, "/api/versions/10/team-rooms/unknown", &platform.Actor{ID: 42})
 		if recorder.Code != http.StatusBadRequest {
 			t.Fatalf("status = %d", recorder.Code)
 		}

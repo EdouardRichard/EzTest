@@ -75,6 +75,75 @@ func (r *Repository) AddRef(ctx context.Context, ref storage.Ref) (storage.Ref, 
 	return ref, nil
 }
 
+// ReplaceRef makes ref the single active reference of its (owner_kind,
+// owner_id, role) tuple. A transaction advisory lock serializes concurrent
+// replacements; an existing row is updated in place (or reused for the same
+// object) and any other active duplicates are soft-deleted.
+func (r *Repository) ReplaceRef(ctx context.Context, ref storage.Ref) (storage.Ref, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return storage.Ref{}, fmt.Errorf("replace content ref: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Serialize the check-then-write per (owner_kind, owner_id, role).
+	if _, err := tx.Exec(ctx, `
+		SELECT pg_advisory_xact_lock(hashtextextended($1 || ':' || $2 || ':' || ($3::bigint)::text, 0))
+	`, ref.OwnerKind, ref.Role, ref.OwnerID); err != nil {
+		return storage.Ref{}, fmt.Errorf("replace content ref: lock: %w", err)
+	}
+
+	var existingID int64
+	var existingObjectID string
+	err = tx.QueryRow(ctx, `
+		SELECT id, object_id FROM content_ref
+		WHERE owner_kind = $1 AND owner_id = $2 AND role = $3 AND deleted_at IS NULL
+		ORDER BY id ASC
+		LIMIT 1
+	`, ref.OwnerKind, ref.OwnerID, ref.Role).Scan(&existingID, &existingObjectID)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO content_ref (id, object_id, owner_kind, owner_id, role)
+			VALUES ($1, $2, $3, $4, $5)
+			RETURNING created_at
+		`, ref.ID, ref.ObjectID, ref.OwnerKind, ref.OwnerID, ref.Role).Scan(&ref.CreatedAt); err != nil {
+			return storage.Ref{}, fmt.Errorf("insert content ref: %w", err)
+		}
+		existingID = ref.ID
+	case err != nil:
+		return storage.Ref{}, fmt.Errorf("find content ref: %w", err)
+	default:
+		if existingObjectID != ref.ObjectID {
+			if _, err := tx.Exec(ctx, `
+				UPDATE content_ref SET object_id = $2 WHERE id = $1
+			`, existingID, ref.ObjectID); err != nil {
+				return storage.Ref{}, fmt.Errorf("replace content ref: %w", err)
+			}
+		}
+		if err := tx.QueryRow(ctx, `
+			SELECT created_at FROM content_ref WHERE id = $1
+		`, existingID).Scan(&ref.CreatedAt); err != nil {
+			return storage.Ref{}, fmt.Errorf("read replaced content ref: %w", err)
+		}
+		ref.ID = existingID
+	}
+
+	// Collapse any legacy duplicates of the same (owner, role) onto the row we
+	// just kept/replaced.
+	if _, err := tx.Exec(ctx, `
+		UPDATE content_ref SET deleted_at = now()
+		WHERE owner_kind = $1 AND owner_id = $2 AND role = $3
+		  AND deleted_at IS NULL AND id <> $4
+	`, ref.OwnerKind, ref.OwnerID, ref.Role, ref.ID); err != nil {
+		return storage.Ref{}, fmt.Errorf("soft delete duplicate content refs: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return storage.Ref{}, fmt.Errorf("replace content ref: commit: %w", err)
+	}
+	return ref, nil
+}
+
 // ListRefs returns active references for one owner ordered by ID.
 func (r *Repository) ListRefs(ctx context.Context, ownerKind string, ownerID int64) ([]storage.Ref, error) {
 	rows, err := r.pool.Query(ctx, `
