@@ -323,7 +323,7 @@ func visualResultBlock(result AssertionResult, ok bool) (string, bool, bool) {
 // the case verdict (inconclusive), not the generic blocked fallback.
 func isVisualBlockedStep(message string) bool {
 	message = strings.TrimSpace(message)
-	return message == "missing_visual_baseline" || strings.HasPrefix(message, "visual_")
+	return strings.HasPrefix(message, "missing_visual_baseline") || strings.HasPrefix(message, "visual_")
 }
 
 func hasObservedStep(steps []StepResult) bool {

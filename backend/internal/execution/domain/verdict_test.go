@@ -409,7 +409,7 @@ func TestVisualMissingBaselineBlockedStepIsInconclusive(t *testing.T) {
 	in := VerdictInput{
 		Case: visualCaseSnapshot(),
 		Steps: []StepResult{
-			{Seq: 1, Status: StepBlocked, Error: "missing_visual_baseline"},
+			{Seq: 1, Status: StepBlocked, Error: "missing_visual_baseline: no approved baseline available"},
 		},
 		Assertions: []AssertionResult{
 			passedAssertion(1, 1, "ui"),
