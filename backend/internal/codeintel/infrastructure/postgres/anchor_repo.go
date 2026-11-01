@@ -76,8 +76,8 @@ func (r *AnchorRepository) List(ctx context.Context, versionID int64, subjectKin
 	rows, err := r.pool.Query(ctx, `
 		SELECT `+anchorColumns+` FROM code_anchor
 		WHERE version_id = $1
-		  AND ($2 = '' OR subject_kind = $2)
-		  AND ($3 = 0 OR subject_id = $3)
+		  AND ($2::text = '' OR subject_kind = $2::text)
+		  AND ($3::bigint = 0 OR subject_id = $3::bigint)
 		ORDER BY id ASC
 	`, versionID, subjectKind, subjectID)
 	if err != nil {
