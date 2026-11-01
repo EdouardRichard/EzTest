@@ -13735,7 +13735,7 @@ components:
                 $ref: '#/components/schemas/GCRunView'
     InstanceView:
       type: object
-      description: API 实例注册表（contracts/db-schema.md §16.4）
+      description: API 实例注册表（contracts/db-schema.md §16.4；P8 在飞计数见 §17.1）
       required: [id, instance_key, hostname, pid, api_port, node_id, status, version, started_at, heartbeat_at, created_at, updated_at]
       properties:
         id:

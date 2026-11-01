@@ -134,7 +134,7 @@ P3 采用 **API pull healthz**（P3-D-01），执行器不主动 push：
 
 ## 10. P3 之后保留与变更控制
 
-- P3 记录为 P7 候选项且 **P7 已实现**：`/api/internal/executors/*` push 注册/心跳、内部鉴权 scheme、多副本执行器调度与 fan-out、跨实例实时（详见 §12）；P8 将 §12.3 多端点 per-executor 派发转正。
+- P3 记录为 P7 候选项且 **P7 已实现**：`/api/internal/executors/*` push 注册/心跳、内部鉴权 scheme、多端点 poll/容量选择、跨实例实时（详见 §12）；**P8 实现** §12.3 多端点 per-executor 派发（线协议仍 v1.2）。
 - 仍保留（不实现）：远程浏览器/VNC、`storage_state` 导入/复用、条件轮询工具（如 wait_until）、>300s 单次等待。
 - 执行器协议 P3 冻结后只允许**增量**：新增 action/字段必须同时更新本文件、`executor/src`、API 客户端与测试；破坏性变更（改既有 action 语义/认证/大小限额）需先更新契约/决策/handoff。
 - token/注册方式（pull）与 HLD 的 `/api/internal/executors/*` push 差异记录为 P3-D-01/P3-D-02；P7 已补 push（§12），P8 仅把多端点派发转正（§12.3），线协议仍 v1.2。
