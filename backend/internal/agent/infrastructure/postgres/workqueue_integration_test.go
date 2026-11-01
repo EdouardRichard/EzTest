@@ -40,6 +40,9 @@ func TestWorkItemClaimForTeamsOnlyRequestedTeam(t *testing.T) {
 	clarification := ensureTeamItem(t, repo, 10, agent.TeamClarification, "chat.turn", "clarification-task", 0)
 	// The code task has the higher priority so an unfiltered claim would pick it.
 	codeItem := ensureTeamItem(t, repo, 10, agent.TeamCode, "index.repo", "code:index:1", 100)
+	// Deterministic ops tasks (report.render_pdf) outrank every product task:
+	// the generic agent worker must still never claim them.
+	opsItem := ensureTeamItem(t, repo, 10, agent.TeamOps, "report.render_pdf", "report:1:rev:1", 200)
 
 	productTeams := []agent.Team{
 		agent.TeamClarification,
@@ -56,6 +59,14 @@ func TestWorkItemClaimForTeamsOnlyRequestedTeam(t *testing.T) {
 		t.Fatalf("product worker claimed %#v, want clarification item %d", claimed, clarification.ID)
 	}
 
+	claimedOps, ok, err := repo.ClaimForTypes(ctx, "render-worker", []string{"report.render_pdf"}, 2*time.Second)
+	if err != nil || !ok {
+		t.Fatalf("ClaimForTypes(report.render_pdf) = %#v, %v, %v", claimedOps, ok, err)
+	}
+	if claimedOps.ID != opsItem.ID || claimedOps.Team != agent.TeamOps || claimedOps.Type != "report.render_pdf" {
+		t.Fatalf("render worker claimed %#v, want ops item %d", claimedOps, opsItem.ID)
+	}
+
 	claimedCode, ok, err := repo.ClaimForTeams(ctx, "code-worker", []agent.Team{agent.TeamCode}, 2*time.Second)
 	if err != nil || !ok {
 		t.Fatalf("ClaimForTeams(code) = %#v, %v, %v", claimedCode, ok, err)
@@ -70,7 +81,7 @@ func TestWorkItemClaimForTeamsOnlyRequestedTeam(t *testing.T) {
 	if empty, ok, err := repo.ClaimForTeams(ctx, "worker", nil, time.Second); err != nil || ok || empty.ID != 0 {
 		t.Fatalf("empty teams claim = %#v, %v, %v", empty, ok, err)
 	}
-	if _, _, err := repo.ClaimForTeams(ctx, "worker", []agent.Team{agent.Team("ops")}, time.Second); err == nil {
+	if _, _, err := repo.ClaimForTeams(ctx, "worker", []agent.Team{agent.Team("unknown")}, time.Second); err == nil {
 		t.Fatal("unknown team was accepted")
 	} else if apiErr := platform.AsError(err); apiErr.Status != 400 || apiErr.Code != "invalid_argument" {
 		t.Fatalf("invalid team error = %#v", apiErr)

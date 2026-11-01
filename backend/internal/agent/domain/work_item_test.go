@@ -57,6 +57,16 @@ func TestValidateNewWorkItem(t *testing.T) {
 		t.Fatalf("valid item rejected: %v", err)
 	}
 
+	// Deterministic ops tasks (report.render_pdf) use their own team so the
+	// generic agent worker never claims them.
+	ops := valid
+	ops.Team = string(agent.TeamOps)
+	ops.Type = "report.render_pdf"
+	ops.DedupeKey = "report:1:rev:1"
+	if err := ops.Validate(); err != nil {
+		t.Fatalf("ops item rejected: %v", err)
+	}
+
 	cases := []struct {
 		name   string
 		mutate func(*agent.NewWorkItem)

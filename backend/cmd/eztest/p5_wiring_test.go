@@ -84,9 +84,10 @@ type fakeP5Queue struct {
 
 	claimTeams []agent.Team
 
-	running   bool
-	heartbeat bool
-	completed bool
+	running        bool
+	heartbeat      bool
+	heartbeatLease time.Duration
+	completed      bool
 
 	failCause     error
 	failRetryable bool
@@ -113,8 +114,9 @@ func (f *fakeP5Queue) MarkRunning(context.Context, int64, int64) error {
 	return nil
 }
 
-func (f *fakeP5Queue) Heartbeat(context.Context, int64, int64) error {
+func (f *fakeP5Queue) Heartbeat(_ context.Context, _, _ int64, lease time.Duration) error {
 	f.heartbeat = true
+	f.heartbeatLease = lease
 	return nil
 }
 

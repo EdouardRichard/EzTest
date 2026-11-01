@@ -129,7 +129,7 @@ func TestWorkQueueLeaseRecoveryAndStaleWrite(t *testing.T) {
 	}
 
 	assertAPIError(t, queue.Complete(ctx, first.ID, first.LeaseEpoch), 409, "lease_lost")
-	assertAPIError(t, queue.Heartbeat(ctx, first.ID, first.LeaseEpoch), 409, "lease_lost")
+	assertAPIError(t, queue.Heartbeat(ctx, first.ID, first.LeaseEpoch, 0), 409, "lease_lost")
 	if err := queue.Complete(ctx, second.ID, second.LeaseEpoch); err != nil {
 		t.Fatalf("second complete: %v", err)
 	}

@@ -146,9 +146,9 @@ func newTestAPI(t *testing.T) *testAPI {
 	// P4 delivery/chain/steward composition (mirrors cmd/eztest with real
 	// repositories and the real adapters).
 	workQueue := agentapp.NewWorkQueue(agentpg.NewWorkItemRepository(pool, ids), clk, 30*time.Second, 3)
-	issueRepo := deliverypg.NewIssueRepository(pool)
-	analysisRepo := deliverypg.NewAnalysisRepository(pool)
-	reportRepo := deliverypg.NewReportRepository(pool)
+	issueRepo := deliverypg.NewIssueRepository(pool, ids)
+	analysisRepo := deliverypg.NewAnalysisRepository(pool, ids)
+	reportRepo := deliverypg.NewReportRepository(pool, ids)
 	closureRepo := versionpg.NewClosureRepository(pool)
 	deliveryContent := deliverycontent.New(storageSvc, deliverypg.NewContentRefReader(pool))
 	reportRenderer, err := deliveryrender.NewHTMLRenderer("1")
@@ -310,8 +310,8 @@ func TestP0EndToEndFlow(t *testing.T) {
 	}
 
 	settings := api.listData(api.do(http.MethodGet, "/api/admin/settings", nil, http.StatusOK))
-	if len(settings) != 72 {
-		t.Fatalf("settings count = %d, want 72 (P6 69->72)", len(settings))
+	if len(settings) != 83 {
+		t.Fatalf("settings count = %d, want 83 (P7 72->83)", len(settings))
 	}
 	updated := api.data(api.do(http.MethodPatch, "/api/admin/settings/execution.global_concurrency", map[string]any{"value": 5}, http.StatusOK))
 	if updated["value"] != float64(5) {

@@ -280,3 +280,98 @@ func TestPublishRepoErrorIsReturnedWithoutBroadcast(t *testing.T) {
 	case <-time.After(20 * time.Millisecond):
 	}
 }
+
+type fakeNotifier struct {
+	refs   []EventRef
+	err    error
+	onCall func()
+}
+
+func (f *fakeNotifier) Notify(_ context.Context, ref EventRef) error {
+	if f.onCall != nil {
+		f.onCall()
+	}
+	f.refs = append(f.refs, ref)
+	return f.err
+}
+
+func TestPublishNotifiesStoredEventAfterAppend(t *testing.T) {
+	at := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	repo := &fakeRepo{appendFn: func(_ context.Context, event eventing.Event) (eventing.Event, error) {
+		event.Seq = 11
+		event.CreatedAt = at
+		return event, nil
+	}}
+	notifier := &fakeNotifier{}
+	appended := false
+	notifier.onCall = func() {
+		if !appended {
+			t.Error("notify happened before the event append")
+		}
+	}
+	svc := New(repo, NewHub(4), notifier)
+	repo.appendFn = func(_ context.Context, event eventing.Event) (eventing.Event, error) {
+		appended = true
+		event.Seq = 11
+		event.CreatedAt = at
+		return event, nil
+	}
+
+	channel, cancel := svc.Subscribe("system")
+	defer cancel()
+	if err := svc.Publish(context.Background(), Event{Channel: "system", Type: "settings.updated"}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if len(notifier.refs) != 1 {
+		t.Fatalf("notify calls = %d, want 1", len(notifier.refs))
+	}
+	if notifier.refs[0] != (EventRef{Channel: "system", Seq: 11}) {
+		t.Fatalf("notified ref = %#v", notifier.refs[0])
+	}
+	select {
+	case got := <-channel:
+		if got.Seq != 11 {
+			t.Fatalf("broadcast seq = %d", got.Seq)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no local broadcast")
+	}
+}
+
+func TestPublishToleratesNotifierFailure(t *testing.T) {
+	repo := &fakeRepo{appendFn: func(_ context.Context, event eventing.Event) (eventing.Event, error) {
+		event.Seq = 5
+		return event, nil
+	}}
+	notifier := &fakeNotifier{err: errors.New("notify failed")}
+	svc := New(repo, NewHub(2), notifier)
+	channel, cancel := svc.Subscribe("system")
+	defer cancel()
+
+	if err := svc.Publish(context.Background(), Event{Channel: "system", Type: "x"}); err != nil {
+		t.Fatalf("Publish must not fail on a lost notification: %v", err)
+	}
+	select {
+	case got := <-channel:
+		if got.Seq != 5 {
+			t.Fatalf("broadcast seq = %d", got.Seq)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("lost notification also suppressed the local broadcast")
+	}
+}
+
+func TestHubBroadcastLoadedDeliversToSubscribers(t *testing.T) {
+	hub := NewHub(2)
+	channel, cancel := hub.Subscribe("version:9")
+	defer cancel()
+	hub.BroadcastLoaded(eventing.Event{Channel: "version:9", Seq: 4, Type: "report.published"})
+	select {
+	case got := <-channel:
+		if got.Seq != 4 || got.Type != "report.published" {
+			t.Fatalf("broadcast = %#v", got)
+		}
+	default:
+		t.Fatal("BroadcastLoaded did not reach the subscriber")
+	}
+}

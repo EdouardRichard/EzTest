@@ -7,9 +7,11 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	deliveryapp "github.com/EdouardRichard/EzTest/backend/internal/delivery/application"
 	delivery "github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
+	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -94,7 +96,11 @@ func issueRepoBuildCandidate(t *testing.T, in issueRepoTestCandidate) (delivery.
 func newIssueRepoForTest(t *testing.T) (*IssueRepository, *pgxpool.Pool) {
 	t.Helper()
 	pool := testutil.NewDB(t)
-	return NewIssueRepository(pool), pool
+	ids, err := platformid.NewSnowflake(0)
+	if err != nil {
+		t.Fatalf("snowflake: %v", err)
+	}
+	return NewIssueRepository(pool, ids), pool
 }
 
 // issueRepoCreateCandidate creates one candidate and fails the test when the
@@ -960,6 +966,293 @@ func TestIssueRepoAppendHistory(t *testing.T) {
 		ActorKind: "system",
 	}); err == nil {
 		t.Fatal("AppendHistory on a missing issue must fail")
+	}
+}
+
+// issueRepoRecurrenceRefs clones candidate refs with the recurrence role.
+func issueRepoRecurrenceRefs(refs []delivery.IssueRef) []delivery.IssueRef {
+	recurrence := make([]delivery.IssueRef, 0, len(refs))
+	for _, ref := range refs {
+		ref.Role = delivery.IssueRefRoleRecurrence
+		recurrence = append(recurrence, ref)
+	}
+	return recurrence
+}
+
+// TestIssueRepoRecurrence covers the P7 recurrence write: the merged dedupe hit
+// must not touch the source refs, ApplyRecurrence appends role='recurrence' refs
+// to the target, increments recurrence_count/last_recurred_at and appends the
+// recurrence history row, and repeated writes stay idempotent for refs.
+func TestIssueRepoRecurrence(t *testing.T) {
+	repo, pool := newIssueRepoForTest(t)
+	ctx := context.Background()
+
+	source := issueRepoCreateCandidate(t, repo, issueRepoTestCandidate{caseRunID: 3301})
+	target := issueRepoCreateCandidate(t, repo, issueRepoTestCandidate{caseRunID: 3302, caseVersionID: 4002})
+	if source.RecurrenceCount != 0 || source.LastRecurredAt != nil {
+		t.Fatalf("new issue recurrence fields = %d/%v, want 0/nil", source.RecurrenceCount, source.LastRecurredAt)
+	}
+	if _, err := repo.Merge(ctx, deliveryapp.IssueMerge{
+		VersionID: 100, SourceID: source.ID, TargetID: target.ID, ActorID: 55,
+	}); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+
+	sourceRefsBefore, err := repo.ListRefs(ctx, source.ID)
+	if err != nil {
+		t.Fatalf("source refs before: %v", err)
+	}
+	sourceHistoryBefore, err := repo.ListHistory(ctx, source.ID)
+	if err != nil {
+		t.Fatalf("source history before: %v", err)
+	}
+	targetRefsBefore, err := repo.ListRefs(ctx, target.ID)
+	if err != nil {
+		t.Fatalf("target refs before: %v", err)
+	}
+	targetHistoryBefore, err := repo.ListHistory(ctx, target.ID)
+	if err != nil {
+		t.Fatalf("target history before: %v", err)
+	}
+
+	// A deduplicated failure on the merged source is a recurrence candidate. The
+	// repository must not append those refs to the source: the service resolves
+	// the target and applies the recurrence.
+	recurring, recurringRefs := issueRepoBuildCandidate(t, issueRepoTestCandidate{caseRunID: 3303})
+	stored, isNew, err := repo.CreateCandidate(ctx, recurring, recurringRefs)
+	if err != nil {
+		t.Fatalf("recurrence candidate: %v", err)
+	}
+	if isNew {
+		t.Fatal("recurrence candidate reported created=true")
+	}
+	if stored.ID != source.ID || stored.Status != delivery.IssueStatusMerged {
+		t.Fatalf("recurrence dedupe = %+v, want the merged source %d", stored, source.ID)
+	}
+	if stored.RecurrenceCount != 0 || stored.LastRecurredAt != nil {
+		t.Fatalf("merged dedupe bumped recurrence fields: %+v", stored)
+	}
+	if refs, err := repo.ListRefs(ctx, source.ID); err != nil || len(refs) != len(sourceRefsBefore) {
+		t.Fatalf("source refs after merged dedupe = %d err=%v, want unchanged %d",
+			len(refs), err, len(sourceRefsBefore))
+	}
+
+	updated, err := repo.ApplyRecurrence(ctx, deliveryapp.IssueRecurrence{
+		VersionID: 100,
+		SourceID:  source.ID,
+		TargetID:  target.ID,
+		Refs:      issueRepoRecurrenceRefs(recurringRefs),
+	})
+	if err != nil {
+		t.Fatalf("ApplyRecurrence: %v", err)
+	}
+	if updated.ID != target.ID || updated.RecurrenceCount != 1 || updated.LastRecurredAt == nil {
+		t.Fatalf("recurred target = %+v, want count 1 and last_recurred_at", updated)
+	}
+	if updated.LastRecurredAt.IsZero() {
+		t.Fatal("last_recurred_at must be a real timestamp")
+	}
+	// A recurrence is not a status transition: expected_revision stays put.
+	if updated.ExpectedRevision != 1 || updated.Status != delivery.IssueStatusOpen {
+		t.Fatalf("target revision/status = %d/%q, want 1/open", updated.ExpectedRevision, updated.Status)
+	}
+
+	targetRefs, err := repo.ListRefs(ctx, target.ID)
+	if err != nil {
+		t.Fatalf("target refs after: %v", err)
+	}
+	if len(targetRefs) != len(targetRefsBefore)+len(recurringRefs) {
+		t.Fatalf("target refs = %d, want %d", len(targetRefs), len(targetRefsBefore)+len(recurringRefs))
+	}
+	recurrenceRoles := 0
+	recurrenceCaseRun := false
+	for _, ref := range targetRefs {
+		if ref.Role != delivery.IssueRefRoleRecurrence {
+			continue
+		}
+		recurrenceRoles++
+		if ref.Kind == delivery.IssueRefKindCaseRun && ref.RefID == 3303 {
+			recurrenceCaseRun = true
+		}
+	}
+	if recurrenceRoles != len(recurringRefs) || !recurrenceCaseRun {
+		t.Fatalf("target recurrence refs = %d case_run=%v, want %d and ref 3303",
+			recurrenceRoles, recurrenceCaseRun, len(recurringRefs))
+	}
+	if refs, err := repo.ListRefs(ctx, source.ID); err != nil || len(refs) != len(sourceRefsBefore) {
+		t.Fatalf("source refs after redirect = %d err=%v, want unchanged %d",
+			len(refs), err, len(sourceRefsBefore))
+	}
+	if history, err := repo.ListHistory(ctx, source.ID); err != nil || len(history) != len(sourceHistoryBefore) {
+		t.Fatalf("source history after redirect = %d err=%v, want unchanged %d",
+			len(history), err, len(sourceHistoryBefore))
+	}
+	if sourceStored, err := repo.Get(ctx, 100, source.ID); err != nil || sourceStored.RecurrenceCount != 0 ||
+		sourceStored.LastRecurredAt != nil {
+		t.Fatalf("source issue changed by redirect: %+v err=%v", sourceStored, err)
+	}
+
+	targetHistory, err := repo.ListHistory(ctx, target.ID)
+	if err != nil {
+		t.Fatalf("target history after: %v", err)
+	}
+	if len(targetHistory) != len(targetHistoryBefore)+1 {
+		t.Fatalf("target history = %d, want one recurrence row (%d)", len(targetHistory), len(targetHistoryBefore)+1)
+	}
+	recurrenceRow := targetHistory[len(targetHistory)-1]
+	if recurrenceRow.From == nil || *recurrenceRow.From != delivery.IssueStatusOpen ||
+		recurrenceRow.To != delivery.IssueStatusOpen ||
+		recurrenceRow.Reason != "recurrence" || recurrenceRow.ActorKind != "system" ||
+		recurrenceRow.ActorID != nil {
+		t.Fatalf("recurrence history = %+v, want from=to=open reason=recurrence system", recurrenceRow)
+	}
+
+	// A repeated recurrence still increments the counter but the unique
+	// (issue_id, kind, ref_id, role) key keeps the refs a single set.
+	second, err := repo.ApplyRecurrence(ctx, deliveryapp.IssueRecurrence{
+		VersionID: 100,
+		SourceID:  source.ID,
+		TargetID:  target.ID,
+		Refs:      issueRepoRecurrenceRefs(recurringRefs),
+	})
+	if err != nil {
+		t.Fatalf("second ApplyRecurrence: %v", err)
+	}
+	if second.RecurrenceCount != 2 {
+		t.Fatalf("second recurrence_count = %d, want 2", second.RecurrenceCount)
+	}
+	if refs, err := repo.ListRefs(ctx, target.ID); err != nil || len(refs) != len(targetRefs) {
+		t.Fatalf("target refs after repeated recurrence = %d err=%v, want unchanged %d",
+			len(refs), err, len(targetRefs))
+	}
+	if history, err := repo.ListHistory(ctx, target.ID); err != nil || len(history) != len(targetHistory)+1 {
+		t.Fatalf("target history after repeated recurrence = %d err=%v", len(history), err)
+	}
+
+	// last_recurred_at only moves forward (db-schema §16.7.7): a clock that
+	// goes backwards must not regress it.
+	future := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
+	if _, err := pool.Exec(ctx, `UPDATE delivery_issue SET last_recurred_at = $2 WHERE id = $1`,
+		target.ID, future); err != nil {
+		t.Fatalf("set future last_recurred_at: %v", err)
+	}
+	third, err := repo.ApplyRecurrence(ctx, deliveryapp.IssueRecurrence{
+		VersionID: 100,
+		SourceID:  source.ID,
+		TargetID:  target.ID,
+		Refs:      nil,
+	})
+	if err != nil {
+		t.Fatalf("third ApplyRecurrence: %v", err)
+	}
+	if third.RecurrenceCount != 3 {
+		t.Fatalf("third recurrence_count = %d, want 3", third.RecurrenceCount)
+	}
+	if third.LastRecurredAt == nil || !third.LastRecurredAt.Equal(future) {
+		t.Fatalf("last_recurred_at = %v, want the later %v (monotonic)", third.LastRecurredAt, future)
+	}
+}
+
+// TestIssueRepoApplyRecurrenceRejections covers the transactional target
+// guards: a merged target and a cross-version target are rejected.
+func TestIssueRepoApplyRecurrenceRejections(t *testing.T) {
+	repo, _ := newIssueRepoForTest(t)
+	ctx := context.Background()
+
+	source := issueRepoCreateCandidate(t, repo, issueRepoTestCandidate{caseRunID: 3501})
+	target := issueRepoCreateCandidate(t, repo, issueRepoTestCandidate{caseRunID: 3502, caseVersionID: 4002})
+	if _, err := repo.Merge(ctx, deliveryapp.IssueMerge{
+		VersionID: 100, SourceID: source.ID, TargetID: target.ID, ActorID: 55,
+	}); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	_, refs := issueRepoBuildCandidate(t, issueRepoTestCandidate{caseRunID: 3503})
+
+	// The merged source cannot be a redirect target.
+	if _, err := repo.ApplyRecurrence(ctx, deliveryapp.IssueRecurrence{
+		VersionID: 100, SourceID: source.ID, TargetID: source.ID, Refs: refs,
+	}); !errors.Is(err, delivery.ErrStateConflict) {
+		t.Fatalf("merged target error = %v, want delivery.ErrStateConflict", err)
+	}
+	// A foreign version cannot receive the recurrence.
+	if _, err := repo.ApplyRecurrence(ctx, deliveryapp.IssueRecurrence{
+		VersionID: 200, SourceID: source.ID, TargetID: target.ID, Refs: refs,
+	}); !errors.Is(err, delivery.ErrNotFound) {
+		t.Fatalf("cross-version target error = %v, want delivery.ErrNotFound", err)
+	}
+	// A missing target is not found.
+	if _, err := repo.ApplyRecurrence(ctx, deliveryapp.IssueRecurrence{
+		VersionID: 100, SourceID: source.ID, TargetID: 999999, Refs: refs,
+	}); !errors.Is(err, delivery.ErrNotFound) {
+		t.Fatalf("missing target error = %v, want delivery.ErrNotFound", err)
+	}
+	// None of the rejected writes changed the durable target row.
+	stored, err := repo.Get(ctx, 100, target.ID)
+	if err != nil || stored.RecurrenceCount != 0 || stored.LastRecurredAt != nil {
+		t.Fatalf("target after rejections = %+v err=%v", stored, err)
+	}
+}
+
+// TestIssueRepoAppendRefsFallback covers the broken-chain fallback that appends
+// candidate refs back onto the source idempotently.
+func TestIssueRepoAppendRefsFallback(t *testing.T) {
+	repo, _ := newIssueRepoForTest(t)
+	ctx := context.Background()
+
+	issue := issueRepoCreateCandidate(t, repo, issueRepoTestCandidate{caseRunID: 3601})
+	_, fallbackRefs := issueRepoBuildCandidate(t, issueRepoTestCandidate{caseRunID: 3602})
+	before, err := repo.ListRefs(ctx, issue.ID)
+	if err != nil {
+		t.Fatalf("ListRefs before: %v", err)
+	}
+	// The candidate refs share the case_version with the created issue; only the
+	// genuinely new (issue_id, kind, ref_id, role) keys are appended.
+	wantAdded := 0
+	for _, ref := range fallbackRefs {
+		found := false
+		for _, existing := range before {
+			if existing.Kind == ref.Kind && existing.RefID == ref.RefID &&
+				existing.Role == delivery.IssueRefRoleSource {
+				found = true
+				break
+			}
+		}
+		if !found {
+			wantAdded++
+		}
+	}
+	if wantAdded == 0 {
+		t.Fatal("fallback fixture has no new ref to append")
+	}
+
+	if err := repo.AppendRefs(ctx, issue.ID, fallbackRefs); err != nil {
+		t.Fatalf("AppendRefs: %v", err)
+	}
+	after, err := repo.ListRefs(ctx, issue.ID)
+	if err != nil {
+		t.Fatalf("ListRefs after: %v", err)
+	}
+	if len(after) != len(before)+wantAdded {
+		t.Fatalf("refs after append = %d, want %d", len(after), len(before)+wantAdded)
+	}
+	// The appended candidate refs keep the default source role.
+	for _, ref := range after[len(before):] {
+		if ref.Role != delivery.IssueRefRoleSource {
+			t.Fatalf("fallback ref role = %q, want source", ref.Role)
+		}
+	}
+
+	// Re-appending the same candidate is a no-op thanks to the unique key.
+	if err := repo.AppendRefs(ctx, issue.ID, fallbackRefs); err != nil {
+		t.Fatalf("second AppendRefs: %v", err)
+	}
+	repeated, err := repo.ListRefs(ctx, issue.ID)
+	if err != nil || len(repeated) != len(after) {
+		t.Fatalf("refs after repeated append = %d err=%v, want %d", len(repeated), err, len(after))
+	}
+
+	if err := repo.AppendRefs(ctx, 999999, fallbackRefs); err == nil {
+		t.Fatal("AppendRefs on a missing issue must fail")
 	}
 }
 

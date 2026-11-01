@@ -39,8 +39,10 @@ const readme = read("README.md")
 // ---------------------------------------------------------------------------
 // OpenAPI
 // ---------------------------------------------------------------------------
-check(/^  version: 0\.2\.0-p6$/m.test(openapi), "openapi info.version = 0.2.0-p6")
-check(/^x-frozen: P6$/m.test(openapi), "openapi x-frozen: P6")
+const openapiPhase = (openapi.match(/^\s*version:\s*0\.2\.0-p(\d+)\s*$/m) || [])[1]
+check(Number(openapiPhase) >= 6, `openapi info.version 0.2.0-p6+ (got p${openapiPhase || "missing"})`)
+const frozenPhase = (openapi.match(/^x-frozen:\s*P(\d+)\s*$/m) || [])[1]
+check(Number(frozenPhase) >= 6, `openapi x-frozen P6+ (got P${frozenPhase || "missing"})`)
 check(!/^x-draft: P6$/m.test(openapi), "openapi has no x-draft: P6")
 for (const tag of ["Search", "Workspace", "AgentCenter"]) {
   check(new RegExp("^  - name: " + tag + "$", "m").test(openapi), "openapi tag " + tag)
@@ -73,7 +75,7 @@ for (const operation of operations) {
   check(matches.length === 1, `openapi operationId ${operation} (got ${matches.length})`)
 }
 const operationCount = (openapi.match(/^\s*operationId:\s*/gm) || []).length
-check(operationCount === 182, `openapi operations = 182 (got ${operationCount})`)
+check(operationCount >= 182, `openapi operations >= 182 (got ${operationCount})`)
 
 const newPaths = [
   "/api/search",
@@ -228,7 +230,7 @@ if (fs.existsSync(orderPath)) {
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith("#"))
   if (order.includes("quality_0001_eval.sql") || order.includes("agent_0005_profile_prompt_revision.sql")) {
-    check(order.length === 33, `order.txt = 33 migrations (got ${order.length})`)
+    check(order.length >= 33, `order.txt >= 33 migrations (got ${order.length})`)
     check(order[31] === "quality_0001_eval.sql", "order.txt #32 = quality_0001_eval.sql")
     check(
       order[32] === "agent_0005_profile_prompt_revision.sql",
@@ -244,7 +246,10 @@ if (fs.existsSync(orderPath)) {
 // ---------------------------------------------------------------------------
 // settings
 // ---------------------------------------------------------------------------
-check(settings.includes("= 72 项"), "settings key count 72")
+check(
+  settings.includes("P6 新增 3 键") || settings.includes("P6 3 项"),
+  "settings P6 increment (3 keys)",
+)
 check(settings.includes("`search.max_results_per_type`"), "setting search.max_results_per_type")
 check(settings.includes("`todos.max_items`"), "setting todos.max_items")
 check(
@@ -287,13 +292,15 @@ check(profiles.includes("validateTemplate") || profiles.includes("模板语法")
 // README
 // ---------------------------------------------------------------------------
 check(/P6 冻结状态|P6 契约状态/.test(readme), "contracts README P6 status")
-check(readme.includes("20") && readme.includes("Search"), "README P6 operation/search counts")
-check(readme.includes("72") && readme.includes("33"), "README P6 settings/migration counts")
+check(
+  readme.includes("P6") && readme.includes("Search") && readme.includes("69→72"),
+  "README P6 status/increment",
+)
 
 if (failures > 0) {
   console.error(`P6 contract check FAILED (${failures} failed needle(s))`)
   process.exit(1)
 }
 console.log(
-  "P6 contract check OK: 20 P6 ops / 18 new path items / 3 tables / #32-#33 / 72 settings",
+  "P6 contract check OK: 20 P6 ops / 18 new path items / 3 tables / #32-#33 / 3 P6 settings",
 )

@@ -76,6 +76,32 @@ func (f *fakeRepository) AddRef(_ context.Context, ref storage.Ref) (storage.Ref
 	return ref, nil
 }
 
+func (f *fakeRepository) ReplaceRef(_ context.Context, ref storage.Ref) (storage.Ref, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for id := int64(1); id <= f.nextRef; id++ {
+		existing, ok := f.refs[id]
+		if !ok || existing.OwnerKind != ref.OwnerKind || existing.OwnerID != ref.OwnerID ||
+			existing.Role != ref.Role || existing.DeletedAt != nil {
+			continue
+		}
+		if existing.ObjectID != ref.ObjectID {
+			existing.ObjectID = ref.ObjectID
+			f.refs[id] = existing
+		}
+		ref.ID = existing.ID
+		ref.CreatedAt = existing.CreatedAt
+		return ref, nil
+	}
+	f.nextRef++
+	ref.ID = f.nextRef
+	if ref.CreatedAt.IsZero() {
+		ref.CreatedAt = fixedTime
+	}
+	f.refs[ref.ID] = ref
+	return ref, nil
+}
+
 func (f *fakeRepository) ListRefs(_ context.Context, ownerKind string, ownerID int64) ([]storage.Ref, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

@@ -105,8 +105,8 @@ func newChainProviders(t *testing.T) (*pgxpool.Pool, *ChainServiceBundle) {
 		Requirements: requirementRepo,
 		Clock:        itClock,
 	})
-	issueRepo := deliverypg.NewIssueRepository(pool)
-	reportRepo := deliverypg.NewReportRepository(pool)
+	issueRepo := deliverypg.NewIssueRepository(pool, ids)
+	reportRepo := deliverypg.NewReportRepository(pool, ids)
 	eventRepo := eventingpg.New(pool)
 	eventSvc := eventingapp.New(eventRepo, nil)
 

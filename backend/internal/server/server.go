@@ -20,8 +20,10 @@ import (
 	executionhttp "github.com/EdouardRichard/EzTest/backend/internal/execution/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/interfaces/httpapi"
+	knowledgeapi "github.com/EdouardRichard/EzTest/backend/internal/knowledge/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/llm/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/llm/interfaces/httpapi"
+	orchestrationapi "github.com/EdouardRichard/EzTest/backend/internal/orchestration/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	qualityapi "github.com/EdouardRichard/EzTest/backend/internal/quality/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/resource/application"
@@ -83,6 +85,21 @@ type Deps struct {
 	// P6 quality/search/todos/global read surfaces. Optional; nil keeps a
 	// P0-P5 deployment unchanged.
 	P6 *P6Handlers
+	// P7 knowledge/orchestration/GC surfaces. Optional; nil keeps a P0-P6
+	// deployment unchanged and the internal executor push routes are mounted
+	// whenever the execution handler exists (the token middleware fails closed
+	// without a settings service).
+	P7 *P7Handlers
+}
+
+// P7Handlers groups the optional P7 HTTP surfaces. The readiness probe is
+// registered by the orchestration handler itself (public), knowledge and GC
+// carry their own middleware classes, and the internal executor push routes are
+// mounted from the execution handler in registerP7Routes.
+type P7Handlers struct {
+	Knowledge     *knowledgeapi.Handler
+	Orchestration *orchestrationapi.Handler
+	GC            *storageapi.GCHandler
 }
 
 // P6Handlers groups the P6 read-model HTTP surfaces. Agent Center handlers are
@@ -142,8 +159,42 @@ func New(deps Deps) http.Handler {
 	registerCodeIntelRoutes(mux, authenticated, deps.CodeIntel)
 	registerVisualRoutes(mux, authenticated, admin, deps.Visual)
 	registerP6Routes(mux, authenticated, admin, deps.P6)
+	registerP7Routes(mux, authenticated, admin, deps.Execution, deps.Settings, deps.P7)
 
 	return RequestID(Recover(Logging(CORS(deps.Config)(mux))))
+}
+
+// registerP7Routes mounts the optional P7 surfaces: knowledge, orchestration
+// (including the public GET /api/health/ready probe), storage GC admin routes
+// and the internal executor push endpoints. Nil handlers keep the route table
+// of a P0-P6 deployment unchanged. The internal routes need only the execution
+// handler; a nil settings service makes InternalTokenAuth fail closed (401)
+// instead of exposing them.
+func registerP7Routes(
+	mux *http.ServeMux,
+	authenticated, admin func(http.Handler) http.Handler,
+	execution *executionhttp.Handler,
+	settings *settingsapp.Service,
+	h *P7Handlers,
+) {
+	if h != nil {
+		if h.Knowledge != nil {
+			knowledgeapi.RegisterRoutes(mux, authenticated, admin, h.Knowledge)
+		}
+		if h.Orchestration != nil {
+			orchestrationapi.RegisterRoutes(mux, authenticated, admin, h.Orchestration)
+		}
+		if h.GC != nil {
+			storageapi.RegisterGCRoutes(mux, admin, h.GC)
+		}
+	}
+	if execution != nil {
+		var tokenAuth func(http.Handler) http.Handler
+		if settings != nil {
+			tokenAuth = executionhttp.InternalTokenAuth(settings)
+		}
+		executionhttp.RegisterInternalRoutes(mux, tokenAuth, execution)
+	}
 }
 
 // registerP6Routes mounts the optional P6 read-model surfaces. A nil handler
@@ -385,6 +436,7 @@ func registerDeliveryRoutes(mux *http.ServeMux, authenticated func(http.Handler)
 	mux.Handle("GET /api/versions/{versionId}/reports/{reportId}", authenticated(http.HandlerFunc(h.GetReport)))
 	mux.Handle("GET /api/versions/{versionId}/reports/{reportId}/revisions/{revision}", authenticated(http.HandlerFunc(h.GetReportRevision)))
 	mux.Handle("GET /api/versions/{versionId}/reports/{reportId}/revisions/{revision}/html", authenticated(http.HandlerFunc(h.DownloadReportHTML)))
+	mux.Handle("GET /api/versions/{versionId}/reports/{reportId}/revisions/{revision}/pdf", authenticated(http.HandlerFunc(h.DownloadReportPDF)))
 	mux.Handle("POST /api/versions/{versionId}/reports/{reportId}/regenerate", authenticated(http.HandlerFunc(h.RegenerateReport)))
 }
 

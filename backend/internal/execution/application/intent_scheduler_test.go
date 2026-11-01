@@ -337,6 +337,51 @@ func TestSchedulerQuotaAndCrossSystem(t *testing.T) {
 	}
 }
 
+func TestSchedulerSelectsExecutorPerPendingRun(t *testing.T) {
+	f := newTask6Fixture(t)
+	ctx := context.Background()
+	f.cases.cases[300] = task6Snapshot(300, 5001)
+	f.cases.cases[301] = task6Snapshot(301, 5002)
+	f.versions.bindings[100] = task6Binding(100, "running", 5001, 5002)
+	now := f.clock.Now()
+	// P7 multi-endpoint: each pending case_run re-selects the best executor so a
+	// single tick can spread work over the registered endpoints.
+	f.registry.sequence = []execution.ExecutorInstance{
+		{ID: 1, Name: "executor-1", Endpoint: "http://127.0.0.1:13336", Capacity: 8, Status: execution.ExecutorActive, LastHeartbeat: &now},
+		{ID: 2, Name: "executor-2", Endpoint: "http://127.0.0.1:13337", Capacity: 8, Status: execution.ExecutorActive, LastHeartbeat: &now},
+	}
+	if _, err := f.intent.EnsureInitialIntents(ctx, 100); err != nil {
+		t.Fatalf("EnsureInitialIntents: %v", err)
+	}
+	if err := f.scheduler.ReconcileVersion(ctx, 100); err != nil {
+		t.Fatalf("ReconcileVersion: %v", err)
+	}
+	wave, _ := f.waves.GetActive(ctx, 100)
+	if wave == nil {
+		t.Fatal("wave not created")
+	}
+	runs, _ := f.runs.ListAllByWave(ctx, wave.ID)
+	if len(runs) != 2 {
+		t.Fatalf("case runs = %d, want 2", len(runs))
+	}
+	owners := map[int64]bool{}
+	for _, run := range runs {
+		if run.Status != execution.CaseRunRunning {
+			t.Fatalf("case run %d status = %s, want running", run.ID, run.Status)
+		}
+		if run.OwnerExecutorID == nil {
+			t.Fatalf("case run %d has no owner executor", run.ID)
+		}
+		owners[*run.OwnerExecutorID] = true
+	}
+	if len(owners) != 2 || !owners[1] || !owners[2] {
+		t.Fatalf("owner executors = %v, want 1 and 2", owners)
+	}
+	if got := f.queue.countType("execute.case"); got != 2 {
+		t.Fatalf("execute.case work items = %d, want 2", got)
+	}
+}
+
 func TestSchedulerCompletesWaveAndEnsuresAnalysis(t *testing.T) {
 	f := newTask6Fixture(t)
 	ctx := context.Background()

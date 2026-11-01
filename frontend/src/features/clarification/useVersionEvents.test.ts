@@ -316,6 +316,43 @@ describe("useVersionEvents", () => {
     expect(sse.connectSSE).toHaveBeenCalledTimes(1)
   })
 
+  it("routes P7 PDF and issue-recurrence events to the P4 refresh handlers", () => {
+    const onReportChanged = vi.fn()
+    const onIssueChanged = vi.fn()
+    render(createElement(Harness, { handlers: { onReportChanged, onIssueChanged } }))
+
+    for (const type of ["report.pdf_ready", "report.pdf_failed"]) {
+      connectOptions.onEvent({
+        event: "message",
+        data: eventFrame(type, {
+          report_id: "8101",
+          report_revision_id: "8201",
+          revision: 2,
+          pdf_ref: "content://pdf",
+          size_bytes: 2048,
+          attempts: 3,
+          error: "renderer unavailable",
+        }),
+      })
+    }
+    connectOptions.onEvent({
+      event: "message",
+      data: eventFrame("issue.recurred", {
+        issue_id: "9101",
+        source_issue_id: "9100",
+        dedupe_key: "login-retry",
+        recurrence_count: 2,
+      }),
+    })
+
+    expect(onReportChanged).toHaveBeenCalledTimes(2)
+    expect(onIssueChanged).toHaveBeenCalledTimes(1)
+    expect(onReportChanged.mock.calls[0][0].type).toBe("report.pdf_ready")
+    expect(onReportChanged.mock.calls[1][0].type).toBe("report.pdf_failed")
+    expect(onIssueChanged.mock.calls[0][0].type).toBe("issue.recurred")
+    expect(sse.connectSSE).toHaveBeenCalledTimes(1)
+  })
+
   it("notifies stream.reset through a callback without opening another EventSource", () => {
     const onStreamReset = vi.fn()
     render(createElement(Harness, { handlers: { onStreamReset } }))

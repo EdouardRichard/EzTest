@@ -119,7 +119,7 @@ func (h *GlobalHandler) ListGlobalIssues(w http.ResponseWriter, r *http.Request)
 	items := make([]GlobalIssueView, 0, len(views))
 	for _, view := range views {
 		items = append(items, GlobalIssueView{
-			IssueView:    toIssueView(view.Issue, nil, nil),
+			IssueView:    toIssueView(view.Issue, nil, nil, view.MergedChain),
 			VersionTitle: view.VersionTitle,
 			URL:          view.URL,
 		})

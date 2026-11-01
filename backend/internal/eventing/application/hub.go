@@ -94,3 +94,11 @@ func (h *Hub) Broadcast(event eventing.Event) {
 		delete(h.subscribers, event.Channel)
 	}
 }
+
+// BroadcastLoaded delivers an event that was loaded from the persisted log by
+// the cross-instance listener. It shares the same subscriber fan-out as
+// Broadcast; the distinct name documents that the event was not published by
+// this process (no new DB row and no NOTIFY).
+func (h *Hub) BroadcastLoaded(event eventing.Event) {
+	h.Broadcast(event)
+}

@@ -48,8 +48,6 @@ export const NAV_ITEMS: NavItem[] = [
     href: "/knowledge",
     icon: BookOpen,
     section: "workspace",
-    placeholder: true,
-    phase: "P1",
   },
   { key: "resources", label: "资源", href: "/resources", icon: Database, section: "workspace" },
   {

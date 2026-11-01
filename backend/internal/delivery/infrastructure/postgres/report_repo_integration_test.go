@@ -10,16 +10,21 @@ import (
 
 	deliveryapp "github.com/EdouardRichard/EzTest/backend/internal/delivery/application"
 	delivery "github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
+	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // newReportRepoForTest opens an isolated migrated schema and wires the report
-// repository against it.
+// repository against it with the deterministic node-0 integration generator.
 func newReportRepoForTest(t *testing.T) (*ReportRepository, *pgxpool.Pool) {
 	t.Helper()
 	pool := testutil.NewDB(t)
-	return NewReportRepository(pool), pool
+	ids, err := platformid.NewSnowflake(0)
+	if err != nil {
+		t.Fatalf("snowflake: %v", err)
+	}
+	return NewReportRepository(pool, ids), pool
 }
 
 func reportRepoFingerprint(char string) string { return strings.Repeat(char, 64) }

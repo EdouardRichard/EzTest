@@ -110,10 +110,41 @@ func (q *WorkQueue) ClaimForTeams(ctx context.Context, claimant string, teams []
 	}
 	for _, team := range teams {
 		if !team.Valid() {
-			return agent.WorkItem{}, false, platform.Invalid("teams", "must contain only clarification, design, execution, delivery, steward, code")
+			return agent.WorkItem{}, false, platform.Invalid("teams", "must contain only clarification, design, execution, delivery, steward, code, ops")
 		}
 	}
 	return q.repo.ClaimForTeams(ctx, claimant, teams, q.lease)
+}
+
+// ClaimForTypes leases the next available item whose type is in types. The
+// caller supplies the lease: the report PDF worker passes
+// report.render_lease_seconds instead of the agent default. An empty type set
+// claims nothing.
+func (q *WorkQueue) ClaimForTypes(ctx context.Context, claimant string, types []string, lease time.Duration) (agent.WorkItem, bool, error) {
+	claimant = strings.TrimSpace(claimant)
+	if claimant == "" {
+		return agent.WorkItem{}, false, platform.Invalid("claimant", "must not be empty")
+	}
+	cleaned := make([]string, 0, len(types))
+	seen := make(map[string]struct{}, len(types))
+	for _, workType := range types {
+		workType = strings.TrimSpace(workType)
+		if workType == "" {
+			continue
+		}
+		if _, ok := seen[workType]; ok {
+			continue
+		}
+		seen[workType] = struct{}{}
+		cleaned = append(cleaned, workType)
+	}
+	if len(cleaned) == 0 {
+		return agent.WorkItem{}, false, nil
+	}
+	if lease <= 0 {
+		lease = q.lease
+	}
+	return q.repo.ClaimForTypes(ctx, claimant, cleaned, lease)
 }
 
 // MarkRunning moves a freshly claimed item to running.
@@ -121,9 +152,16 @@ func (q *WorkQueue) MarkRunning(ctx context.Context, id, epoch int64) error {
 	return mapLeaseLost(q.repo.MarkRunning(ctx, id, epoch))
 }
 
-// Heartbeat extends the current lease without changing the epoch.
-func (q *WorkQueue) Heartbeat(ctx context.Context, id, epoch int64) error {
-	return mapLeaseLost(q.repo.Renew(ctx, id, epoch, q.lease))
+// Heartbeat extends the current lease without changing the epoch. lease is the
+// exact duration the item was claimed with; zero means the queue default. A
+// caller that claims with a longer lease (the report PDF worker) must renew
+// with that same lease, otherwise the renewed lease can expire before the next
+// heartbeat (fix 1: render lease mismatch).
+func (q *WorkQueue) Heartbeat(ctx context.Context, id, epoch int64, lease time.Duration) error {
+	if lease <= 0 {
+		lease = q.lease
+	}
+	return mapLeaseLost(q.repo.Renew(ctx, id, epoch, lease))
 }
 
 // Complete finishes a work item.

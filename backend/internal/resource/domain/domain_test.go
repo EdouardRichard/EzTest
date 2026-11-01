@@ -8,6 +8,8 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
+func strPtr(value string) *string { return &value }
+
 func assertInvalidField(t *testing.T, err error, field string) {
 	t.Helper()
 	if err == nil {
@@ -34,9 +36,16 @@ func TestSUTValidate(t *testing.T) {
 	}{
 		{name: "valid", sut: SUT{Name: "Order Center", Intro: "orders"}},
 		{name: "intro at limit", sut: SUT{Name: "S", Intro: strings.Repeat("x", 2000)}},
+		{name: "family set", sut: SUT{Name: "S", Family: strPtr("payments")}},
+		{name: "family at limit", sut: SUT{Name: "S", Family: strPtr(strings.Repeat("a", 64))}},
 		{name: "blank name", sut: SUT{Name: "   "}, wantErr: true, field: "name"},
 		{name: "name too long", sut: SUT{Name: strings.Repeat("x", 101)}, wantErr: true, field: "name"},
 		{name: "intro too long", sut: SUT{Name: "S", Intro: strings.Repeat("x", 2001)}, wantErr: true, field: "intro"},
+		{name: "empty family", sut: SUT{Name: "S", Family: strPtr("")}, wantErr: true, field: "family"},
+		{name: "blank family", sut: SUT{Name: "S", Family: strPtr("   ")}, wantErr: true, field: "family"},
+		{name: "uppercase family", sut: SUT{Name: "S", Family: strPtr("Payments")}, wantErr: true, field: "family"},
+		{name: "family too long", sut: SUT{Name: "S", Family: strPtr(strings.Repeat("a", 65))}, wantErr: true, field: "family"},
+		{name: "family with whitespace", sut: SUT{Name: "S", Family: strPtr("order center")}, wantErr: true, field: "family"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -46,6 +55,45 @@ func TestSUTValidate(t *testing.T) {
 			}
 			if tc.field != "" {
 				assertInvalidField(t, err, tc.field)
+			}
+		})
+	}
+}
+
+func TestNormalizeFamily(t *testing.T) {
+	cases := []struct {
+		name  string
+		in    *string
+		want  *string
+		field string
+	}{
+		{name: "unset", in: nil},
+		{name: "trims", in: strPtr("  payments  "), want: strPtr("payments")},
+		{name: "allows slug characters", in: strPtr("order-center_v2"), want: strPtr("order-center_v2")},
+		{name: "empty", in: strPtr(""), field: "family"},
+		{name: "blank", in: strPtr("   "), field: "family"},
+		{name: "uppercase", in: strPtr("Payments"), field: "family"},
+		{name: "too long", in: strPtr(strings.Repeat("a", 65)), field: "family"},
+		{name: "inner whitespace", in: strPtr("order center"), field: "family"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := NormalizeFamily(tc.in)
+			if tc.field != "" {
+				assertInvalidField(t, err, tc.field)
+				return
+			}
+			if err != nil {
+				t.Fatalf("NormalizeFamily() error = %v", err)
+			}
+			if tc.want == nil {
+				if got != nil {
+					t.Fatalf("NormalizeFamily() = %q, want nil", *got)
+				}
+				return
+			}
+			if got == nil || *got != *tc.want {
+				t.Fatalf("NormalizeFamily() = %v, want %q", got, *tc.want)
 			}
 		})
 	}

@@ -20,8 +20,8 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 33 {
-		t.Fatalf("applied %d migrations, want 33: %v", len(applied), applied)
+	if len(applied) != 40 {
+		t.Fatalf("applied %d migrations, want 40: %v", len(applied), applied)
 	}
 
 	again, err := db.Migrate(ctx, pool)
@@ -54,6 +54,8 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 		"code_impact_candidate", "code_anchor", "code_fact_review",
 		"visual_assertion", "visual_baseline", "visual_diff",
 		"eval_run", "eval_metric", "agent_profile_prompt_revision",
+		"knowledge_item", "knowledge_revision", "knowledge_usage",
+		"gc_run", "gc_tombstone", "api_instance",
 	}
 	found := map[string]bool{}
 	rows, err := pool.Query(ctx, `
@@ -173,8 +175,8 @@ func TestP3ExecutionTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 33 {
-		t.Fatalf("applied %d migrations, want 33: %v", len(applied), applied)
+	if len(applied) != 40 {
+		t.Fatalf("applied %d migrations, want 40: %v", len(applied), applied)
 	}
 
 	tables := []string{
@@ -314,8 +316,8 @@ func TestP4DeliverySchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 33 {
-		t.Fatalf("applied %d migrations, want 33: %v", len(applied), applied)
+	if len(applied) != 40 {
+		t.Fatalf("applied %d migrations, want 40: %v", len(applied), applied)
 	}
 	again, err := db.Migrate(ctx, pool)
 	if err != nil {
@@ -656,6 +658,151 @@ func TestP6QualityPromptSchema(t *testing.T) {
 	for _, name := range indexes {
 		if !foundIndexes[name] {
 			t.Errorf("missing P6 index %s", name)
+		}
+	}
+}
+
+// TestP7P9Schema pins the seven P7 migrations (#34-#40): knowledge, GC ledger,
+// report PDF metadata, API instances, SUT family, issue recurrence and the
+// deterministic ops work-item team.
+func TestP7P9Schema(t *testing.T) {
+	pool := testutil.NewEmptyDB(t)
+	ctx := context.Background()
+	if _, err := db.Migrate(ctx, pool); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	tables := []string{
+		"knowledge_item", "knowledge_revision", "knowledge_usage",
+		"gc_run", "gc_tombstone", "api_instance",
+	}
+	for _, name := range tables {
+		var exists bool
+		if err := pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, name).Scan(&exists); err != nil {
+			t.Fatalf("to_regclass(%s): %v", name, err)
+		}
+		if !exists {
+			t.Errorf("missing P7 table %s", name)
+		}
+	}
+
+	// Column extensions on pre-existing tables: report PDF metadata, issue
+	// recurrence counters and the optional SUT family.
+	columns := []struct {
+		table      string
+		column     string
+		dataType   string
+		nullable   string
+		defaultSQL string
+	}{
+		{"delivery_report_revision", "pdf_status", "text", "NO", "'pending'::text"},
+		{"delivery_report_revision", "pdf_error", "text", "YES", ""},
+		{"delivery_report_revision", "pdf_attempts", "integer", "NO", "0"},
+		{"delivery_report_revision", "pdf_rendered_at", "timestamp with time zone", "YES", ""},
+		{"delivery_issue", "recurrence_count", "integer", "NO", "0"},
+		{"delivery_issue", "last_recurred_at", "timestamp with time zone", "YES", ""},
+		{"sut", "family", "text", "YES", ""},
+	}
+	for _, column := range columns {
+		var dataType, nullable string
+		var defaultValue *string
+		if err := pool.QueryRow(ctx, `
+			SELECT data_type, is_nullable, column_default
+			FROM information_schema.columns
+			WHERE table_schema = current_schema()
+			  AND table_name = $1 AND column_name = $2
+		`, column.table, column.column).Scan(&dataType, &nullable, &defaultValue); err != nil {
+			t.Errorf("missing P7 column %s.%s: %v", column.table, column.column, err)
+			continue
+		}
+		if dataType != column.dataType {
+			t.Errorf("%s.%s type = %s, want %s", column.table, column.column, dataType, column.dataType)
+		}
+		if nullable != column.nullable {
+			t.Errorf("%s.%s nullable = %s, want %s", column.table, column.column, nullable, column.nullable)
+		}
+		if column.defaultSQL != "" && (defaultValue == nil || *defaultValue != column.defaultSQL) {
+			t.Errorf("%s.%s default = %v, want %s", column.table, column.column, defaultValue, column.defaultSQL)
+		}
+	}
+
+	constraints := []string{
+		"pk_knowledge_item", "ck_knowledge_item_scope",
+		"pk_knowledge_revision", "uk_knowledge_revision_knowledge_id_revision",
+		"pk_knowledge_usage", "pk_gc_run", "pk_gc_tombstone", "pk_api_instance",
+		"uk_api_instance_instance_key", "uk_api_instance_node_id",
+	}
+	rows, err := pool.Query(ctx, `SELECT conname FROM pg_constraint WHERE conname = ANY($1)`, constraints)
+	if err != nil {
+		t.Fatalf("query P7 constraints: %v", err)
+	}
+	foundConstraints := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan constraint: %v", err)
+		}
+		foundConstraints[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate constraints: %v", err)
+	}
+	for _, name := range constraints {
+		if !foundConstraints[name] {
+			t.Errorf("missing P7 constraint %s", name)
+		}
+	}
+
+	indexes := []string{
+		"idx_knowledge_item_scope_status_id", "idx_knowledge_item_status_id",
+		"idx_knowledge_item_source_version", "idx_knowledge_item_search",
+		"idx_knowledge_revision_knowledge_id_id", "idx_knowledge_usage_knowledge_id_id",
+		"idx_content_ref_live_object", "idx_content_object_created_at",
+		"idx_gc_tombstone_run_id", "idx_delivery_report_revision_pdf_pending",
+		"idx_sut_family", "idx_api_instance_status_heartbeat",
+		"uk_gc_run_running",
+	}
+	rows, err = pool.Query(ctx, `
+		SELECT indexname, indexdef FROM pg_indexes
+		WHERE schemaname = current_schema() AND indexname = ANY($1)
+	`, indexes)
+	if err != nil {
+		t.Fatalf("query P7 indexes: %v", err)
+	}
+	defs := map[string]string{}
+	for rows.Next() {
+		var name, definition string
+		if err := rows.Scan(&name, &definition); err != nil {
+			t.Fatalf("scan index: %v", err)
+		}
+		defs[name] = definition
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate indexes: %v", err)
+	}
+	for _, name := range indexes {
+		if _, ok := defs[name]; !ok {
+			t.Errorf("missing P7 index %s", name)
+		}
+	}
+	// One active GC run at a time: partial unique index on a constant expression.
+	if definition := defs["uk_gc_run_running"]; !strings.Contains(definition, "UNIQUE INDEX") ||
+		!strings.Contains(definition, "WHERE (status = 'running'::text)") {
+		t.Errorf("uk_gc_run_running is not a partial unique index: %s", definition)
+	}
+
+	// #40: deterministic worker tasks (report.render_pdf) own the ops team so the
+	// generic agent worker (five product teams) can never claim them.
+	var teamCheck string
+	if err := pool.QueryRow(ctx, `
+		SELECT pg_get_constraintdef(oid) FROM pg_constraint
+		WHERE conrelid = 'work_item'::regclass AND conname = 'chk_work_item_team'
+	`).Scan(&teamCheck); err != nil {
+		t.Fatalf("read chk_work_item_team: %v", err)
+	}
+	for _, team := range []string{"clarification", "design", "execution", "delivery", "steward", "code", "ops"} {
+		if !strings.Contains(teamCheck, "'"+team+"'") {
+			t.Errorf("chk_work_item_team does not allow %q: %s", team, teamCheck)
 		}
 	}
 }

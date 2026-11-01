@@ -47,8 +47,13 @@ export function SUTPanel({ scope, onSelectSut, onRefresh, onRetry }: SUTPanelPro
 
   async function handleCreateSut(values: SutFormValues): Promise<void> {
     try {
+      const family = values.family?.trim() ?? ""
       const { sut } = await createSutWithDefaultEnvironment({
-        sut: { name: values.name, intro: values.intro },
+        sut: {
+          name: values.name,
+          intro: values.intro,
+          ...(family.length > 0 ? { family } : {}),
+        },
         environment: { name: values.environmentName, base_url: values.baseUrl },
       })
       await onRefresh(sut.id)
@@ -75,6 +80,11 @@ export function SUTPanel({ scope, onSelectSut, onRefresh, onRetry }: SUTPanelPro
               {sut.name}
             </button>
             {sut.id === scope.sutId ? <Badge tone="info">已选择</Badge> : null}
+            {sut.family !== null && sut.family !== undefined && sut.family.length > 0 ? (
+              <Badge tone="neutral" className="font-mono">
+                {sut.family}
+              </Badge>
+            ) : null}
           </div>
           {sut.intro.length > 0 ? (
             <p className="max-w-md truncate text-[11px] text-muted-foreground">{sut.intro}</p>
@@ -268,7 +278,12 @@ export function SUTPanel({ scope, onSelectSut, onRefresh, onRetry }: SUTPanelPro
           initial={editingSut}
           onClose={() => setEditingSut(null)}
           onSubmit={async (values) => {
-            await updateSut(editingSut.id, { name: values.name, intro: values.intro })
+            const family = values.family?.trim() ?? ""
+            await updateSut(editingSut.id, {
+              name: values.name,
+              intro: values.intro,
+              ...(family.length > 0 ? { family } : {}),
+            })
             await onRefresh()
           }}
         />

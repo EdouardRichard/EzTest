@@ -60,7 +60,7 @@ func (r *Repository) exec(ctx context.Context, op, query string, args ...any) er
 
 // ---------- SUT ----------
 
-const sutColumns = `id, name, intro, created_by, created_at, updated_at`
+const sutColumns = `id, name, intro, family, created_by, created_at, updated_at`
 
 // ListSUTs returns SUTs ordered by ID descending.
 func (r *Repository) ListSUTs(ctx context.Context, limit int, beforeID *int64) ([]resource.SUT, error) {
@@ -103,10 +103,10 @@ func (r *Repository) GetSUT(ctx context.Context, id int64) (resource.SUT, error)
 // CreateSUT inserts a SUT.
 func (r *Repository) CreateSUT(ctx context.Context, sut resource.SUT) (resource.SUT, error) {
 	row := r.pool.QueryRow(ctx, `
-		INSERT INTO sut (id, name, intro, created_by, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		INSERT INTO sut (id, name, intro, family, created_by, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		RETURNING created_at, updated_at
-	`, sut.ID, sut.Name, sut.Intro, sut.CreatedBy, sut.CreatedAt, sut.UpdatedAt)
+	`, sut.ID, sut.Name, sut.Intro, sut.Family, sut.CreatedBy, sut.CreatedAt, sut.UpdatedAt)
 	if err := row.Scan(&sut.CreatedAt, &sut.UpdatedAt); err != nil {
 		return resource.SUT{}, wrapDB("create sut", err)
 	}
@@ -116,8 +116,8 @@ func (r *Repository) CreateSUT(ctx context.Context, sut resource.SUT) (resource.
 // UpdateSUT updates the editable SUT columns.
 func (r *Repository) UpdateSUT(ctx context.Context, sut resource.SUT) (resource.SUT, error) {
 	if err := r.exec(ctx, "update sut", `
-		UPDATE sut SET name = $2, intro = $3, updated_at = $4 WHERE id = $1
-	`, sut.ID, sut.Name, sut.Intro, sut.UpdatedAt); err != nil {
+		UPDATE sut SET name = $2, intro = $3, family = $4, updated_at = $5 WHERE id = $1
+	`, sut.ID, sut.Name, sut.Intro, sut.Family, sut.UpdatedAt); err != nil {
 		return resource.SUT{}, err
 	}
 	return sut, nil
@@ -130,7 +130,7 @@ func (r *Repository) DeleteSUT(ctx context.Context, id int64) error {
 
 func scanSUT(row rowScanner) (resource.SUT, error) {
 	var item resource.SUT
-	if err := row.Scan(&item.ID, &item.Name, &item.Intro, &item.CreatedBy, &item.CreatedAt, &item.UpdatedAt); err != nil {
+	if err := row.Scan(&item.ID, &item.Name, &item.Intro, &item.Family, &item.CreatedBy, &item.CreatedAt, &item.UpdatedAt); err != nil {
 		return resource.SUT{}, err
 	}
 	return item, nil

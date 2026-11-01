@@ -171,3 +171,17 @@ export function downloadHTML(
     `${reportPath(versionId, reportId)}/revisions/${encodeURIComponent(revision)}/html`,
   )
 }
+
+/**
+ * `GET .../revisions/{revision}/pdf` (P7): authenticated PDF bytes. The API
+ * answers 409 `pdf_not_ready`/`pdf_failed` until the render job is done.
+ */
+export function downloadPDF(
+  versionId: string,
+  reportId: string,
+  revision: number,
+): Promise<ApiDownload> {
+  return apiDownload(
+    `${reportPath(versionId, reportId)}/revisions/${encodeURIComponent(revision)}/pdf`,
+  )
+}

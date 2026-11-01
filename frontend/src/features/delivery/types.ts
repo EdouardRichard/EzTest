@@ -64,6 +64,12 @@ export type IssueView = {
   expected_revision: number
   merged_into_id?: string | null
   merged_at?: string | null
+  /** Number of recurrence redirects into this issue (P7). */
+  recurrence_count?: number
+  /** Last time a recurring failure was redirected here (P7). */
+  last_recurred_at?: string | null
+  /** Merge chain target IDs, direct target first (P7 read-time projection). */
+  merged_chain?: string[] | null
   reopen_count: number
   refs: IssueRef[]
   triage?: IssueTriage | null
@@ -95,6 +101,9 @@ export type ReportStatus = "draft" | "published" | "stale"
 
 export type ReportRenderStatus = "pending" | "running" | "done" | "failed"
 
+/** `ReportRevisionView.pdf_status` (P7): async PDF render state. */
+export type ReportPDFStatus = "pending" | "running" | "done" | "failed" | "disabled"
+
 /** `ReportRevisionView`: one append-only immutable revision (spec §9.3). */
 export type ReportRevisionView = {
   id: string
@@ -107,8 +116,14 @@ export type ReportRevisionView = {
   render_status: ReportRenderStatus
   /** Published + render done + html_ref present. */
   html_available: boolean
-  /** P4 always false; PDF belongs to P7. */
+  /** PDF bytes exist (`pdf_status='done'` with a PDF ref). */
   pdf_available: boolean
+  /** P7 PDF render state; absent only on pre-P7 fixtures/backends. */
+  pdf_status?: ReportPDFStatus
+  /** Render failure detail (null unless `pdf_status='failed'`). */
+  pdf_error?: string | null
+  /** When the PDF bytes were rendered. */
+  pdf_rendered_at?: string | null
   created_at: string
 }
 
@@ -257,6 +272,14 @@ export const REPORT_RENDER_STATUS_LABELS: Record<ReportRenderStatus, string> = {
   running: "生成中",
   done: "已完成",
   failed: "生成失败",
+}
+
+export const REPORT_PDF_STATUS_LABELS: Record<ReportPDFStatus, string> = {
+  pending: "PDF 待生成",
+  running: "PDF 生成中",
+  done: "PDF 已生成",
+  failed: "PDF 生成失败",
+  disabled: "PDF 未启用",
 }
 
 export const REPORT_REF_LABELS: Record<ReportRefKind, string> = {
