@@ -75,3 +75,12 @@
 - **Lead 代用户签字（待用户审阅 handoff）**：____________________
 - 签字日期：____________________
 - 说明：Lead 在 p8 验收环境复跑 `scripts/p8-capability.ps1` 且无 FAIL 后签字；用户审阅 handoff 后可要求复验。本文件未声称 S1–S6/S8–S10/S12–S13 已运行；这些场景的结论以各自 acceptance 文档为准。
+
+## 5. Lead 复跑结果（2026-11-02）
+
+- 命令：`powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/p8-capability.ps1`
+- 环境：eztest_v02_p8，API http://127.0.0.1:13333，真实 P8 二进制
+- 结果：**PASS=28 / PASS(prior)=9 / FAIL=0 / total=37**，退出码 0
+- 证据：`.tmp/p8-capability/capability.txt`、`.tmp/p8-acceptance-run/capability3-console.log`
+- 说明：B4 本次因一次性 P8 数据库没有 code repository 行，只断言 UI 文件与 P5 先验证据，按 PASS(prior) 计；未伪造 code-intel 行为通过。
+- 签字：Lead 代用户签字（2026-11-02）。用户审阅 handoff 后可要求复验。

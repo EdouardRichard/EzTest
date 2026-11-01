@@ -38,3 +38,8 @@
 ## 变更方式
 
 任何限制的解除必须在后续阶段 spec/决策记录中立项，并同步 contracts、迁移、测试与 handoff；P8 不自行扩大范围。
+| L11 | 多次澄清轮次可能让 Curator 重复生成同题需求 draft | 若用户连续发多轮澄清，可能产生重复 draft，阻塞收尾 | P8 验收改用单轮综合澄清；重复 draft 作为 P2 待办记录，不在 P8 改 Curator 去重逻辑 |
+| L12 | 视觉断言可能结束为 inconclusive，P8 没有 waiver 接口 | 若自动确认所有 design-gap 视觉用例，closure 会因 inconclusive 阻塞 | 验收只确认初始用例与有执行价值的 draft，design-gap 视觉 draft 保持 draft；closure 只评估 current+confirmed。后续阶段应补显式 waiver |
+| L13 | equirement.close 依赖 work-item 重试预算（当前 10 次，即上限） | 若同需求的设计/分析任务持续超过约 3 分钟，close 任务仍可能 dead | 验收覆盖 design.gap 排空后成功关闭；更长阻塞需人工/后续阶段调重试模型 |
+| L14 | 真实 LLM 设计输出可能是自由文本步骤，而非可执行 action | 个别用例会在编译阶段 automation/inconclusive | P8 验收对跨系统用例失败做公开 manual-intent 重试；E2E 将无法执行的 UI 变更记为显式 gap，不伪造通过 |
+| L15 | 一次性 P7→P8 数据库常无 code_repository 行，或报告内容对象缺失 | B4 只能按 prior 证据、报告下载测试可能只能 noteGap | Capability B4 记 PASS(prior) 并注明原因；E2E 发现报告字节不可读时记录 gap 而不是失败 |

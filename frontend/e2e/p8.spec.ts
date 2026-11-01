@@ -943,7 +943,9 @@ test("design mindmap renders the scenario graph and confirms a draft case", asyn
       "design",
       "every S4 case is already confirmed; the confirmed badge is asserted instead of a confirm click",
     )
-    await expect(page.getByTestId(`case-card-${selectedCase.case_id}`)).toContainText(/confirmed|\u5df2\u786e\u8ba4/i)
+    await expect(page.getByTestId(`case-card-${selectedCase.case_id}`)).toContainText(
+      /confirmed|\u5df2\u786e\u8ba4/i,
+    )
     return
   }
   if (seed.version.status === "completed") {
@@ -1043,7 +1045,9 @@ test("execution workspace shows waves, evidence and the pause round-trip", async
         .poll(
           async () => {
             try {
-              const waves = await apiGet<RunWave[]>(`/api/versions/${seed.version.id}/waves?limit=20`)
+              const waves = await apiGet<RunWave[]>(
+                `/api/versions/${seed.version.id}/waves?limit=20`,
+              )
               return (
                 waves.find(
                   (wave) =>
