@@ -460,6 +460,16 @@ func TestVisualEnvironmentOverridesAgentFailure(t *testing.T) {
 	}
 }
 
+func TestNormalizeVisualStepsClearsBlockedStep(t *testing.T) {
+	steps := NormalizeVisualSteps(
+		[]StepResult{{Seq: 1, Status: StepBlocked, Error: "missing_visual_baseline: no baseline"}},
+		[]AssertionResult{visualAssertion(1, 1, AssertionInconclusive, "missing_visual_baseline")},
+	)
+	if len(steps) != 1 || steps[0].Status != StepPassed || steps[0].Error != "" {
+		t.Fatalf("steps = %+v", steps)
+	}
+}
+
 func TestApplyVisualOutcomeOverridesBlocked(t *testing.T) {
 	summary := CaseRunSummary{VerdictReason: VerdictReasonBlocked, VisualInconclusive: 1}
 	status, class, got := ApplyVisualOutcome(CaseRunBlocked, FailureClassBlocked, summary, []AssertionResult{

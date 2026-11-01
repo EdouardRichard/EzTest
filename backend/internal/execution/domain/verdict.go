@@ -269,6 +269,33 @@ func (s *CaseRunSummary) countVisualResult(result AssertionResult, ok bool) {
 // visualBlock returns the inconclusive verdict reason of the first visual
 // assertion that did not pass. environment=true maps the environment-mismatch
 // reason to the environment failure class; "case" reasons keep the empty class.
+// NormalizeVisualSteps removes a free-form blocked/failed step status that the
+// Case Executor attached to a visual assertion whose concrete visual result is
+// inconclusive. The visual tool result is authoritative (spec §7.3); without
+// this, a model-authored blocked status hides the visual verdict from Aggregate.
+func NormalizeVisualSteps(steps []StepResult, assertions []AssertionResult) []StepResult {
+	visual := map[int]bool{}
+	for _, result := range assertions {
+		if result.Kind == AssertionKindVisual && result.Verdict == AssertionInconclusive {
+			visual[result.StepSeq] = true
+		}
+	}
+	if len(visual) == 0 {
+		return steps
+	}
+	normalized := append([]StepResult(nil), steps...)
+	for i := range normalized {
+		if normalized[i].Status != StepBlocked && normalized[i].Status != StepFailed {
+			continue
+		}
+		if visual[normalized[i].Seq] {
+			normalized[i].Status = StepPassed
+			normalized[i].Error = ""
+		}
+	}
+	return normalized
+}
+
 // ApplyVisualOutcome is the final defense-in-depth guard for the P5 visual
 // four-state contract: a concrete inconclusive visual assertion result must not
 // be reported as blocked or failed(environment) because the Case Executor used a
