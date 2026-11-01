@@ -133,12 +133,12 @@ func TestAppendPromptRevisionIncrementsAndSyncsCurrentPrompt(t *testing.T) {
 		t.Fatalf("revision = %#v", revisions[0])
 	}
 
-	before := 3
+	before := 2
 	page2, hasMore, err := repo.ListPromptRevisions(ctx, agentapp.ProfileKeyClarificationHost, 1, &before)
 	if err != nil {
 		t.Fatalf("ListPromptRevisions page2: %v", err)
 	}
-	if hasMore || len(page2) != 1 || page2[0].Version != 2 {
+	if hasMore || len(page2) != 1 || page2[0].Version != 1 {
 		t.Fatalf("page2 = %#v hasMore=%v", page2, hasMore)
 	}
 
