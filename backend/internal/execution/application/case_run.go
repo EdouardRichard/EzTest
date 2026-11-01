@@ -922,6 +922,7 @@ func (s *CaseRunner) ensureSUTContexts(ctx context.Context, caseRun execution.Ca
 			rowID := row.ID
 			if _, updateErr := s.sutContexts.UpdateCAS(ctx, rowID, func(target *execution.CaseRunSUTContext) error {
 				target.LeaseEpoch = epoch
+				target.ExecutorID = caseRun.OwnerExecutorID
 				if target.Status == execution.SUTContextClosed || target.Status == execution.SUTContextFailed {
 					target.Status = execution.SUTContextCreating
 					target.BrowserContextID = ""
@@ -938,6 +939,7 @@ func (s *CaseRunner) ensureSUTContexts(ctx context.Context, caseRun execution.Ca
 			CaseRunID:    caseRun.ID,
 			VersionSUTID: step.TargetVersionSUTID,
 			AccountRole:  step.AccountRole,
+			ExecutorID:   caseRun.OwnerExecutorID,
 			LeaseEpoch:   epoch,
 			Status:       execution.SUTContextCreating,
 			CreatedAt:    s.now(),

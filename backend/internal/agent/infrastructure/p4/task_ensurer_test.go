@@ -121,7 +121,7 @@ func TestTaskEnsurerStewardTasks(t *testing.T) {
 	}
 	requirement := queue.items[0]
 	if requirement.VersionID != 7 || requirement.Team != "steward" || requirement.Type != "requirement.close" ||
-		requirement.DedupeKey != "req-close:101:1001:2" {
+		requirement.DedupeKey != "req-close:101:1001:2" || requirement.MaxAttempts != requirementCloseMaxAttempts {
 		t.Fatalf("requirement item = %+v", requirement)
 	}
 	requirementPayload := requirement.Payload.(map[string]any)
