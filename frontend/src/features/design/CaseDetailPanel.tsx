@@ -4,13 +4,22 @@ import { useCallback, useEffect, useState } from "react"
 
 import { Badge, type BadgeTone } from "@/components/ui/Badge"
 import { Button } from "@/components/ui/Button"
-import { ErrorState } from "@/components/ui/ErrorState"
+import { ErrorState, InlineError } from "@/components/ui/ErrorState"
 import { LoadingCard } from "@/components/ui/Spinner"
+import { AnchorPanel } from "@/features/anchors/AnchorPanel"
+import { listVisualAssertions } from "@/features/visual/api"
+import { VisualConfigEditor } from "@/features/visual/components/VisualConfigEditor"
+import type { VisualAssertion } from "@/features/visual/types"
 import { formatDateTime } from "@/lib/format"
 
 import { getDesignCase } from "./api"
 import { CASE_VERSION_STATUS_LABEL } from "./nodeActions"
-import type { DesignAssertionKind, DesignCaseDetail, DesignCaseVersionDetail } from "./types"
+import type {
+  DesignAssertion,
+  DesignAssertionKind,
+  DesignCaseDetail,
+  DesignCaseVersionDetail,
+} from "./types"
 
 function statusTone(status: DesignCaseVersionDetail["status"]): BadgeTone {
   if (status === "confirmed") return "success"
@@ -27,6 +36,140 @@ const ASSERTION_KIND_LABEL: Record<DesignAssertionKind, string> = {
   visual: "视觉",
 }
 
+/**
+ * Visual assertion config section (spec §7.1/§9.4). It maps the design
+ * assertion to its P5 config by `(step_seq, assertion_seq)`, because the frozen
+ * design DTO does not expose the P2 `case_assertion` id; when a config exists,
+ * its `case_assertion_id` is reused for the upsert path. No P2 confirmation or
+ * edit semantics are touched here.
+ */
+function CaseVisualAssertions({
+  versionId,
+  selected,
+  previousCaseVersionId,
+}: {
+  versionId: string
+  selected: DesignCaseVersionDetail
+  previousCaseVersionId?: string
+}) {
+  const visualAssertions = selected.assertions
+    .map((assertion, index) => {
+      let assertionSeq = 0
+      for (let cursor = 0; cursor <= index; cursor += 1) {
+        if (selected.assertions[cursor].step_seq === assertion.step_seq) assertionSeq += 1
+      }
+      return { assertion, assertionSeq }
+    })
+    .filter((item) => item.assertion.kind === "visual")
+
+  const [configs, setConfigs] = useState<VisualAssertion[]>([])
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<unknown>(null)
+  const [editingKey, setEditingKey] = useState<string | null>(null)
+  const [reloadToken, setReloadToken] = useState(0)
+
+  const hasVisual = visualAssertions.length > 0
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: reloadToken/revision refetch the configs
+  useEffect(() => {
+    if (!hasVisual) return undefined
+    let cancelled = false
+    setLoading(true)
+    setError(null)
+    void listVisualAssertions(versionId, { caseVersionId: selected.case_version_id })
+      .then((items) => {
+        if (!cancelled) setConfigs(items)
+      })
+      .catch((cause: unknown) => {
+        if (!cancelled) setError(cause)
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [versionId, selected.case_version_id, hasVisual, reloadToken])
+
+  if (!hasVisual) return null
+
+  function keyOf(assertion: DesignAssertion, assertionSeq: number): string {
+    return `${assertion.step_seq}-${assertionSeq}`
+  }
+
+  function configOf(assertion: DesignAssertion, assertionSeq: number): VisualAssertion | undefined {
+    return configs.find(
+      (config) => config.step_seq === assertion.step_seq && config.assertion_seq === assertionSeq,
+    )
+  }
+
+  return (
+    <section aria-label="视觉断言配置" className="space-y-2">
+      <header className="flex flex-wrap items-center gap-2">
+        <h3 className="text-xs font-semibold text-foreground">视觉断言配置</h3>
+        <Badge tone="info">{visualAssertions.length} 条</Badge>
+        <span className="text-[10px] text-muted-foreground">
+          配置走 P5 visual API；保存不改变 P2 断言确认语义。
+        </span>
+      </header>
+
+      {loading ? <p className="text-[11px] text-muted-foreground">正在加载视觉配置…</p> : null}
+      {error !== null ? <InlineError error={error} /> : null}
+
+      {visualAssertions.map(({ assertion, assertionSeq }) => {
+        const key = keyOf(assertion, assertionSeq)
+        const config = configOf(assertion, assertionSeq)
+        const caseAssertionId = assertion.case_assertion_id ?? config?.case_assertion_id
+        return (
+          <div key={key} className="space-y-1.5">
+            <div className="flex flex-wrap items-center gap-1.5 rounded-md border border-border bg-muted/20 px-2.5 py-2 text-[11px]">
+              <span className="font-medium text-foreground">
+                视觉断言 {assertion.step_seq}.{assertionSeq}
+              </span>
+              <span className="text-muted-foreground">
+                {assertion.expected || assertion.target}
+              </span>
+              {config !== undefined ? (
+                <Badge tone={config.baseline ? "success" : "warning"}>
+                  {config.baseline ? `基线已批准 r${config.config_revision}` : "缺失基线"}
+                </Badge>
+              ) : (
+                <Badge tone="neutral">未配置</Badge>
+              )}
+              <Button
+                variant="secondary"
+                size="sm"
+                className="ml-auto"
+                aria-expanded={editingKey === key}
+                onClick={() => setEditingKey((current) => (current === key ? null : key))}
+              >
+                配置视觉断言
+              </Button>
+            </div>
+            {editingKey === key ? (
+              <VisualConfigEditor
+                versionId={versionId}
+                caseVersionId={selected.case_version_id}
+                caseAssertionId={caseAssertionId}
+                versionSutId={config?.version_sut_id ?? selected.default_version_sut_id}
+                assertion={{
+                  step_seq: assertion.step_seq,
+                  assertion_seq: assertionSeq,
+                  expected: assertion.expected,
+                  case_assertion_id: assertion.case_assertion_id,
+                }}
+                initial={config ?? null}
+                previousCaseVersionId={previousCaseVersionId}
+                onSaved={() => setReloadToken((token) => token + 1)}
+              />
+            ) : null}
+          </div>
+        )
+      })}
+    </section>
+  )
+}
+
 export type CaseDetailPanelProps = {
   versionId: string
   caseId: string | null
@@ -39,6 +182,7 @@ export type CaseDetailPanelProps = {
 }
 
 function CaseDetailBody({
+  versionId,
   detail,
   selectedVersionId,
   onSelectVersion,
@@ -46,6 +190,7 @@ function CaseDetailBody({
   onRequestChange,
   confirming,
 }: {
+  versionId: string
   detail: DesignCaseDetail
   selectedVersionId: string | undefined
   onSelectVersion: (caseVersionId: string) => void
@@ -55,6 +200,14 @@ function CaseDetailBody({
 }) {
   const selected = detail.selected
   const canConfirm = detail.confirmable && selected.status === "draft"
+  const previousVersion = [...detail.versions]
+    .filter((version) => version.revision < selected.revision)
+    .sort((left, right) => right.revision - left.revision)[0]
+  const visualConfigTarget = {
+    versionId,
+    selected,
+    previousCaseVersionId: previousVersion?.case_version_id,
+  }
 
   return (
     <div className="space-y-4">
@@ -177,6 +330,12 @@ function CaseDetailBody({
         )}
       </section>
 
+      <CaseVisualAssertions
+        versionId={visualConfigTarget.versionId}
+        selected={visualConfigTarget.selected}
+        previousCaseVersionId={visualConfigTarget.previousCaseVersionId}
+      />
+
       <section aria-label="来源" className="space-y-1">
         <h3 className="text-xs font-semibold text-foreground">来源</h3>
         {selected.sources.length === 0 ? (
@@ -227,6 +386,15 @@ function CaseDetailBody({
             )
           })}
         </ul>
+      </section>
+
+      <section aria-label="代码锚点" className="soft-divider space-y-1 border-t border-border pt-3">
+        <AnchorPanel
+          versionId={versionId}
+          subjectKind="case_version"
+          subjectId={selected.case_version_id}
+          title="用例代码锚点"
+        />
       </section>
     </div>
   )
@@ -299,6 +467,7 @@ export function CaseDetailPanel({
         <ErrorState error={error} title="用例详情加载失败" onRetry={retry} />
       ) : detail === null ? null : (
         <CaseDetailBody
+          versionId={versionId}
           detail={detail}
           selectedVersionId={selectedVersionId}
           onSelectVersion={setSelectedVersionId}
