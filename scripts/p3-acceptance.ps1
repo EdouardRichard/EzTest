@@ -1605,7 +1605,7 @@ try {
     }
 
     Step "assert P4 tables, if present, are the complete P4 set (P3 execution must not require them)"
-    $forbiddenTables = Invoke-PsqlScalar -DatabaseName $testDatabase -SqlText "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND (table_name ~* '(^|_)(issue|report|analysis_run)($|_)');"
+    $forbiddenTables = Invoke-PsqlScalar -DatabaseName $testDatabase -SqlText "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND (table_name ~* '(^|_)(issue|report|analysis_run|closure)($|_)');"
     Assert-True ([int]$forbiddenTables -eq 0 -or [int]$forbiddenTables -eq 8) "P4 tables must be absent (P3-only) or the complete 8-table P4 set (got $forbiddenTables)"
 
     Pass-Scenario $s6
