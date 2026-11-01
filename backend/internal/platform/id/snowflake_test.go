@@ -80,3 +80,32 @@ func ParseMust(t *testing.T, raw string) int64 {
 	}
 	return value
 }
+
+func TestSnowflakeWaitsForNextMillisecondWhenSequenceExhausted(t *testing.T) {
+	gen, err := NewSnowflake(1)
+	if err != nil {
+		t.Fatalf("NewSnowflake: %v", err)
+	}
+	const base int64 = 1_800_000_000_000
+	var calls int64
+	gen.now = func() int64 {
+		calls++
+		if calls > 5000 {
+			return base + 1
+		}
+		return base
+	}
+	seen := map[int64]struct{}{}
+	var previous int64
+	for i := 0; i < 5000; i++ {
+		next := gen.Next()
+		if next <= previous {
+			t.Fatalf("id %d not greater than %d", next, previous)
+		}
+		if _, duplicate := seen[next]; duplicate {
+			t.Fatalf("duplicate id %d", next)
+		}
+		seen[next] = struct{}{}
+		previous = next
+	}
+}

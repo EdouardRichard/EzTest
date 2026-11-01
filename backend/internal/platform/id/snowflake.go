@@ -3,6 +3,7 @@ package id
 
 import (
 	"fmt"
+	"runtime"
 	"strconv"
 	"sync"
 	"time"
@@ -50,7 +51,15 @@ func (s *Snowflake) Next() int64 {
 	if now == s.lastMilli {
 		s.sequence = (s.sequence + 1) & maxSeq
 		if s.sequence == 0 {
-			now = s.lastMilli + 1
+			// The 12-bit sequence is exhausted inside one millisecond. Wait for
+			// the wall clock to advance instead of logically moving lastMilli
+			// into the future: a future timestamp would leak into logs and make
+			// every subsequent ID look newer than the actual clock.
+			for now <= s.lastMilli {
+				runtime.Gosched()
+				time.Sleep(50 * time.Microsecond)
+				now = s.now()
+			}
 		}
 	} else {
 		s.sequence = 0
