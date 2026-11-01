@@ -6,6 +6,7 @@ package resourceapp
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
@@ -785,6 +786,289 @@ func (s *Service) ImportAPIs(ctx context.Context, environmentID int64, inputs []
 		result.Items = append(result.Items, toAPIView(created))
 	}
 	return result, nil
+}
+
+// ProposedPageInput is the payload for proposing a page from code facts or
+// network evidence (spec §8.1). Source is always ai for pages.
+type ProposedPageInput struct {
+	EnvironmentID int64
+	Name          string
+	URL           string
+	RouteTemplate string
+	PageType      string
+	AuthRole      string
+	Module        string
+	Source        string
+}
+
+// ProposedAPIInput is the payload for proposing an API from code facts or
+// network evidence. Source is ai or code.
+type ProposedAPIInput struct {
+	EnvironmentID int64
+	Method        string
+	PathTemplate  string
+	Name          string
+	AuthRole      string
+	SchemaRef     string
+	Source        string
+}
+
+// CreateProposedPage inserts or refreshes one proposed page. Approved pages are
+// never downgraded and rejected pages are not re-proposed in P5 (both are
+// returned unchanged so the caller counts them as skipped).
+func (s *Service) CreateProposedPage(ctx context.Context, input ProposedPageInput) (PageView, error) {
+	environment, err := s.repo.GetEnvironment(ctx, input.EnvironmentID)
+	if err != nil {
+		return PageView{}, mapRepoError(err, "environment", "")
+	}
+	source := strings.TrimSpace(input.Source)
+	if source == "" {
+		source = resource.PageSourceAI
+	}
+	if source != resource.PageSourceAI {
+		return PageView{}, platform.Invalid("source", "proposed pages must use the ai source")
+	}
+	routeTemplate := strings.TrimSpace(input.RouteTemplate)
+	if routeTemplate == "" {
+		derived, deriveErr := resource.DeriveRouteTemplate(input.URL)
+		if deriveErr != nil {
+			return PageView{}, deriveErr
+		}
+		routeTemplate = derived
+	}
+	pageType := strings.TrimSpace(input.PageType)
+	if pageType == "" {
+		pageType = "page"
+	}
+	at := s.clock.Now()
+	page := resource.Page{
+		SUTID:         environment.SUTID,
+		EnvironmentID: environment.ID,
+		Name:          input.Name,
+		URL:           input.URL,
+		RouteTemplate: routeTemplate,
+		PageType:      pageType,
+		AuthRole:      input.AuthRole,
+		Module:        input.Module,
+		Status:        resource.PageStatusProposed,
+		Source:        source,
+		CreatedAt:     at,
+		UpdatedAt:     at,
+	}
+	if err := page.Validate(); err != nil {
+		return PageView{}, err
+	}
+
+	existing, listErr := s.repo.ListPages(ctx, environment.ID)
+	if listErr != nil {
+		return PageView{}, listErr
+	}
+	for _, candidate := range existing {
+		if candidate.RouteTemplate != routeTemplate {
+			continue
+		}
+		if candidate.Status == resource.PageStatusProposed {
+			page.ID = candidate.ID
+			page.CreatedAt = candidate.CreatedAt
+			updated, updateErr := s.repo.UpdatePage(ctx, page)
+			if updateErr != nil {
+				return PageView{}, mapRepoError(updateErr, "page", "page route already exists in this environment")
+			}
+			s.record(ctx, 0, "resource.page.proposed", "page", platformid.Format(updated.ID), map[string]any{
+				"sut_id":         platformid.Format(updated.SUTID),
+				"environment_id": platformid.Format(updated.EnvironmentID),
+				"route_template": updated.RouteTemplate,
+				"source":         updated.Source,
+			})
+			return toPageView(updated), nil
+		}
+		return toPageView(candidate), nil
+	}
+
+	page.ID = s.ids.Next()
+	created, createErr := s.repo.CreatePage(ctx, page)
+	if createErr != nil {
+		return PageView{}, mapRepoError(createErr, "page", "page route already exists in this environment")
+	}
+	s.record(ctx, 0, "resource.page.proposed", "page", platformid.Format(created.ID), map[string]any{
+		"sut_id":         platformid.Format(created.SUTID),
+		"environment_id": platformid.Format(created.EnvironmentID),
+		"route_template": created.RouteTemplate,
+		"source":         created.Source,
+	})
+	return toPageView(created), nil
+}
+
+// ConfirmPage turns a proposed page into an approved one.
+func (s *Service) ConfirmPage(ctx context.Context, pageID, actorID int64) (PageView, error) {
+	page, err := s.repo.GetPage(ctx, pageID)
+	if err != nil {
+		return PageView{}, mapRepoError(err, "page", "")
+	}
+	if page.Status != resource.PageStatusProposed {
+		return PageView{}, platform.Conflict("page is not proposed")
+	}
+	page.Status = resource.PageStatusApproved
+	page.UpdatedAt = s.clock.Now()
+	updated, err := s.repo.UpdatePage(ctx, page)
+	if err != nil {
+		return PageView{}, mapRepoError(err, "page", "page route already exists in this environment")
+	}
+	s.record(ctx, actorID, "resource.page.confirmed", "page", platformid.Format(updated.ID), map[string]any{
+		"sut_id":         platformid.Format(updated.SUTID),
+		"environment_id": platformid.Format(updated.EnvironmentID),
+		"route_template": updated.RouteTemplate,
+		"source":         updated.Source,
+	})
+	return toPageView(updated), nil
+}
+
+// RejectPage turns a proposed page into a rejected one.
+func (s *Service) RejectPage(ctx context.Context, pageID, actorID int64) (PageView, error) {
+	page, err := s.repo.GetPage(ctx, pageID)
+	if err != nil {
+		return PageView{}, mapRepoError(err, "page", "")
+	}
+	if page.Status != resource.PageStatusProposed {
+		return PageView{}, platform.Conflict("page is not proposed")
+	}
+	page.Status = resource.PageStatusRejected
+	page.UpdatedAt = s.clock.Now()
+	updated, err := s.repo.UpdatePage(ctx, page)
+	if err != nil {
+		return PageView{}, mapRepoError(err, "page", "page route already exists in this environment")
+	}
+	s.record(ctx, actorID, "resource.page.rejected", "page", platformid.Format(updated.ID), map[string]any{
+		"sut_id":         platformid.Format(updated.SUTID),
+		"environment_id": platformid.Format(updated.EnvironmentID),
+		"route_template": updated.RouteTemplate,
+		"source":         updated.Source,
+	})
+	return toPageView(updated), nil
+}
+
+// CreateProposedAPI inserts or refreshes one proposed API. Approved and
+// rejected rows are returned unchanged (skipped).
+func (s *Service) CreateProposedAPI(ctx context.Context, input ProposedAPIInput) (APIView, error) {
+	environment, err := s.repo.GetEnvironment(ctx, input.EnvironmentID)
+	if err != nil {
+		return APIView{}, mapRepoError(err, "environment", "")
+	}
+	source := strings.TrimSpace(input.Source)
+	if source == "" {
+		source = resource.APISourceAI
+	}
+	if source != resource.APISourceAI && source != resource.APISourceCode {
+		return APIView{}, platform.Invalid("source", "proposed APIs must use the ai or code source")
+	}
+	at := s.clock.Now()
+	api := resource.API{
+		SUTID:         environment.SUTID,
+		EnvironmentID: environment.ID,
+		Method:        input.Method,
+		PathTemplate:  input.PathTemplate,
+		Name:          input.Name,
+		AuthRole:      input.AuthRole,
+		SchemaRef:     input.SchemaRef,
+		Status:        resource.APIStatusProposed,
+		Source:        source,
+		CreatedAt:     at,
+		UpdatedAt:     at,
+	}
+	if err := api.Validate(); err != nil {
+		return APIView{}, err
+	}
+
+	existing, listErr := s.repo.ListAPIs(ctx, environment.ID)
+	if listErr != nil {
+		return APIView{}, listErr
+	}
+	for _, candidate := range existing {
+		if candidate.Method != api.Method || candidate.PathTemplate != api.PathTemplate {
+			continue
+		}
+		if candidate.Status == resource.APIStatusProposed {
+			api.ID = candidate.ID
+			api.CreatedAt = candidate.CreatedAt
+			updated, updateErr := s.repo.UpdateAPI(ctx, api)
+			if updateErr != nil {
+				return APIView{}, mapRepoError(updateErr, "api", "api route already exists in this environment")
+			}
+			s.record(ctx, 0, "resource.api.proposed", "api", platformid.Format(updated.ID), map[string]any{
+				"sut_id":         platformid.Format(updated.SUTID),
+				"environment_id": platformid.Format(updated.EnvironmentID),
+				"method":         updated.Method,
+				"path_template":  updated.PathTemplate,
+				"source":         updated.Source,
+			})
+			return toAPIView(updated), nil
+		}
+		return toAPIView(candidate), nil
+	}
+
+	api.ID = s.ids.Next()
+	created, createErr := s.repo.CreateAPI(ctx, api)
+	if createErr != nil {
+		return APIView{}, mapRepoError(createErr, "api", "api route already exists in this environment")
+	}
+	s.record(ctx, 0, "resource.api.proposed", "api", platformid.Format(created.ID), map[string]any{
+		"sut_id":         platformid.Format(created.SUTID),
+		"environment_id": platformid.Format(created.EnvironmentID),
+		"method":         created.Method,
+		"path_template":  created.PathTemplate,
+		"source":         created.Source,
+	})
+	return toAPIView(created), nil
+}
+
+// ConfirmAPI turns a proposed API into an approved one.
+func (s *Service) ConfirmAPI(ctx context.Context, apiID, actorID int64) (APIView, error) {
+	api, err := s.repo.GetAPI(ctx, apiID)
+	if err != nil {
+		return APIView{}, mapRepoError(err, "api", "")
+	}
+	if api.Status != resource.APIStatusProposed {
+		return APIView{}, platform.Conflict("api is not proposed")
+	}
+	api.Status = resource.APIStatusApproved
+	api.UpdatedAt = s.clock.Now()
+	updated, err := s.repo.UpdateAPI(ctx, api)
+	if err != nil {
+		return APIView{}, mapRepoError(err, "api", "api route already exists in this environment")
+	}
+	s.record(ctx, actorID, "resource.api.confirmed", "api", platformid.Format(updated.ID), map[string]any{
+		"sut_id":         platformid.Format(updated.SUTID),
+		"environment_id": platformid.Format(updated.EnvironmentID),
+		"method":         updated.Method,
+		"path_template":  updated.PathTemplate,
+		"source":         updated.Source,
+	})
+	return toAPIView(updated), nil
+}
+
+// RejectAPI turns a proposed API into a rejected one.
+func (s *Service) RejectAPI(ctx context.Context, apiID, actorID int64) (APIView, error) {
+	api, err := s.repo.GetAPI(ctx, apiID)
+	if err != nil {
+		return APIView{}, mapRepoError(err, "api", "")
+	}
+	if api.Status != resource.APIStatusProposed {
+		return APIView{}, platform.Conflict("api is not proposed")
+	}
+	api.Status = resource.APIStatusRejected
+	api.UpdatedAt = s.clock.Now()
+	updated, err := s.repo.UpdateAPI(ctx, api)
+	if err != nil {
+		return APIView{}, mapRepoError(err, "api", "api route already exists in this environment")
+	}
+	s.record(ctx, actorID, "resource.api.rejected", "api", platformid.Format(updated.ID), map[string]any{
+		"sut_id":         platformid.Format(updated.SUTID),
+		"environment_id": platformid.Format(updated.EnvironmentID),
+		"method":         updated.Method,
+		"path_template":  updated.PathTemplate,
+		"source":         updated.Source,
+	})
+	return toAPIView(updated), nil
 }
 
 func importItemError(index int, err error) error {
