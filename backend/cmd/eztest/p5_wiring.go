@@ -164,7 +164,7 @@ func newP5Runtime(ctx context.Context, deps p5RuntimeDeps) *p5Runtime {
 	)
 
 	codeHandlers := &server.CodeIntelHandlers{
-		Index:     codeintelapi.New(indexSvc, querySvc, codeintelapi.WithAnalysis(analysisSvc)),
+		Index:     codeintelapi.New(indexSvc, querySvc, codeintelapi.WithAnalysis(analysisSvc), codeintelapi.WithImpact(impactSvc)),
 		Anchors:   codeintelapi.NewAnchorHandler(anchorSvc),
 		Reviews:   codeintelapi.NewReviewHandler(reviewSvc),
 		Impact:    codeintelapi.NewImpactHandler(impactSvc),

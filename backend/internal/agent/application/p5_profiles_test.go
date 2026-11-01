@@ -27,6 +27,9 @@ var p5ExpectedProfileTools = map[string][]string{
 	agentapp.ProfileKeyDesignPlanner: {
 		tools.ToolCodeImpact,
 	},
+	agentapp.ProfileKeyDesignHost: {
+		tools.ToolCodeFacts, tools.ToolCodeRoutes, tools.ToolCodeAPIs,
+	},
 	agentapp.ProfileKeyCaseExecutor: {
 		tools.ToolExecutionVisualAssert,
 	},

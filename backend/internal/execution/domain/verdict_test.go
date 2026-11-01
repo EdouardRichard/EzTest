@@ -405,6 +405,29 @@ func TestAggregateRejectsInvalidFinishStatus(t *testing.T) {
 	}
 }
 
+func TestVisualMissingBaselineBlockedStepIsInconclusive(t *testing.T) {
+	in := VerdictInput{
+		Case: visualCaseSnapshot(),
+		Steps: []StepResult{
+			{Seq: 1, Status: StepBlocked, Error: "missing_visual_baseline"},
+		},
+		Assertions: []AssertionResult{
+			passedAssertion(1, 1, "ui"),
+			visualAssertion(1, 2, AssertionInconclusive, "missing_visual_baseline"),
+		},
+	}
+	status, class, summary, err := Aggregate(in)
+	if err != nil {
+		t.Fatalf("Aggregate: %v", err)
+	}
+	if status != CaseRunInconclusive || class != "" || summary.VerdictReason != "missing_visual_baseline" {
+		t.Fatalf("got %s/%s reason=%q", status, class, summary.VerdictReason)
+	}
+	if summary.VisualInconclusive != 1 {
+		t.Fatalf("visual inconclusive = %d", summary.VisualInconclusive)
+	}
+}
+
 func TestAggregateFailedStepDoesNotUpgradeToApplication(t *testing.T) {
 	in := VerdictInput{
 		Case: caseSnapshotForVerdict(1),
