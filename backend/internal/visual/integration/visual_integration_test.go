@@ -110,3 +110,12 @@ func TestVisualRepositoriesPartialUniqueAndOverview(t *testing.T) {
 
 	var _ visualapp.DiffRepository = repo.Diffs
 }
+
+func TestGetByCaseAssertionReturnsNotFoundWithoutError(t *testing.T) {
+	pool := testutil.NewDB(t)
+	repo := visualpg.NewRepository(pool)
+	assertion, found, err := repo.Assertions.GetByCaseAssertion(context.Background(), 10, 999)
+	if err != nil || found || assertion.ID != 0 {
+		t.Fatalf("missing config = %+v found=%v err=%v", assertion, found, err)
+	}
+}

@@ -2,6 +2,7 @@ package visualpg
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	visual "github.com/EdouardRichard/EzTest/backend/internal/visual/domain"
@@ -94,10 +95,11 @@ func (r *AssertionRepository) GetByCaseAssertion(ctx context.Context, versionID,
 	`, versionID, caseAssertionID)
 	assertion, err := scanAssertion(row)
 	if err != nil {
-		if err == visual.ErrNotFound {
+		mapped := wrapDB("get assertion by case assertion", err)
+		if errors.Is(mapped, visual.ErrNotFound) {
 			return visual.Assertion{}, false, nil
 		}
-		return visual.Assertion{}, false, wrapDB("get assertion by case assertion", err)
+		return visual.Assertion{}, false, mapped
 	}
 	return assertion, true, nil
 }
