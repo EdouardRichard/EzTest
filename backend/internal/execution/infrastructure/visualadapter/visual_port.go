@@ -61,6 +61,29 @@ func (p *VisualPort) ActiveBaseline(ctx context.Context, assertionID int64) (exe
 	}, true, nil
 }
 
+// LatestBaselineConfigRevision returns the config revision of the most recent
+// baseline, including a superseded one, so a config change can be distinguished
+// from a never-configured assertion.
+func (p *VisualPort) LatestBaselineConfigRevision(ctx context.Context, versionID, assertionID int64) (int, bool, error) {
+	if p.Baselines == nil {
+		return 0, false, nil
+	}
+	list, err := p.Baselines.List(ctx, versionID, assertionID)
+	if err != nil {
+		return 0, false, err
+	}
+	if len(list) == 0 {
+		return 0, false, nil
+	}
+	latest := list[0]
+	for _, baseline := range list[1:] {
+		if baseline.ID > latest.ID {
+			latest = baseline
+		}
+	}
+	return latest.ConfigRevision, true, nil
+}
+
 // RecordDiff persists one comparison with the visual four-state classification.
 func (p *VisualPort) RecordDiff(ctx context.Context, in executionapp.VisualDiffInput) (executionapp.VisualDiffRecord, error) {
 	if p.Diffs == nil {

@@ -398,8 +398,13 @@ func networkRoute(baseURL string, request NetworkRequest) (string, string, bool)
 		return "", "", false
 	}
 	captured, err := url.Parse(strings.TrimSpace(request.URL))
-	if err != nil || captured.Host == "" {
+	if err != nil {
 		return "", "", false
+	}
+	if captured.Host == "" {
+		// The executor may persist a browser-relative request URL; resolve it
+		// against the version SUT base URL before host matching.
+		captured = base.ResolveReference(captured)
 	}
 	if !strings.EqualFold(captured.Host, base.Host) {
 		return "", "", false

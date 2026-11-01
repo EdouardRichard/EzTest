@@ -1,9 +1,6 @@
 package execution
 
-import (
-	"fmt"
-	"strings"
-)
+import "fmt"
 
 // Verdict reasons written to case_run.summary.verdict_reason. They are stable
 // strings: P4 and the UI display them.
@@ -97,26 +94,10 @@ func Aggregate(in VerdictInput) (CaseRunStatus, FailureClass, CaseRunSummary, er
 		summary.LastError = failedStep.Error
 	}
 
-	// Agent-level failures that are not a deterministic result.
-	switch in.AgentFailure {
-	case FailureClassBlocked:
-		summary.VerdictReason = VerdictReasonBlocked
-		return CaseRunBlocked, FailureClassBlocked, summary, nil
-	case FailureClassExecutorLost:
+	// Executor loss is infrastructure state, not a visual verdict.
+	if in.AgentFailure == FailureClassExecutorLost {
 		summary.VerdictReason = VerdictReasonAgentFailure
 		return CaseRunInterrupted, FailureClassExecutorLost, summary, nil
-	case "", FailureClassApplication:
-		// application needs assertion evidence; handled deterministically below.
-	default:
-		if in.AgentFailure.Valid() {
-			summary.VerdictReason = VerdictReasonAgentFailure
-			return CaseRunFailed, in.AgentFailure, summary, nil
-		}
-	}
-
-	if blockedStep != nil && !isVisualBlockedStep(blockedStep.Error) {
-		summary.VerdictReason = VerdictReasonBlocked
-		return CaseRunBlocked, FailureClassBlocked, summary, nil
 	}
 
 	// Assertion failures are the strongest evidence: only they may produce
@@ -131,14 +112,10 @@ func Aggregate(in VerdictInput) (CaseRunStatus, FailureClass, CaseRunSummary, er
 		return CaseRunFailed, class, summary, nil
 	}
 
-	if failedStep != nil {
-		summary.VerdictReason = VerdictReasonStepFailed
-		return CaseRunFailed, stepFailureClass(in.Finish), summary, nil
-	}
-
 	// P5 removes the P3 "visual skipped but case passed" shortcut: a visual
 	// assertion that never ran (or is inconclusive) makes the case inconclusive
-	// instead of silently green (spec §7.3).
+	// instead of silently green (spec §7.3). The visual result is authoritative
+	// over an agent/model "blocked" or step failure for the same visual reason.
 	if reason, environment, inconclusive := visualBlock(in.Case.Assertions, assertionResults); inconclusive {
 		summary.VerdictReason = reason
 		if environment {
@@ -147,12 +124,28 @@ func Aggregate(in VerdictInput) (CaseRunStatus, FailureClass, CaseRunSummary, er
 		return CaseRunInconclusive, "", summary, nil
 	}
 
-	// A visual-tagged blocked step whose visual result is not inconclusive still
-	// wins over a missing visual result; otherwise the visualBlock branch above
-	// already returned. This keeps genuine blocked prerequisites blocking.
+	// Agent-level failures that are not a deterministic result.
+	switch in.AgentFailure {
+	case FailureClassBlocked:
+		summary.VerdictReason = VerdictReasonBlocked
+		return CaseRunBlocked, FailureClassBlocked, summary, nil
+	case "", FailureClassApplication:
+		// application needs assertion evidence; handled deterministically below.
+	default:
+		if in.AgentFailure.Valid() {
+			summary.VerdictReason = VerdictReasonAgentFailure
+			return CaseRunFailed, in.AgentFailure, summary, nil
+		}
+	}
+
 	if blockedStep != nil {
 		summary.VerdictReason = VerdictReasonBlocked
 		return CaseRunBlocked, FailureClassBlocked, summary, nil
+	}
+
+	if failedStep != nil {
+		summary.VerdictReason = VerdictReasonStepFailed
+		return CaseRunFailed, stepFailureClass(in.Finish), summary, nil
 	}
 
 	// A blocked candidate with no executed result is a genuine pre-execution
@@ -315,15 +308,6 @@ func visualResultBlock(result AssertionResult, ok bool) (string, bool, bool) {
 		reason = VerdictReasonVisualAssertionNotRun
 	}
 	return reason, reason == "visual_environment_mismatch", true
-}
-
-// isVisualBlockedStep reports whether a blocked step's error is owned by the
-// visual assertion path. The Case Executor may mark the step blocked after
-// execution.visual_assert returns inconclusive; the visual result must drive
-// the case verdict (inconclusive), not the generic blocked fallback.
-func isVisualBlockedStep(message string) bool {
-	message = strings.TrimSpace(message)
-	return strings.HasPrefix(message, "missing_visual_baseline") || strings.HasPrefix(message, "visual_")
 }
 
 func hasObservedStep(steps []StepResult) bool {
