@@ -7,6 +7,7 @@ type SUTView struct {
 	ID           string
 	Name         string
 	Intro        string
+	Family       *string
 	Environments []EnvironmentView
 	CreatedAt    time.Time
 	UpdatedAt    time.Time

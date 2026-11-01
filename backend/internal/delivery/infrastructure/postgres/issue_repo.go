@@ -25,12 +25,18 @@ import (
 // INSERT ... RETURNING and UPDATE ... RETURNING of the adapter.
 const issueColumns = `id, version_id, title, summary, status, category, severity,
 	dedupe_key, fingerprint, source, expected_revision, merged_into_id, merged_at,
-	merged_by, reopen_count, created_by_run_id, created_at, updated_at`
+	merged_by, reopen_count, recurrence_count, last_recurred_at,
+	created_by_run_id, created_at, updated_at`
 
 const issueRefColumns = `id, issue_id, kind, ref_id, version_sut_id, role, created_at, updated_at`
 
 const issueHistoryColumns = `id, issue_id, from_status, to_status, reason, actor_id,
 	actor_kind, created_at, updated_at`
+
+// issueReasonRecurrence is the status-history reason of a recurrence redirect
+// (spec §4.6): the target status is unchanged (from=to), the row records the
+// redirect.
+const issueReasonRecurrence = "recurrence"
 
 const (
 	insertIssueSQL = `
@@ -73,15 +79,12 @@ type IssueRepository struct {
 
 var _ deliveryapp.IssueRepository = (*IssueRepository)(nil)
 
-// NewIssueRepository wraps a pgx pool. The adapter owns the snowflake source of
-// the rows it inserts (the candidate domain constructor leaves IDs unset); a
+// NewIssueRepository wires the adapter over a pgx pool and the process-wide
+// snowflake generator seeded with this replica's registry-allocated node. A
 // caller-supplied positive ID is preserved for deterministic replays.
-func NewIssueRepository(pool *pgxpool.Pool) *IssueRepository {
-	ids, err := platformid.NewSnowflake(0)
-	if err != nil {
-		// Node 0 is always valid; this only guards a future change of the
-		// platform generator contract.
-		panic(fmt.Sprintf("deliverypg: init snowflake generator: %v", err))
+func NewIssueRepository(pool *pgxpool.Pool, ids platformid.Generator) *IssueRepository {
+	if ids == nil {
+		panic("deliverypg: issue repository requires an id generator")
 	}
 	return &IssueRepository{pool: pool, ids: ids}
 }
@@ -91,6 +94,12 @@ func NewIssueRepository(pool *pgxpool.Pool) *IssueRepository {
 // with created=false; refs are still appended (ON CONFLICT DO NOTHING) so a
 // deduplicated failure from a new case_run/wave becomes resolvable by
 // FindByCaseRun. The creation history row is written exactly once.
+//
+// A dedupe hit whose stored issue is merged defers its refs to the application
+// recurrence redirect (spec §4.6): the source issue keeps its historical refs
+// and the target receives them with role='recurrence' (or the source receives
+// them through AppendRefs when the chain is broken). The caller therefore sees
+// created=false with a merged row and owns the next write.
 func (r *IssueRepository) CreateCandidate(ctx context.Context, issue delivery.Issue, refs []delivery.IssueRef) (delivery.Issue, bool, error) {
 	ctx = contextOrBackground(ctx)
 	tx, err := r.pool.Begin(ctx)
@@ -131,8 +140,10 @@ func (r *IssueRepository) CreateCandidate(ctx context.Context, issue delivery.Is
 		if err != nil {
 			return delivery.Issue{}, false, wrapDB("load deduplicated issue", err)
 		}
-		if err := r.insertRefs(ctx, tx, existing.ID, refs); err != nil {
-			return delivery.Issue{}, false, err
+		if existing.Status != delivery.IssueStatusMerged {
+			if err := r.insertRefs(ctx, tx, existing.ID, refs); err != nil {
+				return delivery.Issue{}, false, err
+			}
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return delivery.Issue{}, false, fmt.Errorf("create issue candidate: commit: %w", err)
@@ -414,6 +425,110 @@ func (r *IssueRepository) Merge(ctx context.Context, m deliveryapp.IssueMerge) (
 	return merged, nil
 }
 
+// ApplyRecurrence writes one recurrence redirection in one transaction
+// (spec §4.6): the target row is locked and must still be non-merged, its
+// recurrence_count is incremented and last_recurred_at stamped, the candidate
+// refs are appended with role='recurrence' (ON CONFLICT DO NOTHING), and one
+// history row records the unchanged target status with reason='recurrence' and
+// actor_kind='system'. The source issue is never written.
+func (r *IssueRepository) ApplyRecurrence(ctx context.Context, rec deliveryapp.IssueRecurrence) (delivery.Issue, error) {
+	ctx = contextOrBackground(ctx)
+	if rec.VersionID <= 0 || rec.TargetID <= 0 {
+		return delivery.Issue{}, delivery.ErrInvalidArgument
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return delivery.Issue{}, fmt.Errorf("apply issue recurrence: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var status string
+	err = tx.QueryRow(ctx, `
+		SELECT status
+		FROM delivery_issue
+		WHERE id = $1 AND version_id = $2
+		FOR UPDATE
+	`, rec.TargetID, rec.VersionID).Scan(&status)
+	if isNoRows(err) {
+		return delivery.Issue{}, ErrNotFound
+	}
+	if err != nil {
+		return delivery.Issue{}, wrapDB("apply issue recurrence: lock target", err)
+	}
+	targetStatus := delivery.IssueStatus(status)
+	if !targetStatus.Valid() || targetStatus == delivery.IssueStatusMerged {
+		// A concurrent merge turned the resolved target into a merged issue;
+		// the service falls back to the source behavior without losing refs.
+		return delivery.Issue{}, delivery.ErrStateConflict
+	}
+
+	now := nowUTC()
+	updated, err := scanIssue(tx.QueryRow(ctx, `
+		UPDATE delivery_issue
+		SET recurrence_count = recurrence_count + 1,
+			last_recurred_at = GREATEST(COALESCE(last_recurred_at, $2), $2),
+			updated_at = $2
+		WHERE id = $1 AND version_id = $3 AND status <> 'merged'
+		RETURNING `+issueColumns,
+		rec.TargetID, now, rec.VersionID,
+	))
+	if isNoRows(err) {
+		return delivery.Issue{}, delivery.ErrStateConflict
+	}
+	if err != nil {
+		return delivery.Issue{}, wrapDB("apply issue recurrence: update target", err)
+	}
+	if err := r.insertRefsWithRole(ctx, tx, rec.TargetID, rec.Refs, delivery.IssueRefRoleRecurrence); err != nil {
+		return delivery.Issue{}, err
+	}
+	from := targetStatus
+	if err := r.insertHistory(ctx, tx, delivery.IssueStatusChange{
+		ID:        r.ids.Next(),
+		IssueID:   rec.TargetID,
+		From:      &from,
+		To:        targetStatus,
+		Reason:    issueReasonRecurrence,
+		ActorKind: "system",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}); err != nil {
+		return delivery.Issue{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return delivery.Issue{}, fmt.Errorf("apply issue recurrence: commit: %w", err)
+	}
+	return updated, nil
+}
+
+// AppendRefs appends the logical refs of one issue idempotently. It is the
+// pre-P7 dedupe fallback used when a merged issue's recurrence chain cannot be
+// redirected: the candidate refs land on the source so no data is lost.
+func (r *IssueRepository) AppendRefs(ctx context.Context, issueID int64, refs []delivery.IssueRef) error {
+	ctx = contextOrBackground(ctx)
+	if issueID <= 0 {
+		return delivery.ErrInvalidArgument
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("append issue refs: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var exists int
+	if err := tx.QueryRow(ctx, `SELECT 1 FROM delivery_issue WHERE id = $1`, issueID).Scan(&exists); isNoRows(err) {
+		return ErrNotFound
+	} else if err != nil {
+		return wrapDB("append issue refs: check issue", err)
+	}
+	if err := r.insertRefs(ctx, tx, issueID, refs); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("append issue refs: commit: %w", err)
+	}
+	return nil
+}
+
 // AppendHistory appends one explicit status history row. History and refs are
 // append-only: updated_at is initialized once and never updated.
 func (r *IssueRepository) AppendHistory(ctx context.Context, h delivery.IssueStatusChange) error {
@@ -526,9 +641,19 @@ func (r *IssueRepository) insertID(explicit int64) int64 {
 // insertRefs supplements the logical refs of one issue. The unique
 // (issue_id, kind, ref_id, role) constraint makes the write idempotent.
 func (r *IssueRepository) insertRefs(ctx context.Context, exec execer, issueID int64, refs []delivery.IssueRef) error {
+	return r.insertRefsWithRole(ctx, exec, issueID, refs, "")
+}
+
+// insertRefsWithRole appends logical refs, optionally forcing one role (the
+// recurrence redirect always writes role='recurrence'). Without an override an
+// empty ref role defaults to role='source'.
+func (r *IssueRepository) insertRefsWithRole(ctx context.Context, exec execer, issueID int64, refs []delivery.IssueRef, overrideRole string) error {
 	now := nowUTC()
 	for _, ref := range refs {
 		role := ref.Role
+		if overrideRole != "" {
+			role = overrideRole
+		}
 		if role == "" {
 			role = delivery.IssueRefRoleSource
 		}
@@ -573,6 +698,7 @@ func scanIssue(row rowScanner) (delivery.Issue, error) {
 		&issue.Category, &issue.Severity, &issue.DedupeKey, &issue.Fingerprint,
 		&issue.Source, &issue.ExpectedRevision, &issue.MergedIntoID,
 		&issue.MergedAt, &issue.MergedBy, &issue.ReopenCount,
+		&issue.RecurrenceCount, &issue.LastRecurredAt,
 		&issue.CreatedByRunID, &issue.CreatedAt, &issue.UpdatedAt,
 	); err != nil {
 		return delivery.Issue{}, err

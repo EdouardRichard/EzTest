@@ -453,3 +453,53 @@ P5 事件一律发布到 `version:{version_id}` 频道（索引/分析/视觉）
 8. 事件发布失败不回滚业务写；P5 仍为单实例 Hub，多副本 fan-out 属 P7。
 9. P5 冻结后 P6+ 只能增量新增事件类型，不得重命名/回退本表类型与 payload 语义。
 
+## 16. P7 增量事件（frozen: P7，2026-11-01）
+
+> 来源：`docs/superpowers/specs/2026-11-01-eztest-v02-p7-p9-design.md` §7/§13。
+> P6 无事件增量；本节编号按设计规格 §13 固定为 §16。P7 新增 **12 个事件类型**、**11 个审计 action**（`orchestration.instance.drained`/`activated` 分开计）；P0–P6 的频道/信封/SSE/游标/心跳/`stream.reset` 语义不变，**不新增频道、不新增事件端点**，复用 `GET /api/events` 与 `GET /api/stream?channel=version:{id}`。
+> P7 新增跨实例 fan-out（`pg_notify` + 每实例 `LISTEN`）只改变投递路径，不改变事件 JSON/频道/游标语义；`Last-Event-ID` 回放与本地 Hub 订阅行为不变。
+
+### 16.1 事件类型（12 个）
+
+| type | 频道 | 触发 | payload 关键字段 |
+|---|---|---|---|
+| `report.pdf_ready` | `version:{id}` | PDF 写入内容账本且 revision 元数据更新为 `done` 后 | `report_id, report_revision_id, revision, pdf_ref, size_bytes` |
+| `report.pdf_failed` | `version:{id}` | PDF 尝试超限或不可重试，revision 置 `failed` 后 | `report_id, report_revision_id, revision, attempts, error` |
+| `knowledge.proposed` | `system` | 创建知识 draft（含 AI `knowledge.propose`） | `knowledge_id, scope, source_version_id?` |
+| `knowledge.approved` | `system` | admin approve（draft/revoked → approved） | `knowledge_id, scope, reviewer_id` |
+| `knowledge.rejected` | `system` | admin reject（draft → rejected） | `knowledge_id, reason` |
+| `knowledge.revoked` | `system` | admin revoke（approved → revoked） | `knowledge_id, reason` |
+| `gc.completed` | `system` | GC 运行结束（`completed` 或 `failed`） | `gc_run_id, mode, deleted_objects, deleted_bytes, run_status` |
+| `instance.registered` | `system` | 实例启动注册成功 | `instance_id, node_id, instance_key` |
+| `instance.drained` | `system` | 实例进入 draining | `instance_id, status` |
+| `instance.activated` | `system` | 实例取消 draining 回到 active | `instance_id, status` |
+| `instance.offline` | `system` | 心跳超时置 offline | `instance_id, status` |
+| `issue.recurred` | `version:{id}` | 复发候选命中 merged 源并完成重定向（或重定向失败） | `issue_id, source_issue_id, dedupe_key, recurrence_count, redirect_failed?` |
+
+### 16.2 审计 action（11 个）
+
+| action | 触发 | metadata 要点 |
+|---|---|---|
+| `delivery.report.pdf_rendered` | PDF 生成成功 | `target_kind=report_revision`、`target_id=report_revision_id`；metadata `report_id, revision, pdf_ref, size_bytes` |
+| `delivery.report.pdf_failed` | PDF 超限/不可重试失败 | `target_kind=report_revision`、`target_id=report_revision_id`；metadata `report_id, revision, attempts, error`（错误截断，不含路径/凭据） |
+| `knowledge.create` | 创建 draft（API 或 `knowledge.propose`） | `target_kind=knowledge_item`、`target_id=knowledge_id`；metadata `knowledge_id, scope, system_key?, source_version_id?, agent_run_id?, actor_id` |
+| `knowledge.edit` | 编辑 draft/rejected 并写新 revision | `target_kind=knowledge_item`、`target_id=knowledge_id`；metadata `knowledge_id, revision, changed_fields[], actor_id` |
+| `knowledge.approve` | approve | `knowledge_id, from_status, to_status, reviewer_id, actor_id` |
+| `knowledge.reject` | reject | `knowledge_id, from_status, to_status, reason, actor_id` |
+| `knowledge.revoke` | revoke | `knowledge_id, from_status, to_status, reason, actor_id` |
+| `storage.gc.completed` | GC 运行结束 | `target_kind=gc_run`、`target_id=gc_run_id`；metadata `mode, status, scanned_objects, scanned_refs, deleted_objects, deleted_refs, deleted_bytes, tombstones` |
+| `orchestration.instance.drained` / `orchestration.instance.activated` | admin drain/activate | `target_kind=api_instance`、`target_id=instance_id`；metadata `instance_id, from_status, to_status`；`actor_id` 在审计信封 |
+| `delivery.issue.recurred` | 复发重定向（含失败） | `target_kind=issue`、`target_id=目标 issue_id`；metadata `issue_id(目标), source_issue_id, dedupe_key, recurrence_count, redirect_failed?` |
+
+### 16.3 约束
+
+1. `report.*` 事件只发 `version:{id}`；payload 的 `pdf_ref` 是内容账本 ref 的十进制 ID，**不含** PDF 字节、HTML 正文、内部路径、renderer token。
+2. `knowledge.*` 事件只发 `system`；payload 只带 ID/scope/reason/审核人，**不含** title/content/tags 正文；`knowledge.proposed` 的 `source_version_id` 可空（非版本晋升时省略）。
+3. `gc.completed` 只发 `system`；counts 为本次 run 的确定性统计，`report` JSONB 明细不随事件下发；`run_status=failed` 也发布（便于运维观察）。
+4. `instance.*` 只发 `system`；只带实例 ID/状态摘要，不含 hostname/pid/node 之外的内部信息（`instance.registered` 含 `node_id`/`instance_key`）；`draining/activated/offline` 每次状态迁移发一次，重复扫描不重复发。
+5. `issue.recurred` 只发 `version:{id}`，`issue_id` 是**目标 issue**、`source_issue_id` 是命中的 merged 源；链断裂/成环时 `redirect_failed=true` 且事件仍发布；不回写源 issue 的 refs，不重开源 issue。
+6. P7 不为 PDF `running/pending/disabled`、GC `running`、knowledge 读取注入发事件；这些状态由视图/轮询呈现。
+7. 事件发布失败不回滚业务写；DB 为真值。**事件表主键是 `(channel, seq)`，没有全局 event id**。P7 跨实例投递在事件 append 提交后 best-effort 调用 `pg_notify('eztest_events', payload)`，payload 为 JSON `{"channel":"version:42","seq":17}`（`eventing.EncodeEventRef`）；每实例一个专用 `LISTEN` 连接，收到引用后按 `(channel, seq)` 从 `event` 表读取并投递本地 Hub。重复 NOTIFY 由每实例有界去重缓存（key = `(channel, seq)`）吸收；NOTIFY 丢失由 SSE `Last-Event-ID` 重连回放兜底。NOTIFY 在 append 事务提交后发出（不在同一事务内），丢失/重复都不改变持久化真值。
+8. 审计只追加；metadata 不含 secret/token/知识正文/PDF 字节/内部路径；`knowledge.reject/revoke` 的 reason 可入审计（≤2000），事件同样带 reason。
+9. 事件类型冻结后只能新增，不得重命名/回退；P0–P6 payload 语义不变。
+

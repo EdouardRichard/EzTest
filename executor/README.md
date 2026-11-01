@@ -25,10 +25,26 @@ hint; it never starts the executor.
 | Variable | Default | Meaning |
 |---|---|---|
 | `EZTEST_EXECUTOR_ADDR` | `127.0.0.1:13336` | listen address; the container overrides it to `0.0.0.0:13336` |
-| `EZTEST_EXECUTOR_TOKEN` | required | bearer token for every `/v1` endpoint |
+| `EZTEST_EXECUTOR_TOKEN` | required | bearer token for every `/v1` endpoint; also the push Bearer |
 | `EZTEST_EXECUTOR_MAX_CONTEXTS` | `8` | concurrent browser contexts |
 | `EZTEST_EXECUTOR_CHROMIUM_PATH` | unset | optional explicit Chromium binary (local dev only) |
 | `EZTEST_EXECUTOR_ALLOW_DATA_PAGES` | unset | `1` allows `data:text/html` pages for self-tests only |
+| `EZTEST_API_URL` | unset | optional EzTest API base URL; enables push registration/heartbeat. Empty disables push (P3 pull-only) |
+| `EZTEST_EXECUTOR_HEARTBEAT_SECONDS` | `10` | push heartbeat interval, 1-60 |
+| `EZTEST_EXECUTOR_NAME` | `hostname:port` | executor name sent by the push register |
+
+## Optional push registration (P7)
+
+P3 pull healthz remains the primary registration path. When `EZTEST_API_URL` is
+set (for example `http://127.0.0.1:13333`), the executor sends
+`POST /api/internal/executors/register` once at startup and then
+`POST /api/internal/executors/heartbeat` every
+`EZTEST_EXECUTOR_HEARTBEAT_SECONDS` using `Authorization: Bearer
+$EZTEST_EXECUTOR_TOKEN`. Responses other than 2xx are logged and retried with
+exponential backoff; push failures never block or crash case execution and the
+token is never logged. The API endpoint is `/api/internal/executors/*`; the
+executor also advertises the absolute endpoint derived from
+`EZTEST_EXECUTOR_ADDR` (wildcard binds advertise `127.0.0.1`).
 
 If the pinned Playwright revision is not installed, the service falls back to the
 newest `chromium-*` already present in the local Playwright browser cache

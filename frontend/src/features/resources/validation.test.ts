@@ -55,6 +55,24 @@ describe("validateSutForm", () => {
       "简介不能超过 2000 个字符",
     )
   })
+
+  it("accepts an optional lowercase family slug", () => {
+    expect(validateSutForm({ ...validSut, family: "payments" })).toEqual({})
+    expect(validateSutForm({ ...validSut, family: "order-center_v2" })).toEqual({})
+    expect(validateSutForm({ ...validSut, family: "  " })).toEqual({})
+  })
+
+  it("rejects an uppercase family", () => {
+    expect(validateSutForm({ ...validSut, family: "Payments" }).family).toBe(
+      "系统族必须为小写 slug（a-z、0-9、-、_）",
+    )
+  })
+
+  it("rejects a family longer than 64 characters", () => {
+    expect(validateSutForm({ ...validSut, family: "a".repeat(65) }).family).toBe(
+      "系统族不能超过 64 个字符",
+    )
+  })
 })
 
 describe("validateEnvironmentForm", () => {

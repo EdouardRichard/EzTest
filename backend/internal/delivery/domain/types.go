@@ -71,6 +71,30 @@ func (s ReportStatus) Valid() bool {
 	}
 }
 
+// PDFStatus is the P7 PDF render state of one report revision (spec §5 #36).
+// HTML is authoritative: PDF is rendered asynchronously and never blocks
+// publishing. done/failed/disabled are terminal for the automatic pipeline.
+type PDFStatus string
+
+// PDF render states.
+const (
+	PDFStatusPending  PDFStatus = "pending"
+	PDFStatusRunning  PDFStatus = "running"
+	PDFStatusDone     PDFStatus = "done"
+	PDFStatusFailed   PDFStatus = "failed"
+	PDFStatusDisabled PDFStatus = "disabled"
+)
+
+// Valid reports whether status is a persisted pdf_status value.
+func (s PDFStatus) Valid() bool {
+	switch s {
+	case PDFStatusPending, PDFStatusRunning, PDFStatusDone, PDFStatusFailed, PDFStatusDisabled:
+		return true
+	default:
+		return false
+	}
+}
+
 // AnalysisStatus is the delivery analysis_run lifecycle state (spec §3.4).
 type AnalysisStatus string
 
@@ -111,9 +135,14 @@ type Issue struct {
 	MergedAt         *time.Time
 	MergedBy         *int64
 	ReopenCount      int
-	CreatedByRunID   *int64
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
+	// RecurrenceCount counts the failures redirect to a merge target (spec
+	// §4.6); LastRecurredAt is the latest redirect time. Neither changes the
+	// source issue's refs or history.
+	RecurrenceCount int
+	LastRecurredAt  *time.Time
+	CreatedByRunID  *int64
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 // IssueRef is one append-only logical reference of an issue (spec §3.2). Kind
@@ -158,7 +187,9 @@ type Report struct {
 }
 
 // ReportRevision is one append-only report content revision (spec §3.3). HTMLRef
-// and PDFRef point at content_ref IDs; PDF is not written in P4.
+// and PDFRef point at content_ref IDs. After publish only the PDF metadata
+// (PDFStatus/PDFError/PDFAttempts/PDFRenderedAt) may change; as_of/html_ref/
+// input_fingerprint/template_version are immutable (spec §5 #36).
 type ReportRevision struct {
 	ID               int64
 	ReportID         int64
@@ -170,9 +201,24 @@ type ReportRevision struct {
 	AsOf             time.Time
 	TemplateVersion  string
 	RenderStatus     string
+	PDFStatus        PDFStatus
+	PDFError         string
+	PDFAttempts      int32
+	PDFRenderedAt    *time.Time
 	CreatedByRunID   *int64
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
+}
+
+// RenderableRevision is one published revision whose PDF is still pending or
+// failed, as scanned by the P7 reconciler before ensuring a render job.
+type RenderableRevision struct {
+	RevisionID  int64
+	ReportID    int64
+	VersionID   int64
+	Revision    int32
+	PDFStatus   PDFStatus
+	PDFAttempts int32
 }
 
 // ReportRef is one append-only logical reference of a report revision (spec

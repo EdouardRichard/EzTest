@@ -172,6 +172,26 @@ describe("resources API", () => {
     expect(readBody(updateInit)).toEqual({ name: "订单中心 v2", intro: "新简介" })
   })
 
+  it("includes the optional SUT family in create and update bodies", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ data: sutListItemFixture }, 201))
+      .mockResolvedValueOnce(jsonResponse({ data: sutFixture }))
+
+    await createSut({ name: "订单中心", intro: "订单主链路", family: "payments" })
+    await updateSut("1001", { name: "订单中心", intro: "订单主链路", family: "order-center" })
+
+    expect(readBody(fetchMock.mock.calls[0][1])).toEqual({
+      name: "订单中心",
+      intro: "订单主链路",
+      family: "payments",
+    })
+    expect(readBody(fetchMock.mock.calls[1][1])).toEqual({
+      name: "订单中心",
+      intro: "订单主链路",
+      family: "order-center",
+    })
+  })
+
   it("deletes a SUT with DELETE", async () => {
     fetchMock.mockResolvedValue(new Response(null, { status: 204 }))
 

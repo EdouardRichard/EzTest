@@ -447,6 +447,7 @@ export function GlobalReportsPage() {
               void openReportHTML()
             }}
             opening={opening}
+            downloadingPDF={false}
             regenerating={false}
             actionError={actionError}
             notice={null}

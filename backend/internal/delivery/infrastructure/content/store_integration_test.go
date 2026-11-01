@@ -134,6 +134,30 @@ func contentFixturePublishRevision(t *testing.T, fixture *contentFixture, revisi
 	}
 }
 
+// contentFixturePublishPDFRevision inserts the published revision that owns a
+// stored PDF through pdf_ref (P7). html_ref is deliberately absent: the report
+// HTML lives elsewhere and the PDF read path must validate pdf_ref ownership.
+func contentFixturePublishPDFRevision(t *testing.T, fixture *contentFixture, revisionID, pdfRefID int64) {
+	t.Helper()
+	ctx := context.Background()
+	reportID := revisionID + 1
+	if _, err := fixture.pool.Exec(ctx, `
+		INSERT INTO delivery_report (id, version_id, kind, status)
+		VALUES ($1, 1, 'version', 'published')
+	`, reportID); err != nil {
+		t.Fatalf("insert report: %v", err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `
+		INSERT INTO delivery_report_revision (
+			id, report_id, revision, status, html_ref, pdf_ref, input_fingerprint,
+			as_of, render_status, pdf_status
+		)
+		VALUES ($1, $2, 1, 'published', NULL, $3, repeat('a', 64), now(), 'done', 'done')
+	`, revisionID, reportID, pdfRefID); err != nil {
+		t.Fatalf("insert report PDF revision: %v", err)
+	}
+}
+
 // TestContentOpenReportHTMLValidatesOwnershipAndBytes covers the read contract:
 // owner/role/sha are re-validated and every mismatch fails closed.
 func TestContentOpenReportHTMLValidatesOwnershipAndBytes(t *testing.T) {
@@ -229,5 +253,249 @@ func TestContentPutReportHTMLValidatesInput(t *testing.T) {
 	// A ledger lookup error is classified as not found, never as success.
 	if _, _, _, err := fixture.store.OpenReportHTML(ctx, 0); err == nil {
 		t.Fatal("zero ref ID must be rejected")
+	}
+}
+
+/* ----------------------------- P7 report PDF ------------------------------ */
+
+var sampleReportPDF = []byte("%PDF-1.7\n" + "renderer bytes\n")
+
+// TestContentPutReportPDFWritesLedger covers the P7 PDF write contract:
+// owner_kind=report_revision, owner_id=revision.id, role=report_pdf, MIME
+// application/pdf and the returned ref/sha/size.
+func TestContentPutReportPDFWritesLedger(t *testing.T) {
+	fixture := newContentFixture(t)
+	ctx := context.Background()
+
+	ref, err := fixture.store.PutReportPDF(ctx, 9101, sampleReportPDF)
+	if err != nil {
+		t.Fatalf("PutReportPDF: %v", err)
+	}
+	if ref.RefID <= 0 || ref.SHA256 != contentSHA(sampleReportPDF) || ref.Size != int64(len(sampleReportPDF)) {
+		t.Fatalf("PutReportPDF = %+v", ref)
+	}
+
+	var (
+		storedSHA, mime, ownerKind, role string
+		storedSize, ownerID              int64
+	)
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT o.sha256, o.size, o.mime, r.owner_kind, r.owner_id, r.role
+		FROM content_ref r
+		JOIN content_object o ON o.sha256 = r.object_id
+		WHERE r.id = $1
+	`, ref.RefID).Scan(&storedSHA, &storedSize, &mime, &ownerKind, &ownerID, &role); err != nil {
+		t.Fatalf("read PDF content ledger: %v", err)
+	}
+	if storedSHA != ref.SHA256 || storedSize != ref.Size {
+		t.Fatalf("ledger object = %s/%d, want %s/%d", storedSHA, storedSize, ref.SHA256, ref.Size)
+	}
+	if mime != "application/pdf" {
+		t.Fatalf("mime = %q, want application/pdf", mime)
+	}
+	if ownerKind != "report_revision" || ownerID != 9101 || role != "report_pdf" {
+		t.Fatalf("content_ref = owner_kind:%s owner_id:%d role:%s", ownerKind, ownerID, role)
+	}
+}
+
+// TestContentOpenReportPDFValidatesOwnershipAndBytes covers the P7 PDF read
+// contract: pdf_ref ownership/role/sha/size are re-validated and every mismatch
+// fails closed.
+func TestContentOpenReportPDFValidatesOwnershipAndBytes(t *testing.T) {
+	fixture := newContentFixture(t)
+	ctx := context.Background()
+	ref, err := fixture.store.PutReportPDF(ctx, 9102, sampleReportPDF)
+	if err != nil {
+		t.Fatalf("PutReportPDF: %v", err)
+	}
+	contentFixturePublishPDFRevision(t, fixture, 9102, ref.RefID)
+
+	opened, openedSHA, openedSize, err := fixture.store.OpenReportPDF(ctx, ref.RefID)
+	if err != nil {
+		t.Fatalf("OpenReportPDF: %v", err)
+	}
+	if !bytes.Equal(opened, sampleReportPDF) || openedSHA != ref.SHA256 || openedSize != ref.Size {
+		t.Fatalf("OpenReportPDF = %q/%s/%d", opened, openedSHA, openedSize)
+	}
+	if _, _, _, err := fixture.store.OpenReportPDF(ctx, 999999); !errors.Is(err, deliveryapp.ErrReportContentNotFound) {
+		t.Fatalf("missing ref error = %v, want ErrReportContentNotFound", err)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		query string
+		arg   any
+	}{
+		{"owner kind", `UPDATE content_ref SET owner_kind = 'evidence' WHERE id = $1`, ref.RefID},
+		{"owner id", `UPDATE content_ref SET owner_id = 7777 WHERE id = $1`, ref.RefID},
+		{"role", `UPDATE content_ref SET role = 'report_html' WHERE id = $1`, ref.RefID},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := fixture.pool.Exec(ctx, `
+				UPDATE content_ref
+				SET owner_kind = 'report_revision', owner_id = 9102, role = 'report_pdf'
+				WHERE id = $1
+			`, ref.RefID); err != nil {
+				t.Fatalf("reset ref: %v", err)
+			}
+			if _, err := fixture.pool.Exec(ctx, tc.query, tc.arg); err != nil {
+				t.Fatalf("tamper ref: %v", err)
+			}
+			if _, _, _, err := fixture.store.OpenReportPDF(ctx, ref.RefID); !errors.Is(err, deliveryapp.ErrReportContentCorrupt) {
+				t.Fatalf("OpenReportPDF error = %v, want ErrReportContentCorrupt", err)
+			}
+		})
+	}
+
+	// The HTML reader must reject a PDF ref (role mismatch) and vice versa.
+	if _, err := fixture.pool.Exec(ctx, `
+		UPDATE content_ref SET role = 'report_pdf' WHERE id = $1
+	`, ref.RefID); err != nil {
+		t.Fatalf("restore PDF ref: %v", err)
+	}
+	if _, _, _, err := fixture.store.OpenReportHTML(ctx, ref.RefID); !errors.Is(err, deliveryapp.ErrReportContentCorrupt) {
+		t.Fatalf("OpenReportHTML on PDF ref error = %v, want ErrReportContentCorrupt", err)
+	}
+
+	// Corrupted stored bytes are detected by the storage service.
+	var relativePath string
+	if err := fixture.pool.QueryRow(ctx, `SELECT relative_path FROM content_object WHERE sha256 = $1`, ref.SHA256).Scan(&relativePath); err != nil {
+		t.Fatalf("read relative path: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(fixture.root, filepath.FromSlash(relativePath)), []byte("tampered pdf bytes"), 0o600); err != nil {
+		t.Fatalf("tamper PDF file: %v", err)
+	}
+	if _, _, _, err := fixture.store.OpenReportPDF(ctx, ref.RefID); !errors.Is(err, deliveryapp.ErrReportContentCorrupt) {
+		t.Fatalf("tampered PDF error = %v, want ErrReportContentCorrupt", err)
+	}
+}
+
+func TestContentPutReportPDFValidatesInput(t *testing.T) {
+	fixture := newContentFixture(t)
+	ctx := context.Background()
+	if _, err := fixture.store.PutReportPDF(ctx, 0, sampleReportPDF); err == nil {
+		t.Fatal("zero revision ID must be rejected")
+	}
+	if _, err := fixture.store.PutReportPDF(ctx, 9103, nil); err == nil {
+		t.Fatal("empty PDF must be rejected")
+	}
+	var count int
+	if err := fixture.pool.QueryRow(ctx, `SELECT count(*) FROM content_ref`).Scan(&count); err != nil {
+		t.Fatalf("count refs: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("invalid PutReportPDF wrote %d refs", count)
+	}
+}
+
+// TestContentPutReportPDFIsIdempotentPerRevision pins the P7 duplicate-ref fix:
+// a re-render (e.g. after a lease takeover) replaces the revision's existing
+// report_pdf ref instead of appending a second live one, and an identical
+// re-put reuses the same row.
+func TestContentPutReportPDFIsIdempotentPerRevision(t *testing.T) {
+	fixture := newContentFixture(t)
+	ctx := context.Background()
+
+	first, err := fixture.store.PutReportPDF(ctx, 9105, sampleReportPDF)
+	if err != nil {
+		t.Fatalf("first PutReportPDF: %v", err)
+	}
+	secondBytes := append(append([]byte(nil), sampleReportPDF...), []byte("v2\n")...)
+	second, err := fixture.store.PutReportPDF(ctx, 9105, secondBytes)
+	if err != nil {
+		t.Fatalf("second PutReportPDF: %v", err)
+	}
+	if second.SHA256 != contentSHA(secondBytes) {
+		t.Fatalf("second ref sha = %q, want %q", second.SHA256, contentSHA(secondBytes))
+	}
+
+	var liveRefs int
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT count(*) FROM content_ref
+		WHERE owner_kind = 'report_revision' AND owner_id = 9105
+		  AND role = 'report_pdf' AND deleted_at IS NULL
+	`).Scan(&liveRefs); err != nil {
+		t.Fatalf("count live PDF refs: %v", err)
+	}
+	if liveRefs != 1 {
+		t.Fatalf("live report_pdf refs = %d, want exactly 1", liveRefs)
+	}
+	var liveRefID int64
+	var liveObjectID string
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT id, object_id FROM content_ref
+		WHERE owner_kind = 'report_revision' AND owner_id = 9105
+		  AND role = 'report_pdf' AND deleted_at IS NULL
+	`).Scan(&liveRefID, &liveObjectID); err != nil {
+		t.Fatalf("read live PDF ref: %v", err)
+	}
+	if liveRefID != second.RefID || liveObjectID != second.SHA256 {
+		t.Fatalf("live ref = %d/%s, want the replaced ref %d/%s",
+			liveRefID, liveObjectID, second.RefID, second.SHA256)
+	}
+	// The existing row is reused in place (no second content_ref row at all),
+	// so historical ledger consumers and GC see exactly one report_pdf ref.
+	if second.RefID != first.RefID {
+		t.Fatalf("replacement ref = %d, want the reused row %d", second.RefID, first.RefID)
+	}
+	var totalRefs int
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT count(*) FROM content_ref
+		WHERE owner_kind = 'report_revision' AND owner_id = 9105 AND role = 'report_pdf'
+	`).Scan(&totalRefs); err != nil {
+		t.Fatalf("count PDF ref rows: %v", err)
+	}
+	if totalRefs != 1 {
+		t.Fatalf("report_pdf rows = %d, want exactly 1 (no duplicate inserted)", totalRefs)
+	}
+
+	// Re-putting identical bytes reuses the live row (no churn).
+	third, err := fixture.store.PutReportPDF(ctx, 9105, secondBytes)
+	if err != nil {
+		t.Fatalf("third PutReportPDF: %v", err)
+	}
+	if third.RefID != second.RefID {
+		t.Fatalf("identical re-put ref = %d, want reused %d", third.RefID, second.RefID)
+	}
+	if err := fixture.pool.QueryRow(ctx, `
+		SELECT count(*) FROM content_ref
+		WHERE owner_kind = 'report_revision' AND owner_id = 9105
+		  AND role = 'report_pdf' AND deleted_at IS NULL
+	`).Scan(&liveRefs); err != nil {
+		t.Fatalf("count live PDF refs after identical re-put: %v", err)
+	}
+	if liveRefs != 1 {
+		t.Fatalf("live report_pdf refs after identical re-put = %d, want 1", liveRefs)
+	}
+
+	// The replacement is the readable PDF.
+	contentFixturePublishPDFRevision(t, fixture, 9105, second.RefID)
+	opened, openedSHA, openedSize, err := fixture.store.OpenReportPDF(ctx, second.RefID)
+	if err != nil {
+		t.Fatalf("OpenReportPDF: %v", err)
+	}
+	if !bytes.Equal(opened, secondBytes) || openedSHA != second.SHA256 || openedSize != second.Size {
+		t.Fatalf("OpenReportPDF = %q/%s/%d", opened, openedSHA, openedSize)
+	}
+}
+
+// TestContentGetReportHTML covers the worker's frozen-HTML read helper.
+func TestContentGetReportHTML(t *testing.T) {
+	fixture := newContentFixture(t)
+	ctx := context.Background()
+	refID, _, _, err := fixture.store.PutReportHTML(ctx, 9104, sampleReportHTML)
+	if err != nil {
+		t.Fatalf("PutReportHTML: %v", err)
+	}
+	contentFixturePublishRevision(t, fixture, 9104, refID)
+	html, err := fixture.store.GetReportHTML(ctx, refID)
+	if err != nil {
+		t.Fatalf("GetReportHTML: %v", err)
+	}
+	if !bytes.Equal(html, sampleReportHTML) {
+		t.Fatalf("GetReportHTML = %q", html)
+	}
+	if _, err := fixture.store.GetReportHTML(ctx, 999999); !errors.Is(err, deliveryapp.ErrReportContentNotFound) {
+		t.Fatalf("missing GetReportHTML error = %v, want ErrReportContentNotFound", err)
 	}
 }

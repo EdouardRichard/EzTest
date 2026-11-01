@@ -475,9 +475,14 @@ ResolveHumanRequestRequest
   for (const field of ["html_available", "pdf_available", "as_of", "input_fingerprint", "template_version", "render_status"]) {
     check(Boolean(revision?.properties?.[field]), `ReportRevisionView.${field} missing`)
   }
+  const pdfAvailable = revision?.properties?.pdf_available
   check(
-    revision?.properties?.pdf_available?.enum?.[0] === false,
-    "ReportRevisionView.pdf_available must be const false in P4",
+    pdfAvailable?.type === "boolean" &&
+      (pdfAvailable.enum === undefined ||
+        (Array.isArray(pdfAvailable.enum) &&
+          pdfAvailable.enum.length === 1 &&
+          pdfAvailable.enum[0] === false)),
+    "ReportRevisionView.pdf_available must stay boolean (P4 const false; P7 widens to true/false)",
   )
   const chain = openapi.components?.schemas?.ChainView
   for (const field of ["snapshot_cursor", "filters", "counts", "nodes", "edges", "truncated", "truncation", "replay"]) {

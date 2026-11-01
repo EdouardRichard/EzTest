@@ -1,0 +1,14 @@
+﻿# EzTest P7 API/DB acceptance scenarios (2026-11-02T01:13:34.7129097+08:00)
+S0 | PASS | 0s | checks=6 failures=0
+S1 | PASS | 7s | checks=13 failures=0
+S3 | PASS | 20s | checks=12 failures=0
+S4 | PASS | 7s | checks=12 failures=0
+S5 | PASS | 5s | checks=11 failures=0
+S6 | PASS | 0s | checks=15 failures=0
+S7 | PASS | 1s | checks=25 failures=0
+S2 | PASS | 31s | checks=10 failures=0
+S8 | PASS | 7s | checks=4 failures=0
+S9 | PASS | 2s | checks=12 failures=0
+S10 | PASS | 5s | checks=10 failures=0
+S11 | PASS | 5s | checks=14 failures=0
+S12 | PASS | 27s | checks=12 failures=0

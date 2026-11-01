@@ -153,7 +153,9 @@ func (h *Handler) CreateSUT(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
-	view, err := h.svc.CreateSUT(r.Context(), resourceapp.SUTInput{Name: body.Name, Intro: body.Intro}, actor)
+	view, err := h.svc.CreateSUT(r.Context(), resourceapp.SUTInput{
+		Name: body.Name, Intro: body.Intro, Family: body.Family,
+	}, actor)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return
@@ -217,7 +219,9 @@ func (h *Handler) UpdateSUT(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
-	view, err := h.svc.UpdateSUT(r.Context(), id, resourceapp.SUTPatch{Name: body.Name, Intro: body.Intro}, actor)
+	view, err := h.svc.UpdateSUT(r.Context(), id, resourceapp.SUTPatch{
+		Name: body.Name, Intro: body.Intro, Family: body.Family,
+	}, actor)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return

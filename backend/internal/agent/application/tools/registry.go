@@ -256,6 +256,9 @@ type Deps struct {
 	// leaves it zero; the P5 tools then fail as an internal configuration
 	// error. It is nested so the frozen P1–P4 Deps fields stay unchanged.
 	P5 P5Deps
+	// P7 is the additive P7 knowledge tool surface. It is nested so the frozen
+	// P1–P6 Deps fields stay unchanged; a zero value disables the P7 tools.
+	P7 P7Deps
 }
 
 // RequirementSummary is one requirement row shown to the model.

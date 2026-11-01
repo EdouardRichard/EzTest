@@ -21,6 +21,13 @@ type DesignReconciler interface {
 	Reconcile(ctx context.Context) error
 }
 
+// P7Ensurer is the P7 control-plane surface (report PDF backfill and other
+// P7 ensure rules) run by the reconciler after the P4 rules. It must be
+// idempotent: repeated scans never add duplicate work items.
+type P7Ensurer interface {
+	ReconcileP7(ctx context.Context) error
+}
+
 // ReconcilerDeps wires the P1+P2+P4 reconciler. It only ensures work items and
 // never executes business actions.
 type ReconcilerDeps struct {
@@ -35,9 +42,12 @@ type ReconcilerDeps struct {
 	// RunningVersions lists the running versions the P4 rules reconcile. Nil
 	// keeps the P4 rules disabled.
 	RunningVersions P4VersionLister
-	Events          eventingapp.Publisher
-	Clock           clock.Clock
-	Logger          *slog.Logger
+	// P7 is the P7 ensure surface (report PDF backfill). Nil keeps the P7
+	// rules disabled for P1-P6 wiring and earlier-rule unit tests.
+	P7     P7Ensurer
+	Events eventingapp.Publisher
+	Clock  clock.Clock
+	Logger *slog.Logger
 }
 
 // Reconciler periodically repairs the control plane: version projection,
@@ -52,6 +62,7 @@ type Reconciler struct {
 	queue           WorkQueueEnsurer
 	p4              P4Ensurer
 	runningVersions P4VersionLister
+	p7              P7Ensurer
 	events          eventingapp.Publisher
 	clock           clock.Clock
 	logger          *slog.Logger
@@ -72,6 +83,7 @@ func NewReconciler(deps ReconcilerDeps) *Reconciler {
 		queue:           deps.Queue,
 		p4:              deps.P4,
 		runningVersions: deps.RunningVersions,
+		p7:              deps.P7,
 		events:          deps.Events,
 		clock:           deps.Clock,
 		logger:          logger,
@@ -98,12 +110,30 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	if err := r.reconcileDesign(ctx); err != nil {
 		errs = append(errs, err)
 	}
-	// P4 runs last: its failures are aggregated, never hiding or skipping the
-	// P1-P3 rules above.
+	// P4 runs last among the pre-P7 rules: its failures are aggregated, never
+	// hiding or skipping the P1-P3 rules above.
 	if err := r.reconcileP4(ctx); err != nil {
 		errs = append(errs, err)
 	}
+	// P7 runs after P4: report PDF backfill depends on the P4 report rules and
+	// must never hide a P4 failure. Nil keeps the hook disabled.
+	if err := r.reconcileP7(ctx); err != nil {
+		errs = append(errs, err)
+	}
 	return errors.Join(errs...)
+}
+
+// reconcileP7 runs the P7 ensure surface (report PDF backfill). It is optional
+// so P1-P6 wiring keeps starting, and its error is aggregated with every other
+// rule by Reconcile.
+func (r *Reconciler) reconcileP7(ctx context.Context) error {
+	if r.p7 == nil {
+		return nil
+	}
+	if err := r.p7.ReconcileP7(ctx); err != nil {
+		return fmt.Errorf("p7 reconcile: %w", err)
+	}
+	return nil
 }
 
 // reconcileDesign runs the design Planner scan (auto-design, pending scopes,

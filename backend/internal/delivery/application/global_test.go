@@ -118,6 +118,50 @@ func globalTitles() *fakeVersionTitles {
 
 /* --------------------------------- issues --------------------------------- */
 
+func TestListGlobalIssuesProjectsMergedChain(t *testing.T) {
+	merged := globalIssue(103, 42)
+	merged.Status = delivery.IssueStatusMerged
+	merged.MergedIntoID = issueServiceTestInt64(104)
+	repo := &fakeIssueRepository{
+		getIssues: map[int64]delivery.Issue{
+			103: merged,
+			104: {ID: 104, VersionID: 42, Status: delivery.IssueStatusOpen},
+		},
+		getErrByID: map[int64]error{},
+	}
+	service := NewIssueService(repo, nil, nil, nil, nil, nil).
+		WithGlobalReader(&fakeGlobalIssueReader{result: []delivery.Issue{merged}}, globalTitles())
+
+	views, _, err := service.ListGlobal(context.Background(), GlobalIssueFilter{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListGlobal() error = %v", err)
+	}
+	if len(views) != 1 {
+		t.Fatalf("views = %d, want 1", len(views))
+	}
+	if chain := views[0].MergedChain; len(chain) != 1 || chain[0] != 104 {
+		t.Fatalf("MergedChain = %v, want [104]", chain)
+	}
+}
+
+func TestListGlobalIssuesWithoutRepositorySkipsMergedChain(t *testing.T) {
+	// Older wirings may resolve global rows without an IssueRepository; the
+	// optional chain simply stays absent instead of failing the page.
+	merged := globalIssue(103, 42)
+	merged.Status = delivery.IssueStatusMerged
+	merged.MergedIntoID = issueServiceTestInt64(104)
+	service := NewIssueService(nil, nil, nil, nil, nil, nil).
+		WithGlobalReader(&fakeGlobalIssueReader{result: []delivery.Issue{merged}}, globalTitles())
+
+	views, _, err := service.ListGlobal(context.Background(), GlobalIssueFilter{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListGlobal() error = %v", err)
+	}
+	if len(views) != 1 || len(views[0].MergedChain) != 0 {
+		t.Fatalf("views = %+v, want no merged chain", views)
+	}
+}
+
 func TestGlobalIssueListPaginatesAndResolvesVersionTitles(t *testing.T) {
 	reader := &fakeGlobalIssueReader{result: []delivery.Issue{
 		globalIssue(103, 42), globalIssue(102, 43), globalIssue(101, 42),
@@ -215,7 +259,7 @@ func TestGlobalIssueListRejectsInvalidFilters(t *testing.T) {
 		{name: "status", filter: GlobalIssueFilter{Status: "bogus"}},
 		{name: "category", filter: GlobalIssueFilter{Category: "security"}},
 		{name: "severity", filter: GlobalIssueFilter{Severity: "critical"}},
-		{name: "query", filter: GlobalIssueFilter{Q: strings.Repeat("长", 101)}},
+		{name: "query", filter: GlobalIssueFilter{Q: strings.Repeat("结", 101)}},
 		{name: "before", filter: GlobalIssueFilter{Before: -1}},
 		{name: "limit", filter: GlobalIssueFilter{Limit: -1}},
 	}

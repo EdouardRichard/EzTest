@@ -407,8 +407,13 @@ type fakeReportRenderer struct {
 	lastSnapshot  delivery.ReportSnapshot
 	lastNarrative string
 	lastOptions   delivery.SectionOptions
+	templateVer   string
 	calls         int
 }
+
+// TemplateVersion implements delivery.ReportTemplateVersioner so a test can
+// prove the service records the renderer's built-in version (P7-D-03).
+func (r *fakeReportRenderer) TemplateVersion() string { return r.templateVer }
 
 func (r *fakeReportRenderer) Render(_ context.Context, snapshot delivery.ReportSnapshot, narrative string, opts delivery.SectionOptions) ([]byte, error) {
 	r.calls++
@@ -428,17 +433,22 @@ func (r *fakeReportRenderer) Render(_ context.Context, snapshot delivery.ReportS
 }
 
 type fakeReportContent struct {
-	mu         sync.Mutex
-	log        *[]string
-	puts       map[int64][]byte
-	putErr     error
-	openErr    error
-	openSHA    string
-	entries    map[int64]fakeReportContentEntry
-	nextRef    int64
-	putCalls   int
-	openCalls  int
-	lastOpenID int64
+	mu          sync.Mutex
+	log         *[]string
+	puts        map[int64][]byte
+	putErr      error
+	openErr     error
+	openSHA     string
+	entries     map[int64]fakeReportContentEntry
+	pdfs        map[int64]fakeReportContentEntry
+	pdfRefs     map[int64]ReportContentRef
+	pdfErr      error
+	putPDFErr   error
+	putPDFCalls int
+	nextRef     int64
+	putCalls    int
+	openCalls   int
+	lastOpenID  int64
 }
 
 type fakeReportContentEntry struct {
@@ -448,7 +458,10 @@ type fakeReportContentEntry struct {
 }
 
 func newFakeReportContent(log *[]string) *fakeReportContent {
-	return &fakeReportContent{log: log, puts: make(map[int64][]byte), entries: make(map[int64]fakeReportContentEntry), nextRef: 5000}
+	return &fakeReportContent{
+		log: log, puts: make(map[int64][]byte), entries: make(map[int64]fakeReportContentEntry),
+		pdfs: make(map[int64]fakeReportContentEntry), pdfRefs: make(map[int64]ReportContentRef), nextRef: 5000,
+	}
 }
 
 func reportContentSHA(data []byte) string {
@@ -503,6 +516,59 @@ func (c *fakeReportContent) seed(refID, revisionID int64, data []byte) {
 	sha := reportContentSHA(data)
 	c.entries[refID] = fakeReportContentEntry{data: append([]byte(nil), data...), sha: sha, size: int64(len(data))}
 	c.puts[revisionID] = append([]byte(nil), data...)
+}
+
+// GetReportHTML implements RenderContent.
+func (c *fakeReportContent) GetReportHTML(_ context.Context, contentRefID int64) ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.openErr != nil {
+		return nil, c.openErr
+	}
+	entry, ok := c.entries[contentRefID]
+	if !ok {
+		return nil, ErrReportContentNotFound
+	}
+	return append([]byte(nil), entry.data...), nil
+}
+
+// PutReportPDF implements RenderContent.
+func (c *fakeReportContent) PutReportPDF(_ context.Context, revisionID int64, data []byte) (ReportContentRef, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.putPDFCalls++
+	if c.putPDFErr != nil {
+		return ReportContentRef{}, c.putPDFErr
+	}
+	refID := c.nextRef
+	c.nextRef++
+	sha := reportContentSHA(data)
+	size := int64(len(data))
+	c.pdfs[refID] = fakeReportContentEntry{data: append([]byte(nil), data...), sha: sha, size: size}
+	ref := ReportContentRef{RefID: refID, SHA256: sha, Size: size}
+	c.pdfRefs[revisionID] = ref
+	return ref, nil
+}
+
+// OpenReportPDF implements ContentStore.
+func (c *fakeReportContent) OpenReportPDF(_ context.Context, contentRefID int64) ([]byte, string, int64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pdfErr != nil {
+		return nil, "", 0, c.pdfErr
+	}
+	entry, ok := c.pdfs[contentRefID]
+	if !ok {
+		return nil, "", 0, ErrReportContentNotFound
+	}
+	return append([]byte(nil), entry.data...), entry.sha, entry.size, nil
+}
+
+// seedPDF stores one PDF content entry for the OpenPDF read path.
+func (c *fakeReportContent) seedPDF(refID int64, data []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pdfs[refID] = fakeReportContentEntry{data: append([]byte(nil), data...), sha: reportContentSHA(data), size: int64(len(data))}
 }
 
 type fakeReportData struct {
@@ -821,6 +887,15 @@ func TestReportServicePublishWritesContentThenPublishes(t *testing.T) {
 	if fixture.renderer.lastSnapshot.GeneratedAt != fixture.clock.now {
 		t.Fatalf("snapshot generated_at = %v", fixture.renderer.lastSnapshot.GeneratedAt)
 	}
+	// The v2 appendix metadata is stamped by the service, never trusted from a
+	// reader: report id, revision number and the final input fingerprint.
+	if fixture.renderer.lastSnapshot.ReportID != report.ID ||
+		fixture.renderer.lastSnapshot.ReportRevision != published.Revision ||
+		fixture.renderer.lastSnapshot.InputFingerprint != published.InputFingerprint {
+		t.Fatalf("renderer appendix metadata = id:%d revision:%d fingerprint:%q",
+			fixture.renderer.lastSnapshot.ReportID, fixture.renderer.lastSnapshot.ReportRevision,
+			fixture.renderer.lastSnapshot.InputFingerprint)
+	}
 	if len(fixture.renderer.lastSnapshot.Issues) != 1 || len(fixture.renderer.lastSnapshot.CaseRuns) != 1 {
 		t.Fatalf("renderer snapshot = %+v", fixture.renderer.lastSnapshot)
 	}
@@ -878,6 +953,103 @@ func TestReportServicePublishWritesContentThenPublishes(t *testing.T) {
 	}
 	if len(fixture.tasks.calls) != 0 {
 		t.Fatalf("Publish ensured tasks: %v", fixture.tasks.calls)
+	}
+}
+
+// TestReportServiceRecordsRendererTemplateVersion pins P7-D-03: every new
+// revision records the template version of the renderer that will render it,
+// not a stale hard-coded constant.
+func TestReportServiceRecordsRendererTemplateVersion(t *testing.T) {
+	fixture := newReportFixture(t)
+	fixture.renderer.templateVer = "2"
+	fixture.data.wave[reportDataWaveKey(7, 12)] = reportTestWaveSnapshot(7, 12)
+
+	report, err := fixture.svc.EnsureWaveReport(context.Background(), 7, 12)
+	if err != nil {
+		t.Fatalf("EnsureWaveReport: %v", err)
+	}
+	revision := fixture.repoRevision(t, report.ID, 1)
+	if revision.TemplateVersion != "2" {
+		t.Fatalf("draft template_version = %q, want the renderer version 2", revision.TemplateVersion)
+	}
+	published, err := fixture.svc.Publish(context.Background(), report.ID, 1, "")
+	if err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if published.TemplateVersion != "2" {
+		t.Fatalf("published template_version = %q, want 2", published.TemplateVersion)
+	}
+
+	// A renderer that does not report a version keeps the frozen P4 version.
+	fallback := newReportFixture(t)
+	fallback.data.wave[reportDataWaveKey(7, 12)] = reportTestWaveSnapshot(7, 12)
+	fallbackReport, err := fallback.svc.EnsureWaveReport(context.Background(), 7, 12)
+	if err != nil {
+		t.Fatalf("EnsureWaveReport fallback: %v", err)
+	}
+	if got := fallback.repoRevision(t, fallbackReport.ID, 1).TemplateVersion; got != "1" {
+		t.Fatalf("fallback template_version = %q, want 1", got)
+	}
+}
+
+// TestReportServiceGetReturnsOnlyCurrentRevisionRefs pins P7-E2E-BUG-01: report
+// detail must project the current revision's refs only (deduplicated by
+// kind/ref_id), never the append-only history of every revision.
+func TestReportServiceGetReturnsOnlyCurrentRevisionRefs(t *testing.T) {
+	fixture := newReportFixture(t)
+	report, first := fixture.seedPublishedWaveReport(7, 12, reportTestFingerprint("a"))
+	second := fixture.repo.seedRevision(delivery.ReportRevision{ReportID: report.ID, Revision: 2})
+	third := fixture.repo.seedRevision(delivery.ReportRevision{ReportID: report.ID, Revision: 3})
+	report.CurrentRevisionID = &third.ID
+	fixture.repo.reports[report.ID] = report
+	fixture.repo.refs[report.ID] = []delivery.ReportRef{
+		{ID: 1, ReportID: report.ID, ReportRevisionID: first.ID, Kind: "case_run", RefID: 3001},
+		{ID: 2, ReportID: report.ID, ReportRevisionID: second.ID, Kind: "case_run", RefID: 3001},
+		{ID: 3, ReportID: report.ID, ReportRevisionID: third.ID, Kind: "case_run", RefID: 3001},
+		{ID: 4, ReportID: report.ID, ReportRevisionID: third.ID, Kind: "issue", RefID: 5001},
+		// A duplicate of the same logical ref inside the current revision is
+		// collapsed too (the schema allows append-only duplicates).
+		{ID: 5, ReportID: report.ID, ReportRevisionID: third.ID, Kind: "case_run", RefID: 3001},
+	}
+
+	detail, err := fixture.svc.Get(context.Background(), 7, report.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if len(detail.Refs) != 2 {
+		t.Fatalf("detail refs = %+v, want 2 unique current-revision refs", detail.Refs)
+	}
+	if detail.Refs[0].ID != 3 || detail.Refs[0].Kind != "case_run" ||
+		detail.Refs[1].ID != 4 || detail.Refs[1].Kind != "issue" {
+		t.Fatalf("detail refs = %+v, want current revision refs [3 4]", detail.Refs)
+	}
+	for _, ref := range detail.Refs {
+		if ref.ReportRevisionID != third.ID {
+			t.Fatalf("detail ref %+v is not from the current revision %d", ref, third.ID)
+		}
+	}
+	if len(detail.Revisions) != 3 {
+		t.Fatalf("detail revisions = %d, want the full history (3)", len(detail.Revisions))
+	}
+}
+
+// TestReportServiceGetWithoutCurrentRevisionDedupes covers a draft report (no
+// current revision): the detail falls back to the deduplicated union instead of
+// repeating append-only history rows.
+func TestReportServiceGetWithoutCurrentRevisionDedupes(t *testing.T) {
+	fixture := newReportFixture(t)
+	report, revision := fixture.seedWaveReport(7, 12)
+	second := fixture.repo.seedRevision(delivery.ReportRevision{ReportID: report.ID, Revision: 2})
+	fixture.repo.refs[report.ID] = []delivery.ReportRef{
+		{ID: 1, ReportID: report.ID, ReportRevisionID: revision.ID, Kind: "case_run", RefID: 3001},
+		{ID: 2, ReportID: report.ID, ReportRevisionID: second.ID, Kind: "case_run", RefID: 3001},
+	}
+	detail, err := fixture.svc.Get(context.Background(), 7, report.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if len(detail.Refs) != 1 || detail.Refs[0].Kind != "case_run" || detail.Refs[0].RefID != 3001 {
+		t.Fatalf("detail refs = %+v, want one deduplicated ref", detail.Refs)
 	}
 }
 

@@ -43,19 +43,21 @@ type fakeWorkItemRepo struct {
 	waitingHumanErr error
 	finishErr       error
 
-	ensured       []agent.NewWorkItem
-	claimants     []string
-	claimLease    []time.Duration
-	claimTeams    [][]agent.Team
-	marked        [][2]int64
-	renewed       [][2]int64
-	renewLease    []time.Duration
-	completed     [][2]int64
-	failed        []failCall
-	waitingHuman  [][2]int64
-	finished      []finishCall
-	listVersionID int64
-	listLimit     int
+	ensured        []agent.NewWorkItem
+	claimants      []string
+	claimLease     []time.Duration
+	claimTeams     [][]agent.Team
+	claimTypes     [][]string
+	claimTypeLease []time.Duration
+	marked         [][2]int64
+	renewed        [][2]int64
+	renewLease     []time.Duration
+	completed      [][2]int64
+	failed         []failCall
+	waitingHuman   [][2]int64
+	finished       []finishCall
+	listVersionID  int64
+	listLimit      int
 }
 
 func (r *fakeWorkItemRepo) Ensure(_ context.Context, in agent.NewWorkItem) (agent.WorkItem, bool, error) {
@@ -73,6 +75,13 @@ func (r *fakeWorkItemRepo) ClaimForTeams(_ context.Context, claimant string, tea
 	r.claimants = append(r.claimants, claimant)
 	r.claimLease = append(r.claimLease, lease)
 	r.claimTeams = append(r.claimTeams, append([]agent.Team(nil), teams...))
+	return r.item, r.claimOK, r.claimErr
+}
+
+func (r *fakeWorkItemRepo) ClaimForTypes(_ context.Context, claimant string, types []string, lease time.Duration) (agent.WorkItem, bool, error) {
+	r.claimants = append(r.claimants, claimant)
+	r.claimTypeLease = append(r.claimTypeLease, lease)
+	r.claimTypes = append(r.claimTypes, append([]string(nil), types...))
 	return r.item, r.claimOK, r.claimErr
 }
 
@@ -282,7 +291,7 @@ func TestWorkQueueClaimForTeams(t *testing.T) {
 		t.Fatalf("repository called for empty teams: %#v", repo.claimTeams)
 	}
 
-	if _, _, err := queue.ClaimForTeams(ctx, "worker-1", []agent.Team{agent.Team("ops")}); err == nil {
+	if _, _, err := queue.ClaimForTeams(ctx, "worker-1", []agent.Team{agent.Team("unknown")}); err == nil {
 		t.Fatal("unknown team accepted")
 	} else {
 		assertAPIError(t, err, 400, "invalid_argument")
@@ -309,6 +318,48 @@ func TestWorkQueueClaimForTeams(t *testing.T) {
 	}
 }
 
+func TestWorkQueueClaimForTypes(t *testing.T) {
+	repo := &fakeWorkItemRepo{item: agent.WorkItem{ID: 11, Type: "report.render_pdf"}, claimOK: true}
+	queue := newWorkQueue(repo)
+	ctx := context.Background()
+
+	item, ok, err := queue.ClaimForTypes(ctx, "  render-worker  ",
+		[]string{" report.render_pdf ", "report.render_pdf", ""}, 90*time.Second)
+	if err != nil || !ok || item.ID != 11 {
+		t.Fatalf("ClaimForTypes = %#v, %v, %v", item, ok, err)
+	}
+	if len(repo.claimants) != 1 || repo.claimants[0] != "render-worker" {
+		t.Fatalf("claimants = %#v", repo.claimants)
+	}
+	if len(repo.claimTypes) != 1 || !slices.Equal(repo.claimTypes[0], []string{"report.render_pdf"}) {
+		t.Fatalf("claim types = %#v, want trimmed/deduplicated", repo.claimTypes)
+	}
+	if len(repo.claimTypeLease) != 1 || repo.claimTypeLease[0] != 90*time.Second {
+		t.Fatalf("claim lease = %#v, want caller-supplied 90s", repo.claimTypeLease)
+	}
+
+	if item, ok, err := queue.ClaimForTypes(ctx, "worker-1", nil, time.Second); err != nil || ok || item.ID != 0 {
+		t.Fatalf("empty types claim = %#v, %v, %v", item, ok, err)
+	}
+	if len(repo.claimTypes) != 1 {
+		t.Fatalf("repository called for empty types: %#v", repo.claimTypes)
+	}
+
+	if _, _, err := queue.ClaimForTypes(ctx, "   ", []string{"report.render_pdf"}, time.Second); err == nil {
+		t.Fatal("empty claimant accepted")
+	} else {
+		assertAPIError(t, err, 400, "invalid_argument")
+	}
+	if len(repo.claimants) != 1 {
+		t.Fatalf("repository called with empty claimant: %#v", repo.claimants)
+	}
+
+	repo.claimErr = errors.New("boom")
+	if _, _, err := queue.ClaimForTypes(ctx, "render-worker", []string{"report.render_pdf"}, time.Second); err == nil {
+		t.Fatal("claim error not propagated")
+	}
+}
+
 func TestWorkQueueFencingErrorsMapToLeaseLost(t *testing.T) {
 	ctx := context.Background()
 
@@ -323,7 +374,7 @@ func TestWorkQueueFencingErrorsMapToLeaseLost(t *testing.T) {
 	t.Run("heartbeat", func(t *testing.T) {
 		repo := &fakeWorkItemRepo{renewErr: agent.ErrLeaseLost}
 		queue := newWorkQueue(repo)
-		assertAPIError(t, queue.Heartbeat(ctx, 7, 2), 409, "lease_lost")
+		assertAPIError(t, queue.Heartbeat(ctx, 7, 2, 0), 409, "lease_lost")
 		if len(repo.renewed) != 1 || repo.renewed[0] != [2]int64{7, 2} {
 			t.Fatalf("renewed = %#v", repo.renewed)
 		}

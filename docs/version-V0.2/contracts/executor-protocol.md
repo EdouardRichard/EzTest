@@ -15,6 +15,8 @@
 | `EZTEST_EXECUTOR_MAX_CONTEXTS` | `8` | 并发 browser context 上限（= healthz `maxContexts` = `executor_instance.capacity`） |
 | `EZTEST_EXECUTOR_CHROMIUM_PATH` | 未设置 | 可选显式 Chromium 二进制（本地开发） |
 | `EZTEST_EXECUTOR_ALLOW_DATA_PAGES` | 未设置 | `1` 仅允许 `data:text/html` 自测页 |
+| `EZTEST_API_URL` | 未设置 | P7 可选：EzTest API 基址；设置后启用 push 注册/心跳，空=仅 pull |
+| `EZTEST_EXECUTOR_HEARTBEAT_SECONDS` | `10` | P7 可选：push 心跳间隔（整数 1–60s）；仅 push 启用时使用 |
 
 - EzTest API 仍只有严格 4 项启动 env；API 通过 DB 设置读取 `execution.executor_url` 与 `execution.executor_token`（`is_secret=true`，P3 首个 secret 键）。`scripts/dev-executor.ps1` 从 DB 读取当前 token 并注入执行器进程的 `EZTEST_EXECUTOR_TOKEN`。
 - 协议版本：HTTP 路径前缀 `/v1`；`GET /healthz` 的 `version` 返回执行器包版本（当前 `0.1.0`），API 记录到 `executor_instance.version`。P3 不改变既有 action 语义，仅新增 context `metadata` 与 `GET /v1/contexts`（P3-D-35）。
@@ -169,3 +171,52 @@ P3 采用 **API pull healthz**（P3-D-01），执行器不主动 push：
 - 失败：页面/导航/context 错误走 §5 通用错误码；环境不一致不按失败处理（`inconclusive`）；执行器重启/context 丢失按 §5 处理。
 - 安全：沿用 §2 host allowlist/只读页面/敏感值擦除；不得执行页面脚本外的高危动作；基线字节只在内存中使用，不写执行器磁盘/日志。
 - 协议版本：P5 起 action 集合新增 `visual.compare`，协议版本记为 **v1.2**；P3 既有 action 语义/认证/限额不变，P6+ 只允许增量。
+
+## 12. P7 增量：执行器 push 注册/心跳、多端点与容量选择（frozen: P7，2026-11-01）
+
+> 来源：`docs/superpowers/specs/2026-11-01-eztest-v02-p7-p9-design.md` §4.5/§6.5/§13。
+> P3 **pull healthz**（§7）保留；P7 增加 **push 注册/心跳**、`execution.executor_urls` 多端点 poll 与容量选择。执行器 action 协议仍为 **v1.2**（§11），action/认证/限额/证据映射不变。
+> 认证：内部端点使用 DB 设置 `execution.executor_token`（`is_secret=true`）作为 Bearer，不是用户登录 token；常量时间比较，永不写日志/事件/证据。
+
+### 12.1 内部端点（非公开）
+
+| Method/Path | 认证 | Body | 成功响应 |
+|---|---|---|---|
+| `POST /api/internal/executors/register` | `Authorization: Bearer <execution.executor_token>` | `{endpoint,name,capacity,active_contexts?,version,max_contexts?,status?}` | 200 `{"data": InstanceView}` |
+| `POST /api/internal/executors/heartbeat` | 同上 | `{endpoint,active_contexts,capacity?,version?,status?}` | 200 `{"data": InstanceView}` |
+
+- `register`：执行器启动注册。`endpoint` 必填、绝对 http(s)、≤500（唯一键；尾部 `/` 归一化后去重）；`name` 必填 1–200（`host:port`）；`capacity`（=执行器 `maxContexts`）必填 ≥1，`max_contexts` 为可选同义别名（同时给出时必须相等）；`active_contexts` 可选 ≥0（默认 0）；`version` 必填 ≤64；`status` 可选 `active|degraded`（仅记录健康信号，不改变持久化状态）。服务端 upsert `executor_instance`（`token_hash=sha256(token)`、`last_heartbeat=now`、`last_error=''`）；状态：已有 `draining` 保持，其余置 `active`。重复 register 幂等。
+- `heartbeat`：执行器周期心跳。`endpoint` 必填且必须是已注册端点；更新 `active_contexts`、`capacity`（可选）、`version`（可选）、`last_heartbeat=now`；`status` 仅允许 `active|degraded`，`degraded` 只记录告警/`last_error`，**不**因一次 degraded 置 offline；DB 状态 `draining` 保持、其余恢复 `active`（含 offline 恢复）。未知 endpoint → **404 `executor_unknown`**，不自动创建行。
+- `InstanceView`：`{instance_id,endpoint,name,status,capacity,active_contexts,version,last_heartbeat}`；ID 为十进制字符串，时间 RFC3339 UTC。
+- 错误：400 `invalid_argument`（字段/长度/URL/capacity/status）、401 `unauthorized`（缺失/错误 token）、404 `executor_unknown`（heartbeat 未知端点）；统一错误信封。
+- 不提供 unregister；离线由 `execution.executor_offline_seconds` 判定；`draining` 只能由 admin API（`/api/admin/executors/{id}/drain|activate`）改变，push 注册/心跳不得清除 draining。
+
+### 12.2 多端点 poll（`execution.executor_urls`）
+
+- 端点集合 = `execution.executor_url` ∪ `execution.executor_urls`（逗号分隔）。逐项 trim、去尾部 `/`、按绝对 http(s) 校验、去重；空项忽略；无效项记日志并跳过，不阻塞启动。
+- 每个端点每 `execution.executor_heartbeat_seconds`（默认 10s，1–60）调用 `GET {endpoint}/healthz`，成功按 P3 §7 upsert 同一 `executor_instance`（`endpoint` 唯一；`capacity=healthz.maxContexts`；`active_contexts=healthz.contexts`；`version=healthz.version`；`last_heartbeat=now`）；失败超过 `execution.executor_offline_seconds`（默认 30s，5–300）置 `offline`。
+- poll 与 push 写同一行：push 注册的端点即使不在 poll 集合中，也通过 heartbeat 保活；poll 成功同样恢复 `active`（`draining` 保持）。
+- `execution.executor_urls` 为空时等价 P3 单端点；`execution.executor_token` 用于内部 push 路由（poll 的 `GET /healthz` 按 P3 §3 无 auth）。
+
+### 12.3 容量选择与排空
+
+- **P7 实现边界（多端点派发 = backlog）**：`execution.executor_urls` 非空时，全部端点仍会被 poll/注册/心跳/在管理端列出，但 **派发只限主端点 `execution.executor_url`** 对应的可派发行（composition root 的 `primaryExecutorRegistry.Select`）。次级端点和 push 注册的端点当前只保活、不参与派发。按容量排序（`capacity DESC, last_heartbeat DESC, id ASC`）与跨端点容量选择只在 **per-executor 路由落地（P8 backlog）后** 生效；在此之前不要依赖 `executor_urls` 分流或容量排序。
+- 单端点兼容：`execution.executor_urls` 为空时保持 P3 语义，只从 `execution.executor_url` 对应端点行派发；push 注册的其它端点只保活、不参与派发。
+- 调度只从 `status='active' AND active_contexts < capacity` 的行中选择；多端点派发启用后按 `capacity DESC, last_heartbeat DESC, id ASC` 排序（容量大者优先、最近心跳优先、稳定 id）。
+- `capacity=0` 永不选中；`draining` 停止新派发、在飞 case_run 继续；`offline` 不派发，pending 等待恢复，running 由 reconciler 按 `interrupted(executor_lost)` 且 `dispatch_epoch++` 重派（最多 3 次，沿用 P3）。
+- 无可用执行器 → 派发返回 503 `executor_unavailable`（沿用 P3 错误语义）；degraded 只影响告警/派发前复检，不直接排除。
+- 不实现跨执行器上下文迁移；一个 case_run 的同一 `(version_sut_id, account_role)` context 仍在同一执行器内复用（§6）。
+
+### 12.4 执行器 push 客户端
+
+- 执行器进程新增可选 env `EZTEST_API_URL`（EzTest API 基址；空/未设置则禁用 push）；使用既有 `EZTEST_EXECUTOR_TOKEN` 作为 Bearer。`EZTEST_EXECUTOR_HEARTBEAT_SECONDS`（默认 10，1–60）控制 push 心跳间隔；广告 endpoint 由 `EZTEST_EXECUTOR_ADDR` 归一化为绝对 http(s) URL。**EzTest API 启动 env 仍严格 4 项**，这些均属于执行器进程配置。
+- 启动时 `register`（`endpoint/name/capacity/active_contexts/version`；`name` 缺省用 endpoint）；之后每 `EZTEST_EXECUTOR_HEARTBEAT_SECONDS` 发 `heartbeat`（携带当前 `active_contexts/capacity/version`，内部 degraded 时 `status="degraded"`，否则 `status="active"`）。注意 push 心跳节奏由执行器本地 env 决定，不由 API 的 `execution.executor_heartbeat_seconds`（那是 API 侧 pull poll 间隔）决定。
+- push 失败（网络/401/404/5xx）按 1s 起、上限 30s 的指数退避重试，只记日志/`last_error`，**不阻断**用例执行；不因 push 失败删除 context 或中断在飞 action。
+- 无 unregister/优雅摘流 push；滚动升级仍由 admin drain + `GET /api/health/ready` 执行。
+
+### 12.5 约束
+
+1. P3 pull、P5 `visual.compare`、action/证据/限额语义不变；P7 不新增 action。
+2. 内部端点只接受 `execution.executor_token` Bearer；不得暴露给前端/普通用户；token 不落日志/事件/证据。
+3. `draining` 保持、未知 heartbeat endpoint 404、`executor_urls` 去重/无效项跳过是冻结语义。
+4. 多端点/多副本不改变事件频道与 SSE 语义；`executor_instance` 表结构不变（P3 已含 capacity/active_contexts/last_heartbeat/version/last_error）。

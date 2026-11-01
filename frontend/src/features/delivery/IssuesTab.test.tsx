@@ -114,6 +114,9 @@ const mergedIssue: IssueView = {
   merged_into_id: "9102",
   merged_at: updated,
   reopen_count: 0,
+  recurrence_count: 3,
+  last_recurred_at: "2026-11-01T04:30:00Z",
+  merged_chain: ["9102"],
   refs: [{ kind: "case_run", ref_id: "9304", version_sut_id: "3001", role: "source" }],
   triage: null,
   created_at: created,
@@ -173,7 +176,7 @@ const openDetailFixture: IssueDetailView = {
 }
 
 function mockWorkspace(): void {
-  api.listIssues.mockResolvedValue([openIssue, confirmedIssue])
+  api.listIssues.mockResolvedValue([openIssue, confirmedIssue, mergedIssue])
   api.getIssue.mockImplementation((_versionId: string, issueId: string) => {
     if (issueId === openIssue.id) return Promise.resolve(openDetailFixture)
     const found = [confirmedIssue, mergedIssue].find((issue) => issue.id === issueId)
@@ -461,7 +464,7 @@ describe("IssuesTab", () => {
     render(<IssuesTab versionId="2001" />)
     const sheet = await openDetail("9103")
 
-    expect(within(sheet).getByText(/已合并至问题/)).toBeInTheDocument()
+    expect(within(sheet).getByText(/该问题已合并/)).toBeInTheDocument()
     expect(within(sheet).getByRole("link", { name: "#9102" })).toHaveAttribute(
       "href",
       "/versions/2001?tab=issues&issue=9102",
@@ -529,6 +532,30 @@ describe("IssuesTab", () => {
     ).toBeInTheDocument()
     expect(screen.getByRole("dialog", { name: "合并问题" })).toBeInTheDocument()
     expect(api.listIssues).toHaveBeenCalledTimes(2)
+  })
+
+  it("shows recurrence count and last recurred time in the issue table", async () => {
+    render(<IssuesTab versionId="2001" />)
+    await screen.findByTestId("issue-9103")
+
+    expect(within(screen.getByRole("table", { name: "问题列表" })).getByText("复发")).toBeVisible()
+    const row = rowOf("9103")
+    expect(row).toHaveTextContent("3")
+    expect(row).toHaveTextContent("2026-11-01")
+  })
+
+  it("shows the recurrence notice and navigable merged chain in the detail sheet", async () => {
+    render(<IssuesTab versionId="2001" />)
+    const sheet = await openDetail("9103")
+
+    const recurrence = within(sheet).getByTestId("issue-recurrence")
+    expect(recurrence).toHaveTextContent("复发 3 次")
+    expect(recurrence).toHaveTextContent("2026-11-01")
+
+    const chain = within(sheet).getByTestId("issue-merged-chain")
+    const target = within(chain).getByRole("link", { name: /#9102/ })
+    expect(target).toHaveAttribute("href", "/versions/2001?tab=issues&issue=9102")
+    expect(within(sheet).getByText(/问题 #9103/)).toBeInTheDocument()
   })
 
   it("shows the empty state when the version has no issues", async () => {

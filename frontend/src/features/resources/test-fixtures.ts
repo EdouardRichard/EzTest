@@ -99,6 +99,7 @@ export const sutFixture: Sut = {
   id: "1001",
   name: "订单中心",
   intro: "订单主链路",
+  family: "payments",
   environments: [environmentFixture, secondEnvironmentFixture],
   created_at: FIXTURE_TIMESTAMP,
   updated_at: FIXTURE_TIMESTAMP,

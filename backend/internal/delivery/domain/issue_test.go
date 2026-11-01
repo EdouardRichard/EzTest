@@ -185,6 +185,147 @@ func TestIssueValidateMerge(t *testing.T) {
 	}
 }
 
+// mergeChainFixture builds a lookup over the given issues plus the source.
+func mergeChainFixture(source Issue, issues ...Issue) (Issue, func(int64) (Issue, bool)) {
+	nodes := make(map[int64]Issue, len(issues))
+	for _, issue := range issues {
+		nodes[issue.ID] = issue
+	}
+	return source, func(id int64) (Issue, bool) {
+		issue, ok := nodes[id]
+		return issue, ok
+	}
+}
+
+func mergeChainIDs(issues []Issue) []int64 {
+	ids := make([]int64, 0, len(issues))
+	for _, issue := range issues {
+		ids = append(ids, issue.ID)
+	}
+	return ids
+}
+
+func requireMergeChainIDs(t *testing.T, got []Issue, want ...int64) {
+	t.Helper()
+	ids := mergeChainIDs(got)
+	if len(ids) != len(want) {
+		t.Fatalf("merge chain = %v, want %v", ids, want)
+	}
+	for index := range want {
+		if ids[index] != want[index] {
+			t.Fatalf("merge chain = %v, want %v", ids, want)
+		}
+	}
+}
+
+func TestIssueMergeChainFollowsMergedLinksToTarget(t *testing.T) {
+	source := Issue{ID: 10, VersionID: 7, Status: IssueStatusMerged, MergedIntoID: int64Pointer(20)}
+	source, lookup := mergeChainFixture(source,
+		Issue{ID: 20, VersionID: 7, Status: IssueStatusMerged, MergedIntoID: int64Pointer(30)},
+		Issue{ID: 30, VersionID: 7, Status: IssueStatusOpen},
+	)
+	chain, ok := MergeChain(source, lookup)
+	if !ok {
+		t.Fatal("MergeChain() ok = false, want the resolved target")
+	}
+	requireMergeChainIDs(t, chain, 20, 30)
+	if chain[len(chain)-1].Status != IssueStatusOpen {
+		t.Fatalf("terminal target status = %q, want open", chain[len(chain)-1].Status)
+	}
+
+	// A non-merged issue has no target chain.
+	open := Issue{ID: 40, VersionID: 7, Status: IssueStatusOpen}
+	if chain, ok := MergeChain(open, lookup); !ok || len(chain) != 0 {
+		t.Fatalf("open MergeChain = %v/%v, want an empty ok chain", mergeChainIDs(chain), ok)
+	}
+	// A merged issue without a recorded link is also an empty chain, not a
+	// failure: the caller only redirects when a link exists.
+	unlinked := Issue{ID: 50, VersionID: 7, Status: IssueStatusMerged}
+	if chain, ok := MergeChain(unlinked, lookup); !ok || len(chain) != 0 {
+		t.Fatalf("unlinked MergeChain = %v/%v, want an empty ok chain", mergeChainIDs(chain), ok)
+	}
+}
+
+func TestIssueMergeChainRejectsBrokenCycleAndForeignTargets(t *testing.T) {
+	t.Run("missing target", func(t *testing.T) {
+		source := Issue{ID: 10, VersionID: 7, Status: IssueStatusMerged, MergedIntoID: int64Pointer(99)}
+		source, lookup := mergeChainFixture(source)
+		if chain, ok := MergeChain(source, lookup); ok || len(chain) != 0 {
+			t.Fatalf("broken MergeChain = %v/%v, want no chain", mergeChainIDs(chain), ok)
+		}
+	})
+
+	t.Run("self cycle", func(t *testing.T) {
+		source := Issue{ID: 10, VersionID: 7, Status: IssueStatusMerged, MergedIntoID: int64Pointer(10)}
+		source, lookup := mergeChainFixture(source, source)
+		if chain, ok := MergeChain(source, lookup); ok {
+			t.Fatalf("self-cycle MergeChain = %v, want redirect failure", mergeChainIDs(chain))
+		}
+	})
+
+	t.Run("indirect cycle", func(t *testing.T) {
+		source := Issue{ID: 10, VersionID: 7, Status: IssueStatusMerged, MergedIntoID: int64Pointer(20)}
+		source, lookup := mergeChainFixture(source,
+			Issue{ID: 20, VersionID: 7, Status: IssueStatusMerged, MergedIntoID: int64Pointer(30)},
+			Issue{ID: 30, VersionID: 7, Status: IssueStatusMerged, MergedIntoID: int64Pointer(20)},
+		)
+		if chain, ok := MergeChain(source, lookup); ok {
+			t.Fatalf("cyclic MergeChain = %v, want redirect failure", mergeChainIDs(chain))
+		}
+	})
+
+	t.Run("cross version target", func(t *testing.T) {
+		source := Issue{ID: 10, VersionID: 7, Status: IssueStatusMerged, MergedIntoID: int64Pointer(20)}
+		source, lookup := mergeChainFixture(source,
+			Issue{ID: 20, VersionID: 8, Status: IssueStatusOpen},
+		)
+		if chain, ok := MergeChain(source, lookup); ok {
+			t.Fatalf("cross-version MergeChain = %v, want redirect failure", mergeChainIDs(chain))
+		}
+	})
+}
+
+func TestIssueMergeChainBudget(t *testing.T) {
+	// A finite chain of exactly MaxIssueMergeChain hops is resolvable.
+	source := Issue{ID: 10, VersionID: 7, Status: IssueStatusMerged, MergedIntoID: int64Pointer(100)}
+	nodes := make([]Issue, 0, MaxIssueMergeChain)
+	for offset := 0; offset < MaxIssueMergeChain; offset++ {
+		node := Issue{ID: int64(100 + offset), VersionID: 7, Status: IssueStatusMerged}
+		if offset == MaxIssueMergeChain-1 {
+			node.Status = IssueStatusConfirmed
+		} else {
+			node.MergedIntoID = int64Pointer(int64(100 + offset + 1))
+		}
+		nodes = append(nodes, node)
+	}
+	source, lookup := mergeChainFixture(source, nodes...)
+	chain, ok := MergeChain(source, lookup)
+	if !ok || len(chain) != MaxIssueMergeChain {
+		t.Fatalf("at-budget MergeChain = %v/%v, want %d resolved targets", mergeChainIDs(chain), ok, MaxIssueMergeChain)
+	}
+
+	// One additional merged hop is over budget: the redirect fails after the
+	// bounded walk instead of guessing.
+	over := make([]Issue, 0, MaxIssueMergeChain)
+	for offset := 0; offset < MaxIssueMergeChain; offset++ {
+		over = append(over, Issue{
+			ID:           int64(200 + offset),
+			VersionID:    7,
+			Status:       IssueStatusMerged,
+			MergedIntoID: int64Pointer(int64(200 + offset + 1)),
+		})
+	}
+	overSource := Issue{ID: 10, VersionID: 7, Status: IssueStatusMerged, MergedIntoID: int64Pointer(200)}
+	source, lookup = mergeChainFixture(overSource, over...)
+	chain, ok = MergeChain(source, lookup)
+	if ok {
+		t.Fatalf("over-budget MergeChain = %v, want redirect failure", mergeChainIDs(chain))
+	}
+	if len(chain) != MaxIssueMergeChain {
+		t.Fatalf("over-budget chain length = %d, want the %d walked targets", len(chain), MaxIssueMergeChain)
+	}
+}
+
 func TestIssueValidateMergeMergedTargetWithLongChain(t *testing.T) {
 	source := Issue{ID: 10, VersionID: 7, Status: IssueStatusOpen}
 

@@ -3,6 +3,8 @@ package render
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"strings"
 	"testing"
@@ -14,7 +16,7 @@ import (
 var renderTime = time.Date(2026, 11, 1, 5, 0, 0, 0, time.UTC)
 
 func allSections() delivery.SectionOptions {
-	return delivery.SectionOptions{Summary: true, Results: true, Issues: true, Coverage: true, Evidence: true}
+	return delivery.SectionOptions{Summary: true, Results: true, Issues: true, Coverage: true, Evidence: true, Appendix: true}
 }
 
 func newTestRenderer(t *testing.T) *HTMLRenderer {
@@ -29,6 +31,19 @@ func newTestRenderer(t *testing.T) *HTMLRenderer {
 	return renderer
 }
 
+// newVersionedRenderer builds one built-in template version under test.
+func newVersionedRenderer(t *testing.T, version string) *HTMLRenderer {
+	t.Helper()
+	renderer, err := NewHTMLRenderer(version)
+	if err != nil {
+		t.Fatalf("NewHTMLRenderer(%q): %v", version, err)
+	}
+	if renderer == nil {
+		t.Fatalf("NewHTMLRenderer(%q) returned a nil renderer", version)
+	}
+	return renderer
+}
+
 // sampleSnapshot exercises every report section with fixed, deterministic data.
 func sampleSnapshot() delivery.ReportSnapshot {
 	waveID := int64(12)
@@ -37,9 +52,12 @@ func sampleSnapshot() delivery.ReportSnapshot {
 	closureID := int64(55)
 	reportID := int64(70)
 	return delivery.ReportSnapshot{
-		Kind:      delivery.ReportKindWave,
-		VersionID: 7,
-		WaveID:    &waveID,
+		Kind:             delivery.ReportKindWave,
+		VersionID:        7,
+		WaveID:           &waveID,
+		ReportID:         70,
+		ReportRevision:   3,
+		InputFingerprint: strings.Repeat("b", 64),
 		Requirements: []delivery.RequirementSnapshot{
 			{ID: 2, VersionID: 7, CurrentVersionID: &requirementVersionID, Title: "需求二", Status: "closed", ClosureID: &closureID, ClosedAt: &renderTime, CloseRound: 1, UpdatedAt: renderTime},
 			{ID: 1, VersionID: 7, Title: "需求一", Status: "clarified", UpdatedAt: renderTime},
@@ -115,7 +133,7 @@ func truncationNote(t *testing.T, output []byte) string {
 }
 
 func TestRenderRejectsUnknownTemplateVersion(t *testing.T) {
-	for _, version := range []string{"", "2", "latest", "1 "} {
+	for _, version := range []string{"", "3", "latest", "1 ", "2.0"} {
 		renderer, err := NewHTMLRenderer(version)
 		if err == nil {
 			t.Fatalf("NewHTMLRenderer(%q) = %v, want an error", version, renderer)
@@ -123,6 +141,128 @@ func TestRenderRejectsUnknownTemplateVersion(t *testing.T) {
 		if renderer != nil {
 			t.Fatalf("NewHTMLRenderer(%q) returned a non-nil renderer on error", version)
 		}
+	}
+}
+
+// v1GoldenSHA256 pins the P4 template v1 output byte-for-byte. Version 2 must
+// never change the v1 document (spec P7-D-03), so any difference here is a
+// regression even if the visible content looks equivalent.
+const v1GoldenSHA256 = "03348b0015f9e80b46d0308255762bdd99db41c83b0a927b80ed15bf0e56c033"
+
+// TestRenderV1GoldenHash is the byte-identity guard of the frozen v1 template.
+// Go's template parser normalizes the raw string's CRLF checkout form to LF; the
+// hash is also taken over LF-normalized bytes so the guard is platform
+// independent either way.
+func TestRenderV1GoldenHash(t *testing.T) {
+	renderer := newTestRenderer(t)
+	output, err := renderer.Render(context.Background(), sampleSnapshot(), "固定叙述\n第二行", allSections())
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	normalized := bytes.ReplaceAll(output, []byte("\r\n"), []byte("\n"))
+	sum := sha256.Sum256(normalized)
+	if got := hex.EncodeToString(sum[:]); got != v1GoldenSHA256 {
+		t.Fatalf("v1 golden hash changed: got %s (%d bytes)", got, len(output))
+	}
+}
+
+// TestRenderV1IgnoresAppendixOption proves v1 stays byte-identical even when
+// the composition root enables the (v2-only) appendix section.
+func TestRenderV1IgnoresAppendixOption(t *testing.T) {
+	renderer := newTestRenderer(t)
+	enabled := allSections()
+	disabled := allSections()
+	disabled.Appendix = false
+	withAppendix, err := renderer.Render(context.Background(), sampleSnapshot(), "叙述", enabled)
+	if err != nil {
+		t.Fatalf("Render with Appendix: %v", err)
+	}
+	without, err := renderer.Render(context.Background(), sampleSnapshot(), "叙述", disabled)
+	if err != nil {
+		t.Fatalf("Render without Appendix: %v", err)
+	}
+	if !bytes.Equal(withAppendix, without) {
+		t.Fatal("v1 output changed when SectionOptions.Appendix was enabled")
+	}
+	if strings.Contains(string(withAppendix), `id="appendix"`) {
+		t.Fatal("v1 rendered a v2 appendix section")
+	}
+}
+
+// TestRenderV2AppendsMetadataSection covers the v2 appendix: it records the
+// report metadata and section switches and explicitly states that the appendix
+// never changes deterministic statistics (spec P7-D-03).
+func TestRenderV2AppendsMetadataSection(t *testing.T) {
+	renderer := newVersionedRenderer(t, TemplateVersionV2)
+	output, err := renderer.Render(context.Background(), sampleSnapshot(), "叙述", allSections())
+	if err != nil {
+		t.Fatalf("Render v2: %v", err)
+	}
+	text := string(output)
+	for _, want := range []string{
+		`data-template-version="2"`,
+		`<section id="appendix" data-section="appendix">`,
+		"附录",
+		"报告 ID",
+		"#70",
+		"报告版本",
+		"r3",
+		"版本",
+		"#7",
+		"波次",
+		"#12",
+		"as_of",
+		"输入指纹",
+		strings.Repeat("b", 64),
+		"模板版本",
+		"生成时间",
+		"章节开关",
+		"本附录由系统生成，不改变确定性统计。",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("v2 appendix is missing %q", want)
+		}
+	}
+	if index := strings.Index(text, `id="appendix"`); index < 0 || index > strings.Index(text, "<footer>") {
+		t.Fatal("v2 appendix is not rendered before the footer/main end")
+	}
+}
+
+// TestRenderV2AppendixCanBeDisabled covers report.section_appendix=false: the
+// template version stays 2 but no appendix section is emitted.
+func TestRenderV2AppendixCanBeDisabled(t *testing.T) {
+	renderer := newVersionedRenderer(t, TemplateVersionV2)
+	opts := allSections()
+	opts.Appendix = false
+	output, err := renderer.Render(context.Background(), sampleSnapshot(), "叙述", opts)
+	if err != nil {
+		t.Fatalf("Render v2: %v", err)
+	}
+	text := string(output)
+	if strings.Contains(text, `id="appendix"`) || strings.Contains(text, `data-section="appendix"`) {
+		t.Fatal("v2 rendered the appendix while report.section_appendix was disabled")
+	}
+	if !strings.Contains(text, `data-template-version="2"`) {
+		t.Fatal("disabled appendix removed the v2 template marker")
+	}
+	// The deterministic sections are untouched by the toggle.
+	if !strings.Contains(text, `data-section="summary"`) || !strings.Contains(text, `data-section="issues"`) {
+		t.Fatal("disabled appendix changed the deterministic sections")
+	}
+}
+
+// TestRenderV2EmptySnapshotIsValid covers a v2 render before any report
+// metadata is available: the appendix still renders with placeholders.
+func TestRenderV2EmptySnapshotIsValid(t *testing.T) {
+	renderer := newVersionedRenderer(t, TemplateVersionV2)
+	output, err := renderer.Render(context.Background(), delivery.ReportSnapshot{
+		Kind: delivery.ReportKindVersion, VersionID: 9, GeneratedAt: renderTime,
+	}, "", allSections())
+	if err != nil {
+		t.Fatalf("Render v2 empty snapshot: %v", err)
+	}
+	if !strings.Contains(string(output), `id="appendix"`) {
+		t.Fatal("v2 empty snapshot is missing its appendix")
 	}
 }
 

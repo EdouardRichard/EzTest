@@ -42,9 +42,10 @@ type fakeIssueRepository struct {
 	createdCandidate delivery.Issue
 	createdRefs      []delivery.IssueRef
 
-	getIssues map[int64]delivery.Issue
-	getCalls  []issueGetCall
-	getErr    error
+	getIssues  map[int64]delivery.Issue
+	getCalls   []issueGetCall
+	getErr     error
+	getErrByID map[int64]error
 
 	refs       []delivery.IssueRef
 	refsErr    error
@@ -63,9 +64,22 @@ type fakeIssueRepository struct {
 	mergeErr    error
 	mergeCalls  []IssueMerge
 
+	applyResult delivery.Issue
+	applyErr    error
+	applyCalls  []IssueRecurrence
+
+	appendRefsErr   error
+	appendRefsCalls []issueAppendRefsCall
+
 	listResult []delivery.Issue
 	listErr    error
 	listCalls  []issueListCall
+}
+
+// issueAppendRefsCall records one AppendRefs fallback.
+type issueAppendRefsCall struct {
+	issueID int64
+	refs    []delivery.IssueRef
 }
 
 func (r *fakeIssueRepository) CreateCandidate(_ context.Context, issue delivery.Issue, refs []delivery.IssueRef) (delivery.Issue, bool, error) {
@@ -80,6 +94,9 @@ func (r *fakeIssueRepository) CreateCandidate(_ context.Context, issue delivery.
 
 func (r *fakeIssueRepository) Get(_ context.Context, versionID, issueID int64) (delivery.Issue, error) {
 	r.getCalls = append(r.getCalls, issueGetCall{versionID: versionID, issueID: issueID})
+	if err := r.getErrByID[issueID]; err != nil {
+		return delivery.Issue{}, err
+	}
 	if r.getErr != nil {
 		return delivery.Issue{}, r.getErr
 	}
@@ -91,6 +108,9 @@ func (r *fakeIssueRepository) Get(_ context.Context, versionID, issueID int64) (
 }
 
 func (r *fakeIssueRepository) GetByID(_ context.Context, issueID int64) (delivery.Issue, error) {
+	if err := r.getErrByID[issueID]; err != nil {
+		return delivery.Issue{}, err
+	}
 	issue, ok := r.getIssues[issueID]
 	if !ok {
 		return delivery.Issue{}, delivery.ErrNotFound
@@ -120,6 +140,27 @@ func (r *fakeIssueRepository) Merge(_ context.Context, m IssueMerge) (delivery.I
 		return delivery.Issue{}, r.mergeErr
 	}
 	return r.mergeResult, nil
+}
+
+func (r *fakeIssueRepository) ApplyRecurrence(_ context.Context, rec IssueRecurrence) (delivery.Issue, error) {
+	r.applyCalls = append(r.applyCalls, IssueRecurrence{
+		VersionID: rec.VersionID,
+		SourceID:  rec.SourceID,
+		TargetID:  rec.TargetID,
+		Refs:      append([]delivery.IssueRef(nil), rec.Refs...),
+	})
+	if r.applyErr != nil {
+		return delivery.Issue{}, r.applyErr
+	}
+	return r.applyResult, nil
+}
+
+func (r *fakeIssueRepository) AppendRefs(_ context.Context, issueID int64, refs []delivery.IssueRef) error {
+	r.appendRefsCalls = append(r.appendRefsCalls, issueAppendRefsCall{
+		issueID: issueID,
+		refs:    append([]delivery.IssueRef(nil), refs...),
+	})
+	return r.appendRefsErr
 }
 
 func (r *fakeIssueRepository) AppendHistory(context.Context, delivery.IssueStatusChange) error {
@@ -301,6 +342,7 @@ func newIssueServiceFixture() *issueServiceFixture {
 	fixture := &issueServiceFixture{
 		repo: &fakeIssueRepository{
 			getIssues:     map[int64]delivery.Issue{},
+			getErrByID:    map[int64]error{},
 			findByCaseRun: map[int64]delivery.Issue{},
 			findErrByCase: map[int64]error{},
 		},
@@ -1148,5 +1190,321 @@ func TestIssueServiceProjectionsAreBestEffort(t *testing.T) {
 	if len(fixture.events.records) != 1 || len(fixture.audit.records) != 1 {
 		t.Fatalf("projection attempts = %d events/%d audits, want 1/1",
 			len(fixture.events.records), len(fixture.audit.records))
+	}
+}
+
+/* ------------------------------ recurrence ------------------------------ */
+
+// recurrenceIssue returns one issue fixture of the recurrence tests.
+func recurrenceIssue(id int64, status delivery.IssueStatus, mergedInto *int64, recurrenceCount int) delivery.Issue {
+	return delivery.Issue{
+		ID:              id,
+		VersionID:       7,
+		Status:          status,
+		Category:        "api",
+		Severity:        "major",
+		DedupeKey:       "0123456789abcdef0123456789abcdef",
+		MergedIntoID:    mergedInto,
+		RecurrenceCount: recurrenceCount,
+	}
+}
+
+// recurrenceMergeFixture seeds a merged source A (dedupe key of the test
+// snapshot) and its merge target(s), then returns the fixture.
+func recurrenceMergeFixture(t *testing.T,
+	source delivery.Issue,
+	targets ...delivery.Issue) *issueServiceFixture {
+	t.Helper()
+	fixture := newIssueServiceFixture()
+	fixture.exec.snapshots[52] = issueServiceTestSnapshot(52)
+	fixture.repo.createCreated = false
+	fixture.repo.createResult = source
+	fixture.repo.getIssues[source.ID] = source
+	for _, target := range targets {
+		fixture.repo.getIssues[target.ID] = target
+	}
+	return fixture
+}
+
+// recurrenceEventPayloadInt reads one integer payload field.
+func recurrenceEventPayloadInt(t *testing.T, payload map[string]any, key string) int {
+	t.Helper()
+	value, ok := payload[key].(int)
+	if !ok {
+		t.Fatalf("payload[%q] = %#v, want an int", key, payload[key])
+	}
+	return value
+}
+
+func TestIssueServiceRecurrenceRedirectsToMergeTarget(t *testing.T) {
+	source := recurrenceIssue(902, delivery.IssueStatusMerged, issueServiceTestInt64(903), 0)
+	target := recurrenceIssue(903, delivery.IssueStatusConfirmed, nil, 0)
+	target.DedupeKey = strings.Repeat("c", 32)
+	fixture := recurrenceMergeFixture(t, source, target)
+	recurredAt := issueServiceTestNow.Add(time.Minute)
+	fixture.repo.applyResult = delivery.Issue{
+		ID: 903, VersionID: 7, Status: delivery.IssueStatusConfirmed,
+		RecurrenceCount: 1, LastRecurredAt: &recurredAt,
+	}
+
+	issue, created, err := fixture.svc.IngestCandidate(context.Background(), 52)
+	if err != nil {
+		t.Fatalf("IngestCandidate() error = %v", err)
+	}
+	if created {
+		t.Fatal("recurrence redirect created = true, want false")
+	}
+	if issue.ID != 903 || issue.RecurrenceCount != 1 || issue.LastRecurredAt == nil {
+		t.Fatalf("IngestCandidate() issue = %+v, want the redirected target with count 1", issue)
+	}
+
+	if len(fixture.repo.applyCalls) != 1 {
+		t.Fatalf("ApplyRecurrence calls = %d, want 1", len(fixture.repo.applyCalls))
+	}
+	rec := fixture.repo.applyCalls[0]
+	if rec.VersionID != 7 || rec.SourceID != 902 || rec.TargetID != 903 {
+		t.Fatalf("recurrence = %+v, want version 7 source 902 -> target 903", rec)
+	}
+	if len(rec.Refs) != 9 {
+		t.Fatalf("recurrence refs = %d, want the 9 candidate refs", len(rec.Refs))
+	}
+	for index, ref := range rec.Refs {
+		if ref.Role != delivery.IssueRefRoleRecurrence {
+			t.Errorf("ref[%d].role = %q, want %q", index, ref.Role, delivery.IssueRefRoleRecurrence)
+		}
+	}
+	if rec.Refs[0].Kind != delivery.IssueRefKindCaseRun || rec.Refs[0].RefID != 52 {
+		t.Errorf("first recurrence ref = %+v, want case_run/52", rec.Refs[0])
+	}
+	if len(fixture.repo.appendRefsCalls) != 0 {
+		t.Fatalf("source refs appended on a successful redirect: %+v", fixture.repo.appendRefsCalls)
+	}
+
+	event := fixture.requireSingleEvent(t, "issue.recurred")
+	if event.versionID != 7 {
+		t.Errorf("event version = %d, want 7", event.versionID)
+	}
+	if event.payload["issue_id"] != "903" || event.payload["source_issue_id"] != "902" {
+		t.Errorf("event IDs = %v, want target 903 / source 902", event.payload)
+	}
+	if event.payload["dedupe_key"] != "0123456789abcdef0123456789abcdef" {
+		t.Errorf("event dedupe_key = %v", event.payload["dedupe_key"])
+	}
+	if count := recurrenceEventPayloadInt(t, event.payload, "recurrence_count"); count != 1 {
+		t.Errorf("event recurrence_count = %d, want 1", count)
+	}
+	if failed, present := event.payload["redirect_failed"]; present && failed != false {
+		t.Errorf("successful redirect payload has redirect_failed = %v", failed)
+	}
+
+	audit := fixture.requireSingleAudit(t, "delivery.issue.recurred")
+	if audit.actorID != 0 || audit.targetKind != "issue" || audit.targetID != "903" {
+		t.Errorf("audit = %+v, want system issue/903", audit)
+	}
+	if audit.metadata["source_issue_id"] != "902" || audit.metadata["issue_id"] != "903" {
+		t.Errorf("audit metadata = %v", audit.metadata)
+	}
+	if len(fixture.tasks.calls) != 0 {
+		t.Fatalf("recurrence ensured %d triage tasks, want none", len(fixture.tasks.calls))
+	}
+}
+
+func TestIssueServiceRecurrenceWalksMergedChain(t *testing.T) {
+	source := recurrenceIssue(902, delivery.IssueStatusMerged, issueServiceTestInt64(903), 0)
+	middle := recurrenceIssue(903, delivery.IssueStatusMerged, issueServiceTestInt64(904), 2)
+	final := recurrenceIssue(904, delivery.IssueStatusOpen, nil, 0)
+	fixture := recurrenceMergeFixture(t, source, middle, final)
+	fixture.repo.applyResult = delivery.Issue{ID: 904, VersionID: 7, Status: delivery.IssueStatusOpen, RecurrenceCount: 3}
+
+	issue, created, err := fixture.svc.IngestCandidate(context.Background(), 52)
+	if err != nil || created {
+		t.Fatalf("IngestCandidate() = %+v/%v err=%v, want the final target", issue, created, err)
+	}
+	if issue.ID != 904 {
+		t.Fatalf("redirected issue = %d, want the chain terminal 904", issue.ID)
+	}
+	if len(fixture.repo.applyCalls) != 1 || fixture.repo.applyCalls[0].TargetID != 904 {
+		t.Fatalf("ApplyRecurrence calls = %+v, want target 904", fixture.repo.applyCalls)
+	}
+	event := fixture.requireSingleEvent(t, "issue.recurred")
+	if event.payload["issue_id"] != "904" || event.payload["source_issue_id"] != "902" {
+		t.Errorf("event IDs = %v, want target 904 / source 902", event.payload)
+	}
+	if count := recurrenceEventPayloadInt(t, event.payload, "recurrence_count"); count != 3 {
+		t.Errorf("event recurrence_count = %d, want the repository count 3", count)
+	}
+	fixture.requireSingleAudit(t, "delivery.issue.recurred")
+}
+
+func TestIssueServiceRecurrenceBrokenChainFallsBackToSource(t *testing.T) {
+	source := recurrenceIssue(902, delivery.IssueStatusMerged, issueServiceTestInt64(903), 2)
+	fixture := recurrenceMergeFixture(t, source)
+	// 903 is intentionally absent: the chain is broken.
+
+	issue, created, err := fixture.svc.IngestCandidate(context.Background(), 52)
+	if err != nil || created {
+		t.Fatalf("IngestCandidate() = %+v/%v err=%v, want the source fallback", issue, created, err)
+	}
+	if issue.ID != 902 {
+		t.Fatalf("fallback issue = %d, want the source 902", issue.ID)
+	}
+	if len(fixture.repo.applyCalls) != 0 {
+		t.Fatalf("ApplyRecurrence calls = %+v, want none on a broken chain", fixture.repo.applyCalls)
+	}
+	if len(fixture.repo.appendRefsCalls) != 1 {
+		t.Fatalf("AppendRefs calls = %d, want the source fallback", len(fixture.repo.appendRefsCalls))
+	}
+	appended := fixture.repo.appendRefsCalls[0]
+	if appended.issueID != 902 || len(appended.refs) != 9 {
+		t.Fatalf("fallback append = %+v, want the 9 candidate refs on source 902", appended)
+	}
+	if appended.refs[0].Role != delivery.IssueRefRoleSource {
+		t.Errorf("fallback ref role = %q, want source", appended.refs[0].Role)
+	}
+
+	event := fixture.requireSingleEvent(t, "issue.recurred")
+	if event.payload["issue_id"] != "902" || event.payload["source_issue_id"] != "902" {
+		t.Errorf("failure event IDs = %v, want source 902", event.payload)
+	}
+	if event.payload["redirect_failed"] != true {
+		t.Errorf("failure event redirect_failed = %v, want true", event.payload["redirect_failed"])
+	}
+	if count := recurrenceEventPayloadInt(t, event.payload, "recurrence_count"); count != 2 {
+		t.Errorf("failure event recurrence_count = %d, want the stored 2", count)
+	}
+	audit := fixture.requireSingleAudit(t, "delivery.issue.recurred")
+	if audit.metadata["redirect_failed"] != true || audit.targetID != "902" {
+		t.Errorf("failure audit = %+v, want redirect_failed on the source", audit)
+	}
+}
+
+func TestIssueServiceRecurrenceCycleFallsBackToSource(t *testing.T) {
+	source := recurrenceIssue(902, delivery.IssueStatusMerged, issueServiceTestInt64(903), 0)
+	target := recurrenceIssue(903, delivery.IssueStatusMerged, issueServiceTestInt64(902), 0)
+	fixture := recurrenceMergeFixture(t, source, target)
+
+	issue, created, err := fixture.svc.IngestCandidate(context.Background(), 52)
+	if err != nil || created {
+		t.Fatalf("IngestCandidate() = %+v/%v err=%v, want the source fallback", issue, created, err)
+	}
+	if issue.ID != 902 {
+		t.Fatalf("cycle fallback issue = %d, want the source 902", issue.ID)
+	}
+	if len(fixture.repo.applyCalls) != 0 || len(fixture.repo.appendRefsCalls) != 1 {
+		t.Fatalf("calls apply=%d append=%d, want 0/1", len(fixture.repo.applyCalls), len(fixture.repo.appendRefsCalls))
+	}
+	event := fixture.requireSingleEvent(t, "issue.recurred")
+	if event.payload["redirect_failed"] != true {
+		t.Errorf("cycle event redirect_failed = %v, want true", event.payload["redirect_failed"])
+	}
+	fixture.requireSingleAudit(t, "delivery.issue.recurred")
+}
+
+func TestIssueServiceRecurrenceTargetChangedFallsBackToSource(t *testing.T) {
+	source := recurrenceIssue(902, delivery.IssueStatusMerged, issueServiceTestInt64(903), 0)
+	target := recurrenceIssue(903, delivery.IssueStatusOpen, nil, 0)
+	fixture := recurrenceMergeFixture(t, source, target)
+	fixture.repo.applyErr = delivery.ErrStateConflict
+
+	issue, created, err := fixture.svc.IngestCandidate(context.Background(), 52)
+	if err != nil || created {
+		t.Fatalf("IngestCandidate() = %+v/%v err=%v, want the source fallback", issue, created, err)
+	}
+	if issue.ID != 902 {
+		t.Fatalf("fallback issue = %d, want the source 902", issue.ID)
+	}
+	if len(fixture.repo.appendRefsCalls) != 1 {
+		t.Fatalf("AppendRefs calls = %d, want the source fallback", len(fixture.repo.appendRefsCalls))
+	}
+	event := fixture.requireSingleEvent(t, "issue.recurred")
+	if event.payload["redirect_failed"] != true {
+		t.Errorf("event redirect_failed = %v, want true", event.payload["redirect_failed"])
+	}
+}
+
+func TestIssueServiceRecurrenceRepositoryFailureReturnsError(t *testing.T) {
+	t.Run("redirect write", func(t *testing.T) {
+		source := recurrenceIssue(902, delivery.IssueStatusMerged, issueServiceTestInt64(903), 0)
+		target := recurrenceIssue(903, delivery.IssueStatusOpen, nil, 0)
+		fixture := recurrenceMergeFixture(t, source, target)
+		fixture.repo.applyErr = errIssueTestBoom
+
+		if _, _, err := fixture.svc.IngestCandidate(context.Background(), 52); !errors.Is(err, errIssueTestBoom) {
+			t.Fatalf("IngestCandidate() error = %v, want the repository failure", err)
+		}
+		if len(fixture.events.records) != 0 || len(fixture.audit.records) != 0 {
+			t.Fatalf("side effects = %d events/%d audits, want none", len(fixture.events.records), len(fixture.audit.records))
+		}
+	})
+
+	t.Run("fallback append", func(t *testing.T) {
+		source := recurrenceIssue(902, delivery.IssueStatusMerged, issueServiceTestInt64(903), 0)
+		fixture := recurrenceMergeFixture(t, source)
+		fixture.repo.appendRefsErr = errIssueTestBoom
+
+		if _, _, err := fixture.svc.IngestCandidate(context.Background(), 52); !errors.Is(err, errIssueTestBoom) {
+			t.Fatalf("IngestCandidate() error = %v, want the repository failure", err)
+		}
+	})
+}
+
+func TestIssueServiceDedupeHitOnOpenIssueKeepsP4Behavior(t *testing.T) {
+	fixture := newIssueServiceFixture()
+	fixture.exec.snapshots[52] = issueServiceTestSnapshot(52)
+	fixture.repo.createCreated = false
+	fixture.repo.createResult = delivery.Issue{
+		ID: 902, VersionID: 7, Status: delivery.IssueStatusConfirmed, RecurrenceCount: 4,
+	}
+
+	issue, created, err := fixture.svc.IngestCandidate(context.Background(), 52)
+	if err != nil || created {
+		t.Fatalf("IngestCandidate() = %+v/%v err=%v", issue, created, err)
+	}
+	if issue.ID != 902 || issue.RecurrenceCount != 4 {
+		t.Fatalf("issue = %+v, want the stored confirmed row untouched", issue)
+	}
+	if len(fixture.repo.applyCalls) != 0 || len(fixture.repo.appendRefsCalls) != 0 {
+		t.Fatalf("non-merged dedupe calls apply=%d append=%d, want none (P4 behavior stays in the repository)",
+			len(fixture.repo.applyCalls), len(fixture.repo.appendRefsCalls))
+	}
+	if len(fixture.events.records) != 0 || len(fixture.audit.records) != 0 {
+		t.Fatalf("non-merged dedupe side effects = %d events/%d audits, want none",
+			len(fixture.events.records), len(fixture.audit.records))
+	}
+	if len(fixture.tasks.calls) != 0 {
+		t.Fatalf("non-merged dedupe ensured %d triage tasks, want none", len(fixture.tasks.calls))
+	}
+}
+
+func TestIssueServiceGetProjectsMergedChain(t *testing.T) {
+	fixture := newIssueServiceFixture()
+	fixture.repo.getIssues[42] = recurrenceIssue(42, delivery.IssueStatusMerged, issueServiceTestInt64(43), 0)
+	fixture.repo.getIssues[43] = recurrenceIssue(43, delivery.IssueStatusMerged, issueServiceTestInt64(44), 0)
+	fixture.repo.getIssues[44] = recurrenceIssue(44, delivery.IssueStatusOpen, nil, 0)
+
+	detail, err := fixture.svc.Get(context.Background(), 7, 42)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if len(detail.MergedChain) != 2 || detail.MergedChain[0] != 43 || detail.MergedChain[1] != 44 {
+		t.Fatalf("MergedChain = %v, want [43 44]", detail.MergedChain)
+	}
+
+	open := recurrenceIssue(45, delivery.IssueStatusOpen, nil, 0)
+	fixture.repo.getIssues[45] = open
+	detail, err = fixture.svc.Get(context.Background(), 7, 45)
+	if err != nil || len(detail.MergedChain) != 0 {
+		t.Fatalf("open issue MergedChain = %v err=%v, want empty", detail.MergedChain, err)
+	}
+}
+
+func TestIssueServiceGetPropagatesMergedChainReadError(t *testing.T) {
+	fixture := newIssueServiceFixture()
+	fixture.repo.getIssues[42] = recurrenceIssue(42, delivery.IssueStatusMerged, issueServiceTestInt64(43), 0)
+	// 43 is unknown (broken chain) but that is not an error; a read failure is.
+	fixture.repo.getErrByID[43] = errIssueTestBoom
+
+	if _, err := fixture.svc.Get(context.Background(), 7, 42); !errors.Is(err, errIssueTestBoom) {
+		t.Fatalf("Get() error = %v, want the read failure", err)
 	}
 }

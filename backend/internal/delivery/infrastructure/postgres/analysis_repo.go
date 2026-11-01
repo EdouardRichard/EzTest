@@ -45,13 +45,12 @@ type AnalysisRepository struct {
 
 var _ deliveryapp.AnalysisRepository = (*AnalysisRepository)(nil)
 
-// NewAnalysisRepository wraps a pgx pool. The adapter owns the snowflake source
-// of inserted rows; a caller-supplied positive ID is preserved for deterministic
-// replays.
-func NewAnalysisRepository(pool *pgxpool.Pool) *AnalysisRepository {
-	ids, err := platformid.NewSnowflake(0)
-	if err != nil {
-		panic(fmt.Sprintf("deliverypg: init snowflake generator: %v", err))
+// NewAnalysisRepository wires the adapter over a pgx pool and the process-wide
+// snowflake generator seeded with this replica's registry-allocated node. A
+// caller-supplied positive ID is preserved for deterministic replays.
+func NewAnalysisRepository(pool *pgxpool.Pool, ids platformid.Generator) *AnalysisRepository {
+	if ids == nil {
+		panic("deliverypg: analysis repository requires an id generator")
 	}
 	return &AnalysisRepository{pool: pool, ids: ids}
 }

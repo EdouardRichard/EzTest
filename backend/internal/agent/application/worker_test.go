@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -91,7 +92,7 @@ func (q *fakeWorkerQueue) MarkRunning(_ context.Context, id, _ int64) error {
 	return nil
 }
 
-func (q *fakeWorkerQueue) Heartbeat(_ context.Context, _, _ int64) error {
+func (q *fakeWorkerQueue) Heartbeat(_ context.Context, _, _ int64, _ time.Duration) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.heartbeats++
@@ -246,6 +247,47 @@ func TestWorkerRecoversExpiredLeasesPeriodically(t *testing.T) {
 	stopWorker(t, cancel, done)
 }
 
+// TestWorkerDrainGateStopsNewClaims pins P7 §4.5 for the agent worker: once the
+// replica starts draining, in-flight runs finish but no new item is claimed.
+func TestWorkerDrainGateStopsNewClaims(t *testing.T) {
+	first := fakeWorkItem(agentapp.WorkTypeChatTurn, agentapp.WorkItemPayload{ConversationID: 20})
+	second := fakeWorkItem(agentapp.WorkTypeChatTurn, agentapp.WorkItemPayload{ConversationID: 21})
+	second.ID = first.ID + 1
+	queue := newFakeWorkerQueue(first, second)
+	executor := &fakeRunExecutor{
+		result:  agentapp.RunResult{AgentRunID: 77, Status: agent.AgentRunDone},
+		started: make(chan int64, 4),
+		release: make(chan struct{}),
+	}
+	var draining atomic.Bool
+	worker := newTestWorker(queue, executor, &fakeSettings{},
+		agentapp.WithWorkerPollInterval(2*time.Millisecond),
+		agentapp.WithWorkerConcurrency(1),
+		agentapp.WithWorkerDrainGate(draining.Load),
+	)
+	cancel, done := runWorker(t, worker)
+	defer stopWorker(t, cancel, done)
+
+	select {
+	case <-executor.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker never started the first item")
+	}
+	draining.Store(true)
+	close(executor.release)
+	waitUntil(t, 2*time.Second, func() bool {
+		queue.mu.Lock()
+		defer queue.mu.Unlock()
+		return len(queue.completes) == 1
+	}, "in-flight item completion")
+
+	time.Sleep(40 * time.Millisecond)
+	claims, _, _ := queue.counts()
+	if claims != 1 {
+		t.Fatalf("claims while draining = %d, want only the in-flight 1", claims)
+	}
+}
+
 func TestWorkerClaimsRunsAndCompletes(t *testing.T) {
 	item := fakeWorkItem(agentapp.WorkTypeChatTurn, agentapp.WorkItemPayload{ConversationID: 20, MessageID: 501})
 	queue := newFakeWorkerQueue(item)
@@ -309,8 +351,8 @@ func TestWorkerClaimsOnlyAgentProductTeams(t *testing.T) {
 			t.Fatalf("claim teams = %#v, want %#v", teams, productTeams)
 		}
 		for _, team := range teams {
-			if team == agent.TeamCode {
-				t.Fatalf("agent worker claimed code team: %#v", teams)
+			if team == agent.TeamCode || team == agent.TeamOps {
+				t.Fatalf("agent worker claimed %s team: %#v", team, teams)
 			}
 		}
 	}

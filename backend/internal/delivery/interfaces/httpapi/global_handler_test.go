@@ -67,6 +67,7 @@ func sampleGlobalIssueViews() []deliveryapp.GlobalIssueView {
 			Issue:        merged,
 			VersionTitle: "登录改版",
 			URL:          "/versions/42?tab=issues&issue=103",
+			MergedChain:  []int64{2002, 2003},
 		},
 		{
 			Issue:        reopened,
@@ -130,6 +131,10 @@ func TestGlobalIssueRouteForwardsFiltersAndProjectsViews(t *testing.T) {
 		first["url"] != "/versions/42?tab=issues&issue=103" ||
 		first["merged_into_id"] != "2002" || first["reopen_count"] != float64(1) {
 		t.Fatalf("first issue = %#v", first)
+	}
+	if chain, ok := first["merged_chain"].([]any); !ok || len(chain) != 2 ||
+		chain[0] != "2002" || chain[1] != "2003" {
+		t.Fatalf("global merged_chain = %#v, want [2002 2003]", first["merged_chain"])
 	}
 	second := items[1].(map[string]any)
 	if second["version_title"] != "结算改版" ||

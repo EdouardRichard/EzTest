@@ -158,10 +158,13 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
         case "issue.updated":
         case "issue.reopened":
         case "issue.merged":
+        case "issue.recurred":
           handlersRef.current.onIssueChanged?.(event)
           break
         case "report.published":
         case "report.stale":
+        case "report.pdf_ready":
+        case "report.pdf_failed":
           handlersRef.current.onReportChanged?.(event)
           break
         case "visual.baseline_approved":

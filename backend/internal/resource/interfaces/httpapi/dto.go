@@ -11,6 +11,7 @@ type sutDTO struct {
 	ID           string           `json:"id"`
 	Name         string           `json:"name"`
 	Intro        string           `json:"intro"`
+	Family       *string          `json:"family"`
 	Environments []environmentDTO `json:"environments"`
 	CreatedAt    string           `json:"created_at"`
 	UpdatedAt    string           `json:"updated_at"`
@@ -115,6 +116,7 @@ func toSUTDTO(view resourceapp.SUTView) sutDTO {
 		ID:           view.ID,
 		Name:         view.Name,
 		Intro:        view.Intro,
+		Family:       view.Family,
 		Environments: environments,
 		CreatedAt:    formatTime(view.CreatedAt),
 		UpdatedAt:    formatTime(view.UpdatedAt),
@@ -250,13 +252,15 @@ func toCodeRepositoryDTO(view resourceapp.CodeRepositoryView) codeRepositoryDTO 
 // ---------- request payloads ----------
 
 type sutCreateRequest struct {
-	Name  string `json:"name"`
-	Intro string `json:"intro"`
+	Name   string  `json:"name"`
+	Intro  string  `json:"intro"`
+	Family *string `json:"family"`
 }
 
 type sutPatchRequest struct {
-	Name  *string `json:"name"`
-	Intro *string `json:"intro"`
+	Name   *string `json:"name"`
+	Intro  *string `json:"intro"`
+	Family *string `json:"family"`
 }
 
 type environmentCreateRequest struct {

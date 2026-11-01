@@ -29,6 +29,11 @@ type WorkItemRepository interface {
 	// ClaimForTeams is Claim restricted to the given teams. An empty team set
 	// claims nothing.
 	ClaimForTeams(ctx context.Context, claimant string, teams []Team, lease time.Duration) (item WorkItem, ok bool, err error)
+	// ClaimForTypes is Claim restricted to the given work item types. Unlike
+	// Claim it also takes over claimed/running items whose lease expired, so a
+	// crashed render/worker instance cannot strand its item until recovery.
+	// An empty type set claims nothing.
+	ClaimForTypes(ctx context.Context, claimant string, types []string, lease time.Duration) (item WorkItem, ok bool, err error)
 	// Get loads one work item, or ErrNotFound.
 	Get(ctx context.Context, id int64) (WorkItem, error)
 	// MarkRunning moves a claimed item to running.

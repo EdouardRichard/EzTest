@@ -13,7 +13,7 @@
 | 字段 | 语义 |
 |---|---|
 | `version_id` | 版本作用域 |
-| `team` | `clarification / design / execution / delivery / steward / code`（`code` 为 P5 增量） |
+| `team` | `clarification / design / execution / delivery / steward / code / ops`（`code` 为 P5 增量，`ops` 为 P7 确定性 worker 任务团队） |
 | `type` | 本文件定义的任务类型 |
 | `priority` | 越大越先（P1 默认 0） |
 | `dedupe_key` | 幂等键；`UNIQUE(version_id,type,dedupe_key)` |
@@ -117,3 +117,18 @@ P5 把 `index.repo` 从 §4 移到本节并实现，并新增 `code.analyze`；�
 - 事件：`work_item.created/claimed/failed/dead` 由 P1 worker 发布到 `version:{id}`；P5 不为 `code` 团队建 `team_room`/digest（§4.4）。
 - 完成语义：业务产物写入成功且事件发布尝试完成后 `done`；事件失败不回滚业务，reconciler 兜底；失败不阻塞其他 version 任务。
 - `visual.compare` 不是 work_item 类型：由 `execute.case` 内的 `execution.visual_assert` 工具/执行流程调用执行器 action（见 `agent-profiles-tools.md` §8、`executor-protocol.md` v1.2）。
+
+## 8. P7 任务类型（实现；frozen: P7，2026-11-01）
+
+P7 把 `report.render_pdf` 从 §4 的预留类型移入本节并实现；team=`ops`，版本域，不映射 Agent profile（非模型任务，由每实例 `RenderWorker` 领取）。`ops` 是 P7 的确定性 worker 团队：P1 agent worker 只领取 `clarification/design/execution/delivery/steward` 五个产品团队，因此永远不会领取 `report.render_pdf`（否则会以 `invalid_work_type` 置 dead，验收 S1 的 P7-BUG-01）；`RenderWorker` 用 `ClaimForTypes` 按类型领取，不依赖 team。
+
+| type | team | profile | dedupe_key | payload | 输出 | 失败语义 |
+|---|---|---|---|---|---|---|
+| `report.render_pdf` | ops | —（不映射 Agent profile） | `report:{report_id}:rev:{revision}` | `{report_id,report_revision_id}` | 读已发布 HTML（内容账本）→ renderer PDF → 写 `content_ref`（owner_kind=`report_revision`、role=`report_pdf`）→ fenced 更新 `pdf_status='done'`/`pdf_ref`/`pdf_rendered_at`/`pdf_attempts` + 事件/审计 | 可重试错误 → `Fail(retryable=true)` 回 `open` 指数退避；超过 `report.render_max_attempts` 或不可重试 → `pdf_status='failed'` + `report.pdf_failed`；不影响报告 published 与版本收尾 |
+
+- **版本作用域**：`version_id` = 报告所属版本（`work_item.version_id` NOT NULL）；payload 只带引用，不带 HTML/PDF 字节。
+- **去重**：`dedupe_key = report:{report_id}:rev:{revision}`（全时唯一）；同一 revision 重复 ensure 返回既有行，不新增；`revision` 取 `delivery_report_revision.revision`。
+- **重试**：`max_attempts` 取设置 `report.render_max_attempts`（1–10，默认 3），不使用 work_item 默认 3；租约取 `report.render_lease_seconds`（30–1800，默认 120）；worker 用 `ClaimForTypes(ctx, claimant, ["report.render_pdf"], lease)` 领取并按类型续租。
+- **创建者**：`ReportService.Publish` 成功后置新 revision `pdf_status='pending'`（`report.render_pdf=false` 时 `disabled`）并 ensure；P7 reconciler（`P7Ensurer`）扫描 `published + render_status='done' + pdf_status IN ('pending','failed') + pdf_attempts < report.render_max_attempts` 的 revision 兜底 ensure（含迁移后既有 revision 补齐）；`report.render_pdf=false` 时跳过。
+- **并发/安全**：同一 revision 至多一个活跃任务（dedupe + work_item CAS）；结果写回必须匹配 `lease_epoch`，PDF 元数据更新需 fenced（`pdf_ref` 为空且 `pdf_status IN ('pending','failed','running')`）；HTML 读取校验内容账本 owner/role/sha/size。
+- P7 **不新增其他任务类型**：`knowledge.review`/`gc.run`/`search.*` 仍保留、不注册；知识审核走 admin API，周期 GC 是 leader worker 而非 work_item。P7 后任务类型合计 **19**（P1 3 + P2 5 + P3 3 + P4 5 + P5 2 + P7 1）。

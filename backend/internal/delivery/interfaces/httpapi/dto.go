@@ -101,6 +101,10 @@ func (r mergeIssueRequest) parse() (int64, issueAction, error) {
 /* ---------------------------------- views --------------------------------- */
 
 // IssueView is the list/action projection of one issue (contract IssueView).
+// RecurrenceCount/LastRecurredAt are the P7 recurrence projection; MergedChain
+// is the read-time merged_into target chain (direct target first, terminal
+// target last, at most MaxIssueMergeChain IDs) and is null for a non-merged
+// issue (spec §4.6).
 type IssueView struct {
 	ID               string           `json:"id"`
 	VersionID        string           `json:"version_id"`
@@ -114,6 +118,9 @@ type IssueView struct {
 	MergedIntoID     *string          `json:"merged_into_id"`
 	MergedAt         *string          `json:"merged_at"`
 	ReopenCount      int              `json:"reopen_count"`
+	RecurrenceCount  int              `json:"recurrence_count"`
+	LastRecurredAt   *string          `json:"last_recurred_at"`
+	MergedChain      []string         `json:"merged_chain"`
 	Refs             []IssueRefView   `json:"refs"`
 	Triage           *IssueTriageView `json:"triage"`
 	CreatedAt        string           `json:"created_at"`
@@ -154,7 +161,7 @@ type IssueDetailView struct {
 	RelatedRefs map[string]int     `json:"related_refs"`
 }
 
-func toIssueView(issue delivery.Issue, refs []delivery.IssueRef, triage *delivery.AnalysisRun) IssueView {
+func toIssueView(issue delivery.Issue, refs []delivery.IssueRef, triage *delivery.AnalysisRun, mergedChain []int64) IssueView {
 	source := issue.Source
 	if source == "" {
 		source = delivery.IssueCandidateSource
@@ -172,6 +179,9 @@ func toIssueView(issue delivery.Issue, refs []delivery.IssueRef, triage *deliver
 		MergedIntoID:     optionalIDString(issue.MergedIntoID),
 		MergedAt:         formatOptionalTime(issue.MergedAt),
 		ReopenCount:      issue.ReopenCount,
+		RecurrenceCount:  issue.RecurrenceCount,
+		LastRecurredAt:   formatOptionalTime(issue.LastRecurredAt),
+		MergedChain:      formatIssueChain(mergedChain),
 		Refs:             make([]IssueRefView, 0, len(refs)),
 		Triage:           toIssueTriageView(triage),
 		CreatedAt:        formatTime(issue.CreatedAt),
@@ -181,6 +191,19 @@ func toIssueView(issue delivery.Issue, refs []delivery.IssueRef, triage *deliver
 		view.Refs = append(view.Refs, toIssueRefView(ref))
 	}
 	return view
+}
+
+// formatIssueChain maps the read-time merge chain onto decimal-string IDs. An
+// empty chain projects as null (the optional contract field).
+func formatIssueChain(chain []int64) []string {
+	if len(chain) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(chain))
+	for _, id := range chain {
+		ids = append(ids, platformid.Format(id))
+	}
+	return ids
 }
 
 func toIssueRefView(ref delivery.IssueRef) IssueRefView {
@@ -292,19 +315,22 @@ type ReportView struct {
 }
 
 // ReportRevisionView is one append-only revision projection (contract
-// ReportRevisionView).
+// ReportRevisionView). PDF fields are the P7 non-breaking widening.
 type ReportRevisionView struct {
-	ID               string `json:"id"`
-	ReportID         string `json:"report_id"`
-	Revision         int32  `json:"revision"`
-	Status           string `json:"status"`
-	AsOf             string `json:"as_of"`
-	InputFingerprint string `json:"input_fingerprint"`
-	TemplateVersion  string `json:"template_version"`
-	RenderStatus     string `json:"render_status"`
-	HTMLAvailable    bool   `json:"html_available"`
-	PDFAvailable     bool   `json:"pdf_available"`
-	CreatedAt        string `json:"created_at"`
+	ID               string  `json:"id"`
+	ReportID         string  `json:"report_id"`
+	Revision         int32   `json:"revision"`
+	Status           string  `json:"status"`
+	AsOf             string  `json:"as_of"`
+	InputFingerprint string  `json:"input_fingerprint"`
+	TemplateVersion  string  `json:"template_version"`
+	RenderStatus     string  `json:"render_status"`
+	HTMLAvailable    bool    `json:"html_available"`
+	PDFAvailable     bool    `json:"pdf_available"`
+	PDFStatus        string  `json:"pdf_status"`
+	PDFError         *string `json:"pdf_error"`
+	PDFRenderedAt    *string `json:"pdf_rendered_at"`
+	CreatedAt        string  `json:"created_at"`
 }
 
 // ReportRefView is one report revision logical reference.
@@ -360,8 +386,11 @@ func toReportRevisionView(revision delivery.ReportRevision) ReportRevisionView {
 		RenderStatus:     revision.RenderStatus,
 		HTMLAvailable: revision.Status == delivery.ReportStatusPublished &&
 			revision.RenderStatus == reportRenderDone && revision.HTMLRef != nil,
-		PDFAvailable: false, // P4 never renders PDF (spec §6.3)
-		CreatedAt:    formatTime(revision.CreatedAt),
+		PDFAvailable:  revision.PDFStatus == delivery.PDFStatusDone && revision.PDFRef != nil,
+		PDFStatus:     string(revision.PDFStatus),
+		PDFError:      optionalString(revision.PDFError),
+		PDFRenderedAt: formatOptionalTime(revision.PDFRenderedAt),
+		CreatedAt:     formatTime(revision.CreatedAt),
 	}
 }
 
@@ -501,6 +530,15 @@ func formatOptionalTime(value *time.Time) *string {
 		return nil
 	}
 	return strPtr(formatTime(*value))
+}
+
+// optionalString maps an empty string to JSON null.
+func optionalString(value string) *string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	trimmed := value
+	return &trimmed
 }
 
 func optionalIDString(value *int64) *string {

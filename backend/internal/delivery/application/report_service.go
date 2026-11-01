@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"time"
 
 	delivery "github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
@@ -18,8 +19,9 @@ const (
 	reportEventStale     = "report.stale"
 )
 
-// Report lifecycle constants. template_version is fixed to "1" in P4 (spec
-// §6.1/§6.2).
+// Report lifecycle constants. template_version falls back to "1" (the frozen
+// P4 built-in template) when the renderer does not report a version; renderers
+// implementing delivery.ReportTemplateVersioner supply the actual version.
 const (
 	reportTemplateVersion = "1"
 	reportRenderPending   = "pending"
@@ -45,6 +47,12 @@ type ReportService struct {
 	// and its tests keep compiling; WithGlobalReader attaches them.
 	global GlobalReportReader
 	titles VersionTitleReader
+
+	// P7 PDF pipeline (spec §4.2). Attached with WithRenderJobs; nil keeps the
+	// P4 HTML-only lifecycle so older wirings keep compiling.
+	renderJobs     RenderJobRepository
+	renderPDF      bool
+	renderAttempts int
 }
 
 // NewReportService wires the report use cases. events, audit and tasks may be
@@ -81,6 +89,20 @@ type systemClock struct{}
 
 // Now implements Clock.
 func (systemClock) Now() time.Time { return time.Now().UTC() }
+
+// WithRenderJobs attaches the P7 PDF render-job pipeline. renderEnabled mirrors
+// report.render_pdf (when false, Publish marks new revisions disabled instead of
+// booking a render job) and maxAttempts mirrors report.render_max_attempts. It
+// returns the service so the composition root can chain it.
+func (s *ReportService) WithRenderJobs(jobs RenderJobRepository, renderEnabled bool, maxAttempts int) *ReportService {
+	s.renderJobs = jobs
+	s.renderPDF = renderEnabled
+	if maxAttempts < MinRenderAttempts || maxAttempts > MaxRenderAttempts {
+		maxAttempts = DefaultRenderMaxAttempts
+	}
+	s.renderAttempts = maxAttempts
+	return s
+}
 
 // EnsureWaveReport makes sure a wave report exists for a terminal wave and has
 // an in-flight draft revision with a report.wave work item. It is idempotent:
@@ -302,6 +324,11 @@ func (s *ReportService) Publish(ctx context.Context, reportID int64, revision in
 		s.failRevision(ctx, current.ID, err)
 		return delivery.ReportRevision{}, err
 	}
+	// Stamp the v2 appendix metadata from the authoritative report/revision
+	// rows. These fields never participate in the fingerprint.
+	snapshot.ReportID = report.ID
+	snapshot.ReportRevision = revision
+	snapshot.InputFingerprint = fingerprint
 
 	html, err := s.renderer.Render(ctx, snapshot, narrative, s.sections)
 	if err != nil {
@@ -334,9 +361,30 @@ func (s *ReportService) Publish(ctx context.Context, reportID int64, revision in
 	if err := s.ensureWaveLink(ctx, report); err != nil {
 		return published, err
 	}
+	s.bookPDF(ctx, report, published)
 	s.publishPublishedEvent(ctx, report, published)
 	s.recordPublishedAudit(ctx, report, published)
 	return published, nil
+}
+
+// bookPDF books the P7 PDF work for one published revision (spec §4.2). It is
+// best-effort: HTML publishing never waits for PDF, and the reconciler backfills
+// any ensure that failed here. With report.render_pdf off the revision is marked
+// disabled instead of booking a task.
+func (s *ReportService) bookPDF(ctx context.Context, report delivery.Report, revision delivery.ReportRevision) {
+	if s == nil || s.renderJobs == nil {
+		return
+	}
+	if !s.renderPDF {
+		_ = s.renderJobs.MarkPDFDisabled(ctx, revision.ID)
+		return
+	}
+	attempts := s.renderAttempts
+	if attempts < MinRenderAttempts || attempts > MaxRenderAttempts {
+		attempts = DefaultRenderMaxAttempts
+	}
+	dedupeKey := fmt.Sprintf("report:%d:rev:%d", report.ID, revision.Revision)
+	_ = s.renderJobs.EnsureRenderJob(ctx, revision.ID, report.ID, report.VersionID, dedupeKey, attempts)
 }
 
 // MarkStaleIfChanged recomputes the current input fingerprint of every
@@ -399,7 +447,11 @@ func (s *ReportService) List(ctx context.Context, versionID int64, kind *deliver
 	return reports, nil
 }
 
-// Get returns one report with its revisions (newest first) and logical refs.
+// Get returns one report with its revisions (newest first) and the logical refs
+// of its current revision. delivery_report_ref is append-only across revisions,
+// so the projection must not expose the historical refs: the report detail
+// shows only the current revision's refs (deduplicated by kind/ref_id), never
+// the union of every revision.
 func (s *ReportService) Get(ctx context.Context, versionID, reportID int64) (ReportDetail, error) {
 	if versionID <= 0 || reportID <= 0 {
 		return ReportDetail{}, platform.Invalid("report_id", "must be a positive decimal ID")
@@ -416,7 +468,29 @@ func (s *ReportService) Get(ctx context.Context, versionID, reportID int64) (Rep
 	if err != nil {
 		return ReportDetail{}, mapReportError(err)
 	}
-	return ReportDetail{Report: report, Revisions: revisions, Refs: refs}, nil
+	return ReportDetail{Report: report, Revisions: revisions, Refs: currentRevisionRefs(refs, report.CurrentRevisionID)}, nil
+}
+
+// currentRevisionRefs keeps the refs of the current report revision only and
+// collapses duplicate (kind, ref_id) rows, preserving insertion order. A report
+// without a current revision (draft) falls back to the deduplicated union, since
+// no revision is authoritative yet.
+func currentRevisionRefs(refs []delivery.ReportRef, currentRevisionID *int64) []delivery.ReportRef {
+	current := make([]delivery.ReportRef, 0, len(refs))
+	seen := make(map[string]struct{}, len(refs))
+	filterByRevision := currentRevisionID != nil && *currentRevisionID > 0
+	for _, ref := range refs {
+		if filterByRevision && ref.ReportRevisionID != *currentRevisionID {
+			continue
+		}
+		key := ref.Kind + ":" + strconv.FormatInt(ref.RefID, 10)
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+		seen[key] = struct{}{}
+		current = append(current, ref)
+	}
+	return current
 }
 
 // OpenHTML returns the verified HTML bytes of one published revision. The
@@ -459,6 +533,61 @@ func (s *ReportService) OpenHTML(ctx context.Context, versionID, reportID int64,
 		return nil, stored, reportContentCorrupt()
 	}
 	return html, stored, nil
+}
+
+// OpenPDF returns the verified PDF bytes of one published revision (spec §6.4).
+// The report must belong to the path version and the revision to the report. A
+// revision whose PDF is pending/running is 409 pdf_not_ready; a failed render is
+// 409 pdf_failed; a disabled or missing PDF is 404. The content adapter
+// re-validates owner/role/sha/size and the service additionally checks the
+// %PDF- magic.
+func (s *ReportService) OpenPDF(ctx context.Context, versionID, reportID int64, revision int32) ([]byte, delivery.ReportRevision, error) {
+	if versionID <= 0 || reportID <= 0 || revision <= 0 {
+		return nil, delivery.ReportRevision{}, platform.Invalid("report_id", "must be a positive decimal ID and revision a positive integer")
+	}
+	if _, err := s.repo.GetReport(ctx, versionID, reportID); err != nil {
+		return nil, delivery.ReportRevision{}, mapReportError(err)
+	}
+	stored, err := s.repo.GetRevision(ctx, reportID, revision)
+	if err != nil {
+		return nil, delivery.ReportRevision{}, mapReportError(err)
+	}
+	if stored.Status != delivery.ReportStatusPublished || stored.RenderStatus != reportRenderDone {
+		return nil, stored, platform.NotFound("report revision")
+	}
+	switch stored.PDFStatus {
+	case delivery.PDFStatusDone:
+		if stored.PDFRef == nil {
+			return nil, stored, platform.NotFound("report PDF")
+		}
+	case delivery.PDFStatusPending, delivery.PDFStatusRunning:
+		return nil, stored, pdfNotReady()
+	case delivery.PDFStatusFailed:
+		return nil, stored, pdfFailed(stored.PDFError)
+	default:
+		return nil, stored, platform.NotFound("report PDF")
+	}
+	if s.content == nil {
+		return nil, stored, reportServiceNotConfigured("content store")
+	}
+	pdf, sha, size, err := s.content.OpenReportPDF(ctx, *stored.PDFRef)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrReportContentNotFound):
+			return nil, stored, platform.NotFound("report PDF content")
+		case errors.Is(err, ErrReportContentCorrupt):
+			return nil, stored, reportContentCorrupt()
+		default:
+			if apiErr := platform.AsError(err); apiErr.Status == 404 {
+				return nil, stored, platform.NotFound("report PDF content")
+			}
+			return nil, stored, err
+		}
+	}
+	if !validReportSHA(sha) || size != int64(len(pdf)) || !validPDFHeader(pdf) {
+		return nil, stored, reportContentCorrupt()
+	}
+	return pdf, stored, nil
 }
 
 // ensureGeneration returns a report with an in-flight draft revision: it
@@ -523,13 +652,25 @@ func (s *ReportService) createNextDraft(ctx context.Context, report delivery.Rep
 		Status:           delivery.ReportStatusDraft,
 		InputFingerprint: fingerprint,
 		AsOf:             asOf,
-		TemplateVersion:  reportTemplateVersion,
+		TemplateVersion:  s.templateVersion(),
 		RenderStatus:     reportRenderPending,
 	})
 	if err != nil {
 		return delivery.ReportRevision{}, mapReportError(err)
 	}
 	return revision, nil
+}
+
+// templateVersion resolves the built-in template version new revisions record:
+// the renderer is the source of truth (P7-D-03); a renderer that does not
+// report one keeps the frozen P4 version.
+func (s *ReportService) templateVersion() string {
+	if versioner, ok := s.renderer.(delivery.ReportTemplateVersioner); ok {
+		if version := versioner.TemplateVersion(); version != "" {
+			return version
+		}
+	}
+	return reportTemplateVersion
 }
 
 // snapshotFor reads and caps the deterministic report input for one report and
@@ -767,6 +908,31 @@ func validReportSHA(value string) bool {
 		}
 	}
 	return true
+}
+
+// validPDFHeader reports the PDF file signature of stored bytes.
+func validPDFHeader(data []byte) bool {
+	return len(data) >= 5 && string(data[:5]) == "%PDF-"
+}
+
+// pdfNotReady is the stable 409 of a revision whose PDF is still rendering
+// (spec §6.4).
+func pdfNotReady() error {
+	apiErr := platform.NewError(409, "pdf_not_ready", "report PDF is not ready")
+	apiErr.Details = map[string]any{"reason": "pdf_not_ready"}
+	return apiErr
+}
+
+// pdfFailed is the stable 409 of a revision whose PDF rendering failed. The
+// readable failure reason travels in details.error (already bounded on write).
+func pdfFailed(message string) error {
+	apiErr := platform.NewError(409, "pdf_failed", "report PDF rendering failed")
+	details := map[string]any{"reason": "pdf_failed"}
+	if message != "" {
+		details["error"] = message
+	}
+	apiErr.Details = details
+	return apiErr
 }
 
 // reportContentCorrupt is the stable 409 for a failed report content integrity

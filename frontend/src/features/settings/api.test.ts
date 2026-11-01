@@ -2,19 +2,28 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import {
   type AuditLogEntry,
+  activateInstance,
   addLLMModel,
+  createGCRun,
   createLLMConfig,
   createUser,
   deleteLLMConfig,
   deleteLLMModel,
+  drainInstance,
   fetchLLMConfigs,
   fetchLLMModels,
   fetchSettings,
   fetchUsers,
+  type GCRun,
+  type GCRunDetail,
+  getGCRun,
   groupSettings,
+  type Instance,
   type LLMConfig,
   type LLMModel,
   listAuditLogs,
+  listGCRuns,
+  listInstances,
   refreshLLMModels,
   resetUserPassword,
   type Setting,
@@ -403,5 +412,143 @@ describe("audit API", () => {
     expect(url.searchParams.has("action")).toBe(false)
     expect(url.searchParams.has("actor")).toBe(false)
     expect(url.searchParams.has("cursor")).toBe(false)
+  })
+})
+
+/* ---------------------------- admin GC / instances ---------------------------- */
+
+const gcRun: GCRun = {
+  id: "6001",
+  mode: "dry_run",
+  status: "completed",
+  actor_id: "9001",
+  actor_kind: "user",
+  started_at: "2026-11-01T06:00:00Z",
+  finished_at: "2026-11-01T06:00:01Z",
+  scanned_objects: 12,
+  scanned_refs: 30,
+  deleted_objects: 0,
+  deleted_refs: 0,
+  deleted_bytes: 0,
+  report: {
+    mode: "dry_run",
+    dry_run: true,
+    status: "completed",
+    candidates: { unreferenced: 2, temp: 1, superseded_export: 1, orphan_file: 0 },
+    planned: { objects: 2, refs: 1, files: 2, bytes: 2048 },
+    deleted: { objects: 0, refs: 0, files: 0, bytes: 0 },
+  },
+  error: null,
+}
+
+const gcDetail: GCRunDetail = {
+  ...gcRun,
+  tombstones: [
+    {
+      id: "6101",
+      run_id: "6001",
+      object_sha: "a".repeat(64),
+      size: 1024,
+      mime: "application/octet-stream",
+      relative_path: "objects/aa/aa.pdf",
+      reason: "unreferenced",
+      deleted_at: "2026-11-01T06:00:01Z",
+    },
+  ],
+}
+
+const instance: Instance = {
+  id: "5001",
+  instance_key: "host-5001",
+  hostname: "test-host",
+  pid: 4242,
+  api_port: 13333,
+  node_id: 1,
+  status: "active",
+  version: "0.2.0-p7",
+  last_error: null,
+  started_at: "2026-11-01T05:00:00Z",
+  heartbeat_at: "2026-11-01T06:00:00Z",
+  draining_at: null,
+  stopped_at: null,
+  created_at: "2026-11-01T05:00:00Z",
+  updated_at: "2026-11-01T06:00:00Z",
+}
+
+describe("admin GC and instance API", () => {
+  beforeEach(() => {
+    window.sessionStorage.clear()
+    fetchMock.mockReset()
+    vi.stubGlobal("fetch", fetchMock)
+    vi.stubEnv("NEXT_PUBLIC_API_BASE_URL", "")
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.unstubAllEnvs()
+    window.sessionStorage.clear()
+  })
+
+  it("lists GC runs with the default limit", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ data: [gcRun], next_cursor: "", has_more: false }))
+
+    const page = await listGCRuns()
+
+    expect(page.items).toEqual([gcRun])
+    expect(fetchMock.mock.calls[0][0]).toBe("http://localhost:13333/api/admin/gc/runs?limit=20")
+    expect(fetchMock.mock.calls[0][1]?.method).toBe("GET")
+  })
+
+  it("starts a dry run without a confirmation flag", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ data: gcRun }))
+
+    await expect(createGCRun("dry_run")).resolves.toEqual(gcRun)
+
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe("http://localhost:13333/api/admin/gc/runs")
+    expect(init?.method).toBe("POST")
+    expect(readBody(init)).toEqual({ mode: "dry_run" })
+  })
+
+  it("sends confirm=true for an apply run", async () => {
+    const applied: GCRun = { ...gcRun, mode: "apply", report: { ...gcRun.report, dry_run: false } }
+    fetchMock.mockResolvedValue(jsonResponse({ data: applied }))
+
+    await expect(createGCRun("apply", true)).resolves.toEqual(applied)
+
+    expect(readBody(fetchMock.mock.calls[0][1])).toEqual({ mode: "apply", confirm: true })
+  })
+
+  it("reads one run detail with tombstones", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ data: gcDetail }))
+
+    await expect(getGCRun("6001")).resolves.toEqual(gcDetail)
+
+    expect(fetchMock.mock.calls[0][0]).toBe("http://localhost:13333/api/admin/gc/runs/6001")
+  })
+
+  it("lists instances and transitions drain/activate", async () => {
+    const draining: Instance = {
+      ...instance,
+      status: "draining",
+      draining_at: "2026-11-01T06:10:00Z",
+    }
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ data: [instance], next_cursor: "", has_more: false }))
+      .mockResolvedValueOnce(jsonResponse({ data: draining }))
+      .mockResolvedValueOnce(jsonResponse({ data: instance }))
+
+    const page = await listInstances()
+    expect(page.items).toEqual([instance])
+    await expect(drainInstance("5001")).resolves.toEqual(draining)
+    await expect(activateInstance("5001")).resolves.toEqual(instance)
+
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      "http://localhost:13333/api/admin/instances",
+      "http://localhost:13333/api/admin/instances/5001/drain",
+      "http://localhost:13333/api/admin/instances/5001/activate",
+    ])
+    expect(fetchMock.mock.calls[1][1]?.method).toBe("POST")
+    expect(fetchMock.mock.calls[2][1]?.method).toBe("POST")
   })
 })

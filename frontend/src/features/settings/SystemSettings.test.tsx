@@ -5,6 +5,13 @@ import "@testing-library/jest-dom/vitest"
 import type { Setting } from "./api"
 import { SystemSettings } from "./SystemSettings"
 
+// Admin-only panels are covered by their own tests; keep this suite on the
+// settings editor and avoid a second data-loading surface per test.
+vi.mock("./GCPanel", () => ({ GCPanel: () => <div data-testid="gc-panel-stub">GC 面板</div> }))
+vi.mock("./InstancePanel", () => ({
+  InstancePanel: () => <div data-testid="instance-panel-stub">实例面板</div>,
+}))
+
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,

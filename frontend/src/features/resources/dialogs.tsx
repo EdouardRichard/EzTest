@@ -116,6 +116,7 @@ export function SutDialog({ initial, onClose, onSubmit }: SutDialogProps) {
   const editing = initial !== undefined
   const [name, setName] = useState(initial?.name ?? "")
   const [intro, setIntro] = useState(initial?.intro ?? "")
+  const [family, setFamily] = useState(initial?.family ?? "")
   const [environmentName, setEnvironmentName] = useState("")
   const [baseUrl, setBaseUrl] = useState("")
   const [errors, setErrors] = useState<FormErrors<SutFormValues>>({})
@@ -129,6 +130,7 @@ export function SutDialog({ initial, onClose, onSubmit }: SutDialogProps) {
     const values: SutFormValues = {
       name: name.trim(),
       intro: intro.trim(),
+      family: family.trim(),
       environmentName: environmentName.trim(),
       baseUrl: baseUrl.trim(),
     }
@@ -178,6 +180,19 @@ export function SutDialog({ initial, onClose, onSubmit }: SutDialogProps) {
           className="min-h-20"
           value={intro}
           onChange={(event) => setIntro(event.target.value)}
+        />
+      </Field>
+      <Field
+        id="sut-family"
+        label="系统族（family）"
+        error={errors.family}
+        hint="可选；小写 slug（a-z、0-9、-、_），最长 64；用于匹配 system 知识。"
+      >
+        <Input
+          id="sut-family"
+          autoComplete="off"
+          value={family}
+          onChange={(event) => setFamily(event.target.value)}
         />
       </Field>
       {editing ? null : (
