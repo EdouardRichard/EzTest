@@ -3,7 +3,7 @@
 > 状态：**completed（全部门禁/验收通过；契约 `frozen: P7`）**
 > 日期：2026-11-02
 > 阶段：P7（`docs/version-V0.2/phases/phase-07-p9.md`）
-> 实施分支：`feat/v0.2-p7`（从 `feat/v0.2` @`a1bd99b` 拉出）→ 合回 `feat/v0.2`（merge 提交见 §7）
+> 实施分支：`feat/v0.2-p7`（从 `feat/v0.2` @`a1bd99b` 拉出）→ 合回 `feat/v0.2`（merge `c62e269`；e2e spec 追加 `e034e09`）
 > 实施 spec：[2026-11-01-eztest-v02-p7-p9-design.md](../../superpowers/specs/2026-11-01-eztest-v02-p7-p9-design.md)
 > 实施 plan：[2026-11-01-eztest-v02-p7-p9.md](../../superpowers/plans/2026-11-01-eztest-v02-p7-p9.md)
 > 验收证据：[acceptance/p7/](../acceptance/p7/)
@@ -46,6 +46,7 @@
   - 关键：S1 真实 PDF 211002B `%PDF-` + ledger sha、revision 五字段/HTML 字节不变；S2 死 renderer→failed+事件→恢复后成功；S3 附录/模板 2；S4/S5 真实 run 的 `context_packet` 含 `knowledge` 与 `[K-`、usage 行、revoke 后排除、scope=system 匹配 family；S6/S7 dry-run 报告 vs apply 精确删除+tombstone/审计/事件+保护完好；S8 跨实例 SSE + Last-Event-ID；S9 双副本 drain/leader 接管/无重复执行/迁移一次；S10 离线→interrupted(executor_lost)+epoch++；S11 合并后跨波次复发重定向 count 1→2、源不变；S12 旧 revision bytes/as_of 不变、新 revision 反映现状。
 - **浏览器 E2E**：`scripts/p7-e2e.ps1` **5 passed**；**21 张截图** `acceptance/p7/screenshots/p7-e2e-01..21`；`acceptance/p7/e2e.md`。
 - 多副本演练：`scripts/p7-multi.ps1`（`-ValidateOnly` 通过；双副本 drain/leader 断言在 S9 内覆盖）。
+- **修复波后复跑（最终树）**：acceptance 13/13 场景、**156 checks / 0 FAIL**、170s；E2E 5/5（Playwright 9.8s，21 截图，无重复 key 警告）；p2–p7 契约与 compose 校验全 exit 0；PDF ledger 0 个 revision 存在 >1 个 live `report_pdf` ref。证据：`.tmp/p7-acceptance/final2/`、`acceptance/p7/{acceptance.md,e2e.md}`。
 
 ## 4. 已知缺口/偏差
 
@@ -55,6 +56,7 @@
 4. 产品 bug 修复记录：P7-BUG-01 通用 agent worker 认领 `report.render_pdf` → 新增 `ops` 团队/迁移 #40；P7-E2E-BUG-01 报告详情重复 refs → 当前 revision 去重。
 5. 其他偏差：API 版本串仍 `0.2.0-p5`（P6 起遗留）；PDF 上限 ledger 10 MiB vs renderer client 20 MiB（>10MiB 终止失败，P8 对齐）；executor push 心跳用 executor 环境变量而非 DB 设置；新增 compose 需一次性设置 `report.render_worker_url=http://renderer:13337`（默认值对单机可用）；0.1 `scripts/acceptance.ps1 -StaticOnly` CI 静态门禁仍是 0.1 树（P6 基线，P8 处置）。
 6. 设计文档未改；`D59/D63/D65/D67` 无独立决策行，本阶段引用 architecture §12 / HLD §9 + OD-2/3/4/11。
+7. 验收脚本脆弱性：`frontend/e2e/p7.spec.ts` 依赖克隆库固定 seed ID；重建验收库后需用 `EZTEST_E2E_P7_*_KNOWLEDGE_ID` 覆盖（或 P8 改为从 clone 动态取 ID）。
 
 ## 5. P8 输入
 
@@ -77,4 +79,4 @@
 
 ## 7. 停止声明
 
-P7 已交付并合回 `feat/v0.2`（merge 提交：本文件所在 commit 的父提交，见 `git log --merges`）：测试/契约/真实 LLM+Chrome 验收/E2E 全绿，`frozen: P7`，本 handoff 完成。**不自动进入 P8**，等待用户验收/指示。
+P7 已交付并合回 `feat/v0.2`（merge `c62e269`，e2e spec `e034e09`）：测试/契约/真实 LLM+Chrome 验收/E2E 全绿，`frozen: P7`，本 handoff 完成。**不自动进入 P8**，等待用户验收/指示。
