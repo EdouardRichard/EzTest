@@ -3,7 +3,7 @@
 > 状态：**completed**
 > 日期：2026-11-01
 > 阶段：P4（`phase-04-delivery-chain.md`）
-> 实施分支：`feat/v0.2-p4`（从 `feat/v0.2` @`5b1e326` 拉出；本文件完成后合入 `feat/v0.2`）
+> 实施分支：`feat/v0.2-p4`（从 `feat/v0.2` @`5b1e326` 拉出）；**已合入统一集成分支 `feat/v0.2`（merge `c88e922`，2026-11-01 P4 完成点）**
 > 实施 spec：[2026-11-01-eztest-v02-p4-delivery-chain-design.md](../../superpowers/specs/2026-11-01-eztest-v02-p4-delivery-chain-design.md)
 > 实施 plan：[2026-11-01-eztest-v02-p4-delivery-chain.md](../../superpowers/plans/2026-11-01-eztest-v02-p4-delivery-chain.md)
 
@@ -109,6 +109,6 @@
 
 ## 6. 合并与审计
 
-- 实施分支：`feat/v0.2-p4`；完成点合入 `feat/v0.2`（保留阶段审计分支）。
+- 实施分支：`feat/v0.2-p4`；完成点 merge `c88e922` 合入 `feat/v0.2`（保留阶段审计分支）。
 - 关键修复提交：`bf395bf` API 版本；`09a00fc` version close 执行读取器；`1ed7c4e` close×intent 串行化；`b719854` requirement.close finalizer；`6f4ed85` chain 根分页/场景 replay；`a7b9a7b` issue CAS/report 单调；`3649fc4` 前端 SSE；`aca66c2` 验收脚本；`305e161` 无参工具 schema。
 - 本阶段报告/证据：`.superpowers/sdd/p4-delivery-chain/task-*-report.md`、`.tmp/p4-acceptance/`、`.tmp/p4/`。
