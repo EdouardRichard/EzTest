@@ -132,11 +132,7 @@ async function getWaves(request: APIRequestContext): Promise<Wave[]> {
 
 async function getIssues(request: APIRequestContext): Promise<IssueView[]> {
   return (
-    await api<{ data: IssueView[] }>(
-      request,
-      "GET",
-      `/api/versions/${versionID}/issues?limit=100`,
-    )
+    await api<{ data: IssueView[] }>(request, "GET", `/api/versions/${versionID}/issues?limit=100`)
   ).data
 }
 
@@ -202,9 +198,7 @@ function trackPageErrors(page: import("@playwright/test").Page): string[] {
 
 test.beforeAll(async ({ request }) => {
   if (VERSION_ID === "") {
-    throw new Error(
-      "EZTEST_E2E_P4_VERSION_ID is unset; run scripts/p4-e2e.ps1 (real LLM stack)",
-    )
+    throw new Error("EZTEST_E2E_P4_VERSION_ID is unset; run scripts/p4-e2e.ps1 (real LLM stack)")
   }
   versionID = VERSION_ID
   token = await login(request)
@@ -346,7 +340,9 @@ test("phase A: running version tabs, issues, chain and report stale/regenerate",
   await waitFor(
     async () => {
       const reports = await getReports(request, "wave")
-      return reports.find((report) => report.wave_id === firstWaveID && report.status === "published")
+      return reports.find(
+        (report) => report.wave_id === firstWaveID && report.status === "published",
+      )
     },
     10 * 60_000,
     "published wave-1 report",
