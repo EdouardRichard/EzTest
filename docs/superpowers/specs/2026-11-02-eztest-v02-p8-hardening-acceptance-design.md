@@ -131,8 +131,8 @@ API B :13344 ──┴── leader (PG advisory lock)
 #### H2 in-flight drain 计数
 
 - 迁移 #41 给 `api_instance` 增加 `active_requests INTEGER NOT NULL DEFAULT 0`、`active_work INTEGER NOT NULL DEFAULT 0`（均 `CHECK >= 0`）。
-- 新增 `orchestration/application.LoadTracker` 端口：`InflightRequests() int`；`ActiveWork(ctx) (int, error)`。缺省 nil 时计 0。
-- 组装根实现：HTTP 中间件原子计数（`server` 暴露 `Inflight()`）；ActiveWork 由 execution/agent 的跨上下文读端口汇总本实例 `owner_instance` 的 running case_run + running agent_run（只读计数，不跨上下文写）。
+- 新增 `orchestration/application.LoadTracker` 端口：`InflightRequests() int`；`InflightWork() int`。缺省 nil 时计 0。
+- 组装根实现：`backend/internal/platform/load.Counter` 两个进程内原子计数器；HTTP 中间件对非 health/SSE 请求 `Inc/defer Dec`；agent `Runner` 在 run 执行入口 `Inc`、退出 `Dec`（case 执行在 agent run 内，天然覆盖）。不跨上下文读表、不新增 DB 查询。
 - `Service.runHeartbeat` 每轮把两个计数写入 `api_instance`（扩展 `Repository.Heartbeat` 签名）；`InstanceView` 与 `GET /api/health/ready` 增加 `active_requests`/`active_work`（readiness 字段名 `inflight_requests`/`inflight_work`）。
 - 语义：`draining` 时 readiness 仍 503（不接新流量）；滚动升级等待计数归零后再停进程。不改变 drain 的“停止新认领”语义。
 - 测试：迁移集成；heartbeat 计数写入/读取；readiness 字段；server 中间件计数（含 SSE 长连接不计/或计入并说明）；滚动升级等待逻辑（脚本断言）。
@@ -503,3 +503,4 @@ ALTER TABLE case_run_sut_context
 - **范围**：仅硬化/验收/文档/契约；不新增功能；SLO/安全审计/fake-LLM/Docker 实跑明确排除并记录。
 - **歧义**：限流默认 0（关闭）已在 P8-D-13 明确；事件保留 90d 在 P8-D-14；多执行器语义转正已获批准；收尾/重开以真实 Agent/API 验证，不用代理。
 - **前置**：P7 完成、contracts frozen P7、真实 LLM/Chrome 可用、无 Docker；P7 库可重建。
+- **2026-11-02 技术修订**：H2 的 `active_work` 改为进程内 `platform/load.Counter`（agent run 入口 Inc/退出 Dec），不跨上下文读表；DB 列/API 字段/验收判据不变。
