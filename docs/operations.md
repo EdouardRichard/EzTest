@@ -1,3 +1,5 @@
+> **0.1 归档；0.2 权威文档见 [docs/version-V0.2/](version-V0.2/README.md) 与 [deploy/README.md](../deploy/README.md)。**
+
 # EzTest 运维手册
 
 > 本文件汇总 P8 运维手册：备份/恢复与密钥（Task 29）、证据 GC（Task 28）、多实例单活（Task 30）、限流/SLO（Task 27）、审计/安全（Task 20/32）与故障处理/日志（Task 33 汇总）。

@@ -59,14 +59,17 @@ func (s *RetentionService) Run(ctx context.Context, auditCutoff, eventCutoff tim
 		}
 	}
 	if s.recorder != nil {
+		cutoff := auditCutoff
+		if s.audit == nil {
+			cutoff = eventCutoff
+		}
 		_ = s.recorder.Record(ctx, Event{
 			Action:     "retention.cleanup",
-			TargetKind: "system",
+			TargetKind: "retention",
 			Metadata: map[string]any{
 				"events_deleted": result.EventsDeleted,
 				"audit_deleted":  result.AuditDeleted,
-				"event_cutoff":   eventCutoff.UTC().Format(time.RFC3339),
-				"audit_cutoff":   auditCutoff.UTC().Format(time.RFC3339),
+				"cutoff":         cutoff.UTC().Format(time.RFC3339),
 			},
 		})
 	}

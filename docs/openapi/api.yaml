@@ -1,3 +1,4 @@
+# 0.1 归档；0.2 权威文档见 docs/version-V0.2/ 与 deploy/README.md
 openapi: 3.0.3
 info:
   title: EzTest API

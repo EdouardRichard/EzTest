@@ -1,3 +1,5 @@
+> **0.1 归档；0.2 权威文档见 [docs/version-V0.2/](version-V0.2/README.md) 与 [deploy/README.md](../deploy/README.md)。**
+
 # EzTest 架构设计文档
 
 > **文档性质**：软件工程标准架构设计文档（GB/T 8567 概要设计 + IEEE 42010 视角裁剪），面向工程评审、交接与"从设计思路讲到实现细节"的深度讲解。

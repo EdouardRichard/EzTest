@@ -49,6 +49,23 @@ func runP8RetentionWorker(
 	if service == nil {
 		return
 	}
+	// One pass at startup makes the retention effect observable without waiting
+	// for a full interval; subsequent passes follow the configured daily loop.
+	runOnce := func() {
+		now := time.Now().UTC()
+		auditCutoff := now.Add(-time.Duration(auditDays(ctx)) * 24 * time.Hour)
+		eventCutoff := now.Add(-time.Duration(eventDays(ctx)) * 24 * time.Hour)
+		p7RunGated(gate, func() {
+			result, err := service.Run(ctx, auditCutoff, eventCutoff)
+			if err != nil && ctx.Err() == nil && logf != nil {
+				logf("retention worker: run failed: %v", err)
+			}
+			if logf != nil {
+				logf("retention worker: events=%d audit=%d", result.EventsDeleted, result.AuditDeleted)
+			}
+		})
+	}
+	runOnce()
 	for {
 		wait := 24 * time.Hour
 		if interval != nil {
@@ -63,18 +80,7 @@ func runP8RetentionWorker(
 			return
 		case <-timer.C:
 		}
-		now := time.Now().UTC()
-		auditCutoff := now.Add(-time.Duration(auditDays(ctx)) * 24 * time.Hour)
-		eventCutoff := now.Add(-time.Duration(eventDays(ctx)) * 24 * time.Hour)
-		p7RunGated(gate, func() {
-			result, err := service.Run(ctx, auditCutoff, eventCutoff)
-			if err != nil && ctx.Err() == nil && logf != nil {
-				logf("retention worker: run failed: %v", err)
-			}
-			if logf != nil {
-				logf("retention worker: events=%d audit=%d", result.EventsDeleted, result.AuditDeleted)
-			}
-		})
+		runOnce()
 	}
 }
 

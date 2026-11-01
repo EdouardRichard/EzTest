@@ -1,12 +1,14 @@
-# Baseline EzTest CI. It runs the same Go, frontend and executor test gates as
-# the local scripts/test.ps1 gate, plus the repository-local static acceptance
-# gate and the CI structural check. Playwright E2E and real-LLM acceptance stay
-# out of scope. The executor tests launch Chromium, so that job installs the
-# browser explicitly instead of relying on the runner image.
+# Baseline EzTest 0.2 CI. It runs the same Go, frontend and executor test gates
+# as the local scripts/test.ps1 gate, plus the P8 static gate
+# (scripts/p8-static-check.ps1) and the frontend compose validator it invokes.
+# Playwright E2E and real-LLM acceptance stay out of scope. The executor tests
+# launch Chromium, so that job installs the browser explicitly instead of
+# relying on the runner image.
 #
-# scripts/acceptance.ps1 resolves its helper PowerShell host as
-# $PSHOME/pwsh.exe, so the static gate runs on a Windows runner (it needs no
-# PostgreSQL and no Go toolchain). Everything else runs on Ubuntu.
+# The static gate runs on a Windows runner because it is the PowerShell gate over
+# the 0.2 docs, contracts and deploy files; it needs no PostgreSQL and no Go
+# toolchain. The 0.1 gate scripts are kept in the repository as legacy and are
+# intentionally not referenced here.
 
 name: CI
 
@@ -112,9 +114,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: CI structural check
-        run: pwsh -NoProfile -File scripts/check-ci.ps1
-
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
         with:
@@ -127,9 +126,9 @@ jobs:
           cache: pnpm
           cache-dependency-path: frontend/pnpm-lock.yaml
 
-      - name: Install frontend dependencies (OpenAPI YAML parser)
+      - name: Install frontend dependencies (OpenAPI + Compose YAML parsers)
         working-directory: frontend
         run: pnpm install --frozen-lockfile
 
-      - name: Static acceptance gate
-        run: pwsh -NoProfile -File scripts/acceptance.ps1 -StaticOnly
+      - name: P8 static gate
+        run: pwsh -NoProfile -File scripts/p8-static-check.ps1

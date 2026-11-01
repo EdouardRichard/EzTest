@@ -1,3 +1,5 @@
+> **0.1 归档；0.2 权威文档见 [docs/version-V0.2/](version-V0.2/README.md) 与 [deploy/README.md](../deploy/README.md)。**
+
 # EzTest 开发指南（P8）
 
 > 读者：参与 EzTest 后端/前端/executor/测试的开发与评审人员。
