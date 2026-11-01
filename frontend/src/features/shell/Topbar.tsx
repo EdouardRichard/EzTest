@@ -6,11 +6,10 @@ import { useEffect, useState } from "react"
 import { cn } from "@/components/ui/cn"
 import { useAuth } from "@/features/auth/AuthProvider"
 import { ChangePasswordDialog } from "@/features/auth/ChangePasswordDialog"
+import { CommandPalette } from "@/features/search/CommandPalette"
 import { getApiBaseUrl } from "@/lib/api-client"
 import { connectSSE, type SSEStatus } from "@/lib/sse-client"
 import { findNavItem } from "@/navigation/nav-items"
-
-import { CommandPalette } from "@/features/search/CommandPalette"
 
 import { TodoDrawerButton } from "./TodoDrawer"
 
