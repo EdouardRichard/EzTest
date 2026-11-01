@@ -23,6 +23,7 @@ type ReviewDeps struct {
 	Reviews  ReviewRepository
 	Facts    FactRepository
 	Versions VersionReader
+	Impact   *ImpactService
 	Events   EventPublisher
 	Audit    AuditRecorder
 	Clock    Clock
@@ -36,6 +37,7 @@ type ReviewService struct {
 	reviews  ReviewRepository
 	facts    FactRepository
 	versions VersionReader
+	impact   *ImpactService
 	events   EventPublisher
 	audit    AuditRecorder
 	clock    Clock
@@ -48,6 +50,7 @@ func NewReviewService(deps ReviewDeps) *ReviewService {
 		reviews:  deps.Reviews,
 		facts:    deps.Facts,
 		versions: deps.Versions,
+		impact:   deps.Impact,
 		events:   deps.Events,
 		audit:    deps.Audit,
 		clock:    clockOrSystem(deps.Clock),
@@ -115,6 +118,12 @@ func (s *ReviewService) Create(ctx context.Context, versionID, factID, reviewerI
 		"verdict":      created.Verdict,
 		"reviewer_id":  platformid.Format(created.ReviewerID),
 	})
+	// A review changes which facts are eligible for automatic impact; recompute
+	// the persisted candidate set so the latest verdict is reflected immediately
+	// even when the T1 analysis itself is served from cache.
+	if s.impact != nil && fact.AnalysisID != nil && *fact.AnalysisID > 0 {
+		_, _ = s.impact.Compute(ctx, *fact.AnalysisID)
+	}
 	return created, nil
 }
 

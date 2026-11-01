@@ -137,7 +137,7 @@ func newP5Runtime(ctx context.Context, deps p5RuntimeDeps) *p5Runtime {
 		Settings: settings, Clock: deps.Clock, IDs: deps.IDs,
 	})
 	reviewSvc := codeintelapp.NewReviewService(codeintelapp.ReviewDeps{
-		Reviews: reviews, Facts: facts, Versions: deps.Bindings, Events: codeEvents,
+		Reviews: reviews, Facts: facts, Versions: deps.Bindings, Impact: impactSvc, Events: codeEvents,
 		Audit: codeAudit, Clock: deps.Clock, IDs: deps.IDs,
 	})
 	proposalSvc := codeintelapp.NewProposalService(codeintelapp.ProposalDeps{
