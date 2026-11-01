@@ -269,6 +269,33 @@ func (s *CaseRunSummary) countVisualResult(result AssertionResult, ok bool) {
 // visualBlock returns the inconclusive verdict reason of the first visual
 // assertion that did not pass. environment=true maps the environment-mismatch
 // reason to the environment failure class; "case" reasons keep the empty class.
+// ApplyVisualOutcome is the final defense-in-depth guard for the P5 visual
+// four-state contract: a concrete inconclusive visual assertion result must not
+// be reported as blocked or failed(environment) because the Case Executor used a
+// free-form step status or finish candidate. It only overrides those two
+// aggregate outcomes; application failures with real assertion evidence stay.
+func ApplyVisualOutcome(status CaseRunStatus, class FailureClass, summary CaseRunSummary, assertions []AssertionResult) (CaseRunStatus, FailureClass, CaseRunSummary) {
+	if status != CaseRunBlocked && !(status == CaseRunFailed && class == FailureClassEnvironment) {
+		return status, class, summary
+	}
+	for _, result := range assertions {
+		if result.Kind != AssertionKindVisual || result.Verdict != AssertionInconclusive {
+			continue
+		}
+		reason := result.Reason
+		if reason == "" {
+			reason = VerdictReasonVisualAssertionNotRun
+		}
+		summary.VerdictReason = reason
+		if reason == "visual_environment_mismatch" {
+			return CaseRunInconclusive, FailureClassEnvironment, summary
+		}
+		return CaseRunInconclusive, "", summary
+	}
+	return status, class, summary
+}
+
+// visualBlock reports whether a visual assertion has no usable verdict.
 func visualBlock(assertions []CaseAssertion, results map[[2]int]AssertionResult) (reason string, environment bool, inconclusive bool) {
 	seen := make(map[[2]int]struct{}, len(assertions))
 	for _, assertion := range assertions {
