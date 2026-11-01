@@ -97,7 +97,7 @@ system prompt 必须包含 `[profile:<key>]`，并声明：AI 只能提交 draft
 
 ## 4b. P4+ 预留工具（不注册）
 
-`code.*`、`knowledge.*`、`budget.check`、`sut.page_propose`。P3 已启用的执行/等待/接管工具见 §6；P4 已启用的 issue/report/version/requirement 工具见 §7。其余 P4+ 工具写入本文件并实现服务端校验后启用。
+`knowledge.*`、`budget.check`。P3 已启用的执行/等待/接管工具见 §6；P4 已启用的 issue/report/version/requirement 工具见 §7；P5 已启用的 codeintel 工具、`execution.visual_assert` 与 `sut.page_propose` 见 §8。其余 P4+ 工具写入本文件并实现服务端校验后启用。
 
 ## 5. 错误返回（给模型）
 
@@ -266,3 +266,67 @@ system prompt 必须包含 `[profile:<key>]`，并声明：AI 只能提交 draft
 - profile 白名单：`issue_triager` 只注册 issue 工具；`report_writer` 只注册 report 工具；`version_steward` 只注册 requirement/version 工具；禁止互相越权。
 - 工具 schema 不包含 `version_id`/`versionId`；ID 参数为十进制字符串；不返回内部 SQL/路径/凭据。
 - 错误统一返回 `{"error":{"code":"invalid_argument|not_found|state_conflict|lease_lost|ai_unavailable","message":"...","details":{...}}}`；409 的 `details.failed` 列出未通过的 check 名与计数。
+
+---
+
+## 8. P5 Profiles 与工具（`frozen: P5`，2026-11-01）
+
+> 来源：`docs/superpowers/specs/2026-11-01-eztest-v02-p5-codeintel-visual-design.md` §4.4/§5.1–§5.4/§6/§7/§8。
+> 实现：`backend/internal/codeintel`（code.* 只读工具与服务端校验）、`backend/internal/visual`（视觉配置/基线/比对）、`backend/internal/agent/application`（profile seed/工具注册）。
+> P5 **不新增 Agent profile**；只扩展现有 profile 的 `allowed_tools`（启动幂等 seed；不覆盖管理员编辑）。`code.*` 全部只读；候选写只有 `sut.page_propose` 与 `execution.visual_assert` 两个入口。
+
+### 8.1 Profiles（仅增量白名单）
+
+| profile | P5 新增允许工具 |
+|---|---|
+| `context_scout` | `code.tree`、`code.read`、`code.search`、`code.facts`、`code.routes`、`code.apis`、`code.diff`、`code.impact`、`sut.page_propose` |
+| `case_author` | `code.facts`、`code.routes`、`code.apis`、`code.diff`、`code.impact`、`code.anchors` |
+| `failure_analyst` | `code.diff`、`code.facts`、`code.anchors` |
+| `design_planner` | `code.impact` |
+| `case_executor` | `execution.visual_assert` |
+
+- 白名单是**并集**：各 profile 的 P1–P4 工具保持；上表只列 P5 追加项。其余 profile（`clarification_host`、`requirement_curator`、`design_host`、`design_critic`、`data_planner`、`coverage_analyst`、`issue_triager`、`report_writer`、`version_steward`）不变。
+- `sut.page_propose` 只允许 Context Scout/Case Author 类 profile；P5 seed 只在 `context_scout` 启用（`case_author` 的 P5 名单不含它）。`execution.visual_assert` 只允许 `case_executor`（按 case_run scope）。
+- P5 不新增 codeintel 写工具；AI 不能确认页面/API 提议（确认/驳回 admin-only，§8.3）。
+
+### 8.2 作用域注入（强制）
+
+每次 run 由 runtime 注入；工具 JSON Schema **不含** `version_id`/`versionId`：
+
+```json
+{
+  "version_id": "1001",
+  "agent_run_id": "4001",
+  "work_item_id": "9101",
+  "case_run_id": "8101",
+  "case_version_id": "3101",
+  "version_sut_ids": ["5001"]
+}
+```
+
+- `repoId` 是**业务参数**，不是版本 scope；服务端校验它属于当前版本的绑定仓库。若版本只绑定一个仓库，工具参数可省略 `repoId`；多个仓库且省略 → 422 `repo_ambiguous`（`code.impact` 可跨仓合并，不受此限）。
+- 跨 scope 引用、不存在、未绑定仓库 → `not_found`/`invalid_argument`；不泄露其他版本/仓库数据。
+- 工具结果统一 JSON；超 `agent.tool_result_max_bytes`（32768）落盘为 text content_object，返回 `{head,sha256,content_ref,truncated:true}`；所有调用写 `agent_message`；写操作审计带 `agent_run_id`。
+- 工具错误码：`invalid_argument|not_found|unavailable|state_conflict`；**不返回**代码正文/凭据/文件系统路径（`code.read` 的受控窗口除外）。
+
+### 8.3 工具清单（11 个；scope 由 runtime 注入）
+
+| 工具 | 参数 | 结果/限制 |
+|---|---|---|
+| `code.tree` | `{repoId?,commit?,path?,cursor?,limit?}` | 树条目 ≤50；无正文；`commit` 缺省用版本基线/分支头 |
+| `code.read` | `{repoId?,path,commit?,startLine?,endLine?}` | ≤400 行/64 KiB；超限 head+`truncated:true`；鉴权读取，不写事件 |
+| `code.search` | `{repoId?,q,kind?,commit?,cursor?,limit?}` | path/name 子串匹配 ≤50；无正文 |
+| `code.facts` | `{repoId?,kind?,path?,commit?,cursor?,limit?}` | 事实摘要 ≤100；无正文 |
+| `code.routes` | `{repoId?,commit?,limit?}` | `route`/`page` 事实 ≤100 |
+| `code.apis` | `{repoId?,commit?,limit?}` | `api`/`client_call` 事实 ≤100 |
+| `code.diff` | `{repoId?,base?,head?,path?,limit?}` | 变更文件摘要 ≤200；**不返回 patch 正文** |
+| `code.impact` | `{repoId?,analysisId?,limit?}` | 影响候选 ≤200；可跨仓合并（带 repo/SUT 标签） |
+| `code.anchors` | `{repoId?,subjectKind?,subjectId?,limit?}` | 锚点 ≤200 |
+| `execution.visual_assert` | `{assertionId}` | 服务端读 case_run/assertion/config/baseline；返回 `classification/reason/diff_ratio/actual_evidence_id/diff_evidence_id?`；幂等重放（同一 `assertion_result_id` 不重复 diff） |
+| `sut.page_propose` | `{kind:"page"\|"api",name,url?,routeTemplate?,method?,pathTemplate?,reason?}` | 只写 `status=proposed`/`source=ai\|code`；返回 `{created,skipped,ids[]}`；admin 后续确认/驳回 |
+
+- 注册：codeintel/visual 工具由 `cmd/eztest` 注册进 agent registry；单测校验工具名/schema/scope 注入与白名单。
+- `code.*` 全部只读：不提供任何代码/事实写工具；锚点、事实复核走用户 API（`code_anchor`/`code_fact_review`，§4.2 #18–#23），不是模型工具。
+- `sut.page_propose` 只提交候选，不改 `sut_page`/`sut_api` 的 `status`；确认/驳回由 admin API 完成（§4.2 #26–#29）。
+- `execution.visual_assert` 的基线/实际字节由 API 从内容账本读取，执行器不访问文件系统/网络取基线；证据 kind 映射 `visual_actual`/`visual_diff`；返回不含图片字节/内部路径。
+- 工具结果超限落 content_object；不返回内部 SQL/凭据/存储路径。

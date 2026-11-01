@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
-  title: EzTest 0.2 API 契约（P0 冻结 + P1 冻结 + P2 增量）
-  version: 0.2.0-p4
+  title: EzTest 0.2 API 契约（P0 冻结 + P1 冻结 + P2 增量 + P3/P4/P5 冻结）
+  version: 0.2.0-p5
   description: |
     EzTest 0.2 P0（平台底座）对外 REST/SSE 契约，来源：
     `docs/superpowers/specs/2026-10-31-eztest-v02-p0-platform-foundation-design.md` §7/§8/§9。
@@ -116,7 +116,19 @@ info:
     业务冲突统一 `state_conflict`，`details.reason` 使用稳定子码（`issue_not_open`/`issue_not_reopenable`/
     `merge_target_invalid`/`merge_cycle`/`report_not_current`/`report_content_corrupt`/`close_predicate_failed`）。
     Version/Requirement 视图仅新增可选字段（`closed_at`/`close_reason`/`closure`）；事件类型见 `contracts/events.md` §13。
-x-frozen: P4
+    ### P5 增量（frozen，2026-11-01）
+
+    来源：`docs/superpowers/specs/2026-11-01-eztest-v02-p5-codeintel-visual-design.md` §4/§14。
+    P0–P4 paths/schemas 语义不变；P5 新增 38 个 operation（代码索引/树/文件/diff/事实/搜索/commit、
+    版本变更/分析/影响、锚点、事实复核、页面/API 提议、视觉配置/基线/比对/概览、全局视觉指标），
+    新增 `Code`/`Visual`/`Quality` 三个 tag。代码正文只经 `code.read`/`GET .../file` 鉴权读取；
+    事件/响应不返回代码正文、图片字节、凭据或文件系统路径；视觉 actual/diff 字节以内容账本为权威。
+    业务冲突统一 `state_conflict`，`details.reason` 使用稳定子码（`index_in_progress`/`analysis_in_progress`/
+    `anchor_duplicate`/`repo_not_bound`/`baseline_commit_missing`/`repo_ambiguous`/`config_invalid`/
+    `baseline_evidence_invalid`）。`VersionSUT`（`Binding`）新增可选 `code_baseline_commit`；
+    `CaseRunSummaryView` 新增视觉四态计数（`visual_skipped` 保留兼容）；`EvidenceView.kind` 扩为
+    10 值（`visual_actual`/`visual_diff`）。事件类型见 `contracts/events.md` §14。
+x-frozen: P5
 servers:
   - url: http://localhost:13333
     description: 本地开发默认 API（端口来自 EZTEST_API_PORT，默认 13333）
@@ -163,6 +175,12 @@ tags:
     description: 版本内问题与报告（P4；报告 HTML 以内容账本为权威）
   - name: Chain
     description: 版本探索链路只读读模型（P4；预算/截断/两档回放）
+  - name: Code
+    description: 代码索引/树/文件/diff/事实/分析/影响/锚点/复核/页面 API 提议（P5）
+  - name: Visual
+    description: 视觉断言配置、基线审批、比对与版本视觉概览（P5）
+  - name: Quality
+    description: 质量指标只读聚合（P5 最小质量页；完整质量中心 P6）
 
 paths:
   /healthz:
@@ -4084,6 +4102,1126 @@ paths:
         '500':
           $ref: '#/components/responses/Internal'
 
+  /api/versions/{versionId}/code/index:
+    post:
+      tags: [Code]
+      operationId: startCodeIndex
+      summary: 触发版本仓库 T0 索引运行
+      description: |
+        仓库必须已绑定到该版本（`repo_not_bound` 422）。同 repo+commit 已 done → 返回既有运行（200 reused）；
+        同 repo 存在 queued/running → 409 `index_in_progress`；新建返回 202。索引由 `code` team 的
+        `index.repo` work item 异步执行；响应/事件不含代码正文或路径树。
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CodeIndexRequest'
+      responses:
+        '202':
+          description: 索引运行已入队
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CodeIndexRunView'
+        '200':
+          description: 同 repo+commit 的 done 运行复用
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CodeIndexRunView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/code/repos:
+    get:
+      tags: [Code]
+      operationId: listCodeRepos
+      summary: 版本绑定仓库的索引/基线状态
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+      responses:
+        '200':
+          description: 绑定仓库状态列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CodeRepoStatusListEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/code/repos/{repoId}/index-runs/latest:
+    get:
+      tags: [Code]
+      operationId: getLatestCodeIndexRun
+      summary: 仓库最新索引运行
+      parameters:
+        - $ref: '#/components/parameters/RepoID'
+      responses:
+        '200':
+          description: 最新索引运行
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CodeIndexRunView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/code/repos/{repoId}/index-runs/{runId}:
+    get:
+      tags: [Code]
+      operationId: getCodeIndexRun
+      summary: 索引运行详情
+      parameters:
+        - $ref: '#/components/parameters/RepoID'
+        - $ref: '#/components/parameters/CodeIndexRunID'
+      responses:
+        '200':
+          description: 索引运行详情
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CodeIndexRunView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/code/repos/{repoId}/tree:
+    get:
+      tags: [Code]
+      operationId: getCodeTree
+      summary: 按 commit 读取代码树（cursor 分页，≤200/页）
+      description: path/name/kind/size 摘要；不返回正文。cursor 为上一页最后 path。
+      parameters:
+        - $ref: '#/components/parameters/RepoID'
+        - $ref: '#/components/parameters/CodeCommitRequired'
+        - $ref: '#/components/parameters/CodePathFilter'
+        - $ref: '#/components/parameters/CodeCursor'
+        - $ref: '#/components/parameters/CodeLimit'
+      responses:
+        '200':
+          description: 代码树条目
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CodeTreeListEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/code/repos/{repoId}/file:
+    get:
+      tags: [Code]
+      operationId: getCodeFile
+      summary: 读取文件窗口（≤400 行/64 KiB，鉴权并审计）
+      description: 超限返回 head + `truncated=true`；不返回其他文件内容；写审计 `code.file.read`。
+      parameters:
+        - $ref: '#/components/parameters/RepoID'
+        - $ref: '#/components/parameters/CodeCommitRequired'
+        - $ref: '#/components/parameters/CodePath'
+        - $ref: '#/components/parameters/CodeStartLine'
+        - $ref: '#/components/parameters/CodeEndLine'
+      responses:
+        '200':
+          description: 文件窗口
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CodeFileWindowView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/code/repos/{repoId}/diff:
+    get:
+      tags: [Code]
+      operationId: getCodeDiff
+      summary: 变更文件列表（≤2000，cursor 分页）
+      description: 只返回 path/status/增删行/binary/head_blob_hash 摘要；不返回 patch 正文。
+      parameters:
+        - $ref: '#/components/parameters/RepoID'
+        - $ref: '#/components/parameters/CodeBaseCommit'
+        - $ref: '#/components/parameters/CodeHeadCommit'
+        - $ref: '#/components/parameters/CodeCursor'
+        - $ref: '#/components/parameters/CodeDiffLimit'
+      responses:
+        '200':
+          description: 变更文件列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CodeChangedFileListEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/code/repos/{repoId}/diff/file:
+    get:
+      tags: [Code]
+      operationId: getCodeFileDiff
+      summary: 单文件按需 patch（≤256 KiB）
+      description: binary/large/deleted 标志；patch 为 null 时以标志说明（不返回不可读正文）。
+      parameters:
+        - $ref: '#/components/parameters/RepoID'
+        - $ref: '#/components/parameters/CodeBaseCommit'
+        - $ref: '#/components/parameters/CodeHeadCommit'
+        - $ref: '#/components/parameters/CodePath'
+      responses:
+        '200':
+          description: 单文件 diff
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CodeFileDiffView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/code/repos/{repoId}/facts:
+    get:
+      tags: [Code]
+      operationId: listCodeFacts
+      summary: 事实列表（≤100/页，cursor 分页）
+      description: kind/path 过滤；事实摘要含结构化 body（不含代码正文/其他文件内容）。
+      parameters:
+        - $ref: '#/components/parameters/RepoID'
+        - $ref: '#/components/parameters/CodeCommitRequired'
+        - $ref: '#/components/parameters/CodeKindFilter'
+        - $ref: '#/components/parameters/CodePathFilter'
+        - $ref: '#/components/parameters/CodeCursor'
+        - $ref: '#/components/parameters/CodeLimit'
+      responses:
+        '200':
+          description: 事实列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CodeFactListEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/code/repos/{repoId}/search:
+    get:
+      tags: [Code]
+      operationId: searchCodeEntities
+      summary: path/name 子串搜索（≤50/页）
+      parameters:
+        - $ref: '#/components/parameters/RepoID'
+        - $ref: '#/components/parameters/CodeCommitRequired'
+        - $ref: '#/components/parameters/CodeSearchQuery'
+        - $ref: '#/components/parameters/CodeKindFilter'
+        - $ref: '#/components/parameters/CodeCursor'
+        - $ref: '#/components/parameters/CodeLimit'
+      responses:
+        '200':
+          description: 实体搜索结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CodeEntityListEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/code/repos/{repoId}/commits/{sha}:
+    get:
+      tags: [Code]
+      operationId: getCodeCommit
+      summary: commit 元数据（只读，不含文件正文）
+      parameters:
+        - $ref: '#/components/parameters/RepoID'
+        - $ref: '#/components/parameters/CommitSHA'
+      responses:
+        '200':
+          description: commit 视图
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CodeCommitView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/code/changes:
+    get:
+      tags: [Code]
+      operationId: getCodeChanges
+      summary: 版本变更集预览（base=version_sut 基线，head 缺省分支头；不落库）
+      description: 版本 SUT 未解析 code baseline commit → 422 `baseline_commit_missing`；repo 未绑定 → 404。
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/RepoIDQuery'
+        - $ref: '#/components/parameters/CodeHeadOptional'
+      responses:
+        '200':
+          description: 变更集
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CodeChangeSetView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/code/analyses:
+    post:
+      tags: [Code]
+      operationId: createCodeAnalysis
+      summary: 触发版本×仓库变更分析（T1）
+      description: |
+        同 base/head/version 的 done 分析复用 200；同 version+repo 存在 queued/running → 409 `analysis_in_progress`；
+        新建 202。分析由 `code` team 的 `code.analyze` work item 异步执行；LLM 不可用 → done+degraded。
+        版本 SUT 未解析 code baseline commit → 422 `baseline_commit_missing`。
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CodeAnalysisRequest'
+      responses:
+        '202':
+          description: 分析运行已入队
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CodeAnalysisView'
+        '200':
+          description: 同 base/head/version 的 done 分析复用
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CodeAnalysisView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/code/analyses/latest:
+    get:
+      tags: [Code]
+      operationId: getLatestCodeAnalysis
+      summary: 版本×仓库最新分析
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/RepoIDQuery'
+      responses:
+        '200':
+          description: 最新分析
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CodeAnalysisView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/code/analyses/{analysisId}:
+    get:
+      tags: [Code]
+      operationId: getCodeAnalysis
+      summary: 分析详情（含 changed_files/unmapped/candidates）
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/CodeAnalysisID'
+      responses:
+        '200':
+          description: 分析详情
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CodeAnalysisDetailView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/code/analyses/{analysisId}/candidates/{candidateId}:
+    patch:
+      tags: [Code]
+      operationId: updateCodeImpactCandidate
+      summary: 更新影响候选选择（selected）
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/CodeAnalysisID'
+        - $ref: '#/components/parameters/CodeCandidateID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CodeCandidatePatchRequest'
+      responses:
+        '200':
+          description: 更新后的候选
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CodeImpactCandidateView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/code/impact:
+    get:
+      tags: [Code]
+      operationId: getCodeImpact
+      summary: 版本影响合并视图（多仓 union，带 repo/SUT 标签）
+      description: 只读聚合最新分析候选；repoId 可省略（跨仓合并）。
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/RepoIDFilter'
+      responses:
+        '200':
+          description: 影响合并视图
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CodeImpactView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/code/anchors:
+    get:
+      tags: [Code]
+      operationId: listCodeAnchors
+      summary: 版本代码锚点列表
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/CodeSubjectKindFilter'
+        - $ref: '#/components/parameters/CodeSubjectIDFilter'
+      responses:
+        '200':
+          description: 锚点列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CodeAnchorListEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [Code]
+      operationId: createCodeAnchor
+      summary: 新建代码锚点
+      description: 重复锚点 → 409 `anchor_duplicate`；主体/文件/行号非法 → 422。
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCodeAnchorRequest'
+      responses:
+        '201':
+          description: 已创建的锚点
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CodeAnchorView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/code/anchors/{anchorId}/validate:
+    post:
+      tags: [Code]
+      operationId: validateCodeAnchor
+      summary: 重算锚点状态（valid/stale/broken）
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/CodeAnchorID'
+      responses:
+        '200':
+          description: 更新后的锚点
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CodeAnchorView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/code/anchors/{anchorId}:
+    delete:
+      tags: [Code]
+      operationId: deleteCodeAnchor
+      summary: 删除代码锚点
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/CodeAnchorID'
+      responses:
+        '204':
+          description: 已删除
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/code/facts/{factId}/reviews:
+    get:
+      tags: [Code]
+      operationId: listCodeFactReviews
+      summary: 事实复核历史（append-only）
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/CodeFactID'
+      responses:
+        '200':
+          description: 复核列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CodeFactReviewListEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [Code]
+      operationId: createCodeFactReview
+      summary: 提交事实复核（append-only）
+      description: fact 必须属于版本绑定仓库（否则 404/422）；verdict=correct/incorrect。
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/CodeFactID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCodeFactReviewRequest'
+      responses:
+        '201':
+          description: 已创建的复核
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CodeFactReviewView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/code/page-api-proposals:
+    post:
+      tags: [Code]
+      operationId: proposePageAPIs
+      summary: 由代码事实生成页面/API 提议（proposed）
+      description: 只写 `status=proposed`（`source=ai|code`），不改已确认资源；重复提议幂等跳过。
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CodeProposalRequest'
+      responses:
+        '200':
+          description: 提议结果计数
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/CodeProposalResultView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '500':
+          $ref: '#/components/responses/Internal'
+    get:
+      tags: [Code]
+      operationId: listPageAPIProposals
+      summary: 版本 proposed 页面/API 提议列表
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+      responses:
+        '200':
+          description: 提议列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CodeProposalListEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/resources/pages/{pageId}/confirm:
+    post:
+      tags: [Resources]
+      operationId: confirmPageProposal
+      summary: 确认页面提议（proposed→approved；admin）
+      parameters:
+        - $ref: '#/components/parameters/ProposalPageID'
+      responses:
+        '200':
+          description: 更新后的页面
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Page'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/resources/pages/{pageId}/reject:
+    post:
+      tags: [Resources]
+      operationId: rejectPageProposal
+      summary: 驳回页面提议（proposed→rejected；admin）
+      parameters:
+        - $ref: '#/components/parameters/ProposalPageID'
+      responses:
+        '200':
+          description: 更新后的页面
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Page'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/resources/apis/{apiId}/confirm:
+    post:
+      tags: [Resources]
+      operationId: confirmAPIProposal
+      summary: 确认 API 提议（proposed→approved；admin）
+      parameters:
+        - $ref: '#/components/parameters/ProposalAPIID'
+      responses:
+        '200':
+          description: 更新后的 API
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/SutApi'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/resources/apis/{apiId}/reject:
+    post:
+      tags: [Resources]
+      operationId: rejectAPIProposal
+      summary: 驳回 API 提议（proposed→rejected；admin）
+      parameters:
+        - $ref: '#/components/parameters/ProposalAPIID'
+      responses:
+        '200':
+          description: 更新后的 API
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/SutApi'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/visual/assertions:
+    get:
+      tags: [Visual]
+      operationId: listVisualAssertions
+      summary: 版本视觉断言列表（含 active baseline 摘要）
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/VisualCaseVersionFilter'
+        - $ref: '#/components/parameters/VisualVersionSUTFilter'
+      responses:
+        '200':
+          description: 视觉断言列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VisualAssertionListEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/visual/assertions/{caseAssertionId}:
+    put:
+      tags: [Visual]
+      operationId: upsertVisualAssertion
+      summary: upsert 视觉断言配置（config_revision++；旧 approved 基线 superseded）
+      description: 仅视觉 kind 的设计断言可配置；threshold/viewport/DPR/selector 非法 → 422 `config_invalid`。
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/VisualCaseAssertionID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VisualAssertionUpsertRequest'
+      responses:
+        '200':
+          description: 更新/创建后的视觉断言
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/VisualAssertionView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/visual/assertions/{id}:
+    get:
+      tags: [Visual]
+      operationId: getVisualAssertion
+      summary: 视觉断言详情（含 active baseline 摘要）
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/VisualAssertionID'
+      responses:
+        '200':
+          description: 视觉断言
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/VisualAssertionView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/visual/assertions/{id}/baselines:
+    get:
+      tags: [Visual]
+      operationId: listVisualBaselines
+      summary: 视觉基线历史（approved/superseded）
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/VisualAssertionID'
+      responses:
+        '200':
+          description: 基线历史
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VisualBaselineListEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [Visual]
+      operationId: approveVisualBaseline
+      summary: 从 actual 证据批准视觉基线（admin）
+      description: |
+        仅 admin。证据必须属于同 case_version/version_sut 且尺寸/配置/环境指纹一致；
+        旧 approved 基线置 superseded（同事务）。非法 → 422 `baseline_evidence_invalid`。
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/VisualAssertionID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VisualBaselineApproveRequest'
+      responses:
+        '201':
+          description: 已批准的基线
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/VisualBaselineView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/visual/diffs:
+    get:
+      tags: [Visual]
+      operationId: listVisualDiffs
+      summary: 视觉比对列表（cursor 分页）
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/VisualCaseRunFilter'
+        - $ref: '#/components/parameters/VisualCaseVersionFilter'
+        - $ref: '#/components/parameters/VisualClassificationFilter'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 比对列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VisualDiffListEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/visual/diffs/{diffId}:
+    get:
+      tags: [Visual]
+      operationId: getVisualDiff
+      summary: 视觉比对详情（evidence ids/ratio/mismatch boxes）
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/VisualDiffID'
+      responses:
+        '200':
+          description: 比对详情
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/VisualDiffDetailView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/visual/overview:
+    get:
+      tags: [Visual]
+      operationId: getVisualOverview
+      summary: 版本视觉概览（基线覆盖率/通过率/inconclusive 原因/diff p50·p95/最近失败）
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+      responses:
+        '200':
+          description: 视觉概览
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/VisualOverviewView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/quality/visual-metrics:
+    get:
+      tags: [Quality]
+      operationId: getVisualMetrics
+      summary: 视觉质量指标（全局或单版本聚合）
+      parameters:
+        - $ref: '#/components/parameters/VersionIDFilter'
+      responses:
+        '200':
+          description: 质量指标
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/VisualMetricsView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+
 components:
   securitySchemes:
     bearerAuth:
@@ -4327,10 +5465,10 @@ components:
       name: kind
       in: query
       required: false
-      description: 证据类型过滤
+      description: 证据类型过滤（P5 起 10 值）
       schema:
         type: string
-        enum: [screenshot, snapshot, console, network, http, db, download, text]
+        enum: [screenshot, snapshot, console, network, http, db, download, text, visual_actual, visual_diff]
     HumanRequestStatusFilter:
       name: status
       in: query
@@ -4493,6 +5631,291 @@ components:
         minimum: 1
         maximum: 1000
         default: 300
+    RepoID:
+      name: repoId
+      in: path
+      required: true
+      description: 代码仓库（resource.code_repository）雪花 ID 的十进制字符串
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    RepoIDQuery:
+      name: repoId
+      in: query
+      required: true
+      description: 代码仓库雪花 ID 的十进制字符串（必须属于当前版本绑定仓库）
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    RepoIDFilter:
+      name: repoId
+      in: query
+      required: false
+      description: 代码仓库雪花 ID 过滤（省略=当前版本全部绑定仓库）
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    CodeIndexRunID:
+      name: runId
+      in: path
+      required: true
+      description: 代码索引运行（code_index_run）雪花 ID 的十进制字符串
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    CodeAnalysisID:
+      name: analysisId
+      in: path
+      required: true
+      description: 代码分析运行（code_analysis）雪花 ID 的十进制字符串
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    CodeCandidateID:
+      name: candidateId
+      in: path
+      required: true
+      description: 影响候选（code_impact_candidate）雪花 ID 的十进制字符串
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    CodeAnchorID:
+      name: anchorId
+      in: path
+      required: true
+      description: 代码锚点（code_anchor）雪花 ID 的十进制字符串
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    CodeFactID:
+      name: factId
+      in: path
+      required: true
+      description: 代码事实（code_fact）雪花 ID 的十进制字符串
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    CommitSHA:
+      name: sha
+      in: path
+      required: true
+      description: 40 位小写 hex commit SHA
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{40}$'
+    CodeCommit:
+      name: commit
+      in: query
+      required: false
+      description: 40 位小写 hex commit；缺省使用版本基线/分支头
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{40}$'
+    CodeCommitRequired:
+      name: commit
+      in: query
+      required: true
+      description: 40 位小写 hex commit（必须属于该仓库；不返回其他 commit 内容）
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{40}$'
+    CodeHeadOptional:
+      name: head
+      in: query
+      required: false
+      description: 变更 head commit（40 位小写 hex；缺省为仓库分支头）
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{40}$'
+    ProposalPageID:
+      name: pageId
+      in: path
+      required: true
+      description: 页面（sut_page）雪花 ID 的十进制字符串
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    ProposalAPIID:
+      name: apiId
+      in: path
+      required: true
+      description: SUT API（sut_api）雪花 ID 的十进制字符串
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    CodeBaseCommit:
+      name: base
+      in: query
+      required: true
+      description: 变更 base commit（40 位小写 hex）；通常为版本基线
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{40}$'
+    CodeHeadCommit:
+      name: head
+      in: query
+      required: true
+      description: 变更 head commit（40 位小写 hex）；通常为分支头
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{40}$'
+    CodePath:
+      name: path
+      in: query
+      required: true
+      description: 仓库内 slash 归一化相对路径（1..4096）
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 4096
+    CodePathFilter:
+      name: path
+      in: query
+      required: false
+      description: 仓库内 slash 归一化相对路径过滤
+      schema:
+        type: string
+        maxLength: 4096
+    CodeCursor:
+      name: cursor
+      in: query
+      required: false
+      description: 值游标（上一页最后一个 path/ID）；空表示第一页
+      schema:
+        type: string
+    CodeLimit:
+      name: limit
+      in: query
+      required: false
+      description: 每页条数（tree ≤200、facts ≤100、search ≤50，见各操作）
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+    CodeDiffLimit:
+      name: limit
+      in: query
+      required: false
+      description: 变更文件每页条数（≤2000）
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 2000
+        default: 200
+    CodeKindFilter:
+      name: kind
+      in: query
+      required: false
+      description: 代码实体/事实 kind 过滤
+      schema:
+        type: string
+        enum: [file, module, route, api, client_call, component, page, symbol]
+    CodeSearchQuery:
+      name: q
+      in: query
+      required: true
+      description: path/name 子串搜索（1..500；不返回代码正文）
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 500
+    CodeStartLine:
+      name: startLine
+      in: query
+      required: false
+      description: 文件窗口起始行（≥1；与 endLine 一起 ≤400 行/64 KiB）
+      schema:
+        type: integer
+        minimum: 1
+    CodeEndLine:
+      name: endLine
+      in: query
+      required: false
+      description: 文件窗口结束行（≥startLine）
+      schema:
+        type: integer
+        minimum: 1
+    CodeSubjectKindFilter:
+      name: subjectKind
+      in: query
+      required: false
+      description: 锚点主体类型过滤
+      schema:
+        type: string
+        enum: [version, requirement, requirement_version, case_version, issue]
+    CodeSubjectIDFilter:
+      name: subjectId
+      in: query
+      required: false
+      description: 锚点主体 ID 过滤（十进制字符串；需与 subjectKind 同时使用）
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    VisualAssertionID:
+      name: id
+      in: path
+      required: true
+      description: 视觉断言（visual_assertion）雪花 ID 的十进制字符串
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    VisualCaseAssertionID:
+      name: caseAssertionId
+      in: path
+      required: true
+      description: 设计断言（case_assertion）雪花 ID 的十进制字符串
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    VisualDiffID:
+      name: diffId
+      in: path
+      required: true
+      description: 视觉比对（visual_diff）雪花 ID 的十进制字符串
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    VisualCaseVersionFilter:
+      name: caseVersionId
+      in: query
+      required: false
+      description: 用例版本过滤（十进制字符串）
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    VisualVersionSUTFilter:
+      name: versionSutId
+      in: query
+      required: false
+      description: 版本 SUT 绑定过滤（十进制字符串）
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    VisualClassificationFilter:
+      name: classification
+      in: query
+      required: false
+      description: 视觉比对分类过滤
+      schema:
+        type: string
+        enum: [passed, failed, inconclusive, blocked]
+    VisualCaseRunFilter:
+      name: caseRunId
+      in: query
+      required: false
+      description: 用例运行过滤（十进制字符串）
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    VersionIDFilter:
+      name: versionId
+      in: query
+      required: false
+      description: 版本过滤（十进制字符串；省略=全局聚合）
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
   responses:
     BadRequest:
       description: 请求参数/请求体校验失败（invalid_argument）
@@ -4539,6 +5962,16 @@ components:
             $ref: '#/components/schemas/ErrorEnvelope'
     Conflict:
       description: 唯一约束/状态冲突（conflict / state_conflict / lease_lost）
+      headers:
+        X-Request-ID:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    Unprocessable:
+      description: 语义/业务校验失败（invalid_argument；422；`details.reason` 稳定子码）
       headers:
         X-Request-ID:
           schema:
@@ -5227,6 +6660,11 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/TestAccount'
+        code_baseline_commit:
+          type: string
+          nullable: true
+          pattern: '^[0-9a-f]{40}$'
+          description: 版本 SUT 绑定的代码基线 commit（P5 增量；未解析/缺失为 null；分析 API 返回 baseline_commit_missing）
     LoginRequest:
       type: object
       required: [username, password]
@@ -7157,7 +8595,19 @@ components:
         visual_skipped:
           type: integer
           minimum: 0
-          description: P3 visual 断言只记 skipped（P3-D-39；P5 实现）
+          description: P5 起为 0（或仅“未配置视觉”时计数）；不再把 visual 断言记 skipped 假通过（P3-D-39/P5 实现）
+        visual_passed:
+          type: integer
+          minimum: 0
+          description: 视觉断言 passed 数（P5 增量）
+        visual_failed:
+          type: integer
+          minimum: 0
+          description: 视觉断言 failed 数（P5 增量）
+        visual_inconclusive:
+          type: integer
+          minimum: 0
+          description: 视觉断言 inconclusive 数（P5 增量；含环境不一致/无基线）
         human_request_id:
           type: string
           nullable: true
@@ -7287,7 +8737,8 @@ components:
           minimum: 1
         kind:
           type: string
-          enum: [screenshot, snapshot, console, network, http, db, download, text]
+          enum: [screenshot, snapshot, console, network, http, db, download, text, visual_actual, visual_diff]
+          description: P5 起 10 值；`visual_actual`/`visual_diff` 为视觉比对证据（P5 增量）
         sha256:
           type: string
           pattern: '^[0-9a-f]{64}$'
@@ -8007,3 +9458,1396 @@ components:
           type: string
           minLength: 1
           maxLength: 2000
+    CodeIndexRequest:
+      type: object
+      required: [repoId]
+      properties:
+        repoId:
+          type: string
+          pattern: '^[0-9]+$'
+        commit:
+          type: string
+          nullable: true
+          pattern: '^[0-9a-f]{40}$'
+          description: 缺省为仓库分支头
+        branch:
+          type: string
+          maxLength: 255
+    CodeIndexRunView:
+      type: object
+      required: [id, repo_id, commit_sha, branch, source, status, files_total, files_indexed, truncated, stats, errors, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        version_id:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+        repo_id:
+          type: string
+          pattern: '^[0-9]+$'
+        commit_sha:
+          type: string
+          pattern: '^[0-9a-f]{40}$'
+        branch:
+          type: string
+        source:
+          type: string
+          enum: [git]
+        status:
+          type: string
+          enum: [queued, running, done, failed]
+        files_total:
+          type: integer
+          minimum: 0
+        files_indexed:
+          type: integer
+          minimum: 0
+        truncated:
+          type: boolean
+        stats:
+          type: object
+          additionalProperties: true
+        errors:
+          type: array
+          maxItems: 20
+          items:
+            type: object
+            additionalProperties: true
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        finished_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_by:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      description: 索引运行摘要；不含代码正文/内部路径。
+    CodeRepoStatusView:
+      type: object
+      required: [repo_id, repository, latest_index, baseline_commit, index_in_progress]
+      properties:
+        repo_id:
+          type: string
+          pattern: '^[0-9]+$'
+        repository:
+          $ref: '#/components/schemas/CodeRepository'
+        latest_index:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/CodeIndexRunView'
+        baseline_commit:
+          type: string
+          nullable: true
+          pattern: '^[0-9a-f]{40}$'
+        index_in_progress:
+          type: boolean
+    CodeRepoStatusListEnvelope:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/CodeRepoStatusView'
+        next_cursor:
+          type: string
+          nullable: true
+        has_more:
+          type: boolean
+    CodeTreeEntryView:
+      type: object
+      required: [path, name, kind]
+      properties:
+        path:
+          type: string
+          maxLength: 4096
+        name:
+          type: string
+          maxLength: 512
+        kind:
+          type: string
+          enum: [file, directory]
+        size_bytes:
+          type: integer
+          format: int64
+          nullable: true
+          minimum: 0
+        blob_hash:
+          type: string
+          nullable: true
+    CodeTreeListEnvelope:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          maxItems: 200
+          items:
+            $ref: '#/components/schemas/CodeTreeEntryView'
+        next_cursor:
+          type: string
+          nullable: true
+        has_more:
+          type: boolean
+    CodeFileWindowView:
+      type: object
+      required: [repo_id, commit_sha, path, start_line, end_line, total_lines, truncated, binary, content, sha256]
+      properties:
+        repo_id:
+          type: string
+          pattern: '^[0-9]+$'
+        commit_sha:
+          type: string
+          pattern: '^[0-9a-f]{40}$'
+        path:
+          type: string
+          maxLength: 4096
+        start_line:
+          type: integer
+          minimum: 1
+        end_line:
+          type: integer
+          minimum: 1
+        total_lines:
+          type: integer
+          minimum: 0
+        truncated:
+          type: boolean
+        binary:
+          type: boolean
+        content:
+          type: string
+          description: 文本窗口（≤400 行/64 KiB）；binary=true 时为空串
+        sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+      description: 单文件窗口；不返回其他文件内容/内部路径。
+    CodeChangedFileView:
+      type: object
+      required: [path, status, additions, deletions, binary]
+      properties:
+        path:
+          type: string
+          maxLength: 4096
+        old_path:
+          type: string
+          nullable: true
+          maxLength: 4096
+        status:
+          type: string
+          enum: [added, modified, deleted, renamed]
+        additions:
+          type: integer
+          minimum: 0
+        deletions:
+          type: integer
+          minimum: 0
+        binary:
+          type: boolean
+        head_blob_hash:
+          type: string
+          nullable: true
+    CodeChangedFileListEnvelope:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          maxItems: 2000
+          items:
+            $ref: '#/components/schemas/CodeChangedFileView'
+        next_cursor:
+          type: string
+          nullable: true
+        has_more:
+          type: boolean
+    CodeFileDiffView:
+      type: object
+      required: [path, status, additions, deletions, binary, large, deleted]
+      properties:
+        path:
+          type: string
+          maxLength: 4096
+        old_path:
+          type: string
+          nullable: true
+          maxLength: 4096
+        status:
+          type: string
+          enum: [added, modified, deleted, renamed]
+        additions:
+          type: integer
+          minimum: 0
+        deletions:
+          type: integer
+          minimum: 0
+        binary:
+          type: boolean
+        large:
+          type: boolean
+        deleted:
+          type: boolean
+        patch:
+          type: string
+          nullable: true
+          maxLength: 262144
+          description: 统一 diff 文本（≤256 KiB）；binary/large/deleted 时为 null
+      description: 单文件按需 diff；binary/large/deleted 时不返回 patch 正文。
+    CodeFactView:
+      type: object
+      required: [id, repo_id, commit_sha, fact_key, version, kind, path, source, confidence, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        repo_id:
+          type: string
+          pattern: '^[0-9]+$'
+        commit_sha:
+          type: string
+          pattern: '^[0-9a-f]{40}$'
+        fact_key:
+          type: string
+          maxLength: 512
+        version:
+          type: integer
+          minimum: 1
+        kind:
+          type: string
+          enum: [file, module, route, api, client_call, component, page, symbol]
+        path:
+          type: string
+          maxLength: 4096
+        name:
+          type: string
+          maxLength: 512
+        signature:
+          type: string
+          maxLength: 2000
+        start_line:
+          type: integer
+          minimum: 1
+          nullable: true
+        end_line:
+          type: integer
+          minimum: 1
+          nullable: true
+        body:
+          type: object
+          additionalProperties: true
+          description: 结构化事实（不含代码正文）
+        evidence:
+          type: array
+          maxItems: 8
+          items:
+            type: object
+            additionalProperties: true
+        source:
+          type: string
+          enum: [git, ai]
+        confidence:
+          type: string
+          enum: [low, medium, high]
+        model:
+          type: string
+          maxLength: 128
+        prompt_version:
+          type: string
+          maxLength: 64
+        analysis_id:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+        superseded_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+    CodeFactListEnvelope:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/CodeFactView'
+        next_cursor:
+          type: string
+          nullable: true
+        has_more:
+          type: boolean
+    CodeEntityView:
+      type: object
+      required: [id, repo_id, commit_sha, kind, path, source, confidence]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        repo_id:
+          type: string
+          pattern: '^[0-9]+$'
+        commit_sha:
+          type: string
+          pattern: '^[0-9a-f]{40}$'
+        kind:
+          type: string
+          enum: [file, module, route, api, client_call, component, page, symbol]
+        path:
+          type: string
+          maxLength: 4096
+        name:
+          type: string
+          maxLength: 512
+        signature:
+          type: string
+          maxLength: 2000
+        start_line:
+          type: integer
+          minimum: 1
+          nullable: true
+        end_line:
+          type: integer
+          minimum: 1
+          nullable: true
+        source:
+          type: string
+          enum: [git, ai]
+        confidence:
+          type: string
+          enum: [low, medium, high]
+    CodeEntityListEnvelope:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/CodeEntityView'
+        next_cursor:
+          type: string
+          nullable: true
+        has_more:
+          type: boolean
+    CodeCommitView:
+      type: object
+      required: [sha, message, authored_at, committed_at, parents, is_head]
+      properties:
+        sha:
+          type: string
+          pattern: '^[0-9a-f]{40}$'
+        branch:
+          type: string
+          nullable: true
+        message:
+          type: string
+          maxLength: 4000
+        author_name:
+          type: string
+          nullable: true
+          maxLength: 255
+        authored_at:
+          type: string
+          format: date-time
+        committed_at:
+          type: string
+          format: date-time
+        parents:
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9a-f]{40}$'
+        is_head:
+          type: boolean
+    CodeChangeSetView:
+      type: object
+      required: [repo_id, base_commit_sha, head_commit_sha, files, stats, truncated]
+      properties:
+        repo_id:
+          type: string
+          pattern: '^[0-9]+$'
+        base_commit_sha:
+          type: string
+          pattern: '^[0-9a-f]{40}$'
+        head_commit_sha:
+          type: string
+          pattern: '^[0-9a-f]{40}$'
+        files:
+          type: array
+          maxItems: 2000
+          items:
+            $ref: '#/components/schemas/CodeChangedFileView'
+        stats:
+          type: object
+          additionalProperties: true
+        truncated:
+          type: boolean
+      description: 变更集预览（不落库）；base 为 version_sut.code_baseline_commit。
+    CodeAnalysisRequest:
+      type: object
+      required: [repoId]
+      properties:
+        repoId:
+          type: string
+          pattern: '^[0-9]+$'
+        headCommit:
+          type: string
+          nullable: true
+          pattern: '^[0-9a-f]{40}$'
+        force:
+          type: boolean
+          default: false
+    CodeAnalysisView:
+      type: object
+      required: [id, version_id, repo_id, base_commit_sha, head_commit_sha, status, degraded, stats, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        version_id:
+          type: string
+          pattern: '^[0-9]+$'
+        repo_id:
+          type: string
+          pattern: '^[0-9]+$'
+        base_commit_sha:
+          type: string
+          pattern: '^[0-9a-f]{40}$'
+        head_commit_sha:
+          type: string
+          pattern: '^[0-9a-f]{40}$'
+        status:
+          type: string
+          enum: [queued, running, done, failed]
+        degraded:
+          type: boolean
+        model:
+          type: string
+          maxLength: 128
+        prompt_version:
+          type: string
+          maxLength: 64
+        analysis_version:
+          type: integer
+          minimum: 1
+        stats:
+          type: object
+          additionalProperties: true
+        changed_files_count:
+          type: integer
+          minimum: 0
+        candidates_count:
+          type: integer
+          minimum: 0
+        selected_count:
+          type: integer
+          minimum: 0
+        unmapped_count:
+          type: integer
+          minimum: 0
+        errors_count:
+          type: integer
+          minimum: 0
+        error:
+          type: string
+          nullable: true
+          maxLength: 2000
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        finished_at:
+          type: string
+          format: date-time
+          nullable: true
+    CodeAnalysisDetailView:
+      type: object
+      required: [analysis, changed_files, unmapped, candidates]
+      properties:
+        analysis:
+          $ref: '#/components/schemas/CodeAnalysisView'
+        changed_files:
+          type: array
+          maxItems: 2000
+          items:
+            $ref: '#/components/schemas/CodeChangedFileView'
+        unmapped:
+          type: array
+          maxItems: 200
+          items:
+            type: object
+            required: [path, reason]
+            properties:
+              path:
+                type: string
+                maxLength: 4096
+              reason:
+                type: string
+                maxLength: 500
+        candidates:
+          type: array
+          items:
+            $ref: '#/components/schemas/CodeImpactCandidateView'
+        fact_versions:
+          type: object
+          additionalProperties:
+            type: integer
+        errors:
+          type: array
+          maxItems: 20
+          items:
+            type: object
+            additionalProperties: true
+    CodeImpactCandidateView:
+      type: object
+      required: [id, analysis_id, subject_kind, subject_id, reason, confidence, source, selected, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        analysis_id:
+          type: string
+          pattern: '^[0-9]+$'
+        repo_id:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+          description: 合并影响视图中的仓库标签
+        version_sut_id:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+          description: 合并影响视图中的 SUT 标签
+        subject_kind:
+          type: string
+          enum: [requirement, requirement_version, case_version, sut_page, sut_api]
+        subject_id:
+          type: string
+          pattern: '^[0-9]+$'
+        reason:
+          type: string
+          maxLength: 2000
+        confidence:
+          type: string
+          enum: [low, medium, high]
+        source:
+          type: string
+          enum: [direct, contract, relation, ai]
+        evidence:
+          type: array
+          maxItems: 5
+          items:
+            type: object
+            additionalProperties: true
+        selected:
+          type: boolean
+        selection_updated_by:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+        selection_updated_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+    CodeCandidatePatchRequest:
+      type: object
+      required: [selected]
+      properties:
+        selected:
+          type: boolean
+    CodeImpactView:
+      type: object
+      required: [version_id, analyses, candidates]
+      properties:
+        version_id:
+          type: string
+          pattern: '^[0-9]+$'
+        analyses:
+          type: array
+          items:
+            type: object
+            required: [repo_id, analysis_id, base_commit_sha, head_commit_sha, status, degraded]
+            properties:
+              repo_id:
+                type: string
+                pattern: '^[0-9]+$'
+              analysis_id:
+                type: string
+                pattern: '^[0-9]+$'
+              base_commit_sha:
+                type: string
+                pattern: '^[0-9a-f]{40}$'
+              head_commit_sha:
+                type: string
+                pattern: '^[0-9a-f]{40}$'
+              status:
+                type: string
+                enum: [queued, running, done, failed]
+              degraded:
+                type: boolean
+              candidates_count:
+                type: integer
+                minimum: 0
+        candidates:
+          type: array
+          maxItems: 200
+          items:
+            $ref: '#/components/schemas/CodeImpactCandidateView'
+    CodeAnchorView:
+      type: object
+      required: [id, version_id, repo_id, subject_kind, subject_id, file_path, status, confidence, created_by_kind, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        version_id:
+          type: string
+          pattern: '^[0-9]+$'
+        repo_id:
+          type: string
+          pattern: '^[0-9]+$'
+        subject_kind:
+          type: string
+          enum: [version, requirement, requirement_version, case_version, issue]
+        subject_id:
+          type: string
+          pattern: '^[0-9]+$'
+        file_path:
+          type: string
+          maxLength: 4096
+        start_line:
+          type: integer
+          minimum: 1
+          nullable: true
+        end_line:
+          type: integer
+          minimum: 1
+          nullable: true
+        entity_id:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+        commit_sha:
+          type: string
+          nullable: true
+          pattern: '^[0-9a-f]{40}$'
+        excerpt_sha:
+          type: string
+          nullable: true
+          description: sha256:<64hex> 或空串/null
+        status:
+          type: string
+          enum: [valid, stale, broken]
+        confidence:
+          type: string
+          enum: [low, medium, high]
+        created_by_kind:
+          type: string
+          enum: [user, ai, system]
+        created_by:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+        last_validated_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    CreateCodeAnchorRequest:
+      type: object
+      required: [subjectKind, subjectId, repoId, filePath]
+      properties:
+        subjectKind:
+          type: string
+          enum: [version, requirement, requirement_version, case_version, issue]
+        subjectId:
+          type: string
+          pattern: '^[0-9]+$'
+        repoId:
+          type: string
+          pattern: '^[0-9]+$'
+        filePath:
+          type: string
+          minLength: 1
+          maxLength: 4096
+        startLine:
+          type: integer
+          minimum: 1
+        endLine:
+          type: integer
+          minimum: 1
+        excerptSha:
+          type: string
+          nullable: true
+          pattern: '^sha256:[0-9a-f]{64}$'
+    CodeAnchorListEnvelope:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/CodeAnchorView'
+        next_cursor:
+          type: string
+          nullable: true
+        has_more:
+          type: boolean
+    CodeFactReviewView:
+      type: object
+      required: [id, fact_id, fact_version, repo_id, commit_sha, verdict, reason, reviewer_id, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        fact_id:
+          type: string
+          pattern: '^[0-9]+$'
+        fact_version:
+          type: integer
+          minimum: 1
+        repo_id:
+          type: string
+          pattern: '^[0-9]+$'
+        commit_sha:
+          type: string
+          pattern: '^[0-9a-f]{40}$'
+        verdict:
+          type: string
+          enum: [correct, incorrect]
+        reason:
+          type: string
+          maxLength: 2000
+        reviewer_id:
+          type: string
+          pattern: '^[0-9]+$'
+        created_at:
+          type: string
+          format: date-time
+    CreateCodeFactReviewRequest:
+      type: object
+      required: [verdict]
+      properties:
+        verdict:
+          type: string
+          enum: [correct, incorrect]
+        reason:
+          type: string
+          maxLength: 2000
+    CodeFactReviewListEnvelope:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/CodeFactReviewView'
+        next_cursor:
+          type: string
+          nullable: true
+        has_more:
+          type: boolean
+    CodeProposalRequest:
+      type: object
+      properties:
+        repoId:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+    CodeProposalCounts:
+      type: object
+      required: [created, skipped, ids]
+      properties:
+        created:
+          type: integer
+          minimum: 0
+        skipped:
+          type: integer
+          minimum: 0
+        ids:
+          type: array
+          maxItems: 20
+          items:
+            type: string
+            pattern: '^[0-9]+$'
+    CodeProposalResultView:
+      type: object
+      required: [pages, apis]
+      properties:
+        pages:
+          $ref: '#/components/schemas/CodeProposalCounts'
+        apis:
+          $ref: '#/components/schemas/CodeProposalCounts'
+    CodeProposalView:
+      type: object
+      required: [kind, id, name, status, source, created_at]
+      properties:
+        kind:
+          type: string
+          enum: [page, api]
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        name:
+          type: string
+          maxLength: 500
+        url:
+          type: string
+          nullable: true
+        route_template:
+          type: string
+          nullable: true
+        method:
+          type: string
+          nullable: true
+        path_template:
+          type: string
+          nullable: true
+        status:
+          type: string
+          enum: [proposed]
+        source:
+          type: string
+          enum: [ai, code]
+        evidence:
+          type: array
+          maxItems: 5
+          items:
+            type: object
+            additionalProperties: true
+        created_at:
+          type: string
+          format: date-time
+    CodeProposalListEnvelope:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/CodeProposalView'
+        next_cursor:
+          type: string
+          nullable: true
+        has_more:
+          type: boolean
+    VisualAssertionUpsertRequest:
+      type: object
+      properties:
+        versionSutId:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+        selector:
+          type: string
+          nullable: true
+          maxLength: 500
+        region:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: '{x,y,width,height} 或省略；归一化'
+        threshold:
+          type: number
+          nullable: true
+          minimum: 0
+          maximum: 0.1
+        viewport:
+          type: object
+          nullable: true
+          required: [width, height]
+          properties:
+            width:
+              type: integer
+              minimum: 1
+              maximum: 10000
+            height:
+              type: integer
+              minimum: 1
+              maximum: 10000
+        deviceScaleFactor:
+          type: number
+          nullable: true
+          minimum: 0.5
+          maximum: 4
+        waitPolicy:
+          type: object
+          nullable: true
+          additionalProperties: true
+    VisualBaselineSummary:
+      type: object
+      required: [id, sha256, width, height, config_revision, environment_fingerprint, approved_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        width:
+          type: integer
+          minimum: 1
+        height:
+          type: integer
+          minimum: 1
+        config_revision:
+          type: integer
+          minimum: 1
+        environment_fingerprint:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        approved_at:
+          type: string
+          format: date-time
+    VisualAssertionView:
+      type: object
+      required: [id, version_id, case_version_id, case_assertion_id, step_seq, assertion_seq, version_sut_id, selector, region, threshold, viewport_width, viewport_height, device_scale_factor, wait_policy, config_revision, status, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        version_id:
+          type: string
+          pattern: '^[0-9]+$'
+        case_version_id:
+          type: string
+          pattern: '^[0-9]+$'
+        case_assertion_id:
+          type: string
+          pattern: '^[0-9]+$'
+        step_seq:
+          type: integer
+          minimum: 1
+        assertion_seq:
+          type: integer
+          minimum: 1
+        version_sut_id:
+          type: string
+          pattern: '^[0-9]+$'
+        selector:
+          type: string
+          maxLength: 500
+        region:
+          type: object
+          additionalProperties: true
+        threshold:
+          type: number
+          minimum: 0
+          maximum: 0.1
+        viewport_width:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        viewport_height:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        device_scale_factor:
+          type: number
+          minimum: 0.5
+          maximum: 4
+        wait_policy:
+          type: object
+          additionalProperties: true
+        config_revision:
+          type: integer
+          minimum: 1
+        status:
+          type: string
+          enum: [active, archived]
+        baseline:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/VisualBaselineSummary'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      description: 视觉断言配置；不含 actual/diff 图片字节。
+    VisualAssertionListEnvelope:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/VisualAssertionView'
+        next_cursor:
+          type: string
+          nullable: true
+        has_more:
+          type: boolean
+    VisualBaselineView:
+      type: object
+      required: [id, visual_assertion_id, case_version_id, version_sut_id, evidence_id, sha256, size_bytes, width, height, viewport_width, viewport_height, device_scale_factor, config_revision, environment_fingerprint, status, approved_by, approved_at, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        visual_assertion_id:
+          type: string
+          pattern: '^[0-9]+$'
+        case_version_id:
+          type: string
+          pattern: '^[0-9]+$'
+        version_sut_id:
+          type: string
+          pattern: '^[0-9]+$'
+        evidence_id:
+          type: string
+          pattern: '^[0-9]+$'
+        sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        size_bytes:
+          type: integer
+          format: int64
+          minimum: 1
+        width:
+          type: integer
+          minimum: 1
+        height:
+          type: integer
+          minimum: 1
+        viewport_width:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        viewport_height:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        device_scale_factor:
+          type: number
+          minimum: 0.5
+          maximum: 4
+        config_revision:
+          type: integer
+          minimum: 1
+        environment_fingerprint:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        status:
+          type: string
+          enum: [approved, superseded]
+        approved_by:
+          type: string
+          pattern: '^[0-9]+$'
+        approved_at:
+          type: string
+          format: date-time
+        superseded_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+    VisualBaselineApproveRequest:
+      type: object
+      required: [evidenceId]
+      properties:
+        evidenceId:
+          type: string
+          pattern: '^[0-9]+$'
+          description: 同 case_version/version_sut 的 visual_actual 证据
+    VisualBaselineListEnvelope:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/VisualBaselineView'
+        next_cursor:
+          type: string
+          nullable: true
+        has_more:
+          type: boolean
+    VisualDiffView:
+      type: object
+      required: [id, visual_assertion_id, case_run_id, assertion_result_id, actual_evidence_id, diff_ratio, threshold, classification, reason, environment_match, width, height, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        visual_assertion_id:
+          type: string
+          pattern: '^[0-9]+$'
+        case_run_id:
+          type: string
+          pattern: '^[0-9]+$'
+        assertion_result_id:
+          type: string
+          pattern: '^[0-9]+$'
+        baseline_id:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+        actual_evidence_id:
+          type: string
+          pattern: '^[0-9]+$'
+        diff_evidence_id:
+          type: string
+          nullable: true
+          pattern: '^[0-9]+$'
+        diff_ratio:
+          type: number
+          minimum: 0
+          maximum: 1
+        threshold:
+          type: number
+          minimum: 0
+          maximum: 0.1
+        classification:
+          type: string
+          enum: [passed, failed, inconclusive, blocked]
+        reason:
+          type: string
+          maxLength: 2000
+        environment_match:
+          type: boolean
+        width:
+          type: integer
+          minimum: 0
+        height:
+          type: integer
+          minimum: 0
+        created_at:
+          type: string
+          format: date-time
+      description: 视觉比对摘要；不含图片字节/内部存储路径。
+    VisualDiffListEnvelope:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/VisualDiffView'
+        next_cursor:
+          type: string
+          nullable: true
+        has_more:
+          type: boolean
+    VisualEvidenceRef:
+      type: object
+      required: [viewport_width, viewport_height, device_scale_factor]
+      properties:
+        viewport_width:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        viewport_height:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        device_scale_factor:
+          type: number
+          minimum: 0.5
+          maximum: 4
+        browser:
+          type: string
+          nullable: true
+        version:
+          type: string
+          nullable: true
+    VisualMismatchBox:
+      type: object
+      required: [x, y, width, height]
+      properties:
+        x:
+          type: integer
+          minimum: 0
+        y:
+          type: integer
+          minimum: 0
+        width:
+          type: integer
+          minimum: 1
+        height:
+          type: integer
+          minimum: 1
+    VisualDiffDetailView:
+      allOf:
+        - $ref: '#/components/schemas/VisualDiffView'
+        - type: object
+          required: [mismatch_boxes]
+          properties:
+            mismatch_boxes:
+              type: array
+              maxItems: 50
+              items:
+                $ref: '#/components/schemas/VisualMismatchBox'
+            environment:
+              nullable: true
+              allOf:
+                - $ref: '#/components/schemas/VisualEvidenceRef'
+    VisualInconclusiveReason:
+      type: object
+      required: [reason, count]
+      properties:
+        reason:
+          type: string
+          maxLength: 200
+        count:
+          type: integer
+          minimum: 0
+    VisualDiffLatency:
+      type: object
+      required: [p50_ms, p95_ms]
+      properties:
+        p50_ms:
+          type: integer
+          minimum: 0
+        p95_ms:
+          type: integer
+          minimum: 0
+    VisualOverviewView:
+      type: object
+      required: [version_id, assertion_total, baseline_covered, baseline_coverage_ratio, passed, failed, inconclusive, blocked, pass_ratio, inconclusive_reasons, diff_latency_ms, recent_failures]
+      properties:
+        version_id:
+          type: string
+          pattern: '^[0-9]+$'
+        assertion_total:
+          type: integer
+          minimum: 0
+        baseline_covered:
+          type: integer
+          minimum: 0
+        baseline_coverage_ratio:
+          type: number
+          nullable: true
+          minimum: 0
+          maximum: 1
+        passed:
+          type: integer
+          minimum: 0
+        failed:
+          type: integer
+          minimum: 0
+        inconclusive:
+          type: integer
+          minimum: 0
+        blocked:
+          type: integer
+          minimum: 0
+        pass_ratio:
+          type: number
+          nullable: true
+          minimum: 0
+          maximum: 1
+        inconclusive_reasons:
+          type: array
+          maxItems: 20
+          items:
+            $ref: '#/components/schemas/VisualInconclusiveReason'
+        diff_latency_ms:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/VisualDiffLatency'
+        recent_failures:
+          type: array
+          maxItems: 10
+          items:
+            $ref: '#/components/schemas/VisualDiffView'
+    VisualMetricTotals:
+      type: object
+      required: [assertions, baselines, diffs, passed, failed, inconclusive, blocked]
+      properties:
+        assertions:
+          type: integer
+          minimum: 0
+        baselines:
+          type: integer
+          minimum: 0
+        diffs:
+          type: integer
+          minimum: 0
+        passed:
+          type: integer
+          minimum: 0
+        failed:
+          type: integer
+          minimum: 0
+        inconclusive:
+          type: integer
+          minimum: 0
+        blocked:
+          type: integer
+          minimum: 0
+    VisualMetricRatios:
+      type: object
+      properties:
+        baseline_coverage:
+          type: number
+          nullable: true
+          minimum: 0
+          maximum: 1
+        pass_rate:
+          type: number
+          nullable: true
+          minimum: 0
+          maximum: 1
+        inconclusive_rate:
+          type: number
+          nullable: true
+          minimum: 0
+          maximum: 1
+    VisualMetricsView:
+      type: object
+      required: [scope, totals, ratios, diff_latency_ms, top_inconclusive_reasons, generated_at]
+      properties:
+        scope:
+          type: object
+          required: [version_id]
+          properties:
+            version_id:
+              type: string
+              nullable: true
+              pattern: '^[0-9]+$'
+        totals:
+          $ref: '#/components/schemas/VisualMetricTotals'
+        ratios:
+          $ref: '#/components/schemas/VisualMetricRatios'
+        diff_latency_ms:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/VisualDiffLatency'
+        top_inconclusive_reasons:
+          type: array
+          maxItems: 10
+          items:
+            $ref: '#/components/schemas/VisualInconclusiveReason'
+        generated_at:
+          type: string
+          format: date-time

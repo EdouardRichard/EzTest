@@ -13,7 +13,7 @@
 | 字段 | 语义 |
 |---|---|
 | `version_id` | 版本作用域 |
-| `team` | `clarification / design / execution / delivery / steward` |
+| `team` | `clarification / design / execution / delivery / steward / code`（`code` 为 P5 增量） |
 | `type` | 本文件定义的任务类型 |
 | `priority` | 越大越先（P1 默认 0） |
 | `dedupe_key` | 幂等键；`UNIQUE(version_id,type,dedupe_key)` |
@@ -62,9 +62,9 @@
 
 ## 4. P4+ 保留类型（不实现、不创建）
 
-`report.render_pdf`、`knowledge.review`、`gc.run`、`index.repo`、`visual.*`、`search.*`。
+`report.render_pdf`、`knowledge.review`、`gc.run`、`visual.*`、`search.*`。
 
-P4 已把 5 个预留类型移入 §6 并实现；`report.render_pdf` 仍保留、不注册（PDF 属 P7）。其余保留类型在后续阶段写入本文件并扩展 work_item/worker；当前阶段不注册对应 profile、不创建任务。
+P4 已把 5 个预留类型移入 §6 并实现；P5 把 `index.repo` 移入 §7 并实现（`code.analyze` 为 P5 新增类型，非预留）；`report.render_pdf` 仍保留、不注册（PDF 属 P7）。`visual.*` 不是独立任务类型：视觉断言在用例执行任务内执行（见 §7 与 `executor-protocol.md` v1.2），`search.*` 仍保留。其余保留类型在后续阶段写入本文件并扩展 work_item/worker；当前阶段不注册对应 profile、不创建任务。
 
 ## 5. P3 任务类型（实现；`frozen: P3`，2026-11-01）
 
@@ -101,3 +101,19 @@ P4 把 `issue.triage`、`report.wave`、`report.version`、`requirement.close`�
 - `version.close` 任务自身从版本 close 谓词的“无开放任务”中排除；`predicate_fingerprint = sha256(canonical(version_id, requirement 状态集合, report_revision_id, open_counts...))`，状态变化自然产生新 dedupe key。
 - `report.wave`/`report.version` 的 revision 在任务创建时确定；同一 next revision 的活跃任务存在时幂等返回 202；旧 revision 不删除。
 - Agent 输出只作候选：`issue.propose` 不改 issue 状态；`report.narrative_propose` 不改统计数字；`requirement.goal_met`/`version.close_propose` 由服务端事务内重算校验，失败返回 409 带失败项（见 `agent-profiles-tools.md` §7）。
+
+## 7. P5 任务类型（实现；`frozen: P5`，2026-11-01）
+
+P5 把 `index.repo` 从 §4 移到本节并实现，并新增 `code.analyze`；两者 team=`code`，由 **codeintel 专用 worker** 领取，不映射 Agent profile（P5-D-03/B1a）。
+
+| type | team | profile | dedupe_key | payload | 输出 | 失败语义 |
+|---|---|---|---|---|---|---|
+| `index.repo` | `code` | —（不映射 Agent profile） | `code:index:{index_run_id}` | `{repo_id,commit_sha,branch,index_run_id}` | `code_index_run` 终态（done/failed）+ `code.index_started/finished/failed` 事件 | 可重试错误重新 `open`；超过 `max_attempts` → `dead` 且 run 置 `failed`；不可重试 → `failed/dead`；同一 run 重跑幂等（不重复实体/边） |
+| `code.analyze` | `code` | —（不映射 Agent profile） | `code:analyze:{analysis_id}` | `{analysis_id,repo_id,base_commit_sha,head_commit_sha}` | `code_analysis` 终态（done/failed，可 degraded）+ candidates/unmapped + `code.analysis_*`/`code.impact_computed` 事件 | 同上；LLM 不可用 → `done + degraded`（不伪造事实）；同一 run 重跑不重复事实/候选 |
+
+- 两者 `version_id` = 触发版本；`work_item.version_id` 保持 NOT NULL（codeintel 任务必须版本作用域，B1a）。`max_attempts=3`；`priority=50`。
+- 领取语义（`agent-profiles-tools.md` §8）：`WorkQueue.ClaimForTeams(ctx, claimant, teams)` 增量；codeintel worker 用 `["code"]`，agent worker 用其余 5 个 team（排除 `code`）。
+- 创建者：`POST /api/versions/{versionId}/code/index` 在同事务内建 `code_index_run` 并 ensure `index.repo`；`POST .../code/analyses` 建 `code_analysis` 并 ensure `code.analyze`；重复 ensure 返回既有行（同 dedupe key），不新增。
+- 事件：`work_item.created/claimed/failed/dead` 由 P1 worker 发布到 `version:{id}`；P5 不为 `code` 团队建 `team_room`/digest（§4.4）。
+- 完成语义：业务产物写入成功且事件发布尝试完成后 `done`；事件失败不回滚业务，reconciler 兜底；失败不阻塞其他 version 任务。
+- `visual.compare` 不是 work_item 类型：由 `execute.case` 内的 `execution.visual_assert` 工具/执行流程调用执行器 action（见 `agent-profiles-tools.md` §8、`executor-protocol.md` v1.2）。
