@@ -52,10 +52,10 @@
 
 | ID | 裁决 |
 |---|---|
-| U1 | 质量/评测按 **0.1 P8 完整对齐**：`eval_run`/`eval_metric` + 指标/阈值/基线 + 质量中心 + 评测 runner 双轨。 |
+| U1 | 质量/评测按 **0.1 P8 完整对齐**：`eval_run`/`eval_metric` + 指标/阈值/基线 + 质量中心 + 评测 runner；runner 按 U4 只做真实 LLM 报告轨。 |
 | U2 | 待办 = **确认类待办 + 设计待办 + 接管/人工请求**；入口为全局 Topbar TodoDrawer + `/api/todos`，**不新增一级导航**。 |
 | U3 | 链路按 **增量对齐剩余 v2**：筛选/counts/typed meta/重连/回放细化；**不承诺任意时点 as-of**。 |
-| U4 | 验收按 **B：全量真实 LLM + Chrome**（真实 DeepSeek `deepseek-flash` + 真实 Chrome + 浏览器 E2E/截图）。 |
+| U4 | 验收按 **B：全量真实 LLM + Chrome**（真实 DeepSeek `deepseek-flash` + 真实 Chrome + 浏览器 E2E/截图）；**验收/评测/E2E/演示不使用 fake-LLM**；单测/集成测试的离线替身仅验证逻辑，不产出验收结论；真实 LLM 评测阈值作为报告轨（0.1 D61 口径），不阻断阶段验收。 |
 | U5 | Agent 提示词运行态定制选 **A1**：完整对齐 ARTEX 核心（编辑、版本、历史/diff、恢复默认、变量/模板、预览、审计、热生效），并接受内网注入风险。 |
 | U6 | 确认 ARTEX 能力矩阵处置：include/defer/na 见 §8.9；不适用项不硬造。 |
 | U7 | 分支 `feat/v0.2-p6`，完成后合回 `feat/v0.2`。 |
@@ -81,7 +81,7 @@
 
 ### 1.2 In
 
-1. **quality 上下文**：`eval_run`/`eval_metric`（#32）+ 6 评测指标 + 视觉指标 + 7 运营指标；`/quality` 质量中心；0.2 评测语料/基线/runner 双轨。
+1. **quality 上下文**：`eval_run`/`eval_metric`（#32）+ 6 评测指标 + 视觉指标 + 7 运营指标；`/quality` 质量中心；0.2 评测语料/基线/真实 LLM runner。
 2. **search 上下文**：`GET /api/search`（5 类实体、Provider 聚合、降级）+ Topbar CommandPalette。
 3. **workspace 上下文**：`GET /api/todos`（确认/设计/接管/人工请求/dead）+ 全局 Topbar TodoDrawer。
 4. **Agent 中心**：`/api/agent-center/{catalog,runs,quality}`（登录只读）+ `/api/agents/profiles*`、`/api/agents/tools`（admin 配置）+ `/agents` 页面；提示词运行态定制（版本/变量/预览/diff/恢复/审计/热生效）。
@@ -103,7 +103,7 @@
 1. 32→33 迁移可重放；`eval_run`/`eval_metric`/`agent_profile_prompt_revision` 存在，约束/索引正确。
 2. `/api/search` 返回 5 类分组、每类上限、`degraded`；CommandPalette 可用。
 3. `/api/todos` 覆盖 6 个 kind、counts pre-limit、权限过滤、30s 轮询。
-4. `/quality` 登录可见运营+视觉指标；admin 可见评测看板/阈值/基线/历史；评测 API 服务端派生、拒绝客户端 verdict。
+4. `/quality` 登录可见运营+视觉指标；admin 可见评测看板/阈值/基线/历史；评测 API 服务端派生、拒绝客户端 verdict；真实 LLM 评测报告轨可见（阈值/基线不阻断）。
 5. `/agents` 目录/运行/质量；普通用户只读且无 prompt；admin 可编辑 profile 配置与提示词（版本/变量/预览/diff/恢复），保存后下一次 run 生效。
 6. `/issues`、`/reports` 跨版本只读列表/筛选/游标/深链；只读边界。
 7. 链路 v2 新筛选/counts/meta/降级/重连/回放/性能可验证；`chain.max_*` 热加载、`replay_event_limit` 生效。
@@ -157,8 +157,8 @@
 ### 2.5 真实 LLM 原则（全阶段强制）
 
 - 真实 LLM 失败按系统缺陷定位：上下文包/工具 scope/schema/提示词歧义/服务端校验/超时预算；修复后重跑。
-- 不得以 fake 替代真实 LLM 验收；fake 仅用于确定性测试/E2E 准备。
-- 工具调用抖动：验收脚本要有重试/最终器/可观测（日志、run id、system message 证据）。
+- 验收/评测/E2E/演示**一律使用真实 LLM**；不得以 fake 替代真实 LLM 验收，也不得用 fake 数据伪造验收结论。单测/集成测试中的离线替身只验证逻辑，不产出验收结论。
+- 真实 LLM 的工具调用抖动：验收脚本要有重试/最终器/可观测（日志、run id、system message 证据）；报告轨阈值不阻断，但必须在验收记录中写明偏差。
 - 验收环境：隔离库 + 独立端口，不碰开发栈（13333/6868/13336/5433）。
 
 ### 2.6 0.1 → 0.2 语义适配（实现必须遵守）
@@ -189,7 +189,7 @@
 ```sql
 CREATE TABLE eval_run (
     id             BIGINT NOT NULL,
-    mode           TEXT NOT NULL CHECK (mode IN ('deterministic','real_llm')),
+    mode           TEXT NOT NULL CHECK (mode = 'real_llm'),
     corpus_version TEXT NOT NULL CHECK (corpus_version <> ''),
     model          TEXT NOT NULL DEFAULT '',
     status         TEXT NOT NULL CHECK (status IN ('running','passed','failed','error')),
@@ -356,13 +356,13 @@ GET /api/quality/overview?version_id=<optional>
 ```
 - `POST` body：
 ```json
-{"mode":"deterministic|real_llm","corpus_version":"v02-2026-11-01.1",
+{"mode":"real_llm","corpus_version":"v02-2026-11-01.1",
  "model":"deepseek-flash","status":"error?","sample":{...},"baseline":{...},
  "summary":{},"started_at":"...","finished_at":"..."}
 ```
 - `sample`（snake_case，11+2 可选计数）：`confirmed_requirements,covered_requirements,impact_expected,impact_hit,impact_selected,injected_failures,correct_classifications,ai_issues,true_positive_issues,supplement_cases,supplement_hits,visual_injected?,visual_correct?`。
 - 服务端校验：全部非负；`covered<=confirmed`、`impact_hit<=impact_expected`、`impact_hit<=impact_selected`、`correct<=injected`、`true_positive<=ai_issues`、`supplement_hits<=supplement_cases`、`visual_correct<=visual_injected`；违反 400 `invalid_argument`（details.field）。
-- 服务端派生 6+1 指标（§5.3）；`threshold` 由服务端按 `mode` 选择；`baseline` 只用于 deterministic 回归（>0.05 → regressed）；`status` 除 `error` 外由指标派生（全 passed→passed，否则 failed）；客户端传 passed/failed 被忽略。
+- 服务端派生 6+1 指标（§5.3）；`threshold` 使用真实 LLM 报告阈值；`baseline` 只用于标记 `regressed`（>0.05），报告轨不因其阻断验收；`status` 除 `error` 外由指标派生（全 passed→passed，否则 failed）；客户端传 passed/failed 被忽略。阈值/基线是“可观察质量信号”，不是阶段硬门禁。
 - 响应 `EvalRunView`：`id,mode,corpus_version,model,status,summary,metrics[{name,value,threshold,passed,detail{numerator,denominator,threshold_passed,baseline?,regressed,reason}}],started_at,finished_at,created_at`。
 - `GET /api/quality/overview`：`{data:{scope:{version_id|null},generated_at,operational:[OperationalMetric],latest_eval:EvalSummary|null}}`；`OperationalMetric{name,value|null,numerator,denominator,available,definition}`；7 项见 §5.2。
 - 权限：eval-runs 全 admin；overview 登录；`visual-metrics` 登录（P5 不变）。普通用户不看评测 run 列表/样本。
@@ -444,7 +444,7 @@ GET /api/reports?version_id=&status=&kind=&before=&limit=
 |---|---|---|---|---|
 | `search.max_results_per_type` | number | 5 | 1–20 | 搜索每类型上限默认值（查询参数可覆盖） |
 | `todos.max_items` | number | 50 | 1–200 | 待办默认上限（查询参数可覆盖） |
-| `quality.eval_baseline_regression` | number | 0.05 | 0–1 | deterministic 基线回归容差 |
+| `quality.eval_baseline_regression` | number | 0.05 | 0–1 | 基线回归标记容差（报告轨，不阻断） |
 
 - 设置中心分类：search/workspace/quality；非 secret；热加载（读缓存失效）。
 - 不新增 env；不新增 task type/profile/tool/executor 协议。
@@ -490,22 +490,25 @@ GET /api/reports?version_id=&status=&kind=&before=&limit=
 
 ### 5.3 评测指标（6+1）
 
-| name | 公式 | deterministic 阈值 | real_llm 阈值 | 方向 |
-|---|---|---|---|---|
-| `design_coverage` | covered_requirements/confirmed_requirements | 0.90 | 0.80 | ≥ |
-| `impact_recall` | impact_hit/impact_expected | 0.90 | 0.70 | ≥ |
-| `impact_precision` | impact_hit/impact_selected | 0.80 | 0.60 | ≥ |
-| `classification_accuracy` | correct_classifications/injected_failures | 1.00 | 0.80 | ≥ |
-| `issue_false_positive_rate` | (ai_issues-true_positive_issues)/ai_issues | 0.05 | 0.15 | ≤ |
-| `supplement_hit_rate` | supplement_hits/supplement_cases | 0.80 | 0.50 | ≥ |
-| `visual_classification_accuracy` | visual_correct/visual_injected（可选计数） | 1.00 | 0.80 | ≥ |
+> P6 只实现真实 LLM 评测轨；0.1 的 deterministic fake-LLM 指标阈值不实现（用户 U4 裁决：全程真实 LLM）。下表阈值仅用于真实 LLM 报告轨，不阻断阶段验收。
 
-- 分母 0 → value=0（`impact_precision`/`issue_false_positive_rate` 分母 0 时 value=0 且 detail 标注 `zero_denominator=true`）；确定性语料保证门禁指标分母非 0。
+| name | 公式 | real_llm 阈值 | 方向 |
+|---|---|---|---|
+| `design_coverage` | covered_requirements/confirmed_requirements | 0.80 | ≥ |
+| `impact_recall` | impact_hit/impact_expected | 0.70 | ≥ |
+| `impact_precision` | impact_hit/impact_selected | 0.60 | ≥ |
+| `classification_accuracy` | correct_classifications/injected_failures | 0.80 | ≥ |
+| `issue_false_positive_rate` | (ai_issues-true_positive_issues)/ai_issues | 0.15 | ≤ |
+| `supplement_hit_rate` | supplement_hits/supplement_cases | 0.50 | ≥ |
+| `visual_classification_accuracy` | visual_correct/visual_injected（可选计数） | 0.80 | ≥ |
+
+- 分母 0 → value=0（`impact_precision`/`issue_false_positive_rate` 分母 0 时 value=0 且 detail 标注 `zero_denominator=true`）；真实 LLM 语料应尽量保证指标分母非 0，若为 0 则记录原因，不伪造通过。
 - 浮点比较 epsilon `1e-9`；`reason ∈ ok|below_threshold|above_threshold|baseline_regression`。
-- 回归：仅 deterministic；非 Max 指标 `value < baseline-0.05-eps` 或 Max 指标 `value > baseline+0.05+eps` → regressed=true/passed=false；real_llm 不应用回归。
+- 回归：真实 LLM 轨仍计算 `regressed`（对照 `eval/v02/baseline.json`），但只作为质量观察，不阻断阶段；基线只允许不下降更新。
 - `passed = threshold_passed && !regressed`；run status = error（请求声明）或全部指标 passed→passed，否则 failed。
 - `detail` 必含 numerator/denominator/threshold_passed/regressed/reason；有 baseline 时含 baseline。
 - 服务端校验样本物理约束（§4.3.3）；拒绝客户端伪造 passed/阈值。
+- `model` 字段记录真实模型名（如 `deepseek-flash`），`corpus_version` 记录真实评测语料版本；不得写 fake 模型名。
 
 ### 5.4 评测语料/基线与 runner
 
@@ -513,13 +516,13 @@ GET /api/reports?version_id=&status=&kind=&before=&limit=
 - `eval/v02/corpus/`：environment、requirements、design、code、execution、issues、visual 的固定语料/真值。
 - `eval/v02/ground-truth/`：impact.json、classification.json、issues.json、supplement.json、visual.json。
 - `eval/v02/baseline.json`：corpus_version + 7 指标基线/阈值；基线只允许不下降更新。
-- `eval/v02/README.md`：维护/更新/双轨说明。
+- `eval/v02/README.md`：维护/更新说明；明确“真实 LLM 报告轨，不阻断”。
 - `scripts/eval.ps1` 重写为 0.2：
-  - `-Mode deterministic`（默认）：独立 DB + 固定语料/种子数据 + 服务端派生；断言阈值/基线/回归；失败非零退出。**不依赖 fake LLM 驱动 P3/P5 agent**（0.2 fake LLM 未覆盖这些 profile；见 P6-D-12）。
-  - `-Mode real-llm`：使用 P6 验收产生的真实 LLM 数据（或重跑验收流程），计算样本计数并 POST `mode=real_llm`；阈值仅报告，不阻断。
+  - `-Mode real-llm`（唯一模式）：使用 P6 验收产生的真实 LLM 数据（或重跑真实 LLM 验收流程），计算样本计数并 POST `mode=real_llm`；阈值/基线仅报告，不阻断。
   - `-DryRun`：静态检查语料/基线/API/DB/工具链。
+  - 不允许 fake LLM 模式；不提供 `-Mode deterministic`。若真实 LLM 不可用，验收失败，不以 fake 绕过。
 - 评测结果只经 admin API 写入，不直接写业务表；输出 `.tmp/p6-eval/{result,observation}.json`。
-- **P6-D-12 说明**：0.1 P8 的“fake LLM 全流程评测”在 0.2 需扩展 fake LLM 的 P3/P5 profile（case_executor/failure_analyst/issue_triager/report_writer/version_steward/code worker）与 fixture executor；P6 先交付**确定性语料门禁 + 真实 LLM 观测**，全流程 fake LLM 评测列入 P8 backlog。若用户要求严格 0.1 全流程，需在 plan 前追加评估（见 §17 风险 R1）。
+- **P6-D-12 说明**：0.1 P8 的 deterministic fake-LLM 硬门禁在 P6 **不实现**（用户 U4：全程真实 LLM）；评测只做真实 LLM 报告轨。单测/集成测试仍可用离线替身验证指标派生逻辑，但不得作为验收证据。若 P8 需要确定性门禁，另行设计（需用户批准）。
 
 ### 5.5 页面
 
@@ -533,7 +536,7 @@ GET /api/reports?version_id=&status=&kind=&before=&limit=
 
 - domain：样本校验、公式、threshold/regression/reason/zero denominator、status 派生、拒绝客户端 verdict。
 - integration：迁移幂等；POST/GET/权限；overview 指标口径；audit。
-- runner：deterministic 门禁通过/失败/基线回归；real-llm 只报告。
+- runner：真实 LLM 报告轨（阈值/基线观察）；无 fake 模式；`-DryRun` 静态检查。
 - 前端：admin/非 admin、空/错/载、基线/阈值展示。
 - 验收：S1/S7 场景（§12）。
 
@@ -627,7 +630,7 @@ GET /api/reports?version_id=&status=&kind=&before=&limit=
 - domain：prompt 校验（空/超长/缺 marker/未知变量/语法）、budgets/tools/model 校验、默认正文同源。
 - 集成：迁移幂等；回填 v1；PUT/reset/restore/no-op/409；PATCH 下一 run 的 `agent_message(role=system)` 含新 prompt 与 marker；旧 run 不变；审计 metadata 无正文；权限。
 - 前端：目录/运行/质量/配置；只读态；变量插入；预览；版本 diff/restore；错误 field；空态。
-- E2E：admin 编辑 prompt（唯一 token）→ 下一次 fake/真实 run 的 system message 含 token；普通用户无 prompt/403；版本历史/恢复；截图。
+- E2E：admin 编辑 prompt（唯一 token）→ 下一次真实 LLM run 的 system message 含 token；普通用户无 prompt/403；版本历史/恢复；截图。
 - 验收：S4。
 
 ### 8.9 ARTEX 能力矩阵处置（include/defer/na）
@@ -708,19 +711,22 @@ GET /api/reports?version_id=&status=&kind=&before=&limit=
 
 ### 12.2 场景（S0–S9）
 
-- **S0 门禁**：33 migrations、72 settings、P2–P6 契约、真实 LLM 连通、executor active、fixture A/B。
-- **S1 质量/评测**：admin POST deterministic sample → 7 指标/threshold/baseline/regression/status 派生；非法 sample 400；客户端 verdict 被忽略；权限（非 admin 403）；overview 7 运营指标口径；visual-metrics 不变；审计。
+- **S0 门禁**：33 migrations、72 settings、P2–P6 契约、真实 LLM 连通、executor active、fixture A/B；**不使用 fake-LLM**。
+- **S1 质量/评测**：真实 LLM 评测 run（S7 产生）→ 7 指标/threshold/baseline/regression/status 派生；非法 sample 400；客户端 verdict 被忽略；权限（非 admin 403）；overview 7 运营指标口径；visual-metrics 不变；审计。
 - **S2 搜索**：真实数据 5 组；per-type limit；truncated/degraded；q/types 400；深链；普通用户可用；E2E ⌘K。
 - **S3 待办**：6 kind/计数/权限（takeover/dead admin-only）；draft 需求/用例、open issue、pending design、open human_request/dead；30s 轮询；深链。
 - **S4 Agent 中心/提示词**：catalog 14/团队/stats；runs；quality；admin PATCH model/budgets/tools；PUT prompt（含变量/预览/版本/restore/reset/no-op/409）；下一次真实 LLM run 的 `agent_message(role=system)` 含新 prompt+marker；普通用户目录无 prompt、PATCH 403；审计无正文；Markdown/特殊字符安全。
 - **S5 全局中心**：跨版本 issue/report；筛选/游标/深链；merged/reopen；report current revision/HTML；只读。
 - **S6 链路 v2**：新筛选/counts/meta/truncation/degraded_layers；latest attempt；空版本 200/不存在 404；热加载；replay_event_limit；query budget/ P95。
-- **S7 真实 LLM 评测观测**：`scripts/eval.ps1 -Mode real-llm` 使用 S1–S6 数据/验收流程；POST real_llm；阈值报告；observation JSON；不阻断。
+- **S7 真实 LLM 评测观测**：`scripts/eval.ps1 -Mode real-llm` 使用 P6 验收真实数据/流程；POST real_llm；阈值/基线报告；observation JSON；不阻断。
 - **S8 P5 回归**：visual/code 关键能力仍 PASS；P3/P4 关键 API 回归。
 - **S9 全量门禁**：`scripts/test.ps1`、P2–P6 契约、前端/executor；E2E 截图；迁移幂等（重启 0 应用）。
 
+> 执行顺序：S0 → S7（产生真实评测 run）→ S1 → S2…S6、S8、S9；避免 S1 依赖未产生数据。
+
 ### 12.3 浏览器 E2E（`scripts/p6-e2e.ps1` + `frontend/e2e/p6.spec.ts`）
 
+- **使用真实 LLM 上游，不使用 fake-llm**；长流程要设置超时/重试；失败先按系统缺陷定位。
 - 管理员：质量评测看板；搜索；待办；Agent 目录/运行/质量/编辑提示词（保存/版本/预览）；全局问题/报告；链路筛选/follow/列表/截断。
 - 普通用户：质量运营/视觉可见、评测拒绝；Agent 只读无 prompt；全局中心只读；待办无 admin 组。
 - 截图至少：质量（admin/普通）、搜索、待办、Agent 目录/编辑/版本 diff、全局问题/报告、链路 v2；1280/1024 宽度；无控制台 error（允许既有 SSE 重连日志）。
@@ -818,15 +824,16 @@ GET /api/reports?version_id=&status=&kind=&before=&limit=
 | P6-D-09 | `eval_run`/`eval_metric` HLD 字面表名；#32/#33 | HLD §2.2 L228；D34 |
 | P6-D-10 | 新增 3 设置键（搜索/待办/质量） | 0.2 设置中心 D50；0.1 参数 |
 | P6-D-11 | 不新增事件；读模型轮询/手动刷新 | 0.1 无事件；避免频道破坏 |
-| P6-D-12 | 评测双轨：确定性语料门禁 + 真实 LLM 观测；0.1 fake-LLM 全流程列 P8 backlog | §5.4；风险 R1 |
+| P6-D-12 | 评测只做真实 LLM 报告轨；不实现 deterministic fake-LLM 门禁；阈值/基线可见但不阻断阶段 | §5.4；U4；0.1 D61 |
 | P6-D-13 | 全局中心只读、跨版本、`before` 分页、复用版本内详情 | HLD §7.1；0.1 全局中心 |
 | P6-D-14 | 变量目录 code-defined（不新增表）；保存白名单/预览/回退 | U5；§8.4 |
-| P6-D-15 | `[profile:<key>]` 保存强制；缺失 400 | 契约 TOOLS:35；fake LLM 依赖 |
+| P6-D-15 | `[profile:<key>]` 保存强制；缺失 400 | 契约 TOOLS:35；契约/测试依赖 |
 | P6-D-16 | `enabled`/name/事件/wrapup/自定义 agent 等按矩阵 defer/na | ARTEX 10 §4；0.2 模型 |
 | P6-D-17 | 迁移门禁前向兼容；P6 新 gate | P5 硬编码 31/162/12 |
 | P6-D-18 | 验收证据入 `docs/version-V0.2/acceptance/p6/` + `.tmp` | phase plan §4.1；P5 先例 |
 | P6-D-19 | 分支 `feat/v0.2-p6` → 合回 `feat/v0.2` | U7；P5 先例 |
 | P6-D-20 | 不修改 0.2 设计文档；只更新 contracts/handoff/证据 | phase plan §4.1；用户要求 |
+| P6-D-21 | 验收/评测/E2E/演示全程真实 LLM；不使用 fake-LLM；单测/集成替身只验证逻辑；真实 LLM 阈值报告轨不阻断；P5 E2E 的 fake 上游不用于 P6 验收 | U4/U7；用户 2026-11-01 追加裁决 |
 
 ---
 
@@ -834,7 +841,7 @@ GET /api/reports?version_id=&status=&kind=&before=&limit=
 
 | # | 风险 | 影响 | 缓解 |
 |---|---|---|---|
-| R1 | 评测确定性门禁不是 0.1 的 fake-LLM 全流程 | 与 0.1 P8 严格对齐有差距 | P6-D-12 明示；P8 补 fake P3/P5 全流程；若用户要求 P6 严格，需追加 fake LLM 扩展任务/评估 |
+| R1 | 评测无确定性硬门禁（用户要求全程真实 LLM） | 质量回归漏报/评测受模型抖动影响 | P6-D-12：真实 LLM 报告轨 + 基线可见；不阻断阶段；若 P8 要确定性门禁，另行设计并需用户批准（不使用 fake 替代验收） |
 | R2 | 提示词模板层新增注入面 | prompt 可影响 Agent 行为 | 内网接受；保存白名单/无函数/无 IO/长度/marker；审计；工具白名单兜底 |
 | R3 | 范围大（8 流） | 集成/验收风险 | 契约先行、写作用域互斥、Wave 0 骨架、Lead 收口、每流小步验收 |
 | R4 | 真实 LLM 抖动 | 验收不稳定 | 重试/可观测/最终器；失败按系统缺陷定位；P5 fixtures 复用 |
@@ -843,9 +850,10 @@ GET /api/reports?version_id=&status=&kind=&before=&limit=
 | R7 | 0.1 旧假设回流 | 控制面错误 | §2.6 适配表；矩阵审计；review checklist |
 | R8 | 旧库 profile/P5 工具增量不补 | Agent 中心显示旧工具 | P6 配置编辑器可补；不自动覆盖管理员编辑；handoff 说明 |
 | R9 | `context_packet` 含 prompt | 观察泄露 | Agent 中心 read model 不返回；未来观察必须裁剪 |
-| R10 | 验收数据复用 P5 DB | 数据依赖/隔离 | 克隆到 `eztest_v02_p6`；模板克隆失败则重跑完整闭环 |
-| R11 | fake LLM/真实 LLM 行为差异 | E2E 与验收结论不一致 | 确定性 E2E 仅作 UI/流程；验收以真实 LLM 为准 |
+| R10 | 验收数据复用 P5 DB | 数据依赖/隔离 | 克隆到 `eztest_v02_p6`；模板克隆失败则重跑完整真实 LLM 闭环 |
+| R11 | 真实 LLM E2E 时长/抖动 | E2E 慢/不稳定 | 超时/重试/可观测；UI 只读页面用真实数据快照、不依赖 fake LLM；验收以真实 LLM 为准 |
 | R12 | 契约冻结后返工 | 返工 | spec 前置裁决 + contract-first + P6 gate + 用户审阅 |
+| R13 | 真实 LLM 成本/时长显著上升 | 阶段验收周期长 | 复用 P5 验收数据 + 聚焦 P6 增量；评测只跑必要真实流程；不并发多套真实栈 |
 
 回滚：迁移只追加，失败按 DB 备份/新库重建；前端/后端功能开关不新增（无需 feature flag）；合并前保留 `feat/v0.2-p6` 分支，合回后按 P5 方式记录 merge。
 
@@ -873,9 +881,9 @@ GET /api/reports?version_id=&status=&kind=&before=&limit=
 - [x] 与 0.2 权威一致：三状态/波次/case_version/report_revision/issue 4 态/human_request/profile 14；未恢复 0.1 旧控制面。
 - [x] 契约增量只追加；P0–P5 语义不变；迁移 #32/#33；设置 69→72；无新事件/task/profile/executor。
 - [x] 权限：admin 写、登录读、普通用户无 prompt/transcript；评测 admin；质量页分层。
-- [x] 验收可执行：真实 LLM+Chrome、E2E、截图、门禁、矩阵。
+- [x] 验收可执行：真实 LLM+Chrome、E2E、截图、门禁、矩阵；**全程不使用 fake-LLM**；单测替身仅验证逻辑、不作验收证据；真实 LLM 评测阈值报告轨。
 - [x] 冲突/漂移已记录（D54–D58、HLD 与实际、quality 权限、ARTEX 变量 na 与用户 U5）。
-- [x] 用户裁决 U1–U7 全部映射到 P6-D/章节。
+- [x] 用户裁决 U1–U7 全部映射到 P6-D/章节；U4 的“全程真实 LLM”覆盖 U1 的“双轨”表述，P6-D-12/P6-D-21 已记录。
 - [x] 风险/回滚/并行写作用域明确。
 - [x] 未修改 `docs/version-V0.2/` 设计文档；本 spec 位于 `docs/superpowers/specs/`。
 
