@@ -24,3 +24,10 @@ delivery_0001_issue_lifecycle.sql
 delivery_0002_report_revision.sql
 delivery_0003_analysis_run.sql
 version_0005_requirement_closure.sql
+codeintel_0001_code_index.sql
+codeintel_0002_code_analysis.sql
+codeintel_0003_anchor_review.sql
+visual_0001_visual_assertion.sql
+execution_0004_visual_evidence.sql
+version_0006_version_sut_code_baseline.sql
+agent_0004_code_team.sql

@@ -493,6 +493,11 @@ func fakeWorkItem(workType string, payload agentapp.WorkItemPayload) agent.WorkI
 		"close_round":            idStringOrZero(int64(payload.CloseRound)),
 		"report_revision_id":     idStringOrZero(payload.ReportRevisionID),
 		"predicate_fingerprint":  payload.PredicateFingerprint,
+		"repo_id":                idStringOrZero(payload.RepoID),
+		"index_run_id":           idStringOrZero(payload.IndexRunID),
+		"analysis_id":            idStringOrZero(payload.AnalysisID),
+		"base_commit_sha":        payload.BaseCommitSHA,
+		"head_commit_sha":        payload.HeadCommitSHA,
 	})
 	leaseEpoch := int64(3)
 	claimedBy := "worker-1"

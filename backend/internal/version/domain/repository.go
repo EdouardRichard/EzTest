@@ -37,6 +37,12 @@ type Repository interface {
 	List(ctx context.Context, limit int, beforeID *int64) ([]Summary, error)
 	Update(ctx context.Context, version Version) (Version, error)
 
+	// SetCodeBaselineCommit writes the resolved commit SHA of one version_sut
+	// binding (P5 §5.5). The first successful code index uses it to backfill a
+	// binding that was created before its repository could be resolved. An empty
+	// commit clears the column to NULL.
+	SetCodeBaselineCommit(ctx context.Context, versionSUTID int64, commitSHA string) error
+
 	// MarkRunning projects the version from initial to running. It reports
 	// whether this call changed the status; the WHERE guard makes it idempotent.
 	MarkRunning(ctx context.Context, id int64, updatedAt time.Time) (bool, error)

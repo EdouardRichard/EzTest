@@ -285,6 +285,27 @@ func ParseWorkItemPayload(raw json.RawMessage) (WorkItemPayload, error) {
 	if payload.ReportRevisionID, err = parseID("report_revision_id"); err != nil {
 		return WorkItemPayload{}, err
 	}
+	// P5 codeintel payload (contracts/task-types.md §7). IDs use the same
+	// decimal-string/number convention; commit SHAs must be strings.
+	if payload.RepoID, err = parseID("repo_id"); err != nil {
+		return WorkItemPayload{}, err
+	}
+	if payload.IndexRunID, err = parseID("index_run_id"); err != nil {
+		return WorkItemPayload{}, err
+	}
+	if payload.AnalysisID, err = parseID("analysis_id"); err != nil {
+		return WorkItemPayload{}, err
+	}
+	if baseSHA, ok := object["base_commit_sha"]; ok {
+		if err := json.Unmarshal(baseSHA, &payload.BaseCommitSHA); err != nil {
+			return WorkItemPayload{}, fmt.Errorf("work item payload base_commit_sha must be a string")
+		}
+	}
+	if headSHA, ok := object["head_commit_sha"]; ok {
+		if err := json.Unmarshal(headSHA, &payload.HeadCommitSHA); err != nil {
+			return WorkItemPayload{}, fmt.Errorf("work item payload head_commit_sha must be a string")
+		}
+	}
 	if fingerprint, ok := object["predicate_fingerprint"]; ok {
 		if err := json.Unmarshal(fingerprint, &payload.PredicateFingerprint); err != nil {
 			return WorkItemPayload{}, fmt.Errorf("work item payload predicate_fingerprint must be a string")

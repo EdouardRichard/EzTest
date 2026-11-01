@@ -3,6 +3,7 @@ package agentapp_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -45,6 +46,7 @@ type fakeWorkItemRepo struct {
 	ensured       []agent.NewWorkItem
 	claimants     []string
 	claimLease    []time.Duration
+	claimTeams    [][]agent.Team
 	marked        [][2]int64
 	renewed       [][2]int64
 	renewLease    []time.Duration
@@ -64,6 +66,13 @@ func (r *fakeWorkItemRepo) Ensure(_ context.Context, in agent.NewWorkItem) (agen
 func (r *fakeWorkItemRepo) Claim(_ context.Context, claimant string, lease time.Duration) (agent.WorkItem, bool, error) {
 	r.claimants = append(r.claimants, claimant)
 	r.claimLease = append(r.claimLease, lease)
+	return r.item, r.claimOK, r.claimErr
+}
+
+func (r *fakeWorkItemRepo) ClaimForTeams(_ context.Context, claimant string, teams []agent.Team, lease time.Duration) (agent.WorkItem, bool, error) {
+	r.claimants = append(r.claimants, claimant)
+	r.claimLease = append(r.claimLease, lease)
+	r.claimTeams = append(r.claimTeams, append([]agent.Team(nil), teams...))
 	return r.item, r.claimOK, r.claimErr
 }
 
@@ -242,6 +251,60 @@ func TestWorkQueueClaimTrimsClaimantAndUsesLease(t *testing.T) {
 
 	repo.claimErr = errors.New("boom")
 	if _, _, err := queue.Claim(ctx, "worker-2"); err == nil {
+		t.Fatal("claim error not propagated")
+	}
+}
+
+func TestWorkQueueClaimForTeams(t *testing.T) {
+	repo := &fakeWorkItemRepo{item: agent.WorkItem{ID: 9, Team: agent.TeamCode}, claimOK: true}
+	queue := newWorkQueue(repo)
+	ctx := context.Background()
+	teams := []agent.Team{agent.TeamClarification, agent.TeamCode}
+
+	item, ok, err := queue.ClaimForTeams(ctx, "  code-worker  ", teams)
+	if err != nil || !ok || item.ID != 9 {
+		t.Fatalf("ClaimForTeams = %#v, %v, %v", item, ok, err)
+	}
+	if len(repo.claimants) != 1 || repo.claimants[0] != "code-worker" {
+		t.Fatalf("claimants = %#v", repo.claimants)
+	}
+	if len(repo.claimTeams) != 1 || !slices.Equal(repo.claimTeams[0], teams) {
+		t.Fatalf("claim teams = %#v", repo.claimTeams)
+	}
+	if repo.claimLease[0] != agentapp.DefaultLease {
+		t.Fatalf("lease = %v", repo.claimLease[0])
+	}
+
+	if item, ok, err := queue.ClaimForTeams(ctx, "worker-1", nil); err != nil || ok || item.ID != 0 {
+		t.Fatalf("empty teams claim = %#v, %v, %v", item, ok, err)
+	}
+	if len(repo.claimTeams) != 1 {
+		t.Fatalf("repository called for empty teams: %#v", repo.claimTeams)
+	}
+
+	if _, _, err := queue.ClaimForTeams(ctx, "worker-1", []agent.Team{agent.Team("ops")}); err == nil {
+		t.Fatal("unknown team accepted")
+	} else {
+		assertAPIError(t, err, 400, "invalid_argument")
+		if field := platform.AsError(err).Details["field"]; field != "teams" {
+			t.Fatalf("field = %#v", field)
+		}
+	}
+	if len(repo.claimTeams) != 1 {
+		t.Fatalf("repository called for invalid team: %#v", repo.claimTeams)
+	}
+
+	if _, _, err := queue.ClaimForTeams(ctx, "   ", teams); err == nil {
+		t.Fatal("empty claimant accepted")
+	} else {
+		assertAPIError(t, err, 400, "invalid_argument")
+	}
+	if len(repo.claimants) != 1 {
+		t.Fatalf("claim called with empty claimant: %#v", repo.claimants)
+	}
+
+	repo.claimErr = errors.New("boom")
+	if _, _, err := queue.ClaimForTeams(ctx, "worker-2", teams); err == nil {
 		t.Fatal("claim error not propagated")
 	}
 }

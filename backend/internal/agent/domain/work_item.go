@@ -114,7 +114,7 @@ func (in NewWorkItem) Validate() error {
 		return platform.Invalid("version_id", "must be a positive decimal ID")
 	}
 	if !Team(in.Team).Valid() {
-		return platform.Invalid("team", "must be one of clarification, design, execution, delivery, steward")
+		return platform.Invalid("team", "must be one of clarification, design, execution, delivery, steward, code")
 	}
 	if strings.TrimSpace(in.Type) == "" {
 		return platform.Invalid("type", "must not be empty")

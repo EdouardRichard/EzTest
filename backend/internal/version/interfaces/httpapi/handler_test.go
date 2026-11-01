@@ -18,6 +18,8 @@ import (
 
 var testTime = time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 
+const sampleCodeBaselineCommit = "0123456789abcdef0123456789abcdef01234567"
+
 type stubService struct {
 	view         versionapp.VersionView
 	getQueue     []versionapp.VersionView
@@ -159,7 +161,8 @@ func sampleView() versionapp.VersionView {
 		AutoDesignNewRequirements: true,
 		Bindings: []versionapp.BindingView{
 			{
-				ID: 201,
+				ID:                 201,
+				CodeBaselineCommit: sampleCodeBaselineCommit,
 				SUT: resourceapp.SUTView{
 					ID: "1001", Name: "Orders", Intro: "order center",
 					CreatedAt: testTime, UpdatedAt: testTime,
@@ -280,6 +283,9 @@ func TestCreateVersionParsesPayloadAndReturnsNestedView(t *testing.T) {
 	if binding["repository"].(map[string]any)["name"] != "orders-repo" {
 		t.Fatalf("repository = %#v", binding["repository"])
 	}
+	if binding["codeBaselineCommit"] != sampleCodeBaselineCommit {
+		t.Fatalf("codeBaselineCommit = %#v, want %q", binding["codeBaselineCommit"], sampleCodeBaselineCommit)
+	}
 	if len(binding["pages"].([]any)) != 1 || len(binding["apis"].([]any)) != 1 {
 		t.Fatalf("pages/apis = %#v", binding)
 	}
@@ -301,6 +307,23 @@ func TestCreateVersionAcceptsMissingRepository(t *testing.T) {
 	}
 	if stub.lastCommand.Bindings[0].CodeRepositoryID != nil {
 		t.Fatalf("empty repository id was not treated as unset")
+	}
+}
+
+func TestGetVersionOmitsUnresolvedCodeBaseline(t *testing.T) {
+	handler, stub := newTestServer(t)
+	view := sampleView()
+	view.Bindings[0].CodeBaselineCommit = ""
+	stub.view = view
+
+	recorder := call(t, handler, http.MethodGet, "/api/versions/101", "", actor())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	bindings := dataBody(t, recorder)["bindings"].([]any)
+	binding := bindings[0].(map[string]any)
+	if value, ok := binding["codeBaselineCommit"]; ok {
+		t.Fatalf("unresolved codeBaselineCommit must be omitted, got %#v", value)
 	}
 }
 

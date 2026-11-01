@@ -12,6 +12,8 @@ func TestEvidenceKinds(t *testing.T) {
 		EvidenceDB,
 		EvidenceDownload,
 		EvidenceText,
+		EvidenceVisualActual,
+		EvidenceVisualDiff,
 	}
 	for _, kind := range valid {
 		if !kind.Valid() {

@@ -21,7 +21,8 @@ type VersionBinding struct {
 }
 
 // VersionSUTBinding is one active version_sut binding with its resolved
-// fingerprint inputs and code-repository baseline.
+// fingerprint inputs and code-repository baseline. Commit is the resolved
+// version_sut.code_baseline_commit; empty means the branch fallback is used.
 type VersionSUTBinding struct {
 	VersionSUTID    int64
 	SUTID           int64
@@ -35,6 +36,7 @@ type VersionSUTBinding struct {
 	AccountRoles    []string
 	CodeRepoID      *int64
 	Branch          string
+	Commit          string
 }
 
 // fingerprintPayload is the canonical JSON shape of §5.1. Field order is
@@ -58,9 +60,14 @@ type codeBaselinePayload struct {
 	Repositories []codeBaselineRepo `json:"repositories"`
 }
 
+// codeBaselineRepo is either a resolved commit ({repo_id, commit_sha}) or, when
+// the binding's baseline could not be resolved, the branch fallback
+// ({repo_id, branch}). The two shapes are mutually exclusive so the canonical
+// JSON matches spec §5.5.
 type codeBaselineRepo struct {
-	RepoID int64  `json:"repo_id"`
-	Branch string `json:"branch"`
+	RepoID    int64  `json:"repo_id"`
+	CommitSHA string `json:"commit_sha,omitempty"`
+	Branch    string `json:"branch,omitempty"`
 }
 
 // EnvironmentFingerprint computes the deterministic environment fingerprint of
@@ -94,23 +101,39 @@ func EnvironmentFingerprint(binding VersionBinding) (string, error) {
 	return hashCanonical(payload)
 }
 
-// CodeBaseline returns the P3 code baseline: empty when the version binds no
-// code repository, otherwise sha256 of the distinct [{repo_id, branch}] set in
-// ascending repo_id order (§5.1). P5 upgrades this to commit SHAs.
+// CodeBaseline returns the P5 code baseline: empty when the version binds no
+// code repository, otherwise sha256 of the canonical JSON of the distinct
+// repositories in ascending repo_id order (§5.5). A repository with a resolved
+// commit contributes {repo_id, commit_sha}; a repository without one falls back
+// to {repo_id, branch}. Multiple version_sut bindings of the same repository
+// are deduplicated: a resolved commit wins over the branch fallback and
+// conflicting commits settle on the lexicographically smallest SHA so the
+// fingerprint never depends on binding order.
 func CodeBaseline(binding VersionBinding) string {
-	byRepo := map[int64]string{}
+	byRepo := map[int64]codeBaselineRepo{}
 	for _, sut := range binding.SUTs {
 		if sut.CodeRepoID == nil || *sut.CodeRepoID <= 0 {
 			continue
 		}
-		byRepo[*sut.CodeRepoID] = sut.Branch
+		candidate := codeBaselineRepo{RepoID: *sut.CodeRepoID}
+		if sut.Commit != "" {
+			candidate.CommitSHA = sut.Commit
+		} else {
+			candidate.Branch = sut.Branch
+		}
+		current, ok := byRepo[candidate.RepoID]
+		if !ok {
+			byRepo[candidate.RepoID] = candidate
+			continue
+		}
+		byRepo[candidate.RepoID] = mergeCodeBaselineRepo(current, candidate)
 	}
 	if len(byRepo) == 0 {
 		return ""
 	}
 	repos := make([]codeBaselineRepo, 0, len(byRepo))
-	for repoID, branch := range byRepo {
-		repos = append(repos, codeBaselineRepo{RepoID: repoID, Branch: branch})
+	for _, repo := range byRepo {
+		repos = append(repos, repo)
 	}
 	sort.SliceStable(repos, func(i, j int) bool { return repos[i].RepoID < repos[j].RepoID })
 	hash, err := hashCanonical(codeBaselinePayload{Repositories: repos})
@@ -118,6 +141,28 @@ func CodeBaseline(binding VersionBinding) string {
 		return ""
 	}
 	return hash
+}
+
+// mergeCodeBaselineRepo picks the canonical entry for one repository: a
+// resolved commit beats the branch fallback, and ties between two commits or
+// two branches settle on the lexicographically smallest value so the
+// fingerprint never depends on binding order.
+func mergeCodeBaselineRepo(current, candidate codeBaselineRepo) codeBaselineRepo {
+	switch {
+	case current.CommitSHA != "" && candidate.CommitSHA != "":
+		if candidate.CommitSHA < current.CommitSHA {
+			return candidate
+		}
+		return current
+	case candidate.CommitSHA != "":
+		return candidate
+	case current.CommitSHA != "":
+		return current
+	case candidate.Branch < current.Branch:
+		return candidate
+	default:
+		return current
+	}
 }
 
 // DedupeKey builds the display/work-item correlation key of §5.1. It is not a

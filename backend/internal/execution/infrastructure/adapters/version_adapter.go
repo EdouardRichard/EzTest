@@ -220,6 +220,7 @@ func mapVersionBinding(item versionapp.BindingView) (executionapp.VersionSUTBind
 		if id := parseViewID(item.Repository.ID); id > 0 {
 			binding.CodeRepoID = &id
 			binding.Branch = item.Repository.Branch
+			binding.Commit = item.CodeBaselineCommit
 		}
 	}
 	return binding, nil

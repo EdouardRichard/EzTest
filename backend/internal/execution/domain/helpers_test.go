@@ -41,14 +41,16 @@ func TestStepAndAssertionVerdictValidity(t *testing.T) {
 
 func TestEvidenceMIMEAndOwnerKinds(t *testing.T) {
 	cases := map[EvidenceKind]string{
-		EvidenceScreenshot: "image/png",
-		EvidenceSnapshot:   "text/plain; charset=utf-8",
-		EvidenceConsole:    "application/json",
-		EvidenceNetwork:    "application/json",
-		EvidenceHTTP:       "application/json",
-		EvidenceDB:         "text/plain; charset=utf-8",
-		EvidenceText:       "text/plain; charset=utf-8",
-		EvidenceDownload:   "application/octet-stream",
+		EvidenceScreenshot:   "image/png",
+		EvidenceSnapshot:     "text/plain; charset=utf-8",
+		EvidenceConsole:      "application/json",
+		EvidenceNetwork:      "application/json",
+		EvidenceHTTP:         "application/json",
+		EvidenceDB:           "text/plain; charset=utf-8",
+		EvidenceText:         "text/plain; charset=utf-8",
+		EvidenceDownload:     "application/octet-stream",
+		EvidenceVisualActual: "image/png",
+		EvidenceVisualDiff:   "image/png",
 	}
 	for kind, want := range cases {
 		if got := kind.MIME(); got != want {
