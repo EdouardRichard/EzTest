@@ -3,7 +3,7 @@
 > 状态：**completed（API/DB 真实 LLM + 真实 Chrome 验收 13/13 PASS；浏览器 E2E 2/2 PASS）**
 > 日期：2026-11-01
 > 阶段：P5（`phase-05-codeintel-visual.md`）
-> 实施分支：`feat/v0.2-p5`（从 `feat/v0.2` @`ff1e176` 拉出；**未合入** `feat/v0.2`）
+> 实施分支：`feat/v0.2-p5`（从 `feat/v0.2` @`ff1e176` 拉出）；**已合入统一集成分支 `feat/v0.2`（merge `90ad0f8`，2026-11-01 P5 完成点）**
 > 实施 spec：[2026-11-01-eztest-v02-p5-codeintel-visual-design.md](../../superpowers/specs/2026-11-01-eztest-v02-p5-codeintel-visual-design.md)
 > 实施 plan：[2026-11-01-eztest-v02-p5-codeintel-visual.md](../../superpowers/plans/2026-11-01-eztest-v02-p5-codeintel-visual.md)
 
@@ -50,7 +50,8 @@
 
 | 证据 | 命令 | 结果/路径 |
 |---|---|---|
-| 全量门禁 | `powershell.exe -File scripts/test.ps1` | **EXIT=0**；Go unit+integration 全绿；frontend **87 files / 668 tests PASS**；`.tmp/p5/final-gate-4.log` |
+| 全量门禁（合并前） | `powershell.exe -File scripts/test.ps1` | **EXIT=0**；Go unit+integration 全绿；frontend **87 files / 668 tests PASS**；`.tmp/p5/pre-merge-gate-2.log` |
+| 全量门禁（合并到 `feat/v0.2` 后） | `powershell.exe -File scripts/test.ps1` | **EXIT=0**；frontend **87 files / 668 tests PASS**；`.tmp/p5/post-merge-gate.log` |
 | P5 契约 | `node scripts/p5-contract-check.cjs` | OK（38 ops/31 migrations/11 tables/12 events/2 tasks/11 tools/16 settings） |
 | P2/P3/P4 契约兼容 | `node scripts/p2/p3/p4-contract-check.cjs` | 全 PASS（129 paths/162 ops/199 schemas） |
 | 前端类型/构建 | `cd frontend; pnpm typecheck` | `tsc --noEmit` EXIT=0 |
@@ -119,7 +120,7 @@
 
 ## 6. 提交与文件索引
 
-- 关键提交：`d9ac066` spec、`a882e5a` plan、`dbbb530` contracts、`5b31570` 迁移/agent/settings/evidence/version/codeintel foundation、`b7c9211` fixtures、`6ea86e7` frontend、`0deb28b` visual/executor、`a34843a` codeintel core/impact、`eb0be72` tools、`bd6adab` wiring、`9c139e8`/`6f25933`/`b51b2cd`/`14bdeb2`/`a1bb983`/`ff47979`/`990608b`/`7b51386`/`e98f6e7`/`dcd12f9` 验收修复、`9c0b875`/`bcfbaf2` E2E scripts/format。
+- 关键提交：`d9ac066` spec、`a882e5a` plan、`dbbb530` contracts、`5b31570` 迁移/agent/settings/evidence/version/codeintel foundation、`b7c9211` fixtures、`6ea86e7` frontend、`0deb28b` visual/executor、`a34843a` codeintel core/impact、`eb0be72` tools、`bd6adab` wiring、`9c139e8`/`6f25933`/`b51b2cd`/`14bdeb2`/`a1bb983`/`ff47979`/`990608b`/`7b51386`/`e98f6e7`/`dcd12f9` 验收修复、`9c0b875`/`bcfbaf2` E2E scripts/format、`db7523a` E2E harness 作用域修复、`02ee691` 测试时序/P6 交接、**`90ad0f8` merge P5 → `feat/v0.2`**。
 - 新增：`backend/internal/codeintel/**`、`backend/internal/visual/**`、`backend/cmd/eztest/p5_wiring.go`、`frontend/src/features/code-intel/**`、`frontend/src/features/visual/**`、`frontend/src/features/anchors/**`、`scripts/{fixture-p5-repo.ps1,fixture-p5-target.cjs,p5-acceptance.ps1,p5-e2e.ps1,p5-contract-check.cjs}`、`frontend/e2e/p5.spec.ts`。
 - 修改（共享）：`backend/internal/server/server.go`、`backend/cmd/eztest/main.go`、`backend/internal/agent/**`、`backend/internal/execution/**`、`backend/internal/resource/**`、`frontend/src/features/{versions,execution,design,delivery,clarification,resources}/**`、`frontend/src/lib/api-client.ts`、`frontend/src/app/(app)/quality/page.tsx`、contracts 8 文件、`scripts/p4-contract-check.cjs`（前向兼容冻结标记）。
 - 用户脏文件未提交：`docs/development.md`、`docs/startup.md`、`docs/用户专用文件，禁止AI阅读.md`、`scripts/dev-all.ps1`。
@@ -152,4 +153,4 @@
 
 ## 8. 停止声明
 
-P5 在本分支交付完成：API/DB 真实 LLM + Chrome 验收 13/13 PASS，浏览器 E2E 2/2 PASS，全量门禁绿，契约冻结，handoff 完成。**未开始 P6**；等待用户验收/指示后再进入 P6。
+P5 已交付并合入 `feat/v0.2`（merge `90ad0f8`）：API/DB 真实 LLM + Chrome 验收 13/13 PASS，浏览器 E2E 2/2 PASS，合并后全量门禁 EXIT=0，契约冻结，handoff 完成。**P6 尚未开始**；P6 启动交接见 §7.1，等待用户指示后进入 P6。
