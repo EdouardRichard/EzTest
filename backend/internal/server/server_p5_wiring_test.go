@@ -135,7 +135,7 @@ func TestP5WiringResourceProposalConfirmRejectAreAdmin(t *testing.T) {
 // TestP5WiringServerNilOptionalDeps pins that a P5 deployment can start with
 // only the base wiring and that the P5 surfaces are registered when provided.
 func TestP5WiringServerNilOptionalDeps(t *testing.T) {
-	handler := New(Deps{Version: "0.2.0-p5"})
+	handler := New(Deps{Version: "0.2.0-p8"})
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/health", nil))
 	if rec.Code != http.StatusServiceUnavailable {
@@ -149,8 +149,8 @@ func TestP5WiringServerNilOptionalDeps(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode health: %v", err)
 	}
-	if body.Data.Version != "0.2.0-p5" {
-		t.Fatalf("reported API version = %q, want 0.2.0-p5", body.Data.Version)
+	if body.Data.Version != "0.2.0-p8" {
+		t.Fatalf("reported API version = %q, want 0.2.0-p8", body.Data.Version)
 	}
 
 	// P5 is optional: without the constructed surfaces the paths stay
@@ -172,7 +172,7 @@ func TestP5WiringServerNilOptionalDeps(t *testing.T) {
 // instead of 404) and a nil set keeps them unmounted.
 func TestP5WiringServerMountsP5Deps(t *testing.T) {
 	handler := New(Deps{
-		Version:   "0.2.0-p5",
+		Version:   "0.2.0-p8",
 		CodeIntel: p5CodeIntelHandlers(),
 		Visual:    visualapi.New(visualapi.Deps{}),
 	})
