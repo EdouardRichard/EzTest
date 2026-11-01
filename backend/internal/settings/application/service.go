@@ -70,6 +70,9 @@ func (s *Service) SeedDefaults(ctx context.Context) error {
 
 // Reload refreshes the hot cache from the repository.
 func (s *Service) Reload(ctx context.Context) error {
+	if s.repo == nil {
+		return platform.Unavailable("settings repository is not configured")
+	}
 	list, err := s.repo.List(ctx)
 	if err != nil {
 		return err

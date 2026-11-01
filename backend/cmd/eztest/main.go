@@ -53,6 +53,7 @@ import (
 	orchestrationapp "github.com/EdouardRichard/EzTest/backend/internal/orchestration/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/clock"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/id"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/load"
 	"github.com/EdouardRichard/EzTest/backend/internal/resource/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/resource/infrastructure"
 	"github.com/EdouardRichard/EzTest/backend/internal/server"
@@ -643,6 +644,7 @@ func main() {
 	executorURL, _ := settingsSvc.String(ctx, executionapp.SettingExecutorURL)
 	executorToken, _ := settingsSvc.String(ctx, executionapp.SettingExecutorToken)
 	executorClient := executioninfra.NewClient(executorURL, executorToken, executioninfra.DefaultTimeout)
+	executorResolver := executioninfra.NewResolver(executorToken, executioninfra.DefaultTimeout)
 	executorRegistry := executionapp.NewRegistry(executionapp.RegistryDeps{
 		Repo:     executionRepo.Executors,
 		Probe:    executionadapters.NewExecutorProbe(executorClient),
@@ -656,6 +658,10 @@ func main() {
 				executioninfra.NewClient(endpoint, executorToken, executioninfra.DefaultTimeout))
 		},
 	})
+	// P8 per-executor routing: browser contexts and control calls are sent to
+	// the endpoint that owns them; executorID 0 keeps the P3 single-endpoint
+	// fallback for historical rows.
+	executorRouter := executionadapters.NewExecutorRouter(executorResolver, executorRegistry, executorURL)
 	executionCanceller := &caseRunCanceller{}
 	executionHumans := executionapp.NewHumanService(executionapp.HumanServiceDeps{
 		Humans:    executionRepo.Humans,
@@ -680,7 +686,7 @@ func main() {
 		Cases:       executionCases,
 		Bindings:    executionVersionAdapter,
 		APIs:        executionVersionAdapter,
-		Browser:     executionadapters.NewBrowserAdapter(executorClient),
+		Browser:     executionadapters.NewBrowserAdapterWithRouter(executorRouter),
 		Credentials: executionCredentials,
 		Content:     executionContent,
 		HTTPClient:  executionHTTPClient,
@@ -728,7 +734,7 @@ func main() {
 		Humans:    executionRepo.Humans,
 		Contexts:  executionSUTContextRepo,
 		Canceller: executionCanceller,
-		Executor:  executionadapters.NewExecutorControl(executorClient),
+		Executor:  executionadapters.NewExecutorControlWithRouter(executorRouter),
 		Clock:     clk,
 		Events:    eventSvc,
 		Audit:     auditSvc,
@@ -744,7 +750,7 @@ func main() {
 		// returns a secondary/push-registered endpoint. Multi-endpoint rows are
 		// still polled, heartbeated, registered and admin-listed; per-executor
 		// browser routing stays a P8 item.
-		Executors:   primaryExecutorRegistry{registry: executorRegistry, primary: executorURL},
+		Executors:   executorRegistry,
 		WorkQueue:   executionQueue,
 		Quota:       execution.QuotaFromSettings(3, 2, 1),
 		QuotaReader: executionQuotaReader{caseRuns: executionRepo.CaseRuns, intents: executionRepo.Intents},
@@ -765,7 +771,7 @@ func main() {
 		Cases:       executionCases,
 		WorkQueue:   executionQueue,
 		Canceller:   executionCanceller,
-		Executor:    executionadapters.NewExecutorControl(executorClient),
+		Executor:    executionadapters.NewExecutorControlWithRouter(executorRouter),
 		Clock:       clk,
 		Events:      eventSvc,
 		Audit:       auditSvc,
@@ -950,6 +956,13 @@ func main() {
 		log.Fatalf("eztest: wire P7 runtime: %v", err)
 	}
 
+	// P8 in-flight counters: HTTP requests and agent runs. The orchestration
+	// heartbeat copies them into api_instance for drain/rolling-upgrade
+	// observation; they never participate in scheduling.
+	requestLoad := &load.Counter{}
+	workLoad := &load.Counter{}
+	p7OrchestrationRuntime.Service.SetLoadTracker(p8LoadTracker{requests: requestLoad, work: workLoad})
+
 	// The P5 tool deps bind the constructed services to this process; the
 	// execution.visual_assert group resolves its port from the case runner.
 	p5Tools := p5.Tools
@@ -984,6 +997,7 @@ func main() {
 		ReportFinalizer:      p4ReportFinalizer{service: reportSvc},
 		RequirementFinalizer: versionapp.NewClosureFinalizer(closureSvc),
 		InstanceID:           instanceID,
+		Load:                 workLoad,
 	})
 	worker := agentapp.NewWorker(workQueue, runner, settingsSvc, slog.Default(), instanceID,
 		agentapp.WithWorkerEvents(eventSvc),
@@ -1038,6 +1052,28 @@ func main() {
 	// per-replica report PDF worker and the leader-gated GC worker.
 	p7rt.StartWorkers(ctx, &background, settingsSvc)
 
+	// P8 leader-gated event/audit retention. The cutoffs are read on every tick
+	// from the settings center; the batch size reuses retention.gc_batch_size.
+	retentionService := auditapp.NewRetentionService(
+		auditpg.New(pool),
+		eventingpg.New(pool),
+		auditSvc,
+		p8RetentionBatch(ctx, settingsSvc),
+	)
+	auditDays := func(ctx context.Context) int {
+		return p8IntSetting(ctx, settingsSvc, "security.audit_retention_days", 90)
+	}
+	eventDays := func(ctx context.Context) int {
+		return p8IntSetting(ctx, settingsSvc, "retention.event_days", 90)
+	}
+	background.Add(1)
+	go func() {
+		defer background.Done()
+		runP8RetentionWorker(ctx, p7rt.leader, retentionService,
+			func(ctx context.Context) time.Duration { return p8RetentionInterval(ctx, settingsSvc) },
+			auditDays, eventDays, p8Logf)
+	}()
+
 	handler := server.New(server.Deps{
 		Config:        cfg,
 		Pool:          pool,
@@ -1065,6 +1101,7 @@ func main() {
 		Visual:        p5.Visual,
 		P6:            &p6Read.Handlers,
 		P7:            p7rt.p7ServerHandlers(),
+		Load:          requestLoad,
 	})
 
 	srv := &http.Server{

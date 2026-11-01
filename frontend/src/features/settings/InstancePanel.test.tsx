@@ -31,7 +31,9 @@ const activeInstance: Instance = {
   api_port: 13333,
   node_id: 1,
   status: "active",
-  version: "0.2.0-p7",
+  version: "0.2.0-p8",
+  active_requests: 3,
+  active_work: 1,
   last_error: null,
   started_at: "2026-11-01T05:00:00Z",
   heartbeat_at: "2026-11-01T06:00:00Z",
@@ -100,11 +102,12 @@ describe("InstancePanel", () => {
     const row = rowOf("5001")
     expect(within(row).getByText("4242")).toBeInTheDocument()
     expect(within(row).getByText("13333")).toBeInTheDocument()
-    expect(within(row).getByText("0.2.0-p7")).toBeInTheDocument()
+    expect(within(row).getByText("0.2.0-p8")).toBeInTheDocument()
     expect(within(row).getByText("运行中")).toBeInTheDocument()
     expect(within(row).getByText(/2026-11-01/)).toBeInTheDocument()
     expect(within(table()).getByText("api-host-1")).toBeInTheDocument()
     expect(within(row).getByTestId("instance-node-5001")).toHaveTextContent("1")
+    expect(within(row).getByTestId("instance-inflight-5001")).toHaveTextContent("3/1")
   })
 
   it("drains an active instance through the admin API and refreshes", async () => {

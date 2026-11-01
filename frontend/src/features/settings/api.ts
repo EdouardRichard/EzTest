@@ -375,6 +375,9 @@ export type Instance = {
   node_id: number
   status: InstanceStatus
   version: string
+  /** P8 in-flight counters reported by the last heartbeat (drain observability). */
+  active_requests?: number
+  active_work?: number
   last_error?: string | null
   started_at: string
   heartbeat_at: string
