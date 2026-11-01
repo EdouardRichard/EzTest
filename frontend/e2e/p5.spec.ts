@@ -1,7 +1,7 @@
 import fs from "node:fs"
 import path from "node:path"
 
-import { type APIRequestContext, type Page, expect, test } from "@playwright/test"
+import { type APIRequestContext, expect, type Page, test } from "@playwright/test"
 
 /**
  * P5 browser E2E (real API/DB/executor/fixture, real LLM + real Chrome).
@@ -74,7 +74,11 @@ async function api<T>(
   return (await response.json()) as T
 }
 
-async function loginApi(request: APIRequestContext, username: string, password: string): Promise<string> {
+async function loginApi(
+  request: APIRequestContext,
+  username: string,
+  password: string,
+): Promise<string> {
   const response = await api<{ data: { token: string } }>(
     request,
     "POST",
@@ -145,7 +149,9 @@ function trackConsoleErrors(page: Page): string[] {
 }
 
 async function getWaves(request: APIRequestContext): Promise<Wave[]> {
-  return (await api<{ data: Wave[] }>(request, "GET", `/api/versions/${VERSION_ID}/waves?limit=100`)).data
+  return (
+    await api<{ data: Wave[] }>(request, "GET", `/api/versions/${VERSION_ID}/waves?limit=100`)
+  ).data
 }
 
 async function waitWaveTerminal(request: APIRequestContext, waveID: string): Promise<Wave> {
@@ -173,7 +179,10 @@ async function reopenRequirement(request: APIRequestContext): Promise<void> {
   throw new Error(`requirement reopen -> ${response.status()}: ${await response.text()}`)
 }
 
-async function getVisualDiffsForRun(request: APIRequestContext, caseRunID: string): Promise<VisualDiff[]> {
+async function getVisualDiffsForRun(
+  request: APIRequestContext,
+  caseRunID: string,
+): Promise<VisualDiff[]> {
   return (
     await api<{ data: VisualDiff[] }>(
       request,
@@ -219,13 +228,17 @@ test("phase A: code tab, visual approve/retest/diff, quality page, resource prop
   await expect(changedSection).toBeVisible()
   await expect(changedSection).toContainText("src/api/refund.ts")
   await expect(changedSection).toContainText("src/pages/RefundPage.tsx")
-  await expect.poll(() => changedSection.locator("li").count(), { timeout: 30_000 }).toBeGreaterThanOrEqual(6)
+  await expect
+    .poll(() => changedSection.locator("li").count(), { timeout: 30_000 })
+    .toBeGreaterThanOrEqual(6)
 
   await changedSection.getByRole("button", { name: /src\/api\/refund\.ts/ }).click()
   const diffDialog = page.getByRole("dialog")
   await expect(diffDialog).toBeVisible({ timeout: 30_000 })
   await expect(diffDialog).toContainText("src/api/refund.ts")
-  await expect(diffDialog.locator('section[aria-label="文件 patch"]')).toBeVisible({ timeout: 30_000 })
+  await expect(diffDialog.locator('section[aria-label="文件 patch"]')).toBeVisible({
+    timeout: 30_000,
+  })
   await page.screenshot({ path: screenshotPath("code-tab-diff"), fullPage: true })
   await diffDialog.getByRole("button", { name: "关闭", exact: true }).click()
 
@@ -368,7 +381,9 @@ test("phase A: code tab, visual approve/retest/diff, quality page, resource prop
       `/api/versions/${VERSION_ID}/code/page-api-proposals`,
     )
   ).data
-  const proposedCountBefore = proposedBefore.filter((proposal) => proposal.status === "proposed").length
+  const proposedCountBefore = proposedBefore.filter(
+    (proposal) => proposal.status === "proposed",
+  ).length
   if (proposedCountBefore < 1) throw new Error("no proposed resource to confirm in the UI")
   await confirmButtons.first().click()
   await expect
