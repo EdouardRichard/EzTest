@@ -62,6 +62,12 @@ type ExecutionAssertion struct {
 	Kind               string
 	Expected           string
 	TargetVersionSUTID int64
+	// P5 visual assertion IDs (spec §7.3). CaseAssertionID is the design
+	// case_assertion.id; VisualAssertionID is the visual_assertion.id the
+	// execution.visual_assert tool takes as assertionId. Both stay zero for
+	// non-visual assertions and when the visual context has no configuration.
+	CaseAssertionID   int64
+	VisualAssertionID int64
 }
 
 // ExecutionPriorStep is one already-recorded step result for resume.
