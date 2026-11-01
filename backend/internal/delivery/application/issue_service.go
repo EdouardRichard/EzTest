@@ -68,6 +68,11 @@ type IssueService struct {
 	clock  Clock
 	tasks  TaskEnsurer
 	triage IssueTriageReader
+
+	// P6 cross-version read ports. They stay optional so the P4 constructor
+	// and its tests keep compiling; WithGlobalReader attaches them.
+	global GlobalIssueReader
+	titles VersionTitleReader
 }
 
 // NewIssueService wires the issue use cases. Events, audit and the triage

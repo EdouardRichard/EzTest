@@ -13,8 +13,9 @@ import {
   Position,
   ReactFlow,
   ReactFlowProvider,
+  useReactFlow,
 } from "@xyflow/react"
-import { useMemo } from "react"
+import { useEffect, useMemo } from "react"
 
 import { Badge, type BadgeTone } from "@/components/ui/Badge"
 import { cn } from "@/components/ui/cn"
@@ -63,6 +64,80 @@ function readMetaNumber(meta: Record<string, unknown> | undefined, key: string):
   return typeof value === "number" && Number.isFinite(value) ? value : null
 }
 
+function readMetaBoolean(meta: Record<string, unknown> | undefined, key: string): boolean {
+  return meta?.[key] === true
+}
+
+/** Kind-specific P6 typed meta lines rendered on the card. */
+function nodeMetaLines(node: ChainNodeView): string[] {
+  const meta = node.meta
+  const lines: string[] = []
+  switch (node.kind) {
+    case "requirement": {
+      const cases = readMetaNumber(meta, "case_count")
+      const executed = readMetaNumber(meta, "executed_count")
+      const failed = readMetaNumber(meta, "failed_count")
+      if (cases !== null)
+        lines.push(`用例 ${cases} · 已执行 ${executed ?? 0} · 失败 ${failed ?? 0}`)
+      if (readMetaBoolean(meta, "uncovered")) lines.push("覆盖缺口：无关联用例")
+      break
+    }
+    case "scenario": {
+      const cases = readMetaNumber(meta, "case_count")
+      if (cases !== null) lines.push(`用例 ${cases}`)
+      break
+    }
+    case "case_version": {
+      const steps = readMetaNumber(meta, "step_count")
+      const assertions = readMetaNumber(meta, "assertion_count")
+      if (steps !== null) lines.push(`步骤 ${steps} · 断言 ${assertions ?? 0}`)
+      if (readMetaBoolean(meta, "stale")) lines.push("用例版本已过期")
+      break
+    }
+    case "wave": {
+      const trigger = readMetaString(meta, "trigger")
+      if (trigger.length > 0) lines.push(`触发 ${trigger}`)
+      break
+    }
+    case "case_run": {
+      const attempt = readMetaNumber(meta, "attempt")
+      const duration = readMetaNumber(meta, "duration_ms")
+      const evidence = readMetaNumber(meta, "evidence_count")
+      const parts: string[] = []
+      if (attempt !== null) parts.push(`第 ${attempt} 次`)
+      if (duration !== null) parts.push(`${duration}ms`)
+      if (evidence !== null) parts.push(`证据 ${evidence}`)
+      if (parts.length > 0) lines.push(parts.join(" · "))
+      break
+    }
+    case "issue": {
+      const severity = readMetaString(meta, "severity")
+      const status = readMetaString(meta, "issue_status")
+      const category = readMetaString(meta, "category")
+      const codeRefs = readMetaNumber(meta, "code_ref_count")
+      const parts = [severity, status, category].filter((part) => part.length > 0)
+      if (codeRefs !== null && codeRefs > 0) parts.push(`代码引用 ${codeRefs}`)
+      if (parts.length > 0) lines.push(parts.join(" · "))
+      break
+    }
+    case "report": {
+      const kind = readMetaString(meta, "report_kind")
+      const status = readMetaString(meta, "report_status")
+      const revision = readMetaNumber(meta, "revision")
+      const parts = [kind, status].filter((part) => part.length > 0)
+      if (revision !== null) parts.push(`v${revision}`)
+      if (parts.length > 0) lines.push(parts.join(" · "))
+      break
+    }
+    case "closure": {
+      const status = readMetaString(meta, "closure_status")
+      if (status.length > 0) lines.push(`闭环 ${status}`)
+      break
+    }
+  }
+  return lines
+}
+
 function ChainNodeCard({ data }: NodeProps) {
   const { node, selected, onSelectNode } = data as unknown as ChainNodeData
   const meta = node.meta
@@ -71,6 +146,7 @@ function ChainNodeCard({ data }: NodeProps) {
   const evidenceCount = readMetaNumber(meta, "evidence_count")
   const stepCount = readMetaNumber(meta, "step_count")
   const assertionCount = readMetaNumber(meta, "assertion_count")
+  const metaLines = nodeMetaLines(node)
 
   return (
     <button
@@ -83,6 +159,7 @@ function ChainNodeCard({ data }: NodeProps) {
       className={cn(
         "w-[260px] cursor-pointer rounded-xl border px-3 py-2.5 text-left shadow-sm transition-colors",
         "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+        "motion-reduce:transition-none",
         CHAIN_NODE_TONE_CLASSES[node.kind],
         selected ? "ring-1 ring-primary" : null,
       )}
@@ -103,6 +180,16 @@ function ChainNodeCard({ data }: NodeProps) {
       </div>
 
       <p className="mt-1 line-clamp-2 text-xs font-semibold text-foreground">{node.label}</p>
+
+      {metaLines.length > 0 ? (
+        <div className="mt-1 space-y-0.5">
+          {metaLines.map((line) => (
+            <p key={line} className="truncate text-[10px] text-muted-foreground">
+              {line}
+            </p>
+          ))}
+        </div>
+      ) : null}
 
       <div className="mt-1 flex flex-wrap items-center gap-1.5">
         {result.length > 0 ? <Badge tone={STATUS_TONE[result] ?? "neutral"}>{result}</Badge> : null}
@@ -131,10 +218,43 @@ export type ChainGraphProps = {
   edges: ChainEdgeView[]
   selectedNodeId: string | null
   onSelectNode: (nodeId: string) => void
+  /** P6: auto-center the followed node when the snapshot/selection changes. */
+  follow?: boolean
+  followNodeId?: string | null
+  /** P6: user pan/zoom pauses follow; the host exposes a resume button. */
+  onUserMove?: () => void
 }
 
-function ChainCanvas({ nodes, edges, selectedNodeId, onSelectNode }: ChainGraphProps) {
+function prefersReducedMotion(): boolean {
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function") return false
+  return window.matchMedia("(prefers-reduced-motion: reduce)").matches
+}
+
+function ChainCanvas({
+  nodes,
+  edges,
+  selectedNodeId,
+  onSelectNode,
+  follow = false,
+  followNodeId = null,
+  onUserMove,
+}: ChainGraphProps) {
   const layout = useMemo(() => layoutChain(nodes), [nodes])
+  const { setCenter } = useReactFlow()
+  const followedPosition = useMemo(
+    () => layout.find((entry) => entry.node.id === followNodeId)?.position ?? null,
+    [followNodeId, layout],
+  )
+
+  // P6 follow: center the selected/first node. The user pan/zoom handler pauses
+  // follow in the host; this effect only re-centers while follow is true.
+  useEffect(() => {
+    if (!follow || followedPosition === null) return
+    setCenter(followedPosition.x + 130, followedPosition.y + 48, {
+      zoom: 1,
+      duration: prefersReducedMotion() ? 0 : 300,
+    })
+  }, [follow, followedPosition, setCenter])
 
   const flowNodes = useMemo<Node[]>(
     () =>
@@ -171,8 +291,9 @@ function ChainCanvas({ nodes, edges, selectedNodeId, onSelectNode }: ChainGraphP
       data-testid="chain-graph"
       data-node-count={nodes.length}
       data-edge-count={edges.length}
+      data-follow={follow ? "true" : "false"}
       aria-label="探索链路图"
-      className="relative h-[620px] w-full overflow-hidden rounded-xl border border-border bg-card"
+      className="relative h-[480px] w-full overflow-hidden rounded-xl border border-border bg-card motion-reduce:transition-none lg:h-[620px]"
     >
       <ReactFlow
         nodes={flowNodes}
@@ -185,6 +306,11 @@ function ChainCanvas({ nodes, edges, selectedNodeId, onSelectNode }: ChainGraphP
         nodesDraggable={false}
         nodesConnectable={false}
         elementsSelectable
+        onMoveStart={(event) => {
+          // Programmatic fitView/center passes a null event; only a real user
+          // pan/zoom pauses follow.
+          if (event) onUserMove?.()
+        }}
         proOptions={{ hideAttribution: true }}
       >
         <Background variant={BackgroundVariant.Dots} gap={20} size={1} />

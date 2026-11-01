@@ -34,6 +34,8 @@ export type IssueDetailSheetProps = {
   issue: IssueDetailView | null
   loading: boolean
   error: unknown
+  /** Global issues reuse the sheet without transitions, merge or anchors. */
+  readOnly?: boolean
   onClose: () => void
   onRetry: () => void
   /** Resolves when the transition succeeded; throws ApiError otherwise. */
@@ -339,6 +341,7 @@ export function IssueDetailSheet({
   issue,
   loading,
   error,
+  readOnly = false,
   onClose,
   onRetry,
   onTransition,
@@ -433,39 +436,51 @@ export function IssueDetailSheet({
                 </p>
               ) : null}
 
-              <div className="flex flex-wrap items-center gap-2">
-                {issue.status === "open" ? (
-                  <>
-                    <Button size="sm" onClick={() => setTransition("confirm")}>
-                      确认
+              {readOnly ? (
+                <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+                  只读视图；请在所属版本工作区处理该问题。
+                </p>
+              ) : (
+                <div className="flex flex-wrap items-center gap-2">
+                  {issue.status === "open" ? (
+                    <>
+                      <Button size="sm" onClick={() => setTransition("confirm")}>
+                        确认
+                      </Button>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onClick={() => setTransition("dismiss")}
+                      >
+                        驳回
+                      </Button>
+                    </>
+                  ) : null}
+                  {issue.status === "confirmed" || issue.status === "dismissed" ? (
+                    <Button size="sm" onClick={() => setTransition("reopen")}>
+                      重开
                     </Button>
-                    <Button variant="secondary" size="sm" onClick={() => setTransition("dismiss")}>
-                      驳回
+                  ) : null}
+                  {canMerge ? (
+                    <Button variant="secondary" size="sm" onClick={onMerge}>
+                      合并
                     </Button>
-                  </>
-                ) : null}
-                {issue.status === "confirmed" || issue.status === "dismissed" ? (
-                  <Button size="sm" onClick={() => setTransition("reopen")}>
-                    重开
-                  </Button>
-                ) : null}
-                {canMerge ? (
-                  <Button variant="secondary" size="sm" onClick={onMerge}>
-                    合并
-                  </Button>
-                ) : null}
-              </div>
+                  ) : null}
+                </div>
+              )}
 
               <RefsSection versionId={versionId} issue={issue} />
 
-              <section aria-label="问题代码锚点" className="border-t border-border pt-3">
-                <AnchorPanel
-                  versionId={versionId}
-                  subjectKind="issue"
-                  subjectId={issue.id}
-                  title="问题代码锚点"
-                />
-              </section>
+              {readOnly ? null : (
+                <section aria-label="问题代码锚点" className="border-t border-border pt-3">
+                  <AnchorPanel
+                    versionId={versionId}
+                    subjectKind="issue"
+                    subjectId={issue.id}
+                    title="问题代码锚点"
+                  />
+                </section>
+              )}
 
               <section data-testid="issue-history" aria-label="状态历史" className="space-y-2">
                 <h3 className="text-xs font-semibold text-foreground">状态历史</h3>

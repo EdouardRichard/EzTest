@@ -318,7 +318,7 @@ func renderSections(in ContextInput) []Section {
 
 func systemContent(in ContextInput) string {
 	parts := make([]string, 0, 3)
-	if prompt := strings.TrimSpace(in.Profile.SystemPrompt); prompt != "" {
+	if prompt := renderedSystemPrompt(in); prompt != "" {
 		parts = append(parts, prompt)
 	}
 	parts = append(parts, taskBlock(in.Task))
@@ -329,14 +329,16 @@ func systemContent(in ContextInput) string {
 }
 
 // minimalSystemContent keeps the task block (goal/constraints first) ahead of
-// the profile prompt so extreme truncation cannot lose task constraints.
+// the profile prompt so extreme truncation cannot lose task constraints. The
+// profile prompt is rendered through the same variable catalog as the normal
+// path.
 func minimalSystemContent(in ContextInput) string {
 	parts := make([]string, 0, 3)
 	parts = append(parts, taskBlock(in.Task))
 	if in.Execution != nil {
 		parts = append(parts, executionBlock(*in.Execution))
 	}
-	if prompt := strings.TrimSpace(in.Profile.SystemPrompt); prompt != "" {
+	if prompt := renderedSystemPrompt(in); prompt != "" {
 		parts = append(parts, prompt)
 	}
 	return strings.Join(parts, "\n\n")

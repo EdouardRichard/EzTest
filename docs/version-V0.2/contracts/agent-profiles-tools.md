@@ -331,3 +331,67 @@ system prompt 必须包含 `[profile:<key>]`，并声明：AI 只能提交 draft
 - `sut.page_propose` 只提交候选，不改 `sut_page`/`sut_api` 的 `status`；确认/驳回由 admin API 完成（§4.2 #26–#29）。
 - `execution.visual_assert` 的基线/实际字节由 API 从内容账本读取，执行器不访问文件系统/网络取基线；证据 kind 映射 `visual_actual`/`visual_diff`；返回不含图片字节/内部路径。
 - 工具结果超限落 content_object；不返回内部 SQL/凭据/存储路径。
+
+---
+
+## 9. P6 Profiles 与提示词运行态（`frozen: P6`，2026-11-01）
+
+> 来源：`docs/superpowers/specs/2026-11-01-eztest-v02-p6-parity-quality-search-agent-center-design.md` §4.3.4/§8/§14（P6-D-01…）。
+> 实现：`backend/internal/agent/{application,domain,infrastructure,interfaces}`（profile 配置、提示词版本/变量/渲染/预览、Agent 中心）与 P5 tool registry（只读目录）。
+> P6 **不新增** profile、工具、work_item type/team、事件或 executor 协议；只对 14 个固定 profile（P1 3 + P2 5 + P3 3 + P4 3）做 model/budgets/allowed_tools 配置与提示词版本化。`enabled`/`name` 编辑 defer（不暴露/不写）。
+
+### 9.1 Profile 配置（PATCH；admin）
+
+- 可写：`model`（null/空=默认模型；非空必须命中默认 LLM 配置模型）、`budgets{max_turns,soft_seconds,hard_seconds}`（非负整数、`soft_seconds<=hard_seconds`、0=跟随全局）、`allowed_tools`（去重、必须 ⊆ P5 tool registry；未知工具 400）。
+- 不可写（只读展示）：`enabled`（runner 未消费；defer）、`name`（defer）；`system_prompt` 走提示词版本端点；`key` 不可变。不提供 enabled/wrapup/triggers/MCP/Skill 编辑。
+- 写路径：校验 → 事务 `UPDATE agent_profile` + 显式 `updated_at=now()`（无 trigger）→ 审计 `agent.profile.updated` → 返回 `{data:ProfileView,changed}`；无实际变化时 `changed=false`。
+- 生效：**下一次 run/新会话生效**；进行中 run 使用启动时快照，不变（profile 每 run 现读）。
+- 权限：admin-only（`RequireAdmin`，403 `forbidden`）；`GET /api/agents/profiles*`、`GET /api/agents/tools` 同为 admin；Agent 中心目录/运行/质量为登录只读。
+
+### 9.2 提示词版本（append-only）
+
+- `agent_profile.system_prompt` 是运行时唯一“当前正文”真源；`agent_profile_prompt_revision` 只追加历史。**不新增** `current_prompt_id`/`prompt_version` 列；当前版本 = `max(version)`。
+- 启动 `EnsureProfiles` 后回填：对无 revision 的 profile 插入 `v1`（内容=当时 DB 正文，`source=seed`，`actor_id=null`）；幂等、不覆盖管理员编辑。
+- `PUT /api/agents/profiles/{key}/prompt`：body `{system_prompt,note?,expected_version?}`；同一事务 `SELECT ... FOR UPDATE` → 校验 → `version=max+1` → insert revision(`source=admin`) → `UPDATE agent_profile.system_prompt` + `updated_at=now()`。
+- no-op：内容与当前正文相同不插版本，返回 `changed=false`；`expected_version` 不匹配 409 `state_conflict`；版本不存在/不属于该 profile 404/400。
+- `POST .../prompt/reset`：追加默认正文（与 `Profiles()` seed 同源，`DefaultPrompt(key)`），`source=reset`。
+- `POST .../prompt/restore`：body `{version}`；追加该旧版本正文，`source=admin`、`note=restore vN`；不修改历史行。
+- `GET .../prompt/revisions?limit=&before_version=`：按 `version DESC`；`RevisionView` 含 `version/system_prompt/note/source/actor_id/created_at`；`next_cursor`=上一页最后 version 字符串。
+- 所有写（PATCH/reset/restore/PUT）统一审计动作 `agent.profile.updated`，metadata 只含 `profile_key,fields[],prompt_version,prompt_sha256,prompt_length`，**不含正文**；不发 SSE（审计+轮询足够）。
+
+### 9.3 变量目录（代码定义；`source=runtime`）
+
+- 所有 profile：`Now`（RFC3339 UTC）、`ProfileKey`、`ProfileName`、`VersionID`、`VersionTitle`、`VersionStatus`、`TaskType`、`TaskGoal`。
+- execution profiles（`case_executor` 等）：另加 `CaseRunID`、`WaveID`、`IntentID`、`CaseVersionID`、`CaseTitle`、`Priority`。
+- 变量由 `ContextInput` 在 run 时由服务端生成；不可用字段为空串；变量目录不落库、不接受客户端传入运行期值。`GET /api/agents/profiles/{key}` 返回 `variables[]`（`name/description/example/source`）。
+
+### 9.4 模板/渲染/预览
+
+- 模板：Go `text/template`，`missingkey=error`；不允许 `FuncMap`，不允许访问环境/IO/网络。
+- 保存时 `validateTemplate`：语法 + 顶层 `{{.Var}}` ⊆ 变量目录；未知变量/语法错误 400 `invalid_argument`（`details.field=system_prompt`）。
+- 强制保留 `[profile:<key>]` 标记：缺失 400 `invalid_argument`（`details.reason=missing_profile_marker`）；默认正文含该标记。
+- 长度：1–32768 runes；非空；超长 400。
+- 预览：`POST /api/agents/profiles/{key}/prompt/preview`，body `{system_prompt?,sample?}`；空 template=当前正文；用变量示例值 + sample 覆盖渲染；返回 `{rendered}`；无效 400（不持久化、不执行工具）。
+
+### 9.5 运行期渲染/回退/生效
+
+- 每次 run 渲染 `agent_profile.system_prompt` 后，仍由代码固定拼接 `taskBlock`/`executionBlock`；这两块不可编辑、不可由模板覆盖。
+- 渲染失败回退内置默认正文（`Profiles()` seed 同源）；仍失败使用原始默认正文；**不半渲染、不阻断/不失败 run**。
+- 进行中 run 的 system content 已生成，不受后续编辑影响；保存后的**下一次 run**生效。
+- `context_packet.sections` 含 system 全文（内部）；Agent 中心 read model/catalog/runs/quality **永不返回** `system_prompt`/`transcript`；普通用户不返回 prompt。若未来观察面板展示，必须裁剪/脱敏。
+- 注入风险由用户接受（内网小团队），但模板仍不允许任意函数/IO；工具白名单由服务端强约束，admin 自担 prompt 行为变更。
+
+### 9.6 权限/错误/脱敏
+
+- 读：`GET /api/agent-center/{catalog,runs,quality}` 登录只读；`GET /api/agents/profiles*`、`GET /api/agents/tools` admin。
+- 写：PATCH/PUT/reset/restore/preview 全部 admin；普通用户 403 `forbidden`；未认证 401。
+- 错误：400 `invalid_argument`（`details.field`/`details.reason`）、403、404、409 `state_conflict`（expected_version）；非法 profile key 400/404。
+- 目录/运行/质量投影：不含 prompt/transcript/工具参数正文/凭据；工具目录只读名称/描述/JSON Schema，不执行工具。
+- 审计 metadata 不含正文；日志/事件不打印 prompt 全文。
+
+### 9.7 测试/验收要点
+
+- domain：prompt 校验（空/超长/缺 marker/未知变量/语法）、budgets/tools/model 校验、默认正文同源、no-op、expected_version。
+- 集成：迁移 #33 幂等、回填 v1 不覆盖、PUT/reset/restore/no-op/409、PATCH 后下一次 run 的 `agent_message(role=system)` 含新 prompt 与 marker、旧 run 不变、审计 metadata 无正文、权限。
+- E2E：admin 编辑 prompt（唯一 token）→ 下一次真实 LLM run 的 system message 含 token；普通用户无 prompt/403；版本历史/恢复；截图（S4）。
+- 前端：目录/运行/质量/配置；只读态；变量 chip 插入；预览；版本 diff/restore；错误 field；空/载/错态。

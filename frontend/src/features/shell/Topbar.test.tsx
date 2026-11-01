@@ -47,27 +47,22 @@ vi.mock("@/lib/sse-client", () => ({
   },
 }))
 
-const executionApi = vi.hoisted(() => ({ listHumanRequests: vi.fn() }))
-vi.mock("@/features/execution/api", () => executionApi)
+const api = vi.hoisted(() => ({ apiGet: vi.fn() }))
+vi.mock("@/lib/api-client", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/api-client")>()
+  return { ...actual, apiGet: api.apiGet }
+})
 
 const versionsApi = vi.hoisted(() => ({ getVersion: vi.fn() }))
 vi.mock("@/features/versions/api", () => versionsApi)
 
-const humanRequest = {
-  id: "9501",
-  version_id: "2001",
-  case_run_id: "9301",
-  kind: "login_takeover",
-  status: "open",
-  payload: {
-    reason: "需要输入短信验证码",
-    version_sut_id: "3001",
-    account_role: "buyer",
-    page_url: "https://order.test/login",
-    challenge_kind: "sms",
-  },
-  expires_at: "2026-11-01T08:00:00Z",
-  created_at: "2026-11-01T07:00:00Z",
+const emptyTodoCounts = {
+  requirement_confirmation: 0,
+  case_confirmation: 0,
+  issue_confirmation: 0,
+  design_pending: 0,
+  human_request: 0,
+  dead_work_item: 0,
 }
 
 const versionFixture = {
@@ -93,8 +88,8 @@ describe("Topbar", () => {
     auth.changePassword.mockReset()
     nav.replace.mockReset()
     nav.pathname = "/issues"
-    executionApi.listHumanRequests.mockReset()
-    executionApi.listHumanRequests.mockResolvedValue([])
+    api.apiGet.mockReset()
+    api.apiGet.mockResolvedValue({ items: [], counts: emptyTodoCounts })
     versionsApi.getVersion.mockReset()
     versionsApi.getVersion.mockResolvedValue(versionFixture)
   })
@@ -152,15 +147,18 @@ describe("Topbar", () => {
     expect(nav.replace).toHaveBeenCalledWith("/login")
   })
 
-  it("shows the current-version todo entry and opens the drawer", async () => {
+  it("shows the global todo entry and opens the drawer", async () => {
     nav.pathname = "/versions/2001"
-    executionApi.listHumanRequests.mockResolvedValue([humanRequest])
+    api.apiGet.mockResolvedValue({
+      items: [],
+      counts: { ...emptyTodoCounts, human_request: 1 },
+    })
 
     render(<Topbar />)
 
     const trigger = await screen.findByTestId("todo-drawer-trigger")
     await waitFor(() => expect(trigger).toHaveTextContent("1"))
-    expect(executionApi.listHumanRequests).toHaveBeenCalledWith("2001", { status: "open" })
+    expect(api.apiGet).toHaveBeenCalledWith("/api/todos?limit=50")
 
     fireEvent.click(trigger)
     expect(await screen.findByRole("dialog", { name: "待办" })).toBeInTheDocument()

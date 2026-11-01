@@ -41,6 +41,21 @@ func (p *DesignProvider) Scenarios(ctx context.Context, versionID int64) ([]chai
 	if err != nil {
 		return nil, err
 	}
+	return p.scenariosFromGraph(graph), nil
+}
+
+// DesignSnapshot is the P6 one-read fast path: scenarios and cases are derived
+// from the same design graph snapshot, so the chain service issues one design
+// read per request instead of two.
+func (p *DesignProvider) DesignSnapshot(ctx context.Context, versionID int64) ([]chain.Node, []chain.Node, error) {
+	graph, err := p.reader.ReadGraph(ctx, versionID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return p.scenariosFromGraph(graph), p.casesFromGraph(graph), nil
+}
+
+func (p *DesignProvider) scenariosFromGraph(graph designapp.GraphView) []chain.Node {
 	nodes := make([]chain.Node, 0)
 	for _, requirement := range graph.Requirements {
 		for _, scenario := range requirement.Scenarios {
@@ -48,6 +63,14 @@ func (p *DesignProvider) Scenarios(ctx context.Context, versionID int64) ([]chai
 				continue
 			}
 			requirementID := requirement.RequirementID
+			meta := map[string]any{
+				"requirement_version_id": scenario.RequirementVersionID,
+				"sort_order":             scenario.SortOrder,
+				"case_count":             len(scenario.Cases),
+			}
+			if requirementID > 0 {
+				meta["requirement_id"] = strconv.FormatInt(requirementID, 10)
+			}
 			node := chain.Node{
 				ID:            chain.NodeID(chain.NodeScenario, scenario.ID),
 				Kind:          chain.NodeScenario,
@@ -55,16 +78,13 @@ func (p *DesignProvider) Scenarios(ctx context.Context, versionID int64) ([]chai
 				Label:         scenario.Name,
 				RequirementID: optionalInt64Ptr(requirementID),
 				VersionSUTIDs: sortUniqueIDs(scenario.VersionSUTIDs),
-				Meta: map[string]any{
-					"requirement_version_id": scenario.RequirementVersionID,
-					"sort_order":             scenario.SortOrder,
-				},
+				Meta:          meta,
 			}
 			attachPageIDs(&node, scenario.PageIDs)
 			nodes = append(nodes, node)
 		}
 	}
-	return nodes, nil
+	return nodes
 }
 
 // Cases returns the current case version of every case in the version design
@@ -75,6 +95,10 @@ func (p *DesignProvider) Cases(ctx context.Context, versionID int64) ([]chain.No
 	if err != nil {
 		return nil, err
 	}
+	return p.casesFromGraph(graph), nil
+}
+
+func (p *DesignProvider) casesFromGraph(graph designapp.GraphView) []chain.Node {
 	nodes := make([]chain.Node, 0)
 	for _, requirement := range graph.Requirements {
 		for _, scenario := range requirement.Scenarios {
@@ -83,6 +107,16 @@ func (p *DesignProvider) Cases(ctx context.Context, versionID int64) ([]chain.No
 					continue
 				}
 				caseVersionID := card.CurrentVersionID
+				meta := map[string]any{
+					"revision":        card.Revision,
+					"priority":        card.Priority,
+					"step_count":      card.StepCount,
+					"assertion_count": card.AssertionCount,
+					"stale":           caseVersionStale(card.Status),
+				}
+				if scenario.ID > 0 {
+					meta["scenario_id"] = strconv.FormatInt(scenario.ID, 10)
+				}
 				node := chain.Node{
 					ID:            chain.NodeID(chain.NodeCaseVersion, caseVersionID),
 					Kind:          chain.NodeCaseVersion,
@@ -96,12 +130,7 @@ func (p *DesignProvider) Cases(ctx context.Context, versionID int64) ([]chain.No
 					VersionSUTIDs: sortUniqueIDs(card.VersionSUTIDs),
 					CreatedAt:     card.CreatedAt,
 					UpdatedAt:     card.CreatedAt,
-					Meta: map[string]any{
-						"revision":        card.Revision,
-						"priority":        card.Priority,
-						"step_count":      card.StepCount,
-						"assertion_count": card.AssertionCount,
-					},
+					Meta:          meta,
 				}
 				if card.DefaultVersionSUTID != nil && *card.DefaultVersionSUTID > 0 {
 					node.VersionSUTID = int64Ptr(*card.DefaultVersionSUTID)
@@ -111,7 +140,13 @@ func (p *DesignProvider) Cases(ctx context.Context, versionID int64) ([]chain.No
 			}
 		}
 	}
-	return nodes, nil
+	return nodes
+}
+
+// caseVersionStale marks the design statuses that let a chain reader warn that
+// the case version is stale/superseded before opening it.
+func caseVersionStale(status string) bool {
+	return status == "stale" || status == "superseded"
 }
 
 // CaseVersionsByIDs is the historical reader. It returns any status (including

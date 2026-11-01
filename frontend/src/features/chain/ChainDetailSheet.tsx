@@ -38,6 +38,7 @@ const META_KEYS = [
   "result",
   "failure_class",
   "severity",
+  "issue_status",
   "category",
   "revision",
   "as_of",
@@ -48,13 +49,27 @@ const META_KEYS = [
   "evidence_count",
   "step_count",
   "assertion_count",
+  "attempt",
+  "duration_ms",
+  "case_count",
+  "executed_count",
+  "failed_count",
+  "uncovered",
+  "stale",
+  "wave_status",
+  "trigger",
+  "report_kind",
+  "report_status",
+  "code_ref_count",
   "close_round",
+  "closure_status",
 ] as const
 
 function readMetaString(meta: Record<string, unknown> | undefined, key: string): string {
   const value = meta?.[key]
   if (typeof value === "string") return value
   if (typeof value === "number") return String(value)
+  if (typeof value === "boolean") return value ? "true" : "false"
   return ""
 }
 
@@ -174,7 +189,10 @@ export function ChainDetailSheet({ versionId, node, onClose }: ChainDetailSheetP
         </header>
 
         <div className="flex-1 space-y-4 overflow-y-auto px-5 py-4">
-          <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[11px]">
+          <dl
+            data-testid="chain-detail-meta"
+            className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[11px]"
+          >
             <dt className="text-muted-foreground">节点</dt>
             <dd className="font-mono text-foreground">{node.id}</dd>
             <dt className="text-muted-foreground">创建于</dt>

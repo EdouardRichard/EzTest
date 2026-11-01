@@ -36,8 +36,10 @@ export type ReportDetailPanelProps = {
   onRetry: () => void
   onRevisionChange: (revision: number) => void
   onOpenHTML: () => void
-  onDownloadHTML: () => void
-  onRegenerate: () => void
+  onDownloadHTML?: () => void
+  onRegenerate?: () => void
+  /** Global reports reuse this panel without download/regenerate/export. */
+  readOnly?: boolean
   /** True while the HTML bytes are being fetched. */
   opening: boolean
   /** True while a regenerate request is being submitted. */
@@ -124,6 +126,7 @@ export function ReportDetailPanel({
   onOpenHTML,
   onDownloadHTML,
   onRegenerate,
+  readOnly = false,
   opening,
   regenerating,
   actionError,
@@ -245,27 +248,41 @@ export function ReportDetailPanel({
           <Button size="sm" disabled={!generated || opening || regenerating} onClick={onOpenHTML}>
             打开报告 HTML
           </Button>
-          <Button
-            size="sm"
-            variant="secondary"
-            disabled={!generated || opening || regenerating}
-            onClick={onDownloadHTML}
-          >
-            <Download className="size-3.5" aria-hidden="true" />
-            下载 HTML
-          </Button>
-          <Button
-            size="sm"
-            variant="secondary"
-            disabled={regenerating || generateState === "pending" || generateState === "running"}
-            onClick={onRegenerate}
-          >
-            <RefreshCw className="size-3.5" aria-hidden="true" />
-            重新生成
-          </Button>
-          <Button size="sm" variant="secondary" disabled title="PDF 导出属于 P7 阶段">
-            PDF（P7）
-          </Button>
+          {readOnly ? (
+            <Link
+              href={`/versions/${encodeURIComponent(versionId)}?tab=reports&report=${encodeURIComponent(report.id)}`}
+              className="inline-flex items-center gap-1 text-xs text-primary underline-offset-2 hover:underline"
+            >
+              在版本中处理
+              <ExternalLink className="size-3" aria-hidden="true" />
+            </Link>
+          ) : (
+            <>
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={!generated || opening || regenerating}
+                onClick={() => onDownloadHTML?.()}
+              >
+                <Download className="size-3.5" aria-hidden="true" />
+                下载 HTML
+              </Button>
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={
+                  regenerating || generateState === "pending" || generateState === "running"
+                }
+                onClick={() => onRegenerate?.()}
+              >
+                <RefreshCw className="size-3.5" aria-hidden="true" />
+                重新生成
+              </Button>
+              <Button size="sm" variant="secondary" disabled title="PDF 导出属于 P7 阶段">
+                PDF（P7）
+              </Button>
+            </>
+          )}
         </div>
 
         {opening ? <p className="text-[11px] text-muted-foreground">正在获取 HTML…</p> : null}

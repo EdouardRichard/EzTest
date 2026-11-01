@@ -1,11 +1,15 @@
 import type { Metadata } from "next"
+import { Suspense } from "react"
 
-import { PlaceholderPage } from "@/components/placeholder-page"
+import { LoadingCard } from "@/components/ui/Spinner"
+import { GlobalIssuesPage } from "@/features/delivery/GlobalIssuesPage"
 
 export const metadata: Metadata = { title: "问题" }
 
 export default function IssuesPage() {
   return (
-    <PlaceholderPage title="问题" phase="P1" description="跨版本缺陷跟踪、证据关联与闭环处置。" />
+    <Suspense fallback={<LoadingCard label="正在加载全局问题…" />}>
+      <GlobalIssuesPage />
+    </Suspense>
   )
 }

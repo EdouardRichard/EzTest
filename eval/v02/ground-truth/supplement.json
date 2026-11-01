@@ -1,0 +1,17 @@
+{
+  "corpus_version": "v02-2026-11-01.1",
+  "expected_cases": [
+    {
+      "title": "筛选后空结果展示空态",
+      "requirement_key": "R2"
+    },
+    {
+      "title": "无权限用户直接访问退款链接被拒绝",
+      "requirement_key": "R4"
+    }
+  ],
+  "expected_counts": {
+    "supplement_cases": 2,
+    "supplement_hits": 2
+  }
+}

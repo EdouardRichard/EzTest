@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
-  title: EzTest 0.2 API 契约（P0 冻结 + P1 冻结 + P2 增量 + P3/P4/P5 冻结）
-  version: 0.2.0-p5
+  title: EzTest 0.2 API 契约（P0 冻结 + P1 冻结 + P2 增量 + P3/P4/P5/P6 冻结）
+  version: 0.2.0-p6
   description: |
     EzTest 0.2 P0（平台底座）对外 REST/SSE 契约，来源：
     `docs/superpowers/specs/2026-10-31-eztest-v02-p0-platform-foundation-design.md` §7/§8/§9。
@@ -128,7 +128,19 @@ info:
     `baseline_evidence_invalid`）。`VersionSUT`（`Binding`）新增可选 `code_baseline_commit`；
     `CaseRunSummaryView` 新增视觉四态计数（`visual_skipped` 保留兼容）；`EvidenceView.kind` 扩为
     10 值（`visual_actual`/`visual_diff`）。事件类型见 `contracts/events.md` §14。
-x-frozen: P5
+    ### P6 增量（frozen，2026-11-01）
+
+    来源：`docs/superpowers/specs/2026-11-01-eztest-v02-p6-parity-quality-search-agent-center-design.md`
+    §4/§14。P0–P5 paths/schemas 语义不变，只加新 path 与可选字段；P6 新增 20 个 operation
+    （搜索、待办、质量/评测、全局问题/报告、Agent 中心、profile/提示词配置），新增
+    `Search`/`Workspace`/`AgentCenter` 三个 tag；chain v2 在既有 `GET /api/versions/{versionId}/exploration-chain`
+    上增加 q/abnormal_only/issue_status/issue_severity/requirement_limit 参数与 counts/meta/degraded_layers/
+    truncated_layers/replay 增量。权限：搜索/待办/质量 overview/全局中心/Agent 中心为登录只读；
+    评测 run 与 profile/prompt/工具目录为 admin（403 `forbidden`）。P6 不新增事件、任务类型、profile、
+    工具或 executor 协议；不新增通用 `Idempotency-Key`（重复 POST eval-run 允许，以 run id 区分）。
+    prompt 正文只在 admin profile API 返回；目录/运行/质量投影永不返回 system_prompt/transcript。
+    错误信封复用；业务冲突 `state_conflict`，链路全层失败 503 `provider_unavailable`。
+x-frozen: P6
 servers:
   - url: http://localhost:13333
     description: 本地开发默认 API（端口来自 EZTEST_API_PORT，默认 13333）
@@ -180,7 +192,13 @@ tags:
   - name: Visual
     description: 视觉断言配置、基线审批、比对与版本视觉概览（P5）
   - name: Quality
-    description: 质量指标只读聚合（P5 最小质量页；完整质量中心 P6）
+    description: 质量指标只读聚合与评测（P5 视觉指标；P6 运营指标/评测 run）
+  - name: Search
+    description: 跨实体搜索（P6；登录只读、5 类分组、降级）
+  - name: Workspace
+    description: 全局待办快照（P6；登录只读、6 kind、权限过滤）
+  - name: AgentCenter
+    description: Agent 目录/运行观察/质量投影与 profile、提示词配置（P6；读登录、写 admin）
 
 paths:
   /healthz:
@@ -3991,11 +4009,19 @@ paths:
     get:
       tags: [Chain]
       operationId: getExplorationChain
-      summary: 版本探索链路（只读单对象 + 预算截断）
+      summary: 版本探索链路（只读单对象 + 预算截断；P6 筛选/counts/meta 增量）
       description: |
         请求级聚合 version/design/execution/delivery/resource 的 application 端口，不写表、不直读他域表。
         支持 SUT/页面/波次/状态/结果过滤、`focus_node` 深链保真、`event_from`/`event_to` 历史回看（近似）；
         空版本返回空 nodes/edges + counts 0（不 404）；超预算 `truncated=true` 并给出 `truncation.reason`。
+        P6 v2：新增 `q`/`abnormal_only`/`issue_status`/`issue_severity`/`requirement_limit` 过滤
+        （过滤作用于节点并同步裁剪/保留诱导边，`focus_node` 及其祖先永不丢；每 case_version 只返回最新
+        case_run）。响应增量：`counts.by_case_run_status`/`by_issue_severity`/`by_issue_status`/`coverage`、
+        `nodes[].meta` 类型化可选字段（保留 additionalProperties 兼容）、`degraded_layers`、
+        `truncated_layers`、`replay.event_limit`/`replay.truncated`。Provider 失败层降级、健康层返回；
+        全层失败 503 `provider_unavailable`；客户端保留旧图并以 degraded_layers 提示，不显示空态。
+        `chain.max_*` 与 `chain.replay_event_limit` 每请求/热缓存读取，
+        PATCH settings 后下一次请求生效。查询预算 ≤10 SQL；API P95 ≤800ms（200 节点）。
       parameters:
         - $ref: '#/components/parameters/VersionID'
         - $ref: '#/components/parameters/ChainSUTFilter'
@@ -4007,6 +4033,11 @@ paths:
         - $ref: '#/components/parameters/ChainEventTo'
         - $ref: '#/components/parameters/ChainFocusNode'
         - $ref: '#/components/parameters/ChainLimit'
+        - $ref: '#/components/parameters/ChainQ'
+        - $ref: '#/components/parameters/ChainAbnormalOnly'
+        - $ref: '#/components/parameters/ChainIssueStatus'
+        - $ref: '#/components/parameters/ChainIssueSeverity'
+        - $ref: '#/components/parameters/ChainRequirementLimit'
       responses:
         '200':
           description: 链路视图
@@ -4026,6 +4057,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '500':
           $ref: '#/components/responses/Internal'
+        '503':
+          $ref: '#/components/responses/Unavailable'
 
   /api/versions/{versionId}/reopen:
     post:
@@ -5222,6 +5255,605 @@ paths:
         '500':
           $ref: '#/components/responses/Internal'
 
+  # -------------------------------------------------------------------------
+  # P6 search/workspace/quality/global-centers/agent-center increments
+  # (frozen, 2026-11-01; P0-P5 semantics unchanged)
+  # -------------------------------------------------------------------------
+  /api/search:
+    get:
+      tags: [Search]
+      operationId: search
+      summary: 跨实体搜索（版本/需求/用例/问题/报告）
+      description: |
+        `q` trim 后必填 1–100；`types` 省略=5 类，未知值 400；`limit` 为每类型上限，总上限 100。
+        每类 1 条只读查询（总 ≤5 SQL），按 `updated_at DESC, id DESC`。任一 Provider 失败该组为空 +
+        `degraded=true`；全失败 200 空 groups + degraded=true（不 5xx）。不返回知识/证据正文/凭据/
+        prompt/transcript。`url` 由服务端按 0.2 8 Tab 生成深链。
+      parameters:
+        - $ref: '#/components/parameters/SearchQuery'
+        - $ref: '#/components/parameters/SearchTypes'
+        - $ref: '#/components/parameters/SearchLimit'
+      responses:
+        '200':
+          description: 分组搜索结果快照
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/SearchResultView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/todos:
+    get:
+      tags: [Workspace]
+      operationId: listTodos
+      summary: 全局待办快照（6 kind，按权限过滤）
+      description: |
+        counts 是 limit 前按 kind 计数（6 个 key 全返回；非 admin 的 admin-only 组为 0）；items 受
+        `limit` 截断。排序：human_request（takeover 优先）→ design_pending → issue_confirmation →
+        requirement_confirmation → case_confirmation → dead_work_item；组内 `created_at DESC, id DESC`。
+        非 admin 不查询 execution 的 human_request/dead 组（服务端过滤，避免泄露）。只读；前端 30s 轮询。
+      parameters:
+        - $ref: '#/components/parameters/TodoLimit'
+      responses:
+        '200':
+          description: 待办快照
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/TodoSnapshotView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/quality/eval-runs:
+    get:
+      tags: [Quality]
+      operationId: listEvalRuns
+      summary: 评测 run 列表（admin，按 id DESC）
+      description: 返回终态评测 run；`limit` 1–50 默认 20，无 cursor；列表 envelope 的 `next_cursor` 恒 null。
+      parameters:
+        - $ref: '#/components/parameters/EvalRunLimit'
+      responses:
+        '200':
+          description: 评测 run 列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvalRunListEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+    post:
+      tags: [Quality]
+      operationId: createEvalRun
+      summary: 记录终态评测 run（admin；服务端派生指标/status）
+      description: |
+        只接受真实 LLM 评测轨（`mode=real_llm`）；服务端校验样本物理约束并派生 6+1 指标与 status
+        （`status=error` 请求声明除外；客户端 passed/failed 被忽略）。`threshold`/`baseline` 只用于
+        标记 passed/regressed，不阻断阶段验收。重复 POST 允许（以 run id 区分），不实现 Idempotency-Key。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EvalRunCreateRequest'
+      responses:
+        '201':
+          description: 已记录的评测 run（含 6+1 指标）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/EvalRunView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/quality/eval-runs/{id}:
+    get:
+      tags: [Quality]
+      operationId: getEvalRun
+      summary: 评测 run 详情（admin）
+      parameters:
+        - $ref: '#/components/parameters/EvalRunID'
+      responses:
+        '200':
+          description: 评测 run
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/EvalRunView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/quality/overview:
+    get:
+      tags: [Quality]
+      operationId: getQualityOverview
+      summary: 运营指标 + 最新评测摘要（登录只读）
+      description: |
+        7 项运营指标（架构 §16）每项 `{name,value|null,numerator,denominator,available,definition}`；
+        分母 0 → available=false、value=null（不显示 0 假数据）。`latest_eval` 为最近 eval_run 摘要或 null。
+        评测 run 列表/样本仍 admin-only；P5 `GET /api/quality/visual-metrics` 语义不变。
+      parameters:
+        - $ref: '#/components/parameters/VersionIDQuery'
+      responses:
+        '200':
+          description: 运营指标与最新评测摘要
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/QualityOverviewView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/issues:
+    get:
+      tags: [Delivery]
+      operationId: listGlobalIssues
+      summary: 全局问题只读列表（跨版本，id DESC）
+      description: |
+        只读；详情复用版本内接口；`q` 为标题 ILIKE（1–100）。列表 envelope；`GlobalIssueView` =
+        IssueView + `version_title` + 深链 `url`（`/versions/{vid}?tab=issues&issue={id}`）。
+      parameters:
+        - $ref: '#/components/parameters/VersionIDQuery'
+        - $ref: '#/components/parameters/IssueStatusFilter'
+        - $ref: '#/components/parameters/IssueSeverityFilter'
+        - $ref: '#/components/parameters/IssueCategoryFilter'
+        - $ref: '#/components/parameters/TextQuery'
+        - $ref: '#/components/parameters/Before'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 全局问题列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GlobalIssueListEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/reports:
+    get:
+      tags: [Delivery]
+      operationId: listGlobalReports
+      summary: 全局报告只读列表（跨版本，id DESC）
+      description: |
+        只读；含 current_revision，不返回 content/内部路径；`GlobalReportView` = ReportView +
+        `version_title` + 深链 `url`（`/versions/{vid}?tab=reports&report={id}`）。
+      parameters:
+        - $ref: '#/components/parameters/VersionIDQuery'
+        - $ref: '#/components/parameters/ReportStatusFilter'
+        - $ref: '#/components/parameters/ReportKindFilter'
+        - $ref: '#/components/parameters/Before'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 全局报告列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GlobalReportListEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/agent-center/catalog:
+    get:
+      tags: [AgentCenter]
+      operationId: getAgentCatalog
+      summary: Agent 目录/团队/统计（登录；不含 prompt/transcript）
+      description: |
+        14 个固定 profile（P1 3 + P2 5 + P3 3 + P4 3）；团队分组 clarification/design/execution/
+        delivery/steward/code（code 无 profile）。stats：`success_rate=done/(done+failed)`（0 分母→0；
+        aborted/interrupted 不进分母）；`last_run_at=max(started_at)`。目录永不含 system_prompt/
+        transcript/工具参数正文/凭据。
+      responses:
+        '200':
+          description: Agent 目录
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/AgentCatalogView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/agent-center/runs:
+    get:
+      tags: [AgentCenter]
+      operationId: listAgentRuns
+      summary: Agent 运行观察（登录；按 id DESC，不含 transcript）
+      description: 列表 envelope；`before`+`limit`；非法 status 400。返回 AgentRunView（join work_item/version）；不返回 message/transcript。
+      parameters:
+        - $ref: '#/components/parameters/AgentProfileKeyFilter'
+        - $ref: '#/components/parameters/AgentRunStatusFilter'
+        - $ref: '#/components/parameters/VersionIDQuery'
+        - $ref: '#/components/parameters/Before'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Agent 运行列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentRunListEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/agent-center/quality:
+    get:
+      tags: [AgentCenter]
+      operationId: getAgentCenterQuality
+      summary: 最新评测摘要 + Agent 运行统计（登录）
+      description: 最新 eval_run 摘要（无 run → null）+ run_stats；不返回 prompt/transcript。
+      responses:
+        '200':
+          description: Agent 中心质量投影
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/AgentCenterQualityView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/agents/profiles:
+    get:
+      tags: [AgentCenter]
+      operationId: listAgentProfiles
+      summary: profile 全量（admin；含当前 prompt 正文）
+      responses:
+        '200':
+          description: profile 列表
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ProfileView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/agents/profiles/{key}:
+    get:
+      tags: [AgentCenter]
+      operationId: getAgentProfile
+      summary: profile 详情 + default prompt + 变量目录 + 当前版本（admin）
+      parameters:
+        - $ref: '#/components/parameters/ProfileKey'
+      responses:
+        '200':
+          description: profile 详情
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/ProfileDetailView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+    patch:
+      tags: [AgentCenter]
+      operationId: patchAgentProfile
+      summary: 更新 profile model/budgets/allowed_tools（admin；不改 prompt）
+      description: |
+        可写 `model`（null/空=默认；非空必须命中默认 LLM 配置模型）、`budgets{max_turns,soft_seconds,
+        hard_seconds}`（非负、soft≤hard、0=跟随全局）、`allowed_tools`（去重、⊆ P5 registry）。
+        `enabled`/`name`/`system_prompt`/`key` 不可写。写后下一次 run 生效；当前 run 快照不变；
+        显式 `updated_at=now()`；审计 `agent.profile.updated`（metadata 不含正文）。
+      parameters:
+        - $ref: '#/components/parameters/ProfileKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProfilePatchRequest'
+      responses:
+        '200':
+          description: 更新后的 profile 与是否变化
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProfilePatchResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/agents/profiles/{key}/prompt:
+    put:
+      tags: [AgentCenter]
+      operationId: saveAgentPrompt
+      summary: 追加提示词版本（admin；下一次 run 生效）
+      description: |
+        body `{system_prompt,note?,expected_version?}`；校验非空/≤32768 runes/含 `[profile:<key>]`/
+        模板语法/变量白名单。事务：`SELECT ... FOR UPDATE` → `max(version)+1` → insert revision
+        (source=admin) → UPDATE `agent_profile.system_prompt` + `updated_at`。内容相同 no-op 不插版本
+        （changed=false）；`expected_version` 不匹配 409 `state_conflict`。返回 profile/version/changed。
+      parameters:
+        - $ref: '#/components/parameters/ProfileKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PromptSaveRequest'
+      responses:
+        '200':
+          description: 新版本或 no-op
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/PromptMutationView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/agents/profiles/{key}/prompt/reset:
+    post:
+      tags: [AgentCenter]
+      operationId: resetAgentPrompt
+      summary: 追加默认提示词版本（admin；source=reset）
+      description: 追加默认正文（与 `Profiles()` seed 同源，`DefaultPrompt(key)`），不改历史行；返回结构同 PUT prompt。
+      parameters:
+        - $ref: '#/components/parameters/ProfileKey'
+      responses:
+        '200':
+          description: 新版本
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/PromptMutationView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/agents/profiles/{key}/prompt/restore:
+    post:
+      tags: [AgentCenter]
+      operationId: restoreAgentPrompt
+      summary: 追加指定旧版本为当前提示词（admin；append-only）
+      description: body `{version}`；校验该版本属于该 profile；追加该正文 source=admin、note=`restore vN`；不修改历史行。
+      parameters:
+        - $ref: '#/components/parameters/ProfileKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PromptRestoreRequest'
+      responses:
+        '200':
+          description: 新版本
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/PromptMutationView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/agents/profiles/{key}/prompt/revisions:
+    get:
+      tags: [AgentCenter]
+      operationId: listAgentPromptRevisions
+      summary: 提示词版本历史（admin；version DESC）
+      description: '`next_cursor` 为上一页最后一个 version 的十进制字符串；`has_more`；不修改历史。'
+      parameters:
+        - $ref: '#/components/parameters/ProfileKey'
+        - $ref: '#/components/parameters/BeforeVersion'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 版本历史
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PromptRevisionListEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/agents/profiles/{key}/prompt/preview:
+    post:
+      tags: [AgentCenter]
+      operationId: previewAgentPrompt
+      summary: 变量示例渲染预览（admin；不持久化）
+      description: body `{system_prompt?,sample?}`；空 template=当前正文；变量示例值 + sample 覆盖渲染；语法/未知变量 400 `invalid_argument`（details.field=system_prompt）。
+      parameters:
+        - $ref: '#/components/parameters/ProfileKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PromptPreviewRequest'
+      responses:
+        '200':
+          description: 渲染结果
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/PromptPreviewView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/agents/tools:
+    get:
+      tags: [AgentCenter]
+      operationId: listAgentTools
+      summary: 工具注册表目录（admin；只读，不执行）
+      description: 来自 P5 tool registry 的 `{name,description,parameters}`；不返回执行结果。
+      responses:
+        '200':
+          description: 工具目录
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AgentToolView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/Internal'
+
 components:
   securitySchemes:
     bearerAuth:
@@ -5585,14 +6217,14 @@ components:
       name: status
       in: query
       required: false
-      description: 链路节点状态过滤（实现按节点 kind 解释）
+      description: 链路节点状态过滤（实现按节点 kind 解释；P6 起非法枚举值 400 invalid_argument）
       schema:
         type: string
     ChainResultFilter:
       name: result
       in: query
       required: false
-      description: 链路结果过滤（passed/failed/blocked/inconclusive/skipped 等）
+      description: 链路结果过滤（passed/failed/blocked/inconclusive/skipped 等；P6 起非法枚举值 400 invalid_argument）
       schema:
         type: string
     ChainEventFrom:
@@ -5916,6 +6548,158 @@ components:
       schema:
         type: string
         pattern: '^[0-9]+$'
+    VersionIDQuery:
+      name: version_id
+      in: query
+      required: false
+      description: 版本过滤（十进制字符串；P6 查询参数 snake_case；省略=全局）
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    SearchQuery:
+      name: q
+      in: query
+      required: true
+      description: 搜索词；trim 后 1–100，空/超长 400（details.field=q）
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 100
+    SearchTypes:
+      name: types
+      in: query
+      required: false
+      description: 逗号分隔的类型集合（version,requirement,case,issue,report）；省略=全部 5 类，未知值 400
+      schema:
+        type: string
+    SearchLimit:
+      name: limit
+      in: query
+      required: false
+      description: 每类型条数上限（1–20，默认 5；总上限 100）
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 20
+        default: 5
+    TodoLimit:
+      name: limit
+      in: query
+      required: false
+      description: 待办条数上限（1–200，默认 50；counts 为 limit 前计数）
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+    EvalRunLimit:
+      name: limit
+      in: query
+      required: false
+      description: 评测 run 条数（1–50，默认 20；无 cursor）
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 50
+        default: 20
+    EvalRunID:
+      name: id
+      in: path
+      required: true
+      description: 评测 run 雪花 ID 的十进制字符串
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    TextQuery:
+      name: q
+      in: query
+      required: false
+      description: 标题模糊过滤（1–100；省略=不过滤）
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 100
+    ReportStatusFilter:
+      name: status
+      in: query
+      required: false
+      description: 报告状态过滤（P6 全局报告）
+      schema:
+        type: string
+        enum: [draft, published, stale]
+    AgentProfileKeyFilter:
+      name: profile_key
+      in: query
+      required: false
+      description: agent profile key 过滤
+      schema:
+        type: string
+        pattern: '^[a-z][a-z0-9_]{0,63}$'
+    AgentRunStatusFilter:
+      name: status
+      in: query
+      required: false
+      description: agent run 状态过滤（非法 400）
+      schema:
+        type: string
+        enum: [running, done, failed, aborted, interrupted]
+    ProfileKey:
+      name: key
+      in: path
+      required: true
+      description: agent_profile.key（自然键）
+      schema:
+        type: string
+        pattern: '^[a-z][a-z0-9_]{0,63}$'
+    BeforeVersion:
+      name: before_version
+      in: query
+      required: false
+      description: 上一页最后一个 revision version（整数；按 version DESC 分页）
+      schema:
+        type: integer
+        minimum: 1
+    ChainQ:
+      name: q
+      in: query
+      required: false
+      description: 需求/场景/用例标题模糊过滤（≤100）
+      schema:
+        type: string
+        maxLength: 100
+    ChainAbnormalOnly:
+      name: abnormal_only
+      in: query
+      required: false
+      description: 仅 failed/blocked/inconclusive/interrupted 节点（默认 false）
+      schema:
+        type: boolean
+        default: false
+    ChainIssueStatus:
+      name: issue_status
+      in: query
+      required: false
+      description: 问题状态过滤（P6）
+      schema:
+        type: string
+        enum: [open, confirmed, dismissed, merged]
+    ChainIssueSeverity:
+      name: issue_severity
+      in: query
+      required: false
+      description: 问题严重度过滤（P6）
+      schema:
+        type: string
+        enum: [major, minor, trivial]
+    ChainRequirementLimit:
+      name: requirement_limit
+      in: query
+      required: false
+      description: 需求根节点上限（1–500；缺省用 settings `chain.max_requirements`）
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 500
   responses:
     BadRequest:
       description: 请求参数/请求体校验失败（invalid_argument）
@@ -6011,7 +6795,7 @@ components:
           properties:
             code:
               type: string
-              description: invalid_argument / unauthenticated / forbidden / not_found / conflict / state_conflict / lease_lost / ai_unavailable / context_overflow / unsupported_attachment_format / extraction_failed / evidence_too_large / executor_unavailable / unavailable / internal
+              description: invalid_argument / unauthenticated / forbidden / not_found / conflict / state_conflict / lease_lost / ai_unavailable / provider_unavailable / context_overflow / unsupported_attachment_format / extraction_failed / evidence_too_large / executor_unavailable / unavailable / internal
             message:
               type: string
             request_id:
@@ -9261,6 +10045,29 @@ components:
           type: integer
           format: int64
           nullable: true
+        q:
+          type: string
+          maxLength: 100
+          nullable: true
+          description: P6：需求/场景/用例标题模糊过滤
+        abnormal_only:
+          type: boolean
+          nullable: true
+          description: P6：仅 failed/blocked/inconclusive/interrupted
+        issue_status:
+          type: string
+          enum: [open, confirmed, dismissed, merged]
+          nullable: true
+        issue_severity:
+          type: string
+          enum: [major, minor, trivial]
+          nullable: true
+        requirement_limit:
+          type: integer
+          minimum: 1
+          maximum: 500
+          nullable: true
+          description: P6：需求根节点上限；缺省用 settings `chain.max_requirements`
     ChainCounts:
       type: object
       description: 过滤后的节点计数
@@ -9289,6 +10096,14 @@ components:
         evidence:
           type: integer
           minimum: 0
+        by_case_run_status:
+          $ref: '#/components/schemas/ChainCaseRunStatusCounts'
+        by_issue_severity:
+          $ref: '#/components/schemas/ChainIssueSeverityCounts'
+        by_issue_status:
+          $ref: '#/components/schemas/ChainIssueStatusCounts'
+        coverage:
+          $ref: '#/components/schemas/ChainCoverageCounts'
     ChainNodeView:
       type: object
       required: [id, kind, ref_id, label, created_at]
@@ -9340,8 +10155,7 @@ components:
           type: string
           format: date-time
         meta:
-          type: object
-          additionalProperties: true
+          $ref: '#/components/schemas/ChainNodeMeta'
     ChainEdgeView:
       type: object
       required: [from, to, kind]
@@ -9393,6 +10207,13 @@ components:
         approximate:
           type: boolean
           description: 历史回看为近似（按实体 created_at 边界），不承诺 as-of 快照
+        event_limit:
+          type: integer
+          minimum: 0
+          description: P6：本次历史回看消费的 `chain.replay_event_limit`
+        truncated:
+          type: boolean
+          description: P6：历史回看事件数超过 event_limit 时为 true
     ChainView:
       type: object
       required: [version_id, generated_at, snapshot_cursor, filters, counts, nodes, edges, truncated, truncation, replay]
@@ -9425,6 +10246,14 @@ components:
           $ref: '#/components/schemas/ChainTruncationView'
         replay:
           $ref: '#/components/schemas/ChainReplayView'
+        degraded_layers:
+          type: array
+          description: P6：Provider 失败的层（健康层仍返回）；空数组表示未降级
+          items:
+            type: string
+            enum: [requirement, design, execution, delivery, codeintel]
+        truncated_layers:
+          $ref: '#/components/schemas/ChainTruncatedLayers'
     ClosureSummary:
       type: object
       description: 需求最新闭环快照（RequirementSummary.closure）
@@ -10855,3 +11684,973 @@ components:
         generated_at:
           type: string
           format: date-time
+    # -----------------------------------------------------------------------
+    # P6 schemas (frozen, 2026-11-01)
+    # -----------------------------------------------------------------------
+    SearchItem:
+      type: object
+      required: [id, title, subtitle, version_id, version_title, status, url]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        title:
+          type: string
+        subtitle:
+          type: string
+          description: 第二行摘要；无内容为空串
+        version_id:
+          type: string
+          pattern: '^[0-9]+$'
+        version_title:
+          type: string
+        status:
+          type: string
+          description: 实体状态原文（version/requirement/case/issue/report）
+        url:
+          type: string
+          description: 服务端按 0.2 8 Tab 生成的深链
+    SearchGroup:
+      type: object
+      required: [type, items]
+      properties:
+        type:
+          type: string
+          enum: [version, requirement, case, issue, report]
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SearchItem'
+    SearchResultView:
+      type: object
+      required: [groups, total, truncated, degraded]
+      properties:
+        groups:
+          type: array
+          items:
+            $ref: '#/components/schemas/SearchGroup'
+        total:
+          type: integer
+          minimum: 0
+        truncated:
+          type: boolean
+        degraded:
+          type: boolean
+          description: 任一 Provider 失败为 true；全失败仍 200 空 groups
+
+    TodoItem:
+      type: object
+      required: [kind, title, version_id, version_title, severity, created_at, url]
+      properties:
+        kind:
+          type: string
+          enum:
+            - requirement_confirmation
+            - case_confirmation
+            - issue_confirmation
+            - design_pending
+            - human_request
+            - dead_work_item
+        title:
+          type: string
+        version_id:
+          type: string
+          pattern: '^[0-9]+$'
+        version_title:
+          type: string
+        severity:
+          type: string
+          enum: [major, warning, info]
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+        url:
+          type: string
+    TodoCounts:
+      type: object
+      required:
+        - requirement_confirmation
+        - case_confirmation
+        - issue_confirmation
+        - design_pending
+        - human_request
+        - dead_work_item
+      properties:
+        requirement_confirmation:
+          type: integer
+          minimum: 0
+        case_confirmation:
+          type: integer
+          minimum: 0
+        issue_confirmation:
+          type: integer
+          minimum: 0
+        design_pending:
+          type: integer
+          minimum: 0
+        human_request:
+          type: integer
+          minimum: 0
+        dead_work_item:
+          type: integer
+          minimum: 0
+    TodoSnapshotView:
+      type: object
+      required: [items, counts]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/TodoItem'
+        counts:
+          $ref: '#/components/schemas/TodoCounts'
+          description: limit 前的按 kind 计数（6 个 key 全返回；非 admin 的 admin-only 组为 0）
+
+    EvalSample:
+      type: object
+      description: 评测样本计数（非负；服务端校验 covered<=confirmed 等物理约束）
+      required:
+        - confirmed_requirements
+        - covered_requirements
+        - impact_expected
+        - impact_hit
+        - impact_selected
+        - injected_failures
+        - correct_classifications
+        - ai_issues
+        - true_positive_issues
+        - supplement_cases
+        - supplement_hits
+      properties:
+        confirmed_requirements:
+          type: integer
+          minimum: 0
+        covered_requirements:
+          type: integer
+          minimum: 0
+        impact_expected:
+          type: integer
+          minimum: 0
+        impact_hit:
+          type: integer
+          minimum: 0
+        impact_selected:
+          type: integer
+          minimum: 0
+        injected_failures:
+          type: integer
+          minimum: 0
+        correct_classifications:
+          type: integer
+          minimum: 0
+        ai_issues:
+          type: integer
+          minimum: 0
+        true_positive_issues:
+          type: integer
+          minimum: 0
+        supplement_cases:
+          type: integer
+          minimum: 0
+        supplement_hits:
+          type: integer
+          minimum: 0
+        visual_injected:
+          type: integer
+          minimum: 0
+          nullable: true
+        visual_correct:
+          type: integer
+          minimum: 0
+          nullable: true
+    EvalMetricDetail:
+      type: object
+      required: [numerator, denominator, threshold_passed, regressed, reason]
+      properties:
+        numerator:
+          type: integer
+          minimum: 0
+        denominator:
+          type: integer
+          minimum: 0
+        threshold_passed:
+          type: boolean
+        baseline:
+          type: number
+          nullable: true
+        regressed:
+          type: boolean
+        reason:
+          type: string
+          enum: [ok, below_threshold, above_threshold, baseline_regression]
+        zero_denominator:
+          type: boolean
+    EvalMetricView:
+      type: object
+      required: [name, value, threshold, passed, detail]
+      properties:
+        name:
+          type: string
+          description: 6+1 指标名（服务端只接受 spec §5.3 的名称）
+        value:
+          type: number
+        threshold:
+          type: number
+          description: 真实 LLM 报告阈值
+        passed:
+          type: boolean
+          description: threshold_passed && !regressed
+        detail:
+          $ref: '#/components/schemas/EvalMetricDetail'
+    EvalRunView:
+      type: object
+      required:
+        - id
+        - mode
+        - corpus_version
+        - model
+        - status
+        - summary
+        - metrics
+        - started_at
+        - finished_at
+        - created_at
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        mode:
+          type: string
+          enum: [real_llm]
+        corpus_version:
+          type: string
+        model:
+          type: string
+          description: 真实模型名（如 deepseek-flash），不得为 fake
+        status:
+          type: string
+          enum: [running, passed, failed, error]
+        summary:
+          type: object
+          additionalProperties: true
+        metrics:
+          type: array
+          items:
+            $ref: '#/components/schemas/EvalMetricView'
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        finished_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+    EvalRunCreateRequest:
+      type: object
+      required: [mode, corpus_version]
+      properties:
+        mode:
+          type: string
+          enum: [real_llm]
+          description: P6 只实现真实 LLM 轨；不接受 fake
+        corpus_version:
+          type: string
+          minLength: 1
+        model:
+          type: string
+        status:
+          type: string
+          description: 仅声明 `error` 生效；客户端传 passed/failed 被忽略（不 400），其余由服务端派生
+        sample:
+          $ref: '#/components/schemas/EvalSample'
+        baseline:
+          type: object
+          additionalProperties:
+            type: number
+        summary:
+          type: object
+          additionalProperties: true
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        finished_at:
+          type: string
+          format: date-time
+          nullable: true
+    EvalSummary:
+      type: object
+      required: [id, mode, status, created_at, metrics_count, metrics_passed]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        mode:
+          type: string
+          enum: [real_llm]
+        status:
+          type: string
+          enum: [running, passed, failed, error]
+        created_at:
+          type: string
+          format: date-time
+        metrics_count:
+          type: integer
+          minimum: 0
+        metrics_passed:
+          type: integer
+          minimum: 0
+    EvalRunListEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/ListEnvelope'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/EvalRunView'
+    OperationalMetric:
+      type: object
+      required: [name, value, numerator, denominator, available, definition]
+      properties:
+        name:
+          type: string
+          enum:
+            - requirement_closure_rate
+            - case_confirmation_rate
+            - execution_pass_rate
+            - issue_validity_rate
+            - evidence_completeness_rate
+            - context_compaction_count
+            - task_failure_retry_rate
+        value:
+          type: number
+          nullable: true
+          description: 分母 0 时为 null（不显示 0 假数据）
+        numerator:
+          type: integer
+          minimum: 0
+        denominator:
+          type: integer
+          minimum: 0
+        available:
+          type: boolean
+        definition:
+          type: string
+          description: 口径文案（UI tooltip）
+    QualityOverviewView:
+      type: object
+      required: [scope, generated_at, operational, latest_eval]
+      properties:
+        scope:
+          type: object
+          required: [version_id]
+          properties:
+            version_id:
+              type: string
+              pattern: '^[0-9]+$'
+              nullable: true
+        generated_at:
+          type: string
+          format: date-time
+        operational:
+          type: array
+          items:
+            $ref: '#/components/schemas/OperationalMetric'
+        latest_eval:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/EvalSummary'
+
+    GlobalIssueView:
+      description: 全局问题只读行（IssueView + version_title + 深链 url）
+      allOf:
+        - $ref: '#/components/schemas/IssueView'
+        - type: object
+          required: [version_title, url]
+          properties:
+            version_title:
+              type: string
+            url:
+              type: string
+              description: '`/versions/{vid}?tab=issues&issue={id}`'
+    GlobalIssueListEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/ListEnvelope'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/GlobalIssueView'
+    GlobalReportView:
+      description: 全局报告只读行（ReportView + version_title + 深链 url；不返回 content/内部路径）
+      allOf:
+        - $ref: '#/components/schemas/ReportView'
+        - type: object
+          required: [version_title, url]
+          properties:
+            version_title:
+              type: string
+            url:
+              type: string
+              description: '`/versions/{vid}?tab=reports&report={id}`'
+    GlobalReportListEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/ListEnvelope'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/GlobalReportView'
+
+    AgentRunStats:
+      type: object
+      required:
+        - run_count
+        - done_count
+        - failed_count
+        - aborted_count
+        - interrupted_count
+        - success_rate
+        - last_run_at
+      properties:
+        run_count:
+          type: integer
+          minimum: 0
+        done_count:
+          type: integer
+          minimum: 0
+        failed_count:
+          type: integer
+          minimum: 0
+        aborted_count:
+          type: integer
+          minimum: 0
+        interrupted_count:
+          type: integer
+          minimum: 0
+        success_rate:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: done/(done+failed)；0 分母为 0；aborted/interrupted 不进分母
+        last_run_at:
+          type: string
+          format: date-time
+          nullable: true
+    CatalogProfile:
+      type: object
+      required:
+        - profile_key
+        - name
+        - team
+        - order
+        - mode
+        - model
+        - enabled
+        - budgets
+        - allowed_tools_count
+        - prompt_version
+        - prompt_updated_at
+        - updated_at
+        - stats
+      properties:
+        profile_key:
+          type: string
+        name:
+          type: string
+        team:
+          type: string
+          enum: [clarification, design, execution, delivery, steward, code]
+        order:
+          type: integer
+          minimum: 0
+        mode:
+          type: string
+          enum: [agent]
+        model:
+          type: string
+          nullable: true
+        enabled:
+          type: boolean
+        budgets:
+          $ref: '#/components/schemas/ProfileBudgets'
+        allowed_tools_count:
+          type: integer
+          minimum: 0
+        prompt_version:
+          type: integer
+          minimum: 1
+        prompt_updated_at:
+          type: string
+          format: date-time
+          nullable: true
+        updated_at:
+          type: string
+          format: date-time
+        stats:
+          $ref: '#/components/schemas/AgentRunStats'
+    AgentTeam:
+      type: object
+      required: [team, label, profile_keys]
+      properties:
+        team:
+          type: string
+          enum: [clarification, design, execution, delivery, steward, code]
+        label:
+          type: string
+        profile_keys:
+          type: array
+          items:
+            type: string
+        note:
+          type: string
+          description: 例如 code 为确定性 worker，无 agent profile
+    AgentCatalogView:
+      type: object
+      required: [profiles, teams]
+      properties:
+        profiles:
+          type: array
+          items:
+            $ref: '#/components/schemas/CatalogProfile'
+        teams:
+          type: array
+          items:
+            $ref: '#/components/schemas/AgentTeam'
+    AgentRunView:
+      type: object
+      required:
+        - id
+        - profile_key
+        - work_item_id
+        - work_type
+        - version_id
+        - conversation_id
+        - status
+        - terminal_reason
+        - turns
+        - usage
+        - started_at
+        - finished_at
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        profile_key:
+          type: string
+        work_item_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        work_type:
+          type: string
+          nullable: true
+        version_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        version_title:
+          type: string
+          description: 可选；版本已删除/无标题时省略
+        conversation_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        status:
+          type: string
+          enum: [running, done, failed, aborted, interrupted]
+        terminal_reason:
+          type: string
+          nullable: true
+        turns:
+          type: integer
+          minimum: 0
+        usage:
+          type: object
+          additionalProperties: true
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        finished_at:
+          type: string
+          format: date-time
+          nullable: true
+    AgentRunListEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/ListEnvelope'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/AgentRunView'
+    AgentCenterQualityView:
+      type: object
+      required: [latest, run_stats]
+      properties:
+        latest:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/EvalSummary'
+        run_stats:
+          $ref: '#/components/schemas/AgentRunStats'
+
+    ProfileBudgets:
+      type: object
+      required: [max_turns, soft_seconds, hard_seconds]
+      properties:
+        max_turns:
+          type: integer
+          minimum: 0
+        soft_seconds:
+          type: integer
+          minimum: 0
+        hard_seconds:
+          type: integer
+          minimum: 0
+    ProfileView:
+      type: object
+      required:
+        - id
+        - key
+        - name
+        - system_prompt
+        - allowed_tools
+        - model
+        - budgets
+        - enabled
+        - prompt_version
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        key:
+          type: string
+        name:
+          type: string
+        system_prompt:
+          type: string
+        allowed_tools:
+          type: array
+          items:
+            type: string
+        model:
+          type: string
+          nullable: true
+        budgets:
+          $ref: '#/components/schemas/ProfileBudgets'
+        enabled:
+          type: boolean
+        prompt_version:
+          type: integer
+          minimum: 1
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    PromptVariable:
+      type: object
+      required: [name, description, example, source]
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        example:
+          type: string
+        source:
+          type: string
+          enum: [runtime]
+    ProfileDetailView:
+      type: object
+      required: [profile, default_system_prompt, variables, prompt_version]
+      properties:
+        profile:
+          $ref: '#/components/schemas/ProfileView'
+        default_system_prompt:
+          type: string
+        variables:
+          type: array
+          items:
+            $ref: '#/components/schemas/PromptVariable'
+        prompt_version:
+          type: integer
+          minimum: 1
+    ProfilePatchRequest:
+      type: object
+      description: 至少一个可写字段；未出现的字段不变。enabled/name/system_prompt/key 不可写。
+      properties:
+        model:
+          type: string
+          nullable: true
+          description: null/空=默认模型；非空必须命中默认 LLM 配置模型
+        budgets:
+          $ref: '#/components/schemas/ProfileBudgets'
+        allowed_tools:
+          type: array
+          items:
+            type: string
+    ProfilePatchResponse:
+      type: object
+      required: [data, changed]
+      properties:
+        data:
+          $ref: '#/components/schemas/ProfileView'
+        changed:
+          type: boolean
+    PromptSaveRequest:
+      type: object
+      required: [system_prompt]
+      properties:
+        system_prompt:
+          type: string
+          minLength: 1
+          maxLength: 32768
+          description: 非空、含 [profile:<key>]、模板语法/变量白名单校验通过
+        note:
+          type: string
+        expected_version:
+          type: integer
+          minimum: 1
+          description: 可选乐观锁；不匹配 409 state_conflict
+    PromptMutationView:
+      type: object
+      required: [profile, version, changed]
+      properties:
+        profile:
+          $ref: '#/components/schemas/ProfileView'
+        version:
+          type: integer
+          minimum: 1
+        changed:
+          type: boolean
+          description: 内容与当前正文相同 no-op 时为 false（不插版本）
+    PromptRestoreRequest:
+      type: object
+      required: [version]
+      properties:
+        version:
+          type: integer
+          minimum: 1
+    PromptRevisionView:
+      type: object
+      required: [version, system_prompt, note, source, actor_id, created_at]
+      properties:
+        version:
+          type: integer
+          minimum: 1
+        system_prompt:
+          type: string
+        note:
+          type: string
+          nullable: true
+        source:
+          type: string
+          enum: [seed, admin, reset]
+        actor_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+    PromptRevisionListEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/ListEnvelope'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/PromptRevisionView'
+    PromptPreviewRequest:
+      type: object
+      properties:
+        system_prompt:
+          type: string
+          description: 空=使用当前正文
+        sample:
+          type: object
+          additionalProperties:
+            type: string
+          description: 变量示例值覆盖
+    PromptPreviewView:
+      type: object
+      required: [rendered]
+      properties:
+        rendered:
+          type: string
+    AgentToolView:
+      type: object
+      required: [name, description, parameters]
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        parameters:
+          type: object
+          additionalProperties: true
+          description: 工具 JSON Schema（只读目录；不执行）
+
+    ChainCaseRunStatusCounts:
+      type: object
+      properties:
+        passed:
+          type: integer
+          minimum: 0
+        failed:
+          type: integer
+          minimum: 0
+        blocked:
+          type: integer
+          minimum: 0
+        inconclusive:
+          type: integer
+          minimum: 0
+        skipped:
+          type: integer
+          minimum: 0
+        interrupted:
+          type: integer
+          minimum: 0
+    ChainIssueSeverityCounts:
+      type: object
+      properties:
+        major:
+          type: integer
+          minimum: 0
+        minor:
+          type: integer
+          minimum: 0
+        trivial:
+          type: integer
+          minimum: 0
+    ChainIssueStatusCounts:
+      type: object
+      properties:
+        open:
+          type: integer
+          minimum: 0
+        confirmed:
+          type: integer
+          minimum: 0
+        dismissed:
+          type: integer
+          minimum: 0
+        merged:
+          type: integer
+          minimum: 0
+    ChainCoverageCounts:
+      type: object
+      properties:
+        requirements:
+          type: integer
+          minimum: 0
+        covered:
+          type: integer
+          minimum: 0
+        uncovered:
+          type: integer
+          minimum: 0
+    ChainTruncatedLayers:
+      type: object
+      properties:
+        requirements:
+          type: boolean
+        cases:
+          type: boolean
+        case_runs:
+          type: boolean
+        issues:
+          type: boolean
+        reports:
+          type: boolean
+    ChainNodeMeta:
+      type: object
+      description: |
+        P6 类型化可选 meta（按 kind 取子集）；保留 additionalProperties=true 兼容 P4 客户端。
+        requirement: uncovered/case_count/executed_count/failed_count；
+        scenario: requirement_id/case_count；case_version: scenario_id/step_count/assertion_count/stale；
+        wave: wave_status/trigger；case_run: attempt/failure_class/evidence_count/duration_ms；
+        issue: severity/issue_status/category/evidence_count/code_ref_count/merged_into_id；
+        report: report_kind/report_status/revision；closure: closure_status。
+      additionalProperties: true
+      properties:
+        uncovered:
+          type: boolean
+        case_count:
+          type: integer
+          minimum: 0
+        executed_count:
+          type: integer
+          minimum: 0
+        failed_count:
+          type: integer
+          minimum: 0
+        requirement_id:
+          type: string
+          pattern: '^[0-9]+$'
+        scenario_id:
+          type: string
+          pattern: '^[0-9]+$'
+        step_count:
+          type: integer
+          minimum: 0
+        assertion_count:
+          type: integer
+          minimum: 0
+        stale:
+          type: boolean
+        wave_status:
+          type: string
+        trigger:
+          type: string
+        attempt:
+          type: integer
+          minimum: 0
+        failure_class:
+          type: string
+        evidence_count:
+          type: integer
+          minimum: 0
+        duration_ms:
+          type: integer
+          minimum: 0
+        severity:
+          type: string
+        issue_status:
+          type: string
+        category:
+          type: string
+        code_ref_count:
+          type: integer
+          minimum: 0
+        merged_into_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        report_kind:
+          type: string
+        report_status:
+          type: string
+        revision:
+          type: integer
+          minimum: 1
+        closure_status:
+          type: string

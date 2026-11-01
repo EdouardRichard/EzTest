@@ -1,0 +1,13 @@
+{
+  "corpus_version": "v02-2026-11-01.1",
+  "true_positives": [
+    { "title": "订单状态筛选结果未刷新" },
+    { "title": "退款入口权限判断错误" },
+    { "title": "退款入口金额展示错误" }
+  ],
+  "expected_counts": {
+    "ai_issues": 3,
+    "true_positive_issues": 3
+  },
+  "note": "ai_issue_false_positive_rate=(ai_issues-true_positive_issues)/ai_issues；本语料期望 0 误报。"
+}

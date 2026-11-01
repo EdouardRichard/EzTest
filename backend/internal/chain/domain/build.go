@@ -69,6 +69,15 @@ func BuildChain(src SourceGraph, f ChainFilter, b Budget, snapshotCursor int64, 
 		b.MaxNodes = f.Limit
 	}
 
+	// P6: one latest case run per case version. The rule is frozen by spec
+	// §4.3.6: newest (wave_id DESC, id DESC); a case version without a run has
+	// no case_run node.
+	src.CaseRuns = latestCaseRunsPerCaseVersion(src.CaseRuns)
+	// P6: requirement_limit is a full override (not the lower-only Limit).
+	if f.RequirementLimit > 0 {
+		b.MaxRequirements = f.RequirementLimit
+	}
+
 	graph := newChainGraph(src)
 	keep := graph.filter(f)
 	protected := map[string]bool{}
@@ -80,12 +89,20 @@ func BuildChain(src SourceGraph, f ChainFilter, b Budget, snapshotCursor int64, 
 		keep[id] = true
 	}
 
+	// P6 typed meta and coverage describe the filtered graph before any budget
+	// truncation, matching the legacy Counts contract.
+	stats := graph.analyze(keep)
+	graph.enrichTypedMeta(stats)
+
 	// Counts describe the filtered graph before any budget truncation (spec
 	// §8.3: counts are the filtered counts, truncation is reported separately).
 	counts := graph.counts(keep)
+	typedCounts := graph.typedCounts(keep, stats)
+	preBudget := cloneSet(keep)
 
 	requirementTruncated, keep := graph.applyRequirementBudget(keep, b.MaxRequirements, protected)
 	nodeTruncated, keep := graph.applyNodeBudget(keep, b.MaxNodes, protected)
+	truncatedLayers := graph.truncatedLayers(preBudget, keep)
 
 	edges := graph.inducedEdges(keep)
 	edgeTruncated, edges := applyEdgeBudget(edges, b.MaxEdges, focusEdges)
@@ -114,8 +131,308 @@ func BuildChain(src SourceGraph, f ChainFilter, b Budget, snapshotCursor int64, 
 			MaxRequirements: b.MaxRequirements,
 			Reason:          reason,
 		},
-		Replay: replayInfo(f),
+		Replay:              replayInfo(f),
+		CaseRunStatusCounts: typedCounts.CaseRunStatusCounts,
+		IssueSeverityCounts: typedCounts.IssueSeverityCounts,
+		IssueStatusCounts:   typedCounts.IssueStatusCounts,
+		Coverage:            typedCounts.Coverage,
+		TruncatedLayers:     truncatedLayers,
 	}
+}
+
+// latestCaseRunsPerCaseVersion applies the frozen P6 latest-attempt rule: one
+// case_run per case_version, ordered by (wave_id DESC, id DESC). Runs without a
+// case version cannot be grouped and are kept unchanged.
+func latestCaseRunsPerCaseVersion(runs []Node) []Node {
+	latest := make(map[int64]Node, len(runs))
+	passthrough := make([]Node, 0, len(runs))
+	for _, run := range runs {
+		if run.CaseVersionID == nil || *run.CaseVersionID <= 0 {
+			passthrough = append(passthrough, run)
+			continue
+		}
+		current, ok := latest[*run.CaseVersionID]
+		if !ok || caseRunIsNewer(run, current) {
+			latest[*run.CaseVersionID] = run
+		}
+	}
+	ids := make([]int64, 0, len(latest))
+	for id := range latest {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	out := make([]Node, 0, len(passthrough)+len(latest))
+	out = append(out, passthrough...)
+	for _, id := range ids {
+		out = append(out, latest[id])
+	}
+	return out
+}
+
+func caseRunIsNewer(candidate, current Node) bool {
+	candidateWave, currentWave := nodeWaveRank(candidate), nodeWaveRank(current)
+	if candidateWave != currentWave {
+		return candidateWave > currentWave
+	}
+	return nodeRefInt64(candidate) > nodeRefInt64(current)
+}
+
+func nodeWaveRank(node Node) int64 {
+	if node.WaveID == nil {
+		return 0
+	}
+	return *node.WaveID
+}
+
+// requirementLayerStats is the per-requirement case/execution tally used by the
+// typed requirement meta and counts.coverage.
+type requirementLayerStats struct {
+	caseCount     int
+	executedCount int
+	failedCount   int
+}
+
+// chainLayerStats is the filtered-graph tally shared by typed meta and counts.
+// It is computed before budget truncation.
+type chainLayerStats struct {
+	requirements  map[int64]*requirementLayerStats
+	scenarioCases map[int64]int
+	coverage      CoverageCounts
+}
+
+// analyze computes the P6 coverage/execution tallies over the filtered keep set.
+func (g *chainGraph) analyze(keep map[string]bool) chainLayerStats {
+	stats := chainLayerStats{
+		requirements:  make(map[int64]*requirementLayerStats, len(g.byKind[NodeRequirement])),
+		scenarioCases: make(map[int64]int, len(g.byKind[NodeScenario])),
+	}
+	for _, id := range g.byKind[NodeRequirement] {
+		if !keep[id] {
+			continue
+		}
+		if ref, ok := parsePositiveID(g.nodes[id].RefID); ok {
+			stats.requirements[ref] = &requirementLayerStats{}
+		}
+	}
+	for _, id := range g.byKind[NodeCaseVersion] {
+		if !keep[id] {
+			continue
+		}
+		node := g.nodes[id]
+		if node.RequirementID != nil {
+			if entry := stats.requirements[*node.RequirementID]; entry != nil {
+				entry.caseCount++
+			}
+		}
+		if node.ScenarioID != nil {
+			stats.scenarioCases[*node.ScenarioID]++
+		}
+	}
+	for _, id := range g.byKind[NodeCaseRun] {
+		if !keep[id] {
+			continue
+		}
+		node := g.nodes[id]
+		if node.CaseVersionID == nil {
+			continue
+		}
+		caseVersion, ok := g.nodes[NodeID(NodeCaseVersion, *node.CaseVersionID)]
+		if !ok || !keep[NodeID(NodeCaseVersion, *node.CaseVersionID)] || caseVersion.RequirementID == nil {
+			continue
+		}
+		entry := stats.requirements[*caseVersion.RequirementID]
+		if entry == nil {
+			continue
+		}
+		entry.executedCount++
+		if strings.EqualFold(node.Status, "failed") {
+			entry.failedCount++
+		}
+	}
+	for _, entry := range stats.requirements {
+		stats.coverage.Requirements++
+		if entry.caseCount > 0 {
+			stats.coverage.Covered++
+		} else {
+			stats.coverage.Uncovered++
+		}
+	}
+	return stats
+}
+
+type chainTypedCounts struct {
+	CaseRunStatusCounts CaseRunStatusCounts
+	IssueSeverityCounts IssueSeverityCounts
+	IssueStatusCounts   IssueStatusCounts
+	Coverage            CoverageCounts
+}
+
+// typedCounts projects the filtered keep set onto the P6 counts objects.
+func (g *chainGraph) typedCounts(keep map[string]bool, stats chainLayerStats) chainTypedCounts {
+	out := chainTypedCounts{Coverage: stats.coverage}
+	for id := range keep {
+		node := g.nodes[id]
+		switch node.Kind {
+		case NodeCaseRun:
+			switch strings.ToLower(strings.TrimSpace(node.Status)) {
+			case "passed":
+				out.CaseRunStatusCounts.Passed++
+			case "failed":
+				out.CaseRunStatusCounts.Failed++
+			case "blocked":
+				out.CaseRunStatusCounts.Blocked++
+			case "inconclusive":
+				out.CaseRunStatusCounts.Inconclusive++
+			case "skipped":
+				out.CaseRunStatusCounts.Skipped++
+			case "interrupted":
+				out.CaseRunStatusCounts.Interrupted++
+			}
+		case NodeIssue:
+			switch strings.ToLower(strings.TrimSpace(metaString(node.Meta, "severity"))) {
+			case "major":
+				out.IssueSeverityCounts.Major++
+			case "minor":
+				out.IssueSeverityCounts.Minor++
+			case "trivial":
+				out.IssueSeverityCounts.Trivial++
+			}
+			switch strings.ToLower(strings.TrimSpace(node.Status)) {
+			case "open":
+				out.IssueStatusCounts.Open++
+			case "confirmed":
+				out.IssueStatusCounts.Confirmed++
+			case "dismissed":
+				out.IssueStatusCounts.Dismissed++
+			case "merged":
+				out.IssueStatusCounts.Merged++
+			}
+		}
+	}
+	return out
+}
+
+// enrichTypedMeta writes the P6 kind-specific meta fields documented by the
+// frozen ChainNodeMeta schema. additionalProperties stays compatible with P4
+// clients because existing keys are preserved.
+func (g *chainGraph) enrichTypedMeta(stats chainLayerStats) {
+	for id, node := range g.nodes {
+		switch node.Kind {
+		case NodeRequirement:
+			entry := &requirementLayerStats{}
+			if ref, ok := parsePositiveID(node.RefID); ok {
+				if found, exists := stats.requirements[ref]; exists {
+					entry = found
+				}
+			}
+			setMetaInt(&node, "case_count", entry.caseCount)
+			setMetaInt(&node, "executed_count", entry.executedCount)
+			setMetaInt(&node, "failed_count", entry.failedCount)
+			setMetaBool(&node, "uncovered", entry.caseCount == 0)
+		case NodeScenario:
+			if node.RequirementID != nil {
+				setMetaString(&node, "requirement_id", strconv.FormatInt(*node.RequirementID, 10))
+			}
+			if ref, ok := parsePositiveID(node.RefID); ok {
+				setMetaInt(&node, "case_count", stats.scenarioCases[ref])
+			}
+		case NodeCaseVersion:
+			if node.ScenarioID != nil {
+				setMetaString(&node, "scenario_id", strconv.FormatInt(*node.ScenarioID, 10))
+			}
+			setMetaBool(&node, "stale", node.Status == "stale" || node.Status == "superseded")
+		case NodeWave:
+			setMetaString(&node, "wave_status", node.Status)
+		case NodeCaseRun:
+			if value, ok := metaNumber(node.Meta, "attempt"); ok {
+				setMetaInt(&node, "attempt", int(value))
+			} else if value, ok := metaNumber(node.Meta, "attempts"); ok {
+				setMetaInt(&node, "attempt", int(value))
+			}
+		case NodeIssue:
+			setMetaString(&node, "issue_status", node.Status)
+			if node.MergedIntoID != nil {
+				setMetaString(&node, "merged_into_id", strconv.FormatInt(*node.MergedIntoID, 10))
+			} else if value := metaString(node.Meta, "merged_into_id"); value != "" {
+				setMetaString(&node, "merged_into_id", value)
+			}
+			// evidence_count/code_ref_count are provider tallies; keep them as
+			// numbers and let the DTO preserve the type.
+		case NodeReport:
+			if kind := metaString(node.Meta, "report_kind"); kind != "" {
+				setMetaString(&node, "report_kind", kind)
+			} else if kind := metaString(node.Meta, "kind"); kind != "" {
+				setMetaString(&node, "report_kind", kind)
+			}
+			setMetaString(&node, "report_status", node.Status)
+			if value, ok := metaNumber(node.Meta, "revision"); ok {
+				setMetaInt(&node, "revision", int(value))
+			} else if value, ok := metaNumber(node.Meta, "current_revision"); ok {
+				setMetaInt(&node, "revision", int(value))
+			}
+		case NodeClosure:
+			setMetaString(&node, "closure_status", node.Status)
+		}
+		g.nodes[id] = node
+	}
+}
+
+func setMetaString(node *Node, key, value string) {
+	if value == "" {
+		return
+	}
+	if node.Meta == nil {
+		node.Meta = map[string]any{}
+	}
+	node.Meta[key] = value
+}
+
+func setMetaInt(node *Node, key string, value int) {
+	if node.Meta == nil {
+		node.Meta = map[string]any{}
+	}
+	node.Meta[key] = value
+}
+
+func setMetaBool(node *Node, key string, value bool) {
+	if node.Meta == nil {
+		node.Meta = map[string]any{}
+	}
+	node.Meta[key] = value
+}
+
+func metaNumber(meta map[string]any, key string) (int64, bool) {
+	if meta == nil {
+		return 0, false
+	}
+	value, ok := meta[key]
+	if !ok || value == nil {
+		return 0, false
+	}
+	return toInt64(value)
+}
+
+// truncatedLayers reports which P6 layers lost at least one node to a budget.
+func (g *chainGraph) truncatedLayers(before, after map[string]bool) TruncatedLayers {
+	var layers TruncatedLayers
+	for id := range before {
+		if after[id] {
+			continue
+		}
+		switch g.nodes[id].Kind {
+		case NodeRequirement:
+			layers.Requirements = true
+		case NodeCaseVersion:
+			layers.Cases = true
+		case NodeCaseRun:
+			layers.CaseRuns = true
+		case NodeIssue:
+			layers.Issues = true
+		case NodeReport:
+			layers.Reports = true
+		}
+	}
+	return layers
 }
 
 var nodeKindOrder = map[NodeKind]int{
@@ -610,7 +927,52 @@ func nodeMatchesFilter(node Node, f ChainFilter) bool {
 	if f.Result != "" && !strings.EqualFold(node.Result, f.Result) {
 		return false
 	}
+	// P6 title filter: q matches requirement/scenario/case-version labels only.
+	// It never deletes context nodes of other kinds; induced edges are trimmed
+	// later because one endpoint may disappear.
+	if f.Q != "" && isTitleNodeKind(node.Kind) &&
+		!strings.Contains(strings.ToLower(node.Label), strings.ToLower(f.Q)) {
+		return false
+	}
+	// P6 abnormal-only: only case_run nodes are classified by result status.
+	if f.AbnormalOnly && node.Kind == NodeCaseRun && !isAbnormalCaseRunStatus(node.Status) {
+		return false
+	}
+	// P6 issue filters prune only issue nodes.
+	if f.IssueStatus != "" && node.Kind == NodeIssue && !strings.EqualFold(node.Status, f.IssueStatus) {
+		return false
+	}
+	if f.IssueSeverity != "" && node.Kind == NodeIssue &&
+		!strings.EqualFold(metaString(node.Meta, "severity"), f.IssueSeverity) {
+		return false
+	}
 	return true
+}
+
+func isTitleNodeKind(kind NodeKind) bool {
+	switch kind {
+	case NodeRequirement, NodeScenario, NodeCaseVersion:
+		return true
+	default:
+		return false
+	}
+}
+
+func isAbnormalCaseRunStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "failed", "blocked", "inconclusive", "interrupted":
+		return true
+	default:
+		return false
+	}
+}
+
+func metaString(meta map[string]any, key string) string {
+	if meta == nil {
+		return ""
+	}
+	value, _ := meta[key].(string)
+	return value
 }
 
 func containsID(ids []int64, wanted int64) bool {

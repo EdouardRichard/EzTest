@@ -1,51 +1,80 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-    Runs the P8 evaluation gate (design spec §9.1/D61).
+    P6 real-LLM evaluation report track (spec section 5.4, P6-D-12/P6-D-21).
 
 .DESCRIPTION
-    Prepares an isolated eztest_eval database, builds and starts the API, the
-    deterministic fake LLM, the fixture target and the Playwright executor, then
-    drives the whole clarification/design/review/execution/supplement/failure/
-    issue/report chain. Metrics are derived from the real API data and the
-    committed eval/ground-truth files; the result is written through the admin
-    API (POST /api/quality/eval-runs), compared with eval/baseline.json and
-    summarised in .tmp/p8-eval/*.json.
+    This is the 0.2 replacement of the 0.1 P8 deterministic evaluation gate.
+    There is exactly one evaluation track: real_llm. Fake / deterministic modes
+    do not exist, and no fake result can be recorded through this script.
 
-    -DryRun validates the corpus, the baseline, the database target and the
-    toolchain without starting a service or calling an LLM. It is the hook used
-    by scripts/acceptance.ps1 -StaticOnly.
+    -DryRun is a static preflight: it validates the committed eval/v02 corpus,
+    ground truth and baseline against the frozen P6 contract, the DB target,
+    the LLM configuration and the toolchain. It never starts a service or
+    calls an LLM.
 
-    -RealLLM is gated by EZTEST_RUN_REAL_LLM=1 and records a report-only run
-    (real model, real executor); it never gates a release.
+    -Mode real-llm reads an observation produced by the P6 acceptance flow
+    (real DeepSeek + real Chrome), derives the sample counts from that real
+    data plus the committed ground truth, and POSTs mode=real_llm to
+    /api/quality/eval-runs. Thresholds and baseline are report-only: a failed
+    metric or a regression never makes this script fail. Only a broken
+    API/DB/observation/authentication is an error.
 
-    The script never prints .env credentials, the database URL or the LLM key.
+    Outputs: .tmp/p6-eval/result.json and .tmp/p6-eval/observation.json.
+    The script never prints .env credentials, database URLs or LLM keys.
+
+.PARAMETER Mode
+    Only real-llm is accepted. No fake/deterministic mode exists.
 
 .PARAMETER DryRun
-    Static preflight only (corpus/baseline/DB target/toolchain); no LLM call.
+    Static/database/toolchain preflight only; no LLM call and no write.
 
-.PARAMETER RealLLM
-    Gated real-LLM report. Requires EZTEST_RUN_REAL_LLM=1 and llm_* in .env.
+.PARAMETER ApiBaseUrl
+    API origin. Defaults to EZTEST_API_BASE_URL, then
+    http://127.0.0.1:<EZTEST_API_PORT or 13333>.
+
+.PARAMETER ObservationFile
+    Real observation JSON from the P6 acceptance flow. Defaults to
+    EZTEST_EVAL_OBSERVATION, then .tmp/p6-acceptance/observation.json.
+
+.PARAMETER BearerToken
+    Admin bearer token. Defaults to EZTEST_ADMIN_TOKEN; otherwise the script
+    logs in with the admin username/password from .env (development seed
+    defaults admin/admin123 when absent).
+
+.PARAMETER RequestTimeoutSeconds
+    Per-request HTTP timeout.
 
 .NOTES
     Compatible with Windows PowerShell 5.1 and PowerShell 7+.
 #>
 [CmdletBinding()]
 param(
+    [ValidateSet("real-llm")]
+    [string]$Mode = "real-llm",
     [switch]$DryRun,
-    [switch]$RealLLM
+    [string]$ApiBaseUrl = "",
+    [string]$ObservationFile = "",
+    [string]$BearerToken = "",
+    [int]$RequestTimeoutSeconds = 60
 )
 
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$backendDir = Join-Path $repoRoot "backend"
-$scriptsDir = Join-Path $repoRoot "scripts"
-$evalRoot = Join-Path $repoRoot "eval"
+$evalRoot = Join-Path $repoRoot "eval\v02"
 $corpusDir = Join-Path $evalRoot "corpus"
 $truthDir = Join-Path $evalRoot "ground-truth"
-$tmpRoot = Join-Path $repoRoot ".tmp"
-$tmpDir = Join-Path $tmpRoot "p8-eval"
+$tmpDir = Join-Path $repoRoot ".tmp\p6-eval"
+
+$script:RepoRoot = $repoRoot
+$script:TmpDir = $tmpDir
+$script:LogPath = Join-Path $tmpDir "eval.log"
+$script:ApiBase = ""
+$script:BearerToken = $BearerToken
+$script:ObservationFile = $ObservationFile
+$script:TimeoutSeconds = $RequestTimeoutSeconds
+$script:DryRun = [bool]$DryRun
 
 $metricNames = @(
     "design_coverage",
@@ -53,23 +82,68 @@ $metricNames = @(
     "impact_precision",
     "classification_accuracy",
     "issue_false_positive_rate",
-    "supplement_hit_rate"
+    "supplement_hit_rate",
+    "visual_classification_accuracy"
 )
+
+# Frozen spec section 5.3 real_llm report thresholds.
+$specThresholds = [ordered]@{
+    design_coverage                = 0.80
+    impact_recall                  = 0.70
+    impact_precision               = 0.60
+    classification_accuracy        = 0.80
+    issue_false_positive_rate      = 0.15
+    supplement_hit_rate            = 0.50
+    visual_classification_accuracy = 0.80
+}
+
+function Write-EvalLog {
+    param([string]$Message)
+    if ($script:DryRun) { return }
+    if ([string]::IsNullOrWhiteSpace($script:LogPath)) { return }
+    try {
+        $parent = Split-Path -Parent $script:LogPath
+        if (-not [string]::IsNullOrWhiteSpace($parent) -and -not (Test-Path -LiteralPath $parent)) {
+            New-Item -ItemType Directory -Force -Path $parent | Out-Null
+        }
+        $line = "[{0}] {1}`r`n" -f (Get-Date).ToUniversalTime().ToString("o"), $Message
+        $encoding = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::AppendAllText($script:LogPath, $line, $encoding)
+    } catch {
+        # Logging must never hide the original evaluation error.
+    }
+}
 
 function Write-Step {
     param([string]$Message)
     Write-Host ""
     Write-Host "==> $Message" -ForegroundColor Cyan
+    Write-EvalLog -Message "STEP $Message"
 }
 
-function Write-LogTail {
-    param([string]$Path, [string]$Label, [int]$Lines = 60)
-    if (-not (Test-Path -LiteralPath $Path)) { return }
-    Write-Host ""
-    Write-Host "--- $Label (last $Lines lines) ---" -ForegroundColor Yellow
-    Get-Content -LiteralPath $Path -Tail $Lines -Encoding UTF8 -ErrorAction SilentlyContinue | ForEach-Object {
-        Write-Host $_
-    }
+function Write-Info {
+    param([string]$Message)
+    Write-Host "    $Message"
+    Write-EvalLog -Message "INFO $Message"
+}
+
+function Write-WarnLine {
+    param([string]$Message)
+    Write-Host "    WARN: $Message" -ForegroundColor Yellow
+    Write-EvalLog -Message "WARN $Message"
+}
+
+function Write-ErrorLine {
+    param([string]$Message)
+    Write-Host "ERROR: $Message" -ForegroundColor Red
+    Write-EvalLog -Message "ERROR $Message"
+}
+
+function Resolve-RepoPath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
+    if ([System.IO.Path]::IsPathRooted($Path)) { return $Path }
+    return (Join-Path $repoRoot $Path)
 }
 
 function Read-JsonFile {
@@ -80,40 +154,97 @@ function Read-JsonFile {
     try {
         return (Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop)
     } catch {
-        throw "$Label is not valid JSON ($Path)"
+        throw "$Label is not valid JSON ($Path): $($_.Exception.Message)"
     }
+}
+
+function Write-JsonFile {
+    param([string]$Path, $Value)
+    $parent = Split-Path -Parent $Path
+    if (-not [string]::IsNullOrWhiteSpace($parent) -and -not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    }
+    $json = $Value | ConvertTo-Json -Depth 14
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $json, $encoding)
 }
 
 function Read-DotEnv {
     param([string]$Path)
     $values = @{}
     if (-not (Test-Path -LiteralPath $Path)) {
-        throw "Missing .env at $Path; the evaluation needs EZTEST_DATABASE_URL and the admin credentials"
+        return $values
     }
-    foreach ($line in Get-Content -LiteralPath $Path -Encoding UTF8) {
-        if ($line -match '^\s*#' -or $line -match '^\s*$') { continue }
-        if ($line -match '^\s*([^=]+)=(.*)$') {
-            $key = $matches[1].Trim()
-            $value = $matches[2].Trim()
-            if ($value.Length -ge 2) {
-                $first = $value.Substring(0, 1)
-                $last = $value.Substring($value.Length - 1, 1)
-                if (($first -eq '"' -and $last -eq '"') -or ($first -eq "'" -and $last -eq "'")) {
-                    $value = $value.Substring(1, $value.Length - 2)
-                }
+    foreach ($rawLine in Get-Content -LiteralPath $Path -Encoding UTF8) {
+        $line = $rawLine.Trim()
+        if ($line.Length -eq 0 -or $line.StartsWith("#")) { continue }
+        $separator = $line.IndexOf("=")
+        if ($separator -lt 1) { continue }
+        $key = $line.Substring(0, $separator).Trim()
+        $value = $line.Substring($separator + 1).Trim()
+        if ($value.Length -ge 2) {
+            $first = $value.Substring(0, 1)
+            $last = $value.Substring($value.Length - 1, 1)
+            if (($first -eq '"' -and $last -eq '"') -or ($first -eq "'" -and $last -eq "'")) {
+                $value = $value.Substring(1, $value.Length - 2)
             }
-            $values[$key] = $value
         }
+        $values[$key] = $value
     }
     return $values
 }
 
-function Get-RequiredValue {
-    param($Values, [string]$Key)
-    if (-not $Values.ContainsKey($Key) -or [string]::IsNullOrWhiteSpace([string]$Values[$Key])) {
-        throw "Missing required value $Key in .env"
+function Get-ConfigValue {
+    param($EnvValues, [string]$Key, [string]$Default = "")
+    $fromEnvironment = [Environment]::GetEnvironmentVariable($Key)
+    if (-not [string]::IsNullOrWhiteSpace($fromEnvironment)) {
+        return $fromEnvironment
     }
-    return [string]$Values[$Key]
+    if ($null -ne $EnvValues -and $EnvValues.ContainsKey($Key) -and -not [string]::IsNullOrWhiteSpace([string]$EnvValues[$Key])) {
+        return [string]$EnvValues[$Key]
+    }
+    return $Default
+}
+
+function Get-DatabaseTarget {
+    param([string]$DatabaseUrl)
+    if ([string]::IsNullOrWhiteSpace($DatabaseUrl)) {
+        throw "EZTEST_DATABASE_URL is missing; the evaluation needs the P6 database"
+    }
+    $uri = $null
+    if (-not [System.Uri]::TryCreate($DatabaseUrl, [System.UriKind]::Absolute, [ref]$uri)) {
+        throw "EZTEST_DATABASE_URL is not a valid absolute URL"
+    }
+    $scheme = $uri.Scheme.ToLowerInvariant()
+    if ($scheme -ne "postgres" -and $scheme -ne "postgresql") {
+        throw "EZTEST_DATABASE_URL must use the postgres scheme"
+    }
+    if ([string]::IsNullOrWhiteSpace($uri.Host)) {
+        throw "EZTEST_DATABASE_URL must include a host"
+    }
+    $hostName = $uri.Host.ToLowerInvariant()
+    if (@("localhost", "127.0.0.1", "::1") -notcontains $hostName) {
+        throw "the evaluation database must run on the local PostgreSQL host; refusing a remote target"
+    }
+    $userInfo = $uri.UserInfo
+    $separator = $userInfo.IndexOf(":")
+    if ($separator -lt 0) {
+        throw "EZTEST_DATABASE_URL must contain a user and password"
+    }
+    $user = [System.Uri]::UnescapeDataString($userInfo.Substring(0, $separator))
+    $password = [System.Uri]::UnescapeDataString($userInfo.Substring($separator + 1))
+    $port = if ($uri.Port -gt 0) { $uri.Port } else { 5432 }
+    $database = [System.Uri]::UnescapeDataString($uri.AbsolutePath.TrimStart([char[]]"/"))
+    if ([string]::IsNullOrWhiteSpace($database)) {
+        throw "EZTEST_DATABASE_URL must include a database name"
+    }
+    return [pscustomobject]@{
+        Host     = $hostName
+        Port     = $port
+        User     = $user
+        Password = $password
+        Database = $database
+    }
 }
 
 function Get-CommandExe {
@@ -128,169 +259,291 @@ function Get-CommandExe {
     return $command.Source
 }
 
-# Invoke-VisualEvaluation replays eval/ground-truth/visual.json through the
-# production execution-domain classifier (backend/internal/execution/evalvisual)
-# and returns its JSON metric document. It needs only the Go toolchain, so both
-# the deterministic run and -DryRun consume the same evaluation.
-function Invoke-VisualEvaluation {
-    param([string]$GoExe, [string]$RepoRoot)
-    $backendDir = Join-Path $RepoRoot "backend"
-    $corpusPath = Join-Path $RepoRoot "eval\corpus\visual.json"
-    $truthPath = Join-Path $RepoRoot "eval\ground-truth\visual.json"
-    New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
-    $errLog = Join-Path $tmpDir "visual-eval.err.log"
+function Invoke-PsqlQuery {
+    param($Target, [string]$Sql)
     $previous = $ErrorActionPreference
-    $ErrorActionPreference = "SilentlyContinue"
-    Push-Location $backendDir
+    $hadPassword = Test-Path Env:PGPASSWORD
+    $previousPassword = $env:PGPASSWORD
+    $output = @()
+    $exitCode = 1
     try {
-        $output = & $GoExe run ./internal/execution/evalvisual -corpus $corpusPath -ground-truth $truthPath 2>$errLog
-        $evalExit = $LASTEXITCODE
+        $env:PGPASSWORD = $Target.Password
+        $ErrorActionPreference = "SilentlyContinue"
+        $psqlArgs = @(
+            "-h", $Target.Host, "-p", "$($Target.Port)", "-U", $Target.User,
+            "-d", $Target.Database, "-v", "ON_ERROR_STOP=1", "-tA", "-c", $Sql
+        )
+        $output = & $script:PsqlExe @psqlArgs 2>&1
+        $exitCode = $LASTEXITCODE
     } finally {
-        Pop-Location
         $ErrorActionPreference = $previous
-    }
-    if ($evalExit -ne 0) {
-        $detail = ""
-        if (Test-Path -LiteralPath $errLog) {
-            $detail = (Get-Content -LiteralPath $errLog -Raw -Encoding UTF8 -ErrorAction SilentlyContinue)
+        if ($hadPassword) {
+            $env:PGPASSWORD = $previousPassword
+        } else {
+            Remove-Item Env:\PGPASSWORD -ErrorAction SilentlyContinue
         }
-        throw "visual assertion evaluation failed (exit $evalExit): $detail"
     }
-    try {
-        $result = ($output | Out-String) | ConvertFrom-Json -ErrorAction Stop
-    } catch {
-        throw "visual assertion evaluation did not return valid JSON"
+    if ($exitCode -ne 0) {
+        throw "psql query failed (exit $exitCode): $($output -join ' ')"
     }
-    if ([string]::IsNullOrWhiteSpace([string]$result.metric)) {
-        throw "visual assertion evaluation returned no metric"
+    return (($output | Out-String).Trim())
+}
+
+function Resolve-ApiBaseUrl {
+    param([string]$Explicit, $EnvValues)
+    $candidate = $Explicit
+    if ([string]::IsNullOrWhiteSpace($candidate)) {
+        $candidate = Get-ConfigValue -EnvValues $EnvValues -Key "EZTEST_API_BASE_URL" -Default ""
     }
-    if (-not [bool]$result.passed) {
-        throw ("visual_classification_accuracy {0:P1} is below the {1:P1} threshold ({2}/{3} cases classified correctly)" -f `
-                [double]$result.accuracy, [double]$result.threshold, [int]$result.correct, [int]$result.total)
+    if ([string]::IsNullOrWhiteSpace($candidate)) {
+        $port = Get-ConfigValue -EnvValues $EnvValues -Key "EZTEST_API_PORT" -Default "13333"
+        $candidate = "http://127.0.0.1:$port"
     }
-    return $result
+    $candidate = $candidate.Trim().TrimEnd([char[]]"/")
+    $uri = $null
+    if (-not [System.Uri]::TryCreate($candidate, [System.UriKind]::Absolute, [ref]$uri)) {
+        throw "the API base URL is not a valid absolute URL"
+    }
+    if ($uri.Scheme -ne "http" -and $uri.Scheme -ne "https") {
+        throw "the API base URL must use http or https"
+    }
+    return $candidate
+}
+
+function Test-ObservationShape {
+    param($Observation, [string]$CorpusVersion, [string]$ExpectedModel)
+    if ($null -eq $Observation) {
+        throw "observation is empty"
+    }
+    if ([string]$Observation.schema -ne "p6-eval-observation/v1") {
+        throw "observation.schema must be p6-eval-observation/v1"
+    }
+    if ([string]$Observation.mode -ne "real_llm") {
+        throw "observation.mode must be real_llm (no fake/deterministic track)"
+    }
+    $model = [string]$Observation.model
+    if ([string]::IsNullOrWhiteSpace($model)) {
+        throw "observation.model is required"
+    }
+    if ($model -match "(?i)fake") {
+        throw "observation.model '$model' looks like a fake model; P6 only records real LLM runs"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedModel) -and $model -ne $ExpectedModel) {
+        throw "observation.model '$model' does not match the corpus/env model '$ExpectedModel'"
+    }
+    if ([string]$Observation.corpus_version -ne $CorpusVersion) {
+        throw "observation.corpus_version '$($Observation.corpus_version)' does not match '$CorpusVersion'"
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$Observation.version_id)) {
+        throw "observation.version_id is required"
+    }
+    if ($null -eq $Observation.requirements -or $null -eq $Observation.requirements.confirmed_keys) {
+        throw "observation.requirements.confirmed_keys is required"
+    }
+    if ($null -eq $Observation.design -or $null -eq $Observation.design.covered_requirement_keys) {
+        throw "observation.design.covered_requirement_keys is required"
+    }
+    if ($null -eq $Observation.impact -or $null -eq $Observation.impact.selected_requirement_keys) {
+        throw "observation.impact.selected_requirement_keys is required"
+    }
+    if ($null -eq $Observation.execution -or $null -eq $Observation.execution.case_runs) {
+        throw "observation.execution.case_runs is required"
+    }
+    if ($null -eq $Observation.issues -or $null -eq $Observation.issues.ai_issues) {
+        throw "observation.issues.ai_issues is required"
+    }
+    if ($null -eq $Observation.supplement -or $null -eq $Observation.supplement.ai_case_titles) {
+        throw "observation.supplement.ai_case_titles is required"
+    }
+    if ($null -ne $Observation.visual) {
+        $injected = 0
+        if (-not [int]::TryParse([string]$Observation.visual.injected, [ref]$injected) -or $injected -lt 0) {
+            throw "observation.visual.injected must be a non-negative integer"
+        }
+        if ($null -eq $Observation.visual.cases) {
+            throw "observation.visual.cases is required when visual is present"
+        }
+    }
+}
+
+function Count-Intersection {
+    param([string[]]$Left, [string[]]$Right)
+    $count = 0
+    foreach ($item in $Left) {
+        if ($Right -contains $item) { $count++ }
+    }
+    return $count
+}
+
+function New-SampleFromObservation {
+    param(
+        $Observation,
+        $ImpactTruth,
+        $ClassificationTruth,
+        $IssuesTruth,
+        $SupplementTruth,
+        $VisualTruth
+    )
+    $confirmedKeys = @($Observation.requirements.confirmed_keys | ForEach-Object { [string]$_ })
+    $coveredKeys = @($Observation.design.covered_requirement_keys | ForEach-Object { [string]$_ })
+    $selectedKeys = @($Observation.impact.selected_requirement_keys | ForEach-Object { [string]$_ })
+    $caseRuns = @($Observation.execution.case_runs)
+    $aiIssues = @($Observation.issues.ai_issues)
+    $supplementTitles = @($Observation.supplement.ai_case_titles | ForEach-Object { [string]$_ })
+
+    $impactExpected = @($ImpactTruth.expected | ForEach-Object { [string]$_.requirement_key })
+    $injected = @($ClassificationTruth.injected_failures)
+    $truePositiveTitles = @($IssuesTruth.true_positives | ForEach-Object { [string]$_.title })
+    $supplementExpected = @($SupplementTruth.expected_cases | ForEach-Object { [string]$_.title })
+    $visualTruthCases = @($VisualTruth.cases)
+
+    $correctClassifications = 0
+    foreach ($truth in $injected) {
+        $title = [string]$truth.case_title
+        $expectedClass = [string]$truth.expected_failure_class
+        $run = $null
+        foreach ($candidate in $caseRuns) {
+            if ([string]$candidate.case_title -eq $title) { $run = $candidate; break }
+        }
+        if ($null -ne $run -and [string]$run.status -eq "failed" -and [string]$run.failure_class -eq $expectedClass) {
+            $correctClassifications++
+        }
+    }
+
+    $aiIssueTitles = @($aiIssues | ForEach-Object { [string]$_.title })
+
+    $sample = [ordered]@{
+        confirmed_requirements  = $confirmedKeys.Count
+        covered_requirements    = (Count-Intersection -Left $confirmedKeys -Right $coveredKeys)
+        impact_expected         = $impactExpected.Count
+        impact_hit              = (Count-Intersection -Left $impactExpected -Right $selectedKeys)
+        impact_selected         = $selectedKeys.Count
+        injected_failures       = $injected.Count
+        correct_classifications = $correctClassifications
+        ai_issues               = $aiIssues.Count
+        true_positive_issues    = (Count-Intersection -Left $aiIssueTitles -Right $truePositiveTitles)
+        supplement_cases        = $supplementTitles.Count
+        supplement_hits         = (Count-Intersection -Left $supplementTitles -Right $supplementExpected)
+    }
+
+    if ($null -ne $Observation.visual) {
+        $visualInjected = [int]$Observation.visual.injected
+        $visualCases = @($Observation.visual.cases)
+        $visualCorrect = 0
+        foreach ($truth in $visualTruthCases) {
+            $title = [string]$truth.case_title
+            $expectedClass = [string]$truth.expected_classification
+            $candidate = $null
+            foreach ($case in $visualCases) {
+                if ([string]$case.case_title -eq $title) { $candidate = $case; break }
+            }
+            if ($null -ne $candidate -and [string]$candidate.classification -eq $expectedClass) {
+                $visualCorrect++
+            }
+        }
+        if ($visualCorrect -gt $visualInjected) {
+            throw "observation.visual.injected ($visualInjected) is smaller than the correct classification count ($visualCorrect)"
+        }
+        $sample["visual_injected"] = $visualInjected
+        $sample["visual_correct"] = $visualCorrect
+    }
+    return $sample
+}
+
+function Assert-Sample {
+    param($Sample)
+    foreach ($key in $Sample.Keys) {
+        if ([int]$Sample[$key] -lt 0) {
+            throw "sample.$key must not be negative"
+        }
+    }
+    if ([int]$Sample["covered_requirements"] -gt [int]$Sample["confirmed_requirements"]) {
+        throw "sample.covered_requirements must not exceed confirmed_requirements"
+    }
+    if ([int]$Sample["impact_hit"] -gt [int]$Sample["impact_expected"]) {
+        throw "sample.impact_hit must not exceed impact_expected"
+    }
+    if ([int]$Sample["impact_hit"] -gt [int]$Sample["impact_selected"]) {
+        throw "sample.impact_hit must not exceed impact_selected"
+    }
+    if ([int]$Sample["correct_classifications"] -gt [int]$Sample["injected_failures"]) {
+        throw "sample.correct_classifications must not exceed injected_failures"
+    }
+    if ([int]$Sample["true_positive_issues"] -gt [int]$Sample["ai_issues"]) {
+        throw "sample.true_positive_issues must not exceed ai_issues"
+    }
+    if ([int]$Sample["supplement_hits"] -gt [int]$Sample["supplement_cases"]) {
+        throw "sample.supplement_hits must not exceed supplement_cases"
+    }
+    if ($Sample.Contains("visual_injected") -and [int]$Sample["visual_correct"] -gt [int]$Sample["visual_injected"]) {
+        throw "sample.visual_correct must not exceed visual_injected"
+    }
 }
 
 # ---------------------------------------------------------------------------
-# Static preflight: corpus, baseline, database target and toolchain. It is
-# shared by -DryRun and the full run so both reject the same broken inputs.
+# Static preflight shared by -DryRun and -Mode real-llm.
 # ---------------------------------------------------------------------------
 function Invoke-Preflight {
-    $requiredFiles = @{
-        "README"                 = (Join-Path $evalRoot "README.md")
-        "requirements corpus"    = (Join-Path $corpusDir "requirements.json")
-        "environment corpus"     = (Join-Path $corpusDir "environment.json")
-        "impact ground truth"    = (Join-Path $truthDir "impact.json")
-        "classification truth"   = (Join-Path $truthDir "classification.json")
-        "issues ground truth"    = (Join-Path $truthDir "issues.json")
-        "supplement ground truth" = (Join-Path $truthDir "supplement.json")
-        "visual corpus"          = (Join-Path $corpusDir "visual.json")
-        "visual ground truth"    = (Join-Path $truthDir "visual.json")
-        "baseline"               = (Join-Path $evalRoot "baseline.json")
-    }
-    $checked = New-Object System.Collections.ArrayList
-    foreach ($entry in $requiredFiles.GetEnumerator() | Sort-Object Name) {
-        if (-not (Test-Path -LiteralPath $entry.Value)) {
-            throw "missing eval artifact: $($entry.Key) ($($entry.Value))"
-        }
-        [void]$checked.Add($entry.Key)
+    param([bool]$ForRealRun)
+
+    Write-Step "Validating the eval/v02 corpus, ground truth and baseline"
+
+    $readmePath = Join-Path $evalRoot "README.md"
+    if (-not (Test-Path -LiteralPath $readmePath)) {
+        throw "missing eval/v02/README.md"
     }
 
-    $requirements = Read-JsonFile -Path $requiredFiles["requirements corpus"] -Label "requirements corpus"
-    $environment = Read-JsonFile -Path $requiredFiles["environment corpus"] -Label "environment corpus"
-    $impact = Read-JsonFile -Path $requiredFiles["impact ground truth"] -Label "impact ground truth"
-    $classification = Read-JsonFile -Path $requiredFiles["classification truth"] -Label "classification ground truth"
-    $issuesTruth = Read-JsonFile -Path $requiredFiles["issues ground truth"] -Label "issues ground truth"
-    $supplement = Read-JsonFile -Path $requiredFiles["supplement ground truth"] -Label "supplement ground truth"
-    $visualCorpus = Read-JsonFile -Path $requiredFiles["visual corpus"] -Label "visual corpus"
-    $visualTruth = Read-JsonFile -Path $requiredFiles["visual ground truth"] -Label "visual ground truth"
-    $baseline = Read-JsonFile -Path $requiredFiles["baseline"] -Label "baseline"
+    $environment = Read-JsonFile -Path (Join-Path $corpusDir "environment.json") -Label "corpus/environment.json"
+    $requirements = Read-JsonFile -Path (Join-Path $corpusDir "requirements.json") -Label "corpus/requirements.json"
+    $design = Read-JsonFile -Path (Join-Path $corpusDir "design.json") -Label "corpus/design.json"
+    $code = Read-JsonFile -Path (Join-Path $corpusDir "code.json") -Label "corpus/code.json"
+    $execution = Read-JsonFile -Path (Join-Path $corpusDir "execution.json") -Label "corpus/execution.json"
+    $issues = Read-JsonFile -Path (Join-Path $corpusDir "issues.json") -Label "corpus/issues.json"
+    $visual = Read-JsonFile -Path (Join-Path $corpusDir "visual.json") -Label "corpus/visual.json"
+    $impactTruth = Read-JsonFile -Path (Join-Path $truthDir "impact.json") -Label "ground-truth/impact.json"
+    $classificationTruth = Read-JsonFile -Path (Join-Path $truthDir "classification.json") -Label "ground-truth/classification.json"
+    $issuesTruth = Read-JsonFile -Path (Join-Path $truthDir "issues.json") -Label "ground-truth/issues.json"
+    $supplementTruth = Read-JsonFile -Path (Join-Path $truthDir "supplement.json") -Label "ground-truth/supplement.json"
+    $visualTruth = Read-JsonFile -Path (Join-Path $truthDir "visual.json") -Label "ground-truth/visual.json"
+    $baseline = Read-JsonFile -Path (Join-Path $evalRoot "baseline.json") -Label "baseline.json"
 
-    # Corpus version consistency is the freeze contract: a mismatch means a file
-    # was edited without bumping the version and the gate must fail.
-    $corpusVersion = [string]$requirements.corpusVersion
+    $corpusVersion = [string]$requirements.corpus_version
     if ([string]::IsNullOrWhiteSpace($corpusVersion)) {
-        throw "requirements.json has no corpusVersion"
+        throw "corpus/requirements.json has no corpus_version"
     }
-    foreach ($pair in @(
-            @{ Name = "environment.json"; Value = [string]$environment.corpusVersion },
-            @{ Name = "impact.json"; Value = [string]$impact.corpusVersion },
-            @{ Name = "classification.json"; Value = [string]$classification.corpusVersion },
-            @{ Name = "issues.json"; Value = [string]$issuesTruth.corpusVersion },
-            @{ Name = "supplement.json"; Value = [string]$supplement.corpusVersion },
-            @{ Name = "visual.json (corpus)"; Value = [string]$visualCorpus.corpusVersion },
-            @{ Name = "visual.json (ground truth)"; Value = [string]$visualTruth.corpusVersion },
-            @{ Name = "baseline.json"; Value = [string]$baseline.corpusVersion }
-        )) {
-        if ($pair.Value -ne $corpusVersion) {
-            throw "$($pair.Name) corpusVersion '$($pair.Value)' does not match '$corpusVersion'"
+    $versionChecks = @(
+        @{ Name = "environment.json"; Value = [string]$environment.corpus_version },
+        @{ Name = "design.json"; Value = [string]$design.corpus_version },
+        @{ Name = "code.json"; Value = [string]$code.corpus_version },
+        @{ Name = "execution.json"; Value = [string]$execution.corpus_version },
+        @{ Name = "issues.json"; Value = [string]$issues.corpus_version },
+        @{ Name = "visual.json"; Value = [string]$visual.corpus_version },
+        @{ Name = "ground-truth/impact.json"; Value = [string]$impactTruth.corpus_version },
+        @{ Name = "ground-truth/classification.json"; Value = [string]$classificationTruth.corpus_version },
+        @{ Name = "ground-truth/issues.json"; Value = [string]$issuesTruth.corpus_version },
+        @{ Name = "ground-truth/supplement.json"; Value = [string]$supplementTruth.corpus_version },
+        @{ Name = "ground-truth/visual.json"; Value = [string]$visualTruth.corpus_version },
+        @{ Name = "baseline.json"; Value = [string]$baseline.corpus_version }
+    )
+    foreach ($check in $versionChecks) {
+        if ($check.Value -ne $corpusVersion) {
+            throw "$($check.Name) corpus_version '$($check.Value)' does not match '$corpusVersion'"
         }
     }
+    Write-Info "corpus_version = $corpusVersion; 14 artifacts parsed"
 
-    if (@($requirements.requirements).Count -eq 0) {
-        throw "requirements.json declares no requirements"
+    # Baseline: exactly the seven spec metric names, numeric [0,1], frozen
+    # thresholds, real_llm mode, report-only description.
+    if ([string]$baseline.mode -ne "real_llm") {
+        throw "baseline.json mode must be real_llm"
     }
-    if (@($requirements.expected.designCoveredRequirementKeys).Count -eq 0) {
-        throw "requirements.json declares no covered requirement keys"
+    $baselineProperties = @($baseline.metrics.PSObject.Properties)
+    if ($baselineProperties.Count -ne 7) {
+        throw "baseline.json must contain exactly 7 metrics (found $($baselineProperties.Count))"
     }
-    if ([int]$requirements.expected.confirmedRequirements -ne @($requirements.requirements).Count) {
-        throw "requirements.json expected.confirmedRequirements must equal the requirement count"
-    }
-    if (@($requirements.expected.caseTitles).Count -eq 0) {
-        throw "requirements.json declares no case title contract"
-    }
-
-    if ([string]::IsNullOrWhiteSpace([string]$environment.fixture.databaseName) -or
-        [string]$environment.fixture.databaseName -notmatch '^[a-z][a-z0-9_]*_eval$') {
-        throw "environment.json fixture.databaseName must match ^[a-z][a-z0-9_]*_eval$"
-    }
-    foreach ($portKey in @("targetPort", "executorPort", "fakeLlmPort", "apiPort")) {
-        $port = [int]$environment.fixture.$portKey
-        if ($port -lt 1024 -or $port -gt 65535) {
-            throw "environment.json fixture.$portKey is not a usable port"
-        }
-    }
-    $fixtureBase = [System.Uri][string]$environment.environment.baseUrl
-    if (-not $fixtureBase.IsAbsoluteUri -or $fixtureBase.Port -ne [int]$environment.fixture.targetPort) {
-        throw "environment.environment.baseUrl must point at the fixture.targetPort"
-    }
-    if (@($environment.environment.allowedHosts) -notcontains "127.0.0.1") {
-        throw "environment.environment.allowedHosts must include 127.0.0.1"
-    }
-    if ([string]::IsNullOrWhiteSpace([string]$environment.fixture.executorToken)) {
-        throw "environment.json fixture.executorToken is empty"
-    }
-
-    if (@($impact.expected).Count -eq 0) { throw "impact.json declares no expected cases" }
-    if ([string]$impact.repository.baseCommit -notmatch '^[0-9a-f]{40}$' -or
-        [string]$impact.repository.headCommit -notmatch '^[0-9a-f]{40}$') {
-        throw "impact.json repository commits are not 40-hex SHAs"
-    }
-    if (@($classification.injectedFailures).Count -eq 0) {
-        throw "classification.json declares no injected failures"
-    }
-    if (@($issuesTruth.truePositives).Count -eq 0) {
-        throw "issues.json declares no true positives"
-    }
-    if (@($supplement.expectedCases).Count -eq 0) {
-        throw "supplement.json declares no expected cases"
-    }
-    if ([string]$visualCorpus.scenario.assertion.kind -ne "visual") {
-        throw "visual.json scenario.assertion.kind must be visual"
-    }
-    if ([string]$visualTruth.metric -ne "visual_classification_accuracy") {
-        throw "ground-truth/visual.json metric must be visual_classification_accuracy"
-    }
-    if (@($visualTruth.cases).Count -eq 0) {
-        throw "ground-truth/visual.json declares no cases"
-    }
-
-    $baselineMetrics = @{}
     foreach ($name in $metricNames) {
         $property = $baseline.metrics.PSObject.Properties[$name]
-        if ($null -eq $property) {
-            throw "baseline.json is missing metric $name"
-        }
+        if ($null -eq $property) { throw "baseline.json is missing metric $name" }
         $value = 0.0
         if (-not [double]::TryParse([string]$property.Value, [ref]$value)) {
             throw "baseline.json metric $name is not a number"
@@ -298,1294 +551,592 @@ function Invoke-Preflight {
         if ($value -lt 0 -or $value -gt 1) {
             throw "baseline.json metric $name must be within [0,1]"
         }
-        $baselineMetrics[$name] = $value
-    }
-
-    $envValues = Read-DotEnv -Path (Join-Path $repoRoot ".env")
-    $databaseUrl = Get-RequiredValue -Values $envValues -Key "EZTEST_DATABASE_URL"
-    $adminUsername = Get-RequiredValue -Values $envValues -Key "EZTEST_ADMIN_USERNAME"
-    $adminPassword = Get-RequiredValue -Values $envValues -Key "EZTEST_ADMIN_PASSWORD"
-
-    $databaseUri = $null
-    if (-not [System.Uri]::TryCreate($databaseUrl, [System.UriKind]::Absolute, [ref]$databaseUri)) {
-        throw "EZTEST_DATABASE_URL is not a valid absolute URL"
-    }
-    $scheme = $databaseUri.Scheme.ToLowerInvariant()
-    if ($scheme -ne "postgres" -and $scheme -ne "postgresql") {
-        throw "EZTEST_DATABASE_URL must use the postgres scheme"
-    }
-    if ([string]::IsNullOrWhiteSpace($databaseUri.Host)) {
-        throw "EZTEST_DATABASE_URL must include a host"
-    }
-    $dbHost = $databaseUri.Host.ToLowerInvariant()
-    if ($dbHost -ne "localhost" -and $dbHost -ne "127.0.0.1" -and $dbHost -ne "::1") {
-        throw "the evaluation database must run on the local PostgreSQL host; refusing a remote target"
-    }
-    $userInfo = $databaseUri.UserInfo
-    $separator = $userInfo.IndexOf(":")
-    if ($separator -lt 0) {
-        throw "EZTEST_DATABASE_URL must contain a user and password"
-    }
-    $dbUser = [System.Uri]::UnescapeDataString($userInfo.Substring(0, $separator))
-    $dbPassword = [System.Uri]::UnescapeDataString($userInfo.Substring($separator + 1))
-    $dbPort = if ($databaseUri.Port -gt 0) { $databaseUri.Port } else { 5432 }
-    $devDbName = [System.Uri]::UnescapeDataString($databaseUri.AbsolutePath.TrimStart([char[]]"/"))
-    if ([string]::IsNullOrWhiteSpace($devDbName)) {
-        throw "EZTEST_DATABASE_URL must include a database name"
-    }
-    $evalDbName = [string]$environment.fixture.databaseName
-    if ($devDbName -eq $evalDbName) {
-        throw "EZTEST_DATABASE_URL already points at the evaluation database '$evalDbName'; point it at the development database instead"
-    }
-    # pgx applies query parameters over the URL path: reject a target override so
-    # the checked eval database is the one actually created and dropped.
-    $query = $databaseUri.Query
-    if (-not [string]::IsNullOrWhiteSpace($query)) {
-        foreach ($pair in ($query.TrimStart([char]"?")) -split "&") {
-            if ([string]::IsNullOrWhiteSpace($pair)) { continue }
-            $equals = $pair.IndexOf("=")
-            $key = if ($equals -ge 0) { $pair.Substring(0, $equals) } else { $pair }
-            $key = [System.Uri]::UnescapeDataString($key).Trim().ToLowerInvariant()
-            if ($key -eq "dbname" -or $key -eq "database" -or $key -eq "host" -or $key -eq "port") {
-                throw "EZTEST_DATABASE_URL must not override the connection target with '$key'"
-            }
+        $thresholdProperty = $baseline.thresholds.PSObject.Properties[$name]
+        if ($null -eq $thresholdProperty) { throw "baseline.json is missing threshold $name" }
+        $threshold = 0.0
+        if (-not [double]::TryParse([string]$thresholdProperty.Value, [ref]$threshold)) {
+            throw "baseline.json threshold $name is not a number"
+        }
+        $expected = [double]$specThresholds[$name]
+        if ([math]::Abs($threshold - $expected) -gt 0.000000001) {
+            throw "baseline.json threshold $name = $threshold, expected spec section 5.3 value $expected"
         }
     }
-    $queryIndex = $databaseUrl.IndexOf("?")
-    if ($queryIndex -ge 0) {
-        $urlBase = $databaseUrl.Substring(0, $queryIndex)
-        $urlQuery = $databaseUrl.Substring($queryIndex)
-    } else {
-        $urlBase = $databaseUrl
-        $urlQuery = ""
-    }
-    $slashIndex = $urlBase.LastIndexOf("/")
-    if ($slashIndex -lt 0) {
-        throw "EZTEST_DATABASE_URL does not contain a database name"
-    }
-    $evalDatabaseUrl = $urlBase.Substring(0, $slashIndex + 1) + $evalDbName + $urlQuery
+    Write-Info "baseline: 7 metrics; thresholds match spec section 5.3 real_llm"
 
-    $goExe = Get-CommandExe -Name "go.exe" -PreferredPath (Join-Path $repoRoot ".tools\go\bin\go.exe")
-    $nodeExe = Get-CommandExe -Name "node.exe" -PreferredPath ""
-    $psqlExe = Get-CommandExe -Name "psql.exe" -PreferredPath (Join-Path $repoRoot ".tools\pgsql\bin\psql.exe")
-    $gitExe = Get-CommandExe -Name "git.exe" -PreferredPath (Join-Path $repoRoot ".tools\git\bin\git.exe")
-    foreach ($relative in @(
-            "executor\src\server.mjs",
-            "scripts\fixture-target.cjs",
-            "scripts\fake-llm.cjs",
-            "scripts\fixture-codeintel-repo.ps1"
+    # Requirements / design.
+    $requirementKeys = @($requirements.requirements | ForEach-Object { [string]$_.key })
+    if ($requirementKeys.Count -eq 0) { throw "corpus/requirements.json declares no requirements" }
+    if (@($requirementKeys | Sort-Object -Unique).Count -ne $requirementKeys.Count) {
+        throw "corpus/requirements.json requirement keys are not unique"
+    }
+    if ([int]$requirements.expected.confirmed_requirements -ne $requirementKeys.Count) {
+        throw "expected.confirmed_requirements must equal the requirement count"
+    }
+    $expectedCovered = @($requirements.expected.design_covered_requirement_keys | ForEach-Object { [string]$_ })
+    if ($expectedCovered.Count -eq 0) { throw "expected.design_covered_requirement_keys is empty" }
+    foreach ($key in $expectedCovered) {
+        if ($requirementKeys -notcontains $key) { throw "covered requirement $key is not declared" }
+    }
+
+    $caseTitles = @($design.cases | ForEach-Object { [string]$_.title })
+    if ($caseTitles.Count -eq 0) { throw "corpus/design.json declares no cases" }
+    foreach ($case in @($design.cases)) {
+        if ($requirementKeys -notcontains [string]$case.requirement_key) {
+            throw "design case '$($case.title)' references an unknown requirement"
+        }
+    }
+    foreach ($title in @($design.expected.case_titles | ForEach-Object { [string]$_ })) {
+        if ($caseTitles -notcontains $title) { throw "expected case '$title' is not declared" }
+    }
+
+    # Code / impact truth.
+    foreach ($commit in @([string]$code.repository.base_commit, [string]$code.repository.head_commit)) {
+        if ($commit -notmatch "^[0-9a-f]{40}$") {
+            throw "corpus/code.json repository commits must be 40 lowercase hex characters"
+        }
+    }
+    $codeImpactKeys = @($code.expected_impact_requirement_keys | ForEach-Object { [string]$_ })
+    if ($codeImpactKeys.Count -eq 0) { throw "corpus/code.json declares no expected impact requirements" }
+    foreach ($key in $codeImpactKeys) {
+        if ($requirementKeys -notcontains $key) { throw "impact requirement $key is not declared" }
+    }
+    if (@($impactTruth.expected).Count -eq 0) { throw "ground-truth/impact.json declares no expected impact" }
+    $truthImpactKeys = @($impactTruth.expected | ForEach-Object { [string]$_.requirement_key })
+    if ((($truthImpactKeys | Sort-Object) -join ",") -ne (($codeImpactKeys | Sort-Object) -join ",")) {
+        throw "corpus/code.json expected impact requirements do not match ground-truth/impact.json"
+    }
+
+    # Execution / classification truth.
+    $injectedCorpus = @($execution.injected_failures)
+    $injectedTruth = @($classificationTruth.injected_failures)
+    if ($injectedTruth.Count -eq 0) { throw "ground-truth/classification.json declares no injected failures" }
+    if ($injectedCorpus.Count -ne $injectedTruth.Count) {
+        throw "corpus/execution.json and ground-truth/classification.json disagree on the injected failure count"
+    }
+    for ($index = 0; $index -lt $injectedTruth.Count; $index++) {
+        $corpusFailure = $injectedCorpus[$index]
+        $truthFailure = $injectedTruth[$index]
+        if ([string]$corpusFailure.case_title -ne [string]$truthFailure.case_title) {
+            throw "injected failure #$($index + 1) case_title disagrees between corpus and ground truth"
+        }
+        if ([string]$corpusFailure.expected_failure_class -ne [string]$truthFailure.expected_failure_class) {
+            throw "injected failure '$($truthFailure.case_title)' failure class disagrees between corpus and ground truth"
+        }
+        if ($caseTitles -notcontains [string]$truthFailure.case_title) {
+            throw "injected failure '$($truthFailure.case_title)' is not a declared design case"
+        }
+    }
+
+    # Issues truth.
+    if (@($issues.scenarios).Count -eq 0) { throw "corpus/issues.json declares no issue scenarios" }
+    $truePositiveTitles = @($issuesTruth.true_positives | ForEach-Object { [string]$_.title })
+    if ($truePositiveTitles.Count -eq 0) { throw "ground-truth/issues.json declares no true positives" }
+    $corpusAITitles = @($issues.scenarios | Where-Object { [string]$_.source -eq "ai" } | ForEach-Object { [string]$_.title })
+    foreach ($title in $truePositiveTitles) {
+        if ($corpusAITitles -notcontains $title) {
+            throw "true positive '$title' is not a declared AI issue scenario"
+        }
+    }
+
+    # Supplement / visual truth.
+    if (@($supplementTruth.expected_cases).Count -eq 0) {
+        throw "ground-truth/supplement.json declares no expected cases"
+    }
+    $visualAssertions = @($visual.assertions)
+    $visualTruthCases = @($visualTruth.cases)
+    if ([string]$visualTruth.metric -ne "visual_classification_accuracy") {
+        throw "ground-truth/visual.json metric must be visual_classification_accuracy"
+    }
+    if ($visualAssertions.Count -eq 0 -or $visualTruthCases.Count -eq 0) {
+        throw "visual corpus/ground truth must declare at least one case"
+    }
+    if ($visualAssertions.Count -ne $visualTruthCases.Count) {
+        throw "visual corpus and ground truth disagree on the case count"
+    }
+    foreach ($truthCase in $visualTruthCases) {
+        $title = [string]$truthCase.case_title
+        $match = $null
+        foreach ($assertion in $visualAssertions) {
+            if ([string]$assertion.case_title -eq $title) { $match = $assertion; break }
+        }
+        if ($null -eq $match) { throw "visual truth case '$title' is not declared in corpus/visual.json" }
+        if ([string]$match.expected_classification -ne [string]$truthCase.expected_classification) {
+            throw "visual case '$title' classification disagrees between corpus and ground truth"
+        }
+    }
+    Write-Info "corpus/ground-truth cross references are consistent"
+
+    # Frozen contract: quality paths/schemas and the P6 frozen marker.
+    $openapiPath = Join-Path $repoRoot "docs\version-V0.2\contracts\openapi.yaml"
+    if (-not (Test-Path -LiteralPath $openapiPath)) { throw "missing frozen OpenAPI contract" }
+    $openapi = Get-Content -LiteralPath $openapiPath -Raw -Encoding UTF8
+    foreach ($needle in @(
+            "x-frozen: P6",
+            "/api/quality/eval-runs:",
+            "/api/quality/eval-runs/{id}:",
+            "/api/quality/overview:",
+            "EvalRunCreateRequest:",
+            "EvalSample:",
+            "EvalSummary:",
+            "QualityOverviewView:"
         )) {
-        if (-not (Test-Path -LiteralPath (Join-Path $repoRoot $relative))) {
-            throw "missing evaluation tool: $relative"
+        if (-not $openapi.Contains($needle)) {
+            throw "openapi.yaml is missing the frozen P6 contract fragment '$needle'"
         }
     }
-    if (-not (Test-Path -LiteralPath (Join-Path $repoRoot "executor\node_modules"))) {
-        throw "executor/node_modules is missing; run pnpm install in executor first"
-    }
-    $scriptHost = Join-Path $PSHOME "pwsh.exe"
-    if (-not (Test-Path -LiteralPath $scriptHost)) { $scriptHost = Join-Path $PSHOME "powershell.exe" }
-    if (-not (Test-Path -LiteralPath $scriptHost)) { throw "cannot locate a PowerShell host to run helper scripts" }
-
-    # The visual scenario is evaluated through the production classifier here so
-    # both the deterministic gate and -DryRun reject a drifted corpus/classifier.
-    $visualEval = Invoke-VisualEvaluation -GoExe $goExe -RepoRoot $repoRoot
-
-    if ($RealLLM) {
-        if ($env:EZTEST_RUN_REAL_LLM -ne "1") {
-            throw "real-LLM evaluation is gated: set EZTEST_RUN_REAL_LLM=1 to run it"
-        }
-        if (-not $envValues.ContainsKey("llm_key") -or [string]::IsNullOrWhiteSpace([string]$envValues["llm_key"])) {
-            throw "real-LLM evaluation requires llm_key in .env (the key is never printed)"
-        }
-        if ([string]::IsNullOrWhiteSpace([string]$envValues["llm_base_url"])) {
-            throw "real-LLM evaluation requires llm_base_url in .env"
+    $routesPath = Join-Path $repoRoot "backend\internal\quality\interfaces\httpapi\routes.go"
+    if (-not (Test-Path -LiteralPath $routesPath)) { throw "missing quality httpapi routes.go" }
+    $routes = Get-Content -LiteralPath $routesPath -Raw -Encoding UTF8
+    foreach ($needle in @(
+            "GET /api/quality/eval-runs",
+            "POST /api/quality/eval-runs",
+            "GET /api/quality/eval-runs/{id}",
+            "GET /api/quality/overview"
+        )) {
+        if (-not $routes.Contains($needle)) {
+            throw "quality routes.go is missing '$needle'"
         }
     }
+    Write-Info "OpenAPI frozen P6 quality paths/schemas and quality routes are present"
 
-    return [pscustomobject]@{
-        CorpusVersion    = $corpusVersion
-        Requirements     = $requirements
-        Environment      = $environment
-        ImpactTruth      = $impact
-        Classification   = $classification
-        IssuesTruth      = $issuesTruth
-        SupplementTruth  = $supplement
-        VisualCorpus     = $visualCorpus
-        VisualTruth      = $visualTruth
-        VisualEval       = $visualEval
-        Baseline         = $baseline
-        BaselineMetrics  = $baselineMetrics
-        EnvValues        = $envValues
-        DatabaseUrl      = $databaseUrl
-        EvalDatabaseUrl  = $evalDatabaseUrl
-        EvalDbName       = $evalDbName
-        DevDbName        = $devDbName
-        DbHost           = $dbHost
-        DbPort           = $dbPort
-        DbUser           = $dbUser
-        DbPassword       = $dbPassword
-        AdminUsername    = $adminUsername
-        AdminPassword    = $adminPassword
-        GoExe            = $goExe
-        NodeExe          = $nodeExe
-        PsqlExe          = $psqlExe
-        GitExe           = $gitExe
-        ScriptHost       = $scriptHost
-        CheckedArtifacts = @($checked)
+    # Migration order must be at 33 and hold the eval migration.
+    $orderPath = Join-Path $repoRoot "backend\internal\db\migrations\order.txt"
+    if (-not (Test-Path -LiteralPath $orderPath)) { throw "missing migrations/order.txt" }
+    $ordered = @(Get-Content -LiteralPath $orderPath -Encoding UTF8 | ForEach-Object { $_.Trim() } | Where-Object {
+            $_.Length -gt 0 -and -not $_.StartsWith("#")
+        })
+    if ($ordered.Count -ne 33) {
+        throw "migrations/order.txt must list 33 migrations (found $($ordered.Count))"
     }
-}
+    if ($ordered -notcontains "quality_0001_eval.sql") {
+        throw "migrations/order.txt must contain quality_0001_eval.sql"
+    }
+    if ($ordered -notcontains "agent_0005_profile_prompt_revision.sql") {
+        throw "migrations/order.txt must contain agent_0005_profile_prompt_revision.sql"
+    }
+    Write-Info "migrations/order.txt = 33 entries including quality_0001_eval.sql"
 
-# ---------------------------------------------------------------------------
-# Process/HTTP helpers (the evaluation uses its own ports and never touches a
-# developer process).
-# ---------------------------------------------------------------------------
-function Test-PortFree {
-    param([int]$Port)
-    $listeners = Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue
-    return (-not $listeners)
-}
+    # Environment / database / LLM configuration.
+    $envPath = Join-Path $repoRoot ".env"
+    if (-not (Test-Path -LiteralPath $envPath)) {
+        throw "missing .env at $envPath (EZTEST_DATABASE_URL and LLM settings are required)"
+    }
+    $envValues = Read-DotEnv -Path $envPath
+    $databaseUrl = Get-ConfigValue -EnvValues $envValues -Key "EZTEST_DATABASE_URL" -Default ""
+    $databaseTarget = Get-DatabaseTarget -DatabaseUrl $databaseUrl
 
-function Stop-ProcessTree {
-    param($Process)
-    if ($null -eq $Process) { return }
-    $previous = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
+    $script:PsqlExe = Get-CommandExe -Name "psql.exe" -PreferredPath (Join-Path $repoRoot ".tools\pgsql\bin\psql.exe")
+    $powerShellHost = Join-Path $PSHOME "powershell.exe"
+    if (-not (Test-Path -LiteralPath $powerShellHost)) { $powerShellHost = Join-Path $PSHOME "pwsh.exe" }
+    if (-not (Test-Path -LiteralPath $powerShellHost)) {
+        throw "cannot locate a PowerShell host for the evaluation (PSHOME=$PSHOME)"
+    }
+
+    $ping = Invoke-PsqlQuery -Target $databaseTarget -Sql "SELECT 1"
+    if ($ping -ne "1") {
+        throw "database connectivity check did not return 1"
+    }
+    $appliedCount = -1
     try {
-        $Process.Refresh()
-        if (-not $Process.HasExited) {
-            & taskkill.exe /PID $Process.Id /T /F 2>$null | Out-Null
-        }
+        $appliedText = Invoke-PsqlQuery -Target $databaseTarget -Sql "SELECT count(*) FROM schema_migrations"
+        $parsedApplied = 0
+        if ([int]::TryParse($appliedText, [ref]$parsedApplied)) { $appliedCount = $parsedApplied }
     } catch {
-        # Best-effort cleanup.
-    } finally {
-        $ErrorActionPreference = $previous
+        Write-WarnLine "schema_migrations is not readable; the database may be uninitialized"
     }
-}
+    if ($ForRealRun) {
+        if ($appliedCount -ge 0 -and $appliedCount -lt 33) {
+            throw "database has $appliedCount migrations; apply #32/#33 before a real-llm evaluation run"
+        }
+        $evalTable = Invoke-PsqlQuery -Target $databaseTarget -Sql "SELECT to_regclass('eval_run') IS NOT NULL"
+        if ($evalTable -ne "t") {
+            throw "eval_run table is missing; apply quality_0001_eval.sql (#32) before a real-llm run"
+        }
+    } elseif ($appliedCount -ge 0 -and $appliedCount -lt 33) {
+        Write-WarnLine "database currently has $appliedCount migrations; real-llm mode requires 33"
+    }
+    Write-Info "database reachable: $($databaseTarget.Host):$($databaseTarget.Port)/$($databaseTarget.Database); applied migrations=$appliedCount"
 
-function Wait-ForHttp {
-    param([string]$Url, [int]$TimeoutSeconds, $Process, [string]$Label)
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    while ((Get-Date) -lt $deadline) {
-        if ($null -ne $Process) {
-            $Process.Refresh()
-            if ($Process.HasExited) {
-                throw "$Label exited early with code $($Process.ExitCode)"
+    $llmKey = Get-ConfigValue -EnvValues $envValues -Key "llm_api_key" -Default ""
+    $llmBase = Get-ConfigValue -EnvValues $envValues -Key "llm_base_url" -Default ""
+    $llmModel = Get-ConfigValue -EnvValues $envValues -Key "llm_model_name" -Default ""
+    if ([string]::IsNullOrWhiteSpace($llmKey) -or [string]::IsNullOrWhiteSpace($llmBase) -or [string]::IsNullOrWhiteSpace($llmModel)) {
+        throw "real-LLM configuration is incomplete in .env (llm_api_key/llm_base_url/llm_model_name)"
+    }
+    if ($llmModel -match "(?i)fake") {
+        throw "the configured LLM model looks fake; P6 evaluation requires a real model"
+    }
+    $corpusModel = [string]$environment.llm.model
+    if ($llmModel -ne $corpusModel) {
+        throw "configured LLM model '$llmModel' does not match the frozen corpus model '$corpusModel'"
+    }
+    Write-Info "llm model = $llmModel (real-LLM track; key/base URL never printed)"
+
+    $adminUsername = Get-ConfigValue -EnvValues $envValues -Key "EZTEST_ADMIN_USERNAME" -Default "admin"
+    $adminPassword = Get-ConfigValue -EnvValues $envValues -Key "EZTEST_ADMIN_PASSWORD" -Default "admin123"
+    $adminToken = Get-ConfigValue -EnvValues $envValues -Key "EZTEST_ADMIN_TOKEN" -Default ""
+    if ([string]::IsNullOrWhiteSpace($adminToken) -and [string]::IsNullOrWhiteSpace($adminUsername)) {
+        throw "admin credentials are missing for the evaluation run"
+    }
+
+    $resolvedApiBase = Resolve-ApiBaseUrl -Explicit $ApiBaseUrl -EnvValues $envValues
+    $script:ApiBase = $resolvedApiBase
+    Write-Info "api base = $resolvedApiBase (reachability is checked in real-llm mode only)"
+
+    # Observation: validate the committed template, and an explicitly supplied
+    # observation, but never require runtime data during -DryRun.
+    $examplePath = Join-Path $evalRoot "observation.example.json"
+    if (Test-Path -LiteralPath $examplePath) {
+        $exampleObservation = Read-JsonFile -Path $examplePath -Label "observation.example.json"
+        Test-ObservationShape -Observation $exampleObservation -CorpusVersion $corpusVersion -ExpectedModel $corpusModel
+        # The committed template must stay consistent with the ground truth so
+        # the runner's derivation logic is exercised by every dry run. This is a
+        # template self-check only; it is never recorded as an evaluation run.
+        $exampleSample = New-SampleFromObservation `
+            -Observation $exampleObservation `
+            -ImpactTruth $impactTruth `
+            -ClassificationTruth $classificationTruth `
+            -IssuesTruth $issuesTruth `
+            -SupplementTruth $supplementTruth `
+            -VisualTruth $visualTruth
+        Assert-Sample -Sample $exampleSample
+        $impactHitTruth = 0
+        foreach ($truth in @($impactTruth.expected)) {
+            if ([bool]$truth.expected_selected) { $impactHitTruth++ }
+        }
+        $expectedSample = [ordered]@{
+            confirmed_requirements  = [int]$requirements.expected.confirmed_requirements
+            covered_requirements    = $expectedCovered.Count
+            impact_expected         = @($impactTruth.expected).Count
+            impact_hit              = $impactHitTruth
+            impact_selected         = [int]$impactTruth.expected_counts.impact_selected
+            injected_failures       = $injectedTruth.Count
+            correct_classifications = [int]$classificationTruth.expected_counts.correct_classifications
+            ai_issues               = [int]$issuesTruth.expected_counts.ai_issues
+            true_positive_issues    = [int]$issuesTruth.expected_counts.true_positive_issues
+            supplement_cases        = [int]$supplementTruth.expected_counts.supplement_cases
+            supplement_hits         = [int]$supplementTruth.expected_counts.supplement_hits
+        }
+        if ($null -ne $exampleObservation.visual) {
+            $expectedSample["visual_injected"] = [int]$visualTruth.expected_counts.visual_injected
+            $expectedSample["visual_correct"] = [int]$visualTruth.expected_counts.visual_correct
+        }
+        foreach ($key in $expectedSample.Keys) {
+            if (-not $exampleSample.Contains($key)) {
+                throw "observation.example.json does not derive sample.$key"
+            }
+            if ([int]$exampleSample[$key] -ne [int]$expectedSample[$key]) {
+                throw "observation.example.json derives sample.$key=$($exampleSample[$key]), expected $($expectedSample[$key])"
             }
         }
-        try {
-            $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 10
-            if ($response.StatusCode -eq 200) { return }
-        } catch {
-            # Not ready yet.
-        }
-        Start-Sleep -Milliseconds 500
+        Write-Info "observation.example.json matches p6-eval-observation/v1 and the committed ground truth"
     }
-    throw "Timed out waiting for $Label at $Url"
-}
+    if (-not [string]::IsNullOrWhiteSpace($ObservationFile)) {
+        $explicitObservationPath = Resolve-RepoPath -Path $ObservationFile
+        $explicitObservation = Read-JsonFile -Path $explicitObservationPath -Label "observation file"
+        Test-ObservationShape -Observation $explicitObservation -CorpusVersion $corpusVersion -ExpectedModel $corpusModel
+        Write-Info "explicit observation file shape is valid"
+    }
+    Write-Info "toolchain: psql and PowerShell host are available"
 
-function Start-EvalNodeProcess {
-    param([string]$ScriptPath, [string]$LogName, [string]$Label)
-    $outLog = Join-Path $tmpDir "$LogName.out.log"
-    $errLog = Join-Path $tmpDir "$LogName.err.log"
-    Remove-Item -LiteralPath $outLog, $errLog -ErrorAction SilentlyContinue
-    return Start-Process -FilePath $pre.NodeExe `
-        -ArgumentList "`"$ScriptPath`"" `
-        -WorkingDirectory $repoRoot `
-        -RedirectStandardOutput $outLog `
-        -RedirectStandardError $errLog `
-        -WindowStyle Hidden `
-        -PassThru
-}
-
-function New-EvalDatabase {
-    param($Pre)
-    $env:PGPASSWORD = $Pre.DbPassword
-    $maintenanceDb = "postgres"
-    $probeArgs = @("-h", $Pre.DbHost, "-p", "$($Pre.DbPort)", "-U", $Pre.DbUser, "-d", $maintenanceDb, "-tA", "-c", "SELECT 1")
-    $previous = $ErrorActionPreference
-    $ErrorActionPreference = "SilentlyContinue"
-    try {
-        & $Pre.PsqlExe @probeArgs *> $null
-        $probeExit = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previous
-    }
-    if ($probeExit -ne 0) {
-        # Fall back to the configured database as the maintenance connection.
-        $maintenanceDb = $Pre.DevDbName
-    }
-    $dbLog = Join-Path $tmpDir "database.log"
-    # DROP DATABASE cannot run inside a transaction block, so it needs its own
-    # psql invocation; CREATE DATABASE follows separately.
-    $dropSql = "DROP DATABASE IF EXISTS `"$($Pre.EvalDbName)`" WITH (FORCE);"
-    $createSql = "CREATE DATABASE `"$($Pre.EvalDbName)`";"
-    $previous = $ErrorActionPreference
-    $ErrorActionPreference = "SilentlyContinue"
-    try {
-        & $Pre.PsqlExe -h $Pre.DbHost -p "$($Pre.DbPort)" -U $Pre.DbUser -d $maintenanceDb -v ON_ERROR_STOP=1 -c $dropSql *> $dbLog
-        $dropExit = $LASTEXITCODE
-        if ($dropExit -eq 0) {
-            & $Pre.PsqlExe -h $Pre.DbHost -p "$($Pre.DbPort)" -U $Pre.DbUser -d $maintenanceDb -v ON_ERROR_STOP=1 -c $createSql *>> $dbLog
-            $createExit = $LASTEXITCODE
-        } else {
-            $createExit = $dropExit
-        }
-    } finally {
-        $ErrorActionPreference = $previous
-    }
-    if ($createExit -ne 0) {
-        Write-LogTail -Path $dbLog -Label "database preparation" -Lines 40
-        throw "could not recreate the '$($Pre.EvalDbName)' database; the configured PostgreSQL role needs CREATEDB"
-    }
-}
-
-function New-FixtureCoordinates {
-    param($Pre)
-    $fixtureRepo = Join-Path $tmpRoot "p4-e2e-repo"
-    if (-not (Test-Path -LiteralPath (Join-Path $fixtureRepo ".git"))) {
-        & $Pre.ScriptHost -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scriptsDir "fixture-codeintel-repo.ps1") *> (Join-Path $tmpDir "fixture-repo.log")
-        if ($LASTEXITCODE -ne 0) {
-            Write-LogTail -Path (Join-Path $tmpDir "fixture-repo.log") -Label "fixture repository" -Lines 40
-            throw "scripts/fixture-codeintel-repo.ps1 failed"
-        }
-    }
-    $baseCommit = ((& $Pre.GitExe -C $fixtureRepo rev-parse HEAD~1 2>$null | Out-String).Trim())
-    $headCommit = ((& $Pre.GitExe -C $fixtureRepo rev-parse HEAD 2>$null | Out-String).Trim())
-    $branch = ((& $Pre.GitExe -C $fixtureRepo rev-parse --abbrev-ref HEAD 2>$null | Out-String).Trim())
-    if ($baseCommit -notmatch '^[0-9a-f]{40}$' -or $headCommit -notmatch '^[0-9a-f]{40}$') {
-        throw "could not resolve the deterministic fixture commits"
-    }
-    if ([string]::IsNullOrWhiteSpace($branch) -or $branch -eq "HEAD") { $branch = "main" }
     return [pscustomobject]@{
-        Path       = $fixtureRepo
-        BaseCommit = $baseCommit
-        HeadCommit = $headCommit
-        Branch     = $branch
+        CorpusVersion       = $corpusVersion
+        CorpusModel         = $corpusModel
+        Environment         = $environment
+        Requirements        = $requirements
+        Design              = $design
+        Code                = $code
+        Execution           = $execution
+        Issues              = $issues
+        Visual              = $visual
+        ImpactTruth         = $impactTruth
+        ClassificationTruth = $classificationTruth
+        IssuesTruth         = $issuesTruth
+        SupplementTruth     = $supplementTruth
+        VisualTruth         = $visualTruth
+        Baseline            = $baseline
+        EnvValues           = $envValues
+        DatabaseTarget      = $databaseTarget
+        AppliedMigrations   = $appliedCount
+        AdminUsername       = $adminUsername
+        AdminPassword       = $adminPassword
+        AdminToken          = $adminToken
+        ApiBaseUrl          = $resolvedApiBase
     }
 }
 
-# The runner is embedded so the evaluation stays a one-file deliverable and the
-# acceptance script can execute it without a second tracked script. It talks to
-# the real API/fixture/executor only; every metric is derived from the API
-# responses and the committed ground truth.
-$runnerScript = @'
-import { readFileSync, writeFileSync } from "node:fs";
-
-const API = process.env.P8_EVAL_API_URL;
-const FAKE = process.env.P8_EVAL_FAKE_LLM_URL;
-const FIXTURE = process.env.P8_EVAL_FIXTURE_URL;
-const MODE = process.env.P8_EVAL_MODE === "real_llm" ? "real_llm" : "deterministic";
-const DETERMINISTIC = MODE === "deterministic";
-const observationPath = process.env.P8_EVAL_OBSERVATION;
-const resultPath = process.env.P8_EVAL_RESULT;
-
-function readJson(path) {
-  return JSON.parse(readFileSync(path, "utf8"));
-}
-
-const requirementsCorpus = readJson(process.env.P8_EVAL_REQUIREMENTS);
-const environmentCorpus = readJson(process.env.P8_EVAL_ENVIRONMENT);
-const baselineFile = readJson(process.env.P8_EVAL_BASELINE);
-const impactTruth = readJson(process.env.P8_EVAL_GT_IMPACT);
-const classificationTruth = readJson(process.env.P8_EVAL_GT_CLASSIFICATION);
-const issuesTruth = readJson(process.env.P8_EVAL_GT_ISSUES);
-const supplementTruth = readJson(process.env.P8_EVAL_GT_SUPPLEMENT);
-// The visual metric is produced by backend/internal/execution/evalvisual from
-// eval/corpus/visual.json + eval/ground-truth/visual.json through the production
-// classifier; the runner only records it next to the six §9.1 metrics.
-const visualResultPath = process.env.P8_EVAL_VISUAL_RESULT;
-const visualEval = visualResultPath ? readJson(visualResultPath) : null;
-
-const startedAt = new Date();
-const observation = {
-  corpusVersion: requirementsCorpus.corpusVersion,
-  mode: MODE,
-  startedAt: startedAt.toISOString(),
-  phases: [],
-  counts: {},
-};
-
-function phase(name, detail) {
-  observation.phases.push({ name, at: new Date().toISOString(), ...(detail || {}) });
-  console.log("[eval] " + name);
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-let token = "";
-
-async function api(method, path, body, expected) {
-  const allowed = expected || [200, 201, 202, 204];
-  const headers = {};
-  if (token !== "") headers.Authorization = "Bearer " + token;
-  if (body !== undefined) headers["Content-Type"] = "application/json";
-  const response = await fetch(API + path, {
-    method,
-    headers,
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  const text = await response.text();
-  let parsed = null;
-  try {
-    parsed = text === "" ? null : JSON.parse(text);
-  } catch {
-    parsed = null;
-  }
-  if (!allowed.includes(response.status)) {
-    const code = parsed?.error?.code ?? "";
-    const reason = parsed?.error?.details?.reason ?? "";
-    throw new Error(`${method} ${path} -> HTTP ${response.status} ${code} ${reason}`.trim());
-  }
-  return parsed?.data;
-}
-
-async function poll(label, fn, done, timeoutMs, intervalMs) {
-  const timeout = timeoutMs ?? 240000;
-  const interval = intervalMs ?? 1000;
-  const deadline = Date.now() + timeout;
-  let last = null;
-  while (Date.now() < deadline) {
-    last = await fn();
-    if (done(last)) return last;
-    await sleep(interval);
-  }
-  const summary = JSON.stringify(last);
-  throw new Error(`${label} timed out after ${timeout}ms (last: ${summary === undefined ? "none" : summary.slice(0, 300)})`);
-}
-
-async function setFakeMode(kind, mode) {
-  const response = await fetch(`${FAKE}/__${kind}-mode`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ mode }),
-  });
-  if (!response.ok) throw new Error(`could not switch the fake LLM ${kind} mode to ${mode}`);
-}
-
-function suffixCounts() {
-  return {
-    confirmedRequirements: 0,
-    coveredRequirements: 0,
-    impactExpected: 0,
-    impactHit: 0,
-    impactSelected: 0,
-    injectedFailures: 0,
-    correctClassifications: 0,
-    aiIssues: 0,
-    truePositiveIssues: 0,
-    supplementCases: 0,
-    supplementHits: 0,
-  };
-}
-
-async function login() {
-  const data = await api(
-    "POST",
-    "/api/auth/login",
-    { username: process.env.P8_EVAL_ADMIN_USERNAME, password: process.env.P8_EVAL_ADMIN_PASSWORD },
-    [200],
-  );
-  token = String(data.token ?? "");
-  if (token === "") throw new Error("admin login did not return a token");
-}
-
-async function seedVersion() {
-  const system = await api("POST", "/api/resources/systems", {
-    key: "p8-eval-system",
-    name: "P8 evaluation system",
-    kind: "web",
-    baseUrl: environmentCorpus.environment.baseUrl,
-  });
-  const environment = await api("POST", `/api/resources/systems/${system.id}/environments`, {
-    key: environmentCorpus.environment.key,
-    name: environmentCorpus.environment.name,
-    kind: environmentCorpus.environment.kind,
-    baseUrl: environmentCorpus.environment.baseUrl,
-    allowedHosts: environmentCorpus.environment.allowedHosts,
-  });
-  const repo = await api("POST", "/api/resources/code-repos", {
-    key: "p8-eval-repo",
-    name: "P8 evaluation fixture repo",
-    localPath: process.env.P8_EVAL_FIXTURE_REPO,
-    fixedBranch: process.env.P8_EVAL_FIXTURE_BRANCH,
-  });
-  const version = await api("POST", "/api/versions", {
-    name: requirementsCorpus.version.name,
-    label: requirementsCorpus.version.label,
-    description: requirementsCorpus.version.description,
-    systemId: system.id,
-    environmentId: environment.id,
-    codeRepositoryId: repo.id,
-    codeBranch: process.env.P8_EVAL_FIXTURE_BRANCH,
-    codeBaselineCommit: process.env.P8_EVAL_BASE_COMMIT,
-  });
-  const requirements = [];
-  for (const requirement of requirementsCorpus.requirements) {
-    const created = await api("POST", `/api/versions/${version.id}/requirements`, {
-      title: requirement.title,
-      description: requirement.description,
-      acceptanceCriteria: requirement.acceptanceCriteria,
-      priority: requirement.priority,
-    });
-    requirements.push({ key: requirement.key, id: created.id });
-  }
-  await api("POST", `/api/versions/${version.id}/start-clarification`, undefined);
-  for (const requirement of requirements) {
-    await api("POST", `/api/versions/${version.id}/requirements/${requirement.id}/confirm`, undefined);
-  }
-  await api("POST", `/api/versions/${version.id}/enter-design`, { acknowledgeUnclarified: false });
-  observation.versionId = String(version.id);
-  return { system, environment, repo, version, requirements };
-}
-
-async function indexRepository(repoId) {
-  await api("POST", `/api/code/repos/${repoId}/index`, undefined, [202]);
-  await poll(
-    "repository index",
-    () => api("GET", `/api/code/repos/${repoId}/index-runs/latest`, undefined, [200]),
-    (run) => run && run.status === "done",
-    180000,
-    300,
-  );
-}
-
-async function runMindmap(kind) {
-  const run = await api("POST", `/api/versions/${observation.versionId}/mindmap/runs`, { kind }, [200, 202]);
-  const runId = String(run.runId ?? run.id ?? "");
-  if (runId === "") throw new Error(`mindmap ${kind} run did not return an id`);
-  const settled = await poll(
-    `mindmap ${kind} run`,
-    () => api("GET", `/api/versions/${observation.versionId}/mindmap/runs/${runId}`, undefined, [200]),
-    (current) => current && ["done", "failed", "degraded"].includes(current.status),
-    240000,
-    500,
-  );
-  if (settled.status !== "done") {
-    throw new Error(`mindmap ${kind} run ended ${settled.status} (${settled.reason ?? "no reason"})`);
-  }
-  return runId;
-}
-
-async function getGraph() {
-  return api("GET", `/api/versions/${observation.versionId}/mindmap`, undefined, [200]);
-}
-
-async function approveBaseline() {
-  await runMindmap("review");
-  await api("POST", `/api/versions/${observation.versionId}/mindmap/submit-review`, {}, [200]);
-  const approved = await api(
-    "POST",
-    `/api/versions/${observation.versionId}/mindmap/review`,
-    { decision: "approve", acknowledgeFindings: true },
-    [200],
-  );
-  if (approved.baseline == null) throw new Error("mindmap approval froze no baseline");
-  return approved.baseline;
-}
-
-async function analyseImpact() {
-  if (DETERMINISTIC) await setFakeMode("p4", "impact-ai");
-  const started = await api("POST", `/api/versions/${observation.versionId}/code/analyses`, {}, [200, 202]);
-  observation.analysisId = String(started.id ?? "");
-  const analysis = await poll(
-    "P4 impact analysis",
-    async () => {
-      const response = await fetch(API + `/api/versions/${observation.versionId}/code/analyses/latest`, {
-        headers: { Authorization: "Bearer " + token },
-      });
-      if (response.status === 404) return null;
-      const payload = await response.json();
-      return payload?.data ?? null;
-    },
-    (current) => current && ["done", "failed", "degraded"].includes(current.status),
-    300000,
-    500,
-  );
-  if (analysis.status !== "done") {
-    if (DETERMINISTIC) {
-      throw new Error(`P4 impact analysis ended ${analysis.status}; the deterministic gate cannot measure impact`);
+function Invoke-EvalApi {
+    param([string]$Method, [string]$Path, $Body, [string]$Token)
+    $headers = @{ "Accept" = "application/json" }
+    if (-not [string]::IsNullOrWhiteSpace($Token)) {
+        $headers["Authorization"] = "Bearer $Token"
     }
-    return null;
-  }
-  return analysis;
-}
-
-function selectedRequirementCandidates(analysis) {
-  if (analysis === null) return new Map();
-  const selected = new Map();
-  for (const candidate of analysis.candidates ?? []) {
-    if (candidate.subjectKind !== "requirement" || candidate.selected !== true) continue;
-    selected.set(String(candidate.subjectId), candidate);
-  }
-  return selected;
-}
-
-function measureImpact(graph, analysis) {
-  const expected = impactTruth.expected;
-  const selected = selectedRequirementCandidates(analysis);
-  const cases = (graph.nodes ?? []).filter((node) => node.kind === "case");
-  let hit = 0;
-  for (const truth of expected) {
-    const node = cases.find((candidate) => candidate.title === truth.caseTitle);
-    if (!node) continue;
-    const requirementSources = (node.sources ?? [])
-      .filter((source) => source.refKind === "requirement")
-      .map((source) => String(source.refId));
-    if (requirementSources.some((id) => selected.has(id))) hit += 1;
-  }
-  return { expected: expected.length, hit, selected: selected.size };
-}
-
-async function setEnvironmentExecution(seed) {
-  await api(
-    "PATCH",
-    `/api/resources/environments/${seed.environment.id}`,
-    {
-      allowAutoLogin: true,
-      loginCheck: { url: "/p6/home", expectStatus: [200], bodyContains: "P6 Home" },
-    },
-    [200],
-  );
-  const loginUrl = `${FIXTURE}/p6/login`;
-  const flow = await api("POST", "/api/resources/auth-flows", {
-    system_id: String(seed.system.id),
-    name: "P8 evaluation login",
-    kind: "form",
-    definition: {
-      login_url: loginUrl,
-      username_selector: "#username",
-      password_selector: "#password",
-      submit_selector: "button[type=submit]",
-      success: { url_contains: "/p6/home" },
-      failure: { invalid_selector: ".login-error", mfa_selector: "#mfa" },
-      timeout_ms: 10000,
-    },
-    enabled: true,
-  });
-  const account = await api("POST", "/api/resources/accounts", {
-    key: environmentCorpus.accounts[0].key,
-    label: environmentCorpus.accounts[0].label,
-    username: environmentCorpus.accounts[0].username,
-    kind: "human",
-  });
-  const access = await api("POST", `/api/resources/accounts/${account.id}/accesses`, {
-    systemId: seed.system.id,
-    authType: "password",
-    concurrencyLimit: 1,
-    credential: "fixture-pass",
-    usernameOverride: "fixture",
-    loginUrl,
-    login_flow_id: flow.id,
-    enabled: true,
-  });
-
-  const loginResponse = await fetch(`${FIXTURE}/p6/login`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ username: "fixture", password: "fixture-pass" }).toString(),
-    redirect: "manual",
-  });
-  if (loginResponse.status !== 302) {
-    throw new Error(`fixture login returned HTTP ${loginResponse.status}, expected 302`);
-  }
-  const cookies =
-    typeof loginResponse.headers.getSetCookie === "function" ? loginResponse.headers.getSetCookie() : [];
-  let cookie = "";
-  for (const raw of cookies.length > 0 ? cookies : [loginResponse.headers.get("set-cookie") ?? ""]) {
-    for (const part of raw.split(",")) {
-      const pair = part.split(";")[0]?.trim() ?? "";
-      const separator = pair.indexOf("=");
-      if (separator > 0 && pair.slice(0, separator) === "p6_session") {
-        cookie = pair.slice(separator + 1);
-      }
+    $request = @{
+        Method     = $Method
+        Uri        = ($script:ApiBase + $Path)
+        Headers    = $headers
+        TimeoutSec = $script:TimeoutSeconds
     }
-  }
-  if (cookie === "") throw new Error("fixture login did not set the p6_session cookie");
-  const fixtureUrl = new URL(FIXTURE);
-  await api(
-    "POST",
-    `/api/resources/accesses/${access.id}/sessions`,
-    {
-      environmentId: seed.environment.id,
-      kind: "storage_state",
-      storageState: {
-        cookies: [
-          {
-            name: "p6_session",
-            value: cookie,
-            domain: fixtureUrl.hostname,
-            path: "/",
-            expires: -1,
-            httpOnly: true,
-            secure: false,
-            sameSite: "Lax",
-          },
-        ],
-        origins: [{ origin: fixtureUrl.origin, localStorage: [], sessionStorage: [] }],
-      },
-      note: "P8 evaluation imported fixture session",
-    },
-    [201],
-  );
-}
-
-async function runBaselineBatch() {
-  if (DETERMINISTIC) await setFakeMode("p6", "fail");
-  const batch = await api("POST", `/api/versions/${observation.versionId}/batches`, {}, [201]);
-  observation.batchId = String(batch.id);
-  const done = await poll(
-    "baseline batch",
-    () => api("GET", `/api/versions/${observation.versionId}/batches/${batch.id}`, undefined, [200]),
-    (current) => current && ["done", "failed", "cancelled"].includes(current.status),
-    600000,
-    1000,
-  );
-  if (done.status !== "done") {
-    throw new Error(`baseline batch ended ${done.status} (${done.failure_reason ?? "no reason"})`);
-  }
-  // The supplement batch must execute with the normal planner.
-  if (DETERMINISTIC) await setFakeMode("p6", "normal");
-  return done;
-}
-
-async function caseRuns(batchId) {
-  return api("GET", `/api/versions/${observation.versionId}/batches/${batchId}/case-runs?limit=100`, undefined, [200]);
-}
-
-function measureClassification(runs) {
-  const injected = classificationTruth.injectedFailures;
-  let correct = 0;
-  for (const truth of injected) {
-    const run = runs.find((candidate) => candidate.title === truth.caseTitle);
-    if (run && run.status === "failed" && run.failure_class === truth.expectedFailureClass) correct += 1;
-  }
-  return { injected: injected.length, correct };
-}
-
-async function waitAnalyses(batchId) {
-  let analyses = [];
-  try {
-    analyses = await poll(
-      "P7 failure analysis and issue triage",
-      () => api("GET", `/api/versions/${observation.versionId}/batches/${batchId}/analysis`, undefined, [200]),
-      (rows) =>
-        Array.isArray(rows) &&
-        ["failure", "issue_triage"].every((kind) => {
-          const run = rows.find((candidate) => candidate.kind === kind);
-          return run && ["done", "failed", "degraded"].includes(run.status);
-        }),
-      300000,
-      500,
-    );
-  } catch (error) {
-    if (DETERMINISTIC) throw error;
-    return;
-  }
-  for (const kind of ["failure", "issue_triage"]) {
-    const run = analyses.find((candidate) => candidate.kind === kind);
-    if (run && run.status !== "done" && DETERMINISTIC) {
-      throw new Error(`${kind} analysis ended ${run.status}`);
+    if ($null -ne $Body) {
+        $request["ContentType"] = "application/json"
+        $request["Body"] = ($Body | ConvertTo-Json -Depth 14)
     }
-  }
-}
-
-async function measureIssues() {
-  let issues = [];
-  try {
-    issues = await poll(
-      "AI issue materialization",
-      () => api("GET", `/api/versions/${observation.versionId}/issues?limit=100`, undefined, [200]),
-      (rows) => Array.isArray(rows) && rows.filter((issue) => issue.source === "ai").length >= (issuesTruth.expectedAIIssues ?? 1),
-      240000,
-      500,
-    );
-  } catch (error) {
-    if (DETERMINISTIC) throw error;
-    issues = await api("GET", `/api/versions/${observation.versionId}/issues?limit=100`, undefined, [200]);
-  }
-  const aiIssues = (issues ?? []).filter((issue) => issue.source === "ai");
-  const truthTitles = new Set(issuesTruth.truePositives.map((truth) => truth.title));
-  const truePositives = aiIssues.filter((issue) => truthTitles.has(issue.title)).length;
-  return { aiIssues: aiIssues.length, truePositives };
-}
-
-async function waitSupplementBatch() {
-  let batches = [];
-  try {
-    batches = await poll(
-      "supplement child batch",
-      () => api("GET", `/api/versions/${observation.versionId}/batches?limit=100`, undefined, [200]),
-      (rows) =>
-        Array.isArray(rows) &&
-        rows.some((batch) => batch.kind === "supplement" && batch.parentBatchId === observation.batchId),
-      600000,
-      1000,
-    );
-  } catch (error) {
-    if (DETERMINISTIC) throw error;
-    return null;
-  }
-  const child = batches.find(
-    (batch) => batch.kind === "supplement" && batch.parentBatchId === observation.batchId,
-  );
-  if (!child) {
-    if (DETERMINISTIC) throw new Error("no supplement child batch appeared");
-    return null;
-  }
-  const done = await poll(
-    "supplement batch",
-    () => api("GET", `/api/versions/${observation.versionId}/batches/${child.id}`, undefined, [200]),
-    (current) => current && ["done", "failed", "cancelled"].includes(current.status),
-    600000,
-    1000,
-  );
-  if (done.status !== "done") {
-    if (DETERMINISTIC) throw new Error(`supplement batch ended ${done.status}`);
-    return null;
-  }
-  observation.supplementBatchId = String(done.id);
-  return done;
-}
-
-async function waitVersionCompleted() {
-  try {
-    await poll(
-      "version completion",
-      () => api("GET", `/api/versions/${observation.versionId}`, undefined, [200]),
-      (current) => current && current.status === "completed",
-      600000,
-      1000,
-    );
-  } catch (error) {
-    if (DETERMINISTIC) throw error;
-  }
-  try {
-    await poll(
-      "batch report",
-      () => api("GET", `/api/versions/${observation.versionId}/reports?limit=100`, undefined, [200]),
-      (rows) => Array.isArray(rows) && rows.length > 0,
-      240000,
-      1000,
-    );
-  } catch (error) {
-    if (DETERMINISTIC) throw error;
-  }
-}
-
-function measureSupplement() {
-  const nodes = (observation.supplementGraph?.nodes ?? []).filter(
-    (node) => node.kind === "case" && node.source === "ai_supplement",
-  );
-  const truthTitles = new Set(supplementTruth.expectedCases.map((entry) => entry.title));
-  const hits = nodes.filter((node) => truthTitles.has(node.title)).length;
-  return { cases: nodes.length, hits };
-}
-
-async function main() {
-  await login();
-  const seed = await seedVersion();
-  phase("seed", { versionId: observation.versionId });
-  // The execution batch leases the imported fixture session; without it every
-  // case run is blocked(session, no_session) before the agent can start.
-  await setEnvironmentExecution(seed);
-  phase("execution-session");
-
-  const designRun = await runMindmap("design");
-  phase("design", { runId: designRun });
-  let graph = await getGraph();
-  const confirmed = new Set(seed.requirements.map((requirement) => String(requirement.id)));
-  const covered = new Set();
-  for (const entry of graph.coverage?.matrix ?? []) {
-    if ((entry.caseIds ?? []).length > 0) covered.add(String(entry.requirementId));
-  }
-  const coveredConfirmed = [...covered].filter((id) => confirmed.has(id));
-  observation.counts.confirmedRequirements = confirmed.size;
-  observation.counts.coveredRequirements = coveredConfirmed.length;
-  if (DETERMINISTIC) {
-    for (const key of requirementsCorpus.expected.designCoveredRequirementKeys) {
-      const requirement = seed.requirements.find((candidate) => candidate.key === key);
-      if (requirement && !covered.has(String(requirement.id))) {
-        throw new Error(`design coverage is missing the frozen requirement ${key}`);
-      }
+    try {
+        return (Invoke-RestMethod @request)
+    } catch {
+        $detail = ""
+        if ($null -ne $_.ErrorDetails -and -not [string]::IsNullOrWhiteSpace([string]$_.ErrorDetails.Message)) {
+            $detail = [string]$_.ErrorDetails.Message
+        }
+        throw "$Method $Path failed: $($_.Exception.Message) $detail"
     }
-  }
-  if ((graph.nodes ?? []).filter((node) => node.kind === "case").length === 0) {
-    throw new Error("design run materialized no cases");
-  }
-  phase("design-coverage", {
-    confirmed: confirmed.size,
-    covered: coveredConfirmed.length,
-    cases: (graph.nodes ?? []).filter((node) => node.kind === "case").length,
-  });
+}
 
-  // P4 impact: index the fixed repository and anchor R1 to the changed file, then
-  // run the analysis after the baseline exists.
-  await indexRepository(seed.repo.id);
-  const firstRequirement = seed.requirements[0];
-  await api("POST", `/api/versions/${observation.versionId}/code/anchors`, {
-    subjectKind: "requirement",
-    subjectId: String(firstRequirement.id),
-    filePath: impactTruth.repository.anchorFile,
-    startLine: impactTruth.repository.anchorLine,
-    endLine: impactTruth.repository.anchorLine,
-  });
-  phase("code-index");
-
-  await approveBaseline();
-  phase("review-baseline");
-  const analysis = await analyseImpact();
-  const impact = measureImpact(await getGraph(), analysis);
-  observation.counts.impactExpected = impact.expected;
-  observation.counts.impactHit = impact.hit;
-  observation.counts.impactSelected = impact.selected;
-  phase("impact", impact);
-
-  const baselineBatch = await runBaselineBatch();
-  phase("baseline-batch", { batchId: observation.batchId, counts: baselineBatch.counts });
-  const runs = await caseRuns(observation.batchId);
-  const classification = measureClassification(runs);
-  observation.counts.injectedFailures = classification.injected;
-  observation.counts.correctClassifications = classification.correct;
-  phase("classification", classification);
-
-  await waitAnalyses(observation.batchId);
-  const issues = await measureIssues();
-  observation.counts.aiIssues = issues.aiIssues;
-  observation.counts.truePositiveIssues = issues.truePositives;
-  phase("issues", issues);
-
-  await waitSupplementBatch();
-  observation.supplementGraph = await getGraph();
-  const supplement = measureSupplement();
-  observation.counts.supplementCases = supplement.cases;
-  observation.counts.supplementHits = supplement.hits;
-  phase("supplement", supplement);
-
-  await waitVersionCompleted();
-  if (visualEval) {
-    observation.visual = visualEval;
-    phase("visual-classification", {
-      metric: visualEval.metric,
-      accuracy: visualEval.accuracy,
-      correct: visualEval.correct,
-      total: visualEval.total,
-    });
-    if (DETERMINISTIC && !visualEval.passed) {
-      throw new Error(
-        `visual_classification_accuracy ${visualEval.accuracy} is below the ${visualEval.threshold} threshold`,
-      );
+function Get-AdminToken {
+    param($Pre)
+    if (-not [string]::IsNullOrWhiteSpace($script:BearerToken)) {
+        return $script:BearerToken.Trim()
     }
-  }
-  phase("report");
+    if (-not [string]::IsNullOrWhiteSpace([string]$Pre.AdminToken)) {
+        return ([string]$Pre.AdminToken).Trim()
+    }
+    $loginBody = [ordered]@{
+        username = [string]$Pre.AdminUsername
+        password = [string]$Pre.AdminPassword
+    }
+    $response = Invoke-EvalApi -Method "POST" -Path "/api/auth/login" -Body $loginBody -Token ""
+    if ($null -eq $response -or $null -eq $response.data -or [string]::IsNullOrWhiteSpace([string]$response.data.token)) {
+        throw "admin login did not return a bearer token"
+    }
+    return [string]$response.data.token
+}
 
-  const sample = observation.counts;
-  const finishedAt = new Date();
-  observation.finishedAt = finishedAt.toISOString();
-  observation.sample = sample;
-  writeFileSync(observationPath, JSON.stringify(observation, null, 2), "utf8");
+function Resolve-ObservationPath {
+    param($Pre)
+    if (-not [string]::IsNullOrWhiteSpace($script:ObservationFile)) {
+        return (Resolve-RepoPath -Path $script:ObservationFile)
+    }
+    $fromEnvironment = Get-ConfigValue -EnvValues $Pre.EnvValues -Key "EZTEST_EVAL_OBSERVATION" -Default ""
+    if (-not [string]::IsNullOrWhiteSpace($fromEnvironment)) {
+        return (Resolve-RepoPath -Path $fromEnvironment)
+    }
+    $candidates = @(
+        (Join-Path $repoRoot ".tmp\p6-acceptance\observation.json"),
+        (Join-Path $repoRoot ".tmp\p6-eval\observation.input.json"),
+        (Join-Path $repoRoot ".tmp\p6-real-llm\observation.json")
+    )
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
+    }
+    throw "no real-LLM observation found; pass -ObservationFile (tried: $($candidates -join ', '))"
+}
 
-  const run = await api(
-    "POST",
-    "/api/quality/eval-runs",
-    {
-      mode: MODE,
-      corpusVersion: requirementsCorpus.corpusVersion,
-      model:
-        MODE === "deterministic"
-          ? environmentCorpus.fixture.fakeLlmModel
-          : process.env.P8_EVAL_REAL_MODEL || "real-llm",
-      startedAt: observation.startedAt,
-      finishedAt: observation.finishedAt,
-      baseline: baselineFile.metrics,
-      sample,
-      summary: {
-        scenario: "p8-eval",
-        deterministic: DETERMINISTIC,
-        versionId: observation.versionId,
-        baselineBatchId: observation.batchId,
-        supplementBatchId: observation.supplementBatchId ?? null,
-        analysisId: observation.analysisId ?? null,
-        visual: visualEval
-          ? {
-              metric: visualEval.metric,
-              accuracy: visualEval.accuracy,
-              threshold: visualEval.threshold,
-              correct: visualEval.correct,
-              total: visualEval.total,
-              passed: visualEval.passed,
+function Write-FailureEvidence {
+    param([string]$Message, [string]$ObservationPath, $Observation)
+    try {
+        New-Item -ItemType Directory -Force -Path $script:TmpDir | Out-Null
+        if (-not [string]::IsNullOrWhiteSpace($ObservationPath) -and (Test-Path -LiteralPath $ObservationPath)) {
+            $destination = Join-Path $script:TmpDir "observation.json"
+            if ([System.IO.Path]::GetFullPath($ObservationPath) -ne [System.IO.Path]::GetFullPath($destination)) {
+                Copy-Item -LiteralPath $ObservationPath -Destination $destination -Force
             }
-          : null,
-        corpusFiles: [
-          "corpus/requirements.json",
-          "corpus/environment.json",
-          "corpus/visual.json",
-          "ground-truth/impact.json",
-          "ground-truth/classification.json",
-          "ground-truth/issues.json",
-          "ground-truth/supplement.json",
-          "ground-truth/visual.json",
-        ],
-      },
-    },
-    [201],
-  );
-
-  const metrics = {};
-  const regressions = [];
-  for (const metric of run.metrics ?? []) {
-    metrics[metric.name] = {
-      value: metric.value,
-      threshold: metric.threshold,
-      passed: metric.passed,
-      reason: metric.detail?.reason ?? "",
-      numerator: metric.detail?.numerator ?? null,
-      denominator: metric.detail?.denominator ?? null,
-      baseline: metric.detail?.baseline ?? null,
-    };
-    if (metric.detail?.reason === "baseline_regression") regressions.push(metric.name);
-  }
-  // The §9.3 visual metric is a corpus-level classification detail. It never
-  // replaces the six §9.1 metrics and is gated by the Go helper in preflight.
-  if (visualEval) {
-    metrics[visualEval.metric] = {
-      value: visualEval.accuracy,
-      threshold: visualEval.threshold,
-      passed: visualEval.passed,
-      reason: visualEval.passed ? "ok" : "below_threshold",
-      numerator: visualEval.correct,
-      denominator: visualEval.total,
-      baseline: null,
-    };
-  }
-  const gatePassed = run.status === "passed";
-  const result = {
-    ok: DETERMINISTIC ? gatePassed : true,
-    mode: MODE,
-    corpusVersion: requirementsCorpus.corpusVersion,
-    runId: String(run.id),
-    status: run.status,
-    gatePassed,
-    reportOnly: !DETERMINISTIC,
-    metrics,
-    regressions,
-    visual: visualEval,
-    baseline: baselineFile.metrics,
-    observationPath,
-    finishedAt: observation.finishedAt,
-  };
-  writeFileSync(resultPath, JSON.stringify(result, null, 2), "utf8");
-  console.log("[eval] recorded quality run #" + result.runId + " status=" + result.status);
-  if (DETERMINISTIC && !gatePassed) {
-    process.exitCode = 1;
-  }
+        }
+        $failure = [ordered]@{
+            schema      = "p6-eval-result/v1"
+            ok          = $false
+            mode        = "real_llm"
+            report_only = $true
+            error       = $Message
+            failed_at   = (Get-Date).ToUniversalTime().ToString("o")
+        }
+        if ($null -ne $Observation) {
+            $failure["version_id"] = [string]$Observation.version_id
+            $failure["corpus_version"] = [string]$Observation.corpus_version
+        }
+        Write-JsonFile -Path (Join-Path $script:TmpDir "result.json") -Value $failure
+    } catch {
+        Write-WarnLine "could not write failure evidence: $($_.Exception.Message)"
+    }
 }
 
-try {
-  await main();
-} catch (error) {
-  observation.finishedAt = new Date().toISOString();
-  observation.error = String(error && error.message ? error.message : error);
-  try {
-    writeFileSync(observationPath, JSON.stringify(observation, null, 2), "utf8");
-  } catch {
-    // The directory is prepared by the caller; ignoring a write failure keeps the
-    // original error as the reported one.
-  }
-  console.error("[eval] FAILED: " + observation.error);
-  process.exitCode = 1;
-}
-'@
-
-$exitCode = 0
-try {
-    Write-Step "Validating the evaluation corpus, baseline and toolchain"
-    $pre = Invoke-Preflight
-    Write-Host ("Corpus {0}: {1} requirements, {2} ground-truth groups; baseline {3} metrics." -f `
-            $pre.CorpusVersion, @($pre.Requirements.requirements).Count, 4, $pre.BaselineMetrics.Count)
-    Write-Host "Corpus/baseline/DB-target/toolchain preflight passed."
-
-    if ($DryRun) {
-        New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
-        $dryRunPath = Join-Path $tmpDir "dry-run.json"
-        $dryRunMode = "deterministic"
-        if ($RealLLM) { $dryRunMode = "real_llm" }
-        $dryRunCheckedAt = (Get-Date).ToUniversalTime().ToString("o")
-        $dryRunReport = [ordered]@{}
-        $dryRunReport["ok"] = $true
-        $dryRunReport["mode"] = "dry_run"
-        $dryRunReport["checkedAt"] = $dryRunCheckedAt
-        $dryRunReport["corpusVersion"] = $pre.CorpusVersion
-        $dryRunReport["artifacts"] = @($pre.CheckedArtifacts)
-        $dryRunReport["baseline"] = $pre.BaselineMetrics
-        $dryRunReport["visual"] = [ordered]@{
-            metric    = [string]$pre.VisualEval.metric
-            accuracy  = [double]$pre.VisualEval.accuracy
-            threshold = [double]$pre.VisualEval.threshold
-            cases     = [int]$pre.VisualEval.total
-            passed    = [bool]$pre.VisualEval.passed
-        }
-        $dryRunReport["databaseTarget"] = [ordered]@{
-            host         = $pre.DbHost
-            port         = $pre.DbPort
-            databaseName = $pre.EvalDbName
-            targetSafe   = $true
-        }
-        $dryRunReport["toolchain"] = [ordered]@{
-            go      = $pre.GoExe
-            node    = $pre.NodeExe
-            psql    = $pre.PsqlExe
-            git     = $pre.GitExe
-            mode    = $dryRunMode
-            llmCall = $false
-        }
-        $json = $dryRunReport | ConvertTo-Json -Depth 8
-        [System.IO.File]::WriteAllText($dryRunPath, $json, (New-Object System.Text.UTF8Encoding($false)))
-        Write-Host "Wrote $dryRunPath"
-        Write-Host "EVAL DRYRUN PASSED" -ForegroundColor Green
+# ---------------------------------------------------------------------------
+# Dry run.
+# ---------------------------------------------------------------------------
+if ($DryRun) {
+    try {
+        $pre = Invoke-Preflight -ForRealRun $false
+        Write-Info "dry-run would POST mode=real_llm to $($pre.ApiBaseUrl)/api/quality/eval-runs"
+        Write-Step "EVAL PREFLIGHT PASSED (dry-run; no LLM call, no write)"
         exit 0
+    } catch {
+        Write-ErrorLine "EVAL DRY-RUN FAILED: $($_.Exception.Message)"
+        exit 1
     }
-
-    $mode = if ($RealLLM) { "real_llm" } else { "deterministic" }
-    $fixture = [pscustomobject]@{
-        TargetPort   = [int]$pre.Environment.fixture.targetPort
-        ExecutorPort = [int]$pre.Environment.fixture.executorPort
-        FakeLlmPort  = [int]$pre.Environment.fixture.fakeLlmPort
-        ApiPort      = [int]$pre.Environment.fixture.apiPort
-        ExecutorToken = [string]$pre.Environment.fixture.executorToken
-        FakeModel    = [string]$pre.Environment.fixture.fakeLlmModel
-        DatabaseName = [string]$pre.Environment.fixture.databaseName
-    }
-
-    New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
-    foreach ($port in @($fixture.ApiPort, $fixture.FakeLlmPort, $fixture.TargetPort, $fixture.ExecutorPort)) {
-        if (-not (Test-PortFree -Port $port)) {
-            throw "port $port is already in use; stop the conflicting process before running the evaluation"
-        }
-    }
-
-    $dataRoot = Join-Path $tmpDir "data"
-    foreach ($child in @("objects", "evidence", "exports", "reports", "attachments")) {
-        New-Item -ItemType Directory -Force -Path (Join-Path $dataRoot $child) | Out-Null
-    }
-    $apiExe = Join-Path $tmpDir "eztest-eval-api.exe"
-    $buildLog = Join-Path $tmpDir "build.log"
-    Write-Step "Building the API"
-    Push-Location $backendDir
-    $previous = $ErrorActionPreference
-    $ErrorActionPreference = "SilentlyContinue"
-    try {
-        & $pre.GoExe build -o $apiExe ./cmd/eztest *> $buildLog
-        $buildExit = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previous
-        Pop-Location
-    }
-    if ($buildExit -ne 0) {
-        Write-LogTail -Path $buildLog -Label "go build" -Lines 60
-        throw "go build ./cmd/eztest failed"
-    }
-
-    Write-Step "Recreating the isolated $($fixture.DatabaseName) database"
-    New-EvalDatabase -Pre $pre
-
-    Write-Step "Preparing the deterministic fixture repository"
-    $fixtureRepo = New-FixtureCoordinates -Pre $pre
-    Write-Host ("Fixture commits base={0} head={1}." -f $fixtureRepo.BaseCommit.Substring(0, 8), $fixtureRepo.HeadCommit.Substring(0, 8))
-
-    $fakeProcess = $null
-    $fixtureProcess = $null
-    $executorProcess = $null
-    $apiProcess = $null
-    try {
-        $fakeBaseUrl = "http://127.0.0.1:$($fixture.FakeLlmPort)"
-        if (-not $RealLLM) {
-            Write-Step "Starting the deterministic fake LLM on port $($fixture.FakeLlmPort)"
-            $env:EZTEST_FAKE_LLM_PORT = "$($fixture.FakeLlmPort)"
-            $env:EZTEST_FAKE_LLM_P3 = "1"
-            $env:EZTEST_FAKE_LLM_P4_MODE = "ok"
-            $env:EZTEST_FAKE_LLM_P5_MODE = "normal"
-            $env:EZTEST_FAKE_LLM_P6_MODE = "normal"
-            $env:EZTEST_FAKE_LLM_P7_MODE = "normal"
-            $fakeProcess = Start-EvalNodeProcess -ScriptPath (Join-Path $repoRoot "scripts\fake-llm.cjs") -LogName "fake-llm" -Label "fake LLM"
-            Wait-ForHttp -Url "$fakeBaseUrl/v1/models" -TimeoutSeconds 30 -Process $fakeProcess -Label "fake LLM"
-        }
-
-        Write-Step "Starting the fixture target on port $($fixture.TargetPort)"
-        $env:FIXTURE_PORT = "$($fixture.TargetPort)"
-        $fixtureProcess = Start-EvalNodeProcess -ScriptPath (Join-Path $repoRoot "scripts\fixture-target.cjs") -LogName "fixture" -Label "fixture target"
-        Wait-ForHttp -Url "http://127.0.0.1:$($fixture.TargetPort)/health" -TimeoutSeconds 30 -Process $fixtureProcess -Label "fixture target"
-
-        Write-Step "Starting the Playwright executor on port $($fixture.ExecutorPort)"
-        $env:EZTEST_EXECUTOR_ADDR = "127.0.0.1:$($fixture.ExecutorPort)"
-        $env:EZTEST_EXECUTOR_TOKEN = $fixture.ExecutorToken
-        $env:EZTEST_EXECUTOR_MAX_CONTEXTS = "4"
-        $executorProcess = Start-EvalNodeProcess -ScriptPath (Join-Path $repoRoot "executor\src\server.mjs") -LogName "executor" -Label "executor"
-        Wait-ForHttp -Url "http://127.0.0.1:$($fixture.ExecutorPort)/healthz" -TimeoutSeconds 90 -Process $executorProcess -Label "executor"
-
-        Write-Step "Starting the evaluation API on port $($fixture.ApiPort)"
-        $env:EZTEST_ENV = "dev"
-        $env:EZTEST_DATABASE_URL = $pre.EvalDatabaseUrl
-        $env:EZTEST_HTTP_ADDR = ":$($fixture.ApiPort)"
-        $env:EZTEST_WEB_ORIGIN = "http://localhost:6868"
-        $env:EZTEST_ENABLE_TEST_ENDPOINTS = "true"
-        $env:EZTEST_STORAGE_DIR = (Join-Path $dataRoot "objects")
-        $env:EZTEST_EVIDENCE_DIR = (Join-Path $dataRoot "evidence")
-        $env:EZTEST_EXPORT_DIR = (Join-Path $dataRoot "exports")
-        $env:EZTEST_REPORT_DIR = (Join-Path $dataRoot "reports")
-        $env:EZTEST_VERSION_ATTACHMENT_DIR = (Join-Path $dataRoot "attachments")
-        $env:EZTEST_ADMIN_USERNAME = $pre.AdminUsername
-        $env:EZTEST_ADMIN_PASSWORD = $pre.AdminPassword
-        $env:EZTEST_EXECUTOR_URL = "http://127.0.0.1:$($fixture.ExecutorPort)"
-        $env:EZTEST_EXECUTOR_TOKEN = $fixture.ExecutorToken
-        $env:EZTEST_AUTONOMY_BATCHES_PER_TICK = "8"
-        $env:EZTEST_EXEC_MAX_CONCURRENT_CASES = "1"
-        $env:EZTEST_SNOWFLAKE_NODE_ID = "2"
-        foreach ($key in @("EZTEST_SECRET_KEYS", "EZTEST_SECRET_KEY_ACTIVE")) {
-            if ($pre.EnvValues.ContainsKey($key) -and -not [string]::IsNullOrWhiteSpace([string]$pre.EnvValues[$key])) {
-                Set-Item -Path ("Env:" + $key) -Value $pre.EnvValues[$key]
-            }
-        }
-        if ($RealLLM) {
-            $env:llm_base_url = Get-RequiredValue -Values $pre.EnvValues -Key "llm_base_url"
-            $env:llm_key = Get-RequiredValue -Values $pre.EnvValues -Key "llm_key"
-            $env:llm_model_name = [string]$pre.EnvValues["llm_model_name"]
-        } else {
-            $env:llm_base_url = $fakeBaseUrl
-            $env:llm_key = "p8-eval-fake-llm"
-            $env:llm_model_name = $fixture.FakeModel
-        }
-        Remove-Item Env:EZTEST_TEST_DATABASE_URL -ErrorAction SilentlyContinue
-
-        $apiOut = Join-Path $tmpDir "api.out.log"
-        $apiErr = Join-Path $tmpDir "api.err.log"
-        Remove-Item -LiteralPath $apiOut, $apiErr -ErrorAction SilentlyContinue
-        $apiProcess = Start-Process -FilePath $apiExe `
-            -WorkingDirectory $backendDir `
-            -RedirectStandardOutput $apiOut `
-            -RedirectStandardError $apiErr `
-            -WindowStyle Hidden `
-            -PassThru
-        $apiBaseUrl = "http://127.0.0.1:$($fixture.ApiPort)"
-        Wait-ForHttp -Url "$apiBaseUrl/api/health" -TimeoutSeconds 90 -Process $apiProcess -Label "evaluation API"
-        $health = Invoke-RestMethod -Uri "$apiBaseUrl/api/health" -TimeoutSec 20
-        if ($health.data.status -ne "ok" -or $health.data.db -ne "ok") {
-            throw "evaluation API health is not ok"
-        }
-        if (-not [bool]$health.data.llm_configured) {
-            if ($RealLLM) {
-                throw "llm_configured=false; the real-LLM evaluation cannot start without a usable LLM configuration"
-            }
-            throw "llm_configured=false; the deterministic fake LLM configuration was not seeded"
-        }
-
-        Write-Step "Running the $mode evaluation chain"
-        $runnerPath = Join-Path $tmpDir "runner.mjs"
-        [System.IO.File]::WriteAllText($runnerPath, $runnerScript, (New-Object System.Text.UTF8Encoding($false)))
-        $observationPath = Join-Path $tmpDir "observation.json"
-        $resultPath = Join-Path $tmpDir "result.json"
-        # The visual metric is computed from the committed corpus/ground truth by
-        # the Go helper and included in the recorded observation/result.
-        $visualEvalPath = Join-Path $tmpDir "visual-eval.json"
-        [System.IO.File]::WriteAllText($visualEvalPath,
-            ($pre.VisualEval | ConvertTo-Json -Depth 8),
-            (New-Object System.Text.UTF8Encoding($false)))
-
-        $env:P8_EVAL_API_URL = $apiBaseUrl
-        $env:P8_EVAL_ADMIN_USERNAME = $pre.AdminUsername
-        $env:P8_EVAL_ADMIN_PASSWORD = $pre.AdminPassword
-        $env:P8_EVAL_FAKE_LLM_URL = $fakeBaseUrl
-        $env:P8_EVAL_FIXTURE_URL = "http://127.0.0.1:$($fixture.TargetPort)"
-        $env:P8_EVAL_FIXTURE_REPO = $fixtureRepo.Path
-        $env:P8_EVAL_FIXTURE_BRANCH = $fixtureRepo.Branch
-        $env:P8_EVAL_BASE_COMMIT = $fixtureRepo.BaseCommit
-        $env:P8_EVAL_HEAD_COMMIT = $fixtureRepo.HeadCommit
-        $env:P8_EVAL_MODE = $mode
-        $env:P8_EVAL_REQUIREMENTS = Join-Path $corpusDir "requirements.json"
-        $env:P8_EVAL_ENVIRONMENT = Join-Path $corpusDir "environment.json"
-        $env:P8_EVAL_BASELINE = Join-Path $evalRoot "baseline.json"
-        $env:P8_EVAL_GT_IMPACT = Join-Path $truthDir "impact.json"
-        $env:P8_EVAL_GT_CLASSIFICATION = Join-Path $truthDir "classification.json"
-        $env:P8_EVAL_GT_ISSUES = Join-Path $truthDir "issues.json"
-        $env:P8_EVAL_GT_SUPPLEMENT = Join-Path $truthDir "supplement.json"
-        $env:P8_EVAL_OBSERVATION = $observationPath
-        $env:P8_EVAL_RESULT = $resultPath
-        $env:P8_EVAL_VISUAL_RESULT = $visualEvalPath
-        $env:P8_EVAL_REAL_MODEL = [string]$pre.EnvValues["llm_model_name"]
-
-        $runnerLog = Join-Path $tmpDir "runner.log"
-        $previous = $ErrorActionPreference
-        $ErrorActionPreference = "SilentlyContinue"
-        try {
-            & $pre.NodeExe $runnerPath *> $runnerLog
-            $runnerExit = $LASTEXITCODE
-        } finally {
-            $ErrorActionPreference = $previous
-        }
-        Write-LogTail -Path $runnerLog -Label "evaluation runner" -Lines 40
-        if ($runnerExit -ne 0) {
-            Write-LogTail -Path $apiErr -Label "API stderr" -Lines 60
-            throw "the evaluation runner failed with exit code $runnerExit (see .tmp/p8-eval/runner.log)"
-        }
-        if (-not (Test-Path -LiteralPath $resultPath)) {
-            throw "the evaluation runner did not write $resultPath"
-        }
-        $result = Get-Content -LiteralPath $resultPath -Raw -Encoding UTF8 | ConvertFrom-Json
-
-        Write-Step "Evaluation metrics"
-        foreach ($name in $metricNames) {
-            $metric = $result.metrics.$name
-            if ($null -eq $metric) { continue }
-            $verdict = if ([bool]$metric.passed) { "PASS" } else { "FAIL" }
-            $counts = ""
-            if ($null -ne $metric.numerator -and $null -ne $metric.denominator) {
-                $counts = " ({0}/{1})" -f $metric.numerator, $metric.denominator
-            }
-            Write-Host ("  {0,-28} {1,8:P1}  threshold {2,6:P1}  {3}{4}" -f `
-                    $name, [double]$metric.value, [double]$metric.threshold, $verdict, $counts)
-        }
-        if ($null -ne $result.visual) {
-            $visualVerdict = if ([bool]$result.visual.passed) { "PASS" } else { "FAIL" }
-            Write-Host ("  {0,-28} {1,8:P1}  threshold {2,6:P1}  {3} ({4}/{5})" -f `
-                    [string]$result.visual.metric, [double]$result.visual.accuracy,
-                    [double]$result.visual.threshold, $visualVerdict,
-                    [int]$result.visual.correct, [int]$result.visual.total)
-        }
-        if (@($result.regressions).Count -gt 0) {
-            Write-Host ("  baseline regressions: " + (@($result.regressions) -join ", ")) -ForegroundColor Yellow
-        }
-        Write-Host ("Evaluation run #{0} recorded with status '{1}'." -f $result.runId, $result.status)
-
-        if ($mode -eq "deterministic") {
-            if (-not [bool]$result.gatePassed) {
-                throw "the deterministic evaluation gate failed (run #$($result.runId))"
-            }
-            Write-Host "EVAL PASSED" -ForegroundColor Green
-        } else {
-            Write-Host ("REAL LLM REPORT RECORDED (status '{0}'); the report never gates a release." -f $result.status)
-            Write-Host "EVAL REPORT PASSED" -ForegroundColor Green
-        }
-    } finally {
-        Stop-ProcessTree -Process $apiProcess
-        Stop-ProcessTree -Process $executorProcess
-        Stop-ProcessTree -Process $fixtureProcess
-        Stop-ProcessTree -Process $fakeProcess
-        Remove-Item Env:PGPASSWORD -ErrorAction SilentlyContinue
-        Remove-Item Env:llm_key -ErrorAction SilentlyContinue
-        Remove-Item Env:P8_EVAL_ADMIN_PASSWORD -ErrorAction SilentlyContinue
-    }
-} catch {
-    Write-Host ""
-    Write-Host "EVAL FAILED: $($_.Exception.Message)" -ForegroundColor Red
-    if (-not [string]::IsNullOrWhiteSpace($_.ScriptStackTrace)) {
-        Write-Host $_.ScriptStackTrace -ForegroundColor DarkGray
-    }
-    Write-LogTail -Path (Join-Path $tmpDir "api.err.log") -Label "API stderr" -Lines 60
-    Write-LogTail -Path (Join-Path $tmpDir "executor.err.log") -Label "executor stderr" -Lines 40
-    Write-LogTail -Path (Join-Path $tmpDir "fixture.err.log") -Label "fixture stderr" -Lines 20
-    Write-LogTail -Path (Join-Path $tmpDir "fake-llm.err.log") -Label "fake LLM stderr" -Lines 20
-    $exitCode = 1
 }
 
-exit $exitCode
+# ---------------------------------------------------------------------------
+# Real-LLM report track.
+# ---------------------------------------------------------------------------
+$observationPath = ""
+$observation = $null
+# The real-llm run keeps a fresh transcript under .tmp/p6-eval/eval.log so a
+# failure can be diagnosed after the console is gone. DryRun never writes.
+if (-not [string]::IsNullOrWhiteSpace($script:LogPath)) {
+    try {
+        $logParent = Split-Path -Parent $script:LogPath
+        New-Item -ItemType Directory -Force -Path $logParent | Out-Null
+        Remove-Item -LiteralPath $script:LogPath -Force -ErrorAction SilentlyContinue
+    } catch {
+        # A log setup failure must not mask the evaluation result.
+    }
+}
+try {
+    $pre = Invoke-Preflight -ForRealRun $true
+    Write-Info "mode = $Mode (only real-llm exists; no fake/deterministic track)"
+    Write-Step "Checking the P6 API and real-LLM data"
+
+    $health = Invoke-EvalApi -Method "GET" -Path "/api/health" -Body $null -Token ""
+    if ($null -eq $health -or $null -eq $health.data -or [string]$health.data.status -ne "ok") {
+        throw "API health check failed at $($pre.ApiBaseUrl)"
+    }
+    Write-Info "API health = ok"
+
+    $observationPath = Resolve-ObservationPath -Pre $pre
+    $observation = Read-JsonFile -Path $observationPath -Label "real-LLM observation"
+    Test-ObservationShape -Observation $observation -CorpusVersion $pre.CorpusVersion -ExpectedModel $pre.CorpusModel
+    Write-Info "observation = $observationPath (version=$($observation.version_id), source=$($observation.source))"
+
+    Write-Step "Deriving the evaluation sample from real data and committed ground truth"
+    $sample = New-SampleFromObservation `
+        -Observation $observation `
+        -ImpactTruth $pre.ImpactTruth `
+        -ClassificationTruth $pre.ClassificationTruth `
+        -IssuesTruth $pre.IssuesTruth `
+        -SupplementTruth $pre.SupplementTruth `
+        -VisualTruth $pre.VisualTruth
+    Assert-Sample -Sample $sample
+    Write-Info ("sample = confirmed {0}/{0}, covered {1}, impact {2}/{3} (selected {4}), classification {5}/{6}, ai issues {7} (tp {8}), supplement {9}/{10}" -f `
+            $sample["confirmed_requirements"], $sample["covered_requirements"], $sample["impact_hit"], `
+            $sample["impact_expected"], $sample["impact_selected"], $sample["correct_classifications"], `
+            $sample["injected_failures"], $sample["ai_issues"], $sample["true_positive_issues"], `
+            $sample["supplement_hits"], $sample["supplement_cases"])
+    if ($sample.Contains("visual_injected")) {
+        Write-Info ("visual = {0}/{1}" -f $sample["visual_correct"], $sample["visual_injected"])
+    }
+
+    $baselineMap = [ordered]@{}
+    foreach ($name in $metricNames) {
+        $baselineMap[$name] = [double]$pre.Baseline.metrics.PSObject.Properties[$name].Value
+    }
+
+    Write-Step "Recording the real-LLM evaluation run through the admin API"
+    $token = Get-AdminToken -Pre $pre
+    $requestBody = [ordered]@{
+        mode           = "real_llm"
+        corpus_version = $pre.CorpusVersion
+        model          = [string]$observation.model
+        sample         = $sample
+        baseline       = $baselineMap
+        summary        = [ordered]@{
+            source           = "p6-acceptance-observation"
+            observation_file = $observationPath
+            version_id       = [string]$observation.version_id
+            generated_at     = [string]$observation.generated_at
+            report_track     = "real_llm"
+            corpus_files     = @(
+                "corpus/environment.json",
+                "corpus/requirements.json",
+                "corpus/design.json",
+                "corpus/code.json",
+                "corpus/execution.json",
+                "corpus/issues.json",
+                "corpus/visual.json",
+                "ground-truth/impact.json",
+                "ground-truth/classification.json",
+                "ground-truth/issues.json",
+                "ground-truth/supplement.json",
+                "ground-truth/visual.json"
+            )
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$observation.started_at)) {
+        $requestBody["started_at"] = [string]$observation.started_at
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$observation.finished_at)) {
+        $requestBody["finished_at"] = [string]$observation.finished_at
+    }
+
+    $response = Invoke-EvalApi -Method "POST" -Path "/api/quality/eval-runs" -Body $requestBody -Token $token
+    if ($null -eq $response -or $null -eq $response.data -or [string]::IsNullOrWhiteSpace([string]$response.data.id)) {
+        throw "the eval API returned no run data"
+    }
+    $run = $response.data
+
+    $metricsOut = [ordered]@{}
+    $regressions = @()
+    foreach ($metric in @($run.metrics)) {
+        $detail = $metric.detail
+        $entry = [ordered]@{
+            value       = [double]$metric.value
+            threshold   = [double]$metric.threshold
+            passed      = [bool]$metric.passed
+            reason      = [string]$detail.reason
+            numerator   = [int]$detail.numerator
+            denominator = [int]$detail.denominator
+            baseline    = $null
+        }
+        if ($null -ne $detail.baseline) {
+            $entry["baseline"] = [double]$detail.baseline
+        }
+        $metricsOut[[string]$metric.name] = $entry
+        if ([string]$detail.reason -eq "baseline_regression") {
+            $regressions += [string]$metric.name
+        }
+    }
+
+    $result = [ordered]@{
+        schema            = "p6-eval-result/v1"
+        ok                = $true
+        mode              = "real_llm"
+        report_only       = $true
+        corpus_version    = [string]$pre.CorpusVersion
+        model             = [string]$observation.model
+        run_id            = [string]$run.id
+        status            = [string]$run.status
+        metrics           = $metricsOut
+        regressions       = $regressions
+        sample            = $sample
+        baseline          = $baselineMap
+        observation_file  = $observationPath
+        api_base_url      = $pre.ApiBaseUrl
+        recorded_at       = (Get-Date).ToUniversalTime().ToString("o")
+    }
+
+    New-Item -ItemType Directory -Force -Path $script:TmpDir | Out-Null
+    Write-JsonFile -Path (Join-Path $script:TmpDir "result.json") -Value $result
+    $observationDestination = Join-Path $script:TmpDir "observation.json"
+    if ([System.IO.Path]::GetFullPath($observationPath) -ne [System.IO.Path]::GetFullPath($observationDestination)) {
+        Copy-Item -LiteralPath $observationPath -Destination $observationDestination -Force
+    }
+
+    Write-Step "REAL-LLM EVAL RECORDED"
+    Write-Info "run #$($result.run_id) status=$($result.status) (report-only; thresholds never block)"
+    foreach ($name in $metricNames) {
+        if ($null -eq $metricsOut[$name]) { continue }
+        $metric = $metricsOut[$name]
+        $line = "{0,-32} value={1} threshold={2} passed={3} reason={4}" -f `
+            $name, $metric["value"], $metric["threshold"], $metric["passed"], $metric["reason"]
+        Write-Info $line
+    }
+    if ($regressions.Count -gt 0) {
+        Write-Info "baseline regressions (reported, non-blocking): $($regressions -join ', ')"
+    }
+    Write-Info "result = $(Join-Path $script:TmpDir 'result.json')"
+    Write-EvalLog -Message "DONE run=$($result.run_id) status=$($result.status) report_only=true"
+    exit 0
+} catch {
+    Write-FailureEvidence -Message $_.Exception.Message -ObservationPath $observationPath -Observation $observation
+    Write-ErrorLine "EVAL FAILED: $($_.Exception.Message)"
+    exit 1
+}

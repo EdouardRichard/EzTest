@@ -35,6 +35,11 @@ export function getChain(versionId: string, options: ChainQuery = {}): Promise<C
       event_from: options.eventFrom,
       event_to: options.eventTo,
       limit: options.limit ?? 300,
+      q: options.q,
+      abnormal_only: options.abnormalOnly === true ? "true" : undefined,
+      issue_status: options.issueStatus,
+      issue_severity: options.issueSeverity,
+      requirement_limit: options.requirementLimit,
     })}`,
   )
 }

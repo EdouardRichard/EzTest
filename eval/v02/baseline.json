@@ -1,0 +1,25 @@
+{
+  "corpus_version": "v02-2026-11-01.1",
+  "mode": "real_llm",
+  "updated_at": "2026-11-01",
+  "description": "P6 真实 LLM 评测初始基线（报告轨，不阻断阶段验收；P6-D-12/P6-D-21）。基线只允许“不变差”更新：下界指标不得下调，上界 issue_false_positive_rate 不得上调。",
+  "metrics": {
+    "design_coverage": 0.9,
+    "impact_recall": 0.9,
+    "impact_precision": 0.8,
+    "classification_accuracy": 0.9,
+    "issue_false_positive_rate": 0.1,
+    "supplement_hit_rate": 0.8,
+    "visual_classification_accuracy": 0.9
+  },
+  "thresholds": {
+    "design_coverage": 0.8,
+    "impact_recall": 0.7,
+    "impact_precision": 0.6,
+    "classification_accuracy": 0.8,
+    "issue_false_positive_rate": 0.15,
+    "supplement_hit_rate": 0.5,
+    "visual_classification_accuracy": 0.8
+  },
+  "regression_tolerance": 0.05
+}

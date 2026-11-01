@@ -23,8 +23,10 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/llm/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/llm/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+	qualityapi "github.com/EdouardRichard/EzTest/backend/internal/quality/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/resource/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/resource/interfaces/httpapi"
+	searchapi "github.com/EdouardRichard/EzTest/backend/internal/search/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/settings/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/settings/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/storage/application"
@@ -32,6 +34,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/version/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/version/interfaces/httpapi"
 	visualapi "github.com/EdouardRichard/EzTest/backend/internal/visual/interfaces/httpapi"
+	workspaceapi "github.com/EdouardRichard/EzTest/backend/internal/workspace/interfaces/httpapi"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -77,6 +80,20 @@ type Deps struct {
 	// always mounted behind the bearer authentication middleware.
 	CodeIntel *CodeIntelHandlers
 	Visual    *visualapi.Handler
+	// P6 quality/search/todos/global read surfaces. Optional; nil keeps a
+	// P0-P5 deployment unchanged.
+	P6 *P6Handlers
+}
+
+// P6Handlers groups the P6 read-model HTTP surfaces. Agent Center handlers are
+// added by the Agent Center wiring once that context lands.
+type P6Handlers struct {
+	Quality     *qualityapi.Handler
+	Search      *searchapi.Handler
+	Todos       *workspaceapi.Handler
+	Global      *deliveryapi.GlobalHandler
+	AgentCenter *agentapi.AgentCenterHandler
+	Profiles    *agentapi.ProfileHandler
 }
 
 // New assembles the HTTP middleware chain and every P0 route.
@@ -124,8 +141,35 @@ func New(deps Deps) http.Handler {
 	registerChainRoutes(mux, authenticated, deps.Chain)
 	registerCodeIntelRoutes(mux, authenticated, deps.CodeIntel)
 	registerVisualRoutes(mux, authenticated, admin, deps.Visual)
+	registerP6Routes(mux, authenticated, admin, deps.P6)
 
 	return RequestID(Recover(Logging(CORS(deps.Config)(mux))))
+}
+
+// registerP6Routes mounts the optional P6 read-model surfaces. A nil handler
+// keeps the route table identical to a P0-P5 deployment.
+func registerP6Routes(mux *http.ServeMux, authenticated, admin func(http.Handler) http.Handler, h *P6Handlers) {
+	if h == nil {
+		return
+	}
+	if h.Quality != nil {
+		qualityapi.RegisterRoutes(mux, authenticated, admin, h.Quality)
+	}
+	if h.Search != nil {
+		searchapi.RegisterRoutes(mux, authenticated, h.Search)
+	}
+	if h.Todos != nil {
+		workspaceapi.RegisterRoutes(mux, authenticated, h.Todos)
+	}
+	if h.Global != nil {
+		deliveryapi.RegisterGlobal(mux, authenticated, h.Global)
+	}
+	if h.AgentCenter != nil {
+		agentapi.RegisterAgentCenterRoutes(mux, authenticated, h.AgentCenter)
+	}
+	if h.Profiles != nil {
+		agentapi.RegisterProfileRoutes(mux, admin, h.Profiles)
+	}
 }
 
 type identityAuthenticator struct {

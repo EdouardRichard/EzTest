@@ -1362,3 +1362,109 @@
 9. 跨上下文一律逻辑引用，不建 FK；同上下文 FK 显式命名。
 10. 迁移只追加：`#29–#31` 是 P5 对既有表的全部结构变更；P0–P4 表/字段/迁移不改。
 
+---
+
+## 14. P6 quality 增量表结构（`frozen: P6`，2026-11-01）
+
+> 来源：`docs/superpowers/specs/2026-11-01-eztest-v02-p6-parity-quality-search-agent-center-design.md` §3.2/§5/§14。
+> 迁移：`quality_0001_eval.sql`（#32，quality 上下文，2 表）。
+> P0–P5 表不变（不 ALTER）；2 张新表雪花 `BIGINT` 主键（应用生成，不 BIGSERIAL），时间 `TIMESTAMPTZ`（API 为 RFC3339 UTC）。
+> quality 上下文只写自己的两张表；运营指标通过 application 端口聚合，不直读他域表。
+
+### 14.1 `eval_run`
+
+**`eval_run`**（终态评测 run；真实 LLM 报告轨）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `id` | BIGINT | NOT NULL，`pk_eval_run` PRIMARY KEY（雪花） |
+| `mode` | TEXT | NOT NULL，CHECK `mode = 'real_llm'`（P6 不实现 fake-LLM） |
+| `corpus_version` | TEXT | NOT NULL，CHECK `corpus_version <> ''` |
+| `model` | TEXT | NOT NULL DEFAULT `''`（真实模型名，如 `deepseek-flash`） |
+| `status` | TEXT | NOT NULL，CHECK `running/passed/failed/error` |
+| `summary` | JSONB | NOT NULL DEFAULT `'{}'::jsonb`，CHECK `jsonb_typeof(summary) = 'object'` |
+| `started_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+| `finished_at` | TIMESTAMPTZ | NULL |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+
+约束/索引：
+
+- `pk_eval_run`；
+- `idx_eval_run_created_at (created_at DESC, id DESC)`（列表/最新摘要按时间倒序）。
+
+### 14.2 `eval_metric`
+
+**`eval_metric`**（run 的 6+1 指标；`run_id` 为同上下文 FK）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `run_id` | BIGINT | NOT NULL，`REFERENCES eval_run(id) ON DELETE CASCADE` |
+| `name` | TEXT | NOT NULL，CHECK `name <> ''`（服务端只接受 §5.3 指标名，DB 不硬编码枚举） |
+| `value` | NUMERIC(8,5) | NOT NULL |
+| `threshold` | NUMERIC(8,5) | NOT NULL（真实 LLM 报告阈值，不阻断阶段验收） |
+| `passed` | BOOLEAN | NOT NULL |
+| `detail` | JSONB | NOT NULL DEFAULT `'{}'::jsonb`，CHECK `jsonb_typeof(detail) = 'object'` |
+| `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+
+约束/索引：
+
+- `pk_eval_metric` PRIMARY KEY `(run_id, name)`；
+- `fk_eval_metric_run` FOREIGN KEY `(run_id) REFERENCES eval_run(id) ON DELETE CASCADE`；
+- `idx_eval_metric_run (run_id, name)`。
+
+### 14.3 P6 quality 数据不变量
+
+1. 不新增 `baseline` 列：基线值写 `detail.baseline`（与 0.1 DDL 一致；0.1 detailed-design 的 baseline 列与 DDL 不一致，以 DDL 为准）。
+2. `eval_metric.name` 不在 DB 硬编码枚举；服务端只接受 §5.3 的 7 个指标名，未知名称拒绝。
+3. 指标由服务端从样本计数派生；客户端传入的 passed/threshold/verdict 被忽略；`detail` 必含 `numerator/denominator/threshold_passed/regressed/reason`，有 baseline 时含 `baseline`。
+4. `eval_run.status` 除请求声明 `error` 外由指标派生（全 passed→passed，否则 failed）；测试项写操作审计走 `audit_log`（不新增事件/触发器）。
+5. 评测样本物理约束（非负、`covered<=confirmed`、`impact_hit<=impact_expected`、`impact_hit<=impact_selected`、`correct<=injected`、`true_positive<=ai_issues`、`supplement_hits<=supplement_cases`、`visual_correct<=visual_injected`）在服务端校验，违反 400 `invalid_argument`；表只持久化已校验结果。
+6. 迁移只追加：`#32` 不改 `#1–#31`；quality 上下文不建跨上下文 FK。
+
+---
+
+## 15. P6 agent 提示词版本增量（`frozen: P6`，2026-11-01）
+
+> 来源：spec §3.3/§8/§14。迁移：`agent_0005_profile_prompt_revision.sql`（#33，agent 上下文，1 表）。
+> P6 **不新增** `agent_profile.current_prompt_id`/`prompt_version` 列：`agent_profile.system_prompt` 仍是运行时唯一“当前真源”，读取路径零改动；当前版本 = `max(version)`。
+> `agent_profile` 表结构不变（只写 `updated_at` 数据）；历史 revision 只追加、不更新、不删除。
+
+### 15.1 `agent_profile_prompt_revision`
+
+**`agent_profile_prompt_revision`**（提示词历史；append-only；`profile_key` 同上下文 FK）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `id` | BIGINT | PRIMARY KEY（雪花） |
+| `profile_key` | TEXT | NOT NULL，`REFERENCES agent_profile(key) ON DELETE CASCADE`（同上下文 FK） |
+| `version` | INT | NOT NULL，CHECK `version > 0` |
+| `system_prompt` | TEXT | NOT NULL，CHECK `system_prompt <> ''` |
+| `note` | TEXT | NULL |
+| `source` | TEXT | NOT NULL，CHECK `source IN ('seed','admin','reset')` |
+| `actor_id` | BIGINT | NULL（逻辑引用 identity；seed 为 NULL） |
+| `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+
+约束/索引：
+
+- `pk_agent_profile_prompt_revision` PRIMARY KEY `(id)`；
+- `uk_agent_profile_prompt_revision` UNIQUE `(profile_key, version)`；
+- `idx_agent_profile_prompt_revision_key (profile_key, version DESC)`。
+
+### 15.2 版本/回填/回退语义
+
+1. **append-only**：只有 INSERT；PUT/reset/restore 均新增版本，不修改历史行。`version=max(version)+1` 在 `SELECT ... FOR UPDATE` 事务内计算。
+2. **seed/回填**：启动 `EnsureProfiles` 后，对无 revision 的 profile 插入 `v1`，内容=当时 DB `system_prompt`，`source=seed`；幂等、不覆盖管理员编辑；不重复插入已有 revision 的 profile。
+3. **PUT**：校验（非空/≤32768 runes/含 `[profile:<key>]`/模板语法/变量白名单）→ insert revision(`source=admin`) → 同一事务 `UPDATE agent_profile.system_prompt` + `updated_at`。内容与当前正文相同 no-op：不插版本、返回 `changed=false`；`expected_version` 不匹配 409 `state_conflict`。
+4. **reset**：追加默认正文（与 `Profiles()` seed 同源，`DefaultPrompt(key)`），`source=reset`。
+5. **restore**：追加指定旧版本正文，`source=admin`、`note=restore vN`；不修改历史行。
+6. **当前正文**：始终以 `agent_profile.system_prompt` 为准（版本表是历史，不是读路径）；`prompt_version` API 字段=当前 `max(version)`。
+7. 迁移只追加：`#33` 不改 `#1–#32`；同上下文 FK 显式，跨上下文只逻辑引用。
+
+### 15.3 `agent_profile.updated_at` 写路径与 P6 新表边界
+
+- `agent_profile` 无触发器：PATCH profile 配置与 PUT/reset/restore prompt 在**同一事务**内显式 `updated_at=now()`；其余读路径不改写。`name`/`enabled`/`key` 不写；`system_prompt` 只经版本端点写。
+- **P6 唯一新表 = 3 张**：`eval_run`、`eval_metric`（#32 quality）+ `agent_profile_prompt_revision`（#33 agent）；**不新增其他表**，P6 不对既有表做任何 ALTER/列变更。
+- `agent_run` 仅为 Agent 中心观察读模型；P6 默认**不加** `idx_agent_run_profile_key_id`（数据量小，仅当集成性能测试证明需要时由后续阶段追加）。
+- `delivery_issue`/`delivery_report`/`delivery_report_revision`/`version` 被全局中心只读复用；不新增表、不加索引，全局列表按 id DESC 走 PK。
+- 命名/结构自检：新表主键 `pk_`、唯一键 `uk_`、普通索引 `idx_`；字段 snake_case；时间 RFC3339 UTC；跨上下文不建 FK；迁移文件只属一个上下文（#32 quality、#33 agent）。
+
