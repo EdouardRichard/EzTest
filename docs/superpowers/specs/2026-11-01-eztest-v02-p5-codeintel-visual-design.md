@@ -1204,6 +1204,12 @@ channel：`version:{version_id}`（索引/分析/视觉）；索引若 `version_
 | P5-D-16 | **提议 `sut_page.source=ai`、`sut_api.source=ai|code`；rejected 不自动重提** | 0.2 枚举；OD-7；D-09 | 设计裁决，随 spec 批准 |
 | P5-D-17 | **质量页只做视觉指标占位；完整质量中心/评测 P6** | phase-05:27；HLD:564；D-09 Q1 | 2026-11-01 用户选择 Q1 |
 | P5-D-18 | **P5 不做 live probe/视觉 mask/GC/PDF/多实例；移交表见 §14/§18** | phase-05 Out；P6/P7 | 2026-11-01 用户选择 A/范围 |
+| P5-D-19 | **`design_host` 增量允许 `code.facts`/`code.routes`/`code.apis`** | S4 要求设计 Agent 真实读码；原 §4.4 仅列 5 profile，契约同步 §8.1；不影响 P1–P4 其他 profile | 实施中追加（验收发现，随本 spec 批准） |
+| P5-D-20 | **视觉断言结果/分类优先于 Case Executor 自由文本 step blocked/failed；失败分析重算同样遵守** | S8/S9 验收发现 blocked/failed 覆盖 visual inconclusive；三层守卫：聚合前规范化 step、聚合后 ApplyVisualOutcome、失败分析重算 override | 实施中追加（验收发现） |
+| P5-D-21 | **config revision 更新 supersede 旧基线后，重跑原因用 `visual_config_changed`（按最近基线 revision 判定），不误报 missing baseline** | S11 验收；`visual_assertion.config_revision` 与最近基线 revision 比较；恢复需重批基线 | 实施中追加（验收发现） |
+| P5-D-22 | **fact review 后立即重算 impact；incorrect fact 从自动影响排除，即使 T1 analysis cache hit** | S6 验收发现 cache 命中时旧候选未刷新；`ReviewService` 可选持有 `ImpactService` 同步重算 | 实施中追加（验收发现） |
+| P5-D-23 | **网络证据 URL 可为浏览器相对路径，按 version SUT base URL 解析后 host 校验；页面级捕获可作 source=code 提议** | S12 验收；fixture 的 `GET /p5/orders` 也形成提议；并非只接受 `/p5/api/orders` | 实施中追加（验收发现） |
+| P5-D-24 | **analysis detail #15 由 `ImpactService.Detail` 填充 candidates，避免与 T1 handler 重复注册路由** | S3 验收要求 detail candidates；`WithImpact` 注入 T1 Handler | 实施中追加（验收发现） |
 
 - 任何实现中新偏差：先在 §16 追加 `P5-D-19+` 并停止报告，不得静默改设计。
 
