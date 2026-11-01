@@ -3,7 +3,7 @@
 > 状态：**completed（真实 LLM + 真实 Chrome 验收 S0–S9 全部 PASS；浏览器 E2E 2/2 PASS；契约 `frozen: P6`）**
 > 日期：2026-11-01
 > 阶段：P6（`phase-06-parity-quality-search-agent-center.md`）
-> 实施分支：`feat/v0.2-p6`（从 `feat/v0.2` @`1c10850` 拉出；**尚未合回**）
+> 实施分支：`feat/v0.2-p6`（从 `feat/v0.2` @`1c10850` 拉出）；**已合回 `feat/v0.2`（merge `d377dfe`，2026-11-01 P6 完成点）**
 > 实施 spec：[2026-11-01-eztest-v02-p6-parity-quality-search-agent-center-design.md](../../superpowers/specs/2026-11-01-eztest-v02-p6-parity-quality-search-agent-center-design.md)
 > 实施 plan：[2026-11-01-eztest-v02-p6-parity-quality-search-agent-center.md](../../superpowers/plans/2026-11-01-eztest-v02-p6-parity-quality-search-agent-center.md)
 > 验收证据：[acceptance/p6/](../acceptance/p6/)
@@ -89,10 +89,10 @@
 ## 7. 下一阶段启动建议
 
 1. 先审阅 `acceptance/p6/` 与 diff；确认无用户文件需要恢复（见 §5.8）。
-2. 将 `feat/v0.2-p6` 合回 `feat/v0.2`（Lead 执行，记录 merge）。
+2. 已合回 `feat/v0.2`（merge `d377dfe`）。
 3. P7 会话按 `phase-07-p9.md` 启动；先读本 handoff + contracts；不要恢复 0.1 控制面。
 4. 若 P8 要做确定性评测门禁，需单独设计 fake-LLM/fixture 全流程并获用户批准；不要改 P6 已冻结契约语义。
 
 ## 8. 停止声明
 
-P6 已交付：真实 LLM + Chrome 验收 S0–S9 PASS，E2E 2/2 PASS，全量测试/契约门禁绿，契约 `frozen: P6`，本 handoff 完成。**尚未合回 `feat/v0.2`；不自动进入 P7**，等待用户验收/指示。
+P6 已交付并合入 `feat/v0.2`（merge `d377dfe`）：真实 LLM + Chrome 验收 S0–S9 PASS，E2E 2/2 PASS，全量测试/契约门禁绿，契约 `frozen: P6`，本 handoff 完成。**不自动进入 P7**，等待用户验收/指示。
