@@ -39,3 +39,12 @@ const (
 type Provider interface {
 	Items(ctx context.Context, viewer platform.Actor) ([]TodoItem, error)
 }
+
+// VersionTitleReader is the narrow version application port used to decorate
+// the todo items whose provider cannot read another context's version table. It
+// resolves every requested version ID in one batch (spec §9: version_title
+// comes from the version context, never from another context's SQL). The
+// version application QueryService satisfies it without an adapter.
+type VersionTitleReader interface {
+	VersionTitles(ctx context.Context, ids []int64) (map[int64]string, error)
+}

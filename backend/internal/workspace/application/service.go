@@ -2,6 +2,7 @@ package workspaceapp
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"time"
 
@@ -80,11 +81,23 @@ var kindOrder = map[string]int{
 // it never writes and never queries another context's storage directly.
 type Service struct {
 	providers []Provider
+	titles    VersionTitleReader
 }
 
 // NewService wires the todo providers in any order.
 func NewService(providers ...Provider) *Service {
 	return &Service{providers: providers}
+}
+
+// WithVersionTitles attaches the version title resolver used to fill the items
+// whose provider cannot see another context's version table. A nil resolver
+// leaves the titles empty; the production assembly root must wire the version
+// QueryService.
+func (s *Service) WithVersionTitles(titles VersionTitleReader) *Service {
+	if s != nil {
+		s.titles = titles
+	}
+	return s
 }
 
 // Snapshot returns the aggregated todo feed for the viewer (spec §4.3.2).
@@ -146,7 +159,61 @@ func (s *Service) Snapshot(ctx context.Context, viewer platform.Actor, limit int
 	if len(items) > limit {
 		items = items[:limit]
 	}
+	if err := s.decorateVersionTitles(ctx, items); err != nil {
+		return Snapshot{}, err
+	}
 	return Snapshot{Items: items, Counts: counts}, nil
+}
+
+// decorateVersionTitles fills the missing version titles of the visible items
+// in one batch read. Only positive version IDs are resolved, so the
+// version-less human requests and dead work items are skipped. A reader failure
+// is propagated, matching the feed's provider error semantics: a todo feed with
+// silently empty titles would hide the regression this decoration fixes.
+func (s *Service) decorateVersionTitles(ctx context.Context, items []TodoItem) error {
+	if s == nil || s.titles == nil {
+		return nil
+	}
+	ids := missingVersionTitleIDs(items)
+	if len(ids) == 0 {
+		return nil
+	}
+	titles, err := s.titles.VersionTitles(ctx, ids)
+	if err != nil {
+		return fmt.Errorf("resolve version titles: %w", err)
+	}
+	if len(titles) == 0 {
+		return nil
+	}
+	for index := range items {
+		if items[index].VersionTitle != "" || items[index].VersionID <= 0 {
+			continue
+		}
+		if title, found := titles[items[index].VersionID]; found {
+			items[index].VersionTitle = title
+		}
+	}
+	return nil
+}
+
+// missingVersionTitleIDs returns the deduplicated positive version IDs of the
+// items that still need a title, sorted so the single batch read is
+// deterministic.
+func missingVersionTitleIDs(items []TodoItem) []int64 {
+	seen := make(map[int64]struct{})
+	ids := make([]int64, 0)
+	for _, item := range items {
+		if item.VersionTitle != "" || item.VersionID <= 0 {
+			continue
+		}
+		if _, duplicate := seen[item.VersionID]; duplicate {
+			continue
+		}
+		seen[item.VersionID] = struct{}{}
+		ids = append(ids, item.VersionID)
+	}
+	sort.Slice(ids, func(left, right int) bool { return ids[left] < ids[right] })
+	return ids
 }
 
 func normalizeLimit(limit int) int {

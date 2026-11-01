@@ -2,6 +2,8 @@ package searchapp
 
 import (
 	"context"
+	"sort"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -12,6 +14,7 @@ import (
 // is stateless and performs no caching: every Search call is independent.
 type Service struct {
 	providers map[string]Provider
+	titles    VersionTitleReader
 }
 
 // NewService wires the five search-type providers.
@@ -23,6 +26,17 @@ func NewService(providers Providers) *Service {
 		TypeIssue:       providers.Issue,
 		TypeReport:      providers.Report,
 	}}
+}
+
+// WithVersionTitles attaches the version title resolver used to fill the items
+// whose provider cannot see another context's version table. A nil resolver
+// leaves the titles empty instead of degrading the search; the production
+// assembly root must wire the version QueryService.
+func (s *Service) WithVersionTitles(titles VersionTitleReader) *Service {
+	if s != nil {
+		s.titles = titles
+	}
+	return s
 }
 
 // Search validates the request, queries each requested type exactly once and
@@ -68,7 +82,86 @@ func (s *Service) Search(ctx context.Context, q string, types []string, limit in
 		snapshot.Total += len(items)
 		snapshot.Groups = append(snapshot.Groups, Group{Type: typeName, Items: items})
 	}
+	s.decorateVersionTitles(ctx, &snapshot)
 	return snapshot, nil
+}
+
+// decorateVersionTitles fills the missing version titles in one batch read. The
+// lookup is best-effort: a failing title reader marks the snapshot degraded and
+// keeps the titles that the providers already resolved, because the groups
+// themselves are healthy and spec §4.3.1 requires a 200 partial result rather
+// than a 5xx. A nil reader is an unwired decoration and stays silent.
+func (s *Service) decorateVersionTitles(ctx context.Context, snapshot *Snapshot) {
+	if s == nil || s.titles == nil {
+		return
+	}
+	ids := missingVersionTitleIDs(snapshot.Groups)
+	if len(ids) == 0 {
+		return
+	}
+	titles, err := s.titles.VersionTitles(ctx, ids)
+	if err != nil {
+		snapshot.Degraded = true
+		return
+	}
+	applyVersionTitles(snapshot.Groups, titles)
+}
+
+// missingVersionTitleIDs returns the deduplicated positive version IDs of the
+// items that still need a title, sorted so the single batch read is
+// deterministic.
+func missingVersionTitleIDs(groups []Group) []int64 {
+	seen := make(map[int64]struct{})
+	ids := make([]int64, 0)
+	for _, group := range groups {
+		for _, item := range group.Items {
+			if item.VersionTitle != "" {
+				continue
+			}
+			id, ok := parseVersionID(item.VersionID)
+			if !ok {
+				continue
+			}
+			if _, duplicate := seen[id]; duplicate {
+				continue
+			}
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+	}
+	sort.Slice(ids, func(left, right int) bool { return ids[left] < ids[right] })
+	return ids
+}
+
+func applyVersionTitles(groups []Group, titles map[int64]string) {
+	if len(titles) == 0 {
+		return
+	}
+	for groupIndex := range groups {
+		items := groups[groupIndex].Items
+		for itemIndex := range items {
+			if items[itemIndex].VersionTitle != "" {
+				continue
+			}
+			id, ok := parseVersionID(items[itemIndex].VersionID)
+			if !ok {
+				continue
+			}
+			if title, found := titles[id]; found {
+				items[itemIndex].VersionTitle = title
+			}
+		}
+	}
+}
+
+// parseVersionID decodes the decimal-string ID of the JSON boundary and drops
+// the zero, negative and malformed IDs that cannot name a version.
+func parseVersionID(raw string) (int64, bool) {
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || id <= 0 {
+		return 0, false
+	}
+	return id, true
 }
 
 // NormalizeQuery trims the raw keyword and enforces the 1–100 character bound.

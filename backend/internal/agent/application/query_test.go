@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
@@ -19,12 +20,58 @@ type fakeP6RetryReader struct {
 	err   error
 	calls int
 	scope *int64
+
+	deadRows  []agentapp.DeadWorkItemRow
+	deadErr   error
+	deadLimit int
+	deadCalls int
 }
 
 func (f *fakeP6RetryReader) CountTaskRetries(_ context.Context, versionID *int64) (int, int, error) {
 	f.calls++
 	f.scope = versionID
 	return f.num, f.denom, f.err
+}
+
+func (f *fakeP6RetryReader) ListDeadWorkItems(_ context.Context, limit int) ([]agentapp.DeadWorkItemRow, error) {
+	f.deadCalls++
+	f.deadLimit = limit
+	return f.deadRows, f.deadErr
+}
+
+func TestP6ListDeadWorkItems(t *testing.T) {
+	created := time.Date(2026, 10, 31, 9, 0, 0, 0, time.UTC)
+	reader := &fakeP6RetryReader{deadRows: []agentapp.DeadWorkItemRow{
+		{ID: 11, VersionID: 7, Title: "execute.case 重试耗尽", CreatedAt: created},
+	}}
+	service := agentapp.NewQueryService(reader)
+
+	rows, err := service.ListDeadWorkItems(context.Background(), 999)
+	if err != nil {
+		t.Fatalf("ListDeadWorkItems: %v", err)
+	}
+	if reader.deadLimit != 200 {
+		t.Fatalf("limit = %d, want clamp 200", reader.deadLimit)
+	}
+	if len(rows) != 1 || rows[0].ID != 11 || rows[0].VersionID != 7 {
+		t.Fatalf("rows = %#v", rows)
+	}
+	if rows[0].Title != "execute.case 重试耗尽" || !rows[0].CreatedAt.Equal(created) {
+		t.Fatalf("row = %#v", rows[0])
+	}
+
+	if _, err := service.ListDeadWorkItems(context.Background(), 0); err != nil {
+		t.Fatalf("ListDeadWorkItems default: %v", err)
+	}
+	if reader.deadLimit != 50 {
+		t.Fatalf("default limit = %d, want 50", reader.deadLimit)
+	}
+
+	want := errors.New("boom")
+	failing := agentapp.NewQueryService(&fakeP6RetryReader{deadErr: want})
+	if _, err := failing.ListDeadWorkItems(context.Background(), 10); !errors.Is(err, want) {
+		t.Fatalf("err = %v, want %v", err, want)
+	}
 }
 
 func TestP6CountTaskRetries(t *testing.T) {

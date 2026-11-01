@@ -80,6 +80,12 @@ type QueryReader interface {
 	CountCaseConfirmation(ctx context.Context, versionID *int64) (num, denom int, err error)
 	SearchCases(ctx context.Context, q string, limit int) ([]CaseSearchRow, error)
 	ListDraftCases(ctx context.Context, limit int) ([]DraftCaseRow, error)
+	// PendingDesignCounts returns the pending design count of every requested
+	// version in one batch: clarified requirements without an active design
+	// scope. Versions with a zero pending count are omitted from the map. The
+	// version context's reader consumes this through its application port so it
+	// never joins the design tables.
+	PendingDesignCounts(ctx context.Context, versionIDs []int64) (map[int64]int, error)
 }
 
 // QueryService is the P6 read-only query port of the design context.
@@ -158,6 +164,39 @@ func (s *QueryService) ListDraftCases(ctx context.Context, limit int) ([]TodoHit
 		})
 	}
 	return items, nil
+}
+
+// PendingDesignCounts batches the pending design count of the requested
+// versions for the version read source. Non-positive IDs are dropped and
+// duplicates are collapsed before the read; an empty input returns an empty map
+// without touching the reader.
+func (s *QueryService) PendingDesignCounts(ctx context.Context, versionIDs []int64) (map[int64]int, error) {
+	if err := s.requireReader(); err != nil {
+		return nil, err
+	}
+	unique := make([]int64, 0, len(versionIDs))
+	seen := make(map[int64]struct{}, len(versionIDs))
+	for _, id := range versionIDs {
+		if id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+	if len(unique) == 0 {
+		return map[int64]int{}, nil
+	}
+	counts, err := s.reader.PendingDesignCounts(ctx, unique)
+	if err != nil {
+		return nil, err
+	}
+	if counts == nil {
+		counts = map[int64]int{}
+	}
+	return counts, nil
 }
 
 func normalizeSearchLimit(limit int) int {

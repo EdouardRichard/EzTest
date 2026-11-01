@@ -27,6 +27,11 @@ type fakeP6DesignReader struct {
 	draftErr   error
 	draftLimit int
 	draftCalls int
+
+	pendingIDs    []int64
+	pendingResult map[int64]int
+	pendingErr    error
+	pendingCalls  int
 }
 
 func (f *fakeP6DesignReader) CountCaseConfirmation(_ context.Context, versionID *int64) (int, int, error) {
@@ -45,6 +50,12 @@ func (f *fakeP6DesignReader) ListDraftCases(_ context.Context, limit int) ([]Dra
 	f.draftCalls++
 	f.draftLimit = limit
 	return f.draftRows, f.draftErr
+}
+
+func (f *fakeP6DesignReader) PendingDesignCounts(_ context.Context, versionIDs []int64) (map[int64]int, error) {
+	f.pendingCalls++
+	f.pendingIDs = append([]int64(nil), versionIDs...)
+	return f.pendingResult, f.pendingErr
 }
 
 func TestP6CountCaseConfirmation(t *testing.T) {
@@ -194,6 +205,46 @@ func TestP6ListDraftCasesBuildsTodos(t *testing.T) {
 	}
 	if reader.draftLimit != 50 {
 		t.Fatalf("default limit = %d, want 50", reader.draftLimit)
+	}
+}
+
+func TestP6PendingDesignCountsBatchesAndDeduplicates(t *testing.T) {
+	reader := &fakeP6DesignReader{pendingResult: map[int64]int{3: 2, 4: 1}}
+	service := NewQueryService(reader)
+
+	counts, err := service.PendingDesignCounts(context.Background(), []int64{3, 3, 0, -1, 4})
+	if err != nil {
+		t.Fatalf("PendingDesignCounts: %v", err)
+	}
+	if reader.pendingCalls != 1 {
+		t.Fatalf("reader calls = %d, want 1 (batch)", reader.pendingCalls)
+	}
+	if len(reader.pendingIDs) != 2 || reader.pendingIDs[0] != 3 || reader.pendingIDs[1] != 4 {
+		t.Fatalf("ids = %v, want [3 4]", reader.pendingIDs)
+	}
+	if counts[3] != 2 || counts[4] != 1 {
+		t.Fatalf("counts = %#v, want map[3:2 4:1]", counts)
+	}
+
+	readsBefore := reader.pendingCalls
+	counts, err = service.PendingDesignCounts(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("PendingDesignCounts nil: %v", err)
+	}
+	if counts == nil || len(counts) != 0 {
+		t.Fatalf("counts = %#v, want empty non-nil map", counts)
+	}
+	if reader.pendingCalls != readsBefore {
+		t.Fatalf("reader calls = %d, want no call for empty input", reader.pendingCalls)
+	}
+}
+
+func TestP6PendingDesignCountsPropagatesReaderError(t *testing.T) {
+	want := errors.New("boom")
+	service := NewQueryService(&fakeP6DesignReader{pendingErr: want})
+
+	if _, err := service.PendingDesignCounts(context.Background(), []int64{3}); !errors.Is(err, want) {
+		t.Fatalf("err = %v, want %v", err, want)
 	}
 }
 
