@@ -57,25 +57,35 @@ func (p *ExecutionProvider) Waves(ctx context.Context, versionID int64) ([]chain
 // CaseRuns returns every case run of the version's waves. The version itself is
 // not a case_run column, so the run set is reached through the wave set.
 func (p *ExecutionProvider) CaseRuns(ctx context.Context, versionID int64) ([]chain.Node, error) {
+	_, nodes, err := p.ExecutionSnapshot(ctx, versionID)
+	return nodes, err
+}
+
+// ExecutionSnapshot is the P6 one-read fast path: the wave list is read once and
+// every wave's runs are mapped in the same walk, so the chain service does not
+// enumerate waves twice.
+func (p *ExecutionProvider) ExecutionSnapshot(ctx context.Context, versionID int64) ([]chain.Node, []chain.Node, error) {
 	waves, err := p.listWaves(ctx, versionID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	nodes := make([]chain.Node, 0)
+	waveNodes := make([]chain.Node, 0, len(waves))
+	runNodes := make([]chain.Node, 0)
 	for _, wave := range waves {
+		waveNodes = append(waveNodes, waveNode(wave))
 		runs, err := p.runs.ListAllByWave(ctx, wave.ID)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		for _, run := range runs {
 			node, err := p.caseRunNode(ctx, run)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
-			nodes = append(nodes, node)
+			runNodes = append(runNodes, node)
 		}
 	}
-	return nodes, nil
+	return waveNodes, runNodes, nil
 }
 
 func (p *ExecutionProvider) listWaves(ctx context.Context, versionID int64) ([]execution.RunWave, error) {
@@ -112,6 +122,7 @@ func waveNode(wave execution.RunWave) chain.Node {
 		UpdatedAt: wave.UpdatedAt,
 		Meta: map[string]any{
 			"trigger":        wave.Trigger,
+			"wave_status":    string(wave.Status),
 			"counts":         waveCountsMap(wave.Counts),
 			"evidence_count": wave.Counts.Evidence,
 		},
@@ -162,6 +173,7 @@ func (p *ExecutionProvider) caseRunNode(ctx context.Context, run execution.CaseR
 		CreatedAt:     run.CreatedAt,
 		UpdatedAt:     run.UpdatedAt,
 		Meta: map[string]any{
+			"attempt":                run.Attempts,
 			"attempts":               run.Attempts,
 			"step_count":             run.Summary.StepTotal,
 			"step_failed_count":      run.Summary.StepFailed,
@@ -169,6 +181,11 @@ func (p *ExecutionProvider) caseRunNode(ctx context.Context, run execution.CaseR
 			"assertion_failed_count": run.Summary.AssertionFailed,
 			"evidence_count":         run.Summary.EvidenceCount,
 		},
+	}
+	if run.StartedAt != nil && run.FinishedAt != nil {
+		if duration := run.FinishedAt.Sub(*run.StartedAt); duration >= 0 {
+			node.Meta["duration_ms"] = duration.Milliseconds()
+		}
 	}
 	if run.FailureClass != "" {
 		node.Meta["failure_class"] = string(run.FailureClass)
@@ -207,6 +224,8 @@ func caseRunResult(status execution.CaseRunStatus) string {
 		return "inconclusive"
 	case execution.CaseRunSkipped:
 		return "skipped"
+	case execution.CaseRunInterrupted:
+		return "interrupted"
 	default:
 		return ""
 	}

@@ -125,14 +125,21 @@ func issueNode(issue delivery.Issue, refs []delivery.IssueRef) chain.Node {
 		CreatedAt:    issue.CreatedAt,
 		UpdatedAt:    issue.UpdatedAt,
 		Meta: map[string]any{
-			"category":     issue.Category,
-			"severity":     issue.Severity,
-			"source":       issue.Source,
-			"reopen_count": issue.ReopenCount,
+			"category":       issue.Category,
+			"severity":       issue.Severity,
+			"issue_status":   string(issue.Status),
+			"source":         issue.Source,
+			"reopen_count":   issue.ReopenCount,
+			"evidence_count": 0,
+			"code_ref_count": 0,
 		},
+	}
+	if issue.MergedIntoID != nil {
+		node.Meta["merged_into_id"] = strconv.FormatInt(*issue.MergedIntoID, 10)
 	}
 	sutIDs := make([]int64, 0)
 	refRows := make([]map[string]any, 0, len(refs))
+	evidenceCount := 0
 	for _, ref := range refs {
 		switch ref.Kind {
 		case delivery.IssueRefKindCaseRun:
@@ -145,6 +152,8 @@ func issueNode(issue delivery.Issue, refs []delivery.IssueRef) chain.Node {
 			setRefOnce(&node.RequirementID, ref.RefID)
 		case delivery.IssueRefKindReport:
 			setRefOnce(&node.ReportID, ref.RefID)
+		case delivery.IssueRefKindEvidence:
+			evidenceCount++
 		}
 		if ref.VersionSUTID != nil {
 			sutIDs = append(sutIDs, *ref.VersionSUTID)
@@ -154,6 +163,7 @@ func issueNode(issue delivery.Issue, refs []delivery.IssueRef) chain.Node {
 			"ref_id": strconv.FormatInt(ref.RefID, 10),
 		})
 	}
+	node.Meta["evidence_count"] = evidenceCount
 	node.VersionSUTIDs = sortUniqueIDs(sutIDs)
 	if len(node.VersionSUTIDs) == 1 {
 		node.VersionSUTID = int64Ptr(node.VersionSUTIDs[0])
@@ -224,7 +234,9 @@ func reportNode(report delivery.Report, refs []delivery.ReportRef, revisions []d
 		CreatedAt: report.CreatedAt,
 		UpdatedAt: report.UpdatedAt,
 		Meta: map[string]any{
-			"kind": string(report.Kind),
+			"kind":          string(report.Kind),
+			"report_kind":   string(report.Kind),
+			"report_status": string(report.Status),
 		},
 	}
 	issueIDs := make([]int64, 0)
@@ -250,7 +262,8 @@ func reportNode(report delivery.Report, refs []delivery.ReportRef, revisions []d
 			if revision.ID != *report.CurrentRevisionID {
 				continue
 			}
-			node.Meta["current_revision"] = revision.Revision
+			node.Meta["current_revision"] = int(revision.Revision)
+			node.Meta["revision"] = int(revision.Revision)
 			if !revision.AsOf.IsZero() {
 				node.Meta["as_of"] = revision.AsOf
 			}
@@ -317,8 +330,9 @@ func (p *DeliveryProvider) Closures(ctx context.Context, versionID int64) ([]cha
 			CreatedAt:     summary.ClosedAt,
 			UpdatedAt:     summary.ClosedAt,
 			Meta: map[string]any{
-				"close_round":  summary.CloseRound,
-				"reopen_count": summary.ReopenCount,
+				"close_round":    summary.CloseRound,
+				"reopen_count":   summary.ReopenCount,
+				"closure_status": summary.Status,
 			},
 		}
 		if !summary.ClosedAt.IsZero() {

@@ -340,8 +340,16 @@ func TestChainHandlerEmptyGraphIsNot404(t *testing.T) {
 	if edges, ok := data["edges"].([]any); !ok || len(edges) != 0 {
 		t.Errorf("edges = %#v, want []", data["edges"])
 	}
-	if counts, ok := data["counts"].(map[string]any); !ok || len(counts) != 0 {
-		t.Errorf("counts = %#v, want {}", data["counts"])
+	// P6 keeps the P4 scalar keys at zero and adds the typed counts objects.
+	counts, ok := data["counts"].(map[string]any)
+	if !ok || counts["requirements"] != float64(0) || counts["evidence"] != float64(0) {
+		t.Errorf("counts = %#v, want zero scalar counts", data["counts"])
+	}
+	if _, ok := counts["by_case_run_status"].(map[string]any); !ok {
+		t.Errorf("counts.by_case_run_status missing: %#v", counts)
+	}
+	if _, ok := counts["coverage"].(map[string]any); !ok {
+		t.Errorf("counts.coverage missing: %#v", counts)
 	}
 	replay := data["replay"].(map[string]any)
 	if replay["approximate"] != true {

@@ -129,7 +129,14 @@ const nodes: ChainNodeView[] = [
     case_run_id: "9301",
     issue_id: "9101",
     created_at: created,
-    meta: { severity: "major", category: "api", merged_into_id: null },
+    meta: {
+      severity: "major",
+      issue_status: "open",
+      category: "api",
+      evidence_count: 2,
+      code_ref_count: 1,
+      merged_into_id: null,
+    },
   },
   {
     id: "report:8101",
@@ -166,6 +173,11 @@ function chainFixture(overrides: Partial<ChainView> = {}): ChainView {
       result: null,
       event_from: null,
       event_to: null,
+      q: null,
+      abnormal_only: null,
+      issue_status: null,
+      issue_severity: null,
+      requirement_limit: null,
     },
     counts: {
       requirements: 1,
@@ -176,6 +188,17 @@ function chainFixture(overrides: Partial<ChainView> = {}): ChainView {
       issues: 1,
       reports: 1,
       evidence: 2,
+      by_case_run_status: {
+        passed: 1,
+        failed: 1,
+        blocked: 0,
+        inconclusive: 0,
+        skipped: 0,
+        interrupted: 0,
+      },
+      by_issue_severity: { major: 1, minor: 0, trivial: 0 },
+      by_issue_status: { open: 1, confirmed: 0, dismissed: 0, merged: 0 },
+      coverage: { requirements: 1, covered: 1, uncovered: 0 },
     },
     nodes,
     edges,
@@ -187,6 +210,16 @@ function chainFixture(overrides: Partial<ChainView> = {}): ChainView {
       event_from: null,
       event_to: null,
       approximate: false,
+      event_limit: 20,
+      truncated: false,
+    },
+    degraded_layers: [],
+    truncated_layers: {
+      requirements: false,
+      cases: false,
+      case_runs: false,
+      issues: false,
+      reports: false,
     },
     ...overrides,
   }
@@ -608,5 +641,177 @@ describe("ChainTab", () => {
     expect(timeline).toHaveTextContent("wave.finished")
     expect(timeline).toHaveTextContent("issue.created")
     expect(api.listChainEvents).toHaveBeenCalledWith("2001", expect.objectContaining({ limit: 20 }))
+  })
+
+  it("debounces q and maps P6 filters to the API and URL", async () => {
+    await renderChain()
+
+    fireEvent.change(screen.getByLabelText("搜索"), { target: { value: "退款" } })
+    await waitFor(
+      () =>
+        expect(api.getChain).toHaveBeenLastCalledWith(
+          "2001",
+          expect.objectContaining({ q: "退款" }),
+        ),
+      { timeout: 2000 },
+    )
+    expect(navigation.replace).toHaveBeenLastCalledWith(
+      expect.stringContaining("q=%E9%80%80%E6%AC%BE"),
+    )
+
+    fireEvent.click(screen.getByTestId("chain-filter-abnormal"))
+    fireEvent.change(screen.getByLabelText("问题状态"), { target: { value: "confirmed" } })
+    fireEvent.change(screen.getByLabelText("严重级"), { target: { value: "major" } })
+    fireEvent.change(screen.getByLabelText("需求上限"), { target: { value: "100" } })
+
+    await waitFor(() =>
+      expect(api.getChain).toHaveBeenLastCalledWith(
+        "2001",
+        expect.objectContaining({
+          q: "退款",
+          abnormalOnly: true,
+          issueStatus: "confirmed",
+          issueSeverity: "major",
+          requirementLimit: 100,
+        }),
+      ),
+    )
+    const lastUrl = navigation.replace.mock.calls.at(-1)?.[0] as string
+    expect(lastUrl).toContain("abnormal_only=true")
+    expect(lastUrl).toContain("issue_status=confirmed")
+    expect(lastUrl).toContain("issue_severity=major")
+    expect(lastUrl).toContain("requirement_limit=100")
+  })
+
+  it("restores P6 filters from the URL deep link without rewriting it", async () => {
+    search.params = new URLSearchParams({
+      tab: "chain",
+      q: "退款",
+      abnormal_only: "true",
+      issue_status: "open",
+      issue_severity: "major",
+      requirement_limit: "100",
+    })
+
+    render(<ChainTab versionId="2001" />)
+
+    await waitFor(() =>
+      expect(api.getChain).toHaveBeenCalledWith(
+        "2001",
+        expect.objectContaining({
+          q: "退款",
+          abnormalOnly: true,
+          issueStatus: "open",
+          issueSeverity: "major",
+          requirementLimit: 100,
+        }),
+      ),
+    )
+    expect(navigation.replace).not.toHaveBeenCalled()
+  })
+
+  it("renders typed counts, coverage, degraded layers and per-layer truncation", async () => {
+    api.getChain.mockResolvedValue(
+      chainFixture({
+        counts: {
+          requirements: 3,
+          scenarios: 2,
+          cases: 2,
+          waves: 1,
+          case_runs: 2,
+          issues: 1,
+          reports: 1,
+          evidence: 2,
+          by_case_run_status: {
+            passed: 2,
+            failed: 1,
+            blocked: 1,
+            inconclusive: 0,
+            skipped: 0,
+            interrupted: 1,
+          },
+          by_issue_severity: { major: 1, minor: 0, trivial: 0 },
+          by_issue_status: { open: 1, confirmed: 0, dismissed: 0, merged: 0 },
+          coverage: { requirements: 3, covered: 2, uncovered: 1 },
+        },
+        degraded_layers: ["design", "delivery"],
+        truncated_layers: {
+          requirements: true,
+          cases: false,
+          case_runs: false,
+          issues: true,
+          reports: false,
+        },
+        replay: {
+          mode: "range",
+          wave_id: null,
+          event_from: 10,
+          event_to: 30,
+          approximate: true,
+          event_limit: 5,
+          truncated: true,
+        },
+      }),
+    )
+
+    await renderChain()
+
+    const stats = screen.getByTestId("chain-stats")
+    expect(stats).toHaveTextContent("覆盖 2/3")
+    expect(screen.getByTestId("chain-run-status-counts")).toHaveTextContent("通过 2")
+    expect(screen.getByTestId("chain-run-status-counts")).toHaveTextContent("中断 1")
+    expect(screen.getByTestId("chain-coverage-counts")).toHaveTextContent("未覆盖 1")
+    expect(screen.getByTestId("chain-issue-status-counts")).toHaveTextContent("待确认 1")
+    expect(screen.getByTestId("chain-issue-severity-counts")).toHaveTextContent("严重 1")
+
+    const degraded = screen.getByTestId("chain-degraded-banner")
+    expect(degraded).toHaveTextContent("设计")
+    expect(degraded).toHaveTextContent("交付")
+    expect(within(degraded).getByTestId("chain-reconnect")).toBeInTheDocument()
+
+    const layerTruncation = screen.getByTestId("chain-layer-truncation-banner")
+    expect(layerTruncation).toHaveTextContent("需求")
+    expect(layerTruncation).toHaveTextContent("问题")
+
+    expect(screen.getByTestId("chain-replay-truncated")).toHaveTextContent("event_limit")
+    expect(api.listChainEvents).toHaveBeenCalledWith("2001", { limit: 5 })
+  })
+
+  it("shows P6 typed meta in the node list and detail sheet", async () => {
+    await renderChain()
+
+    fireEvent.click(screen.getByRole("button", { name: "列表视图" }))
+    expect(screen.getByRole("button", { name: "列表视图" })).toHaveAttribute("aria-pressed", "true")
+    const list = screen.getByTestId("chain-list-view")
+    expect(within(list).getByText("退款到账时效")).toBeInTheDocument()
+
+    fireEvent.click(screen.getByTestId("chain-list-node-issue:9101"))
+    const detail = sheet()
+    const meta = within(detail).getByTestId("chain-detail-meta")
+    expect(meta).toHaveTextContent("severity")
+    expect(meta).toHaveTextContent("major")
+    expect(meta).toHaveTextContent("issue_status")
+    expect(meta).toHaveTextContent("open")
+    expect(meta).toHaveTextContent("category")
+    expect(meta).toHaveTextContent("api")
+  })
+
+  it("keeps the last graph on a refresh error and reconnects", async () => {
+    await renderChain()
+    await waitFor(() => expect(api.getChain).toHaveBeenCalledTimes(1))
+
+    api.getChain.mockRejectedValueOnce(
+      new ApiError({ status: 503, code: "provider_unavailable", message: "down", requestId: "r" }),
+    )
+    act(() => {
+      sse.handlers?.onWaveChanged?.({ type: "wave.finished" })
+    })
+
+    expect(await screen.findByTestId("chain-refresh-error")).toBeInTheDocument()
+    expect(screen.getByTestId("chain-graph")).toBeInTheDocument()
+    expect(screen.queryByText("暂无探索链路")).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByTestId("chain-refresh-reconnect"))
+    await waitFor(() => expect(api.getChain).toHaveBeenCalledTimes(3), { timeout: 2000 })
   })
 })

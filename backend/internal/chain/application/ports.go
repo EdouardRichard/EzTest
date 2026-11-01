@@ -62,3 +62,33 @@ type CursorReader interface {
 type EventTimeReader interface {
 	EventTime(ctx context.Context, channel string, seq int64) (createdAt time.Time, found bool, err error)
 }
+
+// SettingsReader is the hot settings cache surface consumed per request by the
+// P6 chain service (spec §4.3.6). Int must return the currently cached value;
+// the settings application service satisfies it, so a PATCH settings update is
+// visible on the next chain request without a service rebuild. Read failures
+// fall back to the statically wired budget.
+type SettingsReader interface {
+	Int(ctx context.Context, key string) (int64, error)
+}
+
+// DesignSnapshotProvider is the optional one-read fast path of the design
+// provider. When implemented, the service fetches scenarios and cases from the
+// same design graph snapshot instead of reading the graph twice. The query
+// budget test counts this as one bounded SQL read.
+type DesignSnapshotProvider interface {
+	DesignSnapshot(ctx context.Context, versionID int64) (scenarios, cases []chain.Node, err error)
+}
+
+// ExecutionSnapshotProvider is the optional one-read fast path of the execution
+// provider: waves and case runs come from one wave walk.
+type ExecutionSnapshotProvider interface {
+	ExecutionSnapshot(ctx context.Context, versionID int64) (waves, caseRuns []chain.Node, err error)
+}
+
+// ResourceSnapshotProvider is the optional one-read fast path of the resource
+// provider: version-SUT labels and page labels are resolved from one version
+// binding read.
+type ResourceSnapshotProvider interface {
+	ResourceSnapshot(ctx context.Context, versionID int64) (sutNames, pageNames map[int64]string, err error)
+}

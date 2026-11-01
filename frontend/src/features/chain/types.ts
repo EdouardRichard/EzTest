@@ -59,6 +59,44 @@ export type ChainFiltersView = {
   result?: string | null
   event_from?: number | null
   event_to?: number | null
+  /** P6 fuzzy requirement/scenario/case-version title filter. */
+  q?: string | null
+  /** P6 abnormal case-run-only filter. */
+  abnormal_only?: boolean | null
+  issue_status?: ChainIssueStatus | null
+  issue_severity?: ChainIssueSeverity | null
+  requirement_limit?: number | null
+}
+
+export type ChainIssueStatus = "open" | "confirmed" | "dismissed" | "merged"
+export type ChainIssueSeverity = "major" | "minor" | "trivial"
+
+export type ChainCaseRunStatusCounts = {
+  passed: number
+  failed: number
+  blocked: number
+  inconclusive: number
+  skipped: number
+  interrupted: number
+}
+
+export type ChainIssueSeverityCounts = {
+  major: number
+  minor: number
+  trivial: number
+}
+
+export type ChainIssueStatusCounts = {
+  open: number
+  confirmed: number
+  dismissed: number
+  merged: number
+}
+
+export type ChainCoverageCounts = {
+  requirements: number
+  covered: number
+  uncovered: number
 }
 
 export type ChainCounts = {
@@ -70,6 +108,21 @@ export type ChainCounts = {
   issues: number
   reports: number
   evidence: number
+  /** P6 typed projections; optional so a P4-shaped response still renders. */
+  by_case_run_status?: ChainCaseRunStatusCounts
+  by_issue_severity?: ChainIssueSeverityCounts
+  by_issue_status?: ChainIssueStatusCounts
+  coverage?: ChainCoverageCounts
+}
+
+export type ChainDegradedLayer = "requirement" | "design" | "execution" | "delivery" | "codeintel"
+
+export type ChainTruncatedLayers = {
+  requirements: boolean
+  cases: boolean
+  case_runs: boolean
+  issues: boolean
+  reports: boolean
 }
 
 export type ChainTruncationReason = "" | "node_budget" | "edge_budget" | "requirement_budget"
@@ -90,9 +143,13 @@ export type ChainReplay = {
   event_to?: number | null
   /** Historical replay is approximate; P4 never claims an as-of snapshot. */
   approximate: boolean
+  /** P6: chain.replay_event_limit consumed by this request. */
+  event_limit?: number
+  /** P6: the requested event range exceeds event_limit. */
+  truncated?: boolean
 }
 
-/** `ChainView`: one request-level read model (spec §8.3). */
+/** `ChainView`: one request-level read model (spec §8.3 / §4.3.6). */
 export type ChainView = {
   version_id: string
   generated_at: string
@@ -104,6 +161,8 @@ export type ChainView = {
   truncated: boolean
   truncation: ChainTruncation
   replay: ChainReplay
+  degraded_layers?: ChainDegradedLayer[]
+  truncated_layers?: ChainTruncatedLayers
 }
 
 /* --------------------------------- requests -------------------------------- */
@@ -120,6 +179,12 @@ export type ChainQuery = {
   eventFrom?: number
   eventTo?: number
   limit?: number
+  /** P6 increments. */
+  q?: string
+  abnormalOnly?: boolean
+  issueStatus?: ChainIssueStatus
+  issueSeverity?: ChainIssueSeverity
+  requirementLimit?: number
 }
 
 export type ChainEventListOptions = {
@@ -178,4 +243,33 @@ export const CHAIN_NODE_DOT_CLASSES: Record<ChainNodeKind, string> = {
   issue: "bg-destructive",
   report: "bg-muted-foreground",
   closure: "bg-foreground",
+}
+
+export const CHAIN_DEGRADED_LAYER_LABELS: Record<ChainDegradedLayer, string> = {
+  requirement: "需求",
+  design: "设计",
+  execution: "执行",
+  delivery: "交付",
+  codeintel: "代码智能",
+}
+
+export const CHAIN_TRUNCATED_LAYER_LABELS: Record<keyof ChainTruncatedLayers, string> = {
+  requirements: "需求",
+  cases: "用例",
+  case_runs: "运行",
+  issues: "问题",
+  reports: "报告",
+}
+
+export const CHAIN_ISSUE_STATUS_LABELS: Record<ChainIssueStatus, string> = {
+  open: "待确认",
+  confirmed: "已确认",
+  dismissed: "已驳回",
+  merged: "已合并",
+}
+
+export const CHAIN_ISSUE_SEVERITY_LABELS: Record<ChainIssueSeverity, string> = {
+  major: "严重",
+  minor: "一般",
+  trivial: "轻微",
 }

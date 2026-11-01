@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	chainapp "github.com/EdouardRichard/EzTest/backend/internal/chain/application"
 	chain "github.com/EdouardRichard/EzTest/backend/internal/chain/domain"
@@ -17,6 +18,33 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/httpx"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/validation"
 )
+
+// chainStatusEnums is the union of the status values the chain can expose
+// across its node kinds: requirement, case version, wave, case run, issue,
+// report and closure. P6 validates the filter value before it reaches the
+// builder so a typo cannot silently return an empty graph.
+var chainStatusEnums = map[string]bool{
+	"pending": true, "running": true, "paused": true, "passed": true, "failed": true,
+	"blocked": true, "inconclusive": true, "skipped": true, "interrupted": true,
+	"superseded": true, "planned": true, "done": true, "cancelled": true,
+	"draft": true, "clarified": true, "closed": true, "obsolete": true,
+	"open": true, "confirmed": true, "dismissed": true, "merged": true,
+	"published": true, "stale": true, "reopened": true, "active": true,
+}
+
+// chainResultEnums is the case_run result vocabulary exposed by the builder.
+var chainResultEnums = map[string]bool{
+	"passed": true, "failed": true, "blocked": true, "inconclusive": true,
+	"skipped": true, "interrupted": true,
+}
+
+var chainIssueStatusEnums = map[string]bool{
+	"open": true, "confirmed": true, "dismissed": true, "merged": true,
+}
+
+var chainIssueSeverityEnums = map[string]bool{
+	"major": true, "minor": true, "trivial": true,
+}
 
 // focusNodePattern is the contract pattern of ChainFocusNode
 // (openapi.yaml, `^[a-z_]+:[0-9]+$`). The handler rejects anything else with
@@ -83,8 +111,27 @@ func parseChainFilter(r *http.Request) (chain.ChainFilter, error) {
 	if filter.WaveID, err = optionalPositiveID(query.Get("wave_id"), "wave_id"); err != nil {
 		return chain.ChainFilter{}, err
 	}
-	filter.Status = query.Get("status")
-	filter.Result = query.Get("result")
+	if filter.Status, err = optionalEnum(query.Get("status"), "status", chainStatusEnums); err != nil {
+		return chain.ChainFilter{}, err
+	}
+	if filter.Result, err = optionalEnum(query.Get("result"), "result", chainResultEnums); err != nil {
+		return chain.ChainFilter{}, err
+	}
+	if filter.Q, err = optionalQueryText(query.Get("q"), 100); err != nil {
+		return chain.ChainFilter{}, err
+	}
+	if filter.AbnormalOnly, err = optionalBool(query.Get("abnormal_only"), "abnormal_only"); err != nil {
+		return chain.ChainFilter{}, err
+	}
+	if filter.IssueStatus, err = optionalEnum(query.Get("issue_status"), "issue_status", chainIssueStatusEnums); err != nil {
+		return chain.ChainFilter{}, err
+	}
+	if filter.IssueSeverity, err = optionalEnum(query.Get("issue_severity"), "issue_severity", chainIssueSeverityEnums); err != nil {
+		return chain.ChainFilter{}, err
+	}
+	if filter.RequirementLimit, err = optionalRequirementLimit(query.Get("requirement_limit")); err != nil {
+		return chain.ChainFilter{}, err
+	}
 	if filter.EventFrom, err = optionalEventSeq(query.Get("event_from"), "event_from"); err != nil {
 		return chain.ChainFilter{}, err
 	}
@@ -137,6 +184,57 @@ func optionalChainLimit(raw string) (int, error) {
 	value, err := strconv.Atoi(raw)
 	if err != nil || value < 1 || value > chain.MaxNodesLimit {
 		return 0, platform.Invalid("limit", "must be an integer between 1 and 1000")
+	}
+	return value, nil
+}
+
+// optionalEnum normalizes and validates one documented query enum. Empty means
+// unset. The normalized value is what the domain filter echoes back.
+func optionalEnum(raw, field string, allowed map[string]bool) (string, error) {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	if raw == "" {
+		return "", nil
+	}
+	if !allowed[raw] {
+		return "", platform.Invalid(field, "must be one of the documented enum values")
+	}
+	return raw, nil
+}
+
+// optionalQueryText validates the <=100-character q filter.
+func optionalQueryText(raw string, maxRunes int) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	if utf8.RuneCountInString(raw) > maxRunes {
+		return "", platform.Invalid("q", "must be at most 100 characters")
+	}
+	return raw, nil
+}
+
+// optionalBool parses the abnormal_only query flag. Empty means false/unset.
+func optionalBool(raw, field string) (bool, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false, nil
+	}
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, platform.Invalid(field, "must be a boolean")
+	}
+	return value, nil
+}
+
+// optionalRequirementLimit parses the P6 root override (1..500).
+func optionalRequirementLimit(raw string) (int, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 1 || value > chain.MaxRequirementsLimit {
+		return 0, platform.Invalid("requirement_limit", "must be an integer between 1 and 500")
 	}
 	return value, nil
 }

@@ -7,30 +7,104 @@ import (
 	chain "github.com/EdouardRichard/EzTest/backend/internal/chain/domain"
 )
 
-// chainViewDTO is the ChainView response body of spec §4.2. Entity IDs are
-// decimal strings at the API boundary; event-sequence bounds are integers.
+// Legacy scalar count keys of ChainView.Counts (frozen P4 contract).
+const (
+	chainCountKeyRequirements = "requirements"
+	chainCountKeyScenarios    = "scenarios"
+	chainCountKeyCases        = "cases"
+	chainCountKeyWaves        = "waves"
+	chainCountKeyCaseRuns     = "case_runs"
+	chainCountKeyIssues       = "issues"
+	chainCountKeyReports      = "reports"
+	chainCountKeyEvidence     = "evidence"
+)
+
+// chainViewDTO is the ChainView response body of spec §4.2/§4.3.6. Entity IDs
+// are decimal strings at the API boundary; event-sequence bounds are integers.
 type chainViewDTO struct {
-	VersionID      string             `json:"version_id"`
-	GeneratedAt    string             `json:"generated_at"`
-	SnapshotCursor int64              `json:"snapshot_cursor"`
-	Filters        chainFilterDTO     `json:"filters"`
-	Counts         map[string]int     `json:"counts"`
-	Nodes          []chainNodeDTO     `json:"nodes"`
-	Edges          []chainEdgeDTO     `json:"edges"`
-	Truncated      bool               `json:"truncated"`
-	Truncation     chainTruncationDTO `json:"truncation"`
-	Replay         chainReplayDTO     `json:"replay"`
+	VersionID       string                  `json:"version_id"`
+	GeneratedAt     string                  `json:"generated_at"`
+	SnapshotCursor  int64                   `json:"snapshot_cursor"`
+	Filters         chainFilterDTO          `json:"filters"`
+	Counts          chainCountsDTO          `json:"counts"`
+	Nodes           []chainNodeDTO          `json:"nodes"`
+	Edges           []chainEdgeDTO          `json:"edges"`
+	Truncated       bool                    `json:"truncated"`
+	Truncation      chainTruncationDTO      `json:"truncation"`
+	Replay          chainReplayDTO          `json:"replay"`
+	DegradedLayers  []string                `json:"degraded_layers"`
+	TruncatedLayers chainTruncatedLayersDTO `json:"truncated_layers"`
+}
+
+// chainCountsDTO keeps the P4 scalar counts and adds the P6 typed projections
+// of the frozen ChainCounts schema. The typed objects are always emitted so the
+// UI can read them without presence checks.
+type chainCountsDTO struct {
+	Requirements    int                         `json:"requirements"`
+	Scenarios       int                         `json:"scenarios"`
+	Cases           int                         `json:"cases"`
+	Waves           int                         `json:"waves"`
+	CaseRuns        int                         `json:"case_runs"`
+	Issues          int                         `json:"issues"`
+	Reports         int                         `json:"reports"`
+	Evidence        int                         `json:"evidence"`
+	ByCaseRunStatus chainCaseRunStatusCountsDTO `json:"by_case_run_status"`
+	ByIssueSeverity chainIssueSeverityCountsDTO `json:"by_issue_severity"`
+	ByIssueStatus   chainIssueStatusCountsDTO   `json:"by_issue_status"`
+	Coverage        chainCoverageCountsDTO      `json:"coverage"`
+}
+
+type chainCaseRunStatusCountsDTO struct {
+	Passed       int `json:"passed"`
+	Failed       int `json:"failed"`
+	Blocked      int `json:"blocked"`
+	Inconclusive int `json:"inconclusive"`
+	Skipped      int `json:"skipped"`
+	Interrupted  int `json:"interrupted"`
+}
+
+type chainIssueSeverityCountsDTO struct {
+	Major   int `json:"major"`
+	Minor   int `json:"minor"`
+	Trivial int `json:"trivial"`
+}
+
+type chainIssueStatusCountsDTO struct {
+	Open      int `json:"open"`
+	Confirmed int `json:"confirmed"`
+	Dismissed int `json:"dismissed"`
+	Merged    int `json:"merged"`
+}
+
+type chainCoverageCountsDTO struct {
+	Requirements int `json:"requirements"`
+	Covered      int `json:"covered"`
+	Uncovered    int `json:"uncovered"`
+}
+
+// chainTruncatedLayersDTO marks which layer hit a budget in this response.
+type chainTruncatedLayersDTO struct {
+	Requirements bool `json:"requirements"`
+	Cases        bool `json:"cases"`
+	CaseRuns     bool `json:"case_runs"`
+	Issues       bool `json:"issues"`
+	Reports      bool `json:"reports"`
 }
 
 // chainFilterDTO echoes the normalized filter. Unset values are null.
 type chainFilterDTO struct {
-	SUTID     *string `json:"sut_id"`
-	PageID    *string `json:"page_id"`
-	WaveID    *string `json:"wave_id"`
-	Status    *string `json:"status"`
-	Result    *string `json:"result"`
-	EventFrom *int64  `json:"event_from"`
-	EventTo   *int64  `json:"event_to"`
+	SUTID            *string `json:"sut_id"`
+	PageID           *string `json:"page_id"`
+	WaveID           *string `json:"wave_id"`
+	Status           *string `json:"status"`
+	Result           *string `json:"result"`
+	EventFrom        *int64  `json:"event_from"`
+	EventTo          *int64  `json:"event_to"`
+	Q                *string `json:"q"`
+	AbnormalOnly     *bool   `json:"abnormal_only"`
+	IssueStatus      *string `json:"issue_status"`
+	IssueSeverity    *string `json:"issue_severity"`
+	RequirementLimit *int    `json:"requirement_limit"`
 }
 
 // chainNodeDTO is one chain node. Optional ids stay null when the node does not
@@ -76,6 +150,8 @@ type chainReplayDTO struct {
 	EventFrom   *int64  `json:"event_from"`
 	EventTo     *int64  `json:"event_to"`
 	Approximate bool    `json:"approximate"`
+	EventLimit  int     `json:"event_limit"`
+	Truncated   bool    `json:"truncated"`
 }
 
 func toChainViewDTO(view chain.ChainView) chainViewDTO {
@@ -92,7 +168,7 @@ func toChainViewDTO(view chain.ChainView) chainViewDTO {
 		GeneratedAt:    formatChainTime(view.GeneratedAt),
 		SnapshotCursor: view.SnapshotCursor,
 		Filters:        toChainFilterDTO(view.Filters),
-		Counts:         nonNilCounts(view.Counts),
+		Counts:         toChainCountsDTO(view),
 		Nodes:          nodes,
 		Edges:          edges,
 		Truncated:      view.Truncated,
@@ -108,20 +184,81 @@ func toChainViewDTO(view chain.ChainView) chainViewDTO {
 			EventFrom:   copyInt64(view.Replay.EventFrom),
 			EventTo:     copyInt64(view.Replay.EventTo),
 			Approximate: true,
+			EventLimit:  view.Replay.EventLimit,
+			Truncated:   view.Replay.Truncated,
+		},
+		DegradedLayers: nonNilStrings(view.DegradedLayers),
+		TruncatedLayers: chainTruncatedLayersDTO{
+			Requirements: view.TruncatedLayers.Requirements,
+			Cases:        view.TruncatedLayers.Cases,
+			CaseRuns:     view.TruncatedLayers.CaseRuns,
+			Issues:       view.TruncatedLayers.Issues,
+			Reports:      view.TruncatedLayers.Reports,
+		},
+	}
+}
+
+func toChainCountsDTO(view chain.ChainView) chainCountsDTO {
+	counts := view.Counts
+	return chainCountsDTO{
+		Requirements: counts[chainCountKeyRequirements],
+		Scenarios:    counts[chainCountKeyScenarios],
+		Cases:        counts[chainCountKeyCases],
+		Waves:        counts[chainCountKeyWaves],
+		CaseRuns:     counts[chainCountKeyCaseRuns],
+		Issues:       counts[chainCountKeyIssues],
+		Reports:      counts[chainCountKeyReports],
+		Evidence:     counts[chainCountKeyEvidence],
+		ByCaseRunStatus: chainCaseRunStatusCountsDTO{
+			Passed:       view.CaseRunStatusCounts.Passed,
+			Failed:       view.CaseRunStatusCounts.Failed,
+			Blocked:      view.CaseRunStatusCounts.Blocked,
+			Inconclusive: view.CaseRunStatusCounts.Inconclusive,
+			Skipped:      view.CaseRunStatusCounts.Skipped,
+			Interrupted:  view.CaseRunStatusCounts.Interrupted,
+		},
+		ByIssueSeverity: chainIssueSeverityCountsDTO{
+			Major:   view.IssueSeverityCounts.Major,
+			Minor:   view.IssueSeverityCounts.Minor,
+			Trivial: view.IssueSeverityCounts.Trivial,
+		},
+		ByIssueStatus: chainIssueStatusCountsDTO{
+			Open:      view.IssueStatusCounts.Open,
+			Confirmed: view.IssueStatusCounts.Confirmed,
+			Dismissed: view.IssueStatusCounts.Dismissed,
+			Merged:    view.IssueStatusCounts.Merged,
+		},
+		Coverage: chainCoverageCountsDTO{
+			Requirements: view.Coverage.Requirements,
+			Covered:      view.Coverage.Covered,
+			Uncovered:    view.Coverage.Uncovered,
 		},
 	}
 }
 
 func toChainFilterDTO(filter chain.ChainFilter) chainFilterDTO {
 	return chainFilterDTO{
-		SUTID:     formatChainID(filter.VersionSUTID),
-		PageID:    formatChainID(filter.PageID),
-		WaveID:    formatChainID(filter.WaveID),
-		Status:    formatChainText(filter.Status),
-		Result:    formatChainText(filter.Result),
-		EventFrom: copyInt64(filter.EventFrom),
-		EventTo:   copyInt64(filter.EventTo),
+		SUTID:            formatChainID(filter.VersionSUTID),
+		PageID:           formatChainID(filter.PageID),
+		WaveID:           formatChainID(filter.WaveID),
+		Status:           formatChainText(filter.Status),
+		Result:           formatChainText(filter.Result),
+		EventFrom:        copyInt64(filter.EventFrom),
+		EventTo:          copyInt64(filter.EventTo),
+		Q:                formatChainText(filter.Q),
+		AbnormalOnly:     formatChainBool(filter.AbnormalOnly),
+		IssueStatus:      formatChainText(filter.IssueStatus),
+		IssueSeverity:    formatChainText(filter.IssueSeverity),
+		RequirementLimit: formatChainInt(filter.RequirementLimit),
 	}
+}
+
+// nonNilStrings keeps degraded_layers an array (never null) in the response.
+func nonNilStrings(values []string) []string {
+	if values == nil {
+		return []string{}
+	}
+	return values
 }
 
 func toChainNodeDTO(node chain.Node, generatedAt time.Time) chainNodeDTO {
@@ -170,6 +307,15 @@ var chainMetaIDArrayKeys = map[string]bool{
 	"case_run_ids": true,
 }
 
+// chainMetaIDValueKeys are the P6 typed meta keys that carry one entity ID.
+// The contract requires decimal strings, so an int64 emitted by a provider or a
+// P4-era meta value is converted at the DTO boundary.
+var chainMetaIDValueKeys = map[string]bool{
+	"requirement_id": true,
+	"scenario_id":    true,
+	"merged_into_id": true,
+}
+
 // sanitizeChainMeta deep-copies the node meta and converts the documented ID
 // arrays to decimal strings. Other values are preserved as-is (counts, labels,
 // timestamps and maps are not entity IDs).
@@ -182,6 +328,12 @@ func sanitizeChainMeta(meta map[string]any) map[string]any {
 		switch {
 		case chainMetaIDArrayKeys[key]:
 			out[key] = decimalStringArray(value)
+		case chainMetaIDValueKeys[key] && value != nil:
+			if formatted, ok := decimalStringValue(value); ok {
+				out[key] = formatted
+			} else {
+				out[key] = value
+			}
 		case key == "refs":
 			out[key] = sanitizeChainMetaRefs(value)
 		default:
@@ -313,6 +465,22 @@ func formatChainID(value *int64) *string {
 
 func formatChainText(value string) *string {
 	if value == "" {
+		return nil
+	}
+	formatted := value
+	return &formatted
+}
+
+func formatChainBool(value bool) *bool {
+	if !value {
+		return nil
+	}
+	formatted := value
+	return &formatted
+}
+
+func formatChainInt(value int) *int {
+	if value <= 0 {
 		return nil
 	}
 	formatted := value
