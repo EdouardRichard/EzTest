@@ -291,11 +291,14 @@ func Profiles() []agent.AgentProfile {
 	return profiles
 }
 
-// EnsureProfiles idempotently seeds the P1, P2, P3 and P4 profiles. Existing
-// rows (including administrator edits) are returned unchanged by the
-// repository.
+// EnsureProfiles idempotently seeds the P1, P2, P3 and P4 profiles plus the P5
+// allowed_tools increment. Existing rows (including administrator edits) are
+// returned unchanged by the repository.
 func EnsureProfiles(ctx context.Context, repo agent.RuntimeRepository) ([]agent.AgentProfile, error) {
 	seeds := Profiles()
+	for i := range seeds {
+		seeds[i] = applyP5ProfileTools(seeds[i])
+	}
 	stored := make([]agent.AgentProfile, 0, len(seeds))
 	for _, seed := range seeds {
 		profile, _, err := repo.EnsureProfile(ctx, seed)

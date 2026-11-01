@@ -2,7 +2,7 @@ package execution
 
 import "time"
 
-// EvidenceKind is the frozen evidence kind enum (P3-D-21).
+// EvidenceKind is the frozen evidence kind enum (P3-D-21, extended by P5 §3.6).
 type EvidenceKind string
 
 const (
@@ -14,17 +14,22 @@ const (
 	EvidenceDB         EvidenceKind = "db"
 	EvidenceDownload   EvidenceKind = "download"
 	EvidenceText       EvidenceKind = "text"
+	// P5 visual evidence kinds: the live capture and the pixel-diff image of
+	// one visual assertion comparison (executor visual.compare).
+	EvidenceVisualActual EvidenceKind = "visual_actual"
+	EvidenceVisualDiff   EvidenceKind = "visual_diff"
 )
 
 // EvidenceMaxPerCaseRun caps the evidence rows of one case_run. Overflow is
 // dropped and counted, never failed.
 const EvidenceMaxPerCaseRun = 100
 
-// Valid reports whether kind is one of the eight persisted evidence kinds.
+// Valid reports whether kind is one of the ten persisted evidence kinds.
 func (k EvidenceKind) Valid() bool {
 	switch k {
 	case EvidenceScreenshot, EvidenceSnapshot, EvidenceConsole, EvidenceNetwork,
-		EvidenceHTTP, EvidenceDB, EvidenceDownload, EvidenceText:
+		EvidenceHTTP, EvidenceDB, EvidenceDownload, EvidenceText,
+		EvidenceVisualActual, EvidenceVisualDiff:
 		return true
 	default:
 		return false
@@ -35,7 +40,7 @@ func (k EvidenceKind) Valid() bool {
 // not carry one.
 func (k EvidenceKind) MIME() string {
 	switch k {
-	case EvidenceScreenshot:
+	case EvidenceScreenshot, EvidenceVisualActual, EvidenceVisualDiff:
 		return "image/png"
 	case EvidenceSnapshot, EvidenceText, EvidenceDB:
 		return "text/plain; charset=utf-8"

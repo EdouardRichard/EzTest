@@ -10,9 +10,12 @@ import fsp from "node:fs/promises"
 
 export const MAX_REQUEST_BYTES = 1024 * 1024
 // Visual comparisons carry a baseline copy of up to 5 MiB (design spec §9.3),
-// which is ~6.7 MiB once base64 encoded. Only the authenticated action route
-// accepts this larger body; every other route keeps MAX_REQUEST_BYTES.
+// which is ~6.7 MiB once base64 encoded. Only the authenticated
+// visual.compare action accepts this larger body; every other action and route
+// keeps MAX_REQUEST_BYTES.
 export const MAX_ACTION_REQUEST_BYTES = 16 * 1024 * 1024
+/** Default of the visual.baseline_max_bytes DB setting (5 MiB). */
+export const DEFAULT_VISUAL_BASELINE_MAX_BYTES = 5 * 1024 * 1024
 export const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024
 export const MAX_SNAPSHOT_CHARS = 12_000
 export const DEFAULT_ACTION_TIMEOUT_MS = 15_000
@@ -195,8 +198,21 @@ export function isAllowedUrl(rawUrl, { allowedHosts = [], baseUrl, allowData = f
 }
 
 /** Normalizes `timeout_ms` from a request, clamped to [1, 60s]. */
-export function resolveTimeout(value, fallback) {
-  const numeric = typeof value === "number" ? value : Number(value)
+/**
+ * Body limit of one visual.compare action (design spec §4.6/§11.1). The DB
+ * setting visual.baseline_max_bytes caps the decoded baseline; the request
+ * body also carries the base64 expansion and the comparison configuration, so
+ * it gets the 4/3 growth plus a small JSON allowance. Only this action uses
+ * the larger limit.
+ */
+export function visualActionRequestLimit(env = process.env) {
+  const raw = Number(env.EZTEST_VISUAL_BASELINE_MAX_BYTES)
+  const baseline = Number.isInteger(raw) && raw > 0 ? raw : DEFAULT_VISUAL_BASELINE_MAX_BYTES
+  return Math.min(MAX_ACTION_REQUEST_BYTES, Math.ceil((baseline * 4) / 3) + 256 * 1024)
+}
+
+/** Normalizes `timeout_ms` from a request, clamped to [1, 60s]. */
+export function resolveTimeout(value, fallback) {  const numeric = typeof value === "number" ? value : Number(value)
   if (!Number.isFinite(numeric)) {
     return Math.min(Math.max(Math.trunc(fallback), 1), MAX_ACTION_TIMEOUT_MS)
   }

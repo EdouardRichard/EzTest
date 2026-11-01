@@ -223,6 +223,7 @@ type caseStepDTO struct {
 }
 
 type caseAssertionDTO struct {
+	CaseAssertionID    string  `json:"case_assertion_id"`
 	StepSeq            int     `json:"step_seq"`
 	Kind               string  `json:"kind"`
 	Target             string  `json:"target"`
@@ -306,7 +307,8 @@ func toCaseVersionDetailDTO(version designapp.CaseVersionDetailView) caseVersion
 	}
 	for _, assertion := range version.Assertions {
 		dto.Assertions = append(dto.Assertions, caseAssertionDTO{
-			StepSeq: assertion.StepSeq, Kind: assertion.Kind, Target: assertion.Target,
+			CaseAssertionID: platformid.Format(assertion.ID),
+			StepSeq:         assertion.StepSeq, Kind: assertion.Kind, Target: assertion.Target,
 			Expected:           assertion.Expected,
 			TargetVersionSUTID: formatOptionalID(assertion.TargetVersionSUTID),
 			TargetAPIID:        formatOptionalID(assertion.TargetAPIID),

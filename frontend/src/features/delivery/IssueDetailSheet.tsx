@@ -11,6 +11,7 @@ import { ErrorState, InlineError } from "@/components/ui/ErrorState"
 import { Field } from "@/components/ui/Field"
 import { LoadingCard } from "@/components/ui/Spinner"
 import { Textarea } from "@/components/ui/Textarea"
+import { AnchorPanel } from "@/features/anchors/AnchorPanel"
 import { formatDateTime } from "@/lib/format"
 
 import {
@@ -456,6 +457,15 @@ export function IssueDetailSheet({
               </div>
 
               <RefsSection versionId={versionId} issue={issue} />
+
+              <section aria-label="问题代码锚点" className="border-t border-border pt-3">
+                <AnchorPanel
+                  versionId={versionId}
+                  subjectKind="issue"
+                  subjectId={issue.id}
+                  title="问题代码锚点"
+                />
+              </section>
 
               <section data-testid="issue-history" aria-label="状态历史" className="space-y-2">
                 <h3 className="text-xs font-semibold text-foreground">状态历史</h3>

@@ -26,6 +26,9 @@ type WorkItemRepository interface {
 	// Claim picks the highest-priority available open item with
 	// FOR UPDATE SKIP LOCKED and leases it to claimant.
 	Claim(ctx context.Context, claimant string, lease time.Duration) (item WorkItem, ok bool, err error)
+	// ClaimForTeams is Claim restricted to the given teams. An empty team set
+	// claims nothing.
+	ClaimForTeams(ctx context.Context, claimant string, teams []Team, lease time.Duration) (item WorkItem, ok bool, err error)
 	// Get loads one work item, or ErrNotFound.
 	Get(ctx context.Context, id int64) (WorkItem, error)
 	// MarkRunning moves a claimed item to running.

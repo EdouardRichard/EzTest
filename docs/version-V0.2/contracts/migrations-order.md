@@ -197,7 +197,41 @@ version_0005_requirement_closure.sql
 - 集成测试断言 24 个迁移、8 张 P4 表、`pk_/uk_/idx_` 名称与 partial unique 索引谓词；重复执行迁移为 no-op，checksum 不变。
 - 开发库/演示库照常启动前滚；回滚仍为恢复备份，不提供 down SQL。
 
-## 7. 回滚 / 备份 / 数据库边界
+## 7. P5 增量迁移（`frozen: P5`，2026-11-01）
+
+P0/P1/P2/P3/P4 的 24 个迁移保持原样；P5 在 `order.txt` 末尾追加 7 个文件（第 25–31 个）：
+
+| 序号 | 迁移文件 | 上下文（ownership） | 创建/变更 |
+|---|---|---|---|
+| 25 | `codeintel_0001_code_index.sql` | codeintel | 创建 `code_index_run`、`code_entity`、`code_edge` |
+| 26 | `codeintel_0002_code_analysis.sql` | codeintel | 创建 `code_fact`、`code_analysis`、`code_impact_candidate` |
+| 27 | `codeintel_0003_anchor_review.sql` | codeintel | 创建 `code_anchor`、`code_fact_review` |
+| 28 | `visual_0001_visual_assertion.sql` | visual | 创建 `visual_assertion`、`visual_baseline`、`visual_diff` |
+| 29 | `execution_0004_visual_evidence.sql` | execution | `evidence.kind` CHECK 8→10 值（`visual_actual`/`visual_diff`） |
+| 30 | `version_0006_version_sut_code_baseline.sql` | version | `version_sut ADD COLUMN code_baseline_commit TEXT NULL` |
+| 31 | `agent_0004_code_team.sql` | agent | `work_item.team` CHECK 5→6 值（新增 `code`） |
+
+`order.txt` 末尾追加：
+
+```text
+codeintel_0001_code_index.sql
+codeintel_0002_code_analysis.sql
+codeintel_0003_anchor_review.sql
+visual_0001_visual_assertion.sql
+execution_0004_visual_evidence.sql
+version_0006_version_sut_code_baseline.sql
+agent_0004_code_team.sql
+```
+
+- 7 个迁移只追加、不改历史文件；固定顺序 25→31。`codeintel_0001` 内部 FK 依赖同上下文新表（`code_entity → code_index_run`、`code_edge → code_entity`）；`codeintel_0002` 的 `code_impact_candidate → code_analysis` 为同上下文 FK；`codeintel_0003` 依赖 `#26` 的 `code_fact`（同上下文 FK）；`visual_0001` 内部 FK（`visual_baseline`/`visual_diff → visual_assertion`、`visual_diff → visual_baseline`）；`execution_0004`/`version_0006`/`agent_0004` 只 ALTER 既有表，依赖 P0/P1/P3 的表已存在。
+- **partial unique 与表达式唯一键用唯一索引实现**（PostgreSQL 的 UNIQUE 约束不支持 `WHERE`/`COALESCE` 表达式）：`uk_code_index_run_active`、`uk_code_entity_file`、`uk_code_entity_fact`、`uk_code_analysis_active`、`uk_visual_baseline_approved`、`uk_code_anchor_subject_point` 位于 `pg_indexes`；其余 `uk_*` 为表约束（`pg_constraint`）。
+- `execution_0004` 先 `DROP CONSTRAINT IF EXISTS evidence_kind_check`（原内联 CHECK 的自动名）再 `ADD CONSTRAINT chk_evidence_kind`；`agent_0004` 先 `DROP CONSTRAINT IF EXISTS work_item_team_check` 再 `ADD CONSTRAINT chk_work_item_team`。两者只扩宽枚举，不改列/数据。
+- P5 不新增跨上下文 FK；`version_id`/`repo_id`/`analysis_id`/`entity_id`/`subject_id`/`evidence_id`/`case_run_id`/`assertion_result_id`/`approved_by`/`created_by`/`reviewer_id` 均为逻辑引用。
+- 11 张新表 = codeintel 8（`code_index_run`、`code_entity`、`code_edge`、`code_fact`、`code_analysis`、`code_impact_candidate`、`code_anchor`、`code_fact_review`）+ visual 3（`visual_assertion`、`visual_baseline`、`visual_diff`）；`codeintel`/`visual` 为 P5 新 bounded context。
+- 集成测试断言 31 个迁移、11 张 P5 表、二次执行 no-op（`schema_migrations` 不变）；`migrate_test.go` 的 `wantTail` 固定为上述 7 个文件。
+- 开发库/演示库照常启动前滚；回滚仍为恢复备份，不提供 down SQL。
+
+## 8. 回滚 / 备份 / 数据库边界
 
 - P0 **只支持前滚**：没有 down migration，也不提供自动回滚。
 - 部署/验收前必须备份目标库（`pg_dump` / 环境快照）；恢复方式是恢复备份，而不是执行 down SQL。
@@ -206,7 +240,7 @@ version_0005_requirement_closure.sql
 - 多实例同时启动时，advisory lock 使只有一个实例执行迁移，其余等待后看到已完成状态并跳过。
 - 迁移失败时进程必须**拒绝启动 HTTP**（不得带着半迁移 schema 提供服务）。
 
-## 8. 冻结与变更控制
+## 9. 冻结与变更控制
 
 - 本文件在 P0 冻结；P1+ 只能**追加**文件与 `order.txt` 行，并在本文件新增说明。
 - 破坏性变更（改列、改约束、改语义）必须先停止、说明影响面、更新 contracts + 决策记录 + 调用方/测试，再实施。

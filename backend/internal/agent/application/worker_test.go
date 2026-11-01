@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -26,13 +27,15 @@ type fakeWorkerQueue struct {
 	items    []agent.WorkItem
 	claimErr error
 
-	recoverCalls  int
-	claimCalls    int
-	markedRunning []int64
-	heartbeats    int
-	heartbeatErr  error
-	completes     []int64
-	fails         []fakeFailRecord
+	recoverCalls     int
+	claimCalls       int
+	legacyClaimCalls int
+	claimTeams       [][]agent.Team
+	markedRunning    []int64
+	heartbeats       int
+	heartbeatErr     error
+	completes        []int64
+	fails            []fakeFailRecord
 
 	claimed   chan int64
 	completed chan int64
@@ -49,6 +52,20 @@ func newFakeWorkerQueue(items ...agent.WorkItem) *fakeWorkerQueue {
 }
 
 func (q *fakeWorkerQueue) Claim(_ context.Context, _ string) (agent.WorkItem, bool, error) {
+	q.mu.Lock()
+	q.legacyClaimCalls++
+	q.mu.Unlock()
+	return q.claimItem()
+}
+
+func (q *fakeWorkerQueue) ClaimForTeams(_ context.Context, _ string, teams []agent.Team) (agent.WorkItem, bool, error) {
+	q.mu.Lock()
+	q.claimTeams = append(q.claimTeams, append([]agent.Team(nil), teams...))
+	q.mu.Unlock()
+	return q.claimItem()
+}
+
+func (q *fakeWorkerQueue) claimItem() (agent.WorkItem, bool, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.claimErr != nil {
@@ -255,6 +272,47 @@ func TestWorkerClaimsRunsAndCompletes(t *testing.T) {
 	}
 	if len(executor.calls) != 1 {
 		t.Fatalf("runner calls = %d", len(executor.calls))
+	}
+}
+
+func TestWorkerClaimsOnlyAgentProductTeams(t *testing.T) {
+	item := fakeWorkItem(agentapp.WorkTypeChatTurn, agentapp.WorkItemPayload{ConversationID: 20})
+	queue := newFakeWorkerQueue(item)
+	executor := &fakeRunExecutor{result: agentapp.RunResult{AgentRunID: 77, Status: agent.AgentRunDone}}
+	worker := newTestWorker(queue, executor, &fakeSettings{}, agentapp.WithWorkerPollInterval(2*time.Millisecond))
+
+	cancel, done := runWorker(t, worker)
+	waitUntil(t, 2*time.Second, func() bool {
+		queue.mu.Lock()
+		defer queue.mu.Unlock()
+		return len(queue.completes) == 1
+	}, "work item completion")
+	stopWorker(t, cancel, done)
+
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+	if queue.legacyClaimCalls != 0 {
+		t.Fatalf("worker used the unfiltered Claim %d times", queue.legacyClaimCalls)
+	}
+	if len(queue.claimTeams) == 0 {
+		t.Fatal("worker never called ClaimForTeams")
+	}
+	productTeams := []agent.Team{
+		agent.TeamClarification,
+		agent.TeamDesign,
+		agent.TeamExecution,
+		agent.TeamDelivery,
+		agent.TeamSteward,
+	}
+	for _, teams := range queue.claimTeams {
+		if !slices.Equal(teams, productTeams) {
+			t.Fatalf("claim teams = %#v, want %#v", teams, productTeams)
+		}
+		for _, team := range teams {
+			if team == agent.TeamCode {
+				t.Fatalf("agent worker claimed code team: %#v", teams)
+			}
+		}
 	}
 }
 

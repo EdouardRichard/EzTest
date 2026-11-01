@@ -26,6 +26,7 @@ func Definitions(executorURL string) []settings.Definition {
 		}
 		return json.RawMessage("false")
 	}
+	rawJSON := func(value string) json.RawMessage { return json.RawMessage(value) }
 	number := func(min, max float64) *float64 {
 		return &min
 	}
@@ -48,6 +49,19 @@ func Definitions(executorURL string) []settings.Definition {
 	minChainEdges, maxChainEdges := numberRange(1, 2000)
 	minChainRequirements, maxChainRequirements := numberRange(1, 500)
 	minChainReplay, maxChainReplay := numberRange(1, 2000)
+	minIndexFiles, maxIndexFiles := numberRange(1, 50000)
+	minChangedFiles, maxChangedFiles := numberRange(1, 200)
+	minFileBytes, maxFileBytes := numberRange(1024, 1048576)
+	minDiffBytes, maxDiffBytes := numberRange(4096, 1048576)
+	minExcerptLines, maxExcerptLines := numberRange(1, 200)
+	minAnalysisTimeout, maxAnalysisTimeout := numberRange(10, 1800)
+	minConcurrentAnalyses, maxConcurrentAnalyses := numberRange(1, 4)
+	minVisualThreshold, maxVisualThreshold := numberRange(0, 0.1)
+	minBaselineBytes, maxBaselineBytes := numberRange(65536, 20971520)
+	minViewport, maxViewport := numberRange(1, 10000)
+	minDPR, maxDPR := numberRange(0.5, 4)
+	minCompareTimeout, maxCompareTimeout := numberRange(5, 300)
+	minWaitTimeout, maxWaitTimeout := numberRange(1, 120)
 
 	return []settings.Definition{
 		{Key: "runtime.snowflake_node_id", Category: "runtime", Type: settings.TypeNumber, Default: num(1), Integer: true, Min: minNode, Max: maxNode, RestartRequired: true, Description: "Snowflake node ID (0-1023); unique per API instance."},
@@ -68,6 +82,24 @@ func Definitions(executorURL string) []settings.Definition {
 		{Key: "execution.executor_offline_seconds", Category: "execution", Type: settings.TypeNumber, Default: num(30), Integer: true, Min: minOffline, Max: maxOffline, Description: "Heartbeat silence after which the executor is marked offline."},
 		{Key: "execution.executor_context_ttl_seconds", Category: "execution", Type: settings.TypeNumber, Default: num(300), Integer: true, Min: minContextTTL, Max: maxContextTTL, Description: "TTL for cleaning executor browser contexts of non-running case runs."},
 		{Key: "execution.human_request_timeout_seconds", Category: "execution", Type: settings.TypeNumber, Default: num(1800), Integer: true, Min: minHumanTimeout, Max: maxHumanTimeout, Description: "Expiry of login_takeover human requests in seconds."},
+
+		{Key: "codeintel.max_index_files", Category: "codeintel", Type: settings.TypeNumber, Default: num(5000), Integer: true, Min: minIndexFiles, Max: maxIndexFiles, Description: "Maximum files indexed by one T0 index run; excess files set truncated."},
+		{Key: "codeintel.max_changed_files", Category: "codeintel", Type: settings.TypeNumber, Default: num(20), Integer: true, Min: minChangedFiles, Max: maxChangedFiles, Description: "Maximum changed files analyzed by one T1 analysis."},
+		{Key: "codeintel.max_file_bytes", Category: "codeintel", Type: settings.TypeNumber, Default: num(65536), Integer: true, Min: minFileBytes, Max: maxFileBytes, Description: "Maximum readable file size for T1 fact analysis."},
+		{Key: "codeintel.max_diff_bytes", Category: "codeintel", Type: settings.TypeNumber, Default: num(262144), Integer: true, Min: minDiffBytes, Max: maxDiffBytes, Description: "Maximum on-demand file patch size in bytes."},
+		{Key: "codeintel.max_excerpt_lines", Category: "codeintel", Type: settings.TypeNumber, Default: num(40), Integer: true, Min: minExcerptLines, Max: maxExcerptLines, Description: "Maximum lines in one fact evidence excerpt."},
+		{Key: "codeintel.analysis_timeout_seconds", Category: "codeintel", Type: settings.TypeNumber, Default: num(180), Integer: true, Min: minAnalysisTimeout, Max: maxAnalysisTimeout, Description: "Hard timeout for one code analysis run in seconds."},
+		{Key: "codeintel.max_concurrent_analyses", Category: "codeintel", Type: settings.TypeNumber, Default: num(1), Integer: true, Min: minConcurrentAnalyses, Max: maxConcurrentAnalyses, Description: "Maximum concurrent code analyses per codeintel worker."},
+		{Key: "codeintel.prompt_version", Category: "codeintel", Type: settings.TypeString, Default: str("p5.1"), Description: "T1 prompt version; a change produces new fact versions."},
+		{Key: "codeintel.exclude_globs", Category: "codeintel", Type: settings.TypeJSON, Default: rawJSON(`["**/.git/**","**/node_modules/**","**/dist/**","**/build/**","**/vendor/**"]`), Description: "Path globs excluded from indexing (slash-normalized, exclude wins)."},
+
+		{Key: "visual.default_threshold", Category: "visual", Type: settings.TypeNumber, Default: num(0.005), Min: minVisualThreshold, Max: maxVisualThreshold, Description: "Default pixel diff threshold for new visual assertions."},
+		{Key: "visual.baseline_max_bytes", Category: "visual", Type: settings.TypeNumber, Default: num(5 * 1024 * 1024), Integer: true, Min: minBaselineBytes, Max: maxBaselineBytes, Description: "Maximum visual baseline/actual PNG size in bytes."},
+		{Key: "visual.default_viewport_width", Category: "visual", Type: settings.TypeNumber, Default: num(1280), Integer: true, Min: minViewport, Max: maxViewport, Description: "Default visual comparison viewport width."},
+		{Key: "visual.default_viewport_height", Category: "visual", Type: settings.TypeNumber, Default: num(720), Integer: true, Min: minViewport, Max: maxViewport, Description: "Default visual comparison viewport height."},
+		{Key: "visual.default_device_scale_factor", Category: "visual", Type: settings.TypeNumber, Default: num(1), Min: minDPR, Max: maxDPR, Description: "Default visual comparison device scale factor."},
+		{Key: "visual.compare_timeout_seconds", Category: "visual", Type: settings.TypeNumber, Default: num(60), Integer: true, Min: minCompareTimeout, Max: maxCompareTimeout, Description: "Executor visual.compare action timeout in seconds."},
+		{Key: "visual.wait_timeout_seconds", Category: "visual", Type: settings.TypeNumber, Default: num(15), Integer: true, Min: minWaitTimeout, Max: maxWaitTimeout, Description: "Maximum visual capture wait for network/fonts/stability in seconds."},
 
 		{Key: "agent.max_turns", Category: "agent", Type: settings.TypeNumber, Default: num(12), Integer: true, Min: minTurns, Max: maxTurns, Description: "Maximum model turns per agent run."},
 		{Key: "agent.run_soft_timeout_seconds", Category: "agent", Type: settings.TypeNumber, Default: num(300), Integer: true, Min: number(1, 0), Description: "Soft timeout for one agent run in seconds."},

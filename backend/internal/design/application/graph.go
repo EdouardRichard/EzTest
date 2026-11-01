@@ -591,7 +591,7 @@ func caseVersionDetailView(version design.CaseVersion) CaseVersionDetailView {
 	}
 	for _, assertion := range version.Assertions {
 		view.Assertions = append(view.Assertions, CaseAssertionView{
-			StepSeq: assertion.StepSeq, Kind: assertion.Kind, Target: assertion.Target,
+			ID: assertion.ID, StepSeq: assertion.StepSeq, Kind: assertion.Kind, Target: assertion.Target,
 			Expected: assertion.Expected, TargetVersionSUTID: assertion.TargetVersionSUTID,
 			TargetAPIID: assertion.TargetAPIID, DatabaseID: assertion.DatabaseID,
 		})

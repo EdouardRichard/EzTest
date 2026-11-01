@@ -42,18 +42,21 @@ func resourceRepositoryView() resourceapp.CodeRepositoryView {
 	return resourceapp.CodeRepositoryView{ID: "5", Name: "orders-repo", Branch: "main"}
 }
 
+const repositoryCommit = "0123456789abcdef0123456789abcdef01234567"
+
 func versionViewFixture() versionapp.VersionView {
 	repository := resourceRepositoryView()
 	return versionapp.VersionView{
 		ID: 10, Status: "running",
 		Bindings: []versionapp.BindingView{{
-			ID:          7,
-			SUT:         resourceSUTView(),
-			Environment: resourceEnvironmentView(),
-			Repository:  &repository,
-			Pages:       []resourceapp.PageView{{ID: "71", URL: "http://127.0.0.1:13335/login", Name: "登录页"}},
-			APIs:        []resourceapp.APIView{{ID: "72", Method: "GET", PathTemplate: "/api/orders"}},
-			Databases:   []resourceapp.DatabaseView{{ID: "81", Status: "active", ReadOnly: true}},
+			ID:                 7,
+			CodeBaselineCommit: repositoryCommit,
+			SUT:                resourceSUTView(),
+			Environment:        resourceEnvironmentView(),
+			Repository:         &repository,
+			Pages:              []resourceapp.PageView{{ID: "71", URL: "http://127.0.0.1:13335/login", Name: "登录页"}},
+			APIs:               []resourceapp.APIView{{ID: "72", Method: "GET", PathTemplate: "/api/orders"}},
+			Databases:          []resourceapp.DatabaseView{{ID: "81", Status: "active", ReadOnly: true}},
 			Accounts: []resourceapp.AccountView{
 				{ID: "91", Username: "alice", Roles: []string{"admin"}},
 				{ID: "92", Username: "bob", Roles: []string{"viewer"}},
@@ -80,6 +83,7 @@ func TestVersionAdapterMapsFingerprintAndTaskBindings(t *testing.T) {
 		len(sut.APIIDs) != 1 || sut.APIIDs[0] != 72 ||
 		len(sut.DatabaseIDs) != 1 || sut.DatabaseIDs[0] != 81 ||
 		sut.CodeRepoID == nil || *sut.CodeRepoID != 5 || sut.Branch != "main" ||
+		sut.Commit != repositoryCommit ||
 		len(sut.AccountRoles) != 2 {
 		t.Fatalf("version_sut binding = %+v", sut)
 	}

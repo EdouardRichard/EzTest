@@ -224,6 +224,9 @@ func deterministicResult(run execution.CaseRun, steps []execution.StepResult, as
 	}
 
 	if blockedStep != nil || run.Status == execution.CaseRunBlocked {
+		if status, class, overridden := execution.ApplyVisualOutcome(execution.CaseRunBlocked, execution.FailureClassBlocked, summary, assertions); status != execution.CaseRunBlocked {
+			return status, class, overridden
+		}
 		summary.VerdictReason = execution.VerdictReasonBlocked
 		return execution.CaseRunBlocked, execution.FailureClassBlocked, summary
 	}
@@ -244,6 +247,9 @@ func deterministicResult(run execution.CaseRun, steps []execution.StepResult, as
 			if run.FailureClass.Valid() {
 				class = run.FailureClass
 			}
+		}
+		if status, overriddenClass, overridden := execution.ApplyVisualOutcome(execution.CaseRunFailed, class, summary, assertions); status != execution.CaseRunFailed {
+			return status, overriddenClass, overridden
 		}
 		summary.VerdictReason = execution.VerdictReasonStepFailed
 		return execution.CaseRunFailed, class, summary

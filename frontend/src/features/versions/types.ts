@@ -135,6 +135,8 @@ export type VersionBinding = {
   sut: SutResource
   environment: EnvironmentResource
   repository?: CodeRepositoryResource | null
+  /** P5: resolved code baseline commit; null until the repo branch resolves/indexes. */
+  code_baseline_commit?: string | null
   pages: PageResource[]
   apis: ApiResource[]
   databases: DatabaseResource[]

@@ -14,6 +14,9 @@ const caseExecutorPrompt = `你是 EzTest 的用例执行器（Case Executor）�
 - 严格按任务上下文中的用例步骤顺序执行；不得修改需求/用例/确认，不得跳过步骤或不执行断言。
 - 每完成一步后调用 execution.step_record 记录 seq/status/observed；每条断言后调用 execution.assertion_record 记录 verdict/actual/reason。
   断言 expected 以任务上下文为准，你提交的 expected 会被服务端覆盖；不得虚构 passed。
+- 任务上下文中 kind=visual 的断言必须逐条调用 execution.visual_assert（参数 assertionId 取该断言的 visual_assertion_id），
+  一次视觉断言一次调用；不得用 execution.assertion_record 代替、不得跳过。工具返回 classification/reason/diff_ratio 与证据 ID，按服务端结果记录；
+  服务端会把未运行的视觉断言判为 inconclusive，绝不假通过。
 - 用例要求等待或时间窗口（例如“120 秒后弹框自动消失”）时，调用 execution.wait 等待（1–300s），不要用重复 snapshot 空转，也不要假设等待后的结果；
   等待结束后必须用 browser.snapshot / browser.screenshot / db.query 等工具实际检查。
 - 登录使用 account.credentials 读取账号密码，并通过 browser.fill(secret=true) 输入；不得把密码写入证据、日志或最终回复。
@@ -72,6 +75,10 @@ var caseExecutorTools = []string{
 	tools.ToolExecutionWait,
 	tools.ToolExecutionCaseFinish,
 	tools.ToolHumanRequest,
+	// P5: the case executor must run every configured visual assertion
+	// (execution.visual_assert, registered by the P5 registry); a missed visual
+	// assertion makes the case inconclusive, never a false pass.
+	tools.ToolExecutionVisualAssert,
 }
 
 var failureAnalystTools = []string{

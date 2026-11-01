@@ -307,6 +307,14 @@ export function apiPatch<T>(path: string, body?: unknown, init: RequestOptions =
   })
 }
 
+export function apiPut<T>(path: string, body?: unknown, init: RequestOptions = {}): Promise<T> {
+  return apiFetch<T>(path, {
+    ...init,
+    method: "PUT",
+    body: body === undefined ? undefined : JSON.stringify(body),
+  })
+}
+
 export function apiDelete<T>(path: string, init: RequestOptions = {}): Promise<T> {
   return apiFetch<T>(path, { ...init, method: "DELETE" })
 }

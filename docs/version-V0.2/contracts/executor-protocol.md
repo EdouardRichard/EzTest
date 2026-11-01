@@ -1,6 +1,7 @@
 # EzTest 0.2 执行器协议契约（P3）
 
 > 状态：`frozen: P3`（2026-11-01；创建即冻结，P4+ 只允许增量）。
+> P5 增量：§11（`visual.compare`，协议 v1.2，`frozen: P5`，2026-11-01）；§3.3/§4/§8 只做增量补充，P3 语义不变。
 > 来源：`docs/superpowers/specs/2026-11-01-eztest-v02-p3-execution-design.md` §6.1/§6.2/§6.10；`architecture-design.md` §11；`high-level-design.md` §1.3。
 > 实现：`executor/src`（Node + Playwright）与 `backend/internal/execution/infrastructure/executor`（API 侧客户端）。
 > 边界：执行器只执行动作/回传证据，不接触 LLM 上下文、不实现 case/wave 语义（P3-D-10/P3-D-35）。P3 的执行主体是 API 内 Case Executor Agent。
@@ -49,7 +50,7 @@
 
 ### 3.3 Actions
 
-`action ∈ goto, snapshot, click, fill, press, wait_for, screenshot, console, network, download, storage_state, close`。
+`action ∈ goto, snapshot, click, fill, press, wait_for, screenshot, console, network, download, storage_state, close, visual.compare`（`visual.compare` 为 P5 增量，见 §11）。
 
 - `args` 按 action 定义；Target 显式四选一：`{role,name,exact}`、`{text}`、`{test_id}`、`{selector}`。
 - 零匹配 → `target_not_found`；单选动作多匹配 → `target_ambiguous`。
@@ -61,7 +62,7 @@
 
 | 项 | 限额 |
 |---|---|
-| 请求体 | ≤1MB（普通路由）；action 路由在 P8 视觉基线场景可接受更大请求体，不属于 P3 契约 |
+| 请求体 | ≤1MB（普通路由与其余 action）；`visual.compare` ≤ `visual.baseline_max_bytes`（DB 设置，默认 5 MiB，64 KiB..20 MiB；P5 v1.2） |
 | 单 action 超时 | 15s；`goto` 30s；最大 60s（`timeout_ms` 钳制） |
 | artifact | ≤10MB（下载先 stat 再读；截图先 buffer 后校验） |
 | snapshot | ≤12KB（超出截断并返回 `truncated:true`） |
@@ -115,7 +116,7 @@ P3 采用 **API pull healthz**（P3-D-01），执行器不主动 push：
 ## 8. Artifact → 内容账本 / 证据
 
 - 执行器 artifact base64 回传；API 解码后**重算 sha256**（不信任执行器自报）、校验 ≤ `execution.evidence_max_bytes`（5 MiB，P3-D-21）→ `storage.Upload`（P0 `content_object`）→ `storage.AddRef(owner_kind='evidence', owner_id=evidenceID, role=kind)` → 插入 `evidence` 行（先分配雪花 ID、Upload、AddRef、再插行）。
-- evidence kind 映射：screenshot→`screenshot`；snapshot→`snapshot`；console→`console`；network→`network`；http.request→`http`；db.query→`db`；download→`download`；text→`text`。
+- evidence kind 映射：screenshot→`screenshot`；snapshot→`snapshot`；console→`console`；network→`network`；http.request→`http`；db.query→`db`；download→`download`；text→`text`；**P5** `visual.compare` 的 actual→`visual_actual`、diff→`visual_diff`（`screenshot` 仍为通用截图）。
 - 每 `case_run` ≤100 条，超出丢弃并记 `summary.evidence_skipped`（不失败）；超限返回 `evidence_too_large`，用例继续。
 - `evidence` 只存 `content_ref_id/sha256/size_bytes/mime/filename/kind/version_sut_id/...`；**不写 `paths.evidence_dir`**（P3-D-20 例外）；API 不返回 content_ref/路径；下载走 `GET /api/versions/{id}/evidence/{evidenceId}/content` 并校验 sha/size/归属。
 - 失败自动取证：case_run 进入 failed/blocked/inconclusive 时，若仍有活跃 context，best-effort 截图一次。
@@ -133,3 +134,38 @@ P3 采用 **API pull healthz**（P3-D-01），执行器不主动 push：
 - P7 保留（P3 不实现）：`/api/internal/executors/*` push 注册/心跳、内部鉴权 scheme、多副本执行器调度与 fan-out、跨实例实时、远程浏览器/VNC、`storage_state` 导入/复用、条件轮询工具（如 wait_until）、>300s 单次等待。
 - 执行器协议 P3 冻结后只允许**增量**：新增 action/字段必须同时更新本文件、`executor/src`、API 客户端与测试；破坏性变更（改既有 action 语义/认证/大小限额）需先更新契约/决策/handoff。
 - token/注册方式（pull）与 HLD 的 `/api/internal/executors/*` push 差异记录为 P3-D-01/P3-D-02，P7 多副本时补 push（记录于 §10 与 handoff）。
+
+## 11. P5 增量：`visual.compare`（协议 v1.2，`frozen: P5`，2026-11-01）
+
+> 来源：`docs/superpowers/specs/2026-11-01-eztest-v02-p5-codeintel-visual-design.md` §4.6/§7.3/§7.4（P5-D-08）。
+> 实现：`executor/src`（Playwright + pixelmatch）与 `backend/internal/execution/infrastructure/executor`（API 侧客户端）；P3 冻结的其它 action/认证/限额语义不变。
+
+### 11.1 Action `visual.compare`
+
+| 项 | 内容 |
+|---|---|
+| action | `visual.compare`（`POST /v1/contexts/{id}/actions`，与既有 action 同一路由） |
+| 请求 | `{baseline?:{base64,sha256?,bytes}\|null, selector, region?, threshold, viewport:{width,height}, device_scale_factor, wait_policy?}` |
+| 响应 artifact | `actual_png`（必需）+ `diff_png`（有基线且环境匹配时） |
+| 响应 result | `{diff_ratio,diff_pixels,total_pixels,width,height,environment_match,environment:{viewport_width,viewport_height,device_scale_factor,browser,version},mismatch_boxes}` |
+
+- `baseline` 为 `null`/缺省表示 **capture-only**（无基线首跑）：只回 `actual_png`，`classification=inconclusive` 由 API 决定，执行器不伪造 diff。
+- `baseline.base64` 由 **API** 从内容账本读取后放入请求；执行器不访问文件系统/网络取基线，也不把基线/actual/diff 字节落执行器磁盘。
+- `threshold` 0..0.1（NUMERIC(6,5)）；`viewport` 宽高 1..10000；`device_scale_factor` 0.5..4；`selector` ≤500 runes；`region` 归一化 `{x,y,width,height}` 或省略。
+- `wait_policy` 可含 network idle/字体/稳定帧覆盖；最终受 `visual.wait_timeout_seconds`（默认 15s，1..120）与 action 超时（`visual.compare_timeout_seconds`，默认 60s，5..300）双重约束。
+- **仅该 action** 的请求体上限提高到 `visual.baseline_max_bytes`（DB 设置，默认 5 MiB，64 KiB..20 MiB）；其他 action 与普通路由仍 ≤1MB。超限 → 413 `too_large`。
+
+### 11.2 证据映射与四态
+
+- `actual_png` → `visual_actual`，`diff_png` → `visual_diff`（证据 kind 10 值，`db-schema.md` §13.1）；`screenshot` 仍为通用截图，不复用。
+- API 重算 artifact sha256/size（不信任执行器自报），校验 `visual.baseline_max_bytes`，写内容账本（`content_ref`，`owner_kind='evidence'`）后插入 evidence 行。
+- 四态：`passed`（diff_ratio ≤ threshold 且环境匹配）、`failed`（超阈值）、`inconclusive`（无基线/环境不一致/尺寸不可比）、`blocked`（通用执行错误导致无法比对，assertion verdict 仍为 `inconclusive` 的契约见 spec §7.3）。
+- **环境指纹**：viewport/DPR + selector/region/config_revision + 浏览器名/版本；不一致时 `environment_match=false`，**不返回 diff 图**，判 `inconclusive`（环境不一致不是失败）。
+- 幂等重放：同一 `assertion_result_id` 只落一条 `visual_diff`；`execution.visual_assert` 重放返回既有 classification/evidence ids，不重复比对/证据。
+
+### 11.3 等待、失败与安全
+
+- 等待策略：network idle + `document.fonts.ready` + 注入 CSS 冻结动画/过渡/caret + 连续两帧稳定；超时受 `visual.wait_timeout_seconds`/action timeout 限制。
+- 失败：页面/导航/context 错误走 §5 通用错误码；环境不一致不按失败处理（`inconclusive`）；执行器重启/context 丢失按 §5 处理。
+- 安全：沿用 §2 host allowlist/只读页面/敏感值擦除；不得执行页面脚本外的高危动作；基线字节只在内存中使用，不写执行器磁盘/日志。
+- 协议版本：P5 起 action 集合新增 `visual.compare`，协议版本记为 **v1.2**；P3 既有 action 语义/认证/限额不变，P6+ 只允许增量。

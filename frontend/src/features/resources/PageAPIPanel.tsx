@@ -3,27 +3,37 @@
 import { Plus } from "lucide-react"
 import { useCallback, useState } from "react"
 
-import { Badge } from "@/components/ui/Badge"
+import { Badge, type BadgeTone } from "@/components/ui/Badge"
 import { Button } from "@/components/ui/Button"
 import { EmptyState } from "@/components/ui/EmptyState"
-import { ErrorState } from "@/components/ui/ErrorState"
+import { ErrorState, InlineError } from "@/components/ui/ErrorState"
+import { Select } from "@/components/ui/Select"
 import { LoadingCard } from "@/components/ui/Spinner"
 import { Table, type TableColumn } from "@/components/ui/Table"
+import { useIsAdmin } from "@/features/auth/useIsAdmin"
+import { listVersions } from "@/features/versions/api"
+import type { VersionSummary } from "@/features/versions/types"
 import { formatDateTime } from "@/lib/format"
 
 import {
+  confirmApiProposal,
+  confirmPageProposal,
   createApi,
   createPage,
   deleteApi,
   deletePage,
+  generatePageApiProposals,
   importApis,
   importPages,
+  listPageApiProposals,
+  rejectApiProposal,
+  rejectPageProposal,
   updateApi,
   updatePage,
 } from "./api"
 import { ApiDialog, ConfirmDialog, ImportDialog, PageDialog } from "./dialogs"
 import { ScopeBar } from "./ScopeBar"
-import type { ResourceScope, SutApi, SutPage } from "./types"
+import type { CodeProposal, PageStatus, ResourceScope, SutApi, SutPage } from "./types"
 import { parseApisImport, parsePagesImport } from "./validation"
 
 export type PageAPIPanelProps = {
@@ -37,6 +47,28 @@ export type PageAPIPanelProps = {
 const PAGE_IMPORT_EXAMPLE =
   '[{"name":"订单列表","url":"https://order.test/orders","route_template":"/orders"}]'
 const API_IMPORT_EXAMPLE = '[{"name":"查询订单","method":"GET","path_template":"/api/orders"}]'
+
+type StatusFilter = "all" | PageStatus
+
+const STATUS_LABEL: Record<PageStatus, string> = {
+  approved: "已确认",
+  proposed: "待确认",
+  rejected: "已驳回",
+}
+
+const STATUS_TONE: Record<PageStatus, BadgeTone> = {
+  approved: "success",
+  proposed: "warning",
+  rejected: "neutral",
+}
+
+function proposalEvidenceLabels(proposal: CodeProposal): string[] {
+  return (proposal.evidence ?? []).flatMap((item) => {
+    if (typeof item.path === "string" && item.path.length > 0) return [item.path]
+    if (typeof item.ref === "string" && item.ref.length > 0) return [item.ref]
+    return []
+  })
+}
 
 /** Pages + APIs tab for the selected environment, including JSON imports. */
 export function PageAPIPanel({
@@ -54,6 +86,19 @@ export function PageAPIPanel({
   const [editingApi, setEditingApi] = useState<SutApi | null>(null)
   const [deletingApi, setDeletingApi] = useState<SutApi | null>(null)
   const [importApisOpen, setImportApisOpen] = useState(false)
+
+  const isAdmin = useIsAdmin()
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>("all")
+  const [proposalsOpen, setProposalsOpen] = useState(false)
+  const [versions, setVersions] = useState<VersionSummary[]>([])
+  const [proposalVersionId, setProposalVersionId] = useState("")
+  const [proposals, setProposals] = useState<CodeProposal[]>([])
+  const [proposalsLoading, setProposalsLoading] = useState(false)
+  const [proposalsError, setProposalsError] = useState<unknown>(null)
+  const [proposalNotice, setProposalNotice] = useState<string | null>(null)
+  const [proposalActionError, setProposalActionError] = useState<unknown>(null)
+  const [generating, setGenerating] = useState(false)
+  const [decisionBusy, setDecisionBusy] = useState<string | null>(null)
 
   const environments = scope.detail?.environments ?? []
   const environment =
@@ -73,6 +118,91 @@ export function PageAPIPanel({
       return importApis(environment.id, items)
     },
     [environment],
+  )
+
+  const loadProposals = useCallback(async (versionId: string) => {
+    if (versionId.length === 0) {
+      setProposals([])
+      return
+    }
+    setProposalsLoading(true)
+    setProposalsError(null)
+    try {
+      setProposals(await listPageApiProposals(versionId))
+    } catch (cause) {
+      setProposals([])
+      setProposalsError(cause)
+    } finally {
+      setProposalsLoading(false)
+    }
+  }, [])
+
+  const openProposals = useCallback(async () => {
+    setProposalsOpen(true)
+    setProposalNotice(null)
+    setProposalsError(null)
+    setProposalActionError(null)
+    try {
+      let nextVersions = versions
+      if (nextVersions.length === 0) {
+        nextVersions = await listVersions()
+        setVersions(nextVersions)
+      }
+      const versionId =
+        proposalVersionId.length > 0 &&
+        nextVersions.some((version) => version.id === proposalVersionId)
+          ? proposalVersionId
+          : (nextVersions[0]?.id ?? "")
+      setProposalVersionId(versionId)
+      await loadProposals(versionId)
+    } catch (cause) {
+      setProposalsError(cause)
+    }
+  }, [loadProposals, proposalVersionId, versions])
+
+  const generate = useCallback(async () => {
+    if (proposalVersionId.length === 0 || generating) return
+    setGenerating(true)
+    setProposalNotice(null)
+    setProposalActionError(null)
+    try {
+      const result = await generatePageApiProposals(proposalVersionId)
+      setProposalNotice(
+        `已创建 ${result.pages.created} 个页面、${result.apis.created} 个 API，跳过 ${
+          result.pages.skipped + result.apis.skipped
+        } 个。`,
+      )
+      await onRefresh()
+      await loadProposals(proposalVersionId)
+    } catch (cause) {
+      setProposalActionError(cause)
+    } finally {
+      setGenerating(false)
+    }
+  }, [generating, loadProposals, onRefresh, proposalVersionId])
+
+  const decide = useCallback(
+    async (kind: "page" | "api", id: string, action: "confirm" | "reject") => {
+      const key = `${kind}-${id}-${action}`
+      setDecisionBusy(key)
+      setProposalActionError(null)
+      try {
+        if (kind === "page") {
+          await (action === "confirm" ? confirmPageProposal(id) : rejectPageProposal(id))
+        } else {
+          await (action === "confirm" ? confirmApiProposal(id) : rejectApiProposal(id))
+        }
+        await onRefresh()
+        if (proposalsOpen && proposalVersionId.length > 0) {
+          await loadProposals(proposalVersionId)
+        }
+      } catch (cause) {
+        setProposalActionError(cause)
+      } finally {
+        setDecisionBusy(null)
+      }
+    },
+    [loadProposals, onRefresh, proposalVersionId, proposalsOpen],
   )
 
   if (scope.loading) return <LoadingCard label="正在加载 SUT 列表…" />
@@ -118,11 +248,46 @@ export function PageAPIPanel({
       ),
     },
     {
+      key: "status",
+      header: "状态 / 来源",
+      render: (page) => (
+        <div className="flex flex-wrap items-center gap-1">
+          <Badge tone={STATUS_TONE[page.status]}>{STATUS_LABEL[page.status]}</Badge>
+          <Badge tone="neutral">{page.source}</Badge>
+        </div>
+      ),
+    },
+    {
       key: "actions",
       header: "操作",
       className: "text-right",
       render: (page) => (
         <div className="flex items-center justify-end gap-1">
+          {isAdmin && page.status === "proposed" ? (
+            <>
+              <Button
+                size="sm"
+                disabled={decisionBusy === `page-${page.id}-confirm`}
+                aria-label={`确认页面 ${page.name}`}
+                onClick={() => {
+                  void decide("page", page.id, "confirm")
+                }}
+              >
+                确认
+              </Button>
+              <Button
+                variant="secondary"
+                size="sm"
+                disabled={decisionBusy === `page-${page.id}-reject`}
+                aria-label={`驳回页面 ${page.name}`}
+                onClick={() => {
+                  void decide("page", page.id, "reject")
+                }}
+              >
+                驳回
+              </Button>
+            </>
+          ) : null}
           <Button
             variant="ghost"
             size="sm"
@@ -172,11 +337,46 @@ export function PageAPIPanel({
       ),
     },
     {
+      key: "status",
+      header: "状态 / 来源",
+      render: (api) => (
+        <div className="flex flex-wrap items-center gap-1">
+          <Badge tone={STATUS_TONE[api.status]}>{STATUS_LABEL[api.status]}</Badge>
+          <Badge tone="neutral">{api.source}</Badge>
+        </div>
+      ),
+    },
+    {
       key: "actions",
       header: "操作",
       className: "text-right",
       render: (api) => (
         <div className="flex items-center justify-end gap-1">
+          {isAdmin && api.status === "proposed" ? (
+            <>
+              <Button
+                size="sm"
+                disabled={decisionBusy === `api-${api.id}-confirm`}
+                aria-label={`确认 API ${api.name}`}
+                onClick={() => {
+                  void decide("api", api.id, "confirm")
+                }}
+              >
+                确认
+              </Button>
+              <Button
+                variant="secondary"
+                size="sm"
+                disabled={decisionBusy === `api-${api.id}-reject`}
+                aria-label={`驳回 API ${api.name}`}
+                onClick={() => {
+                  void decide("api", api.id, "reject")
+                }}
+              >
+                驳回
+              </Button>
+            </>
+          ) : null}
           <Button
             variant="ghost"
             size="sm"
@@ -198,6 +398,19 @@ export function PageAPIPanel({
     },
   ]
 
+  const visiblePages =
+    environment === null
+      ? []
+      : statusFilter === "all"
+        ? environment.pages
+        : environment.pages.filter((page) => page.status === statusFilter)
+  const visibleApis =
+    environment === null
+      ? []
+      : statusFilter === "all"
+        ? environment.apis
+        : environment.apis.filter((api) => api.status === statusFilter)
+
   return (
     <div className="space-y-5">
       <div>
@@ -217,6 +430,21 @@ export function PageAPIPanel({
         onSelectSut={onSelectSut}
         onSelectEnvironment={onSelectEnvironment}
       />
+
+      <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
+        <span>状态</span>
+        <Select
+          aria-label="状态"
+          value={statusFilter}
+          onChange={(event) => setStatusFilter(event.target.value as StatusFilter)}
+          className="h-8 w-32 text-xs"
+        >
+          <option value="all">全部</option>
+          <option value="approved">已确认</option>
+          <option value="proposed">待确认</option>
+          <option value="rejected">已驳回</option>
+        </Select>
+      </div>
 
       {!environment ? (
         <EmptyState
@@ -251,7 +479,7 @@ export function PageAPIPanel({
             <Table
               ariaLabel="页面列表"
               columns={pageColumns}
-              rows={environment.pages}
+              rows={visiblePages}
               rowKey={(page) => page.id}
               empty="还没有页面。点击「新建页面」或「导入页面」添加。"
             />
@@ -283,13 +511,169 @@ export function PageAPIPanel({
             <Table
               ariaLabel="API 列表"
               columns={apiColumns}
-              rows={environment.apis}
+              rows={visibleApis}
               rowKey={(api) => api.id}
               empty="还没有 API。点击「新建 API」或「导入 API」添加。"
             />
           </section>
         </>
       )}
+
+      <section aria-label="代码提议" className="surface-card space-y-3 p-4">
+        <header className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h3 className="text-sm font-semibold text-foreground">代码提议</h3>
+            <p className="mt-0.5 text-[11px] text-muted-foreground">
+              从索引代码事实与执行网络证据生成 proposed 页面/API；只写
+              proposed，确认或驳回由管理员完成。
+            </p>
+          </div>
+          <Button
+            variant="secondary"
+            onClick={() => {
+              if (proposalsOpen) {
+                setProposalsOpen(false)
+              } else {
+                void openProposals()
+              }
+            }}
+          >
+            {proposalsOpen ? "收起代码提议" : "展开代码提议"}
+          </Button>
+        </header>
+
+        {proposalsOpen ? (
+          <div className="space-y-2">
+            <div className="flex flex-wrap items-end gap-2">
+              <div className="flex flex-col gap-1 text-[11px] text-muted-foreground">
+                <span>提议版本</span>
+                <Select
+                  aria-label="提议版本"
+                  value={proposalVersionId}
+                  onChange={(event) => {
+                    const next = event.target.value
+                    setProposalVersionId(next)
+                    setProposalNotice(null)
+                    void loadProposals(next)
+                  }}
+                  className="h-8 w-56 text-xs"
+                >
+                  {versions.length === 0 ? <option value="">（暂无版本）</option> : null}
+                  {versions.map((version) => (
+                    <option key={version.id} value={version.id}>
+                      #{version.id} · {version.title}
+                    </option>
+                  ))}
+                </Select>
+              </div>
+              <Button
+                disabled={proposalVersionId.length === 0 || generating}
+                onClick={() => {
+                  void generate()
+                }}
+              >
+                {generating ? "生成中…" : "从代码生成提议"}
+              </Button>
+            </div>
+
+            {proposalNotice !== null ? (
+              <p role="status" className="text-[11px] text-success">
+                {proposalNotice}
+              </p>
+            ) : null}
+
+            {proposalActionError !== null ? <InlineError error={proposalActionError} /> : null}
+
+            {proposalsLoading ? <LoadingCard label="正在加载代码提议…" /> : null}
+
+            {!proposalsLoading && proposalsError !== null ? (
+              <div className="space-y-1.5">
+                <InlineError error={proposalsError} />
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => {
+                    void openProposals()
+                  }}
+                >
+                  重试
+                </Button>
+              </div>
+            ) : null}
+
+            {!proposalsLoading && proposalsError === null && proposals.length === 0 ? (
+              <p className="text-[11px] text-muted-foreground">
+                暂无 proposed 页面/API。先生成提议，或在页面/API 列表中确认已有资源。
+              </p>
+            ) : null}
+
+            {!proposalsLoading && proposalsError === null && proposals.length > 0 ? (
+              <ul className="space-y-1.5">
+                {proposals.map((proposal) => {
+                  const evidence = proposalEvidenceLabels(proposal)
+                  return (
+                    <li
+                      key={`${proposal.kind}-${proposal.id}`}
+                      className="rounded-lg border border-border bg-muted/20 px-3 py-2 text-[11px]"
+                    >
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <Badge tone={proposal.kind === "page" ? "info" : "neutral"}>
+                          {proposal.kind === "page" ? "页面" : "API"}
+                        </Badge>
+                        <span className="font-medium text-foreground">{proposal.name}</span>
+                        <Badge tone="warning">待确认</Badge>
+                        <Badge tone="neutral">{proposal.source}</Badge>
+                        <span className="font-mono text-muted-foreground">
+                          {proposal.kind === "page"
+                            ? (proposal.route_template ?? proposal.url ?? "")
+                            : `${proposal.method ?? ""} ${proposal.path_template ?? ""}`.trim()}
+                        </span>
+                        {isAdmin ? (
+                          <div className="ml-auto flex items-center gap-1">
+                            <Button
+                              size="sm"
+                              disabled={decisionBusy !== null}
+                              aria-label={`确认提议 ${proposal.name}`}
+                              onClick={() => {
+                                void decide(proposal.kind, proposal.id, "confirm")
+                              }}
+                            >
+                              确认
+                            </Button>
+                            <Button
+                              variant="secondary"
+                              size="sm"
+                              disabled={decisionBusy !== null}
+                              aria-label={`驳回提议 ${proposal.name}`}
+                              onClick={() => {
+                                void decide(proposal.kind, proposal.id, "reject")
+                              }}
+                            >
+                              驳回
+                            </Button>
+                          </div>
+                        ) : null}
+                      </div>
+                      {evidence.length > 0 ? (
+                        <div className="mt-1">
+                          <p className="text-[10px] text-muted-foreground">代码事实来源</p>
+                          <ul className="mt-0.5 space-y-0.5">
+                            {evidence.map((item) => (
+                              <li key={item} className="truncate font-mono text-[10px]">
+                                {item}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      ) : null}
+                    </li>
+                  )
+                })}
+              </ul>
+            ) : null}
+          </div>
+        ) : null}
+      </section>
 
       {createPageOpen && environment ? (
         <PageDialog

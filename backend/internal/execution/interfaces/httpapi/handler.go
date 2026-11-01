@@ -731,11 +731,7 @@ func (h *Handler) ListEvidence(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
-	kind, err := requireEnum("kind", r.URL.Query().Get("kind"),
-		string(execution.EvidenceScreenshot), string(execution.EvidenceSnapshot),
-		string(execution.EvidenceConsole), string(execution.EvidenceNetwork),
-		string(execution.EvidenceHTTP), string(execution.EvidenceDB),
-		string(execution.EvidenceDownload), string(execution.EvidenceText))
+	kind, err := requireEnum("kind", r.URL.Query().Get("kind"), evidenceKinds()...)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return

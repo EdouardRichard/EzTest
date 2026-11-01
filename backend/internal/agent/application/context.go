@@ -426,6 +426,21 @@ func executionBlock(task ExecutionTask) string {
 	if len(task.Assertions) > 0 {
 		builder.WriteString("断言:\n")
 		for _, assertion := range task.Assertions {
+			if assertion.Kind == "visual" {
+				// P5: the model can only run a visual assertion when the task
+				// context names the visual_assertion ID (spec §7.3). The
+				// finalizer makes a missing run inconclusive, never passed.
+				fmt.Fprintf(&builder, "- step %d assertion %d [kind=visual, version_sut=%s",
+					assertion.StepSeq, assertion.AssertionSeq, idText(assertion.TargetVersionSUTID))
+				if assertion.VisualAssertionID > 0 {
+					fmt.Fprintf(&builder, ", visual_assertion_id=%s", idText(assertion.VisualAssertionID))
+				}
+				if assertion.CaseAssertionID > 0 {
+					fmt.Fprintf(&builder, ", case_assertion_id=%s", idText(assertion.CaseAssertionID))
+				}
+				fmt.Fprintf(&builder, "]: %s\n", assertion.Expected)
+				continue
+			}
 			fmt.Fprintf(&builder, "- step %d assertion %d [kind=%s, version_sut=%s]: %s\n",
 				assertion.StepSeq, assertion.AssertionSeq, assertion.Kind,
 				idText(assertion.TargetVersionSUTID), assertion.Expected)

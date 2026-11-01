@@ -20,8 +20,8 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 24 {
-		t.Fatalf("applied %d migrations, want 24: %v", len(applied), applied)
+	if len(applied) != 31 {
+		t.Fatalf("applied %d migrations, want 31: %v", len(applied), applied)
 	}
 
 	again, err := db.Migrate(ctx, pool)
@@ -50,6 +50,9 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 		"delivery_issue", "delivery_issue_ref", "delivery_issue_status_history",
 		"delivery_report", "delivery_report_revision", "delivery_report_ref",
 		"delivery_analysis_run", "requirement_closure",
+		"code_index_run", "code_entity", "code_edge", "code_fact", "code_analysis",
+		"code_impact_candidate", "code_anchor", "code_fact_review",
+		"visual_assertion", "visual_baseline", "visual_diff",
 	}
 	found := map[string]bool{}
 	rows, err := pool.Query(ctx, `
@@ -169,8 +172,8 @@ func TestP3ExecutionTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 24 {
-		t.Fatalf("applied %d migrations, want 24: %v", len(applied), applied)
+	if len(applied) != 31 {
+		t.Fatalf("applied %d migrations, want 31: %v", len(applied), applied)
 	}
 
 	tables := []string{
@@ -310,8 +313,8 @@ func TestP4DeliverySchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 24 {
-		t.Fatalf("applied %d migrations, want 24: %v", len(applied), applied)
+	if len(applied) != 31 {
+		t.Fatalf("applied %d migrations, want 31: %v", len(applied), applied)
 	}
 	again, err := db.Migrate(ctx, pool)
 	if err != nil {

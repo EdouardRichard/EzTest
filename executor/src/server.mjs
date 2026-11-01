@@ -18,6 +18,7 @@ import {
   ExecutorError,
   MAX_ACTION_REQUEST_BYTES,
   MAX_REQUEST_BYTES,
+  visualActionRequestLimit,
 } from "./security.mjs"
 
 const PACKAGE_VERSION = (() => {
@@ -120,8 +121,7 @@ export function readBody(req, limit = MAX_REQUEST_BYTES) {
   })
 }
 
-async function readJsonBody(req, limit = MAX_REQUEST_BYTES) {
-  const buffer = await readBody(req, limit)
+function parseJsonObject(buffer) {
   if (buffer.length === 0) {
     return {}
   }
@@ -135,6 +135,10 @@ async function readJsonBody(req, limit = MAX_REQUEST_BYTES) {
     throw new ExecutorError("invalid_request", "request body must be a JSON object")
   }
   return value
+}
+
+async function readJsonBody(req, limit = MAX_REQUEST_BYTES) {
+  return parseJsonObject(await readBody(req, limit))
 }
 
 function decodeId(raw) {
@@ -224,7 +228,14 @@ export function createExecutorServer({ token, manager, version = PACKAGE_VERSION
         return sendError(res, 405, "invalid_request", "method not allowed")
       }
       const contextId = decodeId(actionMatch[1])
-      const body = await readJsonBody(req, MAX_ACTION_REQUEST_BYTES)
+      // Only visual.compare may carry the ~6.7 MiB base64 baseline copy; every
+      // other action keeps the normal 1 MiB body cap (executor protocol §11.1).
+      const rawBody = await readBody(req, MAX_ACTION_REQUEST_BYTES)
+      const body = parseJsonObject(rawBody)
+      const limit = body.action === "visual.compare" ? visualActionRequestLimit() : MAX_REQUEST_BYTES
+      if (rawBody.length > limit) {
+        throw new ExecutorError("too_large", `request body exceeds the ${limit} byte limit`)
+      }
       const envelope = await executor.runAction(contextId, body)
       const status = envelope.ok ? 200 : ACTION_ERROR_STATUS[envelope.error.code] ?? 200
       return sendJson(res, status, envelope)

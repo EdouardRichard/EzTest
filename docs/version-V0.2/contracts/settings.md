@@ -91,9 +91,9 @@ system_setting_revision(
   （如雪花 node、数据根目录）。UI 只显示提示，不阻止保存。
 - 相对路径按进程 CWD 解析；`paths.data_root` 启动后不可热改（重启生效）。
 
-## 3. 设置键目录（P0 44 项 + P3 5 项 + P4 4 项 = 53 项）
+## 3. 设置键目录（P0 44 项 + P3 5 项 + P4 4 项 + P5 16 项 = 69 项）
 
-`secret` 列：P0 44 项全部为 `false`；P3 的 `execution.executor_token` 为 `true`（表中以 **secret** 标注），其余 4 项为 `false`；P4 4 个 `chain.*` 键全部为 `false`。
+`secret` 列：P0 44 项全部为 `false`；P3 的 `execution.executor_token` 为 `true`（表中以 **secret** 标注），其余 4 项为 `false`；P4 4 个 `chain.*` 键全部为 `false`；P5 16 个 `codeintel.*`/`visual.*` 键全部为 `false`。
 重启列中“是”对应 `restart_required=true`。
 未给出区间的 `number` 为整数类型，具体上限由后续阶段按合同增量（P0 不额外发明约束；P3 键的区间见本表）。
 
@@ -152,9 +152,25 @@ system_setting_revision(
 | 51 | `chain.max_edges` | number | chain | `600` | 整数 1–2000；链路边上限；越界回退默认并审计 | 否 |
 | 52 | `chain.max_requirements` | number | chain | `100` | 整数 1–500；参与链路的版本需求上限；越界回退默认并审计 | 否 |
 | 53 | `chain.replay_event_limit` | number | chain | `500` | 整数 1–2000；历史回看事件上限；越界回退默认并审计 | 否 |
+| 54 | `codeintel.max_index_files` | number | codeintel | `5000` | 整数 1–50000；T0 索引文件上限，超出 `truncated` | 否 |
+| 55 | `codeintel.max_changed_files` | number | codeintel | `20` | 整数 1–200；T1 分析文件上限 | 否 |
+| 56 | `codeintel.max_file_bytes` | number | codeintel | `65536` | 整数 1024–1048576；T1 可读文件上限 | 否 |
+| 57 | `codeintel.max_diff_bytes` | number | codeintel | `262144` | 整数 4096–1048576；按需 patch 上限 | 否 |
+| 58 | `codeintel.max_excerpt_lines` | number | codeintel | `40` | 整数 1–200；事实证据摘录上限 | 否 |
+| 59 | `codeintel.analysis_timeout_seconds` | number | codeintel | `180` | 整数 10–1800；分析硬超时 | 否 |
+| 60 | `codeintel.max_concurrent_analyses` | number | codeintel | `1` | 整数 1–4；worker 并发 | 否 |
+| 61 | `codeintel.prompt_version` | string | codeintel | `"p5.1"` | 字符串；变化会产生新事实版本 | 否 |
+| 62 | `codeintel.exclude_globs` | json | codeintel | `["**/.git/**","**/node_modules/**","**/dist/**","**/build/**","**/vendor/**"]` | 路径排除，按 slash 归一化 | 否 |
+| 63 | `visual.default_threshold` | number | visual | `0.005` | 小数 0–0.1；新配置默认 | 否 |
+| 64 | `visual.baseline_max_bytes` | number | visual | `5242880` | 整数 65536–20971520；基线/actual 上限（= executor `visual.compare` body 上限） | 否 |
+| 65 | `visual.default_viewport_width` | number | visual | `1280` | 整数 1–10000 | 否 |
+| 66 | `visual.default_viewport_height` | number | visual | `720` | 整数 1–10000 | 否 |
+| 67 | `visual.default_device_scale_factor` | number | visual | `1.0` | 小数 0.5–4 | 否 |
+| 68 | `visual.compare_timeout_seconds` | number | visual | `60` | 整数 5–300；executor 动作超时 | 否 |
+| 69 | `visual.wait_timeout_seconds` | number | visual | `15` | 整数 1–120；network/font/稳定等待上限 | 否 |
 
 类别数量：runtime 1、paths 5、execution 11、chain 4、agent 5、llm 2、context 4、team_room 3、
-retention 5、report 7、knowledge 2、security 2、feature 2 = **53**（P0 44 + P3 5 + P4 4）。
+retention 5、report 7、knowledge 2、security 2、feature 2、codeintel 9、visual 7 = **69**（P0 44 + P3 5 + P4 4 + P5 16）。
 
 默认值来源：规格 §5.2（OD-4/OD-8/OD-9/架构 §9–§12）；未在设计中逐项给出的键由 P0 冻结，
 后续阶段只能通过契约变更修改默认值或新增键；P3 新增 5 键按 spec §11.2 / P3-D-19 冻结。
@@ -218,6 +234,29 @@ retention 5、report 7、knowledge 2、security 2、feature 2 = **53**（P0 44 +
   - `paths.report_dir` **P4 不使用**（与 `paths.export_dir`/`paths.evidence_dir` 例外一致）：报告 HTML 只写 P0 内容账本（`content_ref` owner_kind=`report_revision`、role=`report_html`），下载走鉴权端点，不落 `report_dir`。
 - `paths.data_root` 不变；P4 新增 `delivery`/`chain` 不引入独立 env 或路径设置。
 - P4 的 LLM 验收凭据仍只来自 `.env` 小写 `llm_*`（验收脚本读取，经 admin API 写入 `llm_config`），不属于 EzTest 启动 env。
+
+## 4e. P5 使用说明（`frozen: P5`，2026-11-01）
+
+- P5 **不新增** EzTest 启动 env：仍是严格 4 项（`.env` 只有 `EZTEST_DATABASE_URL`/`EZTEST_API_PORT`/`EZTEST_WEB_PORT`/`EZTEST_EXECUTOR_PORT`）。代码智能/视觉配置一律进设置中心；**不引入第 5 个 EzTest env**。
+- P5 新增 16 键（53→69；新增 `codeintel` 9 键 + `visual` 7 键两个类别；全部非 secret、`restart_required=false`、热加载）：
+  - `codeintel.max_index_files=5000`（1..50000）：T0 索引文件上限；超出 `code_index_run.truncated=true` 并记录 reason，不失败。
+  - `codeintel.max_changed_files=20`（1..200）：T1 分析文件上限。
+  - `codeintel.max_file_bytes=65536`（1024..1048576）：T1 可读文件上限。
+  - `codeintel.max_diff_bytes=262144`（4096..1048576）：按需 patch 上限。
+  - `codeintel.max_excerpt_lines=40`（1..200）：事实证据摘录上限。
+  - `codeintel.analysis_timeout_seconds=180`（10..1800）：分析硬超时。
+  - `codeintel.max_concurrent_analyses=1`（1..4）：codeintel worker 并发。
+  - `codeintel.prompt_version="p5.1"`：变化会产生新事实版本（`code_fact.version+1`）。
+  - `codeintel.exclude_globs`（json，默认 `["**/.git/**","**/node_modules/**","**/dist/**","**/build/**","**/vendor/**"]`）：路径排除，按 slash 归一化；非法 glob 回退默认并写审计（不阻断请求）。
+  - `visual.default_threshold=0.005`（0..0.1）：新视觉配置默认阈值。
+  - `visual.baseline_max_bytes=5242880`（65536..20971520）：基线/actual 字节上限；同时作为 executor `visual.compare` 的 action body 上限（其他 action 仍 1 MiB）。
+  - `visual.default_viewport_width=1280`/`visual.default_viewport_height=720`（1..10000）：新配置默认视口。
+  - `visual.default_device_scale_factor=1.0`（0.5..4）：新配置默认 DPR。
+  - `visual.compare_timeout_seconds=60`（5..300）：executor `visual.compare` 动作超时。
+  - `visual.wait_timeout_seconds=15`（1..120）：network idle/font/稳定等待上限。
+- **代码常量硬上限**（来自 0.1 `limits.go`，设置只能降低不能突破）：`MaxEvidencePerFact=8`、`MaxFactsPerFile=200`、`MaxEdgesPerFile=200`、`MaxFactKeyChars=512`、`MaxReasonChars=2000`、`MaxPathChars=4096`、`MaxChangedFilesStored=2000`、`MaxTreeEntriesPerPage=200`、`MaxReadLines=400`、`MaxRequirementsInPrompt=100`、`MaxAnalysisErrors=20`、`MaxFactVersionsSnapshot=500`、`MaxUnmappedEntries=200`。
+- **视觉常量**：threshold 0..0.1；viewport ≤10000；DPR 0.5..4；selector ≤500 runes；mismatch boxes ≤50；region 归一化。`visual.baseline_max_bytes` 同时限制基线存储与 executor body；`visual.compare_timeout_seconds`/`visual.wait_timeout_seconds` 分别约束 action 超时与等待策略。
+- 消费方：codeintel worker 读 `codeintel.*`；visual 服务与 executor 调用读 `visual.*`；均通过设置 Service 读取（不直接读 env/文件）。所有设置更新必须写 revision（secret 值置 null）与审计。
 
 ## 5. 冻结与变更控制
 

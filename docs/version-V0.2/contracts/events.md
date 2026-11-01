@@ -420,3 +420,36 @@ P4 业务事件一律发布到 `version:{id}` 频道；scope 使用十进制字�
 8. 事件发布失败不回滚业务写；P4 仍为单实例 Hub，多副本 fan-out 属 P7。
 9. P4 冻结后 P5+ 只能增量新增事件类型，不得重命名/回退本表类型与 payload 语义。
 
+## 14. P5 增量事件（`frozen: P5`，2026-11-01）
+
+P5 事件一律发布到 `version:{version_id}` 频道（索引/分析/视觉）；索引若 `version_id` 为空则发 `system`（P5 触发总是有版本，故实际为 `version:{id}`）。P0–P4 的频道/信封/SSE/游标/心跳/`stream.reset` 语义不变；P5 **不新增频道、不新增事件端点**，复用 `GET /api/events` 与 `GET /api/stream?channel=version:{id}`。`work_item.*` 事件并存：codeintel work item 的 created/claimed 由 P1 worker 发布。
+
+### 14.1 事件类型（12 个）
+
+| type | 频道 | 触发 | payload 关键字段 |
+|---|---|---|---|
+| `code.index_started` | `version:{id}` | T0 索引运行进入 running | `index_run_id, repo_id, commit_sha, branch` |
+| `code.index_finished` | `version:{id}` | 索引运行 done | `index_run_id, status, files_total, files_indexed, truncated, stats` |
+| `code.index_failed` | `version:{id}` | 索引运行 failed | `index_run_id, error_code, message` |
+| `code.analysis_started` | `version:{id}` | T1 变更分析进入 running | `analysis_id, repo_id, base_commit_sha, head_commit_sha` |
+| `code.analysis_finished` | `version:{id}` | 分析 done（可 degraded） | `analysis_id, status, degraded, changed_files, facts, candidates, unmapped` |
+| `code.analysis_failed` | `version:{id}` | 分析失败 | `analysis_id, error_code, message` |
+| `code.impact_computed` | `version:{id}` | 影响候选落库后 | `analysis_id, candidates_by_source, candidates_by_kind, selected_count` |
+| `code.anchor_validated` | `version:{id}` | 锚点 validate/状态重算 | `anchor_id, subject_kind, subject_id, status` |
+| `code.fact_reviewed` | `version:{id}` | 事实复核 append | `fact_id, fact_version, verdict, reviewer_id` |
+| `code.page_api_proposed` | `version:{id}` | 页面/API 提议生成 | `pages_created, pages_skipped, apis_created, apis_skipped`（IDs ≤20） |
+| `visual.baseline_approved` | `version:{id}` | 管理员批准视觉基线 | `baseline_id, visual_assertion_id, evidence_id, approved_by` |
+| `visual.diff_created` | `version:{id}` | 每次视觉比对落库 | `visual_diff_id, visual_assertion_id, case_run_id, classification, diff_ratio, reason` |
+
+### 14.2 约束
+
+1. payload **不含**代码正文、图片字节、文件系统路径、凭据/token；锚点事件只含 subject id/status，**不含 path**；`code.diff` 内容不过事件回传。
+2. `code.index_*`/`code.analysis_*` 是运行状态投影；业务真值以 `code_index_run`/`code_analysis` 行为准，前端去抖重拉快照，不从事件重建索引/事实。
+3. `code.analysis_finished` 的 `degraded=true` 表示 LLM 不可用/T1 降级；不伪造事实，不把降级当失败（无 `code.analysis_failed`）。
+4. `code.fact_reviewed` 只给复核摘要（`fact_id/fact_version/verdict/reviewer_id`），不含 reason 全文/内部 SQL。
+5. `code.page_api_proposed` 的 ID 数组 ≤20（`pages_created`/`apis_created` 的 ID 列表）；提议只写 `proposed`，确认/驳回 admin-only 且不新增事件类型（复用资源状态）。
+6. `visual.diff_created` 每次比对一条；`classification` 四态 `passed/failed/inconclusive/blocked`；`reason` ≤2000；不含 actual/diff 图片字节，证据走 evidence id + 内容账本。
+7. `visual.baseline_approved` 在基线批准事务提交后 best-effort 发布；旧 approved 被 supersede 不单独发事件。
+8. 事件发布失败不回滚业务写；P5 仍为单实例 Hub，多副本 fan-out 属 P7。
+9. P5 冻结后 P6+ 只能增量新增事件类型，不得重命名/回退本表类型与 payload 语义。
+

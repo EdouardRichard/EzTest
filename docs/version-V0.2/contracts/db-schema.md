@@ -1003,3 +1003,362 @@
 8. `requirement_closure` 每次通过写一行，`(requirement_id, close_round)` 唯一且轮次递增；`check_result` 为服务端唯一真值快照；closure 行不物理删除，重开只递增最新行的 `reopen_count`。
 9. 报告 HTML 只入 P0 内容账本（`content_ref`，`owner_kind='report_revision'`, `role='report_html'`）；不写 `paths.report_dir`、不 base64 入库；`pdf_ref` P4 恒 NULL，PDF 属 P7。
 10. 既有表只使用不改结构：`version.closed_at/close_reason/close_run_id`（P4 写入/清空）、`run_wave.report_id`（P4 回填 wave 报告）、`content_ref`（报告 HTML）、`human_request`（待办只读）、`requirement.status`（新增 `closed` 写入与 `closed→draft` 重开路径，`obsolete` 只读）、`work_item`（新增 5 个任务类型，不改表结构）。
+
+---
+
+## 11. P5 codeintel 增量表结构（`frozen: P5`，2026-11-01）
+
+> 来源：`docs/superpowers/specs/2026-11-01-eztest-v02-p5-codeintel-visual-design.md` §3.2–§3.4（P5-D-02/P5-D-06）。
+> 迁移：`codeintel_0001_code_index.sql`（#25）、`codeintel_0002_code_analysis.sql`（#26）、`codeintel_0003_anchor_review.sql`（#27）。
+> P0–P4 表不变（不 ALTER）；8 张新表全部雪花 `BIGINT` 主键（应用层生成），JSON/API 中 ID 为十进制字符串，时间 `TIMESTAMPTZ`（RFC3339 UTC）。
+> 8 表均有 `created_at`/`updated_at`（D34 §6.9.4 字面口径）。**append-only**：`code_fact` 内容版本只追加（`superseded_at` 标记历史，不物理删除、不更新内容），`code_fact_review` 的 `updated_at` 仅插入时初始化（仓储不提供更新方法）。
+> 跨上下文只做逻辑引用、不建 FK（`repo_id`/`version_id`/`analysis_id`/`entity_id`/`subject_*`）；同上下文 FK 显式。约束/索引命名 `pk_<表名>`、`uk_<表名>_<全列名>`、`idx_<表名>_<全列名>`；partial unique 与表达式唯一键用唯一索引实现，谓词/表达式写在 `WHERE`/列表达式中。布尔列沿用 P0–P4 既有口径（`truncated`/`degraded`/`environment_match`/`selected` 不加 `is_` 前缀，P5-D-02 的 D34 显式例外）。
+
+### 11.1 `codeintel_0001_code_index.sql`（codeintel 上下文，3 表）
+
+**`code_index_run`**（T0 索引运行；逻辑引用 `version`/`resource.code_repository`/`identity`，无跨上下文 FK；同上下文 FK 无）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `id` | BIGINT | NOT NULL，`pk_code_index_run` PRIMARY KEY（雪花） |
+| `version_id` | BIGINT | NULL（触发版本；逻辑引用 version；全局后台索引 P6/P7 不建） |
+| `repo_id` | BIGINT | NOT NULL（逻辑引用 resource.code_repository） |
+| `commit_sha` | TEXT | NOT NULL，CHECK `~ '^[0-9a-f]{40}$'` |
+| `branch` | TEXT | NOT NULL DEFAULT `''`，CHECK `char_length <= 255` |
+| `source` | TEXT | NOT NULL DEFAULT `'git'`，CHECK `git` |
+| `status` | TEXT | NOT NULL DEFAULT `'queued'`，CHECK `queued/running/done/failed` |
+| `files_total` | INTEGER | NOT NULL DEFAULT 0，CHECK `>= 0` |
+| `files_indexed` | INTEGER | NOT NULL DEFAULT 0，CHECK `>= 0` |
+| `truncated` | BOOLEAN | NOT NULL DEFAULT false |
+| `stats` | JSONB | NOT NULL DEFAULT `'{}'::jsonb`，CHECK `jsonb_typeof = 'object'` |
+| `errors` | JSONB | NOT NULL DEFAULT `'[]'::jsonb`，CHECK `jsonb_typeof = 'array'`（应用限 ≤20 条） |
+| `started_at` / `finished_at` | TIMESTAMPTZ | NULL |
+| `created_by` | BIGINT | NULL（逻辑引用 identity） |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+
+约束/索引：
+
+- `pk_code_index_run`；
+- partial unique **索引** `uk_code_index_run_active` UNIQUE `(repo_id) WHERE status IN ('queued','running')`（同一仓库同时至多一个活跃索引）；
+- `idx_code_index_run_repo (repo_id, created_at DESC)`；
+- `idx_code_index_run_version (version_id, created_at DESC)`。
+
+**`code_entity`**（当前可查询实体/事实投影；`index_run_id` 为同上下文 FK，`repo_id`/`analysis_id` 逻辑引用）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `id` | BIGINT | NOT NULL，`pk_code_entity` PRIMARY KEY |
+| `repo_id` | BIGINT | NOT NULL（逻辑引用 resource.code_repository） |
+| `commit_sha` | TEXT | NOT NULL，CHECK `~ '^[0-9a-f]{40}$'` |
+| `index_run_id` | BIGINT | NULL，`REFERENCES code_index_run(id) ON DELETE SET NULL` |
+| `kind` | TEXT | NOT NULL，CHECK `file/module/route/api/client_call/component/page/symbol` |
+| `path` | TEXT | NOT NULL，CHECK `char_length BETWEEN 1 AND 4096` |
+| `name` | TEXT | NOT NULL DEFAULT `''`，CHECK `char_length <= 512` |
+| `signature` | TEXT | NOT NULL DEFAULT `''`，CHECK `char_length <= 2000` |
+| `start_line` / `end_line` | INTEGER | NULL；CHECK `start_line IS NULL OR start_line >= 1`；CHECK `end_line IS NULL OR (start_line IS NOT NULL AND end_line >= start_line)` |
+| `blob_hash` | TEXT | NOT NULL DEFAULT `''`，CHECK `'' OR ^git-sha1:<40hex>$ OR ^sha256:<64hex>$` |
+| `source` | TEXT | NOT NULL，CHECK `git/ai` |
+| `confidence` | TEXT | NOT NULL DEFAULT `'high'`，CHECK `low/medium/high` |
+| `evidence` | JSONB | NOT NULL DEFAULT `'[]'::jsonb`，CHECK `jsonb_typeof = 'array'`（应用限 ≤8 条） |
+| `meta` | JSONB | NOT NULL DEFAULT `'{}'::jsonb`，CHECK `jsonb_typeof = 'object'` |
+| `fact_key` | TEXT | NOT NULL DEFAULT `''`，CHECK `char_length <= 512` |
+| `fact_version` | INTEGER | NOT NULL DEFAULT 1，CHECK `>= 1` |
+| `analysis_id` | BIGINT | NULL（逻辑引用 code_analysis） |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+
+约束/索引：
+
+- `pk_code_entity`；
+- partial unique **索引** `uk_code_entity_file` UNIQUE `(repo_id, commit_sha, path) WHERE kind='file' AND source='git'`；
+- partial unique **索引** `uk_code_entity_fact` UNIQUE `(repo_id, commit_sha, fact_key) WHERE fact_key <> ''`；
+- `idx_code_entity_kind (repo_id, commit_sha, kind, path)`；
+- `idx_code_entity_path (repo_id, path)`；
+- `idx_code_entity_analysis (analysis_id)`。
+
+**`code_edge`**（实体关系；同上下文 FK 指向 `code_entity`，`analysis_id` 逻辑引用）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `id` | BIGINT | NOT NULL，`pk_code_edge` PRIMARY KEY |
+| `repo_id` | BIGINT | NOT NULL（逻辑引用 resource.code_repository） |
+| `commit_sha` | TEXT | NOT NULL，CHECK `~ '^[0-9a-f]{40}$'` |
+| `analysis_id` | BIGINT | NULL（逻辑引用 code_analysis） |
+| `src_entity_id` / `dst_entity_id` | BIGINT | NOT NULL，`REFERENCES code_entity(id) ON DELETE CASCADE` |
+| `rel` | TEXT | NOT NULL，CHECK `contains/imports/defines/calls/renders/route_to_api` |
+| `source` | TEXT | NOT NULL，CHECK `git/ai` |
+| `confidence` | TEXT | NOT NULL DEFAULT `'high'`，CHECK `low/medium/high` |
+| `evidence` | JSONB | NOT NULL DEFAULT `'[]'::jsonb`，CHECK `jsonb_typeof = 'array'` |
+| `meta` | JSONB | NOT NULL DEFAULT `'{}'::jsonb`，CHECK `jsonb_typeof = 'object'` |
+| `fact_key` | TEXT | NOT NULL DEFAULT `''`，CHECK `char_length <= 512` |
+| `fact_version` | INTEGER | NOT NULL DEFAULT 1，CHECK `>= 1` |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+
+约束/索引：`pk_code_edge`；`uk_code_edge_src_dst_rel` UNIQUE `(src_entity_id, dst_entity_id, rel)`；`idx_code_edge_src (src_entity_id)`；`idx_code_edge_dst (dst_entity_id)`；`idx_code_edge_analysis (analysis_id)`。
+
+### 11.2 `codeintel_0002_code_analysis.sql`（codeintel 上下文，3 表）
+
+**`code_fact`**（不可变事实版本；`analysis_id` 逻辑引用 code_analysis）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `id` | BIGINT | NOT NULL，`pk_code_fact` PRIMARY KEY |
+| `repo_id` | BIGINT | NOT NULL（逻辑引用 resource.code_repository） |
+| `commit_sha` | TEXT | NOT NULL，CHECK `~ '^[0-9a-f]{40}$'` |
+| `fact_key` | TEXT | NOT NULL，CHECK `char_length BETWEEN 1 AND 512` |
+| `version` | INTEGER | NOT NULL，CHECK `>= 1` |
+| `kind` | TEXT | NOT NULL，CHECK 同 `code_entity.kind`（8 值） |
+| `path` | TEXT | NOT NULL，CHECK `char_length BETWEEN 1 AND 4096` |
+| `name` / `signature` | TEXT | NOT NULL DEFAULT `''`，CHECK `<= 512` / `<= 2000` |
+| `start_line` / `end_line` | INTEGER | NULL；同实体行号规则 |
+| `blob_hash` | TEXT | NOT NULL DEFAULT `''`，CHECK 同实体 blob 规则 |
+| `body` | JSONB | NOT NULL DEFAULT `'{}'::jsonb`，CHECK `jsonb_typeof = 'object'` |
+| `evidence` | JSONB | NOT NULL DEFAULT `'[]'::jsonb`，CHECK `jsonb_typeof = 'array'` |
+| `source` | TEXT | NOT NULL，CHECK `git/ai` |
+| `confidence` | TEXT | NOT NULL DEFAULT `'high'`，CHECK `low/medium/high` |
+| `model` | TEXT | NOT NULL DEFAULT `''`，CHECK `char_length <= 128` |
+| `prompt_version` | TEXT | NOT NULL DEFAULT `''`，CHECK `char_length <= 64` |
+| `analysis_id` | BIGINT | NULL（逻辑引用 code_analysis） |
+| `superseded_at` | TIMESTAMPTZ | NULL |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+
+约束/索引：`pk_code_fact`；`uk_code_fact_key_version` UNIQUE `(repo_id, commit_sha, fact_key, version)`；`idx_code_fact_lookup (repo_id, commit_sha, fact_key, version DESC)`；`idx_code_fact_kind (repo_id, commit_sha, kind, path)`。
+
+**`code_analysis`**（版本 × 仓库的变更分析运行；逻辑引用 `version`/`resource.code_repository`/`identity`）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `id` | BIGINT | NOT NULL，`pk_code_analysis` PRIMARY KEY |
+| `version_id` | BIGINT | NOT NULL（逻辑引用 version） |
+| `repo_id` | BIGINT | NOT NULL（逻辑引用 resource.code_repository） |
+| `base_commit_sha` / `head_commit_sha` | TEXT | NOT NULL，CHECK `~ '^[0-9a-f]{40}$'` |
+| `status` | TEXT | NOT NULL DEFAULT `'queued'`，CHECK `queued/running/done/failed` |
+| `degraded` | BOOLEAN | NOT NULL DEFAULT false |
+| `model` | TEXT | NOT NULL DEFAULT `''`，CHECK `char_length <= 128` |
+| `prompt_version` | TEXT | NOT NULL DEFAULT `''`，CHECK `char_length <= 64` |
+| `analysis_version` | INTEGER | NOT NULL DEFAULT 1，CHECK `>= 1` |
+| `changed_files` | JSONB | NOT NULL DEFAULT `'[]'::jsonb`，CHECK `jsonb_typeof = 'array'`；应用限 ≤2000；元素 `{path,old_path,status,additions,deletions,binary,head_blob_hash}` |
+| `stats` | JSONB | NOT NULL DEFAULT `'{}'::jsonb`，CHECK `jsonb_typeof = 'object'` |
+| `unmapped` | JSONB | NOT NULL DEFAULT `'[]'::jsonb`，CHECK `jsonb_typeof = 'array'`；应用限 ≤200；`{path,reason}` |
+| `errors` | JSONB | NOT NULL DEFAULT `'[]'::jsonb`，CHECK `jsonb_typeof = 'array'`（应用限 ≤20） |
+| `fact_versions` | JSONB | NOT NULL DEFAULT `'{}'::jsonb`，CHECK `jsonb_typeof = 'object'`（fact_key→version 快照，应用限 ≤500） |
+| `created_by` | BIGINT | NULL（逻辑引用 identity） |
+| `started_at` / `finished_at` | TIMESTAMPTZ | NULL |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+
+约束/索引：
+
+- `pk_code_analysis`；
+- partial unique **索引** `uk_code_analysis_active` UNIQUE `(version_id, repo_id) WHERE status IN ('queued','running')`；
+- `idx_code_analysis_version (version_id, repo_id, id DESC)`；
+- `idx_code_analysis_status (status, id)`。
+
+**`code_impact_candidate`**（影响候选；`analysis_id` 同上下文 FK，`subject_id` 逻辑引用）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `id` | BIGINT | NOT NULL，`pk_code_impact_candidate` PRIMARY KEY |
+| `analysis_id` | BIGINT | NOT NULL，`REFERENCES code_analysis(id) ON DELETE CASCADE` |
+| `subject_kind` | TEXT | NOT NULL，CHECK `requirement/requirement_version/case_version/sut_page/sut_api` |
+| `subject_id` | BIGINT | NOT NULL（逻辑引用对应实体） |
+| `reason` | TEXT | NOT NULL DEFAULT `''`，CHECK `char_length <= 2000` |
+| `confidence` | TEXT | NOT NULL，CHECK `low/medium/high` |
+| `source` | TEXT | NOT NULL，CHECK `direct/contract/relation/ai` |
+| `evidence` | JSONB | NOT NULL DEFAULT `'[]'::jsonb`，CHECK `jsonb_typeof = 'array'`（应用限 ≤5） |
+| `selected` | BOOLEAN | NOT NULL DEFAULT true |
+| `selection_updated_by` | BIGINT | NULL（逻辑引用 identity） |
+| `selection_updated_at` | TIMESTAMPTZ | NULL |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+
+约束/索引：`pk_code_impact_candidate`；`uk_code_impact_candidate_subject` UNIQUE `(analysis_id, subject_kind, subject_id)`；`idx_code_impact_candidate_subject (subject_kind, subject_id)`。
+
+### 11.3 `codeintel_0003_anchor_review.sql`（codeintel 上下文，2 表）
+
+**`code_anchor`**（统一代码锚点；逻辑引用 `version`/`resource.code_repository`/`code_entity`/主体实体，无跨上下文 FK）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `id` | BIGINT | NOT NULL，`pk_code_anchor` PRIMARY KEY |
+| `version_id` | BIGINT | NOT NULL（逻辑引用 version） |
+| `repo_id` | BIGINT | NOT NULL（逻辑引用 resource.code_repository） |
+| `subject_kind` | TEXT | NOT NULL，CHECK `version/requirement/requirement_version/case_version/issue` |
+| `subject_id` | BIGINT | NOT NULL（逻辑引用对应实体） |
+| `file_path` | TEXT | NOT NULL，CHECK `char_length BETWEEN 1 AND 4096` |
+| `start_line` / `end_line` | INTEGER | NULL；同实体行号规则 |
+| `entity_id` | BIGINT | NULL（逻辑引用 code_entity） |
+| `commit_sha` | TEXT | NULL，CHECK `commit_sha IS NULL OR ~ '^[0-9a-f]{40}$'` |
+| `excerpt_sha` | TEXT | NOT NULL DEFAULT `''`，CHECK `'' OR ~ '^sha256:[0-9a-f]{64}$'` |
+| `status` | TEXT | NOT NULL DEFAULT `'valid'`，CHECK `valid/stale/broken` |
+| `confidence` | TEXT | NOT NULL DEFAULT `'high'`，CHECK `low/medium/high` |
+| `created_by_kind` | TEXT | NOT NULL DEFAULT `'user'`，CHECK `user/ai/system` |
+| `created_by` | BIGINT | NULL（逻辑引用 identity） |
+| `last_validated_at` | TIMESTAMPTZ | NULL |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+
+约束/索引：
+
+- `pk_code_anchor`；
+- unique **表达式索引** `uk_code_anchor_subject_point` UNIQUE `(version_id, subject_kind, subject_id, file_path, COALESCE(start_line,0), COALESCE(end_line,0))`（空行号归一化为 0，避免 NULL 破坏唯一性）；
+- `idx_code_anchor_subject (subject_kind, subject_id)`；
+- `idx_code_anchor_repo_path (repo_id, file_path)`。
+
+**`code_fact_review`**（append-only 事实复核；`fact_id` 同上下文 FK，`reviewer_id` 逻辑引用 identity）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `id` | BIGINT | NOT NULL，`pk_code_fact_review` PRIMARY KEY |
+| `fact_id` | BIGINT | NOT NULL，`REFERENCES code_fact(id) ON DELETE CASCADE` |
+| `fact_version` | INTEGER | NOT NULL，CHECK `>= 1` |
+| `repo_id` | BIGINT | NOT NULL（逻辑引用 resource.code_repository） |
+| `commit_sha` | TEXT | NOT NULL，CHECK `~ '^[0-9a-f]{40}$'` |
+| `verdict` | TEXT | NOT NULL，CHECK `correct/incorrect` |
+| `reason` | TEXT | NOT NULL DEFAULT `''`，CHECK `char_length <= 2000` |
+| `reviewer_id` | BIGINT | NOT NULL（逻辑引用 identity） |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now()（`updated_at` 仅插入初始化） |
+
+约束/索引：`pk_code_fact_review`；`idx_code_fact_review_fact (fact_id, id DESC)`；`idx_code_fact_review_created (created_at DESC)`。
+
+### 11.4 P5 codeintel 数据不变量
+
+1. `code_index_run` 同一 `repo_id` 至多一个 `queued/running`（partial unique）；终态之后可再次触发；失败/截断不删除已建实体。
+2. `code_entity` 的 `(repo_id, commit_sha, path, kind='file', source='git')` 唯一；AI 事实投影按 `fact_key` 唯一（`fact_key <> ''`）；索引刷新可 upsert，不跨 commit 覆盖。
+3. `code_edge` 的 `(src_entity_id, dst_entity_id, rel)` 唯一；实体删除级联删除边；跨仓库/跨 commit 不建边。
+4. `code_fact` 内容版本只追加：新版本 `version = max+1`，旧版本只写 `superseded_at`，不更新 `body/evidence/kind/path/...`；`(repo_id, commit_sha, fact_key, version)` 唯一。
+5. `code_analysis` 同一 `(version_id, repo_id)` 至多一个 `queued/running`；`changed_files`/`unmapped`/`errors`/`fact_versions` 为服务端写侧快照（应用限见 §11.2），不 base64 存正文。
+6. `code_impact_candidate` 同一分析内 `(subject_kind, subject_id)` 唯一；`selected` 是用户选择覆盖，`selection_updated_by/at` 记录最近选择；`low` 置信度不自动选中由应用层保证（§4.5）。
+7. `code_anchor` 同一版本、主体、文件、行区间只允许一个锚点（表达式唯一索引）；`status` 由校验重算（`valid/stale/broken`），不物理删除历史事实。
+8. `code_fact_review` 只追加，不更新/删除；`verdict` 只允许 `correct/incorrect`；`fact_version` 必须与复核的事实版本一致（应用层校验）。
+9. 代码正文不落契约表：表只存 path/行号/摘要/证据引用；正文经 `code.read`/`file` 鉴权读取（§4.1）。
+10. 迁移只追加：`#25–#27` 不改 `#1–#24`；`codeintel` 上下文不建跨上下文 FK。
+
+---
+
+## 12. P5 visual 增量表结构（`frozen: P5`，2026-11-01）
+
+> 来源：`docs/superpowers/specs/2026-11-01-eztest-v02-p5-codeintel-visual-design.md` §3.5/§7（P5-D-07/P5-D-08）。
+> 迁移：`visual_0001_visual_assertion.sql`（#28，visual 上下文，3 表）。
+> P0–P4 表不变（不 ALTER）；3 张新表雪花 `BIGINT` 主键，时间 `TIMESTAMPTZ`（RFC3339 UTC）。
+> 3 表均有 `created_at`/`updated_at`；**视觉 diff 为 append-only**：`updated_at` 仅插入时初始化，不提供更新方法。`evidence_id`/`case_run_id`/`assertion_result_id`/`actual_evidence_id`/`diff_evidence_id` 均为执行/存储上下文的逻辑引用（不建 FK）；`visual_baseline.visual_assertion_id` 与 `visual_diff.visual_assertion_id` 为同上下文 FK。
+
+### 12.1 `visual_0001_visual_assertion.sql`（visual 上下文，3 表）
+
+**`visual_assertion`**（视觉断言配置；逻辑引用 `version`/`design.case_version`/`design.case_assertion`/`version.version_sut`）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `id` | BIGINT | NOT NULL，`pk_visual_assertion` PRIMARY KEY |
+| `version_id` / `case_version_id` / `case_assertion_id` | BIGINT | NOT NULL（逻辑引用对应实体） |
+| `step_seq` / `assertion_seq` | INTEGER | NOT NULL，CHECK `> 0` |
+| `version_sut_id` | BIGINT | NOT NULL（逻辑引用 version_sut） |
+| `selector` | TEXT | NOT NULL DEFAULT `''`，CHECK `char_length <= 500` |
+| `region` | JSONB | NOT NULL DEFAULT `'{}'::jsonb`，CHECK `jsonb_typeof = 'object'`（`{x,y,width,height}` 或空） |
+| `threshold` | NUMERIC(6,5) | NOT NULL DEFAULT 0.005，CHECK `0..0.1` |
+| `viewport_width` / `viewport_height` | INTEGER | NOT NULL DEFAULT 1280 / 720，CHECK `1..10000` |
+| `device_scale_factor` | NUMERIC(4,2) | NOT NULL DEFAULT 1.0，CHECK `0.5..4` |
+| `wait_policy` | JSONB | NOT NULL DEFAULT `'{}'::jsonb`，CHECK `jsonb_typeof = 'object'` |
+| `config_revision` | INTEGER | NOT NULL DEFAULT 1，CHECK `>= 1` |
+| `status` | TEXT | NOT NULL DEFAULT `'active'`，CHECK `active/archived` |
+| `created_by` | BIGINT | NULL（逻辑引用 identity） |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+
+约束/索引：`pk_visual_assertion`；`uk_visual_assertion_case_assertion` UNIQUE `(case_assertion_id)`；`idx_visual_assertion_version (version_id, status)`；`idx_visual_assertion_case_version (case_version_id)`；`idx_visual_assertion_version_sut (version_sut_id)`。
+
+**`visual_baseline`**（已批准基线历史；`visual_assertion_id` 同上下文 FK，`evidence_id` 逻辑引用 execution.evidence）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `id` | BIGINT | NOT NULL，`pk_visual_baseline` PRIMARY KEY |
+| `visual_assertion_id` | BIGINT | NOT NULL，`REFERENCES visual_assertion(id) ON DELETE CASCADE` |
+| `case_version_id` / `version_sut_id` | BIGINT | NOT NULL（逻辑引用） |
+| `evidence_id` | BIGINT | NOT NULL（逻辑引用 execution.evidence） |
+| `sha256` | TEXT | NOT NULL，CHECK `~ '^[0-9a-f]{64}$'` |
+| `size_bytes` | BIGINT | NOT NULL，CHECK `> 0` |
+| `width` / `height` | INTEGER | NOT NULL，CHECK `> 0` |
+| `viewport_width` / `viewport_height` | INTEGER | NOT NULL，CHECK `> 0` |
+| `device_scale_factor` | NUMERIC(4,2) | NOT NULL，CHECK `0.5..4` |
+| `config_revision` | INTEGER | NOT NULL，CHECK `>= 1` |
+| `environment_fingerprint` | TEXT | NOT NULL，CHECK `~ '^[0-9a-f]{64}$'` |
+| `status` | TEXT | NOT NULL DEFAULT `'approved'`，CHECK `approved/superseded` |
+| `approved_by` | BIGINT | NOT NULL（逻辑引用 identity） |
+| `approved_at` | TIMESTAMPTZ | NOT NULL |
+| `superseded_at` | TIMESTAMPTZ | NULL |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+
+约束/索引：
+
+- `pk_visual_baseline`；
+- partial unique **索引** `uk_visual_baseline_approved` UNIQUE `(visual_assertion_id) WHERE status='approved'`（每个断言至多一个已批准基线）；
+- `idx_visual_baseline_assertion (visual_assertion_id, id DESC)`；
+- `idx_visual_baseline_evidence (evidence_id)`。
+
+**`visual_diff`**（每次比对结果；append-only；`visual_assertion_id`/`baseline_id` 同上下文 FK）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `id` | BIGINT | NOT NULL，`pk_visual_diff` PRIMARY KEY |
+| `visual_assertion_id` | BIGINT | NOT NULL，`REFERENCES visual_assertion(id) ON DELETE CASCADE` |
+| `case_run_id` / `assertion_result_id` | BIGINT | NOT NULL（逻辑引用 execution） |
+| `baseline_id` | BIGINT | NULL，`REFERENCES visual_baseline(id) ON DELETE SET NULL` |
+| `actual_evidence_id` | BIGINT | NOT NULL（逻辑引用 execution.evidence） |
+| `diff_evidence_id` | BIGINT | NULL（逻辑引用 execution.evidence） |
+| `diff_ratio` | NUMERIC(8,6) | NOT NULL DEFAULT 0，CHECK `0..1` |
+| `threshold` | NUMERIC(6,5) | NOT NULL，CHECK `0..0.1` |
+| `classification` | TEXT | NOT NULL，CHECK `passed/failed/inconclusive/blocked` |
+| `reason` | TEXT | NOT NULL DEFAULT `''`，CHECK `char_length <= 2000` |
+| `environment_match` | BOOLEAN | NOT NULL DEFAULT true |
+| `width` / `height` | INTEGER | NOT NULL DEFAULT 0，CHECK `>= 0` |
+| `mismatch_boxes` | JSONB | NOT NULL DEFAULT `'[]'::jsonb`，CHECK `jsonb_typeof = 'array'`（应用限 ≤50） |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now()（append-only，`updated_at` 仅初始化） |
+
+约束/索引：`pk_visual_diff`；`uk_visual_diff_assertion_result` UNIQUE `(assertion_result_id)`；`idx_visual_diff_run (case_run_id, id DESC)`；`idx_visual_diff_assertion (visual_assertion_id, id DESC)`；`idx_visual_diff_classification (classification, created_at DESC)`。
+
+### 12.2 P5 visual 数据不变量
+
+1. `visual_assertion` 以 `case_assertion_id` 唯一（一个设计断言至多一条视觉配置）；`PUT` upsert 时 `config_revision++`，并 supersede 旧 `approved` 基线（同事务）。
+2. `visual_baseline` 每个断言至多一个 `approved`（partial unique）；审批新基线把旧 approved 置 `superseded` 并写 `superseded_at`，历史行不删除。
+3. `visual_diff` 每个 `assertion_result_id` 至多一条（同一断言结果不重复记 diff）；append-only，不更新/删除。
+4. 四态：`passed/failed/inconclusive/blocked`；`blocked` 只在通用执行错误出现（assertion verdict 仍为 `inconclusive` 的契约见 §7.3）；`environment_match=false` 不返回 diff 图且不把环境不一致当失败。
+5. 视觉 actual/diff 字节只经内容账本（`content_ref`，execution 写，`evidence.kind=visual_actual/visual_diff`）；表只存 evidence id/sha256/size/尺寸/指纹。
+6. 基线批准 admin-only；`evidence_id` 必须属于同 `case_version`/`version_sut` 且尺寸/指纹/配置一致，否则 422（§4.2 #33）。
+7. 迁移只追加：`#28` 不改 `#1–#27`；visual 上下文不建跨上下文 FK。
+
+---
+
+## 13. P5 跨上下文增量（`frozen: P5`，2026-11-01）
+
+> P5 只对既有表做两处 CHECK 扩宽与一个可空列；不改既有列语义、不重建表、不动 P0–P4 迁移。
+
+### 13.1 `evidence.kind` 10 值（`execution_0004_visual_evidence.sql`，#29）
+
+- 由 8 值扩为 10 值：`screenshot/snapshot/console/network/http/db/download/text/visual_actual/visual_diff`。
+- 实现：`ALTER TABLE evidence DROP CONSTRAINT IF EXISTS evidence_kind_check;` 后 `ADD CONSTRAINT chk_evidence_kind CHECK (kind IN (...10...))`；原内联 CHECK 由 PostgreSQL 自动命名为 `evidence_kind_check`。
+- 不新增列、不改既有证据语义；`assertion_result.kind` 已含 `visual`（5 值），P5 不扩。
+- 应用侧证据映射/视图枚举同步（`EvidenceView.kind` 增加 `visual_actual`/`visual_diff`；README 计数 10）。
+- 视觉证据字节仍写 P0 内容账本（`content_object`/`content_ref`，`owner_kind='evidence'`），不写 `paths.evidence_dir`。
+
+### 13.2 `version_sut.code_baseline_commit`（`version_0006_version_sut_code_baseline.sql`，#30）
+
+- `ALTER TABLE version_sut ADD COLUMN code_baseline_commit TEXT NULL CHECK (code_baseline_commit IS NULL OR code_baseline_commit ~ '^[0-9a-f]{40}$');`
+- 版本绑定创建/更新时解析并回填；解析失败保留 NULL；分析 API 对 NULL 返回 `baseline_commit_missing`（422）。
+- 不新增表；API `Binding`（VersionSUT 视图）增加可选 `code_baseline_commit`。
+- P3 的 `execution_intent.code_baseline` 语义在应用层升级为 commit 列表哈希（P5-D-11），不改列。
+
+### 13.3 `work_item.team` 6 值（`agent_0004_code_team.sql`，#31）
+
+- 由 5 值扩为 6 值：`clarification/design/execution/delivery/steward/code`。
+- 实现：`ALTER TABLE work_item DROP CONSTRAINT IF EXISTS work_item_team_check;` 后 `ADD CONSTRAINT chk_work_item_team CHECK (team IN (...6...))`；原内联 CHECK 由 PostgreSQL 自动命名为 `work_item_team_check`。
+- `work_item.version_id` 保持 NOT NULL（codeintel 任务必须版本作用域，B1a）；`team_room_post`/`team_room_digest` 的 team CHECK 不变（P5 不为 `code` 团队建频道）。
+- 任务类型 `index.repo`/`code.analyze` 由应用注册（`task-types.md` §7），不改表结构。
+
+### 13.4 P5 既有表使用边界
+
+1. `code_repository`（resource）：只读使用 `path/branch/include/exclude`；索引状态由 `code_index_run` 派生，不改列。
+2. `version_sut`：除 `code_baseline_commit` 新列外不改；`code_repo_id` 决定可分析的仓库。
+3. `case_assertion`/`case_source`：不改；P5 读取 visual kind/code source，锚点写 `code_anchor`。
+4. `execution_intent`/`case_run`/`assertion_result`/`evidence`：除证据 kind 外不改；`code_baseline` 语义升级在应用层。
+5. `work_item`：除 team CHECK 扩宽外不改；新增任务类型由应用注册。
+6. `content_ref`/`content_object`：visual actual/diff 字节复用；`owner_kind` 保持 `evidence`（由 execution 写）。
+7. `delivery_issue_ref`：不改枚举；代码锚点统一写 `code_anchor`（P5-D-06）。
+8. `sut_page`/`sut_api`：不改列；P5 允许写 `status=proposed`、`source=ai|code`（P0 服务增量支持，§7.1/§8.1）。
+9. 跨上下文一律逻辑引用，不建 FK；同上下文 FK 显式命名。
+10. 迁移只追加：`#29–#31` 是 P5 对既有表的全部结构变更；P0–P4 表/字段/迁移不改。
+

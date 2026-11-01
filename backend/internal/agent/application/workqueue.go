@@ -98,6 +98,24 @@ func (q *WorkQueue) Claim(ctx context.Context, claimant string) (agent.WorkItem,
 	return q.repo.Claim(ctx, claimant, q.lease)
 }
 
+// ClaimForTeams leases the next available item to claimant when its team is in
+// teams. An empty team set claims nothing; an unknown team is a client error.
+func (q *WorkQueue) ClaimForTeams(ctx context.Context, claimant string, teams []agent.Team) (agent.WorkItem, bool, error) {
+	claimant = strings.TrimSpace(claimant)
+	if claimant == "" {
+		return agent.WorkItem{}, false, platform.Invalid("claimant", "must not be empty")
+	}
+	if len(teams) == 0 {
+		return agent.WorkItem{}, false, nil
+	}
+	for _, team := range teams {
+		if !team.Valid() {
+			return agent.WorkItem{}, false, platform.Invalid("teams", "must contain only clarification, design, execution, delivery, steward, code")
+		}
+	}
+	return q.repo.ClaimForTeams(ctx, claimant, teams, q.lease)
+}
+
 // MarkRunning moves a freshly claimed item to running.
 func (q *WorkQueue) MarkRunning(ctx context.Context, id, epoch int64) error {
 	return mapLeaseLost(q.repo.MarkRunning(ctx, id, epoch))
