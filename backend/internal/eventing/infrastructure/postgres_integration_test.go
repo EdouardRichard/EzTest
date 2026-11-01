@@ -249,3 +249,44 @@ func seqs(events []eventing.Event) []int64 {
 	}
 	return result
 }
+
+func TestDeleteOlderThanRemovesOldEventsAndKeepsCursor(t *testing.T) {
+	pool := testutil.NewDB(t)
+	repo := eventingpg.New(pool)
+	ctx := context.Background()
+	first, err := repo.Append(ctx, eventing.Event{Channel: "system", Type: "retention.old", Payload: map[string]any{}})
+	if err != nil {
+		t.Fatalf("Append old: %v", err)
+	}
+	second, err := repo.Append(ctx, eventing.Event{Channel: "system", Type: "retention.recent", Payload: map[string]any{}})
+	if err != nil {
+		t.Fatalf("Append recent: %v", err)
+	}
+	now := time.Now().UTC()
+	if _, err := pool.Exec(ctx, `UPDATE event SET created_at = $1 WHERE channel = $2 AND seq = $3`,
+		now.Add(-100*24*time.Hour), first.Channel, first.Seq); err != nil {
+		t.Fatalf("backdate old event: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE event SET created_at = $1 WHERE channel = $2 AND seq = $3`,
+		now.Add(-time.Hour), second.Channel, second.Seq); err != nil {
+		t.Fatalf("backdate recent event: %v", err)
+	}
+
+	deleted, err := repo.DeleteOlderThan(ctx, now.Add(-90*24*time.Hour), 10)
+	if err != nil {
+		t.Fatalf("DeleteOlderThan: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("deleted = %d, want 1", deleted)
+	}
+	page, err := repo.Snapshot(ctx, "system", 0, 10)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if len(page.Events) != 1 || page.Events[0].Type != "retention.recent" {
+		t.Fatalf("snapshot after retention = %#v", page.Events)
+	}
+	if page.Cursor != second.Seq {
+		t.Fatalf("cursor = %d, want %d", page.Cursor, second.Seq)
+	}
+}

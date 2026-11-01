@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/audit/domain"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -85,4 +86,26 @@ func (r *Repository) List(ctx context.Context, filter audit.Filter, limit int, b
 		return nil, fmt.Errorf("list audit entries: %w", err)
 	}
 	return entries, nil
+}
+
+// DeleteOlderThan removes up to limit audit rows older than cutoff. The P8
+// leader-gated retention worker drains the table in batches; the append-only
+// business API never exposes a delete.
+func (r *Repository) DeleteOlderThan(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
+	if r == nil || r.pool == nil {
+		return 0, fmt.Errorf("audit repository is not configured")
+	}
+	if limit <= 0 {
+		return 0, nil
+	}
+	tag, err := r.pool.Exec(ctx, `
+		WITH doomed AS (
+			SELECT id FROM audit_log WHERE created_at < $1 ORDER BY created_at LIMIT $2
+		)
+		DELETE FROM audit_log WHERE id IN (SELECT id FROM doomed)
+	`, cutoff, limit)
+	if err != nil {
+		return 0, fmt.Errorf("delete old audit rows: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }
