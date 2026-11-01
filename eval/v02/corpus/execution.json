@@ -1,0 +1,51 @@
+{
+  "corpus_version": "v02-2026-11-01.1",
+  "waves": [
+    {
+      "key": "W1",
+      "kind": "baseline",
+      "case_titles": [
+        "登录后展示订单列表",
+        "按状态筛选订单",
+        "订单详情展示退款入口",
+        "无权限用户不显示退款入口"
+      ]
+    }
+  ],
+  "case_runs": [
+    {
+      "case_title": "登录后展示订单列表",
+      "expected_status": "passed",
+      "expected_failure_class": null
+    },
+    {
+      "case_title": "按状态筛选订单",
+      "expected_status": "failed",
+      "expected_failure_class": "ui_selector"
+    },
+    {
+      "case_title": "订单详情展示退款入口",
+      "expected_status": "failed",
+      "expected_failure_class": "api_contract"
+    },
+    {
+      "case_title": "无权限用户不显示退款入口",
+      "expected_status": "passed",
+      "expected_failure_class": null
+    }
+  ],
+  "injected_failures": [
+    {
+      "case_title": "按状态筛选订单",
+      "expected_failure_class": "ui_selector"
+    },
+    {
+      "case_title": "订单详情展示退款入口",
+      "expected_failure_class": "api_contract"
+    }
+  ],
+  "expected": {
+    "executed_case_count": 4,
+    "injected_failure_count": 2
+  }
+}

@@ -6,9 +6,26 @@ import (
 	"math"
 	"testing"
 
+	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
+	deliveryapp "github.com/EdouardRichard/EzTest/backend/internal/delivery/application"
+	designapp "github.com/EdouardRichard/EzTest/backend/internal/design/application"
+	eventingapp "github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
+	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	quality "github.com/EdouardRichard/EzTest/backend/internal/quality/domain"
 	qualitymetrics "github.com/EdouardRichard/EzTest/backend/internal/quality/infrastructure/metrics"
+	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
+)
+
+// Task 22 wiring contract: the concrete cross-context query services must
+// satisfy the narrow ports without adapters.
+var (
+	_ qualitymetrics.VersionPort   = (*versionapp.QueryService)(nil)
+	_ qualitymetrics.DesignPort    = (*designapp.QueryService)(nil)
+	_ qualitymetrics.ExecutionPort = (*executionapp.QueryService)(nil)
+	_ qualitymetrics.DeliveryPort  = (*deliveryapp.QueryService)(nil)
+	_ qualitymetrics.AgentPort     = (*agentapp.QueryService)(nil)
+	_ qualitymetrics.EventsPort    = (*eventingapp.QueryService)(nil)
 )
 
 type fakeVersion struct {

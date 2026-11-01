@@ -1,0 +1,21 @@
+{
+  "corpus_version": "v02-2026-11-01.1",
+  "description": "P6 真实 LLM 评测固定环境坐标。只记录非敏感 fixture 信息；凭据从 .env 读取且永不打印。",
+  "fixture": {
+    "api_base_url": "http://127.0.0.1:14345",
+    "web_base_url": "http://127.0.0.1:14346",
+    "target_base_url": "http://127.0.0.1:13338",
+    "database_name": "eztest_v02_p6",
+    "executor": "chromium",
+    "viewport": { "width": 1280, "height": 720 }
+  },
+  "llm": {
+    "provider": "deepseek",
+    "model": "deepseek-flash",
+    "temperature": 0,
+    "note": "P6 只允许真实 LLM；模型名必须与评测 run 的 model 一致，不得写 fake。"
+  },
+  "accounts": [
+    { "key": "eval-admin", "role": "admin", "username": "admin" }
+  ]
+}
