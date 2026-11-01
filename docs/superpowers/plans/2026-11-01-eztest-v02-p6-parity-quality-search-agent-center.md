@@ -1287,7 +1287,7 @@ git commit -m "docs(p6): freeze contracts and record handoff"
 
 - **Spec coverage:** Task 1–27 覆盖 spec §1.2 的 8 项 In；§5.2/5.3 指标、§6 搜索、§7 待办、§8 提示词、§9 全局中心、§10 链路、§12 验收、§14 契约均有任务。
 - **Step scan:** 每任务有失败测试/失败验证/实现/通过验证/提交；测试含 spec 精确值（阈值、权限、6 kind、5 类、20 ops、33/72）。
-- **Type consistency:** `EvalRun`/`Metric`/`ProfileView`/`PromptRevision`/`SearchItem`/`Item`/`GlobalIssueView` 命名在 Task 4–21 一致；HTTP DTO 字段 snake_case 与 spec 一致。
+- **Type consistency:** `EvalRun`/`Metric`/`ProfileView`/`PromptRevision`/`SearchItem`/`TodoItem`/`GlobalIssueView` 命名在 Task 4–21 一致；HTTP DTO 字段 snake_case 与 spec 一致。
 - **Review Focus:** R1 真实 LLM 稳定性（Task 24/25）；R2 prompt 边界（Task 14/15/17）；R3 跨上下文空/性能（Task 6/9/11/18/20）；R4 权限脱敏（Task 16/13/24）；R5 迁移/门禁（Task 1/2/23/27）。
 - **Proportion:** 计划按任务/接口/测试组织，未展开实现体；每步一个可执行动作。
 - **缺口:** Task 8 真实 LLM 评测 flow 依赖 Task 24 数据，顺序已在 Task 24 S0→S7→S1 固定；Task 12/10/17/19/21 的 Topbar/nav/app 共享文件由 Task 22 Lead 收口。
