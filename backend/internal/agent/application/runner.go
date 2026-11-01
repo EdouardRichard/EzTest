@@ -578,7 +578,7 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 	// P7 knowledge injection: approved knowledge visible to the version (global
 	// items plus items matching the version's SUT families). A retrieval
 	// failure is log-only supplemental context, never a run failure.
-	versionPack.Knowledge = r.knowledgeForVersion(ctx, state.item.VersionID)
+	versionPack.Knowledge = r.knowledgeForVersion(ctx, versionPack)
 	state.input.VersionPack = versionPack
 
 	if state.payload.ConversationID > 0 {
