@@ -115,6 +115,98 @@ func (r *WorkItemRepository) ClaimForTeams(ctx context.Context, claimant string,
 	return r.claim(ctx, claimant, names, lease)
 }
 
+// ClaimForTypes leases the next item whose type is in types. Unlike Claim it
+// also takes over claimed/running items whose lease expired, so a crashed
+// specialized worker (e.g. the report PDF renderer) does not strand its item
+// until the periodic recovery pass. An empty normalized type set claims
+// nothing.
+func (r *WorkItemRepository) ClaimForTypes(ctx context.Context, claimant string, types []string, lease time.Duration) (agent.WorkItem, bool, error) {
+	claimant = strings.TrimSpace(claimant)
+	if claimant == "" {
+		return agent.WorkItem{}, false, platform.Invalid("claimant", "must not be empty")
+	}
+	if lease <= 0 {
+		lease = 30 * time.Second
+	}
+	names := make([]string, 0, len(types))
+	seen := make(map[string]struct{}, len(types))
+	for _, workType := range types {
+		workType = strings.TrimSpace(workType)
+		if workType == "" {
+			continue
+		}
+		if _, ok := seen[workType]; ok {
+			continue
+		}
+		seen[workType] = struct{}{}
+		names = append(names, workType)
+	}
+	if len(names) == 0 {
+		return agent.WorkItem{}, false, nil
+	}
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return agent.WorkItem{}, false, fmt.Errorf("claim work item by type: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var id int64
+	err = tx.QueryRow(ctx, `
+		SELECT id FROM work_item
+		WHERE type = ANY($1::text[])
+		  AND ((status = 'open' AND available_at <= now())
+		       OR (status IN ('claimed', 'running')
+		           AND lease_until IS NOT NULL AND lease_until < now()))
+		ORDER BY priority DESC, id ASC
+		FOR UPDATE SKIP LOCKED
+		LIMIT 1
+	`, names).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if err := tx.Commit(ctx); err != nil {
+			return agent.WorkItem{}, false, fmt.Errorf("claim work item by type: commit empty: %w", err)
+		}
+		return agent.WorkItem{}, false, nil
+	}
+	if err != nil {
+		return agent.WorkItem{}, false, wrapDB("select claimable work item by type", err)
+	}
+
+	item, err := scanWorkItem(tx.QueryRow(ctx, `
+		UPDATE work_item
+		SET status = 'claimed',
+		    lease_epoch = lease_epoch + 1,
+		    attempts = attempts + 1,
+		    claimed_by = $2,
+		    lease_until = now() + make_interval(secs => $3),
+		    updated_at = now()
+		WHERE id = $1
+		RETURNING `+workItemColumns,
+		id, claimant, lease.Seconds()))
+	if err != nil {
+		return agent.WorkItem{}, false, wrapDB("claim work item by type", err)
+	}
+	// When taking over an expired lease, close the abandoned attempt rows
+	// before appending this claim's attempt.
+	if _, err := tx.Exec(ctx, `
+		UPDATE work_item_attempt
+		SET status = 'recovered', error = COALESCE(error, 'lease expired'), finished_at = now()
+		WHERE work_item_id = $1 AND attempt < $2 AND status IN ('claimed', 'running')
+	`, item.ID, item.Attempts); err != nil {
+		return agent.WorkItem{}, false, wrapDB("recover abandoned work item attempts", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO work_item_attempt (id, work_item_id, attempt, status, started_at)
+		VALUES ($1, $2, $3, 'claimed', now())
+	`, r.ids.Next(), item.ID, item.Attempts); err != nil {
+		return agent.WorkItem{}, false, wrapDB("insert work item attempt", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return agent.WorkItem{}, false, fmt.Errorf("claim work item by type: commit: %w", err)
+	}
+	return item, true, nil
+}
+
 // claim is the shared FOR UPDATE SKIP LOCKED lease path. A nil teams slice
 // claims from every team; a non-empty slice filters with team = ANY(...).
 func (r *WorkItemRepository) claim(ctx context.Context, claimant string, teams []string, lease time.Duration) (agent.WorkItem, bool, error) {

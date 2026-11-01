@@ -255,7 +255,38 @@ agent_0005_profile_prompt_revision.sql
 - 集成测试断言 **33** 个迁移、3 张 P6 表、**二次执行 no-op**（`schema_migrations` 不变）；`migrate_test.go` 的 `wantTail` 固定为上述 2 个文件、迁移计数 31→33。
 - 开发库/演示库照常启动前滚；回滚仍为恢复备份，不提供 down SQL。
 
-## 9. 回滚 / 备份 / 数据库边界
+## 9. P7 增量迁移（draft: P7，2026-11-01）
+
+P0–P6 的 33 个迁移保持原样；P7 在 `order.txt` 末尾追加 6 个文件（第 34–39 个）：
+
+| 序号 | 迁移文件 | 上下文（ownership） | 创建/变更 |
+|---|---|---|---|
+| 34 | `knowledge_0001_knowledge.sql` | knowledge（P7 新上下文） | 创建 `knowledge_item`、`knowledge_revision`、`knowledge_usage`；IMMUTABLE 函数 `eztest_text_array_to_string(TEXT[])`；6 个索引（含 GIN 全文） |
+| 35 | `storage_0003_gc.sql` | storage | 创建 `gc_run`、`gc_tombstone`；`uk_gc_run_running`；`idx_gc_run_started_at`、`idx_gc_tombstone_run_id`；`idx_content_ref_live_object`、`idx_content_object_created_at` |
+| 36 | `delivery_0004_report_pdf.sql` | delivery | `delivery_report_revision` 新增 `pdf_status/pdf_error/pdf_attempts/pdf_rendered_at`；`idx_delivery_report_revision_pdf_pending` |
+| 37 | `orchestration_0001_instance.sql` | orchestration（P7 新上下文） | 创建 `api_instance`；`idx_api_instance_status_heartbeat` |
+| 38 | `resource_0002_sut_family.sql` | resource | `sut` 新增 `family`；`idx_sut_family` |
+| 39 | `delivery_0005_issue_recurrence.sql` | delivery | `delivery_issue` 新增 `recurrence_count/last_recurred_at` |
+
+`order.txt` 末尾追加：
+
+```text
+knowledge_0001_knowledge.sql
+storage_0003_gc.sql
+delivery_0004_report_pdf.sql
+orchestration_0001_instance.sql
+resource_0002_sut_family.sql
+delivery_0005_issue_recurrence.sql
+```
+
+- 固定顺序 34→39（knowledge → storage → delivery_pdf → orchestration → resource → delivery_recurrence）；只追加、不改历史文件，`#1–#33` 的 checksum 不变。
+- **P7 新表共 6 张**：knowledge 3（`knowledge_item`、`knowledge_revision`、`knowledge_usage`）+ storage 2（`gc_run`、`gc_tombstone`）+ orchestration 1（`api_instance`）；**既有表扩展 3 张**（`delivery_report_revision`、`sut`、`delivery_issue`），不新增其他表。
+- 主键/约束/索引命名：`pk_knowledge_item`、`ck_knowledge_item_scope`、`idx_knowledge_item_scope_status_id`、`idx_knowledge_item_status_id`、`idx_knowledge_item_source_version`、`idx_knowledge_item_search`、`pk_knowledge_revision`、`uk_knowledge_revision_knowledge_id_revision`、`idx_knowledge_revision_knowledge_id_id`、`pk_knowledge_usage`、`idx_knowledge_usage_knowledge_id_id`、`pk_gc_run`、`uk_gc_run_running`、`idx_gc_run_started_at`、`pk_gc_tombstone`、`idx_gc_tombstone_run_id`、`idx_content_ref_live_object`、`idx_content_object_created_at`、`idx_delivery_report_revision_pdf_pending`、`pk_api_instance`、`uk_api_instance_instance_key`、`uk_api_instance_node_id`、`idx_api_instance_status_heartbeat`、`idx_sut_family`。
+- 全部新表雪花 `BIGINT` 主键（应用生成）、`TIMESTAMPTZ`（API 为 RFC3339 UTC）；`knowledge_revision`/`knowledge_usage` 的同上下文 FK、`gc_tombstone.run_id → gc_run.id` 同上下文 FK 显式；跨上下文只做逻辑引用（版本/identity/agent_run/work_item）。
+- 集成测试断言 **39** 个迁移、6 张 P7 新表、`#34–#39` 的尾部顺序、**二次执行 no-op**（`schema_migrations` 不变）；`migrate_test.go` 的 `wantTail` 固定为上述 6 个文件、迁移计数 33→39。
+- 开发库/演示库照常启动前滚；回滚仍为恢复备份，不提供 down SQL（见 §10）。
+
+## 10. 回滚 / 备份 / 数据库边界
 
 - P0 **只支持前滚**：没有 down migration，也不提供自动回滚。
 - 部署/验收前必须备份目标库（`pg_dump` / 环境快照）；恢复方式是恢复备份，而不是执行 down SQL。
@@ -264,7 +295,7 @@ agent_0005_profile_prompt_revision.sql
 - 多实例同时启动时，advisory lock 使只有一个实例执行迁移，其余等待后看到已完成状态并跳过。
 - 迁移失败时进程必须**拒绝启动 HTTP**（不得带着半迁移 schema 提供服务）。
 
-## 10. 冻结与变更控制
+## 11. 冻结与变更控制
 
 - 本文件在 P0 冻结；P1+ 只能**追加**文件与 `order.txt` 行，并在本文件新增说明。
 - 破坏性变更（改列、改约束、改语义）必须先停止、说明影响面、更新 contracts + 决策记录 + 调用方/测试，再实施。

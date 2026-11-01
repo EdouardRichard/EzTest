@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -77,6 +78,76 @@ func (r *fakeDesignReconciler) callCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.calls
+}
+
+// fakeP7Ensurer records P7 reconcile passes and can fail, so a test can prove
+// the P7 hook runs every pass without swallowing other rule failures.
+type fakeP7Ensurer struct {
+	mu    sync.Mutex
+	calls int
+	err   error
+}
+
+func (e *fakeP7Ensurer) ReconcileP7(context.Context) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.calls++
+	return e.err
+}
+
+func (e *fakeP7Ensurer) callCount() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.calls
+}
+
+// orderTracker records the P4/P7 execution order in one shared slice.
+type orderTracker struct {
+	mu    sync.Mutex
+	steps []string
+}
+
+func (o *orderTracker) add(step string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.steps = append(o.steps, step)
+}
+
+func (o *orderTracker) recorded() []string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]string(nil), o.steps...)
+}
+
+// trackedP4Ensurer and trackedP7Ensurer share a tracker and record the order in
+// which the reconciler invokes the P4 rules and the P7 hook.
+type trackedP4Ensurer struct{ tracker *orderTracker }
+
+func (e *trackedP4Ensurer) ScanFailures(context.Context, int64) error {
+	e.tracker.add("p4.scan_failures")
+	return nil
+}
+
+func (e *trackedP4Ensurer) EnsureReports(context.Context, int64) error {
+	e.tracker.add("p4.ensure_reports")
+	return nil
+}
+
+func (e *trackedP4Ensurer) EnsureClosures(context.Context, int64) error {
+	e.tracker.add("p4.ensure_closures")
+	return nil
+}
+
+func (e *trackedP4Ensurer) EnsureVersionClose(context.Context, int64) error {
+	e.tracker.add("p4.ensure_version_close")
+	return nil
+}
+
+type trackedP7Ensurer struct{ tracker *orderTracker }
+
+func (e *trackedP7Ensurer) ReconcileP7(context.Context) error {
+	e.tracker.add("p7")
+	return nil
 }
 
 type fakeEnsurer struct {
@@ -439,6 +510,86 @@ func TestReconcilerJoinsDesignReconcilerErrorAndKeepsOtherRules(t *testing.T) {
 	// Earlier rules still ran in the same pass (errors are aggregated).
 	if len(fixture.projector.marked) != 1 || fixture.projector.marked[0] != 10 {
 		t.Fatalf("version projection = %v", fixture.projector.marked)
+	}
+}
+
+func TestReconcilerCallsP7EnsurerEveryPass(t *testing.T) {
+	design := &fakeDesignReconciler{}
+	p7 := &fakeP7Ensurer{}
+	reconciler := agentapp.NewReconciler(agentapp.ReconcilerDeps{
+		Versions: &fakeProjector{},
+		Design:   design,
+		P7:       p7,
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	for i := 0; i < 2; i++ {
+		if err := reconciler.Reconcile(context.Background()); err != nil {
+			t.Fatalf("Reconcile %d: %v", i, err)
+		}
+	}
+	if calls := p7.callCount(); calls != 2 {
+		t.Fatalf("P7 ensurer calls = %d, want one per pass", calls)
+	}
+	if calls := design.callCount(); calls != 2 {
+		t.Fatalf("design reconciler calls = %d, want the existing rules to keep running", calls)
+	}
+}
+
+func TestReconcilerJoinsP7ErrorAndKeepsOtherRules(t *testing.T) {
+	p7Err := errors.New("p7 ensure down")
+	p7 := &fakeP7Ensurer{err: p7Err}
+	projector := &fakeProjector{initial: []int64{10}}
+	design := &fakeDesignReconciler{}
+	p4 := &fakeP4Ensurer{failRule: map[string]error{}}
+	versions := &fakeRunningVersions{ids: []int64{10}}
+	reconciler := agentapp.NewReconciler(agentapp.ReconcilerDeps{
+		Versions:        projector,
+		Design:          design,
+		P4:              p4,
+		RunningVersions: versions,
+		P7:              p7,
+		Logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+
+	err := reconciler.Reconcile(context.Background())
+	if err == nil {
+		t.Fatal("P7 ensurer error was swallowed")
+	}
+	if !errors.Is(err, p7Err) {
+		t.Fatalf("joined error = %v, want P7 error", err)
+	}
+	if len(projector.marked) != 1 || projector.marked[0] != 10 {
+		t.Fatalf("version projection = %v, want the earlier rules to run", projector.marked)
+	}
+	if calls := design.callCount(); calls != 1 {
+		t.Fatalf("design reconciler calls = %d", calls)
+	}
+	if calls := len(p4.recorded()); calls != 4 {
+		t.Fatalf("P4 rule calls = %d, want the P4 rules to run despite the P7 error", calls)
+	}
+	if calls := p7.callCount(); calls != 1 {
+		t.Fatalf("P7 ensurer calls = %d", calls)
+	}
+}
+
+func TestReconcilerRunsP7AfterP4(t *testing.T) {
+	tracker := &orderTracker{}
+	reconciler := agentapp.NewReconciler(agentapp.ReconcilerDeps{
+		Versions:        &fakeProjector{},
+		P4:              &trackedP4Ensurer{tracker: tracker},
+		RunningVersions: &fakeRunningVersions{ids: []int64{10}},
+		P7:              &trackedP7Ensurer{tracker: tracker},
+		Logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err := reconciler.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	want := []string{
+		"p4.scan_failures", "p4.ensure_reports", "p4.ensure_closures",
+		"p4.ensure_version_close", "p7",
+	}
+	if got := tracker.recorded(); !slices.Equal(got, want) {
+		t.Fatalf("P4/P7 order = %v, want %v", got, want)
 	}
 }
 

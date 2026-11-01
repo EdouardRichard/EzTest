@@ -273,6 +273,38 @@ workspace 1、quality 1 = **72**（P0 44 + P3 5 + P4 4 + P5 16 + P6 3）。
 - 消费方：search/workspace/quality application 通过设置 Service 读取（不直接读 env/文件）；`quality.eval_baseline_regression` 只用于 `detail.regressed` 标记，阈值本身仍来自评测语料/基线文件。
 - P6 不新增事件、task type/profile/tool/executor 协议；不修改 P0–P5 已冻结键的语义/默认/类别/secret 标记。
 
+## 4g. P7 使用说明（draft: P7，2026-11-01）
+
+- P7 **不新增** EzTest 启动 env：仍是严格 4 项（`.env` 只有 `EZTEST_DATABASE_URL`/`EZTEST_API_PORT`/`EZTEST_WEB_PORT`/`EZTEST_EXECUTOR_PORT`）。新增配置一律进设置中心，不引入第 5 个 EzTest env。
+- P7 新增 **11 键**（72→83）；新增 `instance` 类别（2 键）；既有类别增量：report 7→12（+5）、knowledge 2→3（+1）、retention 5→7（+2）、execution 11→12（+1）。11 键全部 `restart_required=false`、热加载；仅 `report.render_token` 为 **secret=true**。
+
+| key | type | category | default | 取值/范围 | secret | restart | 热加载/语义 |
+|---|---|---|---|---|---|---|---|
+| `report.section_appendix` | boolean | report | `true` | — | 否 | 否 | 热加载；报告模板 v2 的附录章节开关；仅 `report.template_version="2"` 时生效；false 不渲染 appendix |
+| `report.render_max_attempts` | number | report | `3` | 整数 1–10 | 否 | 否 | 热加载；`report.render_pdf` 任务的 `max_attempts`；超限置 `pdf_status='failed'` |
+| `report.render_lease_seconds` | number | report | `120` | 整数 30–1800 | 否 | 否 | 热加载；render worker 任务租约与心跳续租；租约过期可被其它副本认领 |
+| `report.render_worker_url` | string | report | `http://127.0.0.1:13337` | 绝对 http(s) URL | 否 | 否 | 热加载；独立 renderer 地址（API 调 `POST {url}/v1/pdf`）；下一次 PDF 任务生效 |
+| `report.render_token` | string | report | `eztest-dev-render-token` | — | **是** | 否 | 热加载；API→renderer Bearer；renderer 进程用 `EZTEST_RENDER_TOKEN` 接收；GET 掩码/`null`，PATCH `""` 清空，省略/null 不改；不得写日志/事件/证据 |
+| `knowledge.injection_max_items` | number | knowledge | `5` | 整数 0–50 | 否 | 否 | 热加载；每次 run 注入知识条数上限；0 关闭注入；与 `knowledge.injection_budget_tokens` 同时约束 |
+| `retention.gc_interval_minutes` | number | retention | `1440` | 整数 5–10080 | 否 | 否 | 热加载；leader 周期 GC 间隔（分钟） |
+| `retention.gc_batch_size` | number | retention | `500` | 整数 1–5000 | 否 | 否 | 热加载；单轮 GC 每类候选扫描上限 |
+| `instance.heartbeat_seconds` | number | instance | `10` | 整数 1–60 | 否 | 否 | 热加载；API 实例心跳间隔；rollout 下一轮生效 |
+| `instance.offline_seconds` | number | instance | `30` | 整数 5–300 | 否 | 否 | 热加载；超过该值无心跳判 `offline`；建议 ≥2×`instance.heartbeat_seconds` |
+| `execution.executor_urls` | string | execution | `""` | 逗号分隔绝对 http(s) URL；空=沿用 `execution.executor_url` | 否 | 否 | 热加载；额外执行器端点集合；trim/去重；无效项忽略并记日志，不阻塞启动；下一轮 poller 生效 |
+
+- `report.template_version`（既有键，非新增）**默认值变更说明**：seed 默认由 `"1"` 改为 `"2"`（仅新库生效；既有库因 `ON CONFLICT DO NOTHING` 保留原值，可 admin 显式 PATCH 到 `"2"`）。允许值仅 `"1"`/`"2"`；热加载，只影响**新渲染**的 revision，旧 revision 不重渲染；`"1"` 输出与 P4 完全一致；`"2"` 增加附录章节（受 `report.section_appendix` 控制）。因此 P7 是 72→**83**（新增 11 键，不含本默认值变更）。
+- **P7 消费/扩展的既有键**（P3/P4 已消费的键在 P7 继续消费并扩展语义，不改变原默认/类型）：
+  - `report.render_pdf`：P4 保留不使用；P7 首次实际消费。`true` 时新 revision 排队 PDF；`false` 时新 revision `pdf_status='disabled'`、不建任务，已生成 PDF 不删；可在运行中切换。
+  - `report.template_version`：P4 固定 `"1"`；P7 首次消费版本切换语义；默认/允许值见上。
+  - `report.section_summary`/`report.section_results`/`report.section_issues`/`report.section_coverage`/`report.section_evidence`：P4 起控制 HTML 章节；P7 在 v1/v2 继续生效，并新增 `report.section_appendix`（仅 v2）。
+  - `knowledge.injection_budget_tokens`（默认 4000）与 `knowledge.review_required`（默认 true）：P7 首次实际消费；注入预算与审核门；`review_required=false` 仅允许 admin 创建/晋升时一步 approve，AI 提议仍为 draft。
+  - `retention.temp_hours`、`retention.replaced_export_days`、`retention.unreferenced_content_days`、`retention.gc_grace_hours`、`retention.gc_dry_run`：P7 首次实际消费；GC 候选/保护/周期模式。
+  - `paths.data_root`：P1 起已消费；P7 扩展用于 GC 文件扫描/删除与 readiness 写探针；多副本必须指向同一共享文件系统（不一致 → readiness 503）。
+  - `execution.executor_url`、`execution.executor_token`、`execution.executor_heartbeat_seconds`、`execution.executor_offline_seconds`：P3 起已消费；P7 扩展为多端点 poll、push 内部鉴权、实例/执行器心跳与离线阈值；`execution.executor_token` 同时用于 `POST /api/internal/executors/*`。
+  - `runtime.snowflake_node_id`：P0 起用于雪花 node；P7 扩展为 `api_instance.node_id` 的首选值；被占用时取最小空闲 0–1023。
+- 11 键全部热加载（设置 Service 读缓存失效，后续读取/下一轮循环生效）；P7 **不新增** `restart_required=true` 键；secret 语义沿用 P3/P6（`GET /api/admin/settings` 返回 `null`，revision 存 `null`，更新审计不含明文）。
+- 类别计数（P7 后）：runtime 1、paths 5、execution 12、chain 4、agent 5、llm 2、context 4、team_room 3、retention 7、report 12、knowledge 3、security 2、feature 2、codeintel 9、visual 7、search 1、workspace 1、quality 1、instance 2 = **83**（P0 44 + P3 5 + P4 4 + P5 16 + P6 3 + P7 11）。
+
 ## 5. 冻结与变更控制
 
 1. P0 冻结：4 项 env、44 键目录、类型/默认值/类别/restart 标记、secret 语义、更新流水线。

@@ -627,3 +627,72 @@ func TestRuntimeProfilesRunsMessagesAndPackets(t *testing.T) {
 		t.Fatalf("missing packet = %v, want ErrNotFound", err)
 	}
 }
+
+// TestWorkItemClaimForTypesFiltersAndReclaimsExpiredLeases pins the P7
+// ClaimForTypes contract: only the requested work item types are claimed, an
+// expired claimed/running lease can be taken over (epoch/attempts bump), and an
+// empty type set claims nothing.
+func TestWorkItemClaimForTypesFiltersAndReclaimsExpiredLeases(t *testing.T) {
+	pool := testutil.NewDB(t)
+	repo := agentpg.NewWorkItemRepository(pool, newIDs(t))
+	ctx := context.Background()
+
+	ensureTyped := func(workType, team, dedupe string, priority int) agent.WorkItem {
+		t.Helper()
+		item, created, err := repo.Ensure(ctx, agent.NewWorkItem{
+			VersionID: 10,
+			Team:      team,
+			Type:      workType,
+			Priority:  priority,
+			DedupeKey: dedupe,
+		})
+		if err != nil {
+			t.Fatalf("Ensure(%s): %v", workType, err)
+		}
+		if !created {
+			t.Fatalf("Ensure(%s) did not create", workType)
+		}
+		return item
+	}
+
+	renderPDF := ensureTyped("report.render_pdf", "delivery", "report:1:rev:1", 0)
+	// Higher-priority items of other types prove the type filter is applied.
+	ensureTyped("chat.turn", "clarification", "reply:1", 100)
+	ensureTyped("execute.case", "execution", "execute:1", 50)
+
+	claimed, ok, err := repo.ClaimForTypes(ctx, "render-worker", []string{"report.render_pdf"}, 2*time.Second)
+	if err != nil || !ok {
+		t.Fatalf("ClaimForTypes = %#v, %v, %v", claimed, ok, err)
+	}
+	if claimed.ID != renderPDF.ID || claimed.Type != "report.render_pdf" {
+		t.Fatalf("claimed %#v, want render PDF item %d", claimed, renderPDF.ID)
+	}
+	if claimed.LeaseEpoch != 1 || claimed.Attempts != 1 ||
+		claimed.ClaimedBy == nil || *claimed.ClaimedBy != "render-worker" {
+		t.Fatalf("first claim state = %#v", claimed)
+	}
+
+	// The only render item is leased, so a second claim finds nothing.
+	if extra, ok, err := repo.ClaimForTypes(ctx, "render-worker-2", []string{"report.render_pdf"}, time.Second); err != nil || ok || extra.ID != 0 {
+		t.Fatalf("second ClaimForTypes = %#v, %v, %v", extra, ok, err)
+	}
+
+	// An expired lease is claimable again with a bumped epoch and attempt.
+	if _, err := pool.Exec(ctx, `
+		UPDATE work_item SET status = 'running', lease_until = now() - interval '1 second'
+		WHERE id = $1
+	`, renderPDF.ID); err != nil {
+		t.Fatalf("expire lease: %v", err)
+	}
+	reclaimed, ok, err := repo.ClaimForTypes(ctx, "render-worker-2", []string{"report.render_pdf"}, 2*time.Second)
+	if err != nil || !ok {
+		t.Fatalf("ClaimForTypes(expired) = %#v, %v, %v", reclaimed, ok, err)
+	}
+	if reclaimed.ID != renderPDF.ID || reclaimed.LeaseEpoch != 2 || reclaimed.Attempts != 2 {
+		t.Fatalf("reclaimed state = %#v, want epoch 2 attempt 2", reclaimed)
+	}
+
+	if empty, ok, err := repo.ClaimForTypes(ctx, "worker", nil, time.Second); err != nil || ok || empty.ID != 0 {
+		t.Fatalf("empty types claim = %#v, %v, %v", empty, ok, err)
+	}
+}

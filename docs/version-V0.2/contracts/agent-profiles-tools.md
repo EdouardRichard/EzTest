@@ -395,3 +395,63 @@ system prompt 必须包含 `[profile:<key>]`，并声明：AI 只能提交 draft
 - 集成：迁移 #33 幂等、回填 v1 不覆盖、PUT/reset/restore/no-op/409、PATCH 后下一次 run 的 `agent_message(role=system)` 含新 prompt 与 marker、旧 run 不变、审计 metadata 无正文、权限。
 - E2E：admin 编辑 prompt（唯一 token）→ 下一次真实 LLM run 的 system message 含 token；普通用户无 prompt/403；版本历史/恢复；截图（S4）。
 - 前端：目录/运行/质量/配置；只读态；变量 chip 插入；预览；版本 diff/restore；错误 field；空/载/错态。
+
+## 10. P7 Profiles 与知识注入（draft: P7，2026-11-01）
+
+> 来源：`docs/superpowers/specs/2026-11-01-eztest-v02-p7-p9-design.md` §4.3/§9/§13。
+> 实现：`backend/internal/knowledge`（知识服务/审核）、`backend/internal/agent/application/knowledge.go`（注入适配）、`agent/application/tools/knowledge.go`（工具）、`agent/infrastructure/versionadapter`（`version_pack`）、`agent/application/context.go`（knowledge section）。
+> P7 **不新增 Agent profile**；新增 **1 个工具** `knowledge.propose`、**5 个现有 profile 白名单增量**；知识读取注入由 runtime 自动完成，**不需要工具**（`knowledge.search` 等读取工具 defer）。
+
+### 10.1 Profile 白名单增量
+
+| profile | P7 新增允许工具 |
+|---|---|
+| `clarification_host` | `knowledge.propose` |
+| `context_scout` | `knowledge.propose` |
+| `design_host` | `knowledge.propose` |
+| `design_planner` | `knowledge.propose` |
+| `case_author` | `knowledge.propose` |
+
+- 白名单是**并集**：上表 profile 的 P1–P6 工具保持；其余 9 个 profile（`requirement_curator`、`design_critic`、`data_planner`、`case_executor`、`failure_analyst`、`coverage_analyst`、`issue_triager`、`report_writer`、`version_steward`）不变；profile 总数仍 **14**。
+- 只允许 Host/Scout/Planner/Author 类 profile 提议知识；`knowledge.propose` 只能创建 **draft**，不能 approve/reject/revoke/编辑已审核内容。审核只走 admin API（`POST /api/knowledge/items/{id}/approve|reject|revoke`）。
+
+### 10.2 工具 `knowledge.propose`
+
+| 工具 | 参数 | 语义/服务端校验 |
+|---|---|---|
+| `knowledge.propose` | `{title:string(1..200), content:string(1..20000), tags?:string[]（≤20）, scope?:"global"\|"system", system_key?:string(1..64)}` | 服务端强制 `status=draft`、`source_version_id=当前 version_id`、`promoted_from_version_id=当前 version_id`、`created_by=run actor`；**不接受**客户端传 `status/reviewed_*/source_version_id/promoted_from_version_id/created_by`（schema 无这些字段，额外字段忽略） |
+
+- `scope` 缺省推导：未给 `system_key` → `global`；给了 `system_key` → `system`；显式 `scope=global` 且带 `system_key`、或 `scope=system` 缺 `system_key` → 400 `invalid_argument`。
+- `system_key` 仅 `scope=system` 允许，小写 slug 1–64（对应 `sut.family`）；`tags` 每项非空、去重后 ≤20；title/content 长度按 `knowledge_item` 校验。
+- 即使 `knowledge.review_required=false`，AI 提议仍强制 draft（仅 admin 创建/晋升可一步 approve）；`source_stale` 在读取期计算，不在写入时拒绝。
+- 返回 `{knowledge_id, status:"draft", scope, revision:1}`；同时写审计 `knowledge.create`（带 `agent_run_id`，metadata 不含正文）与事件 `knowledge.proposed`（`system`）。
+- 错误：400 `invalid_argument`（字段/长度/scope/system_key/tags）、404 `not_found`（当前版本 scope 失效）、`ai_unavailable`（持久化/依赖不可用）；不返回其他版本数据、内部 SQL/路径。
+- 工具结果计入 `agent_message`；run 失败/知识写入失败不回滚对话，工具返回结构化错误由模型决定是否继续。
+
+### 10.3 注入上下文 `version_pack.knowledge[]`
+
+每次 run 由 runtime 构建 `VersionPack`，新增字段：
+
+```json
+{
+  "version_pack": {
+    "knowledge": [
+      {"id": "7001", "title": "支付回调重试约定", "snippet": "回调必须在 5 分钟内完成幂等处理…", "scope": "global", "tokens": 123}
+    ]
+  }
+}
+```
+
+- `version_pack.knowledge[]` 元素字段：`id`（十进制字符串）、`title`、`snippet`（截断正文）、`scope`（`global|system`）、`tokens`（整数估算）。`id` 是 `knowledge_item.id`；**不返回**完整 content/审核人/内部路径。
+- 过滤：仅 `status='approved'`；`scope='global'` 或 `system_key ∈ 版本绑定 SUT 的 family[]`；`source_stale=true`（`source_version_id` 指向的版本不存在）排除；`draft/rejected/revoked` 永不出现。
+- 排序/预算：PostgreSQL 全文（`websearch_to_tsquery('simple', 版本标题/需求标题)` + `ts_rank`）+ id DESC；条数受 `knowledge.injection_max_items`（默认 5，0 关闭）、token 受 `knowledge.injection_budget_tokens`（默认 4000，按 title+content+tags 估算 /3）约束；按 rank 顺序累加，超预算截断后续条目不注入。
+- 上下文渲染 section `id="knowledge"`，每条一行：`[K-<id>] <title>（<scope>）：<snippet>`；`K-<id>` 是引用 token（模型可在输出中引用 `[K-<id>]`），**不是工具调用**、不触发额外读取。
+- 知识正文是**参考数据**，不提升为系统指令/工具指令；未审核内容（含 AI draft）不进入上下文，避免污染。
+- 每次注入写 `knowledge_usage`（`knowledge_id/agent_run_id/work_item_id/token_estimate/injected_at`），每个被注入条目一行；记录失败只写日志，不影响 run。
+
+### 10.4 权限、审计与测试要点
+
+- `knowledge.propose` 仅在 §10.1 五个 profile 注册；其它 profile 调用视为未知工具（registry 拒绝），不返回业务数据。
+- 知识 API 权限：读=登录；创建/编辑=登录（编辑仅作者或 admin，且 status∈draft/rejected）；approve/reject/revoke=admin。AI 永不拥有审核权。
+- 审计：`knowledge.create`/`knowledge.edit`/`knowledge.approve`/`knowledge.reject`/`knowledge.revoke`（见 `events.md` §16.2）；事件 `knowledge.proposed/approved/rejected/revoked`；metadata/payload 不含正文。
+- 测试要点：注入只含 approved + scope/family 匹配 + 非 stale；超条数/超预算截断；`review_required=false` 时 AI 仍 draft；propose 不能传 approved/status；usage 一次 run 每个条目一行；上下文不泄露 draft/rejected/revoked 正文。

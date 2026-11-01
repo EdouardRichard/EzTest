@@ -1468,3 +1468,215 @@
 - `delivery_issue`/`delivery_report`/`delivery_report_revision`/`version` 被全局中心只读复用；不新增表、不加索引，全局列表按 id DESC 走 PK。
 - 命名/结构自检：新表主键 `pk_`、唯一键 `uk_`、普通索引 `idx_`；字段 snake_case；时间 RFC3339 UTC；跨上下文不建 FK；迁移文件只属一个上下文（#32 quality、#33 agent）。
 
+## 16. P7 增量表结构（draft: P7，2026-11-01）
+
+> 来源：`docs/superpowers/specs/2026-11-01-eztest-v02-p7-p9-design.md` §5/§13。
+> 迁移：#34–#39（6 个）；新增 bounded context：knowledge（#34）、orchestration（#37）。
+> P0–P6 表结构不变；P7 **新增 6 张表**：knowledge 3（`knowledge_item`、`knowledge_revision`、`knowledge_usage`）+ storage 2（`gc_run`、`gc_tombstone`）+ orchestration 1（`api_instance`）；**扩展 3 张既有表**：`delivery_report_revision`（新增 4 列）、`delivery_issue`（新增 2 列）、`sut`（新增 1 列）。
+> 全部新表雪花 `BIGINT` 主键（应用生成）、`TIMESTAMPTZ`（API 为 RFC3339 UTC）；跨上下文只做逻辑引用、不建 FK；同上下文 FK 显式。
+
+### 16.1 `knowledge_0001_knowledge.sql`（#34，knowledge 上下文，3 表）
+
+**`knowledge_item`**（知识主记录；逻辑引用 `version`/`identity`，无跨上下文 FK）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `id` | BIGINT | NOT NULL，`pk_knowledge_item` PRIMARY KEY（雪花） |
+| `scope` | TEXT | NOT NULL，CHECK `scope IN ('global','system')` |
+| `system_key` | TEXT | NULL，CHECK `system_key IS NULL OR (system_key = lower(system_key) AND char_length(system_key) BETWEEN 1 AND 64)`（对应 `sut.family`） |
+| `title` | TEXT | NOT NULL，CHECK `char_length(title) BETWEEN 1 AND 200` |
+| `content` | TEXT | NOT NULL，CHECK `char_length(content) BETWEEN 1 AND 20000` |
+| `tags` | TEXT[] | NOT NULL DEFAULT `'{}'::text[]`，CHECK `cardinality(tags) <= 20` |
+| `status` | TEXT | NOT NULL DEFAULT `'draft'`，CHECK `draft/approved/rejected/revoked` |
+| `confidence` | NUMERIC(4,3) | NULL，CHECK `confidence IS NULL OR (confidence >= 0 AND confidence <= 1)` |
+| `source_version_id` | BIGINT | NULL（逻辑引用 version；晋升来源版本） |
+| `promoted_from_version_id` | BIGINT | NULL（逻辑引用 version；缺省等同 `source_version_id`） |
+| `revision` | INTEGER | NOT NULL DEFAULT 1，CHECK `revision > 0`（当前 revision；编辑时 +1） |
+| `review_reason` | TEXT | NULL，CHECK `review_reason IS NULL OR char_length(review_reason) <= 2000`（reject/revoke 原因） |
+| `reviewed_by` | BIGINT | NULL（逻辑引用 identity；最近一次审核人） |
+| `reviewed_at` | TIMESTAMPTZ | NULL |
+| `revoked_at` | TIMESTAMPTZ | NULL |
+| `created_by` | BIGINT | NULL（逻辑引用 identity；AI 提议为触发 run 的 actor，未知时为 NULL） |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+| `search_vector` | tsvector | GENERATED ALWAYS AS (`to_tsvector('simple', coalesce(title,'') \|\| ' ' \|\| coalesce(content,'') \|\| ' ' \|\| eztest_text_array_to_string(tags))`) STORED；`eztest_text_array_to_string(TEXT[])` 为 #34 创建的 IMMUTABLE SQL 函数（`array_to_string` 非 IMMUTABLE，不能直接用于生成列） |
+
+约束/索引：
+
+- `pk_knowledge_item`；`ck_knowledge_item_scope` CHECK `((scope = 'global' AND system_key IS NULL) OR (scope = 'system' AND system_key IS NOT NULL))`；
+- `idx_knowledge_item_scope_status_id (scope, status, id DESC)`（按 scope/status 列表）；
+- `idx_knowledge_item_status_id (status, id DESC)`（审核队列/注入扫描）；
+- `idx_knowledge_item_source_version (source_version_id) WHERE source_version_id IS NOT NULL`；
+- `idx_knowledge_item_search USING GIN (search_vector)`（`websearch_to_tsquery('simple', q)` + `ts_rank`，不做向量检索）；
+- 状态机：`draft → approved | rejected`；`approved → revoked`；`revoked → approved`（复审）；`rejected → draft`（编辑后重新提交）。不提供物理删除；`source_stale` 不是列，来源版本不存在时由读取期标注并从注入排除。
+
+**`knowledge_revision`**（追加式内容历史；同上下文 FK `knowledge_id`；spec §5 以字段清单给出，类型/约束在此补全）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `id` | BIGINT | NOT NULL，`pk_knowledge_revision` PRIMARY KEY（雪花） |
+| `knowledge_id` | BIGINT | NOT NULL，`REFERENCES knowledge_item(id) ON DELETE CASCADE`（同上下文 FK） |
+| `revision` | INTEGER | NOT NULL，CHECK `revision > 0` |
+| `title` | TEXT | NOT NULL，CHECK `char_length(title) BETWEEN 1 AND 200` |
+| `content` | TEXT | NOT NULL，CHECK `char_length(content) BETWEEN 1 AND 20000` |
+| `tags` | TEXT[] | NOT NULL DEFAULT `'{}'::text[]`，CHECK `cardinality(tags) <= 20` |
+| `changed_by` | BIGINT | NULL（逻辑引用 identity；AI 提议写入时为 run actor 或 NULL） |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now()（`updated_at` 仅插入初始化） |
+
+约束/索引：
+
+- `pk_knowledge_revision`；
+- `uk_knowledge_revision_knowledge_id_revision` UNIQUE `(knowledge_id, revision)`；
+- `idx_knowledge_revision_knowledge_id_id (knowledge_id, id DESC)`；
+- **append-only**：仅 INSERT，不 UPDATE/DELETE 历史行；创建/编辑在同一事务内写新 revision，`revision = knowledge_item.revision` 新值。
+
+**`knowledge_usage`**（知识注入记录；逻辑引用 `agent_run`/`work_item`，无跨上下文 FK）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `id` | BIGINT | NOT NULL，`pk_knowledge_usage` PRIMARY KEY（雪花） |
+| `knowledge_id` | BIGINT | NOT NULL，`REFERENCES knowledge_item(id) ON DELETE CASCADE`（同上下文 FK） |
+| `agent_run_id` | BIGINT | NULL（逻辑引用 agent_run） |
+| `work_item_id` | BIGINT | NULL（逻辑引用 work_item） |
+| `token_estimate` | INTEGER | NOT NULL DEFAULT 0，CHECK `token_estimate >= 0`（注入估算 token） |
+| `injected_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+
+约束/索引：
+
+- `pk_knowledge_usage`；
+- `idx_knowledge_usage_knowledge_id_id (knowledge_id, id DESC)`；
+- 每次注入一条知识记一行；记录失败只写日志，不影响 run（见 `agent-profiles-tools.md` §10.3）。
+
+### 16.2 `storage_0003_gc.sql`（#35，storage 上下文，2 表 + 5 索引）
+
+**`gc_run`**（GC 运行账本；逻辑引用 `identity`，无跨上下文 FK）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `id` | BIGINT | NOT NULL，`pk_gc_run` PRIMARY KEY（雪花） |
+| `mode` | TEXT | NOT NULL，CHECK `mode IN ('dry_run','apply')` |
+| `status` | TEXT | NOT NULL DEFAULT `'running'`，CHECK `status IN ('running','completed','failed')` |
+| `actor_id` | BIGINT | NULL（逻辑引用 identity；周期 worker 为 NULL） |
+| `actor_kind` | TEXT | NOT NULL DEFAULT `'system'`，CHECK `actor_kind IN ('user','system')` |
+| `lease_owner` | TEXT | NULL |
+| `lease_until` | TIMESTAMPTZ | NULL |
+| `lease_epoch` | BIGINT | NOT NULL DEFAULT 0，CHECK `lease_epoch >= 0` |
+| `started_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+| `finished_at` | TIMESTAMPTZ | NULL |
+| `scanned_objects` | INTEGER | NOT NULL DEFAULT 0，CHECK `scanned_objects >= 0` |
+| `scanned_refs` | INTEGER | NOT NULL DEFAULT 0，CHECK `scanned_refs >= 0` |
+| `deleted_objects` | INTEGER | NOT NULL DEFAULT 0，CHECK `deleted_objects >= 0` |
+| `deleted_refs` | INTEGER | NOT NULL DEFAULT 0，CHECK `deleted_refs >= 0` |
+| `deleted_bytes` | BIGINT | NOT NULL DEFAULT 0，CHECK `deleted_bytes >= 0` |
+| `report` | JSONB | NOT NULL DEFAULT `'{}'::jsonb`，CHECK `jsonb_typeof(report) = 'object'`（候选/解码/缺失文件明细） |
+| `error` | TEXT | NULL，CHECK `error IS NULL OR char_length(error) <= 4000` |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+
+约束/索引：
+
+- `pk_gc_run`；
+- `uk_gc_run_running` UNIQUE `((true)) WHERE status = 'running'`（同一时间只允许一个 running；第二实例冲突 → 409 `gc_running`）；
+- `idx_gc_run_started_at (started_at DESC, id DESC)`（运行历史列表）。
+
+**`gc_tombstone`**（删除墓碑；append-only；同上下文 FK `run_id`）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `id` | BIGINT | NOT NULL，`pk_gc_tombstone` PRIMARY KEY（雪花） |
+| `run_id` | BIGINT | NOT NULL，`REFERENCES gc_run(id) ON DELETE CASCADE`（同上下文 FK） |
+| `object_sha` | TEXT | NOT NULL，CHECK `object_sha ~ '^[0-9a-f]{64}$'` |
+| `size_bytes` | BIGINT | NOT NULL，CHECK `size_bytes >= 0` |
+| `mime` | TEXT | NOT NULL DEFAULT `'application/octet-stream'` |
+| `relative_path` | TEXT | NOT NULL（`paths.data_root` 相对路径；不对外暴露） |
+| `reason` | TEXT | NOT NULL，CHECK `reason IN ('unreferenced','temp','superseded_export','orphan_file')` |
+| `deleted_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now()（`updated_at` 仅插入初始化） |
+
+约束/索引：`pk_gc_tombstone`；同上下文 FK `run_id → gc_run.id`（`ON DELETE CASCADE`）；`idx_gc_tombstone_run_id (run_id, id DESC)`（运行详情墓碑列表）。
+
+- **内容账本扫描索引**（同属 #35）：`idx_content_ref_live_object ON content_ref (object_id) WHERE deleted_at IS NULL`；`idx_content_object_created_at ON content_object (created_at)`。
+- 删除顺序固定：先 soft-delete/删 `content_ref` → 再删 `content_object` 行 → 最后删磁盘文件；删对象前先写 `gc_tombstone`。`dry_run` 不写墓碑、不删任何行/文件，只写 `gc_run.report`。
+- 保护集（永不自动删除）：`report_revision` 的 `report_html`/`report_pdf`（旧 revision 保留）、attachment 行与 version 行均存在的 `requirement_attachment`、evidence 行存在的证据、当前（非被替代）`export_artifact`、任何有活 ref 的对象、落在 `retention.gc_grace_hours` 宽限期内的一切内容。
+
+### 16.3 `delivery_0004_report_pdf.sql`（#36，delivery 上下文，ALTER 1 表 + 1 索引）
+
+**`delivery_report_revision` 新增列**（PDF 生成元数据；既有列与 P4 语义不变）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `pdf_status` | TEXT | NOT NULL DEFAULT `'pending'`，CHECK `pdf_status IN ('pending','running','done','failed','disabled')` |
+| `pdf_error` | TEXT | NULL，CHECK `pdf_error IS NULL OR char_length(pdf_error) <= 2000` |
+| `pdf_attempts` | INTEGER | NOT NULL DEFAULT 0，CHECK `pdf_attempts >= 0`（每次 worker 尝试 +1，成功/失败均计） |
+| `pdf_rendered_at` | TIMESTAMPTZ | NULL |
+
+- `idx_delivery_report_revision_pdf_pending ON delivery_report_revision (pdf_status) WHERE pdf_status IN ('pending','failed')`（补齐队列/重试扫描）。
+- **不可变量**：发布后仅 `pdf_ref`、`pdf_status`、`pdf_error`、`pdf_attempts`、`pdf_rendered_at`、`updated_at` 可变；`as_of`、`html_ref`、`input_fingerprint`、`template_version` 永远不变。
+- `pdf_status` 语义：`pending` 待生成；`running` 已被 render worker 认领；`done` 已写入 PDF 且 `pdf_ref` 非空；`failed` 超过 `report.render_max_attempts` 或不可重试；`disabled` 因 `report.render_pdf=false` 不排队。
+- 迁移把**既有已发布 revision** 默认为 `pending` 并纳入 PDF 补齐队列（历史 revision 补齐，不重写 HTML/内容）；`report.render_pdf=false` 时 reconciler 跳过补齐，新 revision 置 `disabled`。
+- `pdf_ref` 指向 `content_ref`：`owner_kind='report_revision'`、`owner_id=revision.id`、`role='report_pdf'`；下载校验 owner/role/sha/size，不暴露路径。
+- **P4 注记的 P7 生效范围**：P4 §10.2 所述“发布后仅 `pdf_ref/render_status/updated_at` 可更新”在 P7 扩为上述六列；P4 已冻结的其余内容不可变语义不变。
+
+### 16.4 `orchestration_0001_instance.sql`（#37，orchestration 上下文，1 表）
+
+**`api_instance`**（API 副本注册表；无跨上下文 FK）
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `id` | BIGINT | NOT NULL，`pk_api_instance` PRIMARY KEY（雪花） |
+| `instance_key` | TEXT | NOT NULL，UNIQUE（`hostname:pid` 自然键） |
+| `hostname` | TEXT | NOT NULL |
+| `pid` | INTEGER | NOT NULL，CHECK `pid > 0` |
+| `api_port` | INTEGER | NOT NULL，CHECK `api_port BETWEEN 1 AND 65535` |
+| `node_id` | INTEGER | NOT NULL，UNIQUE，CHECK `node_id BETWEEN 0 AND 1023` |
+| `status` | TEXT | NOT NULL DEFAULT `'active'`，CHECK `status IN ('active','draining','offline','stopped')` |
+| `version` | TEXT | NOT NULL DEFAULT `''` |
+| `last_error` | TEXT | NULL |
+| `started_at` | TIMESTAMPTZ | NOT NULL |
+| `heartbeat_at` | TIMESTAMPTZ | NOT NULL |
+| `draining_at` | TIMESTAMPTZ | NULL |
+| `stopped_at` | TIMESTAMPTZ | NULL |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() |
+
+约束/索引：
+
+- `pk_api_instance`；`uk_api_instance_instance_key` UNIQUE `(instance_key)`；`uk_api_instance_node_id` UNIQUE `(node_id)`；
+- `idx_api_instance_status_heartbeat (status, heartbeat_at DESC)`；
+- 语义：启动插入，`node_id` 优先取 `runtime.snowflake_node_id`，被占用取最小空闲 0–1023；每 `instance.heartbeat_seconds` 更新 `heartbeat_at`；超过 `instance.offline_seconds` 无心跳 → `offline`（node 可回收）；优雅退出置 `stopped` 并释放 node；`drain` 置 `draining`（readiness 503、停止认领新任务、in-flight 完成）；启动/恢复**不得**批量中断其它实例的 running。
+- leader 选举使用 PostgreSQL advisory lock（`pg_try_advisory_lock(0x455A5431)`），不落本表；`IsLeader=false` 的副本只跑 workers，不跑 reconciler/scheduler/poller/GC。
+
+### 16.5 `resource_0002_sut_family.sql`（#38，resource 上下文，ALTER 1 表 + 1 索引）
+
+**`sut` 新增列**：
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `family` | TEXT | NULL，CHECK `family IS NULL OR (family = lower(family) AND char_length(family) BETWEEN 1 AND 64)`（系统族键；可多个 SUT 共用） |
+
+- `idx_sut_family ON sut (family) WHERE family IS NOT NULL`。
+- 语义：可选、无回填；用于 `knowledge_item.scope='system'` 的 `system_key` 匹配（`system_key = ANY(版本绑定 SUT 的 family)`）；SUT 读/写模型新增可选 `family`，旧值 NULL 不受影响。
+
+### 16.6 `delivery_0005_issue_recurrence.sql`（#39，delivery 上下文，ALTER 1 表）
+
+**`delivery_issue` 新增列**：
+
+| 列 | 类型 | 约束/默认 |
+|---|---|---|
+| `recurrence_count` | INTEGER | NOT NULL DEFAULT 0，CHECK `recurrence_count >= 0`（复发重定向累计次数） |
+| `last_recurred_at` | TIMESTAMPTZ | NULL |
+
+- 复发重定向（同 `version_id,dedupe_key` 命中且源 issue `status='merged'`）沿 `merged_into_id` 链（≤16）找到目标：向目标追加 `role='recurrence'` refs（重复跳过）、`recurrence_count+1`、`last_recurred_at=now`、写状态历史（`from=to=目标状态`、`reason='recurrence'`、`actor_kind='system'`）；源 issue 的 refs/历史不变；链断裂/成环 → 事件 `issue.recurred` 带 `redirect_failed=true` 并保持旧行为（追加到源）。
+- `merged_chain` 是读取期沿链计算的 ID 数组（≤16），**不落库**；不新增索引（按既有 `uk_delivery_issue_version_id_dedupe_key` 命中）。
+
+### 16.7 P7 数据不变量
+
+1. **只追加**：#34–#39 不改 #1–#33 的文件与 checksum；P7 新表 6 张、既有表扩展 3 张，不新增其他表。
+2. **归属**：knowledge（`knowledge_*`，#34）、storage（`gc_run`/`gc_tombstone`，#35）、delivery（`delivery_report_revision` 列，#36；`delivery_issue` 列，#39）、orchestration（`api_instance`，#37）、resource（`sut.family`，#38）；迁移文件只属一个上下文。
+3. **跨上下文只逻辑引用**：`source_version_id`、`promoted_from_version_id`、`created_by`、`reviewed_by`、`agent_run_id`、`work_item_id`、`actor_id`、`created_by_run_id` 等不建 FK；同上下文 FK（`knowledge_revision.knowledge_id`、`knowledge_usage.knowledge_id`、`gc_tombstone.run_id`）显式 `ON DELETE CASCADE`。
+4. **知识**：`knowledge_item.status` 只允许 §16.1 状态机；reject/revoke 必须带 `review_reason`；`draft/rejected/revoked` 永不注入；`approved` 方可注入；`source_stale` 不建状态/列，读取期过滤；`knowledge_revision` append-only、不做物理删除。
+5. **报告 PDF**：`pdf_status='done'` ⇔ `pdf_ref` 非空；`pdf_status='failed'` 后 reconciler 不再自动补；`report.render_pdf=false` 只影响新 revision（`disabled`）与补齐队列，不删已生成 PDF；PDF 生成失败不影响 report published 与版本收尾谓词。
+6. **GC**：同一时刻至多一个 `running`；`apply` 必须 `confirm=true`；先写 tombstone 再删；删除顺序 ref → object 行 → 文件；保护集与宽限期优先；`dry_run` 绝不删数据。
+7. **问题复发**：`recurrence_count` 单调递增，`last_recurred_at` 只前移；合并链 ≤16 且读取期计算；旧 revision 的 HTML/统计/as_of 不因合并/复发变化。
+8. **实例**：`instance_key`、`node_id` 全表唯一；同一 node 至多一个未回收实例；`draining` 由 admin drain/activate 迁移；状态过期为 `offline`，`stopped` 终态；不批量中断。
+9. **报告 revision 不可变**：§16.3 列出的内容字段在发布后不可变；P7 的 PDF 元数据更新必须使用 fencing（`pdf_ref` 为空且 `pdf_status IN ('pending','failed','running')`）。
+10. 命名/结构自检：新表主键 `pk_`、唯一键 `uk_`、普通索引 `idx_`；字段 snake_case；时间 RFC3339 UTC；JSONB 对象列显式 `jsonb_typeof='object'`；跨上下文不建 FK。
+
