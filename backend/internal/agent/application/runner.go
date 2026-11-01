@@ -610,7 +610,9 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 		})
 	}
 
-	state.registry = tools.NewP4Registry(r.toolDepsForRun(state))
+	// P5 composes the P1–P4 registry with the codeintel/visual tool groups; the
+	// profile allowed_tools still select the surface each run may call.
+	state.registry = tools.NewP5Registry(r.toolDepsForRun(state))
 	state.definitions = state.registry.Definitions(state.profile.AllowedTools)
 
 	packet, compactInfo, err := r.builder.Build(ctx, state.input)
@@ -1677,13 +1679,22 @@ func executionTaskResult(task ExecutionTask) map[string]any {
 	}
 	assertions := make([]map[string]any, 0, len(task.Assertions))
 	for _, assertion := range task.Assertions {
-		assertions = append(assertions, map[string]any{
+		entry := map[string]any{
 			"step_seq":              assertion.StepSeq,
 			"assertion_seq":         assertion.AssertionSeq,
 			"kind":                  assertion.Kind,
 			"expected":              assertion.Expected,
 			"target_version_sut_id": idText(assertion.TargetVersionSUTID),
-		})
+		}
+		if assertion.Kind == "visual" {
+			if assertion.CaseAssertionID > 0 {
+				entry["case_assertion_id"] = idText(assertion.CaseAssertionID)
+			}
+			if assertion.VisualAssertionID > 0 {
+				entry["visual_assertion_id"] = idText(assertion.VisualAssertionID)
+			}
+		}
+		assertions = append(assertions, entry)
 	}
 	priorSteps := make([]map[string]any, 0, len(task.PriorSteps))
 	for _, prior := range task.PriorSteps {
