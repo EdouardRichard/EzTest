@@ -19,6 +19,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/clock"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/id"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/load"
 )
 
 // Runner defaults. Profile budgets and the frozen P0 settings override them.
@@ -71,7 +72,10 @@ type RunnerDeps struct {
 	// Logger receives the log-only knowledge runtime failures. It defaults to
 	// slog.Default().
 	Logger *slog.Logger
-	InstanceID           string
+	// Load counts runs currently executing in this process (P8 drain
+	// observability). Nil disables the counter.
+	Load       *load.Counter
+	InstanceID string
 }
 
 // Runner executes one work item as an agent run: context packet, bounded model
@@ -79,28 +83,29 @@ type RunnerDeps struct {
 // deletes or closes a requirement; the model can only submit drafts and
 // proposals through the scoped tools.
 type Runner struct {
-	repo            agent.RuntimeRepository
-	chat            llmapp.ChatGateway
-	settings        SettingsReader
-	clock           clock.Clock
-	ids             id.Generator
-	events          eventingapp.Publisher
-	audit           auditapp.Recorder
-	conversation    ConversationPort
-	versions        VersionReader
-	attachments     AttachmentReader
-	teamRoom        TeamRoomPort
-	content         ContentWriter
-	toolDeps        tools.Deps
-	taskProvider    TaskContextProvider
-	runCanceller    RunCanceller
+	repo                 agent.RuntimeRepository
+	chat                 llmapp.ChatGateway
+	settings             SettingsReader
+	clock                clock.Clock
+	ids                  id.Generator
+	events               eventingapp.Publisher
+	audit                auditapp.Recorder
+	conversation         ConversationPort
+	versions             VersionReader
+	attachments          AttachmentReader
+	teamRoom             TeamRoomPort
+	content              ContentWriter
+	toolDeps             tools.Deps
+	taskProvider         TaskContextProvider
+	runCanceller         RunCanceller
 	reportFinalizer      ReportFinalizer
 	requirementFinalizer RequirementFinalizer
 	knowledge            KnowledgeReader
 	knowledgeUsage       KnowledgeUsageRecorder
 	logger               *slog.Logger
-	instanceID      string
-	builder         *ContextBuilder
+	load                 *load.Counter
+	instanceID           string
+	builder              *ContextBuilder
 }
 
 // NewRunner wires the agent runner.
@@ -110,28 +115,29 @@ func NewRunner(deps RunnerDeps) *Runner {
 		logger = slog.Default()
 	}
 	return &Runner{
-		repo:            deps.Runtime,
-		chat:            deps.Chat,
-		settings:        deps.Settings,
-		clock:           deps.Clock,
-		ids:             deps.IDs,
-		events:          deps.Events,
-		audit:           deps.Audit,
-		conversation:    deps.Conversation,
-		versions:        deps.Versions,
-		attachments:     deps.Attachments,
-		teamRoom:        deps.TeamRoom,
-		content:         deps.Content,
-		toolDeps:        deps.ToolDeps,
-		taskProvider:    deps.TaskProvider,
-		runCanceller:    deps.RunCanceller,
-		reportFinalizer: deps.ReportFinalizer,
+		repo:                 deps.Runtime,
+		chat:                 deps.Chat,
+		settings:             deps.Settings,
+		clock:                deps.Clock,
+		ids:                  deps.IDs,
+		events:               deps.Events,
+		audit:                deps.Audit,
+		conversation:         deps.Conversation,
+		versions:             deps.Versions,
+		attachments:          deps.Attachments,
+		teamRoom:             deps.TeamRoom,
+		content:              deps.Content,
+		toolDeps:             deps.ToolDeps,
+		taskProvider:         deps.TaskProvider,
+		runCanceller:         deps.RunCanceller,
+		reportFinalizer:      deps.ReportFinalizer,
 		requirementFinalizer: deps.RequirementFinalizer,
 		knowledge:            deps.Knowledge,
 		knowledgeUsage:       deps.KnowledgeUsage,
 		logger:               logger,
-		instanceID:      deps.InstanceID,
-		builder:         NewContextBuilder(deps.Settings, NewLLMSummarizer(deps.Chat)),
+		load:                 deps.Load,
+		instanceID:           deps.InstanceID,
+		builder:              NewContextBuilder(deps.Settings, NewLLMSummarizer(deps.Chat)),
 	}
 }
 
@@ -368,6 +374,10 @@ type runState struct {
 // Run executes one work item. On failure the agent_run row is already marked
 // failed/interrupted and the returned error carries the retry classification.
 func (r *Runner) Run(ctx context.Context, item agent.WorkItem) (RunResult, error) {
+	if r.load != nil {
+		r.load.Inc()
+		defer r.load.Dec()
+	}
 	profileKey, ok := ProfileKeyForWorkType(item.Type)
 	if !ok {
 		return RunResult{}, &RunError{
