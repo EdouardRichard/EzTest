@@ -1465,6 +1465,6 @@
 - `agent_profile` 无触发器：PATCH profile 配置与 PUT/reset/restore prompt 在**同一事务**内显式 `updated_at=now()`；其余读路径不改写。`name`/`enabled`/`key` 不写；`system_prompt` 只经版本端点写。
 - **P6 唯一新表 = 3 张**：`eval_run`、`eval_metric`（#32 quality）+ `agent_profile_prompt_revision`（#33 agent）；**不新增其他表**，P6 不对既有表做任何 ALTER/列变更。
 - `agent_run` 仅为 Agent 中心观察读模型；P6 默认**不加** `idx_agent_run_profile_key_id`（数据量小，仅当集成性能测试证明需要时由后续阶段追加）。
-- `issue`/`report`/`report_revision`/`version` 被全局中心只读复用；不新增表、不加索引，全局列表按 id DESC 走 PK。
+- `delivery_issue`/`delivery_report`/`delivery_report_revision`/`version` 被全局中心只读复用；不新增表、不加索引，全局列表按 id DESC 走 PK。
 - 命名/结构自检：新表主键 `pk_`、唯一键 `uk_`、普通索引 `idx_`；字段 snake_case；时间 RFC3339 UTC；跨上下文不建 FK；迁移文件只属一个上下文（#32 quality、#33 agent）。
 

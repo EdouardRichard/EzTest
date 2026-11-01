@@ -34,8 +34,6 @@ export const NAV_ITEMS: NavItem[] = [
     href: "/issues",
     icon: Bug,
     section: "workspace",
-    placeholder: true,
-    phase: "P1",
   },
   {
     key: "reports",
@@ -43,8 +41,6 @@ export const NAV_ITEMS: NavItem[] = [
     href: "/reports",
     icon: FileText,
     section: "workspace",
-    placeholder: true,
-    phase: "P1",
   },
   {
     key: "knowledge",
@@ -62,8 +58,6 @@ export const NAV_ITEMS: NavItem[] = [
     href: "/quality",
     icon: Gauge,
     section: "platform",
-    placeholder: true,
-    phase: "P1",
   },
   {
     key: "agents",
@@ -71,8 +65,6 @@ export const NAV_ITEMS: NavItem[] = [
     href: "/agents",
     icon: Bot,
     section: "platform",
-    placeholder: true,
-    phase: "P1",
   },
   { key: "settings", label: "设置", href: "/settings", icon: Settings, section: "platform" },
 ]
