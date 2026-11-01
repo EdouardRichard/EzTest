@@ -48,6 +48,7 @@
 ## 3. 测试与验收证据
 
 - `go test -count=1 ./...` → 全部 PASS（含新增 quality/search/workspace/agent prompt）。
+- `scripts/test.ps1`（单测 + integration + frontend lint/typecheck/test + executor/契约）→ **exit 0**；agent 集成分页断言与 e2e lint 已在收口修复。
 - `pnpm test` → **97 files / 739 tests passed**；`pnpm typecheck` exit 0；`pnpm lint` exit 0（1 个既有 warning）。
 - executor `pnpm test` → 104/104 PASS。
 - 契约：P2/P3/P4/P5/P6 全 PASS；P6 计数 20 ops/18 paths/3 表/#32–#33/72 设置。
