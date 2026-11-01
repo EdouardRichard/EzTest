@@ -48,7 +48,7 @@
 
 | 证据 | 命令 | 结果/路径 |
 |---|---|---|
-| 全量门禁 | `powershell.exe -File scripts/test.ps1` | EXIT=0；Go unit 全包 ok；Go integration 全包 ok；frontend 66 files / 548 tests；`.tmp/p4/final-gate.log` |
+| 全量门禁 | `powershell.exe -File scripts/test.ps1` | EXIT=0；Go unit 全包 ok；Go integration 全包 ok；frontend 66 files / 548 tests；`.tmp/p4/final-gate-2.log` |
 | P4 契约 | `node scripts/p4-contract-check.cjs` | OK：14 P4 ops；95 paths/124 ops/148 schemas；8 表；4 迁移 #21–#24；10 事件；5 任务；3 profiles；8 工具；4 设置 |
 | P3 契约兼容 | `node scripts/p3-contract-check.cjs` | OK：95 paths/124 ops/148 schemas；20 事件；10 表；24 迁移；53 设置；executor protocol |
 | P2 契约兼容 | `node scripts/p2-contract-check.cjs` | OK：P2 increments present |
