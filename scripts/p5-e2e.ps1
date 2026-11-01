@@ -221,9 +221,9 @@ function Wait-For {
 }
 
 function Stop-Started {
-    if ($null -ne $apiProcess) {
-        try { if (-not $apiProcess.HasExited) { Stop-Process -Id $apiProcess.Id -Force -ErrorAction SilentlyContinue } } catch { }
-        $apiProcess = $null
+    if ($null -ne $script:apiProcess) {
+        try { if (-not $script:apiProcess.HasExited) { Stop-Process -Id $script:apiProcess.Id -Force -ErrorAction SilentlyContinue } } catch { }
+        $script:apiProcess = $null
     }
     if ($null -ne $executorProcess) {
         try { & taskkill /PID $executorProcess.Id /T /F *> $null } catch { }
@@ -249,6 +249,7 @@ function Set-Setting([string]$Key, $Value) {
 }
 
 function Start-Api {
+    if (Test-Port $ApiPort) { throw "API port $ApiPort is already in use before start; stale process would mask the new API/token" }
     $previousDb = $env:EZTEST_DATABASE_URL
     $previousApi = $env:EZTEST_API_PORT
     $previousWeb = $env:EZTEST_WEB_PORT
@@ -258,7 +259,7 @@ function Start-Api {
         $env:EZTEST_API_PORT = "$ApiPort"
         $env:EZTEST_WEB_PORT = "$WebPort"
         $env:EZTEST_EXECUTOR_PORT = "$ExecutorPort"
-        $apiProcess = Start-Process -FilePath $exePath -WorkingDirectory $repoRoot `
+        $script:apiProcess = Start-Process -FilePath $exePath -WorkingDirectory $repoRoot `
             -RedirectStandardOutput (Join-Path $logDir "e2e-api.out.log") `
             -RedirectStandardError (Join-Path $logDir "e2e-api.err.log") -PassThru
     } finally {
@@ -267,6 +268,7 @@ function Start-Api {
         $env:EZTEST_WEB_PORT = $previousWeb
         $env:EZTEST_EXECUTOR_PORT = $previousExecutor
     }
+    if ($script:apiProcess.HasExited) { throw ("API exited immediately; see " + (Join-Path $logDir "e2e-api.err.log")) }
     if (-not (Wait-Http "$apiUrl/api/health" 180)) { throw "API did not become ready" }
 }
 
@@ -406,11 +408,12 @@ try {
     $user = Invoke-Api -Method "POST" -Path "/api/admin/users" -Token $token -Body @{ username = "p5user"; display_name = "P5 User"; password = "p5-user-pass-123" }
     Assert-Status $user @(201) "POST normal user"
 
-    if ($null -ne $apiProcess) {
-        try { if (-not $apiProcess.HasExited) { Stop-Process -Id $apiProcess.Id -Force -ErrorAction SilentlyContinue } } catch { }
-        $apiProcess.WaitForExit(10000) | Out-Null
-        $apiProcess = $null
+    if ($null -ne $script:apiProcess) {
+        try { if (-not $script:apiProcess.HasExited) { Stop-Process -Id $script:apiProcess.Id -Force -ErrorAction SilentlyContinue } } catch { }
+        $script:apiProcess.WaitForExit(10000) | Out-Null
+        $script:apiProcess = $null
     }
+    if (Test-Port $ApiPort) { throw "API port $ApiPort is still in use after stopping the bootstrap API" }
     Log "start the acceptance API"
     Start-Api
     $login = Invoke-Api -Method "POST" -Path "/api/auth/login" -Token $null -Body @{ username = "admin"; password = "admin123" }
