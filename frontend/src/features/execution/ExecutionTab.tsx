@@ -5,7 +5,9 @@ import { useCallback, useEffect, useRef, useState } from "react"
 
 import { ErrorState } from "@/components/ui/ErrorState"
 import { LoadingCard } from "@/components/ui/Spinner"
+import { Tabs } from "@/components/ui/Tabs"
 import { useVersionEvents } from "@/features/clarification/useVersionEvents"
+import { VisualView } from "@/features/visual/VisualView"
 
 import {
   cancelHumanRequest,
@@ -37,15 +39,35 @@ import type {
 } from "./types"
 import { WaveList } from "./WaveList"
 
+export type ExecutionSubView = "waves" | "visual"
+
 export type ExecutionTabProps = {
   versionId: string
   /** Deep link `?wave=` forwarded by the version page. */
   initialWaveId?: string
   /** Deep link `?case_run=` forwarded by the version page. */
   initialCaseRunId?: string
+  /** Sub-view selector; `?view=visual` in the URL is read when omitted. */
+  view?: ExecutionSubView
 }
 
 const REFRESH_DEBOUNCE_MS = 300
+
+const SUB_VIEW_TABS = [
+  { value: "waves", label: "波次" },
+  { value: "visual", label: "视觉断言" },
+]
+
+function parseSubView(value: string | null | undefined): ExecutionSubView {
+  return value === "visual" ? "visual" : "waves"
+}
+
+/** The version page owns the tab URL; this sub-view reads `?view=` itself. */
+function readInitialSubView(view: ExecutionSubView | undefined): ExecutionSubView {
+  if (view !== undefined) return view
+  if (typeof window === "undefined") return "waves"
+  return parseSubView(new URLSearchParams(window.location.search).get("view"))
+}
 
 /**
  * P3 execution workspace (spec §12.1): a three-column layout — wave history,
@@ -55,8 +77,14 @@ const REFRESH_DEBOUNCE_MS = 300
  * only triggers a debounced snapshot refetch (spec §10.2); the UI never merges
  * step results locally.
  */
-export function ExecutionTab({ versionId, initialWaveId, initialCaseRunId }: ExecutionTabProps) {
+export function ExecutionTab({
+  versionId,
+  initialWaveId,
+  initialCaseRunId,
+  view,
+}: ExecutionTabProps) {
   const router = useRouter()
+  const [subView, setSubView] = useState<ExecutionSubView>(() => readInitialSubView(view))
 
   const [overview, setOverview] = useState<ExecutionOverview | null>(null)
   const [waves, setWaves] = useState<RunWave[]>([])
@@ -228,13 +256,23 @@ export function ExecutionTab({ versionId, initialWaveId, initialCaseRunId }: Exe
   })
 
   const updateUrl = useCallback(
-    (waveId: string | null, caseRunId: string | null) => {
+    (waveId: string | null, caseRunId: string | null, nextView: ExecutionSubView) => {
       const params = new URLSearchParams({ tab: "execution" })
       if (waveId !== null) params.set("wave", waveId)
       if (caseRunId !== null) params.set("case_run", caseRunId)
+      if (nextView === "visual") params.set("view", "visual")
       router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`)
     },
     [router, versionId],
+  )
+
+  const changeSubView = useCallback(
+    (value: string) => {
+      const next = parseSubView(value)
+      setSubView(next)
+      updateUrl(selectedWaveId, selectedCaseRunId, next)
+    },
+    [selectedCaseRunId, selectedWaveId, updateUrl],
   )
 
   const selectWave = useCallback(
@@ -243,17 +281,17 @@ export function ExecutionTab({ versionId, initialWaveId, initialCaseRunId }: Exe
       setSelectedCaseRunId(null)
       setDetail(null)
       setNotice(null)
-      updateUrl(waveId, null)
+      updateUrl(waveId, null, subView)
     },
-    [updateUrl],
+    [subView, updateUrl],
   )
 
   const selectCaseRun = useCallback(
     (caseRunId: string) => {
       setSelectedCaseRunId(caseRunId)
-      updateUrl(selectedWaveId, caseRunId)
+      updateUrl(selectedWaveId, caseRunId, subView)
     },
-    [updateUrl, selectedWaveId],
+    [selectedWaveId, subView, updateUrl],
   )
 
   const runAction = useCallback(
@@ -356,32 +394,11 @@ export function ExecutionTab({ versionId, initialWaveId, initialCaseRunId }: Exe
 
   return (
     <div data-testid="execution-tab" className="space-y-3">
-      <ExecutionToolbar
-        wave={selectedWave}
-        sseStatus={sseStatus}
-        executor={overview?.executor ?? null}
-        sutOptions={sutOptions}
-        sutFilter={sutFilter}
-        onSutFilterChange={setSutFilter}
-        onPause={() => {
-          if (selectedWave !== null) {
-            setPauseTarget({
-              kind: "wave",
-              id: selectedWave.id,
-              title: `#${selectedWave.id}`,
-              alreadyPaused: selectedWave.status === "paused",
-            })
-          }
-        }}
-        onResume={handleResumeWave}
-        onCancel={() => {
-          if (selectedWave !== null) {
-            void runAction(() => cancelWave(versionId, selectedWave.id))
-          }
-        }}
-        busy={busy}
-        actionError={actionError}
-        notice={notice}
+      <Tabs
+        items={SUB_VIEW_TABS}
+        value={subView}
+        onValueChange={changeSubView}
+        ariaLabel="执行视图"
       />
 
       {openHumanRequests.length > 0 ? (
@@ -392,47 +409,81 @@ export function ExecutionTab({ versionId, initialWaveId, initialCaseRunId }: Exe
         />
       ) : null}
 
-      <PausedBanner
-        wave={pausedWave}
-        caseRun={pausedCaseRun}
-        onResumeWave={handleResumeWave}
-        onResumeCaseRun={() => handleResumeCaseRun()}
-        busy={busy}
-      />
+      {subView === "visual" ? (
+        <VisualView versionId={versionId} initialWaveId={selectedWaveId ?? undefined} />
+      ) : (
+        <>
+          <ExecutionToolbar
+            wave={selectedWave}
+            sseStatus={sseStatus}
+            executor={overview?.executor ?? null}
+            sutOptions={sutOptions}
+            sutFilter={sutFilter}
+            onSutFilterChange={setSutFilter}
+            onPause={() => {
+              if (selectedWave !== null) {
+                setPauseTarget({
+                  kind: "wave",
+                  id: selectedWave.id,
+                  title: `#${selectedWave.id}`,
+                  alreadyPaused: selectedWave.status === "paused",
+                })
+              }
+            }}
+            onResume={handleResumeWave}
+            onCancel={() => {
+              if (selectedWave !== null) {
+                void runAction(() => cancelWave(versionId, selectedWave.id))
+              }
+            }}
+            busy={busy}
+            actionError={actionError}
+            notice={notice}
+          />
 
-      <div className="grid gap-3 lg:grid-cols-[300px_minmax(0,1fr)_390px]">
-        <WaveList
-          waves={waves}
-          selectedWaveId={selectedWaveId}
-          activeWaveId={overview?.active_wave?.id ?? null}
-          onSelect={selectWave}
-        />
-        <LiveTrace
-          wave={selectedWave}
-          caseRun={caseRuns.find((caseRun) => caseRun.id === selectedCaseRunId) ?? null}
-          detail={detail}
-          loading={detailLoading}
-          error={detailError}
-          onRetry={() => setDetailToken((token) => token + 1)}
-        />
-        <ResultsPanel
-          versionId={versionId}
-          caseRuns={visibleCaseRuns}
-          selectedCaseRunId={selectedCaseRunId}
-          onSelect={selectCaseRun}
-          onPause={(caseRun) =>
-            setPauseTarget({ kind: "case_run", id: caseRun.id, title: caseRun.title })
-          }
-          onResume={(caseRun) => handleResumeCaseRun(caseRun)}
-          onRerunComplete={() => {
-            void refresh()
-          }}
-          detail={detail}
-          detailLoading={detailLoading}
-          detailError={detailError}
-          onRetryDetail={() => setDetailToken((token) => token + 1)}
-        />
-      </div>
+          <PausedBanner
+            wave={pausedWave}
+            caseRun={pausedCaseRun}
+            onResumeWave={handleResumeWave}
+            onResumeCaseRun={() => handleResumeCaseRun()}
+            busy={busy}
+          />
+
+          <div className="grid gap-3 lg:grid-cols-[300px_minmax(0,1fr)_390px]">
+            <WaveList
+              waves={waves}
+              selectedWaveId={selectedWaveId}
+              activeWaveId={overview?.active_wave?.id ?? null}
+              onSelect={selectWave}
+            />
+            <LiveTrace
+              wave={selectedWave}
+              caseRun={caseRuns.find((caseRun) => caseRun.id === selectedCaseRunId) ?? null}
+              detail={detail}
+              loading={detailLoading}
+              error={detailError}
+              onRetry={() => setDetailToken((token) => token + 1)}
+            />
+            <ResultsPanel
+              versionId={versionId}
+              caseRuns={visibleCaseRuns}
+              selectedCaseRunId={selectedCaseRunId}
+              onSelect={selectCaseRun}
+              onPause={(caseRun) =>
+                setPauseTarget({ kind: "case_run", id: caseRun.id, title: caseRun.title })
+              }
+              onResume={(caseRun) => handleResumeCaseRun(caseRun)}
+              onRerunComplete={() => {
+                void refresh()
+              }}
+              detail={detail}
+              detailLoading={detailLoading}
+              detailError={detailError}
+              onRetryDetail={() => setDetailToken((token) => token + 1)}
+            />
+          </div>
+        </>
+      )}
 
       <PauseDialog
         open={pauseTarget !== null}

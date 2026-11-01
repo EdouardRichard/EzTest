@@ -10,6 +10,7 @@ import { Field } from "@/components/ui/Field"
 import { Input } from "@/components/ui/Input"
 import { Select } from "@/components/ui/Select"
 import { Textarea } from "@/components/ui/Textarea"
+import { AnchorPanel } from "@/features/anchors/AnchorPanel"
 
 import { confirmRequirement, updateRequirement } from "./api"
 import { REQUIREMENT_STATUS_LABEL, REQUIREMENT_STATUS_TONE } from "./labels"
@@ -278,6 +279,15 @@ export function RequirementEditor({
           <InlineError error={error} />
         </div>
       ) : null}
+
+      <div className="mt-3 border-t border-border pt-3">
+        <AnchorPanel
+          versionId={versionId}
+          subjectKind="requirement"
+          subjectId={requirement.id}
+          title="需求代码锚点"
+        />
+      </div>
     </section>
   )
 }

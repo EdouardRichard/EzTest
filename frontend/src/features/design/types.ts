@@ -128,6 +128,11 @@ export type DesignAssertion = {
   target_version_sut_id: string | null
   target_api_id: string | null
   database_id: string | null
+  /**
+   * P2 `case_assertion` id. The frozen design view does not return it yet, so
+   * the visual config UI also falls back to existing visual_assertion rows.
+   */
+  case_assertion_id?: string
 }
 
 export type DesignSourceKind = "requirement" | "code" | "page" | "api" | "knowledge"

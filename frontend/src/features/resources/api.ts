@@ -3,6 +3,8 @@ import { apiDelete, apiGet, apiGetPage, apiPatch, apiPost } from "@/lib/api-clie
 import type {
   AccountFormValues,
   ApiFormValues,
+  CodeProposal,
+  CodeProposalResult,
   CodeRepository,
   DatabaseFormValues,
   EnvironmentFormValues,
@@ -324,4 +326,48 @@ export function updateRepository(
 
 export function deleteRepository(id: string): Promise<void> {
   return apiDelete<void>(`/api/resources/code-repos/${encodeURIComponent(id)}`)
+}
+
+// --- page/API proposals (P5) ----------------------------------------------
+
+/**
+ * Generates proposed pages/APIs from indexed code facts and execution network
+ * evidence (spec §8.1). The optional `repoId` narrows a multi-repo version;
+ * omitted means the server walks every bound repository.
+ */
+export function generatePageApiProposals(
+  versionId: string,
+  options: { repoId?: string } = {},
+): Promise<CodeProposalResult> {
+  const body = options.repoId !== undefined ? { repoId: options.repoId } : undefined
+  return apiPost<CodeProposalResult>(
+    `/api/versions/${encodeURIComponent(versionId)}/code/page-api-proposals`,
+    body,
+  )
+}
+
+/** Lists the version's `status=proposed` pages/APIs with their source/evidence. */
+export async function listPageApiProposals(versionId: string): Promise<CodeProposal[]> {
+  const page = await apiGetPage<CodeProposal>(
+    `/api/versions/${encodeURIComponent(versionId)}/code/page-api-proposals`,
+  )
+  return page.items
+}
+
+/** Admin-only: proposed page → approved (409 when the state changed). */
+export function confirmPageProposal(id: string): Promise<SutPage> {
+  return apiPost<SutPage>(`/api/resources/pages/${encodeURIComponent(id)}/confirm`)
+}
+
+export function rejectPageProposal(id: string): Promise<SutPage> {
+  return apiPost<SutPage>(`/api/resources/pages/${encodeURIComponent(id)}/reject`)
+}
+
+/** Admin-only: proposed API → approved/rejected. */
+export function confirmApiProposal(id: string): Promise<SutApi> {
+  return apiPost<SutApi>(`/api/resources/apis/${encodeURIComponent(id)}/confirm`)
+}
+
+export function rejectApiProposal(id: string): Promise<SutApi> {
+  return apiPost<SutApi>(`/api/resources/apis/${encodeURIComponent(id)}/reject`)
 }

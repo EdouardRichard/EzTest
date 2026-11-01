@@ -70,6 +70,8 @@ export type EvidenceKind =
   | "db"
   | "download"
   | "text"
+  | "visual_actual"
+  | "visual_diff"
 
 export type StepResultStatus = "pending" | "running" | "passed" | "failed" | "blocked" | "skipped"
 
@@ -182,7 +184,11 @@ export type CaseRunSummary = {
   step_failed?: number
   evidence_count?: number
   human_request_id?: string | null
+  /** P5 visual counters (spec §7.3); `visual_skipped` stays compatible. */
   visual_skipped?: number
+  visual_passed?: number
+  visual_failed?: number
+  visual_inconclusive?: number
 }
 
 /** `CaseRunView` (spec §9.3). */

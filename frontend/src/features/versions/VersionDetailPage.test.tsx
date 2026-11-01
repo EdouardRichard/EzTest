@@ -4,7 +4,7 @@ import "@testing-library/jest-dom/vitest"
 
 import { ApiError } from "@/lib/api-client"
 
-import type { Version, VersionTab } from "./types"
+import type { Version } from "./types"
 
 const api = vi.hoisted(() => ({
   listVersions: vi.fn(),
@@ -131,6 +131,17 @@ vi.mock("@/features/chain/ChainTab", async () => {
         "data-version-id": props.versionId,
       })
     },
+  }
+})
+
+vi.mock("@/features/code-intel/CodeTab", async () => {
+  const React = await import("react")
+  return {
+    CodeTab: (props: { versionId: string }) =>
+      React.createElement("div", {
+        "data-testid": "code-workspace",
+        "data-version-id": props.versionId,
+      }),
   }
 })
 
@@ -426,15 +437,35 @@ describe("VersionDetailPage", () => {
     )
   })
 
-  it.each([["code", "代码与变更将在 P5 阶段提供"]] as const)(
-    "keeps the %s placeholder for its real phase copy",
-    async (tab, copy) => {
-      render(<VersionDetailPage versionId="2001" initialTab={tab as VersionTab} />)
+  it("honours a deep-linked code tab and mounts the code workspace", async () => {
+    search.params = new URLSearchParams(
+      "tab=code&repo=1201&analysis=7001&candidate=8101&anchor=8201&fact=9101",
+    )
 
-      await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
-      expect(screen.getByText(copy)).toBeInTheDocument()
-    },
-  )
+    render(<VersionDetailPage versionId="2001" initialTab="code" />)
+
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+    expect(screen.getByRole("tab", { name: "代码与变更" })).toHaveAttribute("aria-selected", "true")
+    const workspace = screen.getByTestId("code-workspace")
+    expect(workspace).toHaveAttribute("data-version-id", "2001")
+    expect(screen.queryByText("代码与变更将在 P5 阶段提供")).not.toBeInTheDocument()
+    expect(navigation.replace).not.toHaveBeenCalled()
+  })
+
+  it("keeps code deep links when switching to the code tab", async () => {
+    search.params = new URLSearchParams(
+      "tab=overview&repo=1201&analysis=7001&candidate=8101&anchor=8201&fact=9101",
+    )
+
+    render(<VersionDetailPage versionId="2001" />)
+    await screen.findByRole("heading", { name: "订单中心 · 2026 Q4 迭代" })
+
+    fireEvent.click(screen.getByRole("tab", { name: "代码与变更" }))
+
+    expect(navigation.replace).toHaveBeenCalledWith(
+      "/versions/2001?tab=code&repo=1201&analysis=7001&candidate=8101&anchor=8201&fact=9101",
+    )
+  })
 
   it("falls back to the overview tab for an unknown deep link", async () => {
     render(<VersionDetailPage versionId="2001" initialTab={"unknown" as never} />)

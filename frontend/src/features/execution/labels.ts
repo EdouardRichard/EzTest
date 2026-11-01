@@ -130,6 +130,8 @@ export const EVIDENCE_KIND_LABEL: Record<EvidenceKind, string> = {
   db: "数据库",
   download: "下载",
   text: "文本",
+  visual_actual: "视觉实际截图",
+  visual_diff: "视觉差异图",
 }
 
 export const STEP_STATUS_LABEL: Record<StepResultStatus, string> = {
