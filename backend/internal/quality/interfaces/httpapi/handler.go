@@ -38,6 +38,10 @@ type Handler struct {
 // New builds the quality HTTP handler.
 func New(service Service) *Handler { return &Handler{service: service} }
 
+// *qualityapp.Service must satisfy the handler's local Service port; the
+// assembly root relies on this when wiring Task 22.
+var _ Service = (*qualityapp.Service)(nil)
+
 // ListEvalRuns GET /api/quality/eval-runs (admin).
 func (h *Handler) ListEvalRuns(w http.ResponseWriter, r *http.Request) {
 	if _, err := requireAdmin(r); err != nil {

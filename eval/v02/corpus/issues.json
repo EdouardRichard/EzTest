@@ -1,0 +1,24 @@
+{
+  "corpus_version": "v02-2026-11-01.1",
+  "scenarios": [
+    {
+      "title": "订单状态筛选结果未刷新",
+      "source": "ai",
+      "expected_true_positive": true
+    },
+    {
+      "title": "退款入口权限判断错误",
+      "source": "ai",
+      "expected_true_positive": true
+    },
+    {
+      "title": "退款入口金额展示错误",
+      "source": "ai",
+      "expected_true_positive": true
+    }
+  ],
+  "expected": {
+    "ai_issue_count": 3,
+    "true_positive_count": 3
+  }
+}

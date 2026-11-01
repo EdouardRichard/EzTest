@@ -1,0 +1,30 @@
+{
+  "corpus_version": "v02-2026-11-01.1",
+  "repository": {
+    "base_commit": "1111111111111111111111111111111111111111",
+    "head_commit": "2222222222222222222222222222222222222222",
+    "changed_files": [
+      "web/src/orders/OrderList.tsx",
+      "web/src/orders/RefundEntry.tsx"
+    ]
+  },
+  "expected": [
+    {
+      "requirement_key": "R1",
+      "case_title": "登录后展示订单列表",
+      "changed_file": "web/src/orders/OrderList.tsx",
+      "expected_selected": true
+    },
+    {
+      "requirement_key": "R3",
+      "case_title": "订单详情展示退款入口",
+      "changed_file": "web/src/orders/RefundEntry.tsx",
+      "expected_selected": true
+    }
+  ],
+  "expected_counts": {
+    "impact_expected": 2,
+    "impact_selected": 2
+  },
+  "note": "impact_expected=真值需求数；impact_selected=真实 run 中被选中的需求数；hit=交集。"
+}
