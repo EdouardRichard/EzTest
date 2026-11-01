@@ -66,7 +66,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/contentstore"
 )
 
-var version = "0.2.0-p4"
+var version = "0.2.0-p5"
 
 func hostName() string {
 	name, err := os.Hostname()
@@ -513,8 +513,14 @@ func main() {
 		llmapp.WithChatClient(llminfra.NewClient()), llmapp.WithSettingsReader(settingsSvc))
 	storageSvc := storageapp.New(storagepg.New(pool), storagepg.NewFileStore(), settingsSvc, ids, auditSvc, eventSvc)
 	resourceSvc := resourceapp.New(resourcepg.New(pool), ids, clk, nil, auditSvc, eventSvc)
+	// P5 code baseline resolution: the version context resolves a bound
+	// repository's HEAD through the read-only codeintel git layer. The adapter
+	// is constructed before the service and completed right after it.
+	p5Git := newP5GitClient()
+	p5Bindings := newP5CodeBindings(p5Git, resourceSvc)
 	versionRepo := versionpg.New(pool, ids)
-	versionSvc := versionapp.New(versionRepo, resourceSvc, ids, clk, auditSvc, eventSvc, nil)
+	versionSvc := versionapp.New(versionRepo, resourceSvc, ids, clk, auditSvc, eventSvc, p5Bindings)
+	p5Bindings.SetVersionService(versionSvc, versionRepo)
 	resourceSvc.SetUsageChecker(versionSvc)
 	designRepo := designpg.New(pool)
 	designStale := designapp.NewStaleService(designRepo, clk, auditSvc, eventSvc)
@@ -567,6 +573,20 @@ func main() {
 	executionGaps := executionadapters.NewGapEnsurer(workQueue, requirementSvc)
 	executionTeamRoom := executionadapters.NewTeamRoomAdapter(teamRoom)
 	executionCoverage := executionCoverageAdapter{requirements: requirementSvc}
+	// The delivery issue repository is created before the P5 contexts because
+	// code anchors validate issue subjects through a read-only adapter.
+	issueRepo := deliverypg.NewIssueRepository(pool)
+
+	// P5 codeintel + visual contexts. Both are constructed here (after the P3
+	// repositories they read, before the P3 case runner that consumes the
+	// visual assert port) and started later with the process.
+	p5 := newP5Runtime(ctx, p5RuntimeDeps{
+		Pool: pool, LLM: llmSvc, IDs: ids, Clock: clk, Audit: auditSvc, Events: eventSvc,
+		Settings: settingsSvc, Resource: resourceSvc, Versions: versionSvc,
+		VersionRepo: versionRepo, Requirements: requirementSvc, Design: designRepo,
+		Issues: issueRepo, Execution: executionRepo, Content: executionContent,
+		Queue: workQueue, Bindings: p5Bindings, InstanceID: instanceID,
+	})
 
 	executorURL, _ := settingsSvc.String(ctx, executionapp.SettingExecutorURL)
 	executorToken, _ := settingsSvc.String(ctx, executionapp.SettingExecutorToken)
@@ -611,6 +631,7 @@ func main() {
 		Gaps:        executionGaps,
 		TeamRoom:    executionTeamRoom,
 		Human:       executionHumans,
+		Visual:      p5.VisualPort,
 		Settings:    settingsSvc,
 		Clock:       clk,
 		IDs:         ids,
@@ -709,7 +730,6 @@ func main() {
 	// P4 delivery/chain/steward composition. The composition root is the only
 	// place that knows every context; the cross-context reads go through the
 	// application adapters, never through another context's tables.
-	issueRepo := deliverypg.NewIssueRepository(pool)
 	analysisRepo := deliverypg.NewAnalysisRepository(pool)
 	reportRepo := deliverypg.NewReportRepository(pool)
 	closureRepo := versionpg.NewClosureRepository(pool)
@@ -816,6 +836,10 @@ func main() {
 	if _, err := agentapp.EnsureProfiles(ctx, runtimeRepo); err != nil {
 		log.Fatalf("eztest: seed agent profiles: %v", err)
 	}
+	// The P5 tool deps bind the constructed services to this process; the
+	// execution.visual_assert group resolves its port from the case runner.
+	p5Tools := p5.Tools
+	p5Tools.VisualAssert = executionRunner
 	runner := agentapp.NewRunner(agentapp.RunnerDeps{
 		Runtime:      runtimeRepo,
 		Chat:         llmSvc,
@@ -835,8 +859,9 @@ func main() {
 			Resource:    ports,
 			Design:      designadapter.New(designGraph),
 			Execution:   executionRunner,
+			P5:          p5Tools,
 		},
-		TaskProvider:    executionadapters.NewTaskProvider(executionRunner),
+		TaskProvider:    executionadapters.NewTaskProvider(executionRunner, p5.VisualConfigs),
 		RunCanceller:    executionRunner,
 		ReportFinalizer:      p4ReportFinalizer{service: reportSvc},
 		RequirementFinalizer: versionapp.NewClosureFinalizer(closureSvc),
@@ -846,6 +871,13 @@ func main() {
 		agentapp.WithWorkerEvents(eventSvc),
 		agentapp.WithWorkerRunSink(executionadapters.NewRunSink(executionRunner)))
 	var background sync.WaitGroup
+	background.Add(1)
+	go func() {
+		defer background.Done()
+		if err := p5.Worker.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("eztest: codeintel worker stopped: %v", err)
+		}
+	}()
 	background.Add(1)
 	go func() {
 		defer background.Done()
@@ -904,6 +936,8 @@ func main() {
 		Chain:         chainHandler,
 		Closure:       closureSvc,
 		VersionClose:  versionCloseSvc,
+		CodeIntel:     p5.CodeIntel,
+		Visual:        p5.Visual,
 	})
 
 	srv := &http.Server{

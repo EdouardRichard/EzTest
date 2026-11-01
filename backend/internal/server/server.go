@@ -10,6 +10,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/audit/interfaces/httpapi"
 	chainapi "github.com/EdouardRichard/EzTest/backend/internal/chain/interfaces/httpapi"
+	codeintelapi "github.com/EdouardRichard/EzTest/backend/internal/codeintel/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
 	deliveryapi "github.com/EdouardRichard/EzTest/backend/internal/delivery/interfaces/httpapi"
 	designapp "github.com/EdouardRichard/EzTest/backend/internal/design/application"
@@ -30,8 +31,20 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/storage/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/version/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/version/interfaces/httpapi"
+	visualapi "github.com/EdouardRichard/EzTest/backend/internal/visual/interfaces/httpapi"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// CodeIntelHandlers groups the P5 code-intelligence HTTP surfaces. The
+// composition root builds it only when the codeintel context is wired; a nil
+// group keeps a P0-P4 deployment unchanged.
+type CodeIntelHandlers struct {
+	Index     *codeintelapi.Handler
+	Anchors   *codeintelapi.AnchorHandler
+	Reviews   *codeintelapi.ReviewHandler
+	Impact    *codeintelapi.ImpactHandler
+	Proposals *codeintelapi.ProposalHandler
+}
 
 // Deps is the fully constructed application surface the HTTP layer exposes.
 type Deps struct {
@@ -60,18 +73,27 @@ type Deps struct {
 	Chain        *chainapi.Handler
 	Closure      *versionapp.ClosureService
 	VersionClose *versionapp.VersionCloseService
+	// P5 code-intelligence and visual surfaces. They are optional and are
+	// always mounted behind the bearer authentication middleware.
+	CodeIntel *CodeIntelHandlers
+	Visual    *visualapi.Handler
 }
 
 // New assembles the HTTP middleware chain and every P0 route.
 func New(deps Deps) http.Handler {
 	mux := http.NewServeMux()
 
-	executorURL, _ := deps.Settings.String(context.Background(), "execution.executor_url")
+	executorURL := ""
+	if deps.Settings != nil {
+		executorURL, _ = deps.Settings.String(context.Background(), "execution.executor_url")
+	}
 	health := &Health{
 		Version:        deps.Version,
-		DB:             deps.Pool,
 		SettingsLoaded: true,
 		ExecutorURL:    executorURL,
+	}
+	if deps.Pool != nil {
+		health.DB = deps.Pool
 	}
 	health.Register(mux)
 
@@ -100,6 +122,8 @@ func New(deps Deps) http.Handler {
 	registerVersionP4Routes(mux, authenticated, versionHandler, requirementHandler)
 	registerDeliveryRoutes(mux, authenticated, deps.Delivery)
 	registerChainRoutes(mux, authenticated, deps.Chain)
+	registerCodeIntelRoutes(mux, authenticated, deps.CodeIntel)
+	registerVisualRoutes(mux, authenticated, admin, deps.Visual)
 
 	return RequestID(Recover(Logging(CORS(deps.Config)(mux))))
 }
@@ -261,6 +285,14 @@ func registerResourceRoutes(mux *http.ServeMux, authenticated, admin func(http.H
 	mux.Handle("GET /api/resources/code-repos/{id}", authenticated(http.HandlerFunc(h.GetRepository)))
 	mux.Handle("PATCH /api/resources/code-repos/{id}", authenticated(http.HandlerFunc(h.UpdateRepository)))
 	mux.Handle("DELETE /api/resources/code-repos/{id}", authenticated(http.HandlerFunc(h.DeleteRepository)))
+
+	// P5 page/API proposal lifecycle (spec §4.2 #26-#29): the AI/code
+	// candidate writers are open to logged-in users, confirmation/rejection is
+	// admin-only.
+	mux.Handle("POST /api/resources/pages/{pageId}/confirm", admin(http.HandlerFunc(h.ConfirmPage)))
+	mux.Handle("POST /api/resources/pages/{pageId}/reject", admin(http.HandlerFunc(h.RejectPage)))
+	mux.Handle("POST /api/resources/apis/{apiId}/confirm", admin(http.HandlerFunc(h.ConfirmAPI)))
+	mux.Handle("POST /api/resources/apis/{apiId}/reject", admin(http.HandlerFunc(h.RejectAPI)))
 }
 
 // registerExecutionRoutes mounts the P3 execution API (21 path items / 22
@@ -319,4 +351,42 @@ func registerChainRoutes(mux *http.ServeMux, authenticated func(http.Handler) ht
 		return
 	}
 	mux.Handle("GET /api/versions/{versionId}/exploration-chain", authenticated(http.HandlerFunc(h.Read)))
+}
+
+// registerCodeIntelRoutes mounts the P5 code-intelligence surfaces (spec §4.2
+// ops #1-#25). Each handler is self-contained and all routes stay behind the
+// bearer middleware; a nil group leaves a P0-P4 deployment unchanged.
+func registerCodeIntelRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *CodeIntelHandlers) {
+	if h == nil {
+		return
+	}
+	if h.Index != nil {
+		h.Index.Register(mux, authenticated)
+	}
+	if h.Anchors != nil {
+		h.Anchors.Register(mux, authenticated)
+	}
+	if h.Reviews != nil {
+		h.Reviews.Register(mux, authenticated)
+	}
+	if h.Impact != nil {
+		h.Impact.Register(mux, authenticated)
+	}
+	if h.Proposals != nil {
+		h.Proposals.Register(mux, authenticated)
+	}
+}
+
+// registerVisualRoutes mounts the P5 visual API (spec §4.2 ops #30-#38).
+// Configuration/read routes require a logged-in user; baseline approval is
+// admin-only. A nil handler leaves a P0-P4 deployment unchanged.
+func registerVisualRoutes(
+	mux *http.ServeMux,
+	authenticated, admin func(http.Handler) http.Handler,
+	h *visualapi.Handler,
+) {
+	if h == nil {
+		return
+	}
+	h.Register(mux, authenticated, admin)
 }
