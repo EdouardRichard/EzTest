@@ -99,14 +99,17 @@ type IntentView struct {
 
 // CaseRunSummaryView is the stable subset of case_run.summary.
 type CaseRunSummaryView struct {
-	VerdictReason   string  `json:"verdict_reason"`
-	AssertionTotal  int     `json:"assertion_total"`
-	AssertionFailed int     `json:"assertion_failed"`
-	StepTotal       int     `json:"step_total"`
-	StepFailed      int     `json:"step_failed"`
-	EvidenceCount   int     `json:"evidence_count"`
-	VisualSkipped   int     `json:"visual_skipped"`
-	HumanRequestID  *string `json:"human_request_id"`
+	VerdictReason      string  `json:"verdict_reason"`
+	AssertionTotal     int     `json:"assertion_total"`
+	AssertionFailed    int     `json:"assertion_failed"`
+	StepTotal          int     `json:"step_total"`
+	StepFailed         int     `json:"step_failed"`
+	EvidenceCount      int     `json:"evidence_count"`
+	VisualSkipped      int     `json:"visual_skipped"`
+	VisualPassed       int     `json:"visual_passed"`
+	VisualFailed       int     `json:"visual_failed"`
+	VisualInconclusive int     `json:"visual_inconclusive"`
+	HumanRequestID     *string `json:"human_request_id"`
 }
 
 // CaseRunView is the case_run projection (spec §9.3).
@@ -273,14 +276,17 @@ func toCaseRunView(run execution.CaseRun, meta caseMeta, versionSUTIDs []int64, 
 		FailureClass:  string(run.FailureClass),
 		Attempts:      run.Attempts,
 		Summary: CaseRunSummaryView{
-			VerdictReason:   run.Summary.VerdictReason,
-			AssertionTotal:  run.Summary.AssertionTotal,
-			AssertionFailed: run.Summary.AssertionFailed,
-			StepTotal:       run.Summary.StepTotal,
-			StepFailed:      run.Summary.StepFailed,
-			EvidenceCount:   run.Summary.EvidenceCount,
-			VisualSkipped:   run.Summary.VisualSkipped,
-			HumanRequestID:  optionalIDString(run.Summary.HumanRequestID),
+			VerdictReason:      run.Summary.VerdictReason,
+			AssertionTotal:     run.Summary.AssertionTotal,
+			AssertionFailed:    run.Summary.AssertionFailed,
+			StepTotal:          run.Summary.StepTotal,
+			StepFailed:         run.Summary.StepFailed,
+			EvidenceCount:      run.Summary.EvidenceCount,
+			VisualSkipped:      run.Summary.VisualSkipped,
+			VisualPassed:       run.Summary.VisualPassed,
+			VisualFailed:       run.Summary.VisualFailed,
+			VisualInconclusive: run.Summary.VisualInconclusive,
+			HumanRequestID:     optionalIDString(run.Summary.HumanRequestID),
 		},
 		StartedAt:     formatOptionalTime(run.StartedAt),
 		FinishedAt:    formatOptionalTime(run.FinishedAt),
