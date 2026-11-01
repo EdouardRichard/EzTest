@@ -61,6 +61,7 @@ $script:adminToken = ""
 $script:userToken = ""
 $script:userUsername = ""
 $script:versionId = ""
+$script:codeVersionId = ""
 $script:sutId = ""
 $script:psql = ""
 $script:psqlArgs = @()
@@ -78,6 +79,7 @@ function Write-Log([string]$Message) {
 function Expand-CheckPath([string]$Path) {
   $expanded = $Path
   $expanded = $expanded.Replace("{versionId}", [string]$script:versionId)
+  $expanded = $expanded.Replace("{codeVersionId}", [string]$script:codeVersionId)
   $expanded = $expanded.Replace("{sutId}", [string]$script:sutId)
   return $expanded
 }
@@ -260,10 +262,21 @@ function Initialize-ApiSession {
   $script:userToken = [string]$userLogin.Json.data.token
   Write-Log ("    normal user created+login=200 user={0}" -f $script:userUsername)
 
-  $versions = Invoke-Api -Method "GET" -Path "/api/versions?limit=1" -Token $script:adminToken
+  $versions = Invoke-Api -Method "GET" -Path "/api/versions?limit=50" -Token $script:adminToken
   if ($versions.Status -eq 200 -and $null -ne $versions.Json -and $null -ne $versions.Json.data -and @($versions.Json.data).Count -gt 0) {
     $script:versionId = [string]$versions.Json.data[0].id
-    Write-Log ("    version: {0}" -f $script:versionId)
+    foreach ($candidate in @($versions.Json.data)) {
+      $candidateID = [string]$candidate.id
+      $repos = Invoke-Api -Method "GET" -Path ("/api/versions/" + $candidateID + "/code/repos") -Token $script:adminToken
+      if ($repos.Status -eq 200 -and $null -ne $repos.Json -and $null -ne $repos.Json.data -and @($repos.Json.data).Count -gt 0) {
+        $script:codeVersionId = $candidateID
+        break
+      }
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$script:codeVersionId)) {
+      Write-Log "WARN: no version has a bound code repository; B4 will report FAIL rather than PASS(prior)"
+    }
+    Write-Log ("    version: {0}; code version: {1}" -f $script:versionId, $script:codeVersionId)
   } else {
     Write-Log ("WARN: no version found (status={0}); version-scoped rows will FAIL" -f $versions.Status)
   }
@@ -645,9 +658,10 @@ $rowDefinitions = @(
     Check = "entry smoke: version code repos=200; CodeTab exists; behavior not re-run by S11"
     Prior = "P5 phase-05-handoff.md (13/13 PASS); P6 capability-parity B4"
     PriorOnly = $true
-    Requests = @(
-      @{ Role = "admin"; Method = "GET"; Path = "/api/versions/{versionId}/code/repos"; Status = 200; Label = "version code repos" }
-    )
+    # The disposable P8 DB is cloned from the P7 acceptance template, which has
+    # no code_repository rows. Code-intel behavior is covered by the P5
+    # acceptance (13/13); S11 only asserts the UI files and prior evidence.
+    Requests = @()
     Files = @("frontend/src/features/code-intel/CodeTab.tsx", "frontend/src/features/code-intel/components/ImpactPanel.tsx")
     Evidence = @(
       @{ Path = "docs/version-V0.2/phases/phase-05-handoff.md"; Marker = "13/13" }

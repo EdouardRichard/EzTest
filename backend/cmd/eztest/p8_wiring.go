@@ -51,11 +51,13 @@ func runP8RetentionWorker(
 	}
 	// One pass at startup makes the retention effect observable without waiting
 	// for a full interval; subsequent passes follow the configured daily loop.
-	runOnce := func() {
+	// The startup pass retries until this replica wins the leader gate, otherwise
+	// a replica that starts follower would not clean up for a whole interval.
+	runOnce := func() bool {
 		now := time.Now().UTC()
 		auditCutoff := now.Add(-time.Duration(auditDays(ctx)) * 24 * time.Hour)
 		eventCutoff := now.Add(-time.Duration(eventDays(ctx)) * 24 * time.Hour)
-		p7RunGated(gate, func() {
+		return p7RunGated(gate, func() {
 			result, err := service.Run(ctx, auditCutoff, eventCutoff)
 			if err != nil && ctx.Err() == nil && logf != nil {
 				logf("retention worker: run failed: %v", err)
@@ -65,7 +67,15 @@ func runP8RetentionWorker(
 			}
 		})
 	}
-	runOnce()
+	for !runOnce() {
+		timer := time.NewTimer(2 * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
 	for {
 		wait := 24 * time.Hour
 		if interval != nil {
