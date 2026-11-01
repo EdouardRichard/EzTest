@@ -105,6 +105,11 @@ func skipRateLimit(path string) bool {
 		return true
 	case path == "/api/stream" || strings.HasPrefix(path, "/api/stream/"):
 		return true
+	case strings.HasPrefix(path, "/api/internal/"):
+		// Executor push registration/heartbeat/claim traffic is control-plane
+		// traffic between EzTest replicas, not a user request; limiting it can
+		// starve the bucket and stop executors from registering.
+		return true
 	default:
 		return false
 	}
