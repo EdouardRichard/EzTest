@@ -88,10 +88,12 @@ type Deps struct {
 // P6Handlers groups the P6 read-model HTTP surfaces. Agent Center handlers are
 // added by the Agent Center wiring once that context lands.
 type P6Handlers struct {
-	Quality *qualityapi.Handler
-	Search  *searchapi.Handler
-	Todos   *workspaceapi.Handler
-	Global  *deliveryapi.GlobalHandler
+	Quality     *qualityapi.Handler
+	Search      *searchapi.Handler
+	Todos       *workspaceapi.Handler
+	Global      *deliveryapi.GlobalHandler
+	AgentCenter *agentapi.AgentCenterHandler
+	Profiles    *agentapi.ProfileHandler
 }
 
 // New assembles the HTTP middleware chain and every P0 route.
@@ -161,6 +163,12 @@ func registerP6Routes(mux *http.ServeMux, authenticated, admin func(http.Handler
 	}
 	if h.Global != nil {
 		deliveryapi.RegisterGlobal(mux, authenticated, h.Global)
+	}
+	if h.AgentCenter != nil {
+		agentapi.RegisterAgentCenterRoutes(mux, authenticated, h.AgentCenter)
+	}
+	if h.Profiles != nil {
+		agentapi.RegisterProfileRoutes(mux, admin, h.Profiles)
 	}
 }
 

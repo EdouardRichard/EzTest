@@ -849,6 +849,15 @@ func main() {
 	if _, err := agentapp.EnsureProfiles(ctx, runtimeRepo); err != nil {
 		log.Fatalf("eztest: seed agent profiles: %v", err)
 	}
+	if err := ensurePromptRevisions(ctx, runtimeRepo); err != nil {
+		log.Fatalf("eztest: seed agent prompt revisions: %v", err)
+	}
+	p6Agent, err := newP6AgentRuntime(pool, runtimeRepo, p6Read.VersionQuery, llmSvc, auditSvc)
+	if err != nil {
+		log.Fatalf("eztest: wire P6 agent centre: %v", err)
+	}
+	p6Read.Handlers.AgentCenter = p6Agent.AgentCenter
+	p6Read.Handlers.Profiles = p6Agent.Profiles
 	// The P5 tool deps bind the constructed services to this process; the
 	// execution.visual_assert group resolves its port from the case runner.
 	p5Tools := p5.Tools
