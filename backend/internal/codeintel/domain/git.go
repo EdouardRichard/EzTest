@@ -1,5 +1,7 @@
 package codeintel
 
+import "time"
+
 // TreeEntry is one git ls-tree entry (spec §5.1). Unsupported marks symlink and
 // submodule entries, which never enter T1 analysis.
 type TreeEntry struct {
@@ -55,4 +57,15 @@ type FileDiff struct {
 	Truncated bool
 	Binary    bool
 	Deleted   bool
+}
+
+// CommitInfo is one read-only git commit metadata row (no file content). It is
+// returned by the additive CommitReader port used by the T0 commit view.
+type CommitInfo struct {
+	SHA         string
+	Message     string
+	AuthorName  string
+	AuthoredAt  time.Time
+	CommittedAt time.Time
+	Parents     []string
 }

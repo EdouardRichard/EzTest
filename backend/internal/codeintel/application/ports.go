@@ -26,6 +26,27 @@ type GitClient interface {
 	FileDiff(ctx context.Context, repoPath, base, head, path string, maxBytes int) (codeintel.FileDiff, error)
 }
 
+// CommitReader is the additive P5-t7 read-only commit-metadata surface used by
+// the T0 commit view. It is a separate port (not a GitClient method) so
+// existing GitClient fakes stay valid. Implemented by infrastructure/gitx.
+type CommitReader interface {
+	Commit(ctx context.Context, repoPath, sha string, maxMessage int) (codeintel.CommitInfo, error)
+}
+
+// FileWindowReader is the additive P5-t8 bulk file read used by T1 analysis.
+// It reads up to maxBytes of ordinary UTF-8 text without the API's 400-line
+// window (maxLines<=0 means no line cap) and rejects larger blobs as
+// file_too_large. Implemented by infrastructure/gitx.
+type FileWindowReader interface {
+	ReadFileWindow(ctx context.Context, repoPath, commit, path string, maxBytes, maxLines int) (codeintel.FileWindow, error)
+}
+
+// ModelResolver optionally reports the model name a FactExtractor resolved for
+// its calls; the analysis row records it without a chat round-trip per file.
+type ModelResolver interface {
+	Model(ctx context.Context) (string, error)
+}
+
 // FactExtractor is the T1 AI layer: per-file fact extraction and the single
 // impact inference call (spec §5.2/§5.4). The model never supplies excerpt
 // hashes; the service re-reads the commit content.
@@ -201,15 +222,20 @@ type ResourceReader interface {
 	CodeRepository(ctx context.Context, repoID int64) (RepoRef, error)
 }
 
-// RepoRef is one code_repository row with its index configuration.
+// RepoRef is one code_repository row with its index configuration. The
+// CreatedBy/CreatedAt/UpdatedAt fields are the additive P5-T7 view fields used
+// by CodeRepoStatusView.repository.
 type RepoRef struct {
-	ID      int64
-	Name    string
-	Path    string
-	Branch  string
-	Include []string
-	Exclude []string
-	Status  string
+	ID        int64
+	Name      string
+	Path      string
+	Branch    string
+	Include   []string
+	Exclude   []string
+	Status    string
+	CreatedBy int64
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // PageRef is one version SUT page.
