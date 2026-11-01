@@ -306,8 +306,12 @@ func (s *Recovery) cleanupContexts(ctx context.Context) error {
 		return mapExecutionError(err, "sut context")
 	}
 	for _, item := range items {
+		executorID := int64(0)
+		if item.ExecutorID != nil {
+			executorID = *item.ExecutorID
+		}
 		if item.BrowserContextID != "" {
-			_ = s.executor.DeleteContext(ctx, item.BrowserContextID)
+			_ = s.executor.DeleteContext(ctx, executorID, item.BrowserContextID)
 		}
 		closedAt := s.now()
 		_, _ = s.contexts.UpdateCAS(ctx, item.ID, func(current *execution.CaseRunSUTContext) error {
@@ -347,7 +351,7 @@ func (s *Recovery) reconcileOrphans(ctx context.Context) error {
 		if _, ok := known[ref.ID]; ok {
 			continue
 		}
-		_ = s.executor.DeleteContext(ctx, ref.ID)
+		_ = s.executor.DeleteContext(ctx, ref.ExecutorID, ref.ID)
 	}
 	return nil
 }
@@ -362,8 +366,12 @@ func (s *Recovery) closeRunContexts(ctx context.Context, caseRunID int64) {
 		return
 	}
 	for _, item := range items {
+		executorID := int64(0)
+		if item.ExecutorID != nil {
+			executorID = *item.ExecutorID
+		}
 		if item.BrowserContextID != "" && s.executor != nil {
-			_ = s.executor.DeleteContext(ctx, item.BrowserContextID)
+			_ = s.executor.DeleteContext(ctx, executorID, item.BrowserContextID)
 		}
 		if item.Status == execution.SUTContextClosed {
 			continue

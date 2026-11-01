@@ -329,6 +329,15 @@ func (r *Registry) List(ctx context.Context) ([]execution.ExecutorInstance, erro
 	return r.repo.List(ctx)
 }
 
+// Get returns one registered executor by id (P8 per-executor routing). It
+// returns execution.ErrNotFound for an unknown id.
+func (r *Registry) Get(ctx context.Context, id int64) (execution.ExecutorInstance, error) {
+	if r.repo == nil {
+		return execution.ExecutorInstance{}, errors.New("execution registry is not configured")
+	}
+	return r.repo.Get(ctx, id)
+}
+
 func (r *Registry) setStatus(ctx context.Context, id int64, status execution.ExecutorStatus) (bool, error) {
 	if r.repo == nil {
 		return false, errors.New("execution registry is not configured")
