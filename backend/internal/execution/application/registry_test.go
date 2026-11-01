@@ -740,3 +740,17 @@ func TestRegistryPushValidation(t *testing.T) {
 		t.Fatal("unsupported heartbeat status must be rejected")
 	}
 }
+
+func TestRegistryGetByID(t *testing.T) {
+	repo := newFakeExecutorRepo()
+	repo.rows[7] = execution.ExecutorInstance{ID: 7, Endpoint: "http://127.0.0.1:14007", Status: execution.ExecutorActive}
+	registry := executionapp.NewRegistry(executionapp.RegistryDeps{Repo: repo})
+
+	row, err := registry.Get(context.Background(), 7)
+	if err != nil || row.ID != 7 || row.Endpoint != "http://127.0.0.1:14007" {
+		t.Fatalf("Get(7) = %+v, %v", row, err)
+	}
+	if _, err := registry.Get(context.Background(), 99); !errors.Is(err, execution.ErrNotFound) {
+		t.Fatalf("Get(99) error = %v, want not found", err)
+	}
+}

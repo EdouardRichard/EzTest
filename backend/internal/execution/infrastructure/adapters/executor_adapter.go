@@ -21,21 +21,40 @@ func errNotConfigured(name string) error {
 // CaseRunner.
 type BrowserAdapter struct {
 	client executorinfra.Client
+	router *ExecutorRouter
 }
 
-// NewBrowserAdapter wires the browser executor adapter.
+// NewBrowserAdapter wires the browser executor adapter with a single client
+// (P3 single-endpoint mode).
 func NewBrowserAdapter(client executorinfra.Client) *BrowserAdapter {
 	return &BrowserAdapter{client: client}
 }
 
+// NewBrowserAdapterWithRouter wires the browser executor adapter with the P8
+// per-executor router. The router takes precedence over client.
+func NewBrowserAdapterWithRouter(router *ExecutorRouter) *BrowserAdapter {
+	return &BrowserAdapter{router: router}
+}
+
 var _ executionapp.BrowserExecutor = (*BrowserAdapter)(nil)
+
+func (a *BrowserAdapter) clientFor(ctx context.Context, executorID int64) (executorinfra.Client, error) {
+	if a.router != nil {
+		return a.router.clientFor(ctx, executorID)
+	}
+	if a.client == nil {
+		return nil, errNotConfigured("executor client")
+	}
+	return a.client, nil
+}
 
 // CreateContext creates one executor browser context and returns its id.
 func (a *BrowserAdapter) CreateContext(ctx context.Context, spec executionapp.BrowserContextSpec) (string, error) {
-	if a.client == nil {
-		return "", errNotConfigured("executor client")
+	client, err := a.clientFor(ctx, spec.ExecutorID)
+	if err != nil {
+		return "", err
 	}
-	info, err := a.client.CreateContext(ctx, executorinfra.CreateContextInput{
+	info, err := client.CreateContext(ctx, executorinfra.CreateContextInput{
 		Key:          spec.Key,
 		AllowedHosts: spec.AllowedHosts,
 		BaseURL:      spec.BaseURL,
@@ -48,11 +67,12 @@ func (a *BrowserAdapter) CreateContext(ctx context.Context, spec executionapp.Br
 }
 
 // Action runs one executor action and maps its envelope.
-func (a *BrowserAdapter) Action(ctx context.Context, contextID, action string, args json.RawMessage) (executionapp.BrowserActionResult, error) {
-	if a.client == nil {
-		return executionapp.BrowserActionResult{}, errNotConfigured("executor client")
+func (a *BrowserAdapter) Action(ctx context.Context, executorID int64, contextID, action string, args json.RawMessage) (executionapp.BrowserActionResult, error) {
+	client, err := a.clientFor(ctx, executorID)
+	if err != nil {
+		return executionapp.BrowserActionResult{}, err
 	}
-	result, err := a.client.Action(ctx, contextID, action, args)
+	result, err := client.Action(ctx, contextID, action, args)
 	if err != nil {
 		return executionapp.BrowserActionResult{}, err
 	}
@@ -79,11 +99,12 @@ func (a *BrowserAdapter) Action(ctx context.Context, contextID, action string, a
 }
 
 // Cancel aborts the in-flight action of one context (best-effort).
-func (a *BrowserAdapter) Cancel(ctx context.Context, contextID string) error {
-	if a.client == nil {
-		return errNotConfigured("executor client")
+func (a *BrowserAdapter) Cancel(ctx context.Context, executorID int64, contextID string) error {
+	client, err := a.clientFor(ctx, executorID)
+	if err != nil {
+		return err
 	}
-	_, err := a.client.Cancel(ctx, contextID)
+	_, err = client.Cancel(ctx, contextID)
 	if isContextNotFound(err) {
 		return nil
 	}
@@ -91,11 +112,12 @@ func (a *BrowserAdapter) Cancel(ctx context.Context, contextID string) error {
 }
 
 // Close deletes one context (best-effort: a missing context is already gone).
-func (a *BrowserAdapter) Close(ctx context.Context, contextID string) error {
-	if a.client == nil {
-		return errNotConfigured("executor client")
+func (a *BrowserAdapter) Close(ctx context.Context, executorID int64, contextID string) error {
+	client, err := a.clientFor(ctx, executorID)
+	if err != nil {
+		return err
 	}
-	err := a.client.Close(ctx, contextID)
+	err = client.Close(ctx, contextID)
 	if isContextNotFound(err) {
 		return nil
 	}
@@ -103,17 +125,18 @@ func (a *BrowserAdapter) Close(ctx context.Context, contextID string) error {
 }
 
 // ListContexts lists the executor contexts (orphan reconciliation).
-func (a *BrowserAdapter) ListContexts(ctx context.Context) ([]executionapp.BrowserContextRef, error) {
-	if a.client == nil {
-		return nil, errNotConfigured("executor client")
+func (a *BrowserAdapter) ListContexts(ctx context.Context, executorID int64) ([]executionapp.BrowserContextRef, error) {
+	client, err := a.clientFor(ctx, executorID)
+	if err != nil {
+		return nil, err
 	}
-	contexts, err := a.client.ListContexts(ctx)
+	contexts, err := client.ListContexts(ctx)
 	if err != nil {
 		return nil, err
 	}
 	refs := make([]executionapp.BrowserContextRef, 0, len(contexts))
 	for _, contextInfo := range contexts {
-		refs = append(refs, executionapp.BrowserContextRef{ID: contextInfo.ID, Key: contextInfo.Key})
+		refs = append(refs, executionapp.BrowserContextRef{ExecutorID: executorID, ID: contextInfo.ID, Key: contextInfo.Key})
 	}
 	return refs, nil
 }
@@ -167,21 +190,38 @@ func (a *ExecutorProbeAdapter) ListContexts(ctx context.Context) ([]executionapp
 // used by pause/cancel/context-TTL cleanup.
 type ExecutorControlAdapter struct {
 	client executorinfra.Client
+	router *ExecutorRouter
 }
 
-// NewExecutorControl wires the executor control adapter.
+// NewExecutorControl wires the executor control adapter with a single client.
 func NewExecutorControl(client executorinfra.Client) *ExecutorControlAdapter {
 	return &ExecutorControlAdapter{client: client}
 }
 
+// NewExecutorControlWithRouter wires the P8 per-executor control adapter.
+func NewExecutorControlWithRouter(router *ExecutorRouter) *ExecutorControlAdapter {
+	return &ExecutorControlAdapter{router: router}
+}
+
 var _ executionapp.ExecutorControl = (*ExecutorControlAdapter)(nil)
 
-// CancelContext aborts an in-flight action; a missing context is a no-op.
-func (a *ExecutorControlAdapter) CancelContext(ctx context.Context, contextID string) error {
-	if a.client == nil {
-		return errNotConfigured("executor client")
+func (a *ExecutorControlAdapter) clientFor(ctx context.Context, executorID int64) (executorinfra.Client, error) {
+	if a.router != nil {
+		return a.router.clientFor(ctx, executorID)
 	}
-	_, err := a.client.Cancel(ctx, contextID)
+	if a.client == nil {
+		return nil, errNotConfigured("executor client")
+	}
+	return a.client, nil
+}
+
+// CancelContext aborts an in-flight action; a missing context is a no-op.
+func (a *ExecutorControlAdapter) CancelContext(ctx context.Context, executorID int64, contextID string) error {
+	client, err := a.clientFor(ctx, executorID)
+	if err != nil {
+		return err
+	}
+	_, err = client.Cancel(ctx, contextID)
 	if isContextNotFound(err) {
 		return nil
 	}
@@ -189,11 +229,12 @@ func (a *ExecutorControlAdapter) CancelContext(ctx context.Context, contextID st
 }
 
 // DeleteContext closes one executor context; a missing context is a no-op.
-func (a *ExecutorControlAdapter) DeleteContext(ctx context.Context, contextID string) error {
-	if a.client == nil {
-		return errNotConfigured("executor client")
+func (a *ExecutorControlAdapter) DeleteContext(ctx context.Context, executorID int64, contextID string) error {
+	client, err := a.clientFor(ctx, executorID)
+	if err != nil {
+		return err
 	}
-	err := a.client.Close(ctx, contextID)
+	err = client.Close(ctx, contextID)
 	if isContextNotFound(err) {
 		return nil
 	}
@@ -202,16 +243,33 @@ func (a *ExecutorControlAdapter) DeleteContext(ctx context.Context, contextID st
 
 // ListContexts lists every executor-side context (orphan reconciliation).
 func (a *ExecutorControlAdapter) ListContexts(ctx context.Context) ([]executionapp.ExecutorContext, error) {
-	if a.client == nil {
-		return nil, errNotConfigured("executor client")
+	clients := []routedClient{}
+	if a.router != nil {
+		routed, err := a.router.clients(ctx)
+		if err != nil {
+			return nil, err
+		}
+		clients = routed
+	} else {
+		client, err := a.clientFor(ctx, 0)
+		if err != nil {
+			return nil, err
+		}
+		clients = []routedClient{{Client: client}}
 	}
-	contexts, err := a.client.ListContexts(ctx)
-	if err != nil {
-		return nil, err
-	}
-	refs := make([]executionapp.ExecutorContext, 0, len(contexts))
-	for _, contextInfo := range contexts {
-		refs = append(refs, executionapp.ExecutorContext{ID: contextInfo.ID, Key: contextInfo.Key})
+	refs := make([]executionapp.ExecutorContext, 0)
+	for _, routed := range clients {
+		contexts, err := routed.Client.ListContexts(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, contextInfo := range contexts {
+			refs = append(refs, executionapp.ExecutorContext{
+				ExecutorID: routed.ExecutorID,
+				ID:         contextInfo.ID,
+				Key:        contextInfo.Key,
+			})
+		}
 	}
 	return refs, nil
 }

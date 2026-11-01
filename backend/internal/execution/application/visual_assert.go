@@ -237,7 +237,7 @@ func (s *CaseRunner) VisualAssert(ctx context.Context, scope tools.Scope, assert
 	if err != nil {
 		return nil, err
 	}
-	actionResult, err := s.browser.Action(ctx, contextID, "visual.compare", args)
+	actionResult, err := s.browser.Action(ctx, caseRunExecutorID(caseRun), contextID, "visual.compare", args)
 	if err != nil {
 		return s.writeVisualFailure(ctx, caseRun, scope, assertion, cfg, reasonForVisualError(err), true)
 	}
