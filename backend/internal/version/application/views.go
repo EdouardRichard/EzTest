@@ -12,7 +12,8 @@ import (
 
 // VersionView is the detail read model returned by Create/Get/Update. Bindings
 // carry nested resource summaries; passwords are never exposed by the resource
-// views.
+// views. ClosedAt/CloseReason carry the P4 close projection (nil/empty while
+// the version is not completed; cleared again by a reopen).
 type VersionView struct {
 	ID                        int64
 	Title                     string
@@ -23,6 +24,8 @@ type VersionView struct {
 	ConversationCount         int
 	PendingDesignCount        int
 	CaseCounts                CaseCounts
+	ClosedAt                  *time.Time
+	CloseReason               string
 	CreatedBy                 int64
 	CreatedAt                 time.Time
 	UpdatedAt                 time.Time

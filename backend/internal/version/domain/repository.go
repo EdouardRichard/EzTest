@@ -60,3 +60,48 @@ type Repository interface {
 	AccountInUse(ctx context.Context, id int64) (bool, error)
 	RepositoryInUse(ctx context.Context, id int64) (bool, error)
 }
+
+// VersionCloseRepository persists the version close/reopen projection (spec
+// §7.3-§7.5). Close flips running -> completed only while holding the version
+// row lock and re-runs the predicate inside that transaction through the
+// recheck callback, so a close cannot commit against an already stale
+// evaluation. ReopenIfCompleted flips completed -> running and clears the close
+// fields; a version in any other status is a no-op.
+type VersionCloseRepository interface {
+	// Get loads one version. It is the read used by Evaluate and by the
+	// reconcile loop.
+	Get(ctx context.Context, id int64) (Version, []Binding, error)
+	// Close completes one running version. The callback runs after the row
+	// lock is acquired and before the conditional UPDATE; a callback error
+	// rolls the transaction back unchanged. A missing version yields
+	// ErrNotFound; a version that is not running yields ErrStateConflict.
+	Close(ctx context.Context, id int64, close VersionCloseFields, recheck func(context.Context, Version) error) (Version, error)
+	// ReopenIfCompleted returns the version after a completed -> running
+	// transition and whether this call changed the row. A version already
+	// running (or still initial) is returned unchanged with changed=false.
+	ReopenIfCompleted(ctx context.Context, id int64, reopenedAt time.Time) (Version, bool, error)
+}
+
+// RequirementClosureRepository persists requirement_closure rounds. Rows are
+// append-only: Close inserts the next close_round and marks the requirement
+// closed in one transaction; Reopen increments the newest row's reopen_count
+// and returns the requirement to draft in one transaction. The unique
+// (requirement_id, close_round) constraint and the requirement row lock make
+// concurrent Close calls mutually exclusive. Close re-runs the closure
+// predicate inside that transaction through the recheck callback, so a close
+// cannot commit against an already stale evaluation.
+type RequirementClosureRepository interface {
+	// Latest returns the newest closure row of one requirement. A requirement
+	// that was never closed yields found=false with a nil error.
+	Latest(ctx context.Context, requirementID int64) (RequirementClosure, bool, error)
+	// Close inserts the next close round and marks the requirement closed. The
+	// callback runs after the requirement row lock is acquired and before the
+	// closure insert; a callback error rolls the transaction back unchanged. A
+	// requirement that is no longer clarified at commit time yields
+	// ErrStateConflict. The returned closure carries the assigned round.
+	Close(ctx context.Context, closure RequirementClosure, requirement Requirement, recheck func(context.Context, Requirement) error) (RequirementClosure, error)
+	// Reopen increments the newest closure's reopen_count and moves the
+	// requirement closed -> draft, clearing closed_at/closed_by_run_id. A
+	// requirement that is not closed yields ErrStateConflict.
+	Reopen(ctx context.Context, requirement Requirement, reopenedAt time.Time) (RequirementClosure, error)
+}

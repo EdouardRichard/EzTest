@@ -109,9 +109,15 @@ func (s *IntentService) EnsureInitialIntents(ctx context.Context, versionID int6
 		if err := intent.Validate(); err != nil {
 			return created, platform.Invalid("intent", "could not build a valid execution intent")
 		}
-		if err := s.intents.Create(ctx, intent); err != nil {
+		if err := s.createIntent(ctx, intent); err != nil {
 			if errors.Is(err, execution.ErrDuplicate) {
 				// A concurrent scan created it; the intent is still covered.
+				continue
+			}
+			if errors.Is(err, execution.ErrRequirementClosed) {
+				// The requirement was closed before this scan created its
+				// initial intent; a closed requirement is terminal, so the
+				// scan skips that case instead of failing the whole version.
 				continue
 			}
 			return created, mapExecutionError(err, "intent")
@@ -171,9 +177,12 @@ func (s *IntentService) CreateManual(ctx context.Context, versionID, caseVersion
 	if err := intent.Validate(); err != nil {
 		return execution.ExecutionIntent{}, platform.Invalid("intent", "could not build a valid execution intent")
 	}
-	if err := s.intents.Create(ctx, intent); err != nil {
+	if err := s.createIntent(ctx, intent); err != nil {
 		if errors.Is(err, execution.ErrDuplicate) {
 			return execution.ExecutionIntent{}, platform.StateConflict("an active intent already exists for this case, environment and purpose")
+		}
+		if errors.Is(err, execution.ErrRequirementClosed) {
+			return execution.ExecutionIntent{}, platform.StateConflict("the requirement is closed; reopen it before creating an execution intent")
 		}
 		return execution.ExecutionIntent{}, mapExecutionError(err, "intent")
 	}
@@ -217,6 +226,35 @@ func (s *IntentService) Cancel(ctx context.Context, intentID, actorID int64) err
 }
 
 var activeIntentStatuses = []execution.IntentStatus{execution.IntentOpen, execution.IntentClaimed, execution.IntentRunning}
+
+// intentCreateAttempts bounds the reopen-and-retry loop used when a version
+// close wins the shared version advisory lock between the service pre-check and
+// the insert.
+const intentCreateAttempts = 3
+
+// createIntent inserts an intent through the repository, which serializes with
+// version close/requirement closure on the version advisory lock. When a
+// concurrent close committed first the repository reports ErrVersionCompleted;
+// the service reopens the version through the version port (P4
+// version.reopened, trigger=execution_intent) and retries so the final state is
+// never a completed version with an active intent. A closed requirement is
+// returned as-is: the callers decide between skipping (reconciler) and a state
+// conflict (manual API).
+func (s *IntentService) createIntent(ctx context.Context, intent execution.ExecutionIntent) error {
+	for attempt := 0; attempt < intentCreateAttempts; attempt++ {
+		err := s.intents.Create(ctx, intent)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, execution.ErrVersionCompleted) {
+			return err
+		}
+		if err := s.versions.Reopen(ctx, intent.VersionID); err != nil {
+			return mapExecutionError(err, "version")
+		}
+	}
+	return platform.StateConflict("the version is being closed; retry creating the execution intent")
+}
 
 func (s *IntentService) publishCreated(ctx context.Context, intent execution.ExecutionIntent, actorID int64) {
 	versionRef := platformid.Format(intent.VersionID)

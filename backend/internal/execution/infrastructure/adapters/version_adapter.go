@@ -16,22 +16,43 @@ import (
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 )
 
-// VersionService is the version application read/write surface consumed by the
-// adapter (*versionapp.Service satisfies it).
+// VersionService is the version application read surface consumed by the
+// adapter (*versionapp.Service satisfies it). Reopening is deliberately not
+// part of this surface: the intent path must use the P4 VersionReopener so the
+// version.reopened projection is published.
 type VersionService interface {
 	Get(ctx context.Context, id int64) (versionapp.VersionView, error)
-	Reopen(ctx context.Context, id int64) error
 }
+
+// VersionReopener is the P4 version reopen surface
+// (*versionapp.VersionCloseService satisfies it). It publishes the
+// version.reopened projection (version + system channels) and marks the version
+// report stale, so the intent path never emits only the P3 status_changed
+// projection.
+type VersionReopener interface {
+	ReopenIfCompleted(ctx context.Context, versionID int64, trigger, reason string) error
+}
+
+// versionReopenTriggerExecutionIntent is the stable P4 reopen trigger owned by
+// the execution intent path (spec §7.5).
+const versionReopenTriggerExecutionIntent = "execution_intent"
 
 // VersionAdapter adapts the version application read model to the execution
 // ports: fingerprint bindings, task-context SUT bindings and API resolution.
 type VersionAdapter struct {
 	versions VersionService
+	reopener VersionReopener
 }
 
-// NewVersionAdapter wires the version adapter.
+// NewVersionAdapter wires the version adapter. SetVersionReopener must be called
+// by the assembly root once the P4 version close service exists.
 func NewVersionAdapter(versions VersionService) *VersionAdapter {
 	return &VersionAdapter{versions: versions}
+}
+
+// SetVersionReopener wires the P4 reopen service (wiring-time only).
+func (a *VersionAdapter) SetVersionReopener(reopener VersionReopener) {
+	a.reopener = reopener
 }
 
 var (
@@ -61,9 +82,16 @@ func (a *VersionAdapter) Get(ctx context.Context, id int64) (executionapp.Versio
 	return binding, nil
 }
 
-// Reopen clears the completed projection of a version (scheduler intent rule).
+// Reopen clears the completed projection of a version through the P4 reopen
+// service: it emits version.reopened (trigger=execution_intent) to version:{id}
+// and system and best-effort marks the version report stale. It fails closed
+// when the P4 service was not wired rather than emitting only the P3
+// version.status_changed projection.
 func (a *VersionAdapter) Reopen(ctx context.Context, id int64) error {
-	return a.versions.Reopen(ctx, id)
+	if a.reopener == nil {
+		return fmt.Errorf("version adapter: P4 version reopen service is not wired")
+	}
+	return a.reopener.ReopenIfCompleted(ctx, id, versionReopenTriggerExecutionIntent, "")
 }
 
 // Resolve returns the task-context bindings (URLs, endpoints, roles, no

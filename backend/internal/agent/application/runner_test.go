@@ -723,9 +723,9 @@ func TestProfileKeyForWorkType(t *testing.T) {
 			t.Fatalf("ProfileKeyForWorkType(%q) = %q/%v, want %q", workType, got, ok, want)
 		}
 	}
-	// P3 mappings live in the P3 contract test; an unregistered later work type
-	// must still not map to a P1/P2 profile.
-	if _, ok := agentapp.ProfileKeyForWorkType("report.wave"); ok {
+	// P3/P4 mappings live in their phase contract tests; an unregistered later
+	// work type must still not map to a P1/P2 profile.
+	if _, ok := agentapp.ProfileKeyForWorkType("report.render_pdf"); ok {
 		t.Fatal("P4+ work type must not map to a P1/P2 profile")
 	}
 }

@@ -68,6 +68,14 @@ func (f *fakeRequirementRepo) Get(_ context.Context, versionID, requirementID in
 	return aggregate, nil
 }
 
+func (f *fakeRequirementRepo) GetRequirement(_ context.Context, requirementID int64) (version.Requirement, error) {
+	requirement, ok := f.requirements[requirementID]
+	if !ok {
+		return version.Requirement{}, version.ErrRequirementNotFound
+	}
+	return requirement, nil
+}
+
 func (f *fakeRequirementRepo) GetMany(_ context.Context, versionID int64, ids []int64) ([]version.RequirementWithCurrent, error) {
 	items := make([]version.RequirementWithCurrent, 0, len(ids))
 	for _, id := range ids {
@@ -861,6 +869,43 @@ func TestRequirementRelationsValidateAndEmit(t *testing.T) {
 		t.Fatal("missing relation target accepted")
 	} else if apiError(t, err).Status != http.StatusNotFound {
 		t.Fatalf("missing target status = %d", apiError(t, err).Status)
+	}
+}
+
+func TestRequirementViewsExposeClosedAt(t *testing.T) {
+	env := newRequirementEnv(t)
+	created := createRequirement(t, env, "Closes later")
+	closedAt := testTime.Add(time.Hour)
+	stored := env.repo.requirements[created.ID]
+	stored.Status = version.RequirementClosed
+	stored.ClosedAt = &closedAt
+	env.repo.requirements[created.ID] = stored
+
+	list, _, err := env.svc.List(requestContext(), env.versionID, "closed", 10, nil)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(list) != 1 || list[0].ClosedAt == nil || !list[0].ClosedAt.Equal(closedAt) {
+		t.Fatalf("list closed_at = %#v", list)
+	}
+
+	detail, err := env.svc.Get(requestContext(), env.versionID, created.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if detail.ClosedAt == nil || !detail.ClosedAt.Equal(closedAt) {
+		t.Fatalf("detail closed_at = %v", detail.ClosedAt)
+	}
+
+	stored.Status = version.RequirementDraft
+	stored.ClosedAt = nil
+	env.repo.requirements[created.ID] = stored
+	reopened, err := env.svc.Get(requestContext(), env.versionID, created.ID)
+	if err != nil {
+		t.Fatalf("Get reopened: %v", err)
+	}
+	if reopened.ClosedAt != nil {
+		t.Fatalf("reopened closed_at = %v", reopened.ClosedAt)
 	}
 }
 

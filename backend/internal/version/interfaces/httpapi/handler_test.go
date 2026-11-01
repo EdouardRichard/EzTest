@@ -20,6 +20,7 @@ var testTime = time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 
 type stubService struct {
 	view         versionapp.VersionView
+	getQueue     []versionapp.VersionView
 	summaries    []versionapp.VersionSummary
 	hasMore      bool
 	err          error
@@ -47,6 +48,11 @@ func (s *stubService) Get(_ context.Context, id int64) (versionapp.VersionView, 
 	s.lastID = id
 	if s.err != nil {
 		return versionapp.VersionView{}, s.err
+	}
+	if len(s.getQueue) > 0 {
+		view := s.getQueue[0]
+		s.getQueue = s.getQueue[1:]
+		return view, nil
 	}
 	return s.view, nil
 }
@@ -516,6 +522,199 @@ func TestUpdateVersionSendsPartialPatch(t *testing.T) {
 	missing := call(t, handler, http.MethodPatch, "/api/versions/999", `{"title":"x"}`, actor())
 	if missing.Code != http.StatusNotFound {
 		t.Fatalf("missing status = %d", missing.Code)
+	}
+}
+
+type versionReopenCall struct {
+	versionID int64
+	trigger   string
+	reason    string
+}
+
+type stubVersionReopenService struct {
+	err   error
+	calls []versionReopenCall
+}
+
+func (s *stubVersionReopenService) ReopenIfCompleted(_ context.Context, versionID int64, trigger, reason string) error {
+	s.calls = append(s.calls, versionReopenCall{versionID: versionID, trigger: trigger, reason: reason})
+	return s.err
+}
+
+var _ versionapi.VersionReopenService = (*stubVersionReopenService)(nil)
+
+func newVersionReopenServer(t *testing.T) (http.Handler, *stubService, *stubVersionReopenService) {
+	t.Helper()
+	stub := &stubService{}
+	reopen := &stubVersionReopenService{}
+	handler := versionapi.New(stub, versionapi.WithVersionReopener(reopen))
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/versions/{versionId}/reopen", handler.Reopen)
+	return mux, stub, reopen
+}
+
+func TestVersionReopenReturnsRunningVersion(t *testing.T) {
+	handler, stub, reopen := newVersionReopenServer(t)
+	closedAt := testTime
+	completed := sampleView()
+	completed.Status = "completed"
+	completed.ClosedAt = &closedAt
+	completed.CloseReason = "all delivery work is done"
+	running := sampleView()
+	running.Status = "running"
+	stub.getQueue = []versionapp.VersionView{completed, running}
+
+	recorder := call(t, handler, http.MethodPost, "/api/versions/101/reopen", `{"reason":"new scope agreed"}`, actor())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if len(reopen.calls) != 1 {
+		t.Fatalf("reopen calls = %#v", reopen.calls)
+	}
+	reopenCall := reopen.calls[0]
+	if reopenCall.versionID != 101 || reopenCall.trigger != versionapp.VersionReopenTriggerManual ||
+		reopenCall.reason != "new scope agreed" {
+		t.Fatalf("reopen call = %#v", reopenCall)
+	}
+	if len(stub.calls) != 2 || stub.calls[0] != "get" || stub.calls[1] != "get" {
+		t.Fatalf("service calls = %#v", stub.calls)
+	}
+	data := dataBody(t, recorder)
+	if data["id"] != "101" || data["status"] != "running" {
+		t.Fatalf("data = %#v", data)
+	}
+	if data["closed_at"] != nil || data["close_reason"] != nil {
+		t.Fatalf("reopened version keeps close projection: %#v", data)
+	}
+}
+
+func TestVersionReopenRejectsNonCompletedVersion(t *testing.T) {
+	handler, stub, reopen := newVersionReopenServer(t)
+	stub.view = sampleView()
+
+	recorder := call(t, handler, http.MethodPost, "/api/versions/101/reopen", `{"reason":"new scope"}`, actor())
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if code := errorBody(t, recorder)["code"]; code != "state_conflict" {
+		t.Fatalf("error = %#v", errorBody(t, recorder))
+	}
+	if len(reopen.calls) != 0 {
+		t.Fatalf("reopen called for a non-completed version: %#v", reopen.calls)
+	}
+	if len(stub.calls) != 1 {
+		t.Fatalf("service calls = %#v", stub.calls)
+	}
+}
+
+func TestVersionReopenValidatesInputAndMapsErrors(t *testing.T) {
+	cases := []struct {
+		name  string
+		path  string
+		body  string
+		actor *platform.Actor
+		want  int
+		field string
+	}{
+		{"missing reason", "/api/versions/101/reopen", `{}`, actor(), 400, "reason"},
+		{"blank reason", "/api/versions/101/reopen", `{"reason":"   "}`, actor(), 400, "reason"},
+		{"malformed body", "/api/versions/101/reopen", `{"reason":`, actor(), 400, "body"},
+		{"invalid version id", "/api/versions/abc/reopen", `{"reason":"x"}`, actor(), 400, "versionId"},
+		{"missing actor", "/api/versions/101/reopen", `{"reason":"x"}`, nil, 401, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			handler, stub, reopen := newVersionReopenServer(t)
+			recorder := call(t, handler, http.MethodPost, tc.path, tc.body, tc.actor)
+			if recorder.Code != tc.want {
+				t.Fatalf("status = %d, want %d, body = %s", recorder.Code, tc.want, recorder.Body.String())
+			}
+			if tc.field != "" {
+				if field := errorBody(t, recorder)["details"].(map[string]any)["field"]; field != tc.field {
+					t.Fatalf("field = %#v, want %q", field, tc.field)
+				}
+			}
+			if len(stub.calls) != 0 || len(reopen.calls) != 0 {
+				t.Fatalf("service called for invalid input: stub=%#v reopen=%#v", stub.calls, reopen.calls)
+			}
+		})
+	}
+
+	missingServer, missingStub, _ := newVersionReopenServer(t)
+	missingStub.err = platform.NotFound("version")
+	if recorder := call(t, missingServer, http.MethodPost, "/api/versions/999/reopen", `{"reason":"x"}`, actor()); recorder.Code != http.StatusNotFound {
+		t.Fatalf("missing status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+
+	conflictServer, conflictStub, conflictReopen := newVersionReopenServer(t)
+	completed := sampleView()
+	completed.Status = "completed"
+	conflictStub.getQueue = []versionapp.VersionView{completed}
+	conflictReopen.err = platform.StateConflict("version is not completed")
+	if recorder := call(t, conflictServer, http.MethodPost, "/api/versions/101/reopen", `{"reason":"x"}`, actor()); recorder.Code != http.StatusConflict {
+		t.Fatalf("conflict status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestVersionDetailExposesCloseProjection(t *testing.T) {
+	handler, stub := newTestServer(t)
+	closedAt := testTime
+	view := sampleView()
+	view.Status = "completed"
+	view.ClosedAt = &closedAt
+	view.CloseReason = "all delivery work is done"
+	stub.view = view
+
+	recorder := call(t, handler, http.MethodGet, "/api/versions/101", "", actor())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	data := dataBody(t, recorder)
+	if data["status"] != "completed" {
+		t.Fatalf("status = %#v", data["status"])
+	}
+	if data["closed_at"] != "2026-10-31T12:00:00Z" {
+		t.Fatalf("closed_at = %#v", data["closed_at"])
+	}
+	if data["close_reason"] != "all delivery work is done" {
+		t.Fatalf("close_reason = %#v", data["close_reason"])
+	}
+
+	open := sampleView()
+	stub.view = open
+	recorder = call(t, handler, http.MethodGet, "/api/versions/101", "", actor())
+	data = dataBody(t, recorder)
+	if data["closed_at"] != nil || data["close_reason"] != nil {
+		t.Fatalf("open version close projection = %#v", data)
+	}
+}
+
+func TestVersionPatchCannotChangeStatus(t *testing.T) {
+	handler, stub := newTestServer(t)
+	view := sampleView()
+	view.Status = "running"
+	stub.view = view
+
+	recorder := call(t, handler, http.MethodPatch, "/api/versions/101", `{"status":"completed"}`, actor())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if stub.lastPatch.Title != nil || stub.lastPatch.AutoDesignNewRequirements != nil {
+		t.Fatalf("status leaked into the update patch: %#v", stub.lastPatch)
+	}
+	if data := dataBody(t, recorder); data["status"] != "running" {
+		t.Fatalf("status changed through PATCH: %#v", data)
+	}
+
+	mixed := call(t, handler, http.MethodPatch, "/api/versions/101", `{"title":"Renamed","status":"completed"}`, actor())
+	if mixed.Code != http.StatusOK {
+		t.Fatalf("mixed status = %d, body = %s", mixed.Code, mixed.Body.String())
+	}
+	if stub.lastPatch.Title == nil || *stub.lastPatch.Title != "Renamed" {
+		t.Fatalf("title = %#v", stub.lastPatch.Title)
+	}
+	if data := dataBody(t, mixed); data["status"] != "running" {
+		t.Fatalf("status changed through PATCH: %#v", data)
 	}
 }
 

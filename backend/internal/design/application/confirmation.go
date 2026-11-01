@@ -266,5 +266,6 @@ func (s *GraphService) Confirm(ctx context.Context, versionID int64, in ConfirmI
 		}
 		_ = s.audit.Record(ctx, event)
 	}
+	s.reopenCompleted(ctx, versionID, "case confirmed")
 	return result, nil
 }

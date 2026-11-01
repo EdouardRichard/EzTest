@@ -21,7 +21,7 @@ type DesignReconciler interface {
 	Reconcile(ctx context.Context) error
 }
 
-// ReconcilerDeps wires the P1+P2 reconciler. It only ensures work items and
+// ReconcilerDeps wires the P1+P2+P4 reconciler. It only ensures work items and
 // never executes business actions.
 type ReconcilerDeps struct {
 	Versions      VersionProjector
@@ -29,25 +29,33 @@ type ReconcilerDeps struct {
 	Attachments   PendingAttachmentReader
 	Design        DesignReconciler
 	Queue         WorkQueueEnsurer
-	Events        eventingapp.Publisher
-	Clock         clock.Clock
-	Logger        *slog.Logger
+	// P4 is the P4 delivery/steward ensure surface. Nil keeps the P4 rules
+	// disabled for P1-P3 wiring (and in unit tests of the earlier rules).
+	P4 P4Ensurer
+	// RunningVersions lists the running versions the P4 rules reconcile. Nil
+	// keeps the P4 rules disabled.
+	RunningVersions P4VersionLister
+	Events          eventingapp.Publisher
+	Clock           clock.Clock
+	Logger          *slog.Logger
 }
 
 // Reconciler periodically repairs the control plane: version projection,
-// conversation opening/reply/curate tasks, attachment ingest tasks and the P2
-// design planner scan. Every ensure uses a dedupe key, so repeated scans never
-// add duplicate work.
+// conversation opening/reply/curate tasks, attachment ingest tasks, the P2
+// design planner scan and the P4 delivery/steward ensure rules. Every ensure
+// uses a dedupe key, so repeated scans never add duplicate work.
 type Reconciler struct {
-	versions      VersionProjector
-	conversations ConversationReader
-	attachments   PendingAttachmentReader
-	design        DesignReconciler
-	queue         WorkQueueEnsurer
-	events        eventingapp.Publisher
-	clock         clock.Clock
-	logger        *slog.Logger
-	limit         int
+	versions        VersionProjector
+	conversations   ConversationReader
+	attachments     PendingAttachmentReader
+	design          DesignReconciler
+	queue           WorkQueueEnsurer
+	p4              P4Ensurer
+	runningVersions P4VersionLister
+	events          eventingapp.Publisher
+	clock           clock.Clock
+	logger          *slog.Logger
+	limit           int
 }
 
 // NewReconciler wires the reconciler.
@@ -57,15 +65,17 @@ func NewReconciler(deps ReconcilerDeps) *Reconciler {
 		logger = slog.Default()
 	}
 	return &Reconciler{
-		versions:      deps.Versions,
-		conversations: deps.Conversations,
-		attachments:   deps.Attachments,
-		design:        deps.Design,
-		queue:         deps.Queue,
-		events:        deps.Events,
-		clock:         deps.Clock,
-		logger:        logger,
-		limit:         reconcilerLimit,
+		versions:        deps.Versions,
+		conversations:   deps.Conversations,
+		attachments:     deps.Attachments,
+		design:          deps.Design,
+		queue:           deps.Queue,
+		p4:              deps.P4,
+		runningVersions: deps.RunningVersions,
+		events:          deps.Events,
+		clock:           deps.Clock,
+		logger:          logger,
+		limit:           reconcilerLimit,
 	}
 }
 
@@ -86,6 +96,11 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		errs = append(errs, err)
 	}
 	if err := r.reconcileDesign(ctx); err != nil {
+		errs = append(errs, err)
+	}
+	// P4 runs last: its failures are aggregated, never hiding or skipping the
+	// P1-P3 rules above.
+	if err := r.reconcileP4(ctx); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)

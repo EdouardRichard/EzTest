@@ -88,6 +88,15 @@ type Scope struct {
 	IntentID      int64
 	DispatchEpoch int64
 	DispatchToken string
+	// P4 delivery/steward scope (contracts/agent-profiles-tools.md §7.2). The
+	// task target IDs are copied from the work-item payload by the runner;
+	// RequirementID/RequirementVersionID above are reused by requirement.close.
+	IssueID              int64
+	ReportID             int64
+	ReportRevision       int32
+	CloseRound           int32
+	ReportRevisionID     int64
+	PredicateFingerprint string
 }
 
 // Tool is one scoped, schema-described agent tool.
@@ -391,6 +400,12 @@ func p1Tools(deps Deps) []Tool {
 var emptyObjectSchema = json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`)
 
 func schemaObject(properties map[string]any, required ...string) json.RawMessage {
+	if properties == nil {
+		// Providers reject "properties": null; a no-argument tool still needs
+		// an empty JSON object. The real DeepSeek API returned HTTP 400 for
+		// execution.coverage_read before this guard.
+		properties = map[string]any{}
+	}
 	document := map[string]any{
 		"type":                 "object",
 		"properties":           properties,

@@ -154,8 +154,10 @@ type CaseReader interface {
 // VersionReader is the read/write port into the version context.
 type VersionReader interface {
 	Get(ctx context.Context, id int64) (VersionBinding, error)
-	// Reopen clears the completed projection (completed -> running). It is
-	// idempotent for non-completed versions.
+	// Reopen clears the completed projection (completed -> running) through the
+	// P4 version reopen path, which publishes version.reopened with
+	// trigger=execution_intent to version:{id} and system and marks the version
+	// report stale. It is idempotent for non-completed versions.
 	Reopen(ctx context.Context, id int64) error
 }
 

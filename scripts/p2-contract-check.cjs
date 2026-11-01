@@ -14,15 +14,20 @@ const check = (ok, message) => {
   if (!ok) failures.push(message)
 }
 const read = (name) => fs.readFileSync(path.join(contractDir, name), "utf8")
+const phaseOf = (value) => {
+  const match = /^P(\d+)$/.exec(value ?? "")
+  return match ? Number(match[1]) : 0
+}
 
 const openapi = yaml.parse(read("openapi.yaml"))
 check(openapi && typeof openapi === "object", "openapi parses to an object")
-// P3 flips the root marker to x-frozen: P3 and removes x-draft. The P2 check is
-// intentionally forward-compatible: it only proves the P2 increments are still
-// present after later phases add their own (P3-D-37).
+// P3 flips the root marker to x-frozen: P3 and removes x-draft; P4+ keeps
+// advancing the frozen marker. The P2 check is intentionally forward-compatible:
+// it only proves the P2 increments are still present after later phases add
+// their own (P3-D-37 / P4-D-10).
 check(
-  openapi["x-frozen"] === "P2" || openapi["x-frozen"] === "P3" || openapi["x-draft"] === "P3",
-  "openapi root must be frozen at P2/P3 or draft P3",
+  phaseOf(openapi["x-frozen"]) >= 2 || phaseOf(openapi["x-draft"]) >= 3,
+  "openapi root must be frozen at P2+ or draft at P3+",
 )
 
 const paths = [

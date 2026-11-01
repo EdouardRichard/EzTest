@@ -26,6 +26,15 @@ type CaseStaleHook interface {
 	MarkRequirementChanged(ctx context.Context, versionID, requirementID int64, reason string, revision int) ([]string, error)
 }
 
+// RequirementVersionReopener clears the completed projection when a new
+// requirement draft is created (new requirement or new draft revision) on a
+// completed version (spec §7.5). It is best effort: a failure never rolls back
+// the requirement write, and the reconciler is the fallback. The composition
+// root wires the version close service.
+type RequirementVersionReopener interface {
+	ReopenIfCompleted(ctx context.Context, versionID int64, trigger, reason string) error
+}
+
 // NoopCaseStaleHook is the P1 stale hook: no case tables exist yet.
 type NoopCaseStaleHook struct{}
 

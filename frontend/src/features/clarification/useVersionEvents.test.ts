@@ -277,6 +277,56 @@ describe("useVersionEvents", () => {
     expect(onExecutionChanged.mock.calls[4][0].type).toBe("execution.coverage_gap")
   })
 
+  it("routes P4 issue, report, requirement-closure and version-closure events", () => {
+    const onIssueChanged = vi.fn()
+    const onReportChanged = vi.fn()
+    const onRequirementChanged = vi.fn()
+    const onVersionChanged = vi.fn()
+    render(
+      createElement(Harness, {
+        handlers: { onIssueChanged, onReportChanged, onRequirementChanged, onVersionChanged },
+      }),
+    )
+
+    for (const type of ["issue.created", "issue.updated", "issue.reopened", "issue.merged"]) {
+      connectOptions.onEvent({ event: "message", data: eventFrame(type, { issue_id: "9101" }) })
+    }
+    for (const type of ["report.published", "report.stale"]) {
+      connectOptions.onEvent({ event: "message", data: eventFrame(type, { report_id: "8101" }) })
+    }
+    for (const type of ["requirement.closed", "requirement.reopened"]) {
+      connectOptions.onEvent({
+        event: "message",
+        data: eventFrame(type, { requirement_id: "6001" }),
+      })
+    }
+    for (const type of ["version.closed", "version.reopened"]) {
+      connectOptions.onEvent({ event: "message", data: eventFrame(type, { version_id: "2001" }) })
+    }
+
+    expect(onIssueChanged).toHaveBeenCalledTimes(4)
+    expect(onReportChanged).toHaveBeenCalledTimes(2)
+    expect(onRequirementChanged).toHaveBeenCalledTimes(2)
+    expect(onVersionChanged).toHaveBeenCalledTimes(2)
+    expect(onIssueChanged.mock.calls[0][0].type).toBe("issue.created")
+    expect(onReportChanged.mock.calls[1][0].type).toBe("report.stale")
+    expect(onRequirementChanged.mock.calls[0][0].type).toBe("requirement.closed")
+    expect(onVersionChanged.mock.calls[1][0].type).toBe("version.reopened")
+    // One connection serves every P4 event family.
+    expect(sse.connectSSE).toHaveBeenCalledTimes(1)
+  })
+
+  it("notifies stream.reset through a callback without opening another EventSource", () => {
+    const onStreamReset = vi.fn()
+    render(createElement(Harness, { handlers: { onStreamReset } }))
+
+    expect(sse.connectSSE).toHaveBeenCalledTimes(1)
+    act(() => connectOptions.onReset?.({ reason: "cursor_too_old", snapshot_cursor: 99 }))
+
+    expect(onStreamReset).toHaveBeenCalledWith({ reason: "cursor_too_old", snapshot_cursor: 99 })
+    expect(sse.connectSSE).toHaveBeenCalledTimes(1)
+  })
+
   it("ignores unknown event types and malformed payloads", () => {
     const onConversationMessage = vi.fn()
     const onRequirementChanged = vi.fn()

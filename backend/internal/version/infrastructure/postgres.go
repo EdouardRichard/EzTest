@@ -263,6 +263,102 @@ func (r *Repository) Reopen(ctx context.Context, id int64, updatedAt time.Time) 
 	return tag.RowsAffected() > 0, nil
 }
 
+// Close completes one running version (P4 spec §7.3/§7.4). It first takes the
+// version-scoped advisory lock shared with execution intent creation, then locks
+// the version row, re-runs the service predicate through recheck while the lock
+// is held and only then applies the conditional running -> completed UPDATE. A
+// recheck error rolls the transaction back untouched; a version that is no
+// longer running is a state conflict.
+func (r *Repository) Close(ctx context.Context, id int64, close version.VersionCloseFields, recheck func(context.Context, version.Version) error) (version.Version, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return version.Version{}, fmt.Errorf("close version: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := lockVersionTx(ctx, tx, id, "close version"); err != nil {
+		return version.Version{}, err
+	}
+	current, err := scanVersion(tx.QueryRow(ctx, `SELECT `+versionColumns+` FROM version WHERE id = $1 FOR UPDATE`, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return version.Version{}, version.ErrNotFound
+	}
+	if err != nil {
+		return version.Version{}, wrapDB("close version: lock version", err)
+	}
+	if current.Status != version.StatusRunning {
+		return version.Version{}, version.ErrStateConflict
+	}
+	if recheck != nil {
+		if err := recheck(ctx, current); err != nil {
+			return version.Version{}, err
+		}
+	}
+
+	closedAt := close.ClosedAt
+	if closedAt.IsZero() {
+		closedAt = time.Now().UTC()
+	}
+	current.Status = version.StatusCompleted
+	current.ClosedAt = &closedAt
+	current.CloseReason = close.CloseReason
+	current.CloseRunID = cloneCloseRunID(close.CloseRunID)
+	current.UpdatedAt = closedAt
+	tag, err := tx.Exec(ctx, `
+		UPDATE version SET status = 'completed', closed_at = $2, close_reason = $3,
+			close_run_id = $4, updated_at = $5
+		WHERE id = $1 AND status = 'running'
+	`, id, closedAt, close.CloseReason, close.CloseRunID, closedAt)
+	if err != nil {
+		return version.Version{}, wrapDB("close version", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return version.Version{}, version.ErrStateConflict
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return version.Version{}, fmt.Errorf("close version: commit: %w", err)
+	}
+	return current, nil
+}
+
+// ReopenIfCompleted flips completed -> running, clears the close projection and
+// returns the updated version. A version in any other status is returned
+// unchanged with changed=false; a missing version yields ErrNotFound. The
+// single-statement conditional UPDATE is the guard, so concurrent reopens and
+// close/reopen races settle on one row version.
+func (r *Repository) ReopenIfCompleted(ctx context.Context, id int64, reopenedAt time.Time) (version.Version, bool, error) {
+	reopened, err := scanVersion(r.pool.QueryRow(ctx, `
+		UPDATE version SET status = 'running', closed_at = NULL, close_reason = '',
+			close_run_id = NULL, updated_at = $2
+		WHERE id = $1 AND status = 'completed'
+		RETURNING `+versionColumns, id, reopenedAt))
+	if err == nil {
+		return reopened, true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return version.Version{}, false, wrapDB("reopen version", err)
+	}
+	// No row was updated: distinguish "not completed" (no-op) from "missing".
+	current, err := scanVersion(r.pool.QueryRow(ctx, `
+		SELECT `+versionColumns+` FROM version WHERE id = $1
+	`, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return version.Version{}, false, version.ErrNotFound
+	}
+	if err != nil {
+		return version.Version{}, false, wrapDB("reopen version", err)
+	}
+	return current, false, nil
+}
+
+func cloneCloseRunID(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
 // Stats returns the P1 detail aggregates: requirement counts, conversation
 // count and (implicitly) the pending-design placeholder.
 func (r *Repository) Stats(ctx context.Context, id int64) (version.VersionStats, error) {
@@ -411,4 +507,7 @@ func encodeScope(scope version.Scope) (string, error) {
 	return string(raw), nil
 }
 
-var _ version.Repository = (*Repository)(nil)
+var (
+	_ version.Repository             = (*Repository)(nil)
+	_ version.VersionCloseRepository = (*Repository)(nil)
+)
