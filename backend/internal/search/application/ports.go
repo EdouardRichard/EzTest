@@ -74,6 +74,15 @@ type Provider interface {
 	Search(ctx context.Context, q string, limit int) ([]Item, error)
 }
 
+// VersionTitleReader is the narrow version application port used to decorate
+// items whose provider cannot read another context's version table. It resolves
+// every requested version ID in one batch (spec §9: version_title comes from the
+// version context, never from another context's SQL). The version application
+// QueryService satisfies it without an adapter.
+type VersionTitleReader interface {
+	VersionTitles(ctx context.Context, ids []int64) (map[int64]string, error)
+}
+
 // Providers groups the five per-type adapters. A nil adapter degrades its group
 // (the search still succeeds with degraded=true).
 type Providers struct {

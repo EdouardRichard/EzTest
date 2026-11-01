@@ -3,6 +3,7 @@ package searchapp
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -329,5 +330,182 @@ func TestSearchNilServiceIsUnavailable(t *testing.T) {
 	var service *Service
 	if _, err := service.Search(context.Background(), "login", nil, 5); err == nil {
 		t.Fatal("nil service Search returned nil error")
+	}
+}
+
+// --- version title decoration -------------------------------------------------
+
+// fakeTitleReader is the narrow version application port used to decorate
+// items whose provider cannot read another context's version titles. It records
+// every batch so the tests can prove a single deduplicated call.
+type fakeTitleReader struct {
+	titles map[int64]string
+	err    error
+
+	calls int
+	ids   [][]int64
+}
+
+func (f *fakeTitleReader) VersionTitles(_ context.Context, ids []int64) (map[int64]string, error) {
+	f.calls++
+	f.ids = append(f.ids, append([]int64(nil), ids...))
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.titles, nil
+}
+
+func versionedItem(id, versionID, versionTitle string) Item {
+	return Item{
+		ID:           id,
+		Title:        "结果 " + id,
+		VersionID:    versionID,
+		VersionTitle: versionTitle,
+		Status:       "running",
+		URL:          "/versions/" + versionID + "?tab=overview",
+	}
+}
+
+func groupTitle(snapshot Snapshot, typeName, id string) string {
+	for _, group := range snapshot.Groups {
+		if group.Type != typeName {
+			continue
+		}
+		for _, it := range group.Items {
+			if it.ID == id {
+				return it.VersionTitle
+			}
+		}
+	}
+	return ""
+}
+
+func TestSearchDecoratesMissingVersionTitlesInOneBatch(t *testing.T) {
+	providers := Providers{
+		Version:     &fakeProvider{items: []Item{versionedItem("1", "10", "版本十")}},
+		Requirement: &fakeProvider{items: []Item{versionedItem("2", "10", "")}},
+		Case: &fakeProvider{items: []Item{
+			versionedItem("3", "11", ""),
+			versionedItem("4", "12", ""),
+		}},
+		Issue:  &fakeProvider{items: []Item{versionedItem("5", "12", "")}},
+		Report: &fakeProvider{items: []Item{versionedItem("6", "0", "")}},
+	}
+	titles := &fakeTitleReader{titles: map[int64]string{
+		10: "版本十",
+		11: "版本十一",
+		12: "版本十二",
+	}}
+
+	snapshot, err := NewService(providers).WithVersionTitles(titles).
+		Search(context.Background(), "login", nil, 5)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if titles.calls != 1 {
+		t.Fatalf("VersionTitles calls = %d, want 1 batch call", titles.calls)
+	}
+	if want := []int64{10, 11, 12}; !reflect.DeepEqual(titles.ids[0], want) {
+		t.Fatalf("VersionTitles ids = %v, want deduplicated %v", titles.ids[0], want)
+	}
+	if got := groupTitle(snapshot, TypeRequirement, "2"); got != "版本十" {
+		t.Fatalf("requirement version_title = %q, want decorated %q", got, "版本十")
+	}
+	if got := groupTitle(snapshot, TypeCase, "3"); got != "版本十一" {
+		t.Fatalf("case version_title = %q, want decorated %q", got, "版本十一")
+	}
+	if got := groupTitle(snapshot, TypeCase, "4"); got != "版本十二" {
+		t.Fatalf("case version_title = %q, want decorated %q", got, "版本十二")
+	}
+	if got := groupTitle(snapshot, TypeIssue, "5"); got != "版本十二" {
+		t.Fatalf("issue version_title = %q, want decorated %q", got, "版本十二")
+	}
+	if got := groupTitle(snapshot, TypeVersion, "1"); got != "版本十" {
+		t.Fatalf("prefilled version_title = %q, want unchanged %q", got, "版本十")
+	}
+	if got := groupTitle(snapshot, TypeReport, "6"); got != "" {
+		t.Fatalf("report with version_id 0 = %q, want empty", got)
+	}
+	if snapshot.Degraded {
+		t.Fatal("degraded = true after a healthy title read")
+	}
+}
+
+func TestSearchSkipsVersionTitleReadWhenNoTitleMissing(t *testing.T) {
+	providers, _ := allProviders(1)
+	titles := &fakeTitleReader{titles: map[int64]string{11: "版本甲"}}
+
+	if _, err := NewService(providers).WithVersionTitles(titles).
+		Search(context.Background(), "login", nil, 5); err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if titles.calls != 0 {
+		t.Fatalf("VersionTitles calls = %d, want 0 when every title is present", titles.calls)
+	}
+}
+
+func TestSearchSkipsEmptyAndNonPositiveVersionIDs(t *testing.T) {
+	providers := Providers{Case: &fakeProvider{items: []Item{
+		versionedItem("1", "", ""),
+		versionedItem("2", "0", ""),
+		versionedItem("3", "-7", ""),
+		versionedItem("4", "not-a-number", ""),
+	}}}
+	titles := &fakeTitleReader{titles: map[int64]string{11: "版本十一"}}
+
+	snapshot, err := NewService(providers).WithVersionTitles(titles).
+		Search(context.Background(), "login", []string{TypeCase}, 5)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if titles.calls != 0 {
+		t.Fatalf("VersionTitles calls = %d, want 0 without a usable version ID", titles.calls)
+	}
+	for _, id := range []string{"1", "2", "3", "4"} {
+		if got := groupTitle(snapshot, TypeCase, id); got != "" {
+			t.Fatalf("case %s version_title = %q, want empty", id, got)
+		}
+	}
+}
+
+func TestSearchTitleReaderFailureDegradesTheSnapshot(t *testing.T) {
+	providers := Providers{
+		Version: &fakeProvider{items: []Item{versionedItem("1", "10", "版本十")}},
+		Case:    &fakeProvider{items: []Item{versionedItem("2", "11", "")}},
+	}
+	titles := &fakeTitleReader{err: errors.New("version titles unavailable")}
+
+	snapshot, err := NewService(providers).WithVersionTitles(titles).
+		Search(context.Background(), "login", []string{TypeVersion, TypeCase}, 5)
+	if err != nil {
+		t.Fatalf("Search: %v (title failure must degrade, not fail)", err)
+	}
+	if !snapshot.Degraded {
+		t.Fatal("degraded = false, want true when the title read fails")
+	}
+	if got := groupTitle(snapshot, TypeCase, "2"); got != "" {
+		t.Fatalf("case version_title = %q, want empty on title failure", got)
+	}
+	if got := groupTitle(snapshot, TypeVersion, "1"); got != "版本十" {
+		t.Fatalf("prefilled version_title = %q, want unchanged %q", got, "版本十")
+	}
+	if snapshot.Total != 2 {
+		t.Fatalf("total = %d, want the two provider items", snapshot.Total)
+	}
+}
+
+func TestSearchWithoutTitleReaderKeepsTitlesEmpty(t *testing.T) {
+	providers := Providers{Case: &fakeProvider{items: []Item{versionedItem("1", "11", "")}}}
+
+	snapshot, err := NewService(providers).
+		Search(context.Background(), "login", []string{TypeCase}, 5)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if got := groupTitle(snapshot, TypeCase, "1"); got != "" {
+		t.Fatalf("case version_title = %q, want empty without a wired reader", got)
+	}
+	if snapshot.Degraded {
+		t.Fatal("degraded = true without a title reader, want an unwired decoration to stay silent")
 	}
 }
