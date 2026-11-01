@@ -2,6 +2,7 @@ package visualpg
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	visual "github.com/EdouardRichard/EzTest/backend/internal/visual/domain"
@@ -84,10 +85,11 @@ func (r *BaselineRepository) Active(ctx context.Context, assertionID int64) (vis
 	`, assertionID)
 	baseline, err := scanBaseline(row)
 	if err != nil {
-		if err == visual.ErrNotFound {
+		mapped := wrapDB("get active baseline", err)
+		if errors.Is(mapped, visual.ErrNotFound) {
 			return visual.Baseline{}, false, nil
 		}
-		return visual.Baseline{}, false, wrapDB("get active baseline", err)
+		return visual.Baseline{}, false, mapped
 	}
 	return baseline, true, nil
 }
