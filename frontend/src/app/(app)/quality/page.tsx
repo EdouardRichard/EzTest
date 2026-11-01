@@ -1,6 +1,6 @@
 import type { Metadata } from "next"
 
-import { VisualQualityPage } from "@/features/visual/VisualQualityPage"
+import { QualityPage } from "@/features/quality/QualityPage"
 
 export const metadata: Metadata = { title: "质量" }
 
@@ -13,7 +13,7 @@ function firstParam(value: string | string[] | undefined): string | undefined {
   return candidate !== undefined && candidate.length > 0 ? candidate : undefined
 }
 
-export default async function QualityPage({ searchParams }: QualityRouteProps) {
+export default async function QualityRoute({ searchParams }: QualityRouteProps) {
   const params = await searchParams
-  return <VisualQualityPage initialVersionId={firstParam(params.version)} />
+  return <QualityPage initialVersionId={firstParam(params.version)} />
 }
