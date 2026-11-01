@@ -29,10 +29,16 @@ const order = fs
   .map((line) => line.trim())
   .filter((line) => line && !line.startsWith("#"))
 
-check(/info:\s*\n\s*title:/.test(openapi) && /version:\s*0\.2\.0-p5/.test(openapi), "openapi info.version 0.2.0-p5")
-check(/x-frozen:\s*P5/.test(openapi), "openapi x-frozen P5")
+const phaseOf = (value) => {
+  const match = /^P(\d+)$/.exec(value ?? "")
+  return match ? Number(match[1]) : 0
+}
+
+const versionPhase = Number((openapi.match(/version:\s*0\.2\.0-p(\d+)/) || [])[1] || 0)
+check(versionPhase >= 5, `openapi info.version 0.2.0-p5+ (got ${versionPhase || "missing"})`)
+check(phaseOf((openapi.match(/\nx-frozen:\s*(P\d+)/) || [])[1]) >= 5, "openapi x-frozen P5+")
 const operationCount = (openapi.match(/^\s*operationId:\s*/gm) || []).length
-check(operationCount === 162, `openapi operations = 162 (got ${operationCount})`)
+check(operationCount >= 162, `openapi operations >= 162 (got ${operationCount})`)
 for (const fragment of [
   "/api/versions/{versionId}/code/index",
   "/api/versions/{versionId}/code/analyses",
@@ -44,7 +50,7 @@ for (const fragment of [
   check(openapi.includes(fragment), `openapi path ${fragment}`)
 }
 
-check(order.length === 31, `order.txt = 31 migrations (got ${order.length})`)
+check(order.length >= 31, `order.txt >= 31 migrations (got ${order.length})`)
 for (const name of [
   "codeintel_0001_code_index.sql",
   "codeintel_0002_code_analysis.sql",
@@ -82,7 +88,7 @@ for (const line of events.split(/\r?\n/)) {
   const match = line.match(/^\|\s*`((?:code|visual)\.[a-z_]+)`\s*\|/)
   if (match) eventTypes.push(match[1])
 }
-check(eventTypes.length === 12, `events = 12 (got ${eventTypes.length})`)
+check(eventTypes.length >= 12, `events >= 12 (got ${eventTypes.length})`)
 
 check(tasks.includes("`index.repo`"), "task index.repo")
 check(tasks.includes("`code.analyze`"), "task code.analyze")

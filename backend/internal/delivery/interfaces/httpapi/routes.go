@@ -21,3 +21,21 @@ func Register(mux *http.ServeMux, h *Handler) {
 	mux.Handle("GET /api/versions/{versionId}/reports/{reportId}/revisions/{revision}/html", http.HandlerFunc(h.DownloadReportHTML))
 	mux.Handle("POST /api/versions/{versionId}/reports/{reportId}/regenerate", http.HandlerFunc(h.RegenerateReport))
 }
+
+// RegisterGlobal mounts the P6 cross-version read-only issue/report paths on the
+// shared mux (spec §4.2 ops #7/#8). Both paths are login-only, so the caller
+// passes the same bearer middleware as the other authenticated routes; the
+// handlers never parse credentials and expose no write operation.
+func RegisterGlobal(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *GlobalHandler) {
+	if h == nil || authenticated == nil {
+		return
+	}
+	mux.Handle("GET /api/issues", authenticated(http.HandlerFunc(h.ListGlobalIssues)))
+	mux.Handle("GET /api/reports", authenticated(http.HandlerFunc(h.ListGlobalReports)))
+}
+
+// RegisterRoutes is the assembly-root convenience hook (Task 22) matching the
+// Register*Routes convention of the other P6 contexts.
+func RegisterRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, handler *GlobalHandler) {
+	RegisterGlobal(mux, authenticated, handler)
+}

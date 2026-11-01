@@ -1,0 +1,38 @@
+{
+  "corpus_version": "v02-2026-11-01.1",
+  "version": {
+    "name": "P6 质量评测固定版本",
+    "label": "v02-eval",
+    "description": "订单中心 0.2 真实 LLM 评测语料：需求/设计/代码/执行/问题/视觉全链路固定输入。"
+  },
+  "requirements": [
+    {
+      "key": "R1",
+      "title": "用户登录后查看订单列表",
+      "description": "登录成功后进入订单列表页，列表展示订单号、状态与金额。",
+      "priority": "P0"
+    },
+    {
+      "key": "R2",
+      "title": "订单列表支持按状态筛选",
+      "description": "订单列表可按待支付/已支付/已退款筛选，筛选后立即刷新结果。",
+      "priority": "P1"
+    },
+    {
+      "key": "R3",
+      "title": "订单详情展示退款入口",
+      "description": "已支付订单详情展示退款入口。",
+      "priority": "P1"
+    },
+    {
+      "key": "R4",
+      "title": "退款入口按权限隐藏",
+      "description": "无退款权限的用户不展示退款入口，直接访问退款链接返回 403。",
+      "priority": "P2"
+    }
+  ],
+  "expected": {
+    "confirmed_requirements": 4,
+    "design_covered_requirement_keys": ["R1", "R2", "R3", "R4"]
+  }
+}

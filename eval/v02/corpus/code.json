@@ -1,0 +1,29 @@
+{
+  "corpus_version": "v02-2026-11-01.1",
+  "repository": {
+    "key": "p6-eval-repo",
+    "base_commit": "1111111111111111111111111111111111111111",
+    "head_commit": "2222222222222222222222222222222222222222",
+    "branch": "main",
+    "note": "由 scripts/fixture-codeintel-repo.ps1 或 P6 验收固定 fixture 提供；提交号必须为 40-hex。"
+  },
+  "changed_files": [
+    { "path": "web/src/orders/OrderList.tsx", "change": "modified" },
+    { "path": "web/src/orders/RefundEntry.tsx", "change": "modified" }
+  ],
+  "anchors": [
+    {
+      "requirement_key": "R1",
+      "file_path": "web/src/orders/OrderList.tsx",
+      "start_line": 12,
+      "end_line": 48
+    },
+    {
+      "requirement_key": "R3",
+      "file_path": "web/src/orders/RefundEntry.tsx",
+      "start_line": 8,
+      "end_line": 30
+    }
+  ],
+  "expected_impact_requirement_keys": ["R1", "R3"]
+}

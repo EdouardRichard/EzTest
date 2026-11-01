@@ -541,45 +541,46 @@ func TestChainServiceErrors(t *testing.T) {
 	tests := []struct {
 		name      string
 		operation string
+		layer     string
 		mutate    func(*fakeProviders)
 	}{
-		{name: "requirements", operation: "requirements", mutate: func(f *fakeProviders) {
+		{name: "requirements", operation: "requirements", layer: chain.LayerRequirement, mutate: func(f *fakeProviders) {
 			f.errs["requirements"] = errProviderBoom
 		}},
-		{name: "version suts", operation: "version_suts", mutate: func(f *fakeProviders) {
+		{name: "version suts", operation: "version_suts", layer: chain.LayerRequirement, mutate: func(f *fakeProviders) {
 			f.errs["version_suts"] = errProviderBoom
 		}},
-		{name: "scenarios", operation: "scenarios", mutate: func(f *fakeProviders) {
+		{name: "scenarios", operation: "scenarios", layer: chain.LayerDesign, mutate: func(f *fakeProviders) {
 			f.errs["scenarios"] = errProviderBoom
 		}},
-		{name: "cases", operation: "cases", mutate: func(f *fakeProviders) {
+		{name: "cases", operation: "cases", layer: chain.LayerDesign, mutate: func(f *fakeProviders) {
 			f.errs["cases"] = errProviderBoom
 		}},
-		{name: "waves", operation: "waves", mutate: func(f *fakeProviders) {
+		{name: "waves", operation: "waves", layer: chain.LayerExecution, mutate: func(f *fakeProviders) {
 			f.errs["waves"] = errProviderBoom
 		}},
-		{name: "case runs", operation: "case_runs", mutate: func(f *fakeProviders) {
+		{name: "case runs", operation: "case_runs", layer: chain.LayerExecution, mutate: func(f *fakeProviders) {
 			f.errs["case_runs"] = errProviderBoom
 		}},
-		{name: "issues", operation: "issues", mutate: func(f *fakeProviders) {
+		{name: "issues", operation: "issues", layer: chain.LayerDelivery, mutate: func(f *fakeProviders) {
 			f.errs["issues"] = errProviderBoom
 		}},
-		{name: "reports", operation: "reports", mutate: func(f *fakeProviders) {
+		{name: "reports", operation: "reports", layer: chain.LayerDelivery, mutate: func(f *fakeProviders) {
 			f.errs["reports"] = errProviderBoom
 		}},
-		{name: "closures", operation: "closures", mutate: func(f *fakeProviders) {
+		{name: "closures", operation: "closures", layer: chain.LayerDelivery, mutate: func(f *fakeProviders) {
 			f.errs["closures"] = errProviderBoom
 		}},
-		{name: "SUT names", operation: "sut_names", mutate: func(f *fakeProviders) {
+		{name: "SUT names", operation: "sut_names", layer: chain.LayerRequirement, mutate: func(f *fakeProviders) {
 			f.errs["sut_names"] = errProviderBoom
 		}},
-		{name: "page names", operation: "page_names", mutate: func(f *fakeProviders) {
+		{name: "page names", operation: "page_names", layer: chain.LayerRequirement, mutate: func(f *fakeProviders) {
 			f.errs["page_names"] = errProviderBoom
 		}},
-		{name: "cursor", operation: "cursor", mutate: func(f *fakeProviders) {
+		{name: "cursor", operation: "cursor", layer: chain.LayerExecution, mutate: func(f *fakeProviders) {
 			f.errs["cursor"] = errProviderBoom
 		}},
-		{name: "historical case versions", operation: "historical", mutate: func(f *fakeProviders) {
+		{name: "historical case versions", operation: "historical", layer: chain.LayerDesign, mutate: func(f *fakeProviders) {
 			f.caseRuns = append(f.caseRuns, chain.Node{
 				ID:            "case_run:202",
 				Kind:          chain.NodeCaseRun,
@@ -595,12 +596,17 @@ func TestChainServiceErrors(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fakes := completeFakes()
 			tc.mutate(fakes)
-			_, err := newService(fakes, now).Read(context.Background(), 42, chain.ChainFilter{})
-			if err == nil {
-				t.Fatalf("Read() error = nil, want the %s provider error", tc.operation)
+			view, err := newService(fakes, now).Read(context.Background(), 42, chain.ChainFilter{})
+			if err != nil {
+				// P6 only lets explicit 4xx provider errors abort the read.
+				if !slices.Contains(fakes.calls, tc.operation) {
+					t.Errorf("provider operation %q was not attempted: %v", tc.operation, fakes.calls)
+				}
+				return
 			}
-			if !errors.Is(err, errProviderBoom) {
-				t.Fatalf("Read() error = %v, want errors.Is(errProviderBoom)", err)
+			if !slices.Contains(view.DegradedLayers, tc.layer) {
+				t.Errorf("degraded_layers = %v, want %q for the %s provider failure",
+					view.DegradedLayers, tc.layer, tc.operation)
 			}
 			if !slices.Contains(fakes.calls, tc.operation) {
 				t.Errorf("provider operation %q was not attempted: %v", tc.operation, fakes.calls)
@@ -647,6 +653,7 @@ func TestChainServiceReplayModes(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fakes := newFakeProviders()
 			fakes.cursor = 7
+			fakes.waves = []chain.Node{chainNode(chain.NodeWave, 7, "Wave 1")}
 			fakes.eventTimes[5] = now.Add(-time.Hour)
 			fakes.eventTimes[9] = now.Add(time.Hour)
 			view, err := newService(fakes, now).Read(context.Background(), 42, tc.filter)

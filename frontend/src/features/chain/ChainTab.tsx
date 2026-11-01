@@ -1,6 +1,6 @@
 "use client"
 
-import { History, RefreshCw } from "lucide-react"
+import { History, LayoutList, Network, RefreshCw } from "lucide-react"
 import { useRouter, useSearchParams } from "next/navigation"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
@@ -24,11 +24,19 @@ import { getChain, listChainEvents, listChainWaves } from "./api"
 import { ChainDetailSheet } from "./ChainDetailSheet"
 import { type ChainFilterKey, ChainFilters, type ChainFilterValues } from "./ChainFilters"
 import { ChainGraph } from "./ChainGraph"
+import { ChainListView } from "./ChainListView"
 import {
+  CHAIN_DEGRADED_LAYER_LABELS,
+  CHAIN_ISSUE_SEVERITY_LABELS,
+  CHAIN_ISSUE_STATUS_LABELS,
   CHAIN_NODE_DOT_CLASSES,
   CHAIN_NODE_KIND_LABELS,
+  CHAIN_TRUNCATED_LAYER_LABELS,
   CHAIN_TRUNCATION_REASON_LABELS,
+  type ChainIssueSeverity,
+  type ChainIssueStatus,
   type ChainNodeView,
+  type ChainTruncatedLayers,
   type ChainTruncationReason,
   type ChainView,
 } from "./types"
@@ -44,7 +52,24 @@ export type ChainTabProps = {
 }
 
 const REFRESH_DEBOUNCE_MS = 350
-const EVENT_LIMIT = 20
+const Q_DEBOUNCE_MS = 300
+const DEFAULT_EVENT_LIMIT = 20
+const MAX_EVENT_LIMIT = 200
+
+type ChainViewMode = "graph" | "list"
+
+const FILTER_KEYS: (keyof ChainFilterValues)[] = [
+  "sutId",
+  "pageId",
+  "waveId",
+  "status",
+  "result",
+  "q",
+  "abnormalOnly",
+  "issueStatus",
+  "issueSeverity",
+  "requirementLimit",
+]
 
 function deriveSelectedNode(params: URLSearchParams): string | null {
   const node = params.get("node")
@@ -58,28 +83,74 @@ function deriveSelectedNode(params: URLSearchParams): string | null {
   return null
 }
 
+export function filtersFromParams(params: URLSearchParams): ChainFilterValues {
+  return {
+    sutId: params.get("sut_id") ?? "all",
+    pageId: params.get("page_id") ?? "all",
+    waveId: params.get("wave_id") ?? params.get("wave") ?? "all",
+    status: params.get("status") ?? "all",
+    result: params.get("result") ?? "all",
+    q: params.get("q") ?? "",
+    abnormalOnly: params.get("abnormal_only") === "true" ? "true" : "all",
+    issueStatus: params.get("issue_status") ?? "all",
+    issueSeverity: params.get("issue_severity") ?? "all",
+    requirementLimit: params.get("requirement_limit") ?? "all",
+  }
+}
+
+function sameFilters(left: ChainFilterValues, right: ChainFilterValues): boolean {
+  return FILTER_KEYS.every((key) => left[key] === right[key])
+}
+
+export function chainFiltersToParams(
+  filters: ChainFilterValues,
+  selectedNodeId: string | null,
+): URLSearchParams {
+  const params = new URLSearchParams({ tab: "chain" })
+  const set = (key: string, value: string) => {
+    if (value.length > 0 && value !== "all") params.set(key, value)
+  }
+  set("sut_id", filters.sutId)
+  set("page_id", filters.pageId)
+  set("wave_id", filters.waveId)
+  set("status", filters.status)
+  set("result", filters.result)
+  set("q", filters.q.trim())
+  set("abnormal_only", filters.abnormalOnly === "true" ? "true" : "all")
+  set("issue_status", filters.issueStatus)
+  set("issue_severity", filters.issueSeverity)
+  set("requirement_limit", filters.requirementLimit)
+  if (selectedNodeId !== null) params.set("node", selectedNodeId)
+  return params
+}
+
 function truncationReasonLabel(reason: ChainTruncationReason): string {
   return reason === "" ? "预算截断" : CHAIN_TRUNCATION_REASON_LABELS[reason]
 }
 
+function truncatedLayerKeys(
+  layers: ChainTruncatedLayers | undefined,
+): (keyof ChainTruncatedLayers)[] {
+  if (layers === undefined) return []
+  return (Object.keys(CHAIN_TRUNCATED_LAYER_LABELS) as (keyof ChainTruncatedLayers)[]).filter(
+    (key) => layers[key],
+  )
+}
+
 /**
- * P4 exploration-chain tab (spec §8, §9.4): React Flow graph over the server
- * read model, server-side filters, live-follow SSE, approximate wave replay,
- * truncation warning, event timeline and URL deep links. No business state is
- * rebuilt from events; an event only schedules a debounced snapshot refetch.
+ * P4/P6 exploration-chain tab (spec §8, §9.4, §10): React Flow graph or
+ * accessible list over the server read model, server-side filters (P6 q /
+ * abnormal / issue status+severity / requirement limit), typed counts+coverage,
+ * follow auto-center, layered degradation/reconnect with the last snapshot
+ * retained, per-layer truncation banners and URL deep links. No business state
+ * is rebuilt from events; an event only schedules a debounced snapshot refetch.
  */
 export function ChainTab({ versionId, onVersionChanged: notifyVersionChanged }: ChainTabProps) {
   const router = useRouter()
   const searchParams = useSearchParams()
 
-  const urlWave = searchParams.get("wave")
-  const [filters, setFilters] = useState<ChainFilterValues>(() => ({
-    sutId: "all",
-    pageId: "all",
-    waveId: urlWave !== null && urlWave.length > 0 ? urlWave : "all",
-    status: "all",
-    result: "all",
-  }))
+  const [filters, setFilters] = useState<ChainFilterValues>(() => filtersFromParams(searchParams))
+  const [qInput, setQInput] = useState<string>(() => filtersFromParams(searchParams).q)
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(() =>
     deriveSelectedNode(searchParams),
   )
@@ -91,20 +162,45 @@ export function ChainTab({ versionId, onVersionChanged: notifyVersionChanged }: 
   const [error, setError] = useState<unknown>(null)
   const [reloadToken, setReloadToken] = useState(0)
   const [follow, setFollow] = useState(true)
+  const [viewMode, setViewMode] = useState<ChainViewMode>("graph")
 
   const followRef = useRef(follow)
   followRef.current = follow
+  const filtersRef = useRef(filters)
+  filtersRef.current = filters
+  const selectedRef = useRef(selectedNodeId)
+  selectedRef.current = selectedNodeId
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  // Follow back/forward navigation: ?node / ?issue / ?report / ?wave.
+  const syncUrl = useCallback(
+    (nextFilters: ChainFilterValues, nodeId: string | null) => {
+      const params = chainFiltersToParams(nextFilters, nodeId)
+      router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`)
+    },
+    [router, versionId],
+  )
+
+  // Follow back/forward navigation and deep links (?node / ?issue / ?report /
+  // ?wave plus every P6 filter). The parsed values are compared first so the
+  // tab never rewrites the URL just because it rendered.
   useEffect(() => {
-    const nextNode = deriveSelectedNode(searchParams)
-    if (nextNode !== null) setSelectedNodeId(nextNode)
-    const wave = searchParams.get("wave")
-    if (wave !== null && wave.length > 0) {
-      setFilters((current) => (current.waveId === wave ? current : { ...current, waveId: wave }))
-    }
+    const parsed = filtersFromParams(searchParams)
+    setFilters((current) => (sameFilters(current, parsed) ? current : parsed))
+    setQInput(parsed.q)
+    setSelectedNodeId(deriveSelectedNode(searchParams))
   }, [searchParams])
+
+  // P6 q input is debounced 300ms; only the committed value reaches the API and
+  // the URL, so typing never floods the chain endpoint.
+  useEffect(() => {
+    if (qInput === filters.q) return
+    const timer = setTimeout(() => {
+      const next = { ...filtersRef.current, q: qInput }
+      setFilters(next)
+      syncUrl(next, selectedRef.current)
+    }, Q_DEBOUNCE_MS)
+    return () => clearTimeout(timer)
+  }, [filters.q, qInput, syncUrl])
 
   useEffect(() => {
     let cancelled = false
@@ -122,19 +218,14 @@ export function ChainTab({ versionId, onVersionChanged: notifyVersionChanged }: 
       .catch(() => {
         // Replay options degrade gracefully.
       })
-    void listChainEvents(versionId, { limit: EVENT_LIMIT })
-      .then((next) => {
-        if (!cancelled) setEvents(next)
-      })
-      .catch(() => {
-        // The timeline is informative only.
-      })
     return () => {
       cancelled = true
     }
   }, [versionId])
 
-  const { sutId, pageId, waveId, status, result } = filters
+  const { sutId, pageId, waveId, status, result, q, abnormalOnly, issueStatus, issueSeverity } =
+    filters
+  const requirementLimit = filters.requirementLimit
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: reloadToken forces a snapshot refetch
   useEffect(() => {
@@ -149,11 +240,22 @@ export function ChainTab({ versionId, onVersionChanged: notifyVersionChanged }: 
       result: result === "all" ? undefined : result,
       focusNode: selectedNodeId ?? undefined,
       limit: 300,
+      q: q.trim().length > 0 ? q.trim() : undefined,
+      abnormalOnly: abnormalOnly === "true" ? true : undefined,
+      issueStatus: issueStatus === "all" ? undefined : (issueStatus as ChainIssueStatus),
+      issueSeverity: issueSeverity === "all" ? undefined : (issueSeverity as ChainIssueSeverity),
+      requirementLimit:
+        requirementLimit === "all" ? undefined : Number.parseInt(requirementLimit, 10),
     })
       .then((next) => {
-        if (!cancelled) setChain(next)
+        if (!cancelled) {
+          setChain(next)
+          setError(null)
+        }
       })
       .catch((cause: unknown) => {
+        // P6 keeps the last successful graph; the host renders an inline
+        // reconnect banner instead of replacing the canvas with an error state.
         if (!cancelled) setError(cause)
       })
       .finally(() => {
@@ -162,7 +264,41 @@ export function ChainTab({ versionId, onVersionChanged: notifyVersionChanged }: 
     return () => {
       cancelled = true
     }
-  }, [versionId, sutId, pageId, waveId, status, result, selectedNodeId, reloadToken])
+  }, [
+    versionId,
+    sutId,
+    pageId,
+    waveId,
+    status,
+    result,
+    q,
+    abnormalOnly,
+    issueStatus,
+    issueSeverity,
+    requirementLimit,
+    selectedNodeId,
+    reloadToken,
+  ])
+
+  // P6 consumes replay.event_limit for the /api/events history read; the P0
+  // endpoint caps a page at 200.
+  const eventLimit = Math.min(
+    Math.max(chain?.replay.event_limit ?? DEFAULT_EVENT_LIMIT, 1),
+    MAX_EVENT_LIMIT,
+  )
+  useEffect(() => {
+    let cancelled = false
+    void listChainEvents(versionId, { limit: eventLimit })
+      .then((next) => {
+        if (!cancelled) setEvents(next)
+      })
+      .catch(() => {
+        // The timeline is informative only.
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [eventLimit, versionId])
 
   // One debounced snapshot refetch shared by every P1-P4 chain-relevant event.
   const scheduleRefresh = useCallback(() => {
@@ -171,13 +307,8 @@ export function ChainTab({ versionId, onVersionChanged: notifyVersionChanged }: 
     refreshTimer.current = setTimeout(() => {
       refreshTimer.current = null
       setReloadToken((token) => token + 1)
-      void listChainEvents(versionId, { limit: EVENT_LIMIT })
-        .then(setEvents)
-        .catch(() => {
-          // Keep the last timeline snapshot.
-        })
     }, REFRESH_DEBOUNCE_MS)
-  }, [versionId])
+  }, [])
 
   useEffect(
     () => () => {
@@ -201,36 +332,38 @@ export function ChainTab({ versionId, onVersionChanged: notifyVersionChanged }: 
     onStreamReset: scheduleRefresh,
   })
 
+  const updateFilter = useCallback(
+    (key: ChainFilterKey, value: string) => {
+      const next = { ...filtersRef.current, [key]: value }
+      setFilters(next)
+      syncUrl(next, selectedRef.current)
+    },
+    [syncUrl],
+  )
+
   const selectNode = useCallback(
     (nodeId: string) => {
       setSelectedNodeId(nodeId)
-      const params = new URLSearchParams({ tab: "chain" })
-      if (waveId !== "all") params.set("wave", waveId)
-      params.set("node", nodeId)
-      router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`)
+      syncUrl(filtersRef.current, nodeId)
     },
-    [router, versionId, waveId],
+    [syncUrl],
   )
 
   const closeDetail = useCallback(() => {
     setSelectedNodeId(null)
-    const params = new URLSearchParams({ tab: "chain" })
-    if (waveId !== "all") params.set("wave", waveId)
-    router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`)
-  }, [router, versionId, waveId])
-
-  const updateFilter = useCallback((key: ChainFilterKey, value: string) => {
-    setFilters((current) => ({ ...current, [key]: value }))
-  }, [])
+    syncUrl(filtersRef.current, null)
+  }, [syncUrl])
 
   function selectHistoryWave(value: string): void {
-    setFilters((current) => ({ ...current, waveId: value }))
+    const next = { ...filtersRef.current, waveId: value }
+    setFilters(next)
     const nodeId = value === "all" ? null : `wave:${value}`
     setSelectedNodeId(nodeId)
-    const params = new URLSearchParams({ tab: "chain" })
-    if (value !== "all") params.set("wave", value)
-    if (nodeId !== null) params.set("node", nodeId)
-    router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`)
+    syncUrl(next, nodeId)
+  }
+
+  function resumeFollow(): void {
+    setFollow(true)
   }
 
   const sutOptions = useMemo(
@@ -260,6 +393,8 @@ export function ChainTab({ versionId, onVersionChanged: notifyVersionChanged }: 
   )
 
   const replayApproximate = chain !== null && (chain.replay.approximate || filters.waveId !== "all")
+  const degradedLayers = chain?.degraded_layers ?? []
+  const truncatedLayers = truncatedLayerKeys(chain?.truncated_layers)
 
   const stats = useMemo(() => {
     const counts = chain?.counts ?? {
@@ -272,11 +407,14 @@ export function ChainTab({ versionId, onVersionChanged: notifyVersionChanged }: 
       reports: 0,
       evidence: 0,
     }
-    const passedRuns =
-      chain?.nodes.filter(
-        (node) => node.kind === "case_run" && String(node.meta?.result ?? "") === "passed",
-      ).length ?? 0
-    const coverage = counts.cases > 0 ? Math.round((passedRuns / counts.cases) * 100) : 0
+    const coverage = counts.coverage
+    const passedRuns = counts.by_case_run_status?.passed ?? 0
+    const coverageValue =
+      coverage !== undefined
+        ? `${coverage.covered}/${coverage.requirements}`
+        : counts.cases > 0
+          ? `${passedRuns}/${counts.cases}`
+          : "0/0"
     return [
       { key: "requirements", label: "需求", value: counts.requirements },
       { key: "scenarios", label: "场景", value: counts.scenarios },
@@ -286,17 +424,21 @@ export function ChainTab({ versionId, onVersionChanged: notifyVersionChanged }: 
       { key: "issues", label: "问题", value: counts.issues },
       { key: "reports", label: "报告", value: counts.reports },
       { key: "evidence", label: "证据", value: counts.evidence },
-      { key: "coverage", label: "覆盖", value: `${coverage}%` },
+      { key: "coverage", label: "覆盖", value: coverageValue },
     ]
   }, [chain])
 
+  const runStatus = chain?.counts.by_case_run_status
+  const issueStatusCounts = chain?.counts.by_issue_status
+  const issueSeverityCounts = chain?.counts.by_issue_severity
+  const coverageCounts = chain?.counts.coverage
+
+  const initialLoading = loading && chain === null
   const empty = !loading && error === null && chain !== null && chain.nodes.length === 0
+  const followNodeId = selectedNodeId ?? chain?.nodes[0]?.id ?? null
 
   return (
-    <div
-      data-testid="chain-tab"
-      className="relative left-1/2 w-screen -translate-x-1/2 space-y-3 px-5 pb-3 md:w-[calc(100vw-15rem)] lg:px-8"
-    >
+    <div data-testid="chain-tab" className="w-full min-w-0 space-y-3 px-1 pb-3 lg:px-0">
       <section
         aria-label="链路工具栏"
         data-testid="chain-toolbar"
@@ -318,13 +460,46 @@ export function ChainTab({ versionId, onVersionChanged: notifyVersionChanged }: 
               <Badge tone="warning">历史回看 · 近似</Badge>
             </span>
           ) : null}
+          {refreshingLabel(loading, chain) ? (
+            <span data-testid="chain-refreshing" className="text-[11px] text-muted-foreground">
+              刷新中…
+            </span>
+          ) : null}
 
           <span className="ml-auto flex flex-wrap items-center gap-1.5">
+            <fieldset aria-label="链路视图切换" className="m-0 inline-flex min-w-0 border-0 p-0">
+              <Button
+                size="sm"
+                variant={viewMode === "graph" ? "primary" : "secondary"}
+                aria-pressed={viewMode === "graph"}
+                aria-label="画布视图"
+                onClick={() => setViewMode("graph")}
+              >
+                <Network className="size-3.5" aria-hidden="true" />
+                画布
+              </Button>
+              <Button
+                size="sm"
+                variant={viewMode === "list" ? "primary" : "secondary"}
+                aria-pressed={viewMode === "list"}
+                aria-label="列表视图"
+                onClick={() => setViewMode("list")}
+              >
+                <LayoutList className="size-3.5" aria-hidden="true" />
+                列表
+              </Button>
+            </fieldset>
+            {follow ? null : (
+              <Button size="sm" variant="secondary" aria-label="恢复跟随" onClick={resumeFollow}>
+                恢复跟随
+              </Button>
+            )}
             <Button
               size="sm"
               variant={follow ? "primary" : "secondary"}
               aria-pressed={follow}
               aria-label="实时跟随"
+              data-testid="chain-follow"
               onClick={() => setFollow((current) => !current)}
             >
               {follow ? "实时跟随中" : "已暂停跟随"}
@@ -344,6 +519,8 @@ export function ChainTab({ versionId, onVersionChanged: notifyVersionChanged }: 
         <div className="flex flex-wrap items-end gap-2">
           <ChainFilters
             values={filters}
+            qInput={qInput}
+            onQInputChange={setQInput}
             sutOptions={sutOptions}
             pageOptions={pageOptions}
             waves={waves}
@@ -364,6 +541,9 @@ export function ChainTab({ versionId, onVersionChanged: notifyVersionChanged }: 
             </Select>
           </Field>
         </div>
+        <p aria-live="polite" data-testid="chain-loading-status" className="sr-only">
+          {loading ? "正在刷新链路" : ""}
+        </p>
       </section>
 
       {replayApproximate ? (
@@ -371,6 +551,37 @@ export function ChainTab({ versionId, onVersionChanged: notifyVersionChanged }: 
           <History className="size-3.5" aria-hidden="true" />
           历史回看按实体 created_at 边界近似还原，不承诺任意时点快照。
         </p>
+      ) : null}
+
+      {degradedLayers.length > 0 ? (
+        <div data-testid="chain-degraded-banner">
+          <Alert tone="warning" title="部分链路图层不可用">
+            <p>
+              {degradedLayers.map((layer) => CHAIN_DEGRADED_LAYER_LABELS[layer]).join("、")}
+              {" 图层读取失败；已保留健康图层与上一次快照，不会显示空态。"}
+            </p>
+            <Button
+              size="sm"
+              variant="secondary"
+              className="mt-2"
+              data-testid="chain-reconnect"
+              onClick={() => setReloadToken((token) => token + 1)}
+            >
+              重新连接
+            </Button>
+          </Alert>
+        </div>
+      ) : null}
+
+      {truncatedLayers.length > 0 ? (
+        <div data-testid="chain-layer-truncation-banner">
+          <Alert tone="warning" title="部分图层已按预算截断">
+            <p>
+              {truncatedLayers.map((layer) => CHAIN_TRUNCATED_LAYER_LABELS[layer]).join("、")}
+              {" 图层已截断；请收窄筛选或调整链路预算。"}
+            </p>
+          </Alert>
+        </div>
       ) : null}
 
       {chain?.truncated === true ? (
@@ -383,13 +594,30 @@ export function ChainTab({ versionId, onVersionChanged: notifyVersionChanged }: 
         </Alert>
       ) : null}
 
-      <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_320px]">
+      {error !== null && chain !== null ? (
+        <div data-testid="chain-refresh-error">
+          <Alert tone="danger" title="链路刷新失败，已保留上一次快照">
+            <p>网络或服务暂不可用；当前画布/列表仍是上一份成功数据。</p>
+            <Button
+              size="sm"
+              variant="secondary"
+              className="mt-2"
+              data-testid="chain-refresh-reconnect"
+              onClick={() => setReloadToken((token) => token + 1)}
+            >
+              重新连接
+            </Button>
+          </Alert>
+        </div>
+      ) : null}
+
+      <div className="grid min-w-0 gap-3 lg:grid-cols-[minmax(0,1fr)_320px]">
         <div className="min-w-0 space-y-2">
-          {loading ? (
+          {initialLoading ? (
             <div className="surface-card">
               <LoadingCard label="正在加载探索链路…" />
             </div>
-          ) : error !== null ? (
+          ) : error !== null && chain === null ? (
             <ErrorState
               error={error}
               title="探索链路加载失败"
@@ -401,12 +629,23 @@ export function ChainTab({ versionId, onVersionChanged: notifyVersionChanged }: 
               description="需求确认并执行后，链路会展示需求、用例、波次、运行、问题与报告之间的关系。"
             />
           ) : chain !== null ? (
-            <ChainGraph
-              nodes={chain.nodes}
-              edges={chain.edges}
-              selectedNodeId={selectedNodeId}
-              onSelectNode={selectNode}
-            />
+            viewMode === "graph" ? (
+              <ChainGraph
+                nodes={chain.nodes}
+                edges={chain.edges}
+                selectedNodeId={selectedNodeId}
+                onSelectNode={selectNode}
+                follow={follow}
+                followNodeId={followNodeId}
+                onUserMove={() => setFollow(false)}
+              />
+            ) : (
+              <ChainListView
+                nodes={chain.nodes}
+                selectedNodeId={selectedNodeId}
+                onSelectNode={selectNode}
+              />
+            )
           ) : null}
 
           <section
@@ -432,13 +671,53 @@ export function ChainTab({ versionId, onVersionChanged: notifyVersionChanged }: 
           <section
             data-testid="chain-stats"
             aria-label="链路统计"
-            className="surface-card flex flex-wrap items-center gap-1.5 px-3 py-2.5"
+            className="surface-card space-y-1.5 px-3 py-2.5"
           >
-            {stats.map((item) => (
-              <Badge key={item.key} tone={item.key === "coverage" ? "info" : "neutral"}>
-                {item.label} {item.value}
-              </Badge>
-            ))}
+            <div className="flex flex-wrap items-center gap-1.5">
+              {stats.map((item) => (
+                <Badge key={item.key} tone={item.key === "coverage" ? "info" : "neutral"}>
+                  {item.label} {item.value}
+                </Badge>
+              ))}
+            </div>
+            {runStatus !== undefined ? (
+              <p
+                data-testid="chain-run-status-counts"
+                className="text-[10px] text-muted-foreground"
+              >
+                运行结果：通过 {runStatus.passed} · 失败 {runStatus.failed} · 阻塞{" "}
+                {runStatus.blocked} · 未定 {runStatus.inconclusive} · 跳过 {runStatus.skipped} ·
+                中断 {runStatus.interrupted}
+              </p>
+            ) : null}
+            {coverageCounts !== undefined ? (
+              <p data-testid="chain-coverage-counts" className="text-[10px] text-muted-foreground">
+                覆盖：已覆盖 {coverageCounts.covered} · 未覆盖 {coverageCounts.uncovered} · 需求{" "}
+                {coverageCounts.requirements}
+              </p>
+            ) : null}
+            {issueStatusCounts !== undefined ? (
+              <p
+                data-testid="chain-issue-status-counts"
+                className="text-[10px] text-muted-foreground"
+              >
+                问题状态：
+                {(Object.keys(CHAIN_ISSUE_STATUS_LABELS) as ChainIssueStatus[])
+                  .map((key) => `${CHAIN_ISSUE_STATUS_LABELS[key]} ${issueStatusCounts[key]}`)
+                  .join(" · ")}
+              </p>
+            ) : null}
+            {issueSeverityCounts !== undefined ? (
+              <p
+                data-testid="chain-issue-severity-counts"
+                className="text-[10px] text-muted-foreground"
+              >
+                问题严重级：
+                {(Object.keys(CHAIN_ISSUE_SEVERITY_LABELS) as ChainIssueSeverity[])
+                  .map((key) => `${CHAIN_ISSUE_SEVERITY_LABELS[key]} ${issueSeverityCounts[key]}`)
+                  .join(" · ")}
+              </p>
+            ) : null}
           </section>
 
           <section
@@ -448,10 +727,16 @@ export function ChainTab({ versionId, onVersionChanged: notifyVersionChanged }: 
           >
             <header className="flex items-center justify-between border-b border-border px-3 py-2">
               <h2 className="text-sm font-semibold text-foreground">事件时间线</h2>
-              <span className="text-[10px] text-muted-foreground">
-                最多 {EVENT_LIMIT} 条 · 近似
-              </span>
+              <span className="text-[10px] text-muted-foreground">最多 {eventLimit} 条 · 近似</span>
             </header>
+            {chain?.replay.truncated === true ? (
+              <p
+                data-testid="chain-replay-truncated"
+                className="px-3 py-2 text-[10px] text-warning"
+              >
+                历史事件超过 replay.event_limit，仅展示最近 {eventLimit} 条。
+              </p>
+            ) : null}
             {events.length === 0 ? (
               <p className="px-3 py-4 text-[11px] text-muted-foreground">暂无版本事件。</p>
             ) : (
@@ -484,4 +769,8 @@ export function ChainTab({ versionId, onVersionChanged: notifyVersionChanged }: 
       ) : null}
     </div>
   )
+}
+
+function refreshingLabel(loading: boolean, chain: ChainView | null): boolean {
+  return loading && chain !== null
 }

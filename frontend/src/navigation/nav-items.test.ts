@@ -24,17 +24,19 @@ describe("NAV_ITEMS", () => {
     expect(platform.map((item) => item.label)).toEqual(["质量", "Agent 中心", "设置"])
   })
 
-  it("marks only the P1+ global placeholders", () => {
+  it("marks only the knowledge placeholder", () => {
     const placeholders = NAV_ITEMS.filter((item) => item.placeholder)
-    expect(placeholders.map((item) => item.label)).toEqual([
+    expect(placeholders.map((item) => item.label)).toEqual(["知识"])
+    const p0 = NAV_ITEMS.filter((item) => !item.placeholder)
+    expect(p0.map((item) => item.label)).toEqual([
+      "版本",
       "问题",
       "报告",
-      "知识",
+      "资源",
       "质量",
       "Agent 中心",
+      "设置",
     ])
-    const p0 = NAV_ITEMS.filter((item) => !item.placeholder)
-    expect(p0.map((item) => item.label)).toEqual(["版本", "资源", "设置"])
   })
 
   it("points every link at its feature route", () => {
