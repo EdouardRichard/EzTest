@@ -73,6 +73,8 @@ func int64Of(t *testing.T, raw string) int64 {
 	return value
 }
 
+func familyPtr(value string) *string { return &value }
+
 func assertAPIErr(t *testing.T, err error, status int, code string) *platform.Error {
 	t.Helper()
 	var apiErr *platform.Error
@@ -235,6 +237,96 @@ func TestRepositoryUniquenessAndDefaultUnset(t *testing.T) {
 	}
 	if storedPassword != "secret" {
 		t.Fatalf("stored password = %q", storedPassword)
+	}
+}
+
+func TestSUTFamilyRoundTripAndClear(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+
+	created, err := e.svc.CreateSUT(ctx, resourceapp.SUTInput{
+		Name: "Order Center", Intro: "orders", Family: familyPtr("  payments  "),
+	}, 42)
+	if err != nil {
+		t.Fatalf("CreateSUT: %v", err)
+	}
+	sutID := int64Of(t, created.ID)
+	if created.Family == nil || *created.Family != "payments" {
+		t.Fatalf("created family = %v", created.Family)
+	}
+
+	stored, err := e.repo.GetSUT(ctx, sutID)
+	if err != nil {
+		t.Fatalf("GetSUT: %v", err)
+	}
+	if stored.Family == nil || *stored.Family != "payments" {
+		t.Fatalf("stored family = %v", stored.Family)
+	}
+
+	list, _, err := e.svc.ListSUTs(ctx, 10, nil)
+	if err != nil {
+		t.Fatalf("ListSUTs: %v", err)
+	}
+	if len(list) != 1 || list[0].Family == nil || *list[0].Family != "payments" {
+		t.Fatalf("list = %#v", list)
+	}
+	detail, err := e.svc.GetSUT(ctx, sutID)
+	if err != nil {
+		t.Fatalf("GetSUT view: %v", err)
+	}
+	if detail.Family == nil || *detail.Family != "payments" {
+		t.Fatalf("detail family = %v", detail.Family)
+	}
+
+	// Renaming keeps the family; a present family replaces it.
+	renamed := "Orders Platform"
+	updated, err := e.svc.UpdateSUT(ctx, sutID, resourceapp.SUTPatch{Name: &renamed}, 42)
+	if err != nil {
+		t.Fatalf("UpdateSUT name: %v", err)
+	}
+	if updated.Family == nil || *updated.Family != "payments" {
+		t.Fatalf("kept family = %v", updated.Family)
+	}
+	updated, err = e.svc.UpdateSUT(ctx, sutID, resourceapp.SUTPatch{Family: familyPtr("order-center")}, 42)
+	if err != nil {
+		t.Fatalf("UpdateSUT family: %v", err)
+	}
+	if updated.Family == nil || *updated.Family != "order-center" {
+		t.Fatalf("updated family = %v", updated.Family)
+	}
+	stored, err = e.repo.GetSUT(ctx, sutID)
+	if err != nil {
+		t.Fatalf("GetSUT: %v", err)
+	}
+	if stored.Family == nil || *stored.Family != "order-center" {
+		t.Fatalf("stored family = %v", stored.Family)
+	}
+
+	// Uppercase families are rejected by the service and by the DB CHECK.
+	_, err = e.svc.UpdateSUT(ctx, sutID, resourceapp.SUTPatch{Family: familyPtr("Orders")}, 42)
+	assertAPIErr(t, err, 400, "invalid_argument")
+	_, err = e.repo.CreateSUT(ctx, resource.SUT{
+		ID: 700001, Name: "Uppercase Family", Family: familyPtr("Orders"),
+		CreatedBy: 42, CreatedAt: testNow, UpdatedAt: testNow,
+	})
+	if err == nil {
+		t.Fatal("repo accepted an uppercase family")
+	}
+
+	// The empty string clears the family.
+	cleared, err := e.svc.UpdateSUT(ctx, sutID, resourceapp.SUTPatch{Family: familyPtr("")}, 42)
+	if err != nil {
+		t.Fatalf("UpdateSUT clear: %v", err)
+	}
+	if cleared.Family != nil {
+		t.Fatalf("cleared family = %v", cleared.Family)
+	}
+	var family *string
+	if err := e.pool.QueryRow(ctx, `SELECT family FROM sut WHERE id = $1`, sutID).Scan(&family); err != nil {
+		t.Fatalf("read family: %v", err)
+	}
+	if family != nil {
+		t.Fatalf("db family = %q, want NULL", *family)
 	}
 }
 

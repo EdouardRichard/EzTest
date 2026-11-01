@@ -360,6 +360,25 @@ export function IssuesTab({ versionId }: IssuesTabProps) {
       ),
     },
     {
+      key: "recurrence",
+      header: "复发",
+      render: (issue) => (
+        <span
+          className="text-xs text-muted-foreground"
+          title={
+            issue.last_recurred_at != null
+              ? `最近复发 ${formatDateTime(issue.last_recurred_at)}`
+              : undefined
+          }
+        >
+          {issue.recurrence_count ?? 0}
+          {issue.last_recurred_at != null ? (
+            <span className="ml-1 text-[10px]">{formatDateTime(issue.last_recurred_at)}</span>
+          ) : null}
+        </span>
+      ),
+    },
+    {
       key: "updated",
       header: "更新时间",
       render: (issue) => (

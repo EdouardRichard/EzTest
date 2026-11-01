@@ -15,10 +15,12 @@ import { formatDateTime } from "@/lib/format"
 
 import {
   REPORT_KIND_LABELS,
+  REPORT_PDF_STATUS_LABELS,
   REPORT_REF_LABELS,
   REPORT_RENDER_STATUS_LABELS,
   REPORT_STATUS_LABELS,
   type ReportDetailView,
+  type ReportPDFStatus,
   type ReportRefKind,
   type ReportRefView,
   type ReportRevisionView,
@@ -37,11 +39,15 @@ export type ReportDetailPanelProps = {
   onRevisionChange: (revision: number) => void
   onOpenHTML: () => void
   onDownloadHTML?: () => void
+  /** P7 PDF download (blob + server filename); disabled unless the PDF is done. */
+  onDownloadPDF?: () => void
   onRegenerate?: () => void
   /** Global reports reuse this panel without download/regenerate/export. */
   readOnly?: boolean
   /** True while the HTML bytes are being fetched. */
   opening: boolean
+  /** True while the PDF bytes are being fetched. */
+  downloadingPDF: boolean
   /** True while a regenerate request is being submitted. */
   regenerating: boolean
   actionError: unknown
@@ -52,6 +58,23 @@ const STATUS_TONE: Record<ReportStatus, BadgeTone> = {
   draft: "neutral",
   published: "success",
   stale: "warning",
+}
+
+const PDF_STATUS_TONE: Record<ReportPDFStatus, BadgeTone> = {
+  pending: "neutral",
+  running: "info",
+  done: "success",
+  failed: "danger",
+  disabled: "neutral",
+}
+
+/**
+ * Pre-P7 fixtures/backends omit `pdf_status`; derive the same state from the
+ * widened `pdf_available` boolean so the old payload still renders sensibly.
+ */
+function pdfStatusOf(revision: ReportRevisionView): ReportPDFStatus {
+  if (revision.pdf_status !== undefined) return revision.pdf_status
+  return revision.pdf_available ? "done" : "disabled"
 }
 
 function reportRefHref(versionId: string, ref: ReportRefView): string {
@@ -125,9 +148,11 @@ export function ReportDetailPanel({
   onRevisionChange,
   onOpenHTML,
   onDownloadHTML,
+  onDownloadPDF,
   onRegenerate,
   readOnly = false,
   opening,
+  downloadingPDF,
   regenerating,
   actionError,
   notice,
@@ -166,6 +191,10 @@ export function ReportDetailPanel({
   const htmlAvailable = revision?.html_available === true
   const generateState = revision?.render_status ?? null
   const generated = generateState === "done" && htmlAvailable
+  const pdfStatus = revision === null ? null : pdfStatusOf(revision)
+  const pdfDownloadable = pdfStatus === "done" && revision?.pdf_available === true
+  const pdfRenderedAt = revision?.pdf_rendered_at ?? null
+  const pdfError = revision?.pdf_error ?? null
 
   return (
     <section data-testid="report-detail" aria-label="报告详情" className="surface-card p-4">
@@ -227,7 +256,9 @@ export function ReportDetailPanel({
             <dt className="text-muted-foreground">修订</dt>
             <dd className="font-medium text-foreground">v{revision.revision}</dd>
             <dt className="text-muted-foreground">as-of</dt>
-            <dd className="text-foreground">{formatDateTime(revision.as_of)}</dd>
+            <dd data-testid="report-as-of" className="text-foreground">
+              {formatDateTime(revision.as_of)}
+            </dd>
             <dt className="text-muted-foreground">模板版本</dt>
             <dd className="text-foreground">{revision.template_version}</dd>
             <dt className="text-muted-foreground">输入指纹</dt>
@@ -241,8 +272,51 @@ export function ReportDetailPanel({
                 <span className="ml-1 text-destructive">，请重新生成</span>
               ) : null}
             </dd>
+            {pdfStatus !== null ? (
+              <>
+                <dt className="text-muted-foreground">PDF 状态</dt>
+                <dd className="text-foreground">
+                  <span data-testid="report-pdf-status">
+                    <Badge tone={PDF_STATUS_TONE[pdfStatus]}>
+                      {REPORT_PDF_STATUS_LABELS[pdfStatus]}
+                    </Badge>
+                  </span>
+                </dd>
+              </>
+            ) : null}
+            {pdfRenderedAt !== null ? (
+              <>
+                <dt className="text-muted-foreground">PDF 生成时间</dt>
+                <dd data-testid="report-pdf-rendered-at" className="text-foreground">
+                  {formatDateTime(pdfRenderedAt)}
+                </dd>
+              </>
+            ) : null}
           </dl>
         )}
+
+        {pdfError !== null ? (
+          <p
+            data-testid="report-pdf-error"
+            className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-[11px] text-destructive"
+          >
+            PDF 生成失败：{pdfError}
+          </p>
+        ) : null}
+
+        {pdfStatus === "pending" || pdfStatus === "running" ? (
+          <p data-testid="report-pdf-hint" className="text-[11px] text-muted-foreground">
+            PDF 正在后台生成，完成后可下载；HTML 不受影响。
+          </p>
+        ) : pdfStatus === "failed" ? (
+          <p data-testid="report-pdf-hint" className="text-[11px] text-muted-foreground">
+            PDF 生成失败；系统会按重试上限自动重试，也可在修复后重新生成报告。
+          </p>
+        ) : pdfStatus === "disabled" ? (
+          <p data-testid="report-pdf-hint" className="text-[11px] text-muted-foreground">
+            PDF 生成已关闭（设置项 report.render_pdf=false），HTML 与修订不受影响。
+          </p>
+        ) : null}
 
         <div className="flex flex-wrap items-center gap-2 border-t border-border pt-3">
           <Button size="sm" disabled={!generated || opening || regenerating} onClick={onOpenHTML}>
@@ -278,8 +352,14 @@ export function ReportDetailPanel({
                 <RefreshCw className="size-3.5" aria-hidden="true" />
                 重新生成
               </Button>
-              <Button size="sm" variant="secondary" disabled title="PDF 导出属于 P7 阶段">
-                PDF（P7）
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={!pdfDownloadable || opening || downloadingPDF || regenerating}
+                onClick={() => onDownloadPDF?.()}
+              >
+                <Download className="size-3.5" aria-hidden="true" />
+                {downloadingPDF ? "正在下载 PDF…" : "下载 PDF"}
               </Button>
             </>
           )}

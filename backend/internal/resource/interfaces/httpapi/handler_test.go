@@ -17,6 +17,8 @@ import (
 
 var testNow = time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 
+func familyPtr(value string) *string { return &value }
+
 type fakeService struct {
 	err error
 
@@ -281,7 +283,7 @@ func sampleViews() (resourceapp.SUTView, resourceapp.EnvironmentView, resourceap
 		CreatedAt: testNow, UpdatedAt: testNow,
 	}
 	sut := resourceapp.SUTView{
-		ID: "1001", Name: "Order Center", Intro: "orders",
+		ID: "1001", Name: "Order Center", Intro: "orders", Family: familyPtr("payments"),
 		Environments: []resourceapp.EnvironmentView{environment},
 		CreatedAt:    testNow, UpdatedAt: testNow,
 	}
@@ -353,6 +355,100 @@ func TestCreateSUTShape(t *testing.T) {
 	}
 	if svc.lastActor != 42 || svc.lastSUTInput.Name != "Order Center" || svc.lastSUTInput.Intro != "orders" {
 		t.Fatalf("service call = %#v actor=%d", svc.lastSUTInput, svc.lastActor)
+	}
+}
+
+func TestCreateSUTFamilyPayload(t *testing.T) {
+	handler, svc := newHandler()
+	req := request(http.MethodPost, "/api/resources/suts",
+		`{"name":"Order Center","intro":"orders","family":"payments"}`, admin)
+	rec := httptest.NewRecorder()
+	handler.CreateSUT(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if svc.lastSUTInput.Family == nil || *svc.lastSUTInput.Family != "payments" {
+		t.Fatalf("input = %#v", svc.lastSUTInput)
+	}
+	var dto sutDTO
+	decodeData(t, rec, &dto)
+	if dto.Family == nil || *dto.Family != "payments" {
+		t.Fatalf("dto = %#v", dto)
+	}
+}
+
+func TestCreateSUTOmittingFamilyLeavesItUnset(t *testing.T) {
+	handler, svc := newHandler()
+	svc.sut.Family = nil
+	svc.suts[0].Family = nil
+	svc.catalog[0].Family = nil
+	req := request(http.MethodPost, "/api/resources/suts", `{"name":"No Family"}`, admin)
+	rec := httptest.NewRecorder()
+	handler.CreateSUT(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if svc.lastSUTInput.Family != nil {
+		t.Fatalf("input family = %v", svc.lastSUTInput.Family)
+	}
+	var raw map[string]any
+	decodeData(t, rec, &raw)
+	value, present := raw["family"]
+	if !present || value != nil {
+		t.Fatalf("family = %v (present %v), want explicit null", value, present)
+	}
+}
+
+func TestUpdateSUTFamilySetAndClear(t *testing.T) {
+	handler, svc := newHandler()
+
+	req := request(http.MethodPatch, "/api/resources/suts/1001", `{"family":"order-center"}`, admin)
+	req.SetPathValue("id", "1001")
+	rec := httptest.NewRecorder()
+	handler.UpdateSUT(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("set status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if svc.lastSUTPatch.Family == nil || *svc.lastSUTPatch.Family != "order-center" {
+		t.Fatalf("set patch = %#v", svc.lastSUTPatch)
+	}
+
+	req = request(http.MethodPatch, "/api/resources/suts/1001", `{"family":""}`, admin)
+	req.SetPathValue("id", "1001")
+	rec = httptest.NewRecorder()
+	handler.UpdateSUT(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("clear status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if svc.lastSUTPatch.Family == nil || *svc.lastSUTPatch.Family != "" {
+		t.Fatalf("clear patch = %#v", svc.lastSUTPatch)
+	}
+
+	req = request(http.MethodPatch, "/api/resources/suts/1001", `{"name":"Renamed"}`, admin)
+	req.SetPathValue("id", "1001")
+	rec = httptest.NewRecorder()
+	handler.UpdateSUT(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("omitted status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if svc.lastSUTPatch.Family != nil {
+		t.Fatalf("omitted patch family = %v", svc.lastSUTPatch.Family)
+	}
+}
+
+func TestGetSUTIncludesFamily(t *testing.T) {
+	handler, _ := newHandler()
+	req := request(http.MethodGet, "/api/resources/suts/1001", "", plainUser)
+	req.SetPathValue("id", "1001")
+	rec := httptest.NewRecorder()
+	handler.GetSUT(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var dto sutDTO
+	decodeData(t, rec, &dto)
+	if dto.Family == nil || *dto.Family != "payments" {
+		t.Fatalf("dto = %#v", dto)
 	}
 }
 

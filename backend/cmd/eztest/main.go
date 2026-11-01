@@ -50,6 +50,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/identity/infrastructure"
 	"github.com/EdouardRichard/EzTest/backend/internal/llm/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/llm/infrastructure"
+	orchestrationapp "github.com/EdouardRichard/EzTest/backend/internal/orchestration/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/clock"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	"github.com/EdouardRichard/EzTest/backend/internal/resource/application"
@@ -77,14 +78,18 @@ func hostName() string {
 }
 
 // runReconciler scans the P1 control plane every three seconds and once at
-// startup. It only ensures work items; business actions remain in workers.
-func runReconciler(ctx context.Context, reconciler *agentapp.Reconciler) {
+// startup. It only ensures work items; business actions remain in workers. The
+// loop is leader-gated per tick so exactly one replica reconciles (P7 §4.5).
+func runReconciler(ctx context.Context, gate orchestrationapp.LeaderGate, reconciler *agentapp.Reconciler) {
 	if reconciler == nil {
 		return
 	}
-	if err := reconciler.Reconcile(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		log.Printf("eztest: reconcile: %v", err)
+	reconcile := func() {
+		if err := reconciler.Reconcile(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("eztest: reconcile: %v", err)
+		}
 	}
+	p7RunGated(gate, reconcile)
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -92,9 +97,7 @@ func runReconciler(ctx context.Context, reconciler *agentapp.Reconciler) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := reconciler.Reconcile(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				log.Printf("eztest: reconcile: %v", err)
-			}
+			p7RunGated(gate, reconcile)
 		}
 	}
 }
@@ -366,9 +369,11 @@ var _ executionapp.SUTContextRepository = executionSUTContexts{}
 // recovery sweep. Intent generation scans version content every few seconds
 // because case confirmations can arrive without an execution event; the scan is
 // idempotent (P3 §5.1). Errors are logged and retried; the loops exit with the
-// process context.
+// process context. The whole tick is leader-gated (P7 §4.5: scheduler+recovery
+// run on the leader only; in-flight work stays protected by leases).
 func runExecutionScheduler(
 	ctx context.Context,
+	gate orchestrationapp.LeaderGate,
 	intents *executionapp.IntentService,
 	versions *versionapp.Service,
 	scheduler *executionapp.Scheduler,
@@ -395,19 +400,21 @@ func runExecutionScheduler(
 		}
 	}
 	tick := func(scan bool) {
-		if scan {
-			scanIntents()
-		}
-		if scheduler != nil {
-			if err := scheduler.Reconcile(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				log.Printf("eztest: execution scheduler: %v", err)
+		p7RunGated(gate, func() {
+			if scan {
+				scanIntents()
 			}
-		}
-		if recovery != nil {
-			if err := recovery.Reconcile(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				log.Printf("eztest: execution recovery: %v", err)
+			if scheduler != nil {
+				if err := scheduler.Reconcile(ctx); err != nil && !errors.Is(err, context.Canceled) {
+					log.Printf("eztest: execution scheduler: %v", err)
+				}
 			}
-		}
+			if recovery != nil {
+				if err := recovery.Reconcile(ctx); err != nil && !errors.Is(err, context.Canceled) {
+					log.Printf("eztest: execution recovery: %v", err)
+				}
+			}
+		})
 	}
 	tick(true)
 	ticker := time.NewTicker(time.Second)
@@ -427,15 +434,17 @@ func runExecutionScheduler(
 // runExecutorPoller pulls the executor /healthz every
 // execution.executor_heartbeat_seconds (P3 §6.2, P3-D-01). The interval is
 // re-read from the hot settings cache each cycle so an admin change applies
-// without a restart.
-func runExecutorPoller(ctx context.Context, registry *executionapp.Registry, settings *settingsapp.Service) {
+// without a restart. Each poll is leader-gated (P7 §4.5).
+func runExecutorPoller(ctx context.Context, gate orchestrationapp.LeaderGate, registry *executionapp.Registry, settings *settingsapp.Service) {
 	if registry == nil {
 		return
 	}
 	poll := func() {
-		if err := registry.PollOnce(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("eztest: executor poll: %v", err)
-		}
+		p7RunGated(gate, func() {
+			if err := registry.PollOnce(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("eztest: executor poll: %v", err)
+			}
+		})
 	}
 	poll()
 	for {
@@ -483,6 +492,11 @@ func main() {
 		log.Fatalf("eztest: seed settings: %v", err)
 	}
 
+	// P7 boot ordering: settings are seeded above, then the orchestration
+	// registry allocates this replica's snowflake node, and only then is the
+	// real ID generator built for every service (S4 report, Task 19). The
+	// bootstrap generator is used solely for the api_instance row; reusing a
+	// shared settings node for business IDs would collide across replicas.
 	nodeID := int64(1)
 	nodeSetting, err := settingsRepo.Get(ctx, "runtime.snowflake_node_id")
 	if err != nil {
@@ -491,14 +505,50 @@ func main() {
 	if err := json.Unmarshal(nodeSetting.Value, &nodeID); err != nil {
 		log.Fatalf("eztest: parse snowflake node: %v", err)
 	}
-	ids, err := id.NewSnowflake(nodeID)
+	bootstrapIDs, err := id.NewSnowflake(nodeID)
+	if err != nil {
+		log.Fatalf("eztest: configure bootstrap snowflake: %v", err)
+	}
+
+	clk := clock.System{}
+	// One eventing service per replica, including the cross-instance NOTIFY
+	// notifier; the local hub is shared with the P7 SSE listener below.
+	eventHub := eventingapp.NewHub(eventingapp.DefaultHubBuffer)
+	eventSvc := eventingapp.New(eventingpg.New(pool), eventHub, eventingpg.NewNotifier(pool))
+
+	instanceKey := p7InstanceKey()
+	p7OrchestrationRuntime, err := startP7Orchestration(ctx, p7OrchestrationDeps{
+		Pool:         pool,
+		SettingsRepo: settingsRepo,
+		BootstrapIDs: bootstrapIDs,
+		Clock:        clk,
+		Events:       eventSvc,
+		Hostname:     hostName(),
+		PID:          os.Getpid(),
+		APIPort:      cfg.APIPort,
+		Version:      version,
+		InstanceKey:  instanceKey,
+	})
+	if err != nil {
+		log.Fatalf("eztest: register api instance: %v", err)
+	}
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), p7StopTimeout)
+		defer cancel()
+		if err := p7OrchestrationRuntime.Service.Stop(stopCtx); err != nil {
+			log.Printf("eztest: stop api instance: %v", err)
+		}
+	}()
+
+	ids, err := id.NewSnowflake(p7OrchestrationRuntime.Service.NodeID())
 	if err != nil {
 		log.Fatalf("eztest: configure snowflake: %v", err)
 	}
 
-	clk := clock.System{}
 	auditSvc := auditapp.New(auditpg.New(pool), ids, clk)
-	eventSvc := eventingapp.New(eventingpg.New(pool), eventingapp.NewHub(eventingapp.DefaultHubBuffer))
+	// The registry is constructed before auditSvc exists; attach the real
+	// recorder now that the allocated node seeded the generator.
+	p7OrchestrationRuntime.LateAudit.Set(auditSvc)
 	settingsSvc := settingsapp.New(settingsRepo, definitions, ids, clk, auditSvc, eventSvc)
 	if err := settingsSvc.Reload(ctx); err != nil {
 		log.Fatalf("eztest: load settings: %v", err)
@@ -597,6 +647,12 @@ func main() {
 		Settings: settingsSvc,
 		Clock:    clk,
 		IDs:      ids,
+		// P7 multi-endpoint pull: each execution.executor_urls entry gets its
+		// own client/probe so one unreachable endpoint cannot hide the others.
+		ProbeFactory: func(endpoint string) executionapp.ExecutorProbe {
+			return executionadapters.NewExecutorProbe(
+				executioninfra.NewClient(endpoint, executorToken, executioninfra.DefaultTimeout))
+		},
 	})
 	executionCanceller := &caseRunCanceller{}
 	executionHumans := executionapp.NewHumanService(executionapp.HumanServiceDeps{
@@ -676,12 +732,17 @@ func main() {
 		Audit:     auditSvc,
 	})
 	executionScheduler := executionapp.NewScheduler(executionapp.SchedulerDeps{
-		Intents:     executionRepo.Intents,
-		Waves:       executionRepo.Waves,
-		CaseRuns:    executionRepo.CaseRuns,
-		Cases:       executionCases,
-		Versions:    executionVersionAdapter,
-		Executors:   executorRegistry,
+		Intents:  executionRepo.Intents,
+		Waves:    executionRepo.Waves,
+		CaseRuns: executionRepo.CaseRuns,
+		Cases:    executionCases,
+		Versions: executionVersionAdapter,
+		// Dispatch restriction (Task 19, S5 report §3): the runner's browser
+		// adapter is bound to the primary executor client, so Select never
+		// returns a secondary/push-registered endpoint. Multi-endpoint rows are
+		// still polled, heartbeated, registered and admin-listed; per-executor
+		// browser routing stays a P8 item.
+		Executors:   primaryExecutorRegistry{registry: executorRegistry, primary: executorURL},
 		WorkQueue:   executionQueue,
 		Quota:       execution.QuotaFromSettings(3, 2, 1),
 		QuotaReader: executionQuotaReader{caseRuns: executionRepo.CaseRuns, intents: executionRepo.Intents},
@@ -765,9 +826,11 @@ func main() {
 	issueSvc.WithTriageReader(analysisRepo)
 	analysisSvc := deliveryapp.NewAnalysisService(analysisRepo, issueSvc, clk)
 	analysisSvc.WithTriagePoster(deliveryTriagePoster{room: teamRoom})
+	pdfEnabled, pdfAttempts := p7RenderSettings(ctx, settingsSvc)
 	reportSvc := deliveryapp.NewReportService(
 		reportRepo, reportRenderer, deliveryContent, deliveryadapters.NewReportDataReader(readDeps),
-		deliveryEvents, deliveryAudit, clk, p4Tasks, p4SectionOptions(ctx, settingsSvc))
+		deliveryEvents, deliveryAudit, clk, p4Tasks, p4SectionOptions(ctx, settingsSvc),
+	).WithRenderJobs(reportRepo, pdfEnabled, pdfAttempts)
 
 	closureReaders := versionadapters.NewClosureReaders(versionadapters.Deps{
 		Requirements: requirementRepo,
@@ -858,6 +921,33 @@ func main() {
 	}
 	p6Read.Handlers.AgentCenter = p6Agent.AgentCenter
 	p6Read.Handlers.Profiles = p6Agent.Profiles
+
+	// P7 services: knowledge (context + agent/tool bridge), storage GC and the
+	// report PDF worker/ensurer. Constructed before the agent runner so the
+	// runner and tool registry receive the knowledge adapter.
+	p7rt, err := newP7Runtime(ctx, p7RuntimeDeps{
+		Pool:           pool,
+		Settings:       settingsSvc,
+		IDs:            ids,
+		Clock:          clk,
+		Audit:          auditSvc,
+		Events:         eventSvc,
+		Hub:            eventHub,
+		Queue:          workQueue,
+		ReportRepo:     reportRepo,
+		ReportContent:  deliveryContent,
+		DeliveryEvents: deliveryEvents,
+		DeliveryAudit:  deliveryAudit,
+		Orchestrator:   p7OrchestrationRuntime.Service,
+		Leader:         p7OrchestrationRuntime.Leader,
+		InstanceKey:    instanceKey,
+		InstanceID:     instanceID,
+		Logger:         slog.Default(),
+	})
+	if err != nil {
+		log.Fatalf("eztest: wire P7 runtime: %v", err)
+	}
+
 	// The P5 tool deps bind the constructed services to this process; the
 	// execution.visual_assert group resolves its port from the case runner.
 	p5Tools := p5.Tools
@@ -875,6 +965,9 @@ func main() {
 		Attachments:  ports,
 		TeamRoom:     teamRoom,
 		Content:      ports,
+		// P7 knowledge injection + usage accounting (S6 report §5).
+		Knowledge:      p7rt.KnowledgeAdapter,
+		KnowledgeUsage: p7rt.KnowledgeAdapter,
 		ToolDeps: tools.Deps{
 			Requirement: ports,
 			Attachment:  ports,
@@ -882,12 +975,13 @@ func main() {
 			Design:      designadapter.New(designGraph),
 			Execution:   executionRunner,
 			P5:          p5Tools,
+			P7:          tools.P7Deps{Knowledge: p7rt.KnowledgeAdapter},
 		},
-		TaskProvider:    executionadapters.NewTaskProvider(executionRunner, p5.VisualConfigs),
-		RunCanceller:    executionRunner,
+		TaskProvider:         executionadapters.NewTaskProvider(executionRunner, p5.VisualConfigs),
+		RunCanceller:         executionRunner,
 		ReportFinalizer:      p4ReportFinalizer{service: reportSvc},
 		RequirementFinalizer: versionapp.NewClosureFinalizer(closureSvc),
-		InstanceID:      instanceID,
+		InstanceID:           instanceID,
 	})
 	worker := agentapp.NewWorker(workQueue, runner, settingsSvc, slog.Default(), instanceID,
 		agentapp.WithWorkerEvents(eventSvc),
@@ -918,22 +1012,28 @@ func main() {
 		Design:          designPlanner,
 		P4:              p4.NewEnsurer(issueSvc, reportSvc, closureSvc, versionCloseSvc),
 		RunningVersions: versionSvc,
+		// P7 report PDF backfill runs after the P4 rules (S1 report §5.5).
+		P7: p7rt.RenderEnsurer,
 	})
 	background.Add(1)
 	go func() {
 		defer background.Done()
-		runReconciler(ctx, reconciler)
+		runReconciler(ctx, p7OrchestrationRuntime.Leader, reconciler)
 	}()
 	background.Add(1)
 	go func() {
 		defer background.Done()
-		runExecutionScheduler(ctx, executionIntents, versionSvc, executionScheduler, executionRecovery)
+		runExecutionScheduler(ctx, p7OrchestrationRuntime.Leader, executionIntents, versionSvc, executionScheduler, executionRecovery)
 	}()
 	background.Add(1)
 	go func() {
 		defer background.Done()
-		runExecutorPoller(ctx, executorRegistry, settingsSvc)
+		runExecutorPoller(ctx, p7OrchestrationRuntime.Leader, executorRegistry, settingsSvc)
 	}()
+
+	// P7 background loops: leader election, SSE listener, instance maintenance,
+	// per-replica report PDF worker and the leader-gated GC worker.
+	p7rt.StartWorkers(ctx, &background, settingsSvc)
 
 	handler := server.New(server.Deps{
 		Config:        cfg,
@@ -961,6 +1061,7 @@ func main() {
 		CodeIntel:     p5.CodeIntel,
 		Visual:        p5.Visual,
 		P6:            &p6Read.Handlers,
+		P7:            p7rt.p7ServerHandlers(),
 	})
 
 	srv := &http.Server{
@@ -990,5 +1091,10 @@ func main() {
 		log.Printf("eztest: graceful shutdown failed: %v", err)
 	}
 	background.Wait()
+	// Graceful registry shutdown marks this api_instance stopped and releases
+	// its node ID for the next replica (the deferred Stop is idempotent).
+	if err := p7OrchestrationRuntime.Service.Stop(shutdownCtx); err != nil {
+		log.Printf("eztest: stop api instance: %v", err)
+	}
 	log.Printf("eztest: stopped")
 }

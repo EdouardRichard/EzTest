@@ -14,10 +14,16 @@ var (
 )
 
 // MaxIssueMergeChain bounds how many merged_into hops ValidateMerge follows
-// (spec §5.2). A chain still open after this budget is rejected as
-// merge_target_invalid, never as merge_cycle: the walk stops before it could
-// prove that the chain reaches the source.
+// (spec §5.2) and how many hops recurrence redirection walks (spec §4.6). A
+// chain still open after this budget is rejected as merge_target_invalid, never
+// as merge_cycle: the walk stops before it could prove that the chain reaches
+// the source.
 const MaxIssueMergeChain = 16
+
+// IssueRefRoleRecurrence is the ref role of a recurring failure redirected to a
+// merge target (spec §4.6). Source refs keep IssueRefRoleSource; the unique
+// (issue_id, kind, ref_id, role) key makes a repeated recurrence ref a no-op.
+const IssueRefRoleRecurrence = "recurrence"
 
 // Stable merge conflict reasons (spec §5.2 details.reason subcodes).
 const (
@@ -119,4 +125,58 @@ func mergeChainError(target Issue, sourceID int64, lookup func(int64) (Issue, bo
 		return nil
 	}
 	return &MergeError{Reason: MergeReasonTargetInvalid}
+}
+
+// MergeChain follows the merged_into links of a merged issue up to
+// MaxIssueMergeChain hops (spec §4.6) and returns the resolved target issues in
+// walk order: the direct merge target first, the first non-merged issue last.
+// A non-merged issue yields an empty chain.
+//
+// ok is false when the chain cannot be redirected: a link is missing or has no
+// positive ID, a target belongs to another version, the walk revisits a node
+// (cycle), or the chain is still merged after the hop budget. Callers treat a
+// false walk as a redirect failure and fall back to the pre-P7 dedupe behavior;
+// the returned slice then holds the targets resolved before the failure.
+func MergeChain(issue Issue, lookup func(int64) (Issue, bool)) ([]Issue, bool) {
+	if issue.MergedIntoID == nil {
+		return nil, true
+	}
+	visited := map[int64]struct{}{issue.ID: {}}
+	targets := make([]Issue, 0, 4)
+	current := issue
+	for hop := 0; hop < MaxIssueMergeChain; hop++ {
+		if current.MergedIntoID == nil {
+			// The last resolved node is not merged, so the chain terminated
+			// before consuming the budget.
+			return targets, true
+		}
+		nextID := *current.MergedIntoID
+		if nextID <= 0 {
+			return targets, false
+		}
+		if _, seen := visited[nextID]; seen {
+			return targets, false
+		}
+		visited[nextID] = struct{}{}
+		if lookup == nil {
+			return targets, false
+		}
+		next, ok := lookup(nextID)
+		if !ok || next.ID != nextID {
+			return targets, false
+		}
+		if next.VersionID != issue.VersionID {
+			// P4 merges are same-version; a foreign target cannot receive the
+			// recurrence refs of this version's issue.
+			return targets, false
+		}
+		targets = append(targets, next)
+		if next.Status != IssueStatusMerged {
+			return targets, true
+		}
+		current = next
+	}
+	// The budget followed MaxIssueMergeChain links and the last target is still
+	// merged: the chain may continue beyond the budget, so it is not redirectable.
+	return targets, false
 }

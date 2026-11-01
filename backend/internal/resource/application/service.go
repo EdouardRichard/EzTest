@@ -51,8 +51,9 @@ func (s *Service) SetUsageChecker(usage UsageChecker) {
 
 // SUTInput is the editable payload for creating a SUT.
 type SUTInput struct {
-	Name  string
-	Intro string
+	Name   string
+	Intro  string
+	Family *string
 }
 
 // EnvironmentInput is the editable payload for creating an environment.
@@ -184,18 +185,35 @@ type RepositoryPatch struct {
 	Status  *string
 }
 
-// SUTPatch is a partial SUT update; nil fields are left untouched.
+// SUTPatch is a partial SUT update; nil fields are left untouched. A non-nil
+// Family replaces the stored family; the empty string clears it.
 type SUTPatch struct {
-	Name  *string
-	Intro *string
+	Name   *string
+	Intro  *string
+	Family *string
+}
+
+// normalizeFamilyInput trims an optional API family. A blank value means no
+// family (explicit clear on update, unset on create); present values must pass
+// the domain family rules.
+func normalizeFamilyInput(raw *string) (*string, error) {
+	if raw == nil || strings.TrimSpace(*raw) == "" {
+		return nil, nil
+	}
+	return resource.NormalizeFamily(raw)
 }
 
 // CreateSUT validates and stores a new SUT.
 func (s *Service) CreateSUT(ctx context.Context, input SUTInput, actorID int64) (SUTView, error) {
+	family, err := normalizeFamilyInput(input.Family)
+	if err != nil {
+		return SUTView{}, err
+	}
 	at := s.clock.Now()
 	sut := resource.SUT{
 		Name:      input.Name,
 		Intro:     input.Intro,
+		Family:    family,
 		CreatedBy: actorID,
 		CreatedAt: at,
 		UpdatedAt: at,
@@ -225,6 +243,13 @@ func (s *Service) UpdateSUT(ctx context.Context, id int64, patch SUTPatch, actor
 	}
 	if patch.Intro != nil {
 		sut.Intro = *patch.Intro
+	}
+	if patch.Family != nil {
+		family, err := normalizeFamilyInput(patch.Family)
+		if err != nil {
+			return SUTView{}, err
+		}
+		sut.Family = family
 	}
 	sut.UpdatedAt = s.clock.Now()
 	if err := sut.Validate(); err != nil {
@@ -1580,6 +1605,7 @@ func toSUTView(sut resource.SUT) SUTView {
 		ID:           platformid.Format(sut.ID),
 		Name:         sut.Name,
 		Intro:        sut.Intro,
+		Family:       sut.Family,
 		Environments: []EnvironmentView{},
 		CreatedAt:    sut.CreatedAt,
 		UpdatedAt:    sut.UpdatedAt,

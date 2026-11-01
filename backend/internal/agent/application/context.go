@@ -55,6 +55,9 @@ type VersionPack struct {
 	APIs         []string
 	Requirements []string
 	Attachments  []string
+	// Knowledge is the approved knowledge injected for the run (P7). It is a
+	// reference set only; rendering never exposes the full item content.
+	Knowledge []KnowledgeRef
 }
 
 // Message is one conversation message supplied to the context builder and the
@@ -136,6 +139,9 @@ func NewContextBuilder(settings SettingsReader, summarizer Summarizer) *ContextB
 func (b *ContextBuilder) Build(ctx context.Context, in ContextInput) (ContextPacket, CompactInfo, error) {
 	budget, threshold, keepRecent := b.resolveBudget(ctx, in)
 	info := CompactInfo{Budget: budget}
+	// Knowledge is supplemental reference data: cap it at the injection budget
+	// in ts_rank order before it can consume the context window.
+	in.VersionPack.Knowledge = fitKnowledge(in.VersionPack.Knowledge, b.knowledgeBudgetTokens(ctx))
 
 	// Keep the recent window bounded even when the whole context is below the
 	// compaction threshold. Older messages are folded into the rolling summary
@@ -267,7 +273,7 @@ func compactInput(in ContextInput, budget, keepRecent int) (ContextInput, Compac
 		out.Conversation.PinnedFacts = out.Conversation.PinnedFacts[len(out.Conversation.PinnedFacts)-MaxPinnedFacts:]
 	}
 
-	for _, name := range []string{"artifacts", "team_room", "version_pack"} {
+	for _, name := range []string{"artifacts", "team_room", "knowledge", "version_pack"} {
 		if totalTokens(renderSections(out)) <= budget {
 			break
 		}
@@ -276,6 +282,8 @@ func compactInput(in ContextInput, budget, keepRecent int) (ContextInput, Compac
 			out.Artifacts = nil
 		case "team_room":
 			out.TeamRoom = TeamRoomContext{}
+		case "knowledge":
+			out.VersionPack.Knowledge = nil
 		case "version_pack":
 			out.VersionPack = VersionPack{}
 		}
@@ -305,15 +313,24 @@ func mergeCompactInfo(target *CompactInfo, addition CompactInfo) {
 	}
 }
 
-// renderSections builds the five ordered context sections (spec §5.3).
+// renderSections builds the ordered context sections (spec §5.3). The P7
+// knowledge section is only present when references were injected, so an empty
+// section is dropped cleanly instead of rendering an empty heading.
 func renderSections(in ContextInput) []Section {
-	return []Section{
-		{Name: "system", Content: systemContent(in)},
-		{Name: "version_pack", Content: versionPackContent(in.VersionPack), Optional: true},
-		{Name: "conversation", Content: conversationContent(in.Conversation)},
-		{Name: "team_room", Content: teamRoomContent(in.TeamRoom), Optional: true},
-		{Name: "artifacts", Content: artifactsContent(in.Artifacts), Optional: true},
+	sections := make([]Section, 0, 6)
+	sections = append(sections,
+		Section{Name: "system", Content: systemContent(in)},
+		Section{Name: "version_pack", Content: versionPackContent(in.VersionPack), Optional: true},
+	)
+	if content := knowledgeContent(in.VersionPack.Knowledge); content != "" {
+		sections = append(sections, Section{Name: knowledgeSectionName, Content: content, Optional: true})
 	}
+	sections = append(sections,
+		Section{Name: "conversation", Content: conversationContent(in.Conversation)},
+		Section{Name: "team_room", Content: teamRoomContent(in.TeamRoom), Optional: true},
+		Section{Name: "artifacts", Content: artifactsContent(in.Artifacts), Optional: true},
+	)
+	return sections
 }
 
 func systemContent(in ContextInput) string {

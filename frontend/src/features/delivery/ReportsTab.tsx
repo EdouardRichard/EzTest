@@ -15,7 +15,7 @@ import { Textarea } from "@/components/ui/Textarea"
 import { useVersionEvents } from "@/features/clarification/useVersionEvents"
 import { formatDateTime } from "@/lib/format"
 
-import { downloadHTML, getReport, getRevision, listReports, regenerate } from "./api"
+import { downloadHTML, downloadPDF, getReport, getRevision, listReports, regenerate } from "./api"
 import { ReportDetailPanel } from "./ReportDetailPanel"
 import {
   REPORT_KIND_LABELS,
@@ -88,6 +88,7 @@ export function ReportsTab({ versionId }: ReportsTabProps) {
   const [detailToken, setDetailToken] = useState(0)
 
   const [opening, setOpening] = useState(false)
+  const [downloadingPDF, setDownloadingPDF] = useState(false)
   const [actionError, setActionError] = useState<unknown>(null)
   const [notice, setNotice] = useState<string | null>(null)
 
@@ -355,6 +356,25 @@ export function ReportsTab({ versionId }: ReportsTabProps) {
     }
   }
 
+  async function downloadReportPDF(): Promise<void> {
+    if (detail === null || revision === null || !revision.pdf_available) return
+    setDownloadingPDF(true)
+    setActionError(null)
+    try {
+      const download = await downloadPDF(versionId, detail.id, revision.revision)
+      saveBlob(
+        download.blob,
+        download.filename.length > 0
+          ? download.filename
+          : `report-${detail.id}-r${revision.revision}.pdf`,
+      )
+    } catch (cause) {
+      setActionError(cause)
+    } finally {
+      setDownloadingPDF(false)
+    }
+  }
+
   async function submitRegenerate(): Promise<void> {
     if (detail === null || regenerating) return
     setRegenerating(true)
@@ -491,11 +511,15 @@ export function ReportsTab({ versionId }: ReportsTabProps) {
           onDownloadHTML={() => {
             void downloadReportHTML()
           }}
+          onDownloadPDF={() => {
+            void downloadReportPDF()
+          }}
           onRegenerate={() => {
             setRegenerateError(null)
             setRegenerateOpen(true)
           }}
           opening={opening}
+          downloadingPDF={downloadingPDF}
           regenerating={regenerating}
           actionError={actionError}
           notice={notice}

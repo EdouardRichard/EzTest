@@ -76,6 +76,7 @@ describe("SUTPanel", () => {
     expect(screen.getByRole("table", { name: "SUT 列表" })).toBeInTheDocument()
     expect(screen.getByText("订单中心")).toBeInTheDocument()
     expect(screen.getByText("支付网关")).toBeInTheDocument()
+    expect(screen.getByText("payments")).toBeInTheDocument()
     expect(screen.getByRole("table", { name: "环境列表" })).toBeInTheDocument()
     expect(screen.getByText("测试环境")).toBeInTheDocument()
     expect(screen.getByText("预发环境")).toBeInTheDocument()
@@ -156,6 +157,61 @@ describe("SUTPanel", () => {
     )
     expect(onRefresh).toHaveBeenCalledWith("1001")
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+  })
+
+  it("creates a SUT with an optional family and rejects an uppercase family", async () => {
+    vi.mocked(api.createSutWithDefaultEnvironment).mockResolvedValue({
+      sut: sutFixture,
+      environment: environmentFixture,
+    })
+    const { onRefresh } = renderPanel({ scope: { ...baseScope, suts: [], detail: null } })
+
+    fireEvent.click(screen.getAllByRole("button", { name: "新建 SUT" })[0] as HTMLElement)
+    fireEvent.change(screen.getByLabelText("SUT 名称"), { target: { value: "支付网关" } })
+    fireEvent.change(screen.getByLabelText("默认环境名称"), { target: { value: "测试环境" } })
+    fireEvent.change(screen.getByLabelText("环境地址"), {
+      target: { value: "https://pay.test" },
+    })
+    fireEvent.change(screen.getByLabelText("系统族（family）"), {
+      target: { value: "Payments" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "创建 SUT" }))
+
+    expect(await screen.findByText("系统族必须为小写 slug（a-z、0-9、-、_）")).toBeInTheDocument()
+    expect(api.createSutWithDefaultEnvironment).not.toHaveBeenCalled()
+
+    fireEvent.change(screen.getByLabelText("系统族（family）"), {
+      target: { value: "payments" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "创建 SUT" }))
+
+    await waitFor(() =>
+      expect(api.createSutWithDefaultEnvironment).toHaveBeenCalledWith({
+        sut: { name: "支付网关", intro: "", family: "payments" },
+        environment: { name: "测试环境", base_url: "https://pay.test" },
+      }),
+    )
+    expect(onRefresh).toHaveBeenCalledWith("1001")
+  })
+
+  it("edits an existing SUT family and sends it in the update payload", async () => {
+    vi.mocked(api.updateSut).mockResolvedValue({ ...sutFixture, family: "order-center" })
+    const { onRefresh } = renderPanel()
+
+    fireEvent.click(screen.getByRole("button", { name: "编辑 SUT 订单中心" }))
+    fireEvent.change(screen.getByLabelText("系统族（family）"), {
+      target: { value: "order-center" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "保存 SUT" }))
+
+    await waitFor(() =>
+      expect(api.updateSut).toHaveBeenCalledWith("1001", {
+        name: "订单中心",
+        intro: "订单主链路",
+        family: "order-center",
+      }),
+    )
+    expect(onRefresh).toHaveBeenCalled()
   })
 
   it("refreshes the SUT list when the default environment fails after the SUT was created", async () => {

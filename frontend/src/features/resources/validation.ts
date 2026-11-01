@@ -15,6 +15,8 @@ export const API_METHODS: ApiMethod[] = ["GET", "POST", "PUT", "PATCH", "DELETE"
 
 const SUT_NAME_MAX = 100
 const SUT_INTRO_MAX = 2000
+const SUT_FAMILY_MAX = 64
+const SUT_FAMILY_PATTERN = /^[a-z0-9][a-z0-9_-]*$/
 const ENVIRONMENT_NAME_MAX = 100
 const PAGE_NAME_MAX = 200
 const API_NAME_MAX = 200
@@ -46,6 +48,20 @@ export function isHttpUrl(value: string): boolean {
   }
 }
 
+/** Validates the optional P7 SUT family: lowercase slug, at most 64 chars. */
+function checkSutFamily(
+  family: string,
+  errors: FormErrors<{ family?: string }>,
+): FormErrors<{ family?: string }> {
+  if (family.length === 0) return errors
+  if (family.length > SUT_FAMILY_MAX) {
+    errors.family = "系统族不能超过 64 个字符"
+  } else if (!SUT_FAMILY_PATTERN.test(family)) {
+    errors.family = "系统族必须为小写 slug（a-z、0-9、-、_）"
+  }
+  return errors
+}
+
 export function validateSutForm(values: SutFormValues): FormErrors<SutFormValues> {
   const errors: FormErrors<SutFormValues> = {}
   const name = values.name.trim()
@@ -56,6 +72,7 @@ export function validateSutForm(values: SutFormValues): FormErrors<SutFormValues
   if (name.length === 0) errors.name = "请输入 SUT 名称"
   else if (name.length > SUT_NAME_MAX) errors.name = "SUT 名称不能超过 100 个字符"
   if (intro.length > SUT_INTRO_MAX) errors.intro = "简介不能超过 2000 个字符"
+  checkSutFamily((values.family ?? "").trim(), errors)
   if (environmentName.length === 0) errors.environmentName = "请输入默认环境名称"
   else if (environmentName.length > ENVIRONMENT_NAME_MAX) {
     errors.environmentName = "默认环境名称不能超过 100 个字符"
@@ -69,14 +86,16 @@ export function validateSutForm(values: SutFormValues): FormErrors<SutFormValues
 export function validateSutBasicForm(values: {
   name: string
   intro: string
-}): FormErrors<{ name: string; intro: string }> {
-  const errors: FormErrors<{ name: string; intro: string }> = {}
+  family?: string
+}): FormErrors<{ name: string; intro: string; family?: string }> {
+  const errors: FormErrors<{ name: string; intro: string; family?: string }> = {}
   const name = values.name.trim()
   const intro = values.intro.trim()
 
   if (name.length === 0) errors.name = "请输入 SUT 名称"
   else if (name.length > SUT_NAME_MAX) errors.name = "SUT 名称不能超过 100 个字符"
   if (intro.length > SUT_INTRO_MAX) errors.intro = "简介不能超过 2000 个字符"
+  checkSutFamily((values.family ?? "").trim(), errors)
   return errors
 }
 

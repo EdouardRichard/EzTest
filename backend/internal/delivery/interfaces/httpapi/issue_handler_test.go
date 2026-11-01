@@ -306,6 +306,64 @@ func errorDetails(t *testing.T, apiError map[string]any) map[string]any {
 	return details
 }
 
+func TestIssueRecurrenceFieldsAndMergedChainProjection(t *testing.T) {
+	issue := sampleIssue(1001, delivery.IssueStatusMerged)
+	issue.RecurrenceCount = 3
+	lastRecurred := deliveryTestTime.Add(5 * time.Minute)
+	issue.LastRecurredAt = &lastRecurred
+	detail := sampleIssueDetail(issue)
+	detail.MergedChain = []int64{2002, 2003}
+	service := &fakeIssueService{
+		listResult: []delivery.Issue{issue},
+		details:    map[int64]deliveryapp.IssueDetail{1001: detail},
+	}
+	mux := newDeliveryMux(t, New(service))
+
+	recorder := deliveryCall(t, mux, http.MethodGet, "/api/versions/42/issues/1001", "", userActor())
+	requireStatus(t, recorder, http.StatusOK)
+	data := decodeDeliveryObject(t, recorder)
+	if data["recurrence_count"] != float64(3) {
+		t.Errorf("recurrence_count = %v, want 3", data["recurrence_count"])
+	}
+	if data["last_recurred_at"] != "2026-11-01T06:05:00Z" {
+		t.Errorf("last_recurred_at = %v, want the RFC3339 UTC timestamp", data["last_recurred_at"])
+	}
+	chain, ok := data["merged_chain"].([]any)
+	if !ok || len(chain) != 2 || chain[0] != "2002" || chain[1] != "2003" {
+		t.Fatalf("merged_chain = %#v, want [2002 2003]", data["merged_chain"])
+	}
+
+	recorder = deliveryCall(t, mux, http.MethodGet, "/api/versions/42/issues", "", userActor())
+	requireStatus(t, recorder, http.StatusOK)
+	items, _, _ := decodeDeliveryList(t, recorder)
+	if len(items) != 1 {
+		t.Fatalf("list items = %d, want 1", len(items))
+	}
+	row := items[0].(map[string]any)
+	if row["recurrence_count"] != float64(3) || row["last_recurred_at"] != "2026-11-01T06:05:00Z" {
+		t.Errorf("list recurrence fields = %v/%v", row["recurrence_count"], row["last_recurred_at"])
+	}
+	if chain, ok := row["merged_chain"].([]any); !ok || len(chain) != 2 {
+		t.Errorf("list merged_chain = %#v, want the 2-link target chain", row["merged_chain"])
+	}
+}
+
+func TestIssueViewOptionalRecurrenceFieldsAreNull(t *testing.T) {
+	issue := sampleIssue(1001, delivery.IssueStatusOpen)
+	service := &fakeIssueService{details: map[int64]deliveryapp.IssueDetail{1001: sampleIssueDetail(issue)}}
+	mux := newDeliveryMux(t, New(service))
+
+	recorder := deliveryCall(t, mux, http.MethodGet, "/api/versions/42/issues/1001", "", userActor())
+	requireStatus(t, recorder, http.StatusOK)
+	data := decodeDeliveryObject(t, recorder)
+	if data["recurrence_count"] != float64(0) {
+		t.Errorf("recurrence_count = %v, want 0", data["recurrence_count"])
+	}
+	if data["last_recurred_at"] != nil || data["merged_chain"] != nil {
+		t.Errorf("optional recurrence fields = %v/%v, want null", data["last_recurred_at"], data["merged_chain"])
+	}
+}
+
 func requireStatus(t *testing.T, recorder *httptest.ResponseRecorder, want int) {
 	t.Helper()
 	if recorder.Code != want {

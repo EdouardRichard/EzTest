@@ -38,20 +38,27 @@ export function getSut(id: string): Promise<Sut> {
 export type SutInput = {
   name: string
   intro: string
+  /** Optional P7 family slug; omitted when blank. */
+  family?: string
+}
+
+/** Builds the SUT create/patch body, omitting the optional family when blank. */
+function sutPayload(input: SutInput): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    name: input.name.trim(),
+    intro: input.intro.trim(),
+  }
+  const family = input.family?.trim() ?? ""
+  if (family.length > 0) payload.family = family
+  return payload
 }
 
 export function createSut(input: SutInput): Promise<Sut> {
-  return apiPost<Sut>("/api/resources/suts", {
-    name: input.name.trim(),
-    intro: input.intro.trim(),
-  })
+  return apiPost<Sut>("/api/resources/suts", sutPayload(input))
 }
 
 export function updateSut(id: string, input: SutInput): Promise<Sut> {
-  return apiPatch<Sut>(`/api/resources/suts/${encodeURIComponent(id)}`, {
-    name: input.name.trim(),
-    intro: input.intro.trim(),
-  })
+  return apiPatch<Sut>(`/api/resources/suts/${encodeURIComponent(id)}`, sutPayload(input))
 }
 
 export function deleteSut(id: string): Promise<void> {

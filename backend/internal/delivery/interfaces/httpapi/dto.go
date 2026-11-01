@@ -101,6 +101,10 @@ func (r mergeIssueRequest) parse() (int64, issueAction, error) {
 /* ---------------------------------- views --------------------------------- */
 
 // IssueView is the list/action projection of one issue (contract IssueView).
+// RecurrenceCount/LastRecurredAt are the P7 recurrence projection; MergedChain
+// is the read-time merged_into target chain (direct target first, terminal
+// target last, at most MaxIssueMergeChain IDs) and is null for a non-merged
+// issue (spec §4.6).
 type IssueView struct {
 	ID               string           `json:"id"`
 	VersionID        string           `json:"version_id"`
@@ -114,6 +118,9 @@ type IssueView struct {
 	MergedIntoID     *string          `json:"merged_into_id"`
 	MergedAt         *string          `json:"merged_at"`
 	ReopenCount      int              `json:"reopen_count"`
+	RecurrenceCount  int              `json:"recurrence_count"`
+	LastRecurredAt   *string          `json:"last_recurred_at"`
+	MergedChain      []string         `json:"merged_chain"`
 	Refs             []IssueRefView   `json:"refs"`
 	Triage           *IssueTriageView `json:"triage"`
 	CreatedAt        string           `json:"created_at"`
@@ -154,7 +161,7 @@ type IssueDetailView struct {
 	RelatedRefs map[string]int     `json:"related_refs"`
 }
 
-func toIssueView(issue delivery.Issue, refs []delivery.IssueRef, triage *delivery.AnalysisRun) IssueView {
+func toIssueView(issue delivery.Issue, refs []delivery.IssueRef, triage *delivery.AnalysisRun, mergedChain []int64) IssueView {
 	source := issue.Source
 	if source == "" {
 		source = delivery.IssueCandidateSource
@@ -172,6 +179,9 @@ func toIssueView(issue delivery.Issue, refs []delivery.IssueRef, triage *deliver
 		MergedIntoID:     optionalIDString(issue.MergedIntoID),
 		MergedAt:         formatOptionalTime(issue.MergedAt),
 		ReopenCount:      issue.ReopenCount,
+		RecurrenceCount:  issue.RecurrenceCount,
+		LastRecurredAt:   formatOptionalTime(issue.LastRecurredAt),
+		MergedChain:      formatIssueChain(mergedChain),
 		Refs:             make([]IssueRefView, 0, len(refs)),
 		Triage:           toIssueTriageView(triage),
 		CreatedAt:        formatTime(issue.CreatedAt),
@@ -181,6 +191,19 @@ func toIssueView(issue delivery.Issue, refs []delivery.IssueRef, triage *deliver
 		view.Refs = append(view.Refs, toIssueRefView(ref))
 	}
 	return view
+}
+
+// formatIssueChain maps the read-time merge chain onto decimal-string IDs. An
+// empty chain projects as null (the optional contract field).
+func formatIssueChain(chain []int64) []string {
+	if len(chain) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(chain))
+	for _, id := range chain {
+		ids = append(ids, platformid.Format(id))
+	}
+	return ids
 }
 
 func toIssueRefView(ref delivery.IssueRef) IssueRefView {

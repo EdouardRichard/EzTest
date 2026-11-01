@@ -2,7 +2,7 @@
 
 import { ExternalLink, X } from "lucide-react"
 import Link from "next/link"
-import { useEffect, useState } from "react"
+import { Fragment, useEffect, useState } from "react"
 
 import { Badge, type BadgeTone } from "@/components/ui/Badge"
 import { Button } from "@/components/ui/Button"
@@ -360,6 +360,10 @@ export function IssueDetailSheet({
   const canMerge =
     issue !== null &&
     (issue.status === "open" || issue.status === "confirmed" || issue.status === "dismissed")
+  const recurrenceCount = issue?.recurrence_count ?? 0
+  const lastRecurredAt = issue?.last_recurred_at ?? null
+  const mergedChain = issue?.merged_chain ?? []
+  const mergedIntoId = issue?.merged_into_id ?? null
 
   return (
     <div className="fixed inset-0 z-40">
@@ -392,6 +396,11 @@ export function IssueDetailSheet({
                 <span className="text-[11px] text-muted-foreground">
                   重开 {issue.reopen_count} 次
                 </span>
+                {recurrenceCount > 0 ? (
+                  <span className="text-[11px] text-muted-foreground">
+                    复发 {recurrenceCount} 次
+                  </span>
+                ) : null}
               </div>
             ) : null}
           </div>
@@ -419,21 +428,63 @@ export function IssueDetailSheet({
                 </p>
               </section>
 
+              {recurrenceCount > 0 ? (
+                <section
+                  data-testid="issue-recurrence"
+                  aria-label="复发信息"
+                  className="rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning"
+                >
+                  <p className="font-medium">复发 {recurrenceCount} 次</p>
+                  {lastRecurredAt !== null ? (
+                    <p className="mt-0.5 text-[11px]">
+                      最近复发于 {formatDateTime(lastRecurredAt)}
+                    </p>
+                  ) : null}
+                  <p className="mt-0.5 text-[11px]">
+                    相同去重键的新失败会重定向到该问题，并追加复发引用。
+                  </p>
+                </section>
+              ) : null}
+
               {issue.status === "merged" &&
-              issue.merged_into_id !== null &&
-              issue.merged_into_id !== undefined ? (
-                <p className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-foreground">
-                  已合并至问题{" "}
-                  <Link
-                    href={issueHref(versionId, issue.merged_into_id)}
-                    className="text-primary underline-offset-2 hover:underline"
-                  >
-                    #{issue.merged_into_id}
-                  </Link>
-                  {issue.merged_at !== null && issue.merged_at !== undefined
-                    ? `（${formatDateTime(issue.merged_at)}）`
-                    : null}
-                </p>
+              (mergedChain.length > 0 || (mergedIntoId !== null && mergedIntoId !== undefined)) ? (
+                <div
+                  data-testid="issue-merged-chain"
+                  className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-foreground"
+                >
+                  <p>
+                    该问题已合并
+                    {issue.merged_at !== null && issue.merged_at !== undefined
+                      ? `（${formatDateTime(issue.merged_at)}）`
+                      : null}
+                  </p>
+                  {mergedChain.length > 0 ? (
+                    <p className="mt-1 flex flex-wrap items-center gap-1 text-[11px]">
+                      <span className="text-muted-foreground">合并链：</span>
+                      {mergedChain.map((chainIssueId, index) => (
+                        <Fragment key={chainIssueId}>
+                          {index > 0 ? <span aria-hidden="true">→</span> : null}
+                          <Link
+                            href={issueHref(versionId, chainIssueId)}
+                            className="text-primary underline-offset-2 hover:underline"
+                          >
+                            #{chainIssueId}
+                          </Link>
+                        </Fragment>
+                      ))}
+                    </p>
+                  ) : mergedIntoId !== null && mergedIntoId !== undefined ? (
+                    <p className="mt-1 text-[11px]">
+                      目标问题{" "}
+                      <Link
+                        href={issueHref(versionId, mergedIntoId)}
+                        className="text-primary underline-offset-2 hover:underline"
+                      >
+                        #{mergedIntoId}
+                      </Link>
+                    </p>
+                  ) : null}
+                </div>
               ) : null}
 
               {readOnly ? (

@@ -62,26 +62,5 @@ func P5ProfileTools() map[string][]string {
 // union: an already-seeded tool such as execution.visual_assert is not
 // duplicated, and P1–P4 ordering is preserved.
 func applyP5ProfileTools(profile agent.AgentProfile) agent.AgentProfile {
-	additions, ok := p5ProfileTools[profile.Key]
-	if !ok {
-		return profile
-	}
-	seen := make(map[string]struct{}, len(profile.AllowedTools)+len(additions))
-	merged := make([]string, 0, len(profile.AllowedTools)+len(additions))
-	for _, name := range profile.AllowedTools {
-		if _, duplicate := seen[name]; duplicate {
-			continue
-		}
-		seen[name] = struct{}{}
-		merged = append(merged, name)
-	}
-	for _, name := range additions {
-		if _, duplicate := seen[name]; duplicate {
-			continue
-		}
-		seen[name] = struct{}{}
-		merged = append(merged, name)
-	}
-	profile.AllowedTools = merged
-	return profile
+	return mergeProfileTools(profile, p5ProfileTools[profile.Key])
 }
