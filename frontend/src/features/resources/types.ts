@@ -113,6 +113,38 @@ export type ImportResult<T> = {
   items: T[]
 }
 
+/* ---------------------------- page/API proposals --------------------------- */
+
+/** `CodeProposalCounts` from `POST /versions/{id}/code/page-api-proposals`. */
+export type CodeProposalCounts = {
+  created: number
+  skipped: number
+  ids: string[]
+}
+
+/** `CodeProposalResultView` (server runs synchronously, ≤200 items). */
+export type CodeProposalResult = {
+  pages: CodeProposalCounts
+  apis: CodeProposalCounts
+}
+
+export type CodeProposalKind = "page" | "api"
+
+/** `CodeProposalView`: a proposed resource plus its code/network evidence. */
+export type CodeProposal = {
+  kind: CodeProposalKind
+  id: string
+  name: string
+  url?: string | null
+  route_template?: string | null
+  method?: string | null
+  path_template?: string | null
+  status: "proposed"
+  source: "ai" | "code"
+  evidence?: Record<string, unknown>[]
+  created_at: string
+}
+
 /** Editable shape of the create-SUT form (SUT + its first default environment). */
 export type SutFormValues = {
   name: string

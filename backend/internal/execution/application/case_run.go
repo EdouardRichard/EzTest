@@ -170,6 +170,7 @@ type CaseRunnerDeps struct {
 	Gaps        GapEnsurer
 	TeamRoom    TeamRoom
 	Human       HumanRequestService
+	Visual      VisualAssertPort
 	Settings    SettingsReader
 	Clock       Clock
 	IDs         IDGenerator
@@ -201,6 +202,7 @@ type CaseRunner struct {
 	gaps        GapEnsurer
 	teamRoom    TeamRoom
 	human       HumanRequestService
+	visual      VisualAssertPort
 	settings    SettingsReader
 	clock       Clock
 	ids         IDGenerator
@@ -240,6 +242,7 @@ func NewCaseRunner(deps CaseRunnerDeps) *CaseRunner {
 		gaps:        deps.Gaps,
 		teamRoom:    deps.TeamRoom,
 		human:       deps.Human,
+		visual:      deps.Visual,
 		settings:    deps.Settings,
 		clock:       deps.Clock,
 		ids:         deps.IDs,
@@ -562,6 +565,7 @@ func (s *CaseRunner) Finish(ctx context.Context, scope tools.Scope, candidate ex
 	if err != nil {
 		return execution.CaseRun{}, mapExecutionError(err, "assertion_result")
 	}
+	steps = execution.NormalizeVisualSteps(steps, assertions)
 	status, class, summary, err := execution.Aggregate(execution.VerdictInput{
 		Case:       caseSnapshot,
 		Steps:      steps,
@@ -571,6 +575,7 @@ func (s *CaseRunner) Finish(ctx context.Context, scope tools.Scope, candidate ex
 	if err != nil {
 		return execution.CaseRun{}, platform.Invalid("verdict", err.Error())
 	}
+	status, class, summary = execution.ApplyVisualOutcome(status, class, summary, assertions)
 	if evidenceCount, countErr := s.evidence.CountByCaseRun(ctx, caseRun.ID); countErr == nil {
 		summary.EvidenceCount = evidenceCount
 	}
@@ -658,12 +663,14 @@ func (s *CaseRunner) finalizeWithCandidate(ctx context.Context, caseRun executio
 	if err != nil {
 		return mapExecutionError(err, "assertion_result")
 	}
+	steps = execution.NormalizeVisualSteps(steps, assertions)
 	status, class, summary, err := execution.Aggregate(execution.VerdictInput{
 		Case: caseSnapshot, Steps: steps, Assertions: assertions, Finish: &candidate,
 	})
 	if err != nil {
 		return platform.Invalid("verdict", err.Error())
 	}
+	status, class, summary = execution.ApplyVisualOutcome(status, class, summary, assertions)
 	if evidenceCount, countErr := s.evidence.CountByCaseRun(ctx, caseRun.ID); countErr == nil {
 		summary.EvidenceCount = evidenceCount
 	}

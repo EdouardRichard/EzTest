@@ -190,6 +190,14 @@ const (
 	WorkTypeVersionClose     = "version.close"
 )
 
+// P5 codeintel work item types (contracts/task-types.md P5 increment). They are
+// claimed by the dedicated codeintel worker and never mapped to an agent
+// profile.
+const (
+	WorkTypeIndexRepo   = "index.repo"
+	WorkTypeCodeAnalyze = "code.analyze"
+)
+
 // WorkItemPayload is the small reference payload carried by work items. IDs
 // are parsed from decimal strings or JSON numbers for P0 payload
 // compatibility.
@@ -219,6 +227,13 @@ type WorkItemPayload struct {
 	CloseRound           int32
 	ReportRevisionID     int64
 	PredicateFingerprint string
+	// P5 codeintel payload (contracts/task-types.md §7). IDs follow the same
+	// decimal-string/number convention; commit SHAs are 40 hex strings.
+	RepoID        int64
+	IndexRunID    int64
+	AnalysisID    int64
+	BaseCommitSHA string
+	HeadCommitSHA string
 }
 
 // ToolDeps is the adapter wiring for the P1 tools. The runner adds the
@@ -235,6 +250,8 @@ type RunExecutor interface {
 // *WorkQueue).
 type WorkerQueue interface {
 	Claim(ctx context.Context, claimant string) (agent.WorkItem, bool, error)
+	// ClaimForTeams leases the next available item whose team is in teams.
+	ClaimForTeams(ctx context.Context, claimant string, teams []agent.Team) (agent.WorkItem, bool, error)
 	MarkRunning(ctx context.Context, id, epoch int64) error
 	Heartbeat(ctx context.Context, id, epoch int64) error
 	Complete(ctx context.Context, id, epoch int64) error

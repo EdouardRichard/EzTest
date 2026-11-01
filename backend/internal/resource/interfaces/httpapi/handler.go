@@ -60,6 +60,11 @@ type Service interface {
 	DeleteRepository(ctx context.Context, id int64, actorID int64) error
 	ListRepositories(ctx context.Context, limit int, beforeID *int64) ([]resourceapp.CodeRepositoryView, bool, error)
 	GetRepository(ctx context.Context, id int64) (resourceapp.CodeRepositoryView, error)
+
+	ConfirmPage(ctx context.Context, pageID, actorID int64) (resourceapp.PageView, error)
+	RejectPage(ctx context.Context, pageID, actorID int64) (resourceapp.PageView, error)
+	ConfirmAPI(ctx context.Context, apiID, actorID int64) (resourceapp.APIView, error)
+	RejectAPI(ctx context.Context, apiID, actorID int64) (resourceapp.APIView, error)
 }
 
 // Handler serves /api/resources/*.
@@ -597,6 +602,110 @@ func toAPIInput(body apiCreateRequest) resourceapp.APIInput {
 		Method: body.Method, PathTemplate: body.PathTemplate, Name: body.Name,
 		AuthRole: body.AuthRole, SchemaRef: body.SchemaRef,
 	}
+}
+
+// ---------- proposals: confirm / reject ----------
+
+// proposalPathID parses the contract path parameter ({pageId}/{apiId}), falling
+// back to {id} so direct handler calls keep working.
+func proposalPathID(r *http.Request, name string) (int64, error) {
+	raw := r.PathValue(name)
+	if raw == "" {
+		raw = r.PathValue("id")
+	}
+	return validation.NonEmptyID("id", raw)
+}
+
+// requireAdmin is the defense-in-depth guard: the server also mounts every
+// confirm/reject route behind the admin middleware.
+func requireAdmin(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	actor, err := actorID(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return 0, false
+	}
+	current, ok := platform.ActorFrom(r.Context())
+	if !ok || !current.IsAdmin() {
+		httpx.Error(w, r, platform.Forbidden())
+		return 0, false
+	}
+	return actor, true
+}
+
+// ConfirmPage POST /api/resources/pages/{pageId}/confirm.
+func (h *Handler) ConfirmPage(w http.ResponseWriter, r *http.Request) {
+	actor, ok := requireAdmin(w, r)
+	if !ok {
+		return
+	}
+	id, err := proposalPathID(r, "pageId")
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	view, err := h.svc.ConfirmPage(r.Context(), id, actor)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, toPageDTO(view))
+}
+
+// RejectPage POST /api/resources/pages/{pageId}/reject.
+func (h *Handler) RejectPage(w http.ResponseWriter, r *http.Request) {
+	actor, ok := requireAdmin(w, r)
+	if !ok {
+		return
+	}
+	id, err := proposalPathID(r, "pageId")
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	view, err := h.svc.RejectPage(r.Context(), id, actor)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, toPageDTO(view))
+}
+
+// ConfirmAPI POST /api/resources/apis/{apiId}/confirm.
+func (h *Handler) ConfirmAPI(w http.ResponseWriter, r *http.Request) {
+	actor, ok := requireAdmin(w, r)
+	if !ok {
+		return
+	}
+	id, err := proposalPathID(r, "apiId")
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	view, err := h.svc.ConfirmAPI(r.Context(), id, actor)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, toAPIDTO(view))
+}
+
+// RejectAPI POST /api/resources/apis/{apiId}/reject.
+func (h *Handler) RejectAPI(w http.ResponseWriter, r *http.Request) {
+	actor, ok := requireAdmin(w, r)
+	if !ok {
+		return
+	}
+	id, err := proposalPathID(r, "apiId")
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	view, err := h.svc.RejectAPI(r.Context(), id, actor)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, toAPIDTO(view))
 }
 
 // ---------- target databases ----------

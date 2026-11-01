@@ -40,15 +40,18 @@ type CaseCounts struct {
 }
 
 // BindingView is one SUT binding with its selected resources in input order.
+// CodeBaselineCommit is empty while the bound repository's HEAD has not been
+// resolved (P5 §5.5).
 type BindingView struct {
-	ID          int64
-	SUT         resourceapp.SUTView
-	Environment resourceapp.EnvironmentView
-	Repository  *resourceapp.CodeRepositoryView
-	Pages       []resourceapp.PageView
-	APIs        []resourceapp.APIView
-	Databases   []resourceapp.DatabaseView
-	Accounts    []resourceapp.AccountView
+	ID                 int64
+	CodeBaselineCommit string
+	SUT                resourceapp.SUTView
+	Environment        resourceapp.EnvironmentView
+	Repository         *resourceapp.CodeRepositoryView
+	Pages              []resourceapp.PageView
+	APIs               []resourceapp.APIView
+	Databases          []resourceapp.DatabaseView
+	Accounts           []resourceapp.AccountView
 }
 
 // VersionSummary is the list read model.

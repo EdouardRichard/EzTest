@@ -13,6 +13,7 @@ import { Tabs } from "@/components/ui/Tabs"
 import { ChainTab } from "@/features/chain/ChainTab"
 import { RequirementsTab } from "@/features/clarification/RequirementsTab"
 import { useVersionEvents } from "@/features/clarification/useVersionEvents"
+import { CodeTab } from "@/features/code-intel/CodeTab"
 import { listIssues, listReports } from "@/features/delivery/api"
 import { IssuesTab } from "@/features/delivery/IssuesTab"
 import { ReportsTab } from "@/features/delivery/ReportsTab"
@@ -25,22 +26,6 @@ import { getVersion } from "./api"
 import { parseVersionTab, VERSION_TABS } from "./tabs"
 import type { Version, VersionBinding, VersionTab } from "./types"
 import { VersionHeader } from "./VersionHeader"
-
-type PlaceholderTab = Extract<VersionTab, "code">
-
-type PlaceholderCopy = {
-  label: string
-  phase: "P5"
-  description: string
-}
-
-const PLACEHOLDER_COPY: Record<PlaceholderTab, PlaceholderCopy> = {
-  code: {
-    label: "代码与变更",
-    phase: "P5",
-    description: "代码仓扫描、变更影响与调用链分析由 P5 阶段提供。",
-  },
-}
 
 /** SSE bursts (issue.created + report.published + version.closed) collapse into one refresh. */
 const SSE_REFRESH_DEBOUNCE_MS = 350
@@ -180,24 +165,10 @@ function VersionOverview({ version }: { version: Version }) {
       </section>
 
       <section className="rounded-xl border border-dashed border-border bg-card/60 px-4 py-3 text-xs leading-relaxed text-muted-foreground">
-        需求与澄清已在 P1
-        提供；用例设计（P2）、执行（P3）、探索链路/问题/报告（P4）与代码与变更（P5）
-        将按阶段逐步提供。
+        需求与澄清（P1）、用例设计（P2）、执行（P3）、探索链路/问题/报告（P4）与代码与变更（P5）
+        已在对应 Tab 提供。
       </section>
     </div>
-  )
-}
-
-function TabPlaceholder({ tab }: { tab: PlaceholderTab }) {
-  const copy = PLACEHOLDER_COPY[tab]
-  return (
-    <section aria-label={`${copy.label}占位`} className="surface-card p-6">
-      <EmptyState
-        title={`${copy.label}将在 ${copy.phase} 阶段提供`}
-        description={copy.description}
-        action={<Badge tone="warning">{copy.phase} 阶段提供</Badge>}
-      />
-    </section>
   )
 }
 
@@ -391,6 +362,12 @@ export function VersionDetailPage({
         if (value) params.set(key, value)
       }
     }
+    if (next === "code") {
+      for (const key of ["repo", "analysis", "candidate", "anchor", "fact"]) {
+        const value = searchParams.get(key)
+        if (value) params.set(key, value)
+      }
+    }
     router.replace(`/versions/${encodeURIComponent(versionId)}?${params.toString()}`)
   }
 
@@ -474,7 +451,7 @@ export function VersionDetailPage({
       ) : activeTab === "reports" ? (
         <ReportsTab versionId={versionId} />
       ) : (
-        <TabPlaceholder tab={activeTab} />
+        <CodeTab versionId={versionId} />
       )}
 
       <TodoDrawer versionId={versionId} open={todoOpen} onClose={() => setTodoOpen(false)} />

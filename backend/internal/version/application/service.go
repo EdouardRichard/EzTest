@@ -21,18 +21,21 @@ import (
 // Service is the version application service. It implements
 // resourceapp.UsageChecker for the resource delete guards.
 type Service struct {
-	repo    version.Repository
-	catalog resourceapp.CatalogReader
-	ids     platformid.Generator
-	clock   clock.Clock
-	audit   auditapp.Recorder
-	events  eventingapp.Publisher
-	metrics DesignMetrics
+	repo     version.Repository
+	catalog  resourceapp.CatalogReader
+	ids      platformid.Generator
+	clock    clock.Clock
+	audit    auditapp.Recorder
+	events   eventingapp.Publisher
+	metrics  DesignMetrics
+	resolver CodeBaselineResolver
 }
 
 // New wires a version service. audit and events may be nil in unit tests; the
 // assembly root sets the real implementations. catalog is the resource
-// application service (resourceapp.Service implements CatalogReader).
+// application service (resourceapp.Service implements CatalogReader). resolver
+// resolves the code baseline commit of bindings with a repository (P5 §5.5);
+// nil keeps baselines unresolved, which never blocks version creation.
 func New(
 	repo version.Repository,
 	catalog resourceapp.CatalogReader,
@@ -40,8 +43,9 @@ func New(
 	clk clock.Clock,
 	audit auditapp.Recorder,
 	events eventingapp.Publisher,
+	resolver CodeBaselineResolver,
 ) *Service {
-	return &Service{repo: repo, catalog: catalog, ids: ids, clock: clk, audit: audit, events: events}
+	return &Service{repo: repo, catalog: catalog, ids: ids, clock: clk, audit: audit, events: events, resolver: resolver}
 }
 
 // SetDesignMetrics injects the design projection source. It is optional (P1
@@ -110,11 +114,15 @@ func (s *Service) Create(ctx context.Context, cmd CreateCommand, actorID int64) 
 		bindings[i].VersionID = entity.ID
 		bindings[i].ID = s.ids.Next()
 	}
+	// Resolve the code baseline commit before persistence (P5 §5.5). A failure
+	// leaves the column empty, is audited as a warning and never blocks Create.
+	warnings := s.resolveCodeBaselines(ctx, bindings)
 
 	if err := s.repo.Create(ctx, entity, bindings); err != nil {
 		return VersionView{}, mapRepositoryError(err)
 	}
 	s.recordCreated(ctx, entity, len(bindings), actorID)
+	s.recordCodeBaselineWarnings(ctx, entity.ID, warnings, actorID)
 	return s.Get(ctx, entity.ID)
 }
 
@@ -475,13 +483,14 @@ func (s *Service) buildBindingView(ctx context.Context, binding version.Binding)
 	}
 
 	view := BindingView{
-		ID:          binding.ID,
-		SUT:         sut,
-		Environment: environment,
-		Pages:       make([]resourceapp.PageView, 0, len(binding.Scope.Pages)),
-		APIs:        make([]resourceapp.APIView, 0, len(binding.Scope.APIs)),
-		Databases:   make([]resourceapp.DatabaseView, 0, len(binding.DatabaseIDs)),
-		Accounts:    make([]resourceapp.AccountView, 0, len(binding.Accounts)),
+		ID:                 binding.ID,
+		CodeBaselineCommit: binding.CodeBaselineCommit,
+		SUT:                sut,
+		Environment:        environment,
+		Pages:              make([]resourceapp.PageView, 0, len(binding.Scope.Pages)),
+		APIs:               make([]resourceapp.APIView, 0, len(binding.Scope.APIs)),
+		Databases:          make([]resourceapp.DatabaseView, 0, len(binding.DatabaseIDs)),
+		Accounts:           make([]resourceapp.AccountView, 0, len(binding.Accounts)),
 	}
 
 	if binding.CodeRepositoryID != nil {

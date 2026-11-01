@@ -13,6 +13,9 @@ const (
 	VerdictReasonNoAssertions    = "no_assertions"
 	VerdictReasonBlocked         = "blocked"
 	VerdictReasonAgentFailure    = "agent_failure"
+	// VerdictReasonVisualAssertionNotRun is the P5 finalizer: a case_version
+	// with visual assertions but no executed visual result must not pass.
+	VerdictReasonVisualAssertionNotRun = "visual_assertion_not_run"
 )
 
 // FinishCandidate is the model-submitted execution.case_finish candidate. The
@@ -86,31 +89,15 @@ func Aggregate(in VerdictInput) (CaseRunStatus, FailureClass, CaseRunSummary, er
 		}
 	}
 
-	summary.VisualSkipped = countVisualSkipped(in.Case.Assertions, assertionResults)
+	summary.countVisualResults(in.Case.Assertions, assertionResults)
 	if failedStep != nil && failedStep.Error != "" {
 		summary.LastError = failedStep.Error
 	}
 
-	// Agent-level failures that are not a deterministic result.
-	switch in.AgentFailure {
-	case FailureClassBlocked:
-		summary.VerdictReason = VerdictReasonBlocked
-		return CaseRunBlocked, FailureClassBlocked, summary, nil
-	case FailureClassExecutorLost:
+	// Executor loss is infrastructure state, not a visual verdict.
+	if in.AgentFailure == FailureClassExecutorLost {
 		summary.VerdictReason = VerdictReasonAgentFailure
 		return CaseRunInterrupted, FailureClassExecutorLost, summary, nil
-	case "", FailureClassApplication:
-		// application needs assertion evidence; handled deterministically below.
-	default:
-		if in.AgentFailure.Valid() {
-			summary.VerdictReason = VerdictReasonAgentFailure
-			return CaseRunFailed, in.AgentFailure, summary, nil
-		}
-	}
-
-	if blockedStep != nil {
-		summary.VerdictReason = VerdictReasonBlocked
-		return CaseRunBlocked, FailureClassBlocked, summary, nil
 	}
 
 	// Assertion failures are the strongest evidence: only they may produce
@@ -123,6 +110,37 @@ func Aggregate(in VerdictInput) (CaseRunStatus, FailureClass, CaseRunSummary, er
 		}
 		summary.VerdictReason = VerdictReasonAssertionFailed
 		return CaseRunFailed, class, summary, nil
+	}
+
+	// P5 removes the P3 "visual skipped but case passed" shortcut: a visual
+	// assertion that never ran (or is inconclusive) makes the case inconclusive
+	// instead of silently green (spec §7.3). The visual result is authoritative
+	// over an agent/model "blocked" or step failure for the same visual reason.
+	if reason, environment, inconclusive := visualBlock(in.Case.Assertions, assertionResults); inconclusive {
+		summary.VerdictReason = reason
+		if environment {
+			return CaseRunInconclusive, FailureClassEnvironment, summary, nil
+		}
+		return CaseRunInconclusive, "", summary, nil
+	}
+
+	// Agent-level failures that are not a deterministic result.
+	switch in.AgentFailure {
+	case FailureClassBlocked:
+		summary.VerdictReason = VerdictReasonBlocked
+		return CaseRunBlocked, FailureClassBlocked, summary, nil
+	case "", FailureClassApplication:
+		// application needs assertion evidence; handled deterministically below.
+	default:
+		if in.AgentFailure.Valid() {
+			summary.VerdictReason = VerdictReasonAgentFailure
+			return CaseRunFailed, in.AgentFailure, summary, nil
+		}
+	}
+
+	if blockedStep != nil {
+		summary.VerdictReason = VerdictReasonBlocked
+		return CaseRunBlocked, FailureClassBlocked, summary, nil
 	}
 
 	if failedStep != nil {
@@ -162,8 +180,9 @@ func Aggregate(in VerdictInput) (CaseRunStatus, FailureClass, CaseRunSummary, er
 	return CaseRunPassed, "", summary, nil
 }
 
-// completeResults checks that every required step and assertion has a final
-// passing result. Visual assertions are skipped (P5) and only counted.
+// completeResults checks that every required step and non-visual assertion has a
+// final passing result. Visual assertions are evaluated by visualBlock before
+// this point (P5 four-state mapping), so they are not re-checked here.
 func completeResults(
 	in VerdictInput,
 	stepResults map[int]StepResult,
@@ -206,8 +225,11 @@ func completeResults(
 	return "", "", true
 }
 
-func countVisualSkipped(assertions []CaseAssertion, results map[[2]int]AssertionResult) int {
-	count := 0
+// countVisualResults fills the P5 four-state visual counters. A missing or
+// legacy-skipped visual result counts as inconclusive, never as skipped: the
+// false-pass shortcut is removed (spec §7.3). VisualSkipped stays 0.
+func (s *CaseRunSummary) countVisualResults(assertions []CaseAssertion, results map[[2]int]AssertionResult) {
+	s.VisualSkipped = 0
 	seen := make(map[[2]int]struct{}, len(assertions))
 	for _, assertion := range assertions {
 		if assertion.Kind != AssertionKindVisual {
@@ -216,8 +238,102 @@ func countVisualSkipped(assertions []CaseAssertion, results map[[2]int]Assertion
 		key := [2]int{assertion.StepSeq, assertion.AssertionSeq}
 		seen[key] = struct{}{}
 		result, ok := results[key]
-		if !ok || result.Verdict != AssertionPassed {
-			count++
+		s.countVisualResult(result, ok)
+	}
+	for key, result := range results {
+		if result.Kind != AssertionKindVisual {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		s.countVisualResult(result, true)
+	}
+}
+
+func (s *CaseRunSummary) countVisualResult(result AssertionResult, ok bool) {
+	if !ok || result.Verdict == AssertionSkipped || result.Verdict == AssertionInconclusive {
+		s.VisualInconclusive++
+		return
+	}
+	switch result.Verdict {
+	case AssertionPassed:
+		s.VisualPassed++
+	case AssertionFailed:
+		s.VisualFailed++
+	default:
+		s.VisualInconclusive++
+	}
+}
+
+// visualBlock returns the inconclusive verdict reason of the first visual
+// assertion that did not pass. environment=true maps the environment-mismatch
+// reason to the environment failure class; "case" reasons keep the empty class.
+// NormalizeVisualSteps removes a free-form blocked/failed step status that the
+// Case Executor attached to a visual assertion whose concrete visual result is
+// inconclusive. The visual tool result is authoritative (spec §7.3); without
+// this, a model-authored blocked status hides the visual verdict from Aggregate.
+func NormalizeVisualSteps(steps []StepResult, assertions []AssertionResult) []StepResult {
+	visual := map[int]bool{}
+	for _, result := range assertions {
+		if result.Kind == AssertionKindVisual && result.Verdict == AssertionInconclusive {
+			visual[result.StepSeq] = true
+		}
+	}
+	if len(visual) == 0 {
+		return steps
+	}
+	normalized := append([]StepResult(nil), steps...)
+	for i := range normalized {
+		if normalized[i].Status != StepBlocked && normalized[i].Status != StepFailed {
+			continue
+		}
+		if visual[normalized[i].Seq] {
+			normalized[i].Status = StepPassed
+			normalized[i].Error = ""
+		}
+	}
+	return normalized
+}
+
+// ApplyVisualOutcome is the final defense-in-depth guard for the P5 visual
+// four-state contract: a concrete inconclusive visual assertion result must not
+// be reported as blocked or failed(environment) because the Case Executor used a
+// free-form step status or finish candidate. It only overrides those two
+// aggregate outcomes; application failures with real assertion evidence stay.
+func ApplyVisualOutcome(status CaseRunStatus, class FailureClass, summary CaseRunSummary, assertions []AssertionResult) (CaseRunStatus, FailureClass, CaseRunSummary) {
+	if status != CaseRunBlocked && !(status == CaseRunFailed && class == FailureClassEnvironment) {
+		return status, class, summary
+	}
+	for _, result := range assertions {
+		if result.Kind != AssertionKindVisual || result.Verdict != AssertionInconclusive {
+			continue
+		}
+		reason := result.Reason
+		if reason == "" {
+			reason = VerdictReasonVisualAssertionNotRun
+		}
+		summary.VerdictReason = reason
+		if reason == "visual_environment_mismatch" {
+			return CaseRunInconclusive, FailureClassEnvironment, summary
+		}
+		return CaseRunInconclusive, "", summary
+	}
+	return status, class, summary
+}
+
+// visualBlock reports whether a visual assertion has no usable verdict.
+func visualBlock(assertions []CaseAssertion, results map[[2]int]AssertionResult) (reason string, environment bool, inconclusive bool) {
+	seen := make(map[[2]int]struct{}, len(assertions))
+	for _, assertion := range assertions {
+		if assertion.Kind != AssertionKindVisual {
+			continue
+		}
+		key := [2]int{assertion.StepSeq, assertion.AssertionSeq}
+		seen[key] = struct{}{}
+		result, ok := results[key]
+		if block, env, blocked := visualResultBlock(result, ok); blocked {
+			return block, env, true
 		}
 	}
 	for key, result := range results {
@@ -227,11 +343,25 @@ func countVisualSkipped(assertions []CaseAssertion, results map[[2]int]Assertion
 		if _, ok := seen[key]; ok {
 			continue
 		}
-		if result.Verdict != AssertionPassed {
-			count++
+		if block, env, ok := visualResultBlock(result, true); ok {
+			return block, env, true
 		}
 	}
-	return count
+	return "", false, false
+}
+
+func visualResultBlock(result AssertionResult, ok bool) (string, bool, bool) {
+	if !ok || result.Verdict == AssertionSkipped {
+		return VerdictReasonVisualAssertionNotRun, false, true
+	}
+	if result.Verdict != AssertionInconclusive {
+		return "", false, false
+	}
+	reason := result.Reason
+	if reason == "" {
+		reason = VerdictReasonVisualAssertionNotRun
+	}
+	return reason, reason == "visual_environment_mismatch", true
 }
 
 func hasObservedStep(steps []StepResult) bool {

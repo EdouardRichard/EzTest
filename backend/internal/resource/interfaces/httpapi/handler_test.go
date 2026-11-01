@@ -231,6 +231,26 @@ func (f *fakeService) GetRepository(_ context.Context, id int64) (resourceapp.Co
 	return f.repository, f.err
 }
 
+func (f *fakeService) ConfirmPage(_ context.Context, pageID, actorID int64) (resourceapp.PageView, error) {
+	f.lastID, f.lastActor = pageID, actorID
+	return f.page, f.err
+}
+
+func (f *fakeService) RejectPage(_ context.Context, pageID, actorID int64) (resourceapp.PageView, error) {
+	f.lastID, f.lastActor = pageID, actorID
+	return f.page, f.err
+}
+
+func (f *fakeService) ConfirmAPI(_ context.Context, apiID, actorID int64) (resourceapp.APIView, error) {
+	f.lastID, f.lastActor = apiID, actorID
+	return f.api, f.err
+}
+
+func (f *fakeService) RejectAPI(_ context.Context, apiID, actorID int64) (resourceapp.APIView, error) {
+	f.lastID, f.lastActor = apiID, actorID
+	return f.api, f.err
+}
+
 func sampleViews() (resourceapp.SUTView, resourceapp.EnvironmentView, resourceapp.PageView, resourceapp.APIView, resourceapp.DatabaseView, resourceapp.AccountView, resourceapp.CodeRepositoryView) {
 	page := resourceapp.PageView{
 		ID: "1003", SUTID: "1001", EnvironmentID: "1002", Name: "orders",

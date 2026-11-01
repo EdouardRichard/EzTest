@@ -89,7 +89,9 @@ describe("ExecutionTab", () => {
     expect(api.getOverview).toHaveBeenCalledWith("2001")
     expect(api.listWaves).toHaveBeenCalledWith("2001")
     expect(api.listHumanRequests).toHaveBeenCalledWith("2001", { status: "open" })
-    expect(api.listCaseRuns).toHaveBeenCalledWith("2001", "9201")
+    await waitFor(() => {
+      expect(api.listCaseRuns).toHaveBeenCalledWith("2001", "9201")
+    })
     await waitFor(() => {
       expect(api.getCaseRun).toHaveBeenCalledWith("2001", "9301")
     })

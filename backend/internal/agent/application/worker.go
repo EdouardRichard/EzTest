@@ -23,6 +23,17 @@ const (
 	workerWriteBackTimeout        = 5 * time.Second
 )
 
+// agentProductTeams is the set of teams claimed by the agent worker. The
+// dedicated P5 codeintel worker claims TeamCode; agent profiles never run
+// index.repo/code.analyze tasks.
+var agentProductTeams = []agent.Team{
+	agent.TeamClarification,
+	agent.TeamDesign,
+	agent.TeamExecution,
+	agent.TeamDelivery,
+	agent.TeamSteward,
+}
+
 // WorkerOption customizes worker timings (used by tests and future tuning).
 type WorkerOption func(*Worker)
 
@@ -185,7 +196,7 @@ func (w *Worker) claim(ctx context.Context, sem chan struct{}, inflight *sync.Wa
 		default:
 			return
 		}
-		item, ok, err := w.queue.Claim(ctx, w.instanceID)
+		item, ok, err := w.queue.ClaimForTeams(ctx, w.instanceID, agentProductTeams)
 		if err != nil {
 			<-sem
 			if ctx.Err() == nil {

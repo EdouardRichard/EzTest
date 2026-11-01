@@ -41,6 +41,8 @@ export type VersionEventHandlers = {
   onIssueChanged?: (event: VersionEvent) => void
   /** P4 `report.*`: refresh the report list/detail and current revision. */
   onReportChanged?: (event: VersionEvent) => void
+  /** P5 `visual.baseline_approved` / `visual.diff_created`: refresh visual projections. */
+  onVisualChanged?: (event: VersionEvent) => void
   /** Synthetic `stream.reset`: refetch every snapshot instead of reconnecting. */
   onStreamReset?: (data: unknown) => void
   /** Connection state for the status indicator. */
@@ -161,6 +163,10 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
         case "report.published":
         case "report.stale":
           handlersRef.current.onReportChanged?.(event)
+          break
+        case "visual.baseline_approved":
+        case "visual.diff_created":
+          handlersRef.current.onVisualChanged?.(event)
           break
         default:
           if (event.type.startsWith("requirement.")) {

@@ -34,6 +34,7 @@ type caseRunnerFixture struct {
 	gaps       *fakeGapEnsurer
 	coverage   *fakeCoverageReader
 	room       *fakeTeamRoom
+	visual     *fakeVisualPort
 	settings   *fakeCaseRunnerSettings
 	clock      *caseRunnerClock
 	ids        *caseRunnerIDs
@@ -88,6 +89,7 @@ func newCaseRunnerFixture(t *testing.T) *caseRunnerFixture {
 		gaps:     &fakeGapEnsurer{},
 		coverage: &fakeCoverageReader{requirements: []executionapp.RequirementRef{{RequirementID: 501, Status: "clarified"}}},
 		room:     &fakeTeamRoom{},
+		visual:   &fakeVisualPort{},
 		settings: &fakeCaseRunnerSettings{ints: map[string]int64{
 			"execution.case_timeout_seconds":          900,
 			"execution.evidence_max_bytes":            5 << 20,
@@ -126,6 +128,7 @@ func newCaseRunnerFixture(t *testing.T) *caseRunnerFixture {
 		Gaps:        fixture.gaps,
 		Coverage:    fixture.coverage,
 		TeamRoom:    fixture.room,
+		Visual:      fixture.visual,
 		Settings:    fixture.settings,
 		Clock:       fixture.clock,
 		IDs:         fixture.ids,

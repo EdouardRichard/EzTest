@@ -92,7 +92,7 @@ func newChainProviders(t *testing.T) (*pgxpool.Pool, *ChainServiceBundle) {
 	resourceRepo := resourcepg.New(pool)
 	resourceSvc := resourceapp.New(resourceRepo, ids, itClock, nil, nil, nil)
 	versionRepo := versionpg.New(pool, ids)
-	versionSvc := versionapp.New(versionRepo, resourceSvc, ids, itClock, nil, nil)
+	versionSvc := versionapp.New(versionRepo, resourceSvc, ids, itClock, nil, nil, nil)
 	requirementRepo := versionpg.NewRequirementRepository(pool)
 	requirementSvc := versionapp.NewRequirementService(
 		requirementRepo, nil, nil, nil, nil, nil, ids, itClock,

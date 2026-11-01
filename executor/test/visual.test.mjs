@@ -1,17 +1,20 @@
 import test from "node:test"
 import assert from "node:assert/strict"
+import crypto from "node:crypto"
 
 import { PNG } from "pngjs"
 
-import { ExecutorError } from "../src/security.mjs"
+import { ExecutorError, MAX_ACTION_REQUEST_BYTES, visualActionRequestLimit } from "../src/security.mjs"
 import {
   comparePngImages,
   cropPng,
   decodePng,
+  environmentFingerprint,
   environmentMatches,
   mismatchBoxes,
   parseVisualCompareArgs,
   parseVisualRegion,
+  parseVisualWaitPolicy,
   runVisualCompare,
 } from "../src/visual.mjs"
 
@@ -31,14 +34,21 @@ function makePng(width, height, paint = () => [10, 20, 30, 255]) {
   return PNG.sync.write(png)
 }
 
-function baseArgs(overrides = {}) {
+function baselineArgs(buffer = makePng(100, 100)) {
   return {
-    baseline_base64: makePng(100, 100).toString("base64"),
+    baseline: {
+      base64: buffer.toString("base64"),
+      sha256: undefined,
+      bytes: buffer.length,
+    },
     threshold: 0.01,
     viewport: { width: 100, height: 100 },
     device_scale_factor: 1,
-    ...overrides,
   }
+}
+
+function baseArgs(overrides = {}) {
+  return { ...baselineArgs(), ...overrides }
 }
 
 function assertInvalid(run, label) {
@@ -63,7 +73,6 @@ test("parseVisualCompareArgs validates every bound", () => {
   assert.deepEqual(parsed.region, { x: 0.1, y: 0.2, width: 0.5, height: 0.3 })
   assert.ok(Buffer.isBuffer(parsed.baseline))
 
-  assertInvalid(() => parseVisualCompareArgs(baseArgs({ baseline_base64: "" })), "empty baseline")
   assertInvalid(() => parseVisualCompareArgs(baseArgs({ threshold: 0.5 })), "threshold high")
   assertInvalid(() => parseVisualCompareArgs(baseArgs({ threshold: -0.1 })), "threshold low")
   assertInvalid(
@@ -87,6 +96,56 @@ test("parseVisualCompareArgs validates every bound", () => {
   )
 })
 
+test("parseVisualCompareArgs accepts the nested contract baseline shape", () => {
+  const png = makePng(20, 10)
+  const parsed = parseVisualCompareArgs(
+    baseArgs({ baseline: { base64: png.toString("base64"), bytes: png.length } }),
+  )
+  assert.equal(parsed.baseline.length, png.length)
+  assert.equal(parsed.captureOnly, false)
+
+  const legacy = parseVisualCompareArgs({
+    baseline_base64: png.toString("base64"),
+    threshold: 0.01,
+    viewport: { width: 100, height: 100 },
+    device_scale_factor: 1,
+  })
+  assert.equal(legacy.baseline.length, png.length)
+})
+
+test("parseVisualCompareArgs treats a null or empty baseline as capture-only", () => {
+  for (const baseline of [null, undefined, {}]) {
+    const parsed = parseVisualCompareArgs(
+      baseArgs({ baseline, baseline_base64: undefined }),
+    )
+    assert.equal(parsed.captureOnly, true, `baseline=${JSON.stringify(baseline)}`)
+    assert.equal(parsed.baseline, null)
+  }
+})
+
+test("parseVisualCompareArgs validates an optional baseline sha256 and byte count", () => {
+  const png = makePng(16, 16)
+  assertInvalid(
+    () =>
+      parseVisualCompareArgs(
+        baseArgs({ baseline: { base64: png.toString("base64"), sha256: "0".repeat(64) } }),
+      ),
+    "sha mismatch",
+  )
+  assertInvalid(
+    () =>
+      parseVisualCompareArgs(
+        baseArgs({ baseline: { base64: png.toString("base64"), bytes: png.length + 1 } }),
+      ),
+    "bytes mismatch",
+  )
+  const digest = crypto.createHash("sha256").update(png).digest("hex")
+  const ok = parseVisualCompareArgs(
+    baseArgs({ baseline: { base64: png.toString("base64"), bytes: png.length, sha256: digest } }),
+  )
+  assert.ok(ok.baseline)
+})
+
 test("parseVisualCompareArgs enforces the configured baseline byte cap", () => {
   const env = { EZTEST_VISUAL_BASELINE_MAX_BYTES: "16" }
   assert.throws(
@@ -104,6 +163,27 @@ test("parseVisualRegion treats an empty object as no crop", () => {
     width: 1,
     height: 1,
   })
+})
+
+test("parseVisualWaitPolicy applies the networkidle/fonts/freeze defaults", () => {
+  assert.deepEqual(parseVisualWaitPolicy(undefined), {
+    network_idle: true,
+    fonts: true,
+    freeze_animations: true,
+    stable_frames: 2,
+  })
+  assert.deepEqual(
+    parseVisualWaitPolicy({
+      network_idle: false,
+      fonts: false,
+      freeze_animations: false,
+      stable_frames: 1,
+    }),
+    { network_idle: false, fonts: false, freeze_animations: false, stable_frames: 1 },
+  )
+  assertInvalid(() => parseVisualWaitPolicy("no"), "wait policy not an object")
+  assertInvalid(() => parseVisualWaitPolicy({ stable_frames: 0 }), "stable frames zero")
+  assertInvalid(() => parseVisualWaitPolicy({ unknown: true }), "unknown wait key")
 })
 
 test("decodePng rejects non-PNG bytes", () => {
@@ -172,12 +252,41 @@ test("environmentMatches compares viewport and DPR", () => {
   assert.equal(environmentMatches({ width: 1280, height: 720, dpr: 2 }, { width: 1280, height: 720 }, 1), false)
 })
 
+test("environmentFingerprint hashes the canonical environment", () => {
+  const base = {
+    viewport_width: 1280,
+    viewport_height: 720,
+    device_scale_factor: 1,
+    selector: "",
+    region: null,
+    config_revision: 3,
+    browser: "chromium",
+    version: "120.0.1",
+  }
+  const fingerprint = environmentFingerprint(base)
+  assert.match(fingerprint, /^[0-9a-f]{64}$/)
+  assert.equal(fingerprint, environmentFingerprint({ ...base }))
+  assert.notEqual(fingerprint, environmentFingerprint({ ...base, config_revision: 4 }))
+  assert.notEqual(fingerprint, environmentFingerprint({ ...base, version: "121.0.0" }))
+})
+
 /** Fake context entry whose page returns a fixed screenshot and fingerprint. */
 function fakeEntry({ actualPng, live, locatorPng = null, selectorCount = 1 }) {
-  return {
+  let evaluateCalls = 0
+  const entry = {
+    context: {
+      browser: () => ({
+        version: () => "120.0.1",
+        browserType: () => ({ name: () => "chromium" }),
+      }),
+    },
     page: {
       screenshot: async () => actualPng,
-      evaluate: async () => live,
+      evaluate: async () => {
+        evaluateCalls += 1
+        return live
+      },
+      waitForLoadState: async () => {},
       locator: () => ({
         count: async () => selectorCount,
         first: () => ({
@@ -186,7 +295,9 @@ function fakeEntry({ actualPng, live, locatorPng = null, selectorCount = 1 }) {
         }),
       }),
     },
+    evaluateCalls: () => evaluateCalls,
   }
+  return entry
 }
 
 test("runVisualCompare reports an environment mismatch without a diff artifact", async () => {
@@ -198,8 +309,9 @@ test("runVisualCompare reports an environment mismatch without a diff artifact",
   const outcome = await runVisualCompare(entry, baseArgs(), 1000)
   assert.equal(outcome.result.environment_match, false)
   assert.equal(outcome.result.diff_ratio, 0)
+  assert.equal(outcome.result.capture_only, false)
   assert.equal(outcome.artifacts.length, 1)
-  assert.equal(outcome.artifacts[0].kind, "visual_actual")
+  assert.equal(outcome.artifacts[0].kind, "actual_png")
   assert.equal(Buffer.from(outcome.artifacts[0].base64, "base64").equals(actual), true)
 })
 
@@ -211,10 +323,40 @@ test("runVisualCompare compares a matching full-page screenshot", async () => {
   assert.equal(outcome.result.diff_ratio, 0)
   assert.equal(outcome.result.width, 100)
   assert.deepEqual(outcome.result.mismatch_boxes, [])
+  assert.equal(outcome.result.environment.viewport_width, 100)
+  assert.equal(outcome.result.environment.device_scale_factor, 1)
+  assert.equal(outcome.result.environment.browser, "chromium")
+  assert.equal(outcome.result.environment.version, "120.0.1")
   assert.deepEqual(
     outcome.artifacts.map((item) => item.kind),
-    ["visual_actual", "visual_diff"],
+    ["actual_png", "diff_png"],
   )
+})
+
+test("runVisualCompare returns capture-only actual when no baseline is supplied", async () => {
+  const page = makePng(100, 100)
+  const entry = fakeEntry({ actualPng: page, live: { width: 100, height: 100, dpr: 1 } })
+  const args = { ...baseArgs(), baseline: null }
+  const outcome = await runVisualCompare(entry, args, 1000)
+  assert.equal(outcome.result.capture_only, true)
+  assert.equal(outcome.result.environment_match, true)
+  assert.equal(outcome.result.diff_ratio, 0)
+  assert.deepEqual(outcome.artifacts.map((item) => item.kind), ["actual_png"])
+  assert.equal(Buffer.from(outcome.artifacts[0].base64, "base64").equals(page), true)
+  // The stabilization wait runs at least one page.evaluate round trip before
+  // the screenshot fingerprint probe.
+  assert.ok(entry.evaluateCalls() >= 2, `evaluate calls = ${entry.evaluateCalls()}`)
+})
+
+test("runVisualCompare still reports capture-only environment mismatches", async () => {
+  const entry = fakeEntry({
+    actualPng: makePng(50, 50),
+    live: { width: 100, height: 100, dpr: 1 },
+  })
+  const outcome = await runVisualCompare(entry, { ...baseArgs(), baseline: null }, 1000)
+  assert.equal(outcome.result.capture_only, true)
+  assert.equal(outcome.result.environment_match, false)
+  assert.deepEqual(outcome.artifacts.map((item) => item.kind), ["actual_png"])
 })
 
 test("runVisualCompare treats a screenshot size mismatch as an environment mismatch", async () => {
@@ -236,7 +378,7 @@ test("runVisualCompare supports an element selector", async () => {
   })
   const outcome = await runVisualCompare(
     entry,
-    baseArgs({ selector: "#box", baseline_base64: element.toString("base64") }),
+    baseArgs({ selector: "#box", baseline: { base64: element.toString("base64") } }),
     1000,
   )
   assert.equal(outcome.result.environment_match, true)
@@ -257,14 +399,14 @@ test("runVisualCompare classifies a selector baseline size mismatch as an enviro
   })
   const outcome = await runVisualCompare(
     entry,
-    baseArgs({ selector: "#box", baseline_base64: makePng(50, 20).toString("base64") }),
+    baseArgs({ selector: "#box", baseline: { base64: makePng(50, 20).toString("base64") } }),
     1000,
   )
   assert.equal(outcome.result.environment_match, false)
   assert.equal(outcome.result.diff_ratio, 0)
   assert.deepEqual(
     outcome.artifacts.map((item) => item.kind),
-    ["visual_actual"],
+    ["actual_png"],
   )
 })
 
@@ -276,12 +418,23 @@ test("runVisualCompare checks the live device scale factor fingerprint", async (
   })
   const outcome = await runVisualCompare(
     entry,
-    baseArgs({ device_scale_factor: 1, baseline_base64: page.toString("base64") }),
+    baseArgs({ device_scale_factor: 1, baseline: { base64: page.toString("base64") } }),
     1000,
   )
   assert.equal(outcome.result.environment_match, false)
   assert.equal(outcome.result.actual_device_scale_factor, 2)
   assert.equal(outcome.artifacts.length, 1)
+})
+
+test("visualActionRequestLimit accepts the base64 growth of the configured cap", () => {
+  const fiveMiB = 5 * 1024 * 1024
+  const limit = visualActionRequestLimit({
+    EZTEST_VISUAL_BASELINE_MAX_BYTES: String(fiveMiB),
+  })
+  assert.ok(limit > fiveMiB, `limit ${limit} must leave room for base64`)
+  assert.ok(limit <= MAX_ACTION_REQUEST_BYTES)
+  const tiny = visualActionRequestLimit({ EZTEST_VISUAL_BASELINE_MAX_BYTES: String(64 * 1024) })
+  assert.ok(tiny < limit)
 })
 
 test("runVisualCompare rejects a missing selector target", async () => {

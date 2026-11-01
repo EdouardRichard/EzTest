@@ -17,6 +17,11 @@ import (
 
 var testTime = time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 
+const (
+	baselineCommit      = "0123456789abcdef0123456789abcdef01234567"
+	otherBaselineCommit = "fedcba9876543210fedcba9876543210fedcba98"
+)
+
 func newIDs(t *testing.T) *id.Snowflake {
 	t.Helper()
 	generator, err := id.NewSnowflake(1)
@@ -42,14 +47,15 @@ func sampleVersion(ids *id.Snowflake, actorID int64) version.Version {
 func sampleBindings(ids *id.Snowflake, versionID int64) []version.Binding {
 	return []version.Binding{
 		{
-			ID:               ids.Next(),
-			VersionID:        versionID,
-			SUTID:            1001,
-			EnvironmentID:    1101,
-			CodeRepositoryID: ptr(int64(1201)),
-			Scope:            version.Scope{Pages: []int64{1301, 1302}, APIs: []int64{1401}},
-			DatabaseIDs:      []int64{1501},
-			Accounts:         []version.AccountBinding{{AccountID: 1601, Role: "order_admin"}},
+			ID:                 ids.Next(),
+			VersionID:          versionID,
+			SUTID:              1001,
+			EnvironmentID:      1101,
+			CodeRepositoryID:   ptr(int64(1201)),
+			CodeBaselineCommit: baselineCommit,
+			Scope:              version.Scope{Pages: []int64{1301, 1302}, APIs: []int64{1401}},
+			DatabaseIDs:        []int64{1501},
+			Accounts:           []version.AccountBinding{{AccountID: 1601, Role: "order_admin"}},
 		},
 		{
 			ID:            ids.Next(),
@@ -93,6 +99,9 @@ func TestRepositoryCreateGetListUpdate(t *testing.T) {
 	first := findBinding(t, storedBindings, 1001)
 	if first.CodeRepositoryID == nil || *first.CodeRepositoryID != 1201 {
 		t.Fatalf("repository = %v", first.CodeRepositoryID)
+	}
+	if first.CodeBaselineCommit != baselineCommit {
+		t.Fatalf("code baseline commit = %q, want %q", first.CodeBaselineCommit, baselineCommit)
 	}
 	if got := first.Scope.Pages; len(got) != 2 || got[0] != 1301 || got[1] != 1302 {
 		t.Fatalf("scope pages = %#v", got)
@@ -224,6 +233,80 @@ func TestRepositoryCreateGetListUpdate(t *testing.T) {
 	missing.ID = 999999
 	if _, err := repo.Update(ctx, missing); !errors.Is(err, version.ErrNotFound) {
 		t.Fatalf("missing Update = %v", err)
+	}
+}
+
+func TestRepositorySetCodeBaselineCommit(t *testing.T) {
+	pool := testutil.NewDB(t)
+	ids := newIDs(t)
+	repo := versionpg.New(pool, ids)
+	ctx := context.Background()
+
+	v := sampleVersion(ids, 1)
+	bindings := sampleBindings(ids, v.ID)
+	bindings[0].CodeBaselineCommit = ""
+	if err := repo.Create(ctx, v, bindings); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	_, storedBindings, err := repo.Get(ctx, v.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	first := findBinding(t, storedBindings, 1001)
+	if first.CodeBaselineCommit != "" {
+		t.Fatalf("initial code baseline commit = %q, want empty", first.CodeBaselineCommit)
+	}
+
+	if err := repo.SetCodeBaselineCommit(ctx, first.ID, baselineCommit); err != nil {
+		t.Fatalf("SetCodeBaselineCommit: %v", err)
+	}
+	_, storedBindings, err = repo.Get(ctx, v.ID)
+	if err != nil {
+		t.Fatalf("Get after backfill: %v", err)
+	}
+	if got := findBinding(t, storedBindings, 1001).CodeBaselineCommit; got != baselineCommit {
+		t.Fatalf("backfilled code baseline commit = %q, want %q", got, baselineCommit)
+	}
+
+	// The single-row update replaces an existing commit.
+	if err := repo.SetCodeBaselineCommit(ctx, first.ID, otherBaselineCommit); err != nil {
+		t.Fatalf("SetCodeBaselineCommit replace: %v", err)
+	}
+	_, storedBindings, err = repo.Get(ctx, v.ID)
+	if err != nil {
+		t.Fatalf("Get after replace: %v", err)
+	}
+	if got := findBinding(t, storedBindings, 1001).CodeBaselineCommit; got != otherBaselineCommit {
+		t.Fatalf("replaced code baseline commit = %q, want %q", got, otherBaselineCommit)
+	}
+
+	// An empty commit clears the column to NULL, keeping the stored baseline
+	// unresolved.
+	if err := repo.SetCodeBaselineCommit(ctx, first.ID, ""); err != nil {
+		t.Fatalf("SetCodeBaselineCommit clear: %v", err)
+	}
+	_, storedBindings, err = repo.Get(ctx, v.ID)
+	if err != nil {
+		t.Fatalf("Get after clear: %v", err)
+	}
+	if got := findBinding(t, storedBindings, 1001).CodeBaselineCommit; got != "" {
+		t.Fatalf("cleared code baseline commit = %q, want empty", got)
+	}
+	var isNull bool
+	if err := pool.QueryRow(ctx,
+		`SELECT code_baseline_commit IS NULL FROM version_sut WHERE id = $1`, first.ID).Scan(&isNull); err != nil {
+		t.Fatalf("query cleared column: %v", err)
+	}
+	if !isNull {
+		t.Fatal("cleared code baseline commit must be stored as NULL")
+	}
+
+	if err := repo.SetCodeBaselineCommit(ctx, 999999, baselineCommit); !errors.Is(err, version.ErrNotFound) {
+		t.Fatalf("missing SetCodeBaselineCommit = %v", err)
+	}
+	// The column CHECK rejects malformed commits.
+	if err := repo.SetCodeBaselineCommit(ctx, first.ID, "not-a-sha"); err == nil {
+		t.Fatal("malformed commit was persisted")
 	}
 }
 

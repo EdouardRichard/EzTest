@@ -252,6 +252,10 @@ type Deps struct {
 	// Execution is the P3 execution context surface. It is nil for P1/P2-only
 	// wiring; P3 tools then fail as an internal configuration error.
 	Execution ExecutionPort
+	// P5 is the additive P5 codeintel/visual service surface. P1–P4 wiring
+	// leaves it zero; the P5 tools then fail as an internal configuration
+	// error. It is nested so the frozen P1–P4 Deps fields stay unchanged.
+	P5 P5Deps
 }
 
 // RequirementSummary is one requirement row shown to the model.

@@ -13,19 +13,20 @@ import (
 // Team is the version-scoped collaboration channel.
 type Team string
 
-// P1 team enum; design/execution/delivery/steward are reserved for later phases.
+// P1 team enum; code is the P5 codeintel worker team (no team room/digest).
 const (
 	TeamClarification Team = "clarification"
 	TeamDesign        Team = "design"
 	TeamExecution     Team = "execution"
 	TeamDelivery      Team = "delivery"
 	TeamSteward       Team = "steward"
+	TeamCode          Team = "code"
 )
 
 // Valid reports whether the team is part of the frozen enum.
 func (t Team) Valid() bool {
 	switch t {
-	case TeamClarification, TeamDesign, TeamExecution, TeamDelivery, TeamSteward:
+	case TeamClarification, TeamDesign, TeamExecution, TeamDelivery, TeamSteward, TeamCode:
 		return true
 	default:
 		return false
@@ -36,7 +37,7 @@ func (t Team) Valid() bool {
 func ParseTeam(raw string) (Team, error) {
 	team := Team(strings.TrimSpace(raw))
 	if !team.Valid() {
-		return "", platform.Invalid("team", "must be one of clarification, design, execution, delivery, steward")
+		return "", platform.Invalid("team", "must be one of clarification, design, execution, delivery, steward, code")
 	}
 	return team, nil
 }
@@ -107,7 +108,7 @@ func (p TeamRoomPost) Validate() error {
 		return platform.Invalid("version_id", "must be a positive decimal ID")
 	}
 	if !p.Team.Valid() {
-		return platform.Invalid("team", "must be one of clarification, design, execution, delivery, steward")
+		return platform.Invalid("team", "must be one of clarification, design, execution, delivery, steward, code")
 	}
 	if !p.Kind.Valid() {
 		return platform.Invalid("kind", "must be one of finding, decision, blocker, handoff, status")
@@ -141,7 +142,7 @@ func (d TeamRoomDigest) Validate() error {
 		return platform.Invalid("version_id", "must be a positive decimal ID")
 	}
 	if !d.Team.Valid() {
-		return platform.Invalid("team", "must be one of clarification, design, execution, delivery, steward")
+		return platform.Invalid("team", "must be one of clarification, design, execution, delivery, steward, code")
 	}
 	if strings.TrimSpace(d.Summary) == "" {
 		return platform.Invalid("summary", "must not be empty")

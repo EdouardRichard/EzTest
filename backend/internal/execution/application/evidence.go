@@ -33,7 +33,8 @@ type ContentStore interface {
 }
 
 // EvidenceInput is one evidence upload. Auto marks evidence produced by a tool
-// (screenshot/console/network/http/db/download) rather than execution.evidence.
+// or executor artifact (screenshot/console/network/http/db/download and the P5
+// visual_actual/visual_diff captures) rather than execution.evidence.
 type EvidenceInput struct {
 	Kind         execution.EvidenceKind
 	Data         []byte
@@ -144,7 +145,8 @@ func (s *CaseRunner) defaultEvidenceVersionSUT(ctx context.Context, caseRun exec
 }
 
 // EvidenceText is the execution.evidence tool: it uploads text evidence.
-func (s *CaseRunner) EvidenceText(ctx context.Context, scope tools.Scope, in tools.EvidenceTextInput) (any, error) {	evidence, err := s.AddEvidence(ctx, scope, EvidenceInput{
+func (s *CaseRunner) EvidenceText(ctx context.Context, scope tools.Scope, in tools.EvidenceTextInput) (any, error) {
+	evidence, err := s.AddEvidence(ctx, scope, EvidenceInput{
 		Kind:         execution.EvidenceKind(in.Kind),
 		Data:         []byte(in.Text),
 		StepSeq:      in.StepSeq,

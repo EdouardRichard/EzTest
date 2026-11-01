@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -130,8 +132,8 @@ func newTestService(t *testing.T, repo *fakeRepo) (*Service, *fakeAudit, *fakePu
 
 func TestDefinitionsAreUniqueAndWellFormed(t *testing.T) {
 	defs := Definitions("http://127.0.0.1:13336")
-	if len(defs) != 53 {
-		t.Fatalf("catalog has %d keys, want 53 (P4: 49 -> 53)", len(defs))
+	if len(defs) != 69 {
+		t.Fatalf("catalog has %d keys, want 69 (P5: 53 -> 69)", len(defs))
 	}
 	seen := map[string]bool{}
 	for _, def := range defs {
@@ -234,6 +236,77 @@ func TestP4ChainSettings(t *testing.T) {
 	}
 	if chainKeys != 4 {
 		t.Fatalf("chain settings = %d, want 4", chainKeys)
+	}
+}
+
+// TestP5CodeintelVisualSettings pins the 16 P5 keys (spec §4.5): nine
+// codeintel.* and seven visual.* settings, plus the JSON-array exclude globs.
+// Every key is non-secret and only lowers the hard domain limits.
+func TestP5CodeintelVisualSettings(t *testing.T) {
+	defs := Definitions("http://127.0.0.1:13336")
+	cases := []struct {
+		key     string
+		typ     settings.Type
+		def     string
+		integer bool
+		min     *float64
+		max     *float64
+	}{
+		{"codeintel.max_index_files", settings.TypeNumber, "5000", true, floatPtr(1), floatPtr(50000)},
+		{"codeintel.max_changed_files", settings.TypeNumber, "20", true, floatPtr(1), floatPtr(200)},
+		{"codeintel.max_file_bytes", settings.TypeNumber, "65536", true, floatPtr(1024), floatPtr(1048576)},
+		{"codeintel.max_diff_bytes", settings.TypeNumber, "262144", true, floatPtr(4096), floatPtr(1048576)},
+		{"codeintel.max_excerpt_lines", settings.TypeNumber, "40", true, floatPtr(1), floatPtr(200)},
+		{"codeintel.analysis_timeout_seconds", settings.TypeNumber, "180", true, floatPtr(10), floatPtr(1800)},
+		{"codeintel.max_concurrent_analyses", settings.TypeNumber, "1", true, floatPtr(1), floatPtr(4)},
+		{"codeintel.prompt_version", settings.TypeString, `"p5.1"`, false, nil, nil},
+		{"visual.default_threshold", settings.TypeNumber, "0.005", false, floatPtr(0), floatPtr(0.1)},
+		{"visual.baseline_max_bytes", settings.TypeNumber, "5242880", true, floatPtr(65536), floatPtr(20971520)},
+		{"visual.default_viewport_width", settings.TypeNumber, "1280", true, floatPtr(1), floatPtr(10000)},
+		{"visual.default_viewport_height", settings.TypeNumber, "720", true, floatPtr(1), floatPtr(10000)},
+		{"visual.default_device_scale_factor", settings.TypeNumber, "1", false, floatPtr(0.5), floatPtr(4)},
+		{"visual.compare_timeout_seconds", settings.TypeNumber, "60", true, floatPtr(5), floatPtr(300)},
+		{"visual.wait_timeout_seconds", settings.TypeNumber, "15", true, floatPtr(1), floatPtr(120)},
+	}
+	for _, tc := range cases {
+		def := defs[indexOf(t, defs, tc.key)]
+		wantCategory := "codeintel"
+		if strings.HasPrefix(tc.key, "visual.") {
+			wantCategory = "visual"
+		}
+		if def.Type != tc.typ || string(def.Default) != tc.def || def.Secret || def.Integer != tc.integer {
+			t.Fatalf("%s = %+v, want type=%s default=%s non-secret integer=%v", tc.key, def, tc.typ, tc.def, tc.integer)
+		}
+		if def.Category != wantCategory {
+			t.Fatalf("%s category = %q, want %q", tc.key, def.Category, wantCategory)
+		}
+		if !floatPtrEqual(def.Min, tc.min) || !floatPtrEqual(def.Max, tc.max) {
+			t.Fatalf("%s range = %v..%v, want %v..%v", tc.key, def.Min, def.Max, tc.min, tc.max)
+		}
+	}
+
+	globs := defs[indexOf(t, defs, "codeintel.exclude_globs")]
+	if globs.Type != settings.TypeJSON || globs.Category != "codeintel" || globs.Secret {
+		t.Fatalf("codeintel.exclude_globs = %+v, want non-secret json in codeintel", globs)
+	}
+	var patterns []string
+	if err := json.Unmarshal(globs.Default, &patterns); err != nil {
+		t.Fatalf("codeintel.exclude_globs default is not a JSON string array: %v", err)
+	}
+	wantPatterns := []string{"**/.git/**", "**/node_modules/**", "**/dist/**", "**/build/**", "**/vendor/**"}
+	if !slices.Equal(patterns, wantPatterns) {
+		t.Fatalf("codeintel.exclude_globs = %v, want %v", patterns, wantPatterns)
+	}
+
+	counts := map[string]int{}
+	for _, def := range defs {
+		counts[def.Category]++
+	}
+	if counts["codeintel"] != 9 {
+		t.Fatalf("codeintel settings = %d, want 9", counts["codeintel"])
+	}
+	if counts["visual"] != 7 {
+		t.Fatalf("visual settings = %d, want 7", counts["visual"])
 	}
 }
 
@@ -349,6 +422,13 @@ func TestUpdateValidatesTypeAndRange(t *testing.T) {
 		{"execution.executor_context_ttl_seconds", 3601},
 		{"execution.human_request_timeout_seconds", 59},
 		{"execution.executor_token", 123},
+		{"codeintel.max_changed_files", 0},
+		{"codeintel.max_changed_files", 201},
+		{"codeintel.max_concurrent_analyses", 5},
+		{"codeintel.prompt_version", 1},
+		{"visual.default_threshold", 0.11},
+		{"visual.default_device_scale_factor", 0.4},
+		{"visual.compare_timeout_seconds", 4},
 	}
 	for _, tc := range cases {
 		if _, err := svc.Update(ctx, tc.key, tc.value, 1); err == nil {
@@ -368,6 +448,9 @@ func TestUpdateValidatesTypeAndRange(t *testing.T) {
 	}
 	if !token.Secret {
 		t.Fatal("executor token must stay a secret setting")
+	}
+	if _, err := svc.Update(ctx, "codeintel.exclude_globs", []string{"**/vendor/**"}, 1); err != nil {
+		t.Fatalf("JSON array exclude_globs rejected: %v", err)
 	}
 }
 

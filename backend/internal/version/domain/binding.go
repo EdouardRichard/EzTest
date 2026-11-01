@@ -1,6 +1,10 @@
 package version
 
-import "github.com/EdouardRichard/EzTest/backend/internal/platform"
+import (
+	"regexp"
+
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+)
 
 // Scope is the page/API subset selected for one SUT binding. The JSON shape is
 // persisted verbatim in version_sut.scope.
@@ -34,9 +38,23 @@ type Binding struct {
 	SUTID            int64
 	EnvironmentID    int64
 	CodeRepositoryID *int64
-	Scope            Scope
-	DatabaseIDs      []int64
-	Accounts         []AccountBinding
+	// CodeBaselineCommit is the resolved commit SHA of the bound repository at
+	// binding time (P5 §5.5). Empty means "not resolved yet"; a valid value is
+	// 40 lowercase hex characters.
+	CodeBaselineCommit string
+	Scope              Scope
+	DatabaseIDs        []int64
+	Accounts           []AccountBinding
+}
+
+// codeBaselineCommitPattern matches the lowercase 40-hex commit SHA stored in
+// version_sut.code_baseline_commit (spec §3.7).
+var codeBaselineCommitPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+// IsValidCodeBaselineCommit reports whether commit is empty (unresolved) or a
+// lowercase 40-hex Git commit SHA.
+func IsValidCodeBaselineCommit(commit string) bool {
+	return commit == "" || codeBaselineCommitPattern.MatchString(commit)
 }
 
 // Validate checks the identifiers of one binding. Cross-resource ownership and
@@ -51,6 +69,9 @@ func (b Binding) Validate() error {
 	}
 	if b.CodeRepositoryID != nil && *b.CodeRepositoryID <= 0 {
 		return platform.Invalid("code_repository_id", "must be a positive decimal ID")
+	}
+	if !IsValidCodeBaselineCommit(b.CodeBaselineCommit) {
+		return platform.Invalid("code_baseline_commit", "must be empty or a lowercase 40-hex commit SHA")
 	}
 	for _, pageID := range b.Scope.Pages {
 		if pageID <= 0 {

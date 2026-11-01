@@ -48,7 +48,12 @@ export function EvidenceViewer({ versionId, evidence, open, onClose }: EvidenceV
     downloadEvidence(versionId, evidence.id)
       .then(async (result) => {
         if (cancelled) return
-        if (evidence.kind === "screenshot" || evidence.kind === "snapshot") {
+        if (
+          evidence.kind === "screenshot" ||
+          evidence.kind === "snapshot" ||
+          evidence.kind === "visual_actual" ||
+          evidence.kind === "visual_diff"
+        ) {
           objectUrl = URL.createObjectURL(result.blob)
           setPreviewUrl(objectUrl)
         } else {

@@ -1,6 +1,7 @@
 package agent_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
@@ -14,6 +15,7 @@ func TestTeamValidity(t *testing.T) {
 		agent.TeamExecution,
 		agent.TeamDelivery,
 		agent.TeamSteward,
+		agent.TeamCode,
 	} {
 		if !team.Valid() {
 			t.Fatalf("team %q should be valid", team)
@@ -25,10 +27,32 @@ func TestTeamValidity(t *testing.T) {
 	if _, err := agent.ParseTeam("design"); err != nil {
 		t.Fatalf("ParseTeam(design): %v", err)
 	}
+	code, err := agent.ParseTeam("code")
+	if err != nil {
+		t.Fatalf("ParseTeam(code): %v", err)
+	}
+	if code != agent.TeamCode {
+		t.Fatalf("ParseTeam(code) = %q, want %q", code, agent.TeamCode)
+	}
 	if _, err := agent.ParseTeam("unknown"); err == nil {
 		t.Fatal("ParseTeam should reject unknown teams")
 	} else if field := platform.AsError(err).Details["field"]; field != "team" {
 		t.Fatalf("field = %#v", field)
+	}
+}
+
+func TestParseTeamErrorListsEveryTeam(t *testing.T) {
+	_, err := agent.ParseTeam("unknown")
+	if err == nil {
+		t.Fatal("ParseTeam should reject unknown teams")
+	}
+	message := platform.AsError(err).Message
+	for _, team := range []string{
+		"clarification", "design", "execution", "delivery", "steward", "code",
+	} {
+		if !strings.Contains(message, team) {
+			t.Fatalf("team error %q does not list %q", message, team)
+		}
 	}
 }
 
