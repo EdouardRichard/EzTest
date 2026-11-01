@@ -170,6 +170,7 @@ type CaseRunnerDeps struct {
 	Gaps        GapEnsurer
 	TeamRoom    TeamRoom
 	Human       HumanRequestService
+	Visual      VisualAssertPort
 	Settings    SettingsReader
 	Clock       Clock
 	IDs         IDGenerator
@@ -201,6 +202,7 @@ type CaseRunner struct {
 	gaps        GapEnsurer
 	teamRoom    TeamRoom
 	human       HumanRequestService
+	visual      VisualAssertPort
 	settings    SettingsReader
 	clock       Clock
 	ids         IDGenerator
@@ -240,6 +242,7 @@ func NewCaseRunner(deps CaseRunnerDeps) *CaseRunner {
 		gaps:        deps.Gaps,
 		teamRoom:    deps.TeamRoom,
 		human:       deps.Human,
+		visual:      deps.Visual,
 		settings:    deps.Settings,
 		clock:       deps.Clock,
 		ids:         deps.IDs,

@@ -123,15 +123,18 @@ func (c FailureClass) IsIssueCandidate() bool { return c == FailureClassApplicat
 
 // CaseRunSummary is the case_run.summary JSONB projection.
 type CaseRunSummary struct {
-	VerdictReason   string `json:"verdict_reason,omitempty"`
-	AssertionTotal  int    `json:"assertion_total"`
-	AssertionFailed int    `json:"assertion_failed"`
-	StepTotal       int    `json:"step_total"`
-	StepFailed      int    `json:"step_failed"`
-	EvidenceCount   int    `json:"evidence_count"`
-	VisualSkipped   int    `json:"visual_skipped"`
-	HumanRequestID  int64  `json:"human_request_id,omitempty"`
-	LastError       string `json:"last_error,omitempty"`
+	VerdictReason      string `json:"verdict_reason,omitempty"`
+	AssertionTotal     int    `json:"assertion_total"`
+	AssertionFailed    int    `json:"assertion_failed"`
+	StepTotal          int    `json:"step_total"`
+	StepFailed         int    `json:"step_failed"`
+	EvidenceCount      int    `json:"evidence_count"`
+	VisualSkipped      int    `json:"visual_skipped"`
+	VisualPassed       int    `json:"visual_passed"`
+	VisualFailed       int    `json:"visual_failed"`
+	VisualInconclusive int    `json:"visual_inconclusive"`
+	HumanRequestID     int64  `json:"human_request_id,omitempty"`
+	LastError          string `json:"last_error,omitempty"`
 }
 
 // EvidenceCountValue returns the evidence count as an int.

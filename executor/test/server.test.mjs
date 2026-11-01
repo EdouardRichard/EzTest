@@ -216,6 +216,58 @@ test("request bodies over 1MB are rejected with 413 too_large", async () => {
   assert.equal(response.json.error.code, "too_large")
 })
 
+test("action bodies over 1MB are rejected unless the action is visual.compare", async () => {
+  const created = await createContext()
+  try {
+    const oversized = {
+      action: "snapshot",
+      args: { pad: "x".repeat(MAX_REQUEST_BYTES + 1024) },
+    }
+    const rejected = await request(`/v1/contexts/${created.contextId}/actions`, {
+      method: "POST",
+      body: oversized,
+    })
+    assert.equal(rejected.status, 413)
+    assert.equal(rejected.json.error.code, "too_large")
+  } finally {
+    await request(`/v1/contexts/${created.contextId}`, { method: "DELETE" })
+  }
+})
+
+test("visual.compare keeps the larger visual action body limit", async () => {
+  let received = null
+  const fakeManager = {
+    runAction: async (_contextId, body) => {
+      received = body
+      return { ok: true, result: {} }
+    },
+  }
+  const visualServer = createExecutorServer({
+    token: TOKEN,
+    manager: fakeManager,
+    logger: null,
+    version: "test",
+  })
+  visualServer.listen(0, "127.0.0.1")
+  await new Promise((resolve) => visualServer.once("listening", resolve))
+  const { port } = visualServer.address()
+  const call = httpClient(`http://127.0.0.1:${port}`, TOKEN)
+  try {
+    const body = {
+      action: "visual.compare",
+      args: { pad: "x".repeat(MAX_REQUEST_BYTES + 1024) },
+    }
+    const response = await call("/v1/contexts/ctx_visual/actions", {
+      method: "POST",
+      body,
+    })
+    assert.equal(response.status, 200, response.text)
+    assert.equal(received.action, "visual.compare")
+  } finally {
+    await new Promise((resolve) => visualServer.close(resolve))
+  }
+})
+
 test("context limit rejects additional contexts", async () => {
   const created = await createContext()
   try {

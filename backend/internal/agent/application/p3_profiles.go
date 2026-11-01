@@ -72,6 +72,10 @@ var caseExecutorTools = []string{
 	tools.ToolExecutionWait,
 	tools.ToolExecutionCaseFinish,
 	tools.ToolHumanRequest,
+	// P5: the case executor must run every configured visual assertion
+	// (execution.visual_assert, registered by the P5 registry); a missed visual
+	// assertion makes the case inconclusive, never a false pass.
+	"execution.visual_assert",
 }
 
 var failureAnalystTools = []string{
