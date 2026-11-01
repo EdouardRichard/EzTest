@@ -388,3 +388,14 @@ func TestP3ToolPortErrorMapping(t *testing.T) {
 		}
 	}
 }
+
+func TestNoArgToolSchemasSerializePropertiesAsObject(t *testing.T) {
+	var document map[string]any
+	if err := json.Unmarshal(schemaObject(nil), &document); err != nil {
+		t.Fatalf("schemaObject: %v", err)
+	}
+	properties, ok := document["properties"].(map[string]any)
+	if !ok || len(properties) != 0 {
+		t.Fatalf("properties = %#v, want empty object (provider rejects null)", document["properties"])
+	}
+}

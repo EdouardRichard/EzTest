@@ -400,6 +400,12 @@ func p1Tools(deps Deps) []Tool {
 var emptyObjectSchema = json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`)
 
 func schemaObject(properties map[string]any, required ...string) json.RawMessage {
+	if properties == nil {
+		// Providers reject "properties": null; a no-argument tool still needs
+		// an empty JSON object. The real DeepSeek API returned HTTP 400 for
+		// execution.coverage_read before this guard.
+		properties = map[string]any{}
+	}
 	document := map[string]any{
 		"type":                 "object",
 		"properties":           properties,
