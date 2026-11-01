@@ -221,24 +221,29 @@ CountRequirementClosure(ctx, versionID *int64) (num, denom int, err error)
 SearchVersions(ctx, q string, limit int) ([]SearchHit, error)
 SearchRequirements(ctx, q string, limit int) ([]SearchHit, error)
 VersionTitles(ctx, ids []int64) (map[int64]string, error)
+ListPendingDesignVersions(ctx) ([]TodoHit, error)
+ListDraftRequirements(ctx, limit int) ([]TodoHit, error)
 // design
 CountCaseConfirmation(ctx, versionID *int64) (num, denom int, err error)
 SearchCases(ctx, q string, limit int) ([]SearchHit, error)
+ListDraftCases(ctx, limit int) ([]TodoHit, error)
 // execution
 CountExecutionPass(ctx, versionID *int64) (num, denom int, err error)
 CountEvidenceCompleteness(ctx, versionID *int64) (num, denom int, err error)
-OpenHumanRequests(ctx, viewer platform.Actor, limit int) ([]HumanRequestHit, error)
-DeadWorkItems(ctx, limit int) ([]WorkItemHit, error)
+OpenHumanRequests(ctx, viewer platform.Actor, limit int) ([]TodoHit, error)
+DeadWorkItems(ctx, limit int) ([]TodoHit, error)
 // delivery
 CountIssueValidity(ctx, versionID *int64) (num, denom int, err error)
 SearchIssues(ctx, q string, limit int) ([]SearchHit, error)
 SearchReports(ctx, q string, limit int) ([]SearchHit, error)
+ListOpenIssues(ctx, limit int) ([]TodoHit, error)
 // agent
 CountTaskRetries(ctx, versionID *int64) (num, denom int, err error)
 // eventing
 CountEvents(ctx, eventType string, channel string) (int, error)
 ```
 - `SearchHit{ID,Title,Subtitle,VersionID,VersionTitle,Status,URL}` 由 owning 包定义或共享 platform 类型；url 在 handler 层补全更稳妥时由 handler 组装。
+- `TodoHit{Kind,Title,VersionID,VersionTitle,Severity,CreatedAt,ExpiresAt,URL}` 由 owning 包定义或共享 platform 类型。
 
 - [ ] **Step 1: 写失败测试**
 
