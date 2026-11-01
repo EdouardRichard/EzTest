@@ -13,21 +13,82 @@ const intentColumns = `id, version_id, case_version_id, version_sut_ids, environ
 // IntentRepository implements executionapp.IntentRepository.
 type IntentRepository struct{ base }
 
-// Create inserts one execution intent.
+// Create inserts one execution intent. It runs in a transaction whose first
+// lock is the version-scoped advisory lock shared with version close and
+// requirement closure. A close/closure that committed while this transaction
+// waited is visible to the guards below, so the insert can never land behind a
+// stale recheck. A completed version yields ErrVersionCompleted (the intent
+// service reopens and retries through the P4 reopen path); a closed requirement
+// yields ErrRequirementClosed (terminal for intent creation).
 func (r *IntentRepository) Create(ctx context.Context, intent execution.ExecutionIntent) error {
 	ctx = contextOrBackground(ctx)
 	sutIDs, err := encodeJSONArray("version_sut_ids", intent.VersionSUTIDs)
 	if err != nil {
 		return err
 	}
-	_, err = r.pool.Exec(ctx, `
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return wrapDB("insert execution intent: begin", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := lockVersionTx(ctx, tx, intent.VersionID, "insert execution intent"); err != nil {
+		return err
+	}
+	if err := guardIntentScope(ctx, tx, intent); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
 		INSERT INTO execution_intent (id, version_id, case_version_id, version_sut_ids,
 			environment_fingerprint, code_baseline, purpose, status, dedupe_key, attempt_no, created_by)
 		VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11)
 	`, r.insertID(intent.ID), intent.VersionID, intent.CaseVersionID, sutIDs,
 		intent.EnvironmentFingerprint, intent.CodeBaseline, string(intent.Purpose), string(intent.Status),
-		intent.DedupeKey, intent.AttemptNo, nullableID(intent.CreatedBy))
-	return wrapDB("insert execution intent", err)
+		intent.DedupeKey, intent.AttemptNo, nullableID(intent.CreatedBy)); err != nil {
+		return wrapDB("insert execution intent", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return wrapDB("insert execution intent: commit", err)
+	}
+	return nil
+}
+
+// guardIntentScope re-checks the version and requirement state while the
+// version advisory lock is held. It intentionally reads the version/design
+// tables directly: only a check in this transaction can see a close/closure
+// that committed while the lock wait was in progress. Missing rows are allowed
+// (the intent table only carries logical references; the service validates the
+// case/version before calling the repository).
+func guardIntentScope(ctx context.Context, tx pgx.Tx, intent execution.ExecutionIntent) error {
+	var versionStatus string
+	err := tx.QueryRow(ctx, `SELECT status FROM version WHERE id = $1`, intent.VersionID).Scan(&versionStatus)
+	switch {
+	case err == nil:
+		if versionStatus == "completed" {
+			return execution.ErrVersionCompleted
+		}
+	case !isNoRows(err):
+		return wrapDB("check intent version", err)
+	}
+
+	var requirementStatus string
+	err = tx.QueryRow(ctx, `
+		SELECT r.status
+		FROM case_version cv
+		JOIN case_entity ce ON ce.id = cv.case_id
+		JOIN case_scenario s ON s.id = ce.scenario_id
+		JOIN requirement r ON r.id = s.requirement_id
+		WHERE cv.id = $1 AND s.version_id = $2
+	`, intent.CaseVersionID, intent.VersionID).Scan(&requirementStatus)
+	switch {
+	case err == nil:
+		if requirementStatus == "closed" {
+			return execution.ErrRequirementClosed
+		}
+	case !isNoRows(err):
+		return wrapDB("check intent requirement", err)
+	}
+	return nil
 }
 
 // Get loads one intent.

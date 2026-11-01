@@ -29,6 +29,7 @@ type RequirementService struct {
 	events    eventingapp.Publisher
 	ids       platformid.Generator
 	clock     clock.Clock
+	reopener  RequirementVersionReopener
 }
 
 // NewRequirementService wires the requirement use cases. audit and events may
@@ -50,6 +51,25 @@ func NewRequirementService(
 		repo: repo, versions: versions, resources: resources, stale: stale,
 		audit: audit, events: events, ids: ids, clock: clk,
 	}
+}
+
+// SetVersionReopener attaches the best-effort completed-version reopen
+// projection. It returns the service for fluent wiring.
+func (s *RequirementService) SetVersionReopener(reopener RequirementVersionReopener) *RequirementService {
+	if s != nil {
+		s.reopener = reopener
+	}
+	return s
+}
+
+// reopenCompleted applies the §7.5 requirement_created/requirement_reopened
+// trigger after the requirement write committed. Failures are ignored: the
+// reconciler is the fallback.
+func (s *RequirementService) reopenCompleted(ctx context.Context, versionID int64, trigger, reason string) {
+	if s == nil || s.reopener == nil {
+		return
+	}
+	_ = s.reopener.ReopenIfCompleted(ctx, versionID, trigger, reason)
 }
 
 // Create persists a new draft requirement with revision 1 and projects the
@@ -115,6 +135,7 @@ func (s *RequirementService) Create(ctx context.Context, versionID int64, in Req
 		"title":                  revision.Title,
 	})
 	s.markRunning(ctx, versionID)
+	s.reopenCompleted(ctx, versionID, VersionReopenTriggerRequirementCreated, "new requirement created")
 	return s.Get(ctx, versionID, requirementID)
 }
 
@@ -196,6 +217,7 @@ func (s *RequirementService) Update(ctx context.Context, versionID, requirementI
 		"reason":                    reason,
 		"affected_case_version_ids": affected,
 	})
+	s.reopenCompleted(ctx, versionID, VersionReopenTriggerRequirementReopened, reason)
 	return s.Get(ctx, versionID, requirementID)
 }
 
@@ -523,6 +545,7 @@ func (s *RequirementService) Rollback(ctx context.Context, versionID, requiremen
 			"proposal_message_id": platformid.Format(*proposalMessageID),
 		})
 	}
+	s.reopenCompleted(ctx, versionID, VersionReopenTriggerRequirementReopened, reason)
 	return s.Get(ctx, versionID, requirementID)
 }
 
@@ -766,6 +789,7 @@ func requirementViewFromRequirement(requirement version.Requirement, current ver
 		TargetPages:       nonNilStrings(current.TargetPages),
 		TargetAPIs:        nonNilStrings(current.TargetAPIs),
 		UpdatedAt:         requirement.UpdatedAt,
+		ClosedAt:          requirement.ClosedAt,
 	}
 	for _, confirmation := range confirmations {
 		if confirmation.RequirementVersionID == current.ID {

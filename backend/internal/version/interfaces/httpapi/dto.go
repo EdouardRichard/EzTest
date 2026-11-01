@@ -22,6 +22,8 @@ type versionDTO struct {
 	ConversationCount         int                  `json:"conversation_count"`
 	PendingDesignCount        int                  `json:"pending_design_count"`
 	CaseCounts                caseCountsDTO        `json:"case_counts"`
+	ClosedAt                  *string              `json:"closed_at"`
+	CloseReason               *string              `json:"close_reason"`
 	CreatedBy                 string               `json:"created_by"`
 	CreatedAt                 string               `json:"created_at"`
 	UpdatedAt                 string               `json:"updated_at"`
@@ -183,9 +185,11 @@ func toVersionDTO(view versionapp.VersionView) versionDTO {
 			Confirmed: view.CaseCounts.Confirmed,
 			Stale:     view.CaseCounts.Stale,
 		},
-		CreatedBy: strconv.FormatInt(view.CreatedBy, 10),
-		CreatedAt: formatTime(view.CreatedAt),
-		UpdatedAt: formatTime(view.UpdatedAt),
+		ClosedAt:    formatOptionalTime(view.ClosedAt),
+		CloseReason: formatOptionalString(view.CloseReason),
+		CreatedBy:   strconv.FormatInt(view.CreatedBy, 10),
+		CreatedAt:   formatTime(view.CreatedAt),
+		UpdatedAt:   formatTime(view.UpdatedAt),
 	}
 }
 
@@ -402,6 +406,12 @@ type updateVersionRequest struct {
 	AutoDesignNewRequirements *bool   `json:"auto_design_new_requirements"`
 }
 
+// reopenVersionRequest is the P4 manual reopen payload; reason is required
+// (openapi VersionReopenRequest, 1..2000).
+type reopenVersionRequest struct {
+	Reason string `json:"reason"`
+}
+
 func (r createVersionRequest) command() (versionapp.CreateCommand, error) {
 	command := versionapp.CreateCommand{
 		Title:    r.Title,
@@ -476,4 +486,13 @@ func parseIDs(raw []string, field string) ([]int64, error) {
 
 func formatTime(value time.Time) string {
 	return value.UTC().Format(time.RFC3339)
+}
+
+// formatOptionalString renders an optional string projection as JSON null when
+// the value is empty.
+func formatOptionalString(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
 }

@@ -21,7 +21,9 @@ type RequirementDraft struct {
 }
 
 // RequirementView is the current-revision summary returned by the list API and
-// embedded in the detail.
+// embedded in the detail. ClosedAt/Closure are the P4 closure projection: they
+// are nil until the requirement closes and ClosedAt is cleared again by a
+// reopen (the newest closure round keeps the historical reopen count).
 type RequirementView struct {
 	ID                int64
 	CurrentVersionID  int64
@@ -34,6 +36,18 @@ type RequirementView struct {
 	TargetAPIs        []string
 	UpdatedAt         time.Time
 	ConfirmedAt       *time.Time
+	ClosedAt          *time.Time
+	Closure           *RequirementClosureView
+}
+
+// RequirementClosureView is the newest requirement_closure round summary
+// exposed on requirement reads (spec §4.2). Internal checks/evidence are not
+// part of the projection.
+type RequirementClosureView struct {
+	ID          int64
+	CloseRound  int
+	ClosedAt    time.Time
+	ReopenCount int
 }
 
 // RequirementVersionView is one immutable requirement revision.

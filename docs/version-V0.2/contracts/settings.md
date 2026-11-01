@@ -91,9 +91,9 @@ system_setting_revision(
   （如雪花 node、数据根目录）。UI 只显示提示，不阻止保存。
 - 相对路径按进程 CWD 解析；`paths.data_root` 启动后不可热改（重启生效）。
 
-## 3. 设置键目录（P0 44 项 + P3 5 项 = 49 项）
+## 3. 设置键目录（P0 44 项 + P3 5 项 + P4 4 项 = 53 项）
 
-`secret` 列：P0 44 项全部为 `false`；P3 的 `execution.executor_token` 为 `true`（表中以 **secret** 标注），其余 4 项为 `false`。
+`secret` 列：P0 44 项全部为 `false`；P3 的 `execution.executor_token` 为 `true`（表中以 **secret** 标注），其余 4 项为 `false`；P4 4 个 `chain.*` 键全部为 `false`。
 重启列中“是”对应 `restart_required=true`。
 未给出区间的 `number` 为整数类型，具体上限由后续阶段按合同增量（P0 不额外发明约束；P3 键的区间见本表）。
 
@@ -148,9 +148,13 @@ system_setting_revision(
 | 47 | `execution.executor_offline_seconds` | number | execution | `30` | 整数 5–300；心跳超时判 offline（建议 ≥2×heartbeat） | 否 |
 | 48 | `execution.executor_context_ttl_seconds` | number | execution | `300` | 整数 30–3600；非 running case 的 context 清理 TTL | 否 |
 | 49 | `execution.human_request_timeout_seconds` | number | execution | `1800` | 整数 60–86400；login_takeover 过期 | 否 |
+| 50 | `chain.max_nodes` | number | chain | `300` | 整数 1–1000；链路节点上限；越界回退默认并审计 | 否 |
+| 51 | `chain.max_edges` | number | chain | `600` | 整数 1–2000；链路边上限；越界回退默认并审计 | 否 |
+| 52 | `chain.max_requirements` | number | chain | `100` | 整数 1–500；参与链路的版本需求上限；越界回退默认并审计 | 否 |
+| 53 | `chain.replay_event_limit` | number | chain | `500` | 整数 1–2000；历史回看事件上限；越界回退默认并审计 | 否 |
 
-类别数量：runtime 1、paths 5、execution 11、agent 5、llm 2、context 4、team_room 3、
-retention 5、report 7、knowledge 2、security 2、feature 2 = **49**（P0 44 + P3 5）。
+类别数量：runtime 1、paths 5、execution 11、chain 4、agent 5、llm 2、context 4、team_room 3、
+retention 5、report 7、knowledge 2、security 2、feature 2 = **53**（P0 44 + P3 5 + P4 4）。
 
 默认值来源：规格 §5.2（OD-4/OD-8/OD-9/架构 §9–§12）；未在设计中逐项给出的键由 P0 冻结，
 后续阶段只能通过契约变更修改默认值或新增键；P3 新增 5 键按 spec §11.2 / P3-D-19 冻结。
@@ -197,6 +201,23 @@ retention 5、report 7、knowledge 2、security 2、feature 2 = **49**（P0 44 +
 - `paths.evidence_dir` **P3 不使用**（P3-D-20 例外，与 P2 `paths.export_dir` 同源）：证据字节写入 P0 内容账本（`content_object`/`content_ref`），`evidence` 行只存 `content_ref_id/sha256/size/mime/kind`；下载走 P3 鉴权端点。`paths.data_root` 不变。
 - `auto_design_new_requirements` 仍是 `version` 列，不是设置键；P3 不改。
 - P3 的 LLM 验收凭据仍只来自 `.env` 小写 `llm_*`（验收脚本读取，经 admin API 写入 `llm_config`），不属于 EzTest 启动 env。
+
+## 4d. P4 使用说明（`frozen: P4`，2026-11-01）
+
+- P4 **不新增** EzTest 启动 env：仍是严格 4 项（`.env` 只有 `EZTEST_DATABASE_URL`/`EZTEST_API_PORT`/`EZTEST_WEB_PORT`/`EZTEST_EXECUTOR_PORT`）。新增配置一律进设置中心。
+- P4 新增 4 键（49→53；新增 `chain` 类别）：
+  - `chain.max_nodes=300`（1..1000）：链路节点上限；超限置 `truncated=true`、`truncation.reason="node_budget"`，按 spec §8.3 顺序丢弃（最后才丢 requirement，`focus_node` 及其祖先永不丢）。
+  - `chain.max_edges=600`（1..2000）：链路边上限；超限 `truncation.reason="edge_budget"`。
+  - `chain.max_requirements=100`（1..500）：参与链路的根需求上限（按 `updated_at DESC, id DESC`）；超限 `truncation.reason="requirement_budget"`。
+  - `chain.replay_event_limit=500`（1..2000）：历史回看（按波次/事件区间）读取 `GET /api/events` 的事件上限。
+- 4 键均非 secret、热加载；越界/非法值回退默认并写审计（不阻断请求）；P4 不承诺任意时点 as-of（两档回放见 spec §8.4）。
+- 既有 `report.*` 键在 P4 的消费方式：
+  - `report.template_version` 固定 `"1"`（P4 内置 HTML 模板，不可用户编辑）；
+  - `report.section_summary/results/issues/coverage/evidence` 在 P4 HTML 渲染中生效（false 时不渲染对应章节）；
+  - `report.render_pdf=true` **保留但 P4 不消费**（PDF 留 P7；`pdf_ref` 恒 NULL、`pdf_available=false`，不调度 `report.render_pdf`）；
+  - `paths.report_dir` **P4 不使用**（与 `paths.export_dir`/`paths.evidence_dir` 例外一致）：报告 HTML 只写 P0 内容账本（`content_ref` owner_kind=`report_revision`、role=`report_html`），下载走鉴权端点，不落 `report_dir`。
+- `paths.data_root` 不变；P4 新增 `delivery`/`chain` 不引入独立 env 或路径设置。
+- P4 的 LLM 验收凭据仍只来自 `.env` 小写 `llm_*`（验收脚本读取，经 admin API 写入 `llm_config`），不属于 EzTest 启动 env。
 
 ## 5. 冻结与变更控制
 

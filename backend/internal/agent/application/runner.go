@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -52,7 +53,14 @@ type RunnerDeps struct {
 	// RunCanceller registers P3 run cancellation for pause/cancel/human
 	// takeover. It may be nil for P1/P2-only deployments.
 	RunCanceller RunCanceller
-	InstanceID   string
+	// ReportFinalizer verifies the published revision of report.wave/
+	// report.version runs (spec §4.4). It may be nil for deployments without the
+	// P4 report worker, but a report task then fails as a configuration error.
+	ReportFinalizer ReportFinalizer
+	// RequirementFinalizer verifies that requirement.close runs recorded the
+	// closure for their scoped requirement version (retryable if absent).
+	RequirementFinalizer RequirementFinalizer
+	InstanceID           string
 }
 
 // Runner executes one work item as an agent run: context packet, bounded model
@@ -60,45 +68,49 @@ type RunnerDeps struct {
 // deletes or closes a requirement; the model can only submit drafts and
 // proposals through the scoped tools.
 type Runner struct {
-	repo         agent.RuntimeRepository
-	chat         llmapp.ChatGateway
-	settings     SettingsReader
-	clock        clock.Clock
-	ids          id.Generator
-	events       eventingapp.Publisher
-	audit        auditapp.Recorder
-	conversation ConversationPort
-	versions     VersionReader
-	attachments  AttachmentReader
-	teamRoom     TeamRoomPort
-	content      ContentWriter
-	toolDeps     tools.Deps
-	taskProvider TaskContextProvider
-	runCanceller RunCanceller
-	instanceID   string
-	builder      *ContextBuilder
+	repo            agent.RuntimeRepository
+	chat            llmapp.ChatGateway
+	settings        SettingsReader
+	clock           clock.Clock
+	ids             id.Generator
+	events          eventingapp.Publisher
+	audit           auditapp.Recorder
+	conversation    ConversationPort
+	versions        VersionReader
+	attachments     AttachmentReader
+	teamRoom        TeamRoomPort
+	content         ContentWriter
+	toolDeps        tools.Deps
+	taskProvider    TaskContextProvider
+	runCanceller    RunCanceller
+	reportFinalizer      ReportFinalizer
+	requirementFinalizer RequirementFinalizer
+	instanceID      string
+	builder         *ContextBuilder
 }
 
 // NewRunner wires the agent runner.
 func NewRunner(deps RunnerDeps) *Runner {
 	return &Runner{
-		repo:         deps.Runtime,
-		chat:         deps.Chat,
-		settings:     deps.Settings,
-		clock:        deps.Clock,
-		ids:          deps.IDs,
-		events:       deps.Events,
-		audit:        deps.Audit,
-		conversation: deps.Conversation,
-		versions:     deps.Versions,
-		attachments:  deps.Attachments,
-		teamRoom:     deps.TeamRoom,
-		content:      deps.Content,
-		toolDeps:     deps.ToolDeps,
-		taskProvider: deps.TaskProvider,
-		runCanceller: deps.RunCanceller,
-		instanceID:   deps.InstanceID,
-		builder:      NewContextBuilder(deps.Settings, NewLLMSummarizer(deps.Chat)),
+		repo:            deps.Runtime,
+		chat:            deps.Chat,
+		settings:        deps.Settings,
+		clock:           deps.Clock,
+		ids:             deps.IDs,
+		events:          deps.Events,
+		audit:           deps.Audit,
+		conversation:    deps.Conversation,
+		versions:        deps.Versions,
+		attachments:     deps.Attachments,
+		teamRoom:        deps.TeamRoom,
+		content:         deps.Content,
+		toolDeps:        deps.ToolDeps,
+		taskProvider:    deps.TaskProvider,
+		runCanceller:    deps.RunCanceller,
+		reportFinalizer: deps.ReportFinalizer,
+		requirementFinalizer: deps.RequirementFinalizer,
+		instanceID:      deps.InstanceID,
+		builder:         NewContextBuilder(deps.Settings, NewLLMSummarizer(deps.Chat)),
 	}
 }
 
@@ -169,11 +181,7 @@ func ParseWorkItemPayload(raw json.RawMessage) (WorkItemPayload, error) {
 	if err := json.Unmarshal(raw, &object); err != nil {
 		return WorkItemPayload{}, fmt.Errorf("work item payload must be a JSON object: %w", err)
 	}
-	parseID := func(field string) (int64, error) {
-		value, ok := object[field]
-		if !ok {
-			return 0, nil
-		}
+	decodeDecimal := func(field string, value json.RawMessage) (int64, error) {
 		text := strings.TrimSpace(string(value))
 		if text == "" || text == "null" || text == `""` {
 			return 0, nil
@@ -193,6 +201,32 @@ func ParseWorkItemPayload(raw json.RawMessage) (WorkItemPayload, error) {
 			return 0, fmt.Errorf("work item payload %s must be a positive decimal ID", field)
 		}
 		return parsed, nil
+	}
+	parseID := func(field string) (int64, error) {
+		value, ok := object[field]
+		if !ok {
+			return 0, nil
+		}
+		return decodeDecimal(field, value)
+	}
+	// parseInt32 decodes a revision/round. The P4 report payloads carry these
+	// as JSON numbers or decimal strings; the first present key wins.
+	parseInt32 := func(fields ...string) (int32, error) {
+		for _, field := range fields {
+			value, ok := object[field]
+			if !ok {
+				continue
+			}
+			parsed, err := decodeDecimal(field, value)
+			if err != nil {
+				return 0, err
+			}
+			if parsed > math.MaxInt32 {
+				return 0, fmt.Errorf("work item payload %s exceeds int32 range", field)
+			}
+			return int32(parsed), nil
+		}
+		return 0, nil
 	}
 	var err error
 	if payload.ConversationID, err = parseID("conversation_id"); err != nil {
@@ -232,6 +266,29 @@ func ParseWorkItemPayload(raw json.RawMessage) (WorkItemPayload, error) {
 	}
 	if payload.DispatchEpoch, err = parseID("dispatch_epoch"); err != nil {
 		return WorkItemPayload{}, err
+	}
+	// P4 delivery/steward payload (contracts/task-types.md §6). ReportRevision
+	// is canonically "report_revision"; the frozen report.wave/report.version
+	// payload spells it "revision", accepted as a compatibility alias.
+	if payload.IssueID, err = parseID("issue_id"); err != nil {
+		return WorkItemPayload{}, err
+	}
+	if payload.ReportID, err = parseID("report_id"); err != nil {
+		return WorkItemPayload{}, err
+	}
+	if payload.ReportRevision, err = parseInt32("report_revision", "revision"); err != nil {
+		return WorkItemPayload{}, err
+	}
+	if payload.CloseRound, err = parseInt32("close_round"); err != nil {
+		return WorkItemPayload{}, err
+	}
+	if payload.ReportRevisionID, err = parseID("report_revision_id"); err != nil {
+		return WorkItemPayload{}, err
+	}
+	if fingerprint, ok := object["predicate_fingerprint"]; ok {
+		if err := json.Unmarshal(fingerprint, &payload.PredicateFingerprint); err != nil {
+			return WorkItemPayload{}, fmt.Errorf("work item payload predicate_fingerprint must be a string")
+		}
 	}
 	if token, ok := object["dispatch_token"]; ok {
 		_ = json.Unmarshal(token, &payload.DispatchToken)
@@ -353,7 +410,82 @@ func (r *Runner) Run(ctx context.Context, item agent.WorkItem) (RunResult, error
 	if err := r.writeOutputs(runCtx, state, finalText); err != nil {
 		return r.fail(runCtx, state, err)
 	}
+	// report.wave/report.version only complete when the targeted revision is
+	// published; a missing published revision is a retryable task failure.
+	if err := r.finalizeReport(runCtx, state); err != nil {
+		return r.fail(runCtx, state, err)
+	}
+	// requirement.close only completes when the closure round was actually
+	// written; a transient predicate rejection is retried through the normal
+	// work-item backoff instead of wedging the current close round.
+	if err := r.finalizeRequirement(runCtx, state); err != nil {
+		return r.fail(runCtx, state, err)
+	}
 	return r.finish(state, agent.AgentRunDone, "", false)
+}
+
+// finalizeReport runs the report finalizer hook for report tasks. It is a
+// no-op for every other work type: only report.wave/report.version own a report
+// revision whose publication gates the task (spec §4.4/§6.5).
+func (r *Runner) finalizeReport(ctx context.Context, state *runState) error {
+	switch state.item.Type {
+	case WorkTypeReportWave, WorkTypeReportVersion:
+	default:
+		return nil
+	}
+	if r.reportFinalizer == nil {
+		return &RunError{
+			Reason:    "tool_failure",
+			Retryable: false,
+			Cause:     errors.New("agent runner has no report finalizer"),
+		}
+	}
+	if state.payload.ReportID <= 0 || state.payload.ReportRevision <= 0 {
+		return &RunError{
+			Reason:    "invalid_payload",
+			Retryable: false,
+			Cause:     errors.New("report task payload has no report_id/revision"),
+		}
+	}
+	if err := r.reportFinalizer.Finalize(ctx, state.payload.ReportID, state.payload.ReportRevision); err != nil {
+		return &RunError{
+			Reason:    "report_finalize_failed",
+			Retryable: true,
+			Cause:     err,
+		}
+	}
+	return nil
+}
+
+// finalizeRequirement runs the requirement.close finalizer. A transient
+// predicate 409 leaves the run marked done by the model loop; without this
+// check the work item would be done with no closure and no new close round.
+func (r *Runner) finalizeRequirement(ctx context.Context, state *runState) error {
+	if state.item.Type != WorkTypeRequirementClose {
+		return nil
+	}
+	if r.requirementFinalizer == nil {
+		return &RunError{
+			Reason:    "tool_failure",
+			Retryable: false,
+			Cause:     errors.New("agent runner has no requirement finalizer"),
+		}
+	}
+	if state.payload.RequirementID <= 0 || state.payload.RequirementVersionID <= 0 {
+		return &RunError{
+			Reason:    "invalid_payload",
+			Retryable: false,
+			Cause:     errors.New("requirement.close payload has no requirement_id/requirement_version_id"),
+		}
+	}
+	if err := r.requirementFinalizer.Finalize(ctx, state.payload.RequirementID, state.payload.RequirementVersionID); err != nil {
+		return &RunError{
+			Reason:    "requirement_finalize_failed",
+			Retryable: true,
+			Cause:     err,
+		}
+	}
+	return nil
 }
 
 func (r *Runner) createRun(ctx context.Context, item agent.WorkItem, profile agent.AgentProfile, payload WorkItemPayload) (agent.AgentRun, error) {
@@ -437,7 +569,7 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 	state.model = modelInfo
 	state.input.ModelBudget = ModelBudget{ContextWindow: modelInfo.ContextWindow, MaxOutput: modelInfo.MaxOutput}
 	state.input.Profile = state.profile
-	state.input.Task = r.taskContext(state)
+	state.input.Task = r.taskContext(ctx, state)
 	state.input.Artifacts = artifactRefs(state)
 
 	attachmentText := ""
@@ -457,7 +589,7 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 		})
 	}
 
-	state.registry = tools.NewP3Registry(r.toolDepsForRun(state))
+	state.registry = tools.NewP4Registry(r.toolDepsForRun(state))
 	state.definitions = state.registry.Definitions(state.profile.AllowedTools)
 
 	packet, compactInfo, err := r.builder.Build(ctx, state.input)
@@ -585,6 +717,13 @@ func (r *Runner) executeTools(ctx context.Context, state *runState, calls []llma
 		IntentID:             state.payload.IntentID,
 		DispatchEpoch:        state.payload.DispatchEpoch,
 		DispatchToken:        state.payload.DispatchToken,
+		// P4 delivery/steward task targets, copied from the work-item payload.
+		IssueID:              state.payload.IssueID,
+		ReportID:             state.payload.ReportID,
+		ReportRevision:       state.payload.ReportRevision,
+		CloseRound:           state.payload.CloseRound,
+		ReportRevisionID:     state.payload.ReportRevisionID,
+		PredicateFingerprint: state.payload.PredicateFingerprint,
 	}
 	maxBytes := r.intSetting("agent.tool_result_max_bytes", defaultToolResultMaxBytes)
 
@@ -723,10 +862,11 @@ func (r *Runner) handleOverflow(ctx context.Context, state *runState) error {
 // Scout/Case Author/Design Critic/Data Planner team-room updates.
 func (r *Runner) writeOutputs(ctx context.Context, state *runState, finalText string) error {
 	switch state.profile.Key {
-	case ProfileKeyCaseExecutor, ProfileKeyFailureAnalyst, ProfileKeyCoverageAnalyst:
-		// P3 execution profiles persist their results through the execution
-		// tools (step/assertion/evidence/analysis); the final message is not a
-		// persisted artifact, so an empty reply is not a run failure.
+	case ProfileKeyCaseExecutor, ProfileKeyFailureAnalyst, ProfileKeyCoverageAnalyst,
+		ProfileKeyIssueTriager, ProfileKeyReportWriter:
+		// P3/P4 profiles persist their results through the scoped tools (or the
+		// report finalizer); the final message is not a persisted artifact, so
+		// an empty reply is not a run failure.
 		return nil
 	case ProfileKeyClarificationHost:
 		if finalText == "" {
@@ -1021,7 +1161,7 @@ func (r *Runner) toolDepsForRun(state *runState) tools.Deps {
 	}
 	task := state.input.Task
 	deps.TaskPack = func(context.Context, tools.Scope) (any, error) {
-		return taskPackResult(versionID, state.payload.ConversationID, state.run.ID, task, state.input.Execution), nil
+		return taskPackResult(versionID, state.payload.ConversationID, state.run.ID, task, state.input.Execution, state.input.P4Task), nil
 	}
 	deps.TeamRoomRead = func(ctx context.Context, scope tools.Scope, maxPosts int) (any, error) {
 		room := r.teamRoomContext(ctx, scope.VersionID, state.team)
@@ -1066,7 +1206,7 @@ func (r *Runner) toolDepsForRun(state *runState) tools.Deps {
 	return deps
 }
 
-func (r *Runner) taskContext(state *runState) TaskContext {
+func (r *Runner) taskContext(ctx context.Context, state *runState) TaskContext {
 	scope := []string{
 		"version_id=" + idText(state.item.VersionID),
 		"work_item_id=" + idText(state.item.ID),
@@ -1206,6 +1346,12 @@ func (r *Runner) taskContext(state *runState) TaskContext {
 			Scope:              scope,
 		}
 	default:
+		// P4 domains register their task-context providers from init hooks. When
+		// one claims the type, its JSON-ready payload is rendered by
+		// context.task_pack; the P3 switch above owns the P1/P2/P3 descriptions.
+		if details, ok := p4TaskDetails(ctx, state.item); ok {
+			state.input.P4Task = details
+		}
 		return TaskContext{Type: state.item.Type, Scope: scope}
 	}
 }
@@ -1455,7 +1601,7 @@ func versionPackResult(pack VersionPack) map[string]any {
 	}
 }
 
-func taskPackResult(versionID, conversationID, runID int64, task TaskContext, execution *ExecutionTask) map[string]any {
+func taskPackResult(versionID, conversationID, runID int64, task TaskContext, execution *ExecutionTask, p4Task any) map[string]any {
 	result := map[string]any{
 		"version_id":          idText(versionID),
 		"conversation_id":     idText(conversationID),
@@ -1468,6 +1614,9 @@ func taskPackResult(versionID, conversationID, runID int64, task TaskContext, ex
 	}
 	if execution != nil {
 		result["execution"] = executionTaskResult(*execution)
+	}
+	if p4Task != nil {
+		result["p4_task"] = p4Task
 	}
 	return result
 }
@@ -1624,8 +1773,9 @@ func artifactRefs(state *runState) []ArtifactRef {
 }
 
 // teamForProfile selects the collaboration channel: design profiles use the
-// design team room, P3 execution profiles use the execution team room, every P1
-// profile keeps the clarification team room.
+// design team room, P3 execution profiles use the execution team room, P4
+// delivery profiles use the delivery room, the P4 steward uses the steward
+// room, and every P1 profile keeps the clarification team room.
 func teamForProfile(profileKey string) agent.Team {
 	switch profileKey {
 	case ProfileKeyDesignHost, ProfileKeyDesignPlanner, ProfileKeyCaseAuthor,
@@ -1633,6 +1783,10 @@ func teamForProfile(profileKey string) agent.Team {
 		return agent.TeamDesign
 	case ProfileKeyCaseExecutor, ProfileKeyFailureAnalyst, ProfileKeyCoverageAnalyst:
 		return agent.TeamExecution
+	case ProfileKeyIssueTriager, ProfileKeyReportWriter:
+		return agent.TeamDelivery
+	case ProfileKeyVersionSteward:
+		return agent.TeamSteward
 	default:
 		return agent.TeamClarification
 	}

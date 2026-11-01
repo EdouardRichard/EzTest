@@ -41,6 +41,7 @@ func TestRequirementStatusTransitions(t *testing.T) {
 	}{
 		{version.RequirementDraft, version.RequirementClarified},
 		{version.RequirementClarified, version.RequirementDraft},
+		{version.RequirementClosed, version.RequirementDraft},
 	}
 	for _, tc := range allowed {
 		if !version.CanTransitionRequirement(tc.from, tc.to) {
@@ -54,10 +55,10 @@ func TestRequirementStatusTransitions(t *testing.T) {
 		{version.RequirementDraft, version.RequirementClosed},
 		{version.RequirementDraft, version.RequirementObsolete},
 		{version.RequirementClarified, version.RequirementClosed},
-		{version.RequirementClosed, version.RequirementDraft},
 		{version.RequirementObsolete, version.RequirementClarified},
 		{version.RequirementDraft, version.RequirementDraft},
 		{version.RequirementClarified, version.RequirementClarified},
+		{version.RequirementClosed, version.RequirementClarified},
 	}
 	for _, tc := range rejected {
 		if version.CanTransitionRequirement(tc.from, tc.to) {

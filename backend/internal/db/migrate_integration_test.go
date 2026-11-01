@@ -20,8 +20,8 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 20 {
-		t.Fatalf("applied %d migrations, want 20: %v", len(applied), applied)
+	if len(applied) != 24 {
+		t.Fatalf("applied %d migrations, want 24: %v", len(applied), applied)
 	}
 
 	again, err := db.Migrate(ctx, pool)
@@ -47,6 +47,9 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 		"execution_intent", "run_wave", "case_run", "case_run_sut_context",
 		"step_result", "assertion_result", "evidence", "evidence_ref",
 		"executor_instance", "human_request",
+		"delivery_issue", "delivery_issue_ref", "delivery_issue_status_history",
+		"delivery_report", "delivery_report_revision", "delivery_report_ref",
+		"delivery_analysis_run", "requirement_closure",
 	}
 	found := map[string]bool{}
 	rows, err := pool.Query(ctx, `
@@ -166,8 +169,8 @@ func TestP3ExecutionTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 20 {
-		t.Fatalf("applied %d migrations, want 20: %v", len(applied), applied)
+	if len(applied) != 24 {
+		t.Fatalf("applied %d migrations, want 24: %v", len(applied), applied)
 	}
 
 	tables := []string{
@@ -296,6 +299,286 @@ func TestP3ExecutionTables(t *testing.T) {
 		if !foundIndexes[name] {
 			t.Errorf("missing P3 index %s", name)
 		}
+	}
+}
+
+func TestP4DeliverySchema(t *testing.T) {
+	pool := testutil.NewEmptyDB(t)
+	ctx := context.Background()
+
+	applied, err := db.Migrate(ctx, pool)
+	if err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	if len(applied) != 24 {
+		t.Fatalf("applied %d migrations, want 24: %v", len(applied), applied)
+	}
+	again, err := db.Migrate(ctx, pool)
+	if err != nil {
+		t.Fatalf("second Migrate: %v", err)
+	}
+	if len(again) != 0 {
+		t.Fatalf("second Migrate applied %v", again)
+	}
+
+	tables := []string{
+		"delivery_issue", "delivery_issue_ref", "delivery_issue_status_history",
+		"delivery_report", "delivery_report_revision", "delivery_report_ref",
+		"delivery_analysis_run", "requirement_closure",
+	}
+	for _, name := range tables {
+		var exists bool
+		if err := pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, name).Scan(&exists); err != nil {
+			t.Fatalf("to_regclass(%s): %v", name, err)
+		}
+		if !exists {
+			t.Errorf("missing P4 table %s", name)
+		}
+	}
+
+	// D34: every P4 table carries both audit columns.
+	for _, name := range tables {
+		var count int
+		if err := pool.QueryRow(ctx, `
+			SELECT count(*) FROM information_schema.columns
+			WHERE table_schema = current_schema() AND table_name = $1
+			  AND column_name IN ('created_at', 'updated_at')
+			  AND data_type = 'timestamp with time zone'
+			  AND is_nullable = 'NO'
+			  AND column_default LIKE 'now()'
+		`, name).Scan(&count); err != nil {
+			t.Fatalf("audit columns for %s: %v", name, err)
+		}
+		if count != 2 {
+			t.Errorf("%s audit columns = %d, want created_at/updated_at", name, count)
+		}
+	}
+
+	constraints := []string{
+		"pk_delivery_issue", "pk_delivery_issue_ref", "pk_delivery_issue_status_history",
+		"pk_delivery_report", "pk_delivery_report_revision", "pk_delivery_report_ref",
+		"pk_delivery_analysis_run", "pk_requirement_closure",
+		"uk_delivery_issue_version_id_dedupe_key",
+		"uk_delivery_issue_ref_issue_id_kind_ref_id_role",
+		"uk_delivery_report_revision_report_id_revision",
+		"uk_delivery_report_ref_report_revision_id_kind_ref_id",
+		"uk_requirement_closure_requirement_id_close_round",
+	}
+	rows, err := pool.Query(ctx, `
+		SELECT c.conname
+		FROM pg_constraint c
+		JOIN pg_class t ON t.oid = c.conrelid
+		JOIN pg_namespace n ON n.oid = t.relnamespace
+		WHERE n.nspname = current_schema() AND c.conname = ANY($1)
+	`, constraints)
+	if err != nil {
+		t.Fatalf("query P4 constraints: %v", err)
+	}
+	foundConstraints := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan constraint: %v", err)
+		}
+		foundConstraints[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate constraints: %v", err)
+	}
+	for _, name := range constraints {
+		if !foundConstraints[name] {
+			t.Errorf("missing P4 constraint %s", name)
+		}
+	}
+
+	indexes := []string{
+		"idx_delivery_issue_version_id_status_id", "idx_delivery_issue_merged_into_id",
+		"idx_delivery_issue_created_at", "idx_delivery_issue_ref_kind_ref_id",
+		"idx_delivery_issue_ref_issue_id_id", "idx_delivery_issue_status_history_issue_id_id",
+		"idx_delivery_report_version_id_kind_id", "idx_delivery_report_current_revision_id",
+		"idx_delivery_report_revision_report_id_revision", "idx_delivery_report_revision_html_ref_id",
+		"idx_delivery_report_ref_kind_ref_id", "idx_delivery_report_ref_report_id_id",
+		"idx_delivery_analysis_run_version_id_kind_id",
+		"idx_requirement_closure_requirement_id_id", "idx_requirement_closure_requirement_version_id",
+	}
+	// Partial unique indexes are indexes, not constraints.
+	partialUnique := []string{
+		"uk_delivery_report_version_id_wave_id", "uk_delivery_report_version_id_kind",
+		"uk_delivery_analysis_run_version_id_kind_dedupe_key",
+		"uk_delivery_analysis_run_agent_run_id",
+	}
+	rows, err = pool.Query(ctx, `
+		SELECT indexname, indexdef FROM pg_indexes
+		WHERE schemaname = current_schema() AND indexname = ANY($1)
+	`, append(append([]string{}, indexes...), partialUnique...))
+	if err != nil {
+		t.Fatalf("query P4 indexes: %v", err)
+	}
+	defs := map[string]string{}
+	for rows.Next() {
+		var name, definition string
+		if err := rows.Scan(&name, &definition); err != nil {
+			t.Fatalf("scan index: %v", err)
+		}
+		defs[name] = definition
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate indexes: %v", err)
+	}
+	for _, name := range indexes {
+		if _, ok := defs[name]; !ok {
+			t.Errorf("missing P4 index %s", name)
+		}
+	}
+	for _, name := range partialUnique {
+		definition, ok := defs[name]
+		if !ok {
+			t.Errorf("missing P4 partial unique index %s", name)
+			continue
+		}
+		if !strings.Contains(definition, "UNIQUE INDEX") {
+			t.Errorf("%s is not a unique index: %s", name, definition)
+		}
+		if !strings.Contains(definition, "WHERE") {
+			t.Errorf("%s is not partial: %s", name, definition)
+		}
+	}
+
+	// Cross-context references are logical BIGINT only: the only foreign keys on
+	// P4 tables stay inside delivery or point at requirement/requirement_version.
+	allowedTargets := map[string]bool{
+		"delivery_issue": true, "delivery_issue_ref": true,
+		"delivery_issue_status_history": true, "delivery_report": true,
+		"delivery_report_revision": true, "delivery_report_ref": true,
+		"delivery_analysis_run": true, "requirement_closure": true,
+		"requirement": true, "requirement_version": true,
+	}
+	rows, err = pool.Query(ctx, `
+		SELECT c.conname, t.relname, rt.relname
+		FROM pg_constraint c
+		JOIN pg_class t ON t.oid = c.conrelid
+		JOIN pg_namespace n ON n.oid = t.relnamespace
+		JOIN pg_class rt ON rt.oid = c.confrelid
+		WHERE n.nspname = current_schema()
+		  AND c.contype = 'f'
+		  AND t.relname::text = ANY($1)
+		ORDER BY c.conname
+	`, tables)
+	if err != nil {
+		t.Fatalf("query P4 foreign keys: %v", err)
+	}
+	foreignKeys := 0
+	for rows.Next() {
+		var name, source, target string
+		if err := rows.Scan(&name, &source, &target); err != nil {
+			t.Fatalf("scan foreign key: %v", err)
+		}
+		foreignKeys++
+		if !allowedTargets[target] {
+			t.Errorf("foreign key %s on %s targets cross-context table %s", name, source, target)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate foreign keys: %v", err)
+	}
+	if foreignKeys != 8 {
+		t.Errorf("P4 foreign keys = %d, want 8", foreignKeys)
+	}
+
+	// Same-context cascades: refs/history follow their issue, revisions and refs
+	// follow their report, closure follows its requirement version.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO delivery_issue (id, version_id, title, category, severity, dedupe_key)
+		VALUES (1, 1, 'issue', 'ui', 'major', repeat('a', 32))
+	`); err != nil {
+		t.Fatalf("insert delivery issue: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO delivery_issue_ref (id, issue_id, kind, ref_id)
+		VALUES (2, 1, 'case_run', 9)
+	`); err != nil {
+		t.Fatalf("insert delivery issue ref: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO delivery_issue_status_history (id, issue_id, to_status, actor_kind)
+		VALUES (3, 1, 'open', 'system')
+	`); err != nil {
+		t.Fatalf("insert delivery issue status history: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM delivery_issue WHERE id = 1`); err != nil {
+		t.Fatalf("delete delivery issue: %v", err)
+	}
+	for _, name := range []string{"delivery_issue_ref", "delivery_issue_status_history"} {
+		var count int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM `+name).Scan(&count); err != nil {
+			t.Fatalf("count %s: %v", name, err)
+		}
+		if count != 0 {
+			t.Errorf("%s rows after issue delete = %d, want 0", name, count)
+		}
+	}
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO delivery_report (id, version_id, kind) VALUES (10, 1, 'version')
+	`); err != nil {
+		t.Fatalf("insert delivery report: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO delivery_report_revision (id, report_id, revision, input_fingerprint, as_of)
+		VALUES (11, 10, 1, repeat('b', 64), now())
+	`); err != nil {
+		t.Fatalf("insert delivery report revision: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO delivery_report_ref (id, report_id, report_revision_id, kind, ref_id)
+		VALUES (12, 10, 11, 'issue', 5)
+	`); err != nil {
+		t.Fatalf("insert delivery report ref: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM delivery_report WHERE id = 10`); err != nil {
+		t.Fatalf("delete delivery report: %v", err)
+	}
+	for _, name := range []string{"delivery_report_revision", "delivery_report_ref"} {
+		var count int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM `+name).Scan(&count); err != nil {
+			t.Fatalf("count %s: %v", name, err)
+		}
+		if count != 0 {
+			t.Errorf("%s rows after report delete = %d, want 0", name, count)
+		}
+	}
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO version (id, title, created_by) VALUES (20, 'v', 1)
+	`); err != nil {
+		t.Fatalf("insert version: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO requirement (id, version_id, status) VALUES (21, 20, 'draft')
+	`); err != nil {
+		t.Fatalf("insert requirement: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO requirement_version (id, requirement_id, revision, title, content_hash)
+		VALUES (22, 21, 1, 'r', repeat('c', 64))
+	`); err != nil {
+		t.Fatalf("insert requirement version: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO requirement_closure (id, requirement_id, requirement_version_id, close_round, check_result)
+		VALUES (23, 21, 22, 1, '{}'::jsonb)
+	`); err != nil {
+		t.Fatalf("insert requirement closure: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM requirement_version WHERE id = 22`); err != nil {
+		t.Fatalf("delete requirement version: %v", err)
+	}
+	var closureRows int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM requirement_closure`).Scan(&closureRows); err != nil {
+		t.Fatalf("count requirement closure: %v", err)
+	}
+	if closureRows != 0 {
+		t.Errorf("requirement_closure rows after requirement version delete = %d, want 0", closureRows)
 	}
 }
 

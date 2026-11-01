@@ -44,6 +44,10 @@ func Definitions(executorURL string) []settings.Definition {
 	minOffline, maxOffline := numberRange(5, 300)
 	minContextTTL, maxContextTTL := numberRange(30, 3600)
 	minHumanTimeout, maxHumanTimeout := numberRange(60, 86400)
+	minChainNodes, maxChainNodes := numberRange(1, 1000)
+	minChainEdges, maxChainEdges := numberRange(1, 2000)
+	minChainRequirements, maxChainRequirements := numberRange(1, 500)
+	minChainReplay, maxChainReplay := numberRange(1, 2000)
 
 	return []settings.Definition{
 		{Key: "runtime.snowflake_node_id", Category: "runtime", Type: settings.TypeNumber, Default: num(1), Integer: true, Min: minNode, Max: maxNode, RestartRequired: true, Description: "Snowflake node ID (0-1023); unique per API instance."},
@@ -95,6 +99,11 @@ func Definitions(executorURL string) []settings.Definition {
 		{Key: "report.section_issues", Category: "report", Type: settings.TypeBool, Default: boolean(true), Description: "Include the issues section in reports."},
 		{Key: "report.section_coverage", Category: "report", Type: settings.TypeBool, Default: boolean(true), Description: "Include the coverage section in reports."},
 		{Key: "report.section_evidence", Category: "report", Type: settings.TypeBool, Default: boolean(true), Description: "Include the evidence section in reports."},
+
+		{Key: "chain.max_nodes", Category: "chain", Type: settings.TypeNumber, Default: num(300), Integer: true, Min: minChainNodes, Max: maxChainNodes, Description: "Maximum exploration-chain nodes before truncation."},
+		{Key: "chain.max_edges", Category: "chain", Type: settings.TypeNumber, Default: num(600), Integer: true, Min: minChainEdges, Max: maxChainEdges, Description: "Maximum exploration-chain edges before truncation."},
+		{Key: "chain.max_requirements", Category: "chain", Type: settings.TypeNumber, Default: num(100), Integer: true, Min: minChainRequirements, Max: maxChainRequirements, Description: "Maximum requirement roots included in one exploration chain."},
+		{Key: "chain.replay_event_limit", Category: "chain", Type: settings.TypeNumber, Default: num(500), Integer: true, Min: minChainReplay, Max: maxChainReplay, Description: "Maximum events read for event-range replay."},
 
 		{Key: "knowledge.injection_budget_tokens", Category: "knowledge", Type: settings.TypeNumber, Default: num(4000), Integer: true, Min: number(0, 0), Description: "Token budget for knowledge injected into a prompt."},
 		{Key: "knowledge.review_required", Category: "knowledge", Type: settings.TypeBool, Default: boolean(true), Description: "Require admin review before knowledge is approved."},

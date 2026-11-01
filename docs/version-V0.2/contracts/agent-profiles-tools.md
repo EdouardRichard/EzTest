@@ -97,7 +97,7 @@ system prompt 必须包含 `[profile:<key>]`，并声明：AI 只能提交 draft
 
 ## 4b. P4+ 预留工具（不注册）
 
-`requirement.goal_met`、`code.*`、`issue.*`、`report.*`、`knowledge.*`、`version.close_propose`、`budget.check`、`sut.page_propose`。P3 已启用的执行/等待/接管工具见 §6；其余 P4+ 工具写入本文件并实现服务端校验后启用。
+`code.*`、`knowledge.*`、`budget.check`、`sut.page_propose`。P3 已启用的执行/等待/接管工具见 §6；P4 已启用的 issue/report/version/requirement 工具见 §7。其余 P4+ 工具写入本文件并实现服务端校验后启用。
 
 ## 5. 错误返回（给模型）
 
@@ -206,3 +206,63 @@ system prompt 必须包含 `[profile:<key>]`，并声明：AI 只能提交 draft
 5. 人机请求：`open` 时 case_run/wave `paused(reason=waiting_human)`、work item `waiting_human`；resolve 一次性响应不落事件/日志/证据。
 6. 错误统一返回 `{"error":{"code":"invalid_argument|not_found|state_conflict|lease_lost|ai_unavailable|evidence_too_large|executor_unavailable","message":"...","details":{...}}}`；不含内部 SQL/密钥/路径。
 7. `context_overflow` 不是失败类（P1 压缩/重试）；`execution.wait` 不占执行器 action 时限（执行器不实现 sleep）。
+
+---
+
+## 7. P4 Profiles 与工具（`frozen: P4`，2026-11-01）
+
+> 来源：`docs/superpowers/specs/2026-11-01-eztest-v02-p4-delivery-chain-design.md` §4.4/§5.3/§7。
+> 实现：`backend/internal/agent/application`（P4 profile seed、任务上下文）、`backend/internal/delivery`（issue/report 工具与服务端校验）、`backend/internal/version`（closure/goal_met/close_propose 工具与服务端校验）。
+> P4 profile 由启动幂等 seed；不覆盖管理员编辑。
+
+### 7.1 Profiles（启动幂等 seed）
+
+| key | 名称 | budgets | 允许工具 |
+|---|---|---|---|
+| `issue_triager` | 问题分诊 | `{max_turns:6,soft_seconds:180,hard_seconds:300}` | `context.task_pack`、`context.team_room_read`、`issue.read`、`issue.propose` |
+| `report_writer` | 报告撰写 | `{max_turns:6,soft_seconds:180,hard_seconds:300}` | `context.task_pack`、`context.team_room_read`、`report.data_read`、`report.narrative_propose` |
+| `version_steward` | 版本管家 | `{max_turns:6,soft_seconds:180,hard_seconds:300}` | `context.task_pack`、`context.team_room_read`、`requirement.read`、`version.close_read`、`requirement.goal_met`、`version.close_propose` |
+
+- system prompt 必须包含 `[profile:<key>]`（fake LLM 识别；真实模型忽略标记）。
+- 提示词约束（写入 profile system prompt，代码常量）：只调用白名单工具；不得伪造统计/证据；不得尝试确认需求/用例、合并/重开问题、关闭版本（除 `version.close_propose`）；失败时按工具返回的缺失项说明，不循环重试无效调用；叙述只提交候选，统计数字以服务端确定性数据为准。
+
+### 7.2 作用域注入（强制）
+
+每次 run 由 runtime 注入；工具 JSON Schema **不含** `version_id`/`versionId`：
+
+```json
+{
+  "version_id": "1001",
+  "agent_run_id": "4001",
+  "work_item_id": "9101",
+  "issue_id": "9201",
+  "report_id": "9301",
+  "requirement_id": "3001",
+  "requirement_version_id": "3101",
+  "wave_id": "8001",
+  "version_sut_ids": ["5001"]
+}
+```
+
+- 工具参数只允许业务字段（`issue_id?`/`report_id?`/`requirement_id?` 等当前任务局部选择器）；`version_id` 与任务目标 ID 由 scope 注入。
+- 跨 scope 引用、不存在、已删除 → `not_found`/`invalid_argument`；跨版本/越权不泄露其他版本数据。
+- 写工具只能提交候选；服务端校验作用域、状态、引用、字段、去重；AI 不能确认/删除/关闭（`version.close_propose`/`requirement.goal_met` 只提交意图，服务端事务内重算）。
+- 工具结果统一 JSON；超 `agent.tool_result_max_bytes`（32768）落盘为 text content_object，返回 `{head,sha256,content_ref,truncated:true}`；所有调用写 `agent_message`；写操作审计带 `agent_run_id`。
+
+### 7.3 工具清单（8 个；scope 由 runtime 注入）
+
+| 工具 | 参数 | 语义/服务端校验 |
+|---|---|---|
+| `issue.read` | `{issue_id?}` | 读 issue/refs/关联 case_run/step/assertion/evidence 摘要；无 `issue_id` 时读当前任务 issue；跨版本/不存在 404 |
+| `issue.propose` | `{classification?, duplicate_of_issue_id?, merge_reason?(<=500), confidence?}` | 只写 `delivery_analysis_run.output` + 团队帖；**禁止改 issue 状态**；`duplicate_of_issue_id` 必须同版本、存在、非 merged、非自身；`classification` ∈ 允许分类（category + `duplicate/expected_failure/flaky` 建议值）；非法 400 `invalid_argument` |
+| `report.data_read` | `{}` | 读当前任务 wave/version 的确定性统计快照（不含证据字节/凭据/内部路径） |
+| `report.narrative_propose` | `{summary_markdown(1..4000), highlights?[]}` | 只提交叙述候选；服务端 HTML 转义后写入本次 revision；不改变统计数字 |
+| `requirement.read` | `{requirement_id?}` | 读需求版本/用例/执行/issue 摘要；跨版本 404 |
+| `version.close_read` | `{}` | 返回 close 谓词逐项快照与未满足原因（只读） |
+| `requirement.goal_met` | `{requirement_id?, note?}` | 服务端重算闭环校验（8 项 checks）；通过写 closure + `closed` + 事件；失败 409 `close_predicate_failed` 带失败项；不改其他需求 |
+| `version.close_propose` | `{reason(1..500)}` | 服务端事务内重算 close 谓词；通过则 `completed` + `closed_*` + 事件；失败 409 `close_predicate_failed` 带失败项；不自动降级 |
+
+- 工具注册：`delivery/application/tools.go`（issue/report 工具）、`version/application/tools.go`（goal_met/close_propose）；由 `cmd/eztest` 注册进 agent registry；单测校验工具名/schema/scope 注入。
+- profile 白名单：`issue_triager` 只注册 issue 工具；`report_writer` 只注册 report 工具；`version_steward` 只注册 requirement/version 工具；禁止互相越权。
+- 工具 schema 不包含 `version_id`/`versionId`；ID 参数为十进制字符串；不返回内部 SQL/路径/凭据。
+- 错误统一返回 `{"error":{"code":"invalid_argument|not_found|state_conflict|lease_lost|ai_unavailable","message":"...","details":{...}}}`；409 的 `details.failed` 列出未通过的 check 名与计数。

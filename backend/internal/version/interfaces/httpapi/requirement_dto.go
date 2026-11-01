@@ -18,15 +18,25 @@ type requirementTargetsDTO struct {
 }
 
 type requirementSummaryDTO struct {
-	ID               string                `json:"id"`
-	CurrentVersionID string                `json:"current_version_id"`
-	Revision         int                   `json:"revision"`
-	Title            string                `json:"title"`
-	Status           string                `json:"status"`
-	Priority         string                `json:"priority"`
-	Targets          requirementTargetsDTO `json:"targets"`
-	UpdatedAt        string                `json:"updated_at"`
-	ConfirmedAt      *string               `json:"confirmed_at"`
+	ID               string                 `json:"id"`
+	CurrentVersionID string                 `json:"current_version_id"`
+	Revision         int                    `json:"revision"`
+	Title            string                 `json:"title"`
+	Status           string                 `json:"status"`
+	Priority         string                 `json:"priority"`
+	Targets          requirementTargetsDTO  `json:"targets"`
+	UpdatedAt        string                 `json:"updated_at"`
+	ConfirmedAt      *string                `json:"confirmed_at"`
+	ClosedAt         *string                `json:"closed_at"`
+	Closure          *requirementClosureDTO `json:"closure"`
+}
+
+// requirementClosureDTO is the P4 latest-closure projection (ClosureSummary).
+type requirementClosureDTO struct {
+	ClosureID   string `json:"closure_id"`
+	CloseRound  int    `json:"close_round"`
+	ClosedAt    string `json:"closed_at"`
+	ReopenCount int    `json:"reopen_count"`
 }
 
 type requirementVersionDTO struct {
@@ -135,6 +145,12 @@ type rollbackRequirementRequest struct {
 	ProposalMessageID *string `json:"proposal_message_id"`
 }
 
+// reopenRequirementRequest is the P4 reopen payload; reason is required
+// (openapi RequirementReopenRequest, 1..2000).
+type reopenRequirementRequest struct {
+	Reason string `json:"reason"`
+}
+
 // draft converts the request body to the application command.
 func (r createRequirementRequest) draft() versionapp.RequirementDraft {
 	return versionapp.RequirementDraft{
@@ -207,6 +223,20 @@ func toRequirementSummaryDTO(view versionapp.RequirementView) requirementSummary
 		Targets:          toRequirementTargetsDTO(view.TargetVersionSUTs, view.TargetPages, view.TargetAPIs),
 		UpdatedAt:        formatTime(view.UpdatedAt),
 		ConfirmedAt:      formatOptionalTime(view.ConfirmedAt),
+		ClosedAt:         formatOptionalTime(view.ClosedAt),
+		Closure:          toRequirementClosureDTO(view.Closure),
+	}
+}
+
+func toRequirementClosureDTO(view *versionapp.RequirementClosureView) *requirementClosureDTO {
+	if view == nil {
+		return nil
+	}
+	return &requirementClosureDTO{
+		ClosureID:   strconv.FormatInt(view.ID, 10),
+		CloseRound:  view.CloseRound,
+		ClosedAt:    formatTime(view.ClosedAt),
+		ReopenCount: view.ReopenCount,
 	}
 }
 

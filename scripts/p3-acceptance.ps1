@@ -976,7 +976,7 @@ try {
     $script:token = [string]$relogin.Json.data.token
     $health = Invoke-Api -Method "GET" -Path "/api/health" -Token $null
     Assert-Status $health @(200) "GET /api/health"
-    Assert-Equal $health.Json.data.version "0.2.0-p3" "API version"
+    Assert-True ([string]$health.Json.data.version -match '^0\.2\.0-p[3-9]$') "API version is P3 or later (got $($health.Json.data.version))"
 
     Step "wait for the executor registry to poll the P3 executor as active"
     $executor = Wait-For -TimeoutSeconds 60 -Description "executor registered active at $($script:executorBase)" -Condition {
@@ -1565,7 +1565,7 @@ try {
     Pass-Scenario $s5
 
     # ---------------- S6: application failure ----------------------------
-    $s6 = Start-Scenario "S6 failure classification: failed(application), failure_candidate event, team post, no issue/report tables"
+    $s6 = Start-Scenario "S6 failure classification: failed(application), failure_candidate event, team post, P4 tables optional/complete"
 
     Step "assert case C failed with failure_class=application"
     $runC = Wait-For -TimeoutSeconds 60 -Description "case C terminal failed(application)" -Condition {
@@ -1604,9 +1604,9 @@ try {
         Add-SoftFailure ("execution team-room finding contract: " + $_.Exception.Message)
     }
 
-    Step "assert no P4 issue/report/analysis_run tables exist"
-    $forbiddenTables = Invoke-PsqlScalar -DatabaseName $testDatabase -SqlText "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND (table_name ~* '(^|_)(issue|report|analysis_run)($|_)');"
-    Assert-Equal $forbiddenTables "0" "P3 must not create issue/report/analysis_run tables"
+    Step "assert P4 tables, if present, are the complete P4 set (P3 execution must not require them)"
+    $forbiddenTables = Invoke-PsqlScalar -DatabaseName $testDatabase -SqlText "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND (table_name ~* '(^|_)(issue|report|analysis_run|closure)($|_)');"
+    Assert-True ([int]$forbiddenTables -eq 0 -or [int]$forbiddenTables -eq 8) "P4 tables must be absent (P3-only) or the complete 8-table P4 set (got $forbiddenTables)"
 
     Pass-Scenario $s6
 
@@ -1882,6 +1882,16 @@ try {
     $oldRunCID = Invoke-PsqlScalar -DatabaseName $testDatabase -SqlText ("SELECT id FROM case_run WHERE case_version_id = {0} ORDER BY id LIMIT 1;" -f $script:caseVersionIDs["C"])
     $oldRunCBefore = (Get-CaseRun -CaseRunID ([string]$oldRunCID.Trim())).case_run
     $oldEvidenceCount = (Get-Array (Get-CaseRun -CaseRunID ([string]$oldRunCBefore.id)).evidence).Count
+    # P4 branch: the real Version Steward may already have closed R3, which
+    # legitimately rejects a new intent. Reopen that requirement through the P4
+    # API so the P3 retest scenario stays meaningful; P3-only runs skip this.
+    $r3Status = (Invoke-PsqlScalar -DatabaseName $testDatabase -SqlText ("SELECT status FROM requirement WHERE id = {0};" -f $script:requirementIDs["R3"])).Trim()
+    if ($r3Status -eq "closed") {
+        Step "reopen R3 through the P4 API so the P3 retest scenario can create a new intent"
+        $reopenR3 = Invoke-Api -Method "POST" -Path ("/api/versions/{0}/requirements/{1}/reopen" -f $script:versionID, $script:requirementIDs["R3"]) -Token $script:token -Body @{ reason = "P3 regression: reopen requirement for retest scenario" }
+        Assert-Status $reopenR3 @(200) "POST requirement reopen before retest"
+        Assert-Equal $reopenR3.Json.data.status "draft" "reopened requirement status"
+    }
     $retestResponse = Invoke-Api -Method "POST" -Path "/api/versions/$script:versionID/execution/intents" -Token $script:token -Body @{
         case_version_id = $script:caseVersionIDs["C"]; purpose = "retest"
     }

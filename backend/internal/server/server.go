@@ -9,7 +9,9 @@ import (
 	agentapi "github.com/EdouardRichard/EzTest/backend/internal/agent/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/audit/interfaces/httpapi"
+	chainapi "github.com/EdouardRichard/EzTest/backend/internal/chain/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
+	deliveryapi "github.com/EdouardRichard/EzTest/backend/internal/delivery/interfaces/httpapi"
 	designapp "github.com/EdouardRichard/EzTest/backend/internal/design/application"
 	designapi "github.com/EdouardRichard/EzTest/backend/internal/design/interfaces/httpapi"
 	"github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
@@ -51,6 +53,13 @@ type Deps struct {
 	DesignExports *designapp.ExportService
 	DesignStarter versionapp.DesignStarter
 	Execution     *executionhttp.Handler
+	// P4 delivery/chain/steward surfaces. They are optional (nil keeps a
+	// P0-P3 deployment unchanged) and are always mounted behind the bearer
+	// authentication middleware.
+	Delivery     *deliveryapi.Handler
+	Chain        *chainapi.Handler
+	Closure      *versionapp.ClosureService
+	VersionClose *versionapp.VersionCloseService
 }
 
 // New assembles the HTTP middleware chain and every P0 route.
@@ -77,12 +86,20 @@ func New(deps Deps) http.Handler {
 	registerContentRoutes(mux, authenticated, storageapi.New(deps.Storage))
 	registerEventRoutes(mux, authenticated, eventingapi.New(deps.Events))
 	registerResourceRoutes(mux, authenticated, admin, resourceapi.New(deps.Resource))
-	registerVersionRoutes(mux, authenticated, versionapi.New(deps.Versions))
-	registerRequirementRoutes(mux, authenticated, versionapi.NewRequirementHandler(deps.Requirements))
+	versionHandler := versionapi.New(deps.Versions, versionapi.WithVersionReopener(deps.VersionClose))
+	requirementHandler := versionapi.NewRequirementHandler(deps.Requirements,
+		versionapi.WithRequirementReopener(deps.Closure),
+		versionapi.WithRequirementClosures(deps.Closure),
+	)
+	registerVersionRoutes(mux, authenticated, versionHandler)
+	registerRequirementRoutes(mux, authenticated, requirementHandler)
 	registerConversationRoutes(mux, authenticated, versionapi.NewConversationHandler(deps.Conversations, deps.DesignStarter))
 	registerTeamRoomRoutes(mux, authenticated, agentapi.NewTeamRoom(deps.TeamRoom, versionExistence{deps.Versions}))
 	registerDesignRoutes(mux, authenticated, designapi.New(deps.DesignGraph, deps.DesignExports))
 	registerExecutionRoutes(mux, authenticated, admin, deps.Execution)
+	registerVersionP4Routes(mux, authenticated, versionHandler, requirementHandler)
+	registerDeliveryRoutes(mux, authenticated, deps.Delivery)
+	registerChainRoutes(mux, authenticated, deps.Chain)
 
 	return RequestID(Recover(Logging(CORS(deps.Config)(mux))))
 }
@@ -253,4 +270,53 @@ func registerExecutionRoutes(mux *http.ServeMux, authenticated, admin func(http.
 		return
 	}
 	h.Register(mux, authenticated, admin)
+}
+
+// registerVersionP4Routes mounts the P4 version/requirement reopen endpoints.
+// They are always registered (an unwired service answers 500) so the contract
+// path is stable across deployments; the versions handler stays optional.
+func registerVersionP4Routes(
+	mux *http.ServeMux,
+	authenticated func(http.Handler) http.Handler,
+	versionHandler *versionapi.Handler,
+	requirementHandler *versionapi.RequirementHandler,
+) {
+	if versionHandler == nil && requirementHandler == nil {
+		return
+	}
+	if versionHandler != nil {
+		mux.Handle("POST /api/versions/{versionId}/reopen", authenticated(http.HandlerFunc(versionHandler.Reopen)))
+	}
+	if requirementHandler != nil {
+		mux.Handle("POST /api/versions/{versionId}/requirements/{requirementId}/reopen", authenticated(http.HandlerFunc(requirementHandler.Reopen)))
+	}
+}
+
+// registerDeliveryRoutes mounts the P4 delivery API (issues and reports,
+// including the verified report HTML download) behind the bearer middleware.
+func registerDeliveryRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *deliveryapi.Handler) {
+	if h == nil {
+		return
+	}
+	mux.Handle("GET /api/versions/{versionId}/issues", authenticated(http.HandlerFunc(h.ListIssues)))
+	mux.Handle("GET /api/versions/{versionId}/issues/{issueId}", authenticated(http.HandlerFunc(h.GetIssue)))
+	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/confirm", authenticated(http.HandlerFunc(h.ConfirmIssue)))
+	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/dismiss", authenticated(http.HandlerFunc(h.DismissIssue)))
+	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/reopen", authenticated(http.HandlerFunc(h.ReopenIssue)))
+	mux.Handle("POST /api/versions/{versionId}/issues/{issueId}/merge", authenticated(http.HandlerFunc(h.MergeIssue)))
+
+	mux.Handle("GET /api/versions/{versionId}/reports", authenticated(http.HandlerFunc(h.ListReports)))
+	mux.Handle("GET /api/versions/{versionId}/reports/{reportId}", authenticated(http.HandlerFunc(h.GetReport)))
+	mux.Handle("GET /api/versions/{versionId}/reports/{reportId}/revisions/{revision}", authenticated(http.HandlerFunc(h.GetReportRevision)))
+	mux.Handle("GET /api/versions/{versionId}/reports/{reportId}/revisions/{revision}/html", authenticated(http.HandlerFunc(h.DownloadReportHTML)))
+	mux.Handle("POST /api/versions/{versionId}/reports/{reportId}/regenerate", authenticated(http.HandlerFunc(h.RegenerateReport)))
+}
+
+// registerChainRoutes mounts the P4 read-only exploration-chain endpoint behind
+// the bearer middleware.
+func registerChainRoutes(mux *http.ServeMux, authenticated func(http.Handler) http.Handler, h *chainapi.Handler) {
+	if h == nil {
+		return
+	}
+	mux.Handle("GET /api/versions/{versionId}/exploration-chain", authenticated(http.HandlerFunc(h.Read)))
 }

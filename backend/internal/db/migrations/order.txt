@@ -20,3 +20,7 @@ storage_0002_export_artifact.sql
 execution_0001_intent_wave.sql
 execution_0002_result_evidence.sql
 execution_0003_executor_human.sql
+delivery_0001_issue_lifecycle.sql
+delivery_0002_report_revision.sql
+delivery_0003_analysis_run.sql
+version_0005_requirement_closure.sql

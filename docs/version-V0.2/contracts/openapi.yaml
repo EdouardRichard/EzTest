@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: EzTest 0.2 API 契约（P0 冻结 + P1 冻结 + P2 增量）
-  version: 0.2.0-p3
+  version: 0.2.0-p4
   description: |
     EzTest 0.2 P0（平台底座）对外 REST/SSE 契约，来源：
     `docs/superpowers/specs/2026-10-31-eztest-v02-p0-platform-foundation-design.md` §7/§8/§9。
@@ -106,7 +106,17 @@ info:
     P3 新增错误码 `evidence_too_large`（证据超 5 MiB，409/413 视体积）与 `executor_unavailable`
     （执行器不可达/未注册，503）；human request 任意登录用户可 resolve，executor 管理仅 admin。
     实时走既有 `GET /api/events` + `GET /api/stream?channel=version:{id}`，事件类型见 `contracts/events.md` §12。
-x-frozen: P3
+    ### P4 增量（frozen，2026-11-01）
+
+    来源：`docs/superpowers/specs/2026-11-01-eztest-v02-p4-delivery-chain-design.md` §4/§6/§7/§8/§14。
+    P0/P1/P2/P3 paths/schemas 语义不变；P4 新增 14 个 operation：版本内问题 6（列表/详情/确认/驳回/重开/合并）、
+    报告 5（列表/详情/revision/HTML 下载/重生成）、探索链路 1、版本重开 1、需求重开 1；新增 `Delivery`/`Chain` 两个 tag。
+    报告 HTML 下载返回 `text/html`，`ETag` 为内容 sha256，`Cache-Control: private, no-store`、
+    `X-Content-Type-Options: nosniff`，CSP 见响应头；HTML 字节以 P0 内容账本为权威，不暴露内部路径。
+    业务冲突统一 `state_conflict`，`details.reason` 使用稳定子码（`issue_not_open`/`issue_not_reopenable`/
+    `merge_target_invalid`/`merge_cycle`/`report_not_current`/`report_content_corrupt`/`close_predicate_failed`）。
+    Version/Requirement 视图仅新增可选字段（`closed_at`/`close_reason`/`closure`）；事件类型见 `contracts/events.md` §13。
+x-frozen: P4
 servers:
   - url: http://localhost:13333
     description: 本地开发默认 API（端口来自 EZTEST_API_PORT，默认 13333）
@@ -149,6 +159,10 @@ tags:
     description: 证据元数据与鉴权下载（P3，不可变）
   - name: HumanRequests
     description: 登录接管/人机请求（P3）
+  - name: Delivery
+    description: 版本内问题与报告（P4；报告 HTML 以内容账本为权威）
+  - name: Chain
+    description: 版本探索链路只读读模型（P4；预算/截断/两档回放）
 
 paths:
   /healthz:
@@ -3575,6 +3589,501 @@ paths:
         '500':
           $ref: '#/components/responses/Internal'
 
+  # -------------------------------------------------------------------------
+  # P4 delivery/chain increments (frozen, 2026-11-01)
+  # -------------------------------------------------------------------------
+  /api/versions/{versionId}/issues:
+    get:
+      tags: [Delivery]
+      operationId: listIssues
+      summary: 版本内问题列表（登录用户）
+      description: 默认按 id DESC；支持状态/类别/严重度/version_sut 过滤；列表沿用 `{data,next_cursor,has_more}`。
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/IssueStatusFilter'
+        - $ref: '#/components/parameters/IssueCategoryFilter'
+        - $ref: '#/components/parameters/IssueSeverityFilter'
+        - $ref: '#/components/parameters/IssueVersionSUTFilter'
+        - $ref: '#/components/parameters/Before'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 问题列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueListEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/issues/{issueId}:
+    get:
+      tags: [Delivery]
+      operationId: getIssue
+      summary: 问题详情（含 refs/history/triage 摘要）
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/IssueID'
+      responses:
+        '200':
+          description: 问题详情
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/IssueDetailView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/issues/{issueId}/confirm:
+    post:
+      tags: [Delivery]
+      operationId: confirmIssue
+      summary: 确认问题（open→confirmed）
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/IssueID'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueActionRequest'
+      responses:
+        '200':
+          description: 更新后的问题
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/IssueView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/issues/{issueId}/dismiss:
+    post:
+      tags: [Delivery]
+      operationId: dismissIssue
+      summary: 驳回问题（open→dismissed）
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/IssueID'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueActionRequest'
+      responses:
+        '200':
+          description: 更新后的问题
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/IssueView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/issues/{issueId}/reopen:
+    post:
+      tags: [Delivery]
+      operationId: reopenIssue
+      summary: 重开问题（confirmed/dismissed→open）
+      description: reason 必填（1..2000）；reopen_count++；写 history/事件/审计；否则 409 `issue_not_reopenable`。
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/IssueID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReopenIssueRequest'
+      responses:
+        '200':
+          description: 重开后的问题
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/IssueView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/issues/{issueId}/merge:
+    post:
+      tags: [Delivery]
+      operationId: mergeIssue
+      summary: 合并问题（源→目标，源置 merged）
+      description: 目标必须同版本、非 merged、非自身、非成环；失败 409 `merge_target_invalid`/`merge_cycle`。
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/IssueID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MergeIssueRequest'
+      responses:
+        '200':
+          description: 合并后的源问题
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/IssueView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/reports:
+    get:
+      tags: [Delivery]
+      operationId: listReports
+      summary: 版本内报告列表（登录用户）
+      description: 版本总结默认在前，wave 报告按 wave id DESC；支持 kind 过滤；列表沿用 `{data,next_cursor,has_more}`。
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/ReportKindFilter'
+        - $ref: '#/components/parameters/Before'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 报告列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportListEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/reports/{reportId}:
+    get:
+      tags: [Delivery]
+      operationId: getReport
+      summary: 报告详情（含 revisions/refs/current_revision）
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/ReportID'
+      responses:
+        '200':
+          description: 报告详情
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/ReportDetailView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/reports/{reportId}/revisions/{revision}:
+    get:
+      tags: [Delivery]
+      operationId: getReportRevision
+      summary: 单 revision 元数据
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/ReportID'
+        - $ref: '#/components/parameters/Revision'
+      responses:
+        '200':
+          description: revision 元数据
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/ReportRevisionView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/reports/{reportId}/revisions/{revision}/html:
+    get:
+      tags: [Delivery]
+      operationId: downloadReportHTML
+      summary: 鉴权下载报告 HTML（已发布 revision）
+      description: |
+        校验版本归属（report.version_id = path versionId）、revision 属于 report、`status='published' AND render_status='done'`；
+        按 `html_ref → content_ref.id` 加载并校验 `owner_kind='report_revision' AND owner_id=revision.id AND role='report_html'`，
+        读取 `content_object` 字节并校验 sha256/size；不暴露文件路径。
+        404：revision 不存在/未发布/内容缺失；409：内容 sha/size 校验失败（`state_conflict` + `report_content_corrupt`）。
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/ReportID'
+        - $ref: '#/components/parameters/Revision'
+      responses:
+        '200':
+          description: 报告 HTML 字节
+          headers:
+            ETag:
+              description: 内容 sha256（双引号包裹）
+              schema:
+                type: string
+            Cache-Control:
+              description: private, no-store
+              schema:
+                type: string
+            X-Content-Type-Options:
+              description: nosniff
+              schema:
+                type: string
+            Content-Security-Policy:
+              description: "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; form-action 'none'"
+              schema:
+                type: string
+          content:
+            text/html:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/reports/{reportId}/regenerate:
+    post:
+      tags: [Delivery]
+      operationId: regenerateReport
+      summary: 重生成报告（append-only 新 revision）
+      description: |
+        计算 `revision = max+1` 并 ensure `report.wave`/`report.version` 任务；同一 next revision 的活跃任务存在时幂等返回 202；
+        仅 report 不存在/状态不允许时 409 `state_conflict`；旧 revision 不删除、仍可读。
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/ReportID'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegenerateReportRequest'
+      responses:
+        '202':
+          description: 已 ensure 新 revision 生成任务（幂等）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/RegenerateReportResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/exploration-chain:
+    get:
+      tags: [Chain]
+      operationId: getExplorationChain
+      summary: 版本探索链路（只读单对象 + 预算截断）
+      description: |
+        请求级聚合 version/design/execution/delivery/resource 的 application 端口，不写表、不直读他域表。
+        支持 SUT/页面/波次/状态/结果过滤、`focus_node` 深链保真、`event_from`/`event_to` 历史回看（近似）；
+        空版本返回空 nodes/edges + counts 0（不 404）；超预算 `truncated=true` 并给出 `truncation.reason`。
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/ChainSUTFilter'
+        - $ref: '#/components/parameters/ChainPageFilter'
+        - $ref: '#/components/parameters/ChainWaveFilter'
+        - $ref: '#/components/parameters/ChainStatusFilter'
+        - $ref: '#/components/parameters/ChainResultFilter'
+        - $ref: '#/components/parameters/ChainEventFrom'
+        - $ref: '#/components/parameters/ChainEventTo'
+        - $ref: '#/components/parameters/ChainFocusNode'
+        - $ref: '#/components/parameters/ChainLimit'
+      responses:
+        '200':
+          description: 链路视图
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/ChainView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/reopen:
+    post:
+      tags: [Versions]
+      operationId: reopenVersion
+      summary: 人工重开版本（completed→running）
+      description: 仅 `completed→running`；清 `closed_at/close_reason/close_run_id`；版本报告置 stale；发 `version.reopened`（trigger=manual）与审计；否则 409。
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VersionReopenRequest'
+      responses:
+        '200':
+          description: 重开后的版本
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Version'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
+  /api/versions/{versionId}/requirements/{requirementId}/reopen:
+    post:
+      tags: [Requirements]
+      operationId: reopenRequirement
+      summary: 重开需求（closed→draft）
+      description: |
+        仅 `closed→draft`；最新 `requirement_closure.reopen_count++`；发 `requirement.reopened`；
+        触发版本从 completed 回到 running；否则 409。
+      parameters:
+        - $ref: '#/components/parameters/VersionID'
+        - $ref: '#/components/parameters/RequirementID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RequirementReopenRequest'
+      responses:
+        '200':
+          description: 重开后的需求
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    $ref: '#/components/schemas/RequirementSummary'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/Internal'
+
 components:
   securitySchemes:
     bearerAuth:
@@ -3830,6 +4339,160 @@ components:
       schema:
         type: string
         enum: [open, resolved, cancelled, expired]
+    VersionID:
+      name: versionId
+      in: path
+      required: true
+      description: 版本雪花 ID 的十进制字符串
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    IssueID:
+      name: issueId
+      in: path
+      required: true
+      description: 问题（issue）雪花 ID 的十进制字符串
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    ReportID:
+      name: reportId
+      in: path
+      required: true
+      description: 报告（report）雪花 ID 的十进制字符串
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    Revision:
+      name: revision
+      in: path
+      required: true
+      description: 报告 revision（从 1 开始递增）
+      schema:
+        type: integer
+        minimum: 1
+    RequirementID:
+      name: requirementId
+      in: path
+      required: true
+      description: 需求（requirement）雪花 ID 的十进制字符串
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    IssueStatusFilter:
+      name: status
+      in: query
+      required: false
+      description: 问题状态过滤
+      schema:
+        type: string
+        enum: [open, confirmed, dismissed, merged]
+    IssueCategoryFilter:
+      name: category
+      in: query
+      required: false
+      description: 问题类别过滤
+      schema:
+        type: string
+        enum: [ui, api, db]
+    IssueSeverityFilter:
+      name: severity
+      in: query
+      required: false
+      description: 问题严重度过滤
+      schema:
+        type: string
+        enum: [major, minor, trivial]
+    IssueVersionSUTFilter:
+      name: version_sut_id
+      in: query
+      required: false
+      description: 按 version_sut 过滤问题（十进制字符串）
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    ReportKindFilter:
+      name: kind
+      in: query
+      required: false
+      description: 报告类型过滤
+      schema:
+        type: string
+        enum: [wave, version]
+    ChainSUTFilter:
+      name: sut_id
+      in: query
+      required: false
+      description: 链路 SUT 过滤（= version_sut_id，十进制字符串）
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    ChainPageFilter:
+      name: page_id
+      in: query
+      required: false
+      description: 链路页面过滤（十进制字符串）
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    ChainWaveFilter:
+      name: wave_id
+      in: query
+      required: false
+      description: 链路波次过滤（十进制字符串）
+      schema:
+        type: string
+        pattern: '^[0-9]+$'
+    ChainStatusFilter:
+      name: status
+      in: query
+      required: false
+      description: 链路节点状态过滤（实现按节点 kind 解释）
+      schema:
+        type: string
+    ChainResultFilter:
+      name: result
+      in: query
+      required: false
+      description: 链路结果过滤（passed/failed/blocked/inconclusive/skipped 等）
+      schema:
+        type: string
+    ChainEventFrom:
+      name: event_from
+      in: query
+      required: false
+      description: 历史回看起始事件 seq（含边界；近似语义）
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+    ChainEventTo:
+      name: event_to
+      in: query
+      required: false
+      description: 历史回看结束事件 seq（含边界；近似语义）
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+    ChainFocusNode:
+      name: focus_node
+      in: query
+      required: false
+      description: 深链目标节点 id（`{kind}:{ref_id}`）；强制保留该节点及其祖先
+      schema:
+        type: string
+        pattern: '^[a-z_]+:[0-9]+$'
+    ChainLimit:
+      name: limit
+      in: query
+      required: false
+      description: 链路节点上限覆盖（受 chain.max_nodes 限制）
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 1000
+        default: 300
   responses:
     BadRequest:
       description: 请求参数/请求体校验失败（invalid_argument）
@@ -4517,6 +5180,15 @@ components:
           description: 已澄清且未进入 active design_scope 的需求数（P2 替换 P1 占位）
         case_counts:
           $ref: '#/components/schemas/CaseCounts'
+        closed_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: 版本收尾时间（P4 增量；completed 时非空，重开清空）
+        close_reason:
+          type: string
+          nullable: true
+          description: 版本收尾原因（P4 增量；重开清空）
         created_by:
           type: string
         created_at:
@@ -5393,6 +6065,16 @@ components:
           format: date-time
           nullable: true
           description: 当前 revision 的确认时间；未确认为 null
+        closed_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: 需求关闭时间（P4 增量；非 closed 时为 null）
+        closure:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/ClosureSummary'
+          description: 最新 requirement_closure 摘要（P4 增量；详情均返回，列表可选）
     RequirementVersionView:
       type: object
       description: 不可变需求版本快照
@@ -6783,3 +7465,545 @@ components:
             note:
               type: string
               maxLength: 2000
+
+    # -------------------------------------------------------------------------
+    # P4 delivery/chain schemas (frozen, 2026-11-01)
+    # -------------------------------------------------------------------------
+    IssueRefView:
+      type: object
+      description: 问题关联引用（refs[] 元素）
+      required: [kind, ref_id, role]
+      properties:
+        kind:
+          type: string
+          enum: [case_run, case_version, wave, step_result, assertion_result, evidence, report, requirement]
+        ref_id:
+          type: string
+          pattern: '^[0-9]+$'
+        version_sut_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        role:
+          type: string
+          maxLength: 32
+    IssueTriageView:
+      type: object
+      description: 最新 triage analysis_run 的只读投影（无独立 API）
+      properties:
+        analysis_run_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        status:
+          type: string
+          enum: [queued, running, done, failed, degraded]
+          nullable: true
+        classification:
+          type: string
+          nullable: true
+        duplicate_of_issue_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        summary:
+          type: string
+    IssueHistoryView:
+      type: object
+      description: 问题状态历史（append-only）
+      required: [from_status, to_status, reason, actor_kind, created_at]
+      properties:
+        from_status:
+          type: string
+          enum: [open, confirmed, dismissed, merged]
+          nullable: true
+        to_status:
+          type: string
+          enum: [open, confirmed, dismissed, merged]
+        reason:
+          type: string
+          maxLength: 2000
+        actor_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        actor_kind:
+          type: string
+          enum: [user, agent, system]
+        created_at:
+          type: string
+          format: date-time
+    IssueView:
+      type: object
+      required: [id, version_id, title, summary, status, category, severity, source, expected_revision, reopen_count, refs, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        version_id:
+          type: string
+          pattern: '^[0-9]+$'
+        title:
+          type: string
+          maxLength: 500
+        summary:
+          type: string
+          maxLength: 4000
+        status:
+          type: string
+          enum: [open, confirmed, dismissed, merged]
+        category:
+          type: string
+          enum: [ui, api, db]
+        severity:
+          type: string
+          enum: [major, minor, trivial]
+        source:
+          type: string
+          enum: [failure_candidate]
+        expected_revision:
+          type: integer
+          minimum: 1
+          description: CAS 乐观锁；状态变更后 +1
+        merged_into_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        merged_at:
+          type: string
+          format: date-time
+          nullable: true
+        reopen_count:
+          type: integer
+          minimum: 0
+        refs:
+          type: array
+          items:
+            $ref: '#/components/schemas/IssueRefView'
+        triage:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/IssueTriageView'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    IssueDetailView:
+      description: 问题详情（IssueView + 历史 + 按 kind 分组的关联计数）
+      allOf:
+        - $ref: '#/components/schemas/IssueView'
+        - type: object
+          required: [history, related_refs]
+          properties:
+            history:
+              type: array
+              items:
+                $ref: '#/components/schemas/IssueHistoryView'
+            related_refs:
+              type: object
+              additionalProperties:
+                type: integer
+                minimum: 0
+    IssueListEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/ListEnvelope'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/IssueView'
+    IssueActionRequest:
+      type: object
+      description: 确认/驳回请求（reason 可选）
+      properties:
+        reason:
+          type: string
+          maxLength: 2000
+        expected_revision:
+          type: integer
+          minimum: 1
+    ReopenIssueRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 2000
+        expected_revision:
+          type: integer
+          minimum: 1
+    MergeIssueRequest:
+      type: object
+      required: [target_issue_id]
+      properties:
+        target_issue_id:
+          type: string
+          pattern: '^[0-9]+$'
+        reason:
+          type: string
+          maxLength: 2000
+        expected_revision:
+          type: integer
+          minimum: 1
+    ReportView:
+      type: object
+      required: [id, version_id, kind, status, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        version_id:
+          type: string
+          pattern: '^[0-9]+$'
+        wave_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        kind:
+          type: string
+          enum: [wave, version]
+        status:
+          type: string
+          enum: [draft, published, stale]
+        input_fingerprint:
+          type: string
+          pattern: '^([0-9a-f]{64})?$'
+          nullable: true
+          description: 发布后为 64 hex；draft/空报告可为空串或 null
+        current_revision:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/ReportRevisionView'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    ReportRevisionView:
+      type: object
+      required: [id, report_id, revision, status, as_of, input_fingerprint, template_version, render_status, html_available, pdf_available, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+        report_id:
+          type: string
+          pattern: '^[0-9]+$'
+        revision:
+          type: integer
+          minimum: 1
+        status:
+          type: string
+          enum: [draft, published, stale]
+        as_of:
+          type: string
+          format: date-time
+        input_fingerprint:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        template_version:
+          type: string
+          maxLength: 32
+        render_status:
+          type: string
+          enum: [pending, running, done, failed]
+        html_available:
+          type: boolean
+          description: revision published + render done + html_ref 非空
+        pdf_available:
+          type: boolean
+          enum: [false]
+          description: P4 恒为 false（PDF 属 P7）
+        created_at:
+          type: string
+          format: date-time
+    ReportRefView:
+      type: object
+      required: [kind, ref_id]
+      properties:
+        kind:
+          type: string
+          enum: [requirement, scenario, case_version, wave, case_run, issue, version_sut]
+        ref_id:
+          type: string
+          pattern: '^[0-9]+$'
+    ReportListEnvelope:
+      allOf:
+        - $ref: '#/components/schemas/ListEnvelope'
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/ReportView'
+    ReportDetailView:
+      description: 报告详情（ReportView + revisions/refs）
+      allOf:
+        - $ref: '#/components/schemas/ReportView'
+        - type: object
+          required: [revisions, refs]
+          properties:
+            revisions:
+              type: array
+              items:
+                $ref: '#/components/schemas/ReportRevisionView'
+            refs:
+              type: array
+              items:
+                $ref: '#/components/schemas/ReportRefView'
+    RegenerateReportRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+          maxLength: 2000
+    RegenerateReportResult:
+      type: object
+      required: [report_id, revision]
+      properties:
+        report_id:
+          type: string
+          pattern: '^[0-9]+$'
+        revision:
+          type: integer
+          minimum: 1
+        work_item_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+    ChainFilterView:
+      type: object
+      description: 链路请求过滤回显（未设置项为 null）
+      properties:
+        sut_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        page_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        wave_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        status:
+          type: string
+          nullable: true
+        result:
+          type: string
+          nullable: true
+        event_from:
+          type: integer
+          format: int64
+          nullable: true
+        event_to:
+          type: integer
+          format: int64
+          nullable: true
+    ChainCounts:
+      type: object
+      description: 过滤后的节点计数
+      properties:
+        requirements:
+          type: integer
+          minimum: 0
+        scenarios:
+          type: integer
+          minimum: 0
+        cases:
+          type: integer
+          minimum: 0
+        waves:
+          type: integer
+          minimum: 0
+        case_runs:
+          type: integer
+          minimum: 0
+        issues:
+          type: integer
+          minimum: 0
+        reports:
+          type: integer
+          minimum: 0
+        evidence:
+          type: integer
+          minimum: 0
+    ChainNodeView:
+      type: object
+      required: [id, kind, ref_id, label, created_at]
+      properties:
+        id:
+          type: string
+          pattern: '^[a-z_]+:[0-9]+$'
+          description: 稳定节点 id `{kind}:{ref_id}`
+        kind:
+          type: string
+          enum: [requirement, scenario, case_version, wave, case_run, issue, report, closure]
+        ref_id:
+          type: string
+          pattern: '^[0-9]+$'
+        label:
+          type: string
+        status:
+          type: string
+          nullable: true
+        version_sut_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        requirement_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        case_version_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        wave_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        case_run_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        issue_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        report_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        meta:
+          type: object
+          additionalProperties: true
+    ChainEdgeView:
+      type: object
+      required: [from, to, kind]
+      properties:
+        from:
+          type: string
+        to:
+          type: string
+        kind:
+          type: string
+          enum: [has_scenario, has_case, executed_by, contains, raised, reports, closed_by, included_in, merged_into]
+    ChainTruncationView:
+      type: object
+      description: 预算截断信息
+      required: [max_nodes, max_edges, max_requirements, reason]
+      properties:
+        max_nodes:
+          type: integer
+          minimum: 1
+        max_edges:
+          type: integer
+          minimum: 1
+        max_requirements:
+          type: integer
+          minimum: 1
+        reason:
+          type: string
+          enum: ['', node_budget, edge_budget, requirement_budget]
+    ChainReplayView:
+      type: object
+      description: 回放档位（P4 两档；不承诺任意时点 as-of）
+      required: [mode, wave_id, event_from, event_to, approximate]
+      properties:
+        mode:
+          type: string
+          enum: [live, wave, range]
+        wave_id:
+          type: string
+          pattern: '^[0-9]+$'
+          nullable: true
+        event_from:
+          type: integer
+          format: int64
+          nullable: true
+        event_to:
+          type: integer
+          format: int64
+          nullable: true
+        approximate:
+          type: boolean
+          description: 历史回看为近似（按实体 created_at 边界），不承诺 as-of 快照
+    ChainView:
+      type: object
+      required: [version_id, generated_at, snapshot_cursor, filters, counts, nodes, edges, truncated, truncation, replay]
+      properties:
+        version_id:
+          type: string
+          pattern: '^[0-9]+$'
+        generated_at:
+          type: string
+          format: date-time
+        snapshot_cursor:
+          type: integer
+          format: int64
+          minimum: 0
+        filters:
+          $ref: '#/components/schemas/ChainFilterView'
+        counts:
+          $ref: '#/components/schemas/ChainCounts'
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChainNodeView'
+        edges:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChainEdgeView'
+        truncated:
+          type: boolean
+        truncation:
+          $ref: '#/components/schemas/ChainTruncationView'
+        replay:
+          $ref: '#/components/schemas/ChainReplayView'
+    ClosureSummary:
+      type: object
+      description: 需求最新闭环快照（RequirementSummary.closure）
+      required: [closure_id, close_round, closed_at, reopen_count]
+      properties:
+        closure_id:
+          type: string
+          pattern: '^[0-9]+$'
+        close_round:
+          type: integer
+          minimum: 1
+        closed_at:
+          type: string
+          format: date-time
+        reopen_count:
+          type: integer
+          minimum: 0
+        checks:
+          type: object
+          additionalProperties: true
+          description: 校验摘要（不返回内部 SQL/凭据）
+    VersionReopenRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 2000
+    RequirementReopenRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 2000

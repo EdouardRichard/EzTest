@@ -169,7 +169,35 @@ execution_0003_executor_human.sql
 - `human_request` 属版本域对象，但迁移归 execution 上下文（P3-D-16）；P3 不建 `analysis_run`/`issue`/`report` 表。
 - 开发库/演示库照常启动前滚；回滚仍为恢复备份，不提供 down SQL。
 
-## 6. 回滚 / 备份 / 数据库边界
+## 6. P4 增量迁移（`frozen: P4`，2026-11-01）
+
+P0/P1/P2/P3 的 20 个迁移保持原样；P4 在 `order.txt` 末尾追加 4 个文件（第 21–24 个）：
+
+| 序号 | 迁移文件 | 上下文（ownership） | 创建的表 |
+|---|---|---|---|
+| 21 | `delivery_0001_issue_lifecycle.sql` | delivery | `delivery_issue`、`delivery_issue_ref`、`delivery_issue_status_history` |
+| 22 | `delivery_0002_report_revision.sql` | delivery | `delivery_report`、`delivery_report_revision`、`delivery_report_ref` |
+| 23 | `delivery_0003_analysis_run.sql` | delivery | `delivery_analysis_run` |
+| 24 | `version_0005_requirement_closure.sql` | version | `requirement_closure` |
+
+`order.txt` 末尾追加：
+
+```text
+delivery_0001_issue_lifecycle.sql
+delivery_0002_report_revision.sql
+delivery_0003_analysis_run.sql
+version_0005_requirement_closure.sql
+```
+
+- 4 个迁移只追加、不改历史文件；固定顺序 21→24。本契约冻结文件名、顺序与 ownership；迁移 SQL 与 `order.txt` 由 P4 迁移任务落盘。
+- `delivery_0002` 依赖 `delivery_0001`（`delivery_report_ref → delivery_report/delivery_report_revision`；`delivery_report_revision → delivery_report` 均为同上下文 FK），`delivery_0003` 独立，`version_0005` 依赖 P1 的 `requirement`/`requirement_version`（同上下文 FK）。
+- **partial unique 用唯一索引实现**（PostgreSQL 的 UNIQUE 约束不支持 `WHERE`）：`uk_delivery_report_version_id_wave_id`、`uk_delivery_report_version_id_kind`、`uk_delivery_analysis_run_version_id_kind_dedupe_key`、`uk_delivery_analysis_run_agent_run_id` 位于 `pg_indexes`；其余 `uk_*` 为表约束（`pg_constraint`）。
+- P4 不新增跨上下文 FK；`version_id`/`wave_id`/`ref_id`/`version_sut_id`/`merged_by`/`created_by_run_id`/`closed_by_run_id`/`content_ref` 均为逻辑引用。
+- 8 张新表全部 `delivery_*`（7 张）+ `requirement_closure`（version 家族）；P4 不建 chain 表（chain 为只读读模型，P4-D-15）。
+- 集成测试断言 24 个迁移、8 张 P4 表、`pk_/uk_/idx_` 名称与 partial unique 索引谓词；重复执行迁移为 no-op，checksum 不变。
+- 开发库/演示库照常启动前滚；回滚仍为恢复备份，不提供 down SQL。
+
+## 7. 回滚 / 备份 / 数据库边界
 
 - P0 **只支持前滚**：没有 down migration，也不提供自动回滚。
 - 部署/验收前必须备份目标库（`pg_dump` / 环境快照）；恢复方式是恢复备份，而不是执行 down SQL。
@@ -178,7 +206,7 @@ execution_0003_executor_human.sql
 - 多实例同时启动时，advisory lock 使只有一个实例执行迁移，其余等待后看到已完成状态并跳过。
 - 迁移失败时进程必须**拒绝启动 HTTP**（不得带着半迁移 schema 提供服务）。
 
-## 7. 冻结与变更控制
+## 8. 冻结与变更控制
 
 - 本文件在 P0 冻结；P1+ 只能**追加**文件与 `order.txt` 行，并在本文件新增说明。
 - 破坏性变更（改列、改约束、改语义）必须先停止、说明影响面、更新 contracts + 决策记录 + 调用方/测试，再实施。

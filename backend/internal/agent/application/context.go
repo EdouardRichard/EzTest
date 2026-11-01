@@ -92,6 +92,9 @@ type ContextInput struct {
 	// section because its steps/assertions/prior results are pinned facts that
 	// compaction must never drop.
 	Execution *ExecutionTask
+	// P4Task is the registered P4 domain task payload (JSON-ready) rendered by
+	// context.task_pack. Nil for P1/P2/P3 runs and for P4 types no domain claims.
+	P4Task any
 }
 
 // Section and ContextPacket are aliases so the builder and the runtime

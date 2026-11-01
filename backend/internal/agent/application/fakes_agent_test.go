@@ -487,6 +487,12 @@ func fakeWorkItem(workType string, payload agentapp.WorkItemPayload) agent.WorkI
 		"dispatch_epoch":         idStringOrZero(payload.DispatchEpoch),
 		"dispatch_token":         payload.DispatchToken,
 		"trigger":                payload.Trigger,
+		"issue_id":               idStringOrZero(payload.IssueID),
+		"report_id":              idStringOrZero(payload.ReportID),
+		"report_revision":        idStringOrZero(int64(payload.ReportRevision)),
+		"close_round":            idStringOrZero(int64(payload.CloseRound)),
+		"report_revision_id":     idStringOrZero(payload.ReportRevisionID),
+		"predicate_fingerprint":  payload.PredicateFingerprint,
 	})
 	leaseEpoch := int64(3)
 	claimedBy := "worker-1"
