@@ -9,12 +9,14 @@ import (
 )
 
 type stubDesignReader struct {
-	graph designapp.GraphView
-	rows  []designapp.CaseVersionHistoryView
-	err   error
+	graph      designapp.GraphView
+	rows       []designapp.CaseVersionHistoryView
+	err        error
+	graphReads int
 }
 
 func (s *stubDesignReader) ReadGraph(context.Context, int64) (designapp.GraphView, error) {
+	s.graphReads++
 	if s.err != nil {
 		return designapp.GraphView{}, s.err
 	}
