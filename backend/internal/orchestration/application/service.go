@@ -27,6 +27,7 @@ type Service struct {
 	clock    clock.Clock
 	settings SettingsReader
 	storage  StorageProbe
+	load     LoadTracker
 	audit    auditapp.Recorder
 	events   eventingapp.Publisher
 	logger   *slog.Logger
@@ -72,6 +73,14 @@ func (s *Service) SetLogger(logger *slog.Logger) {
 	if logger != nil {
 		s.logger = logger
 	}
+}
+
+// SetLoadTracker installs the process-local in-flight counters reported by the
+// heartbeat. Wiring calls it once before Start; a nil tracker reports zero.
+func (s *Service) SetLoadTracker(tracker LoadTracker) {
+	s.mu.Lock()
+	s.load = tracker
+	s.mu.Unlock()
 }
 
 // instanceIDRetries bounds the fresh-ID retries of one registration. Two
@@ -322,7 +331,12 @@ func (s *Service) Readiness(ctx context.Context) Readiness {
 	s.mu.RLock()
 	readiness.InstanceID = s.instance.ID
 	localDraining := s.draining
+	load := s.load
 	s.mu.RUnlock()
+	if load != nil {
+		readiness.InflightRequests = load.InflightRequests()
+		readiness.InflightWork = load.InflightWork()
+	}
 
 	if s.repo == nil {
 		return readiness
@@ -476,11 +490,17 @@ func (s *Service) heartbeatOnce(ctx context.Context) {
 	s.mu.RLock()
 	id := s.instance.ID
 	started := s.started
+	load := s.load
 	s.mu.RUnlock()
 	if !started || id == 0 {
 		return
 	}
-	status, updated, err := s.repo.Heartbeat(ctx, id, s.clock.Now().UTC())
+	activeRequests, activeWork := 0, 0
+	if load != nil {
+		activeRequests = load.InflightRequests()
+		activeWork = load.InflightWork()
+	}
+	status, updated, err := s.repo.Heartbeat(ctx, id, s.clock.Now().UTC(), activeRequests, activeWork)
 	if err != nil {
 		s.logger.Warn("orchestration heartbeat failed", "instance_id", id, "error", err)
 		return

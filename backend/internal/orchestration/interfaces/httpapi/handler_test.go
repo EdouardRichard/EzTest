@@ -61,19 +61,21 @@ func (f *fakeService) Readiness(context.Context) orchestrationapp.Readiness {
 func fixtureInstance(id int64, status orchestration.Status) orchestration.Instance {
 	drainingAt := testTime
 	return orchestration.Instance{
-		ID:          id,
-		InstanceKey: "host-a:42",
-		Hostname:    "host-a",
-		PID:         42,
-		APIPort:     8080,
-		NodeID:      3,
-		Status:      status,
-		Version:     "0.2.0",
-		StartedAt:   testTime,
-		HeartbeatAt: testTime,
-		DrainingAt:  &drainingAt,
-		CreatedAt:   testTime,
-		UpdatedAt:   testTime,
+		ID:             id,
+		InstanceKey:    "host-a:42",
+		Hostname:       "host-a",
+		PID:            42,
+		APIPort:        8080,
+		NodeID:         3,
+		Status:         status,
+		Version:        "0.2.0",
+		ActiveRequests: 5,
+		ActiveWork:     2,
+		StartedAt:      testTime,
+		HeartbeatAt:    testTime,
+		DrainingAt:     &drainingAt,
+		CreatedAt:      testTime,
+		UpdatedAt:      testTime,
 	}
 }
 
@@ -142,7 +144,8 @@ func TestListReturnsInstanceViews(t *testing.T) {
 	first := body.Data[0]
 	if first.ID != "1" || first.InstanceKey != "host-a:42" || first.NodeID != 3 ||
 		first.Status != "active" || first.PID != 42 || first.APIPort != 8080 ||
-		first.StartedAt == "" || first.HeartbeatAt == "" {
+		first.StartedAt == "" || first.HeartbeatAt == "" ||
+		first.ActiveRequests != 5 || first.ActiveWork != 2 {
 		t.Fatalf("first view = %+v", first)
 	}
 	if body.Data[1].Status != "draining" || body.Data[1].DrainingAt == nil {
@@ -240,6 +243,7 @@ func TestTransitionErrorsAreEnveloped(t *testing.T) {
 func TestReadyReturns200WhenAllConditionsPass(t *testing.T) {
 	service := &fakeService{readiness: orchestrationapp.Readiness{
 		Database: true, Storage: true, InstanceID: 42,
+		InflightRequests: 3, InflightWork: 1,
 	}}
 	handler := New(service)
 	recorder := httptest.NewRecorder()
@@ -249,7 +253,8 @@ func TestReadyReturns200WhenAllConditionsPass(t *testing.T) {
 	}
 	data := decodeData(t, recorder)
 	if data["status"] != "ok" || data["database"] != "ok" || data["storage"] != "ok" ||
-		data["draining"] != false || data["instance_id"] != "42" {
+		data["draining"] != false || data["instance_id"] != "42" ||
+		data["inflight_requests"] != float64(3) || data["inflight_work"] != float64(1) {
 		t.Fatalf("ready body = %#v", data)
 	}
 }

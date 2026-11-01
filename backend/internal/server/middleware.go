@@ -11,6 +11,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/httpx"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/load"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/requestid"
 )
 
@@ -70,6 +71,34 @@ func Logging(next http.Handler) http.Handler {
 		log.Printf("method=%s path=%s status=%d duration=%s request_id=%s",
 			r.Method, r.URL.Path, writer.status, time.Since(started).Round(time.Millisecond), requestid.From(r.Context()))
 	})
+}
+
+// TrackInflight counts API requests currently being served. Health probes and
+// the long-lived SSE stream are excluded: they do not represent work that a
+// rolling upgrade must wait for. A nil counter is a no-op.
+func TrackInflight(counter *load.Counter) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if counter == nil || skipInflight(r.URL.Path) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			counter.Inc()
+			defer counter.Dec()
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func skipInflight(path string) bool {
+	switch {
+	case path == "/healthz", path == "/api/health", path == "/api/health/ready":
+		return true
+	case path == "/api/stream" || strings.HasPrefix(path, "/api/stream/"):
+		return true
+	default:
+		return false
+	}
 }
 
 // CORS allows exactly the two origins derived from EZTEST_WEB_PORT.

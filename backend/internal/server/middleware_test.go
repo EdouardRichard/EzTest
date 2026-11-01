@@ -6,10 +6,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/config"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform/load"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/requestid"
 )
 
@@ -188,5 +190,53 @@ func TestRequireAdmin(t *testing.T) {
 	admin.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("admin status = %d", rec.Code)
+	}
+}
+
+func TestTrackInflightCountsConcurrentRequests(t *testing.T) {
+	var counter load.Counter
+	release := make(chan struct{})
+	started := make(chan struct{}, 8)
+	handler := TrackInflight(&counter)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		started <- struct{}{}
+		<-release
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/versions", nil))
+		}()
+	}
+	for i := 0; i < 4; i++ {
+		<-started
+	}
+	if got := counter.Value(); got != 4 {
+		t.Fatalf("inflight = %d, want 4", got)
+	}
+	close(release)
+	wg.Wait()
+	if got := counter.Value(); got != 0 {
+		t.Fatalf("inflight after completion = %d, want 0", got)
+	}
+}
+
+func TestTrackInflightSkipsHealthAndSSE(t *testing.T) {
+	var counter load.Counter
+	handler := TrackInflight(&counter)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	for _, path := range []string{"/healthz", "/api/health", "/api/health/ready", "/api/stream"} {
+		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, path, nil))
+		if got := counter.Value(); got != 0 {
+			t.Fatalf("%s counted as inflight=%d", path, got)
+		}
+	}
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/versions", nil))
+	if got := counter.Value(); got != 0 {
+		t.Fatalf("request not balanced: inflight=%d", got)
 	}
 }

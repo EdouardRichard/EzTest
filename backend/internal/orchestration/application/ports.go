@@ -72,10 +72,11 @@ type Repository interface {
 	Get(ctx context.Context, id int64) (orchestration.Instance, error)
 	// List returns every registered instance.
 	List(ctx context.Context) ([]orchestration.Instance, error)
-	// Heartbeat updates heartbeat_at when the instance is still active or
-	// draining. It reports the persisted status and whether the row matched, so
-	// the service can mirror an externally requested drain.
-	Heartbeat(ctx context.Context, id int64, at time.Time) (orchestration.Status, bool, error)
+	// Heartbeat updates heartbeat_at and the in-flight counters when the
+	// instance is still active or draining. It reports the persisted status and
+	// whether the row matched, so the service can mirror an externally
+	// requested drain.
+	Heartbeat(ctx context.Context, id int64, at time.Time, activeRequests, activeWork int) (orchestration.Status, bool, error)
 	// SetStatus applies an optimistic status transition (WHERE status = from)
 	// and returns the updated row plus whether the transition happened.
 	SetStatus(ctx context.Context, id int64, from, to orchestration.Status, at time.Time) (orchestration.Instance, bool, error)
@@ -105,12 +106,24 @@ type StorageProbe interface {
 }
 
 // Readiness is the GET /api/health/ready condition set: database reachable,
-// shared storage writable, and this instance not draining.
+// shared storage writable, and this instance not draining. InflightRequests and
+// InflightWork are observed counters (P8); they are reported but do not change
+// Ready().
 type Readiness struct {
-	Database   bool
-	Storage    bool
-	Draining   bool
-	InstanceID int64
+	Database         bool
+	Storage          bool
+	Draining         bool
+	InstanceID       int64
+	InflightRequests int
+	InflightWork     int
+}
+
+// LoadTracker supplies the process-local in-flight counters that the heartbeat
+// reports. A nil tracker reports zero. Implementations must be cheap and
+// concurrency-safe; they are read once per heartbeat.
+type LoadTracker interface {
+	InflightRequests() int
+	InflightWork() int
 }
 
 // Ready reports whether the instance may serve traffic.
