@@ -132,8 +132,8 @@ func newTestService(t *testing.T, repo *fakeRepo) (*Service, *fakeAudit, *fakePu
 
 func TestDefinitionsAreUniqueAndWellFormed(t *testing.T) {
 	defs := Definitions("http://127.0.0.1:13336")
-	if len(defs) != 69 {
-		t.Fatalf("catalog has %d keys, want 69 (P5: 53 -> 69)", len(defs))
+	if len(defs) != 72 {
+		t.Fatalf("catalog has %d keys, want 72 (P6: 69 -> 72)", len(defs))
 	}
 	seen := map[string]bool{}
 	for _, def := range defs {
@@ -307,6 +307,33 @@ func TestP5CodeintelVisualSettings(t *testing.T) {
 	}
 	if counts["visual"] != 7 {
 		t.Fatalf("visual settings = %d, want 7", counts["visual"])
+	}
+}
+
+// TestP6SearchTodosQualitySettings pins the three P6 keys (spec §4.5):
+// number, non-secret, hot-reloadable (no restart) and their defaults/ranges.
+func TestP6SearchTodosQualitySettings(t *testing.T) {
+	defs := Definitions("http://127.0.0.1:13336")
+	cases := []struct {
+		key      string
+		category string
+		def      string
+		integer  bool
+		min      *float64
+		max      *float64
+	}{
+		{"search.max_results_per_type", "search", "5", true, floatPtr(1), floatPtr(20)},
+		{"todos.max_items", "workspace", "50", true, floatPtr(1), floatPtr(200)},
+		{"quality.eval_baseline_regression", "quality", "0.05", false, floatPtr(0), floatPtr(1)},
+	}
+	for _, tc := range cases {
+		def := defs[indexOf(t, defs, tc.key)]
+		if def.Type != settings.TypeNumber || def.Category != tc.category || def.Secret || def.RestartRequired || def.Integer != tc.integer {
+			t.Fatalf("%s = %+v, want number/%s/non-secret/hot-reload/integer=%v", tc.key, def, tc.category, tc.integer)
+		}
+		if string(def.Default) != tc.def || !floatPtrEqual(def.Min, tc.min) || !floatPtrEqual(def.Max, tc.max) {
+			t.Fatalf("%s = default %s range %v..%v, want %s %v..%v", tc.key, def.Default, def.Min, def.Max, tc.def, tc.min, tc.max)
+		}
 	}
 }
 

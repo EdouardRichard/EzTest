@@ -20,8 +20,8 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 31 {
-		t.Fatalf("applied %d migrations, want 31: %v", len(applied), applied)
+	if len(applied) != 33 {
+		t.Fatalf("applied %d migrations, want 33: %v", len(applied), applied)
 	}
 
 	again, err := db.Migrate(ctx, pool)
@@ -53,6 +53,7 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 		"code_index_run", "code_entity", "code_edge", "code_fact", "code_analysis",
 		"code_impact_candidate", "code_anchor", "code_fact_review",
 		"visual_assertion", "visual_baseline", "visual_diff",
+		"eval_run", "eval_metric", "agent_profile_prompt_revision",
 	}
 	found := map[string]bool{}
 	rows, err := pool.Query(ctx, `
@@ -172,8 +173,8 @@ func TestP3ExecutionTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 31 {
-		t.Fatalf("applied %d migrations, want 31: %v", len(applied), applied)
+	if len(applied) != 33 {
+		t.Fatalf("applied %d migrations, want 33: %v", len(applied), applied)
 	}
 
 	tables := []string{
@@ -313,8 +314,8 @@ func TestP4DeliverySchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 31 {
-		t.Fatalf("applied %d migrations, want 31: %v", len(applied), applied)
+	if len(applied) != 33 {
+		t.Fatalf("applied %d migrations, want 33: %v", len(applied), applied)
 	}
 	again, err := db.Migrate(ctx, pool)
 	if err != nil {
@@ -582,6 +583,80 @@ func TestP4DeliverySchema(t *testing.T) {
 	}
 	if closureRows != 0 {
 		t.Errorf("requirement_closure rows after requirement version delete = %d, want 0", closureRows)
+	}
+}
+
+// TestP6QualityPromptSchema pins the two P6 migrations: eval tables (#32) and
+// append-only prompt revisions (#33).
+func TestP6QualityPromptSchema(t *testing.T) {
+	pool := testutil.NewEmptyDB(t)
+	ctx := context.Background()
+	if _, err := db.Migrate(ctx, pool); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	tables := []string{"eval_run", "eval_metric", "agent_profile_prompt_revision"}
+	for _, name := range tables {
+		var exists bool
+		if err := pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, name).Scan(&exists); err != nil {
+			t.Fatalf("to_regclass(%s): %v", name, err)
+		}
+		if !exists {
+			t.Errorf("missing P6 table %s", name)
+		}
+	}
+
+	constraints := []string{
+		"pk_eval_run", "pk_eval_metric", "fk_eval_metric_run",
+		"uk_agent_profile_prompt_revision",
+	}
+	rows, err := pool.Query(ctx, `SELECT conname FROM pg_constraint WHERE conname = ANY($1)`, constraints)
+	if err != nil {
+		t.Fatalf("query P6 constraints: %v", err)
+	}
+	foundConstraints := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan constraint: %v", err)
+		}
+		foundConstraints[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate constraints: %v", err)
+	}
+	for _, name := range constraints {
+		if !foundConstraints[name] {
+			t.Errorf("missing P6 constraint %s", name)
+		}
+	}
+
+	indexes := []string{
+		"idx_eval_run_created_at", "idx_eval_metric_run",
+		"idx_agent_profile_prompt_revision_key",
+	}
+	rows, err = pool.Query(ctx, `
+		SELECT indexname FROM pg_indexes
+		WHERE schemaname = current_schema() AND indexname = ANY($1)
+	`, indexes)
+	if err != nil {
+		t.Fatalf("query P6 indexes: %v", err)
+	}
+	foundIndexes := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan index: %v", err)
+		}
+		foundIndexes[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate indexes: %v", err)
+	}
+	for _, name := range indexes {
+		if !foundIndexes[name] {
+			t.Errorf("missing P6 index %s", name)
+		}
 	}
 }
 
