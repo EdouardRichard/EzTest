@@ -175,6 +175,24 @@ type EvidenceView struct {
 	CreatedAt    string  `json:"created_at"`
 }
 
+// evidenceKinds is the EvidenceView.kind API enum (spec §4.2): the eight P3
+// kinds plus the two P5 visual kinds. It is also the accepted ?kind= filter
+// set of GET /api/versions/{id}/evidence.
+func evidenceKinds() []string {
+	return []string{
+		string(execution.EvidenceScreenshot),
+		string(execution.EvidenceSnapshot),
+		string(execution.EvidenceConsole),
+		string(execution.EvidenceNetwork),
+		string(execution.EvidenceHTTP),
+		string(execution.EvidenceDB),
+		string(execution.EvidenceDownload),
+		string(execution.EvidenceText),
+		string(execution.EvidenceVisualActual),
+		string(execution.EvidenceVisualDiff),
+	}
+}
+
 // HumanRequestPayloadView is the frozen human_request payload projection.
 type HumanRequestPayloadView struct {
 	Reason        string  `json:"reason"`

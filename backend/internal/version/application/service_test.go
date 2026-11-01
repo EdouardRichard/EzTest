@@ -248,6 +248,19 @@ func (f *fakeRepo) Stats(_ context.Context, _ int64) (version.VersionStats, erro
 	return f.stats, nil
 }
 
+func (f *fakeRepo) SetCodeBaselineCommit(_ context.Context, versionSUTID int64, commitSHA string) error {
+	for versionID, bindings := range f.bindings {
+		for index := range bindings {
+			if bindings[index].ID == versionSUTID {
+				bindings[index].CodeBaselineCommit = commitSHA
+				f.bindings[versionID] = bindings
+				return nil
+			}
+		}
+	}
+	return version.ErrNotFound
+}
+
 func (f *fakeRepo) ListInitialVersionsWithContent(_ context.Context, limit int) ([]int64, error) {
 	f.lastInitialLimit = limit
 	return f.initialWithContent, nil
@@ -340,6 +353,26 @@ func (f *fakeRepo) RepositoryInUse(_ context.Context, id int64) (bool, error) {
 
 var _ version.Repository = (*fakeRepo)(nil)
 
+// ---------- fake code baseline resolver ----------
+
+const codeBaselineCommit = "0123456789abcdef0123456789abcdef01234567"
+
+type fakeCodeBaselineResolver struct {
+	commit string
+	err    error
+	calls  []resourceapp.CodeRepositoryView
+}
+
+func (f *fakeCodeBaselineResolver) ResolveHeadCommit(_ context.Context, repo resourceapp.CodeRepositoryView) (string, error) {
+	f.calls = append(f.calls, repo)
+	if f.err != nil {
+		return "", f.err
+	}
+	return f.commit, nil
+}
+
+var _ versionapp.CodeBaselineResolver = (*fakeCodeBaselineResolver)(nil)
+
 // ---------- fake audit / publisher ----------
 
 type fakeAudit struct{ events []auditapp.Event }
@@ -364,16 +397,23 @@ type testEnv struct {
 	catalog   *fakeCatalog
 	audit     *fakeAudit
 	publisher *fakePublisher
+	resolver  *fakeCodeBaselineResolver
 }
 
 func newTestEnv(t *testing.T) *testEnv {
+	t.Helper()
+	return newTestEnvWithResolver(t, &fakeCodeBaselineResolver{commit: codeBaselineCommit})
+}
+
+func newTestEnvWithResolver(t *testing.T, resolver versionapp.CodeBaselineResolver) *testEnv {
 	t.Helper()
 	repo := newFakeRepo()
 	catalog := newFakeCatalog()
 	audit := &fakeAudit{}
 	publisher := &fakePublisher{}
-	svc := versionapp.New(repo, catalog, &seqIDs{}, fixedClock{at: testTime}, audit, publisher)
-	return &testEnv{svc: svc, repo: repo, catalog: catalog, audit: audit, publisher: publisher}
+	svc := versionapp.New(repo, catalog, &seqIDs{}, fixedClock{at: testTime}, audit, publisher, resolver)
+	fake, _ := resolver.(*fakeCodeBaselineResolver)
+	return &testEnv{svc: svc, repo: repo, catalog: catalog, audit: audit, publisher: publisher, resolver: fake}
 }
 
 func requestContext() context.Context {
@@ -501,6 +541,9 @@ func TestCreatePersistsMultiSUTBindingsAndEmitsAuditAndEvents(t *testing.T) {
 	if first.Repository == nil || first.Repository.Name != "orders-repo" {
 		t.Fatalf("repository = %#v", first.Repository)
 	}
+	if first.CodeBaselineCommit != codeBaselineCommit {
+		t.Fatalf("code baseline commit = %q, want %q", first.CodeBaselineCommit, codeBaselineCommit)
+	}
 	if len(first.Pages) != 2 || first.Pages[0].ID != "1301" || first.Pages[1].ID != "1302" {
 		t.Fatalf("pages = %#v", first.Pages)
 	}
@@ -545,6 +588,12 @@ func TestCreatePersistsMultiSUTBindingsAndEmitsAuditAndEvents(t *testing.T) {
 	secondStored := findBinding(t, storedBindings, 1002)
 	if got := secondStored.Scope.APIs; len(got) != 1 || got[0] != 1402 {
 		t.Fatalf("second scope apis = %#v", got)
+	}
+	if stored := findBinding(t, storedBindings, 1001); stored.CodeBaselineCommit != codeBaselineCommit {
+		t.Fatalf("stored code baseline commit = %q, want %q", stored.CodeBaselineCommit, codeBaselineCommit)
+	}
+	if len(env.resolver.calls) != 1 || env.resolver.calls[0].ID != "1201" || env.resolver.calls[0].Branch != "main" {
+		t.Fatalf("resolver calls = %#v, want one call for repository 1201", env.resolver.calls)
 	}
 
 	if len(env.audit.events) != 1 {
@@ -661,6 +710,67 @@ func TestCreateValidatesBindings(t *testing.T) {
 				t.Fatalf("invalid input recorded side effects: %d/%d", len(env.audit.events), len(env.publisher.events))
 			}
 		})
+	}
+}
+
+func TestCreateLeavesCodeBaselineEmptyWhenResolutionFails(t *testing.T) {
+	cases := []struct {
+		name     string
+		resolver *fakeCodeBaselineResolver
+	}{
+		{"resolver error", &fakeCodeBaselineResolver{err: errors.New("git rev-parse failed")}},
+		{"malformed commit", &fakeCodeBaselineResolver{commit: "not-a-commit"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newTestEnvWithResolver(t, tc.resolver)
+			view, err := env.svc.Create(requestContext(), validCommand(), 42)
+			if err != nil {
+				t.Fatalf("Create must not be blocked by baseline resolution: %v", err)
+			}
+			if len(view.Bindings) != 1 || view.Bindings[0].CodeBaselineCommit != "" {
+				t.Fatalf("binding view = %#v, want an empty code baseline", view.Bindings)
+			}
+			stored := findBinding(t, env.repo.bindings[view.ID], 1001)
+			if stored.CodeBaselineCommit != "" {
+				t.Fatalf("stored commit = %q, want empty", stored.CodeBaselineCommit)
+			}
+
+			created := 0
+			warnings := 0
+			for _, entry := range env.audit.events {
+				switch entry.Action {
+				case "version.created":
+					created++
+				case "version.code_baseline_unresolved":
+					warnings++
+					if entry.TargetKind != "version" || entry.TargetID != idString(view.ID) {
+						t.Fatalf("warning audit target = %#v", entry)
+					}
+					if entry.Metadata["version_sut_id"] != idString(stored.ID) {
+						t.Fatalf("warning metadata = %#v", entry.Metadata)
+					}
+				}
+			}
+			if created != 1 || warnings != 1 {
+				t.Fatalf("audit actions = %#v, want one version.created and one warning", env.audit.events)
+			}
+			if len(env.publisher.events) != 2 {
+				t.Fatalf("version.created events = %d, want 2", len(env.publisher.events))
+			}
+		})
+	}
+}
+
+func TestCreateSkipsBaselineResolutionWithoutRepository(t *testing.T) {
+	env := newTestEnv(t)
+	cmd := validCommand()
+	cmd.Bindings[0].CodeRepositoryID = nil
+	if _, err := env.svc.Create(requestContext(), cmd, 42); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if len(env.resolver.calls) != 0 {
+		t.Fatalf("resolver calls = %#v, want none for a binding without repository", env.resolver.calls)
 	}
 }
 

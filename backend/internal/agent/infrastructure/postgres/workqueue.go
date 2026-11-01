@@ -88,7 +88,36 @@ func (r *WorkItemRepository) Claim(ctx context.Context, claimant string, lease t
 	if lease <= 0 {
 		lease = 30 * time.Second
 	}
+	return r.claim(ctx, claimant, nil, lease)
+}
 
+// ClaimForTeams leases the next available open item whose team is in teams.
+// An empty team set claims nothing; an unknown team is rejected before the
+// transaction starts.
+func (r *WorkItemRepository) ClaimForTeams(ctx context.Context, claimant string, teams []agent.Team, lease time.Duration) (agent.WorkItem, bool, error) {
+	claimant = strings.TrimSpace(claimant)
+	if claimant == "" {
+		return agent.WorkItem{}, false, platform.Invalid("claimant", "must not be empty")
+	}
+	if lease <= 0 {
+		lease = 30 * time.Second
+	}
+	names := make([]string, 0, len(teams))
+	for _, team := range teams {
+		if !team.Valid() {
+			return agent.WorkItem{}, false, platform.Invalid("teams", "must contain only clarification, design, execution, delivery, steward, code")
+		}
+		names = append(names, string(team))
+	}
+	if len(names) == 0 {
+		return agent.WorkItem{}, false, nil
+	}
+	return r.claim(ctx, claimant, names, lease)
+}
+
+// claim is the shared FOR UPDATE SKIP LOCKED lease path. A nil teams slice
+// claims from every team; a non-empty slice filters with team = ANY(...).
+func (r *WorkItemRepository) claim(ctx context.Context, claimant string, teams []string, lease time.Duration) (agent.WorkItem, bool, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return agent.WorkItem{}, false, fmt.Errorf("claim work item: begin: %w", err)
@@ -96,13 +125,24 @@ func (r *WorkItemRepository) Claim(ctx context.Context, claimant string, lease t
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	var id int64
-	err = tx.QueryRow(ctx, `
-		SELECT id FROM work_item
-		WHERE status = 'open' AND available_at <= now()
-		ORDER BY priority DESC, id ASC
-		FOR UPDATE SKIP LOCKED
-		LIMIT 1
-	`).Scan(&id)
+	if len(teams) == 0 {
+		err = tx.QueryRow(ctx, `
+			SELECT id FROM work_item
+			WHERE status = 'open' AND available_at <= now()
+			ORDER BY priority DESC, id ASC
+			FOR UPDATE SKIP LOCKED
+			LIMIT 1
+		`).Scan(&id)
+	} else {
+		err = tx.QueryRow(ctx, `
+			SELECT id FROM work_item
+			WHERE status = 'open' AND available_at <= now()
+			  AND team = ANY($1::text[])
+			ORDER BY priority DESC, id ASC
+			FOR UPDATE SKIP LOCKED
+			LIMIT 1
+		`, teams).Scan(&id)
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		if err := tx.Commit(ctx); err != nil {
 			return agent.WorkItem{}, false, fmt.Errorf("claim work item: commit empty: %w", err)

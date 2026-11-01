@@ -46,14 +46,15 @@ type requirementCountsDTO struct {
 }
 
 type bindingDTO struct {
-	ID          string             `json:"id"`
-	SUT         sutDTO             `json:"sut"`
-	Environment environmentDTO     `json:"environment"`
-	Repository  *codeRepositoryDTO `json:"repository"`
-	Pages       []pageDTO          `json:"pages"`
-	APIs        []apiDTO           `json:"apis"`
-	Databases   []databaseDTO      `json:"databases"`
-	Accounts    []accountDTO       `json:"accounts"`
+	ID                 string             `json:"id"`
+	CodeBaselineCommit *string            `json:"codeBaselineCommit,omitempty"`
+	SUT                sutDTO             `json:"sut"`
+	Environment        environmentDTO     `json:"environment"`
+	Repository         *codeRepositoryDTO `json:"repository"`
+	Pages              []pageDTO          `json:"pages"`
+	APIs               []apiDTO           `json:"apis"`
+	Databases          []databaseDTO      `json:"databases"`
+	Accounts           []accountDTO       `json:"accounts"`
 }
 
 type versionSummaryDTO struct {
@@ -216,14 +217,15 @@ func toBindingDTO(view versionapp.BindingView) bindingDTO {
 		repository = &converted
 	}
 	return bindingDTO{
-		ID:          strconv.FormatInt(view.ID, 10),
-		SUT:         toSUTDTO(view.SUT),
-		Environment: toEnvironmentDTO(view.Environment),
-		Repository:  repository,
-		Pages:       pages,
-		APIs:        apis,
-		Databases:   databases,
-		Accounts:    accounts,
+		ID:                 strconv.FormatInt(view.ID, 10),
+		CodeBaselineCommit: formatOptionalString(view.CodeBaselineCommit),
+		SUT:                toSUTDTO(view.SUT),
+		Environment:        toEnvironmentDTO(view.Environment),
+		Repository:         repository,
+		Pages:              pages,
+		APIs:               apis,
+		Databases:          databases,
+		Accounts:           accounts,
 	}
 }
 

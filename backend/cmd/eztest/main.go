@@ -514,7 +514,7 @@ func main() {
 	storageSvc := storageapp.New(storagepg.New(pool), storagepg.NewFileStore(), settingsSvc, ids, auditSvc, eventSvc)
 	resourceSvc := resourceapp.New(resourcepg.New(pool), ids, clk, nil, auditSvc, eventSvc)
 	versionRepo := versionpg.New(pool, ids)
-	versionSvc := versionapp.New(versionRepo, resourceSvc, ids, clk, auditSvc, eventSvc)
+	versionSvc := versionapp.New(versionRepo, resourceSvc, ids, clk, auditSvc, eventSvc, nil)
 	resourceSvc.SetUsageChecker(versionSvc)
 	designRepo := designpg.New(pool)
 	designStale := designapp.NewStaleService(designRepo, clk, auditSvc, eventSvc)

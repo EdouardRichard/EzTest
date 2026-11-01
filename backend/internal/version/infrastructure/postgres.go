@@ -78,10 +78,10 @@ func (r *Repository) Create(ctx context.Context, v version.Version, bindings []v
 			return err
 		}
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO version_sut (id, version_id, sut_id, environment_id, code_repo_id, scope)
-			VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+			INSERT INTO version_sut (id, version_id, sut_id, environment_id, code_repo_id, code_baseline_commit, scope)
+			VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
 		`, binding.ID, v.ID, binding.SUTID, binding.EnvironmentID,
-			binding.CodeRepositoryID, scope); err != nil {
+			binding.CodeRepositoryID, nullableCommit(binding.CodeBaselineCommit), scope); err != nil {
 			return wrapDB("insert version_sut", err)
 		}
 		for _, databaseID := range binding.DatabaseIDs {
@@ -116,7 +116,8 @@ func (r *Repository) Get(ctx context.Context, id int64) (version.Version, []vers
 	}
 
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, version_id, sut_id, environment_id, code_repo_id, scope
+		SELECT id, version_id, sut_id, environment_id, code_repo_id,
+			COALESCE(code_baseline_commit, ''), scope
 		FROM version_sut WHERE version_id = $1 ORDER BY id
 	`, id)
 	if err != nil {
@@ -130,7 +131,7 @@ func (r *Repository) Get(ctx context.Context, id int64) (version.Version, []vers
 		var binding version.Binding
 		var scopeRaw []byte
 		if err := rows.Scan(&binding.ID, &binding.VersionID, &binding.SUTID, &binding.EnvironmentID,
-			&binding.CodeRepositoryID, &scopeRaw); err != nil {
+			&binding.CodeRepositoryID, &binding.CodeBaselineCommit, &scopeRaw); err != nil {
 			return version.Version{}, nil, fmt.Errorf("scan version binding: %w", err)
 		}
 		if err := json.Unmarshal(scopeRaw, &binding.Scope); err != nil {
@@ -261,6 +262,23 @@ func (r *Repository) Reopen(ctx context.Context, id int64, updatedAt time.Time) 
 		return false, wrapDB("reopen version", err)
 	}
 	return tag.RowsAffected() > 0, nil
+}
+
+// SetCodeBaselineCommit writes the resolved commit SHA of one version_sut row
+// (P5 §5.5). An empty commit clears the column to NULL so the binding is
+// treated as unresolved again.
+func (r *Repository) SetCodeBaselineCommit(ctx context.Context, versionSUTID int64, commitSHA string) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE version_sut SET code_baseline_commit = NULLIF($2, ''), updated_at = now()
+		WHERE id = $1
+	`, versionSUTID, commitSHA)
+	if err != nil {
+		return wrapDB("set version code baseline commit", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return version.ErrNotFound
+	}
+	return nil
 }
 
 // Close completes one running version (P4 spec §7.3/§7.4). It first takes the
@@ -505,6 +523,15 @@ func encodeScope(scope version.Scope) (string, error) {
 		return "", fmt.Errorf("encode version scope: %w", err)
 	}
 	return string(raw), nil
+}
+
+// nullableCommit stores an unresolved baseline as SQL NULL so the column CHECK
+// only ever sees a full commit SHA.
+func nullableCommit(commit string) any {
+	if commit == "" {
+		return nil
+	}
+	return commit
 }
 
 var (

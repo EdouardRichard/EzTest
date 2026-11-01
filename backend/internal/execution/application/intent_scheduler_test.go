@@ -3,6 +3,7 @@ package executionapp
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
@@ -48,6 +49,41 @@ func TestEnvironmentFingerprintMatchesIntentBetweenScans(t *testing.T) {
 	}
 	if len(created.VersionSUTIDs) != 1 || created.VersionSUTIDs[0] != 5001 {
 		t.Fatalf("version_sut_ids = %v", created.VersionSUTIDs)
+	}
+}
+
+func TestIntentCodeBaselineUsesResolvedCommit(t *testing.T) {
+	f := newTask6Fixture(t)
+	ctx := context.Background()
+	f.cases.cases[300] = task6Snapshot(300, 5001)
+
+	repoID := int64(900)
+	binding := task6Binding(100, "running", 5001)
+	binding.SUTs[0].CodeRepoID = &repoID
+	binding.SUTs[0].Branch = "main"
+	binding.SUTs[0].Commit = strings.Repeat("a", 40)
+	f.versions.bindings[100] = binding
+
+	if _, err := f.intent.EnsureInitialIntents(ctx, 100); err != nil {
+		t.Fatalf("EnsureInitialIntents: %v", err)
+	}
+	intents, err := f.intents.ListActive(ctx, 100)
+	if err != nil || len(intents) != 1 {
+		t.Fatalf("intents = %+v err=%v", intents, err)
+	}
+	expected := CodeBaseline(binding)
+	if len(expected) != 64 {
+		t.Fatalf("expected a 64 hex commit baseline, got %q", expected)
+	}
+	if intents[0].CodeBaseline != expected {
+		t.Fatalf("intent baseline = %q, want %q", intents[0].CodeBaseline, expected)
+	}
+
+	branchOnly := binding
+	branchOnly.SUTs = append([]VersionSUTBinding(nil), binding.SUTs...)
+	branchOnly.SUTs[0].Commit = ""
+	if intents[0].CodeBaseline == CodeBaseline(branchOnly) {
+		t.Fatal("the resolved commit must change the intent baseline")
 	}
 }
 

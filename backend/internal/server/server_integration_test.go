@@ -96,7 +96,7 @@ func newTestAPI(t *testing.T) *testAPI {
 	storageSvc := storageapp.New(storagepg.New(pool), storagepg.NewFileStore(), settingsSvc, ids, auditSvc, eventSvc)
 	resourceSvc := resourceapp.New(resourcepg.New(pool), ids, clk, nil, auditSvc, eventSvc)
 	versionRepo := versionpg.New(pool, ids)
-	versionSvc := versionapp.New(versionRepo, resourceSvc, ids, clk, auditSvc, eventSvc)
+	versionSvc := versionapp.New(versionRepo, resourceSvc, ids, clk, auditSvc, eventSvc, nil)
 	resourceSvc.SetUsageChecker(versionSvc)
 	designRepo := designpg.New(pool)
 	designGraph := designapp.NewGraphService(designRepo, ids, clk, auditSvc, eventSvc, nil)
@@ -310,8 +310,8 @@ func TestP0EndToEndFlow(t *testing.T) {
 	}
 
 	settings := api.listData(api.do(http.MethodGet, "/api/admin/settings", nil, http.StatusOK))
-	if len(settings) != 53 {
-		t.Fatalf("settings count = %d, want 53 (P4 49->53)", len(settings))
+	if len(settings) != 69 {
+		t.Fatalf("settings count = %d, want 69 (P5 53->69)", len(settings))
 	}
 	updated := api.data(api.do(http.MethodPatch, "/api/admin/settings/execution.global_concurrency", map[string]any{"value": 5}, http.StatusOK))
 	if updated["value"] != float64(5) {
