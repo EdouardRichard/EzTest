@@ -46,11 +46,27 @@ type IssueMerge struct {
 	ExpectedRevision *int32
 }
 
+// IssueRecurrence is one recurrence redirection write (spec §4.6): the source
+// issue's dedupe key recurred and the merge chain resolved to TargetID. The
+// repository appends Refs to the target with role='recurrence', increments its
+// recurrence_count, stamps last_recurred_at and appends the recurrence history
+// row in one transaction; the source issue is never written.
+type IssueRecurrence struct {
+	VersionID int64
+	SourceID  int64
+	TargetID  int64
+	Refs      []delivery.IssueRef
+}
+
 // IssueRepository persists delivery_issue, delivery_issue_ref and
 // delivery_issue_status_history rows.
 type IssueRepository interface {
 	// CreateCandidate inserts the issue and its refs idempotently. The bool
-	// reports whether the issue was created (false on a dedupe conflict).
+	// reports whether the issue was created (false on a dedupe conflict). On a
+	// dedupe hit whose stored issue is merged, refs are not appended to the
+	// source: the service resolves the merge target and applies the recurrence
+	// with ApplyRecurrence (or falls back to AppendRefs when the chain is
+	// broken), preserving the P7 "source refs unchanged" invariant.
 	CreateCandidate(ctx context.Context, issue delivery.Issue, refs []delivery.IssueRef) (delivery.Issue, bool, error)
 	Get(ctx context.Context, versionID, issueID int64) (delivery.Issue, error)
 	// GetByID returns an issue regardless of version, for tools and workers
@@ -59,6 +75,14 @@ type IssueRepository interface {
 	List(ctx context.Context, versionID int64, f IssueFilter) ([]delivery.Issue, error)
 	UpdateStatus(ctx context.Context, u IssueStatusUpdate) (delivery.Issue, error)
 	Merge(ctx context.Context, m IssueMerge) (delivery.Issue, error)
+	// ApplyRecurrence writes one recurrence redirection atomically. The target
+	// must belong to VersionID and still be non-merged; otherwise it returns
+	// ErrStateConflict so the service can fall back without losing data.
+	ApplyRecurrence(ctx context.Context, r IssueRecurrence) (delivery.Issue, error)
+	// AppendRefs appends logical refs to one existing issue idempotently
+	// (ON CONFLICT DO NOTHING). It is the broken-chain fallback that preserves
+	// the pre-P7 dedupe behavior.
+	AppendRefs(ctx context.Context, issueID int64, refs []delivery.IssueRef) error
 	AppendHistory(ctx context.Context, h delivery.IssueStatusChange) error
 	ListRefs(ctx context.Context, issueID int64) ([]delivery.IssueRef, error)
 	ListHistory(ctx context.Context, issueID int64) ([]delivery.IssueStatusChange, error)

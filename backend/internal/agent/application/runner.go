@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"strconv"
 	"strings"
@@ -60,6 +61,16 @@ type RunnerDeps struct {
 	// RequirementFinalizer verifies that requirement.close runs recorded the
 	// closure for their scoped requirement version (retryable if absent).
 	RequirementFinalizer RequirementFinalizer
+	// Knowledge retrieves the approved knowledge injected into the version
+	// context (P7). Nil disables injection for deployments without the
+	// knowledge context.
+	Knowledge KnowledgeReader
+	// KnowledgeUsage records knowledge_usage rows after the context packet is
+	// persisted. Nil disables usage accounting.
+	KnowledgeUsage KnowledgeUsageRecorder
+	// Logger receives the log-only knowledge runtime failures. It defaults to
+	// slog.Default().
+	Logger *slog.Logger
 	InstanceID           string
 }
 
@@ -85,12 +96,19 @@ type Runner struct {
 	runCanceller    RunCanceller
 	reportFinalizer      ReportFinalizer
 	requirementFinalizer RequirementFinalizer
+	knowledge            KnowledgeReader
+	knowledgeUsage       KnowledgeUsageRecorder
+	logger               *slog.Logger
 	instanceID      string
 	builder         *ContextBuilder
 }
 
 // NewRunner wires the agent runner.
 func NewRunner(deps RunnerDeps) *Runner {
+	logger := deps.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return &Runner{
 		repo:            deps.Runtime,
 		chat:            deps.Chat,
@@ -109,6 +127,9 @@ func NewRunner(deps RunnerDeps) *Runner {
 		runCanceller:    deps.RunCanceller,
 		reportFinalizer: deps.ReportFinalizer,
 		requirementFinalizer: deps.RequirementFinalizer,
+		knowledge:            deps.Knowledge,
+		knowledgeUsage:       deps.KnowledgeUsage,
+		logger:               logger,
 		instanceID:      deps.InstanceID,
 		builder:         NewContextBuilder(deps.Settings, NewLLMSummarizer(deps.Chat)),
 	}
@@ -544,6 +565,10 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 	if err != nil {
 		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}
+	// P7 knowledge injection: approved knowledge visible to the version (global
+	// items plus items matching the version's SUT families). A retrieval
+	// failure is log-only supplemental context, never a run failure.
+	versionPack.Knowledge = r.knowledgeForVersion(ctx, state.item.VersionID)
 	state.input.VersionPack = versionPack
 
 	if state.payload.ConversationID > 0 {
@@ -610,9 +635,10 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 		})
 	}
 
-	// P5 composes the P1–P4 registry with the codeintel/visual tool groups; the
-	// profile allowed_tools still select the surface each run may call.
-	state.registry = tools.NewP5Registry(r.toolDepsForRun(state))
+	// P5/P7 compose the P1–P4 registry with the codeintel/visual/knowledge tool
+	// groups; the profile allowed_tools still select the surface each run may
+	// call.
+	state.registry = tools.NewP7Registry(r.toolDepsForRun(state))
 	state.definitions = state.registry.Definitions(state.profile.AllowedTools)
 
 	packet, compactInfo, err := r.builder.Build(ctx, state.input)
@@ -629,6 +655,9 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 	state.run.ContextPacketID = &saved.ID
 	state.softDeadline = r.now().Add(time.Duration(r.softSeconds(state.profile)) * time.Second)
 	r.persistCompaction(ctx, state, compactInfo, "threshold")
+	// knowledge_usage is written once per run from the persisted packet; a
+	// failure is logged and never fails the run (contracts §10.3).
+	r.recordKnowledgeUsage(ctx, state)
 
 	systemContent := sectionContent(saved, contextSectionSystem)
 	userContent := r.userMessage(ctx, state, attachmentText)
@@ -1621,6 +1650,7 @@ func versionPackResult(pack VersionPack) map[string]any {
 		"apis":         pack.APIs,
 		"requirements": pack.Requirements,
 		"attachments":  pack.Attachments,
+		"knowledge":    knowledgeRefsResult(pack.Knowledge),
 	}
 }
 

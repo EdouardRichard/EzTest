@@ -225,6 +225,180 @@ function withQuery(path: string, params: Record<string, string | number | undefi
   return query.length > 0 ? `${path}?${query}` : path
 }
 
+// --- Admin GC --------------------------------------------------------------
+
+export type GCRunMode = "dry_run" | "apply"
+export type GCRunStatus = "running" | "completed" | "failed"
+export type GCActorKind = "user" | "system"
+
+/** Retention values a GC pass used (`gc_run.report.settings`). */
+export type GCReportSettings = {
+  temp_hours: number
+  replaced_export_days: number
+  unreferenced_content_days: number
+  grace_hours: number
+  batch_size: number
+}
+
+export type GCReportScanned = {
+  objects: number
+  refs: number
+  files: number
+  export_artifacts: number
+}
+
+export type GCReportActions = {
+  objects: number
+  refs: number
+  files: number
+  bytes: number
+}
+
+export type GCReportFiles = {
+  deleted: number
+  missing: number
+  failed: number
+}
+
+/** One candidate in the capped report sample (`report.candidate_samples`). */
+export type GCCandidateSample = {
+  class: string
+  object_sha: string
+  size: number
+  owner_kind?: string
+  owner_id?: number
+  ref_id?: number
+  export_artifact_id?: number
+  age_seconds: number
+  delete_object: boolean
+  delete_ref: boolean
+}
+
+export type GCProtectedSample = {
+  object_sha?: string
+  owner_kind?: string
+  owner_id?: number
+  ref_id?: number
+  reason: string
+  age_seconds: number
+}
+
+/**
+ * `gc_run.report` JSONB. The API passes the stored object through, so optional
+ * fields keep old/partial reports renderable without a schema migration.
+ */
+export type GCReport = {
+  mode?: GCRunMode
+  dry_run?: boolean
+  status?: string
+  started_at?: string
+  finished_at?: string | null
+  error?: string
+  settings?: Partial<GCReportSettings>
+  scanned?: Partial<GCReportScanned>
+  candidates?: Record<string, number>
+  candidate_samples?: GCCandidateSample[]
+  protected?: Record<string, number>
+  protected_samples?: GCProtectedSample[]
+  samples_truncated?: boolean
+  unknown_owner_kinds?: string[]
+  planned?: Partial<GCReportActions>
+  deleted?: Partial<GCReportActions>
+  files?: Partial<GCReportFiles>
+  tombstones?: number
+  errors?: string[]
+}
+
+/** `GCRunView` from `GET/POST /api/admin/gc/runs` (contract p7-api §3). */
+export type GCRun = {
+  id: string
+  mode: GCRunMode
+  status: GCRunStatus
+  actor_id?: string | null
+  actor_kind: GCActorKind
+  started_at: string
+  finished_at?: string | null
+  scanned_objects: number
+  scanned_refs: number
+  deleted_objects: number
+  deleted_refs: number
+  deleted_bytes: number
+  report: GCReport
+  error?: string | null
+}
+
+/** `gcTombstoneDTO` from `GET /api/admin/gc/runs/{gcRunId}`. */
+export type GCTombstone = {
+  id: string
+  run_id: string
+  object_sha: string
+  size: number
+  mime: string
+  relative_path: string
+  reason: string
+  deleted_at: string
+}
+
+export type GCRunDetail = GCRun & { tombstones: GCTombstone[] }
+
+/** `GET /api/admin/gc/runs?limit=` (newest first). */
+export function listGCRuns(limit = 20): Promise<ApiPage<GCRun>> {
+  return apiGetPage<GCRun>(withQuery("/api/admin/gc/runs", { limit }))
+}
+
+/**
+ * `POST /api/admin/gc/runs`: dry runs need no confirmation; apply passes
+ * `confirm=true` (the server answers 400 `confirmation_required` otherwise).
+ */
+export function createGCRun(mode: GCRunMode, confirm?: boolean): Promise<GCRun> {
+  const body: { mode: GCRunMode; confirm?: boolean } = { mode }
+  if (confirm === true) body.confirm = true
+  return apiPost<GCRun>("/api/admin/gc/runs", body)
+}
+
+/** `GET /api/admin/gc/runs/{gcRunId}`: run + tombstones. */
+export function getGCRun(id: string): Promise<GCRunDetail> {
+  return apiGet<GCRunDetail>(`/api/admin/gc/runs/${encodeURIComponent(id)}`)
+}
+
+// --- Admin instances -------------------------------------------------------
+
+export type InstanceStatus = "active" | "draining" | "offline" | "stopped"
+
+/** `instanceView` from `GET /api/admin/instances` (contract p7-api §2). */
+export type Instance = {
+  id: string
+  instance_key: string
+  hostname: string
+  pid: number
+  api_port: number
+  node_id: number
+  status: InstanceStatus
+  version: string
+  last_error?: string | null
+  started_at: string
+  heartbeat_at: string
+  draining_at?: string | null
+  stopped_at?: string | null
+  created_at: string
+  updated_at: string
+}
+
+/** `GET /api/admin/instances` (admin-only roster). */
+export function listInstances(): Promise<ApiPage<Instance>> {
+  return apiGetPage<Instance>("/api/admin/instances")
+}
+
+/** `POST /api/admin/instances/{instanceId}/drain`: readiness 503, stop claiming. */
+export function drainInstance(id: string): Promise<Instance> {
+  return apiPost<Instance>(`/api/admin/instances/${encodeURIComponent(id)}/drain`)
+}
+
+/** `POST /api/admin/instances/{instanceId}/activate`: cancel draining. */
+export function activateInstance(id: string): Promise<Instance> {
+  return apiPost<Instance>(`/api/admin/instances/${encodeURIComponent(id)}/activate`)
+}
+
 export function fetchUsers(query: PageQuery = {}): Promise<ApiPage<User>> {
   return apiGetPage<User>(
     withQuery("/api/admin/users", { cursor: query.cursor, limit: query.limit }),

@@ -135,9 +135,14 @@ type Issue struct {
 	MergedAt         *time.Time
 	MergedBy         *int64
 	ReopenCount      int
-	CreatedByRunID   *int64
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
+	// RecurrenceCount counts the failures redirect to a merge target (spec
+	// §4.6); LastRecurredAt is the latest redirect time. Neither changes the
+	// source issue's refs or history.
+	RecurrenceCount int
+	LastRecurredAt  *time.Time
+	CreatedByRunID  *int64
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 // IssueRef is one append-only logical reference of an issue (spec §3.2). Kind

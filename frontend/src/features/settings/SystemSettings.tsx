@@ -15,6 +15,8 @@ import { ApiError } from "@/lib/api-client"
 import { formatDateTime } from "@/lib/format"
 
 import { fetchSettings, groupSettings, type Setting, updateSetting } from "./api"
+import { GCPanel } from "./GCPanel"
+import { InstancePanel } from "./InstancePanel"
 
 type ParseResult = { ok: true; value: unknown } | { ok: false; error: string }
 
@@ -300,6 +302,9 @@ export function SystemSettings() {
       <Alert tone="info" title="生效方式">
         `restart_required` 只做提示，不阻断保存；其余配置在保存成功后立即热加载。
       </Alert>
+
+      <GCPanel />
+      <InstancePanel />
     </div>
   )
 }

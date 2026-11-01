@@ -186,7 +186,7 @@ func (h *Handler) GetIssue(w http.ResponseWriter, r *http.Request) {
 		history = append(history, toIssueHistoryView(change))
 	}
 	httpx.JSON(w, http.StatusOK, IssueDetailView{
-		IssueView:   toIssueView(detail.Issue, detail.Refs, detail.Triage),
+		IssueView:   toIssueView(detail.Issue, detail.Refs, detail.Triage, detail.MergedChain),
 		History:     history,
 		RelatedRefs: relatedRefCounts(detail.Refs),
 	})
@@ -360,7 +360,7 @@ func (h *Handler) issueView(ctx context.Context, versionID int64, issue delivery
 	detail, err := h.issues.Get(ctx, versionID, issue.ID)
 	if err != nil {
 		if errors.Is(err, deliveryapp.ErrNotFound) {
-			return toIssueView(issue, nil, nil), nil
+			return toIssueView(issue, nil, nil, nil), nil
 		}
 		return IssueView{}, mapIssueError(err, "")
 	}
@@ -368,7 +368,7 @@ func (h *Handler) issueView(ctx context.Context, versionID int64, issue delivery
 	if detail.Issue.ID > 0 {
 		projected = detail.Issue
 	}
-	return toIssueView(projected, detail.Refs, detail.Triage), nil
+	return toIssueView(projected, detail.Refs, detail.Triage, detail.MergedChain), nil
 }
 
 // actionIssueView enriches an action response with refs/triage. The write has
@@ -376,13 +376,13 @@ func (h *Handler) issueView(ctx context.Context, versionID int64, issue delivery
 // transition into a 500: the base view is returned instead.
 func (h *Handler) actionIssueView(ctx context.Context, versionID int64, issue delivery.Issue) IssueView {
 	if issue.ID <= 0 {
-		return toIssueView(issue, nil, nil)
+		return toIssueView(issue, nil, nil, nil)
 	}
 	detail, err := h.issues.Get(ctx, versionID, issue.ID)
 	if err != nil || detail.Issue.ID <= 0 {
-		return toIssueView(issue, nil, nil)
+		return toIssueView(issue, nil, nil, nil)
 	}
-	return toIssueView(detail.Issue, detail.Refs, detail.Triage)
+	return toIssueView(detail.Issue, detail.Refs, detail.Triage, detail.MergedChain)
 }
 
 // requireActor reads the authenticated caller injected by the server

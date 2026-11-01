@@ -17,6 +17,7 @@ const api = vi.hoisted(() => ({
   getRevision: vi.fn(),
   regenerate: vi.fn(),
   downloadHTML: vi.fn(),
+  downloadPDF: vi.fn(),
 }))
 vi.mock("./api", () => api)
 
@@ -72,7 +73,10 @@ const revision2: ReportRevisionView = {
   template_version: "p4-report-v1",
   render_status: "done",
   html_available: true,
-  pdf_available: false,
+  pdf_available: true,
+  pdf_status: "done",
+  pdf_error: null,
+  pdf_rendered_at: "2026-11-01T05:31:00Z",
   created_at: updated,
 }
 
@@ -87,6 +91,9 @@ const revision1: ReportRevisionView = {
   render_status: "done",
   html_available: true,
   pdf_available: false,
+  pdf_status: "failed",
+  pdf_error: "chrome timed out after 60s",
+  pdf_rendered_at: null,
   created_at: created,
 }
 
@@ -107,6 +114,8 @@ const waveRevision: ReportRevisionView = {
   id: "8203",
   report_id: "8102",
   as_of: "2026-10-31T08:00:00Z",
+  pdf_status: "pending",
+  pdf_error: null,
 }
 
 const waveReport: ReportView = {
@@ -166,6 +175,11 @@ function mockApi(): void {
     filename: "report-8101-r2.html",
     contentType: "text/html",
   })
+  api.downloadPDF.mockResolvedValue({
+    blob: new Blob(["%PDF-1.7"], { type: "application/pdf" }),
+    filename: "report-8101-r2.pdf",
+    contentType: "application/pdf",
+  })
 }
 
 function detailPanel(): HTMLElement {
@@ -211,11 +225,13 @@ describe("ReportsTab", () => {
     const panel = detailPanel()
     await within(panel).findByText("报告详情")
     expect(within(panel).getByText("v2")).toBeInTheDocument()
-    expect(within(panel).getByText(/2026-11-01/)).toHaveTextContent("2026-11-01")
+    expect(within(panel).getByTestId("report-as-of")).toHaveTextContent("2026-11-01")
     expect(within(panel).getByText("p4-report-v1")).toBeInTheDocument()
     expect(within(panel).getByText(fingerprint.slice(0, 12))).toBeInTheDocument()
     expect(within(panel).getByText("输入已变化，建议重新生成。")).toBeInTheDocument()
-    expect(within(panel).getByRole("button", { name: "PDF（P7）" })).toBeDisabled()
+    expect(within(panel).getByTestId("report-pdf-status")).toHaveTextContent("PDF 已生成")
+    expect(within(panel).getByTestId("report-pdf-rendered-at")).toHaveTextContent("2026-11-01")
+    expect(within(panel).getByRole("button", { name: "下载 PDF" })).toBeEnabled()
   })
 
   it("switches to wave reports and writes ?report= into the URL", async () => {
@@ -393,6 +409,108 @@ describe("ReportsTab", () => {
     fireEvent.click(await within(detailPanel()).findByRole("button", { name: "打开报告 HTML" }))
 
     expect(await screen.findByText("报告内容校验失败")).toBeInTheDocument()
+  })
+
+  it("downloads the PDF through apiDownload with the server filename", async () => {
+    Object.assign(URL, {
+      createObjectURL: vi.fn(() => "blob:report-pdf"),
+      revokeObjectURL: vi.fn(),
+    })
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {})
+
+    render(<ReportsTab versionId="2001" />)
+    await screen.findByTestId("report-8101")
+
+    fireEvent.click(await within(detailPanel()).findByRole("button", { name: "下载 PDF" }))
+
+    await waitFor(() => expect(api.downloadPDF).toHaveBeenCalledWith("2001", "8101", 2))
+    const anchor = click.mock.instances[0] as HTMLAnchorElement
+    expect(anchor.download).toBe("report-8101-r2.pdf")
+  })
+
+  it("falls back to a revision PDF filename when Content-Disposition is absent", async () => {
+    api.downloadPDF.mockResolvedValue({
+      blob: new Blob(["%PDF-1.7"], { type: "application/pdf" }),
+      filename: "",
+      contentType: "application/pdf",
+    })
+    Object.assign(URL, {
+      createObjectURL: vi.fn(() => "blob:report-pdf"),
+      revokeObjectURL: vi.fn(),
+    })
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {})
+
+    render(<ReportsTab versionId="2001" />)
+    await screen.findByTestId("report-8101")
+
+    fireEvent.click(await within(detailPanel()).findByRole("button", { name: "下载 PDF" }))
+
+    await waitFor(() => expect(api.downloadPDF).toHaveBeenCalledWith("2001", "8101", 2))
+    const anchor = click.mock.instances[0] as HTMLAnchorElement
+    expect(anchor.download).toBe("report-8101-r2.pdf")
+  })
+
+  it("shows the PDF failure reason and disables the PDF download", async () => {
+    render(<ReportsTab versionId="2001" />)
+    await screen.findByTestId("report-8101")
+
+    fireEvent.change(await screen.findByLabelText("修订版本"), { target: { value: "1" } })
+
+    await waitFor(() => expect(api.getRevision).toHaveBeenCalledWith("2001", "8101", 1))
+    const panel = detailPanel()
+    await within(panel).findByText("PDF 生成失败")
+    expect(within(panel).getByTestId("report-pdf-error")).toHaveTextContent(
+      "chrome timed out after 60s",
+    )
+    expect(within(panel).getByRole("button", { name: "下载 PDF" })).toBeDisabled()
+  })
+
+  it("shows the render_pdf disabled hint when PDF is off", async () => {
+    const disabledRevision: ReportRevisionView = {
+      ...revision1,
+      status: "draft",
+      revision: 4,
+      pdf_status: "disabled",
+      pdf_error: null,
+    }
+    api.listReports.mockResolvedValue([{ ...versionReport, current_revision: disabledRevision }])
+    api.getReport.mockResolvedValue({
+      ...versionDetail,
+      revisions: [disabledRevision, revision2, revision1],
+      current_revision: disabledRevision,
+    })
+    api.getRevision.mockResolvedValue(disabledRevision)
+
+    render(<ReportsTab versionId="2001" />)
+    await screen.findByTestId("report-8101")
+
+    const panel = detailPanel()
+    await within(panel).findByText("PDF 未启用")
+    expect(within(panel).getByTestId("report-pdf-hint")).toHaveTextContent("report.render_pdf")
+    expect(within(panel).getByRole("button", { name: "下载 PDF" })).toBeDisabled()
+  })
+
+  it("shows an inline error when the PDF download fails", async () => {
+    api.downloadPDF.mockRejectedValue(
+      new ApiError({
+        status: 409,
+        code: "pdf_failed",
+        message: "PDF 生成失败，暂不可下载",
+        requestId: "req_pdf",
+      }),
+    )
+    Object.assign(URL, {
+      createObjectURL: vi.fn(() => "blob:report-pdf"),
+      revokeObjectURL: vi.fn(),
+    })
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {})
+
+    render(<ReportsTab versionId="2001" />)
+    await screen.findByTestId("report-8101")
+
+    fireEvent.click(await within(detailPanel()).findByRole("button", { name: "下载 PDF" }))
+
+    expect(await screen.findByText("PDF 生成失败，暂不可下载")).toBeInTheDocument()
   })
 
   it("shows the empty state when the version has no reports", async () => {

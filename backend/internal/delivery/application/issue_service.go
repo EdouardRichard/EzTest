@@ -19,6 +19,9 @@ const (
 	issueEventUpdated  = "issue.updated"
 	issueEventReopened = "issue.reopened"
 	issueEventMerged   = "issue.merged"
+	// issueEventRecurred is the P7 recurrence event (spec §7): emitted on both a
+	// successful redirect and a broken/cyclic chain fallback.
+	issueEventRecurred = "issue.recurred"
 )
 
 // Audit actions of the issue lifecycle (D52). Audit is best effort.
@@ -28,6 +31,9 @@ const (
 	issueAuditDismissed = "delivery.issue.dismissed"
 	issueAuditReopened  = "delivery.issue.reopened"
 	issueAuditMerged    = "delivery.issue.merged"
+	// issueAuditRecurred records a recurrence redirect, including the fallback
+	// that keeps the pre-P7 dedupe behavior.
+	issueAuditRecurred = "delivery.issue.recurred"
 )
 
 const (
@@ -35,16 +41,24 @@ const (
 	issueReasonMax = 2000
 	// issueActorKindUser is the actor kind persisted for human transitions.
 	issueActorKindUser = "user"
+	// issueActorKindSystem is the actor kind persisted for system transitions.
+	issueActorKindSystem = "system"
+	// issueReasonRecurrence is the status-history reason of a recurrence
+	// redirect (spec §4.6); the status itself does not change.
+	issueReasonRecurrence = "recurrence"
 )
 
 // IssueDetail is the read projection of one issue: its row plus the append-only
 // refs and status history and the latest triage analysis run, when one is
-// attached through IssueTriageReader.
+// attached through IssueTriageReader. MergedChain is the read-time merged_into
+// target chain of a merged issue (direct target first, terminal target last);
+// it is empty for a non-merged issue and never persisted (spec §4.6).
 type IssueDetail struct {
-	Issue   delivery.Issue
-	Refs    []delivery.IssueRef
-	History []delivery.IssueStatusChange
-	Triage  *delivery.AnalysisRun
+	Issue       delivery.Issue
+	Refs        []delivery.IssueRef
+	History     []delivery.IssueStatusChange
+	Triage      *delivery.AnalysisRun
+	MergedChain []int64
 }
 
 // IssueTriageReader is the optional triage projection of an issue detail. It is
@@ -218,6 +232,13 @@ func (s *IssueService) Get(ctx context.Context, versionID, issueID int64) (Issue
 		return IssueDetail{}, mapIssueRepositoryError("list issue history", err)
 	}
 	detail := IssueDetail{Issue: issue, Refs: refs, History: history}
+	if issue.MergedIntoID != nil {
+		chain, _, err := s.resolveMergeChain(ctx, issue)
+		if err != nil {
+			return IssueDetail{}, fmt.Errorf("resolve issue %d merge chain: %w", issueID, err)
+		}
+		detail.MergedChain = issueIDs(chain)
+	}
 	if s.triage != nil {
 		run, found, err := s.triage.LatestByIssue(ctx, issueID)
 		if err != nil {
@@ -454,6 +475,14 @@ func (s *IssueService) ingestSnapshot(ctx context.Context, snapshot CaseRunSnaps
 		return delivery.Issue{}, false, mapIssueRepositoryError("create issue candidate", err)
 	}
 	if !created {
+		if stored.Status == delivery.IssueStatusMerged {
+			// A merged source means the candidate recurs (spec §4.6): redirect
+			// the new refs/count/event/audit to the merge target instead of
+			// writing the source. The repository deliberately did not append
+			// the candidate refs on this dedupe hit.
+			redirected, err := s.redirectRecurrence(ctx, stored, issue, refs)
+			return redirected, false, err
+		}
 		return stored, false, nil
 	}
 	// The adapter returns the persisted row; fall back to the snapshot version
@@ -503,6 +532,120 @@ func issueCandidateInput(snapshot CaseRunSnapshot) delivery.CandidateInput {
 		WaveID:                   waveID,
 		EvidenceIDs:              snapshot.EvidenceIDs,
 	}
+}
+
+// redirectRecurrence resolves the merge target of a merged dedupe hit and
+// applies the recurrence there (spec §4.6). The source issue keeps its refs and
+// history untouched. A broken, cyclic, foreign-version or over-budget chain —
+// or a target that changed concurrently — falls back to the pre-P7 dedupe
+// behavior (append the refs to the source) and reports redirect_failed.
+func (s *IssueService) redirectRecurrence(ctx context.Context, stored delivery.Issue, candidate delivery.Issue, refs []delivery.IssueRef) (delivery.Issue, error) {
+	targets, ok, err := s.resolveMergeChain(ctx, stored)
+	if err != nil {
+		return delivery.Issue{}, mapIssueRepositoryError("resolve issue recurrence chain", err)
+	}
+	if !ok || len(targets) == 0 {
+		return s.fallbackRecurrence(ctx, stored, candidate, refs)
+	}
+	target := targets[len(targets)-1]
+	recurrenceRefs := make([]delivery.IssueRef, 0, len(refs))
+	for _, ref := range refs {
+		ref.Role = delivery.IssueRefRoleRecurrence
+		recurrenceRefs = append(recurrenceRefs, ref)
+	}
+	updated, err := s.repo.ApplyRecurrence(ctx, IssueRecurrence{
+		VersionID: stored.VersionID,
+		SourceID:  stored.ID,
+		TargetID:  target.ID,
+		Refs:      recurrenceRefs,
+	})
+	if err != nil {
+		if errors.Is(err, delivery.ErrStateConflict) || errors.Is(err, delivery.ErrNotFound) {
+			// The target was merged/deleted between the chain walk and the
+			// write. Preserve the candidate data on the source; the event/audit
+			// records the failed redirect.
+			return s.fallbackRecurrence(ctx, stored, candidate, refs)
+		}
+		return delivery.Issue{}, mapIssueRepositoryError("apply issue recurrence", err)
+	}
+	s.recordIssueRecurrence(ctx, updated.VersionID, updated.ID, stored.ID, candidate.DedupeKey, updated.RecurrenceCount, false)
+	return updated, nil
+}
+
+// fallbackRecurrence keeps the pre-P7 dedupe behavior when the merge chain
+// cannot be redirected: the candidate refs are appended to the source (the
+// repository skipped them on the merged dedupe hit) and the failure is
+// projected as issue.recurred redirect_failed + audit (spec §4.6).
+func (s *IssueService) fallbackRecurrence(ctx context.Context, stored delivery.Issue, candidate delivery.Issue, refs []delivery.IssueRef) (delivery.Issue, error) {
+	if err := s.repo.AppendRefs(ctx, stored.ID, refs); err != nil {
+		return delivery.Issue{}, mapIssueRepositoryError("append recurrent issue refs", err)
+	}
+	s.recordIssueRecurrence(ctx, stored.VersionID, stored.ID, stored.ID, candidate.DedupeKey, stored.RecurrenceCount, true)
+	return stored, nil
+}
+
+// resolveMergeChain walks the merged_into chain of one issue with the bounded
+// domain walk. A missing link is a data condition (ok=false), while an
+// unexpected repository failure is returned as an error.
+func (s *IssueService) resolveMergeChain(ctx context.Context, issue delivery.Issue) ([]delivery.Issue, bool, error) {
+	if issue.MergedIntoID == nil {
+		return nil, true, nil
+	}
+	var lookupErr error
+	chain, ok := delivery.MergeChain(issue, func(id int64) (delivery.Issue, bool) {
+		next, err := s.repo.GetByID(ctx, id)
+		if err != nil {
+			if !errors.Is(err, delivery.ErrNotFound) {
+				lookupErr = err
+			}
+			return delivery.Issue{}, false
+		}
+		return next, true
+	})
+	if lookupErr != nil {
+		return nil, false, lookupErr
+	}
+	return chain, ok, nil
+}
+
+// recordIssueRecurrence publishes issue.recurred on the version channel and
+// writes the delivery.issue.recurred audit entry. Both are best effort: the
+// business write already committed. On a failed redirect the source issue is
+// reported (there is no target) and redirect_failed is set.
+func (s *IssueService) recordIssueRecurrence(ctx context.Context, versionID, issueID, sourceID int64, dedupeKey string, recurrenceCount int, redirectFailed bool) {
+	payload := map[string]any{
+		"issue_id":         formatIssueID(issueID),
+		"source_issue_id":  formatIssueID(sourceID),
+		"dedupe_key":       dedupeKey,
+		"recurrence_count": recurrenceCount,
+	}
+	if redirectFailed {
+		payload["redirect_failed"] = true
+	}
+	s.publishIssueEvent(ctx, issueEventRecurred, versionID, payload)
+
+	metadata := map[string]any{
+		"issue_id":         formatIssueID(issueID),
+		"source_issue_id":  formatIssueID(sourceID),
+		"dedupe_key":       dedupeKey,
+		"recurrence_count": recurrenceCount,
+	}
+	if redirectFailed {
+		metadata["redirect_failed"] = true
+	}
+	s.recordIssueAudit(ctx, 0, issueAuditRecurred, issueID, metadata)
+}
+
+// issueIDs maps issue rows onto their IDs, preserving walk order.
+func issueIDs(issues []delivery.Issue) []int64 {
+	if len(issues) == 0 {
+		return nil
+	}
+	ids := make([]int64, 0, len(issues))
+	for _, issue := range issues {
+		ids = append(ids, issue.ID)
+	}
+	return ids
 }
 
 // publishIssueCreated publishes issue.created with only IDs/status/classification

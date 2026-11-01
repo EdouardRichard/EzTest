@@ -140,6 +140,9 @@ func p4SectionOptions(ctx context.Context, settings interface {
 		Issues:   enabled("report.section_issues"),
 		Coverage: enabled("report.section_coverage"),
 		Evidence: enabled("report.section_evidence"),
+		// Template v2 appendix (P7). Template v1 ignores it, keeping its bytes
+		// frozen (S1 report §5.6).
+		Appendix: enabled("report.section_appendix"),
 	}
 }
 

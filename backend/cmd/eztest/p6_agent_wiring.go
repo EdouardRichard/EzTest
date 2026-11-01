@@ -86,7 +86,9 @@ func newP6AgentRuntime(
 
 	profileSvc := agentapp.NewProfileAdminService(
 		runtimeRepo,
-		tools.NewP5Registry(tools.Deps{}),
+		// P7 adds knowledge.propose so the admin catalog and allowed_tools
+		// validation know the frozen P7 tool set (S6 report §5.6).
+		tools.NewP7Registry(tools.Deps{}),
 		llmSvc,
 		audit,
 	)

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -17,20 +19,23 @@ import (
 var runnerClockStart = time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 
 type runnerFixture struct {
-	runner      *agentapp.Runner
-	repo        *fakeRuntimeRepo
-	chat        *scriptedChat
-	conv        *fakeConversationPort
-	versions    *fakeVersionReader
-	attachments *fakeAttachmentReader
-	team        *fakeTeamRoomPort
-	content     *fakeContentWriter
-	settings    *fakeSettings
-	clock       *manualClock
-	events      *fakePublisher
-	audit       *fakeAuditRecorder
-	requirement *fakeRequirementPort
-	design      *fakeDesignPort
+	runner         *agentapp.Runner
+	repo           *fakeRuntimeRepo
+	chat           *scriptedChat
+	conv           *fakeConversationPort
+	versions       *fakeVersionReader
+	attachments    *fakeAttachmentReader
+	team           *fakeTeamRoomPort
+	content        *fakeContentWriter
+	settings       *fakeSettings
+	clock          *manualClock
+	events         *fakePublisher
+	audit          *fakeAuditRecorder
+	requirement    *fakeRequirementPort
+	design         *fakeDesignPort
+	knowledge      *fakeKnowledgeReader
+	knowledgeUsage *fakeKnowledgeUsageRecorder
+	knowledgeWriter *fakeKnowledgeWriter
 }
 
 func newRunnerFixture(t *testing.T) *runnerFixture {
@@ -78,6 +83,9 @@ func newRunnerFixtureWithTaskProvider(t *testing.T, taskProvider agentapp.TaskCo
 			detail:  tools.RequirementDetail{RequirementSummary: tools.RequirementSummary{ID: 501, Status: "draft"}},
 		},
 		design: &fakeDesignPort{},
+		knowledge:      &fakeKnowledgeReader{},
+		knowledgeUsage: &fakeKnowledgeUsageRecorder{},
+		knowledgeWriter: &fakeKnowledgeWriter{},
 	}
 	fixture.runner = agentapp.NewRunner(agentapp.RunnerDeps{
 		Runtime:      repo,
@@ -92,12 +100,16 @@ func newRunnerFixtureWithTaskProvider(t *testing.T, taskProvider agentapp.TaskCo
 		Attachments:  fixture.attachments,
 		TeamRoom:     fixture.team,
 		Content:      fixture.content,
+		Knowledge:      fixture.knowledge,
+		KnowledgeUsage: fixture.knowledgeUsage,
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
 		TaskProvider: taskProvider,
 		ToolDeps: tools.Deps{
 			Requirement: fixture.requirement,
 			Attachment:  &fakeAttachmentPort{},
 			Resource:    &fakeResourcePort{},
 			Design:      fixture.design,
+			P7:          tools.P7Deps{Knowledge: fixture.knowledgeWriter},
 		},
 		InstanceID: "instance-1",
 	})

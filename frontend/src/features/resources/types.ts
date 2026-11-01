@@ -89,6 +89,8 @@ export type Sut = {
   id: string
   name: string
   intro: string
+  /** Optional lowercase system family used by `knowledge.scope='system'` (P7). */
+  family?: string | null
   environments: SutEnvironment[]
   created_at: string
   updated_at: string
@@ -149,6 +151,7 @@ export type CodeProposal = {
 export type SutFormValues = {
   name: string
   intro: string
+  family?: string
   environmentName: string
   baseUrl: string
 }

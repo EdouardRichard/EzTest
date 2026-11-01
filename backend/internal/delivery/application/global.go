@@ -42,12 +42,15 @@ type GlobalReportFilter struct {
 }
 
 // GlobalIssueView is one read-only global issue row: the owning issue, the
-// version title resolved through the version application port and the stable
-// version-workspace deep link.
+// version title resolved through the version application port, the stable
+// version-workspace deep link and the read-time merged target chain of a merged
+// issue (spec §4.6). MergedChain stays empty when the service has no issue
+// repository attached.
 type GlobalIssueView struct {
 	Issue        delivery.Issue
 	VersionTitle string
 	URL          string
+	MergedChain  []int64
 }
 
 // GlobalReportRow is one report header with its current revision. The adapter
@@ -139,11 +142,19 @@ func (s *IssueService) ListGlobal(ctx context.Context, f GlobalIssueFilter) ([]G
 	}
 	views := make([]GlobalIssueView, 0, len(issues))
 	for _, issue := range issues {
-		views = append(views, GlobalIssueView{
+		view := GlobalIssueView{
 			Issue:        issue,
 			VersionTitle: titles[issue.VersionID],
 			URL:          fmt.Sprintf("/versions/%d?tab=issues&issue=%d", issue.VersionID, issue.ID),
-		})
+		}
+		if issue.MergedIntoID != nil && s.repo != nil {
+			chain, _, err := s.resolveMergeChain(ctx, issue)
+			if err != nil {
+				return nil, false, fmt.Errorf("resolve global issue %d merge chain: %w", issue.ID, err)
+			}
+			view.MergedChain = issueIDs(chain)
+		}
+		views = append(views, view)
 	}
 	return views, hasMore, nil
 }

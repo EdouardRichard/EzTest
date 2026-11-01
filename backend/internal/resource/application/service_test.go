@@ -562,6 +562,8 @@ func filterSlice[T any](items []T, keep func(T) bool) []T {
 
 var testNow = time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 
+func familyPtr(value string) *string { return &value }
+
 type harness struct {
 	svc    *Service
 	repo   *fakeRepo
@@ -692,6 +694,117 @@ func TestUpdateSUTAppliesPatchAndReportsMissing(t *testing.T) {
 	apiErr := assertAPIError(t, err, 400, "invalid_argument")
 	if apiErr.Details["field"] != "name" {
 		t.Fatalf("details = %#v", apiErr.Details)
+	}
+}
+
+func TestCreateSUTFamilyNormalizesAndClears(t *testing.T) {
+	h := newHarness()
+	view, err := h.svc.CreateSUT(context.Background(), SUTInput{
+		Name: "Payments", Family: familyPtr("  payments  "),
+	}, 42)
+	if err != nil {
+		t.Fatalf("CreateSUT: %v", err)
+	}
+	if view.Family == nil || *view.Family != "payments" {
+		t.Fatalf("family = %v", view.Family)
+	}
+	stored, err := h.repo.GetSUT(context.Background(), 1001)
+	if err != nil {
+		t.Fatalf("stored SUT: %v", err)
+	}
+	if stored.Family == nil || *stored.Family != "payments" {
+		t.Fatalf("stored family = %v", stored.Family)
+	}
+
+	without, err := h.svc.CreateSUT(context.Background(), SUTInput{
+		Name: "No Family", Family: familyPtr(""),
+	}, 42)
+	if err != nil {
+		t.Fatalf("CreateSUT with empty family: %v", err)
+	}
+	if without.Family != nil {
+		t.Fatalf("family = %v, want nil", without.Family)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		family string
+	}{
+		{name: "uppercase", family: "Payments"},
+		{name: "too long", family: strings.Repeat("a", 65)},
+		{name: "inner whitespace", family: "order center"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := h.svc.CreateSUT(context.Background(), SUTInput{
+				Name: "Bad " + tc.name, Family: familyPtr(tc.family),
+			}, 42)
+			apiErr := assertAPIError(t, err, 400, "invalid_argument")
+			if apiErr.Details["field"] != "family" {
+				t.Fatalf("details = %#v", apiErr.Details)
+			}
+		})
+	}
+}
+
+func TestUpdateSUTFamilySetKeepClear(t *testing.T) {
+	h := newHarness()
+	created, err := h.svc.CreateSUT(context.Background(), SUTInput{
+		Name: "Order Center", Family: familyPtr("payments"),
+	}, 42)
+	if err != nil {
+		t.Fatalf("CreateSUT: %v", err)
+	}
+	if created.Family == nil || *created.Family != "payments" {
+		t.Fatalf("family = %v", created.Family)
+	}
+
+	// Omitted family keeps the stored value.
+	name := "Orders Platform"
+	view, err := h.svc.UpdateSUT(context.Background(), 1001, SUTPatch{Name: &name}, 42)
+	if err != nil {
+		t.Fatalf("UpdateSUT: %v", err)
+	}
+	if view.Family == nil || *view.Family != "payments" {
+		t.Fatalf("kept family = %v", view.Family)
+	}
+
+	// A present family is trimmed and replaces the stored value.
+	view, err = h.svc.UpdateSUT(context.Background(), 1001, SUTPatch{Family: familyPtr("  order-center  ")}, 42)
+	if err != nil {
+		t.Fatalf("UpdateSUT set family: %v", err)
+	}
+	if view.Family == nil || *view.Family != "order-center" {
+		t.Fatalf("set family = %v", view.Family)
+	}
+
+	// The empty string is the explicit clear.
+	view, err = h.svc.UpdateSUT(context.Background(), 1001, SUTPatch{Family: familyPtr("")}, 42)
+	if err != nil {
+		t.Fatalf("UpdateSUT clear family: %v", err)
+	}
+	if view.Family != nil {
+		t.Fatalf("cleared family = %v", view.Family)
+	}
+	stored, err := h.repo.GetSUT(context.Background(), 1001)
+	if err != nil {
+		t.Fatalf("stored SUT: %v", err)
+	}
+	if stored.Family != nil {
+		t.Fatalf("stored family = %v", stored.Family)
+	}
+
+	// Invalid present values are rejected and leave the row untouched.
+	_, err = h.svc.UpdateSUT(context.Background(), 1001, SUTPatch{Family: familyPtr("Payments")}, 42)
+	apiErr := assertAPIError(t, err, 400, "invalid_argument")
+	if apiErr.Details["field"] != "family" {
+		t.Fatalf("details = %#v", apiErr.Details)
+	}
+	stored, err = h.repo.GetSUT(context.Background(), 1001)
+	if err != nil {
+		t.Fatalf("stored SUT: %v", err)
+	}
+	if stored.Family != nil {
+		t.Fatalf("stored family after invalid update = %v", stored.Family)
 	}
 }
 
