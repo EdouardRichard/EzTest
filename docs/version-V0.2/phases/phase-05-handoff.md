@@ -141,6 +141,15 @@
 7. **`code.analysis_finished` candidates=0**：P6 若消费该字段会误判；用 `code.impact_computed`/impact API。
 8. **E2E 已绿但依赖真实 LLM**：P5 浏览器 E2E 2/2 PASS（11 截图）；P6 验收仍需保留真实 LLM 重试/超时与 token/端口守卫，不能假设执行 Agent 每次都调用指定工具。
 
+### 7.1 P6 启动交接（用户已准备启动）
+
+- **P6 文档**：`docs/version-V0.2/phases/phase-06-parity-quality-search-agent-center.md`（仅 2.3 KB）；其“D54–D58”引用在 `decision-log.md` 中不存在，不能当详细设计。P6 必须像 P5 一样从 0.2 权威 + 0.1 参考重建 spec，先 brainstorming/澄清，再 writing-plans。
+- **阅读顺序**：本 handoff → P5 spec §0/§16 → `contracts/README.md` + P5 frozen contracts → HLD/architecture/decision-log/capability-matrix/open-decisions → phase-06（边界）→ phase-07（只读边界，避免提前实现）→ P5 代码索引/事实/影响/视觉/工具实现。
+- **可复用基座**：T0/T1 codeintel；`code.*` 工具；`execution.visual_assert`；4 状态视觉与质量指标；P4 issue/report/chain；agent profile/work_item/team room；前端 CodeTab/VisualView/QualityMetricsPanel/AnchorPanel/ProposalPanel/SSE hooks。
+- **P5 → P6 前置项**：A1 `code.analysis_finished` candidates=0（P6 用 `code.impact_computed`/impact API）；A2 为 E2E 增加“真实 LLM 未调用 visual_assert”重试（当前 E2E 已过，但仍建议）；其余 P5 已知限制见 §4。
+- **启动步骤建议**：1) 用户给出 P6 目标/范围；2) 子代理并行做 0.2/0.1 文档考古与 P5 接口 recon；3) Lead 起草 P6 spec（含验收矩阵/契约增量/风险）；4) 用户批准 spec/plan 后，按 P5 的“契约先行 + 并行实施流 + Lead 收口”执行；5) 独立 DB/端口 + 真实 LLM/Chrome + P5 回归。
+- **不要**在 P6 启动前修改 P5 frozen contracts；P6 新增只走 append-only 迁移和 additive API。
+
 ## 8. 停止声明
 
 P5 在本分支交付完成：API/DB 真实 LLM + Chrome 验收 13/13 PASS，浏览器 E2E 2/2 PASS，全量门禁绿，契约冻结，handoff 完成。**未开始 P6**；等待用户验收/指示后再进入 P6。
