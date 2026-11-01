@@ -460,6 +460,26 @@ func TestVisualEnvironmentOverridesAgentFailure(t *testing.T) {
 	}
 }
 
+func TestApplyVisualOutcomeOverridesBlocked(t *testing.T) {
+	summary := CaseRunSummary{VerdictReason: VerdictReasonBlocked, VisualInconclusive: 1}
+	status, class, got := ApplyVisualOutcome(CaseRunBlocked, FailureClassBlocked, summary, []AssertionResult{
+		visualAssertion(1, 1, AssertionInconclusive, "missing_visual_baseline"),
+	})
+	if status != CaseRunInconclusive || class != "" || got.VerdictReason != "missing_visual_baseline" {
+		t.Fatalf("got %s/%s reason=%q", status, class, got.VerdictReason)
+	}
+}
+
+func TestApplyVisualOutcomeOverridesFailedEnvironment(t *testing.T) {
+	summary := CaseRunSummary{VerdictReason: VerdictReasonStepFailed, VisualInconclusive: 1}
+	status, class, got := ApplyVisualOutcome(CaseRunFailed, FailureClassEnvironment, summary, []AssertionResult{
+		visualAssertion(1, 1, AssertionInconclusive, "visual_environment_mismatch"),
+	})
+	if status != CaseRunInconclusive || class != FailureClassEnvironment || got.VerdictReason != "visual_environment_mismatch" {
+		t.Fatalf("got %s/%s reason=%q", status, class, got.VerdictReason)
+	}
+}
+
 func TestAggregateFailedStepDoesNotUpgradeToApplication(t *testing.T) {
 	in := VerdictInput{
 		Case: caseSnapshotForVerdict(1),
