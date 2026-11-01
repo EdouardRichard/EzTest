@@ -1,6 +1,6 @@
 # Phase 05 Handoff — 代码智能 + 视觉断言（P5）
 
-> 状态：**completed（API/DB 真实 LLM + 真实 Chrome 验收 13/13 PASS；浏览器 E2E 准备阶段 blocked，见 §4）**
+> 状态：**completed（API/DB 真实 LLM + 真实 Chrome 验收 13/13 PASS；浏览器 E2E 2/2 PASS）**
 > 日期：2026-11-01
 > 阶段：P5（`phase-05-codeintel-visual.md`）
 > 实施分支：`feat/v0.2-p5`（从 `feat/v0.2` @`ff1e176` 拉出；**未合入** `feat/v0.2`）
@@ -58,7 +58,7 @@
 | **P5 真实 LLM + Chrome API/DB 验收** | `powershell.exe -File scripts/p5-acceptance.ps1` | **EXIT=0；PASS=13 FAIL=0 BLOCKED=0**；`.tmp/p5-acceptance/final7.log`、`scenarios.txt` |
 | 迁移幂等 | acceptance S0（两次启动/31 migrations） | 31 applied；第二次 0；隔离 DB `eztest_v02_p5` |
 | 验收环境 | — | API 14345、executor 14347、fixture target 13338、DB `eztest_v02_p5`、真实 `.env` DeepSeek、真实 Chrome；fixture A/B 动态 SHA |
-| 浏览器 E2E | `powershell.exe -File scripts/p5-e2e.ps1` | **BLOCKED（准备阶段，非 UI 失败）**；见 §4 |
+| 浏览器 E2E | `powershell.exe -File scripts/p5-e2e.ps1` | **EXIT=0；2 tests PASS（14.9s）**；11 张截图；`.tmp/p5-acceptance/e2e-fix1.log`、`e2e.log`、`screenshots/` |
 
 **P5 API/DB 验收场景矩阵（final7，S4 最后运行以避免设计 agent 异步改写 fixture）**
 
@@ -87,12 +87,12 @@
 7. `7b51386` 聚合前规范化视觉 step 状态。
 8. `e98f6e7` 失败分析重算不得把视觉 inconclusive 改回 blocked。
 9. `dcd12f9` fact review 后立即重算影响候选（即使 T1 cache hit）。
+10. E2E harness 根因修复（非产品代码）：`Start-Api` 在 PowerShell 函数内把 `$apiProcess` 写成函数局部变量，脚本级变量保持 `null`；bootstrap API 实际未被停止，第二个 API 绑定失败后 health 检查仍命中旧 API，旧 API 缓存了 token 设置前的 executor token，导致 `execute.case` 3/3 `unauthorized`、无 `visual_assert`/diff、E2E 在准备阶段失败。改为 `$script:apiProcess` 并加“启动前端口必须空闲/进程不得立即退出”守卫后，E2E 2/2 PASS。
 
 ## 4. 已知缺口/偏差（不阻塞 P6，但需带入）
 
 | 缺口/偏差 | 影响 | 阻塞 P6? | 记录 |
 |---|---|---|---|
-| 浏览器 E2E 在 **准备阶段** 失败：真实栈 wave1 的 visual case 未产生 diff（Case Executor 偶发未调用 `execution.visual_assert`；此前另有 executor token/restart 401） | 未获得 UI 截图/浏览器断言；API/DB 验收已覆盖同一真实 LLM/Chrome 管线 | 否（但 P6 前应修 harness） | `scripts/p5-e2e.ps1`、`.tmp/p5-acceptance/e2e-final.log` |
 | `design_host` 增加 `code.facts/routes/apis`（P5-D-19），契约 `agent-profiles-tools.md` §8.1 已改 | 设计对话可直接读码；原 P4 profile 语义扩展 | 否 | spec/handoff |
 | `code.analysis_finished` 的 `candidates` 仍为 0（事件在 impact 计算前发布）；`code.impact_computed` 携带真实计数 | 只影响该事件消费者；前端/验收用 impact 事件/接口 | 否 | D4 |
 | `code_fact` 无 meta 列，`clue`/`invalidEvidence` 合并入 `body` | fact detail 形状与 0.1 略异；0.2 契约无 meta 列 | 否 | Task 6–8 report |
@@ -136,11 +136,11 @@
 2. **真实 LLM 抖动**：设计/执行 agent 偶发不调用指定工具（S4/S8）；P6 的 parity/search/agent-center 同样依赖工具调用，需要重试/最终器/可观测性。
 3. **代码事实质量**：T1 fact 由真实 LLM 抽取，fixture 证据校验通过但跨 repo/大文件需限额/降级；`code_fact` 无 meta 列。
 4. **多 repo union**：同 subject 跨 repo 合并以最高优先级来源元数据为准；PATCH 只对最佳候选 ID 生效，UI 需展示 repo/SUT 标签。
-5. **视觉基线资产**：baseline 审批/环境指纹/config revision 语义；E2E harness token/真实 LLM 重试尚未闭合，P6 前应修。
+5. **视觉基线资产**：baseline 审批/环境指纹/config revision 语义；E2E harness 已修（`$script:apiProcess` + 端口守卫），真实 LLM 工具调用仍需重试兜底。
 6. **profile 旧库 seed**：P5 增量不覆盖管理员编辑；升级库需迁移/管理界面补齐。
 7. **`code.analysis_finished` candidates=0**：P6 若消费该字段会误判；用 `code.impact_computed`/impact API。
-8. **E2E 未通过**：浏览器 UI 覆盖仍缺 P5；P6 的 acceptance 不能假设 P5 E2E 已绿。
+8. **E2E 已绿但依赖真实 LLM**：P5 浏览器 E2E 2/2 PASS（11 截图）；P6 验收仍需保留真实 LLM 重试/超时与 token/端口守卫，不能假设执行 Agent 每次都调用指定工具。
 
 ## 8. 停止声明
 
-P5 在本分支交付完成：API/DB 真实 LLM + Chrome 验收 13/13 PASS，全量门禁绿，契约冻结，handoff 完成。**未开始 P6**；浏览器 E2E 作为已知缺口带入 P6 前置修复。等待用户验收/指示后再进入 P6。
+P5 在本分支交付完成：API/DB 真实 LLM + Chrome 验收 13/13 PASS，浏览器 E2E 2/2 PASS，全量门禁绿，契约冻结，handoff 完成。**未开始 P6**；等待用户验收/指示后再进入 P6。
