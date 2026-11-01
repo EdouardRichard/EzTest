@@ -40,6 +40,11 @@ type ReportService struct {
 	clock    Clock
 	tasks    TaskEnsurer
 	sections delivery.SectionOptions
+
+	// P6 cross-version read ports. They stay optional so the P4 constructor
+	// and its tests keep compiling; WithGlobalReader attaches them.
+	global GlobalReportReader
+	titles VersionTitleReader
 }
 
 // NewReportService wires the report use cases. events, audit and tasks may be
