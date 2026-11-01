@@ -13,6 +13,7 @@ import { pathToFileURL } from "node:url"
 
 import { ContextManager } from "./contexts.mjs"
 import { parseAllowedHosts } from "./limits.mjs"
+import { startPushFromEnv } from "./push.mjs"
 import {
   DEFAULT_MAX_CONTEXTS,
   ExecutorError,
@@ -292,7 +293,7 @@ export function parseMaxContexts(value) {
   return DEFAULT_MAX_CONTEXTS
 }
 
-export async function startFromEnv(env = process.env) {
+export async function startFromEnv(env = process.env, { manager: injectedManager = null } = {}) {
   const token = String(env.EZTEST_EXECUTOR_TOKEN ?? "").trim()
   if (token.length === 0) {
     console.error("[executor] EZTEST_EXECUTOR_TOKEN is required")
@@ -305,12 +306,14 @@ export async function startFromEnv(env = process.env) {
   // It defaults to loopback; remote targets must be listed explicitly.
   const allowedHosts = parseAllowedHosts(env.EZTEST_EXEC_ALLOWED_HOSTS)
   const logger = console
-  const manager = new ContextManager({ maxContexts, logger, allowedHosts })
+  const manager =
+    injectedManager ?? new ContextManager({ maxContexts, logger, allowedHosts })
+  const version = env.EZTEST_EXECUTOR_VERSION ?? PACKAGE_VERSION
   const server = createExecutorServer({
     token,
     manager,
     logger,
-    version: env.EZTEST_EXECUTOR_VERSION ?? PACKAGE_VERSION,
+    version,
   })
   await new Promise((resolve, reject) => {
     server.once("error", reject)
@@ -318,8 +321,16 @@ export async function startFromEnv(env = process.env) {
   })
   console.log(`[executor] listening on http://${host}:${port} (max contexts ${maxContexts})`)
 
+  // Optional push registration/heartbeat (executor-protocol §12.4). A missing
+  // EZTEST_API_URL keeps the P3 pull-only behavior.
+  const push = startPushFromEnv({ env, manager, version, logger })
+  if (push) {
+    console.log("[executor] push registration enabled (EZTEST_API_URL is set)")
+  }
+
   const shutdown = async (signal) => {
     console.log(`[executor] received ${signal}, shutting down`)
+    push?.stop()
     await new Promise((resolve) => server.close(resolve))
     await manager.close()
     process.exit(0)
@@ -330,7 +341,7 @@ export async function startFromEnv(env = process.env) {
   process.once("SIGTERM", () => {
     void shutdown("SIGTERM")
   })
-  return { server, manager }
+  return { server, manager, push }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

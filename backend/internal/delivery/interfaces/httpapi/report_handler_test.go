@@ -28,6 +28,12 @@ type reportHTMLCall struct {
 	revision  int32
 }
 
+type reportPDFCall struct {
+	versionID int64
+	reportID  int64
+	revision  int32
+}
+
 type reportRegenerateCall struct {
 	versionID int64
 	reportID  int64
@@ -49,6 +55,11 @@ type fakeReportService struct {
 	htmlRevision delivery.ReportRevision
 	htmlErr      error
 	htmlCalls    []reportHTMLCall
+
+	pdf         []byte
+	pdfRevision delivery.ReportRevision
+	pdfErr      error
+	pdfCalls    []reportPDFCall
 
 	regenerateRevision int32
 	regenerateErr      error
@@ -94,6 +105,14 @@ func (f *fakeReportService) OpenHTML(_ context.Context, versionID, reportID int6
 	return f.html, f.htmlRevision, nil
 }
 
+func (f *fakeReportService) OpenPDF(_ context.Context, versionID, reportID int64, revision int32) ([]byte, delivery.ReportRevision, error) {
+	f.pdfCalls = append(f.pdfCalls, reportPDFCall{versionID: versionID, reportID: reportID, revision: revision})
+	if f.pdfErr != nil {
+		return nil, delivery.ReportRevision{}, f.pdfErr
+	}
+	return f.pdf, f.pdfRevision, nil
+}
+
 func (f *fakeReportService) Regenerate(_ context.Context, versionID, reportID int64) (int32, error) {
 	f.regenerateCalls = append(f.regenerateCalls, reportRegenerateCall{versionID: versionID, reportID: reportID})
 	if f.regenerateErr != nil {
@@ -131,6 +150,7 @@ func sampleRevision(id, reportID int64, revision int32, status delivery.ReportSt
 		AsOf:             deliveryTestTime,
 		TemplateVersion:  "1",
 		RenderStatus:     renderStatus,
+		PDFStatus:        delivery.PDFStatusPending,
 		CreatedAt:        deliveryTestTime,
 		UpdatedAt:        deliveryTestTime,
 	}

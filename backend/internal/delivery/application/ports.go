@@ -88,14 +88,18 @@ type ReportDetail struct {
 	Refs      []delivery.ReportRef
 }
 
-// ContentStore stores and loads report HTML through the P0 content ledger
-// (spec §6.3/§6.4). Implementations must write content_ref with
-// owner_kind='report_revision', owner_id=reportRevisionID and
-// role='report_html', and must validate that ownership plus the stored
+// ContentStore stores and loads report HTML/PDF through the P0 content ledger
+// (spec §6.3/§6.4 and P7 §4.2). Implementations must write content_ref with
+// owner_kind='report_revision', owner_id=reportRevisionID and role='report_html'
+// (or 'report_pdf'), and must validate that ownership plus the stored
 // SHA-256/size on read. Storage paths never cross this port.
 type ContentStore interface {
 	PutReportHTML(ctx context.Context, reportRevisionID int64, html []byte) (contentRefID int64, sha256 string, size int64, err error)
 	OpenReportHTML(ctx context.Context, contentRefID int64) ([]byte, string, int64, error)
+	// PutReportPDF stores the rendered PDF (role='report_pdf').
+	PutReportPDF(ctx context.Context, reportRevisionID int64, pdf []byte) (ReportContentRef, error)
+	// OpenReportPDF loads and verifies one stored PDF content_ref.
+	OpenReportPDF(ctx context.Context, contentRefID int64) ([]byte, string, int64, error)
 }
 
 // ReportDataReader is the report service's read port into the version,

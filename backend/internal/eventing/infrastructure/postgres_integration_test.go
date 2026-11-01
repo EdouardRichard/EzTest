@@ -5,6 +5,7 @@ package eventingpg_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -202,6 +203,42 @@ func TestAppendConcurrentAllocatesUniqueSeq(t *testing.T) {
 	}
 	if len(seen) != writers {
 		t.Fatalf("unique seqs = %d, want %d", len(seen), writers)
+	}
+}
+
+func TestGetByChannelCursor(t *testing.T) {
+	pool := testutil.NewDB(t)
+	repo := eventingpg.New(pool)
+	ctx := context.Background()
+
+	stored, err := repo.Append(ctx, eventing.Event{
+		Channel:   "system",
+		Type:      "instance.registered",
+		Payload:   map[string]any{"instance_id": "7"},
+		RequestID: "req_get",
+	})
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	loaded, err := repo.Get(ctx, "system", stored.Seq)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if loaded.Channel != "system" || loaded.Seq != stored.Seq || loaded.Type != "instance.registered" {
+		t.Fatalf("loaded = %#v", loaded)
+	}
+	if loaded.Payload["instance_id"] != "7" || loaded.RequestID != "req_get" {
+		t.Fatalf("loaded envelope = %#v", loaded)
+	}
+	if !loaded.CreatedAt.Equal(stored.CreatedAt) {
+		t.Fatalf("created_at = %v, want %v", loaded.CreatedAt, stored.CreatedAt)
+	}
+
+	// (channel, seq) is the identity: the same seq in another channel is a
+	// different event and must not be returned for an unknown pair.
+	if _, err := repo.Get(ctx, "version:77", stored.Seq); !errors.Is(err, eventing.ErrNotFound) {
+		t.Fatalf("Get unknown = %v, want eventing.ErrNotFound", err)
 	}
 }
 

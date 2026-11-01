@@ -33,20 +33,31 @@ type Snapshot struct {
 
 // Service publishes events and serves channel snapshots/subscriptions.
 type Service struct {
-	repo eventing.Repository
-	hub  *Hub
+	repo     eventing.Repository
+	hub      *Hub
+	notifier Notifier
 }
 
-// New wires the event service to its repository and in-process hub.
-func New(repo eventing.Repository, hub *Hub) *Service {
+// New wires the event service to its repository and in-process hub. The
+// notifier is optional so P0-P6 deployments (and unit tests) keep working
+// without cross-instance fan-out; when set, every append is followed by a
+// best-effort NOTIFY carrying the persisted (channel, seq) reference.
+func New(repo eventing.Repository, hub *Hub, notifiers ...Notifier) *Service {
 	if hub == nil {
 		hub = NewHub(DefaultHubBuffer)
 	}
-	return &Service{repo: repo, hub: hub}
+	var notifier Notifier
+	if len(notifiers) > 0 {
+		notifier = notifiers[0]
+	}
+	return &Service{repo: repo, hub: hub, notifier: notifier}
 }
 
 // Publish appends an event in its channel and broadcasts it after the append
 // commits. Channel and type are validated before touching the repository.
+// Cross-instance notification is best-effort: NOTIFY is delivered on commit,
+// but if it is lost (or the notifier fails) SSE clients recover through
+// Last-Event-ID replay.
 func (s *Service) Publish(ctx context.Context, event Event) error {
 	if !ValidChannel(event.Channel) {
 		return platform.Invalid("channel", "unsupported event channel")
@@ -66,6 +77,9 @@ func (s *Service) Publish(ctx context.Context, event Event) error {
 		return err
 	}
 	s.hub.Broadcast(stored)
+	if s.notifier != nil {
+		_ = s.notifier.Notify(ctx, NewEventRef(stored))
+	}
 	return nil
 }
 

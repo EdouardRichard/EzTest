@@ -1,11 +1,16 @@
 package render
 
-// reportTemplate is the fixed, built-in HTML template of report template
+import "strings"
+
+// reportTemplateV1 is the frozen, built-in HTML template of report template
 // version "1" (spec §6.2). It is never user editable. The document is fully
 // self-contained: styles are inline and nothing references an external asset.
 // All runtime strings are printed through html/template's context-aware
 // escaping; user-provided text is never wrapped in template.HTML.
-const reportTemplate = `<!doctype html>
+//
+// P7-D-03: template version 1 is frozen byte-for-byte. TestRenderV1GoldenHash
+// pins its SHA-256; reportTemplateV2 is derived from this exact string.
+const reportTemplateV1 = `<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -166,3 +171,30 @@ footer { margin-top: 32px; padding-top: 12px; border-top: 1px solid #d0d7de; col
 </body>
 </html>
 `
+
+// reportAppendixTemplate is the v2-only appendix section inserted before the
+// footer. It records the revision metadata and the section switches and states
+// explicitly that the appendix never changes deterministic statistics. Every
+// value is escaped by html/template like the rest of the document.
+const reportAppendixTemplate = `{{if .Sections.Appendix}}<section id="appendix" data-section="appendix">
+<h2>附录</h2>
+<dl class="meta">
+<div><dt>报告 ID</dt><dd>{{if .ReportID}}#{{.ReportID}}{{else}}—{{end}}</dd></div>
+<div><dt>报告版本</dt><dd>{{if .ReportRevision}}r{{.ReportRevision}}{{else}}—{{end}}</dd></div>
+<div><dt>版本</dt><dd>#{{.VersionID}}</dd></div>
+{{if .HasWave}}<div><dt>波次</dt><dd>#{{.WaveID}}</dd></div>{{end}}
+<div><dt>as_of</dt><dd>{{.GeneratedAt}}</dd></div>
+<div><dt>输入指纹</dt><dd class="mono">{{if .InputFingerprint}}{{.InputFingerprint}}{{else}}—{{end}}</dd></div>
+<div><dt>模板版本</dt><dd>{{.TemplateVersion}}</dd></div>
+<div><dt>生成时间</dt><dd>{{.GeneratedAt}}</dd></div>
+</dl>
+<p class="empty">章节开关：{{range $index, $section := .SectionSwitches}}{{if $index}}；{{end}}{{$section.Label}} {{$section.State}}{{end}}</p>
+<p>本附录由系统生成，不改变确定性统计。</p>
+</section>
+{{end}}
+`
+
+// reportTemplateV2 is template version 2: the frozen v1 document plus the
+// optional appendix section immediately before the footer. Deriving it from the
+// v1 constant keeps every deterministic section byte-identical across versions.
+var reportTemplateV2 = strings.Replace(reportTemplateV1, "<footer>", reportAppendixTemplate+"\n<footer>", 1)

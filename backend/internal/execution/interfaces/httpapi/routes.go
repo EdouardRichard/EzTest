@@ -40,3 +40,15 @@ func (h *Handler) Register(mux *http.ServeMux, authenticated, admin func(http.Ha
 	mux.Handle("POST /api/admin/executors/{executorId}/drain", admin(http.HandlerFunc(h.DrainExecutor)))
 	mux.Handle("POST /api/admin/executors/{executorId}/activate", admin(http.HandlerFunc(h.ActivateExecutor)))
 }
+
+// RegisterInternalRoutes mounts the P7 internal executor push endpoints
+// (p7-api.md §6.5). tokenAuth is the Bearer middleware shared with the Lead's
+// server assembly (InternalTokenAuth enforces execution.executor_token in
+// constant time); a nil middleware fails closed instead of exposing the routes.
+func RegisterInternalRoutes(mux *http.ServeMux, tokenAuth func(http.Handler) http.Handler, h *Handler) {
+	if tokenAuth == nil {
+		tokenAuth = rejectInternalRequests
+	}
+	mux.Handle("POST /api/internal/executors/register", tokenAuth(http.HandlerFunc(h.InternalRegisterExecutor)))
+	mux.Handle("POST /api/internal/executors/heartbeat", tokenAuth(http.HandlerFunc(h.InternalHeartbeatExecutor)))
+}

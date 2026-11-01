@@ -193,19 +193,23 @@ func (s *Scheduler) dispatchPending(ctx context.Context, wave execution.RunWave,
 	if len(pending) == 0 {
 		return nil
 	}
-	executor, err := s.executors.Select(ctx)
-	if err != nil {
-		return mapExecutionError(err, "executor")
-	}
-	if executor == nil || !executor.Status.Dispatchable() {
-		return nil
-	}
 	usage, err := s.runningUsage(ctx)
 	if err != nil {
 		return err
 	}
 	for index := range pending {
 		run := pending[index]
+		// P7 multi-endpoint selection: re-select the best executor for every
+		// candidate so one tick can use several endpoints (capacity DESC,
+		// last_heartbeat DESC, id) instead of pinning the whole wave to the
+		// executor chosen first.
+		executor, err := s.executors.Select(ctx)
+		if err != nil {
+			return mapExecutionError(err, "executor")
+		}
+		if executor == nil || !executor.Status.Dispatchable() {
+			return nil
+		}
 		intent, err := s.intents.Get(ctx, run.IntentID)
 		if err != nil {
 			return mapExecutionError(err, "intent")

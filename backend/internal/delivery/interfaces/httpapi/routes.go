@@ -19,6 +19,7 @@ func Register(mux *http.ServeMux, h *Handler) {
 	mux.Handle("GET /api/versions/{versionId}/reports/{reportId}", http.HandlerFunc(h.GetReport))
 	mux.Handle("GET /api/versions/{versionId}/reports/{reportId}/revisions/{revision}", http.HandlerFunc(h.GetReportRevision))
 	mux.Handle("GET /api/versions/{versionId}/reports/{reportId}/revisions/{revision}/html", http.HandlerFunc(h.DownloadReportHTML))
+	mux.Handle("GET /api/versions/{versionId}/reports/{reportId}/revisions/{revision}/pdf", http.HandlerFunc(h.DownloadReportPDF))
 	mux.Handle("POST /api/versions/{versionId}/reports/{reportId}/regenerate", http.HandlerFunc(h.RegenerateReport))
 }
 

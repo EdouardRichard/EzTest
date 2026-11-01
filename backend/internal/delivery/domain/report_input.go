@@ -38,6 +38,14 @@ type ReportSnapshot struct {
 	VersionSUTs  []VersionSUTSnapshot
 	Coverage     CoverageSnapshot
 	GeneratedAt  time.Time
+	// ReportID/ReportRevision/InputFingerprint are the P7 render metadata of
+	// the revision being rendered. They feed the template v2 appendix only and
+	// are deliberately not part of the canonical fingerprint payload
+	// (report_fingerprint.go builds its own fixed struct), so they can never
+	// change an input fingerprint.
+	ReportID         int64
+	ReportRevision   int32
+	InputFingerprint string
 	// TruncatedSections lists the input lists reduced to their §6.1 cap, in a
 	// stable order (issues, waves, case_runs). It is derived metadata, not part
 	// of the fingerprint payload; the renderer prints it as a visible
@@ -111,13 +119,16 @@ func canonicalTruncationSections(sections []string) []string {
 }
 
 // SectionOptions controls which report sections are rendered (spec §6.2). A
-// false section is omitted from the HTML entirely.
+// false section is omitted from the HTML entirely. Appendix only exists in
+// template version 2 (report.section_appendix); template v1 ignores it so its
+// rendered bytes stay frozen.
 type SectionOptions struct {
 	Summary  bool
 	Results  bool
 	Issues   bool
 	Coverage bool
 	Evidence bool
+	Appendix bool
 }
 
 // ReportRenderer renders one report revision from a deterministic snapshot and
@@ -125,6 +136,14 @@ type SectionOptions struct {
 // interface; infrastructure/render implements it.
 type ReportRenderer interface {
 	Render(ctx context.Context, snapshot ReportSnapshot, narrative string, opts SectionOptions) ([]byte, error)
+}
+
+// ReportTemplateVersioner is an optional extension of ReportRenderer. A
+// renderer that knows the built-in template version it renders reports it here,
+// so a new revision records exactly the version its bytes were produced with
+// (P7-D-03). A renderer without this method keeps the frozen P4 version "1".
+type ReportTemplateVersioner interface {
+	TemplateVersion() string
 }
 
 // RequirementSnapshot is one version requirement projection with its latest

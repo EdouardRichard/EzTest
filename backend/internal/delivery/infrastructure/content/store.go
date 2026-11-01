@@ -18,12 +18,16 @@ import (
 )
 
 const (
-	// OwnerKindReportRevision is the content_ref owner kind of report HTML.
+	// OwnerKindReportRevision is the content_ref owner kind of report HTML/PDF.
 	OwnerKindReportRevision = "report_revision"
 	// RoleReportHTML is the content_ref role of report HTML.
 	RoleReportHTML = "report_html"
-	// ReportHTMLMIME is the declared report content type.
+	// ReportHTMLMIME is the declared report HTML content type.
 	ReportHTMLMIME = "text/html; charset=utf-8"
+	// RoleReportPDF is the content_ref role of a rendered report PDF (P7).
+	RoleReportPDF = "report_pdf"
+	// ReportPDFMIME is the declared report PDF content type.
+	ReportPDFMIME = "application/pdf"
 )
 
 // Ref is one content_ref row resolved by ID for the report read path.
@@ -97,6 +101,54 @@ func (s *Store) PutReportHTML(ctx context.Context, reportRevisionID int64, html 
 // SHA-256/size mismatch is ErrReportContentCorrupt (mapped to 409 by the
 // service). Storage paths never leave the ledger.
 func (s *Store) OpenReportHTML(ctx context.Context, contentRefID int64) ([]byte, string, int64, error) {
+	return s.openReportContent(ctx, contentRefID, RoleReportHTML)
+}
+
+// GetReportHTML loads the verified HTML bytes of one frozen report revision for
+// the PDF worker (RenderContent). It applies the same ledger validation as
+// OpenReportHTML.
+func (s *Store) GetReportHTML(ctx context.Context, contentRefID int64) ([]byte, error) {
+	data, _, _, err := s.OpenReportHTML(ctx, contentRefID)
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// PutReportPDF uploads the rendered PDF (content-addressed) and records
+// content_ref(owner_kind='report_revision', owner_id=reportRevisionID,
+// role='report_pdf'). The authoritative HTML is untouched.
+func (s *Store) PutReportPDF(ctx context.Context, reportRevisionID int64, pdf []byte) (deliveryapp.ReportContentRef, error) {
+	if reportRevisionID <= 0 {
+		return deliveryapp.ReportContentRef{}, platform.Invalid("report_revision_id", "must be a positive decimal ID")
+	}
+	if len(pdf) == 0 {
+		return deliveryapp.ReportContentRef{}, platform.Invalid("pdf", "report PDF is required")
+	}
+	if s == nil || s.storage == nil {
+		return deliveryapp.ReportContentRef{}, platform.NewError(http.StatusInternalServerError, "internal", "content service is not configured")
+	}
+	filename := fmt.Sprintf("report-%d.pdf", reportRevisionID)
+	object, err := s.storage.Upload(ctx, filename, ReportPDFMIME, bytes.NewReader(pdf), storageapp.MaxUploadBytes, 0)
+	if err != nil {
+		return deliveryapp.ReportContentRef{}, err
+	}
+	ref, err := s.storage.AddRef(ctx, object.SHA256, OwnerKindReportRevision, reportRevisionID, RoleReportPDF)
+	if err != nil {
+		return deliveryapp.ReportContentRef{}, err
+	}
+	return deliveryapp.ReportContentRef{RefID: ref.ID, SHA256: object.SHA256, Size: object.Size}, nil
+}
+
+// OpenReportPDF loads one stored PDF content_ref, re-validates that it is owned
+// by report_revision/report_pdf and reads the verified bytes. The service
+// additionally validates the %PDF- magic.
+func (s *Store) OpenReportPDF(ctx context.Context, contentRefID int64) ([]byte, string, int64, error) {
+	return s.openReportContent(ctx, contentRefID, RoleReportPDF)
+}
+
+// openReportContent is the shared verified read of one report content role.
+func (s *Store) openReportContent(ctx context.Context, contentRefID int64, role string) ([]byte, string, int64, error) {
 	if contentRefID <= 0 {
 		return nil, "", 0, platform.Invalid("content_ref_id", "must be a positive decimal ID")
 	}
@@ -110,7 +162,7 @@ func (s *Store) OpenReportHTML(ctx context.Context, contentRefID int64) ([]byte,
 		}
 		return nil, "", 0, err
 	}
-	if ref.OwnerKind != OwnerKindReportRevision || ref.OwnerID <= 0 || ref.Role != RoleReportHTML || !ref.OwnedByRevision {
+	if ref.OwnerKind != OwnerKindReportRevision || ref.OwnerID <= 0 || ref.Role != role || !ref.OwnedByRevision {
 		return nil, "", 0, fmt.Errorf("%w: content_ref %d owner/role mismatch", deliveryapp.ErrReportContentCorrupt, contentRefID)
 	}
 	object, reader, err := s.storage.Open(ctx, ref.ObjectID)

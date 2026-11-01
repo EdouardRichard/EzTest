@@ -28,6 +28,7 @@ type ReportService interface {
 	List(ctx context.Context, versionID int64, kind *delivery.ReportKind) ([]delivery.Report, error)
 	Get(ctx context.Context, versionID, reportID int64) (deliveryapp.ReportDetail, error)
 	OpenHTML(ctx context.Context, versionID, reportID int64, revision int32) ([]byte, delivery.ReportRevision, error)
+	OpenPDF(ctx context.Context, versionID, reportID int64, revision int32) ([]byte, delivery.ReportRevision, error)
 	Regenerate(ctx context.Context, versionID, reportID int64) (int32, error)
 }
 
@@ -260,6 +261,55 @@ func (h *Handler) DownloadReportHTML(w http.ResponseWriter, r *http.Request) {
 // internal content paths are never exposed.
 func reportContentDisposition(reportID int64, revision int32) string {
 	name := "report-" + platformid.Format(reportID) + "-r" + strconv.FormatInt(int64(revision), 10) + ".html"
+	if disposition := mime.FormatMediaType("inline", map[string]string{"filename": name}); disposition != "" {
+		return disposition
+	}
+	return "inline"
+}
+
+// DownloadReportPDF GET .../reports/{reportId}/revisions/{revision}/pdf. The
+// application service verifies version ownership, the PDF state, content-ledger
+// ownership and sha256/size; this handler only sets the frozen download headers
+// and writes the verified bytes (spec §6.4).
+func (h *Handler) DownloadReportPDF(w http.ResponseWriter, r *http.Request) {
+	if h.reports == nil {
+		writeNotConfigured(w, r, "report service")
+		return
+	}
+	versionID, err := pathID(r, "versionId", "versionId")
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	reportID, err := pathID(r, "reportId", "reportId")
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	revisionNumber, err := parseRevision(r)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	pdf, _, err := h.reports.OpenPDF(r.Context(), versionID, reportID, revisionNumber)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	sum := sha256.Sum256(pdf)
+	w.Header().Set("Content-Type", "application/pdf")
+	w.Header().Set("ETag", `"`+hex.EncodeToString(sum[:])+`"`)
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Length", strconv.Itoa(len(pdf)))
+	w.Header().Set("Content-Disposition", reportPDFContentDisposition(reportID, revisionNumber))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(pdf)
+}
+
+// reportPDFContentDisposition builds the safe inline PDF filename.
+func reportPDFContentDisposition(reportID int64, revision int32) string {
+	name := "report-" + platformid.Format(reportID) + "-r" + strconv.FormatInt(int64(revision), 10) + ".pdf"
 	if disposition := mime.FormatMediaType("inline", map[string]string{"filename": name}); disposition != "" {
 		return disposition
 	}

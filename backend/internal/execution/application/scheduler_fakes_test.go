@@ -583,12 +583,22 @@ func (r *fakeVersionReader) Reopen(_ context.Context, id int64) error {
 
 type fakeExecutorRegistry struct {
 	executor *execution.ExecutorInstance
+	sequence []execution.ExecutorInstance
+	selected int
 	err      error
 }
 
 func (r *fakeExecutorRegistry) Select(context.Context) (*execution.ExecutorInstance, error) {
 	if r.err != nil {
 		return nil, r.err
+	}
+	if len(r.sequence) > 0 {
+		if r.selected >= len(r.sequence) {
+			return nil, nil
+		}
+		copied := r.sequence[r.selected]
+		r.selected++
+		return &copied, nil
 	}
 	if r.executor == nil {
 		return nil, nil
