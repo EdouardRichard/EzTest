@@ -283,9 +283,10 @@ system prompt 必须包含 `[profile:<key>]`，并声明：AI 只能提交 draft
 | `case_author` | `code.facts`、`code.routes`、`code.apis`、`code.diff`、`code.impact`、`code.anchors` |
 | `failure_analyst` | `code.diff`、`code.facts`、`code.anchors` |
 | `design_planner` | `code.impact` |
+| `design_host` | `code.facts`、`code.routes`、`code.apis`（S4 设计 Agent 读码；P5-D-19） |
 | `case_executor` | `execution.visual_assert` |
 
-- 白名单是**并集**：各 profile 的 P1–P4 工具保持；上表只列 P5 追加项。其余 profile（`clarification_host`、`requirement_curator`、`design_host`、`design_critic`、`data_planner`、`coverage_analyst`、`issue_triager`、`report_writer`、`version_steward`）不变。
+- 白名单是**并集**：各 profile 的 P1–P4 工具保持；上表只列 P5 追加项。其余 profile（`clarification_host`、`requirement_curator`、`design_critic`、`data_planner`、`coverage_analyst`、`issue_triager`、`report_writer`、`version_steward`）不变。
 - `sut.page_propose` 只允许 Context Scout/Case Author 类 profile；P5 seed 只在 `context_scout` 启用（`case_author` 的 P5 名单不含它）。`execution.visual_assert` 只允许 `case_executor`（按 case_run scope）。
 - P5 不新增 codeintel 写工具；AI 不能确认页面/API 提议（确认/驳回 admin-only，§8.3）。
 

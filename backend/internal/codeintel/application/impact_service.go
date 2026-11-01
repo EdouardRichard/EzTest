@@ -465,8 +465,7 @@ func (s *ImpactService) Union(ctx context.Context, versionID int64) ([]ImpactCan
 		sutIDs := versionSUTIDsForRepo(bindings, repoID)
 		for _, candidate := range candidates {
 			key := candidateSubjectKey(candidate.SubjectKind, candidate.SubjectID)
-			merged.add(candidate.SubjectKind, candidate.SubjectID, candidate.Source, candidate.Confidence,
-				candidate.Reason, decodeEvidence(candidate.Evidence))
+			merged.addCandidate(candidate)
 			if _, ok := repoBySubject[key]; !ok {
 				repoBySubject[key] = repoID
 				sutsBySubject[key] = sutIDs
@@ -523,6 +522,9 @@ type candidateEntry struct {
 	confidence codeintel.Confidence
 	reasons    []string
 	evidence   []map[string]any
+	// meta preserves the persisted candidate row (id/analysis/timestamps/
+	// selection) of the highest-priority source so union views stay PATCHable.
+	meta codeintel.ImpactCandidate
 }
 
 func newCandidateMerge() *candidateMerge {
@@ -534,6 +536,19 @@ func candidateSubjectKey(kind codeintel.SubjectKind, id int64) string {
 }
 
 func (m *candidateMerge) add(kind codeintel.SubjectKind, id int64, source codeintel.CandidateSource, confidence codeintel.Confidence, reason string, evidence []map[string]any) {
+	m.addEntry(codeintel.ImpactCandidate{
+		SubjectKind: kind, SubjectID: id, Source: source, Confidence: confidence,
+		Reason: reason, Evidence: mustJSON(evidence),
+	}, evidence)
+}
+
+func (m *candidateMerge) addCandidate(candidate codeintel.ImpactCandidate) {
+	m.addEntry(candidate, decodeEvidence(candidate.Evidence))
+}
+
+func (m *candidateMerge) addEntry(candidate codeintel.ImpactCandidate, evidence []map[string]any) {
+	kind, id := candidate.SubjectKind, candidate.SubjectID
+	source, confidence, reason := candidate.Source, candidate.Confidence, candidate.Reason
 	if !kind.Valid() || id <= 0 {
 		return
 	}
@@ -543,11 +558,12 @@ func (m *candidateMerge) add(kind codeintel.SubjectKind, id int64, source codein
 	key := candidateSubjectKey(kind, id)
 	entry, ok := m.entries[key]
 	if !ok {
-		entry = &candidateEntry{kind: kind, id: id, source: source, confidence: confidence}
+		entry = &candidateEntry{kind: kind, id: id, source: source, confidence: confidence, meta: candidate}
 		m.entries[key] = entry
 	} else {
 		if candidateSourceRank(source) < candidateSourceRank(entry.source) {
 			entry.source = source
+			entry.meta = candidate
 		}
 		if confidenceRank(confidence) > confidenceRank(entry.confidence) {
 			entry.confidence = confidence
@@ -585,15 +601,17 @@ func (m *candidateMerge) candidates() []codeintel.ImpactCandidate {
 		if evidence == nil {
 			evidence = []map[string]any{}
 		}
-		result = append(result, codeintel.ImpactCandidate{
-			SubjectKind: entry.kind,
-			SubjectID:   entry.id,
-			Reason:      reason,
-			Confidence:  entry.confidence,
-			Source:      entry.source,
-			Evidence:    mustJSON(evidence),
-			Selected:    entry.confidence != codeintel.ConfidenceLow,
-		})
+		candidate := entry.meta
+		candidate.SubjectKind = entry.kind
+		candidate.SubjectID = entry.id
+		candidate.Reason = reason
+		candidate.Confidence = entry.confidence
+		candidate.Source = entry.source
+		candidate.Evidence = mustJSON(evidence)
+		if candidate.ID <= 0 {
+			candidate.Selected = entry.confidence != codeintel.ConfidenceLow
+		}
+		result = append(result, candidate)
 	}
 	return sortCandidates(result)
 }

@@ -53,11 +53,17 @@ func WithAnalysis(analysis AnalysisServicePort) Option {
 	return func(handler *Handler) { handler.analysis = analysis }
 }
 
+// WithImpact enriches the analysis-detail route with persisted candidates.
+func WithImpact(impact ImpactServicePort) Option {
+	return func(handler *Handler) { handler.impact = impact }
+}
+
 // Handler serves the P5 code routes. The server mounts it behind RequireAuth.
 type Handler struct {
 	index    IndexServicePort
 	query    QueryServicePort
 	analysis AnalysisServicePort
+	impact   ImpactServicePort
 }
 
 // New builds the codeintel HTTP handler.

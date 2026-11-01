@@ -1,6 +1,9 @@
 package execution
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // Verdict reasons written to case_run.summary.verdict_reason. They are stable
 // strings: P4 and the UI display them.
@@ -111,7 +114,7 @@ func Aggregate(in VerdictInput) (CaseRunStatus, FailureClass, CaseRunSummary, er
 		}
 	}
 
-	if blockedStep != nil {
+	if blockedStep != nil && !isVisualBlockedStep(blockedStep.Error) {
 		summary.VerdictReason = VerdictReasonBlocked
 		return CaseRunBlocked, FailureClassBlocked, summary, nil
 	}
@@ -142,6 +145,14 @@ func Aggregate(in VerdictInput) (CaseRunStatus, FailureClass, CaseRunSummary, er
 			return CaseRunInconclusive, FailureClassEnvironment, summary, nil
 		}
 		return CaseRunInconclusive, "", summary, nil
+	}
+
+	// A visual-tagged blocked step whose visual result is not inconclusive still
+	// wins over a missing visual result; otherwise the visualBlock branch above
+	// already returned. This keeps genuine blocked prerequisites blocking.
+	if blockedStep != nil {
+		summary.VerdictReason = VerdictReasonBlocked
+		return CaseRunBlocked, FailureClassBlocked, summary, nil
 	}
 
 	// A blocked candidate with no executed result is a genuine pre-execution
@@ -304,6 +315,15 @@ func visualResultBlock(result AssertionResult, ok bool) (string, bool, bool) {
 		reason = VerdictReasonVisualAssertionNotRun
 	}
 	return reason, reason == "visual_environment_mismatch", true
+}
+
+// isVisualBlockedStep reports whether a blocked step's error is owned by the
+// visual assertion path. The Case Executor may mark the step blocked after
+// execution.visual_assert returns inconclusive; the visual result must drive
+// the case verdict (inconclusive), not the generic blocked fallback.
+func isVisualBlockedStep(message string) bool {
+	message = strings.TrimSpace(message)
+	return message == "missing_visual_baseline" || strings.HasPrefix(message, "visual_")
 }
 
 func hasObservedStep(steps []StepResult) bool {

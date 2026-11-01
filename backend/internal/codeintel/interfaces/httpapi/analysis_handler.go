@@ -120,6 +120,15 @@ func (h *Handler) GetAnalysis(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, platform.NotFound("code analysis"))
 		return
 	}
+	if h.impact != nil {
+		detailed, views, detailErr := h.impact.Detail(r.Context(), analysisID)
+		if detailErr != nil {
+			writeError(w, r, detailErr)
+			return
+		}
+		httpx.JSON(w, http.StatusOK, toAnalysisDetailDTOWithCandidates(detailed, views))
+		return
+	}
 	httpx.JSON(w, http.StatusOK, toAnalysisDetailDTO(analysis))
 }
 

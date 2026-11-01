@@ -37,6 +37,11 @@ var p5ProfileTools = map[string][]string{
 	ProfileKeyDesignPlanner: {
 		tools.ToolCodeImpact,
 	},
+	ProfileKeyDesignHost: {
+		tools.ToolCodeFacts,
+		tools.ToolCodeRoutes,
+		tools.ToolCodeAPIs,
+	},
 	ProfileKeyCaseExecutor: {
 		tools.ToolExecutionVisualAssert,
 	},

@@ -500,6 +500,9 @@ func TestImpactUnionMultiRepo(t *testing.T) {
 	if merged.RepoID != 10 {
 		t.Fatalf("union repo = %d", merged.RepoID)
 	}
+	if merged.ID <= 0 || merged.AnalysisID <= 0 {
+		t.Fatalf("union must preserve persisted candidate ids: %+v", merged)
+	}
 	page, ok := findView(union, codeintel.SubjectSUTPage, 500)
 	if !ok || page.RepoID != 10 {
 		t.Fatalf("union page = %+v", page)
