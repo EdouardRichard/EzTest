@@ -1882,6 +1882,16 @@ try {
     $oldRunCID = Invoke-PsqlScalar -DatabaseName $testDatabase -SqlText ("SELECT id FROM case_run WHERE case_version_id = {0} ORDER BY id LIMIT 1;" -f $script:caseVersionIDs["C"])
     $oldRunCBefore = (Get-CaseRun -CaseRunID ([string]$oldRunCID.Trim())).case_run
     $oldEvidenceCount = (Get-Array (Get-CaseRun -CaseRunID ([string]$oldRunCBefore.id)).evidence).Count
+    # P4 branch: the real Version Steward may already have closed R3, which
+    # legitimately rejects a new intent. Reopen that requirement through the P4
+    # API so the P3 retest scenario stays meaningful; P3-only runs skip this.
+    $r3Status = (Invoke-PsqlScalar -DatabaseName $testDatabase -SqlText ("SELECT status FROM requirement WHERE id = {0};" -f $script:requirementIDs["R3"])).Trim()
+    if ($r3Status -eq "closed") {
+        Step "reopen R3 through the P4 API so the P3 retest scenario can create a new intent"
+        $reopenR3 = Invoke-Api -Method "POST" -Path ("/api/versions/{0}/requirements/{1}/reopen" -f $script:versionID, $script:requirementIDs["R3"]) -Token $script:token -Body @{ reason = "P3 regression: reopen requirement for retest scenario" }
+        Assert-Status $reopenR3 @(200) "POST requirement reopen before retest"
+        Assert-Equal $reopenR3.Json.data.status "draft" "reopened requirement status"
+    }
     $retestResponse = Invoke-Api -Method "POST" -Path "/api/versions/$script:versionID/execution/intents" -Token $script:token -Body @{
         case_version_id = $script:caseVersionIDs["C"]; purpose = "retest"
     }
