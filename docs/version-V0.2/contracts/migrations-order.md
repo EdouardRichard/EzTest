@@ -231,7 +231,31 @@ agent_0004_code_team.sql
 - 集成测试断言 31 个迁移、11 张 P5 表、二次执行 no-op（`schema_migrations` 不变）；`migrate_test.go` 的 `wantTail` 固定为上述 7 个文件。
 - 开发库/演示库照常启动前滚；回滚仍为恢复备份，不提供 down SQL。
 
-## 8. 回滚 / 备份 / 数据库边界
+## 8. P6 增量迁移（`frozen: P6`，2026-11-01）
+
+P0/P1/P2/P3/P4/P5 的 31 个迁移保持原样；P6 在 `order.txt` 末尾追加 2 个文件（第 32–33 个）：
+
+| 序号 | 迁移文件 | 上下文（ownership） | 创建/变更 |
+|---|---|---|---|
+| 32 | `quality_0001_eval.sql` | quality | 创建 `eval_run`、`eval_metric` |
+| 33 | `agent_0005_profile_prompt_revision.sql` | agent | 创建 `agent_profile_prompt_revision`（append-only 提示词版本） |
+
+`order.txt` 末尾追加：
+
+```text
+quality_0001_eval.sql
+agent_0005_profile_prompt_revision.sql
+```
+
+- 2 个迁移只追加、不改历史文件；固定顺序 32→33（`#32` → `#33`）。`quality_0001` 只建同上下文两张表（`eval_metric.run_id → eval_run.id` 同上下文 FK，`ON DELETE CASCADE`）；`agent_0005` 依赖 P1 的 `agent_profile(key)`（同上下文 FK，`ON DELETE CASCADE`）。
+- **P6 新表共 3 张**：quality 2（`eval_run`、`eval_metric`）+ agent 1（`agent_profile_prompt_revision`）；**不新增其他表**，P6 不对既有表做 ALTER/列变更，也不改 P0–P5 迁移的 checksum。
+- 主键/约束/索引命名：`pk_eval_run`、`pk_eval_metric`、`fk_eval_metric_run`、`idx_eval_run_created_at`、`idx_eval_metric_run`、`pk_agent_profile_prompt_revision`、`uk_agent_profile_prompt_revision`、`idx_agent_profile_prompt_revision_key`。
+- 3 张新表均雪花 `BIGINT` 主键（应用生成）、`TIMESTAMPTZ`（API 为 RFC3339 UTC）；`eval_metric` 主键 `(run_id, name)`；`agent_profile_prompt_revision` 唯一键 `(profile_key, version)`，历史只追加。
+- P6 不新增跨上下文 FK；`actor_id` 为 identity 逻辑引用；quality 不直读他域表；agent prompt 版本不新增 `agent_profile.current_prompt_id`/`prompt_version` 列。
+- 集成测试断言 **33** 个迁移、3 张 P6 表、**二次执行 no-op**（`schema_migrations` 不变）；`migrate_test.go` 的 `wantTail` 固定为上述 2 个文件、迁移计数 31→33。
+- 开发库/演示库照常启动前滚；回滚仍为恢复备份，不提供 down SQL。
+
+## 9. 回滚 / 备份 / 数据库边界
 
 - P0 **只支持前滚**：没有 down migration，也不提供自动回滚。
 - 部署/验收前必须备份目标库（`pg_dump` / 环境快照）；恢复方式是恢复备份，而不是执行 down SQL。
@@ -240,7 +264,7 @@ agent_0004_code_team.sql
 - 多实例同时启动时，advisory lock 使只有一个实例执行迁移，其余等待后看到已完成状态并跳过。
 - 迁移失败时进程必须**拒绝启动 HTTP**（不得带着半迁移 schema 提供服务）。
 
-## 9. 冻结与变更控制
+## 10. 冻结与变更控制
 
 - 本文件在 P0 冻结；P1+ 只能**追加**文件与 `order.txt` 行，并在本文件新增说明。
 - 破坏性变更（改列、改约束、改语义）必须先停止、说明影响面、更新 contracts + 决策记录 + 调用方/测试，再实施。
