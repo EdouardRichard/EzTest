@@ -177,7 +177,7 @@ func TestP7RenderQueueDrainGate(t *testing.T) {
 	if _, _, err := (renderQueueAdapter{}).ClaimForTypes(ctx, "render-worker", nil, time.Second); err == nil {
 		t.Fatal("nil work queue returned no error")
 	}
-	if err := (renderQueueAdapter{}).Heartbeat(ctx, 1, 1); err == nil {
+	if err := (renderQueueAdapter{}).Heartbeat(ctx, 1, 1, time.Second); err == nil {
 		t.Fatal("nil work queue heartbeat returned no error")
 	}
 }

@@ -6,6 +6,8 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -378,14 +380,15 @@ func (h *recordedHandler) Handle(_ context.Context, item WorkItem) error {
 	return h.err
 }
 
-func testWorker(queue *fakeWorkQueue, handlers map[string]Handler) *Worker {
-	return NewWorker(queue, handlers,
+func testWorker(queue *fakeWorkQueue, handlers map[string]Handler, options ...WorkerOption) *Worker {
+	base := []WorkerOption{
 		WithWorkerInstanceID("codeintel-test"),
-		WithWorkerPollInterval(5*time.Millisecond),
-		WithWorkerHeartbeatInterval(5*time.Millisecond),
-		WithWorkerRecoveryInterval(5*time.Millisecond),
+		WithWorkerPollInterval(5 * time.Millisecond),
+		WithWorkerHeartbeatInterval(5 * time.Millisecond),
+		WithWorkerRecoveryInterval(5 * time.Millisecond),
 		WithWorkerConcurrency(2),
-	)
+	}
+	return NewWorker(queue, handlers, append(base, options...)...)
 }
 
 func TestWorkerClaimsOnlyCodeTeam(t *testing.T) {
@@ -453,6 +456,82 @@ func TestWorkerHeartbeatRenewsTrackedLeases(t *testing.T) {
 	if len(queue.renewed) != 1 || queue.renewed[0] != (renewCall{id: 21, epoch: 7}) {
 		t.Fatalf("renew calls = %+v", queue.renewed)
 	}
+}
+
+// TestWorkerDrainGateStopsClaims pins P7 §4.5 for the codeintel worker: a
+// draining replica never claims new code-team items (in-flight keeps running).
+func TestWorkerDrainGateStopsClaims(t *testing.T) {
+	queue := &fakeWorkQueue{items: []WorkItem{{ID: 31, Type: "index.repo", LeaseEpoch: 2}}}
+	handler := &recordedHandler{}
+	draining := true
+	worker := testWorker(queue, map[string]Handler{"index.repo": handler},
+		WithWorkerDrainGate(func() bool { return draining }))
+	var inflight sync.WaitGroup
+	sem := make(chan struct{}, 1)
+
+	worker.drain(context.Background(), sem, &inflight)
+	inflight.Wait()
+	if len(queue.claims) != 0 {
+		t.Fatalf("claims while draining = %+v, want none", queue.claims)
+	}
+
+	draining = false
+	worker.drain(context.Background(), sem, &inflight)
+	inflight.Wait()
+	if len(queue.claims) != 1 || len(handler.calls) != 1 || handler.calls[0].ID != 31 {
+		t.Fatalf("claims after drain cleared = %+v handler=%+v", queue.claims, handler.calls)
+	}
+}
+
+// TestWorkerDrainGateStopsRunClaims proves the same gate through the public Run
+// loop: a replica that starts draining stops claiming even with queued work.
+func TestWorkerDrainGateStopsRunClaims(t *testing.T) {
+	queue := &fakeWorkQueue{items: []WorkItem{
+		{ID: 41, Type: "index.repo", LeaseEpoch: 1},
+		{ID: 42, Type: "index.repo", LeaseEpoch: 1},
+	}}
+	started := make(chan int64, 4)
+	handler := &signalingHandler{started: started}
+	var draining atomic.Bool
+	worker := NewWorker(queue, map[string]Handler{"index.repo": handler},
+		WithWorkerInstanceID("codeintel-drain-test"),
+		WithWorkerPollInterval(2*time.Millisecond),
+		WithWorkerHeartbeatInterval(time.Hour),
+		WithWorkerRecoveryInterval(time.Hour),
+		WithWorkerConcurrency(1),
+		WithWorkerDrainGate(draining.Load),
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- worker.Run(ctx) }()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("worker never claimed its first item")
+	}
+	draining.Store(true)
+	time.Sleep(40 * time.Millisecond)
+	cancel()
+	<-done
+	// The worker has stopped, so the fake queue is no longer mutated.
+	if len(queue.claims) != 1 {
+		t.Fatalf("claims after drain = %d, want only the first (in-flight) claim", len(queue.claims))
+	}
+}
+
+// signalingHandler reports each handled item without racing the worker.
+type signalingHandler struct {
+	started chan int64
+}
+
+func (h *signalingHandler) Handle(_ context.Context, item WorkItem) error {
+	select {
+	case h.started <- item.ID:
+	default:
+	}
+	return nil
 }
 
 func TestWorkerRunStopsOnContextCancel(t *testing.T) {

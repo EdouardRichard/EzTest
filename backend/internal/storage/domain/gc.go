@@ -169,12 +169,16 @@ func (c GCCandidate) Validate() error {
 }
 
 // GCRun is one gc_run row. Report is the JSONB candidate/deletion report.
+// LeaseOwner/LeaseUntil fence a running pass: a crashed pass is reclaimed once
+// lease_until passes, so the single-running index can never wedge GC for ever.
 type GCRun struct {
 	ID             int64
 	Mode           GCMode
 	Status         GCRunStatus
 	ActorID        *int64
 	ActorKind      GCActorKind
+	LeaseOwner     string
+	LeaseUntil     *time.Time
 	StartedAt      time.Time
 	FinishedAt     *time.Time
 	ScannedObjects int

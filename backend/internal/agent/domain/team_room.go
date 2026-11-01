@@ -13,7 +13,8 @@ import (
 // Team is the version-scoped collaboration channel.
 type Team string
 
-// P1 team enum; code is the P5 codeintel worker team (no team room/digest).
+// P1 team enum; code is the P5 codeintel worker team and ops is the P7
+// deterministic worker team (both have no team room/digest).
 const (
 	TeamClarification Team = "clarification"
 	TeamDesign        Team = "design"
@@ -21,12 +22,13 @@ const (
 	TeamDelivery      Team = "delivery"
 	TeamSteward       Team = "steward"
 	TeamCode          Team = "code"
+	TeamOps           Team = "ops"
 )
 
 // Valid reports whether the team is part of the frozen enum.
 func (t Team) Valid() bool {
 	switch t {
-	case TeamClarification, TeamDesign, TeamExecution, TeamDelivery, TeamSteward, TeamCode:
+	case TeamClarification, TeamDesign, TeamExecution, TeamDelivery, TeamSteward, TeamCode, TeamOps:
 		return true
 	default:
 		return false
@@ -37,7 +39,7 @@ func (t Team) Valid() bool {
 func ParseTeam(raw string) (Team, error) {
 	team := Team(strings.TrimSpace(raw))
 	if !team.Valid() {
-		return "", platform.Invalid("team", "must be one of clarification, design, execution, delivery, steward, code")
+		return "", platform.Invalid("team", "must be one of clarification, design, execution, delivery, steward, code, ops")
 	}
 	return team, nil
 }
@@ -108,7 +110,7 @@ func (p TeamRoomPost) Validate() error {
 		return platform.Invalid("version_id", "must be a positive decimal ID")
 	}
 	if !p.Team.Valid() {
-		return platform.Invalid("team", "must be one of clarification, design, execution, delivery, steward, code")
+		return platform.Invalid("team", "must be one of clarification, design, execution, delivery, steward, code, ops")
 	}
 	if !p.Kind.Valid() {
 		return platform.Invalid("kind", "must be one of finding, decision, blocker, handoff, status")
@@ -142,7 +144,7 @@ func (d TeamRoomDigest) Validate() error {
 		return platform.Invalid("version_id", "must be a positive decimal ID")
 	}
 	if !d.Team.Valid() {
-		return platform.Invalid("team", "must be one of clarification, design, execution, delivery, steward, code")
+		return platform.Invalid("team", "must be one of clarification, design, execution, delivery, steward, code, ops")
 	}
 	if strings.TrimSpace(d.Summary) == "" {
 		return platform.Invalid("summary", "must not be empty")

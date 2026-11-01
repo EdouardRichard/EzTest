@@ -387,6 +387,54 @@ func TestStartRejectsTakenInstanceKey(t *testing.T) {
 	}
 }
 
+// TestStartRetriesFreshIDOnInstanceIDConflict pins the simultaneous-start fix:
+// two replicas that share the bootstrap snowflake generator can mint the same
+// api_instance.id in the same millisecond; Start must allocate a fresh ID for
+// the same node and retry instead of failing the whole registration.
+func TestStartRetriesFreshIDOnInstanceIDConflict(t *testing.T) {
+	h := newHarness()
+	h.repo.used = []int{7}
+	inserts := 0
+	h.repo.insertFn = func(orchestration.Instance) error {
+		inserts++
+		if inserts <= 2 {
+			return orchestration.ErrInstanceIDTaken
+		}
+		return nil
+	}
+	instance := h.start(t)
+
+	if len(h.repo.attempts) != 3 {
+		t.Fatalf("insert attempts = %d, want 3", len(h.repo.attempts))
+	}
+	firstID := h.repo.attempts[0].ID
+	for index, attempt := range h.repo.attempts {
+		if index > 0 && attempt.ID == firstID {
+			t.Fatalf("attempt %d reused the colliding id %d", index, attempt.ID)
+		}
+		if attempt.NodeID != 0 {
+			t.Fatalf("attempt %d moved to node %d, want the same candidate 0", index, attempt.NodeID)
+		}
+	}
+	if instance.ID != h.repo.attempts[2].ID || h.service.InstanceID() != instance.ID {
+		t.Fatalf("instance id = %d, want the third allocated id %d", instance.ID, h.repo.attempts[2].ID)
+	}
+}
+
+// TestStartFailsAfterInstanceIDRetryBudget pins the bounded retry: a persistent
+// api_instance.id conflict becomes a stable 409 instead of an infinite loop.
+func TestStartFailsAfterInstanceIDRetryBudget(t *testing.T) {
+	h := newHarness()
+	h.repo.insertFn = func(orchestration.Instance) error { return orchestration.ErrInstanceIDTaken }
+	_, err := h.service.Start(context.Background(), StartMeta{Hostname: "host-a", PID: 42, APIPort: 8080})
+	if platform.AsError(err).Status != 409 {
+		t.Fatalf("Start error = %v, want 409", err)
+	}
+	if len(h.repo.attempts) != 3 {
+		t.Fatalf("insert attempts = %d, want the bounded 3", len(h.repo.attempts))
+	}
+}
+
 /* ------------------------------- transitions ------------------------------ */
 
 func TestDrainSelfTransitionsToDraining(t *testing.T) {

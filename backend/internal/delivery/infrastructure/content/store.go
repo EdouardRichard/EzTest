@@ -53,6 +53,10 @@ type RefReader interface {
 type ContentService interface {
 	Upload(ctx context.Context, filename, declaredMIME string, r io.Reader, maxBytes int64, actorID int64) (storagedomain.Object, error)
 	AddRef(ctx context.Context, objectID, ownerKind string, ownerID int64, role string) (storagedomain.Ref, error)
+	// ReplaceRef makes objectID the single active ref of (ownerKind, ownerID,
+	// role): a report PDF re-render reuses/replaces its previous ref instead of
+	// leaking a duplicate one.
+	ReplaceRef(ctx context.Context, objectID, ownerKind string, ownerID int64, role string) (storagedomain.Ref, error)
 	Open(ctx context.Context, sha string) (storagedomain.Object, io.ReadCloser, error)
 }
 
@@ -117,7 +121,10 @@ func (s *Store) GetReportHTML(ctx context.Context, contentRefID int64) ([]byte, 
 
 // PutReportPDF uploads the rendered PDF (content-addressed) and records
 // content_ref(owner_kind='report_revision', owner_id=reportRevisionID,
-// role='report_pdf'). The authoritative HTML is untouched.
+// role='report_pdf'). It is idempotent per revision: a re-render (for example
+// after a lease takeover) replaces the revision's existing report_pdf ref
+// instead of appending a duplicate that GC would protect for ever. The
+// authoritative HTML is untouched.
 func (s *Store) PutReportPDF(ctx context.Context, reportRevisionID int64, pdf []byte) (deliveryapp.ReportContentRef, error) {
 	if reportRevisionID <= 0 {
 		return deliveryapp.ReportContentRef{}, platform.Invalid("report_revision_id", "must be a positive decimal ID")
@@ -133,7 +140,7 @@ func (s *Store) PutReportPDF(ctx context.Context, reportRevisionID int64, pdf []
 	if err != nil {
 		return deliveryapp.ReportContentRef{}, err
 	}
-	ref, err := s.storage.AddRef(ctx, object.SHA256, OwnerKindReportRevision, reportRevisionID, RoleReportPDF)
+	ref, err := s.storage.ReplaceRef(ctx, object.SHA256, OwnerKindReportRevision, reportRevisionID, RoleReportPDF)
 	if err != nil {
 		return deliveryapp.ReportContentRef{}, err
 	}

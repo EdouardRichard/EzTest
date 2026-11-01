@@ -11,6 +11,7 @@ import (
 
 	deliveryapp "github.com/EdouardRichard/EzTest/backend/internal/delivery/application"
 	delivery "github.com/EdouardRichard/EzTest/backend/internal/delivery/domain"
+	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -95,7 +96,11 @@ func issueRepoBuildCandidate(t *testing.T, in issueRepoTestCandidate) (delivery.
 func newIssueRepoForTest(t *testing.T) (*IssueRepository, *pgxpool.Pool) {
 	t.Helper()
 	pool := testutil.NewDB(t)
-	return NewIssueRepository(pool), pool
+	ids, err := platformid.NewSnowflake(0)
+	if err != nil {
+		t.Fatalf("snowflake: %v", err)
+	}
+	return NewIssueRepository(pool, ids), pool
 }
 
 // issueRepoCreateCandidate creates one candidate and fails the test when the

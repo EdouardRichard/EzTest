@@ -17,11 +17,23 @@ import (
 const (
 	// RenderTaskType is the frozen P7 work item type of one PDF render.
 	RenderTaskType = "report.render_pdf"
-	// RenderTaskTeam is the owning team of a PDF render work item.
-	RenderTaskTeam = "delivery"
+	// RenderTaskTeam is the owning team of a PDF render work item. It is a
+	// deterministic ops task, not an agent-model delivery task: the generic agent
+	// worker claims only the five product teams, so "ops" keeps the job safe for
+	// the dedicated RenderWorker (which claims by type).
+	RenderTaskTeam = "ops"
 
 	// DefaultRenderLease is used when report.render_lease_seconds is missing.
 	DefaultRenderLease = 120 * time.Second
+	// MinRenderLease/MaxRenderLease mirror the settings catalog bounds. A
+	// corrupted settings row outside this range falls back to the default so a
+	// heartbeat can never be scheduled at/after the lease expiry.
+	MinRenderLease = 30 * time.Second
+	MaxRenderLease = 1800 * time.Second
+	// RenderHeartbeatFloor is the minimum heartbeat cadence. With the 30s lease
+	// floor, lease/3 (>=10s) is always above it, so every configured lease keeps
+	// at least two renewals before expiry.
+	RenderHeartbeatFloor = 5 * time.Second
 	// DefaultRenderMaxAttempts is used when report.render_max_attempts is
 	// missing or unreadable.
 	DefaultRenderMaxAttempts = 3
@@ -63,7 +75,11 @@ type RenderJob struct {
 // uses a specialized claim (ClaimForTypes) so it never steals P1-P4 agent work.
 type RenderQueue interface {
 	ClaimForTypes(ctx context.Context, claimant string, types []string, lease time.Duration) (RenderJob, bool, error)
-	Heartbeat(ctx context.Context, jobID, epoch int64) error
+	// Heartbeat renews the lease of a claimed job. lease must be the same
+	// duration the job was claimed with (report.render_lease_seconds), never the
+	// agent queue default: renewing shorter than the claim creates a lease gap
+	// in which another replica can re-claim and re-render the revision.
+	Heartbeat(ctx context.Context, jobID, epoch int64, lease time.Duration) error
 	Complete(ctx context.Context, jobID, epoch int64) error
 	Fail(ctx context.Context, jobID, epoch int64, cause error, retryable bool) error
 }
@@ -103,17 +119,22 @@ type SettingsReader interface {
 // touched here (spec §5 #36).
 type RenderJobRepository interface {
 	// ListRenderableRevisions returns published+rendered revisions whose PDF is
-	// pending or failed and still has no pdf_ref, oldest revision first. The
-	// caller applies the report.render_max_attempts bound.
-	ListRenderableRevisions(ctx context.Context, limit int) ([]delivery.RenderableRevision, error)
+	// pending or failed with attempts left, and still has no pdf_ref, oldest
+	// revision first. maxAttempts is the report.render_max_attempts bound: failed
+	// revisions at or above it are excluded in SQL so they can never consume the
+	// bounded page and starve newer work.
+	ListRenderableRevisions(ctx context.Context, limit, maxAttempts int) ([]delivery.RenderableRevision, error)
 	// MarkPDFRunning moves pending/failed -> running and increments
 	// pdf_attempts. Anything else is a state conflict.
 	MarkPDFRunning(ctx context.Context, revisionID int64) error
 	// MarkPDFRendered moves running -> done with the ledger ref and timestamp;
-	// it is fenced on the running state and an empty pdf_ref.
-	MarkPDFRendered(ctx context.Context, revisionID int64, ref ReportContentRef, at time.Time) error
+	// it is fenced on the running state, an empty pdf_ref and an attempt no
+	// older than the current pdf_attempts, so a stale worker cannot settle a
+	// newer attempt.
+	MarkPDFRendered(ctx context.Context, revisionID int64, ref ReportContentRef, attempts int32, at time.Time) error
 	// MarkPDFFailed moves pending/failed/running -> failed with the bounded
-	// error message. A done revision is untouched (state conflict).
+	// error message. It is fenced on the worker's attempt (the current
+	// pdf_attempts must not be newer) and a done revision is untouched.
 	MarkPDFFailed(ctx context.Context, revisionID int64, message string, attempts int32, at time.Time) error
 	// MarkPDFDisabled moves a pending revision to disabled (report.render_pdf
 	// is off). It is idempotent for an already-disabled revision.
@@ -140,7 +161,8 @@ func renderMaxAttempts(ctx context.Context, settings SettingsReader) int {
 	return int(value)
 }
 
-// renderLease resolves report.render_lease_seconds with the frozen default.
+// renderLease resolves report.render_lease_seconds with the frozen default and
+// clamps it to the settings catalog bounds.
 func renderLease(ctx context.Context, settings SettingsReader) time.Duration {
 	if settings == nil {
 		return DefaultRenderLease
@@ -149,7 +171,25 @@ func renderLease(ctx context.Context, settings SettingsReader) time.Duration {
 	if err != nil || value <= 0 {
 		return DefaultRenderLease
 	}
-	return time.Duration(value) * time.Second
+	lease := time.Duration(value) * time.Second
+	if lease < MinRenderLease {
+		return MinRenderLease
+	}
+	if lease > MaxRenderLease {
+		return MaxRenderLease
+	}
+	return lease
+}
+
+// renderHeartbeatInterval is the renewal cadence for one lease: lease/3 with a
+// 5s floor. Callers pass the same lease they claimed the job with, so every
+// renewal happens well before the previous lease expires.
+func renderHeartbeatInterval(lease time.Duration) time.Duration {
+	interval := lease / 3
+	if interval < RenderHeartbeatFloor {
+		interval = RenderHeartbeatFloor
+	}
+	return interval
 }
 
 // renderPDFEnabled resolves report.render_pdf; an unreadable setting keeps the

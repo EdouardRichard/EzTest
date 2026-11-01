@@ -281,6 +281,72 @@ func TestHeartbeatRefreshesAndStaleScanMarksOfflineOnce(t *testing.T) {
 	}
 }
 
+// TestDrainingStaleInstanceGoesOfflineAndReleasesNode pins the P7 node-leak fix:
+// a replica that was draining when it crashed must be marked offline by the
+// stale scan (not skipped as active-only), and its node ID must be reclaimable
+// by the next registration.
+func TestDrainingStaleInstanceGoesOfflineAndReleasesNode(t *testing.T) {
+	pool := testutil.NewDB(t)
+	repo := orchestrationpg.New(pool)
+	ids, err := platformid.NewSnowflake(15)
+	if err != nil {
+		t.Fatalf("NewSnowflake: %v", err)
+	}
+	settings := &fakeSettings{heartbeat: 10, offline: 5, node: 4}
+	events := &recordingPublisher{}
+	ctx := context.Background()
+
+	deadService := newOrchestrationService(repo, settings, events, ids)
+	drained, err := deadService.Start(ctx, startMeta("host-crashed-drain", 501, 22080))
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if drained.NodeID != 4 {
+		t.Fatalf("node_id = %d, want preferred 4", drained.NodeID)
+	}
+	// Stop the heartbeat loop, then simulate a crash while draining: the row
+	// stays 'draining' with a stale heartbeat and no graceful Stop.
+	if err := deadService.Stop(ctx); err != nil {
+		t.Fatalf("Stop heartbeat: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE api_instance
+		SET status = 'draining', stopped_at = NULL, draining_at = now(),
+		    heartbeat_at = now() - interval '10 seconds'
+		WHERE id = $1
+	`, drained.ID); err != nil {
+		t.Fatalf("simulate crashed draining row: %v", err)
+	}
+
+	stale, err := deadService.MarkOfflineStale(ctx)
+	if err != nil {
+		t.Fatalf("MarkOfflineStale: %v", err)
+	}
+	if len(stale) != 1 || stale[0].ID != drained.ID || stale[0].Status != domain.StatusOffline {
+		t.Fatalf("stale = %#v, want the draining instance marked offline", stale)
+	}
+	if got := events.ofType(orchestrationapp.EventOffline); len(got) != 1 {
+		t.Fatalf("offline events = %d, want 1", len(got))
+	}
+
+	// The offline row's node is now reclaimable by the next replica, and the
+	// stale row is deleted (the same reclaim contract as a graceful Stop).
+	nextService := newOrchestrationService(repo, settings, events, ids)
+	replacement, err := nextService.Start(ctx, startMeta("host-replacement", 502, 22081))
+	if err != nil {
+		t.Fatalf("replacement Start: %v", err)
+	}
+	if replacement.NodeID != 4 {
+		t.Fatalf("replacement node_id = %d, want reclaimed 4", replacement.NodeID)
+	}
+	if _, err := repo.Get(ctx, drained.ID); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("offline row after reclaim error = %v, want ErrNotFound", err)
+	}
+	if err := nextService.Stop(ctx); err != nil {
+		t.Fatalf("Stop replacement: %v", err)
+	}
+}
+
 func TestDrainActivateAndReadinessPersistThroughRepository(t *testing.T) {
 	pool := testutil.NewDB(t)
 	repo := orchestrationpg.New(pool)

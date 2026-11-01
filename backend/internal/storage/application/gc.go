@@ -33,6 +33,8 @@ const (
 	DefaultGCRunLimit              = 20
 	MaxGCRunLimit                  = 100
 	gcReportErrorLimit             = 20
+	// gcFinishTimeout bounds the detached terminal-state write.
+	gcFinishTimeout = 10 * time.Second
 )
 
 // Protected reasons recorded in the GC report.
@@ -209,13 +211,18 @@ func (s *GCService) Run(ctx context.Context, mode storage.GCMode, actorID int64)
 	}
 
 	now := s.clock.Now().UTC()
+	leaseUntil := now.Add(GCLease)
 	run := storage.GCRun{
 		ID:        s.ids.Next(),
 		Mode:      mode,
 		Status:    storage.GCRunRunning,
 		ActorKind: storage.GCActorSystem,
 		StartedAt: now,
-		Report:    json.RawMessage(`{}`),
+		// GCLease fences a running pass: a crashed pass leaves this lease
+		// behind and the next CreateRun reclaims it after expiry.
+		LeaseOwner: GCRunLeaseOwner,
+		LeaseUntil: &leaseUntil,
+		Report:     json.RawMessage(`{}`),
 	}
 	if actorID > 0 {
 		actor := actorID
@@ -752,8 +759,13 @@ func (s *GCService) deleteFile(ctx context.Context, root string, candidate gcCan
 	return false
 }
 
-// finish writes the terminal run row, report, audit entry and event.
+// finish writes the terminal run row, report, audit entry and event. The
+// terminal write runs on a detached context with a short timeout: a canceled
+// request or shutdown must not leave a 'running' row behind (it would wedge
+// every later GC until the lease reclaim). The pass error is still returned.
 func (s *GCService) finish(ctx context.Context, run storage.GCRun, report *GCReport, runErr error) (storage.GCRun, error) {
+	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), gcFinishTimeout)
+	defer cancel()
 	finishedAt := s.clock.Now().UTC()
 	report.FinishedAt = &finishedAt
 	if runErr != nil {
@@ -776,10 +788,10 @@ func (s *GCService) finish(ctx context.Context, run storage.GCRun, report *GCRep
 	run.DeletedObjects = report.Deleted.Objects
 	run.DeletedRefs = report.Deleted.Refs
 	run.DeletedBytes = report.Deleted.Bytes
-	if err := s.repo.UpdateRun(ctx, run); err != nil {
+	if err := s.repo.UpdateRun(finishCtx, run); err != nil {
 		return run, fmt.Errorf("finish gc run: %w", err)
 	}
-	s.recordCompletion(ctx, run, report)
+	s.recordCompletion(finishCtx, run, report)
 	return run, runErr
 }
 

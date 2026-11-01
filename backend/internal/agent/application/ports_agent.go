@@ -253,7 +253,9 @@ type WorkerQueue interface {
 	// ClaimForTeams leases the next available item whose team is in teams.
 	ClaimForTeams(ctx context.Context, claimant string, teams []agent.Team) (agent.WorkItem, bool, error)
 	MarkRunning(ctx context.Context, id, epoch int64) error
-	Heartbeat(ctx context.Context, id, epoch int64) error
+	// Heartbeat renews the lease. The caller passes the lease it claimed with;
+	// zero keeps the queue default (the P1 worker always uses the default).
+	Heartbeat(ctx context.Context, id, epoch int64, lease time.Duration) error
 	Complete(ctx context.Context, id, epoch int64) error
 	// MarkWaitingHuman parks a running work item for a human takeover.
 	MarkWaitingHuman(ctx context.Context, id, epoch int64) error

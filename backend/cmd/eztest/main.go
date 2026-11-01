@@ -625,7 +625,7 @@ func main() {
 	executionCoverage := executionCoverageAdapter{requirements: requirementSvc}
 	// The delivery issue repository is created before the P5 contexts because
 	// code anchors validate issue subjects through a read-only adapter.
-	issueRepo := deliverypg.NewIssueRepository(pool)
+	issueRepo := deliverypg.NewIssueRepository(pool, ids)
 
 	// P5 codeintel + visual contexts. Both are constructed here (after the P3
 	// repositories they read, before the P3 case runner that consumes the
@@ -636,6 +636,8 @@ func main() {
 		VersionRepo: versionRepo, Requirements: requirementSvc, Design: designRepo,
 		Issues: issueRepo, Execution: executionRepo, Content: executionContent,
 		Queue: workQueue, Bindings: p5Bindings, InstanceID: instanceID,
+		// P7 §4.5: the codeintel worker stops claiming while this replica drains.
+		DrainGate: p7OrchestrationRuntime.Service.IsDraining,
 	})
 
 	executorURL, _ := settingsSvc.String(ctx, executionapp.SettingExecutorURL)
@@ -791,8 +793,8 @@ func main() {
 	// P4 delivery/chain/steward composition. The composition root is the only
 	// place that knows every context; the cross-context reads go through the
 	// application adapters, never through another context's tables.
-	analysisRepo := deliverypg.NewAnalysisRepository(pool)
-	reportRepo := deliverypg.NewReportRepository(pool)
+	analysisRepo := deliverypg.NewAnalysisRepository(pool, ids)
+	reportRepo := deliverypg.NewReportRepository(pool, ids)
 	closureRepo := versionpg.NewClosureRepository(pool)
 	deliveryContent := deliverycontent.New(storageSvc, deliverypg.NewContentRefReader(pool))
 	templateVersion, err := settingsSvc.String(ctx, "report.template_version")
@@ -985,6 +987,7 @@ func main() {
 	})
 	worker := agentapp.NewWorker(workQueue, runner, settingsSvc, slog.Default(), instanceID,
 		agentapp.WithWorkerEvents(eventSvc),
+		agentapp.WithWorkerDrainGate(p7OrchestrationRuntime.Service.IsDraining),
 		agentapp.WithWorkerRunSink(executionadapters.NewRunSink(executionRunner)))
 	var background sync.WaitGroup
 	background.Add(1)

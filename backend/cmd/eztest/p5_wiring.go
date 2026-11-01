@@ -70,6 +70,9 @@ type p5RuntimeDeps struct {
 	Queue        *agentapp.WorkQueue
 	Bindings     *p5CodeBindings
 	InstanceID   string
+	// DrainGate mirrors this replica's P7 drain state (orchestration
+	// Service.IsDraining); the codeintel worker stops claiming while true.
+	DrainGate func() bool
 }
 
 // p5Runtime is the constructed P5 surface handed to main.
@@ -161,6 +164,7 @@ func newP5Runtime(ctx context.Context, deps p5RuntimeDeps) *p5Runtime {
 		codeintelapp.WithWorkerInstanceID(deps.InstanceID),
 		codeintelapp.WithWorkerLogger(slog.Default()),
 		codeintelapp.WithWorkerConcurrency(concurrency),
+		codeintelapp.WithWorkerDrainGate(deps.DrainGate),
 	)
 
 	codeHandlers := &server.CodeIntelHandlers{
@@ -518,7 +522,8 @@ type p5WorkQueueClient interface {
 	Ensure(ctx context.Context, in agent.NewWorkItem) (agent.WorkItem, bool, error)
 	ClaimForTeams(ctx context.Context, claimant string, teams []agent.Team) (agent.WorkItem, bool, error)
 	MarkRunning(ctx context.Context, id, epoch int64) error
-	Heartbeat(ctx context.Context, id, epoch int64) error
+	// Heartbeat renews the claimed lease; zero selects the queue default.
+	Heartbeat(ctx context.Context, id, epoch int64, lease time.Duration) error
 	Complete(ctx context.Context, id, epoch int64) error
 	Fail(ctx context.Context, id, epoch int64, cause error, retryable bool) error
 	RecoverExpired(ctx context.Context) (int64, error)
@@ -570,9 +575,12 @@ func (q *p5CodeIntelQueue) MarkRunning(ctx context.Context, id, epoch int64) err
 	return q.queue.MarkRunning(ctx, id, epoch)
 }
 
-// Renew maps onto the P1 lease heartbeat; the P1 queue owns the lease length.
+// Renew maps onto the P1 lease heartbeat. The codeintel worker claims with the
+// P1 default lease, so it renews with the same default (0) rather than its
+// heartbeat interval: renewing with the interval would shrink the lease below
+// the claimed length.
 func (q *p5CodeIntelQueue) Renew(ctx context.Context, id, epoch int64, _ time.Duration) error {
-	return q.queue.Heartbeat(ctx, id, epoch)
+	return q.queue.Heartbeat(ctx, id, epoch, 0)
 }
 
 func (q *p5CodeIntelQueue) Complete(ctx context.Context, id, epoch int64) error {

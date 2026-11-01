@@ -20,8 +20,8 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 39 {
-		t.Fatalf("applied %d migrations, want 39: %v", len(applied), applied)
+	if len(applied) != 40 {
+		t.Fatalf("applied %d migrations, want 40: %v", len(applied), applied)
 	}
 
 	again, err := db.Migrate(ctx, pool)
@@ -175,8 +175,8 @@ func TestP3ExecutionTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 39 {
-		t.Fatalf("applied %d migrations, want 39: %v", len(applied), applied)
+	if len(applied) != 40 {
+		t.Fatalf("applied %d migrations, want 40: %v", len(applied), applied)
 	}
 
 	tables := []string{
@@ -316,8 +316,8 @@ func TestP4DeliverySchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if len(applied) != 39 {
-		t.Fatalf("applied %d migrations, want 39: %v", len(applied), applied)
+	if len(applied) != 40 {
+		t.Fatalf("applied %d migrations, want 40: %v", len(applied), applied)
 	}
 	again, err := db.Migrate(ctx, pool)
 	if err != nil {
@@ -662,8 +662,9 @@ func TestP6QualityPromptSchema(t *testing.T) {
 	}
 }
 
-// TestP7P9Schema pins the six P7 migrations (#34-#39): knowledge, GC ledger,
-// report PDF metadata, API instances, SUT family and issue recurrence.
+// TestP7P9Schema pins the seven P7 migrations (#34-#40): knowledge, GC ledger,
+// report PDF metadata, API instances, SUT family, issue recurrence and the
+// deterministic ops work-item team.
 func TestP7P9Schema(t *testing.T) {
 	pool := testutil.NewEmptyDB(t)
 	ctx := context.Background()
@@ -788,6 +789,21 @@ func TestP7P9Schema(t *testing.T) {
 	if definition := defs["uk_gc_run_running"]; !strings.Contains(definition, "UNIQUE INDEX") ||
 		!strings.Contains(definition, "WHERE (status = 'running'::text)") {
 		t.Errorf("uk_gc_run_running is not a partial unique index: %s", definition)
+	}
+
+	// #40: deterministic worker tasks (report.render_pdf) own the ops team so the
+	// generic agent worker (five product teams) can never claim them.
+	var teamCheck string
+	if err := pool.QueryRow(ctx, `
+		SELECT pg_get_constraintdef(oid) FROM pg_constraint
+		WHERE conrelid = 'work_item'::regclass AND conname = 'chk_work_item_team'
+	`).Scan(&teamCheck); err != nil {
+		t.Fatalf("read chk_work_item_team: %v", err)
+	}
+	for _, team := range []string{"clarification", "design", "execution", "delivery", "steward", "code", "ops"} {
+		if !strings.Contains(teamCheck, "'"+team+"'") {
+			t.Errorf("chk_work_item_team does not allow %q: %s", team, teamCheck)
+		}
 	}
 }
 

@@ -291,7 +291,7 @@ func TestWorkQueueClaimForTeams(t *testing.T) {
 		t.Fatalf("repository called for empty teams: %#v", repo.claimTeams)
 	}
 
-	if _, _, err := queue.ClaimForTeams(ctx, "worker-1", []agent.Team{agent.Team("ops")}); err == nil {
+	if _, _, err := queue.ClaimForTeams(ctx, "worker-1", []agent.Team{agent.Team("unknown")}); err == nil {
 		t.Fatal("unknown team accepted")
 	} else {
 		assertAPIError(t, err, 400, "invalid_argument")
@@ -374,7 +374,7 @@ func TestWorkQueueFencingErrorsMapToLeaseLost(t *testing.T) {
 	t.Run("heartbeat", func(t *testing.T) {
 		repo := &fakeWorkItemRepo{renewErr: agent.ErrLeaseLost}
 		queue := newWorkQueue(repo)
-		assertAPIError(t, queue.Heartbeat(ctx, 7, 2), 409, "lease_lost")
+		assertAPIError(t, queue.Heartbeat(ctx, 7, 2, 0), 409, "lease_lost")
 		if len(repo.renewed) != 1 || repo.renewed[0] != [2]int64{7, 2} {
 			t.Fatalf("renewed = %#v", repo.renewed)
 		}

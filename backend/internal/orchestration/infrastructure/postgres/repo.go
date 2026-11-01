@@ -24,6 +24,7 @@ const instanceColumns = `id, instance_key, hostname, pid, api_port, node_id, sta
 const (
 	constraintInstanceKey = "uk_api_instance_instance_key"
 	constraintNodeID      = "uk_api_instance_node_id"
+	constraintInstancePK  = "pk_api_instance"
 )
 
 // Repository persists api_instance rows.
@@ -129,6 +130,8 @@ func classifyInsertError(err error) error {
 			return domain.ErrInstanceKeyTaken
 		case constraintNodeID:
 			return domain.ErrNodeTaken
+		case constraintInstancePK:
+			return domain.ErrInstanceIDTaken
 		}
 	}
 	return fmt.Errorf("insert api_instance: %w", err)
@@ -246,9 +249,14 @@ func (r *Repository) MarkStopped(ctx context.Context, id int64, at time.Time) (b
 	return tag.RowsAffected() > 0, nil
 }
 
-// MarkOfflineStale transitions active rows with a stale heartbeat to offline
-// and returns exactly the rows that changed. Concurrent scans cannot publish a
-// transition twice because the UPDATE only matches status='active'.
+// MarkOfflineStale transitions active AND draining rows with a stale heartbeat
+// to offline and returns exactly the rows that changed. Draining replicas are
+// included because a drained replica that crashes without a graceful Stop would
+// otherwise stay 'draining' for ever: its roster row would be a ghost and its
+// node_id (counted by UsedNodeIDs) could never be reused. Offline is the only
+// state the stale scan may write, so a live process is never reclassified.
+// Concurrent scans cannot publish a transition twice because the UPDATE only
+// matches rows that are still active/draining.
 func (r *Repository) MarkOfflineStale(ctx context.Context, cutoff time.Time) ([]domain.Instance, error) {
 	if r == nil || r.pool == nil {
 		return nil, errors.New("orchestration repository is not configured")
@@ -256,7 +264,7 @@ func (r *Repository) MarkOfflineStale(ctx context.Context, cutoff time.Time) ([]
 	rows, err := r.pool.Query(ctx, `
 		UPDATE api_instance
 		SET status = 'offline', updated_at = now()
-		WHERE status = 'active' AND heartbeat_at < $1
+		WHERE status IN ('active', 'draining') AND heartbeat_at < $1
 		RETURNING `+instanceColumns,
 		cutoff)
 	if err != nil {

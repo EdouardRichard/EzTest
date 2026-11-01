@@ -992,6 +992,67 @@ func TestReportServiceRecordsRendererTemplateVersion(t *testing.T) {
 	}
 }
 
+// TestReportServiceGetReturnsOnlyCurrentRevisionRefs pins P7-E2E-BUG-01: report
+// detail must project the current revision's refs only (deduplicated by
+// kind/ref_id), never the append-only history of every revision.
+func TestReportServiceGetReturnsOnlyCurrentRevisionRefs(t *testing.T) {
+	fixture := newReportFixture(t)
+	report, first := fixture.seedPublishedWaveReport(7, 12, reportTestFingerprint("a"))
+	second := fixture.repo.seedRevision(delivery.ReportRevision{ReportID: report.ID, Revision: 2})
+	third := fixture.repo.seedRevision(delivery.ReportRevision{ReportID: report.ID, Revision: 3})
+	report.CurrentRevisionID = &third.ID
+	fixture.repo.reports[report.ID] = report
+	fixture.repo.refs[report.ID] = []delivery.ReportRef{
+		{ID: 1, ReportID: report.ID, ReportRevisionID: first.ID, Kind: "case_run", RefID: 3001},
+		{ID: 2, ReportID: report.ID, ReportRevisionID: second.ID, Kind: "case_run", RefID: 3001},
+		{ID: 3, ReportID: report.ID, ReportRevisionID: third.ID, Kind: "case_run", RefID: 3001},
+		{ID: 4, ReportID: report.ID, ReportRevisionID: third.ID, Kind: "issue", RefID: 5001},
+		// A duplicate of the same logical ref inside the current revision is
+		// collapsed too (the schema allows append-only duplicates).
+		{ID: 5, ReportID: report.ID, ReportRevisionID: third.ID, Kind: "case_run", RefID: 3001},
+	}
+
+	detail, err := fixture.svc.Get(context.Background(), 7, report.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if len(detail.Refs) != 2 {
+		t.Fatalf("detail refs = %+v, want 2 unique current-revision refs", detail.Refs)
+	}
+	if detail.Refs[0].ID != 3 || detail.Refs[0].Kind != "case_run" ||
+		detail.Refs[1].ID != 4 || detail.Refs[1].Kind != "issue" {
+		t.Fatalf("detail refs = %+v, want current revision refs [3 4]", detail.Refs)
+	}
+	for _, ref := range detail.Refs {
+		if ref.ReportRevisionID != third.ID {
+			t.Fatalf("detail ref %+v is not from the current revision %d", ref, third.ID)
+		}
+	}
+	if len(detail.Revisions) != 3 {
+		t.Fatalf("detail revisions = %d, want the full history (3)", len(detail.Revisions))
+	}
+}
+
+// TestReportServiceGetWithoutCurrentRevisionDedupes covers a draft report (no
+// current revision): the detail falls back to the deduplicated union instead of
+// repeating append-only history rows.
+func TestReportServiceGetWithoutCurrentRevisionDedupes(t *testing.T) {
+	fixture := newReportFixture(t)
+	report, revision := fixture.seedWaveReport(7, 12)
+	second := fixture.repo.seedRevision(delivery.ReportRevision{ReportID: report.ID, Revision: 2})
+	fixture.repo.refs[report.ID] = []delivery.ReportRef{
+		{ID: 1, ReportID: report.ID, ReportRevisionID: revision.ID, Kind: "case_run", RefID: 3001},
+		{ID: 2, ReportID: report.ID, ReportRevisionID: second.ID, Kind: "case_run", RefID: 3001},
+	}
+	detail, err := fixture.svc.Get(context.Background(), 7, report.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if len(detail.Refs) != 1 || detail.Refs[0].Kind != "case_run" || detail.Refs[0].RefID != 3001 {
+		t.Fatalf("detail refs = %+v, want one deduplicated ref", detail.Refs)
+	}
+}
+
 func TestReportServicePublishIsIdempotentForPublishedRevision(t *testing.T) {
 	fixture := newReportFixture(t)
 	fingerprint := reportTestFingerprint("a")

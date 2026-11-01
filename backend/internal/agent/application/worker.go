@@ -78,6 +78,14 @@ func WithWorkerEvents(publisher eventingapp.Publisher) WorkerOption {
 	return func(w *Worker) { w.events = publisher }
 }
 
+// WithWorkerDrainGate injects the replica drain signal. While the gate returns
+// true the worker finishes in-flight runs but claims no new work; nil means the
+// replica never drains. cmd/eztest wires the orchestration service's
+// IsDraining here (P7 §4.5).
+func WithWorkerDrainGate(gate func() bool) WorkerOption {
+	return func(w *Worker) { w.drainGate = gate }
+}
+
 // RunSink observes every finished agent run (result and/or classified error).
 // It is used by P3 to let the execution context finalize the case_run after the
 // run loop ends. Sink failures are logged and never change the work item outcome.
@@ -101,6 +109,7 @@ type Worker struct {
 	instanceID string
 	events     eventingapp.Publisher
 	runSink    RunSink
+	drainGate  func() bool
 
 	pollInterval        time.Duration
 	heartbeatInterval   time.Duration
@@ -191,6 +200,9 @@ func (w *Worker) Run(ctx context.Context) error {
 
 func (w *Worker) claim(ctx context.Context, sem chan struct{}, inflight *sync.WaitGroup) {
 	for {
+		if w.draining() {
+			return
+		}
 		select {
 		case sem <- struct{}{}:
 		default:
@@ -334,6 +346,11 @@ func (w *Worker) recordFailure(item agent.WorkItem, cause error, retryable bool)
 	})
 }
 
+// draining reports the injected P7 drain signal (false when unwired).
+func (w *Worker) draining() bool {
+	return w.drainGate != nil && w.drainGate()
+}
+
 func (w *Worker) track(id int64, entry *workerRun) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -358,7 +375,9 @@ func (w *Worker) heartbeatAll(ctx context.Context) {
 	w.mu.Unlock()
 
 	for id, entry := range entries {
-		if err := w.queue.Heartbeat(ctx, id, entry.epoch); err != nil {
+		// The agent worker claims with the queue default lease, so it renews
+		// with the same default (0 selects it).
+		if err := w.queue.Heartbeat(ctx, id, entry.epoch, 0); err != nil {
 			if IsLeaseLost(err) {
 				entry.lost.Store(true)
 				entry.cancel()

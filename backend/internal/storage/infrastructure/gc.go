@@ -28,20 +28,52 @@ func NewGCRepository(pool *pgxpool.Pool) *GCRepository {
 	return &GCRepository{pool: pool}
 }
 
-// CreateRun inserts one running run. The partial unique index
-// uk_gc_run_running maps to domain.ErrGCRunning so the API can answer 409.
+// CreateRun inserts one running run. Before the insert, inside the same
+// transaction, an expired running row is reclaimed as failed (lease cleared):
+// the previous process is gone, so keeping the uk_gc_run_running index held
+// would wedge every later pass with 409 gc_running for ever. A live run keeps
+// the index and still maps to domain.ErrGCRunning.
 func (r *GCRepository) CreateRun(ctx context.Context, run storage.GCRun) (storage.GCRun, error) {
 	report, err := gcReportJSON(run.Report)
 	if err != nil {
 		return storage.GCRun{}, err
 	}
-	_, err = r.pool.Exec(ctx, `
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return storage.GCRun{}, fmt.Errorf("insert gc run: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Reclaim every stale running row (there can be at most one): lease_until
+	// in the past, or a legacy row that predates lease stamping and is older
+	// than the fixed GCLease window.
+	now := time.Now().UTC()
+	if _, err := tx.Exec(ctx, `
+		UPDATE gc_run
+		SET status = 'failed',
+		    error = 'gc run lease expired (previous process stopped)',
+		    finished_at = $1,
+		    lease_owner = NULL,
+		    lease_until = NULL,
+		    updated_at = $1
+		WHERE status = 'running'
+		  AND (
+		        (lease_until IS NOT NULL AND lease_until < $1)
+		     OR (lease_until IS NULL AND started_at < $2)
+		  )
+	`, now, now.Add(-storageapp.GCLease)); err != nil {
+		return storage.GCRun{}, fmt.Errorf("reclaim stale gc run: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, `
 		INSERT INTO gc_run (
-			id, mode, status, actor_id, actor_kind, started_at, finished_at,
+			id, mode, status, actor_id, actor_kind, lease_owner, lease_until,
+			started_at, finished_at,
 			scanned_objects, scanned_refs, deleted_objects, deleted_refs, deleted_bytes,
 			report, error, created_at, updated_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14,now(),now())
-	`, run.ID, string(run.Mode), string(run.Status), run.ActorID, string(run.ActorKind), run.StartedAt, run.FinishedAt,
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,$16,now(),now())
+	`, run.ID, string(run.Mode), string(run.Status), run.ActorID, string(run.ActorKind),
+		nullableString(run.LeaseOwner), run.LeaseUntil, run.StartedAt, run.FinishedAt,
 		run.ScannedObjects, run.ScannedRefs, run.DeletedObjects, run.DeletedRefs, run.DeletedBytes,
 		report, nullableString(run.Error))
 	if err != nil {
@@ -51,10 +83,13 @@ func (r *GCRepository) CreateRun(ctx context.Context, run storage.GCRun) (storag
 		}
 		return storage.GCRun{}, fmt.Errorf("insert gc run: %w", err)
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return storage.GCRun{}, fmt.Errorf("insert gc run: commit: %w", err)
+	}
 	return run, nil
 }
 
-// UpdateRun persists a run's terminal state and report.
+// UpdateRun persists a run's terminal state and report, clearing its lease.
 func (r *GCRepository) UpdateRun(ctx context.Context, run storage.GCRun) error {
 	report, err := gcReportJSON(run.Report)
 	if err != nil {
@@ -64,7 +99,9 @@ func (r *GCRepository) UpdateRun(ctx context.Context, run storage.GCRun) error {
 		UPDATE gc_run
 		SET status = $2, finished_at = $3, scanned_objects = $4, scanned_refs = $5,
 		    deleted_objects = $6, deleted_refs = $7, deleted_bytes = $8,
-		    report = $9::jsonb, error = $10, updated_at = now()
+		    report = $9::jsonb, error = $10,
+		    lease_owner = NULL, lease_until = NULL,
+		    updated_at = now()
 		WHERE id = $1
 	`, run.ID, string(run.Status), run.FinishedAt, run.ScannedObjects, run.ScannedRefs,
 		run.DeletedObjects, run.DeletedRefs, run.DeletedBytes, report, nullableString(run.Error))

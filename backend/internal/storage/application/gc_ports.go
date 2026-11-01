@@ -27,6 +27,16 @@ const (
 	MaxGCBatchSize                         = 5000
 	DefaultGCInterval                      = 24 * time.Hour
 	MinGCInterval                          = time.Minute
+
+	// GCLease is the fixed lease of one running gc_run (15 minutes). The single
+	// running row is stamped with lease_until=now+GCLease and reclaimed as
+	// failed once it passes, so a crashed pass cannot block every later GC with
+	// 409 gc_running for ever. It is deliberately a constant, not a new settings
+	// key: contracts/db-schema.md §16.2 documents the gc_run lease columns and
+	// this recovery rule. See GCRepository.CreateRun.
+	GCLease = 15 * time.Minute
+	// GCRunLeaseOwner is the lease_owner stamp of a scheduled/API GC pass.
+	GCRunLeaseOwner = "gc"
 )
 
 // GCSettingsReader reads the typed settings a GC pass needs. It is separate
@@ -116,10 +126,14 @@ type SupersededExport struct {
 // scans GC needs. Owner existence is deliberately NOT checked in SQL; the
 // application calls OwnerLookup instead.
 type GCRepository interface {
-	// CreateRun inserts a running run. It returns storage.ErrGCRunning when the
-	// single-running partial unique index is violated.
+	// CreateRun inserts one running run inside a transaction that first reclaims
+	// a stale running row (lease_until < now, or a legacy lease-less row older
+	// than GCLease by started_at): the stale row is marked failed and its lease
+	// cleared. It returns storage.ErrGCRunning only when a live run still holds
+	// the single-running index.
 	CreateRun(ctx context.Context, run storage.GCRun) (storage.GCRun, error)
-	// UpdateRun persists the terminal status/report/counters of a run.
+	// UpdateRun persists the terminal status/report/counters of a run and
+	// clears its lease.
 	UpdateRun(ctx context.Context, run storage.GCRun) error
 	// GetRun returns one run or storage.ErrNotFound.
 	GetRun(ctx context.Context, id int64) (storage.GCRun, error)

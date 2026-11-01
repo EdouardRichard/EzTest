@@ -16,12 +16,13 @@ func TestTeamValidity(t *testing.T) {
 		agent.TeamDelivery,
 		agent.TeamSteward,
 		agent.TeamCode,
+		agent.TeamOps,
 	} {
 		if !team.Valid() {
 			t.Fatalf("team %q should be valid", team)
 		}
 	}
-	if agent.Team("ops").Valid() {
+	if agent.Team("unknown").Valid() {
 		t.Fatal("unknown team must be invalid")
 	}
 	if _, err := agent.ParseTeam("design"); err != nil {
@@ -33,6 +34,13 @@ func TestTeamValidity(t *testing.T) {
 	}
 	if code != agent.TeamCode {
 		t.Fatalf("ParseTeam(code) = %q, want %q", code, agent.TeamCode)
+	}
+	ops, err := agent.ParseTeam("ops")
+	if err != nil {
+		t.Fatalf("ParseTeam(ops): %v", err)
+	}
+	if ops != agent.TeamOps {
+		t.Fatalf("ParseTeam(ops) = %q, want %q", ops, agent.TeamOps)
 	}
 	if _, err := agent.ParseTeam("unknown"); err == nil {
 		t.Fatal("ParseTeam should reject unknown teams")
@@ -48,7 +56,7 @@ func TestParseTeamErrorListsEveryTeam(t *testing.T) {
 	}
 	message := platform.AsError(err).Message
 	for _, team := range []string{
-		"clarification", "design", "execution", "delivery", "steward", "code",
+		"clarification", "design", "execution", "delivery", "steward", "code", "ops",
 	} {
 		if !strings.Contains(message, team) {
 			t.Fatalf("team error %q does not list %q", message, team)

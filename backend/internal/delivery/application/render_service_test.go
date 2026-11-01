@@ -29,6 +29,7 @@ type renderEnsureCall struct {
 type renderRenderedCall struct {
 	RevisionID int64
 	Ref        ReportContentRef
+	Attempts   int32
 	At         time.Time
 }
 
@@ -68,13 +69,28 @@ func newFakeRenderJobs() *fakeRenderJobs {
 	return &fakeRenderJobs{revisions: make(map[int64]delivery.ReportRevision)}
 }
 
-func (f *fakeRenderJobs) ListRenderableRevisions(_ context.Context, limit int) ([]delivery.RenderableRevision, error) {
+func (f *fakeRenderJobs) ListRenderableRevisions(_ context.Context, limit, maxAttempts int) ([]delivery.RenderableRevision, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
-	result := append([]delivery.RenderableRevision(nil), f.renderable...)
+	// Mirror the repository scan: only pending/failed rows whose attempt budget
+	// is not exhausted are renderable (fix 2: exhausted failed rows must not
+	// consume the bounded page).
+	result := make([]delivery.RenderableRevision, 0, len(f.renderable))
+	for _, revision := range f.renderable {
+		switch revision.PDFStatus {
+		case delivery.PDFStatusPending:
+		case delivery.PDFStatusFailed:
+			if maxAttempts > 0 && int(revision.PDFAttempts) >= maxAttempts {
+				continue
+			}
+		default:
+			continue
+		}
+		result = append(result, revision)
+	}
 	if limit > 0 && len(result) > limit {
 		result = result[:limit]
 	}
@@ -91,13 +107,13 @@ func (f *fakeRenderJobs) MarkPDFRunning(_ context.Context, revisionID int64) err
 	return nil
 }
 
-func (f *fakeRenderJobs) MarkPDFRendered(_ context.Context, revisionID int64, ref ReportContentRef, at time.Time) error {
+func (f *fakeRenderJobs) MarkPDFRendered(_ context.Context, revisionID int64, ref ReportContentRef, attempts int32, at time.Time) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.renderedErr != nil {
 		return f.renderedErr
 	}
-	f.renderedCalls = append(f.renderedCalls, renderRenderedCall{RevisionID: revisionID, Ref: ref, At: at})
+	f.renderedCalls = append(f.renderedCalls, renderRenderedCall{RevisionID: revisionID, Ref: ref, Attempts: attempts, At: at})
 	return nil
 }
 
@@ -168,11 +184,12 @@ type fakeRenderQueue struct {
 	claimTypes []string
 	claimLease time.Duration
 
-	heartbeats  int
-	completed   []int64
-	completeErr error
-	failed      []renderFailCall
-	failErr     error
+	heartbeats      int
+	heartbeatLeases []time.Duration
+	completed       []int64
+	completeErr     error
+	failed          []renderFailCall
+	failErr         error
 }
 
 func (q *fakeRenderQueue) ClaimForTypes(_ context.Context, claimant string, types []string, lease time.Duration) (RenderJob, bool, error) {
@@ -189,10 +206,11 @@ func (q *fakeRenderQueue) ClaimForTypes(_ context.Context, claimant string, type
 	return q.job, true, nil
 }
 
-func (q *fakeRenderQueue) Heartbeat(context.Context, int64, int64) error {
+func (q *fakeRenderQueue) Heartbeat(_ context.Context, _ int64, _ int64, lease time.Duration) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.heartbeats++
+	q.heartbeatLeases = append(q.heartbeatLeases, lease)
 	return nil
 }
 
@@ -299,6 +317,17 @@ func renderJob(t *testing.T, id, epoch, versionID int64, revisionID, reportID in
 // ---------------------------------------------------------------------------
 // Ensurer tests
 // ---------------------------------------------------------------------------
+
+func TestRenderTaskContractIsDeterministicOps(t *testing.T) {
+	if RenderTaskType != "report.render_pdf" {
+		t.Fatalf("RenderTaskType = %q", RenderTaskType)
+	}
+	// The generic agent worker claims the five product teams only; deterministic
+	// worker tasks must live outside them so report.render_pdf is never stolen.
+	if RenderTaskTeam != "ops" {
+		t.Fatalf("RenderTaskTeam = %q, want ops", RenderTaskTeam)
+	}
+}
 
 func TestRenderJobEnsurerEnsuresPendingRevisions(t *testing.T) {
 	jobs := newFakeRenderJobs()
@@ -469,7 +498,8 @@ func TestRenderWorkerRendersAndPublishesPDF(t *testing.T) {
 	}
 	rendered := jobs.renderedCalls[0]
 	if rendered.RevisionID != 9001 || rendered.Ref.RefID <= 0 ||
-		rendered.Ref.SHA256 != reportContentSHA(client.pdf) || rendered.Ref.Size != int64(len(client.pdf)) {
+		rendered.Ref.SHA256 != reportContentSHA(client.pdf) || rendered.Ref.Size != int64(len(client.pdf)) ||
+		rendered.Attempts != 1 {
 		t.Fatalf("MarkPDFRendered args = %+v", rendered)
 	}
 	if !rendered.At.Equal(time.Date(2026, 11, 2, 1, 2, 3, 0, time.UTC)) {
@@ -521,6 +551,33 @@ func TestRenderWorkerRetriesWhenRendererIsUnavailable(t *testing.T) {
 	}
 	if events.count("report.pdf_ready") != 0 || events.count("report.pdf_failed") != 0 || len(audit.calls) != 0 {
 		t.Fatal("retryable failure emitted a terminal event/audit")
+	}
+}
+
+// TestRenderWorkerDoesNotFailRevisionAfterLeaseLoss pins the P7 fencing rule:
+// once queue.Fail reports lease_lost, this worker no longer owns the revision
+// and must not mark it failed (a newer attempt may be rendering it).
+func TestRenderWorkerDoesNotFailRevisionAfterLeaseLoss(t *testing.T) {
+	job := renderJob(t, 77, 3, 7, 9001, 100, 1, 3)
+	worker, queue, jobs, content, client, events, audit := newRenderWorkerFixture(t, job)
+	seedRenderableRevision(jobs, content, 9001, 100, 1)
+	client.err = fmt.Errorf("%w: renderer returned 422", ErrRenderRejected)
+	queue.failErr = platform.NewError(409, "lease_lost", "work item lease was taken over by another claimant")
+
+	claimed, err := worker.RunOnce(context.Background())
+	if !claimed {
+		t.Fatal("RunOnce did not report the claimed lease-lost job")
+	}
+	// The queue's lease_lost conflict is propagated (the caller logs it), but it
+	// must never be translated into a revision failure write.
+	if !isRenderLeaseLost(err) {
+		t.Fatalf("RunOnce error = %v, want the propagated lease_lost", err)
+	}
+	if len(jobs.failedCalls) != 0 {
+		t.Fatalf("MarkPDFFailed calls = %+v, want none after lease loss", jobs.failedCalls)
+	}
+	if events.count("report.pdf_failed") != 0 || len(audit.calls) != 0 {
+		t.Fatalf("lease-lost failure emitted events/audit: events=%v audit=%v", events.published, audit.calls)
 	}
 }
 
@@ -646,6 +703,35 @@ func TestRenderWorkerHeartbeatsWhileRendering(t *testing.T) {
 
 	if queue.heartbeats == 0 {
 		t.Fatal("worker never renewed the lease while rendering")
+	}
+	// Fix 1: the heartbeat must renew the lease the job was claimed with
+	// (report.render_lease_seconds = 120s), not the agent queue default 30s;
+	// otherwise the lease lapses between renewals.
+	if queue.claimLease != 120*time.Second {
+		t.Fatalf("claim lease = %v, want 120s", queue.claimLease)
+	}
+	for _, lease := range queue.heartbeatLeases {
+		if lease != queue.claimLease {
+			t.Fatalf("heartbeat lease = %v, want the claimed lease %v", lease, queue.claimLease)
+		}
+	}
+}
+
+// TestRenderHeartbeatIntervalKeepsRenewalBeforeExpiry proves the heartbeat
+// cadence never lets the lease lapse: interval = max(lease/3, 5s) stays below
+// the lease itself for every catalog-valid duration (30s..1800s).
+func TestRenderHeartbeatIntervalKeepsRenewalBeforeExpiry(t *testing.T) {
+	for _, lease := range []time.Duration{30 * time.Second, 60 * time.Second, 120 * time.Second, 1800 * time.Second} {
+		interval := renderHeartbeatInterval(lease)
+		if interval < 5*time.Second {
+			t.Fatalf("lease %v: interval %v is below the 5s floor", lease, interval)
+		}
+		if interval >= lease {
+			t.Fatalf("lease %v: interval %v does not renew before expiry", lease, interval)
+		}
+		if interval*2 >= lease {
+			t.Fatalf("lease %v: interval %v leaves no renewal margin", lease, interval)
+		}
 	}
 }
 

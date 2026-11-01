@@ -122,7 +122,7 @@ func newIntegrationReportFixture(t *testing.T) *integrationReportFixture {
 	clock := integrationReportClock{now: time.Date(2026, 11, 1, 7, 0, 0, 0, time.UTC)}
 	return &integrationReportFixture{
 		svc: deliveryapp.NewReportService(
-			deliverypg.NewReportRepository(pool),
+			deliverypg.NewReportRepository(pool, ids),
 			renderer,
 			contentstore.New(storageSvc, deliverypg.NewContentRefReader(pool)),
 			data,
@@ -132,7 +132,7 @@ func newIntegrationReportFixture(t *testing.T) *integrationReportFixture {
 			tasks,
 			delivery.SectionOptions{Summary: true, Results: true, Issues: true, Coverage: true, Evidence: true},
 		),
-		repo:   deliverypg.NewReportRepository(pool),
+		repo:   deliverypg.NewReportRepository(pool, ids),
 		pool:   pool,
 		data:   data,
 		events: events,

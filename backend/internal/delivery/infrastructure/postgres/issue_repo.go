@@ -79,15 +79,12 @@ type IssueRepository struct {
 
 var _ deliveryapp.IssueRepository = (*IssueRepository)(nil)
 
-// NewIssueRepository wraps a pgx pool. The adapter owns the snowflake source of
-// the rows it inserts (the candidate domain constructor leaves IDs unset); a
+// NewIssueRepository wires the adapter over a pgx pool and the process-wide
+// snowflake generator seeded with this replica's registry-allocated node. A
 // caller-supplied positive ID is preserved for deterministic replays.
-func NewIssueRepository(pool *pgxpool.Pool) *IssueRepository {
-	ids, err := platformid.NewSnowflake(0)
-	if err != nil {
-		// Node 0 is always valid; this only guards a future change of the
-		// platform generator contract.
-		panic(fmt.Sprintf("deliverypg: init snowflake generator: %v", err))
+func NewIssueRepository(pool *pgxpool.Pool, ids platformid.Generator) *IssueRepository {
+	if ids == nil {
+		panic("deliverypg: issue repository requires an id generator")
 	}
 	return &IssueRepository{pool: pool, ids: ids}
 }

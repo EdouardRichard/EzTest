@@ -34,6 +34,12 @@ type Repository interface {
 	GetObject(ctx context.Context, sha256 string) (Object, error)
 	// AddRef inserts a reference with the caller-supplied snowflake ID.
 	AddRef(ctx context.Context, ref Ref) (Ref, error)
+	// ReplaceRef makes ref the single active reference for
+	// (owner_kind, owner_id, role): an existing active row is updated in place
+	// (or reused when it already points at the same object), and any other
+	// active duplicates are soft-deleted. Concurrent calls serialize on a
+	// transaction advisory lock.
+	ReplaceRef(ctx context.Context, ref Ref) (Ref, error)
 	// ListRefs returns the active (not deleted) references of one owner.
 	ListRefs(ctx context.Context, ownerKind string, ownerID int64) ([]Ref, error)
 	// SoftDeleteRef marks a reference deleted; a missing/already-deleted ref is

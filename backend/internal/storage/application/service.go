@@ -154,27 +154,8 @@ func (s *Service) Open(ctx context.Context, sha string) (storage.Object, io.Read
 // AddRef records that an owner uses a content object. A blank role defaults to
 // DefaultRefRole.
 func (s *Service) AddRef(ctx context.Context, objectID, ownerKind string, ownerID int64, role string) (storage.Ref, error) {
-	if !ValidSHA256(objectID) {
-		return storage.Ref{}, platform.Invalid("object_id", "object_id must be a lowercase hex SHA-256")
-	}
-	ownerKind = strings.TrimSpace(ownerKind)
-	if err := validation.String("owner_kind", ownerKind, 1, 64); err != nil {
-		return storage.Ref{}, err
-	}
-	if ownerID <= 0 {
-		return storage.Ref{}, platform.Invalid("owner_id", "owner_id must be a positive decimal ID")
-	}
-	role = strings.TrimSpace(role)
-	if role == "" {
-		role = DefaultRefRole
-	}
-	if err := validation.String("role", role, 1, 64); err != nil {
-		return storage.Ref{}, err
-	}
-	if _, err := s.repo.GetObject(ctx, objectID); err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			return storage.Ref{}, platform.NotFound("content")
-		}
+	objectID, ownerKind, ownerID, role, err := s.validateRef(ctx, objectID, ownerKind, ownerID, role)
+	if err != nil {
 		return storage.Ref{}, err
 	}
 	if s.ids == nil {
@@ -187,6 +168,57 @@ func (s *Service) AddRef(ctx context.Context, objectID, ownerKind string, ownerI
 		OwnerID:   ownerID,
 		Role:      role,
 	})
+}
+
+// ReplaceRef records objectID as the single active reference of
+// (ownerKind, ownerID, role). It is the idempotent write used by renderers that
+// may re-run (report PDFs): a repeat replaces/reuses the existing ref instead
+// of appending a duplicate. The role is required; a blank role keeps its
+// AddRef default.
+func (s *Service) ReplaceRef(ctx context.Context, objectID, ownerKind string, ownerID int64, role string) (storage.Ref, error) {
+	objectID, ownerKind, ownerID, role, err := s.validateRef(ctx, objectID, ownerKind, ownerID, role)
+	if err != nil {
+		return storage.Ref{}, err
+	}
+	if s.ids == nil {
+		return storage.Ref{}, platform.NewError(http.StatusInternalServerError, "internal", "id generator is not configured")
+	}
+	return s.repo.ReplaceRef(ctx, storage.Ref{
+		ID:        s.ids.Next(),
+		ObjectID:  objectID,
+		OwnerKind: ownerKind,
+		OwnerID:   ownerID,
+		Role:      role,
+	})
+}
+
+// validateRef shares the content reference argument validation of AddRef and
+// ReplaceRef.
+func (s *Service) validateRef(ctx context.Context, objectID, ownerKind string, ownerID int64, role string) (string, string, int64, string, error) {
+	if !ValidSHA256(objectID) {
+		return "", "", 0, "", platform.Invalid("object_id", "object_id must be a lowercase hex SHA-256")
+	}
+	ownerKind = strings.TrimSpace(ownerKind)
+	if err := validation.String("owner_kind", ownerKind, 1, 64); err != nil {
+		return "", "", 0, "", err
+	}
+	if ownerID <= 0 {
+		return "", "", 0, "", platform.Invalid("owner_id", "owner_id must be a positive decimal ID")
+	}
+	role = strings.TrimSpace(role)
+	if role == "" {
+		role = DefaultRefRole
+	}
+	if err := validation.String("role", role, 1, 64); err != nil {
+		return "", "", 0, "", err
+	}
+	if _, err := s.repo.GetObject(ctx, objectID); err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return "", "", 0, "", platform.NotFound("content")
+		}
+		return "", "", 0, "", err
+	}
+	return objectID, ownerKind, ownerID, role, nil
 }
 
 // ListRefs lists the active references of one owner.
