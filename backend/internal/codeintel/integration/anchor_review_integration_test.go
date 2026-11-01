@@ -70,6 +70,21 @@ func TestAnchorRepositoryIntegration(t *testing.T) {
 		t.Fatalf("foreign version list = %+v err=%v", list, err)
 	}
 
+	// Snowflake subject ids exceed int32; filtering must not infer int4 for $3.
+	large := anchor
+	large.ID = 9004
+	large.SubjectID = 375157393815769088
+	large.FilePath = "src/snowflake.ts"
+	large.StartLine = nil
+	large.EndLine = nil
+	if _, err := repo.Create(ctx, large); err != nil {
+		t.Fatalf("Create large subject: %v", err)
+	}
+	list, err = repo.List(ctx, 1, "requirement", large.SubjectID)
+	if err != nil || len(list) != 1 || list[0].ID != 9004 {
+		t.Fatalf("large subject list = %+v err=%v", list, err)
+	}
+
 	validatedAt := now.Add(time.Hour)
 	updated, err := repo.UpdateStatus(ctx, 9001, "stale", validatedAt)
 	if err != nil {
