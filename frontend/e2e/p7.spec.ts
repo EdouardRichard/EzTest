@@ -11,34 +11,371 @@ import { expect, type Locator, type Page, test } from "@playwright/test"
  * recurrence/merge chain and the read-only global reports centre all read and
  * write through the live API.
  *
- * Seeded data (see docs/version-V0.2/acceptance/p7/acceptance.md):
- * - version 375072010541207552 (P4 acceptance 2026-11-01 08:02:15)
- * - version 375072612025372672 has a report whose revision 3 is template v2
- *   with the appendix section and a rendered PDF (revision 4 disables it)
- * - knowledge 375317489480892416 is the approved global acceptance item
- * - issue 990200 is the merge target with recurrence_count=2
- * - issue 375072083727613952 is merged through 375072108880855040 -> 990200
+ * The P7 acceptance dataset re-mints its snowflakes on every reset, so the
+ * version/report/knowledge/issue ids are discovered through the real API after
+ * an admin login in `test.beforeAll`. Every `EZTEST_E2E_P7_*` id override is
+ * still honoured when it is set; discovery then only fills the missing ids.
+ * Assertions are unchanged: the discovered data must satisfy the same
+ * preconditions the hardcoded ids used to pin (v2 appendix HTML + PDF, approved
+ * knowledge items, a merged issue chain, recurrence_count >= 2).
  */
 const ADMIN_USER = process.env.EZTEST_E2E_ADMIN_USERNAME?.trim() || "admin"
 const ADMIN_PASSWORD = process.env.EZTEST_E2E_ADMIN_PASSWORD?.trim() || "admin123"
+const API_BASE_URL = (process.env.EZTEST_E2E_API_URL?.trim() || "http://127.0.0.1:13333").replace(
+  /\/+$/,
+  "",
+)
 
-const VERSION_ID = process.env.EZTEST_E2E_P7_VERSION_ID?.trim() || "375072010541207552"
-const REPORT_VERSION_ID =
-  process.env.EZTEST_E2E_P7_REPORT_VERSION_ID?.trim() || "375072612025372672"
-const REPORT_ID = process.env.EZTEST_E2E_P7_REPORT_ID?.trim() || "375072738047426560"
-const KNOWLEDGE_ID = process.env.EZTEST_E2E_P7_KNOWLEDGE_ID?.trim() || "375317489480892416"
-const ORDERS_KNOWLEDGE_ID =
-  process.env.EZTEST_E2E_P7_ORDERS_KNOWLEDGE_ID?.trim() || "375317509823266816"
-const PAYMENTS_KNOWLEDGE_ID =
-  process.env.EZTEST_E2E_P7_PAYMENTS_KNOWLEDGE_ID?.trim() || "375317509861015552"
-const SSE_KNOWLEDGE_ID = process.env.EZTEST_E2E_P7_SSE_KNOWLEDGE_ID?.trim() || "375317682695700480"
-const RECURRENCE_ISSUE_ID = process.env.EZTEST_E2E_P7_RECURRENCE_ISSUE_ID?.trim() || "990200"
-const MERGED_ISSUE_ID = process.env.EZTEST_E2E_P7_MERGED_ISSUE_ID?.trim() || "375072083727613952"
-const MERGED_VIA_ID = process.env.EZTEST_E2E_P7_MERGED_VIA_ID?.trim() || "375072108880855040"
+function envValue(name: string): string {
+  return process.env[name]?.trim() ?? ""
+}
+
+let VERSION_ID = envValue("EZTEST_E2E_P7_VERSION_ID")
+let REPORT_VERSION_ID = envValue("EZTEST_E2E_P7_REPORT_VERSION_ID")
+let REPORT_ID = envValue("EZTEST_E2E_P7_REPORT_ID")
+let APPENDIX_REVISION = Number.parseInt(envValue("EZTEST_E2E_P7_APPENDIX_REVISION"), 10) || 0
+let APPENDIX_TEMPLATE_VERSION = "2"
+let KNOWLEDGE_ID = envValue("EZTEST_E2E_P7_KNOWLEDGE_ID")
+let ORDERS_KNOWLEDGE_ID = envValue("EZTEST_E2E_P7_ORDERS_KNOWLEDGE_ID")
+let PAYMENTS_KNOWLEDGE_ID = envValue("EZTEST_E2E_P7_PAYMENTS_KNOWLEDGE_ID")
+let SSE_KNOWLEDGE_ID = envValue("EZTEST_E2E_P7_SSE_KNOWLEDGE_ID")
+let RECURRENCE_ISSUE_ID = envValue("EZTEST_E2E_P7_RECURRENCE_ISSUE_ID")
+let MERGED_ISSUE_ID = envValue("EZTEST_E2E_P7_MERGED_ISSUE_ID")
+let MERGED_VIA_ID = envValue("EZTEST_E2E_P7_MERGED_VIA_ID")
+let MERGED_CHAIN: string[] = []
+let RECURRENCE_COUNT = 0
 
 const SCREENSHOT_DIR =
   process.env.EZTEST_E2E_P7_SCREENSHOT_DIR?.trim() ||
   path.resolve(process.cwd(), "..", ".tmp", "p7-e2e", "screenshots")
+
+let apiToken = ""
+
+type P7VersionSummary = {
+  id: string
+  title: string
+  status: "initial" | "running" | "completed"
+  updated_at: string
+}
+
+type P7ReportRevision = {
+  revision: number
+  template_version: string
+  status: string
+  html_available: boolean
+  pdf_available: boolean
+}
+
+type P7ReportSummary = {
+  id: string
+  version_id: string
+  kind: "version" | "wave"
+  status: string
+  current_revision?: P7ReportRevision | null
+}
+
+type P7ReportDetail = P7ReportSummary & { revisions: P7ReportRevision[] }
+
+type P7Issue = {
+  id: string
+  title: string
+  status: "open" | "confirmed" | "dismissed" | "merged"
+  recurrence_count?: number
+  merged_into_id?: string | null
+  merged_chain?: string[] | null
+}
+
+type P7KnowledgeItem = {
+  id: string
+  scope: "global" | "system"
+  system_key: string | null
+  title: string
+  content: string
+  tags: string[]
+  status: string
+}
+
+/** Logs in through the real API and returns the bearer token (never printed). */
+async function apiLogin(): Promise<string> {
+  const response = await fetch(`${API_BASE_URL}/api/auth/login`, {
+    method: "POST",
+    headers: { Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify({ username: ADMIN_USER, password: ADMIN_PASSWORD }),
+  })
+  if (!response.ok) {
+    throw new Error(`P7 seed discovery: API login failed (HTTP ${response.status})`)
+  }
+  const payload = (await response.json()) as { data?: { token?: string } }
+  const token = payload.data?.token
+  if (typeof token !== "string" || token.length === 0) {
+    throw new Error("P7 seed discovery: login response did not include a token")
+  }
+  return token
+}
+
+async function apiGet<T>(pathname: string): Promise<T> {
+  const response = await fetch(`${API_BASE_URL}${pathname}`, {
+    headers: { Accept: "application/json", Authorization: `Bearer ${apiToken}` },
+  })
+  if (!response.ok) {
+    throw new Error(`P7 seed discovery: GET ${pathname} failed (HTTP ${response.status})`)
+  }
+  const payload = (await response.json()) as { data: T }
+  return payload.data
+}
+
+async function apiText(pathname: string): Promise<string> {
+  const response = await fetch(`${API_BASE_URL}${pathname}`, {
+    headers: { Accept: "text/html", Authorization: `Bearer ${apiToken}` },
+  })
+  if (!response.ok) {
+    throw new Error(`P7 seed discovery: GET ${pathname} failed (HTTP ${response.status})`)
+  }
+  return response.text()
+}
+
+function versionOrder(left: P7VersionSummary, right: P7VersionSummary): number {
+  const rank = (status: P7VersionSummary["status"]): number => {
+    if (status === "running") return 0
+    if (status === "initial") return 1
+    return 2
+  }
+  if (rank(left.status) !== rank(right.status)) return rank(left.status) - rank(right.status)
+  return right.updated_at.localeCompare(left.updated_at)
+}
+
+/**
+ * Finds the report + appendix revision the PDF/HTML scenario needs:
+ * - the report's current revision has generated PDF bytes;
+ * - some revision with template v2 both has HTML+PDF and its HTML contains the
+ *   enabled appendix (`data-template-version="2"` + `id="appendix"`).
+ */
+async function discoverReport(versions: P7VersionSummary[]): Promise<void> {
+  if (REPORT_ID.length > 0 && APPENDIX_REVISION > 0) {
+    if (REPORT_VERSION_ID.length === 0) {
+      throw new Error(
+        "P7 seed discovery: EZTEST_E2E_P7_REPORT_ID requires EZTEST_E2E_P7_REPORT_VERSION_ID",
+      )
+    }
+    const html = await apiText(
+      `/api/versions/${encodeURIComponent(REPORT_VERSION_ID)}/reports/${encodeURIComponent(
+        REPORT_ID,
+      )}/revisions/${APPENDIX_REVISION}/html`,
+    )
+    if (!html.includes('data-template-version="2"') || !html.includes('id="appendix"')) {
+      throw new Error(
+        "P7 seed discovery: the overridden appendix revision HTML has no template-v2 appendix",
+      )
+    }
+    return
+  }
+
+  const candidates = REPORT_VERSION_ID
+    ? versions.filter((version) => version.id === REPORT_VERSION_ID)
+    : [...versions].sort(versionOrder)
+  for (const version of candidates) {
+    let reports: P7ReportSummary[]
+    try {
+      reports = await apiGet<P7ReportSummary[]>(
+        `/api/versions/${encodeURIComponent(version.id)}/reports?limit=100`,
+      )
+    } catch {
+      continue
+    }
+    if (REPORT_ID.length > 0) reports = reports.filter((report) => report.id === REPORT_ID)
+    reports = [...reports].sort((left, right) =>
+      left.kind === right.kind ? 0 : left.kind === "version" ? -1 : 1,
+    )
+    for (const report of reports) {
+      let detail: P7ReportDetail
+      try {
+        detail = await apiGet<P7ReportDetail>(
+          `/api/versions/${encodeURIComponent(version.id)}/reports/${encodeURIComponent(report.id)}`,
+        )
+      } catch {
+        continue
+      }
+      const current = detail.current_revision
+      if (
+        current === null ||
+        current === undefined ||
+        !current.pdf_available ||
+        Number.parseInt(current.template_version, 10) < 2
+      ) {
+        continue
+      }
+      const revisions = detail.revisions.filter(
+        (revision) =>
+          revision.pdf_available &&
+          revision.html_available &&
+          Number.parseInt(revision.template_version, 10) >= 2 &&
+          (APPENDIX_REVISION <= 0 || revision.revision === APPENDIX_REVISION),
+      )
+      for (const revision of revisions) {
+        let html = ""
+        try {
+          html = await apiText(
+            `/api/versions/${encodeURIComponent(version.id)}/reports/${encodeURIComponent(
+              report.id,
+            )}/revisions/${revision.revision}/html`,
+          )
+        } catch {
+          continue
+        }
+        if (html.includes('data-template-version="2"') && html.includes('id="appendix"')) {
+          REPORT_VERSION_ID = version.id
+          REPORT_ID = report.id
+          APPENDIX_REVISION = revision.revision
+          APPENDIX_TEMPLATE_VERSION = revision.template_version
+          return
+        }
+      }
+    }
+  }
+  throw new Error(
+    "P7 seed discovery: no report with a generated PDF and a template-v2 appendix HTML revision was found; run scripts/p7-acceptance.ps1 (or set EZTEST_E2E_P7_REPORT_* overrides)",
+  )
+}
+
+/**
+ * Finds the issue pair the scenario needs: a merged issue whose chain reaches an
+ * issue with recurrence_count >= 2 (the P7 recurrence redirect target).
+ */
+async function discoverIssues(versions: P7VersionSummary[]): Promise<void> {
+  const candidates = VERSION_ID
+    ? versions.filter((version) => version.id === VERSION_ID)
+    : [...versions].sort(versionOrder)
+  for (const version of candidates) {
+    let issues: P7Issue[]
+    try {
+      issues = await apiGet<P7Issue[]>(
+        `/api/versions/${encodeURIComponent(version.id)}/issues?limit=100`,
+      )
+    } catch {
+      continue
+    }
+    const mergedCandidate = issues.find(
+      (issue) =>
+        issue.status === "merged" && (MERGED_ISSUE_ID.length === 0 || issue.id === MERGED_ISSUE_ID),
+    )
+    if (mergedCandidate === undefined) continue
+    let merged: P7Issue
+    try {
+      merged = await apiGet<P7Issue>(
+        `/api/versions/${encodeURIComponent(version.id)}/issues/${encodeURIComponent(
+          mergedCandidate.id,
+        )}`,
+      )
+    } catch {
+      continue
+    }
+    const chain =
+      merged.merged_chain !== null &&
+      merged.merged_chain !== undefined &&
+      merged.merged_chain.length > 0
+        ? merged.merged_chain
+        : merged.merged_into_id !== null && merged.merged_into_id !== undefined
+          ? [merged.merged_into_id]
+          : []
+    const targetId = chain[chain.length - 1]
+    if (targetId === undefined) continue
+    let recurrence = issues.find((issue) => issue.id === targetId)
+    if (recurrence === undefined || recurrence.recurrence_count === undefined) {
+      try {
+        recurrence = await apiGet<P7Issue>(
+          `/api/versions/${encodeURIComponent(version.id)}/issues/${encodeURIComponent(targetId)}`,
+        )
+      } catch {
+        continue
+      }
+    }
+    if (
+      recurrence === undefined ||
+      (recurrence.recurrence_count ?? 0) < 2 ||
+      (RECURRENCE_ISSUE_ID.length > 0 && recurrence.id !== RECURRENCE_ISSUE_ID)
+    ) {
+      continue
+    }
+    VERSION_ID = version.id
+    MERGED_ISSUE_ID = merged.id
+    MERGED_CHAIN = chain
+    MERGED_VIA_ID = chain[0]
+    RECURRENCE_ISSUE_ID = recurrence.id
+    RECURRENCE_COUNT = recurrence.recurrence_count ?? 0
+    return
+  }
+  throw new Error(
+    "P7 seed discovery: no version with a merged issue chain into a recurrence_count>=2 issue was found; run scripts/p7-acceptance.ps1 (or set the EZTEST_E2E_P7_*_ISSUE_ID overrides)",
+  )
+}
+
+async function listKnowledge(query: string): Promise<P7KnowledgeItem[]> {
+  return apiGet<P7KnowledgeItem[]>(`/api/knowledge/items?limit=100&${query}`)
+}
+
+/** Resolves the four approved knowledge items the knowledge scenario asserts. */
+async function discoverKnowledge(): Promise<void> {
+  if (KNOWLEDGE_ID.length === 0) {
+    const items = await listKnowledge("status=approved&tag=p7-acceptance")
+    const global = items.find(
+      (item) => item.scope === "global" && item.content.includes("P7K-GLOBAL"),
+    )
+    if (global === undefined) {
+      throw new Error(
+        "P7 seed discovery: no approved global knowledge tagged p7-acceptance with token P7K-GLOBAL; run scripts/p7-acceptance.ps1",
+      )
+    }
+    KNOWLEDGE_ID = global.id
+  }
+  if (ORDERS_KNOWLEDGE_ID.length === 0) {
+    const items = await listKnowledge("status=approved&scope=system&system_key=p4-orders")
+    const orders = items.find((item) => item.content.includes("P7K-SYS-ORDERS"))
+    if (orders === undefined) {
+      throw new Error(
+        "P7 seed discovery: no approved p4-orders system knowledge with token P7K-SYS-ORDERS",
+      )
+    }
+    ORDERS_KNOWLEDGE_ID = orders.id
+  }
+  if (PAYMENTS_KNOWLEDGE_ID.length === 0) {
+    const items = await listKnowledge("status=approved&scope=system&system_key=p4-payments")
+    const payments = items.find((item) => item.content.includes("P7K-SYS-PAYMENTS"))
+    if (payments === undefined) {
+      throw new Error(
+        "P7 seed discovery: no approved p4-payments system knowledge with token P7K-SYS-PAYMENTS",
+      )
+    }
+    PAYMENTS_KNOWLEDGE_ID = payments.id
+  }
+  if (SSE_KNOWLEDGE_ID.length === 0) {
+    const items = await listKnowledge("status=approved&q=SSE")
+    const candidates = items.filter(
+      (item) =>
+        item.scope === "global" && `${item.title} ${item.content}`.toUpperCase().includes("SSE"),
+    )
+    // The tag-filter assertion expects this item to be untagged.
+    const sse = candidates.find((item) => !item.tags.includes("p7-acceptance")) ?? candidates[0]
+    if (sse === undefined) {
+      throw new Error(
+        "P7 seed discovery: no approved global knowledge matching q=SSE; run scripts/p7-acceptance.ps1",
+      )
+    }
+    SSE_KNOWLEDGE_ID = sse.id
+  }
+}
+
+test.beforeAll(async () => {
+  apiToken = await apiLogin()
+  const versions = await apiGet<P7VersionSummary[]>("/api/versions?limit=100")
+  if (versions.length === 0) {
+    throw new Error(
+      "P7 seed discovery: no versions returned by GET /api/versions; run scripts/p7-acceptance.ps1 first",
+    )
+  }
+  await discoverReport(versions)
+  await discoverIssues(versions)
+  await discoverKnowledge()
+})
 
 let shot = 0
 
@@ -237,9 +574,12 @@ test("report detail shows the done PDF, downloads it and renders the v2 appendix
   expect(pdf.bytes.subarray(0, 5).toString("latin1")).toBe("%PDF-")
   await snap(page, "report-pdf-downloaded")
 
-  // Revision 3 is template v2 with the appendix section enabled.
-  await page.locator("#report-revision").selectOption("3")
+  // The discovered revision is template v2 with the appendix section enabled.
+  await page.locator("#report-revision").selectOption(String(APPENDIX_REVISION))
   await expect(page.getByTestId("report-pdf-status")).toHaveText(/PDF 已生成/)
+  await expect(
+    page.locator("dt", { hasText: "模板版本" }).locator("xpath=following-sibling::dd[1]"),
+  ).toHaveText(APPENDIX_TEMPLATE_VERSION)
   await snap(page, "report-revision-appendix-on")
 
   const htmlDownloadPromise = page.waitForEvent("download", { timeout: 60_000 })
@@ -247,7 +587,7 @@ test("report detail shows the done PDF, downloads it and renders the v2 appendix
   const htmlDownload = await htmlDownloadPromise
   const downloadDir = path.join(SCREENSHOT_DIR, "..", "downloads")
   fs.mkdirSync(downloadDir, { recursive: true })
-  const htmlPath = path.join(downloadDir, `report-${REPORT_ID}-r3.html`)
+  const htmlPath = path.join(downloadDir, `report-${REPORT_ID}-r${APPENDIX_REVISION}.html`)
   await htmlDownload.saveAs(htmlPath)
   const html = fs.readFileSync(htmlPath, "utf8")
   expect(html).toContain('data-template-version="2"')
@@ -327,20 +667,42 @@ test("version issues show recurrence, the merged chain and the reopen dialog", a
   await expect(page.getByTestId("issues-tab")).toBeVisible()
   await expect(page.getByRole("table", { name: "问题列表" })).toBeVisible()
 
+  // Deep links open the sheet even when the issue is outside the first table
+  // page (the tab lists 20 rows); no fixed seed id is involved.
+  await page.goto(
+    `/versions/${VERSION_ID}?tab=issues&issue=${encodeURIComponent(RECURRENCE_ISSUE_ID)}`,
+  )
   const sheet = page.getByTestId("issue-detail-sheet")
-  await page.getByTestId(`issue-${RECURRENCE_ISSUE_ID}`).click()
   await expect(sheet).toBeVisible()
-  await expect(sheet.getByTestId("issue-recurrence")).toContainText("复发 2 次")
+
+  // Normalize the status to open first: a previous interrupted run may have left
+  // the issue confirmed/dismissed, and the scenario below asserts the open state
+  // before confirming and reopening it again.
+  const resetReopen = sheet.getByRole("button", { name: "重开", exact: true })
+  if ((await resetReopen.count()) > 0) {
+    await resetReopen.click()
+    const resetDialog = page.getByRole("dialog", { name: "重开问题" })
+    await expect(resetDialog).toBeVisible()
+    await resetDialog.locator("#issue-reopen-reason").fill("P7 E2E reset to open for rerun")
+    await resetDialog.getByRole("button", { name: "重开问题" }).click()
+    await expect(resetDialog).toHaveCount(0)
+  }
+
+  await expect(sheet.getByTestId("issue-recurrence")).toContainText(`复发 ${RECURRENCE_COUNT} 次`)
   await expect(sheet.getByText("待确认", { exact: true }).first()).toBeVisible()
   await snapViewport(page, "issues-recurrence")
 
-  // The merged issue exposes the merge chain source -> target.
+  // The merged issue exposes the discovered merge chain source -> target.
   await sheet.getByRole("button", { name: "关闭详情" }).click()
   await expect(sheet).toHaveCount(0)
-  await page.getByTestId(`issue-${MERGED_ISSUE_ID}`).click()
+  await page.goto(`/versions/${VERSION_ID}?tab=issues&issue=${encodeURIComponent(MERGED_ISSUE_ID)}`)
   await expect(sheet).toBeVisible()
   const chain = sheet.getByTestId("issue-merged-chain")
   await expect(chain).toContainText("该问题已合并")
+  await expect(sheet).toContainText(`#${MERGED_ISSUE_ID}`)
+  for (const chainIssueId of MERGED_CHAIN) {
+    await expect(chain).toContainText(chainIssueId)
+  }
   await expect(chain).toContainText(MERGED_VIA_ID)
   await expect(chain).toContainText(RECURRENCE_ISSUE_ID)
   await expect(sheet.getByText("已合并", { exact: true }).first()).toBeVisible()
@@ -350,7 +712,9 @@ test("version issues show recurrence, the merged chain and the reopen dialog", a
   // restore the open state so reruns against the same clone stay deterministic.
   await sheet.getByRole("button", { name: "关闭详情" }).click()
   await expect(sheet).toHaveCount(0)
-  await page.getByTestId(`issue-${RECURRENCE_ISSUE_ID}`).click()
+  await page.goto(
+    `/versions/${VERSION_ID}?tab=issues&issue=${encodeURIComponent(RECURRENCE_ISSUE_ID)}`,
+  )
   await expect(sheet).toBeVisible()
   const confirmButton = sheet.getByRole("button", { name: "确认", exact: true })
   if ((await confirmButton.count()) > 0) {
@@ -375,7 +739,7 @@ test("version issues show recurrence, the merged chain and the reopen dialog", a
   await reopenSubmit.click()
   await expect(reopenDialog).toHaveCount(0)
   await expect(sheet.getByText("待确认", { exact: true }).first()).toBeVisible()
-  await expect(sheet.getByTestId("issue-recurrence")).toContainText("复发 2 次")
+  await expect(sheet.getByTestId("issue-recurrence")).toContainText(`复发 ${RECURRENCE_COUNT} 次`)
 })
 
 test("global reports centre surfaces PDF availability read-only", async ({ page }) => {
