@@ -34,7 +34,7 @@ const (
 // attempt rejected with no_open_work is transient; with the default 3 attempts
 // the task can die before those siblings finish and no newer close task is
 // ensured for the same close round.
-const requirementCloseMaxAttempts = 30
+const requirementCloseMaxAttempts = 10
 
 // Queue ensures an idempotent work item (agentapp.WorkQueue satisfies it).
 type Queue interface {
