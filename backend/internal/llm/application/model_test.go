@@ -241,7 +241,9 @@ func TestConfigThinkingSettings(t *testing.T) {
 		}
 	}
 
-	model, err := svc.AddModel(ctx, cfg.ID, "thinking-model", 128000, 8192, true, false, 1)
+	model, err := svc.AddModel(ctx, cfg.ID, ModelInput{
+		Model: "thinking-model", ContextWindow: 128000, MaxOutput: 8192, SupportsTools: true,
+	}, 1)
 	if err != nil {
 		t.Fatalf("AddModel: %v", err)
 	}
@@ -378,6 +380,134 @@ func TestResolveModelUsesCapabilityContextWindow(t *testing.T) {
 	}
 	if info.ContextWindow != 64000 {
 		t.Fatalf("context window = %d, want the legacy column fallback", info.ContextWindow)
+	}
+}
+
+// TestUpdateModelCapabilities pins the administrative capability write path:
+// the full 0.2.1 capability set (reasoning, prompt cache and the context
+// window included) can be corrected for an existing model without deleting and
+// re-adding it. Partial patches preserve the other flags, the legacy flat
+// columns stay in sync, and an out-of-range context window is a typed 400.
+func TestUpdateModelCapabilities(t *testing.T) {
+	ctx := context.Background()
+	svc, repo, _, _, _ := newTestService(t)
+	cfg, err := svc.CreateConfig(ctx, validCreate(), 1)
+	if err != nil {
+		t.Fatalf("CreateConfig: %v", err)
+	}
+	model, err := svc.AddModel(ctx, cfg.ID, ModelInput{
+		Model:          "gateway-model",
+		ContextWindow:  128000,
+		MaxOutput:      8192,
+		SupportsTools:  true,
+		SupportsVision: false,
+	}, 1)
+	if err != nil {
+		t.Fatalf("AddModel: %v", err)
+	}
+
+	// The gateway did not advertise reasoning support in /models; the admin
+	// corrects the capability set for the existing row.
+	updated, err := svc.UpdateModel(ctx, cfg.ID, model.ID, ModelPatch{
+		SupportsReasoning:   boolPtr(true),
+		SupportsPromptCache: boolPtr(true),
+		ContextWindow:       intPtr(64000),
+	}, 1)
+	if err != nil {
+		t.Fatalf("UpdateModel capabilities: %v", err)
+	}
+	updatedCapabilities := updated.EffectiveCapabilities()
+	if !updatedCapabilities.SupportsReasoning || !updatedCapabilities.SupportsPromptCache || updated.ContextWindow != 64000 {
+		t.Fatalf("updated model = %#v", updated)
+	}
+	// Untouched flags survive a partial patch.
+	if !updated.SupportsTools || updated.SupportsVision {
+		t.Fatalf("partial patch changed unrelated flags: %#v", updated)
+	}
+	capabilities := updated.EffectiveCapabilities()
+	if !capabilities.SupportsTools || capabilities.SupportsVision ||
+		!capabilities.SupportsReasoning || !capabilities.SupportsPromptCache ||
+		capabilities.ContextWindow != 64000 {
+		t.Fatalf("capabilities = %#v", capabilities)
+	}
+
+	stored := repo.models[model.ID]
+	if stored.ContextWindow != 64000 || !stored.SupportsTools || stored.SupportsVision ||
+		!stored.Capabilities.SupportsReasoning || !stored.Capabilities.SupportsPromptCache {
+		t.Fatalf("stored model = %#v", stored)
+	}
+	if stored.Source != llm.SourceManual || stored.UpdatedAt.IsZero() {
+		t.Fatalf("metadata = %#v", stored)
+	}
+
+	// Deprecated is writable through the same patch (the DTO exposes it).
+	retired, err := svc.UpdateModel(ctx, cfg.ID, model.ID, ModelPatch{Deprecated: boolPtr(true)}, 1)
+	if err != nil {
+		t.Fatalf("UpdateModel deprecated: %v", err)
+	}
+	if !retired.Deprecated || retired.Selectable() {
+		t.Fatalf("deprecated model = %#v", retired)
+	}
+
+	// The HTTP boundary validates the context window range like AddModel does.
+	for _, window := range []int{-1, llm.MaxContextWindow + 1} {
+		if _, err := svc.UpdateModel(ctx, cfg.ID, model.ID, ModelPatch{ContextWindow: intPtr(window)}, 1); err == nil {
+			t.Fatalf("context window %d accepted", window)
+		} else if got := apiError(t, err); got.Status != http.StatusBadRequest {
+			t.Fatalf("context window %d status = %d, want 400", window, got.Status)
+		}
+	}
+}
+
+// TestUpdateModelNotFound pins the typed 404 for unknown rows and the config
+// scoping check: a model belonging to another configuration is never updated
+// through this config's route.
+func TestUpdateModelNotFound(t *testing.T) {
+	ctx := context.Background()
+	svc, repo, _, _, _ := newTestService(t)
+	first, err := svc.CreateConfig(ctx, validCreate(), 1)
+	if err != nil {
+		t.Fatalf("CreateConfig: %v", err)
+	}
+	secondInput := validCreate()
+	secondInput.Name = strPtr("Secondary")
+	second, err := svc.CreateConfig(ctx, secondInput, 1)
+	if err != nil {
+		t.Fatalf("CreateConfig secondary: %v", err)
+	}
+	foreign, err := svc.AddModel(ctx, second.ID, ModelInput{Model: "foreign-model", ContextWindow: 1000}, 1)
+	if err != nil {
+		t.Fatalf("AddModel: %v", err)
+	}
+
+	assertNotFound := func(t *testing.T, err error) {
+		t.Helper()
+		apiErr := apiError(t, err)
+		if apiErr.Status != http.StatusNotFound || apiErr.Code != "not_found" {
+			t.Fatalf("error = %#v, want typed 404", apiErr)
+		}
+	}
+
+	// The model exists but belongs to another configuration.
+	if _, err := svc.UpdateModel(ctx, first.ID, foreign.ID, ModelPatch{SupportsTools: boolPtr(true)}, 1); err == nil {
+		t.Fatal("cross-config model update succeeded")
+	} else {
+		assertNotFound(t, err)
+	}
+	if got := repo.models[foreign.ID]; got.SupportsTools {
+		t.Fatalf("cross-config update modified the row: %#v", got)
+	}
+
+	// Unknown model and unknown config both map to the same typed 404.
+	if _, err := svc.UpdateModel(ctx, first.ID, 999999, ModelPatch{SupportsTools: boolPtr(true)}, 1); err == nil {
+		t.Fatal("unknown model update succeeded")
+	} else {
+		assertNotFound(t, err)
+	}
+	if _, err := svc.UpdateModel(ctx, 999999, foreign.ID, ModelPatch{SupportsTools: boolPtr(true)}, 1); err == nil {
+		t.Fatal("unknown config update succeeded")
+	} else {
+		assertNotFound(t, err)
 	}
 }
 

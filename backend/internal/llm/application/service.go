@@ -3,6 +3,7 @@ package llmapp
 import (
 	"context"
 	"errors"
+	"net/http"
 	"strconv"
 	"strings"
 
@@ -200,19 +201,20 @@ func (s *Service) RefreshModels(ctx context.Context, id int64, actorID int64) ([
 	return upserted, nil
 }
 
-// AddModel inserts a manually configured model.
-func (s *Service) AddModel(ctx context.Context, configID int64, model string, contextWindow, maxOutput int, tools, vision bool, actorID int64) (llm.Model, error) {
+// AddModel inserts a manually configured model. Every 0.2.1 capability is
+// accepted because a gateway's /models response may not describe them.
+func (s *Service) AddModel(ctx context.Context, configID int64, input ModelInput, actorID int64) (llm.Model, error) {
 	if _, err := s.repo.GetConfig(ctx, configID); err != nil {
 		return llm.Model{}, mapRepositoryError(err)
 	}
-	name := strings.TrimSpace(model)
+	name := strings.TrimSpace(input.Model)
 	if err := validation.String("model", name, 1, llm.MaxModelNameLength); err != nil {
 		return llm.Model{}, err
 	}
-	if contextWindow < 0 || contextWindow > llm.MaxContextWindow {
+	if input.ContextWindow < 0 || input.ContextWindow > llm.MaxContextWindow {
 		return llm.Model{}, platform.Invalid("context_window", "must be between 0 and "+strconv.Itoa(llm.MaxContextWindow))
 	}
-	if maxOutput < 0 || maxOutput > llm.MaxMaxOutput {
+	if input.MaxOutput < 0 || input.MaxOutput > llm.MaxMaxOutput {
 		return llm.Model{}, platform.Invalid("max_output", "must be between 0 and "+strconv.Itoa(llm.MaxMaxOutput))
 	}
 
@@ -222,14 +224,16 @@ func (s *Service) AddModel(ctx context.Context, configID int64, model string, co
 		ConfigID:       configID,
 		Model:          name,
 		DisplayName:    name,
-		ContextWindow:  contextWindow,
-		MaxOutput:      maxOutput,
-		SupportsTools:  tools,
-		SupportsVision: vision,
+		ContextWindow:  input.ContextWindow,
+		MaxOutput:      input.MaxOutput,
+		SupportsTools:  input.SupportsTools,
+		SupportsVision: input.SupportsVision,
 		Capabilities: llm.Capabilities{
-			SupportsTools:  tools,
-			SupportsVision: vision,
-			ContextWindow:  contextWindow,
+			SupportsTools:       input.SupportsTools,
+			SupportsVision:      input.SupportsVision,
+			SupportsReasoning:   input.SupportsReasoning,
+			SupportsPromptCache: input.SupportsPromptCache,
+			ContextWindow:       input.ContextWindow,
 		},
 		Source:    llm.SourceManual,
 		Status:    llm.ModelStatusActive,
@@ -237,6 +241,68 @@ func (s *Service) AddModel(ctx context.Context, configID int64, model string, co
 		UpdatedAt: now,
 	}
 	stored, err := s.repo.InsertModel(ctx, row)
+	if err != nil {
+		return llm.Model{}, mapRepositoryError(err)
+	}
+	return stored, nil
+}
+
+// UpdateModel patches one model row scoped to its configuration. It backs the
+// admin capability editor so gateways whose /models response omits capabilities
+// can be corrected without deleting and re-adding the model. Unknown rows (and
+// rows owned by another configuration) are a typed 404.
+func (s *Service) UpdateModel(ctx context.Context, configID, modelID int64, patch ModelPatch, actorID int64) (llm.Model, error) {
+	models, err := s.repo.ListModelsByConfig(ctx, configID)
+	if err != nil {
+		return llm.Model{}, err
+	}
+	var target *llm.Model
+	for i := range models {
+		if models[i].ID == modelID {
+			target = &models[i]
+			break
+		}
+	}
+	if target == nil {
+		return llm.Model{}, platform.NotFound("llm model")
+	}
+
+	if patch.ContextWindow != nil {
+		if *patch.ContextWindow < 0 || *patch.ContextWindow > llm.MaxContextWindow {
+			return llm.Model{}, platform.Invalid("context_window", "must be between 0 and "+strconv.Itoa(llm.MaxContextWindow))
+		}
+		target.ContextWindow = *patch.ContextWindow
+		target.Capabilities.ContextWindow = *patch.ContextWindow
+	}
+	if patch.SupportsTools != nil {
+		target.SupportsTools = *patch.SupportsTools
+	}
+	if patch.SupportsVision != nil {
+		target.SupportsVision = *patch.SupportsVision
+	}
+	if patch.Deprecated != nil {
+		target.Deprecated = *patch.Deprecated
+	}
+
+	// Keep the legacy flat columns and the capability object in sync: the
+	// capability set is authoritative for reasoning/prompt-cache, while tools,
+	// vision and the context window mirror into the P0 columns.
+	capabilities := target.EffectiveCapabilities()
+	capabilities.SupportsTools = target.SupportsTools
+	capabilities.SupportsVision = target.SupportsVision
+	if patch.SupportsReasoning != nil {
+		capabilities.SupportsReasoning = *patch.SupportsReasoning
+	}
+	if patch.SupportsPromptCache != nil {
+		capabilities.SupportsPromptCache = *patch.SupportsPromptCache
+	}
+	if patch.ContextWindow != nil {
+		capabilities.ContextWindow = *patch.ContextWindow
+	}
+	target.Capabilities = capabilities
+	target.UpdatedAt = s.clock.Now()
+
+	stored, err := s.repo.UpdateModel(ctx, *target)
 	if err != nil {
 		return llm.Model{}, mapRepositoryError(err)
 	}
@@ -339,16 +405,25 @@ func buildConfig(base llm.Config, input ConfigInput, create bool) (llm.Config, e
 	return cfg, nil
 }
 
-// validateDefaultModel enforces that a configured default_model_id references
-// an active model of the same configuration. A config may be created before its
-// catalog is refreshed; it simply cannot name a default until then.
+// validateDefaultModel enforces that a persisted configuration is
+// dispatch-ready: a configured default_model_id must reference a selectable
+// model of the same configuration, and a configuration that owns at least one
+// selectable model must name a default (resolution never falls back to
+// models[0]). A config may be created before its catalog is refreshed (Task 17
+// carve-out) and a catalog whose models are all deprecated has nothing to
+// select, so neither case requires a default.
 func (s *Service) validateDefaultModel(ctx context.Context, cfg llm.Config) error {
-	if cfg.DefaultModelID <= 0 {
-		return nil
-	}
 	models, err := s.repo.ListModelsByConfig(ctx, cfg.ID)
 	if err != nil {
 		return err
+	}
+	if cfg.DefaultModelID <= 0 {
+		for _, model := range models {
+			if model.Selectable() {
+				return defaultModelRequiredError()
+			}
+		}
+		return nil
 	}
 	for _, model := range models {
 		if model.ID != cfg.DefaultModelID {
@@ -360,6 +435,18 @@ func (s *Service) validateDefaultModel(ctx context.Context, cfg llm.Config) erro
 		return nil
 	}
 	return platform.Invalid("default_model_id", "must reference a model of this LLM configuration")
+}
+
+// defaultModelRequiredError is the typed configuration error the admin UI maps
+// back onto the default-model field: a model is selectable but no default is
+// configured, which would fail every run after the config was saved.
+func defaultModelRequiredError() error {
+	return &platform.Error{
+		Status:  http.StatusBadRequest,
+		Code:    CodeLLMConfigInvalid,
+		Message: "default_model_id is required when the configuration has selectable models",
+		Details: map[string]any{"field": "default_model_id"},
+	}
 }
 
 // recordConfigChange emits the audit entry and the system event for a config

@@ -28,7 +28,8 @@ type Service interface {
 	DeleteConfig(ctx context.Context, id int64, actorID int64) error
 	TestConfig(ctx context.Context, id int64) (llmapp.TestResult, error)
 	RefreshModels(ctx context.Context, id int64, actorID int64) ([]llm.Model, error)
-	AddModel(ctx context.Context, configID int64, model string, contextWindow, maxOutput int, tools, vision bool, actorID int64) (llm.Model, error)
+	AddModel(ctx context.Context, configID int64, input llmapp.ModelInput, actorID int64) (llm.Model, error)
+	UpdateModel(ctx context.Context, configID, modelID int64, patch llmapp.ModelPatch, actorID int64) (llm.Model, error)
 	DeleteModel(ctx context.Context, modelID int64, actorID int64) error
 	ListModels(ctx context.Context) ([]llm.Model, error)
 }
@@ -225,8 +226,42 @@ func (h *Handler) AddModel(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, platform.Invalid("body", "request body must be a JSON object"))
 		return
 	}
-	model, err := h.svc.AddModel(r.Context(), configID, request.Model, request.ContextWindow,
-		request.MaxOutput, request.SupportsTools, request.SupportsVision, actorID)
+	model, err := h.svc.AddModel(r.Context(), configID, request.input(), actorID)
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, toModelDTO(model))
+}
+
+// UpdateModel PATCH /api/admin/llm/configs/{id}/models/{modelId}.
+//
+// It is the admin capability editor's write path: gateways whose /models
+// response does not report capabilities can be corrected here. Unknown model
+// IDs are a typed 404 from the application service.
+func (h *Handler) UpdateModel(w http.ResponseWriter, r *http.Request) {
+	actorID, ok := requireActor(w, r)
+	if !ok {
+		return
+	}
+	configID, err := pathID(r, "id", "id")
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	modelID, err := pathID(r, "modelId", "model_id")
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	var request updateModelRequest
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBody))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		httpx.Error(w, r, platform.Invalid("body", "request body must be a JSON object"))
+		return
+	}
+	model, err := h.svc.UpdateModel(r.Context(), configID, modelID, request.patch(), actorID)
 	if err != nil {
 		httpx.Error(w, r, err)
 		return

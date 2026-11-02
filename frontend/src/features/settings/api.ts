@@ -172,6 +172,18 @@ export type AddLLMModelInput = {
   max_output?: number
   supports_tools?: boolean
   supports_vision?: boolean
+  supports_reasoning?: boolean
+  supports_prompt_cache?: boolean
+}
+
+/** Partial capability patch for an existing model (admin capability editor). */
+export type UpdateLLMModelInput = {
+  context_window?: number
+  supports_tools?: boolean
+  supports_vision?: boolean
+  supports_reasoning?: boolean
+  supports_prompt_cache?: boolean
+  deprecated?: boolean
 }
 
 export function fetchLLMConfigs(): Promise<LLMConfig[]> {
@@ -204,6 +216,22 @@ export function fetchLLMModels(): Promise<LLMModel[]> {
 
 export function addLLMModel(configId: string, input: AddLLMModelInput): Promise<LLMModel> {
   return apiPost<LLMModel>(`/api/admin/llm/configs/${encodeURIComponent(configId)}/models`, input)
+}
+
+/**
+ * Corrects capability flags for an existing model (0.2.1 capability editor).
+ * Gateways whose `/models` response omits capabilities are fixed through this
+ * route instead of deleting and re-adding the row.
+ */
+export function updateLLMModel(
+  configId: string,
+  modelId: string,
+  input: UpdateLLMModelInput,
+): Promise<LLMModel> {
+  return apiPatch<LLMModel>(
+    `/api/admin/llm/configs/${encodeURIComponent(configId)}/models/${encodeURIComponent(modelId)}`,
+    input,
+  )
 }
 
 export function deleteLLMModel(configId: string, modelId: string): Promise<void> {

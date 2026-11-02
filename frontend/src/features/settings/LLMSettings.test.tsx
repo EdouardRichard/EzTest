@@ -369,6 +369,12 @@ describe("LLMSettings", () => {
     expect(within(dialog).getByText(/上下文窗口 128000/)).toBeVisible()
 
     fireEvent.change(thinking, { target: { value: "disabled" } })
+    // disabled thinking cannot be combined with a non-none reasoning effort
+    // (the runtime rejects that contradiction): the effort is pinned to none.
+    expect(effort).toHaveValue("none")
+    expect(effort).toBeDisabled()
+    fireEvent.change(thinking, { target: { value: "enabled" } })
+    expect(effort).not.toBeDisabled()
     fireEvent.change(effort, { target: { value: "xhigh" } })
     fireEvent.change(defaultModel, { target: { value: "8004" } })
     expect(within(dialog).getByLabelText("支持推理")).not.toBeChecked()
@@ -385,10 +391,107 @@ describe("LLMSettings", () => {
     )
     expect(readBody(patch?.[1] ?? {})).toMatchObject({
       protocol: "openai_responses",
-      thinking_type: "disabled",
+      thinking_type: "enabled",
       reasoning_effort: "xhigh",
       default_model_id: "8004",
     })
+  })
+
+  it("edits a model capability and saves it through the model endpoint", async () => {
+    installFetch((url, init) => {
+      if (url.pathname === "/api/admin/llm/configs" && method(init) === "GET") {
+        return jsonResponse({ data: [canonicalConfig] })
+      }
+      if (url.pathname === "/api/admin/llm/models") {
+        return jsonResponse({ data: [reasoningModel, plainModel, deprecatedModel] })
+      }
+      if (url.pathname === "/api/admin/llm/configs/7003" && method(init) === "PATCH") {
+        return jsonResponse({ data: canonicalConfig })
+      }
+      if (url.pathname === "/api/admin/llm/configs/7003/models/8002" && method(init) === "PATCH") {
+        return jsonResponse({
+          data: {
+            ...reasoningModel,
+            capabilities: {
+              ...reasoningModel.capabilities,
+              supports_reasoning: false,
+              supports_vision: true,
+            },
+          },
+        })
+      }
+      return jsonResponse({ data: [] })
+    })
+
+    render(<LLMSettings />)
+    await screen.findByTestId("llm-config-7003")
+    fireEvent.click(within(configCard("7003")).getByRole("button", { name: "编辑" }))
+    const dialog = screen.getByRole("dialog")
+
+    // The capability checkboxes edit the selected default model instead of
+    // being read-only: gateways that do not report capabilities can be fixed.
+    const reasoning = within(dialog).getByLabelText("支持推理")
+    expect(reasoning).toBeChecked()
+    fireEvent.click(reasoning)
+    expect(reasoning).not.toBeChecked()
+    fireEvent.click(within(dialog).getByLabelText("支持视觉"))
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存配置" }))
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+
+    const modelPatch = fetchMock.mock.calls.find(
+      (call) =>
+        method(call[1] ?? {}) === "PATCH" &&
+        new URL(String(call[0])).pathname === "/api/admin/llm/configs/7003/models/8002",
+    )
+    expect(readBody(modelPatch?.[1] ?? {})).toEqual({
+      supports_tools: true,
+      supports_vision: true,
+      supports_reasoning: false,
+      supports_prompt_cache: true,
+      context_window: 128000,
+    })
+    const configPatch = fetchMock.mock.calls.find(
+      (call) =>
+        method(call[1] ?? {}) === "PATCH" &&
+        new URL(String(call[0])).pathname === "/api/admin/llm/configs/7003",
+    )
+    expect(readBody(configPatch?.[1] ?? {})).toMatchObject({ default_model_id: "8002" })
+  })
+
+  it("allows clearing the default model when no selectable model exists", async () => {
+    const deprecatedOnly: LLMConfig = { ...canonicalConfig, default_model_id: "8003" }
+    installFetch((url, init) => {
+      if (url.pathname === "/api/admin/llm/configs" && method(init) === "GET") {
+        return jsonResponse({ data: [deprecatedOnly] })
+      }
+      if (url.pathname === "/api/admin/llm/models") {
+        return jsonResponse({ data: [deprecatedModel] })
+      }
+      if (url.pathname === "/api/admin/llm/configs/7003" && method(init) === "PATCH") {
+        return jsonResponse({ data: { ...deprecatedOnly, default_model_id: undefined } })
+      }
+      return jsonResponse({ data: [] })
+    })
+
+    render(<LLMSettings />)
+    await screen.findByTestId("llm-config-7003")
+    fireEvent.click(within(configCard("7003")).getByRole("button", { name: "编辑" }))
+    const dialog = screen.getByRole("dialog")
+    const defaultModel = within(dialog).getByLabelText("默认模型")
+
+    // The stored default is deprecated, so it is visible but not selectable;
+    // clearing it must actually persist the clear instead of being omitted.
+    fireEvent.change(defaultModel, { target: { value: "" } })
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存配置" }))
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+
+    const patch = fetchMock.mock.calls.find(
+      (call) =>
+        method(call[1] ?? {}) === "PATCH" &&
+        new URL(String(call[0])).pathname === "/api/admin/llm/configs/7003",
+    )
+    expect(readBody(patch?.[1] ?? {})).toMatchObject({ default_model_id: "" })
   })
 
   it("requires a default model when selectable models exist", async () => {

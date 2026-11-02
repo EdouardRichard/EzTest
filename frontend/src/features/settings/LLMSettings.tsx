@@ -37,6 +37,7 @@ import {
   refreshLLMModels,
   testLLMConfig,
   updateLLMConfig,
+  updateLLMModel,
 } from "./api"
 
 /** Canonical protocols offered to new/updated configurations. */
@@ -144,10 +145,12 @@ type ConfigFormDialogProps = {
   /** Catalog rows belonging to this config (empty while creating). */
   models: LLMModel[]
   onClose: () => void
-  onSaved: (saved: LLMConfig, created: boolean) => void
+  /** updatedModels holds rows written through the model capability route. */
+  onSaved: (saved: LLMConfig, created: boolean, updatedModels: LLMModel[]) => void
 }
 
 function ConfigFormDialog({ config, models, onClose, onSaved }: ConfigFormDialogProps) {
+  const initialThinkingType = config?.thinking_type ?? "auto"
   const [name, setName] = useState(config?.name ?? "")
   const [protocol, setProtocol] = useState<LLMProtocol>(
     config?.protocol ?? "openai_chat_completions",
@@ -159,11 +162,14 @@ function ConfigFormDialog({ config, models, onClose, onSaved }: ConfigFormDialog
   const [maxRetries, setMaxRetries] = useState(String(config?.max_retries ?? 2))
   const [isDefault, setIsDefault] = useState(config?.is_default ?? false)
   const [status, setStatus] = useState<LLMStatus>(config?.status ?? "active")
-  const [thinkingType, setThinkingType] = useState<LLMThinkingType>(config?.thinking_type ?? "auto")
+  const [thinkingType, setThinkingType] = useState<LLMThinkingType>(initialThinkingType)
   const [reasoningEffort, setReasoningEffort] = useState<LLMReasoningEffort>(
-    config?.reasoning_effort ?? "none",
+    initialThinkingType === "disabled" ? "none" : (config?.reasoning_effort ?? "none"),
   )
   const [defaultModelID, setDefaultModelID] = useState(config?.default_model_id ?? "")
+  // Capabilities staged for the selected model; flushed through the model
+  // update route when the config form is saved.
+  const [capabilityDrafts, setCapabilityDrafts] = useState<Record<string, LLMModelCapabilities>>({})
   const [error, setError] = useState<string | null>(null)
   const [pending, setPending] = useState(false)
 
@@ -172,7 +178,25 @@ function ConfigFormDialog({ config, models, onClose, onSaved }: ConfigFormDialog
   )
   const defaultModelRequired = selectableModels.length > 0
   const selectedModel = models.find((model) => model.id === defaultModelID)
-  const selectedCapabilities = modelCapabilities(selectedModel)
+  const selectedCapabilities = {
+    ...modelCapabilities(selectedModel),
+    ...(selectedModel === undefined ? {} : capabilityDrafts[selectedModel.id]),
+  }
+
+  function updateCapability(key: CapabilityFlag, checked: boolean): void {
+    if (selectedModel === undefined) return
+    setCapabilityDrafts((current) => ({
+      ...current,
+      [selectedModel.id]: { ...selectedCapabilities, [key]: checked },
+    }))
+  }
+
+  function updateThinkingType(value: LLMThinkingType): void {
+    setThinkingType(value)
+    // The runtime rejects thinking_type=disabled with a non-none effort, so
+    // pin the effort when thinking is turned off.
+    if (value === "disabled") setReasoningEffort("none")
+  }
 
   function buildInput(): ConfigParseResult {
     const trimmedName = name.trim()
@@ -209,6 +233,13 @@ function ConfigFormDialog({ config, models, onClose, onSaved }: ConfigFormDialog
       if (!selectableModels.some((model) => model.id === defaultModelID)) {
         return { ok: false, error: "默认模型已下线或不可用，请重新选择" }
       }
+    } else if (
+      defaultModelID.trim().length > 0 &&
+      !selectableModels.some((model) => model.id === defaultModelID)
+    ) {
+      // No selectable model exists: the stored default is stale, so let the
+      // admin clear it (an empty string persists as NULL) instead of failing.
+      return { ok: false, error: "默认模型已下线或不可用，请清空后保存" }
     }
 
     const parsedHeaders = parseHeaders(headers)
@@ -227,7 +258,14 @@ function ConfigFormDialog({ config, models, onClose, onSaved }: ConfigFormDialog
       reasoning_effort: reasoningEffort,
     }
     if (apiKey.length > 0) input.api_key = apiKey
-    if (defaultModelID.trim().length > 0) input.default_model_id = defaultModelID.trim()
+    if (defaultModelID.trim().length > 0) {
+      input.default_model_id = defaultModelID.trim()
+    } else if (config !== null) {
+      // Explicit empty string clears the default (omitting the field would keep
+      // the stored value). The backend allows it only when nothing selectable
+      // remains, which the branch above has already validated.
+      input.default_model_id = ""
+    }
     return { ok: true, input }
   }
 
@@ -246,7 +284,23 @@ function ConfigFormDialog({ config, models, onClose, onSaved }: ConfigFormDialog
       const saved = created
         ? await createLLMConfig(parsed.input)
         : await updateLLMConfig(config.id, parsed.input)
-      onSaved(saved, created)
+      const updatedModels: LLMModel[] = []
+      if (config !== null) {
+        // Flush every staged capability draft (a model stays dirty when the
+        // admin switches the default-model selection before saving).
+        for (const [modelID, draft] of Object.entries(capabilityDrafts)) {
+          updatedModels.push(
+            await updateLLMModel(config.id, modelID, {
+              supports_tools: draft.supports_tools,
+              supports_vision: draft.supports_vision,
+              supports_reasoning: draft.supports_reasoning,
+              supports_prompt_cache: draft.supports_prompt_cache,
+              context_window: draft.context_window,
+            }),
+          )
+        }
+      }
+      onSaved(saved, created, updatedModels)
     } catch (caught) {
       setError(errorText(caught, "保存失败，请稍后重试"))
     } finally {
@@ -352,7 +406,7 @@ function ConfigFormDialog({ config, models, onClose, onSaved }: ConfigFormDialog
             <Select
               id="llm-thinking-type"
               value={thinkingType}
-              onChange={(event) => setThinkingType(event.target.value as LLMThinkingType)}
+              onChange={(event) => updateThinkingType(event.target.value as LLMThinkingType)}
             >
               {THINKING_OPTIONS.map((option) => (
                 <option key={option.value} value={option.value}>
@@ -361,10 +415,19 @@ function ConfigFormDialog({ config, models, onClose, onSaved }: ConfigFormDialog
               ))}
             </Select>
           </Field>
-          <Field id="llm-reasoning-effort" label="思考强度">
+          <Field
+            id="llm-reasoning-effort"
+            label="思考强度"
+            hint={
+              thinkingType === "disabled"
+                ? "思考模式为禁用时强度固定为 none（运行时会拒绝组合）"
+                : undefined
+            }
+          >
             <Select
               id="llm-reasoning-effort"
               value={reasoningEffort}
+              disabled={thinkingType === "disabled"}
               onChange={(event) => setReasoningEffort(event.target.value as LLMReasoningEffort)}
             >
               {EFFORT_OPTIONS.map((option) => (
@@ -403,7 +466,7 @@ function ConfigFormDialog({ config, models, onClose, onSaved }: ConfigFormDialog
 
         <fieldset className="rounded-md border border-border px-3 py-2">
           <legend className="px-1 text-xs font-medium text-foreground">
-            模型能力（来自模型目录）
+            模型能力（选中默认模型后可编辑）
           </legend>
           <div className="flex flex-wrap items-center gap-4 text-xs text-foreground">
             {CAPABILITY_FIELDS.map((field) => (
@@ -412,8 +475,8 @@ function ConfigFormDialog({ config, models, onClose, onSaved }: ConfigFormDialog
                   id={field.id}
                   type="checkbox"
                   checked={selectedCapabilities[field.key]}
-                  disabled
-                  readOnly
+                  disabled={selectedModel === undefined}
+                  onChange={(event) => updateCapability(field.key, event.target.checked)}
                 />
                 {field.label}
               </label>
@@ -424,7 +487,11 @@ function ConfigFormDialog({ config, models, onClose, onSaved }: ConfigFormDialog
           </div>
           {selectedModel === undefined ? (
             <p className="mt-1 text-xs text-muted-foreground">选择默认模型后显示其能力。</p>
-          ) : null}
+          ) : (
+            <p className="mt-1 text-xs text-muted-foreground">
+              勾选状态会随配置保存，通过模型更新接口写回；上游未上报能力时可在此修正。
+            </p>
+          )}
         </fieldset>
 
         <Field
@@ -728,7 +795,7 @@ export function LLMSettings() {
     }
   }
 
-  function handleSaved(saved: LLMConfig, created: boolean): void {
+  function handleSaved(saved: LLMConfig, created: boolean, updatedModels: LLMModel[]): void {
     setConfigs((current) => {
       const next = current
         ? created
@@ -738,6 +805,10 @@ export function LLMSettings() {
       if (!saved.is_default) return next
       return next.map((item) => (item.id === saved.id ? item : { ...item, is_default: false }))
     })
+    if (updatedModels.length > 0) {
+      const byID = new Map(updatedModels.map((model) => [model.id, model]))
+      setModels((current) => current.map((item) => byID.get(item.id) ?? item))
+    }
     setFormState(null)
   }
 

@@ -279,6 +279,31 @@ func (r *Repository) InsertModel(ctx context.Context, model llm.Model) (llm.Mode
 	return model, nil
 }
 
+// UpdateModel rewrites one existing row's capability set and deprecated flag.
+// The (id, config_id) pair scopes the write so a model cannot be edited through
+// another configuration. Legacy tools/vision/context columns stay authoritative
+// for P0 readers and are rewritten together with the capability object.
+func (r *Repository) UpdateModel(ctx context.Context, model llm.Model) (llm.Model, error) {
+	encodedCapabilities, err := encodeCapabilities(model.EffectiveCapabilities())
+	if err != nil {
+		return llm.Model{}, err
+	}
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE llm_model SET
+			context_window = $3, supports_tools = $4, supports_vision = $5,
+			capabilities = $6::jsonb, deprecated = $7, updated_at = $8
+		WHERE id = $1 AND config_id = $2
+	`, model.ID, model.ConfigID, model.ContextWindow, model.SupportsTools,
+		model.SupportsVision, encodedCapabilities, model.Deprecated, model.UpdatedAt)
+	if err != nil {
+		return llm.Model{}, mapModelError(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return llm.Model{}, llm.ErrModelNotFound
+	}
+	return model, nil
+}
+
 // DeleteModel removes one catalog row.
 func (r *Repository) DeleteModel(ctx context.Context, id int64) error {
 	tag, err := r.pool.Exec(ctx, `DELETE FROM llm_model WHERE id = $1`, id)

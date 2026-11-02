@@ -31,16 +31,8 @@ type stubService struct {
 	lastID    int64
 	lastModel int64
 	lastActor int64
-	lastAdd   addArgs
-}
-
-type addArgs struct {
-	configID      int64
-	model         string
-	contextWindow int
-	maxOutput     int
-	tools         bool
-	vision        bool
+	lastAdd   llmapp.ModelInput
+	lastPatch llmapp.ModelPatch
 }
 
 func (s *stubService) ListConfigs(context.Context) ([]llm.Config, error) {
@@ -104,9 +96,22 @@ func (s *stubService) RefreshModels(_ context.Context, id int64, actorID int64) 
 	return s.models, nil
 }
 
-func (s *stubService) AddModel(_ context.Context, configID int64, model string, contextWindow, maxOutput int, tools, vision bool, actorID int64) (llm.Model, error) {
+func (s *stubService) AddModel(_ context.Context, configID int64, input llmapp.ModelInput, actorID int64) (llm.Model, error) {
 	s.calls = append(s.calls, "add_model")
-	s.lastAdd = addArgs{configID: configID, model: model, contextWindow: contextWindow, maxOutput: maxOutput, tools: tools, vision: vision}
+	s.lastAdd = input
+	s.lastID = configID
+	s.lastActor = actorID
+	if s.err != nil {
+		return llm.Model{}, s.err
+	}
+	return s.model, nil
+}
+
+func (s *stubService) UpdateModel(_ context.Context, configID, modelID int64, patch llmapp.ModelPatch, actorID int64) (llm.Model, error) {
+	s.calls = append(s.calls, "update_model")
+	s.lastID = configID
+	s.lastModel = modelID
+	s.lastPatch = patch
 	s.lastActor = actorID
 	if s.err != nil {
 		return llm.Model{}, s.err
@@ -139,6 +144,7 @@ func newTestServer(t *testing.T) (http.Handler, *stubService) {
 	mux.HandleFunc("POST /api/admin/llm/configs/{id}/test", handler.TestConfig)
 	mux.HandleFunc("POST /api/admin/llm/configs/{id}/refresh-models", handler.RefreshModels)
 	mux.HandleFunc("POST /api/admin/llm/configs/{id}/models", handler.AddModel)
+	mux.HandleFunc("PATCH /api/admin/llm/configs/{id}/models/{modelId}", handler.UpdateModel)
 	mux.HandleFunc("DELETE /api/admin/llm/configs/{id}/models/{modelId}", handler.DeleteModel)
 	mux.HandleFunc("GET /api/admin/llm/models", handler.ListModels)
 	return mux, stub
@@ -471,17 +477,21 @@ func TestAddModelParsesFlags(t *testing.T) {
 	handler, stub := newTestServer(t)
 	stub.model = sampleModel()
 
-	body := `{"model":"gpt-4o","context_window":128000,"max_output":16384,"supports_tools":true,"supports_vision":false}`
+	body := `{"model":"gpt-4o","context_window":128000,"max_output":16384,"supports_tools":true,"supports_vision":false,"supports_reasoning":true,"supports_prompt_cache":true}`
 	recorder := call(t, handler, http.MethodPost, "/api/admin/llm/configs/101/models", body, adminActor())
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
-	want := addArgs{configID: 101, model: "gpt-4o", contextWindow: 128000, maxOutput: 16384, tools: true, vision: false}
-	if stub.lastAdd != want {
-		t.Fatalf("add args = %#v, want %#v", stub.lastAdd, want)
+	want := llmapp.ModelInput{
+		Model: "gpt-4o", ContextWindow: 128000, MaxOutput: 16384,
+		SupportsTools: true, SupportsVision: false,
+		SupportsReasoning: true, SupportsPromptCache: true,
 	}
-	if stub.lastActor != 7 {
-		t.Fatalf("actor = %d", stub.lastActor)
+	if stub.lastAdd != want {
+		t.Fatalf("add input = %#v, want %#v", stub.lastAdd, want)
+	}
+	if stub.lastID != 101 || stub.lastActor != 7 {
+		t.Fatalf("id/actor = %d/%d", stub.lastID, stub.lastActor)
 	}
 	if data := dataBody(t, recorder); data["model"] != "gpt-4o" || data["source"] != "catalog" {
 		t.Fatalf("data = %#v", data)
@@ -490,6 +500,85 @@ func TestAddModelParsesFlags(t *testing.T) {
 	bad := call(t, handler, http.MethodPost, "/api/admin/llm/configs/101/models", `[]`, adminActor())
 	if bad.Code != http.StatusBadRequest {
 		t.Fatalf("bad body status = %d", bad.Code)
+	}
+}
+
+// TestUpdateModelEndpoint pins the capability-editor write path: PATCH accepts
+// the five capability fields plus deprecated, maps them onto the partial patch
+// without inventing values for omitted fields, and surfaces the service's
+// typed 404 for unknown model IDs.
+func TestUpdateModelEndpoint(t *testing.T) {
+	handler, stub := newTestServer(t)
+	model := sampleModel()
+	model.Capabilities = llm.Capabilities{
+		SupportsTools:       true,
+		SupportsVision:      false,
+		SupportsReasoning:   true,
+		SupportsPromptCache: true,
+		ContextWindow:       64000,
+	}
+	stub.model = model
+
+	body := `{"context_window":64000,"supports_tools":true,"supports_vision":false,"supports_reasoning":true,"supports_prompt_cache":true,"deprecated":false}`
+	recorder := call(t, handler, http.MethodPatch, "/api/admin/llm/configs/101/models/201", body, adminActor())
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if stub.lastID != 101 || stub.lastModel != 201 || stub.lastActor != 7 {
+		t.Fatalf("ids/actor = %d/%d/%d", stub.lastID, stub.lastModel, stub.lastActor)
+	}
+	patch := stub.lastPatch
+	if patch.ContextWindow == nil || *patch.ContextWindow != 64000 {
+		t.Fatalf("context_window = %#v", patch.ContextWindow)
+	}
+	if patch.SupportsReasoning == nil || !*patch.SupportsReasoning {
+		t.Fatalf("supports_reasoning = %#v", patch.SupportsReasoning)
+	}
+	if patch.SupportsPromptCache == nil || !*patch.SupportsPromptCache {
+		t.Fatalf("supports_prompt_cache = %#v", patch.SupportsPromptCache)
+	}
+	if patch.SupportsVision == nil || *patch.SupportsVision {
+		t.Fatalf("supports_vision = %#v", patch.SupportsVision)
+	}
+	if patch.Deprecated == nil || *patch.Deprecated {
+		t.Fatalf("deprecated = %#v", patch.Deprecated)
+	}
+	data := dataBody(t, recorder)
+	capabilities, _ := data["capabilities"].(map[string]any)
+	if capabilities["supports_reasoning"] != true || data["deprecated"] != false {
+		t.Fatalf("data = %#v", data)
+	}
+
+	// Omitted fields stay nil so a one-checkbox edit does not reset the rest.
+	partial := call(t, handler, http.MethodPatch, "/api/admin/llm/configs/101/models/201", `{"supports_reasoning":false}`, adminActor())
+	if partial.Code != http.StatusOK {
+		t.Fatalf("partial status = %d, body = %s", partial.Code, partial.Body.String())
+	}
+	if stub.lastPatch.SupportsReasoning == nil || *stub.lastPatch.SupportsReasoning {
+		t.Fatalf("partial supports_reasoning = %#v", stub.lastPatch.SupportsReasoning)
+	}
+	if stub.lastPatch.ContextWindow != nil || stub.lastPatch.SupportsTools != nil || stub.lastPatch.Deprecated != nil {
+		t.Fatalf("omitted fields became non-nil: %#v", stub.lastPatch)
+	}
+
+	invalidID := call(t, handler, http.MethodPatch, "/api/admin/llm/configs/101/models/not-an-id", `{}`, adminActor())
+	if invalidID.Code != http.StatusBadRequest {
+		t.Fatalf("invalid id status = %d", invalidID.Code)
+	}
+	badBody := call(t, handler, http.MethodPatch, "/api/admin/llm/configs/101/models/201", `{"context_window":"big"}`, adminActor())
+	if badBody.Code != http.StatusBadRequest {
+		t.Fatalf("bad body status = %d", badBody.Code)
+	}
+
+	stub.err = platform.NotFound("llm model")
+	missing := call(t, handler, http.MethodPatch, "/api/admin/llm/configs/101/models/999", `{"supports_tools":true}`, adminActor())
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing status = %d", missing.Code)
+	}
+	payload := decodeBody(t, missing)
+	apiErr, _ := payload["error"].(map[string]any)
+	if apiErr["code"] != "not_found" {
+		t.Fatalf("error = %#v", apiErr)
 	}
 }
 

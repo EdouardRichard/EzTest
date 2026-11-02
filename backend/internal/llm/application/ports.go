@@ -67,3 +67,27 @@ type ConfigInput struct {
 	ReasoningEffort *string
 	DefaultModelID  *int64
 }
+
+// ModelInput is the manual-model create payload. The full 0.2.1 capability set
+// is accepted so an administrator can describe gateways whose /models response
+// does not report capabilities (spec §7.3).
+type ModelInput struct {
+	Model               string
+	ContextWindow       int
+	MaxOutput           int
+	SupportsTools       bool
+	SupportsVision      bool
+	SupportsReasoning   bool
+	SupportsPromptCache bool
+}
+
+// ModelPatch is a partial model update: nil fields keep the stored value. It
+// backs the capability editor and the deprecated flag; there is no rename.
+type ModelPatch struct {
+	ContextWindow       *int
+	SupportsTools       *bool
+	SupportsVision      *bool
+	SupportsReasoning   *bool
+	SupportsPromptCache *bool
+	Deprecated          *bool
+}

@@ -225,12 +225,51 @@ func toTestResultDTO(result llmapp.TestResult) testResultDTO {
 	}
 }
 
+// addModelRequest accepts the full 0.2.1 capability set. Gateways whose
+// /models response omits capabilities can be described manually (spec §7.3).
 type addModelRequest struct {
-	Model          string `json:"model"`
-	ContextWindow  int    `json:"context_window"`
-	MaxOutput      int    `json:"max_output"`
-	SupportsTools  bool   `json:"supports_tools"`
-	SupportsVision bool   `json:"supports_vision"`
+	Model               string `json:"model"`
+	ContextWindow       int    `json:"context_window"`
+	MaxOutput           int    `json:"max_output"`
+	SupportsTools       bool   `json:"supports_tools"`
+	SupportsVision      bool   `json:"supports_vision"`
+	SupportsReasoning   bool   `json:"supports_reasoning"`
+	SupportsPromptCache bool   `json:"supports_prompt_cache"`
+}
+
+func (r addModelRequest) input() llmapp.ModelInput {
+	return llmapp.ModelInput{
+		Model:               r.Model,
+		ContextWindow:       r.ContextWindow,
+		MaxOutput:           r.MaxOutput,
+		SupportsTools:       r.SupportsTools,
+		SupportsVision:      r.SupportsVision,
+		SupportsReasoning:   r.SupportsReasoning,
+		SupportsPromptCache: r.SupportsPromptCache,
+	}
+}
+
+// updateModelRequest is the partial capability patch. Pointer fields keep
+// "omitted" distinct from an explicit false/zero so the admin editor can flip a
+// single checkbox without resetting the others.
+type updateModelRequest struct {
+	ContextWindow       *int  `json:"context_window"`
+	SupportsTools       *bool `json:"supports_tools"`
+	SupportsVision      *bool `json:"supports_vision"`
+	SupportsReasoning   *bool `json:"supports_reasoning"`
+	SupportsPromptCache *bool `json:"supports_prompt_cache"`
+	Deprecated          *bool `json:"deprecated"`
+}
+
+func (r updateModelRequest) patch() llmapp.ModelPatch {
+	return llmapp.ModelPatch{
+		ContextWindow:       r.ContextWindow,
+		SupportsTools:       r.SupportsTools,
+		SupportsVision:      r.SupportsVision,
+		SupportsReasoning:   r.SupportsReasoning,
+		SupportsPromptCache: r.SupportsPromptCache,
+		Deprecated:          r.Deprecated,
+	}
 }
 
 type deletedDTO struct {
