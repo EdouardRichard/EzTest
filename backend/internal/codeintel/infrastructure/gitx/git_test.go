@@ -44,12 +44,13 @@ func newGitFixture(t *testing.T) *gitFixture {
 	writeFile(t, dir, "src/big.txt", strings.Repeat("row\n", 450))
 
 	// Symlinks are created through the index so the fixture works on Windows
-	// hosts without symlink privileges.
+	// hosts without symlink privileges. The entries are applied *after*
+	// `git add -A` because a plain add replaces them with the regular worktree
+	// file on hosts with symlink support (Linux CI).
+	runGit(t, dir, "add", "-A")
 	linkBlob := runGitInput(t, dir, "src/a.ts", "hash-object", "-w", "--stdin")
-	runGit(t, dir, "update-index", "--add", "--cacheinfo", "120000,"+linkBlob+",link.txt")
-	runGit(t, dir, "update-index", "--add", "--cacheinfo", "120000,"+linkBlob+",src/link.ts")
 	fixture := &gitFixture{dir: dir}
-	fixture.c1 = commitAll(t, dir, "commit A")
+	fixture.c1 = commitPreservingSymlinks(t, dir, "commit A", linkBlob)
 
 	// Commit B: rename a.ts (pure rename to keep R100 deterministic), add a
 	// file, delete a file, change the binary asset and the shell-metacharacter
@@ -59,8 +60,25 @@ func newGitFixture(t *testing.T) *gitFixture {
 	runGit(t, dir, "rm", "--quiet", "src/old.ts")
 	writeFile(t, dir, "src/assets/logo.bin", string([]byte{0x10, 0x11, 0x12, 0x13, 0x14}))
 	writeFile(t, dir, "src/weird name$().ts", "weird changed line\n")
-	fixture.c2 = commitAll(t, dir, "commit B")
+	fixture.c2 = commitPreservingSymlinks(t, dir, "commit B", linkBlob)
 	return fixture
+}
+
+// commitPreservingSymlinks stages the worktree, re-applies the symlink index
+// entries and then commits, so the fixture tree marks those paths as mode
+// 120000 on every host.
+func commitPreservingSymlinks(t *testing.T, dir, message, symlinkBlob string) string {
+	t.Helper()
+	runGit(t, dir, "add", "-A")
+	runGit(t, dir, "update-index", "--add", "--cacheinfo", "120000,"+symlinkBlob+",link.txt")
+	runGit(t, dir, "update-index", "--add", "--cacheinfo", "120000,"+symlinkBlob+",src/link.ts")
+	cmd := exec.Command("git", "commit", "-m", message)
+	cmd.Dir = dir
+	cmd.Env = fixtureEnv()
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git commit %q: %v\n%s", message, err, output)
+	}
+	return strings.TrimSpace(runGit(t, dir, "rev-parse", "HEAD"))
 }
 
 func writeFile(t *testing.T, dir, name, content string) {

@@ -108,6 +108,10 @@ jobs:
 
   static-acceptance:
     name: Static acceptance gate
+    # The static gate validates the development docs/contracts tree, which is
+    # intentionally not published on the public `main` snapshot. Skip it when
+    # the contracts directory is absent instead of failing the run.
+    if: ${{ hashFiles('docs/version-V0.2/contracts/openapi.yaml') != '' }}
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
