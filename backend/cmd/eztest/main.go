@@ -618,15 +618,6 @@ func main() {
 		designStale,
 	)
 	designGraph := designapp.NewGraphService(designRepo, ids, clk, auditSvc, eventSvc, designTeamRoom)
-	// Deterministic stage machine (0.2.1 §5.3/§5.5). Both hard gates confirm
-	// their selected entities before advancing. The stage-entry job enqueuer is
-	// nil until the work-item dispatcher lands (P2-T2 Task 7); until then a
-	// transition is still persisted, published and audited (gate decisions),
-	// and the missing dispatch is recoverable by the dispatcher's reconciler.
-	stageMachine := versionapp.NewStageMachine(versionRepo, nil, auditSvc, eventSvc, clk,
-		versionapp.WithRequirementGateConfirmer(versionapp.NewRequirementGateConfirmer(requirementSvc)),
-		versionapp.WithCaseGateConfirmer(designCaseGateConfirmer{svc: designGraph}),
-	)
 	storageExportSvc := storageapp.NewExportService(storagepg.NewExportRepository(pool), storageSvc, ids, clk)
 	designExports := designapp.NewExportService(
 		designRepo, storageexport.New(storageExportSvc), ids, clk, eventSvc, auditSvc)
@@ -862,6 +853,26 @@ func main() {
 		reportRepo, reportRenderer, deliveryContent, deliveryadapters.NewReportDataReader(readDeps),
 		deliveryEvents, deliveryAudit, clk, p4Tasks, p4SectionOptions(ctx, settingsSvc),
 	).WithRenderJobs(reportRepo, pdfEnabled, pdfAttempts)
+
+	// Four-way work-item dispatcher (0.2.1 D21): the only writer of 0.2.1
+	// work_item rows. It enforces the creator-kind matrix, the version-stage
+	// ownership of stage-entry kinds and the idempotency key, then delegates to
+	// the Task 6 contract repository. It is also the stage machine's
+	// StageJobEnqueuer (R35, so stage-entry jobs are actually dispatched in
+	// production) and routes report.version through the §5.3 report gate (R43).
+	dispatcher := agentapp.NewDispatcher(agentapp.DispatcherDeps{
+		WorkItems: workItems,
+		Stages:    versionRepo,
+		Reports:   reportSvc,
+	})
+	// Deterministic stage machine (0.2.1 §5.3/§5.5). Both hard gates confirm
+	// their selected entities before advancing; after the stage write commits
+	// the dispatcher enqueues design.cases/execute.batch and routes the reporting
+	// entry through EnsureVersionReport instead of a duplicate stage job.
+	stageMachine := versionapp.NewStageMachine(versionRepo, dispatcher, auditSvc, eventSvc, clk,
+		versionapp.WithRequirementGateConfirmer(versionapp.NewRequirementGateConfirmer(requirementSvc)),
+		versionapp.WithCaseGateConfirmer(designCaseGateConfirmer{svc: designGraph}),
+	)
 
 	closureReaders := versionadapters.NewClosureReaders(versionadapters.Deps{
 		Requirements: requirementRepo,
