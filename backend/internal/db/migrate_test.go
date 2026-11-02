@@ -46,11 +46,11 @@ func TestOrderCoversEverySQLFile(t *testing.T) {
 		"agent_0006_ops_team.sql",
 		"orchestration_0002_instance_inflight.sql",
 		"execution_0005_case_run_sut_context_executor.sql",
-		"version_0002_stage_plan_fact.sql",
+		"version_0007_stage_plan_fact.sql",
 		"agent_0007_work_item021.sql",
 		"llm_0002_model021.sql",
 		"knowledge_0002_binding021.sql",
-		"resource_0002_page_url.sql",
+		"resource_0003_page_url.sql",
 	}
 	tail := migrations[len(migrations)-len(wantTail):]
 	for i, want := range wantTail {

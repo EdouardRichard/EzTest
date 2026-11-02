@@ -1,6 +1,10 @@
--- 0.2.1 agent context: the extended work_item contract, actual model/token
--- accounting on agent_run, and streamed message parts.
+-- 0.2.1 agent context: the extended work_item contract and actual model/token
+-- accounting on agent_run.
 -- Additive only; lease_epoch already exists from agent_0001_work_item.sql.
+-- Streaming UI parts are NOT defined here: they hang off conversation_message,
+-- which belongs to the version context. Cross-context references stay logical
+-- (Agent.md §6.9.7), so the parts table lives in
+-- version_0007_stage_plan_fact.sql instead.
 -- See docs/version-V0.2.1/spec.md §5.4, §6.5, §12.2.
 
 ALTER TABLE work_item
@@ -43,25 +47,3 @@ ALTER TABLE agent_run
         CHECK (jsonb_typeof(cache) = 'object');
 
 CREATE INDEX idx_agent_run_config_model ON agent_run (config_id, model);
-
--- Streaming transcript parts. agent_message remains the ordered message head.
-CREATE TABLE agent_message_part (
-    id         BIGINT PRIMARY KEY,
-    message_id BIGINT NOT NULL
-               CONSTRAINT fk_agent_message_part_message
-               REFERENCES agent_message (id) ON DELETE CASCADE,
-    seq        INTEGER NOT NULL CHECK (seq > 0),
-    part_type  TEXT NOT NULL
-               CONSTRAINT chk_agent_message_part_type
-               CHECK (part_type IN (
-                   'text', 'thinking', 'tool_call', 'job_card',
-                   'attachment', 'requirement_card', 'case_card', 'error'
-               )),
-    payload    JSONB NOT NULL DEFAULT '{}'::jsonb
-               CONSTRAINT chk_agent_message_part_payload
-               CHECK (jsonb_typeof(payload) = 'object'),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE UNIQUE INDEX uk_agent_message_part_message_seq
-    ON agent_message_part (message_id, seq);

@@ -24,7 +24,7 @@ func TestMigrations021Schema(t *testing.T) {
 		t.Fatalf("Migrate: %v", err)
 	}
 
-	tables := []string{"version_plan_item", "version_fact", "agent_message_part"}
+	tables := []string{"version_plan_item", "version_fact", "conversation_message_part"}
 	for _, name := range tables {
 		var exists bool
 		if err := pool.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, name).Scan(&exists); err != nil {
@@ -33,6 +33,15 @@ func TestMigrations021Schema(t *testing.T) {
 		if !exists {
 			t.Errorf("missing 0.2.1 table %s", name)
 		}
+	}
+	// Message parts are version-context rows (conversation_message), not
+	// agent-context rows: the old agent_message_part table must not exist.
+	var oldPartTable bool
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('agent_message_part') IS NOT NULL`).Scan(&oldPartTable); err != nil {
+		t.Fatalf("check old part table: %v", err)
+	}
+	if oldPartTable {
+		t.Error("agent_message_part still exists; parts belong to conversation_message")
 	}
 
 	columns := []struct {
@@ -131,7 +140,7 @@ func TestMigrations021Schema(t *testing.T) {
 		{"uk_version_fact_version_kind_key_hash", []string{"UNIQUE", "(version_id, kind, key, content_hash)"}},
 		{"idx_version_plan_item_version_status_order", []string{"(version_id, status, sort_order)"}},
 		{"uk_work_item_idempotency", []string{"UNIQUE", "(version_id, kind, idempotency_key)"}},
-		{"uk_agent_message_part_message_seq", []string{"UNIQUE", "(message_id, seq)"}},
+		{"uk_conversation_message_part_message_seq", []string{"UNIQUE", "(message_id, seq)"}},
 		{"uk_sut_page_normalized_url", []string{"UNIQUE", "(environment_id, normalized_url)"}},
 	}
 	for _, index := range indexes {
@@ -160,9 +169,9 @@ func TestMigrations021Schema(t *testing.T) {
 
 	// New constraints (including the widened knowledge status enum).
 	constraints := []string{
-		"chk_version_stage", "chk_work_item_created_by", "chk_agent_message_part_type",
-		"chk_agent_message_part_payload", "chk_knowledge_item_status",
-		"fk_agent_message_part_message", "fk_llm_config_default_model",
+		"chk_version_stage", "chk_work_item_created_by", "chk_conversation_message_part_type",
+		"chk_conversation_message_part_payload", "chk_knowledge_item_status",
+		"fk_conversation_message_part_message", "fk_llm_config_default_model",
 	}
 	for _, name := range constraints {
 		var exists bool
@@ -172,6 +181,21 @@ func TestMigrations021Schema(t *testing.T) {
 		if !exists {
 			t.Errorf("missing 0.2.1 constraint %s", name)
 		}
+	}
+
+	// Same-context FK: parts reference conversation_message (version context),
+	// never agent_message (agent context).
+	var fkTargetsConversationMessage bool
+	if err := pool.QueryRow(ctx, `
+		SELECT confrelid = to_regclass('conversation_message')
+		FROM pg_constraint
+		WHERE conname = 'fk_conversation_message_part_message'
+		  AND conrelid = to_regclass('conversation_message_part')
+	`).Scan(&fkTargetsConversationMessage); err != nil {
+		t.Fatalf("read conversation_message_part FK target: %v", err)
+	}
+	if !fkTargetsConversationMessage {
+		t.Error("fk_conversation_message_part_message does not target conversation_message")
 	}
 
 	var statusCheck string

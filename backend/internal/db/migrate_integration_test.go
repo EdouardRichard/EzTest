@@ -56,7 +56,7 @@ func TestMigrateAppliesAllTablesAndIsIdempotent(t *testing.T) {
 		"eval_run", "eval_metric", "agent_profile_prompt_revision",
 		"knowledge_item", "knowledge_revision", "knowledge_usage",
 		"gc_run", "gc_tombstone", "api_instance",
-		"version_plan_item", "version_fact", "agent_message_part",
+		"version_plan_item", "version_fact", "conversation_message_part",
 	}
 	found := map[string]bool{}
 	rows, err := pool.Query(ctx, `

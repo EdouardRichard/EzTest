@@ -1,5 +1,6 @@
 -- 0.2.1 version context: stage machine state, the three-file plan/fact stores,
--- per-conversation model overrides and structured attachment parse metadata.
+-- per-conversation model overrides, streaming conversation parts and structured
+-- attachment parse metadata.
 -- Additive only: no 0.2 row is rewritten (0.2.1 starts from a fresh database).
 -- See docs/version-V0.2.1/spec.md §6.1, §12.1, §12.2.
 
@@ -61,6 +62,33 @@ CREATE INDEX idx_version_fact_current
 
 ALTER TABLE conversation
     ADD COLUMN model_override TEXT NULL;
+
+-- Streaming UI parts of one conversation message. conversation_message is the
+-- ordered message head rendered by the UI and lives in this (version) context,
+-- so the FK is a legitimate same-context reference. The agent-context
+-- agent_message transcript keeps its own history and must not be FK-linked
+-- across contexts (Agent.md §6.9.7). The unique index also serves ordered reads
+-- by message, so no separate (message_id, seq) index is needed.
+CREATE TABLE conversation_message_part (
+    id         BIGINT PRIMARY KEY,
+    message_id BIGINT NOT NULL
+               CONSTRAINT fk_conversation_message_part_message
+               REFERENCES conversation_message (id) ON DELETE CASCADE,
+    seq        INTEGER NOT NULL CHECK (seq > 0),
+    part_type  TEXT NOT NULL
+               CONSTRAINT chk_conversation_message_part_type
+               CHECK (part_type IN (
+                   'text', 'thinking', 'tool_call', 'job_card',
+                   'attachment', 'requirement_card', 'case_card', 'error'
+               )),
+    payload    JSONB NOT NULL DEFAULT '{}'::jsonb
+               CONSTRAINT chk_conversation_message_part_payload
+               CHECK (jsonb_typeof(payload) = 'object'),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX uk_conversation_message_part_message_seq
+    ON conversation_message_part (message_id, seq);
 
 -- 0.2.1 keeps the 0.2 extraction_* pair for compatibility and adds the
 -- structured parse contract used by the new parser/vision pipeline.
