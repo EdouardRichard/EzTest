@@ -237,6 +237,22 @@ func (a *Assembler) Build(ctx context.Context, request AssemblyRequest) (Assembl
 		}))
 		messages = append(messages, Message{Role: roleUser, Content: facts})
 	}
+	// A compacted packet carries its rolling summary in the suffix. The summary
+	// is not derivable from the request fields, so Build carries it forward from
+	// Previous.Segments and places it before the replayed transcript: it
+	// describes older history the caller no longer replays. This is how a
+	// compacted packet re-enters the next assembly; without it the summary would
+	// only survive on the persisted packet and the next round would lose it.
+	for _, summary := range previousSummaries(previous) {
+		summary.Prefix = false
+		summary = withTokens(summary)
+		segments = append(segments, summary)
+		messages = append(messages, Message{
+			Role:       summary.Role,
+			Content:    summary.Content,
+			ToolCallID: summary.ToolCallID,
+		})
+	}
 	// History is replayed verbatim: no merging, reordering or truncation. IDs
 	// and tool-call identities are preserved so an earlier append is never
 	// rewritten.
@@ -376,6 +392,23 @@ func fallbackToolResultRef(result ToolResult) string {
 func withTokens(segment Segment) Segment {
 	segment.Tokens = estimateBriefingTokens(segment.Content)
 	return segment
+}
+
+// previousSummaries returns the rolling summary segments of the previous
+// packet in packet order. Build carries them into the next assembly verbatim
+// (only the token estimate is recomputed), so a compacted packet's summary
+// survives a rebuild without being re-rendered from the transcript.
+func previousSummaries(previous *ContextPacket) []Segment {
+	if previous == nil {
+		return nil
+	}
+	summaries := make([]Segment, 0, 1)
+	for _, segment := range previous.Segments {
+		if segment.Name == SegmentSummary {
+			summaries = append(summaries, segment)
+		}
+	}
+	return summaries
 }
 
 func cachedPrefixTokens(segments []Segment) int {
