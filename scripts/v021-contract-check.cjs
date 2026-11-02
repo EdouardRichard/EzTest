@@ -356,7 +356,7 @@ check(
 )
 
 const alteredTables = {
-  version: ["stage", "stage_entered_at", "blocker"],
+  version: ["stage", "stage_entered_at", "blocker", "suspended_from"],
   work_item: [
     "kind",
     "goal",
