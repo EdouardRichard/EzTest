@@ -4,10 +4,10 @@
     Stops the EzTest stack started by start-eztest.ps1.
 
 .DESCRIPTION
-    Stops, in order: web, the Playwright executor (whole process tree, so
-    Chromium children die too) and the Go API. Pid files under run\ are removed.
-    PostgreSQL and the data\ directories are left untouched; a missing or stale
-    pid file is reported without failing.
+    Stops, in order: web, the PDF renderer, the Playwright executor (whole
+    process tree, so Chromium children die too) and the Go API. Pid files under
+    run\ are removed. PostgreSQL and the .data\ directories are left untouched;
+    a missing or stale pid file is reported without failing.
 
     Windows PowerShell 5.1 compatible. On Linux use stop-eztest.sh.
 #>
@@ -86,7 +86,7 @@ if (-not (Test-Path -LiteralPath $RunDir -PathType Container)) {
 }
 
 $stopped = 0
-foreach ($component in @("web", "executor", "api")) {
+foreach ($component in @("web", "renderer", "executor", "api")) {
     $pidPath = Join-Path $RunDir ($component + ".pid")
     if (-not (Test-Path -LiteralPath $pidPath -PathType Leaf)) {
         Write-Host ("{0,-10} not running (no pid file)" -f $component)
@@ -111,8 +111,8 @@ foreach ($component in @("web", "executor", "api")) {
 
 Write-Host ""
 if ($stopped -gt 0) {
-    Write-Host "EzTest stopped. PostgreSQL and the data\ directories were left untouched." -ForegroundColor Green
+    Write-Host "EzTest stopped. PostgreSQL and the .data\ directories were left untouched." -ForegroundColor Green
 } else {
-    Write-Host "EzTest was not running. PostgreSQL and the data\ directories were left untouched."
+    Write-Host "EzTest was not running. PostgreSQL and the .data\ directories were left untouched."
 }
 exit 0

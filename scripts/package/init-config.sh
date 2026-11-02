@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# First-run configuration for an extracted EzTest package (Linux).
+# First-run configuration for an extracted EzTest 0.2 package (Linux).
 #
 # Copies the packaged .env.example template to .env, rewrites the
-# __PACKAGE_ROOT__ tokens to the absolute path of this package, generates the
-# administrator password, the AES-256 secret keyring and the executor Bearer
-# token, and stores the PostgreSQL 17 connection string passed with
-# --database-url (or EZTEST_DATABASE_URL). Secret values are never printed.
+# __PACKAGE_ROOT__ tokens to the absolute path of this package and stores the
+# PostgreSQL 17 connection string passed with --database-url (or
+# EZTEST_DATABASE_URL). Secret values are never printed.
 #
-# Re-running with --force backs up the current .env to .env.bak and regenerates
-# the secrets. Regenerating EZTEST_SECRET_KEYS makes LLM credentials already
-# stored in PostgreSQL undecryptable.
+# EzTest 0.2 keeps runtime configuration in the database settings center; the
+# API only reads the four startup variables EZTEST_DATABASE_URL, EZTEST_API_PORT,
+# EZTEST_WEB_PORT and EZTEST_EXECUTOR_PORT. The first API start seeds the fixed
+# administrator admin / admin123 (change it in the UI after the first login).
+# The executor and PDF-renderer tokens in .env must match the packaged
+# settings-center defaults; if you change one, change the settings center too.
 #
-# Works on Debian/Ubuntu bash 4+. Uses the bundled Node runtime when present
-# (for cryptographically secure random values) and falls back to /dev/urandom.
+# Re-running with --force backs up the current .env to .env.bak and renders it
+# again from the template.
+#
+# Works on Debian/Ubuntu bash 4+.
 # ---------------------------------------------------------------------------
 set -u
 
@@ -21,7 +25,6 @@ PKG="$(cd "$(dirname "$0")" && pwd)"
 TEMPLATE="$PKG/.env.example"
 ENV_FILE="$PKG/.env"
 BACKUP_FILE="$PKG/.env.bak"
-NODE_BIN="$PKG/runtime/node/bin/node"
 
 FORCE=0
 DB_URL_ARG=""
@@ -140,46 +143,15 @@ if [ -f "$ENV_FILE" ]; then
     printf 'Backed up the previous .env to .env.bak\n'
 fi
 
-# --- Generate secrets -------------------------------------------------------
-# 56-char alphabet; accept random bytes below 224 (56 * 4) to avoid bias.
-gen_secrets() {
-    if [ -f "$NODE_BIN" ]; then
-        chmod +x "$NODE_BIN" 2>/dev/null || true
-        "$NODE_BIN" -e '
-const crypto = require("crypto");
-const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
-function password(length) {
-  let out = "";
-  while (out.length < length) {
-    for (const byte of crypto.randomBytes(32)) {
-      if (byte < 224) {
-        out += alphabet[byte % 56];
-        if (out.length >= length) break;
-      }
-    }
-  }
-  return out;
-}
-process.stdout.write([
-  crypto.randomBytes(32).toString("base64"),
-  crypto.randomBytes(24).toString("hex"),
-  password(20),
-].join("\n") + "\n");
-' && return 0
-    fi
-    # Fallback: /dev/urandom + base64/od (always present on Debian/Ubuntu).
-    _key="$(head -c 32 /dev/urandom | base64 -w0)"
-    _token="$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-    _pwd="$(head -c 64 /dev/urandom | base64 -w0 | tr -dc 'A-Za-z0-9' | cut -c1-20)"
-    printf '%s\n%s\n%s\n' "$_key" "$_token" "$_pwd"
-}
-
-SECRETS="$(gen_secrets)" || fail "Could not generate random secrets (is /dev/urandom available?)."
-SECRET_KEY="$(printf '%s\n' "$SECRETS" | sed -n '1p')"
-EXECUTOR_TOKEN="$(printf '%s\n' "$SECRETS" | sed -n '2p')"
-ADMIN_PASSWORD="$(printf '%s\n' "$SECRETS" | sed -n '3p')"
-[ -n "$SECRET_KEY" ] && [ -n "$EXECUTOR_TOKEN" ] && [ -n "$ADMIN_PASSWORD" ] || fail "Secret generation returned empty values."
-SECRET_KEYS="{\"1\":\"$SECRET_KEY\"}"
+# --- Rendered values --------------------------------------------------------
+# 0.2 seeds a fixed administrator (admin / admin123) on the first API start, so
+# the template values are rendered as that seed: the API ignores the admin
+# variables, smoke-test.sh uses them to log in. The executor/renderer tokens are
+# the packaged settings-center defaults; change both sides if you change them.
+ADMIN_USERNAME="admin"
+ADMIN_PASSWORD="admin123"
+EXECUTOR_TOKEN="eztest-dev-executor-token"
+RENDER_TOKEN="eztest-dev-render-token"
 
 # --- Render .env from the template -----------------------------------------
 PKG_FWD="${PKG//\\//}"
@@ -189,9 +161,10 @@ while IFS= read -r LINE || [ -n "$LINE" ]; do
     RENDERED="${LINE//__PACKAGE_ROOT__/$PKG_FWD}"
     case "$RENDERED" in
         EZTEST_DATABASE_URL=*) RENDERED="EZTEST_DATABASE_URL=$DB_URL" ;;
+        EZTEST_ADMIN_USERNAME=*) RENDERED="EZTEST_ADMIN_USERNAME=$ADMIN_USERNAME" ;;
         EZTEST_ADMIN_PASSWORD=*) RENDERED="EZTEST_ADMIN_PASSWORD=$ADMIN_PASSWORD" ;;
-        EZTEST_SECRET_KEYS=*) RENDERED="EZTEST_SECRET_KEYS=$SECRET_KEYS" ;;
         EZTEST_EXECUTOR_TOKEN=*) RENDERED="EZTEST_EXECUTOR_TOKEN=$EXECUTOR_TOKEN" ;;
+        EZTEST_RENDER_TOKEN=*) RENDERED="EZTEST_RENDER_TOKEN=$RENDER_TOKEN" ;;
     esac
     LINES+=("$RENDERED")
 done < "$TEMPLATE"
@@ -216,8 +189,11 @@ if [ "$DB_FROM_TEMPLATE" -eq 1 ]; then
 else
     printf '  database     : %s (credentials are in .env, not shown)\n' "$(db_hostport "$DB_URL")"
 fi
-printf '  admin user   : admin (password is in .env, not shown)\n'
-printf '  secrets      : generated EZTEST_SECRET_KEYS, EZTEST_ADMIN_PASSWORD, EZTEST_EXECUTOR_TOKEN\n'
+printf '  admin user   : admin / admin123 (fixed first-start seed; smoke-test.sh uses it)\n'
+printf '                 Change the password in the UI after the first login and update\n'
+printf '                 EZTEST_ADMIN_PASSWORD in .env afterwards.\n'
+printf '  tokens       : executor/renderer use the packaged settings-center defaults;\n'
+printf '                 if you change a token here, change the settings center value too.\n'
 printf '\nNext steps:\n'
 if [ "$DB_FROM_TEMPLATE" -eq 1 ]; then
     printf '  1. Edit %s and set EZTEST_DATABASE_URL.\n' "$ENV_FILE"
@@ -225,6 +201,6 @@ if [ "$DB_FROM_TEMPLATE" -eq 1 ]; then
 else
     printf '  1. Run: bash start-eztest.sh\n'
 fi
-printf '  2. Open http://localhost:6868 and sign in as admin.\n'
+printf '  2. Open http://localhost:6868, sign in as admin/admin123 and change the password.\n'
 printf '  3. Optional: bash smoke-test.sh to verify the whole stack.\n'
 exit 0

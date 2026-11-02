@@ -4,11 +4,12 @@
     Shows the status of an extracted EzTest package.
 
 .DESCRIPTION
-    Reports the API/executor/web pid files, the four HTTP health probes
+    Reports the API/executor/web/renderer pid files, the five HTTP health probes
     (API /healthz, API /api/health with db=ok, executor /healthz with a browser
-    version, web /login) and the PostgreSQL TCP reachability from
-    EZTEST_DATABASE_URL as a table. Exits 0 when everything is healthy, 1 when a
-    component is stopped or degraded (details in the table).
+    version, renderer /healthz with a browser version, web /login) and the
+    PostgreSQL TCP reachability from EZTEST_DATABASE_URL as a table. Exits 0
+    when everything is healthy, 1 when a component is stopped or degraded
+    (details in the table).
 
     Windows PowerShell 5.1 compatible. On Linux use status-eztest.sh.
 #>
@@ -154,13 +155,16 @@ if (-not (Test-Path -LiteralPath $envPath -PathType Leaf)) {
 }
 Import-DotEnv -Path $envPath
 
-$apiEndpoint = ConvertTo-HostPort -Value (Get-EnvValue -Name "EZTEST_HTTP_ADDR" -Default "127.0.0.1:13333") -DefaultPort 13333
+$apiPortValue = Get-EnvValue -Name "EZTEST_API_PORT" -Default "13333"
+if ($apiPortValue -notmatch '^\d+$') { $apiPortValue = "13333" }
 $execEndpoint = ConvertTo-HostPort -Value (Get-EnvValue -Name "EZTEST_EXECUTOR_ADDR" -Default "127.0.0.1:13336") -DefaultPort 13336
+$renderEndpoint = ConvertTo-HostPort -Value (Get-EnvValue -Name "EZTEST_RENDERER_ADDR" -Default "127.0.0.1:13337") -DefaultPort 13337
 $webPortValue = Get-EnvValue -Name "PORT" -Default "6868"
 if ($webPortValue -notmatch '^\d+$') { $webPortValue = "6868" }
 $webHost = Get-EnvValue -Name "HOSTNAME" -Default "127.0.0.1"
-$apiBase = "http://$(Get-ProbeHost -BindHost $apiEndpoint.Host):$($apiEndpoint.Port)"
+$apiBase = "http://127.0.0.1:$([int]$apiPortValue)"
 $execBase = "http://$(Get-ProbeHost -BindHost $execEndpoint.Host):$($execEndpoint.Port)"
+$renderBase = "http://$(Get-ProbeHost -BindHost $renderEndpoint.Host):$($renderEndpoint.Port)"
 $webBase = "http://$(Get-ProbeHost -BindHost $webHost):$([int]$webPortValue)"
 $versionFile = Join-Path $PackageRoot "VERSION"
 $packageVersion = ""
@@ -178,7 +182,7 @@ Write-Row -Component "---------" -State "-----" -Detail "------" -Color "DarkGra
 
 # Processes.
 $processStates = @{}
-foreach ($component in @("api", "executor", "web")) {
+foreach ($component in @("api", "executor", "web", "renderer")) {
     $processId = Get-RecordedPid -Name $component
     $alive = Test-PidAlive -ProcessId $processId
     $processStates[$component] = $alive
@@ -240,6 +244,29 @@ try {
     }
 } catch {
     Write-Row -Component "executor /healthz" -State "UNREACHABLE" -Detail $execBase -Color "Red"
+    $failures++
+}
+
+# Renderer probe.
+try {
+    $renderHealth = Invoke-RawHttp -Url "$renderBase/healthz" -TimeoutSec 8
+    $renderJson = $null
+    try { $renderJson = $renderHealth.Body | ConvertFrom-Json } catch { }
+    $renderBrowser = ""
+    if ($null -ne $renderJson) {
+        $renderBrowser = "$($renderJson.browser)"
+        if ([string]::IsNullOrWhiteSpace($renderBrowser)) { $renderBrowser = "$($renderJson.browserVersion)" }
+    }
+    if ($renderHealth.Status -eq 200 -and $null -ne $renderJson -and $renderJson.status -eq "ok" -and -not [string]::IsNullOrWhiteSpace($renderBrowser)) {
+        Write-Row -Component "renderer /healthz" -State "OK" -Detail "browser=$renderBrowser" -Color "Green"
+    } else {
+        $errorText = ""
+        if ($null -ne $renderJson -and $null -ne $renderJson.error) { $errorText = " error=$($renderJson.error)" }
+        Write-Row -Component "renderer /healthz" -State "DEGRADED" -Detail "HTTP $($renderHealth.Status)$errorText" -Color "Red"
+        $failures++
+    }
+} catch {
+    Write-Row -Component "renderer /healthz" -State "UNREACHABLE" -Detail $renderBase -Color "Red"
     $failures++
 }
 

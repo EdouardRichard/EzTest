@@ -4,24 +4,25 @@
     End-to-end smoke test for an extracted, running EzTest package.
 
 .DESCRIPTION
-    Runs the ten packaging checks from the release checklist against a stack
+    Runs the nine packaging checks from the release checklist against a stack
     started with start-eztest.ps1:
 
       1. PostgreSQL TCP reachable
       2. GET /healthz = 200 {status:ok}
       3. GET /api/health = 200, data.db = ok, data.version equals VERSION
-      4. GET /api/openapi.yaml = 200, Content-Type application/yaml, > 100 kB
-      5. GET /api/versions without a token = 401
-      6. Admin login = 200 and GET /api/auth/me = 200 username=admin
-      7. Executor GET /healthz = 200 status=ok with a browserVersion
-      8. Executor round-trip: context -> goto web /login -> aria snapshot ->
+      4. PDF renderer GET /healthz = 200 status=ok with a browser version
+         (replaces the 0.1 GET /api/openapi.yaml check; 0.2 does not serve it)
+      5. Admin login = 200 with the .env admin seed (admin/admin123) and
+         GET /api/auth/me = 200 username=admin
+      6. Executor GET /healthz = 200 status=ok with a browserVersion
+      7. Executor round-trip: context -> goto web /login -> aria snapshot ->
          PNG screenshot artifact -> delete context (all ok:true)
-      9. GET /login = 200 and the body contains "EzTest"
-     10. The data/ directories exist after start
+      8. GET /login = 200 and the body contains "EzTest"
+      9. The .data/ content directories exist after start
 
     Prints PASS/FAIL per check and a summary; exits non-zero when any check
-    fails. Secrets (the admin password and the executor token) are read from
-    .env but never printed.
+    fails. Secrets (the admin password, executor token and renderer token) are
+    read from .env but never printed.
 
     Windows PowerShell 5.1 compatible. On Linux use smoke-test.sh.
 #>
@@ -187,7 +188,7 @@ function Assert-True {
     if (-not $Condition) { throw $Message }
 }
 
-$script:TotalChecks = 10
+$script:TotalChecks = 9
 $script:PassedChecks = 0
 $script:Failures = New-Object System.Collections.ArrayList
 
@@ -230,13 +231,16 @@ if ($databaseUrl.Length -eq 0 -or $databaseUrl.Contains("<")) {
     exit 2
 }
 
-$apiEndpoint = ConvertTo-HostPort -Value (Get-EnvValue -Name "EZTEST_HTTP_ADDR" -Default "127.0.0.1:13333") -DefaultPort 13333
+$apiPortValue = Get-EnvValue -Name "EZTEST_API_PORT" -Default "13333"
+if ($apiPortValue -notmatch '^\d+$') { $apiPortValue = "13333" }
 $execEndpoint = ConvertTo-HostPort -Value (Get-EnvValue -Name "EZTEST_EXECUTOR_ADDR" -Default "127.0.0.1:13336") -DefaultPort 13336
+$renderEndpoint = ConvertTo-HostPort -Value (Get-EnvValue -Name "EZTEST_RENDERER_ADDR" -Default "127.0.0.1:13337") -DefaultPort 13337
 $webPortValue = Get-EnvValue -Name "PORT" -Default "6868"
 if ($webPortValue -notmatch '^\d+$') { $webPortValue = "6868" }
 $webHost = Get-EnvValue -Name "HOSTNAME" -Default "127.0.0.1"
-$apiBase = "http://$(Get-ProbeHost -BindHost $apiEndpoint.Host):$($apiEndpoint.Port)"
+$apiBase = "http://127.0.0.1:$([int]$apiPortValue)"
 $execBase = "http://$(Get-ProbeHost -BindHost $execEndpoint.Host):$($execEndpoint.Port)"
+$renderBase = "http://$(Get-ProbeHost -BindHost $renderEndpoint.Host):$($renderEndpoint.Port)"
 $webBase = "http://$(Get-ProbeHost -BindHost $webHost):$([int]$webPortValue)"
 $dbEndpoint = Get-DatabaseEndpoint -Url $databaseUrl
 
@@ -247,6 +251,7 @@ Write-Host "  version : $packageVersion"
 Write-Host "  API     : $apiBase"
 Write-Host "  web     : $webBase"
 Write-Host "  executor: $execBase"
+Write-Host "  renderer: $renderBase"
 Write-Host "  database: $($dbEndpoint.Host):$($dbEndpoint.Port) (credentials are not displayed)"
 Write-Host ""
 
@@ -270,19 +275,17 @@ Invoke-SmokeCheck -Number 3 -Name "API GET /api/health has db=ok and the VERSION
     Assert-True ("$($json.data.version)" -eq $packageVersion) "GET /api/health version is '$($json.data.version)', expected '$packageVersion' from the VERSION file."
 }
 
-Invoke-SmokeCheck -Number 4 -Name "API GET /api/openapi.yaml is YAML and >100 kB" -Body {
-    $response = Invoke-RawHttp -Url "$apiBase/api/openapi.yaml"
-    Assert-True ($response.Status -eq 200) "GET /api/openapi.yaml returned HTTP $($response.Status) (docs\openapi\api.yaml missing?)."
-    Assert-True ($response.ContentType -match 'application/yaml') "GET /api/openapi.yaml Content-Type is '$($response.ContentType)', expected application/yaml."
-    Assert-True ($response.Bytes -gt 100000) "GET /api/openapi.yaml returned only $($response.Bytes) bytes, expected more than 100000."
+Invoke-SmokeCheck -Number 4 -Name "Renderer GET /healthz is 200 with a browser version" -Body {
+    $response = Invoke-RawHttp -Url "$renderBase/healthz"
+    Assert-True ($response.Status -eq 200) "Renderer /healthz returned HTTP $($response.Status): $(if ($response.Body.Length -gt 400) { $response.Body.Substring(0, 400) } else { $response.Body })"
+    $json = ConvertFrom-JsonSafe $response.Body
+    Assert-True ($json.status -eq "ok") "Renderer status is '$($json.status)'."
+    $browser = "$($json.browser)"
+    if ([string]::IsNullOrWhiteSpace($browser)) { $browser = "$($json.browserVersion)" }
+    Assert-True (-not [string]::IsNullOrWhiteSpace($browser)) "Renderer reports no browser version: the bundled Chromium did not launch (check logs\renderer.err.log)."
 }
 
-Invoke-SmokeCheck -Number 5 -Name "API GET /api/versions without a token is 401" -Body {
-    $response = Invoke-RawHttp -Url "$apiBase/api/versions"
-    Assert-True ($response.Status -eq 401) "GET /api/versions without a token returned HTTP $($response.Status), expected 401."
-}
-
-Invoke-SmokeCheck -Number 6 -Name "Admin login works and GET /api/auth/me is admin" -Body {
+Invoke-SmokeCheck -Number 5 -Name "Admin login works and GET /api/auth/me is admin" -Body {
     $loginBody = ConvertTo-Json -Compress @{ username = $adminUsername; password = $adminPassword }
     $login = Invoke-RawHttp -Url "$apiBase/api/auth/login" -Method "POST" -BodyJson $loginBody
     Assert-True ($login.Status -eq 200) "POST /api/auth/login returned HTTP $($login.Status) (wrong password in .env or the admin was not seeded?)."
@@ -295,7 +298,7 @@ Invoke-SmokeCheck -Number 6 -Name "Admin login works and GET /api/auth/me is adm
     Assert-True ("$($meJson.data.username)" -eq $adminUsername) "GET /api/auth/me username is '$($meJson.data.username)', expected '$adminUsername'."
 }
 
-Invoke-SmokeCheck -Number 7 -Name "Executor /healthz is 200 with a browserVersion" -Body {
+Invoke-SmokeCheck -Number 6 -Name "Executor /healthz is 200 with a browserVersion" -Body {
     $response = Invoke-RawHttp -Url "$execBase/healthz"
     Assert-True ($response.Status -eq 200) "Executor /healthz returned HTTP $($response.Status): $(if ($response.Body.Length -gt 400) { $response.Body.Substring(0, 400) } else { $response.Body })"
     $json = ConvertFrom-JsonSafe $response.Body
@@ -303,7 +306,7 @@ Invoke-SmokeCheck -Number 7 -Name "Executor /healthz is 200 with a browserVersio
     Assert-True (-not [string]::IsNullOrWhiteSpace("$($json.browserVersion)")) "Executor reports no browserVersion: the bundled Chromium did not launch."
 }
 
-Invoke-SmokeCheck -Number 8 -Name "Executor round-trip: context, goto /login, snapshot, screenshot, delete" -Body {
+Invoke-SmokeCheck -Number 7 -Name "Executor round-trip: context, goto /login, snapshot, screenshot, delete" -Body {
     $executorHeaders = @{ Authorization = "Bearer $executorToken" }
     $createBody = ConvertTo-Json -Compress -Depth 6 @{
         key          = "smoke-" + [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
@@ -350,19 +353,19 @@ Invoke-SmokeCheck -Number 8 -Name "Executor round-trip: context, goto /login, sn
     }
 }
 
-Invoke-SmokeCheck -Number 9 -Name "Web GET /login is 200 and renders EzTest" -Body {
+Invoke-SmokeCheck -Number 8 -Name "Web GET /login is 200 and renders EzTest" -Body {
     $response = Invoke-RawHttp -Url "$webBase/login"
     Assert-True ($response.Status -eq 200) "GET /login returned HTTP $($response.Status) (web .next/static assets missing?)."
     Assert-True ($response.Body -match 'EzTest') "GET /login returned 200 but the body does not contain 'EzTest'."
 }
 
-Invoke-SmokeCheck -Number 10 -Name "Data directories exist" -Body {
+Invoke-SmokeCheck -Number 9 -Name "Data directories exist (.data)" -Body {
     $missing = New-Object System.Collections.ArrayList
-    foreach ($name in @("objects", "version-attachments", "evidence", "reports", "exports")) {
-        $path = Join-Path (Join-Path $PackageRoot "data") $name
+    foreach ($name in @("attachments", "evidence", "reports", "exports")) {
+        $path = Join-Path (Join-Path $PackageRoot ".data") $name
         if (-not (Test-Path -LiteralPath $path -PathType Container)) { [void]$missing.Add($name) }
     }
-    Assert-True ($missing.Count -eq 0) ("Missing data directories: " + ($missing -join ", "))
+    Assert-True ($missing.Count -eq 0) ("Missing .data directories: " + ($missing -join ", "))
 }
 
 Write-Host ""
@@ -375,6 +378,7 @@ foreach ($failure in $script:Failures) { Write-Host "  - $failure" -ForegroundCo
 Write-Host ""
 Write-Host "Check logs\ and PACKAGE.md troubleshooting. Common causes:" -ForegroundColor Yellow
 Write-Host "  - PostgreSQL 17 not running or EZTEST_DATABASE_URL uses the placeholder."
-Write-Host "  - The admin password in .env does not match the seeded admin."
+Write-Host "  - The admin password in .env does not match the seeded admin (admin123 until changed)."
 Write-Host "  - Missing Linux browser system libraries (Linux package: install-linux-deps.sh)."
+Write-Host "  - The PDF renderer or executor cannot launch Chromium (logs\renderer.err.log / logs\executor.err.log)."
 exit 1
