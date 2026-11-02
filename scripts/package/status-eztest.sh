@@ -2,11 +2,11 @@
 # ---------------------------------------------------------------------------
 # Shows the status of an extracted EzTest package (Linux).
 #
-# Reports the API/executor/web pid files, the four HTTP health probes
+# Reports the API/executor/web/renderer pid files, the five HTTP health probes
 # (API /healthz, API /api/health with db=ok, executor /healthz with a browser
-# version, web /login) and the PostgreSQL TCP reachability from
-# EZTEST_DATABASE_URL as a table. Exits 0 when everything is healthy, 1 when a
-# component is stopped or degraded.
+# version, renderer /healthz with a browser version, web /login) and the
+# PostgreSQL TCP reachability from EZTEST_DATABASE_URL as a table. Exits 0 when
+# everything is healthy, 1 when a component is stopped or degraded.
 #
 # No curl/jq needed: HTTP probes use the bundled Node runtime.
 # ---------------------------------------------------------------------------
@@ -136,13 +136,16 @@ row() { # component state detail
 chmod +x "$NODE" 2>/dev/null || true
 load_env
 
-read -r api_host api_port <<<"$(split_host_port "$(env_value EZTEST_HTTP_ADDR '127.0.0.1:13333')" 13333)"
+api_port="$(env_value EZTEST_API_PORT 13333)"
+case "$api_port" in ''|*[!0-9]*) api_port=13333 ;; esac
 read -r exec_host exec_port <<<"$(split_host_port "$(env_value EZTEST_EXECUTOR_ADDR '127.0.0.1:13336')" 13336)"
+read -r render_host render_port <<<"$(split_host_port "$(env_value EZTEST_RENDERER_ADDR '127.0.0.1:13337')" 13337)"
 web_port="$(env_value PORT '6868')"
 case "$web_port" in ''|*[!0-9]*) web_port=6868 ;; esac
 web_host="$(env_value HOSTNAME '127.0.0.1')"
-api_base="http://$(probe_host "$api_host"):$api_port"
+api_base="http://127.0.0.1:$api_port"
 exec_base="http://$(probe_host "$exec_host"):$exec_port"
+render_base="http://$(probe_host "$render_host"):$render_port"
 web_base="http://$(probe_host "$web_host"):$web_port"
 
 package_version=""
@@ -158,7 +161,7 @@ row "Component" "State" "Detail"
 row "---------" "-----" "------"
 
 # Processes.
-for component in api executor web; do
+for component in api executor web renderer; do
     pid_file="$RUN/$component.pid"
     pid=""
     [ -f "$pid_file" ] && pid="$(cat "$pid_file" 2>/dev/null || true)"
@@ -220,6 +223,25 @@ if response="$(http_req "$exec_base/healthz" 2>/dev/null)"; then
     fi
 else
     row "executor /healthz" "UNREACHABLE" "$exec_base"
+    failures=$((failures + 1))
+fi
+
+# Renderer probe.
+if response="$(http_req "$render_base/healthz" 2>/dev/null)"; then
+    status="${response%%$'\n'*}"
+    body="${response#*$'\n'}"
+    render_status="$(printf '%s' "$body" | json_field 'status' 2>/dev/null || true)"
+    browser="$(printf '%s' "$body" | json_field 'browser' 2>/dev/null || true)"
+    [ -z "$browser" ] && browser="$(printf '%s' "$body" | json_field 'browserVersion' 2>/dev/null || true)"
+    error_text="$(printf '%s' "$body" | json_field 'error' 2>/dev/null || true)"
+    if [ "$status" = "200" ] && [ "$render_status" = "ok" ] && [ -n "$browser" ]; then
+        row "renderer /healthz" "OK" "browser=$browser"
+    else
+        row "renderer /healthz" "DEGRADED" "HTTP $status status=$render_status ${error_text}"
+        failures=$((failures + 1))
+    fi
+else
+    row "renderer /healthz" "UNREACHABLE" "$render_base"
     failures=$((failures + 1))
 fi
 

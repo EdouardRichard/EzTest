@@ -2,9 +2,9 @@
 # ---------------------------------------------------------------------------
 # Stops the EzTest stack started by start-eztest.sh.
 #
-# Stops, in order: web, the Playwright executor (whole process group, so
+# Stops, in order: web, the PDF renderer, the Playwright executor (whole process group, so
 # Chromium children die too) and the Go API. Pid files under run/ are removed.
-# PostgreSQL and the data/ directories are left untouched; a missing or stale
+# PostgreSQL and the .data/ directories are left untouched; a missing or stale
 # pid file is reported without failing.
 # ---------------------------------------------------------------------------
 set -u
@@ -37,7 +37,7 @@ fi
 
 stopped=0
 failed=0
-for component in web executor api; do
+for component in web renderer executor api; do
     pid_file="$RUN/$component.pid"
     if [ ! -f "$pid_file" ]; then
         printf '%-10s not running (no pid file)\n' "$component"
@@ -66,12 +66,12 @@ done
 
 printf '\n'
 if [ "$failed" -gt 0 ]; then
-    printf 'EzTest is only partially stopped. PostgreSQL and the data/ directories were left untouched.\n' >&2
+    printf 'EzTest is only partially stopped. PostgreSQL and the .data/ directories were left untouched.\n' >&2
     exit 1
 fi
 if [ "$stopped" -gt 0 ]; then
-    printf 'EzTest stopped. PostgreSQL and the data/ directories were left untouched.\n'
+    printf 'EzTest stopped. PostgreSQL and the .data/ directories were left untouched.\n'
 else
-    printf 'EzTest was not running. PostgreSQL and the data/ directories were left untouched.\n'
+    printf 'EzTest was not running. PostgreSQL and the .data/ directories were left untouched.\n'
 fi
 exit 0
