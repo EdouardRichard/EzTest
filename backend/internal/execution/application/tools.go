@@ -433,6 +433,16 @@ func (s *CaseRunner) HTTP(ctx context.Context, scope tools.Scope, raw json.RawMe
 	if stored.ID > 0 {
 		out["evidence_id"] = platformid.Format(stored.ID)
 	}
+	// Large HTTP results follow the same head+content_ref contract as agent
+	// tool results: inline bytes stay bounded while the content ledger keeps
+	// the full evidence blob addressable through content_ref.
+	if len(response.Body) > 4000 || len(response.Body) > len(body) {
+		out["head"] = truncateString(string(body), 200)
+		out["truncated"] = true
+		if stored.ContentRefID > 0 {
+			out["content_ref"] = platformid.Format(stored.ContentRefID)
+		}
+	}
 	return out, nil
 }
 
