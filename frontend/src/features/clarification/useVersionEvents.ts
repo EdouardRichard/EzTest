@@ -7,6 +7,7 @@ import { getToken } from "@/lib/auth-storage"
 import { connectSSE, type SSEStatus } from "@/lib/sse-client"
 
 import type { ConversationMessage, VersionEvent } from "./types"
+import { mergePartsBySeq, publishJobEvent, publishStreamReset } from "./useConversation"
 
 export type VersionEventHandlers = {
   /** `conversation.message` payload (the full message object, spec §9). */
@@ -60,7 +61,10 @@ function toMessage(payload: Record<string, unknown>): ConversationMessage | null
   }
   if (candidate.role !== "user" && candidate.role !== "assistant") return null
   if (!Array.isArray(candidate.parts)) return null
-  return candidate as unknown as ConversationMessage
+  // Streamed rows may carry `seq`; normalise before the thread renderer sees
+  // them so a repeated row is dropped even if it crossed the SSE boundary.
+  const parts = mergePartsBySeq<unknown>([], candidate.parts)
+  return { ...candidate, parts } as unknown as ConversationMessage
 }
 
 /**
@@ -94,6 +98,10 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
         }
         case "agent.activity":
           handlersRef.current.onAgentActivity?.(payload)
+          break
+        case "job.progress":
+        case "job.finished":
+          publishJobEvent(versionId, payload)
           break
         case "conversation.created":
         case "conversation.summary_updated":
@@ -188,6 +196,7 @@ export function useVersionEvents(versionId: string, handlers: VersionEventHandle
         // `stream.reset` means the cursor fell out of the event window; every
         // feature refetches its snapshot. No second EventSource is opened.
         handlersRef.current.onStreamReset?.(data)
+        publishStreamReset(versionId, data)
       },
       onStatus: (next) => {
         setStatus(next)

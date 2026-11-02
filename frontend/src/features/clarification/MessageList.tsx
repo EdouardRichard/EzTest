@@ -3,9 +3,19 @@
 import { Paperclip } from "lucide-react"
 import { useEffect, useState } from "react"
 
+import { Button } from "@/components/ui/Button"
 import { cn } from "@/components/ui/cn"
 import { EmptyState } from "@/components/ui/EmptyState"
 import { Spinner } from "@/components/ui/Spinner"
+import { ErrorPart as ErrorPartView } from "@/features/conversation/ErrorPart"
+import { JobCard } from "@/features/conversation/JobCard"
+import { ThinkingBlock } from "@/features/conversation/ThinkingBlock"
+import { ToolCallBlock } from "@/features/conversation/ToolCallBlock"
+import type {
+  MessagePart as ConversationMessagePart,
+  ErrorPart as ErrorPayload,
+  JobCardPart,
+} from "@/features/conversation/types"
 import { formatDateTime } from "@/lib/format"
 
 import { downloadContent } from "./api"
@@ -13,6 +23,7 @@ import { RequirementCard } from "./RequirementCard"
 import { RichText } from "./RichText"
 import { RollbackCard } from "./RollbackCard"
 import type { ConversationMessage, ImagePart, MessagePart, RequirementDetail } from "./types"
+import { mergePartsBySeq, useJobCardUpdate } from "./useConversation"
 
 export type MessageListProps = {
   versionId: string
@@ -21,7 +32,16 @@ export type MessageListProps = {
   activity: string | null
   onRequirementSelect: (requirementId: string) => void
   onRequirementChanged?: (requirement: RequirementDetail) => void
+  /** History pagination: true while the messages endpoint has a newer page. */
+  hasMore?: boolean
+  loadingMore?: boolean
+  onLoadMore?: () => void
+  /** Runs the action button of a `error` part. */
+  onErrorAction?: (part: ErrorPayload) => void
 }
+
+/** The clarification thread can carry both the P1 and the 0.2.1 part unions. */
+type RenderablePart = MessagePart | ConversationMessagePart
 
 /**
  * Renders one image part through the authenticated content endpoint: the
@@ -83,18 +103,25 @@ function MessageImage({ part }: { part: ImagePart }) {
   )
 }
 
+function JobCardHost({ versionId, part }: { versionId: string; part: JobCardPart }) {
+  const update = useJobCardUpdate(versionId, part.job_id)
+  return <JobCard versionId={versionId} part={update === null ? part : { ...part, ...update }} />
+}
+
 function MessagePartView({
   versionId,
   messageId,
   part,
   onRequirementSelect,
   onRequirementChanged,
+  onErrorAction,
 }: {
   versionId: string
   messageId: string
-  part: MessagePart
+  part: RenderablePart
   onRequirementSelect: (requirementId: string) => void
   onRequirementChanged?: (requirement: RequirementDetail) => void
+  onErrorAction?: (part: ErrorPayload) => void
 }) {
   switch (part.type) {
     case "text":
@@ -122,12 +149,22 @@ function MessagePartView({
           onRolledBack={onRequirementChanged}
         />
       )
-    default:
+    case "thinking":
+      return <ThinkingBlock part={part} />
+    case "tool_call":
+      return <ToolCallBlock part={part} />
+    case "job_card":
+      return <JobCardHost versionId={versionId} part={part} />
+    case "error":
+      return <ErrorPartView part={part} onAction={onErrorAction} />
+    case "case_card":
+      // Case cards are wired by the design conversation task; the thread
+      // intentionally ignores them until then instead of rendering a bare ID.
       return null
   }
 }
 
-function partKey(part: MessagePart): string {
+function partKey(part: RenderablePart): string {
   switch (part.type) {
     case "text":
       return `text:${part.text.slice(0, 32)}`
@@ -139,6 +176,16 @@ function partKey(part: MessagePart): string {
       return `requirement:${part.requirement_id}`
     case "rollback_proposal":
       return `rollback:${part.requirement_id}`
+    case "thinking":
+      return `thinking:${part.duration_ms}:${part.text.slice(0, 32)}`
+    case "tool_call":
+      return `tool:${part.call_id}`
+    case "job_card":
+      return `job:${part.job_id}`
+    case "case_card":
+      return `case:${part.case_id}`
+    case "error":
+      return `error:${part.code}:${part.message.slice(0, 32)}`
   }
 }
 
@@ -147,15 +194,19 @@ function MessageBubble({
   message,
   onRequirementSelect,
   onRequirementChanged,
+  onErrorAction,
 }: {
   versionId: string
   message: ConversationMessage
   onRequirementSelect: (requirementId: string) => void
   onRequirementChanged?: (requirement: RequirementDetail) => void
+  onErrorAction?: (part: ErrorPayload) => void
 }) {
   const isUser = message.role === "user"
   const seenKeys = new Map<string, number>()
-  const parts = message.parts.map((part) => {
+  // Streamed rows are de-duplicated by seq before they reach the renderer; a
+  // repeated SSE frame therefore cannot render the same part twice.
+  const parts = mergePartsBySeq<RenderablePart>([], message.parts).map((part) => {
     const base = `${message.id}:${partKey(part)}`
     const occurrence = seenKeys.get(base) ?? 0
     seenKeys.set(base, occurrence + 1)
@@ -181,6 +232,7 @@ function MessageBubble({
             part={part}
             onRequirementSelect={onRequirementSelect}
             onRequirementChanged={onRequirementChanged}
+            onErrorAction={onErrorAction}
           />
         ))}
       </div>
@@ -198,6 +250,10 @@ export function MessageList({
   activity,
   onRequirementSelect,
   onRequirementChanged,
+  hasMore = false,
+  loadingMore = false,
+  onLoadMore,
+  onErrorAction,
 }: MessageListProps) {
   return (
     <div
@@ -219,8 +275,17 @@ export function MessageList({
           message={message}
           onRequirementSelect={onRequirementSelect}
           onRequirementChanged={onRequirementChanged}
+          onErrorAction={onErrorAction}
         />
       ))}
+
+      {hasMore && onLoadMore !== undefined ? (
+        <div className="flex justify-center">
+          <Button variant="secondary" size="sm" disabled={loadingMore} onClick={onLoadMore}>
+            {loadingMore ? "加载中…" : "加载更多消息"}
+          </Button>
+        </div>
+      ) : null}
 
       {activity !== null ? (
         <div
