@@ -221,6 +221,21 @@ export async function startLocalPage() {
             </script></body></html>`,
         )
         return
+      case "/visibility":
+        // Mixes rendered and non-rendered interactive nodes so the inventory's
+        // `visible` flag can be asserted for display:none, visibility:hidden and
+        // the hidden attribute.
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8" })
+        res.end(
+          `<!doctype html><html><head><title>Visibility</title></head><body><h1>Visibility</h1>` +
+            `<button id="visible-btn" onclick="mark('visible')">Visible</button>` +
+            `<button id="hidden-display" style="display:none">Hidden display</button>` +
+            `<button id="hidden-visibility" style="visibility:hidden">Hidden visibility</button>` +
+            `<input id="hidden-password" type="password" aria-label="Hidden password" hidden />` +
+            `<a id="visible-link" href="/second">Visible link</a>` +
+            `</body></html>`,
+        )
+        return
       case "/secret-leak":
         res.writeHead(200, { "content-type": "text/html; charset=utf-8" })
         res.end(

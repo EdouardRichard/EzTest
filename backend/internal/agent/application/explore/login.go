@@ -13,8 +13,6 @@ package explore
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -93,7 +91,13 @@ type Element struct {
 	Text     string `json:"text"`
 	Value    string `json:"value"`
 	Disabled bool   `json:"disabled"`
-	Checked  *bool  `json:"checked"`
+	// Visible reports whether the element currently has a layout box and is not
+	// visibility-hidden (executor protocol §13.3). It is a pointer because an
+	// executor predating the flag omits it; a missing flag means "assume
+	// visible", while an explicit false is authoritative (display:none SPA
+	// modals and duplicate legacy forms stay in the DOM).
+	Visible *bool `json:"visible"`
+	Checked *bool `json:"checked"`
 }
 
 // LoginForm is one detected login form. It carries selectors and the page
@@ -250,7 +254,9 @@ type FactRecorder interface {
 }
 
 // SessionStore caches captured storage states by (version SUT, environment,
-// role). resourceapp.SessionStore implements it.
+// role). resourceapp.SessionStore implements it. Ref values are owned by the
+// executor runtime and can go stale (executor restart), so Execute verifies a
+// cached ref before reusing it and invalidates it on an unknown ref.
 type SessionStore interface {
 	Find(ctx context.Context, versionSUTID, environmentID int64, role string) (resourceapp.LoginSession, bool)
 	Save(ctx context.Context, session resourceapp.LoginSession) error
@@ -315,7 +321,10 @@ var (
 	submitHints   = regexp.MustCompile(`(?i)\blog\s*-?\s*in\b|\bsign\s*-?\s*in\b|submit|登录|登陆|提交`)
 	modalHints    = regexp.MustCompile(`(?i)\bdialog\b|\bmodal\b|弹窗`)
 	loginHints    = regexp.MustCompile(`(?i)log\s*-?\s*in|sign\s*-?\s*in|登录|登陆`)
-	credentialErr = regexp.MustCompile(`(?i)invalid|incorrect|wrong|denied|failed|error|失败|错误|不正确|密码错|账号或密码|锁定`)
+	// credentialErr is deliberately credential-specific: it must not match an
+	// unrelated page-level failure ("Request failed", "Error loading widget"),
+	// which is common on an otherwise signed-in destination page.
+	credentialErr = regexp.MustCompile(`(?i)(invalid|incorrect|wrong|unrecognized|unknown)\s+(user\s*name|username|password|credentials?|login|sign\s*-?\s*in|auth(?:entication)?|account)|(user\s*name|username|password|credentials?|login|sign\s*-?\s*in|auth(?:entication)?|account).{0,24}(invalid|incorrect|wrong|denied|rejected|failed|mismatch)|账号或密码|用户名或密码|密码.{0,6}(错误|不正确|有误)|登录失败|登陆失败`)
 	logoutHints   = regexp.MustCompile(`(?i)log\s*-?\s*out|sign\s*-?\s*out|logout|退出`)
 )
 
@@ -352,9 +361,11 @@ func (f *LoginFlow) Detect(ctx context.Context, page Page) (LoginForm, error) {
 	return form, nil
 }
 
-// Execute logs in with account and returns the resulting session fact. A valid
-// cached storage state is reused without any executor call or credential read.
-// A rejected login produces a blocked fact with a recovery action and a nil
+// Execute logs in with account and returns the resulting session fact. A cached
+// storage state is re-seeded on a fresh executor page and reused without any
+// credential read or form interaction; an unknown ref (executor restart) is a
+// cache miss that invalidates the entry and falls back to a fresh login. A
+// rejected login produces a blocked fact with a recovery action and a nil
 // error; only infrastructure failures return an error.
 func (f *LoginFlow) Execute(ctx context.Context, account Account) (SessionFact, error) {
 	if f == nil || f.exec == nil {
@@ -377,16 +388,27 @@ func (f *LoginFlow) Execute(ctx context.Context, account Account) (SessionFact, 
 		return SessionFact{}, errors.New("login flow requires a positive account id")
 	}
 
-	// 1. Reuse a still-valid session: no login form, no credential read.
+	// 1. Reuse a still-valid session: no credential read and no form interaction.
+	// The cached ref is re-seeded on a fresh executor page because the ref lives
+	// in the executor process only: the API cache can outlive an executor
+	// restart and then the ref is unknown. An unknown ref is a cache miss, not a
+	// login failure, so it is invalidated and the flow logs in again.
 	if session, ok := f.sess.Find(ctx, f.cfg.VersionSUTID, f.cfg.EnvironmentID, role); ok && session.StorageStateRef != "" {
-		fact := f.sessionFact(account, role, session.StorageStateRef, true)
-		fact.LoginURL = session.LoginURL
-		fact.Route = session.Route
-		fact.Recipe = session.Recipe
-		if err := f.record(ctx, &fact); err != nil {
-			return SessionFact{}, err
+		verifyURL := strings.TrimSpace(session.LoginURL)
+		if verifyURL == "" {
+			verifyURL = strings.TrimSpace(f.cfg.LoginURL)
 		}
-		return fact, nil
+		if verifyURL == "" {
+			// No page can be opened to re-seed the session; keep the cached
+			// session (the wiring is expected to configure LoginURL).
+			return f.reuse(ctx, account, role, session)
+		}
+		if _, openErr := f.openLoginPage(ctx, verifyURL, session.StorageStateRef); openErr == nil {
+			return f.reuse(ctx, account, role, session)
+		} else if !isUnknownStorageStateRef(openErr) {
+			return f.blocked(account, role, "login_page_unavailable", executorFailureAction(openErr)), nil
+		}
+		f.sess.Invalidate(ctx, f.cfg.VersionSUTID, f.cfg.EnvironmentID, role)
 	}
 
 	// 2. Credentials enter through the account store only.
@@ -397,9 +419,9 @@ func (f *LoginFlow) Execute(ctx context.Context, account Account) (SessionFact, 
 
 	form := f.form
 	if form == nil {
-		opened, openErr := f.openLoginPage(ctx)
+		opened, openErr := f.openLoginPage(ctx, strings.TrimSpace(f.cfg.LoginURL), "")
 		if openErr != nil {
-			return f.blocked(account, role, "login_page_unavailable", ActionRetryLogin), nil
+			return f.blocked(account, role, "login_page_unavailable", executorFailureAction(openErr)), nil
 		}
 		detected, blocked := detectLoginForm(opened, Page{ID: opened.PageID, URL: opened.URL})
 		if blocked != nil {
@@ -422,17 +444,17 @@ func (f *LoginFlow) Execute(ctx context.Context, account Account) (SessionFact, 
 	if _, err := f.exec.Action(ctx, actionFill, map[string]any{
 		"page_id": pageID, "selector": form.UsernameSelector, "value": username,
 	}); err != nil {
-		return f.blocked(account, role, "login_fill_failed", ActionRetryLogin), nil
+		return f.blocked(account, role, "login_fill_failed", executorFailureAction(err)), nil
 	}
 	if _, err := f.exec.Action(ctx, actionFill, map[string]any{
 		"page_id": pageID, "selector": form.PasswordSelector, "value": password, "secret": true,
 	}); err != nil {
-		return f.blocked(account, role, "login_fill_failed", ActionRetryLogin), nil
+		return f.blocked(account, role, "login_fill_failed", executorFailureAction(err)), nil
 	}
 	if _, err := f.exec.Action(ctx, actionClick, map[string]any{
 		"page_id": pageID, "selector": form.SubmitSelector,
 	}); err != nil {
-		return f.blocked(account, role, "login_submit_failed", ActionRetryLogin), nil
+		return f.blocked(account, role, "login_submit_failed", executorFailureAction(err)), nil
 	}
 
 	// 4. Verify and capture the session in one snapshot.
@@ -440,7 +462,7 @@ func (f *LoginFlow) Execute(ctx context.Context, account Account) (SessionFact, 
 		"page_id": pageID, "include_storage_state": true,
 	})
 	if err != nil {
-		return f.blocked(account, role, "login_verification_failed", ActionRetryLogin), nil
+		return f.blocked(account, role, "login_verification_failed", executorFailureAction(err)), nil
 	}
 	snapshot, err := decodePageSnapshot(result)
 	if err != nil {
@@ -455,11 +477,10 @@ func (f *LoginFlow) Execute(ctx context.Context, account Account) (SessionFact, 
 		return f.blocked(account, role, reason, ActionFixCredentials), nil
 	}
 
+	// The executor is the authority for the ref: a locally derived hash would be
+	// unknown to the executor runtime, which alone owns the storageState bytes.
 	ref := strings.TrimSpace(snapshot.StorageStateRef)
 	state := snapshot.StorageState
-	if ref == "" && len(state) > 0 {
-		ref = storageStateRef(state)
-	}
 	if ref == "" {
 		return f.blocked(account, role, "storage_state_unavailable", ActionManualLogin), nil
 	}
@@ -501,6 +522,7 @@ type pageSnapshot struct {
 }
 
 type domSnapshot struct {
+	URL      string    `json:"url"`
 	Title    string    `json:"title"`
 	ARIA     string    `json:"aria"`
 	Route    string    `json:"route"`
@@ -519,6 +541,11 @@ func decodePageSnapshot(result map[string]any) (pageSnapshot, error) {
 	if err := json.Unmarshal(encoded, &snapshot); err != nil {
 		return pageSnapshot{}, fmt.Errorf("decode page snapshot: %w", err)
 	}
+	// explore.snapshot has no top-level url; explore.open does. The DOM snapshot
+	// always carries the page URL, so snapshot-only Detect keeps the login URL.
+	if snapshot.URL == "" {
+		snapshot.URL = snapshot.DOM.URL
+	}
 	return snapshot, nil
 }
 
@@ -526,7 +553,7 @@ func detectLoginForm(snapshot pageSnapshot, page Page) (LoginForm, *BlockedError
 	elements := snapshot.DOM.Elements
 	passwordIndex := -1
 	for i, element := range elements {
-		if element.Disabled || strings.TrimSpace(element.Selector) == "" {
+		if element.Disabled || !elementVisible(element) || strings.TrimSpace(element.Selector) == "" {
 			continue
 		}
 		if strings.EqualFold(strings.TrimSpace(element.Type), "password") {
@@ -622,7 +649,7 @@ func detectLoginForm(snapshot pageSnapshot, page Page) (LoginForm, *BlockedError
 }
 
 func isTextInput(element Element) bool {
-	if strings.TrimSpace(element.Selector) == "" || element.Disabled {
+	if strings.TrimSpace(element.Selector) == "" || element.Disabled || !elementVisible(element) {
 		return false
 	}
 	if !strings.EqualFold(strings.TrimSpace(element.Tag), "input") {
@@ -636,6 +663,9 @@ func isTextInput(element Element) bool {
 }
 
 func isSubmitControl(element Element) bool {
+	if element.Disabled || !elementVisible(element) {
+		return false
+	}
 	tag := strings.ToLower(strings.TrimSpace(element.Tag))
 	if tag == "button" {
 		return true
@@ -648,6 +678,12 @@ func isSubmitControl(element Element) bool {
 		return true
 	}
 	return false
+}
+
+// elementVisible hides non-rendered nodes from form detection. An omitted flag
+// (older executor) is treated as visible for compatibility.
+func elementVisible(element Element) bool {
+	return element.Visible == nil || *element.Visible
 }
 
 func fieldScore(element Element, hints *regexp.Regexp) int {
@@ -667,10 +703,12 @@ func fieldScore(element Element, hints *regexp.Regexp) int {
 
 // loginStillVisible reports whether the post-submit page still looks like the
 // login form (a rejected attempt). A visible password field is the primary
-// signal; an error banner without any signed-in marker is the fallback.
+// signal; a credential-specific error banner without any signed-in marker is the
+// fallback. Invisible (display:none/visibility:hidden) fields are ignored: SPAs
+// routinely hide the login modal or keep a stale duplicate form in the DOM.
 func loginStillVisible(snapshot pageSnapshot) bool {
 	for _, element := range snapshot.DOM.Elements {
-		if element.Disabled {
+		if element.Disabled || !elementVisible(element) {
 			continue
 		}
 		if strings.EqualFold(strings.TrimSpace(element.Type), "password") {
@@ -697,17 +735,34 @@ func errorText(elements []Element) string {
 	return builder.String()
 }
 
-func storageStateRef(state json.RawMessage) string {
-	var canonical any
-	if err := json.Unmarshal(state, &canonical); err != nil {
-		canonical = string(state)
+// isUnknownStorageStateRef reports the executor's "I never captured this ref"
+// error. After an executor restart the API cache still holds the ref but the
+// executor runtime does not, so this is a cache miss rather than a login
+// failure: invalidate the cached session and log in again.
+func isUnknownStorageStateRef(err error) bool {
+	var actionErr *ExecutorActionError
+	if !errors.As(err, &actionErr) {
+		return false
 	}
-	encoded, err := json.Marshal(canonical)
-	if err != nil {
-		encoded = state
+	return actionErr.Code == "invalid_arguments" &&
+		strings.Contains(actionErr.Message, "unknown storage_state_ref")
+}
+
+// executorFailureAction maps an executor action failure to a recovery action.
+// Deterministic failures (bad page/selector/arguments/host) cannot be fixed by
+// retrying, so they ask for a human instead. Timeout, transport, cancellation
+// and capacity failures stay retryable.
+func executorFailureAction(err error) string {
+	var actionErr *ExecutorActionError
+	if !errors.As(err, &actionErr) {
+		return ActionRetryLogin
 	}
-	sum := sha256.Sum256(encoded)
-	return "ss_" + hex.EncodeToString(sum[:])[:16]
+	switch actionErr.Code {
+	case "invalid_arguments", "page_not_found", "target_not_found", "host_not_allowed":
+		return ActionManualLogin
+	default:
+		return ActionRetryLogin
+	}
 }
 
 func loginRecipe(form LoginForm) map[string]any {
@@ -737,13 +792,20 @@ func loginRecipe(form LoginForm) map[string]any {
 	}
 }
 
-func (f *LoginFlow) openLoginPage(ctx context.Context) (pageSnapshot, error) {
-	if strings.TrimSpace(f.cfg.LoginURL) == "" {
+// openLoginPage opens url in a new explore page, optionally re-seeding a
+// captured storage state. Ref values are only ever consumed by the executor;
+// the flow never derives one.
+func (f *LoginFlow) openLoginPage(ctx context.Context, url, storageStateRef string) (pageSnapshot, error) {
+	url = strings.TrimSpace(url)
+	if url == "" {
 		return pageSnapshot{}, errors.New("no login page is configured")
 	}
-	args := map[string]any{"url": f.cfg.LoginURL}
+	args := map[string]any{"url": url}
 	if len(f.cfg.AllowedHosts) > 0 {
 		args["allowed_hosts"] = append([]string(nil), f.cfg.AllowedHosts...)
+	}
+	if storageStateRef != "" {
+		args["storage_state_ref"] = storageStateRef
 	}
 	result, err := f.exec.Action(ctx, actionOpen, args)
 	if err != nil {
@@ -777,6 +839,20 @@ func (f *LoginFlow) blocked(account Account, role, reason, action string) Sessio
 	fact.Reason = reason
 	fact.Action = action
 	return fact
+}
+
+// reuse records the cached session as an active, reused fact. It neither drives
+// the login form nor reads credentials; the caller has already re-seeded the
+// cached ref on a fresh executor page.
+func (f *LoginFlow) reuse(ctx context.Context, account Account, role string, session resourceapp.LoginSession) (SessionFact, error) {
+	fact := f.sessionFact(account, role, session.StorageStateRef, true)
+	fact.LoginURL = session.LoginURL
+	fact.Route = session.Route
+	fact.Recipe = session.Recipe
+	if err := f.record(ctx, &fact); err != nil {
+		return SessionFact{}, err
+	}
+	return fact, nil
 }
 
 // record appends the login_session fact. Recording is part of the successful

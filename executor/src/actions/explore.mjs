@@ -558,6 +558,16 @@ async function readElements(page, selector = null) {
         const tag = node.tagName.toLowerCase()
         const type = tag === "input" ? (node.getAttribute("type") ?? "text").toLowerCase() : null
         const isPassword = type === "password"
+        // Playwright's isVisible semantics: a layout box exists and the
+        // computed visibility is not hidden/collapse. display:none, [hidden]
+        // and type=hidden inputs have no client rects; SPA modals routinely stay
+        // in the DOM while hidden, so the backend must not treat them as
+        // actionable or as proof that a login is still pending.
+        const style = window.getComputedStyle(node)
+        const visible =
+          node.getClientRects().length > 0 &&
+          style.visibility !== "hidden" &&
+          style.visibility !== "collapse"
         let value = null
         if (tag === "input" || tag === "textarea" || tag === "select") {
           const raw = typeof node.value === "string" ? node.value : ""
@@ -586,6 +596,7 @@ async function readElements(page, selector = null) {
           value,
           href: href === null ? null : href.slice(0, 500),
           disabled: Boolean(node.disabled),
+          visible,
           checked:
             typeof node.checked === "boolean" ? node.checked : null,
         }
@@ -626,6 +637,13 @@ export class ExploreRuntime {
   // Captured storage states addressable by a stable `storage_state_ref`. The
   // page/session lifecycle is independent: closing a page (or all pages) keeps
   // the session, so the next page can reuse it.
+  //
+  // Scope/bounds: refs are process-local, runtime-local and never persisted, so
+  // a restart or `close()` makes every previously handed-out ref unknown (the
+  // API side must treat `unknown storage_state_ref` as a cache miss). The map is
+  // not size-bounded: it keeps one entry per distinct capture until the runtime
+  // closes. Task 49 wiring must account for both (re-login on unknown ref and
+  // bounded capture frequency / lifecycle) rather than assuming refs are durable.
   #sessions = new Map()
   #nextPageId = 1
   #launcher

@@ -56,6 +56,10 @@ type sessionKey struct {
 // state needed to re-seed a restarted executor. It deliberately does not
 // persist to the database (0.2.1 has no session migration): a process restart
 // drops the cache and the explorer simply logs in again.
+//
+// A stored ref can still go stale while this process lives (executor restart),
+// so reuse callers must verify the ref with the executor and treat an unknown
+// ref as a cache miss: Invalidate and log in again.
 type SessionStore struct {
 	mu       sync.Mutex
 	ttl      time.Duration

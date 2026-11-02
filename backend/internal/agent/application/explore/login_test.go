@@ -24,38 +24,49 @@ type executorCall struct {
 	args   map[string]any
 }
 
+// fakeReply is one scripted executor response: a successful result or an error.
+type fakeReply struct {
+	result map[string]any
+	err    error
+}
+
 // fakeExecutor scripts explore action responses (one queue per action) and
 // records every call, so the tests assert on the real interaction sequence.
 type fakeExecutor struct {
 	mu     sync.Mutex
-	queues map[string][]map[string]any
-	errs   map[string]error
+	queues map[string][]fakeReply
 	calls  []executorCall
 }
 
 func newFakeExecutor() *fakeExecutor {
-	return &fakeExecutor{queues: map[string][]map[string]any{}, errs: map[string]error{}}
+	return &fakeExecutor{queues: map[string][]fakeReply{}}
 }
 
 func (f *fakeExecutor) queue(action string, results ...map[string]any) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.queues[action] = append(f.queues[action], results...)
+	for _, result := range results {
+		f.queues[action] = append(f.queues[action], fakeReply{result: result})
+	}
+}
+
+func (f *fakeExecutor) queueError(action string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.queues[action] = append(f.queues[action], fakeReply{err: err})
 }
 
 func (f *fakeExecutor) Action(_ context.Context, action string, args map[string]any) (map[string]any, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, executorCall{action: action, args: args})
-	if err, ok := f.errs[action]; ok {
-		return nil, err
-	}
 	queue := f.queues[action]
 	if len(queue) == 0 {
 		return nil, errors.New("fake executor: unexpected action " + action)
 	}
+	reply := queue[0]
 	f.queues[action] = queue[1:]
-	return queue[0], nil
+	return reply.result, reply.err
 }
 
 func (f *fakeExecutor) recorded() []executorCall {
@@ -122,6 +133,30 @@ func element(index int, tag, selector, role, name, typ string) map[string]any {
 		"text":     name,
 		"value":    "",
 		"disabled": false,
+		"visible":  true,
+	}
+}
+
+// hiddenElement is a DOM node present in the inventory but not rendered (e.g. a
+// display:none login modal or a duplicate legacy form).
+func hiddenElement(index int, tag, selector, role, name, typ string) map[string]any {
+	node := element(index, tag, selector, role, name, typ)
+	node["visible"] = false
+	return node
+}
+
+func loggedInState() map[string]any {
+	return map[string]any{
+		"cookies": []any{
+			map[string]any{"name": "sid", "value": "session-token", "domain": "127.0.0.1", "path": "/"},
+		},
+		"origins": []any{
+			map[string]any{
+				"origin":         "http://127.0.0.1:13335",
+				"localStorage":   []any{map[string]any{"name": "token", "value": "session-token"}},
+				"sessionStorage": []any{map[string]any{"name": "flag", "value": "logged-in"}},
+			},
+		},
 	}
 }
 
@@ -153,21 +188,84 @@ func loggedInSnapshot() map[string]any {
 		"page_id":           "page_1",
 		"route":             "/home",
 		"storage_state_ref": "ss_abc123",
-		"storage_state": map[string]any{
-			"cookies": []any{
-				map[string]any{"name": "sid", "value": "session-token", "domain": "127.0.0.1", "path": "/"},
-			},
-			"origins": []any{
-				map[string]any{
-					"origin":         "http://127.0.0.1:13335",
-					"localStorage":   []any{map[string]any{"name": "token", "value": "session-token"}},
-					"sessionStorage": []any{map[string]any{"name": "flag", "value": "logged-in"}},
-				},
-			},
-		},
+		"storage_state":     loggedInState(),
 		"dom_snapshot": map[string]any{
 			"title": "EzTest Home",
 			"aria":  "heading \"Home\"\n  button \"Logout\"",
+			"route": "/home",
+			"elements": []any{
+				element(0, "button", "#logout", "button", "Logout", ""),
+			},
+		},
+	}
+}
+
+// loginSnapshotWithHiddenDuplicate keeps a stale, display:none copy of the form
+// in the DOM ahead of the visible one. Detection must use the visible form.
+func loginSnapshotWithHiddenDuplicate() map[string]any {
+	snapshot := loginSnapshot()
+	snapshot["dom_snapshot"].(map[string]any)["elements"] = []any{
+		hiddenElement(0, "input", "#legacy-username", "textbox", "Username", "text"),
+		hiddenElement(1, "input", "#legacy-password", "textbox", "Password", "password"),
+		hiddenElement(2, "button", "#legacy-submit", "button", "Log in", ""),
+		element(3, "input", "#username", "textbox", "Username", "text"),
+		element(4, "input", "#password", "textbox", "Password", "password"),
+		element(5, "button", "#submit", "button", "Log in", ""),
+	}
+	return snapshot
+}
+
+// hiddenLoginSnapshotOnly has a login form that is entirely display:none, as an
+// SPA leaves it after a successful login.
+func hiddenLoginSnapshotOnly() map[string]any {
+	return map[string]any{
+		"page_id": "page_1",
+		"route":   "/home",
+		"dom_snapshot": map[string]any{
+			"title": "Home",
+			"aria":  "heading \"Home\"",
+			"route": "/home",
+			"elements": []any{
+				hiddenElement(0, "input", "#login-username", "textbox", "Username", "text"),
+				hiddenElement(1, "input", "#login-password", "textbox", "Password", "password"),
+				hiddenElement(2, "button", "#login-submit", "button", "Log in", ""),
+			},
+		},
+	}
+}
+
+// hiddenModalLoggedInSnapshot is the post-submit page of an SPA that hides the
+// login modal instead of unmounting it: the password input stays in the DOM.
+func hiddenModalLoggedInSnapshot() map[string]any {
+	return map[string]any{
+		"page_id":           "page_1",
+		"route":             "/home",
+		"storage_state_ref": "ss_hidden_modal",
+		"storage_state":     loggedInState(),
+		"dom_snapshot": map[string]any{
+			"title": "EzTest Home",
+			"aria":  "heading \"Home\"\n  button \"Logout\"",
+			"route": "/home",
+			"elements": []any{
+				hiddenElement(0, "input", "#login-username", "textbox", "Username", "text"),
+				hiddenElement(1, "input", "#login-password", "textbox", "Password", "password"),
+				element(2, "button", "#logout", "button", "Logout", ""),
+			},
+		},
+	}
+}
+
+// unrelatedErrorSnapshot is a logged-in page whose unrelated widgets failed;
+// generic error wording must not be mistaken for a rejected login.
+func unrelatedErrorSnapshot() map[string]any {
+	return map[string]any{
+		"page_id":           "page_1",
+		"route":             "/home",
+		"storage_state_ref": "ss_after_widget_error",
+		"storage_state":     loggedInState(),
+		"dom_snapshot": map[string]any{
+			"title": "Home",
+			"aria":  "heading \"Home\"\n  alert \"Request failed\"",
 			"route": "/home",
 			"elements": []any{
 				element(0, "button", "#logout", "button", "Logout", ""),
@@ -304,6 +402,7 @@ func TestLoginFlowDetectAndExecute(t *testing.T) {
 
 func TestLoginFlowReusesStorageStateWithoutLoggingIn(t *testing.T) {
 	exec := newFakeExecutor()
+	exec.queue("explore.open", loggedInSnapshot())
 	accounts := &fakeAccounts{username: "alice", password: "s3cret-pw"}
 	sessions := resourceapp.NewSessionStore(time.Hour)
 	if err := sessions.Save(context.Background(), resourceapp.LoginSession{
@@ -313,6 +412,8 @@ func TestLoginFlowReusesStorageStateWithoutLoggingIn(t *testing.T) {
 		AccountRole:     "admin",
 		StorageStateRef: "ss_reused",
 		StorageState:    json.RawMessage(`{"cookies":[{"name":"sid","value":"t"}],"origins":[]}`),
+		LoginURL:        "http://127.0.0.1:13335/login",
+		Route:           "/login",
 		VerifiedAt:      time.Now(),
 	}); err != nil {
 		t.Fatalf("seed session: %v", err)
@@ -330,14 +431,156 @@ func TestLoginFlowReusesStorageStateWithoutLoggingIn(t *testing.T) {
 	if session.StorageStateRef != "ss_reused" {
 		t.Fatalf("storage_state_ref = %q", session.StorageStateRef)
 	}
-	if calls := exec.recorded(); len(calls) != 0 {
-		t.Fatalf("reusing a stored session must not touch the executor, calls = %+v", calls)
+	// Reuse re-seeds the executor from the cached ref (a stale ref must be
+	// detectable), but it must never fill or submit the login form.
+	opens := exec.callsOf("explore.open")
+	if len(opens) != 1 {
+		t.Fatalf("reuse must verify the cached ref with one open, calls = %+v", exec.recorded())
+	}
+	if opens[0].args["storage_state_ref"] != "ss_reused" {
+		t.Fatalf("reuse open args = %+v, want storage_state_ref ss_reused", opens[0].args)
+	}
+	if len(exec.callsOf("explore.fill")) != 0 || len(exec.callsOf("explore.click")) != 0 {
+		t.Fatalf("reusing a stored session must not drive the form, calls = %+v", exec.recorded())
 	}
 	if len(accounts.calls) != 0 {
 		t.Fatalf("reusing a stored session must not read credentials, calls = %v", accounts.calls)
 	}
 	if len(facts.recorded()) != 1 {
 		t.Fatalf("reuse must still record a login_session fact, got %d", len(facts.recorded()))
+	}
+}
+
+// TestLoginUnknownStorageStateRefFallsBackToFreshLogin covers an executor restart:
+// the ref is still in the API cache but the executor no longer knows it, so the
+// verification open returns invalid_arguments. That is a cache miss, not a
+// failure: invalidate the entry and log in again.
+func TestLoginUnknownStorageStateRefFallsBackToFreshLogin(t *testing.T) {
+	exec := newFakeExecutor()
+	exec.queueError("explore.open", &exploreapp.ExecutorActionError{
+		Code:    "invalid_arguments",
+		Message: "unknown storage_state_ref: ss_stale",
+	})
+	exec.queue("explore.open", loginSnapshot())
+	exec.queue("explore.fill", map[string]any{})
+	exec.queue("explore.fill", map[string]any{})
+	exec.queue("explore.click", map[string]any{})
+	exec.queue("explore.snapshot", loggedInSnapshot())
+
+	accounts := &fakeAccounts{username: "alice", password: "s3cret-pw"}
+	sessions := resourceapp.NewSessionStore(time.Hour)
+	if err := sessions.Save(context.Background(), resourceapp.LoginSession{
+		VersionID:       10,
+		VersionSUTID:    7,
+		EnvironmentID:   8,
+		AccountRole:     "admin",
+		StorageStateRef: "ss_stale",
+		StorageState:    json.RawMessage(`{"cookies":[{"name":"sid","value":"expired"}],"origins":[]}`),
+		LoginURL:        "http://127.0.0.1:13335/login",
+		Route:           "/login",
+		VerifiedAt:      time.Now(),
+	}); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+	facts := &fakeFacts{}
+	flow := newFlow(t, exec, accounts, sessions, facts)
+
+	session, err := flow.Execute(context.Background(), exploreapp.Account{ID: 81, Role: "admin"})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if session.Status != exploreapp.SessionActive || session.Reused {
+		t.Fatalf("session = %+v, want a fresh active login", session)
+	}
+	if session.StorageStateRef != "ss_abc123" {
+		t.Fatalf("storage_state_ref = %q, want the freshly captured ref", session.StorageStateRef)
+	}
+	opens := exec.callsOf("explore.open")
+	if len(opens) != 2 {
+		t.Fatalf("open calls = %d, want stale-ref verification then a fresh login", len(opens))
+	}
+	if opens[0].args["storage_state_ref"] != "ss_stale" {
+		t.Fatalf("first open args = %+v, want the cached ref", opens[0].args)
+	}
+	if _, present := opens[1].args["storage_state_ref"]; present {
+		t.Fatalf("fresh login open args = %+v, must not reuse the stale ref", opens[1].args)
+	}
+	if len(accounts.calls) != 1 || accounts.calls[0] != 81 {
+		t.Fatalf("account store calls = %v, want [81]", accounts.calls)
+	}
+	stored, ok := sessions.Find(context.Background(), 7, 8, "admin")
+	if !ok || stored.StorageStateRef != "ss_abc123" {
+		t.Fatalf("stale session was not replaced: %+v (ok=%v)", stored, ok)
+	}
+	if len(facts.recorded()) != 1 {
+		t.Fatalf("a fresh login must record one fact, got %d", len(facts.recorded()))
+	}
+}
+
+// TestLoginExecuteWithoutDetectOpensConfiguredLoginPage covers the caller that
+// skips Detect: Execute opens the configured login URL itself.
+func TestLoginExecuteWithoutDetectOpensConfiguredLoginPage(t *testing.T) {
+	exec := newFakeExecutor()
+	exec.queue("explore.open", loginSnapshot())
+	exec.queue("explore.fill", map[string]any{})
+	exec.queue("explore.fill", map[string]any{})
+	exec.queue("explore.click", map[string]any{})
+	exec.queue("explore.snapshot", loggedInSnapshot())
+	facts := &fakeFacts{}
+	flow := newFlow(t, exec, &fakeAccounts{username: "alice", password: "s3cret-pw"}, resourceapp.NewSessionStore(time.Hour), facts)
+
+	session, err := flow.Execute(context.Background(), exploreapp.Account{ID: 81, Role: "admin"})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if session.Status != exploreapp.SessionActive || session.Reused {
+		t.Fatalf("session = %+v, want a fresh active login", session)
+	}
+	opens := exec.callsOf("explore.open")
+	if len(opens) != 1 {
+		t.Fatalf("open calls = %d, want 1", len(opens))
+	}
+	if opens[0].args["url"] != "http://127.0.0.1:13335/login" {
+		t.Fatalf("open args = %+v, want the configured login URL", opens[0].args)
+	}
+	fills := exec.callsOf("explore.fill")
+	if len(fills) != 2 || fills[0].args["selector"] != "#username" || fills[1].args["selector"] != "#password" {
+		t.Fatalf("fill calls = %+v, want the detected form selectors", fills)
+	}
+	if len(facts.recorded()) != 1 {
+		t.Fatalf("a fresh login must record one fact, got %d", len(facts.recorded()))
+	}
+}
+
+// TestLoginNonRetryableExecutorErrorBlocksManualLogin proves a deterministic
+// executor error (a selector that cannot match) asks for a human instead of
+// scheduling another blind autonomous attempt.
+func TestLoginNonRetryableExecutorErrorBlocksManualLogin(t *testing.T) {
+	exec := newFakeExecutor()
+	exec.queue("explore.snapshot", loginSnapshot())
+	exec.queueError("explore.fill", &exploreapp.ExecutorActionError{
+		Code:    "target_not_found",
+		Message: "no element matched selector #username",
+	})
+	facts := &fakeFacts{}
+	flow := newFlow(t, exec, &fakeAccounts{username: "alice", password: "s3cret-pw"}, resourceapp.NewSessionStore(time.Hour), facts)
+	detect(t, flow)
+
+	session, err := flow.Execute(context.Background(), exploreapp.Account{ID: 81, Role: "admin"})
+	if err != nil {
+		t.Fatalf("a non-retryable executor failure is a blocked outcome: %v", err)
+	}
+	if session.Status != exploreapp.SessionBlocked {
+		t.Fatalf("session status = %q, want blocked", session.Status)
+	}
+	if session.Action != exploreapp.ActionManualLogin {
+		t.Fatalf("blocked action = %q, want %q", session.Action, exploreapp.ActionManualLogin)
+	}
+	if session.Reason != "login_fill_failed" {
+		t.Fatalf("blocked reason = %q", session.Reason)
+	}
+	if len(facts.recorded()) != 0 {
+		t.Fatalf("blocked login must not record a fact")
 	}
 }
 
@@ -405,6 +648,127 @@ func TestLoginDetectWithoutFormIsBlockedWithAction(t *testing.T) {
 	}
 	if blocked.Reason != "login_form_not_found" {
 		t.Fatalf("blocked reason = %q", blocked.Reason)
+	}
+}
+
+func TestLoginDetectIgnoresHiddenDuplicateForm(t *testing.T) {
+	exec := newFakeExecutor()
+	exec.queue("explore.snapshot", loginSnapshotWithHiddenDuplicate())
+	flow := newFlow(t, exec, &fakeAccounts{}, resourceapp.NewSessionStore(time.Hour), &fakeFacts{})
+
+	form, err := flow.Detect(context.Background(), exploreapp.Page{
+		ID:  "page_1",
+		URL: "http://127.0.0.1:13335/login",
+	})
+	if err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+	if form.UsernameSelector != "#username" {
+		t.Fatalf("username selector = %q, want the visible #username (not the display:none duplicate)", form.UsernameSelector)
+	}
+	if form.PasswordSelector != "#password" {
+		t.Fatalf("password selector = %q, want the visible #password (not the display:none duplicate)", form.PasswordSelector)
+	}
+	if form.SubmitSelector != "#submit" {
+		t.Fatalf("submit selector = %q, want the visible #submit", form.SubmitSelector)
+	}
+}
+
+func TestLoginDetectHiddenFormOnlyIsBlocked(t *testing.T) {
+	exec := newFakeExecutor()
+	exec.queue("explore.snapshot", hiddenLoginSnapshotOnly())
+	flow := newFlow(t, exec, &fakeAccounts{}, resourceapp.NewSessionStore(time.Hour), &fakeFacts{})
+
+	_, err := flow.Detect(context.Background(), exploreapp.Page{ID: "page_1", URL: "http://127.0.0.1:13335/home"})
+	if err == nil {
+		t.Fatal("a display:none login form must not be detected")
+	}
+	var blocked *exploreapp.BlockedError
+	if !errors.As(err, &blocked) {
+		t.Fatalf("Detect error = %T, want *BlockedError", err)
+	}
+	if blocked.Reason != "login_form_not_found" {
+		t.Fatalf("blocked reason = %q", blocked.Reason)
+	}
+}
+
+// TestLoginDetectWithPageIDOnlyUsesSnapshotURL covers the snapshot-only Detect
+// path: the caller knows the page id but not the URL, so the URL must come from
+// the snapshot itself (dom_snapshot.url).
+func TestLoginDetectWithPageIDOnlyUsesSnapshotURL(t *testing.T) {
+	snapshot := loginSnapshot()
+	snapshot["dom_snapshot"].(map[string]any)["url"] = "http://127.0.0.1:13335/login"
+	exec := newFakeExecutor()
+	exec.queue("explore.snapshot", snapshot)
+	flow := newFlow(t, exec, &fakeAccounts{}, resourceapp.NewSessionStore(time.Hour), &fakeFacts{})
+
+	form, err := flow.Detect(context.Background(), exploreapp.Page{ID: "page_1"})
+	if err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+	if form.LoginURL != "http://127.0.0.1:13335/login" {
+		t.Fatalf("login URL = %q, want the URL from dom_snapshot.url", form.LoginURL)
+	}
+	if form.Route != "/login" {
+		t.Fatalf("route = %q", form.Route)
+	}
+}
+
+// TestLoginHiddenModalAfterSubmitIsSuccess covers an SPA that hides the login
+// modal instead of unmounting it: the password input stays in the DOM but is
+// not rendered, so the login must be treated as successful.
+func TestLoginHiddenModalAfterSubmitIsSuccess(t *testing.T) {
+	exec := newFakeExecutor()
+	exec.queue("explore.snapshot", loginSnapshot())
+	exec.queue("explore.fill", map[string]any{})
+	exec.queue("explore.fill", map[string]any{})
+	exec.queue("explore.click", map[string]any{})
+	exec.queue("explore.snapshot", hiddenModalLoggedInSnapshot())
+	sessions := resourceapp.NewSessionStore(time.Hour)
+	facts := &fakeFacts{}
+	flow := newFlow(t, exec, &fakeAccounts{username: "alice", password: "s3cret-pw"}, sessions, facts)
+	detect(t, flow)
+
+	session, err := flow.Execute(context.Background(), exploreapp.Account{ID: 81, Role: "admin"})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if session.Status != exploreapp.SessionActive || session.Reused {
+		t.Fatalf("session = %+v, want a fresh active login (hidden modal must not count as still visible)", session)
+	}
+	if session.StorageStateRef != "ss_hidden_modal" {
+		t.Fatalf("storage_state_ref = %q", session.StorageStateRef)
+	}
+	if _, ok := sessions.Find(context.Background(), 7, 8, "admin"); !ok {
+		t.Fatal("successful login must cache the hidden-modal session")
+	}
+	if len(facts.recorded()) != 1 {
+		t.Fatalf("recorded facts = %d, want 1", len(facts.recorded()))
+	}
+}
+
+// TestLoginFlowIgnoresUnrelatedPageErrorsAfterSubmit proves generic page errors
+// ("Request failed") are not treated as a credential rejection.
+func TestLoginFlowIgnoresUnrelatedPageErrorsAfterSubmit(t *testing.T) {
+	exec := newFakeExecutor()
+	exec.queue("explore.snapshot", loginSnapshot())
+	exec.queue("explore.fill", map[string]any{})
+	exec.queue("explore.fill", map[string]any{})
+	exec.queue("explore.click", map[string]any{})
+	exec.queue("explore.snapshot", unrelatedErrorSnapshot())
+	facts := &fakeFacts{}
+	flow := newFlow(t, exec, &fakeAccounts{username: "alice", password: "s3cret-pw"}, resourceapp.NewSessionStore(time.Hour), facts)
+	detect(t, flow)
+
+	session, err := flow.Execute(context.Background(), exploreapp.Account{ID: 81, Role: "admin"})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if session.Status != exploreapp.SessionActive {
+		t.Fatalf("session = %+v, an unrelated page error must not block the login", session)
+	}
+	if session.StorageStateRef != "ss_after_widget_error" {
+		t.Fatalf("storage_state_ref = %q", session.StorageStateRef)
 	}
 }
 

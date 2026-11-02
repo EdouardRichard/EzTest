@@ -149,6 +149,24 @@ test("explore actions run the full open→snapshot→click→fill→extract→sc
   assert.equal(shot.json.artifacts[0].sha256, shot.json.result.screenshot_ref.sha256)
 })
 
+test("explore element inventory reports element visibility", async () => {
+  const opened = await openPage("/visibility")
+  const elements = opened.dom_snapshot.elements
+  const bySelector = new Map(elements.map((element) => [element.selector, element]))
+  assert.equal(bySelector.get("#visible-btn")?.visible, true, JSON.stringify(elements))
+  assert.equal(bySelector.get("#visible-link")?.visible, true, JSON.stringify(elements))
+  assert.equal(bySelector.get("#hidden-display")?.visible, false, JSON.stringify(elements))
+  assert.equal(bySelector.get("#hidden-visibility")?.visible, false, JSON.stringify(elements))
+  assert.equal(bySelector.get("#hidden-password")?.visible, false, JSON.stringify(elements))
+
+  // explore.extract returns the same element shape, so its items carry it too.
+  const extracted = await act("explore.extract", { page_id: opened.page_id })
+  assert.equal(extracted.json.ok, true, extracted.text)
+  const items = new Map(extracted.json.result.items.map((element) => [element.selector, element]))
+  assert.equal(items.get("#visible-btn")?.visible, true)
+  assert.equal(items.get("#hidden-display")?.visible, false)
+})
+
 test("unknown explore actions are rejected with 400 invalid_arguments", async () => {
   for (const action of ["explore.bash", "explore.teleport", "bash", "shell", "explore.exec"]) {
     const response = await act(action, { page_id: "page_1", command: "whoami" })
