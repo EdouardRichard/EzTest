@@ -232,8 +232,9 @@ On Linux, run the bundled `install-linux-deps.sh` once to install the Chromium s
 **13337** before starting.
 
 ```powershell
-# Windows (PowerShell), after expanding the archive
-cd .\eztest-0.2.0-preview.1-windows-x64
+# Windows (PowerShell) — extract and enter the package folder
+Expand-Archive .\eztest-0.2.0-preview.1-windows-x64.zip -DestinationPath .\eztest
+cd .\eztest\eztest-0.2.0-preview.1-windows-x64
 .\init-config.ps1 -DatabaseUrl "postgres://eztest:<password>@localhost:5433/eztest?sslmode=disable"
 .\start-eztest.ps1        # starts API, executor, renderer and web, then waits for health
 .\status-eztest.ps1       # processes, health probes and PostgreSQL status
@@ -241,9 +242,18 @@ cd .\eztest-0.2.0-preview.1-windows-x64
 .\smoke-test.ps1          # end-to-end checks of the running installation
 ```
 
+Run these commands from the folder that directly contains `init-config.ps1` and
+`start-eztest.ps1` (the `eztest-0.2.0-preview.1-windows-x64` directory inside the extraction
+destination). If PowerShell says `.\init-config.ps1` is not recognized, you are in a parent folder —
+use `Get-ChildItem -Recurse -Filter init-config.ps1` to locate the package folder and `cd` into it. If
+script execution is blocked by the execution policy, run
+`powershell -NoProfile -ExecutionPolicy Bypass -File .\init-config.ps1 -DatabaseUrl "..."` instead.
+
 ```bash
-# Linux (x64), after extracting the archive
-cd eztest-0.2.0-preview.1-linux-x64
+# Linux (x64) — extract and enter the package folder
+mkdir -p eztest
+tar -xzf eztest-0.2.0-preview.1-linux-x64.tar.gz -C eztest
+cd eztest/eztest-0.2.0-preview.1-linux-x64
 bash install-linux-deps.sh                                  # once, needs sudo
 bash init-config.sh --database-url "postgres://eztest:<password>@localhost:5433/eztest?sslmode=disable"
 bash start-eztest.sh
