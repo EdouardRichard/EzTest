@@ -25,8 +25,7 @@ var _ llmapp.ChatClient = (*Client)(nil)
 // Legacy P0 values (openai/openai_compatible) read as the chat-completions
 // protocol, so stored rows keep working without a data migration. An unknown
 // protocol is rejected instead of silently defaulting. The OpenAI Responses
-// protocol currently returns a fail-closed placeholder until P4-T2 implements
-// the /responses wire adapter in responses.go.
+// protocol returns the independent /responses wire adapter in responses.go.
 func NewAdapter(cfg llm.Config) (llmapp.Adapter, error) {
 	return newAdapter(cfg, NewClient())
 }
@@ -42,34 +41,10 @@ func newAdapter(cfg llm.Config, client *Client) (llmapp.Adapter, error) {
 	case llm.ProtocolOpenAIChatCompletions:
 		return &chatCompletionsAdapter{client: client, cfg: cfg}, nil
 	case llm.ProtocolOpenAIResponses:
-		return &responsesProtocolAdapter{cfg: cfg}, nil
+		return &responsesAdapter{client: client, cfg: cfg}, nil
 	default:
 		return nil, fmt.Errorf("unknown llm protocol %q", cfg.Protocol)
 	}
-}
-
-// responsesProtocolAdapter is the P4-T1 fail-closed placeholder for the OpenAI
-// Responses protocol. It deliberately never posts to /chat/completions:
-// P4-T2 replaces it with the real wire adapter in responses.go, which speaks
-// POST /responses with input/output items and streaming events.
-type responsesProtocolAdapter struct {
-	cfg llm.Config
-}
-
-var _ llmapp.Adapter = (*responsesProtocolAdapter)(nil)
-
-func (a *responsesProtocolAdapter) Chat(context.Context, llmapp.ChatRequest) (llmapp.ChatResponse, error) {
-	return llmapp.ChatResponse{}, a.notImplemented("chat")
-}
-
-func (a *responsesProtocolAdapter) Stream(context.Context, llmapp.ChatRequest, func(llmapp.Delta)) error {
-	return a.notImplemented("stream")
-}
-
-// notImplemented is the stable, actionable error returned until P4-T2 replaces
-// this placeholder. It wraps ErrNotImplemented so callers can classify it.
-func (a *responsesProtocolAdapter) notImplemented(operation string) error {
-	return fmt.Errorf("llm protocol %q %s is not implemented yet: %w", llm.ProtocolOpenAIResponses, operation, llmapp.ErrNotImplemented)
 }
 
 // chatCompletionsAdapter binds one configuration to the
@@ -165,8 +140,9 @@ func (a *chatCompletionsAdapter) Chat(ctx context.Context, req llmapp.ChatReques
 }
 
 // Stream is not implemented for the chat-completions adapter yet: the P1
-// gateway only requires non-streaming completions. It fails closed with the
-// same sentinel as the Responses placeholder instead of pretending to stream.
+// gateway only requires non-streaming completions. It fails closed with
+// ErrNotImplemented instead of pretending to stream; the Responses adapter in
+// responses.go implements streaming on its own wire protocol.
 func (a *chatCompletionsAdapter) Stream(context.Context, llmapp.ChatRequest, func(llmapp.Delta)) error {
 	return fmt.Errorf("llm chat completions streaming is not implemented yet: %w", llmapp.ErrNotImplemented)
 }

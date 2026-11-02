@@ -1,12 +1,9 @@
 package llminfra_test
 
 import (
-	"context"
-	"errors"
 	"reflect"
 	"testing"
 
-	llmapp "github.com/EdouardRichard/EzTest/backend/internal/llm/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/llm/domain"
 	llminfra "github.com/EdouardRichard/EzTest/backend/internal/llm/infrastructure"
 )
@@ -20,9 +17,6 @@ func protocolConfig(protocol string) llm.Config {
 }
 
 func TestProtocolFactory(t *testing.T) {
-	ctx := context.Background()
-	request := llmapp.ChatRequest{Messages: []llmapp.ChatMessage{{Role: "user", Content: "hi"}}}
-
 	chatAdapter, err := llminfra.NewAdapter(protocolConfig(string(llm.ProtocolOpenAIChatCompletions)))
 	if err != nil {
 		t.Fatalf("NewAdapter(chat completions): %v", err)
@@ -38,14 +32,9 @@ func TestProtocolFactory(t *testing.T) {
 		t.Fatalf("both protocols returned the same adapter type %T", chatAdapter)
 	}
 
-	// The Responses wire adapter is P4-T2. P4-T1 must fail closed instead of
-	// silently posting a chat-completions request.
-	if _, err := responsesAdapter.Chat(ctx, request); !errors.Is(err, llmapp.ErrNotImplemented) {
-		t.Fatalf("responses Chat error = %v, want ErrNotImplemented", err)
-	}
-	if err := responsesAdapter.Stream(ctx, request, func(llmapp.Delta) {}); !errors.Is(err, llmapp.ErrNotImplemented) {
-		t.Fatalf("responses Stream error = %v, want ErrNotImplemented", err)
-	}
+	// P4-T2 replaced the P4-T1 fail-closed Responses placeholder with the real
+	// /responses wire adapter; responses_test.go covers that wire behavior. The
+	// factory must keep returning two distinct protocol implementations.
 
 	if _, err := llminfra.NewAdapter(protocolConfig("anthropic")); err == nil {
 		t.Fatal("NewAdapter(unknown protocol) returned no error")
