@@ -1555,6 +1555,186 @@ func TestReportServiceEnsureReports(t *testing.T) {
 	})
 }
 
+// reportGateSnapshot returns a version report input that satisfies the §5.3
+// report gate: terminal waves with execution data and closed requirements.
+func reportGateSnapshot(versionID int64) delivery.ReportSnapshot {
+	return delivery.ReportSnapshot{
+		Kind:      delivery.ReportKindVersion,
+		VersionID: versionID,
+		Requirements: []delivery.RequirementSnapshot{
+			{ID: 101, VersionID: versionID, Status: "closed"},
+			{ID: 102, VersionID: versionID, Status: "obsolete"},
+		},
+		Waves: []delivery.WaveSnapshot{
+			{ID: 11, VersionID: versionID, Status: "done"},
+			{ID: 12, VersionID: versionID, Status: "cancelled"},
+		},
+		CaseRuns: []delivery.CaseRunSnapshot{
+			{ID: 3001, VersionID: versionID, WaveID: 11, CaseVersionID: 4001, Status: "failed"},
+		},
+	}
+}
+
+// TestReportGateRequiresAllWavesTerminal pins the §5.3 report gate: a version
+// report exists only after execution produced data. Empty versions, versions
+// with an active/unknown wave, terminal waves without case runs and versions
+// with open requirements never produce a report or a report.version job.
+func TestReportGateRequiresAllWavesTerminal(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*delivery.ReportSnapshot)
+		want   bool
+	}{
+		{"terminal waves with execution data", func(*delivery.ReportSnapshot) {}, true},
+		{"empty version has no execution data", func(s *delivery.ReportSnapshot) {
+			s.Requirements = nil
+			s.Waves = nil
+			s.CaseRuns = nil
+		}, false},
+		{"version without waves", func(s *delivery.ReportSnapshot) { s.Waves = nil }, false},
+		{"running wave", func(s *delivery.ReportSnapshot) { s.Waves[0].Status = "running" }, false},
+		{"paused wave", func(s *delivery.ReportSnapshot) { s.Waves[1].Status = "paused" }, false},
+		{"unknown wave status is not terminal", func(s *delivery.ReportSnapshot) { s.Waves[1].Status = "bogus" }, false},
+		{"terminal waves without case runs", func(s *delivery.ReportSnapshot) { s.CaseRuns = nil }, false},
+		{"open requirement", func(s *delivery.ReportSnapshot) { s.Requirements[0].Status = "clarified" }, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshot := reportGateSnapshot(7)
+			tc.mutate(&snapshot)
+			if got := versionReportDue(snapshot); got != tc.want {
+				t.Fatalf("versionReportDue = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("empty version does not create a report or job", func(t *testing.T) {
+		fixture := newReportFixture(t)
+		fixture.data.version[7] = delivery.ReportSnapshot{Kind: delivery.ReportKindVersion, VersionID: 7}
+		_, err := fixture.svc.EnsureVersionReport(context.Background(), 7)
+		var notDue *VersionReportNotDueError
+		if !errors.As(err, &notDue) || notDue.Reason != "no_execution_data" {
+			t.Fatalf("EnsureVersionReport error = %v, want no_execution_data", err)
+		}
+		reports, listErr := fixture.repo.ListReports(context.Background(), 7, ReportFilter{Limit: 100})
+		if listErr != nil || len(reports) != 0 {
+			t.Fatalf("reports = %#v err=%v, want none", reports, listErr)
+		}
+		if len(fixture.tasks.calls) != 0 {
+			t.Fatalf("report jobs = %v, want none", fixture.tasks.calls)
+		}
+	})
+
+	t.Run("pending user-visible blocker keeps the gate closed", func(t *testing.T) {
+		fixture := newReportFixture(t)
+		fixture.data.version[7] = reportGateSnapshot(7)
+		notReady := false
+		fixture.data.versionReady = &notReady
+		_, err := fixture.svc.EnsureVersionReport(context.Background(), 7)
+		var notDue *VersionReportNotDueError
+		if !errors.As(err, &notDue) || notDue.Reason != "pending_user_blocker" {
+			t.Fatalf("EnsureVersionReport error = %v, want pending_user_blocker", err)
+		}
+		if reports, _ := fixture.repo.ListReports(context.Background(), 7, ReportFilter{Limit: 100}); len(reports) != 0 {
+			t.Fatalf("report created while a blocker is pending: %#v", reports)
+		}
+		if len(fixture.tasks.calls) != 0 {
+			t.Fatalf("report jobs = %v, want none", fixture.tasks.calls)
+		}
+	})
+}
+
+// TestOnWaveTerminalEnqueuesReportOnce pins wave-terminal idempotency: repeated
+// callbacks reuse the report/revision and the same report.version job, and a
+// stale terminal callback (a newer wave started) is ignored.
+func TestOnWaveTerminalEnqueuesReportOnce(t *testing.T) {
+	fixture := newReportFixture(t)
+	fixture.data.version[7] = reportGateSnapshot(7)
+
+	first, err := fixture.svc.EnsureVersionReport(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("first EnsureVersionReport: %v", err)
+	}
+	second, err := fixture.svc.EnsureVersionReport(context.Background(), 7)
+	if err != nil || second.ID != first.ID {
+		t.Fatalf("second EnsureVersionReport = %+v err=%v, want report %d", second, err, first.ID)
+	}
+	revisions, err := fixture.repo.ListRevisions(context.Background(), first.ID)
+	if err != nil || len(revisions) != 1 {
+		t.Fatalf("revisions = %+v err=%v, want one draft", revisions, err)
+	}
+	if len(fixture.tasks.calls) != 2 || fixture.tasks.calls[0] != fixture.tasks.calls[1] {
+		t.Fatalf("repeated wave-terminal callback enqueued distinct report jobs: %v", fixture.tasks.calls)
+	}
+
+	// A stale terminal callback arrives after a newer wave started: it must not
+	// create another revision or enqueue another report.version job.
+	stale := reportGateSnapshot(7)
+	stale.Waves = append(stale.Waves, delivery.WaveSnapshot{ID: 13, VersionID: 7, Status: "running"})
+	fixture.data.version[7] = stale
+	if _, err := fixture.svc.EnsureVersionReport(context.Background(), 7); !errors.Is(err, ErrVersionReportNotDue) {
+		t.Fatalf("stale wave-terminal callback error = %v, want ErrVersionReportNotDue", err)
+	}
+	revisions, err = fixture.repo.ListRevisions(context.Background(), first.ID)
+	if err != nil || len(revisions) != 1 {
+		t.Fatalf("stale callback created a revision: %+v err=%v", revisions, err)
+	}
+	if len(fixture.tasks.calls) != 2 {
+		t.Fatalf("stale callback enqueued another report job: %v", fixture.tasks.calls)
+	}
+}
+
+// TestVersionReportKeepsFrozenExecutionData proves the report is rendered from
+// the frozen snapshot (wave counts, failed-case reason, evidence refs) and that
+// an open user-visible issue is never dropped from the input.
+func TestVersionReportKeepsFrozenExecutionData(t *testing.T) {
+	fixture := newReportFixture(t)
+	snapshot := reportGateSnapshot(7)
+	snapshot.Waves = []delivery.WaveSnapshot{{
+		ID: 11, VersionID: 7, Status: "done",
+		Counts: delivery.WaveCountsSnapshot{Total: 2, Passed: 1, Failed: 1},
+	}}
+	snapshot.CaseRuns = []delivery.CaseRunSnapshot{{
+		ID: 3001, VersionID: 7, WaveID: 11, CaseVersionID: 4001, CaseTitle: "checkout",
+		Status: "failed", FailureClass: "application", Summary: "cart total mismatch",
+		FailedAssertionSeq: 2,
+		Evidence: []delivery.EvidenceSnapshot{{
+			ID: 7101, CaseRunID: 3001, Kind: "screenshot",
+			SHA256: strings.Repeat("d", 64), SizeBytes: 42,
+		}},
+	}}
+	snapshot.Issues = []delivery.IssueSnapshot{{
+		ID: 5001, VersionID: 7, Title: "checkout blocked",
+		Status: delivery.IssueStatusOpen, Category: "api", Severity: "major",
+	}}
+	fixture.data.version[7] = snapshot
+
+	report, err := fixture.svc.EnsureVersionReport(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("EnsureVersionReport: %v", err)
+	}
+	if _, err := fixture.svc.Publish(context.Background(), report.ID, 1, "narrative"); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	rendered := fixture.renderer.lastSnapshot
+	if rendered.Kind != delivery.ReportKindVersion || rendered.VersionID != 7 {
+		t.Fatalf("rendered snapshot scope = %+v", rendered)
+	}
+	if len(rendered.Waves) != 1 || rendered.Waves[0].Counts.Failed != 1 || rendered.Waves[0].Counts.Passed != 1 {
+		t.Fatalf("rendered wave counts = %+v", rendered.Waves)
+	}
+	if len(rendered.CaseRuns) != 1 || rendered.CaseRuns[0].Summary != "cart total mismatch" ||
+		rendered.CaseRuns[0].FailureClass != "application" {
+		t.Fatalf("rendered failed case = %+v", rendered.CaseRuns)
+	}
+	if len(rendered.CaseRuns[0].Evidence) != 1 || rendered.CaseRuns[0].Evidence[0].ID != 7101 {
+		t.Fatalf("rendered evidence refs = %+v", rendered.CaseRuns[0].Evidence)
+	}
+	if len(rendered.Issues) != 1 || rendered.Issues[0].Status != delivery.IssueStatusOpen {
+		t.Fatalf("open issue dropped from the report input: %+v", rendered.Issues)
+	}
+}
+
 func TestReportServiceListAndGet(t *testing.T) {
 	fixture := newReportFixture(t)
 	waveReport, waveRevision := fixture.seedWaveReport(7, 12)

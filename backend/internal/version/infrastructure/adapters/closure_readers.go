@@ -388,6 +388,55 @@ func (r *ClosureReaders) CountVersionInflightCaseRuns(ctx context.Context, versi
 	return count, nil
 }
 
+// ExecutionCoverage implements versionapp.VersionExecutionReader: it reports
+// whether the version produced any case_run and how many current confirmed case
+// versions have no terminal latest run (spec §5.3). A latest run that was
+// explicitly skipped counts as terminal, so a deliberate skip can complete the
+// version; pending/running/paused/interrupted/superseded latest runs stay
+// pending work.
+func (r *ClosureReaders) ExecutionCoverage(ctx context.Context, versionID int64) (versionapp.VersionExecutionCoverage, error) {
+	if versionID <= 0 {
+		return versionapp.VersionExecutionCoverage{}, platform.Invalid("version_id", "must be a positive decimal ID")
+	}
+	runs, err := r.versionRuns(ctx, versionID)
+	if err != nil {
+		return versionapp.VersionExecutionCoverage{}, err
+	}
+	coverage := versionapp.VersionExecutionCoverage{HasExecutionData: len(runs) > 0}
+	cases, err := r.deps.Design.ListExecutable(ctx, versionID)
+	if err != nil {
+		return versionapp.VersionExecutionCoverage{}, err
+	}
+	if len(cases) == 0 {
+		return coverage, nil
+	}
+	latest, err := r.deps.CaseRuns.LatestByCaseVersions(ctx, versionID, caseVersionIDs(cases))
+	if err != nil {
+		return versionapp.VersionExecutionCoverage{}, err
+	}
+	for _, item := range cases {
+		run, ok := latest[item.CaseVersionID]
+		if !ok || !terminalVersionCaseRunStatus(run.Status) {
+			coverage.UnconfirmedCases++
+		}
+	}
+	return coverage, nil
+}
+
+// terminalVersionCaseRunStatus mirrors the requirement-closure terminal set:
+// interrupted is redispatched and superseded is a replacement, so neither is
+// an executed outcome for the version completion predicate. skipped is
+// terminal because it is the explicit skip the spec allows.
+func terminalVersionCaseRunStatus(status execution.CaseRunStatus) bool {
+	switch status {
+	case execution.CaseRunPassed, execution.CaseRunFailed, execution.CaseRunBlocked,
+		execution.CaseRunInconclusive, execution.CaseRunSkipped:
+		return true
+	default:
+		return false
+	}
+}
+
 // CountOpenHumanRequests implements versionapp.VersionHumanRequestReader.
 func (r *ClosureReaders) CountOpenHumanRequests(ctx context.Context, versionID int64) (int, error) {
 	if versionID <= 0 {
