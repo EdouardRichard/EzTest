@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -39,6 +41,7 @@ import (
 	designpg "github.com/EdouardRichard/EzTest/backend/internal/design/infrastructure/postgres"
 	"github.com/EdouardRichard/EzTest/backend/internal/design/infrastructure/storageexport"
 	"github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
+	eventingdomain "github.com/EdouardRichard/EzTest/backend/internal/eventing/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/eventing/infrastructure"
 	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
@@ -78,9 +81,13 @@ func hostName() string {
 	return name
 }
 
-// runReconciler scans the P1 control plane every three seconds and once at
-// startup. It only ensures work items; business actions remain in workers. The
-// loop is leader-gated per tick so exactly one replica reconciles (P7 §4.5).
+// runReconciler runs one leader-gated startup scan and then the event-driven
+// wake loop (spec §5.7: a 250–500ms debounce replaces the old 3s poll). Every
+// persisted event is a hint that control-plane state may need repair; the
+// reconciler coalesces bursts into one pass. The leader gate is evaluated per
+// pass, so a leadership change takes effect without restarting the loop. The
+// EZTEST_RECONCILER_POLL_INTERVAL compatibility switch can restore periodic
+// polling until the P10 acceptance run retires it.
 func runReconciler(ctx context.Context, gate orchestrationapp.LeaderGate, reconciler *agentapp.Reconciler) {
 	if reconciler == nil {
 		return
@@ -91,16 +98,54 @@ func runReconciler(ctx context.Context, gate orchestrationapp.LeaderGate, reconc
 		}
 	}
 	p7RunGated(gate, reconcile)
-	ticker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			p7RunGated(gate, reconcile)
+	shouldRun := func() bool { return gate != nil && gate.IsLeader() }
+	if err := reconciler.Run(ctx, shouldRun); err != nil && !errors.Is(err, context.Canceled) {
+		log.Printf("eztest: reconciler loop stopped: %v", err)
+	}
+}
+
+// reconcilerPollInterval is the P2-T5 compatibility switch. Unset/0 (the
+// default) keeps the reconciler fully event-driven; a positive duration, for
+// example "3s", restores the pre-0.2.1 periodic scan until P10 acceptance.
+func reconcilerPollInterval() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("EZTEST_RECONCILER_POLL_INTERVAL"))
+	if raw == "" || raw == "0" || strings.EqualFold(raw, "off") {
+		return 0
+	}
+	if interval, err := time.ParseDuration(raw); err == nil && interval > 0 {
+		return interval
+	}
+	log.Printf("eztest: invalid EZTEST_RECONCILER_POLL_INTERVAL %q; keeping the 3s compatibility poll", raw)
+	return 3 * time.Second
+}
+
+// reconcilerEventVersionID extracts the version scope of a published event so
+// the wake carries diagnostic context. Zero is valid: the pass scans every rule
+// and version anyway.
+func reconcilerEventVersionID(event eventingdomain.Event) int64 {
+	if raw, ok := event.Scope["version_id"]; ok {
+		switch value := raw.(type) {
+		case string:
+			if parsed, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64); err == nil && parsed > 0 {
+				return parsed
+			}
+		case float64:
+			return int64(value)
+		case int64:
+			return value
+		case json.Number:
+			if parsed, err := value.Int64(); err == nil {
+				return parsed
+			}
 		}
 	}
+	const prefix = "version:"
+	if strings.HasPrefix(event.Channel, prefix) {
+		if parsed, err := strconv.ParseInt(strings.TrimPrefix(event.Channel, prefix), 10, 64); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	return 0
 }
 
 // versionTaskEnqueuer adapts the version context's local TaskEnqueuer port to
@@ -1067,9 +1112,29 @@ func main() {
 		Design:          designPlanner,
 		P4:              p4.NewEnsurer(issueSvc, reportSvc, closureSvc, versionCloseSvc),
 		RunningVersions: versionSvc,
+		// R49 stage-entry-job recovery: read the stage and re-enqueue through
+		// the same idempotent dispatcher the stage machine uses.
+		Stages:    versionRepo,
+		StageJobs: dispatcher,
+		// The event-driven loop is the default; the env switch restores the old
+		// periodic scan until P10 acceptance.
+		PollInterval: reconcilerPollInterval(),
 		// P7 report PDF backfill runs after the P4 rules (S1 report §5.5).
 		P7: p7rt.RenderEnsurer,
 	})
+	// Event-driven wake (spec §5.7): every persisted event is a hint that the
+	// control plane may need a repair pass. Notify only signals a coalescing
+	// channel, so a slow observer never delays SSE delivery. Both delivery
+	// paths are wired: local publishes (this replica) and cross-instance events
+	// loaded by the P7 listener, so a worker on any replica wakes the leader.
+	wake := func(_ context.Context, event eventingdomain.Event) error {
+		reconciler.Notify(event.Type, reconcilerEventVersionID(event))
+		return nil
+	}
+	eventSvc.Observe(wake)
+	if p7rt.Listener != nil {
+		p7rt.Listener.Observe(wake)
+	}
 	background.Add(1)
 	go func() {
 		defer background.Done()

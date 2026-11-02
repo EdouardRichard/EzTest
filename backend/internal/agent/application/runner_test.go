@@ -362,6 +362,17 @@ func TestRunnerStopsAtMaxTurnsBudget(t *testing.T) {
 	if !containsEvent(fixture.events, "agent.run.failed") {
 		t.Fatalf("events = %v", eventTypes(fixture.events))
 	}
+	// The failed-run event carries the Task 9 failure taxonomy (spec §5.6), so
+	// the UI can show what happened/impact/next step without parsing the error.
+	var failedPayload map[string]any
+	for _, event := range fixture.events.events {
+		if event.Type == "agent.run.failed" {
+			failedPayload = event.Payload
+		}
+	}
+	if failedPayload["failure_kind"] != string(agentapp.FailureKindBudget) {
+		t.Fatalf("agent.run.failed payload = %#v, want failure_kind %q", failedPayload, agentapp.FailureKindBudget)
+	}
 }
 
 func TestRunnerSoftTimeoutDropsTools(t *testing.T) {
@@ -839,6 +850,104 @@ func TestRunnerRejectsImageWithoutVision(t *testing.T) {
 	}
 	if len(fixture.images.refs) != 0 {
 		t.Fatalf("image bytes loaded before the capability gate: %#v", fixture.images.refs)
+	}
+}
+
+// TestRunnerEnforcesRoleToolWhitelist pins R51: the runner intersects the tools
+// it exposes and executes with the profile role's RoleToolSet, even when an
+// already-stored profile was widened outside the role whitelist (the admin
+// validation is separate defense in depth). A role-denied call returns a typed
+// forbidden tool error, writes the role-denial audit and never reaches the tool
+// port.
+func TestRunnerEnforcesRoleToolWhitelist(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	// Simulate a stored profile widened before the Task 8 admin check existed.
+	profile := fixture.repo.profiles[agentapp.ProfileKeyClarificationHost]
+	profile.AllowedTools = append(append([]string(nil), profile.AllowedTools...), tools.ToolDesignReviewSubmit)
+	fixture.repo.profiles[agentapp.ProfileKeyClarificationHost] = profile
+
+	fixture.chat.responses = []llmapp.ChatResponse{
+		toolCall(tools.ToolDesignReviewSubmit, `{"summary":"x","findings":[]}`),
+		{Content: "该工具不属于当前角色，已跳过。"},
+	}
+	if _, err := mustRun(t, fixture, hostItem()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	// The widened tool must not be exposed to the model.
+	for _, definition := range fixture.chat.request(0).Tools {
+		if definition.Name == tools.ToolDesignReviewSubmit {
+			t.Fatalf("role-denied tool was exposed: %s", definition.Name)
+		}
+	}
+	// The call is rejected with the typed forbidden payload before execution.
+	var toolContent string
+	for _, message := range fixture.chat.request(1).Messages {
+		if message.Role == "tool" {
+			toolContent = message.Content
+		}
+	}
+	var result struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(toolContent), &result); err != nil {
+		t.Fatalf("tool result is not JSON: %q", toolContent)
+	}
+	if result.Error.Code != tools.CodeForbidden {
+		t.Fatalf("tool error code = %q, want %q (payload %s)", result.Error.Code, tools.CodeForbidden, toolContent)
+	}
+	if result.Error.Details["role"] != string(agentapp.RoleAssistant) || result.Error.Details["tool"] != tools.ToolDesignReviewSubmit {
+		t.Fatalf("forbidden details = %#v", result.Error.Details)
+	}
+	if fixture.design.reviewCalls != 0 {
+		t.Fatalf("role-denied tool reached the design port: %d calls", fixture.design.reviewCalls)
+	}
+	fixture.audit.mu.Lock()
+	defer fixture.audit.mu.Unlock()
+	audited := false
+	for _, event := range fixture.audit.events {
+		if event.Action == agentapp.ActionRoleToolDenied && event.TargetID == tools.ToolDesignReviewSubmit {
+			audited = true
+			if event.Metadata["role"] != string(agentapp.RoleAssistant) {
+				t.Fatalf("audit metadata = %#v", event.Metadata)
+			}
+		}
+	}
+	if !audited {
+		t.Fatalf("no %s audit event: %#v", agentapp.ActionRoleToolDenied, fixture.audit.events)
+	}
+}
+
+// TestRunnerSettlesOnWorkItemTokenBudget pins the Task 9 Budget.Decide seam in
+// the real loop: the work item's token budget is hit after the first turn, so
+// the next request is a tool-less settlement turn and the run ends with the
+// model's final text instead of spending another tool turn.
+func TestRunnerSettlesOnWorkItemTokenBudget(t *testing.T) {
+	fixture := newRunnerFixture(t)
+	item := hostItem()
+	item.Budget = json.RawMessage(`{"max_tokens":10,"run_seconds":120,"max_turns_fuse":12}`)
+	fixture.chat.responses = []llmapp.ChatResponse{
+		{
+			ToolCalls: []llmapp.ToolCall{{ID: "call_1", Name: tools.ToolContextVersionPack, Arguments: `{}`}},
+			Usage:     map[string]int{"total_tokens": 10},
+		},
+		{Content: "预算已用尽，以下为收尾回复。"},
+	}
+
+	result, err := mustRun(t, fixture, item)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Status != agent.AgentRunDone {
+		t.Fatalf("result = %#v, want a settled done run", result)
+	}
+	if fixture.chat.requestCount() != 2 {
+		t.Fatalf("chat calls = %d, want tool turn + settlement turn", fixture.chat.requestCount())
+	}
+	if tools := len(fixture.chat.request(1).Tools); tools != 0 {
+		t.Fatalf("settlement turn still exposes %d tools", tools)
 	}
 }
 

@@ -3,6 +3,7 @@ package agentapp_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"slices"
@@ -12,6 +13,8 @@ import (
 
 	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
+	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
+	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
 type fakeProjector struct {
@@ -601,6 +604,229 @@ func TestReconcilerIsNilSafeWithoutDesignReconciler(t *testing.T) {
 		t.Fatalf("Reconcile without a design reconciler: %v", err)
 	}
 }
+
+// fakeStageReader is the version-stage read the R49 stage-job recovery scans.
+type fakeStageReader struct {
+	mu     sync.Mutex
+	states map[int64]version.StageState
+	err    error
+}
+
+func (r *fakeStageReader) GetStage(_ context.Context, versionID int64) (version.StageState, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.err != nil {
+		return version.StageState{}, r.err
+	}
+	state, ok := r.states[versionID]
+	if !ok {
+		return version.StageState{}, version.ErrNotFound
+	}
+	return state, nil
+}
+
+// fakeStageJobs records R49 re-enqueues and mirrors the dispatcher's idempotent
+// creation: the repaired stage-entry item appears in the work queue, so a later
+// scan must not enqueue it again.
+type fakeStageJobs struct {
+	mu    sync.Mutex
+	jobs  []versionapp.StageJob
+	queue *fakeEnsurer
+	err   error
+}
+
+func (f *fakeStageJobs) EnqueueStageJob(_ context.Context, job versionapp.StageJob) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	f.jobs = append(f.jobs, job)
+	if f.queue != nil {
+		f.queue.addItem(job.VersionID, job.Kind, fmt.Sprintf("%d:%s:test", job.VersionID, job.Kind), agent.WorkItemOpen)
+	}
+	return nil
+}
+
+func (f *fakeStageJobs) recorded() []versionapp.StageJob {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]versionapp.StageJob(nil), f.jobs...)
+}
+
+func (e *fakeEnsurer) itemsOfType(versionID int64, workType string) []agent.WorkItem {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	items := make([]agent.WorkItem, 0)
+	for _, item := range e.items {
+		if item.VersionID == versionID && item.Type == workType {
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
+// TestNotifyDebounces proves the event-driven wake coalesces a burst: ten
+// Notify calls inside 100ms schedule exactly one reconciliation pass, and
+// cancellation stops the loop. This is what lets the 3s poll be removed
+// without losing wakeups (spec §5.7).
+func TestNotifyDebounces(t *testing.T) {
+	fixture := newReconcilerFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- fixture.reconciler.Run(ctx, nil) }()
+
+	for i := 0; i < 10; i++ {
+		fixture.reconciler.Notify("test.burst", 10)
+		time.Sleep(10 * time.Millisecond)
+	}
+	// The default debounce is 300ms; wait for the coalesced pass, then one full
+	// window more to prove no second pass was scheduled.
+	deadline := time.Now().Add(2 * time.Second)
+	for fixture.design.callCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if calls := fixture.design.callCount(); calls != 1 {
+		t.Fatalf("reconcile passes = %d after a 10-notify burst, want 1", calls)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if calls := fixture.design.callCount(); calls != 1 {
+		t.Fatalf("reconcile passes = %d, want exactly one coalesced pass", calls)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run returned %v on cancellation", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not stop on context cancellation")
+	}
+}
+
+// TestReconcilerRepairsMissingStageJob pins R49: a running version in a stage
+// whose entry job is missing gets exactly one re-enqueue through the stage-job
+// dispatcher (same idempotency key path), and a second scan does not duplicate
+// it. The catalog mapping mirrors the stage machine: designing owns design.cases,
+// executing owns execute.batch, reporting owns report.version.
+func TestReconcilerRepairsMissingStageJob(t *testing.T) {
+	cases := []struct {
+		name     string
+		stage    version.Stage
+		wantKind string
+	}{
+		{"designing", version.StageDesigning, versionapp.StageJobDesignCases},
+		{"executing", version.StageExecuting, versionapp.StageJobExecuteBatch},
+		{"reporting", version.StageReporting, versionapp.StageJobReportVersion},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			queue := &fakeEnsurer{}
+			jobs := &fakeStageJobs{queue: queue}
+			reconciler := agentapp.NewReconciler(agentapp.ReconcilerDeps{
+				Versions:        &fakeProjector{},
+				Queue:           queue,
+				RunningVersions: &fakeRunningVersions{ids: []int64{10}},
+				Stages: &fakeStageReader{states: map[int64]version.StageState{
+					10: {VersionID: 10, Stage: testCase.stage},
+				}},
+				StageJobs: jobs,
+				Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+			})
+			for pass := 0; pass < 2; pass++ {
+				if err := reconciler.Reconcile(context.Background()); err != nil {
+					t.Fatalf("Reconcile pass %d: %v", pass, err)
+				}
+			}
+			recorded := jobs.recorded()
+			if len(recorded) != 1 {
+				t.Fatalf("stage jobs = %#v, want one re-enqueue (idempotent)", recorded)
+			}
+			if recorded[0].VersionID != 10 || recorded[0].Kind != testCase.wantKind {
+				t.Fatalf("re-enqueued job = %#v, want version 10 %s", recorded[0], testCase.wantKind)
+			}
+			if items := queue.itemsOfType(10, testCase.wantKind); len(items) != 1 {
+				t.Fatalf("%s items = %#v, want one", testCase.wantKind, items)
+			}
+		})
+	}
+
+	t.Run("case_review has no dispatchable entry job", func(t *testing.T) {
+		// The design.cases job can only be dispatched while the version is
+		// designing; the dispatcher rejects it at case_review (stage ownership),
+		// so recovery must not emit a guaranteed 409 on every pass. case_review
+		// itself has no entry job (Task 4/7).
+		queue := &fakeEnsurer{}
+		jobs := &fakeStageJobs{queue: queue}
+		reconciler := agentapp.NewReconciler(agentapp.ReconcilerDeps{
+			Versions:        &fakeProjector{},
+			Queue:           queue,
+			RunningVersions: &fakeRunningVersions{ids: []int64{10}},
+			Stages: &fakeStageReader{states: map[int64]version.StageState{
+				10: {VersionID: 10, Stage: version.StageCaseReview},
+			}},
+			StageJobs: jobs,
+			Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		})
+		if err := reconciler.Reconcile(context.Background()); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		if recorded := jobs.recorded(); len(recorded) != 0 {
+			t.Fatalf("stage jobs = %#v, want none at case_review", recorded)
+		}
+	})
+
+	t.Run("existing entry job is not re-enqueued", func(t *testing.T) {
+		queue := &fakeEnsurer{}
+		queue.addItem(10, versionapp.StageJobDesignCases, "10:design.cases:existing", agent.WorkItemOpen)
+		jobs := &fakeStageJobs{queue: queue}
+		reconciler := agentapp.NewReconciler(agentapp.ReconcilerDeps{
+			Versions:        &fakeProjector{},
+			Queue:           queue,
+			RunningVersions: &fakeRunningVersions{ids: []int64{10}},
+			Stages: &fakeStageReader{states: map[int64]version.StageState{
+				10: {VersionID: 10, Stage: version.StageDesigning},
+			}},
+			StageJobs: jobs,
+			Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		})
+		if err := reconciler.Reconcile(context.Background()); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		if recorded := jobs.recorded(); len(recorded) != 0 {
+			t.Fatalf("stage jobs = %#v, want none while the entry job exists", recorded)
+		}
+		if items := queue.itemsOfType(10, versionapp.StageJobDesignCases); len(items) != 1 {
+			t.Fatalf("design.cases items = %#v, want the existing one", items)
+		}
+	})
+
+	t.Run("stages without an entry job are skipped", func(t *testing.T) {
+		queue := &fakeEnsurer{}
+		jobs := &fakeStageJobs{queue: queue}
+		reconciler := agentapp.NewReconciler(agentapp.ReconcilerDeps{
+			Versions:        &fakeProjector{},
+			Queue:           queue,
+			RunningVersions: &fakeRunningVersions{ids: []int64{10}},
+			Stages: &fakeStageReader{states: map[int64]version.StageState{
+				10: {VersionID: 10, Stage: version.StageClarifying},
+			}},
+			StageJobs: jobs,
+			Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		})
+		if err := reconciler.Reconcile(context.Background()); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		if recorded := jobs.recorded(); len(recorded) != 0 {
+			t.Fatalf("stage jobs = %#v, want none for a stage without an entry job", recorded)
+		}
+	})
+}
+
+var _ agentapp.VersionStageReader = (*fakeStageReader)(nil)
+var _ versionapp.StageJobEnqueuer = (*fakeStageJobs)(nil)
 
 var _ agentapp.VersionProjector = (*fakeProjector)(nil)
 var _ agentapp.ConversationReader = (*fakeConversationReader)(nil)

@@ -355,17 +355,28 @@ func ParseWorkItemPayload(raw json.RawMessage) (WorkItemPayload, error) {
 
 // runState carries one run's mutable state.
 type runState struct {
-	item             agent.WorkItem
-	payload          WorkItemPayload
-	profile          agent.AgentProfile
-	run              agent.AgentRun
-	input            ContextInput
-	packet           agent.ContextPacket
-	model            llmapp.ModelInfo
-	registry         *tools.Registry
-	definitions      []llmapp.ToolDefinition
+	item        agent.WorkItem
+	payload     WorkItemPayload
+	profile     agent.AgentProfile
+	run         agent.AgentRun
+	input       ContextInput
+	packet      agent.ContextPacket
+	model       llmapp.ModelInfo
+	registry    *tools.Registry
+	definitions []llmapp.ToolDefinition
+	// roleTools is the intersection of the profile's allowed tools with the
+	// catalog role whitelist (R51); it is the surface exposed to the model.
+	roleTools tools.ToolSet
+	// roleMapped reports whether the profile maps to one of the seven catalog
+	// roles. Unmapped profiles keep their own frozen contract whitelist.
+	roleMapped bool
+	// roleGuard audits and rejects a call outside the role whitelist. Nil for
+	// profiles not mapped to one of the seven roles (they keep their own frozen
+	// contract whitelist).
+	roleGuard        *RoleToolGuard
 	budget           int
-	softDeadline     time.Time
+	resourceBudget   Budget
+	startedAt        time.Time
 	turns            int
 	usage            map[string]int
 	messages         []llmapp.ChatMessage
@@ -457,6 +468,8 @@ func (r *Runner) Run(ctx context.Context, item agent.WorkItem) (RunResult, error
 		usage:            map[string]int{},
 		conversationKind: conversationKind,
 		team:             teamForProfile(profileKey),
+		resourceBudget:   r.resourceBudget(item, profile),
+		startedAt:        run.StartedAt,
 	}
 
 	hard := time.Duration(r.hardSeconds(profile)) * time.Second
@@ -507,7 +520,7 @@ func (r *Runner) Run(ctx context.Context, item agent.WorkItem) (RunResult, error
 	if err := r.finalizeRequirement(runCtx, state); err != nil {
 		return r.fail(runCtx, state, err)
 	}
-	return r.finish(state, agent.AgentRunDone, "", false)
+	return r.finish(state, agent.AgentRunDone, "", false, Failure{})
 }
 
 // finalizeReport runs the report finalizer hook for report tasks. It is a
@@ -683,9 +696,10 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 
 	// P5/P7 compose the P1–P4 registry with the codeintel/visual/knowledge tool
 	// groups; the profile allowed_tools still select the surface each run may
-	// call.
+	// call, and R51 intersects that surface with the profile role's whitelist.
 	state.registry = tools.NewP7Registry(r.toolDepsForRun(state))
-	state.definitions = state.registry.Definitions(state.profile.AllowedTools)
+	state.roleTools, state.roleGuard, state.roleMapped = roleToolSurface(state.profile, r.audit)
+	state.definitions = state.roleTools.Definitions(state.registry)
 
 	packet, compactInfo, err := r.builder.Build(ctx, state.input)
 	if err != nil {
@@ -699,7 +713,6 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 	state.packet = saved
 	state.budget = compactInfo.Budget
 	state.run.ContextPacketID = &saved.ID
-	state.softDeadline = r.now().Add(time.Duration(r.softSeconds(state.profile)) * time.Second)
 	r.persistCompaction(ctx, state, compactInfo, "threshold")
 	// knowledge_usage is written once per run from the persisted packet; a
 	// failure is logged and never fails the run (contracts §10.3).
@@ -725,7 +738,25 @@ func (r *Runner) loop(ctx context.Context, state *runState) (string, error) {
 			return "", contextRunError(err)
 		}
 		r.publishActivity(state, "thinking", "", "")
-		soft := !r.now().Before(state.softDeadline)
+		// Task 9 budget seam (spec §5.7): completion is structural (a reply
+		// without tool calls ends the run), while tokens/time/turns are decided
+		// here. A hit budget asks for one settlement turn (partial artifacts +
+		// summary) instead of a hard stop; a settlement turn that is still over
+		// budget is exhausted.
+		decision := state.resourceBudget.Decide(Usage{
+			Tokens:   usageTokens(state.usage),
+			Seconds:  r.elapsedSeconds(state),
+			Turns:    state.turns,
+			Settling: state.softNoted,
+		})
+		if decision == BudgetExhaust {
+			return "", &RunError{
+				Reason:    "budget",
+				Retryable: false,
+				Cause:     errors.New("agent run exhausted its budget during the settlement turn"),
+			}
+		}
+		soft := decision == BudgetSettle
 		request := llmapp.ChatRequest{
 			Model:           state.model.Model,
 			Messages:        append([]llmapp.ChatMessage(nil), state.messages...),
@@ -835,9 +866,21 @@ func (r *Runner) executeTools(ctx context.Context, state *runState, calls []llma
 		r.publishActivity(state, "tool", call.Name, "")
 		var payload any
 		var err error
-		if !profileAllowsTool(state.profile, call.Name) {
+		switch {
+		case !profileAllowsTool(state.profile, call.Name):
 			err = tools.Invalid("tool", "tool is not allowed for this profile: "+call.Name)
-		} else {
+		case state.roleGuard != nil:
+			// R51: the runner intersects the profile role's whitelist even when
+			// a stored profile was widened outside it. A denial is a typed
+			// forbidden error and an audit event, never a tool execution.
+			payload, err = state.roleGuard.Execute(ctx, state.registry, scope, call.Name, json.RawMessage(call.Arguments))
+		case !state.roleMapped:
+			// Unmapped profile: the profile whitelist was the only surface and
+			// it already passed the first case.
+			payload, err = state.registry.Execute(ctx, scope, call.Name, json.RawMessage(call.Arguments))
+		case !state.roleTools.Allows(call.Name):
+			err = tools.Forbidden(state.roleTools.Role(), call.Name)
+		default:
 			payload, err = state.registry.Execute(ctx, scope, call.Name, json.RawMessage(call.Arguments))
 		}
 		content := ""
@@ -1129,18 +1172,23 @@ func (r *Runner) postDesignUpdate(ctx context.Context, state *runState, kind age
 
 func (r *Runner) fail(ctx context.Context, state *runState, err error) (RunResult, error) {
 	reason, retryable := classifyFailure(ctx, err)
+	// Task 9 seam: Classify is the contract-facing failure taxonomy (kind/
+	// retryable/user-visible/action). The run's own status stays driven by the
+	// RunError reason so lease/cancel semantics keep their existing behavior;
+	// the classification is attached to the failed event for the UI (spec §5.6).
+	failure := Classify(err)
 	status := agent.AgentRunFailed
 	if reason == "interrupted" || reason == "aborted" {
 		status = agent.AgentRunInterrupted
 	}
-	result, finishErr := r.finish(state, status, reason, retryable)
+	result, finishErr := r.finish(state, status, reason, retryable, failure)
 	if finishErr != nil {
 		return result, finishErr
 	}
 	return result, &RunError{Reason: reason, Retryable: retryable, Cause: err}
 }
 
-func (r *Runner) finish(state *runState, status agent.AgentRunStatus, reason string, retryable bool) (RunResult, error) {
+func (r *Runner) finish(state *runState, status agent.AgentRunStatus, reason string, retryable bool, failure Failure) (RunResult, error) {
 	finishedAt := r.now()
 	state.run.Status = status
 	state.run.Turns = state.turns
@@ -1190,6 +1238,11 @@ func (r *Runner) finish(state *runState, status agent.AgentRunStatus, reason str
 			"run_id":          idText(state.run.ID),
 			"terminal_reason": reason,
 			"retryable":       retryable,
+		}
+		if failure.Kind != "" {
+			payload["failure_kind"] = string(failure.Kind)
+			payload["failure_action"] = failure.Action
+			payload["failure_user_visible"] = failure.UserVisible
 		}
 	}
 	r.publish(state, eventType, payload)
@@ -1731,6 +1784,99 @@ func (r *Runner) softSeconds(profile agent.AgentProfile) int {
 		seconds = defaultSoftSeconds
 	}
 	return seconds
+}
+
+// resourceBudget maps the work item's 0.2.1 budget (spec §5.4: max_tokens /
+// run_seconds / max_turns_fuse) onto the Task 9 Budget policy. Legacy P1-P8
+// items carry no Budget JSON and fall back to the frozen profile limits; the
+// token default is the contract default when neither source sets it.
+func (r *Runner) resourceBudget(item agent.WorkItem, profile agent.AgentProfile) Budget {
+	budget := Budget{
+		MaxTokens:    DefaultBudgetMaxTokens,
+		RunSeconds:   r.softSeconds(profile),
+		MaxTurnsFuse: r.maxTurns(profile),
+	}
+	trimmed := strings.TrimSpace(string(item.Budget))
+	if trimmed == "" || trimmed == "null" {
+		return budget
+	}
+	var declared struct {
+		MaxTokens    int `json:"max_tokens"`
+		RunSeconds   int `json:"run_seconds"`
+		MaxTurnsFuse int `json:"max_turns_fuse"`
+	}
+	if err := json.Unmarshal([]byte(trimmed), &declared); err != nil {
+		return budget
+	}
+	if declared.MaxTokens > 0 {
+		budget.MaxTokens = declared.MaxTokens
+	}
+	if declared.RunSeconds > 0 {
+		budget.RunSeconds = declared.RunSeconds
+	}
+	if declared.MaxTurnsFuse > 0 {
+		budget.MaxTurnsFuse = declared.MaxTurnsFuse
+	}
+	return budget
+}
+
+// elapsedSeconds is the wall-clock usage of the run at the decision point. The
+// manual test clock advances it, matching the pre-Task-9 soft-timeout seam.
+func (r *Runner) elapsedSeconds(state *runState) int {
+	if state == nil || state.startedAt.IsZero() {
+		return 0
+	}
+	seconds := int(r.now().Sub(state.startedAt).Seconds())
+	if seconds < 0 {
+		return 0
+	}
+	return seconds
+}
+
+// usageTokens returns the aggregated token usage the budget compares against.
+// Providers report total_tokens; a provider that only reports the components is
+// summed instead of treated as zero usage.
+func usageTokens(usage map[string]int) int {
+	if total, ok := usage["total_tokens"]; ok && total >= 0 {
+		return total
+	}
+	total := 0
+	for _, value := range usage {
+		total += value
+	}
+	if total < 0 {
+		return 0
+	}
+	return total
+}
+
+// roleToolSurface intersects the profile's allowed tools with the catalog role
+// whitelist (R51). A mapped profile executes through a RoleToolGuard, so a
+// denied call is a typed forbidden error plus an audit event. Profiles outside
+// the seven roles (case_executor, coverage_analyst, version_steward) are not
+// constrained by this catalog and keep their own frozen contract whitelist.
+func roleToolSurface(profile agent.AgentProfile, audit auditapp.Recorder) (tools.ToolSet, *RoleToolGuard, bool) {
+	spec, ok := RoleForProfile(profile.Key)
+	if !ok {
+		return tools.NewToolSet("", profile.AllowedTools), nil, false
+	}
+	roleSet, ok := RoleToolSet(spec.Key)
+	if !ok {
+		// Unknown role is a configuration error: fail closed by exposing
+		// nothing rather than granting the profile set.
+		return tools.NewToolSet("", nil), nil, true
+	}
+	names := make([]string, 0, len(profile.AllowedTools))
+	for _, name := range profile.AllowedTools {
+		if roleSet.Allows(name) {
+			names = append(names, name)
+		}
+	}
+	guard, err := NewRoleToolGuard(spec.Key, audit)
+	if err != nil {
+		return tools.NewToolSet(string(spec.Key), names), nil, true
+	}
+	return tools.NewToolSet(string(spec.Key), names), guard, true
 }
 
 func (r *Runner) hardSeconds(profile agent.AgentProfile) int {

@@ -259,3 +259,30 @@ func TestDispatcherObserverErrorDoesNotSkipBroadcast(t *testing.T) {
 		t.Fatalf("broadcast events = %#v", sink.events)
 	}
 }
+
+// TestDispatcherObserveAddsWakeObserver pins the cross-instance wake seam: a
+// listener-registered observer runs for every delivered event alongside the
+// constructor observer, and an observer failure does not stop the later ones.
+func TestDispatcherObserveAddsWakeObserver(t *testing.T) {
+	event := fixtureEvent(10)
+	reader := &fakeEventReader{events: map[string]eventing.Event{"system|10": event}}
+	sink := &fakeBroadcaster{}
+	dispatcher := NewDispatcher(reader, sink, WithDispatcherObserver(func(context.Context, eventing.Event) error {
+		return errors.New("settings reload failed")
+	}))
+	var woken []int64
+	dispatcher.Observe(func(_ context.Context, got eventing.Event) error {
+		woken = append(woken, got.Seq)
+		return nil
+	})
+
+	if err := dispatcher.Handle(context.Background(), storedRef(t, event)); err == nil {
+		t.Fatal("Handle swallowed the observer error")
+	}
+	if len(woken) != 1 || woken[0] != 10 {
+		t.Fatalf("wake observer = %#v, want one seq 10 delivery", woken)
+	}
+	if len(sink.events) != 1 {
+		t.Fatalf("broadcast events = %d, want 1", len(sink.events))
+	}
+}
