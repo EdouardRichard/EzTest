@@ -11,20 +11,23 @@
          web-build guard (fails when port 6868 or a next dev/build process is
          running - coordinate with frontend-ui / stop the dev stack first).
       1. API cross-builds for windows/amd64 and linux/amd64 with -trimpath and
-         -X <module>/internal/server.Version / .Commit.
+         -X main.version=<Version> (0.2 keeps the version in package main;
+         the v0.1 internal/server.Version symbol no longer exists).
       2. Next.js standalone build once (unless -SkipWebBuild), copy
          .next/standalone + .next/static (and public/ if present), flatten the
          pnpm store into a symlink-free node_modules, prune sharp / @img and
          abort when any platform-native binary remains.
-      3. Executor staging: copy package.json/pnpm-lock/src and install a
-         production, hoisted, symlink-free node_modules.
+      3. Executor + PDF renderer staging: copy package.json/pnpm-lock/src and
+         install production, hoisted, symlink-free node_modules for both
+         services.
       4. Pinned Playwright browsers per OS: cached download + extraction into
          playwright-browsers/<browser>/ with INSTALLATION_COMPLETE markers.
       5. Official Node 22 LTS runtime per OS (node.exe + LICENSE; bin/node +
          LICENSE) from nodejs.org (checks digests against SHASUMS256.txt).
       6. Assemble both package trees (layout in the plan §2), writing VERSION,
          manifest.json, the runtime scripts, PACKAGE.md, THIRD_PARTY_NOTICES.md,
-         .env.example, LICENSE, docs/openapi/api.yaml and the data/ directories.
+         .env.example, LICENSE, docs/openapi/api.yaml. The .data content
+         directories are created by start-eztest.* at runtime, never shipped.
       7. Runtime-script sanity: PowerShell parser check, WSL `bash -n`, expected
          files, forbidden paths (.env/.git/.tools/.data/node_modules/.cache) and
          repository-path/secret leak scans.
@@ -41,7 +44,7 @@
 
 .PARAMETER Version
     Release version stamped into the API binary, VERSION and manifest.json
-    (default 0.1.0-preview.1).
+    (default 0.2.0-preview.1).
 
 .PARAMETER RepoRoot
     Repository root. Defaults to the parent directory of scripts/.
@@ -78,7 +81,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Version = "0.1.0-preview.1",
+    [string]$Version = "0.2.0-preview.1",
     [string]$RepoRoot = "",
     [string]$OutDir = ".tmp/release",
     [string]$ApiBaseUrl = "http://localhost:13333",
@@ -377,9 +380,14 @@ function Invoke-ProcessCapture {
 }
 
 # Runs a process with stdout/stderr redirected to the given log files and
-# returns its exit code (reliable: Start-Process -Wait -PassThru). After the
-# process finishes, the last -TailLines lines of both streams are echoed so a
-# long build is still observable; the complete output stays in the log files.
+# returns its exit code reliably on Windows PowerShell 5.1 and PowerShell 7+.
+#
+# Do NOT use `Start-Process -PassThru` without -Wait here: Windows PowerShell
+# 5.1 returns a process object whose ExitCode is empty in that mode, which would
+# silently turn every failed child (go/pnpm/wsl/smoke script) into exit code 0.
+# .NET Process is used directly instead; it waits only for the direct child, not
+# for its process tree (the packaged start script deliberately leaves the API,
+# executor, web and renderer running), and its ExitCode is always populated.
 function Invoke-ProcessWithLog {
     param(
         [string]$FilePath,
@@ -390,29 +398,41 @@ function Invoke-ProcessWithLog {
         [switch]$Quiet,
         [int]$TailLines = 30
     )
-    $outParent = Split-Path -Parent $StdOutPath
-    if ($outParent -and -not (Test-Path -LiteralPath $outParent -PathType Container)) {
-        New-Item -ItemType Directory -Force -Path $outParent | Out-Null
+    foreach ($logPath in @($StdOutPath, $StdErrPath)) {
+        $parent = Split-Path -Parent $logPath
+        if ($parent -and -not (Test-Path -LiteralPath $parent -PathType Container)) {
+            New-Item -ItemType Directory -Force -Path $parent | Out-Null
+        }
+        if (Test-Path -LiteralPath $logPath) { Remove-Item -LiteralPath $logPath -Force -ErrorAction SilentlyContinue }
     }
-    if (Test-Path -LiteralPath $StdOutPath) { Remove-Item -LiteralPath $StdOutPath -Force -ErrorAction SilentlyContinue }
-    if (Test-Path -LiteralPath $StdErrPath) { Remove-Item -LiteralPath $StdErrPath -Force -ErrorAction SilentlyContinue }
-    $startParams = @{
-        FilePath               = $FilePath
-        ArgumentList           = (Format-ProcessArgumentList -Arguments $Arguments)
-        NoNewWindow            = $true
-        PassThru               = $true
-        RedirectStandardOutput = $StdOutPath
-        RedirectStandardError  = $StdErrPath
-    }
-    if ($WorkingDirectory.Length -gt 0) { $startParams["WorkingDirectory"] = $WorkingDirectory }
-    $process = Start-Process @startParams
-    # Do NOT use Start-Process -Wait here: -Wait waits for the process *tree*, and
-    # the packaged start-eztest script deliberately leaves the API, executor and web
-    # processes running. Waiting for the tree never returns (found while running the
-    # Windows package smoke in the release build). Wait for the launcher only; the
-    # descendants are stopped explicitly by the smoke cleanup.
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $FilePath
+    $psi.Arguments = ((Format-ProcessArgumentList -Arguments $Arguments) -join ' ')
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    try {
+        $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+        $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+    } catch { }
+    if ($WorkingDirectory.Length -gt 0) { $psi.WorkingDirectory = $WorkingDirectory }
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $psi
+    if (-not $process.Start()) { Write-Fail "Could not start process: $FilePath" }
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
     $process.WaitForExit()
     $exitCode = [int]$process.ExitCode
+    $stdoutText = ""
+    $stderrText = ""
+    if ($stdoutTask.Wait(120000)) { try { $stdoutText = [string]$stdoutTask.Result } catch { } }
+    if ($stderrTask.Wait(120000)) { try { $stderrText = [string]$stderrTask.Result } catch { } }
+    $process.Dispose()
+    Write-FileUtf8NoBom -Path $StdOutPath -Text $stdoutText
+    Write-FileUtf8NoBom -Path $StdErrPath -Text $stderrText
+
     if (-not $Quiet) {
         foreach ($stream in @(
             @{ Path = $StdOutPath; Label = "stdout" },
@@ -580,7 +600,7 @@ function Test-BuildPreconditions {
     Write-Info "Work dir   : $($script:WorkRoot)"
     Write-Info "Output dir : $($script:ReleaseDir)"
 
-    foreach ($relative in @("backend\go.mod", "frontend\package.json", "frontend\pnpm-lock.yaml", "executor\package.json", "executor\pnpm-lock.yaml", "docs\openapi\api.yaml", "scripts\package\start-eztest.ps1", "LICENSE")) {
+    foreach ($relative in @("backend\go.mod", "frontend\package.json", "frontend\pnpm-lock.yaml", "executor\package.json", "executor\pnpm-lock.yaml", "renderer\package.json", "renderer\pnpm-lock.yaml", "docs\openapi\api.yaml", "scripts\package\start-eztest.ps1", "LICENSE")) {
         $path = Join-Path $script:RepoRoot $relative
         if (-not (Test-Path -LiteralPath $path)) {
             Write-Fail "Required repository file is missing: $relative"
@@ -639,7 +659,11 @@ function Test-BuildPreconditions {
 function Build-ApiBinaries {
     Write-Step "Go API cross-builds (windows/amd64 + linux/amd64, version $Version)"
     $stage = Join-Path $script:WorkRoot "payload\api"
-    $ldflags = "-s -w -X $($script:GoModulePath)/internal/server.Version=$Version -X $($script:GoModulePath)/internal/server.Commit=$($script:Commit)"
+    # EzTest 0.2 keeps the release version in package main
+    # (backend/cmd/eztest/main.go: `var version = "..."`). The v0.1
+    # internal/server.Version/.Commit symbols no longer exist, and -X on a
+    # missing symbol fails the link, so stamp main.version only.
+    $ldflags = "-s -w -X main.version=$Version"
     Write-Info "ldflags: $ldflags"
 
     $targets = @(
@@ -931,6 +955,63 @@ function Build-ExecutorStage {
     }
     $size = ($files | Measure-Object -Property Length -Sum).Sum
     Write-Info ("Executor staged: {0} files, {1}, playwright {2}" -f $files.Count, (Format-Bytes ([long]$size)), $installedPlaywright)
+}
+
+# ---------------------------------------------------------------------------
+# Step 3b: PDF renderer staging (production, hoisted, symlink-free node_modules).
+# ---------------------------------------------------------------------------
+function Build-RendererStage {
+    Write-Step "PDF renderer staging (production, hoisted node_modules)"
+    $rendererSrc = Join-Path $script:RepoRoot "renderer"
+    $stage = Join-Path $script:WorkRoot "payload\renderer"
+    Remove-TreeSafe -Path $stage
+    New-Item -ItemType Directory -Force -Path $stage | Out-Null
+    foreach ($file in @("package.json", "pnpm-lock.yaml")) {
+        Copy-Item -LiteralPath (Join-Path $rendererSrc $file) -Destination (Join-Path $stage $file) -Force
+    }
+    Copy-Item -LiteralPath (Join-Path $rendererSrc "src") -Destination (Join-Path $stage "src") -Recurse -Force
+
+    $logPath = Join-Path $script:WorkRoot "logs\renderer-install.log"
+    $savedSkipDownload = $env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD
+    $env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1"
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        Write-Info "pnpm install --prod --frozen-lockfile --node-linker=hoisted"
+        $exitCode = Invoke-ProcessWithLog -FilePath $script:PnpmExe `
+            -Arguments @("install", "--prod", "--frozen-lockfile", "--node-linker=hoisted") `
+            -StdOutPath $logPath -StdErrPath ($logPath + ".err") -WorkingDirectory $stage
+    } finally {
+        $env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = $savedSkipDownload
+    }
+    $stopwatch.Stop()
+    if ($exitCode -ne 0) {
+        Write-Fail "pnpm install failed in the renderer staging directory (exit $exitCode). See $logPath."
+    }
+    Write-Info ("pnpm install finished in {0}" -f (Format-Duration $stopwatch.Elapsed.TotalSeconds))
+
+    $nodeModules = Join-Path $stage "node_modules"
+    if (-not (Test-Path -LiteralPath $nodeModules -PathType Container)) {
+        Write-Fail "pnpm install did not create renderer/node_modules."
+    }
+    $files = @(Get-ChildItem -LiteralPath $nodeModules -Recurse -File -Force -ErrorAction SilentlyContinue)
+    $links = @(Get-ChildItem -LiteralPath $nodeModules -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { $_.Attributes -band [System.IO.FileAttributes]::ReparsePoint })
+    if ($links.Count -gt 0) {
+        Write-Fail ("The renderer node_modules contains {0} symlink(s)/junction(s) (e.g. {1}); the package must be symlink-free." -f $links.Count, $links[0].FullName)
+    }
+    $native = @($files | Where-Object { $_.Extension -in @(".node", ".dll", ".so", ".dylib") })
+    if ($native.Count -gt 0) {
+        Write-Fail ("The renderer node_modules contains platform-native binaries (e.g. {0}); the staged renderer must be pure JavaScript." -f $native[0].FullName)
+    }
+    $playwrightPackageJson = Join-Path $nodeModules "playwright\package.json"
+    if (-not (Test-Path -LiteralPath $playwrightPackageJson -PathType Leaf)) {
+        Write-Fail "playwright is missing from the staged renderer node_modules."
+    }
+    $installedPlaywright = (Get-Content -LiteralPath $playwrightPackageJson -Raw | ConvertFrom-Json).version
+    if ($installedPlaywright -ne $script:PinnedPlaywrightVersion) {
+        Write-Fail "Expected playwright $($script:PinnedPlaywrightVersion) in the renderer, found '$installedPlaywright'."
+    }
+    $size = ($files | Measure-Object -Property Length -Sum).Sum
+    Write-Info ("Renderer staged: {0} files, {1}, playwright {2}" -f $files.Count, (Format-Bytes ([long]$size)), $installedPlaywright)
 }
 
 # ---------------------------------------------------------------------------
@@ -1317,6 +1398,7 @@ function Write-Manifest {
         postgres        = [ordered]@{ required = $true; bundled = [bool]$postgresBundled }
         api             = [ordered]@{ version = $Version; binary = $(if ($OsName -eq "windows") { "bin/eztest.exe" } else { "bin/eztest" }) }
         web             = [ordered]@{ api_base_url = $ApiBaseUrl; standalone = $true }
+        renderer        = [ordered]@{ dir = "renderer"; playwright_version = $script:PinnedPlaywrightVersion }
         openapi         = "docs/openapi/api.yaml"
         package_scripts = $script:PackageScripts
     }
@@ -1372,7 +1454,7 @@ function Assemble-Package {
     Remove-TreeSafe -Path $parent
     $packageRoot = Join-Path $parent $packageName
     New-Item -ItemType Directory -Force -Path $packageRoot | Out-Null
-    foreach ($relative in @("bin", "docs\openapi", "web", "executor", "playwright-browsers", "runtime\node", "data\objects", "data\version-attachments", "data\evidence", "data\reports", "data\exports")) {
+    foreach ($relative in @("bin", "docs\openapi", "web", "executor", "renderer", "playwright-browsers", "runtime\node")) {
         New-Item -ItemType Directory -Force -Path (Join-Path $packageRoot $relative) | Out-Null
     }
 
@@ -1381,6 +1463,7 @@ function Assemble-Package {
     Copy-Item -LiteralPath $script:Yaml -Destination (Join-Path $packageRoot "docs\openapi\api.yaml") -Force
     Copy-DirContent -Source (Join-Path $script:WorkRoot "payload\web") -Destination (Join-Path $packageRoot "web")
     Copy-DirContent -Source (Join-Path $script:WorkRoot "payload\executor") -Destination (Join-Path $packageRoot "executor")
+    Copy-DirContent -Source (Join-Path $script:WorkRoot "payload\renderer") -Destination (Join-Path $packageRoot "renderer")
     Copy-DirContent -Source (Join-Path (Join-Path $script:WorkRoot "payload\browsers") $OsName) -Destination (Join-Path $packageRoot "playwright-browsers")
     Copy-DirContent -Source (Join-Path (Join-Path $script:WorkRoot "payload\node") $OsName) -Destination (Join-Path $packageRoot "runtime\node")
 
@@ -1512,7 +1595,7 @@ function Test-PackageTree {
         "docs\openapi\api.yaml", $apiBinary, $nodeBinary, "runtime\node\LICENSE",
         "web\server.js", "web\package.json", "web\.next\required-server-files.json", "web\node_modules\next\package.json",
         "executor\src\server.mjs", "executor\node_modules\playwright\package.json",
-        "data\objects", "data\version-attachments", "data\evidence", "data\reports", "data\exports"
+        "renderer\src\server.mjs", "renderer\src\render.mjs", "renderer\node_modules\playwright\package.json"
     )
     foreach ($name in $script:PackageScripts) { $expected += $name }
     foreach ($relative in $expected) {
@@ -1543,8 +1626,34 @@ function Test-PackageTree {
     $envExample = Join-Path $PackageRoot ".env.example"
     if (Test-Path -LiteralPath $envExample) {
         $exampleText = Read-TextFileUtf8 -Path $envExample
-        if (-not $exampleText.Contains('EZTEST_SECRET_KEYS={"1":"<base64-encoded-32-byte-key>"}')) {
-            [void]$problems.Add(".env.example does not keep the EZTEST_SECRET_KEYS placeholder")
+        $requiredExample = @(
+            "EZTEST_DATABASE_URL=",
+            "EZTEST_API_PORT=13333",
+            "EZTEST_WEB_PORT=6868",
+            "EZTEST_EXECUTOR_PORT=13336",
+            "EZTEST_EXECUTOR_TOKEN=eztest-dev-executor-token",
+            "EZTEST_RENDER_TOKEN=eztest-dev-render-token",
+            "EZTEST_EXECUTOR_ADDR=127.0.0.1:13336",
+            "EZTEST_EXECUTOR_MAX_CONTEXTS=",
+            "EZTEST_EXEC_ALLOWED_HOSTS=",
+            "EZTEST_VISUAL_BASELINE_MAX_BYTES=",
+            "EZTEST_ADMIN_USERNAME=admin",
+            "EZTEST_ADMIN_PASSWORD=admin123",
+            "PLAYWRIGHT_BROWSERS_PATH=__PACKAGE_ROOT__/playwright-browsers",
+            "NODE_ENV=production",
+            "PORT=6868",
+            "HOSTNAME=127.0.0.1"
+        )
+        foreach ($needle in $requiredExample) {
+            if (-not $exampleText.Contains($needle)) {
+                [void]$problems.Add(".env.example is missing the 0.2 key '$needle'")
+            }
+        }
+        $obsoleteExample = @("EZTEST_HTTP_ADDR", "EZTEST_SECRET_KEYS", "EZTEST_SECRET_KEY_ACTIVE", "EZTEST_WEB_ORIGIN", "EZTEST_OPENAPI_PATH", "EZTEST_STORAGE_DIR", "EZTEST_VERSION_ATTACHMENT_DIR", "EZTEST_EVIDENCE_DIR", "EZTEST_REPORT_DIR", "EZTEST_EXPORT_DIR", "EZTEST_GC_ENABLED", "EZTEST_LOG_LEVEL")
+        foreach ($obsolete in $obsoleteExample) {
+            if ($exampleText.Contains($obsolete)) {
+                [void]$problems.Add(".env.example still contains the obsolete 0.1 key '$obsolete'")
+            }
         }
         if (-not $exampleText.Contains("__PACKAGE_ROOT__")) {
             [void]$problems.Add(".env.example lost the __PACKAGE_ROOT__ tokens (init-config would not render absolute paths)")
@@ -1598,7 +1707,7 @@ function Test-PackageTree {
     }
 
     # 4. Web and executor bundles must stay symlink-free and native-free.
-    foreach ($bundle in @("web\node_modules", "executor\node_modules")) {
+    foreach ($bundle in @("web\node_modules", "executor\node_modules", "renderer\node_modules")) {
         $bundlePath = Join-Path $PackageRoot $bundle
         if (-not (Test-Path -LiteralPath $bundlePath -PathType Container)) { continue }
         $links = @(Get-ChildItem -LiteralPath $bundlePath -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { $_.Attributes -band [System.IO.FileAttributes]::ReparsePoint })
@@ -1743,7 +1852,7 @@ function Test-ArchiveContents {
         if ($name -match '(^|/)\.data(/|$)') { [void]$problems.Add("archive contains .data: $name") }
         if ($name -match 'node_modules/\.cache/') { [void]$problems.Add("archive contains node_modules/.cache: $name") }
     }
-    foreach ($required in @("$packageName/VERSION", "$packageName/manifest.json", "$packageName/web/server.js", "$packageName/docs/openapi/api.yaml", "$packageName/runtime/node", "$packageName/playwright-browsers", "$packageName/start-eztest.ps1", "$packageName/start-eztest.sh")) {
+    foreach ($required in @("$packageName/VERSION", "$packageName/manifest.json", "$packageName/web/server.js", "$packageName/docs/openapi/api.yaml", "$packageName/runtime/node", "$packageName/playwright-browsers", "$packageName/renderer/src/server.mjs", "$packageName/renderer/node_modules/playwright/package.json", "$packageName/start-eztest.ps1", "$packageName/start-eztest.sh")) {
         $found = $false
         foreach ($entry in @($entries)) {
             if ("$entry".Trim() -eq $required -or "$entry".Trim().StartsWith($required + "/")) { $found = $true; break }
@@ -1783,6 +1892,7 @@ function Assert-SmokePortsFree {
         @{ Port = 13333; Label = "API" },
         @{ Port = 6868; Label = "web" },
         @{ Port = 13336; Label = "executor" },
+        @{ Port = 13337; Label = "PDF renderer" },
         @{ Port = 55432; Label = "smoke PostgreSQL (Windows)" },
         @{ Port = 55433; Label = "smoke PostgreSQL (Linux)" }
     )
@@ -1799,7 +1909,7 @@ function Assert-SmokePortsFree {
             Write-Fail @"
 The package smoke test needs these ports free, but they are already in use:
   $($inUse -join ", ")
-Stop the dev/demo stack (api 13333, web 6868, executor 13336) and the throw-away PostgreSQL probes,
+Stop the dev/demo stack (api 13333, web 6868, executor 13336, renderer 13337) and the throw-away PostgreSQL probes,
 or re-run with -SkipSmoke to only produce the archives.
 "@
         }
@@ -1891,7 +2001,6 @@ function Invoke-WindowsSmoke {
         if ($initCode -ne 0) { Write-Fail "The packaged init-config.ps1 failed (exit $initCode)." }
         $envPath = Join-Path $packageRoot ".env"
         Set-DotEnvValue -Path $envPath -Name "EZTEST_EXECUTOR_MAX_CONTEXTS" -Value "1"
-        Set-DotEnvValue -Path $envPath -Name "EZTEST_LOG_LEVEL" -Value "info"
 
         Write-Info "Running the packaged start-eztest.ps1"
         $startCode = Invoke-WindowsPowerShellScript -ScriptPath (Join-Path $packageRoot "start-eztest.ps1") -Arguments @() -LogPath (Join-Path $script:WorkRoot "logs\smoke-windows-start.log")
@@ -1910,7 +2019,7 @@ function Invoke-WindowsSmoke {
                 Write-Info "Stopping the smoke package..."
                 [void](Invoke-WindowsPowerShellScript -ScriptPath (Join-Path $packageRoot "stop-eztest.ps1") -Arguments @() -LogPath (Join-Path $script:WorkRoot "logs\smoke-windows-stop.log"))
             }
-            foreach ($component in @("web", "executor", "api")) {
+            foreach ($component in @("web", "renderer", "executor", "api")) {
                 $pidFile = Join-Path $runDir ($component + ".pid")
                 if (Test-Path -LiteralPath $pidFile) {
                     $pidText = (Get-Content -LiteralPath $pidFile -TotalCount 1 -ErrorAction SilentlyContinue)
@@ -2037,6 +2146,7 @@ if ! bash "$PACKAGE/start-eztest.sh"; then
     echo "PACKAGE_START_FAILED"
     echo "--- api log ---"; tail -20 "$PACKAGE/logs/api.err.log" 2>/dev/null; tail -20 "$PACKAGE/logs/api.log" 2>/dev/null
     echo "--- executor log ---"; tail -20 "$PACKAGE/logs/executor.err.log" 2>/dev/null; tail -20 "$PACKAGE/logs/executor.log" 2>/dev/null
+    echo "--- renderer log ---"; tail -20 "$PACKAGE/logs/renderer.err.log" 2>/dev/null; tail -20 "$PACKAGE/logs/renderer.log" 2>/dev/null
     echo "--- web log ---"; tail -20 "$PACKAGE/logs/web.err.log" 2>/dev/null
     exit 1
 fi
@@ -2105,6 +2215,7 @@ function Main {
     Build-ApiBinaries
     Build-WebBundle
     Build-ExecutorStage
+    Build-RendererStage
     Stage-Browsers
     Stage-NodeRuntime
 

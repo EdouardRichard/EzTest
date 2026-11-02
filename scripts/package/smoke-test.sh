@@ -2,19 +2,21 @@
 # ---------------------------------------------------------------------------
 # End-to-end smoke test for an extracted, running EzTest package (Linux).
 #
-# Runs the ten packaging checks from the release checklist against a stack
+# Runs the nine packaging checks from the release checklist against a stack
 # started with start-eztest.sh:
 #   1. PostgreSQL TCP reachable
 #   2. GET /healthz = 200 {status:ok}
 #   3. GET /api/health = 200, data.db = ok, data.version equals VERSION
-#   4. GET /api/openapi.yaml = 200, Content-Type application/yaml, > 100 kB
-#   5. GET /api/versions without a token = 401
-#   6. Admin login = 200 and GET /api/auth/me = 200 username=admin
-#   7. Executor GET /healthz = 200 status=ok with a browserVersion
-#   8. Executor round-trip: context -> goto web /login -> aria snapshot ->
+#   4. PDF renderer GET /healthz = 200 status=ok with a browser version (the 0.2
+#      replacement for the 0.1 GET /api/openapi.yaml check, which 0.2 does not
+#      serve)
+#   5. Admin login = 200 with the .env admin seed (admin/admin123) and
+#      GET /api/auth/me = 200 username=admin
+#   6. Executor GET /healthz = 200 status=ok with a browserVersion
+#   7. Executor round-trip: context -> goto web /login -> aria snapshot ->
 #      PNG screenshot artifact -> delete context (all ok:true)
-#   9. GET /login = 200 and the body contains "EzTest"
-#  10. The data/ directories exist after start
+#   8. GET /login = 200 and the body contains "EzTest"
+#   9. The .data/ content directories exist after start
 #
 # Prints PASS/FAIL per check and a summary; exits non-zero when any check
 # fails. Secrets are read from .env but never printed. No curl/jq needed: HTTP
@@ -26,7 +28,7 @@ PKG="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="$PKG/.env"
 NODE="$PKG/runtime/node/bin/node"
 
-TOTAL=10
+TOTAL=9
 PASSED=0
 FAILURES=()
 
@@ -187,13 +189,16 @@ case "$ADMIN_PASSWORD" in ""|*"<"*) fail_startup "EZTEST_ADMIN_PASSWORD is missi
 [ -n "$EXECUTOR_TOKEN" ] || fail_startup "EZTEST_EXECUTOR_TOKEN is empty in .env; run 'bash init-config.sh' first."
 case "$DATABASE_URL" in ""|*"<"*) fail_startup "EZTEST_DATABASE_URL is not configured in .env." ;; esac
 
-read -r api_host api_port <<<"$(split_host_port "$(env_value EZTEST_HTTP_ADDR '127.0.0.1:13333')" 13333)"
+api_port="$(env_value EZTEST_API_PORT 13333)"
+case "$api_port" in ''|*[!0-9]*) api_port=13333 ;; esac
 read -r exec_host exec_port <<<"$(split_host_port "$(env_value EZTEST_EXECUTOR_ADDR '127.0.0.1:13336')" 13336)"
+read -r render_host render_port <<<"$(split_host_port "$(env_value EZTEST_RENDERER_ADDR '127.0.0.1:13337')" 13337)"
 web_port="$(env_value PORT '6868')"
 case "$web_port" in ''|*[!0-9]*) web_port=6868 ;; esac
 web_host="$(env_value HOSTNAME '127.0.0.1')"
-api_base="http://$(probe_host "$api_host"):$api_port"
+api_base="http://127.0.0.1:$api_port"
 exec_base="http://$(probe_host "$exec_host"):$exec_port"
+render_base="http://$(probe_host "$render_host"):$render_port"
 web_base="http://$(probe_host "$web_host"):$web_port"
 read -r db_host db_port <<<"$(db_host_port "$DATABASE_URL")"
 
@@ -203,6 +208,7 @@ printf '  version : %s\n' "$PACKAGE_VERSION"
 printf '  API     : %s\n' "$api_base"
 printf '  web     : %s\n' "$web_base"
 printf '  executor: %s\n' "$exec_base"
+printf '  renderer: %s\n' "$render_base"
 printf '  database: %s:%s (credentials are not displayed)\n\n' "$db_host" "$db_port"
 
 # --- 1 ---------------------------------------------------------------------
@@ -240,38 +246,24 @@ check_3() {
 
 # --- 4 ---------------------------------------------------------------------
 check_4() {
-    local response status body size content_type
-    response="$(http_req "$api_base/api/openapi.yaml" 2>/dev/null)" || { printf 'The API is not reachable at %s.' "$api_base"; return 1; }
+    local response status body value browser
+    response="$(http_req "$render_base/healthz" 2>/dev/null)" || { printf 'The PDF renderer is not reachable at %s.' "$render_base"; return 1; }
     status="${response%%$'\n'*}"
     body="${response#*$'\n'}"
-    [ "$status" = "200" ] || { printf 'GET /api/openapi.yaml returned HTTP %s (docs/openapi/api.yaml missing?).' "$status"; return 1; }
-    size="$(printf '%s' "$body" | wc -c | tr -d ' ')"
-    [ "$size" -gt 100000 ] || { printf 'GET /api/openapi.yaml returned only %s bytes, expected more than 100000.' "$size"; return 1; }
-    # Content-Type check via a header-only Node request.
-    content_type="$("$NODE" -e '
-const http = require("http")
-http.get(process.argv[1], (response) => {
-  process.stdout.write(String(response.headers["content-type"] || ""))
-  response.resume()
-}).on("error", () => process.exit(3))
-' "$api_base/api/openapi.yaml" 2>/dev/null || true)"
-    case "$content_type" in
-        *application/yaml*) return 0 ;;
-        *) printf "GET /api/openapi.yaml Content-Type is '%s', expected application/yaml." "$content_type"; return 1 ;;
-    esac
+    if [ "$status" != "200" ]; then
+        printf 'Renderer /healthz returned HTTP %s: %s' "$status" "$(printf '%s' "$body" | head -c 400)"
+        return 1
+    fi
+    value="$(printf '%s' "$body" | json_field 'status' 2>/dev/null || true)"
+    [ "$value" = "ok" ] || { printf "Renderer status is '%s'." "$value"; return 1; }
+    browser="$(printf '%s' "$body" | json_field 'browser' 2>/dev/null || true)"
+    [ -z "$browser" ] && browser="$(printf '%s' "$body" | json_field 'browserVersion' 2>/dev/null || true)"
+    [ -n "$browser" ] || { printf 'The renderer reports no browser version: the bundled Chromium did not launch (check logs/renderer.err.log).'; return 1; }
+    return 0
 }
 
 # --- 5 ---------------------------------------------------------------------
 check_5() {
-    local response status
-    response="$(http_req "$api_base/api/versions" 2>/dev/null)" || { printf 'The API is not reachable at %s.' "$api_base"; return 1; }
-    status="${response%%$'\n'*}"
-    [ "$status" = "401" ] || { printf 'GET /api/versions without a token returned HTTP %s, expected 401.' "$status"; return 1; }
-    return 0
-}
-
-# --- 6 ---------------------------------------------------------------------
-check_6() {
     local login_body response status body token me_response me_status me_body me_user
     login_body="$("$NODE" -e 'process.stdout.write(JSON.stringify({username:process.argv[1],password:process.argv[2]}))' "$ADMIN_USER" "$ADMIN_PASSWORD")"
     response="$(http_req "$api_base/api/auth/login" POST "" "$login_body" 2>/dev/null)" || { printf 'The API is not reachable at %s.' "$api_base"; return 1; }
@@ -289,8 +281,8 @@ check_6() {
     return 0
 }
 
-# --- 7 ---------------------------------------------------------------------
-check_7() {
+# --- 6 ---------------------------------------------------------------------
+check_6() {
     local response status body value browser
     response="$(http_req "$exec_base/healthz" 2>/dev/null)" || { printf 'The executor is not reachable at %s.' "$exec_base"; return 1; }
     status="${response%%$'\n'*}"
@@ -306,7 +298,7 @@ check_7() {
     return 0
 }
 
-# --- 8 ---------------------------------------------------------------------
+# --- 7 ---------------------------------------------------------------------
 smoke_context_actions() { # contextId
     local context_id="$1" headers action_url goto_body snapshot_body screenshot_body
     local goto_response goto_status goto_res_body ok snapshot_response snapshot_body_body
@@ -355,7 +347,7 @@ process.stdin.on("data", (chunk) => { data += chunk }).on("end", () => {
     esac
 }
 
-check_8() {
+check_7() {
     local headers create_body create_response create_status create_json context_id actions_result
     headers="{\"Authorization\":\"Bearer $EXECUTOR_TOKEN\"}"
     create_body="$("$NODE" -e 'process.stdout.write(JSON.stringify({key:"smoke-"+Date.now(),allowedHosts:["localhost","127.0.0.1"],baseUrl:process.argv[1],viewport:{width:1280,height:720}}))' "$web_base")"
@@ -377,8 +369,8 @@ check_8() {
     return 0
 }
 
-# --- 9 ---------------------------------------------------------------------
-check_9() {
+# --- 8 ---------------------------------------------------------------------
+check_8() {
     local response status body
     response="$(http_req "$web_base/login" 2>/dev/null)" || { printf 'The web server is not reachable at %s.' "$web_base"; return 1; }
     status="${response%%$'\n'*}"
@@ -390,26 +382,25 @@ check_9() {
     esac
 }
 
-# --- 10 --------------------------------------------------------------------
-check_10() {
+# --- 9 ---------------------------------------------------------------------
+check_9() {
     local missing="" directory
-    for directory in objects version-attachments evidence reports exports; do
-        [ -d "$PKG/data/$directory" ] || missing="$missing $directory"
+    for directory in attachments evidence reports exports; do
+        [ -d "$PKG/.data/$directory" ] || missing="$missing $directory"
     done
-    [ -z "$missing" ] || { printf 'Missing data directories:%s' "$missing"; return 1; }
+    [ -z "$missing" ] || { printf 'Missing .data directories:%s' "$missing"; return 1; }
     return 0
 }
 
 check 1 "PostgreSQL TCP reachable" check_1
 check 2 "API GET /healthz is 200 {status:ok}" check_2
 check 3 "API GET /api/health has db=ok and the VERSION version" check_3
-check 4 "API GET /api/openapi.yaml is YAML and >100 kB" check_4
-check 5 "API GET /api/versions without a token is 401" check_5
-check 6 "Admin login works and GET /api/auth/me is admin" check_6
-check 7 "Executor /healthz is 200 with a browserVersion" check_7
-check 8 "Executor round-trip: context, goto /login, snapshot, screenshot, delete" check_8
-check 9 "Web GET /login is 200 and renders EzTest" check_9
-check 10 "Data directories exist" check_10
+check 4 "Renderer GET /healthz is 200 with a browser version" check_4
+check 5 "Admin login works and GET /api/auth/me is admin" check_5
+check 6 "Executor /healthz is 200 with a browserVersion" check_6
+check 7 "Executor round-trip: context, goto /login, snapshot, screenshot, delete" check_7
+check 8 "Web GET /login is 200 and renders EzTest" check_8
+check 9 "Data directories exist (.data)" check_9
 
 printf '\n'
 if [ "${#FAILURES[@]}" -eq 0 ]; then
@@ -423,6 +414,7 @@ done
 printf '\n'
 printf 'Check logs/ and the PACKAGE.md troubleshooting section. Common causes:\n'
 printf '  - PostgreSQL 17 not running or EZTEST_DATABASE_URL uses the placeholder.\n'
-printf '  - The admin password in .env does not match the seeded admin.\n'
+printf '  - The admin password in .env does not match the seeded admin (admin123 until changed).\n'
 printf '  - Missing Linux browser system libraries (run: sudo bash install-linux-deps.sh).\n'
+printf '  - The PDF renderer or executor cannot launch Chromium (logs/renderer.err.log, logs/executor.err.log).\n'
 exit 1
