@@ -31,6 +31,12 @@ import (
 // pages are not execution contexts.
 const ExploreActionsPath = "/v1/explore/actions"
 
+// ExplorePagesPath is the executor route that closes every explore page
+// (DELETE /v1/explore, executor protocol §13). The login flow uses it to drop
+// the throwaway page opened to verify a cached storage ref, so repeated reuse
+// cannot exhaust the executor's 8-page cap.
+const ExplorePagesPath = "/v1/explore"
+
 // defaultExecutorTimeout mirrors the executor client bound: the executor caps a
 // single action at 60s, so the API side waits slightly longer for its typed
 // error envelope.
@@ -155,6 +161,16 @@ type Executor interface {
 	Action(ctx context.Context, action string, args map[string]any) (map[string]any, error)
 }
 
+// PageCloser is the optional executor capability that closes every explore page
+// the executor runtime owns. *HTTPExecutor implements it with DELETE
+// /v1/explore. It is detected from LoginFlowDeps.Executor, so an Executor that
+// predates the page-cleanup requirement still satisfies the action interface
+// (it simply skips cleanup, and the next open can hit the page cap). A close
+// failure never invalidates a verified session: the page is throwaway cleanup.
+type PageCloser interface {
+	ClosePages(ctx context.Context) error
+}
+
 // ExecutorActionError is a typed executor explore action failure (page not
 // found, timeout, host not allowed, ...). It is not a transport error.
 type ExecutorActionError struct {
@@ -242,10 +258,52 @@ func (e *HTTPExecutor) Action(ctx context.Context, action string, args map[strin
 	return envelope.Result, nil
 }
 
-// AccountStore resolves account credentials. The resource Service implements
-// AccountSecret; the password is handed only to fill(secret=true).
+// ClosePages closes every explore page owned by the executor runtime through
+// DELETE /v1/explore (executor protocol §13). Explore pages are addressed by
+// page id and the closed six-action set has no per-page close, so this is the
+// only cleanup route: the login flow uses it for the throwaway page opened to
+// verify a cached ref. The bearer token is only sent in the Authorization
+// header and redirects are not followed, as for Action.
+func (e *HTTPExecutor) ClosePages(ctx context.Context) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodDelete, e.endpoint+ExplorePagesPath, nil)
+	if err != nil {
+		return fmt.Errorf("build executor explore close request: %w", err)
+	}
+	if e.token != "" {
+		request.Header.Set("authorization", "Bearer "+e.token)
+	}
+	response, err := e.client.Do(request)
+	if err != nil {
+		return fmt.Errorf("executor explore close: %w", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if err != nil {
+		return fmt.Errorf("read executor explore close response: %w", err)
+	}
+	var envelope struct {
+		OK    bool `json:"ok"`
+		Error *struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return fmt.Errorf("decode executor explore close response (HTTP %d): %w", response.StatusCode, err)
+	}
+	if envelope.OK {
+		return nil
+	}
+	if envelope.Error != nil && envelope.Error.Code != "" {
+		return &ExecutorActionError{Code: envelope.Error.Code, Message: envelope.Error.Message}
+	}
+	return fmt.Errorf("executor explore close failed with HTTP %d", response.StatusCode)
+}
+
+// AccountStore resolves account credentials. *resourceapp.Service implements
+// GetAccountSecret directly; the password is handed only to fill(secret=true).
 type AccountStore interface {
-	AccountSecret(ctx context.Context, accountID int64) (username, password string, err error)
+	GetAccountSecret(ctx context.Context, accountID int64) (username, password string, err error)
 }
 
 // FactRecorder appends version facts (versionapp.FactService implements it).
@@ -253,18 +311,24 @@ type FactRecorder interface {
 	Record(ctx context.Context, fact version.Fact) (version.Fact, bool, error)
 }
 
-// SessionStore caches captured storage states by (version SUT, environment,
-// role). resourceapp.SessionStore implements it. Ref values are owned by the
-// executor runtime and can go stale (executor restart), so Execute verifies a
-// cached ref before reusing it and invalidates it on an unknown ref.
+// SessionStore caches captured storage states by (version, version SUT,
+// environment, role). resourceapp.SessionStore implements it and bounds the
+// registry. Ref values are owned by the executor runtime and can go stale
+// (executor restart), so Execute verifies a cached ref before reusing it and
+// invalidates it on an unknown ref. A stored ref proves only that the executor
+// still knows the captured bytes, not that the SUT cookie/session is still
+// valid (the store TTL and the verification open are the reuse guards).
 type SessionStore interface {
-	Find(ctx context.Context, versionSUTID, environmentID int64, role string) (resourceapp.LoginSession, bool)
+	Find(ctx context.Context, versionID, versionSUTID, environmentID int64, role string) (resourceapp.LoginSession, bool)
 	Save(ctx context.Context, session resourceapp.LoginSession) error
-	Invalidate(ctx context.Context, versionSUTID, environmentID int64, role string)
+	Invalidate(ctx context.Context, versionID, versionSUTID, environmentID int64, role string)
 }
 
 // LoginFlowConfig binds one flow to a version SUT and account role. LoginURL is
-// the fallback page opened when Execute runs without a preceding Detect.
+// the page opened when Execute runs without a preceding Detect; it is also the
+// URL used to verify a cached storage ref. Optimistic reuse is refused when no
+// URL is configured (a ref only proves the executor still knows the bytes, not
+// that the SUT session is valid), and a fresh login then asks for configuration.
 type LoginFlowConfig struct {
 	VersionID     int64
 	VersionSUTID  int64
@@ -292,6 +356,7 @@ type LoginFlow struct {
 	accts AccountStore
 	sess  SessionStore
 	facts FactRecorder
+	pages PageCloser
 	now   func() time.Time
 
 	form *LoginForm
@@ -304,12 +369,14 @@ func NewLoginFlow(cfg LoginFlowConfig, deps LoginFlowDeps) *LoginFlow {
 	if now == nil {
 		now = time.Now
 	}
+	pages, _ := deps.Executor.(PageCloser)
 	return &LoginFlow{
 		cfg:   cfg,
 		exec:  deps.Executor,
 		accts: deps.Accounts,
 		sess:  deps.Sessions,
 		facts: deps.Facts,
+		pages: pages,
 		now:   now,
 	}
 }
@@ -392,34 +459,46 @@ func (f *LoginFlow) Execute(ctx context.Context, account Account) (SessionFact, 
 	// The cached ref is re-seeded on a fresh executor page because the ref lives
 	// in the executor process only: the API cache can outlive an executor
 	// restart and then the ref is unknown. An unknown ref is a cache miss, not a
-	// login failure, so it is invalidated and the flow logs in again.
-	if session, ok := f.sess.Find(ctx, f.cfg.VersionSUTID, f.cfg.EnvironmentID, role); ok && session.StorageStateRef != "" {
+	// login failure, so it is invalidated and the flow logs in again. A ref
+	// alone never authorizes optimistic reuse: without a URL there is nothing to
+	// verify against, and "the executor still knows the bytes" does not prove
+	// the SUT cookie is still valid.
+	if session, ok := f.sess.Find(ctx, f.cfg.VersionID, f.cfg.VersionSUTID, f.cfg.EnvironmentID, role); ok && session.StorageStateRef != "" {
 		verifyURL := strings.TrimSpace(session.LoginURL)
 		if verifyURL == "" {
 			verifyURL = strings.TrimSpace(f.cfg.LoginURL)
 		}
 		if verifyURL == "" {
-			// No page can be opened to re-seed the session; keep the cached
-			// session (the wiring is expected to configure LoginURL).
-			return f.reuse(ctx, account, role, session)
-		}
-		if _, openErr := f.openLoginPage(ctx, verifyURL, session.StorageStateRef); openErr == nil {
+			f.sess.Invalidate(ctx, f.cfg.VersionID, f.cfg.VersionSUTID, f.cfg.EnvironmentID, role)
+		} else if _, openErr := f.openPage(ctx, verifyURL, session.StorageStateRef); openErr == nil {
+			// The verification page is throwaway: the caller never receives it
+			// and leaving it registered would count against the executor's
+			// 8-page cap. Cleanup is best effort and must not fail the reuse.
+			f.closeVerificationPages(ctx)
 			return f.reuse(ctx, account, role, session)
 		} else if !isUnknownStorageStateRef(openErr) {
 			return f.blocked(account, role, "login_page_unavailable", executorFailureAction(openErr)), nil
+		} else {
+			f.sess.Invalidate(ctx, f.cfg.VersionID, f.cfg.VersionSUTID, f.cfg.EnvironmentID, role)
 		}
-		f.sess.Invalidate(ctx, f.cfg.VersionSUTID, f.cfg.EnvironmentID, role)
 	}
 
-	// 2. Credentials enter through the account store only.
-	username, password, err := f.accts.AccountSecret(ctx, account.ID)
+	// 2. Without a detected form the flow needs a configured login page before
+	// it reads any credential: neither an optimistic reuse nor an autonomous
+	// login can be verified without it.
+	form := f.form
+	if form == nil && strings.TrimSpace(f.cfg.LoginURL) == "" {
+		return f.blocked(account, role, "login_url_not_configured", ActionManualLogin), nil
+	}
+
+	// 3. Credentials enter through the account store only.
+	username, password, err := f.accts.GetAccountSecret(ctx, account.ID)
 	if err != nil || username == "" || password == "" {
 		return f.blocked(account, role, "account_secret_unavailable", ActionConfigureAccount), nil
 	}
 
-	form := f.form
 	if form == nil {
-		opened, openErr := f.openLoginPage(ctx, strings.TrimSpace(f.cfg.LoginURL), "")
+		opened, openErr := f.openPage(ctx, strings.TrimSpace(f.cfg.LoginURL), "")
 		if openErr != nil {
 			return f.blocked(account, role, "login_page_unavailable", executorFailureAction(openErr)), nil
 		}
@@ -435,7 +514,7 @@ func (f *LoginFlow) Execute(ctx context.Context, account Account) (SessionFact, 
 		return f.blocked(account, role, "login_submit_not_found", ActionManualLogin), nil
 	}
 
-	// 3. Drive the form. The password is flagged secret so every executor
+	// 4. Drive the form. The password is flagged secret so every executor
 	// output/error is redacted before it reaches the caller.
 	pageID := form.PageID
 	if pageID == "" {
@@ -457,7 +536,7 @@ func (f *LoginFlow) Execute(ctx context.Context, account Account) (SessionFact, 
 		return f.blocked(account, role, "login_submit_failed", executorFailureAction(err)), nil
 	}
 
-	// 4. Verify and capture the session in one snapshot.
+	// 5. Verify and capture the session in one snapshot.
 	result, err := f.exec.Action(ctx, actionSnapshot, map[string]any{
 		"page_id": pageID, "include_storage_state": true,
 	})
@@ -469,7 +548,7 @@ func (f *LoginFlow) Execute(ctx context.Context, account Account) (SessionFact, 
 		return SessionFact{}, err
 	}
 	if loginStillVisible(snapshot) {
-		f.sess.Invalidate(ctx, f.cfg.VersionSUTID, f.cfg.EnvironmentID, role)
+		f.sess.Invalidate(ctx, f.cfg.VersionID, f.cfg.VersionSUTID, f.cfg.EnvironmentID, role)
 		reason := "login_rejected"
 		if credentialErr.MatchString(snapshot.DOM.ARIA) || credentialErr.MatchString(errorText(snapshot.DOM.Elements)) {
 			reason = "invalid_credentials"
@@ -508,6 +587,122 @@ func (f *LoginFlow) Execute(ctx context.Context, account Account) (SessionFact, 
 		return SessionFact{}, err
 	}
 	return fact, nil
+}
+
+/* --------------------------- direct-ref page open ------------------------- */
+
+// OpenWithSession opens url on a page seeded by the cached session for the
+// (version, version SUT, environment, role) binding. This is the direct-ref
+// caller path used by page/API discovery: it shares the login flow's
+// cache-miss policy instead of blindly forwarding SessionFact.StorageStateRef
+// to the executor.
+//
+//   - A cached ref is used only after a verification URL is available; a ref
+//     without a URL is invalidated (ref existence != session validity).
+//   - An unknown storage_state_ref (executor restart) invalidates the entry and
+//     falls back to a fresh login through the account store.
+//   - After a fresh login the already-authenticated page navigates to url, so
+//     the caller does not pay a second page. If navigation fails, a new page is
+//     seeded with the freshly captured ref.
+//
+// A successfully opened page is returned to the caller and stays open. Only
+// the throwaway verification page inside Execute is closed.
+func (f *LoginFlow) OpenWithSession(ctx context.Context, account Account, url string) (Page, SessionFact, error) {
+	if f == nil || f.exec == nil {
+		return Page{}, SessionFact{}, errors.New("login flow has no executor")
+	}
+	if f.sess == nil {
+		return Page{}, SessionFact{}, errors.New("login flow has no session store")
+	}
+	if f.accts == nil {
+		return Page{}, SessionFact{}, errors.New("login flow has no account store")
+	}
+	role := strings.TrimSpace(account.Role)
+	if role == "" {
+		role = strings.TrimSpace(f.cfg.Role)
+	}
+	if role == "" {
+		return Page{}, SessionFact{}, errors.New("login flow requires an account role")
+	}
+	if account.ID <= 0 {
+		return Page{}, SessionFact{}, errors.New("login flow requires a positive account id")
+	}
+	url = strings.TrimSpace(url)
+	if url == "" {
+		return Page{}, SessionFact{}, errors.New("login flow direct-ref open requires a URL")
+	}
+
+	// 1. Try the cached ref directly against the requested URL. The ref is
+	// re-seeded by the executor; an unknown ref is the same cache miss Execute
+	// handles, so the session is invalidated and the fresh-login path follows.
+	if session, ok := f.sess.Find(ctx, f.cfg.VersionID, f.cfg.VersionSUTID, f.cfg.EnvironmentID, role); ok && session.StorageStateRef != "" {
+		verifyURL := strings.TrimSpace(session.LoginURL)
+		if verifyURL == "" {
+			verifyURL = strings.TrimSpace(f.cfg.LoginURL)
+		}
+		if verifyURL == "" {
+			f.sess.Invalidate(ctx, f.cfg.VersionID, f.cfg.VersionSUTID, f.cfg.EnvironmentID, role)
+		} else if snapshot, openErr := f.openPage(ctx, url, session.StorageStateRef); openErr == nil {
+			fact := f.sessionFact(account, role, session.StorageStateRef, true)
+			fact.LoginURL = session.LoginURL
+			fact.Route = session.Route
+			fact.Recipe = session.Recipe
+			return pageFromSnapshot(snapshot, url), fact, nil
+		} else if !isUnknownStorageStateRef(openErr) {
+			return Page{}, f.blocked(account, role, "explore_open_failed", executorFailureAction(openErr)), nil
+		} else {
+			f.sess.Invalidate(ctx, f.cfg.VersionID, f.cfg.VersionSUTID, f.cfg.EnvironmentID, role)
+		}
+	}
+
+	// 2. Cache miss: log in again. A blocked login is returned to the caller as
+	// a business outcome (nil error) and no page is produced.
+	fact, err := f.Execute(ctx, account)
+	if err != nil {
+		return Page{}, SessionFact{}, err
+	}
+	if fact.Status != SessionActive {
+		return Page{}, fact, nil
+	}
+
+	// 3. The login page is already authenticated: navigate it to the requested
+	// URL instead of consuming a second page. A navigation failure falls back to
+	// a new page seeded with the freshly captured ref.
+	if pageID := strings.TrimSpace(fact.Form.PageID); pageID != "" {
+		if snapshot, navErr := f.navigatePage(ctx, pageID, url); navErr == nil {
+			return pageFromSnapshot(snapshot, url), fact, nil
+		}
+	}
+	snapshot, openErr := f.openPage(ctx, url, fact.StorageStateRef)
+	if openErr != nil {
+		return Page{}, f.blocked(account, role, "explore_open_failed", executorFailureAction(openErr)), nil
+	}
+	return pageFromSnapshot(snapshot, url), fact, nil
+}
+
+// navigatePage sends an existing page to url (explore.open with page_id). It is
+// used after a fresh login so the already-authenticated page serves the
+// requested URL without opening another explore page.
+func (f *LoginFlow) navigatePage(ctx context.Context, pageID, url string) (pageSnapshot, error) {
+	args := map[string]any{"page_id": pageID, "url": url}
+	if len(f.cfg.AllowedHosts) > 0 {
+		args["allowed_hosts"] = append([]string(nil), f.cfg.AllowedHosts...)
+	}
+	result, err := f.exec.Action(ctx, actionOpen, args)
+	if err != nil {
+		return pageSnapshot{}, err
+	}
+	return decodePageSnapshot(result)
+}
+
+// pageFromSnapshot projects an executor result onto a Page, falling back to the
+// requested URL when the executor omits it.
+func pageFromSnapshot(snapshot pageSnapshot, fallbackURL string) Page {
+	url := snapshot.URL
+	if url == "" {
+		url = fallbackURL
+	}
+	return Page{ID: snapshot.PageID, URL: url}
 }
 
 /* ------------------------------- internals -------------------------------- */
@@ -792,10 +987,10 @@ func loginRecipe(form LoginForm) map[string]any {
 	}
 }
 
-// openLoginPage opens url in a new explore page, optionally re-seeding a
-// captured storage state. Ref values are only ever consumed by the executor;
-// the flow never derives one.
-func (f *LoginFlow) openLoginPage(ctx context.Context, url, storageStateRef string) (pageSnapshot, error) {
+// openPage opens url in a new explore page, optionally re-seeding a captured
+// storage state. Ref values are only ever consumed by the executor; the flow
+// never derives one.
+func (f *LoginFlow) openPage(ctx context.Context, url, storageStateRef string) (pageSnapshot, error) {
 	url = strings.TrimSpace(url)
 	if url == "" {
 		return pageSnapshot{}, errors.New("no login page is configured")
@@ -839,6 +1034,18 @@ func (f *LoginFlow) blocked(account Account, role, reason, action string) Sessio
 	fact.Reason = reason
 	fact.Action = action
 	return fact
+}
+
+// closeVerificationPages drops the throwaway page opened to re-seed a cached
+// storage state. The caller never receives it, and leaving it registered would
+// count against the executor's 8-page cap. Cleanup is best effort: a failed
+// close must not turn a verified session into an error (the executor may also
+// omit the close capability entirely).
+func (f *LoginFlow) closeVerificationPages(ctx context.Context) {
+	if f.pages == nil {
+		return
+	}
+	_ = f.pages.ClosePages(ctx)
 }
 
 // reuse records the cached session as an active, reused fact. It neither drives

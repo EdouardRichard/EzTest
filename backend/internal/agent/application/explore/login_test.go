@@ -33,13 +33,33 @@ type fakeReply struct {
 // fakeExecutor scripts explore action responses (one queue per action) and
 // records every call, so the tests assert on the real interaction sequence.
 type fakeExecutor struct {
-	mu     sync.Mutex
-	queues map[string][]fakeReply
-	calls  []executorCall
+	mu       sync.Mutex
+	queues   map[string][]fakeReply
+	calls    []executorCall
+	closed   int
+	closeErr error
 }
 
 func newFakeExecutor() *fakeExecutor {
 	return &fakeExecutor{queues: map[string][]fakeReply{}}
+}
+
+// ClosePages implements the optional explore.PageCloser capability: the login
+// flow closes the throwaway reuse-verification page after a successful check.
+func (f *fakeExecutor) ClosePages(_ context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closed++
+	if f.closeErr != nil {
+		return f.closeErr
+	}
+	return nil
+}
+
+func (f *fakeExecutor) closeCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.closed
 }
 
 func (f *fakeExecutor) queue(action string, results ...map[string]any) {
@@ -92,7 +112,7 @@ type fakeAccounts struct {
 	calls    []int64
 }
 
-func (f *fakeAccounts) AccountSecret(_ context.Context, accountID int64) (string, string, error) {
+func (f *fakeAccounts) GetAccountSecret(_ context.Context, accountID int64) (string, string, error) {
 	f.calls = append(f.calls, accountID)
 	return f.username, f.password, f.err
 }
@@ -193,6 +213,25 @@ func loggedInSnapshot() map[string]any {
 			"title": "EzTest Home",
 			"aria":  "heading \"Home\"\n  button \"Logout\"",
 			"route": "/home",
+			"elements": []any{
+				element(0, "button", "#logout", "button", "Logout", ""),
+			},
+		},
+	}
+}
+
+// targetPageSnapshot is an authenticated destination page opened with a reused
+// storage state, used by the direct-ref open tests.
+func targetPageSnapshot(pageID, url, route string) map[string]any {
+	return map[string]any{
+		"page_id": pageID,
+		"url":     url,
+		"route":   route,
+		"dom_snapshot": map[string]any{
+			"url":   url,
+			"title": "Orders",
+			"aria":  "heading \"Orders\"",
+			"route": route,
 			"elements": []any{
 				element(0, "button", "#logout", "button", "Logout", ""),
 			},
@@ -376,7 +415,7 @@ func TestLoginFlowDetectAndExecute(t *testing.T) {
 		t.Fatalf("account store calls = %v, want [81]", accounts.calls)
 	}
 
-	stored, ok := sessions.Find(context.Background(), 7, 8, "admin")
+	stored, ok := sessions.Find(context.Background(), 10, 7, 8, "admin")
 	if !ok {
 		t.Fatal("successful login must save the storage state for reuse")
 	}
@@ -449,6 +488,9 @@ func TestLoginFlowReusesStorageStateWithoutLoggingIn(t *testing.T) {
 	if len(facts.recorded()) != 1 {
 		t.Fatalf("reuse must still record a login_session fact, got %d", len(facts.recorded()))
 	}
+	if exec.closeCount() != 1 {
+		t.Fatalf("the throwaway reuse-verification page must be closed once, close calls = %d", exec.closeCount())
+	}
 }
 
 // TestLoginUnknownStorageStateRefFallsBackToFreshLogin covers an executor restart:
@@ -508,7 +550,7 @@ func TestLoginUnknownStorageStateRefFallsBackToFreshLogin(t *testing.T) {
 	if len(accounts.calls) != 1 || accounts.calls[0] != 81 {
 		t.Fatalf("account store calls = %v, want [81]", accounts.calls)
 	}
-	stored, ok := sessions.Find(context.Background(), 7, 8, "admin")
+	stored, ok := sessions.Find(context.Background(), 10, 7, 8, "admin")
 	if !ok || stored.StorageStateRef != "ss_abc123" {
 		t.Fatalf("stale session was not replaced: %+v (ok=%v)", stored, ok)
 	}
@@ -616,7 +658,7 @@ func TestLoginFlowWrongPasswordBlockedWithAction(t *testing.T) {
 	if len(facts.recorded()) != 0 {
 		t.Fatalf("blocked login must not record a login_session fact")
 	}
-	if _, ok := sessions.Find(context.Background(), 7, 8, "admin"); ok {
+	if _, ok := sessions.Find(context.Background(), 10, 7, 8, "admin"); ok {
 		t.Fatal("blocked login must invalidate the cached session")
 	}
 }
@@ -739,7 +781,7 @@ func TestLoginHiddenModalAfterSubmitIsSuccess(t *testing.T) {
 	if session.StorageStateRef != "ss_hidden_modal" {
 		t.Fatalf("storage_state_ref = %q", session.StorageStateRef)
 	}
-	if _, ok := sessions.Find(context.Background(), 7, 8, "admin"); !ok {
+	if _, ok := sessions.Find(context.Background(), 10, 7, 8, "admin"); !ok {
 		t.Fatal("successful login must cache the hidden-modal session")
 	}
 	if len(facts.recorded()) != 1 {
@@ -824,6 +866,217 @@ func TestLoginCredentialsNeverEnterFactsOrRecipes(t *testing.T) {
 	passwordFill := exec.callsOf("explore.fill")[1]
 	if passwordFill.args["secret"] != true {
 		t.Fatalf("password fill must carry secret=true, args = %+v", passwordFill.args)
+	}
+}
+
+// TestLoginRefExistsIsNotSessionValidityWithoutLoginURL proves a cached ref is
+// not evidence that the SUT session is still valid: when neither the cached
+// session nor the flow configuration provides a verification URL, optimistic
+// reuse is refused and the flow asks for a configured login URL instead.
+func TestLoginRefExistsIsNotSessionValidityWithoutLoginURL(t *testing.T) {
+	exec := newFakeExecutor()
+	accounts := &fakeAccounts{username: "alice", password: "s3cret-pw"}
+	sessions := resourceapp.NewSessionStore(time.Hour)
+	if err := sessions.Save(context.Background(), resourceapp.LoginSession{
+		VersionID:       10,
+		VersionSUTID:    7,
+		EnvironmentID:   8,
+		AccountRole:     "admin",
+		StorageStateRef: "ss_unverified",
+		StorageState:    json.RawMessage(`{"cookies":[{"name":"sid","value":"stale"}],"origins":[]}`),
+		VerifiedAt:      time.Now(),
+	}); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+	facts := &fakeFacts{}
+	flow := exploreapp.NewLoginFlow(
+		exploreapp.LoginFlowConfig{
+			VersionID:     10,
+			VersionSUTID:  7,
+			EnvironmentID: 8,
+			Role:          "admin",
+			// No LoginURL: the cached ref cannot be verified.
+		},
+		exploreapp.LoginFlowDeps{
+			Executor: exec,
+			Accounts: accounts,
+			Sessions: sessions,
+			Facts:    facts,
+		},
+	)
+
+	session, err := flow.Execute(context.Background(), exploreapp.Account{ID: 81, Role: "admin"})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if session.Status != exploreapp.SessionBlocked {
+		t.Fatalf("session = %+v, want blocked because optimistic reuse must be refused", session)
+	}
+	if session.Reason != "login_url_not_configured" {
+		t.Fatalf("blocked reason = %q, want login_url_not_configured", session.Reason)
+	}
+	if session.Reused {
+		t.Fatal("a ref without a verification URL must never be reported as reused")
+	}
+	if len(exec.recorded()) != 0 {
+		t.Fatalf("unverifiable reuse must not touch the executor, calls = %+v", exec.recorded())
+	}
+	if _, ok := sessions.Find(context.Background(), 10, 7, 8, "admin"); ok {
+		t.Fatal("an unverifiable cached session must be invalidated")
+	}
+	if len(facts.recorded()) != 0 {
+		t.Fatalf("a blocked session must not record a login fact, got %d", len(facts.recorded()))
+	}
+}
+
+// TestLoginOpenWithSessionReusesCachedRef covers the direct-ref caller: the
+// target page is opened with the cached ref, the page stays open for the
+// caller, and no login form or credential is touched.
+func TestLoginOpenWithSessionReusesCachedRef(t *testing.T) {
+	const targetURL = "http://127.0.0.1:13335/orders"
+	exec := newFakeExecutor()
+	exec.queue("explore.open", targetPageSnapshot("page_3", targetURL, "/orders"))
+	accounts := &fakeAccounts{username: "alice", password: "s3cret-pw"}
+	sessions := resourceapp.NewSessionStore(time.Hour)
+	if err := sessions.Save(context.Background(), resourceapp.LoginSession{
+		VersionID:       10,
+		VersionSUTID:    7,
+		EnvironmentID:   8,
+		AccountRole:     "admin",
+		StorageStateRef: "ss_reused",
+		StorageState:    json.RawMessage(`{"cookies":[{"name":"sid","value":"t"}],"origins":[]}`),
+		LoginURL:        "http://127.0.0.1:13335/login",
+		Route:           "/login",
+		VerifiedAt:      time.Now(),
+	}); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+	facts := &fakeFacts{}
+	flow := newFlow(t, exec, accounts, sessions, facts)
+
+	page, session, err := flow.OpenWithSession(context.Background(), exploreapp.Account{ID: 81, Role: "admin"}, targetURL)
+	if err != nil {
+		t.Fatalf("OpenWithSession: %v", err)
+	}
+	if page.ID != "page_3" || page.URL != targetURL {
+		t.Fatalf("page = %+v, want the authenticated destination page", page)
+	}
+	if !session.Reused || session.Status != exploreapp.SessionActive {
+		t.Fatalf("session = %+v, want active reused", session)
+	}
+	opens := exec.callsOf("explore.open")
+	if len(opens) != 1 {
+		t.Fatalf("open calls = %+v, want one direct-ref open", opens)
+	}
+	if opens[0].args["url"] != targetURL || opens[0].args["storage_state_ref"] != "ss_reused" {
+		t.Fatalf("direct-ref open args = %+v", opens[0].args)
+	}
+	if len(accounts.calls) != 0 {
+		t.Fatalf("direct-ref reuse must not read credentials, calls = %v", accounts.calls)
+	}
+	if exec.closeCount() != 0 {
+		t.Fatalf("a page returned to the caller must stay open, close calls = %d", exec.closeCount())
+	}
+}
+
+// TestLoginOpenWithSessionUnknownRefFallsBack covers the direct-ref caller after
+// an executor restart: the target open returns unknown storage_state_ref, which
+// is a cache miss. The flow invalidates the stale entry, logs in again, and
+// reuses the freshly authenticated page for the requested URL.
+func TestLoginOpenWithSessionUnknownRefFallsBack(t *testing.T) {
+	const targetURL = "http://127.0.0.1:13335/orders"
+	exec := newFakeExecutor()
+	exec.queueError("explore.open", &exploreapp.ExecutorActionError{
+		Code:    "invalid_arguments",
+		Message: "unknown storage_state_ref: ss_stale",
+	})
+	exec.queue("explore.open", loginSnapshot())
+	exec.queue("explore.fill", map[string]any{})
+	exec.queue("explore.fill", map[string]any{})
+	exec.queue("explore.click", map[string]any{})
+	exec.queue("explore.snapshot", loggedInSnapshot())
+	exec.queue("explore.open", targetPageSnapshot("page_1", targetURL, "/orders"))
+
+	accounts := &fakeAccounts{username: "alice", password: "s3cret-pw"}
+	sessions := resourceapp.NewSessionStore(time.Hour)
+	if err := sessions.Save(context.Background(), resourceapp.LoginSession{
+		VersionID:       10,
+		VersionSUTID:    7,
+		EnvironmentID:   8,
+		AccountRole:     "admin",
+		StorageStateRef: "ss_stale",
+		StorageState:    json.RawMessage(`{"cookies":[{"name":"sid","value":"revoked"}],"origins":[]}`),
+		LoginURL:        "http://127.0.0.1:13335/login",
+		Route:           "/login",
+		VerifiedAt:      time.Now(),
+	}); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+	facts := &fakeFacts{}
+	flow := newFlow(t, exec, accounts, sessions, facts)
+
+	page, session, err := flow.OpenWithSession(context.Background(), exploreapp.Account{ID: 81, Role: "admin"}, targetURL)
+	if err != nil {
+		t.Fatalf("OpenWithSession: %v", err)
+	}
+	if session.Status != exploreapp.SessionActive || session.Reused {
+		t.Fatalf("session = %+v, want a fresh active login", session)
+	}
+	if page.ID != "page_1" || page.URL != targetURL {
+		t.Fatalf("page = %+v, want the freshly authenticated page", page)
+	}
+	opens := exec.callsOf("explore.open")
+	if len(opens) != 3 {
+		t.Fatalf("open calls = %+v, want stale direct open, fresh login open, target navigation", opens)
+	}
+	if opens[0].args["storage_state_ref"] != "ss_stale" || opens[0].args["url"] != targetURL {
+		t.Fatalf("stale direct open args = %+v", opens[0].args)
+	}
+	if _, present := opens[1].args["storage_state_ref"]; present {
+		t.Fatalf("fresh login open args = %+v, must not reuse the stale ref", opens[1].args)
+	}
+	if opens[2].args["page_id"] != "page_1" || opens[2].args["url"] != targetURL {
+		t.Fatalf("target navigation args = %+v, want the fresh login page", opens[2].args)
+	}
+	if len(accounts.calls) != 1 || accounts.calls[0] != 81 {
+		t.Fatalf("account store calls = %v, want [81]", accounts.calls)
+	}
+	stored, ok := sessions.Find(context.Background(), 10, 7, 8, "admin")
+	if !ok || stored.StorageStateRef != "ss_abc123" {
+		t.Fatalf("stale session was not replaced: %+v (ok=%v)", stored, ok)
+	}
+	if len(facts.recorded()) != 1 {
+		t.Fatalf("a fresh login must record one fact, got %d", len(facts.recorded()))
+	}
+}
+
+func TestLoginHTTPExecutorDeletesExplorePages(t *testing.T) {
+	var (
+		gotMethod string
+		gotPath   string
+		gotAuth   string
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("authorization")
+		w.Header().Set("content-type", "application/json")
+		_, _ = io.WriteString(w, `{"ok":true,"result":{"closed":true}}`)
+	}))
+	defer server.Close()
+
+	exec := exploreapp.NewHTTPExecutor(server.URL, "executor-token", time.Second)
+	if err := exec.ClosePages(context.Background()); err != nil {
+		t.Fatalf("ClosePages: %v", err)
+	}
+	if gotMethod != http.MethodDelete {
+		t.Fatalf("close method = %q, want DELETE", gotMethod)
+	}
+	if gotPath != exploreapp.ExplorePagesPath {
+		t.Fatalf("close path = %q, want %q", gotPath, exploreapp.ExplorePagesPath)
+	}
+	if gotAuth != "Bearer executor-token" {
+		t.Fatalf("authorization = %q", gotAuth)
 	}
 }
 

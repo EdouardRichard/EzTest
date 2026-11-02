@@ -791,6 +791,25 @@ func main() {
 	executorToken, _ := settingsSvc.String(ctx, executionapp.SettingExecutorToken)
 	executorClient := executioninfra.NewClient(executorURL, executorToken, executioninfra.DefaultTimeout)
 	executorResolver := executioninfra.NewResolver(executorToken, executioninfra.DefaultTimeout)
+	// P9 explore runtime: the real HTTP explore-action executor, the bounded
+	// version-scoped session cache and the version fact recorder are constructed
+	// once and shared by every exploration caller (Task 36/37). Reuse
+	// verification closes its throwaway page through DELETE /v1/explore, so the
+	// 8-page cap cannot be exhausted by repeated logins.
+	p9rt, err := newP9Runtime(p9RuntimeDeps{
+		Pool:          pool,
+		IDs:           ids,
+		Events:        eventSvc,
+		Accounts:      resourceSvc,
+		Versions:      versionSvc,
+		ExecutorURL:   executorURL,
+		ExecutorToken: executorToken,
+		Now:           clk.Now,
+	})
+	if err != nil {
+		log.Fatalf("eztest: wire P9 explore runtime: %v", err)
+	}
+	p9ExploreRuntime = p9rt
 	executorRegistry := executionapp.NewRegistry(executionapp.RegistryDeps{
 		Repo:     executionRepo.Executors,
 		Probe:    executionadapters.NewExecutorProbe(executorClient),
@@ -848,6 +867,11 @@ func main() {
 		Events:      eventSvc,
 		Audit:       auditSvc,
 		InstanceID:  instanceID,
+		// TODO(Task 51, P8-T5): KnowledgeHook stays nil until
+		// knowledgeadapter implements executionapp.CaseSuccessHook (page/API ID
+		// -> binding keys, three Success hooks + AutoApprove) and this root
+		// injects it. P7Deps.Retrieval wiring is also Task 51; neither is invented
+		// here. Until then a passed case run does not notify knowledge.
 	})
 	executionCanceller.runner = executionRunner
 	executionIntents := executionapp.NewIntentService(executionapp.IntentServiceDeps{
