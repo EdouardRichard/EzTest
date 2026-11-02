@@ -67,6 +67,13 @@ func Classify(err error) Failure {
 
 	var runErr *RunError
 	if errors.As(err, &runErr) {
+		// The tool loop wraps every execution tool error in a retryable
+		// tool_failure RunError. A fenced case_run (platform lease_lost) has to
+		// win over that wrapper: the run must be requeued with a new epoch, not
+		// retried/displayed as a tool failure.
+		if IsLeaseLost(err) {
+			return Failure{Kind: FailureKindInterrupted, Retryable: false, UserVisible: false, Action: FailureActionRequeue}
+		}
 		switch runErr.Reason {
 		case "budget":
 			return Failure{Kind: FailureKindBudget, Retryable: false, UserVisible: true, Action: FailureActionSettlement}

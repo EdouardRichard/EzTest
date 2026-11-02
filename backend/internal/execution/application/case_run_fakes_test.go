@@ -3,6 +3,7 @@ package executionapp_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"time"
 
@@ -82,9 +83,11 @@ func (f *fakeIntentRepo) CountInitialFor(context.Context, int64, string, string)
 }
 
 type fakeCaseRunRepo struct {
-	mu      sync.Mutex
-	rows    map[int64]execution.CaseRun
-	updates int
+	mu            sync.Mutex
+	rows          map[int64]execution.CaseRun
+	updates       int
+	claimFailures int
+	claimAttempts int
 }
 
 func newFakeCaseRunRepo() *fakeCaseRunRepo {
@@ -177,6 +180,11 @@ func (f *fakeCaseRunRepo) Transition(_ context.Context, id int64, from []executi
 func (f *fakeCaseRunRepo) ClaimLease(_ context.Context, id, epoch int64, until time.Time) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.claimAttempts++
+	if f.claimFailures > 0 {
+		f.claimFailures--
+		return false, errors.New("case_run store temporarily unavailable")
+	}
 	row, ok := f.rows[id]
 	if !ok || row.DispatchEpoch != epoch {
 		return false, nil
@@ -184,6 +192,20 @@ func (f *fakeCaseRunRepo) ClaimLease(_ context.Context, id, epoch int64, until t
 	row.LeaseUntil = &until
 	f.rows[id] = row
 	return true, nil
+}
+
+// failNextClaims injects transient ClaimLease errors (a store blip).
+func (f *fakeCaseRunRepo) failNextClaims(count int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.claimFailures = count
+}
+
+// claimCount reports how many times the lease renewal was attempted.
+func (f *fakeCaseRunRepo) claimCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.claimAttempts
 }
 
 func (f *fakeCaseRunRepo) ListRunningByExecutor(context.Context, int64) ([]execution.CaseRun, error) {
@@ -664,9 +686,22 @@ func (f *fakeCaseRunnerSettings) Int(_ context.Context, key string) (int64, erro
 
 func (f *fakeCaseRunnerSettings) Bool(context.Context, string) (bool, error) { return false, nil }
 
-type caseRunnerClock struct{ now time.Time }
+type caseRunnerClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
 
-func (c *caseRunnerClock) Now() time.Time { return c.now }
+func (c *caseRunnerClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *caseRunnerClock) Advance(delta time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(delta)
+}
 
 type caseRunnerIDs struct {
 	mu   sync.Mutex

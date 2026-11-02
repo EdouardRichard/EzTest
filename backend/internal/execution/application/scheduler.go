@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -61,7 +60,10 @@ type Scheduler struct {
 }
 
 // SchedulerDeps wires the scheduler. quotaReader may be nil: the running set is
-// then read from CaseRunRepository.ListRunning. leaseTTL defaults to 30s.
+// then read from CaseRunRepository.ListRunning. LeaseTTL is the dispatch-time
+// case_run lease; it is clamped to at least DefaultCaseLease (the agent-side
+// lease), because the work item may wait in the queue before any agent claims
+// it.
 type SchedulerDeps struct {
 	Intents     IntentRepository
 	Waves       WaveRepository
@@ -87,8 +89,11 @@ func NewScheduler(deps SchedulerDeps) *Scheduler {
 		quota = execution.QuotaFromSettings(0, 0, 0)
 	}
 	lease := deps.LeaseTTL
-	if lease <= 0 {
-		lease = 30 * time.Second
+	if lease < DefaultCaseLease {
+		// The dispatch lease must outlive the agent lease: a queued work item
+		// can wait behind a busy worker, and Recovery interrupts a running
+		// case_run whose lease expired before the agent even claimed it.
+		lease = DefaultCaseLease
 	}
 	return &Scheduler{
 		intents:     deps.Intents,
@@ -460,16 +465,12 @@ func dispatchableExecutor(executor *execution.ExecutorInstance) bool {
 	return executor != nil && executor.Status.Dispatchable() && !isDegradedExecutor(executor)
 }
 
-// isDegradedExecutor reads the degraded health signal the registry stores in
-// last_error. The registry keeps a degraded executor row Status=active (it can
-// still serve cleanup/cancel routes) but records the health error; a healthy
-// poll or heartbeat clears it again. Push heartbeats store the exact marker
-// "degraded", pull polls store the /healthz error text.
+// isDegradedExecutor reads the explicit degraded health marker the registry
+// keeps on the row (executor health status, not last_error text: a degraded
+// /healthz reply is not required to carry an error message). A healthy poll or
+// heartbeat clears the marker again.
 func isDegradedExecutor(executor *execution.ExecutorInstance) bool {
-	if executor == nil {
-		return false
-	}
-	return strings.TrimSpace(executor.LastError) != ""
+	return executor != nil && executor.Degraded()
 }
 
 // blockedReason maps the unavailable executor to the blocked-event reason.

@@ -146,6 +146,25 @@ func TestFailureClassification(t *testing.T) {
 				UserVisible: false, Action: agentapp.FailureActionRequeue},
 		},
 		{
+			// The tool loop wraps every execution tool error in a retryable
+			// RunError; a fenced case_run must still be requeued, not settled or
+			// retried as a tool failure.
+			name: "lease loss wrapped in a tool failure maps to interrupted",
+			err: fmt.Errorf("run: %w", &agentapp.RunError{
+				Reason: "tool_failure", Retryable: true, Cause: platform.LeaseLost(),
+			}),
+			want: agentapp.Failure{Kind: agentapp.FailureKindInterrupted, Retryable: false,
+				UserVisible: false, Action: agentapp.FailureActionRequeue},
+		},
+		{
+			name: "wrapped agent ErrLeaseLost maps to interrupted",
+			err: fmt.Errorf("run: %w", &agentapp.RunError{
+				Reason: "tool_failure", Retryable: true, Cause: fmt.Errorf("write: %w", agent.ErrLeaseLost),
+			}),
+			want: agentapp.Failure{Kind: agentapp.FailureKindInterrupted, Retryable: false,
+				UserVisible: false, Action: agentapp.FailureActionRequeue},
+		},
+		{
 			name: "platform ai_unavailable is a transient model error",
 			err:  platform.AIUnavailable("gateway unreachable"),
 			want: agentapp.Failure{Kind: agentapp.FailureKindModelError, Retryable: true,

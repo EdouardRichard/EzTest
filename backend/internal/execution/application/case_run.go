@@ -25,8 +25,14 @@ import (
 const (
 	// minCaseLease stays above the 75s executor client bound so a single slow
 	// action can never outlive the lease even before the first heartbeat.
-	minCaseLease             = 80 * time.Second
-	defaultCaseLease         = 90 * time.Second
+	minCaseLease = 80 * time.Second
+	// DefaultCaseLease is the case_run lease the agent stamps in Prepare and
+	// keeps alive with the independent heartbeat. The scheduler's dispatch lease
+	// must never be shorter (SchedulerDeps.LeaseTTL is clamped to it): a queued
+	// work item may wait a long time before any worker claims it, and Recovery
+	// must not interrupt that wait.
+	DefaultCaseLease         = 90 * time.Second
+	heartbeatRetryDelay      = time.Second
 	defaultEvidenceMaxBytes  = int64(5 << 20)
 	evidenceMaxPerCaseRun    = execution.EvidenceMaxPerCaseRun
 	maxSUTFilenameLength     = 255
@@ -233,9 +239,17 @@ type CaseRunner struct {
 
 	mu          sync.Mutex
 	activeRuns  map[int64]context.CancelFunc
-	heartbeats  map[int64]context.CancelFunc
+	heartbeats  map[int64]*leaseHeartbeat
 	waitTotals  map[int64]time.Duration
 	waitStarted map[int64]time.Time
+}
+
+// leaseHeartbeat is one independent renewal timer. The dispatch epoch is part of
+// its identity: a stale Finish/Finalize from an earlier epoch must not stop the
+// heartbeat of the dispatch that superseded it.
+type leaseHeartbeat struct {
+	epoch  int64
+	cancel context.CancelFunc
 }
 
 var (
@@ -247,7 +261,7 @@ var (
 func NewCaseRunner(deps CaseRunnerDeps) *CaseRunner {
 	lease := deps.LeaseTTL
 	if lease <= 0 {
-		lease = defaultCaseLease
+		lease = DefaultCaseLease
 	}
 	if lease < minCaseLease {
 		lease = minCaseLease
@@ -285,7 +299,7 @@ func NewCaseRunner(deps CaseRunnerDeps) *CaseRunner {
 		leaseTTL:    lease,
 		heartbeat:   heartbeat,
 		activeRuns:  map[int64]context.CancelFunc{},
-		heartbeats:  map[int64]context.CancelFunc{},
+		heartbeats:  map[int64]*leaseHeartbeat{},
 		waitTotals:  map[int64]time.Duration{},
 		waitStarted: map[int64]time.Time{},
 	}
@@ -312,9 +326,11 @@ func (s *CaseRunner) CancelRun(caseRunID int64) {
 	}
 }
 
-// ClearRun forgets the cancel function after a run finished.
+// ClearRun forgets the cancel function after a run finished. It deliberately
+// does not stop the lease heartbeat: the heartbeat is bound to the run context
+// (the worker cancels it when the run returns), and a late ClearRun from an old
+// dispatch epoch must not kill the heartbeat of a superseding run.
 func (s *CaseRunner) ClearRun(caseRunID int64) {
-	s.stopLeaseHeartbeat(caseRunID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.activeRuns, caseRunID)
@@ -628,7 +644,7 @@ func (s *CaseRunner) Finish(ctx context.Context, scope tools.Scope, candidate ex
 	if err != nil {
 		return execution.CaseRun{}, err
 	}
-	s.stopLeaseHeartbeat(caseRun.ID)
+	s.stopLeaseHeartbeat(caseRun.ID, caseRun.DispatchEpoch)
 	s.closeSUTContexts(ctx, caseRun.ID)
 	s.publishCaseRunEvent(EventCaseRunFinished, finished, map[string]any{
 		"status":           string(status),
@@ -644,11 +660,14 @@ func (s *CaseRunner) Finish(ctx context.Context, scope tools.Scope, candidate ex
 	return finished, nil
 }
 
-// Finalize is called by the worker run sink after the agent loop ends. A
-// retryable run error before the attempt budget leaves the case_run running for
-// a redispatch; otherwise the deterministic aggregation writes the terminal
-// state. A lease-lost or paused run is left to its new owner.
-func (s *CaseRunner) Finalize(ctx context.Context, caseRunID int64, runErr error, attempt, maxAttempts int) error {
+// Finalize is called by the worker run sink after the agent loop ends.
+// dispatchEpoch is the case_run dispatch epoch carried by the work item: a late
+// Finalize from an older epoch has lost the run to a newer dispatch and must not
+// finalize it nor stop the new owner's heartbeat. A retryable run error before
+// the attempt budget leaves the case_run running for a redispatch; otherwise the
+// deterministic aggregation writes the terminal state. A lease-lost or paused
+// run is left to its new owner.
+func (s *CaseRunner) Finalize(ctx context.Context, caseRunID, dispatchEpoch int64, runErr error, attempt, maxAttempts int) error {
 	if s.caseRuns == nil {
 		return errors.New("case runner is not configured")
 	}
@@ -656,12 +675,19 @@ func (s *CaseRunner) Finalize(ctx context.Context, caseRunID int64, runErr error
 	if err != nil {
 		return mapExecutionError(err, "case_run")
 	}
-	// The agent loop is over; a redispatch (if any) starts its own heartbeat.
-	s.stopLeaseHeartbeat(caseRunID)
-	if caseRun.Status.Finished() || caseRun.Status == execution.CaseRunPaused {
+	// Fence before touching the heartbeat: a newer dispatch owns the run and its
+	// renewal timer.
+	if dispatchEpoch > 0 && caseRun.DispatchEpoch != dispatchEpoch {
 		return nil
 	}
 	if IsRunLeaseLost(runErr) {
+		// The dispatch fence is gone; the new owner owns the heartbeat.
+		return nil
+	}
+	// The agent loop is over and this dispatch still owns the case_run: no
+	// further renewal is needed.
+	s.stopLeaseHeartbeat(caseRunID, caseRun.DispatchEpoch)
+	if caseRun.Status.Finished() || caseRun.Status == execution.CaseRunPaused {
 		return nil
 	}
 	if runErr != nil {
@@ -754,33 +780,32 @@ func (s *CaseRunner) RenewLease(ctx context.Context, caseRunID, epoch int64, tok
 
 // startLeaseHeartbeat runs the independent lease renewal timer (spec §5.7:
 // heartbeat renews independently; lease > executor single-action timeout). It
-// stops when ctx is canceled (the worker cancels its run context) or when a
-// terminal write calls stopLeaseHeartbeat.
+// stops when ctx is canceled (the worker cancels its run context), when
+// Finish/Finalize stops this exact run+epoch, or when the dispatch fence is
+// definitively lost.
 func (s *CaseRunner) startLeaseHeartbeat(ctx context.Context, caseRun execution.CaseRun) {
 	if s.caseRuns == nil || s.heartbeat <= 0 {
 		return
 	}
 	heartbeatCtx, cancel := context.WithCancel(ctx)
+	heartbeat := &leaseHeartbeat{epoch: caseRun.DispatchEpoch, cancel: cancel}
 	s.mu.Lock()
 	if previous := s.heartbeats[caseRun.ID]; previous != nil {
-		previous()
+		previous.cancel()
 	}
-	s.heartbeats[caseRun.ID] = cancel
+	s.heartbeats[caseRun.ID] = heartbeat
 	s.mu.Unlock()
 
 	go func() {
 		ticker := time.NewTicker(s.heartbeat)
 		defer ticker.Stop()
+		defer s.forgetLeaseHeartbeat(caseRun.ID, heartbeat)
 		for {
 			select {
 			case <-heartbeatCtx.Done():
 				return
 			case <-ticker.C:
-				ok, err := s.caseRuns.ClaimLease(heartbeatCtx, caseRun.ID, caseRun.DispatchEpoch,
-					s.now().Add(s.leaseDuration()))
-				if err != nil || !ok {
-					// The epoch was taken over (or the store is gone): stop
-					// renewing; the recovery sweep owns the redispatch.
+				if !s.renewLease(heartbeatCtx, caseRun) {
 					return
 				}
 			}
@@ -788,15 +813,57 @@ func (s *CaseRunner) startLeaseHeartbeat(ctx context.Context, caseRun execution.
 	}()
 }
 
-// stopLeaseHeartbeat cancels and forgets one run's renewal timer.
-func (s *CaseRunner) stopLeaseHeartbeat(caseRunID int64) {
+// renewLease renews the lease once. Transient store errors are retried with a
+// short backoff while ctx is alive: one Postgres blip must not disable renewal
+// for the rest of a long action and turn it into executor_lost. Only a
+// definitive fence loss (!ok) stops the timer; the recovery sweep then owns the
+// redispatch.
+func (s *CaseRunner) renewLease(ctx context.Context, caseRun execution.CaseRun) bool {
+	for {
+		ok, err := s.caseRuns.ClaimLease(ctx, caseRun.ID, caseRun.DispatchEpoch,
+			s.now().Add(s.leaseDuration()))
+		if err == nil {
+			return ok
+		}
+		if ctx.Err() != nil {
+			return false
+		}
+		timer := time.NewTimer(heartbeatRetryDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false
+		case <-timer.C:
+		}
+	}
+}
+
+// stopLeaseHeartbeat cancels and forgets the renewal timer of one dispatch. The
+// epoch is part of the identity so a stale owner cannot stop the heartbeat of
+// the dispatch that superseded it.
+func (s *CaseRunner) stopLeaseHeartbeat(caseRunID, dispatchEpoch int64) {
 	s.mu.Lock()
-	cancel := s.heartbeats[caseRunID]
+	heartbeat := s.heartbeats[caseRunID]
+	if heartbeat == nil || heartbeat.epoch != dispatchEpoch {
+		s.mu.Unlock()
+		return
+	}
 	delete(s.heartbeats, caseRunID)
 	s.mu.Unlock()
-	if cancel != nil {
-		cancel()
+	heartbeat.cancel()
+}
+
+// forgetLeaseHeartbeat drops the timer entry when its goroutine exits, unless a
+// newer dispatch already replaced it.
+func (s *CaseRunner) forgetLeaseHeartbeat(caseRunID int64, heartbeat *leaseHeartbeat) {
+	s.mu.Lock()
+	if s.heartbeats[caseRunID] != heartbeat {
+		s.mu.Unlock()
+		return
 	}
+	delete(s.heartbeats, caseRunID)
+	s.mu.Unlock()
+	heartbeat.cancel()
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -859,7 +926,10 @@ func classifyFinalRunError(ctx context.Context, err error) (execution.FailureCla
 		case "tool_failure":
 			var apiErr *platform.Error
 			if errors.As(err, &apiErr) && apiErr.Code == "executor_unavailable" {
-				return execution.FailureClassEnvironment, runErr.Retryable
+				// "executor" is its own failure class (executor_lost), never
+				// environment: the UI shows 执行器失联 and the run may be retried
+				// on a recovered executor.
+				return execution.FailureClassExecutorLost, runErr.Retryable
 			}
 			return execution.FailureClassAutomation, runErr.Retryable
 		case "interrupted", "aborted":
@@ -1161,7 +1231,7 @@ func (s *CaseRunner) renewLeaseQuietly(ctx context.Context, caseRun execution.Ca
 
 func (s *CaseRunner) leaseDuration() time.Duration {
 	if s.leaseTTL <= 0 {
-		return defaultCaseLease
+		return DefaultCaseLease
 	}
 	return s.leaseTTL
 }

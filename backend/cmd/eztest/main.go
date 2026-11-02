@@ -773,7 +773,10 @@ func main() {
 		Clock:       clk,
 		Events:      eventSvc,
 		Instance:    instanceID,
-		LeaseTTL:    30 * time.Second,
+		// Same lease the CaseRunner stamps in Prepare (the scheduler also
+		// enforces this as a minimum): a queued work item can wait longer than
+		// 30s before a worker claims it.
+		LeaseTTL: executionapp.DefaultCaseLease,
 	})
 	executionRecovery := executionapp.NewRecovery(executionapp.RecoveryDeps{
 		Intents:     executionRepo.Intents,

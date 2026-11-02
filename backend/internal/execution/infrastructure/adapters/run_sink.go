@@ -42,5 +42,7 @@ func (s *RunSinkAdapter) OnRunFinished(ctx context.Context, item agent.WorkItem,
 		attempt = 1
 	}
 	maxAttempts := item.MaxAttempts
-	return s.runner.Finalize(ctx, payload.CaseRunID, runErr, attempt, maxAttempts)
+	// The dispatch epoch fences a stale Finalize: a late sink call from an old
+	// dispatch must not finalize (or stop the heartbeat of) the new owner.
+	return s.runner.Finalize(ctx, payload.CaseRunID, payload.DispatchEpoch, runErr, attempt, maxAttempts)
 }

@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	agentapp "github.com/EdouardRichard/EzTest/backend/internal/agent/application"
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
@@ -44,6 +45,8 @@ type caseRunnerFixture struct {
 	ids        *caseRunnerIDs
 	events     *caseRunnerEvents
 	audit      *caseRunnerAudit
+	runCtx     context.Context
+	runCancel  context.CancelFunc
 }
 
 func int64ptr(value int64) *int64 { return &value }
@@ -106,6 +109,8 @@ func newCaseRunnerFixture(t *testing.T) *caseRunnerFixture {
 		events: &caseRunnerEvents{},
 		audit:  &caseRunnerAudit{},
 	}
+	fixture.runCtx, fixture.runCancel = context.WithCancel(context.Background())
+	t.Cleanup(fixture.runCancel)
 	fixture.intents.rows[1001] = execution.ExecutionIntent{
 		ID: 1001, VersionID: 10, CaseVersionID: 41, Status: execution.IntentClaimed,
 		VersionSUTIDs: []int64{7}, Purpose: execution.PurposeInitial, AttemptNo: 1,
@@ -144,13 +149,17 @@ func newCaseRunnerFixture(t *testing.T) *caseRunnerFixture {
 }
 
 func p3WorkItem() agent.WorkItem {
+	return p3WorkItemFor(3, "dispatch-token")
+}
+
+func p3WorkItemFor(dispatchEpoch int64, dispatchToken string) agent.WorkItem {
 	payload, _ := json.Marshal(map[string]any{
 		"intent_id":       "1001",
 		"wave_id":         "2001",
 		"case_run_id":     "3001",
 		"case_version_id": "41",
-		"dispatch_epoch":  "3",
-		"dispatch_token":  "dispatch-token",
+		"dispatch_epoch":  dispatchEpoch,
+		"dispatch_token":  dispatchToken,
 	})
 	return agent.WorkItem{ID: 9001, VersionID: 10, Type: "execute.case", Payload: payload}
 }
@@ -164,7 +173,7 @@ func p3Scope() tools.Scope {
 
 func prepareCaseRun(t *testing.T, fixture *caseRunnerFixture) execution.TaskSnapshot {
 	t.Helper()
-	snapshot, err := fixture.runner.Prepare(context.Background(), p3WorkItem())
+	snapshot, err := fixture.runner.Prepare(fixture.runCtx, p3WorkItem())
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
@@ -188,7 +197,7 @@ func TestPrepareSetsRunningLeaseAndSnapshot(t *testing.T) {
 	if row.Status != execution.CaseRunRunning {
 		t.Fatalf("status = %q", row.Status)
 	}
-	if row.LeaseUntil == nil || !row.LeaseUntil.After(fixture.clock.now) {
+	if row.LeaseUntil == nil || !row.LeaseUntil.After(fixture.clock.Now()) {
 		t.Fatalf("lease = %v", row.LeaseUntil)
 	}
 	if row.DispatchEpoch != 3 || row.DispatchToken != "dispatch-token" {
@@ -970,6 +979,9 @@ func newDispatchScheduler(fixture *caseRunnerFixture, executor *execution.Execut
 		Clock:     fixture.clock,
 		Events:    fixture.events,
 		Instance:  "api-1",
+		// Mirrors the production wiring: even an explicit short scheduler lease
+		// must be clamped above the agent-side case lease.
+		LeaseTTL: 30 * time.Second,
 	})
 	return scheduler, queue
 }
@@ -981,7 +993,8 @@ func TestDegradedExecutorNotDispatched(t *testing.T) {
 	fixture := newCaseRunnerFixture(t)
 	executor := &execution.ExecutorInstance{
 		ID: 7, Endpoint: "http://127.0.0.1:13336", Capacity: 8,
-		Status: execution.ExecutorActive, LastError: "degraded",
+		Status: execution.ExecutorActive,
+		Labels: map[string]any{"eztest.degraded": true},
 	}
 	scheduler, queue := newDispatchScheduler(fixture, executor)
 
@@ -1041,4 +1054,154 @@ func TestNoExecutorEmitsBlocked(t *testing.T) {
 	if got, _ := payloads[0]["case_run_id"].(string); got != "3001" {
 		t.Fatalf("blocked case_run_id = %q, want 3001", got)
 	}
+}
+
+// TestLeaseHeartbeatRetriesTransientStoreError: one transient ClaimLease error
+// must not permanently disable renewal — the timer retries while the run context
+// is alive, so a later slow action cannot be misread as executor_lost.
+func TestLeaseHeartbeatRetriesTransientStoreError(t *testing.T) {
+	clock := newManualClock(time.Date(2026, 11, 2, 2, 0, 0, 0, time.UTC))
+	fixture := newHeartbeatFixture(t, clock, 2*time.Millisecond)
+	fixture.caseRuns.failNextClaims(1)
+	prepareCaseRun(t, fixture)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for fixture.caseRuns.claimCount() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("lease heartbeat stopped after a transient ClaimLease error: renewal attempts=%d (want a retry)",
+				fixture.caseRuns.claimCount())
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// The retried heartbeat keeps the lease alive across a long action.
+	clock.Advance(70 * time.Second)
+	waitForLeaseRenewal(t, fixture, clock, 75*time.Second)
+}
+
+// TestDispatchLeaseSurvivesDelayedClaim: the scheduler stamps the case_run lease
+// at dispatch, but the agent only claims it when a worker is free. The dispatch
+// lease must not expire while the work item waits in the queue, otherwise
+// recovery interrupts and redispatches a run that never started.
+func TestDispatchLeaseSurvivesDelayedClaim(t *testing.T) {
+	fixture := newCaseRunnerFixture(t)
+	executor := &execution.ExecutorInstance{
+		ID: 7, Endpoint: "http://127.0.0.1:13336", Capacity: 8,
+		Status: execution.ExecutorActive,
+	}
+	scheduler, queue := newDispatchScheduler(fixture, executor)
+	if err := scheduler.ReconcileVersion(context.Background(), 10); err != nil {
+		t.Fatalf("ReconcileVersion: %v", err)
+	}
+	dispatched := fixture.caseRuns.get(t, 3001)
+	if dispatched.Status != execution.CaseRunRunning {
+		t.Fatalf("dispatched status = %q, want running", dispatched.Status)
+	}
+	if dispatched.LeaseUntil == nil {
+		t.Fatal("dispatch did not stamp a case_run lease")
+	}
+	if lease := dispatched.LeaseUntil.Sub(fixture.clock.Now()); lease < 90*time.Second {
+		t.Fatalf("dispatch lease = %v, want at least the 90s agent lease", lease)
+	}
+
+	// The work item waits 45s behind a busy worker before any agent claims it.
+	fixture.clock.Advance(45 * time.Second)
+	recovery := executionapp.NewRecovery(executionapp.RecoveryDeps{
+		Intents:     fixture.intents,
+		Waves:       &fakeSchedulerWaveRepo{wave: &execution.RunWave{ID: 2001, VersionID: 10, Status: execution.WaveRunning}},
+		CaseRuns:    fixture.caseRuns,
+		Clock:       fixture.clock,
+		Events:      fixture.events,
+		MaxAttempts: 3,
+	})
+	if err := recovery.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Recovery.Reconcile: %v", err)
+	}
+	stored := fixture.caseRuns.get(t, 3001)
+	if stored.Status != execution.CaseRunRunning {
+		t.Fatalf("dispatch lease expired while the work item waited: status=%q attempts=%d", stored.Status, stored.Attempts)
+	}
+	if got := countEvents(fixture.events, executionapp.EventCaseRunFinished); got != 0 {
+		t.Fatalf("delayed dispatch emitted %d case_run.finished event(s), want 0", got)
+	}
+
+	// The delayed claim still owns the dispatch fence and starts normally.
+	item := queuedWorkItem(t, queue)
+	if _, err := fixture.runner.Prepare(fixture.runCtx, item); err != nil {
+		t.Fatalf("delayed Prepare after 45s wait: %v", err)
+	}
+	claimed := fixture.caseRuns.get(t, 3001)
+	if claimed.Status != execution.CaseRunRunning || claimed.LeaseUntil == nil ||
+		!claimed.LeaseUntil.After(fixture.clock.Now()) {
+		t.Fatalf("delayed claim did not refresh the lease: %+v", claimed)
+	}
+}
+
+// queuedWorkItem rebuilds the agent work item the scheduler enqueued.
+func queuedWorkItem(t *testing.T, queue *fakeDispatchQueue) agent.WorkItem {
+	t.Helper()
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+	if len(queue.items) != 1 {
+		t.Fatalf("ensured work items = %d, want 1", len(queue.items))
+	}
+	queued := queue.items[0]
+	payload, err := json.Marshal(queued.Payload)
+	if err != nil {
+		t.Fatalf("marshal work item payload: %v", err)
+	}
+	return agent.WorkItem{ID: 9001, VersionID: queued.VersionID, Type: queued.Type, Payload: payload}
+}
+
+// TestFinalizeMapsExecutorUnavailableToExecutorLost: an unreachable executor is
+// an executor failure, not an environment failure; the frontend maps it to
+// “执行器失联”.
+func TestFinalizeMapsExecutorUnavailableToExecutorLost(t *testing.T) {
+	fixture := newCaseRunnerFixture(t)
+	prepareCaseRun(t, fixture)
+	executorUnavailable := platform.NewError(503, "executor_unavailable", "executor is offline")
+	executorUnavailable.Retryable = true
+	runErr := &agentapp.RunError{Reason: "tool_failure", Retryable: true, Cause: executorUnavailable}
+	if err := fixture.runner.Finalize(fixture.runCtx, 3001, 3, runErr, 1, 1); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	stored := fixture.caseRuns.get(t, 3001)
+	if stored.Status != execution.CaseRunFailed {
+		t.Fatalf("status = %q, want failed", stored.Status)
+	}
+	if stored.FailureClass != execution.FailureClassExecutorLost {
+		t.Fatalf("failure class = %q, want executor_lost (not environment)", stored.FailureClass)
+	}
+}
+
+// TestStaleFinalizeDoesNotStopSupersedingHeartbeat: a late Finalize from an old
+// dispatch epoch must neither finalize nor stop the renewal timer of the new
+// dispatch that superseded it.
+func TestStaleFinalizeDoesNotStopSupersedingHeartbeat(t *testing.T) {
+	clock := newManualClock(time.Date(2026, 11, 2, 3, 0, 0, 0, time.UTC))
+	fixture := newHeartbeatFixture(t, clock, 2*time.Millisecond)
+	prepareCaseRun(t, fixture) // old dispatch epoch 3
+
+	fixture.caseRuns.mu.Lock()
+	row := fixture.caseRuns.rows[3001]
+	row.Status = execution.CaseRunPending
+	row.DispatchEpoch = 4
+	row.DispatchToken = "dispatch-token-4"
+	row.LeaseUntil = nil
+	fixture.caseRuns.rows[3001] = row
+	fixture.caseRuns.mu.Unlock()
+	if _, err := fixture.runner.Prepare(fixture.runCtx, p3WorkItemFor(4, "dispatch-token-4")); err != nil {
+		t.Fatalf("Prepare superseding dispatch: %v", err)
+	}
+
+	if err := fixture.runner.Finalize(fixture.runCtx, 3001, 3, nil, 1, 3); err != nil {
+		t.Fatalf("stale Finalize: %v", err)
+	}
+	stored := fixture.caseRuns.get(t, 3001)
+	if stored.Status != execution.CaseRunRunning || stored.DispatchEpoch != 4 {
+		t.Fatalf("stale Finalize touched the superseding run: %+v", stored)
+	}
+
+	clock.Advance(70 * time.Second)
+	waitForLeaseRenewal(t, fixture, clock, 75*time.Second)
 }

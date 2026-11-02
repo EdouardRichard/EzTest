@@ -368,9 +368,13 @@ func toHumanRequestView(request execution.HumanRequest) HumanRequestView {
 }
 
 func toExecutorView(instance execution.ExecutorInstance) ExecutorView {
-	labels := instance.Labels
-	if labels == nil {
-		labels = map[string]any{}
+	// The degraded health marker is internal registry state, not a user label.
+	labels := make(map[string]any, len(instance.Labels))
+	for key, value := range instance.Labels {
+		if key == execution.ExecutorLabelDegraded {
+			continue
+		}
+		labels[key] = value
 	}
 	return ExecutorView{
 		ID:             platformid.Format(instance.ID),
