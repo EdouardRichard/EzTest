@@ -3,6 +3,7 @@ package llminfra
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -272,7 +273,11 @@ func buildResponsesPayload(cfg llm.Config, req llmapp.ChatRequest, stream bool) 
 				})
 			}
 		default:
-			payload.Input = append(payload.Input, responsesMessageItem{Role: message.Role, Content: message.Content})
+			payload.Input = append(payload.Input, responsesMessageItem{
+				Role:    message.Role,
+				Content: message.Content,
+				Images:  message.Images,
+			})
 		}
 	}
 
@@ -641,9 +646,48 @@ type responsesTool struct {
 	Parameters  json.RawMessage `json:"parameters"`
 }
 
+// responsesMessageItem is one role message item. Text-only messages keep the
+// byte-compatible string content; a message with images serializes content as
+// the Responses content-parts array (input_text / input_image).
 type responsesMessageItem struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role    string
+	Content string
+	Images  []llmapp.ChatImage
+}
+
+// responsesInputPart is one Responses input content part.
+type responsesInputPart struct {
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	ImageURL string `json:"image_url,omitempty"`
+}
+
+// MarshalJSON preserves the string content for text-only messages and emits the
+// content-parts array only when the message carries images.
+func (m responsesMessageItem) MarshalJSON() ([]byte, error) {
+	if len(m.Images) == 0 {
+		return json.Marshal(struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		}{Role: m.Role, Content: m.Content})
+	}
+	parts := make([]responsesInputPart, 0, len(m.Images)+1)
+	if m.Content != "" {
+		parts = append(parts, responsesInputPart{Type: "input_text", Text: m.Content})
+	}
+	for _, image := range m.Images {
+		if len(image.Data) == 0 {
+			continue
+		}
+		parts = append(parts, responsesInputPart{
+			Type:     "input_image",
+			ImageURL: "data:" + image.MIME + ";base64," + base64.StdEncoding.EncodeToString(image.Data),
+		})
+	}
+	return json.Marshal(struct {
+		Role    string               `json:"role"`
+		Content []responsesInputPart `json:"content"`
+	}{Role: m.Role, Content: parts})
 }
 
 type responsesFunctionCallItem struct {

@@ -1,8 +1,8 @@
 package attachments_test
 
 import (
+	"context"
 	"encoding/binary"
-	"strings"
 	"testing"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/attachments"
@@ -68,8 +68,8 @@ func putUint24LE(dst []byte, value uint32) {
 	dst[2] = byte(value >> 16)
 }
 
-func TestBuildImagePartProbesDimensions(t *testing.T) {
-	shasum := strings.Repeat("a", 64)
+func TestImageProberDetectsDimensions(t *testing.T) {
+	prober := attachments.NewImageProber()
 	cases := []struct {
 		name   string
 		mime   string
@@ -86,32 +86,29 @@ func TestBuildImagePartProbesDimensions(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			part, err := attachments.BuildImagePart(tc.mime, shasum, tc.data)
+			mime, width, height, err := prober.Probe(context.Background(), tc.mime, tc.data)
 			if err != nil {
-				t.Fatalf("BuildImagePart: %v", err)
+				t.Fatalf("Probe: %v", err)
 			}
-			if part.Mime != tc.want || part.DataRef != shasum || part.Width != tc.width || part.Height != tc.height {
-				t.Fatalf("part = %#v", part)
+			if mime != tc.want || width != tc.width || height != tc.height {
+				t.Fatalf("probe = %q %dx%d, want %q %dx%d", mime, width, height, tc.want, tc.width, tc.height)
 			}
 		})
 	}
 }
 
-func TestBuildImagePartRejectsInvalidAndOversized(t *testing.T) {
-	shasum := strings.Repeat("a", 64)
-	if _, err := attachments.BuildImagePart("image/png", shasum, []byte("not an image")); err == nil {
+func TestImageProberRejectsInvalidAndOversized(t *testing.T) {
+	prober := attachments.NewImageProber()
+	if _, _, _, err := prober.Probe(context.Background(), "image/png", []byte("not an image")); err == nil {
 		t.Fatal("garbage accepted as an image")
 	}
-	if _, err := attachments.BuildImagePart("image/png", shasum, pngFixture(1, 1)[:20]); err == nil {
+	if _, _, _, err := prober.Probe(context.Background(), "image/png", pngFixture(1, 1)[:20]); err == nil {
 		t.Fatal("truncated PNG accepted")
 	}
-	if _, err := attachments.BuildImagePart("image/png", shasum, pngFixture(20000, 16)); err == nil {
+	if _, _, _, err := prober.Probe(context.Background(), "image/png", pngFixture(20000, 16)); err == nil {
 		t.Fatal("oversized dimension accepted")
 	}
-	if _, err := attachments.BuildImagePart("image/webp", shasum, pngFixture(800, 600)); err == nil {
+	if _, _, _, err := prober.Probe(context.Background(), "image/webp", pngFixture(800, 600)); err == nil {
 		t.Fatal("png accepted under a webp declaration")
-	}
-	if _, err := attachments.BuildImagePart("image/png", "", pngFixture(8, 8)); err == nil {
-		t.Fatal("empty data_ref accepted")
 	}
 }

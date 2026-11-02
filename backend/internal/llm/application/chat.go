@@ -69,8 +69,22 @@ type ToolCall struct {
 	Arguments string
 }
 
+// ChatImage is one inline image attached to a user message for a vision model.
+// The runner resolves an image part's content data_ref through its ImageLoader
+// and hands the bytes to the gateway, which serializes them as an
+// OpenAI-compatible data URL. Images are only sent to a model that passed the
+// ResolveModel vision gate.
+type ChatImage struct {
+	MIME string
+	Data []byte
+}
+
 // ChatMessage is one OpenAI-compatible transcript message. Assistant messages
 // may carry ToolCalls; tool messages carry the ToolCallID they answer.
+//
+// Images carries inline vision content for a user message. Adapters render it
+// as content parts (chat completions image_url / Responses input_image) and
+// keep text-only messages byte-compatible with the plain string wire.
 //
 // ReasoningContent is the provider's thinking text for an assistant turn. It
 // must be replayed on later turns for reasoning models that require it
@@ -83,6 +97,7 @@ type ToolCall struct {
 type ChatMessage struct {
 	Role             string
 	Content          string
+	Images           []ChatImage
 	ToolCalls        []ToolCall
 	ToolCallID       string
 	ReasoningContent string

@@ -66,6 +66,9 @@ type AttachmentService interface {
 	ListAttachments(ctx context.Context, versionID, conversationID int64) ([]versionapp.AttachmentMeta, error)
 	ReadAttachmentText(ctx context.Context, versionID, conversationID, attachmentID int64, offset, maxChars int) (versionapp.AttachmentTextRead, error)
 	AttachmentImageRef(ctx context.Context, versionID, conversationID, attachmentID int64) (versionapp.AttachmentImageRef, error)
+	// ReadImage resolves an image part data_ref (content SHA-256) into the
+	// original bytes plus the sniffed MIME for the vision model.
+	ReadImage(ctx context.Context, dataRef string) (mime string, data []byte, err error)
 	// ListPendingForIngest feeds the P1 reconciler (attachment.ingest).
 	ListPendingForIngest(ctx context.Context, limit int) ([]versionapp.PendingAttachment, error)
 }
@@ -112,6 +115,7 @@ var (
 	_ agentapp.ConversationPort        = (*Adapter)(nil)
 	_ agentapp.VersionReader           = (*Adapter)(nil)
 	_ agentapp.AttachmentReader        = (*Adapter)(nil)
+	_ agentapp.ImageLoader             = (*Adapter)(nil)
 	_ agentapp.ContentWriter           = (*Adapter)(nil)
 	_ agentapp.ConversationReader      = (*Adapter)(nil)
 	_ agentapp.PendingAttachmentReader = (*Adapter)(nil)

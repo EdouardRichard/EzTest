@@ -2,6 +2,7 @@ package llminfra_test
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -490,6 +491,61 @@ func TestOpenAIChatRejectsCollidingSanitizedToolNames(t *testing.T) {
 	}
 	if atomic.LoadInt32(&calls) != 0 {
 		t.Fatalf("upstream was called despite the tool-name collision")
+	}
+}
+
+// TestChatCompletionsImagePayload pins the chat-completions vision wire shape:
+// a user message with images serializes content as [{type:text},{type:image_url}]
+// with a base64 data URL, while text-only messages keep the plain string form.
+func TestChatCompletionsImagePayload(t *testing.T) {
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body = captureChatBody(t, r)
+		writeChatCompletion(w)
+	}))
+	defer server.Close()
+
+	imageData := []byte("png-bytes")
+	_, err := llminfra.NewClient().Chat(context.Background(), chatConfigFor(server.URL+"/v1", 0), llmapp.ChatRequest{
+		Model:           "fake-llm",
+		MaxOutputTokens: 8192,
+		Messages: []llmapp.ChatMessage{
+			{Role: "user", Content: "describe this screenshot", Images: []llmapp.ChatImage{
+				{MIME: "image/png", Data: imageData},
+			}},
+			{Role: "user", Content: "plain text stays a string"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+
+	messages, ok := body["messages"].([]any)
+	if !ok || len(messages) != 2 {
+		t.Fatalf("messages = %#v", body["messages"])
+	}
+	imageMessage := messages[0].(map[string]any)
+	parts, ok := imageMessage["content"].([]any)
+	if !ok || len(parts) != 2 {
+		t.Fatalf("image content = %#v, want a two-part array", imageMessage["content"])
+	}
+	textPart := parts[0].(map[string]any)
+	if textPart["type"] != "text" || textPart["text"] != "describe this screenshot" {
+		t.Fatalf("text part = %#v", textPart)
+	}
+	imagePart := parts[1].(map[string]any)
+	if imagePart["type"] != "image_url" {
+		t.Fatalf("image part = %#v", imagePart)
+	}
+	imageURL := imagePart["image_url"].(map[string]any)
+	want := "data:image/png;base64," + base64.StdEncoding.EncodeToString(imageData)
+	if imageURL["url"] != want {
+		t.Fatalf("image url = %#v, want %q", imageURL["url"], want)
+	}
+
+	plain := messages[1].(map[string]any)
+	if _, ok := plain["content"].(string); !ok {
+		t.Fatalf("text-only content = %#v, want the byte-compatible string form", plain["content"])
 	}
 }
 

@@ -25,9 +25,14 @@ type TaskEnqueuer interface {
 }
 
 // MessageAttachmentRegistrar validates a message attachment part against the
-// content ledger and persists the requirement_attachment runtime row. The
-// attachment service implements it; conversation messages never block on
-// extraction.
+// content ledger, converts image attachments into image parts before the
+// message is stored, guards pending references, and persists the
+// requirement_attachment runtime row. The attachment service implements it;
+// conversation messages never block on extraction.
 type MessageAttachmentRegistrar interface {
+	// PrepareUserMessageParts converts image attachment parts into image parts
+	// and returns the typed 409 attachment_pending when the message references
+	// an attachment that is still parsing.
+	PrepareUserMessageParts(ctx context.Context, versionID, conversationID int64, parts []version.MessagePart) ([]version.MessagePart, error)
 	RegisterFromMessage(ctx context.Context, versionID, conversationID, messageID int64, part version.MessagePart, actorID int64) (AttachmentView, error)
 }

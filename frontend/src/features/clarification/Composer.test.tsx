@@ -177,4 +177,91 @@ describe("Composer", () => {
     await screen.findByText("需求说明.pdf")
     expect(api.uploadContent).toHaveBeenCalledWith(file)
   })
+
+  it("blocks sending while an attachment is still pending", async () => {
+    let resolveUpload: (value: typeof CONTENT) => void = () => {}
+    api.uploadContent.mockImplementation(
+      () =>
+        new Promise<typeof CONTENT>((resolve) => {
+          resolveUpload = resolve
+        }),
+    )
+    const onSend = vi.fn().mockResolvedValue(true)
+    render(<Composer onSend={onSend} />)
+
+    const textarea = screen.getByTestId("composer-textarea")
+    fireEvent.paste(textarea, {
+      clipboardData: { files: [new File(["png-bytes"], "登录截图.png", { type: "image/png" })] },
+    })
+
+    const pending = await screen.findByTestId("attachment-pending")
+    expect(pending).toHaveTextContent("登录截图.png")
+    expect(pending).toHaveTextContent("解析中")
+    expect(screen.getByRole("button", { name: "解析中…" })).toBeDisabled()
+
+    fireEvent.change(textarea, { target: { value: "请看截图" } })
+    fireEvent.keyDown(textarea, { key: "Enter" })
+    expect(onSend).not.toHaveBeenCalled()
+
+    resolveUpload({ ...CONTENT, mime: "image/png" })
+    await waitFor(() => expect(screen.queryByTestId("attachment-pending")).not.toBeInTheDocument())
+    await waitFor(() => expect(screen.getByRole("button", { name: "发送" })).toBeEnabled())
+
+    fireEvent.keyDown(textarea, { key: "Enter" })
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
+    const parts = onSend.mock.calls[0][0] as NewMessagePart[]
+    expect(parts[1]).toEqual({
+      type: "attachment",
+      sha256: CONTENT.sha256,
+      name: "登录截图.png",
+      mime: "image/png",
+      size: 12,
+    })
+  })
+
+  it("serializes concurrent paste and drop uploads without losing attachments", async () => {
+    const resolvers: Array<(value: typeof CONTENT) => void> = []
+    api.uploadContent.mockImplementation(
+      () =>
+        new Promise<typeof CONTENT>((resolve) => {
+          resolvers.push(resolve)
+        }),
+    )
+    const onSend = vi.fn().mockResolvedValue(true)
+    render(<Composer onSend={onSend} />)
+
+    const textarea = screen.getByTestId("composer-textarea")
+    fireEvent.paste(textarea, {
+      clipboardData: { files: [new File(["png"], "a.png", { type: "image/png" })] },
+    })
+    fireEvent.drop(textarea, {
+      dataTransfer: {
+        files: [new File(["pdf"], "b.pdf", { type: "application/pdf" })],
+        types: ["Files"],
+      },
+    })
+
+    // Uploads are serialized: the second file waits for the first request.
+    await waitFor(() => expect(api.uploadContent).toHaveBeenCalledTimes(1))
+    resolvers[0]({ ...CONTENT, sha256: "a".repeat(64), mime: "image/png" })
+    await waitFor(() => expect(api.uploadContent).toHaveBeenCalledTimes(2))
+    resolvers[1]({ ...CONTENT, sha256: "b".repeat(64), mime: "application/pdf" })
+    await screen.findByText("b.pdf")
+
+    fireEvent.change(textarea, { target: { value: "两个附件" } })
+    fireEvent.keyDown(textarea, { key: "Enter" })
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
+    const parts = onSend.mock.calls[0][0] as NewMessagePart[]
+    expect(parts).toEqual([
+      { type: "text", text: "两个附件" },
+      { type: "attachment", sha256: "a".repeat(64), name: "a.png", mime: "image/png", size: 12 },
+      {
+        type: "attachment",
+        sha256: "b".repeat(64),
+        name: "b.pdf",
+        mime: "application/pdf",
+        size: 12,
+      },
+    ])
+  })
 })

@@ -92,6 +92,19 @@ type AttachmentReader interface {
 	GetAttachment(ctx context.Context, versionID, attachmentID int64) (AttachmentInfo, error)
 }
 
+// ImageData is one image resolved from an image part data_ref.
+type ImageData struct {
+	MIME string
+	Data []byte
+}
+
+// ImageLoader resolves an image part's content data_ref (the content-ledger
+// SHA-256) into bytes for a vision model. The version attachment adapter
+// implements it; the agent application never opens content storage itself.
+type ImageLoader interface {
+	LoadImage(ctx context.Context, dataRef string) (ImageData, error)
+}
+
 // TeamRoomPort is the agent context's team-room surface. *TeamRoom satisfies it.
 type TeamRoomPort interface {
 	Context(ctx context.Context, versionID int64, team string, maxPosts int) (TeamRoomContext, error)

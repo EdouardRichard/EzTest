@@ -2,6 +2,7 @@ package llminfra
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -233,6 +234,17 @@ func buildChatPayload(cfg llm.Config, req llmapp.ChatRequest) (chatRequestPayloa
 			ToolCallID:       message.ToolCallID,
 			ReasoningContent: message.ReasoningContent,
 		}
+		for _, image := range message.Images {
+			if len(image.Data) == 0 {
+				continue
+			}
+			item.ImageParts = append(item.ImageParts, chatContentPart{
+				Type: "image_url",
+				ImageURL: &chatContentImageURL{
+					URL: "data:" + image.MIME + ";base64," + base64.StdEncoding.EncodeToString(image.Data),
+				},
+			})
+		}
 		for _, call := range message.ToolCalls {
 			item.ToolCalls = append(item.ToolCalls, chatToolCallPayload{
 				ID:   call.ID,
@@ -422,6 +434,53 @@ type chatMessagePayload struct {
 	ToolCalls        []chatToolCallPayload `json:"tool_calls,omitempty"`
 	ToolCallID       string                `json:"tool_call_id,omitempty"`
 	ReasoningContent string                `json:"reasoning_content,omitempty"`
+	// ImageParts switches the content field to the OpenAI content-parts array.
+	// It is never serialized as its own key.
+	ImageParts []chatContentPart `json:"-"`
+}
+
+// chatContentPart is one chat-completions content part: text or an inline image
+// data URL.
+type chatContentPart struct {
+	Type     string               `json:"type"`
+	Text     string               `json:"text,omitempty"`
+	ImageURL *chatContentImageURL `json:"image_url,omitempty"`
+}
+
+// chatContentImageURL is the image_url payload of one content part.
+type chatContentImageURL struct {
+	URL string `json:"url"`
+}
+
+// MarshalJSON keeps text-only messages on the byte-compatible string content
+// wire and switches to the content-parts array only when images are present.
+func (m chatMessagePayload) MarshalJSON() ([]byte, error) {
+	type wireMessage struct {
+		Role             string                `json:"role"`
+		Content          any                   `json:"content,omitempty"`
+		ToolCalls        []chatToolCallPayload `json:"tool_calls,omitempty"`
+		ToolCallID       string                `json:"tool_call_id,omitempty"`
+		ReasoningContent string                `json:"reasoning_content,omitempty"`
+	}
+	var content any
+	switch {
+	case len(m.ImageParts) > 0:
+		parts := make([]chatContentPart, 0, len(m.ImageParts)+1)
+		if m.Content != "" {
+			parts = append(parts, chatContentPart{Type: "text", Text: m.Content})
+		}
+		parts = append(parts, m.ImageParts...)
+		content = parts
+	case m.Content != "":
+		content = m.Content
+	}
+	return json.Marshal(wireMessage{
+		Role:             m.Role,
+		Content:          content,
+		ToolCalls:        m.ToolCalls,
+		ToolCallID:       m.ToolCallID,
+		ReasoningContent: m.ReasoningContent,
+	})
 }
 
 type chatToolCallPayload struct {

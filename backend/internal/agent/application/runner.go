@@ -46,9 +46,13 @@ type RunnerDeps struct {
 	Conversation ConversationPort
 	Versions     VersionReader
 	Attachments  AttachmentReader
-	TeamRoom     TeamRoomPort
-	Content      ContentWriter
-	ToolDeps     tools.Deps
+	// Images resolves image part data_refs into model-ready bytes. It may be nil
+	// for deployments without vision; an image-bearing message then fails the
+	// run instead of silently dropping the image.
+	Images   ImageLoader
+	TeamRoom TeamRoomPort
+	Content  ContentWriter
+	ToolDeps tools.Deps
 	// TaskProvider loads the P3 execution task snapshot (execute.case runs).
 	// P1/P2 work items may leave it nil.
 	TaskProvider TaskContextProvider
@@ -93,6 +97,7 @@ type Runner struct {
 	conversation         ConversationPort
 	versions             VersionReader
 	attachments          AttachmentReader
+	images               ImageLoader
 	teamRoom             TeamRoomPort
 	content              ContentWriter
 	toolDeps             tools.Deps
@@ -125,6 +130,7 @@ func NewRunner(deps RunnerDeps) *Runner {
 		conversation:         deps.Conversation,
 		versions:             deps.Versions,
 		attachments:          deps.Attachments,
+		images:               deps.Images,
 		teamRoom:             deps.TeamRoom,
 		content:              deps.Content,
 		toolDeps:             deps.ToolDeps,
@@ -363,6 +369,7 @@ type runState struct {
 	turns            int
 	usage            map[string]int
 	messages         []llmapp.ChatMessage
+	images           []llmapp.ChatImage
 	userContent      string
 	cards            []ConversationPart
 	conversationKind string
@@ -417,10 +424,22 @@ func (r *Runner) Run(ctx context.Context, item agent.WorkItem) (RunResult, error
 		}
 	}
 
+	// An image on the triggering message requires a vision-capable model
+	// (spec §7.3/§8.3). Detect image parts before resolving so the single gate
+	// is ResolveModel(..., Vision:true); the typed 400 happens before any image
+	// bytes are loaded and before the run row is created.
+	imageRefs, err := r.triggerImageRefs(ctx, item, payload)
+	if err != nil {
+		return RunResult{}, err
+	}
+	requirements := modelRequirements(profile)
+	if len(imageRefs) > 0 {
+		requirements = append(requirements, llmapp.ModelRequirements{Vision: true})
+	}
 	// Resolve the model before creating the run so agent_run records the model
 	// and config actually used (spec §7.3). Capability validation happens in
 	// ResolveModel against the role's tool needs.
-	modelInfo, err := r.chat.ResolveModel(ctx, 0, profileModel(profile), modelRequirements(profile)...)
+	modelInfo, err := r.chat.ResolveModel(ctx, 0, profileModel(profile), requirements...)
 	if err != nil {
 		return RunResult{}, resolveRunError(err)
 	}
@@ -449,6 +468,12 @@ func (r *Runner) Run(ctx context.Context, item agent.WorkItem) (RunResult, error
 		r.runCanceller.RegisterRun(state.payload.CaseRunID, cancel)
 		defer r.runCanceller.ClearRun(state.payload.CaseRunID)
 	}
+
+	images, err := r.loadTriggerImages(runCtx, imageRefs)
+	if err != nil {
+		return r.fail(runCtx, state, err)
+	}
+	state.images = images
 
 	if err := r.prepare(runCtx, state); err != nil {
 		return r.fail(runCtx, state, err)
@@ -687,7 +712,7 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 	if err := r.appendTranscript(ctx, state, agent.MessageRoleUser, userContent, nil, nil); err != nil {
 		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}
-	state.messages = promptMessages(saved, userContent)
+	state.messages = promptMessagesFor(state, saved, userContent)
 	return nil
 }
 
@@ -906,7 +931,7 @@ func (r *Runner) handleOverflow(ctx context.Context, state *runState) error {
 	state.input = compacted
 	state.run.ContextPacketID = &saved.ID
 	systemContent := sectionContent(saved, contextSectionSystem)
-	state.messages = promptMessages(saved, state.userContent)
+	state.messages = promptMessagesFor(state, saved, state.userContent)
 	if err := r.appendTranscript(ctx, state, agent.MessageRoleSystem, systemContent, nil, nil); err != nil {
 		return &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
 	}
@@ -1480,6 +1505,98 @@ func (r *Runner) userMessage(ctx context.Context, state *runState, attachmentTex
 	}
 }
 
+// triggerImageRefs returns the content data_refs of the image parts on the
+// user message that triggered this run. Only chat.turn/requirement.curate read
+// the triggering message; background runs (execution, reports) never attach
+// conversation images. Refs are deduplicated and keep message order.
+func (r *Runner) triggerImageRefs(ctx context.Context, item agent.WorkItem, payload WorkItemPayload) ([]string, error) {
+	switch item.Type {
+	case WorkTypeChatTurn, WorkTypeRequirementCurate:
+	default:
+		return nil, nil
+	}
+	if payload.MessageID <= 0 || payload.ConversationID <= 0 || r.conversation == nil {
+		return nil, nil
+	}
+	message, err := r.conversation.GetMessage(ctx, item.VersionID, payload.ConversationID, payload.MessageID)
+	if err != nil {
+		return nil, &RunError{Reason: "tool_failure", Retryable: true, Cause: err}
+	}
+	refs := make([]string, 0, len(message.Parts))
+	seen := make(map[string]struct{}, len(message.Parts))
+	for _, part := range message.Parts {
+		if part.Type != "image" {
+			continue
+		}
+		ref := imagePartDataRef(part)
+		if ref == "" {
+			continue
+		}
+		if _, duplicate := seen[ref]; duplicate {
+			continue
+		}
+		seen[ref] = struct{}{}
+		refs = append(refs, ref)
+	}
+	return refs, nil
+}
+
+// imagePartDataRef extracts the content data_ref of one image conversation
+// part. The version adapter maps the R5 image payload into Data.
+func imagePartDataRef(part ConversationPart) string {
+	if part.Data == nil {
+		return ""
+	}
+	value, ok := part.Data["data_ref"].(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(value)
+}
+
+// loadTriggerImages resolves the triggering message's image refs into bytes for
+// the LLM request. A missing loader or an unreadable image fails the run: the
+// model must never silently miss an image the user sent.
+func (r *Runner) loadTriggerImages(ctx context.Context, refs []string) ([]llmapp.ChatImage, error) {
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	if r.images == nil {
+		return nil, &RunError{
+			Reason:    "tool_failure",
+			Retryable: false,
+			Cause:     errors.New("agent runner has no image loader"),
+		}
+	}
+	images := make([]llmapp.ChatImage, 0, len(refs))
+	for _, ref := range refs {
+		image, err := r.images.LoadImage(ctx, ref)
+		if err != nil {
+			return nil, &RunError{Reason: "tool_failure", Retryable: imageLoadErrorRetryable(err), Cause: err}
+		}
+		if len(image.Data) == 0 {
+			return nil, &RunError{
+				Reason:    "tool_failure",
+				Retryable: true,
+				Cause:     fmt.Errorf("image %s resolved to no bytes", ref),
+			}
+		}
+		images = append(images, llmapp.ChatImage{MIME: image.MIME, Data: image.Data})
+	}
+	return images, nil
+}
+
+// imageLoadErrorRetryable classifies an image resolution failure: a 4xx means
+// the stored reference is bad (non-retryable unless it says otherwise), while
+// transport/storage failures are retried.
+func imageLoadErrorRetryable(err error) bool {
+	var apiErr *platform.Error
+	if errors.As(err, &apiErr) && apiErr.Status >= 400 && apiErr.Status < 500 {
+		return apiErr.Retryable
+	}
+	return true
+}
+
 func (r *Runner) teamRoomContext(ctx context.Context, versionID int64, team agent.Team) TeamRoomContext {
 	if r.teamRoom == nil {
 		return TeamRoomContext{}
@@ -1648,7 +1765,8 @@ func profileModel(profile agent.AgentProfile) string {
 // modelRequirements derives the capabilities a profile's run needs before
 // dispatch. Profiles that may call tools need a tools-capable model; the
 // reasoning requirement is derived from the config's thinking mode by the
-// gateway itself. Vision is requested by the image-specific call sites.
+// gateway itself. Vision is appended by Run when the triggering message has
+// image parts, so ResolveModel is the single vision gate.
 func modelRequirements(profile agent.AgentProfile) []llmapp.ModelRequirements {
 	if len(profile.AllowedTools) == 0 {
 		return nil
@@ -1988,6 +2106,18 @@ func promptMessages(packet agent.ContextPacket, userContent string) []llmapp.Cha
 		{Role: "system", Content: system},
 		{Role: "user", Content: builder.String()},
 	}
+}
+
+// promptMessagesFor renders the prompt and attaches the triggering message's
+// images to the current user turn, where vision models expect them.
+func promptMessagesFor(state *runState, packet agent.ContextPacket, userContent string) []llmapp.ChatMessage {
+	messages := promptMessages(packet, userContent)
+	if len(state.images) == 0 || len(messages) == 0 {
+		return messages
+	}
+	last := len(messages) - 1
+	messages[last].Images = append([]llmapp.ChatImage(nil), state.images...)
+	return messages
 }
 
 func mergeUsage(target map[string]int, addition map[string]int) {

@@ -2,6 +2,7 @@ package versionapp_test
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -188,6 +189,12 @@ type fakeRegistrar struct {
 	calls []registrarCall
 	err   error
 	id    int64
+}
+
+// PrepareUserMessageParts is the conversion hook: the fake keeps the parts
+// unchanged so conversation tests stay focused on message persistence.
+func (f *fakeRegistrar) PrepareUserMessageParts(_ context.Context, _, _ int64, parts []version.MessagePart) ([]version.MessagePart, error) {
+	return parts, nil
 }
 
 func (f *fakeRegistrar) RegisterFromMessage(_ context.Context, versionID, conversationID, messageID int64, part version.MessagePart, actorID int64) (versionapp.AttachmentView, error) {
@@ -779,5 +786,155 @@ func TestPostUserMessageStoresImagePart(t *testing.T) {
 	stored := env.repo.messages[conversation.ID][0]
 	if stored.Parts[1].Type != version.MessagePartImage {
 		t.Fatalf("stored = %#v", stored.Parts)
+	}
+}
+
+// ---------- image end-to-end (real attachment service) ----------
+
+// imageConversationEnv wires the conversation service to the real attachment
+// service so attachment parts are converted/probed end to end.
+type imageConversationEnv struct {
+	svc          *versionapp.ConversationService
+	repo         *fakeConversationRepo
+	attachments  *attachmentEnv
+	versionEnv   *testEnv
+	versionID    int64
+	conversation versionapp.ConversationView
+}
+
+func newImageConversationEnv(t *testing.T) *imageConversationEnv {
+	t.Helper()
+	base := newTestEnv(t)
+	created := createVersion(t, base, "Image conversation version")
+	attachEnv := newAttachmentEnv(t)
+	attachEnv.versionID = created.ID
+	repo := newFakeConversationRepo()
+	svc := versionapp.NewConversationService(
+		repo, &fakeQueue{}, attachEnv.svc, base.svc, fixedClock{at: testTime}, &seqIDs{}, &fakePublisher{})
+	conversation, err := svc.Create(requestContext(), created.ID, "clarification", "Chat", 42)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	return &imageConversationEnv{
+		svc: svc, repo: repo, attachments: attachEnv, versionEnv: base,
+		versionID: created.ID, conversation: conversation,
+	}
+}
+
+// pngImageBytes builds the smallest header the image prober needs: a PNG
+// signature plus an IHDR chunk carrying the pixel dimensions.
+func pngImageBytes(width, height int) []byte {
+	data := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}
+	header := make([]byte, 25)
+	binary.BigEndian.PutUint32(header[0:4], 13)
+	copy(header[4:8], "IHDR")
+	binary.BigEndian.PutUint32(header[8:12], uint32(width))
+	binary.BigEndian.PutUint32(header[12:16], uint32(height))
+	header[16] = 8 // bit depth
+	header[17] = 2 // truecolor
+	return append(data, header...)
+}
+
+// TestImageAttachmentBecomesImagePart covers the end-to-end server conversion:
+// an uploaded image the Composer sends as an attachment part is stored as a
+// vision-ready image part. The attachment row still exists (extraction skipped,
+// no text) as the content-ledger anchor that keeps the bytes alive.
+func TestImageAttachmentBecomesImagePart(t *testing.T) {
+	env := newImageConversationEnv(t)
+	data := pngImageBytes(800, 600)
+	sha := strings.Repeat("e", 64)
+	env.attachments.store.put(sha, data, "image/png")
+
+	parts := []version.MessagePart{
+		{Type: version.MessagePartText, Text: "这张截图说明了什么？"},
+		{Type: version.MessagePartAttachment, SHA256: sha, Name: "shot.png", MIME: "image/png", Size: int64(len(data))},
+	}
+	message, err := env.svc.PostUserMessage(
+		requestContext(), env.versionID, env.conversation.ID, parts, "image-e2e", 42)
+	if err != nil {
+		t.Fatalf("PostUserMessage: %v", err)
+	}
+	if len(message.Parts) != 2 {
+		t.Fatalf("parts = %#v", message.Parts)
+	}
+	image := message.Parts[1]
+	if image.Type != version.MessagePartImage || image.MIME != "image/png" ||
+		image.DataRef != sha || image.Width != 800 || image.Height != 600 {
+		t.Fatalf("image part = %#v", image)
+	}
+	stored := env.repo.messages[env.conversation.ID][0]
+	if stored.Parts[1].Type != version.MessagePartImage || stored.Parts[1].DataRef != sha {
+		t.Fatalf("stored parts = %#v", stored.Parts)
+	}
+	// The attachment row is the content-ledger anchor (it adds the content ref
+	// the storage GC needs); images are extraction-skipped because there is no
+	// text, while the message itself carries the image part.
+	if len(env.attachments.repo.attachments) != 1 {
+		t.Fatalf("attachment rows = %#v", env.attachments.repo.attachments)
+	}
+	for _, row := range env.attachments.repo.attachments {
+		if row.ExtractionStatus != version.AttachmentSkipped || row.MIME != "image/png" {
+			t.Fatalf("image attachment row = %#v", row)
+		}
+	}
+	if len(env.attachments.store.refs) != 1 || env.attachments.store.refs[0].ObjectID != sha {
+		t.Fatalf("image content refs = %#v", env.attachments.store.refs)
+	}
+	if len(env.repo.messages[env.conversation.ID]) != 1 {
+		t.Fatalf("messages = %#v", env.repo.messages[env.conversation.ID])
+	}
+}
+
+// TestPostUserMessageBlocksPendingAttachment covers the §8.5 guard: a message
+// that references an attachment already registered in the conversation while
+// its extraction is still running returns the typed 409 attachment_pending
+// ("解析中，可重试") instead of being accepted.
+func TestPostUserMessageBlocksPendingAttachment(t *testing.T) {
+	env := newImageConversationEnv(t)
+	env.attachments.repo.conversationMessages = map[int64]int64{7001: env.conversation.ID}
+	env.attachments.repo.conversations = map[int64]int64{env.conversation.ID: env.versionID}
+	data := []byte("# 需求")
+	sha := strings.Repeat("a", 64)
+	env.attachments.store.put(sha, data, "text/markdown")
+	pending, err := env.attachments.svc.RegisterFromMessage(requestContext(), env.versionID,
+		env.conversation.ID, 7001, attachmentPart(sha, "spec.md", "text/markdown", int64(len(data))), 42)
+	if err != nil {
+		t.Fatalf("RegisterFromMessage: %v", err)
+	}
+	if pending.ExtractionStatus != version.AttachmentPending {
+		t.Fatalf("pending = %#v", pending)
+	}
+
+	referencing := []version.MessagePart{
+		{Type: version.MessagePartText, Text: "请再看一下附件"},
+		{Type: version.MessagePartAttachment, SHA256: sha, Name: "spec.md", MIME: "text/markdown", Size: int64(len(data))},
+	}
+	_, err = env.svc.PostUserMessage(requestContext(), env.versionID, env.conversation.ID, referencing, "", 42)
+	if err == nil {
+		t.Fatal("message referencing a pending attachment was accepted")
+	}
+	apiErr := apiError(t, err)
+	if apiErr.Status != http.StatusConflict || apiErr.Code != "attachment_pending" {
+		t.Fatalf("error = %#v, want 409 attachment_pending", apiErr)
+	}
+	if !apiErr.Retryable || !strings.Contains(apiErr.Message, "解析中") {
+		t.Fatalf("error = %#v, want a retryable parsing message", apiErr)
+	}
+	if len(env.repo.messages[env.conversation.ID]) != 0 {
+		t.Fatalf("blocked message was stored: %#v", env.repo.messages[env.conversation.ID])
+	}
+
+	// Once the extraction is done the same reference is accepted.
+	env.attachments.extractor.text = "done text"
+	if _, err := env.attachments.svc.Extract(requestContext(), pending.ID); err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	message, err := env.svc.PostUserMessage(
+		requestContext(), env.versionID, env.conversation.ID, referencing, "", 42)
+	if err != nil {
+		t.Fatalf("PostUserMessage after extraction: %v", err)
+	}
+	if len(message.Parts) != 2 || message.Parts[1].Type != version.MessagePartAttachment {
+		t.Fatalf("parts = %#v", message.Parts)
 	}
 }

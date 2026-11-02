@@ -1,16 +1,18 @@
 "use client"
 
 import { Paperclip } from "lucide-react"
+import { useEffect, useState } from "react"
 
 import { cn } from "@/components/ui/cn"
 import { EmptyState } from "@/components/ui/EmptyState"
 import { Spinner } from "@/components/ui/Spinner"
 import { formatDateTime } from "@/lib/format"
 
+import { downloadContent } from "./api"
 import { RequirementCard } from "./RequirementCard"
 import { RichText } from "./RichText"
 import { RollbackCard } from "./RollbackCard"
-import type { ConversationMessage, MessagePart, RequirementDetail } from "./types"
+import type { ConversationMessage, ImagePart, MessagePart, RequirementDetail } from "./types"
 
 export type MessageListProps = {
   versionId: string
@@ -19,6 +21,66 @@ export type MessageListProps = {
   activity: string | null
   onRequirementSelect: (requirementId: string) => void
   onRequirementChanged?: (requirement: RequirementDetail) => void
+}
+
+/**
+ * Renders one image part through the authenticated content endpoint: the
+ * content bytes are fetched with the bearer token (like every other API call)
+ * and exposed as an object URL, which keeps `GET /api/content/{sha256}` auth
+ * intact instead of a bare `<img src>`.
+ */
+function MessageImage({ part }: { part: ImagePart }) {
+  const [url, setUrl] = useState<string | null>(null)
+  const [failed, setFailed] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    let objectUrl: string | null = null
+    setUrl(null)
+    setFailed(false)
+    void downloadContent(part.data_ref).then(
+      (download) => {
+        if (cancelled) return
+        objectUrl = URL.createObjectURL(download.blob)
+        setUrl(objectUrl)
+      },
+      () => {
+        if (!cancelled) setFailed(true)
+      },
+    )
+    return () => {
+      cancelled = true
+      if (objectUrl !== null) URL.revokeObjectURL(objectUrl)
+    }
+  }, [part.data_ref])
+
+  if (failed) {
+    return (
+      <span data-testid="message-image-error" className="text-[11px] text-destructive">
+        图片加载失败
+      </span>
+    )
+  }
+  if (url === null) {
+    return (
+      <span data-testid="message-image-loading" className="text-[11px] text-muted-foreground">
+        图片加载中…
+      </span>
+    )
+  }
+  // The source is an authenticated content blob object URL, not a static asset
+  // that next/image can optimize.
+  return (
+    // biome-ignore lint/performance/noImgElement: blob URL from the authenticated content API
+    <img
+      data-testid="message-image"
+      src={url}
+      alt="消息图片"
+      width={part.width}
+      height={part.height}
+      className="max-h-64 w-auto rounded-lg border border-border object-contain"
+    />
+  )
 }
 
 function MessagePartView({
@@ -37,6 +99,8 @@ function MessagePartView({
   switch (part.type) {
     case "text":
       return <RichText>{part.text}</RichText>
+    case "image":
+      return <MessageImage part={part} />
     case "attachment":
       return (
         <span
@@ -69,6 +133,8 @@ function partKey(part: MessagePart): string {
       return `text:${part.text.slice(0, 32)}`
     case "attachment":
       return `attachment:${part.sha256}`
+    case "image":
+      return `image:${part.data_ref}`
     case "requirement_card":
       return `requirement:${part.requirement_id}`
     case "rollback_proposal":

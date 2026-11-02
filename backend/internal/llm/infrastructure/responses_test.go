@@ -2,6 +2,7 @@ package llminfra_test
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"io"
 	"net/http"
@@ -537,5 +538,73 @@ func TestResponsesStreamHTTPErrorsAreClassified(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestResponsesImagePayload pins the /responses vision wire shape: an image
+// message item carries input content parts [{type:input_text},{type:input_image}]
+// with a base64 data URL, while text-only messages keep the string form.
+func TestResponsesImagePayload(t *testing.T) {
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body = captureChatBody(t, r)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"id":"resp_image",
+			"object":"response",
+			"status":"completed",
+			"output":[
+				{"type":"message","id":"msg_image","role":"assistant","content":[
+					{"type":"output_text","text":"收到截图","annotations":[]}
+				]}
+			],
+			"usage":{"input_tokens":11,"output_tokens":5,"total_tokens":16}
+		}`)
+	}))
+	defer server.Close()
+
+	imageData := []byte("png-bytes")
+	response, err := llminfra.NewClient().Chat(context.Background(), responsesConfig(server.URL+"/v1", 0), llmapp.ChatRequest{
+		Model:           "fake-llm",
+		MaxOutputTokens: 8192,
+		Messages: []llmapp.ChatMessage{
+			{Role: "user", Content: "describe this screenshot", Images: []llmapp.ChatImage{
+				{MIME: "image/png", Data: imageData},
+			}},
+			{Role: "user", Content: "plain text stays a string"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	if response.Content != "收到截图" {
+		t.Fatalf("content = %q", response.Content)
+	}
+
+	input, ok := body["input"].([]any)
+	if !ok || len(input) != 2 {
+		t.Fatalf("input = %#v", body["input"])
+	}
+	imageMessage := input[0].(map[string]any)
+	if imageMessage["role"] != "user" {
+		t.Fatalf("image item = %#v", imageMessage)
+	}
+	parts, ok := imageMessage["content"].([]any)
+	if !ok || len(parts) != 2 {
+		t.Fatalf("image content = %#v, want a two-part array", imageMessage["content"])
+	}
+	textPart := parts[0].(map[string]any)
+	if textPart["type"] != "input_text" || textPart["text"] != "describe this screenshot" {
+		t.Fatalf("text part = %#v", textPart)
+	}
+	imagePart := parts[1].(map[string]any)
+	want := "data:image/png;base64," + base64.StdEncoding.EncodeToString(imageData)
+	if imagePart["type"] != "input_image" || imagePart["image_url"] != want {
+		t.Fatalf("image part = %#v, want image_url %q", imagePart, want)
+	}
+
+	plain := input[1].(map[string]any)
+	if _, ok := plain["content"].(string); !ok {
+		t.Fatalf("text-only content = %#v, want the byte-compatible string form", plain["content"])
 	}
 }

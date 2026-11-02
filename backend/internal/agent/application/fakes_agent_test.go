@@ -12,6 +12,7 @@ import (
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	auditapp "github.com/EdouardRichard/EzTest/backend/internal/audit/application"
 	llmapp "github.com/EdouardRichard/EzTest/backend/internal/llm/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
 // fakeRuntimeRepo implements agent.RuntimeRepository in memory.
@@ -162,7 +163,11 @@ type scriptedChat struct {
 	models    []llmapp.ModelInfo
 	modelErr  error
 	resolves  []string
-	onChat    func(index int, req llmapp.ChatRequest)
+	// supportsVision mirrors the catalog capability gate: a run that asks for
+	// Vision on a model without it must fail before Chat is called.
+	supportsVision bool
+	requirements   []llmapp.ModelRequirements
+	onChat         func(index int, req llmapp.ChatRequest)
 }
 
 func (f *scriptedChat) Chat(_ context.Context, req llmapp.ChatRequest) (llmapp.ChatResponse, error) {
@@ -189,12 +194,23 @@ func (f *scriptedChat) Chat(_ context.Context, req llmapp.ChatRequest) (llmapp.C
 	return response, scriptedErr
 }
 
-func (f *scriptedChat) ResolveModel(_ context.Context, _ int64, model string, _ ...llmapp.ModelRequirements) (llmapp.ModelInfo, error) {
+func (f *scriptedChat) ResolveModel(_ context.Context, _ int64, model string, required ...llmapp.ModelRequirements) (llmapp.ModelInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.resolves = append(f.resolves, model)
+	f.requirements = append(f.requirements, required...)
 	if f.modelErr != nil {
 		return llmapp.ModelInfo{}, f.modelErr
+	}
+	for _, requirement := range required {
+		if requirement.Vision && !f.supportsVision {
+			return llmapp.ModelInfo{}, &platform.Error{
+				Status:  400,
+				Code:    llmapp.CodeLLMCapabilityMismatch,
+				Message: "llm model does not support vision required by this role; choose a model with that capability",
+				Details: map[string]any{"missing_capabilities": []string{"vision"}},
+			}
+		}
 	}
 	if len(f.models) == 0 {
 		return llmapp.ModelInfo{ConfigID: 1, Model: "fake-llm", ContextWindow: 64000, MaxOutput: 8192}, nil
@@ -306,6 +322,26 @@ func (f *fakeAttachmentReader) GetAttachment(_ context.Context, versionID, attac
 	info := f.info
 	info.ID = attachmentID
 	return info, nil
+}
+
+// fakeImageLoader resolves image part data_refs for vision runs and records
+// the refs the runner asked for.
+type fakeImageLoader struct {
+	images map[string]agentapp.ImageData
+	err    error
+	refs   []string
+}
+
+func (f *fakeImageLoader) LoadImage(_ context.Context, dataRef string) (agentapp.ImageData, error) {
+	f.refs = append(f.refs, dataRef)
+	if f.err != nil {
+		return agentapp.ImageData{}, f.err
+	}
+	image, ok := f.images[dataRef]
+	if !ok {
+		return agentapp.ImageData{}, platform.NotFound("content")
+	}
+	return image, nil
 }
 
 type fakeTeamRoomPort struct {

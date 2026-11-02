@@ -3,9 +3,11 @@ package agentapp_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +16,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/agent/application/tools"
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	llmapp "github.com/EdouardRichard/EzTest/backend/internal/llm/application"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/load"
 )
 
@@ -26,6 +29,7 @@ type runnerFixture struct {
 	conv            *fakeConversationPort
 	versions        *fakeVersionReader
 	attachments     *fakeAttachmentReader
+	images          *fakeImageLoader
 	team            *fakeTeamRoomPort
 	content         *fakeContentWriter
 	settings        *fakeSettings
@@ -70,6 +74,7 @@ func newRunnerFixtureWithTaskProvider(t *testing.T, taskProvider agentapp.TaskCo
 		attachments: &fakeAttachmentReader{info: agentapp.AttachmentInfo{
 			Name: "需求.md", MIME: "text/markdown", Status: "done", Text: "登录需求正文", TotalChars: 6,
 		}},
+		images:  &fakeImageLoader{images: map[string]agentapp.ImageData{}},
 		team:    &fakeTeamRoomPort{},
 		content: &fakeContentWriter{},
 		settings: &fakeSettings{ints: map[string]int64{
@@ -101,6 +106,7 @@ func newRunnerFixtureWithTaskProvider(t *testing.T, taskProvider agentapp.TaskCo
 		Conversation:   fixture.conv,
 		Versions:       fixture.versions,
 		Attachments:    fixture.attachments,
+		Images:         fixture.images,
 		TeamRoom:       fixture.team,
 		Content:        fixture.content,
 		Knowledge:      fixture.knowledge,
@@ -743,6 +749,96 @@ func TestProfileKeyForWorkType(t *testing.T) {
 	// work type must still not map to a P1/P2 profile.
 	if _, ok := agentapp.ProfileKeyForWorkType("report.render_pdf"); ok {
 		t.Fatal("P4+ work type must not map to a P1/P2 profile")
+	}
+}
+
+// imageHostFixture seeds the triggering user message with one image part and a
+// resolvable image loader. The fake gateway enforces supports_vision like the
+// real catalog gate.
+func imageHostFixture(t *testing.T) (*runnerFixture, string) {
+	t.Helper()
+	fixture := newRunnerFixture(t)
+	sha := strings.Repeat("a", 64)
+	fixture.conv.messages[501] = agentapp.ConversationMessage{
+		ID: 501, Role: "user", Text: "这张截图说明了什么？",
+		Parts: []agentapp.ConversationPart{{
+			Type: "image",
+			Data: map[string]any{"mime": "image/png", "data_ref": sha, "width": 800, "height": 600},
+		}},
+	}
+	fixture.images.images[sha] = agentapp.ImageData{MIME: "image/png", Data: []byte("png-bytes")}
+	fixture.chat.supportsVision = true
+	return fixture, sha
+}
+
+// TestRunnerSendsImageContent covers the runner half of the vision path: image
+// parts on the triggering message are resolved through the ImageLoader port and
+// attached to the user LLM message, with Vision required from the model.
+func TestRunnerSendsImageContent(t *testing.T) {
+	fixture, sha := imageHostFixture(t)
+	fixture.chat.responses = []llmapp.ChatResponse{{Content: "截图里是登录页。"}}
+
+	if _, err := mustRun(t, fixture, hostItem()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(fixture.images.refs) != 1 || fixture.images.refs[0] != sha {
+		t.Fatalf("loaded image refs = %#v, want %q", fixture.images.refs, sha)
+	}
+	if fixture.chat.requestCount() == 0 {
+		t.Fatal("no chat request recorded")
+	}
+	request := fixture.chat.request(0)
+	found := false
+	for _, message := range request.Messages {
+		if message.Role != "user" || len(message.Images) == 0 {
+			continue
+		}
+		found = true
+		if message.Images[0].MIME != "image/png" || string(message.Images[0].Data) != "png-bytes" {
+			t.Fatalf("image content = %#v", message.Images[0])
+		}
+	}
+	if !found {
+		t.Fatalf("no user message carried the image: %#v", request.Messages)
+	}
+	vision := false
+	for _, requirement := range fixture.chat.requirements {
+		if requirement.Vision {
+			vision = true
+		}
+	}
+	if !vision {
+		t.Fatalf("ResolveModel requirements = %#v, want Vision", fixture.chat.requirements)
+	}
+}
+
+// TestRunnerRejectsImageWithoutVision covers §7.3/§8.3: the single vision gate
+// is ResolveModel(..., Vision:true); a non-vision model fails with a typed 400
+// before the model is called or any image bytes are loaded.
+func TestRunnerRejectsImageWithoutVision(t *testing.T) {
+	fixture, _ := imageHostFixture(t)
+	fixture.chat.supportsVision = false
+	fixture.chat.responses = []llmapp.ChatResponse{{Content: "must not be called"}}
+
+	_, err := mustRun(t, fixture, hostItem())
+	if err == nil {
+		t.Fatal("image run accepted a model without supports_vision")
+	}
+	var apiErr *platform.Error
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %v, want a typed platform error", err)
+	}
+	if apiErr.Status != http.StatusBadRequest || apiErr.Code != llmapp.CodeLLMCapabilityMismatch {
+		t.Fatalf("error = %#v, want 400 %s", apiErr, llmapp.CodeLLMCapabilityMismatch)
+	}
+	if !strings.Contains(strings.ToLower(apiErr.Message), "vision") {
+		t.Fatalf("message = %q, want an explicit vision capability error", apiErr.Message)
+	}
+	if fixture.chat.requestCount() != 0 {
+		t.Fatalf("chat was called on a rejected model: %#v", fixture.chat.requests)
+	}
+	if len(fixture.images.refs) != 0 {
+		t.Fatalf("image bytes loaded before the capability gate: %#v", fixture.images.refs)
 	}
 }
 

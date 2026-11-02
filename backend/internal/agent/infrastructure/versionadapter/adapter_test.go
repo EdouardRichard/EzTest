@@ -97,12 +97,13 @@ func (f *fakeStorage) Upload(ctx context.Context, filename, mime string, r io.Re
 }
 
 type fakeAttachments struct {
-	extractFn  func(ctx context.Context, attachmentID int64) (versionapp.ExtractionResult, error)
-	getInfoFn  func(ctx context.Context, versionID, attachmentID int64) (versionapp.AttachmentInfo, error)
-	listFn     func(ctx context.Context, versionID, conversationID int64) ([]versionapp.AttachmentMeta, error)
-	readTextFn func(ctx context.Context, versionID, conversationID, attachmentID int64, offset, maxChars int) (versionapp.AttachmentTextRead, error)
-	imageRefFn func(ctx context.Context, versionID, conversationID, attachmentID int64) (versionapp.AttachmentImageRef, error)
-	pendingFn  func(ctx context.Context, limit int) ([]versionapp.PendingAttachment, error)
+	extractFn   func(ctx context.Context, attachmentID int64) (versionapp.ExtractionResult, error)
+	getInfoFn   func(ctx context.Context, versionID, attachmentID int64) (versionapp.AttachmentInfo, error)
+	listFn      func(ctx context.Context, versionID, conversationID int64) ([]versionapp.AttachmentMeta, error)
+	readTextFn  func(ctx context.Context, versionID, conversationID, attachmentID int64, offset, maxChars int) (versionapp.AttachmentTextRead, error)
+	imageRefFn  func(ctx context.Context, versionID, conversationID, attachmentID int64) (versionapp.AttachmentImageRef, error)
+	readImageFn func(ctx context.Context, dataRef string) (string, []byte, error)
+	pendingFn   func(ctx context.Context, limit int) ([]versionapp.PendingAttachment, error)
 }
 
 func (f *fakeAttachments) Extract(ctx context.Context, attachmentID int64) (versionapp.ExtractionResult, error) {
@@ -123,6 +124,13 @@ func (f *fakeAttachments) ReadAttachmentText(ctx context.Context, versionID, con
 
 func (f *fakeAttachments) AttachmentImageRef(ctx context.Context, versionID, conversationID, attachmentID int64) (versionapp.AttachmentImageRef, error) {
 	return f.imageRefFn(ctx, versionID, conversationID, attachmentID)
+}
+
+func (f *fakeAttachments) ReadImage(ctx context.Context, dataRef string) (string, []byte, error) {
+	if f.readImageFn == nil {
+		return "", nil, platform.NotFound("content")
+	}
+	return f.readImageFn(ctx, dataRef)
 }
 
 func (f *fakeAttachments) ListPendingForIngest(ctx context.Context, limit int) ([]versionapp.PendingAttachment, error) {
@@ -213,11 +221,15 @@ func TestRequirementPortMapping(t *testing.T) {
 func TestConversationPortSnapshotAndMapping(t *testing.T) {
 	ctx := context.Background()
 	summaryText := "滚动摘要"
+	imageSHA := strings.Repeat("e", 64)
 	conversation := versionapp.ConversationView{ID: 20, VersionID: 10, Summary: &summaryText}
 	messages := []versionapp.MessageView{
 		{
 			ID: 1, ConversationID: 20, Role: "user", CreatedAt: testTime,
-			Parts: []version.MessagePart{{Type: "text", Text: "hello"}},
+			Parts: []version.MessagePart{
+				{Type: "text", Text: "hello"},
+				{Type: "image", MIME: "image/png", DataRef: imageSHA, Width: 800, Height: 600},
+			},
 		},
 		{
 			ID: 2, ConversationID: 20, Role: "assistant", CreatedAt: testTime,
@@ -256,6 +268,16 @@ func TestConversationPortSnapshotAndMapping(t *testing.T) {
 	if snapshot.Messages[0].ID != 1 || snapshot.Messages[0].Text != "hello" ||
 		snapshot.Messages[1].ID != 2 || snapshot.Messages[1].Text != "draft created" {
 		t.Fatalf("messages = %#v", snapshot.Messages)
+	}
+	// The persisted image part must reach the runtime as an image conversation
+	// part with its data_ref, which is what the runner resolves for vision.
+	if len(snapshot.Messages[0].Parts) != 2 {
+		t.Fatalf("image message parts = %#v", snapshot.Messages[0].Parts)
+	}
+	image := snapshot.Messages[0].Parts[1]
+	if image.Type != "image" || image.Data["mime"] != "image/png" || image.Data["data_ref"] != imageSHA ||
+		image.Data["width"] != 800 || image.Data["height"] != 600 {
+		t.Fatalf("image part = %#v", image)
 	}
 	if len(snapshot.Messages[1].Parts) != 2 {
 		t.Fatalf("parts = %#v", snapshot.Messages[1].Parts)
@@ -541,6 +563,12 @@ func TestAttachmentPortMapsListReadImage(t *testing.T) {
 		imageRefFn: func(_ context.Context, versionID, conversationID, attachmentID int64) (versionapp.AttachmentImageRef, error) {
 			return versionapp.AttachmentImageRef{AttachmentID: 9, SHA256: sha, Name: "login.png", MIME: "image/png", Size: 5}, nil
 		},
+		readImageFn: func(_ context.Context, dataRef string) (string, []byte, error) {
+			if dataRef != sha {
+				return "", nil, platform.NotFound("content")
+			}
+			return "image/png", []byte("png-bytes"), nil
+		},
 	}
 	adapter := versionadapter.New(nil, nil, nil, fake, nil)
 
@@ -571,12 +599,26 @@ func TestAttachmentPortMapsListReadImage(t *testing.T) {
 		t.Fatalf("image = %#v", image)
 	}
 
+	loaded, err := adapter.LoadImage(ctx, sha)
+	if err != nil {
+		t.Fatalf("LoadImage: %v", err)
+	}
+	if loaded.MIME != "image/png" || string(loaded.Data) != "png-bytes" {
+		t.Fatalf("loaded image = %#v", loaded)
+	}
+	if _, err := adapter.LoadImage(ctx, strings.Repeat("c", 64)); err == nil {
+		t.Fatal("LoadImage accepted a missing image")
+	}
+
 	empty := versionadapter.New(nil, nil, nil, nil, nil)
 	if _, err := empty.GetAttachment(ctx, 10, 9); err == nil {
 		t.Fatal("GetAttachment succeeded without attachment service")
 	}
 	if _, err := empty.ListAttachments(ctx, 10, 20); err == nil {
 		t.Fatal("ListAttachments succeeded without attachment service")
+	}
+	if _, err := empty.LoadImage(ctx, sha); err == nil {
+		t.Fatal("LoadImage succeeded without attachment service")
 	}
 }
 

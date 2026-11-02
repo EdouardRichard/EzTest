@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 
 	eventingapp "github.com/EdouardRichard/EzTest/backend/internal/eventing/application"
@@ -33,6 +35,7 @@ type AttachmentService struct {
 	storage   ContentStore
 	queue     TaskEnqueuer
 	extractor TextExtractor
+	images    ImageProber
 	events    eventingapp.Publisher
 	ids       platformid.Generator
 	clock     clock.Clock
@@ -44,21 +47,24 @@ func NewAttachmentService(
 	storage ContentStore,
 	queue TaskEnqueuer,
 	extractor TextExtractor,
+	images ImageProber,
 	events eventingapp.Publisher,
 	ids platformid.Generator,
 	clk clock.Clock,
 ) *AttachmentService {
 	return &AttachmentService{
-		repo: repo, storage: storage, queue: queue, extractor: extractor,
+		repo: repo, storage: storage, queue: queue, extractor: extractor, images: images,
 		events: events, ids: ids, clock: clk,
 	}
 }
 
 // RegisterFromMessage validates one message attachment part against the
 // content ledger, stores the requirement_attachment runtime row and ensures
-// the ingest task. Images are stored as references (skipped extraction);
-// legacy .doc/.ppt are marked failed with unsupported_attachment_format
-// without blocking the message.
+// the ingest task. Image attachments also become image parts in the stored
+// message (PrepareUserMessageParts); registering the original attachment part
+// keeps the content ref alive as an extraction-skipped row because there is no
+// text to extract. Legacy .doc/.ppt are marked failed with
+// unsupported_attachment_format without blocking the message.
 func (s *AttachmentService) RegisterFromMessage(ctx context.Context, versionID, conversationID, messageID int64, part version.MessagePart, actorID int64) (AttachmentView, error) {
 	if versionID <= 0 || messageID <= 0 {
 		return AttachmentView{}, platform.Invalid("attachment", "version and message are required")
@@ -148,6 +154,191 @@ func (s *AttachmentService) RegisterFromMessage(ctx context.Context, versionID, 
 	return toAttachmentView(attachment), nil
 }
 
+// PrepareUserMessageParts converts an image attachment part into the R5 image
+// part stored in the message (spec §8.1/§8.3) and rejects a message that
+// references an attachment already registered in the conversation while its
+// extraction is still running (typed 409 attachment_pending, spec §8.5). It
+// runs before the message insert so a rejected message leaves no rows behind.
+func (s *AttachmentService) PrepareUserMessageParts(ctx context.Context, versionID, conversationID int64, parts []version.MessagePart) ([]version.MessagePart, error) {
+	if versionID <= 0 || conversationID <= 0 {
+		return nil, platform.Invalid("conversation_id", "must be positive decimal IDs")
+	}
+	prepared := make([]version.MessagePart, 0, len(parts))
+	for _, part := range parts {
+		if part.Type != version.MessagePartAttachment {
+			prepared = append(prepared, part)
+			continue
+		}
+		if version.DetectAttachmentKind(part.Name, part.MIME).IsImage() {
+			image, err := s.imagePartFromAttachment(ctx, part)
+			if err != nil {
+				return nil, err
+			}
+			prepared = append(prepared, image)
+			continue
+		}
+		// Documents are extracted asynchronously after the message is stored;
+		// only an already-registered reference can be observed as pending here.
+		if err := s.validateAttachmentContent(ctx, part); err != nil {
+			return nil, err
+		}
+		pending, err := s.pendingAttachmentReference(ctx, versionID, conversationID, part.SHA256)
+		if err != nil {
+			return nil, err
+		}
+		if pending != nil {
+			return nil, attachmentPendingError(*pending)
+		}
+		prepared = append(prepared, part)
+	}
+	if err := version.ValidateUserMessageParts(prepared); err != nil {
+		return nil, err
+	}
+	return prepared, nil
+}
+
+// imagePartFromAttachment reads the uploaded image and builds the validated
+// image part that replaces the attachment part in the stored message.
+func (s *AttachmentService) imagePartFromAttachment(ctx context.Context, part version.MessagePart) (version.MessagePart, error) {
+	content, reader, err := s.storage.Open(ctx, part.SHA256)
+	if err != nil {
+		if isPlatformNotFound(err) {
+			return version.MessagePart{}, platform.Invalid("sha256", "content object was not uploaded")
+		}
+		return version.MessagePart{}, err
+	}
+	defer reader.Close()
+	if content.Size != part.Size {
+		return version.MessagePart{}, platform.Invalid("size", "does not match the uploaded content size")
+	}
+	if s.images == nil {
+		return version.MessagePart{}, errors.New("attachment service has no image prober")
+	}
+	data, err := io.ReadAll(io.LimitReader(reader, version.MaxAttachmentBytes+1))
+	if err != nil {
+		return version.MessagePart{}, err
+	}
+	if int64(len(data)) > version.MaxAttachmentBytes {
+		return version.MessagePart{}, platform.Invalid("size", "image exceeds the 10 MiB upload limit")
+	}
+	mime, width, height, err := s.images.Probe(ctx, part.MIME, data)
+	if err != nil {
+		return version.MessagePart{}, err
+	}
+	return version.MessagePart{
+		Type:    version.MessagePartImage,
+		MIME:    mime,
+		DataRef: part.SHA256,
+		Width:   width,
+		Height:  height,
+	}, nil
+}
+
+// validateAttachmentContent verifies that the uploaded object exists and has
+// the size the message part declares.
+func (s *AttachmentService) validateAttachmentContent(ctx context.Context, part version.MessagePart) error {
+	content, reader, err := s.storage.Open(ctx, part.SHA256)
+	if err != nil {
+		if isPlatformNotFound(err) {
+			return platform.Invalid("sha256", "content object was not uploaded")
+		}
+		return err
+	}
+	_ = reader.Close()
+	if content.Size != part.Size {
+		return platform.Invalid("size", "does not match the uploaded content size")
+	}
+	return nil
+}
+
+// pendingAttachmentReference finds an attachment in the conversation with the
+// same content whose extraction is still pending/processing.
+func (s *AttachmentService) pendingAttachmentReference(ctx context.Context, versionID, conversationID int64, sha256 string) (*version.Attachment, error) {
+	attachments, err := s.repo.ListByConversation(ctx, versionID, conversationID)
+	if err != nil {
+		return nil, mapAttachmentRepositoryError(err)
+	}
+	for _, attachment := range attachments {
+		if attachment.ExtractionStatus != version.AttachmentPending &&
+			attachment.ExtractionStatus != version.AttachmentProcessing {
+			continue
+		}
+		objectID, err := s.originalObjectID(ctx, attachment.ID, attachment.ContentRefID)
+		if err != nil {
+			return nil, err
+		}
+		if objectID == sha256 {
+			found := attachment
+			return &found, nil
+		}
+	}
+	return nil, nil
+}
+
+// attachmentPendingError is the typed 409 for a message that references an
+// attachment still being parsed; the client can retry after the parse finishes.
+func attachmentPendingError(attachment version.Attachment) error {
+	return &platform.Error{
+		Status:    http.StatusConflict,
+		Code:      AttachmentPendingCode,
+		Message:   AttachmentParsingMessage,
+		Retryable: true,
+		Details: map[string]any{
+			"attachment_id": platformid.Format(attachment.ID),
+			"name":          attachment.Name,
+		},
+	}
+}
+
+// ReadImage resolves an image part's content data_ref into the original bytes
+// plus the sniffed MIME for a vision model. The data_ref is the content-ledger
+// SHA-256; the bytes are re-probed so a non-image object can never reach the
+// model as an image.
+func (s *AttachmentService) ReadImage(ctx context.Context, dataRef string) (string, []byte, error) {
+	dataRef = strings.ToLower(strings.TrimSpace(dataRef))
+	if !isContentSHA256(dataRef) {
+		return "", nil, platform.Invalid("data_ref", "must be the 64 lowercase hex content sha256")
+	}
+	content, reader, err := s.storage.Open(ctx, dataRef)
+	if err != nil {
+		if isPlatformNotFound(err) {
+			return "", nil, platform.NotFound("content")
+		}
+		return "", nil, err
+	}
+	defer reader.Close()
+	if content.Size > version.MaxAttachmentBytes {
+		return "", nil, platform.Invalid("data_ref", "image exceeds the 10 MiB upload limit")
+	}
+	data, err := io.ReadAll(io.LimitReader(reader, version.MaxAttachmentBytes+1))
+	if err != nil {
+		return "", nil, err
+	}
+	if int64(len(data)) > version.MaxAttachmentBytes {
+		return "", nil, platform.Invalid("data_ref", "image exceeds the 10 MiB upload limit")
+	}
+	if s.images == nil {
+		return "", nil, errors.New("attachment service has no image prober")
+	}
+	mime, _, _, err := s.images.Probe(ctx, content.MIME, data)
+	if err != nil {
+		return "", nil, err
+	}
+	return mime, data, nil
+}
+
+func isContentSHA256(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, r := range value {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // Get returns one attachment scoped to its version.
 func (s *AttachmentService) Get(ctx context.Context, versionID, attachmentID int64) (AttachmentView, error) {
 	if versionID <= 0 {
@@ -187,37 +378,10 @@ type AttachmentInfo struct {
 	TotalChars            int
 }
 
-// ImagePart is one image content part sent to a vision model. DataRef is the
-// content-ledger SHA-256; the model gateway resolves it to bytes at call time.
-// It mirrors the R5 image payload shape: {mime, data_ref, width, height}.
-type ImagePart struct {
-	Mime    string `json:"mime"`
-	DataRef string `json:"data_ref"`
-	Width   int    `json:"width"`
-	Height  int    `json:"height"`
-}
-
-// Model is the minimal LLM model capability metadata needed to attach image
-// parts. The composition root adapts the selected llm.Model into it.
-type Model struct {
-	ID             string
-	SupportsVision bool
-}
-
-// ValidateVision rejects image attachments when the selected model does not
-// advertise supports_vision (§8.3). The error is explicit so the user can pick
-// a vision-capable model or remove the image.
-func ValidateVision(model Model) error {
-	if model.SupportsVision {
-		return nil
-	}
-	name := strings.TrimSpace(model.ID)
-	if name == "" {
-		name = "the selected model"
-	}
-	return platform.Invalid("model",
-		name+" does not support vision (supports_vision=false); choose a vision-capable model or remove the image")
-}
+// AttachmentPendingCode is the stable error code of the typed 409 returned when
+// a message references an attachment whose extraction is still running
+// (spec §8.5: "解析中，可重试" instead of silently ignoring the attachment).
+const AttachmentPendingCode = "attachment_pending"
 
 // AttachmentTextRead is the structured outcome of reading attachment text. A
 // non-done status is a normal result: callers report it to the model instead

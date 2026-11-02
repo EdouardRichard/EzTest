@@ -1,42 +1,49 @@
-// Package attachments image helpers turn an uploaded image into the R5 image
-// part payload. Images are never OCRed or converted to text: the vision model
-// reads the original bytes referenced by DataRef (spec §8.3).
+// Package attachments image helpers detect the image format and pixel
+// dimensions of an upload. Images are never OCRed or converted to text: the
+// vision model reads the original bytes referenced by the image part's
+// data_ref (spec §8.3).
 package attachments
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"strings"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
-	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
 )
 
-// BuildImagePart sniffs the image format and pixel dimensions from the raw
-// content and returns the image part sent to a vision model. DataRef is the
-// content-ledger SHA-256; the model gateway resolves it to bytes at call time.
-// Oversized images are rejected instead of silently downscaled (§8.3).
-func BuildImagePart(declaredMIME, dataRef string, data []byte) (versionapp.ImagePart, error) {
+// ImageProber implements versionapp.ImageProber: it sniffs png/jpeg/webp from
+// magic bytes, verifies the declared MIME (when supported) matches the content
+// and rejects oversized images instead of silently downscaling them (§8.3).
+// It lives in infrastructure so the version application never imports this
+// package (R25).
+type ImageProber struct{}
+
+// NewImageProber builds the attachment image prober.
+func NewImageProber() *ImageProber { return &ImageProber{} }
+
+// Probe returns the detected MIME plus the pixel dimensions of one image.
+func (ImageProber) Probe(_ context.Context, declaredMIME string, data []byte) (string, int, int, error) {
 	detected, width, height, err := ImageDimensions(data)
 	if err != nil {
-		return versionapp.ImagePart{}, err
-	}
-	if strings.TrimSpace(dataRef) == "" {
-		return versionapp.ImagePart{}, platform.Invalid("data_ref", "image data_ref is required")
+		// Header probing failures are user input errors (corrupt or unsupported
+		// image), not infrastructure failures: surface a field-level 400.
+		return "", 0, 0, platform.Invalid("mime", "image content is not a supported png, jpeg or webp file")
 	}
 	declared := strings.ToLower(strings.TrimSpace(declaredMIME))
 	if declared == "image/jpg" {
 		declared = "image/jpeg"
 	}
 	if version.IsSupportedImageMIME(declared) && declared != detected {
-		return versionapp.ImagePart{}, platform.Invalid("mime",
+		return "", 0, 0, platform.Invalid("mime",
 			"declared mime "+declaredMIME+" does not match the image content ("+detected+")")
 	}
 	if err := version.ValidateImageDimensions(width, height); err != nil {
-		return versionapp.ImagePart{}, err
+		return "", 0, 0, err
 	}
-	return versionapp.ImagePart{Mime: detected, DataRef: dataRef, Width: width, Height: height}, nil
+	return detected, width, height, nil
 }
 
 // ImageDimensions detects png/jpeg/webp from magic bytes and returns the pixel

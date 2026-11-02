@@ -93,6 +93,15 @@ export type AttachmentPart = {
   size: number
 }
 
+/** R5 image part: the uploaded content reference sent to a vision model. */
+export type ImagePart = {
+  type: "image"
+  mime: string
+  data_ref: string
+  width: number
+  height: number
+}
+
 export type RequirementCardPart = {
   type: "requirement_card"
   requirement_id: string
@@ -107,7 +116,12 @@ export type RollbackProposalPart = {
   reason: string
 }
 
-export type MessagePart = TextPart | AttachmentPart | RequirementCardPart | RollbackProposalPart
+export type MessagePart =
+  | TextPart
+  | AttachmentPart
+  | ImagePart
+  | RequirementCardPart
+  | RollbackProposalPart
 
 /** The parts a client may send in a message (P1). */
 export type NewMessagePart = TextPart | AttachmentPart

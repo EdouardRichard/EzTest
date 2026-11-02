@@ -43,6 +43,9 @@ export function Composer({
 
   const value = text ?? internalValue
   const hasContent = value.trim().length > 0 || attachments.length > 0
+  // A pending attachment upload/parse must finish before the message can be
+  // submitted (spec §8.5); the server repeats this with a typed 409
+  // attachment_pending when a referenced attachment is still parsing.
   const blocked = disabled || sending || uploading
 
   function updateValue(next: string): void {
@@ -148,7 +151,7 @@ export function Composer({
             }}
             disabled={blocked || !hasContent}
           >
-            {sending ? "发送中…" : "发送"}
+            {sending ? "发送中…" : uploading ? "解析中…" : "发送"}
           </Button>
         </div>
       </div>

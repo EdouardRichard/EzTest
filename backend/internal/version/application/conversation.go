@@ -212,6 +212,24 @@ func (s *ConversationService) PostUserMessage(ctx context.Context, versionID, co
 		}
 	}
 
+	// Image attachments become image parts before the message is stored so the
+	// persisted thread (and therefore the LLM transcript) carries the vision
+	// content. A referenced attachment still parsing is a typed 409 here, before
+	// any row is written (spec §8.5). The original attachment parts are kept for
+	// the post-insert registration below: its content ref row keeps the uploaded
+	// bytes alive for the storage GC and the attachment tools.
+	registrationParts := parts
+	if s.attachments != nil {
+		prepared, err := s.attachments.PrepareUserMessageParts(ctx, versionID, conversationID, parts)
+		if err != nil {
+			return MessageView{}, err
+		}
+		if err := version.ValidateUserMessageParts(prepared); err != nil {
+			return MessageView{}, err
+		}
+		parts = prepared
+	}
+
 	now := s.clock.Now()
 	message := version.Message{
 		ID:             s.ids.Next(),
@@ -240,8 +258,11 @@ func (s *ConversationService) PostUserMessage(ctx context.Context, versionID, co
 	if s.attachments != nil {
 		// Registration is side-effectful (content refs + ingest tasks); do it
 		// only after the message insert wins so a failed/idempotent post never
-		// leaves attachment rows pointing at a message that does not exist.
-		for _, part := range parts {
+		// leaves attachment rows pointing at a message that does not exist. Image
+		// parts are registered from their original attachment part so the
+		// content-ledger ref exists; their row is extraction-skipped (no text is
+		// extracted from an image) while the stored message keeps the image part.
+		for _, part := range registrationParts {
 			if part.Type != version.MessagePartAttachment {
 				continue
 			}

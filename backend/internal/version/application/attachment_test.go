@@ -15,6 +15,7 @@ import (
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	versionapp "github.com/EdouardRichard/EzTest/backend/internal/version/application"
 	version "github.com/EdouardRichard/EzTest/backend/internal/version/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/version/infrastructure/attachments"
 )
 
 // ---------- fakes ----------
@@ -239,7 +240,8 @@ func newAttachmentEnv(t *testing.T) *attachmentEnv {
 	queue := &fakeQueue{}
 	extractor := &fakeExtractor{text: "extracted text"}
 	events := &fakePublisher{}
-	svc := versionapp.NewAttachmentService(repo, store, queue, extractor, events, &seqIDs{}, fixedClock{at: testTime})
+	svc := versionapp.NewAttachmentService(
+		repo, store, queue, extractor, attachments.NewImageProber(), events, &seqIDs{}, fixedClock{at: testTime})
 	return &attachmentEnv{svc: svc, repo: repo, store: store, queue: queue, extractor: extractor, events: events, versionID: 1}
 }
 
@@ -658,32 +660,46 @@ func TestReadPendingAttachmentReturnsStructuredStatus(t *testing.T) {
 	}
 }
 
-// TestImageRequiresVisionModel covers §8.3: an image part may only be sent to
-// a model whose catalog entry sets supports_vision.
-func TestImageRequiresVisionModel(t *testing.T) {
-	if err := versionapp.ValidateVision(versionapp.Model{ID: "gpt-4o", SupportsVision: true}); err != nil {
-		t.Fatalf("vision model rejected: %v", err)
+// TestPDFNoTextLayerFlowsThroughRead covers R33: the contract enum only allows
+// unsupported_attachment_format|extraction_failed, so a PDF sentinel raised by
+// the parser maps to extraction_failed while its "no text layer" reason still
+// flows through failExtraction -> attachment row -> ReadAttachmentText.
+func TestPDFNoTextLayerFlowsThroughRead(t *testing.T) {
+	env := newAttachmentEnv(t)
+	env.repo.conversationMessages = map[int64]int64{7001: 8001}
+	env.repo.conversations = map[int64]int64{8001: env.versionID}
+	sha := strings.Repeat("d", 64)
+	view := registerAttachment(t, env, sha, "scan.pdf", "application/pdf", []byte("%PDF-1.7"))
+
+	env.extractor.err = fmt.Errorf("%w: scanned or image-only PDFs are not supported", attachments.ErrPDFNoTextLayer)
+	result, err := env.svc.Extract(requestContext(), view.ID)
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
 	}
-	err := versionapp.ValidateVision(versionapp.Model{ID: "text-only"})
-	if err == nil {
-		t.Fatal("model without supports_vision accepted an image")
+	if result.ErrorCode != version.AttachmentErrorExtraction {
+		t.Fatalf("error code = %q, want %q", result.ErrorCode, version.AttachmentErrorExtraction)
 	}
-	apiErr := apiError(t, err)
-	if apiErr.Status != http.StatusBadRequest {
-		t.Fatalf("status = %d", apiErr.Status)
+	stored := env.repo.attachments[view.ID]
+	if stored.ExtractionStatus != version.AttachmentFailed ||
+		stored.ExtractionErrorCode != version.AttachmentErrorExtraction {
+		t.Fatalf("stored = %#v", stored)
 	}
-	if !strings.Contains(apiErr.Message, "supports_vision") || !strings.Contains(apiErr.Message, "vision") {
-		t.Fatalf("message = %q, want an explicit vision capability error", apiErr.Message)
+	if !strings.Contains(strings.ToLower(stored.ExtractionErrorText), "no text layer") {
+		t.Fatalf("stored error = %q, want the parser's no-text-layer reason", stored.ExtractionErrorText)
 	}
 
-	part := versionapp.ImagePart{
-		Mime:    "image/png",
-		DataRef: strings.Repeat("d", 64),
-		Width:   800,
-		Height:  600,
+	read, err := env.svc.ReadAttachmentText(requestContext(), env.versionID, 8001, view.ID, 0, 10)
+	if err != nil {
+		t.Fatalf("ReadAttachmentText: %v", err)
 	}
-	if part.Mime != "image/png" || part.Width != 800 || part.Height != 600 {
-		t.Fatalf("image part = %#v", part)
+	if read.Status != version.AttachmentFailed || read.Retryable {
+		t.Fatalf("read = %#v", read)
+	}
+	if !strings.Contains(strings.ToLower(read.Error), "no text layer") {
+		t.Fatalf("read error = %q, want the no-text-layer message", read.Error)
+	}
+	if strings.Contains(strings.ToLower(read.Error), "text is not available") {
+		t.Fatalf("read error = %q, must not be the generic unavailable message", read.Error)
 	}
 }
 

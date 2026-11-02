@@ -602,7 +602,7 @@ func main() {
 	enqueuer := versionTaskEnqueuer{queue: workQueue}
 	attachmentSvc := versionapp.NewAttachmentService(
 		versionpg.NewAttachmentRepository(pool), contentstore.New(storageSvc), enqueuer,
-		attachments.NewParser(), eventSvc, ids, clk)
+		attachments.NewParser(), attachments.NewImageProber(), eventSvc, ids, clk)
 	conversationSvc := versionapp.NewConversationService(
 		versionpg.NewConversationRepository(pool, ids), enqueuer, attachmentSvc, versionSvc, clk, ids, eventSvc)
 	ports := versionadapter.New(requirementSvc, conversationSvc, versionSvc, attachmentSvc, storageSvc)
@@ -1012,6 +1012,7 @@ func main() {
 		Conversation: ports,
 		Versions:     ports,
 		Attachments:  ports,
+		Images:       ports,
 		TeamRoom:     teamRoom,
 		Content:      ports,
 		// P7 knowledge injection + usage accounting (S6 report §5).

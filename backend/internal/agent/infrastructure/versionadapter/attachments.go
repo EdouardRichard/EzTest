@@ -97,6 +97,21 @@ func (a *Adapter) ReadAttachmentText(ctx context.Context, versionID, conversatio
 	}, nil
 }
 
+// LoadImage implements agentapp.ImageLoader for vision runs: it resolves the
+// image part's content data_ref into the original bytes and MIME. The version
+// service re-probes the content, so a non-image object can never be sent to the
+// model as an image.
+func (a *Adapter) LoadImage(ctx context.Context, dataRef string) (agentapp.ImageData, error) {
+	if a.attachments == nil {
+		return agentapp.ImageData{}, a.missing("attachments")
+	}
+	mime, data, err := a.attachments.ReadImage(ctx, dataRef)
+	if err != nil {
+		return agentapp.ImageData{}, err
+	}
+	return agentapp.ImageData{MIME: mime, Data: data}, nil
+}
+
 // AttachmentImageRef implements tools.AttachmentPort for attachment.image_ref.
 // P1 does not perform vision understanding; the SHA-256 is the content-ledger
 // reference the UI can resolve.

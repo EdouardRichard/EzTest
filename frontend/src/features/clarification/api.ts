@@ -1,4 +1,12 @@
-import { apiGet, apiGetPage, apiPatch, apiPost, apiUpload } from "@/lib/api-client"
+import {
+  type ApiDownload,
+  apiDownload,
+  apiGet,
+  apiGetPage,
+  apiPatch,
+  apiPost,
+  apiUpload,
+} from "@/lib/api-client"
 
 import type {
   BatchConfirmResult,
@@ -204,4 +212,13 @@ export function uploadContent(file: File): Promise<ContentObject> {
   const form = new FormData()
   form.append("file", file)
   return apiUpload<ContentObject>("/api/content", form)
+}
+
+/**
+ * Downloads an uploaded image through the authenticated content endpoint.
+ * `GET /api/content/{sha256}` requires the bearer token, so the UI loads image
+ * parts as an object URL instead of a bare `<img src>`.
+ */
+export function downloadContent(sha256: string): Promise<ApiDownload> {
+  return apiDownload(`/api/content/${encodeURIComponent(sha256)}`)
 }
