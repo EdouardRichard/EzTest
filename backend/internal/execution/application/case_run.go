@@ -17,10 +17,16 @@ import (
 	platformid "github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 )
 
-// Case-run defaults. Settings override the bounded values; the lease is a
-// runtime constant because a case-run is renewed by the API-side agent loop.
+// Case-run defaults. The lease must outlive one executor action: the executor
+// caps an action at 60s and the HTTP client bounds it at 75s (see
+// executor.DefaultTimeout). 90s leaves headroom, and the independent heartbeat
+// renews the lease while an action is in flight, so a slow action never makes
+// recovery misread the run as executor_lost.
 const (
-	defaultCaseLeaseSeconds  = 30
+	// minCaseLease stays above the 75s executor client bound so a single slow
+	// action can never outlive the lease even before the first heartbeat.
+	minCaseLease             = 80 * time.Second
+	defaultCaseLease         = 90 * time.Second
 	defaultEvidenceMaxBytes  = int64(5 << 20)
 	evidenceMaxPerCaseRun    = execution.EvidenceMaxPerCaseRun
 	maxSUTFilenameLength     = 255
@@ -183,6 +189,13 @@ type CaseRunnerDeps struct {
 	Events      EventPublisher
 	Audit       AuditRecorder
 	InstanceID  string
+	// LeaseTTL overrides the case_run lease. Values below 80s (the executor
+	// client bound is 75s) are raised to the minimum; zero selects the 90s
+	// default.
+	LeaseTTL time.Duration
+	// HeartbeatInterval overrides the independent lease renewal interval.
+	// Zero selects LeaseTTL/3.
+	HeartbeatInterval time.Duration
 }
 
 // CaseRunner executes one case_run as an API-side agent: it claims the run
@@ -215,9 +228,12 @@ type CaseRunner struct {
 	events      EventPublisher
 	audit       AuditRecorder
 	instanceID  string
+	leaseTTL    time.Duration
+	heartbeat   time.Duration
 
 	mu          sync.Mutex
 	activeRuns  map[int64]context.CancelFunc
+	heartbeats  map[int64]context.CancelFunc
 	waitTotals  map[int64]time.Duration
 	waitStarted map[int64]time.Time
 }
@@ -229,6 +245,17 @@ var (
 
 // NewCaseRunner wires the case executor runtime.
 func NewCaseRunner(deps CaseRunnerDeps) *CaseRunner {
+	lease := deps.LeaseTTL
+	if lease <= 0 {
+		lease = defaultCaseLease
+	}
+	if lease < minCaseLease {
+		lease = minCaseLease
+	}
+	heartbeat := deps.HeartbeatInterval
+	if heartbeat <= 0 {
+		heartbeat = lease / 3
+	}
 	return &CaseRunner{
 		intents:     deps.Intents,
 		caseRuns:    deps.CaseRuns,
@@ -255,7 +282,10 @@ func NewCaseRunner(deps CaseRunnerDeps) *CaseRunner {
 		events:      deps.Events,
 		audit:       deps.Audit,
 		instanceID:  deps.InstanceID,
+		leaseTTL:    lease,
+		heartbeat:   heartbeat,
 		activeRuns:  map[int64]context.CancelFunc{},
+		heartbeats:  map[int64]context.CancelFunc{},
 		waitTotals:  map[int64]time.Duration{},
 		waitStarted: map[int64]time.Time{},
 	}
@@ -284,6 +314,7 @@ func (s *CaseRunner) CancelRun(caseRunID int64) {
 
 // ClearRun forgets the cancel function after a run finished.
 func (s *CaseRunner) ClearRun(caseRunID int64) {
+	s.stopLeaseHeartbeat(caseRunID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.activeRuns, caseRunID)
@@ -406,6 +437,11 @@ func (s *CaseRunner) Prepare(ctx context.Context, item agent.WorkItem) (executio
 	}
 
 	s.resetWaitTracking(caseRun.ID, now)
+	// Renew the case_run lease independently of tool result writes: one
+	// executor action may take up to 75s while no step/assertion row is
+	// written. The heartbeat stops when the worker cancels the run context, or
+	// explicitly on Finish/Finalize/ClearRun.
+	s.startLeaseHeartbeat(ctx, startedRun)
 	s.publishCaseRunEvent(EventCaseRunStarted, startedRun, map[string]any{
 		"status": string(startedRun.Status),
 	})
@@ -592,6 +628,7 @@ func (s *CaseRunner) Finish(ctx context.Context, scope tools.Scope, candidate ex
 	if err != nil {
 		return execution.CaseRun{}, err
 	}
+	s.stopLeaseHeartbeat(caseRun.ID)
 	s.closeSUTContexts(ctx, caseRun.ID)
 	s.publishCaseRunEvent(EventCaseRunFinished, finished, map[string]any{
 		"status":           string(status),
@@ -619,6 +656,8 @@ func (s *CaseRunner) Finalize(ctx context.Context, caseRunID int64, runErr error
 	if err != nil {
 		return mapExecutionError(err, "case_run")
 	}
+	// The agent loop is over; a redispatch (if any) starts its own heartbeat.
+	s.stopLeaseHeartbeat(caseRunID)
 	if caseRun.Status.Finished() || caseRun.Status == execution.CaseRunPaused {
 		return nil
 	}
@@ -711,6 +750,53 @@ func (s *CaseRunner) RenewLease(ctx context.Context, caseRunID, epoch int64, tok
 		return platform.LeaseLost()
 	}
 	return nil
+}
+
+// startLeaseHeartbeat runs the independent lease renewal timer (spec §5.7:
+// heartbeat renews independently; lease > executor single-action timeout). It
+// stops when ctx is canceled (the worker cancels its run context) or when a
+// terminal write calls stopLeaseHeartbeat.
+func (s *CaseRunner) startLeaseHeartbeat(ctx context.Context, caseRun execution.CaseRun) {
+	if s.caseRuns == nil || s.heartbeat <= 0 {
+		return
+	}
+	heartbeatCtx, cancel := context.WithCancel(ctx)
+	s.mu.Lock()
+	if previous := s.heartbeats[caseRun.ID]; previous != nil {
+		previous()
+	}
+	s.heartbeats[caseRun.ID] = cancel
+	s.mu.Unlock()
+
+	go func() {
+		ticker := time.NewTicker(s.heartbeat)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-heartbeatCtx.Done():
+				return
+			case <-ticker.C:
+				ok, err := s.caseRuns.ClaimLease(heartbeatCtx, caseRun.ID, caseRun.DispatchEpoch,
+					s.now().Add(s.leaseDuration()))
+				if err != nil || !ok {
+					// The epoch was taken over (or the store is gone): stop
+					// renewing; the recovery sweep owns the redispatch.
+					return
+				}
+			}
+		}
+	}()
+}
+
+// stopLeaseHeartbeat cancels and forgets one run's renewal timer.
+func (s *CaseRunner) stopLeaseHeartbeat(caseRunID int64) {
+	s.mu.Lock()
+	cancel := s.heartbeats[caseRunID]
+	delete(s.heartbeats, caseRunID)
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -1074,7 +1160,10 @@ func (s *CaseRunner) renewLeaseQuietly(ctx context.Context, caseRun execution.Ca
 }
 
 func (s *CaseRunner) leaseDuration() time.Duration {
-	return defaultCaseLeaseSeconds * time.Second
+	if s.leaseTTL <= 0 {
+		return defaultCaseLease
+	}
+	return s.leaseTTL
 }
 
 func (s *CaseRunner) nextID() int64 {

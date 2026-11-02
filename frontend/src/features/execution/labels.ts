@@ -60,7 +60,7 @@ export const FAILURE_CLASS_LABEL: Record<FailureClassKey, string> = {
   model: "模型异常",
   automation: "自动化异常",
   timeout: "超时",
-  executor_lost: "执行器丢失",
+  executor_lost: "执行器失联",
   blocked: "无法开始",
   unknown: "未知",
 }

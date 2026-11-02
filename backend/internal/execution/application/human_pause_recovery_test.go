@@ -302,7 +302,8 @@ func TestExecutorOfflineRedispatch(t *testing.T) {
 		t.Fatalf("intent = %s, want running for redispatch", stored.Status)
 	}
 
-	// Exhausted attempts fail as environment.
+	// Exhausted attempts fail as executor_lost (the executor category, not
+	// environment: the reason is executor_lost and the UI must show 执行器失联).
 	f2 := newTask9Fixture()
 	f2.seedWave(execution.WaveRunning)
 	f2.seedIntent(1, 300)
@@ -316,7 +317,7 @@ func TestExecutorOfflineRedispatch(t *testing.T) {
 		t.Fatalf("Reconcile exhausted: %v", err)
 	}
 	failed, _ := f2.runs.Get(ctx, 500)
-	if failed.Status != execution.CaseRunFailed || failed.FailureClass != execution.FailureClassEnvironment {
+	if failed.Status != execution.CaseRunFailed || failed.FailureClass != execution.FailureClassExecutorLost {
 		t.Fatalf("exhausted run = %s/%s", failed.Status, failed.FailureClass)
 	}
 }

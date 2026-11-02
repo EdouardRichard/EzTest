@@ -160,7 +160,8 @@ func (s *Recovery) recoverLeases(ctx context.Context) error {
 }
 
 // interruptRun retries an interrupted case_run up to the dispatch budget, then
-// fails it as an environment failure (§5.5).
+// fails it as an executor_lost failure (spec §5.6: the executor category, never
+// environment, so the UI can show “执行器失联”).
 func (s *Recovery) interruptRun(ctx context.Context, run execution.CaseRun) error {
 	if run.Status != execution.CaseRunRunning {
 		return nil
@@ -207,7 +208,7 @@ func (s *Recovery) interruptRun(ctx context.Context, run execution.CaseRun) erro
 		return nil
 	}
 	run.Status = execution.CaseRunFailed
-	run.FailureClass = execution.FailureClassEnvironment
+	run.FailureClass = execution.FailureClassExecutorLost
 	run.Summary.VerdictReason = "executor_lost"
 	run.Summary.LastError = "executor_lost"
 	run.FinishedAt = &now
@@ -222,7 +223,7 @@ func (s *Recovery) interruptRun(ctx context.Context, run execution.CaseRun) erro
 			"wave_id":       platformid.Format(run.WaveID),
 			"case_run_id":   platformid.Format(run.ID),
 			"status":        string(execution.CaseRunFailed),
-			"failure_class": string(execution.FailureClassEnvironment),
+			"failure_class": string(execution.FailureClassExecutorLost),
 		}, nil)
 	s.record(ctx, "execution.case_run_failed", run, oldEpoch, map[string]any{"reason": "executor_lost", "attempts": run.Attempts})
 	return nil

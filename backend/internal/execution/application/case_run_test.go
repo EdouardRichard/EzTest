@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	agent "github.com/EdouardRichard/EzTest/backend/internal/agent/domain"
 	executionapp "github.com/EdouardRichard/EzTest/backend/internal/execution/application"
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
+	executorexec "github.com/EdouardRichard/EzTest/backend/internal/execution/infrastructure/executor"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 )
 
@@ -684,5 +686,359 @@ func TestFailureSubmitDedupeHintMatchesSpec(t *testing.T) {
 	fixture.events.mu.Unlock()
 	if found != want {
 		t.Fatalf("dedupe_hint = %q, want %q", found, want)
+	}
+}
+
+// ---------- Task 9: lease, heartbeat and dispatch health ----------
+
+// manualClock is a goroutine-safe clock so the lease heartbeat goroutine and the
+// test can advance time without a data race.
+type manualClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func newManualClock(now time.Time) *manualClock { return &manualClock{now: now} }
+
+func (c *manualClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *manualClock) Advance(delta time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(delta)
+}
+
+// newHeartbeatFixture rebuilds the runner with an injectable clock and a fast
+// heartbeat interval so a long action can be simulated quickly.
+func newHeartbeatFixture(t *testing.T, clock executionapp.Clock, interval time.Duration) *caseRunnerFixture {
+	t.Helper()
+	fixture := newCaseRunnerFixture(t)
+	fixture.runner = executionapp.NewCaseRunner(executionapp.CaseRunnerDeps{
+		Intents:           fixture.intents,
+		CaseRuns:          fixture.caseRuns,
+		SUTContexts:       fixture.sutContext,
+		Results:           fixture.results,
+		Evidence:          fixture.evidence,
+		Humans:            fixture.humans,
+		Cases:             fixture.cases,
+		Bindings:          fixture.bindings,
+		Browser:           fixture.browser,
+		Credentials:       fixture.creds,
+		Content:           fixture.content,
+		HTTPClient:        fixture.http,
+		Database:          fixture.db,
+		Gaps:              fixture.gaps,
+		Coverage:          fixture.coverage,
+		TeamRoom:          fixture.room,
+		Visual:            fixture.visual,
+		Settings:          fixture.settings,
+		Clock:             clock,
+		IDs:               fixture.ids,
+		Events:            fixture.events,
+		Audit:             fixture.audit,
+		InstanceID:        "api-1",
+		LeaseTTL:          90 * time.Second,
+		HeartbeatInterval: interval,
+	})
+	return fixture
+}
+
+// waitForLeaseRenewal blocks until the independent heartbeat has renewed the
+// lease to at least wantRemaining past the (already advanced) clock.
+func waitForLeaseRenewal(t *testing.T, fixture *caseRunnerFixture, clock *manualClock, wantRemaining time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		row := fixture.caseRuns.get(t, 3001)
+		if row.LeaseUntil != nil && row.LeaseUntil.Sub(clock.Now()) >= wantRemaining {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("independent lease heartbeat did not renew the case_run lease: lease_until=%v now=%v want remaining >= %v",
+				row.LeaseUntil, clock.Now(), wantRemaining)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func eventPayloads(events *caseRunnerEvents, eventType string) []map[string]any {
+	events.mu.Lock()
+	defer events.mu.Unlock()
+	payloads := make([]map[string]any, 0)
+	for _, event := range events.events {
+		if event.Type == eventType {
+			payloads = append(payloads, event.Payload)
+		}
+	}
+	return payloads
+}
+
+func countEvents(events *caseRunnerEvents, eventType string) int {
+	return len(eventPayloads(events, eventType))
+}
+
+// TestLeaseNotExpiredDuringSlowAction: a single executor action may take 70s
+// (executor cap 60s, client bound 75s). The case_run lease must be longer than
+// that bound, and the independent heartbeat must keep renewing while no step or
+// assertion result is written. Recovery must therefore never emit executor_lost.
+func TestLeaseNotExpiredDuringSlowAction(t *testing.T) {
+	clock := newManualClock(time.Date(2026, 11, 2, 1, 0, 0, 0, time.UTC))
+	fixture := newHeartbeatFixture(t, clock, 2*time.Millisecond)
+	prepareCaseRun(t, fixture)
+	defer fixture.runner.ClearRun(3001)
+
+	row := fixture.caseRuns.get(t, 3001)
+	if row.LeaseUntil == nil {
+		t.Fatal("Prepare did not set a case_run lease")
+	}
+	lease := row.LeaseUntil.Sub(clock.Now())
+	if lease < 75*time.Second {
+		t.Fatalf("case_run lease = %v, want at least the 75s executor action bound", lease)
+	}
+	if lease <= executorexec.DefaultTimeout {
+		t.Fatalf("case_run lease = %v, want longer than the executor client bound %v", lease, executorexec.DefaultTimeout)
+	}
+
+	// One 70s action with no execution.step_record/execution.assertion_record.
+	clock.Advance(70 * time.Second)
+	waitForLeaseRenewal(t, fixture, clock, 75*time.Second)
+	// Extend past the original lease to prove the heartbeat (not just the
+	// initial 90s lease) is what kept the run alive.
+	clock.Advance(30 * time.Second)
+
+	recovery := executionapp.NewRecovery(executionapp.RecoveryDeps{
+		Intents:  fixture.intents,
+		Waves:    &fakeSchedulerWaveRepo{wave: &execution.RunWave{ID: 2001, VersionID: 10, Status: execution.WaveRunning}},
+		CaseRuns: fixture.caseRuns,
+		Clock:    clock,
+		Events:   fixture.events,
+	})
+	if err := recovery.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Recovery.Reconcile: %v", err)
+	}
+
+	row = fixture.caseRuns.get(t, 3001)
+	if row.Status != execution.CaseRunRunning {
+		t.Fatalf("slow action was marked %q (executor_lost misclassification)", row.Status)
+	}
+	if row.FailureClass != "" {
+		t.Fatalf("slow action produced failure class %q, want none", row.FailureClass)
+	}
+	if got := countEvents(fixture.events, executionapp.EventCaseRunFinished); got != 0 {
+		t.Fatalf("slow action emitted %d case_run.finished event(s), want 0", got)
+	}
+}
+
+// TestRecoveryExhaustedAttemptsKeepsExecutorLost proves an expired lease at the
+// dispatch budget is failed as executor_lost, not as environment (frontend used
+// to show “环境异常” while the reason said executor_lost).
+func TestRecoveryExhaustedAttemptsKeepsExecutorLost(t *testing.T) {
+	clock := newManualClock(time.Date(2026, 11, 2, 1, 0, 0, 0, time.UTC))
+	fixture := newCaseRunnerFixture(t)
+	expired := clock.Now().Add(-time.Second)
+	fixture.caseRuns.mu.Lock()
+	row := fixture.caseRuns.rows[3001]
+	row.Status = execution.CaseRunRunning
+	row.Attempts = 3
+	row.LeaseUntil = &expired
+	fixture.caseRuns.rows[3001] = row
+	fixture.caseRuns.mu.Unlock()
+
+	recovery := executionapp.NewRecovery(executionapp.RecoveryDeps{
+		Intents:     fixture.intents,
+		Waves:       &fakeSchedulerWaveRepo{wave: &execution.RunWave{ID: 2001, VersionID: 10, Status: execution.WaveRunning}},
+		CaseRuns:    fixture.caseRuns,
+		Clock:       clock,
+		Events:      fixture.events,
+		MaxAttempts: 3,
+	})
+	if err := recovery.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Recovery.Reconcile: %v", err)
+	}
+
+	stored := fixture.caseRuns.get(t, 3001)
+	if stored.Status != execution.CaseRunFailed {
+		t.Fatalf("exhausted lease status = %q, want failed", stored.Status)
+	}
+	if stored.FailureClass != execution.FailureClassExecutorLost {
+		t.Fatalf("exhausted lease failure class = %q, want executor_lost (not environment)", stored.FailureClass)
+	}
+	payloads := eventPayloads(fixture.events, executionapp.EventCaseRunFinished)
+	if len(payloads) != 1 {
+		t.Fatalf("case_run.finished events = %d, want 1", len(payloads))
+	}
+	if got, _ := payloads[0]["failure_class"].(string); got != string(execution.FailureClassExecutorLost) {
+		t.Fatalf("event failure_class = %q, want executor_lost", got)
+	}
+}
+
+// ---------- Task 9: dispatch health ----------
+
+// fakeSchedulerWaveRepo is the minimal WaveRepository used by the scheduler and
+// recovery tests here.
+type fakeSchedulerWaveRepo struct {
+	wave *execution.RunWave
+}
+
+func (r *fakeSchedulerWaveRepo) CreateWithCaseRuns(context.Context, execution.RunWave, []execution.ExecutionIntent, []execution.CaseRun) error {
+	return nil
+}
+
+func (r *fakeSchedulerWaveRepo) Get(_ context.Context, id int64) (execution.RunWave, error) {
+	if r.wave == nil || r.wave.ID != id {
+		return execution.RunWave{}, execution.ErrNotFound
+	}
+	return *r.wave, nil
+}
+
+func (r *fakeSchedulerWaveRepo) GetActive(_ context.Context, versionID int64) (*execution.RunWave, error) {
+	if r.wave == nil || r.wave.VersionID != versionID {
+		return nil, nil
+	}
+	return r.wave, nil
+}
+
+func (r *fakeSchedulerWaveRepo) List(context.Context, int64, int, *int64) ([]execution.RunWave, bool, error) {
+	if r.wave == nil {
+		return nil, false, nil
+	}
+	return []execution.RunWave{*r.wave}, false, nil
+}
+
+func (r *fakeSchedulerWaveRepo) Update(context.Context, execution.RunWave) (bool, error) {
+	return true, nil
+}
+
+func (r *fakeSchedulerWaveRepo) Transition(context.Context, int64, []execution.WaveStatus, execution.WaveStatus, execution.RunWave) (bool, error) {
+	return false, nil
+}
+
+func (r *fakeSchedulerWaveRepo) Counts(context.Context, int64) (execution.WaveCounts, error) {
+	return execution.WaveCounts{}, nil
+}
+
+func (r *fakeSchedulerWaveRepo) ListActive(context.Context) ([]execution.RunWave, error) {
+	if r.wave == nil {
+		return nil, nil
+	}
+	return []execution.RunWave{*r.wave}, nil
+}
+
+type fakeDispatchRegistry struct {
+	executor *execution.ExecutorInstance
+}
+
+func (r *fakeDispatchRegistry) Select(context.Context) (*execution.ExecutorInstance, error) {
+	return r.executor, nil
+}
+
+type fakeDispatchQueue struct {
+	mu    sync.Mutex
+	items []executionapp.WorkItemInput
+}
+
+func (q *fakeDispatchQueue) Ensure(_ context.Context, in executionapp.WorkItemInput) (int64, bool, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.items = append(q.items, in)
+	return int64(len(q.items)), true, nil
+}
+
+func (q *fakeDispatchQueue) MarkWaitingHuman(context.Context, int64, int64) error { return nil }
+func (q *fakeDispatchQueue) Finish(context.Context, int64, string) error          { return nil }
+
+func (q *fakeDispatchQueue) count() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.items)
+}
+
+func newDispatchScheduler(fixture *caseRunnerFixture, executor *execution.ExecutorInstance) (*executionapp.Scheduler, *fakeDispatchQueue) {
+	queue := &fakeDispatchQueue{}
+	scheduler := executionapp.NewScheduler(executionapp.SchedulerDeps{
+		Intents:   fixture.intents,
+		Waves:     &fakeSchedulerWaveRepo{wave: &execution.RunWave{ID: 2001, VersionID: 10, Status: execution.WaveRunning}},
+		CaseRuns:  fixture.caseRuns,
+		Cases:     fixture.cases,
+		Executors: &fakeDispatchRegistry{executor: executor},
+		WorkQueue: queue,
+		IDs:       fixture.ids,
+		Clock:     fixture.clock,
+		Events:    fixture.events,
+		Instance:  "api-1",
+	})
+	return scheduler, queue
+}
+
+// TestDegradedExecutorNotDispatched proves a degraded executor (active row with
+// the degraded marker) cannot start a pending case_run; the run stays pending
+// and a blocked event explains why instead of a silent no-op.
+func TestDegradedExecutorNotDispatched(t *testing.T) {
+	fixture := newCaseRunnerFixture(t)
+	executor := &execution.ExecutorInstance{
+		ID: 7, Endpoint: "http://127.0.0.1:13336", Capacity: 8,
+		Status: execution.ExecutorActive, LastError: "degraded",
+	}
+	scheduler, queue := newDispatchScheduler(fixture, executor)
+
+	if err := scheduler.ReconcileVersion(context.Background(), 10); err != nil {
+		t.Fatalf("ReconcileVersion: %v", err)
+	}
+	row := fixture.caseRuns.get(t, 3001)
+	if row.Status != execution.CaseRunPending || row.Attempts != 1 || row.DispatchEpoch != 3 {
+		t.Fatalf("degraded executor started the run: %+v", row)
+	}
+	if queue.count() != 0 {
+		t.Fatalf("degraded executor ensured %d work item(s)", queue.count())
+	}
+	if got := countEvents(fixture.events, executionapp.EventCaseRunStarted); got != 0 {
+		t.Fatalf("degraded executor emitted %d case_run.started event(s)", got)
+	}
+	payloads := eventPayloads(fixture.events, executionapp.EventCaseRunBlocked)
+	if len(payloads) != 1 {
+		t.Fatalf("blocked events = %d, want 1: %v", len(payloads), fixture.events.types())
+	}
+	if got, _ := payloads[0]["reason"].(string); got != "executor_degraded" {
+		t.Fatalf("blocked reason = %q, want executor_degraded", got)
+	}
+
+	// The same blocked state is not re-published every scheduler tick.
+	if err := scheduler.ReconcileVersion(context.Background(), 10); err != nil {
+		t.Fatalf("second ReconcileVersion: %v", err)
+	}
+	if got := len(eventPayloads(fixture.events, executionapp.EventCaseRunBlocked)); got != 1 {
+		t.Fatalf("blocked events after second tick = %d, want 1", got)
+	}
+}
+
+// TestNoExecutorEmitsBlocked proves a missing executor is a visible blocked
+// state, not a silent pending run.
+func TestNoExecutorEmitsBlocked(t *testing.T) {
+	fixture := newCaseRunnerFixture(t)
+	scheduler, queue := newDispatchScheduler(fixture, nil)
+
+	if err := scheduler.ReconcileVersion(context.Background(), 10); err != nil {
+		t.Fatalf("ReconcileVersion: %v", err)
+	}
+	row := fixture.caseRuns.get(t, 3001)
+	if row.Status != execution.CaseRunPending {
+		t.Fatalf("no-executor run status = %q, want pending", row.Status)
+	}
+	if queue.count() != 0 {
+		t.Fatalf("no executor ensured %d work item(s)", queue.count())
+	}
+	payloads := eventPayloads(fixture.events, executionapp.EventCaseRunBlocked)
+	if len(payloads) != 1 {
+		t.Fatalf("blocked events = %d, want 1: %v", len(payloads), fixture.events.types())
+	}
+	if got, _ := payloads[0]["reason"].(string); got != "no_executor" {
+		t.Fatalf("blocked reason = %q, want no_executor", got)
+	}
+	if got, _ := payloads[0]["case_run_id"].(string); got != "3001" {
+		t.Fatalf("blocked case_run_id = %q, want 3001", got)
 	}
 }

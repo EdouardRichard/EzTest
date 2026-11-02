@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	execution "github.com/EdouardRichard/EzTest/backend/internal/execution/domain"
@@ -17,6 +19,19 @@ const (
 	WorkTypeAnalyzeFailure  = "analyze.failure"
 	WorkTypeAnalyzeCoverage = "analyze.coverage"
 	TeamExecution           = "execution"
+)
+
+// EventCaseRunBlocked is the 0.2.1 dispatch-health event (spec §5.6): a pending
+// case_run could not be dispatched because no healthy executor is available.
+// It is emitted once per (case_run, reason) until the run is dispatched, so
+// "no executor" never looks like a silent pending row.
+const EventCaseRunBlocked = "case_run.blocked"
+
+// Reasons carried by EventCaseRunBlocked.
+const (
+	BlockedReasonNoExecutor          = "no_executor"
+	BlockedReasonExecutorDegraded    = "executor_degraded"
+	BlockedReasonExecutorUnavailable = "executor_unavailable"
 )
 
 // Scheduler is the deterministic execution planner/reconciler (ARCH §7.1,
@@ -39,6 +54,10 @@ type Scheduler struct {
 	events      EventPublisher
 	instance    string
 	leaseTTL    time.Duration
+	// blocked deduplicates EventCaseRunBlocked by case_run ID; it holds the
+	// last published reason. A successful dispatch clears the entry.
+	blockedMu sync.Mutex
+	blocked   map[int64]string
 }
 
 // SchedulerDeps wires the scheduler. quotaReader may be nil: the running set is
@@ -87,6 +106,7 @@ func NewScheduler(deps SchedulerDeps) *Scheduler {
 		events:      deps.Events,
 		instance:    deps.Instance,
 		leaseTTL:    lease,
+		blocked:     map[int64]string{},
 	}
 }
 
@@ -207,7 +227,11 @@ func (s *Scheduler) dispatchPending(ctx context.Context, wave execution.RunWave,
 		if err != nil {
 			return mapExecutionError(err, "executor")
 		}
-		if executor == nil || !executor.Status.Dispatchable() {
+		if !dispatchableExecutor(executor) {
+			// Do not leave pending case_runs silent (spec §5.6): publish a
+			// visible blocked event per run and stop this tick. A later tick
+			// retries the dispatch once a healthy executor is registered.
+			s.publishBlockedPending(ctx, wave, pending[index:], blockedReason(executor))
 			return nil
 		}
 		intent, err := s.intents.Get(ctx, run.IntentID)
@@ -275,6 +299,7 @@ func (s *Scheduler) dispatchPending(ctx context.Context, wave execution.RunWave,
 		if _, err := s.caseRuns.Update(ctx, run); err != nil {
 			return mapExecutionError(err, "case run")
 		}
+		s.clearBlocked(run.ID)
 		// Reserve the slots in the local usage snapshot so the next candidate
 		// of this tick sees the one-shot reservation.
 		usage = append(usage, candidate)
@@ -425,6 +450,85 @@ func isInfraFailure(class execution.FailureClass) bool {
 	default:
 		return false
 	}
+}
+
+// dispatchableExecutor reports whether a selected instance may start new
+// case_runs. A degraded executor keeps Status=active (it still heartbeat for
+// cleanup) but must not receive new work, and draining/offline rows are never
+// dispatchable.
+func dispatchableExecutor(executor *execution.ExecutorInstance) bool {
+	return executor != nil && executor.Status.Dispatchable() && !isDegradedExecutor(executor)
+}
+
+// isDegradedExecutor reads the degraded health signal the registry stores in
+// last_error. The registry keeps a degraded executor row Status=active (it can
+// still serve cleanup/cancel routes) but records the health error; a healthy
+// poll or heartbeat clears it again. Push heartbeats store the exact marker
+// "degraded", pull polls store the /healthz error text.
+func isDegradedExecutor(executor *execution.ExecutorInstance) bool {
+	if executor == nil {
+		return false
+	}
+	return strings.TrimSpace(executor.LastError) != ""
+}
+
+// blockedReason maps the unavailable executor to the blocked-event reason.
+func blockedReason(executor *execution.ExecutorInstance) string {
+	switch {
+	case executor == nil:
+		return BlockedReasonNoExecutor
+	case !executor.Status.Dispatchable():
+		return BlockedReasonExecutorUnavailable
+	case isDegradedExecutor(executor):
+		return BlockedReasonExecutorDegraded
+	default:
+		return BlockedReasonExecutorUnavailable
+	}
+}
+
+// publishBlockedPending publishes one deduplicated blocked event per pending
+// case_run of the wave.
+func (s *Scheduler) publishBlockedPending(ctx context.Context, wave execution.RunWave, runs []execution.CaseRun, reason string) {
+	action := "等待执行器恢复后重试"
+	if reason == BlockedReasonNoExecutor {
+		action = "等待执行器注册后重试"
+	}
+	for _, run := range runs {
+		if !s.markBlocked(run.ID, reason) {
+			continue
+		}
+		publishEvent(ctx, s.events, EventCaseRunBlocked, wave.VersionID,
+			map[string]any{
+				"wave_id":     platformid.Format(wave.ID),
+				"case_run_id": platformid.Format(run.ID),
+				"intent_id":   platformid.Format(run.IntentID),
+			},
+			map[string]any{
+				"wave_id":     platformid.Format(wave.ID),
+				"case_run_id": platformid.Format(run.ID),
+				"intent_id":   platformid.Format(run.IntentID),
+				"reason":      reason,
+				"action":      action,
+			}, nil)
+	}
+}
+
+// markBlocked reports whether this (case_run, reason) pair must be published.
+func (s *Scheduler) markBlocked(caseRunID int64, reason string) bool {
+	s.blockedMu.Lock()
+	defer s.blockedMu.Unlock()
+	if previous, ok := s.blocked[caseRunID]; ok && previous == reason {
+		return false
+	}
+	s.blocked[caseRunID] = reason
+	return true
+}
+
+// clearBlocked forgets the blocked state once the run is dispatched.
+func (s *Scheduler) clearBlocked(caseRunID int64) {
+	s.blockedMu.Lock()
+	defer s.blockedMu.Unlock()
+	delete(s.blocked, caseRunID)
 }
 
 // requiredContextCount is the number of executor contexts a case needs: one per

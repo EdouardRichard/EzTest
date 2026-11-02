@@ -337,9 +337,14 @@ func (r *WorkItemRepository) CreateWorkItem(ctx context.Context, in agent.Create
 
 // ClaimWorkItem leases the next runnable 0.2.1 item to owner. Runnable means
 // open, retryable failed (attempts below max_attempts), or a claimed/running
-// item whose lease expired before now. Items whose depends_on set is not fully
-// done are skipped; NULL and {} both mean no dependencies. The claim increments
-// lease_epoch and attempts, which fences every older owner out of later writes.
+// item whose lease expired before now while attempts remain below max_attempts.
+// Items whose depends_on set is not fully done are skipped; NULL and {} both
+// mean no dependencies. The claim increments lease_epoch and attempts, which
+// fences every older owner out of later writes.
+//
+// R41: an expired lease at the attempt cap is settled as failed inside the
+// claim transaction (0.2.1 has no dead state), so a crashed run can never be
+// taken over beyond max_attempts.
 func (r *WorkItemRepository) ClaimWorkItem(ctx context.Context, owner string, now time.Time) (*agent.WorkItem, error) {
 	owner = strings.TrimSpace(owner)
 	if owner == "" {
@@ -355,6 +360,44 @@ func (r *WorkItemRepository) ClaimWorkItem(ctx context.Context, owner string, no
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// R41: an expired lease may only be taken over while attempts remain. At
+	// the attempt cap the row is settled as failed (0.2.1 has no dead status)
+	// and its abandoned attempt is closed, so it can never be claimed again.
+	// This runs in the claim transaction so no separate recovery pass is
+	// required for the 0.2.1 queue.
+	if _, err := tx.Exec(ctx, `
+		UPDATE work_item_attempt
+		SET status = 'failed',
+		    error = COALESCE(error, 'lease expired: attempts exhausted'),
+		    finished_at = $1
+		WHERE work_item_id IN (
+		        SELECT id FROM work_item
+		        WHERE kind <> ''
+		          AND status IN ('claimed', 'running')
+		          AND lease_until IS NOT NULL
+		          AND lease_until < $1
+		          AND attempts >= max_attempts
+		        FOR UPDATE SKIP LOCKED)
+		  AND status IN ('claimed', 'running')
+	`, now); err != nil {
+		return nil, wrapDB("settle expired 0.2.1 work item attempts", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE work_item
+		SET status = 'failed',
+		    last_error = COALESCE(last_error, 'lease expired: attempts exhausted'),
+		    claimed_by = NULL,
+		    lease_until = NULL,
+		    updated_at = $1
+		WHERE kind <> ''
+		  AND status IN ('claimed', 'running')
+		  AND lease_until IS NOT NULL
+		  AND lease_until < $1
+		  AND attempts >= max_attempts
+	`, now); err != nil {
+		return nil, wrapDB("settle expired 0.2.1 work items", err)
+	}
+
 	var id int64
 	err = tx.QueryRow(ctx, `
 		SELECT w.id FROM work_item w
@@ -363,7 +406,8 @@ func (r *WorkItemRepository) ClaimWorkItem(ctx context.Context, owner string, no
 		  AND (w.status = 'open'
 		       OR (w.status = 'failed' AND w.attempts < w.max_attempts)
 		       OR (w.status IN ('claimed', 'running')
-		           AND w.lease_until IS NOT NULL AND w.lease_until < $1))
+		           AND w.lease_until IS NOT NULL AND w.lease_until < $1
+		           AND w.attempts < w.max_attempts))
 		  AND (w.depends_on IS NULL
 		       OR cardinality(w.depends_on) = 0
 		       OR NOT EXISTS (
