@@ -17,7 +17,8 @@ const (
 	ProviderOpenAI = "openai"
 
 	// ProtocolOpenAI and ProtocolOpenAICompatible are the legacy P0 storage
-	// values. They stay valid on read and are normalized to
+	// values. They stay valid on read and write (llm_0003_protocol021.sql keeps
+	// them in the CHECK) and are normalized to
 	// ProtocolOpenAIChatCompletions by NormalizeProtocol, so no data migration
 	// is needed for existing rows (spec §7.1).
 	ProtocolOpenAI           = "openai"
@@ -42,9 +43,10 @@ const (
 // rejects the row.
 const (
 	DefaultProvider = ProviderOpenAI
-	// DefaultProtocol stays the legacy P0 storage value: llm_0001_llm.sql still
-	// constrains the column to openai/openai_compatible. The adapter factory
-	// reads it as ProtocolOpenAIChatCompletions.
+	// DefaultProtocol stays the legacy P0 storage value for configs created
+	// without an explicit protocol. llm_0003_protocol021.sql now accepts the
+	// canonical values too, while the adapter factory still reads this value as
+	// ProtocolOpenAIChatCompletions.
 	DefaultProtocol       = ProtocolOpenAI
 	DefaultStatus         = StatusActive
 	DefaultTimeoutSeconds = 60

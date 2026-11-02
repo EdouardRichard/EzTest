@@ -34,10 +34,11 @@ const (
 // context and retrying; on its own it is not a terminal run failure.
 var ErrContextOverflow = errors.New("llm context overflow")
 
-// ErrNotImplemented marks a protocol adapter whose wire implementation has not
-// landed yet. The OpenAI Responses adapter is a fail-closed placeholder until
-// P4-T2 implements infrastructure/responses.go; callers must surface this
-// error instead of silently falling back to chat completions.
+// ErrNotImplemented marks a protocol adapter capability whose wire
+// implementation has not landed yet. The OpenAI Responses adapter is fully
+// implemented in infrastructure/responses.go; chat-completions streaming still
+// fails closed instead of silently falling back to another protocol. Callers
+// must surface this error rather than pretend the request succeeded.
 var ErrNotImplemented = errors.New("llm protocol adapter is not implemented")
 
 // IsContextOverflow reports whether err is a classified context-window

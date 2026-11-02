@@ -7,13 +7,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/llm/domain"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// protocolCheckConstraint is the named 0.2.1 CHECK on llm_config.protocol
+// (llm_0003_protocol021.sql). A CHECK violation on this constraint means the
+// caller bypassed application validation with an unsupported protocol.
+const protocolCheckConstraint = "chk_llm_config_protocol"
 
 const configColumns = `id, name, provider, protocol, base_url, api_key, headers,
 	timeout_seconds, max_retries, is_default, status, created_by, created_at, updated_at`
@@ -314,11 +321,26 @@ func encodeHeaders(headers map[string]string) (string, error) {
 	return string(raw), nil
 }
 
-// mapConfigError translates unique violations on llm_config.
+// mapConfigError translates unique violations and unsupported-protocol CHECK
+// violations on llm_config. A value rejected by chk_llm_config_protocol is a
+// stable 400: it cannot be persisted even though application validation
+// normally rejects it first, so it must not surface as an unmapped 500.
 func mapConfigError(err error) error {
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-		return llm.ErrNameTaken
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case "23505":
+			return llm.ErrNameTaken
+		case "23514":
+			if pgErr.ConstraintName == protocolCheckConstraint {
+				return &platform.Error{
+					Status:  http.StatusBadRequest,
+					Code:    "invalid_protocol",
+					Message: "protocol must be one of openai_chat_completions, openai_responses (legacy openai/openai_compatible accepted)",
+					Details: map[string]any{"field": "protocol"},
+				}
+			}
+		}
 	}
 	return err
 }

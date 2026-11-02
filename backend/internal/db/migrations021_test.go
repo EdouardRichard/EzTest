@@ -123,8 +123,8 @@ func TestMigrations021Schema(t *testing.T) {
 		}
 	}
 
-	if len(applied) != 48 {
-		t.Fatalf("applied %d migrations, want 48: %v", len(applied), applied)
+	if len(applied) != 49 {
+		t.Fatalf("applied %d migrations, want 49: %v", len(applied), applied)
 	}
 	again, err := db.Migrate(ctx, pool)
 	if err != nil {
@@ -174,6 +174,7 @@ func TestMigrations021Schema(t *testing.T) {
 		"chk_version_stage", "chk_work_item_created_by", "chk_conversation_message_part_type",
 		"chk_conversation_message_part_payload", "chk_knowledge_item_status",
 		"fk_conversation_message_part_message", "fk_llm_config_default_model",
+		"chk_llm_config_protocol",
 	}
 	for _, name := range constraints {
 		var exists bool
@@ -183,6 +184,36 @@ func TestMigrations021Schema(t *testing.T) {
 		if !exists {
 			t.Errorf("missing 0.2.1 constraint %s", name)
 		}
+	}
+
+	// llm_config.protocol: the 0.2.1 migration replaced the auto-named P0 CHECK
+	// with a named constraint that admits both canonical wire protocols while
+	// keeping the legacy storage values valid.
+	var protocolCheck string
+	if err := pool.QueryRow(ctx, `
+		SELECT pg_get_constraintdef(oid) FROM pg_constraint
+		WHERE conrelid = 'llm_config'::regclass AND conname = 'chk_llm_config_protocol'
+	`).Scan(&protocolCheck); err != nil {
+		t.Fatalf("read chk_llm_config_protocol: %v", err)
+	}
+	for _, protocol := range []string{
+		"openai", "openai_compatible", "openai_chat_completions", "openai_responses",
+	} {
+		if !strings.Contains(protocolCheck, "'"+protocol+"'") {
+			t.Errorf("chk_llm_config_protocol rejects %q: %s", protocol, protocolCheck)
+		}
+	}
+	var autoNamedProtocolCheck bool
+	if err := pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_constraint
+			WHERE conrelid = 'llm_config'::regclass AND conname = 'llm_config_protocol_check'
+		)
+	`).Scan(&autoNamedProtocolCheck); err != nil {
+		t.Fatalf("check auto-named protocol constraint: %v", err)
+	}
+	if autoNamedProtocolCheck {
+		t.Error("auto-named llm_config_protocol_check still exists; the protocol CHECK must be renamed")
 	}
 
 	// version.suspended_from records the pre-suspension workflow stage so a

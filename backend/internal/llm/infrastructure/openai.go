@@ -82,7 +82,8 @@ func (c *Client) ListModels(ctx context.Context, cfg llm.Config) ([]llmapp.Remot
 }
 
 // Test probes the upstream: a successful GET {base}/models passes; otherwise a
-// minimal chat completion is attempted. Any failure is returned as an error
+// minimal request for the configured protocol is attempted (POST
+// /chat/completions or POST /responses). Any failure is returned as an error
 // that is safe to surface (status code only, no key).
 func (c *Client) Test(ctx context.Context, cfg llm.Config) (llmapp.TestResult, error) {
 	start := time.Now()
@@ -95,8 +96,8 @@ func (c *Client) Test(ctx context.Context, cfg llm.Config) (llmapp.TestResult, e
 		}, nil
 	}
 
-	chatErr := c.chatProbe(ctx, cfg)
-	if chatErr == nil {
+	probeErr := c.probe(ctx, cfg)
+	if probeErr == nil {
 		return llmapp.TestResult{
 			OK:        true,
 			LatencyMS: time.Since(start).Milliseconds(),
@@ -106,9 +107,23 @@ func (c *Client) Test(ctx context.Context, cfg llm.Config) (llmapp.TestResult, e
 	return llmapp.TestResult{
 			OK:        false,
 			LatencyMS: time.Since(start).Milliseconds(),
-			Error:     redact(chatErr.Error(), cfg.APIKey),
-		}, fmt.Errorf("llm connectivity test failed: models: %v; chat: %v",
-			modelsErr, redact(chatErr.Error(), cfg.APIKey))
+			Error:     redact(probeErr.Error(), cfg.APIKey),
+		}, fmt.Errorf("llm connectivity test failed: models: %v; probe: %v",
+			modelsErr, redact(probeErr.Error(), cfg.APIKey))
+}
+
+// probe attempts one minimal completion on the endpoint of the configured
+// protocol. Unknown protocols fail closed instead of silently probing chat
+// completions, which would report a false success for a Responses config.
+func (c *Client) probe(ctx context.Context, cfg llm.Config) error {
+	protocol, ok := llm.NormalizeProtocol(cfg.Protocol)
+	if !ok {
+		return fmt.Errorf("unknown llm protocol %q", cfg.Protocol)
+	}
+	if protocol == llm.ProtocolOpenAIResponses {
+		return c.responsesProbe(ctx, cfg)
+	}
+	return c.chatProbe(ctx, cfg)
 }
 
 func (c *Client) chatProbe(ctx context.Context, cfg llm.Config) error {
@@ -121,6 +136,22 @@ func (c *Client) chatProbe(ctx context.Context, cfg llm.Config) error {
 		"stream":     false,
 	}
 	_, err := c.do(ctx, cfg, http.MethodPost, "/chat/completions", payload)
+	return err
+}
+
+// responsesProbe posts the smallest valid Responses request: one user input
+// message and a bounded output. It reuses the adapter payload types so the
+// probe cannot drift from the real /responses wire shape.
+func (c *Client) responsesProbe(ctx context.Context, cfg llm.Config) error {
+	payload := responsesRequestPayload{
+		Model: probeModel,
+		Input: []any{
+			responsesMessageItem{Role: "user", Content: "ping"},
+		},
+		MaxOutputTokens: 16,
+		Stream:          false,
+	}
+	_, err := c.do(ctx, cfg, http.MethodPost, "/responses", payload)
 	return err
 }
 

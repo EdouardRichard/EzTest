@@ -5,11 +5,13 @@ package llminfra_test
 import (
 	"context"
 	"errors"
+	"net/http"
 	"testing"
 	"time"
 
 	"github.com/EdouardRichard/EzTest/backend/internal/llm/domain"
 	"github.com/EdouardRichard/EzTest/backend/internal/llm/infrastructure"
+	"github.com/EdouardRichard/EzTest/backend/internal/platform"
 	"github.com/EdouardRichard/EzTest/backend/internal/platform/id"
 	"github.com/EdouardRichard/EzTest/backend/internal/testutil"
 )
@@ -27,12 +29,17 @@ func ptr[T any](value T) *T { return &value }
 
 func createConfig(t *testing.T, repo *llminfra.Repository, ids *id.Snowflake, name string, isDefault bool) llm.Config {
 	t.Helper()
+	return createConfigWithProtocol(t, repo, ids, name, llm.ProtocolOpenAI, isDefault)
+}
+
+func createConfigWithProtocol(t *testing.T, repo *llminfra.Repository, ids *id.Snowflake, name, protocol string, isDefault bool) llm.Config {
+	t.Helper()
 	at := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 	cfg := llm.Config{
 		ID:             ids.Next(),
 		Name:           name,
 		Provider:       llm.ProviderOpenAI,
-		Protocol:       llm.ProtocolOpenAI,
+		Protocol:       protocol,
 		BaseURL:        "http://127.0.0.1:13334/v1",
 		APIKey:         "sk-plain-text",
 		Headers:        map[string]string{"X-Org": "team-a"},
@@ -258,4 +265,100 @@ func TestRepositoryModelUpsertAndCascade(t *testing.T) {
 	if len(remaining) != 0 {
 		t.Fatalf("models survived the config delete: %#v", remaining)
 	}
+}
+
+// TestCanonicalProtocolPersists pins that both canonical 0.2.1 protocol values
+// survive the database round trip. The legacy CHECK in llm_0001_llm.sql only
+// allowed openai/openai_compatible, so canonical values validated in Go but
+// could not be stored.
+func TestCanonicalProtocolPersists(t *testing.T) {
+	pool := testutil.NewDB(t)
+	repo := llminfra.NewRepository(pool)
+	ids := newIDs(t)
+	ctx := context.Background()
+
+	canonical := []string{
+		string(llm.ProtocolOpenAIChatCompletions),
+		string(llm.ProtocolOpenAIResponses),
+	}
+	for _, protocol := range canonical {
+		created := createConfigWithProtocol(t, repo, ids, "canonical-"+protocol, protocol, false)
+
+		stored, err := repo.GetConfig(ctx, created.ID)
+		if err != nil {
+			t.Fatalf("GetConfig(%s): %v", protocol, err)
+		}
+		if stored.Protocol != protocol {
+			t.Fatalf("stored protocol = %q, want %q", stored.Protocol, protocol)
+		}
+
+		stored.UpdatedAt = stored.UpdatedAt.Add(time.Hour)
+		updated, err := repo.UpdateConfig(ctx, stored)
+		if err != nil {
+			t.Fatalf("UpdateConfig(%s): %v", protocol, err)
+		}
+		if updated.Protocol != protocol {
+			t.Fatalf("updated protocol = %q, want %q", updated.Protocol, protocol)
+		}
+	}
+
+	list, err := repo.ListConfigs(ctx)
+	if err != nil {
+		t.Fatalf("ListConfigs: %v", err)
+	}
+	got := make(map[string]bool, len(list))
+	for _, cfg := range list {
+		got[cfg.Protocol] = true
+	}
+	for _, protocol := range canonical {
+		if !got[protocol] {
+			t.Fatalf("ListConfigs lost canonical protocol %q: %#v", protocol, list)
+		}
+	}
+}
+
+// TestInvalidProtocolTyped400 pins that a CHECK violation on
+// llm_config.protocol (PostgreSQL 23514) becomes the stable 400
+// invalid_protocol instead of an unmapped 500.
+func TestInvalidProtocolTyped400(t *testing.T) {
+	pool := testutil.NewDB(t)
+	repo := llminfra.NewRepository(pool)
+	ids := newIDs(t)
+	ctx := context.Background()
+
+	assertInvalidProtocol := func(t *testing.T, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("invalid protocol was accepted")
+		}
+		var apiErr *platform.Error
+		if !errors.As(err, &apiErr) {
+			t.Fatalf("error = %T %v, want a typed *platform.Error", err, err)
+		}
+		if apiErr.Status != http.StatusBadRequest || apiErr.Code != "invalid_protocol" {
+			t.Fatalf("error = %d %q, want 400 invalid_protocol", apiErr.Status, apiErr.Code)
+		}
+	}
+
+	at := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
+	invalid := llm.Config{
+		ID:             ids.Next(),
+		Name:           "invalid-protocol",
+		Provider:       llm.ProviderOpenAI,
+		Protocol:       "anthropic",
+		BaseURL:        "http://127.0.0.1:13334/v1",
+		TimeoutSeconds: 60,
+		MaxRetries:     2,
+		Status:         llm.StatusActive,
+		CreatedAt:      at,
+		UpdatedAt:      at,
+	}
+	_, createErr := repo.CreateConfig(ctx, invalid)
+	assertInvalidProtocol(t, createErr)
+
+	valid := createConfig(t, repo, ids, "valid-before-invalid-update", false)
+	valid.Protocol = "anthropic"
+	valid.UpdatedAt = valid.UpdatedAt.Add(time.Hour)
+	_, updateErr := repo.UpdateConfig(ctx, valid)
+	assertInvalidProtocol(t, updateErr)
 }
