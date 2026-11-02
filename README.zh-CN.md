@@ -214,8 +214,9 @@ EzTest 以单机栈运行。API、Web UI、执行器和 PDF renderer 是独立�
 确保端口 **13333**、**6868**、**13336**、**13337** 空闲。
 
 ```powershell
-# Windows（PowerShell），解压后
-cd .\eztest-0.2.0-preview.1-windows-x64
+# Windows（PowerShell）—— 解压并进入包目录
+Expand-Archive .\eztest-0.2.0-preview.1-windows-x64.zip -DestinationPath .\eztest
+cd .\eztest\eztest-0.2.0-preview.1-windows-x64
 .\init-config.ps1 -DatabaseUrl "postgres://eztest:<password>@localhost:5433/eztest?sslmode=disable"
 .\start-eztest.ps1        # 启动 API、执行器、renderer 与 Web，并等待健康检查
 .\status-eztest.ps1       # 进程、健康探针与 PostgreSQL 状态
@@ -223,9 +224,17 @@ cd .\eztest-0.2.0-preview.1-windows-x64
 .\smoke-test.ps1          # 对运行中的安装做端到端检查
 ```
 
+这些命令必须在**直接包含 `init-config.ps1`、`start-eztest.ps1` 的目录**（即解压目录里的
+`eztest-0.2.0-preview.1-windows-x64` 文件夹）中运行。如果 PowerShell 提示找不到 `.\init-config.ps1`，
+说明当前还在上一级目录——用 `Get-ChildItem -Recurse -Filter init-config.ps1` 找到包目录后 `cd` 进去。
+如果被执行策略拦截，改用
+`powershell -NoProfile -ExecutionPolicy Bypass -File .\init-config.ps1 -DatabaseUrl "..."` 运行。
+
 ```bash
-# Linux（x64），解压后
-cd eztest-0.2.0-preview.1-linux-x64
+# Linux（x64）—— 解压并进入包目录
+mkdir -p eztest
+tar -xzf eztest-0.2.0-preview.1-linux-x64.tar.gz -C eztest
+cd eztest/eztest-0.2.0-preview.1-linux-x64
 bash install-linux-deps.sh                                  # 仅首次，需要 sudo
 bash init-config.sh --database-url "postgres://eztest:<password>@localhost:5433/eztest?sslmode=disable"
 bash start-eztest.sh
