@@ -167,3 +167,16 @@ func TestPDFOverLimitIsRejected(t *testing.T) {
 		t.Fatalf("RenderPDF error = %v, want ErrRenderRejected", err)
 	}
 }
+
+func TestPDFAtLimitIsAccepted(t *testing.T) {
+	body := append([]byte("%PDF-"), bytes.Repeat([]byte("x"), renderclient.MaxPDFBytes-5)...)
+	server, _, _ := newPDFServer(t, http.StatusOK, body, "application/pdf")
+	client := renderclient.New(server.URL, "token", 30*time.Second)
+	pdf, err := client.RenderPDF(context.Background(), []byte("<html></html>"))
+	if err != nil {
+		t.Fatalf("RenderPDF at limit: %v", err)
+	}
+	if len(pdf) != renderclient.MaxPDFBytes {
+		t.Fatalf("pdf bytes = %d, want %d", len(pdf), renderclient.MaxPDFBytes)
+	}
+}

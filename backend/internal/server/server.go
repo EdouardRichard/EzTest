@@ -165,10 +165,15 @@ func New(deps Deps) http.Handler {
 	registerP6Routes(mux, authenticated, admin, deps.P6)
 	registerP7Routes(mux, authenticated, admin, deps.Execution, deps.Settings, deps.P7)
 
-	chain := TrackInflight(deps.Load)(CORS(deps.Config)(mux))
+	var chain http.Handler = mux
 	if deps.Settings != nil {
 		chain = RateLimit(deps.Settings)(chain)
 	}
+	// CORS must wrap the rate limiter so a 429 (written before the wrapped mux
+	// runs) still carries Access-Control-Allow-Origin; otherwise browsers see a
+	// network error instead of the frozen rate_limited envelope.
+	chain = CORS(deps.Config)(chain)
+	chain = TrackInflight(deps.Load)(chain)
 	return RequestID(Recover(Logging(chain)))
 }
 

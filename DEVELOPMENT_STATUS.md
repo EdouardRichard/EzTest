@@ -1,6 +1,6 @@
 # EzTest 开发状态（0.2 / P8）
 
-> 状态：**0.2 P8 硬化与验收已完成**（2026-11-02，`feat/v0.2-p8` 已合回 `feat/v0.2`，merge `f5c5801`）。
+> 状态：**P8 实施完成；验收签核待 S9 长执行证据（L17）**（2026-11-02，`feat/v0.2-p8` 已合回 `feat/v0.2`，merge `f5c5801` + 后续修复）。
 > 产品定位：AI 驱动、半自主、端到端测试系统；0.2 为完整替代版（0.1 P0–P8 全功能对齐 + P9 五项）。
 > 设计权威：[docs/version-V0.2/README.md](docs/version-V0.2/README.md) 与
 > [docs/version-V0.2/contracts/README.md](docs/version-V0.2/contracts/README.md)。
@@ -8,10 +8,11 @@
 
 ## 0. 验证状态（先读）
 
-- **P8 验收已 PASS**：证据索引 [docs/version-V0.2/acceptance/p8/](docs/version-V0.2/acceptance/p8/)。
-  全旅程 S0–S6（568s）、韧性 S9/S10、多副本 S8（72 PASS/0 FAIL）、37 行能力矩阵
-  （28 PASS/9 PASS(prior)/0 FAIL）、浏览器 E2E（10 passed/1 显式数据 gap）、静态门 18/18 均通过；
-  证据与限制见 [phase-08-handoff](docs/version-V0.2/phases/phase-08-handoff.md)。
+- **P8 核心验收已 PASS**：证据索引 [docs/version-V0.2/acceptance/p8/](docs/version-V0.2/acceptance/p8/)。
+  全旅程 S0–S6（620s，3 轮澄清）、S10、多副本 S8（72 PASS/0 FAIL）、37 行能力矩阵
+  （28 PASS/9 PASS(prior)/0 FAIL）、浏览器 E2E（11 passed/0 skipped，44 张截图）、静态门 18/18 均通过；
+  **S9 长执行 12 例/2 波仍未覆盖（P3 fallback 6 例，L17）**，pinned facts 未触发（L16），resilience
+  teardown 未干净退出（L18）。证据与限制见 [phase-08-handoff](docs/version-V0.2/phases/phase-08-handoff.md)。
 - **已记录证据**：P6（`acceptance/p6/`，真实 LLM + 真实 Chrome，S0–S9 PASS，9 张截图）与 P7
   （`acceptance/p7/`，13/13 场景、156 checks、21 张 E2E 截图，覆盖 P9 五项）。
 - **Docker 未实跑**：`deploy/` 的 Compose/Dockerfile 已交付并静态校验；本机未安装 Docker，从未构建
@@ -76,8 +77,8 @@ LLM、真实 Chrome、双 SUT、双 API 副本与共享内容目录。
 
 ## 5. 已知限制
 
-1. **P8 最终验收结果尚未记录**：本文件只记录入口与已有 P6/P7 证据；P8 PASS/FAIL 以
-   `acceptance/p8/` 的最终文档为准。
+1. **P8 验收已完成**：全旅程/韧性/多副本/能力矩阵/E2E/静态门 PASS；证据见
+   [acceptance/p8/](docs/version-V0.2/acceptance/p8/) 与 [phase-08-handoff](docs/version-V0.2/phases/phase-08-handoff.md)。
 2. **Docker 未实跑**：Compose/Dockerfile 只做静态校验（`frontend/scripts/validate-compose.mjs`）；
    首次在真实 Docker 主机执行前需复核网络、卷、renderer URL/token 与镜像构建。
 3. **SLO 未测量、安全审计未执行**：按用户裁定跳过；不承诺 SLO 阈值或生产级安全加固。

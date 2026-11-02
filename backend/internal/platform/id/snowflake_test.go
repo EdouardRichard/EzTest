@@ -2,6 +2,7 @@ package id
 
 import (
 	"encoding/json"
+	"sync"
 	"testing"
 )
 
@@ -107,5 +108,55 @@ func TestSnowflakeWaitsForNextMillisecondWhenSequenceExhausted(t *testing.T) {
 		}
 		seen[next] = struct{}{}
 		previous = next
+	}
+}
+
+func TestSnowflakeConcurrentUniqueness(t *testing.T) {
+	gen, err := NewSnowflake(7)
+	if err != nil {
+		t.Fatalf("NewSnowflake: %v", err)
+	}
+	const workers = 8
+	const perWorker = 10_000
+	var wg sync.WaitGroup
+	seen := make(map[int64]struct{}, workers*perWorker)
+	var mu sync.Mutex
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ids := make([]int64, 0, perWorker)
+			for i := 0; i < perWorker; i++ {
+				ids = append(ids, gen.Next())
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			for _, id := range ids {
+				if _, duplicate := seen[id]; duplicate {
+					t.Errorf("duplicate id %d", id)
+					return
+				}
+				seen[id] = struct{}{}
+			}
+		}()
+	}
+	wg.Wait()
+	if len(seen) != workers*perWorker {
+		t.Fatalf("unique ids = %d, want %d", len(seen), workers*perWorker)
+	}
+}
+
+func TestSnowflakeClockRollbackNeverRegresses(t *testing.T) {
+	gen, err := NewSnowflake(2)
+	if err != nil {
+		t.Fatalf("NewSnowflake: %v", err)
+	}
+	const base int64 = 1_800_000_000_000
+	gen.now = func() int64 { return base }
+	first := gen.Next()
+	gen.now = func() int64 { return base - 5_000 }
+	second := gen.Next()
+	if second <= first {
+		t.Fatalf("rollback produced non-monotonic id: first=%d second=%d", first, second)
 	}
 }

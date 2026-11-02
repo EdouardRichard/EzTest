@@ -17,17 +17,17 @@
 
 > **Status: v0.2 (P8).** 0.2 is the full replacement line: it re-aligns every 0.1 P0–P8 capability and
 > adds the five P9 items (HTML/PDF reports, cross-version knowledge, unified GC, multi-replica safety,
-> issue reopen/merge/cross-wave dedupe). P8 hardening and acceptance are complete and merged into
-> `feat/v0.2`.
+> issue reopen/merge/cross-wave dedupe). P8 implementation is complete and merged into `feat/v0.2`;
+> final acceptance sign-off is pending the S9 12-case/2-wave long-execution scenario (L17).
 >
 > **Validation status — read this first.**
 >
 > - Recorded evidence: P6 (`docs/version-V0.2/acceptance/p6/`) and P7
 >   (`docs/version-V0.2/acceptance/p7/`), both exercised with a real LLM and a real Chrome browser.
 > - P8 evidence is recorded in `docs/version-V0.2/acceptance/p8/`: full journey S0–S6, resilience
->   S9/S10, multi-replica S8, the 37-row capability matrix, browser E2E and the static gate all
->   passed (one E2E report-object data gap is recorded explicitly; SLO and the security audit were
->   waived by the user).
+>   S9 long-context/S10, multi-replica S8, the 37-row capability matrix, browser E2E (11/11) and
+>   the static gate passed. S9 long execution is partial (P3 fallback, 6 cases), and the
+>   pinned-fact assertion was not exercised; see `known-limitations.md` L16/L17.
 > - The Docker Compose stack in `deploy/` is **delivered and statically validated, but it has never
 >   been built or started on this host** (Docker is not installed here).
 > - SLO measurement and the security audit were **skipped by user decision** for 0.2 and are not
