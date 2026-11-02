@@ -1,6 +1,7 @@
 package attachments_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"strings"
@@ -58,6 +59,124 @@ func TestExtractTextEnforcesSizeLimit(t *testing.T) {
 	}
 	if !errors.Is(err, attachments.ErrTooLarge) {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestSizeLimit(t *testing.T) {
+	oversized := bytes.Repeat([]byte("a"), 10<<20+1)
+	for _, name := range []string{"big.txt", "big.docx", "big.xlsx"} {
+		if _, err := extract(t, name, "", oversized); !errors.Is(err, attachments.ErrTooLarge) {
+			t.Fatalf("%s over 10 MiB error = %v, want ErrTooLarge", name, err)
+		}
+	}
+	// The extracted-text cap is separate from the upload cap.
+	tooMuchText := bytes.Repeat([]byte("a"), 2<<20+1)
+	if _, err := extract(t, "big.txt", "text/plain", tooMuchText); !errors.Is(err, attachments.ErrTooLarge) {
+		t.Fatalf("text over 2 MiB error = %v, want ErrTooLarge", err)
+	}
+}
+
+func TestExtractOfficeFormats(t *testing.T) {
+	cases := []struct {
+		name    string
+		file    string
+		mime    string
+		data    []byte
+		wants   []string
+		ordered []string
+	}{
+		{
+			name: "docx",
+			file: "requirements.docx",
+			mime: "application/octet-stream",
+			data: docxFixture(
+				[]string{"Attachment matrix paragraph"},
+				[][]string{{"Cell A", "Cell B"}},
+			),
+			wants: []string{"Attachment matrix paragraph", "Cell A", "Cell B"},
+		},
+		{
+			name:  "pptx",
+			file:  "slides.pptx",
+			mime:  "application/octet-stream",
+			data:  pptxFixture([]string{"First slide", "Second slide"}),
+			wants: []string{"First slide", "Second slide"},
+		},
+		{
+			name:    "xlsx",
+			file:    "matrix.xlsx",
+			mime:    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+			data:    xlsxFixture(),
+			wants:   []string{"Requirement", "Expected", "Login works", "inline value", "42", "Expected result"},
+			ordered: []string{"Requirement", "Login works", "42"},
+		},
+		{
+			name:  "xlsx by MIME",
+			file:  "spreadsheet",
+			mime:  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+			data:  xlsxFixture(),
+			wants: []string{"Requirement", "42"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			text, err := extract(t, tc.file, tc.mime, tc.data)
+			if err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+			if strings.TrimSpace(text) == "" {
+				t.Fatalf("%s extraction is empty", tc.name)
+			}
+			for _, want := range tc.wants {
+				if !strings.Contains(text, want) {
+					t.Fatalf("%s extraction missing %q: %q", tc.name, want, text)
+				}
+			}
+			previous := -1
+			for _, want := range tc.ordered {
+				position := strings.Index(text, want)
+				if position <= previous {
+					t.Fatalf("%s extraction order wrong at %q: %q", tc.name, want, text)
+				}
+				previous = position
+			}
+		})
+	}
+}
+
+func TestLegacyFormatsRejected(t *testing.T) {
+	for _, name := range []string{"requirements.doc", "deck.ppt"} {
+		_, err := extract(t, name, "application/octet-stream", []byte("legacy binary"))
+		if err == nil {
+			t.Fatalf("%s was accepted", name)
+		}
+		if !errors.Is(err, attachments.ErrUnsupportedLegacy) {
+			t.Fatalf("%s error = %v, want ErrUnsupportedLegacy", name, err)
+		}
+		if !errors.Is(err, attachments.ErrUnsupported) {
+			t.Fatalf("%s error = %v, want it to also match ErrUnsupported", name, err)
+		}
+		message := strings.ToLower(err.Error())
+		if !strings.Contains(message, "docx") || !strings.Contains(message, "pptx") {
+			t.Fatalf("%s message lacks a save-as hint: %v", name, err)
+		}
+	}
+}
+
+func TestExtractHTML(t *testing.T) {
+	document := []byte("\ufeff<!doctype html><html><body><h1>标题</h1><p>body text</p></body></html>")
+	for _, tc := range []struct{ name, mime string }{
+		{"page.html", "text/html"},
+		{"page.htm", "text/html"},
+		{"page", "text/html"},
+	} {
+		text, err := extract(t, tc.name, tc.mime, document)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if !strings.Contains(text, "标题") || !strings.Contains(text, "body text") {
+			t.Fatalf("%s = %q", tc.name, text)
+		}
 	}
 }
 
@@ -164,4 +283,32 @@ func TestExtractRejectsLegacyAndImageFormats(t *testing.T) {
 			t.Fatalf("%s error = %v", tc.name, err)
 		}
 	}
+}
+
+// xlsxFixture builds a minimal spreadsheet with two worksheets: shared strings
+// (including a rich-text run) on the first sheet, and an inline string plus a
+// numeric cell on the second. Worksheet files are not zero padded, and the
+// sheet order is what the extractor must preserve.
+func xlsxFixture() []byte {
+	const sharedStrings = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="4" uniqueCount="4">
+<si><t>Requirement</t></si>
+<si><t>Expected</t></si>
+<si><r><t>Login </t></r><r><t>works</t></r></si>
+<si><t>Expected result</t></si>
+</sst>`
+	const sheet1 = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>
+<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row>
+<row r="2"><c r="A2" t="s"><v>2</v></c><c r="B2" t="inlineStr"><is><t>inline value</t></is></c></row>
+</sheetData></worksheet>`
+	const sheet2 = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>
+<row r="1"><c r="A1"><v>42</v></c><c r="B1" t="s"><v>3</v></c></row>
+</sheetData></worksheet>`
+	return zipFixture(map[string]string{
+		"xl/sharedStrings.xml":     sharedStrings,
+		"xl/worksheets/sheet1.xml": sheet1,
+		"xl/worksheets/sheet2.xml": sheet2,
+	})
 }

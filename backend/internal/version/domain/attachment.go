@@ -3,6 +3,7 @@ package version
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path"
 	"strings"
 	"time"
@@ -50,8 +51,10 @@ type AttachmentKind string
 const (
 	AttachmentMarkdown    AttachmentKind = "markdown"
 	AttachmentText        AttachmentKind = "text"
+	AttachmentHTML        AttachmentKind = "html"
 	AttachmentDOCX        AttachmentKind = "docx"
 	AttachmentPPTX        AttachmentKind = "pptx"
+	AttachmentXLSX        AttachmentKind = "xlsx"
 	AttachmentPDF         AttachmentKind = "pdf"
 	AttachmentImage       AttachmentKind = "image"
 	AttachmentUnsupported AttachmentKind = "unsupported"
@@ -63,7 +66,8 @@ func (k AttachmentKind) IsImage() bool { return k == AttachmentImage }
 // SupportsExtraction reports whether the parser can extract text for the kind.
 func (k AttachmentKind) SupportsExtraction() bool {
 	switch k {
-	case AttachmentMarkdown, AttachmentText, AttachmentDOCX, AttachmentPPTX, AttachmentPDF:
+	case AttachmentMarkdown, AttachmentText, AttachmentHTML, AttachmentDOCX,
+		AttachmentPPTX, AttachmentXLSX, AttachmentPDF:
 		return true
 	default:
 		return false
@@ -74,9 +78,17 @@ func (k AttachmentKind) SupportsExtraction() bool {
 // wrap these so the application can classify the extraction outcome.
 var (
 	ErrUnsupportedAttachmentFormat = errors.New("unsupported attachment format")
-	ErrAttachmentTooLarge          = errors.New("attachment exceeds the extraction limit")
-	ErrAttachmentCorrupt           = errors.New("attachment cannot be parsed")
-	ErrAttachmentNotFound          = errors.New("attachment not found")
+	// ErrUnsupportedLegacyAttachment is raised for the pre-OOXML .doc/.ppt
+	// binary formats. It wraps ErrUnsupportedAttachmentFormat so callers that
+	// only classify unsupported formats keep working, while callers can still
+	// surface the save-as hint to users.
+	ErrUnsupportedLegacyAttachment = fmt.Errorf(
+		"%w: legacy .doc/.ppt is not supported; save it as .docx/.pptx and upload again",
+		ErrUnsupportedAttachmentFormat,
+	)
+	ErrAttachmentTooLarge = errors.New("attachment exceeds the extraction limit")
+	ErrAttachmentCorrupt  = errors.New("attachment cannot be parsed")
+	ErrAttachmentNotFound = errors.New("attachment not found")
 )
 
 // Attachment is the runtime state of one message attachment. The binary lives
@@ -140,7 +152,8 @@ func SanitizeAttachmentName(raw string) (string, error) {
 }
 
 // DetectAttachmentKind classifies an attachment by extension, falling back to
-// the MIME type. Legacy binary .doc/.ppt are deliberately unsupported.
+// the MIME type. Legacy binary .doc/.ppt are deliberately unsupported; see
+// IsLegacyOfficeFormat for the explicit rejection path.
 func DetectAttachmentKind(name, mime string) AttachmentKind {
 	name = strings.ToLower(strings.TrimSpace(name))
 	mime = strings.ToLower(strings.TrimSpace(mime))
@@ -149,10 +162,14 @@ func DetectAttachmentKind(name, mime string) AttachmentKind {
 		return AttachmentMarkdown
 	case strings.HasSuffix(name, ".txt"):
 		return AttachmentText
+	case strings.HasSuffix(name, ".html"), strings.HasSuffix(name, ".htm"):
+		return AttachmentHTML
 	case strings.HasSuffix(name, ".docx"):
 		return AttachmentDOCX
 	case strings.HasSuffix(name, ".pptx"):
 		return AttachmentPPTX
+	case strings.HasSuffix(name, ".xlsx"):
+		return AttachmentXLSX
 	case strings.HasSuffix(name, ".pdf"):
 		return AttachmentPDF
 	case strings.HasSuffix(name, ".png"), strings.HasSuffix(name, ".jpg"), strings.HasSuffix(name, ".jpeg"),
@@ -166,15 +183,28 @@ func DetectAttachmentKind(name, mime string) AttachmentKind {
 		return AttachmentImage
 	case mime == "text/plain", mime == "text/markdown":
 		return AttachmentText
+	case mime == "text/html":
+		return AttachmentHTML
 	case mime == "application/pdf":
 		return AttachmentPDF
 	case strings.Contains(mime, "wordprocessingml"):
 		return AttachmentDOCX
 	case strings.Contains(mime, "presentationml"):
 		return AttachmentPPTX
+	case strings.Contains(mime, "spreadsheetml"):
+		return AttachmentXLSX
 	default:
 		return AttachmentUnsupported
 	}
+}
+
+// IsLegacyOfficeFormat reports whether name is a pre-OOXML Word (.doc) or
+// PowerPoint (.ppt) file. They are rejected instead of parsed so the user is
+// told to save as .docx/.pptx; .xls is not part of the supported matrix either
+// but has no OOXML save-as sibling here.
+func IsLegacyOfficeFormat(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	return strings.HasSuffix(name, ".doc") || strings.HasSuffix(name, ".ppt")
 }
 
 // PendingAttachment is the ingest reconciler row: a pending attachment plus the
