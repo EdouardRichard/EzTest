@@ -227,8 +227,19 @@ cd .\eztest\eztest-0.2.0-preview.1-windows-x64
 这些命令必须在**直接包含 `init-config.ps1`、`start-eztest.ps1` 的目录**（即解压目录里的
 `eztest-0.2.0-preview.1-windows-x64` 文件夹）中运行。如果 PowerShell 提示找不到 `.\init-config.ps1`，
 说明当前还在上一级目录——用 `Get-ChildItem -Recurse -Filter init-config.ps1` 找到包目录后 `cd` 进去。
-如果被执行策略拦截，改用
-`powershell -NoProfile -ExecutionPolicy Bypass -File .\init-config.ps1 -DatabaseUrl "..."` 运行。
+
+包内脚本没有代码签名。如果 PowerShell 报错"...未对文件...进行数字签名。无法在当前系统上运行该脚本"，
+只需放行**当前窗口**（不改系统全局设置）后正常执行：
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\init-config.ps1 -DatabaseUrl "postgres://eztest:<password>@localhost:5433/eztest?sslmode=disable"
+.\start-eztest.ps1
+```
+
+或者逐个用 bypass 进程执行：
+`powershell -NoProfile -ExecutionPolicy Bypass -File .\init-config.ps1 -DatabaseUrl "..."`（`start-eztest.ps1` /
+`stop-eztest.ps1` / `status-eztest.ps1` / `smoke-test.ps1` 同理）。Linux 的 `.sh` 脚本不受影响。
 
 ```bash
 # Linux（x64）—— 解压并进入包目录
