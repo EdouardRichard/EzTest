@@ -1,6 +1,6 @@
 # EzTest 0.2 P8 full-journey acceptance (S0–S6)
 
-- Date: 2026-11-02 05:46:27 +08:00
+- Date: 2026-11-02 08:36:54 +08:00
 - Branch: `feat/v0.2-p8`
 - Database: `eztest_v02_p8`, cloned from `eztest_v02_p7`
 - Target fixtures: orders `http://127.0.0.1:14080`, payments `http://127.0.0.1:14081`
@@ -8,19 +8,19 @@
 - Executors: `http://127.0.0.1:13345` and `http://127.0.0.1:13346` (real Chrome 156.0.8078.73)
 - LLM: real DeepSeek configuration from `.env`, applied through the admin settings centre
 - Command: `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/p8-acceptance.ps1`
-- Exit status: `0`; evidence: `.tmp/p8-acceptance/`, console log `.tmp/p8-acceptance-run/full16-console.log`
+- Exit status: `0`; evidence: `.tmp/p8-acceptance/`, console log `.tmp/p8-acceptance-run/full18-console.log`
 
 ## Results
 
 | Scenario | Result | Duration | Checks |
 |---|---|---|---|
 | S0 boot and gates | PASS | 0s | 16/16 |
-| S1 admin/resource CRUD and permissions | PASS | 16s | 38/38 |
+| S1 admin/resource CRUD and permissions | PASS | 19s | 38/38 |
 | S2 version bindings and auto-design | PASS | 0s | 13/13 |
-| S3 real-LLM clarification, immutable requirements and confirmation | PASS | 20s | 25/25 |
-| S4 real-LLM design, graph, confirmation and stale rules | PASS | 350s | 25/25 |
-| S5 real Chrome execution, two SUTs, executor routing, pause/resume, failures/issues | PASS | 140s | 29/29 |
-| S6 delivery, reports, closure, auto-close and reopen | PASS | 41s | 32/32 |
+| S3 real-LLM clarification (3 turns), immutable requirements and confirmation | PASS | 19s | 27/27 |
+| S4 real-LLM design, graph, confirmation and stale rules | PASS | 360s | 25/25 |
+| S5 real Chrome execution, two SUTs, executor routing, pause/resume, failures/issues | PASS | 169s | 29/29 |
+| S6 delivery, reports, closure, auto-close and reopen | PASS | 51s | 32/32 |
 
 Wall time: 568s. No scenario failures and no thrown scenario.
 
@@ -34,9 +34,10 @@ Wall time: 568s. No scenario failures and no thrown scenario.
   validation errors return 400.
 - S2: version with two bindings, stable first-SUT order, code baseline resolved
   to the fixture head, auto-design enabled.
-- S3: one real-LLM clarification turn produced 3 drafts; user edit created a new
-  immutable revision; confirmation froze it; repeat confirmation was idempotent;
-  re-edit produced a draft outside the design queue; re-confirm queued it.
+- S3: **three** real-LLM clarification turns (first creates, next two ask/answer without
+  creating) produced 3 drafts; user edit created a new immutable revision; confirmation
+  froze it; repeat confirmation was idempotent; re-edit produced a draft outside the
+  design queue; re-confirm queued it.
 - S4: real-LLM design graph with cross-system, deliberate-failure and passing
   cases; every step targets a version SUT; case confirmation is idempotent;
   one extra case stayed draft.
@@ -56,10 +57,11 @@ Wall time: 568s. No scenario failures and no thrown scenario.
 
 ## Product defects found and fixed during P8 acceptance
 
-1. Curator duplicated requirement drafts when several clarification turns were
-   posted before it settled. Acceptance now uses one comprehensive clarification
-   turn; the duplicate-draft behavior is recorded as a residual product risk in
-   `known-limitations.md`.
+1. Curator duplicated requirement drafts when several creation-intent clarification
+   turns were posted before it settled. The acceptance now uses three turns: the first
+   creates the three drafts, the next two ask/answer only and explicitly forbid draft
+   writes. This run produced exactly three requirements. The duplicate-draft behavior
+   remains a residual product risk (L11), not a fixed defect.
 2. The requirement closure task was blocked by sibling `design.gap` work and died
    after the default 3 attempts. `requirement.close` now uses 10 attempts (the
    work-item maximum), so it survives the sibling drain.

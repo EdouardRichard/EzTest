@@ -114,7 +114,7 @@ func CORS(cfg config.Config) func(http.Handler) http.Handler {
 			if ok {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
 				w.Header().Add("Vary", "Origin")
-				w.Header().Set("Access-Control-Expose-Headers", "X-Request-ID, X-Snapshot-Cursor, X-Content-SHA256, WWW-Authenticate")
+				w.Header().Set("Access-Control-Expose-Headers", "X-Request-ID, X-Snapshot-Cursor, X-Content-SHA256, WWW-Authenticate, Retry-After, X-RateLimit-Limit")
 			}
 			if r.Method == http.MethodOptions {
 				if ok {

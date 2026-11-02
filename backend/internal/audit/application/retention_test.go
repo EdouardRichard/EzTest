@@ -62,6 +62,13 @@ func TestRetentionRunDeletesInBatchesAndAudits(t *testing.T) {
 	if recorder.events[0].Metadata["events_deleted"] != int64(5) || recorder.events[0].Metadata["audit_deleted"] != int64(3) {
 		t.Fatalf("audit metadata = %#v", recorder.events[0].Metadata)
 	}
+	if recorder.events[0].TargetKind != "retention" {
+		t.Fatalf("audit target kind = %q, want retention", recorder.events[0].TargetKind)
+	}
+	cutoff, _ := recorder.events[0].Metadata["cutoff"].(string)
+	if cutoff == "" {
+		t.Fatalf("audit metadata cutoff missing: %#v", recorder.events[0].Metadata)
+	}
 }
 
 func TestRetentionRunContinuesAfterEventFailure(t *testing.T) {

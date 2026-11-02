@@ -1,6 +1,9 @@
 # Phase 08 Handoff — P8 硬化与验收
 
-> 状态：**completed（P8 硬化、契约冻结、真实全旅程/韧性/多副本/能力矩阵/E2E/静态门全部通过；用户批准的 SLO/安全审计/fake-LLM 偏离已记录）**
+> 状态：**implementation complete；sign-off BLOCKED on S9 long-execution evidence（L16/L17/L18）**
+> 已通过：契约冻结、S0–S6 全旅程、S8、S9 长上下文（pinned 未触发）、S10 版本/限流/保留、S11、S12、S13、P7 回归。
+> 未通过/部分：S9 长执行未覆盖 12 例/2 波、`/p8/large`、checkpoint/head+ref；resilience teardown 未干净退出。
+> 用户批准的 SLO/安全审计/fake-LLM/性能/Docker 偏离已记录。
 > 日期：2026-11-02
 > 阶段：P8（`docs/version-V0.2/phases/phase-08-hardening-acceptance.md`）
 > 实施分支：`feat/v0.2-p8`（从 `feat/v0.2` @`e2cf110` 拉出）→ 合回 `feat/v0.2`
@@ -58,13 +61,13 @@
 
 | 场景 | 结果 | 证据 |
 |---|---|---|
-| S0–S6 全旅程（真实 DeepSeek + Chrome，双 SUT） | **PASS**；S0 16/16、S1 38/38、S2 13/13、S3 25/25、S4 25/25、S5 29/29、S6 32/32，568s | [acceptance.md](../acceptance/p8/acceptance.md)、`.tmp/p8-acceptance-run/full16-console.log` |
+| S0–S6 全旅程（真实 DeepSeek + Chrome，双 SUT，3 轮澄清） | **PASS**；S0 16/16、S1 38/38、S2 13/13、S3 27/27、S4 25/25、S5 29/29、S6 32/32，620s | [acceptance.md](../acceptance/p8/acceptance.md)、`.tmp/p8-acceptance-run/full18-console.log` |
 | S8 多副本（双 API/共享 DB/SSE/drain/leader/roll/kill-9/真实 executor loss） | **PASS**；72 PASS / 0 FAIL / 1 SKIP | [multi.md](../acceptance/p8/multi.md)、`.tmp/p8-multi/` |
-| S9 长上下文（30 消息、window 8000） | **PASS**；4 summary、4 `context.compacted`、packet 含摘要/钉住事实 | [resilience.md](../acceptance/p8/resilience.md)、`.tmp/p8-resilience/` |
+| S9 长上下文（30 消息、window 8000） | **PASS（pinned 未触发）**；4 summary、4 `context.compacted`、packet 含摘要；最终 run `pinned_facts=0`，不宣称已验证 pinned 保留（L16） | [resilience.md](../acceptance/p8/resilience.md)、`.tmp/p8-resilience/` |
 | S10 版本/就绪/限流/保留 | **PASS**；限流 38×429 + Retry-After + 恢复；旧行删除/新行保留/`retention.cleanup` | 同上 |
-| S10 长执行（12 例尝试 → P3 fallback） | **PASS**；P3 16/16 场景，真实 LLM+Chrome | 同上 |
+| S10 长执行（12 例尝试 → P3 fallback） | **PARTIAL**；真实 design 未产出 12 例，P3 fallback 16/16 场景但只有 6 个执行用例；`/p8/large`、checkpoint、12 例/2 波未覆盖（L17）；脚本 teardown 挂起（L18） | 同上 |
 | S11 37 行能力矩阵 | **PASS**；28 PASS / 9 PASS(prior) / 0 FAIL | [capability-signoff.md](../acceptance/p8/capability-signoff.md)、`.tmp/p8-capability/` |
-| S12 浏览器 E2E | **PASS**；10 passed / 1 skipped（报告对象缺失 gap），40 张截图 | [e2e.md](../acceptance/p8/e2e.md)、`acceptance/p8/screenshots/` |
+| S12 浏览器 E2E | **PASS**；11 passed / 0 skipped，44 张截图（报告下载与版本重开均已真实执行） | [e2e.md](../acceptance/p8/e2e.md)、`acceptance/p8/screenshots/` |
 | S13 静态门 | **PASS**；18/18 | [static.md](../acceptance/p8/static.md) |
 
 全旅程的关键证据：
@@ -81,7 +84,7 @@
 
 ## 4. 验收中发现并修复的产品缺陷
 
-1. Curator 在多轮澄清中重复生成同题 requirement draft；验收改为单轮综合澄清，重复 draft 记入 P2 风险（L11）。
+1. Curator 在多轮澄清中重复生成同题 requirement draft 的风险仍在；验收改为 3 轮：首轮创建，后两轮只提问/总结并禁止写 draft，本轮产出恰好 3 条需求；产品去重逻辑未改，风险记入 L11（不是已修复缺陷）。
 2. `requirement.close` 被同需求 `design.gap` 阻塞，3 次重试后 dead 且不再重建；改为 10 次（work-item 上限），可跨 sibling 排空。
 3. `case_run_sut_context` 预创建行没有 `executor_id`；Prepare/Start 现在给每一行绑定当前 owner executor。
 4. 限流把 `/api/internal/*` 执行器注册/心跳计入，令牌桶被内部流量耗尽；内部路径豁免。
@@ -93,7 +96,7 @@
 见 [known-limitations.md](../acceptance/p8/known-limitations.md)：
 
 - D1 SLO 不测；D2 安全审计不做；D3 fake-LLM 回归不做；D4 性能基准不做；D5 Docker 不实跑（静态校验）。
-- L11 Curator 重复 draft；L12 视觉 inconclusive 无 P8 waiver；L13 close 重试上限；L14 真实 LLM 自由文本步骤；L15 一次性 DB 缺 code repo/报告对象。
+- L11 Curator 重复 draft（3 轮验收未触发但未修产品）；L12 视觉 inconclusive 无 P8 waiver；L13 close 重试上限；L14 真实 LLM 自由文本步骤；L15 一次性 DB 缺 code repo/报告对象；L16 pinned facts 为 0；L17 长执行 12 例/2 波未覆盖；L18 resilience teardown 挂起。
 - 多副本限流仍为实例级，文档写明总速率=副本数×限额。
 - Docker Compose 仅静态校验，不宣称运行。
 

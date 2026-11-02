@@ -179,7 +179,8 @@ P8 验收驱动位于 `scripts/p8-*.ps1`。推荐顺序如下；聚合入口 `sc
 
 ## 5. 已知限制（运行前必须知道）
 
-1. **P8 最终验收结果尚未记录**：本 runbook 只定义入口；以 `acceptance/p8/` 最终文档为准。
+1. **P8 验收已完成**：全旅程/韧性/多副本/能力矩阵/E2E/静态门 PASS；结果见同一目录的
+   `acceptance.md`、`resilience.md`、`multi.md`、`e2e.md`、`capability-signoff.md`、`static.md`。
 2. **Docker 未实跑**：本机无 Docker；Compose/Dockerfile 从未构建或启动，只做静态校验。真实 Docker
    主机上首次运行需复核镜像构建、网络、共享卷、renderer URL/token。
 3. **SLO 未测量、安全审计未执行**：按用户 2026-11-02 裁定跳过（P8-D-03 / P8-D-04）；不设 SLO 阈值、

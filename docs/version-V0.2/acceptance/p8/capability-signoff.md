@@ -1,6 +1,6 @@
 # EzTest 0.2 P8 能力矩阵签字（S11）
 
-> 状态：**待 Lead 复跑 S11 并签字**（37 行检查表与证据指针已完备；本文件不替代 P8 S1–S6 运行记录）
+> 状态：**Lead 已复跑 S11 并签字**（PASS=28 / PASS(prior)=9 / FAIL=0，exit 0；37 行检查表与证据指针见下）
 > 日期：2026-11-02
 > 分支：`feat/v0.2-p8`
 > 依据：实施 spec [§11.5](../../../superpowers/specs/2026-11-02-eztest-v02-p8-hardening-acceptance-design.md)；[能力矩阵 §3](../../research/capability-matrix.md)；[P6 capability-parity](../p6/capability-parity.md)；[P7 acceptance](../p7/acceptance.md)；[openapi.yaml](../../contracts/openapi.yaml)

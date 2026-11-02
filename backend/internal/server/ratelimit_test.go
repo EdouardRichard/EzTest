@@ -4,8 +4,11 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
+
+	"github.com/EdouardRichard/EzTest/backend/internal/config"
 )
 
 type fakeLimitSettings struct {
@@ -105,5 +108,35 @@ func TestRateLimitReadsSettingPerRequest(t *testing.T) {
 	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/versions", nil))
 	if recorder.Code != http.StatusNoContent {
 		t.Fatalf("disabled limit still rejected: %d", recorder.Code)
+	}
+}
+
+func TestRateLimit429KeepsCORSHeaders(t *testing.T) {
+	settings := &fakeLimitSettings{limit: 1}
+	cors := CORS(config.Config{WebPort: 6868})
+	handler := cors(RateLimit(settings)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})))
+	request := func() *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/versions", nil)
+		req.Header.Set("Origin", "http://localhost:6868")
+		handler.ServeHTTP(recorder, req)
+		return recorder
+	}
+	_ = request()
+	recorder := request()
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d", recorder.Code)
+	}
+	if recorder.Header().Get("Access-Control-Allow-Origin") != "http://localhost:6868" {
+		t.Fatalf("429 missing CORS origin: %q", recorder.Header().Get("Access-Control-Allow-Origin"))
+	}
+	expose := recorder.Header().Get("Access-Control-Expose-Headers")
+	if !strings.Contains(expose, "Retry-After") || !strings.Contains(expose, "X-RateLimit-Limit") {
+		t.Fatalf("429 CORS expose headers = %q", expose)
+	}
+	if recorder.Header().Get("Retry-After") == "" {
+		t.Fatal("429 missing Retry-After")
 	}
 }

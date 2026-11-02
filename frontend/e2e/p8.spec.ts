@@ -668,7 +668,17 @@ async function snapViewport(page: Page, name: string): Promise<void> {
 /** Element screenshot for a specific panel. */
 async function snapElement(locator: Locator, name: string): Promise<void> {
   fs.mkdirSync(SCREENSHOT_DIR, { recursive: true })
-  await locator.screenshot({ path: nextShot(name) })
+  // Polling-driven React pages can replace the matched node while Playwright is
+  // scrolling for the screenshot. The locator is lazy, so retry re-resolves it.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await locator.screenshot({ path: nextShot(name) })
+      return
+    } catch (cause) {
+      if (attempt === 2) throw cause
+      await new Promise((resolve) => setTimeout(resolve, 300))
+    }
+  }
 }
 
 async function downloadReportFile(
@@ -1259,6 +1269,7 @@ test("reports tab downloads the generated PDF and HTML", async ({ page }) => {
     await expect(page.getByTestId("reports-tab")).toBeVisible()
     await expect(page.getByTestId("report-list")).toBeVisible()
     await snapFull(page, "reports-empty")
+    test.skip(true, "no report revision with rendered PDF/HTML was discovered")
     return
   }
 
