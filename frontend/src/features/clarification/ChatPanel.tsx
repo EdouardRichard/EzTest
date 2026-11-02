@@ -8,6 +8,7 @@ import { cn } from "@/components/ui/cn"
 import { EmptyState } from "@/components/ui/EmptyState"
 import { ErrorState } from "@/components/ui/ErrorState"
 import { LoadingCard } from "@/components/ui/Spinner"
+import type { ConversationModel } from "@/features/conversation/api"
 import { ModelSelector } from "@/features/conversation/ModelSelector"
 import { formatRelativeTime } from "@/lib/format"
 import type { SSEStatus } from "@/lib/sse-client"
@@ -33,6 +34,8 @@ export type ChatPanelProps = {
   /** Current `agent.activity` text. */
   activity?: string | null
   sseStatus?: SSEStatus
+  /** Fired after a successful conversation model PATCH. */
+  onConversationModelChanged?: (conversation: ConversationModel) => void
 }
 
 /**
@@ -52,6 +55,7 @@ export function ChatPanel({
   liveMessages = [],
   activity = null,
   sseStatus = "connecting",
+  onConversationModelChanged,
 }: ChatPanelProps) {
   const [historyOpen, setHistoryOpen] = useState(false)
   const { messages, loading, error, reload, send, sendError } = useConversation({
@@ -82,6 +86,7 @@ export function ChatPanel({
               versionId={versionId}
               conversationId={conversationId}
               modelOverride={active?.model_override ?? null}
+              onModelChanged={onConversationModelChanged}
             />
           )}
           <span data-testid="sse-status" className="text-[10px] text-muted-foreground">

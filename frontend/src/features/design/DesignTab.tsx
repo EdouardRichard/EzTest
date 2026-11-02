@@ -17,6 +17,7 @@ import { ErrorState, InlineError } from "@/components/ui/ErrorState"
 import { LoadingCard } from "@/components/ui/Spinner"
 import type { ConversationMessage, ConversationSummary } from "@/features/clarification/types"
 import { useVersionEvents } from "@/features/clarification/useVersionEvents"
+import type { ConversationModel } from "@/features/conversation/api"
 import { AutoDesignSwitch } from "./AutoDesignSwitch"
 import {
   confirmCases,
@@ -346,6 +347,25 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
     )
   }, [])
 
+  /**
+   * Keep the workspace conversation summaries in sync after the chat model
+   * selector persists an override: collapsing/expanding the chat remounts the
+   * keyed selector, which must reseed from the updated summary.
+   */
+  const applyConversationModel = useCallback((updated: ConversationModel) => {
+    setConversations((current) =>
+      current.map((conversation) =>
+        conversation.id === updated.id
+          ? {
+              ...conversation,
+              model_override: updated.model_override,
+              effective_model: updated.effective_model,
+            }
+          : conversation,
+      ),
+    )
+  }, [])
+
   const toggleChatCollapsed = useCallback(() => setChatCollapsed((value) => !value), [])
 
   // The version page is not a flex column, so the workspace measures the space
@@ -534,6 +554,7 @@ export function DesignTab({ versionId, initialCaseId, initialConversationId }: D
             refreshToken={teamRoomToken}
             collapsed={chatCollapsed}
             onToggleCollapsed={toggleChatCollapsed}
+            onConversationModelChanged={applyConversationModel}
           />
         </div>
 

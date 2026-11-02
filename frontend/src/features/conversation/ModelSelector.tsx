@@ -4,7 +4,12 @@ import { useEffect, useState } from "react"
 import { cn } from "@/components/ui/cn"
 import { Select } from "@/components/ui/Select"
 
-import { listPublicModels, type PublicModel, updateConversationModel } from "./api"
+import {
+  type ConversationModel,
+  listPublicModels,
+  type PublicModel,
+  updateConversationModel,
+} from "./api"
 
 export type ModelSelectorProps = {
   versionId: string
@@ -14,6 +19,12 @@ export type ModelSelectorProps = {
   modelOverride?: string | null
   /** The composer draft contains images, so non-vision models are gated. */
   draftHasImages?: boolean
+  /**
+   * Fired after a successful PATCH with the server's canonical view, so the
+   * parent conversation summary stays in sync and a remounted selector reseeds
+   * from the new override.
+   */
+  onModelChanged?: (conversation: ConversationModel) => void
   className?: string
 }
 
@@ -22,18 +33,31 @@ function errorMessage(cause: unknown): string {
   return "模型切换失败，请重试"
 }
 
+type InitialSelection = {
+  value: string
+  /** Stored override the catalog no longer offers as a selectable model. */
+  unavailable: string | null
+}
+
 /**
  * Resolves the initial selection: the conversation override when it still names
  * a selectable model, otherwise the LLM configuration's explicit
- * `default_model_id`. It must never fall back to `models[0]` (D24).
+ * `default_model_id`. It must never fall back to `models[0]` (D24). An override
+ * that is no longer selectable stays visible and disabled instead of silently
+ * reverting to the default: the conversation is still pinned to it, so the user
+ * has to pick a new model deliberately.
  */
-function initialModel(models: PublicModel[], override: string | null | undefined): string {
+function initialSelection(
+  models: PublicModel[],
+  override: string | null | undefined,
+): InitialSelection {
   const value = override?.trim() ?? ""
   if (value !== "") {
     const match = models.find((model) => model.model === value && !model.deprecated)
-    if (match !== undefined) return match.model
+    if (match !== undefined) return { value: match.model, unavailable: null }
+    return { value, unavailable: value }
   }
-  return models.find((model) => model.default)?.model ?? ""
+  return { value: models.find((model) => model.default)?.model ?? "", unavailable: null }
 }
 
 function optionLabel(model: PublicModel): string {
@@ -53,10 +77,12 @@ export function ModelSelector({
   conversationId,
   modelOverride = null,
   draftHasImages = false,
+  onModelChanged,
   className,
 }: ModelSelectorProps) {
   const [models, setModels] = useState<PublicModel[] | null>(null)
   const [selected, setSelected] = useState("")
+  const [unavailable, setUnavailable] = useState<string | null>(null)
   const [switching, setSwitching] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -69,17 +95,21 @@ export function ModelSelector({
     if (conversationId === null) {
       setModels(null)
       setError(null)
+      setUnavailable(null)
       return () => {
         cancelled = true
       }
     }
     setModels(null)
     setError(null)
+    setUnavailable(null)
     void listPublicModels().then(
       (items) => {
         if (cancelled) return
+        const selection = initialSelection(items, modelOverride)
         setModels(items)
-        setSelected(initialModel(items, modelOverride))
+        setSelected(selection.value)
+        setUnavailable(selection.unavailable)
       },
       (cause: unknown) => {
         if (!cancelled) setError(errorMessage(cause))
@@ -99,7 +129,13 @@ export function ModelSelector({
     setError(null)
     setSwitching(true)
     try {
-      await updateConversationModel(versionId, conversationId, next)
+      const updated = await updateConversationModel(versionId, conversationId, next)
+      // Publish the server's canonical value to the parent summary: the keyed
+      // selector is remounted on a conversation switch or a collapse/expand and
+      // must reseed from the persisted override rather than the stale prop.
+      setSelected(updated.model_override ?? next)
+      setUnavailable(null)
+      onModelChanged?.(updated)
     } catch (cause) {
       // No silent switch: put the control back and surface the reason.
       setSelected(previous)
@@ -141,6 +177,11 @@ export function ModelSelector({
               未配置默认模型
             </option>
           ) : null}
+          {unavailable !== null && unavailable === selected ? (
+            <option value={unavailable} disabled>
+              {unavailable}（不可用，请重新选择）
+            </option>
+          ) : null}
           {models.map((model) => {
             const visionGated = draftHasImages && !model.capabilities.supports_vision
             return (
@@ -155,6 +196,11 @@ export function ModelSelector({
       </div>
       {visionBlocked ? (
         <p className="text-[10px] text-warning">当前草稿含图片，请选择支持视觉的模型</p>
+      ) : null}
+      {unavailable !== null ? (
+        <p role="alert" className="text-[10px] text-destructive">
+          会话保存的模型“{unavailable}”当前不可用，请重新选择模型
+        </p>
       ) : null}
       {error !== null ? (
         <p role="alert" className="text-[10px] text-destructive">

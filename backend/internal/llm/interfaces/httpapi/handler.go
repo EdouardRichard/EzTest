@@ -310,15 +310,26 @@ func (h *Handler) ListModels(w http.ResponseWriter, r *http.Request) {
 // ListPublicModels GET /api/llm/models.
 //
 // The login-user model catalog backs the conversation model selector. Only
-// models of an active LLM configuration that are themselves enabled and not
-// deprecated are returned (spec §7.3/§9.1); deprecated rows stay in the admin
-// catalog for display but can never be selected for a run. The response carries
-// the 0.2.1 capability set and the config's default marker, and never any
-// gateway credential or base URL.
+// models of the unique active *default* LLM configuration that are themselves
+// enabled and not deprecated are returned (spec §7.3/§9.1); deprecated rows
+// stay in the admin catalog for display but can never be selected for a run.
+// Restricting the catalog to the default configuration is what keeps it
+// consistent with the conversation override resolver, which resolves only that
+// configuration: another active configuration's models would be advertised but
+// every PATCH naming them would be rejected. The response carries the 0.2.1
+// capability set and the config's default marker, and never any gateway
+// credential or base URL.
 func (h *Handler) ListPublicModels(w http.ResponseWriter, r *http.Request) {
 	configs, err := h.svc.ListConfigs(r.Context())
 	if err != nil {
 		httpx.Error(w, r, err)
+		return
+	}
+	defaultConfig, ok := activeDefaultConfig(configs)
+	if !ok {
+		// No active default configuration is selectable, so the catalog is
+		// empty (matching the override resolver, which has no target config).
+		httpx.JSON(w, http.StatusOK, []publicModelDTO{})
 		return
 	}
 	models, err := h.svc.ListModels(r.Context())
@@ -326,21 +337,30 @@ func (h *Handler) ListPublicModels(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
-	active := make(map[int64]llm.Config, len(configs))
-	for _, cfg := range configs {
-		if cfg.Status == llm.StatusActive {
-			active[cfg.ID] = cfg
-		}
-	}
 	items := make([]publicModelDTO, 0, len(models))
 	for _, model := range models {
-		cfg, ok := active[model.ConfigID]
-		if !ok || !model.Selectable() {
+		if model.ConfigID != defaultConfig.ID || !model.Selectable() {
 			continue
 		}
-		items = append(items, toPublicModelDTO(model, cfg))
+		items = append(items, toPublicModelDTO(model, defaultConfig))
 	}
 	httpx.JSON(w, http.StatusOK, items)
+}
+
+// activeDefaultConfig mirrors the application's selectConfig(0): the unique
+// is_default configuration must be active to be usable. First match wins, like
+// the service, so the catalog and the override resolver always agree.
+func activeDefaultConfig(configs []llm.Config) (llm.Config, bool) {
+	for _, cfg := range configs {
+		if !cfg.IsDefault {
+			continue
+		}
+		if cfg.Status != llm.StatusActive {
+			return llm.Config{}, false
+		}
+		return cfg, true
+	}
+	return llm.Config{}, false
 }
 
 func requireActor(w http.ResponseWriter, r *http.Request) (int64, bool) {

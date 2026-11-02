@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import "@testing-library/jest-dom/vitest"
 
@@ -23,6 +23,14 @@ const api = vi.hoisted(() => ({
 }))
 vi.mock("./api", () => api)
 
+// The header model selector talks to the login-user model catalog; mock it so
+// the workspace never issues a real request and the switch can be asserted.
+const conversationApi = vi.hoisted(() => ({
+  listPublicModels: vi.fn(),
+  updateConversationModel: vi.fn(),
+}))
+vi.mock("@/features/conversation/api", () => conversationApi)
+
 const versionsApi = vi.hoisted(() => ({ getVersion: vi.fn() }))
 vi.mock("@/features/versions/api", () => versionsApi)
 
@@ -45,11 +53,78 @@ vi.mock("./useVersionEvents", () => ({
 import { RequirementsTab } from "./RequirementsTab"
 import { requirementSecondFixture } from "./test-fixtures"
 
+const publicModels = [
+  {
+    id: "8102",
+    config_id: "7101",
+    config_name: "Primary",
+    model: "vision-plus",
+    display_name: "Vision Plus",
+    context_window: 128000,
+    capabilities: {
+      supports_tools: true,
+      supports_vision: true,
+      supports_reasoning: true,
+      supports_prompt_cache: true,
+      context_window: 128000,
+    },
+    default: false,
+    deprecated: false,
+  },
+  {
+    id: "8101",
+    config_id: "7101",
+    config_name: "Primary",
+    model: "gpt-4o",
+    display_name: "GPT-4o",
+    context_window: 128000,
+    capabilities: {
+      supports_tools: true,
+      supports_vision: true,
+      supports_reasoning: true,
+      supports_prompt_cache: true,
+      context_window: 128000,
+    },
+    // Deliberately not models[0]: the selector must use the explicit default.
+    default: true,
+    deprecated: false,
+  },
+]
+
+const conversationFixtures = [
+  {
+    id: "4001",
+    kind: "clarification",
+    title: "退款规则澄清",
+    status: "active",
+    message_count: 2,
+    last_message_at: "2026-10-31T10:00:00Z",
+    created_at: "2026-10-31T10:00:00Z",
+  },
+  {
+    id: "4002",
+    kind: "clarification",
+    title: "退款时效澄清",
+    status: "active",
+    message_count: 1,
+    last_message_at: "2026-10-30T16:00:00Z",
+    created_at: "2026-10-30T16:00:00Z",
+  },
+]
+
 describe("RequirementsTab shell", () => {
   beforeEach(() => {
     for (const fn of Object.values(api)) fn.mockReset()
     versionsApi.getVersion.mockReset()
     navigation.replace.mockReset()
+    conversationApi.listPublicModels.mockReset()
+    conversationApi.updateConversationModel.mockReset()
+    conversationApi.listPublicModels.mockResolvedValue(publicModels)
+    conversationApi.updateConversationModel.mockResolvedValue({
+      id: "4001",
+      model_override: "vision-plus",
+      effective_model: "vision-plus",
+    })
     api.listConversations.mockResolvedValue([])
     api.listRequirements.mockResolvedValue([])
     api.listMessages.mockResolvedValue([])
@@ -147,5 +222,33 @@ describe("RequirementsTab shell", () => {
     render(<RequirementsTab versionId="2001" />)
 
     expect(await screen.findByTestId("design-cta")).toHaveTextContent("4 条需求待设计")
+  })
+
+  it("keeps a switched model when leaving and returning to the conversation", async () => {
+    api.listConversations.mockResolvedValue(conversationFixtures)
+
+    render(<RequirementsTab versionId="2001" />)
+
+    const select = await screen.findByTestId("model-selector")
+    expect(select).toHaveValue("gpt-4o")
+    fireEvent.change(select, { target: { value: "vision-plus" } })
+    await waitFor(() =>
+      expect(conversationApi.updateConversationModel).toHaveBeenCalledWith(
+        "2001",
+        "4001",
+        "vision-plus",
+      ),
+    )
+    await waitFor(() => expect(select).toHaveValue("vision-plus"))
+
+    // Leave the conversation and return: the keyed selector remounts, so it can
+    // only keep the switch if the workspace state now carries the new override.
+    fireEvent.click(screen.getByRole("button", { name: "历史对话" }))
+    fireEvent.click(screen.getByRole("button", { name: /退款时效澄清/ }))
+    await waitFor(() => expect(screen.getByTestId("model-selector")).toHaveValue("gpt-4o"))
+
+    fireEvent.click(screen.getByRole("button", { name: "历史对话" }))
+    fireEvent.click(screen.getByRole("button", { name: /退款规则澄清/ }))
+    await waitFor(() => expect(screen.getByTestId("model-selector")).toHaveValue("vision-plus"))
   })
 })

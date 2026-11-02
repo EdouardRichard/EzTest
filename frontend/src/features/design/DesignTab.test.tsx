@@ -37,6 +37,14 @@ const clarificationApi = vi.hoisted(() => ({
 }))
 vi.mock("@/features/clarification/api", () => clarificationApi)
 
+// The design chat header mounts the login-user model selector; mock its API so
+// the switch and the collapse/expand remount can be asserted without a request.
+const conversationApi = vi.hoisted(() => ({
+  listPublicModels: vi.fn(),
+  updateConversationModel: vi.fn(),
+}))
+vi.mock("@/features/conversation/api", () => conversationApi)
+
 const versionsApi = vi.hoisted(() => ({ updateVersion: vi.fn() }))
 vi.mock("@/features/versions/api", () => versionsApi)
 
@@ -57,6 +65,44 @@ const designConversation: ConversationSummary = {
   last_message_at: TIMESTAMP,
   created_at: TIMESTAMP,
 }
+
+const publicModels = [
+  {
+    id: "8102",
+    config_id: "7101",
+    config_name: "Primary",
+    model: "vision-plus",
+    display_name: "Vision Plus",
+    context_window: 128000,
+    capabilities: {
+      supports_tools: true,
+      supports_vision: true,
+      supports_reasoning: true,
+      supports_prompt_cache: true,
+      context_window: 128000,
+    },
+    default: false,
+    deprecated: false,
+  },
+  {
+    id: "8101",
+    config_id: "7101",
+    config_name: "Primary",
+    model: "gpt-4o",
+    display_name: "GPT-4o",
+    context_window: 128000,
+    capabilities: {
+      supports_tools: true,
+      supports_vision: true,
+      supports_reasoning: true,
+      supports_prompt_cache: true,
+      context_window: 128000,
+    },
+    // Deliberately not models[0]: the selector must use the explicit default.
+    default: true,
+    deprecated: false,
+  },
+]
 
 function mockWorkspace(graph: DesignGraph = designGraphFixture) {
   api.getDesignGraph.mockResolvedValue(graph)
@@ -84,6 +130,14 @@ describe("DesignTab", () => {
     for (const fn of Object.values(clarificationApi)) fn.mockReset()
     versionsApi.updateVersion.mockReset()
     navigation.replace.mockReset()
+    conversationApi.listPublicModels.mockReset()
+    conversationApi.updateConversationModel.mockReset()
+    conversationApi.listPublicModels.mockResolvedValue(publicModels)
+    conversationApi.updateConversationModel.mockResolvedValue({
+      id: "4009",
+      model_override: "vision-plus",
+      effective_model: "vision-plus",
+    })
     clarificationApi.listMessages.mockResolvedValue([])
     clarificationApi.getTeamRoom.mockResolvedValue({
       team: "design",
@@ -254,6 +308,30 @@ describe("DesignTab", () => {
     fireEvent.click(screen.getByTestId("design-chat-new-conversation"))
 
     expect(api.createDesignConversation).toHaveBeenCalledWith("2001")
+  })
+
+  it("keeps a switched model after collapsing and expanding the chat", async () => {
+    render(<DesignTab versionId="2001" />)
+
+    const select = await screen.findByTestId("model-selector")
+    expect(select).toHaveValue("gpt-4o")
+    fireEvent.change(select, { target: { value: "vision-plus" } })
+    await waitFor(() =>
+      expect(conversationApi.updateConversationModel).toHaveBeenCalledWith(
+        "2001",
+        "4009",
+        "vision-plus",
+      ),
+    )
+    await waitFor(() => expect(select).toHaveValue("vision-plus"))
+
+    // Collapsing the chat unmounts the selector; expanding remounts it from the
+    // workspace conversation state, which must already carry the new override.
+    fireEvent.click(screen.getByTestId("design-chat-collapse-toggle"))
+    expect(screen.queryByTestId("model-selector")).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByTestId("design-chat-collapse-toggle"))
+    await waitFor(() => expect(screen.getByTestId("model-selector")).toHaveValue("vision-plus"))
   })
 
   it("fills the design composer from the case '请求修改' action without sending", async () => {

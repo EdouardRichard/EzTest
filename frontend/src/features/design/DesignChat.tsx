@@ -18,6 +18,7 @@ import type {
   NewMessagePart,
 } from "@/features/clarification/types"
 import { useConversation } from "@/features/clarification/useConversation"
+import type { ConversationModel } from "@/features/conversation/api"
 import { ModelSelector } from "@/features/conversation/ModelSelector"
 import { formatRelativeTime } from "@/lib/format"
 import type { SSEStatus } from "@/lib/sse-client"
@@ -46,6 +47,8 @@ export type DesignChatProps = {
   collapsed?: boolean
   /** Collapse state is owned by DesignTab so the divider split can react. */
   onToggleCollapsed?: () => void
+  /** Fired after a successful conversation model PATCH. */
+  onConversationModelChanged?: (conversation: ConversationModel) => void
 }
 
 /**
@@ -70,6 +73,7 @@ export function DesignChat({
   refreshToken = 0,
   collapsed = false,
   onToggleCollapsed,
+  onConversationModelChanged,
 }: DesignChatProps) {
   const [historyOpen, setHistoryOpen] = useState(false)
   const { messages, loading, error, reload, send, sendError } = useConversation({
@@ -116,6 +120,7 @@ export function DesignChat({
                   versionId={versionId}
                   conversationId={activeConversationId}
                   modelOverride={active?.model_override ?? null}
+                  onModelChanged={onConversationModelChanged}
                 />
               )}
               <span data-testid="design-sse-status" className="text-[10px] text-muted-foreground">

@@ -6,6 +6,7 @@ import { useCallback, useEffect, useMemo, useState } from "react"
 import { cn } from "@/components/ui/cn"
 import { ErrorState, InlineError } from "@/components/ui/ErrorState"
 import { LoadingCard } from "@/components/ui/Spinner"
+import type { ConversationModel } from "@/features/conversation/api"
 import { getVersion } from "@/features/versions/api"
 import type { Version } from "@/features/versions/types"
 
@@ -289,6 +290,25 @@ export function RequirementsTab({
     void loadVersion().catch(() => {})
   }
 
+  /**
+   * Keep the workspace conversation summaries in sync after the header model
+   * selector persists an override: the keyed selector is remounted when the
+   * user switches conversations, so it must reseed from the updated summary.
+   */
+  function conversationModelChanged(updated: ConversationModel): void {
+    setConversations((current) =>
+      current.map((conversation) =>
+        conversation.id === updated.id
+          ? {
+              ...conversation,
+              model_override: updated.model_override,
+              effective_model: updated.effective_model,
+            }
+          : conversation,
+      ),
+    )
+  }
+
   if (loading) {
     return <LoadingCard label="正在加载澄清工作区…" />
   }
@@ -327,6 +347,7 @@ export function RequirementsTab({
           liveMessages={liveMessages}
           activity={activity}
           sseStatus={sseStatus}
+          onConversationModelChanged={conversationModelChanged}
         />
 
         <div className="flex min-w-0 flex-col gap-3">
