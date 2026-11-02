@@ -2,6 +2,7 @@ package llmapp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -70,11 +71,22 @@ type ToolCall struct {
 
 // ChatMessage is one OpenAI-compatible transcript message. Assistant messages
 // may carry ToolCalls; tool messages carry the ToolCallID they answer.
+//
+// ReasoningContent is the provider's thinking text for an assistant turn. It
+// must be replayed on later turns for reasoning models that require it
+// (spec §7.2): the adapter emits it only when non-empty.
+//
+// ReasoningItems carries opaque provider-issued reasoning output items (OpenAI
+// Responses). The Responses adapter replays them verbatim before the matching
+// tool calls because the wire item (id/summary/encrypted content) cannot be
+// reconstructed from text alone. It is nil for chat-completions turns.
 type ChatMessage struct {
-	Role       string
-	Content    string
-	ToolCalls  []ToolCall
-	ToolCallID string
+	Role             string
+	Content          string
+	ToolCalls        []ToolCall
+	ToolCallID       string
+	ReasoningContent string
+	ReasoningItems   []json.RawMessage
 }
 
 // ToolDefinition is one OpenAI function tool exposed to the model.
@@ -94,11 +106,17 @@ type ChatRequest struct {
 }
 
 // ChatResponse is the normalized assistant turn returned by the upstream.
+// ReasoningContent captures the provider thinking text (chat completions
+// reasoning_content / Responses reasoning summary) so the runner can replay it
+// on the next turn (spec §7.2). ReasoningItems keeps the opaque Responses
+// reasoning items for the same replay.
 type ChatResponse struct {
-	Content      string
-	ToolCalls    []ToolCall
-	Usage        map[string]int
-	FinishReason string
+	Content          string
+	ReasoningContent string
+	ReasoningItems   []json.RawMessage
+	ToolCalls        []ToolCall
+	Usage            map[string]int
+	FinishReason     string
 }
 
 // Delta is one normalized streaming chunk emitted by an Adapter. Usually one
@@ -194,9 +212,14 @@ func (s *Service) ResolveModel(ctx context.Context, cfgID int64, modelID string,
 		return ModelInfo{}, err
 	}
 	requirements := append([]ModelRequirements(nil), required...)
-	if cfg.EffectiveThinkingType() == llm.ThinkingTypeEnabled {
-		// An enabled thinking mode needs a reasoning-capable model; the caller
-		// does not have to pass this requirement itself.
+	if err := validateThinkingSettings(cfg); err != nil {
+		return ModelInfo{}, err
+	}
+	// Both adapters forward any non-none reasoning effort, independent of the
+	// thinking mode, so an explicit effort also requires a reasoning-capable
+	// model (spec §7.2/§7.3).
+	if cfg.EffectiveThinkingType() == llm.ThinkingTypeEnabled ||
+		cfg.EffectiveReasoningEffort() != llm.ReasoningEffortNone {
 		requirements = append(requirements, ModelRequirements{Reasoning: true})
 	}
 	if err := validateModelCapabilities(chosen, requirements...); err != nil {
@@ -204,20 +227,48 @@ func (s *Service) ResolveModel(ctx context.Context, cfgID int64, modelID string,
 	}
 	capabilities := chosen.EffectiveCapabilities()
 	return ModelInfo{
-		ConfigID:      chosen.ConfigID,
-		ModelID:       chosen.ID,
-		Model:         chosen.Model,
-		ContextWindow: chosen.ContextWindow,
+		ConfigID: chosen.ConfigID,
+		ModelID:  chosen.ID,
+		Model:    chosen.Model,
+		// The structured capability set is authoritative; EffectiveCapabilities
+		// falls back to the legacy llm_model.context_window column.
+		ContextWindow: capabilities.ContextWindow,
 		MaxOutput:     chosen.MaxOutput,
 		SupportsTools: capabilities.SupportsTools,
 		Capabilities:  capabilities,
 	}, nil
 }
 
+// validateThinkingSettings rejects the contradictory combination of disabled
+// thinking with a non-none reasoning effort: "disabled" asks the provider not
+// to think while the effort asks it to tune reasoning. Resolution fails with the
+// stable non-retryable configuration error instead of forwarding both; the
+// stored pair is left for the operator to fix (spec §7.4).
+func validateThinkingSettings(cfg llm.Config) error {
+	effort := cfg.EffectiveReasoningEffort()
+	if cfg.EffectiveThinkingType() != llm.ThinkingTypeDisabled || effort == llm.ReasoningEffortNone {
+		return nil
+	}
+	return &platform.Error{
+		Status: 400,
+		Code:   CodeLLMConfigInvalid,
+		Message: fmt.Sprintf(
+			"thinking_type=disabled cannot be combined with reasoning_effort=%q; set reasoning_effort=none or enable thinking",
+			effort),
+		Details: map[string]any{
+			"thinking_type":    llm.ThinkingTypeDisabled,
+			"reasoning_effort": effort,
+		},
+	}
+}
+
 // Chat performs one completion against the default OpenAI-compatible upstream.
 func (s *Service) Chat(ctx context.Context, req ChatRequest) (ChatResponse, error) {
 	cfg, chosen, err := s.resolveChatTarget(ctx, 0, req.Model)
 	if err != nil {
+		return ChatResponse{}, err
+	}
+	if err := validateThinkingSettings(cfg); err != nil {
 		return ChatResponse{}, err
 	}
 	if s.settings != nil {

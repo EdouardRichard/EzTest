@@ -250,6 +250,16 @@ func buildResponsesPayload(cfg llm.Config, req llmapp.ChatRequest, stream bool) 
 				Output: message.Content,
 			})
 		case "assistant":
+			// Provider-issued reasoning items must be replayed verbatim before
+			// the matching function calls when the caller manually manages the
+			// context (spec §7.2); the wire item carries the provider id and
+			// encrypted content that cannot be reconstructed from text.
+			for _, item := range message.ReasoningItems {
+				if len(item) == 0 {
+					continue
+				}
+				payload.Input = append(payload.Input, item)
+			}
 			if message.Content != "" {
 				payload.Input = append(payload.Input, responsesMessageItem{Role: "assistant", Content: message.Content})
 			}
@@ -318,13 +328,28 @@ func parseResponsesResponse(raw []byte, cfg llm.Config, names *toolNameMapping) 
 	return response, nil
 }
 
-// normalizeResponsesResponse flattens output items into text plus tool calls and
-// reports whether the payload carried any usable assistant turn.
+// normalizeResponsesResponse flattens output items into text, reasoning text
+// and tool calls, and reports whether the payload carried any usable assistant
+// turn. Reasoning items are preserved twice: their readable summary/text is
+// normalized into ReasoningContent and the opaque provider item is kept in
+// ReasoningItems so buildResponsesPayload can replay it verbatim (spec §7.2).
 func normalizeResponsesResponse(payload responsesResponsePayload, names *toolNameMapping) (llmapp.ChatResponse, bool) {
 	response := llmapp.ChatResponse{}
 	empty := true
-	for _, item := range payload.Output {
+	for _, rawItem := range payload.Output {
+		var item responsesOutputItem
+		if err := json.Unmarshal(rawItem, &item); err != nil {
+			continue
+		}
 		switch item.Type {
+		case "reasoning":
+			if text := responsesReasoningText(item); text != "" {
+				if response.ReasoningContent != "" {
+					response.ReasoningContent += "\n"
+				}
+				response.ReasoningContent += text
+			}
+			response.ReasoningItems = append(response.ReasoningItems, append(json.RawMessage(nil), rawItem...))
 		case "message":
 			for _, part := range item.Content {
 				if part.Type == "output_text" && part.Text != "" {
@@ -350,6 +375,34 @@ func normalizeResponsesResponse(payload responsesResponsePayload, names *toolNam
 	}
 	response.FinishReason = responsesFinishReason(payload, len(response.ToolCalls) > 0)
 	return response, empty
+}
+
+// responsesReasoningText extracts the readable reasoning text of one Responses
+// reasoning item: the summary parts when present, otherwise the raw
+// reasoning_text content parts.
+func responsesReasoningText(item responsesOutputItem) string {
+	var builder strings.Builder
+	appendPart := func(text string) {
+		if text == "" {
+			return
+		}
+		if builder.Len() > 0 {
+			builder.WriteByte('\n')
+		}
+		builder.WriteString(text)
+	}
+	for _, part := range item.Summary {
+		appendPart(part.Text)
+	}
+	if builder.Len() > 0 {
+		return builder.String()
+	}
+	for _, part := range item.Content {
+		if part.Type == "reasoning_text" || part.Type == "text" {
+			appendPart(part.Text)
+		}
+	}
+	return builder.String()
 }
 
 // responsesFinishReason maps the Responses status to the chat-completions
@@ -611,8 +664,9 @@ type responsesResponsePayload struct {
 	Status            string                `json:"status"`
 	Error             *responsesErrorDetail `json:"error"`
 	IncompleteDetails *responsesIncomplete  `json:"incomplete_details"`
-	Output            []responsesOutputItem `json:"output"`
-	Usage             *responsesUsage       `json:"usage"`
+	// Output stays raw so reasoning items can be replayed verbatim (spec §7.2).
+	Output []json.RawMessage `json:"output"`
+	Usage  *responsesUsage   `json:"usage"`
 }
 
 type responsesErrorDetail struct {
@@ -633,6 +687,7 @@ type responsesOutputItem struct {
 	ID        string                 `json:"id"`
 	Role      string                 `json:"role"`
 	Content   []responsesContentPart `json:"content"`
+	Summary   []responsesContentPart `json:"summary"`
 	CallID    string                 `json:"call_id"`
 	Name      string                 `json:"name"`
 	Arguments string                 `json:"arguments"`

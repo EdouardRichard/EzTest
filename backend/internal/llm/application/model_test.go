@@ -278,6 +278,138 @@ func TestConfigThinkingSettings(t *testing.T) {
 	}
 }
 
+// TestReasoningEffortRequiresCapability pins spec §7.2/§7.3: both protocol
+// adapters forward any non-none reasoning_effort, so resolution must require a
+// reasoning-capable model even when thinking_type is auto (the mode and the
+// effort are independent settings).
+func TestReasoningEffortRequiresCapability(t *testing.T) {
+	ctx := context.Background()
+	svc, repo := newChatTestService(t, &fakeChatGateway{}, nil)
+	cfg := seedDefaultConfig(repo, 11)
+	cfg.ThinkingType = llm.ThinkingTypeAuto
+	cfg.ReasoningEffort = llm.ReasoningEffortHigh
+	repo.configs[7] = cfg
+	repo.models[11] = chatTestModel(11, 7, "plain-llm", 64000, 8192)
+
+	_, err := svc.ResolveModel(ctx, 0, "")
+	apiErr := apiError(t, err)
+	if apiErr.Status != 400 || apiErr.Code != CodeLLMCapabilityMismatch || apiErr.Retryable {
+		t.Fatalf("error = %#v, want non-retryable %s", apiErr, CodeLLMCapabilityMismatch)
+	}
+	if !strings.Contains(strings.ToLower(apiErr.Message), "reasoning") {
+		t.Fatalf("message = %q, want it to name the missing reasoning capability", apiErr.Message)
+	}
+
+	repo.models[11] = capableModel(11, 7, "capable-llm")
+	if _, err := svc.ResolveModel(ctx, 0, ""); err != nil {
+		t.Fatalf("ResolveModel reasoning-capable model: %v", err)
+	}
+}
+
+// TestDisabledThinkingWithEffortRejected pins the contradictory combination:
+// thinking_type=disabled says the provider must not think while a non-none
+// reasoning_effort asks it to tune reasoning. Resolution rejects it as a
+// non-retryable configuration error instead of forwarding both parameters.
+func TestDisabledThinkingWithEffortRejected(t *testing.T) {
+	ctx := context.Background()
+	gateway := &fakeChatGateway{response: ChatResponse{Content: "ok"}}
+	svc, repo := newChatTestService(t, gateway, nil)
+	cfg := seedDefaultConfig(repo, 11)
+	cfg.ThinkingType = llm.ThinkingTypeDisabled
+	cfg.ReasoningEffort = llm.ReasoningEffortHigh
+	repo.configs[7] = cfg
+	// A reasoning-capable model must not rescue the contradiction.
+	repo.models[11] = capableModel(11, 7, "capable-llm")
+
+	_, err := svc.ResolveModel(ctx, 0, "")
+	apiErr := apiError(t, err)
+	if apiErr.Status != 400 || apiErr.Code != CodeLLMConfigInvalid || apiErr.Retryable {
+		t.Fatalf("error = %#v, want non-retryable %s", apiErr, CodeLLMConfigInvalid)
+	}
+	message := strings.ToLower(apiErr.Message)
+	if !strings.Contains(message, "disabled") || !strings.Contains(message, "reasoning_effort") {
+		t.Fatalf("message = %q, want it to name both contradictory settings", apiErr.Message)
+	}
+
+	// Chat follows the same rule and never calls the upstream.
+	if _, err := svc.Chat(ctx, ChatRequest{Messages: []ChatMessage{{Role: "user", Content: "hi"}}}); err == nil {
+		t.Fatal("Chat accepted disabled thinking with a non-none reasoning effort")
+	} else if got := apiError(t, err); got.Code != CodeLLMConfigInvalid {
+		t.Fatalf("chat error = %#v", got)
+	}
+	if gateway.callCount() != 0 {
+		t.Fatalf("gateway calls = %d, want 0", gateway.callCount())
+	}
+
+	// disabled + none is the valid "thinking off" configuration.
+	cfg.ReasoningEffort = llm.ReasoningEffortNone
+	repo.configs[7] = cfg
+	if _, err := svc.ResolveModel(ctx, 0, ""); err != nil {
+		t.Fatalf("ResolveModel disabled+none: %v", err)
+	}
+}
+
+// TestResolveModelUsesCapabilityContextWindow pins the capability-set source of
+// truth: when capabilities.context_window is present it wins over the legacy
+// llm_model.context_window column, and the legacy column is still the fallback
+// for rows that only carry the pre-0.2.1 fields.
+func TestResolveModelUsesCapabilityContextWindow(t *testing.T) {
+	ctx := context.Background()
+	svc, repo := newChatTestService(t, &fakeChatGateway{}, nil)
+	seedDefaultConfig(repo, 11)
+
+	model := chatTestModel(11, 7, "window-llm", 64000, 8192)
+	model.Capabilities.ContextWindow = 200000
+	repo.models[11] = model
+
+	info, err := svc.ResolveModel(ctx, 0, "")
+	if err != nil {
+		t.Fatalf("ResolveModel: %v", err)
+	}
+	if info.ContextWindow != 200000 {
+		t.Fatalf("context window = %d, want the capabilities.context_window value", info.ContextWindow)
+	}
+
+	model.Capabilities.ContextWindow = 0
+	repo.models[11] = model
+	info, err = svc.ResolveModel(ctx, 0, "")
+	if err != nil {
+		t.Fatalf("ResolveModel legacy fallback: %v", err)
+	}
+	if info.ContextWindow != 64000 {
+		t.Fatalf("context window = %d, want the legacy column fallback", info.ContextWindow)
+	}
+}
+
+// TestRefreshModelsEmptyCatalogKeepsCatalog pins the empty-catalog guard: a
+// provider that answers 200 {"data":[]} must not be treated as an authoritative
+// empty catalog, which would deprecate every stored model.
+func TestRefreshModelsEmptyCatalogKeepsCatalog(t *testing.T) {
+	ctx := context.Background()
+	svc, repo, client, _, _ := newTestService(t)
+	cfg, err := svc.CreateConfig(ctx, validCreate(), 1)
+	if err != nil {
+		t.Fatalf("CreateConfig: %v", err)
+	}
+	client.models = []RemoteModel{{ID: "gpt-4o"}}
+	if _, err := svc.RefreshModels(ctx, cfg.ID, 1); err != nil {
+		t.Fatalf("first RefreshModels: %v", err)
+	}
+
+	client.models = []RemoteModel{}
+	if _, err := svc.RefreshModels(ctx, cfg.ID, 1); err == nil {
+		t.Fatal("empty upstream catalog refresh succeeded")
+	}
+
+	models, err := repo.ListModelsByConfig(ctx, cfg.ID)
+	if err != nil {
+		t.Fatalf("ListModelsByConfig: %v", err)
+	}
+	if len(models) != 1 || models[0].Model != "gpt-4o" || models[0].Deprecated {
+		t.Fatalf("catalog after empty refresh = %#v, want the existing model untouched", models)
+	}
+}
+
 func TestDeprecatedModelExcluded(t *testing.T) {
 	ctx := context.Background()
 	svc, repo := newChatTestService(t, &fakeChatGateway{}, nil)

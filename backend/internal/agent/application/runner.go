@@ -736,9 +736,11 @@ func (r *Runner) loop(ctx context.Context, state *runState) (string, error) {
 			return "", err
 		}
 		state.messages = append(state.messages, llmapp.ChatMessage{
-			Role:      "assistant",
-			Content:   response.Content,
-			ToolCalls: response.ToolCalls,
+			Role:             "assistant",
+			Content:          response.Content,
+			ToolCalls:        response.ToolCalls,
+			ReasoningContent: response.ReasoningContent,
+			ReasoningItems:   response.ReasoningItems,
 		})
 
 		if len(response.ToolCalls) == 0 {

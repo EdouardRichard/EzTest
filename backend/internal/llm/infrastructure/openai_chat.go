@@ -222,14 +222,16 @@ func classifyChatFailure(cfg llm.Config, status int, raw []byte) (bool, error) {
 // returned so response tool calls can be restored to the internal names. The
 // chat-completions thinking mapping adds reasoning_effort plus the
 // provider-specific thinking object; the auto/none defaults add no keys so the
-// legacy payload stays byte-compatible.
+// legacy payload stays byte-compatible. Assistant history replays
+// reasoning_content only when the application captured it (spec §7.2).
 func buildChatPayload(cfg llm.Config, req llmapp.ChatRequest) (chatRequestPayload, *toolNameMapping, error) {
 	messages := make([]chatMessagePayload, 0, len(req.Messages))
 	for _, message := range req.Messages {
 		item := chatMessagePayload{
-			Role:       message.Role,
-			Content:    message.Content,
-			ToolCallID: message.ToolCallID,
+			Role:             message.Role,
+			Content:          message.Content,
+			ToolCallID:       message.ToolCallID,
+			ReasoningContent: message.ReasoningContent,
 		}
 		for _, call := range message.ToolCalls {
 			item.ToolCalls = append(item.ToolCalls, chatToolCallPayload{
@@ -290,7 +292,10 @@ func buildChatPayload(cfg llm.Config, req llmapp.ChatRequest) (chatRequestPayloa
 }
 
 // parseChatCompletion decodes a successful OpenAI-compatible completion and
-// maps sanitized function names back to the internal names.
+// maps sanitized function names back to the internal names. reasoning_content
+// is captured so the application can replay it on the next tool turn (spec
+// §7.2); providers that omit it leave the field empty and the history payload
+// omits the key.
 func parseChatCompletion(raw []byte, names *toolNameMapping) (llmapp.ChatResponse, error) {
 	var payload chatCompletionPayload
 	if err := json.Unmarshal(raw, &payload); err != nil {
@@ -300,7 +305,10 @@ func parseChatCompletion(raw []byte, names *toolNameMapping) (llmapp.ChatRespons
 		return llmapp.ChatResponse{}, errors.New("llm provider returned no choices")
 	}
 	choice := payload.Choices[0]
-	response := llmapp.ChatResponse{FinishReason: choice.FinishReason}
+	response := llmapp.ChatResponse{
+		FinishReason:     choice.FinishReason,
+		ReasoningContent: choice.Message.ReasoningContent,
+	}
 	if choice.Message.Content != nil {
 		response.Content = *choice.Message.Content
 	}
@@ -402,16 +410,18 @@ type chatRequestPayload struct {
 }
 
 // chatThinkingPayload is the provider-specific thinking switch used by
-// OpenAI-compatible gateways (for example GLM/Qwen-style endpoints).
+// OpenAI-compatible gateways that accept a thinking object (for example GLM).
+// Qwen uses enable_thinking instead and is not covered by this switch.
 type chatThinkingPayload struct {
 	Type string `json:"type"`
 }
 
 type chatMessagePayload struct {
-	Role       string                `json:"role"`
-	Content    string                `json:"content,omitempty"`
-	ToolCalls  []chatToolCallPayload `json:"tool_calls,omitempty"`
-	ToolCallID string                `json:"tool_call_id,omitempty"`
+	Role             string                `json:"role"`
+	Content          string                `json:"content,omitempty"`
+	ToolCalls        []chatToolCallPayload `json:"tool_calls,omitempty"`
+	ToolCallID       string                `json:"tool_call_id,omitempty"`
+	ReasoningContent string                `json:"reasoning_content,omitempty"`
 }
 
 type chatToolCallPayload struct {
@@ -439,9 +449,10 @@ type chatFunctionDefinition struct {
 type chatCompletionPayload struct {
 	Choices []struct {
 		Message struct {
-			Role      string  `json:"role"`
-			Content   *string `json:"content"`
-			ToolCalls []struct {
+			Role             string  `json:"role"`
+			Content          *string `json:"content"`
+			ReasoningContent string  `json:"reasoning_content"`
+			ToolCalls        []struct {
 				ID       string `json:"id"`
 				Type     string `json:"type"`
 				Function struct {

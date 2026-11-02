@@ -184,6 +184,15 @@ func (s *Service) RefreshModels(ctx context.Context, id int64, actorID int64) ([
 		})
 	}
 
+	// A provider that answers 200 with an empty data array is not an
+	// authoritative empty catalog: upserting it would deprecate every stored
+	// model. Refuse the refresh and leave the existing catalog untouched.
+	if len(models) == 0 {
+		return nil, upstreamError(
+			errors.New("llm provider returned an empty model catalog; existing models were left unchanged"),
+			cfg.APIKey, "failed to refresh llm models")
+	}
+
 	upserted, err := s.repo.UpsertModels(ctx, id, models, now)
 	if err != nil {
 		return nil, mapRepositoryError(err)
