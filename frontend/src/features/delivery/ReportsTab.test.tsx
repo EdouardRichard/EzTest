@@ -215,7 +215,7 @@ describe("ReportsTab", () => {
 
     expect(await screen.findByTestId("report-8101")).toBeInTheDocument()
     expect(api.listReports).toHaveBeenCalledWith("2001", { limit: 100 })
-    expect(api.getReport).toHaveBeenCalledWith("2001", "8101")
+    await waitFor(() => expect(api.getReport).toHaveBeenCalledWith("2001", "8101"))
 
     const list = screen.getByTestId("report-list")
     expect(within(list).getByText("版本总结")).toBeInTheDocument()
