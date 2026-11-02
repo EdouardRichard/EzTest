@@ -18,7 +18,8 @@ const profileColumns = `id, key, name, system_prompt, allowed_tools, model, budg
 	created_at, updated_at`
 
 const runColumns = `id, profile_key, work_item_id, conversation_id, status, terminal_reason,
-	turns, usage, owner_instance, lease_epoch, context_packet_id, started_at, finished_at`
+	turns, usage, owner_instance, lease_epoch, context_packet_id, started_at, finished_at,
+	model, config_id, fallback_from`
 
 const messageColumns = `id, run_id, conversation_id, role, parts, tool_calls, tool_call_id,
 	usage, created_at`
@@ -132,15 +133,25 @@ func (r *RuntimeRepository) CreateRun(ctx context.Context, run agent.AgentRun) (
 		return agent.AgentRun{}, err
 	}
 	startedAt := timeOrNow(run.StartedAt)
+	var configID *int64
+	if run.ConfigID > 0 {
+		value := run.ConfigID
+		configID = &value
+	}
+	var fallbackFrom *string
+	if run.FallbackFrom != "" {
+		value := run.FallbackFrom
+		fallbackFrom = &value
+	}
 
 	stored, err := scanRun(r.pool.QueryRow(ctx, `
 		INSERT INTO agent_run (id, profile_key, work_item_id, conversation_id, status,
 			terminal_reason, turns, usage, owner_instance, lease_epoch, context_packet_id,
-			started_at, finished_at)
-		VALUES ($1, $2, $3, $4, 'running', NULL, 0, $5::jsonb, $6, $7, NULL, $8, NULL)
+			started_at, finished_at, model, config_id, fallback_from)
+		VALUES ($1, $2, $3, $4, 'running', NULL, 0, $5::jsonb, $6, $7, NULL, $8, NULL, $9, $10, $11)
 		RETURNING `+runColumns,
 		run.ID, run.ProfileKey, run.WorkItemID, run.ConversationID, encodedUsage,
-		run.OwnerInstance, run.LeaseEpoch, startedAt))
+		run.OwnerInstance, run.LeaseEpoch, startedAt, run.Model, configID, fallbackFrom))
 	if err != nil {
 		return agent.AgentRun{}, wrapDB("create agent run", err)
 	}
@@ -337,10 +348,19 @@ func scanRun(row rowScanner) (agent.AgentRun, error) {
 	var run agent.AgentRun
 	var status string
 	var usageRaw []byte
+	var configID *int64
+	var fallbackFrom *string
 	if err := row.Scan(&run.ID, &run.ProfileKey, &run.WorkItemID, &run.ConversationID,
 		&status, &run.TerminalReason, &run.Turns, &usageRaw, &run.OwnerInstance,
-		&run.LeaseEpoch, &run.ContextPacketID, &run.StartedAt, &run.FinishedAt); err != nil {
+		&run.LeaseEpoch, &run.ContextPacketID, &run.StartedAt, &run.FinishedAt,
+		&run.Model, &configID, &fallbackFrom); err != nil {
 		return agent.AgentRun{}, err
+	}
+	if configID != nil {
+		run.ConfigID = *configID
+	}
+	if fallbackFrom != nil {
+		run.FallbackFrom = *fallbackFrom
 	}
 	run.Status = agent.AgentRunStatus(status)
 	run.Usage = map[string]int{}

@@ -20,8 +20,8 @@ import (
 /* ------------------------------- fakes ---------------------------------- */
 
 type fakeProfileAdminRepo struct {
-	profiles map[string]agent.AgentProfile
-	versions map[string]agent.PromptVersionInfo
+	profiles  map[string]agent.AgentProfile
+	versions  map[string]agent.PromptVersionInfo
 	revisions map[string][]agent.PromptRevision
 
 	listErr    error
@@ -37,13 +37,13 @@ type fakeProfileAdminRepo struct {
 	saveCalls   int
 	revCalls    int
 
-	lastUpdate      agent.ProfileUpdate
-	lastWrite       agent.PromptWrite
-	lastLimit       int
-	lastBefore      *int
-	lastVersionKey  string
-	lastVersionNum  int
-	updateChanged   bool
+	lastUpdate     agent.ProfileUpdate
+	lastWrite      agent.PromptWrite
+	lastLimit      int
+	lastBefore     *int
+	lastVersionKey string
+	lastVersionNum int
+	updateChanged  bool
 }
 
 func newFakeProfileAdminRepo(t *testing.T) *fakeProfileAdminRepo {
@@ -222,7 +222,7 @@ type fakeModelCatalog struct {
 	calls  []string
 }
 
-func (f *fakeModelCatalog) ResolveModel(_ context.Context, model string) (llmapp.ModelInfo, error) {
+func (f *fakeModelCatalog) ResolveModel(_ context.Context, _ int64, model string, _ ...llmapp.ModelRequirements) (llmapp.ModelInfo, error) {
 	f.calls = append(f.calls, model)
 	if f.err != nil {
 		return llmapp.ModelInfo{}, f.err
@@ -239,9 +239,9 @@ type stubProfileTool struct {
 	parameters  json.RawMessage
 }
 
-func (s stubProfileTool) Name() string                     { return s.name }
-func (s stubProfileTool) Description() string              { return s.description }
-func (s stubProfileTool) Parameters() json.RawMessage      { return s.parameters }
+func (s stubProfileTool) Name() string                { return s.name }
+func (s stubProfileTool) Description() string         { return s.description }
+func (s stubProfileTool) Parameters() json.RawMessage { return s.parameters }
 func (s stubProfileTool) Execute(context.Context, tools.Scope, json.RawMessage) (any, error) {
 	return nil, errors.New("not executable in tests")
 }

@@ -189,7 +189,7 @@ func (f *scriptedChat) Chat(_ context.Context, req llmapp.ChatRequest) (llmapp.C
 	return response, scriptedErr
 }
 
-func (f *scriptedChat) ResolveModel(_ context.Context, model string) (llmapp.ModelInfo, error) {
+func (f *scriptedChat) ResolveModel(_ context.Context, _ int64, model string, _ ...llmapp.ModelRequirements) (llmapp.ModelInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.resolves = append(f.resolves, model)

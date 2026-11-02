@@ -38,6 +38,28 @@ const (
 	ProtocolOpenAIResponses       Protocol = "openai_responses"
 )
 
+// Thinking modes and reasoning efforts frozen by the 0.2.1 schema
+// (llm_0002_model021.sql), spec §7.2. The two fields are independent: the
+// mode says whether the provider should think, the effort says how hard.
+const (
+	ThinkingTypeAuto     = "auto"
+	ThinkingTypeEnabled  = "enabled"
+	ThinkingTypeDisabled = "disabled"
+
+	ReasoningEffortNone   = "none"
+	ReasoningEffortLow    = "low"
+	ReasoningEffortMedium = "medium"
+	ReasoningEffortHigh   = "high"
+	ReasoningEffortXHigh  = "xhigh"
+	ReasoningEffortMax    = "max"
+
+	// DefaultThinkingType and DefaultReasoningEffort match the migration
+	// defaults; an empty stored value is read as these values for rows written
+	// before the 0.2.1 columns existed.
+	DefaultThinkingType    = ThinkingTypeAuto
+	DefaultReasoningEffort = ReasoningEffortNone
+)
+
 // P0 defaults and validation limits. They mirror the migration check
 // constraints so the application fails with a typed 400 before PostgreSQL
 // rejects the row.
@@ -84,9 +106,54 @@ type Config struct {
 	MaxRetries     int
 	IsDefault      bool
 	Status         string
-	CreatedBy      *int64
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	// ThinkingType and ReasoningEffort are the 0.2.1 thinking settings
+	// (spec §7.2). DefaultModelID is the explicit default model; specs forbid
+	// falling back to models[0]. Zero means "not configured".
+	ThinkingType    string
+	ReasoningEffort string
+	DefaultModelID  int64
+	CreatedBy       *int64
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}
+
+// EffectiveThinkingType returns the stored thinking mode or the schema default
+// when a row predates the 0.2.1 column.
+func (c Config) EffectiveThinkingType() string {
+	if c.ThinkingType == "" {
+		return DefaultThinkingType
+	}
+	return c.ThinkingType
+}
+
+// EffectiveReasoningEffort returns the stored reasoning effort or the schema
+// default when a row predates the 0.2.1 column.
+func (c Config) EffectiveReasoningEffort() string {
+	if c.ReasoningEffort == "" {
+		return DefaultReasoningEffort
+	}
+	return c.ReasoningEffort
+}
+
+// ValidThinkingType reports whether value is part of the frozen enum.
+func ValidThinkingType(value string) bool {
+	switch value {
+	case ThinkingTypeAuto, ThinkingTypeEnabled, ThinkingTypeDisabled:
+		return true
+	default:
+		return false
+	}
+}
+
+// ValidReasoningEffort reports whether value is part of the frozen enum.
+func ValidReasoningEffort(value string) bool {
+	switch value {
+	case ReasoningEffortNone, ReasoningEffortLow, ReasoningEffortMedium,
+		ReasoningEffortHigh, ReasoningEffortXHigh, ReasoningEffortMax:
+		return true
+	default:
+		return false
+	}
 }
 
 // APIKeySet reports whether a secret is configured.
@@ -124,6 +191,15 @@ func (c Config) Validate() error {
 	}
 	if !ValidStatus(c.Status) {
 		return platform.Invalid("status", "must be one of active, disabled")
+	}
+	if !ValidThinkingType(c.ThinkingType) {
+		return platform.Invalid("thinking_type", "must be one of auto, enabled, disabled")
+	}
+	if !ValidReasoningEffort(c.ReasoningEffort) {
+		return platform.Invalid("reasoning_effort", "must be one of none, low, medium, high, xhigh, max")
+	}
+	if c.DefaultModelID < 0 {
+		return platform.Invalid("default_model_id", "must not be negative")
 	}
 	return nil
 }

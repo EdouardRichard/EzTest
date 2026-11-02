@@ -72,7 +72,7 @@ func (e *TransientError) Unwrap() error {
 // output items back into the application response. Transient failures are
 // retried up to cfg.MaxRetries; protocol errors are returned immediately.
 func (a *responsesAdapter) Chat(ctx context.Context, req llmapp.ChatRequest) (llmapp.ChatResponse, error) {
-	payload, names, err := buildResponsesPayload(req, false)
+	payload, names, err := buildResponsesPayload(a.cfg, req, false)
 	if err != nil {
 		return llmapp.ChatResponse{}, err
 	}
@@ -146,7 +146,7 @@ func (a *responsesAdapter) doChat(ctx context.Context, payload responsesRequestP
 // retry would duplicate content, so transport/stream failures are returned to
 // the caller.
 func (a *responsesAdapter) Stream(ctx context.Context, req llmapp.ChatRequest, onDelta func(llmapp.Delta)) error {
-	payload, names, err := buildResponsesPayload(req, true)
+	payload, names, err := buildResponsesPayload(a.cfg, req, true)
 	if err != nil {
 		return err
 	}
@@ -227,14 +227,16 @@ func sanitizeResponsesMessage(cfg llm.Config, message string) string {
 // format: role messages become input message items, assistant tool calls become
 // function_call items, tool results become function_call_output items and tools
 // are flat function definitions. Function names are sanitized for strict
-// upstreams and the reverse mapping is returned for response parsing.
-func buildResponsesPayload(req llmapp.ChatRequest, stream bool) (responsesRequestPayload, *toolNameMapping, error) {
+// upstreams and the reverse mapping is returned for response parsing. The
+// thinking mapping adds reasoning{effort,summary}; auto/none adds no key.
+func buildResponsesPayload(cfg llm.Config, req llmapp.ChatRequest, stream bool) (responsesRequestPayload, *toolNameMapping, error) {
 	payload := responsesRequestPayload{
 		Model:           req.Model,
 		Input:           make([]any, 0, len(req.Messages)),
 		MaxOutputTokens: req.MaxOutputTokens,
 		Stream:          stream,
 	}
+	applyResponsesReasoning(&payload, cfg)
 	if payload.MaxOutputTokens <= 0 {
 		payload.MaxOutputTokens = llmapp.DefaultChatMaxOutputTokens
 	}
@@ -536,13 +538,47 @@ func (s *responsesStreamState) handleEvent(data string, onDelta func(llmapp.Delt
 	return false, nil
 }
 
+// applyResponsesReasoning maps the config's thinking settings onto the
+// Responses payload (spec §7.2): reasoning.effort carries the effort and
+// reasoning.summary is requested when thinking is enabled so the stream can
+// surface the model's thinking. thinking_type auto with effort none adds no
+// reasoning key at all; thinking_type disabled maps to effort none.
+func applyResponsesReasoning(payload *responsesRequestPayload, cfg llm.Config) {
+	thinking := cfg.EffectiveThinkingType()
+	effort := cfg.EffectiveReasoningEffort()
+	reasoning := responsesReasoningPayload{}
+	include := false
+	switch thinking {
+	case llm.ThinkingTypeEnabled:
+		reasoning.Summary = "auto"
+		include = true
+	case llm.ThinkingTypeDisabled:
+		reasoning.Effort = llm.ReasoningEffortNone
+		include = true
+	}
+	if effort != llm.ReasoningEffortNone {
+		reasoning.Effort = effort
+		include = true
+	}
+	if include {
+		payload.Reasoning = &reasoning
+	}
+}
+
 type responsesRequestPayload struct {
-	Model           string          `json:"model"`
-	Input           []any           `json:"input"`
-	Tools           []responsesTool `json:"tools,omitempty"`
-	ToolChoice      string          `json:"tool_choice,omitempty"`
-	MaxOutputTokens int             `json:"max_output_tokens,omitempty"`
-	Stream          bool            `json:"stream,omitempty"`
+	Model           string                     `json:"model"`
+	Input           []any                      `json:"input"`
+	Tools           []responsesTool            `json:"tools,omitempty"`
+	ToolChoice      string                     `json:"tool_choice,omitempty"`
+	MaxOutputTokens int                        `json:"max_output_tokens,omitempty"`
+	Stream          bool                       `json:"stream,omitempty"`
+	Reasoning       *responsesReasoningPayload `json:"reasoning,omitempty"`
+}
+
+// responsesReasoningPayload is the reasoning configuration of POST /responses.
+type responsesReasoningPayload struct {
+	Effort  string `json:"effort,omitempty"`
+	Summary string `json:"summary,omitempty"`
 }
 
 type responsesTool struct {

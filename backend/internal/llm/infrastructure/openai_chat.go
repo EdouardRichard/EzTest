@@ -108,7 +108,7 @@ func (c *Client) Chat(ctx context.Context, cfg llm.Config, req llmapp.ChatReques
 // overflows are wrapped with llmapp.ErrContextOverflow so the runtime can
 // compact and retry. The configured API key is never included in errors.
 func (a *chatCompletionsAdapter) Chat(ctx context.Context, req llmapp.ChatRequest) (llmapp.ChatResponse, error) {
-	payload, names, err := buildChatPayload(req)
+	payload, names, err := buildChatPayload(a.cfg, req)
 	if err != nil {
 		return llmapp.ChatResponse{}, err
 	}
@@ -219,8 +219,11 @@ func classifyChatFailure(cfg llm.Config, status int, raw []byte) (bool, error) {
 
 // buildChatPayload maps the application request to the OpenAI wire format.
 // Function names are sanitized for strict upstreams and the reverse mapping is
-// returned so response tool calls can be restored to the internal names.
-func buildChatPayload(req llmapp.ChatRequest) (chatRequestPayload, *toolNameMapping, error) {
+// returned so response tool calls can be restored to the internal names. The
+// chat-completions thinking mapping adds reasoning_effort plus the
+// provider-specific thinking object; the auto/none defaults add no keys so the
+// legacy payload stays byte-compatible.
+func buildChatPayload(cfg llm.Config, req llmapp.ChatRequest) (chatRequestPayload, *toolNameMapping, error) {
 	messages := make([]chatMessagePayload, 0, len(req.Messages))
 	for _, message := range req.Messages {
 		item := chatMessagePayload{
@@ -250,6 +253,7 @@ func buildChatPayload(req llmapp.ChatRequest) (chatRequestPayload, *toolNameMapp
 		MaxTokens:   req.MaxOutputTokens,
 		Stream:      false,
 	}
+	applyChatThinking(&payload, cfg)
 	if payload.MaxTokens <= 0 {
 		payload.MaxTokens = llmapp.DefaultChatMaxOutputTokens
 	}
@@ -368,14 +372,39 @@ func sanitizeUpstreamMessage(message, secret string, limit int) string {
 	return message
 }
 
+// applyChatThinking maps the config's thinking settings onto the
+// chat-completions payload (spec §7.2):
+//   - thinking_type auto adds nothing (provider default);
+//   - thinking_type enabled/disabled adds the provider-specific thinking object;
+//   - reasoning_effort none adds nothing, every other effort is forwarded.
+func applyChatThinking(payload *chatRequestPayload, cfg llm.Config) {
+	if effort := cfg.EffectiveReasoningEffort(); effort != llm.ReasoningEffortNone {
+		payload.ReasoningEffort = effort
+	}
+	switch cfg.EffectiveThinkingType() {
+	case llm.ThinkingTypeEnabled:
+		payload.Thinking = &chatThinkingPayload{Type: llm.ThinkingTypeEnabled}
+	case llm.ThinkingTypeDisabled:
+		payload.Thinking = &chatThinkingPayload{Type: llm.ThinkingTypeDisabled}
+	}
+}
+
 type chatRequestPayload struct {
-	Model       string               `json:"model"`
-	Messages    []chatMessagePayload `json:"messages"`
-	Tools       []chatToolPayload    `json:"tools,omitempty"`
-	ToolChoice  string               `json:"tool_choice,omitempty"`
-	Temperature float64              `json:"temperature"`
-	MaxTokens   int                  `json:"max_tokens"`
-	Stream      bool                 `json:"stream"`
+	Model           string               `json:"model"`
+	Messages        []chatMessagePayload `json:"messages"`
+	Tools           []chatToolPayload    `json:"tools,omitempty"`
+	ToolChoice      string               `json:"tool_choice,omitempty"`
+	Temperature     float64              `json:"temperature"`
+	MaxTokens       int                  `json:"max_tokens"`
+	Stream          bool                 `json:"stream"`
+	ReasoningEffort string               `json:"reasoning_effort,omitempty"`
+	Thinking        *chatThinkingPayload `json:"thinking,omitempty"`
+}
+
+// chatThinkingPayload is the provider-specific thinking switch used by
+// OpenAI-compatible gateways (for example GLM/Qwen-style endpoints).
+type chatThinkingPayload struct {
+	Type string `json:"type"`
 }
 
 type chatMessagePayload struct {

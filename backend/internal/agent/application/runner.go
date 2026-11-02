@@ -417,7 +417,15 @@ func (r *Runner) Run(ctx context.Context, item agent.WorkItem) (RunResult, error
 		}
 	}
 
-	run, err := r.createRun(ctx, item, profile, payload)
+	// Resolve the model before creating the run so agent_run records the model
+	// and config actually used (spec §7.3). Capability validation happens in
+	// ResolveModel against the role's tool needs.
+	modelInfo, err := r.chat.ResolveModel(ctx, 0, profileModel(profile), modelRequirements(profile)...)
+	if err != nil {
+		return RunResult{}, resolveRunError(err)
+	}
+
+	run, err := r.createRun(ctx, item, profile, payload, modelInfo)
 	if err != nil {
 		return RunResult{}, &RunError{Reason: "run_create_failed", Retryable: true, Cause: err}
 	}
@@ -426,6 +434,7 @@ func (r *Runner) Run(ctx context.Context, item agent.WorkItem) (RunResult, error
 		payload:          payload,
 		profile:          profile,
 		run:              run,
+		model:            modelInfo,
 		usage:            map[string]int{},
 		conversationKind: conversationKind,
 		team:             teamForProfile(profileKey),
@@ -540,13 +549,16 @@ func (r *Runner) finalizeRequirement(ctx context.Context, state *runState) error
 	return nil
 }
 
-func (r *Runner) createRun(ctx context.Context, item agent.WorkItem, profile agent.AgentProfile, payload WorkItemPayload) (agent.AgentRun, error) {
+func (r *Runner) createRun(ctx context.Context, item agent.WorkItem, profile agent.AgentProfile, payload WorkItemPayload, model llmapp.ModelInfo) (agent.AgentRun, error) {
 	if r.ids == nil {
 		return agent.AgentRun{}, errors.New("agent runner has no ID generator")
 	}
 	run := agent.AgentRun{
 		ID:            r.ids.Next(),
 		ProfileKey:    profile.Key,
+		Model:         model.Model,
+		ConfigID:      model.ConfigID,
+		FallbackFrom:  model.FallbackFrom,
 		WorkItemID:    &item.ID,
 		Status:        agent.AgentRunRunning,
 		OwnerInstance: r.instanceID,
@@ -618,12 +630,9 @@ func (r *Runner) prepare(ctx context.Context, state *runState) error {
 		state.input.Execution = &executionTask
 	}
 
-	modelInfo, err := r.chat.ResolveModel(ctx, profileModel(state.profile))
-	if err != nil {
-		return &RunError{Reason: "ai_unavailable", Retryable: true, Cause: err}
-	}
-	state.model = modelInfo
-	state.input.ModelBudget = ModelBudget{ContextWindow: modelInfo.ContextWindow, MaxOutput: modelInfo.MaxOutput}
+	// The model was resolved before the run row was created; the context packet
+	// only needs its budget metadata here.
+	state.input.ModelBudget = ModelBudget{ContextWindow: state.model.ContextWindow, MaxOutput: state.model.MaxOutput}
 	state.input.Profile = state.profile
 	state.input.Task = r.taskContext(ctx, state)
 	state.input.Artifacts = artifactRefs(state)
@@ -1632,6 +1641,29 @@ func profileModel(profile agent.AgentProfile) string {
 		return ""
 	}
 	return strings.TrimSpace(*profile.Model)
+}
+
+// modelRequirements derives the capabilities a profile's run needs before
+// dispatch. Profiles that may call tools need a tools-capable model; the
+// reasoning requirement is derived from the config's thinking mode by the
+// gateway itself. Vision is requested by the image-specific call sites.
+func modelRequirements(profile agent.AgentProfile) []llmapp.ModelRequirements {
+	if len(profile.AllowedTools) == 0 {
+		return nil
+	}
+	return []llmapp.ModelRequirements{{Tools: true}}
+}
+
+// resolveRunError classifies a model-resolution failure. Configuration and
+// capability errors are non-retryable (an operator must fix the config, D24);
+// an unavailable gateway stays retryable like before.
+func resolveRunError(err error) *RunError {
+	retryable := true
+	var apiErr *platform.Error
+	if errors.As(err, &apiErr) {
+		retryable = apiErr.Retryable
+	}
+	return &RunError{Reason: "ai_unavailable", Retryable: retryable, Cause: err}
 }
 
 func conversationMessages(messages []ConversationMessage) []Message {

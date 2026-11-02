@@ -27,6 +27,13 @@ const (
 const (
 	CodeAIUnavailable   = "ai_unavailable"
 	CodeContextOverflow = "context_overflow"
+
+	// CodeLLMConfigInvalid marks a non-retryable configuration error such as a
+	// missing default model or a default model that is not in the catalog.
+	CodeLLMConfigInvalid = "llm_config_invalid"
+	// CodeLLMCapabilityMismatch marks a non-retryable capability error: the
+	// resolved model cannot serve the role (tools/vision/reasoning).
+	CodeLLMCapabilityMismatch = "llm_capability_mismatch"
 )
 
 // ErrContextOverflow marks an upstream rejection caused by the request
@@ -124,26 +131,42 @@ type Adapter interface {
 	Stream(ctx context.Context, req ChatRequest, onDelta func(Delta)) error
 }
 
+// ModelRequirements declares the capabilities a calling role needs before a
+// run is dispatched (spec §7.3). The zero value requires nothing.
+type ModelRequirements struct {
+	Tools     bool
+	Vision    bool
+	Reasoning bool
+}
+
 // ModelInfo is the resolved target for an agent run: the default LLM
 // configuration and the selected catalog model. ContextWindow/MaxOutput come
 // from llm_model metadata and fall back to conservative defaults when the
-// upstream catalog does not report them.
+// upstream catalog does not report them. Capabilities is the merged 0.2.1
+// capability set used by role/vision checks.
 type ModelInfo struct {
 	ConfigID      int64
+	ModelID       int64
 	Model         string
 	ContextWindow int
 	MaxOutput     int
 	SupportsTools bool
+	Capabilities  llm.Capabilities
+	// FallbackFrom records the model that was requested but not used. P4 keeps
+	// it empty: a model is never switched automatically (D24).
+	FallbackFrom string
 }
 
 // ChatGateway is the agent runtime's LLM port. ResolveModel selects the
-// default configuration and a catalog model; Chat performs one completion.
+// configuration (explicit cfgID or the default config) and a catalog model
+// (explicit model name or the config's default_model_id), then validates that
+// the model can serve the caller's capabilities; Chat performs one completion.
 //
 // Implementations must never leak the configured API key through returned
 // errors, and must classify context-window overflows with ErrContextOverflow.
 type ChatGateway interface {
 	Chat(ctx context.Context, req ChatRequest) (ChatResponse, error)
-	ResolveModel(ctx context.Context, model string) (ModelInfo, error)
+	ResolveModel(ctx context.Context, cfgID int64, modelID string, required ...ModelRequirements) (ModelInfo, error)
 }
 
 // Option configures optional P1 dependencies of Service without changing the
@@ -161,26 +184,39 @@ func WithSettingsReader(reader SettingsReader) Option {
 	return func(s *Service) { s.settings = reader }
 }
 
-// ResolveModel returns the target configuration/model for a run. An empty model
-// selects the first catalog model of the default configuration; a non-empty
-// model must match an llm_model row (profile.model).
-func (s *Service) ResolveModel(ctx context.Context, model string) (ModelInfo, error) {
-	_, chosen, err := s.resolveChatTarget(ctx, model)
+// ResolveModel returns the target configuration/model for a run. An explicit
+// cfgID selects that configuration (0 selects the default configuration), and
+// a non-empty modelID selects that catalog model. An empty modelID selects the
+// configuration's explicit default_model_id; models[0] is never used.
+func (s *Service) ResolveModel(ctx context.Context, cfgID int64, modelID string, required ...ModelRequirements) (ModelInfo, error) {
+	cfg, chosen, err := s.resolveChatTarget(ctx, cfgID, modelID)
 	if err != nil {
 		return ModelInfo{}, err
 	}
+	requirements := append([]ModelRequirements(nil), required...)
+	if cfg.EffectiveThinkingType() == llm.ThinkingTypeEnabled {
+		// An enabled thinking mode needs a reasoning-capable model; the caller
+		// does not have to pass this requirement itself.
+		requirements = append(requirements, ModelRequirements{Reasoning: true})
+	}
+	if err := validateModelCapabilities(chosen, requirements...); err != nil {
+		return ModelInfo{}, err
+	}
+	capabilities := chosen.EffectiveCapabilities()
 	return ModelInfo{
 		ConfigID:      chosen.ConfigID,
+		ModelID:       chosen.ID,
 		Model:         chosen.Model,
 		ContextWindow: chosen.ContextWindow,
 		MaxOutput:     chosen.MaxOutput,
-		SupportsTools: chosen.SupportsTools,
+		SupportsTools: capabilities.SupportsTools,
+		Capabilities:  capabilities,
 	}, nil
 }
 
 // Chat performs one completion against the default OpenAI-compatible upstream.
 func (s *Service) Chat(ctx context.Context, req ChatRequest) (ChatResponse, error) {
-	cfg, chosen, err := s.resolveChatTarget(ctx, req.Model)
+	cfg, chosen, err := s.resolveChatTarget(ctx, 0, req.Model)
 	if err != nil {
 		return ChatResponse{}, err
 	}
@@ -210,30 +246,17 @@ func (s *Service) Chat(ctx context.Context, req ChatRequest) (ChatResponse, erro
 	return response, nil
 }
 
-// resolveChatTarget selects the default llm_config and one catalog model. It
-// returns stable ai_unavailable errors instead of empty successes so the worker
-// can apply the model-unavailable retry policy.
-func (s *Service) resolveChatTarget(ctx context.Context, model string) (llm.Config, llm.Model, error) {
+// resolveChatTarget selects the configuration and one catalog model. It
+// returns stable ai_unavailable errors for a missing/disabled configuration and
+// typed non-retryable configuration errors for an invalid default model, so a
+// misconfiguration is not retried while a temporarily unavailable gateway is.
+func (s *Service) resolveChatTarget(ctx context.Context, cfgID int64, model string) (llm.Config, llm.Model, error) {
 	if s.chat == nil {
 		return llm.Config{}, llm.Model{}, aiUnavailable("llm chat gateway is not configured")
 	}
-	configs, err := s.repo.ListConfigs(ctx)
+	cfg, err := s.selectConfig(ctx, cfgID)
 	if err != nil {
 		return llm.Config{}, llm.Model{}, err
-	}
-	var selected *llm.Config
-	for i := range configs {
-		if configs[i].IsDefault {
-			selected = &configs[i]
-			break
-		}
-	}
-	if selected == nil {
-		return llm.Config{}, llm.Model{}, aiUnavailable("no default llm config is configured")
-	}
-	cfg := *selected
-	if cfg.Status != llm.StatusActive {
-		return llm.Config{}, llm.Model{}, aiUnavailable("default llm config is disabled")
 	}
 
 	models, err := s.repo.ListModelsByConfig(ctx, cfg.ID)
@@ -243,16 +266,122 @@ func (s *Service) resolveChatTarget(ctx context.Context, model string) (llm.Conf
 	name := strings.TrimSpace(model)
 	if name != "" {
 		for i := range models {
-			if models[i].Model == name {
-				return cfg, models[i], nil
+			if models[i].Model != name {
+				continue
 			}
+			if !models[i].Selectable() {
+				return llm.Config{}, llm.Model{}, llmConfigError(
+					fmt.Sprintf("llm model %q is deprecated or disabled; choose another model", name))
+			}
+			return cfg, models[i], nil
 		}
 		return llm.Config{}, llm.Model{}, aiUnavailable(fmt.Sprintf("llm model %q is not in the catalog", name))
 	}
-	if len(models) == 0 {
-		return llm.Config{}, llm.Model{}, aiUnavailable("default llm config has no models")
+
+	// The spec forbids deriving the target from models[0]: a config without an
+	// explicit default_model_id is a configuration error, not a silent pick.
+	if cfg.DefaultModelID <= 0 {
+		return llm.Config{}, llm.Model{}, &platform.Error{
+			Status:  400,
+			Code:    CodeLLMConfigInvalid,
+			Message: "llm config has no default model; set default_model_id before running agents (models[0] is never used)",
+			Details: map[string]any{"field": "default_model_id"},
+		}
 	}
-	return cfg, models[0], nil
+	for i := range models {
+		if models[i].ID != cfg.DefaultModelID {
+			continue
+		}
+		if !models[i].Selectable() {
+			return llm.Config{}, llm.Model{}, llmConfigError(fmt.Sprintf(
+				"default model %q is deprecated or disabled; set default_model_id to an active model", models[i].Model))
+		}
+		return cfg, models[i], nil
+	}
+	return llm.Config{}, llm.Model{}, llmConfigError(fmt.Sprintf(
+		"default model %d is not in the catalog of llm config %q; refresh the model catalog or set default_model_id",
+		cfg.DefaultModelID, cfg.Name))
+}
+
+// selectConfig loads the explicitly requested configuration, or the unique
+// default configuration when cfgID is zero.
+func (s *Service) selectConfig(ctx context.Context, cfgID int64) (llm.Config, error) {
+	var cfg llm.Config
+	if cfgID > 0 {
+		selected, err := s.repo.GetConfig(ctx, cfgID)
+		if err != nil {
+			return llm.Config{}, mapRepositoryError(err)
+		}
+		cfg = selected
+		if cfg.Status != llm.StatusActive {
+			return llm.Config{}, aiUnavailable("llm config is disabled")
+		}
+		return cfg, nil
+	}
+	configs, err := s.repo.ListConfigs(ctx)
+	if err != nil {
+		return llm.Config{}, err
+	}
+	for i := range configs {
+		if configs[i].IsDefault {
+			cfg = configs[i]
+			break
+		}
+	}
+	if cfg.ID == 0 {
+		return llm.Config{}, aiUnavailable("no default llm config is configured")
+	}
+	if cfg.Status != llm.StatusActive {
+		return llm.Config{}, aiUnavailable("default llm config is disabled")
+	}
+	return cfg, nil
+}
+
+// validateModelCapabilities rejects a model that cannot serve the calling role.
+// Every requirement is checked so the error names all missing capabilities.
+func validateModelCapabilities(model llm.Model, required ...ModelRequirements) error {
+	capabilities := model.EffectiveCapabilities()
+	missing := make([]string, 0, 3)
+	for _, requirement := range required {
+		if requirement.Tools && !capabilities.SupportsTools && !containsString(missing, "tools") {
+			missing = append(missing, "tools")
+		}
+		if requirement.Vision && !capabilities.SupportsVision && !containsString(missing, "vision") {
+			missing = append(missing, "vision")
+		}
+		if requirement.Reasoning && !capabilities.SupportsReasoning && !containsString(missing, "reasoning") {
+			missing = append(missing, "reasoning")
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	return &platform.Error{
+		Status: 400,
+		Code:   CodeLLMCapabilityMismatch,
+		Message: fmt.Sprintf("llm model %q does not support %s required by this role; choose a model with that capability",
+			model.Model, strings.Join(missing, ", ")),
+		Details: map[string]any{"model": model.Model, "missing_capabilities": missing},
+	}
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+// llmConfigError builds the non-retryable 400 used for invalid LLM
+// configuration that an operator must fix (spec §7.3/§7.4).
+func llmConfigError(message string) *platform.Error {
+	return &platform.Error{
+		Status:  400,
+		Code:    CodeLLMConfigInvalid,
+		Message: message,
+	}
 }
 
 // aiUnavailable builds the stable 503 used when no usable model target exists.

@@ -83,7 +83,7 @@ type ToolRegistry interface {
 // ModelCatalog is the default LLM model catalog surface. *llmapp.Service
 // satisfies it: a non-empty profile model must resolve to a catalog model.
 type ModelCatalog interface {
-	ResolveModel(ctx context.Context, model string) (llmapp.ModelInfo, error)
+	ResolveModel(ctx context.Context, cfgID int64, modelID string, required ...llmapp.ModelRequirements) (llmapp.ModelInfo, error)
 }
 
 // ProfileAdminRepository is the persistence port of the admin API. The
@@ -462,7 +462,7 @@ func (s *ProfileAdminService) validateModel(ctx context.Context, model string) e
 	if s.models == nil {
 		return platform.Unavailable("LLM model catalog is not configured")
 	}
-	if _, err := s.models.ResolveModel(ctx, model); err != nil {
+	if _, err := s.models.ResolveModel(ctx, 0, model); err != nil {
 		return platform.Invalid("model", "must be a model of the default LLM configuration")
 	}
 	return nil

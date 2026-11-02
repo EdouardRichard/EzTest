@@ -29,7 +29,7 @@ func (f *fakeChat) Chat(_ context.Context, request llmapp.ChatRequest) (llmapp.C
 	return llmapp.ChatResponse{Content: f.content}, nil
 }
 
-func (f *fakeChat) ResolveModel(_ context.Context, _ string) (llmapp.ModelInfo, error) {
+func (f *fakeChat) ResolveModel(_ context.Context, _ int64, _ string, _ ...llmapp.ModelRequirements) (llmapp.ModelInfo, error) {
 	f.modelCalls++
 	if f.modelErr != nil {
 		return llmapp.ModelInfo{}, f.modelErr

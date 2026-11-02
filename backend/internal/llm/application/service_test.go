@@ -177,9 +177,25 @@ func (f *fakeRepo) UpsertModels(_ context.Context, configID int64, models []llm.
 		existing.MaxOutput = incoming.MaxOutput
 		existing.SupportsTools = incoming.SupportsTools
 		existing.SupportsVision = incoming.SupportsVision
+		existing.Capabilities = incoming.Capabilities
+		existing.Deprecated = incoming.Deprecated
 		existing.Source = incoming.Source
 		existing.UpdatedAt = incoming.UpdatedAt
 		f.models[existingID] = existing
+	}
+	// Mirror the repository contract: catalog rows absent from the refresh are
+	// kept and marked deprecated instead of being deleted.
+	present := make(map[string]bool, len(models))
+	for _, incoming := range models {
+		present[incoming.Model] = true
+	}
+	for id, existing := range f.models {
+		if existing.ConfigID != configID || existing.Source != llm.SourceCatalog || present[existing.Model] {
+			continue
+		}
+		existing.Deprecated = true
+		existing.UpdatedAt = at
+		f.models[id] = existing
 	}
 	list := make([]llm.Model, 0)
 	for _, model := range f.models {

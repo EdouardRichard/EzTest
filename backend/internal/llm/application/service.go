@@ -78,6 +78,9 @@ func (s *Service) CreateConfig(ctx context.Context, cmd ConfigInput, actorID int
 	cfg.CreatedBy = &actor
 	cfg.CreatedAt = now
 	cfg.UpdatedAt = now
+	if err := s.validateDefaultModel(ctx, cfg); err != nil {
+		return llm.Config{}, err
+	}
 
 	created, err := s.repo.CreateConfig(ctx, cfg)
 	if err != nil {
@@ -101,6 +104,9 @@ func (s *Service) UpdateConfig(ctx context.Context, id int64, cmd ConfigInput, a
 	cfg.CreatedBy = existing.CreatedBy
 	cfg.CreatedAt = existing.CreatedAt
 	cfg.UpdatedAt = s.clock.Now()
+	if err := s.validateDefaultModel(ctx, cfg); err != nil {
+		return llm.Config{}, err
+	}
 
 	updated, err := s.repo.UpdateConfig(ctx, cfg)
 	if err != nil {
@@ -164,10 +170,17 @@ func (s *Service) RefreshModels(ctx context.Context, id int64, actorID int64) ([
 			MaxOutput:      item.MaxOutput,
 			SupportsTools:  item.SupportsTools,
 			SupportsVision: item.SupportsVision,
-			Source:         llm.SourceCatalog,
-			Status:         llm.ModelStatusActive,
-			CreatedAt:      now,
-			UpdatedAt:      now,
+			Capabilities: llm.Capabilities{
+				SupportsTools:       item.SupportsTools,
+				SupportsVision:      item.SupportsVision,
+				SupportsReasoning:   item.SupportsReasoning,
+				SupportsPromptCache: item.SupportsPromptCache,
+				ContextWindow:       item.ContextWindow,
+			},
+			Source:    llm.SourceCatalog,
+			Status:    llm.ModelStatusActive,
+			CreatedAt: now,
+			UpdatedAt: now,
 		})
 	}
 
@@ -204,10 +217,15 @@ func (s *Service) AddModel(ctx context.Context, configID int64, model string, co
 		MaxOutput:      maxOutput,
 		SupportsTools:  tools,
 		SupportsVision: vision,
-		Source:         llm.SourceManual,
-		Status:         llm.ModelStatusActive,
-		CreatedAt:      now,
-		UpdatedAt:      now,
+		Capabilities: llm.Capabilities{
+			SupportsTools:  tools,
+			SupportsVision: vision,
+			ContextWindow:  contextWindow,
+		},
+		Source:    llm.SourceManual,
+		Status:    llm.ModelStatusActive,
+		CreatedAt: now,
+		UpdatedAt: now,
 	}
 	stored, err := s.repo.InsertModel(ctx, row)
 	if err != nil {
@@ -269,6 +287,15 @@ func buildConfig(base llm.Config, input ConfigInput, create bool) (llm.Config, e
 	if input.Status != nil {
 		cfg.Status = strings.TrimSpace(*input.Status)
 	}
+	if input.ThinkingType != nil {
+		cfg.ThinkingType = strings.TrimSpace(*input.ThinkingType)
+	}
+	if input.ReasoningEffort != nil {
+		cfg.ReasoningEffort = strings.TrimSpace(*input.ReasoningEffort)
+	}
+	if input.DefaultModelID != nil {
+		cfg.DefaultModelID = *input.DefaultModelID
+	}
 
 	if create {
 		if input.Provider == nil {
@@ -286,6 +313,12 @@ func buildConfig(base llm.Config, input ConfigInput, create bool) (llm.Config, e
 		if input.Status == nil {
 			cfg.Status = llm.DefaultStatus
 		}
+		if input.ThinkingType == nil {
+			cfg.ThinkingType = llm.DefaultThinkingType
+		}
+		if input.ReasoningEffort == nil {
+			cfg.ReasoningEffort = llm.DefaultReasoningEffort
+		}
 	}
 	if cfg.Headers == nil {
 		cfg.Headers = map[string]string{}
@@ -297,6 +330,29 @@ func buildConfig(base llm.Config, input ConfigInput, create bool) (llm.Config, e
 	return cfg, nil
 }
 
+// validateDefaultModel enforces that a configured default_model_id references
+// an active model of the same configuration. A config may be created before its
+// catalog is refreshed; it simply cannot name a default until then.
+func (s *Service) validateDefaultModel(ctx context.Context, cfg llm.Config) error {
+	if cfg.DefaultModelID <= 0 {
+		return nil
+	}
+	models, err := s.repo.ListModelsByConfig(ctx, cfg.ID)
+	if err != nil {
+		return err
+	}
+	for _, model := range models {
+		if model.ID != cfg.DefaultModelID {
+			continue
+		}
+		if !model.Selectable() {
+			return platform.Invalid("default_model_id", "must reference an active model that is not deprecated")
+		}
+		return nil
+	}
+	return platform.Invalid("default_model_id", "must reference a model of this LLM configuration")
+}
+
 // recordConfigChange emits the audit entry and the system event for a config
 // mutation. Audit/event delivery is best effort and never fails the business
 // operation. None of the recorded fields contain the API key.
@@ -305,14 +361,21 @@ func (s *Service) recordConfigChange(ctx context.Context, verb string, cfg llm.C
 	targetID := id.Format(cfg.ID)
 	requestID := requestid.From(ctx)
 	actor := actorID
+	defaultModelID := ""
+	if cfg.DefaultModelID > 0 {
+		defaultModelID = id.Format(cfg.DefaultModelID)
+	}
 
 	metadata := map[string]any{
-		"name":       cfg.Name,
-		"provider":   cfg.Provider,
-		"protocol":   cfg.Protocol,
-		"base_url":   cfg.BaseURL,
-		"is_default": cfg.IsDefault,
-		"status":     cfg.Status,
+		"name":             cfg.Name,
+		"provider":         cfg.Provider,
+		"protocol":         cfg.Protocol,
+		"base_url":         cfg.BaseURL,
+		"is_default":       cfg.IsDefault,
+		"status":           cfg.Status,
+		"thinking_type":    cfg.EffectiveThinkingType(),
+		"reasoning_effort": cfg.EffectiveReasoningEffort(),
+		"default_model_id": defaultModelID,
 	}
 	if s.audit != nil {
 		_ = s.audit.Record(ctx, auditapp.Event{
@@ -326,13 +389,16 @@ func (s *Service) recordConfigChange(ctx context.Context, verb string, cfg llm.C
 	}
 	if s.events != nil {
 		payload := map[string]any{
-			"id":         targetID,
-			"name":       cfg.Name,
-			"provider":   cfg.Provider,
-			"protocol":   cfg.Protocol,
-			"base_url":   cfg.BaseURL,
-			"is_default": cfg.IsDefault,
-			"status":     cfg.Status,
+			"id":               targetID,
+			"name":             cfg.Name,
+			"provider":         cfg.Provider,
+			"protocol":         cfg.Protocol,
+			"base_url":         cfg.BaseURL,
+			"is_default":       cfg.IsDefault,
+			"status":           cfg.Status,
+			"thinking_type":    cfg.EffectiveThinkingType(),
+			"reasoning_effort": cfg.EffectiveReasoningEffort(),
+			"default_model_id": defaultModelID,
 		}
 		_ = s.events.Publish(ctx, eventingapp.Event{
 			Channel:   "system",

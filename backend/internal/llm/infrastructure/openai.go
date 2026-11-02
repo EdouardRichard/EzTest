@@ -251,14 +251,16 @@ func endpointURL(base, suffix string) (string, error) {
 }
 
 type remoteModelPayload struct {
-	ID              string          `json:"id"`
-	ContextWindow   int             `json:"context_window"`
-	MaxOutputTokens int             `json:"max_output_tokens"`
-	MaxOutput       int             `json:"max_output"`
-	SupportsTools   bool            `json:"supports_tools"`
-	SupportsVision  bool            `json:"supports_vision"`
-	InputModalities []string        `json:"input_modalities"`
-	Capabilities    json.RawMessage `json:"capabilities"`
+	ID                  string          `json:"id"`
+	ContextWindow       int             `json:"context_window"`
+	MaxOutputTokens     int             `json:"max_output_tokens"`
+	MaxOutput           int             `json:"max_output"`
+	SupportsTools       bool            `json:"supports_tools"`
+	SupportsVision      bool            `json:"supports_vision"`
+	SupportsReasoning   bool            `json:"supports_reasoning"`
+	SupportsPromptCache bool            `json:"supports_prompt_cache"`
+	InputModalities     []string        `json:"input_modalities"`
+	Capabilities        json.RawMessage `json:"capabilities"`
 }
 
 func (p remoteModelPayload) remoteModel() llmapp.RemoteModel {
@@ -273,20 +275,30 @@ func (p remoteModelPayload) remoteModel() llmapp.RemoteModel {
 		}
 	}
 	tools := p.SupportsTools
+	reasoning := p.SupportsReasoning
+	promptCache := p.SupportsPromptCache
 	if len(p.Capabilities) > 0 {
 		var capabilities struct {
-			FunctionCalling bool `json:"function_calling"`
+			FunctionCalling     bool `json:"function_calling"`
+			Reasoning           bool `json:"reasoning"`
+			PromptCache         bool `json:"prompt_cache"`
+			SupportsReasoning   bool `json:"supports_reasoning"`
+			SupportsPromptCache bool `json:"supports_prompt_cache"`
 		}
-		if err := json.Unmarshal(p.Capabilities, &capabilities); err == nil && capabilities.FunctionCalling {
-			tools = true
+		if err := json.Unmarshal(p.Capabilities, &capabilities); err == nil {
+			tools = tools || capabilities.FunctionCalling
+			reasoning = reasoning || capabilities.Reasoning || capabilities.SupportsReasoning
+			promptCache = promptCache || capabilities.PromptCache || capabilities.SupportsPromptCache
 		}
 	}
 	return llmapp.RemoteModel{
-		ID:             strings.TrimSpace(p.ID),
-		ContextWindow:  p.ContextWindow,
-		MaxOutput:      maxOutput,
-		SupportsTools:  tools,
-		SupportsVision: vision,
+		ID:                  strings.TrimSpace(p.ID),
+		ContextWindow:       p.ContextWindow,
+		MaxOutput:           maxOutput,
+		SupportsTools:       tools,
+		SupportsVision:      vision,
+		SupportsReasoning:   reasoning,
+		SupportsPromptCache: promptCache,
 	}
 }
 

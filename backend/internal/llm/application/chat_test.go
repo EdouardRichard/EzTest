@@ -111,12 +111,14 @@ func newChatTestService(t *testing.T, gateway ChatClient, settings SettingsReade
 
 func seedSingleConfig(t *testing.T, repo *fakeRepo) {
 	t.Helper()
-	repo.configs[7] = chatTestConfig(7, true)
+	cfg := chatTestConfig(7, true)
+	cfg.DefaultModelID = 11
+	repo.configs[7] = cfg
 	repo.models[11] = chatTestModel(11, 7, "fake-llm", 64000, 8192)
 	repo.models[12] = chatTestModel(12, 7, "fake-llm-mini", 32000, 4096)
 }
 
-func TestChatSelectsDefaultConfigAndFirstCatalogModel(t *testing.T) {
+func TestChatSelectsDefaultConfigAndDefaultModel(t *testing.T) {
 	gateway := &fakeChatGateway{response: ChatResponse{Content: "你好", FinishReason: "stop"}}
 	svc, repo := newChatTestService(t, gateway, nil)
 	seedSingleConfig(t, repo)
@@ -170,16 +172,24 @@ func TestResolveModelReturnsCatalogMetadata(t *testing.T) {
 	seedSingleConfig(t, repo)
 	repo.models[13] = llm.Model{ID: 13, ConfigID: 7, Model: "tool-model", ContextWindow: 128000, MaxOutput: 16384, SupportsTools: true, Status: llm.ModelStatusActive}
 
-	info, err := svc.ResolveModel(context.Background(), "tool-model")
+	info, err := svc.ResolveModel(context.Background(), 0, "tool-model")
 	if err != nil {
 		t.Fatalf("ResolveModel: %v", err)
 	}
-	want := ModelInfo{ConfigID: 7, Model: "tool-model", ContextWindow: 128000, MaxOutput: 16384, SupportsTools: true}
+	want := ModelInfo{
+		ConfigID:      7,
+		ModelID:       13,
+		Model:         "tool-model",
+		ContextWindow: 128000,
+		MaxOutput:     16384,
+		SupportsTools: true,
+		Capabilities:  llm.Capabilities{SupportsTools: true, ContextWindow: 128000},
+	}
 	if info != want {
 		t.Fatalf("info = %#v, want %#v", info, want)
 	}
 
-	info, err = svc.ResolveModel(context.Background(), "")
+	info, err = svc.ResolveModel(context.Background(), 0, "")
 	if err != nil {
 		t.Fatalf("ResolveModel default: %v", err)
 	}
@@ -219,15 +229,20 @@ func TestChatWithDisabledDefaultConfigIsAIUnavailable(t *testing.T) {
 	}
 }
 
-func TestChatWithoutCatalogModelsIsAIUnavailable(t *testing.T) {
+func TestChatWithDefaultModelOutsideCatalogIsConfigError(t *testing.T) {
 	gateway := &fakeChatGateway{}
 	svc, repo := newChatTestService(t, gateway, nil)
-	repo.configs[7] = chatTestConfig(7, true)
+	cfg := chatTestConfig(7, true)
+	cfg.DefaultModelID = 99
+	repo.configs[7] = cfg
 
-	if _, err := svc.ResolveModel(context.Background(), ""); err == nil {
-		t.Fatal("ResolveModel succeeded without catalog models")
-	} else if apiErr := apiError(t, err); apiErr.Code != "ai_unavailable" {
+	if _, err := svc.ResolveModel(context.Background(), 0, ""); err == nil {
+		t.Fatal("ResolveModel succeeded with a default model outside the catalog")
+	} else if apiErr := apiError(t, err); apiErr.Code != CodeLLMConfigInvalid {
 		t.Fatalf("error = %#v", apiErr)
+	}
+	if gateway.callCount() != 0 {
+		t.Fatalf("gateway calls = %d, want 0", gateway.callCount())
 	}
 }
 
@@ -323,7 +338,9 @@ func TestChatGatewayFailureIsRedactedAIUnavailable(t *testing.T) {
 func TestChatDefaultMaxOutputWhenCatalogOmitsIt(t *testing.T) {
 	gateway := &fakeChatGateway{response: ChatResponse{Content: "ok"}}
 	svc, repo := newChatTestService(t, gateway, nil)
-	repo.configs[7] = chatTestConfig(7, true)
+	cfg := chatTestConfig(7, true)
+	cfg.DefaultModelID = 11
+	repo.configs[7] = cfg
 	repo.models[11] = chatTestModel(11, 7, "bare-model", 0, 0)
 
 	if _, err := svc.Chat(context.Background(), ChatRequest{Messages: []ChatMessage{{Role: "user", Content: "hi"}}}); err != nil {

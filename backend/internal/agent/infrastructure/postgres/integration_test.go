@@ -518,6 +518,9 @@ func TestRuntimeProfilesRunsMessagesAndPackets(t *testing.T) {
 	run := agent.AgentRun{
 		ID:             ids.Next(),
 		ProfileKey:     "clarification_host",
+		Model:          "gpt-4o",
+		ConfigID:       77,
+		FallbackFrom:   "old-model",
 		WorkItemID:     ptr(int64(55)),
 		ConversationID: ptr(int64(66)),
 		Status:         agent.AgentRunRunning,
@@ -532,6 +535,19 @@ func TestRuntimeProfilesRunsMessagesAndPackets(t *testing.T) {
 	}
 	if createdRun.ID != run.ID || createdRun.Status != agent.AgentRunRunning {
 		t.Fatalf("created run = %#v", createdRun)
+	}
+	if createdRun.Model != "gpt-4o" || createdRun.ConfigID != 77 || createdRun.FallbackFrom != "old-model" {
+		t.Fatalf("created run model/config/fallback = %q/%d/%q", createdRun.Model, createdRun.ConfigID, createdRun.FallbackFrom)
+	}
+	var runModel, runFallback string
+	var runConfigID *int64
+	if err := pool.QueryRow(ctx,
+		`SELECT model, config_id, fallback_from FROM agent_run WHERE id = $1`, run.ID,
+	).Scan(&runModel, &runConfigID, &runFallback); err != nil {
+		t.Fatalf("query run model: %v", err)
+	}
+	if runModel != "gpt-4o" || runConfigID == nil || *runConfigID != 77 || runFallback != "old-model" {
+		t.Fatalf("stored run model/config/fallback = %q/%v/%q", runModel, runConfigID, runFallback)
 	}
 
 	assistant := agent.AgentMessage{

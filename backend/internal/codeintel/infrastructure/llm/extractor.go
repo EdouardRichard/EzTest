@@ -32,7 +32,7 @@ func (e *Extractor) Model(ctx context.Context) (string, error) {
 	if e == nil || e.chat == nil {
 		return "", platform.AIUnavailable("llm chat gateway is not configured")
 	}
-	info, err := e.chat.ResolveModel(ctx, "")
+	info, err := e.chat.ResolveModel(ctx, 0, "")
 	if err != nil {
 		return "", err
 	}

@@ -10,11 +10,13 @@ import (
 
 // RemoteModel is one model reported by an OpenAI-compatible upstream.
 type RemoteModel struct {
-	ID             string
-	ContextWindow  int
-	MaxOutput      int
-	SupportsTools  bool
-	SupportsVision bool
+	ID                  string
+	ContextWindow       int
+	MaxOutput           int
+	SupportsTools       bool
+	SupportsVision      bool
+	SupportsReasoning   bool
+	SupportsPromptCache bool
 }
 
 // TestResult is the outcome of a connectivity test. Error is only set when the
@@ -51,14 +53,17 @@ type SettingsReader interface {
 // defaults) and update (nil fields keep the stored value; a non-nil empty
 // string clears api_key/headers).
 type ConfigInput struct {
-	Name           *string
-	Provider       *string
-	Protocol       *string
-	BaseURL        *string
-	APIKey         *string
-	Headers        *map[string]string
-	TimeoutSeconds *int
-	MaxRetries     *int
-	IsDefault      *bool
-	Status         *string
+	Name            *string
+	Provider        *string
+	Protocol        *string
+	BaseURL         *string
+	APIKey          *string
+	Headers         *map[string]string
+	TimeoutSeconds  *int
+	MaxRetries      *int
+	IsDefault       *bool
+	Status          *string
+	ThinkingType    *string
+	ReasoningEffort *string
+	DefaultModelID  *int64
 }
